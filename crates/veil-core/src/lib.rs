@@ -39,6 +39,7 @@ pub mod commands;
 pub mod crypto;
 pub mod embargo;
 pub mod error;
+pub mod fsck;
 pub mod id;
 pub mod identity;
 pub mod keychain;

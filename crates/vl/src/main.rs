@@ -69,6 +69,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Init { path } => cmd_init(path.as_deref()),
         Cmd::Clone { source, dest } => cmd_clone(source, dest.as_deref()),
         Cmd::Identity(c) => cmd_identity(c),
+        Cmd::Fsck { verbose } => cmd_fsck(cli.repository.as_deref(), *verbose),
         _ => {
             let mut ctx = open(&cli)?;
             let code = dispatch(&mut ctx, &cli)?;
@@ -80,7 +81,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
 
 fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
     match &cli.cmd {
-        Cmd::Init { .. } | Cmd::Clone { .. } | Cmd::Identity(_) => unreachable!(),
+        Cmd::Init { .. } | Cmd::Clone { .. } | Cmd::Identity(_) | Cmd::Fsck { .. } => unreachable!(),
         Cmd::Status => cmd_status(ctx)?,
         Cmd::Log { limit } => print_log(&ctx.repo, &ctx.ws, *limit)?,
         Cmd::Show { rev, stat } => cmd_show(ctx, rev, *stat)?,
@@ -1047,4 +1048,54 @@ fn cmd_pull(ctx: &mut Ctx, name: &str) -> Result<()> {
     }
     println!("Pulled {} object(s) from {name}", r.objects_copied);
     Ok(())
+}
+
+// ---- integrity -----------------------------------------------------------
+
+/// `vl fsck` deliberately bypasses `Ctx::open`: it must not snapshot or
+/// write anything, and it has to work when the operation head is damaged.
+fn cmd_fsck(repo_arg: Option<&Path>, verbose: bool) -> Result<ExitCode> {
+    use veil_core::fsck::{fsck, Severity};
+    let start = match repo_arg {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir()?,
+    };
+    let root = ctx::find_root(&start)
+        .ok_or_else(|| anyhow!("no Veil repository found in {} or its parents", start.display()))?;
+    let identity = load_identity()?;
+    let report = fsck(Arc::new(DiskBackend::new(&root)), Some(identity))?;
+    for f in &report.findings {
+        let show = verbose || matches!(f.severity, Severity::Corrupt | Severity::Warning);
+        if !show {
+            continue;
+        }
+        let label = match f.severity {
+            Severity::Corrupt => red(f.severity.label()),
+            Severity::Warning => yellow(f.severity.label()),
+            Severity::Redacted | Severity::Note => dim(f.severity.label()),
+        };
+        println!("{label}: {}", f.message);
+    }
+    println!(
+        "Checked {} objects ({} snapshots, {} trees, {} files; {} unreachable), {} operations, {} key rings, {} embargo records",
+        report.objects_checked,
+        report.snapshots,
+        report.trees,
+        report.files,
+        report.objects_unreachable,
+        report.operations,
+        report.keyrings,
+        report.embargoes
+    );
+    let (redacted, notes) = (report.count(Severity::Redacted), report.count(Severity::Note));
+    if !verbose && redacted + notes > 0 {
+        println!("  {redacted} redacted (expected), {notes} note(s); use --verbose to list them");
+    }
+    if report.is_ok() {
+        println!("{}", green("No corruption found"));
+        Ok(ExitCode::SUCCESS)
+    } else {
+        println!("{} {} problem(s) found", red("Corrupt:"), report.count(Severity::Corrupt));
+        Ok(ExitCode::FAILURE)
+    }
 }
