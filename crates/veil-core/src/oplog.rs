@@ -1,0 +1,144 @@
+//! The operation log.
+//!
+//! Every mutation of the repository (snapshot, describe, rebase, tag move,
+//! visibility toggle, push/pull, embargo release, …) is a transaction that
+//! appends one immutable [`Operation`] holding the complete resulting
+//! [`View`]. Undo is therefore trivial and total: restore an older view.
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
+
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    error::{Result, VeilError},
+    id::ObjectId,
+    vfs::StorageBackend,
+    vpath::VPath,
+};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceState {
+    /// The working-copy snapshot of this workspace.
+    pub wc: ObjectId,
+    /// Scope under which this workspace's line of work is cloaked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloak: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tag {
+    pub target: ObjectId,
+    /// Cloaked tags are never pushed to public remotes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloak: Option<String>,
+}
+
+/// The complete mutable state of a repository at one point in time.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct View {
+    /// Visible tips of the DAG. Everything reachable from a head, tag or
+    /// workspace is visible; rewritten snapshots simply stop being reachable.
+    pub heads: BTreeSet<ObjectId>,
+    pub workspaces: BTreeMap<String, WorkspaceState>,
+    pub tags: BTreeMap<String, Tag>,
+    /// `remote/tag` → target as last seen on the remote.
+    #[serde(default)]
+    pub remote_tags: BTreeMap<String, ObjectId>,
+}
+
+impl View {
+    pub fn workspace(&self, name: &str) -> Result<&WorkspaceState> {
+        self.workspaces
+            .get(name)
+            .ok_or_else(|| VeilError::NotFound(format!("workspace '{name}'")))
+    }
+
+    /// Every snapshot referenced directly by this view.
+    pub fn refs(&self) -> Vec<ObjectId> {
+        let mut v: Vec<ObjectId> = self.heads.iter().copied().collect();
+        v.extend(self.workspaces.values().map(|w| w.wc));
+        v.extend(self.tags.values().map(|t| t.target));
+        v.extend(self.remote_tags.values().copied());
+        v.sort();
+        v.dedup();
+        v
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Operation {
+    pub parents: Vec<ObjectId>,
+    pub timestamp: i64,
+    pub user: String,
+    pub description: String,
+    pub view: View,
+}
+
+#[derive(Debug)]
+pub struct OpStore {
+    backend: Arc<dyn StorageBackend>,
+}
+
+impl OpStore {
+    pub fn new(backend: Arc<dyn StorageBackend>) -> Self {
+        OpStore { backend }
+    }
+
+    fn op_path(id: &ObjectId) -> VPath {
+        VPath::new(&format!(".veil/ops/{}", id.hex())).unwrap()
+    }
+
+    fn head_path() -> VPath {
+        VPath::new(".veil/op_head").unwrap()
+    }
+
+    pub fn put(&self, op: &Operation) -> Result<ObjectId> {
+        let raw = serde_json::to_vec(op)?;
+        let id = ObjectId::hash(&raw);
+        self.backend.write(&Self::op_path(&id), &raw)?;
+        Ok(id)
+    }
+
+    pub fn get(&self, id: &ObjectId) -> Result<Operation> {
+        let raw = self
+            .backend
+            .read(&Self::op_path(id))
+            .map_err(|_| VeilError::NotFound(format!("operation {}", id.short())))?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
+    pub fn head(&self) -> Result<ObjectId> {
+        let raw = self.backend.read(&Self::head_path())?;
+        ObjectId::from_hex(String::from_utf8_lossy(&raw).trim())
+    }
+
+    pub fn set_head(&self, id: &ObjectId) -> Result<()> {
+        self.backend.write(&Self::head_path(), id.hex().as_bytes())
+    }
+
+    /// Resolve an operation id prefix by walking back from the head.
+    pub fn resolve_prefix(&self, prefix: &str) -> Result<ObjectId> {
+        let mut cur = Some(self.head()?);
+        let mut found = Vec::new();
+        let mut steps = 0;
+        while let Some(id) = cur {
+            if id.hex().starts_with(prefix) {
+                found.push(id);
+            }
+            let op = self.get(&id)?;
+            cur = op.parents.first().copied();
+            steps += 1;
+            if steps > 100_000 {
+                break;
+            }
+        }
+        match found.as_slice() {
+            [one] => Ok(*one),
+            [] => Err(VeilError::Revset(format!("no operation matches '{prefix}'"))),
+            _ => Err(VeilError::Revset(format!("operation prefix '{prefix}' is ambiguous"))),
+        }
+    }
+}
