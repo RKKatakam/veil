@@ -9,7 +9,7 @@
 //! | unreleased embargoed objects    | ✓           | ✗ (fallback ✓)|
 //! | released embargoed objects      | ✓           | ✓             |
 //! | cloaked tags                    | ✓           | ✗             |
-//! | key rings / embargo records     | ✓           | ✓ (encrypted) |
+//! | key rings / embargo records     | ✓           | ✓ (encrypted, signed) |
 //! | isolated files, vault, `local`  | never — not in the graph at all |
 //!
 //! Redacted tree entries keep their names and ids, so a later push to a
@@ -20,7 +20,7 @@ use std::{collections::HashSet, sync::Arc};
 use crate::{
     error::{Result, VeilError},
     id::ObjectId,
-    keychain::{Keychain, LOCAL_SCOPE},
+    keychain::{Keychain, RingMerge, LOCAL_SCOPE},
     object::{EntryKind, Object},
     oplog::Tag,
     repo::{is_repo, Repo},
@@ -83,7 +83,14 @@ impl Transfer<'_> {
             self.report.objects_copied += 1;
         }
         match obj {
-            Object::Snapshot(s) => self.copy(s.tree)?,
+            Object::Snapshot(s) => {
+                if s.signature_valid() == Some(false) {
+                    self.report
+                        .warnings
+                        .push(format!("snapshot {} carries an invalid signature", id.short()));
+                }
+                self.copy(s.tree)?
+            }
             Object::Tree(t) => {
                 for e in &t.entries {
                     self.copy(e.id)?;
@@ -116,36 +123,25 @@ fn ancestors_in(store: &ObjectStore, tips: &[ObjectId]) -> Result<Vec<ObjectId>>
     Ok(out)
 }
 
-/// Union key rings and embargo records from `src` into `dst`.
+/// Merge key rings and embargo records from `src` into `dst`.
+///
+/// Nothing is merged as a union any more: each ring is a signed, hash-chained
+/// log that only ever fast-forwards (see [`Keychain::merge_ring`]), so a
+/// revocation cannot be undone by syncing with a replica that still lists
+/// the member. Rings are merged before embargo records because the records'
+/// signatures are checked against ring membership.
 fn sync_meta(src: &Keychain, dst: &Keychain, warnings: &mut Vec<String>) -> Result<()> {
     for ring in src.rings()? {
-        let mut merged = match dst.load_ring(&ring.scope)? {
-            Some(existing) if existing.key_id != ring.key_id => {
-                warnings.push(format!(
-                    "scope '{}' exists on both sides with different keys; the incoming key ring was not merged",
-                    ring.scope
-                ));
-                continue;
-            }
-            Some(existing) => existing,
-            None => Default::default(),
-        };
-        merged.scope = ring.scope.clone();
-        merged.key_id = ring.key_id.clone();
-        let before = merged.clone();
-        for (k, m) in ring.members {
-            merged.members.entry(k).or_insert(m);
-        }
-        if merged != before {
-            dst.save_ring(&merged)?;
+        if let RingMerge::Rejected(w) = dst.merge_ring(&ring)? {
+            warnings.push(w);
         }
     }
     for rec in src.embargoes()? {
-        match dst.load_embargo(&rec.id)? {
-            Some(existing) if existing.is_released() || !rec.is_released() => {}
-            _ => dst.save_embargo(&rec)?,
+        if let Some(w) = dst.merge_embargo(&rec)? {
+            warnings.push(w);
         }
     }
+    dst.invalidate();
     Ok(())
 }
 

@@ -258,7 +258,7 @@ impl Repo {
         match self.store.read_text(&s.description) {
             Some(t) => t,
             None => match &s.description {
-                Text::Sealed(e) => format!("[cloaked:{}]", e.scope),
+                Text::Sealed(e) => format!("[cloaked:{}]", crate::keychain::split_label(&e.scope).0),
                 Text::Plain(t) => t.clone(),
             },
         }

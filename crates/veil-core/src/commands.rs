@@ -207,6 +207,7 @@ impl Repo {
             conflicts: merged.conflicts.iter().map(|p| p.to_string()).collect(),
             cloak: into_snap.cloak.clone(),
             embargo: embargo_id.clone(),
+            signature: None, // signed by the transaction
         };
         let m = tx.write_snapshot(&snap)?;
         for tag in tx.view.tags.values_mut() {
@@ -269,7 +270,8 @@ impl Repo {
         let now = now_millis();
         let mut released = Vec::new();
         for rec in self.keys().embargoes()? {
-            if rec.is_released() || rec.until.map_or(true, |u| u > now) {
+            // Only a deadline signed by a scope member may trigger a release.
+            if rec.is_released() || rec.until.map_or(true, |u| u > now) || !self.keys().embargo_trusted(&rec) {
                 continue;
             }
             if self.keys().has(&format!("embargo/{}", rec.id)) {

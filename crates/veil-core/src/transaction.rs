@@ -72,8 +72,23 @@ impl<'r> Transaction<'r> {
         Ok(())
     }
 
+    /// Sign `snap` as produced by this repository's identity (or strip any
+    /// stale signature when there is no identity). Every snapshot a
+    /// transaction writes passes through here, so whoever *produced* a
+    /// snapshot is its signer, including when the auto-rebase rewrites a
+    /// snapshot somebody else authored.
+    fn sign(&self, snap: &Snapshot) -> Snapshot {
+        let mut s = snap.clone();
+        match self.repo.identity() {
+            Some(id) => s.sign(id),
+            None => s.signature = None,
+        }
+        s
+    }
+
     pub fn write_snapshot(&mut self, snap: &Snapshot) -> Result<ObjectId> {
-        let id = self.repo.store.put_snapshot(snap)?;
+        let signed = self.sign(snap);
+        let id = self.repo.store.put_snapshot(&signed)?;
         self.add_head(id)?;
         Ok(id)
     }
@@ -92,6 +107,7 @@ impl<'r> Transaction<'r> {
             conflicts: merged.conflicts.iter().map(|p| p.to_string()).collect(),
             cloak,
             embargo: None,
+            signature: None,
         };
         self.write_snapshot(&snap)
     }
@@ -101,10 +117,12 @@ impl<'r> Transaction<'r> {
         if old == self.repo.root_id {
             return Err(VeilError::repo("the root snapshot cannot be rewritten"));
         }
-        let id = self.repo.store.put_snapshot(&new)?;
-        if id == old {
+        // Content identical to `old` (ignoring signatures): keep `old` and its
+        // original signer instead of re-signing an unchanged snapshot.
+        if self.repo.snapshot(&old)?.unsigned_id() == new.unsigned_id() {
             return Ok(old);
         }
+        let id = self.repo.store.put_snapshot(&self.sign(&new))?;
         self.rewritten.insert(old, Rewrite::Replaced(id));
         self.view.heads.remove(&old);
         self.add_head(id)?;
@@ -216,7 +234,9 @@ impl<'r> Transaction<'r> {
             ns.tree = tree;
             ns.predecessors = vec![id];
             ns.conflicts = conflicts.into_iter().collect();
-            let nid = store.put_snapshot(&ns)?;
+            // Rebasing someone else's change: `author` stays theirs, the
+            // signature becomes ours, and `predecessors` keeps the original.
+            let nid = store.put_snapshot(&self.sign(&ns))?;
             self.rewritten.insert(id, Rewrite::Replaced(nid));
             self.view.heads.remove(&id);
             self.add_head(nid)?;
