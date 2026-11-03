@@ -30,8 +30,8 @@ below it, and nothing above the VFS layer knows a disk exists.
 optional `known_id` hint). The trait takes `&self`, so a backend can be
 shared as `Arc<dyn StorageBackend>`.
 
-* **DiskBackend** does atomic writes (temp file plus rename) and ignores
-  symlinks.
+* **DiskBackend** does atomic, durable writes (temp file, fsync, rename,
+  fsync of the directory; see §9) and ignores symlinks.
 * **MemoryBackend** is a flat `BTreeMap<VPath, Node>`. Because the
   descendants of `a/` are contiguous in string order, directory listings are
   range scans. File buffers are `Arc`-shared.
@@ -209,6 +209,82 @@ nothing is ever transferred under the `local` scope. Isolated content cannot
 be pushed at all, because it was never in the graph. Key rings and embargo
 records are merged as unions; a released key wins. Tags fast-forward. A
 diverged tag is reported and left alone (`--force` overrides on push).
+
+## 9. Locking, crash safety and `fsck`
+
+**The repository lock** (`lock.rs`) is the file `.veil/lock`, created with
+`create_new`, so it behaves the same on every backend. It holds JSON: a random
+per-acquisition token, the holder's pid, host name, boot identity (Linux boot
+id plus pid namespace) and a lease (10 s by default).
+
+* While a `RepoLock` lives, a heartbeat thread renews the lease every 2.5 s.
+  However long a transaction runs, its lock never looks stale. (The MVP stole
+  any lock older than 120 s, even from a live process.)
+* A contender removes someone else's lock only when the lease has expired
+  **and** the holder is provably gone. That means either the same machine
+  (same host, boot id and pid namespace) with a pid that no longer runs, or a
+  lease last renewed before this machine booted. A holder on another host,
+  or a live process that stopped renewing (suspended, stuck), is never robbed.
+  The contender times out with an error naming the holder.
+* Each process keeps a registry of the tokens its live locks hold. A lock
+  file with this process's pid and an unregistered token was leaked, for
+  example by a crash that prevented the file from being removed. It is
+  reclaimed immediately.
+* Steals are serialised through `.veil/lock.steal` (also `create_new`).
+  Under that guard, the stealer re-reads the lock and removes it only if it
+  still has the exact bytes that were judged stale. Two stealers can never
+  both win.
+* Fencing: before moving `op_head`, a transaction checks that the lock still
+  carries its token (`RepoLock::ensure_held`).
+* On disk, `create_new` writes the content to a synced temp file and
+  hard-links it into place. A contender therefore never sees a half-written
+  lock. Unparseable content (left by older versions or a non-atomic fallback)
+  is reclaimed only after it stays unchanged for a full lease.
+
+**Crash ordering.** Every transaction writes in this order: objects (the
+snapshot, trees and blobs it references), then the operation, then
+`op_head`. Pull and push copy objects and shared metadata (key rings,
+embargo records) before the transaction that references them. `init` writes
+`repo.json` last, because it is what makes a directory a repository.
+`DiskBackend::write` and `create_new` return only once the data is durable:
+the file is fsynced, renamed, and its directory fsynced, and new directories
+are synced into their parents. So the program order of writes is also their
+durability order. After a crash at any point, `op_head` names a complete
+operation whose view references only complete objects. The worst leftovers
+are unreachable objects, an operation that never became the head, temp files
+and a lock that will be reclaimed. Undo is unaffected.
+
+The cost is a few fsyncs per object written. A batched barrier (sync every
+touched directory once before writing the operation) is the obvious
+optimisation once packs land.
+
+**`vl fsck`** (`fsck.rs`) is read-only and works without `Repo::open`, so it
+can diagnose a damaged `op_head`. It re-hashes and decodes every object,
+including unreachable ones, and opens sealed objects it holds keys for. It
+walks reachability from the current view and from every retained operation:
+snapshot → parents and tree, tree → entries and embargo fallbacks. It
+rejects tree entry names such as `..`, and checks that key rings and embargo
+records parse and are filed under their own names. It also checks that every
+operation matches its id, that every parent exists, and that the head points
+at a real operation. A missing object is classified by the visibility of the
+entry that references it:
+
+| finding | meaning | exit code |
+|---|---|---|
+| corrupt | hash mismatch, undecodable, missing public file / tree / snapshot / op parent, broken metadata | 1 |
+| warning | sealed under an unexpected scope, embargo without a record, missing embargo fallback | 0 |
+| redacted (expected) | cloaked or embargoed content absent, e.g. in a clone of a public remote | 0 |
+| note | leftovers of interrupted commands: dangling operations, unreachable objects, temp files, a lock | 0 |
+
+**Crash-injection tests** (`crates/veil-core/tests/crash.rs`). A
+`FaultyBackend` wraps `MemoryBackend` and fails the N+1-th mutation and every
+later one, with the fatal write either lost or applied. For snapshot, commit,
+rebase, merge, embargoed merge, push, public push, pull and init, the tests
+sweep every N. After each crash the repository must open and pass `fsck`.
+The operation must appear either not at all or exactly once on top of the old
+head. Every previously visible snapshot must keep identical content. Running
+the operation again must succeed, which also exercises reclaiming the crashed
+process's lock.
 
 ## Threat model (MVP)
 
