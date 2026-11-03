@@ -1233,6 +1233,13 @@ impl Keychain {
     }
 
     pub fn create_embargo(&self, scope: &str, until: Option<i64>, description: &str) -> Result<String> {
+        // Signed records are attributed through the ring, so a legacy
+        // (unsigned) ring is upgraded first.
+        if let Some(ring) = self.load_ring(scope)? {
+            if ring.is_legacy() && self.is_member(scope) {
+                self.upgrade_legacy(ring)?;
+            }
+        }
         let (label, scope_key) = self.sealing_key(scope).map_err(|_| {
             VeilError::Policy(format!("an embargo needs a scope you belong to; you have no key for '{scope}'"))
         })?;

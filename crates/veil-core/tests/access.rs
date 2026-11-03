@@ -576,3 +576,29 @@ fn legacy_rings_and_envelopes_keep_working_and_upgrade_on_first_change() {
     assert!(bob_keys.has("team"), "Bob keeps generation 0 (history)");
     assert!(!bob_keys.is_member("team"), "but not the new generation");
 }
+
+#[test]
+fn embargo_on_a_legacy_ring_upgrades_it_so_the_record_is_attributable() {
+    use veil_core::{crypto::random_key, identity::wrap_key, keychain::{key_fingerprint, RingMember}};
+    let fs = Arc::new(MemoryBackend::new());
+    let alice = Identity::generate("alice");
+    let repo = Repo::init_for_clone(fs, Some(alice.clone()), "alice").unwrap();
+    let key = random_key();
+    let mut legacy = KeyRing {
+        scope: "team".into(),
+        key_id: key_fingerprint(&key),
+        ..Default::default()
+    };
+    legacy.members.insert(
+        alice.public_hex(),
+        RingMember {
+            name: "alice".into(),
+            wrapped: wrap_key(&alice.public_key(), &key, "team").unwrap(),
+        },
+    );
+    repo.keys().save_ring(&legacy).unwrap();
+    let id = repo.keys().create_embargo("team", Some(1), "x").unwrap();
+    assert!(!repo.keys().load_ring("team").unwrap().unwrap().is_legacy());
+    let rec = repo.keys().load_embargo(&id).unwrap().unwrap();
+    assert!(repo.keys().embargo_trusted(&rec));
+}

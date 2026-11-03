@@ -17,7 +17,7 @@ below it, and nothing above the VFS layer knows a disk exists.
 ├──────────────────────────────────────────────────────────────────────┤
 │ CAS       object · store (BLAKE3, transparent unsealing)             │
 ├──────────────────────────────────────────────────────────────────────┤
-│ Crypto    crypto (VeilEnvelope) · identity (X25519) · keychain       │
+│ Crypto    crypto (VeilEnvelope) · identity (X/Ed25519) · keychain    │
 ├──────────────────────────────────────────────────────────────────────┤
 │ VFS       StorageBackend: DiskBackend · MemoryBackend · OverlayBackend│
 └──────────────────────────────────────────────────────────────────────┘
@@ -78,18 +78,158 @@ use random nonces.
 
 ## 3. Identities, scopes and the keychain
 
-* An **identity** is an X25519 keypair, stored outside the repository
-  (`$VEIL_HOME/identity.json`, mode 0600). Its public form is `veil1<hex>`.
-* A **scope** (`team`, `ops`, …) is a random 256-bit key. Its **key ring**
-  (`.veil/meta/keyrings/<scope>.json`) holds the key wrapped to each
-  member's public key with an ECIES-style sealed box: an ephemeral X25519 key,
-  a BLAKE3 key-derivation step, then XChaCha20-Poly1305 with AAD
-  `wrap:<scope>`. Rings are safe to publish and travel with every push and
-  pull. Each ring carries a key fingerprint, so two independently created
-  scopes with the same name are never merged.
+### Identities
+
+* An **identity** is one 32-byte secret, stored outside the repository
+  (`$VEIL_HOME/identity.json`, mode 0600). Two keypairs come from it:
+  * **X25519** (the secret itself) for receiving wrapped scope keys. Its
+    public key `veil1<hex64>` is the **member id**.
+  * **Ed25519** for signing. The seed is
+    `BLAKE3-derive("veil 2026 ed25519-seed v1", secret)`, so identity files
+    written before signatures existed load unchanged and get a stable
+    signing key.
+* The **full public identity** is `veil1<x25519-hex><ed25519-hex>` (128 hex
+  digits). `vl identity show` prints it, and `vl scope grant` should be
+  given it. A grant made with the short member id still works for
+  decryption, but the ring cannot bind a signing key to that member: their
+  signatures show as "unknown key" and they cannot be an effective admin.
+* Secrets in memory are wrapped in `zeroize::Zeroizing`: the identity secret,
+  the derived signing seed, key-encryption keys, unwrapped scope and embargo
+  keys, and the keychain's key cache. Keys returned by value (`Key` is
+  `Copy`) are not tracked.
+
+### Scopes, key generations and envelope labels
+
+* A **scope** (`team`, `ops`, …) is a sequence of random 256-bit keys called
+  **generations**. Generation 0 is created with the scope. Every revocation
+  (and every `vl scope rotate`) starts generation *n+1* with a fresh key,
+  wrapped only to the members that remain.
+* Each key has a public **key id** (`BLAKE3-derive("…key-fingerprint v1",
+  key)[..8]`). A sealed object names its generation in its envelope label:
+  `team#<key-id>`. A bare `team` label means generation 0. Every envelope
+  written before generations existed has a bare label, so those still open.
+  The label is the AEAD associated data, so a generation cannot be swapped
+  without detection. The binary `Envelope` format did not change.
+* New content is always sealed under the **current** generation
+  (`Keychain::sealing_key`). Unchanged cloaked files keep their existing
+  sealing when re-snapshotted, so a rotation does not rewrite the working
+  copy. Content that changes after a revocation moves to the new generation.
+* **History stays readable for members.** Each rotation carries the previous
+  generation's key sealed under the new key (`previous`). Anyone holding the
+  newest key can walk back through every older generation, which includes
+  members granted after the rotation. A revoked member keeps the keys they
+  were given up to the revocation. Those keys were already in their hands,
+  so nothing is lost by keeping them. They never receive a later key.
 * The **`local` scope** key is derived from the identity secret and the
   repository id. It is never stored and protects only device-local state:
   the vault.
+
+### Key rings: a signed membership log
+
+`.veil/meta/keyrings/<scope>.json` (format 2) holds only a **log**: an
+append-only, hash-chained list of signed changes.
+
+```text
+RingChange { seq, prev, timestamp, signer, signing_key, op, signature }
+op = Genesis { key_id, members[], proof }      seq 0 only
+   | Grant   { member }                        add, or change name/role/signing key
+   | Revoke  { member, rotation }              remove + new generation
+   | Rotate  { rotation }                      new generation, same members
+member   = { id, name, signing_key?, role: admin|member, generation, wrapped }
+rotation = { generation, key_id, previous: [{key_id, sealed}], wrapped: {id → key} }
+```
+
+* `seq` is the ring's **epoch**: the change's position in the log. `prev` is
+  the chain hash of the previous change: a BLAKE3 hash in derive-key mode
+  over the signing body plus the signature. The signature is Ed25519 over a
+  domain-separated encoding of
+  `(scope, seq, prev, timestamp, signer, signing_key, op)`. Because `scope`
+  is in the signed body, a change cannot be moved to another scope's ring.
+* **Authorisation.** The state (members, roles, generations) is *derived* by
+  replaying the log. Nothing in the file is trusted unless the replay
+  verifies:
+  * the genesis must be signed by one of the admins it creates;
+  * every later change must be signed with the *registered* signing key of a
+    member who is an **admin at that point of the log**;
+  * a grant must wrap the current generation;
+  * a rotation must be generation *n+1*, use a fresh key id, carry the
+    previous key, and wrap the new key to **exactly** the remaining members
+    (so a revoked member cannot be smuggled into the new generation);
+  * the last admin can be neither revoked nor demoted.
+
+  A ring that fails to verify gives no keys at all.
+* **Genesis proof.** The genesis carries a MAC, made with the generation-0
+  key, over `(scope, key_id, signer, signing_key)`. Every reader who can
+  unwrap generation 0 checks it, along with each rotation's `previous` chain.
+  This stops someone who does not know the key from creating a "genesis"
+  that claims an existing scope's key id. For example, they cannot copy the
+  real wrapped keys and name themselves admin.
+* **Roles.** The creator of a scope is its admin. `vl scope grant` adds
+  members (`--admin` adds admins). Only admins may grant, revoke or rotate.
+  Plain members can read and write content.
+* **Which change wins: fast-forward only.** When rings meet during push or
+  pull (`Keychain::merge_ring`):
+  1. An incoming ring that does not verify is **rejected**, with a warning.
+  2. If the local log is a prefix of the incoming log, the incoming ring is
+     taken (fast-forward).
+  3. If the incoming log is a prefix of the local log, it is a stale or
+     replayed ring and is **ignored**.
+  4. If the logs have diverged (concurrent admin edits, or a fork made by a
+     since-revoked admin), the **local ring is kept**. A warning lists the
+     changes that were not applied, and an admin re-applies them by hand.
+
+  Membership is never merged as a union. So
+  `revoke → push → pull from a replica that still lists the member` leaves
+  the member revoked, in both directions. A stale replica's ring is a prefix
+  of the new one, so it can neither overwrite the remote nor survive a pull.
+* **Legacy rings.** Format-1 rings (an unsigned `members` map plus `key_id`)
+  still load and decrypt. They upgrade to a signed log the first time a
+  member grants, revokes, rotates or creates an embargo: that member becomes
+  admin, and the other legacy members keep their wrapped generation-0 keys.
+  An unsigned ring never overrides a signed one, and two different legacy
+  rings are not merged (the local one is kept).
+
+### Signatures
+
+| Object | What is signed | Checked |
+|---|---|---|
+| ring change | its body (above) | on every load; rejected on pull if invalid |
+| embargo record | `(id, scope, wrapped, until, created, description, scope_key, key_id)` | on pull; signer must be (or have been) a member of the scope |
+| embargo release | `(id, released_key, released_at)`; the key must also match the committed `key_id` fingerprint | on pull and on every key lookup |
+| snapshot | its **unsigned id** (BLAKE3 of the encoding without `signature`) | shown by `vl log` / `vl show`; invalid ones reported on pull |
+
+* **Snapshot signatures and content ids.** `Snapshot.signature` is part of
+  the encoding, so the snapshot id commits to it. The signed value is the id
+  the snapshot would have *without* the signature. Two consequences follow:
+  * Stripping or swapping a signature produces a different object, and
+    children (which name their parents by id) no longer point at it.
+  * Ed25519 signing is deterministic, so a no-op re-snapshot keeps its id.
+* **Author vs. signer.** `author` is a claimed name. The **signer** is
+  whoever *produced this exact snapshot*. `Transaction` signs every snapshot
+  it writes. That includes the auto-rebase: when Bob's rewrite rebases
+  Alice's change, the result keeps `author: alice`, is signed by Bob, and
+  its `predecessors` names Alice's original, which still carries her
+  signature (`vl evolog`). `vl show` reports this as "signed by bob
+  (rewritten; author alice)". A rewrite whose content (ignoring the
+  signature) is identical keeps the original snapshot and its signer.
+* **Status.** Each signature has one of these statuses:
+  * `good`: valid, by a signing key that some ring binds to the claimed
+    member;
+  * `unknown`: valid, but the key is unknown, or it does not belong to the
+    claimed member;
+  * `bad`: does not verify;
+  * `unsigned`.
+
+  `vl log` marks each snapshot with `✓`, `✓<signer>`, `?signer`,
+  `✗bad-signature` or `unsigned`.
+* **Embargo deadlines.** Only a record whose creation signature is `good`
+  can trigger an automatic release. If a record arrives with a tampered
+  deadline, its signature fails and the pull rejects it. An attacker can
+  also strip the signature: the record is then accepted only as "unsigned",
+  and an unsigned record is never auto-released. This matters because a key
+  holder's engine would otherwise publish the key early. If the local
+  record differs from an incoming one in any signed field, the local record
+  is kept.
 
 ## 4. Visibility policy, and where it is enforced
 
@@ -206,11 +346,16 @@ A workspace is only a named pointer in the view. It owns no directory.
 happens *during the object walk*: a public remote never receives sealed
 objects except those of released embargoes, never receives cloaked tags, and
 nothing is ever transferred under the `local` scope. Isolated content cannot
-be pushed at all, because it was never in the graph. Key rings and embargo
-records are merged as unions; a released key wins. Tags fast-forward. A
-diverged tag is reported and left alone (`--force` overrides on push).
+be pushed at all, because it was never in the graph. Key rings are signed
+logs that only fast-forward (§3). Stale, tampered or forged rings are
+ignored or rejected with a warning, and membership is never merged as a
+union. Embargo records are accepted only if signed by a scope member, or as
+flagged legacy records. A release is accepted only if the published key
+matches the committed fingerprint. Snapshots whose signature fails to verify
+are reported. Tags fast-forward. A diverged tag is reported and left alone
+(`--force` overrides on push).
 
-## Threat model (MVP)
+## Threat model
 
 **Protected against:**
 
@@ -219,15 +364,45 @@ diverged tag is reported and left alone (`--force` overrides on push).
 * leaking cloaked content or names of cloaked tags to public remotes;
 * readers of a team remote who are not in a scope (they get ciphertext only);
 * pre-release disclosure of embargoed changes to non-members;
-* tampering with ciphertext or moving it between scopes (AEAD bound to the
-  scope).
+* tampering with ciphertext or moving it between scopes or key generations
+  (AEAD bound to the envelope label);
+* **revoked members reading new content.** Revocation rotates the scope key,
+  and the revoked identity never receives the new generation;
+* **resurrecting a revoked member by syncing.** Rings fast-forward, so stale
+  replicas and replayed old rings are ignored;
+* **tampered or forged rings.** Every change must be signed by an admin
+  authorised at that point of the log. Reordering, removing or editing a
+  change breaks the hash chain or the signature. A forged genesis that
+  claims an existing key fails the genesis proof for every key holder;
+* **forged or tampered embargo records.** A moved deadline, a changed scope
+  or a wrong published key is rejected. Unsigned records never auto-release;
+* **stripped or transplanted snapshot signatures.** The id commits to the
+  signature, and a transplant fails verification. Both show in `vl log`.
 
 **Not protected against (yet), and documented honestly:**
 
 * *File names, sizes and tree shape* of cloaked files are visible. The object
   format can already seal trees; the policy hook for that is still to come.
 * *Equality leakage* from deterministic sealing (see §2).
-* *Revocation* does not re-encrypt history; rotate secrets after revoking.
+* *Revocation is forward-only.* A revoked member keeps every key up to the
+  revocation, and with it all history sealed before it (including unchanged
+  files that are still sealed under an old generation). They also keep
+  anything they already decrypted. Rotate the underlying secrets.
+* *First contact is trust-on-first-use.* A fresh clone accepts the first
+  valid ring it sees. A malicious remote can serve a **fork** created by an
+  admin who was revoked later: the fork is valid at its fork point. Also, a
+  remote can withhold newer changes (a freshness or rollback attack against
+  replicas that never saw them). Replicas that already hold the newer log
+  reject both. Out-of-band pinning of the ring head is future work.
+* *Concurrent admin edits are not merged automatically.* Diverged logs keep
+  the local ring and warn, and an admin re-applies the missing changes.
+* *Snapshot signatures are advisory.* Unsigned and unknown-key snapshots are
+  shown but not rejected, and there is no "require signed" policy yet.
+  `author` is a free-form claim; only the signer is authenticated.
+* *Members granted by short member id* (without a signing key) cannot sign
+  ring changes, and their snapshot signatures show as unknown.
+* *Rings on a non-member remote* (for example a bare remote without an
+  identity) cannot check the genesis proof. Members check it when they pull.
 * *Time-based embargo release* relies on key holders' engines and is not
   time-lock cryptography.
 * Content committed in plaintext **before** a path was cloaked stays readable
@@ -241,8 +416,9 @@ diverged tag is reported and left alone (`--force` overrides on push).
 * Performance: a stat cache (mtime and size → entry) for `DiskBackend`
   snapshots, packfiles with zstd, and incremental push instead of a full
   graph walk.
-* Sealed directory nodes (hide names), scope key rotation, and per-snapshot
-  signatures with the identity key.
+* Sealed directory nodes (hide names); a "require signed snapshots" policy;
+  pinning a ring head out of band; automatic re-application of concurrent
+  ring changes.
 * First-class conflicts (jj-style) instead of conflict markers.
 * Front-ends: a FUSE mount of `TreeView` plus overlay for zero-copy
   checkouts, and a WASM build of `veil-core` with `MemoryBackend`.
