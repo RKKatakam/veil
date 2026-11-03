@@ -491,8 +491,10 @@ impl Checker {
             }
             Load::Bad => return,
         };
+        // Envelope labels may carry a key generation (`team#<key-id>`); the
+        // entry's visibility names only the scope.
         let actual_scope = match &obj {
-            Object::Sealed(env) => Some(env.scope.clone()),
+            Object::Sealed(env) => Some(crate::keychain::split_label(&env.scope).0.to_string()),
             _ => None,
         };
         if let Some(expected) = expected_scope {
