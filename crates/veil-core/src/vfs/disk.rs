@@ -10,9 +10,12 @@ use crate::{
     vpath::VPath,
 };
 
-/// Persistent storage rooted at a host directory. Writes are atomic
-/// (temp file + rename). Symlinks are not followed and are invisible to the
-/// engine in this MVP.
+/// Persistent storage rooted at a host directory. Writes are atomic and
+/// durable: temp file, fsync, rename, fsync of the directory. When `write`
+/// or `create_new` returns, the data survives a crash, so the order of
+/// writes is the order in which they become durable (the engine relies on
+/// this: objects, then the operation, then the operation head). Symlinks are
+/// not followed and are invisible to the engine in this MVP.
 #[derive(Debug, Clone)]
 pub struct DiskBackend {
     root: PathBuf,
@@ -58,6 +61,75 @@ fn is_exec(_m: &fs::Metadata) -> bool {
     false
 }
 
+fn temp_path(parent: &Path, path: &VPath) -> PathBuf {
+    parent.join(format!(
+        ".{}.vltmp{}",
+        path.file_name(),
+        hex::encode(crate::crypto::random_bytes::<4>())
+    ))
+}
+
+/// Create `path` with `data`, flushed to stable storage.
+fn write_synced(path: &Path, data: &[u8]) -> io::Result<()> {
+    let mut f = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    f.write_all(data)?;
+    f.sync_all()
+}
+
+fn create_exclusive(full: &Path, data: &[u8]) -> io::Result<bool> {
+    let mut f = match fs::OpenOptions::new().write(true).create_new(true).open(full) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if let Err(e) = f.write_all(data).and_then(|_| f.sync_all()) {
+        drop(f);
+        let _ = fs::remove_file(full);
+        return Err(e);
+    }
+    sync_dir(full.parent().expect("file has a parent"))?;
+    Ok(true)
+}
+
+/// Flush a directory's entries (new names, renames) to stable storage.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    match fs::File::open(dir).and_then(|d| d.sync_all()) {
+        // Some filesystems cannot fsync directories; nothing more can be done.
+        Err(e) if matches!(e.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported) => Ok(()),
+        r => r,
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// `create_dir_all` that also makes every newly created directory durable
+/// by syncing its parent.
+fn create_dir_all_durable(dir: &Path) -> io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    let mut missing = Vec::new();
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        if d.is_dir() {
+            break;
+        }
+        missing.push(d);
+        cur = d.parent();
+    }
+    fs::create_dir_all(dir)?;
+    for d in missing.iter().rev() {
+        if let Some(p) = d.parent() {
+            sync_dir(p)?;
+        }
+    }
+    Ok(())
+}
+
 impl StorageBackend for DiskBackend {
     fn kind(&self) -> &'static str {
         "disk"
@@ -74,22 +146,17 @@ impl StorageBackend for DiskBackend {
         }
         let full = self.full_path(path);
         let parent = full.parent().expect("non-root path has a parent");
-        fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
-        let tmp = parent.join(format!(
-            ".{}.vltmp{}",
-            path.file_name(),
-            hex::encode(crate::crypto::random_bytes::<4>())
-        ));
+        create_dir_all_durable(parent).map_err(|e| io_err(parent, e))?;
+        let tmp = temp_path(parent, path);
         let res = (|| {
-            let mut f = fs::File::create(&tmp)?;
-            f.write_all(data)?;
-            f.sync_data().ok();
-            drop(f);
+            write_synced(&tmp, data)?;
             #[cfg(unix)]
             if let Ok(old) = fs::metadata(&full) {
                 fs::set_permissions(&tmp, old.permissions())?;
             }
-            fs::rename(&tmp, &full)
+            fs::rename(&tmp, &full)?;
+            // The rename is only durable once the directory entry is.
+            sync_dir(parent)
         })();
         if let Err(e) = res {
             let _ = fs::remove_file(&tmp);
@@ -98,18 +165,33 @@ impl StorageBackend for DiskBackend {
         Ok(())
     }
 
+    /// Exclusive create that never exposes a partially written file: the
+    /// content is written and synced to a temp file, which is then
+    /// hard-linked into place (`link` fails if the target exists). Readers,
+    /// such as lock contenders, therefore always see the complete content.
     fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool> {
-        let full = self.full_path(path);
-        if let Some(parent) = full.parent() {
-            fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
+        if path.is_root() {
+            return Err(VeilError::InvalidPath("cannot write to the root".into()));
         }
-        match fs::OpenOptions::new().write(true).create_new(true).open(&full) {
-            Ok(mut f) => {
-                f.write_all(data).map_err(|e| io_err(&full, e))?;
+        let full = self.full_path(path);
+        let parent = full.parent().expect("non-root path has a parent");
+        create_dir_all_durable(parent).map_err(|e| io_err(parent, e))?;
+        let tmp = temp_path(parent, path);
+        if let Err(e) = write_synced(&tmp, data) {
+            let _ = fs::remove_file(&tmp);
+            return Err(io_err(&full, e));
+        }
+        let linked = fs::hard_link(&tmp, &full);
+        let _ = fs::remove_file(&tmp);
+        match linked {
+            Ok(()) => {
+                sync_dir(parent).map_err(|e| io_err(&full, e))?;
                 Ok(true)
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-            Err(e) => Err(io_err(&full, e)),
+            // Filesystems without hard links: fall back to O_EXCL. A crash
+            // here can leave a short file, which the lock treats as garbage.
+            Err(_) => create_exclusive(&full, data).map_err(|e| io_err(&full, e)),
         }
     }
 

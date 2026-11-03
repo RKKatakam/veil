@@ -272,6 +272,8 @@ impl<'r> Transaction<'r> {
             view: self.view.clone(),
         };
         let id = self.repo.ops.put(&op)?;
+        // Fencing: never move the head unless we still hold the lock.
+        self._lock.ensure_held()?;
         self.repo.ops.set_head(&id)?;
         self.repo.op_id = id;
         self.repo.view = std::mem::take(&mut self.view);

@@ -31,8 +31,8 @@ pub enum VeilError {
     Revset(String),
     #[error("{0}")]
     Repo(String),
-    #[error("repository is locked by another process (remove .veil/lock if stale)")]
-    Locked,
+    #[error("repository is locked: {0}")]
+    Locked(String),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }

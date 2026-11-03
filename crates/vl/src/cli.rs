@@ -72,6 +72,13 @@ pub enum Cmd {
         #[arg(short, long, default_value = "@")]
         rev: String,
     },
+    /// Verify repository integrity: object hashes, reachability, key rings,
+    /// embargo records and the operation log. Exits 1 on corruption.
+    Fsck {
+        /// Also list redacted (expected) objects and notes one by one.
+        #[arg(short, long)]
+        verbose: bool,
+    },
     /// Show how a change evolved (amends, rewrites, rebases).
     Evolog {
         #[arg(short, long, default_value = "@")]
