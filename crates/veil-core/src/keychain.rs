@@ -185,7 +185,8 @@ struct ChangeBody<'a> {
 }
 
 impl RingChange {
-    fn body(&self, scope: &str) -> Vec<u8> {
+    /// The exact bytes that are signed (context `ring-change`).
+    pub fn signing_body(&self, scope: &str) -> Vec<u8> {
         serde_json::to_vec(&ChangeBody {
             scope,
             seq: self.seq,
@@ -201,13 +202,13 @@ impl RingChange {
     /// Chain hash of this change (covers the signature too).
     pub fn hash(&self, scope: &str) -> String {
         let mut h = blake3::Hasher::new_derive_key("veil 2026 ring-change v1");
-        h.update(&self.body(scope));
+        h.update(&self.signing_body(scope));
         h.update(self.signature.as_bytes());
         h.finalize().to_hex()[..32].to_string()
     }
 
     fn signature_valid(&self, scope: &str) -> bool {
-        crate::identity::verify_signature(&self.signing_key, RING_SIG_CONTEXT, &self.body(scope), &self.signature)
+        crate::identity::verify_signature(&self.signing_key, RING_SIG_CONTEXT, &self.signing_body(scope), &self.signature)
     }
 }
 
@@ -287,7 +288,7 @@ fn check_rotation(state: &RingState, r: &Rotation, members: &BTreeSet<&String>) 
             r.generation, state.generation
         ));
     }
-    if state.generations.iter().any(|k| *k == r.key_id) {
+    if state.generations.contains(&r.key_id) {
         return Err(format!("rotation reuses key id {}", r.key_id));
     }
     let wrapped: BTreeSet<&String> = r.wrapped.keys().collect();
@@ -838,7 +839,7 @@ impl Keychain {
             op,
             signature: String::new(),
         };
-        c.signature = me.sign(RING_SIG_CONTEXT, &c.body(&ring.scope));
+        c.signature = me.sign(RING_SIG_CONTEXT, &c.signing_body(&ring.scope));
         Ok(c)
     }
 
@@ -1315,7 +1316,9 @@ impl Keychain {
             local.signature = incoming.signature.clone();
             changed = true;
         }
-        if !local.is_released() && incoming.is_released() {
+        // A local release that does not match the key fingerprint (e.g. one
+        // planted on a remote) is replaced by a consistent one.
+        if (!local.is_released() || !local.release_consistent()) && incoming.is_released() {
             local.released_key = incoming.released_key.clone();
             local.released_at = incoming.released_at;
             local.release_signature = incoming.release_signature.clone();

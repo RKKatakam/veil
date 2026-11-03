@@ -176,8 +176,8 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Embargo(c) => cmd_embargo(ctx, c)?,
         Cmd::Tag(c) => cmd_tag(ctx, c)?,
         Cmd::Cloak { patterns, scope } => {
-            if !ctx.repo.keys().has(scope) {
-                bail!("you hold no key for scope '{scope}' (create it with `vl scope create {scope}`)");
+            if !ctx.repo.keys().is_member(scope) {
+                bail!("you hold no current key for scope '{scope}' (create it with `vl scope create {scope}`)");
             }
             cmd_policy_rules(ctx, patterns, Tier::Cloaked(scope.clone()), false)?
         }
@@ -315,7 +315,7 @@ fn cmd_clone(source: &Path, dest: Option<&Path>) -> Result<ExitCode> {
             "  {} {} cloaked file(s) you hold no key for. Share your public key ({}) with a member\n  and ask them to run `vl scope grant team <key>` and push.",
             yellow("note:"),
             co.redacted.len(),
-            identity.public_hex()
+            identity.public_id()
         );
     }
     Ok(ExitCode::SUCCESS)
@@ -326,7 +326,9 @@ fn cmd_identity(c: &IdentityCmd) -> Result<ExitCode> {
         IdentityCmd::Show => {
             let id = load_identity()?;
             println!("name        {}", id.name);
-            println!("public key  {}", id.public_hex());
+            println!("public key  {}", id.public_id());
+            println!("member id   {}", id.public_hex());
+            println!("signing key {}", id.verifying_hex());
             println!("stored at   {}", ctx::identity_path().display());
         }
         IdentityCmd::New { name, force } => {
@@ -335,7 +337,7 @@ fn cmd_identity(c: &IdentityCmd) -> Result<ExitCode> {
             }
             let id = Identity::generate(&name.clone().unwrap_or_else(ctx::default_user_name));
             ctx::write_identity(&id)?;
-            println!("Created identity {} {}", id.name, id.public_hex());
+            println!("Created identity {} {}", id.name, id.public_id());
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -395,6 +397,9 @@ fn cmd_show(ctx: &mut Ctx, rev: &str, stat: bool) -> Result<()> {
     println!("Change ID : {}", bold(&magenta(&s.change_id.display())));
     println!("Snapshot  : {}", blue(&id.hex()));
     println!("Author    : {} at {}", s.author, fmt_time(s.timestamp));
+    if id != ctx.repo.root_id() {
+        println!("Signature : {}", signature_detail(&ctx.repo.keys().snapshot_status(&s), &s));
+    }
     if s.parents.len() > 1 {
         for p in &s.parents {
             println!("Parent    : {}", one_line(&ctx.repo, p));
@@ -789,32 +794,114 @@ fn cmd_run(ctx: &mut Ctx, command: &[String]) -> Result<ExitCode> {
 }
 
 fn cmd_scope(ctx: &mut Ctx, c: &ScopeCmd) -> Result<()> {
+    use veil_core::keychain::Role;
     let keys = ctx.repo.keys();
     match c {
         ScopeCmd::List => {
             let me = keys.identity().map(|i| i.public_hex()).unwrap_or_default();
             for ring in keys.rings()? {
-                let status = if keys.has(&ring.scope) { green("member") } else { dim("no access") };
-                println!("{}  {status}", bold(&ring.scope));
-                for (pk, m) in &ring.members {
+                let state = match ring.verify() {
+                    Ok(st) => st,
+                    Err(e) => {
+                        println!("{}  {}", bold(&ring.scope), red(&format!("INVALID key ring ({e}); no access")));
+                        continue;
+                    }
+                };
+                let access = if keys.is_member(&ring.scope) {
+                    match state.members.get(&me).map(|m| m.role) {
+                        Some(Role::Admin) => green("admin"),
+                        _ => green("member"),
+                    }
+                } else if keys.has(&ring.scope) {
+                    yellow("revoked (history only)")
+                } else {
+                    dim("no access")
+                };
+                let kind = if state.legacy {
+                    yellow("unsigned legacy ring")
+                } else {
+                    dim(&format!("generation {}, {} changes", state.generation, state.len))
+                };
+                println!("{}  {access}  {kind}", bold(&ring.scope));
+                for (pk, m) in &state.members {
                     let you = if *pk == me { cyan(" (you)") } else { String::new() };
-                    println!("    {:<12} {}{you}", m.name, dim(pk));
+                    let role = if m.role == Role::Admin { "admin " } else { "member" };
+                    let unsigned = if m.signing_key.is_none() && !state.legacy {
+                        yellow(" (no signing key)")
+                    } else {
+                        String::new()
+                    };
+                    println!("    {:<12} {role} {}{unsigned}{you}", m.name, dim(pk));
                 }
             }
         }
         ScopeCmd::Create { name } => {
             keys.create_scope(name)?;
-            println!("Created scope {name}");
+            println!("Created scope {name} (you are its admin)");
         }
-        ScopeCmd::Grant { scope, public_key, name } => {
-            keys.grant(scope, public_key, name)?;
+        ScopeCmd::Grant {
+            scope,
+            public_key,
+            name,
+            admin,
+        } => {
+            let role = if *admin { Role::Admin } else { Role::Member };
+            keys.grant_role(scope, public_key, name, role)?;
             println!("Granted scope {scope} to {name}; push to share the updated key ring");
+            if veil_core::identity::parse_public_identity(public_key)?.ed25519.is_none() {
+                warn("that is a short public key without a signing key: their signatures will show as unknown.\n  Ask them for the full key from `vl identity show` and grant again.");
+            }
         }
         ScopeCmd::Revoke { scope, public_key } => {
             if keys.revoke(scope, public_key)? {
-                println!("Revoked. Note: content they already decrypted cannot be recalled; rotate secrets.");
+                let generation = keys.ring_state(scope)?.and_then(|r| r.ok()).map(|s| s.generation).unwrap_or(0);
+                println!(
+                    "Revoked. Scope {scope} rotated to key generation {generation}: new content is sealed with a key\n\
+                     the revoked identity never receives. Content they already decrypted cannot be recalled; rotate secrets.\n\
+                     Push to share the updated key ring."
+                );
             } else {
                 bail!("that key is not a member of '{scope}'");
+            }
+        }
+        ScopeCmd::Rotate { scope } => {
+            let g = keys.rotate(scope)?;
+            println!("Scope {scope} rotated to key generation {g}; push to share the updated key ring");
+        }
+        ScopeCmd::Log { scope } => {
+            let ring = keys
+                .load_ring(scope)?
+                .ok_or_else(|| anyhow!("no scope named '{scope}'"))?;
+            if ring.is_legacy() {
+                println!("{}", yellow("unsigned legacy ring: no membership log (an admin change upgrades it)"));
+                return Ok(());
+            }
+            if let Err(e) = ring.verify() {
+                warn(&format!("this ring does not verify: {e}"));
+            }
+            let mut names: std::collections::BTreeMap<String, String> = Default::default();
+            for c in &ring.log {
+                match &c.op {
+                    veil_core::keychain::RingOp::Genesis { members, .. } => {
+                        names.extend(members.iter().map(|m| (m.id.clone(), m.name.clone())))
+                    }
+                    veil_core::keychain::RingOp::Grant { member } => {
+                        names.insert(member.id.clone(), member.name.clone());
+                    }
+                    _ => {}
+                }
+            }
+            for c in &ring.log {
+                let who = names.get(&c.signer).cloned().unwrap_or_else(|| c.signer[..17].to_string());
+                let what = match &c.op {
+                    veil_core::keychain::RingOp::Revoke { member, rotation } => format!(
+                        "revoke {} → generation {}",
+                        names.get(member).cloned().unwrap_or_else(|| member.clone()),
+                        rotation.generation
+                    ),
+                    op => op.summary(),
+                };
+                println!("#{:<3} {} {} {what}", c.seq, dim(&fmt_time(c.timestamp)), yellow(&who));
             }
         }
     }

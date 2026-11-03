@@ -243,6 +243,8 @@ impl Snapshot {
     }
 }
 
+// Snapshots are decoded transiently; boxing them is not worth the churn.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Object {
     Blob(Vec<u8>),

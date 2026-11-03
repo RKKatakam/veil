@@ -7,7 +7,8 @@ use std::{
 use anyhow::Result;
 use veil_core::{
     builder::BuildReport,
-    object::{EntryKind, Visibility},
+    keychain::SignatureStatus,
+    object::{EntryKind, Snapshot, Visibility},
     secrets::looks_binary,
     tree::{diff_trees, TreeChange},
     ObjectId, Repo, VPath,
@@ -122,8 +123,37 @@ pub fn print_build_warnings(r: &BuildReport) {
 
 // ---- log -----------------------------------------------------------------
 
+/// Compact signature marker for `vl log`.
+pub fn signature_marker(status: &SignatureStatus, author: &str) -> String {
+    match status {
+        SignatureStatus::Good { name, .. } if name == author => green("✓"),
+        SignatureStatus::Good { name, .. } => green(&format!("✓{name}")),
+        SignatureStatus::Unknown { .. } => yellow("?signer"),
+        SignatureStatus::Bad => red("✗bad-signature"),
+        SignatureStatus::Unsigned => dim("unsigned"),
+    }
+}
+
+/// One-line signature description for `vl show`.
+pub fn signature_detail(status: &SignatureStatus, s: &Snapshot) -> String {
+    let key = s.signature.as_ref().map(|g| dim(&format!(" (key {})", &g.key[..16]))).unwrap_or_default();
+    match status {
+        SignatureStatus::Good { name, .. } if *name == s.author => format!("{}{key}", green(&format!("good, signed by {name}"))),
+        SignatureStatus::Good { name, .. } => format!(
+            "{}{key}",
+            green(&format!("good, signed by {name} (rewritten; author {})", s.author))
+        ),
+        SignatureStatus::Unknown { .. } => {
+            format!("{}{key}", yellow("valid, but by a key no key ring knows (signer unverified)"))
+        }
+        SignatureStatus::Bad => red("BAD: the signature does not match this snapshot"),
+        SignatureStatus::Unsigned => dim("unsigned"),
+    }
+}
+
 pub fn print_log(repo: &Repo, ws: &str, limit: Option<usize>) -> Result<()> {
     let ids = repo.visible_snapshots()?;
+    let signers = repo.keys().known_signers();
     let mut tags: HashMap<ObjectId, Vec<String>> = HashMap::new();
     for (name, t) in &repo.view().tags {
         let label = match &t.cloak {
@@ -192,6 +222,7 @@ pub fn print_log(repo: &Repo, ws: &str, limit: Option<usize>) -> Result<()> {
         let mut header = vec![bold(&magenta(&s.change_id.short()))];
         if *id != root {
             header.push(yellow(&s.author));
+            header.push(signature_marker(&repo.keys().snapshot_status_with(&s, &signers), &s.author));
             header.push(dim(&fmt_time(s.timestamp)));
         }
         if let Some(w) = wss.get(id) {
