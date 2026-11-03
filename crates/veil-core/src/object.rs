@@ -16,7 +16,11 @@ use crate::{
     crypto::Envelope,
     error::{Result, VeilError},
     id::{ChangeId, ObjectId},
+    identity::{Identity, Signature},
 };
+
+/// Signature context for snapshots (see [`Snapshot::sign`]).
+pub const SNAPSHOT_SIG_CONTEXT: &str = "snapshot";
 
 const BLOB_TAG: &[u8] = b"veil:blob\n";
 const TREE_TAG: &[u8] = b"veil:tree\n";
@@ -183,6 +187,14 @@ pub struct Snapshot {
     /// Embargo introduced by this (merge) snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embargo: Option<String>,
+    /// Ed25519 signature of whoever *produced this exact snapshot* (the
+    /// signer), over [`Snapshot::unsigned_id`]. The signer may differ from
+    /// `author`: an automatic rebase of Alice's change by Bob yields a
+    /// snapshot signed by Bob whose `predecessors` names Alice's original.
+    /// Because the signature is part of the encoding, the snapshot id
+    /// commits to it: stripping or swapping a signature changes the id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
 }
 
 impl Snapshot {
@@ -200,10 +212,39 @@ impl Snapshot {
             conflicts: vec![],
             cloak: None,
             embargo: None,
+            signature: None,
         }
+    }
+
+    /// Id this snapshot would have without its signature. This is the value
+    /// that is signed, so a signature commits to every other field (parents,
+    /// tree, change id, author, description, ...).
+    pub fn unsigned_id(&self) -> ObjectId {
+        if self.signature.is_none() {
+            return ObjectId::hash(&Object::Snapshot(self.clone()).encode());
+        }
+        let mut s = self.clone();
+        s.signature = None;
+        ObjectId::hash(&Object::Snapshot(s).encode())
+    }
+
+    /// Replace any existing signature with one by `identity`.
+    pub fn sign(&mut self, identity: &Identity) {
+        self.signature = None;
+        let id = self.unsigned_id();
+        self.signature = Some(Signature::create(identity, SNAPSHOT_SIG_CONTEXT, &id.0));
+    }
+
+    /// `None` if unsigned, otherwise whether the signature is
+    /// cryptographically valid (says nothing about who the key belongs to).
+    pub fn signature_valid(&self) -> Option<bool> {
+        let sig = self.signature.as_ref()?;
+        Some(sig.verify(SNAPSHOT_SIG_CONTEXT, &self.unsigned_id().0))
     }
 }
 
+// Snapshots are decoded transiently; boxing them is not worth the churn.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Object {
     Blob(Vec<u8>),

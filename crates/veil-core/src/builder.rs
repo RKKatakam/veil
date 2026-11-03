@@ -264,6 +264,22 @@ impl Builder<'_> {
             }
         }
 
+        // Unchanged cloaked content keeps its sealing (and key generation),
+        // so a key rotation does not show every cloaked file as modified.
+        if let Some(pe) = parent_file {
+            if !desired.is_public()
+                && pe.visibility == desired
+                && pe.fallback == fallback
+                && pe.executable == executable
+                && self.store.matches_encoding(&pe.id, &data)?
+            {
+                return Ok(Some(TreeEntry {
+                    name: name.to_string(),
+                    ..pe.clone()
+                }));
+            }
+        }
+
         let id = match self.store.store_file(&data, &desired) {
             Ok(id) => id,
             Err(VeilError::Redacted { scope }) => {

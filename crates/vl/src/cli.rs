@@ -314,15 +314,23 @@ pub enum ScopeCmd {
     List,
     /// Create a scope with you as the only member.
     Create { name: String },
-    /// Give an identity access to a scope.
+    /// Give an identity access to a scope (admins only). Use the full public
+    /// key from `vl identity show` so the member's signatures are recognised.
     Grant {
         scope: String,
         public_key: String,
         #[arg(long, default_value = "member")]
         name: String,
+        /// Make the member an admin (may grant, revoke and rotate).
+        #[arg(long)]
+        admin: bool,
     },
-    /// Remove an identity from a scope.
+    /// Remove an identity from a scope and rotate its key (admins only).
     Revoke { scope: String, public_key: String },
+    /// Start a new key generation for the current members (admins only).
+    Rotate { scope: String },
+    /// Show the signed membership log of a scope.
+    Log { scope: String },
 }
 
 #[derive(Subcommand, Debug)]

@@ -9,6 +9,11 @@
 //! object id (dedup, cheap no-op snapshots), while anyone without the scope
 //! key learns nothing except equality of identical plaintexts under the same
 //! scope — the same trade-off made by convergent-encryption backup systems.
+//!
+//! The envelope's `scope` field is a *label*: `<scope>` (generation 0, the
+//! only form written before key rotation existed) or `<scope>#<key-id>` for a
+//! specific key generation (see `keychain`). It is authenticated as AAD, so
+//! the binary format is unchanged and old envelopes still open.
 
 use std::fmt;
 
@@ -60,7 +65,7 @@ impl Envelope {
     /// derived from the plaintext (see module docs); otherwise it is random.
     pub fn seal(key: &Key, scope: &str, plaintext: &[u8], deterministic: bool) -> Result<Envelope> {
         let nonce: [u8; 24] = if deterministic {
-            let nonce_key = blake3::derive_key("veil 2026 siv-nonce v1", key);
+            let nonce_key = zeroize::Zeroizing::new(blake3::derive_key("veil 2026 siv-nonce v1", key));
             let mut h = blake3::Hasher::new_keyed(&nonce_key);
             h.update(scope.as_bytes());
             h.update(&[0]);

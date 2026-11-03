@@ -137,10 +137,12 @@ impl ObjectStore {
         self.put(&Object::Snapshot(s.clone()))
     }
 
-    /// Seal `inner` under `scope` (deterministically, for dedup).
+    /// Seal `inner` under `scope` (deterministically, for dedup). A bare
+    /// scope name seals under its current key generation (`scope#key-id`);
+    /// a label that already names a generation is used as is.
     pub fn seal(&self, inner: &Object, scope: &str) -> Result<Object> {
-        let key = self.keys.require(scope)?;
-        Ok(Object::Sealed(Envelope::seal(&key, scope, &inner.encode(), true)?))
+        let (label, key) = self.keys.sealing_key(scope)?;
+        Ok(Object::Sealed(Envelope::seal(&key, &label, &inner.encode(), true)?))
     }
 
     /// Store file content with the given visibility, returning its id.
@@ -201,8 +203,10 @@ impl ObjectStore {
             return Ok(Object::blob_id(data) == *reference);
         }
         match Object::sealed_scope(&raw) {
-            Some(scope) if self.keys.has(&scope) => {
-                let sealed = self.seal(&Object::Blob(data.to_vec()), &scope)?;
+            Some(label) if self.keys.has(&label) => {
+                // Re-seal under the reference's exact label (generation).
+                let key = self.keys.require(&label)?;
+                let sealed = Object::Sealed(Envelope::seal(&key, &label, &Object::Blob(data.to_vec()).encode(), true)?);
                 Ok(ObjectId::hash(&sealed.encode()) == *reference)
             }
             _ => Ok(false),
@@ -213,8 +217,8 @@ impl ObjectStore {
         match cloak {
             None => Ok(Text::Plain(text.to_string())),
             Some(scope) => {
-                let key = self.keys.require(scope)?;
-                Ok(Text::Sealed(Envelope::seal(&key, scope, text.as_bytes(), false)?))
+                let (label, key) = self.keys.sealing_key(scope)?;
+                Ok(Text::Sealed(Envelope::seal(&key, &label, text.as_bytes(), false)?))
             }
         }
     }

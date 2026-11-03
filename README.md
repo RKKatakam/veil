@@ -52,7 +52,8 @@ vl secret import .env && vl run -- ./server      # encrypted device-local vault 
 
 # Cloaking: encrypted for a scope, inside the same repository.
 vl cloak secrets/ --scope team
-vl scope grant team veil1<bob's public key> --name bob
+vl scope grant team veil1<bob's public key> --name bob   # from bob's `vl identity show`
+vl scope revoke team veil1<…>   # rotates the key: new content is unreadable to them
 vl remote add origin ../team-remote
 vl remote add mirror ../public-mirror --public
 vl push origin        # team members receive ciphertext + key rings
@@ -90,7 +91,8 @@ History      new [revs…] [-m] · commit -m · describe [-r rev] -m · edit <re
 Visibility   cloak <pat…> [--scope S] · isolate <pat…> · expose <pat…> [--force] · ignore <pat…>
              policy show|check <paths…> · scan
 Secrets      secret set|get|list|rm|import · run -- <cmd…>
-Access       scope list|create <S>|grant <S> <pubkey> [--name]|revoke <S> <pubkey>
+Access       scope list|create <S>|grant <S> <pubkey> [--name] [--admin]|revoke <S> <pubkey>
+             scope rotate <S> · scope log <S>
 Workspaces   ws list|new <name> [-r rev] [--cloak [S]]|switch <name>|rm <name>
              ws exec <name>|--ephemeral [-r rev] [-m] [--with-isolated] -- <cmd…>
              ws cat <name> <path> · ws write <name> <path> < stdin
@@ -124,8 +126,8 @@ crates/
   veil-core/   the engine library (no direct std::fs use outside DiskBackend)
     src/vfs/          StorageBackend + Disk / Memory / Overlay backends
     src/crypto.rs     VeilEnvelope (XChaCha20-Poly1305, SIV-style nonces)
-    src/identity.rs   X25519 identities, key wrapping
-    src/keychain.rs   scope key rings, embargo records, the `local` scope
+    src/identity.rs   X25519 + Ed25519 identities, key wrapping, signatures
+    src/keychain.rs   signed key-ring logs, key generations, embargo records, `local`
     src/object.rs     Blob / Tree / Snapshot / Sealed objects
     src/store.rs      BLAKE3 CAS with transparent decryption
     src/policy.rs     visibility tiers   src/secrets.rs  secret scanner
@@ -163,4 +165,4 @@ This is an MVP of the architecture: the full engine and CLI work end-to-end
 and are covered by tests (`cargo test`). See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#limitations-and-roadmap) for
 known limitations and what comes next (network transport, stat cache, sealed
-tree names, key rotation, FUSE/WASM front-ends).
+tree names, FUSE/WASM front-ends).

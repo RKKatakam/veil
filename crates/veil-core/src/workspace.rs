@@ -181,6 +181,7 @@ impl Repo {
             conflicts: vec![],
             cloak: parent.cloak.clone(),
             embargo: None,
+            signature: None, // signed by the transaction
         };
         let id = tx.write_snapshot(&snap)?;
         tx.set_description(format!("record ephemeral workspace as {}", snap.change_id.short()));
