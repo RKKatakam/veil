@@ -114,13 +114,13 @@ impl Repo {
             repo_id: hex::encode(random_bytes::<16>()),
             remotes: BTreeMap::new(),
         };
-        backend.write(&config_path(), &serde_json::to_vec_pretty(&config)?)?;
         let has_identity = identity.is_some();
         let keys = Arc::new(Keychain::new(backend.clone(), identity, config.repo_id.clone()));
         let store = Arc::new(ObjectStore::new(backend.clone(), VPath::new(".veil/objects")?, keys.clone()));
         let empty = store.empty_tree()?;
         let root_id = store.put_snapshot(&Snapshot::root(empty))?;
-        if has_identity && default_scope {
+        // A crashed earlier `init` may have left the ring behind.
+        if has_identity && default_scope && keys.load_ring(DEFAULT_SCOPE)?.is_none() {
             keys.create_scope(DEFAULT_SCOPE)?;
         }
         let mut view = View::default();
@@ -152,6 +152,9 @@ impl Repo {
             view: view.clone(),
         })?;
         ops.set_head(&op_id)?;
+        // `repo.json` is what makes this a repository, so it is written last:
+        // a crash before this point leaves no half-initialised repository.
+        backend.write(&config_path(), &serde_json::to_vec_pretty(&config)?)?;
         Ok(Repo {
             backend,
             store,
