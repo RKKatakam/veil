@@ -368,3 +368,56 @@ fn a_pulled_snapshot_with_a_forged_change_id_does_not_make_the_change_divergent(
         veil_core::revset::resolve(&alice, &short, WS).err()
     );
 }
+
+/// The same root cause through the snapshot's `cloak` field: a hostile
+/// `main` whose snapshot says `cloak: "embargo/<released id>"`. Alice's
+/// `vl edit main` (to amend what looks like a teammate's change) makes it
+/// her working copy; every public file she then touches, and her commit
+/// message, is sealed under the embargo key, which is public.
+#[test]
+#[ignore = "BUG-103: a hostile tree entry's visibility label re-keys the victim's next edit of a cloaked file (to a released embargo key or an attacker's scope)"]
+fn a_hostile_cloak_field_cannot_seal_the_victims_work_under_a_public_key() {
+    let (mut alice, fs, _) = new_repo("alice");
+    let main = commit_files(&mut alice, &*fs, &[("README", "hi\n")], "v1");
+    alice.set_tag("main", main, None, false).unwrap();
+    let hub = Arc::new(MemoryBackend::new());
+    remote::push(&mut alice, hub.clone(), false, &[], false).unwrap();
+
+    let mut m = Repo::init_for_clone(Arc::new(MemoryBackend::new()), Some(Identity::generate("mallory")), "mallory").unwrap();
+    remote::pull(&mut m, "origin", hub.clone()).unwrap();
+    m.keys().create_scope("mal").unwrap();
+    let id = m.keys().create_embargo("mal", None, "").unwrap();
+    m.keys().release_embargo(&id).unwrap();
+    let tree = m.snapshot(&main).unwrap().tree;
+    let evil = m
+        .store()
+        .put_snapshot(&veil_core::Snapshot {
+            parents: vec![main],
+            change_id: veil_core::ChangeId::random(),
+            tree,
+            description: veil_core::object::Text::Plain("chore".into()),
+            author: "mallory".into(),
+            timestamp: 2,
+            predecessors: vec![],
+            conflicts: vec![],
+            cloak: Some(format!("embargo/{id}")),
+            signature: None,
+            embargo: None,
+        })
+        .unwrap();
+    m.set_tag("main", evil, None, true).unwrap();
+    remote::push(&mut m, hub.clone(), false, &["main".into()], false).unwrap();
+
+    remote::pull(&mut alice, "origin", hub).unwrap();
+    let new_main = alice.view().tags["main"].target;
+    alice.edit(WS, new_main).unwrap();
+    fs.write(&p("notes.md"), b"private roadmap\n").unwrap();
+    snap(&mut alice, &*fs);
+    let c = alice.commit_working_copy(WS, "roadmap").unwrap().0;
+    let e = file_entry(&alice, &c, "notes.md").expect("recorded");
+    let scope = e.visibility.key_scope().unwrap_or_default();
+    assert!(
+        !scope.starts_with("embargo/"),
+        "Alice's new file was sealed under the public key {scope}"
+    );
+}

@@ -547,3 +547,44 @@ fn an_interrupted_workspace_switch_does_not_corrupt_the_old_workspace() {
         text(&switch).trim()
     );
 }
+
+// ---- `vl scan` in CI ---------------------------------------------------------------
+
+/// Control: the guide's CI recipe (`vl init` in a Git checkout, then
+/// `vl --no-snapshot scan`) fails the job on a leaked key.
+#[test]
+fn the_ci_scan_recipe_fails_on_a_leaked_key() {
+    let env = Env::new();
+    let co = env.dir("checkout");
+    write(&co, "README.md", "# project\n");
+    write(&co, "leak.js", "const k = \"AKIAIOSFODNN7EXAMPLE\";\n");
+    env.ok("ci", &co, &["init"]);
+    let out = env.vl("ci", &co, &["--no-snapshot", "scan"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+}
+
+/// The guide sells `vl scan` as the CI gate ("In a GitHub Actions step
+/// this fails the job on a hit"), and `vl init` keeps the `.veilpolicy`
+/// that is checked out. `vl scan` honours that policy's `public!` (and
+/// `ignore`) rules, so the same pull request that adds the leaked key can
+/// add `leak.js public!` (or `** public!`) next to it, and the gate
+/// reports `ok: no secrets in public files`. A CI scan whose rules come
+/// from the artefact it scans is not a gate; `vl scan` has no option to
+/// ignore `public!` or to require the policy from a trusted ref.
+#[test]
+#[ignore = "BUG-115: the CI recipe `vl init && vl --no-snapshot scan` is switched off by a `public!` rule in the scanned checkout's .veilpolicy"]
+fn the_ci_scan_recipe_cannot_be_switched_off_by_the_scanned_policy() {
+    let env = Env::new();
+    let co = env.dir("checkout");
+    write(&co, "README.md", "# project\n");
+    write(&co, "leak.js", "const k = \"AKIAIOSFODNN7EXAMPLE\";\n");
+    write(&co, ".veilpolicy", "leak.js public!\n");
+    env.ok("ci", &co, &["init"]);
+    let out = env.vl("ci", &co, &["--no-snapshot", "scan"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the scan passed with a leaked key, because the checkout's own policy says so:\n{}",
+        text(&out)
+    );
+}
