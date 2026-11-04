@@ -128,7 +128,6 @@ impl StorageBackend for FsyncModel {
 /// the retried barrier has nothing left to sync. After a power loss the
 /// acknowledged snapshot must still be readable.
 #[test]
-#[ignore = "BUG-044: after a failed fsync barrier, a retried command reuses objects that never became durable"]
 fn a_retried_command_after_an_fsync_failure_loses_no_acknowledged_data() {
     let backend = Arc::new(FsyncModel::default());
     let mut repo = Repo::init(backend.clone(), Some(Identity::generate("alice")), "alice").unwrap();
@@ -239,7 +238,6 @@ fn a_dead_holders_lock_is_taken_over_at_once() {
 /// lock file by hand.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "BUG-052: a dead holder's lock whose pid was reused blocks the repository indefinitely"]
 fn a_reused_pid_does_not_keep_a_dead_holders_lock() {
     let acquired = now_ms() - 120_000;
     let mut unrelated = std::process::Command::new("sleep").arg("30").spawn().unwrap();
@@ -360,7 +358,6 @@ impl StorageBackend for Hooked {
 /// transaction at the same time.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "BUG-049: clearing a dead contender's takeover guard can delete a live one; two processes both acquire the lock"]
 fn two_contenders_never_both_take_over_a_dead_lock() {
     let backend = Arc::new(Hooked {
         inner: MemoryBackend::new(),

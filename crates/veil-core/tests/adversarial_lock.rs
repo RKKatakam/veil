@@ -26,6 +26,12 @@ const LOCK: &str = ".veil/lock";
 /// minutes ago, held by another process on this machine that is still
 /// running (a live child). B, a separate handle in its own thread, must
 /// wait rather than steal, and both operations must be recorded.
+///
+/// Adapted again for BUG-052 (pid reuse): the planted lock records the
+/// child's start time, as every current lock does for its holder. Without
+/// it, a lock "acquired" two minutes before its pid's process started is
+/// exactly what a dead holder's lock with a reused pid looks like, and is
+/// taken over (`adversarial2_durability::a_reused_pid_does_not_keep_a_dead_holders_lock`).
 #[test]
 #[cfg(unix)]
 fn a_live_lock_holder_is_never_robbed() {
@@ -39,7 +45,10 @@ fn a_live_lock_holder_is_never_robbed() {
     info.pid = alive.id();
     info.acquired = now_millis() - 121_000;
     info.renewed = info.acquired;
-    fs.write(&p(LOCK), &serde_json::to_vec(&info).unwrap()).unwrap();
+    let mut planted = serde_json::to_value(&info).unwrap();
+    let start = veil_core::lock::process_start(alive.id()).expect("start time of a live child");
+    planted["pid_start"] = start.id.into();
+    fs.write(&p(LOCK), &serde_json::to_vec(&planted).unwrap()).unwrap();
 
     let b = std::thread::spawn({
         let fs = fs.clone();
@@ -95,17 +104,17 @@ fn a_tampered_lock_is_reclaimed_and_its_holder_cannot_commit() {
     let head = Repo::open(fs.clone(), None, "x").unwrap();
     assert!(head.view().tags.contains_key("from-b") && !head.view().tags.contains_key("from-a"));
 
-    // Legacy format, live holder on this machine: never robbed.
-    let mut alive = std::process::Command::new("sleep").arg("60").spawn().expect("spawn `sleep`");
-    let legacy = format!("{} {}", alive.id(), now_millis() - 600_000);
+    // Legacy format, live holder on this machine: never robbed. (A legacy
+    // lock records no start time, so the holder must be a process that was
+    // already running when the lock was taken: one started after it cannot
+    // be its holder, BUG-052. Init, pid 1, was running long before.)
+    let legacy = format!("1 {}", now_millis() - 600_000);
     fs.write(&p(LOCK), legacy.as_bytes()).unwrap();
     let quick = LockOptions {
         wait: Duration::from_millis(300),
         ..LockOptions::default()
     };
     let err = RepoLock::acquire_with(fs.clone(), &quick).unwrap_err();
-    let _ = alive.kill();
-    let _ = alive.wait();
     assert!(err.to_string().contains("still running"), "{err}");
     assert_eq!(fs.read(&p(LOCK)).unwrap(), legacy.as_bytes(), "lock untouched");
 }

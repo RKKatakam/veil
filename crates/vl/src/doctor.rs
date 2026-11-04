@@ -14,7 +14,7 @@ use std::{
 
 use anyhow::Result;
 use veil_core::{
-    lock::{assess, RepoLock, Verdict, STEAL_PATH},
+    lock::{assess, assess_raw, RepoLock, Verdict, LOCK_PATH, STEAL_PATH},
     now_millis,
     repo::{is_repo, RepoConfig, REPO_FORMAT_VERSION, VEIL_DIR},
     statcache::{cache_path, StatCache},
@@ -352,7 +352,14 @@ fn check_repo(r: &mut Report, fs: &std::sync::Arc<DiskBackend>, identity: Option
 fn check_lock(r: &mut Report, fs: &dyn StorageBackend) {
     match RepoLock::holder(fs) {
         Ok(None) => r.ok("not locked"),
-        Ok(Some(info)) => match assess(&info, now_millis()) {
+        // The raw file also tells a reused pid from its holder (pid_start).
+        Ok(Some(info)) => match fs
+            .read_opt(&VPath::new(LOCK_PATH).expect("valid path"))
+            .ok()
+            .flatten()
+            .and_then(|raw| assess_raw(&raw, now_millis()))
+            .unwrap_or_else(|| assess(&info, now_millis()))
+        {
             Verdict::Wait => r.note(
                 format!("locked by {}", info.describe()),
                 &["another vl command is running; it is waited for".into()],

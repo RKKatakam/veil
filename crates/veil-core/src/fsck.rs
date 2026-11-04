@@ -118,9 +118,46 @@ impl FsckReport {
 }
 
 /// Check the repository a `Repo` was opened on, with its identity's keys.
-/// Files modified this long before the crashed holder took its lock are
-/// still checked by [`recover_interrupted_writes`] (wall-clock adjustments).
+/// Files modified this long before the crashed holder took its lock, by
+/// its wall clock, are still checked by [`recover_interrupted_writes`]
+/// (wall-clock adjustments, and another host's clock).
 const RECOVERY_MARGIN_MS: i64 = 60 * 60 * 1000;
+
+/// The same for a window known on the backend's own stamp clock (only
+/// steps of that clock between the acquisition and the writes matter).
+const STAMP_MARGIN_MS: i64 = 5 * 60 * 1000;
+
+/// Which loose objects a crashed lock holder may have written unsynced:
+/// those modified since it took the lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryWindow {
+    /// When the holder took the lock, on the backend's stat clock (see
+    /// [`StorageBackend::stat_clock`]; the lock file's own stamp).
+    Stamp(i64),
+    /// When the holder took the lock, by its wall clock (ms since the
+    /// epoch). Used on backends with wall-clock stamps, with a generous
+    /// margin.
+    Wall(i64),
+    /// Unknown: every loose object.
+    All,
+}
+
+impl RecoveryWindow {
+    /// The stamp (on `backend`'s stat clock) before which a file cannot
+    /// have been written by the crashed holder; `None`: check every file.
+    fn cutoff(self, backend: &dyn StorageBackend) -> Option<i64> {
+        let clock = backend.stat_clock()?;
+        match self {
+            // A generation counter never steps back: no margin.
+            RecoveryWindow::Stamp(s) if clock.exact => Some(s),
+            RecoveryWindow::Stamp(s) => Some(s.saturating_sub(STAMP_MARGIN_MS.saturating_mul(1_000_000))),
+            RecoveryWindow::Wall(ms) if !clock.exact => {
+                Some(ms.saturating_sub(RECOVERY_MARGIN_MS).saturating_mul(1_000_000))
+            }
+            RecoveryWindow::Wall(_) | RecoveryWindow::All => None,
+        }
+    }
+}
 
 /// Clean up after a lock holder that died, run by the new holder under the
 /// lock before anything else touches the repository.
@@ -128,29 +165,31 @@ const RECOVERY_MARGIN_MS: i64 = 60 * 60 * 1000;
 /// Transactions write objects *unsynced* and make them durable with one
 /// barrier before writing the operation (see
 /// [`StorageBackend::write_unsynced`]). A holder that dies before its
-/// barrier can leave loose objects that
+/// barrier (or whose barrier failed) can leave loose objects that
 ///
 /// * are intact but not yet durable (the process died, the OS did not):
-///   they are rewritten and synced, because a later transaction may reuse
-///   them instead of writing its own copy; or
+///   they are rewritten (a new file, so a page the kernel marked clean
+///   after a failed write-back is not trusted) and synced, because a later
+///   transaction may reuse them instead of writing its own copy; or
 /// * are empty or truncated (the machine lost power): they are removed, so
 ///   that nobody mistakes them for the object they are named after.
 ///
 /// Neither kind can be referenced by an operation: the operation is only
-/// written after the barrier. On backends with wall-clock stamps only files
-/// modified since shortly before `since_ms` (when the dead holder took the
-/// lock) are read; otherwise, or when `since_ms` is unknown, every loose
-/// object is. Returns the number of objects removed.
-pub fn recover_interrupted_writes(backend: &dyn StorageBackend, since_ms: Option<i64>) -> Result<usize> {
+/// written after the barrier. Only files modified within `window` are read
+/// (fanout directories not modified since are skipped without listing
+/// them). The lock records the holder's acquisition on the backend's own
+/// stamp clock, so on disk this is the dead holder's writes plus five
+/// minutes; without a usable stamp, every loose object is read. Returns
+/// the number of objects removed.
+pub fn recover_interrupted_writes(backend: &dyn StorageBackend, window: RecoveryWindow) -> Result<usize> {
     let root = vpath(".veil/objects");
     if !backend.exists(&root)? {
         return Ok(0);
     }
-    let cutoff_ns = match (since_ms, backend.stat_clock()) {
-        (Some(ms), Some(clock)) if !clock.exact => {
-            Some(ms.saturating_sub(RECOVERY_MARGIN_MS).saturating_mul(1_000_000))
-        }
-        _ => None,
+    let cutoff = window.cutoff(backend);
+    let before = |m: &crate::vfs::Metadata, cut: i64| {
+        let old = |t: Option<i64>| t.is_some_and(|t| t < cut);
+        old(m.mtime) && (m.ctime.is_none() || old(m.ctime))
     };
     let mut removed = 0;
     for d in backend.list_dir(&root)? {
@@ -158,13 +197,19 @@ pub fn recover_interrupted_writes(backend: &dyn StorageBackend, since_ms: Option
             continue;
         }
         let dir = root.join(&d.name);
+        // Writing a loose object (temp file, rename) changes its
+        // directory: an older directory holds nothing to recover.
+        if let Some(cut) = cutoff {
+            if backend.metadata(&dir)?.is_some_and(|m| before(&m, cut)) {
+                continue;
+            }
+        }
         for f in backend.list_dir(&dir)? {
             let Some(id) = loose_id(&d.name, &f) else { continue };
             let path = dir.join(&f.name);
-            if let Some(cut) = cutoff_ns {
+            if let Some(cut) = cutoff {
                 let Some(m) = backend.metadata(&path)? else { continue };
-                let old = |t: Option<i64>| t.is_some_and(|t| t < cut);
-                if old(m.mtime) && (m.ctime.is_none() || old(m.ctime)) {
+                if before(&m, cut) {
                     continue;
                 }
             }

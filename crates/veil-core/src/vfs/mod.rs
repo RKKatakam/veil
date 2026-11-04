@@ -152,6 +152,12 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
     /// created for them. Barriers on one backend value are serialised, so a
     /// caller never returns while writes it depends on are still being
     /// synced by another thread's barrier.
+    ///
+    /// After a failure, the writes it covered must be treated as lost even
+    /// though they read back intact, and even if a later barrier succeeds:
+    /// on Linux a failed `fsync` marks the pages clean, so the retry has
+    /// nothing to write. Only a new copy (or removing the file) is safe.
+    /// [`crate::store::ObjectStore::sync_barrier`] does that for objects.
     fn sync_barrier(&self) -> Result<()> {
         Ok(())
     }

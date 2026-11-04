@@ -28,7 +28,7 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
-        Arc, RwLock,
+        Arc, Mutex, RwLock,
     },
     time::{Duration, Instant},
 };
@@ -108,6 +108,11 @@ pub struct ObjectStore {
     gc: GcHints,
     /// Open [`ObjectStore::begin_unsynced`] scopes (see there).
     unsynced: AtomicUsize,
+    /// Loose objects written unsynced since the last successful barrier.
+    not_durable: Mutex<Vec<ObjectId>>,
+    /// A failed barrier left objects behind that could not be removed (see
+    /// [`ObjectStore::sync_barrier`]).
+    needs_recovery: AtomicBool,
     /// Repository format: decides the tree encoding written and accepted.
     format: AtomicU32,
 }
@@ -149,6 +154,8 @@ impl ObjectStore {
                 freshened: RwLock::new(HashSet::new()),
             },
             unsynced: AtomicUsize::new(0),
+            not_durable: Mutex::new(Vec::new()),
+            needs_recovery: AtomicBool::new(false),
             format: AtomicU32::new(crate::repo::REPO_FORMAT),
         }
     }
@@ -206,13 +213,67 @@ impl ObjectStore {
     }
 
     /// Make every object written so far durable.
+    ///
+    /// If the barrier fails, the objects it covered are *void*: they still
+    /// read back intact (from the page cache), but may never reach the
+    /// disk, and no later barrier changes that. On Linux a failed `fsync`
+    /// marks the pages clean, so a retried one succeeds without writing
+    /// them ("fsyncgate"). Reusing such an object in a later, successful
+    /// transaction would lose acknowledged data at the next power loss
+    /// (BUG-044). Nothing references them yet (an operation is only written
+    /// after its barrier), so they are removed, and a retry writes fresh
+    /// copies. If they cannot be removed, [`ObjectStore::take_needs_recovery`]
+    /// reports it: the transaction then leaves the repository lock behind
+    /// for crash recovery, which rewrites them as new files.
     pub fn sync_barrier(&self) -> Result<()> {
-        self.backend.sync_barrier()
+        let covered = std::mem::take(&mut *self.not_durable_list());
+        match self.backend.sync_barrier() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Also whatever was written while the barrier ran: it may
+                // have been in the failed batch.
+                let mut void = covered;
+                void.extend(std::mem::take(&mut *self.not_durable_list()));
+                self.discard(&void);
+                Err(e)
+            }
+        }
+    }
+
+    fn not_durable_list(&self) -> std::sync::MutexGuard<'_, Vec<ObjectId>> {
+        self.not_durable.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Remove the loose objects of a failed barrier, durably.
+    fn discard(&self, void: &[ObjectId]) {
+        if void.is_empty() {
+            return;
+        }
+        let mut ok = true;
+        for id in void {
+            ok &= self.backend.remove_file(&self.loose_path(id)).is_ok();
+        }
+        // The removals must survive a power loss too, or a torn copy could
+        // reappear. (The backend still has the failed files queued; they are
+        // gone now, so this only syncs their directories.)
+        ok = ok && self.backend.sync_barrier().is_ok();
+        if !ok {
+            self.needs_recovery.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Whether a failed barrier left objects that could not be removed
+    /// (and clears the flag). The repository lock must then not be released
+    /// normally but left for recovery ([`crate::lock::RepoLock::abandon`]).
+    pub(crate) fn take_needs_recovery(&self) -> bool {
+        self.needs_recovery.swap(false, Ordering::SeqCst)
     }
 
     fn write_loose(&self, id: &ObjectId, raw: &[u8]) -> Result<()> {
         if self.unsynced.load(Ordering::SeqCst) > 0 {
-            self.backend.write_unsynced(&self.loose_path(id), raw)
+            self.backend.write_unsynced(&self.loose_path(id), raw)?;
+            self.not_durable_list().push(*id);
+            Ok(())
         } else {
             self.backend.write(&self.loose_path(id), raw)
         }
