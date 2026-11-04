@@ -22,6 +22,7 @@ trimmed where marked (`…`); some paths and host names were shortened
 | 10. [Scripting with `--json`](scripting.md) | An editor, CI job, agent or script needs `vl`'s output as data |
 | 11. [Embedding the engine](embedding.md) | You build on `veil-core` itself: in memory, in tests, or compiled to WebAssembly for a browser |
 | 12. [Editors and agents](editors-and-agents.md) | An editor or agent talks to Veil all the time and should keep one connection open (`vl serve --local`) |
+| 13. [Hooks](hooks.md) | You want checks before a commit or a push: your own hooks, or the ones a repository suggests in `.veilhooks` |
 
 The [command reference](../reference/README.md) lists every command and
 flag. It is generated from `vl` itself and cannot drift from it.

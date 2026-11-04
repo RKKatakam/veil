@@ -174,8 +174,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
         _ => {
             let mut ctx = open(&cli)?;
             refuse_bare(&ctx, runs_in_a_bare_repository(&cli.cmd))?;
+            let before = hooks::checkout_point(&ctx);
             let code = dispatch(&mut ctx, &cli)?;
             ctx.finish()?;
+            hooks::post_checkout(&ctx, &cli.cmd, before);
             Ok(code)
         }
     }
@@ -288,16 +290,20 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Bisect(c) => return history::bisect(ctx, c),
         // Shared with `vl serve --local` (`api`, write methods).
         Cmd::Describe { rev, message, hooks } => {
-            hooks::require_no_verify_unset(hooks)?;
-            let d = api::describe(ctx, rev, message)?;
+            // `pre-commit` and `commit-msg` run for a describe of `@`.
+            let message = match ctx.rev(rev)? == ctx.wc()? {
+                true => hooks::before_commit(ctx, hooks, message, !cli.no_snapshot, "describe")?,
+                false => message.clone(),
+            };
+            let d = api::describe(ctx, rev, &message)?;
             println!("Described {}", one_line(&ctx.repo, &d.id));
         }
         Cmd::New { revs, message } => {
             api::new_change(ctx, revs, message)?;
         }
         Cmd::Commit { message, no_advance, hooks } => {
-            hooks::require_no_verify_unset(hooks)?;
-            let c = api::commit(ctx, message, !*no_advance)?;
+            let message = hooks::before_commit(ctx, hooks, message, !cli.no_snapshot, "commit")?;
+            let c = api::commit(ctx, &message, !*no_advance)?;
             println!("Committed {}", one_line(&ctx.repo, &c.result.committed));
             print_tags_kept(&ctx.repo, &c.result);
         }
@@ -488,10 +494,9 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             force,
             dry_run: true,
             json,
-            hooks,
             ..
         } => {
-            hooks::require_no_verify_unset(hooks)?;
+            // A dry run sends nothing: no `pre-push` (`--no-verify` is moot).
             return cmd_push_dry_run(ctx, remote.as_deref(), tag, *force, *json);
         }
         Cmd::Push {
@@ -503,8 +508,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             hooks,
             ..
         } => {
-            hooks::require_no_verify_unset(hooks)?;
-            return cmd_push(ctx, remote.as_deref().unwrap_or("origin"), tag, *force, *full, delete);
+            return cmd_push(ctx, remote.as_deref().unwrap_or("origin"), tag, *force, *full, delete, hooks);
         }
         Cmd::Pull { remote, full } => cmd_pull(ctx, remote, *full)?,
         Cmd::Git(c) => return cmd_git(ctx, c),
@@ -2281,7 +2285,28 @@ fn cmd_remote(ctx: &mut Ctx, c: &RemoteCmd) -> Result<()> {
     Ok(())
 }
 
-fn cmd_push(ctx: &mut Ctx, name: &str, tags: &[String], force: bool, full: bool, delete: &[String]) -> Result<ExitCode> {
+fn cmd_push(
+    ctx: &mut Ctx,
+    name: &str,
+    tags: &[String],
+    force: bool,
+    full: bool,
+    delete: &[String],
+    verify: &hooks::NoVerifyArgs,
+) -> Result<ExitCode> {
+    // A remote that does not exist fails below, as before; nothing is
+    // connected to here unless a `pre-push` hook will run.
+    if let Some(cfg) = ctx.repo.config().remotes.get(name).cloned() {
+        let kind = if cfg.public { "public" } else { "team" };
+        hooks::before_push(ctx, verify, name, &cfg.url, kind, |ctx| {
+            if tags.is_empty() && !delete.is_empty() {
+                return Ok(hooks::delete_lines(&ctx.repo, name, delete, cfg.public, false));
+            }
+            let (backend, cfg) = remote_backend(ctx, name)?;
+            let plan = veil_core::push_plan::plan_push(&ctx.repo, backend, cfg.public, tags, force)?;
+            Ok(hooks::veil_push_lines(&ctx.repo, &plan, name, delete))
+        })?;
+    }
     if !delete.is_empty() {
         let (backend, _) = remote_backend(ctx, name)?;
         let d = remote::delete_remote_tags(&mut ctx.repo, name, backend, delete, force)?;
@@ -2494,7 +2519,8 @@ fn cmd_git(ctx: &mut Ctx, c: &GitCmd) -> Result<ExitCode> {
             if *force_tags || !delete_tag.is_empty() {
                 bail!("Git tags (`--force-tags`, `--delete-tag`) are not implemented yet");
             }
-            hooks::require_no_verify_unset(hooks)?;
+            let url = git::remotes(&ctx.repo)?.get(remote).cloned().unwrap_or_default();
+            hooks::before_push(ctx, hooks, remote, &url, "git", |ctx| hooks::git_push_lines(ctx, &git_dir, remote, tag, delete))?;
             let r = git::push_with_deletions(&mut ctx.repo, &git_dir, remote, tag, *force, delete)?;
             print_git_export(&r.export);
             let withheld: Vec<String> = r

@@ -27,7 +27,7 @@ Options:
 | `-d, --delete <TAG>` | Delete this tag on the remote (repeatable). Delete it here first with `vl tag delete`. Refused if someone moved it there since (unless --force). With no --tag, nothing else is pushed |
 | `--dry-run` | Show what would be sent, and send nothing |
 | `--json` | With --dry-run: print one JSON document (`veil.push.plan/1`; see docs/reference/json.md) instead of text. Errors then also print a `veil.error/1` document |
-| `--no-verify` | Do not run hooks for this command (not implemented yet) |
+| `--no-verify` | Do not run hooks for this command (device-local or `.veilhooks`) |
 
 ---
 

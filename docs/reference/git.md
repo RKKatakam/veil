@@ -151,7 +151,7 @@ Options:
 | `-d, --delete <BRANCH>` | Delete this branch on the Git remote (repeatable). Delete its tag here first with `vl tag delete`. Refused if the branch moved since the last fetch (unless --force). With no --tag, nothing else is pushed |
 | `--force-tags` | Replace Git tags that exist on the remote with another target (not implemented yet) |
 | `--delete-tag <TAG>` | Delete this Git tag (`refs/tags/TAG`) on the remote (repeatable; not implemented yet) |
-| `--no-verify` | Do not run hooks for this command (not implemented yet) |
+| `--no-verify` | Do not run hooks for this command (device-local or `.veilhooks`) |
 
 ## `vl git export`
 

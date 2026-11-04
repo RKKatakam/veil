@@ -124,9 +124,6 @@ fn new_commands_parse_their_documented_flags_and_refuse() {
         (&["am", "-"], "vl am"),
         (&["am", "series.mbox", "-d", "@", "--3way", "--keep-author", "--signoff"], "vl am"),
         (&["am", "patches/", "--author-as-me"], "vl am"),
-        // stream K: hooks
-        (&["hooks", "show"], "vl hooks"),
-        (&["hooks", "trust", "--yes", "--i-understand-indirect"], "vl hooks"),
         // stream G: submodules
         (&["submodule", "status"], "vl submodule"),
         (&["submodule", "status", "vendor/a"], "vl submodule"),
@@ -181,12 +178,6 @@ fn new_flags_on_existing_commands_refuse_only_when_given() {
         (&["diff", "--find-renames=30", "-C"], "-M -C"),
         (&["show", "@-", "-M"], "-M"),
         (&["show", "-C", "@-", "--json"], "-C"),
-        // stream K: --no-verify
-        (&["commit", "-m", "x", "--no-verify"], "--no-verify"),
-        (&["describe", "-m", "x", "--no-verify"], "--no-verify"),
-        (&["push", "--no-verify"], "--no-verify"),
-        (&["push", "--dry-run", "--no-verify"], "--no-verify"),
-        (&["git", "push", "--no-verify"], "--no-verify"),
         // stream G: annotated tags, Git tags
         (&["tag", "set", "v1", "-a"], "annotated tags"),
         (&["tag", "set", "v1", "-r", "@-", "-a", "-m", "release 1"], "annotated tags"),
