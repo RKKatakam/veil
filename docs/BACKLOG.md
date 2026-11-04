@@ -10,7 +10,6 @@ fixed**. Severity: high / medium / low.
 - **Copy-on-write file clones for project-directory checkouts** (`vl ws
   switch`, `vl edit`): `ws exec` sandboxes clone already
   (`StorageBackend::clone_known`); the project directory does not.
-- **Sparse sandboxes:** `vl ws exec --only src/ tests/`.
 - **Scale benchmark** at 1 GB and ~5 GB (init, status, commit, gc, push,
   clone, peak RAM), then fix what it exposes:
   - streaming / incremental `gc` (no whole-store pack in memory);

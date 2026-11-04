@@ -867,6 +867,11 @@ pub enum WsCmd {
     /// the next run. A second run in the same workspace waits for the first.
     /// With --ephemeral, a one-shot workspace on REV runs in a throwaway
     /// directory instead.
+    ///
+    /// With --only, the sandbox holds just the given files and directories
+    /// (and .veilpolicy): everything else is recorded exactly as the
+    /// workspace has it, and files the command writes elsewhere are not
+    /// recorded (a warning lists them) and are removed from the sandbox.
     Exec {
         /// Workspace to run in (or use --ephemeral).
         name: Option<String>,
@@ -882,6 +887,9 @@ pub enum WsCmd {
         /// Copy local-only (isolated) files such as .env into the sandbox for this run (they are taken out again afterwards).
         #[arg(long)]
         with_isolated: bool,
+        /// Sparse sandbox: hold only these paths (files or directories of the workspace, relative to the current directory).
+        #[arg(long, value_name = "PATH", num_args = 1..)]
+        only: Vec<String>,
         /// Command and arguments.
         #[arg(last = true, required = true)]
         command: Vec<String>,

@@ -136,6 +136,72 @@ points at. Take it from there with its change id: `vl merge zsspmtrn`,
 `vl tag set codegen -r zsspmtrn`, `vl edit zsspmtrn`, or
 `vl abandon zsspmtrn`.
 
+<a id="only"></a>
+## Sparse sandboxes: `--only`
+
+An agent working on one part of a big repository doesn't need the rest
+of it on disk. `--only` gives the sandbox just the paths you name
+(directories or files), plus `.veilpolicy`:
+
+```text
+$ vl ws new agent
+$ vl ws exec agent --only src/ tests/ -m "agent: fix parser" -- my-agent "fix the parser bug"
+sparse: sandbox holds src, tests
+synced sandbox: 412 files written, 0 removed
+running my-agent fix the parser bug in /home/me/app/.veil/local/sandboxes/agent/files
+warning: not recorded: 1 file(s) written outside --only src, tests (removed from the sandbox): NOTES.md
+Recorded lqosxltm 5b0e44a1 agent: fix parser
+$ vl ws exec agent --only src/ tests/ -- cargo test    # the next run rewrites nothing
+```
+
+That is the whole recipe for an agent that needs neither a worktree nor
+a copy of the repository: `vl ws new agent`, then
+`vl ws exec agent --only src/ -- …` as often as you like, and
+`vl merge agent@` (or `vl diff -r agent@`) when it is done.
+
+* **Everything outside the paths is recorded exactly as the workspace has
+  it.** A sparse run never deletes or changes a file it doesn't hold, and
+  cloaked files outside keep their sealing.
+* **Inside the paths, it is an ordinary run**: edits, new files and
+  deletions are recorded, through the policy and the secret scanner.
+* **Files the command writes outside the paths are not recorded.**
+  `vl` lists them (`not recorded: … written outside --only`) and removes
+  them from the sandbox, so a later run with more paths never mistakes
+  them for the workspace's files. Ignored and isolated files are the
+  exception: build output such as `target/` or `node_modules/` stays for
+  the next run wherever it is (it would not be recorded anyway), as do
+  quarantined files from earlier runs and files the command did not write
+  (see below).
+* **`.veilpolicy` is always there** (the snapshot needs it to classify
+  anything). If the command edits it, the new policy applies to every
+  file of the workspace, inside the paths or not, as for a full run: a
+  newly cloaked directory outside the paths is recorded cloaked.
+* **Paths** follow the usual rules: relative to the current directory,
+  never outside the repository (`..` that climbs out, or an absolute path
+  elsewhere, is refused). Each must name a file or directory in the
+  workspace (`--only nope` is an error; to start a new directory, name
+  its parent). Overlapping paths are fine (`--only src src/lib.rs` is
+  `--only src`), and `--only .` at the root is the whole tree. Nested
+  repositories are never part of a workspace, so they can't be chosen.
+* **Changing the paths is cheap.** The sandbox remembers its paths; a run
+  with other paths (or none) only writes what joins and removes what
+  leaves (`sparse: sandbox holds …` says when they change). Nothing
+  unrecorded is lost: what a command writes is recorded (or reported)
+  before the next run narrows, and a file you edited in the sandbox by
+  hand that a narrower set leaves outside stays where it is, unrecorded,
+  with a warning on each run, until a run whose paths hold it records
+  it.
+* **`--with-isolated` injects every isolated file**, inside the paths or
+  not: they are what the command runs with (`.env` at the root of the
+  project), not what it edits, and they are taken out again after the run
+  as always. A copy of one written outside the paths is simply not
+  recorded (and is removed); a copy inside is quarantined.
+* **`--ephemeral --only`** works the same way: the throwaway directory
+  holds only the paths, and the new change has every other file of `REV`.
+* If the workspace moves while a sparse command runs, the result is saved
+  as a change on top of what the command started from, as for a full
+  run, with every file outside the paths as they were.
+
 <a id="with-isolated"></a>
 ## Isolated files in sandboxes: `--with-isolated`
 
@@ -178,7 +244,8 @@ Use the vault for secrets an agent needs (`vl run`), not files it writes.
 
 * A workspace's sandbox lives in `.veil/local/sandboxes/NAME/` (`0700`):
   `files/` (where the command runs), `manifest.json` (which snapshot the
-  files are, whether a run is in progress), `statcache` (each file's size,
+  files are, which paths a sparse sandbox holds, whether a run is in
+  progress), `statcache` (each file's size,
   times, inode, mode and content hash, so recording after a run only reads
   files whose stat changed) and `lock`. It is device-local, like the rest
   of `.veil/local/`, and `vl ws rm` deletes it.

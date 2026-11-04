@@ -2084,6 +2084,7 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
             rev,
             message,
             with_isolated,
+            only,
             command,
         } => {
             return sandbox::exec(
@@ -2094,6 +2095,7 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
                     rev,
                     message,
                     with_isolated: *with_isolated,
+                    only,
                     command,
                 },
             );

@@ -21,9 +21,16 @@
 //! the command the builder records the files through the stat cache:
 //! stamps first, content hash when they are ambiguous (the racy-mtime rule
 //! of [`crate::statcache`]). Files checkout just wrote are vouched for
-//! without being read back ([`vouch_written`]). A subset of the tree
-//! ([`Manifest::only`], `None` today) is where sparse sandboxes will plug
-//! in.
+//! without being read back ([`vouch_written`]).
+//!
+//! **Sparse sandboxes** (`vl ws exec --only`) hold a [`SparseSet`] of the
+//! tree ([`Manifest::only`]) and `.veilpolicy`: [`sync_to`] checks out the
+//! tree restricted to the set ([`restrict`]), from the previous tree
+//! restricted to the previous set, so a different set only adds and
+//! removes what differs. The result is recorded through a [`SparseView`](crate::vfs::SparseView)
+//! (everything outside the set is the synced tree's, unchanged), and what
+//! the command wrote outside the set ([`strays`]) is never recorded and is
+//! removed from the sandbox ([`remove_strays`]).
 //!
 //! **Crash safety.** A run first writes, durably, that it is in progress
 //! ([`Manifest::running`]) and the boot it runs in. The files themselves
@@ -56,8 +63,10 @@ use crate::{
     repo::Repo,
     statcache::{CacheKey, Record, Stamp, StatCache},
     store::ObjectStore,
+    object::is_reserved_name,
+    policy::{Policy, Tier},
     tree::lookup,
-    vfs::{remove_tree, DiskBackend, NodeKind, SandboxFs, StorageBackend},
+    vfs::{holds_repository, is_temp_name, remove_tree, restrict, DiskBackend, NodeKind, SandboxFs, SparseSet, StorageBackend},
     vpath::VPath,
     workspace::validate_workspace_name,
 };
@@ -199,9 +208,11 @@ pub struct Manifest {
     /// has recorded the result and cleaned up. Found set, the run died.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub running: Option<String>,
-    /// The paths materialised, `None` for the whole tree. Reserved for
-    /// sparse sandboxes; a manifest with a subset is rebuilt by this
-    /// version.
+    /// The paths materialised ([`SparseSet::to_strings`]), `None` for the
+    /// whole tree. Files the sandbox holds outside them (besides
+    /// `.veilpolicy`) are not the workspace's: ignored or isolated output,
+    /// or [`Manifest::quarantined`] files. Readers before sparse sandboxes
+    /// rebuild a sandbox with a set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub only: Option<Vec<String>>,
     /// Files the last run left in the sandbox that the builder quarantined
@@ -223,6 +234,14 @@ impl Manifest {
             running: None,
             only: None,
             quarantined: Vec::new(),
+        }
+    }
+
+    /// [`Manifest::only`] as a set (`None`: the whole tree).
+    pub fn only_set(&self) -> Result<Option<SparseSet>> {
+        match &self.only {
+            None => Ok(None),
+            Some(paths) => SparseSet::from_strings(paths),
         }
     }
 }
@@ -258,8 +277,8 @@ pub fn rebuild_reason(repo: &Repo, paths: &SandboxPaths, ws: &str, loaded: &Load
     if boot.is_empty() || m.boot != boot {
         return Some("the machine has restarted since the last run".into());
     }
-    if m.only.is_some() {
-        return Some("it holds a subset of the tree".into());
+    if let Err(e) = m.only_set() {
+        return Some(format!("its manifest names an invalid path ({e})"));
     }
     match std::fs::symlink_metadata(&paths.files) {
         Ok(md) if md.is_dir() => {}
@@ -334,9 +353,119 @@ pub fn list(root: &Path) -> Vec<(Option<String>, SandboxPaths)> {
 /// something else are kept and reported, nothing is written through a
 /// symlink, …). Afterwards the manifest says the files are `tree`.
 pub fn sync(repo: &Repo, fs: &SandboxFs, m: &mut Manifest, tree: &ObjectId, cache: &mut StatCache) -> Result<CheckoutReport> {
-    let report = repo.checkout_tree_recorded(fs, m.tree.as_ref(), tree, &mut m.materialised, Some(cache))?;
+    sync_to(repo, fs, m, tree, None, cache)
+}
+
+/// [`sync`] to `tree` restricted to `only` (`None`: all of it). The files
+/// go from what the manifest says they are ([`Manifest::tree`] restricted
+/// to [`Manifest::only`]) to the new set: paths that leave the set are
+/// removed (as checkout removes files: only if they hold what was
+/// checked out), paths that join it are written, the rest is synced as
+/// usual. Afterwards the manifest says the files are `tree` and `only`.
+pub fn sync_to(
+    repo: &Repo,
+    fs: &SandboxFs,
+    m: &mut Manifest,
+    tree: &ObjectId,
+    only: Option<&SparseSet>,
+    cache: &mut StatCache,
+) -> Result<CheckoutReport> {
+    let store = repo.store();
+    let from = match (m.tree, m.only_set()?) {
+        (Some(t), Some(old)) => Some(restrict(store, &t, &old)?),
+        (t, _) => t,
+    };
+    let to = match only {
+        Some(set) => restrict(store, tree, set)?,
+        None => *tree,
+    };
+    let report = repo.checkout_tree_recorded(fs, from.as_ref(), &to, &mut m.materialised, Some(cache))?;
     m.tree = Some(*tree);
+    m.only = only.map(SparseSet::to_strings);
     Ok(report)
+}
+
+/// The files of the sparse working copy `fs` outside `set` that a full
+/// working copy would record: what a command wrote outside its `--only`
+/// paths. Files `policy` ignores or isolates are left out (build output,
+/// `.env`: no full snapshot records them either), and so are nested
+/// repositories, symlinks and other special files, crash debris and
+/// `.veil`. Sorted.
+pub fn strays(fs: &dyn StorageBackend, set: &SparseSet, policy: &Policy) -> Result<Vec<VPath>> {
+    let mut out = Vec::new();
+    // (directory, entirely outside the set?)
+    let mut stack = vec![(VPath::root(), false)];
+    while let Some((dir, outside)) = stack.pop() {
+        let listing = match fs.list_dir_full(&dir) {
+            Ok(l) => l,
+            Err(e) if e.is_not_found() => continue,
+            Err(e) => return Err(e),
+        };
+        if outside && holds_repository(&listing) {
+            continue;
+        }
+        for e in listing.entries {
+            if is_reserved_name(&e.name) || (e.kind == NodeKind::File && is_temp_name(&e.name)) {
+                continue;
+            }
+            let p = dir.join(&e.name);
+            let is_dir = e.kind == NodeKind::Dir;
+            if !outside && set.contains(&p) {
+                continue;
+            }
+            if !outside && is_dir && set.is_spine(&p) {
+                stack.push((p, false));
+                continue;
+            }
+            // Outside the set (a file where a spine directory belongs too).
+            if matches!(policy.classify(&p, is_dir).tier, Tier::Ignored | Tier::Isolated) {
+                continue;
+            }
+            match is_dir {
+                true => stack.push((p, true)),
+                false => out.push(p),
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Remove `paths` (from [`strays`]) from the sandbox, and the directories
+/// that leaves empty outside the set. Returns the paths that could not be
+/// removed, with why.
+pub fn remove_strays(fs: &SandboxFs, set: &SparseSet, paths: &[VPath], cache: &mut StatCache) -> Vec<(VPath, String)> {
+    let mut failed = Vec::new();
+    let mut dirs = BTreeSet::new();
+    for p in paths {
+        cache.invalidate(p);
+        match behind_special(fs, p) {
+            Ok(false) => {}
+            Ok(true) => continue,
+            Err(e) => {
+                failed.push((p.clone(), e.to_string()));
+                continue;
+            }
+        }
+        if let Err(e) = fs.remove_file(p) {
+            failed.push((p.clone(), e.to_string()));
+            continue;
+        }
+        let mut d = p.parent();
+        while let Some(dir) = d.filter(|d| !d.is_root() && set.is_outside(d)) {
+            d = dir.parent();
+            dirs.insert(dir);
+        }
+    }
+    // Deepest first.
+    for d in dirs.into_iter().rev() {
+        if let Ok(l) = fs.list_dir_full(&d) {
+            if l.entries.is_empty() && l.special.is_empty() && l.unrepresentable.is_empty() {
+                let _ = fs.remove_dir_all(&d);
+            }
+        }
+    }
+    failed
 }
 
 /// When [`vouch_written`] may wait out the racy window.

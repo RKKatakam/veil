@@ -181,6 +181,7 @@ vl push mirror        # same snapshot ids, now readable, and the fix's history f
 vl ws new agent                                   # exists only in the DAG
 vl ws exec agent -m "lint fixes" -- cargo fmt     # runs in the workspace's sandbox, records the result
 vl ws exec --ephemeral -r main -- ./codegen.sh    # one-shot agent task on main
+vl ws exec agent --only src/ -- ./agent.sh        # sparse sandbox: holds src/ only, records the rest unchanged
 vl ws switch agent                                # attach the project dir to another workspace
 vl ws mount agent ../agent                        # or mount it as a directory (FUSE): no worktree, no copy
 
@@ -209,7 +210,7 @@ Secrets      secret set|get|list|rm|import · run -- <cmd…>
 Access       scope list|create <S>|grant <S> <pubkey> [--name] [--admin]|revoke <S> <pubkey>
              scope rotate <S> · scope log <S>
 Workspaces   ws list|new <name> [-r rev] [--cloak [S]]|switch <name>|rm <name>
-             ws exec <name>|--ephemeral [-r rev] [-m] [--with-isolated] -- <cmd…>
+             ws exec <name>|--ephemeral [-r rev] [-m] [--with-isolated] [--only <path>…] -- <cmd…>
              ws cat <name> <path> · ws write <name> <path> < stdin
              ws mount <name> <dir> [--foreground] [--record-every SECS] · ws unmount <name>
 Op log       op log [-n N] · op restore <id> · undo · watch [--interval-ms N]

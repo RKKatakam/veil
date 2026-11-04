@@ -1592,6 +1592,11 @@ impl Builder<'_> {
                 && pe.executable == executable
                 && self.store.matches_encoding(&pe.id, &data)?
             {
+                // Verified: the next snapshot may take it from the stat
+                // cache (BUG-300).
+                if let Visibility::Cloaked { scope } = &desired {
+                    self.learn(path, meta.as_ref(), content, false, Some((scope.clone(), pe.id)), parent_embargoed);
+                }
                 return Ok(Some(TreeEntry {
                     name: name.to_string(),
                     ..pe.clone()
