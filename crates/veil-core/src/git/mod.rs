@@ -81,9 +81,10 @@ pub use transport::{redact_url, PushOutcome, RefStatus};
 use crate::{
     commands::validate_tag_name,
     error::{Result, VeilError},
-    id::{ChangeId, ObjectId},
+    id::ObjectId,
     oplog::Tag,
     repo::Repo,
+    revset::RevisionNames,
     vfs::StorageBackend,
     vpath::VPath,
 };
@@ -522,34 +523,6 @@ fn fetch_inner(repo: &mut Repo, git_dir: &Path, remote: &str, update_tags: bool)
     Ok(report)
 }
 
-/// Change ids and snapshot ids of the visible snapshots, to keep Git
-/// branch names from shadowing them (built on first use).
-#[derive(Default)]
-struct RevisionNames(Option<Vec<(String, String)>>);
-
-impl RevisionNames {
-    /// Would `name`, as a tag, hide a change id or snapshot id prefix of
-    /// this repository in revsets (tags are resolved first)?
-    fn shadows(&mut self, repo: &Repo, name: &str) -> Result<bool> {
-        let change = ChangeId::reverse_hex_to_hex(name);
-        let snapshot = (name.len() >= 4 && name.bytes().all(|b| b.is_ascii_hexdigit())).then(|| name.to_ascii_lowercase());
-        if change.is_none() && snapshot.is_none() {
-            return Ok(false);
-        }
-        if self.0.is_none() {
-            let mut v = Vec::new();
-            for id in repo.visible_snapshots()? {
-                v.push((hex::encode(repo.snapshot(&id)?.change_id.0), id.hex()));
-            }
-            self.0 = Some(v);
-        }
-        let ids = self.0.as_ref().unwrap();
-        Ok(ids.iter().any(|(c, s)| {
-            change.as_ref().is_some_and(|h| c.starts_with(h.as_str())) || snapshot.as_ref().is_some_and(|h| s.starts_with(h.as_str()))
-        }))
-    }
-}
-
 /// Create or fast-forward local tag `branch` to `sid` (as `remote::pull`).
 /// A new tag is not created if its name would shadow one of this
 /// repository's change ids or snapshot ids: anyone who can push a branch
@@ -565,7 +538,7 @@ fn update_tag(
 ) -> Result<()> {
     match tx.view.tags.get(branch).cloned() {
         None => {
-            if revisions.shadows(tx.repo(), branch)? {
+            if revisions.shadows(tx.repo(), || tx.repo().view().refs(), branch)? {
                 report.warnings.push(format!(
                     "no local tag created for Git branch '{branch}': the name is also a change or snapshot id of this repository; use {remote}/{branch}"
                 ));

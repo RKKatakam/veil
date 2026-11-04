@@ -182,7 +182,6 @@ fn ws_write_of_an_isolated_path_does_not_claim_it_was_recorded() {
 /// quietly lands on Mallory's snapshot; `vl log` shows the prefix as a tag
 /// next to it.
 #[test]
-#[ignore = "BUG-105: a remote tag named after a change-id prefix hijacks that change in revsets after `vl pull`"]
 fn a_pulled_tag_named_after_a_change_id_does_not_hijack_the_change() {
     let env = Env::new();
     let hub = env.dir("hub");
@@ -469,7 +468,6 @@ fn a_file_in_the_way_of_a_directory_is_kept_and_reported() {
 /// copy is created the right way (`create_new` with mode `0600`); the live
 /// file is not. Skipped where `strace` is unavailable or cannot attach.
 #[test]
-#[ignore = "BUG-112: identity.json is created world-readable and chmod'ed 0600 afterwards"]
 fn the_identity_file_is_never_world_readable_even_briefly() {
     let env = Env::new();
     let proj = env.dir("proj");
@@ -685,7 +683,6 @@ fn fake_ssh(env: &Env, home: &Path) -> Option<std::path::PathBuf> {
 /// The documented form `ssh://host/~/repo` is resolved. Skipped without an
 /// `sftp-server` binary.
 #[test]
-#[ignore = "BUG-118: scp-style `host:~/path` creates a directory literally named `~` on the server"]
 fn scp_style_tilde_paths_resolve_to_the_home_directory() {
     let env = Env::new();
     let home = env.dir("serverhome");
@@ -708,7 +705,6 @@ fn scp_style_tilde_paths_resolve_to_the_home_directory() {
 /// remote whose `.veil/lock` is a dangling symlink wedges `vl push` for
 /// ever at full CPU. Skipped without an `sftp-server` binary.
 #[test]
-#[ignore = "BUG-119: a symlinked .veil/lock (local or on an SFTP remote) makes every command spin at full CPU for ever"]
 fn a_push_to_a_remote_with_a_symlinked_lock_fails_instead_of_spinning() {
     let env = Env::new();
     let home = env.dir("serverhome");
@@ -728,4 +724,9 @@ fn a_push_to_a_remote_with_a_symlinked_lock_fails_instead_of_spinning() {
         let _ = child.kill();
     }
     assert!(finished, "`vl push` was still running after 120 s against a remote whose lock is a symlink");
+    // And it says why, and what to do (BUG-119 fix).
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains(".veil/lock is a symlink") && err.contains("remove"), "{err}");
 }

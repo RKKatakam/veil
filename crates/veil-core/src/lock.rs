@@ -719,7 +719,20 @@ impl RepoLock {
             start: my_start(),
             ..Extras::default()
         };
+        let mut first = true;
         loop {
+            // Every way round the loop (including `continue`) passes the
+            // deadline and the back-off: a lock path that keeps defeating
+            // `create_new` without reading back as a lock must never spin
+            // (BUG-119).
+            if !first {
+                if clock.now().saturating_sub(start) >= wait {
+                    return Err(VeilError::Locked(reason));
+                }
+                clock.sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_millis(50));
+            }
+            first = false;
             let info = LockInfo::new_in(opts.lease, ctx);
             // Register before creating the file so no thread of this process
             // ever sees our fresh lock with an unregistered token.
@@ -730,7 +743,14 @@ impl RepoLock {
                 return Ok(Self::held(backend, path, info, extra, token, opts, ctx, attempt));
             }
             let Some(raw) = backend.read_opt(&path)? else {
-                continue; // released between our attempts
+                // Released between our attempts, or something that is not a
+                // file (a symlink: invisible to `read`, yet `create_new`
+                // fails on it) that would make us spin for ever (BUG-119).
+                if let Some(what) = backend.special_at(&path)? {
+                    return Err(not_a_lock_file(LOCK_PATH, what));
+                }
+                reason = format!("{LOCK_PATH} exists but cannot be read");
+                continue;
             };
             let unchanged_for = observed.see(&raw, clock.now());
             // `Some(window)`: the stale lock may be replaced by ours. Its
@@ -745,7 +765,7 @@ impl RepoLock {
                         wait = wait.max(lease + ctx.grace + Duration::from_secs(2));
                     }
                     match assess_full(&holder, &holder_extra, clock.wall_ms(), Some(unchanged_for), ctx) {
-                        Verdict::Wait => {}
+                        Verdict::Wait => reason = String::from("another process holds the lock"),
                         Verdict::Stuck(r) => reason = r,
                         Verdict::Steal(_) => {
                             takeover = Some(recovery_window(&*backend, &path, &holder, &holder_extra));
@@ -792,11 +812,6 @@ impl RepoLock {
                 }
             }
             drop(token);
-            if clock.now().saturating_sub(start) >= wait {
-                return Err(VeilError::Locked(reason));
-            }
-            clock.sleep(backoff);
-            backoff = (backoff * 2).min(Duration::from_millis(50));
         }
     }
 
@@ -1072,6 +1087,17 @@ fn take_over(
     Ok(result)
 }
 
+/// The error for a lock or guard path occupied by something that is not a
+/// file, such as a symlink (`what`: "a symlink", …). Nothing reads through
+/// or removes it on the user's behalf: it may be tampering, or a restore
+/// that turned files into links, and only the user can tell (BUG-119).
+fn not_a_lock_file(path: &str, what: &str) -> VeilError {
+    VeilError::Locked(format!(
+        "{path} is {what}, not a lock file; nothing can lock this repository until it is removed \
+         (check that no Veil command is running, then remove {path})"
+    ))
+}
+
 /// A takeover guard this contender holds: its bytes, and its token
 /// (registered as live until the guard is released).
 struct Guard {
@@ -1138,6 +1164,10 @@ fn claim(
         return Ok(None);
     }
     let Some(theirs) = backend.read_opt(path)? else {
+        // A symlink there would keep every takeover busy (BUG-119).
+        if let Some(what) = backend.special_at(path)? {
+            return Err(not_a_lock_file(path.as_str(), what));
+        }
         return Ok(None); // released meanwhile: the caller retries
     };
     let unchanged = seen

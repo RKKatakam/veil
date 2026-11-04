@@ -619,6 +619,17 @@ impl StorageBackend for DiskBackend {
         Ok(out)
     }
 
+    fn special_at(&self, path: &VPath) -> Result<Option<&'static str>> {
+        let full = self.full_path(path);
+        match fs::symlink_metadata(&full) {
+            Ok(m) if m.file_type().is_symlink() => Ok(Some("a symlink")),
+            Ok(m) if m.is_file() || m.is_dir() => Ok(None),
+            Ok(_) => Ok(Some("neither a file nor a directory")),
+            Err(e) if is_missing(&e) => Ok(None),
+            Err(e) => Err(io_err(&full, e)),
+        }
+    }
+
     fn metadata(&self, path: &VPath) -> Result<Option<Metadata>> {
         let full = self.full_path(path);
         match fs::symlink_metadata(&full) {

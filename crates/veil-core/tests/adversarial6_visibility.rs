@@ -327,7 +327,6 @@ fn a_revoked_member_cannot_release_an_embargo() {
 /// change id is "divergent" in every revset (`vl edit`, `vl new`,
 /// `vl squash -r`, `vl describe -r`), until she abandons Mallory's snapshot.
 #[test]
-#[ignore = "BUG-105: a remote tag named after a change-id prefix hijacks that change in revsets after `vl pull`"]
 fn a_pulled_snapshot_with_a_forged_change_id_does_not_make_the_change_divergent() {
     let (mut alice, fs, _) = new_repo("alice");
     let main = commit_files(&mut alice, &*fs, &[("a.txt", "a\n")], "my work");

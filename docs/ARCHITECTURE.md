@@ -1056,6 +1056,22 @@ whose target is missing or not a snapshot, are skipped with a warning. Tags
 fast-forward. A diverged tag is reported and left alone
 (`--force` overrides on push).
 
+**Names a remote cannot hijack.** Revsets resolve tags before change ids,
+and change ids are visible to every reader of a remote. So `pull` (like
+`vl git pull`) never creates a local tag whose name is a change-id or
+snapshot-id prefix of local history or of what the pull brings in; it
+warns, and `<remote>/<name>` still names the snapshot. A change id
+matching several visible snapshots resolves to the one in local history
+(reachable from this repository's heads or working copies) when the
+others are only reachable through tags: a snapshot someone pushed with
+another person's change id cannot make that change divergent (BUG-105).
+
+**Creating a remote.** The first push to an empty remote initialises it
+under the remote's lock and re-checks once the lock is held, so when
+several pushes reach an empty remote at once one creates it and the others
+push to it normally (BUG-120). An error while checking is an error, never
+a reason to initialise over what may be a repository.
+
 ## 9. Locking, crash safety and `fsck`
 
 **The repository lock** (`lock.rs`) is the file `.veil/lock`, created with
@@ -1183,6 +1199,13 @@ and, once renewed, when it was acquired on the backend's own stamp clock.
   hard-links it into place. A contender therefore never sees a half-written
   lock. Unparseable content (left by older versions or a non-atomic fallback)
   is reclaimed only after it stays unchanged for a full lease.
+* Every way round the acquisition loop passes the deadline and the
+  back-off, whatever the lock path reads back as. A lock or takeover guard
+  path that is a symlink (or a socket, a device) defeats `create_new` yet
+  reads as absent, since backends never follow symlinks; it is reported at
+  once (`.veil/lock is a symlink, not a lock file; … remove .veil/lock`),
+  locally and on an SSH remote, and never removed on the user's behalf
+  (BUG-119).
 
 **Shared metadata under the lock.** Every read-modify-write of key rings,
 embargo records and the vault holds the repository lock (`Keychain` and

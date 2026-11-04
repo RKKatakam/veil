@@ -4,6 +4,13 @@
 //!   starting with `/~/` is relative to the remote home directory.
 //! * scp-style `[user@]host:path`: relative to the home directory unless
 //!   `path` starts with `/`. IPv6 hosts go in brackets: `[::1]:repo`.
+//!   `host:~/path` and `host:~` mean the home directory too, as with Git,
+//!   `scp` and `sftp`: the SFTP server does not expand `~` itself, so it is
+//!   stripped here (BUG-118).
+//! * `~user` (another account's home) is refused in both forms rather than
+//!   sent verbatim, which would create a directory literally named `~user`
+//!   in the login directory: use the absolute path. (`./~user` names such a
+//!   directory on purpose.)
 //!
 //! As with Git, a string is scp-style only if a `:` comes before any `/`,
 //! so `./odd:name` and `/tmp/a:b` are local paths.
@@ -48,6 +55,24 @@ fn split_user(s: &str, authority: &str) -> Result<(Option<String>, String)> {
     }
 }
 
+/// `~` and `~/rest` relative to the home directory (`""`, `rest`), the way
+/// a shell expands them for `scp` (SFTP paths without a leading `/` are
+/// home-relative already); `~user…` is refused (module documentation).
+/// Anything else is returned as is.
+fn home_relative<'a>(s: &str, path: &'a str) -> Result<&'a str> {
+    let Some(after) = path.strip_prefix('~') else {
+        return Ok(path);
+    };
+    match after.strip_prefix('/') {
+        Some(rest) => Ok(rest.trim_start_matches('/')),
+        None if after.is_empty() => Ok(""),
+        None => Err(bad(
+            s,
+            "'~user' paths (another account's home directory) are not supported; use the absolute path",
+        )),
+    }
+}
+
 fn normalise_path(p: &str) -> String {
     let trimmed = p.trim_end_matches('/');
     if trimmed.is_empty() && p.starts_with('/') {
@@ -86,6 +111,7 @@ impl SshUrl {
                 .map(str::to_string)
                 .unwrap_or(host);
             check_name(s, "host", &host)?;
+            let path = home_relative(s, path)?;
             Ok(SshUrl {
                 user,
                 host,
@@ -118,12 +144,9 @@ impl SshUrl {
             None | Some("") => None,
             Some(p) => Some(p.parse::<u16>().ok().filter(|p| *p > 0).ok_or_else(|| bad(s, "invalid port"))?),
         };
-        let path = if path == "/~" {
-            String::new()
-        } else if let Some(rel) = path.strip_prefix("/~/") {
-            rel.to_string()
-        } else {
-            path.to_string()
+        let path = match path.strip_prefix('/') {
+            Some(rest) if rest.starts_with('~') => home_relative(s, rest)?.to_string(),
+            _ => path.to_string(),
         };
         Ok(SshUrl {
             user,
@@ -230,6 +253,26 @@ mod tests {
         assert!(SshUrl::parse("-oProxyCommand=evil:x").unwrap().is_err());
         assert_eq!(p("host:repos/proj").last_component(), Some("proj"));
         assert_eq!(p("host:").last_component(), None);
+    }
+
+    #[test]
+    fn tilde_is_the_home_directory() {
+        // BUG-118: as with Git, scp and sftp.
+        assert_eq!(p("host:~/repo").path, "repo");
+        assert_eq!(p("u@host:~/a/b/").path, "a/b");
+        assert_eq!(p("host:~").path, "");
+        assert_eq!(p("host:~/").path, "");
+        assert_eq!(p("ssh://h/~").path, "");
+        assert_eq!(p("ssh://h/~/").path, "");
+        assert_eq!(p("host:~/repo").to_string(), "ssh://host/~/repo");
+        // A literal `~` elsewhere in the path is just a name.
+        assert_eq!(p("host:a/~b").path, "a/~b");
+        assert_eq!(p("host:./~bob").path, "./~bob");
+        // `~user` is refused instead of becoming a directory named `~bob`.
+        for s in ["host:~bob/repo", "host:~bob", "ssh://h/~bob/repo"] {
+            let e = SshUrl::parse(s).unwrap().unwrap_err().to_string();
+            assert!(e.contains("~user"), "{s}: {e}");
+        }
     }
 
     #[test]

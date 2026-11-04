@@ -152,7 +152,7 @@ impl std::fmt::Debug for Repo {
     }
 }
 
-fn config_path() -> VPath {
+pub(crate) fn config_path() -> VPath {
     VPath::new(".veil/repo.json").unwrap()
 }
 

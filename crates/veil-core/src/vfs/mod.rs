@@ -221,6 +221,16 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
         Ok(self.metadata(path)?.is_some())
     }
 
+    /// What occupies `path` if it is neither a file nor a directory (a
+    /// symlink, socket, device): such an entry is invisible to
+    /// [`StorageBackend::metadata`] and [`StorageBackend::read`], yet makes
+    /// [`StorageBackend::create_new`] fail. `Some("a symlink")` and the
+    /// like, for diagnostics; `None` when nothing special is there (or the
+    /// backend cannot hold such entries, the default).
+    fn special_at(&self, _path: &VPath) -> Result<Option<&'static str>> {
+        Ok(None)
+    }
+
     /// Read `len` bytes starting at `offset` (used for packfiles). The
     /// default reads the whole file; backends override it to avoid that.
     /// Reading past the end of the file is an error.

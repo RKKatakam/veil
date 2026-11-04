@@ -30,10 +30,14 @@ origin  team  ../hub
 | URL form | Example |
 |---|---|
 | A path (relative to the repository root, or absolute) | `../hub`, `/mnt/share/proj` |
-| scp-style SSH | `alice@build.example.com:repos/proj` (relative to the home directory) |
-| SSH URL | `ssh://alice@build.example.com:2222/srv/veil/proj` |
+| scp-style SSH | `alice@build.example.com:repos/proj` or `…:~/repos/proj` (relative to the home directory) |
+| SSH URL | `ssh://alice@build.example.com:2222/srv/veil/proj`, `ssh://host/~/repos/proj` |
 
-* The remote doesn't need to exist: the first `vl push` creates it.
+* The remote doesn't need to exist: the first `vl push` creates it (also
+  when several people push to the new remote at once).
+* `~` and `~/` mean your home directory on the server, as with Git and
+  `scp`. `~user` (another account's home) is refused: write the absolute
+  path.
 * SSH remotes use **your own `ssh`**, so `~/.ssh/config` host aliases, the
   agent, `known_hosts` and `ProxyJump` work as they do for Git. `VEIL_SSH`
   replaces the command.

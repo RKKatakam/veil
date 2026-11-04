@@ -576,6 +576,28 @@ impl SftpBackend {
         }
     }
 
+    /// One exclusive create of `path`: `Ok(Ok(true))` if it was created,
+    /// `Ok(Err(e))` if the server refused (often because it exists).
+    fn try_create_new(&self, path: &str, data: &[u8]) -> Result<std::result::Result<bool, VeilError>> {
+        if self.client.ext.hardlink {
+            // Never expose a partly written file: the content is complete
+            // and synced before the link makes it visible.
+            let tmp = self.write_temp(path, data, true)?;
+            let linked = self.call(path, FXP_EXTENDED, |b| {
+                b.str("hardlink@openssh.com").str(&tmp).str(path);
+            });
+            let _ = self.remove(&tmp);
+            return Ok(linked?.ok(path).map(|()| true));
+        }
+        let h = match self.open_creating(path, FXF_WRITE | FXF_CREAT | FXF_EXCL)? {
+            Ok(h) => h,
+            Err(r) => return Ok(Err(r.ok(path).err().unwrap_or_else(|| io_error(path, io::Error::other("open failed"))))),
+        };
+        let res = self.write_handle(path, &h, data).and_then(|()| self.fsync_handle(path, &h));
+        let closed = self.close(path, &h);
+        res.and(closed).map(|()| Ok(true))
+    }
+
     /// Write `data` to a fresh temp file next to `path` (synced if
     /// `durable`) and return the temp file's name.
     fn write_temp(&self, path: &str, data: &[u8], durable: bool) -> Result<String> {
@@ -905,34 +927,24 @@ impl StorageBackend for SftpBackend {
             return Err(VeilError::InvalidPath("cannot write to the root".into()));
         }
         let path = self.rp(p);
-        let exists = |e: VeilError| -> Result<bool> {
-            match self.lstat(&path)? {
-                Some(_) => Ok(false),
-                None => Err(e),
-            }
-        };
-        if self.client.ext.hardlink {
-            // Never expose a partly written file: the content is complete
-            // and synced before the link makes it visible.
-            let tmp = self.write_temp(&path, data, true)?;
-            let linked = self.call(&path, FXP_EXTENDED, |b| {
-                b.str("hardlink@openssh.com").str(&tmp).str(&path);
-            });
-            let _ = self.remove(&tmp);
-            return match linked?.ok(&path) {
-                Ok(()) => Ok(true),
-                Err(e) => exists(e),
+        // SFTP version 3 reports "exists" as a plain failure, so a failed
+        // create is told apart by looking. A file that existed when the
+        // create failed may be gone when we look (a lock released in
+        // between): that is a lost race, tried again a few times, not an
+        // error (BUG-120: brief locks made it common).
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let failed = match self.try_create_new(&path, data)? {
+                Ok(created) => return Ok(created),
+                Err(e) => e,
             };
-        }
-        let h = match self.open_creating(&path, FXF_WRITE | FXF_CREAT | FXF_EXCL)? {
-            Ok(h) => h,
-            Err(r) => {
-                return exists(r.ok(&path).err().unwrap_or_else(|| io_error(&path, io::Error::other("open failed"))))
+            match self.lstat(&path)? {
+                Some(_) => return Ok(false),
+                None if attempts < 4 => continue,
+                None => return Err(failed),
             }
-        };
-        let res = self.write_handle(&path, &h, data).and_then(|()| self.fsync_handle(&path, &h));
-        let closed = self.close(&path, &h);
-        res.and(closed).map(|()| true)
+        }
     }
 
     fn remove_file(&self, p: &VPath) -> Result<()> {
@@ -973,6 +985,14 @@ impl StorageBackend for SftpBackend {
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
+    }
+
+    fn special_at(&self, p: &VPath) -> Result<Option<&'static str>> {
+        Ok(match self.lstat(&self.rp(p))? {
+            Some(a) if a.is_symlink() => Some("a symlink"),
+            Some(a) if a.file_type() == FileType::Special => Some("neither a file nor a directory"),
+            _ => None,
+        })
     }
 
     fn metadata(&self, p: &VPath) -> Result<Option<Metadata>> {

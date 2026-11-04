@@ -20,7 +20,6 @@ fn read(rel: &str) -> String {
 /// debugging a remote lock or clock-skew problem is sent to `vl pull`
 /// instead of the check that exists for exactly that.
 #[test]
-#[ignore = "BUG-114: the maintenance guide says `vl doctor --remotes` skips SSH remotes; it checks them (including their clock)"]
 fn the_guide_does_not_say_doctor_skips_ssh_remotes() {
     let doctor = read("crates/vl/src/doctor.rs");
     assert!(doctor.contains("fn check_ssh_remote"), "doctor no longer checks SSH remotes; update this test");
