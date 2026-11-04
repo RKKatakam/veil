@@ -178,6 +178,7 @@ built-in      id_ed25519               isolate
 built-in      .netrc                   isolate
 built-in      .pgpass                  isolate
 built-in      .pypirc                  isolate
+built-in      .npmrc                   isolate
 built-in      .git-credentials         isolate
 built-in      *.tfstate                isolate
 built-in      *.tfstate.*              isolate
@@ -196,6 +197,15 @@ rule of yours records them, not even `** public` or `vendor/ public!`; only
 a `public!` rule that names the directory itself does
 (`fixtures/repo/.git/ public!`), for a test fixture that really is a
 repository.
+
+`.npmrc` is isolated like `.netrc` and `.pypirc`, because it usually holds
+a registry token (`//registry.npmjs.org/:_authToken=…`). A project
+`.npmrc` without one (`save-exact=true`, a registry URL, a `${NPM_TOKEN}`
+reference) can be shared with your team with `vl cloak .npmrc`, or
+published with `vl expose --force .npmrc` (a `public!` rule, which also
+turns off secret scanning for it, so keep tokens out of it). A `.npmrc`
+recorded before this rule existed stays in earlier snapshots, and the next
+snapshot no longer records it.
 
 ### Editor swap and backup files
 
@@ -429,7 +439,7 @@ db=postgres://app:Xk29vLq8sPz@db/prod token=s3cr3t-value
 | `vl secret import FILE` | Import `KEY=VALUE` lines from a dotenv file (`export` prefixes and quotes are stripped) |
 | `vl secret files` | List the vault's backups of isolated files, including those of files gone from the working copy (kept 30 days) |
 | `vl secret recover PATH` | Write the backup of an isolated file back into the working copy (never over an existing file) |
-| `vl run -- CMD…` | Run `CMD` with every vault secret in its environment (team vaults first, see below); exits with its status |
+| `vl run -- CMD…` | Run `CMD` with the vault's secrets in its environment (and those of the team vaults you choose, see below); exits with its status |
 
 The vault is per repository and per device. A teammate's clone has its own.
 Replacing your identity makes the vault unreadable until you re-key it
@@ -450,7 +460,8 @@ alice$ vl push
 bob$ vl pull
 bob$ vl secret list --scope team
 STRIPE_TEST_KEY  set by alice 2026-11-04 14:53:28 (key generation 0)
-bob$ vl run -- npm test                # STRIPE_TEST_KEY is in its environment
+bob$ vl run --scope team --remember -- npm test   # STRIPE_TEST_KEY is in its environment
+bob$ vl run -- npm test                # from now on, on this device
 ```
 
 | Command | Does |
@@ -460,22 +471,46 @@ bob$ vl run -- npm test                # STRIPE_TEST_KEY is in its environment
 | `vl secret list --scope S` | List names, with who last set each and when; never values |
 | `vl secret list --scope S --exposed-to MEMBER` | Only the names MEMBER (public key, member id or name; current or revoked) could read |
 | `vl secret rm --scope S NAME` | Delete it (a signed deletion that syncs like a write) |
+| `vl secret list --scope S --json` | The same as a [`veil.secret.list/1`](../reference/json.md#veilsecretlist1) document (names, who, when, key generation) |
 | `vl run [--scope S]… [--local-only] -- CMD…` | Choose which team vaults `vl run` loads |
+| `vl run --scope S… --remember [-- CMD…]` | Make those scopes this device's default (`--local-only --remember`: none) |
 
-Names are letters, digits, `_`, `.` and `-`, starting with a letter or `_`,
-because they become environment variables. Values are at most 64 KiB.
+Names are letters, digits and `_`, starting with a letter or `_` (shell
+identifiers), because they become environment variables. Values are at
+most 64 KiB, and a scope's entries at most 256 KiB in all: a command's
+arguments and environment together are limited to about 1 MiB (macOS) or 2
+MiB (Linux), so a bigger vault would break everyone's `vl run`. Keep
+certificates and key files as cloaked files instead.
 
-**What `vl run` loads, in order.** By default, the team vault of **every
-scope you are a member of**, then your local vault on top: a local secret
-with the same name overrides the team's (handy for a personal override of a
-shared value), and both override variables already in the environment.
-`--scope S` (repeatable) loads only those scopes' team vaults;
-`--local-only` loads none. If two loaded scopes set the same name to
-different values, `vl run` refuses and names both, rather than pick one;
-choose with `--scope`, or set the name in your local vault. Loading every
-scope by default means a teammate's `vl run -- npm start` just works after
-a pull. Use `--scope` when a command should see less, for example to keep
+**What `vl run` loads, in order.** The team vaults of the scopes you name
+with `--scope S` (repeatable), or, without `--scope`, the scopes you chose
+on this device with `--remember`, then your local vault on top: a local
+secret with the same name overrides the team's (handy for a personal
+override of a shared value), and both override variables already in the
+environment. Until you choose, `vl run` loads no team vault and says which
+scopes hold secrets. `--local-only` loads none. If two loaded scopes set the
+same name to different values, `vl run` refuses and names both, rather than
+pick one; choose with `--scope`, or set the name in your local vault.
+
+Every member of a loaded scope chooses what its entries are, and your
+command sees them next to the secrets of every other loaded scope and of
+your local vault. That is why nothing is loaded until you choose, and why
+you should remember only scopes whose members you trust with each other's
+secrets: use `--scope` when a command should see less, for example to keep
 `prod` secrets out of a test run.
+
+**Variables a team vault never sets.** Names that decide what a command
+runs, loads or trusts are never taken from a team vault, whatever the
+scope: `PATH`, `LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`, `PROMPT_COMMAND`,
+`SHELL`, `IFS`, `HOME`, `TMPDIR`, `NODE_OPTIONS`, `PYTHON*`, `PERL*`,
+`RUBY*`, `JAVA_TOOL_OPTIONS`, `GIT_*`, `NPM_CONFIG_*`, `XDG_*`, `VEIL_*`,
+compiler and build flags, proxies and CA bundles, and the configuration
+paths of common tools (`KUBECONFIG`, `DOCKER_HOST`, `AWS_CONFIG_FILE`, …);
+the full list is `EXECUTION_VARIABLES` in `crates/veil-core/src/team_vault.rs`.
+Otherwise any member could run code of their choosing in every teammate's
+`vl run`. `vl secret set --scope` stores such a name but warns, and `vl run`
+skips it with a warning. If you trust a value, copy it into your local
+vault: `vl secret get --scope team NAME | vl secret set NAME`.
 
 **Who can read and write.**
 
@@ -493,7 +528,10 @@ deletion is a write. A write is stamped later than everything its author had
 pulled, so a write you make after pulling always wins over what you saw,
 whatever the clocks say. Two teammates writing the same name without
 pulling each other's write: the later timestamp wins, the same on every
-replica.
+replica. Records stamped more than a day ahead of your clock are refused,
+and both `vl push` and `vl pull` say so. If your clock was wrong when you
+wrote a secret, your next write of it replaces that record (on the remote
+too, at the next push) instead of being stamped after it.
 
 **Key rotation.** After `vl scope rotate` (or a revocation) new writes are
 sealed under the new key. Existing entries stay readable through the key
@@ -517,7 +555,18 @@ value they wrote are re-signed by you, so the team keeps working until you
 rotate them. `vl secret list --scope team --exposed-to <their key or name>`
 shows what is still left to rotate: a name drops off the list once it holds
 a value set after the revocation. Setting the *same* value again doesn't
-count as rotation.
+count as rotation, nor does going back to a value they could read (after a
+rotation that broke something, or a deletion): vl remembers, on each
+device, which values each name held.
+
+**Teammates who have not pulled the revocation.** `vl secret set --scope`
+first brings the scope's key ring up to date from your team remotes, so a
+new value is sealed with a key the revoked member never gets; if no team
+remote answers, it warns. `vl push` re-seals your own values sealed with an
+older key than the remote's before sending them. If a value sealed with an
+old key after a revocation reaches you anyway (from an older vl, say), `vl
+pull` names it and `vl secret list --scope` marks it "sealed under an old
+key generation after a revocation": set it again, and rotate it.
 
 **Undo.** Team-vault writes are not part of the operation log (like key
 rings). `vl undo` refuses them and tells you how to reverse the write by hand

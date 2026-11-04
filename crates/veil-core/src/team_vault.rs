@@ -65,7 +65,25 @@
 //! lacks it and it passes the checks above against the receiver's ring
 //! (merged first), except that records of *former* members are kept (they
 //! count again if the member is granted again) with a warning on pull.
+//! Push and pull both report the records they refuse (BUG-522).
 //! Public remotes and the Git bridge never receive the vault.
+//!
+//! # Stale rings, clocks and exposure (round 8)
+//!
+//! * A writer whose ring has not caught up with a revocation seals under a
+//!   generation the revoked member holds (BUG-524). Push re-seals the
+//!   pusher's own such records under the destination ring's current
+//!   generation (on push, in `sync`); other records sealed under a generation after
+//!   the scope had moved past it are flagged ([`Entry::stale_generation`]).
+//! * A write replaces its writer's own records of the name stamped more than
+//!   [`MAX_CLOCK_SKEW_MS`] ahead instead of being stamped after them
+//!   (BUG-522).
+//! * Each device remembers keyed hashes of the values it saw ([`HISTORY_DIR`]),
+//!   so setting a name back to a value a revoked member read keeps its
+//!   first generation as `since` (BUG-521).
+//! * Names are shell identifiers, and a scope's live entries are capped at
+//!   [`MAX_SCOPE_ENV_BYTES`] (BUG-520, BUG-523); `vl run` never sets
+//!   [`is_execution_variable`] names from a team vault.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -225,22 +243,104 @@ struct Payload {
     since: u32,
 }
 
-/// Check an entry name: `[A-Za-z_][A-Za-z0-9_.-]*`, at most
-/// [`MAX_NAME_LEN`] bytes, so it is a usable environment variable name and
-/// safe to print.
-pub fn validate_name(name: &str) -> Result<()> {
-    let ok = !name.is_empty()
+/// Is `name` a shell identifier, `[A-Za-z_][A-Za-z0-9_]*`, of at most
+/// [`MAX_NAME_LEN`] bytes? Only such names are written, and only they reach
+/// `vl run`'s environment (BUG-520).
+pub fn is_identifier(name: &str) -> bool {
+    !name.is_empty()
         && name.len() <= MAX_NAME_LEN
         && name.bytes().next().is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
-    if ok {
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// The names records written before BUG-520 may hold (`.` and `-` were
+/// allowed too). They are still read, so those records keep counting and
+/// replicas keep agreeing, but `vl run` skips them.
+fn readable_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_NAME_LEN
+        && name.bytes().next().is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+/// Check the name of a new write: a shell identifier ([`is_identifier`]),
+/// so it is a usable environment variable name (no `=`, no NUL) and safe to
+/// print.
+pub fn validate_name(name: &str) -> Result<()> {
+    if is_identifier(name) {
         Ok(())
     } else {
         Err(VeilError::repo(format!(
-            "invalid secret name {name:?}: use letters, digits, '_', '.' and '-', starting with a letter or '_' \
-             (at most {MAX_NAME_LEN} characters)"
+            "invalid secret name {name:?}: use letters, digits and '_', starting with a letter or '_' \
+             (at most {MAX_NAME_LEN} characters), since it becomes an environment variable"
         )))
     }
+}
+
+/// Environment variables (compared in upper case) that decide which code a
+/// command runs, which libraries or modules it loads, which configuration
+/// files it reads, or where its traffic and credentials go. `vl run` never
+/// takes them from a team vault (BUG-520): otherwise any member of any
+/// loaded scope would run code of their choosing, on every teammate's
+/// machine, with the secrets of every other loaded scope in its
+/// environment. Sources: the loader (`ld.so(8)`, `dyld(1)`), glibc's
+/// unsecure-environment list, the shells' startup and prompt variables,
+/// language runtimes' option and path variables, and the configuration,
+/// proxy and CA overrides of common tools.
+pub const EXECUTION_VARIABLES: &[&str] = &[
+    // shells and the system
+    "PATH", "CDPATH", "ENV", "BASH_ENV", "SHELL", "SHELLOPTS", "BASHOPTS", "IFS", "PS1", "PS2", "PS3", "PS4",
+    "PROMPT_COMMAND", "BASH_XTRACEFD", "BASH_LOADABLES_PATH", "ZDOTDIR", "FPATH", "GLOBIGNORE", "INPUTRC",
+    "HISTFILE", "HOME", "TMPDIR", "TMP", "TEMP", "EDITOR", "VISUAL", "PAGER", "MANPAGER", "BROWSER",
+    "LESSOPEN", "LESSCLOSE", "SUDO_ASKPASS", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "SSH_AUTH_SOCK", "GNUPGHOME",
+    // the loader and libc
+    "LIBPATH", "SHLIB_PATH", "GCONV_PATH", "GLIBC_TUNABLES", "LOCPATH", "NLSPATH", "HOSTALIASES", "RES_OPTIONS",
+    "LOCALDOMAIN", "MALLOC_TRACE",
+    // language runtimes and build tools
+    "NODE_OPTIONS", "NODE_PATH", "NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED", "NODE_REPL_EXTERNAL_MODULE",
+    "GEM_HOME", "GEM_PATH", "BUNDLE_GEMFILE", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS", "JAVA_OPTS",
+    "JAVA_HOME", "CLASSPATH", "MAVEN_OPTS", "GRADLE_OPTS", "GRADLE_USER_HOME", "PHPRC", "PHP_INI_SCAN_DIR",
+    "LUA_PATH", "LUA_CPATH", "LUA_INIT", "TCLLIBPATH", "GOFLAGS", "GOPATH", "GOROOT", "GOPROXY", "GOTOOLCHAIN",
+    "GOSUMDB", "GONOSUMDB", "GOPRIVATE", "GOINSECURE", "GOENV", "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER",
+    "RUSTFLAGS", "RUSTDOCFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "CC",
+    "CXX", "CPP", "LD", "AR", "AS", "MAKE", "MAKEFLAGS", "MFLAGS", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS",
+    "PKG_CONFIG_PATH", "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_CONFIG_FILE", "UV_INDEX_URL",
+    "UV_EXTRA_INDEX_URL", "UV_CONFIG_FILE",
+    // where traffic goes, which certificates are trusted, which config is read
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "FTP_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "CURL_HOME", "WGETRC", "KUBECONFIG", "DOCKER_HOST", "DOCKER_CONFIG",
+    "DOCKER_CONTEXT", "AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE", "CLOUDSDK_CONFIG", "AZURE_CONFIG_DIR",
+];
+
+/// Prefixes of [`EXECUTION_VARIABLES`] families (compared in upper case):
+/// the dynamic loaders, Git (`GIT_SSH_COMMAND`, `GIT_EXEC_PATH`,
+/// `GIT_CONFIG_*`), exported Bash functions, Python, Perl and Ruby options
+/// and paths, npm configuration, the XDG configuration directories, Cargo's
+/// build and runner settings, and vl's own (`VEIL_HOME` names the identity).
+pub const EXECUTION_PREFIXES: &[&str] = &[
+    "LD_", "DYLD_", "GIT_", "BASH_FUNC_", "PYTHON", "PERL", "RUBY", "NPM_CONFIG_", "XDG_", "CARGO_BUILD_",
+    "CARGO_TARGET_", "VEIL_",
+];
+
+/// Does `name` decide what a command executes or loads (see
+/// [`EXECUTION_VARIABLES`])? Such names may be stored in a team vault, but
+/// `vl run` never sets them from one.
+pub fn is_execution_variable(name: &str) -> bool {
+    let up = name.to_ascii_uppercase();
+    EXECUTION_VARIABLES.contains(&up.as_str()) || EXECUTION_PREFIXES.iter().any(|p| up.starts_with(p))
+}
+
+/// Largest total [`env_cost`] of a scope's live entries. `vl run` hands
+/// them to a command in its environment, and `execve` refuses arguments and
+/// environment over `ARG_MAX` together (2 MiB on a default Linux, 1 MiB on
+/// macOS) with `E2BIG` (BUG-523). A write that would take the scope over
+/// this is refused (one that shrinks it is not).
+pub const MAX_SCOPE_ENV_BYTES: usize = 256 * 1024;
+
+/// What an entry costs in a command's environment, as `execve` counts it:
+/// `NAME=VALUE` and its NUL, plus the pointer to it.
+pub fn env_cost(name: &str, value: &str) -> usize {
+    name.len() + 1 + value.len() + 1 + std::mem::size_of::<usize>()
 }
 
 /// Check an entry value: no NUL (it becomes an environment variable), at
@@ -402,6 +502,12 @@ pub struct Entry {
     pub since: u32,
     /// The record's id.
     pub record: String,
+    /// Sealed under a generation the scope had already moved on from when
+    /// it was written (by its timestamp), by a writer whose key ring was
+    /// stale, so a member revoked in between can read it (BUG-524). Set it
+    /// again to re-seal it under the current generation (and rotate it at
+    /// its source).
+    pub stale_generation: bool,
 }
 
 /// A record that does not count, and why.
@@ -504,7 +610,7 @@ fn open_record(keys: &Keychain, rec: &VaultRecord) -> Option<std::result::Result
         .ok()
         .map(Zeroizing::new)
         .and_then(|pt| serde_json::from_slice::<Payload>(&pt).ok())
-        .filter(|p| validate_name(&p.name).is_ok() && p.value.as_deref().is_none_or(|v| validate_value(v).is_ok()));
+        .filter(|p| readable_name(&p.name) && p.value.as_deref().is_none_or(|v| validate_value(v).is_ok()));
     Some(parsed.map(|p| (p.name, p.value, p.since)).ok_or(()))
 }
 
@@ -529,8 +635,91 @@ fn verified_state(keys: &Keychain, scope: &str) -> Result<(KeyRing, RingState)> 
     Ok((ring, state))
 }
 
+/// When each generation of `ring` started: the timestamp of the change that
+/// introduced it (index = generation; the genesis change for 0).
+fn generation_starts(ring: &KeyRing) -> BTreeMap<u32, i64> {
+    let mut out = BTreeMap::new();
+    for c in &ring.log {
+        let g = match &c.op {
+            RingOp::Genesis { .. } => 0,
+            RingOp::Revoke { rotation, .. } | RingOp::Rotate { rotation } => rotation.generation,
+            RingOp::Grant { .. } => continue,
+        };
+        out.entry(g).or_insert(c.timestamp);
+    }
+    out
+}
+
+/// Every member id `ring` ever listed (genesis and grants).
+fn ever_members(ring: &KeyRing) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for c in &ring.log {
+        match &c.op {
+            RingOp::Genesis { members, .. } => out.extend(members.iter().map(|m| m.id.clone())),
+            RingOp::Grant { member } => {
+                out.insert(member.id.clone());
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// What decides whether a record was sealed under a stale generation
+/// ([`Entry::stale_generation`]).
+pub(crate) struct Staleness {
+    current: u32,
+    starts: BTreeMap<u32, i64>,
+    /// The last generation each former member held.
+    former: Vec<u32>,
+}
+
+impl Staleness {
+    pub(crate) fn new(ring: &KeyRing, state: &RingState) -> Staleness {
+        let former = ever_members(ring)
+            .into_iter()
+            .filter(|m| !state.members.contains_key(m))
+            .filter_map(|m| last_generation_held(ring, state, &m))
+            .collect();
+        Staleness {
+            current: state.generation,
+            starts: generation_starts(ring),
+            former,
+        }
+    }
+
+    /// Was a record sealed under `generation` at `timestamp` written after
+    /// the scope had moved past `generation`, and is it readable by a
+    /// former member who could not have read a record sealed at that time
+    /// under the generation then current? Timestamps are self-asserted:
+    /// this flags an honest writer whose ring was stale, not a member who
+    /// backdates a record on purpose (they could hand the value over
+    /// directly anyway).
+    /// Was a record sealed under `generation` stamped after the next
+    /// generation started (written with a ring that had not caught up)?
+    pub(crate) fn written_late(&self, generation: u32, timestamp: i64) -> bool {
+        self.starts.get(&(generation + 1)).is_some_and(|start| timestamp > *start)
+    }
+
+    pub(crate) fn stale(&self, generation: u32, timestamp: i64) -> bool {
+        if generation >= self.current {
+            return false;
+        }
+        // The generation current when the record says it was written.
+        let then = self
+            .starts
+            .iter()
+            .filter(|(_, t)| **t <= timestamp)
+            .map(|(g, _)| *g)
+            .max()
+            .unwrap_or(0);
+        then > generation && self.former.iter().any(|last| generation <= *last && *last < then)
+    }
+}
+
 /// The vault of `scope` read from `backend` with `keys` (rings and keys).
-fn read_vault(keys: &Keychain, backend: &dyn StorageBackend, scope: &str, state: &RingState) -> Result<TeamVault> {
+fn read_vault(keys: &Keychain, backend: &dyn StorageBackend, scope: &str, ring: &KeyRing, state: &RingState) -> Result<TeamVault> {
+    let staleness = Staleness::new(ring, state);
     let (records, bad) = load_records(backend, scope)?;
     let mut out = TeamVault {
         ignored: bad
@@ -602,6 +791,7 @@ fn read_vault(keys: &Keychain, backend: &dyn StorageBackend, scope: &str, state:
                 since,
                 key_id: state.generations[generation as usize].clone(),
                 record: id.to_string(),
+                stale_generation: staleness.stale(generation, rec.timestamp),
             },
         );
     }
@@ -706,6 +896,9 @@ pub struct WriteOutcome {
     pub previous: Option<Entry>,
     /// The new record's id.
     pub record: String,
+    /// What the writer should be told: earlier writes of theirs this one
+    /// replaced (stamped too far ahead), a value revoked members could read.
+    pub notes: Vec<String>,
 }
 
 /// What [`Keychain::revoke_with_vault`] found.
@@ -721,16 +914,139 @@ pub struct RevokeReport {
     pub warning: Option<String>,
 }
 
+// ---- the value history (device-local) ---------------------------------------
+
+/// Where this device remembers, per scope, a keyed hash of every value each
+/// name held and the first generation it was sealed under (BUG-521):
+/// `<dir>/<scope>.json`. Compaction deletes superseded records, so without
+/// it a name set back to a value a revoked member read (after a rotation,
+/// or a deletion) would no longer count as exposed. Never synced; what it
+/// learns travels in the `since` of the records this device writes.
+pub const HISTORY_DIR: &str = ".veil/local/vault-history";
+/// Values remembered per name; beyond it, those first sealed under the
+/// latest generations are forgotten first.
+const HISTORY_PER_NAME: usize = 256;
+
+#[derive(Default, Serialize, Deserialize)]
+struct HistoryFile {
+    /// Keyed hash of a name → keyed hash of a value → the first generation
+    /// it was sealed under. Names are hashed too: like the records, the
+    /// file holds neither names nor values.
+    #[serde(default)]
+    names: BTreeMap<String, BTreeMap<String, u32>>,
+}
+
+/// The value history of one scope, open for reading and noting.
+struct History {
+    key: [u8; 32],
+    scope: String,
+    data: HistoryFile,
+    dirty: bool,
+}
+
+impl History {
+    /// `None` without an identity (nothing to key the hashes with).
+    fn open(keys: &Keychain, scope: &str) -> Result<Option<History>> {
+        let Some(local) = keys.key(domains::LOCAL_LABEL).map(Zeroizing::new) else {
+            return Ok(None);
+        };
+        let key = blake3::derive_key(domains::TEAM_VAULT_HISTORY, &*local);
+        let data = keys
+            .backend()
+            .read_opt(&history_path(scope)?)?
+            .and_then(|raw| serde_json::from_slice(&raw).ok())
+            .unwrap_or_default();
+        Ok(Some(History {
+            key,
+            scope: scope.to_string(),
+            data,
+            dirty: false,
+        }))
+    }
+
+    fn mac(&self, name: &str, value: Option<&str>) -> String {
+        let mut h = blake3::Hasher::new_keyed(&self.key);
+        h.update(&[u8::from(value.is_some())]);
+        for part in [self.scope.as_str(), name, value.unwrap_or_default()] {
+            h.update(&(part.len() as u64).to_le_bytes());
+            h.update(part.as_bytes());
+        }
+        h.finalize().to_hex()[..32].to_string()
+    }
+
+    /// The first generation `value` of `name` is known to have been sealed
+    /// under.
+    fn since(&self, name: &str, value: &str) -> Option<u32> {
+        self.data.names.get(&self.mac(name, None))?.get(&self.mac(name, Some(value))).copied()
+    }
+
+    fn note(&mut self, name: &str, value: &str, since: u32) {
+        let mac = self.mac(name, Some(value));
+        let values = self.data.names.entry(self.mac(name, None)).or_default();
+        let slot = values.entry(mac).or_insert(u32::MAX);
+        if since < *slot {
+            *slot = since;
+            self.dirty = true;
+        }
+        while values.len() > HISTORY_PER_NAME {
+            let latest = values.iter().max_by_key(|(_, g)| **g).map(|(m, _)| m.clone()).expect("not empty");
+            values.remove(&latest);
+        }
+    }
+
+    /// Note every value of the opened, well-signed records of `records`
+    /// that names a generation of `state`.
+    fn note_records<'a>(&mut self, keys: &Keychain, state: &RingState, records: impl Iterator<Item = &'a VaultRecord>) {
+        for rec in records {
+            let Some(generation) = record_generation(rec, state).filter(|_| rec.signature_valid()) else { continue };
+            if let Some(Ok((name, Some(value), since))) = open_record(keys, rec) {
+                self.note(&name, &value, since.min(generation));
+            }
+        }
+    }
+
+    fn save(&self, keys: &Keychain) -> Result<()> {
+        if self.dirty {
+            keys.backend()
+                .write(&history_path(&self.scope)?, &serde_json::to_vec(&self.data)?)?;
+        }
+        Ok(())
+    }
+}
+
+fn history_path(scope: &str) -> Result<VPath> {
+    validate_scope_name(scope)?;
+    VPath::new(&format!("{HISTORY_DIR}/{scope}.json"))
+}
+
+/// The generation a record's label names in `state`.
+fn record_generation(rec: &VaultRecord, state: &RingState) -> Option<u32> {
+    let kid = rec.key_id()?;
+    state.generations.iter().position(|g| g == kid).map(|g| g as u32)
+}
+
+/// `ms` as a short duration ("2 days", "5 hours").
+fn human_ms(ms: i64) -> String {
+    let h = ms / 3_600_000;
+    if h >= 48 {
+        format!("{} days", h / 24)
+    } else if h >= 1 {
+        format!("{h} hours")
+    } else {
+        format!("{} minutes", (ms / 60_000).max(1))
+    }
+}
+
 impl Keychain {
     /// The team vault of `scope`, for a current member.
     pub fn team_vault(&self, scope: &str) -> Result<TeamVault> {
-        let (_, state) = verified_state(self, scope)?;
+        let (ring, state) = verified_state(self, scope)?;
         if !self.is_member(scope) {
             return Err(VeilError::repo(format!(
                 "you are not a member of scope '{scope}', so you cannot read its team vault"
             )));
         }
-        read_vault(self, &**self.backend(), scope, &state)
+        read_vault(self, &**self.backend(), scope, &ring, &state)
     }
 
     /// The live secrets of `scope` (name → value), for `vl run`.
@@ -763,24 +1079,33 @@ impl Keychain {
     /// vault: a new record sealed under the current generation and signed
     /// by this identity, which must be a current member with its signing
     /// key registered. Deleting a name that holds no value is `NotFound`.
+    ///
+    /// The name must be a shell identifier, and the scope's live entries
+    /// must stay within [`MAX_SCOPE_ENV_BYTES`]. Earlier writes of the same
+    /// name by this identity stamped more than [`MAX_CLOCK_SKEW_MS`] ahead
+    /// (a clock that was wrong) are deleted and replaced by this one, which
+    /// is stamped by the clock (BUG-522); a winning write of someone else's
+    /// that far ahead is an error. A value this device saw before keeps the
+    /// generation it was first sealed under (`since`, BUG-521).
     pub fn team_secret_write(&self, scope: &str, name: &str, value: Option<&str>) -> Result<WriteOutcome> {
         let _lock = self.lock_meta()?;
         validate_name(name)?;
         if let Some(v) = value {
             validate_value(v)?;
         }
-        let (_, state) = verified_state(self, scope)?;
+        let (ring, state) = verified_state(self, scope)?;
         let me = self
             .identity()
             .ok_or_else(|| VeilError::repo("no identity configured (run `vl identity new`)"))?;
         let my_id = me.public_hex();
+        let my_key = me.verifying_hex();
         match state.members.get(&my_id) {
             None => {
                 return Err(VeilError::repo(format!(
                     "you are not a member of scope '{scope}', so you cannot write its team vault"
                 )))
             }
-            Some(m) if m.signing_key.as_deref() != Some(me.verifying_hex().as_str()) => {
+            Some(m) if m.signing_key.as_deref() != Some(my_key.as_str()) => {
                 return Err(VeilError::repo(format!(
                     "scope '{scope}' does not register your signing key (you were granted with the short member id, \
                      or before your identity changed), so teammates would ignore your writes; ask an admin to grant \
@@ -789,20 +1114,98 @@ impl Keychain {
             }
             Some(_) => {}
         }
-        let vault = read_vault(self, &**self.backend(), scope, &state)?;
+        let backend = &**self.backend();
+        let now = crate::now_millis();
+        let ahead = now.saturating_add(MAX_CLOCK_SKEW_MS);
+        let mut notes = Vec::new();
+        let (records, _) = load_records(backend, scope)?;
+        let mut history = History::open(self, scope)?;
+        if let Some(h) = history.as_mut() {
+            h.note_records(self, &state, records.values());
+        }
+        // BUG-522: this identity's own writes of `name` stamped beyond the
+        // skew window. Teammates refuse them, and they would pin every
+        // later write (stamped after them) out of the window too.
+        let mut replaced = Vec::new();
+        for (id, rec) in &records {
+            if rec.timestamp > ahead && rec.signature.signer == my_id && rec.signature.key == my_key && rec.signature_valid() {
+                if let Some(Ok((n, ..))) = open_record(self, rec) {
+                    if n == name {
+                        replaced.push((id.clone(), rec.timestamp));
+                    }
+                }
+            }
+        }
+        if let Some(furthest) = replaced.iter().map(|(_, t)| *t).max() {
+            for (id, _) in &replaced {
+                backend.remove_file(&record_path(scope, id)?)?;
+            }
+            notes.push(format!(
+                "{} earlier write(s) of {name} by you were stamped up to {} ahead of this device's clock (was the \
+                 clock wrong?); teammates refuse such records, so this write replaces them",
+                replaced.len(),
+                human_ms(furthest - now)
+            ));
+        }
+        let vault = read_vault(self, backend, scope, &ring, &state)?;
         let previous = vault.entries.get(name).cloned();
         if value.is_none() && previous.as_ref().is_none_or(|p| p.value.is_none()) {
             return Err(VeilError::NotFound(format!("secret '{name}' in the team vault of scope '{scope}'")));
         }
+        if let Some(p) = previous.as_ref().filter(|p| p.timestamp > ahead) {
+            return Err(VeilError::repo(format!(
+                "the current write of {name} in scope '{scope}' (by {}) is stamped {} ahead of this device's clock, \
+                 so no write made now would win over it, and teammates refuse records that far ahead; check this \
+                 device's clock, and ask {} to check theirs",
+                p.signer_name,
+                human_ms(p.timestamp - now),
+                p.signer_name
+            )));
+        }
+        if let Some(v) = value {
+            let cost = |e: &Entry| env_cost(&e.name, e.value.as_deref().unwrap_or_default());
+            let before: usize = vault.live().map(cost).sum();
+            let after = before - vault.get(name).map_or(0, cost) + env_cost(name, v);
+            if after > MAX_SCOPE_ENV_BYTES && after > before {
+                return Err(VeilError::repo(format!(
+                    "the team vault of scope '{scope}' would hold {} KiB, more than the {} KiB a scope may hold: \
+                     `vl run` passes every entry to a command in its environment, which the system limits to about \
+                     1 to 2 MiB in all, arguments included. Store large values (certificates, key files) as cloaked \
+                     files instead, or remove entries no longer needed",
+                    after.div_ceil(1024),
+                    MAX_SCOPE_ENV_BYTES / 1024
+                )));
+            }
+        }
         let floor = previous.as_ref().map_or(i64::MIN, |p| p.timestamp.saturating_add(1));
-        // The same value written again keeps its first generation.
-        let since = previous
-            .as_ref()
-            .filter(|p| p.value.is_some() && p.value.as_deref() == value)
-            .map_or(state.generation, |p| p.since);
-        let record = self.write_record(scope, name, value, since, crate::now_millis().max(floor))?;
-        compact(self, &**self.backend(), scope)?;
-        Ok(WriteOutcome { previous, record })
+        // The same value written again keeps its first generation, whether
+        // it is the current one or one this device saw earlier.
+        let mut since = state.generation;
+        if let Some(v) = value {
+            if let Some(p) = previous.as_ref().filter(|p| p.value.as_deref() == Some(v)) {
+                since = since.min(p.since);
+            }
+            if let Some(s) = history.as_ref().and_then(|h| h.since(name, v)) {
+                since = since.min(s);
+            }
+            let staleness = Staleness::new(&ring, &state);
+            if staleness.former.iter().any(|last| since <= *last) {
+                notes.push(format!(
+                    "this value of {name} was first sealed under key generation {since}, which a member revoked \
+                     since holds: `vl secret list --scope {scope} --exposed-to <them>` keeps listing it until it \
+                     holds a new value"
+                ));
+            }
+        }
+        let record = self.write_record(scope, name, value, since, now.max(floor))?;
+        if let (Some(h), Some(v)) = (history.as_mut(), value) {
+            h.note(name, v, since);
+        }
+        if let Some(h) = &history {
+            h.save(self)?;
+        }
+        compact(self, backend, scope)?;
+        Ok(WriteOutcome { previous, record, notes })
     }
 
     fn write_record(&self, scope: &str, name: &str, value: Option<&str>, since: u32, timestamp: i64) -> Result<String> {
@@ -816,16 +1219,22 @@ impl Keychain {
     }
 
     /// Live entries of `scope` that `member` (public key, member id or
-    /// name; current or former) could read: those sealed under a generation
-    /// they held. For a current member, all of them.
+    /// name; current or former) could read: those whose value was sealed
+    /// under a generation they held, by the record's `since` or by what
+    /// this device remembers of the value (BUG-521). For a current member,
+    /// all of them.
     pub fn team_vault_exposed_to(&self, scope: &str, member: &str) -> Result<(String, String, Vec<Entry>)> {
         let (ring, state) = verified_state(self, scope)?;
         let (id, name) = resolve_member(&ring, &state, member)?;
         let vault = self.team_vault(scope)?;
+        let history = History::open(self, scope)?;
         let last = last_generation_held(&ring, &state, &id);
         let exposed = vault
             .live()
-            .filter(|e| last.is_some_and(|g| e.since <= g))
+            .filter(|e| {
+                let remembered = history.as_ref().and_then(|h| h.since(&e.name, e.value.as_deref().unwrap_or_default()));
+                last.is_some_and(|g| e.since.min(remembered.unwrap_or(u32::MAX)) <= g)
+            })
             .cloned()
             .collect();
         Ok((id, name, exposed))
@@ -840,6 +1249,12 @@ impl Keychain {
         let _lock = self.lock_meta()?;
         let member = format_public_key(&parse_public_key(public_key)?);
         let before = self.team_vault(scope).ok();
+        if let Ok((_, state)) = verified_state(self, scope) {
+            if let Some(mut h) = History::open(self, scope)? {
+                h.note_records(self, &state, load_records(&**self.backend(), scope)?.0.values());
+                h.save(self)?;
+            }
+        }
         if !self.revoke(scope, public_key)? {
             return Ok(None);
         }
@@ -886,34 +1301,61 @@ impl Keychain {
 /// bad signature, an unknown generation, a signer who was never a member,
 /// a timestamp more than [`MAX_CLOCK_SKEW_MS`] ahead, or (where `local`
 /// can open it) content that does not decrypt to a valid entry, is not
-/// copied. Records of former members are copied but do not count. With
-/// `warn`, every record that is not copied or does not count is reported
-/// (once per scope and reason). Then `dst` is compacted with `local`'s
-/// keys. `local` is the keychain with this identity (the source on push,
-/// the destination on pull).
-pub(crate) fn sync(src: &Keychain, dst: &Keychain, local: &Keychain, warn: bool, warnings: &mut Vec<String>) -> Result<()> {
+/// copied, and both push and pull say so (BUG-522). Records of former
+/// members are copied but do not count (reported on pull). Then `dst` is
+/// compacted with `local`'s keys. `local` is the keychain with this
+/// identity (the source on push, the destination on pull).
+///
+/// Stale key generations (BUG-524): on push, a record of this identity's
+/// sealed under a generation older than the current one of `dst`'s ring,
+/// and stamped after the next generation started (written before this
+/// device had pulled a rotation), is not sent as it is. This device's ring is fast-forwarded to `dst`'s, the entry is
+/// re-sealed under the current generation (same name, value and `since`,
+/// stamped one millisecond later, so it replaces the old record), and the
+/// push says so. Any other record that was sealed under a generation after
+/// the scope had moved on, readable by a member revoked in between
+/// ([`Staleness`]), is copied and reported by name, to be set again.
+///
+/// On push, this identity's own records on `dst` stamped beyond the skew
+/// window that this device no longer holds (replaced by a later write,
+/// [`Keychain::team_secret_write`]) are deleted from `dst`, so they cannot
+/// win over later writes once their time comes.
+pub(crate) fn sync(src: &Keychain, dst: &Keychain, local: &Keychain, pulling: bool, warnings: &mut Vec<String>) -> Result<()> {
     let now = crate::now_millis();
+    let ahead = now.saturating_add(MAX_CLOCK_SKEW_MS);
     let src_backend = &**src.backend();
     let dst_backend = &**dst.backend();
+    let me = local.identity().map(|i| (i.public_hex(), i.verifying_hex()));
+    let mine = |rec: &VaultRecord| {
+        me.as_ref()
+            .is_some_and(|(id, key)| rec.signature.signer == *id && rec.signature.key == *key && rec.signature_valid())
+    };
     for scope in vault_scopes(src_backend)? {
         let have = list_ids(dst_backend, &scope)?;
+        let src_ids = list_ids(src_backend, &scope)?;
+        if !pulling {
+            defuse_future_records(local, dst_backend, &scope, &have, &src_ids, ahead, &mine, warnings)?;
+        }
         let mut incoming = Vec::new();
         let mut problems: BTreeMap<String, usize> = BTreeMap::new();
-        for id in list_ids(src_backend, &scope)?.difference(&have) {
+        for id in src_ids.difference(&have) {
             match read_record(src_backend, &scope, id)? {
                 Some(Ok(rec)) => incoming.push((id.clone(), rec)),
-                Some(Err(_)) if warn => *problems.entry("not copied (not a readable record)".into()).or_default() += 1,
-                _ => {}
+                Some(Err(_)) => *problems.entry("not copied (not a readable record)".into()).or_default() += 1,
+                None => {}
             }
         }
-        if incoming.is_empty() {
+        let flush = |problems: BTreeMap<String, usize>, warnings: &mut Vec<String>| {
             for (why, n) in problems {
                 warnings.push(format!("team vault of scope '{scope}': {n} record(s) {why}"));
             }
+        };
+        if incoming.is_empty() {
+            flush(problems, warnings);
             continue;
         }
-        let state = match verified_state(dst, &scope) {
-            Ok((_, st)) => st,
+        let (ring, state) = match verified_state(dst, &scope) {
+            Ok(rs) => rs,
             Err(e) => {
                 warnings.push(format!(
                     "team vault of scope '{scope}': {} record(s) not copied: {e}",
@@ -922,43 +1364,197 @@ pub(crate) fn sync(src: &Keychain, dst: &Keychain, local: &Keychain, warn: bool,
                 continue;
             }
         };
+        let staleness = Staleness::new(&ring, &state);
+        let mut history = match pulling && local.is_member(&scope) {
+            true => History::open(local, &scope)?,
+            false => None,
+        };
         let mut copied = 0usize;
+        let mut reseal = Vec::new();
+        let mut late: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+        let mut late_unnamed = 0usize;
         for (id, rec) in &incoming {
-            let verdict = match check_record(rec, &state) {
-                Ok(_) | Err(IgnoredReason::FormerMember(_)) if rec.timestamp > now.saturating_add(MAX_CLOCK_SKEW_MS) || rec.timestamp < 0 => {
-                    Err("timestamp out of range".to_string())
-                }
+            let checked = check_record(rec, &state);
+            let verdict = match &checked {
+                Ok(_) | Err(IgnoredReason::FormerMember(_)) if rec.timestamp > ahead || rec.timestamp < 0 => Err(if rec.timestamp < 0 {
+                    "timestamp out of range".to_string()
+                } else {
+                    "timestamp out of range: stamped more than a day ahead of this device's clock; check the clock \
+                     of whoever wrote them"
+                        .to_string()
+                }),
                 Ok(_) => match open_record(local, rec) {
                     Some(Err(())) => Err(IgnoredReason::Unreadable.describe()),
                     _ => Ok(None),
                 },
                 Err(IgnoredReason::FormerMember(n)) => match open_record(local, rec) {
                     Some(Err(())) => Err(IgnoredReason::Unreadable.describe()),
-                    _ => Ok(Some(IgnoredReason::FormerMember(n).describe())),
+                    _ => Ok(Some(IgnoredReason::FormerMember(n.clone()).describe())),
                 },
                 Err(r) => Err(r.describe()),
             };
-            match verdict {
-                Ok(note) => {
-                    dst_backend.write(&record_path(&scope, id)?, &rec.to_bytes())?;
-                    copied += 1;
-                    if let Some(n) = note.filter(|_| warn) {
-                        *problems.entry(format!("kept but ignored ({n})")).or_default() += 1;
-                    }
-                }
+            let note = match verdict {
+                Ok(note) => note,
                 Err(why) => {
-                    if warn {
-                        *problems.entry(format!("not copied ({why})")).or_default() += 1;
-                    }
+                    *problems.entry(format!("not copied ({why})")).or_default() += 1;
+                    continue;
+                }
+            };
+            let generation = record_generation(rec, &state).unwrap_or_default();
+            // Records written before the scope moved on (pushed to a new
+            // remote, say) are sent as they are.
+            if !pulling && checked.is_ok() && mine(rec) && generation < state.generation && staleness.written_late(generation, rec.timestamp) {
+                reseal.push(rec.clone());
+                continue;
+            }
+            dst_backend.write(&record_path(&scope, id)?, &rec.to_bytes())?;
+            copied += 1;
+            if let Some(n) = note.filter(|_| pulling) {
+                *problems.entry(format!("kept but ignored ({n})")).or_default() += 1;
+            }
+            let opened = open_record(local, rec);
+            if let (Some(h), Some(Ok((name, Some(value), since)))) = (history.as_mut(), &opened) {
+                h.note(name, value, (*since).min(generation));
+            }
+            if checked.is_ok() && staleness.stale(generation, rec.timestamp) {
+                match opened {
+                    Some(Ok((name, ..))) => late.entry(generation).or_default().push(name),
+                    _ => late_unnamed += 1,
                 }
             }
         }
-        for (why, n) in problems {
-            warnings.push(format!("team vault of scope '{scope}': {n} record(s) {why}"));
+        if !reseal.is_empty() {
+            copied += reseal_for_push(local, dst_backend, &scope, &ring, state.generation, &reseal, warnings)?;
+        }
+        for (g, mut names) in late {
+            names.sort();
+            names.dedup();
+            warnings.push(format!(
+                "team vault of scope '{scope}': {} secret(s) were sealed under key generation {g} after the scope had \
+                 moved past it (written by a teammate whose key ring was out of date), so members revoked in between \
+                 can read them: {}. Set each again with `vl secret set --scope {scope} NAME` to re-seal it, and \
+                 rotate it at its source",
+                names.len(),
+                names.join(", ")
+            ));
+        }
+        if late_unnamed > 0 {
+            warnings.push(format!(
+                "team vault of scope '{scope}': {late_unnamed} record(s) were sealed under a key generation after the \
+                 scope had moved past it, so members revoked in between can read them; a member should set them again"
+            ));
+        }
+        flush(problems, warnings);
+        if let Some(h) = &history {
+            h.save(local)?;
         }
         if copied > 0 && local.is_member(&scope) {
             compact(local, dst_backend, &scope)?;
         }
+    }
+    Ok(())
+}
+
+/// BUG-524, on push: re-seal `stale` (records of this identity sealed
+/// under a generation older than `current`) under the current generation of
+/// `ring` (the destination's), on this device and on `dst`. Returns how many
+/// records were written to `dst`.
+fn reseal_for_push(
+    local: &Keychain,
+    dst: &dyn StorageBackend,
+    scope: &str,
+    ring: &KeyRing,
+    current: u32,
+    stale: &[VaultRecord],
+    warnings: &mut Vec<String>,
+) -> Result<usize> {
+    let Some(me) = local.identity() else { return Ok(0) };
+    // As a pull would: fast-forward this device's ring, so the current
+    // generation's key is at hand (and later writes use it).
+    if let crate::keychain::RingMerge::Rejected(w) = local.merge_ring(ring)? {
+        warnings.push(format!(
+            "team vault of scope '{scope}': {} record(s) you wrote under an old key generation not pushed: {w}",
+            stale.len()
+        ));
+        return Ok(0);
+    }
+    local.invalidate();
+    let mut names = Vec::new();
+    let mut old = BTreeSet::new();
+    for rec in stale {
+        let Some(Ok((name, value, since))) = open_record(local, rec) else { continue };
+        let new = VaultRecord::seal(local, me, scope, &name, value.as_deref(), since, rec.timestamp.saturating_add(1))?;
+        local.backend().write(&new.path()?, &new.to_bytes())?;
+        dst.write(&new.path()?, &new.to_bytes())?;
+        if let Some(kid) = rec.key_id() {
+            old.insert(kid.to_string());
+        }
+        names.push(name);
+    }
+    compact(local, &**local.backend(), scope)?;
+    if !names.is_empty() {
+        names.sort();
+        names.dedup();
+        warnings.push(format!(
+            "team vault of scope '{scope}': you wrote {} secret(s) under an old key generation, before this device had \
+             pulled the scope's move to generation {current}: {}. They were re-sealed under generation {current} before \
+             being sent, so members revoked in between do not get them from this push (your key ring is updated too)",
+            names.len(),
+            names.join(", ")
+        ));
+    }
+    Ok(names.len())
+}
+
+/// BUG-522, on push: delete from `dst` this identity's records stamped
+/// beyond `ahead` that `src` no longer holds, for names `src` holds a later
+/// write of this identity's for (it replaced them,
+/// [`Keychain::team_secret_write`]).
+#[allow(clippy::too_many_arguments)]
+fn defuse_future_records(
+    local: &Keychain,
+    dst: &dyn StorageBackend,
+    scope: &str,
+    have: &BTreeSet<String>,
+    src_ids: &BTreeSet<String>,
+    ahead: i64,
+    mine: &dyn Fn(&VaultRecord) -> bool,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let mut future = Vec::new();
+    for id in have.difference(src_ids) {
+        if let Some(Ok(rec)) = read_record(dst, scope, id)? {
+            if rec.timestamp > ahead && mine(&rec) {
+                if let Some(Ok((name, ..))) = open_record(local, &rec) {
+                    future.push((id.clone(), name));
+                }
+            }
+        }
+    }
+    if future.is_empty() {
+        return Ok(());
+    }
+    let (records, _) = load_records(&**local.backend(), scope)?;
+    let written: BTreeSet<String> = records
+        .values()
+        .filter(|r| mine(r) && r.timestamp <= ahead)
+        .filter_map(|r| match open_record(local, r) {
+            Some(Ok((name, ..))) => Some(name),
+            _ => None,
+        })
+        .collect();
+    let mut removed = 0;
+    for (id, name) in future {
+        if written.contains(&name) {
+            dst.remove_file(&record_path(scope, &id)?)?;
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        warnings.push(format!(
+            "team vault of scope '{scope}': removed {removed} of your own record(s) stamped more than a day ahead from \
+             the remote (later writes replaced them), so they cannot win over newer values once their time comes"
+        ));
     }
     Ok(())
 }
@@ -1028,11 +1624,43 @@ mod tests {
 
     #[test]
     fn name_rules() {
-        for ok in ["A", "_x", "STRIPE_LIVE_KEY", "a.b-c_9"] {
+        for ok in ["A", "_x", "STRIPE_LIVE_KEY", "a_b_9"] {
             assert!(validate_name(ok).is_ok(), "{ok}");
         }
-        for bad in ["", "9A", "-a", "a b", "a=b", "a/b", "é"] {
+        // New writes take shell identifiers only (BUG-520); records written
+        // before with '.' or '-' are still read.
+        for bad in ["", "9A", "-a", "a b", "a=b", "a/b", "é", "a.b-c_9", "A\0B"] {
             assert!(validate_name(bad).is_err(), "{bad}");
         }
+        assert!(readable_name("a.b-c_9") && !readable_name("a=b"));
+    }
+
+    #[test]
+    fn execution_variables_are_recognised() {
+        for v in ["PATH", "path", "BASH_ENV", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "NODE_OPTIONS", "PYTHONPATH",
+            "PYTHONSTARTUP", "PERL5OPT", "RUBYOPT", "JAVA_TOOL_OPTIONS", "GIT_SSH_COMMAND", "SHELL", "IFS", "HOME",
+            "TMPDIR", "ENV", "PROMPT_COMMAND", "KUBECONFIG", "HTTPS_PROXY", "https_proxy", "VEIL_HOME", "XDG_CONFIG_HOME",
+            "NPM_CONFIG_USERCONFIG", "GCONV_PATH"]
+        {
+            assert!(is_execution_variable(v), "{v}");
+        }
+        for v in ["DATABASE_URL", "STRIPE_LIVE_KEY", "NPM_TOKEN", "GITHUB_TOKEN", "NODE_ENV", "PATHNAME", "AWS_SECRET_ACCESS_KEY"] {
+            assert!(!is_execution_variable(v), "{v}");
+        }
+    }
+
+    #[test]
+    fn staleness_needs_a_revoked_holder_who_missed_the_newer_generation() {
+        let st = Staleness {
+            current: 2,
+            starts: [(0, 0), (1, 100), (2, 200)].into_iter().collect(),
+            former: vec![0],
+        };
+        assert!(st.stale(0, 150), "after generation 1 started, readable by the member revoked at 1");
+        assert!(!st.stale(0, 50), "written while generation 0 was current");
+        assert!(!st.stale(1, 250), "the former member never held generation 1");
+        assert!(!st.stale(2, 250), "current generation");
+        let plain_rotation = Staleness { former: vec![], ..st };
+        assert!(!plain_rotation.stale(0, 150), "nobody revoked: nobody new can read it");
     }
 }

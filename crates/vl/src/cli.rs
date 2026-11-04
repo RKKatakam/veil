@@ -419,20 +419,28 @@ pub enum Cmd {
     Secret(SecretCmd),
     /// Run a command with vault secrets injected as environment variables.
     ///
-    /// Loads the team vaults of your scopes first, then the local vault,
-    /// whose secrets override a team secret of the same name. Variables
-    /// already in the environment are overridden by both.
+    /// Loads the team vaults of the chosen scopes first, then the local
+    /// vault, whose secrets override a team secret of the same name.
+    /// Variables already in the environment are overridden by both. A team
+    /// vault never sets variables that decide what the command runs or loads
+    /// (PATH, LD_*, BASH_ENV, NODE_OPTIONS, GIT_*, …): any member of the
+    /// scope could set them.
     Run {
-        /// Load only these scopes' team vaults (repeatable). Default: every
-        /// scope you are a member of. A name set in two loaded scopes is an
-        /// error unless the local vault overrides it.
+        /// Load these scopes' team vaults (repeatable). Default: the scopes
+        /// chosen with `--remember` on this device, none until then. A name
+        /// set in two loaded scopes is an error unless the local vault
+        /// overrides it.
         #[arg(long = "scope", value_name = "SCOPE")]
         scopes: Vec<String>,
         /// Load only the local vault, no team vault.
         #[arg(long, conflicts_with = "scopes")]
         local_only: bool,
+        /// Make the given `--scope`s (or, with `--local-only`, no team
+        /// vault) this device's default; the command is optional.
+        #[arg(long)]
+        remember: bool,
         /// Command and arguments (put them after `--`).
-        #[arg(trailing_var_arg = true, required = true, allow_hyphen_values = true)]
+        #[arg(trailing_var_arg = true, required_unless_present = "remember", allow_hyphen_values = true)]
         command: Vec<String>,
     },
     /// Your public-key identity.

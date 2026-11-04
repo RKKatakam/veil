@@ -56,7 +56,7 @@ documents described [below](#write-results).
 | `tag.list` | `vl tag list` | | [`veil.tag.list/1`](json.md#veiltaglist1) |
 | `op.log` | `vl op log` | `limit` (number, default 20) | [`veil.op.log/1`](json.md#veiloplog1) |
 | `scan` | `vl scan` | `policy_from` (a file inside the repository) | [`veil.scan/1`](json.md#veilscan1) |
-| `secret.list` | `vl secret list` | | [`veil.secret.list/1`](json.md#veilsecretlist1) |
+| `secret.list` | `vl secret list` | `scope` (a team vault instead of the local vault), `exposed_to` (with `scope`: only what that member could read) | [`veil.secret.list/1`](json.md#veilsecretlist1) |
 | `snapshot` | (any command's automatic snapshot) | none | [`veil.snapshot/1`](#veilsnapshot1) |
 | `describe` | `vl describe` | `message` (required), `rev` (default `@`) | [`veil.describe/1`](#veildescribe1) |
 | `new` | `vl new` | `revs` (list, default `[@]`), `message` | [`veil.new/1`](#veilnew1) |

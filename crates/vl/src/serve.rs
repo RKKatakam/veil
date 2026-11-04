@@ -1050,6 +1050,16 @@ struct Plain {
     snapshot: Option<bool>,
 }
 
+/// `secret.list`: the local vault, or with `scope` a team vault (names
+/// only, never values).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecretListParams {
+    scope: Option<String>,
+    exposed_to: Option<String>,
+    snapshot: Option<bool>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LogParams {
@@ -1237,8 +1247,11 @@ impl Server {
                 }
             }
             "secret.list" => {
-                let p: Plain = params(p)?;
-                read(Cmd::Secret(SecretCmd::List { scope: None, exposed_to: None, out: JSON }), p.snapshot)
+                let p: SecretListParams = params(p)?;
+                if p.exposed_to.is_some() && p.scope.is_none() {
+                    return Err(RpcError::new(INVALID_PARAMS, "invalid params: `exposed_to` needs `scope`"));
+                }
+                read(Cmd::Secret(SecretCmd::List { scope: p.scope, exposed_to: p.exposed_to, out: JSON }), p.snapshot)
             }
             "snapshot" => {
                 let _: NoParams = params(p)?;
@@ -1515,7 +1528,12 @@ fn read_document(ctx: &Ctx, cmd: &Cmd) -> Result<String> {
         Cmd::Tag(TagCmd::List { .. }) => api::to_json(&api::tag_list(&ctx.repo)),
         Cmd::Op(OpCmd::Log { limit, .. }) => api::to_json(&api::op_log(&ctx.repo, *limit)?),
         Cmd::Scan { policy_from: None, .. } => api::to_json(&api::scan(ctx)?),
-        Cmd::Secret(SecretCmd::List { .. }) => api::to_json(&api::secret_list(&ctx.repo)?),
+        Cmd::Secret(SecretCmd::List { scope: None, .. }) => api::to_json(&api::secret_list(&ctx.repo)?),
+        Cmd::Secret(SecretCmd::List {
+            scope: Some(scope),
+            exposed_to,
+            ..
+        }) => api::to_json(&api::team_secret_list(&ctx.repo, scope, exposed_to.as_deref())?),
         _ => unreachable!("not a read method"),
     }
 }

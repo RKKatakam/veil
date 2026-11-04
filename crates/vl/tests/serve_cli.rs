@@ -177,6 +177,7 @@ fn world() -> (Env, PathBuf, PathBuf) {
     env.ok("alice", &alice, &["commit", "-m", "initial"]);
     env.ok("alice", &alice, &["tag", "set", "main", "-r", "@-"]);
     env.ok("alice", &alice, &["secret", "set", "API_TOKEN", VAULT_VALUE]);
+    env.ok("alice", &alice, &["secret", "set", "--scope", "team", "TEAM_TOKEN", VAULT_VALUE]);
     env.ok("alice", &alice, &["ws", "new", "plan", "-r", "main", "--cloak", "team"]);
     write_stdin(&env, "alice", &alice, &["ws", "write", "plan", "internal/plan.md"], format!("{CLOAKED_TEXT} v2\n").as_bytes());
     env.ok("alice", &alice, &["describe", "-r", "plan@", "-m", CLOAKED_DESC]);
@@ -211,6 +212,15 @@ fn read_pairs(env: &Env, user: &str, dir: &Path) -> Vec<(Vec<String>, &'static s
         (s(&["scan"]), "scan", json!({})),
         (s(&["secret", "list"]), "secret.list", json!({})),
     ];
+    // A team vault, for its member (BUG-494).
+    if user == "alice" {
+        pairs.push((s(&["secret", "list", "--scope", "team"]), "secret.list", json!({"scope": "team"})));
+        pairs.push((
+            s(&["secret", "list", "--scope", "team", "--exposed-to", "alice"]),
+            "secret.list",
+            json!({"scope": "team", "exposed_to": "alice"}),
+        ));
+    }
     // Every snapshot in the log, through show and diff.
     let log = cli_json(env, user, dir, &["--no-snapshot", "log", "--json"]);
     for e in log["entries"].as_array().unwrap() {

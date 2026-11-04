@@ -593,3 +593,173 @@ fn entries_sync_over_sftp_and_the_remote_holds_ciphertext_only() {
     let r = fsck::fsck(Arc::new(disk), None).unwrap();
     assert!(r.is_ok(), "{:?}", r.findings);
 }
+
+// ---- round-8 vault wave ---------------------------------------------------
+
+fn records_on(fs: &dyn StorageBackend, scope: &str) -> Vec<VaultRecord> {
+    let dir = VPath::new(&format!("{TEAM_VAULT_DIR}/{scope}")).unwrap();
+    if !fs.exists(&dir).unwrap() {
+        return vec![];
+    }
+    fs.list_dir(&dir)
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| serde_json::from_slice(&fs.read(&dir.join(&e.name)).ok()?).ok())
+        .collect()
+}
+
+/// Alice and Bob as in [`team`], plus Carol (member) who cloned while Bob
+/// was still a member; then Alice revokes Bob and pushes. Carol has not
+/// pulled since.
+fn revoked_bob_and_stale_carol() -> (Peer, Peer, Peer, Arc<MemoryBackend>) {
+    let (mut alice, mut bob, remote) = team();
+    let carol_id = Identity::generate("carol");
+    alice.repo.keys().grant("team", &carol_id.public_id(), "carol").unwrap();
+    set(&alice, "OLD", "old-value");
+    push(&mut alice, &remote);
+    let carol = clone_as(carol_id, Arc::new(MemoryBackend::new()), &remote);
+    pull(&mut bob, &remote);
+    alice.repo.keys().revoke_with_vault("team", &bob.id.public_id()).unwrap().unwrap();
+    push(&mut alice, &remote);
+    (alice, bob, carol, remote)
+}
+
+/// BUG-524: a write made with a stale ring is re-sealed under the current
+/// generation by the push, so the revoked member never gets it, and the
+/// pusher's ring catches up.
+#[test]
+fn a_stale_writers_push_reseals_under_the_current_generation() {
+    let (mut alice, mut bob, mut carol, remote) = revoked_bob_and_stale_carol();
+    set(&carol, "NEW", "fresh-after-revocation");
+    assert_eq!(carol.repo.keys().team_vault("team").unwrap().get("NEW").unwrap().generation, 0);
+    let r = push(&mut carol, &remote);
+    assert!(r.warnings.iter().any(|w| w.contains("re-sealed") && w.contains("NEW")), "{:?}", r.warnings);
+    // Carol's ring caught up, and her own copy moved to generation 1.
+    assert_eq!(carol.repo.keys().ring_state("team").unwrap().unwrap().unwrap().generation, 1);
+    assert_eq!(carol.repo.keys().team_vault("team").unwrap().get("NEW").unwrap().generation, 1);
+    // Bob's generation-0 key opens none of Carol's records on the remote.
+    pull(&mut bob, &remote);
+    let kid0 = alice.repo.keys().ring_state("team").unwrap().unwrap().unwrap().generations[0].clone();
+    let key0 = bob.repo.keys().key(&format!("team#{kid0}")).unwrap();
+    for rec in records_on(&*remote, "team").iter().filter(|r| r.signature.signer == carol.id.public_hex()) {
+        assert!(rec.sealed.open(&key0).is_err(), "Bob can read a record Carol wrote after his revocation");
+    }
+    let r = pull(&mut alice, &remote);
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    let e = alice.repo.keys().team_vault("team").unwrap().get("NEW").cloned().unwrap();
+    assert_eq!((e.value.as_deref(), e.generation, e.stale_generation), (Some("fresh-after-revocation"), 1, false));
+}
+
+/// BUG-524: a record that reaches the remote sealed under the old
+/// generation anyway (an older vl pushed it, or it came by another path) is
+/// flagged by name on pull, marked in the vault, and counted as exposed,
+/// until someone sets it again.
+#[test]
+fn a_record_sealed_late_under_an_old_generation_is_flagged_on_pull() {
+    let (mut alice, bob, carol, remote) = revoked_bob_and_stale_carol();
+    let late = VaultRecord::seal(carol.repo.keys(), &carol.id, "team", "LATE", Some("v"), 0, veil_core::now_millis()).unwrap();
+    plant(&*remote, &late);
+    let r = pull(&mut alice, &remote);
+    assert!(
+        r.warnings.iter().any(|w| w.contains("LATE") && w.contains("generation 0") && w.contains("vl secret set --scope team")),
+        "{:?}",
+        r.warnings
+    );
+    let e = alice.repo.keys().team_vault("team").unwrap().get("LATE").cloned().unwrap();
+    assert!(e.stale_generation);
+    // An old value that was simply never re-sealed is not "late".
+    assert!(!alice.repo.keys().team_vault("team").unwrap().get("OLD").unwrap().stale_generation);
+    let (_, _, exposed) = alice.repo.keys().team_vault_exposed_to("team", &bob.id.public_id()).unwrap();
+    assert!(exposed.iter().any(|e| e.name == "LATE"));
+    set(&alice, "LATE", "v");
+    let e = alice.repo.keys().team_vault("team").unwrap().get("LATE").cloned().unwrap();
+    assert_eq!((e.generation, e.stale_generation), (1, false));
+}
+
+/// BUG-522: push says which records it does not send, instead of reporting
+/// success silently.
+#[test]
+fn push_reports_the_records_it_does_not_send() {
+    let (mut alice, _bob, remote) = team();
+    let far = veil_core::now_millis() + 2 * MAX_CLOCK_SKEW_MS;
+    let rec = VaultRecord::seal(alice.repo.keys(), &alice.id, "team", "AHEAD", Some("x"), 0, far).unwrap();
+    plant(&*alice.fs, &rec);
+    let r = push(&mut alice, &remote);
+    assert!(r.warnings.iter().any(|w| w.contains("1 record(s) not copied") && w.contains("ahead")), "{:?}", r.warnings);
+}
+
+/// BUG-522: a write of a name whose own earlier record was stamped far
+/// ahead replaces it (here and, on the next push, on the remote), instead
+/// of being stamped after it.
+#[test]
+fn a_record_stamped_far_ahead_is_replaced_by_the_next_write_everywhere() {
+    let (mut alice, mut bob, remote) = team();
+    let far = veil_core::now_millis() + 2 * MAX_CLOCK_SKEW_MS;
+    let glitch = VaultRecord::seal(alice.repo.keys(), &alice.id, "team", "API_KEY", Some("glitch"), 0, far).unwrap();
+    // Pushed while the clock was wrong: it is on the remote too.
+    plant(&*alice.fs, &glitch);
+    plant(&*remote, &glitch);
+    let out = alice.repo.keys().team_secret_write("team", "API_KEY", Some("rotated")).unwrap();
+    assert!(out.notes.iter().any(|n| n.contains("replaces")), "{:?}", out.notes);
+    let mine = alice.repo.keys().team_vault("team").unwrap().get("API_KEY").cloned().unwrap();
+    assert_eq!(mine.value.as_deref(), Some("rotated"));
+    assert!(mine.timestamp <= veil_core::now_millis());
+    let r = push(&mut alice, &remote);
+    assert!(r.warnings.iter().any(|w| w.contains("removed 1")), "{:?}", r.warnings);
+    assert!(!records_on(&*remote, "team").contains(&glitch));
+    pull(&mut bob, &remote);
+    assert_eq!(get(&bob, "API_KEY").as_deref(), Some("rotated"));
+    // Someone else's winning write that far ahead: an error, not a write
+    // that silently loses or is pinned out of the window.
+    let bobs = VaultRecord::seal(bob.repo.keys(), &bob.id, "team", "PINNED", Some("b"), 0, far).unwrap();
+    plant(&*alice.fs, &bobs);
+    let err = alice.repo.keys().team_secret_write("team", "PINNED", Some("a")).unwrap_err().to_string();
+    assert!(err.contains("ahead of this device's clock"), "{err}");
+}
+
+/// BUG-523: a scope's live entries are capped in total, so `vl run` can
+/// always pass them to a command; a write that shrinks the vault is fine.
+#[test]
+fn a_scope_vault_is_capped_in_total() {
+    let alice = peer("alice");
+    let big = "x".repeat(64_000);
+    for i in 0..4 {
+        set(&alice, &format!("BLOB_{i}"), &big);
+    }
+    let err = alice.repo.keys().team_secret_write("team", "BLOB_4", Some(&big)).unwrap_err().to_string();
+    assert!(err.contains("scope 'team'") && err.contains("KiB"), "{err}");
+    set(&alice, "BLOB_0", "small");
+    set(&alice, "BLOB_4", &big);
+}
+
+/// BUG-521: the exposure the writer's device remembers travels in the
+/// record, so a teammate's `--exposed-to` agrees.
+#[test]
+fn going_back_to_a_leaked_value_is_exposed_on_every_replica() {
+    let (mut alice, bob, mut carol, remote) = revoked_bob_and_stale_carol();
+    pull(&mut carol, &remote);
+    set(&alice, "OLD", "rotated");
+    set(&alice, "OLD", "old-value");
+    let out_rec = alice.repo.keys().team_vault("team").unwrap().get("OLD").cloned().unwrap();
+    assert_eq!(out_rec.since, 0);
+    push(&mut alice, &remote);
+    pull(&mut carol, &remote);
+    let (_, _, exposed) = carol.repo.keys().team_vault_exposed_to("team", &bob.id.public_id()).unwrap();
+    assert_eq!(exposed.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["OLD"]);
+}
+
+/// BUG-524: records written *before* a rotation are pushed as they are to a
+/// new team remote (nothing to re-seal, no warning).
+#[test]
+fn old_records_reach_a_new_remote_unchanged() {
+    let (mut alice, _bob, remote) = team();
+    set(&alice, "OLD", "v");
+    let before = records_on(&*alice.fs, "team");
+    alice.repo.keys().rotate("team").unwrap();
+    push(&mut alice, &remote);
+    let fresh = Arc::new(MemoryBackend::new());
+    let r = push(&mut alice, &fresh);
+    assert!(!r.warnings.iter().any(|w| w.contains("re-sealed")), "{:?}", r.warnings);
+    let on_fresh = records_on(&*fresh, "team");
+    assert!(before.iter().all(|b| on_fresh.contains(b)), "the old record reached the new remote as it was");
+}
