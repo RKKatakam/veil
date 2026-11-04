@@ -112,6 +112,7 @@ pub fn run(repo_arg: Option<&Path>, remotes: bool) -> Result<ExitCode> {
             check_lock(&mut r, &*fs);
             check_stat_cache(&mut r, &*fs, repo.as_ref());
             check_ws_sandboxes(&mut r, &root, repo.as_ref());
+            check_mounts(&mut r, &root, repo.as_ref());
             if let Some(repo) = &repo {
                 check_vault(&mut r, repo);
             }
@@ -294,6 +295,16 @@ fn check_ws_sandboxes(r: &mut Report, root: &Path, repo: Option<&Repo>) {
     if !problems.is_empty() {
         let detail: Vec<String> = problems.into_iter().map(|(_, l)| l).collect();
         r.warn(format!("{} `ws exec` sandbox(es) need attention", detail.len()), &detail);
+    }
+}
+
+/// The repository's `vl ws mount`s.
+fn check_mounts(r: &mut Report, root: &Path, repo: Option<&Repo>) {
+    for (problem, line) in crate::mount::doctor_status(root, repo) {
+        match problem {
+            true => r.warn(line, &[]),
+            false => r.ok(line),
+        }
     }
 }
 

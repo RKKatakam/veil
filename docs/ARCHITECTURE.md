@@ -62,10 +62,12 @@ must not be trusted (which disables stat caching):
   descendants of `a/` are contiguous in string order, directory listings are
   range scans. File buffers are `Arc`-shared. Every file write takes a fresh
   value from a monotonic generation counter, reported as `mtime`.
-* **OverlayBackend** is copy-on-write. An in-memory upper layer and a
-  whiteout set sit over any read-only lower layer. Ancestor whiteouts hide
-  whole subtrees. A file in the way of a directory is an error, exactly as
-  on the other backends; it is never whited out implicitly.
+* **OverlayBackend** is copy-on-write. An upper layer (in memory by
+  default; any backend with `OverlayBackend::with_upper`, which a `vl ws
+  mount` keeps on disk) and a whiteout set sit over any read-only lower
+  layer. Ancestor whiteouts hide whole subtrees. A file in the way of a
+  directory is an error, exactly as on the other backends; it is never
+  whited out implicitly.
 * **SftpBackend** (`vfs/sftp*.rs`) is a repository on another machine,
   reached through the user's own `ssh` (`ssh … -s -- host sftp`, as
   `sftp(1)` runs it; `VEIL_SSH` replaces the command), so `~/.ssh/config`,
@@ -1374,6 +1376,96 @@ A workspace is only a named pointer in the view. It owns no directory.
   removed when `vl` exits (by `vl`, by the reaper, or by the next `ws exec`
   sweeping sandboxes whose owning process, the pid in the name, is gone).
   The command's stdout is its own: `vl` reports on stderr.
+* **Mounted workspaces** (`vl ws mount`, `crates/vl/src/mount.rs`; the
+  file system in `mount/fs.rs`, the FUSE adapter in `mount/fuse.rs`). A
+  workspace served as a directory through FUSE (the `fuser` crate, pure
+  Rust on Linux: mounting goes through `fusermount3`; macFUSE on macOS,
+  opt-in feature `macfuse`). `vl` is built with the `fuse` feature by
+  default; without it, or without `/dev/fuse`, the command says so and
+  nothing else changes (the mount tests skip themselves).
+  * *Layers.* `MountFs` serves an `OverlayBackend` whose lower layer is a
+    `ReaderView` of the snapshot `base` and whose upper layer is a
+    `DiskBackend` on `.veil/local/mounts/<ws>/upper` (`0700`). The
+    `ReaderView` is a `TreeView` that shows exactly what checkout would
+    write for this reader (§4 rule 5): an entry it cannot read is absent
+    for `lookup`, `stat` and `read`, not only for `readdir` (a `TreeView`
+    answers `metadata` for every entry); a directory holding nothing it
+    can read is absent (checkout would not create it); a cloaked file
+    shown as its public fallback has the fallback's size; conflicts are
+    materialised with markers for this reader. A non-member never
+    receives sealed bytes: they are never decrypted, and a fallback or a
+    redacted conflict is all there is to read.
+  * *Requests.* `MountFs` is the whole file system in terms of inode
+    numbers, handles and errno (so it is unit-tested over
+    `MemoryBackend`s, without a kernel); the adapter only translates. An
+    open file's content is a buffer (one decryption per open, writes at
+    any offset in memory) that reaches the upper layer, durably (temp
+    file, fsync, rename), on `flush` (every `close`), `fsync` and
+    `release`. Deletions append a whiteout to the journal
+    `.veil/local/mounts/<ws>/whiteouts` before they take effect, so a
+    crash can only resurrect a deleted file, never lose one. A rename
+    copies the source (a directory: its whole subtree) into the upper
+    layer, then removes it. `.veil` cannot be created, symlinks, hard
+    links and special files are refused (`EPERM`), only the executable
+    bit of a mode is kept. No `allow_other` (the kernel keeps every other
+    user, root included, out), `default_permissions`, modes `0700`/`0600`,
+    `nosuid`, `nodev`; names and attributes are cached by the kernel for
+    1 s.
+  * *The serving process* (`vl ws mount --foreground`, or that command
+    started in the background in its own session) holds
+    `.veil/local/mounts/<ws>/lock` (`flock`) for its life and writes
+    `state.json` (pid, boot, mountpoint, control socket, `base`). It runs
+    the FUSE session in a thread and, in its main thread, answers the
+    control socket (`record`, `unmount`, `status`; one JSON line each),
+    looks every second whether the workspace moved, records every
+    `--record-every` seconds while there are changes, and on SIGINT,
+    SIGTERM or SIGHUP unmounts (a second signal: lazily). When the session
+    ends (unmounted by `vl ws unmount`, by a signal or by `fusermount -u`)
+    it records once more and cleans up.
+  * *Recording* is `Repo::snapshot_workspace_with` over the merged overlay,
+    with `expected_wc = base`, the path of `vl ws write` and `ws exec`:
+    policy, scanner, sealing (the cloaked-workspace rules included),
+    isolation and quarantine all apply, and `known_id` hints keep it
+    O(changes). Requests wait while it reads the overlay. Afterwards
+    (`MountFs::reconcile`) the overlay is put over the recorded tree,
+    keeping only what still differs from it: files the recording left
+    out (isolated, ignored, quarantined, held back) and whiteouts still
+    hiding something. What the mount shows does not change. Triggers:
+    `vl ws unmount`; every other `vl` command that snapshots
+    (`Ctx::open` asks each live mount over its socket before opening the
+    repository, so the command's view includes the mount, as it includes
+    the project directory; a mount that changed nothing since its last
+    recording answers at once); the timer; the end of the session.
+  * *Concurrency rule: the mount follows the workspace.* Refusing every
+    command that could move a mounted workspace (commit, describe, rebase
+    and auto-rebase of descendants, undo, `op restore`, `ws write`, `ws
+    exec`) would be intrusive and still racy, so the mount follows
+    instead. When the workspace's working copy is no longer `base`, the
+    files that changed between the two trees are compared with the
+    overlay (its upper files and whiteouts). No overlap: the overlay is
+    put over the new tree as it is (`switch_lower`), and the mount shows
+    the other command's change. Overlap (both changed a file since the
+    mount last recorded, which the recording before every command makes
+    rare): the overlay as it is is first saved with
+    `Repo::commit_fs_as_child` as a change on top of `base`, the
+    overlapping parts are dropped from it, then it follows; the warning
+    names the change. Nothing is lost either way. Only `vl ws switch` to a
+    mounted workspace is refused (the directory and the mount would both
+    record into it), and `vl ws rm` while it is mounted. A workspace that
+    disappears (undo of its `vl ws new`) gets the overlay saved as a
+    change on top of `base`, and the mount unmounts itself.
+  * *Crash recovery.* The overlay is on disk, so a dead process loses
+    nothing that was closed. `vl ws unmount` finds no process behind the
+    socket and the lock free, detaches the dead mount (`fusermount3 -u
+    -z`), and records the overlay in-process with the same code; `vl ws
+    mount` of the workspace detaches it and serves the overlay as it is,
+    after recording it. `vl doctor` and every other command warn about a
+    mount whose process died. After an unmount, an overlay that still
+    holds files (isolated, ignored, quarantined) stays for the next mount;
+    `vl ws rm` wants `--force` for it.
+  * *The mountpoint* must be an empty directory outside the project
+    directory: the builder walking the project directory would otherwise
+    walk into the mount and record another workspace's files.
 * **Ephemeral workspaces** (`Repo::ephemeral_workspace`) are an
   `OverlayBackend` over a `TreeView`. Creating one is O(1) and committing one
   is O(changes). They never touch disk and are dropped afterwards. This is
@@ -2821,10 +2913,12 @@ programs), push/pull, and filesystem-event based notifications.
   file is), hunk-level rendering of many-sided conflicts, directory or
   symlink versions in a conflict (file/directory conflicts still move the
   file aside), and an external merge tool for `vl resolve`.
-* Front-ends: a FUSE mount of `TreeView` plus overlay for zero-copy
-  checkouts. (The WASM build of `veil-core` exists, §13; a browser
-  front-end on it, a persistent browser `StorageBackend` and a lock that
-  works across tabs do not yet.)
+* Front-ends: the FUSE mount (§6) has no NFS fallback for machines
+  without FUSE, holds an open file in memory, renames a directory by
+  copying it, and is not tested on macOS in CI; the project directory
+  itself is never a mount. (The WASM build of `veil-core` exists, §13; a
+  browser front-end on it, a persistent browser `StorageBackend` and a
+  lock that works across tabs do not yet.)
 * Symlink support in `DiskBackend`.
 * Git interop: Git tags (annotated or not) are not imported or exported,
   only branches; Git authors' time zones are not kept (export writes UTC);

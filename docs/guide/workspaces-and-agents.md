@@ -2,16 +2,17 @@
 
 A **workspace** is a line of work with its own working-copy change. Unlike a
 Git worktree it needs no directory: it lives in the repository, and you
-attach your project directory to it, run commands in its sandbox (a
-directory Veil keeps for it, so you never set up a worktree), or read and
-write its files directly.
+attach your project directory to it, mount it as a directory of its own
+(`vl ws mount`), run commands in its sandbox (a directory Veil keeps for
+it), or read and write its files directly. You never set up a worktree.
 
 1. [Virtual workspaces](#virtual-workspaces)
 2. [`vl ws exec`: run a command in a sandbox](#vl-ws-exec-run-a-command-in-a-sandbox)
 3. [One-shot runs: `--ephemeral`](#one-shot-runs---ephemeral)
 4. [Isolated files in sandboxes: `--with-isolated`](#with-isolated)
 5. [Sandboxes](#sandboxes)
-6. [Agents in the library: in-memory workspaces](#agents-in-the-library-in-memory-workspaces)
+6. [`vl ws mount`: a workspace as a directory](#vl-ws-mount-a-workspace-as-a-directory)
+7. [Agents in the library: in-memory workspaces](#agents-in-the-library-in-memory-workspaces)
 
 ## Virtual workspaces
 
@@ -34,7 +35,9 @@ $ vl ws list
 | `vl ws exec NAME -- CMD…` | Run `CMD` in `NAME`'s sandbox, which holds its files, and record the result in `NAME` |
 | `vl ws cat NAME PATH` | Print a file from a workspace |
 | `vl ws write NAME PATH < FILE` | Write stdin to a file in a workspace and record it, in memory. Fails, saying why, if the policy keeps the path out (an isolated `.env`, an ignored path) or the scanner quarantines it |
-| `vl ws rm [--force] NAME` | Delete a workspace (not the one your directory is attached to) and its sandbox. Refused while a `ws exec` runs in it, and, without `--force`, while its sandbox holds quarantined files (they are in no snapshot) |
+| `vl ws mount NAME DIR` | Mount `NAME` at `DIR` (FUSE): its files, read and written in place, recorded into `NAME`. See [below](#vl-ws-mount-a-workspace-as-a-directory) |
+| `vl ws unmount NAME` | Record what was written in the mount, and unmount it |
+| `vl ws rm [--force] NAME` | Delete a workspace (not the one your directory is attached to) and its sandbox. Refused while a `ws exec` runs in it or it is mounted, and, without `--force`, while its sandbox or mount keeps files no snapshot has (quarantined, isolated or ignored ones) |
 
 **Switching is safe to interrupt.** Before `vl ws switch` touches a file
 it notes in `.veil/local/checkout.json` where the directory is going. If it
@@ -205,6 +208,86 @@ Use the vault for secrets an agent needs (`vl run`), not files it writes.
 * A sandbox is an isolation of **files**, not a security boundary: the
   command runs as you, with your network and your home directory. Run
   untrusted agents inside your own container or VM.
+
+## `vl ws mount`: a workspace as a directory
+
+```text
+$ vl ws mount agent ../agent
+Mounted workspace agent at /home/me/agent (process 41022)
+  `vl ws unmount agent` records it and unmounts; until then other vl commands record it before they run
+$ cd ../agent && $EDITOR src/app.py && cargo test
+$ vl -R ../app diff -r agent@ --stat
+M src/app.py
+$ vl ws unmount agent
+Recorded lqosxltm 2b7d01aa (no description set)
+Unmounted workspace agent from /home/me/agent
+```
+
+A mount is a workspace as a real directory, with nothing copied: files
+are read from the workspace's snapshot when something reads them, and
+only what you change takes space. Use it instead of a worktree: one
+directory per line of work, any tool works in it, your project directory
+stays where it is.
+
+* **What you see** is what a checkout of the workspace would give you, as
+  you: cloaked files you are a member for, in plaintext; cloaked files you
+  are not, absent (or their last public version, as for an embargoed
+  fix); conflicted files with their markers. Nobody else on the machine,
+  not even root, can enter the mount, and its files are `0600` (`0700`
+  for executables).
+* **What you write** (new files, edits, deletions, renames, `mkdir`,
+  `chmod +x`, truncation) goes to a copy-on-write overlay in
+  `.veil/local/mounts/NAME/`, private to you, and is recorded into the
+  workspace through the same policy and secret scanner as your own
+  snapshots. Files the policy isolates (`.env`), ignores (`target/`) or
+  that look like a secret stay in the mount, as they would in your project
+  directory, and are never recorded (`vl` warns once about each).
+  Symlinks, hard links and special files are refused: Veil records files
+  and directories only.
+* **When it is recorded:** by `vl ws unmount`; before every other `vl`
+  command (as your project directory is), so `vl diff -r agent@`,
+  `vl merge agent@` or `vl commit` see what you wrote; every 60 seconds
+  while there are changes (`--record-every SECS`, `0` to turn it off);
+  and when something else unmounts it (`fusermount -u`). Edits reach the
+  overlay on disk when the file is closed (or `fsync`ed).
+* **One process serves a mount**: a background `vl` (its messages go to
+  `.veil/local/mounts/NAME/log`), or `vl ws mount --foreground`, which
+  serves until Ctrl-C (or `vl ws unmount`). A second mount of the same
+  workspace is refused.
+* **The workspace moving under the mount** (a `vl ws write`, a `vl ws
+  exec`, `vl describe -r agent@`, an undo) shows in the mount within about
+  a second, and your edits stay. If that move changed a file you also
+  changed in the mount since it was last recorded, your version is saved
+  as a change of its own first, and the mount shows the workspace's
+  (`workspace 'agent' changed under its mount …; the mount's version was
+  saved as change yrynnxov …`, in the log and in the next command's
+  output). Merge or abandon that change.
+* **Crashes lose nothing written.** If the serving process dies (`kill
+  -9`, a crash), the directory says `Transport endpoint is not connected`.
+  `vl ws unmount agent` detaches it and records what the overlay holds;
+  `vl ws mount agent DIR` again picks the overlay up as it is. `vl doctor`
+  and every `vl` command point out a mount whose process died.
+* **After unmounting**, files the workspace does not record (isolated,
+  ignored, quarantined) are kept in `.veil/local/mounts/NAME/` and are
+  there again at the next mount. `vl ws rm --force NAME` deletes them.
+* You can't mount the workspace your directory is attached to, mount
+  inside the project directory (every snapshot would walk into it), or on
+  a directory that is not empty. `vl ws switch` to a mounted workspace is
+  refused: unmount it first.
+* `vl ws unmount` refuses while something has a file open in the mount or
+  a shell is `cd`ed in it (`… is busy`); everything is recorded anyway.
+  Close it and run it again.
+* `vl` itself does not work from inside a mount (there is no `.veil`
+  there): use `vl -R <project> …`.
+* Renaming a directory copies its files into the overlay (a large tree
+  costs a copy); an open file is held in memory while it is open.
+
+**Requirements.** Linux: `/dev/fuse` and `fusermount3` (the `fuse3`
+package), nothing else; `vl` mounts without libfuse. macOS: install
+[macFUSE](https://macfuse.github.io) and build `vl` with
+`cargo build --release --features macfuse` (release builds for macOS are
+made without it, so they need no kernel extension). A `vl` built without
+FUSE says so.
 
 ## Agents in the library: in-memory workspaces
 

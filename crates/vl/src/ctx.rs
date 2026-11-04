@@ -258,6 +258,11 @@ impl Ctx {
         };
         let root = find_root(&start)
             .ok_or_else(|| anyhow!("no Veil repository found in {} or its parents (run `vl init`)", start.display()))?;
+        if snapshot {
+            // What was written in mounted workspaces is recorded first, as
+            // the project directory is below.
+            crate::mount::record_live(&root);
+        }
         let identity = load_identity()?;
         let user = user_for(&identity);
         let fs = Arc::new(DiskBackend::new(&root));

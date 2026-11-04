@@ -27,6 +27,21 @@ serde_json = { workspace = true, features = ["raw_value"] }
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+# `vl ws mount` (FUSE). Pure Rust on Linux: mounting goes through
+# `fusermount3`, no libfuse needed. On macOS it needs macFUSE, so it is
+# opt-in there: `cargo build --features macfuse`.
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.18", optional = true, default-features = false }
+[target.'cfg(target_os = "macos")'.dependencies]
+fuser_macos = { package = "fuser", version = "0.18", optional = true, default-features = false }
+
+[features]
+default = ["fuse"]
+# `vl ws mount` on Linux (no effect elsewhere).
+fuse = ["dep:fuser"]
+# `vl ws mount` on macOS: needs macFUSE (https://macfuse.github.io) to build and run.
+macfuse = ["fuse", "dep:fuser_macos"]
+
 [dev-dependencies]
 tempfile.workspace = true
 proptest = "1"

@@ -11,8 +11,6 @@ fixed**. Severity: high / medium / low.
   switch`, `vl edit`): `ws exec` sandboxes clone already
   (`StorageBackend::clone_known`); the project directory does not.
 - **Sparse sandboxes:** `vl ws exec --only src/ tests/`.
-- **Virtual filesystem working copy** (FUSE/NFS mount of `TreeView` +
-  overlay): instant workspaces with real files, edits only use space.
 - **Scale benchmark** at 1 GB and ~5 GB (init, status, commit, gc, push,
   clone, peak RAM), then fix what it exposes:
   - streaming / incremental `gc` (no whole-store pack in memory);
