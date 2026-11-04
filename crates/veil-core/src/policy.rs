@@ -11,6 +11,22 @@
 //!
 //! Tiers: `public`, `public!`, `cloak [scope]`, `isolate`, `ignore`.
 //!
+//! Patterns are globs (`*`, `**`, `?`, `[…]`, `{a,b}`). A backslash escapes
+//! the next character, so `config\[prod\].yml` matches that literal name and
+//! `my\ file.txt` contains a space; `vl cloak <existing path>` writes such
+//! escaped patterns itself (see [`escape_literal`]).
+//!
+//! **Case.** Built-in secret rules and user `cloak`/`isolate` rules match
+//! case-insensitively: on macOS and Windows `.ENV` *is* `.env`, and matching
+//! more paths there only ever protects more. Rules that expose (`public`,
+//! `public!`, the built-in `.env.example` exceptions) or stop tracking
+//! (`ignore`) stay case-sensitive.
+//!
+//! **Invalid rules fail safe.** A rule that names a reserved or malformed
+//! scope (`local`, `embargo/<id>`, `../x`, `UPPER`), an unknown tier, or no
+//! tier at all becomes `isolate` for its pattern, with a warning: a typo can
+//! keep a file off the record, never publish it.
+//!
 //! **Engine-enforced defaults** come first and cannot be weakened by a plain
 //! `public` rule: `.env`, `*.pem`, private SSH keys, … are `isolated` — they
 //! never enter the snapshot graph. They *may* be `cloak`ed (encrypted for a
@@ -18,7 +34,12 @@
 
 use globset::{GlobBuilder, GlobMatcher, GlobSet, GlobSetBuilder};
 
-use crate::{error::Result, vfs::StorageBackend, vpath::VPath};
+use crate::{
+    error::{Result, VeilError},
+    keychain::validate_scope_name,
+    vfs::StorageBackend,
+    vpath::VPath,
+};
 
 pub const POLICY_FILE: &str = ".veilpolicy";
 pub const DEFAULT_SCOPE: &str = "team";
@@ -93,8 +114,82 @@ fn compile_set(rules: &[Rule]) -> GlobSet {
 }
 
 
+/// Characters with a meaning in a policy pattern.
+const SPECIAL: &[char] = &['*', '?', '[', ']', '{', '}', '\\', '#'];
+
+/// Does `pattern` use glob syntax (or escapes)?
+pub fn has_glob_syntax(pattern: &str) -> bool {
+    pattern.contains(SPECIAL)
+}
+
+/// A pattern that matches exactly the literal path `path` (directory
+/// slashes kept): glob metacharacters, `#` and whitespace are escaped.
+pub fn escape_literal(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 8);
+    for c in path.chars() {
+        if SPECIAL.contains(&c) || c.is_whitespace() {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Escape what would otherwise split or end a policy field (whitespace and
+/// `#`), keeping glob syntax and existing escapes as they are.
+pub fn escape_field(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            out.push(c);
+            if let Some(n) = chars.next() {
+                out.push(n);
+            }
+            continue;
+        }
+        if c == '#' || c.is_whitespace() {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Split a policy line into fields: whitespace separates fields unless
+/// escaped, and an unescaped `#` starts a comment. Escapes are kept in the
+/// fields (the glob compiler interprets them).
+fn fields(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                cur.push(c);
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            '#' => break,
+            c if c.is_whitespace() => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 impl Rule {
     fn new(pattern: &str, tier: Tier, force: bool, builtin: bool, secret: bool) -> Result<Rule, String> {
+        // Protective rules match case-insensitively (see the module docs).
+        let case_insensitive = (builtin && secret) || (!builtin && matches!(tier, Tier::Cloaked(_) | Tier::Isolated));
         let mut p = pattern.trim().to_string();
         let dir_only = p.ends_with('/');
         while p.ends_with('/') {
@@ -113,6 +208,8 @@ impl Rule {
         let build = |g: &str| {
             GlobBuilder::new(g)
                 .literal_separator(true)
+                .backslash_escape(true)
+                .case_insensitive(case_insensitive)
                 .build()
                 .map(|g| g.compile_matcher())
                 .map_err(|e| format!("bad pattern '{pattern}': {e}"))
@@ -193,34 +290,48 @@ impl Policy {
     pub fn parse(text: &str) -> Policy {
         let mut policy = Self::builtin();
         for (n, line) in text.lines().enumerate() {
-            let line = line.split('#').next().unwrap_or("").trim();
-            if line.is_empty() {
+            let parts = fields(line);
+            if parts.is_empty() {
                 continue;
             }
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 2 {
-                policy.warnings.push(format!("{POLICY_FILE}:{}: expected '<pattern> <tier>'", n + 1));
-                continue;
-            }
-            let (tier, force) = match parts[1] {
-                "public" => (Tier::Public, false),
-                "public!" => (Tier::Public, true),
-                "cloak" | "cloaked" => (
-                    Tier::Cloaked(parts.get(2).copied().unwrap_or(DEFAULT_SCOPE).to_string()),
-                    false,
-                ),
-                "isolate" | "isolated" | "local" => (Tier::Isolated, false),
-                "ignore" | "ignored" => (Tier::Ignored, false),
-                other => {
-                    policy
-                        .warnings
-                        .push(format!("{POLICY_FILE}:{}: unknown tier '{other}'", n + 1));
-                    continue;
-                }
+            let at = format!("{POLICY_FILE}:{}", n + 1);
+            // Invalid rules fail safe: isolate what they name.
+            let mut invalid = |why: String| {
+                policy.warnings.push(format!("{at}: {why}; treating '{}' as isolate", parts[0]));
+                (Tier::Isolated, false)
             };
-            match Rule::new(parts[0], tier, force, false, false) {
+            let (tier, force) = match parts.get(1).map(String::as_str) {
+                None => invalid("expected '<pattern> <tier>'".into()),
+                Some("public") => (Tier::Public, false),
+                Some("public!") => (Tier::Public, true),
+                Some("cloak" | "cloaked") => {
+                    let scope = parts.get(2).map(String::as_str).unwrap_or(DEFAULT_SCOPE);
+                    match validate_scope_name(scope) {
+                        Ok(()) => (Tier::Cloaked(scope.to_string()), false),
+                        Err(VeilError::Policy(why)) => invalid(why),
+                        Err(e) => invalid(e.to_string()),
+                    }
+                }
+                Some("isolate" | "isolated" | "local") => (Tier::Isolated, false),
+                Some("ignore" | "ignored") => (Tier::Ignored, false),
+                Some(other) => invalid(format!("unknown tier '{other}'")),
+            };
+            match Rule::new(&parts[0], tier.clone(), force, false, false) {
                 Ok(r) => policy.rules.push(r),
-                Err(e) => policy.warnings.push(format!("{POLICY_FILE}:{}: {e}", n + 1)),
+                // Not a valid glob. A protective rule falls back to the
+                // literal name (`config[prod.yml`), so it still protects
+                // what it names; an exposing one is dropped.
+                Err(e) if tier != Tier::Public => {
+                    match Rule::new(&escape_literal(&parts[0]), tier, force, false, false) {
+                        Ok(mut r) => {
+                            policy.warnings.push(format!("{at}: {e}; matching '{}' as a literal name", parts[0]));
+                            r.pattern = parts[0].clone();
+                            policy.rules.push(r);
+                        }
+                        Err(_) => policy.warnings.push(format!("{at}: {e}")),
+                    }
+                }
+                Err(e) => policy.warnings.push(format!("{at}: {e}")),
             }
         }
         policy.set = compile_set(&policy.rules);
@@ -317,5 +428,43 @@ mod tests {
         assert!(f.allow_secrets);
         assert_eq!(p.classify(&VPath::new("target").unwrap(), true).tier, Tier::Ignored);
         assert_eq!(class(&p, "target"), Tier::Public, "dir-only rule does not match a file");
+    }
+
+    #[test]
+    fn escapes_and_fields() {
+        let p = Policy::parse(&format!(
+            "{} cloak\n{} isolate # comment\nissue\\#1.md ignore\n",
+            escape_literal("config[prod].yml"),
+            escape_literal("my notes.txt")
+        ));
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        assert_eq!(class(&p, "config[prod].yml"), Tier::Cloaked("team".into()));
+        assert_eq!(class(&p, "configp.yml"), Tier::Public, "no longer a character class");
+        assert_eq!(class(&p, "my notes.txt"), Tier::Isolated);
+        assert_eq!(class(&p, "issue#1.md"), Tier::Ignored);
+        assert_eq!(escape_field("a b#c\\#d*"), "a\\ b\\#c\\#d*");
+    }
+
+    #[test]
+    fn protective_rules_ignore_case_exposing_rules_do_not() {
+        let p = Policy::parse("secrets/ cloak\nkeys/ isolate\nfixtures/ public!\nbuild/ ignore\n");
+        assert_eq!(class(&p, "Secrets/a"), Tier::Cloaked("team".into()));
+        assert_eq!(class(&p, "KEYS/a"), Tier::Isolated);
+        assert_eq!(class(&p, "Fixtures/a"), Tier::Public);
+        assert_eq!(p.classify(&VPath::new("Fixtures/a.pem").unwrap(), false).tier, Tier::Isolated);
+        assert_eq!(class(&p, "Build/a"), Tier::Public);
+        assert_eq!(class(&p, ".Env.Example"), Tier::Isolated, "exceptions to secret rules stay exact");
+        assert_eq!(class(&p, ".env.example"), Tier::Public);
+    }
+
+    #[test]
+    fn invalid_rules_fail_safe() {
+        let p = Policy::parse("a/ cloak local\nb/ cloak embargo/x\nc/ clok\nd/\ne[ cloak\nf[ public!\n");
+        for path in ["a/x", "b/x", "c/x", "d/x"] {
+            assert_eq!(class(&p, path), Tier::Isolated, "{path}: {:?}", p.warnings);
+        }
+        assert_eq!(class(&p, "e["), Tier::Cloaked("team".into()), "a bad glob still protects its literal name");
+        assert_eq!(class(&p, "f[/k.pem"), Tier::Isolated, "an invalid exposing rule is dropped");
+        assert_eq!(p.warnings.len(), 6, "{:?}", p.warnings);
     }
 }

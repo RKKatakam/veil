@@ -15,7 +15,8 @@ use clap::Parser;
 use veil_core::{
     commands::EmbargoSpec,
     now_millis,
-    policy::{format_rule, Policy, Tier, POLICY_FILE},
+    keychain::validate_scope_name,
+    policy::{escape_field, escape_literal, format_rule, has_glob_syntax, Policy, Tier, POLICY_FILE},
     remote,
     repo::{RemoteConfig, DEFAULT_WORKSPACE},
     secrets,
@@ -40,6 +41,9 @@ const DEFAULT_POLICY: &str = "\
 #   cloak     encrypted for members of a scope (default scope: team)
 #   isolate   local-only: never snapshotted, never pushed
 #   ignore    not tracked at all
+#
+# Patterns are globs. Escape * ? [ ] { } # and spaces with \\ to match them
+# literally (`vl cloak <existing path>` does this for you).
 #
 # Engine-enforced: .env, .env.*, *.pem, *.key, id_rsa, … are isolated by
 # default and cannot be made public by a plain `public` rule. Public files are
@@ -183,6 +187,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Embargo(c) => cmd_embargo(ctx, c)?,
         Cmd::Tag(c) => cmd_tag(ctx, c)?,
         Cmd::Cloak { patterns, scope } => {
+            validate_scope_name(scope)?;
             if !ctx.repo.keys().is_member(scope) {
                 bail!("you hold no current key for scope '{scope}' (create it with `vl scope create {scope}`)");
             }
@@ -642,6 +647,36 @@ fn cmd_tag(ctx: &mut Ctx, c: &TagCmd) -> Result<()> {
 
 // ---- visibility ----------------------------------------------------------
 
+/// The `.veilpolicy` pattern for a command-line argument, and whether it
+/// was taken literally. An argument naming an existing path matches exactly
+/// that path, even if the name contains glob characters (`config[prod].yml`,
+/// Next.js `app/[id]/`); anything else is a glob. Whitespace and `#` are
+/// always escaped so the rule stays one field.
+fn rule_pattern(ctx: &Ctx, arg: &str) -> (String, bool) {
+    let arg = arg.trim();
+    if has_glob_syntax(arg) && !arg.contains('\\') {
+        let lead = if arg.starts_with('/') { "/" } else { "" };
+        let core = arg.trim_start_matches('/');
+        let trail = if core.ends_with('/') { "/" } else { "" };
+        let core = core.trim_end_matches('/');
+        let exists_at = |vp: Option<VPath>| vp.and_then(|vp| ctx.fs.metadata(&vp).ok().flatten()).is_some();
+        // Patterns are relative to the root; a bare name matches at any
+        // depth, so also look for it below the current directory.
+        let exists = exists_at(VPath::new(core).ok())
+            || (lead.is_empty() && !core.contains('/') && exists_at(ctx.repo_path(core).ok()));
+        if exists {
+            return (format!("{lead}{}{trail}", escape_literal(core)), true);
+        }
+        if arg.contains(['[', ']', '{', '}']) {
+            warn(&format!(
+                "'{arg}' is not an existing path, so it is a glob pattern; to match a file with this literal name, escape the characters with '\\' (e.g. {})",
+                escape_literal(arg)
+            ));
+        }
+    }
+    (escape_field(arg), false)
+}
+
 fn cmd_policy_rules(ctx: &mut Ctx, patterns: &[String], tier: Tier, force: bool) -> Result<()> {
     let path = VPath::new(POLICY_FILE)?;
     let mut text = match ctx.fs.read_opt(&path)? {
@@ -658,10 +693,12 @@ fn cmd_policy_rules(ctx: &mut Ctx, patterns: &[String], tier: Tier, force: bool)
     };
     let history = tree_paths(&ctx.repo, &parent_tree)?;
     for p in patterns {
-        let line = format_rule(p, &tier, force);
+        let (pattern, literal) = rule_pattern(ctx, p);
+        let line = format_rule(&pattern, &tier, force);
         text.push_str(&line);
         text.push('\n');
-        println!("Added rule  {}", bold(line.trim()));
+        let note = if literal { dim("  (literal path: glob characters escaped)") } else { String::new() };
+        println!("Added rule  {}{note}", bold(line.trim()));
         if matches!(tier, Tier::Cloaked(_) | Tier::Isolated) {
             let single = Policy::parse(&line);
             let exposed: Vec<&VPath> = history

@@ -162,6 +162,8 @@ impl CacheKey {
 pub fn key_state(keys: &Keychain) -> Result<ObjectId> {
     let mut h = blake3::Hasher::new();
     h.update(b"veil statcache key-state v1\0");
+    // "Scanned clean" facts only hold for the scanner that produced them.
+    h.update(&crate::secrets::RULES_VERSION.to_le_bytes());
     if let Some(id) = keys.identity() {
         h.update(id.public_hex().as_bytes());
     }
