@@ -67,7 +67,7 @@ use veil_core::{
     ObjectId, Repo, VPath,
 };
 
-use self::fs::{Journal, Lower, MountFs, ReaderView};
+use self::fs::{DiskFiles, Journal, Lower, MountFs, ReaderView};
 use crate::{
     ctx::{load_identity, user_for, Ctx},
     render::{bold, one_line, safe, warn},
@@ -367,7 +367,9 @@ impl Recorder {
         let upper: Arc<dyn StorageBackend> = Arc::new(DiskBackend::new(&paths.upper));
         let whiteouts = paths.load_whiteouts();
         let fs = Arc::new(
-            MountFs::new(lower, upper, whiteouts, Some(Box::new(DiskJournal { paths: paths.clone() }))).with_unseen(paths.load_unseen()),
+            MountFs::new(lower, upper, whiteouts, Some(Box::new(DiskJournal { paths: paths.clone() })))
+                .with_files(Arc::new(DiskFiles::new(&paths.upper)))
+                .with_unseen(paths.load_unseen()),
         );
         Ok(Recorder {
             root: root.to_path_buf(),
@@ -443,7 +445,7 @@ impl Recorder {
             self.fs.persist_all().map_err(fs_err)?;
             let desc = format!("edits made in the mount of workspace {} (they conflicted with a change to the workspace)", self.ws);
             let shown = self.shown(repo, &old)?;
-            let (id, _) = self.fs.with_view(|ov| repo.commit_fs_as_child_with(old, ov, &desc, None, Some(&shown), &[]))?;
+            let (id, _) = self.fs.with_view(|ov| repo.commit_fs_as_child_with(old, ov, &desc, None, Some(&shown), &[], true))?;
             let change = repo.snapshot(&id)?.change_id.short();
             // Give up only what the saved change holds: an upper file it
             // left out (quarantined, held back) stays, over the new tree.
@@ -519,6 +521,9 @@ impl Recorder {
                         // and keeps what it recorded (BUG-538).
                         description: Some(mount_record_op_description(&ws)),
                         materialised: Some(&shown),
+                        // Whoever writes in the mount (an agent, a tool, the
+                        // member) is not known to be the member (BUG-560).
+                        policy_from_command: true,
                         ..Default::default()
                     },
                 )?;
@@ -564,6 +569,9 @@ impl Recorder {
         for (p, why) in &r.cloak_failures {
             lines.push(format!("{} held back: {}", safe(p.as_str()), safe(why)));
         }
+        if let Some(msg) = crate::render::policy_edit_held_message(r, Some(("the mount", self.ws.as_str()))) {
+            lines.push(msg);
+        }
         let sig = lines.join("\n");
         if sig != self.said {
             notes.extend(lines);
@@ -581,7 +589,7 @@ impl Recorder {
                 let base = self.base()?;
                 self.refresh(repo)?;
                 let shown = self.shown(repo, &base)?;
-                let (id, _) = self.fs.with_view(|ov| repo.commit_fs_as_child_with(base, ov, &desc, None, Some(&shown), &[]))?;
+                let (id, _) = self.fs.with_view(|ov| repo.commit_fs_as_child_with(base, ov, &desc, None, Some(&shown), &[], true))?;
                 Ok(repo.snapshot(&id)?.change_id.short())
             })();
             notes.push(match saved {

@@ -134,7 +134,7 @@ fn a_restored_sealed_version_stays_sealed_on_the_recovery_path() {
     let (tree, _) = repo.build_amending_carried(&*fs, &held, None, None, &carried).unwrap();
     assert_eq!(entry_of(&repo, tree), sealed);
     let (saved, _) = repo
-        .commit_fs_as_child_with(held, &*fs, "recovered working-copy edits", None, None, &carried)
+        .commit_fs_as_child_with(held, &*fs, "recovered working-copy edits", None, None, &carried, false)
         .unwrap();
     let saved_tree = repo.snapshot(&saved).unwrap().tree;
     assert_eq!(entry_of(&repo, saved_tree), sealed, "the recovered change made the sealed version public");

@@ -1132,7 +1132,9 @@ pub fn take_out_unchanged(fs: &SandboxFs, entries: &[ReaperEntry]) {
 /// applies it and records it unchanged. Deleting `.veilpolicy` in a
 /// sandbox thus never declassifies a cloaked file (BUG-553), and an
 /// unreadable one never fails the recording (BUG-554). Only a regular,
-/// readable `.veilpolicy` is an edit of the policy.
+/// readable `.veilpolicy` is an edit of the policy, and one that weakens
+/// the recorded policy is held back by the recording (BUG-560, see
+/// `SnapshotOptions::policy_from_command`).
 #[derive(Debug)]
 pub struct PolicyPin<'a> {
     inner: &'a dyn StorageBackend,

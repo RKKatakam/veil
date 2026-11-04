@@ -13,5 +13,6 @@ mod common;
 pub use common::*;
 
 mod mount;
+mod policy_edits;
 mod sandbox;
 mod vault;

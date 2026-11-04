@@ -1591,6 +1591,49 @@ fn cmd_policy_rules(ctx: &mut Ctx, patterns: &[String], tier: Tier, force: bool)
     Ok(())
 }
 
+/// The edit of `.veilpolicy` a command made in virtual workspace `ws` that
+/// its recordings hold back (BUG-560): the `.veilpolicy` its mount's
+/// overlay or its `vl ws exec` sandbox holds, where that differs from the
+/// workspace's recorded one.
+fn held_policy_edit(ctx: &Ctx, ws: &str) -> Result<Vec<u8>> {
+    let wc = ctx.repo.workspace_wc(ws)?;
+    let tree = ctx.repo.snapshot(&wc)?.tree;
+    let recorded = match lookup(ctx.repo.store(), &tree, &VPath::new(POLICY_FILE)?)? {
+        Some(e) => Some(ctx.repo.store().read_entry(&e)?),
+        None => None,
+    };
+    let places = [
+        ("its mount", mount::Paths::new(&ctx.root, ws).upper),
+        ("its sandbox", veil_core::sandbox::SandboxPaths::new(&ctx.root, ws).files),
+    ];
+    let mut found: Vec<(&str, Vec<u8>)> = Vec::new();
+    for (place, dir) in places {
+        let path = dir.join(POLICY_FILE);
+        // A regular file only, never through a symlink.
+        if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+            continue;
+        }
+        let data = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        if recorded.as_ref() != Some(&data) && !found.iter().any(|(_, d)| *d == data) {
+            found.push((place, data));
+        }
+    }
+    match found.len() {
+        0 => bail!(
+            "nothing to accept: neither the sandbox nor the mount of workspace '{}' holds a {POLICY_FILE} that differs \
+             from the recorded one",
+            safe(ws)
+        ),
+        1 => Ok(found.remove(0).1),
+        _ => bail!(
+            "{} and {} of workspace '{}' hold different edits of {POLICY_FILE}; make them agree (or remove one) first",
+            found[0].0,
+            found[1].0,
+            safe(ws)
+        ),
+    }
+}
+
 fn cmd_policy(ctx: &mut Ctx, c: &PolicyCmd) -> Result<()> {
     // What snapshots apply: `.veilpolicy`, guarded by the accepted policy.
     let policy = ctx.repo.effective_policy(&*ctx.fs)?;
@@ -1629,7 +1672,30 @@ fn cmd_policy(ctx: &mut Ctx, c: &PolicyCmd) -> Result<()> {
             }
         }
         PolicyCmd::ImportGitignore(a) => colocate_cmd::import_gitignore(ctx, a)?,
-        PolicyCmd::Accept => {
+        PolicyCmd::Accept { workspace: Some(ws) } => {
+            if *ws == ctx.ws {
+                bail!("workspace '{}' is attached to the project directory: run `vl policy accept` there", safe(ws));
+            }
+            let text = held_policy_edit(ctx, ws)?;
+            let (out, held) = ctx.repo.accept_workspace_policy(ws, &text)?;
+            print_build_warnings(&out.report);
+            if held.is_empty() {
+                println!("Recorded the edit of {POLICY_FILE} in workspace '{}'; it weakens the protection of no file", safe(ws));
+            } else {
+                println!(
+                    "Recorded the edit of {POLICY_FILE} in workspace '{}'. Protection weakened for {} path(s):",
+                    safe(ws),
+                    held.len()
+                );
+                for h in &held {
+                    println!("  {}: {} → {}", safe(&h.shown_path()), h.accepted, yellow(&h.wanted));
+                }
+            }
+            if out.changed {
+                println!("Recorded {}", one_line(&ctx.repo, &out.snapshot));
+            }
+        }
+        PolicyCmd::Accept { workspace: None } => {
             let held = ctx.repo.accept_policy(&*ctx.fs)?;
             ctx.repo.record_outside_view(
                 format!("accept {POLICY_FILE}"),

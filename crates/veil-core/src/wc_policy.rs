@@ -14,9 +14,21 @@
 //!
 //! Other backends (sandboxes of `vl ws exec`, overlays, ephemeral
 //! workspaces, trees being imported) hold no local-only files of this
-//! member and are snapshotted under their own `.veilpolicy`, as before; they
-//! never move the accepted policy either, so an agent editing `.veilpolicy`
-//! in a sandbox cannot accept it on the member's behalf.
+//! member and are snapshotted under their own `.veilpolicy`; they never
+//! move the accepted policy either, so an agent editing `.veilpolicy` in a
+//! sandbox cannot accept it on the member's behalf.
+//!
+//! Where the files were written by a command rather than the member (a
+//! `vl ws exec` sandbox, a mount: `SnapshotOptions::policy_from_command`),
+//! the recorded `.veilpolicy` (of the tree the files were synced from) is
+//! the pin (`Repo::command_policy`, BUG-560): an edit that only protects
+//! more is recorded and applies; one that weakens it, or could, is held
+//! back. The paths it would weaken keep their recorded classification
+//! (reported in [`BuildReport::policy_held_back`]), its stronger rules
+//! apply, and the tree keeps the recorded `.veilpolicy`, so the next run,
+//! which starts from that tree, is pinned the same way. The edit stays
+//! where the command made it until the member records it with
+//! [`Repo::accept_workspace_policy`] (`vl policy accept --workspace`).
 //!
 //! [`BuildReport::policy_held_back`]: crate::builder::BuildReport::policy_held_back
 
@@ -26,11 +38,61 @@ use crate::{
     error::{Result, VeilError},
     id::ObjectId,
     object::is_reserved_name,
-    policy::{self, HeldBack, Policy, PolicyFile, Tier, WorkingCopyPolicy, POLICY_FILE},
+    policy::{self, CommandEdit, HeldBack, Policy, PolicyFile, Tier, WorkingCopyPolicy, POLICY_FILE},
     repo::Repo,
     vfs::{is_temp_name, NodeKind, StorageBackend},
     vpath::VPath,
+    workspace::{SnapshotOptions, WcSnapshot},
 };
+
+/// The policy a recording of files a command wrote applies (see
+/// [`Repo::command_policy`]).
+#[derive(Debug)]
+pub(crate) struct CommandPolicy {
+    pub policy: Policy,
+    /// `.veilpolicy` was edited in a way that may weaken the recorded one:
+    /// how, and why (for
+    /// [`BuildReport::policy_edit_held`](crate::builder::BuildReport::policy_edit_held)). Held back
+    /// (`hold_command_edit`) unless it is [`CommandEdit::Adds`] and no
+    /// path of the snapshot is held back.
+    pub edit: Option<(CommandEdit, String)>,
+}
+
+/// Every path of `fs` that `policy` keeps under its accepted classification,
+/// and directories the accepted policy ignores that it would not (as a
+/// whole, as snapshots report them).
+fn held_back_in(fs: &dyn StorageBackend, policy: &Policy) -> Result<Vec<HeldBack>> {
+    if policy.accepted().is_none() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut stack = vec![VPath::root()];
+    while let Some(dir) = stack.pop() {
+        for child in fs.list_dir(&dir)? {
+            if is_reserved_name(&child.name) || is_temp_name(&child.name) {
+                continue;
+            }
+            let path = dir.join(&child.name);
+            let is_dir = child.kind == NodeKind::Dir;
+            let c = policy.classify(&path, is_dir);
+            if is_dir && c.tier != Tier::Ignored {
+                // Never recorded here, so nothing to hold back (BUG-200).
+                if !crate::vfs::is_nested_repository(fs, &path)? {
+                    stack.push(path);
+                }
+            } else if let Some((tier, force)) = &c.held_back {
+                out.push(HeldBack {
+                    path,
+                    accepted: c.keyword(),
+                    wanted: policy::tier_keyword(tier, *force),
+                    dir: is_dir,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
 
 impl Repo {
     /// Is `fs` the repository's own directory (the backend it was opened
@@ -94,37 +156,87 @@ impl Repo {
     /// accepted policy ignores that it would not (as a whole, as snapshots
     /// report them).
     pub fn policy_held_back(&self, fs: &dyn StorageBackend) -> Result<Vec<HeldBack>> {
-        let policy = self.effective_policy(fs)?;
-        if policy.accepted().is_none() {
-            return Ok(Vec::new());
-        }
-        let mut out = Vec::new();
-        let mut stack = vec![VPath::root()];
-        while let Some(dir) = stack.pop() {
-            for child in fs.list_dir(&dir)? {
-                if is_reserved_name(&child.name) || is_temp_name(&child.name) {
-                    continue;
+        held_back_in(fs, &self.effective_policy(fs)?)
+    }
+
+    /// The policy a recording applies to files a command wrote (a `vl ws
+    /// exec` sandbox, a mount), not the member: `parent_tree` is the tree
+    /// they were synced from, whose `.veilpolicy` is the pin (BUG-560).
+    ///
+    /// * The same rules, or an edit that only protects more
+    ///   ([`CommandEdit::Strengthens`]): the edit applies and is recorded.
+    /// * Any other regular `.veilpolicy`: it applies where it is stronger,
+    ///   the recorded policy where it would be weaker; whether the edit is
+    ///   held back is decided once the snapshot's paths are known
+    ///   (`hold_command_edit`).
+    /// * Deleted, a symlink, unreadable: the recorded policy applies, and
+    ///   the tree keeps it (a deleted policy file never lifts protection,
+    ///   BUG-553; an unreadable one never fails the recording, BUG-554).
+    pub(crate) fn command_policy(&self, fs: &dyn StorageBackend, parent_tree: &ObjectId) -> Result<CommandPolicy> {
+        let Some(recorded) = self.policy_text_in(parent_tree)? else {
+            // The recorded policy cannot be read (only a hostile tree):
+            // nothing to pin, as before.
+            return Ok(CommandPolicy {
+                policy: Policy::load_or_accepted(fs, None)?.0,
+                edit: None,
+            });
+        };
+        let pinned = Policy::parse(&String::from_utf8_lossy(recorded.as_deref().unwrap_or_default()));
+        let held = |why: String| {
+            Ok(CommandPolicy {
+                policy: pinned.clone(),
+                edit: Some((CommandEdit::Weakens, why)),
+            })
+        };
+        match policy::read_policy_file(fs)? {
+            PolicyFile::File(text) => {
+                let edited = Policy::parse(&String::from_utf8_lossy(&text));
+                if recorded.as_deref() == Some(text.as_slice()) {
+                    return Ok(CommandPolicy { policy: edited, edit: None });
                 }
-                let path = dir.join(&child.name);
-                let is_dir = child.kind == NodeKind::Dir;
-                let c = policy.classify(&path, is_dir);
-                if is_dir && c.tier != Tier::Ignored {
-                    // Never recorded here, so nothing to hold back (BUG-200).
-                    if !crate::vfs::is_nested_repository(fs, &path)? {
-                        stack.push(path);
-                    }
-                } else if let Some((tier, force)) = &c.held_back {
-                    out.push(HeldBack {
-                        path,
-                        accepted: c.keyword(),
-                        wanted: policy::tier_keyword(tier, *force),
-                        dir: is_dir,
-                    });
+                match policy::command_edit(&pinned, &edited) {
+                    CommandEdit::Strengthens => Ok(CommandPolicy { policy: edited, edit: None }),
+                    kind => Ok(CommandPolicy {
+                        policy: edited.guarded_by(pinned),
+                        edit: Some((kind, "could classify some paths more weakly than the recorded policy".to_string())),
+                    }),
                 }
             }
+            PolicyFile::Absent if recorded.is_none() => Ok(CommandPolicy {
+                policy: Policy::builtin(),
+                edit: None,
+            }),
+            PolicyFile::Absent => held("was deleted".to_string()),
+            PolicyFile::Linked(_) => held("is a symlink".to_string()),
+            PolicyFile::Unavailable(why) => held(format!("cannot be read ({why})")),
         }
-        out.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(out)
+    }
+
+    /// Record `text` as the `.veilpolicy` of virtual workspace `ws`, as the
+    /// member's decision (`vl policy accept --workspace`): an edit a
+    /// command made in the workspace's sandbox or mount that was held back
+    /// because it weakens the recorded policy (see
+    /// `Repo::command_policy`). Returns the recording and the paths of
+    /// the workspace whose protection this weakens.
+    pub fn accept_workspace_policy(&mut self, ws: &str, text: &[u8]) -> Result<(WcSnapshot, Vec<HeldBack>)> {
+        let wc = self.workspace_wc(ws)?;
+        let tree = self.snapshot(&wc)?.tree;
+        let overlay = self.workspace_overlay(ws)?;
+        overlay.write(&VPath::new(POLICY_FILE)?, text)?;
+        let held = held_back_in(&overlay, &self.command_policy(&overlay, &tree)?.policy)?;
+        let out = self.snapshot_workspace_with(
+            ws,
+            &overlay,
+            SnapshotOptions {
+                description: Some(format!("accept {POLICY_FILE} in workspace '{ws}'")),
+                expected_wc: Some(wc),
+                ..Default::default()
+            },
+        )?;
+        if out.superseded {
+            return Err(VeilError::repo(format!("workspace '{ws}' moved meanwhile; try again")));
+        }
+        Ok((out, held))
     }
 
     /// Accept the `.veilpolicy` of working copy `fs` (`vl policy accept`):

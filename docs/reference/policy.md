@@ -42,6 +42,12 @@ Apply the working copy's .veilpolicy in full, including changes that arrived by 
 vl policy accept [OPTIONS]
 ```
 
+Options:
+
+| | |
+|---|---|
+| `--workspace <NAME>` | Record instead the edit of .veilpolicy a command made in this virtual workspace's `vl ws exec` sandbox or mount, held back because it weakens the workspace's recorded policy |
+
 ## `vl policy import-gitignore`
 
 Add an `ignore` rule for each `.gitignore` pattern that matches a file here, so files Git ignores are not recorded (not implemented yet)

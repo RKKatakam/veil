@@ -645,13 +645,43 @@ CAS, and it applies these rules in order:
      `vl ws exec`, overlays, ephemeral workspaces and imported trees hold
      no local-only files of the member (injected secrets are caught by
      `InjectedSecrets`) and use their own `.veilpolicy`; an agent editing
-     `.veilpolicy` in a sandbox cannot accept it for the member. In a
+     `.veilpolicy` in a sandbox cannot accept it for the member, nor
+     weaken it (below). In a
      `ws exec` sandbox only a regular, readable `.veilpolicy` is an edit:
      a deleted, unreadable, symlinked or directory one is replaced, for the
      snapshot, by the `.veilpolicy` of the tree the sandbox was synced from
      (`sandbox::PolicyPin`), which is applied and recorded unchanged, with
      a warning (BUG-553/554). A sandbox has no accepted pin of its own that
-     could keep guarding its next run, so the recorded policy is the pin. The
+     could keep guarding its next run, so the recorded policy is the pin.
+   * **A command is not the member** (BUG-560). In a sandbox the editor of
+     `.veilpolicy` is the command (an agent, typically), not the member, so
+     its edit is an incoming change. Recordings of files a command wrote
+     (`ws exec` sandboxes, full, sparse and ephemeral, and mounts:
+     `SnapshotOptions::policy_from_command`) are pinned by the recorded
+     policy, the `.veilpolicy` of the tree the files were synced from
+     (`Repo::command_policy`, `policy::command_edit`). An edit that cannot
+     weaken it (the same rules, appended `isolate`/`ignore` rules, dropped
+     `public!` ones, or anything the exhaustive check of the fold proves
+     never weaker) is recorded and applies. One that only inserts `cloak`,
+     `isolate` or `ignore` rules is recorded unless it weakens a path of
+     the snapshot (a cloak rule lifting `target/ ignore`, or moving a
+     cloaked file to another scope). Anything else (truncating the file,
+     removing a rule, `public!`, `** public`, retargeting a scope) is
+     **held back**: it applies where it is stronger, the recorded
+     classification where it would be weaker (reported as for a pull,
+     `BuildReport::policy_held_back`), and the tree keeps the recorded
+     `.veilpolicy` (`BuildReport::policy_edit_held`). The next run starts
+     from that tree, so it is pinned the same way, and no device state is
+     needed. A deleted, symlinked or unreadable `.veilpolicy` in a mount is
+     held back the same way. The edit stays where the command made it (the
+     sandbox's files, the mount's overlay; a throwaway sandbox loses it,
+     with a warning) until the member records it with `vl policy accept
+     --workspace NAME` (`Repo::accept_workspace_policy`), which lists the
+     paths it weakens; that recording reclassifies them. The mount counts
+     as a command: tools and agents write there too. `vl ws write` is the
+     member's own command and records what it is given; `vl serve` has no
+     method that writes a file (its `snapshot` records the project
+     directory, under the accepted policy). The
      stale-checkout recovery path (`build_from`, `commit_fs_as_child` on the
      working copy) is guarded but never treats a policy difference as the
      member's edit.
@@ -1559,7 +1589,9 @@ A workspace is only a named pointer in the view. It owns no directory.
      so they stop the command, not the recording;
   7. records with `expected_wc` = the snapshot it synced to, through
      `PolicyPin` (the recorded `.veilpolicy` when the sandbox's is not a
-     regular, readable file) and with the guard of every isolated file
+     regular, readable file), as the command's output
+     (`policy_from_command`: an edit of `.veilpolicy` that weakens the
+     recorded one is held back, §4, BUG-560) and with the guard of every isolated file
      ever injected into the sandbox (not only this run's: BUG-547). If the
      workspace moved meanwhile, the result is saved as a child of that
      snapshot instead of reverting the move. The snapshot it was recorded
@@ -1677,15 +1709,23 @@ A workspace is only a named pointer in the view. It owns no directory.
     uses (BUG-534).
   * *Requests.* `MountFs` is the whole file system in terms of inode
     numbers, handles and errno (so it is unit-tested over
-    `MemoryBackend`s, without a kernel); the adapter only translates. An
-    open file's content is a buffer (one decryption per open, writes at
-    any offset in memory) that reaches the upper layer, durably (temp
-    file, fsync, rename), on `flush` (every `close`), `fsync` and
-    `release`. No file grows past the largest object Veil records
+    `MemoryBackend`s, without a kernel); the adapter only translates.
+    **Open files live on disk** (BUG-561): the first write or `truncate`
+    of a file only the lower layer has copies it up into the upper layer
+    (durably: temp file, fsync, rename), and from then on reads and
+    writes go straight to that upper file, opened in place
+    (`mount::fs::UpperFiles`, `DiskFiles`: `O_NOFOLLOW`, `pread`/`pwrite`,
+    `ftruncate`), synced on `flush` (every `close`), `fsync` and `release`.
+    A `truncate` is a hole, so a sparse file costs nothing until data is
+    written, and memory never grows with a file's size; a file only the
+    lower layer has is read once while it is open (one decryption per
+    open). A file unlinked while open keeps its content for its handles
+    (the open descriptor). A crash can leave an upper file part-written,
+    as any file system can a file being written, but never a torn
+    copy-up. No file grows past the largest object Veil records
     (`VEIL_MAX_OBJECT`, 4 GiB): a larger `truncate` or write offset is
-    `EFBIG`, a buffer that cannot be allocated `ENOMEM`, and a panic in a
-    request fails that request with `EIO`; the mount and the other open
-    files go on (BUG-536). Deletions append a whiteout to the journal
+    `EFBIG`, and a panic in a request fails that request with `EIO`; the
+    mount and the other open files go on (BUG-536). Deletions append a whiteout to the journal
     `.veil/local/mounts/<ws>/whiteouts` before they take effect, so a
     crash can only resurrect a deleted file, never lose one. A whiteout
     that hides files this reader cannot read (a directory deleted with
@@ -1699,7 +1739,9 @@ A workspace is only a named pointer in the view. It owns no directory.
     `remove_dir_all`); `readdir` from offset 0 (`rewinddir`) lists afresh
     (BUG-537). A rename
     copies the source (a directory: its whole subtree) into the upper
-    layer, then removes it. `.veil` cannot be created, symlinks, hard
+    layer, then removes it; a file the upper layer already holds is
+    renamed in it instead (O(1), holes kept; an open one follows), so only
+    files the lower layer alone has are copied. `.veil` cannot be created, symlinks, hard
     links and special files are refused (`EPERM`), only the executable
     bit of a mode is kept. No `allow_other` (the kernel keeps every other
     user, root included, out), `default_permissions`, modes `0700`/`0600`,
@@ -1722,7 +1764,9 @@ A workspace is only a named pointer in the view. It owns no directory.
     (`mount_record_op_description`), which `vl undo`, `vl redo` and `vl op
     restore` skip like the automatic snapshot of the attached workspace,
     whichever workspace is attached, carrying what it recorded over
-    (BUG-538):
+    (BUG-538), as a command's output (`policy_from_command`: an edit of
+    `.veilpolicy` that weakens the recorded one is held back and stays in
+    the overlay, §4, BUG-560):
     policy, scanner, sealing (the cloaked-workspace rules included),
     isolation and quarantine all apply, and `known_id` hints keep it
     O(changes). Requests wait while it reads the overlay. Afterwards

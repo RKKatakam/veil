@@ -624,6 +624,12 @@ pub struct BuildReport {
     /// The member's own edit of `.veilpolicy` waits for `vl policy accept`
     /// (see [`Policy::own_edit_pending`]).
     pub policy_edit_pending: bool,
+    /// An edit of `.veilpolicy` made by a command (a `vl ws exec` sandbox,
+    /// a mount; see `SnapshotOptions::policy_from_command`) that weakens
+    /// the recorded policy, or could, was not recorded: the tree keeps the
+    /// recorded `.veilpolicy`, and the paths it would weaken are in
+    /// `policy_held_back`. Says why (`could weaken …`, `was deleted`).
+    pub policy_edit_held: Option<String>,
     /// Files that should have been cloaked but no key was available, or
     /// whose recorded sealing could not be verified (the edit stays local).
     pub cloak_failures: Vec<(VPath, String)>,

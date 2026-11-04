@@ -99,6 +99,30 @@ running cargo build in /home/me/app/.veil/local/sandboxes/agent/files
 * What the command leaves behind is recorded in the workspace, through the
   same policy and secret scanner as your own snapshots, so a tool or agent
   cannot record a secret either.
+* **Agents can't declassify.** In the sandbox the command edits
+  `.veilpolicy`, not you, so its edit is treated like a policy that
+  arrived from someone else. An edit that only protects more (new
+  `ignore`, `isolate` or `cloak` rules) is recorded and applies at once.
+  One that weakens the workspace's policy (emptying the file, deleting a
+  rule, `public!`, `** public`, moving a cloaked directory to another
+  scope) is **held back**: the workspace keeps its recorded `.veilpolicy`,
+  every file keeps the protection it had (its stronger rules still
+  apply), and `vl` says so:
+
+  ```text
+  $ vl ws exec agent -- my-agent "tidy the repo"
+  …
+  warning: .veilpolicy, as the command left it, would weaken the protection of 1 path(s): the edit is not recorded (a command is not you, so the recorded policy stays, and only the edit's stronger rules apply; these keep their recorded protection: secret/plan.md (cloak team → public)). It stays in the sandbox (…/.veil/local/sandboxes/agent/files): review it, then `vl policy accept --workspace agent` records it
+  ```
+
+  The edit stays in the sandbox, and every later run holds it back again.
+  Read it (`cat .veil/local/sandboxes/agent/files/.veilpolicy`); if you
+  want it, `vl policy accept --workspace agent` records it into the
+  workspace and lists the files it exposes. If not, fix the file in the
+  sandbox (or let the next run of the agent do it). The same holds in
+  sparse runs and in mounts; an `--ephemeral` run has nowhere to keep the
+  edit, so it is dropped (with the same warning). `vl ws write agent
+  .veilpolicy < FILE` is your own command, and records what you give it.
 * `-m MSG` describes the workspace's change.
 * The result is recorded **whatever the command's exit status**, and `vl`
   exits with that status. `vl`'s own messages go to stderr; stdout is the
@@ -167,8 +191,9 @@ a copy of the repository: `vl ws new agent`, then
   Deleting `.veilpolicy`, or leaving it unreadable, a symlink or a
   directory, is not an edit of the policy, in any sandbox: the workspace
   keeps its recorded policy (with a warning, and a deleted one is put
-  back), so no cloaked file is ever declassified that way. To change the
-  rules, edit the file.
+  back), so no cloaked file is ever declassified that way. An edit of the
+  file that weakens the policy is held back (see "Agents can't
+  declassify" above).
 * **Files the command writes outside the paths are not recorded.**
   `vl` lists them (`not recorded: … written outside --only`) and removes
   them from the sandbox, so a later run with more paths never mistakes
@@ -180,7 +205,9 @@ a copy of the repository: `vl ws new agent`, then
 * **`.veilpolicy` is always there** (the snapshot needs it to classify
   anything). If the command edits it, the new policy applies to every
   file of the workspace, inside the paths or not, as for a full run: a
-  newly cloaked directory outside the paths is recorded cloaked. Files
+  newly cloaked directory outside the paths is recorded cloaked, and an
+  edit that would weaken the protection of a file outside the paths is
+  held back as in a full run. Files
   that were ignored or isolated before the edit are never removed as
   "written outside --only".
 * **Removing a directory in the sandbox** (`rm -rf src` with
@@ -350,7 +377,10 @@ stays where it is.
   workspace through the same policy and secret scanner as your own
   snapshots. Files the policy isolates (`.env`), ignores (`target/`) or
   that look like a secret stay in the mount, as they would in your project
-  directory, and are never recorded (`vl` warns once about each).
+  directory, and are never recorded (`vl` warns once about each). Tools
+  and agents write in mounts too, so an edit of `.veilpolicy` there is
+  judged as in a sandbox: what weakens the policy is held back, stays in
+  the mount, and `vl policy accept --workspace NAME` records it.
   Symlinks, hard links and special files are refused: Veil records files
   and directories only.
 * **When it is recorded:** by `vl ws unmount`; before every other `vl`
@@ -358,7 +388,8 @@ stays where it is.
   `vl merge agent@` or `vl commit` see what you wrote; every 60 seconds
   while there are changes (`--record-every SECS`, `0` to turn it off);
   and when something else unmounts it (`fusermount -u`). Edits reach the
-  overlay on disk when the file is closed (or `fsync`ed). These
+  overlay on disk as they are made, and are durable once the file is
+  closed (or `fsync`ed). These
   recordings are not commands: `vl undo` (and `vl redo`, `vl op
   restore`) skips them and keeps what they recorded, as it keeps your
   project directory's edits.
@@ -393,11 +424,13 @@ stays where it is.
   Close it and run it again.
 * `vl` itself does not work from inside a mount (there is no `.veil`
   there): use `vl -R <project> …`.
-* Renaming a directory copies its files into the overlay (a large tree
-  costs a copy); an open file is held in memory while it is open, and no
-  file in a mount can grow past the largest object Veil records
-  (`VEIL_MAX_OBJECT`, 4 GiB): a larger `truncate` or write fails with
-  `File too large`.
+* Renaming a directory copies the files it holds that you have not
+  changed into the overlay (a large tree costs a copy; files you changed
+  are moved, at no cost). Open files are written in place on disk, never
+  held in memory, so a sparse file (`truncate -s 2G`, a disk image) costs
+  nothing until data is written. No file in a mount can grow past the
+  largest object Veil records (`VEIL_MAX_OBJECT`, 4 GiB): a larger
+  `truncate` or write fails with `File too large`.
 
 **Requirements.** Linux: `/dev/fuse` and `fusermount3` (the `fuse3`
 package), nothing else; `vl` mounts without libfuse. macOS: install

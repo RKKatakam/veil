@@ -80,6 +80,14 @@ fixed**. Severity: high / medium / low.
 
 ## Recorded limitations (later rounds)
 
+- **Agent policy edits can be held back too eagerly:** the check that holds
+  back a sandbox's or mount's weakening of `.veilpolicy` (BUG-560) treats
+  any two rules as able to overlap, so an edit that only adds protection is
+  occasionally held; `vl policy accept --workspace NAME` clears it.
+- **Large files still pass through memory** when the FUSE mount renames a
+  file it has not modified, and when the builder records a very large file
+  (the streaming large-file item above).
+
 - **Other scopes on an embargoed line:** later edits on an embargoed line to
   files cloaked under a *different* scope are readable by that scope's
   members before the release. Workaround: cloak and embargo under the same
