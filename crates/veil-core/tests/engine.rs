@@ -232,7 +232,9 @@ fn rebase_reports_conflicts() {
     let rebased = repo.rebase(theirs, vec![ours]).unwrap();
     let s = repo.snapshot(&rebased).unwrap();
     assert_eq!(s.conflicts, vec!["f.txt"]);
-    let text = String::from_utf8(repo.store().read_entry(&file_entry(&repo, &rebased, "f.txt").unwrap()).unwrap()).unwrap();
+    let e = file_entry(&repo, &rebased, "f.txt").unwrap();
+    assert_eq!(e.kind, veil_core::EntryKind::Conflict, "recorded as data, not markers");
+    let text = String::from_utf8(veil_core::conflict::read_file_like(repo.store(), &e).unwrap()).unwrap();
     assert!(text.contains("<<<<<<<") && text.contains("OURS") && text.contains("THEIRS"));
 }
 

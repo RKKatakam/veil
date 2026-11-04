@@ -48,6 +48,12 @@ enum Label {
     Unchanged,
     GenuineMal,
     GenuineMalPolicy,
+    /// Not a label but a planted conflict entry (repository format 4):
+    /// Alice's genuine `team` object relabelled `public` as one side,
+    /// Mallory's genuine `mal` object as the other, over Alice's old version
+    /// labelled `public`. Whatever its labels claim, Alice's resolution
+    /// (her edit of the file checkout shows) is sealed for `team`.
+    ForgedConflict,
 }
 
 impl Label {
@@ -92,7 +98,7 @@ fn label_vis(l: Label, ids: &Ids) -> Visibility {
         },
         Label::OldGeneration => cloaked("team#0000000000000000"),
         Label::Local => cloaked("local"),
-        Label::Unchanged | Label::GenuineMal | Label::GenuineMalPolicy => cloaked("team"),
+        Label::Unchanged | Label::GenuineMal | Label::GenuineMalPolicy | Label::ForgedConflict => cloaked("team"),
     }
 }
 
@@ -128,6 +134,25 @@ fn mallory_pushes(hub: Arc<MemoryBackend>, main: ObjectId, alice_pub: &str, mall
         e.id = store.store_file(MALLORYS, &mal).unwrap();
         e.size = MALLORYS.len() as u64;
         e.visibility = mal;
+    }
+    if let Label::ForgedConflict = label {
+        let mal = Visibility::Cloaked { scope: "mal".into() };
+        let alices = veil_core::ConflictTerm {
+            visibility: Visibility::Public,
+            ..veil_core::ConflictTerm::of(&e)
+        };
+        let mallorys = veil_core::ConflictTerm {
+            id: store.store_file(MALLORYS, &mal).unwrap(),
+            size: MALLORYS.len() as u64,
+            executable: false,
+            visibility: Visibility::Public,
+            fallback: None,
+        };
+        let c = veil_core::Conflict {
+            adds: vec![Some(alices.clone()), Some(mallorys)],
+            removes: vec![Some(veil_core::ConflictTerm { fallback: Some(e.id), ..alices })],
+        };
+        e = veil_core::TreeEntry::conflict("db.yml", store.put_conflict(&c).unwrap());
     }
     secrets.insert(e);
     root.insert(veil_core::TreeEntry::dir("secrets", store.put_tree(&secrets).unwrap()));
@@ -246,15 +271,24 @@ fn run(label: Label, cloak: Cloak, route: Route, n: u32) {
         }
     };
 
-    // Alice's secret is sealed for `team`, whatever the labels said.
+    // Alice's secret is sealed for `team`, whatever the labels said. A
+    // merge of two scopes is a conflict entry (format 4): what Alice is
+    // shown is her side, sealed for `team`, and every version holding her
+    // secret is sealed for `team`.
     let e = file_entry(&alice, &committed, "secrets/db.yml").expect("recorded");
     assert_eq!(read_at(&alice, &committed, "secrets/db.yml"), edited.as_bytes(), "Alice reads her edit");
+    let (shown_as, _) = seen(&alice, &e);
     assert_eq!(
-        e.visibility,
+        shown_as,
         Visibility::Cloaked { scope: "team".into() },
         "{label:?}/{cloak:?}/{route:?}: Alice's edit was sealed as {}",
-        e.visibility.label()
+        shown_as.label()
     );
+    for (vis, data) in versions(&alice, &e) {
+        if data.is_some_and(|d| String::from_utf8_lossy(&d).contains(&secret)) {
+            assert_eq!(vis, Visibility::Cloaked { scope: "team".into() }, "{label:?}/{cloak:?}/{route:?}: a version holds the secret");
+        }
+    }
 
     leak_check(&mut alice, &hub, &mallory, &secret, committed, &format!("{label:?}/{cloak:?}/{route:?}"));
     // The commit message is never sealed under an embargo key.
@@ -289,14 +323,23 @@ fn leak_check(alice: &mut Repo, hub: &Arc<MemoryBackend>, mallory: &Identity, se
             let Ok(Some(e)) = veil_core::tree::lookup(r.store(), &r.snapshot(&tag.target).unwrap().tree, &p("secrets/db.yml")) else {
                 continue;
             };
-            if let Ok(data) = r.store().read_entry(&e) {
+            if let Ok(data) = veil_core::conflict::read_file_like(r.store(), &e) {
                 assert!(
                     !String::from_utf8_lossy(&data).contains(secret),
                     "{case}: {who} reads Alice's new secret at {name}"
                 );
             }
+            if e.kind == veil_core::EntryKind::Conflict {
+                if let Ok(c) = r.store().conflict(&e.id) {
+                    for t in c.interleaved().flatten() {
+                        if let Ok(data) = r.store().read_blob(&t.id) {
+                            assert!(!String::from_utf8_lossy(&data).contains(secret), "{case}: {who} reads a conflict version at {name}");
+                        }
+                    }
+                }
+            }
         }
-        if let Ok(data) = r.store().read_entry(&e) {
+        if let Ok(data) = veil_core::conflict::read_file_like(r.store(), &e) {
             assert!(
                 !String::from_utf8_lossy(&data).contains(secret),
                 "{case}: {who} reads Alice's committed entry"
@@ -317,6 +360,7 @@ fn label() -> impl Strategy<Value = Label> {
         Just(Label::Unchanged),
         Just(Label::GenuineMal),
         Just(Label::GenuineMalPolicy),
+        Just(Label::ForgedConflict),
     ]
 }
 
@@ -372,11 +416,20 @@ fn every_hostile_label_is_neutralised_after_pull_and_new() {
         Label::EmbargoedUnreleased,
         Label::OldGeneration,
         Label::Local,
+        Label::ForgedConflict,
     ]
     .into_iter()
     .enumerate()
     {
         run(l, Cloak::None, Route::New, i as u32);
+    }
+}
+
+/// A planted conflict entry with forged labels, through every route.
+#[test]
+fn a_forged_conflict_entry_never_decides_the_audience_of_a_resolution() {
+    for (i, r) in [Route::New, Route::Edit, Route::Rebase, Route::Merge].into_iter().enumerate() {
+        run(Label::ForgedConflict, Cloak::None, r, 400 + i as u32);
     }
 }
 

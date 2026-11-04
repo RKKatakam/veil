@@ -549,3 +549,71 @@ fn a_git_commit_whose_policy_is_a_directory_is_refused_with_the_reason() {
     assert_eq!(tag(&r, "main"), c1);
     assert!(format!("{rep:?}").contains(".veilpolicy"), "{rep:?}");
 }
+
+// ---- first-class conflicts (format 4) ----------------------------------------------
+
+/// Two lines editing the same line of `notes.md` from `c1`: one public,
+/// one on a line cloaked under `team` (when `cloaked`). Their merge (`vl
+/// new A B`) holds a conflict entry; tagged `main`.
+fn conflicted_main(cloaked: bool) -> (Repo, ObjectId) {
+    let (mut r, fs, c1) = project();
+    fs.write(&p("notes.md"), b"intro\nline\noutro\n").unwrap();
+    let c1b = commit_files(&mut r, &*fs, &[], "notes");
+    let _ = c1;
+    r.create_workspace("pub", vec![c1b], None).unwrap();
+    let o = r.workspace_overlay("pub").unwrap();
+    o.write(&p("notes.md"), b"intro\nPUBLIC-SIDE-LINE\noutro\n").unwrap();
+    let a = r.snapshot_workspace("pub", &o).unwrap().snapshot;
+    r.create_workspace("priv", vec![c1b], cloaked.then(|| "team".to_string())).unwrap();
+    let o = r.workspace_overlay("priv").unwrap();
+    o.write(&p("notes.md"), b"intro\nCLOAKED-SIDE-LINE-3e1f\noutro\n").unwrap();
+    let b = r.snapshot_workspace("priv", &o).unwrap().snapshot;
+    r.new_change(WS, vec![a, b], "").unwrap();
+    let m = r.workspace_wc(WS).unwrap();
+    let e = file_entry(&r, &m, "notes.md").unwrap();
+    assert_eq!(e.kind, veil_core::EntryKind::Conflict);
+    r.set_tag("main", m, None, true).unwrap();
+    (r, m)
+}
+
+/// Git sees a conflict as the marker file a public reader is shown: the
+/// public side, and a "not shown" line for the side sealed for `team`,
+/// whose text never reaches Git.
+#[test]
+fn a_conflict_exports_as_its_public_markers_without_the_sealed_side() {
+    let env = Env::new();
+    let (mut r, _) = conflicted_main(true);
+    env.connect(&mut r);
+    env.push(&mut r);
+    for dir in [&env.bare, &env.bridge] {
+        let objects = all_git_objects(dir);
+        assert!(!contains(&objects, b"CLOAKED-SIDE-LINE-3e1f"), "the sealed side reached {}", dir.display());
+    }
+    let shown = git(&env.bare, &["show", "main:notes.md"]);
+    assert!(shown.contains("<<<<<<<") && shown.contains("PUBLIC-SIDE-LINE"), "{shown}");
+    assert!(shown.contains("not shown: this version is not public"), "{shown}");
+}
+
+/// A Git commit resolving the exported marker file (every side was public,
+/// so Git saw all of it) imports as the resolution of the conflict.
+#[test]
+fn a_git_resolution_of_an_exported_conflict_resolves_it() {
+    let env = Env::new();
+    let (mut r, m) = conflicted_main(false);
+    env.connect(&mut r);
+    env.push(&mut r);
+    let work = env.clone_work("work");
+    let shown = std::fs::read_to_string(work.join("notes.md")).unwrap();
+    assert!(shown.contains("PUBLIC-SIDE-LINE") && shown.contains("CLOAKED-SIDE-LINE-3e1f"), "{shown}");
+    std::fs::write(work.join("notes.md"), "intro\nresolved on GitHub\noutro\n").unwrap();
+    git(&work, &["commit", "-q", "-am", "resolve"]);
+    git(&work, &["push", "-q", "origin", "main"]);
+    let rep = git::pull(&mut r, &env.bridge, "github").unwrap();
+    assert_eq!(rep.import.imported, 1, "{rep:?}");
+    let s = tag(&r, "main");
+    assert_eq!(r.snapshot(&s).unwrap().parents, vec![m]);
+    let e = file_entry(&r, &s, "notes.md").unwrap();
+    assert_eq!(e.kind, veil_core::EntryKind::File, "the conflict is resolved, not widened");
+    assert_eq!(read_at(&r, &s, "notes.md"), b"intro\nresolved on GitHub\noutro\n");
+    assert!(r.snapshot(&s).unwrap().conflicts.is_empty());
+}

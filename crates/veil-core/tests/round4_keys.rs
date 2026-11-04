@@ -274,7 +274,7 @@ fn the_ring_step_runs_whenever_it_is_pending() {
     assert_eq!(ring(&Keychain::new(fs.clone(), None, String::new()), "team"), before, "a dry run writes nothing");
 
     let done = upgrade(fs.clone(), Some(alice.clone()), &UpgradeOptions::default()).unwrap();
-    assert_eq!((done.from, done.to, done.up_to_date), (3, 3, false));
+    assert_eq!((done.from, done.to, done.up_to_date), (veil_core::repo::REPO_FORMAT, veil_core::repo::REPO_FORMAT, false));
     let r = ring(&Keychain::new(fs.clone(), None, String::new()), "team");
     assert!(!current_key_has_legacy_wraps(&r, &r.verify().unwrap()));
     let again = upgrade(fs.clone(), Some(alice), &UpgradeOptions::default()).unwrap();

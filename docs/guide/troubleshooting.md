@@ -185,9 +185,20 @@ if you don't need it.
 
 ### `vl status` doesn't show my merge conflict
 
-`vl status` lists conflicts in `@` only, and after `vl merge` the
-conflicted change is `@-`. Use `vl log` (`×` marks it), then `vl edit` it
-and fix the files there. See [Conflicts](getting-started.md#conflicts).
+In a repository at format 4 it does: the change on top of the merge holds
+the conflict, listed with `recorded on` the merge. In an older format (or
+for a merge under an embargo) conflicts are markers in the file, recorded
+on the merge only, which is `@-` after `vl merge`: use `vl log` (`×` marks
+it), then `vl edit` it and fix the files there. See
+[Conflicts](getting-started.md#conflicts).
+
+### `vl resolve` says I cannot resolve a conflict / my edit of a conflicted file is "held back"
+
+One version in the conflict is sealed for a scope you are not in (`vl
+resolve --list` says `not readable here`). You see it as a `(not shown: …)`
+line, and an edit or a deletion by you would drop content you cannot read,
+so it stays local. Ask a member of the scope to resolve it, or keep a
+version you are allowed to choose with `vl resolve PATH --ours|--theirs`.
 
 ### `warning: edit of X not recorded: this line is under embargo E, whose content you cannot read, …`
 

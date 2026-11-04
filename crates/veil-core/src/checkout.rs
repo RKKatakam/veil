@@ -285,6 +285,23 @@ impl Materialised {
         for (p, fb) in self.fallback.clone() {
             match lookup_opt(store, tree, &p)? {
                 Lookup::Unreadable => {}
+                // A conflict written with versions this reader could not
+                // read then: write it again if it reads differently now.
+                Lookup::Entry(e) if e.kind == EntryKind::Conflict => {
+                    let (data, _) = read_materialised(store, &e)?;
+                    if Object::blob_id(&data) != fb {
+                        let shown = TreeEntry {
+                            kind: EntryKind::File,
+                            id: fb,
+                            ..e.clone()
+                        };
+                        changes.push(TreeChange {
+                            path: p,
+                            old: Some(shown),
+                            new: Some(e),
+                        });
+                    }
+                }
                 Lookup::Entry(e) if e.kind == EntryKind::File && e.fallback == Some(fb) => {
                     if store.read_blob(&e.id).is_ok() {
                         let shown = TreeEntry {
@@ -668,7 +685,7 @@ fn apply_changes(
             continue;
         }
         let mut current = fs.metadata(&c.path)?;
-        if current.as_ref().is_some_and(|m| m.kind == NodeKind::Dir) && new.kind == EntryKind::File {
+        if current.as_ref().is_some_and(|m| m.kind == NodeKind::Dir) && new.kind.is_file_like() {
             // A directory where the tree has a file. Everything `from` put
             // in it was removed above (and the directory with it, if that
             // emptied it), so what is left is not ours: isolated or ignored
@@ -691,7 +708,11 @@ fn apply_changes(
                         continue;
                     }
                 }
-                if let Err(e) = fs.write(&c.path, &data).and_then(|_| fs.set_executable(&c.path, new.executable)) {
+                let executable = match new.kind {
+                    EntryKind::Conflict => crate::conflict::materialize_entry(store, new, crate::conflict::Audience::Reader)?.executable,
+                    _ => new.executable,
+                };
+                if let Err(e) = fs.write(&c.path, &data).and_then(|_| fs.set_executable(&c.path, executable)) {
                     forget(&mut cache, &c.path);
                     // Never leave the previous version where the new one
                     // belongs, or the next snapshot would revert it.
@@ -753,7 +774,19 @@ fn whole_filesystem(e: &std::io::Error) -> bool {
 /// The bytes checkout writes for file entry `e`, and the embargo fallback
 /// they were read from when this reader cannot read the entry itself (as
 /// [`ObjectStore::read_entry`], which falls back silently).
+///
+/// A conflict entry is materialised with markers for this reader
+/// ([`crate::conflict::materialize`]): only here, when it is written to
+/// disk. When a version could not be read, the returned id is the blob id
+/// of what was written, recorded like a fallback ([`Materialised`]) so that
+/// the copy is rewritten once the reader can read it, and is never taken
+/// for an edit meanwhile.
 fn read_materialised(store: &ObjectStore, e: &TreeEntry) -> Result<(Vec<u8>, Option<ObjectId>)> {
+    if e.kind == EntryKind::Conflict {
+        let m = crate::conflict::materialize_entry(store, e, crate::conflict::Audience::Reader)?;
+        let shown = m.unreadable_side.then(|| Object::blob_id(&m.content));
+        return Ok((m.content, shown));
+    }
     match store.read_blob(&e.id) {
         Ok(d) => Ok((d, None)),
         Err(err) if err.is_unreadable() => match e.fallback {
@@ -772,9 +805,18 @@ fn holds(
     entry: Option<&TreeEntry>,
     cache: Option<&StatCache>,
 ) -> Result<bool> {
-    let Some(entry) = entry.filter(|e| e.kind == EntryKind::File) else {
+    let Some(entry) = entry.filter(|e| e.kind.is_file_like()) else {
         return Ok(false);
     };
+    if entry.kind == EntryKind::Conflict {
+        // What checkout wrote for it: its materialisation for this reader.
+        let data = match fs.read_opt(path) {
+            Ok(Some(d)) => d,
+            Ok(None) | Err(VeilError::Io { .. }) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        return Ok(read_materialised(store, entry)?.0 == data);
+    }
     if let (Some(cache), Some(meta)) = (cache, fs.metadata(path)?) {
         if let Some(rec) = cache.trusted(path, &meta) {
             if rec.content == entry.id || rec.sealed.as_ref().is_some_and(|(_, id)| *id == entry.id) {

@@ -403,7 +403,13 @@ impl Checker {
         }
         let need = Object::min_repo_format(&raw);
         if first && need > self.store.format() {
-            let what = if Object::tree_encoding(&raw).is_some() { "tree" } else { "sealed object" };
+            let what = if raw.starts_with(b"veil:conf\n") {
+                "conflict object"
+            } else if Object::tree_encoding(&raw).is_some() {
+                "tree"
+            } else {
+                "sealed object"
+            };
             self.push(
                 Severity::Corrupt,
                 format!(
@@ -634,6 +640,7 @@ impl Checker {
             match e.kind {
                 EntryKind::Dir => next.push((e.id, child, !e.visibility.is_public())),
                 EntryKind::File => self.check_file(e, &child),
+                EntryKind::Conflict => self.check_conflict(e, &child),
             }
         }
         next
@@ -645,6 +652,34 @@ impl Checker {
                 Severity::Warning,
                 format!("embargo {embargo} is used in the history but has no record; its content is unreadable"),
             );
+        }
+    }
+
+    /// A conflict entry: its conflict object (plaintext, sent everywhere: a
+    /// missing one is corruption), then every version it names, as files.
+    fn check_conflict(&mut self, e: &TreeEntry, path: &str) {
+        let c = match self.load(&e.id) {
+            Load::Obj(Object::Conflict(c)) => c,
+            Load::Obj(o) => {
+                self.push(
+                    Severity::Corrupt,
+                    format!("conflict {path}: {} should be a conflict but is a {}", e.id.short(), o.kind_name()),
+                );
+                return;
+            }
+            Load::Missing => {
+                self.note_missing(e.id, Severity::Corrupt, format!("conflict {path}: conflict object {} is missing", e.id));
+                return;
+            }
+            Load::Bad => return,
+        };
+        // One file, however many versions it holds.
+        self.report.files += 1;
+        for (i, t) in c.interleaved().enumerate() {
+            let Some(t) = t else { continue };
+            let what = if i % 2 == 0 { "side" } else { "base" };
+            self.check_file(&t.entry(&e.name), &format!("{path} (conflict {what} {})", i / 2 + 1));
+            self.report.files -= 1;
         }
     }
 

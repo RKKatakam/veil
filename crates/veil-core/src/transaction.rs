@@ -116,8 +116,50 @@ impl<'r> Transaction<'r> {
         s
     }
 
+    /// `snap` with its conflict index brought up to date (repository format
+    /// 4, see [`crate::conflict::index_conflicts`]): every conflict entry of
+    /// its tree, plus the older kinds of conflict the operation carried,
+    /// less those resolved since the snapshot it was derived from (the one
+    /// it rewrites, else its first parent). Under an unreleased embargo no
+    /// conflict is recorded (snapshot metadata is public). Below format 4
+    /// the list is the operation's, unchanged.
+    pub(crate) fn indexed(&self, snap: Snapshot) -> Result<Snapshot> {
+        let store = &self.repo.store;
+        if store.format() < crate::object::CONFLICT_REPO_FORMAT {
+            return Ok(snap);
+        }
+        let mut s = snap;
+        // A tree this reader cannot walk (sealed, withheld, or hostile and
+        // refused) keeps the list the operation computed.
+        let tolerated = |e: &VeilError| {
+            e.is_unreadable() || e.is_not_found() || matches!(e, VeilError::Corrupt(..) | VeilError::Json(_) | VeilError::Unsupported(_))
+        };
+        match crate::embargo::unreleased_wrapper(store, &s.tree) {
+            Ok(Some(_)) => {
+                s.conflicts.clear();
+                return Ok(s);
+            }
+            Ok(None) => {}
+            Err(e) if tolerated(&e) => return Ok(s),
+            Err(e) => return Err(e),
+        }
+        let from = s.predecessors.first().or(s.parents.first()).copied();
+        let base = match from {
+            Some(id) => self.repo.snapshot_opt(&id).ok().flatten(),
+            None => None,
+        };
+        let base = base.as_ref().map(|b| (&b.tree, b.conflicts.as_slice()));
+        match crate::conflict::index_conflicts(store, &s.tree, &s.conflicts, base) {
+            Ok(list) => s.conflicts = list,
+            Err(e) if tolerated(&e) => {}
+            Err(e) => return Err(e),
+        }
+        Ok(s)
+    }
+
     pub fn write_snapshot(&mut self, snap: &Snapshot) -> Result<ObjectId> {
-        let signed = self.sign(snap);
+        let snap = self.indexed(snap.clone())?;
+        let signed = self.sign(&snap);
         let id = self.repo.store.put_snapshot(&signed)?;
         self.add_head(id)?;
         Ok(id)
@@ -128,7 +170,7 @@ impl<'r> Transaction<'r> {
     /// that every replica writing it gets the same id.
     #[cfg(feature = "git")]
     pub(crate) fn write_unsigned_snapshot(&mut self, snap: &Snapshot) -> Result<ObjectId> {
-        let mut s = snap.clone();
+        let mut s = self.indexed(snap.clone())?;
         s.signature = None;
         let id = self.repo.store.put_snapshot(&s)?;
         self.add_head(id)?;
@@ -178,6 +220,7 @@ impl<'r> Transaction<'r> {
         // itself, not content: a rewrite that changes nothing else changes
         // nothing (BUG-246).
         let prev = self.repo.snapshot(&old)?;
+        let new = self.indexed(new)?;
         let mut same = new.clone();
         same.predecessors = prev.predecessors.clone();
         same.timestamp = prev.timestamp;
@@ -232,7 +275,20 @@ impl<'r> Transaction<'r> {
         }
         let s = self.repo.snapshot(&id)?;
         let undescribed = self.repo.store.read_text(&s.description).is_some_and(|t| t.trim().is_empty());
-        if undescribed && s.conflicts.is_empty() && self.repo.is_empty_change(&id)? {
+        // A change holding a conflict of its own (a merge that conflicted)
+        // is kept; one that only inherits its parent's conflicts (format 4:
+        // they are in its tree too) is as empty as any.
+        let mut own_conflict = false;
+        for c in &s.conflicts {
+            let mut inherited = false;
+            for p in &s.parents {
+                if self.repo.snapshot_opt(p)?.is_some_and(|ps| ps.conflicts.contains(c)) {
+                    inherited = true;
+                }
+            }
+            own_conflict |= !inherited;
+        }
+        if undescribed && !own_conflict && self.repo.is_empty_change(&id)? {
             self.abandon(id)?;
         }
         Ok(())
@@ -294,6 +350,7 @@ impl<'r> Transaction<'r> {
             ns.conflicts = crate::embargo::recordable_conflicts(&store, &tree, conflicts.into_iter().collect())?;
             // Rebasing someone else's change: `author` stays theirs, the
             // signature becomes ours, and `predecessors` keeps the original.
+            let ns = self.indexed(ns)?;
             let nid = store.put_snapshot(&self.sign(&ns))?;
             self.rewritten.insert(id, Rewrite::Replaced(nid));
             self.view.heads.remove(&id);

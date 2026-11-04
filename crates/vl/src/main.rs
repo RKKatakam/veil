@@ -206,7 +206,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
                 false => lookup(ctx.repo.store(), &ctx.repo.snapshot(&id)?.tree, &p)?,
             };
             match &e {
-                Some(e) if e.kind == veil_core::EntryKind::File => {}
+                Some(e) if e.kind.is_file_like() => {}
                 Some(_) => bail!("{} is a directory in {}, not a file (`vl files -r {}` lists its files)", safe(p.as_str()), id.short(), id.short()),
                 None if p.is_root() => bail!("'{}' is the repository's root directory, not a file", safe(path)),
                 None => bail!("{} does not exist in {}", safe(p.as_str()), id.short()),
@@ -268,6 +268,46 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             let s = ctx.repo.snapshot(&new)?;
             if !s.conflicts.is_empty() {
                 warn_untrusted(&format!("conflicts in: {}", s.conflicts.join(", ")));
+            }
+        }
+        Cmd::Resolve {
+            paths,
+            list,
+            ours,
+            theirs,
+            base,
+            side,
+            rev,
+            out,
+        } => {
+            let pick = match (*ours, *theirs, *base, *side) {
+                (true, ..) => Some(veil_core::conflict::Pick::Ours),
+                (_, true, ..) => Some(veil_core::conflict::Pick::Theirs),
+                (_, _, true, _) => Some(veil_core::conflict::Pick::Base),
+                (.., Some(n)) => Some(veil_core::conflict::Pick::Side(n)),
+                _ => None,
+            };
+            match pick {
+                Some(_) if *list => unreachable!("clap refuses --list with a version"),
+                None => {
+                    let doc = api::resolve_list(ctx, rev, paths)?;
+                    match out.json {
+                        true => api::emit_json(&doc)?,
+                        false => api::text::resolve_list(&doc),
+                    }
+                }
+                Some(_) if out.json => bail!("--json lists conflicts; it does not resolve them"),
+                Some(_) if paths.is_empty() => {
+                    bail!("name the conflicted files to resolve (`vl resolve --list` lists them)")
+                }
+                Some(pick) => {
+                    let ps: Vec<VPath> = paths.iter().map(|p| ctx.repo_path(p)).collect::<Result<_>>()?;
+                    let ws = ctx.ws.clone();
+                    let done = ctx.repo.resolve_conflicts(&ws, &ps, pick)?;
+                    for p in &done {
+                        println!("Resolved {}", safe(p.as_str()));
+                    }
+                }
             }
         }
         Cmd::Squash { rev } => {
@@ -902,9 +942,15 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()
             continue;
         }
         let res = match veil_core::tree::lookup(ctx.repo.store(), &src_tree, &p)? {
-            Some(e) if e.kind == veil_core::EntryKind::File => {
+            Some(e) if e.kind.is_file_like() => {
                 let data = read_file(&ctx.repo, &p, &e)?;
-                ctx.fs.write(&p, &data).and_then(|_| ctx.fs.set_executable(&p, e.executable))
+                let exec = match e.kind {
+                    veil_core::EntryKind::Conflict => {
+                        veil_core::conflict::materialize_entry(ctx.repo.store(), &e, veil_core::conflict::Audience::Reader)?.executable
+                    }
+                    _ => e.executable,
+                };
+                ctx.fs.write(&p, &data).and_then(|_| ctx.fs.set_executable(&p, exec))
             }
             _ => ctx.fs.remove_file(&p),
         };

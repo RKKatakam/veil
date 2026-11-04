@@ -17,6 +17,7 @@ There is one **repository format**, a number in `.veil/repo.json`:
 | 1 | 0.1.0 | everything below, trees in JSON |
 | 2 | 1.0.0 | binary trees (§3) |
 | 3 | 1.0.0 | standard cryptography: AES-SIV sealed objects (`veil:sea2`), HPKE-wrapped ring keys (ring format 3); see [CRYPTO.md](CRYPTO.md) |
+| 4 | 1.0.0 | first-class conflicts: conflict objects (`veil:conf`, §3.6) and conflict entries in binary trees (flag bit 6) |
 
 * `vl init` writes the newest format (`repo::REPO_FORMAT`). `vl clone` takes
   the format of its source, so that what the clone writes can be pushed
@@ -46,7 +47,8 @@ not be understood.
 | objects (§3) | `tag ‖ payload`, id = BLAKE3 | tag + encoding byte | yes | loose: `.veil/objects/ab/cdef…` (the canonical bytes) |
 | — blob | `veil:blob\n` ‖ bytes | none needed: any bytes are valid | yes | a new blob encoding would be a new tag |
 | — tree | `veil:tree\n` ‖ `{` JSON (v1) or `0x02` binary (v2) | encoding byte | yes | §3 |
-| — snapshot | `veil:snap\n` ‖ `{` JSON (v1) | encoding byte | yes | canonical (§3.3) |
+| — snapshot | `veil:snap\n` ‖ `{` JSON (v1) | encoding byte | yes | canonical (§3.3). `conflicts` lists conflicted paths; from format 4 it is an index the engine keeps (every conflict entry of the tree, plus marker conflicts carried from older formats), same field and encoding |
+| — conflict (format 4) | `veil:conf\n` ‖ `0x04` ‖ binary terms (§3.6) | encoding byte | yes | refused below format 4; plaintext (ids and labels only, never content) |
 | — sealed (formats 1–2) | `veil:seal\n` ‖ u16 **big-endian** label length ‖ label ‖ nonce[24] ‖ XChaCha20-Poly1305 ciphertext | tag | yes | the plaintext is another object's encoding; nonce derived from the plaintext (legacy, CRYPTO.md C1L); still written by format-1/2 repositories |
 | — sealed (format 3) | `veil:sea2\n` ‖ u16 **big-endian** label length ‖ label ‖ SIV[16] ‖ AES-SIV ciphertext | tag | yes | AES-SIV-CMAC-512 under `HKDF-SHA256(scope key)`, AD = `[label]` (CRYPTO.md C1); refused below format 3 |
 | — embargo wrapper | an ordinary tree with an `embargo` marker entry | as trees | yes | `embargo.rs`. Since BUG-104 the listed entries omit ids the fallback tree reaches (the pre-merge versions of changed files); same encoding, and every reader keeps those objects through the fallback, so no new version |
@@ -107,7 +109,10 @@ entry   = name_len uvarint | name (UTF-8) | flags u8 | id [32]
           | fallback [32]                   if flags.FALLBACK
 flags   = bit 0 DIR · bit 1 EXECUTABLE · bit 2 SIZE · bit 3 FALLBACK
           bits 4–5 tier: 0 public, 1 cloaked, 2 embargoed, 3 reserved
-          bits 6–7 reserved
+          bit 6 CONFLICT (format 4): `id` names a conflict object (§3.6);
+                every other bit must be clear (a conflict entry has no
+                size, executable bit, label or fallback of its own)
+          bit 7 reserved
 uvarint = unsigned LEB128, shortest form
 ```
 
@@ -126,7 +131,13 @@ uvarint = unsigned LEB128, shortest form
   every repository of every format, and unrelated histories can still meet.
 * **Size.** On the 20k-file benchmark layout the 1,201 trees take 882 KiB
   instead of 2,449 KiB.
-* A reserved tier or flag bit is `Unsupported`.
+* A reserved tier or flag bit is `Unsupported`. (Before format 4, bit 6
+  was reserved: a format-3 reader refuses a conflict entry as
+  `Unsupported`, never misreading it.)
+* In JSON (format-1) trees a conflict entry is `"kind":"conflict"` with no
+  other optional field. Only a format-4 repository may store a tree holding
+  one, whatever its encoding (`Object::min_repo_format` decodes trees to
+  check), and a format-4 repository writes binary trees anyway.
 
 ### 3.3 Snapshots
 
@@ -163,18 +174,53 @@ work, which the engine avoids:
   set by `Repo::open` from `repo.json`) and its `put_raw` **refuses** a
   binary tree in a format-1 repository, and an AES-SIV sealed object
   (`veil:sea2`) in a format-1 or 2 one (`Object::min_repo_format`,
-  `check_storable`; the pack sink of incremental sync calls it too). The
+  `check_storable`; the pack sink of incremental sync calls it too), and a
+  conflict object or a tree holding a conflict entry below format 4. The
   keychain follows the same format: it wraps keys with HPKE only from
   format 3 and refuses to store a format-3 ring below it. Push and pull copy objects with
   `put_raw`, so a format-1 remote or clone can never receive an object an
   older vl could not read: the push fails with "upgrade it with `vl upgrade
   --remote <name>`", and nothing is recorded.
 * `fsck` reports a binary tree in a format-1 repository, an AES-SIV object
-  or an HPKE ring in a format-1/2 repository as corruption, and a
-  repository format newer than it knows.
+  or an HPKE ring in a format-1/2 repository, and a conflict object or
+  conflict entry below format 4, as corruption, and a repository format
+  newer than it knows. It checks every version a conflict names as it
+  checks a file.
 * `Object::encode()` is the format-1 encoding (unchanged API);
   `Object::encode_with(TreeEncoding)` and `ObjectStore::encode` give the
   encoding of a particular repository.
+
+### 3.6 Conflict objects (format 4)
+
+An unresolved conflict between versions of one file, as Jujutsu records
+it: an alternating sum `add₀ − remove₀ + add₁ − … + addₙ` (a three-way merge
+of `base`, `ours`, `theirs` is adds `[ours, theirs]`, removes `[base]`).
+
+```text
+conflict = 0x04 | removes uvarint (1 to 64) | term{2·removes + 1}
+           -- terms in the order add₀, remove₀, add₁, remove₁, …, addₙ
+term     = 0x00                                    (no file)
+         | flags u8 | id [32]
+           | size uvarint                          if flags.SIZE (then != 0)
+           | label_len uvarint | label UTF-8       if tier != public
+           | fallback [32]                         if flags.FALLBACK
+flags    = bit 0 PRESENT (set) · bit 1 EXECUTABLE · bit 2 SIZE ·
+           bit 3 FALLBACK · bits 4–5 tier (as in trees) · bits 6–7 reserved
+```
+
+* A term is what a file entry holds, without the name: each version keeps
+  its own id, label, executable bit and fallback. The object itself is
+  plaintext and carries no content, so it may be sent anywhere; the
+  versions it names are sent or withheld one by one like any object (a
+  public remote gets a public conflict naming a sealed version, never that
+  version).
+* Canonical by construction (as binary trees: defaults omitted, minimal
+  varints, nothing after the last term). Decoding checks the shape only
+  (one more add than removes, at least one remove, at most 64); the engine
+  simplifies when it reads one, so a hostile unsimplified conflict is
+  merely redundant. A reserved flag bit or tier, or a version byte from
+  the reserved range, is `Unsupported`.
+* The tree entry naming it has kind `conflict` (flag bit 6) and nothing else.
 
 ## 4. Rules for changing a format
 
@@ -215,8 +261,8 @@ vl upgrade [--dry-run] [--remote NAME] [--force]
    writes the journal `.veil/upgrade.json`.
 2. **verify**: runs `fsck` and counts trees by encoding. Any corruption
    stops the upgrade before anything changes (`--force` overrides).
-3. One step per format transition. `1 → 2` and `2 → 3` have none: no
-   object is rewritten.
+3. One step per format transition. `1 → 2`, `2 → 3` and `3 → 4` have
+   none: no object is rewritten.
 4. **set-format**: rewrites `repo.json` with the new format and `min_vl`,
    atomically and durably. This is the commit point: before it the
    repository is entirely the old format, after it entirely the new one.
@@ -238,8 +284,10 @@ notices a commit point already reached; `tests/crash.rs` crashes 1→3 and
 `--remote NAME` (checked structurally, without opening sealed content);
 an SSH remote is reached over SFTP, as push and pull reach it.
 
-In a repository that is already at the newest format, `vl upgrade` still
-runs `3:hpke-ring-keys` when one of this identity's rings needs it (a fresh
+An upgrade from format 3 (to 4) runs `3:hpke-ring-keys` too when one of
+this identity's rings still needs it. In a repository that is already at
+the newest format, `vl upgrade` still runs `3:hpke-ring-keys` when one of
+this identity's rings needs it (a fresh
 clone of an upgraded remote, or a clone a non-admin upgraded), and says so:
 "Moved the key rings of this repository (format 3) to HPKE key wrapping".
 Otherwise it reports "already at format 3", with a note for each scope
@@ -266,6 +314,29 @@ still waiting for its admin.
   is the format-1 encoding.
 * **Downgrades** are not supported: an older vl refuses a format-2
   repository with a message naming the release it needs.
+
+### Format 4 (first-class conflicts)
+
+* **Decision: conflicts recorded before the upgrade stay as they are.** A
+  format-3 merge wrote markers into the file and listed the path on the
+  snapshot; that snapshot keeps its bytes, its id and its signature, and
+  its descendants carry the marker conflict as before (it is resolved by
+  editing the file). Rewriting them as conflict entries would change every
+  snapshot id above them. Merges made after the upgrade record conflict
+  entries.
+* **What a format-4 repository still writes as markers:** merges under an
+  unreleased embargo (the embargo's sealed trees never hold a conflict
+  entry, whose versions keep their own sealing outside the embargo; a
+  conflict entry the embargoed tree would take in goes in as its file of
+  markers), and nothing else.
+* **Remotes and clones.** A format-3 remote or clone refuses conflict
+  objects and trees with conflict entries ("upgrade it with `vl upgrade
+  --remote <name>`"): only history that holds an unresolved conflict is
+  affected. An older vl refuses a format-4 repository outright ("this
+  repository uses format 4, which needs a newer vl"), and a conflict entry
+  or object met elsewhere as `Unsupported`.
+* **The Git export** is unchanged in format: a conflict becomes the file of
+  markers a public reader is shown (ARCHITECTURE.md §11).
 
 ### Format 3 (standard cryptography)
 
@@ -295,7 +366,8 @@ release introducing format N wrote, generated once by `generate.sh` and never
 regenerated (from format 3 on, `generate.sh <vl> <out> <format-(N-1)>`, which
 adds `home-dave`, a legacy identity granted to the scope, and `upgraded/`,
 the previous set after `vl upgrade` with one more commit pushed, mixing old
-and new constructions): three identities (`home-alice`, `home-bob`, `home-carol`), the
+and new constructions; from format 4 also a merge with conflict entries at
+the tag `conflicted`, one resolved with `vl resolve`): three identities (`home-alice`, `home-bob`, `home-carol`), the
 project `alice/` (packed and loose objects, a cloaked directory, a ring with
 a grant, a revocation and a rotation (key generation 2), a released and an
 unreleased embargo, a cloaked tag, a vault, gc pending list, pruned ops,
@@ -318,7 +390,11 @@ this build:
 * writes only AES-SIV objects and HPKE wraps at format 3 and only the legacy
   ones at formats 1–2, upgrades 1→3 and 2→3 (rings rotated to HPKE, every
   object and id kept), and never lets format-3 cryptography reach a
-  format-1/2 repository (push, pull, incremental and full).
+  format-1/2 repository (push, pull, incremental and full);
+* reads the format-4 set's conflict entries as each identity's audience
+  allows (members both sides, the revoked member and the public mirror's
+  readers neither), never lets a conflict reach a format-3 repository, and
+  upgrades 3→4 keeping marker conflicts and every id.
 
 Two checks make format changes impossible to miss:
 
@@ -327,7 +403,7 @@ Two checks make format changes impossible to miss:
 * `encodings_match_the_golden_file` pins the bytes of every object encoding
   in `tests/fixtures/encodings.txt` (blob, empty tree, JSON and binary
   trees, root and full snapshots with a signature, sealed, sealed with
-  AES-SIV). Changing what is
+  AES-SIV, a conflict object, a binary tree with a conflict entry). Changing what is
   written fails until the change becomes a new format; then new lines are
   appended (`VEIL_BLESS_ENCODINGS=1`), never edited.
 

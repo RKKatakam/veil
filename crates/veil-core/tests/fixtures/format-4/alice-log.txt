@@ -1,0 +1,24 @@
+@  oopvuvmn alice ✓ 2026-11-04 12:16:20 default@ 5cff1bde (empty)
+│  (no description set)
+○  rvpyqzso alice ✓ 2026-11-04 12:16:20 main mirror/main origin/main 277436d9 [embargo:66654e7d63]
+│ │  Fix B (embargoed)  ⇠ merges skqzsqxv, poxvvxqk
+│ ○  poxvvxqk alice ✓ 2026-11-04 12:16:20 fix-b@ 817c4bea [cloaked:team]
+│ │  (no description set)
+│ │ ×  zyrnuzyq alice ✓ 2026-11-04 12:16:20 conflicted mirror/conflicted origin/conflicted e11951eb (conflict)
+│ │ │ │  keep side b's strings.rs  ⇠ merges trmukvtk, xotrwkoq
+│ │ │ ○  xotrwkoq alice ✓ 2026-11-04 12:16:20 side-b@ 16f63b34
+│ │ │ │  (no description set)
+│ │ ○ │  trmukvtk alice ✓ 2026-11-04 12:16:20 side-a@ 6503b075
+│ │ │ │  (no description set)
+○        skqzsqxv alice ✓ 2026-11-04 12:16:19 9b6a9b65
+│  third: loose objects
+○  xltmnsor alice ✓ 2026-11-04 12:16:19 03323c1e [embargo:8f2f2e7a15 released]
+│ │  Fix A (released)  ⇠ merges yzlklzws, ylszkosl
+│ ○  ylszkosl alice ✓ 2026-11-04 12:16:19 fix-a@ team-only[cloaked:team] origin/team-only 106a98f3 [cloaked:team]
+│ │  (no description set)
+○    yzlklzws alice ✓ 2026-11-04 12:16:18 b0b27e31
+│  second: edit docs and notes
+○  xnwwozwk alice ✓ 2026-11-04 12:16:18 c5d30ef6
+│  initial import
+◆  zzzzzzzz 72edc798
+   root()

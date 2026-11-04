@@ -13,7 +13,7 @@ use anyhow::Result;
 use veil_core::{
     builder::BuildReport,
     keychain::SignatureStatus,
-    object::{EntryKind, Snapshot, Visibility},
+    object::{Snapshot, Visibility},
     policy::{HeldBack, POLICY_FILE},
     ObjectId, Repo, TreeEntry, VPath,
 };
@@ -430,7 +430,8 @@ pub fn hidden_explanation(repo: &Repo, path: &VPath, e: &TreeEntry) -> Option<St
 /// cloaked, withheld and embargoed content instead of the store's
 /// `object … is not present in this store`.
 pub fn read_file(repo: &Repo, path: &VPath, e: &TreeEntry) -> Result<Vec<u8>> {
-    match repo.store().read_entry(e) {
+    // A conflict: the file with markers this reader is shown.
+    match veil_core::conflict::read_file_like(repo.store(), e) {
         Ok(d) => Ok(d),
         Err(err) if err.is_unreadable() => match hidden_explanation(repo, path, e) {
             Some(why) => Err(anyhow::anyhow!(why)),
@@ -458,7 +459,9 @@ pub fn print_files(repo: &Repo, tree: &ObjectId) -> Result<()> {
             Visibility::Public => "public".to_string(),
             v => safe(&v.label()).into_owned(),
         };
-        let flag = if !readable {
+        let flag = if e.kind == veil_core::EntryKind::Conflict {
+            red(" (conflict)")
+        } else if !readable {
             dim(" (redacted)")
         } else if e.executable {
             dim(" *")
@@ -479,7 +482,7 @@ pub fn print_files(repo: &Repo, tree: &ObjectId) -> Result<()> {
 pub fn tree_paths(repo: &Repo, tree: &ObjectId) -> Result<Vec<(VPath, Visibility)>> {
     Ok(veil_core::tree::walk_files(repo.store(), tree)?
         .into_iter()
-        .filter(|(_, e)| e.kind == EntryKind::File)
+        .filter(|(_, e)| e.kind.is_file_like())
         .map(|(p, e)| (p, e.visibility))
         .collect())
 }

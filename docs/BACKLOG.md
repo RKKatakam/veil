@@ -35,7 +35,6 @@ fixed**. Severity: high / medium / low.
   `archive` (tarball of a snapshot), patch export/import.
 - **Rename and copy detection** in `diff`, `log` and merge (today a rename is
   a delete plus an add, and merges are not rename-aware).
-- **First-class conflicts** (Jujutsu-style) instead of markers in files.
 - **Repository attributes:** line-ending normalisation (CRLF), per-path diff
   and merge drivers, binary handling (`.gitattributes` equivalents).
 - **Symlinks** are ignored; non-UTF-8 names are not recorded; submodules are

@@ -81,7 +81,10 @@ fn tier_mark(tier: &str, scope: Option<&str>, embargo: Option<&str>) -> String {
 
 fn change_mark(c: &Change) -> String {
     let (scope, embargo) = (c.visibility.scope.as_deref(), c.visibility.embargo.as_deref());
-    let mark = tier_mark(c.tier, scope, embargo);
+    let mut mark = tier_mark(c.tier, scope, embargo);
+    if c.conflict.is_some() {
+        mark.push_str(&format!(" {}", red("[conflict]")));
+    }
     if c.tier != "redacted" {
         return mark;
     }
@@ -154,7 +157,7 @@ pub fn status(s: &Status) {
             }
         }
         println!(
-            "  {} edit the files to resolve the conflict markers; a conflict is resolved once its file is edited. Fold the resolution into the merge with `vl squash`, or `vl commit` it",
+            "  {} edit the files to resolve the conflict markers (a conflict is resolved once they are gone), or keep one version with `vl resolve PATH --ours|--theirs`. Fold the resolution into the merge with `vl squash`, or `vl commit` it",
             dim("hint:")
         );
     }
@@ -338,6 +341,11 @@ pub fn diff(repo: &Repo, from: &ObjectId, to: &ObjectId, stat: bool) -> Result<(
 
 pub fn file_diff_text(f: &FileDiff) {
     println!("{}", bold(&format!("diff --veil a/{0} b/{0}", safe(&f.path))));
+    match (f.old.as_ref().and_then(|o| o.conflict.as_ref()), f.new.as_ref().and_then(|n| n.conflict.as_ref())) {
+        (_, Some(c)) => println!("{}", red(&format!("unresolved conflict ({} sides): content with markers", c.sides))),
+        (Some(_), None) => println!("{}", green("conflict resolved")),
+        _ => {}
+    }
     match (f.status, &f.old, &f.new) {
         ("added", _, Some(n)) => println!("{}", green(&format!("added file {}", vis_label(&n.visibility.visibility())))),
         ("deleted", Some(_), _) => println!("{}", red("deleted file")),
@@ -544,6 +552,52 @@ pub fn scan(s: &Scan) {
 
 /// `vl ls`: one file per line, `TIER  SIZE  PATH  (note)`; stops when
 /// stdout goes away.
+/// `conflict: 2 sides` and what of it this reader cannot see.
+fn conflict_note(c: &ConflictInfo) -> String {
+    let mut n = format!("conflict: {} sides", c.sides);
+    if c.unreadable_side {
+        n.push_str(", a version you cannot read; cannot be resolved here");
+    } else if c.redacted {
+        n.push_str(", partly redacted");
+    }
+    n
+}
+
+/// `vl resolve --list`.
+pub fn resolve_list(r: &ResolveList) {
+    if r.conflicts.is_empty() {
+        println!("{}", dim(&format!("(no conflicts in {})", r.snapshot.change_short.as_deref().unwrap_or("root()"))));
+        return;
+    }
+    for item in &r.conflicts {
+        let Some(c) = &item.conflict else {
+            println!("{} {}  {}", red("C"), safe(&item.path), dim("(markers in the file: edit it to resolve)"));
+            continue;
+        };
+        println!("{} {}  {}", red("C"), safe(&item.path), dim(&format!("({})", conflict_note(c))));
+        for v in &c.versions {
+            let name = match (c.sides, v.role, v.number) {
+                (2, "side", 1) => "ours".to_string(),
+                (2, "side", _) => "theirs".to_string(),
+                (2, _, _) => "base".to_string(),
+                (_, role, n) => format!("{role} {n}"),
+            };
+            let what = match &v.visibility {
+                None => "no file".to_string(),
+                Some(vis) => {
+                    let label = safe(&vis.visibility().label()).into_owned();
+                    if v.readable {
+                        label
+                    } else {
+                        format!("{label}, not readable here")
+                    }
+                }
+            };
+            println!("    {name:<8} {}", dim(&what));
+        }
+    }
+}
+
 pub fn ls(l: &Ls) {
     for e in &l.entries {
         if stdout_closed() {
@@ -564,6 +618,9 @@ pub fn ls(l: &Ls) {
                     _ => "never recorded",
                 }
             ));
+        }
+        if let Some(c) = &e.conflict {
+            note.push(conflict_note(c));
         }
         if e.tier == "quarantined" && e.recorded {
             if let Some(v) = &e.visibility {

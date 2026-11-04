@@ -408,7 +408,9 @@ impl Repo {
         let into_snap = tx.repo().snapshot(&into)?;
         let store = tx.repo().store.clone();
         let cloak = into_snap.cloak.as_deref();
-        let merged = tx.repo().parents_tree(&parents)?;
+        // A merge put under an embargo records its conflicts as markers:
+        // the embargo's sealed tree never holds conflict entries.
+        let merged = tx.repo().parents_tree_with(&parents, embargo.is_some())?;
         let outer = unreleased_wrapper(&store, &merged.tree)?;
         // An unreadable `.veilpolicy` on either side (a hostile tree's
         // directory, BUG-121) never blocks the merge: the accepted policy

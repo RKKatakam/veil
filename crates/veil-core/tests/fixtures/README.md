@@ -20,6 +20,16 @@ release still opens, reads, verifies, `fsck`s, upgrades and syncs it.
   (a legacy identity, granted to `team`) and `upgraded/` (format-2's
   `alice/` and `team-remote/` after `vl upgrade`, plus one commit).
 
+* `format-4/`: the release that introduced first-class conflicts,
+  generated with `generate.sh target/debug/vl …/format-4 …/format-3`
+  (a debug build of the same sources): adds the tag `conflicted` (a merge
+  whose cloaked `secrets/notes.txt` stays a conflict entry, both sides
+  sealed for `team`, and whose public `src/util/strings.rs` conflict was
+  resolved with `vl resolve --theirs`); `upgraded/` is format-3's `alice/`
+  after `vl upgrade` (3 → 4). `generate.sh` now reads the full `public key`
+  line of `vl identity show` (the identity binding made it longer than the
+  128 digits the earlier script expected).
+
 `encodings.txt` pins the bytes of every object encoding. Append to it (with
 `VEIL_BLESS_ENCODINGS=1`) only together with a new format; see
 `docs/FORMAT.md` §4 and §6.

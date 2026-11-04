@@ -265,6 +265,11 @@ impl GitBridge {
                         kept.insert(ne);
                     }
                 }
+                EntryKind::Conflict => {
+                    if let Some(ne) = self.public_conflict(store, e, &mut out)? {
+                        kept.insert(ne);
+                    }
+                }
             }
         }
         out.tree = if kept.is_empty() {
@@ -287,6 +292,71 @@ impl GitBridge {
             self.run_projected.insert(*id, p.clone());
         }
         p
+    }
+
+    /// What Git sees of conflict entry `e`: the conflict materialised for a
+    /// public reader, a marker file in which every version that is not
+    /// plaintext is a "not shown" line (`conflict::materialize` with
+    /// `Audience::Public`). Content under an embargo, even a released one,
+    /// is never shown in it (so a pinned pre-release export cannot depend
+    /// on a release). With no public side at all, the newest public version
+    /// a side carries as its fallback, else nothing (like a sealed file).
+    fn public_conflict(&mut self, store: &ObjectStore, e: &TreeEntry, out: &mut Projection) -> Result<Option<TreeEntry>> {
+        let c = match public_open(store, &self.veil, &e.id)? {
+            Public::Visible { obj: Object::Conflict(c), .. } => c,
+            Public::Visible { obj, .. } => {
+                return Err(VeilError::Corrupt(
+                    e.id.hex(),
+                    format!("expected conflict, found {}", obj.kind_name()),
+                ))
+            }
+            Public::Hidden(emb) => {
+                out.pending.extend(emb);
+                return Ok(None);
+            }
+            Public::Missing => {
+                out.complete = false;
+                return Ok(None);
+            }
+        };
+        for t in c.interleaved().flatten() {
+            if store.get_raw(&t.id).is_err() {
+                // A side this replica lacks: the projection may change.
+                if !matches!(t.visibility, Visibility::Cloaked { .. }) {
+                    out.complete = false;
+                }
+            }
+        }
+        let any_public = c.adds.iter().flatten().any(|t| {
+            store.get_raw(&t.id).is_ok_and(|raw| Object::is_blob_raw(&raw))
+        });
+        if !any_public {
+            let fb = c.adds.iter().flatten().find_map(|t| t.fallback);
+            let Some(fb) = fb else { return Ok(None) };
+            return Ok(match public_open(store, &self.veil, &fb)? {
+                Public::Visible { obj: Object::Blob(b), sealed: false } => Some(TreeEntry {
+                    name: e.name.clone(),
+                    kind: EntryKind::File,
+                    id: fb,
+                    size: b.len() as u64,
+                    executable: false,
+                    visibility: Visibility::Public,
+                    fallback: None,
+                }),
+                _ => None,
+            });
+        }
+        let m = crate::conflict::materialize(store, &c, crate::conflict::Audience::Public)?;
+        let id = store.store_file(&m.content, &Visibility::Public)?;
+        Ok(Some(TreeEntry {
+            name: e.name.clone(),
+            kind: EntryKind::File,
+            id,
+            size: m.content.len() as u64,
+            executable: m.executable,
+            visibility: Visibility::Public,
+            fallback: None,
+        }))
     }
 
     /// The entry a public reader materialises for file entry `e`, if any.
@@ -356,6 +426,9 @@ impl GitBridge {
                         gix::objs::tree::EntryKind::Blob
                     };
                     (mode, self.git_blob(store, &e.id)?)
+                }
+                EntryKind::Conflict => {
+                    return Err(VeilError::Corrupt(id.hex(), "a public projection never holds a conflict entry".into()))
                 }
             };
             entries.push(gix::objs::tree::Entry {

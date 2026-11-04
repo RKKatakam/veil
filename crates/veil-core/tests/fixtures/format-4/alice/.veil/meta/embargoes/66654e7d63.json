@@ -1,0 +1,21 @@
+{
+  "id": "66654e7d63",
+  "scope": "team",
+  "wrapped": {
+    "scope": "embargo-wrap:66654e7d63",
+    "nonce": "4a7a5512ec53fbfdc8f1b68b3537657bff1f0bbd166affb3",
+    "ciphertext": "a56267badefdd14e776ea49d3cefcb338b38e76f90c0d1ae59fe9ce2e7f08f29531f5fc6fee21e5dcebcd82c6981ddf8"
+  },
+  "until": 4070908800000,
+  "released_key": null,
+  "released_at": null,
+  "created": 1793794580871,
+  "description": "",
+  "scope_key": "team#60505b6b7d5537fb",
+  "key_id": "0c5ec598d150547d",
+  "signature": {
+    "signer": "veil107cb59858a0e2758711854cfec049aa2a021b3568dd8fc0f6f6895f77337fa1b",
+    "key": "58aa3f8bcd0312b2a9f445a152e3ea4fa4795ea58bf3e672f2f64480416f1e39",
+    "sig": "4cee2287b80594cff51af187aea7cebe54d549fcbd3b0dff4021901f87b43ec27b5761b95c37721dfa352df7b1be49b379c8e85ca27ab7763789ae5a1e22430c"
+  }
+}

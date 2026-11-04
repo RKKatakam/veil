@@ -39,7 +39,7 @@ use crate::{
     error::{Result, VeilError},
     id::ObjectId,
     keychain::Keychain,
-    object::{EntryKind, Object, Snapshot, Text, Tree, TreeEncoding, TreeEntry, Visibility},
+    object::{Conflict, EntryKind, Object, Snapshot, Text, Tree, TreeEncoding, TreeEntry, Visibility},
     pack::{name_from_index_file, Pack},
     vfs::{NodeKind, StorageBackend},
     vpath::VPath,
@@ -192,7 +192,9 @@ impl ObjectStore {
         let need = Object::min_repo_format(raw);
         let have = self.format();
         if need > have {
-            let what = if Object::tree_encoding(raw).is_some() {
+            let what = if need >= crate::object::CONFLICT_REPO_FORMAT {
+                "conflicts (conflict objects, trees with conflict entries)"
+            } else if Object::tree_encoding(raw).is_some() {
                 "(binary) trees"
             } else {
                 "(AES-SIV) sealed objects"
@@ -735,6 +737,30 @@ impl ObjectStore {
         self.put(&Object::Tree(t.clone()))
     }
 
+    /// Store a conflict object (repository format 4). Refused below format 4:
+    /// such repositories record conflicts as markers in the file.
+    pub fn put_conflict(&self, c: &Conflict) -> Result<ObjectId> {
+        c.validate()?;
+        if self.format() < crate::object::CONFLICT_REPO_FORMAT {
+            return Err(VeilError::Unsupported(format!(
+                "this repository is at format {} and cannot store conflicts as data; upgrade it with `vl upgrade`",
+                self.format()
+            )));
+        }
+        self.put(&Object::Conflict(c.clone()))
+    }
+
+    /// The conflict object `id`.
+    pub fn conflict(&self, id: &ObjectId) -> Result<Conflict> {
+        match self.open(id)? {
+            Object::Conflict(c) => Ok(c),
+            o => Err(VeilError::Corrupt(
+                id.hex(),
+                format!("expected conflict, found {}", o.kind_name()),
+            )),
+        }
+    }
+
     pub fn empty_tree(&self) -> Result<ObjectId> {
         self.put_tree(&Tree::default())
     }
@@ -813,7 +839,8 @@ impl ObjectStore {
     /// Can this reader materialise the entry?
     pub fn entry_readable(&self, e: &TreeEntry) -> bool {
         match e.kind {
-            EntryKind::Dir => self.has(&e.id),
+            // A conflict is always materialised (unreadable sides redacted).
+            EntryKind::Dir | EntryKind::Conflict => self.has(&e.id),
             EntryKind::File => self.id_readable(&e.id) || e.fallback.is_some_and(|f| self.id_readable(&f)),
         }
     }

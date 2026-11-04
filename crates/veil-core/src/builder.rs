@@ -689,6 +689,10 @@ struct Builder<'a> {
     folding: NameFolding,
     /// The line's cloak, if it may decide sealing ([`trusted_cloak`]).
     cloak: Option<&'a str>,
+    /// The parent tree is under an unreleased embargo, whose sealed tree
+    /// never holds a conflict entry: a partly edited conflict is recorded
+    /// as the file it is.
+    under_embargo: bool,
 }
 
 /// Build a tree from `fs`, returning its id and a report.
@@ -759,6 +763,10 @@ pub fn build_tree_cached(
         },
         folding: fs.name_folding(),
         cloak: trusted_cloak(opts.cloak),
+        under_embargo: match opts.parent_tree {
+            Some(t) => crate::embargo::unreleased_wrapper(store, &t)?.is_some(),
+            None => false,
+        },
     };
     if let (Some(c), None) = (opts.cloak, b.cloak) {
         b.report.policy_warnings.push(format!(
@@ -1086,6 +1094,23 @@ impl Builder<'_> {
                         Ok(Err(Some(e.clone())))
                     }
                 }
+                EntryKind::Conflict => {
+                    // Deleting a conflicted file resolves it as a deletion,
+                    // but only for a reader who sees every side of it (and
+                    // was shown it): a version it cannot read is carried.
+                    let never_materialised = b.opts.materialised.is_some_and(|m| m.hidden(path));
+                    let all_seen = match crate::conflict::materialize_entry(b.store, e, crate::conflict::Audience::Reader) {
+                        Ok(m) => !m.unreadable_side,
+                        Err(err) if err.is_unreadable() || err.is_not_found() || matches!(err, VeilError::Corrupt(..) | VeilError::Unsupported(_)) => false,
+                        Err(err) => return Err(err),
+                    };
+                    if all_seen && !never_materialised {
+                        Ok(Err(None))
+                    } else {
+                        b.report.carried.push(path.clone());
+                        Ok(Err(Some(e.clone())))
+                    }
+                }
                 EntryKind::Dir => match b.store.tree(&e.id) {
                     Ok(tree) if depth < MAX_TREE_DEPTH => Ok(Ok(Frame {
                         entry: e.clone(),
@@ -1151,6 +1176,134 @@ impl Builder<'_> {
     }
 
     fn file_entry(&mut self, path: &VPath, name: &str, parent_entry: Option<&TreeEntry>) -> Result<Option<TreeEntry>> {
+        match parent_entry {
+            Some(ce) if ce.kind == EntryKind::Conflict => self.conflict_entry(path, name, ce),
+            _ => self.plain_file_entry(path, name, parent_entry),
+        }
+    }
+
+    /// The working-copy file at `path`, whose parent entry is the conflict
+    /// `ce` (repository format 4):
+    ///
+    /// * exactly what checkout writes for this reader (or a copy it wrote
+    ///   with fewer keys, per the materialisation record): the conflict
+    ///   stays, as it is;
+    /// * markers partly edited but still parseable: still a conflict, its
+    ///   sides taken from the copy (text outside the markers belongs to
+    ///   every side, as in jj), each sealed as a resolution would be;
+    /// * anything else (markers gone or no longer parseable): a resolution,
+    ///   built as an edit of a file whose parent is the side that decided
+    ///   the materialised file's audience, so every rule for edits applies
+    ///   (scanning, sealed content keeping its audience, held-back edits).
+    ///
+    /// A reader who cannot read every side cannot resolve the conflict:
+    /// its edits are held back, as an edit of a file it cannot seal.
+    fn conflict_entry(&mut self, path: &VPath, name: &str, ce: &TreeEntry) -> Result<Option<TreeEntry>> {
+        if self.use_hints && self.fs.known_id(path) == Some(ce.id) {
+            return Ok(Some(ce.clone()));
+        }
+        let conflict = match self.store.conflict(&ce.id) {
+            Ok(c) => c,
+            Err(e) if e.is_unreadable() || e.is_not_found() || matches!(e, VeilError::Corrupt(..) | VeilError::Unsupported(_)) => {
+                self.report.carried.push(path.clone());
+                self.report.policy_warnings.push(format!("{path}: its conflict cannot be read ({e}); kept as recorded"));
+                return Ok(Some(ce.clone()));
+            }
+            Err(e) => return Err(e),
+        };
+        let m = crate::conflict::materialize(self.store, &conflict, crate::conflict::Audience::Reader)?;
+        let meta = match self.fs.metadata(path) {
+            Ok(m) => m,
+            Err(e) => return self.unreadable(path, e, Some(ce)),
+        };
+        let executable = meta.as_ref().is_some_and(|m| m.executable);
+        let data = match self.fs.read(path) {
+            Ok(d) => d,
+            Err(e) => return self.unreadable(path, e, Some(ce)),
+        };
+        self.report.hashed += 1;
+        let class = self.opts.policy.classify(path, false);
+        let local_only = matches!(class.tier, Tier::Ignored | Tier::Isolated);
+        if !local_only && data == m.content && executable == m.executable {
+            return Ok(Some(ce.clone()));
+        }
+        if let Some(rec) = self.opts.materialised {
+            if !local_only && rec.from_fallback(self.store, path)? == Some(Object::blob_id(&data)) {
+                return Ok(Some(ce.clone()));
+            }
+        }
+        if m.unreadable_side && !local_only {
+            return self.cannot_seal(
+                path,
+                name,
+                Some(ce),
+                "it is a conflict with a version you cannot read, so you cannot resolve it; the edit stays local, history keeps the conflict".into(),
+            );
+        }
+        // The side that stands in for the parent of a resolution.
+        let pick = m
+            .winner
+            .or_else(|| conflict.adds.iter().position(|t| t.as_ref().is_some_and(|t| t.visibility.is_public())))
+            .or_else(|| conflict.adds.iter().position(Option::is_some));
+        let pseudo = pick.and_then(|i| conflict.adds[i].as_ref()).map(|t| TreeEntry {
+            visibility: if m.winner.is_some() { m.visibility.clone() } else { t.visibility.clone() },
+            fallback: if m.winner.is_some() { m.fallback } else { t.fallback },
+            executable: m.executable,
+            ..t.entry(name)
+        });
+        let held = |r: &BuildReport| (r.cloak_failures.len(), r.quarantined.len(), r.held_back.len(), r.unreadable.len());
+        let before = held(&self.report);
+        let resolved = self.plain_file_entry(path, name, pseudo.as_ref())?;
+        if held(&self.report) != before {
+            // The edit was held back: the conflict stays recorded.
+            return Ok(match resolved {
+                Some(_) => Some(ce.clone()),
+                None if local_only => None,
+                None => Some(ce.clone()),
+            });
+        }
+        let Some(r) = resolved else { return Ok(None) };
+        if let Some(p) = &pseudo {
+            // Kept the stand-in without the copy being its content: never
+            // a resolution (the stand-in is not what the user has).
+            if r.id == p.id && !self.store.matches_encoding(&p.id, &data)? {
+                return Ok(Some(ce.clone()));
+            }
+        }
+        if r.kind == EntryKind::File && !self.under_embargo && crate::conflict::has_markers(&data, &m.style) {
+            if let Some((o, b, t)) = crate::conflict::parse_markers(&data, &m.style) {
+                // Each side keeps its own executable bit unless the copy's
+                // bit was changed.
+                let exec_of = |t: &Option<crate::object::ConflictTerm>| match executable == m.executable {
+                    true => t.as_ref().map_or(executable, |t| t.executable),
+                    false => executable,
+                };
+                let term = |bytes: &[u8], exec: bool| -> Result<Option<crate::object::ConflictTerm>> {
+                    let id = self.store.store_file(bytes, &r.visibility)?;
+                    Ok(Some(crate::object::ConflictTerm {
+                        id,
+                        size: bytes.len() as u64,
+                        executable: exec,
+                        visibility: r.visibility.clone(),
+                        fallback: None,
+                    }))
+                };
+                let merge = crate::conflict::Merge {
+                    adds: vec![term(&o, exec_of(&conflict.adds[0]))?, term(&t, exec_of(&conflict.adds[1]))?],
+                    removes: vec![term(&b, exec_of(&conflict.removes[0]))?],
+                }
+                .simplify();
+                if merge.trivial().is_none() {
+                    if let Some(c) = merge.into_conflict()? {
+                        return Ok(Some(TreeEntry::conflict(name, self.store.put_conflict(&c)?)));
+                    }
+                }
+            }
+        }
+        Ok(Some(r))
+    }
+
+    fn plain_file_entry(&mut self, path: &VPath, name: &str, parent_entry: Option<&TreeEntry>) -> Result<Option<TreeEntry>> {
         let parent_file = parent_entry.filter(|e| e.kind == EntryKind::File);
         let class = self.opts.policy.classify(path, false);
         if class.blocked_exposure {

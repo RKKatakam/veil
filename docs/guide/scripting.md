@@ -13,10 +13,17 @@ output: it is written for people and may change. The read commands take
 | `vl op log --json` | the operation log |
 | `vl scan --json` | secret-scan findings, also as a CI gate (`--policy-from`) |
 | `vl secret list --json` | the names in the local vault (never the values) |
+| `vl resolve --list --json` | unresolved conflicts, each version with who can read it (never content) |
 
 Every field is documented in the [JSON reference](../reference/json.md).
 
 ## Examples
+
+Conflicted files, and whether you can resolve each one:
+
+```sh
+vl resolve --list --json | jq -r '.conflicts[] | "\(.path) \(if .conflict.unreadable_side then "(needs a member)" else "" end)"'
+```
 
 Changed files, one per line:
 

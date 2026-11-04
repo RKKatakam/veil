@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 414b4ce84694182ca0eac6358c4f3df54e523c8253ce925b408e8ce30c2878a6 # shrinks to l = Mal, c = None, r = New, n = 0
+cc d161c922509ae2e2cf4c5039fcde6e14ead99115c49e0d4f17287a63d5175b88 # shrinks to c = None, r = Rebase, n = 0
+cc a8d4013fc9dd59f37ce07aca2be735d52ac878ac5d4c86b4a26ef0ea523dfe55 # shrinks to l = GenuineMal, c = None, r = Rebase, n = 0

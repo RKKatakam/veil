@@ -10,7 +10,7 @@ pub const VERSION: &str = concat!(
     env!("VL_GIT_COMMIT"),
     ", repository format ",
     // Kept in step with `veil_core::repo::REPO_FORMAT_VERSION` by a test.
-    "3",
+    "4",
     ")"
 );
 
@@ -19,7 +19,7 @@ pub const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\ncommit: ",
     env!("VL_GIT_COMMIT"),
-    "\nrepository format: 3",
+    "\nrepository format: 4",
     "\ntarget: ",
     env!("VL_TARGET"),
 );
@@ -234,6 +234,42 @@ pub enum Cmd {
         /// New parent (repeat for a merge).
         #[arg(short, long, required = true)]
         destination: Vec<String>,
+    },
+    /// List unresolved conflicts, or resolve one by keeping one of its
+    /// versions.
+    ///
+    /// With no `--ours`/`--theirs`/`--base`/`--side`, lists the conflicts
+    /// of the working copy (or `-r REV`): each version with who can read
+    /// it. Otherwise each conflict at or below PATHS in the working copy is
+    /// replaced by the version named, exactly as it is recorded: a version
+    /// sealed for a scope stays sealed for that scope, and a version with
+    /// no file removes the path. To combine the versions instead, edit the
+    /// file: a conflict is resolved once its markers are gone.
+    #[command(group(clap::ArgGroup::new("pick").args(["ours", "theirs", "base", "side"])))]
+    Resolve {
+        /// Conflicted files (or directories) to resolve.
+        paths: Vec<String>,
+        /// List the conflicts (the default without a version to keep).
+        #[arg(short, long, conflicts_with = "pick")]
+        list: bool,
+        /// Keep the first side: the change merged into (for a rebase, the
+        /// new parent).
+        #[arg(long)]
+        ours: bool,
+        /// Keep the other side of a two-sided conflict.
+        #[arg(long)]
+        theirs: bool,
+        /// Keep the base of a two-sided conflict.
+        #[arg(long)]
+        base: bool,
+        /// Keep side N (1-based) of a conflict with any number of sides.
+        #[arg(long, value_name = "N")]
+        side: Option<usize>,
+        /// Snapshot whose conflicts to list.
+        #[arg(short, long, default_value = "@", conflicts_with = "pick")]
+        rev: String,
+        #[command(flatten)]
+        out: JsonOut,
     },
     /// Fold a change into its parent.
     Squash {
@@ -504,7 +540,8 @@ impl Cmd {
             | Cmd::Secret(SecretCmd::List { out })
             | Cmd::Workspace(WsCmd::List { out })
             | Cmd::Op(OpCmd::Log { out, .. })
-            | Cmd::Ls { out, .. } => out,
+            | Cmd::Ls { out, .. }
+            | Cmd::Resolve { out, .. } => out,
             Cmd::Push { json, .. } => return *json,
             _ => return false,
         };

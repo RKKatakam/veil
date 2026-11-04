@@ -284,7 +284,55 @@ fn golden_encodings() -> Vec<(String, Vec<u8>)> {
             )
             .encode(),
         ),
+        // Format 4: a conflict object (every term kind: absent, public,
+        // executable with a size, cloaked with a fallback, embargoed), and
+        // a binary tree holding a conflict entry.
+        ("conflict".into(), Object::Conflict(golden_conflict()).encode()),
+        (
+            "tree-v2-binary-conflict".into(),
+            Object::Tree(Tree {
+                entries: vec![
+                    TreeEntry::conflict("both.txt", ObjectId([0x0c; 32])),
+                    TreeEntry {
+                        name: "plain.txt".into(),
+                        kind: EntryKind::File,
+                        id: ObjectId([0x0d; 32]),
+                        size: 3,
+                        executable: false,
+                        visibility: Visibility::Public,
+                        fallback: None,
+                    },
+                ],
+            })
+            .encode_with(TreeEncoding::Binary),
+        ),
     ]
+}
+
+fn golden_conflict() -> veil_core::Conflict {
+    use veil_core::ConflictTerm;
+    let t = |n: u8| ConflictTerm {
+        id: ObjectId([n; 32]),
+        size: 0,
+        executable: false,
+        visibility: Visibility::Public,
+        fallback: None,
+    };
+    veil_core::Conflict {
+        adds: vec![
+            Some(ConflictTerm { executable: true, size: 300, ..t(0x21) }),
+            Some(ConflictTerm {
+                visibility: Visibility::Cloaked { scope: "team".into() },
+                fallback: Some(ObjectId([0x23; 32])),
+                ..t(0x22)
+            }),
+            None,
+        ],
+        removes: vec![
+            Some(t(0x24)),
+            Some(ConflictTerm { visibility: Visibility::Embargoed { embargo: "0123456789".into() }, ..t(0x25) }),
+        ],
+    }
 }
 
 #[test]
@@ -780,12 +828,16 @@ fn newer_object_encodings_are_unsupported_not_corrupt() {
     unsupported(b"veil:tree\n\x1f");
     unsupported(b"veil:snap\n\x02");
     unsupported(b"veil:xtra\npayload");
+    unsupported(b"veil:conf\n\x05");
+    unsupported(b"veil:conf\n\x1f");
     // Reserved flag bits and tier in a binary tree.
     let mut t = Tree::default();
     t.insert(TreeEntry::dir("a", ObjectId([1; 32])));
     let good = Object::Tree(t).encode_with(TreeEncoding::Binary);
     let flags_at = 10 + 1 + 1 + 1 + 1; // tag, version, count, name_len, name
-    for bad_flags in [0x41u8, 0x81, 0x31] {
+    // (Bit 6 is the conflict flag of format 4; with another flag it is
+    // corrupt, see `tree_encoding.rs`.)
+    for bad_flags in [0x81u8, 0xC0, 0x31] {
         let mut raw = good.clone();
         raw[flags_at] = bad_flags;
         unsupported(&raw);
@@ -1015,7 +1067,7 @@ fn upgrade_to_3_rotates_rings_to_hpke_and_reseals_nothing() {
         drop(old);
 
         let r = upgrade(fx.backend("alice"), Some(fx.identity("alice")), &UpgradeOptions::default()).unwrap();
-        assert_eq!((r.from, r.to), (from, 3));
+        assert_eq!((r.from, r.to), (from, REPO_FORMAT));
         assert!(r.steps.contains(&"3:hpke-ring-keys".to_string()), "{:?}", r.steps);
         assert!(r.notes.iter().any(|n| n.contains("scope 'team': new key generation 3")), "{:#?}", r.notes);
         assert!(r.notes.iter().any(|n| n.contains("nothing is re-sealed")), "{:#?}", r.notes);
@@ -1062,7 +1114,7 @@ fn upgrade_by_a_non_admin_leaves_the_ring_and_says_who_can_finish() {
     let r = upgrade(fx.backend("alice"), Some(fx.identity("bob")), &UpgradeOptions::default()).unwrap();
     assert!(r.notes.iter().any(|n| n.contains("an admin should run")), "{:#?}", r.notes);
     let repo = fx.open("alice", Some("alice"));
-    assert_eq!(repo.format(), 3);
+    assert_eq!(repo.format(), REPO_FORMAT);
     assert_eq!(ring_of(&repo, "team"), before, "a non-admin changed the ring");
     // The admin finishes it later (also what `vl scope rotate` does).
     assert_eq!(repo.keys().migrate_to_hpke("team").unwrap(), HpkeMigration::Rotated(3));
@@ -1159,4 +1211,117 @@ fn fsck_reports_format3_crypto_in_a_format2_repository() {
         "{:#?}",
         report.findings
     );
+}
+
+// ---- format 4: first-class conflicts ---------------------------------------------
+
+/// The format-4 set's `conflicted` tag holds a conflict entry for the
+/// cloaked `secrets/notes.txt` (both sides sealed for `team`) and the
+/// resolution of `src/util/strings.rs` (`vl resolve --theirs`). Members read
+/// both sides; the revoked member and the public mirror's readers see
+/// neither, only the conflict naming them.
+#[test]
+fn format_4_fixture_holds_conflicts_as_data_for_their_audiences() {
+    use veil_core::conflict::{materialize_entry, Audience};
+    let fx = Fixture::new(4);
+    for who in ["alice", "bob", "dave"] {
+        let repo = fx.open("alice", Some(who));
+        let c = tag(&repo, "conflicted");
+        let tree = repo.snapshot(&c).unwrap().tree;
+        assert_eq!(repo.snapshot(&c).unwrap().conflicts, vec!["secrets/notes.txt".to_string()], "{who}");
+        let e = lookup(repo.store(), &tree, &p("secrets/notes.txt")).unwrap().unwrap();
+        assert_eq!(e.kind, EntryKind::Conflict, "{who}");
+        let m = materialize_entry(repo.store(), &e, Audience::Reader).unwrap();
+        let text = String::from_utf8(m.content).unwrap();
+        assert!(text.contains("<<<<<<<") && text.contains("side a") && text.contains("side b"), "{who}: {text}");
+        assert_eq!(m.visibility, Visibility::Cloaked { scope: "team".into() });
+        let s = lookup(repo.store(), &tree, &p("src/util/strings.rs")).unwrap().unwrap();
+        assert_eq!(s.kind, EntryKind::File);
+        assert!(read_str(&repo, &c, "src/util/strings.rs").unwrap().contains("to_ascii_uppercase"));
+    }
+    // Carol was revoked before the sides were sealed: redacted.
+    let carol = fx.open("alice", Some("carol"));
+    let e = lookup(carol.store(), &carol.snapshot(&tag(&carol, "conflicted")).unwrap().tree, &p("secrets/notes.txt")).unwrap().unwrap();
+    let m = materialize_entry(carol.store(), &e, Audience::Reader).unwrap();
+    assert!(m.unreadable_side);
+    assert!(!String::from_utf8_lossy(&m.content).contains("side a"));
+    // The public mirror has the conflict, never a sealed side.
+    let mirror = fx.open("public-mirror", None);
+    let c = tag(&mirror, "conflicted");
+    let e = lookup(mirror.store(), &mirror.snapshot(&c).unwrap().tree, &p("secrets/notes.txt")).unwrap().unwrap();
+    let conflict = mirror.store().conflict(&e.id).unwrap();
+    for t in conflict.interleaved().flatten() {
+        assert!(!mirror.store().has(&t.id), "a sealed side reached the public mirror");
+    }
+    let m = materialize_entry(mirror.store(), &e, Audience::Public).unwrap();
+    assert!(!String::from_utf8_lossy(&m.content).contains("team-only"));
+    for f in ["alice", "team-remote", "public-mirror"] {
+        let id = (f == "alice").then(|| fx.identity("alice"));
+        assert_fsck_clean(fx.backend(f), id);
+    }
+}
+
+/// A format-3 remote or clone never receives a conflict entry: the push is
+/// refused (naming `vl upgrade --remote`) and nothing is recorded; after
+/// the upgrade it goes through.
+#[test]
+fn conflicts_never_reach_a_format_3_repository() {
+    let f4 = Fixture::new(4);
+    let mut alice = f4.open("alice", Some("alice"));
+    let remote: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+    drop(Repo::init_bare_at(remote.clone(), 3).unwrap());
+    let before = Repo::open(remote.clone(), None, "remote").unwrap().view().clone();
+    let err = remote::push(&mut alice, remote.clone(), false, &["conflicted".into()], false).unwrap_err();
+    assert!(matches!(err, VeilError::Unsupported(_)), "{err}");
+    assert!(err.to_string().contains("vl upgrade"), "{err}");
+    assert_eq!(Repo::open(remote.clone(), None, "remote").unwrap().view(), &before, "the refused push recorded something");
+    assert_fsck_clean(remote.clone(), None);
+    // A format-3 clone cannot pull it from a format-4 remote either.
+    let mut old = Repo::init_for_clone_at(Arc::new(MemoryBackend::new()), Some(f4.identity("bob")), "bob", 3).unwrap();
+    let err = remote::pull(&mut old, "origin", f4.backend("team-remote")).unwrap_err();
+    assert!(matches!(err, VeilError::Unsupported(_)), "{err}");
+    // Upgraded, the remote takes it.
+    upgrade(remote.clone(), None, &UpgradeOptions::default()).unwrap();
+    remote::push(&mut alice, remote.clone(), false, &["conflicted".into()], false).unwrap();
+    assert_fsck_clean(remote, None);
+}
+
+/// Upgrading 3 → 4 rewrites nothing: conflicts recorded as markers stay
+/// markers (and listed on their snapshots), every id is kept; a merge made
+/// afterwards records a conflict entry.
+#[test]
+fn upgrade_3_to_4_keeps_marker_conflicts_and_records_new_ones_as_data() {
+    let fs = Arc::new(MemoryBackend::new());
+    let alice = Identity::generate("alice");
+    let mut repo = Repo::init_for_clone_at(fs.clone(), Some(alice.clone()), "alice", 3).unwrap();
+    repo.keys().create_scope("team").unwrap();
+    let w = |repo: &mut Repo, text: &str| {
+        fs.write(&p("f.txt"), text.as_bytes()).unwrap();
+        repo.snapshot_workspace("default", &*fs).unwrap();
+        repo.commit_working_copy("default", "c").unwrap().0
+    };
+    let base = w(&mut repo, "a\nb\nc\n");
+    let ours = w(&mut repo, "a\nOURS\nc\n");
+    repo.new_change("default", vec![base], "").unwrap();
+    repo.checkout_tree(&*fs, Some(&repo.snapshot(&ours).unwrap().tree), &repo.snapshot(&base).unwrap().tree).unwrap();
+    let theirs = w(&mut repo, "a\nTHEIRS\nc\n");
+    let m = repo.merge("default", ours, vec![theirs], "merge", None).unwrap();
+    assert_eq!(m.conflicts, vec!["f.txt".to_string()]);
+    let e = lookup(repo.store(), &repo.snapshot(&m.snapshot).unwrap().tree, &p("f.txt")).unwrap().unwrap();
+    assert_eq!(e.kind, EntryKind::File, "format 3 writes markers");
+    let ids: Vec<ObjectId> = repo.store().list_objects().unwrap();
+    drop(repo);
+    let r = upgrade(fs.clone(), Some(alice.clone()), &UpgradeOptions::default()).unwrap();
+    assert_eq!((r.from, r.to), (3, 4));
+    assert!(r.notes.iter().any(|n| n.contains("conflicts recorded before")), "{:#?}", r.notes);
+    let mut repo = Repo::open(fs.clone(), Some(alice), "alice").unwrap();
+    for id in ids {
+        assert!(repo.store().has(&id));
+    }
+    let s = repo.snapshot(&m.snapshot).unwrap();
+    assert_eq!(s.conflicts, vec!["f.txt".to_string()], "the marker conflict stays recorded");
+    // A new merge of the same lines: a conflict entry.
+    let m2 = repo.merge("default", ours, vec![theirs], "merge again", None).unwrap();
+    let e = lookup(repo.store(), &repo.snapshot(&m2.snapshot).unwrap().tree, &p("f.txt")).unwrap().unwrap();
+    assert_eq!(e.kind, EntryKind::Conflict);
 }

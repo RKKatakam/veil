@@ -41,8 +41,8 @@ pub fn lookup(store: &ObjectStore, root: &ObjectId, path: &VPath) -> Result<Opti
 /// the host's `PATH_MAX`. Git's `core.maxTreeDepth` serves the same purpose.
 pub const MAX_TREE_DEPTH: usize = 1024;
 
-/// All file entries below `root`, in tree order (depth first, entries
-/// sorted by name within a directory).
+/// All file entries below `root` (files and conflicts), in tree order
+/// (depth first, entries sorted by name within a directory).
 pub fn walk_files(store: &ObjectStore, root: &ObjectId) -> Result<Vec<(VPath, TreeEntry)>> {
     let mut out = Vec::new();
     // Explicit stack: tree depth is attacker-controlled.
@@ -55,7 +55,7 @@ pub fn walk_files(store: &ObjectStore, root: &ObjectId) -> Result<Vec<(VPath, Tr
         *i += 1;
         let p = dir.join(&e.name);
         match e.kind {
-            EntryKind::File => out.push((p, e.clone())),
+            EntryKind::File | EntryKind::Conflict => out.push((p, e.clone())),
             EntryKind::Dir => {
                 let child = store.tree(&e.id)?;
                 stack.push((p, child, 0));
@@ -155,8 +155,8 @@ fn diff_dir(store: &ObjectStore, a: Option<Arc<Tree>>, b: Option<Arc<Tree>>, out
         let path = f.dir.join(name);
         let da = load_dir(store, ea.as_ref())?;
         let db = load_dir(store, eb.as_ref())?;
-        let fa = ea.filter(|e| e.kind == EntryKind::File);
-        let fb = eb.filter(|e| e.kind == EntryKind::File);
+        let fa = ea.filter(|e| e.kind.is_file_like());
+        let fb = eb.filter(|e| e.kind.is_file_like());
         let file_change = (fa.is_some() || fb.is_some()).then(|| TreeChange {
             path: path.clone(),
             old: fa,
@@ -207,7 +207,7 @@ impl StorageBackend for TreeView {
 
     fn read(&self, path: &VPath) -> Result<Vec<u8>> {
         match self.entry(path)? {
-            Some(e) if e.kind == EntryKind::File => self.store.read_entry(&e),
+            Some(e) if e.kind.is_file_like() => crate::conflict::read_file_like(&self.store, &e),
             Some(_) => Err(VeilError::InvalidPath(format!("{path} is a directory"))),
             None => Err(VeilError::NotFound(path.to_string())),
         }
@@ -245,7 +245,7 @@ impl StorageBackend for TreeView {
                     name: c.name.clone(),
                     kind: match c.kind {
                         EntryKind::Dir => NodeKind::Dir,
-                        EntryKind::File => NodeKind::File,
+                        EntryKind::File | EntryKind::Conflict => NodeKind::File,
                     },
                 })
                 .collect()),
@@ -256,12 +256,15 @@ impl StorageBackend for TreeView {
 
     fn metadata(&self, path: &VPath) -> Result<Option<Metadata>> {
         // Immutable content is identified by `known_id`, not by stamps.
-        Ok(self.entry(path)?.map(|e| {
-            let kind = match e.kind {
-                EntryKind::Dir => NodeKind::Dir,
-                EntryKind::File => NodeKind::File,
-            };
-            Metadata::unstamped(kind, e.size, e.executable)
+        let Some(e) = self.entry(path)? else { return Ok(None) };
+        Ok(Some(match e.kind {
+            EntryKind::Dir => Metadata::unstamped(NodeKind::Dir, e.size, e.executable),
+            EntryKind::File => Metadata::unstamped(NodeKind::File, e.size, e.executable),
+            // What a reader of the view gets is the materialised conflict.
+            EntryKind::Conflict => {
+                let m = crate::conflict::materialize_entry(&self.store, &e, crate::conflict::Audience::Reader)?;
+                Metadata::unstamped(NodeKind::File, m.content.len() as u64, m.executable)
+            }
         }))
     }
 

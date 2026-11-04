@@ -332,11 +332,14 @@ Other ways to reshape history:
 | `vl rebase -s REV -d DEST` | Move a change and its descendants onto `DEST` (several `-d` for a merge) |
 | `vl restore [PATHS…] [--from REV]` | Put files back as they are in `REV` (default: the parent of `@`, or for a merge its merged parents, as `vl status` compares): discards edits, and removes the directories it empties |
 | `vl merge REVS… [-m MSG]` | Merge into `@` (or into `@-` when `@` is empty), then start a new change on top |
+| `vl resolve [--list]`, `vl resolve PATHS --ours\|--theirs\|--base` | List unresolved conflicts, or keep one version of each (see [Conflicts](#conflicts)) |
 
 ### Conflicts
 
-A merge or rebase that conflicts still succeeds. The files hold conflict
-markers, and the snapshot is marked `(conflict)`:
+A merge or rebase that conflicts still succeeds. The conflict is recorded
+in the snapshot as data (the versions that did not merge, each kept as it
+was), the snapshot is marked `(conflict)`, and the working copy gets the
+file with conflict markers:
 
 ```text
 $ vl merge tnorryvo -m "Merge experiment"
@@ -355,29 +358,48 @@ one
 >>>>>>> theirs
 ```
 
-A conflict is cleared when you edit the conflicted file **in the
-conflicted change itself**. After `vl merge`, that change is `@-`, not `@`,
-so `vl status` does not list it (it only lists conflicts in `@`). Resolve it
-like this:
+The markers exist only in your working copy: history holds the versions,
+and each checkout writes the markers again. The change on top of the merge
+holds the conflict too, so `vl status` lists it (`recorded on` names the
+merge), and so do `vl ls` (`conflict: 2 sides`), `vl diff` and `vl resolve
+--list`:
 
 ```text
-$ vl edit wzsvkkoo
-$ vl status
-…
-Unresolved conflicts:
-  C README.md
-$ $EDITOR README.md
-$ vl status
-Working copy changes:
-M README.md
-…
-$ vl new
+$ vl resolve --list
+C README.md  (conflict: 2 sides)
+    ours     public
+    base     public
+    theirs   public
 ```
 
-You can also resolve in `@` (the change on top of the merge) and fold the
-resolution into the merge with `vl squash`, as `vl status` suggests. The
-squash clears the merge's `(conflict)` mark for every file the resolution
-edited; a conflicted file it left untouched stays marked.
+Resolve it in either of two ways:
+
+* **Edit the file.** Once the markers are gone the file is resolved, as you
+  left it. If you edit it but leave markers, it stays a conflict: the text
+  outside the markers belongs to every side (as in Jujutsu), and each side
+  keeps its own section. Deleting the file resolves the conflict as a
+  deletion.
+* **Keep one version** with `vl resolve PATH --ours`, `--theirs` or
+  `--base` (`--side N` for a conflict of more than two sides). The version
+  is kept exactly as it was recorded, sealed for whoever it was sealed for.
+
+`vl undo` brings a resolved conflict back. Resolving in `@` leaves the
+merge itself marked `(conflict)`; fold the resolution into the merge with
+`vl squash` (or `vl edit` the merge and resolve there) to clear it.
+
+Rebases carry conflicts instead of stopping: a rebased change that
+conflicts with its new parent holds the conflict, and its descendants move
+with it. Rebasing it again onto a parent that already has the change (or
+back where it was) resolves it, as in Jujutsu.
+
+A version you cannot read (sealed for a scope you are not in) is shown in
+the markers as a `(not shown: …)` line. You cannot resolve such a conflict:
+an edit of the file is held back (it stays local), and deleting it is not a
+resolution. A member of the scope resolves it.
+
+Repositories at an older format (before `vl upgrade` to format 4), and
+merges under an embargo, still write the markers into the file itself;
+such a conflict is resolved by editing the file in the conflicted change.
 
 When one side has a file where the other has a directory of the same name,
 both survive: the directory keeps the name, and the file is moved aside to
