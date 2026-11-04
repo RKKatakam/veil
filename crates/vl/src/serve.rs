@@ -123,6 +123,10 @@ pub const METHODS: &[&str] = &[
     "op.log",
     "scan",
     "secret.list",
+    // Git-parity round, stream H (read methods; uncomment with the handler):
+    // "blame",
+    // "grep",
+    // `bisect run` executes code and is never served (design 1, point 17).
     "snapshot",
     "describe",
     "new",
@@ -1208,18 +1212,18 @@ impl Server {
             }
             "log" => {
                 let p: LogParams = params(p)?;
-                read(Cmd::Log { limit: p.limit, out: JSON }, p.snapshot)
+                read(Cmd::Log { limit: p.limit, filter: Default::default(), out: JSON }, p.snapshot)
             }
             "diff" => {
                 let p: DiffParams = params(p)?;
                 if p.rev.is_some() && (p.from.is_some() || p.to.is_some()) {
                     return Err(RpcError::new(INVALID_PARAMS, "invalid params: `rev` cannot be used with `from` or `to`"));
                 }
-                read(Cmd::Diff { rev: p.rev, from: p.from, to: p.to, stat: p.stat, out: JSON }, p.snapshot)
+                read(Cmd::Diff { rev: p.rev, from: p.from, to: p.to, stat: p.stat, renames: Default::default(), out: JSON }, p.snapshot)
             }
             "show" => {
                 let p: ShowParams = params(p)?;
-                read(Cmd::Show { rev: p.rev.unwrap_or_else(|| "@".into()), stat: p.stat, out: JSON }, p.snapshot)
+                read(Cmd::Show { rev: p.rev.unwrap_or_else(|| "@".into()), stat: p.stat, renames: Default::default(), out: JSON }, p.snapshot)
             }
             "ws.list" | "workspace.list" => {
                 let p: Plain = params(p)?;

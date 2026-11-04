@@ -50,6 +50,9 @@
 //! # Ok(()) }
 //! ```
 
+pub mod attributes;
+pub mod bisect;
+pub mod blame;
 pub mod builder;
 pub mod cache;
 pub mod checkout;
@@ -57,6 +60,7 @@ pub mod clock;
 pub mod commands;
 pub mod conflict;
 pub mod crypto;
+pub mod duplicate;
 pub mod embargo;
 pub mod error;
 pub mod fsck;
@@ -64,6 +68,7 @@ pub mod gc;
 pub mod hunks;
 #[cfg(feature = "git")]
 pub mod git;
+pub mod grep;
 pub mod id;
 pub mod identity;
 pub mod keychain;
@@ -72,17 +77,25 @@ pub mod merge;
 pub mod object;
 pub mod oplog;
 pub mod pack;
+pub mod patch;
 pub mod policy;
+#[cfg(feature = "git")]
+pub mod policy_gitignore;
 pub mod push_plan;
 pub mod remote;
+pub mod rename;
 pub mod repo;
 pub mod revset;
 #[cfg(feature = "os")]
 pub mod sandbox;
+pub mod search;
 pub mod secrets;
 pub mod selection;
 pub mod statcache;
 pub mod store;
+#[cfg(feature = "git")]
+pub mod submodule;
+pub mod tag_object;
 pub mod team_vault;
 pub mod transaction;
 pub mod textmerge;

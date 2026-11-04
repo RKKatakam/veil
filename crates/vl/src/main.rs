@@ -20,17 +20,24 @@ macro_rules! eprintln {
 }
 
 mod api;
+mod attr_cmd;
 mod cli;
+mod colocate_cmd;
 mod ctx;
 mod doctor;
 #[cfg(test)]
 mod docgen;
+mod history;
+mod hooks;
 mod mount;
+mod patch_cmd;
 mod picker;
 mod render;
+mod rewrite_cmd;
 mod sandbox;
 mod serve;
 mod shape;
+mod submodule_cmd;
 mod team_secret;
 
 use std::{
@@ -129,7 +136,10 @@ fn open(cli: &Cli) -> Result<Ctx> {
 
 fn run(cli: Cli) -> Result<ExitCode> {
     match &cli.cmd {
-        Cmd::Init { path } => cmd_init(path.as_deref()),
+        Cmd::Init { path, colocate } => {
+            colocate_cmd::require_no_init_colocate(colocate)?;
+            cmd_init(path.as_deref())
+        }
         Cmd::Clone { source, dest } => cmd_clone(source, dest.as_deref()),
         Cmd::Identity(c) => cmd_identity(c),
         Cmd::Fsck { verbose } => cmd_fsck(cli.repository.as_deref(), *verbose),
@@ -209,15 +219,22 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             true => api::emit_json(&api::status(ctx)?)?,
             false => api::text::status(&api::status(ctx)?),
         },
-        Cmd::Log { limit, out } => match out.json {
-            true => api::emit_json(&api::log(&ctx.repo, &ctx.ws, *limit)?)?,
-            false => api::text::log(api::log_entries(&ctx.repo, &ctx.ws, *limit)?)?,
-        },
-        Cmd::Show { rev, stat, out } => match out.json {
-            true => api::emit_json(&api::show(ctx, rev, *stat)?)?,
-            false => api::text::show(&ctx.repo, &api::show_header(ctx, rev, *stat)?)?,
-        },
-        Cmd::Diff { rev, from, to, stat, out } => {
+        Cmd::Log { limit, filter, out } => {
+            history::require_no_log_filter(filter)?;
+            match out.json {
+                true => api::emit_json(&api::log(&ctx.repo, &ctx.ws, *limit)?)?,
+                false => api::text::log(api::log_entries(&ctx.repo, &ctx.ws, *limit)?)?,
+            }
+        }
+        Cmd::Show { rev, stat, renames, out } => {
+            history::require_no_rename_flags(renames)?;
+            match out.json {
+                true => api::emit_json(&api::show(ctx, rev, *stat)?)?,
+                false => api::text::show(&ctx.repo, &api::show_header(ctx, rev, *stat)?)?,
+            }
+        }
+        Cmd::Diff { rev, from, to, stat, renames, out } => {
+            history::require_no_rename_flags(renames)?;
             let (a, b) = api::diff_trees_for(ctx, rev.as_deref(), from.as_deref(), to.as_deref())?;
             match out.json {
                 true => api::emit_json(&api::diff(&ctx.repo, &a, &b, *stat)?)?,
@@ -266,15 +283,20 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
                 cur = s.predecessors.first().copied();
             }
         }
+        Cmd::Blame(a) => return history::blame(ctx, a),
+        Cmd::Grep(a) => return history::grep(ctx, a),
+        Cmd::Bisect(c) => return history::bisect(ctx, c),
         // Shared with `vl serve --local` (`api`, write methods).
-        Cmd::Describe { rev, message } => {
+        Cmd::Describe { rev, message, hooks } => {
+            hooks::require_no_verify_unset(hooks)?;
             let d = api::describe(ctx, rev, message)?;
             println!("Described {}", one_line(&ctx.repo, &d.id));
         }
         Cmd::New { revs, message } => {
             api::new_change(ctx, revs, message)?;
         }
-        Cmd::Commit { message, no_advance } => {
+        Cmd::Commit { message, no_advance, hooks } => {
+            hooks::require_no_verify_unset(hooks)?;
             let c = api::commit(ctx, message, !*no_advance)?;
             println!("Committed {}", one_line(&ctx.repo, &c.result.committed));
             print_tags_kept(&ctx.repo, &c.result);
@@ -343,6 +365,8 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Split { paths, rev, message, pick, out } => shape::cmd_split(ctx, paths, rev, message.as_deref(), pick, out)?,
         Cmd::Squash { paths, rev, into, pick, out } => shape::cmd_squash(ctx, paths, rev, into.as_deref(), pick, out)?,
         Cmd::Restore { paths, from } => cmd_restore(ctx, paths, from.as_deref())?,
+        Cmd::Duplicate(a) => return rewrite_cmd::duplicate(ctx, a),
+        Cmd::CherryPick(a) => return rewrite_cmd::cherry_pick(ctx, a),
         Cmd::Merge {
             revs,
             into,
@@ -364,6 +388,8 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Expose { patterns, force } => cmd_policy_rules(ctx, patterns, Tier::Public, *force)?,
         Cmd::Ignore { patterns } => cmd_policy_rules(ctx, patterns, Tier::Ignored, false)?,
         Cmd::Policy(c) => cmd_policy(ctx, c)?,
+        Cmd::Attr(a) => return attr_cmd::attr(ctx, a),
+        Cmd::Renormalize(a) => return attr_cmd::renormalize(ctx, a),
         Cmd::Scan { out, .. } => {
             let scan = api::scan(ctx)?;
             match out.json {
@@ -462,18 +488,30 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             force,
             dry_run: true,
             json,
+            hooks,
             ..
-        } => return cmd_push_dry_run(ctx, remote.as_deref(), tag, *force, *json),
+        } => {
+            hooks::require_no_verify_unset(hooks)?;
+            return cmd_push_dry_run(ctx, remote.as_deref(), tag, *force, *json);
+        }
         Cmd::Push {
             remote,
             tag,
             force,
             full,
             delete,
+            hooks,
             ..
-        } => return cmd_push(ctx, remote.as_deref().unwrap_or("origin"), tag, *force, *full, delete),
+        } => {
+            hooks::require_no_verify_unset(hooks)?;
+            return cmd_push(ctx, remote.as_deref().unwrap_or("origin"), tag, *force, *full, delete);
+        }
         Cmd::Pull { remote, full } => cmd_pull(ctx, remote, *full)?,
         Cmd::Git(c) => return cmd_git(ctx, c),
+        Cmd::FormatPatch(a) => return patch_cmd::format_patch(ctx, a),
+        Cmd::Am(a) => return patch_cmd::am(ctx, a),
+        Cmd::Hooks(c) => return hooks::run(ctx, c),
+        Cmd::Submodule(c) => return submodule_cmd::run(ctx, c),
         Cmd::Gc {
             keep_ops_days,
             grace_minutes,
@@ -1390,11 +1428,18 @@ fn cmd_tag(ctx: &mut Ctx, c: &TagCmd) -> Result<()> {
             rev,
             cloak,
             allow_backwards,
+            annotate,
+            message,
+            force,
         } => {
+            if *annotate || message.is_some() || *force {
+                bail!("annotated tags (`vl tag set -a`, `-m`, `--force`) are not implemented yet");
+            }
             let id = ctx.rev(rev)?;
             ctx.repo.set_tag(name, id, cloak.clone(), *allow_backwards)?;
             println!("Tag {} → {}", cyan(name), one_line(&ctx.repo, &id));
         }
+        TagCmd::Verify { .. } => bail!("`vl tag verify` is not implemented yet"),
         TagCmd::Delete { name } => {
             ctx.repo.delete_tag(name)?;
             println!("Deleted tag {name}");
@@ -1583,6 +1628,7 @@ fn cmd_policy(ctx: &mut Ctx, c: &PolicyCmd) -> Result<()> {
                 println!("Run `vl policy accept` to apply .veilpolicy in full.");
             }
         }
+        PolicyCmd::ImportGitignore(a) => colocate_cmd::import_gitignore(ctx, a)?,
         PolicyCmd::Accept => {
             let held = ctx.repo.accept_policy(&*ctx.fs)?;
             ctx.repo.record_outside_view(
@@ -2426,11 +2472,13 @@ fn cmd_git(ctx: &mut Ctx, c: &GitCmd) -> Result<ExitCode> {
             git::remote_remove(&mut ctx.repo, &git_dir, name)?;
             println!("Removed Git remote {name}");
         }
-        GitCmd::Fetch { remote } => {
+        GitCmd::Fetch { remote, no_tags, prune_tags } => {
+            require_no_git_tag_flags(*no_tags, *prune_tags)?;
             let r = git::fetch(&mut ctx.repo, &git_dir, remote)?;
             print_git_fetch(&r, remote);
         }
-        GitCmd::Pull { remote } => {
+        GitCmd::Pull { remote, no_tags, prune_tags } => {
+            require_no_git_tag_flags(*no_tags, *prune_tags)?;
             let r = git::pull(&mut ctx.repo, &git_dir, remote)?;
             print_git_fetch(&r, remote);
         }
@@ -2439,7 +2487,14 @@ fn cmd_git(ctx: &mut Ctx, c: &GitCmd) -> Result<ExitCode> {
             tag,
             force,
             delete,
+            force_tags,
+            delete_tag,
+            hooks,
         } => {
+            if *force_tags || !delete_tag.is_empty() {
+                bail!("Git tags (`--force-tags`, `--delete-tag`) are not implemented yet");
+            }
+            hooks::require_no_verify_unset(hooks)?;
             let r = git::push_with_deletions(&mut ctx.repo, &git_dir, remote, tag, *force, delete)?;
             print_git_export(&r.export);
             let withheld: Vec<String> = r
@@ -2480,6 +2535,9 @@ fn cmd_git(ctx: &mut Ctx, c: &GitCmd) -> Result<ExitCode> {
                 &withheld,
             ));
         }
+        GitCmd::Colocate(a) => return colocate_cmd::colocate(ctx, a),
+        GitCmd::Uncolocate(a) => return colocate_cmd::uncolocate(ctx, a),
+        GitCmd::CheckPush(a) => return colocate_cmd::check_push(ctx, a),
         GitCmd::Export { tag } => {
             let mut bridge = git::GitBridge::open(&ctx.repo, &git_dir)?;
             let r = bridge.export(&mut ctx.repo, tag)?;
@@ -2490,6 +2548,15 @@ fn cmd_git(ctx: &mut Ctx, c: &GitCmd) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `vl git fetch` / `pull` run as before without `--no-tags` and
+/// `--prune-tags`; they are refused until stream G implements Git tags.
+fn require_no_git_tag_flags(no_tags: bool, prune_tags: bool) -> Result<()> {
+    if no_tags || prune_tags {
+        bail!("Git tags (`--no-tags`, `--prune-tags`) are not implemented yet");
+    }
+    Ok(())
 }
 
 fn print_git_export(r: &veil_core::git::ExportReport) {
