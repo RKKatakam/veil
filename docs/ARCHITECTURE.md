@@ -1059,6 +1059,20 @@ struct Snapshot {
   -d X`) is recorded once, and `vl merge X --into X` is refused (BUG-240).
 * **Merging** is tree-level. Identical subtrees resolve by id, and files
   changed on both sides go through diff3 (`diffy`).
+  * **Bounded text work** (`textmerge.rs`, BUG-484). diffy's Myers diff
+    costs `(N + M) · D` for `D` differing lines, with no limit, so every
+    diff and three-way merge goes through `textmerge` (`merge`,
+    `create_patch`), which first measures the cost by running diffy's own
+    algorithm with a step counter (and a linear lower bound on `D` that
+    rejects full rewrites at once). Within 4 Mi steps plus 128 per line
+    (and 8,192 edits), diffy computes the result, unchanged; past it, a
+    merge is one conflict holding every side whole between the lines all
+    three share at the start and end (the layout diffy would give such a
+    conflict, so it parses back the same), and a diff is one hunk
+    replacing the differing middle. Both are correct, only coarser, and
+    the cost of any input is linear: a merge of two rewritten 20,000-line
+    versions takes 30 ms in a debug build instead of 50 s, and the worst
+    crafted input (reordered lines) about 0.5 s.
   * **First-class conflicts** (repository format 4, `conflict.rs`). A file
     that does not merge becomes a tree entry of kind `conflict` naming a
     conflict object: the versions involved as Jujutsu records them, an
@@ -1076,7 +1090,12 @@ struct Snapshot {
     Versions are recorded with their verified sealing (BUG-103), so a
     forged label is not carried into a conflict.
   * **Materialisation** (`conflict::materialize`) happens only when a file
-    is written: checkout, `vl cat`, `vl restore`, a tree view, a diff. It
+    is written or shown: checkout, `vl cat`, `vl restore`, a tree view, a
+    diff, the Git export, a snapshot comparing an edited copy. What only
+    describes a conflict (`vl status`, `vl ls`, `vl resolve --list`, the
+    JSON output, a checkout's executable bit) uses `conflict::inspect`,
+    which reads every version but never merges their text (BUG-484);
+    `vl ls` reports no size for an unresolved conflict. It
     renders for one audience (§4 rule 5): two readable text sides get
     diffy's diff3 markers (`<<<<<<< ours`, `||||||| original` when the base
     is shown, `=======`, `>>>>>>> theirs`, longer than 7 characters when a
@@ -1088,7 +1107,9 @@ struct Snapshot {
     (`Materialised`), so it is not taken for an edit and is rewritten once
     the side becomes readable.
   * **Snapshots** (`Builder::conflict_entry`): a copy exactly as checkout
-    wrote it keeps the conflict entry. Markers removed (or no longer
+    wrote it keeps the conflict entry. The stat cache notes a copy found to
+    be the conflict's rendering (under the reserved name `:conflict`), so
+    an unchanged copy is not rendered again to compare. Markers removed (or no longer
     parseable): a resolution, built as an edit of the side that decided the
     materialised file's audience, so every rule for edits applies (scanning,
     sealed content keeping its audience, held-back edits). Markers partly
@@ -2131,7 +2152,21 @@ pack-<sum>.idx    "VEILIDX1" | count u32 | fanout[256] u32 | ids[count] (sorted)
   names this pack, the pack header and trailer, and that every entry lies
   inside the file. Every object read is decompressed and **re-hashed against
   its id**, so a flipped bit, a truncated file or a wrong base surfaces as
-  `Corrupt`, never as wrong content. If a pack cannot be opened, lookups
+  `Corrupt`, never as wrong content.
+* **Decompression limits** (BUG-490). A pack may come from a hostile
+  remote, and a few KiB of zstd RLE blocks decode to gigabytes. An entry
+  declaring more than 4 GiB (`VEIL_MAX_OBJECT`, e.g. `8G`; the SFTP
+  read ceiling and the Hub's object limit) is refused before anything is
+  decoded, and an index of more than 2^25 entries is refused. A frame must
+  declare exactly the entry's size, and decoding stops (in both decoders,
+  libzstd and `ruzstd`) as soon as it would produce more, or a second
+  frame. Up to 64 MiB an object is decoded into a buffer of its size;
+  above, it is streamed into its hash first (1 MiB at a time, the window
+  at most 128 MiB) and decoded into memory only once that matched its id,
+  so content that is not the object costs decoding time, never memory. A
+  pull downloads at most 2 GiB of packs into memory for its bulk read,
+  each to the size its index implies; objects in further packs are read
+  one at a time. If a pack cannot be opened, lookups
   that miss report `Corrupt` rather than `Missing`, because "missing" means
   "redacted" to the rest of the engine. `ObjectStore::verify_packs` does a
   full check, and `gc` refuses to run on a store with a broken pack.

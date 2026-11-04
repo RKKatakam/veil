@@ -116,7 +116,10 @@ pub fn lines(text: &str) -> Vec<&str> {
 
 /// The hunks from `old` to `new` (see the module documentation).
 pub fn diff_text(old: &str, new: &str) -> TextDiff {
-    let patch = diffy::create_patch(old, new);
+    // Bounded (BUG-484): past the work limit, one hunk replaces the
+    // differing middle.
+    let mut scratch = String::new();
+    let patch = crate::textmerge::create_patch(old, new, &mut scratch);
     let hunks = patch
         .hunks()
         .iter()

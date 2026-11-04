@@ -343,7 +343,51 @@ fn marker_len<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> usize {
 ///   section only where its audience is the result's (BUG-126).
 /// * More sides, or a side this audience cannot read: every side as a
 ///   whole in one block, unreadable ones as a redaction line.
+///
+/// Only what writes or shows the file calls this (checkout, `vl cat`,
+/// `vl diff`, `vl show`, the Git export, a snapshot comparing an edited
+/// copy); what only describes the conflict uses [`inspect`], which never
+/// compares the sides' text (BUG-484).
 pub fn materialize(store: &ObjectStore, c: &Conflict, audience: Audience) -> Result<Materialized> {
+    render(store, c, audience, true)
+}
+
+/// What a reader is told about a materialised conflict, without its text:
+/// everything in [`Materialized`] but the content and its layout.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct View {
+    pub executable: bool,
+    pub visibility: Visibility,
+    pub fallback: Option<ObjectId>,
+    pub winner: Option<usize>,
+    pub redacted: bool,
+    pub unreadable_side: bool,
+}
+
+/// [`materialize`]'s description of conflict `c` for `audience`, without
+/// merging the sides' text: what `vl status`, `vl ls`, `vl log` and the
+/// JSON output need. Each version is still read (whether this reader can
+/// read it decides the answers), which is linear in their size.
+pub fn inspect(store: &ObjectStore, c: &Conflict, audience: Audience) -> Result<View> {
+    let m = render(store, c, audience, false)?;
+    Ok(View {
+        executable: m.executable,
+        visibility: m.visibility,
+        fallback: m.fallback,
+        winner: m.winner,
+        redacted: m.redacted,
+        unreadable_side: m.unreadable_side,
+    })
+}
+
+/// [`inspect`] of conflict entry `e`.
+pub fn inspect_entry(store: &ObjectStore, e: &TreeEntry, audience: Audience) -> Result<View> {
+    inspect(store, &store.conflict(&e.id)?, audience)
+}
+
+/// [`materialize`], or (`text` false) everything but the merge of two
+/// text sides, whose content is then left empty.
+fn render(store: &ObjectStore, c: &Conflict, audience: Audience, text: bool) -> Result<Materialized> {
     let adds: Vec<Option<Seen>> = c.adds.iter().map(|t| t.as_ref().map(|t| see(store, t, audience)).transpose()).collect::<Result<_>>()?;
     let removes: Vec<Option<Seen>> = c.removes.iter().map(|t| t.as_ref().map(|t| see(store, t, audience)).transpose()).collect::<Result<_>>()?;
     let executable = merged_executable(&Merge {
@@ -482,16 +526,18 @@ pub fn materialize(store: &ObjectStore, c: &Conflict, audience: Audience) -> Res
         let (o, t) = (ours.content.as_deref().expect("shown"), theirs.content.as_deref().expect("shown"));
         let n = marker_len([o, t, base_text]);
         let style = if base_shown {
-            diffy::ConflictStyle::Diff3
+            crate::textmerge::Style::Diff3
         } else {
-            diffy::ConflictStyle::Merge
+            crate::textmerge::Style::Merge
         };
         out.redacted = !base_shown;
-        match diffy::MergeOptions::new()
-            .set_conflict_marker_length(n)
-            .set_conflict_style(style)
-            .merge_bytes(base_text, o, t)
-        {
+        if !text {
+            out.style = Style::Diff3 { marker_len: n, base_shown };
+            return Ok(out);
+        }
+        // Bounded (BUG-484): past the work limit, one conflict holds both
+        // sides whole, in the same layout.
+        match crate::textmerge::merge(base_text, o, t, n, style) {
             Ok(clean) => out.content = clean,
             Err(marked) => {
                 out.content = marked;

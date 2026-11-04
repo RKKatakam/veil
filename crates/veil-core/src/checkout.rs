@@ -722,7 +722,7 @@ fn apply_changes(
                     }
                 }
                 let executable = match new.kind {
-                    EntryKind::Conflict => crate::conflict::materialize_entry(store, new, crate::conflict::Audience::Reader)?.executable,
+                    EntryKind::Conflict => crate::conflict::inspect_entry(store, new, crate::conflict::Audience::Reader)?.executable,
                     _ => new.executable,
                 };
                 if let Err(e) = fs.write(&c.path, &data).and_then(|_| fs.set_executable(&c.path, executable)) {

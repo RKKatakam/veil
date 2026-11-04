@@ -682,6 +682,12 @@ impl Inventory {
     }
 }
 
+/// Most pack data one pull downloads into memory in bulk (BUG-490): packs
+/// past it are read one object at a time instead (ranged reads), so a
+/// remote listing many or huge packs cannot make a pull hold them all.
+/// Each pack is read to the size its index implies, never further.
+const PREFETCH_LIMIT: u64 = 2 << 30;
+
 /// Remote objects downloaded in bulk.
 #[derive(Default)]
 struct Prefetched {
@@ -713,10 +719,22 @@ impl PullSource<'_> {
         got.loaded = true;
         let inv = self.inv;
         let threads = threads_for(&*inv.backend);
+        let mut held = 0u64;
         let packs: Vec<usize> = (0..inv.packs.len())
             .filter(|&i| inv.packs[i].2.ids().iter().any(|id| !self.local_ids.contains(id)))
+            .filter(|&i| {
+                let len = inv.packs[i].2.pack_len();
+                let fits = held.saturating_add(len) <= PREFETCH_LIMIT;
+                if fits {
+                    held += len;
+                }
+                fits
+            })
             .collect();
-        let data = par_map(&packs, threads, |&i| inv.backend.read(&pack_file(&inv.pack_dir, &inv.packs[i].0)));
+        let data = par_map(&packs, threads, |&i| {
+            let len = usize::try_from(inv.packs[i].2.pack_len()).map_err(|_| VeilError::Corrupt("pack".into(), "too large".into()))?;
+            inv.backend.read_range(&pack_file(&inv.pack_dir, &inv.packs[i].0), 0, len)
+        });
         let dir = VPath::new("p")?;
         let mut bytes = 0u64;
         for (i, data) in packs.into_iter().zip(data) {

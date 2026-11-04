@@ -38,6 +38,25 @@ pub use sftp_url::SshUrl;
 pub use crate::vpath::NameFolding;
 use crate::{error::Result, id::ObjectId, vpath::VPath};
 
+/// A size as the `VEIL_SFTP_MAX_FILE` and `VEIL_MAX_OBJECT` settings take
+/// it: `123`, `64K`, `512M`, `8G`, `1T` (binary multiples; `KiB`, `MB` …
+/// and lower case also accepted). Never 0.
+pub(crate) fn parse_size(v: &str) -> Option<u64> {
+    let v = v.trim();
+    let digits = v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len());
+    let (n, unit) = v.split_at(digits);
+    let n: u64 = n.parse().ok()?;
+    let shift = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 0,
+        "k" | "kb" | "kib" => 10,
+        "m" | "mb" | "mib" => 20,
+        "g" | "gb" | "gib" => 30,
+        "t" | "tb" | "tib" => 40,
+        _ => return None,
+    };
+    n.checked_mul(1u64 << shift).filter(|n| *n > 0)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeKind {
     File,

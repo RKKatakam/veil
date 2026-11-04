@@ -84,6 +84,7 @@ pub mod selection;
 pub mod statcache;
 pub mod store;
 pub mod transaction;
+pub mod textmerge;
 pub mod tree;
 pub mod upgrade;
 pub mod vault;
