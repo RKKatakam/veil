@@ -391,13 +391,17 @@ pub fn inspect_entry(store: &ObjectStore, e: &TreeEntry, audience: Audience) -> 
 fn render(store: &ObjectStore, c: &Conflict, audience: Audience, text: bool) -> Result<Materialized> {
     // A link target is never turned into file content (a file of markers a
     // later edit could publish): a conflict with a symlink or gitlink term
-    // is not materialised until the working-copy stream writes our side as
-    // it is (symlinks design, threat 12).
+    // is materialised as its shown side, as it is ([`shown_side`]; symlinks
+    // design, threat 12). It can be described, never rendered as a file.
     if c.has_special_terms() {
-        return Err(VeilError::Unsupported(format!(
-            "a conflict between a symlink or gitlink and another version cannot be written out by vl {} yet",
-            env!("CARGO_PKG_VERSION")
-        )));
+        if text {
+            return Err(VeilError::Unsupported(
+                "a conflict between a symlink or gitlink and another version is never written as a file of markers; \
+                 the working copy holds one side as it is (`vl resolve --ours|--theirs` picks one)"
+                    .into(),
+            ));
+        }
+        return describe_special(store, c, audience);
     }
     let adds: Vec<Option<Seen>> = c.adds.iter().map(|t| t.as_ref().map(|t| see(store, t, audience)).transpose()).collect::<Result<_>>()?;
     let removes: Vec<Option<Seen>> = c.removes.iter().map(|t| t.as_ref().map(|t| see(store, t, audience)).transpose()).collect::<Result<_>>()?;
@@ -617,6 +621,46 @@ fn render(store: &ObjectStore, c: &Conflict, audience: Audience, text: bool) -> 
     Ok(out)
 }
 
+/// The side of a conflict with a symlink or gitlink term (format 5) that
+/// the working copy holds, as it is: the first side present (ours, unless
+/// our side deleted it), with its index in `adds`. `None` only for a
+/// hostile conflict whose every side is "no file".
+pub fn shown_side(c: &Conflict) -> Option<(usize, &crate::object::ConflictTerm)> {
+    c.adds.iter().enumerate().find_map(|(i, t)| t.as_ref().map(|t| (i, t)))
+}
+
+/// [`inspect`] of a conflict with a symlink or gitlink term: the shown side
+/// decides the mode and audience; every other version is not shown.
+fn describe_special(store: &ObjectStore, c: &Conflict, audience: Audience) -> Result<Materialized> {
+    let mut unreadable_side = false;
+    for t in c.adds.iter().flatten() {
+        unreadable_side |= see(store, t, audience)?.content.is_none();
+    }
+    let Some((i, t)) = shown_side(c) else {
+        return Ok(Materialized {
+            content: Vec::new(),
+            executable: false,
+            visibility: Visibility::Public,
+            fallback: None,
+            winner: None,
+            redacted: false,
+            unreadable_side,
+            style: Style::Whole,
+        });
+    };
+    let s = see(store, t, audience)?;
+    Ok(Materialized {
+        content: Vec::new(),
+        executable: t.kind == crate::object::TermKind::File && t.executable,
+        visibility: s.vis().clone(),
+        fallback: t.fallback,
+        winner: Some(i),
+        redacted: true,
+        unreadable_side,
+        style: Style::Whole,
+    })
+}
+
 /// The materialisation of conflict entry `e` for `audience`.
 pub fn materialize_entry(store: &ObjectStore, e: &TreeEntry, audience: Audience) -> Result<Materialized> {
     materialize(store, &store.conflict(&e.id)?, audience)
@@ -642,7 +686,16 @@ pub fn publicly_renders_as(store: &ObjectStore, c: &TreeEntry, file: &TreeEntry)
 /// conflict entry (under an unreleased embargo). Refused when a version
 /// cannot be read here, which writing markers would lose.
 pub fn as_marker_file(store: &ObjectStore, c: &TreeEntry, path: &VPath) -> Result<TreeEntry> {
-    let m = materialize_entry(store, c, Audience::Reader)?;
+    // A conflict with a symlink or gitlink side: its shown side, as it is
+    // (a link target never becomes a file of markers).
+    let conflict = store.conflict(&c.id)?;
+    if conflict.has_special_terms() {
+        return match shown_side(&conflict) {
+            Some((_, t)) => Ok(t.entry(&c.name)),
+            None => Err(VeilError::Corrupt(path.to_string(), "a conflict with no side".into())),
+        };
+    }
+    let m = materialize(store, &conflict, Audience::Reader)?;
     if m.unreadable_side {
         return Err(VeilError::Policy(format!(
             "cannot merge {path} here: it holds a conflict with a version you cannot read; resolve it first (`vl resolve --list`)"
@@ -662,9 +715,21 @@ pub fn as_marker_file(store: &ObjectStore, c: &TreeEntry, path: &VPath) -> Resul
 /// The bytes a reader sees for a file-like entry: a file's content (its
 /// fallback when this reader cannot read it, as [`ObjectStore::read_entry`])
 /// or a conflict's materialisation for this reader.
+///
+/// A symlink's bytes are its target, a gitlink's its commit id line; a
+/// conflict with such a side reads as its shown side ([`shown_side`]).
 pub fn read_file_like(store: &ObjectStore, e: &TreeEntry) -> Result<Vec<u8>> {
     match e.kind {
-        EntryKind::Conflict => Ok(materialize_entry(store, e, Audience::Reader)?.content),
+        EntryKind::Conflict => {
+            let c = store.conflict(&e.id)?;
+            if c.has_special_terms() {
+                return match shown_side(&c) {
+                    Some((_, t)) => store.read_entry(&t.entry(&e.name)),
+                    None => Ok(Vec::new()),
+                };
+            }
+            Ok(materialize(store, &c, Audience::Reader)?.content)
+        }
         _ => store.read_entry(e),
     }
 }

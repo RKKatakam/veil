@@ -60,9 +60,14 @@ pub fn changes_summary_with(changes: &[Change], scores: bool) {
                 println!("{} {} -> {}{}", cyan(&code), safe(c.from.as_deref().unwrap_or_default()), safe(&c.path), change_mark(c));
                 continue;
             }
+            _ if c.old_kind.is_some() => yellow("T"),
             _ => cyan("M"),
         };
-        println!("{status} {}{}", safe(&c.path), change_mark(c));
+        let typechange = match c.old_kind {
+            Some(o) => dim(&format!(" ({o} → {})", c.kind)),
+            None => String::new(),
+        };
+        println!("{status} {}{typechange}{}", safe(&c.path), change_mark(c));
     }
 }
 
@@ -415,15 +420,33 @@ pub fn file_diff_text(f: &FileDiff) {
         ),
         _ => {}
     }
-    // The executable bit, as Git prints it (BUG-241).
+    // A symlink's target, never followed (escaped: targets are raw data).
+    let shown_target = |e: &crate::api::EntryInfo| match &e.target {
+        Some(t) => safe(t).into_owned(),
+        None => "(target not shown: you cannot read it)".to_string(),
+    };
+    let links = f.old.as_ref().is_some_and(|o| o.kind == "symlink") || f.new.as_ref().is_some_and(|n| n.kind == "symlink");
+    if let Some(o) = f.old.as_ref().filter(|o| o.kind == "symlink") {
+        println!("{}", red(&format!("symlink {} -> {}", safe(&f.path), shown_target(o))));
+    }
+    if let Some(n) = f.new.as_ref().filter(|n| n.kind == "symlink") {
+        println!("{}", green(&format!("symlink {} -> {}", safe(&f.path), shown_target(n))));
+    }
+    // The executable bit, as Git prints it (BUG-241), and a change of kind.
     match (&f.old, &f.new) {
-        (Some(o), Some(n)) if o.executable != n.executable => {
+        (Some(o), Some(n)) if o.mode != n.mode => {
             println!("{}", yellow(&format!("old mode {}", o.mode)));
             println!("{}", yellow(&format!("new mode {}", n.mode)));
         }
-        (None, Some(n)) if n.executable => println!("{}", green(&format!("new file mode {}", n.mode))),
-        (Some(o), None) if o.executable => println!("{}", red(&format!("deleted file mode {}", o.mode))),
+        (None, Some(n)) if n.mode != "100644" => {
+            println!("{}", green(&format!("new file mode {}", n.mode)))
+        }
+        (Some(o), None) if o.mode != "100644" => println!("{}", red(&format!("deleted file mode {}", o.mode))),
         _ => {}
+    }
+    // A link's content is its target, shown above.
+    if links {
+        return;
     }
     let Some(content) = &f.content else { return };
     if let Some(h) = &content.hidden {
@@ -684,8 +707,16 @@ pub fn ls(l: &Ls) {
             }
         }
         let note = if note.is_empty() { String::new() } else { dim(&format!("  ({})", note.join("; "))) };
+        // A symlink with its target (escaped; a redacted link's target is
+        // sealed content and never shown), a gitlink as a submodule.
+        let leaf = match (e.kind, &e.target) {
+            ("symlink", Some(t)) => format!("{}{}", dim(" -> "), safe(t)),
+            ("symlink", None) => dim(" -> (target not shown)"),
+            ("gitlink", _) => dim(" (submodule)"),
+            _ => String::new(),
+        };
         println!(
-            "{} {:>9}  {}{}{}{note}",
+            "{} {:>9}  {}{}{}{leaf}{note}",
             tier_coloured(&format!("{label:<18}"), e.tier),
             size,
             safe(&e.path),

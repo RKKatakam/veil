@@ -210,17 +210,12 @@ impl<'a> SparseView<'a> {
                     });
                     continue;
                 }
-                // Format-5 symlinks and gitlinks are not materialised yet:
-                // left out (the builder carries them).
-                if !self.set.is_outside(&p) || !self.store.entry_readable(c) || c.kind.is_special() {
+                if !self.set.is_outside(&p) || !self.store.entry_readable(&self.tree.shown(c.clone())) {
                     continue;
                 }
                 out.entries.push(DirEntry {
                     name: c.name.clone(),
-                    kind: match c.kind {
-                        EntryKind::Dir => NodeKind::Dir,
-                        EntryKind::File | EntryKind::Conflict | EntryKind::Symlink | EntryKind::Gitlink => NodeKind::File,
-                    },
+                    kind: self.tree.node_kind(c),
                 });
             }
         }
@@ -258,6 +253,25 @@ impl StorageBackend for SparseView<'_> {
         } else {
             self.tree.read(path)
         }
+    }
+
+    fn read_link(&self, path: &VPath) -> Result<Vec<u8>> {
+        if self.set.contains(path) {
+            self.inner.read_link(path)
+        } else if self.set.is_spine(path) {
+            Err(VeilError::InvalidPath(format!("{path} is a directory")))
+        } else {
+            self.tree.read_link(path)
+        }
+    }
+
+    fn write_link(&self, path: &VPath, target: &[u8]) -> Result<()> {
+        self.writable(path)?;
+        self.inner.write_link(path, target)
+    }
+
+    fn supports_links(&self) -> bool {
+        self.inner.supports_links()
     }
 
     fn read_through_link(&self, path: &VPath, limit: u64) -> Result<Option<(String, Vec<u8>)>> {

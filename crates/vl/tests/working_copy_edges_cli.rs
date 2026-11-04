@@ -50,8 +50,12 @@ fn op_restore_keeps_edits() {
 
 // ---- symlinks -------------------------------------------------------------
 
+/// Format 5: bob's `vendor -> shared` link is recorded with his change
+/// (a link Veil never follows). Moving onto a tree that has `vendor/` as
+/// a directory replaces the link itself (it stays in bob's change), and
+/// nothing is ever written into `shared`.
 #[test]
-fn a_symlink_in_the_way_is_reported_and_not_recorded_as_a_deletion() {
+fn a_symlink_in_the_way_is_replaced_never_written_through() {
     let env = Env::new();
     let shared = env.dir("shared-vendor");
     let alice = env.project("alice", "alice", &[("a.txt", "a\n")]);
@@ -66,13 +70,18 @@ fn a_symlink_in_the_way_is_reported_and_not_recorded_as_a_deletion() {
     std::os::unix::fs::symlink(&shared, bob.join("vendor")).unwrap();
     env.ok("bob", &bob, &["remote", "add", "origin", remote.to_str().unwrap()]);
     env.ok("bob", &bob, &["pull", "origin"]);
-    let out = env.ok("bob", &bob, &["new", "origin/main"]);
-    assert!(out.contains("skipped vendor/postinstall.sh"), "{out}");
+    let mine = env.stdout("bob", &bob, &["files"]);
+    assert!(mine.contains("vendor"), "the link was not recorded: {mine}");
+    env.ok("bob", &bob, &["new", "origin/main"]);
     assert!(std::fs::read_dir(&shared).unwrap().next().is_none(), "wrote into the link target");
+    assert!(std::fs::symlink_metadata(bob.join("vendor")).unwrap().is_dir());
+    assert_eq!(read(&bob, "vendor/postinstall.sh"), "#!/bin/sh\n");
     let st = env.ok("bob", &bob, &["status"]);
-    assert!(st.contains("symlink"), "{st}");
-    let diff = env.stdout("bob", &bob, &["diff"]);
-    assert!(!diff.contains("postinstall"), "recorded as a deletion:\n{diff}");
+    assert!(st.contains("no changes"), "{st}");
+    // Undo brings the link back, exactly.
+    env.ok("bob", &bob, &["undo"]);
+    assert_eq!(std::fs::read_link(bob.join("vendor")).unwrap(), shared);
+    assert!(std::fs::read_dir(&shared).unwrap().next().is_none());
 }
 
 #[test]
@@ -84,9 +93,11 @@ fn restore_never_writes_through_a_symlink() {
     env.ok("alice", &proj, &["commit", "-m", "v2"]);
     std::fs::remove_dir_all(proj.join("vendor")).unwrap();
     std::os::unix::fs::symlink(&shared, proj.join("vendor")).unwrap();
-    let out = env.ok("alice", &proj, &["restore", "vendor", "--from", "@--"]);
-    assert!(out.contains("skipped vendor/x"), "{out}");
+    // The link is recorded (format 5): restore replaces it, never writes
+    // through it.
+    env.ok("alice", &proj, &["restore", "vendor", "--from", "@--"]);
     assert!(std::fs::read_dir(&shared).unwrap().next().is_none(), "restore wrote through the link");
+    assert_eq!(read(&proj, "vendor/x"), "v1\n");
 }
 
 // ---- unreadable files ---------------------------------------------------------

@@ -293,6 +293,7 @@ fn a_repository_for_native_vl() {
                     export(fs, &child, &path);
                 }
                 veil_core::vfs::NodeKind::File => std::fs::write(&path, fs.read(&child).unwrap()).unwrap(),
+                veil_core::vfs::NodeKind::Symlink => {}
             }
         }
     }

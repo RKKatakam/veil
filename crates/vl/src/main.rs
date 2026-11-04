@@ -245,8 +245,9 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
                 false => lookup(ctx.repo.store(), &ctx.repo.snapshot(&id)?.tree, &p)?,
             };
             match &e {
-                Some(e) if e.kind.is_file_like() => {}
-                Some(e) if e.kind.is_special() => bail!("{}", safe(&e.kind.not_supported_yet(p.as_str()).to_string())),
+                // A symlink prints its target, a gitlink its commit id, as
+                // `git cat-file` does.
+                Some(e) if e.kind.is_file_like() || e.kind.is_special() => {}
                 Some(_) => bail!("{} is a directory in {}, not a file (`vl files -r {}` lists its files)", safe(p.as_str()), id.short(), id.short()),
                 None if p.is_root() => bail!("'{}' is the repository's root directory, not a file", safe(path)),
                 None => bail!("{} does not exist in {}", safe(p.as_str()), id.short()),
@@ -996,12 +997,10 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()
     let mut moves_audience = false;
     for c in changes.iter().filter(|c| wanted(&c.path)) {
         let Some(e) = &c.new else { continue };
-        if e.kind == veil_core::EntryKind::File && !ctx.repo.store().entry_readable(e) {
+        if e.kind.holds_blob() && !ctx.repo.store().entry_readable(e) {
             unreadable.push(c.path.clone());
         } else if restored_as_recorded(&ctx.repo, e)? {
-            let same = c.old.as_ref().is_some_and(|o| {
-                o.kind == veil_core::EntryKind::File && e.kind == veil_core::EntryKind::File && o.visibility == e.visibility
-            });
+            let same = c.old.as_ref().is_some_and(|o| o.kind.holds_blob() && o.kind == e.kind && o.visibility == e.visibility);
             moves_audience |= !same;
         }
     }
@@ -1035,7 +1034,7 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()
     };
     let mut carried: Vec<(VPath, veil_core::TreeEntry)> = Vec::new();
     for c in changes.iter().filter(|c| !embargoed && wanted(&c.path) && !not_written(&c.path)) {
-        if let Some(e) = c.new.as_ref().filter(|e| e.kind.is_file_like()) {
+        if let Some(e) = c.new.as_ref().filter(|e| e.kind.is_file_like() || e.kind.is_special()) {
             if restored_as_recorded(&ctx.repo, e)? {
                 carried.push((c.path.clone(), with_fallback_of(e, c.old.as_ref())));
             }
@@ -1069,6 +1068,15 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()
                 };
                 ctx.fs.write(&p, &data).and_then(|_| ctx.fs.set_executable(&p, exec))
             }
+            // A quarantined link (a token in its target) put back.
+            Some(e) if e.kind == veil_core::EntryKind::Symlink => {
+                let target = read_file(&ctx.repo, &p, &e)?;
+                if !embargoed && restored_as_recorded(&ctx.repo, &e)? {
+                    let was = veil_core::tree::lookup(ctx.repo.store(), &wc_tree, &p)?;
+                    carry = Some((p.clone(), with_fallback_of(&e, was.as_ref())));
+                }
+                ctx.fs.write_link(&p, &target)
+            }
             _ => ctx.fs.remove_file(&p),
         };
         match res {
@@ -1097,10 +1105,10 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()
 /// builder carries it for a sealed edit), not the fallback `e` had where
 /// it came from. A conflict is put back as it is.
 fn with_fallback_of(e: &veil_core::TreeEntry, was: Option<&veil_core::TreeEntry>) -> veil_core::TreeEntry {
-    if e.kind != veil_core::EntryKind::File {
+    if !matches!(e.kind, veil_core::EntryKind::File | veil_core::EntryKind::Symlink) {
         return e.clone();
     }
-    let fallback = match was.filter(|w| w.kind == veil_core::EntryKind::File) {
+    let fallback = match was.filter(|w| w.kind == e.kind) {
         Some(w) if w.visibility.is_public() && w.fallback.is_none() => Some(w.id),
         Some(w) if w.visibility == e.visibility => w.fallback,
         _ => None,
@@ -1120,12 +1128,12 @@ fn restored_as_recorded(repo: &veil_core::repo::Repo, e: &veil_core::TreeEntry) 
     use veil_core::builder::{verify_sealing, Sealing};
     Ok(match e.kind {
         veil_core::EntryKind::Conflict => true,
-        veil_core::EntryKind::File => match verify_sealing(repo.store(), e)? {
+        // A symlink's target and a gitlink's commit id are content too.
+        veil_core::EntryKind::File | veil_core::EntryKind::Symlink | veil_core::EntryKind::Gitlink => match verify_sealing(repo.store(), e)? {
             Sealing::Relabelled(actual) => !actual.is_public(),
             _ => !e.visibility.is_public(),
         },
-        // Format 5: not restored as links yet (the working-copy stream).
-        veil_core::EntryKind::Dir | veil_core::EntryKind::Symlink | veil_core::EntryKind::Gitlink => false,
+        veil_core::EntryKind::Dir => false,
     })
 }
 
@@ -1704,13 +1712,38 @@ fn cmd_policy(ctx: &mut Ctx, c: &PolicyCmd) -> Result<()> {
             ctx.snapshot()?;
         }
         PolicyCmd::Check { paths } => {
+            let wc_tree = ctx.wc().and_then(|w| Ok(ctx.repo.snapshot(&w)?.tree)).ok();
+            let gitlink_at = |a: &VPath| -> bool {
+                !a.is_root()
+                    && wc_tree.is_some_and(|t| {
+                        lookup(ctx.repo.store(), &t, a).ok().flatten().is_some_and(|e| e.kind == veil_core::EntryKind::Gitlink)
+                    })
+            };
             for p in paths {
                 let vp = ctx.repo_path(p)?;
                 // As a snapshot walks: it never looks inside an ignored
                 // directory (Git's rule), so no later rule re-includes a
-                // file below one, nor inside a nested repository (BUG-203).
+                // file below one, nor inside a nested repository (BUG-203),
+                // nor inside a submodule (a gitlink: its own repository
+                // decides where its files are published).
                 let mut skipped = None;
+                if gitlink_at(&vp) {
+                    println!(
+                        "{}: {}: a submodule (a gitlink entry, recorded as its pinned commit); Veil never records what is inside it",
+                        safe(vp.as_str()),
+                        bold("submodule")
+                    );
+                    continue;
+                }
                 for a in vp.ancestors() {
+                    if gitlink_at(&a) {
+                        skipped = Some(format!(
+                            "{}: inside submodule {}: not recorded by Veil; its own repository decides where it is published",
+                            bold("not recorded"),
+                            safe(a.as_str())
+                        ));
+                        break;
+                    }
                     let c = policy.classify(&a, true);
                     if c.tier == Tier::Ignored {
                         let via = c.rule.map(|r| format!("rule '{r}'")).unwrap_or_else(|| "default".into());

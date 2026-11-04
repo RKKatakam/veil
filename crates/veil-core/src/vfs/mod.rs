@@ -15,6 +15,8 @@
 //! * [`SparseView`]     — a sparse working copy (a sandbox holding a
 //!   [`SparseSet`] of paths) seen as the whole tree it was synced from.
 
+#[cfg(all(feature = "os", unix))]
+mod beneath;
 #[cfg(feature = "os")]
 mod disk;
 mod memory;
@@ -65,6 +67,81 @@ pub(crate) fn parse_size(v: &str) -> Option<u64> {
 pub enum NodeKind {
     File,
     Dir,
+    /// A symbolic link, seen as itself (never followed): its
+    /// [`Metadata::len`] is the length of its target, which
+    /// [`StorageBackend::read_link`] returns. Recorded as a symlink entry
+    /// in repository format 5; below format 5 the builder treats it as a
+    /// special file (never recorded, never followed).
+    Symlink,
+}
+
+/// Longest symlink target Veil records or writes, in bytes (`PATH_MAX` on
+/// Linux and macOS, including the terminating NUL that is not stored).
+pub const MAX_LINK_TARGET: usize = 4095;
+
+/// Check a symlink target before it is written to a working copy or
+/// recorded: not empty, no NUL byte, valid UTF-8 (a target that is not
+/// is reported as unrepresentable, as names are, BUG-039), and at most
+/// [`MAX_LINK_TARGET`] bytes. Returns the target as text.
+pub fn check_link_target(target: &[u8]) -> Result<&str> {
+    let bad = |why: &str| crate::error::VeilError::InvalidPath(format!("invalid symlink target: {why}"));
+    if target.is_empty() {
+        return Err(bad("it is empty"));
+    }
+    if target.len() > MAX_LINK_TARGET {
+        return Err(bad(&format!("it is {} bytes long, more than {MAX_LINK_TARGET}", target.len())));
+    }
+    if target.contains(&0) {
+        return Err(bad("it holds a NUL byte"));
+    }
+    std::str::from_utf8(target).map_err(|_| bad("it is not valid UTF-8"))
+}
+
+/// Does `target`, a symlink target found at `link` (a path relative to the
+/// working copy's root), lead outside the working copy? Absolute targets
+/// do; relative ones are resolved lexically against the link's directory,
+/// and do when a `..` climbs above the root. Lexical resolution does not
+/// follow other links on the way, so this is a property of the target
+/// string alone (what `vl status` warns about, and what a sandbox refuses).
+pub fn link_escapes(link: &VPath, target: &str) -> bool {
+    if target.starts_with('/') {
+        return true;
+    }
+    let mut depth = link.components().count().saturating_sub(1) as i64;
+    for part in target.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                depth -= 1;
+                if depth < 0 {
+                    return true;
+                }
+            }
+            _ => depth += 1,
+        }
+    }
+    false
+}
+
+/// The path (relative to the working copy's root) that relative `target`
+/// of the link at `link` names, resolved lexically (see [`link_escapes`]);
+/// `None` when it is absolute or leaves the root.
+pub fn link_resolves_to(link: &VPath, target: &str) -> Option<Vec<String>> {
+    if target.starts_with('/') {
+        return None;
+    }
+    let mut parts: Vec<String> = link.components().map(str::to_string).collect();
+    parts.pop();
+    for part in target.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            p => parts.push(p.to_string()),
+        }
+    }
+    Some(parts)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,9 +199,10 @@ pub struct DirEntry {
 pub struct DirListing {
     /// Files and directories, sorted by name (exactly `list_dir`).
     pub entries: Vec<DirEntry>,
-    /// Names of entries that are neither regular files nor directories
-    /// (symlinks, sockets, devices). The engine never follows or records
-    /// them, and never writes through or over them.
+    /// Names of entries that are neither regular files, directories nor
+    /// symlinks (sockets, FIFOs, devices, the root of a `vl ws mount`).
+    /// The engine never follows or records them, and never writes through
+    /// or over them. Symlinks are in `entries`, as [`NodeKind::Symlink`].
     pub special: Vec<String>,
     /// Entries whose names are not valid UTF-8, escaped for display
     /// (`\xNN` per invalid byte). They cannot be represented as a [`VPath`].
@@ -209,7 +287,8 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
 
     fn create_dir_all(&self, path: &VPath) -> Result<()>;
 
-    /// Direct children of a directory, sorted by name.
+    /// Direct children of a directory, sorted by name: files, directories
+    /// and symlinks ([`NodeKind::Symlink`], never followed).
     fn list_dir(&self, path: &VPath) -> Result<Vec<DirEntry>>;
 
     /// [`StorageBackend::list_dir`] plus the entries it cannot represent.
@@ -223,8 +302,40 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
     }
 
     /// `Ok(None)` when nothing exists at `path`, including when an ancestor
-    /// of `path` is a file.
+    /// of `path` is a file or a symlink (nothing is ever looked up through
+    /// a link). A symlink at `path` itself is [`NodeKind::Symlink`].
     fn metadata(&self, path: &VPath) -> Result<Option<Metadata>>;
+
+    /// The target of the symlink at `path`, never followed. `NotFound`
+    /// when nothing is there (or an ancestor is not a directory),
+    /// `InvalidPath` when something other than a symlink is. Backends that
+    /// cannot hold symlinks return `Unsupported`.
+    fn read_link(&self, path: &VPath) -> Result<Vec<u8>> {
+        Err(crate::error::VeilError::Unsupported(format!(
+            "{path}: this storage ({}) cannot hold symlinks",
+            self.kind()
+        )))
+    }
+
+    /// Create (or atomically replace) a symlink at `path` pointing at
+    /// `target`, which is written as it is and never resolved. Creates
+    /// parent directories as needed, and like every write never goes
+    /// through a symlink on the way (see [`DiskBackend`]). Replaces a file
+    /// or symlink at `path`, never a directory. `target` must pass
+    /// [`check_link_target`].
+    fn write_link(&self, path: &VPath, target: &[u8]) -> Result<()> {
+        let _ = target;
+        Err(crate::error::VeilError::Unsupported(format!(
+            "{path}: this storage ({}) cannot hold symlinks",
+            self.kind()
+        )))
+    }
+
+    /// Can this backend hold symlinks ([`StorageBackend::write_link`])?
+    /// Checkout reports links it cannot write instead of trying each.
+    fn supports_links(&self) -> bool {
+        false
+    }
 
     fn set_executable(&self, path: &VPath, executable: bool) -> Result<()>;
 
@@ -268,11 +379,12 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
     }
 
     /// What occupies `path` if it is neither a file nor a directory (a
-    /// symlink, socket, device): such an entry is invisible to
-    /// [`StorageBackend::metadata`] and [`StorageBackend::read`], yet makes
-    /// [`StorageBackend::create_new`] fail. `Some("a symlink")` and the
-    /// like, for diagnostics; `None` when nothing special is there (or the
-    /// backend cannot hold such entries, the default).
+    /// symlink, socket, device): such an entry is never read through, yet
+    /// makes [`StorageBackend::create_new`] fail. `Some("a symlink")` and
+    /// the like, for diagnostics; `None` when nothing special is there (or
+    /// the backend cannot hold such entries, the default). Sockets and
+    /// devices are invisible to [`StorageBackend::metadata`]; a symlink is
+    /// [`NodeKind::Symlink`] there.
     fn special_at(&self, _path: &VPath) -> Result<Option<&'static str>> {
         Ok(None)
     }
@@ -320,7 +432,8 @@ pub(crate) fn slice_range<'a>(path: &VPath, data: &'a [u8], offset: u64, len: us
 }
 
 /// Recursively list every file below `dir` (depth-first, sorted), skipping
-/// any directory for which `skip` returns true.
+/// any directory for which `skip` returns true. Symlinks are neither listed
+/// nor followed ([`walk_leaves`] lists them too).
 pub fn walk_files(
     fs: &dyn StorageBackend,
     dir: &VPath,
@@ -339,10 +452,32 @@ pub fn walk_files(
             match c.kind {
                 NodeKind::Dir => stack.push(p),
                 NodeKind::File => out.push(p),
+                // A leaf: never descended into.
+                NodeKind::Symlink => {}
             }
         }
     }
     out.sort();
+    Ok(out)
+}
+
+/// [`walk_files`], with symlinks listed too (never followed).
+pub fn walk_leaves(fs: &dyn StorageBackend, dir: &VPath, skip: &dyn Fn(&VPath) -> bool) -> Result<Vec<(VPath, NodeKind)>> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.clone()];
+    while let Some(d) = stack.pop() {
+        for c in fs.list_dir(&d)? {
+            let p = d.join(&c.name);
+            if skip(&p) {
+                continue;
+            }
+            match c.kind {
+                NodeKind::Dir => stack.push(p),
+                k => out.push((p, k)),
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
 }
 
@@ -359,7 +494,7 @@ pub fn holds_repository(listing: &DirListing) -> bool {
     listing
         .entries
         .iter()
-        .any(|e| e.kind == NodeKind::Dir && is_reserved_name(&e.name))
+        .any(|e| matches!(e.kind, NodeKind::Dir | NodeKind::Symlink) && is_reserved_name(&e.name))
         || listing.special.iter().any(|n| is_reserved_name(n))
 }
 

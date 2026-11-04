@@ -432,6 +432,44 @@ pub struct Change {
     pub tier: &'static str,
     /// The new version is an unresolved conflict (null otherwise).
     pub conflict: Option<ConflictInfo>,
+    /// What the new version is (the old one for a deletion): `file`,
+    /// `symlink`, `gitlink` (format 5) or `conflict`.
+    pub kind: &'static str,
+    /// The old version's kind when a modification changed it (a file
+    /// replaced by a symlink: `T` in the text); null otherwise.
+    pub old_kind: Option<&'static str>,
+}
+
+/// What entry `e` is, as JSON spells it: `file`, `symlink`, `gitlink`,
+/// `conflict` (or `dir`).
+pub fn entry_kind(e: &TreeEntry) -> &'static str {
+    e.kind.name()
+}
+
+/// The target of symlink entry `e` as this reader reads it; `None` for
+/// anything else, and for a link this reader cannot read (its target is
+/// content, sealed as a file's would be: never shown to a non-member).
+pub fn link_target(repo: &Repo, e: &TreeEntry) -> Option<String> {
+    if e.kind != EntryKind::Symlink {
+        return None;
+    }
+    // Never its embargo fallback: that is another version.
+    let own = TreeEntry { fallback: None, ..e.clone() };
+    if !repo.store().entry_readable(&own) {
+        return None;
+    }
+    repo.store().read_entry(&own).ok().map(|t| String::from_utf8_lossy(&t).into_owned())
+}
+
+/// The Git mode of entry `e`: `100644`, `100755`, `120000` (symlink) or
+/// `160000` (gitlink).
+fn git_mode(e: &TreeEntry, executable: bool) -> &'static str {
+    match e.kind {
+        EntryKind::Symlink => "120000",
+        EntryKind::Gitlink => "160000",
+        _ if executable => "100755",
+        _ => "100644",
+    }
 }
 
 pub fn change(repo: &Repo, c: &TreeChange) -> Change {
@@ -451,6 +489,12 @@ pub fn change(repo: &Repo, c: &TreeChange) -> Change {
         // The conflict of the new version only (`e` is the old one for a
         // deletion).
         conflict: if c.new.is_some() { looked.map(|l| l.info) } else { None },
+        kind: entry_kind(e),
+        // A conflict edited into a file is a resolution, not a new kind.
+        old_kind: match (&c.old, &c.new) {
+            (Some(o), Some(n)) if o.kind != n.kind && o.kind.holds_blob() && n.kind.holds_blob() => Some(entry_kind(o)),
+            _ => None,
+        },
     }
 }
 
@@ -1066,6 +1110,11 @@ pub struct EntryInfo {
     /// An unresolved conflict (null otherwise); its content is the file
     /// with markers this reader is shown.
     pub conflict: Option<ConflictInfo>,
+    /// `file`, `symlink`, `gitlink` (format 5) or `conflict`.
+    pub kind: &'static str,
+    /// A symlink's target, when this reader can read it (null otherwise,
+    /// and for anything but a symlink).
+    pub target: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -1106,14 +1155,18 @@ fn entry_info(repo: &Repo, e: &TreeEntry, check_readable: bool) -> EntryInfo {
             mode: if view.executable { "100755" } else { "100644" },
             readable: !view.unreadable_side,
             conflict: Some(info),
+            kind: entry_kind(e),
+            target: None,
         };
     }
     EntryInfo {
         visibility: Vis::from(&verified_visibility(repo, e)),
         executable: e.executable,
-        mode: if e.executable { "100755" } else { "100644" },
+        mode: git_mode(e, e.executable),
         readable: !check_readable || repo.store().entry_readable(e),
         conflict: None,
+        kind: entry_kind(e),
+        target: link_target(repo, e),
     }
 }
 
@@ -1780,6 +1833,12 @@ pub struct LsEntry {
     /// `size` and `executable` are those of the file with markers this
     /// reader is shown.
     pub conflict: Option<ConflictInfo>,
+    /// `file`, `symlink`, `gitlink` (format 5) or `conflict`.
+    pub kind: &'static str,
+    /// A symlink's target, when this reader can read it (null for a
+    /// redacted link, whose target is sealed content, and for anything but
+    /// a symlink).
+    pub target: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -1871,6 +1930,8 @@ pub fn ls(ctx: &Ctx, rev: &str, paths: &[String], all: bool, local_files: bool) 
                 redaction,
                 quarantine: q,
                 conflict: looked.map(|l| l.info),
+                kind: entry_kind(&e),
+                target: link_target(repo, &e),
             },
         ));
     }
@@ -1911,6 +1972,12 @@ pub fn ls(ctx: &Ctx, rev: &str, paths: &[String], all: bool, local_files: bool) 
                     redaction: None,
                     quarantine: if tier == "quarantined" { quarantine(&p) } else { None },
                     conflict: None,
+                    kind: match meta.as_ref().map(|m| m.kind) {
+                        Some(veil_core::vfs::NodeKind::Symlink) => "symlink",
+                        _ => "file",
+                    },
+                    // A local-only link's target stays local: never shown.
+                    target: None,
                 },
             ));
         }

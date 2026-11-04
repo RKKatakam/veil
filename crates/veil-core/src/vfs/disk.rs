@@ -16,12 +16,17 @@ use crate::{
 /// durable: temp file, fsync, rename, fsync of the directory. When `write`
 /// or `create_new` returns, the data survives a crash, so the order of
 /// writes is the order in which they become durable (the engine relies on
-/// this: objects, then the operation, then the operation head). Symlinks are
-/// not followed and are invisible to the engine in this MVP: `metadata`
-/// reports nothing at a symlink, `read` refuses one, and `list_dir_full`
-/// reports them as `special` so callers never write through or over them;
-/// writes themselves refuse a path below a symlinked directory (outside
-/// `.veil/`).
+/// this: objects, then the operation, then the operation head).
+///
+/// **Symlinks are never followed.** A symlink is a leaf of its own
+/// ([`NodeKind::Symlink`] in `metadata` and listings, its target from
+/// `read_link`); `read` never reads through one. Every write, removal and
+/// read below the root (outside `.veil/`, the engine's own directory, which
+/// may itself be a link to another disk) resolves its path with `openat`
+/// and `O_NOFOLLOW` on each component (`vfs::beneath`), so a path below a
+/// symlinked directory is refused, and a directory swapped for a link
+/// while a write is under way cannot redirect it. `metadata` and listings
+/// are plain `lstat`s (they only ever lead to such a read or write).
 ///
 /// [`StorageBackend::write_unsynced`] skips both fsyncs and remembers the
 /// file; [`StorageBackend::sync_barrier`] then syncs every remembered file
@@ -137,28 +142,30 @@ impl DiskBackend {
         f
     }
 
+    /// Paths the engine keeps for itself (`.veil/` at the root) are
+    /// written by path, following symlinks: a user may keep the
+    /// repository's directory elsewhere and link it in, and nothing from a
+    /// tree is ever written there. Everything else goes through
+    /// `vfs::beneath`: never through a symlink.
+    fn own_path(path: &VPath) -> bool {
+        path.components().next() == Some(crate::repo::VEIL_DIR)
+    }
+
     /// Refuse to write `path` if a directory above it, below the root, is
-    /// a symlink: the write would land wherever the link points, outside
-    /// what the engine manages (an untracked `vendor -> /shared/vendor`).
-    /// Checkout and `vl restore` already skip such paths; this guards every
-    /// other caller. The engine's own directory (`.veil/` at the root) is
-    /// not checked: nothing from a tree is ever written there. One `lstat`
-    /// per existing directory above the path.
+    /// a symlink (an untracked `vendor -> /shared/vendor`). Advisory only
+    /// (one `lstat` per directory, with a window before the write): the
+    /// writes themselves never resolve through a link (see
+    /// `vfs::beneath`). Kept for callers that only want to know.
     pub(super) fn refuse_symlinked_parent(&self, path: &VPath) -> Result<()> {
         let parts: Vec<&str> = path.components().collect();
-        if parts.first() == Some(&crate::repo::VEIL_DIR) {
+        if Self::own_path(path) {
             return Ok(());
         }
         let mut dir = self.root.clone();
         for part in &parts[..parts.len().saturating_sub(1)] {
             dir.push(part);
             match fs::symlink_metadata(&dir) {
-                Ok(m) if m.file_type().is_symlink() => {
-                    return Err(VeilError::InvalidPath(format!(
-                        "refusing to write {path}: {} is a symbolic link",
-                        dir.strip_prefix(&self.root).unwrap_or(&dir).display()
-                    )));
-                }
+                Ok(m) if m.file_type().is_symlink() => return Err(self.link_in_the_way(path, &dir)),
                 Ok(m) if m.is_dir() => {}
                 // Missing (created as a real directory below) or not a
                 // directory (the write fails).
@@ -166,6 +173,60 @@ impl DiskBackend {
             }
         }
         Ok(())
+    }
+
+    fn link_in_the_way(&self, path: &VPath, dir: &Path) -> VeilError {
+        VeilError::InvalidPath(format!(
+            "refusing to write {path}: {} is a symbolic link",
+            dir.strip_prefix(&self.root).unwrap_or(dir).display()
+        ))
+    }
+
+    /// The error for a write whose walk to `path`'s directory stopped.
+    #[cfg(unix)]
+    fn write_walk_err(&self, path: &VPath, e: super::beneath::WalkError) -> VeilError {
+        use super::beneath::WalkError as W;
+        match e {
+            W::Link(prefix) => self.link_in_the_way(path, Path::new(&prefix)),
+            W::NotDir(prefix) => io_err(Path::new(&prefix), io::Error::from_raw_os_error(libc::ENOTDIR)),
+            W::Missing => VeilError::NotFound(self.full_path(path).display().to_string()),
+            W::Io(e) => io_err(&self.full_path(path), e),
+        }
+    }
+
+    /// The parent directory of `path`, for reading: `Ok(None)` when it is
+    /// not there as a real directory (missing, a file, or a symlink, which
+    /// is never looked through).
+    #[cfg(unix)]
+    fn read_parent(&self, path: &VPath) -> Result<Option<super::beneath::Dir>> {
+        use super::beneath::WalkError as W;
+        match super::beneath::open_parent(&self.root, path, false, false, &mut Vec::new()) {
+            Ok(d) => Ok(Some(d)),
+            Err(W::Link(_) | W::NotDir(_) | W::Missing) => Ok(None),
+            Err(W::Io(e)) if is_missing(&e) => Ok(None),
+            Err(W::Io(e)) => Err(io_err(&self.full_path(path), e)),
+        }
+    }
+
+    /// Write `data` at `path` through the no-follow walk: a temp file in
+    /// the parent directory, renamed over `path` (flushed, and the
+    /// directory too, when `durable`). The parent directories created on
+    /// the way are returned.
+    #[cfg(unix)]
+    fn write_beneath(&self, path: &VPath, data: &[u8], durable: bool) -> Result<Vec<PathBuf>> {
+        let mut created = Vec::new();
+        let dir = super::beneath::open_parent(&self.root, path, true, durable, &mut created).map_err(|e| self.write_walk_err(path, e))?;
+        let name = path.file_name();
+        let tmp = temp_name(path);
+        let full = self.full_path(path);
+        let res = super::beneath::write_temp(&dir, &tmp, name, data, durable)
+            .and_then(|()| dir.rename(&tmp, name))
+            .and_then(|()| if durable { dir.sync() } else { Ok(()) });
+        if let Err(e) = res {
+            let _ = dir.unlink(&tmp, false);
+            return Err(io_err(&full, e));
+        }
+        Ok(created)
     }
 }
 
@@ -188,16 +249,17 @@ const TEMP_NAME_PREFIX: usize = 32;
 /// to [`TEMP_NAME_PREFIX`] bytes so that a name near the filesystem's
 /// 255-byte limit still has a temp name that fits (BUG-202).
 pub(super) fn temp_path(parent: &Path, path: &VPath) -> PathBuf {
+    parent.join(temp_name(path))
+}
+
+/// The name of [`temp_path`].
+pub(super) fn temp_name(path: &VPath) -> String {
     let name = path.file_name();
     let mut cut = name.len().min(TEMP_NAME_PREFIX);
     while !name.is_char_boundary(cut) {
         cut -= 1;
     }
-    parent.join(format!(
-        ".{}.vltmp{}",
-        &name[..cut],
-        hex::encode(crate::crypto::random_bytes::<4>())
-    ))
+    format!(".{}.vltmp{}", &name[..cut], hex::encode(crate::crypto::random_bytes::<4>()))
 }
 
 /// Create `path` with `data`, flushed to stable storage.
@@ -211,7 +273,7 @@ fn write_synced(path: &Path, data: &[u8]) -> io::Result<()> {
 /// `fcntl(F_FULLFSYNC)`, the only call that empties the drive's write cache;
 /// filesystems that do not implement it (some network and FUSE ones) get a
 /// plain `fsync`, the best they offer.
-fn full_sync(f: &fs::File) -> io::Result<()> {
+pub(super) fn full_sync(f: &fs::File) -> io::Result<()> {
     match f.sync_all() {
         #[cfg(target_os = "macos")]
         Err(e) if fullfsync_unsupported(&e) => plain_fsync(f),
@@ -362,7 +424,7 @@ fn sync_dir(_dir: &Path) -> io::Result<()> {
 
 /// `create_dir_all` that also makes every newly created directory durable
 /// by syncing its parent.
-fn create_dir_all_durable(dir: &Path) -> io::Result<()> {
+pub(super) fn create_dir_all_durable(dir: &Path) -> io::Result<()> {
     if dir.is_dir() {
         return Ok(());
     }
@@ -527,12 +589,65 @@ impl StorageBackend for DiskBackend {
 
     fn read(&self, path: &VPath) -> Result<Vec<u8>> {
         let full = self.full_path(path);
-        // Symlinks are invisible: `metadata` reports nothing there, so
-        // reading must not follow one either.
+        #[cfg(unix)]
+        if !Self::own_path(path) && !path.is_root() {
+            // Never through a symlink, at `path` or above it: a link is
+            // not a file (`read_link` reads its target).
+            let Some(dir) = self.read_parent(path)? else {
+                return Err(VeilError::NotFound(full.display().to_string()));
+            };
+            return super::beneath::read_file(&dir, path.file_name()).map_err(|e| match e.raw_os_error() {
+                Some(libc::ELOOP) => VeilError::NotFound(full.display().to_string()),
+                _ => read_err(&full, e),
+            });
+        }
+        // Symlinks are invisible to reads: never followed.
         if fs::symlink_metadata(&full).is_ok_and(|m| m.file_type().is_symlink()) {
             return Err(VeilError::NotFound(full.display().to_string()));
         }
         fs::read(&full).map_err(|e| read_err(&full, e))
+    }
+
+    #[cfg(unix)]
+    fn read_link(&self, path: &VPath) -> Result<Vec<u8>> {
+        let full = self.full_path(path);
+        if path.is_root() {
+            return Err(VeilError::InvalidPath("the root is not a symlink".into()));
+        }
+        let Some(dir) = self.read_parent(path)? else {
+            return Err(VeilError::NotFound(full.display().to_string()));
+        };
+        dir.read_link(path.file_name()).map_err(|e| match e.raw_os_error() {
+            Some(libc::EINVAL) => VeilError::InvalidPath(format!("{path} is not a symlink")),
+            _ => read_err(&full, e),
+        })
+    }
+
+    #[cfg(unix)]
+    fn write_link(&self, path: &VPath, target: &[u8]) -> Result<()> {
+        super::check_link_target(target)?;
+        if path.is_root() || Self::own_path(path) {
+            return Err(VeilError::InvalidPath(format!("refusing to create a symlink at {path}")));
+        }
+        let full = self.full_path(path);
+        let mut created = Vec::new();
+        let dir = super::beneath::open_parent(&self.root, path, true, true, &mut created).map_err(|e| self.write_walk_err(path, e))?;
+        let name = path.file_name();
+        // Never replace a directory (whatever it holds is not ours).
+        if dir.stat(name).is_ok_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR) {
+            return Err(VeilError::InvalidPath(format!("{path} is a directory")));
+        }
+        let tmp = temp_name(path);
+        let res = dir.symlink(target, &tmp).and_then(|()| dir.rename(&tmp, name)).and_then(|()| dir.sync());
+        if let Err(e) = res {
+            let _ = dir.unlink(&tmp, false);
+            return Err(io_err(&full, e));
+        }
+        Ok(())
+    }
+
+    fn supports_links(&self) -> bool {
+        cfg!(unix)
     }
 
     fn read_through_link(&self, path: &VPath, limit: u64) -> Result<Option<(String, Vec<u8>)>> {
@@ -585,6 +700,17 @@ impl StorageBackend for DiskBackend {
     fn read_range(&self, path: &VPath, offset: u64, len: usize) -> Result<Vec<u8>> {
         use std::io::{Read, Seek, SeekFrom};
         let full = self.full_path(path);
+        #[cfg(unix)]
+        let mut f = match Self::own_path(path) {
+            true => fs::File::open(&full).map_err(|e| read_err(&full, e))?,
+            false => {
+                let Some(dir) = self.read_parent(path)? else {
+                    return Err(VeilError::NotFound(full.display().to_string()));
+                };
+                dir.open_file(path.file_name(), libc::O_RDONLY | libc::O_NONBLOCK, 0).map_err(|e| read_err(&full, e))?
+            }
+        };
+        #[cfg(not(unix))]
         let mut f = fs::File::open(&full).map_err(|e| read_err(&full, e))?;
         f.seek(SeekFrom::Start(offset)).map_err(|e| io_err(&full, e))?;
         let mut buf = vec![0; len];
@@ -595,6 +721,10 @@ impl StorageBackend for DiskBackend {
     fn write(&self, path: &VPath, data: &[u8]) -> Result<()> {
         if path.is_root() {
             return Err(VeilError::InvalidPath("cannot write to the root".into()));
+        }
+        #[cfg(unix)]
+        if !Self::own_path(path) {
+            return self.write_beneath(path, data, true).map(drop);
         }
         self.refuse_symlinked_parent(path)?;
         let full = self.full_path(path);
@@ -621,6 +751,16 @@ impl StorageBackend for DiskBackend {
     fn write_unsynced(&self, path: &VPath, data: &[u8]) -> Result<()> {
         if path.is_root() {
             return Err(VeilError::InvalidPath("cannot write to the root".into()));
+        }
+        #[cfg(unix)]
+        if !Self::own_path(path) {
+            let created = self.write_beneath(path, data, false)?;
+            let full = self.full_path(path);
+            let mut u = self.unsynced.lock().unwrap_or_else(|e| e.into_inner());
+            u.dirs.extend(created.iter().filter_map(|d| d.parent().map(Path::to_path_buf)));
+            u.dirs.insert(full.parent().expect("non-root path has a parent").to_path_buf());
+            u.files.push(full);
+            return Ok(());
         }
         self.refuse_symlinked_parent(path)?;
         let full = self.full_path(path);
@@ -702,6 +842,37 @@ impl StorageBackend for DiskBackend {
         if path.is_root() {
             return Err(VeilError::InvalidPath("cannot write to the root".into()));
         }
+        #[cfg(unix)]
+        if !Self::own_path(path) {
+            let full = self.full_path(path);
+            let dir = super::beneath::open_parent(&self.root, path, true, true, &mut Vec::new()).map_err(|e| self.write_walk_err(path, e))?;
+            let (name, tmp) = (path.file_name(), temp_name(path));
+            if let Err(e) = super::beneath::write_temp(&dir, &tmp, &tmp, data, true) {
+                let _ = dir.unlink(&tmp, false);
+                return Err(io_err(&full, e));
+            }
+            let linked = dir.hard_link(&tmp, name);
+            let _ = dir.unlink(&tmp, false);
+            return match linked {
+                Ok(()) => dir.sync().map(|()| true).map_err(|e| io_err(&full, e)),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+                // No hard links here: `O_EXCL` (a crash can leave a short
+                // file, which the lock treats as garbage).
+                Err(_) => {
+                    let mut f = match dir.open_file(name, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o666) {
+                        Ok(f) => f,
+                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+                        Err(e) => return Err(io_err(&full, e)),
+                    };
+                    if let Err(e) = f.write_all(data).and_then(|_| full_sync(&f)) {
+                        drop(f);
+                        let _ = dir.unlink(name, false);
+                        return Err(io_err(&full, e));
+                    }
+                    dir.sync().map(|()| true).map_err(|e| io_err(&full, e))
+                }
+            };
+        }
         self.refuse_symlinked_parent(path)?;
         let full = self.full_path(path);
         let parent = full.parent().expect("non-root path has a parent");
@@ -727,6 +898,15 @@ impl StorageBackend for DiskBackend {
 
     fn remove_file(&self, path: &VPath) -> Result<()> {
         let full = self.full_path(path);
+        #[cfg(unix)]
+        if !Self::own_path(path) && !path.is_root() {
+            // Below a symlink nothing exists as far as the engine sees.
+            let Some(dir) = self.read_parent(path)? else { return Ok(()) };
+            return match dir.unlink(path.file_name(), false) {
+                Err(e) if !is_missing(&e) => Err(io_err(&full, e)),
+                _ => Ok(()),
+            };
+        }
         match fs::remove_file(&full) {
             Err(e) if !is_missing(&e) => Err(io_err(&full, e)),
             _ => Ok(()),
@@ -738,6 +918,14 @@ impl StorageBackend for DiskBackend {
             return Err(VeilError::InvalidPath("refusing to remove the backend root".into()));
         }
         let full = self.full_path(path);
+        #[cfg(unix)]
+        if !Self::own_path(path) {
+            let Some(dir) = self.read_parent(path)? else { return Ok(()) };
+            return match super::beneath::remove_tree_at(&dir, path.file_name()) {
+                Err(e) if !is_missing(&e) => Err(io_err(&full, e)),
+                _ => Ok(()),
+            };
+        }
         match fs::remove_dir_all(&full) {
             Err(e) if !is_missing(&e) => Err(io_err(&full, e)),
             _ => Ok(()),
@@ -746,6 +934,12 @@ impl StorageBackend for DiskBackend {
 
     fn create_dir_all(&self, path: &VPath) -> Result<()> {
         let full = self.full_path(path);
+        #[cfg(unix)]
+        if !Self::own_path(path) {
+            return super::beneath::open_path(&self.root, path, true, false, &mut Vec::new())
+                .map(drop)
+                .map_err(|e| self.write_walk_err(path, e));
+        }
         fs::create_dir_all(&full).map_err(|e| io_err(&full, e))
     }
 
@@ -779,8 +973,10 @@ impl StorageBackend for DiskBackend {
                 NodeKind::Dir
             } else if ft.is_file() {
                 NodeKind::File
+            } else if ft.is_symlink() {
+                NodeKind::Symlink
             } else {
-                out.special.push(name); // symlinks, sockets, devices
+                out.special.push(name); // sockets, FIFOs, devices
                 continue;
             };
             out.entries.push(DirEntry { name, kind });
@@ -810,6 +1006,11 @@ impl StorageBackend for DiskBackend {
         match fs::symlink_metadata(&full) {
             Ok(m) if m.is_dir() => Ok(Some(Metadata::unstamped(NodeKind::Dir, 0, false))),
             Ok(m) if m.is_file() => Ok(Some(file_metadata(&m))),
+            Ok(m) if m.file_type().is_symlink() => Ok(Some(Metadata {
+                kind: NodeKind::Symlink,
+                executable: false,
+                ..file_metadata(&m)
+            })),
             Ok(_) => Ok(None),
             Err(e) if is_missing(&e) => Ok(None),
             Err(e) => Err(io_err(&full, e)),
@@ -840,6 +1041,29 @@ impl StorageBackend for DiskBackend {
 
     #[allow(unused_variables)]
     fn set_executable(&self, path: &VPath, executable: bool) -> Result<()> {
+        #[cfg(unix)]
+        if !Self::own_path(path) && !path.is_root() {
+            use std::os::unix::fs::PermissionsExt;
+            let full = self.full_path(path);
+            let Some(dir) = self.read_parent(path)? else {
+                return Err(VeilError::NotFound(full.display().to_string()));
+            };
+            // Never through a symlink: a link has no mode of its own.
+            let f = dir.open_file(path.file_name(), libc::O_RDONLY | libc::O_NONBLOCK, 0).map_err(|e| match e.raw_os_error() {
+                Some(libc::ELOOP) => VeilError::InvalidPath(format!("{path} is a symlink")),
+                _ => read_err(&full, e),
+            })?;
+            let mode = f.metadata().map_err(|e| io_err(&full, e))?.permissions().mode();
+            let new = if executable {
+                mode | ((mode & 0o444) >> 2)
+            } else {
+                mode & !0o111
+            };
+            if new != mode {
+                f.set_permissions(fs::Permissions::from_mode(new)).map_err(|e| io_err(&full, e))?;
+            }
+            return Ok(());
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

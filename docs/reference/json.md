@@ -187,6 +187,8 @@ A changed path, as `vl status` lists it.
 | `redacted` | bool | The new version is unreadable here |
 | `tier` | string | Its [tier](#tier) for this reader: `public`, `cloaked`, `embargoed` or `redacted` (`[redacted]` in the text, followed by the label of whom it is sealed for) |
 | `conflict` | [conflict](#conflict) or null | The new version is an unresolved conflict (`[conflict]` in the text); `visibility` and `tier` are then those of the file with markers you are shown |
+| `kind` | string | What the new version is (the old one for a deletion): `file`, `symlink`, `gitlink` (repository format 5) or `conflict` |
+| `old_kind` | string or null | The old version's kind when a modification changed it, e.g. a file replaced by a symlink (`T path (file → symlink)` in the text); null otherwise |
 
 ### Conflict
 
@@ -237,9 +239,11 @@ An entry (`old`, `new`):
 |---|---|---|
 | `visibility` | [visibility](#visibility) | Who can read this version |
 | `executable` | bool | The executable bit |
-| `mode` | string | `100644` or `100755`, as Git writes it |
+| `mode` | string | `100644` or `100755`, as Git writes it; `120000` for a symlink and `160000` for a gitlink (repository format 5) |
 | `readable` | bool | This reader can materialise this version (for an embargoed file: its pre-merge fallback counts) |
 | `conflict` | [conflict](#conflict) or null | This version is an unresolved conflict; its content (and `visibility`, `executable`, `readable`) is that of the file with markers you are shown (`unresolved conflict` in the text) |
+| `kind` | string | `file`, `symlink`, `gitlink` (repository format 5) or `conflict` |
+| `target` | string or null | A symlink's target (`symlink PATH -> TARGET` in the text, escaped), when you can read it; null for a link sealed for someone else (its target is content) and for anything but a symlink. A symlink's `content` is the diff of its target |
 
 `content`:
 
@@ -470,6 +474,8 @@ the working copy its local-only files.
 | `redaction` | [redaction](#redaction) or null | Why a `redacted` file cannot be read. Never content |
 | `quarantine` | object or null | A `quarantined` file: `rule` (string), `line` (number) and `state` (`never_recorded`, or `held_back`: history keeps the previous, recorded version) |
 | `conflict` | [conflict](#conflict) or null | An unresolved conflict (`conflict: 2 sides` in the text); `tier`, `scope`, `visibility`, `size` and `executable` are those of the file with markers you are shown, `readable` says whether you can read every side |
+| `kind` | string | `file`, `symlink`, `gitlink` (repository format 5) or `conflict` |
+| `target` | string or null | A symlink's target (`PATH -> TARGET` in the text, escaped), when you can read it; null for a redacted link (its target is sealed content), a local-only link, and anything but a symlink. `size` is the target's length |
 
 ## `veil.resolve.list/1`
 

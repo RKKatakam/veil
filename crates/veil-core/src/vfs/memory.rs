@@ -17,6 +17,8 @@ enum Node {
     /// `stamp` is the write generation that last touched the file.
     File { data: Arc<Vec<u8>>, executable: bool, stamp: u64 },
     Dir,
+    /// A symlink: never followed, never written through.
+    Link { target: Arc<Vec<u8>>, stamp: u64 },
 }
 
 /// A pure in-memory file tree. Cloning file contents is avoided by sharing
@@ -96,6 +98,9 @@ impl MemoryBackend {
                 Some(Node::File { .. }) => {
                     return Err(VeilError::InvalidPath(format!("{anc} is a file, not a directory")))
                 }
+                Some(Node::Link { .. }) => {
+                    return Err(VeilError::InvalidPath(format!("refusing to write below {anc}: it is a symbolic link")))
+                }
                 Some(Node::Dir) => {}
                 None => {
                     nodes.insert(anc, Node::Dir);
@@ -123,15 +128,48 @@ impl StorageBackend for MemoryBackend {
         match self.nodes.read().unwrap().get(path) {
             Some(Node::File { data, .. }) => Ok(data.as_ref().clone()),
             Some(Node::Dir) => Err(VeilError::InvalidPath(format!("{path} is a directory"))),
+            // Never followed (as on disk).
+            Some(Node::Link { .. }) | None => Err(VeilError::NotFound(path.to_string())),
+        }
+    }
+
+    fn read_link(&self, path: &VPath) -> Result<Vec<u8>> {
+        match self.nodes.read().unwrap().get(path) {
+            Some(Node::Link { target, .. }) => Ok(target.as_ref().clone()),
+            Some(_) => Err(VeilError::InvalidPath(format!("{path} is not a symlink"))),
             None => Err(VeilError::NotFound(path.to_string())),
         }
+    }
+
+    fn write_link(&self, path: &VPath, target: &[u8]) -> Result<()> {
+        super::check_link_target(target)?;
+        if path.is_root() {
+            return Err(VeilError::InvalidPath("cannot write to the root".into()));
+        }
+        let mut nodes = self.nodes.write().unwrap();
+        Self::ensure_parents(&mut nodes, path)?;
+        if let Some(Node::Dir) = nodes.get(path) {
+            return Err(VeilError::InvalidPath(format!("{path} is a directory")));
+        }
+        nodes.insert(
+            path.clone(),
+            Node::Link {
+                target: Arc::new(target.to_vec()),
+                stamp: self.next_stamp(),
+            },
+        );
+        Ok(())
+    }
+
+    fn supports_links(&self) -> bool {
+        true
     }
 
     fn read_range(&self, path: &VPath, offset: u64, len: usize) -> Result<Vec<u8>> {
         match self.nodes.read().unwrap().get(path) {
             Some(Node::File { data, .. }) => super::slice_range(path, data, offset, len).map(<[u8]>::to_vec),
             Some(Node::Dir) => Err(VeilError::InvalidPath(format!("{path} is a directory"))),
-            None => Err(VeilError::NotFound(path.to_string())),
+            Some(Node::Link { .. }) | None => Err(VeilError::NotFound(path.to_string())),
         }
     }
 
@@ -144,7 +182,8 @@ impl StorageBackend for MemoryBackend {
         let executable = match nodes.get(path) {
             Some(Node::Dir) => return Err(VeilError::InvalidPath(format!("{path} is a directory"))),
             Some(Node::File { executable, .. }) => *executable,
-            None => false,
+            // Replaced (never written through).
+            Some(Node::Link { .. }) | None => false,
         };
         nodes.insert(
             path.clone(),
@@ -176,7 +215,7 @@ impl StorageBackend for MemoryBackend {
 
     fn remove_file(&self, path: &VPath) -> Result<()> {
         let mut nodes = self.nodes.write().unwrap();
-        if let Some(Node::File { .. }) = nodes.get(path) {
+        if let Some(Node::File { .. } | Node::Link { .. }) = nodes.get(path) {
             nodes.remove(path);
         }
         Ok(())
@@ -198,6 +237,7 @@ impl StorageBackend for MemoryBackend {
         Self::ensure_parents(&mut nodes, path)?;
         match nodes.get(path) {
             Some(Node::File { .. }) => Err(VeilError::InvalidPath(format!("{path} is a file"))),
+            Some(Node::Link { .. }) => Err(VeilError::InvalidPath(format!("{path} is a symlink"))),
             Some(Node::Dir) => Ok(()),
             None => {
                 nodes.insert(path.clone(), Node::Dir);
@@ -211,7 +251,7 @@ impl StorageBackend for MemoryBackend {
         if !path.is_root() {
             match nodes.get(path) {
                 Some(Node::Dir) => {}
-                Some(Node::File { .. }) => {
+                Some(Node::File { .. } | Node::Link { .. }) => {
                     return Err(VeilError::InvalidPath(format!("{path} is not a directory")))
                 }
                 None => return Err(VeilError::NotFound(path.to_string())),
@@ -229,6 +269,7 @@ impl StorageBackend for MemoryBackend {
                 kind: match n {
                     Node::File { .. } => NodeKind::File,
                     Node::Dir => NodeKind::Dir,
+                    Node::Link { .. } => NodeKind::Symlink,
                 },
             });
         }
@@ -254,6 +295,14 @@ impl StorageBackend for MemoryBackend {
                 inode: None,
             },
             Node::Dir => Metadata::unstamped(NodeKind::Dir, 0, false),
+            Node::Link { target, stamp } => Metadata {
+                kind: NodeKind::Symlink,
+                len: target.len() as u64,
+                executable: false,
+                mtime: i64::try_from(*stamp).ok(),
+                ctime: None,
+                inode: None,
+            },
         }))
     }
 
@@ -274,8 +323,13 @@ impl StorageBackend for MemoryBackend {
                 Ok(())
             }
             Some(Node::Dir) => Err(VeilError::InvalidPath(format!("{path} is a directory"))),
+            Some(Node::Link { .. }) => Err(VeilError::InvalidPath(format!("{path} is a symlink"))),
             None => Err(VeilError::NotFound(path.to_string())),
         }
+    }
+
+    fn special_at(&self, path: &VPath) -> Result<Option<&'static str>> {
+        Ok(matches!(self.nodes.read().unwrap().get(path), Some(Node::Link { .. })).then_some("a symlink"))
     }
 }
 

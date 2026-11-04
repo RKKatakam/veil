@@ -152,6 +152,64 @@ looks like a credential is **quarantined**: `vl` warns and leaves it out
 (or keeps its previous, clean version). `vl status` shows such files as `L`
 and `Q`. See [Secrets and visibility](secrets-and-visibility.md#quarantine).
 
+### Symlinks and submodules
+
+A repository in format 5 (new repositories, or `vl upgrade`) records
+symlinks as Git does: the link itself, mode `120000`, whose content is its
+target string. Veil never follows one, for reading or writing.
+
+```text
+$ ln -s ../lib/tool.sh bin/tool
+$ vl status
+A bin/tool
+$ vl ls bin
+public                    14  bin/tool -> ../lib/tool.sh
+$ vl diff
+diff --veil a/bin/tool b/bin/tool
+added file public
+symlink bin/tool -> ../lib/tool.sh
+new file mode 120000
+$ vl cat bin/tool -r @-
+../lib/tool.sh
+```
+
+* A link is classified by **its own path**: a link under a cloaked
+  directory has its target sealed (`vl ls` shows `-> (target not shown)`
+  to someone without the key, and a public remote never receives it), a
+  link named `id_rsa` is isolated, and a target holding a token
+  (`https://user:ghp_…@github.com/…`) is quarantined like a file. What the
+  link points at is never read: `notes -> ~/.ssh/id_rsa` records the
+  path, not the key.
+* A link that points outside the repository (an absolute path, or `..`
+  above the root) is recorded as it is, with a warning the first time:
+  Veil never follows it, but your editor, build scripts and agents will.
+  A link to a file the policy isolates records the name only.
+* A file replaced by a link (or the reverse) shows as `T path (file →
+  symlink)`; the old version stays in history.
+* **Checkout never writes through a link.** A link is replaced or removed
+  only when it is the version Veil wrote; a link you changed is kept. A
+  path below a link (`vendor -> /shared/vendor` and a tree with
+  `vendor/x`) is skipped, and every write opens each directory with
+  `O_NOFOLLOW`, so even a directory swapped for a link while checkout runs
+  receives nothing. On macOS a tree with both `A` (a link) and `a/` is
+  refused before anything is written.
+* A link/link or link/file **conflict** is written as one side, as it is
+  (yours, unless you deleted it): never a file of markers holding a link
+  target. `vl resolve --ours|--theirs` picks one and gets the right kind;
+  replacing the link with a file (or editing it) resolves it too.
+* `.veilpolicy` is never recorded as a link: a symlinked policy is read
+  through, as before. A link named `.git` (or `.jj`, `.hg`, `.svn`) is VCS
+  metadata and never recorded.
+* **Submodules** (gitlinks, from a Git import or `vl submodule`) are
+  carried: checkout makes the submodule's directory, empty, and Veil never
+  records anything inside it, never reads its `.git`, and never removes it
+  while it holds files.
+* Where the filesystem cannot hold symlinks, checkout reports each link
+  (`failed: … cannot hold symlinks`) and keeps it in history untouched.
+* Below format 5 links stay invisible (never recorded, never followed;
+  a tracked file replaced by one keeps its entry): `vl upgrade` to record
+  them.
+
 ### No interactive commands
 
 There is no editor prompt: `-m` is required for `commit` and `describe`.

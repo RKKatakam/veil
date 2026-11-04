@@ -750,7 +750,16 @@ pub fn print_working_copy_warnings(r: &BuildReport) {
     // A symlinked `.veilpolicy` is followed: its policy warning says so.
     for p in r.shadowed.iter().filter(|p| p.as_str() != POLICY_FILE) {
         warn_untrusted(&format!(
-            "{p} is tracked but is now a symlink or special file; Veil never follows it and keeps the recorded version"
+            "{p} is tracked but is now a symlink or special file; Veil never follows it and keeps the recorded version \
+             (repositories in format 5 record symlinks: `vl upgrade`)"
+        ));
+    }
+    for (p, why) in &r.link_warnings {
+        warn_untrusted(&format!("symlink {p} {why}"));
+    }
+    for p in &r.git_repositories {
+        warn_untrusted(&format!(
+            "{p} is a Git repository; its files are recorded as part of this one (`vl submodule` records it as a submodule instead, pinned to a commit)"
         ));
     }
     for (a, b) in &r.name_collisions {

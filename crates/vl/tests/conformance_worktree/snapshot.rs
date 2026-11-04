@@ -7,7 +7,7 @@ use crate::*;
 use std::time::{Duration, Instant};
 
 // Scenario from jj test_local_working_copy.rs "snapshot special file":
-// FIFOs (and symlinks, a pending feature) are skipped, not followed.
+// FIFOs are skipped, symlinks recorded as links (format 5), never followed.
 #[cfg(unix)]
 #[test]
 fn fifos_and_symlinks_are_not_recorded_or_followed() {
@@ -19,7 +19,7 @@ fn fifos_and_symlinks_are_not_recorded_or_followed() {
     r.write("real.txt", "r\n");
     let out = r.run(&["status"]);
     assert!(out.status.success(), "{}", text(&out));
-    assert_eq!(r.paths("@"), vec!["real.txt"]);
+    assert_eq!(r.paths("@"), vec!["link", "real.txt"]);
     if made {
         assert!(fifo.exists());
     }

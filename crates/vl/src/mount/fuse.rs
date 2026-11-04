@@ -55,6 +55,7 @@ impl Adapter {
             NodeKind::Dir => (FileType::Directory, 0o700, 2),
             NodeKind::File if a.executable => (FileType::RegularFile, 0o700, 1),
             NodeKind::File => (FileType::RegularFile, 0o600, 1),
+            NodeKind::Symlink => (FileType::Symlink, 0o777, 1),
         };
         FileAttr {
             ino: INodeNo(a.ino),
@@ -182,9 +183,21 @@ impl Filesystem for Adapter {
         }
     }
 
-    fn symlink(&self, _req: &Request, _parent: INodeNo, _link_name: &OsStr, _target: &Path, reply: ReplyEntry) {
-        // Veil records files and directories only.
-        reply.error(err(libc::EPERM));
+    /// Format 5 records symlinks; below it this is `EPERM` (see
+    /// [`MountFs::symlink`]). The target is stored as it is.
+    fn symlink(&self, _req: &Request, parent: INodeNo, link_name: &OsStr, target: &Path, reply: ReplyEntry) {
+        use std::os::unix::ffi::OsStrExt;
+        match guard(|| self.fs.symlink(parent.0, link_name, target.as_os_str().as_bytes())) {
+            Ok(a) => reply.entry(&TTL, &self.attr(&a), Generation(0)),
+            Err(e) => reply.error(err(e)),
+        }
+    }
+
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        match guard(|| self.fs.readlink(ino.0)) {
+            Ok(t) => reply.data(&t),
+            Err(e) => reply.error(err(e)),
+        }
     }
 
     fn rename(
@@ -306,6 +319,7 @@ impl Filesystem for Adapter {
             let kind = match kind {
                 NodeKind::Dir => FileType::Directory,
                 NodeKind::File => FileType::RegularFile,
+                NodeKind::Symlink => FileType::Symlink,
             };
             if reply.add(INodeNo(child), next, kind, name) {
                 break;

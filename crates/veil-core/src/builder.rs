@@ -662,9 +662,22 @@ pub struct BuildReport {
     /// Entries whose names are not valid UTF-8 (escaped for display, with
     /// their directory). They cannot be recorded.
     pub unrepresentable: Vec<String>,
-    /// Tracked paths that are now a symlink or another special file. Veil
-    /// never follows them; the tracked entry is kept unchanged.
+    /// Tracked paths that are now a symlink (below repository format 5) or
+    /// another special file (a socket, FIFO, device). Veil never follows
+    /// them; the tracked entry is kept unchanged.
     pub shadowed: Vec<VPath>,
+    /// Symlinks recorded (format 5) whose target is new in this snapshot
+    /// and deserves a word: it points outside the repository (other tools
+    /// follow it, Veil never does), or at a path the policy isolates (its
+    /// name becomes visible in history, its content never). With what to
+    /// say.
+    pub link_warnings: Vec<(VPath, String)>,
+    /// Directories new in this snapshot that hold a `.git` of their own
+    /// but are not submodules (a vendored clone): their files are recorded
+    /// as this repository's, as Git does for an untracked nested
+    /// repository; reported once, when first recorded (submodules design,
+    /// threat 13).
+    pub git_repositories: Vec<VPath>,
     /// Pairs of recorded paths that differ only in case or Unicode
     /// normalisation, at least one of them new in this snapshot. Valid
     /// here, but a checkout on a case-insensitive filesystem (macOS by
@@ -718,6 +731,9 @@ struct Builder<'a> {
     under_embargo: bool,
     /// [`BuildOptions::line_base`], once computed.
     line_base: Option<Option<ObjectId>>,
+    /// Symlinks are recorded as entries (repository format 5); below that
+    /// they are special files, never recorded.
+    links: bool,
 }
 
 /// Build a tree from `fs`, returning its id and a report.
@@ -793,6 +809,7 @@ pub fn build_tree_cached(
             None => false,
         },
         line_base: None,
+        links: store.format() >= crate::object::GIT_PARITY_REPO_FORMAT,
     };
     if let (Some(c), None) = (opts.cloak, b.cloak) {
         b.report.policy_warnings.push(format!(
@@ -804,6 +821,7 @@ pub fn build_tree_cached(
         Some(id) => id,
         None => store.empty_tree()?,
     };
+    let id = b.protect_moves(id)?;
     let id = b.keep_embargo(id)?;
     if let (Some(c), Some(run)) = (cache, b.cache.take()) {
         c.end_run(run);
@@ -812,6 +830,86 @@ pub fn build_tree_cached(
 }
 
 impl Builder<'_> {
+    /// Protection follows content across a rename (renames design, builder
+    /// hardening): a new public file (or symlink) whose plaintext is
+    /// exactly that of a cloaked entry this snapshot deletes is the same
+    /// content moved (`mv secrets/db.yml docs/db.yml` where the policy
+    /// cloaks only `secrets/`), and is sealed as that entry was, never
+    /// recorded public. Only a sealing verified against its object counts
+    /// (BUG-103), and only for a path no rule of the policy explicitly
+    /// classifies (an explicit `public` rule is the member's decision).
+    /// Exact content only; nothing is read unless the snapshot both
+    /// deletes a sealed entry and adds a public one.
+    fn protect_moves(&mut self, id: ObjectId) -> Result<ObjectId> {
+        let Some(parent) = self.opts.parent_tree.filter(|p| *p != id) else { return Ok(id) };
+        if crate::embargo::unreleased_wrapper(self.store, &parent)?.is_some() {
+            return Ok(id);
+        }
+        let changes = crate::tree::diff_trees(self.store, Some(&parent), Some(&id))?;
+        let blob_kind = |e: &TreeEntry| matches!(e.kind, EntryKind::File | EntryKind::Symlink);
+        let deleted: Vec<&TreeEntry> = changes
+            .iter()
+            .filter(|c| c.new.is_none())
+            .filter_map(|c| c.old.as_ref())
+            .filter(|e| blob_kind(e) && matches!(e.visibility, Visibility::Cloaked { .. }))
+            .collect();
+        let added: Vec<(&VPath, &TreeEntry)> = changes
+            .iter()
+            .filter(|c| c.old.is_none())
+            .filter_map(|c| c.new.as_ref().map(|e| (&c.path, e)))
+            .filter(|(_, e)| blob_kind(e) && e.visibility.is_public() && e.fallback.is_none())
+            .collect();
+        if deleted.is_empty() || added.is_empty() {
+            return Ok(id);
+        }
+        let mut sealed_as: HashMap<(EntryKind, ObjectId), Visibility> = HashMap::new();
+        for d in deleted {
+            if verify_sealing(self.store, d)? != Sealing::Verified {
+                continue;
+            }
+            match self.store.read_blob(&d.id) {
+                Ok(plain) => {
+                    sealed_as.entry((d.kind, Object::blob_id(&plain))).or_insert_with(|| d.visibility.clone());
+                }
+                Err(e) if e.is_unreadable() || e.is_not_found() => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let mut tree = id;
+        for (path, e) in added {
+            let Some(vis) = sealed_as.get(&(e.kind, e.id)) else { continue };
+            let class = match e.kind {
+                EntryKind::Symlink => self.opts.policy.classify_link(path),
+                _ => self.opts.policy.classify(path, false),
+            };
+            if class.tier != Tier::Public || class.rule.is_some() {
+                continue;
+            }
+            let data = self.store.read_blob(&e.id)?;
+            let sealed = match self.store.store_file(&data, vis) {
+                Ok(s) => s,
+                Err(VeilError::Redacted { .. }) => continue,
+                Err(err) => return Err(err),
+            };
+            let entry = TreeEntry {
+                id: sealed,
+                visibility: vis.clone(),
+                fallback: None,
+                ..e.clone()
+            };
+            tree = crate::conflict::set_entry(self.store, &tree, path, Some(entry))?;
+            if let Some(run) = self.cache.as_mut() {
+                run.forget(path);
+            }
+            self.report.policy_warnings.push(format!(
+                "{path}: its content was moved from a path sealed as {}; it stays sealed there (protection follows content across a rename; \
+                 `vl expose {path}` makes it public)",
+                vis.label()
+            ));
+        }
+        Ok(tree)
+    }
+
     /// A line under an unreleased embargo stays under it. A key holder's new
     /// tree is re-wrapped under the same embargo (readers without the key
     /// keep seeing the pre-merge tree). A reader without the key only sees
@@ -880,7 +978,7 @@ impl Builder<'_> {
             match child.kind {
                 NodeKind::Dir => {
                     let class = self.opts.policy.classify(&path, true);
-                    let pdir = parent_entry.filter(|e| e.kind == EntryKind::Dir);
+                    let pdir = parent_entry.clone().filter(|e| e.kind == EntryKind::Dir);
                     if class.tier == Tier::Ignored {
                         self.report.ignored += 1;
                         self.report.ignored_paths.push((path.clone(), true));
@@ -897,6 +995,16 @@ impl Builder<'_> {
                                 f.out.insert(pe.clone());
                             }
                         }
+                        continue;
+                    }
+                    // A submodule's directory (format 5): never descended
+                    // into, whatever it holds (its own repository decides
+                    // where that is published). Its gitlink entry is
+                    // carried as recorded: only `vl submodule set` or a Git
+                    // import moves the pinned commit, never the inner
+                    // `.git`.
+                    if let Some(pe) = parent_entry.as_ref().filter(|e| e.kind == EntryKind::Gitlink || self.shows_as(e, EntryKind::Gitlink)) {
+                        f.out.insert(pe.clone());
                         continue;
                     }
                     if let Some(pe) = &pdir {
@@ -928,7 +1036,25 @@ impl Builder<'_> {
                     }
                 }
                 NodeKind::File => {
-                    if let Some(e) = self.file_entry(&path, &child.name, parent_entry.as_ref())? {
+                    if let Some(e) = self.file_entry(&path, &child.name, parent_entry.as_ref(), EntryKind::File)? {
+                        self.report.files += 1;
+                        f.out.insert(e);
+                    }
+                }
+                // Below format 5, and for `.veilpolicy` always (the policy
+                // is read through the link, BUG-058): a special file, never
+                // recorded or followed. A tracked entry there is kept.
+                NodeKind::Symlink if !self.links || path.as_str() == POLICY_FILE => {
+                    if let Some(pe) = parent_entry {
+                        let tier = self.opts.policy.classify(&path, pe.kind == EntryKind::Dir).tier;
+                        if !matches!(tier, Tier::Ignored | Tier::Isolated) {
+                            self.report.shadowed.push(path);
+                            f.out.insert(pe);
+                        }
+                    }
+                }
+                NodeKind::Symlink => {
+                    if let Some(e) = self.file_entry(&path, &child.name, parent_entry.as_ref(), EntryKind::Symlink)? {
                         self.report.files += 1;
                         f.out.insert(e);
                     }
@@ -956,6 +1082,14 @@ impl Builder<'_> {
         if !dir.is_root() && crate::vfs::holds_repository(&listing) {
             self.report.nested.push(dir);
             return Ok(Opened::Done(None));
+        }
+        // A Git repository that is not a submodule (a gitlink's directory
+        // is never opened): recorded, and said once, when it is new.
+        if !dir.is_root()
+            && parent.is_none()
+            && listing.entries.iter().any(|e| crate::policy::vcs_metadata_name(&e.name) == Some(".git"))
+        {
+            self.report.git_repositories.push(dir.clone());
         }
         for name in &listing.unrepresentable {
             self.report.unrepresentable.push(match dir.is_root() {
@@ -1137,11 +1271,27 @@ impl Builder<'_> {
                         Ok(Err(Some(e.clone())))
                     }
                 }
-                // Format 5: checkout does not materialise symlinks and
-                // gitlinks yet, so their absence is never a deletion: they
-                // are carried unchanged (the working-copy stream records
-                // and removes them).
-                EntryKind::Symlink | EntryKind::Gitlink => Ok(Err(Some(e.clone()))),
+                // Format 5. Below it, symlinks are special files the builder
+                // never records, so their absence is never a deletion.
+                // Otherwise as a file: readable, materialised and absent is
+                // a deletion (a removed link, a removed submodule
+                // directory).
+                EntryKind::Symlink | EntryKind::Gitlink => {
+                    let never_materialised = b.opts.materialised.is_some_and(|m| m.hidden(path));
+                    let readable = match &e.visibility {
+                        Visibility::Cloaked { .. } => b.store.entry_readable(&TreeEntry {
+                            fallback: None,
+                            ..e.clone()
+                        }),
+                        _ => b.store.entry_readable(e),
+                    };
+                    if b.links && readable && !never_materialised {
+                        Ok(Err(None))
+                    } else {
+                        b.report.carried.push(path.clone());
+                        Ok(Err(Some(e.clone())))
+                    }
+                }
                 EntryKind::Dir => match b.store.tree(&e.id) {
                     Ok(tree) if depth < MAX_TREE_DEPTH => Ok(Ok(Frame {
                         entry: e.clone(),
@@ -1206,10 +1356,84 @@ impl Builder<'_> {
         }
     }
 
-    fn file_entry(&mut self, path: &VPath, name: &str, parent_entry: Option<&TreeEntry>) -> Result<Option<TreeEntry>> {
+    /// The entry for the leaf at `path` of the working copy, a file or (in
+    /// format 5) a symlink (`kind`).
+    fn file_entry(&mut self, path: &VPath, name: &str, parent_entry: Option<&TreeEntry>, kind: EntryKind) -> Result<Option<TreeEntry>> {
         match parent_entry {
-            Some(ce) if ce.kind == EntryKind::Conflict => self.conflict_entry(path, name, ce),
-            _ => self.plain_file_entry(path, name, parent_entry),
+            Some(ce) if ce.kind == EntryKind::Conflict => self.conflict_entry(path, name, ce, kind),
+            _ => self.plain_file_entry(path, name, parent_entry, kind),
+        }
+    }
+
+    /// Is `e` a conflict (format 5) that is materialised as a `kind` (its
+    /// shown side, see [`crate::conflict::shown_side`])?
+    fn shows_as(&self, e: &TreeEntry, kind: EntryKind) -> bool {
+        e.kind == EntryKind::Conflict
+            && self
+                .store
+                .conflict(&e.id)
+                .is_ok_and(|c| crate::conflict::shown_side(&c).is_some_and(|(_, t)| t.kind.entry_kind() == kind && c.has_special_terms()))
+    }
+
+    /// The working-copy leaf at `path` (a file or a symlink, `kind`) whose
+    /// parent entry is conflict `ce` with a symlink or gitlink side
+    /// (format 5). Checkout wrote its shown side as it is, never a file of
+    /// markers (a link target must never become file content, symlinks
+    /// design, threat 12). That side, unchanged, keeps the conflict;
+    /// anything else resolves it, built as an edit of that side (its
+    /// sealing kept) when of the same kind. A reader who cannot read every
+    /// side cannot resolve it: the edit stays local.
+    fn special_conflict_entry(&mut self, path: &VPath, name: &str, ce: &TreeEntry, conflict: &crate::object::Conflict, kind: EntryKind) -> Result<Option<TreeEntry>> {
+        let shown = crate::conflict::shown_side(conflict).map(|(_, t)| t.entry(name));
+        let class = match kind {
+            EntryKind::Symlink => self.opts.policy.classify_link(path),
+            _ => self.opts.policy.classify(path, false),
+        };
+        let local_only = matches!(class.tier, Tier::Ignored | Tier::Isolated);
+        if let Some(se) = shown.as_ref().filter(|se| se.kind == kind && !local_only) {
+            if self.holds_leaf(path, se)? {
+                return Ok(Some(ce.clone()));
+            }
+        }
+        let unreadable_side = match crate::conflict::inspect(self.store, conflict, crate::conflict::Audience::Reader) {
+            Ok(v) => v.unreadable_side,
+            Err(e) if e.is_unreadable() || e.is_not_found() || matches!(e, VeilError::Corrupt(..) | VeilError::Unsupported(_)) => true,
+            Err(e) => return Err(e),
+        };
+        let never_materialised = self.opts.materialised.is_some_and(|m| m.hidden(path));
+        if (unreadable_side || never_materialised) && !local_only {
+            return self.cannot_seal(
+                path,
+                name,
+                Some(ce),
+                "it is a conflict with a version you cannot read, so you cannot resolve it; the edit stays local, history keeps the conflict".into(),
+            );
+        }
+        let pseudo = shown.filter(|se| se.kind == kind);
+        let held = |r: &BuildReport| (r.cloak_failures.len(), r.quarantined.len(), r.held_back.len(), r.unreadable.len());
+        let before = held(&self.report);
+        let resolved = self.plain_file_entry(path, name, pseudo.as_ref(), kind)?;
+        if held(&self.report) != before && !local_only {
+            return Ok(Some(ce.clone()));
+        }
+        Ok(resolved)
+    }
+
+    /// Does the leaf at `path` hold exactly `e` (a file's content and
+    /// mode, a symlink's target)? Unreadable either way is `false`.
+    fn holds_leaf(&mut self, path: &VPath, e: &TreeEntry) -> Result<bool> {
+        let data = match e.kind {
+            EntryKind::Symlink => self.fs.read_link(path),
+            _ => self.fs.read(path),
+        };
+        let Ok(data) = data else { return Ok(false) };
+        if e.kind == EntryKind::File && !self.fs.metadata(path)?.is_some_and(|m| m.executable == e.executable) {
+            return Ok(false);
+        }
+        match self.store.matches_encoding(&e.id, &data) {
+            Ok(m) => Ok(m),
+            Err(err) if err.is_unreadable() || err.is_not_found() => Ok(false),
+            Err(err) => Err(err),
         }
     }
 
@@ -1229,7 +1453,7 @@ impl Builder<'_> {
     ///
     /// A reader who cannot read every side cannot resolve the conflict:
     /// its edits are held back, as an edit of a file it cannot seal.
-    fn conflict_entry(&mut self, path: &VPath, name: &str, ce: &TreeEntry) -> Result<Option<TreeEntry>> {
+    fn conflict_entry(&mut self, path: &VPath, name: &str, ce: &TreeEntry, kind: EntryKind) -> Result<Option<TreeEntry>> {
         if self.use_hints && self.fs.known_id(path) == Some(ce.id) {
             return Ok(Some(ce.clone()));
         }
@@ -1243,10 +1467,13 @@ impl Builder<'_> {
             Err(e) => return Err(e),
         };
         if conflict.has_special_terms() {
-            // Format 5: a conflict with a symlink or gitlink side is not
-            // materialised yet, so whatever is at its path is not a copy of
-            // it: carried unchanged.
-            return Ok(Some(ce.clone()));
+            return self.special_conflict_entry(path, name, ce, &conflict, kind);
+        }
+        if kind != EntryKind::File {
+            // A symlink where a file conflict was materialised: a
+            // resolution by a link, which only a reader of every side may
+            // make.
+            return self.special_conflict_entry(path, name, ce, &conflict, kind);
         }
         let meta = match self.fs.metadata(path) {
             Ok(m) => m,
@@ -1308,7 +1535,7 @@ impl Builder<'_> {
         });
         let held = |r: &BuildReport| (r.cloak_failures.len(), r.quarantined.len(), r.held_back.len(), r.unreadable.len());
         let before = held(&self.report);
-        let resolved = self.plain_file_entry(path, name, pseudo.as_ref())?;
+        let resolved = self.plain_file_entry(path, name, pseudo.as_ref(), EntryKind::File)?;
         if held(&self.report) != before {
             // The edit was held back: the conflict stays recorded.
             return Ok(match resolved {
@@ -1359,9 +1586,19 @@ impl Builder<'_> {
         Ok(Some(r))
     }
 
-    fn plain_file_entry(&mut self, path: &VPath, name: &str, parent_entry: Option<&TreeEntry>) -> Result<Option<TreeEntry>> {
-        let parent_file = parent_entry.filter(|e| e.kind == EntryKind::File);
-        let class = self.opts.policy.classify(path, false);
+    /// The entry for the working-copy leaf at `path`: a file, or (format 5)
+    /// a symlink, whose content is its target string (read with
+    /// `readlinkat`, never followed). A link is classified by its own path,
+    /// scanned and sealed exactly as a file's content would be: its target
+    /// can name private paths or carry a token. Only a parent entry of the
+    /// same kind is its previous version: a file replaced by a link (or
+    /// the reverse) is a new leaf, its old version kept in history.
+    fn plain_file_entry(&mut self, path: &VPath, name: &str, parent_entry: Option<&TreeEntry>, kind: EntryKind) -> Result<Option<TreeEntry>> {
+        let parent_file = parent_entry.filter(|e| e.kind == kind);
+        let class = match kind {
+            EntryKind::Symlink => self.opts.policy.classify_link(path),
+            _ => self.opts.policy.classify(path, false),
+        };
         if class.blocked_exposure {
             self.report.blocked_exposures.push(path.clone());
         }
@@ -1408,22 +1645,61 @@ impl Builder<'_> {
             Ok(m) => m,
             Err(e) => return self.unreadable(path, e, parent_file),
         };
-        let executable = meta.as_ref().is_some_and(|m| m.executable);
+        // Vanished, or replaced by something else since it was listed.
+        let want = match kind {
+            EntryKind::Symlink => NodeKind::Symlink,
+            _ => NodeKind::File,
+        };
+        if meta.as_ref().is_some_and(|m| m.kind != want) {
+            return Ok(parent_file.cloned());
+        }
+        let executable = kind == EntryKind::File && meta.as_ref().is_some_and(|m| m.executable);
         // Embargoed entries depend on the parent entry and on embargo state,
         // not only on content: always take the slow path for them.
         let parent_embargoed = parent_file.is_some_and(|pe| matches!(pe.visibility, Visibility::Embargoed { .. }));
         // With injected secrets every changed file must be read and checked.
-        let cacheable = !parent_embargoed && self.opts.injected.is_none();
+        // A link's target is read in one call, cheaper than a cache lookup
+        // is worth: never cached.
+        let cacheable = !parent_embargoed && self.opts.injected.is_none() && kind == EntryKind::File;
+        let meta = meta.filter(|_| kind == EntryKind::File);
         if let (Some(m), true) = (&meta, cacheable) {
             if let Some(e) = self.cached_entry(path, name, m, &desired, cloak_fallback, class.allow_secrets, parent_file)? {
                 return Ok(Some(e));
             }
         }
 
-        let data = match self.fs.read(path) {
-            Ok(d) => d,
-            Err(e) => return self.unreadable(path, e, parent_file),
+        let data = match kind {
+            EntryKind::Symlink => match self.fs.read_link(path) {
+                Ok(d) => d,
+                // Replaced by something else since it was listed (or a
+                // backend that holds no links): never a failed snapshot.
+                Err(VeilError::InvalidPath(why) | VeilError::Unsupported(why)) => {
+                    self.report.unreadable.push((path.clone(), why));
+                    return Ok(parent_file.cloned());
+                }
+                Err(e) => return self.unreadable(path, e, parent_file),
+            },
+            _ => match self.fs.read(path) {
+                Ok(d) => d,
+                Err(e) => return self.unreadable(path, e, parent_file),
+            },
         };
+        if kind == EntryKind::Symlink {
+            match crate::vfs::check_link_target(&data) {
+                // Not representable (not UTF-8, a NUL, too long): reported
+                // like a name that is not UTF-8, never recorded; a tracked
+                // link keeps its entry.
+                Err(e) => {
+                    self.report.unrepresentable.push(format!("{path} ({e})"));
+                    return Ok(parent_file.cloned());
+                }
+                Ok(target) => {
+                    if parent_file.is_none_or(|pe| !self.store.matches_encoding(&pe.id, &data).unwrap_or(false)) {
+                        self.note_link(path, target);
+                    }
+                }
+            }
+        }
         self.report.hashed += 1;
         let content = Object::blob_id(&data);
 
@@ -1631,7 +1907,7 @@ impl Builder<'_> {
             if content == fb && !self.policy_changed && !self.rescan {
                 let entry = TreeEntry {
                     name: name.to_string(),
-                    kind: EntryKind::File,
+                    kind,
                     id: fb,
                     size: data.len() as u64,
                     executable,
@@ -1706,13 +1982,36 @@ impl Builder<'_> {
         }
         Ok(Some(TreeEntry {
             name: name.to_string(),
-            kind: EntryKind::File,
+            kind,
             id,
             size: data.len() as u64,
             executable,
             visibility: desired,
             fallback,
         }))
+    }
+
+    /// Warn about a symlink target recorded for the first time (see
+    /// [`BuildReport::link_warnings`]).
+    fn note_link(&mut self, path: &VPath, target: &str) {
+        if crate::vfs::link_escapes(path, target) {
+            self.report.link_warnings.push((
+                path.clone(),
+                format!("points outside the repository ({target}); Veil never follows it, but other tools will"),
+            ));
+            return;
+        }
+        let Some(parts) = crate::vfs::link_resolves_to(path, target) else { return };
+        let Ok(to) = VPath::new(&parts.join("/")) else { return };
+        if to.is_root() {
+            return;
+        }
+        if self.opts.policy.classify(&to, false).tier == Tier::Isolated {
+            self.report.link_warnings.push((
+                path.clone(),
+                format!("points to {to}, which the policy isolates: its name is recorded in history, its content never is"),
+            ));
+        }
     }
 
     /// Does the line's base ([`BuildOptions::line_base`]) show readers
@@ -1734,7 +2033,7 @@ impl Builder<'_> {
                 (Visibility::Cloaked { .. }, fb) => fb,
                 _ => None,
             };
-            e.kind == EntryKind::File && shown == Some(entry.id) && e.executable == entry.executable
+            e.kind == entry.kind && shown == Some(entry.id) && e.executable == entry.executable
         }))
     }
 

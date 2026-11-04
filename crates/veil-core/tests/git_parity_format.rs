@@ -354,11 +354,11 @@ fn fsck_checks_link_and_gitlink_content() {
 
 // ---- carried, never misread -----------------------------------------------------
 
-/// Checkout does not write links yet: each is reported (`failed`, "cannot
-/// check out … yet"), nothing is written at its path, a file version
-/// checkout wrote before is removed, and the next snapshot keeps the entry.
+/// Checkout writes a link as a link (replacing the file version it wrote
+/// before) and a gitlink as its submodule's empty directory, and the next
+/// snapshot keeps both entries unchanged (stream W1).
 #[test]
-fn checkout_reports_links_and_the_builder_carries_them() {
+fn checkout_writes_links_and_the_builder_keeps_them() {
     let (mut alice, fs, main, _) = links_repo("/x", "fedcba9876543210fedcba9876543210fedcba98\n");
     // `links/readme` is a file in `main`'s child, then a symlink.
     let file_tree = put_at(&alice, alice.snapshot(&main).unwrap().tree, "links/readme", TreeEntry {
@@ -376,10 +376,9 @@ fn checkout_reports_links_and_the_builder_carries_them() {
     alice.checkout_tree(&*fs, Some(&main_tree), &file_tree).unwrap();
     assert_eq!(fs.read(&p("links/readme")).unwrap(), b"a file\n");
     let r = alice.checkout_tree(&*fs, Some(&file_tree), &link_tree).unwrap();
-    for path in ["links/readme", "vendor/sdk"] {
-        assert!(r.failed.iter().any(|(f, why)| f.as_str() == path && why.contains("cannot check out")), "{path}: {:?}", r.failed);
-        assert!(!fs.exists(&p(path)).unwrap(), "{path} was written");
-    }
+    assert!(r.failed.is_empty() && r.kept_local.is_empty(), "{r:?}");
+    assert_eq!(fs.read_link(&p("links/readme")).unwrap(), b"../README");
+    assert_eq!(fs.metadata(&p("vendor/sdk")).unwrap().unwrap().kind, veil_core::vfs::NodeKind::Dir);
     // The working copy's snapshot keeps both entries, unchanged.
     let wc = snapshot(&alice, main, link_tree, vec![]);
     let mut tx = alice.transaction("wc").unwrap();
@@ -396,7 +395,8 @@ fn checkout_reports_links_and_the_builder_carries_them() {
 
 /// Merges carry links: one side's change wins trivially; two different
 /// targets are a conflict entry with symlink terms (never a line merge of
-/// the targets), which checkout does not write out as markers.
+/// the targets), which checkout writes as our side, as it is (never a file
+/// of markers holding link targets).
 #[test]
 fn merges_never_merge_link_targets_by_line() {
     let (mut alice, fs, main, _) = links_repo("/x", "fedcba9876543210fedcba9876543210fedcba98\n");
@@ -424,10 +424,11 @@ fn merges_never_merge_link_targets_by_line() {
     assert_eq!(e.kind, EntryKind::Conflict);
     let c = alice.store().conflict(&e.id).unwrap();
     assert!(c.interleaved().flatten().all(|t| t.kind == TermKind::Symlink));
-    // Checkout leaves it out (no file of markers holding link targets).
+    // Checkout writes our side as it is: a link, no markers.
     let r = alice.checkout_tree(&*fs, None, &alice.snapshot(&m.snapshot).unwrap().tree).unwrap();
-    assert!(r.failed.iter().any(|(f, _)| f.as_str() == "l"), "{:?}", r.failed);
-    assert!(!fs.exists(&p("l")).unwrap());
+    assert!(r.failed.is_empty(), "{:?}", r.failed);
+    assert_eq!(fs.read_link(&p("l")).unwrap(), b"A\nb\nc\n");
+    assert!(fs.read(&p("l")).is_err());
 }
 
 /// Below format 5 nothing of this can be written, even through the API.
@@ -475,16 +476,20 @@ fn view_fields_are_omitted_when_empty() {
 }
 
 /// `walk_files`, the tree view and the reader-facing VFS: links are leaves,
-/// never directories, never read as file content.
+/// never directories, never read as file content (only their target, by
+/// `read_link`); a gitlink is its submodule's empty directory.
 #[test]
 fn tree_views_do_not_serve_links_as_files() {
     let (alice, _fs, _, links) = links_repo("/x", "fedcba9876543210fedcba9876543210fedcba98\n");
     let tree = alice.snapshot(&links).unwrap().tree;
     let view = veil_core::tree::TreeView::new(alice.store().clone(), tree);
-    let names: Vec<String> = view.list_dir(&p("links")).unwrap().into_iter().map(|e| e.name).collect();
-    assert!(names.is_empty(), "{names:?}");
-    assert!(view.metadata(&p("links/readme")).unwrap().is_none());
-    assert!(matches!(view.read(&p("links/readme")), Err(VeilError::Unsupported(_))));
+    let listed: Vec<(String, veil_core::vfs::NodeKind)> = view.list_dir(&p("links")).unwrap().into_iter().map(|e| (e.name, e.kind)).collect();
+    assert_eq!(listed, vec![("private".into(), veil_core::vfs::NodeKind::Symlink), ("readme".into(), veil_core::vfs::NodeKind::Symlink)]);
+    assert_eq!(view.metadata(&p("links/readme")).unwrap().unwrap().kind, veil_core::vfs::NodeKind::Symlink);
+    assert!(view.read(&p("links/readme")).unwrap_err().is_not_found());
+    assert_eq!(view.read_link(&p("links/readme")).unwrap(), b"../README");
+    assert_eq!(view.metadata(&p("vendor/sdk")).unwrap().unwrap().kind, veil_core::vfs::NodeKind::Dir);
+    assert!(view.list_dir(&p("vendor/sdk")).unwrap().is_empty());
     // `lookup` never descends into a link.
     assert!(lookup(alice.store(), &tree, &p("links/readme/x")).unwrap().is_none());
 }

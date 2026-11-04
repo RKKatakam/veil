@@ -50,7 +50,7 @@ use veil_core::{
     object::{is_reserved_name, EntryKind, TreeEntry},
     store::ObjectStore,
     tree::{lookup, TreeView},
-    vfs::{is_temp_name, walk_files, DirEntry, Metadata, NodeKind, OverlayBackend, StorageBackend},
+    vfs::{is_temp_name, walk_files, walk_leaves, DirEntry, Metadata, NodeKind, OverlayBackend, StorageBackend},
     VPath, VeilError,
 };
 
@@ -354,12 +354,32 @@ impl ReaderView {
         match lookup(&self.store, &self.view.root(), path) {
             Ok(Some(e)) if path.is_root() => Ok(Some(e)),
             Ok(Some(e)) if e.kind == EntryKind::Dir => Ok(self.dir_visible(&e)?.then_some(e)),
-            // Format-5 symlinks and gitlinks are not served yet (carried).
-            Ok(Some(e)) if e.kind.is_special() => Ok(None),
-            Ok(Some(e)) if self.store.entry_readable(&e) => Ok(Some(e)),
+            Ok(Some(e)) if self.visible_leaf(&e) => Ok(Some(e)),
             Ok(_) => Ok(None),
             Err(e) if e.is_unreadable() => Ok(None),
             Err(e) => Err(e),
+        }
+    }
+
+    /// Is leaf entry `e` shown to this reader, as checkout would write it?
+    /// A symlink only with its own target (never an embargo fallback,
+    /// which may not be a link), a gitlink as its submodule's directory, a
+    /// conflict with a symlink or gitlink side as that shown side.
+    fn visible_leaf(&self, e: &TreeEntry) -> bool {
+        let shown = match e.kind {
+            EntryKind::Conflict => match self.store.conflict(&e.id) {
+                Ok(c) if c.has_special_terms() => match veil_core::conflict::shown_side(&c) {
+                    Some((_, t)) => t.entry(&e.name),
+                    None => return false,
+                },
+                _ => return self.store.entry_readable(e),
+            },
+            _ => e.clone(),
+        };
+        match shown.kind {
+            EntryKind::Symlink | EntryKind::Gitlink => self.store.entry_readable(&TreeEntry { fallback: None, ..shown }),
+            EntryKind::Dir => false,
+            _ => self.store.entry_readable(&shown),
         }
     }
 
@@ -376,7 +396,7 @@ impl ReaderView {
             for c in tree.entries.iter().rev() {
                 match c.kind {
                     EntryKind::Dir => stack.push(c.id),
-                    _ if !c.kind.is_special() && self.store.entry_readable(c) => return Ok(true),
+                    _ if self.visible_leaf(c) => return Ok(true),
                     _ => {}
                 }
             }
@@ -402,7 +422,7 @@ impl Lower for ReaderView {
                     Ok(t) => stack.extend(t.entries.iter().map(|c| (p.join(&c.name), c.clone()))),
                     Err(_) => out.push(p),
                 },
-                _ if !e.kind.is_special() && self.store.entry_readable(&e) => {}
+                _ if self.visible_leaf(&e) => {}
                 _ => out.push(p),
             }
         }
@@ -441,6 +461,13 @@ impl StorageBackend for ReaderView {
     }
     fn set_executable(&self, _: &VPath, _: bool) -> VResult<()> {
         Err(VeilError::ReadOnly)
+    }
+
+    fn read_link(&self, path: &VPath) -> VResult<Vec<u8>> {
+        match self.entry(path)? {
+            Some(_) => self.view.read_link(path),
+            None => Err(VeilError::NotFound(path.to_string())),
+        }
     }
 
     fn list_dir(&self, path: &VPath) -> VResult<Vec<DirEntry>> {
@@ -523,6 +550,9 @@ struct Inner {
     epoch: SystemTime,
     /// Bumped by every change of what the mount shows.
     generation: u64,
+    /// `symlink()` creates links (repository format 5); below that it is
+    /// refused, as Veil could not record them.
+    links: bool,
 }
 
 /// The mounted file system (see the module documentation).
@@ -858,6 +888,12 @@ impl Inner {
         Ok(())
     }
 
+    /// Put a copy of symlink `from` at `to` (its target as it is).
+    fn copy_link(&mut self, from: &VPath, to: &VPath) -> FsResult<()> {
+        let target = self.overlay.read_link(from).map_err(|e| errno(&e))?;
+        self.overlay.write_link(to, &target).map_err(|e| errno(&e))
+    }
+
     fn journal_unseen(&mut self) -> FsResult<()> {
         let all: Vec<VPath> = self.unseen.iter().cloned().collect();
         if let Some(j) = self.journal.as_mut() {
@@ -967,8 +1003,16 @@ impl MountFs {
                 times: HashMap::new(),
                 epoch: SystemTime::now(),
                 generation: 0,
+                links: false,
             }),
         }
+    }
+
+    /// Let `symlink()` create links (the repository records them: format
+    /// 5 or later).
+    pub fn with_links(self, links: bool) -> MountFs {
+        self.lock().links = links;
+        self
     }
 
     /// Open the upper layer's files with `files` (a real mount's:
@@ -1080,6 +1124,9 @@ impl MountFs {
         let path = g.path(ino)?;
         match g.meta(&path)? {
             Some(m) if m.kind == NodeKind::Dir => return Err(libc::EISDIR),
+            // The kernel follows links itself: an open of the link node
+            // is `O_NOFOLLOW`'s.
+            Some(m) if m.kind == NodeKind::Symlink => return Err(libc::ELOOP),
             Some(_) => {}
             None => return Err(libc::ENOENT),
         }
@@ -1110,6 +1157,8 @@ impl MountFs {
         let exists = match g.meta(&path)? {
             Some(_) if exclusive => return Err(libc::EEXIST),
             Some(m) if m.kind == NodeKind::Dir => return Err(libc::EISDIR),
+            // Never opened (let alone written) through a link.
+            Some(m) if m.kind == NodeKind::Symlink => return Err(libc::EEXIST),
             m => m.is_some(),
         };
         // `O_CREAT` without `O_EXCL` on a file that exists opens it as it is.
@@ -1216,6 +1265,9 @@ impl MountFs {
             if m.kind == NodeKind::Dir {
                 return Err(libc::EISDIR);
             }
+            if m.kind == NodeKind::Symlink {
+                return Err(libc::EINVAL);
+            }
             if size > max_file_size() {
                 return Err(libc::EFBIG);
             }
@@ -1263,6 +1315,46 @@ impl MountFs {
         g.attr(ino, &path)
     }
 
+    /// The target of symlink `ino`, as it is (the kernel resolves it, in
+    /// the caller's namespace; the mount itself never follows a link).
+    pub fn readlink(&self, ino: u64) -> FsResult<Vec<u8>> {
+        let g = self.lock();
+        let path = g.path(ino)?;
+        match g.meta(&path)? {
+            Some(m) if m.kind == NodeKind::Symlink => g.overlay.read_link(&path).map_err(|e| errno(&e)),
+            Some(_) => Err(libc::EINVAL),
+            None => Err(libc::ENOENT),
+        }
+    }
+
+    /// Create symlink `name` in `parent` pointing at `target` (written as
+    /// it is, never resolved). Refused (`EPERM`) unless the repository
+    /// records links (format 5).
+    pub fn symlink(&self, parent: u64, name: &std::ffi::OsStr, target: &[u8]) -> FsResult<Attr> {
+        let mut g = self.lock();
+        if !g.links {
+            return Err(libc::EPERM);
+        }
+        let path = g.child(parent, name)?;
+        creatable(path.file_name())?;
+        if target.len() > veil_core::vfs::MAX_LINK_TARGET {
+            return Err(libc::ENAMETOOLONG);
+        }
+        if veil_core::vfs::check_link_target(target).is_err() {
+            return Err(libc::EINVAL);
+        }
+        if g.meta(&path)?.is_some() {
+            return Err(libc::EEXIST);
+        }
+        g.overlay.write_link(&path, target).map_err(|e| errno(&e))?;
+        g.touch(&path);
+        let ino = g.ino_for(&path);
+        if let Some(n) = g.nodes.get_mut(&ino) {
+            n.lookups += 1;
+        }
+        g.attr(ino, &path)
+    }
+
     pub fn unlink(&self, parent: u64, name: &std::ffi::OsStr) -> FsResult<()> {
         let mut g = self.lock();
         let path = g.child(parent, name)?;
@@ -1279,7 +1371,7 @@ impl MountFs {
         let mut g = self.lock();
         let path = g.child(parent, name)?;
         match g.meta(&path)? {
-            Some(m) if m.kind == NodeKind::File => return Err(libc::ENOTDIR),
+            Some(m) if m.kind != NodeKind::Dir => return Err(libc::ENOTDIR),
             Some(_) => {}
             None => return Err(libc::ENOENT),
         }
@@ -1318,15 +1410,15 @@ impl MountFs {
                 return Err(libc::EEXIST);
             }
             match (src.kind, dst.kind) {
-                (NodeKind::File, NodeKind::Dir) => return Err(libc::EISDIR),
-                (NodeKind::Dir, NodeKind::File) => return Err(libc::ENOTDIR),
+                (NodeKind::File | NodeKind::Symlink, NodeKind::Dir) => return Err(libc::EISDIR),
+                (NodeKind::Dir, NodeKind::File | NodeKind::Symlink) => return Err(libc::ENOTDIR),
                 (NodeKind::Dir, NodeKind::Dir) => {
                     let entries = g.overlay.list_dir(&to).map_err(|e| errno(&e))?;
                     if !entries.is_empty() {
                         return Err(libc::ENOTEMPTY);
                     }
                 }
-                (NodeKind::File, NodeKind::File) => {}
+                (NodeKind::File | NodeKind::Symlink, NodeKind::File | NodeKind::Symlink) => {}
             }
             g.detach(&to)?;
             g.remove(&to, dst.kind == NodeKind::Dir)?;
@@ -1334,6 +1426,7 @@ impl MountFs {
         g.persist_under(&from)?;
         match src.kind {
             NodeKind::File => g.copy_file(&from, &to)?,
+            NodeKind::Symlink => g.copy_link(&from, &to)?,
             NodeKind::Dir => {
                 g.overlay.create_dir_all(&to).map_err(|e| errno(&e))?;
                 let rel = |p: &VPath| VPath::new(&p.as_str()[from.as_str().len()..]).expect("below");
@@ -1341,9 +1434,12 @@ impl MountFs {
                     let target = VPath::new(&format!("{}/{}", to.as_str(), rel(&d).as_str())).map_err(|e| errno(&e))?;
                     g.overlay.create_dir_all(&target).map_err(|e| errno(&e))?;
                 }
-                for f in walk_files(&g.overlay, &from, &|_| false).map_err(|e| errno(&e))? {
+                for (f, kind) in walk_leaves(&g.overlay, &from, &|_| false).map_err(|e| errno(&e))? {
                     let target = VPath::new(&format!("{}/{}", to.as_str(), rel(&f).as_str())).map_err(|e| errno(&e))?;
-                    g.copy_file(&f, &target)?;
+                    match kind {
+                        NodeKind::Symlink => g.copy_link(&f, &target)?,
+                        _ => g.copy_file(&f, &target)?,
+                    }
                     let t = g.mtime(&f);
                     g.times.insert(target, t);
                 }
@@ -1400,7 +1496,7 @@ impl MountFs {
     pub fn region(&self) -> (Vec<VPath>, Vec<VPath>) {
         let g = self.lock();
         let upper = g.overlay.upper().clone();
-        let mut paths = walk_files(&*upper, &VPath::root(), &|_| false).unwrap_or_default();
+        let mut paths: Vec<VPath> = walk_leaves(&*upper, &VPath::root(), &|_| false).unwrap_or_default().into_iter().map(|(p, _)| p).collect();
         paths.extend(walk_dirs(&*upper, &VPath::root()).unwrap_or_default());
         paths.sort();
         (paths, g.overlay.whiteouts())
@@ -1410,7 +1506,7 @@ impl MountFs {
     /// layer does not).
     pub fn upper_files(&self) -> Vec<VPath> {
         let g = self.lock();
-        walk_files(&**g.overlay.upper(), &VPath::root(), &|_| false).unwrap_or_default()
+        walk_leaves(&**g.overlay.upper(), &VPath::root(), &|_| false).unwrap_or_default().into_iter().map(|(p, _)| p).collect()
     }
 
     /// The same tree as the lower layer, read with keys that may have
@@ -1447,7 +1543,7 @@ impl MountFs {
         for p in drop {
             match upper_kind(&*upper, p) {
                 Some(NodeKind::Dir) => upper.remove_dir_all(p).map_err(|e| errno(&e))?,
-                Some(NodeKind::File) => upper.remove_file(p).map_err(|e| errno(&e))?,
+                Some(NodeKind::File | NodeKind::Symlink) => upper.remove_file(p).map_err(|e| errno(&e))?,
                 None => {}
             }
             g.overlay.remove_whiteout(p);
@@ -1516,12 +1612,15 @@ impl Inner {
             let needed = match lower.metadata(&w).map_err(e)? {
                 None => false,
                 Some(m) if m.kind == NodeKind::File => upper_kind(&*upper, &w) != Some(NodeKind::File),
+                Some(m) if m.kind == NodeKind::Symlink => {
+                    upper_kind(&*upper, &w) != Some(NodeKind::Symlink) || upper.read_link(&w).ok() != lower.read_link(&w).ok()
+                }
                 Some(_) => {
                     upper_kind(&*upper, &w) != Some(NodeKind::Dir)
-                        || walk_files(&*lower, &w, &|_| false)
+                        || walk_leaves(&*lower, &w, &|_| false)
                             .map_err(e)?
                             .iter()
-                            .any(|f| upper_kind(&*upper, f) != Some(NodeKind::File))
+                            .any(|(f, k)| upper_kind(&*upper, f) != Some(*k))
                         || walk_dirs(&*lower, &w)
                             .map_err(e)?
                             .iter()
@@ -1549,6 +1648,15 @@ impl Inner {
             }
             if upper.read(&f).map_err(e)? == lower.read(&f).map_err(e)? {
                 upper.remove_file(&f).map_err(e)?;
+            }
+        }
+        // Upper links identical to the new lower layer's go as well.
+        for (l, kind) in walk_leaves(&*upper, &VPath::root(), &|_| false).map_err(e)? {
+            if kind != NodeKind::Symlink || hidden(&l) {
+                continue;
+            }
+            if lower.metadata(&l).map_err(e)?.is_some_and(|m| m.kind == NodeKind::Symlink) && upper.read_link(&l).ok() == lower.read_link(&l).ok() {
+                upper.remove_file(&l).map_err(e)?;
             }
         }
         // Empty upper directories the lower layer has anyway go too, so
@@ -1838,6 +1946,60 @@ mod tests {
         assert_eq!(m.cat("e/a").unwrap(), b"A!?");
         assert_eq!(m.fs.getattr(open_ino).unwrap().size, 3);
         assert_eq!(m.lower.read(&p("d/a")).unwrap(), b"A");
+    }
+
+    /// Symlinks design, threat 8: a link is a leaf inode. Lookup never
+    /// goes through one (`ENOTDIR`), even one pointing at the repository's
+    /// own `.veil`; `open` refuses it (the kernel follows links itself);
+    /// `symlink()` is refused unless the repository records links, and then
+    /// stores the target as it is.
+    #[test]
+    fn links_are_leaf_inodes_never_traversed() {
+        let m = mem(&[("a.txt", b"A"), ("dir/f", b"F")]);
+        m.lower.write_link(&p("vault"), b"../../.veil/local/vault.sealed").unwrap();
+        m.lower.write_link(&p("up"), b"..").unwrap();
+        m.lower.write_link(&p("dir/l"), b"f").unwrap();
+        let a = m.fs.lookup(ROOT, os("vault")).unwrap();
+        assert_eq!(a.kind, NodeKind::Symlink);
+        assert_eq!(m.fs.readlink(a.ino).unwrap(), b"../../.veil/local/vault.sealed");
+        for (parent, name) in [("vault", "x"), ("up", "a.txt"), ("dir/l", "x")] {
+            let ino = m.ino(parent).unwrap();
+            assert_eq!(m.fs.lookup(ino, os(name)).err(), Some(libc::ENOTDIR), "{parent}/{name}");
+            assert_eq!(m.fs.create(ino, os(name), false, false).err(), Some(libc::ENOTDIR));
+            assert_eq!(m.fs.mkdir(ino, os(name)).err(), Some(libc::ENOTDIR));
+        }
+        assert_eq!(m.fs.open(a.ino, false, false).err(), Some(libc::ELOOP));
+        assert_eq!(m.fs.create(ROOT, os("vault"), false, false).err(), Some(libc::EEXIST));
+        assert_eq!(m.fs.setattr(a.ino, Some(0), None, None).err(), Some(libc::EINVAL));
+        assert!(m.names("").contains(&"vault".to_string()));
+        assert_eq!(m.fs.readlink(m.ino("a.txt").unwrap()).err(), Some(libc::EINVAL));
+        // Below format 5, `symlink()` is refused.
+        assert_eq!(m.fs.symlink(ROOT, os("new"), b"a.txt").err(), Some(libc::EPERM));
+        let m = Mem { fs: m.fs.with_links(true), ..m };
+        let new = m.fs.symlink(ROOT, os("new"), b"/etc/passwd").unwrap();
+        assert_eq!(new.kind, NodeKind::Symlink);
+        assert_eq!(m.upper.read_link(&p("new")).unwrap(), b"/etc/passwd");
+        assert!(m.upper.read(&p("new")).is_err());
+        assert_eq!(m.fs.symlink(ROOT, os("new"), b"x").err(), Some(libc::EEXIST));
+        assert_eq!(m.fs.symlink(ROOT, os("bad"), b"a\0b").err(), Some(libc::EINVAL));
+        assert_eq!(m.fs.symlink(ROOT, os("long"), &[b'a'; 5000]).err(), Some(libc::ENAMETOOLONG));
+        assert_eq!(m.fs.symlink(ROOT, os(".veil"), b"x").err(), Some(libc::EPERM));
+        // Renamed (alone or in a directory), a link stays the same link.
+        m.fs.rename(ROOT, os("new"), ROOT, os("moved"), false).unwrap();
+        assert_eq!(m.fs.readlink(m.ino("moved").unwrap()).unwrap(), b"/etc/passwd");
+        m.fs.rename(ROOT, os("dir"), ROOT, os("dir2"), false).unwrap();
+        assert_eq!(m.fs.readlink(m.ino("dir2/l").unwrap()).unwrap(), b"f");
+        assert_eq!(m.fs.rename(ROOT, os("moved"), ROOT, os("dir2"), false).err(), Some(libc::EISDIR));
+        // Unlinking removes the link, never its target; rmdir refuses it.
+        assert_eq!(m.fs.rmdir(ROOT, os("moved")).err(), Some(libc::ENOTDIR));
+        m.fs.unlink(ROOT, os("moved")).unwrap();
+        assert_eq!(m.fs.lookup(ROOT, os("moved")).err(), Some(libc::ENOENT));
+        assert_eq!(m.cat("a.txt").unwrap(), b"A");
+        // The recorded view (what the builder reads) has the links as links.
+        m.fs.with_view(|v| {
+            assert_eq!(v.read_link(&p("dir2/l")).unwrap(), b"f");
+            assert_eq!(v.metadata(&p("vault")).unwrap().unwrap().kind, NodeKind::Symlink);
+        });
     }
 
     #[test]

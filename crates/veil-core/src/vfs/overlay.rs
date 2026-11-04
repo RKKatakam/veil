@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use super::{walk_files, DirEntry, MemoryBackend, Metadata, NodeKind, StorageBackend};
+use super::{walk_leaves, DirEntry, MemoryBackend, Metadata, NodeKind, StorageBackend};
 use crate::{
     error::{Result, VeilError},
     id::ObjectId,
@@ -82,7 +82,7 @@ impl OverlayBackend {
 
     pub fn changes(&self) -> OverlayChanges {
         OverlayChanges {
-            written: walk_files(&*self.upper, &VPath::root(), &|_| false).unwrap_or_default(),
+            written: walk_leaves(&*self.upper, &VPath::root(), &|_| false).unwrap_or_default().into_iter().map(|(p, _)| p).collect(),
             removed: self.whiteouts.read().unwrap().iter().cloned().collect(),
         }
     }
@@ -134,8 +134,13 @@ impl OverlayBackend {
                 Some(m) => Some(m.kind),
                 None => self.lower_meta(&anc)?.map(|m| m.kind),
             };
-            if kind == Some(NodeKind::File) {
-                return Err(VeilError::InvalidPath(format!("{anc} is a file, not a directory")));
+            match kind {
+                Some(NodeKind::File) => return Err(VeilError::InvalidPath(format!("{anc} is a file, not a directory"))),
+                // Never written through.
+                Some(NodeKind::Symlink) => {
+                    return Err(VeilError::InvalidPath(format!("refusing to write below {anc}: it is a symbolic link")))
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -149,9 +154,13 @@ impl StorageBackend for OverlayBackend {
 
     fn read(&self, path: &VPath) -> Result<Vec<u8>> {
         if let Some(m) = self.upper.metadata(path)? {
-            if m.kind == NodeKind::File {
-                return self.upper.read(path);
-            }
+            return match m.kind {
+                NodeKind::File => self.upper.read(path),
+                NodeKind::Dir if !path.is_root() => Err(VeilError::InvalidPath(format!("{path} is a directory"))),
+                NodeKind::Dir => self.lower.read(path),
+                // A link written over a lower file: never the file's bytes.
+                NodeKind::Symlink => Err(VeilError::NotFound(path.to_string())),
+            };
         }
         if self.hidden(path) {
             return Err(VeilError::NotFound(path.to_string()));
@@ -159,11 +168,55 @@ impl StorageBackend for OverlayBackend {
         self.lower.read(path)
     }
 
+    fn read_link(&self, path: &VPath) -> Result<Vec<u8>> {
+        if let Some(m) = self.upper.metadata(path)? {
+            if m.kind == NodeKind::Symlink {
+                return self.upper.read_link(path);
+            }
+            if !path.is_root() {
+                return Err(VeilError::InvalidPath(format!("{path} is not a symlink")));
+            }
+        }
+        if self.hidden(path) {
+            return Err(VeilError::NotFound(path.to_string()));
+        }
+        self.lower.read_link(path)
+    }
+
+    fn write_link(&self, path: &VPath, target: &[u8]) -> Result<()> {
+        if path.is_root() {
+            return Err(VeilError::InvalidPath("cannot write to the root".into()));
+        }
+        if self.upper.metadata(path)?.is_some_and(|m| m.kind == NodeKind::Dir) {
+            return Err(VeilError::InvalidPath(format!("{path} is a directory")));
+        }
+        if self.upper.metadata(path)?.is_none() && self.lower_meta(path)?.is_some_and(|m| m.kind == NodeKind::Dir) {
+            return Err(VeilError::InvalidPath(format!("{path} is a directory")));
+        }
+        self.check_parents(path)?;
+        self.upper.write_link(path, target)
+    }
+
+    fn supports_links(&self) -> bool {
+        self.upper.supports_links()
+    }
+
+    fn special_at(&self, path: &VPath) -> Result<Option<&'static str>> {
+        if self.upper.metadata(path)?.is_some() {
+            return self.upper.special_at(path);
+        }
+        if self.hidden(path) {
+            return Ok(None);
+        }
+        self.lower.special_at(path)
+    }
+
     fn write(&self, path: &VPath, data: &[u8]) -> Result<()> {
         if self.upper.metadata(path)?.is_some_and(|m| m.kind == NodeKind::Dir) && !path.is_root() {
             return Err(VeilError::InvalidPath(format!("{path} is a directory")));
         }
-        let lower = self.lower_meta(path)?;
+        let upper_has = self.upper.metadata(path)?.is_some();
+        let lower = self.lower_meta(path)?.filter(|_| !upper_has);
         if lower.as_ref().is_some_and(|m| m.kind == NodeKind::Dir) {
             return Err(VeilError::InvalidPath(format!("{path} is a directory")));
         }
@@ -210,8 +263,8 @@ impl StorageBackend for OverlayBackend {
             return Ok(());
         }
         self.check_parents(path)?;
-        if self.upper.metadata(path)?.is_none() && self.lower_meta(path)?.is_some_and(|m| m.kind == NodeKind::File) {
-            return Err(VeilError::InvalidPath(format!("{path} is a file")));
+        if self.upper.metadata(path)?.is_none() && self.lower_meta(path)?.is_some_and(|m| m.kind != NodeKind::Dir) {
+            return Err(VeilError::InvalidPath(format!("{path} is not a directory")));
         }
         self.upper.create_dir_all(path)
     }
@@ -219,9 +272,7 @@ impl StorageBackend for OverlayBackend {
     fn list_dir(&self, path: &VPath) -> Result<Vec<DirEntry>> {
         match self.metadata(path)? {
             None => return Err(VeilError::NotFound(path.to_string())),
-            Some(m) if m.kind == NodeKind::File => {
-                return Err(VeilError::InvalidPath(format!("{path} is not a directory")))
-            }
+            Some(m) if m.kind != NodeKind::Dir => return Err(VeilError::InvalidPath(format!("{path} is not a directory"))),
             _ => {}
         }
         let mut merged: BTreeMap<String, NodeKind> = BTreeMap::new();
