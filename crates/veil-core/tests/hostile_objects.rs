@@ -117,8 +117,10 @@ fn damaged_object_is_repaired_by_pulling_it_again() {
     let bob = Repo::open(bfs.clone(), None, "bob").unwrap();
     assert!(bob.store().read_blob(&e.id).is_err(), "tampered copy served");
 
+    // A plain pull trusts what the local committed view reaches; repair is
+    // the explicit full pull, which re-verifies every local copy.
     let mut bob = bob;
-    remote::pull(&mut bob, "origin", remote_fs).unwrap();
+    remote::pull_with(&mut bob, "origin", remote_fs, &remote::SyncOptions { full: true }).unwrap();
     assert_eq!(bob.store().read_blob(&e.id).unwrap(), b"trusted\n");
 }
 

@@ -113,7 +113,13 @@ fn clone_of_a_tampered_remote_fails_cleanly_and_leaves_no_partial_tags() {
             if b.starts_with(b"veil:blob\n") {
                 let n = b.len() - 1;
                 b[n] ^= 1;
-                std::fs::write(&p, b).unwrap();
+                std::fs::write(&p, &b).unwrap();
+            }
+            // Pushed objects arrive packed: damage the pack data too.
+            if f.ends_with(".pack") {
+                let n = b.len() / 2;
+                b[n] ^= 1;
+                std::fs::write(&p, &b).unwrap();
             }
         }
     }
