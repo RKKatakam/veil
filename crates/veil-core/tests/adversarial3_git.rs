@@ -189,3 +189,36 @@ fn a_released_fix_is_not_reverted_by_the_next_github_round_trip() {
     env.pull(&mut alice);
     assert_eq!(read_at(&alice, &tag(&alice, "main"), "auth.rs"), b"FIXED-v2\n");
 }
+
+// ---- BUG-064: losing the mapping duplicates Veil's own history on the next pull ----
+
+/// The mapping is documented as recomputable ("export is deterministic and
+/// import of the same commit yields the same snapshot"). That holds when
+/// the next command is an export. When it is a pull, every commit Veil had
+/// exported is unmapped, so `import_tips` imports Veil's own commits as
+/// new snapshots: a second, parallel copy of the history, without the
+/// cloaked files, which `github/main` now points at and `main` has
+/// "diverged" from.
+#[test]
+#[ignore = "BUG-064: after .veil/git/map is lost, vl git pull re-imports Veil's own exported commits as a duplicate history"]
+fn a_lost_mapping_does_not_duplicate_history_on_pull() {
+    let env = Env::new();
+    let (mut alice, fs, _) = new_repo("alice");
+    let c1 = commit_files(
+        &mut alice,
+        &*fs,
+        &[(".veilpolicy", "secrets/ cloak team\n"), ("README", "r1\n"), ("secrets/k", "CLOAKED-77\n")],
+        "v1",
+    );
+    let c2 = commit_files(&mut alice, &*fs, &[("README", "r2\n")], "v2");
+    let _ = c1;
+    alice.set_tag("main", c2, None, false).unwrap();
+    env.connect(&mut alice);
+    env.push(&mut alice);
+
+    alice.backend().remove_file(&p(".veil/git/map")).unwrap();
+    let _ = alice.backend().remove_file(&p(".veil/git/cache"));
+    let rep = env.pull(&mut alice);
+    assert_eq!(rep.import.imported, 0, "Veil's own exported commits were imported again: {rep:?}");
+    assert_eq!(alice.view().remote_tags["github/main"], c2);
+}
