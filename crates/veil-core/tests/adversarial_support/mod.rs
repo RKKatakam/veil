@@ -77,16 +77,44 @@ pub fn all_objects(backend: &dyn StorageBackend) -> Vec<(String, Vec<u8>)> {
 }
 
 /// True if `needle` appears anywhere in the backend (objects, ops, meta...).
+/// Every place `needle` occurs on `backend`: raw file bytes, **and** the
+/// decoded (decompressed, delta-resolved) bytes of every object in every
+/// pack. Packed objects are zstd-compressed, so a raw byte search alone would
+/// never find plaintext that was pushed in a pack.
 pub fn backend_contains(backend: &dyn StorageBackend, needle: &[u8]) -> Vec<String> {
+    let has = |data: &[u8]| data.windows(needle.len()).any(|w| w == needle);
     let files = veil_core::vfs::walk_files(backend, &VPath::root(), &|_| false).unwrap();
-    files
-        .into_iter()
-        .filter(|f| {
-            let data = backend.read(f).unwrap();
-            data.windows(needle.len()).any(|w| w == needle)
-        })
+    let mut hits: Vec<String> = files
+        .iter()
+        .filter(|f| has(&backend.read(f).unwrap()))
         .map(|f| f.to_string())
-        .collect()
+        .collect();
+    for (label, raw) in packed_objects(backend) {
+        if has(&raw) {
+            hits.push(label);
+        }
+    }
+    hits
+}
+
+/// `(label, decoded bytes)` of every object in every pack on `backend`.
+pub fn packed_objects(backend: &dyn StorageBackend) -> Vec<(String, Vec<u8>)> {
+    use veil_core::{cache::LruCache, pack};
+    let dir = VPath::new(".veil/objects/pack").unwrap();
+    let Ok(entries) = backend.list_dir(&dir) else {
+        return Vec::new();
+    };
+    let bases = LruCache::new(64 << 20);
+    let mut out = Vec::new();
+    for e in entries {
+        let Some(name) = pack::name_from_index_file(&e.name) else { continue };
+        let p = pack::Pack::open(backend, &dir, name).unwrap();
+        for id in p.index().ids() {
+            let raw = p.get(backend, id, &bases).unwrap().expect("indexed object is in its pack");
+            out.push((format!("{}#{}", dir.join(&e.name), id.short()), raw));
+        }
+    }
+    out
 }
 
 // ---- hostile object construction ---------------------------------------

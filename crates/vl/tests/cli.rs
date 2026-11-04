@@ -134,6 +134,8 @@ fn cloaked_content_and_public_mirrors() {
     assert!(!env.root.join("bob-public/internal/plan.md").exists());
     let grep = Command::new("grep").args(["-r", "secret plan"]).arg(&mirror).output().unwrap();
     assert!(grep.stdout.is_empty(), "plaintext leaked into the public mirror");
+    // Pushed objects arrive zstd-packed, which grep cannot see into.
+    assert!(packed_contains(&mirror, b"secret plan").is_empty(), "plaintext leaked into a pack on the public mirror");
 
     // Alice grants Bob; Bob clones the team remote and can read.
     let bob_key = env.ok("bob", &env.root, &["identity", "show"]);
@@ -169,4 +171,25 @@ fn vault_secrets_are_injected_by_run() {
     assert!(out.contains("token=abc123"));
     let grep = Command::new("grep").args(["-r", "abc123"]).arg(proj.join(".veil")).output().unwrap();
     assert!(grep.stdout.is_empty(), "vault must be encrypted at rest");
+}
+
+/// Packs on a Veil repository directory whose decoded objects contain `needle`.
+fn packed_contains(repo: &Path, needle: &[u8]) -> Vec<String> {
+    use veil_core::{cache::LruCache, pack, DiskBackend, StorageBackend, VPath};
+    let fs = DiskBackend::new(repo);
+    let dir = VPath::new(".veil/objects/pack").unwrap();
+    let Ok(entries) = fs.list_dir(&dir) else { return Vec::new() };
+    let bases = LruCache::new(64 << 20);
+    let mut hits = Vec::new();
+    for e in entries {
+        let Some(name) = pack::name_from_index_file(&e.name) else { continue };
+        let p = pack::Pack::open(&fs, &dir, name).unwrap();
+        for id in p.index().ids() {
+            let raw = p.get(&fs, id, &bases).unwrap().expect("indexed object is in its pack");
+            if raw.windows(needle.len()).any(|w| w == needle) {
+                hits.push(format!("{}#{}", e.name, id.short()));
+            }
+        }
+    }
+    hits
 }
