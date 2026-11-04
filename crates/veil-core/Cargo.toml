@@ -13,6 +13,7 @@ diffy.workspace = true
 ed25519-dalek.workspace = true
 getrandom.workspace = true
 globset.workspace = true
+gix = { workspace = true, optional = true }
 hex.workspace = true
 regex.workspace = true
 serde.workspace = true
@@ -21,6 +22,11 @@ thiserror.workspace = true
 x25519-dalek.workspace = true
 zeroize.workspace = true
 zstd.workspace = true
+
+[features]
+default = ["git"]
+# Two-way Git interop (`veil_core::git`): needs a disk-backed repository.
+git = ["dep:gix"]
 
 [dev-dependencies]
 tempfile.workspace = true

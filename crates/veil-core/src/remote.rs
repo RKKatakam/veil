@@ -223,7 +223,7 @@ fn ancestors_in(store: &ObjectStore, tips: &[ObjectId]) -> Result<Vec<ObjectId>>
 /// receive the cloaked part (its content and descriptions are sealed for
 /// the scope); plaintext snapshots are withheld there too, because team
 /// remotes are also read by people outside the embargo's scope.
-fn embargo_withheld(local: &Repo, public: bool) -> Result<HashMap<ObjectId, String>> {
+pub(crate) fn embargo_withheld(local: &Repo, public: bool) -> Result<HashMap<ObjectId, String>> {
     let mut out = HashMap::new();
     for id in local.visible_snapshots()? {
         let s = local.snapshot(&id)?;
@@ -252,7 +252,7 @@ fn embargo_withheld(local: &Repo, public: bool) -> Result<HashMap<ObjectId, Stri
 /// remote with their extra parents redacted). Fails with a reason if the
 /// tips reach withheld history any other way, i.e. some snapshot *builds
 /// on* the embargoed fix and would publish it.
-fn push_closure(
+pub(crate) fn push_closure(
     store: &ObjectStore,
     keys: &Keychain,
     tips: &[ObjectId],
