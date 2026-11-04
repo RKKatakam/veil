@@ -9,6 +9,8 @@
 //! kept the base's scope (else ours) is kept as it is, and the file is a
 //! conflict (BUG-123). This matters for auto-rebase, where "ours" is the new
 //! (possibly public) parent and "theirs" the (possibly cloaked) child.
+//! Conflict markers show the base's version only where its audience is the
+//! result's (BUG-126).
 //!
 //! Trees under an unreleased embargo (see [`crate::embargo`]) stay under it:
 //! the result is re-wrapped under the same embargo, with the merge of the
@@ -389,17 +391,38 @@ fn merge_file(
     if ours == theirs {
         return Ok(TreeEntry { executable, ..oe.clone() });
     }
+    // The merged content is new: its audience is decided on what both
+    // sides' objects really are sealed for, never on their labels alone
+    // (BUG-103: a forged `cloaked:embargo/<released>` or `cloaked:<scope of
+    // the attacker's>` label on one side would re-key it).
+    let (oe, te) = (&checked(store, oe, path)?, &checked(store, te, path)?);
+    let (visibility, fallback) = merged_visibility(store, oe, te);
+    // The base's text may appear in the result only where its audience is
+    // the result's (BUG-126): a base sealed for a scope never shows in a
+    // public result, or in one sealed for another audience.
+    let base_ok = base_shown(store, be, &visibility)?;
+    let style = match base_ok {
+        true => diffy::ConflictStyle::Diff3,
+        false => diffy::ConflictStyle::Merge,
+    };
     let merged = if mode == Mode::VirtualBase {
+        // A virtual base keeps the base's version where the two merge
+        // bases disagree, and is sealed as they are: where the base's
+        // audience is not theirs, it keeps nothing there instead
+        // (BUG-127), so the base's text is never stored for a wider or
+        // other audience, and the two later versions still both differ
+        // from the virtual base there and conflict.
+        let kept: &[u8] = if base_ok { &base } else { &[] };
         if looks_binary(&ours) || looks_binary(&theirs) || looks_binary(&base) {
-            base
+            kept.to_vec()
         } else {
-            merge_keeping_base(&base, &ours, &theirs)
+            merge_keeping_base(kept, &ours, &theirs)
         }
     } else if looks_binary(&ours) || looks_binary(&theirs) || looks_binary(&base) {
         conflicts.push(path.clone());
         ours
     } else {
-        match diffy::merge_bytes(&base, &ours, &theirs) {
+        match diffy::MergeOptions::new().set_conflict_style(style).merge_bytes(&base, &ours, &theirs) {
             Ok(m) => m,
             Err(m) => {
                 conflicts.push(path.clone());
@@ -407,12 +430,6 @@ fn merge_file(
             }
         }
     };
-    // The merged content is new: its audience is decided on what both
-    // sides' objects really are sealed for, never on their labels alone
-    // (BUG-103: a forged `cloaked:embargo/<released>` or `cloaked:<scope of
-    // the attacker's>` label on one side would re-key it).
-    let (oe, te) = (&checked(store, oe, path)?, &checked(store, te, path)?);
-    let (visibility, fallback) = merged_visibility(store, oe, te);
     let id = store.store_file(&merged, &visibility)?;
     Ok(TreeEntry {
         name: oe.name.clone(),
@@ -431,6 +448,24 @@ fn verified_visibility(store: &ObjectStore, e: &TreeEntry) -> Result<Option<Visi
         Sealing::Verified => Some(e.visibility.clone()),
         Sealing::Relabelled(actual) => Some(actual),
         Sealing::Unverifiable => None,
+    })
+}
+
+/// Whether the text of the base `be` may appear in a merged file sealed as
+/// `result`, as the "original" section of its conflict markers (BUG-126):
+/// when the base is public (or under a released embargo), or (verifiably)
+/// sealed exactly as the result is. Otherwise the conflict shows only the
+/// two sides. A clean merge never holds lines of the base that neither side
+/// has, so only the markers are concerned.
+fn base_shown(store: &ObjectStore, be: Option<&TreeEntry>, result: &Visibility) -> Result<bool> {
+    let Some(b) = be.filter(|e| e.kind == EntryKind::File) else {
+        return Ok(true);
+    };
+    Ok(match verified_visibility(store, b)? {
+        Some(Visibility::Public) => true,
+        Some(Visibility::Embargoed { embargo }) if store.keys.embargo_released(&embargo) => true,
+        Some(v) => v == *result,
+        None => false,
     })
 }
 

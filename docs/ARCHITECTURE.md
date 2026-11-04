@@ -728,6 +728,30 @@ CAS, and it applies these rules in order:
      still goes through the secret scanner below. A policy that arrived by
      merge, `vl new <cloaked change>` in an ordinary workspace, rebases and
      squashes never move sealed content to another audience.
+     **The rule only ever keeps a file out of public view; it never takes
+     an audience the policy does not name** (BUG-125). When the policy (as
+     pinned by the accepted policy) cloaks the path under `P` and the
+     parent's verified sealing is another scope `Q`, with no edit of
+     `.veilpolicy` in this snapshot re-keying it, an *edit* is sealed for
+     neither: it is held back (`cloak_failures`; the file stays local,
+     history keeps the recorded entry as it is), and unchanged content
+     keeps its entry. That state has no honest route of its own (a re-key
+     edits the policy in the same snapshot, and an incoming re-key the
+     member has not accepted is a held-back policy, which waits for `vl
+     policy accept` like any other); Mallory, who can push, produces it by
+     replacing `secrets/db.yml` on `main` with a genuine object sealed for
+     `mal`, a scope Alice is also in. Sealing Alice's edit for `Q` hands it
+     to whoever put the object there. Sealing it for `P` with a warning was
+     the alternative, and is rejected for the same reason as in merges
+     (next rule): the edit holds the `Q` content it was made from, and
+     membership is not ordered, so neither scope is safe to pick for the
+     other's content; it would also undo, on the member's next edit, a
+     teammate's genuine re-key the member has not yet accepted. The report
+     names the way out: `vl cloak --scope P PATH` (a deliberate re-key, by
+     this rule's own exception) or, for an incoming re-key, `vl policy
+     accept`. A file the policy leaves public (sealed only by a cloaked
+     line or by an earlier `vl cloak --scope` that the policy no longer
+     names) is not affected: it keeps its parent's scope as before.
    * **Merging never moves content between scopes** (BUG-123). When the two
      sides of a file are (verifiably) sealed for different scopes,
      `merge::merge_file` seals nothing for either audience: the result
@@ -742,6 +766,30 @@ CAS, and it applies these rules in order:
      destination's audience only when it was public; content sealed for
      another scope is not resealed, and the destination keeps its own
      entry (reported).
+   * **Conflict markers show the base only to its own audience**
+     (BUG-126). A conflicted text merge writes diff3 markers, whose
+     "original" section is the merge base's version. That section is
+     written only when the base is public (or under a released embargo) or
+     is verifiably sealed exactly as the result is. Otherwise, for example
+     with a base sealed for `team` and two sides that both exposed the file,
+     or a base sealed for `ops` and two `team` sides, the markers show the
+     two sides only (Git's `merge` conflict style). Before the fix, the
+     public result carried the `team` text into the snapshot, public
+     remotes and the Git export. The alternative, sealing the conflicted
+     result for the narrowest audience involved, is rejected: scopes are
+     not ordered (see the previous rule), so there is often no narrowest,
+     and it would hide both sides' public edits from public readers
+     because of a section that only helps the person resolving the
+     conflict. That person can still read the base (`vl cat -r` on the
+     merge base). A clean merge never holds a line of the base that neither
+     side has, so only the markers are affected.
+     The same holds for the **virtual merge base** of a criss-cross merge
+     (BUG-127). Where the two merge bases disagree, it keeps their common
+     ancestor's version, and it is sealed as the merge bases are. When that
+     ancestor's audience is not theirs (an ancestor sealed for `team`, two
+     public merge bases), the virtual base keeps nothing there instead. The
+     two later versions still both differ from it there and conflict, and
+     the ancestor's text is never stored for a wider or other audience.
    * **"Now sealed" never reads as "deleted".** A file the policy says is
      public but that is sealed because of the line it is edited on (a
      cloaked workspace, or sealed content keeping its audience) carries its

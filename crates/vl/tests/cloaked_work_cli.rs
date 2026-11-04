@@ -290,3 +290,49 @@ fn cloaking_a_public_file_by_policy_removes_it_from_github() {
     let files = git(&bare, &["ls-tree", "-r", "--name-only", "main"]);
     assert!(!files.contains("README.md"), "{files}");
 }
+
+/// BUG-126: the conflict markers of a merge include the merge base's
+/// version (diff3 style). When that version was sealed for a scope and the
+/// merged file is public (here both sides exposed it independently, each
+/// with its own edit of the same line), the base's text must not reach the
+/// public result: not the snapshot, not a public remote, not GitHub.
+#[test]
+fn a_conflict_never_shows_a_base_sealed_for_another_audience() {
+    const BASE: &str = "TEAM-ONLY-BASE-8841";
+    let env = Env::new();
+    let (proj, bare) = setup(&env);
+    let mirror = env.root.join("mirror");
+    env.ok("alice", &proj, &["remote", "add", "mirror", mirror.to_str().unwrap(), "--public"]);
+    write(&proj, "notes.txt", &format!("intro\n{BASE}\noutro\n"));
+    env.ok("alice", &proj, &["cloak", "--scope", "team", "notes.txt"]);
+    env.ok("alice", &proj, &["commit", "-m", "base"]);
+    env.ok("alice", &proj, &["ws", "new", "b", "-r", "main"]);
+
+    // Two lines expose the file, each editing the sealed line.
+    env.ok("alice", &proj, &["expose", "notes.txt"]);
+    write(&proj, "notes.txt", "intro\nSIDE-A\noutro\n");
+    env.ok("alice", &proj, &["commit", "-m", "a"]);
+    env.ok("alice", &proj, &["ws", "switch", "b"]);
+    assert_eq!(read(&proj, "notes.txt"), format!("intro\n{BASE}\noutro\n"));
+    env.ok("alice", &proj, &["expose", "notes.txt"]);
+    write(&proj, "notes.txt", "intro\nSIDE-B\noutro\n");
+    env.ok("alice", &proj, &["commit", "-m", "b"]);
+    env.ok("alice", &proj, &["ws", "switch", "default"]);
+
+    let out = env.ok("alice", &proj, &["merge", "b@-", "--into", "main", "-m", "merge b"]);
+    let merged = env.stdout("alice", &proj, &["cat", "notes.txt", "-r", "main"]);
+    assert!(merged.contains("SIDE-A") && merged.contains("SIDE-B") && merged.contains("<<<<<<<"), "{out}\n{merged}");
+    assert!(!merged.contains(BASE), "the public conflict shows the sealed base:\n{merged}");
+
+    // Published: a public remote, and GitHub.
+    env.ok("alice", &proj, &["push", "mirror", "-t", "main"]);
+    env.ok("bob", &env.root, &["clone", mirror.to_str().unwrap(), "bob"]);
+    let bob = env.root.join("bob");
+    let seen = env.stdout("bob", &bob, &["cat", "notes.txt", "-r", "main"]);
+    assert!(seen.contains("SIDE-A") && !seen.contains(BASE), "the public mirror shows:\n{seen}");
+    env.ok("alice", &proj, &["git", "push"]);
+    let on_github = git(&bare, &["show", "main:notes.txt"]);
+    assert!(on_github.contains("SIDE-A") && !on_github.contains(BASE), "GitHub shows:\n{on_github}");
+    let history = git(&bare, &["log", "-p", "--all"]);
+    assert!(!history.contains(BASE), "GitHub's history shows the sealed base");
+}
