@@ -42,10 +42,8 @@ fn undo_keeps_unrecorded_edits() {
 }
 
 // Scenario from jj test_undo_redo_commands.rs "undo twice": the guide
-// says "Run it again to go further back". Today the second undo undoes
-// the first (a redo).
+// says "Run it again to go further back" (BUG-206).
 #[test]
-#[ignore = "BUG-206: a second `vl undo` redoes the first instead of going further back, as the guide documents"]
 fn undo_again_goes_further_back() {
     let env = Env::new();
     let (r, one, two) = two_commits(&env);
@@ -55,6 +53,67 @@ fn undo_again_goes_further_back() {
     let log = r.out(&["log"]);
     assert!(!log.contains("two"), "{log}");
     let _ = one;
+}
+
+// Scenario from jj test_undo_redo_commands.rs "redo": `vl redo` takes the
+// undos back, newest first, and stops when there are none left.
+#[test]
+fn redo_takes_back_successive_undos() {
+    let env = Env::new();
+    let (r, one, two) = two_commits(&env);
+    let log_after = r.out(&["log"]);
+    r.ok(&["undo"]);
+    r.ok(&["undo"]);
+    assert_eq!(r.description("@"), "(no description set)");
+    let out = r.ok(&["redo"]);
+    assert!(out.contains(&format!("Redid: commit change {}", &one[..8])), "{out}");
+    assert_eq!(r.change("@-"), one);
+    let out = r.ok(&["redo"]);
+    assert!(out.contains(&format!("Redid: commit change {}", &two[..8])), "{out}");
+    assert_eq!(r.change("@-"), two);
+    assert_eq!(r.out(&["log"]), log_after);
+    let err = r.fails(&["redo"]);
+    assert!(err.contains("nothing to redo"), "{err}");
+}
+
+// Scenario from jj test_undo_redo_commands.rs: a new command after an undo
+// clears what could be redone; edits made in between do not.
+#[test]
+fn a_new_command_clears_the_redo_stack_but_edits_do_not() {
+    let env = Env::new();
+    let (r, _, two) = two_commits(&env);
+    r.ok(&["undo"]);
+    r.write("wip.txt", "unsaved\n");
+    r.ok(&["status"]); // records the edit: not a command
+    r.ok(&["redo"]);
+    assert_eq!(r.change("@-"), two);
+    assert_eq!(r.read("wip.txt"), "unsaved\n", "redo keeps unrecorded edits");
+    r.ok(&["undo"]);
+    r.ok(&["describe", "-m", "something new"]);
+    let err = r.fails(&["redo"]);
+    assert!(err.contains("nothing to redo"), "{err}");
+}
+
+// Undo and redo of `vl ws switch` move the project directory back and
+// forth; repeated undo then continues before the switch.
+#[test]
+fn undo_and_redo_of_a_workspace_switch() {
+    let env = Env::new();
+    let (r, _, _) = two_commits(&env);
+    r.ok(&["ws", "new", "w"]);
+    r.ok(&["ws", "switch", "w"]);
+    r.write("in-w.txt", "w edit\n");
+    let out = r.ok(&["undo"]);
+    assert!(out.contains("Undid: switch the project directory from workspace 'default' to 'w'"), "{out}");
+    assert!(!r.path("in-w.txt").exists());
+    let out = r.ok(&["redo"]);
+    assert!(out.contains("Redid: switch the project directory from workspace 'default' to 'w'"), "{out}");
+    assert_eq!(r.read("in-w.txt"), "w edit\n");
+    r.ok(&["undo"]);
+    // Further back: the creation of `w`, which holds a recorded edit.
+    let err = r.fails(&["undo"]);
+    assert!(err.contains("workspace 'w'") && err.contains("Nothing was changed"), "{err}");
+    assert_eq!(r.out(&["ws", "cat", "w", "in-w.txt"]), "w edit\n");
 }
 
 // Scenario from jj test_undo_redo_commands.rs: nothing to undo in a fresh

@@ -138,9 +138,11 @@ Embargo 77932133a2 is unreleased again: its key had not left this repository.
 ```
 
 (`vl embargo list` shows such a release as `released (not pushed yet)`.)
-Once a push or Git export has published the key, `vl undo` refuses and
-changes nothing: a published key cannot be taken back, so treat the fix
-as public.
+Once a push or Git export has published the key, `vl undo` of the release
+refuses and changes nothing: a published key cannot be taken back, so
+treat the fix as public. (Right after `vl push`, the first `vl undo` takes
+back only what the push recorded about the remote, `mirror/main` and the
+like; the next one reaches the release and refuses.)
 
 For GitHub, `vl git push` after the release adds one commit on top of the
 branch that publishes the fix and links its history (a fast-forward).

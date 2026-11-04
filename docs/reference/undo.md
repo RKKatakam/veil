@@ -3,7 +3,9 @@
 
 # `vl undo`
 
-Undo the last operation
+Undo the last operation; run again to go further back.
+
+Automatic snapshots (your unrecorded edits) and earlier undos are skipped, and the edits on disk are kept. `vl redo` re-applies what the latest undos took back.
 
 ```text
 vl undo [OPTIONS]

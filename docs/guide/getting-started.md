@@ -226,7 +226,10 @@ $ vl evolog -r @-
 Use change ids in day-to-day work. Use snapshot ids when you mean one exact
 version (to compare with `vl diff --from`, or after a change became
 *divergent*: two visible snapshots with the same change id, which `vl`
-reports when you use the change id).
+reports when you use the change id). Every id `vl evolog` prints is a
+revision, earlier versions included: `vl show ecdb49a1`, `vl cat -r ecdb49a1
+FILE` and `vl restore --from ecdb49a1 FILE` reach a file as it was a few
+snapshots ago. A change id always names the current version.
 
 ## Revisions
 
@@ -270,15 +273,31 @@ Undid: commit change yyntkszx
 Working copy now at: yyntkszx 4094f80d (no description set)
 ```
 
-* `vl undo` undoes the last operation. Running it again undoes the undo
-  (a redo); to go further back, find the operation in `vl op log` and use
-  `vl op restore`.
+* `vl undo` undoes the last operation. Run it again to go further back:
+  each undo takes back the command before the one the previous undo took
+  back (undos themselves are skipped, as in jj).
+* `vl redo` re-applies what the latest undo took back; run it again to
+  take back the undo before that. Any other command after an undo (a
+  commit, a rebase, a tag move…) leaves nothing to redo; editing files
+  does not.
+
+```text
+$ vl undo
+Undid: commit change yyntkszx
+$ vl undo
+Undid: set tag main
+$ vl redo
+Redid: set tag main
+```
+
 * `vl op restore <id>` returns the whole repository (changes, tags,
   workspaces) to the state after operation `<id>`.
 * Both **keep the files on disk that you had not recorded yet**: the
   automatic snapshot taken before `undo` is not what gets undone. After
-  `vl ws switch`, `vl undo` switches back; the edits of each workspace stay
-  in that workspace.
+  `vl ws switch`, `vl undo` switches back (and `vl redo` switches again);
+  the edits of each workspace stay in that workspace. An undo that would
+  delete a workspace holding recorded edits (undoing its `vl ws new`) is
+  refused and changes nothing.
 * Some commands change things the operation log does not hold: key rings
   (`vl scope create`, `grant`, `revoke`, `rotate`), remotes (`vl remote add`,
   `rm`), the local vault (`vl secret set`, `rm`, `import`) and the accepted
@@ -290,13 +309,16 @@ Working copy now at: yyntkszx 4094f80d (no description set)
 ```text
 $ vl scope grant team 7f3a… --name bob
 $ vl undo
-error: cannot undo the last command, 'grant scope team to bob': key rings are append-only;
+error: cannot undo 'grant scope team to bob': key rings are append-only;
 take the access back with `vl scope revoke team 7f3a…` (until you push, nobody else has received the key). …
 ```
 
   `vl op restore <id>` still goes back to an earlier operation, and warns
   about each such command it cannot revert.
-* What already left the repository cannot be undone. An **embargo
+* What already left the repository cannot be undone. `vl push` is an
+  operation too, because it records `origin/main` and the other remote
+  tags; undoing it only takes back what this repository remembers about the
+  remote, never the push itself. An **embargo
   release** can be undone only until your next push or Git export; after
   that `vl undo` refuses it ([Embargoes](embargoes.md#the-workflow)).
 

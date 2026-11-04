@@ -61,6 +61,12 @@ fn undo_refuses_a_pushed_release_and_changes_nothing() {
     env.ok(U, &proj, &["embargo", "release", &id, "--yes"]);
     let push = env.ok(U, &proj, &["push", "mirror"]);
     assert!(push.contains(&format!("published embargo {id}")), "{push}");
+    // The push is an operation of its own (it records `mirror/<tag>`,
+    // BUG-248): the first undo takes back only that record, never the
+    // published release.
+    let out = env.ok(U, &proj, &["undo"]);
+    assert!(out.contains("Undid: push to mirror") && out.contains("remote still has"), "{out}");
+    assert!(!out.contains("unreleased"), "{out}");
     let ops_before = env.stdout(U, &proj, &["op", "log"]);
     let out = env.vl(U, &proj, &["undo"]);
     let t = text(&out);
@@ -71,7 +77,7 @@ fn undo_refuses_a_pushed_release_and_changes_nothing() {
     assert!(list.contains("released") && !list.contains("not pushed yet"), "{list}");
     // The refused undo recorded nothing (the automatic snapshot aside).
     let ops_after = env.stdout(U, &proj, &["op", "log"]);
-    assert!(!ops_after.contains("undo:"), "{ops_after}\n(before:\n{ops_before})");
+    assert_eq!(ops_after.matches("undo:").count(), 1, "{ops_after}\n(before:\n{ops_before})");
 }
 
 #[test]

@@ -33,6 +33,8 @@ pub struct Transaction<'r> {
     description: String,
     record_always: bool,
     manual_undo: Option<String>,
+    undo_of: Option<ObjectId>,
+    redo_of: Option<ObjectId>,
     _lock: RepoLock,
 }
 
@@ -50,6 +52,8 @@ impl<'r> Transaction<'r> {
             description,
             record_always: false,
             manual_undo: None,
+            undo_of: None,
+            redo_of: None,
             _lock: lock,
         }
     }
@@ -74,6 +78,20 @@ impl<'r> Transaction<'r> {
     pub fn manual_undo(&mut self, how: impl Into<String>) {
         self.record_always = true;
         self.manual_undo = Some(how.into());
+    }
+
+    /// Record this operation as the undo of operation `op` (see
+    /// [`crate::oplog::Operation::undo_of`]).
+    pub fn undo_of(&mut self, op: ObjectId) {
+        self.record_always = true;
+        self.undo_of = Some(op);
+    }
+
+    /// Record this operation as the redo that reverts the undo `op` (see
+    /// [`crate::oplog::Operation::redo_of`]).
+    pub fn redo_of(&mut self, op: ObjectId) {
+        self.record_always = true;
+        self.redo_of = Some(op);
     }
 
     pub fn add_head(&mut self, id: ObjectId) -> Result<()> {
@@ -317,6 +335,8 @@ impl<'r> Transaction<'r> {
             description: self.description.clone(),
             view: self.view.clone(),
             manual_undo: self.manual_undo.clone(),
+            undo_of: self.undo_of,
+            redo_of: self.redo_of,
         };
         let id = self.repo.ops.put(&op)?;
         // Fencing: never move the head unless we still hold the lock.

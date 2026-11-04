@@ -303,19 +303,41 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         }
         Cmd::Undo => {
             let ws = ctx.ws.clone();
+            ctx.repo.reload()?;
+            let target = ctx.repo.undo_target(&ws)?;
             // The attachment is not in the view: undoing `vl ws switch` is
             // switching back (each workspace keeps its own edits).
-            if let Some(from) = ctx.repo.last_command_switch(&ws)? {
+            if let Some(from) = ctx.repo.undo_switch(&ws, &target)? {
                 ctx.attach(&from)?;
-                ctx.repo.record_workspace_switch(&ws, &from)?;
+                ctx.repo.record_workspace_switch_undo(&ws, &from, target)?;
                 println!("Undid: switch the project directory from workspace '{}' to '{}'", safe(&from), safe(&ws));
                 return Ok(ExitCode::SUCCESS);
             }
             let (_, undone) = ctx.repo.undo_keeping_edits(&ws)?;
             println!("Undid: {}", safe(&undone));
+            if let Some(remote) = undone.strip_prefix("push to ") {
+                println!(
+                    "The remote still has what was pushed: only what this repository remembers about it ({}/<tag>) went back. `vl pull {}` reads it again.",
+                    safe(remote),
+                    safe(remote)
+                );
+            }
             if let Some(e) = undone.strip_prefix(RELEASE_OP_PREFIX) {
                 println!("Embargo {} is unreleased again: its key had not left this repository.", safe(e));
             }
+        }
+        Cmd::Redo => {
+            let ws = ctx.ws.clone();
+            ctx.repo.reload()?;
+            let (undo, target) = ctx.repo.redo_target(&ws)?;
+            if let Some(to) = ctx.repo.redo_switch(&ws, &target)? {
+                ctx.attach(&to)?;
+                ctx.repo.record_workspace_switch_redo(&ws, &to, undo)?;
+                println!("Redid: switch the project directory from workspace '{}' to '{}'", safe(&ws), safe(&to));
+                return Ok(ExitCode::SUCCESS);
+            }
+            let (_, redone) = ctx.repo.redo_keeping_edits(&ws)?;
+            println!("Redid: {}", safe(&redone));
         }
         Cmd::Watch { interval_ms } => cmd_watch(ctx, *interval_ms)?,
         Cmd::Remote(c) => cmd_remote(ctx, c)?,
@@ -893,6 +915,12 @@ fn cmd_show(ctx: &mut Ctx, rev: &str, stat: bool) -> Result<()> {
             None => "unknown".into(),
         };
         println!("Embargo   : {} ({state})", yellow(&safe(e)));
+    }
+    // As `vl log` marks it and `vl status` lists them (BUG-245). A merge's
+    // own diff is relative to the merged parents, so it shows no markers.
+    if !s.conflicts.is_empty() {
+        let paths: Vec<String> = s.conflicts.iter().map(|c| safe(c).into_owned()).collect();
+        println!("Conflicts : {}", red(&paths.join(", ")));
     }
     println!();
     let desc = ctx.repo.description(&s);
@@ -2194,6 +2222,7 @@ fn cmd_push(ctx: &mut Ctx, name: &str, tags: &[String], force: bool, full: bool)
     let (backend, cfg) = remote_backend(ctx, name)?;
     let opts = remote::SyncOptions { full };
     let r = remote::push_with(&mut ctx.repo, backend, cfg.public, tags, force, &opts)?;
+    remote::record_pushed_tags(&mut ctx.repo, name, &r)?;
     for (t, id) in &r.tags_updated {
         println!("  {} {} → {}", green("pushed"), cyan(&safe(t)), id.short());
     }

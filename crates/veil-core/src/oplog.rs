@@ -84,6 +84,17 @@ pub struct Operation {
     /// written before it existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manual_undo: Option<String>,
+    /// Set on an operation recorded by `vl undo`: the operation it undid
+    /// (its view is that operation's parent's). Repeated undos walk back
+    /// past it instead of undoing it, and `vl redo` re-applies what it
+    /// undid (see [`crate::Repo::undo_target`]). Absent elsewhere, and on
+    /// undos written before it existed (those are plain operations).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undo_of: Option<ObjectId>,
+    /// Set on an operation recorded by `vl redo`: the undo operation it
+    /// reverted (its view is that undo's `undo_of`'s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redo_of: Option<ObjectId>,
 }
 
 #[derive(Debug)]

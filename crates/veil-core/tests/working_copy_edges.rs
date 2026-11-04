@@ -349,9 +349,9 @@ fn undo_reverts_the_last_command_and_keeps_edits() {
     let t = wc_tree(&repo);
     assert!(entry(&repo, &t, "new-work.txt").is_some(), "edits are part of the restored working copy");
 
-    // and a second undo is a redo, still keeping them
+    // and a redo re-applies the command, still keeping them
     let disk_tree = wc_tree(&repo);
-    repo.undo_keeping_edits(WS).unwrap();
+    repo.redo_keeping_edits(WS).unwrap();
     materialise(&repo, &fs, &disk_tree);
     assert_eq!(fs.read(&p("b.txt")).unwrap(), b"b1\n");
     assert_eq!(fs.read(&p("new-work.txt")).unwrap(), b"an hour of work\n");

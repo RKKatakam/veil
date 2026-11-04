@@ -158,7 +158,13 @@ fn undo_works_after_op_log_pruning() {
     env.ok("alice", &proj, &["undo"]);
     let log = env.stdout("alice", &proj, &["log"]);
     assert!(log.contains("b") && log.contains("initial"), "{log}");
-    env.ok("alice", &proj, &["undo"]);
+    // A second undo goes further back (BUG-247), into the pruned operations:
+    // it refuses, saying why, and changes nothing; redo still works.
+    let out = env.fails("alice", &proj, &["undo"]);
+    assert!(out.contains("pruned"), "{out}");
+    env.ok("alice", &proj, &["redo"]);
+    let log = env.stdout("alice", &proj, &["log"]);
+    assert!(log.lines().any(|l| l.trim_start_matches(['│', ' ']).trim_end() == "c"), "{log}");
     env.ok("alice", &proj, &["op", "log"]);
     env.ok("alice", &proj, &["fsck"]);
 }

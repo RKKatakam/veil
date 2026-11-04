@@ -314,7 +314,6 @@ fn push_dash_t_with_a_remote_tag_name_fails() {
 
 // Scenario from git t5404-tracking-branches.sh: "check tracking branches updated correctly after push".
 #[test]
-#[ignore = "BUG-281: `vl push` does not update the REMOTE/TAG remote tags (`vl git push` does)"]
 fn push_updates_the_remote_tags() {
     let env = Env::new();
     let (alice, _hub, _bob) = team(&env);

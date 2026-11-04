@@ -840,7 +840,24 @@ struct Snapshot {
   attached workspace at the top of the op log are not commands, so undo
   skips them and undoes the operation before. The edits they recorded are
   re-applied on the restored working copy with a 3-way merge
-  (`Repo::undo_keeping_edits`, `Repo::restore_operation_keeping_edits`).
+  (`Repo::undo_keeping_edits`, `Repo::restore_operation_keeping_edits`), in
+  every workspace that has the same working copy before and after (an undo
+  that would delete a workspace holding recorded edits is refused).
+* **Undo and redo** follow jj. An undo records `undo_of` (the operation it
+  undid), a redo `redo_of` (the undo it took back). `Repo::undo_target`
+  walks back from the head: automatic snapshots of the attached workspace
+  are skipped, an undo jumps to before the operation it undid, and a redo
+  stands for the command it re-applied; the first other operation is what
+  `vl undo` undoes. So repeated undos go further back, and undo, redo, undo
+  undoes the same command twice. `Repo::redo_target` walks the same way
+  but stops at the newest undo not yet redone (a redo jumps to before its
+  undo); any other command ends the walk, so a new command clears what
+  could be redone. Undo restores the view of the undone operation's parent
+  keeping the edits recorded since that operation; redo restores the view of
+  the operation itself, keeping the edits recorded since its parent. A
+  property test checks random command/undo/redo/edit sequences against
+  jj's model (a history stack and a redo stack). Undos written before
+  `undo_of` existed are plain operations: undoing one redoes it, once.
 * **Commit and tags.** `vl commit` (`Repo::commit`) moves the tags that
   pointed at the working copy's first parent to the committed change, so
   `main` follows commits made on it. On a **cloaked line** (the workspace
@@ -971,11 +988,13 @@ A workspace is only a named pointer in the view. It owns no directory.
   `Repo::undo_keeping_edits` refuses to undo one and returns its
   instructions, instead of skipping it and undoing an unrelated, earlier
   operation (BUG-116); `vl op restore` warns about each one it passes. A
-  switch is the exception the CLI can reverse: `vl undo` right after `vl ws
-  switch` switches back, so it never undoes the automatic snapshot of the
-  workspace just left, which held that workspace's last edits (BUG-100).
-  A property test drives random switch/edit/commit/undo sequences through
-  the binary and checks that no edit is ever lost.
+  switch is the exception the CLI can reverse: `vl undo` of `vl ws switch`
+  switches back (recorded as a switch with `undo_of`, so the next undo goes
+  further back), and `vl redo` switches again, so undo never undoes the
+  automatic snapshot of the workspace just left, which held that
+  workspace's last edits (BUG-100). A property test drives random
+  switch/edit/commit/undo/redo sequences through the binary and checks that
+  no edit is ever lost.
 * **Virtual workspaces** (`vl ws new`) exist only in the DAG. They are edited
   through overlays (`vl ws write`), materialised into a throwaway directory
   for one command (`vl ws exec`), or attached to the project directory
@@ -1128,7 +1147,9 @@ remains is mostly the one `lstat` per file and the per-directory
      explanation, and changes nothing: a published key cannot be taken
      back. `vl op restore` to an operation before a staged release takes it
      back too, and warns about published ones, which stay released.
-     Undoing the undo of a release is refused: undo never releases. What
+     Redoing the undo of a release is refused: undo and redo never
+     release (an undo of a release is skipped by later undos, as any undo
+     is; one written before `undo_of` existed is refused). What
      vl cannot know: someone copying the repository directory by other
      means (a backup, a file sync service) copies the embargo key with the
      scope keys anyway.
@@ -1653,7 +1674,7 @@ this order:
    the inventory, so gc never touches them.
 2. **Op-log pruning** (`--keep-ops-days N`, off by default). Delete
    operations older than the window. The current operation and its parents
-   are always kept, so `vl undo` works and can itself be undone. `op log`
+   are always kept, so `vl undo` works and can be redone. `op log`
    and op-id prefixes end where the log was pruned.
 3. **Mark.** The roots are the views of every retained operation (heads,
    workspaces, tags, remote tags), the universal root, the project

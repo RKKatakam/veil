@@ -13,7 +13,7 @@ Options:
 
 | | |
 |---|---|
-| `-r, --rev <REV>` | Snapshot whose changes to show (default: @) |
+| `-r, --rev <REV>` | Snapshot whose changes to show (default: @). Not together with `--from` / `--to`, which compare two snapshots instead |
 | `--from <FROM>` | Compare from this snapshot (default: @) |
 | `--to <TO>` | Compare to this snapshot (default: @) |
 | `--stat` | Only list changed paths |
