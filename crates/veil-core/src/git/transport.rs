@@ -16,7 +16,14 @@ use super::map::GitOid;
 use crate::error::{Result, VeilError};
 
 fn git(git_dir: &Path) -> Command {
-    let bin = std::env::var_os("VEIL_GIT").unwrap_or_else(|| "git".into());
+    let mut bin = std::path::PathBuf::from(std::env::var_os("VEIL_GIT").unwrap_or_else(|| "git".into()));
+    // `git` runs in the bridge directory (below): a relative `$VEIL_GIT`
+    // path means what it means here.
+    if bin.is_relative() && bin.components().count() > 1 {
+        if let Ok(cwd) = std::env::current_dir() {
+            bin = cwd.join(bin);
+        }
+    }
     let mut c = Command::new(bin);
     // Variables that would point git at another repository.
     for v in [
@@ -30,10 +37,22 @@ fn git(git_dir: &Path) -> Command {
     ] {
         c.env_remove(v);
     }
-    c.arg("--git-dir").arg(git_dir);
+    // Never the caller's directory: nothing may depend on where `vl` runs.
+    match git_dir.canonicalize() {
+        Ok(abs) => {
+            c.arg("--git-dir").arg(&abs).current_dir(&abs);
+        }
+        Err(_) => {
+            c.arg("--git-dir").arg(git_dir);
+        }
+    }
     // Objects Veil exported may be referenced only through its mapping:
     // never let a fetch garbage-collect them.
     c.args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"]);
+    // A remote URL never runs a command (`ext::`, whatever the user's
+    // configuration allows), and the bridge runs no hooks.
+    c.args(["-c", "protocol.ext.allow=never", "-c", "protocol.fd.allow=never"]);
+    c.args(["-c", "core.hooksPath=/dev/null"]);
     c.stdin(Stdio::inherit());
     c
 }
@@ -47,11 +66,42 @@ fn run(mut c: Command, what: &str) -> Result<std::process::Output> {
     })
 }
 
+/// The credentials part of `url` that must never be printed: the whole
+/// `user[:password]` of an `http(s)://` URL (a token is often passed as
+/// the user name), the password of any other `scheme://user:password@`.
+fn secret_of(url: &str) -> Option<&str> {
+    let (scheme, rest) = url.split_once("://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let userinfo = &rest[..rest[..end].rfind('@')?];
+    let web = matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https");
+    match userinfo.split_once(':') {
+        _ if web => Some(userinfo),
+        Some((_, password)) => Some(password),
+        None => None,
+    }
+    .filter(|s| !s.is_empty())
+}
+
+/// `url` with any credentials it embeds (`https://user:token@host/…`)
+/// replaced by `***`, for messages and listings.
+pub fn redact_url(url: &str) -> String {
+    redact_in(url, url)
+}
+
+/// `text` with the credentials of `url` replaced by `***` wherever they
+/// occur (in `git`'s own messages too).
+pub(crate) fn redact_in(text: &str, url: &str) -> String {
+    match secret_of(url) {
+        Some(secret) => text.replace(secret, "***"),
+        None => text.to_string(),
+    }
+}
+
 /// URLs are passed to `git` as arguments: refuse anything it could read as
 /// an option.
 pub(crate) fn validate_url(url: &str) -> Result<()> {
     if url.is_empty() || url.starts_with('-') || url.contains(['\n', '\0']) {
-        return Err(VeilError::repo(format!("invalid Git URL {url:?}")));
+        return Err(VeilError::repo(format!("invalid Git URL {:?}", redact_url(url))));
     }
     Ok(())
 }
@@ -67,8 +117,9 @@ pub(crate) fn fetch(git_dir: &Path, url: &str, remote: &str) -> Result<()> {
     let out = run(c, "fetch")?;
     if !out.status.success() {
         return Err(VeilError::repo(format!(
-            "git fetch from {url} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            "git fetch from {} failed: {}",
+            redact_url(url),
+            redact_in(String::from_utf8_lossy(&out.stderr).trim(), url)
         )));
     }
     Ok(())
@@ -133,7 +184,7 @@ pub(crate) fn push(git_dir: &Path, url: &str, updates: &[PushRef]) -> Result<Pus
         let Some(branch) = refs.split_once(':').and_then(|(_, to)| to.strip_prefix("refs/heads/")) else {
             continue;
         };
-        let summary = summary.unwrap_or("").trim().to_string();
+        let summary = redact_in(summary.unwrap_or("").trim(), url);
         let status = match flag {
             "*" => RefStatus::Created,
             " " => RefStatus::FastForward,
@@ -145,9 +196,29 @@ pub(crate) fn push(git_dir: &Path, url: &str, updates: &[PushRef]) -> Result<Pus
     }
     if outcome.refs.is_empty() && !out.status.success() {
         return Err(VeilError::repo(format!(
-            "git push to {url} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            "git push to {} failed: {}",
+            redact_url(url),
+            redact_in(String::from_utf8_lossy(&out.stderr).trim(), url)
         )));
     }
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credentials_are_redacted() {
+        assert_eq!(redact_url("https://bob:ghp_x@h:9/x.git"), "https://***@h:9/x.git");
+        assert_eq!(redact_url("https://ghp_x@github.com/o/r"), "https://***@github.com/o/r");
+        assert_eq!(redact_url("ssh://git:pw@host/r"), "ssh://git:***@host/r");
+        assert_eq!(redact_url("ssh://git@host/r"), "ssh://git@host/r");
+        assert_eq!(redact_url("git@github.com:o/r.git"), "git@github.com:o/r.git");
+        assert_eq!(redact_url("https://host/a@b"), "https://host/a@b");
+        assert_eq!(
+            redact_in("fatal: could not reach https://bob:ghp_x@h/", "https://bob:ghp_x@h/"),
+            "fatal: could not reach https://***@h/"
+        );
+    }
 }

@@ -177,7 +177,6 @@ fn control_a_github_policy_edit_cannot_uncloak_a_sealed_file() {
 /// user's fetch. Policy errors are isolated per commit (`import_tips`);
 /// any other error aborts the import.
 #[test]
-#[ignore = "BUG-058: one hostile Git branch (e.g. .veilpolicy as a symlink) makes every vl git fetch fail"]
 fn a_hostile_branch_does_not_block_importing_the_other_branches() {
     let env = Env::new();
     let (proj, bare) = exported_project(&env, &[("app.txt", "v1\n")]);
@@ -230,7 +229,6 @@ fn control_a_too_deep_branch_does_not_block_importing_the_other_branches() {
 /// next fetch no longer sees the branch as deleted. The stale remote tag
 /// stays forever.
 #[test]
-#[ignore = "BUG-060: a branch deleted on GitHub during a failed vl git fetch keeps its origin/<branch> tag forever"]
 fn a_branch_deleted_during_a_failed_fetch_loses_its_remote_tag() {
     let env = Env::new();
     let (proj, bare) = exported_project(&env, &[("app.txt", "v1\n")]);
@@ -261,7 +259,6 @@ fn a_branch_deleted_during_a_failed_fetch_loses_its_remote_tag() {
 /// over change ids in revsets: `vl new <change>` then checks out the
 /// attacker's commit.
 #[test]
-#[ignore = "BUG-059: a Git branch named after an exported change id hijacks that change id in revsets"]
 fn a_branch_named_after_a_change_id_does_not_hijack_it() {
     let env = Env::new();
     let (proj, bare) = exported_project(&env, &[("app.txt", "alice's work\n")]);
@@ -291,7 +288,6 @@ fn a_branch_named_after_a_change_id_does_not_hijack_it() {
 /// exported change makes that change divergent: the user can no longer
 /// address their own change by id.
 #[test]
-#[ignore = "BUG-059: a forged change-id header from Git makes the user's own change id divergent"]
 fn a_forged_change_id_header_does_not_break_the_users_change_id() {
     let env = Env::new();
     let (proj, bare) = exported_project(&env, &[("app.txt", "alice's work\n")]);
@@ -314,7 +310,6 @@ fn a_forged_change_id_header_does_not_break_the_users_change_id() {
 /// `git` itself redacts `user:password@` in its messages; Veil's own error
 /// (`transport.rs` "git fetch from {url} failed") prints the token.
 #[test]
-#[ignore = "BUG-061: a token embedded in a Git remote URL is printed in vl git fetch/push errors"]
 fn credentials_in_a_git_url_are_not_printed_in_errors() {
     let env = Env::new();
     let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
@@ -333,7 +328,6 @@ fn credentials_in_a_git_url_are_not_printed_in_errors() {
 /// `git` resolves it against the directory `vl` runs in. From a
 /// subdirectory of the project, `vl git push` writes to another repository.
 #[test]
-#[ignore = "BUG-062: a relative Git remote path is resolved against the cwd, so vl git push from a subdirectory pushes elsewhere"]
 fn a_relative_git_remote_is_the_same_repository_from_a_subdirectory() {
     let env = Env::new();
     let bare = env.root.join("github.git");
@@ -386,4 +380,97 @@ fn control_hostile_git_tree_names_are_not_checked_out() {
     assert!(!proj.join(".VEIL").exists());
     assert!(!proj.join(".veil/op_head").exists() || std::fs::read(proj.join(".veil/op_head")).unwrap() != b"hostile\n");
     env.ok(U, &proj, &["status"]);
+}
+
+// ---- follow-ups to the round 3 fixes ---------------------------------------------------
+
+/// BUG-060, the other way in: `git fetch` itself prunes the deleted
+/// branch's tracking ref and *then* fails (here a `git` that exits 1 after
+/// fetching). Deletions are computed from the remote tags Veil recorded,
+/// not from the bridge's refs, so the next fetch still removes the tag.
+#[cfg(unix)]
+#[test]
+fn a_branch_deleted_while_git_fetch_fails_loses_its_remote_tag() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let (proj, bare) = exported_project(&env, &[("app.txt", "v1\n")]);
+    let main = git(&bare, &["rev-parse", "main"]);
+    git(&bare, &["update-ref", "refs/heads/feature", &main]);
+    env.ok(U, &proj, &["git", "fetch"]);
+    assert!(env.stdout(U, &proj, &["tag", "list"]).contains("origin/feature"));
+
+    git(&bare, &["update-ref", "-d", "refs/heads/feature"]);
+    let failing = env.root.join("failing-git");
+    std::fs::write(&failing, "#!/bin/sh\ngit \"$@\"\necho 'fatal: the network went away' >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = env.cmd(U, &proj, &["git", "fetch"]).env("VEIL_GIT", &failing).output().unwrap();
+    assert!(!out.status.success(), "{}", text(&out));
+
+    let out = env.ok(U, &proj, &["git", "fetch"]);
+    assert!(out.contains("feature was deleted"), "{out}");
+    let tags = env.stdout(U, &proj, &["tag", "list"]);
+    assert!(!tags.contains("origin/feature"), "stale remote tag kept:\n{tags}");
+}
+
+/// BUG-058: the warning names the branch and the reason.
+#[test]
+fn a_hostile_branch_is_named_with_the_reason() {
+    let env = Env::new();
+    let (proj, bare) = exported_project(&env, &[("app.txt", "v1\n")]);
+    let b = blob(&bare, "anything\n");
+    let tree = raw_tree(&bare, &[("120000", b".veilpolicy", &b)]);
+    let evil = commit_tree(&bare, &tree, &[], "symlinked policy");
+    git(&bare, &["update-ref", "refs/heads/zz-evil", &evil]);
+    let out = env.ok(U, &proj, &["git", "pull"]);
+    assert!(out.contains("zz-evil") && out.contains(".veilpolicy is not a regular file"), "{out}");
+    assert!(!env.stdout(U, &proj, &["tag", "list"]).contains("zz-evil"));
+}
+
+/// BUG-061: `vl git remote add` and `list` do not print the token either.
+#[test]
+fn credentials_in_a_git_url_are_not_listed() {
+    let env = Env::new();
+    let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
+    let added = env.ok(U, &proj, &["git", "remote", "add", "gh", "https://bob:ghp_S3CRETTOKEN@127.0.0.1:9/x.git"]);
+    let listed = env.ok(U, &proj, &["git", "remote", "list"]);
+    for t in [&added, &listed] {
+        assert!(!t.contains("ghp_S3CRETTOKEN"), "{t}");
+    }
+    assert!(listed.contains("https://***@127.0.0.1:9/x.git"), "{listed}");
+}
+
+/// Round 3 hypothesis: HFS+ spellings of `.git` (an ignorable code point
+/// inside it) are refused like `.git` itself, both ways. On a macOS
+/// filesystem `.g\u{200C}it` *is* `.git`: a colocated working copy would
+/// take what GitHub put there as its repository.
+#[test]
+fn hfs_spellings_of_dot_git_are_refused_both_ways() {
+    let env = Env::new();
+    let spelling = ".g\u{200C}it";
+    // Veil → Git: not exported.
+    let (proj, bare) = exported_project(&env, &[("app.txt", "v1\n")]);
+    write(&proj, &format!("{spelling}/config"), "[core]\n\tfsmonitor = evil\n");
+    env.ok(U, &proj, &["commit", "-m", "hfs"]);
+    env.ok(U, &proj, &["tag", "set", "main", "-r", "@-"]);
+    let out = env.ok(U, &proj, &["git", "push"]);
+    assert!(out.contains("cannot be represented in Git"), "{out}");
+    let names = git(&bare, &["ls-tree", "-r", "--name-only", "-z", "main"]);
+    assert!(!names.contains("config"), "{names:?}");
+
+    // Git → Veil: not recorded, not checked out.
+    let gh = env.root.join("gh.git");
+    git(&env.root, &["init", "-q", "--bare", gh.to_str().unwrap()]);
+    let b = blob(&gh, "hostile\n");
+    let inner = raw_tree(&gh, &[("100644", b"config", &b)]);
+    let mut entries: Vec<(&str, &[u8], &str)> = vec![("40000", spelling.as_bytes(), &inner), ("100644", b"ok.txt", &b)];
+    entries.sort_by(|a, b| a.1.cmp(b.1));
+    let tree = raw_tree(&gh, &entries);
+    let c = commit_tree(&gh, &tree, &[], "hfs");
+    git(&gh, &["update-ref", "refs/heads/main", &c]);
+    let other = env.dir("other");
+    env.ok(U, &other, &["init"]);
+    let out = env.ok(U, &other, &["git", "import", gh.to_str().unwrap()]);
+    assert!(out.contains("not recorded"), "{out}");
+    assert!(other.join("ok.txt").exists());
+    assert!(!other.join(spelling).exists());
 }

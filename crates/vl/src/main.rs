@@ -1579,10 +1579,7 @@ fn cmd_git(ctx: &mut Ctx, c: &GitCmd) -> Result<()> {
     match c {
         GitCmd::Import { source, remote } => {
             // A local path is stored absolute, so later fetches work from anywhere.
-            let src = match Path::new(source).canonicalize() {
-                Ok(p) if !source.contains("://") => p.to_string_lossy().into_owned(),
-                _ => source.clone(),
-            };
+            let src = git::absolute_git_url(source, &std::env::current_dir()?);
             let r = git::import(&mut ctx.repo, &git_dir, &src, remote)?;
             print_git_fetch(&r, remote);
             // A working copy that still sits on the root (a fresh `vl init`)
@@ -1603,12 +1600,15 @@ fn cmd_git(ctx: &mut Ctx, c: &GitCmd) -> Result<()> {
             }
         }
         GitCmd::Remote(GitRemoteCmd::Add { name, url }) => {
-            git::remote_add(&mut ctx.repo, name, url)?;
-            println!("Added Git remote {name} → {}", safe(url));
+            // A relative path means what it means here, not wherever `vl`
+            // runs later: store it absolute.
+            let url = git::absolute_git_url(url, &std::env::current_dir()?);
+            git::remote_add(&mut ctx.repo, name, &url)?;
+            println!("Added Git remote {name} → {}", safe(&git::redact_url(&url)));
         }
         GitCmd::Remote(GitRemoteCmd::List) => {
             for (name, url) in git::remotes(&ctx.repo)? {
-                println!("{}  {}", bold(&safe(&name)), safe(&url));
+                println!("{}  {}", bold(&safe(&name)), safe(&git::redact_url(&url)));
             }
         }
         GitCmd::Remote(GitRemoteCmd::Rm { name }) => {

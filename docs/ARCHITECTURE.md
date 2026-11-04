@@ -1239,7 +1239,7 @@ because Git does.
 .veil/git/repo.git      bare Git repository (gix), the bridge
   refs/heads/<tag>          what Veil last exported for the tag
   refs/remotes/<r>/<b>      branch <b> of Git remote <r>, as last fetched or pushed
-.veil/git/map           c <commit> <snapshot>                         every pair
+.veil/git/map           c <commit> <snapshot> <veiled embargoes>      every pair
                         s <snapshot> <commit> <import|export|publish> <pending embargoes>
 .veil/git/cache         projection and conversion memo (safe to delete)
 .veil/git/remotes.json  Git remote name → URL
@@ -1261,7 +1261,9 @@ how each object is *sealed*, never by which keys this replica holds:
   their entries are left out and a directory left empty disappears. An
   embargo wrapper resolves to its sealed side once released, otherwise to
   its fallback; an embargoed file shows its fallback. A `.git` entry, which
-  Git cannot hold, is left out with a warning. Isolated files were never in
+  Git cannot hold, is left out with a warning, in every spelling that
+  names it on macOS (any case, HFS+-ignorable code points such as
+  `.g\u{200C}it`, as Git's `is_hfs_dotgit`); import refuses them too. Isolated files were never in
   the graph.
 * **Which message.** Plain descriptions as they are. A description sealed
   for a scope becomes `(description withheld: cloaked)`, one sealed under
@@ -1291,7 +1293,18 @@ one: the released tree, parents `[pinned commit, newly visible parents…]`
 header (it would make the change look divergent to Jujutsu). Descendants
 exported before the release (they were sealed by stickiness) get one too,
 linking to their parent's publication commit. `vl git push` is then a
-fast-forward. Commits that came from Git are never recomputed.
+fast-forward.
+
+The same holds for commits that came from Git. The mapping records, for
+every commit, the embargoes that were unreleased in the view it shows
+(*veiled*): an exported commit pinned under an embargo, and a Git commit
+made on top of one (it shows the pre-fix files too). On release, such an
+imported commit also gets a publication commit, parents `[imported commit,
+newly visible parents…]`, whose tree is the imported commit's tree with
+*only the release's change* to the snapshot's public view applied
+(carry-over from the projection through the old veil to the current one).
+GitHub's edits, and paths Veil never recorded, are kept; the fix reaches
+GitHub past any number of GitHub commits.
 
 **Carry-over in the other direction.** Paths Git has but Veil never
 recorded, because Veil isolated or quarantined them at import, or because
@@ -1312,13 +1325,18 @@ Each commit becomes a snapshot:
 * **parents**: the parents' snapshots (the root for a root commit);
 * **author / timestamp**: `Name <email>` and the author time (UTC, ms);
 * **description**: the message, plaintext (it is public in Git already);
-* **change id**: the `change-id` header (Jujutsu or an earlier Veil export),
-  otherwise derived from the commit id, so re-importing gives the same
-  snapshot id (the importer's signature is deterministic too);
+* **change id**: the `change-id` header (Jujutsu), unless a visible change
+  already has that id (a forged header must not make the user's change
+  divergent), otherwise derived from the commit id, so re-importing gives
+  the same snapshot id (the importer's signature is deterministic too);
 * **tree**, as a three-way merge (`merge::merge_trees`):
   * `ours` = the parents' Veil tree (`Repo::parents_tree`): everything,
     cloaked and embargoed content included;
-  * `base` = its public projection: what Git saw;
+  * `base` = its public projection *as the commit's author saw it*: through
+    the veil of the Git parents' commits. A Git commit made after a
+    release on the pre-release view (the merge as pinned, or a Git commit
+    on it) shows the pre-fix files; against the released tree that would
+    read as a revert of the fix;
   * `theirs` = the Git commit built **through the policy gate**: a
     read-only `StorageBackend` over the Git tree is snapshotted by the
     builder on top of `base`, so isolation, secret scanning and cloaking
@@ -1370,6 +1388,31 @@ path), with gix for all object reading and writing:
   `GIT_DIR`-style variables, disables auto-gc in the bridge (exported
   commits may be referenced only by the mapping), and refuses URLs that
   `git` could read as options.
+
+**Commits Veil exported are never imported.** Before importing an
+unmapped commit, import checks whether it is Veil's own: one with a
+`change-id` header naming a visible change is exported again (through the
+veils of earlier release states, if a release shaped it) and recognised if
+the commit id is the same; one without, on top of a commit whose view a
+release changed, is checked against the publication commit export would
+write. A header alone proves nothing (anyone can write one). So a lost
+`.veil/git/map` is rebuilt by the next fetch as well as by the next export,
+and a second replica that holds the same Veil history (from a Veil remote)
+maps the first one's exports to the same snapshots. An earlier import of
+the same commit is found by its derived change id.
+
+**Untrusted branches.** A branch that cannot be imported (an unreadable or
+hostile tree, `.veilpolicy` as a symlink, held back by an embargo) is
+reported with its name and the reason; the other branches are imported and
+the command succeeds. Deleted branches are found from the remote tags Veil
+recorded, not from the bridge's tracking refs (which `git fetch --prune`
+has already moved, even if the import then failed). `vl git pull` does not
+create a local tag whose name is also a change id or snapshot id prefix of
+the repository (tags win in revsets); `<r>/<branch>` names it. Credentials
+in a remote URL (`https://user:token@host`) are replaced by `***` in every
+message and in `vl git remote list`. A relative local path given to `vl git
+remote add` is stored absolute, and `git` always runs in the bridge
+directory, so the remote is the same from any directory.
 
 Every mapped object is re-checked before use; one that has gone (Veil gc
 of an abandoned import, Git gc) is treated as unmapped and recomputed,

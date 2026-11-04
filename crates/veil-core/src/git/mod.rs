@@ -14,8 +14,8 @@
 //!
 //! # Visibility
 //!
-//! Git sees exactly what a **public** Veil remote sees (see [`project`]
-//! for trees). Snapshots are selected with the public push's own rules
+//! Git sees exactly what a **public** Veil remote sees (the *public
+//! projection*, `project.rs`, for trees). Snapshots are selected with the public push's own rules
 //! (`remote::embargo_withheld`, `remote::push_closure`): cloaked tags are
 //! never exported, the merged-in history of an unreleased embargoed merge is
 //! withheld (the merge's extra parents are dropped from the Git commit), and
@@ -31,7 +31,16 @@
 //! exported, a snapshot keeps its commit (the mapping pins it), so Git
 //! history is append-only from Veil's side: when an embargo is released,
 //! a *publication* commit on top of the pinned one brings in the released
-//! tree and the fix's history.
+//! tree and the fix's history. The same holds for a commit made in Git on
+//! top of an embargoed merge (it shows the pre-fix files): the mapping
+//! records which embargoes were unreleased in each commit's view, and a
+//! Git commit made on such a view is imported against it, so the pre-fix
+//! files it shows never read as a revert of the fix.
+//!
+//! The mapping can be lost: an exported commit met in Git without one is
+//! recognised by exporting its snapshot again (same commit id), never by
+//! its `change-id` header alone, which anyone can write. A header naming
+//! an existing change is not taken.
 //!
 //! # Round trips
 //!
@@ -67,12 +76,12 @@ use std::{
 pub use export::ExportReport;
 pub use import::ImportReport;
 pub use map::{GitMap, GitOid, Origin};
-pub use transport::{PushOutcome, RefStatus};
+pub use transport::{redact_url, PushOutcome, RefStatus};
 
 use crate::{
     commands::validate_tag_name,
     error::{Result, VeilError},
-    id::ObjectId,
+    id::{ChangeId, ObjectId},
     oplog::Tag,
     repo::Repo,
     vfs::StorageBackend,
@@ -95,7 +104,10 @@ pub struct GitBridge {
     git_dir: PathBuf,
     pub(crate) map: GitMap,
     pub(crate) cache: map::Cache,
+    /// Projections of this run that the cache cannot keep, for `veil`.
     pub(crate) run_projected: HashMap<ObjectId, project::Projection>,
+    /// Embargoes projections treat as unreleased (see `project::Veil`).
+    pub(crate) veil: project::Veil,
     pub(crate) warnings: Vec<String>,
 }
 
@@ -127,6 +139,7 @@ impl GitBridge {
             cache: map::Cache::load(&**repo.backend()),
             git_dir,
             run_projected: HashMap::new(),
+            veil: project::Veil::default(),
             warnings: Vec::new(),
         })
     }
@@ -291,9 +304,55 @@ pub fn validate_remote_name(name: &str) -> Result<()> {
     }
 }
 
+/// Is `url` a local path to `git` (not `scheme://…` nor scp-style
+/// `host:path`)?
+pub(crate) fn is_local_path(url: &str) -> bool {
+    if url.contains("://") {
+        return false;
+    }
+    match url.find(':') {
+        Some(colon) => url.find('/').is_some_and(|slash| slash < colon),
+        None => true,
+    }
+}
+
+/// `url` as it should be stored for a Git remote: a relative local path is
+/// made absolute against `cwd` (the directory the user typed it in), so
+/// that the remote is the same repository whichever directory `vl` later
+/// runs in. Other URLs are returned unchanged.
+pub fn absolute_git_url(url: &str, cwd: &Path) -> String {
+    if !is_local_path(url) || Path::new(url).is_absolute() {
+        return url.to_string();
+    }
+    let joined = cwd.join(url);
+    if let Ok(p) = joined.canonicalize() {
+        return p.to_string_lossy().into_owned();
+    }
+    // Not there yet: normalise `.` and `..` lexically.
+    let mut out = PathBuf::new();
+    for c in joined.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => out.push(c),
+        }
+    }
+    out.to_string_lossy().into_owned()
+}
+
+/// Add Git remote `name` for `url`. A local path must be absolute (see
+/// [`absolute_git_url`]): `git` would resolve a relative one against
+/// whatever directory it runs in.
 pub fn remote_add(repo: &mut Repo, name: &str, url: &str) -> Result<()> {
     validate_remote_name(name)?;
     transport::validate_url(url)?;
+    if is_local_path(url) && !Path::new(url).is_absolute() {
+        return Err(VeilError::repo(format!(
+            "Git remote path {url:?} is relative; give an absolute path"
+        )));
+    }
     if repo.config().remotes.contains_key(name) {
         return Err(VeilError::repo(format!(
             "'{name}' is already the name of a Veil remote; Git remotes share its `{name}/<branch>` names, pick another"
@@ -327,12 +386,22 @@ pub fn remote_remove(repo: &mut Repo, git_dir: &Path, name: &str) -> Result<()> 
     Ok(())
 }
 
-fn remote_url(repo: &Repo, name: &str) -> Result<String> {
-    remotes(repo)?.get(name).cloned().ok_or_else(|| {
+/// The URL of Git remote `name`. A relative local path (stored by an
+/// older version) is taken relative to the project directory when the
+/// bridge has the standard layout (`<project>/.veil/git/repo.git`).
+fn remote_url(repo: &Repo, git_dir: &Path, name: &str) -> Result<String> {
+    let url = remotes(repo)?.get(name).cloned().ok_or_else(|| {
         VeilError::NotFound(format!(
             "Git remote '{name}' (add one with `vl git remote add {name} <url>`)"
         ))
-    })
+    })?;
+    if is_local_path(&url) && !Path::new(&url).is_absolute() {
+        let standard = git_dir.ends_with(Path::new(".veil").join("git").join("repo.git"));
+        if let Some(project) = git_dir.ancestors().nth(3).filter(|_| standard) {
+            return Ok(absolute_git_url(&url, project));
+        }
+    }
+    Ok(url)
 }
 
 // ---- fetch / pull ------------------------------------------------------------
@@ -372,7 +441,8 @@ pub fn import(repo: &mut Repo, git_dir: &Path, url: &str, remote: &str) -> Resul
         Some(u) if u == url => {}
         Some(u) => {
             return Err(VeilError::repo(format!(
-                "Git remote '{remote}' already points at {u}; choose another name with --remote"
+                "Git remote '{remote}' already points at {}; choose another name with --remote",
+                redact_url(u)
             )))
         }
         None => remote_add(repo, remote, url)?,
@@ -381,7 +451,7 @@ pub fn import(repo: &mut Repo, git_dir: &Path, url: &str, remote: &str) -> Resul
 }
 
 fn fetch_inner(repo: &mut Repo, git_dir: &Path, remote: &str, update_tags: bool) -> Result<FetchReport> {
-    let url = remote_url(repo, remote)?;
+    let url = remote_url(repo, git_dir, remote)?;
     let mut bridge = GitBridge::open(repo, git_dir)?;
     let prefix = format!("refs/remotes/{remote}/");
     let before = bridge.refs_under(&prefix)?;
@@ -391,8 +461,19 @@ fn fetch_inner(repo: &mut Repo, git_dir: &Path, remote: &str, update_tags: bool)
 
     let mut report = FetchReport::default();
     let mut tx = repo.transaction(format!("git fetch from {remote}"))?;
+    // What Veil last recorded for each branch. The bridge's tracking refs
+    // cannot tell: `git fetch` has already moved them (and pruned deleted
+    // branches), even if a previous import then failed.
+    let tag_prefix = format!("{remote}/");
+    let recorded: BTreeMap<String, ObjectId> = tx
+        .view
+        .remote_tags
+        .iter()
+        .filter_map(|(k, v)| k.strip_prefix(&tag_prefix).map(|b| (b.to_string(), *v)))
+        .collect();
     let tips: Vec<GitOid> = after.values().copied().collect();
     report.import = bridge.import_tips(&mut tx, &tips)?;
+    let mut revisions = RevisionNames::default();
     for (branch, oid) in &after {
         let name = format!("{remote}/{branch}");
         if validate_tag_name(branch).is_err() || validate_tag_name(&name).is_err() {
@@ -402,24 +483,36 @@ fn fetch_inner(repo: &mut Repo, git_dir: &Path, remote: &str, update_tags: bool)
             continue;
         }
         let Some(sid) = bridge.snapshot_of(oid) else {
-            report
-                .warnings
-                .push(format!("Git branch '{branch}' ({}) could not be imported", short(oid)));
+            let why = report
+                .import
+                .failed
+                .iter()
+                .find(|(c, _)| c == oid)
+                .map(|(_, why)| why.clone())
+                .unwrap_or_else(|| "not imported".into());
+            report.warnings.push(format!(
+                "Git branch '{branch}' ({}) was not imported: {why}; the other branches were",
+                short(oid)
+            ));
             continue;
         };
-        if let Some(old) = before.get(branch).filter(|o| *o != oid) {
-            match bridge.snapshot_of(old) {
-                Some(old_sid) if tx.repo().is_ancestor(&old_sid, &sid)? => {}
-                _ => report.forced.push((branch.clone(), *old, *oid)),
+        if let Some(old_sid) = recorded.get(branch).filter(|o| **o != sid) {
+            if !tx.repo().is_ancestor(old_sid, &sid)? {
+                let old = before
+                    .get(branch)
+                    .copied()
+                    .or_else(|| bridge.commit_of(old_sid))
+                    .unwrap_or_else(|| GitOid::null(gix::hash::Kind::Sha1));
+                report.forced.push((branch.clone(), old, *oid));
             }
         }
         tx.view.remote_tags.insert(name.clone(), sid);
         report.branches.push((name, sid));
         if update_tags {
-            update_tag(&mut tx, remote, branch, sid, &mut report)?;
+            update_tag(&mut tx, remote, branch, sid, &mut revisions, &mut report)?;
         }
     }
-    for branch in before.keys().filter(|b| !after.contains_key(*b)) {
+    for branch in recorded.keys().filter(|b| !after.contains_key(*b)) {
         tx.view.remote_tags.remove(&format!("{remote}/{branch}"));
         report.deleted.push(branch.clone());
     }
@@ -429,16 +522,55 @@ fn fetch_inner(repo: &mut Repo, git_dir: &Path, remote: &str, update_tags: bool)
     Ok(report)
 }
 
+/// Change ids and snapshot ids of the visible snapshots, to keep Git
+/// branch names from shadowing them (built on first use).
+#[derive(Default)]
+struct RevisionNames(Option<Vec<(String, String)>>);
+
+impl RevisionNames {
+    /// Would `name`, as a tag, hide a change id or snapshot id prefix of
+    /// this repository in revsets (tags are resolved first)?
+    fn shadows(&mut self, repo: &Repo, name: &str) -> Result<bool> {
+        let change = ChangeId::reverse_hex_to_hex(name);
+        let snapshot = (name.len() >= 4 && name.bytes().all(|b| b.is_ascii_hexdigit())).then(|| name.to_ascii_lowercase());
+        if change.is_none() && snapshot.is_none() {
+            return Ok(false);
+        }
+        if self.0.is_none() {
+            let mut v = Vec::new();
+            for id in repo.visible_snapshots()? {
+                v.push((hex::encode(repo.snapshot(&id)?.change_id.0), id.hex()));
+            }
+            self.0 = Some(v);
+        }
+        let ids = self.0.as_ref().unwrap();
+        Ok(ids.iter().any(|(c, s)| {
+            change.as_ref().is_some_and(|h| c.starts_with(h.as_str())) || snapshot.as_ref().is_some_and(|h| s.starts_with(h.as_str()))
+        }))
+    }
+}
+
 /// Create or fast-forward local tag `branch` to `sid` (as `remote::pull`).
+/// A new tag is not created if its name would shadow one of this
+/// repository's change ids or snapshot ids: anyone who can push a branch
+/// named after a published change id could otherwise redirect `vl new
+/// <change>` to their commit. `<remote>/<branch>` still names it.
 fn update_tag(
     tx: &mut crate::transaction::Transaction<'_>,
     remote: &str,
     branch: &str,
     sid: ObjectId,
+    revisions: &mut RevisionNames,
     report: &mut FetchReport,
 ) -> Result<()> {
     match tx.view.tags.get(branch).cloned() {
         None => {
+            if revisions.shadows(tx.repo(), branch)? {
+                report.warnings.push(format!(
+                    "no local tag created for Git branch '{branch}': the name is also a change or snapshot id of this repository; use {remote}/{branch}"
+                ));
+                return Ok(());
+            }
             tx.view.tags.insert(branch.to_string(), Tag { target: sid, cloak: None });
             report.tags_updated.push((branch.to_string(), sid));
         }
@@ -476,7 +608,7 @@ pub struct PushReport {
 /// and merge first); with `force` it is overwritten, but only if it still
 /// holds what was last fetched (`--force-with-lease`).
 pub fn push(repo: &mut Repo, git_dir: &Path, remote: &str, only_tags: &[String], force: bool) -> Result<PushReport> {
-    let url = remote_url(repo, remote)?;
+    let url = remote_url(repo, git_dir, remote)?;
     let mut bridge = GitBridge::open(repo, git_dir)?;
     let export = bridge.export(repo, only_tags)?;
     let mut updates = Vec::new();

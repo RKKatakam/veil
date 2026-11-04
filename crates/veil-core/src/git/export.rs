@@ -11,6 +11,7 @@ use super::{
 use crate::{
     error::{Result, VeilError},
     id::ObjectId,
+    object::Snapshot,
     oplog::Tag,
     remote::{embargo_withheld, push_closure},
     repo::Repo,
@@ -143,8 +144,9 @@ impl GitBridge {
         Ok(report)
     }
 
-    /// The Git tree of snapshot tree `tree` as a public reader sees it,
-    /// and the unreleased embargoes that shaped it.
+    /// The Git tree of snapshot tree `tree` as a public reader sees it
+    /// (through the current veil), and the unreleased embargoes that
+    /// shaped it.
     fn public_git_tree(&mut self, repo: &Repo, tree: &ObjectId) -> Result<(GitOid, BTreeSet<String>)> {
         let p = self.project(repo.store(), tree)?;
         let oid = match p.tree {
@@ -167,10 +169,11 @@ impl GitBridge {
         let mut old = None;
         if let Some(cur) = self.map.current.get(&sid).cloned() {
             if self.has_object(&cur.commit) {
-                // Commits that came from Git are the truth for their
-                // snapshot. Exported ones stay pinned unless an embargo that
-                // shaped them has been released since.
-                if cur.origin == Origin::Imported || !cur.pending.iter().any(|e| repo.keys().embargo_released(e)) {
+                // A commit stays pinned unless an embargo that was
+                // unreleased in the view it shows has been released since.
+                // That holds for commits that came from Git too: one made
+                // on top of an embargoed merge shows the pre-fix files.
+                if !cur.pending.iter().any(|e| repo.keys().embargo_released(e)) {
                     return Ok(());
                 }
                 old = Some(cur);
@@ -179,9 +182,9 @@ impl GitBridge {
             }
         }
         let s = repo.snapshot(&sid)?;
-        let mut pending = BTreeSet::new();
         // Parents as Git sees them: withheld (redacted) and absent ones are
         // dropped; the root is not a commit.
+        let mut pending = BTreeSet::new();
         let mut parents: Vec<GitOid> = Vec::new();
         let mut first: Option<(ObjectId, GitOid)> = None;
         for p in &s.parents {
@@ -200,8 +203,66 @@ impl GitBridge {
                 parents.push(c);
             }
         }
-        let (theirs, tree_pending) = self.public_git_tree(repo, &s.tree)?;
-        pending.extend(tree_pending);
+        let Some(old) = old else {
+            let (commit, more) = self.fresh_commit(repo, &s, first, parents)?;
+            pending.extend(more);
+            let oid = self.write_commit(&commit)?;
+            report.written += 1;
+            self.map.record(
+                sid,
+                Current {
+                    commit: oid,
+                    origin: Origin::Exported,
+                    pending,
+                },
+            );
+            return Ok(());
+        };
+        let oc = self.read_commit(&old.commit)?;
+        let extra: Vec<GitOid> = parents
+            .into_iter()
+            .filter(|p| !oc.parents.contains(p) && *p != old.commit)
+            .collect();
+        let (commit, more) = self.publication_commit(repo, &s, old.commit, &oc, &old.pending, extra, pending)?;
+        let Some(commit) = commit else {
+            // The release changed nothing Git can see.
+            self.map.record(
+                sid,
+                Current {
+                    commit: old.commit,
+                    origin: old.origin,
+                    pending: more,
+                },
+            );
+            return Ok(());
+        };
+        let oid = self.write_commit(&commit)?;
+        report.written += 1;
+        report.published += 1;
+        self.map.record(
+            sid,
+            Current {
+                commit: oid,
+                origin: Origin::Published,
+                pending: more,
+            },
+        );
+        Ok(())
+    }
+
+    /// The commit export writes for snapshot `s` (through the current veil)
+    /// when it has none yet: Git parents `parents`, the first of which is
+    /// `first` = (its snapshot, its commit). Returns the embargoes that
+    /// shaped it. Deterministic: [`GitBridge::recognise_export`] relies on
+    /// it to find exported commits without a mapping.
+    pub(crate) fn fresh_commit(
+        &mut self,
+        repo: &Repo,
+        s: &Snapshot,
+        first: Option<(ObjectId, GitOid)>,
+        parents: Vec<GitOid>,
+    ) -> Result<(gix::objs::Commit, BTreeSet<String>)> {
+        let (theirs, mut pending) = self.public_git_tree(repo, &s.tree)?;
         // Paths Git has but Veil never recorded (committed to Git while
         // isolated or quarantined in Veil, symlinks, submodules) survive.
         let tree = match first {
@@ -212,64 +273,95 @@ impl GitBridge {
                 self.carry(Some(base), Some(ours), Some(theirs))?.unwrap_or_else(empty_tree_oid)
             }
         };
-        let (text, text_pending) = public_text(repo.store(), &s.description);
+        let (text, text_pending) = public_text(repo.store(), &self.veil, &s.description);
         pending.extend(text_pending);
-        let sig = signature(&s.author, s.timestamp);
-
-        let (commit, origin) = match old {
-            None => (
-                gix::objs::Commit {
-                    tree,
-                    parents: parents.into_iter().collect(),
-                    author: sig.clone(),
-                    committer: sig,
-                    encoding: None,
-                    message: message(&text).into(),
-                    extra_headers: vec![(CHANGE_ID_HEADER.into(), s.change_id.display().into())],
-                },
-                Origin::Exported,
-            ),
-            Some(old) => {
-                let oc = self.read_commit(&old.commit)?;
-                if oc.tree == tree && parents.iter().all(|p| oc.parents.contains(p)) {
-                    // The release changed nothing Git can see.
-                    self.map.record(
-                        sid,
-                        Current {
-                            commit: old.commit,
-                            origin: old.origin,
-                            pending,
-                        },
-                    );
-                    return Ok(());
-                }
-                let released: Vec<&String> = old.pending.iter().filter(|e| !pending.contains(*e)).collect();
-                let mut ps = vec![old.commit];
-                ps.extend(parents.into_iter().filter(|p| !oc.parents.contains(p) && *p != old.commit));
-                let body = format!(
-                    "{}\n(Published by Veil: released from embargo {}.)",
-                    message(&text),
-                    released.iter().map(|e| e.as_str()).collect::<Vec<_>>().join(", ")
-                );
-                report.published += 1;
-                (
-                    gix::objs::Commit {
-                        tree,
-                        parents: ps.into_iter().collect(),
-                        author: sig.clone(),
-                        committer: sig,
-                        encoding: None,
-                        message: message(&body).into(),
-                        extra_headers: vec![],
-                    },
-                    Origin::Published,
-                )
+        if let Some(e) = &s.embargo {
+            if !self.veil.released(repo.keys(), e) {
+                pending.insert(e.clone());
             }
+        }
+        let sig = signature(&s.author, s.timestamp);
+        let commit = gix::objs::Commit {
+            tree,
+            parents: parents.into_iter().collect(),
+            author: sig.clone(),
+            committer: sig,
+            encoding: None,
+            message: message(&text).into(),
+            extra_headers: vec![(CHANGE_ID_HEADER.into(), s.change_id.display().into())],
         };
-        let oid = self.write_commit(&commit)?;
-        report.written += 1;
-        self.map.record(sid, Current { commit: oid, origin, pending });
-        Ok(())
+        Ok((commit, pending))
+    }
+
+    /// The publication commit for snapshot `s`, whose commit `old` (`oc`)
+    /// shows the view in which the embargoes `old_veiled` were unreleased,
+    /// now that some of them are released (through the current veil):
+    /// parents `[old, extra…]`, and `old`'s tree with *the release's change
+    /// to the snapshot's public view* applied (carry-over from the
+    /// projection through `old_veiled` to the current one). Paths Git has
+    /// that Veil never recorded, and edits made in Git (when `old` came
+    /// from Git), are kept. `None` if Git would see nothing new. Returns
+    /// the embargoes still shaping the result, including `pending`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn publication_commit(
+        &mut self,
+        repo: &Repo,
+        s: &Snapshot,
+        old: GitOid,
+        oc: &gix::objs::Commit,
+        old_veiled: &BTreeSet<String>,
+        extra: Vec<GitOid>,
+        mut pending: BTreeSet<String>,
+    ) -> Result<(Option<gix::objs::Commit>, BTreeSet<String>)> {
+        let (theirs, tree_pending) = self.public_git_tree(repo, &s.tree)?;
+        pending.extend(tree_pending);
+        let (text, text_pending) = public_text(repo.store(), &self.veil, &s.description);
+        pending.extend(text_pending);
+        if let Some(e) = &s.embargo {
+            if !self.veil.released(repo.keys(), e) {
+                pending.insert(e.clone());
+            }
+        }
+        let mut before = self.veil.clone();
+        before.set.extend(old_veiled.iter().cloned());
+        let (base, _) = self.with_veil(before, |b| b.public_git_tree(repo, &s.tree))?;
+        let tree = self
+            .carry(Some(base), Some(oc.tree), Some(theirs))?
+            .unwrap_or_else(empty_tree_oid);
+        if tree == oc.tree && extra.is_empty() {
+            return Ok((None, pending));
+        }
+        let released: Vec<&str> = old_veiled
+            .iter()
+            .filter(|e| !pending.contains(*e))
+            .map(String::as_str)
+            .collect();
+        let body = format!(
+            "{}\n(Published by Veil: released from embargo {}.)",
+            message(&text),
+            released.join(", ")
+        );
+        let sig = signature(&s.author, s.timestamp);
+        let mut ps = vec![old];
+        ps.extend(extra);
+        let commit = gix::objs::Commit {
+            tree,
+            parents: ps.into_iter().collect(),
+            author: sig.clone(),
+            committer: sig,
+            encoding: None,
+            message: message(&body).into(),
+            extra_headers: vec![],
+        };
+        Ok((Some(commit), pending))
+    }
+
+    /// The id `commit` would have, without writing it.
+    pub(crate) fn commit_id(commit: &gix::objs::Commit) -> Result<GitOid> {
+        use gix::objs::WriteTo;
+        let mut buf = Vec::new();
+        commit.write_to(&mut buf).map_err(super::gerr)?;
+        gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Commit, &buf).map_err(super::gerr)
     }
 
     /// Three-way carry-over of Git trees: Veil's change (`base` → `theirs`)
