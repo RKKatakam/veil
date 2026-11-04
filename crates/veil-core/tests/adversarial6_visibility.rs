@@ -157,7 +157,7 @@ fn a_relabelled_entry_cannot_seal_the_victims_edit_under_a_public_key() {
     let (mut alice, fs, hub, main) = alice_with_hub();
     mallory_relabels(hub.clone(), main, |m| {
         m.keys().create_scope("mal").unwrap();
-        let id = m.keys().create_embargo("mal", None, "").unwrap();
+        let id = m.keys().create_embargo("mal", None).unwrap();
         m.keys().release_embargo(&id).unwrap();
         format!("embargo/{id}")
     });
@@ -386,7 +386,7 @@ fn a_hostile_cloak_field_cannot_seal_the_victims_work_under_a_public_key() {
     let mut m = Repo::init_for_clone(Arc::new(MemoryBackend::new()), Some(Identity::generate("mallory")), "mallory").unwrap();
     remote::pull(&mut m, "origin", hub.clone()).unwrap();
     m.keys().create_scope("mal").unwrap();
-    let id = m.keys().create_embargo("mal", None, "").unwrap();
+    let id = m.keys().create_embargo("mal", None).unwrap();
     m.keys().release_embargo(&id).unwrap();
     let tree = m.snapshot(&main).unwrap().tree;
     let evil = m

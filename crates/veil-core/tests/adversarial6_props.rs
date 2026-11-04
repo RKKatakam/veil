@@ -120,7 +120,7 @@ fn sample_ring() -> (Vec<u8>, KeyRing) {
 
 fn sample_embargo() -> Vec<u8> {
     let (alice, _, _) = new_repo("alice");
-    let id = alice.keys().create_embargo("team", Some(4_102_444_800_000), "").unwrap();
+    let id = alice.keys().create_embargo("team", Some(4_102_444_800_000)).unwrap();
     alice.keys().release_embargo(&id).unwrap();
     serde_json::to_vec(&alice.keys().load_embargo(&id).unwrap().unwrap()).unwrap()
 }
