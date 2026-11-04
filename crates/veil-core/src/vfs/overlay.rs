@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use super::{DirEntry, MemoryBackend, Metadata, NodeKind, StorageBackend};
+use super::{walk_files, DirEntry, MemoryBackend, Metadata, NodeKind, StorageBackend};
 use crate::{
     error::{Result, VeilError},
     id::ObjectId,
@@ -16,10 +16,14 @@ use crate::{
 /// in-memory `upper`) or deleted (recorded as a whiteout). The lower layer is
 /// never modified, so many overlays can share one base snapshot — this is how
 /// Veil spins up agent workspaces in microseconds without copying files.
+///
+/// The upper layer is a [`MemoryBackend`] by default; [`OverlayBackend::with_upper`]
+/// takes any backend instead (a `vl ws mount` keeps its upper layer on disk,
+/// so edits survive a crash of the mount).
 #[derive(Debug)]
 pub struct OverlayBackend {
     lower: Arc<dyn StorageBackend>,
-    upper: MemoryBackend,
+    upper: Arc<dyn StorageBackend>,
     whiteouts: RwLock<BTreeSet<VPath>>,
 }
 
@@ -32,10 +36,21 @@ pub struct OverlayChanges {
 
 impl OverlayBackend {
     pub fn new(lower: Arc<dyn StorageBackend>) -> Self {
+        Self::with_upper(lower, Arc::new(MemoryBackend::new()), [])
+    }
+
+    /// An overlay whose upper layer is `upper` (which must not be written
+    /// by anyone else meanwhile) and whose lower layer is already hidden at
+    /// `whiteouts`: reopening an overlay that was persisted.
+    pub fn with_upper(
+        lower: Arc<dyn StorageBackend>,
+        upper: Arc<dyn StorageBackend>,
+        whiteouts: impl IntoIterator<Item = VPath>,
+    ) -> Self {
         OverlayBackend {
             lower,
-            upper: MemoryBackend::new(),
-            whiteouts: RwLock::new(BTreeSet::new()),
+            upper,
+            whiteouts: RwLock::new(whiteouts.into_iter().collect()),
         }
     }
 
@@ -43,11 +58,41 @@ impl OverlayBackend {
         &self.lower
     }
 
+    /// The upper (written) layer.
+    pub fn upper(&self) -> &Arc<dyn StorageBackend> {
+        &self.upper
+    }
+
+    /// The paths hidden from the lower layer (each hides its subtree).
+    pub fn whiteouts(&self) -> Vec<VPath> {
+        self.whiteouts.read().unwrap().iter().cloned().collect()
+    }
+
+    /// Is `path` hidden from the lower layer, by a whiteout on it or on
+    /// one of its ancestors?
+    pub fn is_whited_out(&self, path: &VPath) -> bool {
+        self.hidden(path)
+    }
+
+    /// Stop hiding the lower layer at `path` (only that whiteout; one on an
+    /// ancestor still hides it).
+    pub fn remove_whiteout(&self, path: &VPath) -> bool {
+        self.whiteouts.write().unwrap().remove(path)
+    }
+
     pub fn changes(&self) -> OverlayChanges {
         OverlayChanges {
-            written: self.upper.files(),
+            written: walk_files(&*self.upper, &VPath::root(), &|_| false).unwrap_or_default(),
             removed: self.whiteouts.read().unwrap().iter().cloned().collect(),
         }
+    }
+
+    /// Does the upper layer hold `path` or anything below it?
+    fn upper_has_any_under(&self, path: &VPath) -> bool {
+        if path.is_root() {
+            return self.upper.list_dir(path).is_ok_and(|l| !l.is_empty());
+        }
+        self.upper.metadata(path).is_ok_and(|m| m.is_some())
     }
 
     /// Is `path` hidden from the lower layer by a whiteout on it or an ancestor?
@@ -222,7 +267,7 @@ impl StorageBackend for OverlayBackend {
     }
 
     fn known_id(&self, path: &VPath) -> Option<ObjectId> {
-        if self.upper.has_any_under(path) || self.whiteout_under(path) || self.hidden(path) {
+        if self.upper_has_any_under(path) || self.whiteout_under(path) || self.hidden(path) {
             return None;
         }
         self.lower.known_id(path)

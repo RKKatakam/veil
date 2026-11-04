@@ -415,6 +415,30 @@ disk is left alone), but earlier snapshots keep it, so treat anything
 secret in `.git/config` (tokens in remote URLs) as exposed to whoever has
 those snapshots.
 
+### A mounted workspace says `Transport endpoint is not connected`
+
+The process serving the mount (`vl ws mount`) died. Nothing written there
+is lost: it is in `.veil/local/mounts/NAME/`. `vl ws unmount NAME` detaches
+the dead mount and records it; or `vl ws mount NAME DIR` again, which
+picks it up as it was. `vl doctor`, and every `vl` command meanwhile, say
+which mount it is (`the mount of workspace NAME at DIR lost its process`).
+
+### `warning: … the mount's version was saved as change X`
+
+The workspace changed under its mount (another command recorded into it)
+at a file you had also changed in the mount since it was last recorded.
+Your version is in change X, on top of what the mount showed before; the
+mount now shows the workspace's. `vl diff -r X`, then `vl merge X` or
+`vl abandon X`. See
+[mounts](workspaces-and-agents.md#vl-ws-mount-a-workspace-as-a-directory).
+
+### `error: … is busy …; its edits are recorded, but it stays mounted`
+
+`vl ws unmount` does not pull a mount from under a program: a file is
+open there, or a shell has `cd`ed into it. Close it and run `vl ws
+unmount` again (`lsof +D DIR` finds the culprit). Everything written so far
+was recorded.
+
 ### `warning: workspace 'X' no longer exists; attaching to 'Y'`
 
 The workspace your directory was attached to was removed (perhaps by

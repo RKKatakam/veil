@@ -25,6 +25,7 @@ mod ctx;
 mod doctor;
 #[cfg(test)]
 mod docgen;
+mod mount;
 mod picker;
 mod render;
 mod sandbox;
@@ -143,6 +144,22 @@ fn run(cli: Cli) -> Result<ExitCode> {
         // for every request.
         Cmd::Serve { call: Some(method), params, .. } => serve::call(cli.repository.as_deref(), method, params.as_deref()),
         Cmd::Serve { .. } => serve::run(cli.repository.as_deref(), !cli.no_snapshot),
+        // The serving process must not hold a `Ctx` while it serves.
+        Cmd::Workspace(WsCmd::Mount {
+            name,
+            dir,
+            foreground,
+            record_every,
+        }) => mount::cmd_mount(
+            cli.repository.as_deref(),
+            !cli.no_snapshot,
+            &mount::MountArgs {
+                name,
+                dir,
+                foreground: *foreground,
+                record_every: *record_every,
+            },
+        ),
         _ => {
             let mut ctx = open(&cli)?;
             refuse_bare(&ctx, runs_in_a_bare_repository(&cli.cmd))?;
@@ -1980,6 +1997,7 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
                 println!("Project directory already attached to workspace {}", bold(name));
                 return Ok(ExitCode::SUCCESS);
             }
+            mount::refuse_if_mounted(&ctx.root, name, "switch to")?;
             let from = ctx.ws.clone();
             ctx.attach(name)?;
             // An operation of its own, so `vl undo` right after it does not
@@ -1992,7 +2010,11 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
             if *name == ctx.ws {
                 bail!("workspace '{name}' is attached to the project directory; switch away first");
             }
+            let had_mount = mount::check_removable(&ctx.root, name, *force)?;
             let had_sandbox = sandbox::remove_workspace(ctx, name, *force)?;
+            if had_mount {
+                mount::remove_state(&ctx.root, name);
+            }
             println!("Removed workspace {name}{}", if had_sandbox { " and its sandbox" } else { "" });
         }
         WsCmd::Cat { name, path } => {
@@ -2054,6 +2076,8 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
             }
             println!("Recorded {} in {}", safe(path), one_line(&ctx.repo, &out.snapshot));
         }
+        WsCmd::Mount { .. } => unreachable!("handled before the context opens"),
+        WsCmd::Unmount { name } => mount::cmd_unmount(ctx, name)?,
         WsCmd::Exec {
             name,
             ephemeral,

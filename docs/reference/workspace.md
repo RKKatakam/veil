@@ -16,6 +16,8 @@ Subcommands:
 * [`vl workspace exec`](#vl-workspace-exec): Run a command in a workspace's sandbox and record the result
 * [`vl workspace cat`](#vl-workspace-cat): Print a file from a workspace
 * [`vl workspace write`](#vl-workspace-write): Write stdin to a file in a workspace (in memory, no checkout)
+* [`vl workspace mount`](#vl-workspace-mount): Mount a workspace as a directory (FUSE), without checking it out
+* [`vl workspace unmount`](#vl-workspace-unmount): Record a mounted workspace and unmount it (also recovers a mount whose process died)
 
 ## `vl workspace list`
 
@@ -141,6 +143,44 @@ Arguments:
 |---|---|
 | `<NAME>` | Workspace name (required) |
 | `<PATH>` | File to write (required) |
+
+## `vl workspace mount`
+
+Mount a workspace as a directory (FUSE), without checking it out.
+
+Reads come from the workspace's tree, as this identity may see it (cloaked files it cannot read are absent or show their public version, as in a checkout). Writes go to an overlay kept in .veil/local/mounts/NAME and are recorded into the workspace, through the policy and the secret scanner: by `vl ws unmount`, before every other vl command, every --record-every seconds, and when the directory is unmounted from outside. Isolated, ignored and quarantined files stay in the mount and are never recorded. Without --foreground a background process serves the mount. Needs FUSE (/dev/fuse and fusermount3 on Linux; macFUSE and a `--features macfuse` build on macOS).
+
+```text
+vl workspace mount [OPTIONS] <NAME> <DIR>
+```
+
+Arguments:
+
+| | |
+|---|---|
+| `<NAME>` | Workspace name (required) |
+| `<DIR>` | Directory to mount it at: empty, outside the project directory (created if missing) (required) |
+
+Options:
+
+| | |
+|---|---|
+| `--foreground` | Serve the mount from this process until it is unmounted (Ctrl-C unmounts) |
+| `--record-every <SECS>` | Also record the mount every SECS seconds while it has changes (0: never on a timer) (default: `60`) |
+
+## `vl workspace unmount`
+
+Record a mounted workspace and unmount it (also recovers a mount whose process died)
+
+```text
+vl workspace unmount [OPTIONS] <NAME>
+```
+
+Arguments:
+
+| | |
+|---|---|
+| `<NAME>` | Workspace name (required) |
 
 ---
 

@@ -13,6 +13,14 @@ fn git(args: &[&str]) -> Option<String> {
 }
 
 fn main() {
+    // `vl_fuse`: this build can mount workspaces (`vl ws mount`): the
+    // `fuse` feature on Linux, `macfuse` on macOS.
+    println!("cargo:rustc-check-cfg=cfg(vl_fuse)");
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let feature = |f: &str| std::env::var_os(format!("CARGO_FEATURE_{f}")).is_some();
+    if (os == "linux" && feature("FUSE")) || (os == "macos" && feature("MACFUSE")) {
+        println!("cargo:rustc-cfg=vl_fuse");
+    }
     println!("cargo:rerun-if-env-changed=VL_GIT_COMMIT");
     let commit = std::env::var("VL_GIT_COMMIT")
         .ok()
