@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+use crate::{attr_cmd, colocate_cmd, history, hooks, patch_cmd, rewrite_cmd, submodule_cmd};
+
 /// `vl -V`: version, the commit it was built from and the repository format
 /// it reads and writes.
 pub const VERSION: &str = concat!(
@@ -52,6 +54,8 @@ pub enum Cmd {
     Init {
         /// Directory to create the repository in (created if missing).
         path: Option<PathBuf>,
+        #[command(flatten)]
+        colocate: colocate_cmd::InitColocateArgs,
     },
     /// Copy a repository (and every tag you can see) into a new directory.
     ///
@@ -78,6 +82,8 @@ pub enum Cmd {
         #[arg(short = 'n', long)]
         limit: Option<usize>,
         #[command(flatten)]
+        filter: history::LogFilterArgs,
+        #[command(flatten)]
         out: JsonOut,
     },
     /// Show a snapshot's metadata and diff.
@@ -88,6 +94,8 @@ pub enum Cmd {
         /// Only list changed paths.
         #[arg(long)]
         stat: bool,
+        #[command(flatten)]
+        renames: history::RenameArgs,
         #[command(flatten)]
         out: JsonOut,
     },
@@ -106,6 +114,8 @@ pub enum Cmd {
         /// Only list changed paths.
         #[arg(long)]
         stat: bool,
+        #[command(flatten)]
+        renames: history::RenameArgs,
         #[command(flatten)]
         out: JsonOut,
     },
@@ -182,6 +192,17 @@ pub enum Cmd {
         #[arg(short, long, default_value = "@")]
         rev: String,
     },
+    /// Show which change last touched each line of a file (not implemented
+    /// yet).
+    #[command(visible_alias = "annotate")]
+    Blame(history::BlameArgs),
+    /// Search the files of a snapshot (never the working copy's local-only
+    /// files) for a pattern (not implemented yet).
+    Grep(history::GrepArgs),
+    /// Find the change that introduced a problem by binary search (not
+    /// implemented yet).
+    #[command(subcommand)]
+    Bisect(history::BisectCmd),
 
     // ---- shaping history --------------------------------------------------
     /// Set the description of a change.
@@ -192,6 +213,8 @@ pub enum Cmd {
         /// The new description.
         #[arg(short, long)]
         message: String,
+        #[command(flatten)]
+        hooks: hooks::NoVerifyArgs,
     },
     /// Start a new change on top of REVS (default: @). Several = merge.
     New {
@@ -214,6 +237,8 @@ pub enum Cmd {
         /// Move no tag, not even those at the parent.
         #[arg(long)]
         no_advance: bool,
+        #[command(flatten)]
+        hooks: hooks::NoVerifyArgs,
     },
     /// Make REV the working-copy change.
     Edit {
@@ -333,6 +358,11 @@ pub enum Cmd {
         #[arg(long)]
         from: Option<String>,
     },
+    /// Copy changes onto new parents, as new changes (not implemented yet).
+    Duplicate(rewrite_cmd::DuplicateArgs),
+    /// Copy changes onto the working copy's parent: `vl duplicate REV… -d
+    /// @-`, then the working copy moves on top (not implemented yet).
+    CherryPick(rewrite_cmd::CherryPickArgs),
     /// Merge REVS into the current line of work.
     Merge {
         /// Snapshots to merge in.
@@ -411,6 +441,12 @@ pub enum Cmd {
         #[command(flatten)]
         out: JsonOut,
     },
+    /// Per-path attributes from `.gitattributes`: line endings, binary
+    /// files, diff and merge drivers (not implemented yet).
+    Attr(attr_cmd::AttrArgs),
+    /// Re-record files whose line endings `.gitattributes` now says to
+    /// convert (not implemented yet).
+    Renormalize(attr_cmd::RenormalizeArgs),
 
     // ---- secrets & identities ---------------------------------------------
     /// Encrypted secrets: the device-local vault, or a scope's team vault
@@ -543,6 +579,8 @@ pub enum Cmd {
         /// a `veil.error/1` document.
         #[arg(long, requires = "dry_run")]
         json: bool,
+        #[command(flatten)]
+        hooks: hooks::NoVerifyArgs,
     },
     /// Fetch tags and history from a remote.
     Pull {
@@ -562,6 +600,20 @@ pub enum Cmd {
     /// unreleased embargo. Tags map to branches.
     #[command(subcommand)]
     Git(GitCmd),
+    /// Export snapshots as patch emails in Git's format, public view by
+    /// default (not implemented yet).
+    FormatPatch(patch_cmd::FormatPatchArgs),
+    /// Apply patch emails as new changes on top of a snapshot (not
+    /// implemented yet).
+    Am(patch_cmd::AmArgs),
+    /// Hooks run before commits and pushes; repository-suggested ones only
+    /// once this device trusts them (not implemented yet).
+    #[command(subcommand)]
+    Hooks(hooks::HooksCmd),
+    /// Git submodules: pinned commits of other Git repositories (not
+    /// implemented yet).
+    #[command(subcommand)]
+    Submodule(submodule_cmd::SubmoduleCmd),
 
     // ---- maintenance ------------------------------------------------------
     /// Pack objects and delete those no retained operation can reach.
@@ -661,7 +713,11 @@ impl Cmd {
             | Cmd::Ls { out, .. }
             | Cmd::Resolve { out, .. }
             | Cmd::Split { out, .. }
-            | Cmd::Squash { out, .. } => out,
+            | Cmd::Squash { out, .. }
+            | Cmd::Blame(history::BlameArgs { out, .. })
+            | Cmd::Grep(history::GrepArgs { out, .. })
+            | Cmd::Duplicate(rewrite_cmd::DuplicateArgs { out, .. })
+            | Cmd::CherryPick(rewrite_cmd::CherryPickArgs { out, .. }) => out,
             Cmd::Push { json, .. } => return *json,
             _ => return false,
         };
@@ -689,9 +745,25 @@ pub enum TagCmd {
         /// Allow moving the tag to a snapshot that is not a descendant.
         #[arg(long)]
         allow_backwards: bool,
+        /// Make an annotated release tag: immutable, signed when you have
+        /// an identity, exported to Git as `refs/tags/NAME` (not implemented
+        /// yet).
+        #[arg(short, long)]
+        annotate: bool,
+        /// The annotated tag's message (implies `-a`; not implemented yet).
+        #[arg(short, long)]
+        message: Option<String>,
+        /// Replace an existing annotated tag (not implemented yet).
+        #[arg(long)]
+        force: bool,
     },
     /// Delete a tag.
     Delete {
+        /// Tag name.
+        name: String,
+    },
+    /// Verify an annotated tag's signature (not implemented yet).
+    Verify {
         /// Tag name.
         name: String,
     },
@@ -727,6 +799,10 @@ pub enum PolicyCmd {
     /// arrived by merge, pull or checkout and weaken the protection of
     /// local files (until now held back on this device).
     Accept,
+    /// Add an `ignore` rule for each `.gitignore` pattern that matches a
+    /// file here, so files Git ignores are not recorded (not implemented
+    /// yet).
+    ImportGitignore(colocate_cmd::ImportGitignoreArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -1050,12 +1126,26 @@ pub enum GitCmd {
         /// Git remote.
         #[arg(default_value = "origin")]
         remote: String,
+        /// Do not fetch the remote's Git tags (not implemented yet).
+        #[arg(long)]
+        no_tags: bool,
+        /// Forget remote Git tags that the remote deleted (not implemented
+        /// yet).
+        #[arg(long, conflicts_with = "no_tags")]
+        prune_tags: bool,
     },
     /// Fetch, then create or fast-forward local tags from the branches.
     Pull {
         /// Git remote.
         #[arg(default_value = "origin")]
         remote: String,
+        /// Do not fetch the remote's Git tags (not implemented yet).
+        #[arg(long)]
+        no_tags: bool,
+        /// Forget remote Git tags that the remote deleted (not implemented
+        /// yet).
+        #[arg(long, conflicts_with = "no_tags")]
+        prune_tags: bool,
     },
     /// Export tags (all by default) as branches and push them.
     Push {
@@ -1075,6 +1165,16 @@ pub enum GitCmd {
         /// pushed.
         #[arg(short, long, value_name = "BRANCH")]
         delete: Vec<String>,
+        /// Replace Git tags that exist on the remote with another target
+        /// (not implemented yet).
+        #[arg(long)]
+        force_tags: bool,
+        /// Delete this Git tag (`refs/tags/TAG`) on the remote (repeatable;
+        /// not implemented yet).
+        #[arg(long, value_name = "TAG")]
+        delete_tag: Vec<String>,
+        #[command(flatten)]
+        hooks: hooks::NoVerifyArgs,
     },
     /// Export tags into the local bridge repository without pushing, and
     /// print the commit of each.
@@ -1083,6 +1183,15 @@ pub enum GitCmd {
         #[arg(short, long)]
         tag: Vec<String>,
     },
+    /// Keep a real `.git` beside this working copy, in step with Veil
+    /// (experimental; not implemented yet).
+    Colocate(colocate_cmd::ColocateArgs),
+    /// Stop mirroring into `.git`, leaving it a plain Git repository (not
+    /// implemented yet).
+    Uncolocate(colocate_cmd::UncolocateArgs),
+    /// The `pre-push` guard of colocated mode: refuse a direct `git push`
+    /// of commits holding private content (not implemented yet).
+    CheckPush(colocate_cmd::CheckPushArgs),
 }
 
 #[derive(Subcommand, Debug)]

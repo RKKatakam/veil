@@ -15,6 +15,12 @@ Arguments:
 |---|---|
 | `<PATH>` | Directory to create the repository in (created if missing) |
 
+Options:
+
+| | |
+|---|---|
+| `--colocate` | Create (or adopt) a real `.git` beside the working copy, kept in step with Veil (not implemented yet) |
+
 ---
 
 [All commands](README.md) · [User guide](../guide/README.md)

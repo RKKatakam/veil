@@ -10,6 +10,7 @@ Subcommands:
 * [`vl tag list`](#vl-tag-list): List tags
 * [`vl tag set`](#vl-tag-set): Create or move a tag
 * [`vl tag delete`](#vl-tag-delete): Delete a tag
+* [`vl tag verify`](#vl-tag-verify): Verify an annotated tag's signature (not implemented yet)
 
 ## `vl tag list`
 
@@ -46,6 +47,9 @@ Options:
 | `-r, --rev <REV>` | Snapshot the tag points at (default: `@`) |
 | `--cloak [<SCOPE>]` | Cloak the tag (default scope: team): never pushed to public remotes |
 | `--allow-backwards` | Allow moving the tag to a snapshot that is not a descendant |
+| `-a, --annotate` | Make an annotated release tag: immutable, signed when you have an identity, exported to Git as `refs/tags/NAME` (not implemented yet) |
+| `-m, --message <MESSAGE>` | The annotated tag's message (implies `-a`; not implemented yet) |
+| `--force` | Replace an existing annotated tag (not implemented yet) |
 
 ## `vl tag delete`
 
@@ -53,6 +57,20 @@ Delete a tag
 
 ```text
 vl tag delete [OPTIONS] <NAME>
+```
+
+Arguments:
+
+| | |
+|---|---|
+| `<NAME>` | Tag name (required) |
+
+## `vl tag verify`
+
+Verify an annotated tag's signature (not implemented yet)
+
+```text
+vl tag verify [OPTIONS] <NAME>
 ```
 
 Arguments:

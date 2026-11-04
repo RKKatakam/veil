@@ -17,6 +17,7 @@ Options:
 |---|---|
 | `-m, --message <MESSAGE>` | Description of the change being committed (required) |
 | `--no-advance` | Move no tag, not even those at the parent |
+| `--no-verify` | Do not run hooks for this command (not implemented yet) |
 
 ---
 

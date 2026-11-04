@@ -62,8 +62,10 @@
 //! the user's credential helpers, SSH configuration and agent, proxies and
 //! `insteadOf` rules all apply unchanged.
 
+pub mod colocate;
 mod export;
 mod import;
+mod index;
 pub mod map;
 mod project;
 mod transport;

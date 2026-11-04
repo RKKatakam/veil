@@ -264,7 +264,7 @@ pub fn reference_pages() -> BTreeMap<String, String> {
     }
     let _ = writeln!(
         index,
-        "\nThe read commands (`status`, `log`, `diff`, `show`, `workspace list`, `tag list`, `op log`,\n`scan`, `secret list`, `ls`, `resolve --list`) take `--json`, and so do `split` and `squash`:\ntheir schemas are in [JSON output](json.md)."
+        "\nThe read commands (`status`, `log`, `diff`, `show`, `workspace list`, `tag list`, `op log`,\n`scan`, `secret list`, `ls`, `resolve --list`, `blame`, `grep`) take `--json`, and so do `split`,\n`squash`, `duplicate` and `cherry-pick`: their schemas are in [JSON output](json.md)."
     );
     pages.insert("README.md".to_string(), index);
 

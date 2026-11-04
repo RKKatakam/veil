@@ -15,6 +15,7 @@ Options:
 |---|---|
 | `-r, --rev <REV>` | Change to describe (default: `@`) |
 | `-m, --message <MESSAGE>` | The new description (required) |
+| `--no-verify` | Do not run hooks for this command (not implemented yet) |
 
 ---
 

@@ -37,6 +37,9 @@ Global options (accepted by every command):
 | [`vl fsck`](fsck.md) | Verify repository integrity: object hashes, reachability, key rings, embargo records and the operation log. Exits 1 on corruption |
 | [`vl upgrade`](upgrade.md) | Upgrade the repository (or a remote) to the newest format |
 | [`vl evolog`](evolog.md) | Show how a change evolved (amends, rewrites, rebases) |
+| [`vl blame`](blame.md) | Show which change last touched each line of a file (not implemented yet) |
+| [`vl grep`](grep.md) | Search the files of a snapshot (never the working copy's local-only files) for a pattern (not implemented yet) |
+| [`vl bisect`](bisect.md) | Find the change that introduced a problem by binary search (not implemented yet) |
 | [`vl describe`](describe.md) | Set the description of a change |
 | [`vl new`](new.md) | Start a new change on top of REVS (default: @). Several = merge |
 | [`vl commit`](commit.md) | Describe the working-copy change and start a new one on top |
@@ -47,6 +50,8 @@ Global options (accepted by every command):
 | [`vl split`](split.md) | Split a change in two: what you choose, then the rest |
 | [`vl squash`](squash.md) | Move a change, or part of it, into its parent or another change |
 | [`vl restore`](restore.md) | Restore paths in the working copy from another snapshot |
+| [`vl duplicate`](duplicate.md) | Copy changes onto new parents, as new changes (not implemented yet) |
+| [`vl cherry-pick`](cherry-pick.md) | Copy changes onto the working copy's parent: `vl duplicate REV… -d @-`, then the working copy moves on top (not implemented yet) |
 | [`vl merge`](merge.md) | Merge REVS into the current line of work |
 | [`vl embargo`](embargo.md) | Manage embargoes created by delayed-visibility merges |
 | [`vl tag`](tag.md) | Manage tags (named pointers into the snapshot graph) |
@@ -56,6 +61,8 @@ Global options (accepted by every command):
 | [`vl ignore`](ignore.md) | Do not track matching paths at all |
 | [`vl policy`](policy.md) | Inspect the visibility policy |
 | [`vl scan`](scan.md) | Scan the working copy for secrets that would become public |
+| [`vl attr`](attr.md) | Per-path attributes from `.gitattributes`: line endings, binary files, diff and merge drivers (not implemented yet) |
+| [`vl renormalize`](renormalize.md) | Re-record files whose line endings `.gitattributes` now says to convert (not implemented yet) |
 | [`vl secret`](secret.md) | Encrypted secrets: the device-local vault, or a scope's team vault (`--scope`), shared with the scope's members through team remotes |
 | [`vl run`](run.md) | Run a command with vault secrets injected as environment variables |
 | [`vl identity`](identity.md) | Your public-key identity |
@@ -70,11 +77,15 @@ Global options (accepted by every command):
 | [`vl push`](push.md) | Send tags and their history to a remote (visibility-filtered) |
 | [`vl pull`](pull.md) | Fetch tags and history from a remote |
 | [`vl git`](git.md) | Two-way Git interop: import Git history, push and fetch Git remotes |
+| [`vl format-patch`](format-patch.md) | Export snapshots as patch emails in Git's format, public view by default (not implemented yet) |
+| [`vl am`](am.md) | Apply patch emails as new changes on top of a snapshot (not implemented yet) |
+| [`vl hooks`](hooks.md) | Hooks run before commits and pushes; repository-suggested ones only once this device trusts them (not implemented yet) |
+| [`vl submodule`](submodule.md) | Git submodules: pinned commits of other Git repositories (not implemented yet) |
 | [`vl gc`](gc.md) | Pack objects and delete those no retained operation can reach |
 | [`vl doctor`](doctor.md) | Check this machine's setup and explain every problem found: identity, VEIL_HOME, the repository and its lock, the stat cache, the filesystem (case sensitivity, fsync, network mounts), the clock, the vault and leftover sandboxes. Exits 1 if anything is broken |
 | [`vl completions`](completions.md) | Print a shell completion script, e.g. `vl completions zsh > ~/.zfunc/_vl` |
 | [`vl man`](man.md) | Print the man page (`vl man \| man -l -`), or write one page per command into DIR |
 
 The read commands (`status`, `log`, `diff`, `show`, `workspace list`, `tag list`, `op log`,
-`scan`, `secret list`, `ls`, `resolve --list`) take `--json`, and so do `split` and `squash`:
-their schemas are in [JSON output](json.md).
+`scan`, `secret list`, `ls`, `resolve --list`, `blame`, `grep`) take `--json`, and so do `split`,
+`squash`, `duplicate` and `cherry-pick`: their schemas are in [JSON output](json.md).
