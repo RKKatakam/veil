@@ -2355,6 +2355,7 @@ name = "vl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "chrono",
  "clap",
  "clap_complete",
@@ -2367,6 +2368,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "toml_edit",
  "veil-core",
 ]
 

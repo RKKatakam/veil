@@ -34,7 +34,7 @@ fixed**. Severity: high / medium / low.
   and merge drivers, binary handling (`.gitattributes` equivalents).
 - **Symlinks** are ignored; non-UTF-8 names are not recorded; submodules are
   not supported.
-- **Hooks** (pre-commit / pre-push) and signed tags and releases.
+- **Signed tags and releases.**
 - **Git bridge gaps:** tags are not synced; author time zones become UTC.
 - **Windows** support.
 - **Maturity:** days of history versus Git's two decades; unaudited; no

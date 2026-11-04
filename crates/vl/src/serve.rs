@@ -1108,6 +1108,9 @@ struct DescribeParams {
     rev: Option<String>,
     message: String,
     snapshot: Option<bool>,
+    /// Skip the `pre-commit` and `commit-msg` hooks (a describe of `@`).
+    #[serde(default)]
+    no_verify: bool,
 }
 
 #[derive(Deserialize)]
@@ -1127,6 +1130,9 @@ struct CommitParams {
     #[serde(default)]
     no_advance: bool,
     snapshot: Option<bool>,
+    /// Skip the `pre-commit` and `commit-msg` hooks.
+    #[serde(default)]
+    no_verify: bool,
 }
 
 /// `split`: what goes in the first change, as a `--plan` lists it.
@@ -1160,9 +1166,9 @@ struct WatchParams {
 /// A write method: what it does to the repository.
 enum WriteOp {
     Snapshot,
-    Describe { rev: String, message: String },
+    Describe { rev: String, message: String, no_verify: bool },
     New { revs: Vec<String>, message: String },
-    Commit { message: String, advance: bool },
+    Commit { message: String, advance: bool, no_verify: bool },
     Split { rev: String, message: Option<String>, files: Vec<api::shape::PlanFile> },
     Squash { rev: String, into: Option<String>, files: Option<Vec<api::shape::PlanFile>> },
 }
@@ -1263,7 +1269,10 @@ impl Server {
             }
             "describe" => {
                 let p: DescribeParams = params(p)?;
-                self.write(WriteOp::Describe { rev: p.rev.unwrap_or_else(|| "@".into()), message: p.message }, self.snap(p.snapshot))
+                self.write(
+                    WriteOp::Describe { rev: p.rev.unwrap_or_else(|| "@".into()), message: p.message, no_verify: p.no_verify },
+                    self.snap(p.snapshot),
+                )
             }
             "new" => {
                 let p: NewParams = params(p)?;
@@ -1271,7 +1280,7 @@ impl Server {
             }
             "commit" => {
                 let p: CommitParams = params(p)?;
-                self.write(WriteOp::Commit { message: p.message, advance: !p.no_advance }, self.snap(p.snapshot))
+                self.write(WriteOp::Commit { message: p.message, advance: !p.no_advance, no_verify: p.no_verify }, self.snap(p.snapshot))
             }
             "split" => {
                 let p: SplitParams = params(p)?;
@@ -1376,9 +1385,22 @@ impl Server {
         let mut ctx = self.open(snapshot, false)?;
         let doc = match w {
             WriteOp::Snapshot => json(&api::recorded(&ctx)?),
-            WriteOp::Describe { rev, message } => json(&api::describe(&mut ctx, &rev, &message)?),
+            // The same hooks as the commands; their output goes to this
+            // server's stderr, never into the reply.
+            WriteOp::Describe { rev, message, no_verify } => {
+                let verify = crate::hooks::NoVerifyArgs { no_verify };
+                let message = match ctx.rev(&rev)? == ctx.wc()? {
+                    true => crate::hooks::before_commit(&mut ctx, &verify, &message, snapshot, "describe")?,
+                    false => message,
+                };
+                json(&api::describe(&mut ctx, &rev, &message)?)
+            }
             WriteOp::New { revs, message } => json(&api::new_change(&mut ctx, &revs, &message)?),
-            WriteOp::Commit { message, advance } => json(&api::commit(&mut ctx, &message, advance)?),
+            WriteOp::Commit { message, advance, no_verify } => {
+                let verify = crate::hooks::NoVerifyArgs { no_verify };
+                let message = crate::hooks::before_commit(&mut ctx, &verify, &message, snapshot, "commit")?;
+                json(&api::commit(&mut ctx, &message, advance)?)
+            }
             // No picker: what to take is always given.
             WriteOp::Split { rev, message, files } => {
                 let choice = plan_choice(files)?;

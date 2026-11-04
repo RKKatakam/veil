@@ -3124,6 +3124,89 @@ the next snapshot.
 **Not served** (future work): `vl ws exec` and `vl run` (they run
 programs), push/pull, and filesystem-event based notifications.
 
+## 15. Hooks (`crates/vl/src/hooks.rs`)
+
+Commands `vl` runs at fixed points (feature 5a of the Git-parity round;
+user guide: `docs/guide/hooks.md`). They are a CLI concern: the engine never
+starts a process, and `veil-core` has no hook API.
+
+| point | call site | input | a failure |
+|---|---|---|---|
+| `pre-commit` | `cmd_commit`, `cmd_describe` of `@`, `serve` `commit` / `describe` | env `VEIL_SNAPSHOT`, `VEIL_WORKSPACE` | refuses |
+| `commit-msg` | after `pre-commit` | `$1`: the message, `0600` in `.veil/local/tmp/` | refuses; an edit is used |
+| `pre-push` | `cmd_push`, the `vl git push` arm | argv remote, `redact_url(url)`, `public`/`team`/`git`; stdin one line per tag | refuses |
+| `post-checkout` | `run()`, after `ctx.finish()`, for `new`, `edit`, `ws switch` | old and new snapshot ids | warning |
+
+**Sources.** Device-local hooks (`$VEIL_HOME/hooks/<name>`, then
+`.veil/hooks/<name>`) run as they are, like `.git/hooks`. Nothing from a
+tree can create them: `.veil` is never a tree entry (BUG-002). Repository
+hooks come from the tracked TOML file `.veilhooks` (`[pre-commit] run =
+[argv…]`, `files = […]`, or `[[pre-push]]` arrays). The parser is strict
+(unknown hooks or keys, non-array `run`, paths that are not canonical and
+relative or that point into `.veil`/`.git`, over 64 KiB, over 16 commands
+per hook or 64 arguments are errors), and a file that does not parse runs
+nothing and warns.
+
+**Trust.** `vl hooks trust` records in `.veil/local/hooks-trust.json`
+(`{version: 1, veilhooks: <blake3>, trusted: [{hook, command, digests,
+indirect}]}`, `0600`, written by rename) the BLAKE3 of `.veilhooks` and the
+state of every repository path a command names: each argv element that is
+a canonical relative path (whether or not a file is there: `absent` and
+`directory` are states too), its `files`, and, for a known build tool
+(`make`, `npm`, `cargo`, `pytest`, `python -m`, … in `INDIRECT`), the tool's
+own files (`Makefile`, `package.json`, …). Build tools need
+`--i-understand-indirect`. A repository hook runs only when the whole
+record matches: any change to any pinned path untrusts every command of the
+file (all or nothing, so a security check is never silently dropped while
+the rest still runs), and each command that would have run it warns,
+naming the paths and the change that last touched them (a bounded
+first-parent walk). The record is device-local: never synced, never in a
+tree, and written only by `vl hooks trust`, on a terminal or with `--yes`,
+never from inside a hook (`VEIL_HOOK` set) and with no `vl serve` method.
+It is re-checked against the files after the confirmation, so what is
+trusted is what was shown.
+
+**Execution.** `std::process::Command`, no shell. A pinned file the command
+runs or is given is read once (`O_NOFOLLOW`, a regular file, at most 64
+MiB), hashed, compared with its trusted digest, and written to
+`.veil/local/hooks-run/<digest prefix>-<unique>` (`0700`, directory `0700`);
+the argv gets that copy, which is removed afterwards. A script swapped
+between the check and `exec` cannot run (copy-then-exec). Programs named
+bare are resolved on a cleaned `PATH` (absolute entries outside the
+project only) and must resolve outside the project; an absolute argument
+inside the project is refused. The environment is cleared and rebuilt from
+`ALLOWED_ENV` (`HOME`, `USER`, `LOGNAME`, `LANG`, `TERM`, `TMPDIR`, `TZ`,
+`VEIL_HOME`) plus `LC_*`, the cleaned `PATH`, and `VEIL_HOOK`,
+`VEIL_SNAPSHOT`, `VEIL_WORKSPACE`: no vault values (`vl run` is the
+explicit route), no inherited `VEIL_*`/`GIT_*`. stdout and stderr both go to
+`vl`'s stderr (never into `--json` or a `vl serve` reply); stdin is
+`/dev/null` except for `pre-push`. The hook gets its own process group:
+`VEIL_HOOK_TIMEOUT` (1 s to 7 days, default 600 s, anything else an error
+before anything runs) kills the group; the group is also killed once the
+hook exits; SIGINT/SIGTERM/SIGHUP/SIGQUIT received meanwhile are forwarded
+to the group and re-raised under `vl`'s own disposition once the hook is
+gone. `ETXTBSY` on a fresh copy is retried.
+
+**No lock, re-checked.** No repository lock is held while hooks run (each
+`Repo` method takes it for its own transaction), so a hook may run `vl`.
+After `pre-commit`/`commit-msg`, `before_commit` reloads the view and, when
+the command snapshots, records the directory again; if the operation log
+moved (a file the hook edited, a `vl describe` it ran), the commit is
+refused: the edits are in `@`, nothing is lost. `before_push` compares the
+tags instead. `vl` started inside a hook runs no hooks (no recursion).
+
+**Input never carries sealed content.** No hook input carries file content.
+`pre-push` lines come from the push's own plan (`push_plan::plan_push`) or,
+for Git, from the export the push then sends: only tags created, updated or
+rejected; never a cloaked tag on a public remote, never a snapshot in
+`withheld_snapshots`; for Git, the snapshot is `-` when the exported commit
+is a projection. A trusted hook runs as the user in the project directory
+and can read what the user can: that is the documented trust boundary.
+
+**Where hooks do not run.** `ws exec` sandboxes and FUSE mounts record
+through the engine, not through `cmd_commit`, and `vl` inside a sandbox
+finds no repository (`find_root`). `push --dry-run` runs nothing.
+
 ## Threat model
 
 **Protected against:**
@@ -3176,6 +3259,10 @@ programs), push/pull, and filesystem-event based notifications.
   New content is never sealed under a released embargo's (public) key, a
   key generation (`team#<old>`, which a revoked member holds), `local`, or
   a scope the label merely names (§4, rule 5).
+* **code execution from a teammate's content** (§15). Nothing that arrives
+  by pull, merge, patch or Git import runs: repository hooks run only from
+  bytes this device pinned by digest (copy-then-exec), with a scrubbed
+  environment and a timeout; `.veil/hooks` cannot be written from a tree.
 
 **Not protected against (yet), and documented honestly:**
 
@@ -3201,6 +3288,9 @@ programs), push/pull, and filesystem-event based notifications.
   reject both. Out-of-band pinning of the ring head is future work.
 * *Concurrent admin edits are not merged automatically.* Diverged logs keep
   the local ring and warn, and an admin re-applies the missing changes.
+* *A trusted hook is code running as you.* It can read what you can in the
+  project (and run `vl cat`). Trusting a build tool (`make`, `npm`) trusts
+  what its pinned files pull in further, which is not pinned (§15).
 * *Snapshot signatures are advisory.* Unsigned and unknown-key snapshots are
   shown but not rejected, and there is no "require signed" policy yet.
   `author` is a free-form claim; only the signer is authenticated.

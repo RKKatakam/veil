@@ -58,9 +58,9 @@ documents described [below](#write-results).
 | `scan` | `vl scan` | `policy_from` (a file inside the repository) | [`veil.scan/1`](json.md#veilscan1) |
 | `secret.list` | `vl secret list` | `scope` (a team vault instead of the local vault), `exposed_to` (with `scope`: only what that member could read) | [`veil.secret.list/1`](json.md#veilsecretlist1) |
 | `snapshot` | (any command's automatic snapshot) | none | [`veil.snapshot/1`](#veilsnapshot1) |
-| `describe` | `vl describe` | `message` (required), `rev` (default `@`) | [`veil.describe/1`](#veildescribe1) |
+| `describe` | `vl describe` | `message` (required), `rev` (default `@`), `no_verify` (bool) | [`veil.describe/1`](#veildescribe1) |
 | `new` | `vl new` | `revs` (list, default `[@]`), `message` | [`veil.new/1`](#veilnew1) |
-| `commit` | `vl commit` | `message` (required), `no_advance` (bool) | [`veil.commit/1`](#veilcommit1) |
+| `commit` | `vl commit` | `message` (required), `no_advance` (bool), `no_verify` (bool) | [`veil.commit/1`](#veilcommit1) |
 | `split` | `vl split` | `files` (required: a [plan](json.md#veilsplit1)'s `files`), `rev` (default `@`), `message` | [`veil.split/1`](json.md#veilsplit1) |
 | `squash` | `vl squash` | `rev` (default `@`), `into` (a revision), `files` (as for `split`; leave it out to move the whole change) | [`veil.squash/1`](json.md#veilsquash1) |
 | `watch` | | `interval_ms` (50–60000, default 500), `working_copy` (bool) | [`veil.watch/1`](#veilwatch1), then [`changed`](#notifications) notifications |
@@ -95,6 +95,12 @@ repository lock exactly as the command does (for each transaction, never
 between requests), and record the same operations, so `vl undo` and
 `vl op restore` take them back. `operation` in each result is the head of
 the operation log afterwards.
+
+`commit`, and `describe` of `@`, run the same `pre-commit` and `commit-msg`
+hooks as the commands (see [the hooks guide](../guide/hooks.md)), unless
+`no_verify` is `true`. A hook's output goes to the server's stderr, never
+into the reply; a failing hook is an error reply, and nothing is
+committed. There is no method to trust repository hooks.
 
 #### `veil.snapshot/1`
 
