@@ -264,6 +264,14 @@ pub enum Cmd {
         remote: String,
     },
 
+    /// Two-way Git interop: import Git history, push and fetch Git remotes.
+    ///
+    /// Git sees exactly what a public Veil remote sees: no cloaked or
+    /// isolated files, no cloaked descriptions, and the pre-merge tree of an
+    /// unreleased embargo. Tags map to branches.
+    #[command(subcommand)]
+    Git(GitCmd),
+
     // ---- maintenance ------------------------------------------------------
     /// Pack objects and delete those no retained operation can reach.
     ///
@@ -476,5 +484,58 @@ pub enum RemoteCmd {
     /// List remotes.
     List,
     /// Remove a remote.
+    Rm { name: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GitCmd {
+    /// Import a Git repository's history (path or URL): adds it as a Git
+    /// remote and creates a tag for every branch.
+    Import {
+        source: String,
+        /// Name of the Git remote to create.
+        #[arg(long, default_value = "origin")]
+        remote: String,
+    },
+    /// Manage Git remotes.
+    #[command(subcommand)]
+    Remote(GitRemoteCmd),
+    /// Fetch a Git remote's branches as `<remote>/<branch>` (local tags stay).
+    Fetch {
+        #[arg(default_value = "origin")]
+        remote: String,
+    },
+    /// Fetch, then create or fast-forward local tags from the branches.
+    Pull {
+        #[arg(default_value = "origin")]
+        remote: String,
+    },
+    /// Export tags (all by default) as branches and push them.
+    Push {
+        #[arg(default_value = "origin")]
+        remote: String,
+        /// Only push these tags.
+        #[arg(short, long)]
+        tag: Vec<String>,
+        /// Overwrite branches that moved on the Git side (only if they still
+        /// hold what was last fetched).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Export tags into the local bridge repository without pushing, and
+    /// print the commit of each.
+    Export {
+        #[arg(short, long)]
+        tag: Vec<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GitRemoteCmd {
+    /// Add a Git remote (any URL `git` understands, or a path).
+    Add { name: String, url: String },
+    /// List Git remotes.
+    List,
+    /// Remove a Git remote.
     Rm { name: String },
 }

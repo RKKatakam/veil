@@ -21,6 +21,7 @@ clap_mangen = "0.3"
 diffy = "0.4"
 ed25519-dalek = { version = "2", features = ["zeroize"] }
 getrandom = "0.2"
+gix = { version = "0.90", default-features = false, features = ["sha1", "parallel"] }
 globset = "0.4"
 hex = "0.4"
 libc = "0.2"

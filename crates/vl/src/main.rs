@@ -260,6 +260,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Remote(c) => cmd_remote(ctx, c)?,
         Cmd::Push { remote, tag, force } => cmd_push(ctx, remote, tag, *force)?,
         Cmd::Pull { remote } => cmd_pull(ctx, remote)?,
+        Cmd::Git(c) => cmd_git(ctx, c)?,
         Cmd::Gc {
             keep_ops_days,
             grace_minutes,
@@ -1440,6 +1441,149 @@ fn cmd_pull(ctx: &mut Ctx, name: &str) -> Result<()> {
     }
     println!("Pulled {} object(s) from {name}", r.objects_copied);
     Ok(())
+}
+
+// ---- git -----------------------------------------------------------------
+
+fn cmd_git(ctx: &mut Ctx, c: &GitCmd) -> Result<()> {
+    use veil_core::git;
+    let git_dir = git::default_git_dir(&ctx.root);
+    match c {
+        GitCmd::Import { source, remote } => {
+            // A local path is stored absolute, so later fetches work from anywhere.
+            let src = match Path::new(source).canonicalize() {
+                Ok(p) if !source.contains("://") => p.to_string_lossy().into_owned(),
+                _ => source.clone(),
+            };
+            let r = git::import(&mut ctx.repo, &git_dir, &src, remote)?;
+            print_git_fetch(&r, remote);
+            // A working copy that still sits on the root (a fresh `vl init`)
+            // moves on top of the imported default branch, keeping its files.
+            let wc = ctx.wc()?;
+            let s = ctx.repo.snapshot(&wc)?;
+            let on_root = s.parents == [ctx.repo.root_id()] && ctx.repo.description(&s).trim().is_empty();
+            let default = ["main", "master", "trunk"]
+                .into_iter()
+                .find_map(|t| ctx.repo.view().tags.get(t).map(|tag| (t, tag.target)));
+            if let (true, Some((name, target))) = (on_root, default) {
+                let new = ctx.repo.rebase(wc, vec![target])?;
+                println!("Working copy is now a change on {}", cyan(name));
+                let conflicts = &ctx.repo.snapshot(&new)?.conflicts;
+                if !conflicts.is_empty() {
+                    warn_untrusted(&format!("conflicts in: {}", conflicts.join(", ")));
+                }
+            }
+        }
+        GitCmd::Remote(GitRemoteCmd::Add { name, url }) => {
+            git::remote_add(&mut ctx.repo, name, url)?;
+            println!("Added Git remote {name} → {}", safe(url));
+        }
+        GitCmd::Remote(GitRemoteCmd::List) => {
+            for (name, url) in git::remotes(&ctx.repo)? {
+                println!("{}  {}", bold(&safe(&name)), safe(&url));
+            }
+        }
+        GitCmd::Remote(GitRemoteCmd::Rm { name }) => {
+            git::remote_remove(&mut ctx.repo, &git_dir, name)?;
+            println!("Removed Git remote {name}");
+        }
+        GitCmd::Fetch { remote } => {
+            let r = git::fetch(&mut ctx.repo, &git_dir, remote)?;
+            print_git_fetch(&r, remote);
+        }
+        GitCmd::Pull { remote } => {
+            let r = git::pull(&mut ctx.repo, &git_dir, remote)?;
+            print_git_fetch(&r, remote);
+        }
+        GitCmd::Push { remote, tag, force } => {
+            let r = git::push(&mut ctx.repo, &git_dir, remote, tag, *force)?;
+            print_git_export(&r.export);
+            let mut rejected = false;
+            for (branch, status) in &r.outcome.refs {
+                let commit = r
+                    .export
+                    .branches
+                    .iter()
+                    .find(|(b, _)| b == branch)
+                    .map(|(_, c)| c.to_hex_with_len(10).to_string())
+                    .unwrap_or_default();
+                let b = cyan(&safe(branch));
+                match status {
+                    git::RefStatus::Created => println!("  {} {b} → {commit} (new branch)", green("pushed")),
+                    git::RefStatus::FastForward => println!("  {} {b} → {commit}", green("pushed")),
+                    git::RefStatus::Forced => println!("  {} {b} → {commit} (forced)", yellow("pushed")),
+                    git::RefStatus::UpToDate => println!("  {} {b}", dim("up to date")),
+                    git::RefStatus::Rejected(why) => {
+                        rejected = true;
+                        println!("  {} {b} ({})", red("rejected"), safe(why));
+                    }
+                }
+            }
+            if rejected {
+                bail!(
+                    "some branches were rejected: they moved on the Git side. Run `vl git pull {remote}`, merge, and push again (or push --force)"
+                );
+            }
+        }
+        GitCmd::Export { tag } => {
+            let mut bridge = git::GitBridge::open(&ctx.repo, &git_dir)?;
+            let r = bridge.export(&mut ctx.repo, tag)?;
+            print_git_export(&r);
+            for (b, c) in &r.branches {
+                println!("{}  {c}", cyan(&safe(b)));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_git_export(r: &veil_core::git::ExportReport) {
+    for (t, why) in &r.skipped {
+        println!("  {} {} ({})", yellow("skipped"), safe(t), safe(why));
+    }
+    for w in &r.warnings {
+        warn_untrusted(w);
+    }
+    if r.written > 0 {
+        eprintln!(
+            "Exported {} commit(s){}",
+            r.written,
+            if r.published > 0 {
+                format!(", {} publishing released embargoes", r.published)
+            } else {
+                String::new()
+            }
+        );
+    }
+}
+
+fn print_git_fetch(r: &veil_core::git::FetchReport, remote: &str) {
+    for (b, old, new) in &r.forced {
+        warn_untrusted(&format!(
+            "{remote}/{b} was force-pushed on the Git side ({} → {}); the Veil history it dropped is kept",
+            old.to_hex_with_len(10),
+            new.to_hex_with_len(10)
+        ));
+    }
+    for b in &r.deleted {
+        warn_untrusted(&format!("branch {b} was deleted on {remote}; local tag {b}, if any, is kept"));
+    }
+    for (path, why) in &r.import.left_in_git {
+        println!("  {} {} ({why}; it stays in Git)", yellow("not recorded"), safe(path));
+    }
+    for (c, why) in &r.import.failed {
+        println!("  {} {} ({})", red("not imported"), c.to_hex_with_len(10), safe(why));
+    }
+    for (c, paths) in &r.import.conflicts {
+        println!("  {} {} in {}", yellow("conflicts"), c.to_hex_with_len(10), safe(&paths.join(", ")));
+    }
+    for (t, id) in &r.tags_updated {
+        println!("  {} {} → {}", green("updated"), cyan(&safe(t)), id.short());
+    }
+    for w in r.import.warnings.iter().chain(&r.warnings) {
+        warn_untrusted(w);
+    }
+    println!("Imported {} commit(s) from {remote}", r.import.imported);
 }
 
 // ---- integrity -----------------------------------------------------------

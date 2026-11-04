@@ -42,6 +42,8 @@ pub mod embargo;
 pub mod error;
 pub mod fsck;
 pub mod gc;
+#[cfg(feature = "git")]
+pub mod git;
 pub mod id;
 pub mod identity;
 pub mod keychain;

@@ -109,6 +109,9 @@ Workspaces   ws list|new <name> [-r rev] [--cloak [S]]|switch <name>|rm <name>
 Op log       op log [-n N] · op restore <id> · undo · watch [--interval-ms N]
 Sync         remote add <name> <path> [--public]|list|rm · push [remote] [-t tag…] [--force]
              pull [remote]
+Git          git import <path|url> [--remote R] · git remote add <name> <url>|list|rm
+             git fetch [remote] · git pull [remote] · git push [remote] [-t tag…] [--force]
+             git export [-t tag…]
 Maintenance  gc [--keep-ops-days N] [--grace-minutes M | --prune-now] [--level L] [--no-deltas]
 ```
 
@@ -138,6 +141,43 @@ and `cloak`/`isolate` rules ignore case (`.ENV`, `Secrets/`). `public`,
 (`local`, `embargo/…`, `UPPER`), an unknown tier or no tier is treated as
 `isolate`, with a warning.
 
+## Git interop: keep GitHub, CI and code review
+
+```sh
+vl init my-project && cd my-project
+vl git import git@github.com:me/my-project.git   # history, authors and dates; every branch becomes a tag
+                                                 # (`origin` is added as a Git remote)
+vl cloak secrets/                                # Veil-only from here on
+… edit, vl commit -m "…" …
+vl tag set main -r @-
+vl git push                                      # tags → branches; GitHub sees what a public remote would
+vl git pull                                      # commits made on GitHub become snapshots; tags fast-forward
+```
+
+Git sees exactly what a `--public` Veil remote sees: no cloaked or isolated
+files, no cloaked descriptions (a placeholder instead), no cloaked tags, and
+an unreleased embargo's pre-merge tree with the fix's history withheld.
+After `vl embargo release`, the next `vl git push` fast-forwards the branch
+with one commit that publishes the fix and links its history.
+
+* **Round trips are safe.** A commit made on GitHub never saw your cloaked
+  files, so importing it does not delete them: Veil applies the commit on
+  top of the full Veil tree. A Git commit that would widen a cloaked path's
+  audience by editing `.veilpolicy` is not taken. Paths Git has but Veil
+  refuses (a committed `.env`, a file the scanner quarantines, symlinks,
+  submodules) are reported, stay in Git, and are never deleted there by a
+  later Veil push.
+* **Deterministic.** The same snapshot always exports to the same commit;
+  the change id travels in a `change-id` commit header (Jujutsu's), and
+  `.veil/git/map` records commit ↔ snapshot.
+* **Divergence is reported, never resolved by losing data.** A branch
+  force-pushed on GitHub is reported by `vl git fetch` and leaves your tags
+  alone; `vl git push` refuses to overwrite a branch that moved
+  (`vl git pull`, `vl merge <remote>/<branch>`, push again, or `--force`,
+  which only overwrites what you last fetched).
+* Fetch and push run your `git` binary (`$VEIL_GIT`), so credential
+  helpers, SSH config and agents work as they do for Git.
+
 ## Repository layout
 
 ```text
@@ -157,6 +197,7 @@ crates/
     src/workspace.rs  workspaces, ephemeral overlays
     src/embargo.rs    delayed-visibility merges
     src/remote.rs     visibility-filtered push / pull
+    src/git/          Git import/export (gix) and the `git` transport
     src/vault.rs      device-local encrypted vault
     tests/engine.rs   end-to-end tests, entirely in memory
   vl/          the CLI (clap)
@@ -184,5 +225,5 @@ drop(ws);                                       // vanishes; the snapshot remain
 This is an MVP of the architecture: the full engine and CLI work end-to-end
 and are covered by tests (`cargo test`). See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#limitations-and-roadmap) for
-known limitations and what comes next (network transport, Git interop, sealed
+known limitations and what comes next (network transport, sealed
 tree names, FUSE/WASM front-ends).
