@@ -60,6 +60,15 @@ pub struct Shim {
 
 /// Like [`connect`], through `shim`. The returned child is the server.
 pub fn connect_with(server: &Path, root: &Path, shim: Shim) -> (SftpBackend, Arc<Mutex<Child>>) {
+    try_connect_with(server, root, shim).unwrap()
+}
+
+/// [`connect_with`], failing if the shim cuts the handshake.
+pub fn try_connect_with(
+    server: &Path,
+    root: &Path,
+    shim: Shim,
+) -> veil_core::Result<(SftpBackend, Arc<Mutex<Child>>)> {
     let mut child = Command::new(server)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -83,8 +92,8 @@ pub fn connect_with(server: &Path, root: &Path, shim: Shim) -> (SftpBackend, Arc
         (None, true) => Box::new(stdin),
         (None, false) => Box::new(DelayedWriter::new(stdin, shim.delay)),
     };
-    let b = SftpBackend::from_streams(reader, writer, root.to_str().unwrap(), "shimmed sftp-server").unwrap();
-    (b, child)
+    let b = SftpBackend::from_streams(reader, writer, root.to_str().unwrap(), "shimmed sftp-server")?;
+    Ok((b, child))
 }
 
 // ---- latency ------------------------------------------------------------------
