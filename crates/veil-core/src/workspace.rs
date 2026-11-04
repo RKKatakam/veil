@@ -46,6 +46,13 @@ pub struct SnapshotOptions<'a> {
     /// guarded by the accepted policy like any incoming change (see
     /// [`crate::policy::working_copy_policy`]).
     pub policy_incoming: bool,
+    /// The working-copy snapshot `fs` was materialised from. If the
+    /// workspace has moved on since (another process committed, undid or
+    /// checked out, and has not updated `fs` yet), nothing is recorded and
+    /// [`WcSnapshot::superseded`] is set: recording `fs` now would put the
+    /// old snapshot's files into the new one. Checked under the repository
+    /// lock, so no other command can slip in between.
+    pub expected_wc: Option<ObjectId>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +60,9 @@ pub struct WcSnapshot {
     pub snapshot: ObjectId,
     pub changed: bool,
     pub report: BuildReport,
+    /// Nothing was recorded: the workspace no longer points at
+    /// [`SnapshotOptions::expected_wc`] (`snapshot` is where it points now).
+    pub superseded: bool,
 }
 
 /// An in-memory copy-on-write workspace over a base snapshot. Creating one is
@@ -156,9 +166,18 @@ impl Repo {
             materialised,
             description,
             policy_incoming,
+            expected_wc,
         } = opts;
         let mut tx = self.transaction(description.unwrap_or_else(|| snapshot_op_description(ws)))?;
         let wc_id = tx.view.workspace(ws)?.wc;
+        if expected_wc.is_some_and(|e| e != wc_id) {
+            return Ok(WcSnapshot {
+                snapshot: wc_id,
+                changed: false,
+                report: BuildReport::default(),
+                superseded: true,
+            });
+        }
         let wc = tx.repo().snapshot(&wc_id)?;
         // `fs` was checked out from `wc.tree`: a `.veilpolicy` edit is the
         // member's, unless a command wrote it from elsewhere.
@@ -188,6 +207,7 @@ impl Repo {
                 snapshot: wc_id,
                 changed: false,
                 report,
+                superseded: false,
             });
         }
         let mut new = (*wc).clone();
@@ -213,6 +233,7 @@ impl Repo {
             snapshot: id,
             changed: true,
             report,
+            superseded: false,
         })
     }
 
@@ -418,10 +439,25 @@ impl Repo {
     /// re-applied on top of the restored working copy (a 3-way merge, so
     /// what the undone command changed is reverted and the edits stay).
     /// Returns the new operation and the description of the undone one.
+    ///
+    /// A command whose effect lies outside the view (a grant, `vl remote
+    /// add`, `vl ws switch`; see [`crate::oplog::Operation::manual_undo`])
+    /// is not undone, and neither is anything before it: the error says
+    /// how to reverse it by hand. Restoring an older view would leave its
+    /// effect in place and silently undo an unrelated, earlier command
+    /// instead (BUG-116).
     pub fn undo_keeping_edits(&mut self, ws: &str) -> Result<(ObjectId, String)> {
         self.reload()?;
         let command = self.last_command_op(ws)?;
         let op = self.ops.get(&command)?;
+        if let Some(how) = &op.manual_undo {
+            return Err(VeilError::repo(format!(
+                "cannot undo the last command, '{}': {how}. \
+                 To go back to an earlier state of the repository anyway, pick an operation from `vl op log` \
+                 and run `vl op restore <id>` (your unrecorded edits are kept)",
+                op.description
+            )));
+        }
         let parent = *op
             .parents
             .first()
@@ -441,8 +477,28 @@ impl Repo {
         self.restore_view_keeping_edits(ws, view, &before_edits, format!("restore to operation {}", op.short()))
     }
 
+    /// The operations after `op`, newest first, whose effect lies outside
+    /// the view (see [`crate::oplog::Operation::manual_undo`]): restoring
+    /// the view of `op` leaves what they did in place.
+    pub fn manual_undo_since(&self, op: ObjectId) -> Result<Vec<crate::oplog::Operation>> {
+        let mut out = Vec::new();
+        let mut cur = self.op_id;
+        while cur != op {
+            let Some(o) = self.ops.try_get(&cur)? else { break };
+            let next = o.parents.first().copied();
+            if o.manual_undo.is_some() {
+                out.push(o);
+            }
+            match next {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
     /// The newest operation that is not an automatic snapshot of `ws`.
-    fn last_command_op(&self, ws: &str) -> Result<ObjectId> {
+    pub(crate) fn last_command_op(&self, ws: &str) -> Result<ObjectId> {
         let auto = snapshot_op_description(ws);
         let mut cur = self.op_id;
         loop {

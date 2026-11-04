@@ -15,6 +15,15 @@
 //! (The builder keeps such tracked entries unchanged, so this is not
 //! recorded as a deletion.)
 //!
+//! Checkout never deletes what it did not write. A directory where the tree
+//! now has a file is only removed once checkout has emptied it; a directory
+//! that still holds something (isolated or ignored files, untracked files,
+//! kept local edits) is left in place, and so is a file where the tree now
+//! has a directory. Both are reported in [`CheckoutReport::obstructed`],
+//! and the paths they stand in the way of are not written. The next snapshot
+//! records the working copy as it is, so the user's layout wins, as with
+//! [`CheckoutReport::kept_local`].
+//!
 //! On a backend that folds names (a macOS volume: `README` and `readme`, or
 //! NFC and NFD spellings, are one entry) checkout refuses a tree with two
 //! such names in one directory, before writing anything: materialising both
@@ -54,6 +63,13 @@ pub struct CheckoutReport {
     /// Files written from their embargo fallback because this reader cannot
     /// read the entry itself, with the fallback's id.
     pub from_fallback: Vec<(VPath, ObjectId)>,
+    /// Paths of the tree that were not written because something checkout
+    /// did not write is in the way, with that obstacle: a directory that
+    /// still holds files where the tree has a file (an isolated `private/`,
+    /// an ignored `target/`, untracked work), or a file where the tree has a
+    /// directory (a quarantined or untracked `cfg` where the tree has
+    /// `cfg/settings.json`). The obstacle is left exactly as it is.
+    pub obstructed: Vec<(VPath, VPath)>,
 }
 
 /// What a working copy holds where it differs from its tree as this reader
@@ -352,6 +368,7 @@ impl CheckoutReport {
         self.kept_local.extend(o.kept_local);
         self.blocked.extend(o.blocked);
         self.from_fallback.extend(o.from_fallback);
+        self.obstructed.extend(o.obstructed);
     }
 }
 
@@ -393,6 +410,26 @@ impl<'a> SpecialGuard<'a> {
             self.special.insert(dir.clone(), names);
         }
         Ok(self.special[&dir].contains(path.file_name()))
+    }
+
+    /// The nearest ancestor of `path` that is a file (or anything but a
+    /// directory) in the working copy: writing `path` would need to replace
+    /// it. Directories checkout creates are real ones, so the answer for a
+    /// directory already seen stays valid for the whole run.
+    fn file_in_the_way(&mut self, path: &VPath) -> Result<Option<VPath>> {
+        for p in path.ancestors() {
+            if self.real_dirs.contains(&p) {
+                continue;
+            }
+            match self.fs.metadata(&p)? {
+                Some(m) if m.kind == NodeKind::Dir => {
+                    self.real_dirs.insert(p);
+                }
+                Some(_) => return Ok(Some(p)),
+                None => return Ok(None),
+            }
+        }
+        Ok(None)
     }
 
     /// Is `path` or any of its ancestors a special entry? Only the topmost
@@ -517,7 +554,26 @@ fn apply_changes(
             report.blocked.push(c.path.clone());
             continue;
         }
-        let current = fs.metadata(&c.path)?;
+        // A file where the tree has a directory (a quarantined or untracked
+        // `cfg` where the tree has `cfg/settings.json`): checkout removed
+        // every file `from` put there, so this one is the user's. Keep it.
+        if let Some(obstacle) = guard.file_in_the_way(&c.path)? {
+            report.obstructed.push((c.path.clone(), obstacle));
+            continue;
+        }
+        let mut current = fs.metadata(&c.path)?;
+        if current.as_ref().is_some_and(|m| m.kind == NodeKind::Dir) && new.kind == EntryKind::File {
+            // A directory where the tree has a file. Everything `from` put
+            // in it was removed above (and the directory with it, if that
+            // emptied it), so what is left is not ours: isolated or ignored
+            // files, untracked work, kept edits. Never delete it.
+            if !is_empty_dir(fs, &c.path)? {
+                report.obstructed.push((c.path.clone(), c.path.clone()));
+                continue;
+            }
+            fs.remove_dir_all(&c.path)?;
+            current = None;
+        }
         let local_edit = current.as_ref().is_some_and(|m| m.kind == NodeKind::File)
             && !holds(store, fs, &c.path, c.old.as_ref(), cache.as_deref())?;
         match read_materialised(store, new) {
@@ -528,9 +584,6 @@ fn apply_changes(
                         report.kept_local.push(c.path.clone());
                         continue;
                     }
-                }
-                if current.is_some_and(|m| m.kind == NodeKind::Dir) {
-                    fs.remove_dir_all(&c.path)?;
                 }
                 fs.write(&c.path, &data)?;
                 fs.set_executable(&c.path, new.executable)?;
@@ -623,16 +676,25 @@ fn is_local_only(policy: &Policy, path: &VPath) -> bool {
 fn prune_empty_parents(fs: &dyn StorageBackend, path: &VPath) -> Result<()> {
     let mut cur = path.parent();
     while let Some(dir) = cur {
-        if dir.is_root() {
+        if dir.is_root() || !is_empty_dir(fs, &dir)? {
             break;
         }
-        match fs.list_dir(&dir) {
-            Ok(children) if children.is_empty() => fs.remove_dir_all(&dir)?,
-            _ => break,
-        }
+        fs.remove_dir_all(&dir)?;
         cur = dir.parent();
     }
     Ok(())
+}
+
+/// Does the directory at `dir` hold nothing at all? Symlinks, sockets and
+/// entries whose names are not UTF-8 count: `list_dir` leaves them out, and
+/// removing the directory would delete them. Anything unexpected (not a
+/// directory, unreadable) counts as not empty.
+fn is_empty_dir(fs: &dyn StorageBackend, dir: &VPath) -> Result<bool> {
+    match fs.list_dir_full(dir) {
+        Ok(l) => Ok(l.entries.is_empty() && l.special.is_empty() && l.unrepresentable.is_empty()),
+        Err(e) if e.is_not_found() || matches!(e, VeilError::Io { .. } | VeilError::InvalidPath(_)) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// Pairs of entries of tree `root` that a backend with `folding` would

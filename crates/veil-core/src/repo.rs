@@ -251,6 +251,7 @@ impl Repo {
             user: user.to_string(),
             description: "initialize repository".into(),
             view: view.clone(),
+            manual_undo: None,
         })?;
         ops.set_head(&op_id)?;
         // `repo.json` is what makes this a repository, so it is written last:

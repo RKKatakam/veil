@@ -287,6 +287,46 @@ A checkout would have overwritten a file whose content isn't in history
 didn't write. Look at the file; the next snapshot records or quarantines it
 as usual.
 
+### `kept X (X/ holds files that are in no snapshot …)` or `kept X (X is a file that is in no snapshot …)`
+
+The snapshot being checked out has a file where your directory has a
+folder that still holds files in no snapshot (an isolated `private/`, an
+ignored `target/`, untracked work), or a folder where you have a file in no
+snapshot (a quarantined `cfg`). Veil never deletes what it did not write,
+so it kept yours and did not write the snapshot's version there. The next
+snapshot records the working copy as it is (`vl status` shows the
+snapshot's file as deleted). To take the snapshot's version instead, move
+`X` out of the way and run `vl restore X`.
+
+### `Finished the interrupted move of the working copy to workspace 'X'`
+
+An earlier `vl ws switch`, `vl new`, `vl edit` or `vl undo` was killed (or
+failed) while it replaced your files. This command finished the move before
+recording anything. Nothing was lost: files the move did not put there were
+kept.
+
+### `error: cannot undo the last command, '…': …`
+
+The last command changed something the operation log does not hold (a key
+ring, a remote, the local vault, the accepted policy). Restoring an older
+view would not revert it, so `vl undo` refuses rather than undo an
+unrelated, earlier command. Do what the message says. To go back further
+anyway, use `vl op log` and `vl op restore ID`.
+
+### `error: X was not recorded in workspace 'NAME': …`
+
+`vl ws write` wrote the file, but the policy keeps that path out of history
+(an isolated `.env` or `*.pem`, an ignored path) or the scanner quarantined
+it. A virtual workspace has no local files, so nothing was kept. Check the
+path, or change `.veilpolicy`.
+
+### My isolated file is gone: can I get it back?
+
+Every snapshot backs isolated files (`.env` & co) up into the local vault,
+and the backup of a file that disappears is kept for 30 days.
+`vl secret files` lists them; `vl secret recover PATH` writes one back
+(never over an existing file).
+
 ### `warning: the working copy was stale; your edits were saved as change X`
 
 The repository moved on without your files (an interrupted command, a

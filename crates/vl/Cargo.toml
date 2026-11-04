@@ -29,6 +29,7 @@ libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+proptest = "1"
 
 # Release archives (see dist-workspace.toml): shell completions and man
 # pages generated from this vl by .github/build-setup.yml.

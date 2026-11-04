@@ -114,7 +114,10 @@ It is already in the repository. Consequences:
   to keep things out, and `vl restore <path>` to drop an edit.
 * `vl --no-snapshot <command>` skips the automatic snapshot, for the rare
   case you need to look at the repository without recording the disk.
-* `vl watch` records continuously, as files change.
+* `vl watch` records continuously, as files change. It steps aside while
+  another `vl` command in the same directory moves the working copy (a
+  `vl commit` in another terminal), and picks up where that command left
+  it.
 
 ## The daily loop
 
@@ -271,7 +274,26 @@ Working copy now at: yyntkszx 4094f80d (no description set)
 * `vl op restore <id>` returns the whole repository (changes, tags,
   workspaces) to the state after operation `<id>`.
 * Both **keep the files on disk that you had not recorded yet**: the
-  automatic snapshot taken before `undo` is not what gets undone.
+  automatic snapshot taken before `undo` is not what gets undone. After
+  `vl ws switch`, `vl undo` switches back; the edits of each workspace stay
+  in that workspace.
+* Some commands change things the operation log does not hold: key rings
+  (`vl scope create`, `grant`, `revoke`, `rotate`), remotes (`vl remote add`,
+  `rm`), the local vault (`vl secret set`, `rm`, `import`) and the accepted
+  policy (`vl policy accept`). They are operations too, so `vl undo` never
+  skips past them to undo something older. Instead it refuses and says how
+  to reverse them by hand. A revocation or a key rotation cannot be taken
+  back at all.
+
+```text
+$ vl scope grant team 7f3a… --name bob
+$ vl undo
+error: cannot undo the last command, 'grant scope team to bob': key rings are append-only;
+take the access back with `vl scope revoke team 7f3a…` (until you push, nobody else has received the key). …
+```
+
+  `vl op restore <id>` still goes back to an earlier operation, and warns
+  about each such command it cannot revert.
 
 Other ways to reshape history:
 

@@ -275,11 +275,27 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Op(OpCmd::Restore { id }) => {
             let op = ctx.repo.ops().resolve_prefix(id)?;
             let ws = ctx.ws.clone();
+            let outside = ctx.repo.manual_undo_since(op)?;
             ctx.repo.restore_operation_keeping_edits(&ws, op)?;
             println!("Restored to operation {}", op.short());
+            for o in outside {
+                warn(&format!(
+                    "not reverted: '{}' ({})",
+                    safe(&o.description),
+                    safe(o.manual_undo.as_deref().unwrap_or_default())
+                ));
+            }
         }
         Cmd::Undo => {
             let ws = ctx.ws.clone();
+            // The attachment is not in the view: undoing `vl ws switch` is
+            // switching back (each workspace keeps its own edits).
+            if let Some(from) = ctx.repo.last_command_switch(&ws)? {
+                ctx.attach(&from)?;
+                ctx.repo.record_workspace_switch(&ws, &from)?;
+                println!("Undid: switch the project directory from workspace '{}' to '{}'", safe(&from), safe(&ws));
+                return Ok(ExitCode::SUCCESS);
+            }
             let (_, undone) = ctx.repo.undo_keeping_edits(&ws)?;
             println!("Undid: {}", safe(&undone));
         }
@@ -1337,6 +1353,13 @@ fn cmd_policy(ctx: &mut Ctx, c: &PolicyCmd) -> Result<()> {
         }
         PolicyCmd::Accept => {
             let held = ctx.repo.accept_policy(&*ctx.fs)?;
+            ctx.repo.record_outside_view(
+                format!("accept {POLICY_FILE}"),
+                format!(
+                    "the accepted policy is device-local state outside the operation log; edit {POLICY_FILE} back \
+                     and run `vl policy accept` again"
+                ),
+            )?;
             if held.is_empty() {
                 println!("Accepted {POLICY_FILE}; it weakens the protection of no local file");
             } else {
@@ -1501,10 +1524,17 @@ fn cmd_secret(ctx: &mut Ctx, c: &SecretCmd) -> Result<()> {
                     s.trim_end_matches(['\n', '\r']).to_string()
                 }
             };
-            ctx.repo.vault_update(|vault| {
-                vault.secrets.insert(name.clone(), value);
-                Ok(())
-            })?;
+            let previous = ctx.repo.vault_update(|vault| Ok(vault.secrets.insert(name.clone(), value)))?;
+            ctx.repo.record_outside_view(
+                format!("store secret {name} in the local vault"),
+                match previous {
+                    Some(_) => format!(
+                        "the local vault is not part of the operation log, and the previous value of {name} was replaced; \
+                         set it again with `vl secret set {name}`"
+                    ),
+                    None => format!("the local vault is not part of the operation log; run `vl secret rm {name}`"),
+                },
+            )?;
             println!("Stored secret {name} in the local vault");
         }
         SecretCmd::Get { name } => {
@@ -1521,7 +1551,31 @@ fn cmd_secret(ctx: &mut Ctx, c: &SecretCmd) -> Result<()> {
             if !ctx.repo.vault_update(|vault| Ok(vault.secrets.remove(name).is_some()))? {
                 bail!("no secret named '{name}'");
             }
+            ctx.repo.record_outside_view(
+                format!("remove secret {name} from the local vault"),
+                format!("the local vault is not part of the operation log and the value is gone; set it again with `vl secret set {name}`"),
+            )?;
             println!("Removed secret {name}");
+        }
+        SecretCmd::Files => {
+            let vault = ctx.repo.vault_load()?;
+            for p in vault.files.keys() {
+                println!("{}", safe(p));
+            }
+            for (p, r) in &vault.removed {
+                println!(
+                    "{}  {}",
+                    safe(p),
+                    dim(&format!("(gone from the working copy since {}; `vl secret recover {}`)", fmt_time(r.removed_at), safe(p)))
+                );
+            }
+        }
+        SecretCmd::Recover { path } => {
+            let p = ctx.repo_path(path)?;
+            if !ctx.repo.vault_recover_file(&*ctx.fs, &p)? {
+                bail!("the local vault holds no backup of {}", safe(p.as_str()));
+            }
+            println!("Recovered {} from the local vault", safe(p.as_str()));
         }
         SecretCmd::Import { file } => {
             let text = std::fs::read_to_string(file)?;
@@ -1538,10 +1592,18 @@ fn cmd_secret(ctx: &mut Ctx, c: &SecretCmd) -> Result<()> {
                 }
             }
             let n = pairs.len();
+            let names: Vec<String> = pairs.iter().map(|(k, _)| k.clone()).collect();
             ctx.repo.vault_update(|vault| {
                 vault.secrets.extend(pairs);
                 Ok(())
             })?;
+            ctx.repo.record_outside_view(
+                format!("import {n} secret(s) into the local vault"),
+                format!(
+                    "the local vault is not part of the operation log; remove what was imported with `vl secret rm` ({})",
+                    names.join(", ")
+                ),
+            )?;
             println!("Imported {n} secret(s) from {}", file.display());
         }
     }
@@ -1560,7 +1622,8 @@ fn cmd_run(ctx: &mut Ctx, command: &[String]) -> Result<ExitCode> {
 
 fn cmd_scope(ctx: &mut Ctx, c: &ScopeCmd) -> Result<()> {
     use veil_core::keychain::Role;
-    let keys = ctx.repo.keys();
+    let store = ctx.repo.store().clone();
+    let keys = &store.keys;
     match c {
         ScopeCmd::List => {
             let me = keys.identity().map(|i| i.public_hex()).unwrap_or_default();
@@ -1606,6 +1669,10 @@ fn cmd_scope(ctx: &mut Ctx, c: &ScopeCmd) -> Result<()> {
         }
         ScopeCmd::Create { name } => {
             keys.create_scope(name)?;
+            ctx.repo.record_outside_view(
+                format!("create scope {name}"),
+                "key rings are append-only, so a scope cannot be removed; it stays unused if nothing is cloaked under it",
+            )?;
             println!("Created scope {name} (you are its admin)");
         }
         ScopeCmd::Grant {
@@ -1616,6 +1683,13 @@ fn cmd_scope(ctx: &mut Ctx, c: &ScopeCmd) -> Result<()> {
         } => {
             let role = if *admin { Role::Admin } else { Role::Member };
             keys.grant_role(scope, public_key, name, role)?;
+            ctx.repo.record_outside_view(
+                format!("grant scope {scope} to {name}"),
+                format!(
+                    "key rings are append-only; take the access back with `vl scope revoke {scope} {public_key}` \
+                     (until you push, nobody else has received the key)"
+                ),
+            )?;
             println!("Granted scope {scope} to {}; push to share the updated key ring", safe(name));
             if veil_core::identity::parse_public_identity(public_key)?.ed25519.is_none() {
                 warn("that is a short public key without a signing key: their signatures will show as unknown.\n  Ask them for the full key from `vl identity show` and grant again.");
@@ -1623,6 +1697,13 @@ fn cmd_scope(ctx: &mut Ctx, c: &ScopeCmd) -> Result<()> {
         }
         ScopeCmd::Revoke { scope, public_key } => {
             if keys.revoke(scope, public_key)? {
+                ctx.repo.record_outside_view(
+                    format!("revoke {public_key} from scope {scope}"),
+                    format!(
+                        "a revocation and its key rotation cannot be taken back; grant the key again with \
+                         `vl scope grant {scope} {public_key} --name <name>` (it receives the new generation)"
+                    ),
+                )?;
                 let generation = keys.ring_state(scope)?.and_then(|r| r.ok()).map(|s| s.generation).unwrap_or(0);
                 println!(
                     "Revoked. Scope {scope} rotated to key generation {generation}: new content is sealed with a key\n\
@@ -1636,6 +1717,10 @@ fn cmd_scope(ctx: &mut Ctx, c: &ScopeCmd) -> Result<()> {
         }
         ScopeCmd::Rotate { scope } => {
             let g = keys.rotate(scope)?;
+            ctx.repo.record_outside_view(
+                format!("rotate scope {scope}"),
+                "a key rotation cannot be taken back; members keep access through the new generation",
+            )?;
             println!("Scope {scope} rotated to key generation {g}; push to share the updated key ring");
             warn_unreachable_members(keys, scope);
         }
@@ -1733,7 +1818,16 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
             );
         }
         WsCmd::Switch { name } => {
+            if *name == ctx.ws {
+                println!("Project directory already attached to workspace {}", bold(name));
+                return Ok(ExitCode::SUCCESS);
+            }
+            let from = ctx.ws.clone();
             ctx.attach(name)?;
+            // An operation of its own, so `vl undo` right after it does not
+            // undo the snapshot of the workspace just left (BUG-100). The
+            // files move when the command finishes, journalled (BUG-113).
+            ctx.repo.record_workspace_switch(&from, name)?;
             println!("Project directory attached to workspace {}", bold(name));
         }
         WsCmd::Rm { name } => {
@@ -1766,10 +1860,38 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
             let mut data = Vec::new();
             std::io::stdin().read_to_end(&mut data)?;
             let overlay = ctx.repo.workspace_overlay(name)?;
-            overlay.write(&VPath::new(path)?, &data)?;
+            let vp = VPath::new(path)?;
+            overlay.write(&vp, &data)?;
             let out = ctx.repo.snapshot_workspace(name, &overlay)?;
             print_build_warnings(&out.report);
-            println!("Recorded {} in {}", path, one_line(&ctx.repo, &out.snapshot));
+            // Say what the builder did with it, not what was asked (BUG-102).
+            let tree = ctx.repo.snapshot(&out.snapshot)?.tree;
+            let recorded = match lookup(ctx.repo.store(), &tree, &vp)? {
+                Some(e) => ctx.repo.store().read_entry(&e).is_ok_and(|d| d == data),
+                None => false,
+            };
+            if !recorded {
+                let r = &out.report;
+                let why = if r.isolated.contains(&vp) {
+                    "the policy isolates it (local-only): it never enters history, and a virtual workspace has no local files"
+                        .to_string()
+                } else if r.quarantined.iter().any(|(p, _)| *p == vp) {
+                    "it looks like it contains a secret, so it was quarantined".to_string()
+                } else if r.held_back.iter().any(|(p, _)| *p == vp) {
+                    "it is held back under an embargo this identity holds no key for".to_string()
+                } else if r.cloak_failures.iter().any(|(p, _)| *p == vp) {
+                    "it should be cloaked but no key is available".to_string()
+                } else {
+                    let class = ctx.repo.effective_policy(&overlay)?.classify(&vp, false);
+                    match class.tier {
+                        Tier::Ignored => "the policy ignores it".to_string(),
+                        Tier::Isolated => "the policy isolates it (local-only)".to_string(),
+                        _ => "the policy or the scanner kept it out".to_string(),
+                    }
+                };
+                bail!("{} was not recorded in workspace '{}': {why}", safe(path), safe(name));
+            }
+            println!("Recorded {} in {}", safe(path), one_line(&ctx.repo, &out.snapshot));
         }
         WsCmd::Exec {
             name,
@@ -1848,9 +1970,23 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
 fn cmd_watch(ctx: &mut Ctx, interval_ms: u64) -> Result<()> {
     eprintln!("Watching {} (Ctrl-C to stop)", ctx.root.display());
     let mut last = ctx.wc()?;
+    let mut behind_since: Option<std::time::Instant> = None;
     loop {
         std::thread::sleep(Duration::from_millis(interval_ms));
-        ctx.repo.reload()?;
+        // Another command may have moved the working copy since the last
+        // tick: never judge the directory against a pointer read earlier
+        // (BUG-117).
+        ctx.refresh()?;
+        if ctx.behind()? {
+            // That command may still be checking the directory out. Leave it
+            // alone; only if it stays behind (the command died) recover it
+            // as any command would.
+            let since = *behind_since.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() < ctx::WATCH_YIELD.max(Duration::from_millis(interval_ms.saturating_mul(2))) {
+                continue;
+            }
+        }
+        behind_since = None;
         ctx.snapshot()?;
         let now = ctx.wc()?;
         if now != last {
@@ -1903,6 +2039,10 @@ fn cmd_remote(ctx: &mut Ctx, c: &RemoteCmd) -> Result<()> {
                 );
                 Ok(())
             })?;
+            ctx.repo.record_outside_view(
+                format!("add remote {name}"),
+                format!("remotes live in .veil/repo.json, outside the operation log; run `vl remote rm {name}`"),
+            )?;
             println!(
                 "Added {} remote {} → {}",
                 if *public { "public" } else { "team" },
@@ -1917,13 +2057,21 @@ fn cmd_remote(ctx: &mut Ctx, c: &RemoteCmd) -> Result<()> {
             }
         }
         RemoteCmd::Rm { name } => {
-            ctx.repo.update_config(|config| {
+            let removed = ctx.repo.update_config(|config| {
                 config
                     .remotes
                     .remove(name)
-                    .map(|_| ())
                     .ok_or_else(|| veil_core::VeilError::repo(format!("no remote named '{name}'")))
             })?;
+            ctx.repo.record_outside_view(
+                format!("remove remote {name}"),
+                format!(
+                    "remotes live in .veil/repo.json, outside the operation log; add it back with `vl remote add {name} {}{}` \
+                     (what was last seen there is kept until the next pull)",
+                    removed.url,
+                    if removed.public { " --public" } else { "" }
+                ),
+            )?;
             println!("Removed remote {}", safe(name));
         }
     }

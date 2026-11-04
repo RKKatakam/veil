@@ -2258,6 +2258,7 @@ dependencies = [
  "diffy",
  "hex",
  "libc",
+ "proptest",
  "serde",
  "serde_json",
  "tempfile",
