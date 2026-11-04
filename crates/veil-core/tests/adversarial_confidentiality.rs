@@ -201,7 +201,6 @@ fn squash_keeps_cloaked_descriptions_sealed() {
 /// *released embargo* scope. The key of a released embargo is published, and
 /// objects sealed under it are pushed to public remotes.
 #[test]
-#[ignore = "BUG-008: .veilpolicy accepts reserved scopes (embargo/<id>, local); 'cloaked' files become publicly decryptable"]
 fn policy_cannot_cloak_under_a_released_embargo_key() {
     let (mut alice, fs, _) = new_repo("alice");
     let main = commit_files(&mut alice, &*fs, &[("a.txt", "v1\n")], "v1");
@@ -232,7 +231,6 @@ fn policy_cannot_cloak_under_a_released_embargo_key() {
 }
 
 #[test]
-#[ignore = "BUG-008: .veilpolicy accepts reserved scopes (embargo/<id>, local); 'cloaked' files become publicly decryptable"]
 fn policy_rejects_reserved_and_malformed_scope_names() {
     let p = Policy::parse("a cloak local\nb cloak embargo/abc\nc cloak ../../x\nd cloak UPPER\n");
     for path in ["a", "b", "c", "d"] {
@@ -345,7 +343,6 @@ fn embargoed_tree_reveals_nothing_about_the_fix() {
 }
 
 #[test]
-#[ignore = "BUG-019: built-in secret rules are case-sensitive; .ENV, KEY.PEM, ID_RSA are snapshotted publicly"]
 fn builtin_secret_rules_are_case_insensitive() {
     let p = Policy::builtin();
     for path in [".ENV", ".Env", "certs/Server.PEM", "deploy/ID_RSA", "prod.TFSTATE", ".NETRC", ".Env.Production"] {
@@ -358,7 +355,6 @@ fn builtin_secret_rules_are_case_insensitive() {
 }
 
 #[test]
-#[ignore = "BUG-019: built-in secret rules are case-sensitive; .ENV, KEY.PEM, ID_RSA are snapshotted publicly"]
 fn uppercase_dotenv_never_reaches_a_public_mirror() {
     let (mut alice, fs, _) = new_repo("alice");
     let c = commit_files(&mut alice, &*fs, &[(".ENV", "DB_PASSWORD=hunter2hunter2\n")], "c");
@@ -471,7 +467,6 @@ fn committed_publicly(data: &[u8]) -> bool {
 }
 
 #[test]
-#[ignore = "BUG-020: the secret scanner skips any file with a NUL byte (e.g. UTF-16 text) and any file over 8 MiB"]
 fn scanner_is_not_bypassed_by_utf16_encoding() {
     let text = "aws_access_key_id = AKIAIOSFODNN7EXAMPLE\r\n";
     let mut utf16 = vec![0xff, 0xfe];
@@ -482,13 +477,11 @@ fn scanner_is_not_bypassed_by_utf16_encoding() {
 }
 
 #[test]
-#[ignore = "BUG-020: the secret scanner skips any file with a NUL byte (e.g. UTF-16 text) and any file over 8 MiB"]
 fn scanner_is_not_bypassed_by_a_single_nul_byte() {
     assert!(!committed_publicly(b"\0\nconst k = \"AKIAIOSFODNN7EXAMPLE\";\n"));
 }
 
 #[test]
-#[ignore = "BUG-020: the secret scanner skips any file with a NUL byte (e.g. UTF-16 text) and any file over 8 MiB"]
 fn scanner_is_not_bypassed_by_file_size() {
     let mut big = vec![b'x'; 8 * 1024 * 1024];
     big.extend_from_slice(b"\nconst k = \"AKIAIOSFODNN7EXAMPLE\";\n");
@@ -496,7 +489,6 @@ fn scanner_is_not_bypassed_by_file_size() {
 }
 
 #[test]
-#[ignore = "BUG-032: generic secret rule requires quotes; YAML/dotenv-style unquoted credentials are not detected"]
 fn scanner_detects_unquoted_credentials() {
     for sample in [
         "database:\n  password: Xk9mQ2vL7pR4wZt8\n",
@@ -508,7 +500,6 @@ fn scanner_detects_unquoted_credentials() {
 }
 
 #[test]
-#[ignore = "BUG-032: AWS key rule requires a word boundary; `KEY_AKIA…` style identifiers slip through"]
 fn scanner_detects_aws_key_glued_to_an_identifier() {
     assert!(!committed_publicly(b"AWS_KEY_AKIAIOSFODNN7EXAMPLE\n"));
 }

@@ -300,11 +300,28 @@ CAS, and it applies these rules in order:
    `*.pem`, `*.key`, SSH private keys, `*.tfstate`, …), are reported back and
    never hashed into the store. A user's plain `public` rule cannot override a
    built-in secret. `cloak` can (the file is shared encrypted), and so can an
-   explicit `public!`.
+   explicit `public!`. Built-in secret rules and user `cloak`/`isolate` rules
+   match case-insensitively. Rules that expose or untrack do not. Policy
+   rules fail safe: an invalid scope (`validate_scope_name`), an unknown tier
+   or a missing tier isolates the pattern. A protective rule whose glob does
+   not compile matches its literal name.
 3. Public files are scanned for credentials (AWS, GitHub, GitLab, Slack,
    Stripe, Anthropic, OpenAI, Google, JWT, private keys, and high-entropy
-   `password = "…"` assignments). A hit **quarantines** the file: the
-   offending content stays local and is not snapshotted.
+   `password = …` / `API_KEY=…` assignments, quoted or not). A hit
+   **quarantines** the file: the offending content stays local and is not
+   snapshotted.
+   * The scanner (`secrets.rs`) reads every file, whatever its size or
+     encoding. Binary files are not skipped. Text in NUL-padded encodings
+     (UTF-16/32, with or without a BOM) is scanned a second time with the
+     NULs removed, in 256 KiB chunks with a 16 KiB overlap. Token rules run
+     as one alternation, so the regex literal prefilter makes a single pass.
+     The assignment rule runs on an ASCII-lowercased copy of each chunk,
+     because `(?i)` keywords defeat the prefilter. Unquoted values must
+     look like credentials: references (`$X`, `${X}`), placeholders
+     (`<key>`) and identifiers made of words (`settings.SECRET_KEY`) do not
+     count. A PEM header inside binary data needs key material after it.
+     `secrets::RULES_VERSION` is part of the stat-cache key, so "scanned
+     clean" facts from an older scanner are not reused.
    * A **never-tracked** file is left out of the tree.
    * A **tracked** file keeps the parent's entry, so history still holds
      the previous, safe version. The edit is *held back*, not recorded as a

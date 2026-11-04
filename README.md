@@ -120,6 +120,14 @@ Built-in rules (`.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa`, `*.tfstate`, …)
 come first and **cannot be overridden by a plain `public` rule**, only by
 `cloak` (encrypted sharing) or an explicit `public!`.
 
+Patterns are globs; `\` escapes a character (`config\[prod\].yml`,
+`my\ notes.txt`). `vl cloak|isolate|expose|ignore <path>` on an existing path
+writes it escaped, so `app/[id]/` means that directory. Built-in secret rules
+and `cloak`/`isolate` rules ignore case (`.ENV`, `Secrets/`). `public`,
+`public!` and `ignore` rules are case-sensitive. A rule with an invalid scope
+(`local`, `embargo/…`, `UPPER`), an unknown tier or no tier is treated as
+`isolate`, with a warning.
+
 ## Repository layout
 
 ```text

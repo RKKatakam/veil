@@ -433,7 +433,6 @@ fn undo_does_not_discard_uncommitted_edits() {
 /// writes the name as a glob, so the literal file is not matched and stays
 /// public while the CLI reports it as cloaked.
 #[test]
-#[ignore = "BUG-007: `vl cloak/isolate <file>` does not escape glob metacharacters; files like `config[prod].yml` stay public"]
 fn cloaking_a_file_with_glob_metacharacters_cloaks_that_file() {
     let env = Env::new();
     let proj = env.dir("proj");
