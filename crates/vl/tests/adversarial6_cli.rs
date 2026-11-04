@@ -7,7 +7,7 @@
 
 mod adversarial_support;
 
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use adversarial_support::{read, text, write, Env};
 
@@ -616,6 +616,44 @@ fn undo_after_a_scope_grant_does_not_undo_an_unrelated_operation() {
     assert!(
         tags.contains("main") && (!out.status.success() || !scope.contains("bob")),
         "undo after the grant: {}\ntags:\n{tags}scope:\n{scope}",
+        text(&out).trim()
+    );
+}
+
+// ---- `vl watch` next to other commands ----------------------------------------------
+
+/// `vl watch` is the guide's "records continuously, as files change". It
+/// keeps one `Ctx` for its whole life, with the checkout pointer it read at
+/// start; every tick reloads the *view* but not `checkout.json`. When
+/// another `vl` command in the same directory moves the working copy (a
+/// `vl commit`, `vl new`: it checks the directory out and rewrites
+/// `checkout.json`), the watcher's next tick sees the view's working copy
+/// differ from its cached pointer, judges the directory *stale*, saves
+/// whatever the user wrote since as `recovered working-copy edits` on top
+/// of the obsolete snapshot it remembers (a branch off a predecessor that
+/// is no longer visible), and then checks the directory out again, which
+/// **removes those files from disk**. The user's new file vanishes while
+/// they are editing; it survives only in a stray change.
+#[test]
+#[ignore = "BUG-117: `vl watch` next to another `vl` command moves the user's new files off disk into a stray change on an obsolete snapshot"]
+fn watch_does_not_move_new_files_off_disk_after_a_concurrent_command() {
+    let env = Env::new();
+    let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
+    let mut watch = env.spawn(U, &proj, &["watch", "--interval-ms", "2500"]);
+    std::thread::sleep(Duration::from_millis(300));
+    write(&proj, "e1.txt", "edit before the other command\n");
+    // Let one tick record e1.txt (the watcher is now at the recorded wc).
+    std::thread::sleep(Duration::from_millis(3000));
+    env.ok(U, &proj, &["commit", "-m", "from the other terminal"]);
+    write(&proj, "f.txt", "new file right after the commit\n");
+    // Two more ticks.
+    std::thread::sleep(Duration::from_millis(6000));
+    watch.kill().unwrap();
+    let out = watch.wait_with_output().unwrap();
+    let files = env.stdout(U, &proj, &["files"]);
+    assert!(
+        proj.join("f.txt").is_file() && files.contains("f.txt"),
+        "f.txt was moved off disk by the watcher ({}):\nfiles:\n{files}",
         text(&out).trim()
     );
 }
