@@ -15,6 +15,9 @@ file it comes from. Everything else is a proposal, and is worded as one.
 Contents:
 
 1. [Goals, non-goals and personas](#1-goals-non-goals-and-personas)
+   * D. [Product and experience design](#d-product-and-experience-design):
+     principles, information architecture, the visibility lens, key screens,
+     review model, trust UX, visual language, CLI parity, MVP UI
 2. [Architecture](#2-architecture)
 3. [Security model and threat model](#3-security-model-and-threat-model)
 4. [The smart sync protocol](#4-the-smart-sync-protocol)
@@ -44,7 +47,8 @@ Contents:
   needs an approval from a member of `ops`, enforced by the Hub and
   verifiable by every client.
 * **A web UI** for history, files, diffs, scopes and their membership logs,
-  embargoes and the Hub's push log.
+  embargoes and the Hub's push log. Its product and experience design is
+  [§D](#d-product-and-experience-design).
 * **A trusted embargo-release clock**, so an embargo releases on time even
   when no key holder runs `vl` at the deadline (today release waits for "the
   first `vl` command a key holder runs after it",
@@ -83,6 +87,1170 @@ Contents:
 | **Small team with mixed open and closed code** (the owner's team) | A team SSH remote, scopes granted by hand with pasted `veil1…` keys, review on GitHub for the public part only | Review of *whole* changes, closed parts included; invitations without pasting keys; offboarding that lists what to rotate; per-scope approvals |
 | **Open-source maintainer with outside contributors** | GitHub PRs for public code; the closed parts (deploy configs, release keys, internal docs) are invisible to contributors | Contributors open PRs against the public projection; maintainers review and merge them without exposing closed files; mixed PRs from insiders in the same queue |
 | **Security team using embargoes** | `vl merge --embargo --until`, release by hand or by the next key holder's `vl` | Reports from outside researchers, private advisories, a release that happens on time, coordinated disclosure with downstreams, a fix that lands on GitHub the moment it is public |
+
+---
+
+## D. Product and experience design
+
+This section designs what the Hub looks like and how it feels to use. The
+rest of this document designs what it does. The section sits right after the
+goals because every later section has a face here. It is labelled **D**
+rather than numbered, so the numbers of §2–§11 (and the links into them
+from other documents) stay as they are.
+
+The owner's requirement is that the Hub must not be a GitHub clone with a
+new logo. The repo / branch / commit / pull-request page set fits Git's
+model. Veil's model is different, so the product is built from Veil's own
+nouns instead.
+
+**Provenance.** Each feature below is one of three kinds:
+
+* behaviour Veil has **today**, cited to the guide or ARCHITECTURE.md;
+* behaviour designed in **another section of this document**, cited by §;
+* a proposal **new in this section**, marked *(UX addition)*.
+
+A *(UX addition)* that needs server or engine work says so.
+
+Wireframes use these text chips. The real UI pairs each one with an icon
+and a pattern (§D.7):
+
+```text
+[public]        public file, plaintext                    [public!]  public, secret scanning off
+[team]          cloaked for `team`, decrypted on THIS device (you are a member)
+[ops: locked]   cloaked for `ops`, you hold no key        [embargo 7793]  under an unreleased embargo
+[withheld]      history the Hub will not serve you yet    [device]   isolated: exists only on devices
+✓ ✓bob ? ✗ –    signature: good, good (other signer), unknown key, bad, unsigned (as in `vl log`)
+@ ○ × ◆         working copy, snapshot, conflicted snapshot, root (as in `vl log`)
+```
+
+### D.1 Design principles
+
+Each principle says what GitHub does, what the Hub does instead, and why
+Veil's model calls for it.
+
+1. **The change is the unit.** GitHub's unit is the commit, which is
+   immutable and dies on every rebase. Veil's unit is the **change**, whose
+   id survives describe, rebase and squash
+   ([getting-started](guide/getting-started.md#change-ids-and-snapshot-ids),
+   ARCHITECTURE.md §5). So every Hub page about history is keyed on a change
+   id: URLs, review threads, sign-offs and notifications. Snapshot ids
+   appear only where one exact version is meant, as in the CLI.
+2. **Time first, tree second.** GitHub opens on a file tree and a README.
+   In Veil every command records the working copy as a snapshot, every
+   action is an operation, and the work is the evolving graph
+   ([getting-started](guide/getting-started.md#no-staging-every-command-snapshots)).
+   So a member's repository home is a **timeline** of changes and of the
+   Hub's operations. The file tree is one keystroke away (`g f`). Anonymous
+   visitors are the exception: they get the README first, because they came
+   to learn what the project is (§D.4.1).
+3. **Every surface has an audience.** On GitHub, visibility is a
+   repository setting. In Veil it is a property of every path
+   ([secrets-and-visibility](guide/secrets-and-visibility.md#tiers-and-veilpolicy)),
+   and of tags, descriptions, lines of work and embargoes. Each viewer
+   receives a different slice (§4.7, §5.2). So the audience appears on
+   every row, every diff and every comment, and one control in the top bar,
+   the **lens**, names whose slice you are looking at (§D.3).
+4. **Absence is always explained.** Veil never lets a partial view read as
+   a deletion. Entries a reader cannot open are carried over (ARCHITECTURE.md
+   §4 rule 6). "Now sealed" never reads as "deleted" (rule 4). A clone
+   without a key says how many cloaked files it skipped
+   ([teams](guide/teams-and-remotes.md#onboarding-a-teammate)). The Hub
+   keeps that promise visually. Locked, withheld, embargoed and
+   not-yet-fetched content each get a placeholder that says what it is, why
+   you can't see it, and what would open it.
+5. **Show where the plaintext came from.** On GitHub the server renders
+   everything. On the Hub, closed content is decrypted in your browser or in
+   `vl`, never on the server (§2.3). The UI marks decrypted content as
+   opened on this device, with the key generation that opened it (§D.6.1).
+   The point is to keep the zero-knowledge property visible.
+6. **Reversible by default, irreversible by ceremony.** Veil's op log
+   makes local actions undoable (`vl undo`, `vl op restore`). Some Hub
+   actions cannot be taken back: revocation is forward-only, a release
+   publishes a key, and a declassification reaches the public projection
+   and GitHub (§1.2). The UI sorts every action into *undoable*,
+   *compensable* or *permanent*. Permanent actions get a preview of what
+   becomes visible, and a passkey confirmation (§D.4.6).
+7. **The command is the documentation.** `vl` is the complete client
+   (§9.5). Every page and every button shows its `vl` equivalent, and the
+   jump field accepts `vl` syntax (§D.8). The web is the CLI made visible,
+   not a separate product.
+8. **Calm security.** Most of what the Hub shows is normal: closed areas,
+   visible metadata, unverified-but-ordinary browsers. Normal states are
+   stated plainly and quietly. Red and blocking dialogs are reserved for
+   integrity failures: a bad signature, a ring that does not verify, a
+   client-pinning mismatch (§D.6.4).
+9. **No social layer.** There are no stars, followers, contribution
+   heatmaps or trending pages. The Hub is a workplace for mixed open and
+   closed code, and a social layer would mostly leak who works on what (one
+   of the metadata items in §3.3). Public projects can link to their GitHub
+   mirror for that (§5.8).
+
+### D.2 Information architecture
+
+#### D.2.1 Vocabulary
+
+The UI uses Veil's words. Where GitHub has a near equivalent, the Hub's
+word is chosen not to be mistaken for it.
+
+| Hub UI says | Veil concept | Nearest on GitHub | Why not GitHub's word |
+|---|---|---|---|
+| **change** | a change id and its versions (ARCHITECTURE.md §5) | commit | A commit is one version; a change has many |
+| **version** | a snapshot (`53414202`) | commit | Shown only where one exact version matters |
+| **line** | a tag and the first-parent history behind it | branch | Veil has no branches. A tag follows rewrites and moves only on commit, merge and pull ([coming-from-git](guide/coming-from-git.md#concept-map)). The guide already says "line of work" and "one embargo per line" |
+| **proposal** | `PullRequest` (§5.1) | pull request | Nothing is pulled. A proposal asks to move a tag so that it includes a stack of changes |
+| **stack** | `PullRequest.stack`, bottom first (§5.1) | — | — |
+| **round** | `Revision` (§5.1), one per push to a proposal | "force-pushed" | In `vl`, "revision" already means a `REV` expression such as `main--` ([getting-started](guide/getting-started.md#revisions)) |
+| **sign-off** | a signed `Approval` per scope (§5.6) | approve | It is a signature, and it is per scope |
+| **land** | client-side merge, then push (§5.7) | merge button | The Hub never merges; the lander's client does |
+| **scope** | a ring (ARCHITECTURE.md §3) | team / repo permissions | A scope is a key, not a permission |
+| **device** | an identity (§6.2) | SSH key | Every browser, laptop and runner is one |
+| **Hub log** | server operations (§4.5) | audit log, activity | It is the remote's op log |
+| **workspace** | a workspace (ARCHITECTURE.md §6) | codespace / worktree | Virtual: no directory |
+| **run** | a CI or agent job on a runner (§7) | Actions run | — |
+
+The data model and protocol names in §4–§8 (`PullRequest`, `Revision`,
+`Approval`) stay. Only the UI and CLI words change. §5.7's
+`vl hub pr merge 42` becomes `vl hub land 42`, and `vl hub pr` remains an
+alias (§D.8).
+
+#### D.2.2 Objects
+
+```text
+Org ─┬─ Accounts ── Devices (identities: native | web | runner)
+     ├─ Teams ── mapped to scopes in repositories (§6.1)
+     └─ Repositories ─┬─ Timeline: changes (each with versions) + Hub log operations
+                      ├─ Lines: tags, each with its signed update chain (§4.6) and protection rules (§5.6)
+                      ├─ Files: the tree at any revision, through the lens
+                      ├─ Proposals: stacks, rounds, threads, sign-offs
+                      ├─ Scopes: rings, members, ring log, checkpoints, grant requests
+                      ├─ Embargoes: records, deadlines, release mode
+                      ├─ Workspaces & runs: shared workspaces, agent and CI runs (UX addition, §D.4.7)
+                      └─ Policy: .veilpolicy rendered as rules, tiers and audiences
+```
+
+#### D.2.3 Navigation
+
+* **The top bar** holds four items: the org switcher; the **jump field**
+  (`/`), which accepts revisions (`main--`, `yl`, `fix-cve@`) and `vl`
+  commands; the **lens** chip (whose slice you see, §D.3); and the
+  **device** chip (locked or unlocked, and the client's verification
+  state, §D.6). There is no global search box: search over closed content
+  runs in the worker (§9.4), so it lives in the jump field and says which
+  scopes it searched.
+* **A repository** has a narrow left rail, in this order: Timeline, Files,
+  Proposals, Lines, Embargoes, Scopes, Workspaces & runs, Hub log, Policy,
+  Settings. Every item has a `g`-chord (§D.7.6). The rail replaces GitHub's
+  horizontal tab strip. The order follows how often members use each
+  surface, not GitHub's "Code first".
+* **An inspector** on the right of every page shows facts about the
+  selected object: its audience, what the Hub can see of it, its signature,
+  who decrypted it where, and the equivalent `vl` command. It is the one
+  place for the trust facts (§D.6), so they don't clutter the main column.
+* **URLs** *(UX addition)*: `/acme/app` (timeline), `/acme/app/c/yltznuyx`
+  (a change), `/acme/app/c/yltznuyx/53414202` (one version),
+  `/acme/app/@main` (a line), `/acme/app/@main/files/src/app.py`,
+  `/acme/app/p/42` (a proposal), `/acme/app/scopes/ops`,
+  `/acme/app/embargoes/77932133a2`, `/acme/app/log/<op>`,
+  `/acme/app/ws/fix-cve`, `/acme/app/r/<revision>` (resolved by the
+  client). **Paths of sealed files never appear in the URL path.** They go
+  in the fragment (`/acme/app/@main/files#p=deploy/prod.yml`), which
+  browsers never send to the server. The Hub can read cloaked file names
+  until sealed trees ship (§3.3, C5), but its access logs, `Referer`
+  headers and link previews should not collect them, and after C5 the
+  rule is required anyway.
+
+#### D.2.4 What replaces "branches", "commits" and "pull requests"
+
+| GitHub page | Hub page | What is different |
+|---|---|---|
+| Code (tree + README) | **Timeline** for members; **README + public timeline** for anonymous visitors | History first; the tree is a tab |
+| Branches | **Lines** | One row per tag: target change, cloak (a cloaked tag is listed only to its scope, as public remotes never receive it, [secrets-and-visibility](guide/secrets-and-visibility.md#cloaking-for-a-team)), protection rules, the signed update chain (who moved it, from what, when, §4.6), and whether it carries an unreleased embargo (one per line, ARCHITECTURE.md §7) |
+| Commits | **Timeline**, filtered to one line | The graph with `vl log`'s glyphs, grouped by the Hub operation (push) that brought each change |
+| Commit | **Change** | A change page with its versions (evolution log) and interdiffs between versions (§D.4.2) |
+| Pull request | **Proposal** | A stack of changes, rounds, per-scope sign-offs (§D.5) |
+| Security advisories, private forks | **Embargoes** | Embargoed merges on the real line (§8, §D.4.5) |
+| Settings → collaborators | **Scopes** | Keys and signed membership logs, not ACL checkboxes (§D.4.4) |
+| Actions | **Workspaces & runs** | Runs are sandboxed workspaces on runners that are scope members (§7, §D.4.7) |
+| Audit log | **Hub log** | Every server operation, with its reversibility (§D.4.6) |
+
+### D.3 The visibility lens
+
+#### D.3.1 What a viewer can be shown
+
+Every entry, change, description, tag, comment and log line is in exactly
+one of these states for a given viewer. The state is computed by that
+viewer's client from the tree labels and the rings. Except for "opened on
+this device", it is also computable by the Hub, because projections are
+key-independent (§2.2).
+
+| State | Meaning | Grounded in | Shown as |
+|---|---|---|---|
+| **Public** | plaintext for everyone | `public` tier | `[public]`; quiet |
+| **Public, unscanned** | `public!`: a deliberate exposure | [secrets-and-visibility](guide/secrets-and-visibility.md#tiers-and-veilpolicy) | `[public!]`, with "secret scanning off" in the inspector |
+| **Opened here** | cloaked; you are a member; decrypted in this browser or in `vl` | §2.4 data flow | `[team]` plus the "opened on this device" margin (§D.6.1) |
+| **Locked** | cloaked; you are not a member | `R` in `vl status` ([teams](guide/teams-and-remotes.md#onboarding-a-teammate)) | `[ops: locked]`, with name and size until sealed trees (C5), and "N entries in a sealed directory" after |
+| **Locked, with a public fallback** | a public file edited on a cloaked line: you see its last public version | ARCHITECTURE.md §4 rule 4 | The fallback content, with a band: "a newer version exists for `team`" |
+| **Device locked** | you are a member, but this browser's identity is locked (auto-lock, §9.3) | §9.3 | `[team: unlock]`, one action away; never the same chip as "locked" |
+| **Embargoed, readable** | you hold the embargo's scope | ARCHITECTURE.md §7 | `[embargo 7793]`, with a toggle "show what the public sees now" (the pre-merge fallback) |
+| **Embargoed, pre-merge view** | you don't hold the scope: you see the pre-merge tree exactly | [embargoes](guide/embargoes.md#what-the-public-sees) | The pre-merge content, with a band naming the embargo, its scope and its deadline (all public metadata) |
+| **Withheld** | history the Hub won't serve you yet (an unreleased fix's own line) | §4.5 check 11; `(withheld)` in `vl log` | A dotted node in the graph: "merges 2be318b2 (withheld until release)" |
+| **Not fetched yet** | the client hasn't downloaded it (partial history, §9.7) | C7 | A skeleton, never a lock. The two must not look alike |
+| **Does not open** | ciphertext fails to authenticate, or a ring fails to verify | ARCHITECTURE.md §3 ("A ring that fails to verify gives no keys at all") | A Stop state (§D.6.4) |
+| **Device-only** | isolated: never in history, never on the Hub | `isolate` tier | Never in trees (the Hub cannot know of them). Shown only in the Policy view, as rules: "`*.local.json` stays on devices" |
+| **Held at the gate** | a newly public blob failed the pre-publish scan on the server | §4.5 check 12 | `[held at gate]` on the proposal or Hub log entry, visible to maintainers |
+
+**Locked is never silently absent.** A locked file keeps its row in the
+tree, sorted where it belongs, with its name and size (both visible to the
+Hub and to public remotes today, [secrets-and-visibility](guide/secrets-and-visibility.md#what-is-protected-and-what-isnt)),
+its scope (or its opaque id `s-7f3a9c21` with "name sealed", §6.1) and one
+action. That action is **Ask for access** for org members, which creates a
+grant request (§6.1), and nothing for anonymous visitors. Every tree and
+diff ends with a count line: "You see 1,204 of 1,260 entries. 56 are in 2
+scopes you are not in." A locked file in a diff shows its size before and
+after (sizes are metadata, §3.3) and **no line counts**. The Hub doesn't
+know them, and the UI never invents them.
+
+#### D.3.2 The lens chip and "preview as"
+
+The lens chip in the top bar names the audience the page is rendered for,
+by default your own: `Seeing as you · public + team + ops`. Opening it gives
+**Preview as** *(UX addition)*:
+
+* **Public** renders the page as the public renderer serves it. It is not
+  simulated: the client fetches the public projection itself, which is
+  exactly what a `--public` remote or the GitHub mirror holds (§2.2, §5.8).
+  This is the view to check before landing a declassification.
+* **A member of scopes…** renders with a subset of your own scopes, for
+  example "what a `team` member outside `ops` sees". The subset is computed
+  in your client from the same labels.
+* **A person** (admins) renders with that person's audience (§4.7). Parts
+  that person could read and you can't are shown as locked *to you*, with a
+  note: "bob can read this; you can't". Preview never opens anything.
+
+While a preview is active, the whole page gets a coloured frame and a
+pinned banner, "Previewing as: public", with Exit (`Esc`). This prevents
+signing or commenting in the wrong frame of mind. Sign-off and land are
+disabled during previews.
+
+#### D.3.3 One page, three viewers
+
+`acme/app`, files at `main`. Alice (member of `team` and `ops`), Dan (a
+`team` member outside `ops`) and an anonymous visitor look at the same
+directory. `main` carries an embargoed fix in `team` that touches
+`parser.py`.
+
+```text
+ANONYMOUS ─────────────────────────────────────────────── lens: public
+ acme/app  @main  pzkmnmrl…uqttozys   ✓ alice
+ ┌─ This line carries an embargo (77932133a2, scope team). You see main's pre-merge tree.
+ │  Its release is public metadata; when it happens, this view fills in by itself.
+ ├────────────────────────────────────────────────────────────────────────
+ │ [public]         app.py                  12 B
+ │ [public]         parser.py               31 B     (pre-merge version)
+ │ [team: locked]   secrets/notes.md        15 B
+ │ [ops: locked]    deploy/prod.yml        1.3 KB
+ │ You see 2 of 4 entries. 2 are in closed areas of this repository.
+ └────────────────────────────────────────────────────────────────────────
+
+DAN (team) ───────────────────────────────── lens: you · public + team
+ │ [public]         app.py                  12 B
+ │ [embargo 7793]   parser.py               58 B     ◐ opened on this device
+ │ [team]           secrets/notes.md        15 B     ◐ opened on this device
+ │ [ops: locked]    deploy/prod.yml        1.3 KB    Ask for access
+ │ You see 3 of 4 entries. 1 is in a scope you are not in (ops).
+
+ALICE (team, ops; scope admin) ────────────── lens: you · public + team + ops
+ │ [public]         app.py                  12 B
+ │ [embargo 7793]   parser.py               58 B     ◐   Public sees: pre-merge (31 B)
+ │ [team]           secrets/notes.md        15 B     ◐
+ │ [ops]            deploy/prod.yml        1.3 KB    ◐
+ │ You see everything in this tree.
+```
+
+An **org owner who holds no scope** sees exactly what Dan sees for `team`,
+or what the anonymous visitor sees, plus admin controls. Org ownership is
+not a key (§6.1), and the UI never implies that it is. The settings page
+says it in one line: "Org owners manage people and access to ciphertext.
+Only scope members can read closed files."
+
+#### D.3.4 Lines, descriptions, tags and comments
+
+The lens applies to more than files:
+
+* **Descriptions** sealed under a scope or an embargo render as
+  `[cloaked:team]` / `[cloaked:embargo/77932133a2]` for non-holders, the
+  same placeholders `vl log` prints
+  ([embargoes](guide/embargoes.md#what-the-public-sees)).
+* **Cloaked tags** are not listed to non-members at all, which is what
+  public remotes do today. This is the one deliberate exception to "never
+  silently absent". A cloaked tag's existence is itself protected, and the
+  Lines page says so once: "Lines cloaked for scopes you're not in are not
+  listed."
+* **Sealed review threads** show as "3 threads in `ops`" with their
+  states. Counts and sizes are metadata the Hub holds (§3.3); bodies are
+  not.
+* **Proposals with a scope audience** (§5.2) are hidden by the server from
+  non-members. That is the second, server-enforced exception, needed for
+  security fixes.
+
+### D.4 Key screens
+
+All screens share one frame: the top bar, the left rail, the main column
+and the inspector. Wireframes show the main column and the inspector, and
+omit the rail where space is short.
+
+#### D.4.1 Repository home
+
+**For members**, the home is the timeline of `main` (or the line last
+viewed): changes grouped under the Hub operation that brought them, with
+anything that needs you at the top. **For anonymous visitors**, the README
+of the public projection comes first (rendered in the sandboxed content
+origin, §9.6), then the public timeline.
+
+```text
+┌ acme/app ──────────────────────────────────────── [/ jump]  [lens: you · public+team+ops]  [device: unlocked ◐] ┐
+│ Timeline  Files  Proposals  Lines  Embargoes  Scopes  Workspaces&runs  Hub log  Policy                          │
+├──────────────────────────────────────────────────────────────────────────────────┬──────────────────────────────┤
+│ @main ▾   Changes ● Operations ● Both                                            │ INSPECTOR  ·  @main          │
+│                                                                                  │ Tag main → uqttozys af765f31 │
+│ NEEDS YOU                                                                        │ Moved by alice ✓, op 7a1c,   │
+│  ▸ Proposal 42 waits for an ops sign-off from you            round 3 · 2 changes │   2026-11-04 04:09 UTC       │
+│  ▸ Scope ops: grant request for carol (laptop, native)            3f2a 91c0 ...  │ Chain verified (seq 41)      │
+│  ▸ Embargo 7793 releases in 6 days (mode A: a key holder releases)               │ Protection: proposal needed, │
+│                                                                                  │  sign-offs per touched scope │
+│ YOUR SLICE   1,260 entries · you read all · 2 scopes · 1 embargo on this line    │ Hub sees: ids, tree shape,   │
+│                                                                                  │  names+sizes of cloaked files│
+│ ── op 7a1c · alice pushed to main · 2026-11-04 04:09 ─────────────────────────── │  (no sealed trees yet), times│
+│  ○  uqttozys alice ✓ main af765f31 [embargo 7793]                                │                              │
+│  │╲  Fix CVE-2026-1234                ⇠ merges pzkmnmrl, ooquruqt                │ vl log -r main               │
+│  │ ○ ooquruqt alice ✓ [team]  Fix CVE-2026-1234: empty buffer crash              │   [copy]                     │
+│ ── op 69e0 · dan pushed to main · 2026-11-03 17:20 ────────────────────────────  │                              │
+│  ○  pzkmnmrl dan ✓ 781e94dc            Parser                    [public]        │                              │
+│ ── op 6511 · alice granted dan → team (ring #4) ──────────────────────────────── │                              │
+│  ◆  root                                                                         │                              │
+└──────────────────────────────────────────────────────────────────────────────────┴──────────────────────────────┘
+```
+
+* "Needs you" lists only items addressed to you or to a scope you're in
+  (§D.5.4). It is empty most of the time, and when it is, it disappears.
+* "Your slice" is the visibility summary in one line. It links to the lens.
+* **Operations** interleave with changes. A ring change or an embargo
+  event is history too, and on GitHub it would be buried in settings.
+* The graph glyphs are `vl log`'s (`@ ○ × ◆`, `⇠ merges`). Signature marks
+  are `vl log`'s (`✓ ✓bob ? ✗ unsigned`). Someone who knows `vl log` can
+  read the Hub, and the reverse.
+
+#### D.4.2 A change and its evolution log
+
+The change page is keyed by change id. It answers four questions: what the
+change does now, how it got here, who touched it, and who can see which
+part of it.
+
+```text
+ yltznuyx  Greet the world                                          [public] description
+ author alice · current version 53414202 · signed ✓alice · on main · in proposal 42 (round 3)
+ ─────────────────────────────────────────────────────────────────────────────────────────────
+ VERSIONS (evolution log)                                    compare:  [v2] → [v4]
+   v4  53414202  ✓alice   2026-11-04 04:14   pushed (op 7a1c) · proposal 42 round 3   ◀ current
+   v3  95fbd25b  ✓bob     2026-11-04 03:50   pushed (op 6f02) · round 2 · rebased by bob, author alice
+   v2  ecdb49a1  ✓alice   2026-11-03 18:02   pushed (op 6c11) · round 1
+   ·   ab0323d9           not on the Hub      (a local version on alice's device; id only)
+ ─────────────────────────────────────────────────────────────────────────────────────────────
+ v2 → v4:  content edited in 1 file · rebased onto main (af765f31)
+   [public]       main.rs        +1 −1      (rendered diff)
+   [ops: locked]  deploy/prod.yml   changed between v2 and v4 (1.2 KB → 1.3 KB). ops content: you hold no key.
+```
+
+* **Versions** come from the evolution log (`vl evolog`,
+  [getting-started](guide/getting-started.md#change-ids-and-snapshot-ids)).
+  The Hub holds only the versions someone pushed: sync walks parents and
+  trees, never `predecessors` (`remote.rs`), which are weak references even
+  locally (`gc.rs` module docs). Versions that never left a device
+  appear as ids with "not on the Hub", never as gaps.
+* **"Rebased only" versus "edited"** is computed per file by object id,
+  without keys, for sealed files too (§5.4, §5.6). A reviewer outside `ops`
+  still learns *that* `ops` content changed between two versions, which is
+  exactly what the sign-off carry-over rule needs.
+* **Author versus signer** follows `vl show`: "signed by bob (rewritten;
+  author alice)" (ARCHITECTURE.md §3, "Author vs. signer").
+* **Divergent changes** (two visible snapshots with one change id) get a
+  band at the top that lists both, with the `vl` command to settle it.
+* A **conflicted** version shows `×` and lists conflicted paths. On an
+  embargoed line no list is recorded (ARCHITECTURE.md §7 step 5), and the
+  page says so instead of showing an empty list.
+
+#### D.4.3 Review of a change that spans open and closed files
+
+A proposal page has three columns: the **stack** on the left, the **diff**
+grouped by audience in the middle, and the **sign-off matrix** in the
+inspector. Here Dan (a `team` member outside `ops`) is looking at it.
+
+```text
+ Proposal 42 · land on main · by alice · round 3 of 3                       audience: everyone
+ "Retry deploys on 503"                                                     [public] title
+ ┌ STACK (bottom first) ┐ ┌ DIFF · change ksnqvlmo · round 2 → 3 ─────────────┐ ┌ SIGN-OFFS · round 3 ─────────┐
+ │ ▸ ksnqvlmo  Retry…   │ │ PUBLIC                                            │ │ public  1 needed  ✓ dan      │
+ │   rebased, edited    │ │  [public] app/retry.py        +24 −3   viewed ✓   │ │          (maintainer)        │
+ │ ▸ wlmrptzn  Config…  │ │  [public] tests/test_retry.py +40      viewed ✓   │ │ team    1 needed  ✓ dan      │
+ │   rebased only       │ │ TEAM                                ◐ opened here │ │          carried from round 2│
+ │                      │ │  [team] secrets/notes.md      +2 −0               │ │          team files unchanged│
+ │ round  1 2 [3]       │ │ OPS                                               │ │ ops     1 needed  —          │
+ │ base main af765f31   │ │  [ops: locked] deploy/prod.yml  1.2→1.3 KB        │ │          you are not in ops  │
+ │                      │ │   You can't review this file. 1 ops member must   │ │          ask: carol, erin    │
+ │ POLICY               │ │   sign off. Its content changed in this round.    │ │          [Request ops review]│
+ │ no .veilpolicy edits │ │ THREADS  2 open in public · 1 resolved in ops     │ │ ci/build ✓  (runner r-ops-1) │
+ └──────────────────────┘ └───────────────────────────────────────────────────┘ │ ──────────────────────────── │
+                                                                                │ Land: an ops member must     │
+                                                                                │ land: main moved since round │
+                                                                                │ 3 and also changed           │
+                                                                                │ deploy/prod.yml (§5.5)       │
+                                                                                │ vl hub land 42               │
+                                                                                └──────────────────────────────┘
+```
+
+* **Grouping by audience** is the core of the screen. Public files come
+  first, then each scope you hold, then locked scopes. Within a group, the
+  order follows the tree. A locked group still lists every file with size
+  changes (until C5), and says who can review it.
+* **Rounds** are compared per change, matched by change id across rebases
+  (§5.1). Each change in the stack is labelled *rebased only*, *edited* or
+  *new / dropped / squashed away*, so a reviewer re-reads only what
+  changed.
+* **The sign-off matrix** has one row per touched scope (§5.3, §5.6). Each
+  row shows who signed, whether the sign-off was carried over and why
+  ("`team` files unchanged", from equal `(path, object id)` pairs), or why
+  it was dismissed ("`deploy/prod.yml` changed in round 3"). Required
+  statuses appear under it (§7.5).
+* **Who can land** is computed before anyone clicks (§5.5): "you can land",
+  "an `ops` member must land, or rebase the proposal first", or "blocked:
+  sign-off missing for `ops`". Land runs in the browser's worker or in `vl`
+  (§5.7), and the button says so: "Land on main (merges in this browser,
+  then pushes)".
+* **Policy changes** get their own tab whenever the stack edits
+  `.veilpolicy` (§D.6.5).
+
+#### D.4.4 Scopes and members, and the grant flow
+
+```text
+ SCOPES · acme/app                                                       vl scope list
+ ┌─────────┬─────────┬────────┬────────┬───────────────┬──────────────────┬─────────────────────┐
+ │ scope   │ you     │ gen    │ admins │ members       │ checkpoint       │ team (Hub) mapping  │
+ ├─────────┼─────────┼────────┼────────┼───────────────┼──────────────────┼─────────────────────┤
+ │ team    │ admin   │ 2      │ 2      │ 6 (9 devices) │ 3 h ago ✓        │ eng · in step       │
+ │ ops     │ member  │ 4      │ 1  !   │ 3 (4 devices) │ 2 d ago ✓        │ sre · 1 behind      │
+ │ s-7f3a… │ none    │ —      │ —      │ hidden        │ —                │ —                   │
+ └─────────┴─────────┴────────┴────────┴───────────────┴──────────────────┴─────────────────────┘
+  ! ops has one admin. Losing that device freezes the scope (guide: "Have at least two admins").
+```
+
+The **scope page** has three tabs:
+
+1. **Members.** One row per person, expanded to their devices: name,
+   fingerprint, device kind (native, web or runner, §6.2), role, the
+   generation they were granted at, and whether their binding is proved
+   (a short member id gives "unknown key" signatures,
+   ARCHITECTURE.md §3). Actions: grant, revoke (rotates, and says so),
+   make admin.
+2. **Ring log.** `vl scope log` as a timeline: each change with its signer
+   and signature, generation and time. Ring changes that need attention are
+   flagged (§D.6.6).
+3. **Requests.** Grant and revocation requests from team mappings (§6.1),
+   new devices (§6.2) and "Ask for access" (§D.3.1), and the drift between
+   team and ring. An admin acts on them in a batch: one confirmation, one
+   signed change per scope and repository, pushed together (§6.1).
+
+**Inviting**, as designed in §6.3. The point of the UI is to make the
+out-of-band step impossible to skip by accident.
+
+```text
+ 1  ADMIN: Invite to ops                          2  INVITEE opens the link
+ ┌──────────────────────────────────────────┐     ┌──────────────────────────────────────────────┐
+ │ Scope ops · role member · expires 72 h   │     │ alice invites you to scope ops in acme/app.  │
+ │                                          │     │ This browser will get its own key; it never  │
+ │ Your invite link (copied):               │     │ leaves this browser.                         │
+ │ hub.example/i/9Q2F…#k=xxxxxxxx           │     │ [Use passkey]  then  [Accept invite]         │
+ │                                          │     │ Your device fingerprint:                     │
+ │ Send it yourself: chat, in person.       │     │   3f2a 91c0 7be4 d018                        │
+ │ The part after # never reaches the Hub,  │     │   "harbor · velvet · comet · ninety"         │
+ │ so the Hub can't swap in its own key.    │     │ Read these to alice when she asks.           │
+ │ The Hub doesn't email invites. (§6.3)    │     └──────────────────────────────────────────────┘
+ └──────────────────────────────────────────┘
+ 3  ADMIN: Confirm and grant
+ ┌───────────────────────────────────────────────────────────────────────────────┐
+ │ bob accepted (account bob, device "laptop", native).  Invite tag verified ✓   │
+ │ Fingerprint 3f2a 91c0 7be4 d018 · "harbor · velvet · comet · ninety"          │
+ │ Compare by voice or in person if the content matters.  [ ] I compared it      │
+ │ [Grant ops to bob's laptop]   signs a ring change, then pushes                │
+ │ vl scope grant ops veil1e75c…c00a --name bob                                  │
+ └───────────────────────────────────────────────────────────────────────────────┘
+```
+
+* The "I compared it" box is not required, but an unticked grant is
+  recorded in the Hub's metadata as "fingerprint not confirmed" and shown
+  on the member row. Pressure through visibility, not through a blocker.
+* The fingerprint words *(UX addition)* are a display encoding of the same
+  hash as the hex, for comparison by voice. They protect nothing beyond the
+  comparison itself, and they are not the 6-word invite code of §6.3, which
+  needs a PAKE first (§11.3 item 3).
+* After the grant, the invitee's page fills in without a reload: the
+  clone-then-grant flow (ARCHITECTURE.md §6), with a short unseal transition
+  (§D.7.5).
+
+#### D.4.5 The embargo board
+
+The board is a view of embargo records and their lines. Columns follow an
+embargo's life:
+
+```text
+ EMBARGOES · acme/app                                   vl embargo list    [+ New embargoed fix]
+ ┌ IN PREPARATION ────────┐ ┌ EMBARGOED ─────────────────┐ ┌ DUE ────────────────┐ ┌ RELEASED ──────────┐
+ │ fix-cve2@ (cloaked:sec)│ │ 77932133a2 · scope team    │ │ (none)              │ │ 51c0aa9e3f         │
+ │ proposal 44 (audience  │ │ on main · mode A           │ │                     │ │ released 10-28     │
+ │   sec, hidden)         │ │ until 2026-11-11 04:09 UTC │ │ Mode A: due means   │ │ by erin ✓          │
+ │ ! main carries 7793:   │ │   (Thu 05:09 your time)    │ │ "waiting for a key  │ │ public: ✓ mirror ✓ │
+ │   lands after release, │ │ public sees: pre-merge tree│ │ holder's vl"; the   │ │ history filled in  │
+ │   or on another line   │ │ withheld: 2 snapshots      │ │ Hub notifies them   │ │                    │
+ │                        │ │ [Preview release] [Release]│ │ (§8.2)              │ │                    │
+ └────────────────────────┘ └────────────────────────────┘ └─────────────────────┘ └────────────────────┘
+```
+
+* **One embargo per line** is shown, not just enforced: a line with an
+  unreleased embargo is marked in Lines and on the board, and a fix being
+  prepared for that line shows the same message `vl merge` gives
+  ([embargoes](guide/embargoes.md#one-embargo-per-line)).
+* **Release mode** is part of each card, with what it means: A ("released
+  by the first key holder's `vl` after the deadline; the Hub notifies"), B
+  ("released by the release service at the deadline"), C ("anyone can
+  release once the drand round is out; cannot be postponed") (§8.1).
+* **Preview release** shows the public projection as it would be after
+  release: the files that become public, the history that fills in, and
+  what the Git mirror will receive (§8.2). **Release** is a permanent
+  action (§D.4.6).
+* **Scope match** is checked when preparing: a fix workspace cloaked for a
+  different scope than the planned embargo gets the guide's warning ("Use
+  the same scope as the fix workspace's `--cloak`").
+* **Outsiders get no board.** The embargoed merge appears in their timeline
+  as it appears in `vl log` on a public clone, with id, scope and deadline,
+  because that is public metadata. The Hub doesn't advertise it beyond
+  that: no countdown and no list of upcoming publications (an open
+  question, §D.9.2).
+
+#### D.4.6 The Hub log and undo
+
+The Hub log is the remote's op log: one entry per accepted push or Hub
+action (§4.5). Members' own op logs stay on their devices (FORMAT.md §2),
+and the page says so in its header: "This is the Hub's log. Your device's
+log: `vl op log`."
+
+Every entry carries a reversibility class *(UX addition; server support
+noted per row)*:
+
+| Class | Mark | Examples | What "undo" does |
+|---|---|---|---|
+| **Undoable** | ↺ | a tag move by push or land; closing a proposal; Hub settings, ACL and team changes; dismissing a sign-off | Restores the earlier state. For a tag, see *retraction* below |
+| **Compensable** | ⇄ | a grant (→ revoke, which rotates); a revoke (→ re-grant at the current generation, which opens history again); a team mapping | Proposes the counter-action, and says what it cannot take back |
+| **Permanent** | ■ | an embargo release; a land that declassifies cloaked files; a push that published public content mirrored to GitHub; a rotation | Nothing. The entry explains what to do instead (rotate the underlying secrets) |
+
+```text
+ HUB LOG · acme/app                                                  vl hub log
+ ↺  op 7a1c  alice   land proposal 42 → main  e7645a71 → af765f31          [Undo…]
+ ⇄  op 7a0f  alice   ops: grant carol (laptop)   ring #9                    [Revoke…]
+       carol's devices have not fetched since the grant: the key has not reached them yet
+ ■  op 79d2  erin    release embargo 51c0aa9e3f   (public + GitHub mirror)   permanent
+ ↺  op 7911  dan     push main  5f50d8ae → e7645a71                         [Undo…]
+```
+
+* **Retraction for tag moves** *(UX addition; needs a server rule in §4.5
+  check 1 and a signed tag update, §4.6).* Moving `main` back on the Hub
+  does not move it on the clones that already pulled. Their next `vl push`
+  would fast-forward it again, because tags fast-forward
+  ([teams](guide/teams-and-remotes.md#push-and-pull)). So undoing a tag move
+  records the undone target as **retracted**: the Hub refuses to
+  fast-forward that tag onto a retracted snapshot unless the pusher forces
+  it, and members who pulled it get a notice ("main was moved back by
+  alice; your local main is ahead"). The undo dialog says all of this
+  before it acts.
+* **"Not yet delivered"** for grants uses metadata the Hub has anyway (who
+  fetched what, §3.3). If the grantee's devices haven't fetched since the
+  grant, a revoke is close to a clean undo. If they have, the dialog says
+  that they hold the key for everything up to now (forward-only,
+  [teams](guide/teams-and-remotes.md#removing-a-teammate)).
+* **Permanent actions get a ceremony, not a typing test.** The ceremony is
+  a publication preview: the public projection before and after, the
+  files, the history that fills in, and the Git mirror effect. The user
+  confirms with a passkey user-verification, which is needed anyway to
+  sign. There is no "type the repository name" dialog.
+* In the browser, actions are a local transaction followed by a push (land,
+  release, ring changes). The worker's own repository has an op log too, so
+  a failed push leaves nothing half-done, and the UI offers "Retry push" or
+  "Discard local change" (`vl undo` in the worker).
+
+#### D.4.7 Workspaces and agent sandboxes
+
+In 1.0, workspaces are entries in a device's view. Only tags travel on push
+([teams](guide/teams-and-remotes.md#push-and-pull)), so the Hub cannot see
+anyone's workspaces today. The proposal *(UX addition; needs a server-side
+ref namespace like `pr/<n>/…` in §5.1)*: a member may **share** a workspace
+to the Hub as `ws/<account>/<name>`, a server-side ref that is not a tag,
+never reaches public remotes or Git, and keeps the workspace's cloak.
+Shared workspaces do three jobs: hand-off between devices, "look at this"
+without opening a proposal, and a target for agent runs.
+
+A **run** is a job on a runner (§7.2): an ephemeral workspace over snapshot
+S (`Repo::ephemeral_workspace`, ARCHITECTURE.md §6) runs a command, and the
+result is recorded as a new change on top of S, as
+`vl ws exec --ephemeral` does today
+([workspaces](guide/workspaces-and-agents.md#one-shot-runs---ephemeral)).
+CI runs and agent runs are the same object. They differ only in what
+happens to the result: CI reports a status, and an agent run offers its
+change as a proposal or adds it to a shared workspace.
+
+```text
+ WORKSPACES & RUNS · acme/app
+ SHARED WORKSPACES
+  fix-cve@   alice   [cloaked:team]  ooquruqt  "Fix CVE-…" (sealed)   updated 2 h ago   [Open] [Propose]
+  docs@      dan     public          tnqynyzv  "Rewrite guide"        updated 1 d ago   [Open] [Propose]
+
+ RUNS
+  ● agent "lint fixes"  on main (af765f31)  runner group: hub-hosted (public projection only)
+      result  zsspmtrn  "agent: lint fixes"  +3 files
+      held back  2 files at paths cloaked for ops: this runner holds no ops key, so they were not recorded
+      quarantined  1 file: leaked.txt (injected-isolated-secret)
+      [Review as proposal]  [Discard]                    vl hub run --ephemeral -r main -- cargo fmt
+  ✓ ci/build            on proposal 42 round 3  runner r-ops-1 (member of ops)  log sealed for ops ◐
+```
+
+* **What a run could see** is its first fact: hub-hosted runners get the
+  public projection only, and self-hosted runners get the scopes they are
+  members of (§7.1). An agent that edits files it cannot seal has those
+  edits held back (`BuildReport::cloak_failures`, ARCHITECTURE.md §4 rule
+  4), and the UI lists them as "held back", never as "failed".
+* **Quarantine is legible.** A run that writes a secret, or a copy of an
+  injected one, shows the file and the scanner rule
+  ([workspaces](guide/workspaces-and-agents.md#with-isolated)). This is
+  Veil's most distinctive safety net for agents, and on GitHub it would be
+  invisible.
+* **Run logs** are sealed for the job's scope (§7.2), and they open in the
+  browser like files.
+* The UI repeats the guide's caution where it matters: a sandbox isolates
+  files, not processes. Untrusted agents belong on ephemeral runners
+  ([workspaces](guide/workspaces-and-agents.md#sandboxes)).
+
+#### D.4.8 Onboarding: "unlock this device"
+
+Three distinct states, never conflated: **signed in** (account, passkey),
+**unlocked** (this browser's identity decrypted into the worker, §9.3) and
+**granted** (scopes have wrapped keys to this device).
+
+```text
+ FIRST VISIT TO A REPOSITORY YOU BELONG TO
+ ┌─────────────────────────────────────────────────────────────────────────────────┐
+ │ Set up this browser                                                    step 2/3 │
+ │                                                                                 │
+ │ ✓ Signed in as bob (passkey)                                                    │
+ │ ▸ Create this browser's key                                                     │
+ │     Closed files are decrypted here, in this browser. To do that, it needs its  │
+ │     own key. The key is created here, locked with your passkey, and never sent  │
+ │     to the Hub.                                                                 │
+ │     [Create key with passkey]       (no passkey PRF? use a passphrase instead)  │
+ │ · Ask for access                                                                │
+ │     Your laptop (native) is a member of team, ops. This browser is a new device:│
+ │     an admin must grant it, like any device. (§6.2)                             │
+ │     [Request team]  [Request ops]                    ops is native-only: use vl │
+ └─────────────────────────────────────────────────────────────────────────────────┘
+
+ LATER VISITS                                      WHILE WAITING FOR A GRANT
+ [device: locked ●] → [Unlock with passkey]        [team: requested · alice notified]
+ Locked: closed content is cleared from the page;  Public content and metadata work
+ public content stays.                             normally.
+```
+
+* The **device chip** in the top bar always shows the state: `locked ●`,
+  `unlocked ◐ (locks after 15 min idle)`, or `no key in this browser`.
+  When the device auto-locks, plaintext is removed from the page, not
+  merely hidden.
+* **Native-only scopes** (§9.5) are named at the request step, with the
+  `vl` path offered instead, so nobody waits for a grant that policy
+  forbids.
+* **The CLI path** *(UX addition)*: `vl hub login` shows a short pairing
+  code and opens the browser. The account confirms with its passkey, and
+  `vl` signs the identity registration statement (§6.2). The device's
+  identity is the one `vl identity show` prints.
+* **Link device** (§6.2, optional) appears only when org policy allows it,
+  with the short-code comparison on both screens.
+
+#### D.4.9 Org settings
+
+Org settings group by who is trusted with what. Each group says what
+enforces it: the Hub, clients, or cryptography.
+
+```text
+ ORG · acme · settings
+ People          accounts, teams, invitations                                   enforced by: Hub
+ Scope mapping   team → scope in repos, drift per repository                    Hub requests, admins sign
+ Roles           Org owners manage people and access to ciphertext.
+                 Only scope admins can grant keys; only members can read.        cryptography
+ Devices         web identities may not be admins [on]; native-only scopes [ops, prod]   admins' clients
+ Governance      minimum admins per scope [2]; hold admin changes for a 2nd admin [off]   Hub (not proof
+                 break-glass identity [not set]                                  against a compromised Hub)
+ Publishing      pre-publish gate: [reject] / quarantine for review (§4.5 check 12)        Hub
+                 Git mirror: github.com/acme/app [on]
+ Embargoes       modes allowed: A [on] B [off] C [off]                           §8
+ Scope names     opaque by default [on] (§6.1)                                   Hub
+ Runners         groups, identities, the scopes they are members of              cryptography
+ Offboarding     [Offboard a person…]                                            §6.5
+ What the Hub sees   this org's metadata exposure, specific and current          (read-only)
+```
+
+* **Offboarding** is the §6.5 sequence as a checklist with live progress:
+  Hub steps (sessions suspended, serving stopped) tick immediately, admin
+  steps wait with the name of each admin who can act, and the rotation
+  list is decrypted and secret-scanned in the admin's browser (§6.5 step
+  5).
+* **What the Hub sees** *(UX addition)* turns §3.3 into a concrete page for
+  this org: "The Hub can read the names of 214 cloaked files in 9
+  repositories, because sealed trees are not enabled; member names of 12
+  scopes; who fetched what and when." Each row links to the setting or
+  roadmap item that reduces it (opaque scope names, C5, C6). The page tells
+  the truth in one place, so no other page has to oversell.
+
+### D.5 Review and collaboration model
+
+The Hub's proposals are built on §5. This section covers how they feel,
+and why they don't follow GitHub's choices.
+
+#### D.5.1 A proposal moves a tag
+
+A proposal says: *move `main` so that it includes this stack*. Its header
+always shows the tag and the stack (`land on main · 2 changes`), never a
+branch-to-branch arrow. A proposal can be opened from a shared workspace,
+from a run, or from the CLI (`vl hub propose -r @- --onto main`, *UX
+addition*). The stack is the chain of changes between the target and the
+named revision. Outside contributors propose against the public
+projection (§1.3), and their stack is public-only by construction (§3.2,
+"Outside contributor").
+
+#### D.5.2 Stacks are first-class
+
+* Each change in the stack is reviewed on its own (`]` / `[` move between
+  changes). Sign-offs cover the whole round, as the `Approval` statement
+  signs every head (§5.6), and the UI shows that as "signs all 2 changes".
+* **Landing part of a stack** (the bottom k changes) *(UX addition; needs
+  §5.7's server check to accept a prefix of the signed heads)* lets a long
+  stack land in pieces without being split into new proposals.
+* Reordering the stack is not a web action. It is a rewrite, done with
+  `vl rebase` and pushed as a new round. The web shows the command.
+
+#### D.5.3 Rounds, not force-pushes
+
+Every push to a proposal is a round (§5.1). The default view is **since
+your last sign-off or visit**, per change: *rebased only* changes are
+collapsed with a one-line reason ("same content, new base"), and *edited*
+changes open on the interdiff between your last round and the current one.
+Sealed files take part through object ids: a non-member learns "`ops`
+content changed in round 3", and nothing more (§5.3).
+
+#### D.5.4 Sign-offs are per scope, and you sign what you read
+
+* Requests go to **scopes, not people**: "needs a sign-off from `ops`".
+  Any `ops` member can pick it up from their "Needs you" list. A person can
+  still be asked by name, but the requirement is the scope's (§5.6).
+* The sign-off control for scope S is enabled only after the client has
+  rendered every S file of the round *(UX interpretation of §5.6: "the web
+  client signs an approval for S only if it decrypted and showed the S
+  diff")*. A reviewer who wants to vouch for the public part only signs
+  `public`, which the UI offers as an explicit choice ("sign public only").
+* A sign-off shows as a **stamp**: signer, device, scope, round, time, and
+  "verified by your client" (each viewer's client checks the signature and
+  ring membership itself, §5.6). It is not a green check mark.
+* Carry-over and dismissal are explained in words on every stamp (§D.4.3).
+  "Stale review" is not a mysterious state.
+
+#### D.5.5 Threads anchored across rewrites
+
+Threads are anchored to `(change id, path, lines)` (§5.4) and have four
+visible states: **current**, **moved** (re-anchored, with "re-anchored by
+carol's client" and the version it moved from), **outdated** (waiting for
+a reader with the key to re-anchor), and **sealed** (you can't read the
+file, so you see "1 thread in `ops`, resolved"). A comment on a sealed file
+is sealed under that file's scope (§5.4). The composer shows the audience
+before you type: "Visible to `ops` members". A comment on a public file in
+a proposal whose audience is a scope gets the same label, so nobody writes
+for the wrong audience.
+
+**Suggested edits are changes** *(UX addition)*. "Suggest" on a line
+creates a small change on top of the commented change, authored by the
+reviewer and pushed into the proposal's next round as a separate change.
+The author takes it with `vl squash -r <suggestion>` or the web's "Fold in"
+button, or abandons it. It is Veil's own vocabulary, and the reviewer gets
+credit in the evolution log.
+
+#### D.5.6 Landing, embargoes and outside work
+
+* **Land** offers the strategies the protection rules allow: merge,
+  fast-forward or rebase (§5.7). Before it runs, it shows who can land and
+  why (§5.5), and what the public projection gains: "publishes 3 files from
+  scope `team`" for a declassification (§5.7).
+* **Land under embargo** is a variant of land, available when the
+  proposal's audience is a scope. It asks for the deadline and the release
+  mode, and checks scope match and one-embargo-per-line before anything is
+  signed (§5.7, §8).
+* **Proposals imported from GitHub** (§5.8) carry a provenance stamp:
+  "imported from github.com/acme/app#123, signed by the Hub bridge
+  identity (not a member)". Snapshots signed by the bridge identity show `?`
+  where a member's would show `✓`, so the signature column stays honest.
+
+#### D.5.7 What is deliberately not GitHub's
+
+| GitHub | Hub | Reason |
+|---|---|---|
+| Pull request from branch A to branch B | Proposal to move tag T over a stack | No branches; tags follow rewrites |
+| "Force-pushed" event; reviews go stale wholesale | Rounds, compared per change id; sign-offs dismissed per scope | Change ids survive rewrites; sealing is deterministic (§5.6) |
+| One "Approve" per reviewer | A signed sign-off per scope | Different people hold different keys |
+| Reviewers requested by name | Requests to scopes | Any key holder may sign |
+| Suggestion blocks applied as commits by GitHub | Suggested changes, folded in by `vl squash` | The server can't write closed files, and shouldn't write anything |
+| Merge button on the server | Land, in your client | Merging closed files needs keys (§5.7) |
+| Hidden private fork for advisories | Embargoed proposal on the real line | §8.5 |
+
+### D.6 Trust and security UX
+
+The Hub makes four kinds of trust facts visible: **content** (where
+plaintext came from), **signatures** (who made what), **the client** (is
+this page the real one) and **freshness** (is this the latest membership).
+Each has one home, the inspector, and one compact form, a chip.
+
+#### D.6.1 "Opened on this device"
+
+Every pane that shows closed content has a thin margin mark ◐ and, in the
+inspector:
+
+```text
+ Opened on this device
+   deploy/prod.yml · scope ops · generation 4 · key id 9c41e07a2b5d8f13
+   fetched 1.3 KB of ciphertext from the Hub · decrypted in this browser's worker
+   The Hub stored and sent only ciphertext; the plaintext above never left this device.
+ What the Hub can see about this file
+   its name and size (sealed trees are not enabled), its scope, when it changed, who fetched it
+```
+
+Public content says the opposite, just as plainly: "Public: the Hub and
+everyone can read this." The contrast teaches the model better than a
+tutorial. The key id is the public key id of the generation
+(ARCHITECTURE.md §3, "key id"), safe to show.
+
+#### D.6.2 Signatures
+
+The marks are `vl log`'s, with the same meanings (ARCHITECTURE.md §3,
+"Status"): `✓` good, `✓bob` good with a different signer, `?alice`
+unknown key (valid, but no ring binds it to that member), `✗` bad,
+`unsigned`. They differ in severity:
+
+* `✓` is quiet;
+* `?` and `unsigned` are a Notice. Signatures are advisory in 1.0
+  ([secrets-and-visibility](guide/secrets-and-visibility.md#what-is-protected-and-what-isnt)),
+  so this is a fact to know, not an alarm. Protection rules can still
+  require signatures (§5.6), in which case land says so;
+* `✗` is a Stop: a version whose signature does not verify is marked on
+  every page it appears on, and land refuses it.
+
+Each person also gets a **key mark** *(UX addition)*: a small geometric
+glyph derived from their signing key and shown beside their name. Two
+"alice" accounts with different keys look different at a glance. The mark
+is never the only cue: the inspector shows the fingerprint.
+
+#### D.6.3 The client: verified, unverified, native
+
+The device chip carries the client state (§9.5):
+
+| State | Shown as | Meaning |
+|---|---|---|
+| Native (desktop app or `vl`) | `native · 1.4.0 ✓` | Updates verified against the release signature |
+| Web, verified by the pinning extension | `web · verified 1.4.0 ✓` | The extension matched every asset to the transparency log |
+| Web, not independently verified | `web · served by hub.example` (neutral grey) | The usual case. You trust the Hub to serve the right code, which the inspector explains in two sentences. Native-only scopes are not unlockable here |
+| Extension reports a mismatch | **full-page stop** | The page is blocked; nothing is unlocked. This is the one red full-page state |
+
+The unverified state is not a warning. Most people will run it, and
+treating it as an error teaches people to ignore warnings. It becomes a
+Warning only where it matters: when the user tries to unlock a scope marked
+sensitive, or to sign a ring change, the dialog says "Admin actions are
+native-only in this org" or offers to continue in the desktop app.
+
+#### D.6.4 Severity scale and copy
+
+| Level | Colour | Used for | Example copy |
+|---|---|---|---|
+| **Info** | none (ink) | normal limits | "Names of cloaked files are visible to the Hub." |
+| **Notice** | blue band | something to act on, at your pace | "carol asked for access to ops." |
+| **Warning** | amber band + icon | a risk you can accept | "ops has a single admin." |
+| **Stop** | red, blocking + icon | integrity failure | "This version's signature does not verify. It was not made by the key it claims." |
+
+Copy rules: say what happened, what it means, and what to do, in that
+order. Use words like "attack" or "compromise" only when verification
+proves it, never as a guess. Never say "secure"; say what is protected and
+against what, as the guide does.
+
+#### D.6.5 A held-back policy change
+
+`.veilpolicy` changes are review subjects of their own (§5.3). When a
+proposal edits it, a **Policy** tab renders the edit as tier transitions,
+not as a text diff:
+
+```text
+ POLICY CHANGES IN THIS PROPOSAL                                     vl policy show
+  rule                 before            after                 effect
+  .env                 isolate (built-in) public!             WEAKENS: devices keep their accepted
+                                                                protection until each member runs
+                                                                `vl policy accept`
+  deploy/**            cloak ops          cloak opz            RE-SCOPES sealed files: needs ops; a merge
+                                                                never takes such a rule from the merged
+                                                                side (ARCHITECTURE.md §5)
+  build/               —                  ignore               applies at once (strengthens)
+  needs sign-off from: public, ops   (scopes whose paths the rules mention, §5.3)
+```
+
+This reuses the engine's own definitions: what counts as weakening
+([secrets-and-visibility](guide/secrets-and-visibility.md#the-accepted-policy-when-an-incoming-change-is-held-back)),
+what a merge refuses to take (ARCHITECTURE.md §5), and what applies at
+once. The Hub cannot know any member's accepted policy, which is
+device-local, so it never claims to. It says what *their devices* will do.
+
+#### D.6.6 Ring changes that need attention
+
+On the scope page and in the Hub log, ring changes are graded:
+
+* **routine**: grant a member, rotate. Listed.
+* **notable**: revoke, or grant to a web identity. Listed, with a dot in
+  admins' "Needs you".
+* **sensitive**: grant or remove an admin, demote an admin, grant to a
+  device registered in the last 24 hours, grant without a confirmed
+  fingerprint. With governance on (§6.7), the Hub **holds** the change
+  until a second admin confirms, and the card says what it would do and
+  who must confirm. With governance off, every member of the scope gets a
+  one-line digest: "alice made dave an admin of ops".
+
+**Freshness** (§6.6) appears as the checkpoint age on each scope ("3 h ago
+✓"). When a scope's newest checkpoint is older than the window, the chip
+turns into a Warning: "New ops content can't be sealed until an admin
+checkpoints the ring (newest: 9 days ago)." A gossip mismatch (two members
+hold different ring heads) is a Stop for that scope, with what each side
+holds.
+
+#### D.6.7 What we will not do
+
+* No "encrypted" padlock theatre on pages that hold public content.
+* No security score. It invites gaming and hides the trade-offs that §3.3
+  states.
+* No silent auto-acceptance of anything security-relevant on the user's
+  behalf. The web never runs the equivalent of `vl policy accept` for
+  anyone.
+
+### D.7 Visual language
+
+#### D.7.1 Direction: a ledger, not a dashboard
+
+The Hub looks like a well-set ledger: light by default (with an equal dark
+theme), typographic, few boxes, hairline rules between entries, generous
+line spacing in prose and tight spacing in lists. Change ids, the most
+important identifiers, are set as typographic elements in monospace,
+with the shortest unique prefix in bold (*UX addition*, like the unique
+prefix `vl` accepts, [getting-started](guide/getting-started.md#revisions)).
+
+How it differs from its neighbours:
+
+| | GitHub | GitLab | Linear | Veil Hub |
+|---|---|---|---|---|
+| Structure | horizontal tabs, file tree first | heavy left sidebar, many menus | issue-centric lists | narrow rail, timeline first, inspector of facts |
+| Mood | busy, social (avatars, counters, stars) | dense, enterprise | dark-first, glossy, minimal | calm paper-and-ink, no social chrome |
+| Colour | green/purple/red state badges | orange/purple brand | purple gradients | ink neutrals; colour reserved for audience and severity |
+| Identity marks | avatars | avatars | avatars | names with a key mark (§D.6.2); avatars optional and small |
+
+#### D.7.2 Typography
+
+* **UI:** Atkinson Hyperlegible Next. It is open-licensed, designed for
+  character distinction (`l I 1`, `0 O`), and used by none of the three
+  products above. **Ids, paths and code:** Atkinson Hyperlegible Mono by
+  default, user-selectable.
+* Tabular figures everywhere numbers align (sizes, times, generations).
+* Base size 14 px in compact density, 15 px in comfortable. Three densities,
+  compact by default, because members live in lists.
+
+#### D.7.3 Colour encodes audience, never alone
+
+Every state from §D.3.1 has **an icon, a pattern, a text label and a
+colour**. Remove the colour and nothing is lost.
+
+| State | Icon | Pattern / border | Label | Hue family |
+|---|---|---|---|---|
+| Public | open aperture | none | `public` | ink (no hue: openness is the default) |
+| Public, unscanned | aperture with a bar | none | `public!` | ink, with a Notice dot |
+| Opened here (scope S) | key | solid left rule | `S` | the scope's hue |
+| Locked (scope S) | closed padlock | diagonal hatch | `S: locked` | the scope's hue, desaturated |
+| Device locked | padlock with a person | dotted hatch | `S: unlock` | the scope's hue, desaturated |
+| Embargoed | hourglass | dashed outline | `embargo <id>` | amber |
+| Withheld | — | dotted outline, hollow node | `withheld` | ink, light |
+| Not fetched | — | skeleton shimmer (static under reduced motion) | (screen readers: "loading") | none |
+| Held at the gate | shield with a bar | double rule | `held at gate` | amber |
+
+* **Scope hues** come from a fixed set of eight hues, chosen so that
+  adjacent hues stay distinguishable under the common colour-vision
+  deficiencies. Scopes are assigned hues in creation order. With more than
+  eight scopes, hues repeat but labels never do. An org can pin a hue to a
+  scope.
+* **Red** is reserved for Stop. Closed is not an error, so locked content
+  is never red.
+* **Diffs** keep the conventional added/removed meaning, with `+`/`−` in
+  the gutter and word-level underlines, so colour isn't needed. A
+  blue/orange palette is one setting away.
+* Contrast: text 4.5:1 (WCAG 1.4.3), icons, borders and patterns 3:1
+  against adjacent colours (1.4.11), in both themes.
+
+#### D.7.4 Layout and responsiveness
+
+* Desktop: rail (56 px) + main (fluid) + inspector (320 px, collapsible
+  with `i`).
+* Narrow screens and phones (the solo persona wants a phone, §1.3): the
+  rail becomes a bottom bar of five items (Timeline, Proposals, Embargoes,
+  Needs you, Jump), and the inspector becomes a sheet. Reading,
+  commenting and signing off work on a phone. Ring changes and land
+  default to "continue on a computer", because both are consequential and
+  admin roles are native-only by default (§9.5).
+
+#### D.7.5 Motion
+
+One signature motion: **unseal**. When content becomes readable (unlock, a
+grant arriving, an embargo release), its placeholder's hatch dissolves into
+the content in about 150 ms. It marks a real state change the user should
+notice. Otherwise motion is functional only: no parallax, no ticking
+countdowns (deadlines read "in 6 days" and show the exact time on focus).
+Under `prefers-reduced-motion`, every transition is instant.
+
+#### D.7.6 Keyboard first, and WCAG 2.2 AA
+
+* `/` jump: revisions (`main--`, `yl`, `fix-cve@`, `origin/main`), paths,
+  proposal numbers, and `vl` commands (`vl show yl`,
+  `vl diff --from main- --to main` open the matching page).
+* `g t` timeline, `g f` files, `g p` proposals, `g l` lines, `g e`
+  embargoes, `g s` scopes, `g w` workspaces, `g h` Hub log.
+* Lists: `j`/`k` move, `o` open, `x` select. Review: `n`/`p` next/previous
+  file, `]`/`[` next/previous change in the stack, `c` comment, `v` mark
+  viewed, `s` sign off (opens the confirmation; never signs directly).
+* `?` lists every shortcut. Single-key shortcuts can be turned off or
+  remapped (WCAG 2.1.4).
+* **WCAG 2.2 AA specifics.** Focus indicators are never hidden by the
+  sticky top bar or the inspector (2.4.11). Targets are at least 24×24 px
+  (2.5.8). Nothing needs a drag (2.5.7), including reordering and resizing.
+  Sign-in and unlock use passkeys, so authentication needs no transcription
+  or memorised puzzle (3.3.8). The invite code field accepts paste. Help
+  lives in the same place on every page (3.2.6). Multi-step flows never ask
+  for the same thing twice (3.3.7).
+* **Screen readers.** The timeline is a list of entries, each with its
+  change id, description, author, signature status and audience as text.
+  The graph drawing is decorative and has a text equivalent per entry
+  ("merges pzkmnmrl and ooquruqt; ooquruqt withheld"). Every chip's label
+  is real text.
+
+### D.8 CLI and web parity
+
+Every page and action shows its `vl` equivalent in the inspector, with a
+copy button, and the jump field accepts the same commands. Commands use
+change ids and tag names, never URLs. Where a web action has no `vl`
+equivalent yet, the inspector says so. The UI never shows a command that
+doesn't exist.
+
+| Web | `vl` today | `vl` with the Hub *(UX addition unless cited)* |
+|---|---|---|
+| Timeline, changes | `vl log` | — |
+| Timeline, operations / Hub log | (device: `vl op log`) | `vl hub log`; `vl hub undo <op>` |
+| Change page, versions | `vl show <change>`, `vl evolog -r <change>` | — |
+| Interdiff between versions | `vl diff --from <snap> --to <snap>` | — |
+| Files, file | `vl files -r main`, `vl cat PATH -r main` | — |
+| Preview as public | — | `vl files -r main --as public` (computable without keys, C1) |
+| Lines | `vl tag list` | `vl hub tag log main` (signed update chain, §4.6) |
+| Policy view | `vl policy show`, `vl policy check PATHS` | — |
+| Open a proposal | — | `vl hub propose -r @- --onto main` |
+| Review a proposal | — | `vl hub review 42` (diffs per scope in the terminal) |
+| Sign off | — | `vl hub sign-off 42 --scopes public,ops` (§5.6 has `--scopes public`) |
+| Land | `vl merge … --into main` + `vl push` | `vl hub land 42` (§5.7's `vl hub pr merge 42`; `pr` stays an alias) |
+| Comment | — | `vl hub comment 42 -r <change> PATH:LINE -m …` |
+| Scopes, members, ring log | `vl scope list`, `vl scope log S` | — |
+| Grant, revoke, rotate | `vl scope grant|revoke|rotate` | — |
+| Invite, accept | (paste keys today) | `vl hub invite --scope ops`, `vl hub accept <link>` |
+| Grant requests | — | `vl hub sync-grants` (§6.1) |
+| Embargo board, release | `vl embargo list`, `vl embargo release ID` | `vl merge … --embargo --release-mode escrow` (needs C8) |
+| Shared workspaces | `vl ws list|new|exec` | `vl hub ws share NAME` |
+| Runs | `vl ws exec --ephemeral -r REV -- CMD` | `vl hub run --ephemeral -r REV -- CMD` |
+| Unlock this device | `vl identity show` | `vl hub login` |
+| Offboarding | `vl scope revoke` per scope | `vl hub offboard bob` (§6.5 batch) |
+| Recover from a rogue admin | — | `vl scope recover` (§6.7) |
+| Verify everything locally | `vl fsck` | `vl hub verify 42` (sign-offs, rings, statuses, tag chain) |
+| Open the web page for a revision | — | `vl hub open [REV]` |
+
+Web-only by nature: passkey management, billing, and the extension's
+verification. The org settings page lists these as web-only.
+
+### D.9 The MVP UI, and what to validate
+
+#### D.9.1 What each phase ships
+
+| Phase (§10.2) | UI it ships |
+|---|---|
+| **1. Smart remote** | Anonymous home (README + public timeline), files and change pages for the public projection (public renderer); Hub log (read-only); Lines with signed update chains; account sign-in; `vl hub login`; the "What the Hub sees" page |
+| **2. Web client, read and administer** | Unlock this device; the lens with "preview as public / as a subset of my scopes"; member timeline and "Needs you"; change page with versions and interdiffs; files decrypted in the worker with "opened on this device"; scopes, members, ring log, requests; the invite flow with fingerprint words; grant, revoke, rotate; offboarding checklist; checkpoint chips; embargo board (mode A: notify, release, preview release); device chip with the unverified state |
+| **3. Proposals** | Proposal page (stack, rounds, audience-grouped diff, sign-off matrix, threads, suggested changes), land and land under embargo, the Policy tab, held-at-gate review, Hub log undo with retraction (needs the server rule), reversibility classes; phone reading and sign-off |
+| **4. CI** | Runs (CI first), sealed logs, statuses in the sign-off matrix |
+| **5. Embargo service, Git mirror** | Release modes B and C on the board; GitHub import provenance stamps; mirror status |
+| **6. Hardening** | Extension-verified client state and the full-page stop; native-only scope UX; governance holds and second-admin confirmation; desktop app |
+| **Later** | Shared workspaces and agent runs (needs the `ws/` ref namespace; phase 4's runner work is the base); preview as a specific person; partial stack landing |
+
+**The MVP (phases 0–3, §10.3)** therefore includes the lens, the timeline
+home, change pages with evolution, the audience-grouped review with
+per-scope sign-offs, scopes with the out-of-band invite, the embargo board
+for mode A, the Hub log with reversibility classes, and the trust chips
+for content, signatures, device state and checkpoints. It excludes runs,
+shared workspaces, release modes B and C, and the verified-client state.
+Until phase 6, the device chip says "web · served by hub.example" for
+every browser, which matches §10.3's "as trustworthy as the Hub".
+
+#### D.9.2 Open UX questions to validate with real users
+
+Tested with the owner's team first, then with open-source maintainers and
+outside contributors (§1.3):
+
+1. **Timeline home.** Do members orient faster from the timeline than from
+   a file tree? Is README-first right for anonymous visitors? *Method:*
+   first-click tests on both homes, then a week of diary use.
+2. **Vocabulary.** Are proposal, round, sign-off and land understood
+   without explanation by people who know Git? Does "line" help or confuse
+   next to "tag"? *Method:* comprehension test on screenshots, before and
+   after a one-paragraph explainer.
+3. **Locked placeholders for outsiders.** Does seeing names of closed files
+   (until C5) feel informative or like a tease to outside contributors? Should
+   anonymous visitors see only the count line?
+4. **Embargo discretion.** No countdown for outsiders is the current
+   choice. Do downstreams want a public "something will be published" signal,
+   and does that outweigh tipping off attackers?
+5. **Sign what you read.** Will reviewers accept that a scope's sign-off
+   unlocks only after every file of that scope has been rendered, or will
+   they find it paternalistic on large generated files?
+6. **Requests to scopes.** Does routing review to a scope instead of a
+   person get faster responses, or diffuse responsibility?
+7. **Undo of tag moves.** Do teams understand that a retraction moves the
+   Hub's tag but not their clones', and is the notice enough?
+8. **The unverified-client state.** Does a neutral grey chip strike the
+   balance, or do users read it as "secure"? Do they install the
+   extension once they understand it?
+9. **Fingerprint comparison.** Do admins compare at all? Are words read
+   aloud more reliably than hex groups? *Method:* observed invites with a
+   planted mismatch, with consent.
+10. **Tier glyphs and patterns.** Are the nine states distinguishable in
+    greyscale, under simulated colour-vision deficiencies, at compact
+    density, and with a screen reader?
+11. **Preview as.** Does "preview as public" before landing a
+    declassification catch mistakes in practice, and should it be
+    mandatory for declassifying lands?
+12. **Phone scope.** Is read + comment + sign-off the right phone feature
+    set for the solo persona, or do they expect to release embargoes from a
+    phone?
 
 ---
 
@@ -538,6 +1706,9 @@ public projection have their own, lower limits.
 ---
 
 ## 5. Pull requests and review on change ids
+
+The UI calls these *proposals*; how review looks and feels is
+[§D.5](#d5-review-and-collaboration-model).
 
 ### 5.1 Data model
 
@@ -1214,7 +2385,9 @@ scopes and ring logs, embargo state, PR review and approval signing, ring
 changes for admins (grant, revoke, rotate) and the client side of merges.
 Syntax highlighting (tree-sitter in WASM) and search run in the worker over
 decrypted content. A search index of closed content is stored in OPFS,
-sealed under a device-local key, never uploaded.
+sealed under a device-local key, never uploaded. The screens are in
+[§D.4](#d4-key-screens), and how the client's trust state is shown is
+[§D.6](#d6-trust-and-security-ux).
 
 ### 9.5 The hard problem: the Hub serves the client
 
@@ -1361,7 +2534,7 @@ key holders, with Hub notifications), server-side Git mirroring (`vl git
 push` from a client, as today), the pinning extension and the desktop app.
 Until phase 6, the MVP is for the owner and their team only, with the web
 client treated as "as trustworthy as the Hub" and sensitive scopes kept to
-`vl`.
+`vl`. The UI each phase ships is in [§D.9](#d9-the-mvp-ui-and-what-to-validate).
 
 ---
 
