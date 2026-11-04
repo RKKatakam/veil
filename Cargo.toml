@@ -28,6 +28,7 @@ tempfile = "3"
 thiserror = "2"
 x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 zeroize = { version = "1", features = ["derive"] }
+zstd = { version = "0.14", default-features = false }
 
 [profile.release]
 lto = "thin"

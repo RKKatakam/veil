@@ -115,7 +115,13 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Evolog { rev } => {
             let mut cur = Some(ctx.rev(rev)?);
             while let Some(id) = cur {
-                let s = ctx.repo.snapshot(&id)?;
+                let s = match ctx.repo.snapshot(&id) {
+                    Err(veil_core::VeilError::Missing(_)) => {
+                        println!("{}", dim("(older versions were removed by `vl gc`)"));
+                        break;
+                    }
+                    r => r?,
+                };
                 println!("{}  {}", dim(&fmt_time(s.timestamp)), one_line(&ctx.repo, &id));
                 cur = s.predecessors.first().copied();
             }
@@ -216,6 +222,13 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Remote(c) => cmd_remote(ctx, c)?,
         Cmd::Push { remote, tag, force } => cmd_push(ctx, remote, tag, *force)?,
         Cmd::Pull { remote } => cmd_pull(ctx, remote)?,
+        Cmd::Gc {
+            keep_ops_days,
+            grace_minutes,
+            prune_now,
+            level,
+            no_deltas,
+        } => cmd_gc(ctx, *keep_ops_days, *grace_minutes, *prune_now, *level, *no_deltas)?,
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1185,4 +1198,65 @@ fn cmd_fsck(repo_arg: Option<&Path>, verbose: bool) -> Result<ExitCode> {
         println!("{} {} problem(s) found", red("Corrupt:"), report.count(Severity::Corrupt));
         Ok(ExitCode::FAILURE)
     }
+}
+
+// ---- storage -------------------------------------------------------------
+
+fn cmd_gc(
+    ctx: &mut Ctx,
+    keep_ops_days: Option<f64>,
+    grace_minutes: f64,
+    prune_now: bool,
+    level: i32,
+    no_deltas: bool,
+) -> Result<()> {
+    use veil_core::gc::{gc, GcOptions};
+    let secs = |x: f64, what: &str| -> Result<Duration> {
+        Duration::try_from_secs_f64(x).map_err(|_| anyhow!("invalid {what}: {x}"))
+    };
+    let opts = GcOptions {
+        keep_ops: keep_ops_days.map(|d| secs(d * 86_400.0, "--keep-ops-days")).transpose()?,
+        grace: if prune_now {
+            Duration::ZERO
+        } else {
+            secs(grace_minutes * 60.0, "--grace-minutes")?
+        },
+        level,
+        deltas: !no_deltas,
+        ..GcOptions::default()
+    };
+    let r = gc(&mut ctx.repo, &opts)?;
+    let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+    println!(
+        "Objects: {} before ({} loose, {} pack(s)), {} reachable, {} deleted, {} pending deletion",
+        r.objects_before, r.loose_before, r.packs_before, r.reachable, r.deleted, r.pending
+    );
+    if r.rescued > 0 {
+        println!("Kept {} object(s) that another process started using", r.rescued);
+    }
+    if let Some(name) = &r.pack {
+        let s = &r.pack_stats;
+        println!(
+            "Packed {} object(s) into pack-{} ({} delta, {} compressed, {} stored)",
+            s.objects,
+            &name[..12],
+            s.deltas,
+            s.compressed,
+            s.stored
+        );
+    }
+    if opts.keep_ops.is_some() {
+        println!("Operations: pruned {} of {}", r.ops_pruned, r.ops_before);
+    }
+    println!("Storage: {:.2} MiB -> {:.2} MiB", mib(r.bytes_before), mib(r.bytes_after));
+    for why in &r.incomplete {
+        println!("{} {why}", yellow("warning:"));
+    }
+    if !r.incomplete.is_empty() {
+        println!(
+            "{} part of the history could not be read, so nothing was deleted",
+            yellow("warning:")
+        );
+    }
+    Ok(())
 }

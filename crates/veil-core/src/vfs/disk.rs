@@ -140,6 +140,16 @@ impl StorageBackend for DiskBackend {
         fs::read(&full).map_err(|e| io_err(&full, e))
     }
 
+    fn read_range(&self, path: &VPath, offset: u64, len: usize) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let full = self.full_path(path);
+        let mut f = fs::File::open(&full).map_err(|e| io_err(&full, e))?;
+        f.seek(SeekFrom::Start(offset)).map_err(|e| io_err(&full, e))?;
+        let mut buf = vec![0; len];
+        f.read_exact(&mut buf).map_err(|e| io_err(&full, e))?;
+        Ok(buf)
+    }
+
     fn write(&self, path: &VPath, data: &[u8]) -> Result<()> {
         if path.is_root() {
             return Err(VeilError::InvalidPath("cannot write to the root".into()));

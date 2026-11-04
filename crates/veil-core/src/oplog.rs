@@ -110,6 +110,15 @@ impl OpStore {
         Ok(serde_json::from_slice(&raw)?)
     }
 
+    /// Like [`OpStore::get`], but `Ok(None)` if the operation does not exist
+    /// (e.g. pruned by `vl gc --keep-ops-days`).
+    pub fn try_get(&self, id: &ObjectId) -> Result<Option<Operation>> {
+        match self.backend.read_opt(&Self::op_path(id))? {
+            Some(raw) => Ok(Some(serde_json::from_slice(&raw)?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn head(&self) -> Result<ObjectId> {
         let raw = self.backend.read(&Self::head_path())?;
         ObjectId::from_hex(String::from_utf8_lossy(&raw).trim())
@@ -128,7 +137,8 @@ impl OpStore {
             if id.hex().starts_with(prefix) {
                 found.push(id);
             }
-            let op = self.get(&id)?;
+            // Older operations may have been pruned by gc.
+            let Some(op) = self.try_get(&id)? else { break };
             cur = op.parents.first().copied();
             steps += 1;
             if steps > 100_000 {

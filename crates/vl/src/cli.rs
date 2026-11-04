@@ -241,6 +241,32 @@ pub enum Cmd {
         #[arg(default_value = "origin")]
         remote: String,
     },
+
+    // ---- maintenance ------------------------------------------------------
+    /// Pack objects and delete those no retained operation can reach.
+    ///
+    /// Unreachable objects are deleted only once they have stayed unreachable
+    /// for the grace period (seen by an earlier `vl gc`), so running `vl`
+    /// commands are never affected.
+    Gc {
+        /// Prune operations older than this many days (the current operation
+        /// and its parents are always kept). Default: keep the whole op log.
+        #[arg(long, value_name = "DAYS")]
+        keep_ops_days: Option<f64>,
+        /// Minutes an object must have been unreachable before deletion.
+        #[arg(long, value_name = "MINUTES", default_value_t = 60.0)]
+        grace_minutes: f64,
+        /// Delete unreachable objects now (grace period 0). Unsafe while
+        /// another `vl` process is running.
+        #[arg(long)]
+        prune_now: bool,
+        /// zstd compression level for packed objects.
+        #[arg(long, default_value_t = 3)]
+        level: i32,
+        /// Do not delta-compress successive versions of a file.
+        #[arg(long)]
+        no_deltas: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
