@@ -115,9 +115,14 @@ too), `VEIL_HOME`, leftover sandboxes, the repository's format and lock
 it removes those whose holder has provably exited, which is the one thing
 it changes, and names the rest), the stat cache, the vault, the filesystem (network mounts, `fsync`, case and
 Unicode folding, see the README's [platform notes](../../README.md#platform-notes))
-and the clock. `vl doctor --remotes` also checks that each path remote is a
-Veil repository. SSH remotes are not contacted by `doctor` in 1.0
-(`not a local path; vl pull origin checks it`).
+and the clock. `vl doctor --remotes` also checks every remote: a path
+remote must be a Veil repository; an SSH remote is contacted (through your
+`ssh`, like `vl push`), must be a Veil repository, and its clock is compared
+with this machine's by the modification time of a probe file it creates and
+removes in the remote's `.veil/`. Beyond 60 s it warns: locks on a shared
+remote allow 2 minutes of clock difference between clients, and two clients
+can be off in opposite directions. Use it when a push or pull to an SSH
+remote reports a lock you do not expect.
 
 Run it after installing, after moving a repository to another disk, and
 whenever something behaves strangely.

@@ -979,11 +979,7 @@ pub fn push_with(
     force: bool,
     opts: &SyncOptions,
 ) -> Result<SyncReport> {
-    let mut remote = if is_repo(&*remote_backend) {
-        Repo::open(remote_backend.clone(), None, "remote")?
-    } else {
-        Repo::init_bare(remote_backend.clone())?
-    };
+    let mut remote = open_or_init_remote(&remote_backend)?;
     let mut report = SyncReport::default();
     let mut selected: Vec<(String, Tag)> = Vec::new();
     for (name, tag) in &local.view().tags {
@@ -1193,6 +1189,37 @@ fn unusable_target(store: &ObjectStore, target: &ObjectId) -> Result<Option<&'st
     }
 }
 
+/// Open the repository a push goes to, creating an empty bare one first if
+/// there is none.
+///
+/// Initialisation happens under the remote's lock, re-checked once the
+/// lock is held: when several first pushes reach an empty remote at once,
+/// one initialises it and the others find a repository and push to it
+/// normally (BUG-120). Without the lock the losers failed with
+/// "already exists", or, worse, a late loser could reset `op_head` to its
+/// own empty view after the winner had already pushed. An error while
+/// checking (a flaky connection) is an error, never a reason to initialise
+/// over what may be an existing repository.
+fn open_or_init_remote(backend: &Arc<dyn StorageBackend>) -> Result<Repo> {
+    let config = crate::repo::config_path();
+    if backend.exists(&config)? {
+        return Repo::open(backend.clone(), None, "remote");
+    }
+    let lock = crate::lock::RepoLock::acquire(backend.clone())?;
+    let repo = if backend.exists(&config)? {
+        Repo::open(backend.clone(), None, "remote")
+    } else {
+        Repo::init_bare(backend.clone())
+    };
+    drop(lock);
+    match repo {
+        // Initialised meanwhile by a client that did not take the lock
+        // (an older version): push to it like to any other repository.
+        Err(VeilError::AlreadyExists(_)) => Repo::open(backend.clone(), None, "remote"),
+        r => r,
+    }
+}
+
 /// Fetch every tag from `remote`, record them as `<remote_name>/<tag>`, and
 /// create or fast-forward local tags.
 pub fn pull(local: &mut Repo, remote_name: &str, remote_backend: Arc<dyn StorageBackend>) -> Result<SyncReport> {
@@ -1246,6 +1273,16 @@ pub fn pull_with(
     }
     sync_meta(remote.keys(), tx.repo().keys(), false, &mut report.warnings)?;
     tx.repo().keys().invalidate();
+    // Change and snapshot ids a new local tag must not shadow: those of
+    // local history and of everything this pull brings in (a teammate's
+    // change, tagged after its id by someone else, BUG-105).
+    let mut revisions = crate::revset::RevisionNames::default();
+    let mut incoming = Vec::new();
+    for (_, tag) in &tags {
+        if unusable_target(tx.repo().store(), &tag.target)?.is_none() {
+            incoming.push(tag.target);
+        }
+    }
     for (name, tag) in tags {
         // Tag names and targets come from the remote: a name may carry
         // terminal escapes or path tricks, and a target may be missing or
@@ -1265,6 +1302,17 @@ pub fn pull_with(
         tx.view.remote_tags.insert(format!("{remote_name}/{name}"), tag.target);
         match tx.view.tags.get(&name).cloned() {
             None => {
+                let refs = || {
+                    let mut r = tx.view.refs();
+                    r.extend(incoming.iter().copied());
+                    r
+                };
+                if revisions.shadows(tx.repo(), refs, &name)? {
+                    report.warnings.push(format!(
+                        "no local tag created for remote tag '{name}': the name is also a change or snapshot id of this repository; use {remote_name}/{name}"
+                    ));
+                    continue;
+                }
                 tx.view.tags.insert(name.clone(), tag.clone());
                 report.tags_updated.push((name, tag.target));
             }

@@ -94,6 +94,7 @@ const FX_FILE_ALREADY_EXISTS: u32 = 11;
 const S_IFMT: u32 = 0o170_000;
 const S_IFDIR: u32 = 0o040_000;
 const S_IFREG: u32 = 0o100_000;
+const S_IFLNK: u32 = 0o120_000;
 
 /// Largest packet accepted from the server (its length field). OpenSSH
 /// never sends more than 256 KiB and Veil never asks for more than 255 KiB
@@ -221,6 +222,10 @@ impl Attrs {
             }
         }
         Ok(a)
+    }
+
+    pub(crate) fn is_symlink(&self) -> bool {
+        self.perms.is_some_and(|p| p & S_IFMT == S_IFLNK)
     }
 
     pub(crate) fn file_type(&self) -> FileType {

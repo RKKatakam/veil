@@ -46,7 +46,6 @@ fn a_garbage_lock_file_is_handled_within_the_wait() {
 /// reclaimed after a lease (control above); a directory is refused at
 /// once.
 #[test]
-#[ignore = "BUG-119: a symlinked .veil/lock (local or on an SFTP remote) makes every command spin at full CPU for ever"]
 fn a_symlinked_lock_file_does_not_spin_for_ever() {
     let dir = tempfile::tempdir().unwrap();
     let backend = Arc::new(DiskBackend::new(dir.path()));
@@ -56,4 +55,32 @@ fn a_symlinked_lock_file_does_not_spin_for_ever() {
     let b: Arc<dyn StorageBackend> = backend;
     let r = within(Duration::from_secs(60), move || RepoLock::acquire(b).map(|_| ()));
     assert!(r.is_some(), "acquire neither succeeded nor failed within 60 s (busy loop)");
+}
+
+/// BUG-119 follow-up: the symlink is diagnosed at once (not after the
+/// whole wait), naming the path and what to do; the same for a symlinked
+/// takeover guard, which would otherwise keep every takeover "busy".
+#[test]
+fn a_symlinked_lock_or_guard_is_diagnosed_at_once() {
+    for name in ["lock", "lock.steal"] {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(DiskBackend::new(dir.path()));
+        Repo::init(backend.clone(), Some(Identity::generate("alice")), "alice").unwrap();
+        if name == "lock.steal" {
+            // A dead holder's lock, so that acquiring needs a takeover.
+            std::fs::write(dir.path().join(".veil/lock"), b"garbage{").unwrap();
+        }
+        std::os::unix::fs::symlink("/nonexistent", dir.path().join(".veil").join(name)).unwrap();
+        let b: Arc<dyn StorageBackend> = backend;
+        let started = std::time::Instant::now();
+        let opts = veil_core::lock::LockOptions {
+            lease: Duration::from_millis(200),
+            ..veil_core::lock::LockOptions::default()
+        };
+        let r = within(Duration::from_secs(60), move || RepoLock::acquire_with(b, &opts).map(|_| ()));
+        let err = r.expect("acquire hung").expect_err("acquired through a symlink");
+        let msg = err.to_string();
+        assert!(msg.contains(&format!(".veil/{name} is a symlink")) && msg.contains("remove"), "{name}: {msg}");
+        assert!(started.elapsed() < Duration::from_secs(5), "{name}: took {:?}", started.elapsed());
+    }
 }

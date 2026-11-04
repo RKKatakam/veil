@@ -58,15 +58,49 @@ pub fn default_user_name() -> String {
         .unwrap_or_else(|_| "anonymous".into())
 }
 
+/// Write the identity (private keys) to [`identity_path`]: never readable
+/// by anyone else, not even briefly (BUG-112), and never half-written.
+/// The content goes to a fresh temp file created with mode `0600`, is
+/// synced, and is renamed over the old file; a new `$VEIL_HOME` is created
+/// owner-only.
 pub fn write_identity(id: &Identity) -> Result<()> {
+    use std::io::Write;
     let path = identity_path();
-    std::fs::create_dir_all(path.parent().unwrap())?;
-    std::fs::write(&path, id.to_json())?;
+    let dir = path.parent().unwrap();
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
     }
+    builder.create(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(".identity.json.{}.{nanos:08x}.tmp", std::process::id()));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let written = (|| -> std::io::Result<()> {
+        let mut f = opts.open(&tmp)?;
+        f.write_all(id.to_json().as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, &path)?;
+        #[cfg(unix)]
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written.with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
