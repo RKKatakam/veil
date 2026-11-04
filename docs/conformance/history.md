@@ -85,7 +85,8 @@ with `-- --ignored`. Baseline: `integration` @ `8dbdb61`.
 ## Pending features (acceptance scenarios for the feature wave)
 
 The Git-parity round built rename and copy detection (in `diff`, `show`,
-`status` and `log --follow`; not yet in merges), path-limited `log`, the
+`status` and `log --follow`, and since stream R in merges and rebases),
+`vl duplicate` and `vl cherry-pick`, path-limited `log`, the
 `-r` ranges `A..B`, `::B`, `..B` and `A..`, blame, `log -S`/`-G`, `grep` and
 bisect (`crates/vl/tests/history_cli.rs`,
 `crates/veil-core/tests/history_tools.rs`, `history_rename.rs`). Their
@@ -94,13 +95,13 @@ scenarios below are still to port; until then their rows keep the status
 
 | Feature | Scenarios to port when it lands |
 |---|---|
-| Rename / copy detection | t4001, t4003, t4005, t4007, t4008, t4009, t4023, t4043, t4206, t4219 (`log --follow`), t6402, t6412, t6414, t6422, t6423, t6425, t6429, t6434, t3401, t4130; jj test_diff_renamed_file_and_dir, test_diff_rename_in_merge_commit. Veil detects renames in diffs, status and `log --follow`; a rename on one side of a merge plus an edit on the other is still a modify/delete conflict. |
+| Rename / copy detection | t4001, t4003, t4005, t4007, t4008, t4009, t4023, t4043, t4206, t4219 (`log --follow`), t6402, t6412, t6414, t6422, t6423, t6425, t6429, t6434, t3401, t4130; jj test_diff_renamed_file_and_dir, test_diff_rename_in_merge_commit. Veil detects renames in diffs, status and `log --follow`, and merges and rebases follow them (`conformance_history/renames.rs`); the merge rows below are ported. |
 | Path-limited diff and log (`diff -- PATH`, `log -- PATH`) | t4010, t4045 (`--relative`), t4208, t4216 (bloom), t6004, t6012, t6016, t6111, t6130–t6137 (pathspecs); jj test_log_filtered_by_path, test_diff_relative_paths. |
 | Revset language (ranges, ancestry, set operators, functions) | t6000, t6003 (`--topo-order`/`--date-order` choices), t6005 (`--count`), t6009, t6013 (`--reverse`), t6014 (`--all`), t6017, t6018 (globs), t6019 (`--ancestry-path`), t6100, t6600 (reachability); jj test_revset_output.rs, lib test_revset.rs, test_revset_optimized.rs, test_default_revset_graph_iterator.rs. |
 | Log/diff output formats and templates | t4205, t4207, t4026, t4013 option matrix (`--name-only`, `--name-status`, `-p --stat` combos), t4047 (dirstat), t4049, t4052, t4073 (stat widths); jj template tests in test_log_command.rs and test_evolog_command.rs. |
 | Diff algorithms and whitespace options | t4033 (patience), t4050 (histogram), t4065 (anchored), t4071 (minimal), t4061 (indent heuristic), t4015 `-w`/`-b` options, t4032, t4055 (`-U`), t4051 (function context), t4018/t4025 (hunk headers), t4034 (word diff); jj test_diff_ignore_whitespace, test_diff_color_words*, test_diff_skipped_context*. |
 | Blame / annotate | t8001–t8015, t8020; jj test_file_annotate_command.rs. |
-| Cherry-pick, duplicate, revert/backout | t3500–t3514; jj test_duplicate_command.rs, test_revert_command.rs, lib test_rewrite_duplicate.rs. |
+| Revert/backout | jj test_revert_command.rs (cherry-pick and duplicate are ported: `conformance_history/duplicate.rs`). |
 | Splitting and absorbing changes | t3452 (`history split`); jj test_split_command.rs (non-interactive `split PATHS` would map), test_absorb_command.rs, test_parallelize_command.rs, test_diffedit_command.rs. |
 | Rebase variants (`--insert-after/before`, `-r` without descendants, multiple sources, `--skip-emptied`) | t3421 (`--keep-empty`), t3424; jj test_rebase_after, test_rebase_before, test_rebase_after_before, test_rebase_multiple_revisions, test_rebase_skip_emptied*, test_rebase_simplify_parents. |
 | `squash --from/--into/--keep-emptied`, partial squash | jj test_squash_from_to*, test_squash_from_multiple*, test_squash_keep_emptied, test_squash_partial, test_squash_to_new_commit. |
@@ -263,7 +264,7 @@ scenarios below are still to port; until then their rows keep the status
 | t6300–t6302 (for-each-ref) | not applicable | ref plumbing (`vl tag list` is the everyday-commands suite's area) |
 | t6400-merge-df | ported | `merge::file_directory_conflict_is_flagged`, `directory_file_conflict_is_flagged`, `deleted_file_replaced_by_directory_merges`, `file_directory_conflict_keeps_both_sides_content` (BUG-243), `rewrite::rebase_across_a_file_directory_swap` |
 | t6401-merge-criss-cross | ported | `merge::criss_cross_merge_with_different_resolutions_conflicts` (BUG-244), `criss_cross_merge_with_agreeing_resolutions_is_clean` |
-| t6402-merge-rename | pending feature | rename detection |
+| t6402-merge-rename | ported | `renames::an_edit_follows_a_rename_in_either_direction`, `a_renamed_and_edited_file_merges_with_an_edit_of_the_old_name` |
 | t6403-merge-file | ported | `merge::disjoint_edits_in_one_file_merge_cleanly`, `no_trailing_newline_merges`, `no_trailing_newline_conflict_has_markers`, `large_file_merge` |
 | t6404-recursive-merge | ported | `merge::criss_cross_*` (recursive bases) |
 | t6405-merge-symlinks | pending feature | symlinks |
@@ -272,28 +273,28 @@ scenarios below are still to port; until then their rows keep the status
 | t6408-merge-up-to-date | ported | `merge::identical_changes_on_both_sides_are_clean`, `merging_an_ancestor_changes_no_content`, `merging_a_descendant_takes_its_content` |
 | t6409-merge-subtree | not applicable | subtree strategy |
 | t6411-merge-filemode | ported | `merge::mode_change_and_content_change_combine`, `mode_change_on_one_side_merges` |
-| t6412-merge-large-rename | pending feature | rename detection |
+| t6412-merge-large-rename | ported | `renames::many_renamed_files_each_follow_their_edits`; the detection limit: veil-core `rename_merge::over_the_limit_inexact_renames_fall_back_to_modify_delete` |
 | t6413-merge-crlf | ported | `merge::crlf_files_merge` (byte-exact; no autocrlf) |
-| t6414-merge-rename-nocruft | pending feature | rename detection |
+| t6414-merge-rename-nocruft | ported | `renames::an_edit_follows_a_rename_in_either_direction`, `many_renamed_files_each_follow_their_edits` (no file left at the old name) |
 | t6415-merge-dir-to-symlink | pending feature | symlinks |
-| t6416-recursive-corner-cases | ported | `merge::emptied_file_against_an_edit_conflicts`, `criss_cross_*`; rename corner cases pending |
+| t6416-recursive-corner-cases | ported | `merge::emptied_file_against_an_edit_conflicts`, `criss_cross_*`; renames in a criss-cross: veil-core `rename_merge::criss_cross_merges_follow_renames_in_the_virtual_base` |
 | t6417-merge-ours-theirs | not applicable | `-X ours/theirs` strategy options (no strategy options in Veil) |
 | t6418-merge-text-auto | pending feature | attributes |
 | t6419-merge-ignorecase | not applicable | case-folding filesystems are the working-copy suite's area |
 | t6421-merge-partial-clone | not applicable | partial clone |
-| t6422-merge-rename-corner-cases | pending feature | rename detection |
-| t6423-merge-rename-directories | pending feature | rename detection |
+| t6422-merge-rename-corner-cases | ported | `renames::rename_rename_to_two_names_conflicts_at_both`, `rename_add_falls_back_to_modify_delete`; veil-core `rename_merge::both_sides_renaming_the_same_way_merge_their_edits_there` (rename/rename(2to1) and the rest of the script need directory renames or content merged into both names: not followed) |
+| t6423-merge-rename-directories | pending feature | directory-rename detection (each file of a renamed directory is followed; files added into it are not moved) |
 | t6424-merge-unrelated-index-changes | not applicable | index |
-| t6425-merge-rename-delete | pending feature | rename detection |
+| t6425-merge-rename-delete | ported | `renames::rename_delete_is_a_conflict_at_the_new_name` |
 | t6426-merge-skip-unneeded-updates | ported | `merge::ignored_file_in_the_way_is_not_clobbered`, `isolated_file_survives_a_merge` (untouched files are not rewritten) |
 | t6427-diff3-conflict-markers | ported | `merge::same_line_conflict_writes_diff3_markers`, `veil_angles::merge_conflict_in_a_cloaked_file_stays_sealed` |
 | t6428-merge-conflicts-sparse | not applicable | sparse checkout |
-| t6429-merge-sequence-rename-caching | pending feature | rename detection |
+| t6429-merge-sequence-rename-caching | ported | `renames::rebasing_a_sequence_onto_a_rename_follows_it` (no cache: detection is recomputed per merge, bounded) |
 | t6430-merge-recursive | ported | `merge::changes_to_different_files_merge_cleanly`, `add_add_*`, `modify_delete_*`, `delete_modify_*`, `delete_delete_is_clean`, `octopus_*`, `unrelated_lines_*`, `both_sides_add_files_in_the_same_new_directory`, `conflicts_in_unusual_names` |
 | t6431-merge-criscross | ported | `merge::criss_cross_merge_with_different_resolutions_conflicts` (BUG-244) |
 | t6432-merge-recursive-space-options | pending feature | whitespace merge options |
 | t6433-merge-toplevel | ported | `merge::merge_into_a_non_empty_working_copy_merges_into_it`, `merge_moves_tags_at_the_destination_only` (merge from the CLI; octopus in t6430) |
-| t6434-merge-recursive-rename-options | pending feature | rename detection |
+| t6434-merge-recursive-rename-options | ported | `renames::rename_following_can_be_switched_off_and_respects_the_threshold` (`VEIL_MERGE_RENAMES=0` for `--no-renames`; the 50 % threshold is fixed in merges) |
 | t6435-merge-sparse | not applicable | sparse checkout |
 | t6436-merge-overwrite | ported | `merge::ignored_file_in_the_way_is_not_clobbered`, `isolated_file_survives_a_merge`, `veil_angles::isolated_file_survives_rebase_squash_and_abandon` |
 | t6437-submodule-merge | not applicable | submodules |
@@ -309,7 +310,7 @@ scenarios below are still to port; until then their rows keep the status
 | Script | Status | Veil tests / reason |
 |---|---|---|
 | t3400-rebase | ported | `rewrite::rebase_moves_a_change_and_keeps_its_change_id`, `rebase_onto_a_descendant_or_itself_is_refused`, `conflicting_rebase_records_the_conflict`, `rebase_onto_a_conflicted_change`, `veil_angles::rebase_conflict_in_a_cloaked_file_stays_sealed` |
-| t3401-rebase-and-am-rename | pending feature | rename detection |
+| t3401-rebase-and-am-rename | ported (rebase) | `renames::rebasing_a_sequence_onto_a_rename_follows_it`; `am` is feature 4 |
 | t3402-rebase-merge | ported | `rewrite::conflicting_rebase_records_the_conflict`, `descendants_of_a_conflicted_rebase_follow` (Veil always rebases by three-way merge) |
 | t3403-rebase-skip | not applicable | no sequencer; conflicts never stop a rebase |
 | t3404-rebase-interactive | ported (non-interactive parts) | `rewrite::editing_an_older_change_rebases_descendants` (edit), `squash_a_middle_change` (squash), `abandon_a_middle_change_rebases_descendants` (drop), `describe_an_ancestor_rebases_descendants_with_stable_ids` (reword); the todo-list UI is not applicable |
@@ -351,7 +352,7 @@ scenarios below are still to port; until then their rows keep the status
 | t3453-history-fixup | ported | `rewrite::squash_a_middle_change` |
 | t3454-history-drop | ported | `rewrite::abandon_a_middle_change_rebases_descendants`, `abandon_under_a_dependent_edit_conflicts` |
 | t3455-history-squash | ported | `rewrite::squash_*` |
-| t3500–t3514 (cherry-pick, revert) | pending feature | cherry-pick / duplicate / revert (t3504 rerere, t3512/t3513 submodules, t3514 GPG: not applicable even then) |
+| t3500–t3511 (cherry-pick) | ported | `duplicate::cherry_pick_many_applies_them_in_order` (t3500, t3508, t3510 ranges), `cherry_pick_onto_a_line_that_renamed_the_file` (t3501), `a_merge_change_can_be_duplicated` (t3502, t3509), `root_changes_and_the_root` (t3503), `picking_a_change_already_applied_is_empty` (t3505), `a_conflicting_pick_records_a_conflict` (t3507), `x_records_the_origin_and_m_replaces_the_description` (t3511); revert is pending; t3504 rerere, t3512/t3513 submodules, t3514 GPG: not applicable |
 
 ## Git t8xxx (blame)
 
@@ -367,7 +368,7 @@ scenarios below are still to port; until then their rows keep the status
 | test_squash_command.rs | ported (in part) | `rewrite::squash_*`; `--from/--into/--keep-emptied`, partial squash, editor: pending / not applicable |
 | test_split_command.rs | pending feature | split (interactive selection not applicable) |
 | test_abandon_command.rs | ported | `rewrite::abandon_*`, `double_abandon_fails_the_second_time`, `abandoning_another_workspaces_working_copy`; `--restore-descendants` pending |
-| test_duplicate_command.rs | pending feature | duplicate |
+| test_duplicate_command.rs | ported | `duplicate::duplicate_keeps_the_structure_of_what_it_copies`, `root_changes_and_the_root`, `a_merge_change_can_be_duplicated`; veil-core `duplicate::*` |
 | test_parallelize_command.rs | pending feature | parallelize |
 | test_absorb_command.rs | pending feature | absorb |
 | test_revert_command.rs (backout) | pending feature | revert |
@@ -391,7 +392,7 @@ scenarios below are still to port; until then their rows keep the status
 | test_merge_trees.rs | ported | `merge::*` (clean, conflicting, add/add, delete, D/F, deep trees, binary, modes) through `vl merge` |
 | test_merged_tree.rs | ported | `merge::octopus_*`, `new_with_two_parents_merges_and_records_conflicts`, `conflicts_in_unusual_names` |
 | test_rewrite.rs | ported | `rewrite::*` (descendant rebasing, abandoned parents, merges, tags and workspaces following), `veil_angles::change_ids_survive_every_rewrite_of_a_cloaked_change` |
-| test_rewrite_duplicate.rs | pending feature | duplicate |
+| test_rewrite_duplicate.rs | ported | veil-core `duplicate::a_duplicate_is_a_new_change_with_the_same_diff_on_new_parents`, `a_chain_is_copied_as_a_chain_and_one_undo_takes_it_all_back`, `without_a_destination_the_copy_sits_beside_the_source` |
 | test_rewrite_transform.rs | not applicable | library transform API |
 | test_revset.rs, test_revset_optimized.rs | ported (symbols only) | `revisions::*`; the language is pending |
 | test_default_revset_graph_iterator.rs | ported | `log::log_is_in_topological_order`, `log_of_skewed_crossing_merges` |

@@ -82,7 +82,9 @@ be undone. Add to that per-file encryption and engine-level secret handling.
 | `git blame`, `git grep`, `git bisect`, `git log -S`/`-G`/`--follow`/`-- PATH` | `vl blame`, `vl grep`, `vl bisect`, `vl log -S`/`-G`/`--follow`/`-- PATH` ([Investigating history](investigating-history.md)) |
 | `git format-patch A..B` | `vl format-patch A..B` (the public view: what `vl git push` would show; [details](github.md#patches-by-mail-vl-format-patch-and-vl-am)) |
 | `git am FILE` | `vl am FILE` (new changes on `@-`, all or nothing) |
-| `git revert`, `git cherry-pick` | *(no equivalent in 1.0)* |
+| `git cherry-pick REV…` | `vl cherry-pick REV…` (copies onto `@-`, `@` moves on top; `-x` as in Git) ([Copying changes](copying-changes.md)) |
+| `git cherry-pick` onto another branch, without switching | `vl duplicate REV… -d DEST` |
+| `git revert` | *(no equivalent yet)* |
 
 ## Pitfalls
 
@@ -149,7 +151,9 @@ want the pulled commits: `vl rebase -d main`.
 `vl merge X` merges into `@`, or into `@-` if `@` is empty (the usual case
 right after a commit), and then starts a new change on top. Conflicts don't
 stop the merge: see [Conflicts](getting-started.md#conflicts), including how
-to clear the `(conflict)` mark.
+to clear the `(conflict)` mark. Like Git's `ort`, merges and rebases follow
+file renames (not directory renames): see
+[Copying changes](copying-changes.md#merges-and-rebases-follow-renames).
 
 ### Secrets don't get committed, even if you try
 

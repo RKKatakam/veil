@@ -306,8 +306,9 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Rebase { source, destination } => {
             let src = ctx.rev(source)?;
             let dest = destination.iter().map(|d| ctx.rev(d)).collect::<Result<Vec<_>>>()?;
-            let new = ctx.repo.rebase(src, dest)?;
+            let (new, renames) = ctx.repo.rebase_reporting(src, dest)?;
             println!("Rebased {}", one_line(&ctx.repo, &new));
+            rewrite_cmd::print_renames(&renames);
             let s = ctx.repo.snapshot(&new)?;
             if !s.conflicts.is_empty() {
                 warn_untrusted(&format!("conflicts in: {}", s.conflicts.join(", ")));
@@ -1278,8 +1279,10 @@ fn cmd_merge(
             res.quarantined.join(", ")
         ));
     }
+    rewrite_cmd::print_renames(&res.renames);
+    // Warnings quote paths from the merged trees: escaped (BUG-680).
     for w in &res.warnings {
-        warn(w);
+        warn_untrusted(w);
     }
     if !res.conflicts.is_empty() {
         warn_untrusted(&format!("conflicts in: {}", res.conflicts.join(", ")));
@@ -1708,7 +1711,7 @@ fn cmd_policy(ctx: &mut Ctx, c: &PolicyCmd) -> Result<()> {
                 println!("{origin:<12}  {}", r.to_line());
             }
             for w in &policy.warnings {
-                warn_untrusted(w);
+                warn(w);
             }
             let held = ctx.repo.policy_held_back(&*ctx.fs)?;
             if !held.is_empty() {
@@ -2456,7 +2459,7 @@ fn cmd_push(
             println!("  {} deleting {} ({})", red("rejected"), safe(t), safe(why));
         }
         for w in &d.warnings {
-            warn_untrusted(w);
+            warn(w);
         }
         if tags.is_empty() {
             return Ok(push_status(

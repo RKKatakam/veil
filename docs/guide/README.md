@@ -24,6 +24,7 @@ trimmed where marked (`…`); some paths and host names were shortened
 | 12. [Editors and agents](editors-and-agents.md) | An editor or agent talks to Veil all the time and should keep one connection open (`vl serve --local`) |
 | 13. [Hooks](hooks.md) | You want checks before a commit or a push: your own hooks, or the ones a repository suggests in `.veilhooks` |
 | 14. [Investigating history](investigating-history.md) | You want to know who wrote a line, when a string appeared, or which change broke something (`blame`, `grep`, `log -S`, `bisect`, renames) |
+| 15. [Copying changes, and merges that follow renames](copying-changes.md) | You want a change on another line too (`vl duplicate`, `vl cherry-pick`), or wonder what a merge does with a moved file |
 
 The [command reference](../reference/README.md) lists every command and
 flag. It is generated from `vl` itself and cannot drift from it.

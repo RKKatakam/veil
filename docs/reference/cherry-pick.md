@@ -3,7 +3,7 @@
 
 # `vl cherry-pick`
 
-Copy changes onto the working copy's parent: `vl duplicate REV… -d @-`, then the working copy moves on top (not implemented yet)
+Copy changes onto the working copy's parent: `vl duplicate REV… -d @-`, then the working copy moves on top
 
 ```text
 vl cherry-pick [OPTIONS] <REVS>...
@@ -13,7 +13,7 @@ Arguments:
 
 | | |
 |---|---|
-| `<REVS>…` | Changes to copy onto the working copy's parent (required) |
+| `<REVS>…` | Changes to copy onto the working copy's parent, in this order (ranges such as `A..B` name several, oldest first) (required) |
 
 Options:
 

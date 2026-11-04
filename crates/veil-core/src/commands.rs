@@ -89,6 +89,8 @@ pub struct MergeResult {
     pub quarantined: Vec<String>,
     /// Visibility changes the merge refused to make silently.
     pub warnings: Vec<String>,
+    /// Renames the merge followed (this reader's report; never stored).
+    pub renames: Vec<crate::merge::FollowedRename>,
 }
 
 /// What [`Repo::commit`] did.
@@ -394,12 +396,19 @@ impl Repo {
     /// Rebasing onto the parents `source` already has changes nothing
     /// (BUG-246).
     pub fn rebase(&mut self, source: ObjectId, dest: Vec<ObjectId>) -> Result<ObjectId> {
+        Ok(self.rebase_reporting(source, dest)?.0)
+    }
+
+    /// [`Repo::rebase`], also returning the renames moving `source` followed
+    /// (a file the destination renamed gets the change's edit at its new
+    /// name).
+    pub fn rebase_reporting(&mut self, source: ObjectId, dest: Vec<ObjectId>) -> Result<(ObjectId, Vec<crate::merge::FollowedRename>)> {
         let dest = dedup_parents(dest);
         if dest.is_empty() {
             return Err(VeilError::repo("rebase needs at least one destination"));
         }
         if self.snapshot(&source)?.parents == dest {
-            return Ok(source);
+            return Ok((source, vec![]));
         }
         for d in &dest {
             if self.is_ancestor(&source, d)? {
@@ -420,7 +429,7 @@ impl Repo {
         let id = tx.rewrite(source, ns)?;
         tx.set_description(format!("rebase change {}", s.change_id.short()));
         tx.commit()?;
-        Ok(id)
+        Ok((id, out.renames))
     }
 
     /// Fold a change into its (single) parent.
@@ -810,6 +819,10 @@ impl Repo {
             },
             &mut report,
         )?;
+        // A file whose edit followed a rename stays sealed at its new path,
+        // whatever the policy says there: the rename moved it, not the line
+        // being merged, and only `vl expose` publishes it.
+        tree = crate::merge::keep_followed_sealed(&store, tree, merged.tree, &merged.renames, &mut report.declassified, &mut report.quarantined, &mut warnings)?;
         // The destination is under an unreleased embargo: stay under it.
         if let Some(w) = &outer {
             tree = seal_declassified(&store, &tree, &report.declassified, &w.embargo, &into_snap.tree)?;
@@ -899,6 +912,7 @@ impl Repo {
                 })
                 .collect(),
             warnings,
+            renames: merged.renames,
         })
     }
 

@@ -45,6 +45,10 @@ the operation log, a remote or the Git export records them. In `--json`,
 a renamed file has `"status": "renamed"`, `from` and `score`
 ([JSON reference](../reference/json.md#change)).
 
+Merges, rebases and `vl cherry-pick` use the same detection to make an
+edit follow a rename made on the other side
+([Copying changes](copying-changes.md#merges-and-rebases-follow-renames)).
+
 Detection is bounded so that a hostile change cannot stall it: content is
 compared only while `deleted × added ≤ 1000²` (and within a byte budget);
 past that only exact renames are shown and `vl diff` says

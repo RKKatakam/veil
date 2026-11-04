@@ -13,8 +13,10 @@
 mod support;
 
 mod diff;
+mod duplicate;
 mod log;
 mod merge;
+mod renames;
 mod revisions;
 mod rewrite;
 mod veil_angles;

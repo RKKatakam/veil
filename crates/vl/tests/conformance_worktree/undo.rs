@@ -51,7 +51,8 @@ fn undo_again_goes_further_back() {
     r.ok(&["undo"]); // further back: undo the snapshot / "commit one"
     assert_ne!(r.change("@-"), two, "the second undo re-applied the commit it should step past");
     let log = r.out(&["log"]);
-    assert!(!log.contains("two"), "{log}");
+    // Description lines only: a random change id can contain "two".
+    assert!(!log.lines().any(|l| l.trim_start_matches(['│', ' ']).trim_end() == "two"), "{log}");
     let _ = one;
 }
 

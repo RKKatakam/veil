@@ -1368,6 +1368,41 @@ struct Snapshot {
     `NAME~theirs` (the side it came from; `NAME~theirs~2`, … if taken).
     Both paths are recorded as conflicted. Two directories (or two files)
     merge as such even when the base had the other kind at that name.
+  * **Renames are followed** (`merge::follow_renames`, Git-parity feature
+    2). Before the directory walk, renames base → ours and base → theirs
+    are detected with `rename::detect` (exact, then inexact within its
+    limits; copies are not followed), but only when one side deleted a
+    file the other side changed and added a file: most merges skip
+    detection entirely. A rename the other side cares about is applied to
+    the trees that did not make it (the base, and the other side when it
+    edited the file), so the walk merges the versions at one path: an
+    edit follows a rename, and two identical renames merge there. A rename
+    onto a name the other side took (rename/add), or one that needs a
+    directory where the other side has a file, is not followed. In a real
+    merge, rename/delete is a conflict entry at the new name (the renamed
+    version against no file), and rename/rename to two names a conflict
+    entry at both (each holding its side's version against no file, so
+    `vl resolve --ours|--theirs` on both keeps one name); below format 4
+    the files stay and are flagged. A virtual merge base follows renames
+    too (criss-cross merges). `VEIL_MERGE_RENAMES=0` turns it off.
+    *Audiences* (§4 rule 5, design 2's threat review): detection reads as
+    a public mirror does (`Reader::Public`), so the inexact pass reads
+    plaintext only and sealed content pairs only by exact object id (an
+    equality any reader of the trees sees). The result never depends on
+    the merger's keys, and a merger without a key never reads a sealed
+    version (an exact rename of it resolves trivially). A pair is kept
+    only when both versions have the same kind and the same *verified*
+    audience (labels are claims, BUG-103), so content never moves between
+    a public file and a sealed one, or between scopes. The pairing only
+    chooses which entries are combined; `merge_file`'s rules decide the
+    result's sealing as for any file. `vl merge`'s declassification of a
+    cloaked line never publishes a file whose edit followed a rename
+    (`merge::keep_followed_sealed`): the rename put it at a public path,
+    not the line, so it stays sealed with a warning, and only `vl expose`
+    publishes it. Renames are reported (`MergeOutcome::renames`, printed by
+    `vl merge`, `vl rebase`, `vl cherry-pick`), never stored. Directory
+    renames (Git `ort`'s detection of files added into a renamed
+    directory) are not followed.
 * **Shaping history: `vl split` and partial `vl squash`** (`selection.rs`,
   `hunks.rs`, `Repo::split`, `Repo::squash_into`). A change from its base
   (the merge of its parents) to its tree is listed as *units*: one per
@@ -1449,6 +1484,27 @@ struct Snapshot {
     binary, publishing every change to a public mirror after each command
     and searching the mirror's decoded objects for every text written in
     the cloaked workspace.
+* **Copying changes: `vl duplicate` and `vl cherry-pick`**
+  (`duplicate.rs`, `Repo::duplicate`, `Repo::cherry_pick`). A copy is a new
+  change (new change id, the source's author as a claim, the time of the
+  copy), signed by whoever copies it. Its tree is the auto-rebase merge of
+  the source onto the new parents (`Repo::rebase_tree`), so a copy of a
+  merge applies what the merge changed, conflicts are recorded as entries,
+  and renames are followed. Without a destination a copy sits beside its
+  source; a source whose parent is copied too goes onto that parent's
+  copy. `vl cherry-pick` copies its sources one after the other onto `@-`,
+  rebases `@` onto the last copy, and moves the tags at `@-` as `vl commit`
+  would (`TagKept` rules; never an annotated tag). One transaction: `vl
+  undo` restores the view exactly. *Audiences:* a copy is a tree merge
+  only, never a declassification. It takes the destination line's cloak,
+  and a cloaked line seals what the copy brings (`seal_introduced`,
+  conflict versions included). Content and a sealed description keep
+  their sealing on any line (`-x` appends its origin line to plain
+  descriptions only). A source an unreleased embargo withholds
+  (`remote::embargo_withheld`) is refused unless every new parent is
+  inside the same embargo, and an unreleased embargoed merge is refused:
+  a copy elsewhere would publish the fix's names before the release (the
+  same route through `vl restore --from` is BUG-681).
 * **Visibility never silently widens.** Declassification (any move from
   cloaked or embargoed to more visible) is an explicit act by a member: a
   `vl merge` of a cloaked line of work, or a `vl expose`, both of which go

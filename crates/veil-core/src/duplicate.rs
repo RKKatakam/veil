@@ -1,6 +1,325 @@
-//! `Repo::duplicate`: copy a change onto new parents as a new change (the
+//! `Repo::duplicate`: copy changes onto new parents as new changes (the
 //! engine of `vl duplicate` and `vl cherry-pick`).
 //!
-//! Owned by stream R of the Git-parity round (feature 1;
-//! `docs/design/git-parity/1-blame-bisect-duplicate.md`). Empty until stream
-//! R lands.
+//! A duplicate is a new change (a new change id, the source's author, the
+//! time of the copy), signed by whoever made the copy. Its tree is the
+//! auto-rebase merge of the source onto its new parents
+//! ([`Repo::rebase_tree`]): what the source changed relative to the merge of
+//! its own parents, applied to the merge of the new ones, so conflicts are
+//! recorded as first-class conflict entries rather than refused, and renames
+//! the new parents made are followed ([`crate::merge`]).
+//!
+//! Audiences (`docs/design/git-parity/1-blame-bisect-duplicate.md`, threat
+//! review 11–16):
+//! * a duplicate is a tree merge only: content keeps the sealing it really
+//!   has ([`crate::merge`] never reads a sealed file into a wider
+//!   audience), and nothing is declassified: copying a cloaked change onto
+//!   a public line keeps its files sealed (a duplicate publishes nothing a
+//!   merge would not, BUG-122; it publishes nothing at all);
+//! * the duplicate takes the destination line's cloak, and a cloaked line
+//!   seals what the copy brings it ([`crate::embargo::seal_introduced`],
+//!   conflict versions included, BUG-480);
+//! * the description is kept as stored: a sealed one stays sealed for its
+//!   scope and is never re-written as plaintext;
+//! * a source an unreleased embargo withholds (the fix and how it was
+//!   made) is refused unless every new parent is inside that same embargo:
+//!   a copy elsewhere would publish the fix's file names, sizes and
+//!   existence before the release. An embargoed merge itself is refused
+//!   (release it first).
+//!
+//! One transaction per command: `vl undo` removes every duplicate (and, for
+//! cherry-pick, puts `@` and the tags back) exactly.
+
+use std::collections::{HashMap, HashSet};
+
+use crate::{
+    builder::trusted_cloak,
+    embargo::{description_scope, recordable_conflicts},
+    error::{Result, VeilError},
+    id::{ChangeId, ObjectId},
+    merge::FollowedRename,
+    now_millis,
+    object::{EntryKind, Snapshot, Text},
+    repo::Repo,
+    transaction::{dedup_parents, Transaction},
+    tree::lookup,
+    vpath::VPath,
+};
+
+/// How each duplicate is described.
+#[derive(Clone, Debug, Default)]
+pub struct DuplicateOptions {
+    /// A new description for every duplicate (sealed as the destination
+    /// line seals descriptions); `None` keeps each source's as stored.
+    pub message: Option<String>,
+    /// Append `(duplicated from change ID)` to a plain description.
+    pub record_origin: bool,
+}
+
+/// One change copied.
+#[derive(Clone, Debug)]
+pub struct Duplicated {
+    pub source: ObjectId,
+    pub duplicate: ObjectId,
+    /// Paths that conflicted while applying the source's change.
+    pub conflicts: Vec<VPath>,
+    /// Renames the copy followed.
+    pub renames: Vec<FollowedRename>,
+}
+
+/// What `vl cherry-pick` did.
+#[derive(Clone, Debug)]
+pub struct CherryPicked {
+    pub duplicates: Vec<Duplicated>,
+    /// The workspace's working copy, rebased onto the last duplicate.
+    pub wc: ObjectId,
+    /// Tags that pointed at the working copy's parent and moved to the last
+    /// duplicate (as `vl commit` moves them).
+    pub advanced: Vec<String>,
+    /// Tags that pointed there but stayed, with the reason.
+    pub kept: Vec<(String, crate::commands::TagKept)>,
+}
+
+/// Where the duplicates go.
+enum Placement<'a> {
+    /// Onto each source's own parents (those duplicated too are replaced
+    /// by their duplicates).
+    InPlace,
+    /// Sources with no parent among the sources go onto these; the others
+    /// onto their parents' duplicates.
+    Onto(&'a [ObjectId]),
+    /// One after the other: the first onto this, each next onto the
+    /// previous duplicate (cherry-pick), all on the line cloaked as given.
+    Chain(ObjectId, Option<String>),
+}
+
+/// The `(duplicated from change ID)` line `-x` appends.
+fn with_origin(text: &str, change: &ChangeId) -> String {
+    let line = format!("(duplicated from change {})", change.short());
+    match text.trim_end() {
+        "" => line,
+        t => format!("{t}\n\n{line}"),
+    }
+}
+
+impl Repo {
+    /// Copy `sources` as new changes onto `dest` (or, empty, onto each
+    /// source's own parents), as `vl duplicate` does. A source whose
+    /// parent is also a source goes onto that parent's duplicate, so a
+    /// chain of changes is copied as a chain. One transaction.
+    pub fn duplicate(&mut self, sources: &[ObjectId], dest: &[ObjectId], o: &DuplicateOptions) -> Result<Vec<Duplicated>> {
+        let dest = dedup_parents(dest.to_vec());
+        let placement = match dest.is_empty() {
+            true => Placement::InPlace,
+            false => Placement::Onto(&dest),
+        };
+        let mut tx = self.transaction("duplicate")?;
+        let done = duplicate_in(&mut tx, sources, &placement, o)?;
+        tx.set_description(describe_op("duplicate", &tx, &done)?);
+        tx.commit()?;
+        Ok(done)
+    }
+
+    /// `vl cherry-pick`: copy `sources`, one after the other, onto the
+    /// working copy's parent (`@-`), then rebase the working copy onto the
+    /// last copy. Tags at `@-` move to the last copy as `vl commit` moves
+    /// them (not on a cloaked line unless cloaked under its scope; never a
+    /// release tag). One transaction.
+    pub fn cherry_pick(&mut self, ws: &str, sources: &[ObjectId], o: &DuplicateOptions) -> Result<CherryPicked> {
+        let mut tx = self.transaction("cherry-pick")?;
+        let wc_id = tx.view.workspace(ws)?.wc;
+        let ws_cloak = tx.view.workspace(ws)?.cloak.clone();
+        let wc = tx.repo().snapshot(&wc_id)?;
+        let Some(&onto) = wc.parents.first() else {
+            return Err(VeilError::repo("the working copy has no parent to cherry-pick onto"));
+        };
+        let onto_cloak = tx.repo().snapshot(&onto)?.cloak.clone();
+        // The line the copies join: the workspace's (a commit here would be
+        // cloaked like it), else that of the change being worked on.
+        let line = [&ws_cloak, &wc.cloak, &onto_cloak]
+            .into_iter()
+            .find_map(|c| trusted_cloak(c.as_deref()).map(str::to_string));
+        let done = duplicate_in(&mut tx, sources, &Placement::Chain(onto, line.clone()), o)?;
+        let last = done.last().expect("at least one source").duplicate;
+        // `@` moves on top, keeping what it changed (and its other parents).
+        let mut parents = wc.parents.clone();
+        parents[0] = last;
+        let parents = dedup_parents(parents);
+        let out = tx.repo().rebase_tree(&wc.parents, &parents, wc.tree, trusted_cloak(wc.cloak.as_deref()))?;
+        let mut ns = (*wc).clone();
+        ns.parents = parents;
+        ns.tree = out.tree;
+        ns.predecessors = vec![wc_id];
+        ns.conflicts.extend(out.conflicts.iter().map(|p| p.to_string()));
+        ns.conflicts.sort();
+        ns.conflicts.dedup();
+        ns.conflicts = recordable_conflicts(&tx.repo().store, &ns.tree, ns.conflicts)?;
+        let new_wc = tx.rewrite(wc_id, ns)?;
+        let (mut advanced, mut kept) = (Vec::new(), Vec::new());
+        for (name, tag) in tx.view.tags.iter_mut() {
+            if tag.target != onto || tag.annotation.is_some() {
+                continue;
+            }
+            match line.as_deref() {
+                Some(scope) if tag.cloak.as_deref() != Some(scope) => {
+                    kept.push((name.clone(), crate::commands::TagKept::CloakedLine(scope.to_string())));
+                }
+                _ => {
+                    tag.target = last;
+                    advanced.push(name.clone());
+                }
+            }
+        }
+        tx.set_description(describe_op("cherry-pick", &tx, &done)?);
+        tx.commit()?;
+        Ok(CherryPicked { duplicates: done, wc: new_wc, advanced, kept })
+    }
+}
+
+/// `"<verb> change X"` or `"<verb> N changes"`.
+fn describe_op(verb: &str, tx: &Transaction, done: &[Duplicated]) -> Result<String> {
+    Ok(match done {
+        [one] => format!("{verb} change {}", tx.repo().snapshot(&one.source)?.change_id.short()),
+        many => format!("{verb} {} changes", many.len()),
+    })
+}
+
+/// `sources` in an order where a source comes after every source that is
+/// its parent; otherwise as given (first occurrence). Iterative.
+fn parents_first(tx: &Transaction, sources: &[ObjectId]) -> Result<Vec<ObjectId>> {
+    let set: HashSet<ObjectId> = sources.iter().copied().collect();
+    let mut placed: HashSet<ObjectId> = HashSet::new();
+    let mut order = Vec::with_capacity(set.len());
+    for s in sources {
+        let mut stack = vec![(*s, false)];
+        while let Some((id, expanded)) = stack.pop() {
+            if placed.contains(&id) {
+                continue;
+            }
+            if expanded {
+                placed.insert(id);
+                order.push(id);
+                continue;
+            }
+            stack.push((id, true));
+            for p in tx.repo().snapshot(&id)?.parents.iter().rev() {
+                if set.contains(p) && !placed.contains(p) {
+                    stack.push((*p, false));
+                }
+            }
+        }
+    }
+    Ok(order)
+}
+
+fn duplicate_in(tx: &mut Transaction, sources: &[ObjectId], placement: &Placement, o: &DuplicateOptions) -> Result<Vec<Duplicated>> {
+    if sources.is_empty() {
+        return Err(VeilError::repo("nothing to duplicate"));
+    }
+    if let Some(m) = &o.message {
+        if m.contains('\0') {
+            return Err(VeilError::repo("a description cannot contain a NUL character"));
+        }
+    }
+    let root = tx.repo().root_id();
+    let order = parents_first(tx, sources)?;
+    // What unreleased embargoes withhold from a public remote, by embargo.
+    let withheld = crate::remote::embargo_withheld(tx.repo(), true)?;
+    let store = tx.repo().store.clone();
+    let mut copy_of: HashMap<ObjectId, ObjectId> = HashMap::new();
+    // Duplicates made inside an embargo (their source was withheld by it).
+    let mut inside: HashMap<ObjectId, String> = HashMap::new();
+    let mut done = Vec::with_capacity(order.len());
+    let mut prev: Option<ObjectId> = None;
+    for src in order {
+        if src == root {
+            return Err(VeilError::repo("the root snapshot cannot be duplicated"));
+        }
+        let s = tx.repo().snapshot(&src)?;
+        if let Some(e) = &s.embargo {
+            if !tx.repo().keys().embargo_released(e) {
+                return Err(VeilError::Policy(format!(
+                    "cannot duplicate {}: it is the merge of unreleased embargo {e}; release the embargo first (`vl embargo release {e}`)",
+                    src.short()
+                )));
+            }
+        }
+        let mapped: Vec<ObjectId> = s.parents.iter().filter_map(|p| copy_of.get(p).copied()).collect();
+        let (parents, cloak) = match placement {
+            Placement::InPlace => (s.parents.iter().map(|p| copy_of.get(p).copied().unwrap_or(*p)).collect(), None),
+            Placement::Onto(dest) if mapped.is_empty() => (dest.to_vec(), None),
+            Placement::Onto(_) => (mapped, None),
+            Placement::Chain(onto, line) => (vec![prev.unwrap_or(*onto)], Some(line.clone())),
+        };
+        let parents = dedup_parents(parents);
+        // The duplicate joins the line of its (first) new parent, unless
+        // the placement names the line.
+        let cloak: Option<String> = match cloak {
+            Some(line) => line,
+            None => match parents.first() {
+                Some(p) => trusted_cloak(tx.repo().snapshot(p)?.cloak.as_deref()).map(str::to_string),
+                None => None,
+            },
+        };
+        // Threat review 11: never copy withheld fix history out of its
+        // embargo.
+        let mut within: Option<String> = None;
+        if let Some(e) = withheld.get(&src) {
+            let all_inside = parents.iter().all(|p| withheld.get(p) == Some(e) || inside.get(p) == Some(e));
+            if !all_inside {
+                return Err(VeilError::Policy(format!(
+                    "cannot duplicate {}: unreleased embargo {e} withholds it (it is part of the fix), and a copy outside the embargo would publish its file names before the release; duplicate it onto a change inside the embargo, or merge the fix with `vl merge --embargo`",
+                    src.short()
+                )));
+            }
+            within = Some(e.clone());
+        }
+        let out = tx.repo().rebase_tree(&s.parents, &parents, s.tree, cloak.as_deref())?;
+        let description = match &o.message {
+            Some(m) => store.make_text(m, description_scope(&store, &out.tree, cloak.as_deref())?.as_deref())?,
+            None => match &s.description {
+                Text::Plain(t) if o.record_origin => Text::Plain(with_origin(t, &s.change_id)),
+                d => d.clone(),
+            },
+        };
+        // Conflicts: those of applying the change, plus older kinds the
+        // source recorded (markers, files moved aside) that the copy holds
+        // as the source does. Conflict entries are indexed from the tree.
+        let mut conflicts: Vec<String> = out.conflicts.iter().map(|p| p.to_string()).collect();
+        for c in &s.conflicts {
+            let Ok(p) = VPath::new(c) else { continue };
+            let Some(e) = lookup(&store, &s.tree, &p).ok().flatten() else { continue };
+            if e.kind != EntryKind::Conflict && lookup(&store, &out.tree, &p).ok().flatten().as_ref() == Some(&e) {
+                conflicts.push(c.clone());
+            }
+        }
+        conflicts.sort();
+        conflicts.dedup();
+        let snap = Snapshot {
+            parents,
+            change_id: ChangeId::random(),
+            tree: out.tree,
+            description,
+            author: s.author.clone(),
+            timestamp: now_millis(),
+            predecessors: vec![],
+            conflicts: recordable_conflicts(&store, &out.tree, conflicts)?,
+            cloak,
+            embargo: None,
+            signature: None, // signed by the transaction
+        };
+        let id = tx.write_snapshot(&snap)?;
+        copy_of.insert(src, id);
+        if let Some(e) = within {
+            inside.insert(id, e);
+        }
+        prev = Some(id);
+        done.push(Duplicated {
+            source: src,
+            duplicate: id,
+            conflicts: out.conflicts,
+            renames: out.renames,
+        });
+    }
+    Ok(done)
+}

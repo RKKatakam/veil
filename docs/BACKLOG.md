@@ -33,10 +33,10 @@ fixed**. Severity: high / medium / low.
 ### Gaps compared with Git and GitHub (core, before the Hub)
 - **Colocated Git mode:** a real `.git` next to `.veil` (as Jujutsu does) so
   IDEs, GUIs, `git blame`, pre-commit and other Git tools keep working.
-- **Missing everyday commands:** cherry-pick/duplicate,
-  `archive` (tarball of a snapshot).
-- **Rename-aware merges** (`diff`, `status`, `show` and `log --follow`
-  detect renames; merges still see a delete plus an add).
+- **Missing everyday commands:** `archive` (tarball of a snapshot).
+- **Directory-rename detection in merges** (Git's `ort`: a file added on one
+  side inside a directory the other side renamed goes to the new
+  directory). Merges follow file renames, not directory renames.
 - **Patches, phase 2:** `vl format-patch -M` renames, symlinks and
   submodules in `vl am`, binary literals both ways, `vl am --3way`.
 - **Repository attributes:** line-ending normalisation (CRLF), per-path diff
