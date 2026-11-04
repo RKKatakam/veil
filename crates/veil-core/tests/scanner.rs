@@ -462,6 +462,230 @@ fn findings_are_capped() {
     assert!(!f.is_empty() && f.len() <= 16);
 }
 
+// ---- scanner v4: value grammar, more keys, linear time --------------------------------
+
+/// Look-alikes of the rules added for BUG-091 … BUG-095 (`RULES_VERSION` 4):
+/// references and templates anywhere in a value, hashes and encrypted
+/// values, code that sits where a configuration value would, keys that
+/// end in `_key` but hold no secret, URL look-alikes with `:`.
+const LOOKALIKES_V4: &[&str] = &[
+    // references, templates, placeholders (BUG-091)
+    "password: \"$DB_PASSWORD\"",
+    "password: \"${DB_PASSWORD:-changeme-later}\"",
+    "PASSWORD=\"$(cat /run/secrets/db-password)\"",
+    "password: \"{{.Values.db.password}}\"",
+    "token: ${{secrets.GITHUB_TOKEN}}",
+    "password = \"%(db_password)s\"",
+    "password: \"#{ENV['DB_PASSWORD']}\"",
+    "password: '%DB_PASSWORD%'",
+    "ISCSI_PASSWORD=\"${x#iscsi_password=}\"",
+    "password: $HOME/.config/app/password-file",
+    "$db_password = $_ENV['DB_PASSWORD'];",
+    "$last_update_token = \"\\\"$last_update_token\\\"\";",
+    "myURL.password = &#39;123&#39;;",
+    "password: <your-database-password>",
+    "password: !vault |",
+    // hashes and encrypted values
+    "password: \"$2b$12$KIXQJbXk9mQ2vL7pR4wZt8eOuLmNp3qRsTuVwXyZaBcDeFgHiJkL\"",
+    "password: \"pbkdf2_sha256$600000$abcDEF123$Xk9mQ2vL7pR4wZt8uY3nAbCdEf=\"",
+    "userPassword: {SSHA}Xk9mQ2vL7pR4wZt8uY3nAbCd",
+    "spring.datasource.password=ENC(G6N718UuyPE5bHyWKyuLQSm02auQPUtm)",
+    "password: '{cipher}AQA8x9mQ2vL7pR4wZt8uY3n'",
+    "api_key: ENC[AES256_GCM,data:Tr7oXk9mQ2,iv:abc,tag:def,type:str]",
+    "password: vault:v1:8SDd3WHDOjf7mq69CyCqYjBXAiQQAVZRkFM13ok481zo",
+    // app-password look-alikes, words, numbers, other scripts
+    "password: abcd efgh ijkl mnop",
+    "password: \"xxxx xxxx xxxx xxxx\"",
+    "password: well done good luck",
+    "SMTP_PASSWORD=defaultpassword",
+    "let encoded_signing_key_too_long = \"[62,70,27,163]\";",
+    "password: パスワードを変更します",
+    // shapes of BUG-092 that hold no literal
+    "define('DB_PASSWORD', getenv('DB_PASSWORD'));",
+    "define( 'AUTH_KEY', 'put your unique phrase here' );",
+    "__('Password', 'woocommerce-payments')",
+    "t('password', 'Enter your password')",
+    "os.environ[\"API_KEY\"] = api_key_from_vault",
+    "config['password'] = request.form['password']",
+    "ENV.fetch('SECRET_KEY') { 'development-secret' }",
+    "System.getProperty(\"db.password\", \"\");",
+    "env:\n  - name: DB_PASSWORD\n    valueFrom:\n      secretKeyRef:\n        name: db",
+    "- name: DB_PASSWORD\n  value: \"$(DB_PASS)\"",
+    "- name: API_TOKEN\n  value: \"{{ .Values.token }}\"",
+    "PASSWORDS_MATCH=true",
+    "API_KEYS_FILE=/run/secrets/api-keys",
+    "<password type=\"hash\"></password>",
+    "<password><![CDATA[${db.password}]]></password>",
+    "<key>PasswordPolicy</key>\n<string>StrongPasswordPolicy</string>",
+    "<key>Password</key>\n<string>${PASSWORD}</string>",
+    "<add key=\"PasswordLength\" value=\"12\"/>",
+    "ALTER USER app WITH PASSWORD :'pw';",
+    "CREATE USER app IDENTIFIED BY '${DB_PASS}';",
+    "APP_KEY=",
+    "cache_key = \"a8f5f167f44f4964e6c998dee827110c\"",
+    "PUBLIC_KEY=MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE",
+    "SIGNING_KEY_PATH=/etc/keys/signing.pem",
+    "encryption_key_id = \"arn:aws:kms:us-east-1:123456789012:key/abc\"",
+    "whatsappkey = \"Xk9mQ2vL7pR4wZt8uY3n\"",
+    // code where a configuration value would be
+    "    secret_key = config.secret_key.clone();",
+    "    password: Option<String>,",
+    "    and_token: input.parse()?,",
+    "    lt_token: Token![<](span),",
+    "    colon_token: <Token![:]>::default(),",
+    "    tokens = _generate_tokens_from_c_tokenizer(",
+    "    token: \"foo\".into(),",
+    "    secret_key: *secret_key,",
+    "    _token_start: &Self::Checkpoint,",
+    "    shared_secret: SharedSecret<Kem>,",
+    "    semaphore_tokens: Rc<Cell<Vec<JobToken>>>,",
+    "    tokens: &[AnsiString<'_>],",
+    "    secret = _wcsdup(password);",
+    "    password = CFDataCreate(kCFAllocatorDefault,",
+    "    authkey=process.current_process().authkey)",
+    "    Token::Str(\"field0\"),",
+    "    TOKEN: import(\"./llhttp/constants\").CharList;",
+    "    let tokens = quote::quote! {",
+    "    trait Secret: ZeroizeOnDrop + Zeroize {}",
+    "pub const SE_PRIVILEGE_USED: TOKEN_PRIVILEGES_ATTRIBUTES = 2147483648u32;",
+    "_non_token_end_matcher = re.compile(r\"[^{}]+\".format(",
+    // URLs (BUG-093)
+    "cvs://:pserver:anoncvs@sources.redhat.com:/cvs/src",
+    "https://user:%24%7BGIT_PASSWORD%7D@git.example.com/repo.git",
+    "{\"url\":\"postgres:\\/\\/user:password@localhost\\/db\"}",
+    "ssh://git@host.example.com:2222/org/repo.git",
+];
+
+#[test]
+fn credential_lookalikes_of_v4_rules_are_not_flagged() {
+    for l in LOOKALIKES_V4 {
+        assert_clean(l, l.as_bytes());
+    }
+    assert_clean("all v4 look-alikes", LOOKALIKES_V4.join("\n").as_bytes());
+}
+
+#[test]
+fn detects_v4_shapes() {
+    let jwt = format!("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ{}.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c", "zdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ".repeat(12));
+    let long_value = format!("FIREBASE_API_KEY={}\n", "Xk9mQ2vL7pR4wZt8uY3n".repeat(30));
+    let cases: Vec<String> = [
+        "<add key=\"DbPassword\" value=\"Xk9mQ2vL7pR4wZt8\"/>\n",
+        "SMTP_PASSWORD=qzvx kwpr mtfh jlnb\n",
+        "smtp:\n  password: \"qzvx kwpr mtfh jlnb\"\n",
+        "CREATE USER 'app'@'%' IDENTIFIED BY 'Xk9mQ2vL7pR4wZt8';\n",
+        "CREATE ROLE app WITH ENCRYPTED PASSWORD 'Xk9mQ2vL7pR4wZt8';\n",
+        "environment:\n  - \"DB_PASSWORD=Xk9#mQ2(vL7pR4wZt8\"\n",
+        "export API_KEY='$Xk9mQ2vL7pR4wZt8'\n",
+        "password: Xk9mQ2vL7pR4wZt8 # production\n",
+        "DefaultEndpointsProtocol=https;AccountName=prod;AccountKey=Zq8vXk9mQ2vL7pR4wZt8aB3cD5eF7gH9==;EndpointSuffix=core.windows.net\n",
+        "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=root;SharedAccessKey=Zq8vXk9mQ2vL7pR4wZt8aB3c=\n",
+        "define('NONCE_SALT', 'q8|Zp]x%Wc+Ly~Bv&Hn4Rt7Dj2Mk9Gs5Ef1Aw6Uz');\n",
+        "secret_key_base: 9f86d081884c7d659a2feaa0c55ad0159f86d081884c7d659a2feaa0c55ad015\n",
+        "firebase: { appKey: \"Zq8vXk9mQ2vL7pR4wZt8aB3c\" }\n",
+        "DB_PASSWORD=\"Xk9m${Q2v}L7pR4wZt8\"\n",
+        "password: '@Xk9mQ2vL7pR4wZt8'\n",
+        "spring.datasource.password=Xk9(mQ2)vL7[pR4]wZt8\n",
+        "password = \"Xk9mQ2vL7pR4wZt8\\\\\"\n",
+        "token: 'Xk9mQ2''vL7pR4wZt8'\n",
+        "DATABASE_URL=mysql://app:Xk9%40mQ2vL7pR4@db.example.com/app\n",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .chain([format!("token: {jwt}\n"), format!("const t = \"{jwt}\";\n"), long_value])
+    .collect();
+    for c in &cases {
+        assert!(!scan(c.as_bytes()).is_empty(), "missed: {c:?}");
+    }
+}
+
+#[test]
+fn a_line_value_and_its_token_are_reported_once() {
+    let f = scan(b"x = 1\nDB_PASSWORD=Xk9mQ2vL7pR4wZt8nB3c\n");
+    assert_eq!(f.len(), 1, "{f:?}");
+    assert_eq!(f[0].line, 2);
+}
+
+/// BUG-094: in UTF-16/32 a non-ASCII character next to ASCII text becomes
+/// a space in the NUL-stripped view; line numbers are kept.
+#[test]
+fn utf16_cjk_glued_to_tokens_keeps_line_numbers() {
+    let text = "設定ファイル\r\nアクセスキーAKIAIOSFODNN7EXAMPLE\r\n令牌ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ。\r\n";
+    for be in [false, true] {
+        let data: Vec<u8> = text.encode_utf16().flat_map(|u| if be { u.to_be_bytes() } else { u.to_le_bytes() }).collect();
+        let lines: Vec<usize> = scan(&data).iter().map(|f| f.line).collect();
+        assert_eq!(lines, vec![2, 3], "be={be}");
+    }
+    // Clean Japanese and Chinese text glued to ASCII words stays clean.
+    let clean = "設定ファイルtoken数据库password连接。\r\nアクセスAKIAキー\r\n".repeat(50);
+    let data: Vec<u8> = clean.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    assert_clean("utf-16 cjk glued to words", &data);
+}
+
+/// BUG-095: archives that store files uncompressed (`.tar`, `.zip` with
+/// stored entries) hold the file's bytes as they are, so every rule sees
+/// them. A PEM header whose newline is escaped (`\n` in JSON) counts inside
+/// binary data when key material follows; a bare escaped header does not.
+#[test]
+fn uncompressed_archive_members_are_scanned() {
+    let key = "{\"private_key\": \"-----BEGIN PRIVATE KEY-----\\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\\n-----END PRIVATE KEY-----\\n\"}";
+    let mut zip = b"PK\x03\x04\x0a\0\0\0\0\0\0\0\0\0".to_vec();
+    zip.extend_from_slice(&[0; 16]);
+    zip.extend_from_slice(b"sa.json");
+    zip.extend_from_slice(key.as_bytes());
+    zip.extend_from_slice(b"PK\x01\x02\0\0\0\0");
+    assert!(!scan(&zip).is_empty(), "service-account key in a stored zip entry");
+    let mut binary = b"\x7fELF\0\0\0\0".to_vec();
+    binary.extend_from_slice(b"\"-----BEGIN PRIVATE KEY-----\\n\"\0\0parse error\0");
+    assert_clean("a bare escaped header in a program", &binary);
+}
+
+/// BUG-090: a search that spends more than `WORK_FACTOR` times its input
+/// on restarts inside rejected matches stops and reports `scan-limit`
+/// (which quarantines the file). Ordinary text with many rejected
+/// candidates stays far below the limit.
+#[test]
+fn crafted_input_is_reported_and_ordinary_input_is_not() {
+    let crafted = "xtoken=".repeat(40_000);
+    assert!(scan(crafted.as_bytes()).iter().any(|f| f.rule == "scan-limit"));
+    let mut dense = String::new();
+    for i in 0..20_000 {
+        dense.push_str(&format!("csrf_token={i:08}abcdefgh\nX_PASSWORD=${{DATABASE_PASSWORD_{i}}}\nmytoken_x = \"ghp_short\"\n"));
+    }
+    assert_clean("dense rejected candidates", dense.as_bytes());
+}
+
+/// Inputs crafted against the scanner's worst case (repeated token
+/// prefixes after a byte that rejects them, near-miss tokens, assignment
+/// runs, long runs of one byte) take time linear in their size: 8 times the
+/// input must not take much more than 8 times as long. (The quadratic
+/// scanner of BUG-090 took 64 times as long, and minutes at 256 KiB.)
+#[test]
+fn scanning_time_is_linear_on_crafted_input() {
+    let units = [
+        "xgithub_pat_", "xsk-", "xsk-ant-", "xglpat-", "xxoxb-", "xsk_live_", "xAIza", "xeyJ", "-eyJ-AKIAIOSFODNN7EXAMPLEZ-", "XAKIA", "://a:",
+        ":\\/\\/a:", "ghp_", "-----BEGIN PRIVATE KEY-----", "xtoken=", "csrf_token=", "password_url=", "password=", "password=\"", "password='",
+        "<password>", "<password a=\"b\">", "'password', '", "- name: password\n  value: ", "with password '", "password_x_x_x_x_x_x_x=",
+        "xapp_key=", "a", "password", " ", "\\", "\"", "${{", "%(", "password: x\n", "password=a(b)\n", "xtoken=Xk9mQ2vL7pR4wZt8,",
+        "<key>password</key><string>", "identified by '", "password=:", "password: [", "password: abcd ",
+    ];
+    let time = |data: &[u8]| {
+        let t = Instant::now();
+        std::hint::black_box(scan(data));
+        t.elapsed()
+    };
+    let mut report = Vec::new();
+    for unit in units {
+        let make = |n: usize| unit.repeat(n / unit.len() + 1).into_bytes()[..n].to_vec();
+        let (small, large) = (make(32 << 10), make(256 << 10));
+        let ts = time(&small).min(time(&small));
+        let tl = time(&large);
+        if tl > ts * 24 + std::time::Duration::from_millis(300) {
+            report.push(format!("{unit:?}: 32 KiB {ts:?}, 256 KiB {tl:?}"));
+        }
+    }
+    assert!(report.is_empty(), "superlinear:\n{}", report.join("\n"));
+}
+
 // ---- throughput ------------------------------------------------------------------------
 
 fn bench(name: &str, data: &[u8]) {
@@ -505,6 +729,10 @@ fn scanner_throughput() {
     dirty.extend_from_slice(b"\npassword: Xk9mQ2vL7pR4wZt8\nAKIAIOSFODNN7EXAMPLE\n");
     bench("mixed text + 2 secrets", &dirty);
     bench("large mixed text", &corpus(32 << 20, 9));
+    // Worst cases (BUG-090): linear, reported as `scan-limit` where noted.
+    for unit in ["xsk-", "xtoken=", "-eyJ-AKIAIOSFODNN7EXAMPLEZ-", "password=", "password=\""] {
+        bench(&format!("crafted {unit:?}"), &unit.repeat((4 << 20) / unit.len()).into_bytes());
+    }
 }
 
 /// Scans every file under `$VEIL_SCAN_DIR` one by one, as snapshots do, and

@@ -531,13 +531,20 @@ CAS, and it applies these rules in order:
 4. Public files are scanned for credentials (AWS, GitHub, GitLab, Slack,
    Stripe, Anthropic, OpenAI, Google, JWT, private keys, passwords in URLs
    (`postgres://app:<password>@db`), and high-entropy `password = …` /
-   `API_KEY=…` / `JWT_SECRET: …` / `GITLAB_TOKEN=…` assignments, quoted or
-   not, and `<password>…</password>` elements). A hit **quarantines** the
-   file: the offending content stays local and is not snapshotted.
+   `API_KEY=…` / `JWT_SECRET: …` / `GITLAB_TOKEN=…` / `APP_KEY=…`
+   assignments in their common shapes: quoted (escaped quotes included) or
+   not, the rest of a configuration line, `define('KEY', '…')`,
+   `env["KEY"] = …`, Kubernetes `name:`/`value:` pairs, XML elements (with
+   attributes or CDATA) and `key="…" value="…"` attributes, plist entries,
+   SQL `WITH PASSWORD '…'` / `IDENTIFIED BY '…'`, Google app passwords).
+   A hit **quarantines** the file: the offending content stays local and
+   is not snapshotted.
    * The scanner (`secrets.rs`) reads every file, whatever its size or
      encoding. Binary files are not skipped. Text in NUL-padded encodings
      (UTF-16/32, with or without a BOM) is scanned a second time with the
-     NULs removed, in 256 KiB chunks with a 16 KiB overlap. A chunk counts
+     NULs removed, in 256 KiB chunks with a 16 KiB overlap (where the NUL
+     positions show UTF-16/32, a non-ASCII character next to ASCII text
+     becomes a space, so it is not glued to a token). A chunk counts
      as such text if the file has a BOM, if 1/32 of its bytes are NUL, or
      if the chunk or its overlap holds a run of 8 ASCII characters in
      UTF-16 (text in a non-Latin script has almost no NULs in UTF-16, and
@@ -549,22 +556,43 @@ CAS, and it applies these rules in order:
      the PEM rule. Token rules run as one
      alternation, so the regex literal prefilter makes a single pass.
      The assignment rule runs on an ASCII-lowercased copy of each chunk,
-     because `(?i)` keywords defeat the prefilter. Unquoted values must
-     look like credentials: references (`$X`, `${X}`), placeholders
-     (`<key>`) and identifiers made of words (`settings.SECRET_KEY`) do not
-     count. A PEM header inside binary data needs key material after it.
+     because `(?i)` keywords defeat the prefilter. Values must look like
+     credentials: whole references (`$X`, `${X}`; a `$` *inside* a random
+     password is no reference), placeholders (`<key>`), hashes and
+     encrypted values (`$2b$…`, `ENC(…)`), code (`os.getenv("X")`,
+     `Option<String>,`) and identifiers made of words
+     (`settings.SECRET_KEY`; long words are judged by letter-pair
+     frequencies, so `qzvxkwprmtfhjlnb` is no word) do not count, and the
+     entropy bar is lower for short, hex and lower-case values. The rest of
+     a line counts only where the key starts a configuration line. A PEM
+     header inside binary data needs key material after it (after a real
+     or an escaped `\n`, as in a service-account JSON key inside a `.tar`).
+     Uncompressed archives (`.tar`, stored `.zip` entries) are scanned as
+     their bytes are; compressed ones (`.tar.gz`, deflated `.zip`, `.docx`,
+     `.jar`) are not decompressed.
+   * Time is linear in the input: repetitions that could hold another match
+     are bounded, so a search reads at most about 1 KiB past its match, and
+     the work redone after restarting inside a rejected match is counted;
+     past 16 times the input the file is reported (`scan-limit`) and
+     quarantined. Crafted input scans at 24+ MiB/s, ordinary text at
+     300–450 MiB/s (dense synthetic corpus) or ~1.5 GiB/s (real source).
    * Keys: the credential keywords match anywhere in an identifier
-     (`DB_PASSWORD`, `spring.datasource.password`), plus up to three
-     suffix words (`DB_PASSWORD_PROD`, `aws_secret_access_key`) unless one
+     (`DB_PASSWORD`, `spring.datasource.password`), plural or numbered
+     (`API_KEYS`, `PASSWORD2`), plus up to six suffix words
+     (`DB_PASSWORD_PROD_EU_WEST_1`, `aws_secret_access_key`) unless one
      of them says the value is something else (`password_hash`,
      `token_url`, `secret_name`, `…_file`, `…_path`). The generic `secret`
      and `token` only count as a word of their own (`JWT_SECRET`, not
      `mytoken`), and `token` not after a word that names a non-credential
-     (`csrf_token`, `next_page_token`, `cancellation_token`). camelCase
+     (`csrf_token`, `next_page_token`, `cancellation_token`). `key` alone
+     is no keyword; a short list of `*_KEY` / `*_SALT` names is (`APP_KEY`,
+     `RAILS_MASTER_KEY`, `ENCRYPTION_KEY`, `SIGNING_KEY`, `AccountKey`,
+     WordPress's `AUTH_KEY` … `NONCE_SALT`), as a word or camelCase hump. camelCase
      generic tokens (`githubToken`) are not matched; `authToken`,
      `accessToken`, `apiKey`, `clientSecret` are. A URL password must not
      be a word, a number or a reference (`user:password@`,
-     `postgres:postgres@`, `${USER}:${PASS}@` do not count).
+     `postgres:postgres@`, `${USER}:${PASS}@` do not count); it is judged
+     percent-decoded, may contain `:`, and `:\/\/` (JSON) counts as `://`.
      `secrets::RULES_VERSION` is part of the stat-cache key, so "scanned
      clean" facts from an older scanner are not reused.
    * A **never-tracked** file is left out of the tree.
