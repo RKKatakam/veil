@@ -36,6 +36,7 @@ fn ctx(host: &str, clock: Arc<dyn LockClock>) -> LockContext {
         skew: SKEW,
         clock,
         host: Some(HostIdentity::simulated(host)),
+        ..LockContext::default()
     }
 }
 

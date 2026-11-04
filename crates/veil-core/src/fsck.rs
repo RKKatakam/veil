@@ -129,7 +129,13 @@ const STAMP_MARGIN_MS: i64 = 5 * 60 * 1000;
 
 /// Which loose objects a crashed lock holder may have written unsynced:
 /// those modified since it took the lock.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// Recorded in a lock file (`"recover_window"`) while a recovery is
+/// outstanding, so that a recovery that fails or is interrupted hands the
+/// next holder the whole window it was working through (see
+/// [`RecoveryWindow::union`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RecoveryWindow {
     /// When the holder took the lock, on the backend's stat clock (see
     /// [`StorageBackend::stat_clock`]; the lock file's own stamp).
@@ -143,6 +149,20 @@ pub enum RecoveryWindow {
 }
 
 impl RecoveryWindow {
+    /// A window covering both `self` and `other`: what the next holder
+    /// must recover when a holder that was recovering `other` died or
+    /// failed after writing within `self`. Stamps and wall-clock times are
+    /// not comparable without the backend, so mixing them checks every
+    /// loose object.
+    pub fn union(self, other: RecoveryWindow) -> RecoveryWindow {
+        use RecoveryWindow::*;
+        match (self, other) {
+            (Stamp(a), Stamp(b)) => Stamp(a.min(b)),
+            (Wall(a), Wall(b)) => Wall(a.min(b)),
+            _ => All,
+        }
+    }
+
     /// The stamp (on `backend`'s stat clock) before which a file cannot
     /// have been written by the crashed holder; `None`: check every file.
     fn cutoff(self, backend: &dyn StorageBackend) -> Option<i64> {
@@ -1086,11 +1106,20 @@ impl Checker {
                 format!("repository lock present ({state}), held by {}", holder.describe()),
             );
         }
-        if self.backend.exists(&vpath(STEAL_PATH))? {
-            self.push(
-                Severity::Note,
-                format!("{STEAL_PATH} present (an interrupted lock takeover)"),
-            );
+        for g in crate::lock::takeover_guards(&*self.backend)? {
+            let what = if g.depth == 0 {
+                format!("{STEAL_PATH} present (an interrupted lock takeover)")
+            } else {
+                format!("{} present (a takeover sub-guard left by an interrupted lock takeover)", g.path)
+            };
+            let state = match &g.stale {
+                Some(why) => format!("stale ({why}); `vl doctor` or the next lock takeover removes it"),
+                None => match &g.holder {
+                    Some(h) => format!("held by {}", h.describe()),
+                    None => "unreadable content".into(),
+                },
+            };
+            self.push(Severity::Note, format!("{what}, {state}"));
         }
         Ok(())
     }

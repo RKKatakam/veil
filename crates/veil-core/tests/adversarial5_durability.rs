@@ -40,6 +40,11 @@ fn p(s: &str) -> VPath {
 /// * `fail_unsynced_writes` makes that many later `write_unsynced` calls
 ///   fail (ENOSPC), without writing.
 /// * `power_loss` tears every file that is not durable.
+/// * [`Disk::arm`] makes the k-th mutation from now fail once
+///   ([`Fault::Fail`]: ENOSPC for a write, EIO for a removal, a barrier
+///   with the semantics above) or crash the process ([`Fault::Crash`]:
+///   that mutation and every later one fails, nothing more is applied,
+///   unsynced files stay volatile) until [`Disk::disarm`].
 #[derive(Debug)]
 struct Disk {
     inner: Arc<MemoryBackend>,
@@ -49,6 +54,16 @@ struct Disk {
     fail_unsynced_writes: AtomicUsize,
     volatile: Mutex<HashSet<VPath>>,
     lost: Mutex<HashSet<VPath>>,
+    mutations: AtomicUsize,
+    fault: Mutex<Option<(usize, Fault)>>,
+    fired: AtomicBool,
+    crashed: AtomicBool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fault {
+    Fail,
+    Crash,
 }
 
 impl Disk {
@@ -61,6 +76,40 @@ impl Disk {
             fail_unsynced_writes: AtomicUsize::new(0),
             volatile: Mutex::default(),
             lost: Mutex::default(),
+            mutations: AtomicUsize::new(0),
+            fault: Mutex::default(),
+            fired: AtomicBool::new(false),
+            crashed: AtomicBool::new(false),
+        }
+    }
+
+    fn arm(&self, at: usize, fault: Fault) {
+        self.mutations.store(0, Ordering::SeqCst);
+        self.fired.store(false, Ordering::SeqCst);
+        self.crashed.store(false, Ordering::SeqCst);
+        *self.fault.lock().unwrap() = Some((at, fault));
+    }
+
+    /// Stop injecting (a new process); whether the fault was reached.
+    fn disarm(&self) -> bool {
+        *self.fault.lock().unwrap() = None;
+        self.crashed.store(false, Ordering::SeqCst);
+        self.fired.load(Ordering::SeqCst)
+    }
+
+    /// Count one mutation; whether it fails.
+    fn faulted(&self) -> bool {
+        if self.crashed.load(Ordering::SeqCst) {
+            return true;
+        }
+        let n = self.mutations.fetch_add(1, Ordering::SeqCst);
+        match *self.fault.lock().unwrap() {
+            Some((at, fault)) if at == n => {
+                self.fired.store(true, Ordering::SeqCst);
+                self.crashed.store(fault == Fault::Crash, Ordering::SeqCst);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -107,6 +156,9 @@ impl StorageBackend for Disk {
         self.inner.read(path)
     }
     fn write(&self, path: &VPath, data: &[u8]) -> Result<()> {
+        if self.faulted() {
+            return Err(Self::err("ENOSPC: no space left on device"));
+        }
         self.inner.write(path, data)?;
         self.durable(path);
         Ok(())
@@ -116,7 +168,7 @@ impl StorageBackend for Disk {
             let left = self.fail_unsynced_writes.load(Ordering::SeqCst);
             left > 0 && self.fail_unsynced_writes.compare_exchange(left, left - 1, Ordering::SeqCst, Ordering::SeqCst).is_ok()
         };
-        if fail {
+        if fail || self.faulted() {
             return Err(Self::err("ENOSPC: no space left on device"));
         }
         self.inner.write(path, data)?;
@@ -125,9 +177,16 @@ impl StorageBackend for Disk {
         Ok(())
     }
     fn sync_barrier(&self) -> Result<()> {
+        if self.crashed.load(Ordering::SeqCst) {
+            return Err(Self::err("the process is gone"));
+        }
         let mut volatile = self.volatile.lock().unwrap();
         let n = self.barriers.fetch_add(1, Ordering::SeqCst);
-        if self.fail_barriers.lock().unwrap().contains(&n) {
+        let injected = self.faulted();
+        if injected && self.crashed.load(Ordering::SeqCst) {
+            return Err(Self::err("the process is gone"));
+        }
+        if injected || self.fail_barriers.lock().unwrap().contains(&n) {
             self.lost.lock().unwrap().extend(volatile.drain());
             return Err(Self::err("EIO: writeback failed"));
         }
@@ -135,6 +194,9 @@ impl StorageBackend for Disk {
         Ok(())
     }
     fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool> {
+        if self.faulted() {
+            return Err(Self::err("ENOSPC: no space left on device"));
+        }
         let created = self.inner.create_new(path, data)?;
         if created {
             self.durable(path);
@@ -142,6 +204,9 @@ impl StorageBackend for Disk {
         Ok(created)
     }
     fn remove_file(&self, path: &VPath) -> Result<()> {
+        if self.faulted() {
+            return Err(Self::err("EIO: cannot remove"));
+        }
         if self.refuse_removes.load(Ordering::SeqCst) && path.as_str().starts_with(".veil/objects/") {
             return Err(Self::err("EIO: cannot remove"));
         }
@@ -182,8 +247,13 @@ fn corruption(mem: &Arc<MemoryBackend>, id: &Identity) -> Vec<String> {
 /// A repository with one committed file, and twelve new files (spread over
 /// many fanout directories once stored) waiting in the working copy.
 fn world() -> (Arc<MemoryBackend>, Arc<Disk>, Identity) {
-    let mem = Arc::new(MemoryBackend::new());
     let id = Identity::generate("alice");
+    let (mem, disk) = world_of(&id);
+    (mem, disk, id)
+}
+
+fn world_of(id: &Identity) -> (Arc<MemoryBackend>, Arc<Disk>) {
+    let mem = Arc::new(MemoryBackend::new());
     let mut repo = Repo::init(mem.clone(), Some(id.clone()), "alice").unwrap();
     mem.write(&p("README"), b"hello\n").unwrap();
     repo.snapshot_workspace(WS, &*mem).unwrap();
@@ -192,7 +262,7 @@ fn world() -> (Arc<MemoryBackend>, Arc<Disk>, Identity) {
         mem.write(&p(&format!("src/file{i}.rs")), format!("pub fn f{i}() -> u32 {{ {i} }}\n").as_bytes()).unwrap();
     }
     let disk = Arc::new(Disk::new(mem.clone()));
-    (mem, disk, id)
+    (mem, disk)
 }
 
 /// Process A snapshots the twelve files; its barrier fails with EIO and
@@ -238,7 +308,6 @@ fn a_successful_recovery_makes_the_retry_durable() {
 /// five-minute margin, which a retry after the user frees space easily
 /// exceeds.)
 #[test]
-#[ignore = "BUG-096: a failed crash recovery hands the next holder a recovery window that skips the dead holder's voided objects"]
 fn a_failed_recovery_does_not_narrow_the_next_recovery_window() {
     let (mem, disk, id) = world();
     a_fails_and_leaves_the_lock_for_recovery(&disk, &id);
@@ -266,6 +335,63 @@ fn a_failed_recovery_does_not_narrow_the_next_recovery_window() {
          after a power loss fsck reports:\n{}",
         bad.join("\n")
     );
+}
+
+/// BUG-096, swept: after A leaves its lock for recovery, B's takeover and
+/// recovery (and the snapshot after it) fail once, or B crashes, at every
+/// mutation in turn; optionally the power fails before the next process
+/// runs. C then takes over, retries and commits, the power fails, and
+/// nothing C's acknowledged commit references may be torn. A third
+/// variant fails B *and* C at the same point before D succeeds.
+#[test]
+fn every_failed_or_interrupted_recovery_still_ends_durable() {
+    let id = Identity::generate("alice");
+    let mut points = 0;
+    let mut recovery_failures = 0;
+    for (fault, power_loss_between, chained) in [
+        (Fault::Fail, false, false),
+        (Fault::Fail, true, false),
+        (Fault::Crash, false, false),
+        (Fault::Crash, true, false),
+        (Fault::Fail, false, true),
+    ] {
+        for k in 0.. {
+            let ctx = format!("{fault:?} at mutation {k}, power loss between: {power_loss_between}, chained: {chained}");
+            let (mem, disk) = world_of(&id);
+            a_fails_and_leaves_the_lock_for_recovery(&disk, &id);
+            let backend: Arc<dyn StorageBackend> = disk.clone();
+            let mut fired = false;
+            for _ in 0..if chained { 2 } else { 1 } {
+                disk.arm(k, fault);
+                let result = Repo::open(backend.clone(), Some(id.clone()), "alice")
+                    .and_then(|mut b| b.snapshot_workspace(WS, &*backend).map(drop));
+                fired = disk.disarm();
+                if fired && disk.read_opt(&p(LOCK_PATH)).unwrap().is_some_and(|l| needs_recovery(&l)) {
+                    recovery_failures += 1;
+                }
+                assert!(fired || result.is_ok(), "{ctx}: failed without a fault: {:?}", result.err());
+                if power_loss_between {
+                    disk.power_loss();
+                }
+            }
+            let mut c = Repo::open(backend.clone(), Some(id.clone()), "alice").unwrap();
+            c.snapshot_workspace(WS, &*backend).unwrap_or_else(|e| panic!("{ctx}: retry: {e}"));
+            c.commit_working_copy(WS, "add files").unwrap_or_else(|e| panic!("{ctx}: commit: {e}"));
+            drop(c);
+            disk.power_loss();
+            let bad = corruption(&mem, &id);
+            assert!(bad.is_empty(), "{ctx}: after a power loss fsck reports:\n{}", bad.join("\n"));
+            let repo = Repo::open(mem.clone(), Some(id.clone()), "alice").unwrap();
+            let head = repo.op_id();
+            assert!(repo.ops().get(&head).is_ok(), "{ctx}: head operation readable");
+            if !fired {
+                break;
+            }
+            points += 1;
+        }
+    }
+    assert!(points > 100, "too few fault points: {points}");
+    assert!(recovery_failures > 20, "too few failed recoveries: {recovery_failures}");
 }
 
 // ---- process liveness ---------------------------------------------------------------
@@ -316,7 +442,6 @@ fn plant_lock_of(backend: &dyn StorageBackend, pid: u32) {
 /// "instant" recovery from `kill -9` that ARCHITECTURE §9 promises.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "BUG-097: a killed vl that is not yet reaped (zombie) keeps the repository locked"]
 fn a_killed_but_unreaped_holder_is_taken_over() {
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut child = std::process::Command::new("sleep").arg("60").spawn().unwrap();
