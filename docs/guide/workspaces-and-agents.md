@@ -2,8 +2,9 @@
 
 A **workspace** is a line of work with its own working-copy change. Unlike a
 Git worktree it needs no directory: it lives in the repository, and you
-attach your project directory to it, run a command in a throwaway copy of
-it, or read and write its files directly.
+attach your project directory to it, run commands in its sandbox (a
+directory Veil keeps for it, so you never set up a worktree), or read and
+write its files directly.
 
 1. [Virtual workspaces](#virtual-workspaces)
 2. [`vl ws exec`: run a command in a sandbox](#vl-ws-exec-run-a-command-in-a-sandbox)
@@ -30,10 +31,10 @@ $ vl ws list
 | `vl ws new NAME [-r REV] [--cloak [S]]` | A workspace whose working copy is a new change on `REV` (default: the parents of `@`, like a fresh checkout). `--cloak` seals everything recorded in it (default scope `team`) |
 | `vl ws list` | Workspaces and their working copies; `*` marks the one your directory is attached to |
 | `vl ws switch NAME` | Attach the project directory to `NAME`: your files are recorded in the current workspace first, then replaced by `NAME`'s. `vl undo` right after it switches back |
-| `vl ws exec NAME -- CMD…` | Run `CMD` in a sandbox holding `NAME`'s files, and record the result in `NAME` |
+| `vl ws exec NAME -- CMD…` | Run `CMD` in `NAME`'s sandbox, which holds its files, and record the result in `NAME` |
 | `vl ws cat NAME PATH` | Print a file from a workspace |
 | `vl ws write NAME PATH < FILE` | Write stdin to a file in a workspace and record it, in memory. Fails, saying why, if the policy keeps the path out (an isolated `.env`, an ignored path) or the scanner quarantines it |
-| `vl ws rm NAME` | Delete a workspace (not the one your directory is attached to) |
+| `vl ws rm [--force] NAME` | Delete a workspace (not the one your directory is attached to) and its sandbox. Refused while a `ws exec` runs in it, and, without `--force`, while its sandbox holds quarantined files (they are in no snapshot) |
 
 **Switching is safe to interrupt.** Before `vl ws switch` touches a file
 it notes in `.veil/local/checkout.json` where the directory is going. If it
@@ -72,7 +73,8 @@ When an ordinary workspace's work should land later, `vl describe` it (or
 
 ```text
 $ vl ws exec agent -m "agent: add notes" -- sh -c 'echo "notes" > NOTES.md; ls -a'
-running sh -c echo "notes" > NOTES.md; ls -a in /tmp/veil-ws-agent-1042683-a0f4da85
+synced sandbox: 3 files written, 0 removed
+running sh -c echo "notes" > NOTES.md; ls -a in /home/me/app/.veil/local/sandboxes/agent/files
 .
 ..
 .veilpolicy
@@ -80,10 +82,17 @@ NOTES.md
 app.py
 cfg.js
 Recorded lqosxltm 79607804 agent: add notes
+$ vl ws exec agent -- cargo build      # the second run rewrites nothing
+running cargo build in /home/me/app/.veil/local/sandboxes/agent/files
 ```
 
-* The sandbox is a fresh directory holding the workspace's files. Your
-  project directory is not touched.
+* Each workspace has **one sandbox**, `.veil/local/sandboxes/NAME/files`,
+  kept between runs like a Git worktree. Before each run, Veil brings it
+  to the workspace's current files, rewriting only what changed since the
+  last run (`synced sandbox: …` says how much). Files the command leaves
+  that are not recorded (an ignored `target/` or `node_modules/`) stay for
+  the next run, so incremental builds stay incremental. Your project
+  directory is not touched.
 * What the command leaves behind is recorded in the workspace, through the
   same policy and secret scanner as your own snapshots, so a tool or agent
   cannot record a secret either.
@@ -91,12 +100,26 @@ Recorded lqosxltm 79607804 agent: add notes
 * The result is recorded **whatever the command's exit status**, and `vl`
   exits with that status. `vl`'s own messages go to stderr; stdout is the
   command's.
-* The sandbox has no `.veil` directory: the command cannot run `vl`
-  against the repository from inside it.
+* The sandbox has no `.veil` directory, and neither `vl` nor `git` look
+  above it for a repository: the command cannot act on your project
+  directory through them.
+* **One run at a time per workspace.** A second `vl ws exec` in the same
+  workspace waits for the first (`waiting: another vl ws exec is running
+  in workspace agent`); runs in different workspaces, or `--ephemeral`
+  ones, run side by side.
+* **Ctrl-C** stops the command; `vl` records what it left and exits with
+  130, as for any other exit status.
+* If the workspace moves while the command runs (a `vl ws write`, a rebase
+  of it from another terminal), recording the sandbox would undo that. The
+  result is saved as a change of its own on top of what the command
+  started from instead (`workspace 'agent' moved while the command ran; its
+  result was saved as change …`); merge it or abandon it.
 * You can't `ws exec` the workspace your directory is attached to (`vl`
   says: just run the command).
 
 ## One-shot runs: `--ephemeral`
+
+`--ephemeral` keeps no sandbox: each run gets a fresh throwaway copy.
 
 ```text
 $ vl ws exec --ephemeral -r @ -m "codegen" -- sh -c 'echo gen > gen.txt'
@@ -120,9 +143,10 @@ a copy under another name can't be recorded:
 
 ```text
 $ vl ws exec agent --with-isolated -- sh -c 'cat .env; cp .env leaked.txt'
-running sh -c cat .env; cp .env leaked.txt in /tmp/veil-ws-agent-1042703-3c70c6db
+running sh -c cat .env; cp .env leaked.txt in /home/me/app/.veil/local/sandboxes/agent/files
 DB_URL=postgres://app:Xk29vLq8sPz@db/prod
 warning: leaked.txt quarantined: looks like a secret (injected-isolated-secret at line 1: content of .env injected into the sandbox); not snapshotted. Fix it, or `vl cloak|isolate|expose --force leaked.txt`
+  cleaned leaked.txt (they held an injected secret; quarantined and taken out of the sandbox)
 No changes in lqosxltm 79607804 agent: add notes
 ```
 
@@ -132,18 +156,52 @@ secret (8+ characters, mixed character classes or 20+ characters, so
 line. The command itself can of course read and use the secrets (that is
 the point); quarantine only keeps them out of history.
 
-A quarantined file written in a sandbox **disappears with the sandbox**
-(it was never recorded). Use the vault for secrets an agent needs
-(`vl run`), not files it writes.
+**Injected files live for one run.** After the run is recorded, the
+injected files are taken out of the sandbox again (a file the sandbox had
+at that path before is put back), and so is every file quarantined
+because it holds an injected value: a tracked file gets its recorded
+version back, a new one is removed (`cleaned leaked.txt (they held an
+injected secret; …)`). So no copy is left for a later run, which no longer
+guards against the injected values, to record. Copies in ignored or
+isolated files (a build log under `target/`) are never recorded and stay.
+Pass `--with-isolated` on every run that needs the files.
+
+Other quarantined files (the scanner found what looks like a secret in
+something the command wrote) stay in the sandbox, as they would in your
+project directory, and are quarantined again on every run until fixed.
+Use the vault for secrets an agent needs (`vl run`), not files it writes.
 
 ## Sandboxes
 
-* Sandboxes are created in `$TMPDIR` (`/tmp` on Linux, a per-user directory
-  under `/var/folders` on macOS), named `veil-ws-<workspace>-<pid>-<random>`,
-  and made private to you before the command runs.
-* They are removed when `vl` exits, including after `kill -9` (a small
-  reaper process watches `vl`).
-* `vl doctor` reports leftover sandboxes, if any.
+* A workspace's sandbox lives in `.veil/local/sandboxes/NAME/` (`0700`):
+  `files/` (where the command runs), `manifest.json` (which snapshot the
+  files are, whether a run is in progress), `statcache` (each file's size,
+  times, inode, mode and content hash, so recording after a run only reads
+  files whose stat changed) and `lock`. It is device-local, like the rest
+  of `.veil/local/`, and `vl ws rm` deletes it.
+* **Copy-on-write.** Where the filesystem supports clones (btrfs and XFS
+  on Linux, APFS on macOS), files the sandbox shares with your project
+  directory are cloned instead of copied: no time, no extra space until one
+  side changes. Elsewhere (ext4, tmpfs) they are written normally, so a
+  sandbox takes as much space as the workspace's files.
+* **Crashes.** If `vl` dies during a run (`kill -9`, a crash, a power cut),
+  the sandbox is wiped: by a small reaper process that watches `vl`, or by
+  the next run, which finds the run unfinished (`Rebuilding the sandbox of
+  workspace agent: the previous run did not finish`) and starts from a
+  fresh copy. What the dead run changed is lost; what earlier runs recorded
+  is not. The same happens after a reboot, and to a sandbox whose files
+  were tampered with in a way Veil cannot trust.
+* Files you edit in the sandbox yourself, between runs, are recorded by
+  the next run, as if the command had written them.
+* Tools that look in parent directories (Node's `node_modules` lookup,
+  editor and linter configuration) can see your project directory above
+  the sandbox. Install dependencies inside the sandbox if that matters.
+* `--ephemeral` runs use a throwaway directory in `$TMPDIR` (`/tmp` on
+  Linux, a per-user directory under `/var/folders` on macOS), named
+  `veil-ws-ephemeral-<pid>-<random>`, private to you and removed when `vl`
+  exits, including after `kill -9`.
+* `vl doctor` reports leftover throwaway sandboxes, sandboxes of removed
+  workspaces and interrupted runs.
 * A sandbox is an isolation of **files**, not a security boundary: the
   command runs as you, with your network and your home directory. Run
   untrusted agents inside your own container or VM.

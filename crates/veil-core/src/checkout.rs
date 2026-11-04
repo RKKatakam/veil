@@ -682,6 +682,19 @@ fn apply_changes(
         }
         let local_edit = current.as_ref().is_some_and(|m| m.kind == NodeKind::File)
             && !holds(store, fs, &c.path, c.old.as_ref(), cache.as_deref())?;
+        // A copy the backend can clone (a sandbox reflinking the project
+        // directory's file): nothing to read or write.
+        if !local_edit && new.fallback.is_none() && store.entry_readable(new) && fs.clone_known(&c.path, &new.id)? {
+            forget(&mut cache, &c.path);
+            if let Err(e) = fs.set_executable(&c.path, new.executable) {
+                // Never leave the content with the wrong mode behind.
+                let _ = fs.remove_file(&c.path);
+                per_file(&mut report, &c.path, e)?;
+                continue;
+            }
+            report.written += 1;
+            continue;
+        }
         match read_materialised(store, new) {
             Ok((data, via_fallback)) => {
                 if local_edit {

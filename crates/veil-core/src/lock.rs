@@ -1507,7 +1507,7 @@ fn gethostname() -> Option<String> {
 
 /// Identifies one boot of one machine *and* the pid namespace, so a pid is
 /// only compared against processes it could actually refer to.
-fn boot_identity() -> String {
+pub fn boot_identity() -> String {
     #[cfg(target_os = "linux")]
     {
         let boot = read_trimmed("/proc/sys/kernel/random/boot_id");

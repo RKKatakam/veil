@@ -53,7 +53,7 @@ use veil_core::{
 
 use crate::{
     cli::*,
-    ctx::{load_identity, print_working_copy_warnings, save_checkout, user_for, CheckoutState, Ctx},
+    ctx::{load_identity, save_checkout, user_for, CheckoutState, Ctx},
     render::*,
 };
 
@@ -82,7 +82,7 @@ node_modules/            ignore
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
     if args.next().is_some_and(|a| a == sandbox::REAPER_ARG) {
-        return sandbox::reaper_main(args.next().as_deref());
+        return sandbox::reaper_main(args.collect());
     }
     let cli = Cli::parse();
     render::exit_status(match run(cli) {
@@ -2012,15 +2012,6 @@ fn warn_unreachable_members(keys: &veil_core::keychain::Keychain, scope: &str) {
 
 // ---- workspaces ----------------------------------------------------------
 
-fn run_in(dir: &Path, command: &[String]) -> Result<i32> {
-    let status = std::process::Command::new(&command[0])
-        .args(&command[1..])
-        .current_dir(dir)
-        .status()
-        .with_context(|| format!("failed to run {}", command[0]))?;
-    Ok(status.code().unwrap_or(1))
-}
-
 fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
     match c {
         WsCmd::List => {
@@ -2059,12 +2050,12 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
             ctx.repo.record_workspace_switch(&from, name)?;
             println!("Project directory attached to workspace {}", bold(name));
         }
-        WsCmd::Rm { name } => {
+        WsCmd::Rm { name, force } => {
             if *name == ctx.ws {
                 bail!("workspace '{name}' is attached to the project directory; switch away first");
             }
-            ctx.repo.remove_workspace(name)?;
-            println!("Removed workspace {name}");
+            let had_sandbox = sandbox::remove_workspace(ctx, name, *force)?;
+            println!("Removed workspace {name}{}", if had_sandbox { " and its sandbox" } else { "" });
         }
         WsCmd::Cat { name, path } => {
             let wc = ctx.repo.workspace_wc(name)?;
@@ -2133,67 +2124,17 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
             with_isolated,
             command,
         } => {
-            let (label, base_snapshot) = if *ephemeral {
-                ("ephemeral".to_string(), ctx.rev(rev)?)
-            } else {
-                let name = name.as_deref().ok_or_else(|| anyhow!("give a workspace name or --ephemeral"))?;
-                if name == ctx.ws {
-                    bail!("workspace '{name}' is attached to the project directory; just run the command");
-                }
-                (name.to_string(), ctx.repo.workspace_wc(name)?)
-            };
-            let sb = sandbox::Sandbox::create(&label)?;
-            let dir = sb.path().to_path_buf();
-            let sandbox = DiskBackend::new(&dir);
-            let result = (|| -> Result<i32> {
-                let tree = ctx.repo.snapshot(&base_snapshot)?.tree;
-                ctx.repo.checkout_tree(&sandbox, None, &tree)?;
-                let mut injected = None;
-                if *with_isolated {
-                    let mut files = Vec::new();
-                    for (p, hexdata) in ctx.repo.vault_load()?.files {
-                        let data = hex::decode(hexdata)?;
-                        sandbox.write(&VPath::new(&p)?, &data)?;
-                        files.push((p, data));
-                    }
-                    // Whatever the command does with these, they must not be
-                    // recorded under another name.
-                    injected = Some(veil_core::builder::InjectedSecrets::from_files(
-                        files.iter().map(|(p, d)| (p.as_str(), d.as_slice())),
-                    ));
-                }
-                sb.make_private()?;
-                eprintln!("{} {} in {}", dim("running"), command.join(" "), dir.display());
-                let code = run_in(&dir, command)?;
-                if *ephemeral {
-                    let (id, report) =
-                        ctx.repo
-                            .commit_fs_as_child_injected(base_snapshot, &sandbox, message, injected.as_ref())?;
-                    print_build_warnings(&report);
-                    print_working_copy_warnings(&report);
-                    eprintln!("Recorded {}", one_line(&ctx.repo, &id));
-                } else {
-                    let out = ctx
-                        .repo
-                        .snapshot_workspace_injected(&label, &sandbox, None, injected.as_ref())?;
-                    print_build_warnings(&out.report);
-                    print_working_copy_warnings(&out.report);
-                    if !message.is_empty() {
-                        ctx.repo.describe(out.snapshot, message)?;
-                    }
-                    let wc = ctx.repo.workspace_wc(&label)?;
-                    // stderr: stdout belongs to the sandboxed command.
-                    eprintln!(
-                        "{} {}",
-                        if out.changed { "Recorded" } else { "No changes in" },
-                        one_line(&ctx.repo, &wc)
-                    );
-                }
-                Ok(code)
-            })();
-            drop(sb);
-            let code = result?;
-            return Ok(ExitCode::from(code.clamp(0, 255) as u8));
+            return sandbox::exec(
+                ctx,
+                &sandbox::Exec {
+                    name: name.as_deref(),
+                    ephemeral: *ephemeral,
+                    rev,
+                    message,
+                    with_isolated: *with_isolated,
+                    command,
+                },
+            );
         }
     }
     Ok(ExitCode::SUCCESS)

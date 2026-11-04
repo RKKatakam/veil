@@ -12,8 +12,8 @@ Subcommands:
 * [`vl workspace list`](#vl-workspace-list): List workspaces
 * [`vl workspace new`](#vl-workspace-new): Create a virtual workspace (no directory is created)
 * [`vl workspace switch`](#vl-workspace-switch): Attach the project directory to another workspace
-* [`vl workspace rm`](#vl-workspace-rm): Delete a workspace
-* [`vl workspace exec`](#vl-workspace-exec): Run a command inside a workspace in a throwaway directory and record the result. With --ephemeral, a one-shot workspace on REV is used
+* [`vl workspace rm`](#vl-workspace-rm): Delete a workspace, and its `ws exec` sandbox
+* [`vl workspace exec`](#vl-workspace-exec): Run a command in a workspace's sandbox and record the result
 * [`vl workspace cat`](#vl-workspace-cat): Print a file from a workspace
 * [`vl workspace write`](#vl-workspace-write): Write stdin to a file in a workspace (in memory, no checkout)
 
@@ -62,7 +62,7 @@ Arguments:
 
 ## `vl workspace rm`
 
-Delete a workspace
+Delete a workspace, and its `ws exec` sandbox
 
 ```text
 vl workspace rm [OPTIONS] <NAME>
@@ -74,9 +74,17 @@ Arguments:
 |---|---|
 | `<NAME>` | Workspace name (required) |
 
+Options:
+
+| | |
+|---|---|
+| `--force` | Also when its sandbox holds quarantined files, which are in no snapshot |
+
 ## `vl workspace exec`
 
-Run a command inside a workspace in a throwaway directory and record the result. With --ephemeral, a one-shot workspace on REV is used
+Run a command in a workspace's sandbox and record the result.
+
+Each workspace keeps one sandbox, .veil/local/sandboxes/NAME/files, between runs: a run rewrites only what changed since the last one (copy-on-write clones where the filesystem has them), and files the command leaves that are not recorded (ignored build output) stay for the next run. A second run in the same workspace waits for the first. With --ephemeral, a one-shot workspace on REV runs in a throwaway directory instead.
 
 ```text
 vl workspace exec [OPTIONS] [NAME] -- <COMMAND>...
@@ -96,7 +104,7 @@ Options:
 | `--ephemeral` | Run in a one-shot workspace on REV and record the result as a new change on top of it |
 | `-r, --rev <REV>` | Base revision for --ephemeral (default: `@-`) |
 | `-m, --message <MESSAGE>` | Description to record (default: empty) |
-| `--with-isolated` | Copy local-only (isolated) files such as .env into the sandbox |
+| `--with-isolated` | Copy local-only (isolated) files such as .env into the sandbox for this run (they are taken out again afterwards) |
 
 ## `vl workspace cat`
 

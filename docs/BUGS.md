@@ -836,3 +836,13 @@ fails). Coverage: `docs/conformance/sync.md`. Line numbers refer to
   simulate a dropped TCP connection exactly: cutting the server's output
   leaves the server process alive, which `vl` sees as a server that
   stopped answering (the documented 300 s timeout, shortened in the test).
+
+## Findings from the local-tooling round
+
+Found while building persistent `vl ws exec` sandboxes (BUG-300–319),
+against `integration` @ `b4b244d`. Reproductions are `#[ignore = "BUG-NNN:
+…"]` tests; `cargo test -p veil-core --test sandbox -- --ignored` runs them.
+
+| ID | Sev. | Area | Finding | Root cause | Reproducing tests |
+|---|---|---|---|---|---|
+| BUG-300 | low | stat cache / performance | Once a checkout has written a cloaked file (a clone, `vl ws switch`, every `ws exec` sandbox sync), every later snapshot reads and decrypts it again: the stat cache never learns it back. A working copy with many cloaked files pays for all of them on every command, and `ws exec` cannot vouch for them either (it must leave cloaked files to the builder's sealing check, BUG-103). | `builder.rs:1390`–`1401` ("Unchanged cloaked content keeps its sealing"): the early `return Ok(Some(pe.clone()))` after `matches_encoding` succeeds records no `learn(…, sealed: Some((scope, pe.id)))`, unlike the unchanged-public path at `builder.rs:1377`. | `veil-core/tests/sandbox.rs::unchanged_cloaked_files_are_cached_after_a_checkout` |

@@ -144,7 +144,7 @@ impl DiskBackend {
     /// other caller. The engine's own directory (`.veil/` at the root) is
     /// not checked: nothing from a tree is ever written there. One `lstat`
     /// per existing directory above the path.
-    fn refuse_symlinked_parent(&self, path: &VPath) -> Result<()> {
+    pub(super) fn refuse_symlinked_parent(&self, path: &VPath) -> Result<()> {
         let parts: Vec<&str> = path.components().collect();
         if parts.first() == Some(&crate::repo::VEIL_DIR) {
             return Ok(());
@@ -187,7 +187,7 @@ const TEMP_NAME_PREFIX: usize = 32;
 /// in the same directory: `.<name>.vltmp<8 hex digits>`, with `<name>` cut
 /// to [`TEMP_NAME_PREFIX`] bytes so that a name near the filesystem's
 /// 255-byte limit still has a temp name that fits (BUG-202).
-fn temp_path(parent: &Path, path: &VPath) -> PathBuf {
+pub(super) fn temp_path(parent: &Path, path: &VPath) -> PathBuf {
     let name = path.file_name();
     let mut cut = name.len().min(TEMP_NAME_PREFIX);
     while !name.is_char_boundary(cut) {
@@ -419,6 +419,19 @@ fn stamps(m: &fs::Metadata) -> (Option<i64>, Option<i64>, Option<u64>) {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .and_then(|d| i64::try_from(d.as_nanos()).ok());
     (mtime, None, None)
+}
+
+/// [`Metadata`] of a regular file from what the OS reports.
+pub(super) fn file_metadata(m: &fs::Metadata) -> Metadata {
+    let (mtime, ctime, inode) = stamps(m);
+    Metadata {
+        kind: NodeKind::File,
+        len: m.len(),
+        executable: is_exec(m),
+        mtime,
+        ctime,
+        inode,
+    }
 }
 
 impl StorageBackend for DiskBackend {
@@ -699,17 +712,7 @@ impl StorageBackend for DiskBackend {
         let full = self.full_path(path);
         match fs::symlink_metadata(&full) {
             Ok(m) if m.is_dir() => Ok(Some(Metadata::unstamped(NodeKind::Dir, 0, false))),
-            Ok(m) if m.is_file() => {
-                let (mtime, ctime, inode) = stamps(&m);
-                Ok(Some(Metadata {
-                    kind: NodeKind::File,
-                    len: m.len(),
-                    executable: is_exec(&m),
-                    mtime,
-                    ctime,
-                    inode,
-                }))
-            }
+            Ok(m) if m.is_file() => Ok(Some(file_metadata(&m))),
             Ok(_) => Ok(None),
             Err(e) if is_missing(&e) => Ok(None),
             Err(e) => Err(io_err(&full, e)),

@@ -153,6 +153,12 @@ pub fn find_root(start: &Path) -> Option<PathBuf> {
         if d.join(VEIL_DIR).join("repo.json").is_file() {
             return Some(d.to_path_buf());
         }
+        // Never from inside a `vl ws exec` sandbox
+        // (`.veil/local/sandboxes/<ws>/files`): `vl` run by the command
+        // there must not act on the project directory above it.
+        if veil_core::sandbox::is_sandboxes_dir(d) {
+            return None;
+        }
         cur = d.parent();
     }
     None
@@ -239,6 +245,12 @@ impl Ctx {
             ctx.snapshot()?;
         }
         Ok(ctx)
+    }
+
+    /// The project directory's stat cache (what its files hold, as far as
+    /// the last snapshot verified).
+    pub fn stat_cache(&self) -> &StatCache {
+        &self.cache
     }
 
     pub fn wc(&self) -> Result<ObjectId> {
@@ -647,6 +659,17 @@ fn print_filled_in(r: &CheckoutReport) {
             r.removed
         );
     }
+    print_kept_local(&r.kept_local);
+    print_blocked(&r.blocked);
+    print_obstructed(&r.obstructed);
+    print_nested(&r.nested);
+    print_failed(&r.failed);
+    print_checkout_warnings(&r.warnings);
+}
+
+/// Everything a checkout left alone or could not do (`vl ws exec`'s sync of
+/// its sandbox reports through this).
+pub fn print_checkout_problems(r: &CheckoutReport) {
     print_kept_local(&r.kept_local);
     print_blocked(&r.blocked);
     print_obstructed(&r.obstructed);
