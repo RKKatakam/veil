@@ -230,3 +230,44 @@ fn an_incoming_removal_of_an_accepted_public_bang_is_accepted_so_it_cannot_retur
     let wc = snap(&mut repo, &*fs);
     assert!(file_entry(&repo, &wc, ".env").is_none());
 }
+
+#[test]
+fn an_incoming_policy_cannot_record_the_members_vcs_metadata() {
+    // BUG-076: VCS metadata is ignored by the engine; only a `public!` rule
+    // naming the directory records it, and one that arrives from someone
+    // else is held back like any weakening.
+    let (mut repo, fs, main) = setup();
+    fs.write(&p(".git/config"), b"[remote \"origin\"]\n  url = https://token@example.com/x\n").unwrap();
+    fs.write(&p("sub/.git"), b"gitdir: ../.git/modules/sub\n").unwrap();
+    let wc = snap(&mut repo, &*fs);
+    assert!(file_entry(&repo, &wc, ".git/config").is_none());
+    assert!(file_entry(&repo, &wc, "sub/.git").is_none());
+    let pr = incoming(&mut repo, main, &[(".veilpolicy", ".git public!\n**/.git public!\n")]);
+    move_to(&mut repo, &*fs, pr);
+    let out = repo.snapshot_workspace(WS, &*fs).unwrap();
+    assert!(file_entry(&repo, &out.snapshot, ".git/config").is_none());
+    assert!(file_entry(&repo, &out.snapshot, "sub/.git").is_none());
+    let held: Vec<&str> = out.report.policy_held_back.iter().map(|h| h.path.as_str()).collect();
+    assert!(held.contains(&".git/config") || held.contains(&"sub/.git"), "{held:?}");
+}
+
+#[test]
+fn checking_out_a_snapshot_that_recorded_git_metadata_leaves_the_git_directory_alone() {
+    // Snapshots made before VCS metadata was ignored (BUG-076) may hold
+    // `.git/…`: checking them out neither writes into nor removes from the
+    // working copy's own `.git/`, and the next snapshot drops it.
+    let (mut repo, fs, _) = setup();
+    fs.write(&p(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+    let head = blob(&repo, b"ref: refs/heads/stale\n");
+    let lock = blob(&repo, b"");
+    let git = raw_tree(&repo, vec![file("HEAD", head), file("index.lock", lock)]);
+    let readme = blob(&repo, b"old\n");
+    let tree = raw_tree(&repo, vec![dir(".git", git), file("README", readme)]);
+    let old = raw_snapshot(&repo, vec![], tree, "made by an older vl");
+    move_to(&mut repo, &*fs, old);
+    assert_eq!(fs.read(&p("README")).unwrap(), b"old\n");
+    assert_eq!(fs.read(&p(".git/HEAD")).unwrap(), b"ref: refs/heads/main\n");
+    assert!(!fs.exists(&p(".git/index.lock")).unwrap(), "nothing written into .git");
+    let wc = snap(&mut repo, &*fs);
+    assert!(file_entry(&repo, &wc, ".git/HEAD").is_none(), "no longer recorded");
+}

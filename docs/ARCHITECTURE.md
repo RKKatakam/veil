@@ -390,13 +390,24 @@ rotation = { generation, key_id, previous: [{key_id, sealed}], wrapped: {id → 
 The **builder** (`builder.rs`) is the single point where content enters the
 CAS, and it applies these rules in order:
 
-1. Ignored paths are skipped.
+1. Ignored paths are skipped. That includes, built in and at any depth,
+   the metadata of other version control systems: a `.git` directory or
+   `.git` file (worktrees, submodules), `.jj/`, `.hg/`, `.svn/`, in any
+   ASCII case and with HFS+-ignorable code points
+   (`policy::vcs_metadata`; the Git bridge's refusal of `.git` entries uses
+   the same test). No `.veilpolicy` rule records them (not `** public`,
+   not `vendor/ public!`, not a cloak), except a `public!` rule whose
+   pattern names the directory itself (`fixtures/repo/.git/ public!`).
+   Lifting that ignore counts as weakening for the accepted policy below.
+   Checkout never writes VCS metadata that an older snapshot recorded, nor
+   removes it.
 2. Isolated paths, including the built-in secret rules (`.env`, `.env.*`,
    `*.pem`, `*.key`, SSH private keys, `*.tfstate`, …), are reported back and
    never hashed into the store. A user's plain `public` rule cannot override a
-   built-in secret. `cloak` can (the file is shared encrypted), and so can an
-   explicit `public!`. Built-in secret rules and user `cloak`/`isolate` rules
-   match case-insensitively. Rules that expose or untrack do not. Policy
+   built-in secret (the warning about it stops once a later rule decides
+   the path, e.g. the `public!` of `vl expose --force`). `cloak` can (the
+   file is shared encrypted), and so can an explicit `public!`. Built-in
+   secret rules and user `cloak`/`isolate` rules match case-insensitively. Rules that expose or untrack do not. Policy
    rules fail safe: an invalid scope (`validate_scope_name`), an unknown tier
    or a missing tier isolates the pattern. A protective rule whose glob does
    not compile matches its literal name.
@@ -412,9 +423,10 @@ CAS, and it applies these rules in order:
      the path is reported as held back (`BuildReport::policy_held_back`).
      Weakening is: isolated → cloaked or public; cloaked → public or
      another scope; `public` → `public!` (scanning off); `ignore` lifted
-     from a built-in secret. Moving to `isolate` or `ignore` never weakens
-     (the file stays on the device either way), and strengthening applies
-     at once. A held-back tracked file keeps its entry: an incoming
+     from a built-in secret or from VCS metadata. Moving to `isolate` or
+     `ignore` never weakens (the file stays on the device either way), and
+     strengthening applies at once. A held-back tracked file keeps its
+     entry: an incoming
      `.env public!` plus a decoy tracked `.env` cannot get the member's own
      `.env` recorded as an edit of it, and nothing is recorded as deleted.
    * The accepted policy moves forward on its own only when that cannot
@@ -422,14 +434,36 @@ CAS, and it applies these rules in order:
      repository, a clone, the first snapshot after upgrading), when the
      rules are unchanged (comments and spacing never count), when the only
      changes are `isolate`/`ignore` rules appended to the accepted ones and
-     dropped `public!` rules (so an exposure a teammate reverted cannot
-     come back silently later), and when the member edits `.veilpolicy` themselves (by hand or with
-     `vl cloak|isolate|expose|ignore`): then exactly their edit (the rule
-     lines they removed and added, relative to the tree the working copy
-     was checked out from) is applied to the accepted policy, so editing a
-     policy that arrived from someone else does not accept what that
-     someone else changed. Anything else waits for `vl policy accept`,
-     which lists the local files whose protection it weakens.
+     dropped `public!` rules (so an exposure a teammate reverted cannot come
+     back silently later), and when the member edits `.veilpolicy`
+     themselves (by hand or with `vl cloak|isolate|expose|ignore`): then
+     exactly their edit, relative to the tree the working copy was checked
+     out from, is applied to the accepted policy (`policy::fold_edit`), so
+     editing a policy that arrived from someone else does not accept what
+     that someone else changed. Rules are last-match-wins, so a rule's
+     position is part of its meaning: the edit is a line diff applied *in
+     place*, each added rule landing between the same accepted rules as in
+     the member's file (BUG-073: appending them let `notes/** public`
+     written above `notes/private.md isolate` override it). Where that place
+     is ambiguous (the member added rules exactly where the pending change
+     removed some), their rules go after the removed ones (deciding where
+     both match, as in their file), or else before them. It is refused where
+     the member moved a rule of the pending change. The result is then
+     checked exhaustively: no path may be classified by it more weakly than
+     by both the old accepted policy and the member's file. The check runs
+     over rule combinations, not paths (a path's class depends only on its
+     built-in state, the `public!` rules it matches and the last rule that
+     applies, so every built-in state × set of `public!` rules × last rule
+     per policy covers every path and every glob overlap; rules with the
+     same pattern and case handling count as one), within a fixed work
+     budget. When the fold is refused, only the `isolate`/`ignore` rules the
+     member added are appended to the accepted policy (that never weakens
+     anything), and every snapshot warns that the rest of the edit waits for
+     `vl policy accept`. The accepted policy's first line (a comment)
+     records which edit it folded, so a snapshot that saved it but was not
+     recorded does not fold the same edit twice. Anything else waits for
+     `vl policy accept`, which lists the local files whose protection it
+     weakens.
    * Only the repository's own directory (the backend it was opened on)
      is guarded and can move the accepted policy. Sandboxes of
      `vl ws exec`, overlays, ephemeral workspaces and imported trees hold

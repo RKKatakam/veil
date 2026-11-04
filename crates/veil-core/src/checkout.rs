@@ -504,6 +504,11 @@ fn apply_changes(
     }
     for c in changes {
         let Some(new) = &c.new else { continue };
+        // VCS metadata a snapshot made before it was ignored (`.git/`) is
+        // never written into the working copy's own repository.
+        if policy.classify(&c.path, false).builtin_vcs {
+            continue;
+        }
         if is_local_only(&policy, &c.path) && fs.exists(&c.path)? {
             report.protected.push(c.path.clone());
             continue;

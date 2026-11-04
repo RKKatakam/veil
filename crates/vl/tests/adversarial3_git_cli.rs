@@ -450,7 +450,15 @@ fn hfs_spellings_of_dot_git_are_refused_both_ways() {
     // Veil → Git: not exported.
     let (proj, bare) = exported_project(&env, &[("app.txt", "v1\n")]);
     write(&proj, &format!("{spelling}/config"), "[core]\n\tfsmonitor = evil\n");
+    // VCS metadata is never recorded (BUG-076), HFS+ spellings included…
     env.ok(U, &proj, &["commit", "-m", "hfs"]);
+    let files = env.stdout(U, &proj, &["files", "-r", "@-"]);
+    assert!(!files.contains("config"), "{files}");
+    // …unless a `public!` rule names it; then the export still refuses it.
+    let policy = std::fs::read_to_string(proj.join(".veilpolicy")).unwrap_or_default();
+    write(&proj, ".veilpolicy", &format!("{policy}{spelling}/ public!\n"));
+    env.ok(U, &proj, &["commit", "-m", "hfs"]);
+    assert!(env.stdout(U, &proj, &["files", "-r", "@-"]).contains("config"));
     env.ok(U, &proj, &["tag", "set", "main", "-r", "@-"]);
     let out = env.ok(U, &proj, &["git", "push"]);
     assert!(out.contains("cannot be represented in Git"), "{out}");

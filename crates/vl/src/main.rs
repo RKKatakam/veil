@@ -224,7 +224,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Cloak { patterns, scope } => {
             validate_scope_name(scope)?;
             if !ctx.repo.keys().is_member(scope) {
-                bail!("you hold no current key for scope '{scope}' (create it with `vl scope create {scope}`)");
+                bail!("{}", not_a_member(ctx, scope)?);
             }
             cmd_policy_rules(ctx, patterns, Tier::Cloaked(scope.clone()), false)?
         }
@@ -1096,6 +1096,40 @@ fn rule_pattern(ctx: &Ctx, arg: &str) -> (String, bool) {
     (escape_field(arg), false)
 }
 
+/// Why `vl cloak --scope <scope>` cannot seal for `scope`, and what to do:
+/// create the scope if it does not exist; otherwise ask one of its admins
+/// for a grant (with this member's public key).
+fn not_a_member(ctx: &Ctx, scope: &str) -> Result<String> {
+    use veil_core::keychain::Role;
+    let keys = ctx.repo.keys();
+    let Some(ring) = keys.load_ring(scope)? else {
+        return Ok(format!(
+            "there is no scope '{scope}' in this repository yet: create it with `vl scope create {scope}` \
+             (or `vl pull` first if a teammate created it)"
+        ));
+    };
+    let me = keys.identity().map(|i| i.public_id()).unwrap_or_default();
+    let admins: Vec<String> = match ring.verify() {
+        Ok(state) => state
+            .members
+            .values()
+            .filter(|m| m.role == Role::Admin)
+            .map(|m| safe(&m.name).into_owned())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    let who = match admins.as_slice() {
+        [] => "an admin of the scope".to_string(),
+        names => format!("an admin of the scope ({})", names.join(", ")),
+    };
+    let lost = if keys.has(scope) { " Your access was revoked." } else { "" };
+    Ok(format!(
+        "you are not a member of scope '{scope}', so you cannot cloak files for it.{lost} Ask {who} to grant you \
+         access (`vl scope grant {scope} <your key> --name <your name>`, then `vl push`), then `vl pull` and run \
+         this again. Your public key: {me}"
+    ))
+}
+
 fn cmd_policy_rules(ctx: &mut Ctx, patterns: &[String], tier: Tier, force: bool) -> Result<()> {
     let path = VPath::new(POLICY_FILE)?;
     let mut text = match ctx.fs.read_opt(&path)? {
@@ -1154,6 +1188,10 @@ fn cmd_policy(ctx: &mut Ctx, c: &PolicyCmd) -> Result<()> {
     let policy = ctx.repo.effective_policy(&*ctx.fs)?;
     match c {
         PolicyCmd::Show => {
+            for name in veil_core::policy::BUILTIN_VCS_DIRS {
+                let what = if *name == ".git" { "dirs and files, any depth" } else { "dirs, any depth" };
+                println!("{:<12}  {}  {}", dim("built-in"), format_rule(name, &Tier::Ignored, false), dim(&format!("({what})")));
+            }
             for r in policy.rules() {
                 let origin = if r.builtin { dim("built-in") } else { cyan(".veilpolicy") };
                 println!("{origin:<12}  {}", r.to_line());

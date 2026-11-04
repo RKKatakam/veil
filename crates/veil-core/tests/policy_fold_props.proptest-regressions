@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a53ddecc318bcf311337f555c24e7e5c1dc09b01e6076edbbee4749cdf57bc71 # shrinks to a = ["notes/** public", "notes/** public", "notes/** public", "notes/** public"], pending = [Insert(0, "notes/** public!")], mine = [Move(78194546951815451, 265130705534393430)]
+cc dd1f8f7675076c93fc2accb8be041cfada5eb9c4b8737569f2a26c35c6eeaba1 # shrinks to a = ["notes/** public!"], pending = [Insert(103803356073275183, "notes/** isolate")], mine = [Move(11281152760371154802, 5011126095161249076)]
+cc 48005ecf5478a69575386925af54f8b52c739075be579b91e1562342a2238c86 # shrinks to a = ["notes/** public", "notes/** public", "notes/** public", "notes/** public", "notes/** public"], pending = [Remove(0)], mine = [Remove(0)]
+cc b57b8cd5e7242666f65f4ecb3932a4e41e2a31dde0a6c52cc152025574859456 # shrinks to a = ["*.pem public", "notes/** public", "notes/** public"], pending = [Insert(2754389231992013801, "notes/** isolate")], mine = [Insert(1336152866926562411, "notes/** public"), Move(15860201324474581433, 4108781928493085475)]
