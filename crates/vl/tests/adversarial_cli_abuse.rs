@@ -278,7 +278,6 @@ fn symlinks_are_never_followed_when_snapshotting() {
 /// `vendor -> /shared/vendor`. A pulled tree containing `vendor/x` is written
 /// *through* the link, outside the working copy.
 #[test]
-#[ignore = "BUG-025: checkout writes through symlinked directories in the working copy, escaping it"]
 fn checkout_never_writes_through_a_symlinked_directory() {
     let env = Env::new();
     let shared = env.dir("shared-vendor");
@@ -345,7 +344,6 @@ fn unsafe_is_root() -> bool {
 }
 
 #[test]
-#[ignore = "BUG-038: one unreadable file in the working copy makes every command fail, including `vl ignore` for that file"]
 fn an_unreadable_file_does_not_brick_the_cli() {
     let env = Env::new();
     if unsafe_is_root() {
@@ -362,7 +360,6 @@ fn an_unreadable_file_does_not_brick_the_cli() {
 }
 
 #[test]
-#[ignore = "BUG-039: files whose names are not valid UTF-8 are silently skipped (never recorded, no warning)"]
 fn non_utf8_file_names_are_not_silently_dropped() {
     use std::os::unix::ffi::OsStrExt;
     let env = Env::new();
@@ -421,7 +418,6 @@ fn quarantined_edits_are_never_lost() {
 /// `vl undo` right after editing undoes the auto-snapshot of those edits and
 /// deletes them from disk (recoverable only through the op log).
 #[test]
-#[ignore = "BUG-040: `vl undo` with uncommitted edits undoes their auto-snapshot and removes them from disk"]
 fn undo_does_not_discard_uncommitted_edits() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a.txt", "a\n")]);

@@ -6,6 +6,16 @@
 //! edit, which the builder held back from the tree because it contains a
 //! secret) is left alone and reported in [`CheckoutReport::kept_local`]. The
 //! next snapshot then quarantines it again on top of the new tree.
+//!
+//! Checkout also never writes *through* or *over* something the engine does
+//! not manage: if a path, or any directory above it, is a symlink (or a
+//! socket, device…) in the working copy, the path is left alone and
+//! reported in [`CheckoutReport::blocked`]. An untracked `vendor ->
+//! /shared/vendor` link therefore never receives files from a pulled tree.
+//! (The builder keeps such tracked entries unchanged, so this is not
+//! recorded as a deletion.)
+
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     error::{Result, VeilError},
@@ -30,6 +40,69 @@ pub struct CheckoutReport {
     /// Files whose local content is not what `from` recorded (e.g.
     /// quarantined edits): neither overwritten nor removed.
     pub kept_local: Vec<VPath>,
+    /// Paths that are, or lie below, a symlink or other special file in the
+    /// working copy: never written, removed or followed.
+    pub blocked: Vec<VPath>,
+}
+
+/// Finds paths that are, or lie below, a special entry (symlink, socket,
+/// device) of the working copy. Directory listings are memoised: checkout
+/// never creates special entries, so they cannot appear during a run.
+struct SpecialGuard<'a> {
+    fs: &'a dyn StorageBackend,
+    special: HashMap<VPath, HashSet<String>>,
+    /// Directories already seen to be real directories (checkout itself only
+    /// ever creates real ones).
+    real_dirs: HashSet<VPath>,
+}
+
+/// Is `path`, or any directory above it, a symlink or other special entry
+/// of `fs`? Anything that writes to a working copy outside [`checkout`]
+/// (e.g. `vl restore`) must skip such paths.
+pub fn behind_special(fs: &dyn StorageBackend, path: &VPath) -> Result<bool> {
+    SpecialGuard::new(fs).blocks(path)
+}
+
+impl<'a> SpecialGuard<'a> {
+    fn new(fs: &'a dyn StorageBackend) -> Self {
+        SpecialGuard {
+            fs,
+            special: HashMap::new(),
+            real_dirs: HashSet::new(),
+        }
+    }
+
+    fn is_special(&mut self, path: &VPath) -> Result<bool> {
+        let Some(dir) = path.parent() else { return Ok(false) };
+        if !self.special.contains_key(&dir) {
+            let names = match self.fs.list_dir_full(&dir) {
+                Ok(l) => l.special.into_iter().collect(),
+                Err(e) if e.is_not_found() || matches!(e, VeilError::InvalidPath(_)) => HashSet::new(),
+                Err(e) => return Err(e),
+            };
+            self.special.insert(dir.clone(), names);
+        }
+        Ok(self.special[&dir].contains(path.file_name()))
+    }
+
+    /// Is `path` or any of its ancestors a special entry? Only the topmost
+    /// component that is not a real directory needs checking: below a
+    /// missing directory nothing can exist yet.
+    fn blocks(&mut self, path: &VPath) -> Result<bool> {
+        for p in path.ancestors().into_iter().chain(std::iter::once(path.clone())) {
+            if self.real_dirs.contains(&p) {
+                continue;
+            }
+            match self.fs.metadata(&p)? {
+                Some(m) if m.kind == NodeKind::Dir => {
+                    self.real_dirs.insert(p);
+                }
+                Some(_) => return Ok(false),
+                None => return self.is_special(&p),
+            }
+        }
+        Ok(false)
+    }
 }
 
 /// Update `fs` from tree `from` (what is currently materialised, `None` for an
@@ -67,10 +140,15 @@ pub fn checkout_cached(
         return Err(VeilError::InvalidPath(format!("{:?} is inside reserved .veil", c.path.as_str())));
     }
     let policy = Policy::load(&TreeView::new(store.clone(), *to))?;
+    let mut guard = SpecialGuard::new(fs);
 
     // Removals first so file<->directory swaps work.
     for c in changes.iter().filter(|c| c.new.is_none()) {
         if is_local_only(&policy, &c.path) {
+            continue;
+        }
+        if guard.blocks(&c.path)? {
+            report.blocked.push(c.path.clone());
             continue;
         }
         if fs.metadata(&c.path)?.is_some_and(|m| m.kind == NodeKind::File) {
@@ -90,6 +168,10 @@ pub fn checkout_cached(
             report.protected.push(c.path.clone());
             continue;
         }
+        if guard.blocks(&c.path)? {
+            report.blocked.push(c.path.clone());
+            continue;
+        }
         let current = fs.metadata(&c.path)?;
         let local_edit = current.as_ref().is_some_and(|m| m.kind == NodeKind::File)
             && !holds(store, fs, &c.path, c.old.as_ref(), cache.as_deref())?;
@@ -97,7 +179,7 @@ pub fn checkout_cached(
             Ok(data) => {
                 if local_edit {
                     // Already what we want? Then there is nothing to protect.
-                    if fs.read(&c.path)? != data {
+                    if fs.read(&c.path).map_or(true, |d| d != data) {
                         report.kept_local.push(c.path.clone());
                         continue;
                     }
@@ -150,8 +232,11 @@ fn holds(
             }
         }
     }
-    let Some(data) = fs.read_opt(path)? else {
-        return Ok(false);
+    // A file we cannot read is not one we may overwrite.
+    let data = match fs.read_opt(path) {
+        Ok(Some(d)) => d,
+        Ok(None) | Err(VeilError::Io { .. }) => return Ok(false),
+        Err(e) => return Err(e),
     };
     if entry.visibility.is_public() && Object::blob_id(&data) == entry.id {
         return Ok(true);

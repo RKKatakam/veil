@@ -74,6 +74,39 @@ pub struct DirEntry {
     pub kind: NodeKind,
 }
 
+/// A directory listing that also reports what [`StorageBackend::list_dir`]
+/// leaves out, so callers can warn about it instead of losing it silently.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DirListing {
+    /// Files and directories, sorted by name (exactly `list_dir`).
+    pub entries: Vec<DirEntry>,
+    /// Names of entries that are neither regular files nor directories
+    /// (symlinks, sockets, devices). The engine never follows or records
+    /// them, and never writes through or over them.
+    pub special: Vec<String>,
+    /// Entries whose names are not valid UTF-8, escaped for display
+    /// (`\xNN` per invalid byte). They cannot be represented as a [`VPath`].
+    pub unrepresentable: Vec<String>,
+}
+
+/// Prefix and suffix of the temp files [`DiskBackend`] writes before the
+/// atomic rename: `.<name>.vltmp<8 hex digits>`.
+const TEMP_MARKER: &str = ".vltmp";
+
+/// Is `name` a temp file left behind by an interrupted [`DiskBackend`]
+/// write? Such leftovers are crash debris, never content: the builder skips
+/// them.
+pub fn is_temp_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some(pos) = rest.rfind(TEMP_MARKER) else {
+        return false;
+    };
+    let suffix = &rest[pos + TEMP_MARKER.len()..];
+    pos > 0 && suffix.len() == 8 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Abstract storage. All methods take `&self`; implementations use interior
 /// mutability so a backend can be shared (`Arc<dyn StorageBackend>`) between
 /// the repository, its working copies and concurrent tasks.
@@ -101,7 +134,18 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
     /// Direct children of a directory, sorted by name.
     fn list_dir(&self, path: &VPath) -> Result<Vec<DirEntry>>;
 
-    /// `Ok(None)` when nothing exists at `path`.
+    /// [`StorageBackend::list_dir`] plus the entries it cannot represent.
+    /// Backends that only hold files and directories with UTF-8 names (all
+    /// but [`DiskBackend`]) keep the default.
+    fn list_dir_full(&self, path: &VPath) -> Result<DirListing> {
+        Ok(DirListing {
+            entries: self.list_dir(path)?,
+            ..Default::default()
+        })
+    }
+
+    /// `Ok(None)` when nothing exists at `path`, including when an ancestor
+    /// of `path` is a file.
     fn metadata(&self, path: &VPath) -> Result<Option<Metadata>>;
 
     fn set_executable(&self, path: &VPath, executable: bool) -> Result<()>;

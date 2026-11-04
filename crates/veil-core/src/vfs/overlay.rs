@@ -80,16 +80,17 @@ impl OverlayBackend {
     }
 
     /// Make sure every ancestor of `path` can be a directory in the merged
-    /// view: lower-layer *files* in the way get whited out.
-    fn prepare_parents(&self, path: &VPath) -> Result<()> {
+    /// view. A *file* in the way is an error, exactly as on every other
+    /// backend: silently whiting it out would delete it from the snapshot
+    /// (e.g. an agent's `mkdir -p a` where `a` is a file).
+    fn check_parents(&self, path: &VPath) -> Result<()> {
         for anc in path.ancestors() {
-            if self.upper.metadata(&anc)?.is_some() {
-                continue;
-            }
-            if let Some(m) = self.lower_meta(&anc)? {
-                if m.kind == NodeKind::File {
-                    self.whiteouts.write().unwrap().insert(anc.clone());
-                }
+            let kind = match self.upper.metadata(&anc)? {
+                Some(m) => Some(m.kind),
+                None => self.lower_meta(&anc)?.map(|m| m.kind),
+            };
+            if kind == Some(NodeKind::File) {
+                return Err(VeilError::InvalidPath(format!("{anc} is a file, not a directory")));
             }
         }
         Ok(())
@@ -121,7 +122,7 @@ impl StorageBackend for OverlayBackend {
         if lower.as_ref().is_some_and(|m| m.kind == NodeKind::Dir) {
             return Err(VeilError::InvalidPath(format!("{path} is a directory")));
         }
-        self.prepare_parents(path)?;
+        self.check_parents(path)?;
         let existed_upper = self.upper.metadata(path)?.is_some();
         self.upper.write(path, data)?;
         // Preserve the executable bit of a lower-layer file being replaced.
@@ -160,11 +161,12 @@ impl StorageBackend for OverlayBackend {
     }
 
     fn create_dir_all(&self, path: &VPath) -> Result<()> {
-        self.prepare_parents(path)?;
-        if let Some(m) = self.lower_meta(path)? {
-            if m.kind == NodeKind::File {
-                self.whiteouts.write().unwrap().insert(path.clone());
-            }
+        if path.is_root() {
+            return Ok(());
+        }
+        self.check_parents(path)?;
+        if self.upper.metadata(path)?.is_none() && self.lower_meta(path)?.is_some_and(|m| m.kind == NodeKind::File) {
+            return Err(VeilError::InvalidPath(format!("{path} is a file")));
         }
         self.upper.create_dir_all(path)
     }
@@ -213,7 +215,7 @@ impl StorageBackend for OverlayBackend {
         if self.upper.metadata(path)?.is_none() {
             // copy up
             let data = self.read(path)?;
-            self.prepare_parents(path)?;
+            self.check_parents(path)?;
             self.upper.write(path, &data)?;
         }
         self.upper.set_executable(path, executable)
@@ -252,7 +254,13 @@ mod tests {
         let a: Vec<_> = o.list_dir(&p("a")).unwrap().into_iter().map(|e| e.name).collect();
         assert_eq!(a, vec!["x"]);
 
-        // replace a lower file with a directory
+        // a lower file is never silently replaced by a directory (as on
+        // every other backend); remove it first to make the swap explicit
+        assert!(o.write(&p("b/inner"), b"5").is_err());
+        assert!(o.create_dir_all(&p("b")).is_err());
+        assert!(o.create_dir_all(&p("b/inner")).is_err());
+        assert_eq!(o.read(&p("b")).unwrap(), b"3", "the file survives");
+        o.remove_file(&p("b")).unwrap();
         o.write(&p("b/inner"), b"5").unwrap();
         assert_eq!(o.metadata(&p("b")).unwrap().unwrap().kind, NodeKind::Dir);
         assert_eq!(o.read(&p("b/inner")).unwrap(), b"5");

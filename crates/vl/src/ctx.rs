@@ -214,10 +214,12 @@ impl Ctx {
                     s.change_id.short()
                 ));
             }
+            print_working_copy_warnings(&report);
             self.report = report;
             let to = self.repo.snapshot(&view_wc)?.tree;
             let co = self.repo.checkout_tree_cached(fs, Some(&from), &to, Some(&mut self.cache))?;
             print_kept_local(&co.kept_local);
+            print_blocked(&co.blocked);
             self.checkout = CheckoutState {
                 workspace: self.ws.clone(),
                 snapshot: view_wc,
@@ -232,6 +234,7 @@ impl Ctx {
         self.save_cache();
         self.repo.capture_local_files(fs, &out.report)?;
         render::print_build_warnings(&out.report);
+        print_working_copy_warnings(&out.report);
         self.report = out.report;
         if self.checkout.snapshot != out.snapshot {
             self.checkout.snapshot = out.snapshot;
@@ -275,6 +278,7 @@ impl Ctx {
                 eprintln!("  {} {p} (local-only file kept as is)", render::yellow("protected"));
             }
             print_kept_local(&r.kept_local);
+            print_blocked(&r.blocked);
         }
         if previous != target {
             eprintln!("Working copy now at: {}", render::one_line(&self.repo, &target));
@@ -311,6 +315,35 @@ impl Ctx {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|_| PathBuf::from(user));
         Ok(VPath::new(&rel.to_string_lossy().replace('\\', "/"))?)
+    }
+}
+
+/// Things in the working copy a snapshot could not record. Never fatal, never
+/// silent.
+pub fn print_working_copy_warnings(r: &BuildReport) {
+    for (p, why) in &r.unreadable {
+        warn(&format!(
+            "skipped {p}: cannot read it ({why}); its last recorded version, if any, is kept. Fix its permissions or `vl ignore {p}`"
+        ));
+    }
+    for name in &r.unrepresentable {
+        warn(&format!(
+            "skipped {name}: the file name is not valid UTF-8, so Veil cannot record it. Rename it to keep it under version control"
+        ));
+    }
+    for p in &r.shadowed {
+        warn(&format!(
+            "{p} is tracked but is now a symlink or special file; Veil never follows it and keeps the recorded version"
+        ));
+    }
+}
+
+fn print_blocked(paths: &[VPath]) {
+    for p in paths {
+        eprintln!(
+            "  {} {p} (a symlink or special file is in the way; Veil never writes through or over it)",
+            render::yellow("skipped")
+        );
     }
 }
 
