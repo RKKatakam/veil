@@ -319,7 +319,7 @@ impl Pack {
         }
         let data_end = size - SUM_LEN as u64;
         for (o, l) in index.offsets.iter().zip(&index.lens) {
-            if *o < HEADER_LEN as u64 || o.checked_add(*l).map_or(true, |end| end > data_end) || *l < 9 {
+            if *o < HEADER_LEN as u64 || o.checked_add(*l).is_none_or(|end| end > data_end) || *l < 9 {
                 return Err(corrupt(what(), "index entry points outside the pack"));
             }
         }

@@ -398,7 +398,7 @@ impl Repo {
         let mut released = Vec::new();
         for rec in self.keys().embargoes()? {
             // Only a deadline signed by a scope member may trigger a release.
-            if rec.is_released() || rec.until.map_or(true, |u| u > now) || !self.keys().embargo_trusted(&rec) {
+            if rec.is_released() || rec.until.is_none_or(|u| u > now) || !self.keys().embargo_trusted(&rec) {
                 continue;
             }
             if self.keys().has(&format!("embargo/{}", rec.id)) {

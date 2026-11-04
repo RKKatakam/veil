@@ -1,0 +1,29 @@
+# Steps dist inserts into every `build-local-artifacts` job of release.yml,
+# before it builds the release binary (see `github-build-setup` in
+# dist-workspace.toml). After editing, run `dist generate`.
+#
+# Completions and man pages do not depend on the target, so a quick host
+# build of the same source generates them; the `include` list in
+# crates/vl/Cargo.toml puts them in every archive.
+- name: Generate shell completions and man pages
+  shell: bash
+  run: |
+    set -euo pipefail
+    cargo build --locked -p vl
+    vl=target/debug/vl
+    out=target/vl-extras
+    rm -rf "$out"
+    mkdir -p "$out/completions" "$out/man"
+    "$vl" completions bash > "$out/completions/vl.bash"
+    "$vl" completions zsh > "$out/completions/_vl"
+    "$vl" completions fish > "$out/completions/vl.fish"
+    "$vl" man --out-dir "$out/man"
+    ls -l "$out/completions" "$out/man"
+# zstd and blake3 compile C. For x86_64 musl the `cc` crate finds
+# `musl-gcc` (from musl-tools, which dist installs) by itself; for aarch64
+# it only looks for `aarch64-linux-musl-gcc` and would fall back to the
+# glibc compiler, so point it at musl-gcc explicitly.
+- name: Use musl-gcc for C code on aarch64 Linux
+  if: runner.os == 'Linux' && runner.arch == 'ARM64'
+  shell: bash
+  run: echo "CC_aarch64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"

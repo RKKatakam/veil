@@ -194,8 +194,8 @@ fn merge_dir(
             te.cloned()
         } else {
             let kinds: Vec<EntryKind> = [oe, te].into_iter().flatten().map(|e| e.kind).collect();
-            let base_ok = be.map_or(true, |e| e.kind == kinds[0]);
-            if kinds.iter().all(|k| *k == EntryKind::Dir) && be.map_or(true, |e| e.kind == EntryKind::Dir) {
+            let base_ok = be.is_none_or(|e| e.kind == kinds[0]);
+            if kinds.iter().all(|k| *k == EntryKind::Dir) && be.is_none_or(|e| e.kind == EntryKind::Dir) {
                 if depth >= MAX_TREE_DEPTH {
                     return Err(VeilError::Corrupt(
                         path.to_string(),

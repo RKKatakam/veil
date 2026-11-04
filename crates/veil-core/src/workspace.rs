@@ -404,7 +404,7 @@ fn scanner_outdated(backend: &dyn StorageBackend, ws: &str) -> Result<bool> {
     let current = crate::secrets::RULES_VERSION.to_string();
     Ok(backend
         .read_opt(&scanned_marker(ws)?)?
-        .map_or(true, |v| String::from_utf8_lossy(&v).trim() != current))
+        .is_none_or(|v| String::from_utf8_lossy(&v).trim() != current))
 }
 
 fn mark_scanned(backend: &dyn StorageBackend, ws: &str) -> Result<()> {

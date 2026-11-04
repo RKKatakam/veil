@@ -1,0 +1,108 @@
+# Nightly (and on demand): the deep property tests and the benchmarks, on
+# Linux and macOS. Benchmarks only print their numbers (no thresholds):
+# shared runners are too noisy to gate on; compare runs by eye.
+name: Nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      proptest_cases:
+        description: PROPTEST_CASES for the property tests
+        required: false
+        default: "2000"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  props:
+    name: property tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      PROPTEST_CASES: ${{ inputs.proptest_cases || '2000' }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2.9.3
+      # adversarial_props, plus every adversarial2_* suite that uses proptest.
+      - name: Property tests (PROPTEST_CASES=${{ env.PROPTEST_CASES }})
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          for file in crates/veil-core/tests/adversarial_props.rs crates/*/tests/adversarial2_*.rs; do
+            [ -f "$file" ] || continue
+            grep -q 'proptest' "$file" || continue
+            crate=$(basename "$(dirname "$(dirname "$file")")")
+            test=$(basename "$file" .rs)
+            echo "::group::$crate --test $test"
+            cargo test --release --locked -p "$crate" --test "$test" || status=1
+            echo "::endgroup::"
+          done
+          exit "$status"
+      - name: Keep proptest regressions
+        if: failure()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: proptest-regressions-${{ matrix.os }}
+          path: crates/*/tests/**/*.proptest-regressions
+          if-no-files-found: ignore
+
+  bench:
+    name: benchmarks (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2.9.3
+      - name: Build benchmarks
+        run: cargo test --release --locked --no-run -p veil-core --test storage_bench --test scanner -p vl --test bench_status
+      # `--ignored` runs only the #[ignore]d tests of these binaries: the
+      # benchmarks. One thread, so they do not compete with each other.
+      - name: Run benchmarks
+        shell: bash
+        env:
+          # scanner_real_world scans a real tree: this repository's sources.
+          VEIL_SCAN_DIR: ${{ github.workspace }}/crates
+        run: |
+          set -euo pipefail
+          cargo test --release --locked -p veil-core --test storage_bench --test scanner -p vl --test bench_status \
+            -- --ignored --nocapture --test-threads=1 2>&1 | tee bench.txt
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Benchmarks on ${{ matrix.os }}"
+            echo '```text'
+            cat bench.txt 2>/dev/null || echo "(no output)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

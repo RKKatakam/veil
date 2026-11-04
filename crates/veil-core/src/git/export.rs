@@ -304,7 +304,7 @@ impl GitBridge {
             (Some(x), Some(y)) => x.mode == y.mode && x.oid == y.oid,
             _ => false,
         };
-        let tree_or_none = |x: Option<&gix::objs::tree::Entry>| x.map_or(true, |e| e.mode.is_tree());
+        let tree_or_none = |x: Option<&gix::objs::tree::Entry>| x.is_none_or(|e| e.mode.is_tree());
         let mut out = Vec::new();
         for name in names {
             let (bx, ox, tx) = (be.get(name), oe.get(name), te.get(name));

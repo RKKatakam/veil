@@ -17,11 +17,92 @@ working tree *is* the host filesystem. Veil drops all three assumptions:
 | Worktrees lock directories hostage | **Virtual workspaces** live in the DAG; agents get **in-memory overlays** in microseconds |
 | Tied to the OS filesystem | Engine runs on any `StorageBackend`: disk, memory, overlay, SFTP |
 
+## Install
+
+Veil 1.0 supports **Linux and macOS**, on x86_64 and aarch64 (Apple
+silicon). Windows is not supported.
+
+### From a release
+
+Every release has a `vl` binary for each platform (static musl binaries on
+Linux, so they run on any distribution), with its SHA-256 checksum, shell
+completions and man pages. The installer script picks the right one, checks
+its checksum and puts `vl` in `~/.cargo/bin`, adding that to your `PATH`:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/veil-vcs/veil/releases/latest/download/vl-installer.sh | sh
+vl --version
+```
+
+`VL_INSTALL_DIR=<dir>` installs into `<dir>/bin` instead;
+`VL_NO_MODIFY_PATH=1` leaves your shell profile alone. To install by hand, download
+`vl-<target>.tar.xz` and its `.sha256` from the release page
+(`<target>` is `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`,
+`x86_64-apple-darwin` or `aarch64-apple-darwin`):
+
+```sh
+shasum -a 256 -c vl-aarch64-apple-darwin.tar.xz.sha256    # or sha256sum -c
+tar -xJf vl-aarch64-apple-darwin.tar.xz
+install -m 755 vl-aarch64-apple-darwin/vl ~/.local/bin/
+```
+
+The installer only installs the binary. For completions and man pages, see
+[below](#shell-completions-and-man-pages).
+
+### Homebrew (macOS and Linux)
+
+```sh
+brew install veil-vcs/tap/vl
+```
+
+The formula installs the binary, bash/zsh/fish completions and man pages.
+
+### With Cargo
+
+From a clone of this repository (Rust 1.80 or newer and a C compiler, for
+zstd):
+
+```sh
+cargo install --locked --path crates/vl
+```
+
+### Build from source
+
+```sh
+cargo build --release --locked        # binary at target/release/vl
+```
+
+A static Linux binary, as releases ship it, needs the musl target and
+`musl-gcc` (Debian/Ubuntu package `musl-tools`):
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --locked -p vl --target x86_64-unknown-linux-musl
+```
+
+`vl --version` names the commit it was built from (set `VL_GIT_COMMIT` when
+building outside a Git checkout), the repository format it reads and writes,
+and the target.
+
+### Shell completions and man pages
+
+Release archives have them in `completions/` and `man/`; `vl` also prints
+them itself:
+
+```sh
+vl completions bash > ~/.local/share/bash-completion/completions/vl
+vl completions zsh  > ~/.zfunc/_vl      # with `fpath+=~/.zfunc` before `compinit` in ~/.zshrc
+vl completions fish > ~/.config/fish/completions/vl.fish
+vl man --out-dir ~/.local/share/man/man1    # one page per command: `man vl-commit`
+vl man | man -l -                           # just read the main page (Linux)
+```
+
+Then run `vl doctor` to check the machine (see [Platform notes](#platform-notes)).
+Maintainers: [docs/RELEASING.md](docs/RELEASING.md) explains how releases are cut.
+
 ## Quick start
 
 ```sh
-cargo build --release          # binary at target/release/vl
-
 cd my-project
 vl init                        # creates .veil/, a default .veilpolicy, your identity and a `team` scope
 vl status                      # no `add`: the working copy is already snapshotted
@@ -179,6 +260,87 @@ with one commit that publishes the fix and links its history.
   which only overwrites what you last fetched).
 * Fetch and push run your `git` binary (`$VEIL_GIT`), so credential
   helpers, SSH config and agents work as they do for Git.
+
+## Platform notes
+
+Veil runs on Linux and macOS. What differs between them is mostly the
+filesystem, and `vl doctor` tells you what yours does.
+
+### Case-insensitive filesystems
+
+On a default macOS volume (APFS or HFS+), and on FAT, exFAT, SMB shares and
+case-insensitive ext4 directories, `README` and `readme` are the same file.
+Veil detects this per repository (it looks `.veil` up again with its case
+swapped and checks that it is the same file), and adapts:
+
+* **Names that collide there are refused, not overwritten.** If a snapshot
+  has two entries in one directory that differ only in case (or in Unicode
+  normalisation, below), checking it out on such a filesystem fails with an
+  error instead of silently writing one file over the other. To catch this
+  before a macOS teammate does, `vl` warns on *every* platform, Linux
+  included, whenever it snapshots such a pair: rename one of them.
+* **Aliases keep the recorded spelling.** If a tool rewrites `README.md` as
+  `Readme.md` on a case-insensitive filesystem, the file is still the same
+  entry, so Veil keeps its recorded name rather than recording a rename.
+* **A rename that only changes case is not recorded** for the same reason.
+  Rename through an intermediate name, letting `vl` snapshot in between:
+  `mv README.md tmp && vl status && mv tmp Readme.md && vl status`.
+* **`.veil` is reserved** in any case (`.VEIL`, `.Veil`), at any depth,
+  including spellings with characters HFS+ ignores; a snapshot holding such a
+  name is refused, so nobody can plant files in your repository's metadata.
+
+### Unicode normalisation
+
+macOS also treats canonically equivalent names as one: `café` with a
+precomposed `é` (NFC) and with `e` + a combining accent (NFD). Veil records
+new names in NFC there (as Git does with `core.precomposeUnicode`, the macOS
+default), and keeps the recorded spelling when the filesystem hands back the
+other form. Names already in a snapshot are never re-normalised, as that would
+change snapshot ids. Linux filesystems compare names byte by byte, so two
+files whose names differ only in normalisation can coexist there, and get the
+collision warning above.
+
+`VEIL_FS_FOLDING` overrides the detection: `exact`, `case`, `unicode`,
+`macos` (both) or `auto` (the default). Use it to rehearse a macOS checkout
+on Linux (`VEIL_FS_FOLDING=macos vl edit <rev>` refuses what a Mac would), or when `vl doctor` reports
+that the detection is wrong.
+
+### Durability, locks and temporary files
+
+* On macOS, `fsync` hands data to the drive without flushing its cache. Veil
+  uses `F_FULLFSYNC`, once per batch of writes, and falls back to `fsync` on
+  filesystems that do not support it.
+* The repository lock records the machine and process that hold it, so a
+  lock left by a crashed `vl` is taken over safely. It uses the boot ID and
+  PID namespace on Linux, and a per-boot UUID and the local host name
+  (stable across network changes) on macOS. On a network filesystem a lock
+  can only be proven stale from the machine that took it.
+* `vl ws exec` sandboxes live in `$TMPDIR`: `/tmp` on Linux, a per-user
+  directory under `/var/folders` on macOS. They are private to you and
+  removed when `vl` exits, even after `kill -9`.
+
+### `vl doctor`
+
+`vl doctor` checks this machine and the repository you are in, changes
+nothing you care about, and explains every problem it finds. It exits 1 if
+something is broken:
+
+* **Setup:** `VEIL_HOME` (exists, yours, not world-writable), your identity
+  (readable, valid, mode `0600`, also for retired identities) and leftover
+  `ws exec` sandboxes.
+* **Repository:** `.veil/repo.json` is valid and its format is one this `vl`
+  supports (newer: upgrade `vl`; older: a warning), the repository opens,
+  the workspace the directory is attached to exists, the lock (free, held by
+  a live process, stale, or stuck), the stat cache and the vault.
+* **Filesystem:** its type (warns on NFS, SMB, sshfs and other network
+  mounts); a durable write, timed (warns if `fsync` looks like a no-op, or
+  is very slow); and how it compares names, measured with real files and
+  compared with what Veil assumes (it suggests a `VEIL_FS_FOLDING` value if
+  they differ).
+* **Clock:** set, not behind the last recorded operation, and in step with
+  the filesystem's clock (a network share's server).
+* **Remotes**, with `vl doctor --remotes`: each remote can be reached and is
+  a Veil repository.
 
 ## Repository layout
 
