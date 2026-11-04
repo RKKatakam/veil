@@ -239,7 +239,7 @@ impl ObjectStore {
     /// transaction would lose acknowledged data at the next power loss
     /// (BUG-044). Nothing references them yet (an operation is only written
     /// after its barrier), so they are removed, and a retry writes fresh
-    /// copies. If they cannot be removed, [`ObjectStore::take_needs_recovery`]
+    /// copies. If they cannot be removed, `ObjectStore::take_needs_recovery`
     /// reports it: the transaction then leaves the repository lock behind
     /// for crash recovery, which rewrites them as new files.
     pub fn sync_barrier(&self) -> Result<()> {
