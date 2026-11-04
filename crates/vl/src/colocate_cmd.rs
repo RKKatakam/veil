@@ -205,13 +205,21 @@ pub fn finish_session(ctx: &mut Ctx) -> Result<()> {
     let policy = ctx.repo.effective_policy(&*ctx.fs)?;
     let literal = colocate::literal_paths(&policy, state.local_only.iter().cloned());
     let mut frozen = state.frozen;
-    if session.in_progress.is_none() && session.followed {
+    let unchanged = || -> Result<bool> {
+        let (head, refs) = colocate::git_view(&session.git_dir)?;
+        let key = colocate::mirror_key_of(&ctx.repo.op_id(), &ctx.ws, &head, &refs, &state.local_only);
+        Ok(state.mirrored.as_deref() == Some(key.as_str())
+            && session.expected_head.is_some()
+            && !index::is_locked(&session.git_dir)
+            && colocate::index_intact(&session.git_dir, &state))
+    };
+    if session.in_progress.is_none() && session.followed && !unchanged()? {
         let mut bridge = GitBridge::open(&ctx.repo, &session.git_dir)?;
         let local_only = state.local_only.clone();
         let ws = ctx.ws.clone();
         let r = bridge.mirror(&mut ctx.repo, &mut state, &ws, session.expected_head.as_ref(), &local_only)?;
         frozen = r.frozen;
-        for w in &r.warnings {
+            for w in &r.warnings {
             warn_untrusted(w);
         }
         for n in &r.notes {
@@ -227,6 +235,13 @@ pub fn finish_session(ctx: &mut Ctx) -> Result<()> {
 /// `HEAD`.
 fn follow(ctx: &mut Ctx, session: &mut Session) -> Result<()> {
     let mut state = State::load(&**ctx.repo.backend())?;
+    // The common case, cheaply: Git did nothing since the last command.
+    let (head, refs) = colocate::git_view(&session.git_dir)?;
+    if !colocate::follow_needed(&state, &head, &refs) {
+        session.expected_head = Some(head);
+        session.followed = true;
+        return Ok(());
+    }
     let mut bridge = GitBridge::open(&ctx.repo, &session.git_dir)?;
     let r = bridge.follow_local(&mut ctx.repo, &mut state)?;
     print_follow(&r);

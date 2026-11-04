@@ -79,7 +79,17 @@ pub fn is_locked(git_dir: &Path) -> bool {
 /// Decode the index at `path`. `Ok(None)`: there is none (a fresh
 /// repository, or after `rm .git/index`).
 pub fn read(path: &Path) -> Result<Option<Vec<IndexEntry>>> {
-    let Some(state) = read_state(path)? else { return Ok(None) };
+    read_with(path, false)
+}
+
+/// [`read()`] without verifying the trailing checksum (the per-command
+/// re-check of skip-worktree bits: Git verifies it on its own reads).
+pub fn read_unverified(path: &Path) -> Result<Option<Vec<IndexEntry>>> {
+    read_with(path, true)
+}
+
+fn read_with(path: &Path, skip_hash: bool) -> Result<Option<Vec<IndexEntry>>> {
+    let Some(state) = read_state(path, skip_hash)? else { return Ok(None) };
     let backing = state.path_backing();
     let out = state
         .entries()
@@ -96,7 +106,7 @@ pub fn read(path: &Path) -> Result<Option<Vec<IndexEntry>>> {
     Ok(Some(out))
 }
 
-fn read_state(path: &Path) -> Result<Option<gi::State>> {
+fn read_state(path: &Path, skip_hash: bool) -> Result<Option<gi::State>> {
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(io(path)(e)),
@@ -112,7 +122,7 @@ fn read_state(path: &Path) -> Result<Option<gi::State>> {
         alloc_limit_bytes: Some(1 << 30),
         ..Default::default()
     };
-    let file = gi::File::at(path, gix::hash::Kind::Sha1, false, options).map_err(gerr)?;
+    let file = gi::File::at(path, gix::hash::Kind::Sha1, skip_hash, options).map_err(gerr)?;
     Ok(Some(file.into()))
 }
 
@@ -136,7 +146,7 @@ pub fn write(git_dir: &Path, entries: &[NewEntry]) -> Result<bool> {
     // From here the lock is ours: removed again on any failure.
     let written = (|| -> Result<()> {
         // Stat data of unchanged entries, so Git need not rehash them.
-        let old: HashMap<(Vec<u8>, u32, GitOid), gi::entry::Stat> = match read_state(&index) {
+        let old: HashMap<(Vec<u8>, u32, GitOid), gi::entry::Stat> = match read_state(&index, true) {
             Ok(Some(st)) => {
                 let backing = st.path_backing();
                 st.entries()

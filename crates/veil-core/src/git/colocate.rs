@@ -339,24 +339,7 @@ impl GitBridge {
 
     /// `HEAD` as Git has it now.
     pub fn head(&self) -> Result<Head> {
-        use gix::refs::TargetRef;
-        let Some(r) = self.git.try_find_reference("HEAD").map_err(gerr)? else {
-            return Ok(Head { symbolic: None, commit: None });
-        };
-        match r.target() {
-            TargetRef::Object(id) => Ok(Head {
-                symbolic: None,
-                commit: Some(id.to_owned()),
-            }),
-            TargetRef::Symbolic(name) => {
-                let name = name.as_bstr().to_string();
-                let commit = self.get_ref(&name)?;
-                Ok(Head {
-                    symbolic: Some(name),
-                    commit,
-                })
-            }
-        }
+        head_of(&self.git)
     }
 
     /// Set ref `name` from `expected` to `new` (`None` = absent), only if
@@ -444,14 +427,7 @@ impl GitBridge {
 
     /// Every `refs/heads/*` and `refs/tags/*` (full names).
     pub fn local_refs(&self) -> Result<BTreeMap<String, GitOid>> {
-        let mut out = BTreeMap::new();
-        for (k, v) in self.refs_under("refs/heads/")? {
-            out.insert(format!("refs/heads/{k}"), v);
-        }
-        for (k, v) in self.refs_under("refs/tags/")? {
-            out.insert(format!("refs/tags/{k}"), v);
-        }
-        Ok(out)
+        local_refs_of(&self.git)
     }
 
     /// The commit `oid` names, peeling tag objects (at most 8 levels).
@@ -815,22 +791,15 @@ impl GitBridge {
         // refs and HEAD, same local-only files): only the skip-worktree
         // bits are checked, which Git may have cleared.
         let key = self.mirror_key(repo, ws, local_only)?;
-        if state.mirrored.as_deref() == Some(key.as_str()) && expected.is_some() && !index::is_locked(self.git_dir()) {
-            let intact = index::read(&index::index_path(self.git_dir())).ok().flatten().is_some_and(|cur| {
-                if state.frozen {
-                    cur.iter().all(|e| e.skip_worktree || e.stage != 0)
-                } else {
-                    let flagged: HashSet<String> =
-                        cur.iter().filter(|e| e.skip_worktree).map(|e| escape_git_path(&e.path)).collect();
-                    state.skip.iter().all(|p| flagged.contains(p))
-                }
-            });
-            if intact {
-                report.frozen = state.frozen;
-                report.frozen_reason = state.frozen_reason.clone();
-                report.head = self.head()?.commit;
-                return Ok(report);
-            }
+        if state.mirrored.as_deref() == Some(key.as_str())
+            && expected.is_some()
+            && !index::is_locked(self.git_dir())
+            && index_intact(self.git_dir(), state)
+        {
+            report.frozen = state.frozen;
+            report.frozen_reason = state.frozen_reason.clone();
+            report.head = self.head()?.commit;
+            return Ok(report);
         }
         let tx = repo.transaction("git: mirror into the colocated .git")?;
         let r = tx.repo();
@@ -1001,20 +970,7 @@ impl GitBridge {
     /// What a mirror depends on: the operation, Git's refs and `HEAD`, the
     /// workspace, the local-only files.
     fn mirror_key(&self, repo: &Repo, ws: &str, local_only: &BTreeSet<String>) -> Result<String> {
-        let mut h = blake3::Hasher::new();
-        h.update(repo.op_id().to_string().as_bytes());
-        h.update(ws.as_bytes());
-        let head = self.head()?;
-        h.update(format!("{:?}{:?}", head.symbolic, head.commit).as_bytes());
-        for (k, v) in self.local_refs()? {
-            h.update(k.as_bytes());
-            h.update(v.as_bytes());
-        }
-        for p in local_only {
-            h.update(p.as_bytes());
-            h.update(b"\0");
-        }
-        Ok(h.finalize().to_hex().to_string())
+        Ok(mirror_key_of(&repo.op_id(), ws, &self.head()?, &self.local_refs()?, local_only))
     }
 
     fn public_plain_paths(&self, repo: &Repo, tree: &ObjectId) -> HashSet<Vec<u8>> {
@@ -1270,6 +1226,109 @@ pub fn public_plain(repo: &Repo, tree: &ObjectId) -> HashSet<Vec<u8>> {
         }
     }
     out
+}
+
+fn get_ref_of(git: &gix::Repository, name: &str) -> Result<Option<GitOid>> {
+    Ok(git
+        .try_find_reference(name)
+        .map_err(gerr)?
+        .and_then(|r| r.try_id().map(|id| id.detach())))
+}
+
+fn head_of(git: &gix::Repository) -> Result<Head> {
+    use gix::refs::TargetRef;
+    let Some(r) = git.try_find_reference("HEAD").map_err(gerr)? else {
+        return Ok(Head { symbolic: None, commit: None });
+    };
+    match r.target() {
+        TargetRef::Object(id) => Ok(Head {
+            symbolic: None,
+            commit: Some(id.to_owned()),
+        }),
+        TargetRef::Symbolic(name) => {
+            let name = name.as_bstr().to_string();
+            let commit = get_ref_of(git, &name)?;
+            Ok(Head {
+                symbolic: Some(name),
+                commit,
+            })
+        }
+    }
+}
+
+fn local_refs_of(git: &gix::Repository) -> Result<BTreeMap<String, GitOid>> {
+    let mut out = BTreeMap::new();
+    let platform = git.references().map_err(gerr)?;
+    for r in platform.all().map_err(gerr)? {
+        let r = r.map_err(gerr)?;
+        let name = r.name().as_bstr().to_string();
+        if !(name.starts_with("refs/heads/") || name.starts_with("refs/tags/")) {
+            continue;
+        }
+        if let Some(id) = r.try_id() {
+            out.insert(name, id.detach());
+        }
+    }
+    Ok(out)
+}
+
+/// `HEAD` and the local refs of `git_dir`, read without opening the bridge
+/// (its mapping and caches): the cheap check every command starts with.
+pub fn git_view(git_dir: &Path) -> Result<(Head, BTreeMap<String, GitOid>)> {
+    let git = gix::open_opts(git_dir, gix::open::Options::isolated()).map_err(gerr)?;
+    Ok((head_of(&git)?, local_refs_of(&git)?))
+}
+
+/// Has Git changed nothing a follow imports since `state` (same `HEAD`,
+/// same branches)?
+pub fn follow_needed(state: &State, head: &Head, refs: &BTreeMap<String, GitOid>) -> bool {
+    let heads: BTreeMap<&String, String> = refs
+        .iter()
+        .filter(|(k, _)| k.starts_with("refs/heads/"))
+        .map(|(k, v)| (k, v.to_string()))
+        .collect();
+    let known: BTreeMap<&String, String> = state
+        .refs
+        .iter()
+        .filter(|(k, _)| k.starts_with("refs/heads/"))
+        .map(|(k, v)| (k, v.clone()))
+        .collect();
+    heads != known || head.commit.map(|c| c.to_string()) != state.last_head || head.symbolic != state.last_head_ref
+}
+
+/// The key of a mirror (see [`State::mirrored`]): the operation, the
+/// workspace, Git's `HEAD` and refs, the local-only files.
+pub fn mirror_key_of(op: &ObjectId, ws: &str, head: &Head, refs: &BTreeMap<String, GitOid>, local_only: &BTreeSet<String>) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(op.to_string().as_bytes());
+    h.update(ws.as_bytes());
+    h.update(format!("{:?}{:?}", head.symbolic, head.commit).as_bytes());
+    for (k, v) in refs {
+        h.update(k.as_bytes());
+        h.update(v.as_bytes());
+    }
+    for p in local_only {
+        h.update(p.as_bytes());
+        h.update(b"\0");
+    }
+    h.finalize().to_hex().to_string()
+}
+
+/// Does the index still carry every skip-worktree bit Veil set (Git may
+/// clear them: `sparse-checkout disable`, some versions on checkout)?
+pub fn index_intact(git_dir: &Path, state: &State) -> bool {
+    if !state.frozen && state.skip.is_empty() {
+        // Nothing to check (the index exists, or Git would have nothing).
+        return std::fs::symlink_metadata(index::index_path(git_dir)).is_ok() || state.index_head.is_none();
+    }
+    index::read_unverified(&index::index_path(git_dir)).ok().flatten().is_some_and(|cur| {
+        if state.frozen {
+            cur.iter().all(|e| e.skip_worktree || e.stage != 0)
+        } else {
+            let flagged: HashSet<String> = cur.iter().filter(|e| e.skip_worktree).map(|e| escape_git_path(&e.path)).collect();
+            state.skip.iter().all(|p| flagged.contains(p))
+        }
+    })
 }
 
 // ---- following a Git checkout ------------------------------------------------------------
