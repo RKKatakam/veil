@@ -1,0 +1,249 @@
+# Teams and remotes
+
+A Veil **remote** is another Veil repository: a directory (local disk, a
+mounted share) or a directory on any machine you can `ssh` to. The server
+needs SSH with its SFTP subsystem and nothing else: no `vl`, no daemon.
+For GitHub, see [Using Veil with GitHub](github.md).
+
+1. [Adding remotes](#adding-remotes)
+2. [Team remotes and public remotes](#team-remotes-and-public-remotes)
+3. [Push and pull](#push-and-pull)
+4. [Onboarding a teammate](#onboarding-a-teammate)
+5. [Removing a teammate](#removing-a-teammate)
+6. [Recovering from crashes](#recovering-from-crashes)
+
+## Adding remotes
+
+```text
+$ vl remote add origin ../hub
+Added team remote origin → ../hub
+$ vl remote add build alice@build.example.com:/srv/veil/proj.veil
+Added team remote build → alice@build.example.com:/srv/veil/proj.veil
+$ vl remote add mirror ../mirror --public
+Added public remote mirror → ../mirror
+$ vl remote list
+build  team  alice@build.example.com:/srv/veil/proj.veil
+mirror  public  ../mirror
+origin  team  ../hub
+```
+
+| URL form | Example |
+|---|---|
+| A path (relative to the repository root, or absolute) | `../hub`, `/mnt/share/proj` |
+| scp-style SSH | `alice@build.example.com:repos/proj` (relative to the home directory) |
+| SSH URL | `ssh://alice@build.example.com:2222/srv/veil/proj` |
+
+* The remote doesn't need to exist: the first `vl push` creates it.
+* SSH remotes use **your own `ssh`**, so `~/.ssh/config` host aliases, the
+  agent, `known_hosts` and `ProxyJump` work as they do for Git. `VEIL_SSH`
+  replaces the command.
+* Cloaked content is encrypted before it leaves your machine. The server
+  only ever stores ciphertext for it.
+* `vl remote rm NAME` removes a remote from the configuration (not the
+  remote's data).
+
+## Team remotes and public remotes
+
+| | Team remote (default) | Public remote (`--public`) |
+|---|---|---|
+| Public files | ✓ | ✓ |
+| Cloaked files | ciphertext, for members to decrypt | withheld (the entry shows as redacted) |
+| Cloaked descriptions and tags | ciphertext / ✓ | placeholders / never sent |
+| Unreleased embargoes | the fix, for the embargo's scope | the pre-merge tree only |
+| Key rings | ✓ | ✓: they hold no usable keys, but **scope names, member names and member ids are visible** (`vl scope list` on a clone of the mirror lists them) |
+| Isolated files | never (they are not in history) | never |
+
+A teammate outside a scope who pulls from a team remote gets ciphertext
+they can't open: the files appear as redacted (`R`) until someone grants
+them access.
+
+Use a public remote for a published mirror. For GitHub use `vl git`, which
+exports the same public view.
+
+## Push and pull
+
+```text
+$ vl push
+  pushed main → e7645a71
+Pushed 6 object(s) to origin
+$ vl pull
+  updated main → b90dc04e
+Pulled 3 object(s) from origin
+```
+
+| Command | Does |
+|---|---|
+| `vl push [REMOTE] [-t TAG…]` | Send tags (all by default) and their history. `REMOTE` defaults to `origin` |
+| `vl push --force` | Overwrite tags that diverged on the remote |
+| `vl pull [REMOTE]` | Fetch tags and history; update `REMOTE/TAG` and fast-forward local tags |
+| `vl push --full` / `vl pull --full` | Walk and verify every object instead of trusting what the other side has; repairs damaged or missing objects |
+
+Like everywhere in Veil, **only tags travel**, and **a pull never moves
+your working copy**: `vl rebase -d main` after pulling.
+
+**Diverged tags are skipped, not overwritten**, in both directions:
+
+```text
+$ vl push
+  skipped main (remote has diverged (non-fast-forward; use --force))
+Pushed 23 object(s) to origin
+$ vl pull
+warning: tag 'main' has diverged from origin/main; merge with `vl merge origin/main`
+Pulled 3 object(s) from origin
+$ vl merge origin/main -m "Merge bob"
+$ vl push
+  pushed main → 5f50d8ae
+Pushed 5 object(s) to origin
+```
+
+Note that a push with skipped tags still **exits 0**. In scripts, check
+the output for `skipped`.
+
+Concurrent pushes to one remote are serialised by a lock on the remote. A
+client that crashes mid-push leaves a lease that the next push takes over
+after at most about 45 seconds.
+
+## Onboarding a teammate
+
+Bob joins Alice's project. Alice is an admin of the `team` scope (she ran
+`vl init`).
+
+**1. Bob creates his identity and sends Alice his public key.** The public
+key is not secret; send it any way you like, but make sure it's really his
+(compare it by voice or in person if the content matters).
+
+```text
+bob$ vl identity show
+Created new identity for 'bob' at /home/bob/.config/veil/identity.json
+name        bob
+public key  veil16a988eb735d62860962e1e092f14b8676952fa35228f9d45c891b6cbc2fedc6083fdcc46d8ad95d11987bfa36ebd3b643ab4cdc4b278eee04057492477d73420
+…
+```
+
+**2. Alice grants him the scope and pushes** the updated key ring:
+
+```text
+alice$ vl scope grant team veil16a988eb735d62860962e1e092f14b8676952fa35228f9d45c891b6cbc2fedc6083fdcc46d8ad95d11987bfa36ebd3b643ab4cdc4b278eee04057492477d73420 --name bob
+Granted scope team to bob; push to share the updated key ring
+alice$ vl push
+Pushed 0 object(s) to origin
+```
+
+(The key ring is sent even when no objects are: "0 objects" is normal.)
+
+**3. Bob clones:**
+
+```text
+bob$ vl clone ../hub bob2
+Cloned /tmp/vdoc/hub into /tmp/vdoc/bob2 (26 objects, 4 files)
+bob$ cat bob2/secrets/notes.md
+internal notes
+```
+
+If Bob clones *before* Alice granted him (or pushed), he gets the public
+files and a note; the cloaked ones arrive with his next pull after the
+grant:
+
+```text
+bob$ vl clone ../hub bobwc
+Cloned /tmp/vdoc/hub into /tmp/vdoc/bobwc (6 objects, 2 files)
+  note: 1 cloaked file(s) you hold no key for. Share your public key (veil16a98…3420) with a member
+  and ask them to run `vl scope grant team <key>` and push. They appear here on your next `vl pull` after that.
+bob$ vl status
+…
+Redacted (no key; kept in history, absent on disk):
+  R secrets/notes.md
+
+bob$ vl pull
+Pulled 0 object(s) from origin
+Filled in 1 file(s) that became readable (a key arrived or an embargo was released), removed 0
+```
+
+`vl clone SRC [DEST]` accepts the same paths and SSH URLs as `vl remote
+add`, sets `SRC` up as `origin`, and starts a new change on `main` (or
+`trunk`, `master`, or the first tag).
+
+### Use `vl clone`, not `vl init` + pull
+
+`vl init` creates a **new** `team` scope with you as its only member. If
+you then pull a repository that has its own `team` scope, the two rings
+can't be reconciled: yours is kept, theirs is not merged, and grants made
+in theirs never reach you:
+
+```text
+dave$ vl init && vl remote add origin ../hub && vl pull
+  updated main → 5f50d8ae
+warning: key ring for scope 'team': exists on both sides with different keys; the incoming key ring was not merged
+Pulled 26 object(s) from origin
+dave$ vl scope list
+…
+team  admin  generation 0, 1 changes
+    dave         admin  veil1c2b2cb…d800 (you)
+```
+
+If this happened, start over: delete that directory and `vl clone`.
+
+### Admins
+
+`vl scope grant … --admin` makes a member an admin, who may grant, revoke
+and rotate. Have at least two admins per scope so that losing one identity
+doesn't freeze the scope. Two admins changing a scope at the same time
+diverge: the second to pull keeps their ring and gets a warning, and must
+re-apply the other's change.
+
+## Removing a teammate
+
+```text
+alice$ vl scope revoke team veil16a988eb…3420
+Revoked. Scope team rotated to key generation 1: new content is sealed with a key
+the revoked identity never receives. Content they already decrypted cannot be recalled; rotate secrets.
+Push to share the updated key ring.
+alice$ vl push
+```
+
+Revocation is **forward-only**: Bob keeps everything he could read before,
+including every file still sealed under an older key generation. Rotate the
+real secrets (passwords, API keys) that those files contain. Remove his
+access to the remote itself (SSH keys, share permissions) as well.
+
+## Recovering from crashes
+
+Veil is built to survive `kill -9`, power loss and full disks without
+losing recorded work. What you may see:
+
+**A lock left behind.** Every command that writes takes a lock
+(`.veil/lock`) recording the machine and process holding it. A lock left by
+a crashed `vl` on the same machine is taken over automatically by the next
+command. `vl doctor` shows the state:
+
+```text
+$ vl doctor
+…
+Repository /tmp/vdoc/team
+  ok    opens: format 3, id 05710380e40e4e83bbfdafb25d9423a2, operation 49596559, workspace 'default'
+  note  a stale lock from pid 12345 on build-box (…) is left (holder pid 12345 is no longer running)
+        the next command reclaims it automatically
+```
+
+If a command fails with `repository is locked: held by …, which cannot be
+proven gone from this machine; if it is, remove .veil/lock`, the holder is
+on another machine (a network filesystem) or can't be checked. Make sure
+no `vl` is running there, then delete `.veil/lock`.
+
+**A stale working copy.** If the repository moved on while your files
+didn't (an interrupted command, a restored backup), the next command saves
+what is on disk rather than overwriting it:
+
+```text
+warning: the working copy was stale; your edits were saved as change <id>
+```
+
+The edits are in that change: `vl log`, then `vl squash`, `vl rebase` or
+`vl restore --from <id>` to bring them where you want them.
+
+**Checking integrity.** `vl fsck` verifies every object, the key rings,
+embargo records and the operation log, changes nothing, and exits 1 on
+corruption. `vl push --full` / `vl pull --full` repair missing or damaged
+objects from the other side. See [Maintenance](maintenance.md).
+
+Next: [Maintenance](maintenance.md).

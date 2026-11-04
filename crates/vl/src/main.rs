@@ -1,6 +1,8 @@
 mod cli;
 mod ctx;
 mod doctor;
+#[cfg(test)]
+mod docgen;
 mod render;
 mod sandbox;
 
