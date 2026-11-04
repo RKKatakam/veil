@@ -4,14 +4,14 @@ use std::collections::BTreeSet;
 
 use crate::{
     embargo::{
-        apply_embargo, normalize_tree, policy_rekeys, seal_introduced, unreleased_wrapper, wrap, NormalizeOptions,
-        NormalizeReport,
+        apply_embargo, description_scope, normalize_tree, policy_rekeys, recordable_conflicts, seal_introduced,
+        unreleased_wrapper, wrap, NormalizeOptions, NormalizeReport,
     },
     error::{Result, VeilError},
     id::{ChangeId, ObjectId},
     merge::merge_trees,
     now_millis,
-    object::{Snapshot, TreeEntry},
+    object::{EntryKind, Snapshot, TreeEntry, Visibility},
     oplog::Tag,
     policy::{Policy, POLICY_FILE},
     repo::Repo,
@@ -54,6 +54,23 @@ fn with_root_entry(store: &ObjectStore, tree: &ObjectId, name: &str, entry: Opti
     store.put_tree(&t)
 }
 
+/// Files that `tree` adds or changes relative to `dest` and that are sealed
+/// under a scope other than `scope`. An embargo wrapper keeps such content
+/// sealed as it is (releasing the embargo must not declassify it), so every
+/// member of that other scope could read the change before the release.
+fn sealed_for_other_scopes(store: &ObjectStore, dest: &ObjectId, tree: &ObjectId, scope: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for c in crate::tree::diff_trees(store, Some(dest), Some(tree))? {
+        let Some(e) = &c.new else { continue };
+        if let (EntryKind::File, Visibility::Cloaked { scope: s }) = (e.kind, &e.visibility) {
+            if s != scope {
+                out.push(format!("{} (cloaked under '{s}')", c.path));
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn validate_tag_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && !name.ends_with('-')
@@ -71,6 +88,26 @@ pub fn validate_tag_name(name: &str) -> Result<()> {
 }
 
 impl Repo {
+    /// The unreleased embargo that snapshot `id` carries, if any: its tree
+    /// is under one, or one of its ancestors (itself included) is an
+    /// embargoed merge whose embargo has not been released. An embargo this
+    /// repository has no record of counts as unreleased.
+    pub fn carried_embargo(&self, id: &ObjectId) -> Result<Option<String>> {
+        let s = self.snapshot(id)?;
+        if let Some(w) = unreleased_wrapper(&self.store, &s.tree)? {
+            return Ok(Some(w.embargo));
+        }
+        for a in self.ancestors(id)? {
+            let Some(s) = self.snapshot_opt(&a)? else { continue };
+            if let Some(e) = &s.embargo {
+                if !self.keys().embargo_released(e) {
+                    return Ok(Some(e.clone()));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Start a new change on top of `parents` in workspace `ws`.
     pub fn new_change(&mut self, ws: &str, parents: Vec<ObjectId>, message: &str) -> Result<ObjectId> {
         let mut tx = self.transaction("new change")?;
@@ -87,7 +124,8 @@ impl Repo {
         let mut tx = self.transaction("describe")?;
         let s = tx.repo().snapshot(&id)?;
         let mut ns = (*s).clone();
-        ns.description = tx.repo().store.make_text(message, s.cloak.as_deref())?;
+        let store = &tx.repo().store;
+        ns.description = store.make_text(message, description_scope(store, &s.tree, s.cloak.as_deref())?.as_deref())?;
         ns.predecessors = vec![id];
         let new = tx.rewrite(id, ns)?;
         tx.set_description(format!("describe change {}", s.change_id.short()));
@@ -104,7 +142,10 @@ impl Repo {
         let cloak = tx.view.workspace(ws)?.cloak.clone();
         let s = tx.repo().snapshot(&wc_id)?;
         let mut ns = (*s).clone();
-        ns.description = tx.repo().store.make_text(message, s.cloak.as_deref())?;
+        // On a line under an unreleased embargo a key holder's message
+        // describes the hidden fix: it is sealed under the embargo key.
+        let store = &tx.repo().store;
+        ns.description = store.make_text(message, description_scope(store, &s.tree, s.cloak.as_deref())?.as_deref())?;
         ns.predecessors = vec![wc_id];
         ns.timestamp = now_millis();
         let committed = tx.rewrite(wc_id, ns)?;
@@ -160,6 +201,7 @@ impl Repo {
         ns.conflicts.extend(out.conflicts.iter().map(|p| p.to_string()));
         ns.conflicts.sort();
         ns.conflicts.dedup();
+        ns.conflicts = recordable_conflicts(&tx.repo().store, &ns.tree, ns.conflicts)?;
         let id = tx.rewrite(source, ns)?;
         tx.set_description(format!("rebase change {}", s.change_id.short()));
         tx.commit()?;
@@ -200,7 +242,11 @@ impl Repo {
                 }
                 (a, b) => a.as_deref().or(b.as_deref()),
             };
-            np.description = tx.repo().store.make_text(&joined, scope)?;
+            // Folded into (or from) a line under an unreleased embargo: the
+            // joined text stays sealed under the embargo key.
+            let store = &tx.repo().store;
+            let scope = description_scope(store, &np.tree, scope)?;
+            np.description = store.make_text(&joined, scope.as_deref())?;
         }
         let new_parent = tx.rewrite(*parent, np)?;
         tx.abandon(id)?;
@@ -223,13 +269,19 @@ impl Repo {
         if others.is_empty() {
             return Err(VeilError::repo("nothing to merge"));
         }
-        // Embargo records are synced to every remote, public ones included,
-        // so the record carries no message; the merge's description is
-        // sealed under the embargo key instead.
-        let embargo_id = match &embargo {
-            Some(spec) => Some(self.keys().create_embargo(&spec.scope, spec.until, "")?),
-            None => None,
-        };
+        // Embargoes never overlap (Veil 1.0): a new embargoed merge is
+        // refused if the line it merges into, or any line it merges in,
+        // still carries an unreleased embargo.
+        if embargo.is_some() {
+            for (what, id) in std::iter::once(("the line it merges into", into)).chain(others.iter().map(|o| ("a line it merges in", *o))) {
+                if let Some(e) = self.carried_embargo(&id)? {
+                    return Err(VeilError::Policy(format!(
+                        "cannot merge under a new embargo: {what} ({}) already carries unreleased embargo {e}, and embargoes cannot overlap; release the earlier embargo first (`vl embargo release {e}`), then merge",
+                        id.short()
+                    )));
+                }
+            }
+        }
         let mut tx = self.transaction("merge")?;
         let mut parents = vec![into];
         parents.extend(others.iter().copied());
@@ -296,13 +348,41 @@ impl Repo {
                 tree = wrap(&store, &w.embargo, &tree, &w.fallback)?;
             }
         }
-        if let Some(e) = &embargo_id {
-            tree = apply_embargo(&store, &tree, &into_snap.tree, e)?;
-        }
-        let description = match (&embargo_id, cloak) {
-            (Some(e), None) => store.make_text(message, Some(&format!("embargo/{e}")))?,
-            _ => store.make_text(message, cloak)?,
+        let mut conflicts: Vec<String> = merged.conflicts.iter().map(|p| p.to_string()).collect();
+        let reported_conflicts = conflicts.clone();
+        // Embargo records are synced to every remote, public ones included,
+        // so the record carries no message; the merge's description is
+        // sealed under the embargo key instead. The record is only created
+        // once the merge is known to be possible.
+        let embargo_id = match &embargo {
+            Some(spec) => {
+                let other_scopes = sealed_for_other_scopes(&store, &into_snap.tree, &tree, &spec.scope)?;
+                if !other_scopes.is_empty() {
+                    return Err(VeilError::Policy(format!(
+                        "cannot merge under an embargo for scope '{}': the merge changes files cloaked under another scope, whose members could read them before the release ({}); embargo under that scope, or make those changes after the release",
+                        spec.scope,
+                        other_scopes.join(", ")
+                    )));
+                }
+                let e = tx.repo().keys().create_embargo(&spec.scope, spec.until, "")?;
+                tree = apply_embargo(&store, &tree, &into_snap.tree, &e)?;
+                Some(e)
+            }
+            None => None,
         };
+        let recorded = recordable_conflicts(&store, &tree, std::mem::take(&mut conflicts))?;
+        if recorded.len() < reported_conflicts.len() {
+            warnings.push(format!(
+                "{} conflicted file(s) are not recorded on the merge: snapshot metadata is public, and their names would reveal what the embargo hides; resolve the conflict markers before committing",
+                reported_conflicts.len()
+            ));
+        }
+        let scope = match (&embargo_id, cloak) {
+            (Some(e), None) => Some(format!("embargo/{e}")),
+            // Also a plain merge into a line under an unreleased embargo.
+            _ => description_scope(&store, &tree, cloak)?,
+        };
+        let description = store.make_text(message, scope.as_deref())?;
         warnings.extend(report.kept_sealed.iter().map(|(p, why)| format!("{p} {why}")));
         let snap = Snapshot {
             parents,
@@ -312,7 +392,7 @@ impl Repo {
             author: tx.repo().user.clone(),
             timestamp: now_millis(),
             predecessors: vec![],
-            conflicts: merged.conflicts.iter().map(|p| p.to_string()).collect(),
+            conflicts: recorded,
             cloak: into_snap.cloak.clone(),
             embargo: embargo_id.clone(),
             signature: None, // signed by the transaction
@@ -333,7 +413,7 @@ impl Repo {
         tx.commit()?;
         Ok(MergeResult {
             snapshot: m,
-            conflicts: snap.conflicts,
+            conflicts: reported_conflicts,
             embargo: embargo_id,
             declassified: report.declassified.iter().map(|p| p.to_string()).collect(),
             quarantined: report

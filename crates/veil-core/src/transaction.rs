@@ -104,15 +104,20 @@ impl<'r> Transaction<'r> {
     /// `builder.rs`), so `vl new <cloaked change>` cannot declassify it.
     pub fn new_change(&mut self, parents: Vec<ObjectId>, description: &str, cloak: Option<String>) -> Result<ObjectId> {
         let merged = self.repo.parents_tree(&parents)?;
+        let store = &self.repo.store;
+        // On a line under an unreleased embargo, messages are sealed under
+        // the embargo key and conflicts are not recorded (see `embargo`).
+        let scope = crate::embargo::description_scope(store, &merged.tree, cloak.as_deref())?;
+        let conflicts = merged.conflicts.iter().map(|p| p.to_string()).collect();
         let snap = Snapshot {
             parents,
             change_id: ChangeId::random(),
             tree: merged.tree,
-            description: self.repo.store.make_text(description, cloak.as_deref())?,
+            description: store.make_text(description, scope.as_deref())?,
             author: self.repo.user.clone(),
             timestamp: now_millis(),
             predecessors: vec![],
-            conflicts: merged.conflicts.iter().map(|p| p.to_string()).collect(),
+            conflicts: crate::embargo::recordable_conflicts(store, &merged.tree, conflicts)?,
             cloak,
             embargo: None,
             signature: None,
@@ -241,7 +246,7 @@ impl<'r> Transaction<'r> {
             ns.parents = new_parents;
             ns.tree = tree;
             ns.predecessors = vec![id];
-            ns.conflicts = conflicts.into_iter().collect();
+            ns.conflicts = crate::embargo::recordable_conflicts(&store, &tree, conflicts.into_iter().collect())?;
             // Rebasing someone else's change: `author` stays theirs, the
             // signature becomes ours, and `predecessors` keeps the original.
             let nid = store.put_snapshot(&self.sign(&ns))?;

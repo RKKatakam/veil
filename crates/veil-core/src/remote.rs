@@ -8,7 +8,7 @@
 //! | cloaked objects (ciphertext)    | ✓           | ✗ redacted    |
 //! | unreleased embargoed objects    | ✓           | ✗ (fallback ✓)|
 //! | released embargoed objects      | ✓           | ✓             |
-//! | merged-in history of an unreleased embargoed merge | cloaked part only | ✗ |
+//! | merged-in history of an unreleased embargoed merge | cloaked under the embargo's scope, not building on withheld history | ✗ |
 //! | cloaked tags                    | ✓           | ✗             |
 //! | key rings / embargo records     | ✓           | ✓ (encrypted, signed) |
 //! | isolated files, vault, `local`  | never — not in the graph at all |
@@ -803,9 +803,15 @@ fn ancestors_in(store: &ObjectStore, tips: &[ObjectId]) -> Result<Vec<ObjectId>>
 /// Maps each to the embargo that withholds it.
 ///
 /// A public remote receives none of it before release. A team remote may
-/// receive the cloaked part (its content and descriptions are sealed for
-/// the scope); plaintext snapshots are withheld there too, because team
-/// remotes are also read by people outside the embargo's scope.
+/// receive the part that is cloaked under **the embargo's own scope** (its
+/// content and descriptions are sealed for exactly the readers the embargo
+/// allows). Everything else is withheld there too, because team remotes are
+/// also read by people outside the embargo's scope:
+/// * plaintext snapshots;
+/// * snapshots cloaked under another scope, even a wider one (BUG-043);
+/// * snapshots that build on withheld ones (BUG-054): their trees carry the
+///   withheld content, and sending them would leave a dangling parent that
+///   blocks the push.
 pub(crate) fn embargo_withheld(local: &Repo, public: bool) -> Result<HashMap<ObjectId, String>> {
     let mut out = HashMap::new();
     for id in local.visible_snapshots()? {
@@ -814,17 +820,43 @@ pub(crate) fn embargo_withheld(local: &Repo, public: bool) -> Result<HashMap<Obj
         if s.parents.len() < 2 || local.keys().embargo_released(e) {
             continue;
         }
+        // An unknown record (no scope to compare with) withholds everything.
+        let scope = local.keys().load_embargo(e).ok().flatten().map(|r| r.scope);
         let mainline = local.ancestors(&s.parents[0])?;
+        let mut merged_in: HashMap<ObjectId, Option<Arc<crate::object::Snapshot>>> = HashMap::new();
         for p in &s.parents[1..] {
             for a in local.ancestors(p)? {
-                if mainline.contains(&a) || out.contains_key(&a) {
-                    continue;
-                }
-                let Some(snap) = local.snapshot_opt(&a)? else { continue };
-                if public || snap.cloak.is_none() {
-                    out.insert(a, e.clone());
+                if !mainline.contains(&a) {
+                    let snap = local.snapshot_opt(&a)?;
+                    merged_in.insert(a, snap);
                 }
             }
+        }
+        // Withheld: everything on a public remote; on a team remote, what
+        // is not cloaked under the embargo's scope, and whatever has a
+        // withheld parent. Post-order walk (parents first), iterative.
+        let own = |snap: &Arc<crate::object::Snapshot>| public || scope.is_none() || snap.cloak != scope;
+        let mut state: HashMap<ObjectId, bool> = HashMap::new();
+        for start in merged_in.keys() {
+            let mut stack = vec![(*start, false)];
+            while let Some((a, expanded)) = stack.pop() {
+                if state.contains_key(&a) {
+                    continue;
+                }
+                let snap = &merged_in[&a];
+                let parents = snap.iter().flat_map(|s| s.parents.iter()).filter(|p| merged_in.contains_key(*p));
+                if !expanded {
+                    stack.push((a, true));
+                    stack.extend(parents.filter(|p| !state.contains_key(*p)).map(|p| (*p, false)));
+                } else {
+                    let w = snap.as_ref().is_some_and(own) || parents.into_iter().any(|p| state.get(p) == Some(&true));
+                    state.insert(a, w);
+                }
+            }
+        }
+        let withheld = state.into_iter().filter(|(_, w)| *w).map(|(a, _)| a);
+        for a in withheld {
+            out.entry(a).or_insert_with(|| e.clone());
         }
     }
     Ok(out)

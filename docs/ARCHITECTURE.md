@@ -404,7 +404,13 @@ CAS, and it applies these rules in order:
      merge, `vl new <cloaked change>` in an ordinary workspace, rebases and
      squashes never move sealed content to another audience.
 5. Embargoed entries stay embargoed until their embargo is released, and a
-   tree under an unreleased embargo stays under it (§7).
+   tree under an unreleased embargo stays under it (§7). A key holder's
+   edit of an embargoed file is secret-scanned like a public one, because
+   the release publishes it; a hit is quarantined and the previous (sealed)
+   entry kept. An embargoed entry only stays under the embargo while its
+   path would be public anyway: once the policy (or the line's cloak) seals
+   the path under a scope, an edit, or a merge, seals it under that scope
+   instead, so the release never publishes it.
 6. Entries this reader cannot materialise (no key, or withheld by a public
    remote) are **carried over** instead of being treated as deletions. A
    partial view can never accidentally delete hidden content.
@@ -621,10 +627,56 @@ remains is mostly the one `lstat` per file and the per-directory
    back (reported like cloak failures), because that reader sees only the
    pre-merge tree and recording on top of it would silently revert the fix
    for everyone. Merging such history without the key is refused.
+   Descriptions written on such a line by a key holder (`commit`, `describe`,
+   `new -m`, squash, a plain merge into it) are sealed under the embargo key
+   too, and its snapshots record no conflict list: snapshot metadata is
+   public, and conflicted file names would tell outsiders what the fix
+   touches. The command that produced the conflicts still reports them, and
+   the markers are in the files.
 6. **Release** (manual, or automatic on the first `vl` run by a key holder
    after the deadline) publishes the key in the record. Snapshot ids do not
    change, nothing is rewritten, and the next push carries the
    now-releasable objects *and the withheld history*.
+7. After the release, the builder records what the working copy holds: a
+   file written back to its pre-embargo content is a revert, and is
+   recorded. The builder does not guess whether a working copy is stale. A
+   non-holder's working copy materialised before the release still holds
+   the fallback versions; the CLI records which paths it materialised from
+   a fallback (or could not materialise) and checks them out again once it
+   learns of the release, before snapshotting.
+
+**Embargoes never overlap (1.0).** At most one unreleased embargo per line:
+
+* `vl merge --embargo` is refused if the line it merges into, or any line it
+  merges in, already carries an unreleased embargo: its tree is a wrapper of
+  an unreleased embargo, or an ancestor (itself included) is an embargoed
+  merge whose embargo is unreleased, or unknown to this repository. The
+  message names the embargo: release it first, then merge. Nothing is
+  recorded, not even the embargo record.
+* No other route nests one embargo inside another either. A merge, rebase,
+  auto-rebase or `vl new` whose inputs sit under two different unreleased
+  embargoes is refused (`merge_trees`), and `embargo::wrap` refuses content
+  or a fallback under another unreleased embargo. Two embargoes may coexist
+  on *separate* lines (say `main` and a release branch cut before the
+  first merge); those lines are combined after one of them is released.
+* Why: nesting wrapped the second fix under the first embargo's key, so
+  releasing the first published the second (BUG-041), and releasing the
+  second first revealed the first's changed file names and sizes
+  (BUG-047). Supporting both orders needs per-embargo layering of the
+  sealed tree; that is future work.
+
+**Scopes.** The embargo's scope is the audience before release, so content
+readable by anyone else must not be part of it:
+
+* A team remote receives the fix's history only where it is cloaked under
+  the embargo's own scope, and only if it does not build on anything
+  withheld (§8). A fix line cloaked under a wider scope (`--cloak team`,
+  `--embargo --scope sec`) is withheld from the team remote until release.
+* An embargoed merge that adds or changes files cloaked under *another*
+  scope is refused: the wrapper keeps such content sealed under its own
+  scope (so the release cannot declassify it), which would let every member
+  of that scope read the change before the release. Embargo under that
+  scope, or make those changes after the release.
 
 **Trade-offs.**
 * Until release, outsiders see the main line's pre-merge tree. That
@@ -639,6 +691,10 @@ remains is mostly the one `lstat` per file and the per-directory
   merge as merging a snapshot it does not have.
 * Cost: every key holder's snapshot on an embargoed line re-seals the
   directories it changes, a cost in proportion to the changed region.
+* One unreleased embargo per line (see above). A second security fix waits
+  for the first release, or is embargoed on a separate line.
+* Conflicts on an embargoed line are not recorded on snapshots until the
+  release (see step 5).
 
 ## 8. Synchronisation
 
@@ -652,9 +708,13 @@ be pushed at all, because it was never in the graph.
 unreleased embargoed merge in the local graph, the snapshots that only its
 merged-in (non-first) parents reach: the fix, and how it was made.
 * A public remote receives none of them. A team remote receives only the
-  cloaked ones (content and descriptions sealed for the scope): plaintext
-  history is withheld there too, because team remotes are also read by
-  people outside the embargo's scope.
+  ones cloaked under the embargo's own scope (content and descriptions
+  sealed for exactly its audience), and none that builds on a withheld
+  one. Plaintext history, history cloaked under another (even wider) scope,
+  and whatever descends from either within the fix are withheld there too,
+  because team remotes are also read by people outside the embargo's
+  scope. A fix line that starts with a plaintext commit is therefore
+  withheld whole, and the merge is still pushed with its parent redacted.
 * The merge reaches the remote with those parents **redacted**. If a tag
   would publish withheld history any other way (a tag on the fix itself, or
   a commit that builds on the fix without going through the embargoed
@@ -1206,19 +1266,24 @@ repository lock.
   its parents' ids (the merged-in ones are redacted, not hidden), its
   author, its timestamp, the embargo's scope and deadline, and the
   ciphertext sizes on team remotes. The embargo record and the wrapper do
-  not name files. Two embargoes merged together before either is released
-  are wrapped under the first: if it is released first, the names (not the
-  content) of the second's files become visible.
+  not name files. (Overlapping embargoes, which used to reveal one
+  another's files, are refused in 1.0, §7.)
 * *History withheld by an embargo* is computed from the local graph. If the
   embargoed merge is undone or abandoned before a push, nothing protects
   the fix branch any more; it is then an ordinary change.
 * *Stale working copies after a release.* A working copy materialised by a
   non-holder before the release still holds the pre-merge files. The
-  builder recognises unchanged fallback content and does not record it as a
-  revert of the fix. But files the fix *added* are absent from that working
-  copy, and the next snapshot records them as deleted. The CLI must check
-  the working copy out again when it learns of a release; that is not done
-  yet.
+  builder records what is on disk (a revert to the pre-embargo content is
+  a real edit), so the CLI must check such paths out again when it learns
+  of a release, before snapshotting (§7, step 7).
+* *Other scopes on an embargoed line.* Content sealed under a scope stays
+  under that scope, never under the embargo key (which the release
+  publishes). So a cloaked line of work on top of an embargoed line (its
+  files and descriptions), and a key holder's follow-up edits there of
+  files cloaked by policy under another scope, are readable before the
+  release by members of that scope who are not in the embargo's. The
+  embargoed merge itself refuses such changes (§7); for follow-ups, use the
+  same scope for the cloak and the embargo.
 * *Git sees what a public remote sees*, including the metadata a public
   remote keeps: names of public files, that a cloaked snapshot or an
   embargoed merge exists (an empty-looking commit with a placeholder

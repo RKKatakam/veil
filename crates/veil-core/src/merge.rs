@@ -9,12 +9,14 @@
 //!
 //! Trees under an unreleased embargo (see [`crate::embargo`]) stay under it:
 //! the result is re-wrapped under the same embargo, with the merge of the
-//! inputs' public views as its fallback. Merging them needs the embargo key.
+//! inputs' public views as its fallback. Merging them needs the embargo key,
+//! and trees under two different unreleased embargoes are never merged
+//! (embargoes cannot overlap in Veil 1.0).
 
 use std::{collections::BTreeSet, sync::Arc};
 
 use crate::{
-    embargo::{public_view, unreleased_wrapper, wrap},
+    embargo::{overlap_error, public_view, unreleased_wrapper, wrap},
     error::{Result, VeilError},
     id::ObjectId,
     object::{EntryKind, Tree, TreeEntry, Visibility},
@@ -37,7 +39,7 @@ pub fn merge_trees(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, 
     if Some(ours) == base {
         return Ok(MergeOutcome { tree: theirs, conflicts: vec![] });
     }
-    let mut wrapped = None;
+    let mut wrapped: Option<crate::embargo::EmbargoWrapper> = None;
     for id in [Some(ours), Some(theirs), base].into_iter().flatten() {
         if let Some(w) = unreleased_wrapper(store, &id)? {
             if !store.keys.has(&w.key_label()) {
@@ -46,7 +48,13 @@ pub fn merge_trees(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, 
                     w.embargo
                 )));
             }
-            wrapped.get_or_insert(w);
+            // Embargoes never overlap (Veil 1.0): combining two lines under
+            // different unreleased embargoes would nest one inside the other.
+            match &wrapped {
+                Some(first) if first.embargo != w.embargo => return Err(overlap_error(&first.embargo, &w.embargo)),
+                Some(_) => {}
+                None => wrapped = Some(w),
+            }
         }
     }
     let full = merge_resolved(store, base, ours, theirs)?;

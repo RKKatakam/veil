@@ -80,19 +80,15 @@ struct Model {
     /// Tokens under `secrets/` (cloaked) since the last expose.
     cloaked_now: Vec<String>,
     exposed: bool,
-    /// At most one unreleased embargo at a time (avoids BUG-041).
+    /// Only attempt an embargoed merge when no embargo is unreleased.
+    /// Otherwise the attempt is made and the model expects it to be refused:
+    /// overlapping embargoes are refused in Veil 1.0 (BUG-041, BUG-047).
     single_embargo: bool,
-    /// Embargoes that were unreleased when the last expose was committed:
-    /// the expose sits on their line, with the pre-expose policy as its
-    /// fallback.
-    expose_under: Vec<String>,
-    /// Skip a re-cloak once one of `expose_under` is released (BUG-050).
-    avoid_bug050: bool,
     log: Vec<String>,
 }
 
 impl Model {
-    fn new(single_embargo: bool, avoid_bug050: bool) -> Model {
+    fn new(single_embargo: bool) -> Model {
         let (mut alice, fs, _) = new_repo("alice");
         let main = commit_files(&mut alice, &*fs, &[(".veilpolicy", "secrets/ cloak team\n"), ("README", "r\n")], "v1");
         alice.set_tag("main", main, None, false).unwrap();
@@ -114,8 +110,6 @@ impl Model {
             cloaked_now: Vec::new(),
             exposed: false,
             single_embargo,
-            expose_under: Vec::new(),
-            avoid_bug050,
             log: Vec::new(),
         }
     }
@@ -170,16 +164,10 @@ impl Model {
                 self.fs.write(&p(".veilpolicy"), b"secrets/ public\n").unwrap();
                 self.allowed.extend(self.cloaked_now.drain(..));
                 self.exposed = true;
-                self.expose_under = self.unreleased.keys().cloned().collect();
                 self.commit("expose");
             }
             Op::Recloak => {
                 if !self.exposed {
-                    return;
-                }
-                // Writing back the pre-expose policy after the expose's
-                // embargo was released is dropped by the snapshot (BUG-050).
-                if self.avoid_bug050 && self.expose_under.iter().any(|e| !self.unreleased.contains_key(e)) {
                     return;
                 }
                 self.fs.write(&p(".veilpolicy"), b"secrets/ cloak team\n").unwrap();
@@ -205,20 +193,29 @@ impl Model {
                     ws.write(&path, format!("{t}\n")).unwrap();
                     self.alice.commit_ephemeral(&ws, "fix").unwrap().0
                 };
-                let r = self
-                    .alice
-                    .merge(
-                        WS,
-                        tip,
-                        vec![fix],
-                        "merge fix",
-                        Some(EmbargoSpec {
-                            scope: "team".into(),
-                            until: None,
-                        }),
-                    )
-                    .unwrap();
-                self.unreleased.insert(r.embargo.unwrap(), vec![t]);
+                let records = self.alice.keys().embargoes().unwrap().len();
+                let r = self.alice.merge(
+                    WS,
+                    tip,
+                    vec![fix],
+                    "merge fix",
+                    Some(EmbargoSpec {
+                        scope: "team".into(),
+                        until: None,
+                    }),
+                );
+                if self.unreleased.is_empty() {
+                    let r = r.unwrap();
+                    self.unreleased.insert(r.embargo.unwrap(), vec![t]);
+                } else {
+                    // `main` carries the unreleased embargo: refused, and
+                    // nothing was recorded. The fix's token stays sensitive
+                    // (it exists in a local fix line that must not leak).
+                    let err = r.map(|r| r.snapshot).unwrap_err().to_string();
+                    assert!(err.contains("release the earlier embargo first"), "{err}\nops: {:#?}", self.log);
+                    assert_eq!(self.main(), tip, "a refused merge moved main\nops: {:#?}", self.log);
+                    assert_eq!(self.alice.keys().embargoes().unwrap().len(), records, "ops: {:#?}", self.log);
+                }
                 self.sync_fs();
             }
             Op::Release(n) => {
@@ -335,8 +332,8 @@ impl Model {
     }
 }
 
-fn run(ops: &[Op], single_embargo: bool, avoid_bug050: bool) {
-    let mut m = Model::new(single_embargo, avoid_bug050);
+fn run(ops: &[Op], single_embargo: bool) {
+    let mut m = Model::new(single_embargo);
     for o in ops {
         m.apply(o);
     }
@@ -352,19 +349,19 @@ fn cases() -> u32 {
 proptest! {
     #![proptest_config(ProptestConfig { cases: cases(), max_shrink_iters: 2000, ..ProptestConfig::default() })]
 
-    /// With at most one unreleased embargo at a time (BUG-041), and no
-    /// re-cloak after the expose's embargo is released (BUG-050), the
-    /// invariant holds.
+    /// Embargoed merges only while no embargo is unreleased; re-cloaks
+    /// after a released expose included (BUG-050).
     #[test]
     fn visibility_invariants_hold_with_one_embargo_at_a_time(ops in prop::collection::vec(op(), 1..28)) {
-        run(&ops, true, true);
+        run(&ops, true);
     }
 
-    /// Unrestricted: overlapping embargoes find BUG-041.
+    /// Unrestricted: a second embargoed merge while one is unreleased is
+    /// attempted, and the model expects the 1.0 refusal (BUG-041, BUG-047),
+    /// with the invariant holding throughout.
     #[test]
-    #[ignore = "BUG-041: releasing an older embargo publishes the content of a newer, unreleased one"]
     fn visibility_invariants_hold_with_overlapping_embargoes(ops in prop::collection::vec(op(), 1..28)) {
-        run(&ops, false, true);
+        run(&ops, false);
     }
 }
 
@@ -374,7 +371,6 @@ proptest! {
 /// line then declassifies the cloaked `secrets/` file under the new embargo
 /// key, and releasing that embargo publishes it.
 #[test]
-#[ignore = "BUG-050: after a release, reverting a file to its pre-embargo content is silently not recorded"]
 fn recloak_after_a_released_expose_survives_a_cloaked_embargo_release() {
     use Op::*;
     run(
@@ -388,6 +384,26 @@ fn recloak_after_a_released_expose_survives_a_cloaked_embargo_release() {
             Release(0),
         ],
         true,
-        false,
+    );
+}
+
+/// Found at 1,000 cases once the BUG-041/BUG-050 skips were removed: on an
+/// embargoed line, an exposed file edited by a key holder is sealed under
+/// the embargo key. After a re-cloak, a further edit stayed under the
+/// embargo key (sticky) instead of being sealed for the scope, so the
+/// release published cloaked content.
+#[test]
+fn a_recloaked_file_on_an_embargoed_line_is_not_published_by_the_release() {
+    use Op::*;
+    run(
+        &[
+            Expose,
+            Embargo { cloaked_line: false, file: 0 },
+            CloakEdit(39),
+            Recloak,
+            CloakEdit(150),
+            Release(0),
+        ],
+        true,
     );
 }

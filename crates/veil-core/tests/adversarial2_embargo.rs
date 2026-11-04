@@ -2,8 +2,10 @@
 //! embargoes and the routes by which an embargoed fix could leave the
 //! repository before its release.
 //!
-//! Every `#[ignore = "BUG-NNN: …"]` test asserts the secure behaviour and
-//! currently fails; see `docs/BUGS.md`.
+//! Every test asserts the secure behaviour; the BUG-NNN references point at
+//! `docs/BUGS.md`. Overlapping embargoes are refused in Veil 1.0, so the
+//! nested-embargo tests (BUG-041, BUG-047) assert that refusal and that
+//! nothing leaks before or after it.
 
 mod adversarial_support;
 
@@ -11,7 +13,7 @@ use std::sync::Arc;
 
 use adversarial_support::*;
 use veil_core::{
-    commands::EmbargoSpec,
+    commands::{EmbargoSpec, MergeResult},
     object::Object,
     remote,
     tree::walk_files,
@@ -69,15 +71,20 @@ fn wc_checkout(repo: &mut Repo, fs: &dyn StorageBackend, from: ObjectId) {
 struct Two {
     alice: Repo,
     m1: ObjectId,
-    m2: ObjectId,
     e1: String,
-    e2: String,
+    fix2: ObjectId,
+    /// Merging fix 2 under a second embargo while E1 is unreleased.
+    second: veil_core::Result<MergeResult>,
 }
 
 /// Two security fixes in flight on `main`: fix 1 is merged under embargo
-/// E1, then fix 2 (an independent bug) is merged on top under embargo E2.
-/// Both fixes are developed as cloaked lines of work, as the README
-/// recommends.
+/// E1, then fix 2 (an independent bug) is to be merged on top under
+/// embargo E2. Both fixes are developed as cloaked lines of work, as the
+/// README recommends.
+///
+/// Overlapping embargoes are refused in Veil 1.0 (BUG-041, BUG-047): the
+/// second merge fails while E1 is unreleased, and goes ahead once E1 is
+/// released ([`merge_second_after_release`]).
 fn two_embargoes(scope1: &str, scope2: &str, alice_id: Identity) -> Two {
     let (mut alice, fs) = repo_for("alice", &alice_id);
     for s in [scope1, scope2] {
@@ -105,24 +112,44 @@ fn two_embargoes(scope1: &str, scope2: &str, alice_id: Identity) -> Two {
     let fix2 = alice.snapshot_workspace("fix2", &ov).unwrap().snapshot;
     let main_now = alice.view().tags["main"].target;
     assert_eq!(main_now, r1.snapshot);
-    let r2 = alice.merge(WS, main_now, vec![fix2], "fix two", embargo(scope2)).unwrap();
-    assert!(String::from_utf8(read_at(&alice, &r2.snapshot, "crypto.rs")).unwrap().contains("FIX2"));
+    let second = alice.merge(WS, main_now, vec![fix2], "fix two", embargo(scope2));
     Two {
         alice,
         m1: r1.snapshot,
-        m2: r2.snapshot,
         e1: r1.embargo.unwrap(),
-        e2: r2.embargo.unwrap(),
+        fix2,
+        second,
     }
 }
 
-// ---- nested embargoes ----------------------------------------------------------
+/// The second embargoed merge was refused, with a message naming the
+/// earlier embargo and the way out, and left nothing behind.
+fn assert_overlap_refused(t: &Two) {
+    let err = t.second.as_ref().map(|r| r.snapshot).unwrap_err().to_string();
+    assert!(
+        err.contains(&t.e1) && err.contains("release the earlier embargo first"),
+        "unexpected refusal: {err}"
+    );
+    assert_eq!(t.alice.view().tags["main"].target, t.m1, "the refused merge moved main");
+    assert_eq!(t.alice.keys().embargoes().unwrap().len(), 1, "the refused merge created an embargo record");
+}
 
-/// Control: before any release nothing of either fix can be read on the
-/// public mirror.
+/// What the message says to do: release E1, then merge fix 2 under E2.
+fn merge_second_after_release(t: &mut Two, scope2: &str) -> (ObjectId, String) {
+    t.alice.release_embargo(&t.e1).unwrap();
+    let r = t.alice.merge(WS, t.m1, vec![t.fix2], "fix two", embargo(scope2)).unwrap();
+    assert!(String::from_utf8(read_at(&t.alice, &r.snapshot, "crypto.rs")).unwrap().contains("FIX2"));
+    (r.snapshot, r.embargo.unwrap())
+}
+
+// ---- nested embargoes (refused in 1.0) -------------------------------------------
+
+/// Control: the refused second embargo publishes nothing, and nothing of
+/// the first fix can be read on the public mirror before its release.
 #[test]
 fn two_unreleased_embargoes_publish_nothing() {
     let mut t = two_embargoes("team", "team", Identity::generate("alice"));
+    assert_overlap_refused(&t);
     let mirror = Arc::new(MemoryBackend::new());
     remote::push(&mut t.alice, mirror.clone(), true, &[], false).unwrap();
     let anon = reader(mirror, None);
@@ -130,16 +157,17 @@ fn two_unreleased_embargoes_publish_nothing() {
     assert!(readable_containing(&anon, b"FIX2").is_empty());
 }
 
-/// Releasing the *first* embargo must not publish the second fix. The
-/// second fix's files were sealed under the first embargo's key when the
-/// merge re-wrapped the line (sticky embargo), and the second wrapper lists
-/// them, so the public push carries them under a key that is now public.
+/// BUG-041: releasing the first embargo published the second fix, which
+/// had been wrapped under the first embargo's key. Adapted to the 1.0
+/// design (overlap refused): the second merge is refused while E1 is
+/// unreleased; after E1's release it goes ahead under E2, and the public
+/// mirror then reads fix 1 but not fix 2.
 #[test]
-#[ignore = "BUG-041: releasing an older embargo publishes the content of a newer, unreleased one"]
 fn releasing_the_first_embargo_does_not_publish_the_second_fix() {
     let mut t = two_embargoes("team", "team", Identity::generate("alice"));
-    t.alice.release_embargo(&t.e1).unwrap();
-    assert!(!t.alice.keys().embargo_released(&t.e2));
+    assert_overlap_refused(&t);
+    let (_, e2) = merge_second_after_release(&mut t, "team");
+    assert!(!t.alice.keys().embargo_released(&e2));
     let mirror = Arc::new(MemoryBackend::new());
     remote::push(&mut t.alice, mirror.clone(), true, &[], false).unwrap();
     let anon = reader(mirror, None);
@@ -150,36 +178,54 @@ fn releasing_the_first_embargo_does_not_publish_the_second_fix() {
     assert!(leaked.is_empty(), "objects of the unreleased fix readable on the public mirror: {leaked:?}");
 }
 
-/// Same root cause, no release needed: a team member who holds the first
-/// embargo's scope but not the second's reads the second fix from the team
-/// remote.
+/// BUG-041, same root cause without a release: a team member who holds the
+/// first embargo's scope but not the second's read the second fix from the
+/// team remote. Adapted: the overlap is refused, and neither the refused
+/// attempt nor the later, legitimate E2 merge lets bob read fix 2.
 #[test]
-#[ignore = "BUG-041: releasing an older embargo publishes the content of a newer, unreleased one"]
 fn a_member_of_the_first_embargo_scope_cannot_read_the_second_fix() {
     let alice_id = Identity::generate("alice");
     let bob = Identity::generate("bob");
     let mut t = two_embargoes("team", "sec", alice_id);
+    assert_overlap_refused(&t);
     t.alice.keys().grant("team", &bob.public_id(), "bob").unwrap();
     let team = Arc::new(MemoryBackend::new());
     remote::push(&mut t.alice, team.clone(), false, &[], false).unwrap();
-    let bob_repo = reader(team, Some(bob));
+    let bob_repo = reader(team.clone(), Some(bob.clone()));
     assert!(!bob_repo.keys().has("sec"));
-    assert!(!bob_repo.keys().has(&format!("embargo/{}", t.e2)));
+    let leaked = readable_containing(&bob_repo, b"FIX2");
+    assert!(leaked.is_empty(), "bob (team, not sec) reads the sec fix: {leaked:?}");
+
+    let (_, e2) = merge_second_after_release(&mut t, "sec");
+    remote::push(&mut t.alice, team.clone(), false, &[], false).unwrap();
+    let bob_repo = reader(team, Some(bob));
+    assert!(!bob_repo.keys().has(&format!("embargo/{e2}")));
     let leaked = readable_containing(&bob_repo, b"FIX2");
     assert!(leaked.is_empty(), "bob (team, not sec) reads the sec-embargoed fix: {leaked:?}");
 }
 
-/// Releasing the *second* embargo first must not reveal what the first
-/// one changed: its new file names and sizes, or which files it touched.
+/// BUG-047: releasing a newer embargo first revealed what the older one
+/// changed (file names, sizes). With overlap refused there is no newer
+/// embargo on the line to release: the outsider's view of the line is the
+/// pre-E1 tree, exactly, and a line built on top of E1 cannot be merged in
+/// under another embargo either.
 #[test]
-#[ignore = "BUG-047: releasing a newer embargo first reveals the older one's changed files and sizes"]
 fn releasing_the_second_embargo_first_hides_the_first_fix_metadata() {
     let mut t = two_embargoes("team", "team", Identity::generate("alice"));
-    t.alice.release_embargo(&t.e2).unwrap();
+    assert_overlap_refused(&t);
+    // Merging in a line that carries E1 (instead of merging into it).
+    let main0 = t.alice.snapshot(&t.m1).unwrap().parents[0];
+    let ws = t.alice.ephemeral_workspace(t.m1).unwrap();
+    ws.write("notes.md", "built on the fix\n").unwrap();
+    let (on_e1, _) = t.alice.commit_ephemeral(&ws, "on top of fix one").unwrap();
+    let err = t.alice.merge(WS, main0, vec![on_e1], "m", embargo("team")).unwrap_err().to_string();
+    assert!(err.contains("a line it merges in") && err.contains(&t.e1), "{err}");
+    assert_eq!(t.alice.keys().embargoes().unwrap().len(), 1);
+
     let mirror = Arc::new(MemoryBackend::new());
     remote::push(&mut t.alice, mirror.clone(), true, &[], false).unwrap();
     let anon = reader(mirror, None);
-    let tree = anon.snapshot(&t.m2).unwrap().tree;
+    let tree = anon.snapshot(&t.alice.view().tags["main"].target).unwrap().tree;
     let files: Vec<(String, u64, String)> = walk_files(anon.store(), &tree)
         .unwrap()
         .into_iter()
@@ -192,7 +238,55 @@ fn releasing_the_second_embargo_first_hides_the_first_fix_metadata() {
         ("fn check() -> bool { true }\n".len() as u64, "public"),
         "the mirror reveals that E1 changed auth.rs and its new size: {files:?}"
     );
-    let _ = t.m1;
+}
+
+/// Two embargoes on separate lines are allowed (neither line carries the
+/// other's), but the lines can then not be combined by any route until one
+/// embargo is released: merge, rebase and `new` with both as parents are
+/// refused, and nothing leaks.
+#[test]
+fn lines_under_different_unreleased_embargoes_cannot_be_combined() {
+    let (mut alice, fs, _) = new_repo("alice");
+    let main = commit_files(&mut alice, &*fs, &[("a.rs", "a\n"), ("b.rs", "b\n")], "v1");
+    alice.set_tag("main", main, None, false).unwrap();
+    let ws = alice.ephemeral_workspace(main).unwrap();
+    ws.write("a.rs", "a FIX1\n").unwrap();
+    let (fix1, _) = alice.commit_ephemeral(&ws, "fix1").unwrap();
+    let r1 = alice.merge(WS, main, vec![fix1], "m1", embargo("team")).unwrap();
+    let e1 = r1.embargo.clone().unwrap();
+    // A release branch cut before the merge gets its own embargoed fix.
+    let ws = alice.ephemeral_workspace(main).unwrap();
+    ws.write("b.rs", "b FIX2\n").unwrap();
+    let (fix2, _) = alice.commit_ephemeral(&ws, "fix2").unwrap();
+    let r2 = alice.merge(WS, main, vec![fix2], "m2", embargo("team")).unwrap();
+    let e2 = r2.embargo.clone().unwrap();
+    alice.set_tag("release", r2.snapshot, None, false).unwrap();
+
+    let overlap = |err: veil_core::VeilError| {
+        let err = err.to_string();
+        assert!(err.contains("cannot overlap") && err.contains(&e1) && err.contains(&e2), "{err}");
+    };
+    overlap(alice.merge(WS, r1.snapshot, vec![r2.snapshot], "combine", None).unwrap_err());
+    overlap(alice.rebase(r2.snapshot, vec![r1.snapshot]).unwrap_err());
+    overlap(alice.new_change(WS, vec![r1.snapshot, r2.snapshot], "").unwrap_err());
+    // A new embargo over either line is refused as well.
+    assert!(alice.merge(WS, r1.snapshot, vec![r2.snapshot], "combine", embargo("team")).is_err());
+
+    let mirror = Arc::new(MemoryBackend::new());
+    remote::push(&mut alice, mirror.clone(), true, &[], false).unwrap();
+    let anon = reader(mirror.clone(), None);
+    assert!(readable_containing(&anon, b"FIX1").is_empty());
+    assert!(readable_containing(&anon, b"FIX2").is_empty());
+
+    // Release one; the lines can be combined, and the other fix stays hidden.
+    alice.release_embargo(&e1).unwrap();
+    let m = alice.merge(WS, r1.snapshot, vec![r2.snapshot], "combine", None).unwrap();
+    assert!(String::from_utf8(read_at(&alice, &m.snapshot, "b.rs")).unwrap().contains("FIX2"));
+    alice.set_tag("main", m.snapshot, None, false).unwrap();
+    remote::push(&mut alice, mirror.clone(), true, &[], false).unwrap();
+    let anon = reader(mirror, None);
+    assert!(!readable_containing(&anon, b"FIX1").is_empty());
+    assert!(readable_containing(&anon, b"FIX2").is_empty());
 }
 
 // ---- secret scanning of content that a release publishes -------------------------
@@ -202,7 +296,6 @@ fn releasing_the_second_embargo_first_hides_the_first_fix_metadata() {
 /// the embargo then publishes it: a declassification that never went
 /// through the scanner.
 #[test]
-#[ignore = "BUG-042: edits of embargoed files skip the secret scanner and are published by the release"]
 fn an_edit_on_an_embargoed_file_is_secret_scanned_before_release_publishes_it() {
     let (mut alice, fs, _) = new_repo("alice");
     let main = commit_files(&mut alice, &*fs, &[("auth.rs", "fn check() -> bool { true }\n")], "v1");
@@ -257,7 +350,6 @@ fn a_new_file_on_an_embargoed_line_is_secret_scanned() {
 /// `adversarial2_props` model turns that into a public leak of cloaked
 /// content).
 #[test]
-#[ignore = "BUG-050: after a release, reverting a file to its pre-embargo content is silently not recorded"]
 fn reverting_a_file_to_its_pre_embargo_content_after_release_is_recorded() {
     let (mut alice, fs, _) = new_repo("alice");
     let main = commit_files(&mut alice, &*fs, &[("a.txt", "v1\n")], "v1");
@@ -285,7 +377,6 @@ fn reverting_a_file_to_its_pre_embargo_content_after_release_is_recorded() {
 /// documented as visible), but its `conflicts` list names files of the
 /// fix in plaintext.
 #[test]
-#[ignore = "BUG-048: an embargoed merge's conflict list names the fix's files in plaintext"]
 fn an_embargoed_merge_does_not_name_the_fix_files_in_its_conflict_list() {
     let (mut alice, fs, _) = new_repo("alice");
     let main0 = commit_files(&mut alice, &*fs, &[("src/session_token_validation.rs", "a\nb\nc\n")], "v1");
@@ -313,7 +404,6 @@ fn an_embargoed_merge_does_not_name_the_fix_files_in_its_conflict_list() {
 /// hidden "because everything below the embargoed root is sealed"; their
 /// descriptions do not.
 #[test]
-#[ignore = "BUG-053: commit messages on an embargoed line are public before release"]
 fn follow_up_commit_messages_on_an_embargoed_line_are_not_public() {
     let (mut alice, fs, _) = new_repo("alice");
     let main = commit_files(&mut alice, &*fs, &[("auth.rs", "v1\n")], "v1");
@@ -332,6 +422,14 @@ fn follow_up_commit_messages_on_an_embargoed_line_are_not_public() {
     remote::push(&mut alice, mirror.clone(), true, &[], false).unwrap();
     let hits = backend_contains(&*mirror, b"CVE-2026-9999");
     assert!(hits.is_empty(), "follow-up message on the public mirror: {hits:?}");
+    // Packs are compressed, so the raw scan above can miss a plain
+    // description: read every snapshot as an outsider too.
+    let anon = reader(mirror, None);
+    let readable = readable_containing(&anon, b"CVE-2026-9999");
+    assert!(readable.is_empty(), "follow-up message readable on the public mirror: {readable:?}");
+    // Key holders still read it.
+    let main = alice.view().tags["main"].target;
+    assert!(alice.description(&alice.snapshot(&main).unwrap()).contains("CVE-2026-9999"));
 }
 
 // ---- embargo scope vs. the cloak of the fix line --------------------------------------
@@ -341,7 +439,6 @@ fn follow_up_commit_messages_on_an_embargoed_line_are_not_public() {
 /// receives the cloaked fix history, which every `team` member can read,
 /// although only `sec` members are supposed to see the fix.
 #[test]
-#[ignore = "BUG-043: a fix cloaked under a wider scope than the embargo reaches every member of that scope"]
 fn the_fix_history_is_not_readable_outside_the_embargo_scope() {
     let alice_id = Identity::generate("alice");
     let bob = Identity::generate("bob");
@@ -362,6 +459,35 @@ fn the_fix_history_is_not_readable_outside_the_embargo_scope() {
     assert!(!bob_repo.keys().has("sec"));
     let leaked = readable_containing(&bob_repo, b"SECONLY");
     assert!(leaked.is_empty(), "bob (team, not sec) reads the embargoed fix: {leaked:?}");
+}
+
+/// The tree-level variant of BUG-043: a fix that changes a file cloaked by
+/// policy under `team`, merged under an embargo for `sec`. The wrapper keeps
+/// cloaked content sealed under its own scope (releasing the embargo must
+/// not declassify it), so every `team` member could read the new content
+/// before the release. Refused; nothing is recorded.
+#[test]
+fn an_embargo_cannot_hide_changes_to_files_cloaked_under_another_scope() {
+    let alice_id = Identity::generate("alice");
+    let (mut alice, fs) = repo_for("alice", &alice_id);
+    alice.keys().create_scope("sec").unwrap();
+    let main = commit_files(
+        &mut alice,
+        &*fs,
+        &[(".veilpolicy", "secrets/ cloak team\n"), ("auth.rs", "v1\n"), ("secrets/k", "old\n")],
+        "v1",
+    );
+    alice.set_tag("main", main, None, false).unwrap();
+    let ws = alice.ephemeral_workspace(main).unwrap();
+    ws.write("auth.rs", "v2\n").unwrap();
+    ws.write("secrets/k", "rotated SECONLY\n").unwrap();
+    let (fix, _) = alice.commit_ephemeral(&ws, "fix").unwrap();
+    let err = alice.merge(WS, main, vec![fix], "fix", embargo("sec")).unwrap_err().to_string();
+    assert!(err.contains("secrets/k") && err.contains("'team'"), "{err}");
+    assert!(alice.keys().embargoes().unwrap().is_empty(), "the refused merge created an embargo record");
+    assert_eq!(alice.view().tags["main"].target, main);
+    // Under the files' own scope the same merge is fine.
+    alice.merge(WS, main, vec![fix], "fix", embargo("team")).unwrap();
 }
 
 // ---- withheld history: other routes ------------------------------------------------------

@@ -35,6 +35,19 @@
 //! non-holder cannot record edits on top of it (the builder holds them back)
 //! because they cannot see what they would be editing.
 //!
+//! Embargoes never overlap (Veil 1.0). A tree under one unreleased embargo
+//! is never wrapped under another ([`wrap`] refuses, and so does
+//! [`crate::merge::merge_trees`] for inputs under two of them); a new
+//! embargoed merge of, or into, a line that carries an unreleased embargo is
+//! refused before anything is recorded (`Repo::merge`). Nesting would wrap
+//! the second fix under the first's key, so releasing either one would
+//! publish, or reveal the shape of, the other.
+//!
+//! Snapshot metadata stays public, so on a line under an unreleased embargo
+//! a key holder's descriptions are sealed under the embargo key
+//! ([`description_scope`]) and no conflict list is recorded
+//! ([`recordable_conflicts`]).
+//!
 //! Time-based release is enforced by the engines of key holders: the first
 //! `vl` invocation by a key holder after the deadline publishes the key.
 //! (True time-lock cryptography is out of scope.)
@@ -133,15 +146,59 @@ pub fn public_view(store: &ObjectStore, id: &ObjectId) -> Result<ObjectId> {
     Ok(id)
 }
 
+/// Embargoes never overlap (Veil 1.0): refusal for content of two
+/// unreleased embargoes `a` and `b` meeting in one tree.
+pub fn overlap_error(a: &str, b: &str) -> VeilError {
+    VeilError::Policy(format!(
+        "cannot combine history under two unreleased embargoes ({a} and {b}): embargoes cannot overlap; release one of them first (`vl embargo release <id>`), then merge or rebase"
+    ))
+}
+
+/// The scope a description written on a snapshot with `tree` is sealed
+/// under: the line's cloak if it is a cloaked line of work, else the
+/// embargo key if `tree` is under an unreleased embargo whose key we hold
+/// (a key holder's follow-up messages describe the hidden fix), else none.
+pub fn description_scope(store: &ObjectStore, tree: &ObjectId, cloak: Option<&str>) -> Result<Option<String>> {
+    if let Some(c) = cloak {
+        return Ok(Some(c.to_string()));
+    }
+    Ok(unreleased_wrapper(store, tree)?
+        .map(|w| w.key_label())
+        .filter(|l| store.keys.has(l)))
+}
+
+/// The conflict list a snapshot with `tree` may carry. Snapshot metadata is
+/// public, so a tree under an unreleased embargo records none: the names
+/// would tell outsiders which files the hidden change touches. (The markers
+/// are in the files themselves, and the command that produced them reports
+/// them.)
+pub fn recordable_conflicts(store: &ObjectStore, tree: &ObjectId, conflicts: Vec<String>) -> Result<Vec<String>> {
+    if !conflicts.is_empty() && unreleased_wrapper(store, tree)?.is_some() {
+        return Ok(vec![]);
+    }
+    Ok(conflicts)
+}
+
 /// Seal `tree` under `embargo`, showing `fallback` to everyone without the
 /// key. Public files that differ from the fallback are sealed under the
-/// embargo key. Content that is already sealed (cloaked under a scope, or
-/// under another embargo) stays sealed as it is: releasing this embargo
-/// never declassifies it. Returns `fallback` itself when `tree` holds
-/// nothing to hide.
+/// embargo key. Content that is already sealed under a scope stays sealed
+/// as it is: releasing this embargo never declassifies it. Returns
+/// `fallback` itself when `tree` holds nothing to hide.
+///
+/// Embargoes never nest: content (or a fallback) under *another*
+/// unreleased embargo is refused ([`overlap_error`]). Nesting would wrap
+/// one embargo's fix under the other's key, so releasing either would
+/// publish (or reveal the shape of) the other.
 pub fn wrap(store: &ObjectStore, embargo: &str, tree: &ObjectId, fallback: &ObjectId) -> Result<ObjectId> {
     if tree == fallback {
         return Ok(*fallback);
+    }
+    for id in [tree, fallback] {
+        if let Some(w) = unreleased_wrapper(store, id)? {
+            if w.embargo != embargo {
+                return Err(overlap_error(&w.embargo, embargo));
+            }
+        }
     }
     let base = public_view(store, fallback)?;
     let vis = Visibility::Embargoed {
@@ -237,6 +294,11 @@ fn seal_dir(
                 stack.push(child);
             }
             EntryKind::File => {
+                if let (Visibility::Embargoed { embargo: other }, Visibility::Embargoed { embargo: this }) = (&e.visibility, vis) {
+                    if other != this && !store.keys.embargo_released(other) {
+                        return Err(overlap_error(other, this));
+                    }
+                }
                 let ne = if e.visibility.is_public() {
                     let data = store.read_entry(&e)?;
                     TreeEntry {
@@ -456,6 +518,19 @@ fn normalize_file(
                     v.label()
                 ),
             ));
+        }
+        // Under an (unreleased) embargo but cloaked by policy: seal it under
+        // the scope (narrower), so the release never publishes it. Without
+        // the key the entry stays as it was.
+        (Visibility::Embargoed { embargo }, Some(want @ Visibility::Cloaked { .. })) if !store.keys.embargo_released(embargo) => {
+            if let Ok(data) = store.read_entry(e) {
+                ne = Some(TreeEntry {
+                    id: store.store_file(&data, &want)?,
+                    visibility: want,
+                    fallback: None,
+                    ..e.clone()
+                });
+            }
         }
         (Visibility::Embargoed { .. }, _) | (_, None) => {}
         (v, Some(want)) if *v == want => {}

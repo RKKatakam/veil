@@ -148,8 +148,13 @@ vl push mirror        # the mirror shows main's pre-merge tree: no new names, si
 vl embargo release <id>   # (or automatically after 7 days)
 vl push mirror        # same snapshot ids, now readable, and the fix's history follows
 # Until release, outsiders keep seeing the pre-merge tree, even for commits made on
-# top of the merge, and cannot commit on top of it; a tag that would publish the fix
-# by another route is skipped by `vl push`.
+# top of the merge (their messages are sealed too), and cannot commit on top of it;
+# a tag that would publish the fix by another route is skipped by `vl push`.
+# Veil 1.0 keeps one unreleased embargo per line: a second `--embargo` merge into
+# (or of) a line that still carries one is refused, and so is merging or rebasing
+# two embargoed lines together. Release the earlier embargo first, then merge.
+# Use `--scope S` matching the fix line's cloak (`--cloak S`): the team remote only
+# receives the fix's history if it is sealed for the embargo's own scope.
 
 # Visibility never widens by accident: rebase, `vl new`, squash and policy edits that
 # arrive by merge keep sealed files sealed. Publishing is explicit: `vl merge` of a
