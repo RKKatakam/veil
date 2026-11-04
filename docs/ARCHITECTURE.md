@@ -805,17 +805,45 @@ struct Snapshot {
   CLI names the tags that stayed and how to move them (BUG-075).
 * **Transactions auto-rebase.** Rewrites and abandons go into a
   `rewritten` map. On commit, every visible descendant is rebased in
-  topological order with a 3-way tree merge
-  (`base = old parent tree, ours = new parent tree, theirs = child tree`).
+  topological order with a 3-way tree merge (`Repo::rebase_tree`):
+  `base` = the merge of its old parents, `ours` = the merge of its new
+  parents, `theirs` = its own tree. `vl rebase` moves its source the same
+  way. A merge one of whose parents moved is thus re-merged, as Jujutsu
+  does, never rebased by the moved parent's diff alone, which would drop
+  what its other parents hold (BUG-251). Conflicts of the new parents' own
+  merge are recorded when their markers reach the result unchanged.
   Tags and workspaces are then re-pointed, and an abandoned working copy gets
   a fresh empty change. Empty, undescribed working-copy changes you move away
   from are abandoned automatically.
+* **Rewrites that change nothing change nothing.** `Transaction::rewrite`
+  keeps the old snapshot (and its signer) when the new one differs only in
+  predecessors, timestamp or signature; `vl rebase` onto the parents a
+  change already has, and `vl describe` with its current message, record no
+  operation (BUG-246). A parent named twice (`vl new X X`, `vl rebase -d X
+  -d X`) is recorded once, and `vl merge X --into X` is refused (BUG-240).
 * **Merging** is tree-level. Identical subtrees resolve by id, and files
   changed on both sides go through diff3 (`diffy`). Conflicts are written as
   markers and recorded on the snapshot until the file is edited. `vl merge`
   records them on the merge and continues on a new change on top, so
   `vl status` lists the conflicts of `@` and those of its parents whose
   file `@` has not touched yet.
+  * **Merge base.** Each further parent is merged into the result so far
+    against the merge base of the parents merged so far and that parent
+    (`Repo::merge_bases`: common ancestors that are not ancestors of another
+    common ancestor). After a criss-cross merge there are several; they are
+    combined into a **virtual merge base** (`Repo::merge_base_tree`),
+    recursively against their own merge bases, as Git's recursive/ort
+    strategies do. Where the merge bases disagree, the virtual base keeps
+    their common ancestor's version (for text, per conflicting hunk), so two
+    earlier resolutions that disagree conflict again rather than one being
+    taken silently (BUG-244). Git writes conflict markers into its virtual
+    base instead; with a line diff3, those markers line up with one side's
+    resolution and let it win.
+  * **File/directory conflicts** keep both sides (BUG-243): the directory
+    keeps the name, and the file moves aside to `NAME~ours` or
+    `NAME~theirs` (the side it came from; `NAME~theirs~2`, … if taken).
+    Both paths are recorded as conflicted. Two directories (or two files)
+    merge as such even when the base had the other kind at that name.
 * **Visibility never silently widens.** Declassification (any move from
   cloaked or embargoed to more visible) is an explicit act by a member: a
   `vl merge` of a cloaked line of work, or a `vl expose`, both of which go

@@ -303,7 +303,6 @@ fn divergent_change_is_reported_when_used() {
 // Scenario from the getting-started guide ("Conflicts"), checked against the behaviour
 // (`merge::squashing_a_resolution_clears_the_conflict`) and `vl status`'s own hint.
 #[test]
-#[ignore = "BUG-250: the guide says squashing a resolution into a merge leaves it marked (conflict); squash clears it, as `vl status` says"]
 fn guide_describes_squashing_a_resolution_correctly() {
     let guide = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),

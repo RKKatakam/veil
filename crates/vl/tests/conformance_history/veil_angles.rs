@@ -658,3 +658,31 @@ fn non_member_diff_show_and_log_of_a_cloaked_merge_reveal_nothing() {
         assert!(!on_disk.contains("NM-"), "{on_disk}");
     }
 }
+
+// BUG-243 / BUG-251 (merge wave): a cloaked change rebased into a file/directory conflict holds the
+// public file moved aside to `NAME~ours`; as a path the cloaked line introduces, it is sealed.
+#[test]
+fn file_moved_aside_in_a_cloaked_rebase_is_sealed() {
+    let env = Env::new();
+    let r = env.repo("p");
+    r.commit("base", &[("x", "file\n")]);
+    r.tag("base", "@-");
+    r.ok(&["ws", "new", "sec", "-r", "base", "--cloak", "team"]);
+    r.ok(&["ws", "switch", "sec"]);
+    r.rm("x");
+    r.write("x/inner.txt", "dir content\n");
+    r.ok(&["commit", "--no-advance", "-m", "cloaked dir"]);
+    r.tag("c", "@-");
+    assert_eq!(r.snap("c").cloak.as_deref(), Some("team"));
+    r.ok(&["ws", "switch", "default"]);
+    r.ok(&["new", "base"]);
+    r.write("x", "edited\n");
+    r.ok(&["commit", "--no-advance", "-m", "public edit"]);
+    r.tag("p", "@-");
+    r.ok(&["rebase", "-s", "c", "-d", "p"]);
+    let s = r.snap("c");
+    assert!(s.conflicts.contains(&"x~ours".to_string()), "{s:?}");
+    assert_eq!(r.cat("c", "x~ours"), "edited\n");
+    assert_eq!(r.cat("c", "x/inner.txt"), "dir content\n");
+    assert!(is_cloaked(&r.visibility("c", "x~ours")), "moved-aside file public on a cloaked line");
+}
