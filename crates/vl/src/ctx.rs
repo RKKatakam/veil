@@ -267,6 +267,8 @@ impl Ctx {
         let user = user_for(&identity);
         let fs = Arc::new(DiskBackend::new(&root));
         let mut repo = Repo::open(fs.clone(), Some(identity), &user)?;
+        // This device's diff and merge drivers (`.gitattributes` only names them).
+        crate::attr_cmd::register(&repo, &root);
         if repo.view().workspaces.is_empty() {
             let checkout = CheckoutState::new(DEFAULT_WORKSPACE, repo.root_id(), Materialised::default());
             return Ok(Ctx {
@@ -472,6 +474,37 @@ impl Ctx {
             save_checkout(&self.fs, &self.checkout)?;
         }
         Ok(true)
+    }
+
+    /// Record the project directory as operation `description`, with line
+    /// endings as `line_endings` says (`vl renormalize`). The directory was
+    /// recorded when the command started, so it is not stale.
+    pub fn snapshot_with_line_endings(&mut self, description: String, line_endings: veil_core::builder::LineEndings<'_>) -> Result<BuildReport> {
+        let view_wc = self.wc()?;
+        let disk = self.fs.clone();
+        let fs: &dyn StorageBackend = &*disk;
+        let out = self.repo.snapshot_workspace_with(
+            &self.ws,
+            fs,
+            SnapshotOptions {
+                cache: Some(&mut self.cache),
+                materialised: Some(&self.checkout.materialised),
+                description: Some(description),
+                expected_wc: Some(view_wc),
+                line_endings,
+                ..Default::default()
+            },
+        )?;
+        if out.superseded {
+            bail!("the working copy moved while this command ran (another `vl` is running here?); try again");
+        }
+        self.save_cache();
+        self.repo.capture_local_files(fs, &out.report)?;
+        if self.checkout.snapshot != out.snapshot {
+            self.checkout.snapshot = out.snapshot;
+            save_checkout(&self.fs, &self.checkout)?;
+        }
+        Ok(out.report)
     }
 
     /// Does the directory already hold every change from the snapshot it
@@ -761,6 +794,9 @@ pub fn print_working_copy_warnings(r: &BuildReport) {
         warn_untrusted(&format!(
             "{p} is a Git repository; its files are recorded as part of this one (`vl submodule` records it as a submodule instead, pinned to a commit)"
         ));
+    }
+    for (p, why) in &r.line_endings {
+        warn_untrusted(&format!("{p}: {why}"));
     }
     for (a, b) in &r.name_collisions {
         warn_untrusted(&format!(

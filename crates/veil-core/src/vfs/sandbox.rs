@@ -229,6 +229,11 @@ impl SandboxFs {
             if rec.content != *id && rec.sealed.as_ref().map(|s| &s.1) != Some(id) {
                 continue;
             }
+            // The file on disk is a line-ending conversion of the recorded
+            // version (`.gitattributes`), not its bytes.
+            if rec.eol.as_ref().is_some_and(|f| f.recorded.is_some()) {
+                continue;
+            }
             let Ok(file) = open_no_follow(&src.fs.full_path(cand)) else { continue };
             if !unchanged(&file, &meta) {
                 continue;

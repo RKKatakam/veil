@@ -27,6 +27,15 @@
 //! as its shown side, as it is ([`crate::conflict::shown_side`]): never a
 //! file of markers, which would turn a link target into file content.
 //!
+//! Line endings follow `.gitattributes` (see [`crate::attributes`]): a
+//! file whose attributes say `eol=crlf` is written with CRLF line endings
+//! (the attributes of the tree checked out decide), and recorded in
+//! [`Materialised`] as written so. A file is taken for the version
+//! checkout wrote when it holds that version's bytes, the CRLF rendering
+//! recorded for it, or bytes that the attributes of the tree it was
+//! checked out from normalise to that version (so an attribute change never
+//! wedges a file as a local edit, and never hides one).
+//!
 //! Checkout never deletes what it did not write. A directory where the tree
 //! now has a file is only removed once checkout has emptied it; a directory
 //! that still holds something (isolated or ignored files, untracked files,
@@ -53,6 +62,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    attributes::{lf_to_crlf, to_odb, to_worktree, Attrs, ToOdb},
     error::{Result, VeilError},
     id::ObjectId,
     object::{is_reserved_name, EntryKind, Object, TreeEntry, Visibility},
@@ -103,6 +113,9 @@ pub struct CheckoutReport {
     /// Problems that did not stop the checkout (the target tree's
     /// `.veilpolicy` could not be read, so the accepted policy applied).
     pub warnings: Vec<String>,
+    /// Files written with CRLF line endings (`eol=crlf`) for a version
+    /// recorded with LF.
+    pub crlf: Vec<VPath>,
 }
 
 /// What a working copy holds where it differs from its tree as this reader
@@ -136,6 +149,10 @@ pub struct Materialised {
     view: Option<ObjectId>,
     hidden: BTreeSet<VPath>,
     fallback: BTreeMap<VPath, ObjectId>,
+    /// Files checkout wrote with CRLF line endings for their LF version
+    /// (`eol=crlf`). Whatever the attributes say later, such a file still
+    /// holding exactly that rendering is the version, not an edit.
+    crlf: BTreeSet<VPath>,
 }
 
 /// On-disk form of [`Materialised`]: paths are plain strings, validated when
@@ -148,6 +165,8 @@ struct MaterialisedRaw {
     hidden: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     fallback: BTreeMap<String, ObjectId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    crlf: Vec<String>,
 }
 
 impl TryFrom<MaterialisedRaw> for Materialised {
@@ -165,6 +184,7 @@ impl TryFrom<MaterialisedRaw> for Materialised {
                 .iter()
                 .map(|(s, id)| Ok((path(s)?, *id)))
                 .collect::<std::result::Result<_, String>>()?,
+            crlf: r.crlf.iter().map(|s| path(s)).collect::<std::result::Result<_, _>>()?,
         })
     }
 }
@@ -175,6 +195,7 @@ impl From<Materialised> for MaterialisedRaw {
             view: m.view,
             hidden: m.hidden.into_iter().map(|p| p.as_str().to_string()).collect(),
             fallback: m.fallback.into_iter().map(|(p, id)| (p.as_str().to_string(), id)).collect(),
+            crlf: m.crlf.into_iter().map(|p| p.as_str().to_string()).collect(),
         }
     }
 }
@@ -191,9 +212,15 @@ impl Materialised {
         }
     }
 
-    /// Nothing hidden, nothing from a fallback.
+    /// Nothing hidden, nothing from a fallback, nothing converted.
     pub fn is_empty(&self) -> bool {
-        self.view.is_none() && self.hidden.is_empty() && self.fallback.is_empty()
+        self.view.is_none() && self.hidden.is_empty() && self.fallback.is_empty() && self.crlf.is_empty()
+    }
+
+    /// Did checkout write the file at `path` with CRLF line endings for
+    /// its LF version (and has not written that path since)?
+    pub fn wrote_crlf(&self, path: &VPath) -> bool {
+        self.crlf.contains(path)
     }
 
     /// The tree actually materialised when the working copy's tree is an
@@ -248,6 +275,10 @@ impl Materialised {
         for c in changes {
             self.hidden.remove(&c.path);
             self.fallback.remove(&c.path);
+            self.crlf.remove(&c.path);
+        }
+        for p in &report.crlf {
+            self.crlf.insert(p.clone());
         }
         for p in report.redacted.iter().chain(report.failed.iter().map(|(p, _)| p)) {
             // Left absent (a kept local edit is the user's file, not ours).
@@ -281,7 +312,7 @@ impl Materialised {
             let (now, fell_back) = resolve_view(store, tree)?;
             if now != shown {
                 let changes = diff_trees(store, Some(&shown), Some(tree))?;
-                let report = apply_changes(store, fs, tree, &changes, cache.as_deref_mut())?;
+                let report = apply_changes(store, fs, Some(&shown), tree, &changes, cache.as_deref_mut(), Some(&self.crlf))?;
                 self.absorb(fs, &changes, &report)?;
                 self.view = fell_back.then_some(now);
                 total.merge(report);
@@ -346,7 +377,7 @@ impl Materialised {
             }
         }
         if !changes.is_empty() {
-            let report = apply_changes(store, fs, tree, &changes, cache)?;
+            let report = apply_changes(store, fs, Some(tree), tree, &changes, cache, Some(&self.crlf))?;
             self.absorb(fs, &changes, &report)?;
             total.merge(report);
         }
@@ -412,7 +443,7 @@ pub fn checkout_recorded(
 ) -> Result<CheckoutReport> {
     let shown = record.view.or(from.copied());
     let changes = diff_trees(store, shown.as_ref(), Some(to))?;
-    let mut report = apply_changes(store, fs, to, &changes, cache.as_deref_mut())?;
+    let mut report = apply_changes(store, fs, shown.as_ref(), to, &changes, cache.as_deref_mut(), Some(&record.crlf))?;
     record.absorb(fs, &changes, &report)?;
     let (now, fell_back) = resolve_view(store, to)?;
     record.view = fell_back.then_some(now);
@@ -448,7 +479,7 @@ pub fn restore_paths(
         .into_iter()
         .filter(|c| wanted(&c.path))
         .collect();
-    let report = apply_changes(store, fs, to, &changes, cache)?;
+    let report = apply_changes(store, fs, Some(from), to, &changes, cache, Some(&record.crlf))?;
     record.absorb(fs, &changes, &report)?;
     Ok(report)
 }
@@ -464,6 +495,7 @@ impl CheckoutReport {
         self.from_fallback.extend(o.from_fallback);
         self.obstructed.extend(o.obstructed);
         self.nested.extend(o.nested);
+        self.crlf.extend(o.crlf);
         // `fill_in` right after a checkout retries what it could not write.
         for f in o.failed {
             if !self.failed.iter().any(|(p, _)| *p == f.0) {
@@ -660,20 +692,61 @@ pub fn checkout_cached(
     cache: Option<&mut StatCache>,
 ) -> Result<CheckoutReport> {
     let changes = diff_trees(store, from, Some(to))?;
-    apply_changes(store, fs, to, &changes, cache)
+    apply_changes(store, fs, from, to, &changes, cache, None)
 }
 
-/// Apply `changes` (towards tree `to`, whose policy decides what is
-/// local-only) to `fs`. Shared by [`checkout_cached`] and
+/// What [`holds`] needs to recognise a file checkout wrote with converted
+/// line endings: the attributes of the tree `fs` was checked out from, and
+/// the files the materialisation record says were written with CRLF.
+struct Eol<'s> {
+    from: Option<Attrs<'s>>,
+    crlf: Option<&'s BTreeSet<VPath>>,
+}
+
+impl Eol<'_> {
+    /// Does working-copy content `data` at `path` stand for recorded
+    /// content `want` (exactly, as the CRLF rendering checkout wrote, or as
+    /// what the `from` attributes normalise it to)?
+    fn stands_for(&self, path: &VPath, data: &[u8], want: &[u8]) -> bool {
+        if data == want {
+            return true;
+        }
+        if memchr::memchr(b'\r', data).is_none() {
+            return false;
+        }
+        if self.crlf.is_some_and(|c| c.contains(path)) && lf_to_crlf(want) == data {
+            return true;
+        }
+        match &self.from {
+            Some(a) => matches!(
+                to_odb(data, a.for_path(path).conversion, || memchr::memchr(b'\r', want).is_some()),
+                ToOdb::Converted(v) if v == want
+            ),
+            None => false,
+        }
+    }
+}
+
+/// Apply `changes` (from tree `from` towards tree `to`, whose policy
+/// decides what is local-only and whose attributes decide line endings) to
+/// `fs`, given the files `crlf` the materialisation record says were
+/// written with CRLF. Shared by [`checkout_cached`] and
 /// [`Materialised::fill_in`].
 fn apply_changes(
     store: &std::sync::Arc<ObjectStore>,
     fs: &dyn StorageBackend,
+    from: Option<&ObjectId>,
     to: &ObjectId,
     changes: &[TreeChange],
     mut cache: Option<&mut StatCache>,
+    crlf: Option<&BTreeSet<VPath>>,
 ) -> Result<CheckoutReport> {
     let mut report = CheckoutReport::default();
+    let eol = Eol {
+        from: from.map(|f| Attrs::for_tree(store, *f)),
+        crlf,
+    };
+    let attrs = Attrs::for_tree(store, *to);
     // Defence in depth: trees naming `.veil` are refused when decoded, but
     // checkout must never write repository metadata whatever the tree says.
     if let Some(c) = changes.iter().find(|c| c.path.components().any(is_reserved_name)) {
@@ -721,7 +794,7 @@ fn apply_changes(
         let old = c.old.as_ref().map(|o| Form::of(store, o));
         match fs.metadata(&c.path)?.map(|m| m.kind) {
             Some(NodeKind::File | NodeKind::Symlink) => {
-                if !holds(store, fs, &c.path, c.old.as_ref(), cache.as_deref())? {
+                if !holds(store, fs, &c.path, c.old.as_ref(), cache.as_deref(), &eol)? {
                     // A link checkout did not write is never removed.
                     report.kept_local.push(c.path.clone());
                     continue;
@@ -775,7 +848,7 @@ fn apply_changes(
             continue;
         }
         if let Form::Symlink(_) | Form::Gitlink(_) = &form {
-            apply_special(store, fs, c, &form, &policy, &mut guard, &mut report, cache.as_deref_mut())?;
+            apply_special(store, fs, c, &form, &policy, &mut guard, &mut report, cache.as_deref_mut(), &eol)?;
             continue;
         }
         let new = form.entry().expect("a form with an entry");
@@ -791,7 +864,7 @@ fn apply_changes(
             // A link where the tree has a file: replaced only when it is
             // the version checkout wrote (the write renames over the link
             // itself, never through it). A link of the user's stays.
-            if !holds(store, fs, &c.path, c.old.as_ref(), cache.as_deref())? {
+            if !holds(store, fs, &c.path, c.old.as_ref(), cache.as_deref(), &eol)? {
                 report.blocked.push(c.path.clone());
                 continue;
             }
@@ -815,10 +888,17 @@ fn apply_changes(
             current = None;
         }
         let local_edit = current.as_ref().is_some_and(|m| m.kind == NodeKind::File)
-            && !holds(store, fs, &c.path, c.old.as_ref(), cache.as_deref())?;
+            && !holds(store, fs, &c.path, c.old.as_ref(), cache.as_deref(), &eol)?;
+        let conversion = attrs.for_path(&c.path).conversion;
         // A copy the backend can clone (a sandbox reflinking the project
-        // directory's file): nothing to read or write.
-        if !local_edit && new.fallback.is_none() && store.entry_readable(new) && fs.clone_known(&c.path, &new.id)? {
+        // directory's file): nothing to read or write. Never for a file
+        // whose line endings are converted on the way out.
+        if !local_edit
+            && !conversion.writes_crlf()
+            && new.fallback.is_none()
+            && store.entry_readable(new)
+            && fs.clone_known(&c.path, &new.id)?
+        {
             forget(&mut cache, &c.path);
             if let Err(e) = fs.set_executable(&c.path, new.executable) {
                 // Never leave the content with the wrong mode behind.
@@ -831,6 +911,12 @@ fn apply_changes(
         }
         match read_materialised(store, new) {
             Ok((data, via_fallback)) => {
+                // Line endings for the working copy (`eol=crlf`), on the
+                // bytes as read: a conflict's markers too, a fallback too.
+                let (data, crlf) = match to_worktree(&data, conversion) {
+                    Some(d) => (d, true),
+                    None => (data, false),
+                };
                 if local_edit {
                     // Already what we want? Then there is nothing to protect.
                     if fs.read(&c.path).map_or(true, |d| d != data) {
@@ -854,6 +940,9 @@ fn apply_changes(
                 }
                 forget(&mut cache, &c.path);
                 report.written += 1;
+                if crlf {
+                    report.crlf.push(c.path.clone());
+                }
                 if let Some(fb) = via_fallback {
                     report.from_fallback.push((c.path.clone(), fb));
                 }
@@ -877,6 +966,11 @@ fn apply_changes(
             Err(e) => return Err(e),
         }
     }
+    for w in attrs.warnings().into_iter().chain(eol.from.iter().flat_map(|a| a.warnings())) {
+        if !report.warnings.contains(&w) {
+            report.warnings.push(w);
+        }
+    }
     Ok(report)
 }
 
@@ -893,10 +987,11 @@ fn apply_special(
     guard: &mut SpecialGuard<'_>,
     report: &mut CheckoutReport,
     mut cache: Option<&mut StatCache>,
+    eol: &Eol<'_>,
 ) -> Result<Option<()>> {
     let path = &c.path;
     let current = fs.metadata(path)?;
-    let ours = |fs: &dyn StorageBackend| holds(store, fs, path, c.old.as_ref(), None);
+    let ours = |fs: &dyn StorageBackend| holds(store, fs, path, c.old.as_ref(), None, eol);
     match form {
         Form::Symlink(e) => {
             // A link named like VCS metadata (`.git -> …`) is never written.
@@ -918,14 +1013,14 @@ fn apply_special(
                 // A link is never written from an embargo fallback (the
                 // pre-merge version may be a file); left out, as unreadable.
                 Ok((_, Some(_))) => {
-                    remove_ours(store, fs, c, current.as_ref(), report, &mut cache)?;
+                    remove_ours(store, fs, c, current.as_ref(), report, &mut cache, eol)?;
                     report.redacted.push(path.clone());
                     return Ok(None);
                 }
                 Err(err) if err.is_unreadable() => {
                     // Never leave a readable old version where hidden
                     // content now lives.
-                    remove_ours(store, fs, c, current.as_ref(), report, &mut cache)?;
+                    remove_ours(store, fs, c, current.as_ref(), report, &mut cache, eol)?;
                     report.redacted.push(path.clone());
                     return Ok(None);
                 }
@@ -934,12 +1029,12 @@ fn apply_special(
             // A hostile tree's target (a NUL, over PATH_MAX, not UTF-8) is
             // refused for this path only, never written.
             if let Err(err) = crate::vfs::check_link_target(&target) {
-                remove_ours(store, fs, c, current.as_ref(), report, &mut cache)?;
+                remove_ours(store, fs, c, current.as_ref(), report, &mut cache, eol)?;
                 report.failed.push((path.clone(), err.to_string()));
                 return Ok(None);
             }
             if !fs.supports_links() {
-                remove_ours(store, fs, c, current.as_ref(), report, &mut cache)?;
+                remove_ours(store, fs, c, current.as_ref(), report, &mut cache, eol)?;
                 report.failed.push((
                     path.clone(),
                     format!("this working copy's storage ({}) cannot hold symlinks; the link stays recorded, untouched", fs.kind()),
@@ -1044,11 +1139,12 @@ fn remove_ours(
     current: Option<&crate::vfs::Metadata>,
     report: &mut CheckoutReport,
     cache: &mut Option<&mut StatCache>,
+    eol: &Eol<'_>,
 ) -> Result<()> {
     if c.old.is_none() || !current.is_some_and(|m| matches!(m.kind, NodeKind::File | NodeKind::Symlink)) {
         return Ok(());
     }
-    if holds(store, fs, &c.path, c.old.as_ref(), cache.as_deref())? {
+    if holds(store, fs, &c.path, c.old.as_ref(), cache.as_deref(), eol)? {
         fs.remove_file(&c.path)?;
         forget(cache, &c.path);
         report.removed += 1;
@@ -1119,13 +1215,14 @@ fn read_materialised(store: &ObjectStore, e: &TreeEntry) -> Result<(Vec<u8>, Opt
 
 /// Does the node at `path` hold exactly what checkout materialises for
 /// `entry`: a file's content, a conflict's rendering, a symlink's target
-/// (`readlink`, never followed)?
+/// (`readlink`, never followed)? Line endings as `eol` allows.
 fn holds(
     store: &ObjectStore,
     fs: &dyn StorageBackend,
     path: &VPath,
     entry: Option<&TreeEntry>,
     cache: Option<&StatCache>,
+    eol: &Eol<'_>,
 ) -> Result<bool> {
     let form = entry.map(|e| Form::of(store, e));
     let entry = match &form {
@@ -1153,11 +1250,14 @@ fn holds(
             Ok(None) | Err(VeilError::Io { .. }) => return Ok(false),
             Err(e) => return Err(e),
         };
-        return Ok(read_materialised(store, entry)?.0 == data);
+        return Ok(eol.stands_for(path, &data, &read_materialised(store, entry)?.0));
     }
     if let (Some(cache), Some(meta)) = (cache, fs.metadata(path)?) {
         if let Some(rec) = cache.trusted(path, &meta) {
-            if rec.content == entry.id || rec.sealed.as_ref().is_some_and(|(_, id)| *id == entry.id) {
+            if rec.content == entry.id
+                || rec.sealed.as_ref().is_some_and(|(_, id)| *id == entry.id)
+                || rec.eol.as_ref().is_some_and(|f| f.recorded == Some(entry.id))
+            {
                 return Ok(true);
             }
         }
@@ -1172,7 +1272,7 @@ fn holds(
         return Ok(true);
     }
     match store.read_entry(entry) {
-        Ok(expected) => Ok(expected == data),
+        Ok(expected) => Ok(eol.stands_for(path, &data, &expected)),
         Err(e) if e.is_unreadable() => Ok(false),
         Err(e) => Err(e),
     }

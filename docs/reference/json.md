@@ -25,6 +25,7 @@ text:
 | [`vl blame`](blame.md) | [`veil.blame/1`](#veilblame1) |
 | [`vl grep`](grep.md) | [`veil.grep/1`](#veilgrep1) |
 | [`vl duplicate`](duplicate.md), [`vl cherry-pick`](cherry-pick.md) (write commands) | [`veil.duplicate/1`](#veilduplicate1) |
+| [`vl attr check`](attr.md#vl-attr-check) | [`veil.attr-check/1`](#veilattr-check1) |
 | any of them, on failure | [`veil.error/1`](#veilerror1) |
 
 ```sh
@@ -298,6 +299,7 @@ this command found.
 | `nested` | array of strings | Directories that are repositories of their own; nothing in them is recorded here |
 | `redacted` | array | Files of `@` that are absent on disk because you cannot read them: `path`, `redaction` (a [redaction](#redaction)) and `tier` (`redacted`, or for `unwritable` the file's own [tier](#tier)) |
 | `conflicts` | array | Unresolved conflicts: `path`, `recorded_on` (string or null: the short change id of the parent, a merge, that recorded it with the same version; null if recorded on `@` itself) and `conflict` (a [conflict](#conflict), or null for markers in the file) |
+| `renormalizable` | array of strings | Omitted when empty. Files that still hold their recorded version, but whose line endings `.gitattributes` would now convert: `vl renormalize` re-records them (changing `.gitattributes` alone never does) |
 
 ## `veil.log/1`
 
@@ -665,6 +667,29 @@ A copy:
 | `duplicate` | object | The new change: `snapshot_id`, `change_id` |
 | `conflicts` | array of strings | Paths that conflicted while applying the change (recorded in the copy) |
 | `renames` | array | Renames the copy followed: `from`, `to`, `score` (similarity in percent), `how` (`followed`, `both`, `rename/delete` or `rename/rename`), `other` (string, rename/rename only: the other side's name) and `sealed` (string, omitted when public: the audience the file stays sealed for at its new path) |
+## `veil.attr-check/1`
+
+`vl attr check PATH… --json`: the attributes that apply to each path, read
+from the working copy's `.gitattributes` files and the device-local
+`.veil/local/attributes` (as `git check-attr -a`), and what Veil does with
+them. The paths need not exist.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `veil.attr-check/1` |
+| `paths` | array | One per path asked about, in order (below) |
+| `warnings` | array of strings | Problems with the attributes files (unreadable, larger than 1 MiB, an ignored line) and with this device's driver configuration |
+
+A path:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `path` | string | The repository path |
+| `attributes` | array | Every attribute assigned to it, by name: `name`, `state` (`set`, `unset`, `value` or `unspecified`: reset with `!name`) and `value` (string or null: of `value`). Macros appear expanded (`binary` also lists `diff`, `merge` and `text` unset) |
+| `line_endings` | string | `none`, `text-lf`, `text-crlf`, `auto-lf` or `auto-crlf`: what recording (CRLF → LF) and checkout (`-crlf`: LF → CRLF) do; `auto` only for content that looks like text |
+| `diff` | string | `text`, `binary`, `driver NAME`, or `text (driver NAME is not defined on this device)` |
+| `merge` | string | `text`, `binary`, `union`, `driver NAME`, or `text (driver NAME is not defined on this device)` |
+| `unsupported` | array | Assigned attributes Veil does not act on: `name` and `note` (why: `filter`, `ident`, `working-tree-encoding`, `export-ignore`, `linguist-*`, …) |
 
 ## `veil.error/1`
 

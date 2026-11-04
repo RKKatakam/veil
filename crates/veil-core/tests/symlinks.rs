@@ -454,6 +454,7 @@ fn below_format_5_links_stay_special_files() {
             rescan: false,
             materialised: None,
             line_base: None,
+            line_endings: Default::default(),
         },
     )
     .unwrap();

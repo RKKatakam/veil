@@ -88,10 +88,6 @@ impl Env {
 fn new_commands_parse_their_documented_flags_and_refuse() {
     let env = Env::new();
     let cases: &[(&[&str], &str)] = &[
-        // stream W: attributes
-        (&["attr", "check", "README.md", "src/x.c"], "vl attr"),
-        (&["renormalize"], "vl renormalize"),
-        (&["renormalize", "src"], "vl renormalize"),
         // stream C: colocated Git
         (&["git", "colocate"], "vl git colocate"),
         (&["git", "colocate", "--experimental"], "vl git colocate"),

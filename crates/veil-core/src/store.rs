@@ -116,6 +116,9 @@ pub struct ObjectStore {
     needs_recovery: AtomicBool,
     /// Repository format: decides the tree encoding written and accepted.
     format: AtomicU32,
+    /// This device's diff and merge drivers (`.gitattributes` only names
+    /// them; see [`crate::attributes::DeviceDrivers`]).
+    drivers: RwLock<Option<Arc<dyn crate::attributes::DeviceDrivers>>>,
 }
 
 impl fmt::Debug for ObjectStore {
@@ -158,6 +161,31 @@ impl ObjectStore {
             not_durable: Mutex::new(Vec::new()),
             needs_recovery: AtomicBool::new(false),
             format: AtomicU32::new(crate::repo::REPO_FORMAT),
+            drivers: RwLock::new(None),
+        }
+    }
+
+    /// Register this device's diff and merge drivers (the CLI does, from
+    /// its own configuration; never from anything in a tree).
+    pub fn set_device_drivers(&self, d: Arc<dyn crate::attributes::DeviceDrivers>) {
+        *self.drivers.write().expect("drivers lock") = Some(d);
+    }
+
+    /// This device's drivers, if any were registered.
+    pub fn device_drivers(&self) -> Option<Arc<dyn crate::attributes::DeviceDrivers>> {
+        self.drivers.read().expect("drivers lock").clone()
+    }
+
+    /// The device-local attributes file of the repository this store
+    /// belongs to ([`crate::attributes::LOCAL_ATTRIBUTES`]), if there is one
+    /// (a regular file, never followed through a link).
+    pub fn local_attributes(&self) -> Option<Vec<u8>> {
+        let path = VPath::new(crate::attributes::LOCAL_ATTRIBUTES).ok()?;
+        match self.backend.metadata(&path) {
+            Ok(Some(m)) if m.kind == crate::vfs::NodeKind::File && m.len <= crate::attributes::MAX_FILE as u64 => self.backend.read(&path).ok(),
+            // Too large: parsed as such (ignored, with a warning).
+            Ok(Some(m)) if m.kind == crate::vfs::NodeKind::File => Some(vec![b'#'; crate::attributes::MAX_FILE + 1]),
+            _ => None,
         }
     }
 

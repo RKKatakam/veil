@@ -609,6 +609,10 @@ pub fn vouch_written(
                 content,
                 scanned_clean: false,
                 sealed: None,
+                // Written as recorded (`vouchable`: the entry's id is the
+                // written content) against the tree the sandbox is
+                // recorded against, so no line-ending fact is needed.
+                eol: None,
             },
         ));
     }

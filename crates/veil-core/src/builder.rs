@@ -38,6 +38,14 @@
 //! ([`BuildReport::name_collisions`]), so a Linux user learns before a macOS
 //! teammate's checkout refuses the snapshot.
 //!
+//! Line endings follow the working copy's `.gitattributes` (see
+//! [`crate::attributes`] and [`LineEndings`]): a file is normalised (CRLF →
+//! LF) before it is hashed, scanned and sealed, all on the one buffer, and
+//! only when that is lossless; a file that still holds its recorded version
+//! (as it is, or as the CRLF rendering checkout wrote for it) keeps it, so
+//! a change of attributes never re-records anything by itself (`vl
+//! renormalize` does, [`LineEndings::Renormalize`]).
+//!
 //! With [`InjectedSecrets`] (the isolated files a `ws exec` sandbox was given)
 //! any new content that contains one of those values is quarantined, so a
 //! command cannot launder an injected secret into history under another name.
@@ -48,13 +56,14 @@ use std::{
 };
 
 use crate::{
+    attributes::{lf_to_crlf, to_odb, Attrs, ToOdb},
     checkout::Materialised,
     error::{Result, VeilError},
     id::ObjectId,
     object::{EntryKind, Object, Tree, TreeEntry, Visibility},
     policy::{tier_keyword, Classification, HeldBack, Policy, PolicyFile, Tier, POLICY_FILE},
     secrets::{self, Finding},
-    statcache::{CacheKey, CacheRun, StatCache},
+    statcache::{CacheKey, CacheRun, EolFact, StatCache},
     store::ObjectStore,
     tree::MAX_TREE_DEPTH,
     vfs::{is_temp_name, DirEntry, DirListing, Metadata, NodeKind, StorageBackend},
@@ -112,6 +121,23 @@ pub struct BuildOptions<'a> {
     /// introduces, so it is sealed (BUG-128). `None`: not known, so such an
     /// edit is always sealed.
     pub line_base: Option<&'a dyn Fn() -> Result<ObjectId>>,
+    /// How `.gitattributes` decides the line endings recorded.
+    pub line_endings: LineEndings<'a>,
+}
+
+/// How a build applies the line-ending attributes of `.gitattributes`.
+#[derive(Clone, Copy, Default)]
+pub enum LineEndings<'a> {
+    /// Normalise new content as the working copy's attributes say (when
+    /// lossless); a file that still holds its recorded version keeps it.
+    #[default]
+    Convert,
+    /// Record the bytes as they are (a Git import, a patch applied to
+    /// recorded bytes).
+    Off,
+    /// `vl renormalize`: the paths selected are recorded as the attributes
+    /// say now, even unchanged ones; the others as with `Convert`.
+    Renormalize(&'a (dyn Fn(&VPath) -> bool + 'a)),
 }
 
 /// Rule name of a [`Finding`] for content copied from an injected secret.
@@ -688,6 +714,14 @@ pub struct BuildReport {
     /// (see [`crate::vfs::holds_repository`]). Something tracked there
     /// before is recorded as deleted (the files stay on disk).
     pub nested: Vec<VPath>,
+    /// New content `.gitattributes` asks to normalise (CRLF → LF) that was
+    /// recorded exactly as it is because the conversion would lose
+    /// information (mixed line endings, a lone CR), with why.
+    pub line_endings: Vec<(VPath, String)>,
+    /// Files that still hold their recorded version but whose line endings
+    /// `vl renormalize` would change (the attributes changed since they
+    /// were recorded).
+    pub renormalizable: Vec<VPath>,
 }
 
 impl BuildReport {
@@ -734,6 +768,11 @@ struct Builder<'a> {
     /// Symlinks are recorded as entries (repository format 5); below that
     /// they are special files, never recorded.
     links: bool,
+    /// The working copy's attributes, read on first need.
+    attrs: Option<Attrs<'a>>,
+    /// For the file just read: its bytes on disk and its line-ending facts
+    /// (see [`Builder::line_endings`]), for the stat cache.
+    eol_now: Option<(ObjectId, EolFact)>,
 }
 
 /// Build a tree from `fs`, returning its id and a report.
@@ -810,6 +849,8 @@ pub fn build_tree_cached(
         },
         line_base: None,
         links: store.format() >= crate::object::GIT_PARITY_REPO_FORMAT,
+        attrs: None,
+        eol_now: None,
     };
     if let (Some(c), None) = (opts.cloak, b.cloak) {
         b.report.policy_warnings.push(format!(
@@ -829,7 +870,7 @@ pub fn build_tree_cached(
     Ok((id, b.report))
 }
 
-impl Builder<'_> {
+impl<'a> Builder<'a> {
     /// Protection follows content across a rename (renames design, builder
     /// hardening): a new public file (or symlink) whose plaintext is
     /// exactly that of a cloaked entry this snapshot deletes is the same
@@ -1438,7 +1479,14 @@ impl Builder<'_> {
             return Ok(false);
         }
         match self.store.matches_encoding(&e.id, &data) {
-            Ok(m) => Ok(m),
+            Ok(true) => Ok(true),
+            // A file written with converted line endings (`eol=crlf`).
+            Ok(false) if e.kind == EntryKind::File && memchr::memchr(b'\r', &data).is_some() => match self.store.read_entry(e) {
+                Ok(want) => Ok(self.disk_stands_for(path, &data, &want)),
+                Err(err) if err.is_unreadable() || err.is_not_found() => Ok(false),
+                Err(err) => Err(err),
+            },
+            Ok(false) => Ok(false),
             Err(err) if err.is_unreadable() || err.is_not_found() => Ok(false),
             Err(err) => Err(err),
         }
@@ -1505,14 +1553,31 @@ impl Builder<'_> {
         }
         let m = crate::conflict::materialize(self.store, &conflict, crate::conflict::Audience::Reader)?;
         let executable = meta.as_ref().is_some_and(|m| m.executable);
-        let data = match self.fs.read(path) {
+        let raw = match self.fs.read(path) {
             Ok(d) => d,
             Err(e) => return self.unreadable(path, e, Some(ce)),
         };
         self.report.hashed += 1;
+        // Line endings (`.gitattributes`): the copy as recorded, markers
+        // and all (checkout wrote it converted for `eol=crlf`, and an
+        // editor that keeps CRLF keeps it so).
+        let data = if raw != m.content && self.disk_stands_for(path, &raw, &m.content) {
+            m.content.clone()
+        } else {
+            match (self.opts.line_endings, memchr::memchr(b'\r', &raw)) {
+                (LineEndings::Off, _) | (_, None) => raw.clone(),
+                _ => {
+                    let conv = self.attrs().for_path(path).conversion;
+                    match to_odb(&raw, conv, || true) {
+                        ToOdb::Converted(v) => v,
+                        _ => raw.clone(),
+                    }
+                }
+            }
+        };
         if !local_only && data == m.content && executable == m.executable {
-            if let (Some(run), Some(meta)) = (self.cache.as_mut(), meta.as_ref()) {
-                run.learn(path, meta, Object::blob_id(&data), false, rendered_as(&ce.id));
+            if let (Some(run), Some(meta), true) = (self.cache.as_mut(), meta.as_ref(), raw == data) {
+                run.learn(path, meta, Object::blob_id(&data), false, rendered_as(&ce.id), None);
             }
             return Ok(Some(ce.clone()));
         }
@@ -1601,6 +1666,7 @@ impl Builder<'_> {
     /// same kind is its previous version: a file replaced by a link (or
     /// the reverse) is a new leaf, its old version kept in history.
     fn plain_file_entry(&mut self, path: &VPath, name: &str, parent_entry: Option<&TreeEntry>, kind: EntryKind) -> Result<Option<TreeEntry>> {
+        self.eol_now = None;
         let parent_file = parent_entry.filter(|e| e.kind == kind);
         let class = match kind {
             EntryKind::Symlink => self.opts.policy.classify_link(path),
@@ -1643,7 +1709,7 @@ impl Builder<'_> {
 
         // Fast path: overlay/tree-view says the file is byte-identical.
         if let Some(pe) = parent_file {
-            if self.use_hints && self.fs.known_id(path) == Some(pe.id) {
+            if self.use_hints && !self.renormalizing(path) && self.fs.known_id(path) == Some(pe.id) {
                 return Ok(Some(pe.clone()));
             }
         }
@@ -1708,6 +1774,12 @@ impl Builder<'_> {
             }
         }
         self.report.hashed += 1;
+        // Line endings (`.gitattributes`): from here on `data` is what is
+        // recorded, and exactly what is scanned, hashed and sealed.
+        let data = match kind {
+            EntryKind::File => self.line_endings(path, parent_file, data)?,
+            _ => data,
+        };
         let content = Object::blob_id(&data);
 
         // The parent's visibility label is a claim (it comes from whoever
@@ -2133,9 +2205,153 @@ impl Builder<'_> {
         sealed: Option<(String, ObjectId)>,
         parent_embargoed: bool,
     ) {
+        // The record describes the bytes on disk: with a line-ending fact
+        // when they hold a CR (and the blob recorded for them, when it is
+        // another).
+        let (content, eol) = match self.eol_now.take() {
+            Some((disk, fact)) => (disk, Some(fact)),
+            None => (content, None),
+        };
         if let (Some(run), Some(m), false) = (self.cache.as_mut(), meta, parent_embargoed) {
-            run.learn(path, m, content, scanned_clean, sealed);
+            run.learn(path, m, content, scanned_clean, sealed, eol);
         }
+    }
+
+    /// The working copy's attributes (read on first use).
+    fn attrs(&mut self) -> &Attrs<'a> {
+        let (store, fs) = (self.store, self.fs);
+        self.attrs.get_or_insert_with(|| Attrs::for_backend(store, fs))
+    }
+
+    /// Is `path` re-recorded by `vl renormalize` in this build?
+    fn renormalizing(&self, path: &VPath) -> bool {
+        matches!(self.opts.line_endings, LineEndings::Renormalize(f) if f(path))
+    }
+
+    /// The bytes recorded for working-copy file `path` whose content on
+    /// disk is `raw`, given its parent entry (see the module
+    /// documentation): `raw` itself unless it holds a CR; the parent's
+    /// version when `raw` still stands for it (unchanged, or the CRLF
+    /// rendering checkout wrote for it), so no attribute change re-records
+    /// a file; else `raw` normalised (CRLF → LF) when the attributes ask
+    /// for it and that is lossless. Sets `eol_now` for the stat cache.
+    fn line_endings(&mut self, path: &VPath, parent_file: Option<&TreeEntry>, raw: Vec<u8>) -> Result<Vec<u8>> {
+        self.eol_now = None;
+        if matches!(self.opts.line_endings, LineEndings::Off) || memchr::memchr(b'\r', &raw).is_none() {
+            return Ok(raw);
+        }
+        let renorm = self.renormalizing(path);
+        let conv = self.attrs().for_path(path).conversion;
+        let code = self.attrs().fingerprint(path);
+        let disk = Object::blob_id(&raw);
+        // What `vl renormalize` would record for `raw`.
+        let renormalised = |raw: &[u8]| match to_odb(raw, conv, || false) {
+            ToOdb::Converted(v) => v,
+            _ => raw.to_vec(),
+        };
+        if !renorm {
+            if let Some(pe) = parent_file {
+                let unchanged = pe.fallback == Some(disk) || matches_quietly(self.store, &pe.id, &raw);
+                if unchanged {
+                    let renormalize = renormalised(&raw) != raw;
+                    if renormalize {
+                        self.report.renormalizable.push(path.clone());
+                    }
+                    self.eol_now = Some((
+                        disk,
+                        EolFact {
+                            attributes: code,
+                            renormalize,
+                            recorded: None,
+                        },
+                    ));
+                    return Ok(raw);
+                }
+                if self.opts.materialised.is_some_and(|m| m.wrote_crlf(path)) {
+                    for v in self.shown_versions(pe) {
+                        if lf_to_crlf(&v) == raw {
+                            let renormalize = renormalised(&raw) != v;
+                            if renormalize {
+                                self.report.renormalizable.push(path.clone());
+                            }
+                            self.eol_now = Some((
+                                disk,
+                                EolFact {
+                                    attributes: code,
+                                    renormalize,
+                                    recorded: Some(Object::blob_id(&v)),
+                                },
+                            ));
+                            return Ok(v);
+                        }
+                    }
+                }
+            }
+        }
+        // Git's "safer autocrlf": under `text=auto` a file recorded with a
+        // CR is never normalised by an edit (only by `vl renormalize`).
+        let store = self.store;
+        let recorded_has_cr = || {
+            !renorm
+                && parent_file
+                    .and_then(|pe| store.read_entry(pe).ok())
+                    .is_some_and(|b| memchr::memchr(b'\r', &b).is_some())
+        };
+        let (data, recorded) = match to_odb(&raw, conv, recorded_has_cr) {
+            ToOdb::Unchanged => (raw, None),
+            ToOdb::Converted(v) => {
+                let id = Object::blob_id(&v);
+                (v, Some(id))
+            }
+            ToOdb::Lossy(why) => {
+                self.report.line_endings.push((
+                    path.clone(),
+                    format!("{why}; recorded unchanged (`.gitattributes` asks for LF line endings, and converting would change more than the line endings)"),
+                ));
+                (raw, None)
+            }
+        };
+        self.eol_now = Some((
+            disk,
+            EolFact {
+                attributes: code,
+                renormalize: false,
+                recorded,
+            },
+        ));
+        Ok(data)
+    }
+
+    /// The versions of `e` a reader may have been shown in the working
+    /// copy: its content if readable, and its fallback.
+    fn shown_versions(&self, e: &TreeEntry) -> Vec<Vec<u8>> {
+        let mut v = Vec::new();
+        if let Ok(d) = self.store.read_blob(&e.id) {
+            v.push(d);
+        }
+        if let Some(fb) = e.fallback {
+            if let Ok(d) = self.store.read_blob(&fb) {
+                v.push(d);
+            }
+        }
+        v
+    }
+
+    /// Does working-copy content `raw` at `path` stand for recorded content
+    /// `want`: the same bytes, the CRLF rendering checkout wrote for it, or
+    /// bytes the attributes normalise to it?
+    fn disk_stands_for(&mut self, path: &VPath, raw: &[u8], want: &[u8]) -> bool {
+        if raw == want {
+            return true;
+        }
+        if matches!(self.opts.line_endings, LineEndings::Off) || memchr::memchr(b'\r', raw).is_none() {
+            return false;
+        }
+        if self.opts.materialised.is_some_and(|m| m.wrote_crlf(path)) && lf_to_crlf(want) == raw {
+            return true;
+        }
+        let conv = self.attrs().for_path(path).conversion;
+        matches!(to_odb(raw, conv, || memchr::memchr(b'\r', want).is_some()), ToOdb::Converted(v) if v == want)
     }
 
     /// The entry for an unchanged file, built from cached content facts
@@ -2154,6 +2370,14 @@ impl Builder<'_> {
         let Some(rec) = self.cache.as_ref().and_then(|c| c.trusted(path, meta)).cloned() else {
             return Ok(None);
         };
+        // Content holding a CR: its facts only hold for the parent entry
+        // they were learned against and the attributes then in force (the
+        // file is read again otherwise, once).
+        if let Some(f) = &rec.eol {
+            if self.renormalizing(path) || f.attributes != self.attrs().fingerprint(path) {
+                return Ok(None);
+            }
+        }
         // Only cloaked entries carry a fallback here (a sealed edit of a
         // public file); embargoed ones never come from the cache.
         let fallback = match desired {
@@ -2165,7 +2389,7 @@ impl Builder<'_> {
         };
         let entry = match desired {
             Visibility::Public => {
-                let id = rec.content;
+                let id = rec.eol.as_ref().and_then(|f| f.recorded).unwrap_or(rec.content);
                 match same_as_parent(&id) {
                     // Same rule as the uncached path: unchanged public content
                     // was scanned when it entered the parent.
@@ -2187,7 +2411,14 @@ impl Builder<'_> {
             },
             Visibility::Embargoed { .. } => None,
         };
+        let entry = match (&rec.eol, entry) {
+            (Some(_), Some(e)) if !parent_file.is_some_and(|pe| *pe == e) => None,
+            (_, e) => e,
+        };
         if entry.is_some() {
+            if rec.eol.as_ref().is_some_and(|f| f.renormalize) {
+                self.report.renormalizable.push(path.clone());
+            }
             self.report.cache_hits += 1;
             if let Some(run) = self.cache.as_mut() {
                 run.keep(path, rec);
@@ -2222,4 +2453,10 @@ impl Builder<'_> {
             Err(e) => Err(e),
         }
     }
+}
+
+/// Is `raw` the content of object `id` (an unreadable or missing object is
+/// not)?
+fn matches_quietly(store: &ObjectStore, id: &ObjectId, raw: &[u8]) -> bool {
+    store.matches_encoding(id, raw).unwrap_or(false)
 }

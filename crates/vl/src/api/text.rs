@@ -182,6 +182,12 @@ pub fn status(s: &Status) {
             dim("hint:")
         );
     }
+    if !s.renormalizable.is_empty() {
+        println!(
+            "{} file(s) would change line endings (`.gitattributes` asks for other line endings than they were recorded with); run `vl renormalize` to re-record them",
+            s.renormalizable.len()
+        );
+    }
 }
 
 // ---- log -------------------------------------------------------------------------
@@ -384,11 +390,12 @@ pub fn diff(repo: &Repo, from: &ObjectId, to: &ObjectId, stat: bool, r: &Renames
         changes_summary_with(&summary, true);
         return Ok(());
     }
+    let attrs = crate::api::diff_attrs(repo);
     for c in &items {
         if stdout_closed() {
             break;
         }
-        file_diff_text(&item_diff_for_text(repo, c));
+        file_diff_text(&item_diff_for_text(repo, c, &attrs));
     }
     Ok(())
 }

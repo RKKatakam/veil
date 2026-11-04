@@ -1991,6 +1991,15 @@ attached.
   cannot stat *the* file it wrote, so a concurrent edit between the write and
   the stat would be recorded under the checked-out content. Written files are
   re-read once by the next snapshot instead.
+* **Line endings** (§16). A record of content holding a CR also keeps an
+  `EolFact`: a fingerprint of the `.gitattributes` files the path is under
+  (a hash of their bytes, so checking it parses nothing), whether `vl
+  renormalize` would change the file, and the blob recorded for it when
+  that is not the content itself (a CRLF copy of an LF version). `content`
+  is always the blob id of the bytes on disk, which checkout's `holds` and
+  the sandbox's reflink clones rely on. Such a record is trusted only for
+  the same fingerprint and only to keep the parent entry; anything else
+  re-reads the file once.
 * The cache is binary with a trailing BLAKE3 checksum. A missing, corrupt or
   foreign-version cache is just empty. It only accelerates; failing to save
   it is a warning.
@@ -3655,6 +3664,84 @@ and can read what the user can: that is the documented trust boundary.
 through the engine, not through `cmd_commit`, and `vl` inside a sandbox
 finds no repository (`find_root`). `push --dry-run` runs nothing.
 
+## 16. Attributes and line endings (`attributes.rs`)
+
+Feature 7 of the Git-parity round (design and threat review:
+`docs/design/git-parity/7-attributes-line-endings.md`; user guide:
+`docs/guide/line-endings-and-attributes.md`). No format change:
+`.gitattributes` is a tracked file, and conversion only decides which
+bytes are recorded and written.
+
+**Reading.** `attributes::Attrs` reads `.gitattributes` itself, lazily:
+only the directories of the paths asked about, each file once
+(`AttrSource`: a working copy's backend, never through a symlink, or a
+recorded tree, where a file the reader cannot open counts as absent with a
+warning), and parses a file only when an attribute is asked for. The
+device-local `.veil/local/attributes` (`ObjectStore::local_attributes`) has
+the highest priority. Matching ports Git's `wildmatch.c` and `attr.c`
+exactly (basename versus pathname patterns, `**` rules, `[attr]` macros
+from the top level only, the built-in `binary`, `!name`, the precedence of
+deeper files and later lines), checked by a differential test against `git
+check-attr` on generated trees (`tests/attributes_git.rs`). Exact names
+and `*suffix` patterns are indexed, so a megabyte of them costs a lookup
+little. Limits: 1 MiB per file (ignored as a whole), Git's 2 048 bytes per
+line.
+
+**Conversion** (`Conversion`, `to_odb`, `to_worktree`) follows Git's
+`convert.c` with `core.autocrlf=false` and LF native, with one deviation:
+`to_odb` refuses a lossy conversion (`ToOdb::Lossy`: a lone CR, or CRLF
+mixed with lone LF), which Git performs with a warning.
+
+* **Recording** (`builder::Builder::line_endings`, before hashing,
+  scanning and sealing, on the one buffer). A file holding no CR costs
+  nothing. A file that still stands for its parent entry keeps it (its
+  bytes, or the CRLF rendering checkout wrote for it, `Materialised::crlf`),
+  whatever the attributes now say: changing `.gitattributes` never
+  re-records a file (`BuildReport::renormalizable` lists those a
+  renormalisation would change). Otherwise the attributes of the working
+  copy decide. `LineEndings::Off` (Git imports, `vl am`) records bytes as
+  they are; `LineEndings::Renormalize` (`vl renormalize`, an operation of
+  its own) ignores the parent for the paths selected.
+* **Checkout** (`checkout::apply_changes`) converts what it writes with the
+  attributes of the tree it checks out (files, conflict renderings,
+  fallbacks), records each CRLF write in `Materialised` (absent in older
+  records: no conversion assumed), and never reflinks a file it converts.
+  `holds` (may this file be replaced?) accepts the recorded bytes, the CRLF
+  rendering recorded for the path, or bytes the `from` tree's attributes
+  normalise to the version: an attribute change neither wedges an unedited
+  file nor hides an edit.
+* **Conflicts.** Markers are rendered on LF content and converted for the
+  working copy; the builder undoes the conversion before comparing or
+  parsing a copy back.
+* **Export.** The Git bridge exports recorded blobs as they are (Git
+  applies its own `.gitattributes` at checkout), so blob ids are those of
+  the recorded bytes.
+
+**Diff and merge.** `-diff`/`binary` make `vl diff` and `show`
+show binary (`api::content`, attributes of the working copy, as Git) and
+`format-patch` write `Binary files … differ` (attributes of the patched
+side's projection for the public audience, without the local file: a
+sealed `.gitattributes` never shapes a public patch; only regular files
+are written as binary, and a rename's destination decides). In `merge.rs`
+stream R's `content_merge` seam picks the content merge (`strategy`,
+`attribute_merge`) from the attributes of `ours` with the followed renames
+applied, so a renamed file merges under the attributes of its new path: `Binary` (whole-file conflict), `Union`
+(`textmerge::merge_union`), a device driver, or the built-in line merge.
+A driver or union gets the base only when `base_shown` (its audience is
+the result's), never runs across an `audience_clash`, and its output is
+sealed by `merged_visibility`. A virtual merge base never runs a driver.
+
+**Drivers are device-local.** `.gitattributes` only names a driver. The
+engine knows only what the device registered on the store
+(`DeviceDrivers`, `ObjectStore::set_device_drivers`); the CLI registers
+`attr_cmd::LocalDrivers` from `$VEIL_HOME/config.toml` and
+`.veil/local/config.toml`, and nothing else. Its runner follows the hooks
+trust model (§15): a program on a cleaned `PATH` or absolute, never inside
+the project; scrubbed environment; `vl`'s process group (Ctrl-C stops
+both); 60 s limit; merge
+inputs in a fresh 0700 directory under `.veil/local/tmp/`, removed
+afterwards; textconv input on stdin, output never stored.
+
 ## Threat model
 
 **Protected against:**
@@ -3842,6 +3929,12 @@ finds no repository (`find_root`). `push --dry-run` runs nothing.
   itself is never a mount. (The WASM build of `veil-core` exists, §13; a
   browser front-end on it, a persistent browser `StorageBackend` and a
   lock that works across tabs do not yet.)
+* Attributes (§16): `filter`, `ident` and `working-tree-encoding` are not
+  supported (bytes are recorded as they are on disk); the FUSE mount shows
+  recorded line endings (no conversion on read); a converted file
+  (`eol=crlf` on disk) is cached through its `EolFact` but checkout never
+  reflinks it; mixed-ending files are recorded unchanged where Git would
+  normalise them; patterns match case-sensitively on every device.
 * Git interop: Git tags (annotated or not) are not imported or exported,
   only branches; Git authors' time zones are not kept (export writes UTC);
   carry-over of Git-only paths follows the first parent only; `vl git`

@@ -61,8 +61,8 @@ Global options (accepted by every command):
 | [`vl ignore`](ignore.md) | Do not track matching paths at all |
 | [`vl policy`](policy.md) | Inspect the visibility policy |
 | [`vl scan`](scan.md) | Scan the working copy for secrets that would become public |
-| [`vl attr`](attr.md) | Per-path attributes from `.gitattributes`: line endings, binary files, diff and merge drivers (not implemented yet) |
-| [`vl renormalize`](renormalize.md) | Re-record files whose line endings `.gitattributes` now says to convert (not implemented yet) |
+| [`vl attr`](attr.md) | Per-path attributes from `.gitattributes`: line endings, binary files, diff and merge drivers |
+| [`vl renormalize`](renormalize.md) | Re-record files with the line endings `.gitattributes` asks for now (changing `.gitattributes` alone never re-records a file). `vl undo` reverts it |
 | [`vl secret`](secret.md) | Encrypted secrets: the device-local vault, or a scope's team vault (`--scope`), shared with the scope's members through team remotes |
 | [`vl run`](run.md) | Run a command with vault secrets injected as environment variables |
 | [`vl identity`](identity.md) | Your public-key identity |
@@ -87,5 +87,5 @@ Global options (accepted by every command):
 | [`vl man`](man.md) | Print the man page (`vl man \| man -l -`), or write one page per command into DIR |
 
 The read commands (`status`, `log`, `diff`, `show`, `workspace list`, `tag list`, `op log`,
-`scan`, `secret list`, `ls`, `resolve --list`, `blame`, `grep`) take `--json`, and so do `split`,
+`scan`, `secret list`, `ls`, `resolve --list`, `blame`, `grep`, `attr check`) take `--json`, and so do `split`,
 `squash`, `duplicate` and `cherry-pick`: their schemas are in [JSON output](json.md).

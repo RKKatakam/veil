@@ -376,6 +376,49 @@ fn create_patch_within<'a>(old: &'a str, new: &'a str, scratch: &'a mut String, 
     diffy::Patch::from_str(scratch).unwrap_or_else(|_| diffy::create_patch(old, new))
 }
 
+/// The union merge of `ours` and `theirs` from `base` (`.gitattributes`
+/// `merge=union`): the line merge, where each conflicting hunk takes ours'
+/// lines followed by theirs'. Never fails, and never holds a line only the
+/// base has (the base's section of a conflict is dropped).
+pub fn merge_union(base: &[u8], ours: &[u8], theirs: &[u8]) -> Vec<u8> {
+    // Markers long enough to appear in no input, so the conflict blocks can
+    // be cut out unambiguously (as `merge::merge_keeping_base` does).
+    let longest_run = [base, ours, theirs]
+        .iter()
+        .flat_map(|x| x.chunk_by(|a, b| a == b))
+        .filter(|run| matches!(run[0], b'<' | b'=' | b'>'))
+        .map(|run| run.len())
+        .max()
+        .unwrap_or(0);
+    let n = longest_run.max(63) + 1;
+    let marker = |c: u8, label: &[u8]| {
+        let mut m = vec![c; n];
+        m.extend_from_slice(label);
+        m.push(b'\n');
+        m
+    };
+    let (start, mid, end) = (marker(b'<', b" ours"), marker(b'=', b""), marker(b'>', b" theirs"));
+    let merged = match merge(base, ours, theirs, n, Style::Merge) {
+        Ok(m) => return m,
+        Err(m) => m,
+    };
+    let find = |hay: &[u8], needle: &[u8]| memchr::memmem::find(hay, needle);
+    let mut out = Vec::with_capacity(merged.len());
+    let mut rest = merged.as_slice();
+    while let Some(i) = find(rest, &start) {
+        out.extend_from_slice(&rest[..i]);
+        rest = &rest[i + start.len()..];
+        let Some(m) = find(rest, &mid) else { break };
+        out.extend_from_slice(&rest[..m]);
+        rest = &rest[m + mid.len()..];
+        let Some(e) = find(rest, &end) else { break };
+        out.extend_from_slice(&rest[..e]);
+        rest = &rest[e + end.len()..];
+    }
+    out.extend_from_slice(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
