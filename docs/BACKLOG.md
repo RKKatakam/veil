@@ -53,6 +53,15 @@ fixed**. Severity: high / medium / low.
 - **A hostile SFTP server can still force up to the 4 GiB read ceiling**
   (`VEIL_SFTP_MAX_FILE`), since sizes come from the server.
 
+## Optional (owner: "nice to have, not needed")
+
+- **Scope governance:** a rogue or departed sole admin can revoke everyone;
+  recovery today is manual (new scope, re-cloak, rotate real secrets).
+  Possible additions: hold suspicious ring changes for `vl scope accept`,
+  two-admin approval for admin revocations, a minimum admin count, a
+  break-glass offline recovery identity, and a `vl scope recover` command
+  that automates the re-key. Belongs with the Veil Hub's organisation model.
+
 ## Performance
 
 - **`gc` always rewrites everything into one in-memory pack;** no
