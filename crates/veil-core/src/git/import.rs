@@ -184,6 +184,7 @@ impl GitBridge {
                 cloak: None,
                 injected: None,
                 rescan: false,
+                materialised: None,
             },
         )?;
         for (g, v) in fs.learned.into_inner().unwrap() {
@@ -199,6 +200,11 @@ impl GitBridge {
         }
         for (p, why) in &build.cloak_failures {
             report.left_in_git.insert(p.to_string(), why.clone());
+        }
+        for (p, embargo) in &build.held_back {
+            report
+                .left_in_git
+                .insert(p.to_string(), format!("held back: embargo {embargo} hides this line's current content"));
         }
         for p in build.unrepresentable.iter().chain(fs.special.into_inner().unwrap().iter()) {
             report.left_in_git.insert(p.clone(), "not representable in Veil".into());

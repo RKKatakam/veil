@@ -4,6 +4,13 @@
 //! The session owns the project directory's stat cache
 //! (`.veil/local/statcache/<workspace>.cache`). It is loaded once, used by
 //! every snapshot and checkout of the session, and saved only when it changed.
+//!
+//! It also keeps the record of what the directory was materialised from
+//! (`checkout.json`, [`Materialised`]): files left out because they were
+//! unreadable, files written from an embargo fallback. Every command fills
+//! in whatever has become readable since, before it snapshots and again when
+//! it finishes, so a grant or an embargo release is never recorded as a
+//! deletion or a revert.
 
 use std::{
     path::{Path, PathBuf},
@@ -14,13 +21,15 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use veil_core::{
     builder::BuildReport,
+    checkout::{CheckoutReport, Materialised},
+    workspace::SnapshotOptions,
     repo::{DEFAULT_WORKSPACE, VEIL_DIR},
     revset,
     statcache::{cache_path, StatCache},
     DiskBackend, Identity, ObjectId, Repo, StorageBackend, VPath,
 };
 
-use crate::render::{self, warn};
+use crate::render::{self, safe, warn, warn_untrusted};
 
 pub fn veil_home() -> PathBuf {
     if let Some(h) = std::env::var_os("VEIL_HOME") {
@@ -81,12 +90,26 @@ pub fn user_for(id: &Identity) -> String {
     std::env::var("VEIL_USER").unwrap_or_else(|_| id.name.clone())
 }
 
-/// Which workspace the project directory is attached to, and which snapshot
-/// was last materialised there. Device-local.
+/// Which workspace the project directory is attached to, which snapshot
+/// was last materialised there, and what was materialised from what (files
+/// left out because they were unreadable, files written from an embargo
+/// fallback; see [`Materialised`]). Device-local.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CheckoutState {
     pub workspace: String,
     pub snapshot: ObjectId,
+    #[serde(default, skip_serializing_if = "Materialised::is_empty")]
+    pub materialised: Materialised,
+}
+
+impl CheckoutState {
+    pub fn new(workspace: &str, snapshot: ObjectId, materialised: Materialised) -> CheckoutState {
+        CheckoutState {
+            workspace: workspace.to_string(),
+            snapshot,
+            materialised,
+        }
+    }
 }
 
 pub fn checkout_path() -> VPath {
@@ -138,10 +161,7 @@ impl Ctx {
         }
         let checkout = match fs.read_opt(&checkout_path())? {
             Some(raw) => serde_json::from_slice(&raw)?,
-            None => CheckoutState {
-                workspace: DEFAULT_WORKSPACE.into(),
-                snapshot: repo.workspace_wc(DEFAULT_WORKSPACE)?,
-            },
+            None => CheckoutState::new(DEFAULT_WORKSPACE, repo.workspace_wc(DEFAULT_WORKSPACE)?, Materialised::default()),
         };
         let cache = StatCache::load(&*fs, &cache_path(&checkout.workspace));
         let mut ws = checkout.workspace.clone();
@@ -153,7 +173,7 @@ impl Ctx {
                 .next()
                 .cloned()
                 .ok_or_else(|| anyhow!("repository has no workspaces"))?;
-            warn(&format!("workspace '{ws}' no longer exists; attaching to '{fallback}'"));
+            warn_untrusted(&format!("workspace '{ws}' no longer exists; attaching to '{fallback}'"));
             ws = fallback;
         }
         let mut ctx = Ctx {
@@ -181,9 +201,25 @@ impl Ctx {
 
     /// Record the project directory into the attached workspace.
     pub fn snapshot(&mut self) -> Result<()> {
+        self.record(None)
+    }
+
+    /// Record the project directory as operation `description`: for commands
+    /// that edit the working copy themselves (`vl expose`, `vl restore`, …),
+    /// so that `vl undo` reverts them instead of skipping them as the
+    /// user's uncommitted edits.
+    pub fn snapshot_as(&mut self, description: String) -> Result<()> {
+        self.record(Some(description))
+    }
+
+    fn record(&mut self, description: Option<String>) -> Result<()> {
         let view_wc = self.wc()?;
         let disk = self.fs.clone();
         let fs: &dyn StorageBackend = &*disk;
+        // Whatever became readable since the directory was materialised
+        // (a grant, an embargo release) is filled in first; otherwise the
+        // snapshot would record it as deleted, or reverted to the fallback.
+        self.fill_in()?;
         let stale = self.checkout.workspace != self.ws
             || (self.checkout.snapshot != view_wc && self.repo.store().has(&self.checkout.snapshot));
         if stale {
@@ -193,11 +229,12 @@ impl Ctx {
             let base = self.checkout.snapshot;
             let base_snap = self.repo.snapshot(&base)?;
             let target_tree = self.repo.snapshot(&view_wc)?.tree;
-            let (tree, report) = self.repo.build_from_cached(
+            let (tree, report) = self.repo.build_from_recorded(
                 fs,
                 Some(base_snap.tree),
                 base_snap.cloak.as_deref(),
                 Some(&mut self.cache),
+                Some(&self.checkout.materialised),
             )?;
             let mut from = base_snap.tree;
             if tree == target_tree {
@@ -217,20 +254,27 @@ impl Ctx {
             print_working_copy_warnings(&report);
             self.report = report;
             let to = self.repo.snapshot(&view_wc)?.tree;
-            let co = self.repo.checkout_tree_cached(fs, Some(&from), &to, Some(&mut self.cache))?;
+            let mut record = std::mem::take(&mut self.checkout.materialised);
+            let co = self
+                .repo
+                .checkout_tree_recorded(fs, Some(&from), &to, &mut record, Some(&mut self.cache))?;
             print_kept_local(&co.kept_local);
             print_blocked(&co.blocked);
-            self.checkout = CheckoutState {
-                workspace: self.ws.clone(),
-                snapshot: view_wc,
-            };
+            self.checkout = CheckoutState::new(&self.ws, view_wc, record);
             save_checkout(&self.fs, &self.checkout)?;
             self.save_cache();
             return Ok(());
         }
-        let out = self
-            .repo
-            .snapshot_workspace_cached(&self.ws, fs, Some(&mut self.cache))?;
+        let out = self.repo.snapshot_workspace_with(
+            &self.ws,
+            fs,
+            SnapshotOptions {
+                cache: Some(&mut self.cache),
+                materialised: Some(&self.checkout.materialised),
+                description,
+                ..Default::default()
+            },
+        )?;
         self.save_cache();
         self.repo.capture_local_files(fs, &out.report)?;
         render::print_build_warnings(&out.report);
@@ -243,28 +287,56 @@ impl Ctx {
         Ok(())
     }
 
+    /// Materialise what was unreadable when the directory was checked out
+    /// and is readable now (see [`Materialised::fill_in`]). Local edits are
+    /// never overwritten.
+    fn fill_in(&mut self) -> Result<()> {
+        if self.checkout.materialised.is_empty() || !self.repo.store().has(&self.checkout.snapshot) {
+            return Ok(());
+        }
+        let tree = self.repo.snapshot(&self.checkout.snapshot)?.tree;
+        let mut record = self.checkout.materialised.clone();
+        let co = self
+            .repo
+            .fill_in_materialised(&*self.fs, &tree, &mut record, Some(&mut self.cache))?;
+        if record != self.checkout.materialised {
+            self.checkout.materialised = record;
+            save_checkout(&self.fs, &self.checkout)?;
+            self.save_cache();
+        }
+        print_filled_in(&co);
+        Ok(())
+    }
+
     /// Bring the project directory in line with the attached workspace.
     pub fn finish(&mut self) -> Result<()> {
         let target = self.wc()?;
-        if target == self.checkout.snapshot && self.checkout.workspace == self.ws {
+        let moved = target != self.checkout.snapshot || self.checkout.workspace != self.ws;
+        if !moved && self.checkout.materialised.is_empty() {
             return Ok(());
+        }
+        if !moved {
+            // Same snapshot, but this command may have made more of it
+            // readable (`vl pull` brought a grant, `vl embargo release`).
+            return self.fill_in();
         }
         let from = self.repo.snapshot(&self.checkout.snapshot)?.tree;
         let to_snap = self.repo.snapshot(&target)?;
         let previous = self.checkout.snapshot;
-        let report = if from != to_snap.tree {
-            Some(
-                self.repo
-                    .checkout_tree_cached(&*self.fs, Some(&from), &to_snap.tree, Some(&mut self.cache))?,
-            )
+        let mut record = std::mem::take(&mut self.checkout.materialised);
+        let report = if from != to_snap.tree || !record.is_empty() {
+            Some(self.repo.checkout_tree_recorded(
+                &*self.fs,
+                Some(&from),
+                &to_snap.tree,
+                &mut record,
+                Some(&mut self.cache),
+            )?)
         } else {
             None
         };
         // Persist the pointer before printing anything.
-        self.checkout = CheckoutState {
-            workspace: self.ws.clone(),
-            snapshot: target,
-        };
+        self.checkout = CheckoutState::new(&self.ws, target, record);
         save_checkout(&self.fs, &self.checkout)?;
         self.save_cache();
         if let Some(r) = report {
@@ -272,10 +344,18 @@ impl Ctx {
                 eprintln!("Updated {} files, removed {}", r.written, r.removed);
             }
             for p in &r.redacted {
-                eprintln!("  {} {p} (no key; left out of the working copy)", render::yellow("redacted"));
+                eprintln!(
+                    "  {} {} (no key; left out of the working copy)",
+                    render::yellow("redacted"),
+                    safe(p.as_str())
+                );
             }
             for p in &r.protected {
-                eprintln!("  {} {p} (local-only file kept as is)", render::yellow("protected"));
+                eprintln!(
+                    "  {} {} (local-only file kept as is)",
+                    render::yellow("protected"),
+                    safe(p.as_str())
+                );
             }
             print_kept_local(&r.kept_local);
             print_blocked(&r.blocked);
@@ -319,36 +399,52 @@ impl Ctx {
 }
 
 /// Things in the working copy a snapshot could not record. Never fatal, never
-/// silent.
+/// silent. Paths and reasons come from the working copy (or a tree), so they
+/// are escaped.
 pub fn print_working_copy_warnings(r: &BuildReport) {
     for (p, why) in &r.unreadable {
-        warn(&format!(
+        warn_untrusted(&format!(
             "skipped {p}: cannot read it ({why}); its last recorded version, if any, is kept. Fix its permissions or `vl ignore {p}`"
         ));
     }
     for name in &r.unrepresentable {
-        warn(&format!(
+        warn_untrusted(&format!(
             "skipped {name}: the file name is not valid UTF-8, so Veil cannot record it. Rename it to keep it under version control"
         ));
     }
     for p in &r.shadowed {
-        warn(&format!(
+        warn_untrusted(&format!(
             "{p} is tracked but is now a symlink or special file; Veil never follows it and keeps the recorded version"
         ));
     }
     for (a, b) in &r.name_collisions {
-        warn(&format!(
+        warn_untrusted(&format!(
             "{a} and {b} differ only in case or Unicode normalisation; a checkout on a case-insensitive \
              filesystem (macOS by default) will refuse this snapshot. Rename one of them"
         ));
     }
 }
 
+/// Report files that became readable and were materialised.
+fn print_filled_in(r: &CheckoutReport) {
+    if r.written + r.removed > 0 {
+        eprintln!(
+            "{} {} file(s) that became readable (a key arrived or an embargo was released), removed {}",
+            render::green("Filled in"),
+            r.written,
+            r.removed
+        );
+    }
+    print_kept_local(&r.kept_local);
+    print_blocked(&r.blocked);
+}
+
 fn print_blocked(paths: &[VPath]) {
     for p in paths {
         eprintln!(
-            "  {} {p} (a symlink or special file is in the way; Veil never writes through or over it)",
-            render::yellow("skipped")
+            "  {} {} (a symlink or special file is in the way; Veil never writes through or over it)",
+            render::yellow("skipped"),
+            safe(p.as_str())
         );
     }
 }
@@ -356,8 +452,9 @@ fn print_blocked(paths: &[VPath]) {
 fn print_kept_local(paths: &[VPath]) {
     for p in paths {
         eprintln!(
-            "  {} {p} (local edit not in history, e.g. quarantined; left as is instead of being overwritten)",
-            render::yellow("kept")
+            "  {} {} (local edit not in history, e.g. quarantined; left as is instead of being overwritten)",
+            render::yellow("kept"),
+            safe(p.as_str())
         );
     }
 }

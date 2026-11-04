@@ -350,6 +350,18 @@ impl Repo {
         Ok(())
     }
 
+    /// Read-modify-write `.veil/repo.json` under the repository lock, so
+    /// concurrent edits (two `vl remote add`) cannot lose one another: `f`
+    /// sees the configuration as currently on disk, not this handle's copy.
+    /// Nothing is written if `f` fails.
+    pub fn update_config<T>(&mut self, f: impl FnOnce(&mut RepoConfig) -> Result<T>) -> Result<T> {
+        let _lock = RepoLock::acquire(self.backend.clone())?;
+        let mut config = read_config(&*self.backend)?;
+        let out = f(&mut config)?;
+        self.save_config(config)?;
+        Ok(out)
+    }
+
     /// Repository format (see [`REPO_FORMAT`]).
     pub fn format(&self) -> u32 {
         self.config.format

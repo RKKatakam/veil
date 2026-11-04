@@ -240,7 +240,15 @@ vl cloak secrets/                                # Veil-only from here on
 vl tag set main -r @-
 vl git push                                      # tags → branches; GitHub sees what a public remote would
 vl git pull                                      # commits made on GitHub become snapshots; tags fast-forward
+vl rebase -d main                                # like after `vl pull`: move your working copy onto the new main
 ```
+
+Like `vl pull`, `vl git pull` moves tags, never your working copy: that is
+a change of your own, and moving it would rewrite it under you. Rebase it
+(`vl rebase -d main`) or start a new one (`vl new main`) when you want the
+pulled commits on disk. Anything that became readable meanwhile (a scope
+grant, a released embargo) is filled into the working copy by every
+command, pull included.
 
 Git sees exactly what a `--public` Veil remote sees: no cloaked or isolated
 files, no cloaked descriptions (a placeholder instead), no cloaked tags, and

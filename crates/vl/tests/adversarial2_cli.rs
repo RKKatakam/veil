@@ -1,8 +1,8 @@
 //! Round-2 adversarial CLI tests: undo and op restore after commands that
 //! only edit files and let the auto-snapshot record them.
 //!
-//! Every `#[ignore = "BUG-NNN: …"]` test asserts the expected behaviour and
-//! currently fails; see `docs/BUGS.md`.
+//! These were BUG-046 reproductions (fixed): commands that edit the working
+//! copy record their own operation, so `vl undo` reverts them.
 
 mod adversarial_support;
 
@@ -33,7 +33,6 @@ fn tier_of(files: &[(String, String)], path: &str) -> Option<String> {
 /// (here the commit), says so, and the exposure stays: the next commit and
 /// push publish the formerly cloaked files.
 #[test]
-#[ignore = "BUG-046: vl undo cannot undo expose/cloak/isolate/ignore/restore; it silently undoes the command before"]
 fn undo_reverts_an_accidental_expose() {
     let env = Env::new();
     let proj = env.project(
@@ -62,7 +61,6 @@ fn undo_reverts_an_accidental_expose() {
 /// last command). Instead undo reverts an earlier command and the discarded
 /// edit is gone.
 #[test]
-#[ignore = "BUG-046: vl undo cannot undo expose/cloak/isolate/ignore/restore; it silently undoes the command before"]
 fn undo_reverts_a_restore() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("notes.txt", "v1\n")]);
@@ -94,4 +92,19 @@ fn undo_of_a_commit_keeps_later_edits() {
     env.ok("alice", &proj, &["undo"]);
     assert_eq!(read(&proj, "b.txt"), "uncommitted\n");
     assert_eq!(read(&proj, "a.txt"), "2\n");
+}
+
+/// `vl isolate` is undone like any command, and edits made after it stay.
+#[test]
+fn undo_reverts_an_isolate_and_keeps_later_edits() {
+    let env = Env::new();
+    let proj = env.project("alice", "proj", &[("config.yml", "port: 1\n"), ("README", "hi\n")]);
+    env.ok("alice", &proj, &["isolate", "config.yml"]);
+    assert_eq!(tier_of(&recorded(&env, &proj, "@"), "config.yml"), None);
+    write(&proj, "README", "edited after the isolate\n");
+    let undo = env.ok("alice", &proj, &["undo"]);
+    assert!(undo.contains("isolate config.yml"), "{undo}");
+    assert_eq!(tier_of(&recorded(&env, &proj, "@"), "config.yml").as_deref(), Some("public"));
+    assert!(!read(&proj, ".veilpolicy").contains("config.yml"));
+    assert_eq!(read(&proj, "README"), "edited after the isolate\n");
 }

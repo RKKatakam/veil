@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::{
     builder::{build_tree_cached, BuildOptions, BuildReport, InjectedSecrets},
-    checkout::{checkout_cached, CheckoutReport},
+    checkout::{checkout_cached, checkout_recorded, CheckoutReport, Materialised},
     error::{Result, VeilError},
     id::{ChangeId, ObjectId},
     merge::merge_trees,
@@ -24,6 +24,24 @@ use crate::{
     vfs::{OverlayBackend, StorageBackend},
     vpath::VPath,
 };
+
+/// Options of [`Repo::snapshot_workspace_with`].
+#[derive(Default)]
+pub struct SnapshotOptions<'a> {
+    /// Stat cache of `fs` (consulted and updated).
+    pub cache: Option<&'a mut StatCache>,
+    /// Secrets handed to whoever wrote `fs` (see
+    /// [`Repo::snapshot_workspace_injected`]).
+    pub injected: Option<&'a InjectedSecrets>,
+    /// What `fs` was materialised from (see [`BuildOptions::materialised`]).
+    pub materialised: Option<&'a Materialised>,
+    /// Description of the operation. The default is the automatic snapshot
+    /// ([`snapshot_op_description`]), which `undo` skips as "the user's
+    /// uncommitted edits". A command that edits the working copy itself
+    /// (`vl expose`, `vl restore`, …) names its operation instead, so `vl
+    /// undo` reverts that command.
+    pub description: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct WcSnapshot {
@@ -114,7 +132,26 @@ impl Repo {
         cache: Option<&mut StatCache>,
         injected: Option<&InjectedSecrets>,
     ) -> Result<WcSnapshot> {
-        let mut tx = self.transaction(snapshot_op_description(ws))?;
+        self.snapshot_workspace_with(
+            ws,
+            fs,
+            SnapshotOptions {
+                cache,
+                injected,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Record `fs` as the working copy of `ws`, with every option.
+    pub fn snapshot_workspace_with(&mut self, ws: &str, fs: &dyn StorageBackend, opts: SnapshotOptions<'_>) -> Result<WcSnapshot> {
+        let SnapshotOptions {
+            cache,
+            injected,
+            materialised,
+            description,
+        } = opts;
+        let mut tx = self.transaction(description.unwrap_or_else(|| snapshot_op_description(ws)))?;
         let wc_id = tx.view.workspace(ws)?.wc;
         let wc = tx.repo().snapshot(&wc_id)?;
         let policy = Policy::load(fs)?;
@@ -129,6 +166,7 @@ impl Repo {
                 cloak: wc.cloak.as_deref(),
                 injected,
                 rescan,
+                materialised,
             },
             cache,
         )?;
@@ -183,8 +221,33 @@ impl Repo {
         cloak: Option<&str>,
         cache: Option<&mut StatCache>,
     ) -> Result<(ObjectId, BuildReport)> {
+        self.build_from_recorded(fs, parent_tree, cloak, cache, None)
+    }
+
+    /// [`Repo::build_from_cached`] for a working copy materialised as
+    /// `materialised` says (see [`BuildOptions::materialised`]).
+    pub fn build_from_recorded(
+        &self,
+        fs: &dyn StorageBackend,
+        parent_tree: Option<ObjectId>,
+        cloak: Option<&str>,
+        cache: Option<&mut StatCache>,
+        materialised: Option<&Materialised>,
+    ) -> Result<(ObjectId, BuildReport)> {
         let policy = Policy::load(fs)?;
-        build_tree_cached(&self.store, fs, &BuildOptions { policy: &policy, parent_tree, cloak, injected: None, rescan: false }, cache)
+        build_tree_cached(
+            &self.store,
+            fs,
+            &BuildOptions {
+                policy: &policy,
+                parent_tree,
+                cloak,
+                injected: None,
+                rescan: false,
+                materialised,
+            },
+            cache,
+        )
     }
 
     /// Materialise the difference between two trees onto `fs`.
@@ -202,6 +265,35 @@ impl Repo {
         cache: Option<&mut StatCache>,
     ) -> Result<CheckoutReport> {
         checkout_cached(&self.store, fs, from, to, cache)
+    }
+
+    /// [`Repo::checkout_tree_cached`] that keeps `record`, the record of
+    /// what `fs` was materialised from (see [`Materialised`]), up to date:
+    /// on entry it describes `fs` relative to `from`, on return relative to
+    /// `to`. Anything recorded that has become readable is filled in.
+    pub fn checkout_tree_recorded(
+        &self,
+        fs: &dyn StorageBackend,
+        from: Option<&ObjectId>,
+        to: &ObjectId,
+        record: &mut Materialised,
+        cache: Option<&mut StatCache>,
+    ) -> Result<CheckoutReport> {
+        checkout_recorded(&self.store, fs, from, to, record, cache)
+    }
+
+    /// Materialise what `record` says is missing from `fs` (or shown as an
+    /// embargo fallback) relative to `tree`, where this reader can now read
+    /// it: a scope key arrived, an embargo was released. Local edits are
+    /// never overwritten. See [`Materialised::fill_in`].
+    pub fn fill_in_materialised(
+        &self,
+        fs: &dyn StorageBackend,
+        tree: &ObjectId,
+        record: &mut Materialised,
+        cache: Option<&mut StatCache>,
+    ) -> Result<CheckoutReport> {
+        record.fill_in(&self.store, fs, tree, cache)
     }
 
     /// A read-only VFS view of a snapshot's tree.
@@ -251,6 +343,7 @@ impl Repo {
                 cloak: parent.cloak.as_deref(),
                 injected,
                 rescan: false,
+                materialised: None,
             },
             None,
         )?;
