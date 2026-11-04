@@ -19,6 +19,7 @@ trimmed where marked (`…`); some paths and host names were shortened
 | 7. [Teams and remotes](teams-and-remotes.md) | You share a repository with teammates, over a path or SSH |
 | 8. [Maintenance](maintenance.md) | Housekeeping: `gc`, `fsck`, `doctor`, `upgrade`, backups, recovery |
 | 9. [Troubleshooting and FAQ](troubleshooting.md) | A command printed a warning or an error you want explained |
+| 10. [Scripting with `--json`](scripting.md) | An editor, CI job, agent or script needs `vl`'s output as data |
 
 The [command reference](../reference/README.md) lists every command and
 flag. It is generated from `vl` itself and cannot drift from it.

@@ -1,0 +1,385 @@
+<!-- Written by hand (not generated). crates/vl/tests/json_cli.rs checks that
+     every field of every schema is documented here. -->
+
+# JSON output
+
+The read commands take `--json` and then print one JSON document instead of
+text:
+
+| Command | Schema |
+|---|---|
+| [`vl status`](status.md) | [`veil.status/1`](#veilstatus1) |
+| [`vl log`](log.md) | [`veil.log/1`](#veillog1) |
+| [`vl diff`](diff.md) | [`veil.diff/1`](#veildiff1) |
+| [`vl show`](show.md) | [`veil.show/1`](#veilshow1) |
+| [`vl workspace list`](workspace.md#vl-workspace-list) | [`veil.workspace.list/1`](#veilworkspacelist1) |
+| [`vl tag list`](tag.md#vl-tag-list) | [`veil.tag.list/1`](#veiltaglist1) |
+| [`vl op log`](op.md#vl-op-log) | [`veil.op.log/1`](#veiloplog1) |
+| [`vl scan`](scan.md) | [`veil.scan/1`](#veilscan1) |
+| [`vl secret list`](secret.md#vl-secret-list) | [`veil.secret.list/1`](#veilsecretlist1) |
+| any of them, on failure | [`veil.error/1`](#veilerror1) |
+
+```sh
+vl status --json | jq -r '.changes[] | "\(.status) \(.path)"'
+vl log -n 20 --json | jq -r '.entries[] | select(.empty | not) | .change_short'
+vl diff --json | jq '[.files[].content.hunks[].lines[] | select(.kind == "added")] | length'
+```
+
+Every other flag of the command works as without `--json` (`vl log -n 5
+--json`, `vl diff --from main --stat --json`), and so do the global ones:
+like every command, a read command first snapshots the working copy unless
+`--no-snapshot` is given.
+
+## Conventions
+
+* **One document per invocation**, on one line of standard output, followed
+  by a newline. Nothing else is written to standard output. Warnings,
+  progress and errors still go to standard error, as without `--json`.
+* **`schema`** is the first field of every document: `veil.<command>/<version>`.
+* **Field names** are `snake_case`. Every field documented here is always
+  present; a field that has no value is `null`, and a list with no items is
+  `[]`.
+* **Enumerations** are lower-case strings (`added`, `no_key`, …). A consumer
+  should treat a value it does not know as "other": new values may be added
+  without a version bump.
+* **Ids** are full lower-case hex: 64 digits for snapshot and operation ids
+  (`snapshot_id`, `op_id`). Change ids (`change_id`, 32 digits) use Veil's
+  reverse-hex alphabet `k`–`z`, exactly as the text output shows them and as
+  revisions accept them. Wherever the text output shows a short form, the
+  JSON has it too, as `…_short` (8 characters).
+* **Times** are RFC 3339 in UTC, to the millisecond:
+  `2026-11-04T09:24:56.748Z`.
+* **Paths** are relative to the repository root, separated by `/`, with no
+  leading `./` or `/`.
+* **Strings are the raw data.** The text output escapes control characters in
+  names, paths, descriptions and file content (`\x1b`); JSON carries them
+  unchanged, and any JSON decoder gives back the original string. On the wire,
+  besides what JSON itself escapes, DEL, the C1 control characters and the
+  Unicode bidirectional overrides are written as `\uXXXX`, so a document
+  printed straight to a terminal cannot drive it. Escape strings yourself
+  before showing them to a person.
+
+### Versioning
+
+The version in `schema` changes only when a change could break a consumer:
+
+* **Additive changes keep the version**: a new field in an object, a new
+  value of an enumeration, a new kind of document.
+* **Anything else bumps it** (`veil.status/2`): removing or renaming a field,
+  changing its type or whether it can be `null`, or changing what a value
+  means.
+
+Ignore fields you do not know, and check `schema` before reading a document.
+
+### Confidentiality
+
+A JSON document never contains anything the text output of the same command
+does not show to the same reader:
+
+* Content you cannot decrypt (cloaked for a scope you are not in, withheld by
+  a public remote, under an unreleased embargo) is reported as a
+  [`redaction`](#redaction): a reason, never the content.
+* A description sealed for a scope you are not in is `null`, with a
+  [`description_hidden`](#hidden-description) that names the scope.
+* Isolated files (`.env`, …) are listed by path in `vl status`; their
+  content is never recorded, so it is never in any document.
+* `vl secret list --json` lists secret **names**; values are never read into
+  the result. `vl scan --json` gives the scanner's redacted excerpt (the
+  first four characters and a length), as the text does.
+
+### Exit status and errors
+
+The exit status is the same with and without `--json`: 0 on success, 1 on
+failure, and 1 from `vl scan` when a public file contains a secret (its
+document is printed all the same, with `clean: false`).
+
+When a command fails, `error: …` goes to standard error as always and, with
+`--json`, a [`veil.error/1`](#veilerror1) document goes to standard output,
+so a script that reads standard output always gets one document. Two
+exceptions:
+
+* **Usage errors** (an unknown flag, a missing argument) are reported by the
+  argument parser before `vl` knows `--json` was asked for: text on standard
+  error, exit status 2, nothing on standard output.
+* If the command had already printed its document when a later step failed
+  (finishing the working-copy checkout), no second document is printed:
+  standard error and the exit status tell.
+
+## Common objects
+
+Objects that several documents share.
+
+### Snapshot reference
+
+A snapshot as the text shows it on one line (`kxqpvmkk ee720280 Add the
+README`): in `status`, `show` (`parents`), `workspace list`, `tag list`.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `snapshot_id` | string | Snapshot id, 64 hex digits |
+| `snapshot_short` | string | Its first 8 digits |
+| `change_id` | string or null | The change id (reverse hex); null if the snapshot is not `available` |
+| `change_short` | string or null | Its first 8 characters |
+| `available` | bool | False when this repository cannot read the snapshot (withheld by an unreleased embargo on a public clone, or removed by `vl gc`): only its id is known, and every other field is null or false |
+| `empty` | bool | The change makes no changes of its own (`(empty)`) |
+| `description` | string or null | The full description (`""` if none is set); null if it is sealed for a scope you are not in |
+| `description_hidden` | [hidden description](#hidden-description) or null | Why `description` is null |
+
+### Hidden description
+
+A description sealed for a scope you are not in (the text shows
+`[cloaked:team]`).
+
+| Field | Type | Meaning |
+|---|---|---|
+| `scope` | string | The scope it is sealed for |
+| `reason` | string | `no_key` |
+
+### Visibility
+
+Who can read a file: the `visibility` of a change or diff entry.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `kind` | string | `public`, `cloaked` or `embargoed` |
+| `scope` | string or null | The scope of a `cloaked` file |
+| `embargo` | string or null | The embargo id of an `embargoed` file |
+
+### Redaction
+
+Content this reader cannot see, and why. It never carries the content.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `reason` | string | `no_key`: cloaked for a scope you hold no key for; `withheld`: a public remote never delivered it; `not_released`: under an embargo not released yet; `unwritable` (`status` only): readable, but this filesystem could not hold the file; `missing`: a public object absent from the store (damage, not a redaction: run `vl fsck`); `error`: the store could not read it |
+| `message` | string | The explanation the text output prints (`cloaked:team; no key`) |
+
+### Signature
+
+| Field | Type | Meaning |
+|---|---|---|
+| `status` | string | `good` (by a known member), `unknown` (valid, but by a key no key ring knows), `bad` (does not match the snapshot) or `unsigned` |
+| `signer` | string or null | The member's name, for `good`. It differs from the author when someone else rewrote the snapshot (a rebase) |
+| `key` | string or null | The signing public key, in hex; null if unsigned |
+| `key_short` | string or null | Its first 16 digits, as `vl show` prints them |
+
+### Change
+
+A changed path, as `vl status` lists it.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `path` | string | The file |
+| `status` | string | `added`, `deleted` or `modified` |
+| `visibility` | [visibility](#visibility) | Of the new version (of the old one, for a deletion) |
+| `redacted` | bool | The new version is unreadable here (`(redacted)` in the text) |
+
+### File diff
+
+One file of `vl diff` and `vl show`.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `path` | string | The file |
+| `status` | string | `added`, `deleted` or `modified` |
+| `old`, `new` | entry or null | The two versions; `old` is null for an added file, `new` for a deleted one |
+| `content` | object or null | The changed lines; null with `--stat` |
+
+An entry (`old`, `new`):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `visibility` | [visibility](#visibility) | Who can read this version |
+| `executable` | bool | The executable bit |
+| `mode` | string | `100644` or `100755`, as Git writes it |
+| `readable` | bool | This reader can materialise this version (for an embargoed file: its pre-merge fallback counts) |
+
+`content`:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `binary` | bool | Either version is binary: no `hunks` (the text says `binary content differs`) |
+| `hidden` | [redaction](#redaction) or null | Either version is unreadable here: no `hunks`, and why |
+| `hunks` | array of hunks | The unified diff, 3 lines of context |
+
+A hunk:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `old_start`, `old_lines` | number | The lines of the old version it covers (start counts from 1; 0 for an empty file) |
+| `new_start`, `new_lines` | number | The same, in the new version |
+| `lines` | array of lines | In order |
+
+A line:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `kind` | string | `context`, `added` or `removed` |
+| `text` | string | The line without its line break (a `\r` before it is kept) |
+| `newline` | bool | False only for a last line that has no line break (`\ No newline at end of file`) |
+
+## `veil.status/1`
+
+`vl status --json`: the working-copy change and what the snapshot taken by
+this command found.
+
+```json
+{"schema":"veil.status/1","workspace":{"name":"default","cloak":null},
+ "working_copy":{"snapshot_id":"ee72…02c8","snapshot_short":"ee720280","change_id":"kxqp…slxt","change_short":"kxqpvmkk","available":true,"empty":false,"description":"","description_hidden":null},
+ "parents":[{"snapshot_id":"37cd…e8f2","snapshot_short":"37cdc51f","change_id":"pqmv…ynro","change_short":"pqmvvlvm","available":true,"empty":false,"description":"Add the README","description_hidden":null}],
+ "changes":[{"path":"README.md","status":"modified","visibility":{"kind":"public","scope":null,"embargo":null},"redacted":false}],
+ "isolated":[".env"],"quarantined":[],"policy_held_back":[],"nested":[],"redacted":[],"conflicts":[]}
+```
+
+(Wrapped and shortened here; the real document is one line.)
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `veil.status/1` |
+| `workspace` | object | The workspace the project directory is attached to: `name` (string) and `cloak` (string or null: the scope everything recorded in it is cloaked under) |
+| `working_copy` | [snapshot reference](#snapshot-reference) | The working-copy change, `@` |
+| `parents` | array of [snapshot references](#snapshot-reference) | Its parents (two or more for a merge) |
+| `changes` | array of [changes](#change) | What `@` changes, compared with its parents |
+| `isolated` | array of strings | Local-only files (isolated): never snapshotted or pushed |
+| `quarantined` | array | Public files kept out of the snapshot because they look like they contain a secret: `path`; `rule` (string: the first scanner rule that matched) and `line` (number: where); `state`: `never_recorded`, or `held_back` (an edit of a file history already has; history keeps the previous version) |
+| `policy_held_back` | array | Local paths that keep the protection you accepted because `.veilpolicy` would weaken it (`vl policy accept` applies it): `path` (with a trailing `/` for a directory), `dir` (bool: a directory held back as a whole), `accepted` and `wanted` (strings: policy keywords such as `isolate`, `cloak ops`, `public!`) |
+| `nested` | array of strings | Directories that are repositories of their own; nothing in them is recorded here |
+| `redacted` | array | Files of `@` that are absent on disk because you cannot read them: `path`, and `redaction` (a [redaction](#redaction)) |
+| `conflicts` | array | Unresolved conflicts: `path`, and `recorded_on` (string or null: the short change id of the parent, a merge, that recorded it; null if recorded on `@` itself) |
+
+## `veil.log/1`
+
+`vl log --json`: the snapshot graph, children before parents and newest
+first among unrelated snapshots, as the text draws it. `-n` limits it.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `veil.log/1` |
+| `entries` | array of entries | The snapshots, in log order |
+| `truncated` | bool | `-n` cut the log short (the text prints `(more snapshots elided)`) |
+
+An entry:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `snapshot_id`, `snapshot_short` | string | The snapshot id and its short form |
+| `change_id`, `change_short` | string | The change id and its short form |
+| `root` | bool | The universal root, `root()`: its `author`, `timestamp` and `signature` are null |
+| `current` | bool | The working copy of the current workspace (`@`) |
+| `author` | string or null | Who made the change |
+| `timestamp` | string or null | When this snapshot was made |
+| `signature` | [signature](#signature) or null | Its signature |
+| `workspaces` | array of strings | Workspaces whose working copy this is (`name@` in the text) |
+| `tags` | array | Local tags pointing here: `name`, and `cloak` (string or null: the scope of a cloaked tag, never pushed to public remotes) |
+| `remote_tags` | array of strings | Tags last seen on a remote, as `remote/tag` |
+| `empty` | bool | The change makes no changes of its own |
+| `conflicts` | array of strings | Paths that still have conflict markers (`×` and `(conflict)` in the text) |
+| `cloak` | string or null | The scope of a snapshot on a cloaked line of work |
+| `embargo` | object or null | The embargo this merge introduced: `id` (string) and `released` (bool) |
+| `description` | string or null | The full description; null if sealed for a scope you are not in |
+| `description_hidden` | [hidden description](#hidden-description) or null | Why `description` is null |
+| `parents` | array | The parents, first parent first: `snapshot_id`, `snapshot_short`, `change_short` (string or null) and `withheld` (bool: the parent is not in this repository, as with an unreleased embargo on a public clone; its `change_short` is then null) |
+
+## `veil.diff/1`
+
+`vl diff --json`, with `-r`, `--from`, `--to` and `--stat` as without it.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `veil.diff/1` |
+| `stat` | bool | `--stat` was given: every file's `content` is null |
+| `files` | array of [file diffs](#file-diff) | The changed files, in path order |
+
+## `veil.show/1`
+
+`vl show --json`: a snapshot's metadata and its diff against its parents.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `veil.show/1` |
+| `snapshot_id`, `snapshot_short` | string | The snapshot id and its short form |
+| `change_id`, `change_short` | string | The change id and its short form |
+| `root` | bool | The universal root (no signature) |
+| `author` | string | Who made the change (empty for the root) |
+| `timestamp` | string or null | When this snapshot was made |
+| `signature` | [signature](#signature) or null | Its signature; null for the root |
+| `parents` | array of [snapshot references](#snapshot-reference) | Its parents (the text lists them only for a merge) |
+| `tags` | array of strings | Local tags pointing here |
+| `cloak` | string or null | The scope of a snapshot on a cloaked line of work |
+| `embargo` | object or null | The embargo this merge introduced: `id` (string); `state`: `pending`, `staged` (released here, not pushed yet), `released` or `unknown` (no record of it here); `until` (string or null: when a `pending` embargo is released automatically; null for a manual release) |
+| `conflicts` | array of strings | Paths that still have conflict markers |
+| `description` | string or null | The full description; null if sealed for a scope you are not in |
+| `description_hidden` | [hidden description](#hidden-description) or null | Why `description` is null |
+| `diff` | object | The snapshot's changes: `stat` (bool) and `files` (array of [file diffs](#file-diff)), as in [`veil.diff/1`](#veildiff1) |
+
+## `veil.workspace.list/1`
+
+`vl workspace list --json` (`vl ws list --json`).
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `veil.workspace.list/1` |
+| `workspaces` | array | By name: `name`; `current` (bool: the project directory is attached to it); `cloak` (string or null); `working_copy` (a [snapshot reference](#snapshot-reference)) |
+
+## `veil.tag.list/1`
+
+`vl tag list --json`.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `veil.tag.list/1` |
+| `tags` | array | Local tags, by name: `name`; `cloak` (string or null: never pushed to public remotes); `target` (a [snapshot reference](#snapshot-reference)) |
+| `remote_tags` | array | Tags as last seen on remotes: `name` (`remote/tag`) and `target` |
+
+## `veil.op.log/1`
+
+`vl op log --json`: the operation log, newest first; `-n` (default 20)
+limits it.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `veil.op.log/1` |
+| `operations` | array | `op_id` and `op_short` (string: pass either to `vl op restore`); `timestamp`; `user`; `description` (what the operation did) |
+
+## `veil.scan/1`
+
+`vl scan --json`, and the CI gate `vl scan --policy-from FILE --json`.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `veil.scan/1` |
+| `mode` | string | `working_copy` (the repository's own policy), or `gate` (`--policy-from`: every file counts as public) |
+| `policy_from` | string or null | The gate's trusted policy file, as given |
+| `nested` | array of strings | Nested repositories, not scanned (`working_copy` only) |
+| `files` | array | Files that contain secrets, or could not be read (`gate` only), in path order: `path`; `tier` (`public`, `cloaked`, `isolated`, or in a gate also `ignored`: the policy tier) and `scope` (string or null: of a cloaked tier); `protected` (bool: its tier keeps the secret out of public history; always false in a gate, as a Git checkout publishes every file); `findings` (array: `line`, `rule`, and `excerpt`, the scanner's redacted excerpt, never the secret); `error` (string or null: why the file could not be read, in a gate; it then has no findings and counts as exposed) |
+| `exposed` | number | Files that would publish a secret (in a gate, unreadable files too) |
+| `protected` | number | Cloaked or isolated files that contain secrets (`working_copy` only) |
+| `clean` | bool | Nothing is exposed. False makes `vl scan` exit 1 |
+
+## `veil.secret.list/1`
+
+`vl secret list --json`: the names in this repository's local vault. Values
+are never part of the document; `vl secret get NAME` prints one.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `veil.secret.list/1` |
+| `secrets` | array | By name: `name` (the environment variable `vl run` sets) |
+
+## `veil.error/1`
+
+Printed instead of a command's document when it fails (see
+[Exit status and errors](#exit-status-and-errors)).
+
+```json
+{"schema":"veil.error/1","error":{"message":"revision 'nosuch' not found","hint":null}}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `veil.error/1` |
+| `error` | object | `message` (string: what standard error shows after `error:`, unescaped) and `hint` (string or null: the `hint:` that follows it, if any) |
+
+---
+
+[All commands](README.md) · [User guide](../guide/README.md)

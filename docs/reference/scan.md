@@ -16,6 +16,7 @@ Options:
 | | |
 |---|---|
 | `--policy-from <FILE>` | CI gate: take the rules from FILE (the base branch's `.veilpolicy`, e.g. from `git show`; an empty file for the built-in rules only) and disregard the scanned directory's own `.veilpolicy`, so a pull request cannot switch the scan off |
+| `--json` | Print one JSON document instead of text (its schema is named in its `schema` field; see docs/reference/json.md). Errors then also print a `veil.error/1` document |
 
 ---
 

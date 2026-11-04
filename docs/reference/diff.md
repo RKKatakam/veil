@@ -17,6 +17,7 @@ Options:
 | `--from <FROM>` | Compare from this snapshot (default: @) |
 | `--to <TO>` | Compare to this snapshot (default: @) |
 | `--stat` | Only list changed paths |
+| `--json` | Print one JSON document instead of text (its schema is named in its `schema` field; see docs/reference/json.md). Errors then also print a `veil.error/1` document |
 
 ---
 

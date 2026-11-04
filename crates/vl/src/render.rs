@@ -1,6 +1,5 @@
 use std::{
     borrow::Cow,
-    collections::HashMap,
     fmt::Write as _,
     io::{self, IsTerminal, Write as _},
     process::ExitCode,
@@ -16,8 +15,6 @@ use veil_core::{
     keychain::SignatureStatus,
     object::{EntryKind, Snapshot, Visibility},
     policy::{HeldBack, POLICY_FILE},
-    secrets::looks_binary,
-    tree::{diff_trees, TreeChange},
     ObjectId, Repo, TreeEntry, VPath,
 };
 
@@ -274,23 +271,7 @@ pub fn first_line(s: &str) -> Cow<'_, str> {
 
 /// `change id  snapshot id  description` on one line.
 pub fn one_line(repo: &Repo, id: &ObjectId) -> String {
-    match repo.snapshot(id) {
-        Ok(s) => {
-            let desc = repo.description(&s);
-            let desc = if desc.trim().is_empty() {
-                dim("(no description set)")
-            } else {
-                first_line(&desc).into_owned()
-            };
-            let empty = if repo.is_empty_change(id).unwrap_or(false) && !s.parents.is_empty() {
-                format!("{} ", green("(empty)"))
-            } else {
-                String::new()
-            };
-            format!("{} {} {empty}{desc}", bold(&magenta(&s.change_id.short())), blue(&id.short()))
-        }
-        Err(_) => id.short(),
-    }
+    crate::api::text::one_line(&crate::api::snapshot_ref(repo, id))
 }
 
 pub fn print_build_warnings(r: &BuildReport) {
@@ -396,173 +377,13 @@ pub fn signature_detail(status: &SignatureStatus, s: &Snapshot) -> String {
     }
 }
 
-pub fn print_log(repo: &Repo, ws: &str, limit: Option<usize>) -> Result<()> {
-    let ids = repo.visible_snapshots()?;
-    let signers = repo.keys().known_signers();
-    let mut tags: HashMap<ObjectId, Vec<String>> = HashMap::new();
-    for (name, t) in &repo.view().tags {
-        let label = match &t.cloak {
-            Some(s) => format!("{}[cloaked:{}]", safe(name), safe(s)),
-            None => safe(name).into_owned(),
-        };
-        tags.entry(t.target).or_default().push(label);
-    }
-    for (name, t) in &repo.view().remote_tags {
-        tags.entry(*t).or_default().push(safe(name).into_owned());
-    }
-    let mut wss: HashMap<ObjectId, Vec<String>> = HashMap::new();
-    for (name, w) in &repo.view().workspaces {
-        wss.entry(w.wc).or_default().push(format!("{}@", safe(name)));
-    }
-    // None in a bare repository (no workspace).
-    let current = repo.view().workspaces.get(ws).map(|w| w.wc);
-    let root = repo.root_id();
-
-    let mut lanes: Vec<Option<ObjectId>> = Vec::new();
-    for (shown, id) in ids.iter().enumerate() {
-        if stdout_closed() {
-            break;
-        }
-        if limit.is_some_and(|l| shown >= l) {
-            println!("{}", dim("~  (more snapshots elided)"));
-            break;
-        }
-        let s = repo.snapshot(id)?;
-        let col = match lanes.iter().position(|l| *l == Some(*id)) {
-            Some(c) => c,
-            None => match lanes.iter().position(|l| l.is_none()) {
-                Some(c) => {
-                    lanes[c] = Some(*id);
-                    c
-                }
-                None => {
-                    lanes.push(Some(*id));
-                    lanes.len() - 1
-                }
-            },
-        };
-        for (j, l) in lanes.iter_mut().enumerate() {
-            if j != col && *l == Some(*id) {
-                *l = None;
-            }
-        }
-        let marker = if Some(*id) == current {
-            bold(&green("@"))
-        } else if *id == root {
-            "◆".to_string()
-        } else if !s.conflicts.is_empty() {
-            red("×")
-        } else {
-            "○".to_string()
-        };
-        let row = |lanes: &[Option<ObjectId>], node: Option<(usize, &str)>| -> String {
-            let mut out = String::new();
-            for (j, l) in lanes.iter().enumerate() {
-                match node {
-                    Some((c, m)) if c == j => out.push_str(m),
-                    _ => out.push_str(if l.is_some() { "│" } else { " " }),
-                }
-                out.push(' ');
-            }
-            out
-        };
-        let line1_prefix = row(&lanes, Some((col, &marker)));
-
-        let mut header = vec![bold(&magenta(&s.change_id.short()))];
-        if *id != root {
-            header.push(yellow(&safe(&s.author)));
-            header.push(signature_marker(&repo.keys().snapshot_status_with(&s, &signers), &s.author));
-            header.push(dim(&fmt_time(s.timestamp)));
-        }
-        if let Some(w) = wss.get(id) {
-            header.push(green(&w.join(" ")));
-        }
-        if let Some(t) = tags.get(id) {
-            header.push(cyan(&t.join(" ")));
-        }
-        header.push(blue(&id.short()));
-        if *id != root && repo.is_empty_change(id).unwrap_or(false) {
-            header.push(green("(empty)"));
-        }
-        if !s.conflicts.is_empty() {
-            header.push(red("(conflict)"));
-        }
-        if let Some(c) = &s.cloak {
-            header.push(magenta(&format!("[cloaked:{}]", safe(c))));
-        }
-        if let Some(e) = &s.embargo {
-            let released = repo.keys().embargo_released(e);
-            header.push(yellow(&format!("[embargo:{}{}]", safe(e), if released { " released" } else { "" })));
-        }
-
-        let parents: Vec<ObjectId> = s.parents.clone();
-        lanes[col] = parents.first().copied();
-        for p in parents.iter().skip(1) {
-            if !lanes.contains(&Some(*p)) {
-                match lanes.iter().position(|l| l.is_none()) {
-                    Some(c) => lanes[c] = Some(*p),
-                    None => lanes.push(Some(*p)),
-                }
-            }
-        }
-        while lanes.last() == Some(&None) {
-            lanes.pop();
-        }
-        let mut line2_prefix = row(&lanes, None);
-        if line2_prefix.is_empty() {
-            line2_prefix = "  ".into();
-        }
-        println!("{line1_prefix} {}", header.join(" "));
-        if *id == root {
-            println!("{line2_prefix} {}", dim("root()"));
-        } else {
-            let desc = repo.description(&s);
-            let desc = if desc.trim().is_empty() {
-                dim("(no description set)")
-            } else {
-                first_line(&desc).into_owned()
-            };
-            let merge = if parents.len() > 1 {
-                dim(&format!(
-                    "  ⇠ merges {}",
-                    parents
-                        .iter()
-                        // A parent may be withheld (unreleased embargo on a
-                        // public clone): name it by snapshot id instead.
-                        .map(|p| match repo.snapshot_opt(p) {
-                            Ok(Some(s)) => s.change_id.short(),
-                            _ => format!("{} (withheld)", p.short()),
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ))
-            } else {
-                String::new()
-            };
-            println!("{line2_prefix} {desc}{merge}");
-        }
-    }
-    Ok(())
-}
+// `vl log` is rendered by `api::text::log`.
 
 // ---- content this reader cannot see ----------------------------------------
 
-/// Why the content of `e` cannot be shown, in a few words for a listing:
-/// `cloaked:team; you hold no key`. `None` if nothing explains it (a public
-/// object that is simply missing: damage, not a redaction).
-pub fn hidden_note(repo: &Repo, e: &TreeEntry) -> Option<String> {
-    let present = repo.store().has(&e.id);
-    Some(match &e.visibility {
-        Visibility::Public => return None,
-        Visibility::Cloaked { .. } if present => format!("{}; you hold no key", e.visibility.label()),
-        Visibility::Cloaked { .. } => format!("{}; withheld by a public remote", e.visibility.label()),
-        Visibility::Embargoed { .. } => format!("{}; not released yet", e.visibility.label()),
-    })
-}
-
 /// What to tell someone who asked for the content of `path` (entry `e`),
 /// which this repository cannot show. `None`: no explanation beyond the
-/// engine's error (see [`hidden_note`]).
+/// engine's error (see `api::redaction_for_diff`).
 /// Why this reader cannot materialise `e`, in a few words (`cloaked:team;
 /// no key`, `cloaked:team; withheld by a public remote`, `embargo …; not
 /// released`), for listings; [`hidden_explanation`] says what to do.
@@ -625,114 +446,7 @@ pub fn read_file(repo: &Repo, path: &VPath, e: &TreeEntry) -> Result<Vec<u8>> {
 
 // ---- diffs ---------------------------------------------------------------
 
-pub fn print_changes_summary(repo: &Repo, changes: &[TreeChange]) {
-    for c in changes {
-        let status = match c.status() {
-            'A' => green("A"),
-            'D' => red("D"),
-            _ => cyan("M"),
-        };
-        let vis = c
-            .new
-            .as_ref()
-            .or(c.old.as_ref())
-            .map(|e| vis_label(&e.visibility))
-            .unwrap_or_default();
-        let hidden = c
-            .new
-            .as_ref()
-            .is_some_and(|e| !repo.store().entry_readable(e));
-        let hidden = if hidden { dim(" (redacted)") } else { String::new() };
-        println!(
-            "{status} {}{}{hidden}",
-            safe(c.path.as_str()),
-            if vis.is_empty() { String::new() } else { format!(" {vis}") }
-        );
-    }
-}
-
-pub fn print_diff(repo: &Repo, from: &ObjectId, to: &ObjectId, stat: bool) -> Result<()> {
-    let changes = diff_trees(repo.store(), Some(from), Some(to))?;
-    if changes.is_empty() {
-        println!("{}", dim("(no changes)"));
-        return Ok(());
-    }
-    if stat {
-        print_changes_summary(repo, &changes);
-        return Ok(());
-    }
-    for c in &changes {
-        if stdout_closed() {
-            break;
-        }
-        println!("{}", bold(&format!("diff --veil a/{0} b/{0}", safe(c.path.as_str()))));
-        let read = |e: &Option<veil_core::TreeEntry>| -> Result<Option<Vec<u8>>, String> {
-            match e {
-                None => Ok(Some(Vec::new())),
-                Some(e) => match repo.store().read_entry(e) {
-                    Ok(d) => Ok(Some(d)),
-                    Err(err) if err.is_unreadable() => Err(hidden_note(repo, e).unwrap_or_else(|| err.to_string())),
-                    Err(err) => Err(err.to_string()),
-                },
-            }
-        };
-        match (c.status(), &c.old, &c.new) {
-            ('A', _, Some(n)) => println!("{}", green(&format!("added file {}", vis_label(&n.visibility)))),
-            ('D', Some(_), _) => println!("{}", red("deleted file")),
-            (_, Some(o), Some(n)) if o.visibility != n.visibility => println!(
-                "{}",
-                yellow(&format!(
-                    "visibility: {} → {}",
-                    safe(&o.visibility.label()),
-                    safe(&n.visibility.label())
-                ))
-            ),
-            _ => {}
-        }
-        // The executable bit, as Git prints it (BUG-241).
-        let mode = |e: &veil_core::TreeEntry| if e.executable { "100755" } else { "100644" };
-        match (&c.old, &c.new) {
-            (Some(o), Some(n)) if o.executable != n.executable => {
-                println!("{}", yellow(&format!("old mode {}", mode(o))));
-                println!("{}", yellow(&format!("new mode {}", mode(n))));
-            }
-            (None, Some(n)) if n.executable => println!("{}", green(&format!("new file mode {}", mode(n)))),
-            (Some(o), None) if o.executable => println!("{}", red(&format!("deleted file mode {}", mode(o)))),
-            _ => {}
-        }
-        let (old, new) = match (read(&c.old), read(&c.new)) {
-            (Ok(Some(a)), Ok(Some(b))) => (a, b),
-            (Err(v), _) | (_, Err(v)) => {
-                println!("{}", dim(&format!("  (content hidden: {})", safe(&v))));
-                continue;
-            }
-            _ => continue,
-        };
-        if looks_binary(&old) || looks_binary(&new) {
-            println!("{}", dim("  (binary content differs)"));
-            continue;
-        }
-        let old_s = String::from_utf8_lossy(&old);
-        let new_s = String::from_utf8_lossy(&new);
-        let patch = diffy::create_patch(&old_s, &new_s);
-        for line in patch.to_string().lines().skip(2) {
-            // File content comes from the repository (possibly a remote).
-            let line = safe_content_line(line);
-            let line = line.as_ref();
-            let colored = if line.starts_with('+') {
-                green(line)
-            } else if line.starts_with('-') {
-                red(line)
-            } else if line.starts_with("@@") {
-                cyan(line)
-            } else {
-                line.to_string()
-            };
-            println!("{colored}");
-        }
-    }
-    Ok(())
-}
+// `vl status`, `vl diff` and `vl show` are rendered by `api::text`.
 
 pub fn print_files(repo: &Repo, tree: &ObjectId) -> Result<()> {
     for (path, e) in veil_core::tree::walk_files(repo.store(), tree)? {

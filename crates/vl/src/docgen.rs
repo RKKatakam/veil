@@ -23,6 +23,11 @@ use crate::cli::Cli;
 
 const BLESS_VAR: &str = "VEIL_BLESS_DOCS";
 
+/// Pages of `docs/reference/` written by hand, not generated (and not
+/// removed by a regeneration). `json.md` documents the `--json` schemas;
+/// `crates/vl/tests/json_cli.rs` checks that it covers every field.
+const HAND_WRITTEN: &[&str] = &["json.md"];
+
 fn docs_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs")
 }
@@ -255,6 +260,10 @@ pub fn reference_pages() -> BTreeMap<String, String> {
     for s in subcommands(&cli) {
         let _ = writeln!(index, "| [`vl {}`]({}.md) | {} |", s.get_name(), s.get_name(), cell(&text(s.get_about())));
     }
+    let _ = writeln!(
+        index,
+        "\nThe read commands (`status`, `log`, `diff`, `show`, `workspace list`, `tag list`, `op log`,\n`scan`, `secret list`) take `--json`: their schemas are in [JSON output](json.md)."
+    );
     pages.insert("README.md".to_string(), index);
 
     for s in subcommands(&cli) {
@@ -289,7 +298,7 @@ fn reference_is_up_to_date() {
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            if name.ends_with(".md") && !pages.contains_key(&name) {
+            if name.ends_with(".md") && !pages.contains_key(&name) && !HAND_WRITTEN.contains(&name.as_str()) {
                 if bless {
                     std::fs::remove_file(e.path()).unwrap();
                 } else {

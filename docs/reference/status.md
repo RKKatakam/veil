@@ -11,6 +11,12 @@ Alias: `vl st`.
 vl status [OPTIONS]
 ```
 
+Options:
+
+| | |
+|---|---|
+| `--json` | Print one JSON document instead of text (its schema is named in its `schema` field; see docs/reference/json.md). Errors then also print a `veil.error/1` document |
+
 ---
 
 [All commands](README.md) · [User guide](../guide/README.md)
