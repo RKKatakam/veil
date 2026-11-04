@@ -39,6 +39,12 @@ use std::{
     process::{Command, Output, Stdio},
 };
 
+impl Default for Env {
+    fn default() -> Env {
+        Env::new()
+    }
+}
+
 /// An isolated test environment: a temporary directory holding every
 /// user's `VEIL_HOME` and every project.
 pub struct Env {

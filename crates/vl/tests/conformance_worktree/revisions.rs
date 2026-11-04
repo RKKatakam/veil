@@ -258,7 +258,7 @@ fn ids_printed_by_log_resolve() {
         assert_eq!(r.change(short), *id);
     }
     for l in log.lines().filter(|l| l.contains(" alice ")) {
-        let snap = l.split_whitespace().filter(|w| w.len() == 8 && w.bytes().all(|b| b.is_ascii_hexdigit())).last();
+        let snap = l.split_whitespace().rev().find(|w| w.len() == 8 && w.bytes().all(|b| b.is_ascii_hexdigit()));
         if let Some(s) = snap {
             r.ok(&["--no-snapshot", "show", "--stat", s]);
         }
