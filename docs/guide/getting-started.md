@@ -157,7 +157,7 @@ $ vl log
 | `vl log [-n N]` | The snapshot graph: change id, author, signature, time, tags and workspaces, snapshot id, description |
 | `vl show [REV] [--stat]` | One snapshot's metadata and diff |
 | `vl describe -m MSG [-r REV]` | Set the description of a change (default `@`). Does not start a new change |
-| `vl commit -m MSG` | Describe `@`, then start a new, empty change on top of it. **Moves tags that pointed at the parent** to the committed change |
+| `vl commit -m MSG [--no-advance]` | Describe `@`, then start a new, empty change on top of it. **Moves tags that pointed at the parent** to the committed change (in a cloaked workspace, only tags cloaked under its scope; with `--no-advance`, none) |
 | `vl new [REVS…] [-m MSG]` | Start a new change on top of `REVS` (default `@`); with several revisions, a merge. Moves no tags |
 | `vl files [-r REV]`, `vl cat PATH [-r REV]` | List a snapshot's files with their visibility, or print one |
 
@@ -185,7 +185,9 @@ main: yltznuyx 53414202 Greet the world
 * A tag **follows its change** when that change is rewritten (`describe`,
   `rebase`, `squash`).
 * `vl commit` moves every tag that pointed at the parent of `@` onto the
-  committed change. That is how `main` moved above. `vl merge` moves tags
+  committed change. That is how `main` moved above. In a cloaked workspace
+  it moves only tags cloaked under the same scope, so cloaked work never
+  reaches `main` by accident. `vl merge` moves tags
   that pointed at the change merged into. Pulls fast-forward tags.
 * Nothing else moves a tag. `vl tag set` refuses to move one backwards or
   sideways unless you pass `--allow-backwards`.

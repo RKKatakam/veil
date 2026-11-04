@@ -18,7 +18,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser};
 use veil_core::{
     checkout::{behind_special, Materialised},
-    commands::EmbargoSpec,
+    commands::{CommitResult, EmbargoSpec, TagKept},
     now_millis,
     keychain::validate_scope_name,
     policy::{escape_field, escape_literal, format_rule, has_glob_syntax, Policy, Tier, POLICY_FILE},
@@ -178,10 +178,11 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             let ws = ctx.ws.clone();
             ctx.repo.new_change(&ws, parents, message)?;
         }
-        Cmd::Commit { message } => {
+        Cmd::Commit { message, no_advance } => {
             let ws = ctx.ws.clone();
-            let (c, _) = ctx.repo.commit_working_copy(&ws, message)?;
-            println!("Committed {}", one_line(&ctx.repo, &c));
+            let r = ctx.repo.commit(&ws, message, !*no_advance)?;
+            println!("Committed {}", one_line(&ctx.repo, &r.committed));
+            print_tags_kept(&ctx.repo, &r);
         }
         Cmd::Edit { rev } => {
             let id = ctx.rev(rev)?;
@@ -572,6 +573,32 @@ fn retire_identity(path: &Path) -> Result<(PathBuf, Option<Identity>)> {
 
 // ---- inspection ----------------------------------------------------------
 
+/// Tags a commit left at its parent, and how to move them on purpose.
+fn print_tags_kept(repo: &Repo, r: &CommitResult) {
+    let (cloaked, plain): (Vec<_>, Vec<_>) = r.kept.iter().partition(|(_, why)| matches!(why, TagKept::CloakedLine(_)));
+    let names = |v: &[&(String, TagKept)]| v.iter().map(|(n, _)| safe(n).into_owned()).collect::<Vec<_>>().join(", ");
+    let change = repo
+        .snapshot(&r.committed)
+        .map(|s| s.change_id.short())
+        .unwrap_or_else(|_| r.committed.short());
+    if let Some((_, TagKept::CloakedLine(scope))) = cloaked.first() {
+        let first = safe(&cloaked[0].0).into_owned();
+        eprintln!(
+            "{} {} not moved: this is a line cloaked for '{}', and a commit there never moves an uncloaked tag (public remotes and Git would receive it)",
+            yellow("note:"),
+            names(&cloaked),
+            safe(scope)
+        );
+        eprintln!(
+            "  {} publish the work with `vl merge {change} --into {first}` (add `--embargo` to keep it hidden until a release), or move the tag yourself: `vl tag set {first} -r {change}`",
+            dim("hint:")
+        );
+    }
+    if !plain.is_empty() {
+        eprintln!("{} {} not moved (--no-advance)", dim("note:"), names(&plain));
+    }
+}
+
 fn cmd_status(ctx: &mut Ctx) -> Result<()> {
     let wc = ctx.wc()?;
     let s = ctx.repo.snapshot(&wc)?;
@@ -620,11 +647,31 @@ fn cmd_status(ctx: &mut Ctx) -> Result<()> {
             println!("  {} {}", dim("R"), safe(p.as_str()));
         }
     }
-    if !s.conflicts.is_empty() {
-        println!("{}", red("Unresolved conflicts:"));
-        for c in &s.conflicts {
-            println!("  {} {}", red("C"), safe(c));
+    // Conflicts recorded on `@`, and those of its parents (a merge records
+    // them on the merge, `@-`) whose file `@` has not touched since.
+    let mut conflicts: Vec<(String, Option<String>)> = s.conflicts.iter().map(|c| (c.clone(), None)).collect();
+    for p in &s.parents {
+        let ps = ctx.repo.snapshot(p)?;
+        for c in &ps.conflicts {
+            let Ok(path) = VPath::new(c) else { continue };
+            let before = lookup(ctx.repo.store(), &ps.tree, &path)?;
+            if before.is_some() && before == lookup(ctx.repo.store(), &s.tree, &path)? && !conflicts.iter().any(|(x, _)| x == c) {
+                conflicts.push((c.clone(), Some(ps.change_id.short())));
+            }
         }
+    }
+    if !conflicts.is_empty() {
+        println!("{}", red("Unresolved conflicts:"));
+        for (c, from) in &conflicts {
+            match from {
+                Some(change) => println!("  {} {}  (recorded on {change})", red("C"), safe(c)),
+                None => println!("  {} {}", red("C"), safe(c)),
+            }
+        }
+        println!(
+            "  {} edit the files to resolve the conflict markers; a conflict is resolved once its file is edited. Fold the resolution into the merge with `vl squash`, or `vl commit` it",
+            dim("hint:")
+        );
     }
     Ok(())
 }

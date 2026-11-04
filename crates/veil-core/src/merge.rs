@@ -108,7 +108,13 @@ fn subtree(store: &ObjectStore, e: Option<&TreeEntry>) -> Result<Option<(Arc<Tre
 }
 
 fn read_for_merge(store: &ObjectStore, e: &TreeEntry, path: &VPath) -> Result<Vec<u8>> {
-    store.read_entry(e).map_err(|err| match err {
+    // A cloaked entry's fallback is its last public version, not its
+    // content: merging that would silently revert the sealed edit.
+    let read = match e.visibility {
+        Visibility::Cloaked { .. } => store.read_blob(&e.id),
+        _ => store.read_entry(e),
+    };
+    read.map_err(|err| match err {
         VeilError::Redacted { scope } => VeilError::Policy(format!(
             "cannot merge {path}: it is cloaked under scope '{scope}' and you do not hold the key"
         )),
@@ -279,13 +285,24 @@ fn merge_file(
 /// The visibility of a file merged from `oe` and `te`: never wider than
 /// either side. Ours' sealing wins if ours is sealed; otherwise theirs'.
 /// An embargoed result taken from theirs shows ours (public) as fallback.
+/// A cloaked result from a side that is a sealed edit of a public file
+/// (it has a fallback) shows the other side's public version as its
+/// fallback if there is one (the newest public version), else the
+/// sealed side's own.
 fn merged_visibility(oe: &TreeEntry, te: &TreeEntry) -> (Visibility, Option<ObjectId>) {
+    let public_other = |sealed: &TreeEntry, other: &TreeEntry| match (sealed.fallback, other.visibility.is_public() && other.fallback.is_none()) {
+        (Some(_), true) => Some(other.id),
+        (fb, _) => fb,
+    };
     if !oe.visibility.is_public() {
-        return (oe.visibility.clone(), oe.fallback);
+        return match oe.visibility {
+            Visibility::Cloaked { .. } => (oe.visibility.clone(), public_other(oe, te)),
+            _ => (oe.visibility.clone(), oe.fallback),
+        };
     }
     match &te.visibility {
         Visibility::Public => (Visibility::Public, None),
-        Visibility::Cloaked { .. } => (te.visibility.clone(), None),
+        Visibility::Cloaked { .. } => (te.visibility.clone(), public_other(te, oe)),
         Visibility::Embargoed { .. } => (te.visibility.clone(), Some(oe.id)),
     }
 }

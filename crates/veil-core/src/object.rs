@@ -166,8 +166,10 @@ pub struct TreeEntry {
     pub executable: bool,
     #[serde(default, skip_serializing_if = "Visibility::is_public")]
     pub visibility: Visibility,
-    /// For embargoed entries: the pre-merge object shown to readers who do
-    /// not (yet) hold the embargo key.
+    /// The object shown to readers who cannot read `id`: for embargoed
+    /// entries the pre-merge version (until they hold the embargo key); for
+    /// a public file sealed only because it was edited on a cloaked line,
+    /// its last public version (ARCHITECTURE §4, rule 4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<ObjectId>,
 }

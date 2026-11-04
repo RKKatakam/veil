@@ -17,15 +17,14 @@ rewritten.
 ## The workflow
 
 The fix must be developed **out of sight and off `main`**: in a separate,
-cloaked workspace, without `vl commit`.
+cloaked workspace.
 
-> **Why not `vl new main` + `vl commit`?** `vl commit` moves every tag that
-> pointed at the parent, so committing a change made on top of `main`
-> moves `main` onto the fix before any embargo exists. That happens in a
-> separate workspace too. The next push then shows the public a cloaked
-> change on `main` (the changed file disappears for them) before you
-> merged anything. Use `vl describe` on the fix line instead: it records
-> the message without moving tags.
+> **Why a cloaked workspace?** Everything recorded there is sealed for the
+> scope, descriptions included, and `vl commit` there never moves an
+> uncloaked tag: `main` stays where it is until you merge. (In an ordinary
+> workspace `vl commit` moves the tags at the parent, so a fix committed on
+> top of `main` would move `main` onto it before any embargo exists. If you
+> must work in one, use `vl describe`, or `vl commit --no-advance`.)
 
 **1. Create a cloaked workspace for the fix**, based on `main`:
 
@@ -39,7 +38,7 @@ Created virtual workspace fix-cve at ooquruqt 373d2ea3 (empty) (no description s
 pushing to the team remote before the merge doesn't publish it either.
 
 **2. Work on it.** Attach your project directory to the workspace, edit,
-and describe (don't commit):
+and describe it (or commit, as often as you like: `main` does not move):
 
 ```text
 $ vl ws switch fix-cve

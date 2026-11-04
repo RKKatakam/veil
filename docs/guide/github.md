@@ -81,7 +81,8 @@ Exported 1 commit(s)
 
 **Only tags are pushed**, so a change must be tagged to reach GitHub. If you
 commit on top of `main`, `vl commit` moves `main` for you (it moves tags
-that pointed at the parent). Otherwise: `vl tag set main -r @-`.
+that pointed at the parent; not from a cloaked workspace). Otherwise:
+`vl tag set main -r @-`.
 
 **A pull never moves your working copy.** After `vl git pull`, rebase onto
 the new `main` when you want the commits on disk:
@@ -110,7 +111,7 @@ Git sees exactly what a `--public` Veil remote sees.
 | Cloaked files (`vl cloak`) | **Absent.** A directory left empty disappears |
 | Isolated files (`.env`, keys…) | Absent: they were never recorded |
 | A description of a cloaked change | `(description withheld: cloaked)` |
-| A snapshot made in a cloaked workspace | A commit with the author, the time and the placeholder message, and none of the cloaked files |
+| A snapshot made in a cloaked workspace | A commit with the author, the time and the placeholder message, and none of the cloaked files. A public file it edited keeps its last public version |
 | A cloaked tag (`vl tag set --cloak`) | No branch: `skipped notes (cloaked tag is never exported to Git)` |
 | An unreleased embargoed merge | The pre-merge tree, message `(description withheld: under embargo)`, and none of the fix's history |
 | After `vl embargo release` | The next push adds one commit that publishes the fix and links its history |

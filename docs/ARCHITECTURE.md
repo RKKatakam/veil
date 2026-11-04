@@ -494,6 +494,31 @@ CAS, and it applies these rules in order:
      still goes through the secret scanner below. A policy that arrived by
      merge, `vl new <cloaked change>` in an ordinary workspace, rebases and
      squashes never move sealed content to another audience.
+   * **"Now sealed" never reads as "deleted".** A file the policy says is
+     public but that is sealed because of the line it is edited on (a
+     cloaked workspace, or sealed content keeping its audience) carries its
+     **last public version** as the entry's `fallback`, as an embargoed
+     file does: the parent's public entry, or the fallback the parent's
+     sealed entry already carried. Readers without the key (public remotes,
+     the Git projection, members of other scopes) see and check out that
+     version; key holders see the edit. Squash into a cloaked change
+     (`seal_introduced`), merges into a cloaked line (`normalize_tree`) and
+     diff3 merges (`merged_visibility`: the other side's public version
+     when there is one, so a rebase onto a public edit shows the newer
+     public version) keep the same rule. Edited back to that version, the
+     file is recorded public again. A file the *policy* cloaks (`vl cloak`)
+     carries no fallback: hiding it is the point, so public readers lose it.
+     The fallback reveals nothing new (it was public), and nothing reads a
+     cloaked entry's fallback as its content: merges and declassification
+     read the sealed object itself (no key: refused), so the old version is
+     never re-sealed or published in place of the edit.
+   * A reader without the key who edits such a file cannot seal the edit:
+     it is held back (`BuildReport::cloak_failures`; the file stays local)
+     and the recorded entry is kept, as is any tracked file this reader
+     cannot seal. Deleting the copy shown is not a deletion of the sealed
+     content (it is carried, rule 6). Before this rule (BUG-074), such an
+     edit made the public side see the file deleted, on GitHub as a commit
+     deleting it.
 5. Embargoed entries stay embargoed until their embargo is released, and a
    tree under an unreleased embargo stays under it (§7). A key holder's
    edit of an embargoed file is secret-scanned like a public one, because
@@ -564,6 +589,14 @@ struct Snapshot {
   skips them and undoes the operation before. The edits they recorded are
   re-applied on the restored working copy with a 3-way merge
   (`Repo::undo_keeping_edits`, `Repo::restore_operation_keeping_edits`).
+* **Commit and tags.** `vl commit` (`Repo::commit`) moves the tags that
+  pointed at the working copy's first parent to the committed change, so
+  `main` follows commits made on it. On a **cloaked line** (the workspace
+  or the change is cloaked under `S`) only tags cloaked under `S` move: an
+  uncloaked tag is what public remotes and Git receive, and cloaked work
+  reaches it only through an explicit `vl merge` (published after a scan,
+  or embargoed) or `vl tag set`. `vl commit --no-advance` moves no tag. The
+  CLI names the tags that stayed and how to move them (BUG-075).
 * **Transactions auto-rebase.** Rewrites and abandons go into a
   `rewritten` map. On commit, every visible descendant is rebased in
   topological order with a 3-way tree merge
@@ -573,7 +606,10 @@ struct Snapshot {
   from are abandoned automatically.
 * **Merging** is tree-level. Identical subtrees resolve by id, and files
   changed on both sides go through diff3 (`diffy`). Conflicts are written as
-  markers and recorded on the snapshot until the file is edited.
+  markers and recorded on the snapshot until the file is edited. `vl merge`
+  records them on the merge and continues on a new change on top, so
+  `vl status` lists the conflicts of `@` and those of its parents whose
+  file `@` has not touched yet.
 * **Visibility never silently widens.** Declassification (any move from
   cloaked or embargoed to more visible) is an explicit act by a member: a
   `vl merge` of a cloaked line of work, or a `vl expose`, both of which go
@@ -597,7 +633,9 @@ struct Snapshot {
     controls;
   * squashing a cloaked change into a public parent seals the joined
     description; squashing anything into a cloaked change seals what it
-    brings;
+    brings (a public file keeping its last public version as fallback,
+    §4 rule 4). A squash keeps a recorded conflict only if the squashed
+    change left the file untouched, or has the conflict itself;
   * the builder rule above (sealed content keeps its audience) covers
     working copies.
 
@@ -813,7 +851,10 @@ readable by anyone else must not be part of it:
 happens *during the object walk*: a public remote never receives sealed
 objects except those of released embargoes, never receives cloaked tags, and
 nothing is ever transferred under the `local` scope. Isolated content cannot
-be pushed at all, because it was never in the graph.
+be pushed at all, because it was never in the graph. File fallbacks are
+plaintext and travel with their entries: a clone of a public remote checks
+out the last public version of a file edited on a cloaked line (§4 rule 4),
+and records it as shown from a fallback (§6), never as deleted.
 
 **Embargoed history.** Before walking, `push` computes, for every
 unreleased embargoed merge in the local graph, the snapshots that only its
@@ -1260,7 +1301,12 @@ how each object is *sealed*, never by which keys this replica holds:
   objects are visible. Objects sealed under a scope or `local` are not:
   their entries are left out and a directory left empty disappears. An
   embargo wrapper resolves to its sealed side once released, otherwise to
-  its fallback; an embargoed file shows its fallback. A `.git` entry, which
+  its fallback; a file whose content is hidden shows its fallback if it has
+  one: an embargoed file its pre-merge version, a public file edited on a
+  cloaked line its last public version (§4 rule 4). So a cloaked edit is
+  exported as a commit that leaves the file as it was, never one that
+  deletes it, and a Git commit made on that view imports as an edit of it
+  (the import's `base` is the same projection). A `.git` entry, which
   Git cannot hold, is left out with a warning, in every spelling that
   names it on macOS (any case, HFS+-ignorable code points such as
   `.g\u{200C}it`, as Git's `is_hfs_dotgit`); import refuses them too. Isolated files were never in

@@ -11,8 +11,10 @@
 //!   entries are left out, and a directory left empty disappears;
 //! * objects sealed under an embargo are visible only once it is released;
 //! * an embargo wrapper resolves to its sealed side once released, else to
-//!   its fallback (the pre-merge tree); an embargoed file whose content is
-//!   hidden shows its fallback.
+//!   its fallback (the pre-merge tree); a file whose content is hidden
+//!   shows its fallback if it has one (an embargoed file its pre-merge
+//!   version, a public file edited on a cloaked line its last public
+//!   version), so "now sealed" never reads as "deleted".
 //!
 //! Isolated files never reach this point: they are not in the graph at all.
 

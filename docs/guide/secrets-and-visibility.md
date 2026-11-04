@@ -325,19 +325,22 @@ member id works for encryption, but then their signatures show as unknown
 
 **Cloaked workspaces and tags.** `vl ws new NAME --cloak [S]` makes a
 workspace in which everything recorded is cloaked, descriptions included.
-`vl tag set NAME --cloak [S]` makes a tag that public remotes never receive.
+`vl commit` there moves only tags cloaked under the same scope, never
+`main` or another uncloaked tag. `vl tag set NAME --cloak [S]` makes a tag
+that public remotes never receive.
 
 **Visibility never widens by accident.** Rebase, `vl new`, squash, and
 policy edits that arrive by merge keep sealed files sealed. Publishing is
 explicit: `vl merge` of a cloaked line (secret-scanned; it lists what it
 published) or `vl expose`.
 
-> **Careful with public files in a cloaked workspace.** A public file you
-> *edit* in a cloaked workspace is recorded cloaked. If that change then
-> lands on a tag you push to a public remote or GitHub (for example because
-> `vl commit` moved `main`, see [the pitfalls](coming-from-git.md#vl-commit-moves-the-tags-at-the-parent)),
-> the public side sees the file **deleted**. Bring cloaked work to a public
-> line with `vl merge`, which publishes it deliberately.
+> **Public files edited in a cloaked workspace.** A public file you *edit*
+> in a cloaked workspace is recorded cloaked, together with its last public
+> version. Anyone who cannot read the scope (a public remote, GitHub,
+> teammates outside it) keeps seeing that last public version, never a
+> deleted file, until you publish the work with `vl merge`. A file you
+> cloak with `vl cloak` is different: hiding it is the point, so public
+> readers stop seeing it.
 
 ## The accepted policy: when an incoming change is held back
 

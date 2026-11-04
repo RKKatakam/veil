@@ -498,12 +498,14 @@ fn normalize_file(
         // with the merged content if we can read it.
         (v, _) if !unchanged_from_dest && !matches!(v, Visibility::Embargoed { .. }) && dest_sealed.is_some_and(|d| d.visibility != *v) => {
             let d = dest_sealed.expect("checked");
-            let resealed = match store.read_entry(e) {
+            // The entry's own content, never its fallback: resealing the
+            // last public version would revert the merged side's edit.
+            let resealed = match store.read_blob(&e.id) {
                 Ok(data) => Some(TreeEntry {
                     id: store.store_file(&data, &d.visibility)?,
                     size: data.len() as u64,
                     visibility: d.visibility.clone(),
-                    fallback: None,
+                    fallback: public_fallback(Some(e), &d.visibility).or(d.fallback),
                     ..e.clone()
                 }),
                 Err(err) if err.is_unreadable() => None,
@@ -536,13 +538,16 @@ fn normalize_file(
         (v, Some(want)) if *v == want => {}
         (Visibility::Public, Some(want)) => {
             // Sealing is never a downgrade. Without the key the
-            // entry stays as it was in its source.
+            // entry stays as it was in its source. Sealed only by the
+            // destination's cloak (the policy says public): the public
+            // content stays what readers without the key see.
+            let line_sealed = opts.policy.classify(&path, false).tier == Tier::Public;
             if let Ok(data) = store.read_entry(e) {
                 if let Ok(id) = store.store_file(&data, &want) {
                     ne = Some(TreeEntry {
                         id,
                         visibility: want,
-                        fallback: None,
+                        fallback: line_sealed.then_some(e.id),
                         ..e.clone()
                     });
                 }
@@ -583,7 +588,9 @@ fn declassify(
     opts: &NormalizeOptions,
     report: &mut NormalizeReport,
 ) -> Result<Option<TreeEntry>> {
-    let data = match store.read_entry(e) {
+    // The entry's own content: publishing its fallback (the last public
+    // version) would silently revert the cloaked line's edit.
+    let data = match store.read_blob(&e.id) {
         Ok(d) => d,
         Err(err) if err.is_unreadable() => {
             return Err(VeilError::Policy(format!(
@@ -632,6 +639,23 @@ pub fn policy_rekeys(
         }
     }
     Ok(out)
+}
+
+/// The last public version of a file about to be sealed under `vis` only
+/// because of the line it is edited on (its policy says public), given its
+/// previous entry `prev`: `prev` itself if public, or the fallback `prev`
+/// already carries if it is such a sealed edit under the same scope.
+/// Readers without the key see this version instead of losing the file
+/// (BUG-074): public remotes, Git export and members of other scopes.
+pub(crate) fn public_fallback(prev: Option<&TreeEntry>, vis: &Visibility) -> Option<ObjectId> {
+    let prev = prev.filter(|p| p.kind == EntryKind::File)?;
+    if prev.visibility.is_public() && prev.fallback.is_none() {
+        Some(prev.id)
+    } else if prev.visibility == *vis {
+        prev.fallback
+    } else {
+        None
+    }
 }
 
 /// Seal, under `scope`, every public file of `tree` that differs from
@@ -709,7 +733,9 @@ fn seal_introduced_dir(store: &ObjectStore, tree: &ObjectId, base: Option<Object
                     let data = store.read_entry(&e)?;
                     ne.id = store.store_file(&data, &vis)?;
                     ne.visibility = vis.clone();
-                    ne.fallback = None;
+                    // Its last public version stays what readers without
+                    // the key see (see `public_fallback`).
+                    ne.fallback = public_fallback(be.as_ref(), &vis);
                 }
                 EntryKind::File => {}
             }
