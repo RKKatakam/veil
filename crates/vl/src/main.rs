@@ -1,3 +1,24 @@
+// Every `println!` / `eprintln!` in this crate (these definitions shadow
+// std's in all modules declared below) goes through `render`, which survives
+// a closed pipe instead of panicking (`vl log | head`; see `render::Out`).
+macro_rules! println {
+    () => {
+        $crate::render::out_line(format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        $crate::render::out_line(format_args!($($arg)*))
+    };
+}
+
+macro_rules! eprintln {
+    () => {
+        $crate::render::err_line(format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        $crate::render::err_line(format_args!($($arg)*))
+    };
+}
+
 mod cli;
 mod ctx;
 mod doctor;
@@ -64,7 +85,7 @@ fn main() -> ExitCode {
         return sandbox::reaper_main(args.next().as_deref());
     }
     let cli = Cli::parse();
-    match run(cli) {
+    render::exit_status(match run(cli) {
         Ok(code) => code,
         Err(e) => {
             // Errors may quote repository data (names, paths): escape them.
@@ -81,7 +102,7 @@ fn main() -> ExitCode {
             }
             ExitCode::FAILURE
         }
-    }
+    })
 }
 
 fn open(cli: &Cli) -> Result<Ctx> {
@@ -96,7 +117,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Fsck { verbose } => cmd_fsck(cli.repository.as_deref(), *verbose),
         Cmd::Doctor { remotes } => doctor::run(cli.repository.as_deref(), *remotes),
         Cmd::Completions { shell } => {
-            clap_complete::generate(*shell, &mut Cli::command(), "vl", &mut std::io::stdout());
+            clap_complete::generate(*shell, &mut Cli::command(), "vl", &mut render::Out);
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Man { out_dir } => cmd_man(out_dir.as_deref()),
@@ -147,8 +168,8 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             let p = ctx.repo_path(path)?;
             let e = lookup(ctx.repo.store(), &ctx.repo.snapshot(&id)?.tree, &p)?
                 .ok_or_else(|| anyhow!("{p} does not exist in {}", id.short()))?;
-            let data = ctx.repo.store().read_entry(&e)?;
-            std::io::stdout().write_all(&data)?;
+            let data = read_file(&ctx.repo, &p, &e)?;
+            render::Out.write_all(&data)?;
         }
         Cmd::Evolog { rev } => {
             let mut cur = Some(ctx.rev(rev)?);
@@ -263,9 +284,9 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         }
         Cmd::Watch { interval_ms } => cmd_watch(ctx, *interval_ms)?,
         Cmd::Remote(c) => cmd_remote(ctx, c)?,
-        Cmd::Push { remote, tag, force, full } => cmd_push(ctx, remote, tag, *force, *full)?,
+        Cmd::Push { remote, tag, force, full } => return cmd_push(ctx, remote, tag, *force, *full),
         Cmd::Pull { remote, full } => cmd_pull(ctx, remote, *full)?,
-        Cmd::Git(c) => cmd_git(ctx, c)?,
+        Cmd::Git(c) => return cmd_git(ctx, c),
         Cmd::Gc {
             keep_ops_days,
             grace_minutes,
@@ -421,14 +442,7 @@ fn clone_populate(backend: Arc<dyn StorageBackend>, url: String, shown: String, 
         report.objects_copied,
         co.written
     );
-    if !co.redacted.is_empty() {
-        println!(
-            "  {} {} cloaked file(s) you hold no key for. Share your public key ({}) with a member\n  and ask them to run `vl scope grant team <key>` and push. They appear here on your next `vl pull` after that.",
-            yellow("note:"),
-            co.redacted.len(),
-            identity.public_id()
-        );
-    }
+    print_clone_redactions(&repo, &to, &co.redacted, &identity);
     if hidden_by_embargo {
         println!(
             "  {} an embargoed merge is not readable to you yet; you see its pre-merge content until it is released.",
@@ -436,6 +450,47 @@ fn clone_populate(backend: Arc<dyn StorageBackend>, url: String, shown: String, 
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// After a clone: explain the cloaked files left out of the working copy
+/// (`redacted`, paths in `tree`).
+/// A team remote delivers them sealed (a grant and a pull make them
+/// readable); a public remote never delivers them at all.
+fn print_clone_redactions(repo: &Repo, tree: &veil_core::ObjectId, redacted: &[VPath], identity: &Identity) {
+    use veil_core::object::Visibility;
+    let (mut sealed, mut withheld) = (0, 0);
+    let mut scopes = std::collections::BTreeSet::new();
+    for p in redacted {
+        // Embargoed content has a note of its own (below).
+        let Ok(Some(e)) = lookup(repo.store(), tree, p) else {
+            continue;
+        };
+        let Visibility::Cloaked { scope } = &e.visibility else {
+            continue;
+        };
+        scopes.insert(safe(scope).into_owned());
+        if repo.store().has(&e.id) {
+            sealed += 1;
+        } else {
+            withheld += 1;
+        }
+    }
+    let scopes: Vec<String> = scopes.into_iter().collect();
+    let scope = scopes.first().cloned().unwrap_or_default();
+    let named = format!(" (scope {})", scopes.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(", "));
+    if sealed > 0 {
+        println!(
+            "  {} {sealed} cloaked file(s){named} you hold no key for. Share your public key ({}) with a member\n  and ask them to run `vl scope grant {scope} <key>` and push. They appear here on your next `vl pull` after that.",
+            yellow("note:"),
+            identity.public_id()
+        );
+    }
+    if withheld > 0 {
+        println!(
+            "  {} {withheld} cloaked file(s){named} withheld: this is a public remote, and public remotes never deliver\n  cloaked content. To read them, ask a member to grant you (`vl scope grant {scope} <key>`; your key is in\n  `vl identity show`), then clone or pull from a team remote.",
+            yellow("note:"),
+        );
+    }
 }
 
 fn cmd_identity(c: &IdentityCmd) -> Result<ExitCode> {
@@ -794,7 +849,7 @@ fn cmd_show(ctx: &mut Ctx, rev: &str, stat: bool) -> Result<()> {
         let state = match rec {
             Some(r) if r.is_released() => "released".to_string(),
             Some(r) => match r.until {
-                Some(u) => format!("until {}", fmt_time(u)),
+                Some(u) => format!("until {}", fmt_deadline(u)),
                 None => "until manually released".into(),
             },
             None => "unknown".into(),
@@ -835,7 +890,7 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: &str) -> Result<()> {
         }
         match &c.new {
             Some(e) => {
-                let data = ctx.repo.store().read_entry(e)?;
+                let data = read_file(&ctx.repo, &c.path, e)?;
                 ctx.fs.write(&c.path, &data)?;
                 ctx.fs.set_executable(&c.path, e.executable)?;
             }
@@ -855,7 +910,7 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: &str) -> Result<()> {
         }
         match veil_core::tree::lookup(ctx.repo.store(), &src_tree, &p)? {
             Some(e) if e.kind == veil_core::EntryKind::File => {
-                ctx.fs.write(&p, &ctx.repo.store().read_entry(&e)?)?;
+                ctx.fs.write(&p, &read_file(&ctx.repo, &p, &e)?)?;
                 ctx.fs.set_executable(&p, e.executable)?;
             }
             _ => ctx.fs.remove_file(&p)?,
@@ -947,10 +1002,11 @@ fn cmd_merge(
         }
     };
     let others = revs.iter().map(|r| ctx.rev(r)).collect::<Result<Vec<_>>>()?;
+    let deadline = until.map(parse_time).transpose()?;
     let spec = if embargo || until.is_some() {
         Some(EmbargoSpec {
             scope: scope.to_string(),
-            until: until.map(parse_time).transpose()?,
+            until: deadline,
         })
     } else {
         None
@@ -964,19 +1020,40 @@ fn cmd_merge(
     println!("Merged {}", one_line(&ctx.repo, &res.snapshot));
     if let Some(e) = &res.embargo {
         println!(
-            "  {} {e}: changed files are sealed for scope '{scope}'; everyone else sees the pre-merge content{}.",
+            "  {} {e}: changed files are sealed for scope '{scope}'; everyone else sees the pre-merge content {}.",
             yellow("embargo"),
-            match until {
-                Some(u) => format!(" until {u}"),
-                None => " until `vl embargo release`".into(),
+            match deadline {
+                Some(t) => format!("until {}, or an earlier `vl embargo release {e}`", fmt_deadline(t)),
+                None => format!("until `vl embargo release {e}`"),
             }
         );
     }
-    if !res.declassified.is_empty() {
+    // A file of the merged-in cloaked line is public now, or (under an
+    // embargo, this merge's or the destination's) once that is released.
+    let merged = ctx.repo.snapshot(&res.snapshot)?.tree;
+    let (mut published, mut on_release) = (Vec::new(), Vec::new());
+    for p in &res.declassified {
+        let visibility = match VPath::new(p) {
+            Ok(vp) => lookup(ctx.repo.store(), &merged, &vp)?.map(|e| e.visibility),
+            Err(_) => None,
+        };
+        match visibility {
+            Some(veil_core::object::Visibility::Embargoed { .. }) => on_release.push(p.as_str()),
+            _ => published.push(p.as_str()),
+        }
+    }
+    if !published.is_empty() {
         println!(
             "  {} (secret-scanned): {}",
             yellow("published from the cloaked line"),
-            res.declassified.join(", ")
+            safe(&published.join(", "))
+        );
+    }
+    if !on_release.is_empty() {
+        println!(
+            "  {} (from the cloaked line; secret-scanned): {}",
+            yellow("public on release"),
+            safe(&on_release.join(", "))
         );
     }
     if !res.quarantined.is_empty() {
@@ -1006,7 +1083,7 @@ fn cmd_embargo(ctx: &mut Ctx, c: &EmbargoCmd) -> Result<()> {
                     green("released")
                 } else {
                     match r.until {
-                        Some(u) => yellow(&format!("until {}", fmt_time(u))),
+                        Some(u) => yellow(&format!("until {}", fmt_deadline(u))),
                         None => yellow("manual release"),
                     }
                 };
@@ -1554,8 +1631,18 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
         WsCmd::Cat { name, path } => {
             let wc = ctx.repo.workspace_wc(name)?;
             let view = ctx.repo.tree_view(&wc)?;
-            let data = view.read(&VPath::new(path)?)?;
-            std::io::stdout().write_all(&data)?;
+            let p = VPath::new(path)?;
+            let data = match view.read(&p) {
+                Err(err) if err.is_unreadable() => {
+                    let tree = ctx.repo.snapshot(&wc)?.tree;
+                    match lookup(ctx.repo.store(), &tree, &p)?.and_then(|e| hidden_explanation(&ctx.repo, &p, &e)) {
+                        Some(why) => bail!(why),
+                        None => return Err(err.into()),
+                    }
+                }
+                r => r?,
+            };
+            render::Out.write_all(&data)?;
         }
         WsCmd::Write { name, path } => {
             if *name == ctx.ws {
@@ -1653,6 +1740,10 @@ fn cmd_watch(ctx: &mut Ctx, interval_ms: u64) -> Result<()> {
         let now = ctx.wc()?;
         if now != last {
             println!("{}  snapshot {}", dim(&fmt_time(now_millis())), one_line(&ctx.repo, &now));
+            if stdout_closed() {
+                // Nobody is watching any more (`vl watch | head -1`).
+                return Ok(());
+            }
             last = now;
         }
     }
@@ -1724,15 +1815,25 @@ fn cmd_remote(ctx: &mut Ctx, c: &RemoteCmd) -> Result<()> {
     Ok(())
 }
 
-fn cmd_push(ctx: &mut Ctx, name: &str, tags: &[String], force: bool, full: bool) -> Result<()> {
+fn cmd_push(ctx: &mut Ctx, name: &str, tags: &[String], force: bool, full: bool) -> Result<ExitCode> {
     let (backend, cfg) = remote_backend(ctx, name)?;
     let opts = remote::SyncOptions { full };
     let r = remote::push_with(&mut ctx.repo, backend, cfg.public, tags, force, &opts)?;
     for (t, id) in &r.tags_updated {
         println!("  {} {} → {}", green("pushed"), cyan(&safe(t)), id.short());
     }
+    let mut rejected = Vec::new();
+    let mut withheld = Vec::new();
     for (t, why) in &r.tags_skipped {
-        println!("  {} {} ({})", yellow("skipped"), safe(t), safe(why));
+        if r.tags_rejected.contains(t) {
+            println!("  {} {} (remote has diverged: not a fast-forward)", red("rejected"), safe(t));
+            rejected.push(t.clone());
+        } else {
+            println!("  {} {} ({})", yellow("skipped"), safe(t), safe(why));
+            if tags.contains(t) {
+                withheld.push(t.clone());
+            }
+        }
     }
     for w in &r.warnings {
         warn_untrusted(w);
@@ -1747,7 +1848,46 @@ fn cmd_push(ctx: &mut Ctx, name: &str, tags: &[String], force: bool, full: bool)
             String::new()
         }
     );
-    Ok(())
+    let first = rejected.first().map(|t| safe(t).into_owned()).unwrap_or_default();
+    Ok(push_status(
+        &rejected,
+        &format!(
+            "{name} has changes you don't have. Run `vl pull {name}`, `vl merge {name}/{first}`, and push again (or `vl push --force` to overwrite them)"
+        ),
+        &withheld,
+    ))
+}
+
+/// Exit status of a push that did not send every tag it was asked to:
+/// failure if the remote rejected any (`rejected`, with `fix` saying what
+/// to do), or if a tag named on the command line was held back. Tags held
+/// back by design from an all-tags push (cloaked tags on a public remote,
+/// unreleased embargoes) do not fail it: a script tells "nothing to do"
+/// (0) from "partially rejected" (1) by the status alone.
+fn push_status(rejected: &[String], fix: &str, withheld: &[String]) -> ExitCode {
+    let list = |tags: &[String]| tags.iter().map(|t| safe(t).into_owned()).collect::<Vec<_>>().join(", ");
+    if !rejected.is_empty() {
+        eprintln!(
+            "{} {} {} rejected ({}): {fix}",
+            red("error:"),
+            rejected.len(),
+            if rejected.len() == 1 { "tag was" } else { "tags were" },
+            list(rejected)
+        );
+    }
+    if !withheld.is_empty() {
+        eprintln!(
+            "{} requested {} not pushed: {} (see `skipped` above)",
+            red("error:"),
+            if withheld.len() == 1 { "tag was" } else { "tags were" },
+            list(withheld)
+        );
+    }
+    if rejected.is_empty() && withheld.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 fn cmd_pull(ctx: &mut Ctx, name: &str, full: bool) -> Result<()> {
@@ -1765,7 +1905,7 @@ fn cmd_pull(ctx: &mut Ctx, name: &str, full: bool) -> Result<()> {
 
 // ---- git -----------------------------------------------------------------
 
-fn cmd_git(ctx: &mut Ctx, c: &GitCmd) -> Result<()> {
+fn cmd_git(ctx: &mut Ctx, c: &GitCmd) -> Result<ExitCode> {
     use veil_core::git;
     let git_dir = git::default_git_dir(&ctx.root);
     match c {
@@ -1818,7 +1958,14 @@ fn cmd_git(ctx: &mut Ctx, c: &GitCmd) -> Result<()> {
         GitCmd::Push { remote, tag, force } => {
             let r = git::push(&mut ctx.repo, &git_dir, remote, tag, *force)?;
             print_git_export(&r.export);
-            let mut rejected = false;
+            let withheld: Vec<String> = r
+                .export
+                .skipped
+                .iter()
+                .filter(|(t, _)| tag.contains(t))
+                .map(|(t, _)| t.clone())
+                .collect();
+            let mut rejected = Vec::new();
             for (branch, status) in &r.outcome.refs {
                 let commit = r
                     .export
@@ -1834,16 +1981,19 @@ fn cmd_git(ctx: &mut Ctx, c: &GitCmd) -> Result<()> {
                     git::RefStatus::Forced => println!("  {} {b} → {commit} (forced)", yellow("pushed")),
                     git::RefStatus::UpToDate => println!("  {} {b}", dim("up to date")),
                     git::RefStatus::Rejected(why) => {
-                        rejected = true;
+                        rejected.push(branch.clone());
                         println!("  {} {b} ({})", red("rejected"), safe(why));
                     }
                 }
             }
-            if rejected {
-                bail!(
-                    "some branches were rejected: they moved on the Git side. Run `vl git pull {remote}`, merge, and push again (or push --force)"
-                );
-            }
+            let first = rejected.first().map(|t| safe(t).into_owned()).unwrap_or_default();
+            return Ok(push_status(
+                &rejected,
+                &format!(
+                    "{remote} has commits you don't have. Run `vl git pull {remote}`, `vl merge {remote}/{first}`, and push again (or `vl git push --force` to overwrite them)"
+                ),
+                &withheld,
+            ));
         }
         GitCmd::Export { tag } => {
             let mut bridge = git::GitBridge::open(&ctx.repo, &git_dir)?;
@@ -1854,7 +2004,7 @@ fn cmd_git(ctx: &mut Ctx, c: &GitCmd) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 fn print_git_export(r: &veil_core::git::ExportReport) {
@@ -2106,7 +2256,7 @@ fn cmd_gc(
 fn cmd_man(out_dir: Option<&Path>) -> Result<ExitCode> {
     let cmd = Cli::command();
     match out_dir {
-        None => clap_mangen::Man::new(cmd).render(&mut std::io::stdout())?,
+        None => clap_mangen::Man::new(cmd).render(&mut render::Out)?,
         Some(dir) => {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
             clap_mangen::generate_to(cmd, dir).with_context(|| format!("writing man pages to {}", dir.display()))?;

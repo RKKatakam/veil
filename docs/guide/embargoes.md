@@ -61,13 +61,13 @@ switch). You can also work on the fix without switching, with
 ```text
 $ vl merge fix-cve@ --into main --embargo --until +7d -m "Fix CVE-2026-1234"
 Merged uqttozys af765f31 Fix CVE-2026-1234
-  embargo 77932133a2: changed files are sealed for scope 'team'; everyone else sees the pre-merge content until +7d.
-  published from the cloaked line (secret-scanned): parser.py
+  embargo 77932133a2: changed files are sealed for scope 'team'; everyone else sees the pre-merge content until 2026-11-11 04:09:55 UTC, or an earlier `vl embargo release 77932133a2`.
+  public on release (from the cloaked line; secret-scanned): parser.py
 Updated 1 files, removed 0
 Working copy now at: ykskusvt 0ce6baf3 (empty) (no description set)
 
 $ vl embargo list
-77932133a2  scope:team  until 2026-11-11 04:09:55
+77932133a2  scope:team  until 2026-11-11 04:09:55 UTC
 
 $ vl log -n 4
 @  ykskusvt alice ✓ 2026-11-04 04:09:55 default@ 0ce6baf3 (empty)
@@ -83,9 +83,13 @@ $ vl log -n 4
 * `--scope S` (default `team`) is the audience before release. **Use the
   same scope as the fix workspace's `--cloak`**: a team remote only receives
   the fix's history if it is sealed for the embargo's own scope.
-* "published from the cloaked line" means the merge moves the fix's files
-  from the cloaked line onto `main` (after a secret scan). Under the
-  embargo, they become readable to others only at the release.
+* "public on release" lists the fix's files that the merge moves from the
+  cloaked line onto `main` (after a secret scan). They are sealed under the
+  embargo and become readable to others at the release. (A merge without
+  `--embargo` lists them as "published from the cloaked line": public at
+  once.)
+* The deadline is shown in local time with its UTC offset, plus UTC
+  (here the machine's zone is UTC).
 * `main` moved to the merge, as `vl merge` moves tags at the change it
   merges into.
 
@@ -136,7 +140,7 @@ def parse(buf):
 
 $ vl show main
 …
-Embargo   : 77932133a2 (until 2026-11-11 04:09:55)
+Embargo   : 77932133a2 (until 2026-11-11 04:09:55 UTC)
 
     [cloaked:embargo/77932133a2]
 

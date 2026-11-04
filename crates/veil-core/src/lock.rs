@@ -364,15 +364,44 @@ impl LockInfo {
 
     fn describe_at(&self, now: i64) -> String {
         format!(
-            "pid {} on {} (lease renewed {:.1}s ago)",
+            "pid {} on {} ({}{})",
             self.pid,
             if self.host.is_empty() {
                 "an unknown host"
             } else {
                 &self.host
             },
-            (now - self.renewed) as f64 / 1000.0
+            lease_age(self.renewed, now),
+            // Only the legacy `"<pid> <millis>"` format has no token.
+            if self.token.is_empty() { "; legacy lock file" } else { "" }
         )
+    }
+}
+
+/// When a lease was last renewed, relative to `now`, for messages. A time
+/// no version of `vl` writes (before 2000, or more than a day ahead: a
+/// damaged or hand-written lock file, a timestamp in another unit) is said
+/// to be unreadable rather than turned into a nonsense age.
+fn lease_age(renewed: i64, now: i64) -> String {
+    const Y2000_MS: i64 = 946_684_800_000;
+    const DAY_MS: i64 = 86_400_000;
+    if renewed < Y2000_MS || renewed > now.saturating_add(DAY_MS) {
+        return format!("lease renewal time unreadable: {renewed}");
+    }
+    match now - renewed {
+        age if age >= 0 => format!("lease renewed {} ago", fmt_age(age)),
+        ahead => format!("lease renewed {} in the future; the clocks differ", fmt_age(-ahead)),
+    }
+}
+
+/// `4.2s`, `3m 05s`, `2h 10m`, `3d 4h`.
+fn fmt_age(ms: i64) -> String {
+    let s = ms / 1000;
+    match s {
+        _ if ms < 60_000 => format!("{:.1}s", ms as f64 / 1000.0),
+        _ if s < 3_600 => format!("{}m {:02}s", s / 60, s % 60),
+        _ if s < 86_400 => format!("{}h {:02}m", s / 3_600, s / 60 % 60),
+        _ => format!("{}d {}h", s / 86_400, s / 3_600 % 24),
     }
 }
 
@@ -1533,6 +1562,31 @@ mod tests {
         assert_eq!((i.pid, i.renewed, i.lease_ms), (4242, 1_700_000_000_000, 120_000));
         assert!(LockInfo::parse(b"").is_none());
         assert!(LockInfo::parse(b"garbage here now").is_none());
+    }
+
+    /// BUG-082: a legacy or damaged lock file used to read
+    /// `lease renewed -1793763700901071.5s ago`.
+    #[test]
+    fn lock_descriptions_never_show_nonsense_ages() {
+        let now = 1_793_000_000_000;
+        let at = |raw: &[u8]| LockInfo::parse(raw).unwrap().describe_at(now);
+        // Legacy file, millis: a readable age, and marked legacy.
+        let d = at(format!("4242 {}", now - 125_000).as_bytes());
+        assert!(d.contains("lease renewed 2m 05s ago; legacy lock file"), "{d}");
+        // Legacy file written with nanoseconds, or garbage numbers.
+        for raw in [b"4242 1793763700901071512".as_slice(), b"4242 -5", b"4242 12"] {
+            let d = at(raw);
+            assert!(d.contains("lease renewal time unreadable"), "{d}");
+            assert!(!d.contains("ago"), "{d}");
+        }
+        // Current format: a few hours, and a clock slightly ahead.
+        let mut i = info(7, "h", "b", 0);
+        i.renewed = now - 3 * 3_600_000 - 60_000;
+        assert!(i.describe_at(now).ends_with("(lease renewed 3h 01m ago)"), "{}", i.describe_at(now));
+        i.renewed = now + 4_000;
+        assert!(i.describe_at(now).contains("lease renewed 4.0s in the future"), "{}", i.describe_at(now));
+        i.renewed = now - 1_500;
+        assert!(i.describe_at(now).contains("lease renewed 1.5s ago"), "{}", i.describe_at(now));
     }
 
     #[test]

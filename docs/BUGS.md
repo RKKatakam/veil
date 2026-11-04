@@ -553,17 +553,17 @@ the SFTP wave.)
 | BUG-076 | medium (**fixed**, policy wave: built-in VCS metadata ignore, `policy::vcs_metadata`; tests in `policy_round4_cli`, `policy_accept`) | init / policy | `vl init` inside a Git checkout records the whole `.git/` directory as public content (56 files in the test), which would be pushed to Veil remotes. `.jj/`, `.hg/` likewise. |
 | BUG-077 | medium (**fixed**, key-management wave) | sync / privacy | Key rings are synced to public remotes (public readers need them to verify embargo records), so `vl scope list` on a public-mirror clone shows member names and ids. Not in the threat model. **Fix:** public remotes receive no key rings; their clones accept embargo records unverified (they hold no scope key, so they never auto-release; released keys are checked against the fingerprint) and a member-signed record later replaces an unverified one; rings an earlier vl pushed there are reported, not deleted. What stays visible is in the threat model. `round4_keys`. |
 | BUG-089 | medium (**fixed**, key-management wave) | identity | Replacing your identity (`vl identity new --force`) while being a scope's only admin freezes the scope: no command restores admin rights; only a manual restore of the retired identity file works. **Fix:** `vl identity new --force` warns about scopes whose only admin it is replacing; `vl identity recover-admin [--from FILE] [--revoke-old]` lets the retired identity grant the new one admin rights (then optionally revokes it). `identity_cli`: `a_sole_admin_can_hand_over_after_replacing_the_identity`; `round4_keys`. |
-| BUG-078 | low | CLI | `vl log \| head` (any truncated pipe) panics with exit code 101. |
+| BUG-078 | low (**fixed**, CLI polish wave) | CLI | `vl log \| head` (any truncated pipe) panics with exit code 101. |
 | BUG-079 | low (**fixed**) | status | **Fixed:** status lists conflicts of `@` and of its parents whose file `@` has not touched, with a hint. Originally: `vl status` never shows the conflicts of a merge (they are recorded on `@-`; status only lists `@`'s). |
 | BUG-080 | low (**fixed**) | squash | **Fixed:** squash keeps a conflict only if the squashed change left the file untouched (or has the conflict itself). Originally: `vl squash` of a conflict resolution into the merge keeps the `(conflict)` mark. |
-| BUG-081 | low | push | A push that skips diverged tags exits 0 (Git exits non-zero). |
-| BUG-082 | low | doctor | A legacy-format stale lock shows a nonsense time in `vl doctor` (`lease renewed -1793763700901071.5s ago`). |
+| BUG-081 | low (**fixed**, CLI polish wave) | push | A push that skips diverged tags exits 0 (Git exits non-zero). |
+| BUG-082 | low (**fixed**, CLI polish wave) | doctor | A legacy-format stale lock shows a nonsense time in `vl doctor` (`lease renewed -1793763700901071.5s ago`). |
 | BUG-083 | low (**fixed**, policy wave) | policy | After `vl expose t.pem` the ignored `public` rule warns on every command, even after `vl expose --force` adds `public!`; `vl policy check` shows both. |
-| BUG-084 | low | messages | `vl cat` of a cloaked file in a public-mirror clone says `object … is not present in this store` instead of "withheld/redacted". |
+| BUG-084 | low (**fixed**, CLI polish wave) | messages | `vl cat` of a cloaked file in a public-mirror clone says `object … is not present in this store` instead of "withheld/redacted". |
 | BUG-085 | low (**fixed**, policy wave) | messages | `vl cloak x` by a non-member of an existing `team` scope suggests `vl scope create team`. |
-| BUG-086 | low | messages | A clone from a public mirror suggests asking for a grant, but public remotes never deliver cloaked content. |
-| BUG-087 | low | messages | `vl merge --embargo` reports embargoed files as "published from the cloaked line" and prints `until +7d` literally rather than the date. |
-| BUG-088 | low | docs | The README Quick start log shows a `main` tag that `vl init` + `vl commit` never creates. |
+| BUG-086 | low (**fixed**, CLI polish wave) | messages | A clone from a public mirror suggests asking for a grant, but public remotes never deliver cloaked content. |
+| BUG-087 | low (**fixed**, CLI polish wave) | messages | `vl merge --embargo` reports embargoed files as "published from the cloaked line" and prints `until +7d` literally rather than the date. |
+| BUG-088 | low (**fixed**, CLI polish wave) | docs | The README Quick start log shows a `main` tag that `vl init` + `vl commit` never creates. |
 
 ---
 

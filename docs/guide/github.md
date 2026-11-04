@@ -170,7 +170,7 @@ rejected:
 $ vl git push
 Exported 1 commit(s)
   rejected main ([rejected] (fetch first))
-error: some branches were rejected: they moved on the Git side. Run `vl git pull origin`, merge, and push again (or push --force)
+error: 1 tag was rejected (main): origin has commits you don't have. Run `vl git pull origin`, `vl merge origin/main`, and push again (or `vl git push --force` to overwrite them)
 
 $ vl git pull
 warning: tag 'main' has diverged from Git branch origin/main; nothing was lost on either side. Merge with `vl merge origin/main`, then `vl git push origin`

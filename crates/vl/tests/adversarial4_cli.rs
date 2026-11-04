@@ -187,7 +187,9 @@ fn a_members_edit_during_a_pending_change_keeps_their_rule_order() {
     alice_publishes_policy(&env, &alice, &bob, "notes/** public\n.env public!\n");
     let out = env.ok("bob", &bob, &["commit", "-m", "work"]);
     env.ok("bob", &bob, &["tag", "set", "bob-work", "-r", "@-"]);
-    env.ok("bob", &bob, &["push"]);
+    // Only Bob's work: `main` has diverged on the remote, and since the
+    // CLI polish wave a push with a rejected tag exits non-zero (BUG-081).
+    env.ok("bob", &bob, &["push", "origin", "-t", "bob-work"]);
     let files = recorded(&env, "bob", &bob, "@-");
     let leaked = veil_core_backend_contains(&env.root.join("team"), b"salary review");
     assert!(

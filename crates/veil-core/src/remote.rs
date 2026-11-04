@@ -100,6 +100,11 @@ pub struct SyncReport {
     pub missing: usize,
     pub tags_updated: Vec<(String, ObjectId)>,
     pub tags_skipped: Vec<(String, String)>,
+    /// The tags of `tags_skipped` that the remote refused: it holds a
+    /// version that is not an ancestor of ours (push without `force`).
+    /// The others were held back by design (a cloaked tag on a public
+    /// remote, an unreleased embargo).
+    pub tags_rejected: Vec<String>,
     pub warnings: Vec<String>,
     /// Packs written on the receiving side.
     pub packs_written: usize,
@@ -1048,6 +1053,7 @@ pub fn push_with(
             // `tag`, and walking the remote's would cost a round trip per
             // snapshot.
             if !force && !local.is_ancestor(&existing.target, &tag.target)? {
+                report.tags_rejected.push(name.clone());
                 report
                     .tags_skipped
                     .push((name, "remote has diverged (non-fast-forward; use --force)".into()));

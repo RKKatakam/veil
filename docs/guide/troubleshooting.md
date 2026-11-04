@@ -70,10 +70,32 @@ readable`) after an admin grants you the scope and pushes, and you pull.
 From a **public** remote they never appear: public remotes don't carry
 cloaked content at all.
 
-### `error: object … is not present in this store` from `vl cat`
+### `note: N cloaked file(s) (scope 'S') withheld: this is a public remote, and public remotes never deliver cloaked content. …`
 
-The file is cloaked, and this repository was cloned from a public remote,
-which withheld its content. `vl files` shows it as `(redacted)`.
+You cloned a public mirror. The cloaked files' names are in history, but
+not their content, and no pull from the mirror will bring it, even after
+a grant. Ask a member of `S` to grant you (`vl scope grant S <key>`; your
+key is in `vl identity show`), then clone the **team** remote, or add it
+(`vl remote add origin …`) and `vl pull origin`.
+
+### `error: X is cloaked under scope 'S' and was withheld: this repository's content came from a public remote, …`
+
+`vl cat` (or `vl restore`) of a cloaked file in a clone of a public
+mirror. As above: once granted, clone or pull from a team remote.
+`vl files` shows such files as `(redacted)`, and `vl diff` / `vl show` as
+`(content hidden: cloaked:S; withheld by a public remote)`.
+
+### `error: X is cloaked under scope 'S' and you hold no key for it. …`
+
+The content is here, sealed, but you are not a member of `S`. Share your
+public key (`vl identity show`) with a member, who runs
+`vl scope grant S <key>` and pushes; then `vl pull`. `vl diff` and
+`vl show` say `(content hidden: cloaked:S; you hold no key)`.
+
+### `error: X is under embargo E, which is not released yet …`
+
+The file belongs to an embargoed merge you can't read. `vl show REV`
+gives the deadline (`Embargo   : E (until …)`); after the release, pull.
 
 ### `warning: key ring for scope 'team': exists on both sides with different keys; the incoming key ring was not merged`
 
@@ -157,21 +179,29 @@ embargo the second fix on a separate line. See
 
 ## Remotes and Git
 
-### `skipped main (remote has diverged (non-fast-forward; use --force))`
+### `rejected main (remote has diverged: not a fast-forward)` / `error: 1 tag was rejected (main): origin has changes you don't have. …`
 
 Someone pushed to `main` since you last pulled. `vl pull`,
-`vl merge origin/main`, `vl push`. The push still exits 0, so scripts must
-check for `skipped`.
+`vl merge origin/main`, `vl push`. The other tags were pushed; the push
+exits 1 so that scripts notice. `vl push --force` overwrites the remote's
+`main` instead.
+
+### `skipped T (cloaked tag is never pushed to a public remote)`, `skipped T (… embargo …)`
+
+Held back by design; a push of all tags still exits 0. If you named the
+tag (`vl push -t T`), the push fails with
+`error: requested tag was not pushed: T`.
 
 ### `warning: tag 'main' has diverged from origin/main; merge with `vl merge origin/main``
 
 The pull updated `origin/main` but left your `main` alone. Merge, then
 push.
 
-### `rejected main ([rejected] (fetch first))` / `error: some branches were rejected: …`
+### `rejected main ([rejected] (fetch first))` / `error: 1 tag was rejected (main): origin has commits you don't have. …`
 
 The Git branch moved on GitHub. `vl git pull`, `vl merge origin/main`,
-`vl git push`. `vl git push --force` overwrites only what you last fetched.
+`vl git push`. The other branches were pushed; the push exits 1.
+`vl git push --force` overwrites only what you last fetched.
 
 ### `warning: origin/B was force-pushed on the Git side (…); the Veil history it dropped is kept`
 
@@ -274,10 +304,14 @@ those snapshots.
 The workspace your directory was attached to was removed (perhaps by
 `vl ws rm` from elsewhere, or an undo). `vl ws list`, then `vl ws switch`.
 
-### `error: … Broken pipe` when piping into `head`
+### Exit status 141 after `vl log | head`
 
-`vl log | head` currently panics when `head` closes the pipe (exit code
-101). The repository is not affected. Use `vl log -n N` instead.
+`head` closed the pipe before `vl` finished writing. `vl` stops printing,
+finishes the command (the repository is not affected) and exits with 141,
+as Git does (128 + SIGPIPE). Shells only show it with `set -o pipefail`.
+`vl log -n N` avoids it. If standard output fails for another reason (a
+full disk), `vl` says `error: could not write to standard output: …` and
+exits 1.
 
 ## Locks, crashes and integrity
 
@@ -286,7 +320,10 @@ The workspace your directory was attached to was removed (perhaps by
 Another `vl` holds the lock, or held it on another machine (common on
 network filesystems). Locks left by a crashed `vl` on the same machine are
 taken over automatically. If you're sure nothing is running, delete
-`.veil/lock`. `vl doctor` describes the holder.
+`.veil/lock`. `vl doctor` describes the holder, such as
+`pid 4242 on build-host (lease renewed 2m 05s ago)`. `legacy lock file`
+means an old `vl` wrote it; `lease renewal time unreadable: N` means the
+file holds no valid time (it is damaged or was written by hand).
 
 ### `error: repository is locked: this process's repository lock was taken over; the operation was not recorded`
 
