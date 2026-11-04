@@ -265,6 +265,7 @@ fn an_embargoed_merge_reports_files_as_public_on_release_and_an_absolute_deadlin
 
     let out = env.cmd("alice", &proj, &["embargo", "list"]).env("TZ", "CET-1").output().unwrap();
     assert!(text(&out).contains("until 2099-12-01 10:00:00 +01:00 (09:00:00 UTC)"), "{}", text(&out));
+    assert!(text(&out).lines().all(|l| l == l.trim_end()), "no trailing spaces: {:?}", text(&out));
 
     // A relative deadline is printed as a date, never as typed.
     env.ok("alice", &proj, &["undo"]);

@@ -19,7 +19,9 @@ use crate::{
 /// this: objects, then the operation, then the operation head). Symlinks are
 /// not followed and are invisible to the engine in this MVP: `metadata`
 /// reports nothing at a symlink, `read` refuses one, and `list_dir_full`
-/// reports them as `special` so callers never write through or over them.
+/// reports them as `special` so callers never write through or over them;
+/// writes themselves refuse a path below a symlinked directory (outside
+/// `.veil/`).
 ///
 /// [`StorageBackend::write_unsynced`] skips both fsyncs and remembers the
 /// file; [`StorageBackend::sync_barrier`] then syncs every remembered file
@@ -127,6 +129,37 @@ impl DiskBackend {
             f.push(c);
         }
         f
+    }
+
+    /// Refuse to write `path` if a directory above it, below the root, is
+    /// a symlink: the write would land wherever the link points, outside
+    /// what the engine manages (an untracked `vendor -> /shared/vendor`).
+    /// Checkout and `vl restore` already skip such paths; this guards every
+    /// other caller. The engine's own directory (`.veil/` at the root) is
+    /// not checked: nothing from a tree is ever written there. One `lstat`
+    /// per existing directory above the path.
+    fn refuse_symlinked_parent(&self, path: &VPath) -> Result<()> {
+        let parts: Vec<&str> = path.components().collect();
+        if parts.first() == Some(&crate::repo::VEIL_DIR) {
+            return Ok(());
+        }
+        let mut dir = self.root.clone();
+        for part in &parts[..parts.len().saturating_sub(1)] {
+            dir.push(part);
+            match fs::symlink_metadata(&dir) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    return Err(VeilError::InvalidPath(format!(
+                        "refusing to write {path}: {} is a symbolic link",
+                        dir.strip_prefix(&self.root).unwrap_or(&dir).display()
+                    )));
+                }
+                Ok(m) if m.is_dir() => {}
+                // Missing (created as a real directory below) or not a
+                // directory (the write fails).
+                _ => break,
+            }
+        }
+        Ok(())
     }
 }
 
@@ -399,6 +432,7 @@ impl StorageBackend for DiskBackend {
         if path.is_root() {
             return Err(VeilError::InvalidPath("cannot write to the root".into()));
         }
+        self.refuse_symlinked_parent(path)?;
         let full = self.full_path(path);
         let parent = full.parent().expect("non-root path has a parent");
         create_dir_all_durable(parent).map_err(|e| io_err(parent, e))?;
@@ -424,6 +458,7 @@ impl StorageBackend for DiskBackend {
         if path.is_root() {
             return Err(VeilError::InvalidPath("cannot write to the root".into()));
         }
+        self.refuse_symlinked_parent(path)?;
         let full = self.full_path(path);
         let parent = full.parent().expect("non-root path has a parent");
         let mut created = Vec::new();
@@ -503,6 +538,7 @@ impl StorageBackend for DiskBackend {
         if path.is_root() {
             return Err(VeilError::InvalidPath("cannot write to the root".into()));
         }
+        self.refuse_symlinked_parent(path)?;
         let full = self.full_path(path);
         let parent = full.parent().expect("non-root path has a parent");
         create_dir_all_durable(parent).map_err(|e| io_err(parent, e))?;

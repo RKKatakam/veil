@@ -95,7 +95,7 @@ fn normalisation_and_embargo_sealing_of_deep_trees_do_not_overflow() {
     let deep = chain(s, 4 * MAX_TREE_DEPTH, b"x");
     assert!(normalize_tree(s, &deep, &opts, &mut NormalizeReport::default()).is_err());
 
-    let id = r.keys().create_embargo("team", None, "").unwrap();
+    let id = r.keys().create_embargo("team", None).unwrap();
     wrap(s, &id, &ok, &base).unwrap();
     assert!(wrap(s, &id, &deep, &base).is_err());
 }

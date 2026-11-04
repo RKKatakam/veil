@@ -237,8 +237,12 @@ pub struct BuildReport {
     /// Paths whose protection the working copy's `.veilpolicy` would weaken
     /// and the member has not accepted (see `wc_policy`). They were built
     /// under the accepted classification; a tracked one the accepted policy
-    /// keeps local keeps its previous entry (never a deletion).
+    /// keeps local keeps its previous entry (never a deletion). A directory
+    /// the accepted policy ignores is reported once, as a whole.
     pub policy_held_back: Vec<HeldBack>,
+    /// The member's own edit of `.veilpolicy` waits for `vl policy accept`
+    /// (see [`Policy::own_edit_pending`]).
+    pub policy_edit_pending: bool,
     /// Files that should have been cloaked but no key was available.
     pub cloak_failures: Vec<(VPath, String)>,
     /// Edits held back on a line under an unreleased embargo this reader
@@ -364,6 +368,7 @@ pub fn build_tree_cached(
         cache: run,
         report: BuildReport {
             policy_warnings: opts.policy.warnings.clone(),
+            policy_edit_pending: opts.policy.own_edit_pending,
             ..Default::default()
         },
         folding: fs.name_folding(),
@@ -451,9 +456,18 @@ impl Builder<'_> {
                     let pdir = parent_entry.filter(|e| e.kind == EntryKind::Dir);
                     if class.tier == Tier::Ignored {
                         self.report.ignored += 1;
-                        // Ignored only by the accepted policy: not a deletion.
-                        if let (Some(pe), Some(_)) = (&pdir, &class.held_back) {
-                            f.out.insert(pe.clone());
+                        // Ignored only by the accepted policy: reported, and
+                        // not a deletion.
+                        if let Some((t, force)) = &class.held_back {
+                            self.report.policy_held_back.push(HeldBack {
+                                path: path.clone(),
+                                accepted: class.keyword(),
+                                wanted: tier_keyword(t, *force),
+                                dir: true,
+                            });
+                            if let Some(pe) = &pdir {
+                                f.out.insert(pe.clone());
+                            }
                         }
                         continue;
                     }
@@ -750,6 +764,7 @@ impl Builder<'_> {
                 path: path.clone(),
                 accepted: class.keyword(),
                 wanted: tier_keyword(t, *force),
+                dir: false,
             });
             if let (Tier::Isolated | Tier::Ignored, Some(pe)) = (&class.tier, parent_file) {
                 return Ok(Some(pe.clone()));

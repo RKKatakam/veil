@@ -32,6 +32,12 @@
 //! never enter the snapshot graph. They *may* be `cloak`ed (encrypted for a
 //! team) or deliberately published with `public!`.
 //!
+//! **Editor artefacts.** Editor scratch files (`.x.swp`, `x~`, `#x#`, …) are
+//! ignored by the engine, and every editor or backup artefact of a file
+//! (`.x.swp`, `x~`, `x.bak`, …, see [`editor_artefact`]) takes that file's
+//! protection: the swap file of an isolated key is isolated, the backup of
+//! a cloaked file is cloaked under the same scope.
+//!
 //! **Accepted policy.** `.veilpolicy` is shared: it arrives by merge, pull,
 //! checkout, rebase, Git import or undo like any other file. Isolated files
 //! never enter history, so their protection lives *only* in the policy, and
@@ -139,6 +145,154 @@ fn names_vcs(pattern: &str) -> bool {
     })
 }
 
+// ---- editor and backup artefacts -----------------------------------------
+
+/// Extensions of backup copies (`<name>.<ext>`, also with a number:
+/// `<name>.bak2`, `<name>.save.1`). Such a name is only an artefact of a
+/// file that exists by that name, so these have no rule of their own: they
+/// take their base's protection (see [`editor_artefact`]).
+pub const BACKUP_EXTENSIONS: &[&str] = &["orig", "rej", "bak", "backup", "old", "tmp", "temp", "save", "sav"];
+
+/// The built-in rules for editor scratch files, as patterns (see
+/// [`editor_artefact`] for exactly what they match).
+pub const SCRATCH_PATTERNS: &[&str] =
+    &[".*.sw[a-p]", ".*.un~", ".*.kate-swp", "*~", "#*#", ".#*", "*___jb_tmp___", "*___jb_old___", ".~lock.*#"];
+
+/// How many artefact layers a name is unwrapped (`.env.bak~` → `.env.bak`
+/// → `.env`).
+const ARTEFACT_DEPTH: usize = 4;
+
+/// What [`editor_artefact`] recognised in a file name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Artefact {
+    /// An editor's scratch file (swap, undo, auto-save, lock, backup or
+    /// safe-write temporary), recognised by its name alone: the pattern
+    /// shown as the deciding built-in rule (`.*.swp`, `*~`, …). `None` for
+    /// a backup copy (`<name>.bak`, …).
+    pub scratch: Option<&'static str>,
+    /// The names, in the same directory, of the files it may belong to.
+    pub bases: Vec<String>,
+}
+
+fn strip_suffix_ci<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
+    let n = s.len().checked_sub(suffix.len())?;
+    (s.is_char_boundary(n) && s[n..].eq_ignore_ascii_case(suffix)).then(|| &s[..n])
+}
+
+/// Is `name` an editor or backup artefact of another file in its
+/// directory, and of which? Fixed parts match in any ASCII case.
+///
+/// Editor scratch files (built-in `ignore`, see [`Classification::builtin_artefact`]):
+///
+/// | name | written by | base |
+/// |---|---|---|
+/// | `.B.swp`, `.B.swo` … `.B.swa` | Vim, Neovim (swap), nano (lock) | `B`, `.B` |
+/// | `.B.un~` | Vim (`undofile`) | `B`, `.B` |
+/// | `.B.kate-swp` | Kate, KWrite | `B`, `.B` |
+/// | `B~`, `B.~N~` | Emacs, Vim (`backup`), gedit, Kate (backups) | `B` |
+/// | `#B#` | Emacs (auto-save) | `B` |
+/// | `.#B` | Emacs (lock symlink) | `B` |
+/// | `B___jb_tmp___`, `B___jb_old___` | JetBrains IDEs (safe write) | `B` |
+/// | `.~lock.B#` | LibreOffice (lock) | `B` |
+///
+/// (`B`, `.B`: Vim does not add a dot to a name that has one, so the swap
+/// file of `.env` is `.env.swp`.) Backup copies: `B.<ext>`, `B.<ext>N` and
+/// `B.<ext>.N` for each of [`BACKUP_EXTENSIONS`] (`.env.orig`,
+/// `server.pem.bak`, `secrets.yml.tmp`).
+pub fn editor_artefact(name: &str) -> Option<Artefact> {
+    let ok = |b: &str| !b.is_empty() && b != "." && b != ".." && !b.contains('/');
+    let mut bases: Vec<String> = Vec::new();
+    let mut scratch = None;
+    let mut found = |kind: Option<&'static str>, names: &[&str], bases: &mut Vec<String>| {
+        let names: Vec<&str> = names.iter().copied().filter(|b| ok(b)).collect();
+        if !names.is_empty() {
+            scratch = scratch.or(kind);
+            bases.extend(names.into_iter().map(str::to_string));
+        }
+    };
+    // Dotted scratch files: `.B.swp`, `.B.un~`, `.B.kate-swp`.
+    if let Some(rest) = name.strip_prefix('.') {
+        // (The last byte is checked first: it makes the slice below valid.)
+        let swap = rest.len() > 4
+            && matches!(rest.as_bytes()[rest.len() - 1].to_ascii_lowercase(), b'a'..=b'p')
+            && rest.is_char_boundary(rest.len() - 4)
+            && rest[rest.len() - 4..rest.len() - 1].eq_ignore_ascii_case(".sw");
+        let dotted = [(".un~", ".*.un~"), (".kate-swp", ".*.kate-swp")];
+        let stem = match swap {
+            true => Some((&rest[..rest.len() - 4], ".*.sw[a-p]")),
+            false => dotted.iter().find_map(|(s, kind)| strip_suffix_ci(rest, s).map(|b| (b, *kind))),
+        };
+        if let Some((stem, kind)) = stem {
+            found(Some(kind), &[stem, &name[..stem.len() + 1]], &mut bases);
+        }
+        // Emacs lock `.#B`, LibreOffice lock `.~lock.B#`.
+        if let Some(b) = rest.strip_prefix('#') {
+            found(Some(".#*"), &[b], &mut bases);
+        }
+        if let Some(b) = rest.strip_prefix("~lock.").and_then(|r| r.strip_suffix('#')) {
+            found(Some(".~lock.*#"), &[b], &mut bases);
+        }
+    }
+    // `B~`, Emacs numbered backups `B.~N~`.
+    if let Some(b) = name.strip_suffix('~') {
+        let numbered = b
+            .rfind(".~")
+            .filter(|&i| b.len() > i + 2 && b[i + 2..].bytes().all(|c| c.is_ascii_digit()))
+            .map(|i| &b[..i]);
+        found(Some("*~"), &[numbered.unwrap_or(b)], &mut bases);
+    }
+    // Emacs auto-save `#B#`.
+    if let Some(b) = name.strip_prefix('#').and_then(|r| r.strip_suffix('#')) {
+        found(Some("#*#"), &[b], &mut bases);
+    }
+    for (s, kind) in [("___jb_tmp___", "*___jb_tmp___"), ("___jb_old___", "*___jb_old___")] {
+        if let Some(b) = strip_suffix_ci(name, s) {
+            found(Some(kind), &[b], &mut bases);
+        }
+    }
+    // Backup copies: `B.bak`, `B.bak2`, `B.save.1`.
+    let unnumbered = name.trim_end_matches(|c: char| c.is_ascii_digit());
+    let unnumbered = match unnumbered.strip_suffix('.') {
+        Some(u) if unnumbered.len() < name.len() => u,
+        _ => unnumbered,
+    };
+    if let Some(dot) = unnumbered.rfind('.') {
+        if BACKUP_EXTENSIONS.iter().any(|e| unnumbered[dot + 1..].eq_ignore_ascii_case(e)) {
+            found(None, &[&unnumbered[..dot]], &mut bases);
+        }
+    }
+    bases.dedup();
+    (!bases.is_empty()).then_some(Artefact { scratch, bases })
+}
+
+/// Does a policy pattern's file name itself spell an editor scratch file
+/// (`*~`, `.*.swp`, `.*.sw?`, `#*#`)? As `public!`, such a rule records
+/// scratch files (see [`Classification::builtin_artefact`]).
+fn names_scratch(pattern: &str) -> bool {
+    let last = pattern.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+    // Escapes removed; a `?` or a character class stands for one letter.
+    let mut plain = String::with_capacity(last.len());
+    let mut chars = last.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => plain.extend(chars.next()),
+            '?' => plain.push('p'),
+            '[' => {
+                for c in chars.by_ref() {
+                    if c == ']' {
+                        break;
+                    }
+                }
+                plain.push('p');
+            }
+            c => plain.push(c),
+        }
+    }
+    // `*.swp` matches `.x.swp` too (a `*` matches a leading dot).
+    let dotted = plain.starts_with('*').then(|| format!(".{plain}"));
+    [Some(plain), dotted].into_iter().flatten().any(|n| editor_artefact(&n).is_some_and(|a| a.scratch.is_some()))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Tier {
     Public,
@@ -170,6 +324,9 @@ pub struct Rule {
     /// The pattern names a VCS metadata directory itself (`.git`, …): as
     /// `public!`, it records one (see [`BUILTIN_VCS_DIRS`]).
     names_vcs: bool,
+    /// The pattern's file name spells an editor scratch file (`*~`,
+    /// `.*.swp`): as `public!`, it records them (see [`editor_artefact`]).
+    names_scratch: bool,
     dir_only: bool,
     exact: GlobMatcher,
     under: GlobMatcher,
@@ -323,6 +480,7 @@ impl Rule {
             builtin,
             secret,
             names_vcs: names_vcs(pattern),
+            names_scratch: names_scratch(pattern),
             dir_only,
         })
     }
@@ -370,6 +528,17 @@ pub struct Classification {
     /// VCS metadata (`.git`, `.jj`, …), ignored by the engine (see
     /// [`BUILTIN_VCS_DIRS`]).
     pub builtin_vcs: bool,
+    /// An editor scratch file ([`editor_artefact`]: `.x.swp`, `x~`, `#x#`,
+    /// …), ignored by the engine, or an artefact that took an ignored
+    /// built-in secret's or VCS metadata's protection. Only an `isolate`
+    /// rule, or a `public!` rule whose own file name spells a scratch file
+    /// (`*~ public!`), applies to a scratch file; lifting the ignore is a
+    /// weakening (see [`weakens`]).
+    pub builtin_artefact: bool,
+    /// This path is an editor or backup artefact of `artefact_of` (in the
+    /// same directory) and has that path's protection, which it would not
+    /// have by its own rules: `rule` is the rule that decided the base.
+    pub artefact_of: Option<VPath>,
     /// The working copy's `.veilpolicy` would weaken this path's protection
     /// (see [`weakens`]), and the member has not accepted it: this is the
     /// *accepted* classification, and `held_back` holds what the working
@@ -393,20 +562,35 @@ pub struct HeldBack {
     pub accepted: String,
     /// What the working copy's `.veilpolicy` wants (`public!`, …).
     pub wanted: String,
+    /// A directory the accepted policy ignores (`.git/`, `target/`), held
+    /// back as a whole: what is in it is not listed.
+    pub dir: bool,
+}
+
+impl HeldBack {
+    /// The path, with a `/` after a directory.
+    pub fn shown_path(&self) -> String {
+        match self.dir {
+            true => format!("{}/", self.path),
+            false => self.path.to_string(),
+        }
+    }
 }
 
 /// Does moving a path from the `accepted` classification to `current`
 /// weaken its protection? That is: isolated → cloaked or public, cloaked →
 /// public or to another scope (another audience), secret scanning turned
-/// off (`public` → `public!`), or an `ignore` lifted from a built-in secret
-/// or from VCS metadata (other than to `isolate`). Moving to `isolate` or
-/// `ignore` never weakens anything: the file stays on this device either
-/// way.
+/// off (`public` → `public!`), or an `ignore` lifted from a built-in secret,
+/// from VCS metadata or from an editor scratch file (other than to
+/// `isolate`). Moving to `isolate` or `ignore` never weakens anything: the
+/// file stays on this device either way. An editor or backup artefact of a
+/// protected file ([`editor_artefact`]) has that file's protection, so a
+/// policy that would publish it, or its base, weakens it too.
 pub fn weakens(accepted: &Classification, current: &Classification) -> bool {
     match (&accepted.tier, &current.tier) {
         (_, Tier::Isolated | Tier::Ignored) => false,
         (Tier::Isolated, _) => true,
-        (Tier::Ignored, _) => accepted.builtin_secret || accepted.builtin_vcs,
+        (Tier::Ignored, _) => accepted.builtin_secret || accepted.builtin_vcs || accepted.builtin_artefact,
         (Tier::Cloaked(_), Tier::Public) => true,
         (Tier::Cloaked(a), Tier::Cloaked(c)) => a != c,
         (Tier::Public, Tier::Public) => current.allow_secrets && !accepted.allow_secrets,
@@ -419,6 +603,11 @@ pub struct Policy {
     rules: Vec<Rule>,
     set: GlobSet,
     pub warnings: Vec<String>,
+    /// The member's own edit of `.veilpolicy` could not be folded into the
+    /// accepted policy and waits for `vl policy accept` (see
+    /// [`working_copy_policy`]): some of what is held back may be the
+    /// member's own change.
+    pub own_edit_pending: bool,
     /// The policy the member accepted, if this one is guarded by it (see
     /// [`Policy::guarded_by`]).
     accepted: Option<Box<Policy>>,
@@ -436,6 +625,7 @@ impl Policy {
             rules: builtin_rules().0.clone(),
             set: GlobSet::empty(),
             warnings: vec![],
+            own_edit_pending: false,
             accepted: None,
         }
     }
@@ -566,11 +756,36 @@ impl Policy {
     }
 
     fn classify_own(&self, path: &VPath, is_dir: bool) -> Classification {
-        let mut c = Classification::unmatched();
+        self.classify_depth(path, is_dir, ARTEFACT_DEPTH)
+    }
+
+    /// [`Policy::classify_rules`], then, for an editor or backup artefact
+    /// ([`editor_artefact`]), the protection of the file it belongs to
+    /// ([`Classification::inherit`]), unwrapping up to `depth` layers.
+    fn classify_depth(&self, path: &VPath, is_dir: bool, depth: usize) -> Classification {
         // The policy file itself is always public: everyone must agree on it.
         if path.as_str() == POLICY_FILE {
-            return c;
+            return Classification::unmatched();
         }
+        let artefact = match is_dir {
+            true => None,
+            false => editor_artefact(path.file_name()),
+        };
+        let mut c = self.classify_rules(path, is_dir, artefact.as_ref().and_then(|a| a.scratch));
+        let Some(artefact) = artefact.filter(|_| depth > 0) else { return c };
+        let dir = path.parent().unwrap_or_else(VPath::root);
+        for base in &artefact.bases {
+            let base = dir.join(base);
+            let b = self.classify_depth(&base, false, depth - 1);
+            c.inherit(&b, &base);
+        }
+        c
+    }
+
+    /// The classification by the rules alone. `scratch`: the path is an
+    /// editor scratch file, with this built-in pattern.
+    fn classify_rules(&self, path: &VPath, is_dir: bool, scratch: Option<&'static str>) -> Classification {
+        let mut c = Classification::unmatched();
         let name = crate::vpath::nfc(path.as_str());
         let (builtin, builtin_set) = builtin_rules();
         let hits = builtin_set.matches(&*name).into_iter().chain(self.set.matches(&*name).into_iter().map(|i| i + 2 * builtin.len()));
@@ -592,6 +807,9 @@ impl Policy {
         if let Some(name) = vcs_metadata(path, is_dir) {
             c.mark_vcs(name);
         }
+        if let Some(kind) = scratch {
+            c.mark_scratch(kind);
+        }
         for r in hit {
             c.apply(r);
         }
@@ -609,6 +827,8 @@ impl Classification {
             builtin_secret: false,
             blocked_exposure: false,
             builtin_vcs: false,
+            builtin_artefact: false,
+            artefact_of: None,
             held_back: None,
         }
     }
@@ -620,11 +840,60 @@ impl Classification {
         self.builtin_vcs = true;
     }
 
+    /// An editor scratch file, unless a built-in secret rule or the VCS
+    /// metadata rule (which are no weaker) already decided it.
+    fn mark_scratch(&mut self, kind: &str) {
+        if self.builtin_secret || self.builtin_vcs {
+            return;
+        }
+        self.tier = Tier::Ignored;
+        self.allow_secrets = false;
+        self.rule = Some(kind.to_string());
+        self.builtin_artefact = true;
+    }
+
+    /// This path is an editor or backup artefact of `base_path`, classified
+    /// `base`: it gets the base's protection where its own is weaker. An
+    /// artefact of an isolated file is isolated (listed and backed up as
+    /// local-only, like the file). An artefact of a cloaked file is cloaked
+    /// under the same scope, unless its own classification keeps it on the
+    /// device (ignored, as editor scratch files are, or isolated). An
+    /// artefact of an ignored file is ignored, unless it is isolated. No
+    /// rule of the artefact's own can undo this: only a change of the base's
+    /// classification does.
+    fn inherit(&mut self, base: &Classification, base_path: &VPath) {
+        let stronger = match (&self.tier, &base.tier) {
+            (_, Tier::Public) | (Tier::Isolated, _) => false,
+            (_, Tier::Isolated) => true,
+            (Tier::Ignored, _) => false,
+            (_, Tier::Ignored) => true,
+            (Tier::Public, Tier::Cloaked(_)) => true,
+            (Tier::Cloaked(own), Tier::Cloaked(theirs)) => own != theirs,
+        };
+        // Lifting an ignore that protects the base protects the artefact.
+        if base.tier == Tier::Ignored && (stronger || self.tier == Tier::Ignored) {
+            self.builtin_artefact |= base.builtin_secret || base.builtin_vcs || base.builtin_artefact;
+        }
+        if stronger {
+            self.tier = base.tier.clone();
+            self.allow_secrets = false;
+            self.rule = base.rule.clone();
+            self.blocked_exposure = false;
+            self.builtin_secret = base.builtin_secret;
+            self.artefact_of = Some(base.artefact_of.clone().unwrap_or_else(|| base_path.clone()));
+        }
+    }
+
     /// Apply matching user rule `r` (rules are applied in order; the last
     /// one that applies decides). Did it apply?
     fn apply(&mut self, r: &Rule) -> bool {
         // VCS metadata: only a `public!` rule naming the directory records it.
         if self.builtin_vcs && !(r.force && r.names_vcs) {
+            return false;
+        }
+        // Editor scratch files: only `isolate`, or a `public!` rule naming
+        // scratch files, applies.
+        if self.builtin_artefact && !(r.tier == Tier::Isolated || (r.force && r.names_scratch)) {
             return false;
         }
         // A built-in secret: a plain `public` rule cannot expose it.
@@ -640,6 +909,7 @@ impl Classification {
         if r.force {
             self.builtin_secret = false;
             self.builtin_vcs = false;
+            self.builtin_artefact = false;
         }
         true
     }
@@ -798,7 +1068,8 @@ type Applied = (Option<usize>, Classification);
 /// paths, so any overlap of globs is covered (rules with the same pattern
 /// and case handling are matched together; any others are assumed to
 /// overlap in every way). A path's classification only depends on its
-/// built-in state (built-in secret, VCS metadata), on which `public!` rules
+/// built-in state (built-in secret, VCS metadata, editor scratch file), on
+/// which `public!` rules
 /// it matches (they decide which other rules apply), and on the last rule
 /// that applies. So a path that breaks the property has a witness that
 /// matches its `public!` rules plus at most one other rule per policy (the
@@ -806,6 +1077,10 @@ type Applied = (Option<usize>, Classification);
 /// policy's classification of the witness is the one of the single rule
 /// (or none) that applies latest. That makes the check every built-in
 /// state × every set of `public!` rules × one rule (or none) per policy.
+///
+/// An editor or backup artefact then takes its base's protection where that
+/// is stronger ([`Classification::inherit`]); the check covers the base and
+/// the artefact's own rules, each on its own.
 fn verify_fold(accepted: &Policy, current: &Policy, folded: &Policy) -> std::result::Result<(), String> {
     let policies = [accepted, current, folded];
     // Rules with the same pattern that match case the same way match the
@@ -852,13 +1127,13 @@ fn verify_fold(accepted: &Policy, current: &Policy, folded: &Policy) -> std::res
     // policy per rule to precompute the single-rule classifications.
     let per_set = candidates.iter().map(Vec::len).product::<usize>() + 3 * (others.len() + 1) * (longest + 1) * (longest + 1);
     let sets = 1usize.checked_shl(bangs.len() as u32).filter(|_| bangs.len() < 24);
-    match sets.and_then(|n| n.checked_mul(4)).and_then(|n| n.checked_mul(per_set)) {
+    match sets.and_then(|n| n.checked_mul(5)).and_then(|n| n.checked_mul(per_set)) {
         Some(work) if work <= FOLD_BUDGET => {}
         _ => return Err("the policies have too many rules to check".into()),
     }
     // The classification of `list` for a path matching the rules in
     // `member`, with the position of the last rule applied.
-    let classify = |list: &[(usize, &Rule)], member: &[bool], secret: bool, vcs: bool| {
+    let classify = |list: &[(usize, &Rule)], member: &[bool], secret: bool, vcs: bool, scratch: bool| {
         let mut c = Classification::unmatched();
         if secret {
             c.tier = Tier::Isolated;
@@ -866,6 +1141,9 @@ fn verify_fold(accepted: &Policy, current: &Policy, folded: &Policy) -> std::res
         }
         if vcs {
             c.mark_vcs(".git");
+        }
+        if scratch {
+            c.mark_scratch("*~");
         }
         let mut last = None;
         for (pos, (i, r)) in list.iter().enumerate() {
@@ -876,20 +1154,24 @@ fn verify_fold(accepted: &Policy, current: &Policy, folded: &Policy) -> std::res
         (last, c)
     };
     let mut member = vec![false; universe.len()];
-    for state in 0..4u8 {
-        let (secret, vcs) = (state & 1 != 0, state & 2 != 0);
+    for state in 0..8u8 {
+        let (secret, vcs, scratch) = (state & 1 != 0, state & 2 != 0, state & 4 != 0);
+        // The scratch rule only applies where the other two do not.
+        if scratch && (secret || vcs) {
+            continue;
+        }
         for set in 0..sets.unwrap_or(0) {
             for (bit, &i) in bangs.iter().enumerate() {
                 member[i] = set & (1 << bit) != 0;
             }
             // single[policy][rule]: the classification with that one rule
             // (other than `public!`) added; `none[policy]` with none.
-            let none: Vec<_> = lists.iter().map(|l| classify(l, &member, secret, vcs)).collect();
+            let none: Vec<_> = lists.iter().map(|l| classify(l, &member, secret, vcs, scratch)).collect();
             let mut single: Vec<Vec<Option<Applied>>> = vec![vec![None; universe.len()]; 3];
             for &e in &others {
                 member[e] = true;
                 for (k, l) in lists.iter().enumerate() {
-                    single[k][e] = Some(classify(l, &member, secret, vcs));
+                    single[k][e] = Some(classify(l, &member, secret, vcs, scratch));
                 }
                 member[e] = false;
             }
@@ -1089,6 +1371,7 @@ pub fn working_copy_policy(
         };
         let mut policy = current.guarded_by(pin.as_deref().map_or(accepted, Policy::parse));
         if let Some(why) = notice {
+            policy.own_edit_pending = true;
             policy.warnings.push(format!(
                 "your edit of {POLICY_FILE} was not applied to the policy you accepted on this device, because a change \
                  you have not accepted is pending: {why}. Until `vl policy accept`, files your edit exposes keep the \
@@ -1321,6 +1604,129 @@ mod tests {
         let only = fold_protection_only(&acc, &parent, &mine);
         assert_eq!(p(&only).rule_lines(), lines("a/x isolate\nlogs/ ignore\n"));
         assert_eq!(fold_protection_only(&p(&only), &parent, &mine), only, "idempotent");
+    }
+
+    #[test]
+    fn editor_artefact_names() {
+        let a = |n: &str| editor_artefact(n).map(|a| (a.scratch.is_some(), a.bases));
+        let v = |b: &[&str]| b.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(a(".id_ed25519.swp"), Some((true, v(&["id_ed25519", ".id_ed25519"]))));
+        assert_eq!(a(".env.swo"), Some((true, v(&["env", ".env"]))));
+        assert_eq!(a(".server.pem.SWN"), Some((true, v(&["server.pem", ".server.pem"]))));
+        assert_eq!(a(".x.swa").map(|x| x.0), Some(true));
+        assert_eq!(a(".x.swq"), None, "Vim stops at .swa");
+        assert_eq!(a(".x.un~").map(|x| x.1[..2].to_vec()), Some(v(&["x", ".x"])));
+        assert_eq!(a(".env.kate-swp"), Some((true, v(&["env", ".env"]))));
+        assert_eq!(a(".env~"), Some((true, v(&[".env"]))));
+        assert_eq!(a("notes.md.~12~"), Some((true, v(&["notes.md"]))));
+        assert_eq!(a("#.env#"), Some((true, v(&[".env"]))));
+        assert_eq!(a(".#.env"), Some((true, v(&[".env"]))));
+        assert_eq!(a("id_rsa___jb_tmp___"), Some((true, v(&["id_rsa"]))));
+        assert_eq!(a("id_rsa___jb_old___"), Some((true, v(&["id_rsa"]))));
+        assert_eq!(a(".~lock.keys.ods#"), Some((true, v(&["keys.ods"]))));
+        for (n, b) in [(".env.orig", ".env"), ("server.pem.bak", "server.pem"), ("s.yml.tmp", "s.yml"), ("k.BAK2", "k"), ("k.save.1", "k")] {
+            assert_eq!(a(n), Some((false, v(&[b]))), "{n}");
+        }
+        for n in ["main.rs", "~", "#", "##", ".#", ".swp", "..swp", ".bak", "x.1", "v1.2.3", ".svg.icon", "a.swp", "x.bakery", "é.swp", ".é"] {
+            assert_eq!(a(n), None, "{n}");
+        }
+        assert!(names_scratch("*~") && names_scratch("*.swp") && names_scratch("dir/.*.sw?") && names_scratch(".*.sw[a-p]") && names_scratch(r"\#*\#"));
+        assert!(!names_scratch("*.bak") && !names_scratch("tests/") && !names_scratch("**"));
+        for name in [".a.swp", ".a.un~", ".a.kate-swp", "a~", "#a#", ".#a", "a___jb_tmp___", "a___jb_old___", ".~lock.a#"] {
+            let kind = editor_artefact(name).and_then(|a| a.scratch);
+            assert!(kind.is_some_and(|k| SCRATCH_PATTERNS.contains(&k)), "{name}: {kind:?}");
+        }
+    }
+
+    #[test]
+    fn editor_artefacts_take_their_bases_protection() {
+        let p = Policy::parse("notes/** public\nnotes/private.md isolate\nsecrets/ cloak ops\nx/ cloak team\nbuild.log ignore\n");
+        let c = |path: &str| p.classify(&VPath::new(path).unwrap(), false);
+        for path in [
+            "deploy/.id_ed25519.swp",
+            "deploy/.id_ed25519.swo",
+            "deploy/.server.pem.swp",
+            "deploy/.server.pem.un~",
+            "deploy/id_ed25519~",
+            ".env~",
+            "#.env#",
+            ".#.env",
+            "a/b/.env.kate-swp",
+            "id_rsa___jb_tmp___",
+            "deploy/server.pem.bak",
+            "deploy/id_ed25519.orig",
+            "k/server.key.tmp",
+            ".envrc.bak~",
+            "notes/.private.md.swp",
+            "notes/private.md~",
+            "notes/#private.md#",
+            "notes/private.md.orig",
+        ] {
+            let k = c(path);
+            assert_eq!(k.tier, Tier::Isolated, "{path}: {k:?}");
+            assert!(k.artefact_of.is_some() || path.contains(".env"), "{path}: {k:?}");
+        }
+        assert_eq!(c("notes/.private.md.swp").artefact_of, Some(VPath::new("notes/private.md").unwrap()));
+        assert_eq!(c(".envrc.bak~").artefact_of, Some(VPath::new(".envrc").unwrap()), "unwrapped twice");
+        // Cloaked bases: backup copies get the same scope; scratch files stay
+        // ignored (they never leave the device) unless a rule lifts that.
+        assert_eq!(c("secrets/db.yml.bak").tier, Tier::Cloaked("ops".into()));
+        assert_eq!(c("secrets/.db.yml.swp").tier, Tier::Ignored);
+        assert_eq!(c("secrets/.db.yml.swp").rule.as_deref(), Some(".*.sw[a-p]"));
+        assert_eq!(c("x/.db.yml.swp").tier, Tier::Ignored, "a plain cloak does not lift the scratch rule");
+        let lifted = Policy::parse("secrets/ cloak ops\n*.sw? public!\nx/ cloak team\nx/*.bak cloak ops\n");
+        let k = lifted.classify(&VPath::new("secrets/.db.yml.swp").unwrap(), false);
+        assert_eq!(k.tier, Tier::Cloaked("ops".into()), "the base's scope, not public: {k:?}");
+        assert_eq!(lifted.classify(&VPath::new("src/.main.rs.swp").unwrap(), false).tier, Tier::Public);
+        let k = lifted.classify(&VPath::new("x/db.yml.bak").unwrap(), false);
+        assert_eq!(k.tier, Tier::Cloaked("team".into()), "the base's scope, not the artefact's: {k:?}");
+        // Ignored bases.
+        assert_eq!(c("build.log.old").tier, Tier::Ignored);
+        // Public bases: scratch files are ignored, backup copies are ordinary.
+        assert_eq!(c("src/.main.rs.swp").tier, Tier::Ignored);
+        assert!(c("src/.main.rs.swp").builtin_artefact);
+        assert_eq!(c("src/main.rs~").tier, Tier::Ignored);
+        assert_eq!(c("src/main.rs.orig").tier, Tier::Public);
+        assert_eq!(c("notes/a.md.bak").tier, Tier::Public);
+        // Whatever the artefact's own rules say.
+        let p = Policy::parse("** public!\n.env* public!\n*~ public!\nnotes/x isolate\n");
+        let k = p.classify(&VPath::new("notes/x~").unwrap(), false);
+        assert_eq!(k.tier, Tier::Isolated, "{k:?}");
+        assert_eq!(p.classify(&VPath::new(".env~").unwrap(), false).tier, Tier::Public, ".env itself is public! here");
+        assert_eq!(p.classify(&VPath::new("src/a~").unwrap(), false).tier, Tier::Public, "*~ public! names scratch files");
+        // Directories are not artefacts.
+        assert_eq!(Policy::parse("").classify(&VPath::new("x~").unwrap(), true).tier, Tier::Public);
+    }
+
+    #[test]
+    fn publishing_an_artefact_is_a_weakening() {
+        let c = |p: &str, path: &str| Policy::parse(p).classify(&VPath::new(path).unwrap(), false);
+        let w = |a: &str, b: &str, path: &str| weakens(&c(a, path), &c(b, path));
+        assert!(!w("", "*.swp public!\n", "deploy/.id_ed25519.swp"), "still isolated through its base");
+        assert!(!w("", "id_ed25519 public!\n", "deploy/.id_ed25519.swp"), "still an ignored scratch file");
+        assert!(w("", "id_ed25519 public!\n*.swp public!\n", "deploy/.id_ed25519.swp"), "published with its base");
+        assert!(w("", "*.swp public!\n", "src/.main.rs.swp"), "the scratch rule lifted");
+        assert!(w("", "id_ed25519 public!\n", "deploy/id_ed25519.bak"), "its base published");
+        assert!(w("s/ cloak ops\n", "s/ cloak team\n", "s/a.yml.bak"), "another audience");
+        assert!(w("k/ ignore\n", "k/ public!\n", "k/id_rsa.bak"), "ignore lifted from a built-in secret's artefact");
+        assert!(!w("k/ ignore\n", "k/ public!\n", "k/.id_rsa.swp"), "the scratch rule still ignores it");
+        assert!(!w("", "*.swp isolate\n", "src/.main.rs.swp"));
+        assert!(!w("", "notes/ isolate\n", "notes/a.md.bak"), "strengthening");
+        let g = Policy::parse("id_ed25519 public!\n*.swp public!\n").guarded_by(Policy::parse(""));
+        let k = g.classify(&VPath::new("deploy/.id_ed25519.swp").unwrap(), false);
+        assert_eq!((k.tier, k.held_back), (Tier::Isolated, Some((Tier::Public, true))));
+    }
+
+    #[test]
+    fn a_refused_fold_says_the_members_edit_is_pending() {
+        let (local, fs) = (crate::MemoryBackend::new(), crate::MemoryBackend::new());
+        save_accepted(&local, b"a/x isolate\n").unwrap();
+        fs.write(&VPath::new(POLICY_FILE).unwrap(), b"a/** isolate\n.env public!\n").unwrap();
+        let parent = b"a/x isolate\na/** isolate\n.env public!\n";
+        let wp = working_copy_policy(&local, &fs, Some(Some(parent))).unwrap();
+        assert!(wp.policy.own_edit_pending);
+        let wp = working_copy_policy(&local, &fs, None).unwrap();
+        assert!(!wp.policy.own_edit_pending, "nothing of the member's is pending");
     }
 
     #[test]

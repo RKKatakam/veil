@@ -785,13 +785,14 @@ fn cmd_status(ctx: &mut Ctx) -> Result<()> {
     if !ctx.report.policy_held_back.is_empty() {
         println!("{}", yellow("Policy change not accepted (protection kept; `vl policy accept` applies it):"));
         for h in &ctx.report.policy_held_back {
-            println!("  {} {}  ({}; .veilpolicy says {})", yellow("P"), safe(h.path.as_str()), h.accepted, h.wanted);
+            println!("  {} {}  ({}; .veilpolicy says {})", yellow("P"), safe(&h.shown_path()), h.accepted, h.wanted);
         }
     }
     if !ctx.report.carried.is_empty() {
-        println!("{}", dim("Redacted (no key; kept in history, absent on disk):"));
+        println!("{}", dim("Redacted (unreadable here; kept in history, absent on disk):"));
         for p in &ctx.report.carried {
-            println!("  {} {}", dim("R"), safe(p.as_str()));
+            let why = veil_core::tree::lookup(ctx.repo.store(), &s.tree, p)?.and_then(|e| render::hidden_reason(&ctx.repo, &e));
+            println!("  {} {}  ({})", dim("R"), safe(p.as_str()), why.unwrap_or_else(|| "no key".into()));
         }
     }
     // Conflicts recorded on `@`, and those of its parents (a merge records
@@ -1092,12 +1093,13 @@ fn cmd_embargo(ctx: &mut Ctx, c: &EmbargoCmd) -> Result<()> {
                 } else {
                     " (no key)"
                 };
-                println!(
-                    "{}  scope:{}  {state}{key}  {}",
-                    bold(&safe(&r.id)),
-                    safe(&r.scope),
-                    first_line(&r.description)
-                );
+                // Records carry no description; one written by an early
+                // version is still shown.
+                let desc = match first_line(&r.description) {
+                    d if d.trim().is_empty() => String::new(),
+                    d => format!("  {d}"),
+                };
+                println!("{}  scope:{}  {state}{key}{desc}", bold(&safe(&r.id)), safe(&r.scope));
             }
         }
         EmbargoCmd::Release { id } => {
@@ -1269,6 +1271,14 @@ fn cmd_policy(ctx: &mut Ctx, c: &PolicyCmd) -> Result<()> {
                 let what = if *name == ".git" { "dirs and files, any depth" } else { "dirs, any depth" };
                 println!("{:<12}  {}  {}", dim("built-in"), format_rule(name, &Tier::Ignored, false), dim(&format!("({what})")));
             }
+            for pattern in veil_core::policy::SCRATCH_PATTERNS {
+                println!("{:<12}  {}  {}", dim("built-in"), format_rule(pattern, &Tier::Ignored, false), dim("(editor scratch files)"));
+            }
+            println!(
+                "{:<12}  {}",
+                dim("built-in"),
+                dim("editor and backup artefacts of an isolated, cloaked or ignored file (.x.swp, x~, x.bak, …) take its protection")
+            );
             for r in policy.rules() {
                 let origin = if r.builtin { dim("built-in") } else { cyan(".veilpolicy") };
                 println!("{origin:<12}  {}", r.to_line());
@@ -1284,7 +1294,7 @@ fn cmd_policy(ctx: &mut Ctx, c: &PolicyCmd) -> Result<()> {
                     bold("Not yet accepted: .veilpolicy would weaken the protection of local files")
                 );
                 for h in &held {
-                    println!("  {}: {} → {}", safe(h.path.as_str()), h.accepted, yellow(&h.wanted));
+                    println!("  {}: {} → {}", safe(&h.shown_path()), h.accepted, yellow(&h.wanted));
                 }
                 println!("Run `vl policy accept` to apply .veilpolicy in full.");
             }
@@ -1296,7 +1306,7 @@ fn cmd_policy(ctx: &mut Ctx, c: &PolicyCmd) -> Result<()> {
             } else {
                 println!("Accepted {POLICY_FILE}. Protection weakened for {} local file(s):", held.len());
                 for h in &held {
-                    println!("  {}: {} → {}", safe(h.path.as_str()), h.accepted, yellow(&h.wanted));
+                    println!("  {}: {} → {}", safe(&h.shown_path()), h.accepted, yellow(&h.wanted));
                 }
             }
             ctx.snapshot()?;
@@ -1308,10 +1318,17 @@ fn cmd_policy(ctx: &mut Ctx, c: &PolicyCmd) -> Result<()> {
                 let c = policy.classify(&vp, is_dir);
                 let why = match (&c.rule, c.builtin_secret) {
                     (Some(r), true) => format!("built-in secret rule '{r}'"),
+                    (Some(r), false) if c.builtin_vcs => format!("built-in VCS metadata rule '{r}'"),
+                    (Some(r), false) if c.builtin_artefact && c.artefact_of.is_none() => {
+                        format!("built-in editor scratch rule '{r}'")
+                    }
                     (Some(r), false) => format!("rule '{r}'"),
                     (None, _) => "default".into(),
                 };
                 let mut extra = String::new();
+                if let Some(base) = &c.artefact_of {
+                    extra.push_str(&format!(" (an editor or backup artefact of {}, so it has that file's protection)", safe(base.as_str())));
+                }
                 if c.blocked_exposure {
                     extra.push_str(" (a `public` rule was ignored: use `public!`)");
                 }

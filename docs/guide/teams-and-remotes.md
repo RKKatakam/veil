@@ -156,8 +156,8 @@ Cloned /tmp/vdoc/hub into /tmp/vdoc/bobwc (6 objects, 2 files)
   and ask them to run `vl scope grant team <key>` and push. They appear here on your next `vl pull` after that.
 bob$ vl status
 …
-Redacted (no key; kept in history, absent on disk):
-  R secrets/notes.md
+Redacted (unreadable here; kept in history, absent on disk):
+  R secrets/notes.md  (cloaked:team; no key)
 
 bob$ vl pull
 Pulled 0 object(s) from origin

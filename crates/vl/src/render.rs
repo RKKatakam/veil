@@ -328,12 +328,14 @@ pub fn print_build_warnings(r: &BuildReport) {
              after the release (or work on the embargoed merge's first parent instead)"
         ));
     }
-    print_policy_held_back(&r.policy_held_back);
+    print_policy_held_back(&r.policy_held_back, r.policy_edit_pending);
 }
 
 /// Local files kept under the accepted policy because `.veilpolicy` (as
 /// changed by a merge, pull, checkout, …) would weaken their protection.
-pub fn print_policy_held_back(held: &[HeldBack]) {
+/// `own_edit_pending`: the member's own edit of `.veilpolicy` could not be
+/// applied on its own and waits too, so some of `held` may be theirs.
+pub fn print_policy_held_back(held: &[HeldBack], own_edit_pending: bool) {
     const SHOWN: usize = 5;
     if held.is_empty() {
         return;
@@ -341,13 +343,18 @@ pub fn print_policy_held_back(held: &[HeldBack]) {
     let mut list: Vec<String> = held
         .iter()
         .take(SHOWN)
-        .map(|h| format!("{} ({} → {})", safe(h.path.as_str()), h.accepted, h.wanted))
+        .map(|h| format!("{} ({} → {})", safe(&h.shown_path()), h.accepted, h.wanted))
         .collect();
     if held.len() > SHOWN {
         list.push(format!("and {} more", held.len() - SHOWN));
     }
+    let origin = match own_edit_pending {
+        false => "and that change came from a merge, pull, checkout or undo rather than your own edit",
+        true => "through a change from a merge, pull, checkout or undo that you have not accepted, or through your \
+                 own edit, which waits for `vl policy accept` because it could not be applied without that change",
+    };
     warn(&format!(
-        "{} local file(s) keep the protection you accepted: {POLICY_FILE} would weaken it, and that change came from a merge, pull, checkout or undo rather than your own edit ({}). Review it with `vl policy show`; apply it with `vl policy accept`",
+        "{} local path(s) keep the protection you accepted: {POLICY_FILE} would weaken it, {origin} ({}). Review it with `vl policy show`; apply it with `vl policy accept`",
         held.len(),
         list.join(", ")
     ));
@@ -555,6 +562,19 @@ pub fn hidden_note(repo: &Repo, e: &TreeEntry) -> Option<String> {
 /// What to tell someone who asked for the content of `path` (entry `e`),
 /// which this repository cannot show. `None`: no explanation beyond the
 /// engine's error (see [`hidden_note`]).
+/// Why this reader cannot materialise `e`, in a few words (`cloaked:team;
+/// no key`, `cloaked:team; withheld by a public remote`, `embargo …; not
+/// released`), for listings; [`hidden_explanation`] says what to do.
+pub fn hidden_reason(repo: &Repo, e: &TreeEntry) -> Option<String> {
+    let present = repo.store().has(&e.id);
+    Some(match &e.visibility {
+        Visibility::Public => return None,
+        Visibility::Cloaked { scope } if present => format!("cloaked:{}; no key", safe(scope)),
+        Visibility::Cloaked { scope } => format!("cloaked:{}; withheld by a public remote", safe(scope)),
+        Visibility::Embargoed { embargo } => format!("embargo {}; not released", safe(embargo)),
+    })
+}
+
 pub fn hidden_explanation(repo: &Repo, path: &VPath, e: &TreeEntry) -> Option<String> {
     let path = safe(path.as_str());
     let present = repo.store().has(&e.id);

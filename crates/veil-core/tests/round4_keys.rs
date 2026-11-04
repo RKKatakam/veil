@@ -334,7 +334,7 @@ fn public_remotes_receive_no_key_rings_and_still_read_released_embargoes() {
 fn a_member_signed_record_replaces_an_unverified_local_one() {
     let alice = Identity::generate("alice");
     let (repo, fs) = repo_at(3, &alice);
-    let id = repo.keys().create_embargo("team", None, "").unwrap();
+    let id = repo.keys().create_embargo("team", None).unwrap();
     let real = repo.keys().load_embargo(&id).unwrap().unwrap();
     // A hostile public remote strips the signature and moves the deadline.
     let mut forged = real.clone();
@@ -355,7 +355,7 @@ fn a_member_signed_record_replaces_an_unverified_local_one() {
     assert!(ck.embargo_released(&id));
     // With the ring here, a record signed by a non-member is rejected again.
     let (outsider, _ofs) = repo_at(3, &Identity::generate("outsider"));
-    let oid = outsider.keys().create_embargo("team", None, "").unwrap();
+    let oid = outsider.keys().create_embargo("team", None).unwrap();
     let theirs = outsider.keys().load_embargo(&oid).unwrap().unwrap();
     assert!(ck.merge_embargo(&theirs).unwrap().is_some_and(|w| w.contains("rejected")));
     drop(fs);

@@ -48,6 +48,15 @@ fixed**. Severity: high / medium / low.
 
 ## Correctness
 
+- **Medium: concurrent first pushes to an empty remote race.**
+  `remote::push_with` checks whether the remote is a repository, then
+  initialises it; when several pushes hit an empty remote at once, the losers
+  fail with `AlreadyExists("a Veil repository")`. Seen as the occasional
+  failure of `sftp_sync::concurrent_pushers_serialise_on_the_remote_lock`
+  under full-suite load. Initialisation must be atomic (create-new on
+  `repo.json`) and a loser should retry as a normal push. To be numbered
+  after the Fable pass.
+
 - **Medium: undo right after stale-working-copy recovery hides the
   recovered change.** Recoverable with `vl op restore`.
 

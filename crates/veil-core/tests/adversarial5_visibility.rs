@@ -67,7 +67,6 @@ fn the_key_and_its_text_backups_stay_local() {
 /// Veil snapshots on every command, so the window is any `vl` command run
 /// (by the user or an agent) while the editor has the file open.
 #[test]
-#[ignore = "BUG-098: Vim swap files of isolated files (.id_ed25519.swp, .server.pem.swp) are recorded and pushed in plaintext"]
 fn a_swap_file_of_an_isolated_key_is_not_recorded() {
     let (mut repo, fs, _) = new_repo("alice");
     fs.write(&p("deploy/id_ed25519"), KEY.as_bytes()).unwrap();
@@ -96,7 +95,6 @@ fn a_swap_file_of_an_isolated_key_is_not_recorded() {
 /// common ones (`APP_KEY`, `RAILS_MASTER_KEY`, `ENCRYPTION_KEY`: `key` alone
 /// is no keyword; see BUG-092), so `.env`'s content is recorded and pushed.
 #[test]
-#[ignore = "BUG-098: an editor backup of .env (.env~) is recorded and pushed in plaintext"]
 fn an_editor_backup_of_dotenv_is_not_recorded() {
     let (mut repo, fs, _) = new_repo("alice");
     let env = "APP_KEY=base64:Zq8vXk9mQ2vL7pR4wZt8aB3cD5eF7gH9jK1mN3pQ5sU=\nRAILS_MASTER_KEY=9f86d081884c7d659a2feaa0c55ad015\n";

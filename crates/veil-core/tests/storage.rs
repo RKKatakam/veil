@@ -404,7 +404,7 @@ fn gc_keeps_embargo_fallbacks_that_are_the_only_reference() {
     let mut merged = Tree::default();
     merged.insert(file(new));
     let merged_tree = store.put_tree(&merged).unwrap();
-    let embargo = repo.keys().create_embargo("team", None, "fix").unwrap();
+    let embargo = repo.keys().create_embargo("team", None).unwrap();
     let sealed_tree = apply_embargo(&store, &merged_tree, &base_tree, &embargo).unwrap();
 
     let root = repo.root_id();

@@ -648,6 +648,9 @@ pub struct EmbargoRecord {
     pub released_key: Option<String>,
     pub released_at: Option<i64>,
     pub created: i64,
+    /// Always empty: an embargo carries no description (the record is
+    /// synced in plaintext, to public remotes too). Kept, and signed, so
+    /// records stay readable by, and verifiable for, every version.
     pub description: String,
     /// Envelope label of the scope key generation `wrapped` is sealed under
     /// (absent on legacy records: the bare scope, i.e. generation 0).
@@ -1705,7 +1708,7 @@ impl Keychain {
         self.embargo_status(rec).is_good()
     }
 
-    pub fn create_embargo(&self, scope: &str, until: Option<i64>, description: &str) -> Result<String> {
+    pub fn create_embargo(&self, scope: &str, until: Option<i64>) -> Result<String> {
         let _lock = self.lock_meta()?;
         // Signed records are attributed through the ring, so a legacy
         // (unsigned) ring is upgraded first.
@@ -1728,7 +1731,7 @@ impl Keychain {
             released_key: None,
             released_at: None,
             created: crate::now_millis(),
-            description: description.to_string(),
+            description: String::new(),
             scope_key: Some(label),
             key_id: Some(key_fingerprint(&key)),
             signature: None,

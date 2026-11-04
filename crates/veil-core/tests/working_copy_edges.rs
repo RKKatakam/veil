@@ -151,6 +151,32 @@ fn disk_backend_never_reads_through_a_symlink() {
     assert_eq!(fs.list_dir_full(&VPath::root()).unwrap().special, vec!["link".to_string()]);
 }
 
+/// `write` (and `write_unsynced`, `create_new`) refuse a path below a
+/// symlinked directory, whoever calls them; `.veil/` is the engine's own.
+#[cfg(unix)]
+#[test]
+fn disk_backend_never_writes_through_a_symlinked_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("real")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), tmp.path().join("real/vendor")).unwrap();
+    let fs = DiskBackend::new(tmp.path());
+    for path in ["real/vendor/x", "real/vendor/deep/x"] {
+        let e = fs.write(&p(path), b"pulled").unwrap_err();
+        assert!(e.to_string().contains("symbolic link"), "{e}");
+        assert!(fs.write_unsynced(&p(path), b"pulled").is_err());
+        assert!(fs.create_new(&p(path), b"pulled").is_err());
+    }
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0, "nothing was written outside");
+    fs.write(&p("real/ok/x"), b"fine").unwrap();
+    assert_eq!(std::fs::read(tmp.path().join("real/ok/x")).unwrap(), b"fine");
+    // The engine's own directory may be a symlink (e.g. to another disk).
+    let store = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(store.path(), tmp.path().join(".veil")).unwrap();
+    fs.write(&p(".veil/local/state"), b"s").unwrap();
+    assert_eq!(std::fs::read(store.path().join("local/state")).unwrap(), b"s");
+}
+
 #[cfg(unix)]
 #[test]
 fn a_tracked_path_replaced_by_a_symlink_keeps_its_entry() {

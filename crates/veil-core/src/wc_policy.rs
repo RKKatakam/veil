@@ -28,7 +28,7 @@ use crate::{
     object::is_reserved_name,
     policy::{self, HeldBack, Policy, Tier, WorkingCopyPolicy, POLICY_FILE},
     repo::Repo,
-    vfs::{is_temp_name, walk_files, StorageBackend},
+    vfs::{is_temp_name, NodeKind, StorageBackend},
     vpath::VPath,
 };
 
@@ -84,28 +84,37 @@ impl Repo {
     }
 
     /// Files of working copy `fs` kept under the accepted policy because its
-    /// `.veilpolicy` would weaken their protection.
+    /// `.veilpolicy` would weaken their protection, and directories the
+    /// accepted policy ignores that it would not (as a whole, as snapshots
+    /// report them).
     pub fn policy_held_back(&self, fs: &dyn StorageBackend) -> Result<Vec<HeldBack>> {
         let policy = self.effective_policy(fs)?;
         if policy.accepted().is_none() {
             return Ok(Vec::new());
         }
-        let skip = |p: &VPath| {
-            let name = p.file_name();
-            let c = policy.classify(p, true);
-            is_reserved_name(name) || is_temp_name(name) || (c.tier == Tier::Ignored && c.held_back.is_none())
-        };
         let mut out = Vec::new();
-        for path in walk_files(fs, &VPath::root(), &skip)? {
-            let c = policy.classify(&path, false);
-            if let Some((tier, force)) = &c.held_back {
-                out.push(HeldBack {
-                    path,
-                    accepted: c.keyword(),
-                    wanted: policy::tier_keyword(tier, *force),
-                });
+        let mut stack = vec![VPath::root()];
+        while let Some(dir) = stack.pop() {
+            for child in fs.list_dir(&dir)? {
+                if is_reserved_name(&child.name) || is_temp_name(&child.name) {
+                    continue;
+                }
+                let path = dir.join(&child.name);
+                let is_dir = child.kind == NodeKind::Dir;
+                let c = policy.classify(&path, is_dir);
+                if is_dir && c.tier != Tier::Ignored {
+                    stack.push(path);
+                } else if let Some((tier, force)) = &c.held_back {
+                    out.push(HeldBack {
+                        path,
+                        accepted: c.keyword(),
+                        wanted: policy::tier_keyword(tier, *force),
+                        dir: is_dir,
+                    });
+                }
             }
         }
+        out.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(out)
     }
 
