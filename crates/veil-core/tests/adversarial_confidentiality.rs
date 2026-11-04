@@ -293,6 +293,57 @@ fn policy_pr_cannot_rekey_cloaked_files_to_an_attacker_scope() {
     assert!(got.is_none(), "Mallory reads ops-only content: {:?}", got.map(String::from_utf8));
 }
 
+/// Same root cause, simplest form: a PR flips `secrets/ cloak team` to
+/// `secrets/ public!`. Merging it decrypts every existing cloaked file into
+/// public blobs; `vl merge` neither warns nor asks.
+#[test]
+#[ignore = "BUG-011: merging a .veilpolicy change silently declassifies existing cloaked files"]
+fn merging_a_policy_change_does_not_silently_declassify_cloaked_files() {
+    let (mut alice, fs, _) = new_repo("alice");
+    let main = commit_files(
+        &mut alice,
+        &*fs,
+        &[(".veilpolicy", "secrets/ cloak team\n"), ("secrets/db.yml", "db-password-xyz\n")],
+        "v1",
+    );
+    alice.set_tag("main", main, None, false).unwrap();
+    let pr_ws = alice.ephemeral_workspace(main).unwrap();
+    pr_ws.write(".veilpolicy", "# tidy\nsecrets/ public!\n").unwrap();
+    let (pr, _) = alice.commit_ephemeral(&pr_ws, "tidy policy").unwrap();
+    alice.merge(WS, main, vec![pr], "merge PR", None).unwrap();
+    let m = alice.view().tags["main"].target;
+    let e = file_entry(&alice, &m, "secrets/db.yml").unwrap();
+    assert!(!e.visibility.is_public(), "existing cloaked content became public by merging a policy edit");
+}
+
+/// The embargoed tree on a public mirror is supposed to look exactly like the
+/// pre-merge tree. It reveals which files the fix touches, their new sizes,
+/// and the names of files it adds.
+#[test]
+#[ignore = "BUG-038: an embargoed merge reveals changed/added file names and new sizes to public mirrors before release"]
+fn embargoed_tree_reveals_nothing_about_the_fix() {
+    let (mut alice, fs, _) = new_repo("alice");
+    let main = commit_files(&mut alice, &*fs, &[("auth.rs", "fn check() -> bool { true }\n"), ("lib.rs", "x\n")], "v1");
+    alice.set_tag("main", main, None, false).unwrap();
+    alice.create_workspace("fix", vec![main], Some("team".into())).unwrap();
+    let ov = alice.workspace_overlay("fix").unwrap();
+    ov.write(&p("auth.rs"), b"fn check() -> bool { verify_signature_and_expiry_and_audience() }\n").unwrap();
+    ov.write(&p("CVE-2026-31337-auth-bypass.md"), b"details\n").unwrap();
+    let fix = alice.snapshot_workspace("fix", &ov).unwrap().snapshot;
+    alice
+        .merge(WS, main, vec![fix], "merge", Some(EmbargoSpec { scope: "team".into(), until: None }))
+        .unwrap();
+    let mirror = Arc::new(MemoryBackend::new());
+    remote::push(&mut alice, mirror.clone(), true, &["main".to_string()], false).unwrap();
+    let anon = anon_view(mirror);
+    let m = anon.view().tags["main"].target;
+    let listing = |r: &Repo, id| -> Vec<(String, u64)> {
+        let tree = r.snapshot(&id).unwrap().tree;
+        veil_core::tree::walk_files(r.store(), &tree).unwrap().into_iter().map(|(p, e)| (p.to_string(), e.size)).collect()
+    };
+    assert_eq!(listing(&anon, m), listing(&alice, main), "public mirror learns about the fix");
+}
+
 #[test]
 #[ignore = "BUG-012: built-in secret rules are case-sensitive; .ENV, KEY.PEM, ID_RSA are snapshotted publicly"]
 fn builtin_secret_rules_are_case_insensitive() {

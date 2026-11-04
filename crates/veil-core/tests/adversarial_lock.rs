@@ -150,3 +150,74 @@ fn concurrent_snapshots_of_different_workspaces_are_all_recorded() {
         assert_eq!(read_at(&r, &wc, &format!("file-{i}")), b"4\n");
     }
 }
+
+/// A working copy that is slow to read (huge tree, network FS): the snapshot
+/// holds the lock for its whole duration; a concurrent writer must wait, not
+/// fail or interleave, and both operations must be recorded.
+#[test]
+fn slow_snapshot_serialises_with_a_concurrent_writer() {
+    #[derive(Debug)]
+    struct Slow(MemoryBackend);
+    impl StorageBackend for Slow {
+        fn kind(&self) -> &'static str {
+            "slow"
+        }
+        fn read(&self, p: &veil_core::VPath) -> veil_core::Result<Vec<u8>> {
+            std::thread::sleep(Duration::from_millis(15));
+            self.0.read(p)
+        }
+        fn write(&self, p: &veil_core::VPath, d: &[u8]) -> veil_core::Result<()> {
+            self.0.write(p, d)
+        }
+        fn create_new(&self, p: &veil_core::VPath, d: &[u8]) -> veil_core::Result<bool> {
+            self.0.create_new(p, d)
+        }
+        fn remove_file(&self, p: &veil_core::VPath) -> veil_core::Result<()> {
+            self.0.remove_file(p)
+        }
+        fn remove_dir_all(&self, p: &veil_core::VPath) -> veil_core::Result<()> {
+            self.0.remove_dir_all(p)
+        }
+        fn create_dir_all(&self, p: &veil_core::VPath) -> veil_core::Result<()> {
+            self.0.create_dir_all(p)
+        }
+        fn list_dir(&self, p: &veil_core::VPath) -> veil_core::Result<Vec<veil_core::vfs::DirEntry>> {
+            self.0.list_dir(p)
+        }
+        fn metadata(&self, p: &veil_core::VPath) -> veil_core::Result<Option<veil_core::vfs::Metadata>> {
+            self.0.metadata(p)
+        }
+        fn set_executable(&self, p: &veil_core::VPath, x: bool) -> veil_core::Result<()> {
+            self.0.set_executable(p, x)
+        }
+    }
+    let repo_fs = Arc::new(MemoryBackend::new());
+    let mut repo = Repo::init(repo_fs.clone(), Some(veil_core::Identity::generate("a")), "a").unwrap();
+    let wc = Slow(MemoryBackend::new());
+    for i in 0..120 {
+        wc.0.write(&p(&format!("dir{}/f{i}", i % 7)), format!("{i}\n").as_bytes()).unwrap();
+    }
+    let other = std::thread::spawn({
+        let repo_fs = repo_fs.clone();
+        move || {
+            std::thread::sleep(Duration::from_millis(200));
+            let mut r = Repo::open(repo_fs, None, "b").unwrap();
+            let start = Instant::now();
+            let mut tx = r.transaction("concurrent tag").unwrap();
+            let root = tx.repo().root_id();
+            tx.view.tags.insert("b".into(), veil_core::oplog::Tag { target: root, cloak: None });
+            tx.commit().unwrap();
+            start.elapsed()
+        }
+    });
+    let start = Instant::now();
+    let out = repo.snapshot_workspace(WS, &wc).unwrap();
+    let snap_time = start.elapsed();
+    let waited = other.join().unwrap();
+    assert!(out.changed && snap_time > Duration::from_secs(1));
+    assert!(waited > Duration::from_millis(500), "writer did not wait for the snapshot ({waited:?})");
+    let r = Repo::open(repo_fs, None, "c").unwrap();
+    assert!(r.view().tags.contains_key("b"));
+    assert_eq!(r.workspace_wc(WS).unwrap(), out.snapshot, "snapshot lost");
+    assert_eq!(read_at(&r, &out.snapshot, "dir3/f10"), b"10\n");
+}
