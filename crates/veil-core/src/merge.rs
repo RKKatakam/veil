@@ -36,7 +36,33 @@ pub struct MergeOutcome {
     pub conflicts: Vec<VPath>,
 }
 
+/// How conflicts are resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// A real merge: conflicts are recorded, with markers in text files.
+    Merge,
+    /// Building a virtual merge base: whatever conflicts takes the base's
+    /// version (a conflicting text hunk the base's lines), nothing is
+    /// recorded. Two later versions that disagree on it then both differ
+    /// from the virtual base and conflict.
+    VirtualBase,
+}
+
 pub fn merge_trees(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, theirs: ObjectId) -> Result<MergeOutcome> {
+    merge_trees_in(store, base, ours, theirs, Mode::Merge)
+}
+
+/// The virtual merge base of two merge bases `ours` and `theirs` (whose
+/// own merge base is `base`), for a criss-cross merge (see
+/// [`crate::repo::Repo::merge_base_tree`]). What the two bases disagree on
+/// is left as `base` has it, so neither base's version of it is taken
+/// silently (BUG-244). Markers in the virtual base, as Git writes them,
+/// would line up with one side's resolution in a line diff and let it win.
+pub fn virtual_merge_base(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, theirs: ObjectId) -> Result<ObjectId> {
+    Ok(merge_trees_in(store, base, ours, theirs, Mode::VirtualBase)?.tree)
+}
+
+fn merge_trees_in(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, theirs: ObjectId, mode: Mode) -> Result<MergeOutcome> {
     if ours == theirs || Some(theirs) == base {
         return Ok(MergeOutcome { tree: ours, conflicts: vec![] });
     }
@@ -61,14 +87,14 @@ pub fn merge_trees(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, 
             }
         }
     }
-    let full = merge_resolved(store, base, ours, theirs)?;
+    let full = merge_resolved(store, base, ours, theirs, mode)?;
     let Some(w) = wrapped else {
         return Ok(full);
     };
     // What readers without the key see: the same merge of what they see.
     let pv = |id: ObjectId| public_view(store, &id);
     let (pb, po, pt) = (base.map(pv).transpose()?, pv(ours)?, pv(theirs)?);
-    let fallback = match merge_resolved(store, pb, po, pt) {
+    let fallback = match merge_resolved(store, pb, po, pt, mode) {
         Ok(m) => m.tree,
         Err(_) => po,
     };
@@ -78,7 +104,7 @@ pub fn merge_trees(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, 
     })
 }
 
-fn merge_resolved(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, theirs: ObjectId) -> Result<MergeOutcome> {
+fn merge_resolved(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, theirs: ObjectId, mode: Mode) -> Result<MergeOutcome> {
     if ours == theirs || Some(theirs) == base {
         return Ok(MergeOutcome { tree: ours, conflicts: vec![] });
     }
@@ -89,7 +115,7 @@ fn merge_resolved(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, t
     let o = store.tree(&ours)?;
     let t = store.tree(&theirs)?;
     let mut conflicts = Vec::new();
-    let tree = match merge_dir(store, b, Some((o, ours)), Some((t, theirs)), &mut conflicts)? {
+    let tree = match merge_dir(store, b, Some((o, ours)), Some((t, theirs)), mode, &mut conflicts)? {
         Some(id) => id,
         None => store.empty_tree()?,
     };
@@ -180,6 +206,7 @@ fn merge_dir(
     b: Option<Arc<Tree>>,
     o: Option<(Arc<Tree>, ObjectId)>,
     t: Option<(Arc<Tree>, ObjectId)>,
+    mode: Mode,
     conflicts: &mut Vec<VPath>,
 ) -> Result<Option<ObjectId>> {
     let mut stack = vec![MergeFrame::new(VPath::root(), b, o, t)];
@@ -206,14 +233,16 @@ fn merge_dir(
         let oe = f.o.as_ref().and_then(|x| x.0.get(&name));
         let te = f.t.as_ref().and_then(|x| x.0.get(&name));
         let path = f.dir.join(&name);
+        let mut aside = None;
         let pick = if same(oe, te) || same(be, te) {
             oe.cloned()
         } else if same(be, oe) {
             te.cloned()
         } else {
             let kinds: Vec<EntryKind> = [oe, te].into_iter().flatten().map(|e| e.kind).collect();
-            let base_ok = be.is_none_or(|e| e.kind == kinds[0]);
-            if kinds.iter().all(|k| *k == EntryKind::Dir) && be.is_none_or(|e| e.kind == EntryKind::Dir) {
+            // Two directories (or two files) merge as such, whatever the base
+            // was: a base of the other kind counts as absent.
+            if kinds == [EntryKind::Dir, EntryKind::Dir] {
                 if depth >= MAX_TREE_DEPTH {
                     return Err(VeilError::Corrupt(
                         path.to_string(),
@@ -224,19 +253,107 @@ fn merge_dir(
                 f.waiting = Some(name);
                 stack.push(MergeFrame::new(path, bs, os, ts));
                 continue;
-            } else if let (Some(oe), Some(te), true) = (oe, te, kinds.iter().all(|k| *k == EntryKind::File) && base_ok) {
-                Some(merge_file(store, &path, be, oe, te, conflicts)?)
+            } else if let (Some(oe), Some(te), [EntryKind::File, EntryKind::File]) = (oe, te, kinds.as_slice()) {
+                let be = be.filter(|e| e.kind == EntryKind::File);
+                Some(merge_file(store, &path, be, oe, te, mode, conflicts)?)
+            } else if mode == Mode::VirtualBase {
+                // Modify/delete or file/directory: the base's version.
+                be.cloned()
+            } else if let (Some(oe), Some(te)) = (oe, te) {
+                // File/directory conflict (BUG-243): both sides survive. The
+                // directory keeps the name; the file moves aside to
+                // `<name>~ours` or `<name>~theirs` (the side it came from).
+                // Both paths are recorded as conflicted.
+                let (dir, file, side) = if oe.kind == EntryKind::Dir {
+                    (oe, te, "theirs")
+                } else {
+                    (te, oe, "ours")
+                };
+                let moved = aside_name(f, &name, side);
+                conflicts.push(path.clone());
+                conflicts.push(f.dir.join(&moved));
+                aside = Some(TreeEntry {
+                    name: moved,
+                    ..file.clone()
+                });
+                Some(dir.clone())
             } else {
-                // modify/delete or file/directory conflict: keep the surviving
-                // side (ours first) and flag it.
+                // modify/delete conflict: keep the modified side and flag it.
                 conflicts.push(path.clone());
                 oe.or(te).cloned()
             }
         };
-        if let Some(e) = pick {
+        for e in pick.into_iter().chain(aside) {
             f.out.insert(e);
         }
     }
+}
+
+/// diff3 of `ours` and `theirs` where each conflicting hunk takes the
+/// `base`'s lines (for a virtual merge base, see [`Mode::VirtualBase`]).
+fn merge_keeping_base(base: &[u8], ours: &[u8], theirs: &[u8]) -> Vec<u8> {
+    // Markers long enough to appear in none of the inputs, so the
+    // conflict blocks can be cut out of the output unambiguously, even
+    // where a section without a final newline runs into the next marker.
+    let longest_run = [base, ours, theirs]
+        .iter()
+        .flat_map(|x| x.chunk_by(|a, b| a == b))
+        .filter(|run| matches!(run[0], b'<' | b'|' | b'=' | b'>'))
+        .map(|run| run.len())
+        .max()
+        .unwrap_or(0);
+    let n = longest_run.max(63) + 1;
+    let marker = |c: u8, label: &[u8]| {
+        let mut m = vec![c; n];
+        m.extend_from_slice(label);
+        m.push(b'\n');
+        m
+    };
+    let (start, orig, mid, end) = (marker(b'<', b" ours"), marker(b'|', b" original"), marker(b'=', b""), marker(b'>', b" theirs"));
+    let merged = match diffy::MergeOptions::new()
+        .set_conflict_marker_length(n)
+        .set_conflict_style(diffy::ConflictStyle::Diff3)
+        .merge_bytes(base, ours, theirs)
+    {
+        Ok(m) => return m,
+        Err(m) => m,
+    };
+    let mut out = Vec::with_capacity(merged.len());
+    let mut rest = merged.as_slice();
+    while let Some(i) = find(rest, &start) {
+        out.extend_from_slice(&rest[..i]);
+        rest = &rest[i + start.len()..];
+        let (Some(o), Some(m)) = (find(rest, &orig), find(rest, &mid)) else { break };
+        let base_part = &rest[o + orig.len()..m];
+        out.extend_from_slice(base_part);
+        rest = &rest[m + mid.len()..];
+        let Some(e) = find(rest, &end) else { break };
+        rest = &rest[e + end.len()..];
+    }
+    out.extend_from_slice(rest);
+    out
+}
+
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    memchr::memmem::find(hay, needle)
+}
+
+/// A name for the file side of a file/directory conflict on `name`:
+/// `<name>~<side>`, or `<name>~<side>~2`, … if that name is taken in any
+/// input of the directory being merged or in its result so far.
+fn aside_name(f: &MergeFrame, name: &str, side: &str) -> String {
+    let taken = |n: &str| {
+        f.out.get(n).is_some()
+            || f.b.as_ref().is_some_and(|t| t.get(n).is_some())
+            || [&f.o, &f.t].into_iter().flatten().any(|(t, _)| t.get(n).is_some())
+    };
+    let mut candidate = format!("{name}~{side}");
+    let mut n = 2;
+    while taken(&candidate) {
+        candidate = format!("{name}~{side}~{n}");
+        n += 1;
+    }
+    candidate
 }
 
 fn merge_file(
@@ -245,6 +362,7 @@ fn merge_file(
     be: Option<&TreeEntry>,
     oe: &TreeEntry,
     te: &TreeEntry,
+    mode: Mode,
     conflicts: &mut Vec<VPath>,
 ) -> Result<TreeEntry> {
     let base = match be.filter(|e| e.kind == EntryKind::File) {
@@ -271,7 +389,13 @@ fn merge_file(
     if ours == theirs {
         return Ok(TreeEntry { executable, ..oe.clone() });
     }
-    let merged = if looks_binary(&ours) || looks_binary(&theirs) || looks_binary(&base) {
+    let merged = if mode == Mode::VirtualBase {
+        if looks_binary(&ours) || looks_binary(&theirs) || looks_binary(&base) {
+            base
+        } else {
+            merge_keeping_base(&base, &ours, &theirs)
+        }
+    } else if looks_binary(&ours) || looks_binary(&theirs) || looks_binary(&base) {
         conflicts.push(path.clone());
         ours
     } else {
@@ -385,5 +509,43 @@ fn checked(store: &ObjectStore, e: &TreeEntry, path: &VPath) -> Result<TreeEntry
             "cannot merge {path}: it is labelled {} but its sealing cannot be verified",
             e.visibility.label()
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_keeping_base;
+
+    #[test]
+    fn conflicting_hunks_take_the_base() {
+        let base = b"1\n2\n3\n4\n5\n";
+        let ours = b"ONE\n2\nB\n4\n5\n";
+        let theirs = b"1\n2\nC\n4\nFIVE\n";
+        assert_eq!(merge_keeping_base(base, ours, theirs), b"ONE\n2\n3\n4\nFIVE\n");
+    }
+
+    #[test]
+    fn a_clean_merge_is_the_merge() {
+        assert_eq!(merge_keeping_base(b"1\n2\n3\n", b"A\n2\n3\n", b"1\n2\nC\n"), b"A\n2\nC\n");
+    }
+
+    #[test]
+    fn missing_final_newlines_and_marker_like_content() {
+        let markers = "<<<<<<< ours\n=======\n>>>>>>> theirs\n";
+        let base = format!("{markers}last");
+        let ours = format!("{markers}left");
+        let theirs = format!("{markers}right");
+        assert_eq!(merge_keeping_base(base.as_bytes(), ours.as_bytes(), theirs.as_bytes()), base.as_bytes());
+        // Long runs of marker characters in the content get longer markers.
+        let run = "=".repeat(200);
+        let base = format!("{run}\nx\n");
+        let ours = format!("{run}\ny\n");
+        let theirs = format!("{run}\nz\n");
+        assert_eq!(merge_keeping_base(base.as_bytes(), ours.as_bytes(), theirs.as_bytes()), base.as_bytes());
+    }
+
+    #[test]
+    fn no_base_drops_the_conflicting_hunk() {
+        assert_eq!(merge_keeping_base(b"", b"a\n", b"b\n"), b"");
     }
 }

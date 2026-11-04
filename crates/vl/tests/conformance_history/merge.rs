@@ -321,7 +321,6 @@ fn merging_a_descendant_takes_its_content() {
 
 // Scenario from jj test_merge_trees (duplicate parents): merging a snapshot with itself.
 #[test]
-#[ignore = "BUG-240: `vl merge X --into X` (and `vl new X X`) records a snapshot whose parents are duplicates"]
 fn merging_a_snapshot_into_itself_records_no_duplicate_parent() {
     let env = Env::new();
     let r = env.repo("p");
@@ -343,7 +342,6 @@ fn merging_a_snapshot_into_itself_records_no_duplicate_parent() {
 
 // Scenario from jj test_new (duplicate parents): `vl new X X` with work in progress.
 #[test]
-#[ignore = "BUG-240: `vl merge X --into X` (and `vl new X X`) records a snapshot whose parents are duplicates"]
 fn new_with_a_repeated_parent_records_one_parent() {
     let env = Env::new();
     let r = env.repo("p");
@@ -473,7 +471,6 @@ fn file_directory_conflict_is_flagged() {
 
 // Scenario from git t6400-merge-df.sh / t6438: a D/F conflict must not silently drop the other side's files.
 #[test]
-#[ignore = "BUG-243: a file/directory merge conflict keeps one side and drops the other side's files from the result, with nothing on disk to show them"]
 fn file_directory_conflict_keeps_both_sides_content() {
     let env = Env::new();
     let r = fork(
@@ -655,7 +652,6 @@ fn emptied_file_against_an_edit_conflicts() {
 
 // Scenario from git t6401-merge-criss-cross.sh / t6431-merge-criscross.sh: two merge bases.
 #[test]
-#[ignore = "BUG-244: a criss-cross merge uses one arbitrary merge base and silently takes one side's earlier resolution instead of reporting the conflict"]
 fn criss_cross_merge_with_different_resolutions_conflicts() {
     let env = Env::new();
     let base = lines("l", 9);
@@ -665,13 +661,16 @@ fn criss_cross_merge_with_different_resolutions_conflicts() {
         w(&[("f", &base.replace("l5\n", "B\n"))]),
         w(&[("f", &base.replace("l5\n", "C\n"))]),
     );
+    // The merge below moves the `right` tag to R2: L2 must merge the
+    // original `right`, or R2 would be L2's ancestor (no criss-cross).
+    let right = r.sid("right");
     // right + left, resolved as "B".
     r.ok(&["merge", "left", "--into", "right", "-m", "R2"]);
     resolve(&r, &[("f", &base.replace("l5\n", "B\n"))]);
     r.tag("r2", "@-");
     // left + right, resolved as "C".
     r.ok(&["new", "left"]);
-    r.ok(&["merge", "right", "--into", "left", "-m", "L2"]);
+    r.ok(&["merge", &right, "--into", "left", "-m", "L2"]);
     resolve(&r, &[("f", &base.replace("l5\n", "C\n"))]);
     r.tag("l2", "@-");
     // Merge the two resolutions: they disagree, so this must conflict
@@ -696,10 +695,13 @@ fn criss_cross_merge_with_agreeing_resolutions_is_clean() {
         w(&[("f", &base.replace("l2\n", "B\n"))]),
         w(&[("f", &base.replace("l8\n", "C\n"))]),
     );
+    let right = r.sid("right");
     r.ok(&["merge", "left", "--into", "right", "-m", "R2"]);
     r.tag("r2", "@-");
+    let left = r.sid("left");
     r.ok(&["new", "left"]);
-    r.ok(&["merge", "right", "--into", "left", "-m", "L2"]);
+    r.ok(&["merge", &right, "--into", "left", "-m", "L2"]);
+    assert_eq!(r.snap("@-").parents, vec![left, right], "not a criss-cross");
     r.tag("l2", "@-");
     r.ok(&["new", "r2"]);
     r.write("other", "o\n");
@@ -965,4 +967,117 @@ fn isolated_file_survives_a_merge() {
     r.ok(&["merge", "left"]);
     assert_eq!(r.read(".env"), "API_KEY=supersecret-local-value\n");
     assert!(r.store_contains("supersecret-local-value").is_empty());
+}
+
+// ---- merge wave regressions ------------------------------------------------
+
+// BUG-243: the file side of a file/directory conflict is moved aside to `NAME~<side>`, both paths recorded.
+#[test]
+fn file_directory_conflict_moves_the_file_aside() {
+    let env = Env::new();
+    let r = fork(
+        &env,
+        &[("thing", "file\n"), ("k", "k\n")],
+        |r: &R| {
+            r.rm("thing");
+            r.write("thing/inner.txt", "dir content\n");
+        },
+        w(&[("thing", "file edited\n")]),
+    );
+    let out = r.ok(&["merge", "left"]);
+    assert!(out.contains("thing~ours"), "{out}");
+    assert_eq!(r.read("thing/inner.txt"), "dir content\n");
+    assert_eq!(r.read("thing~ours"), "file edited\n");
+    let mut c = r.snap("@-").conflicts;
+    c.sort();
+    assert_eq!(c, vec!["thing".to_string(), "thing~ours".to_string()]);
+    // Deleting the moved-aside copy resolves that path.
+    r.ok(&["edit", "@-"]);
+    r.rm("thing~ours");
+    r.ok(&["status"]);
+    assert_eq!(r.snap("@").conflicts, vec!["thing".to_string()]);
+}
+
+// BUG-243: the moved-aside name never overwrites an existing entry.
+#[test]
+fn file_directory_conflict_aside_name_avoids_existing_files() {
+    let env = Env::new();
+    let r = fork(
+        &env,
+        &[("thing", "file\n"), ("thing~theirs", "already here\n")],
+        w(&[("thing", "file edited\n")]),
+        |r: &R| {
+            r.rm("thing");
+            r.write("thing/inner.txt", "dir content\n");
+        },
+    );
+    r.ok(&["merge", "left"]);
+    assert_eq!(r.read("thing~theirs"), "already here\n");
+    assert_eq!(r.read("thing~theirs~2"), "file edited\n");
+    assert_eq!(r.read("thing/inner.txt"), "dir content\n");
+}
+
+// BUG-243: two directories merge as directories even where the base had a file of that name.
+#[test]
+fn directories_added_on_both_sides_over_a_file_merge() {
+    let env = Env::new();
+    let r = fork(
+        &env,
+        &[("thing", "file\n")],
+        |r: &R| {
+            r.rm("thing");
+            r.write("thing/a.txt", "a\n");
+        },
+        |r: &R| {
+            r.rm("thing");
+            r.write("thing/b.txt", "b\n");
+        },
+    );
+    let out = r.ok(&["merge", "left"]);
+    assert!(!out.contains("conflict"), "{out}");
+    assert_eq!(r.read("thing/a.txt"), "a\n");
+    assert_eq!(r.read("thing/b.txt"), "b\n");
+}
+
+// BUG-240: merging the destination into itself is refused, and records nothing.
+#[test]
+fn merging_the_destination_into_itself_is_refused() {
+    let env = Env::new();
+    let r = env.repo("p");
+    r.commit("one", &[("f", "1\n")]);
+    r.tag("main", "@-");
+    r.ok(&["status"]);
+    let op = r.op_head();
+    let err = r.fails(&["merge", "main", "--into", "main"]);
+    assert!(err.contains("nothing to merge"), "{err}");
+    assert_eq!(r.op_head(), op);
+}
+
+// BUG-244: a criss-cross where one side changed nothing since its merge base takes the other side.
+#[test]
+fn criss_cross_merge_takes_a_later_edit_cleanly() {
+    let env = Env::new();
+    let base = lines("l", 9);
+    let r = fork(
+        &env,
+        &[("f", &base)],
+        w(&[("f", &base.replace("l5\n", "B\n"))]),
+        w(&[("f", &base.replace("l5\n", "C\n"))]),
+    );
+    let right = r.sid("right");
+    r.ok(&["merge", "left", "--into", "right", "-m", "R2"]);
+    resolve(&r, &[("f", &base.replace("l5\n", "B\n"))]);
+    r.tag("r2", "@-");
+    r.ok(&["new", "left"]);
+    r.ok(&["merge", &right, "--into", "left", "-m", "L2"]);
+    resolve(&r, &[("f", &base.replace("l5\n", "B\n"))]);
+    // Both resolved as B; L2's line then edits l9.
+    r.ok(&["new", "@-"]);
+    r.write("f", base.replace("l5\n", "B\n").replace("l9\n", "NINE\n"));
+    r.ok(&["commit", "--no-advance", "-m", "edit"]);
+    r.tag("l3", "@-");
+    r.ok(&["new", "r2"]);
+    let out = r.ok(&["merge", "l3"]);
+    assert!(!out.contains("conflict"), "{out}");
+    assert_eq!(r.read("f"), base.replace("l5\n", "B\n").replace("l9\n", "NINE\n"));
 }

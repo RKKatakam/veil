@@ -374,8 +374,16 @@ M README.md
 $ vl new
 ```
 
-Resolving in `@` and then running `vl squash` gives the right content but
-leaves the merge marked `(conflict)` in `vl log`.
+You can also resolve in `@` (the change on top of the merge) and fold the
+resolution into the merge with `vl squash`, as `vl status` suggests. The
+squash clears the merge's `(conflict)` mark for every file the resolution
+edited; a conflicted file it left untouched stays marked.
+
+When one side has a file where the other has a directory of the same name,
+both survive: the directory keeps the name, and the file is moved aside to
+`NAME~ours` or `NAME~theirs` (the side it came from). Both paths are marked
+as conflicted. Move what you need from the file into the directory (or the
+other way round), then delete the moved-aside copy.
 
 ## Global options and environment
 

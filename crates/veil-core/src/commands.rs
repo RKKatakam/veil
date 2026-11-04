@@ -11,13 +11,13 @@ use crate::{
     error::{Result, VeilError},
     id::{ChangeId, ObjectId},
     keychain::{ReleaseState, StageOutcome, TakeBack},
-    merge::merge_trees,
     now_millis,
-    object::{EntryKind, Snapshot, TreeEntry, Visibility},
+    object::{EntryKind, Snapshot, Text, TreeEntry, Visibility},
     oplog::Tag,
     policy::{Policy, POLICY_FILE},
     repo::Repo,
     store::ObjectStore,
+    transaction::dedup_parents,
     tree::{lookup, TreeView},
     vpath::VPath,
 };
@@ -112,6 +112,19 @@ fn sealed_for_other_scopes(store: &ObjectStore, dest: &ObjectId, tree: &ObjectId
     Ok(out)
 }
 
+/// Is `text` the description `message`, sealed for `scope` (plain when
+/// `None`)?
+fn same_description(store: &ObjectStore, text: &Text, message: &str, scope: Option<&str>) -> bool {
+    match (text, scope) {
+        (Text::Plain(t), None) => t == message,
+        (Text::Sealed(env), Some(scope)) => {
+            store.keys.sealing_key(scope).is_ok_and(|(label, _)| label == env.scope)
+                && store.read_text(text).as_deref() == Some(message)
+        }
+        _ => false,
+    }
+}
+
 pub fn validate_tag_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && !name.ends_with('-')
@@ -166,7 +179,14 @@ impl Repo {
         let s = tx.repo().snapshot(&id)?;
         let mut ns = (*s).clone();
         let store = &tx.repo().store;
-        ns.description = store.make_text(message, description_scope(store, &s.tree, s.cloak.as_deref())?.as_deref())?;
+        let scope = description_scope(store, &s.tree, s.cloak.as_deref())?;
+        // The same message, sealed for the same audience: nothing to do
+        // (a sealed description never encrypts the same way twice, so the
+        // rewrite's own no-op check cannot see this, BUG-246).
+        if same_description(store, &s.description, message, scope.as_deref()) {
+            return Ok(id);
+        }
+        ns.description = store.make_text(message, scope.as_deref())?;
         ns.predecessors = vec![id];
         let new = tx.rewrite(id, ns)?;
         tx.set_description(format!("describe change {}", s.change_id.short()));
@@ -255,9 +275,16 @@ impl Repo {
     }
 
     /// Move `source` (and, automatically, its descendants) onto `dest`.
+    ///
+    /// Rebasing onto the parents `source` already has changes nothing
+    /// (BUG-246).
     pub fn rebase(&mut self, source: ObjectId, dest: Vec<ObjectId>) -> Result<ObjectId> {
+        let dest = dedup_parents(dest);
         if dest.is_empty() {
             return Err(VeilError::repo("rebase needs at least one destination"));
+        }
+        if self.snapshot(&source)?.parents == dest {
+            return Ok(source);
         }
         for d in &dest {
             if self.is_ancestor(&source, d)? {
@@ -266,9 +293,7 @@ impl Repo {
         }
         let mut tx = self.transaction("rebase")?;
         let s = tx.repo().snapshot(&source)?;
-        let old_base = tx.repo().parents_tree(&s.parents)?.tree;
-        let new_base = tx.repo().parents_tree(&dest)?.tree;
-        let out = merge_trees(&tx.repo().store, Some(old_base), new_base, s.tree)?;
+        let out = tx.repo().rebase_tree(&s.parents, &dest, s.tree, s.cloak.as_deref())?;
         let mut ns = (*s).clone();
         ns.parents = dest;
         ns.tree = out.tree;
@@ -355,8 +380,14 @@ impl Repo {
         message: &str,
         embargo: Option<EmbargoSpec>,
     ) -> Result<MergeResult> {
+        // Each parent once (BUG-240): merging the destination into itself
+        // merges nothing.
+        let others: Vec<ObjectId> = dedup_parents(others).into_iter().filter(|o| *o != into).collect();
         if others.is_empty() {
-            return Err(VeilError::repo("nothing to merge"));
+            return Err(VeilError::repo(format!(
+                "nothing to merge: {} is the change being merged into",
+                into.short()
+            )));
         }
         // Embargoes never overlap (Veil 1.0): a new embargoed merge is
         // refused if the line it merges into, or any line it merges in,

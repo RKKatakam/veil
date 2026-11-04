@@ -225,7 +225,6 @@ fn change_already_upstream_becomes_empty() {
 
 // Scenario from jj test_rebase_skip_if_on_destination: rebasing onto the current parent changes nothing.
 #[test]
-#[ignore = "BUG-246: a no-op rebase (onto the current parent) rewrites the change and all its descendants, re-signing them"]
 fn rebase_onto_the_current_parent_is_a_no_op() {
     let env = Env::new();
     let r = chain(&env);
@@ -601,7 +600,6 @@ fn describe_an_ancestor_rebases_descendants_with_stable_ids() {
 
 // Scenario from jj test_describe (no-op): the same message records nothing.
 #[test]
-#[ignore = "BUG-246: `vl describe` with the unchanged message rewrites the change and its descendants, and records an operation"]
 fn describe_with_the_same_message_is_a_no_op() {
     let env = Env::new();
     let r = chain(&env);
@@ -905,7 +903,6 @@ fn abandoning_another_workspaces_working_copy() {
 // Scenario from git t3425-rebase-topology-merges.sh / jj test_rebase_with_descendants: a merge among the
 // descendants is carried along, and still holds what its untouched other parent holds.
 #[test]
-#[ignore = "BUG-251: auto-rebasing a merge when one parent moves drops files the other parent still has (a merge's tree is rebased one parent at a time)"]
 fn rebase_carries_a_descendant_merge() {
     let env = Env::new();
     let r = chain(&env);
@@ -986,4 +983,61 @@ fn rebase_onto_a_conflicted_change() {
     r.ok(&["rebase", "-s", &g, "-d", &m]);
     assert!(r.cat(&g, "f").contains("<<<<<<<"));
     assert_eq!(r.cat(&g, "g"), "G\n");
+}
+
+// ---- merge wave regressions ------------------------------------------------
+
+// BUG-251: a resolved merge carried along by a rebase of one parent keeps its resolution.
+#[test]
+fn rebase_carries_a_resolved_merge_with_its_resolution() {
+    let env = Env::new();
+    let r = fork(
+        &env,
+        &[("f", "x\n")],
+        |r: &R| r.write("f", "left\n"),
+        |r: &R| r.write("f", "right\n"),
+    );
+    r.ok(&["merge", "left", "-m", "m"]);
+    r.write("f", "resolved\n");
+    r.ok(&["squash"]);
+    let m = r.cid("@-");
+    assert!(r.snap(&m).conflicts.is_empty());
+    r.ok(&["new", "base"]);
+    r.commit("nb", &[("g", "g\n")]);
+    r.tag("nb", "@-");
+    r.ok(&["rebase", "-s", "left", "-d", "nb"]);
+    let s = r.snap(&m);
+    assert!(s.conflicts.is_empty(), "{s:?}");
+    assert_eq!(r.cat(&m, "f"), "resolved\n");
+    assert_eq!(r.cat(&m, "g"), "g\n");
+}
+
+// A rebase onto several destinations that conflict with each other records the conflict.
+#[test]
+fn rebase_onto_conflicting_destinations_records_the_conflict() {
+    let env = Env::new();
+    let r = fork(
+        &env,
+        &[("f", "x\n")],
+        |r: &R| r.write("f", "left\n"),
+        |r: &R| r.write("f", "right\n"),
+    );
+    r.ok(&["new", "base"]);
+    r.commit("g", &[("g", "g\n")]);
+    let g = r.cid("@-");
+    r.ok(&["rebase", "-s", &g, "-d", "left", "-d", "right"]);
+    let s = r.snap(&g);
+    assert_eq!(s.conflicts, vec!["f".to_string()], "{s:?}");
+    assert!(r.cat(&g, "f").contains("<<<<<<<"));
+    assert_eq!(r.cat(&g, "g"), "g\n");
+}
+
+// BUG-246: rebasing onto the same parent named twice is still a no-op.
+#[test]
+fn rebase_onto_the_current_parent_named_twice_is_a_no_op() {
+    let env = Env::new();
+    let r = chain(&env);
+    let before = (r.sid("b"), r.sid("c"));
+    r.ok(&["rebase", "-s", "b", "-d", "a", "-d", "a"]);
+    assert_eq!((r.sid("b"), r.sid("c")), before);
 }

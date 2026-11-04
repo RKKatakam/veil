@@ -11,7 +11,6 @@ use crate::{
     error::{Result, VeilError},
     id::{ChangeId, ObjectId},
     lock::RepoLock,
-    merge::merge_trees,
     now_millis,
     object::Snapshot,
     oplog::{Operation, View},
@@ -130,7 +129,10 @@ impl<'r> Transaction<'r> {
     /// entries it inherits from a cloaked parent stay sealed regardless: the
     /// builder never moves sealed content to a wider audience (see
     /// `builder.rs`), so `vl new <cloaked change>` cannot declassify it.
+    ///
+    /// A parent named more than once is recorded once (BUG-240).
     pub fn new_change(&mut self, parents: Vec<ObjectId>, description: &str, cloak: Option<String>) -> Result<ObjectId> {
+        let parents = dedup_parents(parents);
         let merged = self.repo.parents_tree(&parents)?;
         let store = &self.repo.store;
         // On a line under an unreleased embargo, messages are sealed under
@@ -158,9 +160,17 @@ impl<'r> Transaction<'r> {
         if old == self.repo.root_id {
             return Err(VeilError::repo("the root snapshot cannot be rewritten"));
         }
-        // Content identical to `old` (ignoring signatures): keep `old` and its
-        // original signer instead of re-signing an unchanged snapshot.
-        if self.repo.snapshot(&old)?.unsigned_id() == new.unsigned_id() {
+        // Content identical to `old`: keep `old` and its original signer
+        // instead of re-signing an unchanged snapshot. Signatures,
+        // predecessors and the timestamp are bookkeeping of the rewrite
+        // itself, not content: a rewrite that changes nothing else changes
+        // nothing (BUG-246).
+        let prev = self.repo.snapshot(&old)?;
+        let mut same = new.clone();
+        same.predecessors = prev.predecessors.clone();
+        same.timestamp = prev.timestamp;
+        same.signature = None;
+        if prev.unsigned_id() == same.unsigned_id() {
             return Ok(old);
         }
         let id = self.repo.store.put_snapshot(&self.sign(&new))?;
@@ -257,19 +267,14 @@ impl<'r> Transaction<'r> {
             if new_parents == s.parents {
                 continue;
             }
-            let mut tree = s.tree;
+            // The merge of the new parents, plus what this snapshot changed
+            // relative to the merge of its old ones. A merge one of whose
+            // parents moved is re-merged, never rebased by one parent's diff
+            // (that dropped what the other parents hold, BUG-251).
+            let out = self.repo.rebase_tree(&s.parents, &new_parents, s.tree, s.cloak.as_deref())?;
+            let tree = out.tree;
             let mut conflicts: BTreeSet<String> = s.conflicts.iter().cloned().collect();
-            for p in &s.parents {
-                let (r, _) = self.resolve(*p);
-                if r == [*p] {
-                    continue;
-                }
-                let old_parent_tree = self.repo.snapshot(p)?.tree;
-                let new_parent_tree = self.repo.parents_tree(&r)?.tree;
-                let out = merge_trees(&store, Some(old_parent_tree), new_parent_tree, tree)?;
-                tree = out.tree;
-                conflicts.extend(out.conflicts.iter().map(|c| c.to_string()));
-            }
+            conflicts.extend(out.conflicts.iter().map(|c| c.to_string()));
             let mut ns = (*s).clone();
             ns.parents = new_parents;
             ns.tree = tree;
@@ -346,6 +351,17 @@ impl<'r> Transaction<'r> {
         self.repo.view = std::mem::take(&mut self.view);
         Ok(Some(id))
     }
+}
+
+/// `parents` without repeats, first occurrence kept (BUG-240).
+pub(crate) fn dedup_parents(parents: Vec<ObjectId>) -> Vec<ObjectId> {
+    let mut out: Vec<ObjectId> = Vec::with_capacity(parents.len());
+    for p in parents {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
 }
 
 impl Drop for Transaction<'_> {

@@ -27,7 +27,7 @@ use crate::{
     identity::Identity,
     keychain::Keychain,
     lock::RepoLock,
-    merge::{merge_trees, MergeOutcome},
+    merge::{merge_trees, virtual_merge_base, MergeOutcome},
     now_millis,
     object::{Snapshot, Text},
     oplog::{OpStore, Operation, View, WorkspaceState},
@@ -484,6 +484,10 @@ impl Repo {
     }
 
     /// The tree a new child of `parents` starts from (merging if several).
+    ///
+    /// Each further parent is merged into the accumulated result against
+    /// the merge base of the parents merged so far and that parent
+    /// ([`Repo::merge_base_tree`]: a virtual base when there are several).
     pub fn parents_tree(&self, parents: &[ObjectId]) -> Result<MergeOutcome> {
         match parents {
             [] => Ok(MergeOutcome {
@@ -496,26 +500,140 @@ impl Repo {
             }),
             [first, rest @ ..] => {
                 let mut acc = self.snapshot(first)?.tree;
+                let mut merged = vec![*first];
                 let mut conflicts = Vec::new();
                 for p in rest {
                     // A redacted extra parent (the withheld source of an
                     // unreleased embargo) contributes nothing we can see.
-                    if self.snapshot_opt(p)?.is_none() {
-                        continue;
-                    }
-                    let base = self.common_ancestor(first, p)?;
-                    let out = merge_trees(
-                        &self.store,
-                        Some(self.snapshot(&base)?.tree),
-                        acc,
-                        self.snapshot(p)?.tree,
-                    )?;
+                    let Some(ps) = self.snapshot_opt(p)? else { continue };
+                    let base = self.merge_base_tree(&merged, &[*p])?;
+                    let out = merge_trees(&self.store, Some(base), acc, ps.tree)?;
                     acc = out.tree;
                     conflicts.extend(out.conflicts);
+                    merged.push(*p);
                 }
                 Ok(MergeOutcome { tree: acc, conflicts })
             }
         }
+    }
+
+    /// Every snapshot reachable from `ids` (themselves included). Redacted
+    /// snapshots are included but not walked through.
+    fn ancestors_of(&self, ids: &[ObjectId]) -> Result<HashSet<ObjectId>> {
+        let mut seen = HashSet::new();
+        let mut stack = ids.to_vec();
+        while let Some(x) = stack.pop() {
+            if seen.insert(x) {
+                if let Some(s) = self.snapshot_opt(&x)? {
+                    stack.extend(s.parents.iter().copied());
+                }
+            }
+        }
+        Ok(seen)
+    }
+
+    /// The merge bases of `a` and `b` (each a set of snapshots): their
+    /// common ancestors that are not an ancestor of another common
+    /// ancestor. There are several after a criss-cross merge. Oldest first
+    /// (by timestamp, then id), so the order does not depend on the order
+    /// of `a` and `b`. Redacted snapshots are left out.
+    pub fn merge_bases(&self, a: &[ObjectId], b: &[ObjectId]) -> Result<Vec<ObjectId>> {
+        let from_a = self.ancestors_of(a)?;
+        let common: HashSet<ObjectId> = self.ancestors_of(b)?.into_iter().filter(|x| from_a.contains(x)).collect();
+        // Everything below a common ancestor is a common ancestor too, and
+        // not a best one.
+        let mut below = HashSet::new();
+        let mut stack = Vec::new();
+        for c in &common {
+            if let Some(s) = self.snapshot_opt(c)? {
+                stack.extend(s.parents.iter().copied());
+            }
+        }
+        while let Some(x) = stack.pop() {
+            if below.insert(x) {
+                if let Some(s) = self.snapshot_opt(&x)? {
+                    stack.extend(s.parents.iter().copied());
+                }
+            }
+        }
+        let mut best = Vec::new();
+        for c in common {
+            if below.contains(&c) {
+                continue;
+            }
+            if let Some(s) = self.snapshot_opt(&c)? {
+                best.push((s.timestamp, c));
+            }
+        }
+        best.sort();
+        Ok(best.into_iter().map(|(_, id)| id).collect())
+    }
+
+    /// The tree to merge `a` and `b` against: the tree of their merge base
+    /// or, when there are several (a criss-cross merge), a **virtual merge
+    /// base**, as Git's recursive/ort strategies build it. The bases are
+    /// merged with each other, recursively against their own merge bases,
+    /// and conflicts in that merge stay in it as markers. So two earlier
+    /// resolutions that disagree conflict again instead of one of them
+    /// being taken silently (BUG-244).
+    pub fn merge_base_tree(&self, a: &[ObjectId], b: &[ObjectId]) -> Result<ObjectId> {
+        self.merge_base_tree_at(a, b, 0)
+    }
+
+    fn merge_base_tree_at(&self, a: &[ObjectId], b: &[ObjectId], depth: usize) -> Result<ObjectId> {
+        /// Nested criss-crosses deeper than this merge against the empty
+        /// tree: every disagreement is then a conflict, never a silent pick.
+        const MAX_VIRTUAL_BASE_DEPTH: usize = 8;
+        let bases = self.merge_bases(a, b)?;
+        match bases.as_slice() {
+            [] => self.store.empty_tree(),
+            [one] => Ok(self.snapshot(one)?.tree),
+            _ if depth >= MAX_VIRTUAL_BASE_DEPTH => self.store.empty_tree(),
+            [first, rest @ ..] => {
+                let mut acc = self.snapshot(first)?.tree;
+                let mut merged = vec![*first];
+                for x in rest {
+                    let base = self.merge_base_tree_at(&merged, &[*x], depth + 1)?;
+                    acc = virtual_merge_base(&self.store, Some(base), acc, self.snapshot(x)?.tree)?;
+                    merged.push(*x);
+                }
+                Ok(acc)
+            }
+        }
+    }
+
+    /// `tree`, a child of `old_parents`, moved onto `new_parents`: what the
+    /// child changed relative to the merge of its old parents, applied to
+    /// the merge of its new parents. A merge moved because one parent moved
+    /// is re-merged this way, as Jujutsu does, never rebased by one
+    /// parent's diff alone (BUG-251).
+    ///
+    /// Conflicts are those of applying the change, plus those of the new
+    /// parents' own merge whose markers reach the result unchanged.
+    ///
+    /// A change on a cloaked line (`cloak`) never introduces public content:
+    /// what the result holds publicly that the new parents' merge does not
+    /// (such as a file moved aside by a file/directory conflict, BUG-243) is
+    /// sealed under its scope, as `vl squash` into a cloaked change does.
+    pub fn rebase_tree(&self, old_parents: &[ObjectId], new_parents: &[ObjectId], tree: ObjectId, cloak: Option<&str>) -> Result<MergeOutcome> {
+        let base = self.parents_tree(old_parents)?.tree;
+        let onto = self.parents_tree(new_parents)?;
+        let out = merge_trees(&self.store, Some(base), onto.tree, tree)?;
+        let mut conflicts = out.conflicts;
+        for c in onto.conflicts {
+            if conflicts.contains(&c) {
+                continue;
+            }
+            let now = crate::tree::lookup(&self.store, &out.tree, &c).ok().flatten();
+            if now.is_some() && now == crate::tree::lookup(&self.store, &onto.tree, &c).ok().flatten() {
+                conflicts.push(c);
+            }
+        }
+        let tree = match cloak {
+            Some(scope) => crate::embargo::seal_introduced(&self.store, &out.tree, Some(onto.tree), scope)?,
+            None => out.tree,
+        };
+        Ok(MergeOutcome { tree, conflicts })
     }
 
     /// No content change relative to its parents.
