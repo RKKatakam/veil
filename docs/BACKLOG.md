@@ -61,17 +61,17 @@ fixed**. Severity: high / medium / low.
 - **Embargo metadata still visible:** that an embargo exists, parent ids,
   author, time, scope, deadline, ciphertext sizes on team remotes.
 - **Scanner misses:** word-only passphrases and passwords with spaces,
-  weak passwords, camelCase generic tokens (`githubToken: …`), URL
-  passwords that are words or numbers, `*_KEY` names beyond the common
-  ones, XML attributes other than `value`, values whose key is on another
-  line (except Kubernetes `value:`), compressed archives (not
-  decompressed). ~0.02–0.04 % of random 16-character passwords are still
-  taken for words, hashes or code (0.2 % of 16-character hex).
-- **Scanner throughput:** scanner v4 (BUG-090…095) is ~2× slower than v3
-  on keyword-dense text (300–450 MiB/s vs 700–950 MiB/s; ~1.5 GiB/s on
-  real source trees): every `key = expr` code line is now a candidate for
-  the rest-of-line rule. A cheaper pre-filter for code lines would win it
-  back.
+  weak passwords, URL passwords that are words or numbers, values whose
+  key is on another line (except Kubernetes `value:` and XML elements),
+  compressed archives (not decompressed). ~0.02–0.04 % of random
+  16-character passwords are still taken for words, hashes or code (0.2 %
+  of 16-character hex). The scanner v6 rules (camelCase keys, `pwd`, the
+  newer `*_KEY` names, any `<WORD>_KEY`) are stricter about values: an
+  unquoted value in code is not taken (`apiKey: someName,`, also a random
+  one), nor a value on the next line; 0.1–0.35 % of random 16-character
+  tokens (≤ 0.1 % at 20, up to 1.3 % if upper-case and digits only) are
+  taken for words; `<WORD>_KEY` values need 16+ characters (32 hex).
+  Keys not on the list (`credentials`, `pass`) are not seen.
 - **`DiskBackend::write` follows symlinked parent directories** if called
   directly (checkout and restore guard against it).
 - **Tags carry no provenance:** a hostile tag created by an older `vl pull`

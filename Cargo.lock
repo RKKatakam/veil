@@ -2221,6 +2221,7 @@ name = "veil-core"
 version = "0.1.0"
 dependencies = [
  "aes-siv",
+ "aho-corasick",
  "blake3",
  "chacha20poly1305",
  "diffy",

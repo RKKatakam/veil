@@ -1,4 +1,5 @@
-//! Round-5 adversarial tests: scanner v3 (`secrets.rs`, `RULES_VERSION` 3).
+//! Round-5 adversarial tests: scanner v3 (`secrets.rs`, `RULES_VERSION` 3),
+//! and the scanner v6 rules (`RULES_VERSION` 6).
 //!
 //! Every `#[ignore = "BUG-NNN: …"]` test asserts the secure behaviour and
 //! currently fails; see `docs/BUGS.md` ("Round 5 findings"). The documented
@@ -356,6 +357,76 @@ fn a_service_account_key_inside_a_tar_is_found() {
     tar.extend_from_slice(GCP_KEY.as_bytes());
     tar.resize(tar.len().div_ceil(512) * 512 + 1024, 0);
     assert!(found(&tar), "service-account key in a tar archive not found");
+}
+
+// ---------------------------------------------------------------------------
+// Scanner v6 (`RULES_VERSION` 6): camelCase keys and generic `<WORD>_KEY`
+// ---------------------------------------------------------------------------
+
+/// Places a random token is pasted under a key found by a v6 rule: a
+/// camelCase key in JSON, YAML, a JS object, a TS property and a template
+/// literal; a generic `<WORD>_KEY` in dotenv and JSON; `Pwd=` in a
+/// connection string. (Tokens: no quotes or backslashes to escape.)
+const V6_FORMATS: &[Format] = &[
+    ("json githubToken", |p| format!("{{\n  \"githubToken\": \"{p}\"\n}}\n")),
+    ("yaml stripeSecret", |p| format!("stripe:\n  stripeSecret: '{p}'\n")),
+    ("js authToken", |p| format!("const c = {{ authToken: \"{p}\", retries: 3 }};\n")),
+    ("ts accessKey", |p| format!("  private accessKey: string = \"{p}\";\n")),
+    ("js template clientSecret", |p| format!("export const clientSecret = `{p}`;\n")),
+    ("dotenv MAPBOX_KEY", |p| format!("MAPBOX_KEY={p}\n")),
+    ("json SENDGRID_KEY", |p| format!("{{\"SENDGRID_KEY\": \"{p}\"}}\n")),
+    ("connection string Pwd", |p| format!("<add name=\"db\" connectionString=\"Server=db;User ID=sa;Pwd={p}\" />\n")),
+];
+
+fn v6_miss_rate(seed: u64, set: &[u8], len: usize, n: usize) -> Vec<(&'static str, f64, Vec<String>)> {
+    let mut r = Rng(seed);
+    V6_FORMATS
+        .iter()
+        .map(|(name, fmt)| {
+            let mut missed = Vec::new();
+            for _ in 0..n {
+                let pw: String = (0..len).map(|_| r.pick(set) as char).collect();
+                if !found(fmt(&pw).as_bytes()) {
+                    missed.push(pw);
+                }
+            }
+            let rate = missed.len() as f64 / n as f64;
+            missed.truncate(3);
+            (*name, rate, missed)
+        })
+        .collect()
+}
+
+/// Random tokens under the v6 keys are found: the extra checks of those
+/// rules (the value is not made of words) cost little. Measured over 4,000
+/// tokens per cell: A-Za-z0-9 0.15–0.35 % missed at 16 characters, ≤ 0.1 %
+/// at 20, 0 at 32; base64url ≤ 0.03 % at 24; hex 0; upper-case and digits
+/// only (held to looser bars) up to 1.3 % at 20 and 0.25 % at 32. The
+/// legacy keys (`authToken`, `clientSecret`) miss nothing.
+#[test]
+fn random_tokens_under_v6_keys_are_found() {
+    let hex = b"0123456789abcdef";
+    let upnum = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let b64url = [ALNUM, b"-_"].concat();
+    let mut report = Vec::new();
+    for (set_name, set, len, bar) in [
+        ("A-Za-z0-9", ALNUM, 16, 0.01),
+        ("A-Za-z0-9", ALNUM, 20, 0.0025),
+        ("A-Za-z0-9", ALNUM, 32, 0.0025),
+        ("base64url", &b64url[..], 24, 0.0025),
+        ("hex", &hex[..], 32, 0.0),
+        ("hex", &hex[..], 40, 0.0),
+        ("A-Z0-9", &upnum[..], 20, 0.02),
+        ("A-Z0-9", &upnum[..], 32, 0.005),
+    ] {
+        for (fmt, rate, ex) in v6_miss_rate(0x5eed_0600 ^ len as u64 ^ set.len() as u64, set, len, 4000) {
+            println!("{set_name} len {len} in {fmt}: {:.3}% missed", rate * 100.0);
+            if rate > bar {
+                report.push(format!("{set_name} len {len} in {fmt}: {:.2}% missed (bar {:.2}%), e.g. {ex:?}", rate * 100.0, bar * 100.0));
+            }
+        }
+    }
+    assert!(report.is_empty(), "random tokens missed:\n{}", report.join("\n"));
 }
 
 // ---------------------------------------------------------------------------

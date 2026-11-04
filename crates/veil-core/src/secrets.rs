@@ -14,11 +14,18 @@
 //!   credential compiled into a binary is still a credential.
 //! * The `key = value` rule (also `key: value`, `<key>value</key>`) works
 //!   in 256 KiB chunks (16 KiB overlap) on an ASCII-lowercased copy of each
-//!   chunk. Case-insensitive keywords have too many case variants for the
-//!   prefilter; lowercasing is cheaper. Candidate matches are rejected as
-//!   cheaply as possible (the regex itself checks how an unquoted value
-//!   ends, and a match made only of words is dropped before its capture
-//!   groups are computed), because ordinary code has thousands per MiB.
+//!   chunk, each starting at the start of a line. Case-insensitive keywords
+//!   have too many case variants for the prefilter; lowercasing is cheaper.
+//!   A pre-filter then finds the keywords (Aho-Corasick over the eight
+//!   words of `KEYWORD_PARTS`): a chunk without one is not searched, and
+//!   the search is limited to where they are. On the lines that have one,
+//!   it marks the `:` / `=` that ends the key of a configuration line, the
+//!   only place the rest-of-line value counts (code has thousands of
+//!   `key = expr` lines per MiB, see `lowercase_into`). Candidate matches
+//!   are rejected as cheaply as possible (the regex itself checks how an
+//!   unquoted value ends, and a match made only of words, or whose keyword
+//!   its left context rules out, is dropped before its capture groups are
+//!   computed).
 //! * Text in a NUL-padded encoding (UTF-16 LE/BE, UTF-32, with or without a
 //!   BOM) is searched again, chunk by chunk, with its NUL bytes removed,
 //!   which turns the ASCII range of those encodings back into ASCII. This
@@ -47,12 +54,14 @@
 //! another match through a value, a comment or a token body, which the
 //! patterns bound (256 to 512 bytes): so every search reads at most about
 //! 1 KiB past its match. Whitespace and key words are not bounded; no
-//! match fits in them. A candidate rejected for the byte before it or for
-//! its key restarts the search inside itself (a real credential may start
-//! there), which crafted input can repeat at every byte. So the work done
-//! again is counted, and a search that has spent [`WORK_FACTOR`] times its
-//! input on it ends with a `scan-limit` finding, which quarantines the
-//! file. Ordinary files do almost none; crafted ones are scanned at 25+
+//! match fits in them. The pre-filter and the marking of configuration
+//! lines read each line once (a key's line start is looked for at most 256
+//! bytes back, a configuration key at most 512 bytes in). A candidate
+//! rejected for the byte before it or for its key restarts the search
+//! inside itself (a real credential may start there), which crafted input
+//! can repeat at every byte. So the work done again is counted, and a
+//! search that has spent [`WORK_FACTOR`] times its input on it ends with a
+//! `scan-limit` finding, which quarantines the file. Ordinary files do almost none; crafted ones are scanned at 25+
 //! MiB/s before they are reported.
 
 use std::sync::OnceLock;
@@ -61,7 +70,7 @@ use regex::bytes::Regex;
 
 /// Bumped whenever the rules change, so cached "scanned clean" facts (see
 /// `statcache`) from an older scanner are not reused.
-pub const RULES_VERSION: u32 = 5;
+pub const RULES_VERSION: u32 = 6;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Finding {
@@ -127,44 +136,91 @@ struct Rule {
 
 /// Keywords for `key = value` assignments, in lower case: they are matched
 /// on lowercased text, so case-insensitively, where `-` is also `_` (see
-/// [`lowercase_into`]), so `api_?key` matches `API-KEY`. (Each variant is a
-/// literal for the prefilter; past about 60 it is much slower.) They match anywhere in an
-/// identifier, so `DB_PASSWORD`, `spring.datasource.password` and `$api_key`
-/// count. The generic `secret` and `token` only count as a whole word or
-/// after `_` / `-` (`JWT_SECRET`, `GITLAB_TOKEN`, not `mytoken`), and not
+/// [`lowercase_into`]), so `api_key` matches `API-KEY`. (Each variant is a
+/// literal for the prefilter, and short ones that occur everywhere in code,
+/// like `key`, cost the more the more there are: so `api_key` is `key`
+/// after `api`, see [`COMPOUNDS`].) `password` and `passwd` match anywhere
+/// in an identifier, so `DB_PASSWORD`, `spring.datasource.password`,
+/// `getPasswordFromEnv` and `$api_key` count.
+///
+/// The generic `secret`, `token` and `pwd` only count as a whole word, after
+/// `_` / `-` or at a camelCase boundary (`JWT_SECRET`, `GITLAB_TOKEN`,
+/// `githubToken`, `stripeSecret`, `dbPwd`; not `mytoken`, `OLDPWD`), and not
 /// after a word that names something other than a credential
-/// ([`TOKEN_NOT_CREDENTIAL`]: `csrf_token`, `next_page_token`). So do the
-/// `…_key` / `…_salt` names of [`KEY_NAMES`], or at a camelCase boundary
-/// (`appKey`, `RAILS_MASTER_KEY`, not `whatsappkey`).
+/// ([`TOKEN_NOT_CREDENTIAL`]: `csrf_token`, `nextPageToken`). So does `key`
+/// (and `salt`), which must also follow a word: one that names a secret
+/// ([`KEY_NAMES`]: `APP_KEY`, `RAILS_MASTER_KEY`, `appkey`, not
+/// `whatsappkey`; [`MORE_KEY_NAMES`]: `accessKey`, `LICENSE_KEY`), or any
+/// other word except those of [`KEY_NOT_CREDENTIAL`]
+/// (`primary_key`, `cacheKey`, `PUBLIC_KEY`), and then the value must be
+/// random enough for a key ([`key_value`]: `MAPBOX_KEY`, `stripeKey`).
 ///
 /// The keyword may be plural or numbered (`API_KEYS`, `PASSWORD2`) and carry
-/// up to six `_x` / `-x` suffix words (`DB_PASSWORD_PROD_EU_WEST_1`,
-/// `aws_secret_access_key`), unless one of them says the value is something
-/// else ([`NOT_A_CREDENTIAL`]: `password_hash`, `token_url`, `secret_name`).
+/// suffix words: up to six `_x` / `-x` (`DB_PASSWORD_PROD_EU_WEST_1`,
+/// `aws_secret_access_key`), and camelCase words glued to it (`apiKeyProd`,
+/// not `tokenizer`), unless one of them says the value is something else
+/// ([`NOT_A_CREDENTIAL`]: `password_hash`, `tokenUrl`, `secretName`).
 /// `identified by` only counts in SQL (`IDENTIFIED BY '…'`).
-const KEYWORDS: &str = r"api_?key|secret_?access_?key|secret_?key|client_?secret|access_?token|auth_?token|private_?key|(?P<kk>KEY_NAMES)|password|passwd|secret|token|identified[ \t]{1,8}by";
+const KEYWORDS: &str = r"password|passwd|(?P<gk>key|salt)|secret|token|pwd|identified[ \t]{1,8}by";
 
-/// `*_KEY` / `*_SALT` names that hold a secret (`APP_KEY` of Laravel,
+/// Words that made one keyword with `key`, `secret` or `token` before
+/// scanner v6 (`api_?key`, `secret_?access_?key`, `client_?secret`,
+/// `access_?token`): before or glued to it they count anywhere in an
+/// identifier, as they did (`x_api_key`, `myapikey`, `clientsecret`). (One
+/// keyword each keeps the prefilter's literals few: see [`KEYWORDS`].)
+const COMPOUNDS: &[(&str, &[&str])] = &[("key", &["api", "private", "secret", "secret_access"]), ("secret", &["client"]), ("token", &["access", "auth"])];
+
+/// Words before `key` / `salt` that name a secret (`APP_KEY` of Laravel,
 /// `RAILS_MASTER_KEY`, `ENCRYPTION_KEY`, `SIGNING_KEY`, WordPress's
 /// `AUTH_KEY` … `NONCE_SALT`, Azure's `AccountKey` and `SharedAccessKey`).
-/// `key` alone is not a keyword: most keys are not secrets (`primary_key`,
-/// `cache_key`, `public_key`).
-const KEY_NAMES: &str = r"(?:app|master|encryption|signing|hmac|account|shared_?access|auth|secure_?auth|logged_?in|nonce)_?key|(?:auth|secure_?auth|logged_?in|nonce)_?salt";
+/// Their values are judged like any credential's, also glued to the key
+/// (`appkey`); a salt needs one of the WordPress words.
+const KEY_NAMES: &[&str] = &["account", "app", "auth", "encryption", "hmac", "logged_in", "master", "nonce", "secure_auth", "shared_access", "signing"];
+
+/// More words before `key` that name a secret (`MINIO_ACCESS_KEY`,
+/// `LICENSE_KEY`, `sessionKey`), added in scanner v6: only as their own
+/// word (not HTML's `accesskey`), and the value is held to more
+/// ([`Key::Strict`]).
+const MORE_KEY_NAMES: &[&str] = &[
+    "access", "admin", "aes", "cipher", "crypt", "crypto", "decryption", "jwt", "license", "licence", "otp", "server", "service", "session",
+    "totp", "webhook",
+];
+
+/// The WordPress `*_SALT` names ([`KEY_NAMES`]).
+const SALT_NAMES: &[&str] = &["auth", "logged_in", "nonce", "secure_auth"];
+
+/// Words before `key` that make it something other than a secret: database
+/// and cache keys, public halves, identifiers, names of things.
+const KEY_NOT_CREDENTIAL: &[&str] = &[
+    "attr", "attribute", "bucket", "cache", "candidate", "child", "col", "column", "composite", "compound", "config", "cursor", "dedup",
+    "dedupe", "default", "dict", "dictionary", "entry", "env", "event", "field", "file", "first", "foreign", "gpg", "group", "hash",
+    "header", "host", "hot", "i18n", "id", "idempotency", "index", "item", "json", "kms", "l10n", "label", "last", "list", "locale",
+    "lookup", "map", "max", "message", "meta", "min", "msg", "name", "natural", "next", "node", "object", "option", "page", "param",
+    "parent", "partition", "path", "pgp", "prev", "primary", "prop", "property", "pub", "public", "publishable", "query", "range", "react",
+    "ref", "reference", "registry", "route", "routing", "row", "schema", "sequence", "setting", "settings", "shard", "sharding", "short",
+    "shortcut", "site", "sort", "ssh", "start", "state", "surrogate", "table", "tag", "text", "title", "translation", "type", "unique",
+    "url", "verification", "verify", "verifying",
+];
 
 /// Suffix words after a keyword that make the value not a credential: its
 /// hash, where it is, what it is called, its policy or metadata.
 const NOT_A_CREDENTIAL: &[&str] = &[
-    "algo", "algorithm", "arn", "cmd", "command", "count", "desc", "description", "digest", "dir", "enabled", "endpoint", "env",
-    "error", "expiration", "expires", "expiry", "field", "file", "flag", "format", "hash", "hashed", "header", "help", "hint", "host",
-    "id", "ids", "input", "kind", "label", "len", "length", "location", "max", "message", "method", "min", "mode", "name", "param",
-    "path", "pattern", "placeholder", "policy", "prompt", "provider", "ref", "regex", "required", "rule", "salt", "size", "source",
-    "store", "text", "timeout", "title", "ttl", "type", "uri", "url", "var", "version",
+    "age", "algo", "algorithm", "arn", "callback", "check", "checksum", "class", "cmd", "command", "count", "created", "date", "delimiter",
+    "desc", "description", "digest", "dir", "enabled", "endpoint", "env", "error", "expiration", "expires", "expiry", "field", "file",
+    "fingerprint", "flag", "flags", "fn", "format", "handler", "hash", "hashed", "header", "help", "hint", "host", "icon", "id",
+    "identifier", "ids", "info", "input", "interval", "kind", "label", "last", "len", "length", "location", "mask", "max", "message",
+    "method", "min", "mode", "name", "options", "param", "path", "pattern", "placeholder", "policy", "prefix", "prompt", "provider", "ref",
+    "reference", "regex", "regexp", "required", "rule", "salt", "schema", "separator", "size", "source", "state", "status", "store",
+    "strength", "suffix", "text", "time", "timeout", "timestamp", "title", "ttl", "type", "updated", "uri", "url", "usage", "usages",
+    "used", "validator", "var", "version", "visible",
 ];
 
-/// Words before `token` that make it not a credential.
+/// Words before `token` that make it not a credential (also AWS's
+/// idempotency tokens: `ClientToken`, `ChangeToken`).
 const TOKEN_NOT_CREDENTIAL: &[&str] = &[
-    "cancel", "cancellation", "continuation", "csrf", "cursor", "device", "idempotency", "lexer", "next", "page", "pagination", "parser",
-    "request", "resume", "sync", "xsrf",
+    "abort", "cancel", "cancellation", "change", "client", "close", "continuation", "csrf", "current", "cursor", "device", "end", "expected", "first",
+    "idempotency", "last", "lexer", "lookahead", "next", "open", "page", "pagination", "parser", "peek", "prev", "previous", "request",
+    "resume", "start", "stop", "sync", "syntax", "xsrf",
 ];
 
 struct Rules {
@@ -176,6 +232,8 @@ struct Rules {
     /// `token_re` unbounded, for capture groups (see `assignment_caps`).
     token_caps: Regex,
     token_groups: Vec<usize>,
+    /// Finds [`KEYWORD_PARTS`] (see `lowercase_into`).
+    keyword_parts: aho_corasick::AhoCorasick,
     /// Groups of `token_re` holding the part to judge and print.
     token_values: Vec<usize>,
     /// `key = value` assignments, run on ASCII-lowercased text: `(?i)`
@@ -195,8 +253,8 @@ struct Rules {
 /// matches per MiB.)
 struct AssignGroups {
     kw: usize,
-    /// A [`KEY_NAMES`] keyword (`app_key`, `nonce_salt`).
-    kk: usize,
+    /// `key` or `salt` ([`KEY_NAMES`]).
+    gk: usize,
     sfx: usize,
     /// How the value is attached when it is not `key = value` (see
     /// [`assignment_pattern`]): SQL (`WITH PASSWORD '…'`), an element
@@ -204,6 +262,8 @@ struct AssignGroups {
     /// (`<key>Password</key><string>value</string>`).
     sql: usize,
     el: usize,
+    /// An element whose key is an attribute (`<entry key="db.password">`).
+    ek: usize,
     /// A single-quoted value (the only kind SQL has).
     s: usize,
     /// A Google app password with its spaces ([`app_password`]).
@@ -212,8 +272,16 @@ struct AssignGroups {
     line: [usize; 2],
     /// The next line's `value:`, whole or truncated.
     k8s: [usize; 2],
+    /// A quoted value on the next line's `value:`.
+    k8q: usize,
+    /// An unquoted value in code, whole or truncated.
+    u: usize,
+    ut: usize,
     /// Groups that hold the value.
     values: Vec<usize>,
+    /// Those of them that hold a quoted value, an element's text or an app
+    /// password, not the rest of a line or an unquoted token.
+    literal: Vec<usize>,
 }
 
 impl AssignGroups {
@@ -221,7 +289,8 @@ impl AssignGroups {
         let g = |n| group(re, n);
         AssignGroups {
             kw: g("kw"),
-            kk: g("kk"),
+            gk: g("gk"),
+            ek: g("ek"),
             sfx: g("sfx"),
             sql: g("sql"),
             el: g("el"),
@@ -229,7 +298,11 @@ impl AssignGroups {
             g: g("g"),
             line: [g("l"), g("lt")],
             k8s: [g("kl"), g("klt")],
-            values: ["q", "qt", "s", "st", "g", "kl", "klt", "l", "lt", "u", "ut", "xc", "x"].iter().map(|n| g(n)).collect(),
+            k8q: g("k8q"),
+            u: g("u"),
+            ut: g("ut"),
+            values: ["q", "qt", "s", "st", "b", "bt", "g", "kl", "klt", "l", "lt", "u", "ut", "xc", "x"].iter().map(|n| g(n)).collect(),
+            literal: ["q", "qt", "s", "st", "b", "bt", "g", "xc", "x"].iter().map(|n| g(n)).collect(),
         }
     }
 }
@@ -241,8 +314,7 @@ fn group(re: &Regex, name: &str) -> usize {
 /// The key of an assignment: a keyword, maybe plural or numbered, and
 /// suffix words.
 fn key_pattern() -> String {
-    let keywords = KEYWORDS.replace("KEY_NAMES", KEY_NAMES);
-    format!(r"(?P<kw>{keywords})(?:s|[0-9]{{1,3}})?(?P<sfx>(?:[_-][a-z0-9]+){{0,6}})")
+    format!(r"(?P<kw>{KEYWORDS})(?:s|[0-9]{{1,3}})?(?P<sfx>[a-z0-9]*(?:[_-][a-z0-9]+){{0,6}})")
 }
 
 /// The rest of a line as a value: printable bytes up to the end of the
@@ -255,21 +327,26 @@ const LINE_VALUE: &str = r"(?:(?P<VALUE>[!-~\x80-\xff]{12,256})(?:[ \t]+#[^\r\n]
 /// * a quoted value after `=`, `:`, `:=`, `=>`, or after a quoted key and
 ///   `,` / `]` (`define('KEY', '…')`, `env["KEY"] = "…"`), or on the next
 ///   line's `value:` (Kubernetes env lists), in a `value="…"` attribute, or
-///   SQL's `PASSWORD '…'`. Quoted values may hold escaped quotes (`\"`,
-///   YAML's `''`);
+///   SQL's `PASSWORD '…'`, or after a string type (`: &str =`, `: string
+///   =`, `: str =`). Quoted values (`"…"`, `'…'`, JavaScript's `` `…` ``)
+///   may hold escaped quotes (`\"`, YAML's `''`);
 /// * a Google app password as Google shows it (`abcd efgh ijkl mnop`),
 ///   quoted or not;
 /// * an unquoted value on the next line's `value:`, to the end of it;
 /// * the rest of the line (`.properties`, dotenv, YAML, INI): any printable
-///   bytes up to the end of the line or a ` #` comment. Before the next
-///   kind, because it is the whole value in a configuration line; where the
-///   key does not start the line (see [`config_line`]), this is code, and
-///   only the token the value starts with counts ([`code_token`]);
+///   bytes up to the end of the line or a ` #` comment, only in a
+///   configuration line, whose separator [`lowercase_into`] marks. Before
+///   the next kind, because it is the whole value there; where the key
+///   starts more than 256 bytes into the line ([`config_line`]), only the
+///   token the value starts with counts ([`code_token`]);
 /// * an unquoted value in code (kwargs, dotenv) made of credential
 ///   characters, which must end the token (whitespace, `,;)]}"'` or the end
 ///   follow it): `x = a(b)` is code. Checking that here keeps `password_hash
 ///   = user.password_hash()` from even being a match;
-/// * the text of an XML element (with attributes, or CDATA) or plist entry.
+/// * the text of an XML element (with attributes, or CDATA) or plist entry,
+///   also where the key is the element's `key` or `name` attribute
+///   (`<entry key="db.password">…</entry>`, Spring's `<property
+///   name="password"><value>…`).
 ///
 /// Every repetition that could hold another match (values, attribute
 /// values, comments) is bounded (see "linear" in the module docs); a value
@@ -277,27 +354,33 @@ const LINE_VALUE: &str = r"(?:(?P<VALUE>[!-~\x80-\xff]{12,256})(?:[ \t]+#[^\r\n]
 fn assignment_pattern() -> String {
     let dq = r"(?:\\[!-~]|[!#-~\x80-\xff])"; // one unit of a "…" value
     let sq = r"(?:\\[!-~]|''|[!-&(-~\x80-\xff])"; // one unit of a '…' value
+    let bq = r"(?:\\[!-~]|[!-_a-~\x80-\xff])"; // one unit of a `…` value (JavaScript)
     let uq = r"[a-z0-9!#$%&*+./:=?@^_~|\-]"; // an unquoted value in code
     let uq1 = r"[a-z0-9!#$%&*+./=?@^_~|\-]"; // its first byte: not `:` (`Token::Str`)
     let xt = r"[!-;=?-~\x80-\xff]"; // element text: no `<`, `>`
     let xc = r"[!-\\^-~\x80-\xff]"; // CDATA: no `]`
-    let sep = r"(?::=|=>|[:=])";
-    let k8s = r#"["']?[ \t]*\r?\n[ \t]*value[ \t]*:"#;
-    let attrs = r#"(?:\s+[a-z_:][a-z0-9_:.\-]*\s*=\s*(?:"[^"<>]{0,128}"|'[^'<>]{0,128}')){0,4}"#;
+    // `:` and `=` may be the stand-ins of a configuration line
+    // ([`lowercase_into`]); only the rest-of-line value needs one.
+    let sep = r"(?:[:C]=|[=E]>|[:=CE])";
+    let k8s = r#"["']?[ \t]*\r?\n[ \t]*value[ \t]*[:C]"#;
+    let attrs = r#"(?:\s+[a-z_:][a-z0-9_:.\-]*\s*[=E]\s*(?:"[^"<>]{0,128}"|'[^'<>]{0,128}')){0,4}"#;
     let key = key_pattern();
     let assign = format!(r#"(?:["']\]?\s*(?:,|{sep})|\]?\s*{sep})\s*"#);
-    let connector = format!(r#"{assign}|{k8s}[ \t]*|["'][ \t]+value[ \t]*=[ \t]*|(?P<sql>[ \t]+)"#);
+    // A declaration with a string type (`API_KEY: &str = "…"`, TypeScript's
+    // `apiKey: string = "…"`, Python's `api_key: str = "…"`).
+    let typed = r#"["']?[ \t]*[:C][ \t]*(?:&(?:'static[ \t]+)?str|string|str|secretstr|optional\[str\])[?!]?[ \t]*[=E][ \t]*"#;
+    let connector = format!(r#"{assign}|{typed}|(?P<k8q>{k8s})[ \t]*|["'][ \t]+value[ \t]*[=E][ \t]*|(?P<sql>[ \t]+)"#);
     // As Google shows an app password: `abcd efgh ijkl mnop`.
     let app = format!(r#"{assign}["']?(?P<g>[a-z]{{4}} [a-z]{{4}} [a-z]{{4}} [a-z]{{4}})(?:[\s,;)\]}}"']|$)"#);
     // A value longer than 256 bytes matches as its first 256 (`qt`, `st`,
     // `ut`); see "linear" in the module docs.
-    let quoted = format!(r#"(?:{connector})(?:"(?:(?P<q>{dq}{{12,256}})"|(?P<qt>{dq}{{256}}){dq})|'(?:(?P<s>{sq}{{12,256}})'|(?P<st>{sq}{{256}}){sq}))"#);
+    let quoted = format!(r#"(?:{connector})(?:"(?:(?P<q>{dq}{{12,256}})"|(?P<qt>{dq}{{256}}){dq})|'(?:(?P<s>{sq}{{12,256}})'|(?P<st>{sq}{{256}}){sq})|`(?:(?P<b>{bq}{{12,256}})`|(?P<bt>{bq}{{256}}){bq}))"#);
     let k8s_line = format!("{k8s}[ \\t]*{}", LINE_VALUE.replace("VALUE", "kl"));
     let unquoted = format!(r#"["']?[ \t]*{sep}[ \t]*(?:(?P<u>{uq1}{uq}{{11,255}})(?:[\s,;)\]}}"']|$)|(?P<ut>{uq1}{uq}{{255}}){uq})"#);
     let element = format!(
-        r#"(?P<el>{attrs}\s*>|</key>\s*<string>)[ \t]*(?:<!\[cdata\[(?P<xc>{xc}{{12,256}})\]\]>|(?P<x>{xt}{{12,256}})[ \t]*</)"#
+        r#"(?P<el>{attrs}\s*>|</key>\s*<string>|(?P<ek>["']{attrs}\s*>\s*(?:<value>)?))[ \t]*(?:<!\[cdata\[(?P<xc>{xc}{{12,256}})\]\]>|(?P<x>{xt}{{12,256}})[ \t]*</)"#
     );
-    let line = format!(r#"["']?[ \t]*[:=][ \t]*{}"#, LINE_VALUE.replace("VALUE", "l"));
+    let line = format!(r#"["']?[ \t]*[CE][ \t]*{}"#, LINE_VALUE.replace("VALUE", "l"));
     format!("{key}(?:{quoted}|{app}|{k8s_line}|{line}|{unquoted}|{element})")
 }
 
@@ -388,6 +471,10 @@ fn rules() -> &'static Rules {
         let assignment_caps = compile(&unbounded(&assignment.pattern));
         let assign = AssignGroups::new(&assignment_re);
         Rules {
+            keyword_parts: aho_corasick::AhoCorasick::builder()
+                .match_kind(aho_corasick::MatchKind::LeftmostFirst)
+                .build(KEYWORD_PARTS)
+                .expect("keyword parts"),
             token_groups: (0..tokens.len()).map(|i| group(&token_re, &format!("t{i}"))).collect(),
             token_values: vec![group(&token_re, "pw")],
             assignment_re,
@@ -561,7 +648,11 @@ fn identifier(v: &[u8]) -> bool {
 /// and low-entropy strings. A sigil or a `${` *inside* a random password
 /// (`$Xk9mQ2…`, `Xk9m%(Q2…`) does not make it a reference.
 fn plausible_value(v: &[u8]) -> bool {
-    let v = unquote(v);
+    // (Also `&#39;…&#39;,`: HTML-quoted, then the end of an expression.)
+    let v = match unquote(trim_code_end(v)) {
+        u if u.len() < trim_code_end(v).len() => u,
+        _ => unquote(v),
+    };
     // Text in another script (`パスワードを変更`), or numbers
     // (`[62,70,27,163]`), not a credential.
     if v.is_empty()
@@ -584,6 +675,41 @@ fn plausible_value(v: &[u8]) -> bool {
     let rest = trim_code_end(rest);
     let rest = rest.strip_prefix(b"&mut ").or_else(|| rest.strip_prefix(b"&")).or_else(|| rest.strip_prefix(b"*")).unwrap_or(rest);
     !identifier(rest) && shannon_entropy(v) >= min_entropy(v)
+}
+
+/// Is the value of a generic `<word>_key` ([`KEYWORDS`]) a secret key: a
+/// credential ([`plausible_value`]) as long as a key? It must be 16 bytes
+/// or more (hex: 32, a 128-bit key) and not a UUID (an identifier:
+/// `ROW_KEY = "123e4567-…"`).
+fn key_value(v: &[u8]) -> bool {
+    let u = trim_code_end(unquote(v));
+    let hex = u.iter().all(u8::is_ascii_hexdigit);
+    plausible_value(v) && u.len() >= if hex { 32 } else { 16 } && !uuid(u)
+}
+
+/// `123e4567-e89b-12d3-a456-426614174000`.
+fn uuid(v: &[u8]) -> bool {
+    v.len() == 36 && v.iter().enumerate().all(|(i, b)| if matches!(i, 8 | 13 | 18 | 23) { *b == b'-' } else { b.is_ascii_hexdigit() })
+}
+
+/// Are two thirds of the letters of `v` in words of three letters or more,
+/// as in names and text (`?NonExpressionParenKeyword`,
+/// `D3DKMT_PRESENTHISTORYTOKEN`, `my-app/stage.war`), rather than random
+/// (`Xk9mQ2vL7pR4wZt8`, base64, hex)? Random values pass for words about
+/// 0.2 % of the time at 16 characters (A-Za-z0-9), 0.1 % at 20, 2 % and
+/// 1 % if upper-case and digits only.
+fn wordy(v: &[u8]) -> bool {
+    if v.iter().all(u8::is_ascii_hexdigit) {
+        return false;
+    }
+    let letters = v.iter().filter(|b| b.is_ascii_alphabetic()).count();
+    let in_words: usize = v
+        .split(|b| !b.is_ascii_alphabetic())
+        .flat_map(words)
+        .filter(|w| w.len() >= 3 && plain_case(w) && english_like(w))
+        .map(<[u8]>::len)
+        .sum();
+    letters > 0 && in_words * 3 >= letters * 2
 }
 
 /// Shannon entropy (bits per byte) a value needs to count as random: 3.2
@@ -737,9 +863,16 @@ fn not_a_secret(v: &[u8]) -> bool {
         || (v[0] == b'{' && prefix(1, b'}', SCHEMES))
         || v.starts_with(b"vault:v")
         || v.starts_with(b"AQICAH")
-        || (v.starts_with(b"{\"") && v.ends_with(b"}"))
+        || ((v.starts_with(b"{\"") || v.starts_with(b"{\\\"")) && v.ends_with(b"}"))
+        || timestamp(v)
         || (v.starts_with(b"[\"") && v.ends_with(b"]"))
         || code_like(v)
+}
+
+/// An ISO 8601 date or time stamp (`2016-09-08T21:47:36Z`).
+fn timestamp(v: &[u8]) -> bool {
+    let d = |r: std::ops::Range<usize>| v.get(r).is_some_and(|s| s.iter().all(u8::is_ascii_digit));
+    d(0..4) && v.get(4) == Some(&b'-') && d(5..7) && v.get(7) == Some(&b'-') && d(8..10)
 }
 
 /// Code rather than a literal (random passwords practically never have
@@ -877,61 +1010,289 @@ fn trim_code_end(v: &[u8]) -> &[u8] {
     &v[..v.len() - n]
 }
 
+/// What the key of an assignment says about its value.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Key {
+    /// Not a credential (`csrf_token`, `password_hash`, `primary_key`).
+    No,
+    /// A credential: its value is judged by [`plausible_value`].
+    Credential,
+    /// A `<word>_key` that may be a secret (`MAPBOX_KEY`, `stripeKey`): its
+    /// value is judged by [`key_value`].
+    Generic,
+    /// A credential found by a rule added in scanner v6 (`githubToken`,
+    /// `apiKeyProd`, `LICENSE_KEY`, `DB_PWD`, see [`credential_key`]): its
+    /// value is held to more than [`plausible_value`] (see `search_with`).
+    Strict,
+}
+
+/// Is `b` part of a word in the lowercased text? (Not
+/// `is_ascii_alphanumeric`: `C` and `E` stand for `:` and `=` there, see
+/// [`lowercase_into`].)
+fn word_byte(b: u8) -> bool {
+    b.is_ascii_lowercase() || b.is_ascii_digit()
+}
+
+/// Is `i` (> 0) a camelCase hump of `text`: a capital after a lower-case
+/// letter or digit (`githubToken`), or the last capital of an acronym
+/// before a lower-case letter (`APIToken`)?
+fn camel(text: &[u8], i: usize) -> bool {
+    let (a, b) = (text[i - 1], text[i]);
+    b.is_ascii_uppercase()
+        && (a.is_ascii_lowercase() || a.is_ascii_digit() || (a.is_ascii_uppercase() && text.get(i + 1).is_some_and(u8::is_ascii_lowercase)))
+}
+
+/// Does a word of an identifier start at `i`: at its start, after `_` /
+/// `-`, or at a camelCase hump? (`lower` is `text` lowercased.)
+fn word_start(lower: &[u8], text: &[u8], i: usize) -> bool {
+    i == 0 || !word_byte(lower[i - 1]) || camel(text, i)
+}
+
+/// The word of an identifier that ends at `end`, lowercased: back to `_`,
+/// `-` or a camelCase hump (`next_page` and `nextPage` → `page`, `XSRF`).
+fn word_before<'a>(lower: &'a [u8], text: &[u8], end: usize) -> &'a [u8] {
+    let mut j = end;
+    while j > 0 && word_byte(lower[j - 1]) {
+        j -= 1;
+        if word_start(lower, text, j) {
+            break;
+        }
+    }
+    &lower[j..end]
+}
+
+/// Does the identifier that ends at `end` end with the words of `name`
+/// (`shared_access`), starting at a word start, with or without `_` between
+/// them (`sharedAccess`, `SHARED_ACCESS`, `sharedaccess`)?
+fn ends_with_words(lower: &[u8], text: &[u8], end: usize, name: &str) -> bool {
+    let mut j = end;
+    for (n, w) in name.split('_').rev().enumerate() {
+        if n > 0 && j > 0 && lower[j - 1] == b'_' {
+            j -= 1;
+        }
+        match j.checked_sub(w.len()) {
+            Some(i) if &lower[i..j] == w.as_bytes() => j = i,
+            _ => return false,
+        }
+    }
+    word_start(lower, text, j)
+}
+
+/// The words of an identifier: split at `_`, `-` and camelCase humps
+/// (`DB_PASSWORD_PROD`, `passwordHashV2` → `hash`, `v2`).
+fn words(s: &[u8]) -> impl Iterator<Item = &[u8]> {
+    s.split(|b| matches!(b, b'_' | b'-')).flat_map(|part| {
+        let mut from = 0;
+        let mut i = 1;
+        std::iter::from_fn(move || {
+            while i < part.len() {
+                let at = i;
+                i += 1;
+                if camel(part, at) {
+                    let w = &part[from..at];
+                    from = at;
+                    return Some(w);
+                }
+            }
+            (from < part.len()).then(|| {
+                let w = &part[from..];
+                from = part.len();
+                w
+            })
+        })
+    })
+}
+
+/// Is `glued`, what follows a keyword in `text` up to the next `_` / `-`, a
+/// plural or number (`API_KEYS`, `PASSWORD2`), camelCase words (`apiKeyProd`,
+/// `secretsManager`), or nothing? Not a longer word (`tokenizer`,
+/// `PASSWORDLESS`). `last` is the keyword's last character.
+fn glued_ok(glued: &[u8], last: u8) -> bool {
+    let plural = match glued {
+        [b's'] => 1,
+        [b'S'] if last.is_ascii_uppercase() => 1,
+        [b's', next, ..] if next.is_ascii_uppercase() => 1,
+        _ => glued.iter().take(3).take_while(|b| b.is_ascii_digit()).count(),
+    };
+    let before = if plural > 0 { glued[plural - 1] } else { last };
+    match glued.get(plural) {
+        None => true,
+        Some(b) => b.is_ascii_uppercase() && (before.is_ascii_lowercase() || before.is_ascii_digit()),
+    }
+}
+
+/// Is the keyword at `kw` (an assignment match starts with its keyword)
+/// one that [`credential_key`] rejects for what comes before it: `token`
+/// or `pwd` inside a word (`mytoken`, `OLDPWD`), `key` or `salt` glued to
+/// a word that is not a [`KEY_NAMES`] one (`monkey`), unless it is one of
+/// [`COMPOUNDS`] (`accesstoken`, `apikey`)? (No other keyword starts with
+/// `token`, `pwd`, `key` or `salt`.)
+fn rejected_by_context(lower: &[u8], text: &[u8], kw: usize) -> bool {
+    if kw == 0 || !word_byte(lower[kw - 1]) || camel(text, kw) {
+        return false;
+    }
+    let at = &lower[kw..];
+    let (k, names): (&[u8], &[&str]) = match () {
+        _ if at.starts_with(b"token") => (b"token", &[]),
+        _ if at.starts_with(b"pwd") => (b"pwd", &[]),
+        _ if at.starts_with(b"key") => (b"key", KEY_NAMES),
+        _ if at.starts_with(b"salt") => (b"salt", SALT_NAMES),
+        _ => return false,
+    };
+    !compound(lower, kw, k) && !names.iter().any(|n| ends_with_words(lower, text, kw, n))
+}
+
+/// Is the keyword `k` at `kw` (in `lower`) part of one of [`COMPOUNDS`]:
+/// right after one of its words, or after it and `_`?
+fn compound(lower: &[u8], kw: usize, k: &[u8]) -> bool {
+    let end = if kw > 0 && lower[kw - 1] == b'_' { kw - 1 } else { kw };
+    COMPOUNDS.iter().filter(|(c, _)| c.as_bytes() == k).flat_map(|(_, names)| names.iter()).any(|name| {
+        // Its words, with or without `_` between them, anywhere.
+        let mut j = end;
+        name.split('_').rev().enumerate().all(|(n, w)| {
+            if n > 0 && j > 0 && lower[j - 1] == b'_' {
+                j -= 1;
+            }
+            match j.checked_sub(w.len()) {
+                Some(i) if &lower[i..j] == w.as_bytes() => {
+                    j = i;
+                    true
+                }
+                _ => false,
+            }
+        })
+    })
+}
+
 /// Does the key of an assignment name a credential? `caps` is a match of
 /// the assignment rule in `lower` (`text` lowercased). See [`KEYWORDS`].
-fn credential_key(caps: &regex::bytes::Captures, g: &AssignGroups, lower: &[u8], text: &[u8]) -> bool {
+fn credential_key(caps: &regex::bytes::Captures, g: &AssignGroups, lower: &[u8], text: &[u8]) -> Key {
     let kw = caps.get(g.kw).expect("keyword group");
     let k = kw.as_bytes();
-    let ident = |b: &u8| b.is_ascii_alphanumeric();
-    let prev = kw.start().checked_sub(1).map(|i| lower[i]);
-    let after_ident = prev.as_ref().is_some_and(ident);
+    let ident = |b: &u8| word_byte(*b);
+    let after_ident = kw.start() > 0 && word_byte(lower[kw.start() - 1]);
     // Bounded look-behind (see "linear" in the module docs).
     let before = &lower[kw.start().saturating_sub(256)..kw.start()];
     // SQL: `WITH [ENCRYPTED] PASSWORD '…'`, `IDENTIFIED BY '…'`.
     let identified = k.starts_with(b"identified");
     let sql = caps.get(g.sql);
+    let yes = |b: bool| if b { Key::Credential } else { Key::No };
     if identified || sql.is_some() {
-        let Some(sql) = sql else { return false };
+        let Some(sql) = sql else { return Key::No };
         if caps.get(g.s).is_none() || sql.start() != kw.end() || after_ident {
-            return false;
+            return Key::No;
         }
         let words = before.trim_ascii_end();
         let word = |w: &[u8]| words.strip_suffix(w).is_some_and(|r| !r.last().is_some_and(ident));
-        return identified || (k == b"password" && (word(b"with") || word(b"encrypted")));
+        return yes(identified || (k == b"password" && (word(b"with") || word(b"encrypted"))));
     }
-    if matches!(k, b"secret" | b"token") {
-        if after_ident {
-            return false; // `mytoken`, `topsecret`
+    // Where the word before the keyword ends (past a `_`), if there is one.
+    let word_end = match kw.start().checked_sub(1) {
+        Some(i) if lower[i] == b'_' => Some(i),
+        _ if after_ident && camel(text, kw.start()) => Some(kw.start()),
+        _ => None,
+    };
+    // `api_key`, `clientSecret`, `accesstoken`: as before scanner v6.
+    let compound = compound(lower, kw.start(), k);
+    // At a camelCase hump (`githubToken`), the word before must be a word:
+    // not the one-letter prefix of Hungarian notation (`nToken`, `pKey`).
+    let at_hump = word_end == Some(kw.start());
+    let hump = at_hump && !compound;
+    if hump && word_before(lower, text, kw.start()).len() < 2 {
+        return Key::No;
+    }
+    let mut kind = Key::Credential;
+    if compound {
+        if k == b"token" && word_end.is_some_and(|e| TOKEN_NOT_CREDENTIAL.iter().any(|w| w.as_bytes() == word_before(lower, text, e))) {
+            return Key::No;
         }
-        if k == b"token" {
-            let before = before.strip_suffix(b"_").or_else(|| before.strip_suffix(b"-")).unwrap_or(&[]);
-            let word = &before[before.iter().rposition(|b| !ident(b)).map_or(0, |i| i + 1)..];
-            if TOKEN_NOT_CREDENTIAL.iter().any(|w| w.as_bytes() == word) {
-                return false;
+    } else if matches!(k, b"secret" | b"token" | b"pwd") {
+        if after_ident && word_end.is_none() {
+            return Key::No; // `mytoken`, `topsecret`, `OLDPWD`
+        }
+        if k == b"token" && word_end.is_some_and(|e| TOKEN_NOT_CREDENTIAL.iter().any(|w| w.as_bytes() == word_before(lower, text, e))) {
+            return Key::No;
+        }
+        if hump || k == b"pwd" {
+            kind = Key::Strict; // (`pwd.getpwuid(…)` in Python)
+        }
+    } else if caps.get(g.gk).is_some() {
+        // `app_key`, `appKey`, `appkey`, `RAILS_MASTER_KEY`, not `whatsappkey`.
+        let end = word_end.unwrap_or(kw.start());
+        let names = if k == b"salt" { SALT_NAMES } else { KEY_NAMES };
+        if !names.iter().any(|n| ends_with_words(lower, text, end, n)) {
+            let Some(end) = word_end else { return Key::No };
+            if k == b"salt" {
+                return Key::No;
             }
+            if MORE_KEY_NAMES.iter().any(|n| ends_with_words(lower, text, end, n)) {
+                kind = Key::Strict;
+            } else {
+                // Any other `<word>_key`, if the word is not one of a non-secret.
+                let word = word_before(lower, text, end);
+                if word.len() < 2 || KEY_NOT_CREDENTIAL.iter().any(|w| w.as_bytes() == word) {
+                    return Key::No;
+                }
+                kind = Key::Generic;
+            }
+        } else if hump {
+            kind = Key::Credential; // (as before scanner v6: `appKey`)
         }
     }
-    // `app_key`, `appKey`, `RAILS_MASTER_KEY`, not `whatsappkey`.
-    if caps.get(g.kk).is_some() && after_ident && !(text[kw.start()].is_ascii_uppercase() && text[kw.start() - 1].is_ascii_lowercase()) {
-        return false;
+    // The suffix words, from the original text (for camelCase).
+    let sfx_end = caps.get(g.sfx).map_or(kw.end(), |m| m.end());
+    let tail = &text[kw.end()..sfx_end];
+    let glued = &tail[..tail.iter().position(|b| matches!(b, b'_' | b'-')).unwrap_or(tail.len())];
+    if !glued_ok(glued, text[kw.end() - 1]) {
+        return Key::No; // `tokenizer`, `passwordless`
     }
-    let suffix = caps.get(g.sfx).map_or(&b""[..], |m| m.as_bytes());
-    if suffix
-        .split(|b| matches!(b, b'_' | b'-'))
-        .any(|w| NOT_A_CREDENTIAL.iter().any(|n| n.as_bytes() == w))
-    {
-        return false;
+    let is = |w: &[u8], list: &[&str]| list.iter().any(|n| n.as_bytes().eq_ignore_ascii_case(w));
+    if words(tail).any(|w| is(w, NOT_A_CREDENTIAL)) {
+        return Key::No;
+    }
+    // `STRIPE_KEY_PASSWORD`: a keyword in the suffix decides.
+    if kind == Key::Generic && words(tail).any(|w| is(w, &["password", "passwd", "pwd", "secret", "token"])) {
+        return Key::No;
+    }
+    // Found at a camelCase hump, by its camelCase words or by a v6 rule:
+    // the identifier must be made of words, so that base64 (`…xXD5KeY3ImI=`)
+    // does not count. Every word of the identifier is lower-case,
+    // capitalised or upper-case, maybe with digits after it, and those of
+    // the keyword have two letters or more (`Key`, `KEY`, `ApiKey`, not
+    // `KeY`).
+    let camel_tail = glued.iter().any(u8::is_ascii_uppercase);
+    if kind != Key::Credential || at_hump || camel_tail {
+        let start = kw.start() - text[kw.start().saturating_sub(64)..kw.start()].iter().rev().take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')).count();
+        let keyword_words = words(&text[kw.range()]).all(|w| w.len() >= 2);
+        if !keyword_words || !words(&text[start..sfx_end]).all(|w| wordlike(w, false)) {
+            return Key::No;
+        }
+        if kind == Key::Credential && (at_hump || camel_tail) {
+            kind = Key::Strict; // (also `accessToken`: `pub GetToken: GetTokenFn,`)
+        }
     }
     if let Some(el) = caps.get(g.el) {
         let name = before.iter().rposition(|b| !(ident(b) || matches!(b, b'_' | b'-' | b'.' | b':')));
-        return match el.as_bytes().starts_with(b"</key>") {
+        if caps.get(g.ek).is_some() {
+            // `<entry key="db.password">`: the keyword is (part of) the
+            // value of a `key` or `name` attribute.
+            let attr = |i: usize| {
+                let b = before[..=i].strip_suffix(b"\"").or_else(|| before[..=i].strip_suffix(b"'"));
+                let b = b.map(<[u8]>::trim_ascii_end).and_then(|b| b.strip_suffix(b"=").or_else(|| b.strip_suffix(&[CONFIG_EQUALS])));
+                let b = b.map(<[u8]>::trim_ascii_end).unwrap_or(&[]);
+                [&b"key"[..], b"name"].iter().any(|a| b.strip_suffix(*a).is_some_and(|r| r.last().is_some_and(u8::is_ascii_whitespace)))
+            };
+            return if name.is_some_and(attr) { kind } else { Key::No };
+        }
+        let ok = match el.as_bytes().starts_with(b"</key>") {
             // A plist entry: the keyword is (part of) the `<key>`.
             true => name.is_some_and(|i| before[..=i].ends_with(b"<key>")),
             // An element: the keyword is part of the name of the tag just opened.
             false => name.is_some_and(|i| before[i] == b'<'),
         };
+        return if ok { kind } else { Key::No };
     }
-    true
+    kind
 }
 
 /// The part of an assignment match to judge (see [`assignment_pattern`]).
@@ -977,24 +1338,29 @@ fn value_start(m: &[u8]) -> Option<usize> {
     i += usize::from(matches!(m.get(i), Some(b'"' | b'\'')));
     let blanks = |i: usize| i + m[i..].iter().take_while(|b| matches!(b, b' ' | b'\t')).count();
     i = blanks(i);
-    let sep = [&b":="[..], b"=>", b":", b"="].into_iter().find(|s| m[i..].starts_with(s))?;
+    // (`C` and `E`: a configuration line's `:` and `=`, see `lowercase_into`.)
+    let sep = [&b":="[..], b"C=", b"=>", b"E>", b":", b"C", b"=", b"E"].into_iter().find(|s| m[i..].starts_with(s))?;
     Some(blanks(i + sep.len()))
 }
 
 /// Does a key starting at `kw` start a configuration line: is the text
-/// before it on its line nothing but the rest of the key, maybe indented,
-/// quoted, a YAML list item or after `export` (`spring.datasource.`,
-/// `  DB_`, `- "`, `export `)? Looks back at most 256 bytes.
+/// before it on its line (after a newline or NUL) nothing but the rest of
+/// the key, maybe indented,
+/// quoted, a YAML list item, after `export` / `set` or a Dockerfile's
+/// `ENV` / `ARG` (`spring.datasource.`, `  DB_`, `- "`, `export `)? Looks
+/// back at most 256 bytes.
 fn config_line(text: &[u8], kw: usize) -> bool {
     let from = kw.saturating_sub(256);
     let before = &text[from..kw];
-    let line = match before.iter().rposition(|&b| b == b'\n') {
+    // (In binary data a NUL ends a line too: the first line of a file in
+    // a `.tar` follows the header's NUL padding.)
+    let line = match before.iter().rposition(|&b| b == b'\n' || b == 0) {
         Some(i) => &before[i + 1..],
         None if from == 0 => before,
         None => return false,
     };
     let mut s = line.trim_ascii_start();
-    for p in [&b"export "[..], b"set ", b"-"] {
+    for p in [&b"export "[..], b"set ", b"ENV ", b"ARG ", b"-"] {
         if let Some(rest) = s.strip_prefix(p) {
             s = rest.trim_ascii_start();
             break;
@@ -1113,12 +1479,13 @@ struct Hit {
     excerpt: String,
 }
 
-/// Token rules over `hay`; only matches starting before `limit` are
-/// reported (the rest of `hay` is overlap owned by the next chunk).
-/// `stripped`: `hay` is NUL-padded data with the NULs removed.
-fn search_tokens(hay: &[u8], limit: usize, stripped: bool, out: &mut Vec<Hit>) {
+/// Token rules over `hay`; only matches starting in `from..limit` are
+/// reported (before `from` is context, the end of the previous chunk; after
+/// `limit` overlap owned by the next chunk). `stripped`: `hay` is
+/// NUL-padded data with the NULs removed.
+fn search_tokens(hay: &[u8], from: usize, limit: usize, stripped: bool, out: &mut Vec<Hit>) {
     let rules = rules();
-    search_with(&rules.token_re, &rules.token_caps, &rules.token_values, None, stripped, hay, hay, limit, out, |caps| {
+    search_with(&rules.token_re, &rules.token_caps, &rules.token_values, None, stripped, hay, hay, from..limit, out, |caps| {
         let i = rules.token_groups.iter().position(|&g| caps.get(g).is_some()).expect("one alternative matched");
         &rules.tokens[i]
     });
@@ -1127,9 +1494,15 @@ fn search_tokens(hay: &[u8], limit: usize, stripped: bool, out: &mut Vec<Hit>) {
 /// The assignment rule. `lower` is `text` ASCII-lowercased (same offsets):
 /// the keywords are matched there case-sensitively, which keeps the regex
 /// prefilter effective, and values are judged on the original `text`.
-fn search_assignments(text: &[u8], lower: &[u8], limit: usize, out: &mut Vec<Hit>) {
+/// `keywords`: where [`lowercase_into`] found keywords (none: nothing to
+/// search). Every match starts at a keyword, and ends within [`OVERLAP`]
+/// of the end of its line (only a run of 16 KiB of blanks between a key
+/// and its value could be longer), so the search is limited to that.
+fn search_assignments(text: &[u8], lower: &[u8], keywords: Option<(usize, usize)>, from: usize, limit: usize, out: &mut Vec<Hit>) {
+    let Some((first, last)) = keywords else { return };
+    let hay = &lower[..(last + OVERLAP).min(lower.len())];
     let rules = rules();
-    search_with(&rules.assignment_re, &rules.assignment_caps, &rules.assign.values, Some(&rules.assign), false, lower, text, limit, out, |_| {
+    search_with(&rules.assignment_re, &rules.assignment_caps, &rules.assign.values, Some(&rules.assign), false, hay, text, from.max(first)..limit.min(hay.len()), out, |_| {
         &rules.assignment
     });
 }
@@ -1167,12 +1540,12 @@ fn search_with<'r>(
     stripped: bool,
     hay: &[u8],
     text: &[u8],
-    limit: usize,
+    range: std::ops::Range<usize>,
     out: &mut Vec<Hit>,
     rule_of: impl Fn(&regex::bytes::Captures) -> &'r Rule,
 ) {
     let mut found = 0;
-    let mut at = 0;
+    let (mut at, limit) = (range.start, range.end);
     let budget = WORK_FACTOR * hay.len() + WORK_SLACK;
     // Work done again so far, and how far the searches and the capture
     // groups computed have reached.
@@ -1238,6 +1611,13 @@ fn search_with<'r>(
         }
         work += CAPTURE_COST * captured.clamp(whole.start(), whole.end()).saturating_sub(whole.start());
         captured = captured.max(whole.end());
+        // A keyword that its left context alone rejects (`mytoken`,
+        // `monkey`; see `credential_key`) needs no capture groups. (Their
+        // work is still counted above, so the budget runs out as before.)
+        if assign.is_some() && rejected_by_context(hay, text, whole.start()) {
+            at = restart;
+            continue;
+        }
         let caps = caps_re.captures_at(&hay[..whole.end()], whole.start()).expect("the same match");
         let rule = rule_of(&caps);
         if !rule.before.allows(prev) {
@@ -1248,7 +1628,8 @@ fn search_with<'r>(
         if !rule.after.allows(next) {
             continue;
         }
-        if assign.is_some_and(|g| !credential_key(&caps, g, hay, text)) {
+        let key = assign.map(|g| credential_key(&caps, g, hay, text));
+        if key == Some(Key::No) {
             // Another keyword may start inside (`mytoken_password = …`).
             at = restart;
             continue;
@@ -1260,11 +1641,36 @@ fn search_with<'r>(
             },
             None => values.iter().find_map(|&g| caps.get(g)).unwrap_or(whole).range(),
         };
+        // A key found by a v6 rule (`Key::Strict`, `Key::Generic`) needs a
+        // value that is clearly a literal: on the same line (base64 can
+        // look like `…abcKey=`, and the next line be anything) unless the
+        // shape is multi-line by nature (a Kubernetes `value:`, an XML
+        // element); quoted, or one token (not code: `nKey = pOp->p4.z;`,
+        // `keys = set(d.keys())`); not made of words (type names,
+        // `Ipv6CidrAssociations`, `"?NonExpressionParenKeyword"`); not a
+        // UUID (`ChangeToken`, an identifier).
+        if let (Some(g), Some(Key::Generic | Key::Strict)) = (assign, key) {
+            let kw_end = caps.get(g.kw).expect("keyword group").end();
+            let multi = [g.k8q, g.k8s[0], g.k8s[1], g.el].iter().any(|&i| caps.get(i).is_some());
+            let v = &text[span.clone()];
+            let literal = g.literal.iter().any(|&i| caps.get(i).is_some());
+            let token = v.iter().all(|b| b.is_ascii_alphanumeric() || b"!#$%&*+./:=?@^_~|-".contains(b));
+            // An unquoted token in code is a name (`Key: TypeName,`,
+            // `isFlat?getAllKeys:keys`), except in a connection string
+            // (`;Pwd=…`).
+            let ident = whole.start() - text[..whole.start()].iter().rev().take(256).take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')).count();
+            let unquoted = [g.u, g.ut].iter().any(|&i| caps.get(i).is_some());
+            let code = unquoted && !config_line(text, whole.start()) && ident.checked_sub(1).map(|i| text[i]) != Some(b';');
+            if (!multi && text[kw_end..span.start].contains(&b'\n')) || !(literal || token) || code || wordy(v) || uuid(trim_code_end(unquote(v))) {
+                continue;
+            }
+        }
         let token = &text[span];
         let ok = match rule.check {
             Check::None => true,
             Check::Entropy(min) => shannon_entropy(token) >= min,
             Check::Assignment if assign.is_some_and(|g| caps.get(g.g).is_some()) => app_password(token),
+            Check::Assignment if key == Some(Key::Generic) => key_value(token),
             Check::Assignment => plausible_value(token),
             Check::UrlPassword => plausible_url_password(token),
             Check::PemHeader => {
@@ -1299,7 +1705,8 @@ fn nul_padded(chunk: &[u8], window: &[u8], bom: bool) -> bool {
     if bom {
         return true;
     }
-    let nuls = chunk.iter().filter(|&&b| b == 0).count();
+    // (`memchr`: a plain count costs as much as the rest of a text scan.)
+    let nuls = memchr::memchr_iter(0, chunk).count();
     nuls > 0 && nuls * 32 >= chunk.len() || utf16_run(window)
 }
 
@@ -1394,9 +1801,103 @@ fn strip_nuls(out: &mut Vec<u8>, data: &[u8], from: usize, to: usize, units: Opt
 
 /// `s` ASCII-lowercased, with `-` as `_`, for the assignment rule: its
 /// keywords then need fewer variants (see [`KEYWORDS`]). Offsets are kept.
-fn lowercase_into(buf: &mut Vec<u8>, s: &[u8]) {
+///
+/// The `:` or `=` that ends the key of a configuration line (see
+/// [`config_line`]) becomes [`CONFIG_COLON`] or [`CONFIG_EQUALS`], so that
+/// the rest-of-line value of [`assignment_pattern`] only matches there: in
+/// code (`let secret = config.secret_key.clone();`) it would match every
+/// line with a keyword before `=`, only to be rejected (the pre-filter for
+/// code lines).
+fn lowercase_into(buf: &mut Vec<u8>, s: &[u8]) -> Option<(usize, usize)> {
     buf.clear();
     buf.extend(s.iter().map(|&b| if b == b'-' { b'_' } else { b.to_ascii_lowercase() }));
+    let mark = |buf: &mut Vec<u8>, line: usize| {
+        if let Some(i) = config_separator(&s[line..]) {
+            buf[line + i] = if s[line + i] == b':' { CONFIG_COLON } else { CONFIG_EQUALS };
+        }
+    };
+    // Looking at every line costs more than finding the keywords (most
+    // lines have none), and the rest-of-line value needs a keyword within
+    // 256 bytes of the start of its line (`config_line`): so only the lines
+    // with one are looked at, once each. The keywords are
+    // [`KEYWORD_PARTS`]. (The stand-ins are no part of any keyword, so
+    // marking does not change what is found next.) The keywords found also
+    // tell `search_assignments` where to search.
+    let finder = &rules().keyword_parts;
+    let mut pos = 0;
+    let mut first = None;
+    while let Some((start, end)) = finder.find(&buf[pos..]).map(|m| (pos + m.start(), pos + m.end())) {
+        first.get_or_insert(start);
+        let from = start.saturating_sub(256);
+        match memchr::memrchr2(b'\n', 0, &buf[from..start]) {
+            Some(i) => mark(buf, from + i + 1),
+            None if from == 0 => mark(buf, 0),
+            None => {}
+        }
+        pos = memchr::memchr(b'\n', &buf[end..]).map_or(buf.len(), |i| end + i + 1);
+    }
+    // Every keyword is in `first..pos` (`pos`: the end of the last line
+    // with one).
+    first.map(|first| (first, pos))
+}
+
+/// The words each keyword of [`KEYWORDS`] starts with.
+const KEYWORD_PARTS: &[&str] = &["password", "passwd", "secret", "token", "key", "salt", "pwd", "identified"];
+
+/// Stand-ins for the `:` and `=` after the key of a configuration line in
+/// the lowercased text (see [`lowercase_into`]): upper-case letters never
+/// occur there otherwise.
+const CONFIG_COLON: u8 = b'C';
+const CONFIG_EQUALS: u8 = b'E';
+
+/// Where the `:` or `=` after the key of a configuration line is, if `line`
+/// (to the end of the text) starts with one: what [`config_line`] accepts
+/// before a key, more key characters, maybe a quote and blanks, then the
+/// separator. Lines whose key starts more than 256 bytes in are marked too;
+/// `config_line` rejects them after the match.
+fn config_separator(line: &[u8]) -> Option<usize> {
+    // (Hand-rolled, with a table: this runs on every line.) A key that
+    // starts more than 256 bytes in does not count anyway (`config_line`);
+    // one that ends after 512 bytes does not either.
+    let line = &line[..line.len().min(512)];
+    const BLANK: u8 = 1; // ` \t\r\x0c`
+    const KEY: u8 = 2; // `[A-Za-z0-9_.-]`
+    const SPACE: u8 = 4; // ` \t`
+    static CLASS: [u8; 256] = {
+        let mut t = [0u8; 256];
+        let mut b = 0;
+        while b < 256 {
+            let c = b as u8;
+            if matches!(c, b' ' | b'\t') {
+                t[b] = BLANK | SPACE;
+            } else if matches!(c, b'\r' | b'\x0c') {
+                t[b] = BLANK;
+            } else if c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-') {
+                t[b] = KEY;
+            }
+            b += 1;
+        }
+        t
+    };
+    let skip = |mut i: usize, class: u8| {
+        while i < line.len() && CLASS[line[i] as usize] & class != 0 {
+            i += 1;
+        }
+        i
+    };
+    let mut i = skip(0, BLANK);
+    match line.get(i) {
+        Some(b'-') => i = skip(i + 1, BLANK),
+        Some(b'e') if line[i..].starts_with(b"export ") => i = skip(i + 7, BLANK),
+        Some(b's') if line[i..].starts_with(b"set ") => i = skip(i + 4, BLANK),
+        Some(b'E') if line[i..].starts_with(b"ENV ") => i = skip(i + 4, BLANK),
+        Some(b'A') if line[i..].starts_with(b"ARG ") => i = skip(i + 4, BLANK),
+        _ => {}
+    }
+    let quote = |i: usize| i + usize::from(matches!(line.get(i), Some(b'"' | b'\'')));
+    i = skip(quote(i), KEY);
+    i = skip(quote(i), SPACE);
+    matches!(line.get(i), Some(b':' | b'=')).then_some(i)
 }
 
 // ---- NUL-separated text ------------------------------------------------------
@@ -1416,24 +1917,43 @@ fn text_line(line: &[u8]) -> bool {
 /// only lines of 2 or more bytes count towards the share).
 fn nul_separated_lines(data: &[u8]) -> Option<Vec<(usize, &[u8])>> {
     memchr::memchr(0, data)?;
-    let (mut lines, mut text, mut other) = (Vec::new(), 0usize, 0usize);
+    // Is a line of one byte text? (UTF-16 is all such lines: this is the
+    // hot path there, so no UTF-8 decoding.)
+    let short = |b: u8| matches!(b, b'\t' | b'\r' | 0x20..=0x7e);
+    let is_text = |line: &[u8]| if line.len() == 1 { short(line[0]) } else { text_line(line) };
+    // First count, then collect the lines only if they qualify.
+    let (mut text, mut other) = (0usize, 0usize);
     let mut start = 0;
     for end in memchr::memchr_iter(0, data) {
         let line = &data[start..end];
         if !line.is_empty() {
-            if text_line(line) {
-                lines.push((start, line));
+            if is_text(line) {
                 if line.len() >= 2 {
                     text += line.len();
                 }
             } else {
                 other += line.len();
+                if other * 2 > data.len() {
+                    return None; // text can no longer be half
+                }
             }
         }
         start = end + 1;
     }
     other += data.len() - start;
-    (text > 0 && text >= other).then_some(lines)
+    if text == 0 || text < other {
+        return None;
+    }
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for end in memchr::memchr_iter(0, data) {
+        let line = &data[start..end];
+        if !line.is_empty() && is_text(line) {
+            lines.push((start, line));
+        }
+        start = end + 1;
+    }
+    Some(lines)
 }
 
 /// Defence in depth for NUL-separated text ([`nul_separated_lines`]): its
@@ -1463,13 +1983,14 @@ fn scan_nul_separated(data: &[u8]) -> Vec<Finding> {
         let mut start = 0;
         while start < text.len() && found.len() < MAX_FINDINGS {
             let end = (start + CHUNK).min(text.len());
-            let window = &text[start..(end + OVERLAP).min(text.len())];
+            let from = line_start(&text, start);
+            let window = &text[from..(end + OVERLAP).min(text.len())];
             hits.clear();
-            search_tokens(window, end - start, true, &mut hits);
-            lowercase_into(&mut lower, window);
-            search_assignments(window, &lower, end - start, &mut hits);
+            search_tokens(window, start - from, end - from, true, &mut hits);
+            let keywords = lowercase_into(&mut lower, window);
+            search_assignments(window, &lower, keywords, start - from, end - from, &mut hits);
             for h in hits.drain(..) {
-                let at = start + h.offset;
+                let at = from + h.offset;
                 let i = starts.partition_point(|&(t, _)| t <= at) - 1;
                 let line = 1 + newlines(&data[..starts[i].1]);
                 let f = Finding { rule: h.rule, line, excerpt: h.excerpt };
@@ -1483,11 +2004,25 @@ fn scan_nul_separated(data: &[u8]) -> Vec<Finding> {
     found
 }
 
+/// Where the window of the chunk at `start` begins: at the start of the
+/// line `start` is in, so that the assignment rule sees the whole line (a
+/// key that only seems to start a line where a chunk starts is not a
+/// configuration line). If the line starts more than [`LINE_LOOKBACK`]
+/// bytes before (even in UTF-32, more than the 256 characters
+/// [`config_line`] looks back), the window starts there; a key in the
+/// chunk then never starts a configuration line.
+fn line_start(data: &[u8], start: usize) -> usize {
+    let from = start.saturating_sub(LINE_LOOKBACK);
+    memchr::memrchr(b'\n', &data[from..start]).map_or(from, |i| from + i + 1)
+}
+
+const LINE_LOOKBACK: usize = 2048;
+
 /// Scan file content for likely credentials.
 pub fn scan(data: &[u8]) -> Vec<Finding> {
     // Token rules over the raw bytes, in one go (offsets into `data`).
     let mut hits = Vec::new();
-    search_tokens(data, data.len(), false, &mut hits);
+    search_tokens(data, 0, data.len(), false, &mut hits);
 
     // Chunked passes: assignments over the raw bytes, and every rule over
     // NUL-padded text with the NULs removed. Removing NULs keeps every
@@ -1499,24 +2034,29 @@ pub fn scan(data: &[u8]) -> Vec<Finding> {
     let mut start = 0;
     while start < data.len() && hits.len() + stripped_found.len() < MAX_FINDINGS {
         let end = (start + CHUNK).min(data.len());
-        let window = &data[start..(end + OVERLAP).min(data.len())];
-        lowercase_into(&mut lower, window);
+        let window_end = (end + OVERLAP).min(data.len());
+        let from = line_start(data, start);
+        let window = &data[from..window_end];
+        let keywords = lowercase_into(&mut lower, window);
         chunk_hits.clear();
-        search_assignments(window, &lower, end - start, &mut chunk_hits);
-        hits.extend(chunk_hits.drain(..).map(|h| Hit { offset: h.offset + start, ..h }));
+        search_assignments(window, &lower, keywords, start - from, end - from, &mut chunk_hits);
+        hits.extend(chunk_hits.drain(..).map(|h| Hit { offset: h.offset + from, ..h }));
 
+        let window = &data[start..window_end];
         if nul_padded(&data[start..end], window, bom) {
             stripped.clear();
             let units = units_of(window, start);
+            strip_nuls(&mut stripped, data, from, start, units);
+            let first = stripped.len();
             strip_nuls(&mut stripped, data, start, end, units);
             let limit = stripped.len();
-            strip_nuls(&mut stripped, data, end, start + window.len(), units);
-            lowercase_into(&mut lower, &stripped);
-            search_tokens(&stripped, limit, true, &mut chunk_hits);
-            search_assignments(&stripped, &lower, limit, &mut chunk_hits);
+            strip_nuls(&mut stripped, data, end, window_end, units);
+            let keywords = lowercase_into(&mut lower, &stripped);
+            search_tokens(&stripped, first, limit, true, &mut chunk_hits);
+            search_assignments(&stripped, &lower, keywords, first, limit, &mut chunk_hits);
             if !chunk_hits.is_empty() {
-                line += newlines(&data[pos..start]);
-                pos = start;
+                line += newlines(&data[pos..from]);
+                pos = from;
                 for h in chunk_hits.drain(..) {
                     stripped_found.push(Finding {
                         rule: h.rule,
@@ -1703,6 +2243,102 @@ QyNTUxOQAAACBGqZt3YkVvQ2mR8sXlN0pWcF4hTj7uK9eAoD1bLyS6xQAAAJgVb1oKFW9a
     }
 
     #[test]
+    fn identifier_words() {
+        let w = |s: &str| words(s.as_bytes()).map(|w| String::from_utf8_lossy(w).into_owned()).collect::<Vec<_>>().join(" ");
+        assert_eq!(w("passwordHashV2"), "password Hash V2");
+        assert_eq!(w("DB_PASSWORD_PROD"), "DB PASSWORD PROD");
+        assert_eq!(w("getHTTPClient_x"), "get HTTP Client x");
+        assert_eq!(w("Hash"), "Hash");
+        assert_eq!(w(""), "");
+        let before = |s: &str| {
+            let lower = s.to_ascii_lowercase();
+            String::from_utf8_lossy(word_before(lower.as_bytes(), s.as_bytes(), s.len())).into_owned()
+        };
+        assert_eq!(before("nextPage"), "page");
+        assert_eq!(before("NEXT_PAGE"), "page");
+        assert_eq!(before("XSRF"), "xsrf");
+        assert_eq!(before("x.csrf"), "csrf");
+        for (g, ok) in [("", true), ("s", true), ("S", true), ("sManager", true), ("Prod", true), ("izer", false), ("2", true), ("2Prod", true), ("less", false)] {
+            assert_eq!(glued_ok(g.as_bytes(), b'n'), ok, "{g}");
+        }
+        assert!(glued_ok(b"S", b'N') && !glued_ok(b"PROD", b'N'));
+    }
+
+    /// The cheap check before capture groups (`rejected_by_context`) only
+    /// rejects what `credential_key` rejects, over generated identifiers.
+    #[test]
+    fn context_rejection_agrees_with_the_key_check() {
+        let parts = [
+            "key", "Key", "KEY", "token", "Token", "pwd", "Pwd", "salt", "Salt", "secret", "api", "Api", "app", "access", "Access", "auth",
+            "client", "my", "x", "X", "whatsapp", "nonce", "_", "_", "-", "2", "s", "license", "logged", "in",
+        ];
+        let mut x = 0x9e3779b97f4a7c15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let rules = rules();
+        let (mut checked, mut lower) = (0, Vec::new());
+        for _ in 0..20_000 {
+            let n = 1 + next() % 5;
+            let ident: String = (0..n).map(|_| parts[(next() % parts.len() as u64) as usize]).collect();
+            let line = format!("{ident} = \"Xk9mQ2vL7pR4wZt8uY3n\"\n");
+            let text = line.as_bytes();
+            lowercase_into(&mut lower, text);
+            for m in rules.assignment_re.find_iter(&lower) {
+                if rejected_by_context(&lower, text, m.start()) {
+                    let caps = rules.assignment_caps.captures_at(&lower[..m.end()], m.start()).expect("same match");
+                    assert!(credential_key(&caps, &rules.assign, &lower, text) == Key::No, "{line:?} at {}", m.start());
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 1000, "{checked}");
+    }
+
+    #[test]
+    fn configuration_lines_and_compounds() {
+        for (line, sep) in [
+            ("DB_PASSWORD=x", Some(11)),
+            ("  password: x", Some(10)),
+            ("export API_KEY=\"x\"", Some(14)),
+            ("ENV MAPBOX_KEY=x", Some(14)),
+            ("- \"githubToken\": x", Some(15)),
+            ("spring.datasource.password = x", Some(27)),
+            ("    let password = x;", None),
+            ("x = password", Some(2)),
+            ("<add key=\"x\"/>", None),
+        ] {
+            assert_eq!(config_separator(line.as_bytes()), sep, "{line}");
+        }
+        assert_eq!(config_separator(format!("{}=x", "a".repeat(600)).as_bytes()), None, "beyond 512 bytes");
+        let at = |s: &str, k: &str| {
+            let i = s.rfind(k).unwrap();
+            compound(s.as_bytes(), i, k.as_bytes())
+        };
+        assert!(at("x_api_key", "key") && at("myapikey", "key") && at("aws_secret_access_key", "key") && at("clientsecret", "secret"));
+        assert!(at("accesstoken", "token") && at("auth_token", "token"));
+        assert!(!at("monkey", "key") && !at("mytoken", "token") && !at("topsecret", "secret"));
+    }
+
+    #[test]
+    fn key_values_and_words() {
+        for v in [&b"?NonExpressionParenKeyword"[..], b"D3DKMT_PRESENTHISTORYTOKEN", b"BCryptGenerateSymmetricKeyFn", b"my-app/22a0-stage-150819_185942.war", b"Ipv6CidrAssociations"] {
+            assert!(wordy(v), "{}", String::from_utf8_lossy(v));
+        }
+        for v in [&b"Xk9mQ2vL7pR4wZt8uY3n"[..], b"9f86d081884c7d659a2feaa0c55ad015", b"deadbeefcafefacefeedbadc0ffee123"] {
+            assert!(!wordy(v), "{}", String::from_utf8_lossy(v));
+        }
+        assert!(key_value(b"Xk9mQ2vL7pR4wZt8uY3n") && key_value(b"9f86d081884c7d659a2feaa0c55ad015"));
+        assert!(!key_value(b"123e4567-e89b-12d3-a456-426614174000"), "a UUID");
+        assert!(!key_value(b"9f86d081884c7d65"), "16 hex digits: 64 bits");
+        assert!(!key_value(b"Xk9mQ2vL7pR4"), "too short");
+        assert!(timestamp(b"2016-09-08T21:47:36Z") && !timestamp(b"2016-0X"));
+    }
+
+    #[test]
     fn entropy_bars() {
         assert!((min_entropy(&[b'X'; 16]) - 3.0).abs() < 1e-9);
         assert!((min_entropy(&[b'x'; 16]) - 2.6).abs() < 1e-9, "lower-case");
@@ -1724,3 +2360,4 @@ QyNTUxOQAAACBGqZt3YkVvQ2mR8sXlN0pWcF4hTj7uK9eAoD1bLyS6xQAAAJgVb1oKFW9a
         assert_eq!(out, b"\xad\x30 AKIA");
     }
 }
+
