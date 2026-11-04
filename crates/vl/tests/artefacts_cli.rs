@@ -24,7 +24,7 @@ fn status_lists_editor_artefacts_of_protected_files_as_local_only() {
     write(&proj, "src/.main.rs.swp", "fn main() {}\n");
     let status = env.ok("alice", &proj, &["status"]);
     for path in ["deploy/.id_ed25519.swp", ".env~", "deploy/server.pem.bak"] {
-        assert!(status.lines().any(|l| l.trim() == format!("L {path}")), "{path} not local-only:\n{status}");
+        assert!(status.lines().any(|l| l.trim() == format!("L {path} [isolated]")), "{path} not local-only:\n{status}");
     }
     assert!(!status.contains("src/.main.rs.swp"), "a scratch file of a public file is ignored:\n{status}");
     let check = env.ok("alice", &proj, &["policy", "check", "deploy/.id_ed25519.swp", "src/.main.rs.swp"]);
@@ -54,8 +54,8 @@ fn status_says_why_a_file_is_redacted() {
 
     env.ok("bob", &env.root, &["clone", mirror.to_str().unwrap(), "bob"]);
     let status = env.ok("bob", &env.root.join("bob"), &["status"]);
-    assert!(status.contains("R plans/q3.md  (cloaked:team; withheld by a public remote)"), "{status}");
+    assert!(status.contains("R plans/q3.md [redacted]  (cloaked:team; withheld by a public remote)"), "{status}");
     env.ok("carol", &env.root, &["clone", team.to_str().unwrap(), "carol"]);
     let status = env.ok("carol", &env.root.join("carol"), &["status"]);
-    assert!(status.contains("R plans/q3.md  (cloaked:team; no key)"), "{status}");
+    assert!(status.contains("R plans/q3.md [redacted]  (cloaked:team; no key)"), "{status}");
 }

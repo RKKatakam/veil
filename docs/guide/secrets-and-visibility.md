@@ -5,6 +5,7 @@ Every path in a Veil repository has a **visibility tier**, decided by
 when it records a snapshot, so no command, merge or push can get around it.
 
 1. [Tiers and `.veilpolicy`](#tiers-and-veilpolicy)
+   * [Every file's tier: `vl ls`](#every-files-tier-vl-ls)
 2. [Built-in secret rules](#built-in-secret-rules)
 3. [The secret scanner](#the-secret-scanner)
 4. [Quarantine](#quarantine)
@@ -63,13 +64,66 @@ $ vl policy check .env cfg.js app.py
 .env: isolated via built-in secret rule '.env'
 cfg.js: public via default
 app.py: public via default
-$ vl files
+$ vl ls
+isolated                  20  .env
 public                   887  .veilpolicy
 public                    12  app.py
-cloaked:team              15  secrets/notes.md
+cloaked:team              16  secrets/notes.md
 ```
 
 `vl policy show` lists every rule, built-in ones first.
+
+### Every file's tier: `vl ls`
+
+`vl ls [-r REV] [PATHS…]` lists a snapshot's files (default `@`, the
+working copy) with their tier **as you see it**, their size in bytes, and a
+note where there is something to say. It never prints content.
+
+```text
+$ vl ls --all
+isolated                  20  .env
+public                   887  .veilpolicy
+public                    12  app.py
+quarantined               27  cfg.js  (aws-access-key-id; never recorded)
+cloaked:team              16  secrets/notes.md
+ignored                    -  target/
+```
+
+| Tier | Meaning |
+|---|---|
+| `public` | Plaintext; every remote gets it (also a file of a released embargo) |
+| `cloaked:<scope>` | Encrypted for a scope you are in; team remotes get the ciphertext, public remotes nothing |
+| `embargoed:<id>` | Under an unreleased embargo whose key you hold |
+| `redacted` | Recorded, but you cannot read it: sealed for a scope you are not in, or withheld from your clone. The note says for whom (`(cloaked:ops; no key)`) |
+| `isolated` | Local only: never snapshotted, never pushed |
+| `quarantined` | Kept out of snapshots: the scanner found a secret in it |
+| `ignored` | Not tracked at all (only with `--all`; an ignored directory is listed once, as `target/`) |
+
+The local-only tiers (`isolated`, `quarantined`, `ignored`) come from the
+working copy, so they are listed for `-r @` only (and not with
+`--no-snapshot`). Paths narrow the list to those files or directories,
+relative to the current directory. `vl ls --json` prints the same as one
+document ([`veil.ls/1`](../reference/json.md#veills1)).
+
+`vl status` marks changed and local-only files with the same tiers (public
+files carry no mark):
+
+```text
+$ vl status
+Working copy changes:
+A .veilpolicy
+A app.py
+A secrets/notes.md [cloaked:team]
+…
+Local-only (isolated; never snapshotted or pushed):
+  L .env [isolated]
+Quarantined (secrets detected; kept local):
+  Q cfg.js [quarantined]  (aws-access-key-id; never recorded)
+```
+
+`vl files` is the older, plainer listing of recorded files (the label as
+recorded, `(redacted)` when unreadable), kept unchanged for scripts that
+parse it. Prefer `vl ls`.
 
 **Pattern details.** Patterns are globs (`*`, `**`, `?`, `[…]`, `{a,b}`), and
 a trailing `/` means a directory. `\` escapes a character
@@ -251,9 +305,9 @@ Workspace    : default
 Working copy : @ wwttlpsq 7b1d03cc (no description set)
 Parent       : zzzzzzzz 72edc798 (no description set)
 Local-only (isolated; never snapshotted or pushed):
-  L .env
+  L .env [isolated]
 Quarantined (secrets detected; kept local):
-  Q cfg.js  (aws-access-key-id; never recorded)
+  Q cfg.js [quarantined]  (aws-access-key-id; never recorded)
 ```
 
 * A **new** file is not recorded at all (`never recorded`).

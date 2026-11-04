@@ -110,10 +110,38 @@ pub enum Cmd {
         out: JsonOut,
     },
     /// List the files of a snapshot with their visibility.
+    ///
+    /// The plain listing of recorded files, kept unchanged for scripts.
+    /// `vl ls` shows more: tiers as this reader sees them, and the working
+    /// copy's local-only files.
     Files {
         /// Snapshot to list.
         #[arg(short, long, default_value = "@")]
         rev: String,
+    },
+    /// List a snapshot's files with their tier: who can read each one, and
+    /// what never leaves this machine.
+    ///
+    /// One line per file: tier, size in bytes, path (`*` marks an
+    /// executable), and a note in parentheses. Tiers: `public`;
+    /// `cloaked:<scope>` (encrypted for a scope you are in);
+    /// `embargoed:<id>` (under an unreleased embargo whose key you hold);
+    /// `redacted` (sealed for someone else, or withheld from this
+    /// repository: the note says for whom). For the working copy (`-r @`,
+    /// the default) the local-only files are listed too: `isolated` (never
+    /// snapshotted or pushed), `quarantined` (a secret was found in it) and,
+    /// with `--all`, `ignored`. No content is ever printed.
+    Ls {
+        /// Files or directories to list (default: all).
+        paths: Vec<String>,
+        /// Snapshot to list.
+        #[arg(short, long, default_value = "@")]
+        rev: String,
+        /// Also list ignored files and directories (working copy only).
+        #[arg(short, long)]
+        all: bool,
+        #[command(flatten)]
+        out: JsonOut,
     },
     /// Print a file's content at a snapshot.
     Cat {
@@ -350,10 +378,17 @@ pub enum Cmd {
     #[command(subcommand)]
     Remote(RemoteCmd),
     /// Send tags and their history to a remote (visibility-filtered).
+    ///
+    /// `--dry-run` shows what the push would send, writing nothing to the
+    /// remote (it only reads the remote's tags): which tags it creates,
+    /// moves or would have rejected, how many snapshots and objects it
+    /// sends and their size, and what stays here (embargoed history). For a
+    /// public remote it also lists every file whose content would become
+    /// public there, and the files it withholds, with the reason.
     Push {
-        /// Remote to push to.
-        #[arg(default_value = "origin")]
-        remote: String,
+        /// Remote to push to (default: origin; with --dry-run, every
+        /// configured remote).
+        remote: Option<String>,
         /// Only push these tags.
         #[arg(short, long)]
         tag: Vec<String>,
@@ -369,6 +404,14 @@ pub enum Cmd {
         /// (unless --force). With no --tag, nothing else is pushed.
         #[arg(short, long, value_name = "TAG")]
         delete: Vec<String>,
+        /// Show what would be sent, and send nothing.
+        #[arg(long, conflicts_with_all = ["full", "delete"])]
+        dry_run: bool,
+        /// With --dry-run: print one JSON document (`veil.push.plan/1`; see
+        /// docs/reference/json.md) instead of text. Errors then also print
+        /// a `veil.error/1` document.
+        #[arg(long, requires = "dry_run")]
+        json: bool,
     },
     /// Fetch tags and history from a remote.
     Pull {
@@ -460,7 +503,9 @@ impl Cmd {
             | Cmd::Tag(TagCmd::List { out })
             | Cmd::Secret(SecretCmd::List { out })
             | Cmd::Workspace(WsCmd::List { out })
-            | Cmd::Op(OpCmd::Log { out, .. }) => out,
+            | Cmd::Op(OpCmd::Log { out, .. })
+            | Cmd::Ls { out, .. } => out,
+            Cmd::Push { json, .. } => return *json,
             _ => return false,
         };
         out.json

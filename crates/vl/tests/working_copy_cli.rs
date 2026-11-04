@@ -97,10 +97,10 @@ fn quarantined_edits_keep_history_and_survive_checkouts() {
         "no deletion recorded:\n{st}"
     );
     assert!(
-        st.contains("Q cfg.js  (aws-access-key-id; edit held back; history keeps the previous version)"),
+        st.contains("Q cfg.js [quarantined]  (aws-access-key-id; edit held back; history keeps the previous version)"),
         "{st}"
     );
-    assert!(st.contains("Q leak.js  (aws-access-key-id; never recorded)"), "{st}");
+    assert!(st.contains("Q leak.js [quarantined]  (aws-access-key-id; never recorded)"), "{st}");
     assert!(
         st.contains("history keeps the previous version"),
         "warning explains it:\n{st}"

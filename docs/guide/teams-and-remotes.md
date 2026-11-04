@@ -120,6 +120,48 @@ The history of a rejected tag is not sent: which tags the remote takes is
 decided before anything is uploaded, so retrying a rejected push doesn't
 grow the remote.
 
+### Before you push: `--dry-run`
+
+`vl push --dry-run [REMOTE] [-t TAG…]` shows what the push would do, and
+sends nothing: with no remote named, for **every** configured remote. It
+only reads the remote (its tags and pack list) and takes no lock. For each
+remote it lists the tags it would create, move, leave or have rejected; how
+many snapshots and objects it would send, and their size; and what stays
+here. For a **public** remote it also lists every file whose content would
+become public there (`new`: never public there; `exposed`: there, but
+withheld until now; `modified`: new content), and the files it withholds,
+with the reason:
+
+```text
+$ vl push --dry-run
+mirror public ../mirror (no repository there yet: the push creates one)
+  create    main → 8a0a97dd
+  skipped   ops (cloaked tag is never pushed to a public remote)
+  would send 2 snapshot(s), 10 object(s) (4 tree(s), 4 file content(s), 0 encrypted): 2.7 KiB, 2.1 KiB packed
+  withheld  2 cloaked/embargoed object(s)
+  Would become public on mirror:
+    new            887  .veilpolicy
+    new              7  README.md
+    new             18  app.py
+  Withheld from mirror:
+    secrets/notes.md  (cloaked:team; public remotes never receive it)
+
+origin team ../hub
+  update    main 441e1419 → 8a0a97dd
+  update    ops 441e1419 → 8a0a97dd
+  would send 1 snapshot(s), 6 object(s) (2 tree(s), 2 file content(s), 1 encrypted): 1.0 KiB, 931 B packed
+Dry run: nothing was sent.
+```
+
+The plan is the push itself, stopped before it writes: the objects and tags
+it lists are exactly what `vl push` then sends (unless someone pushes to the
+remote in between). History withheld by an unreleased embargo is counted
+too, and files changed under an embargo are listed as withheld if you hold
+its key (otherwise only that the snapshot's tree is under an embargo).
+Like `vl push`, it exits 1 if a tag would be rejected or a tag named with
+`-t` would be held back. `--json` prints the plan as one document
+([`veil.push.plan/1`](../reference/json.md#veilpushplan1)).
+
 ### Deleting a tag
 
 A plain `vl push` never deletes anything on the remote. To delete a tag
@@ -204,7 +246,7 @@ Cloned /tmp/vdoc/hub into /tmp/vdoc/bobwc (6 objects, 2 files)
 bob$ vl status
 …
 Redacted (unreadable here; kept in history, absent on disk):
-  R secrets/notes.md  (cloaked:team; no key)
+  R secrets/notes.md [redacted]  (cloaked:team; no key)
 
 bob$ vl pull
 Pulled 0 object(s) from origin

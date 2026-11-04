@@ -162,7 +162,7 @@ $ vl log
 | `vl describe -m MSG [-r REV]` | Set the description of a change (default `@`). Does not start a new change |
 | `vl commit -m MSG [--no-advance]` | Describe `@`, then start a new, empty change on top of it. **Moves tags that pointed at the parent** to the committed change (in a cloaked workspace, only tags cloaked under its scope; with `--no-advance`, none) |
 | `vl new [REVS…] [-m MSG]` | Start a new change on top of `REVS` (default `@`); with several revisions, a merge. Moves no tags |
-| `vl files [-r REV]`, `vl cat PATH [-r REV]` | List a snapshot's files with their visibility, or print one |
+| `vl ls [-r REV] [PATHS…]`, `vl cat PATH [-r REV]` | List a snapshot's files with their tier (public, cloaked, isolated, …), or print one |
 
 In `vl log`: `@` is your working copy, `○` another snapshot, `×` one with
 conflicts, `◆` the root. `✓` is a good signature from the author (`✓bob`

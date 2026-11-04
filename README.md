@@ -153,6 +153,8 @@ vl scope revoke team veil1<…>   # rotates the key: new content is unreadable t
 vl remote add origin alice@build.example.com:repos/proj   # any SSH server: no vl needed there
 vl remote add mirror ../public-mirror --public
 vl push origin        # team members receive ciphertext + key rings
+vl ls                 # every file's tier: public, cloaked:team, isolated, quarantined…
+vl push --dry-run     # per remote: tags, objects, bytes, what becomes public, what is withheld
 vl push mirror        # cloaked blobs and cloaked tags are withheld
 
 # Delayed-visibility merge (e.g. a security fix), developed out of sight.
@@ -194,7 +196,7 @@ vl <command> [args]     global: -R <repo>  --no-snapshot
 Setup        init [path] · clone <src> [dest] · identity show|new
              (<src>, remotes: a path, ssh://[user@]host[:port]/path or [user@]host:path)
 Inspect      status|st · log [-n N] · show [rev] · diff [-r rev | --from a --to b] [--stat]
-             files [-r rev] · cat <path> [-r rev] · evolog [-r rev]
+             ls [-r rev] [paths…] [--all] · files [-r rev] · cat <path> [-r rev] · evolog [-r rev]
 History      new [revs…] [-m] · commit -m · describe [-r rev] -m · edit <rev>
              abandon [rev] · rebase -s <rev> -d <dest…> · squash [-r rev]
              restore [paths…] [--from rev]
@@ -210,7 +212,7 @@ Workspaces   ws list|new <name> [-r rev] [--cloak [S]]|switch <name>|rm <name>
              ws cat <name> <path> · ws write <name> <path> < stdin
 Op log       op log [-n N] · op restore <id> · undo · watch [--interval-ms N]
 Sync         remote add <name> <path|ssh-url> [--public]|list|rm
-             push [remote] [-t tag…] [--force] [--full] · pull [remote] [--full]
+             push [remote] [-t tag…] [--force] [--full] [--dry-run [--json]] · pull [remote] [--full]
 Git          git import <path|url> [--remote R] · git remote add <name> <url>|list|rm
              git fetch [remote] · git pull [remote] · git push [remote] [-t tag…] [--force]
              git export [-t tag…]
