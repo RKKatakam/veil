@@ -261,6 +261,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             };
             match &e {
                 Some(e) if e.kind.is_file_like() => {}
+                Some(e) if e.kind.is_special() => bail!("{}", safe(&e.kind.not_supported_yet(p.as_str()).to_string())),
                 Some(_) => bail!("{} is a directory in {}, not a file (`vl files -r {}` lists its files)", safe(p.as_str()), id.short(), id.short()),
                 None if p.is_root() => bail!("'{}' is the repository's root directory, not a file", safe(path)),
                 None => bail!("{} does not exist in {}", safe(p.as_str()), id.short()),
@@ -1136,7 +1137,8 @@ fn restored_as_recorded(repo: &veil_core::repo::Repo, e: &veil_core::TreeEntry) 
             Sealing::Relabelled(actual) => !actual.is_public(),
             _ => !e.visibility.is_public(),
         },
-        veil_core::EntryKind::Dir => false,
+        // Format 5: not restored as links yet (the working-copy stream).
+        veil_core::EntryKind::Dir | veil_core::EntryKind::Symlink | veil_core::EntryKind::Gitlink => false,
     })
 }
 

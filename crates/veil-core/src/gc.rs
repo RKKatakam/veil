@@ -276,7 +276,8 @@ impl Mark<'_> {
                 };
                 match e.kind {
                     EntryKind::Dir => stack.push((e.id, p)),
-                    EntryKind::File => {
+                    // Symlink targets and gitlink pointers are blobs too.
+                    EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink => {
                         if self.reach.insert(e.id) {
                             self.hint(HINT_FILE, &p, e.id);
                         }
@@ -288,6 +289,26 @@ impl Mark<'_> {
                     }
                     EntryKind::Conflict => self.conflict(e.id, &p),
                 }
+            }
+        }
+    }
+
+    /// An annotated tag object (format 5): kept, and its target returned
+    /// as a root.
+    fn atag(&mut self, id: ObjectId) -> Option<ObjectId> {
+        if !self.reach.insert(id) {
+            return None;
+        }
+        match self.store.get(&id) {
+            Ok(Object::Atag(a)) => Some(a.target),
+            Ok(other) => {
+                self.incomplete
+                    .push(format!("annotated tag {} is a {}", id.short(), other.kind_name()));
+                None
+            }
+            Err(e) => {
+                self.incomplete.push(format!("annotated tag {}: {e}", id.short()));
+                None
             }
         }
     }
@@ -329,6 +350,12 @@ impl Mark<'_> {
             }
             Ok(Object::Tree(_)) => self.tree(id, String::new()),
             Ok(Object::Conflict(_)) => self.conflict(id, ""),
+            Ok(Object::Atag(_)) => {
+                if let Some(t) = self.atag(id) {
+                    self.snapshots([t]);
+                    self.trees_of_snapshots();
+                }
+            }
             Ok(Object::Blob(_)) => {
                 self.reach.insert(id);
             }
@@ -441,8 +468,15 @@ pub fn gc(repo: &mut Repo, opts: &GcOptions) -> Result<GcReport> {
     }
     roots.extend(opts.extra_roots.iter().copied());
     roots.extend(checkout_snapshots(&*backend));
-    roots.sort();
-    roots.dedup();
+    // Annotated tags (format 5) are kept with their targets.
+    let mut annotations = head_op.view.annotations();
+    for (id, op) in &ops {
+        if retained.contains(id) {
+            annotations.extend(op.view.annotations());
+        }
+    }
+    annotations.sort();
+    annotations.dedup();
     let mut mark = Mark {
         store: &store,
         reach: HashSet::new(),
@@ -450,6 +484,11 @@ pub fn gc(repo: &mut Repo, opts: &GcOptions) -> Result<GcReport> {
         snaps: Vec::new(),
         incomplete,
     };
+    for a in annotations {
+        roots.extend(mark.atag(a));
+    }
+    roots.sort();
+    roots.dedup();
     mark.snapshots(roots);
     mark.trees_of_snapshots();
     for m in &markers {

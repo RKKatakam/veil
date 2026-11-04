@@ -12,7 +12,7 @@ pub const VERSION: &str = concat!(
     env!("VL_GIT_COMMIT"),
     ", repository format ",
     // Kept in step with `veil_core::repo::REPO_FORMAT_VERSION` by a test.
-    "4",
+    "5",
     ")"
 );
 
@@ -21,7 +21,7 @@ pub const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\ncommit: ",
     env!("VL_GIT_COMMIT"),
-    "\nrepository format: 4",
+    "\nrepository format: 5",
     "\ntarget: ",
     env!("VL_TARGET"),
 );

@@ -142,6 +142,7 @@ fn mallory_pushes(hub: Arc<MemoryBackend>, main: ObjectId, alice_pub: &str, mall
             ..veil_core::ConflictTerm::of(&e)
         };
         let mallorys = veil_core::ConflictTerm {
+            kind: veil_core::object::TermKind::File,
             id: store.store_file(MALLORYS, &mal).unwrap(),
             size: MALLORYS.len() as u64,
             executable: false,

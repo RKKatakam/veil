@@ -112,7 +112,7 @@ fn metadata_writes_inside_and_outside_transactions_interleave_safely() {
             let mut repo = Repo::open(fs, Some(alice), "alice").unwrap();
             for i in 0..3 {
                 let mut tx = repo.transaction(format!("tag {t}-{i}")).unwrap();
-                tx.view.tags.insert(format!("t{t}-{i}"), Tag { target: base, cloak: None });
+                tx.view.tags.insert(format!("t{t}-{i}"), Tag::new(base, None));
                 tx.commit().unwrap();
                 remote::push(&mut repo, remote_fs.clone(), false, &[], false).unwrap();
             }

@@ -338,7 +338,7 @@ fn seal_dir(
             }
             // Converted to its file of markers above.
             EntryKind::Conflict => unreachable!("conflict entries are converted first"),
-            EntryKind::File => {
+            EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink => {
                 // A public label is a claim: content that is really sealed
                 // (a forged label) keeps its sealing, under its real label.
                 let e = match e.visibility.is_public() {
@@ -355,7 +355,7 @@ fn seal_dir(
                     let ne = TreeEntry {
                         id: store.store_file(&data, vis)?,
                         visibility: vis.clone(),
-                        fallback: be.filter(|x| x.kind == EntryKind::File).map(|x| x.id),
+                        fallback: be.filter(|x| x.kind == e.kind).map(|x| x.id),
                         ..e.clone()
                     };
                     // New ciphertext; its fallback is in the base (above).
@@ -520,7 +520,7 @@ fn normalize_dir(
                 let child = normalize_frame(store, &e.id, sub_dest, path)?;
                 stack.push(child);
             }
-            EntryKind::File => {
+            EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink => {
                 let ne = normalize_file(store, &e, de.as_ref(), &path, opts, report)?;
                 settle(f, &e, ne);
             }
@@ -559,7 +559,7 @@ fn normalize_file(
     let unchanged_from_dest = de.is_some_and(|x| x.same_content(e));
     let desired = desired_visibility(opts.policy, &path, opts.cloak);
     let differs_from_dest_seal = |e: &TreeEntry, de: Option<&TreeEntry>| {
-        de.is_some_and(|d| d.kind == EntryKind::File && matches!(d.visibility, Visibility::Cloaked { .. }) && d.visibility != e.visibility)
+        de.is_some_and(|d| d.kind.holds_blob() && matches!(d.visibility, Visibility::Cloaked { .. }) && d.visibility != e.visibility)
     };
     // Labels are claims (BUG-103). Whenever this entry may be resealed,
     // published, or resealed for the destination's audience, both labels
@@ -585,7 +585,7 @@ fn normalize_file(
     };
     let checked_d;
     let de = match de {
-        Some(d) if d.kind == EntryKind::File && !d.visibility.is_public() && !unchanged_from_dest => match verify_sealing(store, d)? {
+        Some(d) if d.kind.holds_blob() && !d.visibility.is_public() && !unchanged_from_dest => match verify_sealing(store, d)? {
             Sealing::Verified => Some(d),
             Sealing::Relabelled(actual) => {
                 checked_d = TreeEntry {
@@ -609,7 +609,7 @@ fn normalize_file(
         d => d,
     };
     let mut ne = Some(e.clone());
-    let dest_sealed = de.filter(|d| d.kind == EntryKind::File && matches!(d.visibility, Visibility::Cloaked { .. }));
+    let dest_sealed = de.filter(|d| d.kind.holds_blob() && matches!(d.visibility, Visibility::Cloaked { .. }));
     match (&e.visibility, desired) {
         // The destination holds this file sealed and the merged
         // side would widen or move its audience (e.g. a PR whose
@@ -736,7 +736,7 @@ fn declassify(
         if !findings.is_empty() {
             report.quarantined.push((path.clone(), findings));
             // Keep what the destination already had at this path.
-            return Ok(dest.filter(|d| d.kind == EntryKind::File).cloned());
+            return Ok(dest.filter(|d| d.kind == e.kind).cloned());
         }
     }
     report.declassified.push(path.clone());
@@ -791,7 +791,7 @@ fn seal_paths(store: &ObjectStore, tree: &ObjectId, dest: Option<&ObjectId>, pat
         let Some(e) = t.get(name).cloned() else { continue };
         let de = d.as_deref().and_then(|d| d.get(name)).cloned();
         let ne = match e.kind {
-            EntryKind::File if rest.iter().any(|r| r.is_empty()) => {
+            EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink if rest.iter().any(|r| r.is_empty()) => {
                 let data = store.read_blob(&e.id)?;
                 TreeEntry {
                     id: store.store_file(&data, vis)?,
@@ -808,7 +808,7 @@ fn seal_paths(store: &ObjectStore, tree: &ObjectId, dest: Option<&ObjectId>, pat
                     ..e
                 }
             }
-            EntryKind::File | EntryKind::Conflict => continue,
+            EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink | EntryKind::Conflict => continue,
         };
         t.insert(ne);
     }
@@ -893,7 +893,7 @@ pub fn seal_moved(store: &ObjectStore, src: ObjectId, pre: ObjectId, post: Objec
             Some(now.clone())
         } else {
             match cur.kind {
-                EntryKind::File if cur.visibility.is_public() && c.path.as_str() != POLICY_FILE && now.visibility == vis => {
+                EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink if cur.visibility.is_public() && c.path.as_str() != POLICY_FILE && now.visibility == vis => {
                     match verified_entry(store, &cur)? {
                         Some(real) => Some(real),
                         None => match store.read_entry(&cur) {
@@ -985,7 +985,7 @@ fn seal_introduced_dir(store: &ObjectStore, tree: &ObjectId, base: Option<Object
                 }
                 // A public label is a claim: content that is really sealed
                 // keeps its own sealing (under its real label).
-                EntryKind::File if e.visibility.is_public() && path.as_str() != POLICY_FILE => {
+                EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink if e.visibility.is_public() && path.as_str() != POLICY_FILE => {
                     match verified_entry(store, &e)? {
                         Some(real) => ne = real,
                         None => {
@@ -1008,7 +1008,7 @@ fn seal_introduced_dir(store: &ObjectStore, tree: &ObjectId, base: Option<Object
                     }
                 }
                 // Sealed content keeps its sealing.
-                EntryKind::File => {}
+                EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink => {}
             }
         }
         f.changed |= ne != e;
@@ -1024,7 +1024,7 @@ fn publicly_seen(store: &ObjectStore, e: Option<&TreeEntry>) -> Result<BTreeSet<
     let Some(e) = e else { return Ok(out) };
     let mut terms = Vec::new();
     match e.kind {
-        EntryKind::File => terms.push(ConflictTerm::of(e)),
+        EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink => terms.push(ConflictTerm::of(e)),
         EntryKind::Conflict => match store.conflict(&e.id) {
             Ok(c) => terms.extend(c.interleaved().flatten().cloned()),
             Err(err) if err.is_unreadable() || err.is_not_found() || matches!(err, VeilError::Corrupt(..)) => {}

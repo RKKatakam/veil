@@ -146,6 +146,11 @@ fn transition_steps(from: u32) -> Vec<&'static str> {
         // ids and signatures of every snapshot above them. Merges made
         // after the upgrade record conflicts as conflict entries.
         3 => vec![],
+        // Git parity (symlinks, gitlinks, annotated tags, the colocated
+        // marker): nothing to rewrite. Links recorded before the upgrade
+        // stayed unrecorded (a format-4 snapshot never holds one), so no
+        // object, id or signature changes.
+        4 => vec![],
         _ => vec![],
     }
 }
@@ -239,6 +244,19 @@ fn notes_for(from: u32, to: u32, report: &UpgradeReport) -> Vec<String> {
         notes.push(
             "a remote or clone still at format 3 refuses conflict entries: upgrade it with `vl upgrade --remote <name>` \
              before pushing a change that holds an unresolved conflict"
+                .into(),
+        );
+    }
+    if from < crate::object::GIT_PARITY_REPO_FORMAT && to >= crate::object::GIT_PARITY_REPO_FORMAT {
+        notes.push(
+            "the repository may now record symlinks and Git submodule pointers (gitlinks), and annotated \
+             (signed) tags; nothing recorded before the upgrade changes"
+                .into(),
+        );
+        notes.push(
+            "a remote or clone still at format 4 refuses symlinks, gitlinks and annotated tags: upgrade it with \
+             `vl upgrade --remote <name>` before pushing them; vl releases that only know format 4 refuse this \
+             repository"
                 .into(),
         );
     }

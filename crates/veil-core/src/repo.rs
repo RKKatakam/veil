@@ -49,10 +49,11 @@ pub const VEIL_DIR: &str = ".veil";
 /// | 2 | vl 1.0.0 | binary trees (`TreeEncoding::Binary`) |
 /// | 3 | vl 1.0.0 | standard crypto: AES-SIV sealed objects (`veil:sea2`), HPKE-wrapped ring keys (ring format 3) |
 /// | 4 | vl 1.0.0 | first-class conflicts: conflict objects (`veil:conf`) and conflict tree entries |
+/// | 5 | vl 1.0.0 | Git parity: symlink and gitlink tree entries and conflict terms, annotated tags (`veil:atag`, `Tag::annotation`, `View::remote_release_tags`), the `colocated` marker |
 ///
 /// Every format up to this one is read; see `docs/FORMAT.md` and
 /// `docs/CRYPTO.md`.
-pub const REPO_FORMAT: u32 = 4;
+pub const REPO_FORMAT: u32 = 5;
 
 /// Oldest repository format this build reads (and keeps writing, unchanged,
 /// until `vl upgrade`).
@@ -62,7 +63,7 @@ pub const MIN_REPO_FORMAT: u32 = 1;
 pub fn min_vl_for_format(format: u32) -> &'static str {
     match format {
         0 | 1 => "0.1.0",
-        2..=4 => "1.0.0",
+        2..=5 => "1.0.0",
         _ => "a newer release",
     }
 }
@@ -107,6 +108,43 @@ pub struct RepoConfig {
     /// of releases that do not know the format yet ("needs vl ≥ X").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_vl: Option<String>,
+    /// Set while the project directory is colocated with a Git repository
+    /// (`vl git colocate`, format 5): `vl` keeps the Git side's guards
+    /// (excludes, skip-worktree bits, the pre-push check). Only a format-5
+    /// repository may carry it, so an older vl, which would not keep the
+    /// guards, refuses the directory by its format. Device-local, like the
+    /// whole file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub colocated: Option<Colocated>,
+}
+
+/// The `colocated` marker of `repo.json` (see [`RepoConfig::colocated`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Colocated {
+    /// The Git directory, relative to the project root (normally `.git`).
+    pub git_dir: String,
+}
+
+impl Colocated {
+    /// The Git directory must be a plain relative path inside the project
+    /// (no `..`, not absolute, not inside `.veil`).
+    pub fn validate(&self) -> Result<()> {
+        let ok = !self.git_dir.is_empty()
+            && !self.git_dir.starts_with('/')
+            && !self.git_dir.contains('\0')
+            && !self.git_dir.contains('\\')
+            && self.git_dir.split('/').all(|c| !c.is_empty() && c != "." && c != "..")
+            && !crate::object::is_reserved_name(self.git_dir.split('/').next().unwrap_or(""));
+        if ok {
+            Ok(())
+        } else {
+            Err(VeilError::Corrupt(
+                "repo.json".into(),
+                format!("invalid colocated Git directory {:?}", self.git_dir),
+            ))
+        }
+    }
 }
 
 impl RepoConfig {
@@ -120,7 +158,21 @@ impl RepoConfig {
                 env!("CARGO_PKG_VERSION")
             )),
             _ => e,
-        })
+        })?;
+        if let Some(c) = &self.colocated {
+            if self.format < crate::object::GIT_PARITY_REPO_FORMAT {
+                return Err(VeilError::Corrupt(
+                    "repo.json".into(),
+                    format!(
+                        "a colocated repository must be at format {} or later (this one says {})",
+                        crate::object::GIT_PARITY_REPO_FORMAT,
+                        self.format
+                    ),
+                ));
+            }
+            c.validate()?;
+        }
+        Ok(())
     }
 }
 
@@ -215,6 +267,7 @@ impl Repo {
             repo_id: hex::encode(random_bytes::<16>()),
             remotes: BTreeMap::new(),
             min_vl: (format > 1).then(|| min_vl_for_format(format).to_string()),
+            colocated: None,
         };
         let has_identity = identity.is_some();
         let keys = Arc::new(Keychain::new(backend.clone(), identity, config.repo_id.clone()));
@@ -247,6 +300,7 @@ impl Repo {
             );
         }
         let ops = OpStore::new(backend.clone());
+        ops.set_format(format);
         let op_id = ops.put(&Operation {
             parents: vec![],
             timestamp: now_millis(),
@@ -283,6 +337,7 @@ impl Repo {
         store.set_format(config.format);
         let root_id = store.put_snapshot(&Snapshot::root(store.empty_tree()?))?;
         let ops = OpStore::new(backend.clone());
+        ops.set_format(config.format);
         let op_id = ops.head()?;
         let view = ops.get(&op_id)?.view;
         Ok(Repo {
@@ -353,6 +408,7 @@ impl Repo {
         config.check_supported()?;
         write_config(&*self.backend, &config)?;
         self.store.set_format(config.format);
+        self.ops.set_format(config.format);
         self.config = config;
         Ok(())
     }

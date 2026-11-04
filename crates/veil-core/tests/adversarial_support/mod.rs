@@ -217,7 +217,7 @@ pub fn evil_remote(build: impl FnOnce(&Repo) -> ObjectId) -> (Arc<MemoryBackend>
 
 pub fn set_remote_tag(remote: &mut Repo, name: &str, target: ObjectId) {
     let mut tx = remote.transaction("evil").unwrap();
-    tx.view.tags.insert(name.to_string(), Tag { target, cloak: None });
+    tx.view.tags.insert(name.to_string(), Tag::new(target, None));
     tx.view.heads.insert(target);
     tx.commit().unwrap();
 }

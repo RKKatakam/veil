@@ -13,6 +13,8 @@
 //!   of a file that a merge could not combine, as jj records them (adds and
 //!   removes), each with its own visibility. Referenced by tree entries of
 //!   kind [`EntryKind::Conflict`] (repository format 4).
+//! * `Atag`     — an annotated (optionally signed) tag ([`crate::tag_object::Atag`],
+//!   `veil:atag`, repository format 5), named by `oplog::Tag::annotation`.
 //! * `Sealed`   — a [`crate::crypto::Envelope`] wrapping the encoding of any
 //!   other object. Sealed objects are self-describing: the envelope names the
 //!   scope whose key opens it. Two tags: `veil:seal` (XChaCha20-Poly1305,
@@ -40,6 +42,7 @@ use crate::{
     error::{Result, VeilError},
     id::{ChangeId, ObjectId},
     identity::{Identity, Signature},
+    tag_object::Atag,
 };
 
 /// Signature context for snapshots (see [`Snapshot::sign`]).
@@ -50,6 +53,8 @@ const TREE_TAG: &[u8] = b"veil:tree\n";
 const SNAP_TAG: &[u8] = b"veil:snap\n";
 /// Conflict object (repository format 4).
 const CONF_TAG: &[u8] = b"veil:conf\n";
+/// Annotated tag object (repository format 5).
+pub(crate) const ATAG_TAG: &[u8] = b"veil:atag\n";
 const SEAL_TAG: &[u8] = b"veil:seal\n";
 /// Sealed object, AES-SIV envelope (repository format 3).
 const SEAL_AES_SIV_TAG: &[u8] = b"veil:sea2\n";
@@ -59,6 +64,11 @@ pub const AES_SIV_REPO_FORMAT: u32 = 3;
 /// Lowest repository format that may store conflict objects (`veil:conf`)
 /// and trees with conflict entries.
 pub const CONFLICT_REPO_FORMAT: u32 = 4;
+/// Lowest repository format that may store the Git-parity additions:
+/// symlink and gitlink tree entries (and conflict terms), annotated tag
+/// objects (`veil:atag`), `Tag::annotation`, `View::remote_release_tags`
+/// and the `colocated` marker of `repo.json`.
+pub const GIT_PARITY_REPO_FORMAT: u32 = 5;
 /// First payload byte of the conflict object encoding.
 pub const ENCODING_CONFLICT: u8 = 0x04;
 /// Most removes (bases) a conflict object may hold: a conflict of more than
@@ -127,12 +137,91 @@ pub enum EntryKind {
     /// entry itself is always public, not executable, with no size or
     /// fallback (its terms carry their own); repository format 4.
     Conflict,
+    /// A symbolic link: `id` names the (plaintext or sealed) blob of the
+    /// link's target bytes, sealed like file content under the policy of
+    /// the link's own path. Never executable; repository format 5.
+    Symlink,
+    /// A Git submodule pointer: `id` names the (plaintext or sealed) blob
+    /// `"<hex commit id>\n"`. Never executable, never descended into;
+    /// repository format 5.
+    Gitlink,
 }
 
 impl EntryKind {
     /// A file or a conflicted file: something checkout writes as a file.
     pub fn is_file_like(self) -> bool {
         matches!(self, EntryKind::File | EntryKind::Conflict)
+    }
+
+    /// A symlink or a gitlink (repository format 5): its object holds
+    /// content (a target, a commit id) that is not a file's bytes.
+    pub fn is_special(self) -> bool {
+        matches!(self, EntryKind::Symlink | EntryKind::Gitlink)
+    }
+
+    /// A file, symlink or gitlink: an entry whose `id` names a blob (or
+    /// its sealed form), sealed, withheld and published by the same rules.
+    pub fn holds_blob(self) -> bool {
+        matches!(self, EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink)
+    }
+
+    /// Name of the kind as JSON trees and messages spell it.
+    pub fn name(self) -> &'static str {
+        match self {
+            EntryKind::File => "file",
+            EntryKind::Dir => "dir",
+            EntryKind::Conflict => "conflict",
+            EntryKind::Symlink => "symlink",
+            EntryKind::Gitlink => "gitlink",
+        }
+    }
+
+    /// The error for reading a format-5 entry where this build does not
+    /// support it yet (checkout, the builder, the Git export, …). The
+    /// entry itself is kept: merges, diffs, gc, fsck and sync carry it.
+    pub fn not_supported_yet(self, path: &str) -> VeilError {
+        VeilError::Unsupported(format!(
+            "{path:?} is a {} entry, which vl {} cannot check out or record yet",
+            self.name(),
+            env!("CARGO_PKG_VERSION"),
+        ))
+    }
+}
+
+/// The kind of one version of a file in a [`Conflict`] (repository format 5
+/// adds links: a link/file or link/link conflict).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TermKind {
+    #[default]
+    File,
+    Symlink,
+    Gitlink,
+}
+
+impl TermKind {
+    fn is_file(&self) -> bool {
+        *self == TermKind::File
+    }
+
+    /// The term kind of an entry kind (`None` for directories and
+    /// conflicts, which are never terms).
+    pub fn of(kind: EntryKind) -> Option<TermKind> {
+        match kind {
+            EntryKind::File => Some(TermKind::File),
+            EntryKind::Symlink => Some(TermKind::Symlink),
+            EntryKind::Gitlink => Some(TermKind::Gitlink),
+            EntryKind::Dir | EntryKind::Conflict => None,
+        }
+    }
+
+    /// The entry kind holding a term of this kind.
+    pub fn entry_kind(self) -> EntryKind {
+        match self {
+            TermKind::File => EntryKind::File,
+            TermKind::Symlink => EntryKind::Symlink,
+            TermKind::Gitlink => EntryKind::Gitlink,
+        }
     }
 }
 
@@ -234,12 +323,20 @@ impl TreeEntry {
         self.kind != EntryKind::Conflict
             || (self.size == 0 && !self.executable && self.visibility.is_public() && self.fallback.is_none())
     }
+
+    /// A symlink or gitlink is never executable.
+    fn special_fields_valid(&self) -> bool {
+        !self.kind.is_special() || !self.executable
+    }
 }
 
 /// One version of a file in a [`Conflict`]: what a tree entry of kind
 /// [`EntryKind::File`] holds, without the name.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConflictTerm {
+    /// File (the default, omitted), symlink or gitlink (format 5).
+    #[serde(default, skip_serializing_if = "TermKind::is_file")]
+    pub kind: TermKind,
     pub id: ObjectId,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub size: u64,
@@ -252,9 +349,12 @@ pub struct ConflictTerm {
 }
 
 impl ConflictTerm {
-    /// The term of a file entry.
+    /// The term of a file, symlink or gitlink entry (a directory or
+    /// conflict entry is never a term; callers check, and get a file term).
     pub fn of(e: &TreeEntry) -> ConflictTerm {
+        debug_assert!(TermKind::of(e.kind).is_some(), "{:?} is not a conflict term", e.kind);
         ConflictTerm {
+            kind: TermKind::of(e.kind).unwrap_or_default(),
             id: e.id,
             size: e.size,
             executable: e.executable,
@@ -263,11 +363,12 @@ impl ConflictTerm {
         }
     }
 
-    /// The file entry `name` holding this term.
+    /// The entry `name` holding this term (a file, or in format 5 a
+    /// symlink or gitlink).
     pub fn entry(&self, name: &str) -> TreeEntry {
         TreeEntry {
             name: name.to_string(),
-            kind: EntryKind::File,
+            kind: self.kind.entry_kind(),
             id: self.id,
             size: self.size,
             executable: self.executable,
@@ -278,7 +379,7 @@ impl ConflictTerm {
 
     /// Same version: equal in everything but the (claimed) size.
     pub fn same(&self, other: &ConflictTerm) -> bool {
-        self.id == other.id && self.executable == other.executable && self.visibility == other.visibility && self.fallback == other.fallback
+        self.kind == other.kind && self.id == other.id && self.executable == other.executable && self.visibility == other.visibility && self.fallback == other.fallback
     }
 }
 
@@ -317,7 +418,15 @@ impl Conflict {
         if self.removes.len() > MAX_CONFLICT_REMOVES {
             return Err(conflict_corrupt(format!("more than {MAX_CONFLICT_REMOVES} removes")));
         }
+        if self.interleaved().flatten().any(|t| t.kind != TermKind::File && t.executable) {
+            return Err(conflict_corrupt("a symlink or gitlink term is executable"));
+        }
         Ok(())
+    }
+
+    /// Does a term hold a symlink or gitlink (repository format 5)?
+    pub fn has_special_terms(&self) -> bool {
+        self.interleaved().flatten().any(|t| t.kind != TermKind::File)
     }
 
     /// Every term, adds and removes interleaved as stored: `add0, remove0,
@@ -349,7 +458,9 @@ impl Conflict {
     ///            | label_len uvarint | label            if tier != public
     ///            | fallback [32]                        if flags.FALLBACK
     /// flags    = bit 0 PRESENT (set) · bit 1 EXECUTABLE · bit 2 SIZE ·
-    ///            bit 3 FALLBACK · bits 4–5 tier as in trees · bits 6–7 reserved
+    ///            bit 3 FALLBACK · bits 4–5 tier as in trees ·
+    ///            bits 6–7 term kind (format 5): 0 file, 1 symlink,
+    ///            2 gitlink, 3 reserved; EXECUTABLE clear unless a file
     /// ```
     pub fn encode_payload(&self) -> Vec<u8> {
         let mut out = vec![ENCODING_CONFLICT];
@@ -360,7 +471,7 @@ impl Conflict {
                 continue;
             };
             let (tier, label) = tier_of(&t.visibility);
-            let mut flags = C_PRESENT | (tier << TIER_SHIFT);
+            let mut flags = C_PRESENT | (tier << TIER_SHIFT) | (term_kind_bits(t.kind) << C_KIND_SHIFT);
             if t.executable {
                 flags |= C_EXEC;
             }
@@ -412,11 +523,19 @@ impl Conflict {
             if flags & C_PRESENT == 0 {
                 return Err(conflict_corrupt("absent term with flags set"));
             }
-            if flags & F_RESERVED != 0 {
-                return Err(VeilError::Unsupported(format!(
-                    "conflict term uses flags {flags:#04x} that vl {} does not know; this repository needs a newer vl",
-                    env!("CARGO_PKG_VERSION")
-                )));
+            let kind = match (flags & C_KIND_MASK) >> C_KIND_SHIFT {
+                0 => TermKind::File,
+                1 => TermKind::Symlink,
+                2 => TermKind::Gitlink,
+                _ => {
+                    return Err(VeilError::Unsupported(format!(
+                        "conflict term uses flags {flags:#04x} that vl {} does not know; this repository needs a newer vl",
+                        env!("CARGO_PKG_VERSION")
+                    )))
+                }
+            };
+            if kind != TermKind::File && flags & C_EXEC != 0 {
+                return Err(conflict_corrupt("a symlink or gitlink term is executable"));
             }
             let id = r.id().map_err(corrupt)?;
             let size = if flags & C_SIZE != 0 {
@@ -440,6 +559,7 @@ impl Conflict {
             };
             let fallback = if flags & C_FALLBACK != 0 { Some(r.id().map_err(corrupt)?) } else { None };
             terms.push(Some(ConflictTerm {
+                kind,
                 id,
                 size,
                 executable: flags & C_EXEC != 0,
@@ -552,6 +672,11 @@ impl Tree {
         self.entries.iter().any(|e| e.kind == EntryKind::Conflict)
     }
 
+    /// Does the tree hold a symlink or gitlink entry (repository format 5)?
+    pub fn has_special_entries(&self) -> bool {
+        self.entries.iter().any(|e| e.kind.is_special())
+    }
+
     /// Structural validity: every name passes [`validate_entry_name`] and
     /// the entries are strictly sorted by name (so no duplicates). Lookups
     /// use binary search, so an unsorted tree would show different files to
@@ -564,6 +689,12 @@ impl Tree {
                 return Err(VeilError::Corrupt(
                     "tree".into(),
                     format!("conflict entry {:?} carries file fields", truncate_for_error(&e.name)),
+                ));
+            }
+            if !e.special_fields_valid() {
+                return Err(VeilError::Corrupt(
+                    "tree".into(),
+                    format!("{} entry {:?} is executable", e.kind.name(), truncate_for_error(&e.name)),
                 ));
             }
             if let Some(p) = prev {
@@ -594,7 +725,10 @@ impl Tree {
 //   flags   = bit 0 DIR, bit 1 EXECUTABLE, bit 2 SIZE, bit 3 FALLBACK,
 //             bits 4-5 tier (0 public, 1 cloaked, 2 embargoed, 3 reserved),
 //             bit 6 CONFLICT (format 4: `id` names a conflict object; every
-//             other bit clear), bit 7 reserved (must be 0)
+//             other bit clear), bit 7 KIND (format 5: a `kind` byte follows
+//             the flags, 1 symlink or 2 gitlink; DIR, EXECUTABLE and
+//             CONFLICT clear)
+//   entry  += kind u8 (right after flags)  if flags & KIND
 //
 // `uvarint` is unsigned LEB128 in its shortest form. Canonical by
 // construction: every field has exactly one representation, defaults are
@@ -608,12 +742,27 @@ const F_FALLBACK: u8 = 1 << 3;
 const TIER_SHIFT: u8 = 4;
 const TIER_MASK: u8 = 0b11 << TIER_SHIFT;
 const F_CONFLICT: u8 = 1 << 6;
-const F_RESERVED: u8 = 0b1000_0000;
+/// Format 5: a kind byte follows the flags.
+const F_KIND: u8 = 1 << 7;
+/// Kind bytes after `F_KIND` (0 and 3–255 are `Unsupported`).
+const KIND_SYMLINK: u8 = 1;
+const KIND_GITLINK: u8 = 2;
 // Conflict term flags (see `Conflict::encode_payload`).
 const C_PRESENT: u8 = 1 << 0;
 const C_EXEC: u8 = 1 << 1;
 const C_SIZE: u8 = 1 << 2;
 const C_FALLBACK: u8 = 1 << 3;
+/// Bits 6–7 of a conflict term's flags: its kind (format 5).
+const C_KIND_SHIFT: u8 = 6;
+const C_KIND_MASK: u8 = 0b11 << C_KIND_SHIFT;
+
+fn term_kind_bits(k: TermKind) -> u8 {
+    match k {
+        TermKind::File => 0,
+        TermKind::Symlink => 1,
+        TermKind::Gitlink => 2,
+    }
+}
 const TIER_PUBLIC: u8 = 0;
 const TIER_CLOAKED: u8 = 1;
 const TIER_EMBARGOED: u8 = 2;
@@ -705,10 +854,21 @@ impl Tree {
             out.extend_from_slice(e.name.as_bytes());
             let (tier, label) = tier_of(&e.visibility);
             let mut flags = tier << TIER_SHIFT;
-            match e.kind {
-                EntryKind::Dir => flags |= F_DIR,
-                EntryKind::Conflict => flags |= F_CONFLICT,
-                EntryKind::File => {}
+            let kind_byte = match e.kind {
+                EntryKind::Dir => {
+                    flags |= F_DIR;
+                    None
+                }
+                EntryKind::Conflict => {
+                    flags |= F_CONFLICT;
+                    None
+                }
+                EntryKind::File => None,
+                EntryKind::Symlink => Some(KIND_SYMLINK),
+                EntryKind::Gitlink => Some(KIND_GITLINK),
+            };
+            if kind_byte.is_some() {
+                flags |= F_KIND;
             }
             if e.executable {
                 flags |= F_EXEC;
@@ -720,6 +880,9 @@ impl Tree {
                 flags |= F_FALLBACK;
             }
             out.push(flags);
+            if let Some(k) = kind_byte {
+                out.push(k);
+            }
             out.extend_from_slice(&e.id.0);
             if e.size != 0 {
                 put_uvarint(&mut out, e.size);
@@ -755,13 +918,30 @@ impl Tree {
         for _ in 0..count {
             let name = r.string()?;
             let flags = r.byte()?;
-            if flags & F_RESERVED != 0 {
-                return Err(VeilError::Unsupported(format!(
-                    "tree entry {:?} uses flags {flags:#04x} that vl {} does not know; this repository needs a newer vl",
-                    truncate_for_error(&name),
-                    env!("CARGO_PKG_VERSION")
-                )));
-            }
+            let special = if flags & F_KIND != 0 {
+                let k = r.byte()?;
+                let kind = match k {
+                    KIND_SYMLINK => EntryKind::Symlink,
+                    KIND_GITLINK => EntryKind::Gitlink,
+                    _ => {
+                        return Err(VeilError::Unsupported(format!(
+                            "tree entry {:?} uses entry kind {k}, which vl {} does not know; this repository needs a newer vl",
+                            truncate_for_error(&name),
+                            env!("CARGO_PKG_VERSION")
+                        )))
+                    }
+                };
+                if flags & (F_DIR | F_EXEC | F_CONFLICT) != 0 {
+                    return Err(tree_corrupt(format!(
+                        "{} entry {:?} carries the directory, executable or conflict flag",
+                        kind.name(),
+                        truncate_for_error(&name)
+                    )));
+                }
+                Some(kind)
+            } else {
+                None
+            };
             if flags & F_CONFLICT != 0 && flags != F_CONFLICT {
                 return Err(tree_corrupt(format!(
                     "conflict entry {:?} carries other flags",
@@ -793,7 +973,9 @@ impl Tree {
             let fallback = if flags & F_FALLBACK != 0 { Some(r.id()?) } else { None };
             entries.push(TreeEntry {
                 name,
-                kind: if flags & F_DIR != 0 {
+                kind: if let Some(k) = special {
+                    k
+                } else if flags & F_DIR != 0 {
                     EntryKind::Dir
                 } else if flags & F_CONFLICT != 0 {
                     EntryKind::Conflict
@@ -917,6 +1099,8 @@ pub enum Object {
     Tree(Tree),
     Snapshot(Snapshot),
     Conflict(Conflict),
+    /// An annotated tag (repository format 5).
+    Atag(Atag),
     Sealed(Envelope),
 }
 
@@ -940,6 +1124,7 @@ impl Object {
             Object::Tree(t) => (TREE_TAG, serde_json::to_vec(t).unwrap()),
             Object::Snapshot(s) => (SNAP_TAG, serde_json::to_vec(s).unwrap()),
             Object::Conflict(c) => (CONF_TAG, c.encode_payload()),
+            Object::Atag(a) => (ATAG_TAG, a.encode_payload()),
             Object::Sealed(e) if e.is_aes_siv() => (SEAL_AES_SIV_TAG, e.to_bytes()),
             Object::Sealed(e) => (SEAL_TAG, e.to_bytes()),
         };
@@ -993,6 +1178,12 @@ impl Object {
                 Some(v) if ENCODING_RESERVED.contains(v) || *v < ENCODING_CONFLICT => Err(unsupported_encoding("conflict", *v)),
                 _ => Err(corrupt("conflict is not in canonical encoding")),
             }
+        } else if let Some(b) = raw.strip_prefix(ATAG_TAG) {
+            match b.first() {
+                Some(&ENCODING_JSON) => Ok(Object::Atag(Atag::decode_payload(b)?)),
+                Some(v) if ENCODING_RESERVED.contains(v) || *v == ENCODING_BINARY_TREE => Err(unsupported_encoding("atag", *v)),
+                _ => Err(corrupt("atag is not in canonical encoding")),
+            }
         } else if let Some(b) = raw.strip_prefix(SEAL_TAG) {
             Ok(Object::Sealed(Envelope::from_bytes(b)?))
         } else if let Some(b) = raw.strip_prefix(SEAL_AES_SIV_TAG) {
@@ -1019,22 +1210,25 @@ impl Object {
 
     /// Lowest repository format whose readers can read the raw object
     /// (binary trees: 2; AES-SIV sealed objects: 3; conflict objects and
-    /// trees holding a conflict entry: 4; everything else: 1).
+    /// trees holding a conflict entry: 4; trees holding a symlink or
+    /// gitlink, conflicts with such a term, and annotated tags: 5;
+    /// everything else: 1).
     pub fn min_repo_format(raw: &[u8]) -> u32 {
         if let Some(enc) = Object::tree_encoding(raw) {
-            // Only a tree that decodes can hold a conflict entry; anything
-            // else is refused when it is read.
-            let conflicted = match Object::decode(raw) {
-                Ok(Object::Tree(t)) => t.has_conflicts(),
-                _ => false,
-            };
-            if conflicted {
-                CONFLICT_REPO_FORMAT
-            } else {
-                enc.min_repo_format()
+            // Only a tree that decodes can hold a conflict or special
+            // entry; anything else is refused when it is read.
+            match Object::decode(raw) {
+                Ok(Object::Tree(t)) if t.has_special_entries() => GIT_PARITY_REPO_FORMAT,
+                Ok(Object::Tree(t)) if t.has_conflicts() => CONFLICT_REPO_FORMAT,
+                _ => enc.min_repo_format(),
             }
         } else if raw.starts_with(CONF_TAG) {
-            CONFLICT_REPO_FORMAT
+            match Object::decode(raw) {
+                Ok(Object::Conflict(c)) if c.has_special_terms() => GIT_PARITY_REPO_FORMAT,
+                _ => CONFLICT_REPO_FORMAT,
+            }
+        } else if raw.starts_with(ATAG_TAG) {
+            GIT_PARITY_REPO_FORMAT
         } else if raw.starts_with(SEAL_AES_SIV_TAG) {
             AES_SIV_REPO_FORMAT
         } else {
@@ -1067,6 +1261,7 @@ impl Object {
             Object::Tree(_) => "tree",
             Object::Snapshot(_) => "snapshot",
             Object::Conflict(_) => "conflict",
+            Object::Atag(_) => "atag",
             Object::Sealed(_) => "sealed",
         }
     }

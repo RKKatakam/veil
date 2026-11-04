@@ -188,9 +188,23 @@ impl ObjectStore {
     /// Refuse objects this repository's format may not hold (a format-1
     /// repository must stay readable by every vl that reads format 1): binary
     /// trees below format 2, AES-SIV sealed objects below format 3.
+    /// The `Unsupported` error for a format-5 object in an older repository.
+    fn format_5_refusal(&self) -> VeilError {
+        let need = crate::object::GIT_PARITY_REPO_FORMAT;
+        VeilError::Unsupported(format!(
+            "this repository is at format {} and cannot store format-{need} symlinks, gitlinks or annotated tags; \
+             upgrade it with `vl upgrade` (a remote: `vl upgrade --remote <name>`) once everyone who uses it runs vl {} or later",
+            self.format(),
+            crate::repo::min_vl_for_format(need)
+        ))
+    }
+
     pub(crate) fn check_storable(&self, raw: &[u8]) -> Result<()> {
         let need = Object::min_repo_format(raw);
         let have = self.format();
+        if need > have && need >= crate::object::GIT_PARITY_REPO_FORMAT {
+            return Err(self.format_5_refusal());
+        }
         if need > have {
             let what = if need >= crate::object::CONFLICT_REPO_FORMAT {
                 "conflicts (conflict objects, trees with conflict entries)"
@@ -539,7 +553,19 @@ impl ObjectStore {
     }
 
     /// Store `obj` in this repository's encoding (see [`ObjectStore::encode`]).
+    /// Format-5 objects (trees holding a symlink or gitlink, conflicts with
+    /// such a term, annotated tags) are refused below format 5, as by
+    /// [`ObjectStore::put_raw`] (checked on the value, without decoding).
     pub fn put(&self, obj: &Object) -> Result<ObjectId> {
+        let format5 = match obj {
+            Object::Tree(t) => t.has_special_entries(),
+            Object::Conflict(c) => c.has_special_terms(),
+            Object::Atag(_) => true,
+            _ => false,
+        };
+        if format5 && self.format() < crate::object::GIT_PARITY_REPO_FORMAT {
+            return Err(self.format_5_refusal());
+        }
         let raw = self.encode(obj);
         let id = ObjectId::hash(&raw);
         self.write_if_absent(&id, &raw)?;
@@ -750,6 +776,24 @@ impl ObjectStore {
         self.put(&Object::Conflict(c.clone()))
     }
 
+    /// Store an annotated tag (format 5; refused below, see
+    /// [`ObjectStore::put`]). Validated first, as every reader does.
+    pub fn put_atag(&self, a: &crate::tag_object::Atag) -> Result<ObjectId> {
+        a.validate()?;
+        self.put(&Object::Atag(a.clone()))
+    }
+
+    /// The annotated tag `id` (format 5).
+    pub fn atag(&self, id: &ObjectId) -> Result<crate::tag_object::Atag> {
+        match self.get(id)? {
+            Object::Atag(a) => Ok(a),
+            o => Err(VeilError::Corrupt(
+                id.hex(),
+                format!("expected annotated tag, found {}", o.kind_name()),
+            )),
+        }
+    }
+
     /// The conflict object `id`.
     pub fn conflict(&self, id: &ObjectId) -> Result<Conflict> {
         match self.open(id)? {
@@ -841,7 +885,9 @@ impl ObjectStore {
         match e.kind {
             // A conflict is always materialised (unreadable sides redacted).
             EntryKind::Dir | EntryKind::Conflict => self.has(&e.id),
-            EntryKind::File => self.id_readable(&e.id) || e.fallback.is_some_and(|f| self.id_readable(&f)),
+            EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink => {
+                self.id_readable(&e.id) || e.fallback.is_some_and(|f| self.id_readable(&f))
+            }
         }
     }
 

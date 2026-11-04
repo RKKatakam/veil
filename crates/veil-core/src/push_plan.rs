@@ -474,7 +474,9 @@ fn walk_public(
                 let p = dir.join(&e.name);
                 match e.kind {
                     EntryKind::Dir => stack.push((e.id, p, depth + 1)),
-                    EntryKind::File => visit(&p, e),
+                    // A symlink target or gitlink pointer is sent or
+                    // withheld like file content.
+                    EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink => visit(&p, e),
                     // Each version as a file: the plan shows what of it is
                     // sent and what is withheld.
                     EntryKind::Conflict => {

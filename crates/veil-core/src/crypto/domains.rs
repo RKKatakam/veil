@@ -76,6 +76,10 @@ pub const SIG_CONTEXT_MEMBER_BINDING: &str = "member-binding";
 /// Signature context: a team-vault write (over `team_vault::RecordBody`):
 /// a member of the scope set or deleted one entry.
 pub const SIG_CONTEXT_VAULT_ENTRY: &str = "vault-entry";
+/// Signature context: an annotated tag (`veil:atag`, repository format 5),
+/// over the id of its encoding without `signature` (`Atag::unsigned_id`):
+/// name, target, kind, message, tagger, time and Git payload.
+pub const SIG_CONTEXT_TAG: &str = "tag";
 
 /// Every signature context, for the uniqueness test.
 pub const SIG_CONTEXTS: &[&str] = &[
@@ -85,6 +89,7 @@ pub const SIG_CONTEXTS: &[&str] = &[
     SIG_CONTEXT_EMBARGO_RELEASE,
     SIG_CONTEXT_MEMBER_BINDING,
     SIG_CONTEXT_VAULT_ENTRY,
+    SIG_CONTEXT_TAG,
 ];
 
 // ---- key rings and embargoes (keychain.rs) --------------------------------
@@ -178,7 +183,7 @@ mod tests {
             "028e842fb2475981",
             "a signature context changed; that breaks existing signatures. Add a new constant instead."
         );
-        assert_eq!(SIG_CONTEXTS[5..], ["vault-entry"], "a signature context changed or was reordered");
+        assert_eq!(SIG_CONTEXTS[5..], ["vault-entry", "tag"], "a signature context changed or was reordered");
         let labels = [
             WRAP_LABEL_PREFIX,
             PREV_KEY_LABEL_PREFIX,

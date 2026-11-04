@@ -210,14 +210,16 @@ impl<'a> SparseView<'a> {
                     });
                     continue;
                 }
-                if !self.set.is_outside(&p) || !self.store.entry_readable(c) {
+                // Format-5 symlinks and gitlinks are not materialised yet:
+                // left out (the builder carries them).
+                if !self.set.is_outside(&p) || !self.store.entry_readable(c) || c.kind.is_special() {
                     continue;
                 }
                 out.entries.push(DirEntry {
                     name: c.name.clone(),
                     kind: match c.kind {
                         EntryKind::Dir => NodeKind::Dir,
-                        EntryKind::File | EntryKind::Conflict => NodeKind::File,
+                        EntryKind::File | EntryKind::Conflict | EntryKind::Symlink | EntryKind::Gitlink => NodeKind::File,
                     },
                 });
             }

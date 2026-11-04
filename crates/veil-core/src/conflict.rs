@@ -78,7 +78,8 @@ impl Merge {
     /// file in a file merge) is resolved to nothing.
     pub fn of_entry(store: &ObjectStore, e: Option<&TreeEntry>) -> Result<Merge> {
         Ok(match e {
-            Some(e) if e.kind == EntryKind::File => Merge::resolved(Some(ConflictTerm::of(e))),
+            // A symlink or gitlink (format 5) is a version like a file.
+            Some(e) if e.kind.holds_blob() => Merge::resolved(Some(ConflictTerm::of(e))),
             Some(e) if e.kind == EntryKind::Conflict => Merge::of_conflict(store.conflict(&e.id)?),
             _ => Merge::resolved(None),
         })
@@ -388,6 +389,16 @@ pub fn inspect_entry(store: &ObjectStore, e: &TreeEntry, audience: Audience) -> 
 /// [`materialize`], or (`text` false) everything but the merge of two
 /// text sides, whose content is then left empty.
 fn render(store: &ObjectStore, c: &Conflict, audience: Audience, text: bool) -> Result<Materialized> {
+    // A link target is never turned into file content (a file of markers a
+    // later edit could publish): a conflict with a symlink or gitlink term
+    // is not materialised until the working-copy stream writes our side as
+    // it is (symlinks design, threat 12).
+    if c.has_special_terms() {
+        return Err(VeilError::Unsupported(format!(
+            "a conflict between a symlink or gitlink and another version cannot be written out by vl {} yet",
+            env!("CARGO_PKG_VERSION")
+        )));
+    }
     let adds: Vec<Option<Seen>> = c.adds.iter().map(|t| t.as_ref().map(|t| see(store, t, audience)).transpose()).collect::<Result<_>>()?;
     let removes: Vec<Option<Seen>> = c.removes.iter().map(|t| t.as_ref().map(|t| see(store, t, audience)).transpose()).collect::<Result<_>>()?;
     let executable = merged_executable(&Merge {
@@ -968,6 +979,7 @@ mod tests {
 
     fn t(n: u8) -> Term {
         Some(ConflictTerm {
+            kind: crate::object::TermKind::File,
             id: ObjectId([n; 32]),
             size: 0,
             executable: false,

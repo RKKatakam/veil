@@ -462,7 +462,7 @@ fn pulled_tag_pointing_at_missing_object_does_not_brick_the_repo() {
     let remote_fs = Arc::new(MemoryBackend::new());
     let mut remote = Repo::init_bare(remote_fs.clone()).unwrap();
     let mut tx = remote.transaction("evil").unwrap();
-    tx.view.tags.insert("main".into(), Tag { target: ObjectId([7; 32]), cloak: None });
+    tx.view.tags.insert("main".into(), Tag::new(ObjectId([7; 32]), None));
     tx.commit().unwrap();
     let (mut victim, _fs, _) = new_repo("v");
     let pulled = remote::pull(&mut victim, "origin", remote_fs);

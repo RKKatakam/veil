@@ -12,7 +12,7 @@ use crate::{
     id::{ChangeId, ObjectId},
     keychain::{ReleaseState, StageOutcome, TakeBack},
     now_millis,
-    object::{EntryKind, Snapshot, Text, TreeEntry, Visibility},
+    object::{Snapshot, Text, TreeEntry, Visibility},
     oplog::Tag,
     policy::{Policy, POLICY_FILE},
     repo::Repo,
@@ -104,7 +104,7 @@ fn sealed_for_other_scopes(store: &ObjectStore, dest: &ObjectId, tree: &ObjectId
     let mut out = Vec::new();
     for c in crate::tree::diff_trees(store, Some(dest), Some(tree))? {
         let Some(e) = &c.new else { continue };
-        if let (EntryKind::File, Visibility::Cloaked { scope: s }) = (e.kind, &e.visibility) {
+        if let (true, Visibility::Cloaked { scope: s }) = (e.kind.holds_blob(), &e.visibility) {
             if s != scope {
                 out.push(format!("{} (cloaked under '{s}')", c.path));
             }
@@ -902,7 +902,7 @@ impl Repo {
         }
         let mut tx = self.transaction(format!("set tag {name}"))?;
         let cloak = cloak.or_else(|| tx.view.tags.get(name).and_then(|t| t.cloak.clone()));
-        tx.view.tags.insert(name.to_string(), Tag { target, cloak });
+        tx.view.tags.insert(name.to_string(), Tag::new(target, cloak));
         tx.commit()?;
         Ok(())
     }

@@ -270,6 +270,15 @@ impl GitBridge {
                         kept.insert(ne);
                     }
                 }
+                // Format 5: what a sealed link would show is omitted like a
+                // sealed file (never exported); a public one cannot be
+                // exported yet (mode 120000 / 160000 is the Git-bridge
+                // stream's), and is refused rather than exported wrong.
+                EntryKind::Symlink | EntryKind::Gitlink => {
+                    if self.public_file(store, e, &mut out)?.is_some() {
+                        return Err(e.kind.not_supported_yet(&e.name));
+                    }
+                }
             }
         }
         out.tree = if kept.is_empty() {
@@ -319,6 +328,10 @@ impl GitBridge {
                 return Ok(None);
             }
         };
+        if c.has_special_terms() {
+            // Format 5: not exported yet (never as a file of markers).
+            return Err(EntryKind::Symlink.not_supported_yet(&e.name));
+        }
         for t in c.interleaved().flatten() {
             if store.get_raw(&t.id).is_err() {
                 // A side this replica lacks: the projection may change.
@@ -429,6 +442,9 @@ impl GitBridge {
                 }
                 EntryKind::Conflict => {
                     return Err(VeilError::Corrupt(id.hex(), "a public projection never holds a conflict entry".into()))
+                }
+                EntryKind::Symlink | EntryKind::Gitlink => {
+                    return Err(VeilError::Corrupt(id.hex(), "a public projection never holds a symlink or gitlink yet".into()))
                 }
             };
             entries.push(gix::objs::tree::Entry {
