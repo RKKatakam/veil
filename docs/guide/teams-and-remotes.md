@@ -81,12 +81,13 @@ Pulled 3 object(s) from origin
 Like everywhere in Veil, **only tags travel**, and **a pull never moves
 your working copy**: `vl rebase -d main` after pulling.
 
-**Diverged tags are skipped, not overwritten**, in both directions:
+**Diverged tags are rejected, not overwritten**, in both directions:
 
 ```text
 $ vl push
-  skipped main (remote has diverged (non-fast-forward; use --force))
+  rejected main (remote has diverged: not a fast-forward)
 Pushed 23 object(s) to origin
+error: 1 tag was rejected (main): origin has changes you don't have. Run `vl pull origin`, `vl merge origin/main`, and push again (or `vl push --force` to overwrite them)
 $ vl pull
 warning: tag 'main' has diverged from origin/main; merge with `vl merge origin/main`
 Pulled 3 object(s) from origin
@@ -96,8 +97,12 @@ $ vl push
 Pushed 5 object(s) to origin
 ```
 
-Note that a push with skipped tags still **exits 0**. In scripts, check
-the output for `skipped`.
+The other tags are still pushed, but the push **exits 1**, as `git push`
+does, so a script can tell "partially rejected" (1) from "nothing to do"
+(0). Tags held back by design are listed as `skipped` and don't fail a
+push of all tags (a cloaked tag on a public remote, a tag that would
+publish an unreleased embargo), but a tag you named with `-t` that is
+held back does.
 
 Concurrent pushes to one remote are serialised by a lock on the remote. A
 client that crashes mid-push leaves a lease that the next push takes over
@@ -147,7 +152,7 @@ grant:
 ```text
 bob$ vl clone ../hub bobwc
 Cloned /tmp/vdoc/hub into /tmp/vdoc/bobwc (6 objects, 2 files)
-  note: 1 cloaked file(s) you hold no key for. Share your public key (veil16a98…3420) with a member
+  note: 1 cloaked file(s) (scope 'team') you hold no key for. Share your public key (veil16a98…3420) with a member
   and ask them to run `vl scope grant team <key>` and push. They appear here on your next `vl pull` after that.
 bob$ vl status
 …

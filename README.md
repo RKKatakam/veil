@@ -120,20 +120,21 @@ cd my-project
 vl init                        # creates .veil/, a default .veilpolicy, your identity and a `team` scope
 vl status                      # no `add`: the working copy is already snapshotted
 vl commit -m "first change"    # describe @ and start a new change on top
+vl tag set main -r @-          # name it: tags are what `vl push` sends (`@-` is the parent of @)
 vl log
 ```
 
 ```text
-@  tnkzpxlp alice 2026-11-03 23:14:49 default@ 9359028f (empty)
+@  mqqtumlp alice ✓ 2026-11-04 05:01:21 default@ aa203cdf (empty)
 │  (no description set)
-○  nsuvxswx alice 2026-11-03 23:14:49 main f0b52e3c
+○  syplqsok alice ✓ 2026-11-04 05:01:21 main 814bccc1
 │  first change
 ◆  zzzzzzzz 72edc798
    root()
 ```
 
-Change ids (`tnkzpxlp`, letters k–z) are stable across rewrites; snapshot ids
-(`f0b52e3c`, hex) are BLAKE3 content addresses.
+Change ids (`syplqsok`, letters k–z) are stable across rewrites; snapshot ids
+(`814bccc1`, hex) are BLAKE3 content addresses. `✓` marks a good signature.
 
 ## A tour
 

@@ -2,8 +2,12 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     fmt::Write as _,
-    io::IsTerminal,
-    sync::OnceLock,
+    io::{self, IsTerminal, Write as _},
+    process::ExitCode,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        OnceLock,
+    },
 };
 
 use anyhow::Result;
@@ -14,8 +18,119 @@ use veil_core::{
     policy::{HeldBack, POLICY_FILE},
     secrets::looks_binary,
     tree::{diff_trees, TreeChange},
-    ObjectId, Repo, VPath,
+    ObjectId, Repo, TreeEntry, VPath,
 };
+
+// ---- output streams ---------------------------------------------------------
+//
+// `println!` panics when stdout is gone, as in `vl log | head` once `head`
+// exits (Rust ignores SIGPIPE, so the write fails with EPIPE instead of
+// killing the process). Every line `vl` prints goes through [`Out`] / [`ErrOut`]
+// instead (`main.rs` shadows `println!` and `eprintln!`): a closed stream is
+// remembered and further output to it is dropped, so the command still runs
+// to completion and leaves the repository and working copy consistent, and
+// [`exit_status`] then exits with 141 (128 + SIGPIPE), the status a shell
+// reports for Git killed by SIGPIPE. Long listings stop early through
+// [`stdout_closed`].
+//
+// Restoring the default SIGPIPE disposition instead would also kill `vl`
+// mid-transaction when an `ssh` or `git` child it writes to exits.
+
+static STDOUT_CLOSED: AtomicBool = AtomicBool::new(false);
+static STDERR_CLOSED: AtomicBool = AtomicBool::new(false);
+static PIPE_BROKEN: AtomicBool = AtomicBool::new(false);
+/// The first stdout write error that was not a closed pipe (a full disk...).
+static STDOUT_ERROR: OnceLock<String> = OnceLock::new();
+
+/// Exit status for output cut short by a closed pipe: 128 + SIGPIPE.
+pub const BROKEN_PIPE_STATUS: u8 = 141;
+
+/// Standard output that never fails: see the module notes above.
+pub struct Out;
+
+/// Standard error that never fails.
+pub struct ErrOut;
+
+fn stream_write(closed: &AtomicBool, stdout: bool, f: impl FnOnce() -> io::Result<usize>, len: usize) -> io::Result<usize> {
+    if closed.load(Ordering::Relaxed) {
+        return Ok(len);
+    }
+    match f() {
+        Ok(n) => Ok(n),
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(e),
+        Err(e) => {
+            closed.store(true, Ordering::Relaxed);
+            if e.kind() == io::ErrorKind::BrokenPipe {
+                PIPE_BROKEN.store(true, Ordering::Relaxed);
+            } else if stdout {
+                let _ = STDOUT_ERROR.set(e.to_string());
+            }
+            Ok(len)
+        }
+    }
+}
+
+impl io::Write for Out {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        stream_write(&STDOUT_CLOSED, true, || io::stdout().write(buf), buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        stream_write(&STDOUT_CLOSED, true, || io::stdout().flush().map(|()| 0), 0).map(|_| ())
+    }
+}
+
+impl io::Write for ErrOut {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        stream_write(&STDERR_CLOSED, false, || io::stderr().write(buf), buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        stream_write(&STDERR_CLOSED, false, || io::stderr().flush().map(|()| 0), 0).map(|_| ())
+    }
+}
+
+/// What `println!` expands to (see `main.rs`).
+pub fn out_line(args: std::fmt::Arguments<'_>) {
+    if stdout_closed() {
+        return;
+    }
+    // Held for the whole line, so lines from several threads don't mix
+    // (the lock is reentrant: `Out` takes it again).
+    let _line = io::stdout().lock();
+    let _ = Out.write_fmt(args).and_then(|()| Out.write_all(b"\n"));
+}
+
+/// What `eprintln!` expands to (see `main.rs`).
+pub fn err_line(args: std::fmt::Arguments<'_>) {
+    if STDERR_CLOSED.load(Ordering::Relaxed) {
+        return;
+    }
+    let _line = io::stderr().lock();
+    let _ = ErrOut.write_fmt(args).and_then(|()| ErrOut.write_all(b"\n"));
+}
+
+/// Is standard output gone? Long listings stop when it is.
+pub fn stdout_closed() -> bool {
+    STDOUT_CLOSED.load(Ordering::Relaxed)
+}
+
+/// The process exit status for a command that ended with `code`: output
+/// cut short by a closed pipe turns success into [`BROKEN_PIPE_STATUS`],
+/// and a failed write to stdout (not a closed pipe) into a failure.
+/// Failures keep their own status.
+pub fn exit_status(code: ExitCode) -> ExitCode {
+    let _ = Out.flush();
+    if code != ExitCode::SUCCESS {
+        return code;
+    }
+    if let Some(e) = STDOUT_ERROR.get() {
+        err_line(format_args!("{} could not write to standard output: {e}", red("error:")));
+        return ExitCode::FAILURE;
+    }
+    if PIPE_BROKEN.load(Ordering::Relaxed) {
+        return ExitCode::from(BROKEN_PIPE_STATUS);
+    }
+    code
+}
 
 // ---- untrusted text -------------------------------------------------------
 
@@ -124,6 +239,24 @@ pub fn fmt_time(ms: i64) -> String {
         chrono::LocalResult::Single(t) => t.format("%Y-%m-%d %H:%M:%S").to_string(),
         _ => "-".into(),
     }
+}
+
+/// An absolute deadline, in local time with its UTC offset, plus UTC when
+/// the local zone is not UTC: `2026-11-11 09:00:00 +01:00 (08:00:00 UTC)`.
+pub fn fmt_deadline(ms: i64) -> String {
+    use chrono::{Local, TimeZone, Utc};
+    let (Some(local), Some(utc)) = (Local.timestamp_millis_opt(ms).single(), Utc.timestamp_millis_opt(ms).single()) else {
+        return "-".into();
+    };
+    if local.offset().local_minus_utc() == 0 {
+        return utc.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+    }
+    let utc_part = if local.date_naive() == utc.date_naive() {
+        utc.format("%H:%M:%S UTC")
+    } else {
+        utc.format("%Y-%m-%d %H:%M:%S UTC")
+    };
+    format!("{} ({utc_part})", local.format("%Y-%m-%d %H:%M:%S %:z"))
 }
 
 pub fn vis_label(v: &Visibility) -> String {
@@ -279,6 +412,9 @@ pub fn print_log(repo: &Repo, ws: &str, limit: Option<usize>) -> Result<()> {
 
     let mut lanes: Vec<Option<ObjectId>> = Vec::new();
     for (shown, id) in ids.iter().enumerate() {
+        if stdout_closed() {
+            break;
+        }
         if limit.is_some_and(|l| shown >= l) {
             println!("{}", dim("~  (more snapshots elided)"));
             break;
@@ -401,6 +537,71 @@ pub fn print_log(repo: &Repo, ws: &str, limit: Option<usize>) -> Result<()> {
     Ok(())
 }
 
+// ---- content this reader cannot see ----------------------------------------
+
+/// Why the content of `e` cannot be shown, in a few words for a listing:
+/// `cloaked:team; you hold no key`. `None` if nothing explains it (a public
+/// object that is simply missing: damage, not a redaction).
+pub fn hidden_note(repo: &Repo, e: &TreeEntry) -> Option<String> {
+    let present = repo.store().has(&e.id);
+    Some(match &e.visibility {
+        Visibility::Public => return None,
+        Visibility::Cloaked { .. } if present => format!("{}; you hold no key", e.visibility.label()),
+        Visibility::Cloaked { .. } => format!("{}; withheld by a public remote", e.visibility.label()),
+        Visibility::Embargoed { .. } => format!("{}; not released yet", e.visibility.label()),
+    })
+}
+
+/// What to tell someone who asked for the content of `path` (entry `e`),
+/// which this repository cannot show. `None`: no explanation beyond the
+/// engine's error (see [`hidden_note`]).
+pub fn hidden_explanation(repo: &Repo, path: &VPath, e: &TreeEntry) -> Option<String> {
+    let path = safe(path.as_str());
+    let present = repo.store().has(&e.id);
+    Some(match &e.visibility {
+        Visibility::Public => return None,
+        Visibility::Cloaked { scope } if present => {
+            let scope = safe(scope);
+            format!(
+                "{path} is cloaked under scope '{scope}' and you hold no key for it. Share your public key \
+                 (`vl identity show`) with a member and ask them to run `vl scope grant {scope} <key>` and push; \
+                 it becomes readable after your next `vl pull`"
+            )
+        }
+        Visibility::Cloaked { scope } => {
+            let scope = safe(scope);
+            format!(
+                "{path} is cloaked under scope '{scope}' and was withheld: this repository's content came from \
+                 a public remote, and public remotes never deliver cloaked content. Once a member grants you \
+                 '{scope}' (`vl scope grant {scope} <key>`), clone or pull from a team remote to read it"
+            )
+        }
+        Visibility::Embargoed { embargo } => format!(
+            "{path} is under embargo {}, which is not released yet (`vl show` gives the deadline); \
+             it becomes readable once it is released and you pull",
+            safe(embargo)
+        ),
+    })
+}
+
+/// The content of the file entry `e` at `path`, or an error that explains
+/// cloaked, withheld and embargoed content instead of the store's
+/// `object … is not present in this store`.
+pub fn read_file(repo: &Repo, path: &VPath, e: &TreeEntry) -> Result<Vec<u8>> {
+    match repo.store().read_entry(e) {
+        Ok(d) => Ok(d),
+        Err(err) if err.is_unreadable() => match hidden_explanation(repo, path, e) {
+            Some(why) => Err(anyhow::anyhow!(why)),
+            None => Err(anyhow::Error::new(err).context(format!(
+                "the content of {} is missing from this repository (`vl fsck` checks the store; \
+                 `vl pull --full` restores missing objects from a remote that has them)",
+                safe(path.as_str())
+            ))),
+        },
+        Err(err) => Err(err.into()),
+    }
+}
+
 // ---- diffs ---------------------------------------------------------------
 
 pub fn print_changes_summary(repo: &Repo, changes: &[TreeChange]) {
@@ -440,13 +641,16 @@ pub fn print_diff(repo: &Repo, from: &ObjectId, to: &ObjectId, stat: bool) -> Re
         return Ok(());
     }
     for c in &changes {
+        if stdout_closed() {
+            break;
+        }
         println!("{}", bold(&format!("diff --veil a/{0} b/{0}", safe(c.path.as_str()))));
         let read = |e: &Option<veil_core::TreeEntry>| -> Result<Option<Vec<u8>>, String> {
             match e {
                 None => Ok(Some(Vec::new())),
                 Some(e) => match repo.store().read_entry(e) {
                     Ok(d) => Ok(Some(d)),
-                    Err(err) if err.is_unreadable() => Err(e.visibility.label()),
+                    Err(err) if err.is_unreadable() => Err(hidden_note(repo, e).unwrap_or_else(|| err.to_string())),
                     Err(err) => Err(err.to_string()),
                 },
             }
@@ -467,7 +671,7 @@ pub fn print_diff(repo: &Repo, from: &ObjectId, to: &ObjectId, stat: bool) -> Re
         let (old, new) = match (read(&c.old), read(&c.new)) {
             (Ok(Some(a)), Ok(Some(b))) => (a, b),
             (Err(v), _) | (_, Err(v)) => {
-                println!("{}", dim(&format!("  (content hidden: {}; you hold no key)", safe(&v))));
+                println!("{}", dim(&format!("  (content hidden: {})", safe(&v))));
                 continue;
             }
             _ => continue,
@@ -500,6 +704,9 @@ pub fn print_diff(repo: &Repo, from: &ObjectId, to: &ObjectId, stat: bool) -> Re
 
 pub fn print_files(repo: &Repo, tree: &ObjectId) -> Result<()> {
     for (path, e) in veil_core::tree::walk_files(repo.store(), tree)? {
+        if stdout_closed() {
+            break;
+        }
         let readable = repo.store().entry_readable(&e);
         let vis = match &e.visibility {
             Visibility::Public => "public".to_string(),
