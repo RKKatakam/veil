@@ -108,6 +108,16 @@ impl fmt::Debug for ObjectStore {
     }
 }
 
+enum Loose {
+    Good(Vec<u8>),
+    Absent,
+    Corrupt,
+}
+
+fn loose_mismatch(id: &ObjectId) -> VeilError {
+    VeilError::Corrupt(id.hex(), "content does not match its hash".into())
+}
+
 fn is_hex(s: &str) -> bool {
     s.bytes().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
 }
@@ -292,33 +302,77 @@ impl ObjectStore {
     }
 
     /// `get_raw` without gc freshening (used by gc itself).
+    ///
+    /// Every read is verified: the bytes returned always hash to `id`.
+    /// Loose objects are re-hashed here; packed objects are re-hashed by
+    /// [`Pack::get`]. A loose copy that fails verification is skipped in
+    /// favour of a packed copy, if there is a good one. Decoded trees and
+    /// snapshots are cached, so the hash is paid once per object and
+    /// process for those; blobs are hashed on every read (BLAKE3, typically
+    /// well above 1 GiB/s, so small next to the I/O and decryption).
     pub(crate) fn read_raw(&self, id: &ObjectId) -> Result<Vec<u8>> {
-        match self.backend.read(&self.loose_path(id)) {
-            Ok(b) => return Ok(b),
-            Err(e) if e.is_not_found() => {}
-            Err(e) => return Err(e),
+        let loose_corrupt = match self.read_loose_verified(id)? {
+            Loose::Good(b) => return Ok(b),
+            Loose::Absent => false,
+            Loose::Corrupt => true,
+        };
+        match self.read_packed(id) {
+            Ok(Some(raw)) => Ok(raw),
+            Ok(None) if loose_corrupt => Err(loose_mismatch(id)),
+            Ok(None) => Err(VeilError::Missing(*id)),
+            Err(e) if loose_corrupt && e.is_not_found() => Err(loose_mismatch(id)),
+            Err(e) => Err(e),
         }
-        self.read_packed(id)?.ok_or(VeilError::Missing(*id))
     }
 
-    fn write_if_absent(&self, id: &ObjectId, raw: &[u8]) -> Result<()> {
+    fn read_loose_verified(&self, id: &ObjectId) -> Result<Loose> {
+        match self.backend.read(&self.loose_path(id)) {
+            Ok(b) if ObjectId::hash(&b) == *id => Ok(Loose::Good(b)),
+            Ok(_) => Ok(Loose::Corrupt),
+            Err(e) if e.is_not_found() => Ok(Loose::Absent),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Is there a copy of `id` that passes verification? Errors other than
+    /// "absent" or "corrupt" (I/O) are passed on.
+    fn has_verified(&self, id: &ObjectId) -> Result<bool> {
+        match self.read_raw(id) {
+            Ok(_) => Ok(true),
+            Err(VeilError::Missing(_)) | Err(VeilError::Corrupt(..)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Store `raw` (already verified to hash to `id`) unless a good copy
+    /// exists. Returns whether it was written.
+    ///
+    /// An existing copy is re-read and re-hashed rather than trusted, so a
+    /// damaged object is *repaired* by putting it again (for example by
+    /// pulling it from a remote): the new loose copy replaces a corrupt
+    /// loose one and shadows a corrupt packed one. That costs one read of
+    /// the existing copy whenever an object is put twice.
+    fn write_if_absent(&self, id: &ObjectId, raw: &[u8]) -> Result<bool> {
         if self.is_gc_candidate(id) {
             // A gc may be about to delete the existing copy: mark it, then
-            // make sure we have our own loose copy (in that order).
+            // make sure we have our own good loose copy (in that order).
             self.write_keep_marker(id);
-            if !self.loose_exists(id) {
-                self.backend.write(&self.loose_path(id), raw)?;
+            if matches!(self.read_loose_verified(id)?, Loose::Good(_)) {
+                return Ok(false);
             }
-            return Ok(());
-        }
-        if !self.has_cached(id) {
             self.backend.write(&self.loose_path(id), raw)?;
+            return Ok(true);
         }
-        Ok(())
+        if self.has_cached(id) && self.has_verified(id)? {
+            return Ok(false);
+        }
+        self.backend.write(&self.loose_path(id), raw)?;
+        Ok(true)
     }
 
-    /// Insert an already-encoded object, verifying its address.
-    pub fn put_raw(&self, id: &ObjectId, raw: &[u8]) -> Result<()> {
+    /// Insert an already-encoded object, verifying its address. Returns
+    /// whether a copy was written (false if a verified copy was present).
+    pub fn put_raw(&self, id: &ObjectId, raw: &[u8]) -> Result<bool> {
         if ObjectId::hash(raw) != *id {
             return Err(VeilError::Corrupt(id.hex(), "hash mismatch".into()));
         }
@@ -493,7 +547,10 @@ impl ObjectStore {
         Ok(t)
     }
 
+    /// Store a tree. It must be valid ([`Tree::validate`]): the store never
+    /// writes a tree that it would refuse to read back.
     pub fn put_tree(&self, t: &Tree) -> Result<ObjectId> {
+        t.validate()?;
         self.put(&Object::Tree(t.clone()))
     }
 

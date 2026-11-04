@@ -27,6 +27,9 @@ use crate::error::{Result, VeilError};
 
 pub type Key = [u8; 32];
 
+/// Longest scope label an envelope can carry (its length is a `u16`).
+pub const MAX_SCOPE_LEN: usize = u16::MAX as usize;
+
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     let mut b = [0u8; N];
     getrandom::getrandom(&mut b).expect("operating system RNG unavailable");
@@ -64,6 +67,12 @@ impl Envelope {
     /// Encrypt `plaintext` for `scope`. With `deterministic`, the nonce is
     /// derived from the plaintext (see module docs); otherwise it is random.
     pub fn seal(key: &Key, scope: &str, plaintext: &[u8], deterministic: bool) -> Result<Envelope> {
+        if scope.len() > MAX_SCOPE_LEN {
+            return Err(VeilError::Crypto(format!(
+                "scope label is {} bytes; at most {MAX_SCOPE_LEN} can be encoded",
+                scope.len()
+            )));
+        }
         let nonce: [u8; 24] = if deterministic {
             let nonce_key = zeroize::Zeroizing::new(blake3::derive_key("veil 2026 siv-nonce v1", key));
             let mut h = blake3::Hasher::new_keyed(&nonce_key);
@@ -103,9 +112,18 @@ impl Envelope {
     }
 
     /// Binary layout: `u16 BE scope_len | scope | nonce[24] | ciphertext`.
+    ///
+    /// # Panics
+    ///
+    /// If `scope` is longer than [`MAX_SCOPE_LEN`]. [`Envelope::seal`] and
+    /// [`Envelope::from_bytes`] never produce such an envelope; only direct
+    /// mutation of the public field can, and a silently truncated length
+    /// would make the encoding ambiguous.
     pub fn to_bytes(&self) -> Vec<u8> {
+        let len = u16::try_from(self.scope.len())
+            .unwrap_or_else(|_| panic!("envelope scope label exceeds {MAX_SCOPE_LEN} bytes"));
         let mut out = Vec::with_capacity(2 + self.scope.len() + 24 + self.ciphertext.len());
-        out.extend_from_slice(&(self.scope.len() as u16).to_be_bytes());
+        out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(self.scope.as_bytes());
         out.extend_from_slice(&self.nonce);
         out.extend_from_slice(&self.ciphertext);

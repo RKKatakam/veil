@@ -8,9 +8,9 @@
 //! next snapshot then quarantines it again on top of the new tree.
 
 use crate::{
-    error::Result,
+    error::{Result, VeilError},
     id::ObjectId,
-    object::{EntryKind, Object, TreeEntry},
+    object::{is_reserved_name, EntryKind, Object, TreeEntry},
     policy::{Policy, Tier},
     statcache::StatCache,
     store::ObjectStore,
@@ -61,6 +61,11 @@ pub fn checkout_cached(
 ) -> Result<CheckoutReport> {
     let mut report = CheckoutReport::default();
     let changes = diff_trees(store, from, Some(to))?;
+    // Defence in depth: trees naming `.veil` are refused when decoded, but
+    // checkout must never write repository metadata whatever the tree says.
+    if let Some(c) = changes.iter().find(|c| c.path.components().any(is_reserved_name)) {
+        return Err(VeilError::InvalidPath(format!("{:?} is inside reserved .veil", c.path.as_str())));
+    }
     let policy = Policy::load(&TreeView::new(store.clone(), *to))?;
 
     // Removals first so file<->directory swaps work.

@@ -232,6 +232,15 @@ impl Repo {
 
     pub fn set_tag(&mut self, name: &str, target: ObjectId, cloak: Option<String>, allow_backwards: bool) -> Result<()> {
         validate_tag_name(name)?;
+        // A tag on anything but a snapshot (a blob, a tree) would break
+        // every graph query that walks the view.
+        match self.snapshot(&target) {
+            Ok(_) => {}
+            Err(VeilError::Corrupt(..)) | Err(VeilError::Json(_)) => {
+                return Err(VeilError::repo(format!("{} is not a snapshot", target.short())))
+            }
+            Err(e) => return Err(e),
+        }
         if let Some(t) = self.view.tags.get(name) {
             if !allow_backwards && !self.is_ancestor(&t.target, &target)? {
                 return Err(VeilError::repo(format!(

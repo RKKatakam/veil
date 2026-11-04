@@ -53,7 +53,8 @@ fn resolve_base(repo: &Repo, base: &str, ws: &str) -> Result<ObjectId> {
     }
     if base.len() == 64 {
         if let Ok(id) = ObjectId::from_hex(base) {
-            if repo.store().has(&id) {
+            // Only snapshots are revisions (not blobs or trees).
+            if repo.store().has(&id) && repo.snapshot(&id).is_ok() {
                 return Ok(id);
             }
         }

@@ -158,7 +158,9 @@ impl Builder<'_> {
         let mut out = Tree::default();
         let mut seen = HashSet::new();
         for child in self.fs.list_dir(dir)? {
-            if dir.is_root() && child.name == ".veil" {
+            // `.veil` is reserved at every depth (trees containing it are
+            // refused on decode), like Git's `.git` in nested repositories.
+            if crate::object::is_reserved_name(&child.name) {
                 continue;
             }
             seen.insert(child.name.clone());

@@ -47,9 +47,20 @@ impl VPath {
         &self.0
     }
 
-    /// Append a single component (which must not contain `/`).
+    /// Append a single component.
+    ///
+    /// # Panics
+    ///
+    /// If `name` is not a single normal component (empty, `.`, `..`, or
+    /// containing `/` or NUL). This is checked in release builds too: a
+    /// malformed component would let a path escape its root. Names from
+    /// trees are validated when the tree is decoded, so this is defence in
+    /// depth, not input validation.
     pub fn join(&self, name: &str) -> VPath {
-        debug_assert!(!name.contains('/') && !name.is_empty());
+        assert!(
+            !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\0']),
+            "invalid path component {name:?}"
+        );
         if self.0.is_empty() {
             VPath(name.to_string())
         } else {

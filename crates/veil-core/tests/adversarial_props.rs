@@ -55,6 +55,7 @@ const CONTENTS: &[&str] = &[
 ];
 
 #[derive(Debug, Clone)]
+#[allow(clippy::enum_variant_names)]
 enum Op {
     Write(usize, usize),
     Remove(usize),
@@ -100,6 +101,7 @@ fn arb_op() -> impl Strategy<Value = Op> {
     ]
 }
 
+#[allow(clippy::type_complexity)]
 struct Harness {
     repo: Repo,
     fs: Arc<MemoryBackend>,

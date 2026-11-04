@@ -82,6 +82,31 @@ loose objects first, then packs. Either way the id is the BLAKE3 of the
 canonical, uncompressed encoding, and `get_raw` / `put_raw` always return and
 accept that encoding, so sync and fsck never see compression.
 
+**Everything read is verified.** Objects arrive from remotes and live in a
+`.veil/` that anyone with file access can edit, so the store treats them as
+hostile:
+
+* Every read is re-hashed against its id. Loose objects are hashed by
+  `ObjectStore::read_raw`, packed ones by `Pack::get`; a corrupt loose copy
+  falls back to a good packed copy if there is one, and otherwise surfaces
+  as `Corrupt`. Decoded trees and snapshots are cached, so they are hashed
+  once per process; blobs are hashed on every read (BLAKE3 runs at several
+  GiB/s, small next to I/O and decryption).
+* `put` and `put_raw` re-verify an existing copy instead of trusting it, so
+  a damaged object is **repaired** by putting it again, e.g. by pulling it
+  from a remote that has a good copy. The cost is one read of the existing
+  copy whenever an object that is already stored is put again.
+* Trees are accepted only in **canonical form** (`Object::decode`): the
+  exact bytes `serde_json` writes, entries strictly sorted by name (so
+  unique), and every name a single safe component: not empty, `.` or `..`,
+  no `/` or NUL, and never `.veil` in any ASCII case, at any depth (as Git
+  refuses `.git`). The builder skips `.veil` directories at every depth for
+  the same reason, and `put_tree` refuses to write a tree it could not read
+  back. Checkout additionally refuses any path through `.veil`, and
+  `VPath::join` asserts its component in release builds too.
+* Envelope scope labels are at most 65,535 bytes (`MAX_SCOPE_LEN`); `seal`
+  refuses longer ones rather than encode a truncated length.
+
 Sealed objects describe themselves: the envelope names the scope that opens
 it. `ObjectStore::open` peels sealed layers using the keychain. A missing key
 and a wrong key both surface as `Redacted`. A missing object surfaces as
@@ -443,7 +468,11 @@ ignored or rejected with a warning, and membership is never merged as a
 union. Embargo records are accepted only if signed by a scope member, or as
 flagged legacy records. A release is accepted only if the published key
 matches the committed fingerprint. Snapshots whose signature fails to verify
-are reported. Tags fast-forward. A diverged tag is reported and left alone
+are reported. The object walk is iterative and refuses trees nested deeper
+than `MAX_TREE_DEPTH` (1,024) levels, measured as each tree's height so
+that shared subtrees cannot hide depth. Remote tags with an invalid name, or
+whose target is missing or not a snapshot, are skipped with a warning. Tags
+fast-forward. A diverged tag is reported and left alone
 (`--force` overrides on push).
 
 ## 9. Locking, crash safety and `fsck`
@@ -648,7 +677,12 @@ BLAKE3 verification that loose reads skip, and the loose-first probe.
 * **forged or tampered embargo records.** A moved deadline, a changed scope
   or a wrong published key is rejected. Unsigned records never auto-release;
 * **stripped or transplanted snapshot signatures.** The id commits to the
-  signature, and a transplant fails verification. Both show in `vl log`.
+  signature, and a transplant fails verification. Both show in `vl log`;
+* **hostile trees and metadata from a remote.** Path traversal (`..`, `/`),
+  writes into `.veil/`, non-canonical trees, stack exhaustion by deep
+  nesting, dangling tags and terminal escape sequences in names and
+  descriptions (the CLI escapes control and bidi characters) are refused
+  (§2, §8).
 
 **Not protected against (yet), and documented honestly:**
 
