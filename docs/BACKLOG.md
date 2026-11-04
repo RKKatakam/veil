@@ -93,6 +93,15 @@ fixed**. Severity: high / medium / low.
 - **Retired identities stay on disk** (`$VEIL_HOME/retired/`, 0600) until
   the user deletes them, so vaults can be re-keyed.
 
+## Build
+
+- **`--all-features` does not resolve:** `vl`'s `fuse` and `macfuse`
+  features name the `fuser` crate twice (`fuser` and `fuser_macos`), so
+  `cargo build --all-features` and tools that run `cargo metadata
+  --all-features` (cargo-nextest, docs.rs) fail. The verification script
+  passes nextest default-feature metadata instead. Fix with one `fuser`
+  dependency name and a cfg in code, tested on macOS.
+
 ## Usability
 
 - **Non-UTF-8 file names are reported but not recorded.**
