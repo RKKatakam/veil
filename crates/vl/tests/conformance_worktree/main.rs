@@ -143,6 +143,27 @@ impl<'a> R<'a> {
         self.env.run_as(&self.user, &self.dir, args)
     }
 
+    /// Run with `input` on stdin.
+    pub fn run_stdin<S: AsRef<OsStr>>(&self, args: &[S], input: &[u8]) -> Output {
+        use std::io::Write;
+        let mut c = self
+            .cmd(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        c.stdin.take().unwrap().write_all(input).unwrap();
+        c.wait_with_output().unwrap()
+    }
+
+    /// `vl ws write WS PATH` with `data`, which must succeed.
+    pub fn ws_write(&self, ws: &str, path: &str, data: &str) -> String {
+        let out = self.run_stdin(&["ws", "write", ws, path], data.as_bytes());
+        assert!(out.status.success(), "vl ws write {ws} {path} failed:\n{}", text(&out));
+        text(&out)
+    }
+
     /// Run in a subdirectory of the working copy.
     pub fn run_in<S: AsRef<OsStr>>(&self, sub: &str, args: &[S]) -> Output {
         self.env.run_as(&self.user, &self.dir.join(sub), args)
