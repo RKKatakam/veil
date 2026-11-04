@@ -1634,6 +1634,27 @@ impl Keychain {
         }
     }
 
+    /// Is `s` validly signed by a **current** member of `scope`, with the
+    /// signing key the scope's verified ring registers for them (or by this
+    /// identity, while it is a member)? Unlike [`Keychain::snapshot_status`],
+    /// a member of some other scope, or a revoked member, does not count
+    /// (BUG-122: only members of `scope` may decide to publish its content).
+    pub fn signed_by_member(&self, scope: &str, s: &Snapshot) -> bool {
+        let (Some(sig), Some(true)) = (&s.signature, s.signature_valid()) else {
+            return false;
+        };
+        if let Some(me) = &self.identity {
+            if sig.key == me.verifying_hex() && sig.signer == me.public_hex() && self.is_member(scope) {
+                return true;
+            }
+        }
+        let access = self.scope_access(scope);
+        access
+            .release_signers
+            .as_ref()
+            .is_some_and(|m| m.get(&sig.key).is_some_and(|(member, _)| *member == sig.signer))
+    }
+
     // ---- embargoes -------------------------------------------------------
 
     fn embargo_path(id: &str) -> Result<VPath> {

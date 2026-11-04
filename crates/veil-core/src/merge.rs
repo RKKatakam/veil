@@ -4,7 +4,10 @@
 //!
 //! Visibility never widens: a file merged from a sealed side stays sealed
 //! (ours' sealing if ours is sealed, else theirs'), whichever side "ours"
-//! happens to be. This matters for auto-rebase, where "ours" is the new
+//! happens to be. Nor does it move: when the two sides are sealed under
+//! different scopes, nothing merged is sealed for either; the side that
+//! kept the base's scope (else ours) is kept as it is, and the file is a
+//! conflict (BUG-123). This matters for auto-rebase, where "ours" is the new
 //! (possibly public) parent and "theirs" the (possibly cloaked) child.
 //!
 //! Trees under an unreleased embargo (see [`crate::embargo`]) stay under it:
@@ -255,6 +258,16 @@ fn merge_file(
     } else {
         oe.executable
     };
+    // Sealed for two different scopes: no merged content may be sealed for
+    // either audience, since that would show one scope's content to the
+    // other's members (BUG-123). One side is kept as it is.
+    if let Some(keep) = audience_clash(store, be, oe, te)? {
+        if ours == theirs {
+            return Ok(TreeEntry { executable, ..keep });
+        }
+        conflicts.push(path.clone());
+        return Ok(keep);
+    }
     if ours == theirs {
         return Ok(TreeEntry { executable, ..oe.clone() });
     }
@@ -286,6 +299,41 @@ fn merge_file(
         visibility,
         fallback,
     })
+}
+
+/// The visibility `e`'s object really has (BUG-103), if it can be checked.
+fn verified_visibility(store: &ObjectStore, e: &TreeEntry) -> Result<Option<Visibility>> {
+    Ok(match verify_sealing(store, e)? {
+        Sealing::Verified => Some(e.visibility.clone()),
+        Sealing::Relabelled(actual) => Some(actual),
+        Sealing::Unverifiable => None,
+    })
+}
+
+/// If `oe` and `te` are (really) sealed under two different scopes, the
+/// side to keep, unchanged, under its real label: the one whose scope is
+/// the base's (the other side moved the file to another audience, and its
+/// content goes nowhere), else ours. Neither scope can be called narrower:
+/// membership is not ordered and changes. `None`: no such clash.
+fn audience_clash(store: &ObjectStore, be: Option<&TreeEntry>, oe: &TreeEntry, te: &TreeEntry) -> Result<Option<TreeEntry>> {
+    let scope = |e: &TreeEntry| -> Result<Option<Visibility>> {
+        Ok(verified_visibility(store, e)?.filter(|v| matches!(v, Visibility::Cloaked { .. })))
+    };
+    let (Some(so), Some(st)) = (scope(oe)?, scope(te)?) else {
+        return Ok(None);
+    };
+    if so == st {
+        return Ok(None);
+    }
+    let sb = match be.filter(|b| b.kind == EntryKind::File) {
+        Some(b) => scope(b)?,
+        None => None,
+    };
+    let (keep, vis) = if sb.as_ref() == Some(&st) { (te, st) } else { (oe, so) };
+    Ok(Some(TreeEntry {
+        visibility: vis,
+        ..keep.clone()
+    }))
 }
 
 /// The visibility of a file merged from `oe` and `te`: never wider than

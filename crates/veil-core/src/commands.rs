@@ -3,8 +3,9 @@
 use std::collections::BTreeSet;
 
 use crate::{
+    builder::trusted_cloak,
     embargo::{
-        apply_embargo, description_scope, normalize_tree, policy_rekeys, recordable_conflicts, seal_introduced,
+        apply_embargo, description_scope, normalize_tree, policy_rekeys, recordable_conflicts, seal_declassified, seal_introduced,
         unreleased_wrapper, wrap, NormalizeOptions, NormalizeReport,
     },
     error::{Result, VeilError},
@@ -408,13 +409,25 @@ impl Repo {
         }
 
         // Merging a cloaked line of work into this one is the explicit act
-        // that may publish its files (secret-scanned).
+        // that may publish its files (secret-scanned). A `cloak` field is a
+        // claim anyone can write over anyone's sealed objects, so a line
+        // counts only if every snapshot the merge brings in is signed by a
+        // current member of its scope (BUG-122).
         let mut declassify = BTreeSet::new();
         for o in &others {
-            if let Some(c) = tx.repo().snapshot(o)?.cloak.clone() {
-                if Some(c.as_str()) != cloak {
-                    declassify.insert(c);
-                }
+            let Some(c) = trusted_cloak(tx.repo().snapshot(o)?.cloak.as_deref()).map(str::to_string) else {
+                continue;
+            };
+            if Some(c.as_str()) == cloak || declassify.contains(&c) {
+                continue;
+            }
+            if tx.repo().merged_in_signed_by(&into, &others, &c)? {
+                declassify.insert(c);
+            } else {
+                warnings.push(format!(
+                    "not publishing the files of the line cloaked under '{c}' ({}): not every snapshot this merge brings in is signed by a current member of '{c}', and only members may publish its content; they stay cloaked (`vl expose` publishes deliberately)",
+                    o.short()
+                ));
             }
         }
         let mut report = NormalizeReport::default();
@@ -427,11 +440,16 @@ impl Repo {
                 dest_tree: into_snap.tree,
                 cloak,
                 declassify: &declassify,
+                // Declassified content of an embargoed result is sealed
+                // under the embargo key directly, never stored as
+                // plaintext first (BUG-249).
+                defer_declassify: embargo.is_some() || outer.is_some(),
             },
             &mut report,
         )?;
         // The destination is under an unreleased embargo: stay under it.
         if let Some(w) = &outer {
+            tree = seal_declassified(&store, &tree, &report.declassified, &w.embargo, &into_snap.tree)?;
             if tree != merged.tree {
                 tree = wrap(&store, &w.embargo, &tree, &w.fallback)?;
             }
@@ -444,7 +462,10 @@ impl Repo {
         // once the merge is known to be possible.
         let embargo_id = match &embargo {
             Some(spec) => {
-                let other_scopes = sealed_for_other_scopes(&store, &into_snap.tree, &tree, &spec.scope)?;
+                let mut other_scopes = sealed_for_other_scopes(&store, &into_snap.tree, &tree, &spec.scope)?;
+                // Declassified files are still sealed under their line's
+                // scope here; they go under the embargo key below.
+                other_scopes.retain(|o| !report.declassified.iter().any(|p| o.starts_with(&format!("{p} ("))));
                 if !other_scopes.is_empty() {
                     return Err(VeilError::Policy(format!(
                         "cannot merge under an embargo for scope '{}': the merge changes files cloaked under another scope, whose members could read them before the release ({}); embargo under that scope, or make those changes after the release",
@@ -453,6 +474,7 @@ impl Repo {
                     )));
                 }
                 let e = tx.repo().keys().create_embargo(&spec.scope, spec.until)?;
+                tree = seal_declassified(&store, &tree, &report.declassified, &e, &into_snap.tree)?;
                 tree = apply_embargo(&store, &tree, &into_snap.tree, &e)?;
                 Some(e)
             }
@@ -516,8 +538,37 @@ impl Repo {
         })
     }
 
+    /// Is every snapshot that merging `others` into `into` brings in (an
+    /// ancestor of one of `others`, not of `into`) present and signed by a
+    /// current member of `scope` ([`crate::keychain::Keychain::signed_by_member`])?
+    fn merged_in_signed_by(&self, into: &ObjectId, others: &[ObjectId], scope: &str) -> Result<bool> {
+        let known = self.ancestors(into)?;
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = others.to_vec();
+        while let Some(x) = stack.pop() {
+            if known.contains(&x) || !seen.insert(x) {
+                continue;
+            }
+            let Some(s) = self.snapshot_opt(&x)? else { return Ok(false) };
+            if !self.keys().signed_by_member(scope, &s) {
+                return Ok(false);
+            }
+            stack.extend(s.parents.iter().copied());
+        }
+        Ok(true)
+    }
+
     pub fn set_tag(&mut self, name: &str, target: ObjectId, cloak: Option<String>, allow_backwards: bool) -> Result<()> {
         validate_tag_name(name)?;
+        // A cloaked tag names a scope you can use, as `vl ws new --cloak`
+        // and `vl cloak --scope` require: a typo or a reserved name would
+        // leave a tag no cloaked line ever advances (BUG-210).
+        if let Some(scope) = &cloak {
+            crate::keychain::validate_scope_name(scope)?;
+            if !self.keys().is_member(scope) {
+                return Err(VeilError::Policy(format!("you hold no key for scope '{scope}'")));
+            }
+        }
         // A tag on anything but a snapshot (a blob, a tree) would break
         // every graph query that walks the view.
         match self.snapshot(&target) {

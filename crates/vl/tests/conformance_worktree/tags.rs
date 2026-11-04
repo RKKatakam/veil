@@ -195,7 +195,6 @@ fn a_cloaked_tag_is_marked_in_the_list() {
 // `vl cloak --scope` and `vl ws new --cloak` require; reserved names
 // (`local`, `embargo/…`) and malformed ones are refused.
 #[test]
-#[ignore = "BUG-210: `vl tag set --cloak` accepts any scope: unknown, non-member, reserved (`local`, `embargo/…`) or malformed"]
 fn a_cloaked_tag_needs_a_valid_scope() {
     let env = Env::new();
     let (r, one, _) = chain(&env);

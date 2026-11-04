@@ -676,7 +676,39 @@ CAS, and it applies these rules in order:
      it names a scope (`builder::trusted_cloak`): never an embargo label,
      `local` or a key generation, for files and for descriptions
      (`embargo::description_scope`). As a backstop, the builder never seals
-     under a released embargo or a cloak label that is not a scope.
+     under a released embargo or a cloak label that is not a scope, and
+     `vl ws new --cloak` and `vl tag set --cloak` refuse a name that is not
+     a scope you are a member of (`validate_scope_name`, BUG-124/210).
+   * **True labels are not enough to publish** (BUG-122). Verification
+     proves what an object is sealed for, not who put it where. A teammate
+     outside `team` (Mallory) can write a snapshot with `cloak: "team"`
+     whose tree holds Alice's genuine `cloaked:team` objects at new paths;
+     every label is true. Merging that "team line" into a public line used
+     to publish them. A merge now publishes a cloaked line of `s`
+     (`Repo::merge`, `NormalizeOptions::declassify`) only if
+     (1) **every snapshot it brings in** (ancestors of the merged-in heads
+     that are not ancestors of the destination) is present and validly
+     signed by a **current member of `s`**, with the signing key the
+     scope's verified ring registers for them (`Keychain::signed_by_member`;
+     this identity counts while it is a member), and (2) only for content
+     the merge brings in: an entry equal to the destination's at that path
+     stays as it is, whoever sealed it there. Otherwise the merge warns,
+     and the files stay cloaked; `vl expose` publishes deliberately.
+     Why this rule: a member of `s` can read `s` and could publish it
+     anyway, so a declassification signed by members gives no one an
+     ability they lack; a non-member can copy object ids but cannot sign
+     as a member. The alternative, "only content the line introduced
+     relative to the merge base", does not stop the attack: Alice's
+     objects come from another line of hers (an unmerged cloaked
+     workspace), so relative to `main` they are new. It is kept as part
+     (2), which stops the variant where Mallory plants the objects on the
+     destination (`main`) and waits for Alice to merge a genuine line. A
+     revoked member does not count (it could copy objects of the new key
+     generation it cannot read), and neither does a member of another
+     scope. The cost: a cloaked line that took in an unsigned or
+     outsider's snapshot (say, a public branch from a non-member merged
+     into it) is not published by merging; expose it, or merge that
+     branch separately.
    * **Sealed content keeps its audience.** A tracked file the parent holds
      sealed under scope `s` stays sealed under `s` (as verified above), edited or not, whatever
      the workspace or the current policy says, unless this very snapshot
@@ -685,6 +717,20 @@ CAS, and it applies these rules in order:
      still goes through the secret scanner below. A policy that arrived by
      merge, `vl new <cloaked change>` in an ordinary workspace, rebases and
      squashes never move sealed content to another audience.
+   * **Merging never moves content between scopes** (BUG-123). When the two
+     sides of a file are (verifiably) sealed for different scopes,
+     `merge::merge_file` seals nothing for either audience: the result
+     would hold both sides' content, readable by the members of one. The
+     file is a conflict, and one side's entry is kept exactly as it is:
+     the side whose scope is the base's (the other side moved the file to
+     another audience, so in an auto-rebase onto a `main` where the file
+     was replaced by a `mal`-sealed object, Alice's pending `team` edit is
+     kept, sealed for `team`), else ours. Neither scope is taken as the
+     narrower one: membership is not ordered and changes over time.
+     Likewise merge normalisation reseals a merged-in edit for the
+     destination's audience only when it was public; content sealed for
+     another scope is not resealed, and the destination keeps its own
+     entry (reported).
    * **"Now sealed" never reads as "deleted".** A file the policy says is
      public but that is sealed because of the line it is edited on (a
      cloaked workspace, or sealed content keeping its audience) carries its
@@ -1022,7 +1068,13 @@ remains is mostly the one `lstat` per file and the per-directory
    every public file that differs is sealed under the embargo key, with the
    pre-merge version as its fallback. Content that was already sealed
    (cloaked under a scope) stays as it is, so releasing the embargo never
-   declassifies cloaked files. The wrapper's other entries list, by id,
+   declassifies cloaked files. The files the merge publishes from a cloaked
+   fix line go from their scope's sealing straight to the embargo key
+   (`embargo::seal_declassified`): normalisation defers them
+   (`NormalizeOptions::defer_declassify`), so no plaintext copy of the fix
+   is ever written to `.veil/objects`, not even an unreferenced one that
+   `vl gc` would prune later (BUG-249). The same holds for a plain merge
+   into a line under an unreleased embargo. The wrapper's other entries list, by id,
    every object reachable only through the sealed side **and not through
    the fallback**. Relays, `gc` and `fsck` cannot open sealed trees, and
    the list is how they find, keep and transfer those objects. The
@@ -1853,8 +1905,9 @@ repository lock.
   set of changed files (the embargoed tree is sealed whole);
 * declassification as a side effect. Rebase, `new`, squash, a policy edit
   that arrives by merge, and push never move cloaked or embargoed content
-  to a wider audience. Only an explicit merge of a cloaked line or an
-  `expose` does, with the secret scanner applied;
+  to a wider audience. Only an explicit merge of a cloaked line (signed
+  throughout by members of its scope) or an `expose` does, with the secret
+  scanner applied. No merge moves content from one scope to another;
 * tampering with ciphertext or moving it between scopes or key generations
   (AEAD bound to the envelope label);
 * **revoked members reading new content.** Revocation rotates the scope key,

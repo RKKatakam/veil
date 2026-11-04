@@ -404,6 +404,9 @@ impl Repo {
     pub fn create_workspace(&mut self, name: &str, bases: Vec<ObjectId>, cloak: Option<String>) -> Result<ObjectId> {
         validate_workspace_name(name)?;
         if let Some(scope) = &cloak {
+            // A line is cloaked under a scope: never an embargo (whose key
+            // `is_member` also finds), `local` or a key generation (BUG-124).
+            crate::keychain::validate_scope_name(scope)?;
             if !self.keys().is_member(scope) {
                 return Err(VeilError::Policy(format!("you hold no key for scope '{scope}'")));
             }

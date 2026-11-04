@@ -85,7 +85,10 @@ $ vl log -n 4
   the fix's history if it is sealed for the embargo's own scope.
 * "public on release" lists the fix's files that the merge moves from the
   cloaked line onto `main` (after a secret scan). They are sealed under the
-  embargo and become readable to others at the release. (A merge without
+  embargo, straight from their cloaked version (no plaintext copy is
+  written to `.veil`), and become readable to others at the release. Only a
+  line whose snapshots are all signed by current members of its scope is
+  published this way. (A merge without
   `--embargo` lists them as "published from the cloaked line": public at
   once.)
 * The deadline is shown in local time with its UTC offset, plus UTC
