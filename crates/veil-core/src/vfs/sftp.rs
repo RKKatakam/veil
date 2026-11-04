@@ -32,9 +32,29 @@
 //! Errors: "no such file" is [`VeilError::NotFound`] like everywhere
 //! else; other statuses become [`VeilError::Io`] with a matching
 //! [`std::io::ErrorKind`]; a dead connection is `ConnectionAborted`.
+//!
+//! **Limits** (BUG-065, BUG-066). The server is not trusted to be finite or
+//! responsive. [`SftpOptions`] holds the limits; the environment overrides
+//! the defaults:
+//!
+//! | limit | default | override |
+//! |---|---|---|
+//! | request timeout (see `sftp_client.rs`; also the handshake) | 300 s | `VEIL_SFTP_TIMEOUT` (seconds) |
+//! | one file read: the size the server stated plus [`READ_SLACK`], and never more than | 4 GiB | `VEIL_SFTP_MAX_FILE` (bytes, or `K`/`M`/`G` suffix) |
+//! | one directory listing | 1,000,000 entries, [`MAX_LISTING_BYTES`] of names | `VEIL_SFTP_MAX_LISTING` (entries) |
+//! | one packet from the server | 1 MiB (`MAX_PACKET`) | – |
+//! | replies to requests never made | 16 per connection (`MAX_STRAY`) | – |
+//!
+//! A read stops, and fails with `InvalidData`, as soon as the data passes
+//! its limit; a listing likewise. The stated size is only a hint (a file
+//! replaced between the stat and the open is read to its end), so a file
+//! may outgrow it by [`READ_SLACK`]: Veil's mutable files (operation head,
+//! lock, configuration, key rings) are small, and packs and objects never
+//! change. `read_range` reads exactly what was asked, which callers derive
+//! from pack indexes, and is held to the same ceiling.
 
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{HashSet, VecDeque},
     io::{self, Read, Write},
     process::{Child, Command, Stdio},
     sync::Mutex,
@@ -58,11 +78,116 @@ use crate::{
 
 /// Requests one operation keeps in flight (reads, writes, fsyncs).
 const WINDOW: usize = 64;
-/// A request with no reply and no other traffic for this long fails.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long a request may go unanswered (see `sftp_client.rs`) by default.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+/// Largest file one `read` accepts by default.
+pub const DEFAULT_MAX_FILE: u64 = 4 << 30;
+/// Most entries one directory listing accepts by default. A repository's
+/// largest directories are its pack directory (two files per push) and its
+/// loose-object fan-out directories.
+pub const DEFAULT_MAX_LISTING: usize = 1_000_000;
+/// How much longer than the server said a file read by `read` may turn
+/// out to be (it was replaced between the stat and the open).
+pub const READ_SLACK: u64 = 16 << 20;
+/// Most bytes of names one directory listing accepts.
+pub const MAX_LISTING_BYTES: u64 = 256 << 20;
+/// Empty `READDIR` batches in a row accepted before a listing fails.
+const MAX_EMPTY_BATCHES: u32 = 4;
+/// Deepest directory tree `remove_dir_all` descends into.
+const MAX_REMOVE_DEPTH: usize = 256;
+
+/// Limits and timing of an SFTP connection (see the module documentation).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SftpOptions {
+    /// A request unanswered for this long fails and closes the connection.
+    pub timeout: Duration,
+    /// Largest file one read accepts.
+    pub max_file: u64,
+    /// Most entries one directory listing accepts.
+    pub max_listing: usize,
+}
+
+impl Default for SftpOptions {
+    fn default() -> Self {
+        SftpOptions {
+            timeout: DEFAULT_TIMEOUT,
+            max_file: DEFAULT_MAX_FILE,
+            max_listing: DEFAULT_MAX_LISTING,
+        }
+    }
+}
+
+impl SftpOptions {
+    /// The defaults, overridden by `VEIL_SFTP_TIMEOUT`, `VEIL_SFTP_MAX_FILE`
+    /// and `VEIL_SFTP_MAX_LISTING`.
+    pub fn from_env() -> Result<SftpOptions> {
+        let var = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+        let bad = |name: &str, v: &str, what: &str| VeilError::repo(format!("{name}={v:?}: expected {what}"));
+        let mut o = SftpOptions::default();
+        if let Some(v) = var("VEIL_SFTP_TIMEOUT") {
+            o.timeout = v
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|s| *s > 0.0)
+                .and_then(|s| Duration::try_from_secs_f64(s).ok())
+                .ok_or_else(|| bad("VEIL_SFTP_TIMEOUT", &v, "a positive number of seconds"))?;
+        }
+        if let Some(v) = var("VEIL_SFTP_MAX_FILE") {
+            o.max_file = parse_size(&v).ok_or_else(|| bad("VEIL_SFTP_MAX_FILE", &v, "a size such as 8G"))?;
+        }
+        if let Some(v) = var("VEIL_SFTP_MAX_LISTING") {
+            o.max_listing = v
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or_else(|| bad("VEIL_SFTP_MAX_LISTING", &v, "a number of entries"))?;
+        }
+        Ok(o)
+    }
+}
+
+/// `123`, `64K`, `512M`, `8G`, `1T` (binary multiples; `KiB`, `MB` … and
+/// lower case also accepted).
+fn parse_size(v: &str) -> Option<u64> {
+    let v = v.trim();
+    let digits = v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len());
+    let (n, unit) = v.split_at(digits);
+    let n: u64 = n.parse().ok()?;
+    let shift = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 0,
+        "k" | "kb" | "kib" => 10,
+        "m" | "mb" | "mib" => 20,
+        "g" | "gb" | "gib" => 30,
+        "t" | "tb" | "tib" => 40,
+        _ => return None,
+    };
+    n.checked_mul(1u64 << shift).filter(|n| *n > 0)
+}
+
+/// The error for a read or listing that passed one of the limits.
+fn too_big(path: &str, what: String) -> VeilError {
+    io_error(path, io::Error::new(io::ErrorKind::InvalidData, format!("sftp: {what}")))
+}
+
+fn fmt_bytes(n: u64) -> String {
+    const UNITS: [(u64, &str); 4] = [(1 << 40, "TiB"), (1 << 30, "GiB"), (1 << 20, "MiB"), (1 << 10, "KiB")];
+    for (size, unit) in UNITS {
+        if n >= size {
+            return if n.is_multiple_of(size) {
+                format!("{} {unit}", n / size)
+            } else {
+                format!("{:.1} {unit}", n as f64 / size as f64)
+            };
+        }
+    }
+    format!("{n} bytes")
+}
 
 pub struct SftpBackend {
     client: Client,
+    opts: SftpOptions,
     /// Directory on the server, without a trailing `/` (`""`: the login
     /// directory, `"/"`: the server root).
     root: String,
@@ -111,12 +236,13 @@ impl SftpBackend {
     /// server. The command's stderr is inherited, so `ssh` can report
     /// authentication problems and ask for passwords on the terminal.
     pub fn spawn(mut cmd: Command, root: &str, label: &str) -> Result<SftpBackend> {
+        let opts = SftpOptions::from_env()?;
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
         let program = cmd.get_program().to_string_lossy().into_owned();
         let mut child = cmd.spawn().map_err(|e| conn_err(&program, e))?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
-        match Self::from_streams(stdout, stdin, root, label) {
+        match Self::from_streams_with(stdout, stdin, root, label, opts) {
             Ok(b) => {
                 *b.child.lock().unwrap() = Some(child);
                 Ok(b)
@@ -137,7 +263,18 @@ impl SftpBackend {
         root: &str,
         label: &str,
     ) -> Result<SftpBackend> {
-        let client = Client::start(Box::new(reader), Box::new(io::BufWriter::new(writer)), DEFAULT_TIMEOUT)
+        Self::from_streams_with(reader, writer, root, label, SftpOptions::from_env()?)
+    }
+
+    /// [`SftpBackend::from_streams`] with explicit limits and timeout.
+    pub fn from_streams_with(
+        reader: impl Read + Send + 'static,
+        writer: impl Write + Send + 'static,
+        root: &str,
+        label: &str,
+        opts: SftpOptions,
+    ) -> Result<SftpBackend> {
+        let client = Client::start(Box::new(reader), Box::new(io::BufWriter::new(writer)), opts.timeout)
             .map_err(|e| conn_err(label, e))?;
         let root = if root == "/" {
             "/".to_string()
@@ -146,6 +283,7 @@ impl SftpBackend {
         };
         Ok(SftpBackend {
             client,
+            opts,
             root,
             label: label.to_string(),
             unsynced: Mutex::default(),
@@ -219,31 +357,54 @@ impl SftpBackend {
     }
 
     /// Read `[offset, offset + len)` (`exact`), or from `offset` to the end
-    /// of the file with `len` as a size hint. Up to [`WINDOW`] reads are in
-    /// flight; short reads are re-requested.
-    fn read_handle(&self, path: &str, handle: &[u8], offset: u64, len: u64, exact: bool) -> Result<Vec<u8>> {
+    /// of the file with `len` as a size hint, failing once more than `limit`
+    /// bytes arrive. Up to [`WINDOW`] reads are in flight; short reads are
+    /// re-requested. Data goes straight into the result buffer, which never
+    /// grows past `limit`.
+    fn read_handle(
+        &self,
+        path: &str,
+        handle: &[u8],
+        offset: u64,
+        len: u64,
+        exact: bool,
+        limit: u64,
+    ) -> Result<Vec<u8>> {
+        let bad = |m: &str| io_error(path, io::Error::new(io::ErrorKind::InvalidData, format!("sftp: {m}")));
         let chunk = u64::from(self.client.max_read);
-        let mut want: VecDeque<(u64, u64)> = VecDeque::new();
-        let end = offset + len;
-        let mut o = offset;
-        while o < end {
-            let n = chunk.min(end - o);
-            want.push_back((o, n));
-            o += n;
-        }
-        // Until EOF: always probe past the expected end, so a file that is
-        // longer than its size hint is still read completely.
-        let mut next = end;
+        let end = offset.checked_add(len).ok_or_else(|| bad("read range overflows"))?;
+        // Past `cap` is too much: the requested end when exact, else the limit.
+        let cap = if exact { end } else { offset.saturating_add(limit) };
+        // Short-read remainders, served before new ranges.
+        let mut retry: VecDeque<(u64, u64)> = VecDeque::new();
+        // Next offset to ask for. Until EOF, the reader probes past the
+        // expected end (two requests at a time), so a file that is longer
+        // than its size hint is still read completely, up to `cap`; one
+        // probe past `cap` shows whether the file goes on.
+        let mut next = offset;
         let mut eof: Option<u64> = if exact { Some(end) } else { None };
-        let mut got: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        // The size is the server's word: reserve it if the system lets us,
+        // else grow as data actually arrives.
+        let mut out: Vec<u8> = Vec::new();
+        let _ = out.try_reserve_exact(len.min(limit) as usize);
+        // Every piece placed: (offset, length). They never overlap.
+        let mut pieces: Vec<(u64, u64)> = Vec::new();
         let mut inflight: VecDeque<(u64, u64, Pending)> = VecDeque::new();
         loop {
-            if !exact && eof.is_none() && want.is_empty() && inflight.len() < 2 {
-                want.push_back((next, chunk));
-                next += chunk;
-            }
             while inflight.len() < WINDOW {
-                let Some((o, n)) = want.pop_front() else { break };
+                let (o, n) = if let Some(r) = retry.pop_front() {
+                    r
+                } else if next < end {
+                    let n = chunk.min(end - next);
+                    (next, n)
+                } else if eof.is_none() && inflight.len() < 2 && next <= cap {
+                    (next, chunk)
+                } else {
+                    break;
+                };
+                if o >= next {
+                    next = o + n;
+                }
                 if eof.is_some_and(|e| o >= e) {
                     continue;
                 }
@@ -254,14 +415,28 @@ impl SftpBackend {
             }
             let Some((o, n, p)) = inflight.pop_front() else { break };
             match self.wait(path, p)? {
-                Reply::Data(d) if d.is_empty() || d.len() as u64 > n => {
-                    return Err(io_error(path, io::Error::new(io::ErrorKind::InvalidData, "sftp: bad read reply")));
-                }
+                Reply::Data(d) if d.is_empty() || d.len() as u64 > n => return Err(bad("bad read reply")),
                 Reply::Data(d) => {
                     let k = d.len() as u64;
-                    got.insert(o, d);
+                    if o + k > cap {
+                        return Err(too_big(
+                            path,
+                            format!(
+                                "the server sent more than {} for this file (limit: the size it stated plus {}, at most {}; VEIL_SFTP_MAX_FILE raises it)",
+                                fmt_bytes(cap - offset),
+                                fmt_bytes(READ_SLACK),
+                                fmt_bytes(self.opts.max_file)
+                            ),
+                        ));
+                    }
+                    let at = (o - offset) as usize;
+                    if out.len() < at + d.len() {
+                        out.resize(at + d.len(), 0);
+                    }
+                    out[at..at + d.len()].copy_from_slice(&d);
+                    pieces.push((o, k));
                     if k < n {
-                        want.push_front((o + k, n - k));
+                        retry.push_front((o + k, n - k));
                     }
                 }
                 Reply::Status(FX_EOF, _) => {
@@ -277,22 +452,16 @@ impl SftpBackend {
             }
         }
         let stop = eof.unwrap_or(end);
-        let mut out = Vec::with_capacity((stop - offset) as usize);
-        let mut pos = offset;
-        for (o, d) in got {
-            if o >= stop {
-                break;
-            }
-            if o != pos {
-                return Err(io_error(path, io::Error::new(io::ErrorKind::InvalidData, "sftp: gap in read")));
-            }
-            let take = (stop - o).min(d.len() as u64) as usize;
-            out.extend_from_slice(&d[..take]);
-            pos += take as u64;
-        }
-        if pos != stop {
+        // Pieces are disjoint, so the bytes they cover below `stop` add up
+        // to its distance from `offset` exactly when nothing is missing.
+        let covered: u64 = pieces
+            .iter()
+            .map(|&(o, k)| (o + k).min(stop).saturating_sub(o.min(stop)))
+            .sum();
+        if covered != stop - offset {
             return Err(io_error(path, io::Error::new(io::ErrorKind::UnexpectedEof, "sftp: short read")));
         }
+        out.truncate((stop - offset) as usize);
         Ok(out)
     }
 
@@ -466,18 +635,43 @@ impl SftpBackend {
         Ok(())
     }
 
-    /// Raw directory listing (names other than `.` and `..`).
+    /// Raw directory listing (names other than `.` and `..`), failing once
+    /// it passes [`SftpOptions::max_listing`] entries or
+    /// [`MAX_LISTING_BYTES`] of names.
     fn readdir(&self, path: &str) -> Result<Vec<(String, Attrs)>> {
         let p = self.send(path, FXP_OPENDIR, |b| {
             b.str(path);
         })?;
         let h = self.wait(path, p)?.handle(path)?;
         let mut out = Vec::new();
+        let (mut entries, mut bytes, mut empty) = (0usize, 0u64, 0u32);
         let res = loop {
             match self.call(path, FXP_READDIR, |b| {
                 b.bytes(&h);
             }) {
-                Ok(Reply::Name(names)) => out.extend(names.into_iter().filter(|(n, _)| n != "." && n != "..")),
+                Ok(Reply::Name(names)) if names.is_empty() => {
+                    // Not EOF, and no progress either: tolerated a few times.
+                    empty += 1;
+                    if empty > MAX_EMPTY_BATCHES {
+                        break Err(too_big(path, "the server keeps sending empty directory batches".into()));
+                    }
+                }
+                Ok(Reply::Name(names)) => {
+                    empty = 0;
+                    entries += names.len();
+                    bytes += names.iter().map(|(n, _)| n.len() as u64).sum::<u64>();
+                    if entries > self.opts.max_listing || bytes > MAX_LISTING_BYTES {
+                        break Err(too_big(
+                            path,
+                            format!(
+                                "directory listing passed {} entries or {} of names (VEIL_SFTP_MAX_LISTING raises the entry limit)",
+                                self.opts.max_listing,
+                                fmt_bytes(MAX_LISTING_BYTES)
+                            ),
+                        ));
+                    }
+                    out.extend(names.into_iter().filter(|(n, _)| n != "." && n != ".."));
+                }
                 Ok(Reply::Status(FX_EOF, _)) => break Ok(()),
                 Ok(r) => break r.ok(path),
                 Err(e) => break Err(e),
@@ -487,30 +681,43 @@ impl SftpBackend {
         res.map(|()| out)
     }
 
-    /// Kind of each entry, asking the server for entries whose listing
-    /// carried no permissions.
+    /// Kind of each entry, asking the server (many requests in flight) for
+    /// entries whose listing carried no permissions.
     fn typed(&self, dir: &str, entries: Vec<(String, Attrs)>) -> Result<Vec<(String, FileType)>> {
-        let mut out = Vec::with_capacity(entries.len());
-        for (name, a) in entries {
-            let t = match a.file_type() {
-                FileType::Unknown => self
-                    .lstat(&format!("{dir}/{name}"))?
-                    .map_or(FileType::Unknown, |a| a.file_type()),
-                t => t,
-            };
-            out.push((name, t));
+        let mut out: Vec<(String, FileType)> = entries.into_iter().map(|(n, a)| (n, a.file_type())).collect();
+        let unknown: Vec<usize> = (0..out.len()).filter(|&i| out[i].1 == FileType::Unknown).collect();
+        for group in unknown.chunks(WINDOW) {
+            let asked = group
+                .iter()
+                .map(|&i| {
+                    let child = format!("{dir}/{}", out[i].0);
+                    let p = self.send(&child, FXP_LSTAT, |b| {
+                        b.str(&child);
+                    })?;
+                    Ok((i, child, p))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for (i, child, p) in asked {
+                out[i].1 = match self.wait(&child, p)? {
+                    Reply::Status(FX_NO_SUCH_FILE, _) => FileType::Unknown,
+                    r => r.attrs(&child)?.file_type(),
+                };
+            }
         }
         Ok(out)
     }
 
-    fn remove_tree(&self, path: &str) -> Result<()> {
+    fn remove_tree(&self, path: &str, depth: usize) -> Result<()> {
+        if depth > MAX_REMOVE_DEPTH || path.len() > 4096 {
+            return Err(too_big(path, format!("directory tree deeper than {MAX_REMOVE_DEPTH} levels")));
+        }
         let entries = self.readdir(path)?;
         let entries = self.typed(path, entries)?;
         let mut pending = Vec::new();
         for (name, t) in entries {
             let child = format!("{path}/{name}");
             if t == FileType::Dir {
-                self.remove_tree(&child)?;
+                self.remove_tree(&child, depth + 1)?;
             } else {
                 pending.push((
                     child.clone(),
@@ -593,7 +800,18 @@ impl StorageBackend for SftpBackend {
                 // Replaced between the stat and the open: read to the end.
                 _ => 0,
             };
-            self.read_handle(&path, &handle, 0, size, false)
+            if size > self.opts.max_file {
+                return Err(too_big(
+                    &path,
+                    format!(
+                        "the server says this file is {}, more than the {} limit (VEIL_SFTP_MAX_FILE raises it)",
+                        fmt_bytes(size),
+                        fmt_bytes(self.opts.max_file)
+                    ),
+                ));
+            }
+            let limit = size.saturating_add(READ_SLACK).min(self.opts.max_file);
+            self.read_handle(&path, &handle, 0, size, false, limit)
         })();
         self.close_detached(&path, &handle);
         res
@@ -601,12 +819,22 @@ impl StorageBackend for SftpBackend {
 
     fn read_range(&self, p: &VPath, offset: u64, len: usize) -> Result<Vec<u8>> {
         let path = self.rp(p);
+        if len as u64 > self.opts.max_file {
+            return Err(too_big(
+                &path,
+                format!(
+                    "a read of {} is more than the {} limit (VEIL_SFTP_MAX_FILE raises it)",
+                    fmt_bytes(len as u64),
+                    fmt_bytes(self.opts.max_file)
+                ),
+            ));
+        }
         let op = self.open(&path, FXF_READ)?;
         let handle = self.wait(&path, op)?.handle(&path)?;
         let res = if len == 0 {
             Ok(Vec::new())
         } else {
-            self.read_handle(&path, &handle, offset, len as u64, true)
+            self.read_handle(&path, &handle, offset, len as u64, true, len as u64)
         };
         self.close_detached(&path, &handle);
         res
@@ -718,7 +946,7 @@ impl StorageBackend for SftpBackend {
         let path = self.rp(p);
         match self.lstat(&path)? {
             None => Ok(()),
-            Some(a) if a.file_type() == FileType::Dir => self.remove_tree(&path),
+            Some(a) if a.file_type() == FileType::Dir => self.remove_tree(&path, 0),
             Some(_) => self.remove(&path),
         }
     }
@@ -785,5 +1013,33 @@ impl SftpBackend {
     /// Is the connection gone (server exited, network failure)?
     pub fn is_disconnected(&self) -> bool {
         self.client.is_dead()
+    }
+
+    /// The limits and timeout this connection runs with.
+    pub fn options(&self) -> &SftpOptions {
+        &self.opts
+    }
+
+    /// How far the server's clock is ahead of this machine's, in
+    /// milliseconds (negative: behind). Measured with the modification
+    /// time of an empty probe file created in `dir` and removed again; it
+    /// is named like a temp file (`.clock.vltmp…`), so Veil treats it as
+    /// crash debris if it is ever left behind. Precise to about a second
+    /// (SFTP version 3 times are whole seconds) plus half the round trip.
+    pub fn clock_offset(&self, dir: &VPath) -> Result<i64> {
+        let tmp = Self::temp_name(&self.rp(&dir.join("clock")));
+        let before = crate::now_millis();
+        let p = self.open(&tmp, FXF_WRITE | FXF_CREAT | FXF_EXCL)?;
+        let h = self.wait(&tmp, p)?.handle(&tmp)?;
+        let after = crate::now_millis();
+        let closed = self.close(&tmp, &h);
+        let stat = closed.and_then(|()| self.lstat(&tmp));
+        let _ = self.remove(&tmp);
+        let mtime = stat?
+            .and_then(|a| a.mtime)
+            .ok_or_else(|| io_error(&tmp, io::Error::other("the server reports no modification time")))?;
+        // The file was created between `before` and `after`; `mtime` is
+        // that moment rounded down to the second.
+        Ok(i64::from(mtime) * 1000 + 500 - (before + after) / 2)
     }
 }

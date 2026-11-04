@@ -90,6 +90,26 @@
 //!   `grace` *between* its final check and the single write that moves the
 //!   operation head (SFTP has no compare-and-swap). Its token check then
 //!   catches every later step.
+//! * **Renewal and release are fenced too.** A renewal reads the file,
+//!   checks the token, then rewrites it; a takeover landing in between
+//!   would be overwritten. That can only happen to a write that lands
+//!   `lease + grace` after the previous renewal started, so a renewal that
+//!   returns after the holder's lease lapsed counts as losing the lock
+//!   (both sides then fail rather than both publish), and a lapsed holder
+//!   never removes the file on release.
+//! * **Clock skew beyond the allowance.** The wall-clock rule assumes the
+//!   holder's and the contender's clocks agree within `skew`. A contender
+//!   whose clock runs more than `lease + grace + skew` (165 s) ahead of a
+//!   live holder's takes its lock over at once. The holder notices at its
+//!   next renewal or [`RepoLock::ensure_held`] and fails, so the expected
+//!   result is a failed push, not a double publish. Two races remain, and
+//!   neither needs a stall any more: a takeover that lands between a
+//!   renewal's check and its write is overwritten (the contender then
+//!   fails instead of the holder), and one that lands between the
+//!   holder's final check and its operation-head write lets both publish
+//!   (the residual window above). `vl doctor --remotes` measures this
+//!   machine's clock against each SSH remote's and warns about large
+//!   differences.
 //! * Locks without the flag (local holders, older versions) keep the
 //!   provably-gone rule: they are never taken over from another host.
 //!
@@ -821,8 +841,13 @@ impl Drop for RepoLock {
         // Only remove the file if it is still ours. The token stays
         // registered until then, so no thread of this process can steal it
         // between the check and the removal.
+        // A fencing holder whose lease lapsed cannot tell whether a file
+        // carrying its token is still its lock (a late renewal may have
+        // replaced a successor's): it leaves the file alone, and the next
+        // contender takes it over (with crash recovery) once it expires.
+        let fenced = || self.fence.as_ref().is_some_and(|f| self.lost.load(Ordering::SeqCst) || f.lapsed());
         if let Ok(Some(raw)) = self.backend.read_opt(&self.path) {
-            if LockInfo::parse(&raw).is_some_and(|i| i.token == self.token) {
+            if LockInfo::parse(&raw).is_some_and(|i| i.token == self.token) && !fenced() {
                 if self.abandoned {
                     // Durably flagged; if even that fails, the file stays as
                     // it is, which a contender reclaims once this process
@@ -885,6 +910,21 @@ impl Heartbeat {
                             // a fencing holder's lease runs out meanwhile.
                             if backend.write(&path, &encode(&info, &extra)).is_ok() {
                                 if let Some(f) = &fence {
+                                    // The check above and this write are not
+                                    // atomic (SFTP has no compare-and-swap),
+                                    // so the write may have replaced a
+                                    // takeover that landed in between. No
+                                    // contender takes over before our previous
+                                    // renewal is `lease + grace` old; a write
+                                    // that returned before our lease lapsed
+                                    // landed before that. One that returned
+                                    // later may have overwritten a successor:
+                                    // the lease is then treated as lost, so
+                                    // neither side publishes.
+                                    if f.lapsed() {
+                                        lost.store(true, Ordering::SeqCst);
+                                        return;
+                                    }
                                     *f.confirmed.lock().unwrap_or_else(|e| e.into_inner()) = started;
                                 }
                                 next = started + every;

@@ -364,7 +364,9 @@ something is broken:
 * **Clock:** set, not behind the last recorded operation, and in step with
   the filesystem's clock (a network share's server).
 * **Remotes**, with `vl doctor --remotes`: each remote can be reached and is
-  a Veil repository.
+  a Veil repository; for SSH remotes, also that the server's clock is within
+  60 s of this machine's (remote locks allow 2 minutes of clock difference
+  between clients).
 
 ## Repository layout
 
@@ -436,4 +438,7 @@ they do for Git (`VEIL_SSH` replaces the command). Cloaked content is
 encrypted before it leaves your machine. Pushes send one pack of what the
 remote lacks; pulls download what they lack in a few round trips. A client
 that crashes mid-push leaves a lease-based lock that the next push takes
-over after at most about 45 seconds.
+over after at most about 45 seconds. A server that stops answering fails the
+command after 5 minutes (`VEIL_SFTP_TIMEOUT`, in seconds); a single file over
+4 GiB (`VEIL_SFTP_MAX_FILE`, e.g. `8G`) or a directory of more than a million
+entries (`VEIL_SFTP_MAX_LISTING`) is refused rather than buffered.

@@ -21,7 +21,7 @@ mod sftp_url;
 pub use disk::{parse_folding, probe_folding, DiskBackend, FOLDING_ENV};
 pub use memory::MemoryBackend;
 pub use overlay::{OverlayBackend, OverlayChanges};
-pub use sftp::{SftpBackend, SftpStats};
+pub use sftp::{SftpBackend, SftpOptions, SftpStats};
 pub use sftp_url::SshUrl;
 
 pub use crate::vpath::NameFolding;

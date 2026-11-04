@@ -116,8 +116,14 @@ fn ssh_remotes_through_a_stand_in_ssh() {
     let remote = env.root.join("srv/team.veil");
     round_trip(&env, &format!("someone@example.invalid:{}", remote.display()), &remote);
 
-    // Malformed SSH URLs are refused up front.
+    // `vl doctor --remotes` connects, and compares the remote's clock with
+    // ours (the same machine here, so within a second or two).
     let proj = env.root.join("proj");
+    let out = env.ok("alice", &proj, &["doctor", "--remotes"]);
+    assert!(out.contains("origin (") && out.contains("reachable in"), "{out}");
+    assert!(out.contains("origin's clock is within"), "{out}");
+
+    // Malformed SSH URLs are refused up front.
     let out = env.vl("alice", &proj, &["remote", "add", "bad", "ssh://-oProxyCommand=x/r"]);
     assert!(!out.status.success());
 }

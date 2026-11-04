@@ -13,10 +13,28 @@
 //! (`openssh-sftp-client`, `russh-sftp`, `ssh2`) either need an async
 //! runtime under a synchronous `StorageBackend`, or bring their own SSH
 //! implementation instead of the user's `ssh` (see `sftp.rs`).
+//!
+//! **A hostile or broken server cannot hang or exhaust the client** (BUG-065,
+//! BUG-066):
+//!
+//! * Requests are written by a writer thread, so a server that stops
+//!   reading blocks that thread, never a caller, and the request times out.
+//! * Every request has its own deadline: it fails once `timeout` has passed
+//!   since it was sent, or since the latest reply to a request sent
+//!   *before* it, whichever is later. Replies to earlier requests extend it
+//!   because servers answer in order: on a slow link a deep pipeline is
+//!   progress, not silence. Replies to later requests (another thread's)
+//!   and replies to no request at all never extend it.
+//! * A reply carrying an id that no request is waiting for is a protocol
+//!   error: after [`MAX_STRAY`] of them the connection is closed.
+//! * The handshake has the same timeout.
+//! * Replies longer than [`MAX_PACKET`] close the connection; `sftp.rs`
+//!   bounds what one file read or directory listing may accumulate.
 
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     io::{self, Read, Write},
+    ops::Bound,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc, Arc, Mutex,
@@ -77,9 +95,19 @@ const S_IFMT: u32 = 0o170_000;
 const S_IFDIR: u32 = 0o040_000;
 const S_IFREG: u32 = 0o100_000;
 
-/// Largest reply accepted from the server. OpenSSH never sends more than
-/// 256 KiB; anything far bigger is a broken or hostile server.
-const MAX_PACKET: usize = 8 << 20;
+/// Largest packet accepted from the server (its length field). OpenSSH
+/// never sends more than 256 KiB and Veil never asks for more than 255 KiB
+/// of data at once; anything far bigger is a broken or hostile server.
+pub(crate) const MAX_PACKET: usize = 1 << 20;
+
+/// Replies to requests nobody is waiting for (unknown or repeated ids)
+/// tolerated per connection before it is closed as a protocol error.
+/// Veil itself never abandons a request id, so a correct server sends none.
+pub(crate) const MAX_STRAY: u32 = 16;
+
+/// Longest status message kept from the server (it ends up in errors shown
+/// on the user's terminal).
+const MAX_STATUS_MESSAGE: usize = 200;
 
 /// What a reply looked like when its kind could not be used.
 fn unexpected(what: &str) -> io::Error {
@@ -256,8 +284,23 @@ pub(crate) fn status_error(path: &str, code: u32, msg: &str) -> VeilError {
         FX_FILE_ALREADY_EXISTS => io::ErrorKind::AlreadyExists,
         _ => io::ErrorKind::Other,
     };
-    let msg = if msg.is_empty() { "failure" } else { msg };
+    let msg = printable(msg);
+    let msg = if msg.is_empty() { "failure".to_string() } else { msg };
     io_error(path, io::Error::new(kind, format!("sftp: {msg} (status {code})")))
+}
+
+/// `msg` from the server without control characters (terminal escapes)
+/// and cut to [`MAX_STATUS_MESSAGE`] characters.
+fn printable(msg: &str) -> String {
+    let mut out: String = msg
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_STATUS_MESSAGE)
+        .collect();
+    if msg.chars().count() > MAX_STATUS_MESSAGE {
+        out.push('…');
+    }
+    out.trim().to_string()
 }
 
 pub(crate) fn io_error(path: &str, e: io::Error) -> VeilError {
@@ -319,18 +362,39 @@ pub struct SftpStats {
 
 type Waiter = mpsc::Sender<io::Result<Reply>>;
 
-#[derive(Default)]
+/// A request waiting for its reply.
+struct Slot {
+    tx: Waiter,
+    /// Milliseconds since [`Shared::epoch`] from which this request's
+    /// timeout runs: when it was sent, or the latest reply to an earlier
+    /// request.
+    since: Arc<AtomicU64>,
+}
+
 struct Shared {
-    pending: Mutex<HashMap<u32, Waiter>>,
+    pending: Mutex<BTreeMap<u32, Slot>>,
     /// Why the connection is gone, once it is.
     dead: Mutex<Option<String>>,
-    last_rx: Mutex<Option<Instant>>,
+    epoch: Instant,
+    stray: AtomicU32,
     requests: AtomicU64,
     sent: AtomicU64,
     received: AtomicU64,
 }
 
 impl Shared {
+    fn new() -> Shared {
+        Shared {
+            pending: Mutex::default(),
+            dead: Mutex::default(),
+            epoch: Instant::now(),
+            stray: AtomicU32::new(0),
+            requests: AtomicU64::new(0),
+            sent: AtomicU64::new(0),
+            received: AtomicU64::new(0),
+        }
+    }
+
     fn kill(&self, why: String) {
         let mut d = self.dead.lock().unwrap_or_else(|e| e.into_inner());
         if d.is_none() {
@@ -344,16 +408,22 @@ impl Shared {
     fn dead_reason(&self) -> Option<String> {
         self.dead.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
+
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
 }
 
 pub(crate) struct Client {
-    writer: Mutex<Option<Box<dyn Write + Send>>>,
+    /// Packets for the writer thread; `None` once closed.
+    writer: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     shared: Arc<Shared>,
     next_id: AtomicU32,
     pub(crate) ext: Extensions,
     pub(crate) max_read: u32,
     pub(crate) max_write: u32,
-    /// A request with no reply and no other traffic for this long fails.
+    /// A request with no reply for this long (see the module documentation)
+    /// fails, and closes the connection.
     timeout: Duration,
     closed: AtomicBool,
 }
@@ -368,31 +438,38 @@ impl std::fmt::Debug for Client {
 pub(crate) struct Pending {
     rx: mpsc::Receiver<io::Result<Reply>>,
     shared: Arc<Shared>,
-    sent: Instant,
+    since: Arc<AtomicU64>,
     timeout: Duration,
 }
 
 impl Pending {
     pub(crate) fn wait(self) -> io::Result<Reply> {
+        let poll = self.timeout.min(Duration::from_millis(500));
         loop {
-            match self.rx.recv_timeout(Duration::from_millis(500)) {
+            match self.rx.recv_timeout(poll) {
                 Ok(r) => return r,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return Err(lost(self.shared.dead_reason()));
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // Time out only when the server has gone quiet: replies
-                    // to other requests (a big batch ahead of us) count.
-                    let last = (*self.shared.last_rx.lock().unwrap_or_else(|e| e.into_inner()))
-                        .map_or(self.sent, |t| t.max(self.sent));
-                    if last.elapsed() >= self.timeout {
-                        let why = format!("no reply from the SFTP server for {}s", self.timeout.as_secs());
+                    let since = self.since.load(Ordering::Relaxed);
+                    let waited = Duration::from_millis(self.shared.now_ms().saturating_sub(since));
+                    if waited >= self.timeout {
+                        let why = format!("no reply from the SFTP server for {}", fmt_secs(self.timeout));
                         self.shared.kill(why.clone());
                         return Err(lost(Some(why)));
                     }
                 }
             }
         }
+    }
+}
+
+fn fmt_secs(d: Duration) -> String {
+    if d.subsec_millis() == 0 {
+        format!("{}s", d.as_secs())
+    } else {
+        format!("{:.1}s", d.as_secs_f64())
     }
 }
 
@@ -408,37 +485,85 @@ fn read_packet(r: &mut dyn Read) -> io::Result<Vec<u8>> {
     r.read_exact(&mut len)?;
     let len = u32::from_be_bytes(len) as usize;
     if len == 0 || len > MAX_PACKET {
-        return Err(unexpected(&format!("packet of {len} bytes")));
+        return Err(unexpected(&format!(
+            "a packet of {len} bytes; at most {MAX_PACKET} are accepted"
+        )));
     }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     Ok(buf)
 }
 
+/// Write queued packets in order, batching whatever is queued before each
+/// flush. Ends when the client closes (and the queue is drained) or a
+/// write fails; dropping `writer` then tells the server we are done.
+fn writer_loop(mut writer: Box<dyn Write + Send>, rx: &mpsc::Receiver<Vec<u8>>, shared: &Shared) {
+    while let Ok(first) = rx.recv() {
+        let mut res = writer.write_all(&first);
+        while res.is_ok() {
+            match rx.try_recv() {
+                Ok(more) => res = writer.write_all(&more),
+                Err(_) => break,
+            }
+        }
+        if let Err(e) = res.and_then(|()| writer.flush()) {
+            shared.kill(format!("write failed: {e}"));
+            return;
+        }
+    }
+    let _ = writer.flush();
+}
+
 impl Client {
-    /// Run the version handshake over `reader`/`writer`, then start the
-    /// reader thread.
+    /// Run the version handshake over `reader`/`writer` (failing after
+    /// `timeout` without an answer), with the reader and writer threads
+    /// running.
     pub(crate) fn start(
         mut reader: Box<dyn Read + Send>,
-        mut writer: Box<dyn Write + Send>,
+        writer: Box<dyn Write + Send>,
         timeout: Duration,
     ) -> io::Result<Client> {
+        let shared = Arc::new(Shared::new());
+        let (wtx, wrx) = mpsc::channel::<Vec<u8>>();
+        let w_shared = shared.clone();
+        std::thread::Builder::new()
+            .name("veil-sftp-writer".into())
+            .spawn(move || writer_loop(writer, &wrx, &w_shared))?;
         let mut init = Vec::with_capacity(9);
         init.extend_from_slice(&5u32.to_be_bytes());
         init.push(FXP_INIT);
         init.extend_from_slice(&3u32.to_be_bytes());
-        writer.write_all(&init)?;
-        writer.flush()?;
-        let pkt = read_packet(&mut *reader).map_err(|e| {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
-                io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    "the SFTP server closed the connection during the handshake (is SSH access and the sftp subsystem available?)",
-                )
-            } else {
-                e
+        let _ = wtx.send(init);
+
+        // The reader thread reads the version reply first and hands it over.
+        let (htx, hrx) = mpsc::channel::<io::Result<Vec<u8>>>();
+        let rx_shared = shared.clone();
+        std::thread::Builder::new().name("veil-sftp-reader".into()).spawn(move || {
+            let first = read_packet(&mut *reader);
+            let ok = first.is_ok();
+            let _ = htx.send(first);
+            if ok {
+                reader_loop(&mut *reader, &rx_shared);
             }
         })?;
+        let pkt = match hrx.recv_timeout(timeout) {
+            Ok(Ok(pkt)) => pkt,
+            Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "the SFTP server closed the connection during the handshake (is SSH access and the sftp subsystem available?)",
+                ))
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                shared.kill("handshake timed out".into());
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("the SFTP server did not answer the handshake within {}", fmt_secs(timeout)),
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(lost(shared.dead_reason())),
+        };
         let mut c = Cursor { buf: &pkt, at: 0 };
         if c.take(1)?[0] != FXP_VERSION {
             return Err(unexpected("wanted the version reply"));
@@ -462,13 +587,8 @@ impl Client {
                 _ => {}
             }
         }
-        let shared = Arc::new(Shared::default());
-        let rx_shared = shared.clone();
-        std::thread::Builder::new()
-            .name("veil-sftp-reader".into())
-            .spawn(move || reader_loop(&mut *reader, &rx_shared))?;
         let mut client = Client {
-            writer: Mutex::new(Some(writer)),
+            writer: Mutex::new(Some(wtx)),
             shared,
             next_id: AtomicU32::new(1),
             ext,
@@ -502,44 +622,58 @@ impl Client {
     }
 
     /// Send one request; the reply arrives through the returned [`Pending`].
-    /// Requests are written in call order.
+    /// Requests are written in call order, by the writer thread.
     pub(crate) fn send(&self, kind: u8, build: impl FnOnce(&mut Body)) -> io::Result<Pending> {
         if let Some(why) = self.shared.dead_reason() {
             return Err(lost(Some(why)));
         }
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut body = Body(Vec::with_capacity(64));
         body.u32(0).0.push(kind);
-        body.u32(id);
+        body.u32(0);
         build(&mut body);
         let len = (body.0.len() - 4) as u32;
         body.0[..4].copy_from_slice(&len.to_be_bytes());
         let (tx, rx) = mpsc::channel();
-        self.shared.pending.lock().unwrap_or_else(|e| e.into_inner()).insert(id, tx);
-        let sent = Instant::now();
-        let res = {
-            let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-            match w.as_mut() {
-                Some(w) => w.write_all(&body.0).and_then(|()| w.flush()),
-                None => Err(io::Error::new(io::ErrorKind::NotConnected, "SFTP connection closed")),
+        let since = Arc::new(AtomicU64::new(self.shared.now_ms()));
+        let size = body.0.len() as u64;
+        let queued = {
+            // Ids are taken under the writer lock, so they are queued (and
+            // written) in increasing order, as the timeout rule expects.
+            let w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+            match w.as_ref() {
+                Some(w) => {
+                    let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                    body.0[5..9].copy_from_slice(&id.to_be_bytes());
+                    self.shared.pending.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                        id,
+                        Slot {
+                            tx,
+                            since: since.clone(),
+                        },
+                    );
+                    w.send(body.0).map_err(|_| id)
+                }
+                None => return Err(io::Error::new(io::ErrorKind::NotConnected, "SFTP connection closed")),
             }
         };
-        if let Err(e) = res {
+        if let Err(id) = queued {
             self.shared.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
-            self.shared.kill(format!("write failed: {e}"));
+            self.shared.kill("the writer stopped".into());
             return Err(lost(self.shared.dead_reason()));
         }
         // A connection that died while we registered would never answer.
+        // (`kill` marks the connection dead before clearing the pending
+        // table, so either we see that here or our slot was cleared.)
         if let Some(why) = self.shared.dead_reason() {
-            self.shared.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+            self.shared.pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
             return Err(lost(Some(why)));
         }
         self.shared.requests.fetch_add(1, Ordering::Relaxed);
-        self.shared.sent.fetch_add(body.0.len() as u64, Ordering::Relaxed);
+        self.shared.sent.fetch_add(size, Ordering::Relaxed);
         Ok(Pending {
             rx,
             shared: self.shared.clone(),
-            sent,
+            since,
             timeout: self.timeout,
         })
     }
@@ -556,7 +690,8 @@ impl Client {
         self.shared.dead_reason().is_some()
     }
 
-    /// Close our end; the server (or `ssh`) exits when it sees EOF.
+    /// Close our end; the server (or `ssh`) exits when it sees EOF, which
+    /// the writer thread sends once everything queued is written.
     pub(crate) fn close(&self) {
         if !self.closed.swap(true, Ordering::SeqCst) {
             self.writer.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -579,7 +714,6 @@ fn reader_loop(reader: &mut dyn Read, shared: &Shared) {
                 return;
             }
         };
-        *shared.last_rx.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
         shared.received.fetch_add(pkt.len() as u64 + 4, Ordering::Relaxed);
         let mut c = Cursor { buf: &pkt, at: 0 };
         let parsed = c.take(1).and_then(|k| Ok((k[0], c.u32()?)));
@@ -588,10 +722,32 @@ fn reader_loop(reader: &mut dyn Read, shared: &Shared) {
             return;
         };
         let reply = parse_reply(kind, &mut c);
-        let waiter = shared.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
-        if let Some(w) = waiter {
+        let waiter = {
+            let mut pending = shared.pending.lock().unwrap_or_else(|e| e.into_inner());
+            let waiter = pending.remove(&id);
+            if waiter.is_some() {
+                // Progress for every request sent after this one.
+                let now = shared.now_ms();
+                for slot in pending.range((Bound::Excluded(id), Bound::Unbounded)).map(|(_, s)| s) {
+                    slot.since.fetch_max(now, Ordering::Relaxed);
+                }
+            }
+            waiter
+        };
+        match waiter {
             // The waiter may have given up (fire-and-forget close).
-            let _ = w.send(reply);
+            Some(w) => {
+                let _ = w.tx.send(reply);
+            }
+            None => {
+                let n = shared.stray.fetch_add(1, Ordering::Relaxed) + 1;
+                if n > MAX_STRAY {
+                    shared.kill(format!(
+                        "protocol error: the server sent {n} replies to requests that were never made (id {id})"
+                    ));
+                    return;
+                }
+            }
         }
     }
 }

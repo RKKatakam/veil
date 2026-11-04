@@ -75,13 +75,30 @@ must not be trusted (which disables stat caching):
   round trip and reads everything in the next (255 KiB requests, short
   reads re-requested, a probe past the expected end). "No such file" maps
   to `NotFound`, other statuses to `Io` with a matching `ErrorKind`, a lost
-  connection to `ConnectionAborted`; a server silent for 5 minutes is a
-  lost connection. SFTP cannot fsync a directory, so a rename is as durable
+  connection to `ConnectionAborted`. SFTP cannot fsync a directory, so a rename is as durable
   as the server's file system makes it after the file itself was synced.
   `is_network()` is true: its lock is a fencing lease (§9) and sync batches
   requests (§8). Remote URLs are `ssh://[user@]host[:port]/path` (`/~/` for
   the home directory) and scp-style `[user@]host:path`; as in Git, a `:`
   after a `/` makes a local path.
+  *A hostile or broken server* can neither hang the client nor exhaust its
+  memory (BUG-065, BUG-066). A writer thread sends requests, so a server
+  that stops reading never blocks a caller. Every request has its own
+  timeout: 300 s (`VEIL_SFTP_TIMEOUT`, in seconds), counted from when it
+  was sent or from the latest reply to an *earlier* request (servers answer
+  in order, so a deep pipeline on a slow link is progress); the handshake
+  has the same timeout. Replies to later requests, or to none at all, never
+  extend it, and more than 16 replies to requests never made close the
+  connection as a protocol error. Packets over 1 MiB are refused. One
+  `read` accepts the size the server stated plus 16 MiB (the file may have
+  been replaced between the stat and the open; Veil's mutable files are
+  small, packs and objects never change), and never more than 4 GiB
+  (`VEIL_SFTP_MAX_FILE`, e.g. `8G`); `read_range` reads exactly what was
+  asked, within the same ceiling. A directory listing accepts 1,000,000
+  entries (`VEIL_SFTP_MAX_LISTING`) and 256 MiB of names, and
+  `remove_dir_all` descends 256 levels. Each limit fails the operation with
+  a message that names it. Status messages from the server are stripped of
+  control characters before they reach the terminal.
   *Why not a library:* `openssh-sftp-client` (with `openssh`) also drives
   the system `ssh`, but is async-only: a tokio runtime under a synchronous,
   `&self`, multi-threaded `StorageBackend`, for a protocol that takes a few
@@ -965,6 +982,25 @@ and, once renewed, when it was acquired on the backend's own stamp clock.
     holder stalled for more than `grace` *between* its final check and the
     single `op_head` write (SFTP has no compare-and-swap); its token check
     catches every later step;
+  * renewal and release are fenced the same way. A renewal reads the file,
+    checks the token, then rewrites it, so a takeover that lands in between
+    would be overwritten. A contender takes over only `lease + grace` after
+    the previous renewal started, so a renewal write that returns before
+    the holder's lease lapses landed before any takeover; one that returns
+    later counts as losing the lock (both sides then fail instead of both
+    publishing), and a holder whose lease lapsed never removes the lock
+    file on release;
+  * clock skew beyond the allowance: a contender whose clock runs more
+    than `lease + grace + skew` (165 s) ahead of a live holder's takes its
+    lock over at once by the wall-clock rule. The holder fails at its next
+    renewal or `ensure_held`, so this normally costs a failed push. Two
+    races no longer need a stall then: a takeover landing between a
+    renewal's check and its write is overwritten (the contender fails), and
+    one landing between the holder's final check and its `op_head` write
+    lets both publish. `vl doctor --remotes` measures each SSH remote's
+    clock against this machine's (the modification time of a probe file it
+    creates and removes in the remote's `.veil/`) and warns beyond 60 s,
+    half the allowance, since two clients can be off in opposite directions;
   * locks without the flag (local holders, older versions) keep the rule
     above and are never taken over from another host. The takeover guard
     is a fencing lock too, so a contender that crashed mid-takeover on
