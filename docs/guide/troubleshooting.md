@@ -305,13 +305,26 @@ failed) while it replaced your files. This command finished the move before
 recording anything. Nothing was lost: files the move did not put there were
 kept.
 
-### `error: cannot undo the last command, '…': …`
+### `error: cannot undo '…': …`
 
-The last command changed something the operation log does not hold (a key
-ring, a remote, the local vault, the accepted policy). Restoring an older
-view would not revert it, so `vl undo` refuses rather than undo an
+The command `vl undo` would undo next (the last one, or the one before what
+earlier undos took back) changed something the operation log does not hold
+(a key ring, a remote, the local vault, the accepted policy). Restoring an
+older view would not revert it, so `vl undo` refuses rather than undo an
 unrelated, earlier command. Do what the message says. To go back further
 anyway, use `vl op log` and `vl op restore ID`.
+
+### `error: cannot undo '…': it would remove workspace 'NAME', which holds edits recorded since`
+
+Undoing `vl ws new NAME` would delete the workspace with the edits recorded
+in it since. Nothing was changed. To go back anyway, pick an operation in
+`vl op log` and `vl op restore ID`; the operation log keeps those edits.
+
+### `error: nothing to redo: the last command was not an undo`
+
+`vl redo` only takes back undos, and any other command after them (editing
+files aside) clears what could be redone. `vl op log` still lists every
+state; `vl op restore ID` returns to one.
 
 ### `error: X was not recorded in workspace 'NAME': …`
 

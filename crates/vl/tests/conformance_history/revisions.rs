@@ -236,7 +236,6 @@ fn remote_tags_resolve_after_a_pull() {
 
 // Scenario from guide ("origin/main: where main was on remote origin at the last pull or push").
 #[test]
-#[ignore = "BUG-248: `vl push` does not record remote tags: `origin/main` is unknown after a push until the next pull"]
 fn remote_tags_are_recorded_by_push() {
     let env = Env::new();
     let r = env.repo("p");

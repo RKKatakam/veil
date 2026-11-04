@@ -315,6 +315,13 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             }
             let (_, undone) = ctx.repo.undo_keeping_edits(&ws)?;
             println!("Undid: {}", safe(&undone));
+            if let Some(remote) = undone.strip_prefix("push to ") {
+                println!(
+                    "The remote still has what was pushed: only what this repository remembers about it ({}/<tag>) went back. `vl pull {}` reads it again.",
+                    safe(remote),
+                    safe(remote)
+                );
+            }
             if let Some(e) = undone.strip_prefix(RELEASE_OP_PREFIX) {
                 println!("Embargo {} is unreleased again: its key had not left this repository.", safe(e));
             }
@@ -908,6 +915,12 @@ fn cmd_show(ctx: &mut Ctx, rev: &str, stat: bool) -> Result<()> {
             None => "unknown".into(),
         };
         println!("Embargo   : {} ({state})", yellow(&safe(e)));
+    }
+    // As `vl log` marks it and `vl status` lists them (BUG-245). A merge's
+    // own diff is relative to the merged parents, so it shows no markers.
+    if !s.conflicts.is_empty() {
+        let paths: Vec<String> = s.conflicts.iter().map(|c| safe(c).into_owned()).collect();
+        println!("Conflicts : {}", red(&paths.join(", ")));
     }
     println!();
     let desc = ctx.repo.description(&s);
@@ -2209,6 +2222,7 @@ fn cmd_push(ctx: &mut Ctx, name: &str, tags: &[String], force: bool, full: bool)
     let (backend, cfg) = remote_backend(ctx, name)?;
     let opts = remote::SyncOptions { full };
     let r = remote::push_with(&mut ctx.repo, backend, cfg.public, tags, force, &opts)?;
+    remote::record_pushed_tags(&mut ctx.repo, name, &r)?;
     for (t, id) in &r.tags_updated {
         println!("  {} {} → {}", green("pushed"), cyan(&safe(t)), id.short());
     }

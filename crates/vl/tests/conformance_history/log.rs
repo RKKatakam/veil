@@ -88,7 +88,9 @@ fn log_limit_elides_the_rest() {
         .count();
     assert_eq!(nodes, 2, "{log}");
     assert!(log.contains("more snapshots elided"), "{log}");
-    assert!(log.contains("c4") && !log.contains("c3"), "{log}");
+    // Description lines only: a hex snapshot id may contain "c3".
+    let described = |d: &str| log.lines().any(|l| l.trim_start_matches(['│', ' ']) == d);
+    assert!(described("c4") && !described("c3"), "{log}");
 }
 
 // Scenario from git t4217-log-limit.sh: -n 0 shows nothing but the elision.

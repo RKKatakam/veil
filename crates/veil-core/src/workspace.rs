@@ -639,8 +639,8 @@ impl Repo {
                     let (verb, what) = description.split_once(": ").unwrap_or(("restore", &description));
                     return Err(VeilError::repo(format!(
                         "cannot {verb} '{what}': it would remove workspace '{name}', which holds edits recorded since. \
-                         Nothing was changed; remove the workspace first (`vl ws rm {name}`), or pick an operation \
-                         from `vl op log` and run `vl op restore <id>`"
+                         Nothing was changed. To go back anyway, pick an operation from `vl op log` and run \
+                         `vl op restore <id>` (the op log keeps those edits)"
                     )));
                 }
                 None => {}

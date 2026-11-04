@@ -309,13 +309,16 @@ Redid: set tag main
 ```text
 $ vl scope grant team 7f3a… --name bob
 $ vl undo
-error: cannot undo the last command, 'grant scope team to bob': key rings are append-only;
+error: cannot undo 'grant scope team to bob': key rings are append-only;
 take the access back with `vl scope revoke team 7f3a…` (until you push, nobody else has received the key). …
 ```
 
   `vl op restore <id>` still goes back to an earlier operation, and warns
   about each such command it cannot revert.
-* What already left the repository cannot be undone. An **embargo
+* What already left the repository cannot be undone. `vl push` is an
+  operation too, because it records `origin/main` and the other remote
+  tags; undoing it only takes back what this repository remembers about the
+  remote, never the push itself. An **embargo
   release** can be undone only until your next push or Git export; after
   that `vl undo` refuses it ([Embargoes](embargoes.md#the-workflow)).
 

@@ -688,6 +688,17 @@ pub fn print_diff(repo: &Repo, from: &ObjectId, to: &ObjectId, stat: bool) -> Re
             ),
             _ => {}
         }
+        // The executable bit, as Git prints it (BUG-241).
+        let mode = |e: &veil_core::TreeEntry| if e.executable { "100755" } else { "100644" };
+        match (&c.old, &c.new) {
+            (Some(o), Some(n)) if o.executable != n.executable => {
+                println!("{}", yellow(&format!("old mode {}", mode(o))));
+                println!("{}", yellow(&format!("new mode {}", mode(n))));
+            }
+            (None, Some(n)) if n.executable => println!("{}", green(&format!("new file mode {}", mode(n)))),
+            (Some(o), None) if o.executable => println!("{}", red(&format!("deleted file mode {}", mode(o)))),
+            _ => {}
+        }
         let (old, new) = match (read(&c.old), read(&c.new)) {
             (Ok(Some(a)), Ok(Some(b))) => (a, b),
             (Err(v), _) | (_, Err(v)) => {

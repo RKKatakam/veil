@@ -86,8 +86,9 @@ pub enum Cmd {
     },
     /// Show changes in a snapshot, or between two snapshots.
     Diff {
-        /// Snapshot whose changes to show (default: @).
-        #[arg(short, long)]
+        /// Snapshot whose changes to show (default: @). Not together with
+        /// `--from` / `--to`, which compare two snapshots instead.
+        #[arg(short, long, conflicts_with_all = ["from", "to"])]
         rev: Option<String>,
         /// Compare from this snapshot (default: @).
         #[arg(long)]

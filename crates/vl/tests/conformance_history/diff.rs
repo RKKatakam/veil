@@ -219,7 +219,6 @@ fn mode_only_change_is_listed_by_stat() {
 
 // Scenario from git t4006-diff-mode.sh / jj test_diff_file_mode: the full diff names the mode change.
 #[test]
-#[ignore = "BUG-241: `vl diff` prints only a bare header for an executable-bit change; nothing says what changed"]
 fn mode_only_change_is_described_in_the_diff() {
     let env = Env::new();
     let r = env.repo("p");
@@ -466,7 +465,6 @@ fn diff_of_an_unknown_revision_fails() {
 
 // Scenario from jj test_diff_bad_args: -r together with --from/--to is ambiguous.
 #[test]
-#[ignore = "BUG-242: `vl diff -r A --from B` silently ignores -r instead of refusing the conflicting options"]
 fn diff_rev_with_from_is_refused() {
     let env = Env::new();
     let r = env.repo("p");
@@ -516,7 +514,6 @@ fn diff_of_a_conflicted_merge_and_its_resolution() {
 
 // Scenario from jj test_diff_conflict_* / test_log (conflict marker): `vl show` of a conflicted snapshot says so.
 #[test]
-#[ignore = "BUG-245: `vl show` of a snapshot with recorded conflicts never mentions them (log marks it ×, show is silent)"]
 fn show_of_a_conflicted_merge_names_the_conflicts() {
     let env = Env::new();
     let r = env.repo("p");

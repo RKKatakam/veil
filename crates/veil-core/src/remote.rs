@@ -114,6 +114,9 @@ pub struct SyncReport {
     /// Embargo releases staged here that this push published (written into
     /// their records and sent): from now on they cannot be taken back.
     pub releases_published: Vec<String>,
+    /// Push: every pushed tag the remote holds at our target now (updated
+    /// or already there), for [`record_pushed_tags`].
+    pub remote_tags: Vec<(String, ObjectId)>,
 }
 
 /// How to synchronise.
@@ -1064,6 +1067,7 @@ pub fn push_with(
     for (name, tag) in selected {
         if let Some(existing) = tx.view.tags.get(&name) {
             if existing.target == tag.target {
+                report.remote_tags.push((name, tag.target));
                 continue;
             }
             // Decided on the local graph: it holds the whole history of
@@ -1089,10 +1093,28 @@ pub fn push_with(
                 cloak,
             },
         );
+        report.remote_tags.push((name.clone(), tag.target));
         report.tags_updated.push((name, tag.target));
     }
     tx.commit()?;
     Ok(report)
+}
+
+/// After a push to the remote named `remote_name`, record the tags it now
+/// holds (`report.remote_tags`) as `<remote_name>/<tag>`, as `vl pull` does
+/// and as Git and jj update remote-tracking refs on push (BUG-248). One
+/// local operation, `push to <remote_name>`, if anything changed. Rejected
+/// tags are not recorded: the remote's version may not even be here.
+pub fn record_pushed_tags(local: &mut Repo, remote_name: &str, report: &SyncReport) -> Result<()> {
+    if report.remote_tags.is_empty() {
+        return Ok(());
+    }
+    let mut tx = local.transaction(format!("push to {remote_name}"))?;
+    for (name, target) in &report.remote_tags {
+        tx.view.remote_tags.insert(format!("{remote_name}/{name}"), *target);
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 /// Send `ids` (snapshots) and what they reference, except what the
