@@ -330,7 +330,7 @@ Other ways to reshape history:
 | `vl abandon [REV]` | Drop a change. Its descendants move onto its parent |
 | `vl squash [-r REV]` | Fold a change into its parent |
 | `vl rebase -s REV -d DEST` | Move a change and its descendants onto `DEST` (several `-d` for a merge) |
-| `vl restore [PATHS…] [--from REV]` | Put files back as they are in `REV` (default `@-`): discards edits |
+| `vl restore [PATHS…] [--from REV]` | Put files back as they are in `REV` (default: the parent of `@`, or for a merge its merged parents, as `vl status` compares): discards edits, and removes the directories it empties |
 | `vl merge REVS… [-m MSG]` | Merge into `@` (or into `@-` when `@` is empty), then start a new change on top |
 
 ### Conflicts

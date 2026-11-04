@@ -644,6 +644,11 @@ pub struct BuildReport {
     /// here, but a checkout on a case-insensitive filesystem (macOS by
     /// default) refuses the snapshot.
     pub name_collisions: Vec<(VPath, VPath)>,
+    /// Directories that hold a Veil repository of their own (a `.veil`
+    /// directory): nothing in them is recorded, whatever the policy says
+    /// (see [`crate::vfs::holds_repository`]). Something tracked there
+    /// before is recorded as deleted (the files stay on disk).
+    pub nested: Vec<VPath>,
 }
 
 impl BuildReport {
@@ -725,6 +730,8 @@ pub fn build_tree_cached(
         _ => None,
     };
     let parent_policy = match parent.as_ref().and_then(|t| t.get(POLICY_FILE)) {
+        // A directory (a hostile tree, BUG-121) holds no rules.
+        Some(e) if policy_changed && e.kind != EntryKind::File => None,
         Some(e) if policy_changed => match store.read_entry(e) {
             Ok(b) => Some(Policy::parse(&String::from_utf8_lossy(&b))),
             Err(err) if err.is_unreadable() => None,
@@ -820,7 +827,8 @@ impl Builder<'_> {
             };
             f.next += 1;
             // `.veil` is reserved at every depth (trees containing it are
-            // refused on decode), like Git's `.git` in nested repositories.
+            // refused on decode). A directory holding one is a nested
+            // repository, left out as a whole by `open_dir`.
             if crate::object::is_reserved_name(&child.name) {
                 continue;
             }
@@ -906,6 +914,11 @@ impl Builder<'_> {
             }
             Err(e) => return Err(e),
         };
+        // A repository of its own: none of it is ours to record (BUG-200).
+        if !dir.is_root() && crate::vfs::holds_repository(&listing) {
+            self.report.nested.push(dir);
+            return Ok(Opened::Done(None));
+        }
         for name in &listing.unrepresentable {
             self.report.unrepresentable.push(match dir.is_root() {
                 true => name.clone(),

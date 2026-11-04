@@ -151,7 +151,6 @@ fn nested_repository_is_independent_of_the_outer_one() {
 // the inner repository cloaks is plaintext on disk, and the outer
 // repository must not record it in public.
 #[test]
-#[ignore = "BUG-200: an enclosing repository records a nested Veil repository's working files, cloaked ones as public plaintext"]
 fn outer_repository_does_not_record_a_nested_repositorys_cloaked_files() {
     let env = Env::new();
     let outer = env.repo("outer");
@@ -168,6 +167,92 @@ fn outer_repository_does_not_record_a_nested_repositorys_cloaked_files() {
         leaked.iter().all(|f| f.path != "inner/secrets/plan.txt" || f.vis != "public"),
         "the inner repository's cloaked file is recorded in public by the outer one: {leaked:?}"
     );
+}
+
+/// `git` with a fixed identity and no system configuration.
+fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "Gita Hub")
+        .env("GIT_AUTHOR_EMAIL", "gita@example.com")
+        .env("GIT_COMMITTER_NAME", "Gita Hub")
+        .env("GIT_COMMITTER_EMAIL", "gita@example.com")
+        .args(["-c", "init.defaultBranch=main", "-c", "commit.gpgsign=false"])
+        .args(args)
+        .output()
+        .expect("git runs");
+    assert!(out.status.success(), "git {args:?}: {}", text(&out));
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+// BUG-200, end to end: nothing of a nested repository (its cloaked files,
+// plaintext on disk, above all) reaches the outer repository's objects,
+// a push of it, or its Git export; `vl status` names the nested
+// repository once, and `vl scan` leaves it to its own repository.
+#[test]
+fn a_nested_repositorys_plaintext_never_leaves_the_outer_one() {
+    let env = Env::new();
+    let outer = env.repo("outer");
+    outer.write("o.txt", "outer\n");
+    let inner = env.bare_dir("outer/inner");
+    inner.ok(&["init"]);
+    inner.ok(&["cloak", "secrets/"]);
+    inner.write("secrets/plan.txt", SECRET_PLAN);
+    inner.write("notes.txt", "inner notes\n");
+    inner.commit("inner");
+    let st = outer.status();
+    assert_eq!(st.matches("inner").count(), 1, "the nested repository is named once: {st}");
+    assert!(st.contains("N inner/"), "{st}");
+    assert!(!outer.out(&["scan"]).contains("plan.txt"));
+    outer.commit("outer");
+    let recorded = outer.paths("@-");
+    assert!(recorded.contains(&"o.txt".to_string()) && !recorded.iter().any(|p| p.starts_with("inner")), "{recorded:?}");
+    outer.ok(&["tag", "set", "main", "-r", "@-"]);
+    // Pushed to a team remote: a clone has none of it.
+    let hub = env.root.join("hub");
+    outer.ok(&["remote", "add", "origin", hub.to_str().unwrap()]);
+    outer.ok(&["push", "origin"]);
+    let clone = env.root.join("clone");
+    let out = env.run_as("alice", &env.root, &["clone", hub.to_str().unwrap(), clone.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", text(&out));
+    let c = env.as_user("alice", &clone);
+    assert!(!c.exists("inner"), "{:?}", c.disk());
+    assert!(!c.paths("main").iter().any(|p| p.starts_with("inner")));
+    // Exported to Git: no path, no content.
+    let bare = env.root.join("github.git");
+    git(&env.root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+    outer.ok(&["git", "remote", "add", "github", bare.to_str().unwrap()]);
+    outer.ok(&["git", "push", "github"]);
+    let files = git(&bare, &["ls-tree", "-r", "--name-only", "main"]);
+    assert!(files.contains("o.txt") && !files.contains("inner"), "{files}");
+    assert!(!git(&bare, &["log", "-p", "--all"]).contains(SECRET_PLAN));
+    // The outer repository's own objects (loose, uncompressed) never held it.
+    assert!(!contains_bytes(&all_bytes(&outer.path(".veil/objects")), SECRET_PLAN));
+    assert!(!contains_bytes(&all_bytes(&outer.path(".veil/objects")), "inner notes"));
+}
+
+// BUG-200: a directory the outer repository recorded before it became a
+// repository of its own is recorded as deleted (the files stay on disk),
+// and checking out the older snapshot never writes into, or removes from,
+// the nested repository.
+#[test]
+fn checkout_never_touches_a_nested_repository() {
+    let env = Env::new();
+    let outer = env.repo("outer");
+    outer.write("inner/x.txt", "x\n");
+    let with = outer.commit("vendored");
+    let inner = env.bare_dir("outer/inner");
+    inner.ok(&["init"]);
+    inner.commit("inner");
+    assert!(outer.status().contains("D inner/x.txt"));
+    let without = outer.commit("now a repository of its own");
+    assert!(inner.exists("x.txt"));
+    let out = outer.ok(&["new", with.as_str()]);
+    assert!(out.contains("inner/"), "{out}");
+    outer.ok(&["new", without.as_str()]);
+    assert_eq!(inner.read("x.txt"), "x\n", "checkout removed a nested repository's file");
+    assert!(inner.status().contains("no changes"), "{}", inner.status());
 }
 
 // Scenario from git t1500-rev-parse.sh "--show-toplevel from subdir" and

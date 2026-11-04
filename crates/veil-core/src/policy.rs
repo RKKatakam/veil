@@ -694,6 +694,33 @@ impl Policy {
         })
     }
 
+    /// [`Policy::load`] for a tree that came from someone else (a checkout
+    /// target, a merge, a Git commit): a `.veilpolicy` that cannot be read
+    /// there (a directory, a symlink, sealed for a scope this reader lacks:
+    /// only a hostile or corrupt tree records one) never blocks the
+    /// command. The policy the member last accepted (`accepted`, the text
+    /// of [`ACCEPTED_POLICY`]; the built-in rules if none) applies instead,
+    /// with a warning, which is returned too (and added to the policy's
+    /// own [`Policy::warnings`]).
+    pub fn load_or_accepted(fs: &dyn StorageBackend, accepted: Option<&[u8]>) -> Result<(Policy, Option<String>)> {
+        Ok(match read_policy_file(fs)? {
+            PolicyFile::File(b) | PolicyFile::Linked(b) => (Self::parse(&String::from_utf8_lossy(&b)), None),
+            PolicyFile::Absent => (Self::builtin(), None),
+            PolicyFile::Unavailable(why) => {
+                let mut p = match accepted {
+                    Some(t) => Self::parse(&String::from_utf8_lossy(t)),
+                    None => Self::builtin(),
+                };
+                let w = format!(
+                    "cannot read {POLICY_FILE} in this revision ({why}); the policy you accepted applies instead \
+                     (a remote or an import may have recorded a broken one)"
+                );
+                p.warnings.push(w.clone());
+                (p, Some(w))
+            }
+        })
+    }
+
     pub fn rules(&self) -> &[Rule] {
         &self.rules
     }

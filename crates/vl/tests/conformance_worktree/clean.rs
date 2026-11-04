@@ -69,7 +69,6 @@ fn isolated_files_are_never_cleaned() {
 
 // Scenario from git t7300-clean.sh "clean removes empty directories" (-d).
 #[test]
-#[ignore = "BUG-209: `vl restore` leaves the directories it empties behind"]
 fn restore_removes_the_new_directories_it_empties() {
     let env = Env::new();
     let r = env.repo("p");

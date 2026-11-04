@@ -502,3 +502,50 @@ fn a_git_commit_on_an_embargoed_merge_is_held_back_without_the_key() {
     assert_eq!(env.push(&mut alice).export.written, 0);
     assert!(!contains(&all_git_objects(&env.bare), b"fixed\n"));
 }
+
+/// BUG-200: a Git commit that adds a Veil repository's directory (its
+/// `.veil/` included) is imported without it: nothing in a nested
+/// repository is recorded, whichever route it comes by.
+#[test]
+fn a_nested_veil_repository_in_a_git_commit_is_not_imported() {
+    let env = Env::new();
+    let (mut r, _fs, _) = project();
+    env.connect(&mut r);
+    env.push(&mut r);
+    let work = env.clone_work("work");
+    std::fs::create_dir_all(work.join("vendor/lib/.veil")).unwrap();
+    std::fs::write(work.join("vendor/lib/.veil/repo.json"), "{}\n").unwrap();
+    std::fs::write(work.join("vendor/lib/plan.txt"), "NESTED-PLAINTEXT\n").unwrap();
+    std::fs::write(work.join("new.txt"), "added in Git\n").unwrap();
+    git(&work, &["add", "-A"]);
+    git(&work, &["commit", "-q", "-m", "vendor a library"]);
+    git(&work, &["push", "-q", "origin", "main"]);
+
+    git::pull(&mut r, &env.bridge, "github").unwrap();
+    let s2 = tag(&r, "main");
+    assert_eq!(read_at(&r, &s2, "new.txt"), b"added in Git\n");
+    assert!(file_entry(&r, &s2, "vendor/lib/plan.txt").is_none(), "a nested repository's file was imported");
+    assert!(file_entry(&r, &s2, "vendor").is_none());
+}
+
+/// BUG-121 (the Git route): a Git commit whose `.veilpolicy` is a
+/// directory is refused with the reason, as a symlinked one is (BUG-058):
+/// the pull itself goes ahead, and nothing of that commit is recorded.
+#[test]
+fn a_git_commit_whose_policy_is_a_directory_is_refused_with_the_reason() {
+    let env = Env::new();
+    let (mut r, _fs, c1) = project();
+    env.connect(&mut r);
+    env.push(&mut r);
+    let work = env.clone_work("work");
+    git(&work, &["rm", "-q", ".veilpolicy"]);
+    std::fs::create_dir_all(work.join(".veilpolicy")).unwrap();
+    std::fs::write(work.join(".veilpolicy/rules"), "** public!\n").unwrap();
+    git(&work, &["add", "-A"]);
+    git(&work, &["commit", "-q", "-m", "policy as a directory"]);
+    git(&work, &["push", "-q", "origin", "main"]);
+
+    let rep = git::pull(&mut r, &env.bridge, "github").expect("the pull is blocked");
+    assert_eq!(tag(&r, "main"), c1);
+    assert!(format!("{rep:?}").contains(".veilpolicy"), "{rep:?}");
+}

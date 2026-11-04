@@ -647,6 +647,17 @@ CAS, and it applies these rules in order:
      is left in place and reported as `kept`. The next snapshot quarantines
      it again on top of the new tree. `vl restore <path>` deliberately
      discards a quarantined edit.
+   * **`vl restore` is a checkout of some paths** (BUG-201, BUG-209,
+     `checkout::restore_paths`): the working copy is snapshotted first, so
+     every edit it can record is in `@`'s tree, and the diff from that
+     tree to the source, restricted to the paths given, goes through
+     checkout's rules: removals before writes (a file and a directory can
+     trade places either way), nothing in the way that checkout did not
+     write is deleted, emptied directories are removed. By default the
+     source is what `vl status` compares with: the parent of `@`, or for a
+     merge its merged parents (BUG-208), as in jj. Path arguments are
+     relative to the current directory; a path outside the repository is
+     refused, and `\` is an ordinary character (BUG-204).
 5. Cloaked files are sealed under their scope. In a cloaked workspace, every
    public file it introduces is sealed under the workspace scope, and the
    description is too.
@@ -771,8 +782,31 @@ CAS, and it applies these rules in order:
 The working copy itself is untrusted ground. Nothing in it can fail a
 snapshot (and with it every command), and nothing is dropped silently:
 
-* Leftovers of an interrupted `DiskBackend` write (`.name.vltmpXXXXXXXX`)
-  are crash debris and are skipped.
+* Leftovers of an interrupted `DiskBackend` write (`.name.vltmpXXXXXXXX`,
+  `name` cut to its first 32 bytes so that a name near the filesystem's
+  255-byte limit still has a temp name that fits, BUG-202) are crash
+  debris and are skipped.
+* A directory (other than the root) that holds a `.veil` directory, or a
+  symlink named `.veil`, is a **nested repository**: a vendored project, a
+  monorepo member, `vl init` run in the wrong place. Like Git with an
+  embedded repository, the enclosing repository records nothing of it,
+  whatever its policy says: the nested repository's cloaked files are
+  plaintext on disk and only its own policy knows they are secret
+  (BUG-200, `vfs::holds_repository`). It is reported once, in `vl status`
+  (`N inner/`, `BuildReport::nested`); anything tracked there before is
+  recorded as deleted (the files stay on disk). The same walk serves
+  every route (snapshots, `vl watch`, `vl ws exec` sandboxes, the Git
+  import, where a Git tree's subdirectory holding `.veil/` is left out
+  too); `vl scan` and `vl policy check` skip it and say so. Checkout
+  (and `vl restore`) never write or remove anything inside one
+  (`CheckoutReport::nested`). A plain *file* named `.veil` is only
+  skipped itself. The CI gate `vl scan --policy-from` does scan nested
+  repositories: Git publishes their files.
+* A directory the policy ignores is never descended into (Git's rule), so
+  no later rule re-includes a file below it (`build/ ignore` then
+  `build/keep.txt public` records nothing under `build/`); `vl policy
+  check` reports such a path as ignored via the directory's rule
+  (BUG-203).
 * An unreadable file or directory (permission denied) is reported. A tracked
   one keeps its previous entry, an untracked one stays out, and the command
   goes on, so `vl ignore` still works.
@@ -783,6 +817,23 @@ snapshot (and with it every command), and nothing is dropped silently:
   `vl restore` never write, remove or prune at or below such an entry
   (`CheckoutReport::blocked`), so an untracked `vendor -> /shared/vendor`
   link never receives pulled files.
+* A path the working copy's filesystem refuses (a name too long for it,
+  a character it cannot hold, permission denied on one directory) never
+  stops a checkout and never wedges the working copy: it is reported
+  (`CheckoutReport::failed`), left out and recorded as such in the
+  checkout record (`Materialised::hidden`), so the next snapshot carries
+  its entry instead of recording a deletion, and every command tries
+  again (BUG-202). A full or read-only filesystem still stops the
+  checkout. `DiskBackend` takes a name too long to exist as "nothing
+  there" when reading.
+* A tree whose `.veilpolicy` cannot be read (a directory, a symlink, sealed
+  for a scope this reader lacks: only a hostile or corrupt tree records
+  one) never blocks a checkout or a merge: the policy this member last
+  accepted applies there, with a warning (BUG-121,
+  `Policy::load_or_accepted`). A snapshot of a working copy holding such a
+  `.veilpolicy` already falls back to the accepted policy. A Git commit
+  whose `.veilpolicy` is not a regular file is refused with the branch
+  named (BUG-058), and the pull goes on.
 
 Local-only files (isolated and quarantined) are backed up into the vault, so
 `vl ws exec --with-isolated` can inject `.env` into a sandbox without it ever

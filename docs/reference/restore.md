@@ -19,7 +19,7 @@ Options:
 
 | | |
 |---|---|
-| `--from <FROM>` | Source snapshot (default: @-) (default: `@-`) |
+| `--from <FROM>` | Source snapshot (default: the parent of @; for a merge, its merged parents, which is what `vl status` compares with) |
 
 ---
 

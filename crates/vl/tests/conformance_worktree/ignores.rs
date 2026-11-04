@@ -109,7 +109,6 @@ fn rule_order_decides_last_match_wins() {
 // matching rule wins", and `vl policy check` agrees, but the snapshot
 // never descends into the ignored directory.
 #[test]
-#[ignore = "BUG-203: a file re-included below an ignored directory is reported public by `vl policy check` but never recorded"]
 fn policy_check_and_the_snapshot_agree_below_an_ignored_directory() {
     let env = Env::new();
     let r = with_rules(&env, "build/ ignore\nbuild/keep.txt public\n");

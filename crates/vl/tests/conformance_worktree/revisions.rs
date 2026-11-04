@@ -113,11 +113,15 @@ fn ambiguous_change_id_prefix_is_refused() {
         .enumerate()
         .find_map(|(i, a)| ids[i + 1..].iter().find(|b| b[..1] == a[..1]).map(|b| (a.clone(), b.clone())))
         .expect("pigeonhole");
-    let common = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
+    let lcp = |x: &str, y: &str| x.chars().zip(y.chars()).take_while(|(p, q)| p == q).count();
+    let common = lcp(&a, &b);
     let err = r.fails(&["show", &a[..common]]);
     assert!(err.contains("ambiguous"), "{err}");
-    assert_eq!(r.change(&a[..common + 1]), a);
-    assert_eq!(r.change(&b[..common + 1]), b);
+    // A third id can share a longer prefix with either (ids are random):
+    // the shortest unique prefix is one past the longest shared one.
+    let unique = |x: &String| 1 + ids.iter().filter(|y| *y != x).map(|y| lcp(x, y)).max().unwrap_or(0);
+    assert_eq!(r.change(&a[..unique(&a)]), a);
+    assert_eq!(r.change(&b[..unique(&b)]), b);
 }
 
 // Scenario from git t1512-rev-parse-disambiguation.sh: snapshot-id
