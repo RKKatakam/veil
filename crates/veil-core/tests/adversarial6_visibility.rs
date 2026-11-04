@@ -316,3 +316,55 @@ fn a_revoked_member_cannot_release_an_embargo() {
         "a release by a revoked member was accepted; Alice's next public push publishes the fix"
     );
 }
+
+// ---- names and ids from a hostile team remote -------------------------------------
+
+/// The Git-side fix of BUG-059 ("a forged change-id header must not make
+/// the user's change divergent") has no counterpart for Veil remotes:
+/// `remote::pull` records every remote tag, and a snapshot that carries
+/// Alice's change id (change ids are visible to every reader of the team
+/// remote) becomes visible through `origin/<tag>`. From then on Alice's own
+/// change id is "divergent" in every revset (`vl edit`, `vl new`,
+/// `vl squash -r`, `vl describe -r`), until she abandons Mallory's snapshot.
+#[test]
+#[ignore = "BUG-105: a remote tag named after a change-id prefix hijacks that change in revsets after `vl pull`"]
+fn a_pulled_snapshot_with_a_forged_change_id_does_not_make_the_change_divergent() {
+    let (mut alice, fs, _) = new_repo("alice");
+    let main = commit_files(&mut alice, &*fs, &[("a.txt", "a\n")], "my work");
+    alice.set_tag("main", main, None, false).unwrap();
+    let hub = Arc::new(MemoryBackend::new());
+    remote::push(&mut alice, hub.clone(), false, &[], false).unwrap();
+    let cid = alice.snapshot(&main).unwrap().change_id;
+
+    let mut m = Repo::init_for_clone(Arc::new(MemoryBackend::new()), Some(Identity::generate("mallory")), "mallory").unwrap();
+    remote::pull(&mut m, "origin", hub.clone()).unwrap();
+    let tree = m.snapshot(&main).unwrap().tree;
+    let evil = m
+        .store()
+        .put_snapshot(&veil_core::Snapshot {
+            parents: vec![main],
+            change_id: cid,
+            tree,
+            description: veil_core::object::Text::Plain("evil".into()),
+            author: "mallory".into(),
+            timestamp: 2,
+            predecessors: vec![],
+            conflicts: vec![],
+            cloak: None,
+            signature: None,
+            embargo: None,
+        })
+        .unwrap();
+    set_remote_tag(&mut m, "evil", evil);
+    remote::push(&mut m, hub.clone(), false, &["evil".into()], false).unwrap();
+
+    remote::pull(&mut alice, "origin", hub).unwrap();
+    let short = cid.display()[..8].to_string();
+    let resolved = veil_core::revset::resolve(&alice, &short, WS);
+    assert_eq!(
+        resolved.ok(),
+        Some(main),
+        "Alice's change id {short} no longer resolves to her change: {:?}",
+        veil_core::revset::resolve(&alice, &short, WS).err()
+    );
+}

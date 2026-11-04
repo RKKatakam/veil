@@ -454,3 +454,96 @@ fn a_file_in_the_way_of_a_directory_is_kept_and_reported() {
     );
     assert_eq!(read(&proj, "cfg"), "k = \"AKIAIOSFODNN7EXAMPLE\"\n", "the quarantined file was lost");
 }
+
+// ---- the identity file ------------------------------------------------------------------
+
+/// `ctx::write_identity` creates `identity.json` with `std::fs::write`
+/// (mode `0666 & ~umask`, so `0644` for most users) and only then
+/// `chmod 0600`s it. Between the two calls the private keys are
+/// world-readable in `$VEIL_HOME`, which on a shared machine is enough for
+/// another local user polling the directory (round-1 hypothesis
+/// "identity-file race", demonstrated here with `strace`). The retired
+/// copy is created the right way (`create_new` with mode `0600`); the live
+/// file is not. Skipped where `strace` is unavailable or cannot attach.
+#[test]
+#[ignore = "BUG-112: identity.json is created world-readable and chmod'ed 0600 afterwards"]
+fn the_identity_file_is_never_world_readable_even_briefly() {
+    let env = Env::new();
+    let proj = env.dir("proj");
+    let trace = env.root.join("trace.txt");
+    let strace = match std::process::Command::new("strace").arg("-V").output() {
+        Ok(o) if o.status.success() => "strace",
+        _ => return, // not available: nothing to demonstrate with
+    };
+    let home = env.root.join("home-fresh");
+    let out = std::process::Command::new(strace)
+        .args(["-f", "-e", "trace=openat,open,creat,chmod,fchmod,fchmodat", "-o"])
+        .arg(&trace)
+        .arg(env!("CARGO_BIN_EXE_vl"))
+        .args(["identity", "show"])
+        .current_dir(&proj)
+        .env("VEIL_HOME", &home)
+        .env("VEIL_USER", U)
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    if !out.status.success() || !trace.exists() {
+        return; // ptrace not permitted here
+    }
+    let log = std::fs::read_to_string(&trace).unwrap();
+    let creates: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("identity.json") && l.contains("O_CREAT") && !l.contains("ENOENT"))
+        .collect();
+    assert!(!creates.is_empty(), "no create of identity.json seen:\n{log}");
+    for c in &creates {
+        // `openat(AT_FDCWD, "…/identity.json", O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0666) = 3`
+        let mode = c.rsplit(", ").next().unwrap_or("").split(')').next().unwrap_or("").trim();
+        assert!(
+            mode.ends_with("600") || mode.ends_with("400"),
+            "identity.json is created with mode {mode} (then chmod'ed): {c}"
+        );
+    }
+}
+
+// ---- `vl ws switch` is not failure-safe ----------------------------------------------
+
+/// `vl ws switch` changes nothing in the repository: the attachment lives
+/// only in `.veil/local/checkout.json`, written by `Ctx::finish` **after**
+/// the checkout that replaces the directory's files. If that checkout
+/// fails half way (here: a quarantined file `cfg` where `agent` has a
+/// directory `cfg/`, BUG-111; a `kill -9` or a full disk at that point
+/// leaves the same state), the directory holds a mix of both workspaces
+/// but is still recorded as attached to `default`, and nothing is stale
+/// (`Ctx::record`: same workspace, same snapshot). The next command
+/// records that mix as `default`'s working copy: `agent`'s files appear as
+/// additions and `default`'s own files, already removed by the checkout,
+/// are recorded as deleted. `vl new`/`vl edit` survive the same crash
+/// (the view moved, so the directory is detected as stale and its state is
+/// saved as a change); `ws switch` does not.
+#[test]
+#[ignore = "BUG-113: a `vl ws switch` whose checkout fails or is interrupted records the half-switched directory as the old workspace's working copy"]
+fn an_interrupted_workspace_switch_does_not_corrupt_the_old_workspace() {
+    let env = Env::new();
+    let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
+    env.ok(U, &proj, &["ws", "new", "agent"]);
+    for (path, content) in [("agent.txt", "agent only\n"), ("cfg/settings.json", "{}\n")] {
+        let mut c = env.cmd(U, &proj, &["ws", "write", "agent", path]);
+        c.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        let mut child = c.spawn().unwrap();
+        use std::io::Write as _;
+        child.stdin.take().unwrap().write_all(content.as_bytes()).unwrap();
+        assert!(child.wait_with_output().unwrap().status.success());
+    }
+    write(&proj, "default.txt", "default work\n");
+    write(&proj, "cfg", "k = \"AKIAIOSFODNN7EXAMPLE\"\n");
+    env.ok(U, &proj, &["status"]);
+    let switch = env.vl(U, &proj, &["ws", "switch", "agent"]);
+    let _ = env.vl(U, &proj, &["status"]);
+    let default_files = env.stdout(U, &proj, &["files", "-r", "default@"]);
+    assert!(
+        default_files.contains("default.txt") && !default_files.contains("agent.txt"),
+        "after the failed switch ({}), default's working copy is:\n{default_files}",
+        text(&switch).trim()
+    );
+}
