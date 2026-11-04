@@ -100,6 +100,28 @@ fn large_and_ranged_reads() {
     assert_eq!(b.read(&p("grown")).unwrap(), &big[..10]);
 }
 
+/// The limits against hostile servers (BUG-065) leave real files alone:
+/// a pack far larger than the slack a stat may be off by, read whole and
+/// in ranges, and a listing of a few thousand entries.
+#[test]
+fn files_beyond_the_read_slack_and_big_listings_are_fine() {
+    let server = need_server!();
+    let dir = tempfile::tempdir().unwrap();
+    let big: Vec<u8> = (0..(40u32 << 20)).map(|i| (i ^ (i >> 13)) as u8).collect();
+    std::fs::create_dir_all(dir.path().join("pack")).unwrap();
+    std::fs::write(dir.path().join("pack/a.pack"), &big).unwrap();
+    for i in 0..3_000 {
+        std::fs::write(dir.path().join(format!("pack/{i:05}.idx")), b"x").unwrap();
+    }
+    let b = connect(&server, dir.path());
+    assert_eq!(b.read(&p("pack/a.pack")).unwrap(), big);
+    assert_eq!(b.read_range(&p("pack/a.pack"), 30 << 20, 10 << 20).unwrap(), &big[30 << 20..]);
+    assert_eq!(b.list_dir(&p("pack")).unwrap().len(), 3_001);
+    // This machine and the server share a clock.
+    assert!(b.clock_offset(&p("pack")).unwrap().abs() < 2_000);
+    assert_eq!(b.list_dir(&p("pack")).unwrap().len(), 3_001, "the clock probe was left behind");
+}
+
 #[test]
 fn unsynced_writes_and_barrier() {
     let server = need_server!();

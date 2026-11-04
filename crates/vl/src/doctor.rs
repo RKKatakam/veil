@@ -14,12 +14,12 @@ use std::{
 
 use anyhow::Result;
 use veil_core::{
-    lock::{assess, assess_raw, RepoLock, Verdict, LOCK_PATH, STEAL_PATH},
+    lock::{assess, assess_raw, LockContext, RepoLock, Verdict, LOCK_PATH, STEAL_PATH},
     now_millis,
     repo::{is_repo, RepoConfig, REPO_FORMAT_VERSION, VEIL_DIR},
     statcache::{cache_path, StatCache},
     vfs::{NameFolding, FOLDING_ENV},
-    DiskBackend, Identity, Repo, StorageBackend, VPath,
+    DiskBackend, Identity, Repo, SftpBackend, SshUrl, StorageBackend, VPath,
 };
 
 use crate::{
@@ -451,6 +451,10 @@ fn check_remotes(r: &mut Report, root: &Path, config: &RepoConfig) {
         return;
     }
     for (name, remote) in &config.remotes {
+        if let Some(url) = SshUrl::parse(&remote.url) {
+            check_ssh_remote(r, name, &remote.url, url);
+            continue;
+        }
         if remote.url.contains("://") {
             r.note(
                 format!("{name} ({}): not a local path; `vl pull {name}` checks it", remote.url),
@@ -473,6 +477,59 @@ fn check_remotes(r: &mut Report, root: &Path, config: &RepoConfig) {
                 &[format!("{} does not exist (an unmounted drive or share?)", path.display())],
             );
         }
+    }
+}
+
+/// Connect to an SSH remote, check that it holds a repository, and compare
+/// its clock with ours: fencing locks on network remotes judge abandoned
+/// locks partly by wall-clock age, assuming hosts agree within the skew
+/// allowance (see `lock.rs`).
+fn check_ssh_remote(r: &mut Report, name: &str, shown: &str, url: veil_core::Result<SshUrl>) {
+    let url = match url {
+        Ok(u) => u,
+        Err(e) => {
+            r.fail(format!("{name} ({shown}) is not a valid SSH URL"), &[e.to_string()]);
+            return;
+        }
+    };
+    let started = Instant::now();
+    let backend = match SftpBackend::connect(&url) {
+        Ok(b) => b,
+        Err(e) => {
+            r.fail(format!("{name} ({shown}) is not reachable"), &[e.to_string()]);
+            return;
+        }
+    };
+    let took = started.elapsed();
+    if !is_repo(&backend) {
+        r.fail(
+            format!("{name} ({shown}) is not a Veil repository"),
+            &["`vl push` creates one there".into()],
+        );
+        return;
+    }
+    r.ok(format!("{name} ({shown}) reachable in {}", fmt_duration(took)));
+    let allowance = LockContext::default().skew;
+    match backend.clock_offset(&VPath::new(VEIL_DIR).expect("valid path")) {
+        Ok(offset) => {
+            let ahead = if offset >= 0 { "ahead of" } else { "behind" };
+            let secs = offset.unsigned_abs() as f64 / 1000.0;
+            if offset.unsigned_abs() > (allowance / 2).as_millis() as u64 {
+                r.warn(
+                    format!("{name}'s clock is {secs:.0} s {ahead} this machine's"),
+                    &[
+                        format!(
+                            "locks on a shared remote are taken over by wall-clock age with a {} s allowance for clock differences between clients; a client whose clock runs ahead of another's by more than that can take over the other's live lock, and a push then fails (or, rarely, both publish)",
+                            allowance.as_secs()
+                        ),
+                        "keep every client's clock in sync (NTP: `timedatectl`, or System Settings → Date & Time on macOS)".into(),
+                    ],
+                );
+            } else {
+                r.ok(format!("{name}'s clock is within {:.0} s of this machine's", secs.max(1.0)));
+            }
+        }
+        Err(e) => r.note(format!("{name}: cannot compare clocks"), &[e.to_string()]),
     }
 }
 
