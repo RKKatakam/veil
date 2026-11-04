@@ -331,7 +331,7 @@ impl<'a> R<'a> {
     }
 
     fn show_field(&self, rev: &str, field: &str) -> String {
-        let out = self.out(&["--no-snapshot", "show", "--stat", rev]);
+        let out = self.out(&["--no-snapshot", "show", "--stat", "--", rev]);
         out.lines()
             .find_map(|l| {
                 let (k, v) = l.split_once(':')?;
@@ -342,7 +342,7 @@ impl<'a> R<'a> {
 
     /// The description of REV, as `vl show` prints it (indented lines).
     pub fn description(&self, rev: &str) -> String {
-        let out = self.out(&["--no-snapshot", "show", "--stat", rev]);
+        let out = self.out(&["--no-snapshot", "show", "--stat", "--", rev]);
         let mut lines = out.lines().skip_while(|l| !l.is_empty());
         lines.next();
         lines
