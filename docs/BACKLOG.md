@@ -4,6 +4,48 @@ Collected from the agents' reports during rounds 1–2. Fixed adversarial
 findings are in `docs/BUGS.md`; this file lists what is known and **not yet
 fixed**. Severity: high / medium / low.
 
+## Before the Hub (owner-approved order: after all bugs are fixed)
+
+### Agent workspaces and scale
+- **Persistent `ws exec` sandboxes:** keep one sandbox folder per workspace
+  between runs and update only changed files (as a Git worktree does); wipe
+  it on `vl ws rm`. Today every run re-copies the whole tree.
+- **Copy-on-write file clones** (APFS, btrfs, XFS reflinks) when writing
+  sandboxes and checkouts: near-instant, near-zero extra disk.
+- **Sparse sandboxes:** `vl ws exec --only src/ tests/`.
+- **Virtual filesystem working copy** (FUSE/NFS mount of `TreeView` +
+  overlay): instant workspaces with real files, edits only use space.
+- **Scale benchmark** at 1 GB and ~5 GB (init, status, commit, gc, push,
+  clone, peak RAM), then fix what it exposes:
+  - streaming / incremental `gc` (no whole-store pack in memory);
+  - streaming pull (packs written to disk, not held in RAM);
+  - streaming large-file read/hash/seal (no whole file in memory);
+  - content-defined chunking for large binaries (an LFS replacement);
+  - partial and sparse clone;
+  - a history index (like Git's commit-graph) so commands stop walking all
+    history;
+  - concurrent op-log merging instead of one repository lock.
+
+### Gaps compared with Git and GitHub (core, before the Hub)
+- **Colocated Git mode:** a real `.git` next to `.veil` (as Jujutsu does) so
+  IDEs, GUIs, `git blame`, pre-commit and other Git tools keep working.
+- **Missing everyday commands:** `blame`/annotate, `bisect`,
+  cherry-pick/duplicate, `split` (and interactive squash/split), history
+  search (`log -S`/`-G`, path and author filters), `grep` over a snapshot,
+  `archive` (tarball of a snapshot), patch export/import.
+- **Rename and copy detection** in `diff`, `log` and merge (today a rename is
+  a delete plus an add, and merges are not rename-aware).
+- **First-class conflicts** (Jujutsu-style) instead of markers in files.
+- **Repository attributes:** line-ending normalisation (CRLF), per-path diff
+  and merge drivers, binary handling (`.gitattributes` equivalents).
+- **Symlinks** are ignored; non-UTF-8 names are not recorded; submodules are
+  not supported.
+- **Hooks** (pre-commit / pre-push) and signed tags and releases.
+- **Git bridge gaps:** tags are not synced; author time zones become UTC.
+- **Windows** support.
+- **Maturity:** days of history versus Git's two decades; unaudited; no
+  community, tutorials or Stack Overflow answers yet.
+
 ## Correctness
 
 - **Medium: undo right after stale-working-copy recovery hides the
