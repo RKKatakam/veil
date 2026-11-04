@@ -98,7 +98,6 @@ fn hostile_names_and_arguments_are_rejected_cleanly() {
 
 /// Scope and embargo names typed by the user reach `VPath::new(..).unwrap()`.
 #[test]
-#[ignore = "BUG-015: key-ring/embargo paths are built from untrusted strings with VPath::new(..).unwrap(); path-like names panic"]
 fn path_like_scope_and_embargo_names_do_not_panic() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a.txt", "a\n")]);
@@ -394,7 +393,6 @@ fn running_from_a_subdirectory_uses_repository_relative_paths() {
 /// another change (`vl new main`) then overwrites the edited file with the old
 /// version, and the next snapshot drops it from the vault: the edit is gone.
 #[test]
-#[ignore = "BUG-014: a quarantined edit of a tracked file is overwritten by the next checkout and then purged from the vault"]
 fn quarantined_edits_are_never_lost() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("config.js", "const a = 1;\n")]);

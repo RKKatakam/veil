@@ -276,7 +276,6 @@ fn remote_with_meta(meta: &[(&str, Vec<u8>)]) -> Arc<MemoryBackend> {
 }
 
 #[test]
-#[ignore = "BUG-015: key-ring/embargo paths are built from untrusted strings with VPath::new(..).unwrap(); a remote can crash pull"]
 fn ring_with_path_like_scope_does_not_crash_pull() {
     let ring = KeyRing {
         scope: "../../evil".into(),
@@ -291,7 +290,6 @@ fn ring_with_path_like_scope_does_not_crash_pull() {
 }
 
 #[test]
-#[ignore = "BUG-015: key-ring/embargo paths are built from untrusted strings with VPath::new(..).unwrap(); a remote can crash pull"]
 fn embargo_record_with_path_like_id_does_not_crash_pull() {
     let k = random_key();
     let rec = EmbargoRecord {
@@ -315,7 +313,6 @@ fn embargo_record_with_path_like_id_does_not_crash_pull() {
 }
 
 #[test]
-#[ignore = "BUG-015: a sealed object naming a path-like scope panics every reader (checkout, cat, log)"]
 fn sealed_object_with_path_like_scope_does_not_crash_readers() {
     let (remote, main) = evil_remote(|r| {
         let env = Envelope::seal(&random_key(), "../../x", b"veil:blob\nhi", true).unwrap();
@@ -424,7 +421,6 @@ fn embargo_from_cloaked_branch_stays_hidden_until_release() {
 /// "released" record with a garbage key. Alice pulls, keeps working, commits
 /// and pushes to the public mirror. The fix must not reach the mirror.
 #[test]
-#[ignore = "BUG-012: a forged 'released' embargo record is accepted; the embargoed fix is re-snapshotted as public"]
 fn forged_embargo_release_does_not_publish_the_fix() {
     let (mut alice, fs, embargo) = embargoed_setup();
     let team = Arc::new(MemoryBackend::new());
@@ -447,7 +443,6 @@ fn forged_embargo_release_does_not_publish_the_fix() {
 /// Same forgery, observed from the key holder's side: Alice can no longer
 /// read the embargoed content she merged.
 #[test]
-#[ignore = "BUG-012: a forged 'released' embargo record is accepted; key holders lose access to embargoed content"]
 fn forged_embargo_release_does_not_lock_out_key_holders() {
     let (mut alice, _fs, embargo) = embargoed_setup();
     let team = Arc::new(MemoryBackend::new());
@@ -491,7 +486,6 @@ fn tag_cannot_point_at_a_non_snapshot_object() {
 // ---- hostile snapshot metadata ---------------------------------------------
 
 #[test]
-#[ignore = "BUG-015: a snapshot's `cloak` field naming a path-like scope panics `ws exec --ephemeral` / commit_fs_as_child"]
 fn hostile_cloak_field_on_snapshot_does_not_panic() {
     let remote_fs = Arc::new(MemoryBackend::new());
     let mut remote = Repo::init_bare(remote_fs.clone()).unwrap();

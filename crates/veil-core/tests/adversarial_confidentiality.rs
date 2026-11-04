@@ -361,7 +361,6 @@ fn uppercase_dotenv_never_reaches_a_public_mirror() {
 /// is then all zeros, so *anyone who can read the key ring* (rings are
 /// published to every remote, public ones included) recovers the scope key.
 #[test]
-#[ignore = "BUG-010: grant accepts low-order X25519 public keys; the wrapped scope key is recoverable by anyone"]
 fn granting_a_low_order_public_key_does_not_publish_the_scope_key() {
     let (mut alice, fs, _) = new_repo("alice");
     alice.keys().grant("team", &format!("veil1{}", "00".repeat(32)), "new-hire").unwrap_or(());
@@ -398,7 +397,6 @@ fn granting_a_low_order_public_key_does_not_publish_the_scope_key() {
 /// and pushes again. Bob clones afterwards. Push unions key rings, so the
 /// remote still wraps the key for Bob.
 #[test]
-#[ignore = "BUG-011: revocation never reaches remotes (key rings are merged as unions); a revoked member still gets the key"]
 fn revoked_member_cannot_obtain_the_scope_key_from_the_remote() {
     let (mut alice, fs, _) = new_repo("alice");
     alice.keys().create_scope("ops").unwrap();
@@ -420,7 +418,6 @@ fn revoked_member_cannot_obtain_the_scope_key_from_the_remote() {
 }
 
 #[test]
-#[ignore = "BUG-011: revocation never reaches remotes (key rings are merged as unions); a replayed old ring re-adds the member"]
 fn replayed_key_ring_does_not_undo_a_revocation() {
     let (mut alice, _fs, _) = new_repo("alice");
     alice.keys().create_scope("ops").unwrap();

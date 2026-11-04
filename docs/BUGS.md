@@ -1,5 +1,12 @@
 # Veil adversarial test findings
 
+> **Status (round 2, `integration` @ 81fcd28 and later): all 40 findings are
+> fixed.** Every reproduction below is now an ordinary, un-ignored test that
+> passes; `cargo test --no-fail-fast` runs them all. The instructions that
+> follow describe the suite as originally delivered against the baseline.
+> Fixes are summarised in `docs/ARCHITECTURE.md` (threat model) and in the
+> merge commits `Merge fix stream: …`.
+
 Baseline: `integration` @ `06f8757` ("Veil MVP: veil-core engine and vl CLI").
 Every finding below was **demonstrated** by a test in this branch. Each test
 asserts the *secure / correct* behaviour and is marked
