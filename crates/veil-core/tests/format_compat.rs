@@ -19,7 +19,7 @@ use veil_core::{
     fsck::{fsck, Severity},
     id::ChangeId,
     object::{EntryKind, Object, Snapshot, Text, Tree, TreeEncoding, TreeEntry, Visibility},
-    pack::{PACK_MAGIC, IDX_MAGIC},
+    pack::{IDX_MAGIC, PACK_MAGIC},
     remote,
     repo::{read_config, MIN_REPO_FORMAT, REPO_FORMAT},
     tree::{lookup, walk_files},
@@ -78,7 +78,11 @@ fn p(s: &str) -> VPath {
 }
 
 fn tag(repo: &Repo, name: &str) -> ObjectId {
-    repo.view().tags.get(name).unwrap_or_else(|| panic!("tag {name} missing")).target
+    repo.view()
+        .tags
+        .get(name)
+        .unwrap_or_else(|| panic!("tag {name} missing"))
+        .target
 }
 
 fn read(repo: &Repo, rev: &ObjectId, path: &str) -> Option<Vec<u8>> {
@@ -143,7 +147,11 @@ fn every_repository_format_has_a_fixture_set() {
         let dir = fixtures().join(format!("format-{f}"));
         let cfg = read_config(&DiskBackend::new(dir.join("alice")))
             .unwrap_or_else(|e| panic!("format {f} has no fixture set at {} ({e}); run tests/fixtures/generate.sh with the release that introduces it", dir.display()));
-        assert_eq!(cfg.format, f, "fixture format-{f} holds a format-{} repository", cfg.format);
+        assert_eq!(
+            cfg.format, f,
+            "fixture format-{f} holds a format-{} repository",
+            cfg.format
+        );
         for part in ["team-remote", "public-mirror", "home-alice", "home-bob", "home-carol"] {
             assert!(dir.join(part).exists(), "fixture format-{f} lacks {part}");
         }
@@ -192,7 +200,9 @@ fn sample_tree() -> Tree {
         id: id(4),
         size: 1 << 40,
         executable: false,
-        visibility: Visibility::Embargoed { embargo: "0123456789".into() },
+        visibility: Visibility::Embargoed {
+            embargo: "0123456789".into(),
+        },
         fallback: Some(id(5)),
     });
     t.insert(TreeEntry {
@@ -237,7 +247,10 @@ fn golden_encodings() -> Vec<(String, Vec<u8>)> {
     let tree = Object::Tree(sample_tree());
     vec![
         ("blob".into(), Object::Blob(b"hello\n".to_vec()).encode()),
-        ("tree-empty".into(), Object::Tree(Tree::default()).encode_with(TreeEncoding::Binary)),
+        (
+            "tree-empty".into(),
+            Object::Tree(Tree::default()).encode_with(TreeEncoding::Binary),
+        ),
         ("tree-v1-json".into(), tree.encode_with(TreeEncoding::Json)),
         ("tree-v2-binary".into(), tree.encode_with(TreeEncoding::Binary)),
         (
@@ -277,7 +290,11 @@ fn encodings_match_the_golden_file() {
              VEIL_BLESS_ENCODINGS=1 — and only by appending lines."
         );
     }
-    assert_eq!(actual.lines().count(), expected.lines().count(), "golden entries added or removed");
+    assert_eq!(
+        actual.lines().count(),
+        expected.lines().count(),
+        "golden entries added or removed"
+    );
     // Every golden encoding still decodes, and decodes back to itself.
     for (name, raw) in golden_encodings() {
         let obj = Object::decode(&raw).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -302,22 +319,50 @@ fn universal_root_id_never_changes() {
 // ---- reading format-1 repositories -----------------------------------------
 
 #[test]
-fn format1_fixture_opens_reads_and_verifies() {
-    let fx = Fixture::new(1);
+fn every_fixture_set_opens_reads_and_verifies() {
+    for f in MIN_REPO_FORMAT..=REPO_FORMAT {
+        check_fixture_reads(f);
+    }
+}
+
+fn check_fixture_reads(format: u32) {
+    let fx = Fixture::new(format);
     let repo = fx.open("alice", Some("alice"));
-    assert_eq!(repo.format(), 1);
+    assert_eq!(repo.format(), format);
     assert!(repo.root_id().hex().starts_with(UNIVERSAL_ROOT));
     let main = tag(&repo, "main");
-    assert_eq!(read_str(&repo, &main, "README.md").as_deref(), Some("Fixture project\n"));
+    assert_eq!(
+        read_str(&repo, &main, "README.md").as_deref(),
+        Some("Fixture project\n")
+    );
     assert!(read_str(&repo, &main, "src/main.rs").unwrap().contains("v3"));
-    assert!(read_str(&repo, &main, "src/util/strings.rs").unwrap().contains("to_uppercase"));
+    assert!(read_str(&repo, &main, "src/util/strings.rs")
+        .unwrap()
+        .contains("to_uppercase"));
     let tree = repo.snapshot(&main).unwrap().tree;
-    assert!(lookup(repo.store(), &tree, &p("bin/run.sh")).unwrap().unwrap().executable);
+    assert!(
+        lookup(repo.store(), &tree, &p("bin/run.sh"))
+            .unwrap()
+            .unwrap()
+            .executable
+    );
     // Cloaked (key generation 2), released embargo, unreleased embargo (key holder).
-    assert_eq!(read_str(&repo, &main, "secrets/notes.txt").as_deref(), Some("team-only notes v2\n"));
-    assert_eq!(read_str(&repo, &main, "src/fix_a.rs").as_deref(), Some("pub fn fix_a() {}\n"));
-    assert_eq!(read_str(&repo, &main, "src/fix_b.rs").as_deref(), Some("pub fn fix_b() {}\n"));
-    assert!(wrapper_of(repo.store(), &tree).unwrap().is_some(), "main is under an embargo wrapper");
+    assert_eq!(
+        read_str(&repo, &main, "secrets/notes.txt").as_deref(),
+        Some("team-only notes v2\n")
+    );
+    assert_eq!(
+        read_str(&repo, &main, "src/fix_a.rs").as_deref(),
+        Some("pub fn fix_a() {}\n")
+    );
+    assert_eq!(
+        read_str(&repo, &main, "src/fix_b.rs").as_deref(),
+        Some("pub fn fix_b() {}\n")
+    );
+    assert!(
+        wrapper_of(repo.store(), &tree).unwrap().is_some(),
+        "main is under an embargo wrapper"
+    );
     // Isolated files never entered history.
     assert!(read(&repo, &main, ".env").is_none());
     // Signatures, ring, embargo records, vault.
@@ -326,7 +371,11 @@ fn format1_fixture_opens_reads_and_verifies() {
         if s.parents.is_empty() {
             continue;
         }
-        assert!(repo.keys().snapshot_status(&s).is_good(), "snapshot {} signature", id.short());
+        assert!(
+            repo.keys().snapshot_status(&s).is_good(),
+            "snapshot {} signature",
+            id.short()
+        );
     }
     let ring = repo.keys().ring_state("team").unwrap().unwrap().unwrap();
     assert_eq!(ring.generation, 2);
@@ -336,23 +385,42 @@ fn format1_fixture_opens_reads_and_verifies() {
     assert_eq!(embargoes.len(), 2);
     assert_eq!(embargoes.iter().filter(|r| r.is_released()).count(), 1);
     assert!(embargoes.iter().all(|r| repo.keys().embargo_status(r).is_good()));
-    assert_eq!(repo.vault_load().unwrap().secrets.get("API_TOKEN").map(String::as_str), Some("fixture-value"));
-    // Packed and loose; JSON trees only.
+    assert_eq!(
+        repo.vault_load().unwrap().secrets.get("API_TOKEN").map(String::as_str),
+        Some("fixture-value")
+    );
+    // Packed and loose; the trees of the fixture's format (format 2 still
+    // has the format-1 empty tree).
     let stats = repo.store().stats().unwrap();
-    assert!(stats.packs >= 1 && stats.packed_objects > 0 && stats.loose_objects > 0, "{stats:?}");
+    assert!(
+        stats.packs >= 1 && stats.packed_objects > 0 && stats.loose_objects > 0,
+        "{stats:?}"
+    );
     assert!(repo.store().verify_packs().unwrap().is_empty());
     let (json, binary) = tree_census(&repo);
     assert!(json > 0);
-    assert_eq!(binary, 0);
+    match format {
+        1 => assert_eq!(binary, 0),
+        _ => assert!(binary > json, "{binary} binary, {json} JSON trees"),
+    }
     assert_fsck_clean(fx.backend("alice"), Some(fx.identity("alice")));
 }
 
 #[test]
-fn format1_fixture_key_generations_and_audiences() {
-    let fx = Fixture::new(1);
+fn every_fixture_set_keeps_key_generations_and_audiences() {
+    for f in MIN_REPO_FORMAT..=REPO_FORMAT {
+        check_audiences(f);
+    }
+}
+
+fn check_audiences(format: u32) {
+    let fx = Fixture::new(format);
     let bob = fx.open("alice", Some("bob"));
     let main = tag(&bob, "main");
-    assert_eq!(read_str(&bob, &main, "secrets/notes.txt").as_deref(), Some("team-only notes v2\n"));
+    assert_eq!(
+        read_str(&bob, &main, "secrets/notes.txt").as_deref(),
+        Some("team-only notes v2\n")
+    );
     // Carol was revoked before the second commit: generation 0 content only.
     let carol = fx.open("alice", Some("carol"));
     assert_eq!(read_str(&carol, &main, "secrets/notes.txt"), None);
@@ -362,26 +430,41 @@ fn format1_fixture_key_generations_and_audiences() {
         .into_iter()
         .find(|id| carol.description(&carol.snapshot(id).unwrap()) == "initial import")
         .unwrap();
-    assert_eq!(read_str(&carol, &first, "secrets/notes.txt").as_deref(), Some("team-only notes v1\n"));
+    assert_eq!(
+        read_str(&carol, &first, "secrets/notes.txt").as_deref(),
+        Some("team-only notes v1\n")
+    );
     // An outsider sees the pre-merge tree of the unreleased embargo.
     let outsider = Repo::open(fx.backend("alice"), Some(Identity::generate("eve")), "eve").unwrap();
     assert_eq!(read_str(&outsider, &main, "src/fix_b.rs"), None);
-    assert_eq!(read_str(&outsider, &main, "src/fix_a.rs").as_deref(), Some("pub fn fix_a() {}\n"));
+    assert_eq!(
+        read_str(&outsider, &main, "src/fix_a.rs").as_deref(),
+        Some("pub fn fix_a() {}\n")
+    );
     assert_eq!(read_str(&outsider, &main, "secrets/notes.txt"), None);
 }
 
 #[test]
-fn format1_fixture_remotes_read_and_verify() {
-    let fx = Fixture::new(1);
+fn every_fixture_set_remotes_read_and_verify() {
+    for f in MIN_REPO_FORMAT..=REPO_FORMAT {
+        check_remotes(f);
+    }
+}
+
+fn check_remotes(format: u32) {
+    let fx = Fixture::new(format);
     let team = fx.open("team-remote", None);
     let public = fx.open("public-mirror", None);
     for (r, name) in [(&team, "team-remote"), (&public, "public-mirror")] {
-        assert_eq!(r.format(), 1);
+        assert_eq!(r.format(), format);
         assert_fsck_clean(fx.backend(name), None);
     }
-    assert!(public.view().tags.get("team-only").is_none(), "cloaked tag published");
+    assert!(!public.view().tags.contains_key("team-only"), "cloaked tag published");
     let main = tag(&public, "main");
-    assert_eq!(read_str(&public, &main, "README.md").as_deref(), Some("Fixture project\n"));
+    assert_eq!(
+        read_str(&public, &main, "README.md").as_deref(),
+        Some("Fixture project\n")
+    );
     assert_eq!(read_str(&public, &main, "src/fix_b.rs"), None);
     assert_eq!(read_str(&public, &main, "secrets/notes.txt"), None);
 }
@@ -437,7 +520,12 @@ fn upgrade_keeps_ids_and_switches_new_trees_to_binary() {
     let old_files = walk_files(old.store(), &old.snapshot(&old_main).unwrap().tree).unwrap();
     drop(old);
 
-    let r = upgrade(fx.backend("alice"), Some(fx.identity("alice")), &UpgradeOptions::default()).unwrap();
+    let r = upgrade(
+        fx.backend("alice"),
+        Some(fx.identity("alice")),
+        &UpgradeOptions::default(),
+    )
+    .unwrap();
     assert_eq!((r.from, r.to, r.up_to_date), (1, REPO_FORMAT, false));
     assert!(!fx.root.join("alice").join(JOURNAL_PATH).exists());
     let cfg = read_config(&*fx.backend("alice")).unwrap();
@@ -446,11 +534,18 @@ fn upgrade_keeps_ids_and_switches_new_trees_to_binary() {
 
     let mut repo = fx.open("alice", Some("alice"));
     assert_eq!(repo.view(), &old_view, "upgrade changed the view");
-    assert_eq!(walk_files(repo.store(), &repo.snapshot(&old_main).unwrap().tree).unwrap(), old_files);
+    assert_eq!(
+        walk_files(repo.store(), &repo.snapshot(&old_main).unwrap().tree).unwrap(),
+        old_files
+    );
     assert_fsck_clean(fx.backend("alice"), Some(fx.identity("alice")));
 
     // Running it again is a no-op.
-    assert!(upgrade(fx.backend("alice"), None, &UpgradeOptions::default()).unwrap().up_to_date);
+    assert!(
+        upgrade(fx.backend("alice"), None, &UpgradeOptions::default())
+            .unwrap()
+            .up_to_date
+    );
 
     std::fs::write(fx.root.join("alice/src/after.rs"), "// after upgrade\n").unwrap();
     let fs = fx.backend("alice");
@@ -460,11 +555,21 @@ fn upgrade_keeps_ids_and_switches_new_trees_to_binary() {
     // The root is an embargo wrapper (main is under an unreleased embargo);
     // either way it is new, so it is binary.
     assert_eq!(Object::tree_encoding(&raw), Some(TreeEncoding::Binary));
-    assert_eq!(read_str(&repo, &c, "src/after.rs").as_deref(), Some("// after upgrade\n"));
-    assert_eq!(read_str(&repo, &c, "secrets/notes.txt").as_deref(), Some("team-only notes v2\n"));
+    assert_eq!(
+        read_str(&repo, &c, "src/after.rs").as_deref(),
+        Some("// after upgrade\n")
+    );
+    assert_eq!(
+        read_str(&repo, &c, "secrets/notes.txt").as_deref(),
+        Some("team-only notes v2\n")
+    );
     // Unchanged directories keep their format-1 trees (and ids).
-    let old_util = lookup(repo.store(), &repo.snapshot(&old_main).unwrap().tree, &p("src/util")).unwrap().unwrap();
-    let new_util = lookup(repo.store(), &repo.snapshot(&c).unwrap().tree, &p("src/util")).unwrap().unwrap();
+    let old_util = lookup(repo.store(), &repo.snapshot(&old_main).unwrap().tree, &p("src/util"))
+        .unwrap()
+        .unwrap();
+    let new_util = lookup(repo.store(), &repo.snapshot(&c).unwrap().tree, &p("src/util"))
+        .unwrap()
+        .unwrap();
     assert_eq!(old_util.id, new_util.id);
     assert_fsck_clean(fx.backend("alice"), Some(fx.identity("alice")));
 }
@@ -487,7 +592,12 @@ fn upgrade_refuses_a_corrupt_repository_and_changes_nothing() {
     bytes[last] ^= 1;
     std::fs::write(&file, &bytes).unwrap();
     let before = veil_files(&root);
-    let err = upgrade(fx.backend("alice"), Some(fx.identity("alice")), &UpgradeOptions::default()).unwrap_err();
+    let err = upgrade(
+        fx.backend("alice"),
+        Some(fx.identity("alice")),
+        &UpgradeOptions::default(),
+    )
+    .unwrap_err();
     assert!(err.to_string().contains("upgrade refused"), "{err}");
     let mut after = veil_files(&root);
     after.retain(|(p, _)| !p.ends_with("upgrade.json"));
@@ -502,7 +612,8 @@ fn interrupted_upgrade_resumes() {
     let fs = fx.backend("alice");
     let mut cfg = read_config(&*fs).unwrap();
     cfg.format = REPO_FORMAT;
-    fs.write(&p(".veil/repo.json"), &serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+    fs.write(&p(".veil/repo.json"), &serde_json::to_vec_pretty(&cfg).unwrap())
+        .unwrap();
     fs.write(
         &p(JOURNAL_PATH),
         format!(r#"{{"from":1,"to":{REPO_FORMAT},"started":1,"done":["verify"]}}"#).as_bytes(),
@@ -510,15 +621,26 @@ fn interrupted_upgrade_resumes() {
     .unwrap();
     let r = upgrade(fs.clone(), Some(fx.identity("alice")), &UpgradeOptions::default()).unwrap();
     assert!(r.resumed && !r.up_to_date);
-    assert!(!r.steps.contains(&"verify".to_string()), "verification repeated: {:?}", r.steps);
+    assert!(
+        !r.steps.contains(&"verify".to_string()),
+        "verification repeated: {:?}",
+        r.steps
+    );
     assert!(!fs.exists(&p(JOURNAL_PATH)).unwrap());
 
     // Crash before the commit point: the repository is still format 1.
     let fx = Fixture::new(1);
     let fs = fx.backend("alice");
-    fs.write(&p(JOURNAL_PATH), format!(r#"{{"from":1,"to":{REPO_FORMAT},"started":1,"done":[]}}"#).as_bytes())
-        .unwrap();
-    assert_eq!(fx.open("alice", Some("alice")).format(), 1, "half an upgrade is still the old format");
+    fs.write(
+        &p(JOURNAL_PATH),
+        format!(r#"{{"from":1,"to":{REPO_FORMAT},"started":1,"done":[]}}"#).as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        fx.open("alice", Some("alice")).format(),
+        1,
+        "half an upgrade is still the old format"
+    );
     let r = upgrade(fs.clone(), Some(fx.identity("alice")), &UpgradeOptions::default()).unwrap();
     assert!(r.resumed);
     assert_eq!(read_config(&*fs).unwrap().format, REPO_FORMAT);
@@ -528,22 +650,39 @@ fn interrupted_upgrade_resumes() {
 // ---- sync across formats ----------------------------------------------------
 
 #[test]
-fn format2_clone_of_a_format1_remote_reads_everything() {
-    let fx = Fixture::new(1);
+fn format2_clone_of_every_fixture_remote_reads_everything() {
+    for f in MIN_REPO_FORMAT..=REPO_FORMAT {
+        clone_and_read(f);
+    }
+}
+
+fn clone_and_read(format: u32) {
+    let fx = Fixture::new(format);
     let fs = Arc::new(MemoryBackend::new());
     let mut bob = Repo::init_for_clone(fs, Some(fx.identity("bob")), "bob").unwrap();
     assert_eq!(bob.format(), REPO_FORMAT);
     remote::pull(&mut bob, "origin", fx.backend("team-remote")).unwrap();
     let main = tag(&bob, "main");
-    assert_eq!(read_str(&bob, &main, "secrets/notes.txt").as_deref(), Some("team-only notes v2\n"));
-    assert_eq!(read_str(&bob, &main, "src/fix_b.rs").as_deref(), Some("pub fn fix_b() {}\n"));
+    assert_eq!(
+        read_str(&bob, &main, "secrets/notes.txt").as_deref(),
+        Some("team-only notes v2\n")
+    );
+    assert_eq!(
+        read_str(&bob, &main, "src/fix_b.rs").as_deref(),
+        Some("pub fn fix_b() {}\n")
+    );
     assert_fsck_clean(bob.backend().clone(), Some(fx.identity("bob")));
 }
 
 #[test]
 fn binary_trees_never_reach_a_format1_repository() {
     let fx = Fixture::new(1);
-    upgrade(fx.backend("alice"), Some(fx.identity("alice")), &UpgradeOptions::default()).unwrap();
+    upgrade(
+        fx.backend("alice"),
+        Some(fx.identity("alice")),
+        &UpgradeOptions::default(),
+    )
+    .unwrap();
     let mut alice = fx.open("alice", Some("alice"));
     std::fs::write(fx.root.join("alice/NEW.md"), "new\n").unwrap();
     let fs = fx.backend("alice");
@@ -576,7 +715,10 @@ fn binary_trees_never_reach_a_format1_repository() {
     remote::pull(&mut up, "origin", fx.backend("team-remote")).unwrap();
     let main = tag(&up, "main");
     assert_eq!(read_str(&up, &main, "NEW.md").as_deref(), Some("new\n"));
-    assert_eq!(read_str(&up, &main, "secrets/notes.txt").as_deref(), Some("team-only notes v2\n"));
+    assert_eq!(
+        read_str(&up, &main, "secrets/notes.txt").as_deref(),
+        Some("team-only notes v2\n")
+    );
     // The format-1 public mirror still accepts pushes of JSON-only history.
     let mut f1 = fx.open("public-mirror", None);
     assert_eq!(f1.format(), 1);
@@ -593,11 +735,16 @@ fn newer_repository_format_is_refused_with_the_release_it_needs() {
     let fs = fx.backend("alice");
     let mut cfg = read_config(&*fs).unwrap();
     cfg.format = REPO_FORMAT + 1;
-    fs.write(&p(".veil/repo.json"), &serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+    fs.write(&p(".veil/repo.json"), &serde_json::to_vec_pretty(&cfg).unwrap())
+        .unwrap();
     let err = Repo::open(fs.clone(), None, "x").unwrap_err();
-    assert!(matches!(err, VeilError::Unsupported(_)) && err.to_string().contains("newer vl"), "{err}");
+    assert!(
+        matches!(err, VeilError::Unsupported(_)) && err.to_string().contains("newer vl"),
+        "{err}"
+    );
     cfg.min_vl = Some("9.9.0".into());
-    fs.write(&p(".veil/repo.json"), &serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+    fs.write(&p(".veil/repo.json"), &serde_json::to_vec_pretty(&cfg).unwrap())
+        .unwrap();
     let err = Repo::open(fs.clone(), None, "x").unwrap_err();
     assert!(err.to_string().contains("needs vl 9.9.0 or later"), "{err}");
     assert!(upgrade(fs.clone(), None, &UpgradeOptions::default()).is_err());
@@ -626,8 +773,19 @@ fn newer_object_encodings_are_unsupported_not_corrupt() {
         unsupported(&raw);
     }
     // But garbage is still corruption.
-    for raw in [&b"veil:tree\n {}"[..], b"veil:tree\n\x00", b"veil:tree\n", b"VEIL:TREE\nx"] {
-        assert!(matches!(Object::decode(raw), Err(VeilError::Corrupt(..)) | Err(VeilError::Json(_))), "{raw:?}");
+    for raw in [
+        &b"veil:tree\n {}"[..],
+        b"veil:tree\n\x00",
+        b"veil:tree\n",
+        b"VEIL:TREE\nx",
+    ] {
+        assert!(
+            matches!(
+                Object::decode(raw),
+                Err(VeilError::Corrupt(..)) | Err(VeilError::Json(_))
+            ),
+            "{raw:?}"
+        );
     }
     assert_eq!(PACK_MAGIC, b"VEILPAK1");
     assert_eq!(IDX_MAGIC, b"VEILIDX1");
@@ -657,9 +815,16 @@ fn newer_ring_and_embargo_formats_are_refused() {
     let fx = Fixture::new(1);
     let root = fx.root.join("alice/.veil/meta");
     let ring_path = root.join("keyrings/team.json");
-    let ring = std::fs::read_to_string(&ring_path).unwrap().replacen("\"format\": 2", "\"format\": 3", 1);
+    let ring = std::fs::read_to_string(&ring_path)
+        .unwrap()
+        .replacen("\"format\": 2", "\"format\": 3", 1);
     std::fs::write(&ring_path, ring).unwrap();
-    let rec = std::fs::read_dir(root.join("embargoes")).unwrap().next().unwrap().unwrap().path();
+    let rec = std::fs::read_dir(root.join("embargoes"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
     let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&rec).unwrap()).unwrap();
     v["format"] = 2.into();
     std::fs::write(&rec, serde_json::to_vec(&v).unwrap()).unwrap();

@@ -144,7 +144,11 @@ fn notes_for(from: u32, to: u32, report: &UpgradeReport) -> Vec<String> {
 
 /// Upgrade the repository on `backend` (a project or a bare remote) to
 /// `opts.to`. `identity` lets the verification open sealed objects.
-pub fn upgrade(backend: Arc<dyn StorageBackend>, identity: Option<Identity>, opts: &UpgradeOptions) -> Result<UpgradeReport> {
+pub fn upgrade(
+    backend: Arc<dyn StorageBackend>,
+    identity: Option<Identity>,
+    opts: &UpgradeOptions,
+) -> Result<UpgradeReport> {
     check_format_supported(opts.to)?;
     let _lock = if opts.dry_run {
         None

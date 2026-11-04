@@ -31,9 +31,17 @@ fn file(store: &ObjectStore, name: &str, data: &[u8]) -> TreeEntry {
 
 /// `d/d/…/d/f` with `depth` directories, `f` holding `leaf`.
 fn chain(store: &ObjectStore, depth: usize, leaf: &[u8]) -> ObjectId {
-    let mut id = store.put_tree(&Tree { entries: vec![file(store, "f", leaf)] }).unwrap();
+    let mut id = store
+        .put_tree(&Tree {
+            entries: vec![file(store, "f", leaf)],
+        })
+        .unwrap();
     for _ in 1..depth {
-        id = store.put_tree(&Tree { entries: vec![TreeEntry::dir("d", id)] }).unwrap();
+        id = store
+            .put_tree(&Tree {
+                entries: vec![TreeEntry::dir("d", id)],
+            })
+            .unwrap();
     }
     id
 }
@@ -48,12 +56,18 @@ fn merge_of_deep_trees_is_bounded_and_does_not_overflow() {
     let s = r.store();
     // Legitimate depth: merged without recursion.
     let depth = MAX_TREE_DEPTH - 24;
-    let (b, o, t) = (chain(s, depth, b"a\nb\nc\n"), chain(s, depth, b"A\nb\nc\n"), chain(s, depth, b"a\nb\nC\n"));
+    let (b, o, t) = (
+        chain(s, depth, b"a\nb\nc\n"),
+        chain(s, depth, b"A\nb\nc\n"),
+        chain(s, depth, b"a\nb\nC\n"),
+    );
     let m = merge_trees(s, Some(b), o, t).unwrap();
     assert!(m.conflicts.is_empty());
     let mut path = "d/".repeat(depth - 1);
     path.push('f');
-    let e = veil_core::tree::lookup(s, &m.tree, &VPath::new(&path).unwrap()).unwrap().unwrap();
+    let e = veil_core::tree::lookup(s, &m.tree, &VPath::new(&path).unwrap())
+        .unwrap()
+        .unwrap();
     assert_eq!(s.read_entry(&e).unwrap(), b"A\nb\nC\n");
     // Hostile depth: refused.
     let depth = 4 * MAX_TREE_DEPTH;
@@ -117,7 +131,10 @@ fn builder_handles_a_working_copy_deeper_than_the_limit() {
     wc.write(&VPath::new("top.txt").unwrap(), b"top\n").unwrap();
     let out = r.snapshot_workspace("default", &*wc).unwrap();
     assert!(
-        out.report.unreadable.iter().any(|(_, why)| why.contains("nesting exceeds")),
+        out.report
+            .unreadable
+            .iter()
+            .any(|(_, why)| why.contains("nesting exceeds")),
         "{:?}",
         out.report.unreadable
     );

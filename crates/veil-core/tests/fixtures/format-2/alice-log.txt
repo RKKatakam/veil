@@ -1,0 +1,18 @@
+@  ssuoyywl alice ✓ 2026-11-04 01:49:35 default@ 3d96087c (empty)
+│  (no description set)
+○  zosxouyy alice ✓ 2026-11-04 01:49:35 main 83b9be95 [embargo:c357ad6530]
+│ │  Fix B (embargoed)  ⇠ merges rssxrnst, ytprrvny
+│ ○  ytprrvny alice ✓ 2026-11-04 01:49:35 fix-b@ 2f81d73c [cloaked:team]
+│ │  (no description set)
+○    rssxrnst alice ✓ 2026-11-04 01:49:35 204f9efd
+│  third: loose objects
+○  wxuumrvt alice ✓ 2026-11-04 01:49:35 406f9a5d [embargo:886db5f013 released]
+│ │  Fix A (released)  ⇠ merges ypurtsnq, nmlzkxvm
+│ ○  nmlzkxvm alice ✓ 2026-11-04 01:49:35 fix-a@ team-only[cloaked:team] 767315cd [cloaked:team]
+│ │  (no description set)
+○    ypurtsnq alice ✓ 2026-11-04 01:49:35 2ab88a73
+│  second: edit docs and notes
+○  orwyyvys alice ✓ 2026-11-04 01:49:35 9da9335f
+│  initial import
+◆  zzzzzzzz 72edc798
+   root()

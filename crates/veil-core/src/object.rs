@@ -676,9 +676,9 @@ impl Object {
     /// Encoding of a raw tree object, `None` if `raw` is not a tree in an
     /// encoding this build knows.
     pub fn tree_encoding(raw: &[u8]) -> Option<TreeEncoding> {
-        match raw.strip_prefix(TREE_TAG)?.first()? {
-            &ENCODING_JSON => Some(TreeEncoding::Json),
-            &ENCODING_BINARY_TREE => Some(TreeEncoding::Binary),
+        match *raw.strip_prefix(TREE_TAG)?.first()? {
+            ENCODING_JSON => Some(TreeEncoding::Json),
+            ENCODING_BINARY_TREE => Some(TreeEncoding::Binary),
             _ => None,
         }
     }

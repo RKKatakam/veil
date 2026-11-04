@@ -78,10 +78,19 @@ policy change always reclassifies everything.
 ```text
 object      = tag || payload            id = BLAKE3(object)
 veil:blob\n   raw bytes
-veil:tree\n   JSON { entries: [ {name, kind, id, size, executable, visibility, fallback} ] }
+veil:tree\n   0x02 binary entries (format 2)  |  JSON { entries: [ {name, kind, id, size, executable, visibility, fallback} ] } (format 1)
 veil:snap\n   JSON Snapshot
 veil:seal\n   u16 scope_len | scope | nonce[24] | XChaCha20-Poly1305(ciphertext of an encoded object)
 ```
+
+The first payload byte of a tree or snapshot is its encoding version (`{`
+for JSON), and a repository writes trees in the encoding of its format
+(`repo.json`): format-2 repositories write compact binary trees, format-1
+repositories keep writing JSON, and every encoding is read forever. The
+empty tree is always JSON, so the universal root never changes. Newer
+encodings, formats and object kinds fail as `Unsupported` ("needs a newer
+vl"). [FORMAT.md](FORMAT.md) inventories every persisted structure, the
+evolution rules, `vl upgrade` and the compatibility fixtures.
 
 Objects are stored *loose* (`.veil/objects/ab/cdef…`, the canonical
 encoding as-is) until `vl gc` moves them into a *pack* (§10). Lookups check
@@ -104,8 +113,9 @@ hostile:
   from a remote that has a good copy. The cost is one read of the existing
   copy whenever an object that is already stored is put again.
 * Trees are accepted only in **canonical form** (`Object::decode`): the
-  exact bytes `serde_json` writes, entries strictly sorted by name (so
-  unique), and every name a single safe component: not empty, `.` or `..`,
+  exact bytes the encoder writes (`serde_json`'s output for JSON trees; the
+  shortest varints and no explicit defaults for binary ones), entries
+  strictly sorted by name (so unique), and every name a single safe component: not empty, `.` or `..`,
   no `/` or NUL, and never `.veil` in any ASCII case, at any depth (as Git
   refuses `.git`). The builder skips `.veil` directories at every depth for
   the same reason, and `put_tree` refuses to write a tree it could not read
@@ -540,9 +550,11 @@ attached.
 `vl status` on a clean 20,000-file working copy (1,000 cloaked, 500 ignored;
 ext4, warm page cache, release build) went from about 145 ms to about
 55 ms. After a one-file edit it went from about 150 ms to about 74 ms.
-What remains is mostly the one `lstat` per file and the per-directory
-`readdir`, plus decoding the parent's ~1,200 tree objects (JSON). Run the
-benchmark with
+Binary trees (format 2) then cut decoding the parent's ~1,200 trees from
+12.4 ms to 0.7 ms; on tmpfs a clean status went from 72–77 ms to 58–59 ms
+and a one-file edit from 77–99 ms to about 63 ms (FORMAT.md §7). What
+remains is mostly the one `lstat` per file and the per-directory
+`readdir`. Run the benchmark with
 `cargo test --release -p vl --test bench_status -- --ignored --nocapture`.
 
 ## 7. Delayed-visibility (embargoed) merges
@@ -631,7 +643,9 @@ union. Embargo records are accepted only if signed by a scope member, or as
 flagged legacy records. A release is accepted only if the published key
 matches the committed fingerprint. Snapshots whose signature fails to verify
 are reported. The object walk is iterative and refuses trees nested deeper
-than `MAX_TREE_DEPTH` (1,024) levels, measured as each tree's height so
+than `MAX_TREE_DEPTH` (1,024) levels (merge, normalisation, embargo
+sealing, the builder and `fsck` are iterative too, and bounded by the same
+limit, because a tampered local `.veil/` is not depth-checked on arrival), measured as each tree's height so
 that shared subtrees cannot hide depth. Remote tags with an invalid name, or
 whose target is missing or not a snapshot, are skipped with a warning. Tags
 fast-forward. A diverged tag is reported and left alone
@@ -949,9 +963,7 @@ BLAKE3 verification that loose reads skip, and the loose-first probe.
 * Network transport: remotes are paths to other repositories (any
   `StorageBackend`). Next is an HTTP/QUIC object protocol with
   have/want negotiation.
-* Performance: a binary tree encoding (decoding the parent's JSON trees is
-  now a large share of a cached `vl status`), incremental push instead of a
-  full graph walk, recording checked-out files in the stat cache (needs a
+* Performance: incremental push instead of a full graph walk, recording checked-out files in the stat cache (needs a
   backend write that returns the stat of the file it wrote), and batched
   fsync barriers. `gc` always rewrites everything into one pack, built in
   memory; incremental packing (small packs merged geometrically), streaming
