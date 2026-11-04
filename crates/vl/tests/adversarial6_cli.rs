@@ -247,3 +247,90 @@ fn a_copied_keystore_is_quarantined_in_the_sandbox() {
         text(&out).trim()
     );
 }
+
+// ---- the policy file itself ---------------------------------------------------------
+
+/// What an anonymous reader of the public mirror at `mirror` gets for
+/// `path` at tag `main`: `Some(plaintext)` if it is there and readable.
+fn mirror_reads(mirror: &Path, path: &str) -> Option<Vec<u8>> {
+    use std::sync::Arc;
+    use veil_core::{tree::lookup, DiskBackend, Identity, Repo, VPath};
+    let anon = Repo::open(Arc::new(DiskBackend::new(mirror)), Some(Identity::generate("anon")), "anon").unwrap();
+    let main = anon.view().tags.get("main")?.target;
+    let tree = anon.snapshot(&main).unwrap().tree;
+    let e = lookup(anon.store(), &tree, &VPath::new(path).unwrap()).unwrap()?;
+    anon.store().read_entry(&e).ok()
+}
+
+/// A project with `secrets/ cloak team`, one cloaked file, tag `main` and
+/// a public mirror remote `mirror`.
+fn project_with_cloaked_secret(env: &Env) -> std::path::PathBuf {
+    let proj = env.dir("proj");
+    env.ok(U, &proj, &["init"]);
+    write(&proj, ".veilpolicy", "secrets/ cloak team\n");
+    write(&proj, "secrets/db.yml", "password: hunter2hunter2\n");
+    write(&proj, "README", "hi\n");
+    env.ok(U, &proj, &["commit", "-m", "initial"]);
+    env.ok(U, &proj, &["tag", "set", "main", "-r", "@-"]);
+    let mirror = env.dir("mirror");
+    env.ok(U, &proj, &["remote", "add", "mirror", mirror.to_str().unwrap(), "--public"]);
+    env.ok(U, &proj, &["push", "mirror"]);
+    assert!(mirror_reads(&mirror, "secrets/db.yml").is_none(), "control: cloaked content is withheld");
+    proj
+}
+
+/// `DiskBackend` reports nothing at a symlink, so when `.veilpolicy` is a
+/// symlink (a dotfiles manager, `stow`, `chezmoi`, `cp -s`, a monorepo
+/// pointing it at a shared file) `Policy::load` finds no policy at all
+/// and every user rule stops applying. The working copy's "deleted" policy
+/// counts as the member's own edit (`working_copy_policy`), so the accepted
+/// policy follows it, and because the policy "changed" the builder's
+/// "sealed content keeps its audience" rule is lifted (`file_entry`:
+/// `reclassified`): the next snapshot re-stores every cloaked file in
+/// plaintext, and the next push sends it to the public mirror. The only
+/// message is `.veilpolicy is tracked but is now a symlink …; Veil … keeps
+/// the recorded version`, which says the opposite of what happens: the
+/// recorded *entry* is kept, the rules are not.
+#[test]
+#[ignore = "BUG-106: a symlinked .veilpolicy is ignored and previously cloaked files are re-recorded in plaintext"]
+fn a_symlinked_policy_file_still_applies() {
+    let env = Env::new();
+    let proj = project_with_cloaked_secret(&env);
+    let aside = env.root.join("dotfiles-veilpolicy");
+    std::fs::rename(proj.join(".veilpolicy"), &aside).unwrap();
+    std::os::unix::fs::symlink(&aside, proj.join(".veilpolicy")).unwrap();
+    write(&proj, "secrets/api.yml", "token: Xk9mQ2vL7pR4wZt8\n");
+    let status = env.ok(U, &proj, &["status"]);
+    let files = env.stdout(U, &proj, &["files"]);
+    assert!(
+        files.contains("cloaked:team") && !files.lines().any(|l| l.starts_with("public") && l.contains("secrets/")),
+        "the policy stopped applying:\n{status}\n{files}"
+    );
+    env.ok(U, &proj, &["commit", "-m", "more secrets"]);
+    env.ok(U, &proj, &["push", "mirror"]);
+    let mirror = env.root.join("mirror");
+    assert!(mirror_reads(&mirror, "secrets/db.yml").is_none(), "the cloaked file reached the public mirror in plaintext");
+    assert!(mirror_reads(&mirror, "secrets/api.yml").is_none(), "the new secret reached the public mirror in plaintext");
+}
+
+/// "Nothing in the working copy can fail a snapshot" (ARCHITECTURE §4):
+/// an unreadable file is reported and skipped. `.veilpolicy` is the
+/// exception: `Policy::load` runs before the build and propagates the I/O
+/// error, so with `chmod 000 .veilpolicy` (or a directory named
+/// `.veilpolicy`) every command fails, `vl ignore` and `vl status`
+/// included; only `--no-snapshot` gets through.
+#[test]
+#[ignore = "BUG-107: an unreadable (or directory) .veilpolicy makes every command fail"]
+fn an_unreadable_policy_file_does_not_brick_the_cli() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
+    std::fs::set_permissions(proj.join(".veilpolicy"), std::fs::Permissions::from_mode(0o000)).unwrap();
+    let out = env.vl(U, &proj, &["status"]);
+    std::fs::set_permissions(proj.join(".veilpolicy"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(out.status.success(), "vl status failed on an unreadable .veilpolicy: {}", text(&out));
+    std::fs::rename(proj.join(".veilpolicy"), proj.join("policy.bak")).unwrap();
+    std::fs::create_dir(proj.join(".veilpolicy")).unwrap();
+    let out = env.vl(U, &proj, &["status"]);
+    assert!(out.status.success(), "vl status failed on a directory named .veilpolicy: {}", text(&out));
+}

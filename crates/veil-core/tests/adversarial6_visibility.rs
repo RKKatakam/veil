@@ -266,3 +266,53 @@ fn the_wrapper_does_not_reveal_which_files_the_fix_changed() {
         "the wrapper names the pre-merge version of the files the fix changed: {revealed:?}"
     );
 }
+
+// ---- embargo release by a revoked member ---------------------------------------------
+
+/// Bob was in `team` when the embargo was created, so he holds the embargo
+/// key (wrapped under that key generation). Alice revokes him; revocation
+/// is forward-only, so he keeps reading the fix (documented). But he can
+/// also *release* it: `Keychain::release_embargo` needs only the key, and
+/// `merge_embargo` accepts any valid release signature, by anyone, as long
+/// as the published key matches the fingerprint (`release_consistent`).
+/// Bob pushes the released record to the team remote (any writer can); on
+/// her next pull Alice's replica considers the embargo released, and her
+/// next `vl push mirror` publishes the fix, days before the advisory. The
+/// embargo guide says "nobody can force a key holder to release"; a
+/// revoked member does exactly that.
+#[test]
+#[ignore = "BUG-108: a revoked member can release an embargo, and every replica accepts the release"]
+fn a_revoked_member_cannot_release_an_embargo() {
+    let (mut alice, fs, _) = new_repo("alice");
+    let bob = Identity::generate("bob");
+    alice.keys().grant("team", &bob.public_id(), "bob").unwrap();
+    let main = commit_files(&mut alice, &*fs, &[("auth.rs", "fn check() -> bool { true }\n")], "v1");
+    alice.set_tag("main", main, None, false).unwrap();
+    alice.create_workspace("fix", vec![main], Some("team".into())).unwrap();
+    let ov = alice.workspace_overlay("fix").unwrap();
+    ov.write(&p("auth.rs"), b"fn check() -> bool { verify_signature() }\n").unwrap();
+    let fix = alice.snapshot_workspace("fix", &ov).unwrap().snapshot;
+    let r = alice
+        .merge(WS, main, vec![fix], "merge", Some(EmbargoSpec { scope: "team".into(), until: None }))
+        .unwrap();
+    let embargo = r.embargo.clone().unwrap();
+    let hub = Arc::new(MemoryBackend::new());
+    remote::push(&mut alice, hub.clone(), false, &[], false).unwrap();
+
+    // Bob clones while he is still a member, then is revoked.
+    let mut bobs = Repo::init_for_clone(Arc::new(MemoryBackend::new()), Some(bob.clone()), "bob").unwrap();
+    remote::pull(&mut bobs, "origin", hub.clone()).unwrap();
+    assert!(bobs.keys().has(&format!("embargo/{embargo}")), "control: Bob held the key before the revocation");
+    assert!(alice.keys().revoke("team", &bob.public_id()).unwrap());
+    remote::push(&mut alice, hub.clone(), false, &[], false).unwrap();
+
+    // The revoked Bob releases the embargo and pushes the record.
+    bobs.release_embargo(&embargo).unwrap();
+    remote::push(&mut bobs, hub.clone(), false, &[], false).unwrap();
+
+    remote::pull(&mut alice, "origin", hub).unwrap();
+    assert!(
+        !alice.keys().embargo_released(&embargo),
+        "a release by a revoked member was accepted; Alice's next public push publishes the fix"
+    );
+}
