@@ -130,15 +130,13 @@ fn restore_from_a_revision_does_not_accept_its_policy() {
         !files.contains(".env") && !status.contains("A .env"),
         "the restored policy published .env without `vl policy accept`:\n{status}\n{files}"
     );
-    // And it never reaches the team remote.
+    // And it never reaches the team remote (packs are zstd: read it back
+    // through the engine, as any reader of the remote would).
     env.ok(U, &proj, &["commit", "-m", "after restore"]);
+    env.ok(U, &proj, &["tag", "set", "after", "-r", "@-"]);
     env.ok(U, &proj, &["push"]);
     let hub = env.root.join("hub");
-    let leaked = adversarial_support::tree_listing(&hub.join(".veil/objects"))
-        .into_iter()
-        .filter(|f| std::fs::read(hub.join(".veil/objects").join(f)).map_or(false, |d| d.windows(14).any(|w| w == b"hunter2hunter2")))
-        .count();
-    assert_eq!(leaked, 0, ".env reached the team remote in plaintext");
+    assert!(remote_reads(&hub, "after", ".env").is_none(), ".env reached the team remote in plaintext");
 }
 
 // ---- messages that lead users into mistakes --------------------------------------
@@ -250,13 +248,18 @@ fn a_copied_keystore_is_quarantined_in_the_sandbox() {
 
 // ---- the policy file itself ---------------------------------------------------------
 
-/// What an anonymous reader of the public mirror at `mirror` gets for
-/// `path` at tag `main`: `Some(plaintext)` if it is there and readable.
+/// [`remote_reads`] at tag `main`.
 fn mirror_reads(mirror: &Path, path: &str) -> Option<Vec<u8>> {
+    remote_reads(mirror, "main", path)
+}
+
+/// What an anonymous reader of the remote at `remote` gets for `path` at
+/// `tag`: `Some(plaintext)` if it is there and readable.
+fn remote_reads(remote: &Path, tag: &str, path: &str) -> Option<Vec<u8>> {
     use std::sync::Arc;
     use veil_core::{tree::lookup, DiskBackend, Identity, Repo, VPath};
-    let anon = Repo::open(Arc::new(DiskBackend::new(mirror)), Some(Identity::generate("anon")), "anon").unwrap();
-    let main = anon.view().tags.get("main")?.target;
+    let anon = Repo::open(Arc::new(DiskBackend::new(remote)), Some(Identity::generate("anon")), "anon").unwrap();
+    let main = anon.view().tags.get(tag)?.target;
     let tree = anon.snapshot(&main).unwrap().tree;
     let e = lookup(anon.store(), &tree, &VPath::new(path).unwrap()).unwrap()?;
     anon.store().read_entry(&e).ok()
