@@ -206,9 +206,10 @@ fn documented_assignment_shapes_are_found() {
 /// the key and the value, or a digit or plural `s` after the keyword, and
 /// are never matched. WordPress's `wp-config.php` (`define( 'DB_PASSWORD',
 /// '…' )`) is the classic leaked file; it is missed, as are its eight
-/// `AUTH_KEY`/`…_SALT` secrets.
+/// `AUTH_KEY`/`…_SALT` secrets. `key` alone is no keyword, so
+/// `APP_KEY` (Laravel), `RAILS_MASTER_KEY` and `ENCRYPTION_KEY` never count.
 #[test]
-#[ignore = "BUG-092: wp-config define(), env[\"KEY\"] = …, PASSWORD2, API_KEYS and k8s env shapes are missed"]
+#[ignore = "BUG-092: wp-config define(), env[\"KEY\"] = …, PASSWORD2, API_KEYS, APP_KEY and k8s env shapes are missed"]
 fn common_credential_shapes_are_found() {
     let cases = [
         ("wp-config.php", "define( 'DB_PASSWORD', 'Xk9mQ2vL7pR4wZt8' );\n"),
@@ -225,6 +226,9 @@ fn common_credential_shapes_are_found() {
         ("XML CDATA", "<password><![CDATA[Xk9mQ2vL7pR4wZt8]]></password>\n"),
         ("plist", "<key>Password</key>\n<string>Xk9mQ2vL7pR4wZt8</string>\n"),
         ("SQL", "ALTER USER app WITH PASSWORD 'Xk9mQ2vL7pR4wZt8';\n"),
+        ("Laravel APP_KEY", "APP_KEY=base64:Zq8vXk9mQ2vL7pR4wZt8aB3cD5eF7gH9jK1mN3pQ5sU=\n"),
+        ("Rails master key", "RAILS_MASTER_KEY=9f86d081884c7d659a2feaa0c55ad015\n"),
+        ("encryption key", "ENCRYPTION_KEY: \"Zq8vXk9mQ2vL7pR4wZt8aB3c\"\n"),
     ];
     let missed: Vec<_> = cases.iter().filter(|(_, c)| !found(c.as_bytes())).map(|(n, c)| format!("{n}: {c:?}")).collect();
     assert!(missed.is_empty(), "{} of {} shapes missed:\n{}", missed.len(), cases.len(), missed.join("\n"));

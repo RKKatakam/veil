@@ -88,3 +88,21 @@ fn a_swap_file_of_an_isolated_key_is_not_recorded() {
         "private-key material is on the public mirror: {hits:?} (scanner findings on the swap file: {scanned:?})"
     );
 }
+
+/// The same gap for text backups of `.env`: Emacs writes `.env~` on the
+/// first save of every session (by default), Vim does with `backup` set.
+/// `.env~` matches neither `.env` nor `.env.*`, so it is public, and only
+/// the scanner stands between `.env`'s values and history. It misses
+/// common ones (`APP_KEY`, `RAILS_MASTER_KEY`, `ENCRYPTION_KEY`: `key` alone
+/// is no keyword; see BUG-092), so `.env`'s content is recorded and pushed.
+#[test]
+#[ignore = "BUG-098: an editor backup of .env (.env~) is recorded and pushed in plaintext"]
+fn an_editor_backup_of_dotenv_is_not_recorded() {
+    let (mut repo, fs, _) = new_repo("alice");
+    let env = "APP_KEY=base64:Zq8vXk9mQ2vL7pR4wZt8aB3cD5eF7gH9jK1mN3pQ5sU=\nRAILS_MASTER_KEY=9f86d081884c7d659a2feaa0c55ad015\n";
+    fs.write(&p(".env"), env.as_bytes()).unwrap();
+    fs.write(&p(".env~"), env.as_bytes()).unwrap();
+    let s = snap(&mut repo, &*fs);
+    assert!(file_entry(&repo, &s, ".env").is_none(), "control: .env is isolated");
+    assert!(file_entry(&repo, &s, ".env~").is_none(), ".env~ (with .env's values) was recorded as a public file");
+}
