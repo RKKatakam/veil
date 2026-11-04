@@ -15,6 +15,7 @@ Code map:
 | `crates/veil-core/src/crypto.rs` | envelopes: AES-SIV (deterministic) and XChaCha20-Poly1305 (random nonce, and the legacy deterministic form) |
 | `crates/veil-core/src/identity.rs` | identities, HPKE key wrapping (and the legacy sealed box), Ed25519 signatures |
 | `crates/veil-core/src/keychain.rs` | key generations, ring log (hash chain, signatures, genesis MAC), embargo key wrapping and release |
+| `crates/veil-core/src/team_vault.rs` | team-vault records: sealed entries, their signatures and who counts (C12) |
 | `crates/veil-core/src/store.rs` | which construction a repository writes (by repository format) and what it accepts |
 | `crates/veil-core/src/upgrade.rs` | the migration to format 3 |
 
@@ -117,6 +118,7 @@ repositories at format 1 or 2 (so that older vl can read them), see §5.
   | older generation key | `prev-key:<scope>#<new-key-id>` | the new generation's key | ring `Rotation.previous` |
   | embargo key | `embargo-wrap:<id>` | scope key (generation in `scope_key`) | `EmbargoRecord.wrapped` |
   | device-local vault | `local` | `local_key` (C8) | `.veil/local/vault.sealed` |
+  | team-vault entry (name and value) | `vault:<scope>#<key-id>` | scope generation key | `.veil/meta/vault/` records (C12) |
 
 * **Goal.** Ordinary nonce-based AEAD. The label is authenticated, so a
   sealed key cannot be presented as another role or for another embargo or
@@ -234,8 +236,8 @@ Read forever; written only into format-1/2 repositories.
 ### C5. Signatures (all)
 
 `Ed25519(signing_key, SIG_PREFIX ‖ context ‖ 0x00 ‖ payload)`, contexts
-`snapshot`, `ring-change`, `embargo`, `embargo-release`, `member-binding`
-(see the domains table). Payloads are fixed encodings (FORMAT.md §2, "signed bodies never
+`snapshot`, `ring-change`, `embargo`, `embargo-release`, `member-binding`,
+`vault-entry` (see the domains table). Payloads are fixed encodings (FORMAT.md §2, "signed bodies never
 change"). What a valid signature *means* (who may sign what) is decided
 against the ring log (ARCHITECTURE §3).
 
@@ -335,6 +337,45 @@ boundaries beyond collision resistance of BLAKE3-256.
 of Git commit ids to Veil change ids. Not secret, and not a security
 boundary.
 
+### C12. Team-vault records (all)
+
+* **Construction.** C2 (XChaCha20-Poly1305, random nonce) under the
+  scope's current generation key, label `vault:<scope>#<key-id>`, over the
+  JSON `{name, value, since}` padded with spaces to a multiple of 128 bytes.
+  Then an Ed25519 signature (C5, context `vault-entry`) by the writer over
+  `{format, scope, sealed, timestamp, signer}` (encrypt-then-sign). Record
+  id = unkeyed BLAKE3 of the canonical file bytes (C10).
+* **Goal.** Only members of the scope (holders of a generation key) read
+  names and values. A record counts only if its signer is a *current*
+  member with the signing key the verified ring registers (judged by every
+  reader against the ring, as for embargo releases, C7). The label binds
+  the ciphertext to the scope and generation, and the signature binds the
+  ciphertext to its writer, time and scope. Because the signature is over the
+  ciphertext, a non-member relay can check who wrote a record without being
+  able to open it.
+* **Why random nonces, not AES-SIV (C1).** Nothing needs determinism: a
+  record is written once and never re-derived. Determinism would leak
+  equality: setting a secret back to an earlier value, or two entries with
+  the same value, would give identical ciphertexts. The `vault:` prefix keeps
+  these envelopes apart from cloaked change descriptions, which use C2 with
+  the bare `<scope>#<key-id>` label under the same key.
+* **Why encrypt-then-sign.** The signer is a member who could read and
+  re-sign any entry anyway, so signing the ciphertext gives up nothing and
+  lets anyone holding the ring verify membership. A member can take
+  another member's ciphertext and sign it as their own write. That gives
+  them nothing they could not do by writing the value directly.
+* **Known limits.**
+  * Revocation is forward-only, as for content: a revoked member keeps the
+    keys of the generations they held, so they can read every record sealed
+    under them. `vl scope revoke` lists those entries.
+  * Visible to a remote's operator: scope, record count, sizes in 128-byte
+    steps, timestamps, the signer's member id and signing key. They can
+    withhold or delete records (rollback for fresh clones). Freshness is
+    TOFU, as for rings.
+  * Timestamps are self-asserted. Ordering uses them only between counting
+    writers (current members). Sync refuses records stamped more than a day
+    ahead, and a writer stamps after everything they have pulled.
+
 ## 3. Domain-separation strings
 
 All in `crates/veil-core/src/crypto/domains.rs`. A unit test checks they
@@ -358,11 +399,13 @@ are distinct and pins their exact bytes.
 | `SIG_CONTEXT_EMBARGO` | `embargo` | Ed25519 context | C5, C7 |
 | `SIG_CONTEXT_EMBARGO_RELEASE` | `embargo-release` | Ed25519 context | C5, C7 |
 | `SIG_CONTEXT_MEMBER_BINDING` | `member-binding` | Ed25519 context | C4, C5 |
+| `SIG_CONTEXT_VAULT_ENTRY` | `vault-entry` | Ed25519 context | C5, C12 |
 | `WRAP_LABEL_PREFIX` | `wrap:` | AEAD associated data | C3, C3L |
 | `PREV_KEY_LABEL_PREFIX` | `prev-key:` | AEAD associated data | C2 |
 | `EMBARGO_WRAP_LABEL_PREFIX` | `embargo-wrap:` | AEAD associated data | C2, C7 |
 | `EMBARGO_LABEL_PREFIX` | `embargo/` | AEAD associated data | C1, C2 |
 | `LOCAL_LABEL` | `local` | AEAD associated data | C2, C8 |
+| `VAULT_LABEL_PREFIX` | `vault:` | AEAD associated data | C2, C12 |
 | `GENERATION_SEPARATOR` | `#` | label syntax `<scope>#<key-id>` | C1, C2 |
 
 Signature contexts never contain NUL and are followed by `0x00`, so

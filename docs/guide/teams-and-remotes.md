@@ -62,7 +62,8 @@ origin  team  ../hub
 | Cloaked descriptions and tags | ciphertext / ✓ | placeholders / never sent |
 | Unreleased embargoes | the fix, for the embargo's scope | the pre-merge tree only |
 | Key rings | ✓ | ✗: never sent (since BUG-077). Still visible: scope names, and the member id and signing key of whoever signed public snapshots or embargo records. Rings an older `vl` already pushed stay there; each public push warns about them |
-| Isolated files | never (they are not in history) | never |
+| Team vaults (`vl secret set --scope team NAME`) | ✓ (encrypted and signed records) | ✗: never sent |
+| Isolated files, local vault | never (they are not in history) | never |
 
 A teammate outside a scope who pulls from a team remote gets ciphertext
 they can't open: the files appear as redacted (`R`) until someone grants
@@ -299,6 +300,13 @@ Revocation is **forward-only**: Bob keeps everything he could read before,
 including every file still sealed under an older key generation. Rotate the
 real secrets (passwords, API keys) that those files contain. Remove his
 access to the remote itself (SSH keys, share permissions) as well.
+
+If the scope has a [team vault](secrets-and-visibility.md#the-team-vault),
+the revocation also lists every secret in it that Bob could read: rotate each
+at its source and store the new value with `vl secret set --scope team
+NAME`. Bob's own writes stop counting, and the values he last set are
+re-signed by you so they don't vanish. `vl secret list --scope team
+--exposed-to bob` shows what is still to rotate.
 
 ## Recovering from crashes
 

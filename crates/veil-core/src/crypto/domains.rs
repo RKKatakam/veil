@@ -67,6 +67,9 @@ pub const SIG_CONTEXT_EMBARGO_RELEASE: &str = "embargo-release";
 /// X25519 key (over the 32 raw bytes of the X25519 public key). Proves that
 /// whoever holds the signing key chose that encryption key (BUG-069).
 pub const SIG_CONTEXT_MEMBER_BINDING: &str = "member-binding";
+/// Signature context: a team-vault write (over `team_vault::RecordBody`):
+/// a member of the scope set or deleted one entry.
+pub const SIG_CONTEXT_VAULT_ENTRY: &str = "vault-entry";
 
 /// Every signature context, for the uniqueness test.
 pub const SIG_CONTEXTS: &[&str] = &[
@@ -75,6 +78,7 @@ pub const SIG_CONTEXTS: &[&str] = &[
     SIG_CONTEXT_EMBARGO,
     SIG_CONTEXT_EMBARGO_RELEASE,
     SIG_CONTEXT_MEMBER_BINDING,
+    SIG_CONTEXT_VAULT_ENTRY,
 ];
 
 // ---- key rings and embargoes (keychain.rs) --------------------------------
@@ -108,6 +112,11 @@ pub const PREV_KEY_LABEL_PREFIX: &str = "prev-key:";
 pub const EMBARGO_WRAP_LABEL_PREFIX: &str = "embargo-wrap:";
 /// `embargo/<id>`: content sealed under an embargo key.
 pub const EMBARGO_LABEL_PREFIX: &str = "embargo/";
+/// `vault:<scope>#<key-id>`: a team-vault entry (name and value) sealed
+/// under a scope generation key (XChaCha20-Poly1305, random nonce). The
+/// prefix keeps it apart from cloaked change descriptions, which use the
+/// bare `<scope>#<key-id>` label under the same key.
+pub const VAULT_LABEL_PREFIX: &str = "vault:";
 /// `local`: the device-local vault and isolated files.
 pub const LOCAL_LABEL: &str = "local";
 /// Separator of `<scope>#<key-id>` generation labels.
@@ -151,16 +160,20 @@ mod tests {
         let contexts: std::collections::BTreeSet<&str> = SIG_CONTEXTS.iter().copied().collect();
         assert_eq!(contexts.len(), SIG_CONTEXTS.len(), "duplicate signature context");
         assert!(SIG_CONTEXTS.iter().all(|c| !c.contains('\0')));
+        // The first five contexts are pinned as they were before the team
+        // vault added `vault-entry`; each later one is pinned on its own.
         assert_eq!(
-            &blake3::hash(SIG_CONTEXTS.join("\n").as_bytes()).to_hex()[..16],
+            &blake3::hash(SIG_CONTEXTS[..5].join("\n").as_bytes()).to_hex()[..16],
             "028e842fb2475981",
             "a signature context changed; that breaks existing signatures. Add a new constant instead."
         );
+        assert_eq!(SIG_CONTEXTS[5..], ["vault-entry"], "a signature context changed or was reordered");
         let labels = [
             WRAP_LABEL_PREFIX,
             PREV_KEY_LABEL_PREFIX,
             EMBARGO_WRAP_LABEL_PREFIX,
             EMBARGO_LABEL_PREFIX,
+            VAULT_LABEL_PREFIX,
         ];
         for (i, a) in labels.iter().enumerate() {
             for b in &labels[i + 1..] {

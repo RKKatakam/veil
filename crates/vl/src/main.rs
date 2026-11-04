@@ -31,6 +31,7 @@ mod render;
 mod sandbox;
 mod serve;
 mod shape;
+mod team_secret;
 
 use std::{
     io::{IsTerminal, Read, Write},
@@ -372,7 +373,11 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             return Ok(scan_status(&scan));
         }
         Cmd::Secret(c) => cmd_secret(ctx, c)?,
-        Cmd::Run { command } => return cmd_run(ctx, command),
+        Cmd::Run {
+            command,
+            scopes,
+            local_only,
+        } => return cmd_run(ctx, command, scopes, *local_only),
         Cmd::Scope(c) => cmd_scope(ctx, c)?,
         Cmd::Workspace(c) => return cmd_ws(ctx, c),
         Cmd::Op(OpCmd::Log { limit, out }) => match out.json {
@@ -1706,7 +1711,7 @@ fn scan_gate(root: &Path, file: &Path, shown: &str) -> Result<api::Scan> {
 
 fn cmd_secret(ctx: &mut Ctx, c: &SecretCmd) -> Result<()> {
     match c {
-        SecretCmd::Set { name, value } => {
+        SecretCmd::Set { name, value, scope } => {
             let value = match value {
                 Some(v) => v.clone(),
                 None => {
@@ -1715,6 +1720,9 @@ fn cmd_secret(ctx: &mut Ctx, c: &SecretCmd) -> Result<()> {
                     s.trim_end_matches(['\n', '\r']).to_string()
                 }
             };
+            if let Some(scope) = scope {
+                return team_secret::set(ctx, scope, name, &value);
+            }
             let previous = ctx.repo.vault_update(|vault| Ok(vault.secrets.insert(name.clone(), value)))?;
             ctx.repo.record_outside_view(
                 format!("store secret {name} in the local vault"),
@@ -1728,17 +1736,29 @@ fn cmd_secret(ctx: &mut Ctx, c: &SecretCmd) -> Result<()> {
             )?;
             println!("Stored secret {name} in the local vault");
         }
-        SecretCmd::Get { name } => {
+        SecretCmd::Get { name, scope: Some(scope) } => team_secret::get(ctx, scope, name)?,
+        SecretCmd::List {
+            scope: Some(scope),
+            exposed_to,
+            out,
+        } => {
+            if out.json {
+                bail!("`vl secret list --scope` has no --json output yet; use it without --scope for the local vault");
+            }
+            team_secret::list(ctx, scope, exposed_to.as_deref())?
+        }
+        SecretCmd::Rm { name, scope: Some(scope) } => team_secret::rm(ctx, scope, name)?,
+        SecretCmd::Get { name, scope: None } => {
             let vault = ctx.repo.vault_load()?;
             let v = vault.secrets.get(name).ok_or_else(|| anyhow!("no secret named '{name}'"))?;
             println!("{v}");
         }
         // Names only: no value ever enters the result.
-        SecretCmd::List { out } => match out.json {
+        SecretCmd::List { scope: None, out, .. } => match out.json {
             true => api::emit_json(&api::secret_list(&ctx.repo)?)?,
             false => api::text::secret_list(&api::secret_list(&ctx.repo)?),
         },
-        SecretCmd::Rm { name } => {
+        SecretCmd::Rm { name, scope: None } => {
             if !ctx.repo.vault_update(|vault| Ok(vault.secrets.remove(name).is_some()))? {
                 bail!("no secret named '{name}'");
             }
@@ -1801,10 +1821,14 @@ fn cmd_secret(ctx: &mut Ctx, c: &SecretCmd) -> Result<()> {
     Ok(())
 }
 
-fn cmd_run(ctx: &mut Ctx, command: &[String]) -> Result<ExitCode> {
+/// `vl run`: team-vault secrets first, then the local vault's, which
+/// override them (`team_secret::run_env`).
+fn cmd_run(ctx: &mut Ctx, command: &[String], scopes: &[String], local_only: bool) -> Result<ExitCode> {
     let vault = ctx.repo.vault_load()?;
+    let team = team_secret::run_env(ctx, scopes, local_only, &vault.secrets)?;
     let status = std::process::Command::new(&command[0])
         .args(&command[1..])
+        .envs(&team)
         .envs(&vault.secrets)
         .status()
         .with_context(|| format!("failed to run {}", command[0]))?;
@@ -1887,7 +1911,7 @@ fn cmd_scope(ctx: &mut Ctx, c: &ScopeCmd) -> Result<()> {
             }
         }
         ScopeCmd::Revoke { scope, public_key } => {
-            if keys.revoke(scope, public_key)? {
+            if let Some(vault_report) = keys.revoke_with_vault(scope, public_key)? {
                 ctx.repo.record_outside_view(
                     format!("revoke {public_key} from scope {scope}"),
                     format!(
@@ -1901,6 +1925,7 @@ fn cmd_scope(ctx: &mut Ctx, c: &ScopeCmd) -> Result<()> {
                      the revoked identity never receives. Content they already decrypted cannot be recalled; rotate secrets.\n\
                      Push to share the updated key ring."
                 );
+                team_secret::print_revoke_report(scope, &vault_report);
                 warn_unreachable_members(keys, scope);
             } else {
                 bail!("that key is not a member of '{scope}'");

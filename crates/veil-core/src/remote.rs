@@ -12,6 +12,7 @@
 //! | cloaked tags                    | ✓           | ✗             |
 //! | key rings                       | ✓           | ✗ (they name the members) |
 //! | embargo records                 | ✓           | ✓ (encrypted, signed) |
+//! | team vault (`vl secret --scope`) | ✓ (sealed, signed records) | ✗ |
 //! | isolated files, vault, `local`  | never — not in the graph at all |
 //!
 //! Redacted tree entries keep their names and ids, so a later push to a
@@ -1061,8 +1062,21 @@ pub(crate) fn push_closure(
 /// ([`Keychain::merge_embargo`]). Rings an earlier vl pushed there are left
 /// alone (removing them would lock members out of a team remote that was
 /// added as public by mistake), with a warning.
-fn sync_meta(src: &Keychain, dst: &Keychain, public: bool, warnings: &mut Vec<String>) -> Result<()> {
+///
+/// Team-vault records follow the rings: team destinations only, checked
+/// against the destination's (just merged) ring ([`crate::team_vault`]).
+/// `local` is the keychain holding this identity (the source on push, the
+/// destination on pull); `pulling` turns on warnings about records that are
+/// refused or will not count.
+fn sync_meta(src: &Keychain, dst: &Keychain, public: bool, pulling: bool, warnings: &mut Vec<String>) -> Result<()> {
     if public {
+        let records = crate::team_vault::record_count(&**dst.backend())?;
+        if records > 0 {
+            warnings.push(format!(
+                "this public remote holds {records} team-vault record(s) (encrypted), which vl never pushes to \
+                 public remotes. If it really is public, delete .veil/meta/vault/ there"
+            ));
+        }
         let left = dst.rings()?.len();
         if left > 0 {
             warnings.push(format!(
@@ -1077,6 +1091,9 @@ fn sync_meta(src: &Keychain, dst: &Keychain, public: bool, warnings: &mut Vec<St
                 warnings.push(w);
             }
         }
+        dst.invalidate();
+        let local = if pulling { dst } else { src };
+        crate::team_vault::sync(src, dst, local, pulling, warnings)?;
     }
     for rec in src.embargoes()? {
         if let Some(w) = dst.merge_embargo(&rec)? {
@@ -1422,7 +1439,7 @@ pub fn push_with(
     // (BUG-109). Objects sealed under their keys may already have been
     // sent above; without the key they are unreadable.
     report.releases_published = local.keys().publish_staged_releases()?;
-    sync_meta(local.keys(), tx.repo().keys(), public, &mut report.warnings)?;
+    sync_meta(local.keys(), tx.repo().keys(), public, false, &mut report.warnings)?;
     for (name, tag) in selected {
         if tx.view.tags.get(&name).is_some_and(|existing| existing.target == tag.target) {
             report.remote_tags.push((name, tag.target));
@@ -1784,7 +1801,7 @@ pub fn pull_with(
         let local_refs = tx.view.refs();
         report = pull_incremental(tx.repo().store(), &local_refs, &remote, &remote_backend, &tags, report)?;
     }
-    sync_meta(remote.keys(), tx.repo().keys(), false, &mut report.warnings)?;
+    sync_meta(remote.keys(), tx.repo().keys(), false, true, &mut report.warnings)?;
     tx.repo().keys().invalidate();
     // Change and snapshot ids a new local tag must not shadow: those of
     // local history and of everything this pull brings in (a teammate's

@@ -990,6 +990,14 @@ impl Checker {
                 }
             }
         }
+        // Team-vault records: a file that is not a readable record never
+        // counts (and sync never copies it); report it, never delete it.
+        for scope in crate::team_vault::vault_scopes(&*self.backend)? {
+            let (_, bad) = crate::team_vault::load_records(&*self.backend, &scope)?;
+            for b in bad {
+                self.push(Severity::Warning, format!("{b} (ignored by every reader)"));
+            }
+        }
         Ok(())
     }
 

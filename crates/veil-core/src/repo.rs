@@ -10,6 +10,7 @@
 //! .veil/ops/<id>, op_head       operation log (local)
 //! .veil/meta/keyrings/*.json    wrapped scope keys (shared, safe to publish)
 //! .veil/meta/embargoes/*.json   embargo records (shared)
+//! .veil/meta/vault/<scope>/     team-vault records (shared with team remotes)
 //! .veil/local/                  device-only state: checkout pointer, vault
 //! ```
 

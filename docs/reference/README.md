@@ -56,7 +56,7 @@ Global options (accepted by every command):
 | [`vl ignore`](ignore.md) | Do not track matching paths at all |
 | [`vl policy`](policy.md) | Inspect the visibility policy |
 | [`vl scan`](scan.md) | Scan the working copy for secrets that would become public |
-| [`vl secret`](secret.md) | Device-local encrypted secret vault |
+| [`vl secret`](secret.md) | Encrypted secrets: the device-local vault, or a scope's team vault (`--scope`), shared with the scope's members through team remotes |
 | [`vl run`](run.md) | Run a command with vault secrets injected as environment variables |
 | [`vl identity`](identity.md) | Your public-key identity |
 | [`vl scope`](scope.md) | Key scopes and their members (identity rings) |

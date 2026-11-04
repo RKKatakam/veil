@@ -11,6 +11,7 @@ when it records a snapshot, so no command, merge or push can get around it.
 4. [Quarantine](#quarantine)
 5. [`vl scan` in CI](#vl-scan-in-ci)
 6. [The vault: `vl secret` and `vl run`](#the-vault-vl-secret-and-vl-run)
+   * [The team vault](#the-team-vault)
 7. [Cloaking for a team](#cloaking-for-a-team)
 8. [The accepted policy: when an incoming change is held back](#the-accepted-policy-when-an-incoming-change-is-held-back)
 9. [What is protected, and what isn't](#what-is-protected-and-what-isnt)
@@ -428,11 +429,100 @@ db=postgres://app:Xk29vLq8sPz@db/prod token=s3cr3t-value
 | `vl secret import FILE` | Import `KEY=VALUE` lines from a dotenv file (`export` prefixes and quotes are stripped) |
 | `vl secret files` | List the vault's backups of isolated files, including those of files gone from the working copy (kept 30 days) |
 | `vl secret recover PATH` | Write the backup of an isolated file back into the working copy (never over an existing file) |
-| `vl run -- CMD…` | Run `CMD` with every vault secret in its environment; exits with its status |
+| `vl run -- CMD…` | Run `CMD` with every vault secret in its environment (team vaults first, see below); exits with its status |
 
 The vault is per repository and per device. A teammate's clone has its own.
 Replacing your identity makes the vault unreadable until you re-key it
 (`vl identity recover-vault`, see [Maintenance](maintenance.md#replacing-your-identity)).
+
+### The team vault
+
+Secrets the whole team needs (a staging database URL, a shared API key) go
+into a scope's **team vault**: sealed for the members of the scope and
+synced through team remotes, so a new teammate who is granted the scope gets
+them on their next `vl pull`. Public remotes and the Git export never
+receive it.
+
+```text
+alice$ vl secret set --scope team STRIPE_TEST_KEY        # value from stdin
+Stored secret STRIPE_TEST_KEY in the team vault of scope team; push to share it with its members
+alice$ vl push
+bob$ vl pull
+bob$ vl secret list --scope team
+STRIPE_TEST_KEY  set by alice 2026-11-04 14:53:28 (key generation 0)
+bob$ vl run -- npm test                # STRIPE_TEST_KEY is in its environment
+```
+
+| Command | Does |
+|---|---|
+| `vl secret set --scope S NAME [VALUE]` | Store (or overwrite) a secret in scope `S`'s team vault. You must be a member, granted with your full public key |
+| `vl secret get --scope S NAME` | Print its value to stdout |
+| `vl secret list --scope S` | List names, with who last set each and when; never values |
+| `vl secret list --scope S --exposed-to MEMBER` | Only the names MEMBER (public key, member id or name; current or revoked) could read |
+| `vl secret rm --scope S NAME` | Delete it (a signed deletion that syncs like a write) |
+| `vl run [--scope S]… [--local-only] -- CMD…` | Choose which team vaults `vl run` loads |
+
+Names are letters, digits, `_`, `.` and `-`, starting with a letter or `_`,
+because they become environment variables. Values are at most 64 KiB.
+
+**What `vl run` loads, in order.** By default, the team vault of **every
+scope you are a member of**, then your local vault on top: a local secret
+with the same name overrides the team's (handy for a personal override of a
+shared value), and both override variables already in the environment.
+`--scope S` (repeatable) loads only those scopes' team vaults;
+`--local-only` loads none. If two loaded scopes set the same name to
+different values, `vl run` refuses and names both, rather than pick one;
+choose with `--scope`, or set the name in your local vault. Loading every
+scope by default means a teammate's `vl run -- npm start` just works after
+a pull. Use `--scope` when a command should see less, for example to keep
+`prod` secrets out of a test run.
+
+**Who can read and write.**
+
+* Every entry, **name and value**, is encrypted under the scope's current
+  key, so the operator of a team remote sees only opaque record ids, sizes
+  rounded to 128 bytes, write times and who wrote.
+* Every write is signed by its author. An entry counts only if its author is
+  a **current** member of the scope, signing with the key the scope's ring
+  registers for them. A write by someone else, by a revoked member, or with
+  a bad signature is ignored, and `vl pull` warns about it.
+* Members granted with the short member id can read but not write.
+
+**Concurrent writes.** For each name the newest signed write wins, and a
+deletion is a write. A write is stamped later than everything its author had
+pulled, so a write you make after pulling always wins over what you saw,
+whatever the clocks say. Two teammates writing the same name without
+pulling each other's write: the later timestamp wins, the same on every
+replica.
+
+**Key rotation.** After `vl scope rotate` (or a revocation) new writes are
+sealed under the new key. Existing entries stay readable through the key
+chain, and move to the new key the next time someone writes them.
+
+**When someone leaves.** `vl scope revoke` lists every team-vault secret
+the revoked member could read, the secrets to rotate:
+
+```text
+alice$ vl scope revoke team veil1e75c0889…c00a
+Revoked. Scope team rotated to key generation 1: …
+Team vault of scope team: the revoked identity could read 2 secret(s). Rotate each at its source,
+then store the new value with `vl secret set --scope team <name>`:
+  DB_PASSWORD
+  WEBHOOK_SECRET
+Their writes no longer count, so you re-signed the 1 secret(s) they last set (still to rotate): WEBHOOK_SECRET
+```
+
+Their writes stop counting from the revocation on. Entries whose current
+value they wrote are re-signed by you, so the team keeps working until you
+rotate them. `vl secret list --scope team --exposed-to <their key or name>`
+shows what is still left to rotate: a name drops off the list once it holds
+a value set after the revocation. Setting the *same* value again doesn't
+count as rotation.
+
+**Undo.** Team-vault writes are not part of the operation log (like key
+rings). `vl undo` refuses them and tells you how to reverse the write by hand
+(`vl secret rm --scope …`, or set the old value again). Once pushed,
+teammates have the value.
 
 ## Cloaking for a team
 
@@ -632,6 +722,7 @@ are in [`docs/BACKLOG.md`](../BACKLOG.md). In short:
 | **Trust on first use** | A fresh clone accepts the first valid key ring it sees. A malicious remote could serve an outdated ring. Members who already hold the newer ring reject it |
 | **Signatures are advisory** | Unsigned or unknown-key snapshots are shown (`unsigned`, `?signer`) but not rejected. `author` is a free-form claim; only the signer is authenticated |
 | **Embargoes** | See [Embargoes: limitations](embargoes.md#limitations-in-10): metadata stays visible, release time isn't cryptographically enforced, one embargo per line |
+| **Team vault metadata** | A team remote's operator can't read names or values, but sees how many entries a scope has (roughly), their sizes in 128-byte steps, when they were written and by whom. They can also withhold records: a fresh clone then sees an older value, or a deleted secret (members who already pulled the newer record keep it) |
 | **Concurrent admin edits** | Two admins changing a scope at the same time: the local ring is kept, `vl` warns, and an admin re-applies the missing change |
 
 Next: [Embargoes](embargoes.md).

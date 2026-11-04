@@ -413,11 +413,24 @@ pub enum Cmd {
     },
 
     // ---- secrets & identities ---------------------------------------------
-    /// Device-local encrypted secret vault.
+    /// Encrypted secrets: the device-local vault, or a scope's team vault
+    /// (`--scope`), shared with the scope's members through team remotes.
     #[command(subcommand)]
     Secret(SecretCmd),
     /// Run a command with vault secrets injected as environment variables.
+    ///
+    /// Loads the team vaults of your scopes first, then the local vault,
+    /// whose secrets override a team secret of the same name. Variables
+    /// already in the environment are overridden by both.
     Run {
+        /// Load only these scopes' team vaults (repeatable). Default: every
+        /// scope you are a member of. A name set in two loaded scopes is an
+        /// error unless the local vault overrides it.
+        #[arg(long = "scope", value_name = "SCOPE")]
+        scopes: Vec<String>,
+        /// Load only the local vault, no team vault.
+        #[arg(long, conflicts_with = "scopes")]
+        local_only: bool,
         /// Command and arguments (put them after `--`).
         #[arg(trailing_var_arg = true, required = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -634,7 +647,7 @@ impl Cmd {
             | Cmd::Diff { out, .. }
             | Cmd::Scan { out, .. }
             | Cmd::Tag(TagCmd::List { out })
-            | Cmd::Secret(SecretCmd::List { out })
+            | Cmd::Secret(SecretCmd::List { out, .. })
             | Cmd::Workspace(WsCmd::List { out })
             | Cmd::Op(OpCmd::Log { out, .. })
             | Cmd::Ls { out, .. }
@@ -714,23 +727,41 @@ pub enum SecretCmd {
     Set {
         /// Secret name (the environment variable `vl run` sets).
         name: String,
-        /// Secret value (default: read from stdin).
+        /// Secret value (default: read from stdin, which keeps it out of
+        /// your shell history).
         value: Option<String>,
+        /// Store it in this scope's team vault (sealed for its members,
+        /// pushed to team remotes) instead of the local vault.
+        #[arg(long, value_name = "SCOPE")]
+        scope: Option<String>,
     },
-    /// Print a secret.
+    /// Print a secret's value to stdout.
     Get {
         /// Secret name.
         name: String,
+        /// Read it from this scope's team vault.
+        #[arg(long, value_name = "SCOPE")]
+        scope: Option<String>,
     },
-    /// List secret names.
+    /// List secret names (never values).
     List {
+        /// List this scope's team vault, with who last set each name and when.
+        #[arg(long, value_name = "SCOPE")]
+        scope: Option<String>,
+        /// Only the names MEMBER (public key, member id or name; current or
+        /// revoked) could read: the secrets to rotate when they leave.
+        #[arg(long, value_name = "MEMBER", requires = "scope")]
+        exposed_to: Option<String>,
         #[command(flatten)]
         out: JsonOut,
     },
-    /// Delete a secret.
+    /// Delete a secret (in a team vault: a signed deletion that syncs).
     Rm {
         /// Secret name.
         name: String,
+        /// Delete it from this scope's team vault.
+        #[arg(long, value_name = "SCOPE")]
+        scope: Option<String>,
     },
     /// List the vault's backups of isolated files (`.env` & co), including
     /// those of files gone from the working copy (kept 30 days).
@@ -809,6 +840,7 @@ pub enum ScopeCmd {
         admin: bool,
     },
     /// Remove an identity from a scope and rotate its key (admins only).
+    /// Lists the scope's team-vault secrets they could read: rotate them.
     Revoke {
         /// Scope name.
         scope: String,

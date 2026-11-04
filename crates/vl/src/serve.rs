@@ -1238,7 +1238,7 @@ impl Server {
             }
             "secret.list" => {
                 let p: Plain = params(p)?;
-                read(Cmd::Secret(SecretCmd::List { out: JSON }), p.snapshot)
+                read(Cmd::Secret(SecretCmd::List { scope: None, exposed_to: None, out: JSON }), p.snapshot)
             }
             "snapshot" => {
                 let _: NoParams = params(p)?;
