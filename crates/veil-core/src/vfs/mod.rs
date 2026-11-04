@@ -11,16 +11,21 @@
 //! * [`SftpBackend`]    — a repository on another machine, reached through
 //!   the user's `ssh` and its `sftp` subsystem (remotes).
 
+#[cfg(feature = "os")]
 mod disk;
 mod memory;
 mod overlay;
+#[cfg(feature = "os")]
 mod sftp;
+#[cfg(feature = "os")]
 mod sftp_client;
 mod sftp_url;
 
+#[cfg(feature = "os")]
 pub use disk::{parse_folding, probe_folding, DiskBackend, FOLDING_ENV};
 pub use memory::MemoryBackend;
 pub use overlay::{OverlayBackend, OverlayChanges};
+#[cfg(feature = "os")]
 pub use sftp::{SftpBackend, SftpOptions, SftpStats};
 pub use sftp_url::SshUrl;
 

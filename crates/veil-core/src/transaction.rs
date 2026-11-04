@@ -126,6 +126,7 @@ impl<'r> Transaction<'r> {
     /// Write `snap` as it is, without a signature: for snapshots whose
     /// content is a function of something outside Veil (a Git commit), so
     /// that every replica writing it gets the same id.
+    #[cfg(feature = "git")]
     pub(crate) fn write_unsigned_snapshot(&mut self, snap: &Snapshot) -> Result<ObjectId> {
         let mut s = snap.clone();
         s.signature = None;

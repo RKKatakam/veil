@@ -23,6 +23,9 @@ below it, and nothing above the VFS layer knows a disk exists.
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
+Without the `os` feature (the WASM build, §13) the same stack runs over
+`MemoryBackend`, overlays or a backend the embedder provides.
+
 ## 1. VFS layer
 
 `StorageBackend` is a small synchronous trait (`read`, `read_range`, `write`,
@@ -2163,6 +2166,116 @@ a key is missing from `json.md`. A failure under `--json` prints a
 printed its own (`api::json_emitted`), so stdout carries at most one
 document; clap's usage errors (exit 2) stay text.
 
+## 13. Builds without an operating system (WASM)
+
+`veil-core` builds for `wasm32-unknown-unknown` (browsers, Web Workers, any
+WebAssembly host) with `--no-default-features --features wasm`. Nothing
+above the VFS layer needed changing for it: the work was keeping what
+needs a host behind cargo features, so the engine core (object store,
+packs, trees, snapshots, op log, merge, policy, scanner, crypto,
+keychain, embargoes, sync, gc, fsck, `MemoryBackend`, overlays) compiles
+and runs without them. The user's view is in
+[guide/embedding.md](guide/embedding.md).
+
+| Feature | Default | Gates |
+|---|---|---|
+| `os` | on | `DiskBackend` (`std::fs`, fsync, `libc`), `SftpBackend` (spawns `ssh`, threads), the lock's host introspection (`/proc`, `sysctl`, `kill`, `gethostname`, `std::process::id`) and heartbeat thread, the worker threads of sync (`par_map`), `Instant` as the monotonic clock |
+| `zstd` | on | the zstd C library (`zstd-sys`): compressed and delta pack entries written and read |
+| `git` | on | `veil_core::git` (gix, the system `git`); implies `os` |
+| `ruzstd` | off | the pure-Rust zstd decoder (`pack::pure`) |
+| `wasm` | off | `ruzstd` + getrandom's `wasm_js` (WebCrypto) backend |
+
+`lib.rs` refuses to compile with neither `zstd` nor `ruzstd`: every
+build must read every pack. `vl` uses the defaults, so the native build,
+its behaviour and its performance are what they were (the only change on
+that path is that the gc pending cache asks `clock::monotonic` for
+`Instant`'s elapsed time).
+
+**The clock** (`clock.rs`). Every timestamp the engine records comes from
+`now_millis()`, which asks the clock installed with `clock::set_clock`
+(process-wide), else the system clock. `wasm32-unknown-unknown` has none
+(`SystemTime::now()` panics there), so time stands at 0 until the embedder
+installs one. That is fail-safe: deadlines, grace periods and leases are
+all "wait until time has passed", so nothing happens early. Monotonic time
+(`clock::monotonic`) is `Instant` with `os` and the installed wall clock,
+made non-decreasing, without it. The lock's `SystemClock` uses both. This
+is also the hook for a trusted time source (HUB.md §8.2) and for
+deterministic tests.
+
+**The lock without `os`** keeps the file protocol of §9 but has no host to
+introspect. The holder's "host" and "boot" are a random name per engine
+instance (`instance-<16 hex>`), its pid 0. So:
+
+* a lock of another instance on a shared backend is *another host's* lock,
+  which §9 never takes over (no instance can prove another is gone);
+* within one instance, the same-process rules hold: a lock whose token no
+  live `RepoLock` of this instance holds was leaked and is reclaimed at
+  once, and a lock flagged for recovery is taken over;
+* `LockOptions::default().wait` is zero: the engine runs on one thread, so
+  a held lock is held by someone who cannot release it while we wait, and
+  there may be no clock to wait on (a busy wait on a clock that stands
+  still would never end);
+* there is no heartbeat (no threads). Nobody else ever takes the lock over,
+  so an unrenewed lease is harmless.
+
+The limitation: an instance that dies holding the lock of a *persistent,
+shared* backend (IndexedDB across tabs) leaves `.veil/lock` behind for good,
+and so does any lock file this instance did not write: an unreadable one
+(native vl reclaims it after a lease unchanged) or a lock of a native
+process copied along with the repository (native vl checks its pid). Each
+fails with `Locked` naming the holder; removing `.veil/lock` by hand is the
+remedy.
+Single-writer use, and in-memory repositories, never meet it. A Hub web
+client that shares storage between tabs needs a lock built on the
+platform's own (Web Locks API) behind `StorageBackend::create_new`.
+
+**Packs without zstd.** The loose object format always was the
+uncompressed canonical encoding, so only packs involve zstd:
+
+* *Reading* uses `ruzstd`, which decodes every entry the C library writes.
+  Delta entries are zstd frames compressed against their base as
+  *raw-content* history (a dictionary, or a prefix with long-distance
+  matching above 2 MiB, BUG-290). `ruzstd` only loads *formatted*
+  dictionaries (magic, id, entropy tables, three repeat offsets, then
+  content), so the base is given to it behind a fixed 112-byte header:
+  tables cut from a trained dictionary and the repeat offsets 1, 4, 8,
+  which are exactly what a raw-content dictionary starts with. The tables
+  are never consulted: a frame compressed against raw content has no
+  earlier tables to repeat, so its first block always carries its own. The
+  frame must declare the recorded length, decoding stops as soon as the
+  output would exceed it, the window is capped at 2^27 as for libzstd, and
+  the result is re-hashed against its id like every pack read. Tests check
+  the pure decoder against libzstd's output (plain frames at levels 1–19,
+  dictionary and prefix deltas, property tests on random edits) and that
+  damaged frames and random bytes are errors, never a panic.
+* *Writing* (`PackBuilder`, so gc and sync) stores every entry as kind 0.
+  Packs are larger but the format is unchanged; every vl reads them, and
+  the next native `vl gc` recompresses them.
+
+**Randomness**: getrandom's `wasm_js` backend (WebCrypto through
+wasm-bindgen). A plain WebAssembly host without JavaScript glue builds
+with `--cfg getrandom_backend="custom"` and `ruzstd` instead of `wasm`, and
+supplies a `__getrandom_v03_custom` function (getrandom 0.4.3 does not
+compile with both `wasm_js` and the custom backend).
+
+**What is not there without `os`**: `DiskBackend`, SFTP remotes, Git
+interop, process-based lock recovery, worker threads (sync runs its
+requests one after another), and the CLI.
+
+**Testing.** `tests/portable.rs` runs in both configurations: the smoke
+scenario (`examples/wasm_smoke.rs`: init, write, snapshot, read back, log,
+diff, seal and unseal under a scope, an outsider, merge, pull, gc), the
+format fixtures written by native vl (zstd frames and deltas) opened from
+memory and verified, the installed clock, gc and reopen, and the lock
+rules. CI's `wasm` job (`scripts/check-wasm.sh`) builds the crate for
+`wasm32-unknown-unknown`, runs `portable` and the example natively with
+the WASM feature set, runs the decoder tests (`--features ruzstd`), clippy
+over the portable configurations, and finally the example compiled to
+WebAssembly under node, whose only imports are a clock and randomness. The
+example is about 4 MB of WebAssembly in a release build (1.2 MB gzipped),
+2.2 MB (0.85 MB) with `opt-level = "z"`, fat LTO and stripped symbols;
+the scenario takes about 50 ms.
+
 ## Threat model
 
 **Protected against:**
@@ -2327,7 +2440,9 @@ document; clap's usage errors (exit 2) stay text.
   ring changes.
 * First-class conflicts (jj-style) instead of conflict markers.
 * Front-ends: a FUSE mount of `TreeView` plus overlay for zero-copy
-  checkouts, and a WASM build of `veil-core` with `MemoryBackend`.
+  checkouts. (The WASM build of `veil-core` exists, §13; a browser
+  front-end on it, a persistent browser `StorageBackend` and a lock that
+  works across tabs do not yet.)
 * Symlink support in `DiskBackend`.
 * Git interop: Git tags (annotated or not) are not imported or exported,
   only branches; Git authors' time zones are not kept (export writes UTC);

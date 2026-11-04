@@ -12,9 +12,23 @@
 //! | Graph | [`oplog`], [`repo`], [`transaction`], [`revset`] | snapshot DAG, change ids, operation log, undo |
 //! | Features | [`workspace`], [`commands`], [`embargo`], [`remote`], [`vault`], [`upgrade`] | workspaces, cloaking, embargoes, sync, secrets vault, format migrations |
 //!
-//! Nothing in the engine touches `std::fs` directly except [`vfs::DiskBackend`]:
+//! Nothing in the engine touches `std::fs` directly except `vfs::DiskBackend`:
 //! every repository, working copy and remote is just a `StorageBackend`, so the
 //! whole engine runs unchanged in memory, over overlays, or inside a sandbox.
+//!
+//! ## Features
+//!
+//! | Feature | Default | What it adds |
+//! |---------|---------|--------------|
+//! | `os` | yes | `DiskBackend`, `SftpBackend`, process checks and a heartbeat thread in the [`lock`], worker threads, the system clock |
+//! | `zstd` | yes | the zstd C library: compressed and delta pack entries |
+//! | `git` | yes | two-way Git interop (`git`, needs `os`) |
+//! | `ruzstd` | no | a pure-Rust zstd decoder that reads every pack without the C library |
+//! | `wasm` | no | `ruzstd` plus WebCrypto randomness: with `--no-default-features`, the engine for `wasm32-unknown-unknown` |
+//!
+//! Without `os` the engine runs over [`MemoryBackend`], [`OverlayBackend`]
+//! or any `StorageBackend` the embedder provides, on the clock it installs
+//! ([`clock::set_clock`]). See `examples/wasm_smoke.rs`.
 //!
 //! ```
 //! # fn main() -> veil_core::Result<()> {
@@ -36,6 +50,7 @@
 pub mod builder;
 pub mod cache;
 pub mod checkout;
+pub mod clock;
 pub mod commands;
 pub mod crypto;
 pub mod embargo;
@@ -75,13 +90,20 @@ pub use id::{ChangeId, ObjectId};
 pub use identity::Identity;
 pub use object::{EntryKind, Snapshot, Tree, TreeEntry, Visibility};
 pub use repo::Repo;
-pub use vfs::{DiskBackend, MemoryBackend, OverlayBackend, SftpBackend, SshUrl, StorageBackend};
+pub use vfs::{MemoryBackend, OverlayBackend, SshUrl, StorageBackend};
+#[cfg(feature = "os")]
+pub use vfs::{DiskBackend, SftpBackend};
 pub use vpath::VPath;
 
-/// Current wall-clock time in milliseconds since the Unix epoch.
+#[cfg(not(any(feature = "zstd", feature = "ruzstd")))]
+compile_error!(
+    "veil-core needs a zstd decoder to read packs: enable the `zstd` feature (the default) \
+     or `ruzstd` (part of `wasm`)"
+);
+
+/// Current wall-clock time in milliseconds since the Unix epoch, by the
+/// engine's clock (see [`clock`]: the system clock unless the embedder
+/// installed another).
 pub fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    clock::now_millis()
 }

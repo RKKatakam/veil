@@ -30,7 +30,7 @@ use std::{
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
         Arc, Mutex, RwLock,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use crate::{
@@ -93,7 +93,8 @@ const PENDING_TTL: Duration = Duration::from_secs(30);
 
 struct GcHints {
     enabled: AtomicBool,
-    pending: RwLock<Option<(Instant, Arc<HashSet<ObjectId>>)>>,
+    /// (when loaded, on [`crate::clock::monotonic`]; the set)
+    pending: RwLock<Option<(Duration, Arc<HashSet<ObjectId>>)>>,
     freshened: RwLock<HashSet<ObjectId>>,
 }
 
@@ -633,7 +634,7 @@ impl ObjectStore {
         {
             let p = self.gc.pending.read().unwrap();
             if let Some((at, set)) = &*p {
-                if at.elapsed() < PENDING_TTL {
+                if crate::clock::monotonic().saturating_sub(*at) < PENDING_TTL {
                     return set.contains(id);
                 }
             }
@@ -644,7 +645,7 @@ impl ObjectStore {
                 .unwrap_or_default(),
         );
         let hit = set.contains(id);
-        *self.gc.pending.write().unwrap() = Some((Instant::now(), set));
+        *self.gc.pending.write().unwrap() = Some((crate::clock::monotonic(), set));
         hit
     }
 
