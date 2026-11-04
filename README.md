@@ -15,7 +15,7 @@ working tree *is* the host filesystem. Veil drops all three assumptions:
 | Security fixes leak the moment they're merged | **Embargoed merges**: outsiders see the pre-merge tree, and none of the fix's history, until release |
 | `git add` / index / detached HEAD | Every command **auto-snapshots** the working copy; stable **change ids**; undoable **op log** |
 | Worktrees lock directories hostage | **Virtual workspaces** live in the DAG; agents get **in-memory overlays** in microseconds |
-| Tied to the OS filesystem | Engine runs on any `StorageBackend`: disk, memory, overlay |
+| Tied to the OS filesystem | Engine runs on any `StorageBackend`: disk, memory, overlay, SFTP |
 
 ## Quick start
 
@@ -54,7 +54,7 @@ vl secret import .env && vl run -- ./server      # encrypted device-local vault 
 vl cloak secrets/ --scope team
 vl scope grant team veil1<bob's public key> --name bob   # from bob's `vl identity show`
 vl scope revoke team veil1<…>   # rotates the key: new content is unreadable to them
-vl remote add origin ../team-remote
+vl remote add origin alice@build.example.com:repos/proj   # any SSH server: no vl needed there
 vl remote add mirror ../public-mirror --public
 vl push origin        # team members receive ciphertext + key rings
 vl push mirror        # cloaked blobs and cloaked tags are withheld
@@ -91,6 +91,7 @@ vl undo
 vl <command> [args]     global: -R <repo>  --no-snapshot
 
 Setup        init [path] · clone <src> [dest] · identity show|new
+             (<src>, remotes: a path, ssh://[user@]host[:port]/path or [user@]host:path)
 Inspect      status|st · log [-n N] · show [rev] · diff [-r rev | --from a --to b] [--stat]
              files [-r rev] · cat <path> [-r rev] · evolog [-r rev]
 History      new [revs…] [-m] · commit -m · describe [-r rev] -m · edit <rev>
@@ -107,8 +108,8 @@ Workspaces   ws list|new <name> [-r rev] [--cloak [S]]|switch <name>|rm <name>
              ws exec <name>|--ephemeral [-r rev] [-m] [--with-isolated] -- <cmd…>
              ws cat <name> <path> · ws write <name> <path> < stdin
 Op log       op log [-n N] · op restore <id> · undo · watch [--interval-ms N]
-Sync         remote add <name> <path> [--public]|list|rm · push [remote] [-t tag…] [--force]
-             pull [remote]
+Sync         remote add <name> <path|ssh-url> [--public]|list|rm
+             push [remote] [-t tag…] [--force] [--full] · pull [remote] [--full]
 Git          git import <path|url> [--remote R] · git remote add <name> <url>|list|rm
              git fetch [remote] · git pull [remote] · git push [remote] [-t tag…] [--force]
              git export [-t tag…]
@@ -184,7 +185,7 @@ with one commit that publishes the fix and links its history.
 ```text
 crates/
   veil-core/   the engine library (no direct std::fs use outside DiskBackend)
-    src/vfs/          StorageBackend + Disk / Memory / Overlay backends
+    src/vfs/          StorageBackend + Disk / Memory / Overlay / SFTP backends
     src/crypto.rs     VeilEnvelope (XChaCha20-Poly1305, SIV-style nonces)
     src/identity.rs   X25519 + Ed25519 identities, key wrapping, signatures
     src/keychain.rs   signed key-ring logs, key generations, embargo records, `local`
@@ -197,7 +198,7 @@ crates/
     src/oplog.rs      views + operation log  src/transaction.rs  auto-rebase
     src/workspace.rs  workspaces, ephemeral overlays
     src/embargo.rs    delayed-visibility merges
-    src/remote.rs     visibility-filtered push / pull
+    src/remote.rs     visibility-filtered, incremental push / pull (packs on the wire)
     src/git/          Git import/export (gix) and the `git` transport
     src/vault.rs      device-local encrypted vault
     src/upgrade.rs    `vl upgrade`: journaled repository format migrations
@@ -237,5 +238,16 @@ drop(ws);                                       // vanishes; the snapshot remain
 This is an MVP of the architecture: the full engine and CLI work end-to-end
 and are covered by tests (`cargo test`). See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#limitations-and-roadmap) for
-known limitations and what comes next (network transport, sealed
-tree names, FUSE/WASM front-ends).
+known limitations and what comes next (sealed tree names,
+FUSE/WASM front-ends).
+
+### SSH remotes
+
+A remote can live on any machine you can `ssh` to; the server needs SSH
+with its SFTP subsystem and nothing else. `vl` runs your own `ssh`, so
+`~/.ssh/config` host aliases, the agent, `known_hosts` and ProxyJump work as
+they do for Git (`VEIL_SSH` replaces the command). Cloaked content is
+encrypted before it leaves your machine. Pushes send one pack of what the
+remote lacks; pulls download what they lack in a few round trips. A client
+that crashes mid-push leaves a lease-based lock that the next push takes
+over after at most about 45 seconds.

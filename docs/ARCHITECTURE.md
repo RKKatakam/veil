@@ -41,6 +41,7 @@ must not be trusted (which disables stat caching):
 | `DiskBackend` | ns since the epoch / ns / inode number (Unix; mtime only elsewhere) | wall clock, ns, `exact: false` |
 | `MemoryBackend` | per-backend write-generation counter / – / – | current generation, `exact: true` |
 | `OverlayBackend`, `TreeView` | – (mixed or immutable sources) | `None` (they use `known_id`) |
+| `SftpBackend` | – (another machine's clock) | `None` |
 
 * **DiskBackend** does atomic, durable writes (temp file, fsync, rename,
   fsync of the directory; see §9) and ignores symlinks: `metadata` reports
@@ -58,6 +59,36 @@ must not be trusted (which disables stat caching):
   whiteout set sit over any read-only lower layer. Ancestor whiteouts hide
   whole subtrees. A file in the way of a directory is an error, exactly as
   on the other backends; it is never whited out implicitly.
+* **SftpBackend** (`vfs/sftp*.rs`) is a repository on another machine,
+  reached through the user's own `ssh` (`ssh … -s -- host sftp`, as
+  `sftp(1)` runs it; `VEIL_SSH` replaces the command), so `~/.ssh/config`,
+  the agent, `known_hosts` and ProxyJump just work and the server needs only
+  SSH. It speaks SFTP version 3 itself: a small pipelined client in which
+  any number of threads keep any number of requests in flight, a reader
+  thread routing replies by request id. `write` is a temp file opened with
+  `O_EXCL`, written with every chunk in flight, `fsync@openssh.com`, then
+  `posix-rename@openssh.com`; `write_unsynced` skips the fsync and queues
+  the file, and `sync_barrier` opens, fsyncs and closes every queued file in
+  one pipelined batch. `create_new` writes a synced temp file and
+  `hardlink@openssh.com`s it into place (fails if the target exists), or
+  falls back to `OPEN` with `CREAT|EXCL`. `read` stats and opens in one
+  round trip and reads everything in the next (255 KiB requests, short
+  reads re-requested, a probe past the expected end). "No such file" maps
+  to `NotFound`, other statuses to `Io` with a matching `ErrorKind`, a lost
+  connection to `ConnectionAborted`; a server silent for 5 minutes is a
+  lost connection. SFTP cannot fsync a directory, so a rename is as durable
+  as the server's file system makes it after the file itself was synced.
+  `is_network()` is true: its lock is a fencing lease (§9) and sync batches
+  requests (§8). Remote URLs are `ssh://[user@]host[:port]/path` (`/~/` for
+  the home directory) and scp-style `[user@]host:path`; as in Git, a `:`
+  after a `/` makes a local path.
+  *Why not a library:* `openssh-sftp-client` (with `openssh`) also drives
+  the system `ssh`, but is async-only: a tokio runtime under a synchronous,
+  `&self`, multi-threaded `StorageBackend`, for a protocol that takes a few
+  hundred lines. `russh` and `ssh2` (libssh2) bring their own SSH
+  implementation, so the user's config, agent forwarding, ProxyJump,
+  ControlMaster, FIDO keys and known_hosts handling would all have to be
+  re-created (or would silently differ), and `ssh2` adds a C dependency.
 * **TreeView** (in `tree.rs`) is a lazy, read-only backend over a snapshot
   tree. It only loads and decrypts the nodes that are actually read.
 
@@ -636,6 +667,63 @@ merged-in (non-first) parents reach: the fix, and how it was made.
 * After the release, the next push fills the parents in, with unchanged
   snapshot ids.
 
+### Incremental transfer and packs on the wire
+
+Over a WAN, sync costs round trips, so neither side re-walks or re-checks
+what the other provably has (`remote.rs` has the details):
+
+* **The receiver's committed view is a complete closure**: transactions
+  write objects, a barrier, then the operation, so everything reachable
+  from the receiver's committed view is present. Presence alone proves
+  nothing (a crashed transfer leaves snapshots without trees), so only
+  reachability counts. Two refinements keep it exact: the non-first parents
+  of an embargoed merge (possibly redacted when it was sent) count only if
+  the receiver holds them in a pack, and on a public receiver embargo
+  wrappers are always revisited (what they hold may have been withheld then
+  and be releasable now).
+* **Push** walks the remote view's closure on the *local* graph, sends only
+  the snapshots outside it, and skips every subtree reachable from the
+  known snapshots they build on. Everything sent goes into one pack with
+  deltas between versions of the same path (`PackBuilder`), written to the
+  remote's pack directory inside its transaction: the pack unsynced, a
+  barrier, then the index durably. A crash leaves at worst an invisible
+  pack (no index) or a complete one whose operation never landed. Tag
+  fast-forward checks run on the local graph too.
+* **Pull** lists the remote's objects (pack indexes and loose fan-out
+  directories, many requests in flight), skips every snapshot the local
+  committed view reaches, and at the first object it lacks downloads, in
+  parallel, every remote pack and loose object it lacks. The walk then
+  runs locally; objects already present are read locally, never fetched.
+  When the remote holds objects the walk did not need, a local walk of the
+  committed view finds references to them: that fills gaps such as a clone
+  of a public mirror now pulling from a team remote, or embargoed content
+  released since. More than 256 new objects are stored locally as a pack.
+* Filtering is unchanged: whatever crosses passes the same `allowed`,
+  decoding and depth checks as before.
+* `vl push --full` / `vl pull --full` is the object-by-object walk of
+  everything, which re-verifies the receiver's copies: it repairs a
+  damaged object, and fills content a push receiver lacks below snapshots
+  it already has (a gap a plain push does not detect).
+
+Benchmark (`cargo test --release -p veil-core --test sftp_bench --
+--ignored --nocapture`): 3,000 files, 300 snapshots, about 7,850 objects,
+through a local OpenSSH `sftp-server` with an artificial delay in both
+directions (release build):
+
+| operation | full walk, 2 ms RTT | incremental, 2 ms RTT | incremental, 50 ms RTT |
+|---|---|---|---|
+| first push | 87.5 s, 63,720 requests, 41 MiB sent | 0.51 s, 122 requests, 2.6 MiB | 5.3 s |
+| clone | 52.7 s, 40,904 requests, 37 MiB | 0.41 s, 80 requests, 2.6 MiB | 2.4 s |
+| push, up to date | 68.3 s, 47,400 requests | 0.08 s, 58 requests | 1.9 s |
+| push of 1 new snapshot | 68.4 s | 0.14 s, 85 requests | 3.1 s |
+| pull of 1 new snapshot | 52.9 s | 0.11 s, 75 requests | 2.2 s |
+
+The full walk's requests are almost all one round trip each, so at 50 ms
+it would take about 25 times its 2 ms time (not run). The incremental
+costs at 50 ms are a fixed number of round trips: opening the remote,
+the lock, metadata, the operation; a pull also reads every remote pack
+index (0.4 MiB here).
+
 Key rings are signed
 logs that only fast-forward (§3). Stale, tampered or forged rings are
 ignored or rejected with a warning, and membership is never merged as a
@@ -684,6 +772,33 @@ id plus pid namespace) and a lease (10 s by default).
   has the exact bytes that were judged stale, replaces it with its own lock
   in one atomic write. Two contenders can never both win, and no third
   process can slip in between the removal and the new lock.
+* **Network remotes: fencing leases.** On an `is_network()` backend
+  (SFTP), other hosts can never prove a holder gone, so a client that
+  crashed mid-push would lock the remote forever. Its lock is a *fencing*
+  lock (`"fencing": true`; lease 30 s, renewed every 5 s):
+  * the holder remembers, on its monotonic clock, when its last successful
+    renewal *started*; once that is a whole lease ago it stops renewing and
+    `ensure_held` fails, so it never publishes after its lease, however
+    long it was suspended or partitioned;
+  * any host may take over an expired fencing lock: after seeing the same
+    lock bytes unrenewed for `lease + grace` (15 s) on its own monotonic
+    clock (no clock comparison, so skew does not matter), or at once when
+    `renewed` is older than `lease + grace + skew` (skew allowance 2 min)
+    by its wall clock. A contender facing a fencing lock waits at least
+    `lease + grace`, so the next push recovers a crashed one;
+  * safety: the holder's last renewal started before the contender first
+    saw its bytes, the holder stops publishing a lease after that start,
+    and the contender waits `grace` longer still. The residual risk is a
+    holder stalled for more than `grace` *between* its final check and the
+    single `op_head` write (SFTP has no compare-and-swap); its token check
+    catches every later step;
+  * locks without the flag (local holders, older versions) keep the rule
+    above and are never taken over from another host. The takeover guard
+    is a fencing lock too, so a contender that crashed mid-takeover on
+    another host is cleared after its 5 s lease plus grace.
+
+  `LockContext` carries the clock and host identity: the tests simulate
+  hosts, skew, suspension and crashes with `SimClock`.
 * Fencing: before moving `op_head`, a transaction checks that the lock still
   carries its token (`RepoLock::ensure_held`). A holder whose lock file was
   replaced behind its back (tampering) fails with `Locked` instead of
@@ -1114,15 +1229,19 @@ repository lock.
 
 ## Limitations and roadmap
 
-* Network transport: remotes are paths to other repositories (any
-  `StorageBackend`). Next is an HTTP/QUIC object protocol with
-  have/want negotiation.
-* Performance: incremental push instead of a full graph walk, recording checked-out files in the stat cache (needs a
-  backend write that returns the stat of the file it wrote), and batched
-  fsync barriers. `gc` always rewrites everything into one pack, built in
+* Network transport: remotes are paths or SSH remotes (`SftpBackend`, §1,
+  §8); no smart server protocol (have/want negotiation, server-side
+  packing) is planned for 1.0. Remote packs accumulate, one per push, and a
+  pull reads every index, so consolidating small remote packs (by the
+  pushing client, which holds their objects) is next. A plain push does not
+  notice content a remote lacks below snapshots it already has
+  (`vl push --full` fills it).
+* Performance: recording checked-out files
+  in the stat cache (needs a backend write that returns the stat of the
+  file it wrote). `gc` always rewrites everything into one pack, built in
   memory; incremental packing (small packs merged geometrically), streaming
-  pack writes and cross-pack deltas are next. Sync sends canonical objects,
-  not packs.
+  pack writes and cross-pack deltas are next. Sync builds its packs in
+  memory too, and a pull holds the remote packs it downloads in memory.
 * Sealed directory nodes for cloaked paths, to hide their names (embargoes
   already seal their trees, §7); a "require signed snapshots" policy;
   pinning a ring head out of band; automatic re-application of concurrent

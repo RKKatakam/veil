@@ -42,6 +42,41 @@
 //!   token is no longer ours. Transactions call it right before moving the
 //!   operation head.
 //!
+//! **Network remotes: leases with self-fencing.** A repository on an
+//! [`StorageBackend::is_network`] backend (SFTP) is shared by clients on
+//! other hosts, which can never prove each other gone: under the rules
+//! above, a client that crashed mid-push would lock the remote forever.
+//! Locks on such a backend are *fencing* locks (`"fencing": true` in the
+//! file, [`LockOptions::for_backend`] timings: lease 30 s, renewed every
+//! 5 s):
+//!
+//! * **The holder fences itself.** It remembers, on its own monotonic
+//!   clock, when its last successful renewal *started*. Once that is a
+//!   whole lease ago it stops renewing and [`RepoLock::ensure_held`]
+//!   fails, so it never publishes after its lease ran out, even if it was
+//!   suspended, stuck on the network or had its clock changed.
+//! * **Anyone may take over an expired fencing lock**, from any host, in
+//!   one of two ways. *Observed:* the contender saw the same lock bytes
+//!   (no renewal) for `lease + grace` on its own monotonic clock. Clocks
+//!   are never compared, so this is immune to skew. *Wall clock:* the
+//!   `renewed` time is older than `lease + grace + skew` by the contender's
+//!   clock (default skew allowance 2 minutes), for locks abandoned long ago.
+//!   A contender facing a fencing lock waits at least `lease + grace`
+//!   before giving up, so a crashed pusher's lock is recovered by the next
+//!   push (in at most 45 s).
+//! * **Why it is safe.** The holder's last renewal started before the
+//!   contender first saw its bytes, and the holder stops publishing a lease
+//!   after that start; the contender takes over `grace` (15 s) later
+//!   still. The residual risk is a holder that stalls for longer than
+//!   `grace` *between* its final check and the single write that moves the
+//!   operation head (SFTP has no compare-and-swap). Its token check then
+//!   catches every later step.
+//! * Locks without the flag (local holders, older versions) keep the
+//!   provably-gone rule: they are never taken over from another host.
+//!
+//! [`LockContext`] carries the clock and host identity, so tests simulate
+//! hosts and time (see [`SimClock`]).
+//!
 //! Detecting a dead pid, the host name and the boot id requires asking the
 //! host OS. That is process introspection, not repository storage, so it
 //! lives here rather than behind the VFS:
@@ -60,8 +95,10 @@ use std::{
         mpsc, Arc, Mutex, OnceLock,
     },
     thread::{JoinHandle, ThreadId},
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+pub use clock::{LockClock, SimClock, SystemClock};
 
 use serde::{Deserialize, Serialize};
 
@@ -97,6 +134,66 @@ impl Default for LockOptions {
     }
 }
 
+impl LockOptions {
+    /// Timings for a lock on `backend`. Network backends get a longer
+    /// lease (a renewal is several round trips), and contenders wait long
+    /// enough to take over an expired one.
+    pub fn for_backend(backend: &dyn StorageBackend) -> LockOptions {
+        if backend.is_network() {
+            LockOptions {
+                lease: Duration::from_secs(30),
+                renew_every: Duration::from_secs(5),
+                wait: Duration::from_secs(90),
+            }
+        } else {
+            LockOptions::default()
+        }
+    }
+}
+
+/// Who is locking, by which clock, and under which takeover rules.
+#[derive(Clone, Debug)]
+pub struct LockContext {
+    /// Write a fencing lock (see the module documentation): renew it, stop
+    /// publishing once its lease lapses, and let any host take it over
+    /// after expiry. On for network backends.
+    pub fencing: bool,
+    /// Extra time beyond the lease before an unrenewed fencing lock is
+    /// taken over: covers the holder's last write being in flight.
+    pub grace: Duration,
+    /// Clock skew tolerated between hosts when judging a fencing lock by
+    /// its `renewed` wall-clock time.
+    pub skew: Duration,
+    pub clock: Arc<dyn LockClock>,
+    /// Pretend to be this machine (tests); `None`: the real one.
+    pub host: Option<HostIdentity>,
+}
+
+impl Default for LockContext {
+    fn default() -> Self {
+        LockContext {
+            fencing: false,
+            grace: Duration::from_secs(15),
+            skew: Duration::from_secs(120),
+            clock: Arc::new(SystemClock),
+            host: None,
+        }
+    }
+}
+
+impl LockContext {
+    pub fn for_backend(backend: &dyn StorageBackend) -> LockContext {
+        LockContext {
+            fencing: backend.is_network(),
+            ..LockContext::default()
+        }
+    }
+
+    fn me(&self) -> &HostIdentity {
+        self.host.as_ref().unwrap_or_else(|| host_identity())
+    }
+}
+
 /// Content of the lock file.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockInfo {
@@ -112,10 +209,36 @@ pub struct LockInfo {
     pub lease_ms: i64,
 }
 
+/// The lock file: [`LockInfo`] plus the fencing flag (kept out of
+/// `LockInfo` so its shape stays what older versions and callers know).
+#[derive(Serialize, Deserialize)]
+struct LockFile {
+    #[serde(flatten)]
+    info: LockInfo,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    fencing: bool,
+}
+
+fn encode(info: &LockInfo, fencing: bool) -> Vec<u8> {
+    if !fencing {
+        return info.encode();
+    }
+    serde_json::to_vec(&LockFile {
+        info: info.clone(),
+        fencing,
+    })
+    .expect("lock info serialises")
+}
+
+/// Whether a lock file is a fencing lock.
+pub fn is_fencing(raw: &[u8]) -> bool {
+    serde_json::from_slice::<LockFile>(raw).is_ok_and(|f| f.fencing)
+}
+
 impl LockInfo {
-    fn new_local(lease: Duration) -> LockInfo {
-        let h = host_identity();
-        let now = now_millis();
+    fn new_in(lease: Duration, ctx: &LockContext) -> LockInfo {
+        let h = ctx.me();
+        let now = ctx.clock.wall_ms();
         LockInfo {
             token: hex::encode(random_bytes::<16>()),
             pid: std::process::id(),
@@ -162,6 +285,10 @@ impl LockInfo {
     }
 
     pub fn describe(&self) -> String {
+        self.describe_at(now_millis())
+    }
+
+    fn describe_at(&self, now: i64) -> String {
         format!(
             "pid {} on {} (lease renewed {:.1}s ago)",
             self.pid,
@@ -170,7 +297,7 @@ impl LockInfo {
             } else {
                 &self.host
             },
-            (now_millis() - self.renewed) as f64 / 1000.0
+            (now - self.renewed) as f64 / 1000.0
         )
     }
 }
@@ -187,9 +314,22 @@ pub enum Verdict {
     Stuck(String),
 }
 
-/// Decide whether the lock described by `info` may be stolen at time `now`.
+/// Decide whether the (non-fencing) lock described by `info` may be stolen
+/// at time `now`.
 pub fn assess(info: &LockInfo, now: i64) -> Verdict {
-    let me = host_identity();
+    assess_in(info, false, now, None, &LockContext::default())
+}
+
+/// [`assess`] with the fencing flag, how long the contender has seen these
+/// exact lock bytes unchanged (`unchanged_for`), and its context.
+pub fn assess_in(
+    info: &LockInfo,
+    fencing: bool,
+    now: i64,
+    unchanged_for: Option<Duration>,
+    ctx: &LockContext,
+) -> Verdict {
+    let me = ctx.me();
     // On platforms without a boot id both sides are empty and the host name
     // alone identifies the machine.
     let same_machine = !me.host.is_empty() && info.host == me.host && info.boot == me.boot;
@@ -206,6 +346,28 @@ pub fn assess(info: &LockInfo, now: i64) -> Verdict {
     // `kill -9` or Ctrl-C instant). Checked before the lease on purpose.
     if same_machine && process_alive(info.pid) == Some(false) {
         return Verdict::Steal(format!("holder pid {} is no longer running", info.pid));
+    }
+    if fencing {
+        // The holder stops publishing once its lease lapses (it measures
+        // that itself), so an expired lease may be taken over from any host.
+        let lease = Duration::from_millis(info.lease_ms.max(0) as u64);
+        if let Some(seen) = unchanged_for {
+            if seen >= lease + ctx.grace {
+                return Verdict::Steal(format!("lease not renewed for {}s", seen.as_secs()));
+            }
+        }
+        let limit = lease + ctx.grace + ctx.skew;
+        if now.saturating_sub(info.renewed) > limit.as_millis() as i64 {
+            return Verdict::Steal(format!(
+                "lease expired {}s ago",
+                (now.saturating_sub(info.renewed) - info.lease_ms) / 1000
+            ));
+        }
+        return Verdict::Stuck(format!(
+            "held by {}; taken over if it is not renewed for {}s",
+            info.describe_at(now),
+            (lease + ctx.grace).as_secs()
+        ));
     }
     if !info.lease_expired(now) {
         return Verdict::Wait;
@@ -247,6 +409,25 @@ pub struct RepoLock {
     /// A handle from [`RepoLock::acquire_reentrant`] inside an outer one:
     /// dropping it releases nothing.
     nested: bool,
+    /// Fencing locks only: the lease, and when (holder's monotonic clock)
+    /// the last successful renewal started.
+    fence: Option<Fence>,
+}
+
+#[derive(Clone, Debug)]
+struct Fence {
+    lease: Duration,
+    clock: Arc<dyn LockClock>,
+    confirmed: Arc<Mutex<Duration>>,
+    /// Tests: stop renewing, as a suspended or partitioned holder would.
+    paused: Arc<AtomicBool>,
+}
+
+impl Fence {
+    fn lapsed(&self) -> bool {
+        let confirmed = *self.confirmed.lock().unwrap_or_else(|e| e.into_inner());
+        self.clock.now().saturating_sub(confirmed) >= self.lease
+    }
 }
 
 #[derive(Debug)]
@@ -255,9 +436,30 @@ struct Heartbeat {
     thread: JoinHandle<()>,
 }
 
+/// What a contender has seen of one lock file: the bytes, and since when
+/// (its monotonic clock) they have not changed.
+#[derive(Default)]
+struct Observed(Option<(Vec<u8>, Duration)>);
+
+impl Observed {
+    fn see(&mut self, raw: &[u8], now: Duration) -> Duration {
+        match &self.0 {
+            Some((seen, since)) if seen == raw => now.saturating_sub(*since),
+            _ => {
+                self.0 = Some((raw.to_vec(), now));
+                Duration::ZERO
+            }
+        }
+    }
+}
+
 impl RepoLock {
+    /// Acquire the lock with the timings and takeover rules for this kind
+    /// of backend ([`LockOptions::for_backend`], [`LockContext::for_backend`]).
     pub fn acquire(backend: Arc<dyn StorageBackend>) -> Result<RepoLock> {
-        Self::acquire_with(backend, &LockOptions::default())
+        let opts = LockOptions::for_backend(&*backend);
+        let ctx = LockContext::for_backend(&*backend);
+        Self::acquire_in(backend, &opts, &ctx)
     }
 
     /// Like [`RepoLock::acquire`], but when the calling *thread* already
@@ -276,55 +478,77 @@ impl RepoLock {
                     lost: Arc::new(AtomicBool::new(false)),
                     heartbeat: None,
                     nested: true,
+                    fence: None,
                 });
             }
         }
         Self::acquire(backend)
     }
 
+    /// Acquire with explicit timings, and this backend's takeover rules.
     pub fn acquire_with(backend: Arc<dyn StorageBackend>, opts: &LockOptions) -> Result<RepoLock> {
+        let ctx = LockContext::for_backend(&*backend);
+        Self::acquire_in(backend, opts, &ctx)
+    }
+
+    /// Acquire with explicit timings and context (clock, host, fencing).
+    pub fn acquire_in(backend: Arc<dyn StorageBackend>, opts: &LockOptions, ctx: &LockContext) -> Result<RepoLock> {
         let path = VPath::new(LOCK_PATH)?;
-        let start = Instant::now();
+        let clock = &ctx.clock;
+        let start = clock.now();
+        let mut wait = opts.wait;
         let mut backoff = Duration::from_millis(1);
         // Unparseable content (a crash of a non-atomic writer) is only
-        // reclaimed once it has stayed unchanged for a whole lease.
-        let mut garbage: Option<(Vec<u8>, Instant)> = None;
+        // reclaimed once it has stayed unchanged for a whole lease; a
+        // fencing lock once it has not been renewed for lease + grace.
+        let mut observed = Observed::default();
+        let mut guard_observed = Observed::default();
         let mut reason = String::from("another process holds the lock");
         loop {
-            let info = LockInfo::new_local(opts.lease);
+            let info = LockInfo::new_in(opts.lease, ctx);
             // Register before creating the file so no thread of this process
             // ever sees our fresh lock with an unregistered token.
             let token = Registered::new(info.token.clone());
-            if backend.create_new(&path, &info.encode())? {
-                return Ok(Self::held(backend, path, info, token, opts));
+            // The lease runs from before the write that may grant it.
+            let attempt = clock.now();
+            if backend.create_new(&path, &encode(&info, ctx.fencing))? {
+                return Ok(Self::held(backend, path, info, token, opts, ctx, attempt));
             }
             let Some(raw) = backend.read_opt(&path)? else {
                 continue; // released between our attempts
             };
+            let unchanged_for = observed.see(&raw, clock.now());
             // `Some(since)`: the stale lock may be replaced by ours. Its
             // holder may have died half-way through a batch of unsynced
             // writes made after `since` (`None`: unknown).
             let mut takeover: Option<Option<i64>> = None;
             match LockInfo::parse(&raw) {
-                Some(holder) => match assess(&holder, now_millis()) {
-                    Verdict::Wait => {}
-                    Verdict::Stuck(r) => reason = r,
-                    Verdict::Steal(_) => takeover = Some(Some(holder.acquired)),
-                },
-                None => match &garbage {
-                    Some((seen, since)) if *seen == raw => {
-                        if since.elapsed() >= opts.lease {
-                            takeover = Some(None);
-                        }
-                        reason = format!("{LOCK_PATH} holds unreadable content");
+                Some(holder) => {
+                    let fencing = is_fencing(&raw);
+                    if fencing {
+                        // Wait long enough to see an expired lease through.
+                        let lease = Duration::from_millis(holder.lease_ms.clamp(0, 600_000) as u64);
+                        wait = wait.max(lease + ctx.grace + Duration::from_secs(2));
                     }
-                    _ => garbage = Some((raw.clone(), Instant::now())),
-                },
+                    match assess_in(&holder, fencing, clock.wall_ms(), Some(unchanged_for), ctx) {
+                        Verdict::Wait => {}
+                        Verdict::Stuck(r) => reason = r,
+                        Verdict::Steal(_) => takeover = Some(Some(holder.acquired)),
+                    }
+                }
+                None => {
+                    if unchanged_for >= opts.lease {
+                        takeover = Some(None);
+                    }
+                    reason = format!("{LOCK_PATH} holds unreadable content");
+                }
             }
             if let Some(since) = takeover {
-                match take_over(&*backend, &path, &raw, &info.encode())? {
+                let attempt = clock.now();
+                let ours = encode(&info, ctx.fencing);
+                match take_over(&*backend, &path, &raw, &ours, ctx, &mut guard_observed)? {
                     TakeOver::Ours => {
-                        let lock = Self::held(backend, path, info, token, opts);
+                        let lock = Self::held(backend, path, info, token, opts, ctx, attempt);
                         // Under our lock, before anyone builds on what the
                         // previous holder left: discard its torn objects and
                         // make its intact ones durable.
@@ -336,10 +560,10 @@ impl RepoLock {
                 }
             }
             drop(token);
-            if start.elapsed() >= opts.wait {
+            if clock.now().saturating_sub(start) >= wait {
                 return Err(VeilError::Locked(reason));
             }
-            std::thread::sleep(backoff);
+            clock.sleep(backoff);
             backoff = (backoff * 2).min(Duration::from_millis(50));
         }
     }
@@ -350,9 +574,25 @@ impl RepoLock {
         info: LockInfo,
         token: Registered,
         opts: &LockOptions,
+        ctx: &LockContext,
+        attempt: Duration,
     ) -> RepoLock {
         let lost = Arc::new(AtomicBool::new(false));
-        let heartbeat = Heartbeat::spawn(backend.clone(), path.clone(), info, opts.renew_every, lost.clone());
+        let fence = ctx.fencing.then(|| Fence {
+            lease: opts.lease,
+            clock: ctx.clock.clone(),
+            confirmed: Arc::new(Mutex::new(attempt)),
+            paused: Arc::new(AtomicBool::new(false)),
+        });
+        let heartbeat = Heartbeat::spawn(
+            backend.clone(),
+            path.clone(),
+            info,
+            opts.renew_every,
+            lost.clone(),
+            ctx.clock.clone(),
+            fence.clone(),
+        );
         RepoLock {
             backend,
             path,
@@ -360,6 +600,7 @@ impl RepoLock {
             lost,
             heartbeat,
             nested: false,
+            fence,
         }
     }
 
@@ -370,12 +611,22 @@ impl RepoLock {
             .and_then(|raw| LockInfo::parse(&raw)))
     }
 
-    /// Fail unless the lock file still carries our token. Call right before
+    /// Fail unless the lock file still carries our token (and, for a
+    /// fencing lock, our lease has not lapsed). Call right before
     /// publishing the result of a transaction.
     pub fn ensure_held(&self) -> Result<()> {
+        let lapsed = || self.fence.as_ref().is_some_and(Fence::lapsed);
         if !self.lost.load(Ordering::SeqCst) {
+            if lapsed() {
+                self.lost.store(true, Ordering::SeqCst);
+                return Err(VeilError::Locked(
+                    "this process's lease on the repository lock lapsed (stalled or disconnected for too long); the operation was not recorded".into(),
+                ));
+            }
             if let Some(raw) = self.backend.read_opt(&self.path)? {
-                if LockInfo::parse(&raw).is_some_and(|i| i.token == self.token) {
+                // Checked again after the round trip: the publication that
+                // follows must start inside the lease.
+                if LockInfo::parse(&raw).is_some_and(|i| i.token == self.token) && !lapsed() {
                     return Ok(());
                 }
             }
@@ -384,6 +635,17 @@ impl RepoLock {
         Err(VeilError::Locked(
             "this process's repository lock was taken over; the operation was not recorded".into(),
         ))
+    }
+
+    /// Tests: stop renewing the lease, as a suspended or partitioned holder
+    /// would, while the handle stays alive.
+    #[doc(hidden)]
+    pub fn pause_renewal(&self) {
+        if let Some(f) = &self.fence {
+            f.paused.store(true, Ordering::SeqCst);
+        } else if let Some(hb) = &self.heartbeat {
+            let _ = hb.stop.send(());
+        }
     }
 }
 
@@ -415,19 +677,44 @@ impl Heartbeat {
         mut info: LockInfo,
         every: Duration,
         lost: Arc<AtomicBool>,
+        clock: Arc<dyn LockClock>,
+        fence: Option<Fence>,
     ) -> Option<Heartbeat> {
         let (stop, rx) = mpsc::channel::<()>();
+        let fencing = fence.is_some();
         let thread = std::thread::Builder::new()
             .name("veil-lock-heartbeat".into())
             .spawn(move || {
-                // Disconnection (the lock was dropped) ends the loop.
-                while let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(every) {
+                let mut next = clock.now() + every;
+                // Disconnection (the lock was dropped) ends the loop; an
+                // explicit message pauses renewal for good.
+                while let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(clock.poll_interval(every)) {
+                    let started = clock.now();
+                    if started < next {
+                        continue;
+                    }
+                    if let Some(f) = &fence {
+                        if f.paused.load(Ordering::SeqCst) {
+                            continue;
+                        }
+                        // A lapsed lease may already belong to someone else:
+                        // renewing it now could overwrite their lock.
+                        if f.lapsed() {
+                            lost.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                    }
                     match backend.read_opt(&path) {
                         Ok(Some(raw)) if LockInfo::parse(&raw).is_some_and(|i| i.token == info.token) => {
-                            info.renewed = now_millis();
+                            info.renewed = clock.wall_ms();
                             // A failed renewal is retried on the next tick;
-                            // the lease is only a hint to other processes.
-                            let _ = backend.write(&path, &info.encode());
+                            // a fencing holder's lease runs out meanwhile.
+                            if backend.write(&path, &encode(&info, fencing)).is_ok() {
+                                if let Some(f) = &fence {
+                                    *f.confirmed.lock().unwrap_or_else(|e| e.into_inner()) = started;
+                                }
+                                next = started + every;
+                            }
                         }
                         Ok(_) => {
                             lost.store(true, Ordering::SeqCst);
@@ -451,20 +738,35 @@ enum TakeOver {
     Busy,
 }
 
+/// How long a takeover guard may be held; a fencing guard older than this
+/// (plus grace) is cleared by other contenders.
+const GUARD_LEASE: Duration = Duration::from_secs(5);
+
 /// Replace `path` by `ours` if it still holds exactly `observed`, serialised
 /// against other contenders through [`STEAL_PATH`]. The stale lock is
 /// replaced in one atomic write rather than removed, so no third process can
 /// slip in between and skip the crash recovery the new holder performs.
-fn take_over(backend: &dyn StorageBackend, path: &VPath, observed: &[u8], ours: &[u8]) -> Result<TakeOver> {
+fn take_over(
+    backend: &dyn StorageBackend,
+    path: &VPath,
+    observed: &[u8],
+    ours: &[u8],
+    ctx: &LockContext,
+    guard_seen: &mut Observed,
+) -> Result<TakeOver> {
     let guard_path = VPath::new(STEAL_PATH)?;
-    let guard = LockInfo::new_local(Duration::from_secs(5));
+    let guard = LockInfo::new_in(GUARD_LEASE, ctx);
     let token = Registered::new(guard.token.clone());
-    if !backend.create_new(&guard_path, &guard.encode())? {
+    let started = ctx.clock.now();
+    if !backend.create_new(&guard_path, &encode(&guard, ctx.fencing))? {
         // Another contender is stealing. If it crashed mid-steal, clear its
-        // guard (only when it is provably gone, like any other lock).
+        // guard (only when it is provably gone or, for a fencing guard,
+        // expired, like any other lock).
         if let Some(raw) = backend.read_opt(&guard_path)? {
+            let unchanged = guard_seen.see(&raw, ctx.clock.now());
             if let Some(other) = LockInfo::parse(&raw) {
-                if let Verdict::Steal(_) = assess(&other, now_millis()) {
+                let verdict = assess_in(&other, is_fencing(&raw), ctx.clock.wall_ms(), Some(unchanged), ctx);
+                if let Verdict::Steal(_) = verdict {
                     if backend.read_opt(&guard_path)?.as_deref() == Some(&raw[..]) {
                         backend.remove_file(&guard_path)?;
                     }
@@ -475,6 +777,10 @@ fn take_over(backend: &dyn StorageBackend, path: &VPath, observed: &[u8], ours: 
     }
     let result = (|| {
         if backend.read_opt(path)?.as_deref() == Some(observed) {
+            // A contender that stalled inside its guard may have lost it.
+            if ctx.fencing && ctx.clock.now().saturating_sub(started) >= GUARD_LEASE {
+                return Ok(TakeOver::Retry);
+            }
             backend.write(path, ours)?;
             return Ok(TakeOver::Ours);
         }
@@ -527,12 +833,113 @@ impl Drop for Registered {
     }
 }
 
+// ---- clocks -------------------------------------------------------------------
+
+mod clock {
+    use std::{
+        sync::{Mutex, OnceLock},
+        time::{Duration, Instant},
+    };
+
+    /// The two clocks a lock needs: wall time (written into the lock file
+    /// for other hosts, compared only with a skew allowance) and monotonic
+    /// time (leases, waits and observations on this host).
+    pub trait LockClock: Send + Sync + std::fmt::Debug {
+        /// Milliseconds since the Unix epoch.
+        fn wall_ms(&self) -> i64;
+        /// Monotonic time since an arbitrary origin.
+        fn now(&self) -> Duration;
+        fn sleep(&self, d: Duration);
+        /// How long (real time) the heartbeat waits between checks of
+        /// [`LockClock::now`].
+        fn poll_interval(&self, every: Duration) -> Duration {
+            every
+        }
+    }
+
+    #[derive(Debug, Default)]
+    pub struct SystemClock;
+
+    impl LockClock for SystemClock {
+        fn wall_ms(&self) -> i64 {
+            crate::now_millis()
+        }
+        fn now(&self) -> Duration {
+            static ORIGIN: OnceLock<Instant> = OnceLock::new();
+            ORIGIN.get_or_init(Instant::now).elapsed()
+        }
+        fn sleep(&self, d: Duration) {
+            std::thread::sleep(d)
+        }
+    }
+
+    /// Simulated time for tests: `sleep` advances it (after yielding
+    /// briefly in real time, so other threads on the same clock run), and
+    /// [`SimClock::advance`] jumps it. Share one between simulated hosts,
+    /// or give each its own to simulate skew.
+    #[derive(Debug)]
+    pub struct SimClock {
+        state: Mutex<(i64, Duration)>,
+    }
+
+    impl SimClock {
+        pub fn new(wall_ms: i64) -> SimClock {
+            SimClock {
+                state: Mutex::new((wall_ms, Duration::from_secs(1_000_000))),
+            }
+        }
+
+        pub fn advance(&self, d: Duration) {
+            let mut s = self.state.lock().unwrap();
+            s.0 += d.as_millis() as i64;
+            s.1 += d;
+        }
+
+        /// Step the wall clock only (an NTP correction, or skew).
+        pub fn step_wall(&self, delta_ms: i64) {
+            self.state.lock().unwrap().0 += delta_ms;
+        }
+    }
+
+    impl LockClock for SimClock {
+        fn wall_ms(&self) -> i64 {
+            self.state.lock().unwrap().0
+        }
+        fn now(&self) -> Duration {
+            self.state.lock().unwrap().1
+        }
+        fn sleep(&self, d: Duration) {
+            std::thread::sleep(Duration::from_micros(500));
+            self.advance(d);
+        }
+        fn poll_interval(&self, _every: Duration) -> Duration {
+            Duration::from_micros(200)
+        }
+    }
+}
+
 // ---- host introspection -----------------------------------------------------
 
-#[derive(Debug)]
-struct HostIdentity {
-    host: String,
-    boot: String,
+/// Which machine (and boot, and pid namespace) a lock holder runs on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostIdentity {
+    pub host: String,
+    pub boot: String,
+}
+
+impl HostIdentity {
+    /// This machine.
+    pub fn current() -> HostIdentity {
+        host_identity().clone()
+    }
+
+    /// A made-up machine, for simulating other hosts in tests.
+    pub fn simulated(host: &str) -> HostIdentity {
+        HostIdentity {
+            host: host.to_string(),
+            boot: format!("simulated-{host}"),
+        }
+    }
 }
 
 fn host_identity() -> &'static HostIdentity {

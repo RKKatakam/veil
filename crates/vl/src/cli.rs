@@ -51,7 +51,11 @@ pub enum Cmd {
     /// Create a repository in PATH (default: current directory).
     Init { path: Option<PathBuf> },
     /// Copy a repository (and every tag you can see) into a new directory.
-    Clone { source: PathBuf, dest: Option<PathBuf> },
+    ///
+    /// SOURCE is a path, `ssh://[user@]host[:port]/path` or scp-style
+    /// `[user@]host:path` (through your own `ssh`; the server needs only
+    /// SSH with SFTP).
+    Clone { source: String, dest: Option<PathBuf> },
 
     // ---- inspecting -------------------------------------------------------
     /// Show working-copy changes, local-only files and conflicts.
@@ -275,11 +279,19 @@ pub enum Cmd {
         tag: Vec<String>,
         #[arg(long)]
         force: bool,
+        /// Walk and verify every object instead of skipping what the remote
+        /// provably has (repairs damaged or missing objects on the remote).
+        #[arg(long)]
+        full: bool,
     },
     /// Fetch tags and history from a remote.
     Pull {
         #[arg(default_value = "origin")]
         remote: String,
+        /// Walk and verify every object instead of skipping what this
+        /// repository provably has (repairs damaged local objects).
+        #[arg(long)]
+        full: bool,
     },
 
     /// Two-way Git interop: import Git history, push and fetch Git remotes.
@@ -490,7 +502,10 @@ pub enum OpCmd {
 
 #[derive(Subcommand, Debug)]
 pub enum RemoteCmd {
-    /// Add a remote (a path to another Veil repository).
+    /// Add a remote: a path to another Veil repository, or an SSH remote
+    /// (`ssh://[user@]host[:port]/path` or `[user@]host:path`), reached
+    /// through your own `ssh` and its SFTP subsystem (`VEIL_SSH` overrides
+    /// the command). Nothing but SSH is needed on the server.
     Add {
         name: String,
         url: String,

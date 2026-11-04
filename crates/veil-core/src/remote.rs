@@ -23,23 +23,73 @@
 //! it) is skipped with a reason. Graph walks treat a missing parent as
 //! absent, so clones of such a remote work normally; the next push after
 //! the release fills the parents in, with unchanged snapshot ids.
+//!
+//! # Incremental transfer
+//!
+//! Over a WAN the cost of sync is round trips, not bytes, so neither side
+//! re-walks or re-checks what the other provably has:
+//!
+//! * **The receiver's committed view is a complete closure.** Every
+//!   transaction writes its objects, then a durability barrier, then the
+//!   operation, so everything reachable from the receiver's *committed*
+//!   view is there. Mere presence of an object proves nothing (a crashed
+//!   transfer leaves snapshots without their trees), so only reachability
+//!   from the committed view counts. Two refinements keep this exact: the
+//!   non-first parents of an embargoed merge may have been redacted when it
+//!   was sent, so they count only if the receiver holds them in a pack; and
+//!   on a public receiver an embargo wrapper may hold content that was
+//!   withheld then and is releasable now, so wrappers are always revisited.
+//! * **Push** walks, on the local graph, the snapshots the remote's view
+//!   reaches; those are not sent. Of the trees of the remaining snapshots,
+//!   every subtree reachable from a known parent snapshot is skipped.
+//!   Everything left goes into **one pack** (plus index), written to the
+//!   remote's pack directory pack first, index second, each made durable
+//!   before the next, inside the remote transaction. A crash leaves at
+//!   worst a pack nobody can see (no index) or a complete pack whose
+//!   operation never landed; both are harmless.
+//! * **Pull** lists the remote's objects (pack indexes and loose fan-out
+//!   directories, many requests in flight at once), skips every snapshot
+//!   the local committed view reaches, and at the first object it lacks
+//!   downloads, in parallel, every remote pack and loose object it lacks:
+//!   a few round trips instead of one per object. The walk then runs
+//!   locally. Objects already present locally are read locally (and their
+//!   subtrees checked), never fetched. Content the local view references
+//!   but lacks (a clone of a public mirror that now pulls from a team
+//!   remote, or embargoed content released since) is found by a local walk
+//!   whenever the remote holds objects the walk did not need. More than a
+//!   few hundred objects are written locally as a pack too.
+//! * Filtering is unchanged: every object that crosses goes through the
+//!   same checks (`allowed`, canonical decoding, tree depth) as before.
+//! * [`SyncOptions::full`] (`vl push --full`, `vl pull --full`) is the old
+//!   object-by-object walk of everything, which re-verifies the receiver's
+//!   copies: it repairs a damaged object, and fills content a receiver
+//!   lacks below snapshots it already has (on push, such gaps are not
+//!   detected otherwise).
 
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use crate::{
+    cache::LruCache,
     commands::validate_tag_name,
+    embargo::wrapper_parts,
     error::{Result, VeilError},
     id::ObjectId,
     keychain::{Keychain, RingMerge, LOCAL_SCOPE},
-    object::Object,
+    object::{EntryKind, Object},
     oplog::Tag,
+    pack::{index_file, name_from_index_file, pack_file, Pack, PackBuilder, PackIndex, DEFAULT_LEVEL},
     repo::{is_repo, Repo},
     store::ObjectStore,
     tree::MAX_TREE_DEPTH,
-    vfs::StorageBackend,
+    vfs::{MemoryBackend, NodeKind, StorageBackend},
+    vpath::VPath,
 };
 
 #[derive(Debug, Default, Clone)]
@@ -50,13 +100,225 @@ pub struct SyncReport {
     pub tags_updated: Vec<(String, ObjectId)>,
     pub tags_skipped: Vec<(String, String)>,
     pub warnings: Vec<String>,
+    /// Packs written on the receiving side.
+    pub packs_written: usize,
+    /// Object bytes that crossed: packs written (push), packs and loose
+    /// objects downloaded (pull).
+    pub bytes_transferred: u64,
+}
+
+/// How to synchronise.
+#[derive(Clone, Debug, Default)]
+pub struct SyncOptions {
+    /// Walk and re-verify everything object by object instead of skipping
+    /// what the receiver provably has (see the module documentation).
+    pub full: bool,
+}
+
+/// Raw objects for a transfer: `New` must be written to the receiver,
+/// `Have` is already there (read only to look inside it).
+enum Fetched {
+    New(Vec<u8>),
+    Have(Vec<u8>),
+}
+
+trait Source {
+    /// The verified canonical encoding of `id`; [`VeilError::Missing`] if
+    /// the sending side does not have it.
+    fn fetch(&self, id: &ObjectId) -> Result<Fetched>;
+}
+
+/// Everything from one store, all of it new to the receiver.
+struct StoreSource<'a>(&'a ObjectStore);
+
+impl Source for StoreSource<'_> {
+    fn fetch(&self, id: &ObjectId) -> Result<Fetched> {
+        self.0.get_raw(id).map(Fetched::New)
+    }
+}
+
+/// Where transferred objects go.
+enum Sink<'a> {
+    /// Loose objects through `put_raw` (which re-verifies existing copies).
+    Store(&'a ObjectStore),
+    Pack(Box<PackSink<'a>>),
+}
+
+impl Sink<'_> {
+    fn put(&mut self, id: ObjectId, raw: Vec<u8>, path: &str) -> Result<bool> {
+        match self {
+            Sink::Store(s) => s.put_raw(&id, &raw),
+            Sink::Pack(p) => p.put(id, raw, path),
+        }
+    }
+
+    fn finish(self, report: &mut SyncReport) -> Result<()> {
+        if let Sink::Pack(p) = self {
+            p.finish(report)?;
+        }
+        Ok(())
+    }
+}
+
+/// A pack holding at most about this much (uncompressed) data is written
+/// before the next one is started.
+const PACK_LIMIT: u64 = 128 << 20;
+
+/// Collects objects into packs on `backend`. Below `threshold` objects
+/// (and with a `loose` store) they are written as loose objects instead,
+/// so a small pull does not leave a tiny pack behind.
+struct PackSink<'a> {
+    /// The destination store: decides what its repository format may hold
+    /// (packs bypass `put_raw`, so the check happens here).
+    dest: &'a ObjectStore,
+    backend: &'a dyn StorageBackend,
+    dir: VPath,
+    loose: Option<&'a ObjectStore>,
+    threshold: usize,
+    pending: Vec<(ObjectId, Vec<u8>, String)>,
+    builder: Option<PackBuilder>,
+    builder_bytes: u64,
+    /// The last object packed at each path: the delta base for the next
+    /// version found there.
+    last: HashMap<String, (ObjectId, Vec<u8>)>,
+    packs: usize,
+    bytes: u64,
+}
+
+impl<'a> PackSink<'a> {
+    fn new(dest: &'a ObjectStore, dir: VPath, loose: Option<&'a ObjectStore>, threshold: usize) -> Self {
+        PackSink {
+            dest,
+            backend: &**dest.backend(),
+            dir,
+            loose,
+            threshold,
+            pending: Vec::new(),
+            builder: None,
+            builder_bytes: 0,
+            last: HashMap::new(),
+            packs: 0,
+            bytes: 0,
+        }
+    }
+
+    fn put(&mut self, id: ObjectId, raw: Vec<u8>, path: &str) -> Result<bool> {
+        // A format-1 repository must never receive binary trees.
+        self.dest.check_storable(&raw)?;
+        if self.builder.is_none() && self.pending.len() < self.threshold {
+            self.pending.push((id, raw, path.to_string()));
+            return Ok(true);
+        }
+        for (id, raw, path) in std::mem::take(&mut self.pending) {
+            self.pack(id, raw, path)?;
+        }
+        self.pack(id, raw, path.to_string())?;
+        Ok(true)
+    }
+
+    fn pack(&mut self, id: ObjectId, raw: Vec<u8>, path: String) -> Result<()> {
+        let builder = match &mut self.builder {
+            Some(b) => b,
+            None => self.builder.insert(PackBuilder::new(DEFAULT_LEVEL)?),
+        };
+        let base = self
+            .last
+            .get(&path)
+            .filter(|(bid, braw)| builder.contains(bid) && Object::is_blob_raw(braw) == Object::is_blob_raw(&raw));
+        builder.add(id, &raw, base.map(|(bid, braw)| (bid, &braw[..])))?;
+        self.builder_bytes += raw.len() as u64;
+        self.last.insert(path, (id, raw));
+        if self.builder_bytes >= PACK_LIMIT {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if let Some(b) = self.builder.take() {
+            // `finish` writes the pack, then its index: the pack unsynced,
+            // then a barrier, then the index durably. A crash before the
+            // index leaves a pack nobody finds; the index is never torn.
+            if let Some((_, stats)) = b.finish(&PackWrites(self.backend), &self.dir)? {
+                self.packs += 1;
+                self.bytes += stats.pack_bytes;
+            }
+        }
+        self.builder_bytes = 0;
+        self.last.clear();
+        Ok(())
+    }
+
+    fn finish(mut self, report: &mut SyncReport) -> Result<()> {
+        if self.builder.is_none() {
+            if let Some(store) = self.loose {
+                for (id, raw, _) in std::mem::take(&mut self.pending) {
+                    store.put_raw(&id, &raw)?;
+                }
+            }
+            for (id, raw, path) in std::mem::take(&mut self.pending) {
+                self.pack(id, raw, path)?;
+            }
+        }
+        self.flush()?;
+        report.packs_written += self.packs;
+        if self.loose.is_none() {
+            report.bytes_transferred += self.bytes;
+        }
+        Ok(())
+    }
+}
+
+/// The backend as `PackBuilder::finish` sees it: data files are written
+/// unsynced, and an index only after a barrier, durably.
+#[derive(Debug)]
+struct PackWrites<'a>(&'a dyn StorageBackend);
+
+impl StorageBackend for PackWrites<'_> {
+    fn kind(&self) -> &'static str {
+        self.0.kind()
+    }
+    fn read(&self, path: &VPath) -> Result<Vec<u8>> {
+        self.0.read(path)
+    }
+    fn write(&self, path: &VPath, data: &[u8]) -> Result<()> {
+        if path.as_str().ends_with(".idx") {
+            self.0.sync_barrier()?;
+            self.0.write(path, data)
+        } else {
+            self.0.write_unsynced(path, data)
+        }
+    }
+    fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool> {
+        self.0.create_new(path, data)
+    }
+    fn remove_file(&self, path: &VPath) -> Result<()> {
+        self.0.remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &VPath) -> Result<()> {
+        self.0.remove_dir_all(path)
+    }
+    fn create_dir_all(&self, path: &VPath) -> Result<()> {
+        self.0.create_dir_all(path)
+    }
+    fn list_dir(&self, path: &VPath) -> Result<Vec<crate::vfs::DirEntry>> {
+        self.0.list_dir(path)
+    }
+    fn metadata(&self, path: &VPath) -> Result<Option<crate::vfs::Metadata>> {
+        self.0.metadata(path)
+    }
+    fn set_executable(&self, path: &VPath, executable: bool) -> Result<()> {
+        self.0.set_executable(path, executable)
+    }
 }
 
 struct Transfer<'a> {
-    src: &'a ObjectStore,
-    dst: &'a ObjectStore,
+    src: &'a dyn Source,
+    sink: Sink<'a>,
     src_keys: &'a Keychain,
     public: bool,
+    /// Objects the receiver provably has: not visited at all.
+    known: Box<dyn Fn(&ObjectId) -> bool + 'a>,
     seen: HashSet<ObjectId>,
     /// Tree height of every object copied so far (0 for non-trees).
     heights: HashMap<ObjectId, usize>,
@@ -83,20 +345,21 @@ impl Transfer<'_> {
     /// each tree's *height* (longest chain of trees below it, memoised per
     /// id), because content-addressed trees are shared: the same subtree
     /// may first be met shallowly and later deep inside another tree.
-    fn copy(&mut self, root: ObjectId) -> Result<()> {
+    /// `path` (where the object was found) only picks delta bases.
+    fn copy(&mut self, root: ObjectId, path: &str) -> Result<()> {
         struct Frame {
             id: ObjectId,
             is_tree: bool,
-            children: Vec<ObjectId>,
+            children: Vec<(ObjectId, String)>,
             next: usize,
             height: usize,
         }
         let mut stack: Vec<Frame> = Vec::new();
         let mut trees_on_stack = 0usize;
-        let mut pending = Some(root);
+        let mut pending = Some((root, path.to_string()));
         loop {
-            if let Some(id) = pending.take() {
-                if let Some(frame) = self.enter(id)? {
+            if let Some((id, path)) = pending.take() {
+                if let Some(frame) = self.enter(id, &path)? {
                     if frame.0 {
                         trees_on_stack += 1;
                         if trees_on_stack > MAX_TREE_DEPTH {
@@ -118,9 +381,9 @@ impl Transfer<'_> {
             let Some(top) = stack.last_mut() else {
                 return Ok(());
             };
-            if let Some(child) = top.children.get(top.next) {
+            if let Some(child) = top.children.get_mut(top.next) {
                 top.next += 1;
-                pending = Some(*child);
+                pending = Some((child.0, std::mem::take(&mut child.1)));
                 continue;
             }
             let done = stack.pop().unwrap();
@@ -139,54 +402,374 @@ impl Transfer<'_> {
     }
 
     /// Fetch, check and store one object. Returns `None` if there is
-    /// nothing to descend into (already seen, missing or redacted), else
-    /// whether it is a tree and the ids it references.
-    fn enter(&mut self, id: ObjectId) -> Result<Option<(bool, Vec<ObjectId>)>> {
-        if !self.seen.insert(id) {
+    /// nothing to descend into (already seen, known to the receiver,
+    /// missing or redacted), else whether it is a tree and the ids it
+    /// references, with their paths.
+    #[allow(clippy::type_complexity)]
+    fn enter(&mut self, id: ObjectId, path: &str) -> Result<Option<(bool, Vec<(ObjectId, String)>)>> {
+        if !self.seen.insert(id) || (self.known)(&id) {
             return Ok(None);
         }
-        // `get_raw` verifies the content against `id`.
-        let raw = match self.src.get_raw(&id) {
-            Ok(r) => r,
+        // Every source verifies the content against `id`.
+        let (raw, new) = match self.src.fetch(&id) {
+            Ok(Fetched::New(r)) => (r, true),
+            Ok(Fetched::Have(r)) => (r, false),
             Err(VeilError::Missing(_)) => {
                 self.report.missing += 1;
                 return Ok(None);
             }
             Err(e) => return Err(e),
         };
-        if !self.allowed(&raw) {
+        if new && !self.allowed(&raw) {
             self.report.redacted += 1;
             return Ok(None);
         }
+        if !new && (Object::is_blob_raw(&raw) || Object::sealed_scope(&raw).is_some()) {
+            return Ok(None); // already there, and nothing below it
+        }
         // Decoding validates structure: canonical trees with safe names.
         let obj = Object::decode(&raw)?;
-        if self.dst.put_raw(&id, &raw)? {
+        if new && self.sink.put(id, raw, path)? {
             self.report.objects_copied += 1;
         }
         Ok(Some(match obj {
             Object::Snapshot(s) => {
-                if s.signature_valid() == Some(false) {
+                if new && s.signature_valid() == Some(false) {
                     self.report
                         .warnings
                         .push(format!("snapshot {} carries an invalid signature", id.short()));
                 }
-                (false, vec![s.tree])
+                (false, vec![(s.tree, String::new())])
             }
             Object::Tree(t) => {
                 let mut children = Vec::with_capacity(t.entries.len());
                 for e in &t.entries {
-                    children.push(e.id);
+                    let p = if path.is_empty() {
+                        e.name.clone()
+                    } else {
+                        format!("{path}/{}", e.name)
+                    };
                     // File fallbacks, and the pre-merge tree of an embargo
                     // wrapper's marker entry.
                     if let Some(fb) = e.fallback {
-                        children.push(fb);
+                        children.push((fb, p.clone()));
                     }
+                    children.push((e.id, p));
                 }
                 (true, children)
             }
             Object::Blob(_) | Object::Sealed(_) => (false, Vec::new()),
         }))
     }
+}
+
+/// `f` over `items` on up to `threads` threads, results in order. Network
+/// backends answer many requests at once (the SFTP client pipelines
+/// whatever several threads send).
+fn par_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    if threads <= 1 || items.len() <= 1 {
+        return items.iter().map(f).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let out: Vec<Mutex<Option<R>>> = items.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        for _ in 0..threads.min(items.len()) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= items.len() {
+                    break;
+                }
+                let r = f(&items[i]);
+                *out[i].lock().unwrap() = Some(r);
+            });
+        }
+    });
+    out.into_iter().map(|m| m.into_inner().unwrap().expect("every item mapped")).collect()
+}
+
+fn threads_for(backend: &dyn StorageBackend) -> usize {
+    if backend.is_network() {
+        16
+    } else {
+        4
+    }
+}
+
+// ---- the other side's object inventory ---------------------------------------------
+
+/// Every object id a (remote) store holds, from its pack indexes and its
+/// loose fan-out directories, listed with many requests in flight.
+struct Inventory {
+    backend: Arc<dyn StorageBackend>,
+    pack_dir: VPath,
+    /// Pack name, raw index, parsed index.
+    packs: Vec<(String, Vec<u8>, PackIndex)>,
+    packed: HashMap<ObjectId, usize>,
+    loose: HashSet<ObjectId>,
+}
+
+fn is_hex(s: &str) -> bool {
+    s.bytes().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
+impl Inventory {
+    fn load(backend: Arc<dyn StorageBackend>, warnings: &mut Vec<String>) -> Result<Inventory> {
+        let threads = threads_for(&*backend);
+        let root = VPath::new(".veil/objects")?;
+        let pack_dir = root.join("pack");
+        let listing = |p: &VPath| match backend.list_dir(p) {
+            Ok(l) => Ok(l),
+            Err(e) if e.is_not_found() => Ok(Vec::new()),
+            Err(e) => Err(e),
+        };
+        let fanout: Vec<String> = listing(&root)?
+            .into_iter()
+            .filter(|d| d.kind == NodeKind::Dir && d.name.len() == 2 && is_hex(&d.name))
+            .map(|d| d.name)
+            .collect();
+        let mut loose = HashSet::new();
+        for (dir, entries) in fanout.iter().zip(par_map(&fanout, threads, |d| listing(&root.join(d)))) {
+            for f in entries? {
+                if f.kind == NodeKind::File && f.name.len() == 62 && is_hex(&f.name) {
+                    loose.insert(ObjectId::from_hex(&format!("{dir}{}", f.name))?);
+                }
+            }
+        }
+        let names: Vec<String> = listing(&pack_dir)?
+            .into_iter()
+            .filter(|e| e.kind == NodeKind::File)
+            .filter_map(|e| name_from_index_file(&e.name).map(str::to_string))
+            .collect();
+        let idx = par_map(&names, threads, |n| backend.read(&index_file(&pack_dir, n)));
+        let mut packs = Vec::new();
+        let mut packed = HashMap::new();
+        for (name, raw) in names.into_iter().zip(idx) {
+            let raw = match raw {
+                Ok(r) => r,
+                Err(e) if e.is_not_found() => continue, // removed meanwhile
+                Err(e) => return Err(e),
+            };
+            match PackIndex::decode(&raw) {
+                Ok(i) if i.name() == name => {
+                    for id in i.ids() {
+                        packed.insert(*id, packs.len());
+                    }
+                    packs.push((name, raw, i));
+                }
+                // Its objects are fetched one by one (and verified) instead.
+                _ => warnings.push(format!("remote pack {} has an unreadable index", &name[..12])),
+            }
+        }
+        Ok(Inventory {
+            backend,
+            pack_dir,
+            packs,
+            packed,
+            loose,
+        })
+    }
+
+    fn contains(&self, id: &ObjectId) -> bool {
+        self.packed.contains_key(id) || self.loose.contains(id)
+    }
+
+    fn ids(&self) -> impl Iterator<Item = &ObjectId> {
+        self.packed.keys().chain(self.loose.iter())
+    }
+}
+
+/// Remote objects downloaded in bulk.
+#[derive(Default)]
+struct Prefetched {
+    loaded: bool,
+    packs: HashMap<usize, (MemoryBackend, Pack)>,
+    loose: HashMap<ObjectId, Vec<u8>>,
+}
+
+/// Pull's view of the objects: local copies first, then the bulk download
+/// of everything the remote has and we lack, then the remote one by one.
+struct PullSource<'a> {
+    local: &'a ObjectStore,
+    local_ids: &'a HashSet<ObjectId>,
+    remote: &'a ObjectStore,
+    inv: &'a Inventory,
+    got: RefCell<Prefetched>,
+    bases: LruCache<Arc<Vec<u8>>>,
+    bytes: RefCell<u64>,
+}
+
+impl PullSource<'_> {
+    /// Download, in parallel, every remote pack holding an object we lack
+    /// and every loose object we lack.
+    fn prefetch(&self) -> Result<()> {
+        let mut got = self.got.borrow_mut();
+        if got.loaded {
+            return Ok(());
+        }
+        got.loaded = true;
+        let inv = self.inv;
+        let threads = threads_for(&*inv.backend);
+        let packs: Vec<usize> = (0..inv.packs.len())
+            .filter(|&i| inv.packs[i].2.ids().iter().any(|id| !self.local_ids.contains(id)))
+            .collect();
+        let data = par_map(&packs, threads, |&i| inv.backend.read(&pack_file(&inv.pack_dir, &inv.packs[i].0)));
+        let dir = VPath::new("p")?;
+        let mut bytes = 0u64;
+        for (i, data) in packs.into_iter().zip(data) {
+            let (name, idx, _) = &inv.packs[i];
+            let Ok(data) = data else { continue }; // fetched one by one instead
+            bytes += (data.len() + idx.len()) as u64;
+            let mem = MemoryBackend::new();
+            mem.write(&pack_file(&dir, name), &data)?;
+            mem.write(&index_file(&dir, name), idx)?;
+            if let Ok(p) = Pack::open(&mem, &dir, name) {
+                got.packs.insert(i, (mem, p));
+            }
+        }
+        let loose: Vec<ObjectId> = inv.loose.iter().filter(|id| !self.local_ids.contains(id)).copied().collect();
+        let data = par_map(&loose, threads, |id| {
+            let h = id.hex();
+            inv.backend.read(&VPath::new(&format!(".veil/objects/{}/{}", &h[..2], &h[2..]))?)
+        });
+        for (id, d) in loose.into_iter().zip(data) {
+            if let Ok(d) = d {
+                bytes += d.len() as u64;
+                // Unverified copies are simply not used.
+                if ObjectId::hash(&d) == id {
+                    got.loose.insert(id, d);
+                }
+            }
+        }
+        *self.bytes.borrow_mut() += bytes;
+        Ok(())
+    }
+
+    fn prefetched(&self, id: &ObjectId) -> Result<Option<Vec<u8>>> {
+        let got = self.got.borrow();
+        if let Some(d) = got.loose.get(id) {
+            return Ok(Some(d.clone()));
+        }
+        if let Some((mem, p)) = self.inv.packed.get(id).and_then(|i| got.packs.get(i)) {
+            // `Pack::get` re-hashes what it returns.
+            return p.get(mem, id, &self.bases);
+        }
+        Ok(None)
+    }
+}
+
+impl Source for PullSource<'_> {
+    fn fetch(&self, id: &ObjectId) -> Result<Fetched> {
+        if self.local_ids.contains(id) {
+            match self.local.get_raw(id) {
+                Ok(raw) => return Ok(Fetched::Have(raw)),
+                // A damaged local copy is replaced from the remote.
+                Err(VeilError::Corrupt(..)) | Err(VeilError::Missing(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if self.inv.contains(id) {
+            self.prefetch()?;
+            if let Some(raw) = self.prefetched(id)? {
+                return Ok(Fetched::New(raw));
+            }
+        }
+        let raw = self.remote.get_raw(id)?;
+        *self.bytes.borrow_mut() += raw.len() as u64;
+        Ok(Fetched::New(raw))
+    }
+}
+
+// ---- what the receiver provably has ------------------------------------------------
+
+/// Snapshots in the closure of `refs`, walked on `store` (only those
+/// `store` holds). Non-first parents of embargoed merges count only if
+/// `parent_ok` says the receiver has them: they may have been redacted.
+fn committed_closure(
+    store: &ObjectStore,
+    refs: &[ObjectId],
+    mut parent_ok: impl FnMut(&ObjectId) -> bool,
+) -> Result<HashSet<ObjectId>> {
+    let mut known = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut stack = refs.to_vec();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let s = match store.snapshot(&id) {
+            Ok(s) => s,
+            Err(VeilError::Missing(_)) => continue,
+            Err(e) => return Err(e),
+        };
+        known.insert(id);
+        for (i, p) in s.parents.iter().enumerate() {
+            if i == 0 || s.embargo.is_none() || parent_ok(p) {
+                stack.push(*p);
+            }
+        }
+    }
+    Ok(known)
+}
+
+/// Plaintext trees reachable from `roots` (through directory entries and
+/// embargo fallbacks), each once.
+fn local_trees(store: &ObjectStore, roots: impl IntoIterator<Item = ObjectId>, mut visit: impl FnMut(&ObjectId, &crate::object::Tree) -> bool) -> Result<()> {
+    let mut seen = HashSet::new();
+    let mut stack: Vec<ObjectId> = roots.into_iter().collect();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let t = match store.tree_object(&id) {
+            Ok(t) => t,
+            Err(e) if e.is_unreadable() || matches!(e, VeilError::Corrupt(..) | VeilError::Json(_)) => continue,
+            Err(e) => return Err(e),
+        };
+        if !visit(&id, &t) {
+            continue;
+        }
+        for e in &t.entries {
+            if e.kind == EntryKind::Dir && e.visibility.is_public() {
+                stack.push(e.id);
+            }
+            if let Some(fb) = e.fallback {
+                if e.kind == EntryKind::Dir {
+                    stack.push(fb);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every object reachable from the trees of `snaps`, as far as a receiver
+/// holding those snapshots provably has it. On a public receiver embargo
+/// wrappers (and their entries) are left out: what they hold may have
+/// been withheld when they were sent and be releasable now.
+fn known_objects(store: &ObjectStore, snaps: &HashSet<ObjectId>, public: bool) -> Result<HashSet<ObjectId>> {
+    let mut roots = Vec::new();
+    for s in snaps {
+        match store.snapshot(s) {
+            Ok(s) => roots.push(s.tree),
+            Err(VeilError::Missing(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let mut known = HashSet::new();
+    local_trees(store, roots, |id, t| {
+        if public && wrapper_parts(t).is_some() {
+            return true; // descend (into the fallback), but know nothing here
+        }
+        known.insert(*id);
+        for e in &t.entries {
+            known.insert(e.id);
+            if let Some(fb) = e.fallback {
+                known.insert(fb);
+            }
+        }
+        true
+    })?;
+    Ok(known)
 }
 
 fn too_deep(root: ObjectId) -> VeilError {
@@ -327,10 +910,22 @@ pub fn push(
     only_tags: &[String],
     force: bool,
 ) -> Result<SyncReport> {
+    push_with(local, remote_backend, public, only_tags, force, &SyncOptions::default())
+}
+
+/// [`push`] with options.
+pub fn push_with(
+    local: &mut Repo,
+    remote_backend: Arc<dyn StorageBackend>,
+    public: bool,
+    only_tags: &[String],
+    force: bool,
+    opts: &SyncOptions,
+) -> Result<SyncReport> {
     let mut remote = if is_repo(&*remote_backend) {
-        Repo::open(remote_backend, None, "remote")?
+        Repo::open(remote_backend.clone(), None, "remote")?
     } else {
-        Repo::init_bare(remote_backend)?
+        Repo::init_bare(remote_backend.clone())?
     };
     let mut report = SyncReport::default();
     let mut selected: Vec<(String, Tag)> = Vec::new();
@@ -366,36 +961,51 @@ pub fn push(
     let ids = push_closure(local.store(), local.keys(), &tips, &withheld)?
         .map_err(|why| VeilError::repo(format!("push: {why}")))?;
     // Objects and metadata are copied under the remote's lock: metadata
-    // merges are read-modify-writes, and objects go through the
-    // transaction's durability barrier.
+    // merges are read-modify-writes, and objects must land before the
+    // operation that references them.
     let mut tx = remote.transaction(format!("push from {}", local.repo_id()))?;
-    let mut xfer = Transfer {
-        src: local.store(),
-        dst: tx.repo().store(),
-        src_keys: local.keys(),
-        public,
-        seen: HashSet::new(),
-        heights: HashMap::new(),
-        report,
-    };
-    for id in ids {
-        xfer.copy(id)?;
+    {
+        let dst = tx.repo().store().clone();
+        let src = StoreSource(local.store());
+        if opts.full {
+            let mut xfer = Transfer {
+                src: &src,
+                sink: Sink::Store(&dst),
+                src_keys: local.keys(),
+                public,
+                known: Box::new(|_| false),
+                seen: HashSet::new(),
+                heights: HashMap::new(),
+                report,
+            };
+            for id in ids {
+                xfer.copy(id, "")?;
+            }
+            report = xfer.report;
+        } else {
+            report = push_incremental(local, &tx.view.refs(), &dst, ids, public, report)?;
+        }
     }
-    let mut report = xfer.report;
     sync_meta(local.keys(), tx.repo().keys(), &mut report.warnings)?;
     for (name, tag) in selected {
         if let Some(existing) = tx.view.tags.get(&name) {
             if existing.target == tag.target {
                 continue;
             }
-            if !force && !tx.repo().is_ancestor(&existing.target, &tag.target)? {
+            // Decided on the local graph: it holds the whole history of
+            // `tag`, and walking the remote's would cost a round trip per
+            // snapshot.
+            if !force && !local.is_ancestor(&existing.target, &tag.target)? {
                 report
                     .tags_skipped
                     .push((name, "remote has diverged (non-fast-forward; use --force)".into()));
                 continue;
             }
         }
-        tx.add_head(tag.target)?;
+        for p in &local.snapshot(&tag.target)?.parents {
+            tx.view.heads.remove(p);
+        }
+        tx.view.heads.insert(tag.target);
         let cloak = if public { None } else { tag.cloak };
         tx.view.tags.insert(
             name.clone(),
@@ -407,6 +1017,110 @@ pub fn push(
         report.tags_updated.push((name, tag.target));
     }
     tx.commit()?;
+    Ok(report)
+}
+
+/// Send `ids` (snapshots) and what they reference, except what the
+/// remote's committed view (`remote_refs`) provably holds, as packs.
+fn push_incremental(
+    local: &Repo,
+    remote_refs: &[ObjectId],
+    dst: &ObjectStore,
+    ids: Vec<ObjectId>,
+    public: bool,
+    report: SyncReport,
+) -> Result<SyncReport> {
+    let store = local.store();
+    let mut warnings = Vec::new();
+    let inventory: RefCell<Option<Inventory>> = RefCell::new(None);
+    let load_inventory = || -> Result<()> {
+        if inventory.borrow().is_none() {
+            *inventory.borrow_mut() = Some(Inventory::load(dst.backend().clone(), &mut Vec::new())?);
+        }
+        Ok(())
+    };
+    // An embargoed merge's extra parents count only if they reached the
+    // remote in a pack (complete by construction): they may have been
+    // redacted when the merge was pushed.
+    let mut inv_err = None;
+    let known_snaps = committed_closure(store, remote_refs, |p| match load_inventory() {
+        Ok(()) => inventory.borrow().as_ref().is_some_and(|i| i.packed.contains_key(p)),
+        Err(e) => {
+            inv_err.get_or_insert(e);
+            false
+        }
+    })?;
+    if let Some(e) = inv_err {
+        return Err(e);
+    }
+    let to_send: Vec<ObjectId> = ids.into_iter().filter(|i| !known_snaps.contains(i)).collect();
+    // Trees of the known snapshots the new ones build on.
+    let mut boundary = HashSet::new();
+    for id in &to_send {
+        for p in &store.snapshot(id)?.parents {
+            if known_snaps.contains(p) {
+                boundary.insert(*p);
+            }
+        }
+    }
+    let known = known_objects(store, &boundary, public)?;
+    // On a public remote, released embargoes may have made content under
+    // already-pushed snapshots sendable: revisit their wrappers (sending
+    // only what the remote does not hold yet).
+    let mut rewalk = Vec::new();
+    if public && local.keys().embargoes()?.iter().any(|r| local.keys().embargo_released(&r.id)) {
+        for s in &known_snaps {
+            let tree = store.snapshot(s)?.tree;
+            if let Ok(t) = store.tree_object(&tree) {
+                if wrapper_parts(&t).is_some() {
+                    rewalk.push(tree);
+                }
+            }
+        }
+    }
+    if !rewalk.is_empty() {
+        load_inventory()?;
+    }
+    let inventory = inventory.into_inner();
+    let src = StoreSource(store);
+    let pack_dir = dst.pack_dir();
+    let mut xfer = Transfer {
+        src: &src,
+        sink: Sink::Pack(Box::new(PackSink::new(dst, pack_dir, None, 0))),
+        src_keys: local.keys(),
+        public,
+        known: Box::new(|id| known.contains(id)),
+        seen: HashSet::new(),
+        heights: HashMap::new(),
+        report,
+    };
+    for id in &to_send {
+        xfer.copy(*id, "")?;
+    }
+    if let Some(inv) = inventory.as_ref().filter(|_| !rewalk.is_empty()) {
+        xfer.known = Box::new(|id| known.contains(id) || inv.contains(id));
+        let mut wrappers = Vec::new();
+        local_trees(store, rewalk, |_, t| {
+            if wrapper_parts(t).is_some() {
+                wrappers.push(t.clone());
+            }
+            true
+        })?;
+        for w in wrappers {
+            for e in &w.entries {
+                xfer.copy(e.id, &e.name)?;
+                if let Some(fb) = e.fallback {
+                    xfer.copy(fb, "")?;
+                }
+            }
+        }
+    }
+    let Transfer { sink, mut report, .. } = xfer;
+    sink.finish(&mut report)?;
+    report.warnings.append(&mut warnings);
+    // Nothing reads the remote store after this (the tag checks run on the
+    // local graph), so its pack list is not reloaded: that would download
+    // every remote index.
     Ok(report)
 }
 
@@ -424,36 +1138,54 @@ fn unusable_target(store: &ObjectStore, target: &ObjectId) -> Result<Option<&'st
 /// Fetch every tag from `remote`, record them as `<remote_name>/<tag>`, and
 /// create or fast-forward local tags.
 pub fn pull(local: &mut Repo, remote_name: &str, remote_backend: Arc<dyn StorageBackend>) -> Result<SyncReport> {
+    pull_with(local, remote_name, remote_backend, &SyncOptions::default())
+}
+
+/// [`pull`] with options.
+pub fn pull_with(
+    local: &mut Repo,
+    remote_name: &str,
+    remote_backend: Arc<dyn StorageBackend>,
+    opts: &SyncOptions,
+) -> Result<SyncReport> {
     if !is_repo(&*remote_backend) {
         return Err(VeilError::NotFound(format!("Veil repository at remote '{remote_name}'")));
     }
-    let remote = Repo::open(remote_backend, None, "remote")?;
+    let remote = Repo::open(remote_backend.clone(), None, "remote")?;
     let tags: Vec<(String, Tag)> = remote.view().tags.clone().into_iter().collect();
-    // Only snapshot targets are fetched; tags on anything else (missing,
-    // a tree, a blob) are skipped with a warning below.
-    let mut tips = Vec::new();
-    for (_, t) in &tags {
-        match remote.store().get(&t.target) {
-            Ok(Object::Snapshot(_)) => tips.push(t.target),
-            Ok(_) | Err(VeilError::Missing(_)) => {}
-            Err(e) => return Err(e),
-        }
-    }
     // Under the local lock, like push (see there).
     let mut tx = local.transaction(format!("pull from {remote_name}"))?;
-    let mut xfer = Transfer {
-        src: remote.store(),
-        dst: tx.repo().store(),
-        src_keys: remote.keys(),
-        public: false,
-        seen: HashSet::new(),
-        heights: HashMap::new(),
-        report: SyncReport::default(),
-    };
-    for id in ancestors_in(remote.store(), &tips)? {
-        xfer.copy(id)?;
+    let mut report = SyncReport::default();
+    if opts.full {
+        // Only snapshot targets are fetched; tags on anything else (missing,
+        // a tree, a blob) are skipped with a warning below.
+        let mut tips = Vec::new();
+        for (_, t) in &tags {
+            match remote.store().get(&t.target) {
+                Ok(Object::Snapshot(_)) => tips.push(t.target),
+                Ok(_) | Err(VeilError::Missing(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let src = StoreSource(remote.store());
+        let mut xfer = Transfer {
+            src: &src,
+            sink: Sink::Store(tx.repo().store()),
+            src_keys: remote.keys(),
+            public: false,
+            known: Box::new(|_| false),
+            seen: HashSet::new(),
+            heights: HashMap::new(),
+            report,
+        };
+        for id in ancestors_in(remote.store(), &tips)? {
+            xfer.copy(id, "")?;
+        }
+        report = xfer.report;
+    } else {
+        let local_refs = tx.view.refs();
+        report = pull_incremental(tx.repo().store(), &local_refs, &remote, &remote_backend, &tags, report)?;
     }
-    let mut report = xfer.report;
     sync_meta(remote.keys(), tx.repo().keys(), &mut report.warnings)?;
     tx.repo().keys().invalidate();
     for (name, tag) in tags {
@@ -498,5 +1230,122 @@ pub fn pull(local: &mut Repo, remote_name: &str, remote_backend: Arc<dyn Storage
         }
     }
     tx.commit()?;
+    Ok(report)
+}
+
+/// Fetch what the remote's tags reach and the local committed view
+/// (`local_refs`) does not, with bulk downloads (module documentation).
+fn pull_incremental(
+    local: &Arc<ObjectStore>,
+    local_refs: &[ObjectId],
+    remote: &Repo,
+    remote_backend: &Arc<dyn StorageBackend>,
+    tags: &[(String, Tag)],
+    mut report: SyncReport,
+) -> Result<SyncReport> {
+    let inv = Inventory::load(remote_backend.clone(), &mut report.warnings)?;
+    let local_ids: HashSet<ObjectId> = local.list_objects()?.into_iter().collect();
+    let src = PullSource {
+        local,
+        local_ids: &local_ids,
+        remote: remote.store(),
+        inv: &inv,
+        got: RefCell::default(),
+        bases: LruCache::new(64 << 20),
+        bytes: RefCell::new(0),
+    };
+    // Locally, everything the committed view reaches is complete, except
+    // possibly redacted extra parents of embargoed merges: ask for those.
+    let mut redacted_parents = Vec::new();
+    let known = committed_closure(local, local_refs, |p| {
+        if !local_ids.contains(p) {
+            redacted_parents.push(*p);
+        }
+        true
+    })?;
+    // Only snapshot targets are fetched; tags on anything else (missing,
+    // a tree, a blob) are skipped with a warning by the caller.
+    let mut tips = redacted_parents;
+    for (_, t) in tags {
+        let raw = match src.fetch(&t.target) {
+            Ok(Fetched::New(r) | Fetched::Have(r)) => r,
+            Err(VeilError::Missing(_)) => continue,
+            Err(e) => return Err(e),
+        };
+        if let Ok(Object::Snapshot(_)) = Object::decode(&raw) {
+            tips.push(t.target);
+        }
+    }
+    // The remote's snapshots that the local view does not reach.
+    let mut snaps = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = tips;
+    while let Some(id) = stack.pop() {
+        if known.contains(&id) || !seen.insert(id) {
+            continue;
+        }
+        let raw = match src.fetch(&id) {
+            Ok(Fetched::New(r) | Fetched::Have(r)) => r,
+            Err(VeilError::Missing(_)) => continue,
+            Err(e) => return Err(e),
+        };
+        match Object::decode(&raw)? {
+            Object::Snapshot(s) => stack.extend(s.parents.iter().copied()),
+            other => {
+                return Err(VeilError::Corrupt(
+                    id.hex(),
+                    format!("expected a snapshot, found a {}", other.kind_name()),
+                ))
+            }
+        }
+        snaps.push(id);
+    }
+    let mut xfer = Transfer {
+        src: &src,
+        sink: Sink::Pack(Box::new(PackSink::new(local, local.pack_dir(), Some(&**local), 256))),
+        src_keys: remote.keys(),
+        public: false,
+        known: Box::new(|_| false),
+        seen: HashSet::new(),
+        heights: HashMap::new(),
+        report,
+    };
+    for id in snaps {
+        xfer.copy(id, "")?;
+    }
+    // The remote holds objects we lack that the walk did not need: maybe
+    // content our committed view references but lacks (a clone of a public
+    // mirror pulling from a team remote, embargoed content released since).
+    let remaining: HashSet<ObjectId> = inv
+        .ids()
+        .filter(|id| !local_ids.contains(id) && !xfer.seen.contains(id))
+        .copied()
+        .collect();
+    if !remaining.is_empty() {
+        let mut roots = Vec::new();
+        for s in &known {
+            if let Ok(s) = local.snapshot(s) {
+                roots.push(s.tree);
+            }
+        }
+        let mut gaps = Vec::new();
+        local_trees(local, roots, |_, t| {
+            for e in &t.entries {
+                for c in std::iter::once(e.id).chain(e.fallback) {
+                    if remaining.contains(&c) {
+                        gaps.push((c, e.name.clone()));
+                    }
+                }
+            }
+            true
+        })?;
+        for (id, name) in gaps {
+            xfer.copy(id, &name)?;
+        }
+    }
+    let Transfer { sink, mut report, .. } = xfer;
+    sink.finish(&mut report)?;
+    report.bytes_transferred += *src.bytes.borrow();
+    local.reload_packs()?;
     Ok(report)
 }

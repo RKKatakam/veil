@@ -177,7 +177,7 @@ impl ObjectStore {
 
     /// Refuse objects this repository's format may not hold (a format-1
     /// repository must stay readable by every vl that reads format 1).
-    fn check_storable(&self, raw: &[u8]) -> Result<()> {
+    pub(crate) fn check_storable(&self, raw: &[u8]) -> Result<()> {
         if let Some(enc) = Object::tree_encoding(raw) {
             let need = enc.min_repo_format();
             let have = self.format();

@@ -72,7 +72,7 @@ pub use id::{ChangeId, ObjectId};
 pub use identity::Identity;
 pub use object::{EntryKind, Snapshot, Tree, TreeEntry, Visibility};
 pub use repo::Repo;
-pub use vfs::{DiskBackend, MemoryBackend, OverlayBackend, StorageBackend};
+pub use vfs::{DiskBackend, MemoryBackend, OverlayBackend, SftpBackend, SshUrl, StorageBackend};
 pub use vpath::VPath;
 
 /// Current wall-clock time in milliseconds since the Unix epoch.
