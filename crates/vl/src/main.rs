@@ -377,7 +377,8 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             command,
             scopes,
             local_only,
-        } => return cmd_run(ctx, command, scopes, *local_only),
+            remember,
+        } => return cmd_run(ctx, command, scopes, *local_only, *remember),
         Cmd::Scope(c) => cmd_scope(ctx, c)?,
         Cmd::Workspace(c) => return cmd_ws(ctx, c),
         Cmd::Op(OpCmd::Log { limit, out }) => match out.json {
@@ -1741,12 +1742,7 @@ fn cmd_secret(ctx: &mut Ctx, c: &SecretCmd) -> Result<()> {
             scope: Some(scope),
             exposed_to,
             out,
-        } => {
-            if out.json {
-                bail!("`vl secret list --scope` has no --json output yet; use it without --scope for the local vault");
-            }
-            team_secret::list(ctx, scope, exposed_to.as_deref())?
-        }
+        } => team_secret::list(ctx, scope, exposed_to.as_deref(), out.json)?,
         SecretCmd::Rm { name, scope: Some(scope) } => team_secret::rm(ctx, scope, name)?,
         SecretCmd::Get { name, scope: None } => {
             let vault = ctx.repo.vault_load()?;
@@ -1823,15 +1819,34 @@ fn cmd_secret(ctx: &mut Ctx, c: &SecretCmd) -> Result<()> {
 
 /// `vl run`: team-vault secrets first, then the local vault's, which
 /// override them (`team_secret::run_env`).
-fn cmd_run(ctx: &mut Ctx, command: &[String], scopes: &[String], local_only: bool) -> Result<ExitCode> {
+fn cmd_run(ctx: &mut Ctx, command: &[String], scopes: &[String], local_only: bool, remember: bool) -> Result<ExitCode> {
+    if remember {
+        if scopes.is_empty() && !local_only {
+            bail!("`vl run --remember` needs the scopes to remember (`--scope S`, repeatable), or `--local-only` for none");
+        }
+        team_secret::remember(ctx, scopes)?;
+        if command.is_empty() {
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
     let vault = ctx.repo.vault_load()?;
     let team = team_secret::run_env(ctx, scopes, local_only, &vault.secrets)?;
-    let status = std::process::Command::new(&command[0])
+    // BUG-523: say what is too big, instead of passing on E2BIG.
+    let mut env: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> = std::env::vars_os().collect();
+    env.extend(team.vars.iter().chain(&vault.secrets).map(|(k, v)| (k.into(), v.into())));
+    let (total, limit) = (team_secret::exec_size(command, &env), team_secret::arg_max());
+    if total > limit {
+        return Err(team_secret::too_big(total, limit, &team));
+    }
+    let status = match std::process::Command::new(&command[0])
         .args(&command[1..])
-        .envs(&team)
+        .envs(&team.vars)
         .envs(&vault.secrets)
         .status()
-        .with_context(|| format!("failed to run {}", command[0]))?;
+    {
+        Err(e) if e.raw_os_error() == Some(libc::E2BIG) => return Err(team_secret::too_big(total, limit, &team)),
+        r => r.with_context(|| format!("failed to run {}", command[0]))?,
+    };
     Ok(ExitCode::from(status.code().unwrap_or(1).clamp(0, 255) as u8))
 }
 

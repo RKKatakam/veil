@@ -1104,6 +1104,25 @@ fn sync_meta(src: &Keychain, dst: &Keychain, public: bool, pulling: bool, warnin
     Ok(())
 }
 
+/// Fast-forward `local`'s key ring of `scope` to a team remote's, as a pull
+/// would, without pulling anything else. `vl secret set --scope` runs it
+/// first, so a value is sealed under the scope's current generation even
+/// when this device has not pulled a revocation yet (BUG-524). `Ok(None)`:
+/// the remote has no ring for the scope. `NotFound` if there is no Veil
+/// repository there (not pushed to yet, or not reachable as a path).
+pub fn refresh_ring(local: &Repo, remote_backend: Arc<dyn StorageBackend>, scope: &str) -> Result<Option<RingMerge>> {
+    if !remote_backend.exists(&crate::repo::config_path())? {
+        return Err(VeilError::NotFound("a Veil repository there".into()));
+    }
+    let remote_keys = Keychain::new(remote_backend, None, "remote".into());
+    let Some(ring) = remote_keys.load_ring(scope)? else {
+        return Ok(None);
+    };
+    let merged = local.keys().merge_ring(&ring)?;
+    local.keys().invalidate();
+    Ok(Some(merged))
+}
+
 // ---- remotes -----------------------------------------------------------------
 
 /// Check a remote name (Veil or Git): it becomes the first component of

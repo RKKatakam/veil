@@ -374,7 +374,40 @@ boundary.
     TOFU, as for rings.
   * Timestamps are self-asserted. Ordering uses them only between counting
     writers (current members). Sync refuses records stamped more than a day
-    ahead, and a writer stamps after everything they have pulled.
+    ahead (push and pull both say so), and a writer stamps after everything
+    they have pulled. A writer's own records stamped more than a day ahead
+    (a clock that was wrong) are replaced by their next write of the name,
+    here and, on the next push, on the remote (BUG-522).
+  * **Stale rings** (BUG-524). A member who has not pulled a revocation
+    seals under the generation their ring calls current, which the revoked
+    member holds. `vl secret set --scope` first fast-forwards the ring from
+    the team remotes (and warns when none answers); push re-seals the
+    pusher's own records sealed under an older generation than the remote
+    ring's current one before sending them. What stays: a record that
+    reaches a remote another way (an older vl, a relay) is only *detected*.
+    A record sealed under generation g, timestamped after generation g+1
+    started and readable by a member revoked in between, is flagged on
+    pull and in `vl secret list` (to set again), and counts as exposed
+    (`since` ≤ g). Because timestamps are self-asserted, a writer can
+    backdate it to escape the flag; but a counting writer could hand the
+    value to the revoked member directly anyway, so the flag is for honest
+    stale writers, not a defence against members.
+  * **Exposure memory** (BUG-521). `since` is the first generation a
+    *value* was sealed under, kept when the same value is written again. As
+    compaction deletes superseded records, each device remembers, in
+    `.veil/local/vault-history/<scope>.json`, a keyed BLAKE3 of every name
+    and value it saw (key `derive_key(TEAM_VAULT_HISTORY, local_key)` from
+    C8: without the identity the file reveals no names and allows no
+    guessing of values) with the first generation of each value. A write of
+    a value seen before takes that generation as `since`, so going back to a
+    leaked value after a rotation or a deletion stays exposed on every
+    replica. A device that never saw the earlier value cannot link it.
+  * `vl run` does not take execution-affecting variables (`PATH`, `LD_*`,
+    `BASH_ENV`, `NODE_OPTIONS`, `GIT_*`, …) from a team vault, and loads
+    only the scopes chosen on the command line or remembered on the device
+    (BUG-520). Other variables a member sets still reach the command next
+    to the other loaded scopes' secrets: load only scopes whose members you
+    trust with each other's secrets.
 
 ## 3. Domain-separation strings
 
@@ -389,6 +422,7 @@ are distinct and pins their exact bytes.
 | `LEGACY_KEY_WRAP` | `veil 2026 key-wrap v1` | BLAKE3 `derive_key` | C3L (legacy) |
 | `LEGACY_ED25519_SEED` | `veil 2026 ed25519-seed v1` | BLAKE3 `derive_key` | C4 (legacy identities) |
 | `LOCAL_VAULT_KEY` | `veil 2026 local-vault v1` | BLAKE3 `derive_key` | C8 |
+| `TEAM_VAULT_HISTORY` | `veil 2026 team-vault history v1` | BLAKE3 `derive_key` → keyed BLAKE3 | C12 (device-local value history) |
 | `KEY_FINGERPRINT` | `veil 2026 key-fingerprint v1` | BLAKE3 `derive_key` | C9 |
 | `RING_CHANGE_HASH` | `veil 2026 ring-change v1` | BLAKE3 `derive_key` mode as a hash | C6 |
 | `RING_PROOF` | `veil 2026 ring-proof v1` | BLAKE3 `derive_key` → keyed BLAKE3 | C6 |

@@ -80,6 +80,7 @@ const BUILTIN_SECRETS: &[&str] = &[
     ".netrc",
     ".pgpass",
     ".pypirc",
+    ".npmrc",
     ".git-credentials",
     "*.tfstate",
     "*.tfstate.*",
@@ -1561,6 +1562,10 @@ mod tests {
         assert_eq!(class(&p, "certs/server.pem"), Tier::Isolated);
         assert_eq!(class(&p, ".env.example"), Tier::Public);
         assert_eq!(class(&p, "src/main.rs"), Tier::Public);
+        // BUG-493: registry credentials, like .netrc and .pypirc.
+        for f in [".npmrc", "web/.npmrc", ".netrc", ".pypirc"] {
+            assert_eq!(class(&p, f), Tier::Isolated, "{f}");
+        }
     }
 
     #[test]

@@ -122,6 +122,51 @@ fn team_secrets_round_trip_and_reach_teammates() {
     assert!(err.contains("no scope 'nope'"), "{err}");
 }
 
+/// BUG-494: `vl secret list --scope S --json` is `veil.secret.list/1` with
+/// who set each name, when and under which generation; never values.
+#[test]
+fn team_secret_list_has_a_json_form() {
+    let env = Env::new();
+    let (proj, _, bob) = setup(&env);
+    env.ok("alice", &proj, &["secret", "set", "--scope", "team", "STRIPE_KEY", "sk_json_canary"]);
+    let (out, _) = env.ok2("alice", &proj, &["secret", "list", "--scope", "team", "--json"]);
+    assert!(!out.contains("sk_json_canary"), "{out}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["schema"], "veil.secret.list/1");
+    assert_eq!(v["scope"], "team");
+    let item = &v["secrets"][0];
+    assert_eq!(item["name"], "STRIPE_KEY");
+    assert_eq!(item["set_by"], "alice");
+    assert_eq!(item["generation"], 0);
+    assert_eq!(item["stale_generation"], false);
+    assert!(item["timestamp"].as_str().unwrap().ends_with('Z') && item["timestamp_ms"].is_i64(), "{item}");
+    assert!(item["set_by_id"].as_str().unwrap().starts_with("veil1"), "{item}");
+    let (out, _) = env.ok2("alice", &proj, &["secret", "list", "--scope", "team", "--exposed-to", &bob, "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!((v["exposed_to"]["name"].as_str(), v["exposed_to"]["current"].as_bool()), (Some("bob"), Some(true)));
+    assert_eq!(v["secrets"].as_array().unwrap().len(), 1);
+    // The local vault's document is unchanged.
+    let (out, _) = env.ok2("alice", &proj, &["secret", "list", "--json"]);
+    assert_eq!(out.trim(), r#"{"schema":"veil.secret.list/1","secrets":[]}"#);
+}
+
+/// BUG-520: names must be shell identifiers, and a variable that decides
+/// what a command runs may be stored but is said never to reach `vl run`.
+#[test]
+fn team_secret_names_are_identifiers_and_loader_variables_are_flagged() {
+    let env = Env::new();
+    let (proj, _, _) = setup(&env);
+    for bad in ["A.B", "A-B", "A=B"] {
+        let err = env.fails("alice", &proj, &["secret", "set", "--scope", "team", bad, "v"]);
+        assert!(err.contains("invalid secret name"), "{err}");
+    }
+    let (_, err) = env.ok2("alice", &proj, &["secret", "set", "--scope", "team", "NODE_OPTIONS", "require-hook"]);
+    assert!(err.contains("never sets NODE_OPTIONS"), "{err}");
+    let (out, err) = env.ok2("alice", &proj, &["run", "--scope", "team", "--", "sh", "-c", "echo \"[$NODE_OPTIONS]\""]);
+    assert_eq!(out, "[]\n");
+    assert!(err.contains("not setting NODE_OPTIONS"), "{err}");
+}
+
 #[test]
 fn run_loads_team_secrets_then_the_local_vault_overrides() {
     let env = Env::new();
@@ -132,8 +177,15 @@ fn run_loads_team_secrets_then_the_local_vault_overrides() {
     env.ok("alice", &proj, &["secret", "set", "--scope", "ops", "OPS_ONLY", "o"]);
     env.ok("alice", &proj, &["secret", "set", "--scope", "ops", "SHARED", "ops-value"]);
     let show = ["sh", "-c", "echo T=$TEAM_ONLY O=$OPS_ONLY S=$SHARED L=$LOCAL"];
-    // Two scopes disagree on SHARED: refused rather than guessed.
+    // By default no team vault is loaded until this device chooses
+    // (BUG-520), and vl run says how.
     let mut args = vec!["run", "--"];
+    args.extend(show);
+    let (out, err) = env.ok2("alice", &proj, &args);
+    assert_eq!(out, "T= O= S= L=\n");
+    assert!(err.contains("--remember"), "{err}");
+    // Two scopes disagree on SHARED: refused rather than guessed.
+    let mut args = vec!["run", "--scope", "team", "--scope", "ops", "--"];
     args.extend(show);
     let err = env.fails("alice", &proj, &args);
     assert!(err.contains("SHARED") && err.contains("'ops'") && err.contains("'team'"), "{err}");
@@ -144,9 +196,16 @@ fn run_loads_team_secrets_then_the_local_vault_overrides() {
     // The local vault overrides any team secret (and settles conflicts).
     env.ok("alice", &proj, &["secret", "set", "SHARED", "local-value"]);
     env.ok("alice", &proj, &["secret", "set", "LOCAL", "l"]);
-    let mut args = vec!["run", "--"];
+    let mut args = vec!["run", "--scope", "team", "--scope", "ops", "--"];
     args.extend(show);
     assert_eq!(env.ok2("alice", &proj, &args).0, "T=t O=o S=local-value L=l\n");
+    // Remembered scopes are this device's default.
+    env.ok("alice", &proj, &["run", "--scope", "team", "--scope", "ops", "--remember"]);
+    let mut args = vec!["run", "--"];
+    args.extend(show);
+    let (out, err) = env.ok2("alice", &proj, &args);
+    assert_eq!(out, "T=t O=o S=local-value L=l\n");
+    assert!(!err.contains("--remember"), "{err}");
     let mut args = vec!["run", "--local-only", "--"];
     args.extend(show);
     assert_eq!(env.ok2("alice", &proj, &args).0, "T= O= S=local-value L=l\n");
@@ -188,4 +247,32 @@ fn revoke_lists_the_secrets_to_rotate() {
     assert!(env
         .fails("bob", &bob_dir, &["secret", "set", "--scope", "team", "DB_PASSWORD", "x"])
         .contains("not a member"));
+}
+
+/// BUG-524: `vl secret set --scope` brings the scope's key ring up to date
+/// from the team remotes first, so a teammate who has not pulled a
+/// revocation still seals a new value under the current generation; with
+/// no reachable remote it warns.
+#[test]
+fn a_write_checks_the_key_ring_against_the_team_remote_first() {
+    let env = Env::new();
+    let (proj, _bob_dir, bob) = setup(&env);
+    let carol = env.public_key("carol");
+    env.ok("alice", &proj, &["scope", "grant", "team", &carol, "--name", "carol"]);
+    env.ok("alice", &proj, &["push"]);
+    env.ok("carol", &env.root, &["clone", "team", "carol"]);
+    let carol_dir = env.root.join("carol");
+    env.ok("alice", &proj, &["scope", "revoke", "team", &bob]);
+    env.ok("alice", &proj, &["push"]);
+    // Carol has not pulled the revocation.
+    let (_, err) = env.ok2("carol", &carol_dir, &["secret", "set", "--scope", "team", "NEW_KEY", "fresh"]);
+    assert!(err.contains("Updated the key ring of scope team from remote origin"), "{err}");
+    let (list, _) = env.ok2("carol", &carol_dir, &["secret", "list", "--scope", "team"]);
+    assert!(list.contains("NEW_KEY") && list.contains("key generation 1"), "{list}");
+    // Unreachable: a warning, and the write still happens.
+    let gone = env.root.join("team-moved");
+    std::fs::rename(env.root.join("team"), &gone).unwrap();
+    std::fs::write(env.root.join("team"), "not a directory").unwrap();
+    let (_, err) = env.ok2("carol", &carol_dir, &["secret", "set", "--scope", "team", "OFFLINE_KEY", "v"]);
+    assert!(err.contains("could not check that the key ring of scope team is current"), "{err}");
 }

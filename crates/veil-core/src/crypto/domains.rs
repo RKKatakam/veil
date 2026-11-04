@@ -51,6 +51,12 @@ pub const LEGACY_ED25519_SEED: &str = "veil 2026 ed25519-seed v1";
 /// `x25519_secret ‖ repo_id`.
 pub const LOCAL_VAULT_KEY: &str = "veil 2026 local-vault v1";
 
+/// BLAKE3 `derive_key` context of the device-local team-vault history key,
+/// over the local vault key (C8): a keyed BLAKE3 of each value a team vault
+/// held, so going back to a value a revoked member read is still reported
+/// (C12, BUG-521). Never stored or synced.
+pub const TEAM_VAULT_HISTORY: &str = "veil 2026 team-vault history v1";
+
 /// Prefix of every Ed25519-signed message: `SIG_PREFIX ‖ context ‖ 0x00 ‖
 /// payload`, with `context` one of the `SIG_CONTEXT_*` values below.
 pub const SIG_PREFIX: &[u8] = b"veil 2026 sig v1\0";
@@ -138,6 +144,7 @@ pub const BLAKE3_CONTEXTS: &[&str] = &[
     RING_CHANGE_HASH,
     RING_PROOF,
     GIT_CHANGE_ID,
+    TEAM_VAULT_HISTORY,
 ];
 
 #[cfg(test)]
@@ -150,6 +157,10 @@ mod tests {
         all.extend([AES_SIV_SUBKEY, HPKE_KEY_WRAP_INFO]);
         let unique: std::collections::BTreeSet<&str> = all.iter().copied().collect();
         assert_eq!(unique.len(), all.len(), "duplicate domain-separation string");
+        // Contexts added after the first eight are pinned on their own.
+        assert_eq!(BLAKE3_CONTEXTS[8..], ["veil 2026 team-vault history v1"], "a context changed or was reordered");
+        let mut all: Vec<&str> = BLAKE3_CONTEXTS[..8].to_vec();
+        all.extend([AES_SIV_SUBKEY, HPKE_KEY_WRAP_INFO]);
         // Pinned: these strings are part of data already on disk.
         let pinned = blake3::hash(all.join("\n").as_bytes()).to_hex().to_string();
         assert_eq!(

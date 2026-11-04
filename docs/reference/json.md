@@ -404,6 +404,21 @@ are never part of the document; `vl secret get NAME` prints one.
 | `schema` | string | `veil.secret.list/1` |
 | `secrets` | array | By name: `name` (the environment variable `vl run` sets) |
 
+`vl secret list --scope S --json` lists the live names of scope `S`'s team
+vault (still never values). The document and its items gain these fields;
+the local vault's document has none of them:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `scope` | string | The scope |
+| `exposed_to` | object | Only with `--exposed-to`, which then keeps just the names that member could read: `member_id`; `name` (in the scope's ring); `current` (bool: still a member, so every entry is readable to them) |
+| `secrets[].set_by` | string | Name, in the scope's ring, of the member who last set it |
+| `secrets[].set_by_id` | string | Their member id |
+| `secrets[].timestamp` | string | When (RFC 3339, UTC, the writer's clock) |
+| `secrets[].timestamp_ms` | number | The same, in milliseconds since the epoch |
+| `secrets[].generation` | number | Key generation the value is sealed under |
+| `secrets[].stale_generation` | bool | Sealed under an old generation, after a revocation, by a writer whose key ring was out of date: the revoked member can read it. Set it again |
+
 ## `veil.ls/1`
 
 `vl ls --json`: the files of a snapshot with their [tier](#tier), and for

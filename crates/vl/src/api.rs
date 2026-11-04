@@ -1252,23 +1252,102 @@ pub fn op_log(repo: &Repo, limit: usize) -> Result<OpLog> {
 }
 
 /// `vl secret list --json` (`veil.secret.list/1`): names only. A secret's
-/// value never enters this structure.
+/// value never enters this structure. With `--scope` (a team vault) the
+/// document gains `scope`, and each item who last set it, when, and under
+/// which key generation (BUG-494); with `--exposed-to`, `exposed_to` too.
 #[derive(Serialize, Debug)]
 pub struct SecretList {
     pub schema: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exposed_to: Option<ExposedTo>,
     pub secrets: Vec<SecretItem>,
+    /// Records of the team vault that do not count, and why (printed as
+    /// warnings by the text output; not part of the JSON document).
+    #[serde(skip)]
+    pub(crate) warnings: Vec<String>,
+}
+
+/// The member `--exposed-to` asked about.
+#[derive(Serialize, Debug)]
+pub struct ExposedTo {
+    pub member_id: String,
+    pub name: String,
+    /// Still a member of the scope (then every entry is readable to them).
+    pub current: bool,
 }
 
 #[derive(Serialize, Debug)]
 pub struct SecretItem {
     pub name: String,
+    #[serde(flatten)]
+    pub team: Option<TeamSecretItem>,
+}
+
+/// What a team-vault item adds.
+#[derive(Serialize, Debug)]
+pub struct TeamSecretItem {
+    /// Name, in the scope's ring, of the member who last set it.
+    pub set_by: String,
+    pub set_by_id: String,
+    pub timestamp: Option<String>,
+    pub timestamp_ms: i64,
+    /// Key generation the value is sealed under.
+    pub generation: u32,
+    /// Sealed under an old generation by a writer whose key ring was out of
+    /// date, after a revocation: set it again (BUG-524).
+    pub stale_generation: bool,
 }
 
 pub fn secret_list(repo: &Repo) -> Result<SecretList> {
     let vault = repo.vault_load()?;
     Ok(SecretList {
         schema: SECRET_LIST_SCHEMA,
-        secrets: vault.secrets.keys().map(|k| SecretItem { name: k.clone() }).collect(),
+        scope: None,
+        exposed_to: None,
+        secrets: vault.secrets.keys().map(|k| SecretItem { name: k.clone(), team: None }).collect(),
+        warnings: vec![],
+    })
+}
+
+/// `vl secret list --scope S [--exposed-to M] --json`: the live names of a
+/// team vault (never values).
+pub fn team_secret_list(repo: &Repo, scope: &str, exposed_to: Option<&str>) -> Result<SecretList> {
+    let keys = repo.keys();
+    crate::team_secret::check_scope(keys, scope)?;
+    let vault = keys.team_vault(scope)?;
+    let warnings = crate::team_secret::ignored_warnings(scope, &vault);
+    let (entries, exposed_to) = match exposed_to {
+        Some(who) => {
+            let (id, name, exposed) = keys.team_vault_exposed_to(scope, who)?;
+            let current = keys
+                .ring_state(scope)?
+                .and_then(|r| r.ok())
+                .is_some_and(|st| st.members.contains_key(&id));
+            (exposed, Some(ExposedTo { member_id: id, name, current }))
+        }
+        None => (vault.live().cloned().collect(), None),
+    };
+    Ok(SecretList {
+        schema: SECRET_LIST_SCHEMA,
+        scope: Some(scope.to_string()),
+        exposed_to,
+        secrets: entries
+            .into_iter()
+            .map(|e| SecretItem {
+                name: e.name,
+                team: Some(TeamSecretItem {
+                    set_by: e.signer_name,
+                    set_by_id: e.signer,
+                    timestamp: rfc3339(e.timestamp),
+                    timestamp_ms: e.timestamp,
+                    generation: e.generation,
+                    stale_generation: e.stale_generation,
+                }),
+            })
+            .collect(),
+        warnings,
     })
 }
 

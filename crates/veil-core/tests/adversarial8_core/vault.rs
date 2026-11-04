@@ -79,7 +79,6 @@ fn exposure_survives_setting_the_current_value_again() {
 /// yet `--exposed-to bob` no longer lists it: `since` is carried over only
 /// from the immediately previous winner, not from the value's history.
 #[test]
-#[ignore = "BUG-521: --exposed-to forgets a leaked value that is set again after a rotation"]
 fn exposure_survives_going_back_to_a_leaked_value() {
     let (alice, bob, _remote) = team();
     set(&alice, "DB_PASSWORD", "p1-leaked");
@@ -109,7 +108,6 @@ fn exposure_survives_going_back_to_a_leaked_value() {
 /// when pulling), reports success, and teammates never receive the
 /// rotation. Alice's own vault shows the new value.
 #[test]
-#[ignore = "BUG-522: push silently withholds the writer's records stamped over a day ahead, rotations included"]
 fn a_rotation_after_a_clock_glitch_reaches_teammates_or_push_says_why() {
     let (mut alice, mut bob, remote) = team();
     set(&alice, "API_KEY", "v1");
@@ -157,7 +155,6 @@ fn records(fs: &dyn StorageBackend, scope: &str) -> Vec<VaultRecord> {
 /// after the revocation is readable by the revoked member. Push (which
 /// merges the remote's ring anyway) should refuse or re-seal it, or warn.
 #[test]
-#[ignore = "BUG-524: a new team-vault value written by a stale teammate is sealed under the revoked member's generation, silently"]
 fn a_value_written_after_a_revocation_is_not_readable_by_the_revoked_member() {
     let (mut alice, mut bob, remote) = team();
     let carol_id = Identity::generate("carol");

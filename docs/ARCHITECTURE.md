@@ -428,8 +428,46 @@ one **immutable record per write**.
   when the same value is written again (re-signing, re-sealing after a
   rotation), so re-signing doesn't hide an exposure but a new value does.
   `vl secret list --scope S --exposed-to M` recomputes it at any time.
+  Since compaction deletes superseded records, a device also remembers, in
+  `.veil/local/vault-history/<scope>.json`, a keyed hash of every value each
+  name held with its first generation (CRYPTO.md C12). A write of a value
+  seen before takes that `since` (going back to a leaked value after a
+  rotation or a deletion stays exposed, BUG-521), and `--exposed-to`
+  consults it too.
 * **Rotation.** New writes use the current generation; existing records keep
   theirs (members walk the key chain) and are re-sealed on their next write.
+* **Stale rings** (BUG-524). `vl secret set|rm --scope` first
+  fast-forwards the scope's ring from every team remote
+  (`remote::refresh_ring`), and warns when none could be checked. On push,
+  `sync` re-seals the pusher's own records sealed under a generation older
+  than the destination ring's current one and stamped after the next
+  generation started (written before this device
+  pulled a rotation): the local ring is fast-forwarded, the entry re-sealed
+  under the current generation with its `since`, stamped 1 ms later, and
+  the stale record is not sent. Any other record sealed under a generation
+  g after generation g+1 started (by its timestamp), readable by a member
+  revoked in between (`Staleness`), is copied, reported by name on push and
+  pull, and marked `stale_generation` in the vault, to be set again.
+* **Clocks** (BUG-522). Push and pull both report the records they refuse.
+  A write replaces (deletes) its writer's own records of the name stamped
+  more than a day ahead, and is stamped by the clock; on the next push, such
+  records of theirs on the remote are deleted when this device holds a
+  later write of that name. A winning write of someone else's stamped that
+  far ahead makes the write an error that names the clocks to check.
+* **Names and size.** New writes need shell identifiers
+  (`[A-Za-z_][A-Za-z0-9_]*`); records with `.` or `-` written before still
+  count. A scope's live entries are capped at 256 KiB in all, counted as
+  `execve` counts environment strings (BUG-523).
+* **`vl run`** (`crates/vl/src/team_secret.rs`) loads the team vaults of the
+  `--scope`s given, or of the scopes `vl run --remember` stored in
+  `.veil/local/run-scopes.json`; none by default (BUG-520). It never sets
+  names that are not identifiers or that decide what runs or loads
+  (`team_vault::is_execution_variable`: `PATH`, `LD_*`, `DYLD_*`,
+  `BASH_ENV`, `ENV`, `NODE_OPTIONS`, `PYTHON*`, `GIT_*`, `HOME`, `TMPDIR`,
+  proxies and CA bundles, tool configuration paths, …) from a team vault,
+  and warns about them. Before running it adds up arguments and environment
+  and compares them with `ARG_MAX`; over it (or on `E2BIG`) the error names
+  each loaded scope's size and largest entries.
 * **Sync** (`sync_meta`, §8): team destinations only, after the rings are
   merged. A record the receiver lacks is copied if it passes the checks
   above against the receiver's ring, except that records of *former*
@@ -437,7 +475,7 @@ one **immutable record per write**.
   once. Records with a bad signature, an unknown generation, a signer who
   was never a member, a timestamp more than a day ahead, or (where the
   local identity can open them) content that does not decrypt, are refused,
-  and `pull` warns. A non-member relays records it cannot read.
+  and push and pull both say so. A non-member relays records it cannot read.
 * **Older vl** never looks at `.veil/meta/vault/`: it neither reads nor
   rewrites records, and it does not relay them (FORMAT.md §2). No format
   change was needed.
