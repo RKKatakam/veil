@@ -25,9 +25,11 @@ mod ctx;
 mod doctor;
 #[cfg(test)]
 mod docgen;
+mod picker;
 mod render;
 mod sandbox;
 mod serve;
+mod shape;
 
 use std::{
     io::{IsTerminal, Read, Write},
@@ -320,11 +322,8 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
                 }
             }
         }
-        Cmd::Squash { rev } => {
-            let id = ctx.rev(rev)?;
-            let p = ctx.repo.squash(id)?;
-            println!("Squashed into {}", one_line(&ctx.repo, &p));
-        }
+        Cmd::Split { paths, rev, message, pick, out } => shape::cmd_split(ctx, paths, rev, message.as_deref(), pick, out)?,
+        Cmd::Squash { paths, rev, into, pick, out } => shape::cmd_squash(ctx, paths, rev, into.as_deref(), pick, out)?,
         Cmd::Restore { paths, from } => cmd_restore(ctx, paths, from.as_deref())?,
         Cmd::Merge {
             revs,

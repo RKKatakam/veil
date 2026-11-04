@@ -63,8 +63,15 @@ added main.rs
 
 ## Record work
 
-Four methods change the repository, exactly as their commands do:
-`snapshot` (record the working copy now), `describe`, `new` and `commit`.
+Six methods change the repository, exactly as their commands do:
+`snapshot` (record the working copy now), `describe`, `new`, `commit`,
+`split` and `squash`. The last two take what to move as a list of files,
+each with the hunks to take (`vl diff --json` numbers them) or none for the
+whole file; there is no picker over the socket:
+
+```sh
+vl serve --call split '{"files":[{"path":"src/config.rs","hunks":[1,3]}],"message":"Config: read the new keys"}'
+```
 
 ```sh
 vl serve --call commit '{"message":"Add main.rs"}'

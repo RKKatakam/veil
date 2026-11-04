@@ -61,6 +61,8 @@ documents described [below](#write-results).
 | `describe` | `vl describe` | `message` (required), `rev` (default `@`) | [`veil.describe/1`](#veildescribe1) |
 | `new` | `vl new` | `revs` (list, default `[@]`), `message` | [`veil.new/1`](#veilnew1) |
 | `commit` | `vl commit` | `message` (required), `no_advance` (bool) | [`veil.commit/1`](#veilcommit1) |
+| `split` | `vl split` | `files` (required: a [plan](json.md#veilsplit1)'s `files`), `rev` (default `@`), `message` | [`veil.split/1`](json.md#veilsplit1) |
+| `squash` | `vl squash` | `rev` (default `@`), `into` (a revision), `files` (as for `split`; leave it out to move the whole change) | [`veil.squash/1`](json.md#veilsquash1) |
 | `watch` | | `interval_ms` (50–60000, default 500), `working_copy` (bool) | [`veil.watch/1`](#veilwatch1), then [`changed`](#notifications) notifications |
 | `unwatch` | | none | [`veil.watch/1`](#veilwatch1) |
 | `server.info` | | none | [`veil.server.info/1`](#veilserverinfo1) |
