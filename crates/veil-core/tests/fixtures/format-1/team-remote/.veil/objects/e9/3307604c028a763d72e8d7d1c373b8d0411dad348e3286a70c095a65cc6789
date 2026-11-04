@@ -1,0 +1,4 @@
+veil:blob
+fn main() {
+    println!("v1");
+}

@@ -11,7 +11,7 @@
 //! the result is re-wrapped under the same embargo, with the merge of the
 //! inputs' public views as its fallback. Merging them needs the embargo key.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 use crate::{
     embargo::{public_view, unreleased_wrapper, wrap},
@@ -20,6 +20,7 @@ use crate::{
     object::{EntryKind, Tree, TreeEntry, Visibility},
     secrets::looks_binary,
     store::ObjectStore,
+    tree::MAX_TREE_DEPTH,
     vpath::VPath,
 };
 
@@ -76,7 +77,7 @@ fn merge_resolved(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, t
     let o = store.tree(&ours)?;
     let t = store.tree(&theirs)?;
     let mut conflicts = Vec::new();
-    let tree = match merge_dir(store, &VPath::root(), b.as_deref(), Some(&o), Some(&t), &mut conflicts)? {
+    let tree = match merge_dir(store, b, Some((o, ours)), Some((t, theirs)), &mut conflicts)? {
         Some(id) => id,
         None => store.empty_tree()?,
     };
@@ -91,9 +92,9 @@ fn same(a: Option<&TreeEntry>, b: Option<&TreeEntry>) -> bool {
     }
 }
 
-fn subtree(store: &ObjectStore, e: Option<&TreeEntry>) -> Result<Option<std::sync::Arc<Tree>>> {
+fn subtree(store: &ObjectStore, e: Option<&TreeEntry>) -> Result<Option<(Arc<Tree>, ObjectId)>> {
     match e {
-        Some(e) if e.kind == EntryKind::Dir => Ok(Some(store.tree(&e.id)?)),
+        Some(e) if e.kind == EntryKind::Dir => Ok(Some((store.tree(&e.id)?, e.id))),
         _ => Ok(None),
     }
 }
@@ -107,24 +108,86 @@ fn read_for_merge(store: &ObjectStore, e: &TreeEntry, path: &VPath) -> Result<Ve
     })
 }
 
+/// One directory being merged.
+struct MergeFrame {
+    dir: VPath,
+    b: Option<Arc<Tree>>,
+    o: Option<(Arc<Tree>, ObjectId)>,
+    t: Option<(Arc<Tree>, ObjectId)>,
+    names: Vec<String>,
+    next: usize,
+    out: Tree,
+    /// Name of the entry whose subdirectory is being merged on top of this
+    /// frame.
+    waiting: Option<String>,
+}
+
+impl MergeFrame {
+    fn new(dir: VPath, b: Option<Arc<Tree>>, o: Option<(Arc<Tree>, ObjectId)>, t: Option<(Arc<Tree>, ObjectId)>) -> Self {
+        let mut names = BTreeSet::new();
+        for tree in [b.as_deref(), o.as_ref().map(|x| &*x.0), t.as_ref().map(|x| &*x.0)].into_iter().flatten() {
+            names.extend(tree.entries.iter().map(|e| e.name.clone()));
+        }
+        MergeFrame {
+            dir,
+            b,
+            o,
+            t,
+            names: names.into_iter().collect(),
+            next: 0,
+            out: Tree::default(),
+            waiting: None,
+        }
+    }
+
+    /// Store the merged directory. A result equal to one side reuses that
+    /// side's id (no re-encoding, so a format-1 tree keeps its id).
+    fn finish(self, store: &ObjectStore) -> Result<Option<ObjectId>> {
+        if self.out.is_empty() {
+            return Ok(None);
+        }
+        for (tree, id) in [&self.o, &self.t].into_iter().flatten() {
+            if **tree == self.out {
+                return Ok(Some(*id));
+            }
+        }
+        Ok(Some(store.put_tree(&self.out)?))
+    }
+}
+
+/// Three-way merge of directories. Iterative: tree depth comes from
+/// `.veil/` and remotes and is not trusted.
 fn merge_dir(
     store: &ObjectStore,
-    dir: &VPath,
-    b: Option<&Tree>,
-    o: Option<&Tree>,
-    t: Option<&Tree>,
+    b: Option<Arc<Tree>>,
+    o: Option<(Arc<Tree>, ObjectId)>,
+    t: Option<(Arc<Tree>, ObjectId)>,
     conflicts: &mut Vec<VPath>,
 ) -> Result<Option<ObjectId>> {
-    let mut names = BTreeSet::new();
-    for tree in [b, o, t].into_iter().flatten() {
-        names.extend(tree.entries.iter().map(|e| e.name.clone()));
-    }
-    let mut out = Tree::default();
-    for name in names {
-        let be = b.and_then(|x| x.get(&name));
-        let oe = o.and_then(|x| x.get(&name));
-        let te = t.and_then(|x| x.get(&name));
-        let path = dir.join(&name);
+    let mut stack = vec![MergeFrame::new(VPath::root(), b, o, t)];
+    let mut result: Option<Option<ObjectId>> = None;
+    loop {
+        let depth = stack.len();
+        let f = stack.last_mut().expect("stack is never empty here");
+        if let Some(name) = f.waiting.take() {
+            if let Some(id) = result.take().expect("a finished subdirectory") {
+                f.out.insert(TreeEntry::dir(&name, id));
+            }
+        }
+        let Some(name) = f.names.get(f.next).cloned() else {
+            let done = stack.pop().expect("checked");
+            let id = done.finish(store)?;
+            if stack.is_empty() {
+                return Ok(id);
+            }
+            result = Some(id);
+            continue;
+        };
+        f.next += 1;
+        let be = f.b.as_ref().and_then(|x| x.get(&name));
+        let oe = f.o.as_ref().and_then(|x| x.0.get(&name));
+        let te = f.t.as_ref().and_then(|x| x.0.get(&name));
+        let path = f.dir.join(&name);
         let pick = if same(oe, te) || same(be, te) {
             oe.cloned()
         } else if same(be, oe) {
@@ -133,9 +196,16 @@ fn merge_dir(
             let kinds: Vec<EntryKind> = [oe, te].into_iter().flatten().map(|e| e.kind).collect();
             let base_ok = be.map_or(true, |e| e.kind == kinds[0]);
             if kinds.iter().all(|k| *k == EntryKind::Dir) && be.map_or(true, |e| e.kind == EntryKind::Dir) {
-                let (bs, os, ts) = (subtree(store, be)?, subtree(store, oe)?, subtree(store, te)?);
-                merge_dir(store, &path, bs.as_deref(), os.as_deref(), ts.as_deref(), conflicts)?
-                    .map(|id| TreeEntry::dir(&name, id))
+                if depth >= MAX_TREE_DEPTH {
+                    return Err(VeilError::Corrupt(
+                        path.to_string(),
+                        format!("directory nesting exceeds {MAX_TREE_DEPTH} levels"),
+                    ));
+                }
+                let (bs, os, ts) = (subtree(store, be)?.map(|x| x.0), subtree(store, oe)?, subtree(store, te)?);
+                f.waiting = Some(name);
+                stack.push(MergeFrame::new(path, bs, os, ts));
+                continue;
             } else if let (Some(oe), Some(te), true) = (oe, te, kinds.iter().all(|k| *k == EntryKind::File) && base_ok) {
                 Some(merge_file(store, &path, be, oe, te, conflicts)?)
             } else {
@@ -146,13 +216,8 @@ fn merge_dir(
             }
         };
         if let Some(e) = pick {
-            out.insert(e);
+            f.out.insert(e);
         }
-    }
-    if out.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(store.put_tree(&out)?))
     }
 }
 

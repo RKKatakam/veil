@@ -98,6 +98,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Man { out_dir } => cmd_man(out_dir.as_deref()),
+        Cmd::Upgrade { dry_run, remote, force } => cmd_upgrade(cli.repository.as_deref(), *dry_run, remote.as_deref(), *force),
         _ => {
             let mut ctx = open(&cli)?;
             let code = dispatch(&mut ctx, &cli)?;
@@ -115,7 +116,8 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         | Cmd::Fsck { .. }
         | Cmd::Doctor { .. }
         | Cmd::Completions { .. }
-        | Cmd::Man { .. } => unreachable!(),
+        | Cmd::Man { .. }
+        | Cmd::Upgrade { .. } => unreachable!(),
         Cmd::Status => cmd_status(ctx)?,
         Cmd::Log { limit } => print_log(&ctx.repo, &ctx.ws, *limit)?,
         Cmd::Show { rev, stat } => cmd_show(ctx, rev, *stat)?,
@@ -327,7 +329,11 @@ fn cmd_clone(source: &Path, dest: Option<&Path>) -> Result<ExitCode> {
     let dest = dest.canonicalize()?;
     let identity = load_identity()?;
     let fs = Arc::new(DiskBackend::new(&dest));
-    let mut repo = Repo::init_for_clone(fs.clone(), Some(identity.clone()), &user_for(&identity))?;
+    // Same format as the source, so that what the clone writes can be
+    // pushed back and read by everyone who reads the source.
+    let source_config = veil_core::repo::read_config(&DiskBackend::new(&source))?;
+    source_config.check_supported()?;
+    let mut repo = Repo::init_for_clone_at(fs.clone(), Some(identity.clone()), &user_for(&identity), source_config.format)?;
     let mut config = repo.config().clone();
     config.remotes.insert(
         "origin".into(),
@@ -1634,6 +1640,66 @@ fn cmd_fsck(repo_arg: Option<&Path>, verbose: bool) -> Result<ExitCode> {
         println!("{} {} problem(s) found", red("Corrupt:"), report.count(Severity::Corrupt));
         Ok(ExitCode::FAILURE)
     }
+}
+
+/// `vl upgrade` bypasses `Ctx::open` too: it must not snapshot, and it
+/// works on bare remotes.
+fn cmd_upgrade(repo_arg: Option<&Path>, dry_run: bool, remote_name: Option<&str>, force: bool) -> Result<ExitCode> {
+    use veil_core::upgrade::{upgrade, UpgradeOptions};
+    let start = match repo_arg {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir()?,
+    };
+    let root = ctx::find_root(&start)
+        .ok_or_else(|| anyhow!("no Veil repository found in {} or its parents", start.display()))?;
+    let (target, label, identity) = match remote_name {
+        None => (root.clone(), "this repository".to_string(), Some(load_identity()?)),
+        Some(name) => {
+            let config = veil_core::repo::read_config(&DiskBackend::new(&root))?;
+            let r = config
+                .remotes
+                .get(name)
+                .ok_or_else(|| anyhow!("no remote named '{name}'"))?;
+            let path = PathBuf::from(&r.url);
+            let path = if path.is_absolute() { path } else { root.join(path) };
+            // A remote is checked structurally: its sealed content is not ours to open.
+            (path, format!("remote '{name}'"), None)
+        }
+    };
+    let backend: Arc<dyn StorageBackend> = Arc::new(DiskBackend::new(&target));
+    let opts = UpgradeOptions {
+        dry_run,
+        force,
+        ..UpgradeOptions::default()
+    };
+    let r = upgrade(backend, identity, &opts)?;
+    if r.up_to_date {
+        println!("{label} is already at format {} (the newest)", r.to);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let verb = if dry_run { "Would upgrade" } else { "Upgraded" };
+    println!(
+        "{verb} {label} from format {} to format {}{}",
+        r.from,
+        r.to,
+        if r.resumed { " (resumed an interrupted upgrade)" } else { "" }
+    );
+    println!(
+        "  objects    {} ({} JSON tree(s), {} binary tree(s))",
+        r.objects, r.trees_json, r.trees_binary
+    );
+    println!("  steps      {}", r.steps.join(", "));
+    for c in &r.corrupt {
+        println!("  {} {}", red("corrupt:"), safe(c));
+    }
+    for n in &r.notes {
+        println!("  {} {n}", dim("note:"));
+    }
+    if dry_run && !r.corrupt.is_empty() && !force {
+        println!("{}", yellow("The upgrade would be refused until `vl fsck` is clean (or --force)."));
+        return Ok(ExitCode::FAILURE);
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 // ---- storage -------------------------------------------------------------

@@ -1,0 +1,21 @@
+{
+  "id": "c357ad6530",
+  "scope": "team",
+  "wrapped": {
+    "scope": "embargo-wrap:c357ad6530",
+    "nonce": "a78068fb69e8338843f0e9de0c5675ef87a48bc42d7fe16a",
+    "ciphertext": "590682eac85f6b7d70c01e75bfee7b60af38dfee08fa375e150f41423c08d803e45383d8b8dac0d1a65d9244e91e6112"
+  },
+  "until": 4070908800000,
+  "released_key": null,
+  "released_at": null,
+  "created": 1793756975878,
+  "description": "",
+  "scope_key": "team#f24434b2f470dbec",
+  "key_id": "3755dcf586139ae2",
+  "signature": {
+    "signer": "veil158c27caf203c315ac0f68812429b877ac31698cbfe1ca33b9addac37c3252116",
+    "key": "bd44c03072d13b56bce8329f3ff8f2bab97cca223eeb16531beb37c8f2e5b7b0",
+    "sig": "5c46e8d49df4aca46074c55ecff721ac5fc5adfb61da6ee99c04e5b1142a1cd9291b1f232dc25d64e71a6314503f18d398d53444e457bd6c2884828371d7000c"
+  }
+}

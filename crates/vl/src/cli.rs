@@ -10,7 +10,7 @@ pub const VERSION: &str = concat!(
     env!("VL_GIT_COMMIT"),
     ", repository format ",
     // Kept in step with `veil_core::repo::REPO_FORMAT_VERSION` by a test.
-    "1",
+    "2",
     ")"
 );
 
@@ -19,7 +19,7 @@ pub const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\ncommit: ",
     env!("VL_GIT_COMMIT"),
-    "\nrepository format: 1",
+    "\nrepository format: 2",
     "\ntarget: ",
     env!("VL_TARGET"),
 );
@@ -100,6 +100,24 @@ pub enum Cmd {
         /// Also list redacted (expected) objects and notes one by one.
         #[arg(short, long)]
         verbose: bool,
+    },
+    /// Upgrade the repository (or a remote) to the newest format.
+    ///
+    /// Existing repositories keep working at their format without this;
+    /// upgrading enables what the newer format adds (format 2: binary
+    /// trees, which make `vl status` faster). Old objects keep their ids,
+    /// nothing is rewritten, and older vl releases can no longer read the
+    /// repository afterwards. Runs `fsck` first; resumable after a crash.
+    Upgrade {
+        /// Show what would happen without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Upgrade this remote instead of the local repository.
+        #[arg(long, value_name = "NAME")]
+        remote: Option<String>,
+        /// Upgrade even if fsck reports corruption.
+        #[arg(long)]
+        force: bool,
     },
     /// Show how a change evolved (amends, rewrites, rebases).
     Evolog {

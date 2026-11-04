@@ -113,6 +113,7 @@ Git          git import <path|url> [--remote R] · git remote add <name> <url>|l
              git fetch [remote] · git pull [remote] · git push [remote] [-t tag…] [--force]
              git export [-t tag…]
 Maintenance  gc [--keep-ops-days N] [--grace-minutes M | --prune-now] [--level L] [--no-deltas]
+             fsck [-v] · upgrade [--dry-run] [--remote NAME] [--force]
 ```
 
 Revisions: `@` (working copy), `name@` (another workspace), `root`, tags,
@@ -199,10 +200,21 @@ crates/
     src/remote.rs     visibility-filtered push / pull
     src/git/          Git import/export (gix) and the `git` transport
     src/vault.rs      device-local encrypted vault
+    src/upgrade.rs    `vl upgrade`: journaled repository format migrations
+    tests/fixtures/   golden repositories written by every format's release
     tests/engine.rs   end-to-end tests, entirely in memory
   vl/          the CLI (clap)
 docs/ARCHITECTURE.md  design, data model, threat model, roadmap
+docs/FORMAT.md        on-disk formats, compatibility rules, migrations
 ```
+
+## Repository formats
+
+A repository records its format in `.veil/repo.json`. Every release reads
+every older format and keeps writing it, so existing repositories just
+work; `vl upgrade` opts in to a newer one (format 2: binary trees, a faster
+`vl status`) without rewriting history: ids and signatures stay valid. See
+[docs/FORMAT.md](docs/FORMAT.md).
 
 ## Embedding the engine (in-memory, e.g. for agents)
 

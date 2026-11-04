@@ -57,6 +57,25 @@ pub const LOCAL_SCOPE: &str = "local";
 /// Ring file format with a signed change log.
 pub const RING_FORMAT: u32 = 2;
 
+/// Embargo record format. Format-1 records carry no `format` field; a later
+/// format adds `"format": N`, which this build refuses (see
+/// `docs/FORMAT.md`) instead of reading, and re-writing, half of it.
+pub const EMBARGO_FORMAT: u32 = 1;
+
+/// Refuse an embargo record written in a newer format.
+pub fn check_embargo_format(raw: &[u8]) -> Result<()> {
+    let v: serde_json::Value = serde_json::from_slice(raw)?;
+    match v.get("format").map(|f| f.as_u64()) {
+        None => Ok(()),
+        Some(Some(f)) if f <= u64::from(EMBARGO_FORMAT) => Ok(()),
+        Some(f) => Err(VeilError::Unsupported(format!(
+            "embargo record format {} needs a newer vl (this is vl {})",
+            f.map_or("?".to_string(), |f| f.to_string()),
+            env!("CARGO_PKG_VERSION")
+        ))),
+    }
+}
+
 const RING_SIG_CONTEXT: &str = "ring-change";
 const EMBARGO_SIG_CONTEXT: &str = "embargo";
 const RELEASE_SIG_CONTEXT: &str = "embargo-release";
@@ -316,6 +335,13 @@ impl KeyRing {
     /// change was signed by an admin authorised at that point of the log.
     pub fn verify(&self) -> std::result::Result<RingState, String> {
         validate_scope_name(&self.scope).map_err(|e| e.to_string())?;
+        if self.format > RING_FORMAT {
+            return Err(format!(
+                "ring format {} needs a newer vl (this is vl {}, which reads ring formats up to {RING_FORMAT})",
+                self.format,
+                env!("CARGO_PKG_VERSION")
+            ));
+        }
         if self.is_legacy() {
             let mut members = BTreeMap::new();
             for (id, m) in &self.members {
@@ -1181,6 +1207,7 @@ impl Keychain {
     pub fn load_embargo(&self, id: &str) -> Result<Option<EmbargoRecord>> {
         match self.backend.read_opt(&Self::embargo_path(id)?)? {
             Some(b) => {
+                check_embargo_format(&b)?;
                 let r: EmbargoRecord = serde_json::from_slice(&b)?;
                 Ok((r.id == id).then_some(r))
             }

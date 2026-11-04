@@ -1,0 +1,163 @@
+//! The binary tree encoding (repository format 2) is canonical: every valid
+//! tree has exactly one encoding, decoding accepts only that encoding, and
+//! the two encodings describe the same trees (see `docs/FORMAT.md`).
+
+use proptest::prelude::*;
+use veil_core::{
+    object::{EntryKind, Object, Tree, TreeEncoding, TreeEntry, Visibility},
+    ObjectId, VeilError,
+};
+
+fn entry_strategy() -> impl Strategy<Value = TreeEntry> {
+    (
+        "[a-zA-Z0-9._ é-]{1,12}",
+        any::<bool>(),
+        any::<[u8; 32]>(),
+        prop_oneof![Just(0u64), 1u64..200, any::<u64>()],
+        any::<bool>(),
+        prop_oneof![
+            Just(Visibility::Public),
+            "[a-z]{0,8}".prop_map(|s| Visibility::Cloaked { scope: s }),
+            "[0-9a-f]{10}".prop_map(|s| Visibility::Embargoed { embargo: s }),
+        ],
+        proptest::option::of(any::<[u8; 32]>()),
+    )
+        .prop_map(|(name, dir, id, size, executable, visibility, fallback)| TreeEntry {
+            name,
+            kind: if dir { EntryKind::Dir } else { EntryKind::File },
+            id: ObjectId(id),
+            size,
+            executable,
+            visibility,
+            fallback: fallback.map(ObjectId),
+        })
+}
+
+fn tree_strategy() -> impl Strategy<Value = Tree> {
+    proptest::collection::vec(entry_strategy(), 1..20).prop_filter_map("valid names", |entries| {
+        let mut t = Tree::default();
+        for e in entries {
+            t.insert(e);
+        }
+        t.validate().ok().map(|_| t)
+    })
+}
+
+proptest! {
+    #[test]
+    fn binary_roundtrip_is_exact(t in tree_strategy()) {
+        let raw = Object::Tree(t.clone()).encode_with(TreeEncoding::Binary);
+        prop_assert_eq!(Object::tree_encoding(&raw), Some(TreeEncoding::Binary));
+        let back = match Object::decode(&raw).unwrap() { Object::Tree(t) => t, _ => unreachable!() };
+        prop_assert_eq!(&back, &t);
+        prop_assert_eq!(Object::Tree(back.clone()).encode_with(TreeEncoding::Binary), raw);
+        // Both encodings carry the same tree.
+        let json = Object::Tree(t.clone()).encode_with(TreeEncoding::Json);
+        let via_json = match Object::decode(&json).unwrap() { Object::Tree(t) => t, _ => unreachable!() };
+        prop_assert_eq!(via_json, t);
+    }
+
+    /// Any single-byte change of a valid encoding either fails to decode or
+    /// decodes to a tree whose canonical encoding is exactly the changed
+    /// bytes (a different tree, never a second encoding of the same one).
+    #[test]
+    fn mutations_never_yield_a_second_encoding(t in tree_strategy(), at in any::<prop::sample::Index>(), x in 1u8..=255) {
+        let raw = Object::Tree(t).encode_with(TreeEncoding::Binary);
+        let i = 10 + at.index(raw.len() - 10);
+        let mut m = raw.clone();
+        m[i] ^= x;
+        if let Ok(Object::Tree(d)) = Object::decode(&m) {
+            prop_assert_eq!(Object::Tree(d).encode_with(TreeEncoding::Binary), m);
+        }
+    }
+
+    /// Truncations and arbitrary bytes never panic.
+    #[test]
+    fn garbage_never_panics(body in proptest::collection::vec(any::<u8>(), 0..200)) {
+        let mut raw = b"veil:tree\n\x02".to_vec();
+        raw.extend_from_slice(&body);
+        let _ = Object::decode(&raw);
+    }
+}
+
+fn one_entry() -> Vec<u8> {
+    let mut t = Tree::default();
+    t.insert(TreeEntry {
+        name: "a".into(),
+        kind: EntryKind::File,
+        id: ObjectId([1; 32]),
+        size: 5,
+        executable: false,
+        visibility: Visibility::Public,
+        fallback: None,
+    });
+    Object::Tree(t).encode_with(TreeEncoding::Binary)
+}
+
+fn corrupt(raw: &[u8]) -> bool {
+    matches!(Object::decode(raw), Err(VeilError::Corrupt(..)))
+}
+
+#[test]
+fn non_canonical_binary_trees_are_refused() {
+    let good = one_entry();
+    // tag(10) | 02 | count | name_len | 'a' | flags | id(32) | size
+    assert_eq!(&good[10..15], &[0x02, 0x01, 0x01, b'a', 0x04]);
+    assert!(Object::decode(&good).is_ok());
+
+    let mut overlong_count = good[..11].to_vec();
+    overlong_count.extend_from_slice(&[0x81, 0x00]);
+    overlong_count.extend_from_slice(&good[12..]);
+    assert!(corrupt(&overlong_count), "non-minimal varint accepted");
+
+    let mut zero_size = good.clone();
+    let last = zero_size.len() - 1;
+    zero_size[last] = 0;
+    assert!(corrupt(&zero_size), "explicit zero size accepted");
+
+    let mut trailing = good.clone();
+    trailing.push(0);
+    assert!(corrupt(&trailing), "trailing bytes accepted");
+
+    assert!(corrupt(&good[..good.len() - 1]), "truncated tree accepted");
+    assert!(corrupt(b"veil:tree\n\x02\x00"), "empty binary tree accepted");
+
+    let mut bad_utf8 = good.clone();
+    bad_utf8[13] = 0xff;
+    assert!(corrupt(&bad_utf8), "invalid UTF-8 name accepted");
+
+    // Names are still validated, and entries must be sorted and unique.
+    let mut dot_veil = Tree::default();
+    dot_veil.entries.push(TreeEntry::dir(".veil", ObjectId([2; 32])));
+    assert!(corrupt(&Object::Tree(dot_veil).encode_with(TreeEncoding::Binary)));
+    let mut unsorted = Tree::default();
+    unsorted.entries.push(TreeEntry::dir("b", ObjectId([2; 32])));
+    unsorted.entries.push(TreeEntry::dir("a", ObjectId([2; 32])));
+    assert!(corrupt(&Object::Tree(unsorted).encode_with(TreeEncoding::Binary)));
+}
+
+#[test]
+fn the_empty_tree_is_always_format_1() {
+    let json = Object::Tree(Tree::default()).encode_with(TreeEncoding::Json);
+    assert_eq!(Object::Tree(Tree::default()).encode_with(TreeEncoding::Binary), json);
+    assert_eq!(json, b"veil:tree\n{\"entries\":[]}");
+}
+
+#[test]
+fn binary_trees_are_smaller() {
+    let mut t = Tree::default();
+    for i in 0..100 {
+        t.insert(TreeEntry {
+            name: format!("file_{i:03}.rs"),
+            kind: EntryKind::File,
+            id: ObjectId([i as u8; 32]),
+            size: 1000 + i,
+            executable: false,
+            visibility: Visibility::Public,
+            fallback: None,
+        });
+    }
+    let json = Object::Tree(t.clone()).encode_with(TreeEncoding::Json).len();
+    let bin = Object::Tree(t).encode_with(TreeEncoding::Binary).len();
+    assert!(bin * 2 < json, "binary {bin} vs JSON {json}");
+}

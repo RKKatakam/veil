@@ -48,6 +48,23 @@ use crate::{
 
 pub const PACK_MAGIC: &[u8; 8] = b"VEILPAK1";
 pub const IDX_MAGIC: &[u8; 8] = b"VEILIDX1";
+
+/// A later pack or index version (`VEILPAK2`, `VEILIDX2`, …): written by a
+/// newer vl, so "unsupported", not "corrupt".
+fn newer_magic(found: &[u8], ours: &[u8; 8]) -> Option<VeilError> {
+    let v = *found.get(7)?;
+    (found.len() >= 8 && found[..7] == ours[..7] && v.is_ascii_digit() && v > ours[7]).then(|| {
+        VeilError::Unsupported(format!(
+            "{} version {} needs a newer vl (this is vl {})",
+            if ours == PACK_MAGIC { "pack" } else { "pack index" },
+            v as char,
+            env!("CARGO_PKG_VERSION")
+        ))
+    })
+}
+
+/// Entry kinds reserved for later pack versions.
+const RESERVED_KINDS: std::ops::RangeInclusive<u8> = 3..=15;
 const HEADER_LEN: usize = 12;
 const SUM_LEN: usize = 32;
 const FANOUT_LEN: usize = 256 * 4;
@@ -177,6 +194,9 @@ impl PackIndex {
 
     pub fn decode(raw: &[u8]) -> Result<PackIndex> {
         let bad = |m: &str| corrupt("pack index", m);
+        if let Some(e) = newer_magic(raw, IDX_MAGIC) {
+            return Err(e);
+        }
         if raw.len() < HEADER_LEN + FANOUT_LEN + 2 * SUM_LEN || &raw[..8] != IDX_MAGIC {
             return Err(bad("bad header"));
         }
@@ -287,6 +307,9 @@ impl Pack {
             return Err(corrupt(what(), "pack data file is truncated"));
         }
         let header = backend.read_range(&path, 0, HEADER_LEN)?;
+        if let Some(e) = newer_magic(&header, PACK_MAGIC) {
+            return Err(e);
+        }
         if &header[..8] != PACK_MAGIC || u32_at(&header, 8) as usize != index.len() {
             return Err(corrupt(what(), "pack header does not match its index"));
         }
@@ -366,7 +389,17 @@ impl Pack {
                 &ranged
             }
         };
-        let kind = EntryKind::from_u8(raw[0]).ok_or_else(|| corrupt(self.what(), "unknown entry kind"))?;
+        let kind = EntryKind::from_u8(raw[0]).ok_or_else(|| {
+            if RESERVED_KINDS.contains(&raw[0]) {
+                VeilError::Unsupported(format!(
+                    "pack entry kind {} needs a newer vl (this is vl {})",
+                    raw[0],
+                    env!("CARGO_PKG_VERSION")
+                ))
+            } else {
+                corrupt(self.what(), "unknown entry kind")
+            }
+        })?;
         let raw_len = u64_at(raw, 1);
         let (base, data_at) = match kind {
             EntryKind::Delta if raw.len() >= 41 => (Some(id_at(raw, 9)), 41),

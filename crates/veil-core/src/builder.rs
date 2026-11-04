@@ -41,7 +41,10 @@
 //! any new content that contains one of those values is quarantined, so a
 //! command cannot launder an injected secret into history under another name.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use crate::{
     error::{Result, VeilError},
@@ -51,9 +54,27 @@ use crate::{
     secrets::{self, Finding},
     statcache::{CacheKey, CacheRun, StatCache},
     store::ObjectStore,
-    vfs::{is_temp_name, DirListing, Metadata, NodeKind, StorageBackend},
+    tree::MAX_TREE_DEPTH,
+    vfs::{is_temp_name, DirEntry, DirListing, Metadata, NodeKind, StorageBackend},
     vpath::{NameFolding, VPath},
 };
+
+/// One directory of the working copy being built (see `Builder::build_dir`).
+struct BuildFrame {
+    dir: VPath,
+    parent: Option<(Arc<Tree>, ObjectId)>,
+    entries: Vec<DirEntry>,
+    next: usize,
+    out: Tree,
+    seen: HashSet<String>,
+    /// Name of the subdirectory being built on top of this frame.
+    waiting: Option<String>,
+}
+
+enum Opened {
+    Frame(BuildFrame),
+    Done(Option<ObjectId>),
+}
 
 pub struct BuildOptions<'a> {
     pub policy: &'a Policy,
@@ -327,7 +348,7 @@ pub fn build_tree_cached(
         },
         folding: fs.name_folding(),
     };
-    let root_parent = parent.as_deref().zip(opts.parent_tree);
+    let root_parent = parent.clone().zip(opts.parent_tree);
     let id = match b.build_dir(&VPath::root(), root_parent)? {
         Some(id) => id,
         None => store.empty_tree()?,
@@ -368,19 +389,106 @@ impl Builder<'_> {
         Ok(parent)
     }
 
-    /// `parent` is the parent's tree for `dir` and its id.
-    fn build_dir(&mut self, dir: &VPath, parent: Option<(&Tree, ObjectId)>) -> Result<Option<ObjectId>> {
-        let parent_id = parent.map(|(_, id)| id);
-        let parent = parent.map(|(t, _)| t);
-        let listing = match self.fs.list_dir_full(dir) {
-            Ok(l) if self.folding.folds() => self.canonical_names(dir, l, parent),
+    /// Build the tree of directory `dir`. `parent` is the parent snapshot's
+    /// tree for `dir` and its id. Iterative: one frame per directory being
+    /// built (working copies on memory or overlay backends can nest without
+    /// bound); nesting beyond [`MAX_TREE_DEPTH`] is reported as unreadable
+    /// and keeps what was tracked.
+    fn build_dir(&mut self, dir: &VPath, parent: Option<(Arc<Tree>, ObjectId)>) -> Result<Option<ObjectId>> {
+        let mut stack = match self.open_dir(dir.clone(), parent)? {
+            Opened::Done(r) => return Ok(r),
+            Opened::Frame(f) => vec![f],
+        };
+        let mut done: Option<Option<ObjectId>> = None;
+        loop {
+            let depth = stack.len();
+            let f = stack.last_mut().expect("never empty here");
+            if let Some(name) = f.waiting.take() {
+                if let Some(id) = done.take().expect("a finished subdirectory") {
+                    f.out.insert(TreeEntry::dir(&name, id));
+                }
+            }
+            let Some(child) = f.entries.get(f.next).cloned() else {
+                let fin = stack.pop().expect("checked");
+                let id = self.finish_dir(fin)?;
+                if stack.is_empty() {
+                    return Ok(id);
+                }
+                done = Some(id);
+                continue;
+            };
+            f.next += 1;
+            // `.veil` is reserved at every depth (trees containing it are
+            // refused on decode), like Git's `.git` in nested repositories.
+            if crate::object::is_reserved_name(&child.name) {
+                continue;
+            }
+            // Crash debris of an interrupted atomic write, never content.
+            if child.kind == NodeKind::File && is_temp_name(&child.name) {
+                self.report.ignored += 1;
+                continue;
+            }
+            f.seen.insert(child.name.clone());
+            let path = f.dir.join(&child.name);
+            let parent_entry = f.parent.as_ref().and_then(|(t, _)| t.get(&child.name)).cloned();
+            match child.kind {
+                NodeKind::Dir => {
+                    let class = self.opts.policy.classify(&path, true);
+                    if class.tier == Tier::Ignored {
+                        self.report.ignored += 1;
+                        continue;
+                    }
+                    let pdir = parent_entry.filter(|e| e.kind == EntryKind::Dir);
+                    if let Some(pe) = &pdir {
+                        if self.use_hints && self.fs.known_id(&path) == Some(pe.id) {
+                            f.out.insert(pe.clone());
+                            continue;
+                        }
+                    }
+                    if depth >= MAX_TREE_DEPTH {
+                        self.report
+                            .unreadable
+                            .push((path, format!("directory nesting exceeds {MAX_TREE_DEPTH} levels")));
+                        if let Some(pe) = pdir {
+                            f.out.insert(pe);
+                        }
+                        continue;
+                    }
+                    let sub = match pdir {
+                        Some(e) => Some((self.store.tree(&e.id)?, e.id)),
+                        None => None,
+                    };
+                    match self.open_dir(path, sub)? {
+                        Opened::Done(Some(id)) => f.out.insert(TreeEntry::dir(&child.name, id)),
+                        Opened::Done(None) => {}
+                        Opened::Frame(c) => {
+                            f.waiting = Some(child.name.clone());
+                            stack.push(c);
+                        }
+                    }
+                }
+                NodeKind::File => {
+                    if let Some(e) = self.file_entry(&path, &child.name, parent_entry.as_ref())? {
+                        self.report.files += 1;
+                        f.out.insert(e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// List `dir` and start its frame, or finish at once (vanished or
+    /// unreadable directory).
+    fn open_dir(&mut self, dir: VPath, parent: Option<(Arc<Tree>, ObjectId)>) -> Result<Opened> {
+        let listing = match self.fs.list_dir_full(&dir) {
+            Ok(l) if self.folding.folds() => self.canonical_names(&dir, l, parent.as_ref().map(|(t, _)| &**t)),
             Ok(l) => l,
             // Vanished while we were building: a deletion like any other.
-            Err(e) if e.is_not_found() && !dir.is_root() => return Ok(None),
+            Err(e) if e.is_not_found() && !dir.is_root() => return Ok(Opened::Done(None)),
             // Unreadable (e.g. permission denied): keep what was tracked.
             Err(VeilError::Io { source, .. }) if !dir.is_root() => {
                 self.report.unreadable.push((dir.clone(), source.to_string()));
-                return Ok(parent_id);
+                return Ok(Opened::Done(parent.map(|(_, id)| id)));
             }
             Err(e) => return Err(e),
         };
@@ -395,7 +503,7 @@ impl Builder<'_> {
         // A tracked path that is now a symlink (or socket, device…) is never
         // followed, and is not a deletion either: keep the tracked entry.
         for name in &listing.special {
-            if let Some(pe) = parent.and_then(|t| t.get(name)) {
+            if let Some(pe) = parent.as_ref().and_then(|(t, _)| t.get(name)) {
                 let path = dir.join(name);
                 let tier = self.opts.policy.classify(&path, pe.kind == EntryKind::Dir).tier;
                 if matches!(tier, Tier::Ignored | Tier::Isolated) {
@@ -406,51 +514,21 @@ impl Builder<'_> {
                 out.insert(pe.clone());
             }
         }
-        for child in listing.entries {
-            // `.veil` is reserved at every depth (trees containing it are
-            // refused on decode), like Git's `.git` in nested repositories.
-            if crate::object::is_reserved_name(&child.name) {
-                continue;
-            }
-            // Crash debris of an interrupted atomic write, never content.
-            if child.kind == NodeKind::File && is_temp_name(&child.name) {
-                self.report.ignored += 1;
-                continue;
-            }
-            seen.insert(child.name.clone());
-            let path = dir.join(&child.name);
-            let parent_entry = parent.and_then(|t| t.get(&child.name));
-            match child.kind {
-                NodeKind::Dir => {
-                    let class = self.opts.policy.classify(&path, true);
-                    if class.tier == Tier::Ignored {
-                        self.report.ignored += 1;
-                        continue;
-                    }
-                    if let Some(pe) = parent_entry.filter(|e| e.kind == EntryKind::Dir) {
-                        if self.use_hints && self.fs.known_id(&path) == Some(pe.id) {
-                            out.insert(pe.clone());
-                            continue;
-                        }
-                    }
-                    let sub = match parent_entry.filter(|e| e.kind == EntryKind::Dir) {
-                        Some(e) => Some((self.store.tree(&e.id)?, e.id)),
-                        None => None,
-                    };
-                    if let Some(id) = self.build_dir(&path, sub.as_ref().map(|(t, id)| (&**t, *id)))? {
-                        out.insert(TreeEntry::dir(&child.name, id));
-                    }
-                }
-                NodeKind::File => {
-                    if let Some(e) = self.file_entry(&path, &child.name, parent_entry)? {
-                        self.report.files += 1;
-                        out.insert(e);
-                    }
-                }
-            }
-        }
+        Ok(Opened::Frame(BuildFrame {
+            dir,
+            parent,
+            entries: listing.entries,
+            next: 0,
+            out,
+            seen,
+            waiting: None,
+        }))
+    }
+
+    fn finish_dir(&mut self, f: BuildFrame) -> Result<Option<ObjectId>> {
+        let BuildFrame { dir, parent, mut out, seen, .. } = f;
         // Entries we could never have materialised are not deletions.
-        if let Some(p) = parent {
+        if let Some((p, _)) = &parent {
             for e in &p.entries {
                 if !seen.contains(&e.name) {
                     if let Some(c) = self.carry_unreadable(e, &dir.join(&e.name))? {
@@ -463,13 +541,14 @@ impl Builder<'_> {
             return Ok(None);
         }
         // Unchanged directory: same entries, same id, already stored. Skips
-        // encoding, hashing and the existence check for most directories.
-        if let (Some(p), Some(id)) = (parent, parent_id) {
-            if *p == out {
-                return Ok(Some(id));
+        // encoding, hashing and the existence check for most directories,
+        // and keeps the id of a tree written in an older format.
+        if let Some((p, id)) = &parent {
+            if **p == out {
+                return Ok(Some(*id));
             }
         }
-        self.report_collisions(dir, &out, parent);
+        self.report_collisions(&dir, &out, parent.as_ref().map(|(t, _)| &**t));
         Ok(Some(self.store.put_tree(&out)?))
     }
 
@@ -541,31 +620,73 @@ impl Builder<'_> {
         }
     }
 
+    /// What to keep of a tracked entry that is not in the working copy:
+    /// everything this reader could not have materialised. Iterative over
+    /// stored trees (a tampered `.veil/` may nest without bound; beyond
+    /// [`MAX_TREE_DEPTH`] the subtree is carried whole).
     fn carry_unreadable(&mut self, e: &TreeEntry, path: &VPath) -> Result<Option<TreeEntry>> {
-        match e.kind {
-            EntryKind::File => {
-                if self.store.entry_readable(e) {
-                    Ok(None)
-                } else {
-                    self.report.carried.push(path.clone());
-                    Ok(Some(e.clone()))
-                }
-            }
-            EntryKind::Dir => {
-                let Ok(tree) = self.store.tree(&e.id) else {
-                    self.report.carried.push(path.clone());
-                    return Ok(Some(e.clone()));
-                };
-                let mut kept = Tree::default();
-                for c in &tree.entries {
-                    if let Some(k) = self.carry_unreadable(c, &path.join(&c.name))? {
-                        kept.insert(k);
+        struct Frame {
+            entry: TreeEntry,
+            path: VPath,
+            tree: Arc<Tree>,
+            next: usize,
+            kept: Tree,
+        }
+        let open = |b: &mut Self, e: &TreeEntry, path: &VPath, depth: usize| -> Result<std::result::Result<Frame, Option<TreeEntry>>> {
+            match e.kind {
+                EntryKind::File => {
+                    if b.store.entry_readable(e) {
+                        Ok(Err(None))
+                    } else {
+                        b.report.carried.push(path.clone());
+                        Ok(Err(Some(e.clone())))
                     }
                 }
-                if kept.is_empty() {
-                    return Ok(None);
+                EntryKind::Dir => match b.store.tree(&e.id) {
+                    Ok(tree) if depth < MAX_TREE_DEPTH => Ok(Ok(Frame {
+                        entry: e.clone(),
+                        path: path.clone(),
+                        tree,
+                        next: 0,
+                        kept: Tree::default(),
+                    })),
+                    _ => {
+                        b.report.carried.push(path.clone());
+                        Ok(Err(Some(e.clone())))
+                    }
+                },
+            }
+        };
+        let mut stack = match open(self, e, path, 0)? {
+            Err(r) => return Ok(r),
+            Ok(f) => vec![f],
+        };
+        loop {
+            let depth = stack.len();
+            let f = stack.last_mut().expect("never empty here");
+            let Some(c) = f.tree.entries.get(f.next).cloned() else {
+                let fin = stack.pop().expect("checked");
+                let r = if fin.kept.is_empty() {
+                    None
+                } else {
+                    Some(TreeEntry::dir(&fin.entry.name, self.store.put_tree(&fin.kept)?))
+                };
+                match stack.last_mut() {
+                    None => return Ok(r),
+                    Some(p) => {
+                        if let Some(k) = r {
+                            p.kept.insert(k);
+                        }
+                    }
                 }
-                Ok(Some(TreeEntry::dir(&e.name, self.store.put_tree(&kept)?)))
+                continue;
+            };
+            f.next += 1;
+            let cpath = f.path.join(&c.name);
+            match open(self, &c, &cpath, depth)? {
+                Err(Some(k)) => stack.last_mut().expect("checked").kept.insert(k),
+                Err(None) => {}
+                Ok(child) => stack.push(child),
             }
         }
     }

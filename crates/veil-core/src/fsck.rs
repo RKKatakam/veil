@@ -44,6 +44,7 @@ use crate::{
     oplog::Operation,
     repo::{Repo, RepoConfig},
     store::ObjectStore,
+    tree::MAX_TREE_DEPTH,
     vfs::{NodeKind, StorageBackend},
     vpath::VPath,
 };
@@ -202,18 +203,28 @@ pub fn fsck_repo(repo: &Repo) -> Result<FsckReport> {
 pub fn fsck(backend: Arc<dyn StorageBackend>, identity: Option<Identity>) -> Result<FsckReport> {
     let mut report = FsckReport::default();
     let config = backend.read(&vpath(".veil/repo.json"))?;
-    let repo_id = match serde_json::from_slice::<RepoConfig>(&config) {
-        Ok(c) => c.repo_id,
+    let (repo_id, format) = match serde_json::from_slice::<RepoConfig>(&config) {
+        Ok(c) => (c.repo_id, c.format),
         Err(e) => {
             report.findings.push(Finding {
                 severity: Severity::Corrupt,
                 message: format!(".veil/repo.json cannot be parsed: {e}"),
             });
-            String::new()
+            (String::new(), crate::repo::REPO_FORMAT)
         }
     };
+    if let Err(e) = crate::repo::check_format_supported(format) {
+        report.findings.push(Finding {
+            severity: Severity::Corrupt,
+            message: e.to_string(),
+        });
+    }
     let keys = Arc::new(Keychain::new(backend.clone(), identity, repo_id));
     let store = ObjectStore::new(backend.clone(), vpath(".veil/objects"), keys.clone());
+    store.set_format(format);
+    // Read-only: looking at gc-pending objects must not write keep markers
+    // or loose copies (that would also rescue garbage from the next gc).
+    store.set_freshening(false);
     let mut c = Checker {
         backend,
         store,
@@ -323,6 +334,18 @@ impl Checker {
                 );
             }
             return Load::Bad;
+        }
+        if let Some(enc) = Object::tree_encoding(&raw) {
+            if first && enc.min_repo_format() > self.store.format() {
+                self.push(
+                    Severity::Corrupt,
+                    format!(
+                        "object {id}: a format-{} tree in a format-{} repository (older vl cannot read it)",
+                        enc.min_repo_format(),
+                        self.store.format()
+                    ),
+                );
+            }
         }
         match Object::decode(&raw) {
             Ok(o) => Load::Obj(o),
@@ -447,9 +470,30 @@ impl Checker {
         }
     }
 
+    /// Check the tree `id` and everything below it. Iterative: the depth of
+    /// a tampered `.veil/` is unbounded, so nesting beyond
+    /// [`MAX_TREE_DEPTH`] is reported instead of followed.
     fn check_tree(&mut self, id: ObjectId, path: &str, redactable: bool) {
+        let mut stack = vec![(id, path.to_string(), redactable, 0usize)];
+        while let Some((id, path, redactable, depth)) = stack.pop() {
+            if depth > MAX_TREE_DEPTH {
+                self.push(
+                    Severity::Corrupt,
+                    format!("directory {path}: nesting exceeds {MAX_TREE_DEPTH} levels; not followed"),
+                );
+                continue;
+            }
+            let children = self.check_tree_node(id, &path, redactable);
+            // Reverse, so that entries are visited in tree order.
+            stack.extend(children.into_iter().rev().map(|(id, p, r)| (id, p, r, depth + 1)));
+        }
+    }
+
+    /// Check one tree node; returns the trees below it still to visit.
+    fn check_tree_node(&mut self, id: ObjectId, path: &str, redactable: bool) -> Vec<(ObjectId, String, bool)> {
+        let mut next = Vec::new();
         if !self.seen_trees.insert(id) {
-            return;
+            return next;
         }
         let obj = match self.load(&id) {
             Load::Obj(o) => o,
@@ -460,9 +504,9 @@ impl Checker {
                     Severity::Corrupt
                 };
                 self.note_missing(id, sev, format!("directory {path}: tree {id} is missing"));
-                return;
+                return next;
             }
-            Load::Bad => return,
+            Load::Bad => return next,
         };
         let tree = match self.unseal(&id, obj, path) {
             Some(Object::Tree(t)) => t,
@@ -475,18 +519,18 @@ impl Checker {
                         o.kind_name()
                     ),
                 );
-                return;
+                return next;
             }
-            None => return,
+            None => return next,
         };
         self.report.trees += 1;
         // An embargo wrapper: its sealed side (withheld until release) and
         // its fallback, plus the listed objects only the sealed side reaches.
         if let Some(w) = crate::embargo::wrapper_parts(&tree) {
             self.check_embargo_known(&w.embargo);
-            self.check_tree(w.inner, &format!("{path} (under embargo {})", w.embargo), true);
-            self.check_tree(w.fallback, path, false);
-            return;
+            next.push((w.inner, format!("{path} (under embargo {})", w.embargo), true));
+            next.push((w.fallback, path.to_string(), false));
+            return next;
         }
         let mut prev: Option<&str> = None;
         for e in &tree.entries {
@@ -523,10 +567,11 @@ impl Checker {
                 format!("{path}/{}", e.name)
             };
             match e.kind {
-                EntryKind::Dir => self.check_tree(e.id, &child, !e.visibility.is_public()),
+                EntryKind::Dir => next.push((e.id, child, !e.visibility.is_public())),
                 EntryKind::File => self.check_file(e, &child),
             }
         }
+        next
     }
 
     fn check_embargo_known(&mut self, embargo: &str) {
