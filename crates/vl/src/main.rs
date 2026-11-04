@@ -24,7 +24,7 @@ use veil_core::{
     secrets,
     tree::lookup,
     vfs::{walk_files, NodeKind},
-    DiskBackend, Identity, Repo, StorageBackend, VPath,
+    DiskBackend, Identity, Repo, SftpBackend, SshUrl, StorageBackend, VPath,
 };
 
 use crate::{
@@ -235,8 +235,8 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         }
         Cmd::Watch { interval_ms } => cmd_watch(ctx, *interval_ms)?,
         Cmd::Remote(c) => cmd_remote(ctx, c)?,
-        Cmd::Push { remote, tag, force } => cmd_push(ctx, remote, tag, *force)?,
-        Cmd::Pull { remote } => cmd_pull(ctx, remote)?,
+        Cmd::Push { remote, tag, force, full } => cmd_push(ctx, remote, tag, *force, *full)?,
+        Cmd::Pull { remote, full } => cmd_pull(ctx, remote, *full)?,
         Cmd::Gc {
             keep_ops_days,
             grace_minutes,
@@ -288,32 +288,57 @@ fn cmd_init(path: Option<&Path>) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_clone(source: &Path, dest: Option<&Path>) -> Result<ExitCode> {
-    let source = source
-        .canonicalize()
-        .with_context(|| format!("remote {} not found", source.display()))?;
+fn cmd_clone(source: &str, dest: Option<&Path>) -> Result<ExitCode> {
+    // An SSH remote, or a local path.
+    let (backend, url, shown): (Arc<dyn StorageBackend>, String, String) = match SshUrl::parse(source) {
+        Some(url) => {
+            let url = url?;
+            let name = url
+                .last_component()
+                .ok_or_else(|| anyhow!("cannot derive a directory name from {source}; give one"))?
+                .to_string();
+            let dest = dest.map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(name));
+            return clone_into(connect_sftp(&url)?, source.to_string(), url.to_string(), &dest);
+        }
+        None => {
+            let path = Path::new(source)
+                .canonicalize()
+                .with_context(|| format!("remote {source} not found"))?;
+            let shown = path.display().to_string();
+            (Arc::new(DiskBackend::new(&path)), shown.clone(), shown)
+        }
+    };
     let dest = match dest {
         Some(d) => d.to_path_buf(),
-        None => PathBuf::from(source.file_name().ok_or_else(|| anyhow!("cannot derive a directory name"))?),
+        None => PathBuf::from(
+            Path::new(&url)
+                .file_name()
+                .ok_or_else(|| anyhow!("cannot derive a directory name"))?,
+        ),
     };
-    if dest.exists() && std::fs::read_dir(&dest)?.next().is_some() {
+    clone_into(backend, url, shown, &dest)
+}
+
+fn connect_sftp(url: &SshUrl) -> Result<Arc<dyn StorageBackend>> {
+    Ok(Arc::new(
+        SftpBackend::connect(url).with_context(|| format!("connecting to {url}"))?,
+    ))
+}
+
+/// Clone the repository on `backend` (configured as `origin` → `url`) into `dest`.
+fn clone_into(backend: Arc<dyn StorageBackend>, url: String, shown: String, dest: &Path) -> Result<ExitCode> {
+    if dest.exists() && std::fs::read_dir(dest)?.next().is_some() {
         bail!("destination {} is not empty", dest.display());
     }
-    std::fs::create_dir_all(&dest)?;
+    std::fs::create_dir_all(dest)?;
     let dest = dest.canonicalize()?;
     let identity = load_identity()?;
     let fs = Arc::new(DiskBackend::new(&dest));
     let mut repo = Repo::init_for_clone(fs.clone(), Some(identity.clone()), &user_for(&identity))?;
     let mut config = repo.config().clone();
-    config.remotes.insert(
-        "origin".into(),
-        RemoteConfig {
-            url: source.display().to_string(),
-            public: false,
-        },
-    );
+    config.remotes.insert("origin".into(), RemoteConfig { url, public: false });
     repo.save_config(config)?;
-    let report = remote::pull(&mut repo, "origin", Arc::new(DiskBackend::new(&source)))?;
+    let report = remote::pull(&mut repo, "origin", backend)?;
     for w in &report.warnings {
         warn_untrusted(w);
     }
@@ -334,7 +359,7 @@ fn cmd_clone(source: &Path, dest: Option<&Path>) -> Result<ExitCode> {
     )?;
     println!(
         "Cloned {} into {} ({} objects, {} files)",
-        source.display(),
+        safe(&shown),
         dest.display(),
         report.objects_copied,
         co.written
@@ -1333,7 +1358,7 @@ fn cmd_watch(ctx: &mut Ctx, interval_ms: u64) -> Result<()> {
 
 // ---- sync ----------------------------------------------------------------
 
-fn remote_backend(ctx: &Ctx, name: &str) -> Result<(Arc<DiskBackend>, RemoteConfig)> {
+fn remote_backend(ctx: &Ctx, name: &str) -> Result<(Arc<dyn StorageBackend>, RemoteConfig)> {
     let r = ctx
         .repo
         .config()
@@ -1341,6 +1366,9 @@ fn remote_backend(ctx: &Ctx, name: &str) -> Result<(Arc<DiskBackend>, RemoteConf
         .get(name)
         .cloned()
         .ok_or_else(|| anyhow!("no remote named '{name}' (add one with `vl remote add {name} <path>`)"))?;
+    if let Some(url) = SshUrl::parse(&r.url) {
+        return Ok((connect_sftp(&url?)?, r));
+    }
     let path = PathBuf::from(&r.url);
     let path = if path.is_absolute() { path } else { ctx.root.join(path) };
     Ok((Arc::new(DiskBackend::new(path)), r))
@@ -1352,6 +1380,9 @@ fn cmd_remote(ctx: &mut Ctx, c: &RemoteCmd) -> Result<()> {
         RemoteCmd::Add { name, url, public } => {
             if config.remotes.contains_key(name) {
                 bail!("remote '{name}' already exists");
+            }
+            if let Some(parsed) = SshUrl::parse(url) {
+                parsed?;
             }
             config.remotes.insert(
                 name.clone(),
@@ -1381,9 +1412,10 @@ fn cmd_remote(ctx: &mut Ctx, c: &RemoteCmd) -> Result<()> {
     Ok(())
 }
 
-fn cmd_push(ctx: &mut Ctx, name: &str, tags: &[String], force: bool) -> Result<()> {
+fn cmd_push(ctx: &mut Ctx, name: &str, tags: &[String], force: bool, full: bool) -> Result<()> {
     let (backend, cfg) = remote_backend(ctx, name)?;
-    let r = remote::push(&mut ctx.repo, backend, cfg.public, tags, force)?;
+    let opts = remote::SyncOptions { full };
+    let r = remote::push_with(&mut ctx.repo, backend, cfg.public, tags, force, &opts)?;
     for (t, id) in &r.tags_updated {
         println!("  {} {} → {}", green("pushed"), cyan(&safe(t)), id.short());
     }
@@ -1406,9 +1438,9 @@ fn cmd_push(ctx: &mut Ctx, name: &str, tags: &[String], force: bool) -> Result<(
     Ok(())
 }
 
-fn cmd_pull(ctx: &mut Ctx, name: &str) -> Result<()> {
+fn cmd_pull(ctx: &mut Ctx, name: &str, full: bool) -> Result<()> {
     let (backend, _) = remote_backend(ctx, name)?;
-    let r = remote::pull(&mut ctx.repo, name, backend)?;
+    let r = remote::pull_with(&mut ctx.repo, name, backend, &remote::SyncOptions { full })?;
     for (t, id) in &r.tags_updated {
         println!("  {} {} → {}", green("updated"), cyan(&safe(t)), id.short());
     }
