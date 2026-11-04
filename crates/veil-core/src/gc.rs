@@ -180,7 +180,9 @@ fn op_path(id: &ObjectId) -> VPath {
 /// The CLI diffs the working copy against it, so it must survive gc even if
 /// no retained view references it any more.
 fn checkout_snapshot(backend: &dyn StorageBackend) -> Option<ObjectId> {
-    let raw = backend.read_opt(&VPath::new(".veil/local/checkout.json").ok()?).ok()??;
+    let raw = backend
+        .read_opt(&VPath::new(".veil/local/checkout.json").ok()?)
+        .ok()??;
     let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
     ObjectId::from_hex(v.get("snapshot")?.as_str()?).ok()
 }
@@ -294,11 +296,13 @@ impl Mark<'_> {
                 }
                 Ok(_) => {
                     self.reach.insert(id);
-                    self.incomplete.push(format!("kept object {} is a sealed non-tree", id.short()));
+                    self.incomplete
+                        .push(format!("kept object {} is a sealed non-tree", id.short()));
                 }
                 Err(e) => {
                     self.reach.insert(id);
-                    self.incomplete.push(format!("kept object {} cannot be opened: {e}", id.short()));
+                    self.incomplete
+                        .push(format!("kept object {} cannot be opened: {e}", id.short()));
                 }
             },
             Err(e) => self.incomplete.push(format!("kept object {}: {e}", id.short())),
@@ -449,7 +453,11 @@ pub fn gc(repo: &mut Repo, opts: &GcOptions) -> Result<GcReport> {
             prev = Some((*id, raw));
         }
     }
-    let mut rest: Vec<ObjectId> = inventory.iter().filter(|id| keep(id) && !pb.contains(id)).copied().collect();
+    let mut rest: Vec<ObjectId> = inventory
+        .iter()
+        .filter(|id| keep(id) && !pb.contains(id))
+        .copied()
+        .collect();
     rest.sort();
     for id in rest {
         pb.add(id, &store.read_raw(&id)?, None)?;

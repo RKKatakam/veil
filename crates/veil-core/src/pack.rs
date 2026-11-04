@@ -433,7 +433,10 @@ impl Pack {
 
     fn check(&self, id: &ObjectId, raw_len: u64, raw: Vec<u8>) -> Result<Vec<u8>> {
         if raw.len() as u64 != raw_len || ObjectId::hash(&raw) != *id {
-            return Err(corrupt(id.hex(), format!("content does not match its id (in {})", self.what())));
+            return Err(corrupt(
+                id.hex(),
+                format!("content does not match its id (in {})", self.what()),
+            ));
         }
         Ok(raw)
     }

@@ -97,6 +97,7 @@ Workspaces   ws list|new <name> [-r rev] [--cloak [S]]|switch <name>|rm <name>
 Op log       op log [-n N] · op restore <id> · undo · watch [--interval-ms N]
 Sync         remote add <name> <path> [--public]|list|rm · push [remote] [-t tag…] [--force]
              pull [remote]
+Maintenance  gc [--keep-ops-days N] [--grace-minutes M | --prune-now] [--level L] [--no-deltas]
 ```
 
 Revisions: `@` (working copy), `name@` (another workspace), `root`, tags,
@@ -127,7 +128,8 @@ crates/
     src/identity.rs   X25519 identities, key wrapping
     src/keychain.rs   scope key rings, embargo records, the `local` scope
     src/object.rs     Blob / Tree / Snapshot / Sealed objects
-    src/store.rs      BLAKE3 CAS with transparent decryption
+    src/store.rs      BLAKE3 CAS with transparent decryption, bounded caches
+    src/pack.rs       packfiles (zstd, deltas, fan-out index)   src/gc.rs  garbage collection
     src/policy.rs     visibility tiers   src/secrets.rs  secret scanner
     src/builder.rs    working copy → tree (policy enforcement point)
     src/checkout.rs   tree → working copy    src/merge.rs  3-way tree merge

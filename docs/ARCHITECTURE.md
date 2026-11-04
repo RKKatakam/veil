@@ -15,7 +15,7 @@ below it, and nothing above the VFS layer knows a disk exists.
 ├──────────────────────────────────────────────────────────────────────┤
 │ Policy    policy (.veilpolicy tiers) · secrets (scanner)             │
 ├──────────────────────────────────────────────────────────────────────┤
-│ CAS       object · store (BLAKE3, transparent unsealing)             │
+│ CAS       object · store (BLAKE3, unsealing) · pack · gc             │
 ├──────────────────────────────────────────────────────────────────────┤
 │ Crypto    crypto (VeilEnvelope) · identity (X25519) · keychain       │
 ├──────────────────────────────────────────────────────────────────────┤
@@ -25,7 +25,7 @@ below it, and nothing above the VFS layer knows a disk exists.
 
 ## 1. VFS layer
 
-`StorageBackend` is a small synchronous trait (`read`, `write`,
+`StorageBackend` is a small synchronous trait (`read`, `read_range`, `write`,
 `create_new`, `list_dir`, `metadata`, `remove_*`, `set_executable`, plus an
 optional `known_id` hint). The trait takes `&self`, so a backend can be
 shared as `Arc<dyn StorageBackend>`.
@@ -62,6 +62,12 @@ veil:tree\n   JSON { entries: [ {name, kind, id, size, executable, visibility, f
 veil:snap\n   JSON Snapshot
 veil:seal\n   u16 scope_len | scope | nonce[24] | XChaCha20-Poly1305(ciphertext of an encoded object)
 ```
+
+Objects are stored *loose* (`.veil/objects/ab/cdef…`, the canonical
+encoding as-is) until `vl gc` moves them into a *pack* (§9). Lookups check
+loose objects first, then packs. Either way the id is the BLAKE3 of the
+canonical, uncompressed encoding, and `get_raw` / `put_raw` always return and
+accept that encoding, so sync and fsck never see compression.
 
 Sealed objects describe themselves: the envelope names the scope that opens
 it. `ObjectStore::open` peels sealed layers using the keychain. A missing key
@@ -210,6 +216,110 @@ be pushed at all, because it was never in the graph. Key rings and embargo
 records are merged as unions; a released key wins. Tags fast-forward. A
 diverged tag is reported and left alone (`--force` overrides on push).
 
+## 9. Storage: packfiles, caches and garbage collection
+
+### Pack format
+
+A pack is two files in `.veil/objects/pack/`, both named after the BLAKE3
+checksum of the pack data. All integers are little-endian.
+
+```text
+pack-<sum>.pack   "VEILPAK1" | count u32 | entry* | BLAKE3(all preceding bytes)
+  entry           kind u8 | raw_len u64 | [base id: 32 bytes, deltas only] | data
+    0 stored      data = canonical encoding (sealed objects, incompressible data)
+    1 zstd        data = zstd frame of the canonical encoding
+    2 delta       data = zstd frame compressed with the canonical encoding of
+                  `base` (in the same pack) as a raw-content dictionary
+
+pack-<sum>.idx    "VEILIDX1" | count u32 | fanout[256] u32 | ids[count] (sorted)
+                  | offsets[count] u64 | lengths[count] u64 | pack sum | BLAKE3(all preceding bytes)
+```
+
+* **Lookup.** `fanout[b]` counts ids whose first byte is `<= b`. A lookup
+  is one fan-out step, then a binary search over one bucket, then a ranged
+  read (`StorageBackend::read_range`) of one entry. A process that reads a
+  pack often (more than 64 entries; packs up to 256 MiB) loads it into memory
+  once instead.
+* **Deltas.** A zstd frame "compressed against" the base object as a
+  dictionary is a compact delta with no extra code. GC groups objects by the
+  path where it found them (files and directories separately), newest version
+  first, and tries each version against the previous one. A delta is kept
+  only if it beats plain zstd by more than an eighth. Chains are at most 10
+  deep, so recent versions are cheap to read and old ones are deltas. Bases
+  met while reading go into a bounded cache.
+* **Sealed objects** are stored as they are: ciphertext does not compress,
+  and deltas between ciphertexts never help.
+* **Integrity.** Opening a pack checks the index checksum, that the index
+  names this pack, the pack header and trailer, and that every entry lies
+  inside the file. Every object read is decompressed and **re-hashed against
+  its id**, so a flipped bit, a truncated file or a wrong base surfaces as
+  `Corrupt`, never as wrong content. If a pack cannot be opened, lookups
+  that miss report `Corrupt` rather than `Missing`, because "missing" means
+  "redacted" to the rest of the engine. `ObjectStore::verify_packs` does a
+  full check, and `gc` refuses to run on a store with a broken pack.
+* **Atomic publication.** The `.pack` is written before its `.idx`, and
+  readers find packs only through `.idx` files. Old packs are removed index
+  first. A reader whose pack disappears (a concurrent gc replaced it)
+  rescans the pack directory and retries.
+
+### Caches
+
+`ObjectStore` keeps decoded trees, snapshots and decompressed delta bases in
+weight-bounded LRU caches (`cache.rs`). A tree weighs `entries + 1`, a
+snapshot 1, a base its size in bytes. The defaults are 200k tree entries,
+20k snapshots and 64 MiB of bases, adjustable with
+`ObjectStore::set_cache_limits`.
+
+### Garbage collection (`vl gc`)
+
+`gc` holds the repository lock (`RepoLock`) for its whole run and works in
+this order:
+
+1. **Inventory.** List every loose and packed object *before* looking at
+   reachability. Objects written after this point, for example by a `vl`
+   process that is building a snapshot and waiting for the lock, are not in
+   the inventory, so gc never touches them.
+2. **Op-log pruning** (`--keep-ops-days N`, off by default). Delete
+   operations older than the window. The current operation and its parents
+   are always kept, so `vl undo` works and can itself be undone. `op log`
+   and op-id prefixes end where the log was pruned.
+3. **Mark.** The roots are the views of every retained operation (heads,
+   workspaces, tags, remote tags), the universal root, the project
+   directory's checkout pointer (`.veil/local/checkout.json`; the CLI diffs
+   the working copy against it), and keep markers. From there gc walks
+   snapshot → parents and tree, tree → entries, and file entry → object and
+   embargo `fallback`. An embargoed entry's pre-merge content is therefore
+   kept even after the fallback becomes its only reference. Snapshot
+   `predecessors` (the evolution log) are weak references, as they already
+   are for sync: `vl evolog` stops where history was collected.
+4. **Grace period, two phases.** An unreachable object is first recorded in
+   `objects/gc/pending` with the time gc first saw it unreachable. A later
+   gc deletes it only if it is still unreachable after `--grace-minutes`
+   (default 60). `--prune-now` sets the grace period to zero.
+5. **Freshening.** Any process that touches a pending object through `has`,
+   `get_raw`, `put` or `put_raw` writes a keep marker
+   `objects/gc/keep/<id>` and then makes sure a loose copy exists, in that
+   order. Markers are roots for the next gc, and a kept object's grace period
+   restarts. Each loose object gc deletes goes through three steps: read it,
+   delete it, then check for a marker; if a marker appeared, gc restores it.
+   Packed garbage needs no such step: the freshening process has its own
+   loose copy. So a process that starts using an object in the middle of a
+   gc keeps it, unless that process runs longer than the grace period.
+6. **Repack.** Write one new pack with everything kept: reachable objects
+   plus pending ones. Then delete the pruned ops, the now-packed loose files
+   and the old packs, and finally write the new pending list.
+7. **Refuse to guess.** If any operation, snapshot or tree on the way cannot
+   be read (missing, corrupt, or sealed without a key), gc still packs but
+   deletes nothing, and reports why.
+
+Benchmark (`cargo test --release -p veil-core --test storage_bench --
+--ignored --nocapture`): 3,000 source files, 300 commits and 30 abandoned
+experiments, about 8,000 objects. They take 36.5 MiB loose and 3.2 MiB after
+`vl gc` (8.5 MiB without deltas), or 2.6 MiB once the experiments are
+pruned. Reading every object costs about 2.3 µs each loose and 6.5 µs each
+packed, with a warm page cache. The packed cost is zstd decompression, the
+BLAKE3 verification that loose reads skip, and the loose-first probe.
+
 ## Threat model (MVP)
 
 **Protected against:**
@@ -239,8 +349,10 @@ diverged tag is reported and left alone (`--force` overrides on push).
   `StorageBackend`). Next is an HTTP/QUIC object protocol with
   have/want negotiation.
 * Performance: a stat cache (mtime and size → entry) for `DiskBackend`
-  snapshots, packfiles with zstd, and incremental push instead of a full
-  graph walk.
+  snapshots, and incremental push instead of a full graph walk. `gc`
+  always rewrites everything into one pack, built in memory; incremental
+  packing (small packs merged geometrically), streaming pack writes and
+  cross-pack deltas are next. Sync sends canonical objects, not packs.
 * Sealed directory nodes (hide names), scope key rotation, and per-snapshot
   signatures with the identity key.
 * First-class conflicts (jj-style) instead of conflict markers.

@@ -139,7 +139,14 @@ mod tests {
         c.insert(id(4), 4, 11); // heavier than the capacity: not cached
         assert_eq!(c.get(&id(4)), None);
         c.insert(id(1), 10, 2); // replace keeps the weight accounting exact
-        assert_eq!(c.stats(), CacheStats { entries: 2, weight: 6, capacity: 10 });
+        assert_eq!(
+            c.stats(),
+            CacheStats {
+                entries: 2,
+                weight: 6,
+                capacity: 10
+            }
+        );
         c.set_capacity(3);
         assert_eq!(c.stats().entries, 1);
         assert_eq!(c.get(&id(1)), Some(10));

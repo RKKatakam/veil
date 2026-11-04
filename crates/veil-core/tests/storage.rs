@@ -76,7 +76,9 @@ fn assert_history_intact(repo: &Repo) {
         if !seen.insert(id) {
             continue;
         }
-        let s = store.snapshot(&id).unwrap_or_else(|e| panic!("snapshot {}: {e}", id.short()));
+        let s = store
+            .snapshot(&id)
+            .unwrap_or_else(|e| panic!("snapshot {}: {e}", id.short()));
         snaps.extend(s.parents.iter().copied());
         trees.push(s.tree);
     }
@@ -90,7 +92,9 @@ fn assert_history_intact(repo: &Repo) {
                 EntryKind::Dir => trees.push(e.id),
                 EntryKind::File => {
                     for id in std::iter::once(e.id).chain(e.fallback) {
-                        let raw = store.get_raw(&id).unwrap_or_else(|err| panic!("{} {}: {err}", e.name, id.short()));
+                        let raw = store
+                            .get_raw(&id)
+                            .unwrap_or_else(|err| panic!("{} {}: {err}", e.name, id.short()));
                         assert_eq!(ObjectId::hash(&raw), id);
                     }
                 }
@@ -104,7 +108,8 @@ fn history(repo: &mut Repo, fs: &MemoryBackend, files: usize, snapshots: usize) 
         for f in 0..files {
             if f % 3 == s % 3 || s == 0 {
                 let body: String = (0..40).map(|l| format!("file {f} line {l} rev {}\n", s / 3)).collect();
-                fs.write(&p(&format!("src/m{}/f{f}.txt", f % 4)), body.as_bytes()).unwrap();
+                fs.write(&p(&format!("src/m{}/f{f}.txt", f % 4)), body.as_bytes())
+                    .unwrap();
             }
         }
         snap(repo, fs);
@@ -149,7 +154,9 @@ fn pack_round_trip_every_object_kind() {
 fn pack_builder_stores_incompressible_and_sealed_objects_raw() {
     let fs = MemoryBackend::new();
     let dir = p("objects/pack");
-    let noise: Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+    let noise: Vec<u8> = (0..4096u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
     let blob = Object::Blob(noise).encode();
     let id = ObjectId::hash(&blob);
     let mut pb = PackBuilder::new(3).unwrap();
@@ -175,13 +182,23 @@ fn mixed_loose_and_packed_store() {
     let stats = repo.store().stats().unwrap();
     assert!(stats.loose_objects > 0 && stats.packs == 1);
     assert_eq!(read_file(&repo, &wc, "src/new.txt").unwrap(), b"fresh\n");
-    assert!(read_file(&repo, &wc, "src/m0/f0.txt").is_some(), "packed content still reads");
+    assert!(
+        read_file(&repo, &wc, "src/m0/f0.txt").is_some(),
+        "packed content still reads"
+    );
     assert!(repo.store().has(&packed_wc));
 
     // An object both loose and packed reads fine and is listed once.
     let raw = repo.store().get_raw(&packed_wc).unwrap();
-    fs.write(&p(&format!(".veil/objects/{}/{}", &packed_wc.hex()[..2], &packed_wc.hex()[2..])), &raw)
-        .unwrap();
+    fs.write(
+        &p(&format!(
+            ".veil/objects/{}/{}",
+            &packed_wc.hex()[..2],
+            &packed_wc.hex()[2..]
+        )),
+        &raw,
+    )
+    .unwrap();
     let ids = repo.store().list_objects().unwrap();
     assert_eq!(ids.iter().filter(|i| **i == packed_wc).count(), 1);
 
@@ -212,7 +229,10 @@ fn other_process_survives_a_repack() {
     snap(&mut repo, &fs);
     gc(&mut repo, &now_gc()).unwrap();
     other.store().snapshot(&repo.workspace_wc(WS).unwrap()).unwrap();
-    assert!(read_file(&other, &wc, "src/m2/f2.txt").is_some(), "re-scans packs after they vanish");
+    assert!(
+        read_file(&other, &wc, "src/m2/f2.txt").is_some(),
+        "re-scans packs after they vanish"
+    );
 }
 
 #[test]
@@ -363,7 +383,9 @@ fn gc_keeps_embargo_fallbacks_that_are_the_only_reference() {
     let (mut repo, _fs, _) = new_repo();
     let store = repo.store().clone();
     // Pre-merge content that is referenced by nothing but a fallback.
-    let old = store.store_file(b"fn check() -> bool { true }\n", &Visibility::Public).unwrap();
+    let old = store
+        .store_file(b"fn check() -> bool { true }\n", &Visibility::Public)
+        .unwrap();
     let file = |id| TreeEntry {
         name: "auth.rs".into(),
         kind: EntryKind::File,
@@ -376,7 +398,9 @@ fn gc_keeps_embargo_fallbacks_that_are_the_only_reference() {
     let mut base = Tree::default();
     base.insert(file(old));
     let base_tree = store.put_tree(&base).unwrap();
-    let new = store.store_file(b"fn check() -> bool { verify() }\n", &Visibility::Public).unwrap();
+    let new = store
+        .store_file(b"fn check() -> bool { verify() }\n", &Visibility::Public)
+        .unwrap();
     let mut merged = Tree::default();
     merged.insert(file(new));
     let merged_tree = store.put_tree(&merged).unwrap();
@@ -399,11 +423,16 @@ fn gc_keeps_embargo_fallbacks_that_are_the_only_reference() {
             embargo: Some(embargo.clone()),
         })
         .unwrap();
-    tx.view.tags.insert("main".into(), veil_core::oplog::Tag { target: s, cloak: None });
+    tx.view
+        .tags
+        .insert("main".into(), veil_core::oplog::Tag { target: s, cloak: None });
     tx.commit().unwrap();
 
     let r = gc(&mut repo, &now_gc()).unwrap();
-    assert!(r.deleted >= 3, "the base tree, merged tree and plain new blob were garbage");
+    assert!(
+        r.deleted >= 3,
+        "the base tree, merged tree and plain new blob were garbage"
+    );
     assert!(!store.has(&base_tree) && !store.has(&merged_tree) && !store.has(&new));
     assert!(store.has(&old), "fallback-only blob kept");
     let e = lookup(&store, &sealed_tree, &p("auth.rs")).unwrap().unwrap();
@@ -432,10 +461,26 @@ fn gc_after_real_embargoed_merge_and_release() {
     fix_ws.write("auth.rs", "fn check() -> bool { verify() }\n").unwrap();
     let (fix, _) = repo.commit_ephemeral(&fix_ws, "fix").unwrap();
     let res = repo
-        .merge(WS, main, vec![fix], "merge", Some(EmbargoSpec { scope: "team".into(), until: None }))
+        .merge(
+            WS,
+            main,
+            vec![fix],
+            "merge",
+            Some(EmbargoSpec {
+                scope: "team".into(),
+                until: None,
+            }),
+        )
         .unwrap();
-    gc(&mut repo, &GcOptions { keep_ops: Some(Duration::ZERO), now: Some(now_millis() + DAY), ..now_gc() })
-        .unwrap();
+    gc(
+        &mut repo,
+        &GcOptions {
+            keep_ops: Some(Duration::ZERO),
+            now: Some(now_millis() + DAY),
+            ..now_gc()
+        },
+    )
+    .unwrap();
     assert_history_intact(&repo);
     repo.release_embargo(res.embargo.as_deref().unwrap()).unwrap();
     gc(&mut repo, &now_gc()).unwrap();
@@ -456,7 +501,14 @@ fn op_log_pruning_keeps_the_current_op_and_its_parents() {
     assert_eq!(total, 7);
 
     // Within the window nothing is pruned.
-    let r = gc(&mut repo, &GcOptions { keep_ops: Some(Duration::from_secs(3600)), ..now_gc() }).unwrap();
+    let r = gc(
+        &mut repo,
+        &GcOptions {
+            keep_ops: Some(Duration::from_secs(3600)),
+            ..now_gc()
+        },
+    )
+    .unwrap();
     assert_eq!(r.ops_pruned, 0);
 
     // Two days later with a one-day window: only the head and its parent stay.
@@ -513,14 +565,19 @@ fn grace_period_and_keep_markers() {
     // Another process starts using one of them (e.g. re-adds the content).
     let other = Repo::open(fs.clone(), Some(id), "alice").unwrap();
     other.store().put(&Object::Blob(b"maybe needed".to_vec())).unwrap();
-    assert!(fs.exists(&p(&format!(".veil/objects/gc/keep/{}", stray.hex()))).unwrap());
+    assert!(fs
+        .exists(&p(&format!(".veil/objects/gc/keep/{}", stray.hex())))
+        .unwrap());
 
     // After the grace period only the untouched one goes.
     let r = gc(&mut repo, &opts(t0 + 2 * 3_600_000)).unwrap();
     assert_eq!(r.deleted, 1);
     assert!(present(&repo, &stray), "kept: another process freshened it");
     assert!(!present(&repo, &other_stray));
-    assert!(fs.list_dir(&p(".veil/objects/gc/keep")).map(|d| d.is_empty()).unwrap_or(true));
+    assert!(fs
+        .list_dir(&p(".veil/objects/gc/keep"))
+        .map(|d| d.is_empty())
+        .unwrap_or(true));
 
     // The rescue restarts its grace period.
     let r = gc(&mut repo, &opts(t0 + 3 * 3_600_000)).unwrap();
@@ -559,7 +616,14 @@ fn gc_with_a_concurrent_writer() {
     for _ in 0..15 {
         // Default grace: objects of in-flight snapshots are never deleted,
         // while ops are pruned aggressively.
-        gc(&mut gcr, &GcOptions { keep_ops: Some(Duration::ZERO), ..GcOptions::default() }).unwrap();
+        gc(
+            &mut gcr,
+            &GcOptions {
+                keep_ops: Some(Duration::ZERO),
+                ..GcOptions::default()
+            },
+        )
+        .unwrap();
     }
     writer.join().unwrap();
     let mut repo = Repo::open(fs.clone(), Some(id), "alice").unwrap();
@@ -601,4 +665,3 @@ fn tree_and_snapshot_caches_are_bounded() {
     assert!(stats.delta_bases.weight <= 4096);
     assert_history_intact(&repo);
 }
-

@@ -27,7 +27,10 @@ const EDITS_PER_COMMIT: usize = 8;
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.0 >> 33
     }
     fn below(&mut self, n: usize) -> usize {
@@ -101,7 +104,13 @@ fn read_times(root: &Path, id: &Identity, head: ObjectId, all: &[ObjectId]) -> R
     let mut cur = Some(head);
     while let Some(s) = cur {
         let snap = repo.snapshot(&s).unwrap();
-        if let Some(e) = veil_core::tree::lookup(repo.store(), &snap.tree, &veil_core::VPath::new("src/d7/m0007.rs").unwrap()).unwrap() {
+        if let Some(e) = veil_core::tree::lookup(
+            repo.store(),
+            &snap.tree,
+            &veil_core::VPath::new("src/d7/m0007.rs").unwrap(),
+        )
+        .unwrap()
+        {
             repo.store().read_entry(&e).unwrap();
             n += 1;
         }
@@ -209,13 +218,24 @@ fn storage_benchmark() {
     let pruned = read_times(root, &id, head, &all2);
 
     // 3. Same, without deltas, for comparison.
-    let r3 = gc(&mut repo, &GcOptions { deltas: false, ..GcOptions::default() }).unwrap();
+    let r3 = gc(
+        &mut repo,
+        &GcOptions {
+            deltas: false,
+            ..GcOptions::default()
+        },
+    )
+    .unwrap();
     let (bytes3, _) = disk_usage(&objects_dir);
     let all3 = repo.store().list_objects().unwrap();
     let no_deltas = read_times(root, &id, head, &all3);
 
     println!("Disk usage of .veil/objects:");
-    println!("  loose                    {:>8.2} MiB in {files0} files ({} objects)", mib(bytes0), all_before.len());
+    println!(
+        "  loose                    {:>8.2} MiB in {files0} files ({} objects)",
+        mib(bytes0),
+        all_before.len()
+    );
     println!(
         "  gc (pack, deltas)        {:>8.2} MiB in {files1} files  [{:.2} s; {} deltas, {} zstd, {} stored]",
         mib(bytes1),
@@ -231,7 +251,11 @@ fn storage_benchmark() {
         r2.ops_pruned,
         r2.deleted
     );
-    println!("  same, without deltas     {:>8.2} MiB ({} zstd)", mib(bytes3), r3.pack_stats.compressed);
+    println!(
+        "  same, without deltas     {:>8.2} MiB ({} zstd)",
+        mib(bytes3),
+        r3.pack_stats.compressed
+    );
     println!(
         "  canonical object bytes   {:>8.2} MiB (sum of uncompressed encodings)",
         mib(r1.pack_stats.raw_bytes)

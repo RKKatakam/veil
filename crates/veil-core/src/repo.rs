@@ -5,6 +5,8 @@
 //! ```text
 //! .veil/repo.json               format version, repository id, remotes
 //! .veil/objects/ab/cdef…        content-addressed objects (shared)
+//! .veil/objects/pack/           packfiles written by `vl gc`
+//! .veil/objects/gc/             gc pending list and keep markers
 //! .veil/ops/<id>, op_head       operation log (local)
 //! .veil/meta/keyrings/*.json    wrapped scope keys (shared, safe to publish)
 //! .veil/meta/embargoes/*.json   embargo records (shared)

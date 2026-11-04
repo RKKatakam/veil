@@ -482,7 +482,12 @@ impl ObjectStore {
         }
         let t = match self.open(id)? {
             Object::Tree(t) => Arc::new(t),
-            o => return Err(VeilError::Corrupt(id.hex(), format!("expected tree, found {}", o.kind_name()))),
+            o => {
+                return Err(VeilError::Corrupt(
+                    id.hex(),
+                    format!("expected tree, found {}", o.kind_name()),
+                ))
+            }
         };
         self.trees.insert(*id, t.clone(), t.entries.len() + 1);
         Ok(t)
@@ -535,7 +540,10 @@ impl ObjectStore {
     pub fn read_blob(&self, id: &ObjectId) -> Result<Vec<u8>> {
         match self.open(id)? {
             Object::Blob(b) => Ok(b),
-            o => Err(VeilError::Corrupt(id.hex(), format!("expected blob, found {}", o.kind_name()))),
+            o => Err(VeilError::Corrupt(
+                id.hex(),
+                format!("expected blob, found {}", o.kind_name()),
+            )),
         }
     }
 

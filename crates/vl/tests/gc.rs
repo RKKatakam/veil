@@ -14,7 +14,11 @@ fn vl(home: &Path, cwd: &Path, args: &[&str]) -> String {
         .env("NO_COLOR", "1")
         .output()
         .unwrap();
-    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(out.status.success(), "vl {args:?} failed:\n{text}");
     text
 }
