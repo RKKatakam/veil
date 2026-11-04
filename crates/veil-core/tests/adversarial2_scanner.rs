@@ -95,7 +95,6 @@ fn ascii_case_variants_of_dot_veil_are_refused() {
 /// remote tree with such an entry is accepted and checkout would write
 /// into the repository's own `.veil/` on such a volume (BUG-002 again).
 #[test]
-#[ignore = "BUG-051: tree names that HFS+ folds to .veil (ignorable code points) are accepted"]
 fn hfs_ignorable_spellings_of_dot_veil_are_refused() {
     let accepted: Vec<String> = ["\u{200c}", "\u{200d}", "\u{200e}", "\u{200f}", "\u{202a}", "\u{206a}", "\u{feff}"]
         .iter()

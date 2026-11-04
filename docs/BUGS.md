@@ -451,7 +451,7 @@ tests are the primary record; the root cause noted here is where known.
 | BUG-052 | medium | lock | A dead holder's lock whose pid was reused by a live process blocks the repository indefinitely. | `adversarial2_durability`: `a_reused_pid_does_not_keep_a_dead_holders_lock` |
 | BUG-055 | medium | scanner | Common credential keywords are not detected: `aws_secret_access_key`, `*_secret`, `*_token`, passwords in URLs. | `adversarial2_scanner`: `common_credential_assignments_are_detected` |
 | BUG-056 | medium | scanner | BOM-less UTF-16 in non-Latin scripts, and UTF-16 starting mid-chunk, bypass the scanner. (Reported as a second "BUG-050"; renumbered.) | `adversarial2_scanner`: `bomless_utf16_with_cjk_text_is_scanned`, `utf16_starting_just_before_a_chunk_boundary_is_scanned` |
-| BUG-051 | medium | untrusted input | Tree names that HFS+ folds to `.veil` (ignorable code points) are accepted. May be fixed by the macOS stream merged after this pass. | `adversarial2_scanner`: `hfs_ignorable_spellings_of_dot_veil_are_refused` |
+| BUG-051 | medium | untrusted input | **Fixed** by the macOS stream (c4247ea): tree names that HFS+ folds to `.veil` (ignorable code points) were accepted. | `adversarial2_scanner`: `hfs_ignorable_spellings_of_dot_veil_are_refused` |
 
 The property suite `adversarial2_props` (single-embargo variant) passes 2,000
 release cases while skipping the BUG-041/BUG-050 sequences; remove those
