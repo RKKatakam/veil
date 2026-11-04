@@ -98,15 +98,6 @@ fn new_commands_parse_their_documented_flags_and_refuse() {
         (&["attr", "check", "README.md", "src/x.c"], "vl attr"),
         (&["renormalize"], "vl renormalize"),
         (&["renormalize", "src"], "vl renormalize"),
-        // stream C: colocated Git
-        (&["git", "colocate"], "vl git colocate"),
-        (&["git", "colocate", "--experimental"], "vl git colocate"),
-        (&["git", "colocate", "--status"], "vl git colocate"),
-        (&["git", "colocate", "--prune"], "vl git colocate"),
-        (&["git", "uncolocate"], "vl git uncolocate"),
-        (&["git", "check-push"], "vl git check-push"),
-        (&["git", "check-push", "origin", "https://example.com/r.git"], "vl git check-push"),
-        (&["policy", "import-gitignore"], "vl policy import-gitignore"),
     ];
     for (args, what) in cases {
         env.refuses(args, what);
@@ -132,13 +123,13 @@ fn new_flags_on_existing_commands_refuse_only_when_given() {
 }
 
 #[test]
-fn init_colocate_refuses_before_creating_anything() {
+fn init_colocate_without_experimental_refuses_before_creating_anything() {
     let env = Env::new();
     let dir = env.root.join("colocated");
     let out = env.vl(&env.root, &["init", "--colocate", dir.to_str().unwrap()]);
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{err}");
-    assert!(err.contains("`vl init --colocate` is not implemented yet"), "{err}");
+    assert!(err.contains("experimental"), "{err}");
     assert!(!dir.exists(), "init --colocate created {}", dir.display());
 }
 
