@@ -101,6 +101,17 @@ pub struct BuildOptions<'a> {
     /// `fs` is not a checked-out working copy (overlays, sandboxes) or the
     /// caller keeps no record.
     pub materialised: Option<&'a Materialised>,
+    /// On a cloaked line of work: the tree its change is compared with (the
+    /// merged tree of its parents), computed only if needed. The one public
+    /// entry such a build creates from a sealed one, an edit back to the
+    /// last public version, is kept public only where this tree holds that
+    /// very version at the same path, as a public entry or as the fallback
+    /// of a sealed one (what readers without the key see there already).
+    /// Anywhere else (a rebase moved the change onto a base without the
+    /// file, or with another version) it would be public content the line
+    /// introduces, so it is sealed (BUG-128). `None`: not known, so such an
+    /// edit is always sealed.
+    pub line_base: Option<&'a dyn Fn() -> Result<ObjectId>>,
 }
 
 /// Rule name of a [`Finding`] for content copied from an injected secret.
@@ -693,6 +704,8 @@ struct Builder<'a> {
     /// never holds a conflict entry: a partly edited conflict is recorded
     /// as the file it is.
     under_embargo: bool,
+    /// [`BuildOptions::line_base`], once computed.
+    line_base: Option<Option<ObjectId>>,
 }
 
 /// Build a tree from `fs`, returning its id and a report.
@@ -767,6 +780,7 @@ pub fn build_tree_cached(
             Some(t) => crate::embargo::unreleased_wrapper(store, &t)?.is_some(),
             None => false,
         },
+        line_base: None,
     };
     if let (Some(c), None) = (opts.cloak, b.cloak) {
         b.report.policy_warnings.push(format!(
@@ -1562,10 +1576,13 @@ impl Builder<'_> {
         }
 
         // A sealed edit of a public file, edited back to its last public
-        // version: nothing to seal, that content is public already.
+        // version: nothing to seal, that content is public already. On a
+        // cloaked line only where the line's base shows that version here:
+        // otherwise the public entry would be one the line introduces
+        // (BUG-128), and the edit is sealed like any other.
         if let (Some(fb), Visibility::Cloaked { .. }) = (cloak_fallback, &desired) {
             if content == fb && !self.policy_changed && !self.rescan {
-                return Ok(Some(TreeEntry {
+                let entry = TreeEntry {
                     name: name.to_string(),
                     kind: EntryKind::File,
                     id: fb,
@@ -1573,7 +1590,10 @@ impl Builder<'_> {
                     executable,
                     visibility: Visibility::Public,
                     fallback: None,
-                }));
+                };
+                if self.cloak.is_none() || self.base_holds(path, &entry)? {
+                    return Ok(Some(entry));
+                }
             }
         }
 
@@ -1645,6 +1665,29 @@ impl Builder<'_> {
             executable,
             visibility: desired,
             fallback,
+        }))
+    }
+
+    /// Does the line's base ([`BuildOptions::line_base`]) show readers
+    /// without a key `entry`'s public version of `path`: as a public entry,
+    /// or as the fallback of a sealed one (same object and mode)?
+    fn base_holds(&mut self, path: &VPath, entry: &TreeEntry) -> Result<bool> {
+        let base = match self.line_base {
+            Some(b) => b,
+            None => {
+                let b = self.opts.line_base.map(|f| f()).transpose()?;
+                self.line_base = Some(b);
+                b
+            }
+        };
+        let Some(base) = base else { return Ok(false) };
+        Ok(crate::tree::lookup(self.store, &base, path)?.is_some_and(|e| {
+            let shown = match (&e.visibility, e.fallback) {
+                (Visibility::Public, None) => Some(e.id),
+                (Visibility::Cloaked { .. }, fb) => fb,
+                _ => None,
+            };
+            e.kind == EntryKind::File && shown == Some(entry.id) && e.executable == entry.executable
         }))
     }
 

@@ -684,7 +684,12 @@ fn cmd_identity(c: &IdentityCmd) -> Result<ExitCode> {
                 None
             };
             let id = Identity::generate(&name.clone().unwrap_or_else(ctx::default_user_name));
-            ctx::write_identity(&id)?;
+            if previous.is_some() {
+                ctx::write_identity(&id)?;
+            } else if !ctx::create_identity(&id)? {
+                // Another `vl` created one in the meantime (BUG-360).
+                bail!("an identity already exists (use --force to replace it; you will lose access to scopes granted to it)");
+            }
             println!("Created identity {} {}", id.name, id.public_id());
             if let Some((kept, old)) = previous {
                 println!(

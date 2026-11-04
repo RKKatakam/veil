@@ -851,7 +851,12 @@ CAS, and it applies these rules in order:
      diff3 merges (`merged_visibility`: the other side's public version
      when there is one, so a rebase onto a public edit shows the newer
      public version) keep the same rule. Edited back to that version, the
-     file is recorded public again. A file the *policy* cloaks (`vl cloak`)
+     file is recorded public again, on a cloaked line only where the line's
+     base (the merged tree of the change's parents) already shows readers
+     without the key that version at that path (as a public entry, or as
+     the fallback of a sealed one); anywhere else (a rebase onto a base
+     without the file, or with another version) a public entry would be
+     content the line introduces, so the edit stays sealed (BUG-128). A file the *policy* cloaks (`vl cloak`)
      carries no fallback: hiding it is the point, so public readers lose it.
      The fallback reveals nothing new (it was public), and nothing reads a
      cloaked entry's fallback as its content: merges and declassification

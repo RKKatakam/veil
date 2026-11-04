@@ -183,7 +183,7 @@ impl Harness {
         // working copy matches @
         let wc = self.repo.workspace_wc(WS).unwrap();
         let s = self.repo.snapshot(&wc).unwrap();
-        let (tree, _) = self.repo.build_from(&*self.fs, Some(s.tree), s.cloak.as_deref()).unwrap();
+        let (tree, _) = self.repo.build_amending(&*self.fs, &wc, None, None).unwrap();
         assert_eq!(
             tree, s.tree,
             "[{ctx}] working copy does not match @: disk={:?} @={:?}\nlog: {:#?}",
@@ -223,8 +223,19 @@ impl Harness {
                         continue;
                     }
                     if let Some(e) = &c.new {
+                        // A sealed edit edited back to the version readers
+                        // without the key are shown at that path (the
+                        // fallback of the base's sealed entry) introduces
+                        // nothing either: they see the same bytes before and
+                        // after (BUG-074 records it public again).
+                        let shown_before = c
+                            .old
+                            .as_ref()
+                            .filter(|o| matches!(o.visibility, veil_core::object::Visibility::Cloaked { .. }))
+                            .and_then(|o| o.fallback)
+                            .filter(|_| c.old.as_ref().is_some_and(|o| o.executable == e.executable));
                         assert!(
-                            !e.visibility.is_public() || c.path.as_str() == ".veilpolicy",
+                            !e.visibility.is_public() || c.path.as_str() == ".veilpolicy" || shown_before == Some(e.id),
                             "[{ctx}] cloaked change {id:?} introduces public content at {}\nlog: {:#?}",
                             c.path,
                             self.log
@@ -771,7 +782,6 @@ fn disk_paths_below_a_file_are_simply_missing() {
 /// pick depends on random ids, so it fails in about 1 run in 12; the loop
 /// makes a failure near-certain.
 #[test]
-#[ignore = "BUG-128: a cloaked line of work can record a new file as public"]
 fn bug128_cloaked_line_records_a_public_file() {
     use Op::*;
     let ops = vec![

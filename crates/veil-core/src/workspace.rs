@@ -184,6 +184,8 @@ impl Repo {
         let wp = tx.repo().snapshot_policy(fs, (!policy_incoming).then_some(&wc.tree))?;
         let store = tx.repo().store.clone();
         let rescan = scanner_outdated(&*tx.repo().backend, ws)?;
+        let repo = tx.repo();
+        let line_base = || Ok(repo.parents_tree(&wc.parents)?.tree);
         let (tree, report) = build_tree_cached(
             &store,
             fs,
@@ -194,6 +196,7 @@ impl Repo {
                 injected,
                 rescan,
                 materialised,
+                line_base: Some(&line_base),
             },
             cache,
         )?;
@@ -237,8 +240,40 @@ impl Repo {
         })
     }
 
+    /// Build a tree from `fs` as an amendment of `snapshot` (what recording
+    /// `fs` as that snapshot's new content would give), without recording
+    /// anything: [`Repo::build_from_recorded`] relative to its tree, on its
+    /// line of work, with its parents as the line's base.
+    pub fn build_amending(
+        &self,
+        fs: &dyn StorageBackend,
+        snapshot: &ObjectId,
+        cache: Option<&mut StatCache>,
+        materialised: Option<&Materialised>,
+    ) -> Result<(ObjectId, BuildReport)> {
+        let snap = self.snapshot(snapshot)?;
+        let policy = self.snapshot_policy(fs, None)?.policy;
+        let line_base = || Ok(self.parents_tree(&snap.parents)?.tree);
+        build_tree_cached(
+            &self.store,
+            fs,
+            &BuildOptions {
+                policy: &policy,
+                parent_tree: Some(snap.tree),
+                cloak: snap.cloak.as_deref(),
+                injected: None,
+                rescan: false,
+                materialised,
+                line_base: Some(&line_base),
+            },
+            cache,
+        )
+    }
+
     /// Build a tree from `fs` relative to `parent_tree` without recording
-    /// anything (dry run / change detection).
+    /// anything (dry run / change detection). With a `cloak`, the line's
+    /// base is unknown (see [`BuildOptions::line_base`]); to rebuild a
+    /// snapshot of a cloaked line use [`Repo::build_amending`].
     pub fn build_from(&self, fs: &dyn StorageBackend, parent_tree: Option<ObjectId>, cloak: Option<&str>) -> Result<(ObjectId, BuildReport)> {
         self.build_from_cached(fs, parent_tree, cloak, None)
     }
@@ -275,6 +310,7 @@ impl Repo {
                 injected: None,
                 rescan: false,
                 materialised,
+                line_base: None,
             },
             cache,
         )
@@ -364,6 +400,8 @@ impl Repo {
         let parent = tx.repo().snapshot(&base)?;
         let wp = tx.repo().snapshot_policy(fs, None)?;
         let store = tx.repo().store.clone();
+        // The new change's base is `base` itself.
+        let line_base = || Ok(parent.tree);
         let (tree, report) = build_tree_cached(
             &store,
             fs,
@@ -374,6 +412,7 @@ impl Repo {
                 injected,
                 rescan: false,
                 materialised: None,
+                line_base: Some(&line_base),
             },
             None,
         )?;

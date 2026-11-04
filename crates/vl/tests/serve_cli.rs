@@ -817,7 +817,6 @@ fn the_protocol_is_documented() {
 /// BUG-360: concurrent first uses of `vl` on a fresh `VEIL_HOME` must end
 /// with one identity, not one each.
 #[test]
-#[ignore = "BUG-360: concurrent first uses of vl each generate their own identity"]
 fn bug_360_concurrent_first_uses_share_one_identity() {
     let env = Env::new();
     for round in 0..3 {

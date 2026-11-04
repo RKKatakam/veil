@@ -63,6 +63,18 @@ pub fn default_user_name() -> String {
 /// synced, and is renamed over the old file; a new `$VEIL_HOME` is created
 /// owner-only.
 pub fn write_identity(id: &Identity) -> Result<()> {
+    store_identity(id, true).map(|_| ())
+}
+
+/// Store `id` as [`identity_path`] only if no identity is there yet, as
+/// [`write_identity`] does but without ever replacing one: the synced temp
+/// file is hard-linked into place, which fails if another process got there
+/// first (BUG-360). `false`: an identity already existed, nothing changed.
+pub fn create_identity(id: &Identity) -> Result<bool> {
+    store_identity(id, false)
+}
+
+fn store_identity(id: &Identity, replace: bool) -> Result<bool> {
     use std::io::Write;
     let path = identity_path();
     let dir = path.parent().unwrap();
@@ -86,32 +98,57 @@ pub fn write_identity(id: &Identity) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let written = (|| -> std::io::Result<()> {
+    let written = (|| -> std::io::Result<bool> {
         let mut f = opts.open(&tmp)?;
         f.write_all(id.to_json().as_bytes())?;
         f.sync_all()?;
         drop(f);
-        std::fs::rename(&tmp, &path)?;
+        if replace {
+            std::fs::rename(&tmp, &path)?;
+        } else {
+            let linked = match std::fs::hard_link(&tmp, &path) {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+                // A filesystem without hard links: claim the name with an
+                // exclusive create instead (the content follows by rename,
+                // so a reader only ever sees an empty file, never half of
+                // one, and `load_identity` waits that out).
+                Err(_) => match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                    Ok(_) => {
+                        std::fs::rename(&tmp, &path)?;
+                        true
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+                    Err(e) => return Err(e),
+                },
+            };
+            let _ = std::fs::remove_file(&tmp);
+            if !linked {
+                return Ok(false);
+            }
+        }
         #[cfg(unix)]
         std::fs::File::open(dir)?.sync_all()?;
-        Ok(())
+        Ok(true)
     })();
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-    written.with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+    written.with_context(|| format!("writing {}", path.display()))
 }
 
-/// Load the identity, creating one on first use.
+/// Load the identity, creating one on first use. Several processes
+/// starting at once on a fresh `$VEIL_HOME` agree on one identity: the
+/// first to store its own wins, the others load that one (BUG-360).
 pub fn load_identity() -> Result<Identity> {
     let path = identity_path();
     if path.exists() {
-        let s = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-        return Ok(Identity::from_json(&s)?);
+        return read_identity(&path);
     }
     let id = Identity::generate(&default_user_name());
-    write_identity(&id)?;
+    if !create_identity(&id)? {
+        return read_identity(&path);
+    }
     eprintln!(
         "{} new identity for '{}' at {}",
         render::green("Created"),
@@ -119,6 +156,19 @@ pub fn load_identity() -> Result<Identity> {
         path.display()
     );
     Ok(id)
+}
+
+/// Read the identity file. An empty one is another process's identity
+/// being put in place (see [`create_identity`]): wait for it briefly.
+fn read_identity(path: &Path) -> Result<Identity> {
+    for attempt in 0.. {
+        let s = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        if !s.is_empty() || attempt == 50 {
+            return Ok(Identity::from_json(&s)?);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    unreachable!()
 }
 
 pub fn user_for(id: &Identity) -> String {
@@ -325,13 +375,9 @@ impl Ctx {
             let base = self.checkout.snapshot;
             let base_snap = self.repo.snapshot(&base)?;
             let target_tree = self.repo.snapshot(&view_wc)?.tree;
-            let (tree, report) = self.repo.build_from_recorded(
-                fs,
-                Some(base_snap.tree),
-                base_snap.cloak.as_deref(),
-                Some(&mut self.cache),
-                Some(&self.checkout.materialised),
-            )?;
+            let (tree, report) =
+                self.repo
+                    .build_amending(fs, &base, Some(&mut self.cache), Some(&self.checkout.materialised))?;
             // The snapshot the directory now holds: what it was checked out
             // from, the edits saved on top of it, or already the target.
             let mut holds = base;

@@ -406,6 +406,7 @@ impl GitBridge {
                 injected: None,
                 rescan: false,
                 materialised: None,
+                line_base: None,
             },
         )?;
         for (g, v) in fs.learned.into_inner().unwrap() {
