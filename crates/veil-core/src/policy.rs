@@ -190,7 +190,10 @@ impl Rule {
     fn new(pattern: &str, tier: Tier, force: bool, builtin: bool, secret: bool) -> Result<Rule, String> {
         // Protective rules match case-insensitively (see the module docs).
         let case_insensitive = (builtin && secret) || (!builtin && matches!(tier, Tier::Cloaked(_) | Tier::Isolated));
-        let mut p = pattern.trim().to_string();
+        // Patterns and paths are compared in NFC, so a rule typed in one
+        // Unicode normalisation form matches a name recorded in the other
+        // (macOS file names often come back in NFD).
+        let mut p = crate::vpath::nfc(pattern.trim()).into_owned();
         let dir_only = p.ends_with('/');
         while p.ends_with('/') {
             p.pop();
@@ -227,7 +230,7 @@ impl Rule {
     }
 
     pub fn matches(&self, path: &VPath, is_dir: bool) -> bool {
-        let s = path.as_str();
+        let s = &*crate::vpath::nfc(path.as_str());
         (self.exact.is_match(s) && (!self.dir_only || is_dir)) || self.under.is_match(s)
     }
 
@@ -363,7 +366,7 @@ impl Policy {
         if path.as_str() == POLICY_FILE {
             return c;
         }
-        let hits = self.set.matches(path.as_str());
+        let hits = self.set.matches(&*crate::vpath::nfc(path.as_str()));
         let mut matched = vec![false; self.rules.len()];
         for i in hits {
             let r = &self.rules[i / 2];

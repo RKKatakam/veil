@@ -1,5 +1,6 @@
 mod cli;
 mod ctx;
+mod doctor;
 mod render;
 mod sandbox;
 
@@ -12,7 +13,7 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use veil_core::{
     checkout::behind_special,
     commands::EmbargoSpec,
@@ -66,6 +67,16 @@ fn main() -> ExitCode {
         Err(e) => {
             // Errors may quote repository data (names, paths): escape them.
             eprintln!("{} {}", red("error:"), safe(&format!("{e:#}")));
+            if e
+                .chain()
+                .any(|c| matches!(c.downcast_ref::<veil_core::VeilError>(), Some(veil_core::VeilError::NameCollision(_))))
+            {
+                eprintln!(
+                    "{} the repository already moved to that snapshot. To work here meanwhile, move the working copy \
+                     back without touching files: `vl --no-snapshot undo` (or `vl --no-snapshot edit <rev>`)",
+                    yellow("hint:")
+                );
+            }
             ExitCode::FAILURE
         }
     }
@@ -81,6 +92,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Clone { source, dest } => cmd_clone(source, dest.as_deref()),
         Cmd::Identity(c) => cmd_identity(c),
         Cmd::Fsck { verbose } => cmd_fsck(cli.repository.as_deref(), *verbose),
+        Cmd::Doctor { remotes } => doctor::run(cli.repository.as_deref(), *remotes),
+        Cmd::Completions { shell } => {
+            clap_complete::generate(*shell, &mut Cli::command(), "vl", &mut std::io::stdout());
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Man { out_dir } => cmd_man(out_dir.as_deref()),
         _ => {
             let mut ctx = open(&cli)?;
             let code = dispatch(&mut ctx, &cli)?;
@@ -92,7 +109,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
 
 fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
     match &cli.cmd {
-        Cmd::Init { .. } | Cmd::Clone { .. } | Cmd::Identity(_) | Cmd::Fsck { .. } => unreachable!(),
+        Cmd::Init { .. }
+        | Cmd::Clone { .. }
+        | Cmd::Identity(_)
+        | Cmd::Fsck { .. }
+        | Cmd::Doctor { .. }
+        | Cmd::Completions { .. }
+        | Cmd::Man { .. } => unreachable!(),
         Cmd::Status => cmd_status(ctx)?,
         Cmd::Log { limit } => print_log(&ctx.repo, &ctx.ws, *limit)?,
         Cmd::Show { rev, stat } => cmd_show(ctx, rev, *stat)?,
@@ -1528,6 +1551,22 @@ fn cmd_gc(
         );
     }
     Ok(())
+}
+
+// ---- packaging ---------------------------------------------------------------
+
+/// `vl man`: the man page on stdout, or `vl.1` plus one `vl-<command>.1` page
+/// per (sub)command in `out_dir`. Packagers run this at release time.
+fn cmd_man(out_dir: Option<&Path>) -> Result<ExitCode> {
+    let cmd = Cli::command();
+    match out_dir {
+        None => clap_mangen::Man::new(cmd).render(&mut std::io::stdout())?,
+        Some(dir) => {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+            clap_mangen::generate_to(cmd, dir).with_context(|| format!("writing man pages to {}", dir.display()))?;
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(test)]

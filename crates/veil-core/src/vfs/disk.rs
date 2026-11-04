@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use super::{DirEntry, DirListing, Metadata, NodeKind, StatClock, StorageBackend};
+use super::{DirEntry, DirListing, Metadata, NameFolding, NodeKind, StatClock, StorageBackend};
 use crate::{
     error::{Result, VeilError},
     vpath::VPath,
@@ -25,12 +25,23 @@ use crate::{
 /// file; [`StorageBackend::sync_barrier`] then syncs every remembered file
 /// (several at a time, so the filesystem can share journal commits) and
 /// every touched directory once. Clones share that state.
+///
+/// On macOS, durability needs `F_FULLFSYNC` (a plain `fsync` leaves data in
+/// the drive's volatile cache). Single writes use it directly. A barrier
+/// `fsync`s every file and directory, then issues one `F_FULLFSYNC`, which
+/// flushes the drive cache for all of them at once.
+///
+/// [`StorageBackend::name_folding`] is probed once (see [`probe_folding`]):
+/// whether the filesystem holding the root treats `README` and `readme` as
+/// one name, which macOS volumes and FAT/SMB mounts do.
 #[derive(Debug, Clone)]
 pub struct DiskBackend {
     root: PathBuf,
     unsynced: Arc<Mutex<Unsynced>>,
     /// Serialises barriers (see [`StorageBackend::sync_barrier`]).
     barrier: Arc<Mutex<()>>,
+    /// Probed lazily; only a definite answer is cached.
+    folding: Arc<Mutex<Option<NameFolding>>>,
 }
 
 /// Writes made durable by the next barrier.
@@ -102,6 +113,7 @@ impl DiskBackend {
             root: root.into(),
             unsynced: Arc::default(),
             barrier: Arc::default(),
+            folding: Arc::default(),
         }
     }
 
@@ -141,7 +153,44 @@ fn temp_path(parent: &Path, path: &VPath) -> PathBuf {
 fn write_synced(path: &Path, data: &[u8]) -> io::Result<()> {
     let mut f = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
     f.write_all(data)?;
-    f.sync_all()
+    full_sync(&f)
+}
+
+/// Flush `f` to stable storage. On macOS `File::sync_all` is
+/// `fcntl(F_FULLFSYNC)`, the only call that empties the drive's write cache;
+/// filesystems that do not implement it (some network and FUSE ones) get a
+/// plain `fsync`, the best they offer.
+fn full_sync(f: &fs::File) -> io::Result<()> {
+    match f.sync_all() {
+        #[cfg(target_os = "macos")]
+        Err(e) if fullfsync_unsupported(&e) => plain_fsync(f),
+        r => r,
+    }
+}
+
+/// `fsync(2)` without `F_FULLFSYNC`: on macOS this hands the data to the
+/// drive but does not flush its cache (see [`DiskBackend`]'s barrier).
+#[cfg(target_os = "macos")]
+fn plain_fsync(f: &fs::File) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    loop {
+        // SAFETY: `fsync` on a file descriptor we own for the duration.
+        if unsafe { libc::fsync(f.as_raw_fd()) } == 0 {
+            return Ok(());
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn fullfsync_unsupported(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ENOTSUP | libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL)
+    )
 }
 
 fn create_exclusive(full: &Path, data: &[u8]) -> io::Result<bool> {
@@ -150,7 +199,7 @@ fn create_exclusive(full: &Path, data: &[u8]) -> io::Result<bool> {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
         Err(e) => return Err(e),
     };
-    if let Err(e) = f.write_all(data).and_then(|_| f.sync_all()) {
+    if let Err(e) = f.write_all(data).and_then(|_| full_sync(&f)) {
         drop(f);
         let _ = fs::remove_file(full);
         return Err(e);
@@ -162,7 +211,7 @@ fn create_exclusive(full: &Path, data: &[u8]) -> io::Result<bool> {
 /// Flush a directory's entries (new names, renames) to stable storage.
 #[cfg(unix)]
 fn sync_dir(dir: &Path) -> io::Result<()> {
-    match fs::File::open(dir).and_then(|d| d.sync_all()) {
+    match fs::File::open(dir).and_then(|d| full_sync(&d)) {
         // Some filesystems cannot fsync directories; nothing more can be done.
         Err(e) if matches!(e.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported) => Ok(()),
         r => r,
@@ -221,11 +270,52 @@ fn create_dir_all_tracked(dir: &Path, created: &mut Vec<PathBuf>) -> io::Result<
 /// fsync an existing file.
 fn sync_file(path: &Path) -> io::Result<()> {
     // Windows needs write access to flush; Unix flushes through any handle.
-    fs::OpenOptions::new()
-        .read(true)
-        .write(cfg!(windows))
-        .open(path)?
-        .sync_all()
+    full_sync(&fs::OpenOptions::new().read(true).write(cfg!(windows)).open(path)?)
+}
+
+/// What a barrier does per file: on macOS a plain `fsync` (the drive cache
+/// is flushed once for the whole batch by [`flush_drive_cache`]), elsewhere
+/// [`sync_file`].
+fn barrier_sync_file(path: &Path) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        plain_fsync(&fs::File::open(path)?)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        sync_file(path)
+    }
+}
+
+/// [`barrier_sync_file`] for directories.
+fn barrier_sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        match fs::File::open(dir).and_then(|d| plain_fsync(&d)) {
+            Err(e) if fullfsync_unsupported(&e) => Ok(()),
+            r => r,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        sync_dir(dir)
+    }
+}
+
+/// End of a barrier: on macOS, one `F_FULLFSYNC` empties the drive's write
+/// cache, making every `fsync` of the batch durable. A no-op elsewhere,
+/// where `fsync` already reached stable storage.
+#[allow(unused_variables)]
+fn flush_drive_cache(files: &[PathBuf], dirs: &[PathBuf]) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    for p in files.iter().chain(dirs) {
+        match fs::File::open(p) {
+            Ok(f) => return full_sync(&f),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Run `f` on every item, on up to `max_workers` threads. Concurrent
@@ -377,18 +467,19 @@ impl StorageBackend for DiskBackend {
             return Ok(());
         }
         let dirs: Vec<PathBuf> = batch.dirs.iter().cloned().collect();
-        let res = for_each_parallel(&batch.files, SYNC_WORKERS, |f| match sync_file(f) {
+        let res = for_each_parallel(&batch.files, SYNC_WORKERS, |f| match barrier_sync_file(f) {
             // Removed since (by gc, or by crash recovery as torn): the
             // directory sync below makes the removal durable instead.
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             r => r,
         })
         .and_then(|()| {
-            for_each_parallel(&dirs, SYNC_WORKERS, |d| match sync_dir(d) {
+            for_each_parallel(&dirs, SYNC_WORKERS, |d| match barrier_sync_dir(d) {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
                 r => r,
             })
-        });
+        })
+        .and_then(|()| flush_drive_cache(&batch.files, &dirs));
         if let Err(e) = res {
             // Keep the batch for the next barrier; nothing that depends on it
             // may be written by the caller, which gets the error.
@@ -509,6 +600,18 @@ impl StorageBackend for DiskBackend {
         }
     }
 
+    fn name_folding(&self) -> NameFolding {
+        let mut cached = self.folding.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(f) = *cached {
+            return f;
+        }
+        let (folding, definite) = probe_folding(&self.root);
+        if definite {
+            *cached = Some(folding);
+        }
+        folding
+    }
+
     fn stat_clock(&self) -> Option<StatClock> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -538,4 +641,91 @@ impl StorageBackend for DiskBackend {
         }
         Ok(())
     }
+}
+
+// ---- name folding -------------------------------------------------------------
+
+/// Environment override for [`probe_folding`]: `exact`, `case`, `unicode`,
+/// `macos` (both) or `auto`. Lets Linux users and CI check that a tree
+/// checks out on a macOS volume, and works around a wrong probe.
+pub const FOLDING_ENV: &str = "VEIL_FS_FOLDING";
+
+/// Parse a [`FOLDING_ENV`] value; `None` for `auto` and unknown values.
+pub fn parse_folding(v: &str) -> Option<NameFolding> {
+    let (case_insensitive, unicode_insensitive) = match v.trim().to_ascii_lowercase().as_str() {
+        "exact" | "none" | "sensitive" => (false, false),
+        "case" => (true, false),
+        "unicode" => (false, true),
+        "macos" | "case,unicode" | "unicode,case" | "all" => (true, true),
+        _ => return None,
+    };
+    Some(NameFolding {
+        case_insensitive,
+        unicode_insensitive,
+    })
+}
+
+/// How the filesystem holding `root` compares names, and whether that
+/// answer is definite (worth caching).
+///
+/// Case-insensitivity is measured: the first entry of `root` with an ASCII
+/// letter is looked up again with its letters' case swapped, and the two
+/// must be the very same file (device and inode). A repository root always
+/// has `.veil`, so this works wherever it matters. Without a usable entry
+/// the platform default is assumed (insensitive on macOS) and re-probed
+/// next time.
+///
+/// Normalisation-insensitivity cannot be measured without creating files,
+/// so it is the platform's: APFS (both variants) and HFS+ are
+/// normalisation-insensitive, Linux filesystems are not (`vl doctor` probes
+/// it for real).
+pub fn probe_folding(root: &Path) -> (NameFolding, bool) {
+    if let Some(f) = std::env::var(FOLDING_ENV).ok().as_deref().and_then(parse_folding) {
+        return (f, true);
+    }
+    let (case_insensitive, definite) = match probe_case_insensitive(root) {
+        Some(ci) => (ci, true),
+        None => (cfg!(target_os = "macos"), false),
+    };
+    (
+        NameFolding {
+            case_insensitive,
+            unicode_insensitive: cfg!(target_os = "macos"),
+        },
+        definite,
+    )
+}
+
+fn probe_case_insensitive(root: &Path) -> Option<bool> {
+    for entry in fs::read_dir(root).ok()?.flatten().take(256) {
+        let Ok(name) = entry.file_name().into_string() else { continue };
+        let swapped: String = name
+            .chars()
+            .map(|c| match c {
+                'a'..='z' => c.to_ascii_uppercase(),
+                'A'..='Z' => c.to_ascii_lowercase(),
+                c => c,
+            })
+            .collect();
+        if swapped == name {
+            continue;
+        }
+        let Ok(original) = fs::symlink_metadata(root.join(&name)) else { continue };
+        return Some(match fs::symlink_metadata(root.join(&swapped)) {
+            Ok(alias) => same_file(&original, &alias),
+            Err(_) => false,
+        });
+    }
+    None
+}
+
+#[cfg(unix)]
+fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(_a: &fs::Metadata, _b: &fs::Metadata) -> bool {
+    true
 }

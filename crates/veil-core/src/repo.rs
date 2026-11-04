@@ -40,6 +40,8 @@ use crate::{
 
 pub const VEIL_DIR: &str = ".veil";
 pub const DEFAULT_WORKSPACE: &str = "default";
+/// The `format` written to `.veil/repo.json` by this version.
+pub const REPO_FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RemoteConfig {
@@ -112,7 +114,7 @@ impl Repo {
             return Err(VeilError::AlreadyExists("a Veil repository".into()));
         }
         let config = RepoConfig {
-            format: 1,
+            format: REPO_FORMAT_VERSION,
             repo_id: hex::encode(random_bytes::<16>()),
             remotes: BTreeMap::new(),
         };

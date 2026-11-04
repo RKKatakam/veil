@@ -29,11 +29,19 @@
 //! * a tracked path that became a symlink (or socket, device…) is never
 //!   followed: its tracked entry is kept and reported.
 //!
+//! On a backend that folds names ([`StorageBackend::name_folding`], e.g. a
+//! macOS volume) a name that is an alias of the parent's entry (another case,
+//! or HFS+ handing back NFD for a name checked out in NFC) keeps the parent's
+//! spelling, and new names are recorded in NFC. Directories whose entries
+//! would collide on such a filesystem are reported on every backend
+//! ([`BuildReport::name_collisions`]), so a Linux user learns before a macOS
+//! teammate's checkout refuses the snapshot.
+//!
 //! With [`InjectedSecrets`] (the isolated files a `ws exec` sandbox was given)
 //! any new content that contains one of those values is quarantined, so a
 //! command cannot launder an injected secret into history under another name.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     error::{Result, VeilError},
@@ -43,8 +51,8 @@ use crate::{
     secrets::{self, Finding},
     statcache::{CacheKey, CacheRun, StatCache},
     store::ObjectStore,
-    vfs::{is_temp_name, Metadata, NodeKind, StorageBackend},
-    vpath::VPath,
+    vfs::{is_temp_name, DirListing, Metadata, NodeKind, StorageBackend},
+    vpath::{NameFolding, VPath},
 };
 
 pub struct BuildOptions<'a> {
@@ -216,6 +224,11 @@ pub struct BuildReport {
     /// Tracked paths that are now a symlink or another special file. Veil
     /// never follows them; the tracked entry is kept unchanged.
     pub shadowed: Vec<VPath>,
+    /// Pairs of recorded paths that differ only in case or Unicode
+    /// normalisation, at least one of them new in this snapshot. Valid
+    /// here, but a checkout on a case-insensitive filesystem (macOS by
+    /// default) refuses the snapshot.
+    pub name_collisions: Vec<(VPath, VPath)>,
 }
 
 impl BuildReport {
@@ -248,6 +261,8 @@ struct Builder<'a> {
     rescan: bool,
     cache: Option<CacheRun>,
     report: BuildReport,
+    /// How `fs` compares names (read once per build).
+    folding: NameFolding,
 }
 
 /// Build a tree from `fs`, returning its id and a report.
@@ -310,6 +325,7 @@ pub fn build_tree_cached(
             policy_warnings: opts.policy.warnings.clone(),
             ..Default::default()
         },
+        folding: fs.name_folding(),
     };
     let root_parent = parent.as_deref().zip(opts.parent_tree);
     let id = match b.build_dir(&VPath::root(), root_parent)? {
@@ -357,6 +373,7 @@ impl Builder<'_> {
         let parent_id = parent.map(|(_, id)| id);
         let parent = parent.map(|(t, _)| t);
         let listing = match self.fs.list_dir_full(dir) {
+            Ok(l) if self.folding.folds() => self.canonical_names(dir, l, parent),
             Ok(l) => l,
             // Vanished while we were building: a deletion like any other.
             Err(e) if e.is_not_found() && !dir.is_root() => return Ok(None),
@@ -452,7 +469,76 @@ impl Builder<'_> {
                 return Ok(Some(id));
             }
         }
+        self.report_collisions(dir, &out, parent);
         Ok(Some(self.store.put_tree(&out)?))
+    }
+
+    /// Rewrite the names of a listing from a name-folding backend to the
+    /// spelling to record: the parent's entry when the name is an alias of
+    /// it (unless an entry with that exact name is listed too), otherwise
+    /// [`NameFolding::record`] (NFC on macOS). A substituted name is only
+    /// used if the backend really resolves it, so a wrongly reported
+    /// folding can never make a file look deleted.
+    fn canonical_names(&self, dir: &VPath, mut listing: DirListing, parent: Option<&Tree>) -> DirListing {
+        let folding = self.folding;
+        let tracked: HashMap<std::borrow::Cow<'_, str>, &str> = parent
+            .map(|t| t.entries.iter().map(|e| (folding.key(&e.name), e.name.as_str())).collect())
+            .unwrap_or_default();
+        let listed: HashSet<String> = listing
+            .entries
+            .iter()
+            .map(|e| e.name.clone())
+            .chain(listing.special.iter().cloned())
+            .collect();
+        let mut used = HashSet::new();
+        // `verify`: special entries (symlinks…) report no metadata, so they
+        // are only matched to a tracked alias, never checked.
+        let mut canonical = |name: &str, verify: bool| -> String {
+            if parent.is_some_and(|t| t.get(name).is_some()) {
+                used.insert(name.to_string());
+                return name.to_string();
+            }
+            let want = match tracked.get(&folding.key(name)) {
+                Some(&p) if !listed.contains(p) => p.to_string(),
+                _ => folding.record(name).into_owned(),
+            };
+            if want == name
+                || listed.contains(&want)
+                || used.contains(&want)
+                || (verify && !matches!(self.fs.metadata(&dir.join(&want)), Ok(Some(_))))
+            {
+                used.insert(name.to_string());
+                return name.to_string();
+            }
+            used.insert(want.clone());
+            want
+        };
+        for e in &mut listing.entries {
+            e.name = canonical(&e.name, true);
+        }
+        for n in &mut listing.special {
+            *n = canonical(n, false);
+        }
+        listing.entries.sort_by(|a, b| a.name.cmp(&b.name));
+        listing.special.sort();
+        listing
+    }
+
+    /// Record pairs of entries of `out` that a macOS volume would store as
+    /// one, when at least one of them is new relative to `parent`.
+    fn report_collisions(&mut self, dir: &VPath, out: &Tree, parent: Option<&Tree>) {
+        if out.entries.len() < 2 || out.entries.iter().all(|e| e.name.is_ascii() && !e.name.bytes().any(|b| b.is_ascii_uppercase())) {
+            return;
+        }
+        let mut first: HashMap<std::borrow::Cow<'_, str>, &str> = HashMap::new();
+        for e in &out.entries {
+            if let Some(other) = first.insert(NameFolding::MACOS.key(&e.name), &e.name) {
+                let old = |n: &str| parent.is_some_and(|t| t.get(n).is_some());
+                if !(old(other) && old(&e.name)) {
+                    self.report.name_collisions.push((dir.join(other), dir.join(&e.name)));
+                }
+            }
+        }
     }
 
     fn carry_unreadable(&mut self, e: &TreeEntry, path: &VPath) -> Result<Option<TreeEntry>> {

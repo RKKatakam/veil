@@ -2,6 +2,28 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+/// `vl -V`: version, the commit it was built from and the repository format
+/// it reads and writes.
+pub const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (commit ",
+    env!("VL_GIT_COMMIT"),
+    ", repository format ",
+    // Kept in step with `veil_core::repo::REPO_FORMAT_VERSION` by a test.
+    "1",
+    ")"
+);
+
+/// `vl --version`.
+pub const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\ncommit: ",
+    env!("VL_GIT_COMMIT"),
+    "\nrepository format: 1",
+    "\ntarget: ",
+    env!("VL_TARGET"),
+);
+
 /// Veil — snapshot-first version control with cloaking, engine-level secret
 /// protection and virtual workspaces.
 ///
@@ -9,7 +31,7 @@ use clap::{Parser, Subcommand};
 /// copy as a snapshot of the current change. Use `vl commit -m` to finish a
 /// change, `vl undo` to step back through the operation log.
 #[derive(Parser, Debug)]
-#[command(name = "vl", version, propagate_version = true, max_term_width = 100)]
+#[command(name = "vl", version = VERSION, long_version = LONG_VERSION, propagate_version = true, max_term_width = 100)]
 pub struct Cli {
     /// Path to the repository (defaults to searching upward from the cwd).
     #[arg(short = 'R', long, global = true, value_name = "PATH")]
@@ -266,6 +288,26 @@ pub enum Cmd {
         /// Do not delta-compress successive versions of a file.
         #[arg(long)]
         no_deltas: bool,
+    },
+    /// Check this machine's setup and explain every problem found: identity,
+    /// VEIL_HOME, the repository and its lock, the stat cache, the
+    /// filesystem (case sensitivity, fsync, network mounts), the clock, the
+    /// vault and leftover sandboxes. Exits 1 if anything is broken.
+    Doctor {
+        /// Also check that every remote can be reached.
+        #[arg(long)]
+        remotes: bool,
+    },
+    /// Print a shell completion script, e.g. `vl completions zsh > ~/.zfunc/_vl`.
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+    /// Print the man page (`vl man | man -l -`), or write one page per
+    /// command into DIR.
+    Man {
+        #[arg(long, value_name = "DIR")]
+        out_dir: Option<PathBuf>,
     },
 }
 

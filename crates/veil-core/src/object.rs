@@ -122,14 +122,25 @@ impl TreeEntry {
 }
 
 /// Directory name reserved for repository metadata. Like Git's `.git`, it
-/// is refused as a tree entry name at every depth, compared ASCII
-/// case-insensitively (`.VEIL` is the same directory on case-insensitive
-/// filesystems).
+/// is refused as a tree entry name at every depth, in every spelling that
+/// names the same directory on a macOS filesystem: any ASCII case (`.VEIL`)
+/// and with HFS+-ignorable code points inserted anywhere (`.v\u{200C}eil`),
+/// as Git's `is_hfs_dotgit` does.
 pub const RESERVED_NAME: &str = ".veil";
 
-/// Is `name` the reserved metadata directory name (in any ASCII case)?
+/// Is `name` an alias of the reserved metadata directory name?
+///
+/// No other spellings need catching: no non-ASCII character case-folds or
+/// canonically decomposes to `.`, `v`, `e`, `i` or `l`.
 pub fn is_reserved_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case(RESERVED_NAME)
+    if name.is_ascii() {
+        return name.eq_ignore_ascii_case(RESERVED_NAME);
+    }
+    let mut folded = name.chars().filter(|c| !crate::vpath::is_hfs_ignorable(*c));
+    RESERVED_NAME
+        .chars()
+        .all(|r| folded.next().is_some_and(|c| c.eq_ignore_ascii_case(&r)))
+        && folded.next().is_none()
 }
 
 /// Check that `name` is a single, safe path component for a tree entry: not

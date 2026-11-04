@@ -33,6 +33,11 @@ pub enum VeilError {
     Repo(String),
     #[error("repository is locked: {0}")]
     Locked(String),
+    /// A tree holds names that the target filesystem would store as one
+    /// entry (they differ only in case or Unicode normalisation), so it
+    /// cannot be checked out there. Nothing was written.
+    #[error("{0}")]
+    NameCollision(String),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
