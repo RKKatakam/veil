@@ -1041,3 +1041,73 @@ Leads that held up (no bug): the no-follow writer (`vfs/beneath.rs`) for checkou
 
 | ID | Sev. | Area | Finding | Root cause | Reproducing tests |
 |---|---|---|---|---|---|
+
+## Round 9 findings (Opus, colocated Git mode)
+
+Baseline: `integration` @ `4a62259`; line numbers refer to it. Git 2.53 on
+Linux. Tests: `crates/vl/tests/adversarial9_colocated/` (one module per
+finding; every test skips without `git`). Each `#[ignore = "BUG-NNN: …"]`
+test asserts the safe outcome and fails today:
+
+```sh
+cargo test -p vl --test adversarial9_colocated -- --ignored
+```
+
+Summary: 2 critical, 6 high, 6 medium, 1 low (15 findings; BUG-749 unused). The two critical findings
+need only a hostile upstream commit and a plain `git pull`.
+
+| ID | Sev. | Area | Finding | Root cause | Reproducing tests |
+|---|---|---|---|---|---|
+| BUG-740 | critical | hostile tree / policy pin | A Git commit with paths under `.veil/` is checked out by `git pull` into Veil's own state. Overwriting `.veil/local/accepted-policy` together with a weakened `.veilpolicy` defeats the pin: the next snapshot records `secrets/` public and `vl git push` exports the cloaked plaintext. | The Veil repository lives inside Git's work tree (`repo::VEIL_DIR`); `/.veil/` in `info/exclude` (`policy_gitignore.rs:251`) only hides *untracked* files; import keeps `.veil` entries as Git-only paths (`git/import.rs:1018`), so Git checks them out; the pin is read from the work tree (`policy.rs:1455`). | `policy_injection::bug740_a_pulled_commit_never_writes_veils_accepted_policy` |
+| BUG-741 | critical | hostile tree / data loss | A Git commit adding a *file* named `.veil` makes `git pull` delete the whole Veil repository (unpushed changes, cloaked work, the device vault). The `.veil/.git` marker does not stop it. | As BUG-740; `colocate::guard_veil_dir` (`git/colocate.rs:1629`) only affects `git clean`/`stash`. | `dot_veil_file::bug741_a_pulled_dot_veil_file_never_deletes_the_repository` |
+| BUG-742 | high | excludes | A tracked `.gitignore` negation (`!secrets/`, `!.env`, `!*.yml`, or an allow-list `.gitignore`) outranks `info/exclude`, including frozen mode's `*`. `git add -A` hashes cloaked and isolated files into `.git`; `git stash -u` stores them in a stash commit and deletes them from disk. Only `pre-commit` still refuses a commit; nothing guards `stash`. | `exclude_block` (`git/colocate.rs:1499`) writes only `info/exclude`, which Git consults after every per-directory `.gitignore`. | `gitignore_negation::bug742_a_negating_gitignore_never_unhides_protected_files`, `gitignore_negation::bug742_frozen_mode_survives_a_negating_gitignore` |
+| BUG-743 | high | `--prune` / Git data loss | `vl git colocate --prune` destroys every stash but the newest commit (`git stash list` is empty afterwards) and every commit only a reflog held (e.g. after `git reset --hard`). The docs say it expires unreachable entries only. It also keeps `git stash -a` plaintext (BUG-747). | `colocate_cmd.rs:832` runs `reflog expire --expire=now --expire-unreachable=now --all`. | `prune::bug743_prune_keeps_the_users_stashes_and_reflog` |
+| BUG-744 | high | `uncolocate` | After `vl git uncolocate`, `git add -A` stages `.env`, the cloaked files and all of `.veil/`, with no warning. Held commits and stashes stay in `.git`. | `remove_exclude` (`colocate_cmd.rs:880`) and `unguard_veil_dir` (`:899`) drop every guard; the warning counts skip-worktree entries only (`:884`). | `uncolocate::bug744_uncolocate_keeps_protected_files_out_of_git_add` |
+| BUG-745 | high | adoption | Adopting a checkout records local edits the user hid with `git update-index --skip-worktree` / `--assume-unchanged` as public changes; `vl commit` + `vl git push` publishes them. The bits are dropped from Git's index too. | Adoption (`colocate_cmd.rs:700-721`) never reads the index flags; `index::write` rebuilds flags with only skip-worktree (`git/index.rs:166`). | `adopt::bug745_adoption_never_publishes_edits_git_was_told_to_hide` |
+| BUG-746 | high | data loss | `git clean -ffdx` deletes `.veil` and the cloaked files, unrecoverably. Documented as an exception in the guide's table, but nothing brings it back. | `guard_veil_dir` (`git/colocate.rs:1629`): a nested-repository marker, which `-ff` overrides. | `clean::bug746_git_clean_ffdx_never_deletes_the_veil_repository` |
+| BUG-747 | medium | skip-worktree / stash | Once Git clears skip-worktree in frozen mode (`git sparse-checkout set`, `update-index --no-skip-worktree`), plain `git stash` stores the cloaked line's edit in a stash commit, which `--prune` keeps. The guide's limitation only mentions a loose object that `--prune` removes. | Bits are re-asserted only by the next `vl` command (`mirror_index`, `git/colocate.rs:981`); `prune` never touches `refs/stash` (`colocate_cmd.rs:828`). | `stash::bug747_a_stash_after_skip_worktree_is_cleared_holds_no_sealed_edit` |
+| BUG-748 | high | freeze / pre-commit | `vl ws switch` onto a cloaked line while a Git operation is in progress, or while a Git command holds `index.lock` (an IDE refresh), materialises the cloaked work without freezing: no `*`, no skip-worktree. `git commit -a` then commits it, passing `pre-commit`. Superseding and `pre-push` still keep it off the remote. A real race (looping `git add -A` during a switch) hashed all 30 cloaked files. | `open_session` skips follow and mirror (`colocate_cmd.rs:153`); `finish_session` writes the excludes with the stale `state.frozen` (`:207`, `:229`); `check_staged` trusts `state.frozen` / `state.skip` (`git/colocate.rs:1162`, `:1169`); files are written before the mirror runs. | `switch_race::bug748_a_switch_while_git_holds_the_index_lock_still_freezes`, `switch_race::bug748_a_switch_during_a_rebase_never_lets_git_commit_sealed_work` |
+| BUG-750 | medium | follow / tags | A Git branch named like a cloaked Veil tag retargets that cloaked tag to the public commit (the old target stays a visible head), and the mirror deletes the Git branch and detaches `HEAD`. A `vl push` would move the team's cloaked tag. | `follow_local` matches the tag whatever its cloak (`git/colocate.rs:612`); the mirror deletes refs in `state.refs` that Veil does not export (`:857`, `:875`). | `branches::bug750_a_branch_named_like_a_cloaked_tag_moves_neither` |
+| BUG-751 | medium | mirror / Git data loss | A Git branch whose name is not a valid Veil tag (`issue#12`) is deleted from `.git` by the next `vl` command. | Recorded in `state.refs` though not followed (`git/colocate.rs:594`), then deleted by the mirror (`:857`, `:875`). | `branches::bug751_a_branch_veil_cannot_follow_is_never_deleted` |
+| BUG-752 | medium | stash / exfiltration | `git bundle create --all` (and `git fast-export --all`) carry `refs/stash`, so `git stash -a` plaintext leaves in a file meant for sharing. The guide says the stash is "local, never pushed". | Only `pre-push` guards `refs/stash` (`check_push`, `git/colocate.rs:1084`); bundles run no hook. | `bundle::bug752_a_bundle_of_all_refs_carries_no_isolated_file` |
+| BUG-753 | medium | hooks | A `core.hooksPath` set after colocation (a hook manager's install) turns off both guards silently: `vl status` says nothing. A plain `git commit` and `git push` of cloaked content then go through. | The warning is printed only at install (`colocate_cmd.rs:494`) and by `--status`; `status_notes` (`:1014`) does not check it. | `hookspath::bug753_ordinary_commands_warn_when_the_guards_are_inactive` |
+| BUG-754 | medium | checkout / data loss | `git checkout` of an old commit that had a now-cloaked file overwrites it; the edit made since the last `vl` command is lost. Documented, but the design's mitigation (threat 8: excluded paths present in an exported commit go in the index as skip-worktree) is not implemented. | `mirror_index` takes only `HEAD`'s tree (`git/colocate.rs:991`). | `checkout_old::bug754_an_old_checkout_never_overwrites_a_cloaked_file` |
+| BUG-755 | low | attributes | Checkout transforms Git applies (`ident` expanding `$Id$`) are recorded as the member's edits, then exported, then re-expanded: a permanent spurious change. | The follow snapshots disk content (`colocate_cmd.rs:384`); Veil's attributes (`attributes.rs`) do not model `ident`. | `ident::bug755_a_git_checkout_transform_is_not_recorded_as_an_edit` |
+
+**Guards that held** (control: `controls::control_frozen_mode_keeps_sealed_edits_through_forced_checkouts`):
+frozen mode refused `git checkout`, `git checkout -f` and `git reset --hard`
+of an older commit and kept the sealed edit; `pre-commit` judged a linked
+worktree's own index; `info/exclude` applied in linked worktrees; an edit
+Veil had quarantined stayed out of `git stash` and `git stash -u`; a split
+index was read and written correctly; `git push --mirror` does not send
+`refs/stash`; `--prune` did remove commits only `ORIG_HEAD` named; cloaked
+descriptions never reached commit messages.
+
+## Round 9 hypotheses (not demonstrated)
+
+* **Quarantine before Veil looks.** A secret pasted into a file and stashed (`git stash` / `git stash -u`) before any `vl` command lands in a stash commit. Veil cannot see it in time; only a watcher (`vl watch`) narrows the window.
+* **`git status` racing the index write.** `git status` reads the index before taking `index.lock`, so an IDE refresh could write back an index without the bits Veil just set. Not reproduced; VS Code sets `GIT_OPTIONAL_LOCKS=0`.
+* **LFS and smudge filters.** With git-lfs installed, a tracked `.gitattributes` `filter=lfs` would make Veil record smudged content (as BUG-755), and `git add` of a hidden file would copy it into `.git/lfs/objects`, which object dumps do not check.
+* **A planted `.veil` in a Git checkout.** `vl init --colocate` refuses when `.veil` exists and suggests `vl git colocate`, which would open a Veil repository that came from the Git tree (same root cause as BUG-740).
+* **macOS.** `.VEIL` spellings on a case-insensitive file system (BUG-740/741) were not tested.
+
+## Round 9 coverage notes
+
+* **Index tricks:** `add -A`, `add -f`, `commit -a`, `update-index --no-skip-worktree`, `sparse-checkout set/disable`, split index, linked-worktree commits.
+* **History:** `stash` (plain, `-u`, `-a`, pop), `reset --hard`, `checkout`/`checkout -f` of old commits, `rebase -i` paused at `break`, `cherry-pick` of a held commit (superseded again), `worktree add`, `bundle`. Not run: `am`, `revert`, `filter-branch`, `notes` beyond reading the code.
+* **Network:** `pull` from a hostile upstream (BUG-740, 741, 755), plain `push` with `core.hooksPath` set (BUG-753), `push --mirror`. `--no-verify` remains the documented hole.
+* **Configuration:** `core.hooksPath`, `GIT_INDEX_FILE` in hooks, `gc --prune` through `vl git colocate --prune`. `includeIf`, `core.excludesFile` (lower precedence than `info/exclude`, so harmless) and `info/attributes` were reviewed, not attacked.
+* Only Git 2.53 on Linux; the design's version matrix (point 3) is still open.
+
+**Recommendation: keep `--experimental`.** Colocated mode can lose the
+flag only when all of the following hold, each with its test passing:
+
+1. **The Veil repository is out of reach of Git's work tree** (BUG-740, 741, 746): for example under `.git/` or outside the project, or every Git tree entry naming `.veil` refused before Git can check it out. No file Git may write may decide policy.
+2. **Protection does not depend on Git's ignore precedence** (BUG-742): a tracked `.gitignore` that un-ignores a protected path is detected on every command and the mode freezes, or colocation refuses it.
+3. **No `vl` command destroys Git data** (BUG-743, 751, 750): `--prune` expires only the reflog entries of held commits, and the mirror never deletes a ref it does not own.
+4. **Leaving and entering are safe** (BUG-744, 745): `uncolocate` keeps the excludes and lists every protected file; adoption treats skip-worktree and assume-unchanged edits as local-only.
+5. **The freeze happens before cloaked files reach disk** (BUG-748), and `pre-commit` decides from the live workspace, not from `colocated.json`.
+6. The design's Git-version matrix and interleaving property test run clean on Linux and macOS.
+
+The medium findings (BUG-747, 752, 753, 754) should be fixed or plainly
+documented as leaks in the guide, not as recoverable limitations.
