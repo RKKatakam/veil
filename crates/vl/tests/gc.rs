@@ -78,4 +78,8 @@ fn gc_packs_prunes_and_keeps_the_repository_usable() {
     vl(&home, &proj, &["undo"]);
     let st = vl(&home, &proj, &["status"]);
     assert!(st.contains("after.txt"), "{st}");
+
+    // fsck (from the durability stream) understands packed and pruned repos.
+    let out = vl(&home, &proj, &["fsck"]);
+    assert!(out.contains("No corruption found"), "{out}");
 }

@@ -421,6 +421,7 @@ fn gc_keeps_embargo_fallbacks_that_are_the_only_reference() {
             conflicts: vec![],
             cloak: None,
             embargo: Some(embargo.clone()),
+            signature: None,
         })
         .unwrap();
     tx.view
@@ -602,7 +603,7 @@ fn gc_with_a_concurrent_writer() {
             loop {
                 match repo.snapshot_workspace(WS, &*writer_fs) {
                     Ok(_) => break,
-                    Err(VeilError::Locked) => continue,
+                    Err(VeilError::Locked(_)) => continue,
                     Err(e) => panic!("{e}"),
                 }
             }
