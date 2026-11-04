@@ -755,7 +755,6 @@ fn op_restore_returns_to_an_exact_earlier_state() {
 
 // Scenario from guide "Undo anything" ("Run it again to go further back") / jj test_undo (repeated).
 #[test]
-#[ignore = "BUG-247: a second `vl undo` undoes the first undo (re-applying the operation) instead of going further back as the guide says"]
 fn repeated_undo_walks_back_through_rewrites() {
     let env = Env::new();
     let r = chain(&env);

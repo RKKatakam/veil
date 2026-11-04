@@ -45,9 +45,11 @@ quarantined) stay where they are; see
 [the working copy and the filesystem](troubleshooting.md#the-working-copy-and-the-filesystem).
 
 **Undo and switching.** `vl ws switch` is an operation of its own, and
-`vl undo` right after it switches back: the edits you had made in the
-workspace you left were recorded there and stay there. Each workspace keeps
-its own unrecorded edits whatever you undo.
+`vl undo` right after it switches back (`vl redo` switches again): the
+edits you had made in the workspace you left were recorded there and stay
+there. Each workspace keeps its own unrecorded edits whatever you undo or
+redo; an undo that would delete a workspace holding recorded edits (undoing
+its `vl ws new`) is refused.
 
 In revisions, `NAME@` is a workspace's working copy: `vl diff -r agent@`,
 `vl merge agent@`, `vl show fix-cve@`. In `vl log`, `agent@` marks it.

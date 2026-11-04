@@ -270,15 +270,31 @@ Undid: commit change yyntkszx
 Working copy now at: yyntkszx 4094f80d (no description set)
 ```
 
-* `vl undo` undoes the last operation. Running it again undoes the undo
-  (a redo); to go further back, find the operation in `vl op log` and use
-  `vl op restore`.
+* `vl undo` undoes the last operation. Run it again to go further back:
+  each undo takes back the command before the one the previous undo took
+  back (undos themselves are skipped, as in jj).
+* `vl redo` re-applies what the latest undo took back; run it again to
+  take back the undo before that. Any other command after an undo (a
+  commit, a rebase, a tag move…) leaves nothing to redo; editing files
+  does not.
+
+```text
+$ vl undo
+Undid: commit change yyntkszx
+$ vl undo
+Undid: set tag main
+$ vl redo
+Redid: set tag main
+```
+
 * `vl op restore <id>` returns the whole repository (changes, tags,
   workspaces) to the state after operation `<id>`.
 * Both **keep the files on disk that you had not recorded yet**: the
   automatic snapshot taken before `undo` is not what gets undone. After
-  `vl ws switch`, `vl undo` switches back; the edits of each workspace stay
-  in that workspace.
+  `vl ws switch`, `vl undo` switches back (and `vl redo` switches again);
+  the edits of each workspace stay in that workspace. An undo that would
+  delete a workspace holding recorded edits (undoing its `vl ws new`) is
+  refused and changes nothing.
 * Some commands change things the operation log does not hold: key rings
   (`vl scope create`, `grant`, `revoke`, `rotate`), remotes (`vl remote add`,
   `rm`), the local vault (`vl secret set`, `rm`, `import`) and the accepted

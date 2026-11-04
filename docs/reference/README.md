@@ -59,7 +59,8 @@ Global options (accepted by every command):
 | [`vl scope`](scope.md) | Key scopes and their members (identity rings) |
 | [`vl workspace`](workspace.md) | Virtual workspaces (replacing worktrees) |
 | [`vl op`](op.md) | Inspect or restore the operation log |
-| [`vl undo`](undo.md) | Undo the last operation |
+| [`vl undo`](undo.md) | Undo the last operation; run again to go further back |
+| [`vl redo`](redo.md) | Re-apply what the latest `vl undo` took back |
 | [`vl watch`](watch.md) | Snapshot continuously as files change |
 | [`vl remote`](remote.md) | Manage remotes |
 | [`vl push`](push.md) | Send tags and their history to a remote (visibility-filtered) |

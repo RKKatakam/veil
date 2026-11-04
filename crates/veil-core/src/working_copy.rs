@@ -168,20 +168,32 @@ impl Repo {
         Ok(None)
     }
 
-    /// If the newest command (automatic snapshots of `ws` aside) attached
-    /// the project directory to `ws`, the workspace it came from: `vl undo`
-    /// then goes back to that workspace instead of restoring a view (the
-    /// attachment is not in the view). The edits of either workspace are
-    /// kept: each was recorded into its own workspace.
-    pub fn last_command_switch(&mut self, ws: &str) -> Result<Option<String>> {
-        self.reload()?;
-        let op = self.ops().get(&self.last_command_op(ws)?)?;
+    /// If `op` (what `vl undo` in `ws` undoes, see [`Repo::undo_target`])
+    /// attached the project directory to `ws`, the workspace it came from:
+    /// `vl undo` then goes back to that workspace instead of restoring a
+    /// view (the attachment is not in the view). The edits of either
+    /// workspace are kept: each was recorded into its own workspace.
+    pub fn undo_switch(&self, ws: &str, op: &ObjectId) -> Result<Option<String>> {
+        let op = self.ops().get(op)?;
         if op.manual_undo.is_none() {
             return Ok(None);
         }
         Ok(parse_switch_description(&op.description)
             .filter(|(from, to)| to == ws && self.view().workspaces.contains_key(from))
             .map(|(from, _)| from))
+    }
+
+    /// If `op` (what `vl redo` in `ws` re-applies, see
+    /// [`Repo::redo_target`]) attached the project directory from `ws` to
+    /// another workspace, that workspace: `vl redo` switches to it again.
+    pub fn redo_switch(&self, ws: &str, op: &ObjectId) -> Result<Option<String>> {
+        let op = self.ops().get(op)?;
+        if op.manual_undo.is_none() {
+            return Ok(None);
+        }
+        Ok(parse_switch_description(&op.description)
+            .filter(|(from, to)| from == ws && self.view().workspaces.contains_key(to))
+            .map(|(_, to)| to))
     }
 
     /// Record, as an operation of its own, that the project directory moves
@@ -192,7 +204,24 @@ impl Repo {
     /// the workspace just left, which would drop the edits recorded there
     /// (BUG-100).
     pub fn record_workspace_switch(&mut self, from: &str, to: &str) -> Result<Option<ObjectId>> {
+        self.record_switch(from, to, |_| {})
+    }
+
+    /// [`Repo::record_workspace_switch`] for `vl undo` of the switch `undone`
+    /// (see [`Repo::undo_switch`]).
+    pub fn record_workspace_switch_undo(&mut self, from: &str, to: &str, undone: ObjectId) -> Result<Option<ObjectId>> {
+        self.record_switch(from, to, |tx| tx.undo_of(undone))
+    }
+
+    /// [`Repo::record_workspace_switch`] for `vl redo` taking back the undo
+    /// `undo` (see [`Repo::redo_switch`]).
+    pub fn record_workspace_switch_redo(&mut self, from: &str, to: &str, undo: ObjectId) -> Result<Option<ObjectId>> {
+        self.record_switch(from, to, |tx| tx.redo_of(undo))
+    }
+
+    fn record_switch(&mut self, from: &str, to: &str, link: impl FnOnce(&mut crate::transaction::Transaction<'_>)) -> Result<Option<ObjectId>> {
         let mut tx = self.transaction(switch_description(from, to))?;
+        link(&mut tx);
         tx.view.workspace(to)?;
         tx.manual_undo(format!(
             "it attached the project directory to another workspace, which is not part of the operation log; \

@@ -1,11 +1,12 @@
 //! Property test (BUG-100): random sequences of `vl ws switch`, edits,
-//! `vl commit` and `vl undo` through the real binary never lose an edit the
-//! user had not recorded yet. The guide: undo and `op restore` "keep the
-//! files on disk that you had not recorded yet".
+//! `vl commit`, `vl undo` and `vl redo` through the real binary never lose
+//! an edit the user had not recorded yet. The guide: undo and `op restore`
+//! "keep the files on disk that you had not recorded yet".
 //!
 //! Every edit is a new file with unique content, written into the project
 //! directory while it is attached to some workspace. Whatever `vl undo`
-//! undoes (a commit, a switch, an undo) or refuses to undo, at the end each
+//! undoes (a commit, a switch, going further back past earlier undos) or
+//! `vl redo` re-applies, or either refuses, at the end each
 //! edit must still be in the working copy of the workspace it was made in.
 
 mod adversarial_support;
@@ -22,6 +23,7 @@ enum Step {
     Switch(usize),
     Commit,
     Undo,
+    Redo,
 }
 
 fn step() -> impl Strategy<Value = Step> {
@@ -30,6 +32,7 @@ fn step() -> impl Strategy<Value = Step> {
         3 => (0..WORKSPACES.len()).prop_map(Step::Switch),
         1 => Just(Step::Commit),
         3 => Just(Step::Undo),
+        2 => Just(Step::Redo),
     ]
 }
 
@@ -71,6 +74,10 @@ proptest! {
                     // Refusing is allowed (nothing to undo, a grant…); a
                     // crash or lost work is not.
                     log.push(format!("undo → {}", text(&out).trim().replace('\n', " | ")));
+                }
+                Step::Redo => {
+                    let out = env.vl(U, &proj, &["redo"]);
+                    log.push(format!("redo → {}", text(&out).trim().replace('\n', " | ")));
                 }
             }
             // Where the directory is attached now (an undone switch moves it).

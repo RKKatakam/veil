@@ -303,11 +303,13 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         }
         Cmd::Undo => {
             let ws = ctx.ws.clone();
+            ctx.repo.reload()?;
+            let target = ctx.repo.undo_target(&ws)?;
             // The attachment is not in the view: undoing `vl ws switch` is
             // switching back (each workspace keeps its own edits).
-            if let Some(from) = ctx.repo.last_command_switch(&ws)? {
+            if let Some(from) = ctx.repo.undo_switch(&ws, &target)? {
                 ctx.attach(&from)?;
-                ctx.repo.record_workspace_switch(&ws, &from)?;
+                ctx.repo.record_workspace_switch_undo(&ws, &from, target)?;
                 println!("Undid: switch the project directory from workspace '{}' to '{}'", safe(&from), safe(&ws));
                 return Ok(ExitCode::SUCCESS);
             }
@@ -316,6 +318,19 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             if let Some(e) = undone.strip_prefix(RELEASE_OP_PREFIX) {
                 println!("Embargo {} is unreleased again: its key had not left this repository.", safe(e));
             }
+        }
+        Cmd::Redo => {
+            let ws = ctx.ws.clone();
+            ctx.repo.reload()?;
+            let (undo, target) = ctx.repo.redo_target(&ws)?;
+            if let Some(to) = ctx.repo.redo_switch(&ws, &target)? {
+                ctx.attach(&to)?;
+                ctx.repo.record_workspace_switch_redo(&ws, &to, undo)?;
+                println!("Redid: switch the project directory from workspace '{}' to '{}'", safe(&ws), safe(&to));
+                return Ok(ExitCode::SUCCESS);
+            }
+            let (_, redone) = ctx.repo.redo_keeping_edits(&ws)?;
+            println!("Redid: {}", safe(&redone));
         }
         Cmd::Watch { interval_ms } => cmd_watch(ctx, *interval_ms)?,
         Cmd::Remote(c) => cmd_remote(ctx, c)?,

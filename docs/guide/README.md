@@ -30,7 +30,7 @@ vl init                          # a repository in the current directory
 vl status                        # there is no `add`: every command snapshots the working copy
 vl commit -m "What I did"        # describe this change and start a new one on top
 vl log                           # the snapshot graph
-vl undo                          # step back through the operation log
+vl undo                          # step back through the operation log (`vl redo` to step forward)
 ```
 
 * There is **no staging area**. Every `vl` command first records the files on

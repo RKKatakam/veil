@@ -314,8 +314,17 @@ pub enum Cmd {
     /// Inspect or restore the operation log.
     #[command(subcommand)]
     Op(OpCmd),
-    /// Undo the last operation.
+    /// Undo the last operation; run again to go further back.
+    ///
+    /// Automatic snapshots (your unrecorded edits) and earlier undos are
+    /// skipped, and the edits on disk are kept. `vl redo` re-applies what
+    /// the latest undos took back.
     Undo,
+    /// Re-apply what the latest `vl undo` took back.
+    ///
+    /// Successive redos take back successive undos, newest first. Any other
+    /// command after an undo leaves nothing to redo.
+    Redo,
     /// Snapshot continuously as files change.
     Watch {
         /// How often to snapshot, in milliseconds.
