@@ -248,13 +248,15 @@ Veil records UTF-8 names only. Rename the file.
 Veil 1.0 doesn't record symlinks, and never writes through one. Replace the
 link with a regular file, or ignore the path.
 
-### `vl init` in a Git checkout records `.git/`
+### `vl init` in a Git checkout: is `.git/` recorded?
 
-`.git/` isn't ignored by default, so `vl init` (and every snapshot) inside
-a Git working tree records it as public files. In a throwaway CI
-repository that's harmless. Otherwise add `.git/  ignore` to `.veilpolicy`
-before `vl init` records anything, or start from `vl git import` in a
-fresh directory ([GitHub](github.md)).
+No. VCS metadata (`.git`, `.jj/`, `.hg/`, `.svn/`) is ignored by the
+engine at any depth, whatever `.veilpolicy` says, unless a `public!` rule
+names the directory itself. Versions of `vl` before 1.0 recorded `.git/`;
+the next snapshot with this version records it as deleted (your `.git/` on
+disk is left alone), but earlier snapshots keep it, so treat anything
+secret in `.git/config` (tokens in remote URLs) as exposed to whoever has
+those snapshots.
 
 ### `warning: workspace 'X' no longer exists; attaching to 'Y'`
 
@@ -303,9 +305,9 @@ Reword it with `vl describe -r @- -m …`.
 **Where is my work after `vl undo`?** Unrecorded edits on disk are kept.
 Everything else is in the operation log: `vl op log`, `vl op restore ID`.
 
-**Can I use Veil and Git in the same directory?** Not recommended: `vl
-init` would record `.git/` (see above), and both tools would track the same
-files. Use `vl git import` in a separate directory and push to GitHub with
+**Can I use Veil and Git in the same directory?** Veil never records
+`.git/` (see above), but both tools would track the same files. Prefer
+`vl git import` in a separate directory and push to GitHub with
 `vl git push`.
 
 **Is my `.env` safe?** It's never recorded or pushed, by any command,

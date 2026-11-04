@@ -159,12 +159,10 @@ pub(crate) fn public_text(store: &ObjectStore, veil: &Veil, t: &Text) -> (String
 /// a colocated working copy would take as its repository)? Any ASCII case,
 /// and with HFS+-ignorable code points anywhere (`.g\u{200C}it`), as Git's
 /// `is_hfs_dotgit` does: on macOS those all name the same directory.
+/// The same test as the engine's built-in VCS ignore
+/// ([`crate::policy::vcs_metadata_name`]).
 pub(crate) fn is_git_dir_name(name: &str) -> bool {
-    if name.is_ascii() {
-        return name.eq_ignore_ascii_case(".git");
-    }
-    let mut folded = name.chars().filter(|c| !crate::vpath::is_hfs_ignorable(*c));
-    ".git".chars().all(|r| folded.next().is_some_and(|c| c.eq_ignore_ascii_case(&r))) && folded.next().is_none()
+    crate::policy::vcs_metadata_name(name) == Some(".git")
 }
 
 impl GitBridge {

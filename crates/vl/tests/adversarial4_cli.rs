@@ -162,16 +162,15 @@ fn a_members_reordered_edit_is_accepted_in_their_order() {
 }
 
 /// The same edit while a teammate's change is pending (any change Bob has
-/// not accepted, here an unrelated `.env public!`). Now "exactly his edit"
-/// is applied to the accepted policy by `Policy::with_edit`, which *appends*
-/// the rules he added. Bob wrote `notes/** public` above his exception; in
-/// the accepted policy it lands below it and overrides it, so the accepted
-/// policy now says `notes/private.md` is public. Nothing shows this (his
-/// working copy's own file still isolates it). When Alice's next policy
-/// drops the exception, Bob's private notes are recorded in plaintext and
-/// pushed, with no warning and no `vl policy accept`.
+/// not accepted, here an unrelated `.env public!`). "Exactly his edit" is
+/// applied to the accepted policy. It used to be applied by *appending* the
+/// rules he added (BUG-073): Bob wrote `notes/** public` above his
+/// exception, in the accepted policy it landed below it and overrode it, so
+/// the accepted policy said `notes/private.md` is public. When Alice's next
+/// policy dropped the exception, Bob's private notes were recorded in
+/// plaintext and pushed, with no warning and no `vl policy accept`. Now his
+/// rule keeps its place (`policy::fold_edit`).
 #[test]
-#[ignore = "BUG-073: a member's policy edit made while a change is pending is accepted out of order (added rules appended), so a later policy can publish their isolated file silently"]
 fn a_members_edit_during_a_pending_change_keeps_their_rule_order() {
     let env = Env::new();
     let (alice, bob) = team_with_private_notes(&env);

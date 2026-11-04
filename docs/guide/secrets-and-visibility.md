@@ -89,6 +89,10 @@ These come before your rules and **cannot be made public by a plain
 
 ```text
 $ vl policy show
+built-in      .git                     ignore  (dirs and files, any depth)
+built-in      .jj                      ignore  (dirs, any depth)
+built-in      .hg                      ignore  (dirs, any depth)
+built-in      .svn                     ignore  (dirs, any depth)
 built-in      .env                     isolate
 built-in      .env.*                   isolate
 built-in      .envrc                   isolate
@@ -116,8 +120,17 @@ built-in      .env.dist                public
 .veilpolicy   node_modules/            ignore
 ```
 
-A plain `public` rule on one of them is ignored, and every command warns
-until you remove it:
+The first four keep the metadata of version control systems out of every
+snapshot: `.git` (a directory, or the `.git` file of a Git worktree or
+submodule), `.jj/`, `.hg/` and `.svn/`, at any depth and in any case. No
+rule of yours records them, not even `** public` or `vendor/ public!`; only
+a `public!` rule that names the directory itself does
+(`fixtures/repo/.git/ public!`), for a test fixture that really is a
+repository.
+
+A plain `public` rule on a built-in secret is ignored, and every command
+warns until you remove it or settle it with a later `public!`
+(`vl expose --force`):
 
 ```text
 $ vl expose t.pem
@@ -239,10 +252,8 @@ PUBLIC    leak.js:1  aws-access-key-id AKIA…(20 chars)
 found: 1 public file(s) contain secrets; they are quarantined from snapshots until cloaked, isolated or fixed
 ```
 
-In a GitHub Actions step this fails the job on a hit. Note that `vl init`
-in a Git checkout also records `.git/` (it is not ignored by default); that
-is harmless in a throwaway CI repository, but see
-[Troubleshooting](troubleshooting.md#vl-init-in-a-git-checkout-records-git).
+In a GitHub Actions step this fails the job on a hit. `vl init` in a Git
+checkout never records `.git/` (see the built-in rules above).
 
 ## The vault: `vl secret` and `vl run`
 
