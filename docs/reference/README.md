@@ -50,8 +50,8 @@ Global options (accepted by every command):
 | [`vl split`](split.md) | Split a change in two: what you choose, then the rest |
 | [`vl squash`](squash.md) | Move a change, or part of it, into its parent or another change |
 | [`vl restore`](restore.md) | Restore paths in the working copy from another snapshot |
-| [`vl duplicate`](duplicate.md) | Copy changes onto new parents, as new changes (not implemented yet) |
-| [`vl cherry-pick`](cherry-pick.md) | Copy changes onto the working copy's parent: `vl duplicate REV… -d @-`, then the working copy moves on top (not implemented yet) |
+| [`vl duplicate`](duplicate.md) | Copy changes onto new parents, as new changes (merges follow renames; nothing changes audience) |
+| [`vl cherry-pick`](cherry-pick.md) | Copy changes onto the working copy's parent: `vl duplicate REV… -d @-`, then the working copy moves on top |
 | [`vl merge`](merge.md) | Merge REVS into the current line of work |
 | [`vl embargo`](embargo.md) | Manage embargoes created by delayed-visibility merges |
 | [`vl tag`](tag.md) | Manage tags (named pointers into the snapshot graph) |

@@ -443,9 +443,13 @@ fn base_body(i: usize, a: Aud) -> String {
     (0..10).map(|l| format!("{}:f{i}:l{l}\n", a.tag())).collect()
 }
 
+/// A side's files (path, entry) and the tokens it wrote (with their
+/// audience).
+type Side = (Vec<(String, TreeEntry)>, Vec<(String, Aud)>);
+
 /// Apply one side's ops; returns the tree and the tokens it introduced
 /// with their audience.
-fn side(r: &Repo, files: &[Aud], ops: &[Op], who: &str, line: usize) -> (Vec<(String, TreeEntry)>, Vec<(String, Aud)>) {
+fn side(r: &Repo, files: &[Aud], ops: &[Op], who: &str, line: usize) -> Side {
     let mut out = Vec::new();
     let mut tokens = Vec::new();
     for (i, (a, op)) in files.iter().zip(ops).enumerate() {

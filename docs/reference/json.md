@@ -24,6 +24,7 @@ text:
 | [`vl squash`](squash.md) (a write command) | [`veil.squash/1`](#veilsquash1) |
 | [`vl blame`](blame.md) | [`veil.blame/1`](#veilblame1) |
 | [`vl grep`](grep.md) | [`veil.grep/1`](#veilgrep1) |
+| [`vl duplicate`](duplicate.md), [`vl cherry-pick`](cherry-pick.md) (write commands) | [`veil.duplicate/1`](#veilduplicate1) |
 | any of them, on failure | [`veil.error/1`](#veilerror1) |
 
 ```sh
@@ -632,6 +633,29 @@ Members see newer content there.
 
 The exit status is 0 when something matched and 1 when nothing did, with
 the document printed either way.
+
+## `veil.duplicate/1`
+
+`vl duplicate --json` and `vl cherry-pick --json`: the copies made, as one
+operation. Ids only: no description appears here (a sealed one stays out
+of the document, a plain one is a `vl show` away).
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `veil.duplicate/1` |
+| `duplicates` | array | One per copy, parents before children (for cherry-pick, in the order applied) |
+| `working_copy` | object | Cherry-pick only: where `@` is now (`snapshot_id`, `change_id`) |
+| `tags_advanced` | array of strings | Cherry-pick only, omitted when empty: the tags at `@-` that moved to the last copy |
+| `operation` | object | The head of the operation log afterwards: `op_id`, `op_short` |
+
+A copy:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `source` | object | The change copied: `snapshot_id`, `change_id` (reverse hex) |
+| `duplicate` | object | The new change: `snapshot_id`, `change_id` |
+| `conflicts` | array of strings | Paths that conflicted while applying the change (recorded in the copy) |
+| `renames` | array | Renames the copy followed: `from`, `to`, `score` (similarity in percent), `how` (`followed`, `both`, `rename/delete` or `rename/rename`), `other` (string, rename/rename only: the other side's name) and `sealed` (string, omitted when public: the audience the file stays sealed for at its new path) |
 
 ## `veil.error/1`
 

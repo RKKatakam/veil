@@ -12,7 +12,7 @@
 //! Conflict markers show the base's version only where its audience is the
 //! result's (BUG-126).
 //!
-//! Renames are followed (see [`follow_renames`]): when one side renamed a
+//! Renames are followed (see [`FollowedRename`]): when one side renamed a
 //! file and the other edited it, the edit is merged at the new path instead
 //! of being a modify/delete conflict. Pairs are found by
 //! [`crate::rename::detect`] as a public mirror reads the trees, and only

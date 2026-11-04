@@ -374,10 +374,11 @@ pub enum Cmd {
         #[arg(long)]
         from: Option<String>,
     },
-    /// Copy changes onto new parents, as new changes (not implemented yet).
+    /// Copy changes onto new parents, as new changes (merges follow
+    /// renames; nothing changes audience).
     Duplicate(rewrite_cmd::DuplicateArgs),
     /// Copy changes onto the working copy's parent: `vl duplicate REV… -d
-    /// @-`, then the working copy moves on top (not implemented yet).
+    /// @-`, then the working copy moves on top.
     CherryPick(rewrite_cmd::CherryPickArgs),
     /// Merge REVS into the current line of work.
     Merge {

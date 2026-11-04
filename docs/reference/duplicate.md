@@ -3,7 +3,7 @@
 
 # `vl duplicate`
 
-Copy changes onto new parents, as new changes (not implemented yet)
+Copy changes onto new parents, as new changes (merges follow renames; nothing changes audience)
 
 ```text
 vl duplicate [OPTIONS] <REVS>...
@@ -13,7 +13,7 @@ Arguments:
 
 | | |
 |---|---|
-| `<REVS>…` | Changes to duplicate (required) |
+| `<REVS>…` | Changes to duplicate (ranges such as `A..B` name several) (required) |
 
 Options:
 

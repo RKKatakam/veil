@@ -186,7 +186,7 @@ fn a_killed_duplicate_leaves_the_repository_consistent() {
         let _ = c.kill();
         let _ = c.wait();
         let now = r.visible_changes().len();
-        assert!(now == before || (now - before) % 60 == 0, "all or nothing: {before} → {now}");
+        assert!(now == before || (now - before).is_multiple_of(60), "all or nothing: {before} → {now}");
         r.ok(&["fsck"]);
         r.ok(&["status"]);
     }
