@@ -5,7 +5,7 @@
 //! `docs/BUGS.md` ("Round 4 findings"); the others are controls.
 
 mod adversarial_support;
-#[allow(dead_code, unused_imports)]
+#[allow(unused_imports)]
 #[path = "../../veil-core/tests/adversarial_support/mod.rs"]
 mod core_support;
 
