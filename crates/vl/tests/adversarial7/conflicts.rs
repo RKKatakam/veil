@@ -51,7 +51,6 @@ fn squash_into_a_cloaked_change_seals_a_public_edit() {
 /// cloaked change, the conflict object and that side are sent to a public
 /// remote, and Carol's checkout of the cloaked change shows it.
 #[test]
-#[ignore = "BUG-480: squash into a cloaked change leaves a conflict's public side unsealed"]
 fn squash_into_a_cloaked_change_seals_the_public_side_of_a_conflict_it_brings() {
     let env = Env::new();
     let proj = squash_public_work_into_cloaked_change(&env, true);
@@ -78,7 +77,6 @@ fn squash_into_a_cloaked_change_seals_the_public_side_of_a_conflict_it_brings() 
 /// A restore puts back a recorded *version*; its audience is part of it
 /// (as `vl resolve --theirs` keeps a side's sealing).
 #[test]
-#[ignore = "BUG-481: vl restore --from records a cloaked version's plaintext as public"]
 fn restore_from_a_cloaked_version_keeps_it_sealed() {
     let env = Env::new();
     let proj = sealed_conflict(&env);
@@ -98,7 +96,6 @@ fn restore_from_a_cloaked_version_keeps_it_sealed() {
 /// the markers, sealed side included, as a public file: pushed to a public
 /// remote, Carol reads `SEALED-SIDE-0042`.
 #[test]
-#[ignore = "BUG-481: vl restore --from of a conflict records its sealed side as public"]
 fn restore_from_a_conflict_does_not_publish_its_sealed_side() {
     let env = Env::new();
     let proj = sealed_conflict(&env);
@@ -135,7 +132,6 @@ fn a_published_conflict_shows_its_sealed_side_redacted() {
 /// an exposure nobody asked for, and pushing the line publishes what was
 /// just moved into the cloaked change.
 #[test]
-#[ignore = "BUG-483: a partial squash into a cloaked parent leaves the moved file public in the source"]
 fn a_file_squashed_into_a_cloaked_parent_does_not_stay_public_in_the_source() {
     let env = Env::new();
     let proj = env.project(U, "proj", &[("a.txt", "one\ntwo\nthree\n"), ("b.txt", "b\n")]);

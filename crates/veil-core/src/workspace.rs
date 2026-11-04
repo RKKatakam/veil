@@ -53,6 +53,13 @@ pub struct SnapshotOptions<'a> {
     /// old snapshot's files into the new one. Checked under the repository
     /// lock, so no other command can slip in between.
     pub expected_wc: Option<ObjectId>,
+    /// Entries a command put back from another revision (`vl restore`):
+    /// it wrote what each materialises to into `fs`. The files at these
+    /// paths are judged against these entries instead of the working
+    /// copy's, so a version put back as it was keeps its audience (a
+    /// sealed version stays sealed, a conflict stays the same conflict,
+    /// BUG-481); an edit made on top of it is sealed as an edit of it.
+    pub carried: &'a [(VPath, crate::object::TreeEntry)],
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +174,7 @@ impl Repo {
             description,
             policy_incoming,
             expected_wc,
+            carried,
         } = opts;
         let mut tx = self.transaction(description.unwrap_or_else(|| snapshot_op_description(ws)))?;
         let wc_id = tx.view.workspace(ws)?.wc;
@@ -184,6 +192,12 @@ impl Repo {
         let wp = tx.repo().snapshot_policy(fs, (!policy_incoming).then_some(&wc.tree))?;
         let store = tx.repo().store.clone();
         let rescan = scanner_outdated(&*tx.repo().backend, ws)?;
+        // What `fs` was materialised from: the working copy, with the
+        // entries a command put back in place of its own.
+        let mut parent_tree = wc.tree;
+        for (p, e) in carried {
+            parent_tree = crate::conflict::set_entry(&store, &parent_tree, p, Some(e.clone()))?;
+        }
         let repo = tx.repo();
         let line_base = || Ok(repo.parents_tree(&wc.parents)?.tree);
         let (tree, report) = build_tree_cached(
@@ -191,7 +205,7 @@ impl Repo {
             fs,
             &BuildOptions {
                 policy: &wp.policy,
-                parent_tree: Some(wc.tree),
+                parent_tree: Some(parent_tree),
                 cloak: wc.cloak.as_deref(),
                 injected,
                 rescan,
@@ -224,6 +238,15 @@ impl Repo {
             let cur = lookup(&store, &tree, &p).ok().flatten();
             old.is_some() && old == cur
         });
+        // A conflict put back as it was is a conflict of this change again.
+        for (p, e) in carried {
+            if e.kind == crate::object::EntryKind::Conflict
+                && lookup(&store, &tree, p).ok().flatten().as_ref() == Some(e)
+                && !new.conflicts.iter().any(|c| c == p.as_str())
+            {
+                new.conflicts.push(p.to_string());
+            }
+        }
         let id = tx.rewrite(wc_id, new)?;
         let backend = tx.repo().backend.clone();
         tx.commit()?;

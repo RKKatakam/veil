@@ -693,6 +693,25 @@ CAS, and it applies these rules in order:
      merge its merged parents (BUG-208), as in jj. Path arguments are
      relative to the current directory; a path outside the repository is
      refused, and `\` is an ordinary character (BUG-204).
+     **A version put back keeps its audience** (BUG-481). The restored
+     files are not judged as edits of `@`'s entries (whose audience is
+     `@`'s, often public): a sealed version (cloaked, or under an embargo,
+     as its object proves) and a conflict entry are recorded as the entry
+     they were written from (`SnapshotOptions::carried`), the conflict
+     exactly as it was (and listed as a conflict of `@` again), a sealed
+     file with `@`'s last public version at that path as its fallback (as
+     the builder gives a sealed edit). A plaintext version is an ordinary
+     edit: the policy and `@`'s line decide its sealing, which can only
+     narrow it. A sealed version this reader cannot read is not restored
+     (it is reported `redacted`; its last public version is not it). Into
+     a working copy under an unreleased embargo, a version sealed for
+     another audience, or a conflict, is refused: it cannot be put into the
+     embargo's tree as it is, and taking it in as an edit would seal it
+     under the embargo's key, which its release publishes. The other routes
+     that put recorded versions into `@` already keep them: `vl resolve
+     --ours/--theirs/--base` takes a term's entry as recorded, `vl new`/`vl
+     edit` check a tree out as it is, and split/squash halves keep each
+     version's sealing (below).
 5. Cloaked files are sealed under their scope. In a cloaked workspace, every
    public file it introduces is sealed under the workspace scope, and the
    description is too.
@@ -1155,7 +1174,23 @@ struct Snapshot {
     chosen part is merged into the destination. A source left with nothing
     is abandoned and its description joined, as a whole squash always did;
     otherwise both keep their descriptions. A cloaked destination seals
-    what it gains (`seal_introduced`).
+    what it gains (`seal_introduced`), the public versions of a conflict
+    entry it gains included (each version readers without the key could
+    not already see at that path is sealed, the conflict keeping its
+    shape, BUG-480). Where the source keeps its own tree (into its parent
+    or an ancestor), what the destination sealed is sealed in the source
+    too (`embargo::seal_moved`, BUG-483): a file the source holds as it
+    gave it takes the destination's sealed entry (so the moved part
+    leaves the source's own change), and a file the source edited further
+    is an edit on top of sealed content and is sealed like it, with the
+    last public version as its fallback. Otherwise the source would hold
+    the moved work as public plaintext on top of the sealed version (a
+    `cloaked:team → public` exposure in its diff, published by the next
+    push of the line). The older public version that readers without the
+    key still see there (the destination's fallback, in the history
+    below it) is not a leak: it was public before the squash and the
+    squash adds nothing to it; the new content is sealed everywhere it
+    is.
   * **Audiences** (§4 rule 5). Hunks are offered only when the reader can
     read both versions (a version it cannot read makes the file whole:
     nobody chooses lines they cannot see), both labels are verified against
@@ -1180,7 +1215,12 @@ struct Snapshot {
     random selections, that the halves are the selection and its complement,
     that every entry keeps one of its versions' audiences, that squashing
     the halves together gives the original tree, and that undo restores the
-    view.
+    view. Another (`vl/tests/adversarial7/rewrites.rs`) runs random
+    sequences of squash (whole, partial, into and out of a cloaked change),
+    split, rebase onto a cloaked change, restore and resolve through the
+    binary, publishing every change to a public mirror after each command
+    and searching the mirror's decoded objects for every text written in
+    the cloaked workspace.
 * **Visibility never silently widens.** Declassification (any move from
   cloaked or embargoed to more visible) is an explicit act by a member: a
   `vl merge` of a cloaked line of work, or a `vl expose`, both of which go
@@ -1714,6 +1754,14 @@ content object is in the plan, or its path was never public there:
 push), `modified`. Paths changed under an unreleased embargo are listed as
 withheld only for a reader holding its key; others get the snapshot id and
 the embargo, nothing about which files it changes.
+The push sends an object by what it is (a plaintext blob goes to a
+public remote whatever its entry's label says), so the plan decides the
+same way: a sealed label is checked against its object
+(`builder::verify_sealing`), and a file labelled `cloaked:team` whose
+object is plaintext is listed as published (BUG-482). `vl ls`, `vl
+files` and the tier marks use the same verified visibility. A public
+label is taken as it is: if its object is in fact sealed, the push
+withholds it, so the plan can only overstate what becomes public.
 
 Benchmark (`cargo test --release -p veil-core --test sftp_bench --
 --ignored --nocapture`): 3,000 files, 300 snapshots, about 7,850 objects,

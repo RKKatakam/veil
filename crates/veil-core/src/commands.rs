@@ -462,10 +462,12 @@ impl Repo {
     /// destination's, as a whole squash always did.
     ///
     /// * into its **parent**: the parent gets the chosen part; the source's
-    ///   own tree is unchanged (it already held everything);
+    ///   own tree is unchanged (it already held everything), except that
+    ///   what a cloaked destination sealed is sealed in it too
+    ///   ([`crate::embargo::seal_moved`]);
     /// * into an **ancestor**: the chosen part is merged into it, the
     ///   changes in between are rebased onto it, and the source keeps its
-    ///   tree;
+    ///   tree (sealed the same way);
     /// * into a **descendant**: the source keeps the rest, the changes in
     ///   between are rebased without the chosen part, and the destination
     ///   keeps its tree;
@@ -600,18 +602,31 @@ impl Repo {
             let out = crate::merge::merge_trees(&store, Some(base), tree, chosen)?;
             Ok((out.tree, out.conflicts.iter().map(|p| p.to_string()).collect()))
         };
+        // A source that keeps its tree (into its parent or an ancestor)
+        // still holds what it gave: where a cloaked destination sealed it,
+        // the source holds it sealed too, so that the moved part leaves
+        // the source's own change and nothing sealed in the destination
+        // stays public on top of it (BUG-483).
+        let kept_source = |nd: &Snapshot, given: ObjectId| -> Result<ObjectId> {
+            match &nd.cloak {
+                Some(scope) => crate::embargo::seal_moved(&store, s.tree, given, nd.tree, scope),
+                None => Ok(s.tree),
+            }
+        };
         let (destination, source) = if into_parent {
             let nd = finish_dest(&tx, dest, chosen, vec![])?;
+            let src_tree = kept_source(&nd, chosen)?;
             let new_dest = tx.rewrite(dest, nd)?;
-            let source = finish_source(&mut tx, id, Some(vec![new_dest]), s.tree)?;
+            let source = finish_source(&mut tx, id, Some(vec![new_dest]), src_tree)?;
             (new_dest, source)
         } else if tx.repo().is_ancestor(&dest, &id)? {
             let (tree, extra) = merge_into(d.tree)?;
             let nd = finish_dest(&tx, dest, tree, extra)?;
+            let src_tree = kept_source(&nd, tree)?;
             let new_dest = tx.rewrite(dest, nd)?;
             tx.rebase_now()?;
             let cur = tx.current(id).ok_or_else(|| VeilError::repo("the change to squash disappeared while rebasing"))?;
-            let source = finish_source(&mut tx, cur, None, s.tree)?;
+            let source = finish_source(&mut tx, cur, None, src_tree)?;
             (new_dest, source)
         } else if tx.repo().is_ancestor(&id, &dest)? {
             let source = finish_source(&mut tx, id, None, rest)?;

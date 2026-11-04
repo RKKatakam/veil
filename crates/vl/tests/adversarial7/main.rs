@@ -14,6 +14,7 @@ mod adversarial_support;
 
 mod conflicts;
 mod plan;
+mod rewrites;
 mod serve;
 
 use std::{

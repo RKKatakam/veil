@@ -333,7 +333,7 @@ Other ways to reshape history:
 | `vl squash [-r REV] [--into DEST] [PATHS…] [-i]` | Fold a change, or the files or hunks you choose, into its parent (or `DEST`) |
 | `vl split [-r REV] PATHS…`, `vl split -i` | Split a change in two (see [Shaping history after the fact](#shaping-history-after-the-fact)) |
 | `vl rebase -s REV -d DEST` | Move a change and its descendants onto `DEST` (several `-d` for a merge) |
-| `vl restore [PATHS…] [--from REV]` | Put files back as they are in `REV` (default: the parent of `@`, or for a merge its merged parents, as `vl status` compares): discards edits, and removes the directories it empties |
+| `vl restore [PATHS…] [--from REV]` | Put files back as they are in `REV` (default: the parent of `@`, or for a merge its merged parents, as `vl status` compares): discards edits, and removes the directories it empties. A version keeps its audience: one sealed for a scope stays sealed, a conflict comes back as the same conflict, and a version you cannot read is not restored |
 | `vl merge REVS… [-m MSG]` | Merge into `@` (or into `@-` when `@` is empty), then start a new change on top |
 | `vl resolve [--list]`, `vl resolve PATHS --ours\|--theirs\|--base` | List unresolved conflicts, or keep one version of each (see [Conflicts](#conflicts)) |
 

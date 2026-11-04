@@ -316,7 +316,7 @@ impl Ctx {
 
     /// Record the project directory into the attached workspace.
     pub fn snapshot(&mut self) -> Result<()> {
-        self.record(None, false)
+        self.record(None, false, &[])
     }
 
     /// Record the project directory as operation `description`: for commands
@@ -324,17 +324,20 @@ impl Ctx {
     /// so that `vl undo` reverts them instead of skipping them as the
     /// user's uncommitted edits.
     pub fn snapshot_as(&mut self, description: String) -> Result<()> {
-        self.record(Some(description), false)
+        self.record(Some(description), false, &[])
     }
 
-    /// [`Ctx::snapshot_as`] after the command wrote `.veilpolicy` from
-    /// another revision (`vl restore --from`): it is guarded by the accepted
+    /// [`Ctx::snapshot_as`] after `vl restore` wrote the versions `carried`
+    /// into the directory: those files are recorded as the entries they
+    /// were written from (their sealing, or the conflict as it was), not as
+    /// edits of `@`'s (BUG-481). With `policy_incoming`, the command wrote
+    /// `.veilpolicy` from another revision: it is guarded by the accepted
     /// policy like any incoming change, never taken as the member's edit.
-    pub fn snapshot_as_incoming_policy(&mut self, description: String) -> Result<()> {
-        self.record(Some(description), true)
+    pub fn snapshot_restored(&mut self, description: String, policy_incoming: bool, carried: &[(VPath, veil_core::TreeEntry)]) -> Result<()> {
+        self.record(Some(description), policy_incoming, carried)
     }
 
-    fn record(&mut self, description: Option<String>, policy_incoming: bool) -> Result<()> {
+    fn record(&mut self, description: Option<String>, policy_incoming: bool, carried: &[(VPath, veil_core::TreeEntry)]) -> Result<()> {
         // A move of the directory that a previous command started and did
         // not finish (killed, disk full): finish it before recording
         // anything, or the half-moved directory would be recorded as the
@@ -344,7 +347,7 @@ impl Ctx {
         // the snapshot's transaction; the snapshot then records nothing, and
         // we look again (the directory is stale now).
         for _ in 0..3 {
-            if self.record_once(description.clone(), policy_incoming)? {
+            if self.record_once(description.clone(), policy_incoming, carried)? {
                 return Ok(());
             }
             // The process that moved it also recorded what the directory
@@ -359,7 +362,7 @@ impl Ctx {
 
     /// One attempt of [`Ctx::record`]; `false` if the workspace moved
     /// before the snapshot could be recorded.
-    fn record_once(&mut self, description: Option<String>, policy_incoming: bool) -> Result<bool> {
+    fn record_once(&mut self, description: Option<String>, policy_incoming: bool, carried: &[(VPath, veil_core::TreeEntry)]) -> Result<bool> {
         let view_wc = self.wc()?;
         let disk = self.fs.clone();
         let fs: &dyn StorageBackend = &*disk;
@@ -434,6 +437,7 @@ impl Ctx {
                 description,
                 policy_incoming,
                 expected_wc: Some(view_wc),
+                carried,
                 ..Default::default()
             },
         )?;
