@@ -62,8 +62,8 @@ use crate::{
     crypto::{domains, parse_key_hex, random_bytes, random_key, Envelope, Key},
     error::{Result, VeilError},
     identity::{
-        format_public_key, parse_public_identity, parse_public_key, wrap_key, wrap_key_legacy, Identity, Signature,
-        WrappedKey,
+        format_public_key, is_low_order_public_key, parse_public_identity, parse_public_key, verify_binding, wrap_key,
+        wrap_key_legacy, Identity, Signature, WrappedKey,
     },
     lock::RepoLock,
     object::Snapshot,
@@ -151,6 +151,12 @@ pub struct MemberGrant {
     /// changes or have their signatures attributed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signing_key: Option<String>,
+    /// The member's binding: `signing_key`'s signature (context
+    /// `member-binding`) over the X25519 key of `id`, proving the holder of
+    /// the signing key chose this member id (BUG-069). Ring format 3 only;
+    /// grants recorded earlier (and in format-1/2 repositories) have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<String>,
     pub role: Role,
     /// Generation of the key in `wrapped`.
     pub generation: u32,
@@ -298,6 +304,8 @@ pub struct KeyRing {
 pub struct MemberInfo {
     pub name: String,
     pub signing_key: Option<String>,
+    /// The member's binding of `signing_key` to their id, if recorded.
+    pub binding: Option<String>,
     pub role: Role,
 }
 
@@ -312,7 +320,11 @@ pub struct RingState {
     pub generations: Vec<String>,
     pub members: BTreeMap<String, MemberInfo>,
     /// Every signing key that ever belonged to a member: key → (id, name).
+    /// A key belongs to one member id only (replay refuses a second).
     pub ever_signers: BTreeMap<String, (String, String)>,
+    /// The keys of `ever_signers` whose binding to their member was proved
+    /// in the ring (the others were granted before bindings existed).
+    pub bound_signers: BTreeSet<String>,
     /// Hash of the last change (empty for legacy rings).
     pub head: String,
     pub len: usize,
@@ -336,6 +348,25 @@ impl RingState {
     fn admins(&self) -> usize {
         self.members.values().filter(|m| m.role == Role::Admin).count()
     }
+
+    /// Current members whose member id is a low-order X25519 point: no key
+    /// can be wrapped to them (a wrap would be readable by anyone), so
+    /// rotations leave them out (BUG-070). Revoke them.
+    pub fn unreachable_members(&self) -> Vec<(String, String)> {
+        self.members
+            .iter()
+            .filter(|(id, _)| member_is_unreachable(id))
+            .map(|(id, m)| (id.clone(), m.name.clone()))
+            .collect()
+    }
+}
+
+/// Is `member` (a member id) a key no scope key may be wrapped to? Low-order
+/// X25519 points make the shared secret all zeros (BUG-010). Granting such a
+/// key is refused, but rings granted before that fix, or by a hostile
+/// admin, may hold one.
+pub fn member_is_unreachable(member: &str) -> bool {
+    parse_public_key(member).is_ok_and(|pk| is_low_order_public_key(&pk))
 }
 
 fn check_rotation(state: &RingState, r: &Rotation, members: &BTreeSet<&String>) -> std::result::Result<(), String> {
@@ -348,8 +379,11 @@ fn check_rotation(state: &RingState, r: &Rotation, members: &BTreeSet<&String>) 
     if state.generations.contains(&r.key_id) {
         return Err(format!("rotation reuses key id {}", r.key_id));
     }
+    // Exactly the remaining members, except that a member no key can be
+    // wrapped to (a low-order point) may be left out: they receive nothing,
+    // and refusing the rotation would stop every revocation (BUG-070).
     let wrapped: BTreeSet<&String> = r.wrapped.keys().collect();
-    if wrapped != *members {
+    if !wrapped.is_subset(members) || members.difference(&wrapped).any(|m| !member_is_unreachable(m)) {
         return Err("rotation must wrap the new key to exactly the remaining members".into());
     }
     if !r.previous.iter().any(|p| p.key_id == state.key_id()) {
@@ -381,9 +415,18 @@ impl KeyRing {
         self.wrapped_keys().any(WrappedKey::is_hpke)
     }
 
+    /// Does any member grant carry a binding (so it needs ring format 3)?
+    pub fn has_bindings(&self) -> bool {
+        self.log.iter().any(|c| match &c.op {
+            RingOp::Genesis { members, .. } => members.iter().any(|m| m.binding.is_some()),
+            RingOp::Grant { member } => member.binding.is_some(),
+            _ => false,
+        })
+    }
+
     /// The lowest ring format that can hold this ring's content.
     pub fn required_format(&self) -> u32 {
-        if self.has_hpke_keys() {
+        if self.has_hpke_keys() || self.has_bindings() {
             RING_FORMAT
         } else if self.is_legacy() {
             self.format
@@ -412,6 +455,13 @@ impl KeyRing {
                 self.format
             ));
         }
+        // Older readers would drop a binding and then fail the signature.
+        if self.format < RING_FORMAT && self.has_bindings() {
+            return Err(format!(
+                "ring format {} cannot hold member bindings (needs ring format {RING_FORMAT})",
+                self.format
+            ));
+        }
         if self.is_legacy() {
             let mut members = BTreeMap::new();
             for (id, m) in &self.members {
@@ -420,6 +470,7 @@ impl KeyRing {
                     MemberInfo {
                         name: m.name.clone(),
                         signing_key: None,
+                        binding: None,
                         role: Role::Member,
                     },
                 );
@@ -431,6 +482,7 @@ impl KeyRing {
                 generations: vec![self.key_id.clone()],
                 members,
                 ever_signers: BTreeMap::new(),
+                bound_signers: BTreeSet::new(),
                 head: String::new(),
                 len: 0,
             });
@@ -459,6 +511,7 @@ impl KeyRing {
                         generations: vec![key_id.clone()],
                         members: BTreeMap::new(),
                         ever_signers: BTreeMap::new(),
+                        bound_signers: BTreeSet::new(),
                         head: String::new(),
                         len: 0,
                     };
@@ -466,7 +519,7 @@ impl KeyRing {
                         if m.generation != 0 || parse_public_key(&m.id).is_err() || st.members.contains_key(&m.id) {
                             return Err(at("malformed genesis member"));
                         }
-                        add_member(&mut st, m);
+                        add_member(&mut st, m).map_err(|e| at(&e))?;
                     }
                     if !st.is_admin(&c.signer, &c.signing_key) {
                         return Err(at("genesis is not signed by one of its admins"));
@@ -486,18 +539,13 @@ impl KeyRing {
                                 return Err(at("grant wraps a key from the wrong generation"));
                             }
                             parse_public_key(&member.id).map_err(|e| at(&e.to_string()))?;
-                            if let Some(k) = &member.signing_key {
-                                if parse_public_identity(&format!("{}{k}", member.id)).is_err() {
-                                    return Err(at("invalid signing key"));
-                                }
-                            }
                             let demotes_last_admin = st.members.get(&member.id).is_some_and(|m| m.role == Role::Admin)
                                 && member.role != Role::Admin
                                 && st.admins() == 1;
                             if demotes_last_admin {
                                 return Err(at("would leave the scope without an admin"));
                             }
-                            add_member(st, member);
+                            add_member(st, member).map_err(|e| at(&e))?;
                         }
                         RingOp::Revoke { member, rotation } => {
                             let Some(info) = st.members.get(member) else {
@@ -535,18 +583,46 @@ impl KeyRing {
     }
 }
 
-fn add_member(st: &mut RingState, m: &MemberGrant) {
-    if let Some(k) = &m.signing_key {
-        st.ever_signers.insert(k.clone(), (m.id.clone(), m.name.clone()));
+/// Apply a genesis member or a grant to the replayed state. A signing key
+/// must be a valid Ed25519 key, a binding must prove it chose this member id,
+/// and a signing key can never move to another member (BUG-069: otherwise a
+/// grant of Alice's public signing key to Mallory re-attributes everything
+/// Alice signed).
+fn add_member(st: &mut RingState, m: &MemberGrant) -> std::result::Result<(), String> {
+    let pk = parse_public_key(&m.id).map_err(|e| e.to_string())?;
+    match (&m.signing_key, &m.binding) {
+        (None, Some(_)) => return Err("binding without a signing key".into()),
+        (None, None) => {}
+        (Some(k), binding) => {
+            if parse_public_identity(&format!("{}{k}", m.id)).is_err() {
+                return Err("invalid signing key".into());
+            }
+            if let Some(b) = binding {
+                if !verify_binding(&pk, k, b) {
+                    return Err(format!("the binding of {}'s signing key does not verify (forged grant)", m.id));
+                }
+            }
+            if let Some((owner, _)) = st.ever_signers.get(k) {
+                if *owner != m.id {
+                    return Err(format!("signing key {} already belongs to member {owner}", &k[..k.len().min(16)]));
+                }
+            }
+            st.ever_signers.insert(k.clone(), (m.id.clone(), m.name.clone()));
+            if binding.is_some() {
+                st.bound_signers.insert(k.clone());
+            }
+        }
     }
     st.members.insert(
         m.id.clone(),
         MemberInfo {
             name: m.name.clone(),
             signing_key: m.signing_key.clone(),
+            binding: m.binding.clone(),
             role: m.role,
         },
     );
+    Ok(())
 }
 
 fn genesis_proof(key: &Key, scope: &str, key_id: &str, signer: &str, signing_key: &str) -> String {
@@ -712,6 +788,20 @@ pub enum HpkeMigration {
     Unverifiable(String),
 }
 
+/// Result of [`Keychain::recover_admin`] for one scope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdminRecovery {
+    /// The retired identity granted this one admin rights (and, if asked,
+    /// was then revoked).
+    HandedOver { revoked: bool },
+    /// This identity already is an admin.
+    AlreadyAdmin,
+    /// The retired identity is a member but not an admin: ask an admin.
+    RetiredNotAdmin,
+    /// The ring does not verify; left alone.
+    Unverifiable,
+}
+
 /// Was the current generation's key ever wrapped with the legacy sealed box
 /// (to anyone, at any point of the log)?
 pub fn current_key_has_legacy_wraps(ring: &KeyRing, state: &RingState) -> bool {
@@ -774,6 +864,13 @@ impl Keychain {
         } else {
             wrap_key_legacy(recipient, key, scope)
         }
+    }
+
+    /// The binding to record in a grant: from ring format 3 (repository
+    /// format 3) only, because older readers cannot verify a grant that
+    /// carries one.
+    fn binding_to_record(&self, binding: Option<String>) -> Option<String> {
+        binding.filter(|_| self.format() >= HPKE_REPO_FORMAT)
     }
 
     pub fn identity(&self) -> Option<&Identity> {
@@ -1060,6 +1157,7 @@ impl Keychain {
             id: me.public_hex(),
             name: me.name.clone(),
             signing_key: Some(me.verifying_hex()),
+            binding: self.binding_to_record(Some(me.binding_hex())),
             role: Role::Admin,
             generation: 0,
             wrapped: self.wrap_for(&me.public_key(), &key, scope)?,
@@ -1103,6 +1201,7 @@ impl Keychain {
                 id: id.clone(),
                 name: m.name.clone(),
                 signing_key: mine.then(|| me.verifying_hex()),
+                binding: self.binding_to_record(mine.then(|| me.binding_hex())),
                 role: if mine { Role::Admin } else { Role::Member },
                 generation: 0,
                 wrapped: m.wrapped.clone(),
@@ -1114,7 +1213,9 @@ impl Keychain {
     /// Give an identity access to the scope's current key generation (or
     /// update an existing member's name, role or signing key). `public_key`
     /// is the full public identity (`vl identity show`); the short member
-    /// id also works but leaves the member without a signing key.
+    /// id also works but leaves the member without a signing key. The
+    /// earlier unbound full form (`veil1<x25519><ed25519>`) is refused:
+    /// nothing proves its signing key belongs to that member (BUG-069).
     pub fn grant(&self, scope: &str, public_key: &str, name: &str) -> Result<()> {
         self.grant_role(scope, public_key, name, Role::Member)
     }
@@ -1122,19 +1223,55 @@ impl Keychain {
     pub fn grant_role(&self, scope: &str, public_key: &str, name: &str, role: Role) -> Result<()> {
         let _lock = self.lock_meta()?;
         let pk = parse_public_identity(public_key)?;
+        if pk.is_unbound() {
+            return Err(VeilError::Policy(format!(
+                "that public identity has a signing key but no proof that it belongs to {} (it was printed by \
+                 an earlier vl, or pieced together); ask {name} for the `public key` line of `vl identity show` \
+                 from this vl, or grant just their member id {} (read access, no signing key)",
+                pk.member_id(),
+                pk.member_id()
+            )));
+        }
         let (ring, state) = self.ring_for_admin(scope, "grant access")?;
+        if let Some(k) = pk.signing_hex() {
+            if let Some((owner, owner_name)) = state.ever_signers.get(&k).filter(|(o, _)| *o != pk.member_id()) {
+                return Err(VeilError::Policy(format!(
+                    "that signing key already belongs to {} ({owner}) in scope '{scope}'; a signing key \
+                     cannot move to another member",
+                    owner_name
+                )));
+            }
+        }
         let key = Zeroizing::new(self.require(&generation_label(scope, state.key_id()))?);
-        let existing_key = state.members.get(&pk.member_id()).and_then(|m| m.signing_key.clone());
+        let existing = state.members.get(&pk.member_id());
+        let (signing_key, binding) = match (pk.signing_hex(), existing) {
+            (Some(k), _) => (Some(k), pk.binding_hex()),
+            (None, Some(m)) => (m.signing_key.clone(), m.binding.clone()),
+            (None, None) => (None, None),
+        };
         let member = MemberGrant {
             id: pk.member_id(),
             name: name.to_string(),
-            signing_key: pk.signing_hex().or(existing_key),
+            signing_key,
+            binding: self.binding_to_record(binding),
             role,
             generation: state.generation,
-            wrapped: self.wrap_for(&pk.x25519, &key, scope)?,
+            wrapped: self.wrap_for(&pk.x25519, &key, scope).map_err(|e| {
+                VeilError::Crypto(format!("cannot wrap the scope key to {name} ({}): {e}", pk.member_id()))
+            })?,
         };
         self.append(ring, RingOp::Grant { member })?;
         Ok(())
+    }
+
+    /// Current members of `scope` that no key can be wrapped to (low-order
+    /// member ids, see [`RingState::unreachable_members`]): rotations leave
+    /// them out. `(member id, name)`.
+    pub fn unreachable_members(&self, scope: &str) -> Vec<(String, String)> {
+        match self.ring_state(scope) {
+            Ok(Some(Ok(st))) => st.unreachable_members(),
+            _ => Vec::new(),
+        }
     }
 
     fn rotation(&self, scope: &str, state: &RingState, members: &[&String]) -> Result<Rotation> {
@@ -1143,7 +1280,18 @@ impl Keychain {
         let new_id = key_fingerprint(&new);
         let mut wrapped = BTreeMap::new();
         for m in members {
-            wrapped.insert((*m).clone(), self.wrap_for(&parse_public_key(m)?, &new, scope)?);
+            // A low-order member id gets nothing (a wrap to it would publish
+            // the key); replay allows exactly this omission (BUG-070).
+            if member_is_unreachable(m) {
+                continue;
+            }
+            let w = parse_public_key(m).and_then(|pk| self.wrap_for(&pk, &new, scope)).map_err(|e| {
+                let name = state.members.get(*m).map_or("?", |i| i.name.as_str());
+                VeilError::Crypto(format!(
+                    "cannot wrap the new key of scope '{scope}' to member {name} ({m}): {e}; revoke them first"
+                ))
+            })?;
+            wrapped.insert((*m).clone(), w);
         }
         Ok(Rotation {
             generation: state.generation + 1,
@@ -1225,6 +1373,78 @@ impl Keychain {
             return Ok(HpkeMigration::NotAdmin);
         }
         Ok(HpkeMigration::Rotated(self.rotate(scope)?))
+    }
+
+    /// Scopes whose current key still has legacy wraps (the `3:hpke-ring-keys`
+    /// step is pending for them), with whether this identity may move them
+    /// to HPKE (an admin; for a legacy ring, a member).
+    pub fn hpke_migration_pending(&self) -> Result<Vec<(String, bool)>> {
+        let mut out = Vec::new();
+        let me = self.identity.as_ref();
+        for ring in self.rings()? {
+            let Ok(state) = ring.verify() else { continue };
+            if !current_key_has_legacy_wraps(&ring, &state) {
+                continue;
+            }
+            let allowed = match me {
+                None => false,
+                Some(_) if ring.is_legacy() => self.is_member(&ring.scope),
+                Some(me) => state.is_admin(&me.public_hex(), &me.verifying_hex()),
+            };
+            out.push((ring.scope.clone(), allowed));
+        }
+        Ok(out)
+    }
+
+    /// Hand the admin rights of `retired` (an identity this device used
+    /// before `vl identity new --force`) over to this identity, in every
+    /// scope (BUG-089): the retired identity signs a grant that makes this
+    /// identity an admin, with its full public identity. With
+    /// `revoke_retired`, this identity then revokes the retired one (which
+    /// rotates the key). Scopes where this identity is already an admin, or
+    /// where the retired one is not, are reported and left alone.
+    pub fn recover_admin(&self, retired: &Identity, revoke_retired: bool) -> Result<Vec<(String, AdminRecovery)>> {
+        let _lock = self.lock_meta()?;
+        let me = self.me()?.clone();
+        if me.public_hex() == retired.public_hex() {
+            return Err(VeilError::repo("that is the current identity, not a replaced one"));
+        }
+        let old = Keychain::new(self.backend.clone(), Some(retired.clone()), self.repo_id.clone());
+        old.set_format(self.format());
+        let mut out = Vec::new();
+        for ring in self.rings()? {
+            let scope = ring.scope.clone();
+            let Ok(state) = ring.verify() else {
+                out.push((scope, AdminRecovery::Unverifiable));
+                continue;
+            };
+            let old_admin = if ring.is_legacy() {
+                old.is_member(&scope)
+            } else {
+                state.is_admin(&retired.public_hex(), &retired.verifying_hex())
+            };
+            let me_admin = !ring.is_legacy() && state.is_admin(&me.public_hex(), &me.verifying_hex());
+            let retired_member = state.members.contains_key(&retired.public_hex());
+            let outcome = if !me_admin && !old_admin {
+                if !retired_member {
+                    continue;
+                }
+                AdminRecovery::RetiredNotAdmin
+            } else {
+                if !me_admin {
+                    old.grant_role(&scope, &me.public_id(), &me.name, Role::Admin)?;
+                    self.invalidate();
+                }
+                let revoked = revoke_retired && retired_member && self.revoke(&scope, &retired.public_hex())?;
+                if me_admin && !revoked {
+                    AdminRecovery::AlreadyAdmin
+                } else {
+                    AdminRecovery::HandedOver { revoked }
+                }
+            };
+            out.push((scope, outcome));
+        }
+        Ok(out)
     }
 
     /// Checks only key holders can make: the genesis proof, and that every
@@ -1337,11 +1557,29 @@ impl Keychain {
     }
 
     /// Every signing key known from any ring: key → (member id, name).
+    ///
+    /// Within a ring a key belongs to one member. Across rings, a key that
+    /// two rings give to different members is resolved in favour of the
+    /// rings where the binding was proved; if that still leaves more than
+    /// one member (or none was proved), the key is left out, so its
+    /// signatures show as unknown rather than as someone else's (BUG-069).
     pub fn known_signers(&self) -> BTreeMap<String, (String, String)> {
-        let mut out = BTreeMap::new();
+        // key → [(member, name, bound)]
+        let mut claims: BTreeMap<String, Vec<(String, String, bool)>> = BTreeMap::new();
         for r in self.rings().unwrap_or_default() {
             if let Ok(st) = r.verify() {
-                out.extend(st.ever_signers);
+                for (k, (member, name)) in st.ever_signers {
+                    let bound = st.bound_signers.contains(&k);
+                    claims.entry(k).or_default().push((member, name, bound));
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        for (k, c) in claims {
+            let bound: Vec<&(String, String, bool)> = c.iter().filter(|x| x.2).collect();
+            let pick = if bound.is_empty() { c.iter().collect::<Vec<_>>() } else { bound };
+            if pick.iter().all(|x| x.0 == pick[0].0) {
+                out.insert(k, (pick[0].0.clone(), pick[0].1.clone()));
             }
         }
         if let Some(me) = &self.identity {
@@ -1522,8 +1760,22 @@ impl Keychain {
         self.save_embargo(&rec)
     }
 
+    /// Does this repository hold a verifying ring for `scope` (so it can
+    /// judge who may sign that scope's embargo records)?
+    fn can_judge(&self, scope: &str) -> bool {
+        matches!(self.ring_state(scope), Ok(Some(Ok(_))))
+    }
+
     /// Merge an embargo record received from another repository. Returns a
     /// warning when (part of) the record was rejected.
+    ///
+    /// A repository without a ring for the record's scope (a clone of a
+    /// public remote, which never receives rings, BUG-077) cannot tell who
+    /// may sign it. It accepts the record unverified: it holds no key for
+    /// the scope, so the record can never trigger a release here, and a
+    /// published key is still checked against the record's fingerprint and
+    /// then by the AEAD of the content it opens. A record that a ring later
+    /// shows to be signed by a member replaces an unverified local one.
     pub fn merge_embargo(&self, incoming: &EmbargoRecord) -> Result<Option<String>> {
         let _lock = self.lock_meta()?;
         let id = &incoming.id;
@@ -1531,7 +1783,8 @@ impl Keychain {
             return Ok(Some(format!("embargo record with invalid id '{id}' rejected")));
         }
         let status = self.embargo_status(incoming);
-        if matches!(status, SignatureStatus::Bad | SignatureStatus::Unknown { .. }) {
+        let judged = self.can_judge(&incoming.scope);
+        if status == SignatureStatus::Bad || (judged && matches!(status, SignatureStatus::Unknown { .. })) {
             return Ok(Some(format!(
                 "embargo {id}: record rejected ({}; not signed by a member of '{}')",
                 status.label(),
@@ -1548,10 +1801,35 @@ impl Keychain {
         }
         let Some(mut local) = self.load_embargo(id)? else {
             self.save_embargo(incoming)?;
-            return Ok((status == SignatureStatus::Unsigned)
+            return Ok((judged && status == SignatureStatus::Unsigned)
                 .then(|| format!("embargo {id}: record is unsigned (legacy); it will never be released automatically")));
         };
         if local.body() != incoming.body() {
+            if status.is_good() && !self.embargo_status(&local).is_good() {
+                // The local record was accepted unverified (no ring then);
+                // the signed one wins. Keep a local release only if it is
+                // the key this record commits to.
+                let mut rec = incoming.clone();
+                if !rec.is_released() && local.is_released() {
+                    rec.released_key = local.released_key.clone();
+                    rec.released_at = local.released_at;
+                    rec.release_signature = local.release_signature.clone();
+                    let signed = rec
+                        .release_signature
+                        .as_ref()
+                        .is_none_or(|rs| rs.verify(RELEASE_SIG_CONTEXT, &rec.release_body()));
+                    if rec.key_id.is_none() || !rec.release_consistent() || !signed {
+                        rec.released_key = None;
+                        rec.released_at = None;
+                        rec.release_signature = None;
+                    }
+                }
+                self.save_embargo(&rec)?;
+                return Ok(Some(format!(
+                    "embargo {id}: replaced an unverified local record with the one signed by a member of '{}'",
+                    rec.scope
+                )));
+            }
             return Ok(Some(format!(
                 "embargo {id}: incoming record conflicts with the local one (tampered deadline, scope or key?); kept the local record"
             )));
@@ -1607,6 +1885,41 @@ mod tests {
         assert_eq!(bobs.key(&g0_label), Some(g0), "revoked member keeps old history");
         assert_eq!(bobs.key(&g1_label), None, "but never receives the new generation");
         assert!(!bobs.is_member("team"));
+    }
+
+    /// Pinned: where `binding` sits in a signed grant body (ring format 3).
+    /// Grants without one keep the body they always had.
+    #[test]
+    fn grant_signing_body_with_and_without_a_binding() {
+        let member = |binding: Option<&str>| MemberGrant {
+            id: "veil1aa".into(),
+            name: "bob".into(),
+            signing_key: Some("bb".into()),
+            binding: binding.map(str::to_string),
+            role: Role::Member,
+            generation: 0,
+            wrapped: WrappedKey::Hpke(crate::identity::HpkeWrappedKey {
+                hpke: "s".into(),
+                enc: "e".into(),
+                ct: "c".into(),
+            }),
+        };
+        let body = |m| {
+            let c = RingChange {
+                seq: 1,
+                prev: "p".into(),
+                timestamp: 2,
+                signer: "veil1cc".into(),
+                signing_key: "dd".into(),
+                op: RingOp::Grant { member: m },
+                signature: String::new(),
+            };
+            String::from_utf8(c.signing_body("team")).unwrap()
+        };
+        let head = r#"{"scope":"team","seq":1,"prev":"p","timestamp":2,"signer":"veil1cc","signing_key":"dd","op":{"kind":"grant","member":{"id":"veil1aa","name":"bob","signing_key":"bb","#;
+        let tail = r#""role":"member","generation":0,"wrapped":{"hpke":"s","enc":"e","ct":"c"}}}}"#;
+        assert_eq!(body(member(None)), format!("{head}{tail}"));
+        assert_eq!(body(member(Some("ee"))), format!(r#"{head}"binding":"ee",{tail}"#));
     }
 
     #[test]

@@ -205,11 +205,16 @@ the vault use XChaCha20-Poly1305 with random nonces.
     `BLAKE3-derive("veil 2026 ed25519-seed v1", x25519_secret)`; they load
     unchanged, keep their signing key, and `vl identity show` marks them
     legacy (CRYPTO.md C4).
-* The **full public identity** is `veil1<x25519-hex><ed25519-hex>` (128 hex
-  digits). `vl identity show` prints it, and `vl scope grant` should be
-  given it. A grant made with the short member id still works for
-  decryption, but the ring cannot bind a signing key to that member: their
-  signatures show as "unknown key" and they cannot be an effective admin.
+* The **full public identity** is `veil1<x25519-hex><ed25519-hex><binding-hex>`
+  (256 hex digits): the two public keys and the **binding**, the signing
+  key's signature over the X25519 key (CRYPTO.md C4). `vl identity show`
+  prints it, and `vl scope grant` should be given it. The binding proves
+  that the holder of the signing key chose this member id, so nobody can
+  register someone else's signing key as theirs (BUG-069); a grant refuses
+  a full identity without one. A grant made with the short member id still
+  works for decryption, but the ring cannot bind a signing key to that
+  member: their signatures show as "unknown key" and they cannot be an
+  effective admin.
 * Secrets in memory are wrapped in `zeroize::Zeroizing`: the identity secret,
   the derived signing seed, key-encryption keys, unwrapped scope and embargo
   keys, and the keychain's key cache. Keys returned by value (`Key` is
@@ -250,6 +255,14 @@ the vault use XChaCha20-Poly1305 with random nonces.
   `vl identity recover-vault [--from FILE]` re-keys any other one. Deleting
   the retired file (and the vault) is the way to really forget the old
   identity.
+* **Admin rights after a replacement.** The new identity is not an admin
+  of anything. `vl identity new --force` warns, before replacing it, about
+  scopes of the repository it runs in where the identity is the only
+  admin. `vl identity recover-admin [--from FILE] [--revoke-old]` then lets
+  the retired identity sign the hand-over: a grant that makes the new
+  identity an admin, in every scope of the repository where the retired
+  one is an admin (and, with `--revoke-old`, a revocation of the retired
+  one by the new admin, which rotates the key). BUG-089.
 
 ### Key rings: a signed membership log
 
@@ -262,7 +275,7 @@ op = Genesis { key_id, members[], proof }      seq 0 only
    | Grant   { member }                        add, or change name/role/signing key
    | Revoke  { member, rotation }              remove + new generation
    | Rotate  { rotation }                      new generation, same members
-member   = { id, name, signing_key?, role: admin|member, generation, wrapped }
+member   = { id, name, signing_key?, binding?, role: admin|member, generation, wrapped }
 rotation = { generation, key_id, previous: [{key_id, sealed}], wrapped: {id → key} }
 ```
 
@@ -281,7 +294,12 @@ rotation = { generation, key_id, previous: [{key_id, sealed}], wrapped: {id → 
   * a grant must wrap the current generation;
   * a rotation must be generation *n+1*, use a fresh key id, carry the
     previous key, and wrap the new key to **exactly** the remaining members
-    (so a revoked member cannot be smuggled into the new generation);
+    (so a revoked member cannot be smuggled into the new generation). The
+    one exception: a member whose id is a low-order X25519 point, to which
+    no key may be wrapped, may be left out (BUG-070);
+  * a member's `binding`, if present, must be a valid signature by their
+    signing key over their member id's X25519 key, and a signing key can
+    belong to only one member id over the whole log (BUG-069);
   * the last admin can be neither revoked nor demoted.
 
   A ring that fails to verify gives no keys at all.
@@ -341,7 +359,8 @@ rotation = { generation, key_id, previous: [{key_id, sealed}], wrapped: {id → 
   signature) is identical keeps the original snapshot and its signer.
 * **Status.** Each signature has one of these statuses:
   * `good`: valid, by a signing key that some ring binds to the claimed
-    member;
+    member (if rings disagree about a key, a ring that proved the binding
+    wins; otherwise the key counts as unknown);
   * `unknown`: valid, but the key is unknown, or it does not belong to the
     claimed member;
   * `bad`: does not verify;
@@ -1526,6 +1545,29 @@ repository lock.
   `author` is a free-form claim; only the signer is authenticated.
 * *Members granted by short member id* (without a signing key) cannot sign
   ring changes, and their snapshot signatures show as unknown.
+* *Bindings recorded in rings* start with repository format 3. In
+  format-1/2 rings (and grants made before bindings existed) the admin's vl
+  checked the binding but readers cannot, so a hostile admin can record an
+  unbound grant of a signing key nobody in that ring holds yet. It is
+  believed only where no ring proves a binding for the key.
+* *What a public remote reveals about scopes.* Public remotes receive no
+  key rings (BUG-077): a clone of a public mirror cannot list scopes'
+  members, roles, names or membership history. What stays visible there:
+  scope names (in the labels of redacted tree entries and in embargo
+  records); the member id and signing key of whoever signed a public
+  snapshot (the signature names them) and of whoever created or released
+  an embargo (the record's signatures), with the snapshot's free-form
+  `author`; and embargo records themselves (scope, deadline, the wrapped
+  key as ciphertext). Without rings, a public clone shows every snapshot
+  signature as "unknown key", and accepts embargo records unverified: it
+  holds no scope key, so it can never auto-release, and a published key
+  is checked against the record's fingerprint and by the AEAD of the
+  content it opens. Rings that an earlier vl pushed to a public remote stay
+  there (removing them would lock members out of a team remote added as
+  public by mistake); every public push warns about them until someone
+  deletes `.veil/meta/keyrings/` on that remote. Team remotes still hold
+  the full rings, so anyone who can read a team remote sees the
+  membership.
 * *Rings on a non-member remote* (for example a bare remote without an
   identity) cannot check the genesis proof. Members check it when they pull.
 * *Time-based embargo release* relies on key holders' engines and is not

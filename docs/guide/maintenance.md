@@ -85,7 +85,7 @@ vl 0.1.0 (commit d0342039c517, repository format 3) on x86_64-unknown-linux-gnu
 
 Setup
   ok    VEIL_HOME /home/alice/.config/veil ($VEIL_HOME)
-  ok    identity 'alice' veil14ee1c25cc30… (/home/alice/.config/veil/identity.json)
+  ok    identity 'alice' veil15dc25eaf411… (/home/alice/.config/veil/identity.json)
   ok    no leftover `ws exec` sandboxes in /tmp
 
 Repository /home/alice/team
@@ -139,9 +139,9 @@ Upgraded this repository from format 1 to format 3
   …
   note: scope 'team': new key generation 3, wrapped to every member with HPKE; earlier generations stay reachable (and stay under the legacy key wrapping already published)
 $ vl upgrade --remote origin
-Upgraded remote 'origin' from format 1 to format 3
+Upgraded remote 'origin' (../team) from format 1 to format 3
   …
-  note: key rings were not re-keyed here (no identity: a remote is upgraded structurally); they move to HPKE when an admin who has upgraded their clone pushes
+  note: key rings were not re-keyed here (no identity: a remote is upgraded structurally); they move to HPKE when an admin who has upgraded their clone pushes (in a clone that is already at format 3, `vl upgrade` still moves the admin's rings)
 ```
 
 * **Nothing is rewritten.** Old objects keep their bytes and ids, so
@@ -153,9 +153,13 @@ Upgraded remote 'origin' from format 1 to format 3
   the shared remote (`vl upgrade --remote origin`), and each member upgrades
   their clone. A format-1 or format-2 remote refuses format-3 objects, and a
   clone at an older format can't pull them.
-* `vl upgrade --remote` only works for **path** remotes in 1.0. For an SSH
-  remote, run `vl upgrade -R /path/to/remote` on the server (with `vl`
-  installed there), or see [Troubleshooting](troubleshooting.md#vl-upgrade---remote-on-an-ssh-remote).
+* `vl upgrade --remote` works for path and SSH remotes (over SFTP, as push
+  and pull reach them).
+* **Admins: run `vl upgrade` even in a clone that is already at format 3**
+  (a fresh clone of the upgraded remote, or one a non-admin upgraded). It
+  moves the key rings you administer to HPKE ("Moved the key rings of this
+  repository (format 3) to HPKE key wrapping"), then push. Members who are
+  not admins get a note naming the scopes still waiting.
 * `vl clone` creates a clone at the source's format.
 
 Details: [`docs/FORMAT.md`](../FORMAT.md).
@@ -185,15 +189,17 @@ What only exists on your machine:
 ## Replacing your identity
 
 `vl identity new --force` creates a new key pair. **Think twice**: every
-scope you were in must grant the new key again, and if you were a scope's
-only admin, nobody can.
+scope you were in must grant the new key again. If you were a scope's only
+admin, `vl identity new --force` warns first (for the repository you run it
+in), and `vl identity recover-admin` hands your admin rights over afterwards
+(below).
 
 ```text
 $ vl identity new --force --name alice
 Created identity alice veil15c991ab1c95…
 The replaced identity was kept at /home/alice/.config/veil/retired/identity-1793766156152.json (delete it once no vault needs it)
 Re-keyed the local vault of /home/alice/sec2
-warning: other repositories' local vaults are still sealed by the replaced identity; run `vl identity recover-vault` in each. Scope admins must grant the new public key again.
+warning: other repositories' local vaults are still sealed by the replaced identity; run `vl identity recover-vault` in each. Scope admins must grant the new public key again; where you were an admin, `vl identity recover-admin` hands your admin rights over.
 ```
 
 * The old identity is kept in `$VEIL_HOME/retired/` (mode `0600`). It
@@ -203,8 +209,22 @@ warning: other repositories' local vaults are still sealed by the replaced ident
 * Until they grant it, cloaked files you edit can't be sealed and are kept
   local-only, with `warning: could not cloak … (no key for scope 'team')`.
 
-**Undoing a replacement** (for example, you were the only admin): put the
-old identity back, keeping the new one where `recover-vault` can find it:
+**Admin rights.** Where the replaced identity was an admin, it can sign the
+hand-over to the new one. In each repository:
+
+```sh
+vl identity recover-admin          # the replaced identity grants you admin rights
+vl push                            # share the updated key rings
+vl identity recover-admin --revoke-old   # later, once no device uses the old identity
+```
+
+`recover-admin` tries every identity in `$VEIL_HOME/retired/` (or `--from
+FILE`). In scopes where the old identity was only a member, it says so: ask
+an admin to grant your new public key. `--revoke-old` revokes the old
+identity, which rotates the scope key.
+
+**Undoing a replacement**: put the old identity back, keeping the new one
+where `recover-vault` can find it:
 
 ```sh
 cd ~/.config/veil

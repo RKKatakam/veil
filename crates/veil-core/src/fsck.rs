@@ -816,8 +816,23 @@ impl Checker {
                             _ => {}
                         }
                     }
+                    granted.sort();
+                    granted.dedup();
+                    let current = ring.verify().ok().map(|st| st.members);
                     for id in granted {
                         if parse_public_key(id).is_ok_and(|pk| crate::identity::is_low_order_public_key(&pk)) {
+                            // Revoked since: the generations it was given stay
+                            // exposed, but later ones never reach it (BUG-070).
+                            if current.as_ref().is_some_and(|m| !m.contains_key(id)) {
+                                self.push(
+                                    Severity::Note,
+                                    format!(
+                                        "key ring {path}: former member {id} was a low-order key; the key generations \
+                                         wrapped to it before its revocation are readable by anyone"
+                                    ),
+                                );
+                                continue;
+                            }
                             self.push(
                                 Severity::Warning,
                                 format!(

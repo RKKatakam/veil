@@ -71,7 +71,8 @@ fn revoke_rotates_and_survives_push_and_pull() {
     let team = env.root.join("team");
     env.ok("alice", &proj, &["remote", "add", "origin", team.to_str().unwrap()]);
     let bob = env.public_key("bob");
-    assert_eq!(bob.len(), 5 + 128, "full public identity: {bob}");
+    // veil1 + X25519 + Ed25519 + the binding signature (BUG-069).
+    assert_eq!(bob.len(), 5 + 256, "full public identity: {bob}");
     env.ok("alice", &proj, &["scope", "grant", "team", &bob, "--name", "bob"]);
     env.ok("alice", &proj, &["push"]);
     env.ok("bob", &env.root, &["clone", "team", "bob"]);

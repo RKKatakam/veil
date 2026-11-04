@@ -224,3 +224,64 @@ fn ssh_remotes_through_real_ssh_and_a_throwaway_sshd() {
     let remote = env.root.join("srv/proj");
     round_trip(&env, &format!("ssh://veil-test-host{}", remote.display()), &remote);
 }
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let dst = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_dir(&e.path(), &dst);
+        } else {
+            std::fs::copy(e.path(), &dst).unwrap();
+        }
+    }
+}
+
+fn format_of(repo: &Path) -> u64 {
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(repo.join(".veil/repo.json")).unwrap()).unwrap();
+    v["format"].as_u64().unwrap()
+}
+
+/// BUG-072: `vl upgrade --remote` upgrades an SSH remote over SFTP (as push
+/// and pull reach it), not a local path spelled like its URL. Then the
+/// admin's upgraded clone pushes its HPKE ring and AES-SIV objects there.
+#[test]
+fn upgrade_remote_over_a_stand_in_ssh() {
+    let Some(server) = sftp_server() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let script = tmp.path().join("fake-ssh");
+    std::fs::write(&script, format!("#!/bin/sh\nexec {}\n", server.display())).unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let env = Env::new(script.display().to_string(), tmp);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../veil-core/tests/fixtures/format-2");
+    copy_dir(&fixture, &env.root);
+    let alice = env.root.join("alice");
+    let remote = env.root.join("srv/team.veil");
+    copy_dir(&env.root.join("team-remote"), &remote);
+    let url = format!("someone@example.invalid:{}", remote.display());
+    env.ok("alice", &alice, &["remote", "add", "ssh", &url]);
+    // A decoy where the URL would land if it were read as a relative path.
+    let decoy = alice.join(&url);
+    copy_dir(&env.root.join("team-remote"), &decoy);
+
+    let dry = env.ok("alice", &alice, &["upgrade", "--remote", "ssh", "--dry-run"]);
+    assert!(dry.contains("Would upgrade remote 'ssh'"), "{dry}");
+    assert_eq!(format_of(&remote), 2, "a dry run writes nothing");
+    let out = env.ok("alice", &alice, &["upgrade", "--remote", "ssh"]);
+    assert!(out.contains("from format 2 to format 3"), "{out}");
+    assert_eq!(format_of(&remote), 3, "the SFTP remote was upgraded");
+    assert_eq!(format_of(&decoy), 2, "the look-alike local path was not touched");
+    assert!(!remote.join(".veil/upgrade.json").exists());
+
+    // Alice's clone, then a push of what only format 3 may hold.
+    env.ok("alice", &alice, &["upgrade"]);
+    std::fs::write(alice.join("after-upgrade.txt"), "new\n").unwrap();
+    env.ok("alice", &alice, &["commit", "-m", "after the upgrade"]);
+    env.ok("alice", &alice, &["tag", "set", "main", "-r", "@-"]);
+    env.ok("alice", &alice, &["push", "ssh"]);
+    let fsck = env.ok("alice", &alice, &["fsck", "-R", remote.to_str().unwrap()]);
+    assert!(fsck.contains("No corruption found"), "{fsck}");
+    let ring = std::fs::read_to_string(remote.join(".veil/meta/keyrings/team.json")).unwrap();
+    assert!(ring.contains("\"hpke\""), "the remote holds the HPKE-wrapped ring");
+}

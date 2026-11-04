@@ -48,8 +48,10 @@ use std::{
 use veil_core::{
     commands::EmbargoSpec,
     fsck::{fsck, Severity},
+    keychain::current_key_has_legacy_wraps,
     remote,
-    repo::is_repo,
+    repo::{is_repo, read_config},
+    upgrade::{upgrade, UpgradeOptions, JOURNAL_PATH},
     tree::walk_files,
     vfs::{DirEntry, Metadata, StatClock},
     Identity, MemoryBackend, ObjectId, Repo, Result, StorageBackend, VPath, VeilError,
@@ -746,4 +748,110 @@ fn crash_during_init() {
             }
         }
     }
+}
+
+// ---- vl upgrade ------------------------------------------------------------------
+
+/// A repository at `format` (1 or 2): history with cloaked files under
+/// `team`, which Alice administers and Bob is a member of, so the upgrade
+/// to format 3 runs `verify`, `set-format` and `3:hpke-ring-keys`.
+fn upgrade_world(format: u32, alice: &Identity, bob: &Identity) -> MemoryBackend {
+    let fs = Arc::new(MemoryBackend::new());
+    let mut repo = Repo::init_for_clone_at(fs.clone(), Some(alice.clone()), "alice", format).unwrap();
+    repo.keys().create_scope("team").unwrap();
+    repo.keys().grant("team", &bob.public_id(), "bob").unwrap();
+    fs.write(&p(".veilpolicy"), b"secrets/ cloak team\n").unwrap();
+    fs.write(&p("src/a.rs"), b"fn a() {}\n").unwrap();
+    fs.write(&p("secrets/key.txt"), b"s3cr3t\n").unwrap();
+    repo.snapshot_workspace(WS, &*fs).unwrap();
+    let (v1, _) = repo.commit_working_copy(WS, "v1").unwrap();
+    repo.set_tag("main", v1, None, false).unwrap();
+    fs.write(&p("secrets/key.txt"), b"rotated\n").unwrap();
+    repo.snapshot_workspace(WS, &*fs).unwrap();
+    repo.commit_working_copy(WS, "v2").unwrap();
+    drop(repo);
+    fs.fork()
+}
+
+/// The upgrade finished: format 3, no journal, the ring's current key
+/// HPKE-wrapped (Bob still holds it), history unchanged and readable.
+fn assert_upgraded(disk: &Arc<dyn StorageBackend>, alice: &Identity, bob: &Identity, before: &BTreeMap<ObjectId, Files>, ctx: &str) {
+    assert_eq!(read_config(&**disk).unwrap().format, 3, "{ctx}");
+    assert!(!disk.exists(&p(JOURNAL_PATH)).unwrap(), "{ctx}: journal left behind");
+    let repo = Repo::open(disk.clone(), Some(alice.clone()), "alice").unwrap();
+    let ring = repo.keys().load_ring("team").unwrap().unwrap();
+    let st = ring.verify().unwrap();
+    assert!(!current_key_has_legacy_wraps(&ring, &st), "{ctx}: ring not moved to HPKE");
+    assert_eq!(&history(&repo), before, "{ctx}: history changed");
+    drop(repo);
+    let bobs = Repo::open(disk.clone(), Some(bob.clone()), "bob").unwrap();
+    assert!(bobs.keys().is_member("team"), "{ctx}: Bob lost the key");
+    assert_healthy(disk.clone(), alice, ctx);
+}
+
+/// Crash `vl upgrade` at every write, in every crash mode, from format 1 and
+/// from format 2. After each crash the repository opens at the old or the new
+/// format with its history intact and `fsck` clean; running the upgrade
+/// again finishes it, including the ring step.
+fn upgrade_sweep(from: u32) {
+    let alice = Identity::generate("alice");
+    let bob = Identity::generate("bob");
+    let world = upgrade_world(from, &alice, &bob);
+    let before = {
+        let disk: Arc<dyn StorageBackend> = Arc::new(world.fork());
+        history(&Repo::open(disk, Some(alice.clone()), "alice").unwrap())
+    };
+    let mut crashes = 0;
+    // Crashes past the commit point with the ring step still to do.
+    let mut in_ring_step = 0;
+    for mode in [Crash::BeforeWrite, Crash::AfterWrite, Crash::PowerLoss] {
+        for budget in 0..10_000 {
+            let mem = Arc::new(world.fork());
+            let faulty = Arc::new(FaultyBackend::new(mem.clone(), budget, mode));
+            let ctx = format!("upgrade {from}→3: {mode:?} after {budget} writes");
+            let result = upgrade(faulty.clone(), Some(alice.clone()), &UpgradeOptions::default());
+            let disk: Arc<dyn StorageBackend> = mem;
+            match result {
+                Ok(r) if !faulty.crashed() => {
+                    assert!(budget > 0 && r.steps.iter().any(|s| s == "3:hpke-ring-keys"), "{ctx}: {r:?}");
+                    assert_upgraded(&disk, &alice, &bob, &before, &ctx);
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => assert!(faulty.crashed(), "{ctx}: failed without a crash: {e}"),
+            }
+            crashes += 1;
+
+            // Reboot: either format, never anything in between.
+            let format = read_config(&*disk).unwrap().format;
+            assert!(format == from || format == 3, "{ctx}: format {format}");
+            let repo = Repo::open(disk.clone(), Some(alice.clone()), "alice")
+                .unwrap_or_else(|e| panic!("{ctx}: repository does not open: {e}"));
+            assert_eq!(history(&repo), before, "{ctx}: history changed");
+            let ring = repo.keys().load_ring("team").unwrap().unwrap();
+            if format == 3 && current_key_has_legacy_wraps(&ring, &ring.verify().unwrap()) {
+                in_ring_step += 1;
+            }
+            drop(repo);
+            assert_healthy(disk.clone(), &alice, &ctx);
+
+            // `vl upgrade` again resumes and finishes.
+            let r = upgrade(disk.clone(), Some(alice.clone()), &UpgradeOptions::default())
+                .unwrap_or_else(|e| panic!("{ctx}: resuming failed: {e}"));
+            assert!(!r.up_to_date || format == 3, "{ctx}: {r:?}");
+            assert_upgraded(&disk, &alice, &bob, &before, &format!("{ctx}, after resuming"));
+        }
+    }
+    assert!(crashes >= 5, "upgrade {from}→3: too few crash points ({crashes})");
+    assert!(in_ring_step >= 3, "upgrade {from}→3: no crash between the commit point and the ring rotation");
+}
+
+#[test]
+fn crash_during_upgrade_from_format_1() {
+    upgrade_sweep(1);
+}
+
+#[test]
+fn crash_during_upgrade_from_format_2() {
+    upgrade_sweep(2);
 }

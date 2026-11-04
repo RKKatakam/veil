@@ -33,9 +33,9 @@ Veil identifies you by a key pair, not by a name and an email. The first
 $ vl identity show
 Created new identity for 'alice' at /home/alice/.config/veil/identity.json
 name        alice
-public key  veil14ee1c25cc3089f6bc41d9eb126ae1a2aa15d541d374b9198b941e77c18d2d446e7ee0fd963ba3969cabe01b4fc91fb1003fbbdaf3e3d29e55092938f91b24e1a
-member id   veil14ee1c25cc3089f6bc41d9eb126ae1a2aa15d541d374b9198b941e77c18d2d446
-signing key e7ee0fd963ba3969cabe01b4fc91fb1003fbbdaf3e3d29e55092938f91b24e1a
+public key  veil15dc25eaf4116d32ea46c6bc1cc0f2a62f04e962ecb4c585f4f827bd609b96d59711356edc60003febde90d2de5cedcaa3325c69855af8bb84621e091f68b75d422e081bbe9c366cc0debfd0f7553376afdd2173d39be908e8266c8fc7eb2421618d765d113e4bada98237e0870f19e09d905b31c90beac23f64be82fb7141d09
+member id   veil15dc25eaf4116d32ea46c6bc1cc0f2a62f04e962ecb4c585f4f827bd609b96d59
+signing key 711356edc60003febde90d2de5cedcaa3325c69855af8bb84621e091f68b75d4
 stored at   /home/alice/.config/veil/identity.json
 ```
 
@@ -67,7 +67,7 @@ the change, not just before you commit it.
 $ cd hello
 $ vl init
 Initialized Veil repository in /tmp/vdoc/hello/.veil
-  identity   alice (veil14ee1c25cc3089f6bc41d9eb126ae1a2aa15d541d374b9198b941e77c18d2d446)
+  identity   alice (veil15dc25eaf4116d32ea46c6bc1cc0f2a62f04e962ecb4c585f4f827bd609b96d59)
   scope      team (you are the only member)
   recorded   2 files
 ```

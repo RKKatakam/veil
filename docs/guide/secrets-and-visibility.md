@@ -286,7 +286,7 @@ never receive it.
 ```text
 $ vl scope list
 team  admin  generation 0, 1 changes
-    alice        admin  veil14ee1c25cc3089f6bc41d9eb126ae1a2aa15d541d374b9198b941e77c18d2d446 (you)
+    alice        admin  veil15dc25eaf4116d32ea46c6bc1cc0f2a62f04e962ecb4c585f4f827bd609b96d59 (you)
 $ vl scope create ops
 Created scope ops (you are its admin)
 $ vl cloak 'deploy/*.yml' --scope ops
@@ -308,7 +308,7 @@ next pull. The full walkthrough of adding a teammate is in
 [Teams and remotes](teams-and-remotes.md#onboarding-a-teammate).
 
 ```text
-$ vl scope revoke team veil16a98…20
+$ vl scope revoke team veil1e75c…0a
 Revoked. Scope team rotated to key generation 1: new content is sealed with a key
 the revoked identity never receives. Content they already decrypted cannot be recalled; rotate secrets.
 Push to share the updated key ring.
@@ -408,7 +408,7 @@ are in [`docs/BACKLOG.md`](../BACKLOG.md). In short:
 | Limit | What it means for you |
 |---|---|
 | **File names, sizes and tree shape of cloaked files are visible** | A public remote shows `cloaked:team 15 secrets/notes.md (redacted)`: anyone can see that the file exists, its name and its size. Don't put secrets in file names |
-| **Scope membership is visible** | Key rings are synced to every remote, public ones included: anyone with a clone of a public mirror can list each scope's member names and ids (`vl scope list`) |
+| **Scope membership is visible on team remotes** | Key rings go to team remotes, so anyone who can read one can list each scope's member names and ids (`vl scope list`). Public remotes get no rings; a public mirror shows only the member ids and signing keys in the signatures of what it holds (snapshots, embargo records) |
 | **Equality leakage** | Sealing is deterministic: two cloaked files (or versions) with identical content produce identical ciphertext, so an observer can tell they are equal |
 | **Revocation is forward-only** | A revoked member keeps every key up to the revocation, so they can still read all history sealed before it, including unchanged files still sealed under an old generation, and anything they already decrypted. Rotate the underlying secrets |
 | **Plaintext history stays** | Cloaking a path doesn't encrypt earlier snapshots. Git history imported from GitHub is public by definition |
