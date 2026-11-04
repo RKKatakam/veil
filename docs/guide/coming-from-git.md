@@ -71,6 +71,8 @@ be undone. Add to that per-file encryption and engine-level secret handling.
 | `git rm --cached PATH` | `vl ignore PATH` (the file stays on disk, the next snapshot drops it) |
 | `git mv A B` | `mv A B` |
 | `git gc`, `git fsck` | `vl gc`, `vl fsck` |
+| `git format-patch A..B` | `vl format-patch A..B` (the public view: what `vl git push` would show; [details](github.md#patches-by-mail-vl-format-patch-and-vl-am)) |
+| `git am FILE` | `vl am FILE` (new changes on `@-`, all or nothing) |
 | `git revert`, `git cherry-pick`, `git blame`, `git bisect`, `git log -- PATH` | *(no equivalent in 1.0)* |
 
 ## Pitfalls

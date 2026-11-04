@@ -600,11 +600,19 @@ pub enum Cmd {
     /// unreleased embargo. Tags map to branches.
     #[command(subcommand)]
     Git(GitCmd),
-    /// Export snapshots as patch emails in Git's format, public view by
-    /// default (not implemented yet).
+    /// Export snapshots as patch emails in Git's format.
+    ///
+    /// The default view is the public one: exactly what `vl git push`
+    /// shows (no cloaked files or descriptions, nothing of an unreleased
+    /// embargo). `--audience me` includes what you can read, and says so.
     FormatPatch(patch_cmd::FormatPatchArgs),
-    /// Apply patch emails as new changes on top of a snapshot (not
-    /// implemented yet).
+    /// Apply patch emails (Git's `format-patch` output, or a plain diff) as
+    /// new changes on top of a snapshot.
+    ///
+    /// One change per patch, keeping its author, date and message; all or
+    /// nothing. Each patch is recorded like an incoming change: secrets are
+    /// quarantined (which aborts the series), a weakening `.veilpolicy` is
+    /// held back, and hostile paths are refused.
     Am(patch_cmd::AmArgs),
     /// Hooks run before commits and pushes; repository-suggested ones only
     /// once this device trusts them (not implemented yet).

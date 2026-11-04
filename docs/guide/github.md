@@ -200,6 +200,105 @@ Exported 1 commit(s)
 * `vl git push --force` only overwrites what you last fetched
   (`--force-with-lease`), so it cannot clobber commits you never saw.
 
+## Patches by mail: `vl format-patch` and `vl am`
+
+Projects that take patches by mail (or in an issue) get Git's own format.
+`vl format-patch` writes one mail per change, exactly as `git format-patch`
+would on what `vl git push` exports:
+
+```text
+$ vl format-patch main..@- -o ../outgoing
+../outgoing/0001-Say-hi.patch
+../outgoing/0002-Say-hello-instead.patch
+$ cat ../outgoing/0002-Say-hello-instead.patch
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Alice Doe <alice@example.com>
+Date: Wed, 4 Nov 2026 20:10:41 +0000
+Subject: [PATCH 2/2] Say hello instead
+
+---
+ app.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/app.rs b/app.rs
+index 1b7c1e7d7369c0f9472f22e1378605d8a590ddf8..75275760623f7f5fe5ad07f415dc5b1a374c87cd 100644
+--- a/app.rs
++++ b/app.rs
+@@ -1,3 +1,3 @@
+ fn main() {
+-    println!("hi");
++    println!("hello");
+ }
+-- 
+vl 0.1.0
+```
+
+* `REVSET` is `A..B` (what `B` has and `A` does not), `::B` (all of `B`'s
+  history) or one change. `--stdout` writes one mbox instead of files;
+  `--cover-letter` adds patch 0. Merges have no patch and are skipped.
+* **A patch shows what GitHub would see.** The cloaked `secrets/db.txt`
+  of "Say hi" is not in it, a cloaked description reads `(description
+  withheld: cloaked)`, and a change that is the withheld fix of an
+  unreleased embargo is refused before anything is written. `-o DIR`
+  writes into a temporary directory first, so a refused series leaves
+  nothing behind.
+* A description line that looks like patch syntax (`diff --git …`, `---`,
+  a `From ` line) is indented by one space, with a warning, so nobody's
+  `git am` takes it for part of the patch.
+* `--audience me` writes what *you* can read, cloaked content included.
+  It is never the default, can't be abbreviated, needs `--yes` when the
+  output is not a terminal, warns which scopes it holds, and puts them in
+  an `X-Veil-Audience:` header of every mail. Unreleased embargo content
+  also needs `--include-embargoed ID`. Use it only for someone in those
+  scopes, and prefer pushing to a team remote.
+
+`vl am` applies a series (a file, a directory of `.patch` files, or `-`
+for standard input) as **new changes**, one per patch, on top of `@-`
+(`-d REV` for another place). It keeps each patch's author, date and
+message; the change is signed by you. Your working copy moves on top:
+
+```text
+$ vl am ../outgoing
+Applied 2 patch(es):
+  nmvnzsot 2ee1f0f8 Say hi
+  quroxnlk 3314da20 Say hello instead
+The working copy was rebased onto the last of them.
+$ vl log -n 2
+@  wsksumok Bob Roe <bob@example.com> ✓ 2026-11-04 20:10:47 default@ f40d4c58 (empty)
+│  (no description set)
+○  quroxnlk Alice Doe <alice@example.com> ✓Bob Roe <bob@example.com> 2026-11-04 20:10:41 3314da20
+│  Say hello instead
+```
+
+A patch is someone else's content, so it goes through every check an
+incoming change does:
+
+* **All or nothing.** If any patch fails (a hunk that does not apply, a
+  hostile path, a secret), nothing at all is recorded; `vl undo` takes back
+  a whole applied series.
+* Hunks must match exactly, at most 1000 lines from where they say (no
+  fuzz, no whitespace or line-ending leniency, no `.rej` files).
+* Paths outside the repository, `.veil/`, `.git/` (in any spelling), and
+  names that would collide with an existing file on macOS are refused.
+* A secret is quarantined as in any snapshot, which aborts the series:
+
+  ```text
+  $ vl am ../evil.patch
+  error: policy violation: patch 1/1 (Add config): config.yml quarantined (aws-access-key-id): the patch adds what looks like a secret. Nothing was recorded; remove the secret from the patch, or make the path cloaked or isolated first
+  ```
+
+* A patch editing `.veilpolicy` to weaken it is recorded but **held back**
+  (`P` in `vl status`) until you run `vl policy accept`, as a pulled
+  change is. A file the patch writes is never recorded with less
+  protection than the policy it was applied to gives it.
+* A cloaked file you can read stays cloaked when a patch edits it; one you
+  hold no key for cannot be patched.
+
+**Not yet (phase 2):** rename detection in `format-patch -M` (a rename is a
+deletion and an addition), symlinks and submodules (refused by `vl am`),
+binary files (`Binary files … differ` on export, refused on import),
+`--binary` and `--3way`.
+
 ## Credentials and authorship
 
 * `vl git` runs your own **`git` binary** for fetch and push

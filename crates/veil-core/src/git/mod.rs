@@ -76,6 +76,10 @@ use std::{
 };
 
 pub use export::ExportReport;
+// The public projection's readers, for `vl format-patch` (`crate::patch`):
+// one projection function for every export.
+pub(crate) use export::split_author;
+pub(crate) use project::{public_open, public_text, Public, Veil, CLOAKED_DESCRIPTION};
 pub use import::ImportReport;
 pub use map::{GitMap, GitOid, Origin};
 pub use transport::{redact_url, PushOutcome, RefStatus};

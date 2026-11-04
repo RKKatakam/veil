@@ -77,8 +77,8 @@ Global options (accepted by every command):
 | [`vl push`](push.md) | Send tags and their history to a remote (visibility-filtered) |
 | [`vl pull`](pull.md) | Fetch tags and history from a remote |
 | [`vl git`](git.md) | Two-way Git interop: import Git history, push and fetch Git remotes |
-| [`vl format-patch`](format-patch.md) | Export snapshots as patch emails in Git's format, public view by default (not implemented yet) |
-| [`vl am`](am.md) | Apply patch emails as new changes on top of a snapshot (not implemented yet) |
+| [`vl format-patch`](format-patch.md) | Export snapshots as patch emails in Git's format |
+| [`vl am`](am.md) | Apply patch emails (Git's `format-patch` output, or a plain diff) as new changes on top of a snapshot |
 | [`vl hooks`](hooks.md) | Hooks run before commits and pushes; repository-suggested ones only once this device trusts them (not implemented yet) |
 | [`vl submodule`](submodule.md) | Git submodules: pinned commits of other Git repositories (not implemented yet) |
 | [`vl gc`](gc.md) | Pack objects and delete those no retained operation can reach |

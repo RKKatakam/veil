@@ -2792,6 +2792,89 @@ which gives the same result. A crash between writing objects and the map
 therefore only costs recomputation. Export and import run under the
 repository lock.
 
+### Patches: `vl format-patch` and `vl am` (`patch.rs`)
+
+Git's mbox format both ways (design and threat review:
+`docs/design/git-parity/4-patches.md`). No format change: `am` writes
+ordinary snapshots.
+
+**Export** (`patch::format_patches`, behind the `git` feature). The default
+audience is **public**, and it uses the export's own functions, not a copy
+of them: trees through `GitBridge::project`, file content through
+`project::public_open` (no scope key is ever used), descriptions through
+`project::public_text`. So a patch shows exactly what a Git push shows, and
+`git format-patch` on the bridge's export of the same range gives the same
+headers, file sections and `index` lines (`patch_cli`'s differential test).
+`index` ids are Git blob ids of the projected content, never Veil object
+ids; the `From <id>` line is the bridge's commit when the snapshot is
+mapped. `remote::embargo_withheld(_, true)` is checked first: a range
+holding withheld history is refused before anything is computed. Merges
+and the root have no patch. Hunks come from diffy within `textmerge`'s work
+bound (one coarse hunk past it), so a hostile pair of files cannot stall an
+export. `--audience me` reads through the keychain instead (`TreeView`
+semantics: a conflict for its reader, a file without a key left out with a
+warning) and collects the label of every sealed object it opened: scopes go
+to `X-Veil-Audience`, an unreleased embargo needs `--include-embargoed`,
+and `local` is refused. A description line a reader would take
+for patch syntax (`diff --git`, `---`, `-- `, a `From ` postmark, an
+in-body `From:` first in the body) is indented by one space, with a
+warning: a teammate's text never becomes a file section, a forged author or
+a message of its own when someone runs `git am` on the export. The CLI names
+changes by id only in its messages (a description may be sealed), writes `-o DIR` into a private temp
+directory inside `DIR` and renames into place at the end, and requires
+`--yes` for `me` on a non-terminal standard output.
+
+**Parse** (`patch::parse`). Hand-written, one pass over the input, no
+regexes, refusing anything it does not understand exactly (see the module
+documentation for the grammar). Hunks are stored as byte ranges of the
+input and re-read by `Series::hunk_lines`, so memory is the input plus a
+few dozen bytes per hunk; every count and size is capped by `Limits`
+(input 1 GiB, 16 MiB lines, 1 000 000 hunks per file, …), and a binary
+section's declared size is checked before anything is read (nothing is
+ever inflated: binary sections are refused). Paths go through
+`check_path` before they are `VPath`s; decoded headers holding control
+characters or direction overrides are refused.
+
+**Apply** (`patch::apply_series`). The input is parsed before the lock is
+taken; then one transaction, in which the destination revision is
+resolved (so a racing commit is never lost: the series lands on `@-` as it
+is now). For each patch:
+
+1. every section is checked against the *pre-image* tree (all sections of
+   a patch read the pre-image, as in Git; each path is claimed by at most
+   one section, a copy's source by any number): a source must be a regular
+   file whose own object this reader can open (never its fallback), a
+   target must be free with directories (or files the same patch deletes)
+   above it, and no name may fold (`NameFolding::MACOS`) onto another of
+   its directory, readable or not;
+2. hunks apply exactly, up to `max_offset` lines away, inside a work
+   budget; the results are written to an `OverlayBackend` over a
+   `TreeView` of the pre-image (never the working copy, never an OS path);
+3. the **builder** records the overlay with the policy guarded by the one
+   this device accepted (the pre-image's if none was): a weakening
+   `.veilpolicy` is recorded but held back (`P`), nothing is ever
+   accepted, and cloaking, isolation and scanning apply as to any
+   snapshot; sealed files edited stay sealed under their scope;
+4. the result is checked: anything quarantined, isolated, ignored, not
+   cloakable or held back by an embargo aborts the series, and so does a
+   written file recorded with less protection than the pre-image's own
+   `.veilpolicy` gives it (the accepted policy may predate a stricter
+   rule that arrived since);
+5. a new change is written (`Transaction::write_snapshot`: signed by this
+   identity; author and time are the patch's claims, description sealed as
+   `embargo::description_scope` says).
+
+The working copy is rebased onto the last new change when it was a child
+of the destination. Any error drops the transaction: nothing is recorded,
+and the objects already written are unreferenced (gc removes them; a
+quarantined file never reaches the store). `vl undo` takes back a whole
+series.
+
+**Phase 2** adds rename detection on the projected sides (`rename.rs`;
+the seam is marked in `writer::changes`), symlink and submodule entries
+(format 5; `parse_mode` refuses 120000 and 160000 today), binary literals
+both ways, and `--3way`.
+
 ## 12. Read commands: one API, text or JSON (`crates/vl/src/api.rs`)
 
 The read commands (`status`, `log`, `diff`, `show`, `ls`, `workspace list`,

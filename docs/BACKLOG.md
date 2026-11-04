@@ -27,7 +27,9 @@ fixed**. Severity: high / medium / low.
 - **Missing everyday commands:** `blame`/annotate, `bisect`,
   cherry-pick/duplicate, history
   search (`log -S`/`-G`, path and author filters), `grep` over a snapshot,
-  `archive` (tarball of a snapshot), patch export/import.
+  `archive` (tarball of a snapshot).
+- **Patches, phase 2:** `vl format-patch -M` renames, symlinks and
+  submodules in `vl am`, binary literals both ways, `vl am --3way`.
 - **Rename and copy detection** in `diff`, `log` and merge (today a rename is
   a delete plus an add, and merges are not rename-aware).
 - **Repository attributes:** line-ending normalisation (CRLF), per-path diff

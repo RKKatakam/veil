@@ -3,7 +3,9 @@
 
 # `vl am`
 
-Apply patch emails as new changes on top of a snapshot (not implemented yet)
+Apply patch emails (Git's `format-patch` output, or a plain diff) as new changes on top of a snapshot.
+
+One change per patch, keeping its author, date and message; all or nothing. Each patch is recorded like an incoming change: secrets are quarantined (which aborts the series), a weakening `.veilpolicy` is held back, and hostile paths are refused.
 
 ```text
 vl am [OPTIONS] <INPUT>
@@ -20,7 +22,7 @@ Options:
 | | |
 |---|---|
 | `-d, --destination <DEST>` | Apply the series on top of this snapshot (default: `@-`) |
-| `--3way` | Fall back to a three-way merge when a patch's pre-image is known |
+| `--3way` | Fall back to a three-way merge when a patch's pre-image is known (not supported yet) |
 | `--keep-author` | Record each patch's `From:` as the change's author (the default) |
 | `--author-as-me` | Record yourself as the author of every change |
 | `--signoff` | Add a `Signed-off-by:` line to each description |
