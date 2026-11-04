@@ -47,7 +47,7 @@
 //! merge of a cloaked line of work into a public line publishes that line's
 //! files, after secret scanning them.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 use crate::{
     error::{Result, VeilError},
@@ -56,6 +56,7 @@ use crate::{
     policy::{Policy, Tier, POLICY_FILE},
     secrets::{self, Finding},
     store::ObjectStore,
+    tree::MAX_TREE_DEPTH,
     vpath::VPath,
 };
 
@@ -172,6 +173,25 @@ pub fn wrap(store: &ObjectStore, embargo: &str, tree: &ObjectId, fallback: &Obje
     store.put_tree(&w)
 }
 
+struct SealFrame {
+    t: Arc<Tree>,
+    b: Option<Arc<Tree>>,
+    dir: VPath,
+    next: usize,
+    out: Tree,
+}
+
+fn seal_frame(store: &ObjectStore, tree: &ObjectId, base: Option<ObjectId>, dir: VPath) -> Result<SealFrame> {
+    Ok(SealFrame {
+        t: store.tree(tree)?,
+        b: base.map(|b| store.tree(&b)).transpose()?,
+        dir,
+        next: 0,
+        out: Tree::default(),
+    })
+}
+
+/// Iterative (tree depth is not trusted).
 fn seal_dir(
     store: &ObjectStore,
     vis: &Visibility,
@@ -179,25 +199,46 @@ fn seal_dir(
     base: Option<ObjectId>,
     listed: &mut BTreeSet<ObjectId>,
 ) -> Result<ObjectId> {
-    let t = store.tree(tree)?;
-    let b = base.map(|b| store.tree(&b)).transpose()?;
-    let mut out = Tree::default();
-    for e in &t.entries {
-        let be = b.as_deref().and_then(|b| b.get(&e.name));
-        if be.is_some_and(|x| x.same_content(e)) {
+    let scope = vis.key_scope().expect("embargo visibility has a key scope");
+    let mut stack = vec![seal_frame(store, tree, base, VPath::root())?];
+    let mut done: Option<ObjectId> = None;
+    loop {
+        let depth = stack.len();
+        let f = stack.last_mut().expect("never empty here");
+        if let Some(id) = done.take() {
+            let name = f.t.entries[f.next - 1].name.clone();
+            f.out.insert(TreeEntry::dir(&name, id));
+        }
+        let Some(e) = f.t.entries.get(f.next).cloned() else {
+            let fin = stack.pop().expect("checked");
+            let sealed = store.put(&store.seal(&Object::Tree(fin.out), &scope)?)?;
+            listed.insert(sealed);
+            if stack.is_empty() {
+                return Ok(sealed);
+            }
+            done = Some(sealed);
+            continue;
+        };
+        f.next += 1;
+        let be = f.b.as_deref().and_then(|b| b.get(&e.name)).cloned();
+        if be.as_ref().is_some_and(|x| x.same_content(&e)) {
             // Reachable through the fallback; nothing to hide.
-            out.insert(e.clone());
+            f.out.insert(e);
             continue;
         }
         match e.kind {
             EntryKind::Dir => {
+                let path = f.dir.join(&e.name);
+                if depth >= MAX_TREE_DEPTH {
+                    return Err(too_deep(&path));
+                }
                 let sub_base = be.filter(|x| x.kind == EntryKind::Dir).map(|x| x.id);
-                let id = seal_dir(store, vis, &e.id, sub_base, listed)?;
-                out.insert(TreeEntry::dir(&e.name, id));
+                let child = seal_frame(store, &e.id, sub_base, path)?;
+                stack.push(child);
             }
             EntryKind::File => {
                 let ne = if e.visibility.is_public() {
-                    let data = store.read_entry(e)?;
+                    let data = store.read_entry(&e)?;
                     TreeEntry {
                         id: store.store_file(&data, vis)?,
                         visibility: vis.clone(),
@@ -211,14 +252,10 @@ fn seal_dir(
                 if let Some(fb) = ne.fallback {
                     listed.insert(fb);
                 }
-                out.insert(ne);
+                f.out.insert(ne);
             }
         }
     }
-    let scope = vis.key_scope().expect("embargo visibility has a key scope");
-    let sealed = store.put(&store.seal(&Object::Tree(out), &scope)?)?;
-    listed.insert(sealed);
-    Ok(sealed)
 }
 
 /// Embargo the merged `tree`: readers without the key see `base` (the first
@@ -275,14 +312,17 @@ fn desired_visibility(policy: &Policy, path: &VPath, cloak: Option<&str>) -> Opt
     }
 }
 
-fn normalize_dir(
-    store: &ObjectStore,
-    tree: &ObjectId,
-    dest: Option<ObjectId>,
-    dir: &VPath,
-    opts: &NormalizeOptions,
-    report: &mut NormalizeReport,
-) -> Result<ObjectId> {
+struct NormalizeFrame {
+    id: ObjectId,
+    t: Arc<Tree>,
+    d: Option<Arc<Tree>>,
+    dir: VPath,
+    next: usize,
+    out: Tree,
+    changed: bool,
+}
+
+fn normalize_frame(store: &ObjectStore, tree: &ObjectId, dest: Option<ObjectId>, dir: VPath) -> Result<NormalizeFrame> {
     let t = store.tree(tree)?;
     let d = match dest {
         Some(id) => match store.tree(&id) {
@@ -292,108 +332,171 @@ fn normalize_dir(
         },
         None => None,
     };
-    let mut out = Tree::default();
-    let mut changed = false;
-    for e in &t.entries {
-        let path = dir.join(&e.name);
-        let de = d.as_deref().and_then(|d| d.get(&e.name));
-        let mut ne = Some(e.clone());
+    Ok(NormalizeFrame {
+        id: *tree,
+        t,
+        d,
+        dir,
+        next: 0,
+        out: Tree::default(),
+        changed: false,
+    })
+}
+
+/// Iterative (tree depth is not trusted): a frame per directory being
+/// normalised, resumed when its subdirectory is done.
+fn normalize_dir(
+    store: &ObjectStore,
+    tree: &ObjectId,
+    dest: Option<ObjectId>,
+    dir: &VPath,
+    opts: &NormalizeOptions,
+    report: &mut NormalizeReport,
+) -> Result<ObjectId> {
+    let mut stack = vec![normalize_frame(store, tree, dest, dir.clone())?];
+    let mut done: Option<ObjectId> = None;
+    loop {
+        let depth = stack.len();
+        let f = stack.last_mut().expect("never empty here");
+        // Entry `next - 1` is a directory whose normalisation just finished.
+        if let Some(id) = done.take() {
+            let e = f.t.entries[f.next - 1].clone();
+            // Everything in it was quarantined: no empty directory.
+            let emptied = id != e.id && store.tree(&id)?.is_empty();
+            let ne = if emptied { None } else { Some(TreeEntry { id, ..e.clone() }) };
+            settle(f, &e, ne);
+        }
+        let Some(e) = f.t.entries.get(f.next).cloned() else {
+            let fin = stack.pop().expect("checked");
+            let id = if !fin.changed {
+                fin.id
+            } else if fin.out.is_empty() {
+                store.empty_tree()?
+            } else {
+                store.put_tree(&fin.out)?
+            };
+            if stack.is_empty() {
+                return Ok(id);
+            }
+            done = Some(id);
+            continue;
+        };
+        f.next += 1;
+        let path = f.dir.join(&e.name);
+        let de = f.d.as_deref().and_then(|d| d.get(&e.name)).cloned();
         match e.kind {
             EntryKind::Dir => {
+                if depth >= MAX_TREE_DEPTH {
+                    return Err(too_deep(&path));
+                }
                 let sub_dest = de.filter(|x| x.kind == EntryKind::Dir).map(|x| x.id);
-                let id = normalize_dir(store, &e.id, sub_dest, &path, opts, report)?;
-                // Everything in it was quarantined: no empty directory.
-                let emptied = id != e.id && store.tree(&id)?.is_empty();
-                ne = if emptied { None } else { Some(TreeEntry { id, ..e.clone() }) };
+                let child = normalize_frame(store, &e.id, sub_dest, path)?;
+                stack.push(child);
             }
             EntryKind::File => {
-                let unchanged_from_dest = de.is_some_and(|x| x.same_content(e));
-                let dest_sealed = de.filter(|d| d.kind == EntryKind::File && matches!(d.visibility, Visibility::Cloaked { .. }));
-                let desired = desired_visibility(opts.policy, &path, opts.cloak);
-                match (&e.visibility, desired) {
-                    // The destination holds this file sealed and the merged
-                    // side would widen or move its audience (e.g. a PR whose
-                    // author exposed it): keep the destination's audience,
-                    // with the merged content if we can read it.
-                    (v, _) if !unchanged_from_dest && !matches!(v, Visibility::Embargoed { .. }) && dest_sealed.is_some_and(|d| d.visibility != *v) => {
-                        let d = dest_sealed.expect("checked");
-                        let resealed = match store.read_entry(e) {
-                            Ok(data) => Some(TreeEntry {
-                                id: store.store_file(&data, &d.visibility)?,
-                                size: data.len() as u64,
-                                visibility: d.visibility.clone(),
-                                fallback: None,
-                                ..e.clone()
-                            }),
-                            Err(err) if err.is_unreadable() => None,
-                            Err(err) => return Err(err),
-                        };
-                        ne = Some(resealed.unwrap_or_else(|| d.clone()));
-                        report.kept_sealed.push((
-                            path.clone(),
-                            format!(
-                                "stays {}: the merged side would make it {}; a merge never widens or moves the audience of content the destination keeps sealed",
-                                d.visibility.label(),
-                                v.label()
-                            ),
-                        ));
-                    }
-                    (Visibility::Embargoed { .. }, _) | (_, None) => {}
-                    (v, Some(want)) if *v == want => {}
-                    (Visibility::Public, Some(want)) => {
-                        // Sealing is never a downgrade. Without the key the
-                        // entry stays as it was in its source.
-                        if let Ok(data) = store.read_entry(e) {
-                            if let Ok(id) = store.store_file(&data, &want) {
-                                ne = Some(TreeEntry {
-                                    id,
-                                    visibility: want,
-                                    fallback: None,
-                                    ..e.clone()
-                                });
-                            }
-                        }
-                    }
-                    (Visibility::Cloaked { scope: have }, Some(Visibility::Cloaked { scope: want })) => {
-                        if !unchanged_from_dest {
-                            report.kept_sealed.push((
-                                path.clone(),
-                                format!("stays cloaked under '{have}' (policy says '{want}'); a merge never re-keys cloaked content, re-cloak it deliberately"),
-                            ));
-                        }
-                    }
-                    (Visibility::Cloaked { scope: have }, Some(Visibility::Public)) => {
-                        let dest_public = opts.dest_policy.classify(&path, false).tier == Tier::Public;
-                        if !opts.declassify.contains(have) || !dest_public {
-                            if !unchanged_from_dest {
-                                report.kept_sealed.push((
-                                    path.clone(),
-                                    format!("stays cloaked under '{have}'; a merge only publishes files of the cloaked line being merged (use `vl expose` to publish deliberately)"),
-                                ));
-                            }
-                        } else {
-                            ne = declassify(store, e, de, &path, opts, report)?;
-                        }
-                    }
-                    (Visibility::Cloaked { .. }, Some(Visibility::Embargoed { .. })) => {}
+                let ne = normalize_file(store, &e, de.as_ref(), &path, opts, report)?;
+                settle(f, &e, ne);
+            }
+        }
+    }
+}
+
+fn settle(f: &mut NormalizeFrame, e: &TreeEntry, ne: Option<TreeEntry>) {
+    match ne {
+        Some(ne) => {
+            f.changed |= ne != *e;
+            f.out.insert(ne);
+        }
+        None => f.changed = true,
+    }
+}
+
+fn too_deep(path: &VPath) -> VeilError {
+    VeilError::Corrupt(path.to_string(), format!("directory nesting exceeds {MAX_TREE_DEPTH} levels"))
+}
+
+/// The normalised entry for file `e` (`None`: left out of the merge).
+fn normalize_file(
+    store: &ObjectStore,
+    e: &TreeEntry,
+    de: Option<&TreeEntry>,
+    path: &VPath,
+    opts: &NormalizeOptions,
+    report: &mut NormalizeReport,
+) -> Result<Option<TreeEntry>> {
+    let path = path.clone();
+    let mut ne = Some(e.clone());
+    let unchanged_from_dest = de.is_some_and(|x| x.same_content(e));
+    let dest_sealed = de.filter(|d| d.kind == EntryKind::File && matches!(d.visibility, Visibility::Cloaked { .. }));
+    let desired = desired_visibility(opts.policy, &path, opts.cloak);
+    match (&e.visibility, desired) {
+        // The destination holds this file sealed and the merged
+        // side would widen or move its audience (e.g. a PR whose
+        // author exposed it): keep the destination's audience,
+        // with the merged content if we can read it.
+        (v, _) if !unchanged_from_dest && !matches!(v, Visibility::Embargoed { .. }) && dest_sealed.is_some_and(|d| d.visibility != *v) => {
+            let d = dest_sealed.expect("checked");
+            let resealed = match store.read_entry(e) {
+                Ok(data) => Some(TreeEntry {
+                    id: store.store_file(&data, &d.visibility)?,
+                    size: data.len() as u64,
+                    visibility: d.visibility.clone(),
+                    fallback: None,
+                    ..e.clone()
+                }),
+                Err(err) if err.is_unreadable() => None,
+                Err(err) => return Err(err),
+            };
+            ne = Some(resealed.unwrap_or_else(|| d.clone()));
+            report.kept_sealed.push((
+                path.clone(),
+                format!(
+                    "stays {}: the merged side would make it {}; a merge never widens or moves the audience of content the destination keeps sealed",
+                    d.visibility.label(),
+                    v.label()
+                ),
+            ));
+        }
+        (Visibility::Embargoed { .. }, _) | (_, None) => {}
+        (v, Some(want)) if *v == want => {}
+        (Visibility::Public, Some(want)) => {
+            // Sealing is never a downgrade. Without the key the
+            // entry stays as it was in its source.
+            if let Ok(data) = store.read_entry(e) {
+                if let Ok(id) = store.store_file(&data, &want) {
+                    ne = Some(TreeEntry {
+                        id,
+                        visibility: want,
+                        fallback: None,
+                        ..e.clone()
+                    });
                 }
             }
         }
-        match ne {
-            Some(ne) => {
-                changed |= ne != *e;
-                out.insert(ne);
+        (Visibility::Cloaked { scope: have }, Some(Visibility::Cloaked { scope: want })) => {
+            if !unchanged_from_dest {
+                report.kept_sealed.push((
+                    path.clone(),
+                    format!("stays cloaked under '{have}' (policy says '{want}'); a merge never re-keys cloaked content, re-cloak it deliberately"),
+                ));
             }
-            None => changed = true,
         }
+        (Visibility::Cloaked { scope: have }, Some(Visibility::Public)) => {
+            let dest_public = opts.dest_policy.classify(&path, false).tier == Tier::Public;
+            if !opts.declassify.contains(have) || !dest_public {
+                if !unchanged_from_dest {
+                    report.kept_sealed.push((
+                        path.clone(),
+                        format!("stays cloaked under '{have}'; a merge only publishes files of the cloaked line being merged (use `vl expose` to publish deliberately)"),
+                    ));
+                }
+            } else {
+                ne = declassify(store, e, de, &path, opts, report)?;
+            }
+        }
+        (Visibility::Cloaked { .. }, Some(Visibility::Embargoed { .. })) => {}
     }
-    if !changed {
-        return Ok(*tree);
-    }
-    if out.is_empty() {
-        return store.empty_tree();
-    }
-    store.put_tree(&out)
+    Ok(ne)
 }
 
 /// Publish one file of a merged-in cloaked line, unless it holds a secret.
@@ -463,27 +566,72 @@ pub fn seal_introduced(store: &ObjectStore, tree: &ObjectId, base: Option<Object
     seal_introduced_dir(store, tree, base, &VPath::root(), scope)
 }
 
+struct IntroFrame {
+    id: ObjectId,
+    t: Arc<Tree>,
+    b: Option<Arc<Tree>>,
+    dir: VPath,
+    next: usize,
+    out: Tree,
+    changed: bool,
+}
+
+/// Iterative (tree depth is not trusted).
 fn seal_introduced_dir(store: &ObjectStore, tree: &ObjectId, base: Option<ObjectId>, dir: &VPath, scope: &str) -> Result<ObjectId> {
     if Some(*tree) == base {
         return Ok(*tree);
     }
-    let t = store.tree(tree)?;
-    let b = base.map(|b| store.tree(&b)).transpose()?;
     let vis = Visibility::Cloaked { scope: scope.to_string() };
-    let mut out = Tree::default();
-    let mut changed = false;
-    for e in &t.entries {
-        let be = b.as_deref().and_then(|b| b.get(&e.name));
-        let path = dir.join(&e.name);
+    let frame = |id: &ObjectId, base: Option<ObjectId>, dir: VPath| -> Result<IntroFrame> {
+        Ok(IntroFrame {
+            id: *id,
+            t: store.tree(id)?,
+            b: base.map(|b| store.tree(&b)).transpose()?,
+            dir,
+            next: 0,
+            out: Tree::default(),
+            changed: false,
+        })
+    };
+    let mut stack = vec![frame(tree, base, dir.clone())?];
+    let mut done: Option<ObjectId> = None;
+    loop {
+        let depth = stack.len();
+        let f = stack.last_mut().expect("never empty here");
+        if let Some(id) = done.take() {
+            let e = &f.t.entries[f.next - 1];
+            let ne = TreeEntry { id, ..e.clone() };
+            f.changed |= ne != *e;
+            f.out.insert(ne);
+        }
+        let Some(e) = f.t.entries.get(f.next).cloned() else {
+            let fin = stack.pop().expect("checked");
+            let id = if fin.changed { store.put_tree(&fin.out)? } else { fin.id };
+            if stack.is_empty() {
+                return Ok(id);
+            }
+            done = Some(id);
+            continue;
+        };
+        f.next += 1;
+        let be = f.b.as_deref().and_then(|b| b.get(&e.name)).cloned();
+        let path = f.dir.join(&e.name);
         let mut ne = e.clone();
-        if !be.is_some_and(|x| x.same_content(e)) {
+        if !be.as_ref().is_some_and(|x| x.same_content(&e)) {
             match e.kind {
                 EntryKind::Dir => {
                     let sub = be.filter(|x| x.kind == EntryKind::Dir).map(|x| x.id);
-                    ne.id = seal_introduced_dir(store, &e.id, sub, &path, scope)?;
+                    if Some(e.id) != sub {
+                        if depth >= MAX_TREE_DEPTH {
+                            return Err(too_deep(&path));
+                        }
+                        let child = frame(&e.id, sub, path)?;
+                        stack.push(child);
+                        continue;
+                    }
                 }
                 EntryKind::File if e.visibility.is_public() && path.as_str() != POLICY_FILE => {
-                    let data = store.read_entry(e)?;
+                    let data = store.read_entry(&e)?;
                     ne.id = store.store_file(&data, &vis)?;
                     ne.visibility = vis.clone();
                     ne.fallback = None;
@@ -491,11 +639,7 @@ fn seal_introduced_dir(store: &ObjectStore, tree: &ObjectId, base: Option<Object
                 EntryKind::File => {}
             }
         }
-        changed |= ne != *e;
-        out.insert(ne);
+        f.changed |= ne != e;
+        f.out.insert(ne);
     }
-    if !changed {
-        return Ok(*tree);
-    }
-    store.put_tree(&out)
 }
