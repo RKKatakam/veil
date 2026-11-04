@@ -1,6 +1,6 @@
 # Build, test and lint on every push and pull request, on Linux and macOS.
 #
-#   test       cargo build / test (incl. doc tests) / clippy -D warnings
+#   test       cargo build / test (incl. doc tests) / clippy / cargo doc, all -D warnings
 #   musl       the static Linux binaries releases ship (x86_64 and aarch64)
 #   packaging  completions, man pages, Homebrew formula, dist config, actionlint
 #
@@ -14,6 +14,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Least privilege: every job only reads the repository (and says so itself).
+# Actions are pinned to commit SHAs (Dependabot keeps them current, see
+# .github/dependabot.yml); downloaded tools are checked against a pinned
+# SHA-256 before they run.
 permissions:
   contents: read
 
@@ -35,8 +39,10 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install Rust
@@ -44,7 +50,7 @@ jobs:
           rustup toolchain install stable --profile minimal --component clippy
           rustup default stable
           rustc --version
-      - uses: Swatinem/rust-cache@v2.9.3
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Tests spawn `sh`, `sleep` and `true` (always present) and, for SFTP
       # remotes, `ssh` and `sftp-server`. macOS ships OpenSSH, including
       # /usr/libexec/sftp-server; Ubuntu runners have the client only.
@@ -65,6 +71,10 @@ jobs:
         run: cargo test --workspace --doc --no-fail-fast --locked
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Docs build without warnings (broken intra-doc links, …)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --locked
 
   musl:
     name: musl (${{ matrix.target }})
@@ -78,12 +88,14 @@ jobs:
             os: ubuntu-24.04-arm
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    permissions:
+      contents: read
     env:
       TARGET: ${{ matrix.target }}
       # The `cc` crate (zstd's C code) finds musl-gcc by itself only on x86_64.
       CC_aarch64_unknown_linux_musl: musl-gcc
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install Rust and musl
@@ -92,7 +104,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends musl-tools
           rustup toolchain install stable --profile minimal --target "$TARGET"
           rustup default stable
-      - uses: Swatinem/rust-cache@v2.9.3
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}
       - name: Build
@@ -115,8 +127,10 @@ jobs:
   packaging:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install Rust and checkers
@@ -125,7 +139,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends zsh fish groff-base ruby
           rustup toolchain install stable --profile minimal
           rustup default stable
-      - uses: Swatinem/rust-cache@v2.9.3
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build
         run: cargo build --locked -p vl
       - name: Shell completions parse
@@ -154,19 +168,51 @@ jobs:
           done
           packaging/homebrew/render-formula.sh v0.0.0 sums > vl.rb
           ruby -c vl.rb
+          packaging/homebrew/render-formula.sh v1.2.3-rc.1 sums > vl-rc.rb
+          ruby -c vl-rc.rb
+          # Tags that are not plain SemVer are refused (BUG-067): quotes
+          # would be Ruby code in the formula, `|` a sed command.
+          # shellcheck disable=SC2016 # `$(id)` is meant literally
+          for tag in 'v1.2.3";system "id";"' 'v1.2.3|g;1e id;s|x' 'v1.2.3$(id)' \
+                     "$(printf 'v1.2.3\nx')" v1.2 v01.2.3 1.2.3 --help; do
+            if packaging/homebrew/render-formula.sh "$tag" sums > /dev/null 2>&1; then
+              echo "::error::render-formula.sh accepted a hostile tag"
+              exit 1
+            fi
+          done
+      # The dist release binary, checked against a pinned SHA-256 (not its
+      # installer piped to sh). Keep DIST_VERSION equal to
+      # `cargo-dist-version` in dist-workspace.toml; the hash is the
+      # `cargo-dist-x86_64-unknown-linux-gnu.tar.xz.sha256` of that release
+      # (see docs/RELEASING.md, "Updating dist").
       - name: Release config is consistent (dist plan)
+        env:
+          DIST_VERSION: 0.34.0
+          DIST_SHA256: 7fee44ff3ff71ed0064b32d4ec62fee6b58bd37c5887b12a86aedddc5af0c7b5
         run: |
-          curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.34.0/cargo-dist-installer.sh | sh
+          set -euo pipefail
+          grep -qx "cargo-dist-version = \"$DIST_VERSION\"" dist-workspace.toml || {
+            echo "::error::DIST_VERSION in ci.yml differs from cargo-dist-version in dist-workspace.toml"
+            exit 1
+          }
+          name=cargo-dist-x86_64-unknown-linux-gnu
+          curl --proto '=https' --tlsv1.2 -LsSf -o "$RUNNER_TEMP/$name.tar.xz" \
+            "https://github.com/axodotdev/cargo-dist/releases/download/v${DIST_VERSION}/$name.tar.xz"
+          echo "$DIST_SHA256  $RUNNER_TEMP/$name.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/$name.tar.xz" -C "$RUNNER_TEMP"
+          dist="$RUNNER_TEMP/$name/dist"
+          "$dist" --version
           # Fails if .github/workflows/release.yml is out of date with
           # dist-workspace.toml or .github/build-setup.yml.
-          dist plan
+          "$dist" plan
       - name: actionlint
         env:
           ACTIONLINT_VERSION: 1.7.12
           ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
         run: |
+          set -euo pipefail
           tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
-          curl -LsSf -o "$RUNNER_TEMP/$tarball" "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/$tarball"
+          curl --proto '=https' --tlsv1.2 -LsSf -o "$RUNNER_TEMP/$tarball" "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/$tarball"
           echo "$ACTIONLINT_SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint" -color

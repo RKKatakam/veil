@@ -9,11 +9,11 @@ right *before* the tag, and how to check the result.
 
 | Asset | Contents |
 |---|---|
-| `vl-<target>.tar.xz` | `vl`, `README.md`, `completions/` (`vl.bash`, `_vl`, `vl.fish`) and `man/` (`vl.1`, `vl-<command>.1`, …) |
+| `vl-<target>.tar.xz` | `vl`, `README.md`, `LICENSE-MIT`, `LICENSE-APACHE`, `completions/` (`vl.bash`, `_vl`, `vl.fish`) and `man/` (`vl.1`, `vl-<command>.1`, …) |
 | `vl-<target>.tar.xz.sha256` | its SHA-256 (`sha256sum -c` / `shasum -a 256 -c`) |
 | `sha256.sum` | every checksum in one file |
 | `vl-installer.sh` | shell installer: picks the target, verifies the checksum, installs into `$CARGO_HOME/bin` |
-| `vl.rb` | the Homebrew formula (also pushed to the tap) |
+| `vl.rb` | the Homebrew formula (also pushed to the tap); installs the binary, completions, man pages and both licence texts |
 | `source.tar.gz` | the source at the tag |
 
 Targets: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` (static
@@ -31,6 +31,9 @@ binaries, so they run on any Linux distribution), `x86_64-apple-darwin` and
 | `.github/workflows/publish-homebrew.yml` | after a successful Release: renders and publishes `vl.rb` |
 | `packaging/homebrew/vl.rb.in`, `render-formula.sh` | the formula template and its renderer |
 | `Cargo.toml` `[profile.dist]` | the profile release binaries are built with (same as `release`) |
+| `LICENSE-MIT`, `LICENSE-APACHE` | the licence texts (`MIT OR Apache-2.0`); dist puts them in every archive by itself |
+| `.github/dependabot.yml` | weekly updates of the pinned action SHAs and the Cargo dependencies |
+| `SECURITY.md` | how to report a vulnerability, supported versions |
 
 `release.yml` also runs on pull requests, where it only runs `dist plan`.
 CI's `packaging` job runs `dist plan` on every push too, which fails if
@@ -64,7 +67,15 @@ an invalid `uses: $/...` path.
    the tap repository only and **Contents: Read and write**. Store it as the
    repository **secret** `HOMEBREW_TAP_TOKEN`. Without it, releases still
    attach `vl.rb` and the workflow prints a warning instead of pushing.
-5. **Runners.** The aarch64 Linux build and CI's `musl` job use the
+5. **Security contact.** Replace the placeholder contact in `SECURITY.md`
+   with a real, monitored address, and enable *private vulnerability
+   reporting* (Settings → Code security). Enable Dependabot alerts and
+   version updates there too; `.github/dependabot.yml` configures them.
+6. **Licence holder.** `LICENSE-MIT` says "Copyright (c) 2026 The Veil
+   Authors". Change the holder line if it should name a person or an
+   organisation. `LICENSE-APACHE` is the unmodified Apache text, which has
+   no holder line.
+7. **Runners.** The aarch64 Linux build and CI's `musl` job use the
    `ubuntu-22.04-arm` / `ubuntu-24.04-arm` runners. They are free for public
    repositories. For a private repository, check that your plan includes
    them, or drop `aarch64-unknown-linux-musl` from `targets` (and from the
@@ -74,7 +85,7 @@ an invalid `uses: $/...` path.
 
 ### 1. Everything is green
 
-* CI on `main` (Linux and macOS: build, tests, doc tests, clippy, musl,
+* CI on `main` (Linux and macOS: build, tests, doc tests, clippy, `cargo doc`, musl,
   packaging).
 * The latest **Nightly** run (deep property tests). Run it by hand from the
   Actions tab if the last one is old.
@@ -126,14 +137,25 @@ For every release:
    previous release shows its format as older (or upgrade it with
    `vl upgrade`).
 
-### 4. Release notes
+### 4. Supply chain
+
+* No open Dependabot pull request for `github-actions` is left unreviewed,
+  and the pins in `[dist.github-action-commits]` (`dist-workspace.toml`)
+  are not older than the last release of each action's major version (see
+  "Maintenance").
+* Review the parts of the generated `release.yml` that dist does not let
+  us harden (below, "What dist does not pin"). After a `dist generate`,
+  read its diff for new `uses:` lines without a SHA, new `curl … | sh`
+  lines, and new `${{ … }}` expressions in `run:` scripts.
+
+### 5. Release notes
 
 dist uses the section of `CHANGELOG.md` (or `RELEASES.md`) whose heading
 matches the version (`## 1.2.3`) as the Release body. Without one the
 body only lists the assets. Mention format changes and `vl upgrade` steps
 first.
 
-### 5. Optional dry run
+### 6. Optional dry run
 
 ```sh
 dist plan --tag v1.2.3      # what would be built; fails on config problems
@@ -206,13 +228,70 @@ sha256sum -c vl-x86_64-unknown-linux-musl.tar.xz.sha256
 ## Maintenance
 
 * **Updating dist:** install the new version, set `cargo-dist-version` in
-  `dist-workspace.toml`, run `dist generate`, and update the dist version
-  in the `packaging` job of `ci.yml`. Read the generated diff. If a new
-  dist installs completions and man pages in its Homebrew formula and
-  renders custom jobs correctly, `publish-homebrew.yml` could become a dist
-  `publish-jobs` entry.
-* **Actions** are pinned to release tags (`actions/checkout@v7.0.1`,
-  `Swatinem/rust-cache@v2.9.3`, …) in `ci.yml`, `nightly.yml` and
-  `publish-homebrew.yml`. `release.yml` uses the versions dist chooses.
-  `actionlint` runs in CI with its own pinned version and checksum
-  (configuration: `.github/actionlint.yaml`).
+  `dist-workspace.toml`, run `dist generate`, and update `DIST_VERSION` and
+  `DIST_SHA256` in the `packaging` job of `ci.yml` (the hash is in the
+  release's `cargo-dist-x86_64-unknown-linux-gnu.tar.xz.sha256`; CI fails
+  if `DIST_VERSION` and `cargo-dist-version` differ). Read the generated
+  diff, with the checks of "Before the tag", step 4. Check whether the new
+  dist can pin its own installer (a checksum, not `curl | sh`) or set
+  per-job permissions, and use that. If a new dist installs completions
+  and man pages in its Homebrew formula and renders custom jobs correctly,
+  `publish-homebrew.yml` could become a dist `publish-jobs` entry.
+* **Actions** are pinned to full commit SHAs, with the version in a
+  comment (`actions/checkout@3d3c42e… # v7.0.1`).
+  * `ci.yml`, `nightly.yml`, `publish-homebrew.yml`: Dependabot opens a
+    weekly pull request that moves the SHAs and comments together.
+  * `release.yml`: dist writes the SHAs from `[dist.github-action-commits]`
+    in `dist-workspace.toml`, and Dependabot is told to leave the file
+    alone (an edit there would fail the `dist plan` drift check; if
+    Dependabot edits it anyway, close that part and update
+    `dist-workspace.toml` instead). To update: find the commit of the new
+    tag, `git ls-remote https://github.com/actions/checkout 'refs/tags/v6*'`
+    (for an annotated tag, the `^{}` line is the commit), set it and the
+    version comment in `dist-workspace.toml`, run `dist generate`. Stay on
+    the major version dist chose (`checkout` v6, `upload-artifact` v7,
+    `download-artifact` v8) until a dist release moves it.
+  * `crates/vl/tests/adversarial3_release.rs` fails if any `uses:` in the
+    four workflows is not a 40-character SHA, or if `ci.yml` pipes a
+    download into `sh`.
+* **Downloaded tools** in CI (`dist`, `actionlint`) are fetched as release
+  archives and checked against a SHA-256 pinned in `ci.yml` before they run.
+  `actionlint` runs with its own pinned version (configuration:
+  `.github/actionlint.yaml`).
+* **Permissions:** every workflow defaults to `contents: read`, and each job
+  states its own. Only `publish-homebrew.yml`'s `formula` job has
+  `contents: write` (to attach `vl.rb` to the Release). No workflow uses
+  `pull_request_target`, and event values (tags, branch names, inputs)
+  reach `run:` scripts only through `env:`, except in the generated
+  `release.yml` (below).
+
+### What dist does not pin
+
+dist 0.34 generates `release.yml` and refuses hand edits (the drift check).
+It can pin the actions (above), but not the following. Each one runs only
+for a tag push or a pull request; tags can only be pushed by people with
+write access to the repository.
+
+* **dist's installer is piped into `sh`**, without a checksum, in the
+  `plan` job and in every `build-local-artifacts` job
+  (`matrix.install_dist.run`), from
+  `github.com/axodotdev/cargo-dist/releases/download/v0.34.0/`. The
+  installer itself checks the archive it downloads against the release's
+  checksum, but both come from the same place. Per release: nothing to do
+  unless the dist version changed; then compare the installer's SHA-256
+  with the one recorded when it was adopted (0.34.0:
+  `abb014a8486f08a3c2d9dd8bbf2c646c62fab61b1f1c9ff5bf2811ab305d17b1`).
+* **The workflow-level `contents: write`** applies to every job, including
+  `plan` on pull requests. GitHub gives pull requests from forks a
+  read-only token whatever the file says, so the write token only reaches
+  branches of this repository. `github-custom-job-permissions` only applies
+  to custom jobs.
+* **The tag name is interpolated into `run:`** (`${{ github.ref_name }}` in
+  `plan`, `${{ needs.plan.outputs.tag-flag }}` in the build jobs and
+  `host`, `${{ needs.plan.outputs.tag }}` in `host`'s `gh release create`). Git allows `$`, `(`,
+  `;` and `|` in tag names. Only push tags of the form `v1.2.3` or
+  `v1.2.3-rc.1`; the `publish-homebrew.yml` workflow refuses any other.
+  Consider a tag protection rule (Settings → Rules → Tags) that only lets
+  maintainers create `v*` tags.
+* `rustup`'s installer is piped into `sh` for container builds; this
+  configuration has none (no `container` in the matrix).

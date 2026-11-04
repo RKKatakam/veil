@@ -14,6 +14,13 @@
 #
 # The tap is <owner>/homebrew-tap unless the HOMEBREW_TAP repository
 # variable names another `owner/repo`.
+#
+# Security: `workflow_run` runs this file from the default branch, never
+# from a pull request, and checks out the default branch, not the release's
+# code. The tag (a dispatch input, or the Release run's `head_branch`) only
+# reaches scripts through `env:`, and is checked as a SemVer tag before any
+# command sees it. Only `formula` can write, and only to this repository's
+# Releases; the tap is written with HOMEBREW_TAP_TOKEN.
 name: Publish Homebrew formula
 
 on:
@@ -28,7 +35,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: publish-homebrew
@@ -43,15 +50,20 @@ jobs:
        github.event.workflow_run.event == 'push')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: write # gh release upload
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAG: ${{ inputs.tag || github.event.workflow_run.head_branch }}
       TAP: ${{ vars.HOMEBREW_TAP || format('{0}/homebrew-tap', github.repository_owner) }}
       HAS_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Before any command sees it: a dispatched tag is arbitrary text.
+      - name: Check the tag
+        run: packaging/homebrew/render-formula.sh --check-tag "$TAG"
       - name: Render the formula
         id: render
         shell: bash
@@ -68,7 +80,7 @@ jobs:
         run: gh release upload "$TAG" vl.rb --clobber --repo "$GITHUB_REPOSITORY"
       - name: Check out the tap
         if: env.HAS_TAP_TOKEN == 'true' && steps.render.outputs.prerelease != 'true'
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ env.TAP }}
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
