@@ -38,6 +38,7 @@ class Vl < Formula
     zsh_completion.install "completions/_vl"
     fish_completion.install "completions/vl.fish"
     man1.install Dir["man/*.1"]
+    prefix.install "LICENSE-APACHE", "LICENSE-MIT"
   end
 
   test do
