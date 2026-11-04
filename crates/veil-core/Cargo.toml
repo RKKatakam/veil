@@ -21,3 +21,4 @@ x25519-dalek.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+proptest = "1"
