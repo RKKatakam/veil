@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use crate::{
-    builder::{build_tree_cached, BuildOptions, BuildReport, InjectedSecrets},
+    builder::{build_tree_cached, BuildOptions, BuildReport, InjectedSecrets, LineEndings},
     checkout::{checkout_cached, checkout_recorded, CheckoutReport, Materialised},
     error::{Result, VeilError},
     id::{ChangeId, ObjectId},
@@ -81,6 +81,9 @@ pub struct SnapshotOptions<'a> {
     /// sparse sandbox is recorded: a file outside the set is never read,
     /// recorded or deleted.
     pub only: Option<&'a crate::vfs::SparseSet>,
+    /// How `.gitattributes` line endings apply (`vl renormalize` sets
+    /// [`LineEndings::Renormalize`]).
+    pub line_endings: LineEndings<'a>,
 }
 
 #[derive(Debug, Clone)]
@@ -272,6 +275,7 @@ impl Repo {
             expected_wc,
             carried,
             only,
+            line_endings,
         } = opts;
         let mut tx = self.transaction(description.unwrap_or_else(|| snapshot_op_description(ws)))?;
         let wc_id = tx.view.workspace(ws)?.wc;
@@ -316,6 +320,7 @@ impl Repo {
                 rescan,
                 materialised,
                 line_base: Some(&line_base),
+                line_endings,
             },
             cache,
         )?;
@@ -410,6 +415,7 @@ impl Repo {
                 rescan: false,
                 materialised,
                 line_base: Some(&line_base),
+                line_endings: LineEndings::Convert,
             },
             cache,
         )
@@ -456,6 +462,7 @@ impl Repo {
                 rescan: false,
                 materialised,
                 line_base: None,
+                line_endings: LineEndings::Convert,
             },
             cache,
         )
@@ -580,6 +587,7 @@ impl Repo {
                 rescan: false,
                 materialised,
                 line_base: Some(&line_base),
+                line_endings: LineEndings::Convert,
             },
             None,
         )?;

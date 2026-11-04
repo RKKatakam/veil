@@ -35,6 +35,7 @@ use veil_core::{
     search::{LogFilter, Match, Searcher},
     object::{EntryKind, Snapshot, Text, Visibility},
     policy::{Policy, Tier},
+    attributes::Attrs,
     secrets::{self, looks_binary},
     tree::{diff_trees, lookup, TreeChange},
     vfs::walk_files,
@@ -631,6 +632,10 @@ pub struct Status {
     /// Files in the working-copy snapshot that are absent on disk.
     pub redacted: Vec<RedactedPath>,
     pub conflicts: Vec<Conflict>,
+    /// Files still recorded with line endings `.gitattributes` would now
+    /// convert (`vl renormalize` re-records them). Omitted when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub renormalizable: Vec<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -768,6 +773,7 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
         nested: report.nested.iter().map(path).collect(),
         redacted,
         conflicts,
+        renormalizable: report.renormalizable.iter().map(path).collect(),
     })
 }
 
@@ -1176,7 +1182,7 @@ pub fn diff_changes(repo: &Repo, from: &ObjectId, to: &ObjectId) -> Result<Vec<T
     Ok(diff_trees(repo.store(), Some(from), Some(to))?)
 }
 
-fn file_diff_with(repo: &Repo, c: &TreeChange, stat: bool, check_readable: bool) -> FileDiff {
+fn file_diff_with(repo: &Repo, c: &TreeChange, stat: bool, check_readable: bool, attrs: &Attrs<'_>) -> FileDiff {
     FileDiff {
         path: path(&c.path),
         status: status_word(c),
@@ -1184,28 +1190,34 @@ fn file_diff_with(repo: &Repo, c: &TreeChange, stat: bool, check_readable: bool)
         score: None,
         old: c.old.as_ref().map(|e| entry_info(repo, e, check_readable)),
         new: c.new.as_ref().map(|e| entry_info(repo, e, check_readable)),
-        content: (!stat).then(|| content(repo, c)),
+        content: (!stat).then(|| content(repo, c, attrs)),
     }
 }
 
 /// The [`FileDiff`] of a detected item (a pair: the source's version against
 /// the destination's).
-pub fn item_diff(repo: &Repo, item: &Item, stat: bool) -> FileDiff {
-    item_diff_with(repo, item, stat, true)
+pub fn item_diff(repo: &Repo, item: &Item, stat: bool, attrs: &Attrs<'_>) -> FileDiff {
+    item_diff_with(repo, item, stat, true, attrs)
 }
 
 /// [`item_diff`] for the text output of a full diff, which does not show
 /// `readable`: each entry's `readable` is left true instead of costing a
 /// second read of every object.
-pub(crate) fn item_diff_for_text(repo: &Repo, item: &Item) -> FileDiff {
-    item_diff_with(repo, item, false, false)
+pub(crate) fn item_diff_for_text(repo: &Repo, item: &Item, attrs: &Attrs<'_>) -> FileDiff {
+    item_diff_with(repo, item, false, false, attrs)
 }
 
-fn item_diff_with(repo: &Repo, item: &Item, stat: bool, check_readable: bool) -> FileDiff {
+/// The attributes diffs are shown under: the working copy's
+/// `.gitattributes` (as Git does), with the device-local file.
+pub fn diff_attrs(repo: &Repo) -> Attrs<'_> {
+    Attrs::for_backend(repo.store(), &**repo.backend())
+}
+
+fn item_diff_with(repo: &Repo, item: &Item, stat: bool, check_readable: bool, attrs: &Attrs<'_>) -> FileDiff {
     match item {
-        Item::Change(c) => file_diff_with(repo, c, stat, check_readable),
+        Item::Change(c) => file_diff_with(repo, c, stat, check_readable, attrs),
         Item::Pair(p) => {
-            let mut f = file_diff_with(repo, &pair_change(p), stat, check_readable);
+            let mut f = file_diff_with(repo, &pair_change(p), stat, check_readable, attrs);
             f.status = if p.copy { "copied" } else { "renamed" };
             f.from = Some(path(&p.from));
             f.score = Some(p.score);
@@ -1214,7 +1226,7 @@ fn item_diff_with(repo: &Repo, item: &Item, stat: bool, check_readable: bool) ->
     }
 }
 
-fn content(repo: &Repo, c: &TreeChange) -> Content {
+fn content(repo: &Repo, c: &TreeChange, attrs: &Attrs<'_>) -> Content {
     let read = |e: &Option<TreeEntry>| -> Result<Vec<u8>, Redaction> {
         match e {
             None => Ok(Vec::new()),
@@ -1229,6 +1241,23 @@ fn content(repo: &Repo, c: &TreeChange) -> Content {
     let (old, new) = match (read(&c.old), read(&c.new)) {
         (Ok(a), Ok(b)) => (a, b),
         (Err(v), _) | (_, Err(v)) => return none(false, Some(v)),
+    };
+    // `.gitattributes`: `-diff` / `binary` show "binary"; `diff=<name>`
+    // diffs the output of this device's textconv of that name, if it
+    // defines one (never anything a tree defines; nothing is cached).
+    let (old, new) = match veil_core::attributes::diff_strategy(repo.store(), attrs, &c.path) {
+        veil_core::attributes::DiffAttr::Binary => return none(true, None),
+        veil_core::attributes::DiffAttr::Driver(name) => match repo.store().device_drivers() {
+            Some(d) => {
+                let conv = |data: &[u8]| if data.is_empty() { Some(Vec::new()) } else { d.textconv(&name, &c.path, data) };
+                match (conv(&old), conv(&new)) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => (old, new),
+                }
+            }
+            None => (old, new),
+        },
+        veil_core::attributes::DiffAttr::Auto => (old, new),
     };
     if looks_binary(&old) || looks_binary(&new) {
         return none(true, None);
@@ -1270,7 +1299,8 @@ fn hunks(patch: &diffy::Patch<'_, str>) -> Vec<Hunk> {
 
 pub fn diff_body_with(repo: &Repo, from: &ObjectId, to: &ObjectId, stat: bool, r: &Renames) -> Result<DiffBody> {
     let (items, renames_skipped) = detect_renames(repo, diff_changes(repo, from, to)?, r)?;
-    Ok(DiffBody { stat, files: items.iter().map(|c| item_diff(repo, c, stat)).collect(), renames_skipped })
+    let attrs = diff_attrs(repo);
+    Ok(DiffBody { stat, files: items.iter().map(|c| item_diff(repo, c, stat, &attrs)).collect(), renames_skipped })
 }
 
 /// `vl diff --json` with rename detection on (the default).

@@ -10,7 +10,12 @@
 //! * `scanned_clean`: the secret scanner ran on that content and found
 //!   nothing;
 //! * `sealed`: under scope `s` (with the current key), the content seals to
-//!   object `id`.
+//!   object `id`;
+//! * `eol`: for content holding a CR, the line-ending facts
+//!   (`.gitattributes`, see [`EolFact`]): a fingerprint of the attributes
+//!   files in force when it was read, whether `vl renormalize` would record it otherwise, and the
+//!   blob recorded for it when that is not the content itself (a file
+//!   checkout wrote with CRLF for an LF version).
 //!
 //! Records hold facts, not policy decisions. The builder still classifies
 //! every path against the current policy on every run and only uses a fact
@@ -41,7 +46,7 @@ use crate::{
 };
 
 const MAGIC: &[u8] = b"veil:statcache\n";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 /// Racy window when stamps have whole-second precision (ext3, HFS+, FAT's
 /// 2 s mtime, many network filesystems).
 const COARSE_WINDOW_NS: i64 = 2_000_000_000;
@@ -112,9 +117,30 @@ pub struct Record {
     pub content: ObjectId,
     /// The secret scanner ran on `content` and found nothing.
     pub scanned_clean: bool,
-    /// `(scope, id)`: `content` sealed under `scope` is object `id`.
+    /// `(scope, id)`: the recorded version of `content` sealed under
+    /// `scope` is object `id`.
     pub sealed: Option<(String, ObjectId)>,
+    /// Line-ending facts, for content that holds a CR (`None`: it holds
+    /// none, so no attribute can change how it is recorded).
+    pub eol: Option<EolFact>,
 }
+
+/// What `.gitattributes` made of a file's content when it was read (see
+/// [`crate::attributes`]). Only valid for the parent entry it was learned
+/// against: the builder trusts such a record only where the parent entry
+/// is still the recorded version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EolFact {
+    /// The attributes in force ([`crate::attributes::Attrs::fingerprint`]
+    /// of the files the path is under).
+    pub attributes: crate::attributes::Fingerprint,
+    /// `vl renormalize` would record other bytes.
+    pub renormalize: bool,
+    /// The blob recorded for this content when it is not `content` itself
+    /// (checkout wrote it with CRLF, or it was normalised).
+    pub recorded: Option<ObjectId>,
+}
+
 
 impl Record {
     /// Can this record vouch for a file currently stat'ing as `stamp`?
@@ -137,6 +163,9 @@ impl Record {
     /// Facts about the same content accumulate across runs.
     fn absorb(&mut self, old: &Record) {
         if old.content != self.content {
+            return;
+        }
+        if old.eol != self.eol {
             return;
         }
         self.scanned_clean |= old.scanned_clean;
@@ -367,6 +396,7 @@ impl CacheRun {
         content: ObjectId,
         scanned_clean: bool,
         sealed: Option<(String, ObjectId)>,
+        eol: Option<EolFact>,
     ) {
         let Some(stamp) = Stamp::of(meta) else { return };
         let mut rec = Record {
@@ -375,6 +405,7 @@ impl CacheRun {
             content,
             scanned_clean,
             sealed,
+            eol,
         };
         if let Some(old) = self.old.get(path) {
             rec.absorb(old);
@@ -430,6 +461,16 @@ fn encode(c: &StatCache) -> Vec<u8> {
             }
             None => out.push(0),
         }
+        match &r.eol {
+            Some(f) => {
+                out.push(1 | (f.renormalize as u8) << 1 | (f.recorded.is_some() as u8) << 2);
+                out.extend_from_slice(&f.attributes);
+                if let Some(id) = &f.recorded {
+                    out.extend_from_slice(&id.0);
+                }
+            }
+            None => out.push(0),
+        }
     }
     let sum = blake3::hash(&out);
     out.extend_from_slice(sum.as_bytes());
@@ -474,6 +515,19 @@ fn decode(raw: &[u8]) -> Option<StatCache> {
             1 => Some((String::from_utf8(r.bytes()?.to_vec()).ok()?, r.id()?)),
             _ => return None,
         };
+        let eol = match r.u8()? {
+            0 => None,
+            f if f & !7 == 0 && f & 1 == 1 => {
+                let attributes: crate::attributes::Fingerprint = r.take(16)?.try_into().ok()?;
+                let recorded = if f & 4 != 0 { Some(r.id()?) } else { None };
+                Some(EolFact {
+                    attributes,
+                    renormalize: f & 2 != 0,
+                    recorded,
+                })
+            }
+            _ => return None,
+        };
         let stamp = Stamp {
             mtime,
             ctime,
@@ -489,6 +543,7 @@ fn decode(raw: &[u8]) -> Option<StatCache> {
                 content,
                 scanned_clean: flags & 2 != 0,
                 sealed,
+                eol,
             },
         );
     }
@@ -597,6 +652,7 @@ mod tests {
             content: ObjectId::hash(b"x"),
             scanned_clean: true,
             sealed: Some(("team".into(), ObjectId::hash(b"y"))),
+            eol: None,
         }
     }
 
@@ -640,6 +696,20 @@ mod tests {
         r2.stamp.ctime = None;
         r2.stamp.inode = None;
         c.records.insert(VPath::new("c").unwrap(), r2);
+        let mut r3 = rec(7, 9);
+        r3.eol = Some(EolFact {
+            attributes: [2; 16],
+            renormalize: true,
+            recorded: Some(ObjectId::hash(b"lf")),
+        });
+        c.records.insert(VPath::new("d.bat").unwrap(), r3);
+        let mut r4 = rec(8, 9);
+        r4.eol = Some(EolFact {
+            attributes: [0; 16],
+            renormalize: false,
+            recorded: None,
+        });
+        c.records.insert(VPath::new("e.png").unwrap(), r4);
         let raw = encode(&c);
         let back = decode(&raw).unwrap();
         assert_eq!(back.key, c.key);

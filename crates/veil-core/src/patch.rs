@@ -2954,6 +2954,9 @@ pub fn apply_series(repo: &mut Repo, ws: &str, dest: &str, series: &Series, opts
                 rescan: false,
                 materialised: None,
                 line_base: Some(&line_base),
+                // Git blobs (and patched recorded bytes) are recorded as
+                // they are: line endings are a working-copy matter.
+                line_endings: crate::builder::LineEndings::Off,
             },
         )
         .map_err(ctx)?;
@@ -3156,6 +3159,10 @@ mod writer {
         pub(super) old: Option<Side>,
         pub(super) new: Option<Side>,
         pub(super) from: Option<Renamed>,
+        /// `.gitattributes` of the patched side says `-diff` (or
+        /// `binary`): written as "Binary files … differ", as `git
+        /// format-patch` does. Never a textconv.
+        pub(super) binary: bool,
     }
 
     /// Which labels the patch of one snapshot depends on (audience `me`).
@@ -3405,6 +3412,10 @@ mod writer {
             Audience::Me => (Some(*old), Some(*new)),
         };
         let mut out = Vec::new();
+        // The attributes of the side shown (the projection for the public
+        // audience: a sealed `.gitattributes` never shapes a public patch),
+        // without this device's local file: the patch is the same anywhere.
+        let attrs = to.map(|t| crate::attributes::Attrs::with_source(Box::new(crate::attributes::TreeSource { store, tree: t }), None));
         let list = diff_trees(store, from.as_ref(), to.as_ref())?;
         // Renames and copies pair deletions with additions of the
         // audience's own sides: for the public audience the projected
@@ -3453,7 +3464,10 @@ mod writer {
                 continue;
             }
             let sealed = [&old, &new].into_iter().flatten().any(|s| s.sealed);
-            let binary = [&old, &new].into_iter().flatten().any(|s| s.mode.kind() == EntryKind::File && is_binary(&s.data));
+            // `-diff` / `binary` in the shown side's attributes, at the
+            // path the patch writes (a rename's destination).
+            let attr_binary = attrs.as_ref().is_some_and(|a| a.for_path(&c.path).diff == crate::attributes::DiffAttr::Binary);
+            let binary = [&old, &new].into_iter().flatten().any(|s| s.mode.kind() == EntryKind::File && (attr_binary || is_binary(&s.data)));
             if r.opts.binary && sealed && binary && !same {
                 warnings.push(format!(
                     "{}: sealed binary content is never written as a binary patch; shown as 'Binary files … differ'",
@@ -3465,6 +3479,7 @@ mod writer {
                 old,
                 new,
                 from: renamed,
+                binary: attr_binary,
             });
         }
         Ok(out)
@@ -3778,12 +3793,14 @@ mod writer {
                     old: Some(o.clone()),
                     new: None,
                     from: None,
+                    binary: f.binary,
                 };
                 let add = FileDiff {
                     path: f.path.clone(),
                     old: None,
                     new: Some(n.clone()),
                     from: None,
+                    binary: f.binary,
                 };
                 let a = one_section(out, &del, binary);
                 let b = one_section(out, &add, binary);
@@ -3913,7 +3930,7 @@ mod writer {
             if f.new.is_some() { b.clone() } else { "/dev/null".into() },
         );
         let files = [&f.old, &f.new].into_iter().flatten().all(|s| s.mode.kind() == EntryKind::File);
-        if files && (is_binary(&old) || is_binary(&new)) {
+        if files && (f.binary || is_binary(&old) || is_binary(&new)) {
             st.binary = Some((old.len(), new.len()));
             if binary && ![&f.old, &f.new].into_iter().flatten().any(|s| s.sealed) {
                 w(out, "GIT binary patch\n");
@@ -4611,6 +4628,7 @@ index 1234567..89abcde 100644
                 old: (kind != 1).then(|| Side::file(old.clone(), old_x)),
                 new: (kind != 2).then(|| Side::file(new.clone(), new_x)),
                 from: None,
+                binary: false,
             };
             prop_assume!(kind != 0 || old != new || old_x != new_x);
             let mut diff = Vec::new();
@@ -4661,6 +4679,7 @@ index 1234567..89abcde 100644
             old: old.map(|o| Side::file(o.to_vec(), false)),
             new: Some(Side::file(new.to_vec(), false)),
             from: None,
+            binary: false,
         };
         let mut diff = Vec::new();
         section(&mut diff, &f, true);

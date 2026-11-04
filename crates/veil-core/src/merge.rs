@@ -19,6 +19,14 @@
 //! between versions of the same (verified) audience, so the result never
 //! depends on the merger's keys and never moves content between audiences.
 //!
+//! How a file's content merges follows `.gitattributes` (feature 7), read
+//! from `ours`: `-merge` / `binary` make it a whole-file conflict,
+//! `merge=union` keeps both sides' lines, and `merge=<name>` runs a driver
+//! only if this device defines one ([`crate::attributes::DeviceDrivers`]).
+//! A driver gets the base only where its audience is the result's (as
+//! conflict markers do, BUG-126), never runs where two scopes clash, and
+//! its output is sealed as any merged content is.
+//!
 //! Trees under an unreleased embargo (see [`crate::embargo`]) stay under it:
 //! the result is re-wrapped under the same embargo, with the merge of the
 //! inputs' public views as its fallback. Merging them needs the embargo key,
@@ -31,6 +39,7 @@ use std::{
 };
 
 use crate::{
+    attributes::{Attrs, MergeAttr},
     blame::Reader,
     builder::{verify_sealing, Sealing},
     conflict::{Merge, Term},
@@ -163,7 +172,10 @@ fn merge_resolved(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, t
     let o = store.tree(&plan.ours)?;
     let t = store.tree(&plan.theirs)?;
     let mut conflicts = Vec::new();
-    let tree = match merge_dir(store, b, Some((o, plan.ours)), Some((t, plan.theirs)), mode, markers, &mut conflicts)? {
+    // Attributes of the path the content merges at: `ours` with the
+    // followed renames applied (a renamed file merges at its new path).
+    let attrs = Attrs::for_tree(store, plan.ours);
+    let tree = match merge_dir(store, b, Some((o, plan.ours)), Some((t, plan.theirs)), mode, markers, &mut conflicts, &attrs)? {
         Some(id) => id,
         None => store.empty_tree()?,
     };
@@ -250,6 +262,7 @@ impl MergeFrame {
 
 /// Three-way merge of directories. Iterative: tree depth comes from
 /// `.veil/` and remotes and is not trusted.
+#[allow(clippy::too_many_arguments)]
 fn merge_dir(
     store: &ObjectStore,
     b: Option<Arc<Tree>>,
@@ -258,6 +271,7 @@ fn merge_dir(
     mode: Mode,
     markers: bool,
     conflicts: &mut Vec<VPath>,
+    attrs: &Attrs<'_>,
 ) -> Result<Option<ObjectId>> {
     let mut stack = vec![MergeFrame::new(VPath::root(), b, o, t)];
     let mut result: Option<Option<ObjectId>> = None;
@@ -332,10 +346,10 @@ fn merge_dir(
             } else if !markers && !kinds.contains(&EntryKind::Dir) && (kinds.contains(&EntryKind::Conflict) || mode == Mode::Merge) {
                 // Conflicts as data (format 4): files, absent files and
                 // conflicts merge algebraically, then by content.
-                merge_terms(store, &path, &name, be, oe, te, mode, conflicts)?
+                merge_terms(store, &path, &name, be, oe, te, mode, conflicts, attrs)?
             } else if let (Some(oe), Some(te), [EntryKind::File, EntryKind::File]) = (oe, te, kinds.as_slice()) {
                 let be = be.filter(|e| e.kind == EntryKind::File);
-                Some(merge_file(store, &path, be, oe, te, mode, conflicts)?)
+                Some(merge_file(store, &path, be, oe, te, mode, conflicts, attrs)?)
             } else if mode == Mode::VirtualBase {
                 // Modify/delete or file/directory: the base's version.
                 be.cloned()
@@ -393,13 +407,14 @@ fn merge_terms(
     te: Option<&TreeEntry>,
     mode: Mode,
     conflicts: &mut Vec<VPath>,
+    attrs: &Attrs<'_>,
 ) -> Result<Option<TreeEntry>> {
     let be = be.filter(|e| e.kind != EntryKind::Dir);
     let m = Merge::three_way(Merge::of_entry(store, be)?, Merge::of_entry(store, oe)?, Merge::of_entry(store, te)?).simplify();
     if let Some(t) = m.trivial() {
         return Ok(t.map(|t| t.entry(name)));
     }
-    if let Some(e) = resolve_by_content(store, path, name, &m)? {
+    if let Some(e) = resolve_by_content(store, path, name, &m, strategy(store, attrs, path, mode))? {
         return Ok(Some(e));
     }
     if mode == Mode::VirtualBase {
@@ -437,7 +452,7 @@ fn relabelled(store: &ObjectStore, t: &Term, name: &str) -> Result<Term> {
 /// the result so far against its base. Its audience is the merged
 /// audience of the sides, as for any merged file (never wider than either,
 /// never moved between scopes). `None`: a real conflict.
-fn resolve_by_content(store: &ObjectStore, path: &VPath, name: &str, m: &Merge) -> Result<Option<TreeEntry>> {
+fn resolve_by_content(store: &ObjectStore, path: &VPath, name: &str, m: &Merge, how: MergeAttr) -> Result<Option<TreeEntry>> {
     if m.adds.iter().any(Option::is_none) || (m.adds.len() > 2 && m.removes.iter().any(Option::is_none)) {
         return Ok(None);
     }
@@ -452,7 +467,7 @@ fn resolve_by_content(store: &ObjectStore, path: &VPath, name: &str, m: &Merge) 
         let base = entry(&m.removes[i - 1]);
         let side = entry(&m.adds[i]).expect("present");
         let mut found = Vec::new();
-        let merged = merge_file_content(store, path, base.as_ref(), &acc, &side, &mut found)?;
+        let merged = merge_file_content(store, path, base.as_ref(), &acc, &side, &mut found, &how)?;
         match merged {
             Some(e) if found.is_empty() => acc = e,
             _ => return Ok(None),
@@ -464,6 +479,40 @@ fn resolve_by_content(store: &ObjectStore, path: &VPath, name: &str, m: &Merge) 
 
 /// Git's (and diffy's default) conflict marker length.
 const MARKER_LEN: usize = 7;
+
+/// How the content at `path` merges, as `.gitattributes` (read from ours)
+/// says, with named drivers resolved against this device's definitions
+/// (see [`crate::attributes::merge_strategy`]). A virtual merge base only
+/// tells whole-file merges from line merges: no driver runs for it.
+fn strategy(store: &ObjectStore, attrs: &Attrs<'_>, path: &VPath, mode: Mode) -> MergeAttr {
+    match crate::attributes::merge_strategy(store, attrs, path) {
+        MergeAttr::Union | MergeAttr::Driver(_) if mode == Mode::VirtualBase => MergeAttr::Text,
+        m => m,
+    }
+}
+
+/// The content merge of `base`, `ours` and `theirs` by `how` (when it is
+/// not the built-in line merge): `Some(Ok(merged))` clean, `Some(Err(()))`
+/// a whole-file conflict, `None` for the built-in line merge. The base is
+/// given (to a driver, or to the union) only when `base_ok` (its audience
+/// is the result's): otherwise an empty file stands in for it.
+fn attribute_merge(store: &ObjectStore, path: &VPath, how: &MergeAttr, base: &[u8], ours: &[u8], theirs: &[u8], base_ok: bool) -> Option<Result<Vec<u8>, ()>> {
+    let base: &[u8] = if base_ok { base } else { &[] };
+    match how {
+        MergeAttr::Text => None,
+        MergeAttr::Binary => Some(Err(())),
+        MergeAttr::Union if looks_binary(ours) || looks_binary(theirs) || looks_binary(base) => Some(Err(())),
+        MergeAttr::Union => Some(Ok(crate::attributes::union_merge(base, ours, theirs))),
+        MergeAttr::Driver(name) => {
+            let d = store.device_drivers()?;
+            let input = crate::attributes::DriverInput { path, base, ours, theirs };
+            Some(match d.merge(name, &input) {
+                crate::attributes::DriverMerge::Clean(m) => Ok(m),
+                crate::attributes::DriverMerge::Conflict => Err(()),
+            })
+        }
+    }
+}
 
 /// diff3 of `ours` and `theirs` where each conflicting hunk takes the
 /// `base`'s lines (for a virtual merge base, see [`Mode::VirtualBase`]).
@@ -538,6 +587,7 @@ fn merge_file_content(
     oe: &TreeEntry,
     te: &TreeEntry,
     conflicts: &mut Vec<VPath>,
+    how: &MergeAttr,
 ) -> Result<Option<TreeEntry>> {
     let base = match be.filter(|e| e.kind == EntryKind::File) {
         Some(e) => read_for_merge(store, e, path)?,
@@ -561,18 +611,15 @@ fn merge_file_content(
         return Ok(Some(TreeEntry { executable, ..oe.clone() }));
     }
     let (oe, te) = (&checked(store, oe, path)?, &checked(store, te, path)?);
-    if looks_binary(&ours) || looks_binary(&theirs) || looks_binary(&base) {
-        conflicts.push(path.clone());
-        return Ok(None);
-    }
-    let merged = match content_merge(path, &base, &ours, &theirs, crate::textmerge::Style::Diff3) {
+    let (visibility, fallback) = merged_visibility(store, oe, te);
+    let base_ok = base_shown(store, be, &visibility)?;
+    let merged = match content_merge(store, path, how, &base, &ours, &theirs, base_ok, crate::textmerge::Style::Diff3) {
         Ok(m) => m,
         Err(_) => {
             conflicts.push(path.clone());
             return Ok(None);
         }
     };
-    let (visibility, fallback) = merged_visibility(store, oe, te);
     let id = store.store_file(&merged, &visibility)?;
     Ok(Some(TreeEntry {
         name: oe.name.clone(),
@@ -588,6 +635,7 @@ fn merge_file_content(
 /// The three-way merge of two file versions that records a conflict as
 /// markers in the content (repository formats 1 to 3, trees under an
 /// embargo, and virtual merge bases).
+#[allow(clippy::too_many_arguments)]
 fn merge_file(
     store: &ObjectStore,
     path: &VPath,
@@ -596,6 +644,7 @@ fn merge_file(
     te: &TreeEntry,
     mode: Mode,
     conflicts: &mut Vec<VPath>,
+    attrs: &Attrs<'_>,
 ) -> Result<TreeEntry> {
     let base = match be.filter(|e| e.kind == EntryKind::File) {
         Some(e) => read_for_merge(store, e, path)?,
@@ -635,28 +684,32 @@ fn merge_file(
         true => crate::textmerge::Style::Diff3,
         false => crate::textmerge::Style::Merge,
     };
+    let how = strategy(store, attrs, path, mode);
     let merged = if mode == Mode::VirtualBase {
         // A virtual base keeps the base's version where the two merge
         // bases disagree, and is sealed as they are: where the base's
         // audience is not theirs, it keeps nothing there instead
         // (BUG-127), so the base's text is never stored for a wider or
         // other audience, and the two later versions still both differ
-        // from the virtual base there and conflict.
+        // from the virtual base there and conflict. No driver runs here.
         let kept: &[u8] = if base_ok { &base } else { &[] };
-        if looks_binary(&ours) || looks_binary(&theirs) || looks_binary(&base) {
+        if how == MergeAttr::Binary || looks_binary(&ours) || looks_binary(&theirs) || looks_binary(&base) {
             kept.to_vec()
         } else {
             merge_keeping_base(kept, &ours, &theirs)
         }
-    } else if looks_binary(&ours) || looks_binary(&theirs) || looks_binary(&base) {
-        conflicts.push(path.clone());
-        ours
     } else {
-        match content_merge(path, &base, &ours, &theirs, style) {
+        match content_merge(store, path, &how, &base, &ours, &theirs, base_ok, style) {
             Ok(m) => m,
-            Err(m) => {
+            // Markers in the content.
+            Err(Some(m)) => {
                 conflicts.push(path.clone());
                 m
+            }
+            // A whole-file conflict: ours, flagged.
+            Err(None) => {
+                conflicts.push(path.clone());
+                ours
             }
         }
     };
@@ -672,21 +725,35 @@ fn merge_file(
     })
 }
 
-/// The line merge of one file's three readable text versions: `Ok` when
-/// clean, `Err` with conflict markers otherwise (see
-/// [`crate::textmerge::merge`]).
+/// The content merge of one file's three readable versions at `path`, by
+/// `how` (what `.gitattributes` asks for, see [`strategy`]): `Ok` when
+/// clean, `Err(Some(markers))` for a line conflict (see
+/// [`crate::textmerge::merge`]), `Err(None)` for a whole-file conflict
+/// (`binary` / `-merge`, binary-looking content, a driver's conflict).
 ///
-/// The seam for per-path merge drivers (`.gitattributes` `merge=`, stream
-/// W2 of the Git-parity round): a driver chosen for `path` would run here.
-/// Until then every path merges with the built-in diff3, whose clean result
-/// never holds a line of the base that neither side has. A driver can
-/// output anything it is given, so it must not be given a base whose
-/// audience is not the result's (design 7, threat review 6): check
-/// [`base_shown`] against the result's visibility first, and pass an empty
-/// base otherwise (BUG-126).
-fn content_merge(path: &VPath, base: &[u8], ours: &[u8], theirs: &[u8], style: crate::textmerge::Style) -> std::result::Result<Vec<u8>, Vec<u8>> {
-    let _ = path;
-    crate::textmerge::merge(base, ours, theirs, MARKER_LEN, style)
+/// The seam for per-path merge drivers. The built-in diff3's clean result
+/// never holds a line of the base that neither side has; a union or a
+/// driver can output anything it is given, so it is given the base only
+/// when `base_ok` ([`base_shown`] against the result's visibility, BUG-126)
+/// and an empty one otherwise (design 7, threat review 6).
+#[allow(clippy::too_many_arguments)]
+fn content_merge(
+    store: &ObjectStore,
+    path: &VPath,
+    how: &MergeAttr,
+    base: &[u8],
+    ours: &[u8],
+    theirs: &[u8],
+    base_ok: bool,
+    style: crate::textmerge::Style,
+) -> std::result::Result<Vec<u8>, Option<Vec<u8>>> {
+    if let Some(r) = attribute_merge(store, path, how, base, ours, theirs, base_ok) {
+        return r.map_err(|()| None);
+    }
+    if looks_binary(ours) || looks_binary(theirs) || looks_binary(base) {
+        return Err(None);
+    }
+    crate::textmerge::merge(base, ours, theirs, MARKER_LEN, style).map_err(Some)
 }
 
 /// The visibility `e`'s object really has (BUG-103), if it can be checked.

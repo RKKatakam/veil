@@ -459,10 +459,11 @@ pub enum Cmd {
         out: JsonOut,
     },
     /// Per-path attributes from `.gitattributes`: line endings, binary
-    /// files, diff and merge drivers (not implemented yet).
+    /// files, diff and merge drivers.
     Attr(attr_cmd::AttrArgs),
-    /// Re-record files whose line endings `.gitattributes` now says to
-    /// convert (not implemented yet).
+    /// Re-record files with the line endings `.gitattributes` asks for now
+    /// (changing `.gitattributes` alone never re-records a file). `vl undo`
+    /// reverts it.
     Renormalize(attr_cmd::RenormalizeArgs),
 
     // ---- secrets & identities ---------------------------------------------
@@ -742,7 +743,8 @@ impl Cmd {
             | Cmd::Blame(history::BlameArgs { out, .. })
             | Cmd::Grep(history::GrepArgs { out, .. })
             | Cmd::Duplicate(rewrite_cmd::DuplicateArgs { out, .. })
-            | Cmd::CherryPick(rewrite_cmd::CherryPickArgs { out, .. }) => out,
+            | Cmd::CherryPick(rewrite_cmd::CherryPickArgs { out, .. })
+            | Cmd::Attr(attr_cmd::AttrArgs { cmd: attr_cmd::AttrCmd::Check { out, .. } }) => out,
             Cmd::Push { json, .. } => return *json,
             _ => return false,
         };

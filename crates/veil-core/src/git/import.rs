@@ -425,6 +425,9 @@ impl GitBridge {
                 rescan: false,
                 materialised: None,
                 line_base: None,
+                // Git blobs (and patched recorded bytes) are recorded as
+                // they are: line endings are a working-copy matter.
+                line_endings: crate::builder::LineEndings::Off,
             },
         )?;
         for (g, v) in fs.learned.into_inner().unwrap() {

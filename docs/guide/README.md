@@ -25,6 +25,7 @@ trimmed where marked (`…`); some paths and host names were shortened
 | 13. [Hooks](hooks.md) | You want checks before a commit or a push: your own hooks, or the ones a repository suggests in `.veilhooks` |
 | 14. [Investigating history](investigating-history.md) | You want to know who wrote a line, when a string appeared, or which change broke something (`blame`, `grep`, `log -S`, `bisect`, renames) |
 | 15. [Copying changes, and merges that follow renames](copying-changes.md) | You want a change on another line too (`vl duplicate`, `vl cherry-pick`), or wonder what a merge does with a moved file |
+| 16. [Line endings and attributes](line-endings-and-attributes.md) | Your project has `.gitattributes`, Windows line endings, binary files, or wants its own diff or merge driver |
 
 The [command reference](../reference/README.md) lists every command and
 flag. It is generated from `vl` itself and cannot drift from it.
