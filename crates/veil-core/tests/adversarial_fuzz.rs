@@ -257,7 +257,7 @@ fn descriptions_use_random_nonces_but_blobs_are_convergent() {
 }
 
 #[test]
-#[ignore = "BUG-021: Envelope::to_bytes truncates scope length to u16; long scopes encode to a corrupt envelope"]
+#[ignore = "BUG-033: Envelope::to_bytes truncates scope length to u16; long scopes encode to a corrupt envelope"]
 fn envelope_encoding_roundtrips_or_refuses_long_scopes() {
     let k = random_key();
     let scope = "s".repeat(70_000);

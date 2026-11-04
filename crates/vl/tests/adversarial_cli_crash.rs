@@ -86,7 +86,7 @@ fn kill_9_mid_command_never_corrupts_the_repository() {
         std::thread::sleep(Duration::from_millis(20 + 37 * round as u64));
         let _ = child.kill(); // SIGKILL
         let _ = child.wait();
-        // a crash may leave a fresh lock behind (see BUG-023); clear it
+        // a crash may leave a fresh lock behind (see BUG-026); clear it
         let _ = std::fs::remove_file(proj.join(".veil/lock"));
         let st = env.vl("alice", &proj, &["status"]);
         assert!(st.status.success(), "round {round}: repo unusable after kill -9:\n{}", text(&st));
@@ -103,7 +103,7 @@ fn kill_9_mid_command_never_corrupts_the_repository() {
 /// A process killed while holding the repository lock blocks every later
 /// command for two minutes.
 #[test]
-#[ignore = "BUG-023: a lock left by a crashed process blocks every command for 2 minutes (no PID liveness check)"]
+#[ignore = "BUG-026: a lock left by a crashed process blocks every command for 2 minutes (no PID liveness check)"]
 fn repository_is_usable_right_after_a_crash_while_locked() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a", "a\n")]);
@@ -134,7 +134,7 @@ fn repository_is_usable_right_after_a_crash_while_locked() {
 }
 
 #[test]
-#[ignore = "BUG-029: temp files of an interrupted DiskBackend::write ('.name.vltmpXXXX') are snapshotted into history"]
+#[ignore = "BUG-037: temp files of an interrupted DiskBackend::write ('.name.vltmpXXXX') are snapshotted into history"]
 fn interrupted_write_leftovers_are_not_snapshotted() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("src/main.rs", "fn main() {}\n")]);
@@ -170,7 +170,7 @@ fn sandbox_project(env: &Env) -> std::path::PathBuf {
 }
 
 #[test]
-#[ignore = "BUG-030: `vl ws exec` materialises cloaked files and isolated secrets into a world-readable temp dir (0755/0644)"]
+#[ignore = "BUG-022: `vl ws exec` materialises cloaked files and isolated secrets into a world-readable temp dir (0755/0644)"]
 fn ws_exec_sandbox_is_private_to_the_user() {
     let env = Env::new();
     let proj = sandbox_project(&env);
@@ -186,7 +186,7 @@ fn ws_exec_sandbox_is_private_to_the_user() {
 }
 
 #[test]
-#[ignore = "BUG-030: a `vl ws exec` killed mid-run leaves plaintext secrets and cloaked files in the temp directory"]
+#[ignore = "BUG-022: a `vl ws exec` killed mid-run leaves plaintext secrets and cloaked files in the temp directory"]
 fn killed_ws_exec_leaves_no_plaintext_behind() {
     let env = Env::new();
     let proj = sandbox_project(&env);
@@ -248,7 +248,7 @@ fn ws_write_from_stdin_records_into_the_virtual_workspace_only() {
 /// the secret into a tracked file publishes it: nothing compares recorded
 /// content with the isolated values the engine itself injected.
 #[test]
-#[ignore = "BUG-031: isolated secrets injected by `ws exec --with-isolated` are recorded if the command copies them into a tracked file"]
+#[ignore = "BUG-023: isolated secrets injected by `ws exec --with-isolated` are recorded if the command copies them into a tracked file"]
 fn ws_exec_cannot_launder_isolated_secrets_into_history() {
     let env = Env::new();
     let proj = sandbox_project(&env);

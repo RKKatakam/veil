@@ -474,7 +474,7 @@ proptest! {
 
     /// Same random operations with cloaked virtual workspaces.
     #[test]
-    #[ignore = "BUG-005/BUG-026: rebase and `new` on cloaked changes declassify cloaked content to public"]
+    #[ignore = "BUG-005/BUG-006: rebase and `new` on cloaked changes declassify cloaked content to public"]
     fn cloaked_lines_of_work_never_hold_public_entries(ops in proptest::collection::vec(arb_op(), 1..30)) {
         let r = run_ops_with(&ops, true);
         prop_assert!(r.is_ok(), "{}", r.unwrap_err());
@@ -523,10 +523,10 @@ fn ancestors(p: &str) -> Vec<String> {
 
 impl Model {
     /// Would `op` fail only because a *file* is in the way of a directory?
-    /// Overlays deliberately white such files out (BUG-024), so overlay runs
+    /// Overlays deliberately white such files out (BUG-034), so overlay runs
     /// skip these operations and check everything else.
     /// Does `op` address a path *below* an existing file? DiskBackend reports
-    /// ENOTDIR there instead of "missing" (BUG-025); disk runs skip these.
+    /// ENOTDIR there instead of "missing" (BUG-035); disk runs skip these.
     fn under_a_file(&self, op: &FsOp) -> bool {
         let i = match op {
             FsOp::RemoveFile(i) | FsOp::RemoveDirAll(i) | FsOp::Probe(i) | FsOp::SetExec(i, _) => *i,
@@ -743,7 +743,7 @@ proptest! {
 // Deterministic reproductions of divergences found by the model tests.
 
 #[test]
-#[ignore = "BUG-024: OverlayBackend::write silently replaces a lower-layer file with a directory where Memory/Disk return an error"]
+#[ignore = "BUG-034: OverlayBackend::write silently replaces a lower-layer file with a directory where Memory/Disk return an error"]
 fn overlay_does_not_replace_a_lower_file_with_a_directory() {
     let lower = Arc::new(MemoryBackend::from_files([("a", &b"file"[..])]).unwrap());
     let o = OverlayBackend::new(lower);
@@ -753,7 +753,7 @@ fn overlay_does_not_replace_a_lower_file_with_a_directory() {
 }
 
 #[test]
-#[ignore = "BUG-025: DiskBackend treats ENOTDIR as an error: metadata/exists/remove_* fail for paths below a file"]
+#[ignore = "BUG-035: DiskBackend treats ENOTDIR as an error: metadata/exists/remove_* fail for paths below a file"]
 fn disk_paths_below_a_file_are_simply_missing() {
     let tmp = tempfile::tempdir().unwrap();
     let d = DiskBackend::new(tmp.path());

@@ -98,7 +98,7 @@ fn hostile_names_and_arguments_are_rejected_cleanly() {
 
 /// Scope and embargo names typed by the user reach `VPath::new(..).unwrap()`.
 #[test]
-#[ignore = "BUG-007: key-ring/embargo paths are built from untrusted strings with VPath::new(..).unwrap(); path-like names panic"]
+#[ignore = "BUG-015: key-ring/embargo paths are built from untrusted strings with VPath::new(..).unwrap(); path-like names panic"]
 fn path_like_scope_and_embargo_names_do_not_panic() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a.txt", "a\n")]);
@@ -115,7 +115,7 @@ fn path_like_scope_and_embargo_names_do_not_panic() {
 }
 
 #[test]
-#[ignore = "BUG-032: `--until +Nd` multiplies without overflow checks: panics in debug, wraps to a past time (instant release) in release"]
+#[ignore = "BUG-024: `--until +Nd` multiplies without overflow checks: panics in debug, wraps to a past time (instant release) in release"]
 fn embargo_deadline_overflow_is_rejected() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a.txt", "a\n")]);
@@ -278,7 +278,7 @@ fn symlinks_are_never_followed_when_snapshotting() {
 /// `vendor -> /shared/vendor`. A pulled tree containing `vendor/x` is written
 /// *through* the link, outside the working copy.
 #[test]
-#[ignore = "BUG-033: checkout writes through symlinked directories in the working copy, escaping it"]
+#[ignore = "BUG-025: checkout writes through symlinked directories in the working copy, escaping it"]
 fn checkout_never_writes_through_a_symlinked_directory() {
     let env = Env::new();
     let shared = env.dir("shared-vendor");
@@ -345,7 +345,7 @@ fn unsafe_is_root() -> bool {
 }
 
 #[test]
-#[ignore = "BUG-034: one unreadable file in the working copy makes every command fail, including `vl ignore` for that file"]
+#[ignore = "BUG-038: one unreadable file in the working copy makes every command fail, including `vl ignore` for that file"]
 fn an_unreadable_file_does_not_brick_the_cli() {
     let env = Env::new();
     if unsafe_is_root() {
@@ -362,7 +362,7 @@ fn an_unreadable_file_does_not_brick_the_cli() {
 }
 
 #[test]
-#[ignore = "BUG-035: files whose names are not valid UTF-8 are silently skipped (never recorded, no warning)"]
+#[ignore = "BUG-039: files whose names are not valid UTF-8 are silently skipped (never recorded, no warning)"]
 fn non_utf8_file_names_are_not_silently_dropped() {
     use std::os::unix::ffi::OsStrExt;
     let env = Env::new();
@@ -398,7 +398,7 @@ fn running_from_a_subdirectory_uses_repository_relative_paths() {
 /// another change (`vl new main`) then overwrites the edited file with the old
 /// version, and the next snapshot drops it from the vault: the edit is gone.
 #[test]
-#[ignore = "BUG-036: a quarantined edit of a tracked file is overwritten by the next checkout and then purged from the vault"]
+#[ignore = "BUG-014: a quarantined edit of a tracked file is overwritten by the next checkout and then purged from the vault"]
 fn quarantined_edits_are_never_lost() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("config.js", "const a = 1;\n")]);
@@ -421,7 +421,7 @@ fn quarantined_edits_are_never_lost() {
 /// `vl undo` right after editing undoes the auto-snapshot of those edits and
 /// deletes them from disk (recoverable only through the op log).
 #[test]
-#[ignore = "BUG-037: `vl undo` with uncommitted edits undoes their auto-snapshot and removes them from disk"]
+#[ignore = "BUG-040: `vl undo` with uncommitted edits undoes their auto-snapshot and removes them from disk"]
 fn undo_does_not_discard_uncommitted_edits() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a.txt", "a\n")]);
@@ -437,7 +437,7 @@ fn undo_does_not_discard_uncommitted_edits() {
 /// writes the name as a glob, so the literal file is not matched and stays
 /// public while the CLI reports it as cloaked.
 #[test]
-#[ignore = "BUG-040: `vl cloak/isolate <file>` does not escape glob metacharacters; files like `config[prod].yml` stay public"]
+#[ignore = "BUG-007: `vl cloak/isolate <file>` does not escape glob metacharacters; files like `config[prod].yml` stay public"]
 fn cloaking_a_file_with_glob_metacharacters_cloaks_that_file() {
     let env = Env::new();
     let proj = env.dir("proj");
@@ -459,7 +459,7 @@ fn cloaking_a_file_with_glob_metacharacters_cloaks_that_file() {
 }
 
 #[test]
-#[ignore = "BUG-039: replacing the identity makes every command fail ('authentication failed for scope local') once a vault exists"]
+#[ignore = "BUG-027: replacing the identity makes every command fail ('authentication failed for scope local') once a vault exists"]
 fn rotating_the_identity_does_not_brick_the_repository() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a.txt", "a\n")]);

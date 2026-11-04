@@ -60,7 +60,7 @@ fn clone_cannot_overwrite_repository_metadata() {
 }
 
 #[test]
-#[ignore = "BUG-027: recursive tree walks (Transfer::copy, diff_trees, checkout) overflow the stack on deeply nested hostile trees"]
+#[ignore = "BUG-021: recursive tree walks (Transfer::copy, diff_trees, checkout) overflow the stack on deeply nested hostile trees"]
 fn deeply_nested_remote_tree_does_not_crash_clone() {
     let env = Env::new();
     let remote = env.dir("remote");
@@ -82,7 +82,7 @@ fn deeply_nested_remote_tree_does_not_crash_clone() {
 }
 
 #[test]
-#[ignore = "BUG-028: remote-controlled tag names, descriptions and authors are printed raw; terminal escape sequences are injected"]
+#[ignore = "BUG-036: remote-controlled tag names, descriptions and authors are printed raw; terminal escape sequences are injected"]
 fn remote_metadata_cannot_inject_terminal_escapes() {
     let env = Env::new();
     let remote = env.dir("remote");

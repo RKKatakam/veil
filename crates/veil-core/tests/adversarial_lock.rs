@@ -17,7 +17,7 @@ const LOCK: &str = ".veil/lock";
 /// age, steals it, and both commit: one operation silently disappears from the
 /// op log. (Simulated by back-dating the live holder's lock file.)
 #[test]
-#[ignore = "BUG-022: lock staleness is judged by age only (no liveness/heartbeat); a live holder's lock is stolen and an operation is lost"]
+#[ignore = "BUG-013: lock staleness is judged by age only (no liveness/heartbeat); a live holder's lock is stolen and an operation is lost"]
 fn a_live_lock_holder_is_never_robbed() {
     let (mut a, fs, _) = new_repo("alice");
     let base = commit_files(&mut a, &*fs, &[("f", "1\n")], "base");
@@ -47,7 +47,7 @@ fn a_live_lock_holder_is_never_robbed() {
 }
 
 #[test]
-#[ignore = "BUG-022: RepoLock::drop removes the lock file unconditionally, releasing a lock that belongs to someone else"]
+#[ignore = "BUG-013: RepoLock::drop removes the lock file unconditionally, releasing a lock that belongs to someone else"]
 fn dropping_a_lock_never_releases_someone_elses_lock() {
     let (mut a, fs, _) = new_repo("alice");
     let tx = a.transaction("A").unwrap();
@@ -76,7 +76,7 @@ fn garbage_lock_file_is_treated_as_stale() {
 /// After `kill -9` the lock of a dead process blocks every command for two
 /// minutes (each command waits 15 s and then fails).
 #[test]
-#[ignore = "BUG-023: a lock left by a crashed process blocks the repository for 2 minutes (no PID liveness check)"]
+#[ignore = "BUG-026: a lock left by a crashed process blocks the repository for 2 minutes (no PID liveness check)"]
 fn lock_of_a_dead_process_does_not_block_for_minutes() {
     let (mut a, fs, _) = new_repo("alice");
     // PID 2^22+1 is above Linux's pid_max default and never alive.

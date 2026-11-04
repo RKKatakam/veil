@@ -107,7 +107,7 @@ fn local_cycle_in_tampered_store_does_not_hang_graph_queries() {
 }
 
 #[test]
-#[ignore = "BUG-016: objects are never re-verified on read; a tampered local object is served silently"]
+#[ignore = "BUG-028: objects are never re-verified on read; a tampered local object is served silently"]
 fn tampered_local_object_is_detected_on_read() {
     let (mut repo, fs, _) = new_repo("alice");
     let c = commit_files(&mut repo, &*fs, &[("a.txt", "trusted\n")], "c");
@@ -228,7 +228,7 @@ fn nul_in_entry_name_does_not_escape() {
 }
 
 #[test]
-#[ignore = "BUG-017: non-canonical trees (unsorted/duplicate entries) are accepted; `files` and `cat` disagree"]
+#[ignore = "BUG-029: non-canonical trees (unsorted/duplicate entries) are accepted; `files` and `cat` disagree"]
 fn non_canonical_trees_are_rejected_or_consistent() {
     let (remote, main) = evil_remote(|r| {
         let a = blob(r, b"a\n");
@@ -282,7 +282,7 @@ fn remote_with_meta(meta: &[(&str, Vec<u8>)]) -> Arc<MemoryBackend> {
 }
 
 #[test]
-#[ignore = "BUG-007: key-ring/embargo paths are built from untrusted strings with VPath::new(..).unwrap(); a remote can crash pull"]
+#[ignore = "BUG-015: key-ring/embargo paths are built from untrusted strings with VPath::new(..).unwrap(); a remote can crash pull"]
 fn ring_with_path_like_scope_does_not_crash_pull() {
     let ring = KeyRing {
         scope: "../../evil".into(),
@@ -296,7 +296,7 @@ fn ring_with_path_like_scope_does_not_crash_pull() {
 }
 
 #[test]
-#[ignore = "BUG-007: key-ring/embargo paths are built from untrusted strings with VPath::new(..).unwrap(); a remote can crash pull"]
+#[ignore = "BUG-015: key-ring/embargo paths are built from untrusted strings with VPath::new(..).unwrap(); a remote can crash pull"]
 fn embargo_record_with_path_like_id_does_not_crash_pull() {
     let k = random_key();
     let rec = EmbargoRecord {
@@ -316,7 +316,7 @@ fn embargo_record_with_path_like_id_does_not_crash_pull() {
 }
 
 #[test]
-#[ignore = "BUG-007: a sealed object naming a path-like scope panics every reader (checkout, cat, log)"]
+#[ignore = "BUG-015: a sealed object naming a path-like scope panics every reader (checkout, cat, log)"]
 fn sealed_object_with_path_like_scope_does_not_crash_readers() {
     let (remote, main) = evil_remote(|r| {
         let env = Envelope::seal(&random_key(), "../../x", b"veil:blob\nhi", true).unwrap();
@@ -423,7 +423,7 @@ fn embargo_from_cloaked_branch_stays_hidden_until_release() {
 /// "released" record with a garbage key. Alice pulls, keeps working, commits
 /// and pushes to the public mirror. The fix must not reach the mirror.
 #[test]
-#[ignore = "BUG-006: a forged 'released' embargo record is accepted; the embargoed fix is re-snapshotted as public"]
+#[ignore = "BUG-012: a forged 'released' embargo record is accepted; the embargoed fix is re-snapshotted as public"]
 fn forged_embargo_release_does_not_publish_the_fix() {
     let (mut alice, fs, embargo) = embargoed_setup();
     let team = Arc::new(MemoryBackend::new());
@@ -446,7 +446,7 @@ fn forged_embargo_release_does_not_publish_the_fix() {
 /// Same forgery, observed from the key holder's side: Alice can no longer
 /// read the embargoed content she merged.
 #[test]
-#[ignore = "BUG-006: a forged 'released' embargo record is accepted; key holders lose access to embargoed content"]
+#[ignore = "BUG-012: a forged 'released' embargo record is accepted; key holders lose access to embargoed content"]
 fn forged_embargo_release_does_not_lock_out_key_holders() {
     let (mut alice, _fs, embargo) = embargoed_setup();
     let team = Arc::new(MemoryBackend::new());
@@ -462,7 +462,7 @@ fn forged_embargo_release_does_not_lock_out_key_holders() {
 }
 
 #[test]
-#[ignore = "BUG-019: pull accepts remote tags whose target is missing, after which every graph query fails"]
+#[ignore = "BUG-031: pull accepts remote tags whose target is missing, after which every graph query fails"]
 fn pulled_tag_pointing_at_missing_object_does_not_brick_the_repo() {
     let remote_fs = Arc::new(MemoryBackend::new());
     let mut remote = Repo::init_bare(remote_fs.clone()).unwrap();
@@ -480,7 +480,7 @@ fn pulled_tag_pointing_at_missing_object_does_not_brick_the_repo() {
 }
 
 #[test]
-#[ignore = "BUG-018: `set_tag` (and `vl tag set`) accepts any object id, e.g. a blob, bricking `vl log`"]
+#[ignore = "BUG-030: `set_tag` (and `vl tag set`) accepts any object id, e.g. a blob, bricking `vl log`"]
 fn tag_cannot_point_at_a_non_snapshot_object() {
     let (mut repo, fs, _) = new_repo("alice");
     let c = commit_files(&mut repo, &*fs, &[("a.txt", "a\n")], "c");
@@ -492,7 +492,7 @@ fn tag_cannot_point_at_a_non_snapshot_object() {
 // ---- hostile snapshot metadata ---------------------------------------------
 
 #[test]
-#[ignore = "BUG-007: a snapshot's `cloak` field naming a path-like scope panics `ws exec --ephemeral` / commit_fs_as_child"]
+#[ignore = "BUG-015: a snapshot's `cloak` field naming a path-like scope panics `ws exec --ephemeral` / commit_fs_as_child"]
 fn hostile_cloak_field_on_snapshot_does_not_panic() {
     let remote_fs = Arc::new(MemoryBackend::new());
     let mut remote = Repo::init_bare(remote_fs.clone()).unwrap();

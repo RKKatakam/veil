@@ -54,7 +54,7 @@ fn embargoed_merge_does_not_push_the_fix_branch_to_a_public_mirror() {
 }
 
 #[test]
-#[ignore = "BUG-008: embargoed merge message and embargo record description are published in plaintext before release"]
+#[ignore = "BUG-016: embargoed merge message and embargo record description are published in plaintext before release"]
 fn embargo_messages_are_not_public_before_release() {
     let (mut alice, fs, _) = new_repo("alice");
     let main = commit_files(&mut alice, &*fs, &[("auth.rs", "v1\n")], "v1");
@@ -149,7 +149,7 @@ fn auto_rebase_never_downgrades_cloaked_content_to_public() {
 /// inherits the sealed entries, and the very next auto-snapshot re-stores
 /// them as public plaintext (the workspace is not cloaked). No warning.
 #[test]
-#[ignore = "BUG-026: starting a change on top of a cloaked change in a public workspace declassifies its files at the next snapshot"]
+#[ignore = "BUG-006: starting a change on top of a cloaked change in a public workspace declassifies its files at the next snapshot"]
 fn new_change_on_a_cloaked_change_does_not_declassify_it() {
     let (mut alice, fs, _) = new_repo("alice");
     let main = commit_files(&mut alice, &*fs, &[("README", "hi\n")], "v1");
@@ -176,7 +176,7 @@ fn new_change_on_a_cloaked_change_does_not_declassify_it() {
 }
 
 #[test]
-#[ignore = "BUG-009: squashing a cloaked change into a public parent writes its description in plaintext"]
+#[ignore = "BUG-017: squashing a cloaked change into a public parent writes its description in plaintext"]
 fn squash_keeps_cloaked_descriptions_sealed() {
     let (mut alice, fs, _) = new_repo("alice");
     let base = commit_files(&mut alice, &*fs, &[("README", "hi\n")], "public base");
@@ -201,7 +201,7 @@ fn squash_keeps_cloaked_descriptions_sealed() {
 /// *released embargo* scope. The key of a released embargo is published, and
 /// objects sealed under it are pushed to public remotes.
 #[test]
-#[ignore = "BUG-010: .veilpolicy accepts reserved scopes (embargo/<id>, local); 'cloaked' files become publicly decryptable"]
+#[ignore = "BUG-008: .veilpolicy accepts reserved scopes (embargo/<id>, local); 'cloaked' files become publicly decryptable"]
 fn policy_cannot_cloak_under_a_released_embargo_key() {
     let (mut alice, fs, _) = new_repo("alice");
     let main = commit_files(&mut alice, &*fs, &[("a.txt", "v1\n")], "v1");
@@ -232,7 +232,7 @@ fn policy_cannot_cloak_under_a_released_embargo_key() {
 }
 
 #[test]
-#[ignore = "BUG-010: .veilpolicy accepts reserved scopes (embargo/<id>, local); 'cloaked' files become publicly decryptable"]
+#[ignore = "BUG-008: .veilpolicy accepts reserved scopes (embargo/<id>, local); 'cloaked' files become publicly decryptable"]
 fn policy_rejects_reserved_and_malformed_scope_names() {
     let p = Policy::parse("a cloak local\nb cloak embargo/abc\nc cloak ../../x\nd cloak UPPER\n");
     for path in ["a", "b", "c", "d"] {
@@ -250,7 +250,7 @@ fn policy_rejects_reserved_and_malformed_scope_names() {
 /// that only changes `.veilpolicy`: `prod/ cloak ops` → `prod/ cloak opz`.
 /// Alice merges the PR. Nothing warns her; `prod/` is re-encrypted to Mallory.
 #[test]
-#[ignore = "BUG-011: merging a .veilpolicy change silently re-encrypts cloaked files to any scope named in the PR"]
+#[ignore = "BUG-009: merging a .veilpolicy change silently re-encrypts cloaked files to any scope named in the PR"]
 fn policy_pr_cannot_rekey_cloaked_files_to_an_attacker_scope() {
     let alice_id = Identity::generate("alice");
     let (mut alice, fs) = repo_for("alice", &alice_id);
@@ -297,7 +297,7 @@ fn policy_pr_cannot_rekey_cloaked_files_to_an_attacker_scope() {
 /// `secrets/ public!`. Merging it decrypts every existing cloaked file into
 /// public blobs; `vl merge` neither warns nor asks.
 #[test]
-#[ignore = "BUG-011: merging a .veilpolicy change silently declassifies existing cloaked files"]
+#[ignore = "BUG-009: merging a .veilpolicy change silently declassifies existing cloaked files"]
 fn merging_a_policy_change_does_not_silently_declassify_cloaked_files() {
     let (mut alice, fs, _) = new_repo("alice");
     let main = commit_files(
@@ -320,7 +320,7 @@ fn merging_a_policy_change_does_not_silently_declassify_cloaked_files() {
 /// pre-merge tree. It reveals which files the fix touches, their new sizes,
 /// and the names of files it adds.
 #[test]
-#[ignore = "BUG-038: an embargoed merge reveals changed/added file names and new sizes to public mirrors before release"]
+#[ignore = "BUG-018: an embargoed merge reveals changed/added file names and new sizes to public mirrors before release"]
 fn embargoed_tree_reveals_nothing_about_the_fix() {
     let (mut alice, fs, _) = new_repo("alice");
     let main = commit_files(&mut alice, &*fs, &[("auth.rs", "fn check() -> bool { true }\n"), ("lib.rs", "x\n")], "v1");
@@ -345,7 +345,7 @@ fn embargoed_tree_reveals_nothing_about_the_fix() {
 }
 
 #[test]
-#[ignore = "BUG-012: built-in secret rules are case-sensitive; .ENV, KEY.PEM, ID_RSA are snapshotted publicly"]
+#[ignore = "BUG-019: built-in secret rules are case-sensitive; .ENV, KEY.PEM, ID_RSA are snapshotted publicly"]
 fn builtin_secret_rules_are_case_insensitive() {
     let p = Policy::builtin();
     for path in [".ENV", ".Env", "certs/Server.PEM", "deploy/ID_RSA", "prod.TFSTATE", ".NETRC", ".Env.Production"] {
@@ -358,7 +358,7 @@ fn builtin_secret_rules_are_case_insensitive() {
 }
 
 #[test]
-#[ignore = "BUG-012: built-in secret rules are case-sensitive; .ENV, KEY.PEM, ID_RSA are snapshotted publicly"]
+#[ignore = "BUG-019: built-in secret rules are case-sensitive; .ENV, KEY.PEM, ID_RSA are snapshotted publicly"]
 fn uppercase_dotenv_never_reaches_a_public_mirror() {
     let (mut alice, fs, _) = new_repo("alice");
     let c = commit_files(&mut alice, &*fs, &[(".ENV", "DB_PASSWORD=hunter2hunter2\n")], "c");
@@ -374,7 +374,7 @@ fn uppercase_dotenv_never_reaches_a_public_mirror() {
 /// is then all zeros, so *anyone who can read the key ring* (rings are
 /// published to every remote, public ones included) recovers the scope key.
 #[test]
-#[ignore = "BUG-013: grant accepts low-order X25519 public keys; the wrapped scope key is recoverable by anyone"]
+#[ignore = "BUG-010: grant accepts low-order X25519 public keys; the wrapped scope key is recoverable by anyone"]
 fn granting_a_low_order_public_key_does_not_publish_the_scope_key() {
     let (mut alice, fs, _) = new_repo("alice");
     alice.keys().grant("team", &format!("veil1{}", "00".repeat(32)), "new-hire").unwrap_or(());
@@ -411,7 +411,7 @@ fn granting_a_low_order_public_key_does_not_publish_the_scope_key() {
 /// and pushes again. Bob clones afterwards. Push unions key rings, so the
 /// remote still wraps the key for Bob.
 #[test]
-#[ignore = "BUG-014: revocation never reaches remotes (key rings are merged as unions); a revoked member still gets the key"]
+#[ignore = "BUG-011: revocation never reaches remotes (key rings are merged as unions); a revoked member still gets the key"]
 fn revoked_member_cannot_obtain_the_scope_key_from_the_remote() {
     let (mut alice, fs, _) = new_repo("alice");
     alice.keys().create_scope("ops").unwrap();
@@ -433,7 +433,7 @@ fn revoked_member_cannot_obtain_the_scope_key_from_the_remote() {
 }
 
 #[test]
-#[ignore = "BUG-014: revocation never reaches remotes (key rings are merged as unions); a replayed old ring re-adds the member"]
+#[ignore = "BUG-011: revocation never reaches remotes (key rings are merged as unions); a replayed old ring re-adds the member"]
 fn replayed_key_ring_does_not_undo_a_revocation() {
     let (mut alice, _fs, _) = new_repo("alice");
     alice.keys().create_scope("ops").unwrap();
@@ -471,7 +471,7 @@ fn committed_publicly(data: &[u8]) -> bool {
 }
 
 #[test]
-#[ignore = "BUG-015: the secret scanner skips any file with a NUL byte (e.g. UTF-16 text) and any file over 8 MiB"]
+#[ignore = "BUG-020: the secret scanner skips any file with a NUL byte (e.g. UTF-16 text) and any file over 8 MiB"]
 fn scanner_is_not_bypassed_by_utf16_encoding() {
     let text = "aws_access_key_id = AKIAIOSFODNN7EXAMPLE\r\n";
     let mut utf16 = vec![0xff, 0xfe];
@@ -482,13 +482,13 @@ fn scanner_is_not_bypassed_by_utf16_encoding() {
 }
 
 #[test]
-#[ignore = "BUG-015: the secret scanner skips any file with a NUL byte (e.g. UTF-16 text) and any file over 8 MiB"]
+#[ignore = "BUG-020: the secret scanner skips any file with a NUL byte (e.g. UTF-16 text) and any file over 8 MiB"]
 fn scanner_is_not_bypassed_by_a_single_nul_byte() {
     assert!(!committed_publicly(b"\0\nconst k = \"AKIAIOSFODNN7EXAMPLE\";\n"));
 }
 
 #[test]
-#[ignore = "BUG-015: the secret scanner skips any file with a NUL byte (e.g. UTF-16 text) and any file over 8 MiB"]
+#[ignore = "BUG-020: the secret scanner skips any file with a NUL byte (e.g. UTF-16 text) and any file over 8 MiB"]
 fn scanner_is_not_bypassed_by_file_size() {
     let mut big = vec![b'x'; 8 * 1024 * 1024];
     big.extend_from_slice(b"\nconst k = \"AKIAIOSFODNN7EXAMPLE\";\n");
@@ -496,7 +496,7 @@ fn scanner_is_not_bypassed_by_file_size() {
 }
 
 #[test]
-#[ignore = "BUG-020: generic secret rule requires quotes; YAML/dotenv-style unquoted credentials are not detected"]
+#[ignore = "BUG-032: generic secret rule requires quotes; YAML/dotenv-style unquoted credentials are not detected"]
 fn scanner_detects_unquoted_credentials() {
     for sample in [
         "database:\n  password: Xk9mQ2vL7pR4wZt8\n",
@@ -508,7 +508,7 @@ fn scanner_detects_unquoted_credentials() {
 }
 
 #[test]
-#[ignore = "BUG-020: AWS key rule requires a word boundary; `KEY_AKIA…` style identifiers slip through"]
+#[ignore = "BUG-032: AWS key rule requires a word boundary; `KEY_AKIA…` style identifiers slip through"]
 fn scanner_detects_aws_key_glued_to_an_identifier() {
     assert!(!committed_publicly(b"AWS_KEY_AKIAIOSFODNN7EXAMPLE\n"));
 }
