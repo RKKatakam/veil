@@ -17,6 +17,19 @@ working tree *is* the host filesystem. Veil drops all three assumptions:
 | Worktrees lock directories hostage | **Virtual workspaces** live in the DAG; agents get **in-memory overlays** in microseconds |
 | Tied to the OS filesystem | Engine runs on any `StorageBackend`: disk, memory, overlay, SFTP |
 
+## Documentation
+
+* **[User guide](docs/guide/README.md)**: [getting started](docs/guide/getting-started.md),
+  [coming from Git](docs/guide/coming-from-git.md), [GitHub](docs/guide/github.md),
+  [secrets and visibility](docs/guide/secrets-and-visibility.md),
+  [embargoes](docs/guide/embargoes.md), [workspaces and agents](docs/guide/workspaces-and-agents.md),
+  [teams and remotes](docs/guide/teams-and-remotes.md), [maintenance](docs/guide/maintenance.md),
+  [troubleshooting](docs/guide/troubleshooting.md).
+* **[Command reference](docs/reference/README.md)**, generated from the CLI
+  (also `vl <command> --help` and `vl man`).
+* Design, for developers and reviewers: [architecture and threat model](docs/ARCHITECTURE.md),
+  [formats](docs/FORMAT.md), [cryptography](docs/CRYPTO.md), [releasing](docs/RELEASING.md).
+
 ## Install
 
 Veil 1.0 supports **Linux and macOS**, on x86_64 and aarch64 (Apple

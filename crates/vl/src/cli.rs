@@ -49,13 +49,21 @@ pub struct Cli {
 pub enum Cmd {
     // ---- setup ------------------------------------------------------------
     /// Create a repository in PATH (default: current directory).
-    Init { path: Option<PathBuf> },
+    Init {
+        /// Directory to create the repository in (created if missing).
+        path: Option<PathBuf>,
+    },
     /// Copy a repository (and every tag you can see) into a new directory.
     ///
     /// SOURCE is a path, `ssh://[user@]host[:port]/path` or scp-style
     /// `[user@]host:path` (through your own `ssh`; the server needs only
     /// SSH with SFTP).
-    Clone { source: String, dest: Option<PathBuf> },
+    Clone {
+        /// Repository to clone: a path or an SSH URL.
+        source: String,
+        /// Directory to clone into (default: the source's last path component).
+        dest: Option<PathBuf>,
+    },
 
     // ---- inspecting -------------------------------------------------------
     /// Show working-copy changes, local-only files and conflicts.
@@ -69,8 +77,10 @@ pub enum Cmd {
     },
     /// Show a snapshot's metadata and diff.
     Show {
+        /// Snapshot to show.
         #[arg(default_value = "@")]
         rev: String,
+        /// Only list changed paths.
         #[arg(long)]
         stat: bool,
     },
@@ -79,8 +89,10 @@ pub enum Cmd {
         /// Snapshot whose changes to show (default: @).
         #[arg(short, long)]
         rev: Option<String>,
+        /// Compare from this snapshot (default: @).
         #[arg(long)]
         from: Option<String>,
+        /// Compare to this snapshot (default: @).
         #[arg(long)]
         to: Option<String>,
         /// Only list changed paths.
@@ -89,12 +101,15 @@ pub enum Cmd {
     },
     /// List the files of a snapshot with their visibility.
     Files {
+        /// Snapshot to list.
         #[arg(short, long, default_value = "@")]
         rev: String,
     },
     /// Print a file's content at a snapshot.
     Cat {
+        /// File to print.
         path: String,
+        /// Snapshot to read it from.
         #[arg(short, long, default_value = "@")]
         rev: String,
     },
@@ -125,6 +140,7 @@ pub enum Cmd {
     },
     /// Show how a change evolved (amends, rewrites, rebases).
     Evolog {
+        /// Change whose evolution to show.
         #[arg(short, long, default_value = "@")]
         rev: String,
     },
@@ -132,43 +148,56 @@ pub enum Cmd {
     // ---- shaping history --------------------------------------------------
     /// Set the description of a change.
     Describe {
+        /// Change to describe.
         #[arg(short, long, default_value = "@")]
         rev: String,
+        /// The new description.
         #[arg(short, long)]
         message: String,
     },
     /// Start a new change on top of REVS (default: @). Several = merge.
     New {
+        /// Parents of the new change.
         revs: Vec<String>,
+        /// Description of the new change.
         #[arg(short, long, default_value = "")]
         message: String,
     },
     /// Describe the working-copy change and start a new one on top.
     Commit {
+        /// Description of the change being committed.
         #[arg(short, long)]
         message: String,
     },
     /// Make REV the working-copy change.
-    Edit { rev: String },
+    Edit {
+        /// Change to edit.
+        rev: String,
+    },
     /// Discard a change; descendants are rebased onto its parent.
     Abandon {
+        /// Change to abandon.
         #[arg(default_value = "@")]
         rev: String,
     },
     /// Move a change (and its descendants) onto new parents.
     Rebase {
+        /// Change to move; its descendants follow.
         #[arg(short, long, visible_short_alias = 'r', default_value = "@")]
         source: String,
+        /// New parent (repeat for a merge).
         #[arg(short, long, required = true)]
         destination: Vec<String>,
     },
     /// Fold a change into its parent.
     Squash {
+        /// Change to fold into its parent.
         #[arg(short, long, default_value = "@")]
         rev: String,
     },
     /// Restore paths in the working copy from another snapshot.
     Restore {
+        /// Paths to restore (default: every path).
         paths: Vec<String>,
         /// Source snapshot (default: @-).
         #[arg(long, default_value = "@-")]
@@ -176,11 +205,13 @@ pub enum Cmd {
     },
     /// Merge REVS into the current line of work.
     Merge {
+        /// Snapshots to merge in.
         #[arg(required = true)]
         revs: Vec<String>,
         /// Merge into this snapshot (default: @, or @- if @ is empty).
         #[arg(long)]
         into: Option<String>,
+        /// Description of the merge (default: "merge REVS").
         #[arg(short, long)]
         message: Option<String>,
         /// Delayed-visibility merge: hide the merged changes from anyone
@@ -204,18 +235,22 @@ pub enum Cmd {
     // ---- visibility ---------------------------------------------------------
     /// Encrypt matching paths for a scope (default: team).
     Cloak {
+        /// Paths or glob patterns.
         #[arg(required = true)]
         patterns: Vec<String>,
+        /// Scope to encrypt for (you must hold its key).
         #[arg(long, default_value = "team")]
         scope: String,
     },
     /// Keep matching paths local-only: never snapshotted, never synced.
     Isolate {
+        /// Paths or glob patterns.
         #[arg(required = true)]
         patterns: Vec<String>,
     },
     /// Make matching paths public.
     Expose {
+        /// Paths or glob patterns.
         #[arg(required = true)]
         patterns: Vec<String>,
         /// Also allow built-in secret paths and disable secret scanning.
@@ -224,6 +259,7 @@ pub enum Cmd {
     },
     /// Do not track matching paths at all.
     Ignore {
+        /// Paths or glob patterns.
         #[arg(required = true)]
         patterns: Vec<String>,
     },
@@ -239,6 +275,7 @@ pub enum Cmd {
     Secret(SecretCmd),
     /// Run a command with vault secrets injected as environment variables.
     Run {
+        /// Command and arguments (put them after `--`).
         #[arg(trailing_var_arg = true, required = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -262,6 +299,7 @@ pub enum Cmd {
     Undo,
     /// Snapshot continuously as files change.
     Watch {
+        /// How often to snapshot, in milliseconds.
         #[arg(long, default_value_t = 1000)]
         interval_ms: u64,
     },
@@ -272,11 +310,13 @@ pub enum Cmd {
     Remote(RemoteCmd),
     /// Send tags and their history to a remote (visibility-filtered).
     Push {
+        /// Remote to push to.
         #[arg(default_value = "origin")]
         remote: String,
         /// Only push these tags.
         #[arg(short, long)]
         tag: Vec<String>,
+        /// Overwrite tags that diverged on the remote.
         #[arg(long)]
         force: bool,
         /// Walk and verify every object instead of skipping what the remote
@@ -286,6 +326,7 @@ pub enum Cmd {
     },
     /// Fetch tags and history from a remote.
     Pull {
+        /// Remote to pull from.
         #[arg(default_value = "origin")]
         remote: String,
         /// Walk and verify every object instead of skipping what this
@@ -338,12 +379,14 @@ pub enum Cmd {
     },
     /// Print a shell completion script, e.g. `vl completions zsh > ~/.zfunc/_vl`.
     Completions {
+        /// Shell to generate the script for.
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
     /// Print the man page (`vl man | man -l -`), or write one page per
     /// command into DIR.
     Man {
+        /// Write `vl.1` and one `vl-<command>.1` page per command here.
         #[arg(long, value_name = "DIR")]
         out_dir: Option<PathBuf>,
     },
@@ -355,17 +398,23 @@ pub enum TagCmd {
     List,
     /// Create or move a tag.
     Set {
+        /// Tag name.
         name: String,
+        /// Snapshot the tag points at.
         #[arg(short, long, default_value = "@")]
         rev: String,
-        /// Cloak the tag: never pushed to public remotes.
+        /// Cloak the tag (default scope: team): never pushed to public remotes.
         #[arg(long, value_name = "SCOPE", num_args = 0..=1, default_missing_value = "team")]
         cloak: Option<String>,
+        /// Allow moving the tag to a snapshot that is not a descendant.
         #[arg(long)]
         allow_backwards: bool,
     },
     /// Delete a tag.
-    Delete { name: String },
+    Delete {
+        /// Tag name.
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -373,7 +422,10 @@ pub enum EmbargoCmd {
     /// List embargoes.
     List,
     /// Publish an embargo key now.
-    Release { id: String },
+    Release {
+        /// Embargo id, from `vl embargo list`.
+        id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -382,6 +434,7 @@ pub enum PolicyCmd {
     Show,
     /// Explain how paths are classified.
     Check {
+        /// Paths to classify.
         #[arg(required = true)]
         paths: Vec<String>,
     },
@@ -394,15 +447,29 @@ pub enum PolicyCmd {
 #[derive(Subcommand, Debug)]
 pub enum SecretCmd {
     /// Store a secret (reads VALUE from stdin if omitted).
-    Set { name: String, value: Option<String> },
+    Set {
+        /// Secret name (the environment variable `vl run` sets).
+        name: String,
+        /// Secret value (default: read from stdin).
+        value: Option<String>,
+    },
     /// Print a secret.
-    Get { name: String },
+    Get {
+        /// Secret name.
+        name: String,
+    },
     /// List secret names.
     List,
     /// Delete a secret.
-    Rm { name: String },
+    Rm {
+        /// Secret name.
+        name: String,
+    },
     /// Import KEY=VALUE lines from a dotenv file.
-    Import { file: PathBuf },
+    Import {
+        /// Dotenv file to read.
+        file: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -412,8 +479,10 @@ pub enum IdentityCmd {
     /// Create a new identity (replaces the existing one with --force; the
     /// replaced one is kept so local vaults can be re-keyed).
     New {
+        /// Your name (default: $VEIL_USER, then $USER).
         #[arg(long)]
         name: Option<String>,
+        /// Replace the existing identity.
         #[arg(long)]
         force: bool,
     },
@@ -432,12 +501,18 @@ pub enum ScopeCmd {
     /// List scopes and members.
     List,
     /// Create a scope with you as the only member.
-    Create { name: String },
+    Create {
+        /// Scope name.
+        name: String,
+    },
     /// Give an identity access to a scope (admins only). Use the full public
     /// key from `vl identity show` so the member's signatures are recognised.
     Grant {
+        /// Scope name.
         scope: String,
+        /// The member's full public key, from their `vl identity show`.
         public_key: String,
+        /// Display name for the member.
         #[arg(long, default_value = "member")]
         name: String,
         /// Make the member an admin (may grant, revoke and rotate).
@@ -445,11 +520,22 @@ pub enum ScopeCmd {
         admin: bool,
     },
     /// Remove an identity from a scope and rotate its key (admins only).
-    Revoke { scope: String, public_key: String },
+    Revoke {
+        /// Scope name.
+        scope: String,
+        /// The member's public key or member id.
+        public_key: String,
+    },
     /// Start a new key generation for the current members (admins only).
-    Rotate { scope: String },
+    Rotate {
+        /// Scope name.
+        scope: String,
+    },
     /// Show the signed membership log of a scope.
-    Log { scope: String },
+    Log {
+        /// Scope name.
+        scope: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -458,6 +544,7 @@ pub enum WsCmd {
     List,
     /// Create a virtual workspace (no directory is created).
     New {
+        /// Workspace name.
         name: String,
         /// Base revision (default: the parents of @, like a fresh checkout).
         #[arg(short, long)]
@@ -467,41 +554,65 @@ pub enum WsCmd {
         cloak: Option<String>,
     },
     /// Attach the project directory to another workspace.
-    Switch { name: String },
+    Switch {
+        /// Workspace name.
+        name: String,
+    },
     /// Delete a workspace.
-    Rm { name: String },
+    Rm {
+        /// Workspace name.
+        name: String,
+    },
     /// Run a command inside a workspace in a throwaway directory and record
     /// the result. With --ephemeral, a one-shot workspace on REV is used.
     Exec {
+        /// Workspace to run in (or use --ephemeral).
         name: Option<String>,
+        /// Run in a one-shot workspace on REV and record the result as a new change on top of it.
         #[arg(long)]
         ephemeral: bool,
         /// Base revision for --ephemeral.
         #[arg(short, long, default_value = "@-")]
         rev: String,
+        /// Description to record.
         #[arg(short, long, default_value = "")]
         message: String,
         /// Copy local-only (isolated) files such as .env into the sandbox.
         #[arg(long)]
         with_isolated: bool,
+        /// Command and arguments.
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
     /// Print a file from a workspace.
-    Cat { name: String, path: String },
+    Cat {
+        /// Workspace name.
+        name: String,
+        /// File to print.
+        path: String,
+    },
     /// Write stdin to a file in a workspace (in memory, no checkout).
-    Write { name: String, path: String },
+    Write {
+        /// Workspace name.
+        name: String,
+        /// File to write.
+        path: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
 pub enum OpCmd {
     /// Show the operation log.
     Log {
+        /// Number of operations to show.
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
     },
     /// Restore the repository to the state after operation ID.
-    Restore { id: String },
+    Restore {
+        /// Operation id (or prefix), from `vl op log`.
+        id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -511,7 +622,9 @@ pub enum RemoteCmd {
     /// through your own `ssh` and its SFTP subsystem (`VEIL_SSH` overrides
     /// the command). Nothing but SSH is needed on the server.
     Add {
+        /// Remote name.
         name: String,
+        /// Path or SSH URL.
         url: String,
         /// Public remote: cloaked content, cloaked tags and unreleased
         /// embargoes are never sent.
@@ -521,7 +634,10 @@ pub enum RemoteCmd {
     /// List remotes.
     List,
     /// Remove a remote.
-    Rm { name: String },
+    Rm {
+        /// Remote name.
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -529,6 +645,7 @@ pub enum GitCmd {
     /// Import a Git repository's history (path or URL): adds it as a Git
     /// remote and creates a tag for every branch.
     Import {
+        /// Git repository: a path or any URL `git` understands.
         source: String,
         /// Name of the Git remote to create.
         #[arg(long, default_value = "origin")]
@@ -539,16 +656,19 @@ pub enum GitCmd {
     Remote(GitRemoteCmd),
     /// Fetch a Git remote's branches as `<remote>/<branch>` (local tags stay).
     Fetch {
+        /// Git remote.
         #[arg(default_value = "origin")]
         remote: String,
     },
     /// Fetch, then create or fast-forward local tags from the branches.
     Pull {
+        /// Git remote.
         #[arg(default_value = "origin")]
         remote: String,
     },
     /// Export tags (all by default) as branches and push them.
     Push {
+        /// Git remote.
         #[arg(default_value = "origin")]
         remote: String,
         /// Only push these tags.
@@ -562,6 +682,7 @@ pub enum GitCmd {
     /// Export tags into the local bridge repository without pushing, and
     /// print the commit of each.
     Export {
+        /// Only export these tags.
         #[arg(short, long)]
         tag: Vec<String>,
     },
@@ -570,9 +691,17 @@ pub enum GitCmd {
 #[derive(Subcommand, Debug)]
 pub enum GitRemoteCmd {
     /// Add a Git remote (any URL `git` understands, or a path).
-    Add { name: String, url: String },
+    Add {
+        /// Git remote name.
+        name: String,
+        /// Any URL `git` understands, or a path.
+        url: String,
+    },
     /// List Git remotes.
     List,
     /// Remove a Git remote.
-    Rm { name: String },
+    Rm {
+        /// Git remote name.
+        name: String,
+    },
 }

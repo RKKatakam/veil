@@ -1,0 +1,20 @@
+<!-- Generated from the CLI definition by crates/vl/src/docgen.rs. Do not edit:
+     regenerate with `VEIL_BLESS_DOCS=1 cargo test -p vl --bin vl reference_is_up_to_date`. -->
+
+# `vl commit`
+
+Describe the working-copy change and start a new one on top
+
+```text
+vl commit [OPTIONS] --message <MESSAGE>
+```
+
+Options:
+
+| | |
+|---|---|
+| `-m, --message <MESSAGE>` | Description of the change being committed (required) |
+
+---
+
+[All commands](README.md) · [User guide](../guide/README.md)
