@@ -7,7 +7,10 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU32, Ordering as AtomicOrdering},
+        Arc,
+    },
 };
 
 use serde::{Deserialize, Serialize};
@@ -34,6 +37,23 @@ pub struct Tag {
     /// Cloaked tags are never pushed to public remotes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloak: Option<String>,
+    /// The annotated tag object (`veil:atag`, repository format 5) that
+    /// makes this a release tag. Its `name` and `target` must equal this
+    /// entry's (`Atag::verify`). Absent on every other tag, and on every
+    /// tag written before format 5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotation: Option<ObjectId>,
+}
+
+impl Tag {
+    /// A tag without annotation.
+    pub fn new(target: ObjectId, cloak: Option<String>) -> Tag {
+        Tag {
+            target,
+            cloak,
+            annotation: None,
+        }
+    }
 }
 
 /// The complete mutable state of a repository at one point in time.
@@ -47,6 +67,13 @@ pub struct View {
     /// `remote/tag` → target as last seen on the remote.
     #[serde(default)]
     pub remote_tags: BTreeMap<String, ObjectId>,
+    /// `remote/tag` → the annotated tag object (`veil:atag`) of a Git
+    /// release tag as last fetched from a Git remote (repository format 5;
+    /// bridge tags). Kept apart from `remote_tags`, which holds branches,
+    /// so a branch `v1` and a tag `v1` never collide. Omitted when empty,
+    /// so views without it keep their bytes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub remote_release_tags: BTreeMap<String, ObjectId>,
 }
 
 impl View {
@@ -65,6 +92,23 @@ impl View {
         v.sort();
         v.dedup();
         v
+    }
+
+    /// Every annotated tag object the view names (format 5): tag
+    /// annotations and remote release tags. Not snapshots: gc keeps them
+    /// and their targets, fsck checks them, sync sends them with their tag.
+    pub fn annotations(&self) -> Vec<ObjectId> {
+        let mut v: Vec<ObjectId> = self.tags.values().filter_map(|t| t.annotation).collect();
+        v.extend(self.remote_release_tags.values().copied());
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// Does the view use a format-5 field (an annotation or a remote
+    /// release tag)? Only a format-5 repository may record one.
+    pub fn uses_format_5(&self) -> bool {
+        !self.remote_release_tags.is_empty() || self.tags.values().any(|t| t.annotation.is_some())
     }
 }
 
@@ -100,11 +144,23 @@ pub struct Operation {
 #[derive(Debug)]
 pub struct OpStore {
     backend: Arc<dyn StorageBackend>,
+    /// Repository format: below format 5, an operation whose view uses a
+    /// format-5 field ([`View::uses_format_5`]) is refused, so an older vl
+    /// never reads a view it would rewrite without the field.
+    format: AtomicU32,
 }
 
 impl OpStore {
     pub fn new(backend: Arc<dyn StorageBackend>) -> Self {
-        OpStore { backend }
+        OpStore {
+            backend,
+            format: AtomicU32::new(crate::repo::REPO_FORMAT),
+        }
+    }
+
+    /// Set the repository format the store writes for (`Repo::open`).
+    pub fn set_format(&self, format: u32) {
+        self.format.store(format, AtomicOrdering::Relaxed);
     }
 
     fn op_path(id: &ObjectId) -> VPath {
@@ -116,6 +172,14 @@ impl OpStore {
     }
 
     pub fn put(&self, op: &Operation) -> Result<ObjectId> {
+        let format = self.format.load(AtomicOrdering::Relaxed);
+        if format < crate::object::GIT_PARITY_REPO_FORMAT && op.view.uses_format_5() {
+            return Err(VeilError::Unsupported(format!(
+                "this repository is at format {format} and cannot record annotated or release tags; \
+                 upgrade it with `vl upgrade` (a remote: `vl upgrade --remote <name>`) once everyone who uses it runs vl {} or later",
+                crate::repo::min_vl_for_format(crate::object::GIT_PARITY_REPO_FORMAT)
+            )));
+        }
         let raw = serde_json::to_vec(op)?;
         let id = ObjectId::hash(&raw);
         self.backend.write(&Self::op_path(&id), &raw)?;

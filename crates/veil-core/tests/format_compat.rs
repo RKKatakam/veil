@@ -306,12 +306,121 @@ fn golden_encodings() -> Vec<(String, Vec<u8>)> {
             })
             .encode_with(TreeEncoding::Binary),
         ),
+        // Format 5: binary trees with a symlink and with a gitlink (each
+        // public and cloaked, one with a fallback), a conflict with a
+        // symlink term, and annotated tags (signed with a plain message,
+        // with a sealed message, and imported from Git).
+        ("tree-v2-binary-symlink".into(), Object::Tree(golden_special_tree(EntryKind::Symlink)).encode_with(TreeEncoding::Binary)),
+        ("tree-v2-binary-gitlink".into(), Object::Tree(golden_special_tree(EntryKind::Gitlink)).encode_with(TreeEncoding::Binary)),
+        ("conflict-symlink-term".into(), Object::Conflict(golden_link_conflict()).encode()),
+        ("atag".into(), Object::Atag(golden_atag()).encode()),
+        (
+            "atag-sealed".into(),
+            Object::Atag(veil_core::tag_object::Atag {
+                name: "team-release".into(),
+                message: Text::Sealed(Envelope {
+                    scope: "team#0011223344556677".into(),
+                    suite: Suite::XChaCha20Poly1305 { nonce: [6; 24] },
+                    ciphertext: vec![7; 26],
+                }),
+                signature: None,
+                ..golden_atag()
+            })
+            .encode(),
+        ),
+        (
+            "atag-git".into(),
+            Object::Atag(veil_core::tag_object::Atag {
+                signature: None,
+                tagger: "Git Hub <noreply@github.com>".into(),
+                git: Some(veil_core::tag_object::GitTagOrigin {
+                    oid: "ab".repeat(20),
+                    raw: hex::encode("object 0101\ntype commit\ntag v1.0\ntagger x <x> 0 +0000\n\nmsg\n"),
+                }),
+                ..golden_atag()
+            })
+            .encode(),
+        ),
     ]
+}
+
+/// A tree holding `kind` entries (format 5): public with a size, and
+/// cloaked with a fallback, next to a file.
+fn golden_special_tree(kind: EntryKind) -> Tree {
+    let e = |name: &str, n: u8| TreeEntry {
+        name: name.into(),
+        kind,
+        id: ObjectId([n; 32]),
+        size: 12,
+        executable: false,
+        visibility: Visibility::Public,
+        fallback: None,
+    };
+    Tree {
+        entries: vec![
+            e("current", 0x31),
+            TreeEntry {
+                name: "file.txt".into(),
+                kind: EntryKind::File,
+                id: ObjectId([0x32; 32]),
+                size: 3,
+                executable: false,
+                visibility: Visibility::Public,
+                fallback: None,
+            },
+            TreeEntry {
+                visibility: Visibility::Cloaked { scope: "team".into() },
+                fallback: Some(ObjectId([0x34; 32])),
+                ..e("private", 0x33)
+            },
+        ],
+    }
+}
+
+/// A link/file conflict: ours a symlink, theirs a file, the base a file.
+fn golden_link_conflict() -> veil_core::Conflict {
+    use veil_core::{object::TermKind, ConflictTerm};
+    let t = |kind: TermKind, n: u8| ConflictTerm {
+        kind,
+        id: ObjectId([n; 32]),
+        size: 7,
+        executable: false,
+        visibility: Visibility::Public,
+        fallback: None,
+    };
+    veil_core::Conflict {
+        adds: vec![
+            Some(t(TermKind::Symlink, 0x41)),
+            Some(ConflictTerm { executable: true, ..t(TermKind::File, 0x42) }),
+        ],
+        removes: vec![Some(ConflictTerm {
+            visibility: Visibility::Cloaked { scope: "team".into() },
+            ..t(TermKind::Gitlink, 0x43)
+        })],
+    }
+}
+
+fn golden_atag() -> veil_core::tag_object::Atag {
+    veil_core::tag_object::Atag {
+        name: "v1.0".into(),
+        target: ObjectId([0x51; 32]),
+        kind: veil_core::tag_object::AtagKind::Annotated,
+        message: Text::Plain("Release 1.0\n".into()),
+        tagger: "alice".into(),
+        timestamp: 1_767_225_600_000,
+        signature: Some(veil_core::identity::Signature {
+            signer: "ab".repeat(32),
+            key: "cd".repeat(32),
+            sig: "ef".repeat(64),
+        }),
+        git: None,
+    }
 }
 
 fn golden_conflict() -> veil_core::Conflict {
     use veil_core::ConflictTerm;
     let t = |n: u8| ConflictTerm {
+        kind: veil_core::object::TermKind::File,
         id: ObjectId([n; 32]),
         size: 0,
         executable: false,
@@ -830,18 +939,33 @@ fn newer_object_encodings_are_unsupported_not_corrupt() {
     unsupported(b"veil:xtra\npayload");
     unsupported(b"veil:conf\n\x05");
     unsupported(b"veil:conf\n\x1f");
-    // Reserved flag bits and tier in a binary tree.
+    unsupported(b"veil:atag\n\x05");
+    unsupported(b"veil:atag\n\x1f");
+    // Reserved tier in a binary tree.
     let mut t = Tree::default();
     t.insert(TreeEntry::dir("a", ObjectId([1; 32])));
     let good = Object::Tree(t).encode_with(TreeEncoding::Binary);
     let flags_at = 10 + 1 + 1 + 1 + 1; // tag, version, count, name_len, name
-    // (Bit 6 is the conflict flag of format 4; with another flag it is
-    // corrupt, see `tree_encoding.rs`.)
-    for bad_flags in [0x81u8, 0xC0, 0x31] {
+    // (Bit 6 is the conflict flag of format 4 and bit 7 the kind flag of
+    // format 5; with a flag they exclude it is corrupt, see
+    // `tree_encoding.rs`.)
+    let mut raw = good.clone();
+    raw[flags_at] = 0x31;
+    unsupported(&raw);
+    // An entry kind this build does not know (format 5: 1 symlink,
+    // 2 gitlink): the kind byte follows the flags.
+    for kind in [0u8, 3, 0x7f, 0xff] {
         let mut raw = good.clone();
-        raw[flags_at] = bad_flags;
+        raw[flags_at] = 0x80;
+        raw.insert(flags_at + 1, kind);
         unsupported(&raw);
     }
+    // A conflict term kind this build does not know (bits 6-7 = 3).
+    let mut c = Object::Conflict(golden_conflict()).encode();
+    let first_term = 10 + 1 + 1; // tag, version, removes
+    c[first_term] |= 0xC0;
+    c[first_term] &= !0x02; // and not executable
+    unsupported(&c);
     // But garbage is still corruption.
     for raw in [
         &b"veil:tree\n {}"[..],
@@ -1311,7 +1435,7 @@ fn upgrade_3_to_4_keeps_marker_conflicts_and_records_new_ones_as_data() {
     assert_eq!(e.kind, EntryKind::File, "format 3 writes markers");
     let ids: Vec<ObjectId> = repo.store().list_objects().unwrap();
     drop(repo);
-    let r = upgrade(fs.clone(), Some(alice.clone()), &UpgradeOptions::default()).unwrap();
+    let r = upgrade(fs.clone(), Some(alice.clone()), &UpgradeOptions { to: 4, ..UpgradeOptions::default() }).unwrap();
     assert_eq!((r.from, r.to), (3, 4));
     assert!(r.notes.iter().any(|n| n.contains("conflicts recorded before")), "{:#?}", r.notes);
     let mut repo = Repo::open(fs.clone(), Some(alice), "alice").unwrap();
@@ -1324,4 +1448,384 @@ fn upgrade_3_to_4_keeps_marker_conflicts_and_records_new_ones_as_data() {
     let m2 = repo.merge("default", ours, vec![theirs], "merge again", None).unwrap();
     let e = lookup(repo.store(), &repo.snapshot(&m2.snapshot).unwrap().tree, &p("f.txt")).unwrap().unwrap();
     assert_eq!(e.kind, EntryKind::Conflict);
+}
+
+// ---- format 5: symlinks, gitlinks, annotated tags ---------------------------
+
+const LINK_TARGET: &str = "../README.md";
+const ABSOLUTE_TARGET: &str = "/usr/share/dict/words";
+/// The sealed symlink target: it names a private path.
+const SEALED_TARGET: &str = "/srv/acme-secret-merger/build";
+const PUBLIC_GITLINK: &str = "0123456789abcdef0123456789abcdef01234567\n";
+const SEALED_GITLINK: &str = "fedcba9876543210fedcba9876543210fedcba98\n";
+const TEAM_RELEASE_NOTES: &str = "team-only release notes: the acme merger\n";
+
+fn special_entry(repo: &Repo, name: &str, kind: EntryKind, content: &str, vis: Visibility) -> TreeEntry {
+    TreeEntry {
+        name: name.into(),
+        kind,
+        id: repo.store().store_file(content.as_bytes(), &vis).unwrap(),
+        size: content.len() as u64,
+        executable: false,
+        visibility: vis,
+        fallback: None,
+    }
+}
+
+/// The format-5 additions of the fixture set, written through the engine
+/// into the `alice/` that `generate.sh` is building (the CLI for links and
+/// annotated tags comes later in this round). `generate.sh` runs it, once,
+/// with `VEIL_FIXTURE_DIR=<the set being written>`:
+///
+/// * tag `links`: `main` plus `links/readme` → `../README.md`,
+///   `links/words` → an absolute target, `secrets/current` → a target
+///   sealed for `team`, `vendor/sdk` (a public gitlink) and
+///   `secrets/private-sdk` (a gitlink sealed for `team`);
+/// * tag `link-conflict`: a child of it whose `links/both` is a link/file
+///   conflict (ours a symlink, theirs a file);
+/// * annotated tags on `links`: `v5.0` (signed by alice), `team-release`
+///   (cloaked for `team`, its message sealed, signed) and `imported` (a
+///   lightweight Git tag, also recorded as the remote release tag
+///   `github/imported`).
+#[test]
+#[ignore = "fixture generator: run by tests/fixtures/generate.sh"]
+fn write_format_5_extras() {
+    use veil_core::{conflict::set_entry, object::TermKind, oplog::Tag, tag_object::Atag, ConflictTerm};
+    let out = PathBuf::from(std::env::var("VEIL_FIXTURE_DIR").expect("VEIL_FIXTURE_DIR"));
+    let identity = Identity::from_json(&std::fs::read_to_string(out.join("home-alice/identity.json")).unwrap()).unwrap();
+    let mut repo = Repo::open(Arc::new(DiskBackend::new(out.join("alice"))), Some(identity.clone()), "alice").unwrap();
+    assert_eq!(repo.format(), 5, "the format-5 extras go into a format-5 set");
+    let main = tag(&repo, "main");
+    let store = repo.store().clone();
+    let base_tree = repo.snapshot(&main).unwrap().tree;
+    let base_tree = match wrapper_of(&store, &base_tree).unwrap() {
+        Some(w) => w.inner,
+        None => base_tree,
+    };
+    let team = Visibility::Cloaked { scope: "team".into() };
+    let mut tree = base_tree;
+    for (path, e) in [
+        ("links/readme", special_entry(&repo, "readme", EntryKind::Symlink, LINK_TARGET, Visibility::Public)),
+        ("links/words", special_entry(&repo, "words", EntryKind::Symlink, ABSOLUTE_TARGET, Visibility::Public)),
+        ("secrets/current", special_entry(&repo, "current", EntryKind::Symlink, SEALED_TARGET, team.clone())),
+        ("vendor/sdk", special_entry(&repo, "sdk", EntryKind::Gitlink, PUBLIC_GITLINK, Visibility::Public)),
+        ("secrets/private-sdk", special_entry(&repo, "private-sdk", EntryKind::Gitlink, SEALED_GITLINK, team.clone())),
+    ] {
+        let path = p(path);
+        let parent = path.parent().unwrap();
+        tree = if lookup(&store, &tree, &parent).unwrap().is_some() {
+            set_entry(&store, &tree, &path, Some(e)).unwrap()
+        } else {
+            // A new directory holding just this entry.
+            let dir = store.put_tree(&Tree { entries: vec![e] }).unwrap();
+            set_entry(&store, &tree, &parent, Some(TreeEntry::dir(parent.file_name(), dir))).unwrap()
+        };
+    }
+    let snap = |parent: ObjectId, tree: ObjectId, msg: &str, conflicts: Vec<String>| {
+        let mut s = Snapshot {
+            parents: vec![parent],
+            change_id: ChangeId::random(),
+            tree,
+            description: Text::Plain(msg.into()),
+            author: "alice".into(),
+            timestamp: veil_core::now_millis(),
+            conflicts,
+            ..Snapshot::root(tree)
+        };
+        s.sign(&identity);
+        store.put_snapshot(&s).unwrap()
+    };
+    let links = snap(main, tree, "format 5: symlinks and gitlinks", vec![]);
+    // A link/file conflict.
+    let blob = |data: &str| store.store_file(data.as_bytes(), &Visibility::Public).unwrap();
+    let term = |kind: TermKind, data: &str| ConflictTerm {
+        kind,
+        id: blob(data),
+        size: data.len() as u64,
+        executable: false,
+        visibility: Visibility::Public,
+        fallback: None,
+    };
+    let conflict = veil_core::Conflict {
+        adds: vec![Some(term(TermKind::Symlink, "readme")), Some(term(TermKind::File, "a file now\n"))],
+        removes: vec![Some(term(TermKind::File, "the base\n"))],
+    };
+    let cid = store.put_conflict(&conflict).unwrap();
+    let ctree = set_entry(&store, &tree, &p("links/both"), Some(TreeEntry::conflict("both", cid))).unwrap();
+    let conflicted = snap(links, ctree, "a link/file conflict", vec!["links/both".into()]);
+    // Annotated tags.
+    let now = veil_core::now_millis();
+    let mut v5 = Atag::annotated("v5.0", links, Text::Plain("Release 5.0: links and gitlinks\n".into()), "alice", now);
+    v5.sign(&identity);
+    let mut team_release = Atag::annotated("team-release", links, store.make_text(TEAM_RELEASE_NOTES, Some("team")).unwrap(), "alice", now);
+    team_release.sign(&identity);
+    let imported = Atag {
+        kind: veil_core::tag_object::AtagKind::LightweightGit,
+        ..Atag::annotated("imported", links, Text::Plain(String::new()), "Git Hub <noreply@github.com>", now)
+    };
+    let (v5, team_release, imported) = (store.put_atag(&v5).unwrap(), store.put_atag(&team_release).unwrap(), store.put_atag(&imported).unwrap());
+    let mut tx = repo.transaction("format 5 fixture: links, gitlinks, annotated tags").unwrap();
+    tx.view.heads.insert(conflicted);
+    let tag_at = |target, cloak: Option<&str>, annotation| Tag {
+        target,
+        cloak: cloak.map(str::to_string),
+        annotation,
+    };
+    tx.view.tags.insert("links".into(), tag_at(links, None, None));
+    tx.view.tags.insert("link-conflict".into(), tag_at(conflicted, None, None));
+    tx.view.tags.insert("v5.0".into(), tag_at(links, None, Some(v5)));
+    tx.view.tags.insert("team-release".into(), tag_at(links, Some("team"), Some(team_release)));
+    tx.view.tags.insert("imported".into(), tag_at(links, None, Some(imported)));
+    tx.view.remote_release_tags.insert("github/imported".into(), imported);
+    tx.commit().unwrap();
+}
+
+/// Every object of `repo` that decodes (after opening, when it can), as
+/// bytes to search for plaintext.
+fn readable_bytes(repo: &Repo) -> Vec<(ObjectId, Vec<u8>)> {
+    let mut out = Vec::new();
+    for id in repo.store().list_objects().unwrap() {
+        let raw = repo.store().get_raw(&id).unwrap();
+        let mut bytes = raw.clone();
+        if let Ok(o) = repo.store().open(&id) {
+            bytes.extend(o.encode());
+        }
+        out.push((id, bytes));
+    }
+    out
+}
+
+#[test]
+fn format_5_fixture_holds_links_gitlinks_and_annotated_tags_for_their_audiences() {
+    use veil_core::tag_object::{AtagKind, AtagVerification};
+    let fx = Fixture::new(5);
+    let alice_key = fx.identity("alice").verifying_hex();
+    for who in ["alice", "bob", "dave"] {
+        let repo = fx.open("alice", Some(who));
+        let links = tag(&repo, "links");
+        let tree = repo.snapshot(&links).unwrap().tree;
+        let entry = |path: &str| lookup(repo.store(), &tree, &p(path)).unwrap().unwrap_or_else(|| panic!("{path}"));
+        for (path, kind, content) in [
+            ("links/readme", EntryKind::Symlink, LINK_TARGET),
+            ("links/words", EntryKind::Symlink, ABSOLUTE_TARGET),
+            ("secrets/current", EntryKind::Symlink, SEALED_TARGET),
+            ("vendor/sdk", EntryKind::Gitlink, PUBLIC_GITLINK),
+            ("secrets/private-sdk", EntryKind::Gitlink, SEALED_GITLINK),
+        ] {
+            let e = entry(path);
+            assert_eq!(e.kind, kind, "{who} {path}");
+            assert!(!e.executable);
+            assert_eq!(repo.store().read_entry(&e).unwrap(), content.as_bytes(), "{who} {path}");
+        }
+        assert!(!entry("secrets/current").visibility.is_public());
+        // `walk_files` and diffs see the links (carried by every algorithm).
+        let walked: Vec<String> = walk_files(repo.store(), &tree).unwrap().into_iter().map(|(p, _)| p.to_string()).collect();
+        assert!(walked.contains(&"links/readme".to_string()) && walked.contains(&"vendor/sdk".to_string()));
+        let main = tag(&repo, "main");
+        let changed: Vec<String> = veil_core::tree::diff_trees(repo.store(), Some(&repo.snapshot(&main).unwrap().tree), Some(&tree))
+            .unwrap()
+            .into_iter()
+            .map(|c| c.path.to_string())
+            .collect();
+        assert!(changed.contains(&"links/readme".to_string()), "{changed:?}");
+        // The link/file conflict.
+        let c = tag(&repo, "link-conflict");
+        assert_eq!(repo.snapshot(&c).unwrap().conflicts, vec!["links/both".to_string()]);
+        let ce = lookup(repo.store(), &repo.snapshot(&c).unwrap().tree, &p("links/both")).unwrap().unwrap();
+        let conflict = repo.store().conflict(&ce.id).unwrap();
+        assert_eq!(conflict.adds[0].as_ref().unwrap().kind, veil_core::object::TermKind::Symlink);
+        assert!(conflict.has_special_terms());
+        // Annotated tags: signed by alice, the sealed one readable here.
+        let v5 = repo.view().tags["v5.0"].clone();
+        let atag = repo.store().atag(&v5.annotation.unwrap()).unwrap();
+        assert!(matches!(atag.verify("v5.0", &v5.target), AtagVerification::Signed { ref key, .. } if *key == alice_key), "{who}");
+        let tr = repo.view().tags["team-release"].clone();
+        assert_eq!(tr.cloak.as_deref(), Some("team"));
+        let atag = repo.store().atag(&tr.annotation.unwrap()).unwrap();
+        assert!(atag.is_sealed());
+        assert_eq!(repo.store().read_text(&atag.message).as_deref(), Some(TEAM_RELEASE_NOTES), "{who}");
+        assert!(atag.verify("team-release", &tr.target).is_signed());
+        let imp = repo.store().atag(&repo.view().tags["imported"].annotation.unwrap()).unwrap();
+        assert_eq!(imp.kind, AtagKind::LightweightGit);
+        assert_eq!(imp.verify("imported", &links), AtagVerification::Unsigned);
+        assert_eq!(repo.view().remote_release_tags.get("github/imported"), repo.view().tags["imported"].annotation.as_ref());
+    }
+    // Carol (revoked) and an outsider: the links' names, never the sealed
+    // target or the sealed release notes.
+    let outsider = Repo::open(fx.backend("alice"), Some(Identity::generate("eve")), "eve").unwrap();
+    for (who, repo) in [("carol", fx.open("alice", Some("carol"))), ("eve", outsider)] {
+        let tree = repo.snapshot(&tag(&repo, "links")).unwrap().tree;
+        let e = lookup(repo.store(), &tree, &p("secrets/current")).unwrap().unwrap();
+        assert!(repo.store().read_entry(&e).is_err(), "{who} reads the sealed target");
+        let tr = repo.view().tags["team-release"].clone();
+        let atag = repo.store().atag(&tr.annotation.unwrap()).unwrap();
+        assert_eq!(repo.store().read_text(&atag.message), None, "{who}");
+    }
+    // The team remote has everything (ciphertext for the sealed parts).
+    let team = fx.open("team-remote", None);
+    assert!(team.view().tags["team-release"].annotation.is_some());
+    assert!(team.view().tags["v5.0"].annotation.is_some());
+    // The public mirror: the public release tags with their atags; never
+    // the cloaked tag, its atag, the sealed target or the sealed gitlink.
+    let mirror = fx.open("public-mirror", None);
+    assert!(!mirror.view().tags.contains_key("team-release"), "a cloaked annotated tag was published");
+    let v5 = mirror.view().tags["v5.0"].clone();
+    assert!(mirror.store().atag(&v5.annotation.unwrap()).unwrap().verify("v5.0", &v5.target).is_signed());
+    let alice = fx.open("alice", Some("alice"));
+    let sealed_atag = alice.view().tags["team-release"].annotation.unwrap();
+    assert!(!mirror.store().has(&sealed_atag), "the sealed atag reached the public mirror");
+    let tree = mirror.snapshot(&tag(&mirror, "links")).unwrap().tree;
+    for path in ["secrets/current", "secrets/private-sdk"] {
+        let e = lookup(mirror.store(), &tree, &p(path)).unwrap().unwrap();
+        assert!(!mirror.store().has(&e.id), "{path}'s sealed object reached the public mirror");
+    }
+    assert_eq!(read_str(&mirror, &tag(&mirror, "links"), "links/readme").as_deref(), Some(LINK_TARGET));
+    for (id, bytes) in readable_bytes(&mirror) {
+        for secret in [SEALED_TARGET, SEALED_GITLINK.trim(), TEAM_RELEASE_NOTES.trim()] {
+            assert!(!bytes.windows(secret.len()).any(|w| w == secret.as_bytes()), "{} holds {secret:?}", id.short());
+        }
+    }
+    for f in ["alice", "team-remote", "public-mirror"] {
+        let id = (f == "alice").then(|| fx.identity("alice"));
+        assert_fsck_clean(fx.backend(f), id);
+    }
+}
+
+/// What a format-4 vl cannot read is refused by a format-4 repository:
+/// every format-5 object of the fixture is `Unsupported` there (the only
+/// way to simulate the older build: its decoder refuses bit 7 and the
+/// term-kind bits, `newer_object_encodings_are_unsupported_not_corrupt`),
+/// and a push of one to a format-4 remote fails with the upgrade hint and
+/// records nothing; a format-4 clone cannot pull one either.
+#[test]
+fn format_5_objects_never_reach_a_format_4_repository() {
+    let f5 = Fixture::new(5);
+    let mut alice = f5.open("alice", Some("alice"));
+    let old: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+    let old_repo = Repo::init_bare_at(old.clone(), 4).unwrap();
+    let mut format5 = 0;
+    for id in alice.store().list_objects().unwrap() {
+        let raw = alice.store().get_raw(&id).unwrap();
+        if Object::min_repo_format(&raw) == 5 {
+            format5 += 1;
+            let err = old_repo.store().put_raw(&id, &raw).unwrap_err();
+            assert!(matches!(err, VeilError::Unsupported(ref m) if m.contains("vl upgrade")), "{err}");
+        }
+    }
+    // Trees with links (two directories and their parents), the conflict,
+    // three atags, and the trees above them.
+    assert!(format5 >= 6, "{format5} format-5 objects in the fixture");
+    // Writing them through the API is refused too.
+    let a = alice.store().atag(&alice.view().tags["v5.0"].annotation.unwrap()).unwrap();
+    assert!(matches!(old_repo.store().put_atag(&a), Err(VeilError::Unsupported(_))));
+    let links_tree = alice.snapshot(&tag(&alice, "links")).unwrap().tree;
+    let links_dir = lookup(alice.store(), &links_tree, &p("links")).unwrap().unwrap();
+    let t = (*alice.store().tree(&links_dir.id).unwrap()).clone();
+    assert!(matches!(old_repo.store().put_tree(&t), Err(VeilError::Unsupported(_))));
+    drop(old_repo);
+    let before = Repo::open(old.clone(), None, "remote").unwrap().view().clone();
+    for tags in [vec!["links".to_string()], vec!["v5.0".to_string()], vec!["link-conflict".to_string()]] {
+        let err = remote::push(&mut alice, old.clone(), false, &tags, false).unwrap_err();
+        assert!(matches!(err, VeilError::Unsupported(_)), "{tags:?}: {err}");
+        assert!(err.to_string().contains("vl upgrade"), "{err}");
+        assert_eq!(Repo::open(old.clone(), None, "remote").unwrap().view(), &before, "the refused push recorded something");
+    }
+    assert_fsck_clean(old.clone(), None);
+    // A view with an annotation cannot be recorded below format 5 either.
+    let mut r4 = Repo::open(old.clone(), None, "remote").unwrap();
+    let mut tx = r4.transaction("forge").unwrap();
+    tx.view.tags.insert(
+        "x1".into(),
+        veil_core::oplog::Tag {
+            target: r4_root(&old),
+            cloak: None,
+            annotation: Some(ObjectId([1; 32])),
+        },
+    );
+    assert!(matches!(tx.commit(), Err(VeilError::Unsupported(_))));
+    // A format-4 clone cannot pull them from the format-5 remote.
+    let mut clone = Repo::init_for_clone_at(Arc::new(MemoryBackend::new()), Some(f5.identity("bob")), "bob", 4).unwrap();
+    let err = remote::pull(&mut clone, "origin", f5.backend("team-remote")).unwrap_err();
+    assert!(matches!(err, VeilError::Unsupported(_)), "{err}");
+    // Upgraded to 5, the remote takes everything.
+    upgrade(old.clone(), None, &UpgradeOptions::default()).unwrap();
+    remote::push(&mut alice, old.clone(), false, &[], false).unwrap();
+    let r = Repo::open(old.clone(), None, "remote").unwrap();
+    assert!(r.view().tags["v5.0"].annotation.is_some());
+    assert_fsck_clean(old, None);
+}
+
+fn r4_root(b: &Arc<MemoryBackend>) -> ObjectId {
+    Repo::open(b.clone(), None, "remote").unwrap().root_id()
+}
+
+/// `vl upgrade` 4 → 5 rewrites nothing: every object, operation and the
+/// view keep their bytes; afterwards format-5 objects may be stored.
+#[test]
+fn upgrade_4_to_5_rewrites_nothing() {
+    let fx = Fixture::new(4);
+    let alice_dir = fx.root.join("alice");
+    let before_objects: Vec<ObjectId> = fx.open("alice", Some("alice")).store().list_objects().unwrap();
+    let before_view = fx.open("alice", Some("alice")).view().clone();
+    let ops_before: Vec<(PathBuf, Vec<u8>)> = veil_files(&alice_dir).into_iter().filter(|(p, _)| p.to_string_lossy().contains("/.veil/ops/")).collect();
+    let r = upgrade(fx.backend("alice"), Some(fx.identity("alice")), &UpgradeOptions::default()).unwrap();
+    assert_eq!((r.from, r.to), (4, 5));
+    assert!(r.notes.iter().any(|n| n.contains("symlinks")), "{:#?}", r.notes);
+    let repo = fx.open("alice", Some("alice"));
+    assert_eq!(repo.format(), 5);
+    assert_eq!(read_config(&*fx.backend("alice")).unwrap().min_vl.as_deref(), Some(veil_core::repo::min_vl_for_format(5)));
+    let after: Vec<ObjectId> = repo.store().list_objects().unwrap();
+    for id in &before_objects {
+        assert!(after.contains(id), "{} lost", id.short());
+    }
+    assert_eq!(repo.view(), &before_view, "the view changed");
+    let ops_after: Vec<(PathBuf, Vec<u8>)> = veil_files(&alice_dir).into_iter().filter(|(p, _)| p.to_string_lossy().contains("/.veil/ops/")).collect();
+    for op in &ops_before {
+        assert!(ops_after.contains(op), "operation {} rewritten", op.0.display());
+    }
+    // Idempotent, and now an atag can be stored.
+    let again = upgrade(fx.backend("alice"), Some(fx.identity("alice")), &UpgradeOptions::default()).unwrap();
+    assert_eq!(again.from, 5);
+    let a = veil_core::tag_object::Atag::annotated("v1", tag(&repo, "main"), Text::Plain("x".into()), "alice", 1);
+    repo.store().put_atag(&a).unwrap();
+    assert_fsck_clean(fx.backend("alice"), Some(fx.identity("alice")));
+    // The fixture's `upgraded/` set (format 4's alice after the upgrade).
+    let f5 = Fixture::new(5);
+    let up = Repo::open(f5.backend("upgraded/alice"), Some(f5.identity_at("upgraded", "alice")), "alice").unwrap();
+    assert_eq!(up.format(), 5);
+    assert!(read_str(&up, &tag(&up, "main"), "UPGRADED.md").is_some());
+}
+
+/// The `colocated` marker of `repo.json` exists only at format 5: an older
+/// vl refuses the directory by its format; this one refuses the marker in
+/// a repository that says format 4, and a Git directory outside the
+/// project.
+#[test]
+fn colocated_marker_needs_format_5() {
+    use veil_core::repo::Colocated;
+    let fs: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+    drop(Repo::init_for_clone_at(fs.clone(), None, "alice", 4).unwrap());
+    let cfg_path = p(".veil/repo.json");
+    let mut cfg: serde_json::Value = serde_json::from_slice(&fs.read(&cfg_path).unwrap()).unwrap();
+    cfg["colocated"] = serde_json::json!({"git_dir": ".git"});
+    fs.write(&cfg_path, &serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+    let err = Repo::open(fs.clone(), None, "alice").unwrap_err();
+    assert!(err.to_string().contains("format 5"), "{err}");
+    // At format 5 it opens and keeps the marker through a config rewrite.
+    cfg["format"] = 5.into();
+    fs.write(&cfg_path, &serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+    let mut repo = Repo::open(fs.clone(), None, "alice").unwrap();
+    assert_eq!(repo.config().colocated, Some(Colocated { git_dir: ".git".into() }));
+    repo.update_config(|_| Ok(())).unwrap();
+    assert_eq!(read_config(&*fs).unwrap().colocated, Some(Colocated { git_dir: ".git".into() }));
+    // Hostile Git directories.
+    for bad in ["", "/etc", "../x", "a/../../b", ".veil", ".VEIL/git", "a//b", "x\0y", "a\\b"] {
+        cfg["colocated"] = serde_json::json!({ "git_dir": bad });
+        fs.write(&cfg_path, &serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+        assert!(Repo::open(fs.clone(), None, "alice").is_err(), "{bad:?}");
+    }
+    // Unknown fields in the marker are refused (no ignorable fields).
+    cfg["colocated"] = serde_json::json!({ "git_dir": ".git", "follow": true });
+    fs.write(&cfg_path, &serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+    assert!(Repo::open(fs.clone(), None, "alice").is_err());
 }

@@ -115,11 +115,17 @@ repositories at format 1 or 2 (so that older vl can read them), see §5.
   | use | label | key | where |
   |---|---|---|---|
   | cloaked change descriptions | `<scope>#<key-id>` / `embargo/<id>` | scope / embargo key | `Text::Sealed` in snapshots |
+  | cloaked tag messages (format 5) | `<scope>#<key-id>` | scope generation key | `Text::Sealed` in annotated tags (`veil:atag`) |
   | older generation key | `prev-key:<scope>#<new-key-id>` | the new generation's key | ring `Rotation.previous` |
   | embargo key | `embargo-wrap:<id>` | scope key (generation in `scope_key`) | `EmbargoRecord.wrapped` |
   | device-local vault | `local` | `local_key` (C8) | `.veil/local/vault.sealed` |
   | team-vault entry (name and value) | `vault:<scope>#<key-id>` | scope generation key | `.veil/meta/vault/` records (C12) |
 
+* A cloaked tag message shares its label with cloaked descriptions under
+  the same key: a member could copy a sealed description into an atag of
+  their own (it then shows as that tag's message), but not into anyone
+  else's signed atag, whose signature covers the ciphertext. Both are text
+  for the same audience, so no content changes audience.
 * **Goal.** Ordinary nonce-based AEAD. The label is authenticated, so a
   sealed key cannot be presented as another role or for another embargo or
   generation. Scope names are `[a-z0-9_-]`, so a label prefix such as
@@ -237,9 +243,27 @@ Read forever; written only into format-1/2 repositories.
 
 `Ed25519(signing_key, SIG_PREFIX ‖ context ‖ 0x00 ‖ payload)`, contexts
 `snapshot`, `ring-change`, `embargo`, `embargo-release`, `member-binding`,
-`vault-entry` (see the domains table). Payloads are fixed encodings (FORMAT.md §2, "signed bodies never
+`vault-entry`, `tag` (see the domains table). Payloads are fixed encodings (FORMAT.md §2, "signed bodies never
 change"). What a valid signature *means* (who may sign what) is decided
 against the ring log (ARCHITECTURE §3).
+
+* **Annotated tags (`tag`, repository format 5).** The payload is the
+  32-byte *unsigned id* of the atag: the BLAKE3 id of its canonical
+  encoding (`veil:atag\n` ‖ JSON) with `signature` omitted, as for
+  snapshots. It therefore covers the tag's name, target, kind, message (as
+  stored: the ciphertext of a sealed one), tagger, time and Git payload.
+  Goals: a signature cannot be moved to another tag name or target (the
+  atag changes, the signature fails), and a view entry that names a
+  genuine atag under another name or target is reported as "unverified
+  (name mismatch / target mismatch)" before the signature is even looked
+  at (`Atag::verify`); a signature made in another context over the same
+  32 bytes (a snapshot signature) does not verify. *Limits:* a valid
+  signature proves only possession of the key; "verified" additionally
+  needs the key to be a member's in the ring, which the caller checks. An
+  older atag of the same name and target, signed then, stays valid: a
+  release tag is immutable, so replaying it restores what the signer
+  signed. A Git tag's own GPG or SSH signature, kept verbatim in
+  `git.raw`, is never verified by Veil and never reported as verified.
 
 ### C6. Ring log hash chain and genesis proof (all) — custom, kept
 
@@ -434,6 +458,7 @@ are distinct and pins their exact bytes.
 | `SIG_CONTEXT_EMBARGO_RELEASE` | `embargo-release` | Ed25519 context | C5, C7 |
 | `SIG_CONTEXT_MEMBER_BINDING` | `member-binding` | Ed25519 context | C4, C5 |
 | `SIG_CONTEXT_VAULT_ENTRY` | `vault-entry` | Ed25519 context | C5, C12 |
+| `SIG_CONTEXT_TAG` | `tag` | Ed25519 context (format 5: annotated tags, over `Atag::unsigned_id`) | C5 |
 | `WRAP_LABEL_PREFIX` | `wrap:` | AEAD associated data | C3, C3L |
 | `PREV_KEY_LABEL_PREFIX` | `prev-key:` | AEAD associated data | C2 |
 | `EMBARGO_WRAP_LABEL_PREFIX` | `embargo-wrap:` | AEAD associated data | C2, C7 |
@@ -470,7 +495,11 @@ Signature contexts never contain NUL and are followed by `0x00`, so
 | repository format | sealed objects | wrapped ring keys | ring format | identities created |
 |---|---|---|---|---|
 | 1, 2 | C1L `veil:seal` | C3L | 0/1 (legacy), 2 | (older vl) derived signing key |
-| 3 | C1 `veil:sea2` | C3 HPKE | 3 once it holds an HPKE wrap | independent signing key |
+| 3, 4, 5 | C1 `veil:sea2` | C3 HPKE | 3 once it holds an HPKE wrap | independent signing key |
+
+Format 5 adds no construction: a sealed symlink target or gitlink pointer
+is a sealed blob (C1), a cloaked tag message a C2 envelope, and an
+annotated tag's signature a C5 signature in the new context `tag`.
 
 * **Readers** read every construction forever: `veil:seal` and `veil:sea2`
   objects, legacy and HPKE wraps, legacy and new identity files.

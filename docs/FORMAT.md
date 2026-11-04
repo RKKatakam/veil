@@ -18,6 +18,7 @@ There is one **repository format**, a number in `.veil/repo.json`:
 | 2 | 1.0.0 | binary trees (§3) |
 | 3 | 1.0.0 | standard cryptography: AES-SIV sealed objects (`veil:sea2`), HPKE-wrapped ring keys (ring format 3); see [CRYPTO.md](CRYPTO.md) |
 | 4 | 1.0.0 | first-class conflicts: conflict objects (`veil:conf`, §3.6) and conflict entries in binary trees (flag bit 6) |
+| 5 | 1.0.0 | Git parity: symlink and gitlink tree entries (flag bit 7 and a kind byte, §3.7) and conflict terms (§3.6), annotated tags (`veil:atag`, §3.8; `Tag.annotation`, `View.remote_release_tags`), the `colocated` marker of `repo.json` |
 
 * `vl init` writes the newest format (`repo::REPO_FORMAT`). `vl clone` takes
   the format of its source, so that what the clone writes can be pushed
@@ -43,18 +44,19 @@ not be understood.
 
 | Path / structure | Encoding | Version | Synced? | Notes |
 |---|---|---|---|---|
-| `.veil/repo.json` | pretty JSON `{format, repo_id, remotes, min_vl?}` | `format` | no | written last by `init`, rewritten atomically by `upgrade` (commit point) |
+| `.veil/repo.json` | pretty JSON `{format, repo_id, remotes, min_vl?, colocated?}` | `format` | no | written last by `init`, rewritten atomically by `upgrade` (commit point). `colocated: {git_dir}` (format 5, `deny_unknown_fields`) marks a project directory colocated with Git; a repository below format 5 carrying it is refused as corrupt, and so is a `git_dir` that is empty, absolute, holds `..`, `\\` or NUL, or names `.veil`. An older vl refuses the whole directory by its format, so it never snapshots a colocated directory without its guards |
 | objects (§3) | `tag ‖ payload`, id = BLAKE3 | tag + encoding byte | yes | loose: `.veil/objects/ab/cdef…` (the canonical bytes) |
 | — blob | `veil:blob\n` ‖ bytes | none needed: any bytes are valid | yes | a new blob encoding would be a new tag |
 | — tree | `veil:tree\n` ‖ `{` JSON (v1) or `0x02` binary (v2) | encoding byte | yes | §3 |
 | — snapshot | `veil:snap\n` ‖ `{` JSON (v1) | encoding byte | yes | canonical (§3.3). `conflicts` lists conflicted paths; from format 4 it is an index the engine keeps (every conflict entry of the tree, plus marker conflicts carried from older formats), same field and encoding |
-| — conflict (format 4) | `veil:conf\n` ‖ `0x04` ‖ binary terms (§3.6) | encoding byte | yes | refused below format 4; plaintext (ids and labels only, never content) |
+| — conflict (format 4) | `veil:conf\n` ‖ `0x04` ‖ binary terms (§3.6) | encoding byte | yes | refused below format 4; plaintext (ids and labels only, never content); one with a symlink or gitlink term refused below format 5 |
+| — annotated tag (format 5) | `veil:atag\n` ‖ `{` canonical JSON (§3.8) | encoding byte | yes, with its tag | refused below format 5; plaintext but for a cloaked tag's message (sealed); never sent to a public remote when that message is sealed |
 | — sealed (formats 1–2) | `veil:seal\n` ‖ u16 **big-endian** label length ‖ label ‖ nonce[24] ‖ XChaCha20-Poly1305 ciphertext | tag | yes | the plaintext is another object's encoding; nonce derived from the plaintext (legacy, CRYPTO.md C1L); still written by format-1/2 repositories |
 | — sealed (format 3) | `veil:sea2\n` ‖ u16 **big-endian** label length ‖ label ‖ SIV[16] ‖ AES-SIV ciphertext | tag | yes | AES-SIV-CMAC-512 under `HKDF-SHA256(scope key)`, AD = `[label]` (CRYPTO.md C1); refused below format 3 |
 | — embargo wrapper | an ordinary tree with an `embargo` marker entry | as trees | yes | `embargo.rs`. Since BUG-104 the listed entries omit ids the fallback tree reaches (the pre-merge versions of changed files); same encoding, and every reader keeps those objects through the fallback, so no new version |
 | packs `.veil/objects/pack/pack-<sum>.pack` | `VEILPAK1` ‖ count u32 ‖ entries ‖ BLAKE3 | magic digit | no (sync sends canonical objects) | entry kinds 0 stored, 1 zstd, 2 delta; 3–15 reserved. A delta is a zstd frame read with its base as a raw-content dictionary; above 2 MiB of base plus object it is written with the base as a *prefix* and long-distance matching (BUG-290), with a window of at most 2^27, which every zstd decoder accepts by default: the same bytes to every reader, so no new version. Builds without the zstd C library (WASM, ARCHITECTURE.md §13) write kind 0 only and read 1 and 2 with a pure-Rust decoder (a delta's base given to it as a formatted dictionary: a fixed header, then the base); no new version either |
 | pack indexes `pack-<sum>.idx` | `VEILIDX1` ‖ count ‖ fanout ‖ ids ‖ offsets ‖ lengths ‖ pack sum ‖ BLAKE3 | magic digit | no | |
-| operations `.veil/ops/<id>` | JSON `Operation {parents, timestamp, user, description, view, manual_undo?, undo_of?, redo_of?}`, id = BLAKE3 of the bytes | repository format | no (device/repository-local) | `manual_undo` (absent unless set) marks an operation whose effect lies outside the view; `undo_of` / `redo_of` (absent unless set, hex operation ids) mark an undo and a redo, so repeated undos go further back (BUG-247). Older readers ignore all three (an older `vl undo` then treats an undo as a plain operation, as it always did); operations written before them have none, so no version bump or upgrade step |
+| operations `.veil/ops/<id>` | JSON `Operation {parents, timestamp, user, description, view, manual_undo?, undo_of?, redo_of?}`, id = BLAKE3 of the bytes | repository format | no (device/repository-local) | `manual_undo` (absent unless set) marks an operation whose effect lies outside the view; `undo_of` / `redo_of` (absent unless set, hex operation ids) mark an undo and a redo, so repeated undos go further back (BUG-247). Older readers ignore all three (an older `vl undo` then treats an undo as a plain operation, as it always did); operations written before them have none, so no version bump or upgrade step. Format 5: a view's tags may carry `annotation` (hex id of a `veil:atag`) and the view `remote_release_tags` (`"<remote>/<name>"` → atag id); both omitted when absent or empty, so earlier views keep their bytes, and an operation using either is refused below format 5 (`OpStore::put`), so a format-4 vl never meets one (it refuses the repository and the remote by format before reading a view). |
 | `.veil/op_head` | hex id | fixed | no | |
 | pruned-ops list `.veil/ops_pruned` | one hex id per line | fixed | no | append-only |
 | key rings `.veil/meta/keyrings/<scope>.json` | pretty JSON `KeyRing` | `format` (0/1 legacy, 2 signed log, 3 signed log that may hold HPKE-wrapped keys) | yes | readers reject `format > 3` (no keys, a warning on sync); a ring with an HPKE wrap must say 3, and a format-1/2 repository refuses to store it |
@@ -84,8 +86,9 @@ not be understood.
 Signed bodies have their own fixed encodings and must never change: the ring
 change body (`RingChange::signing_body`), the embargo body
 (`EmbargoRecord::body`), the team-vault record body
-(`VaultRecord::signing_body`, pinned by a unit test) and the snapshot's *unsigned id* (the id of its
-encoding without `signature`). A format change that touches a signed type
+(`VaultRecord::signing_body`, pinned by a unit test), the snapshot's *unsigned id* (the id of its
+encoding without `signature`) and, from format 5, the annotated tag's unsigned id
+(`Atag::unsigned_id`, context `tag`). A format change that touches a signed type
 needs a new signing context.
 
 ## 3. Objects
@@ -97,7 +100,7 @@ tag is the **encoding version**:
 
 | byte | meaning |
 |---|---|
-| `{` (0x7B) | format-1 JSON |
+| `{` (0x7B) | format-1 JSON (trees, snapshots); canonical JSON (annotated tags, format 5) |
 | 0x02 | binary tree (format 2) |
 | 0x03–0x1F | reserved for later versions → `Unsupported` ("needs a newer vl") |
 | anything else | corrupt |
@@ -109,7 +112,9 @@ A tag shaped like an object tag (`veil:` + four lowercase letters or digits
 
 ```text
 tree    = 0x02 | count uvarint (>= 1) | entry{count}
-entry   = name_len uvarint | name (UTF-8) | flags u8 | id [32]
+entry   = name_len uvarint | name (UTF-8) | flags u8
+          | kind u8                         if flags.KIND (format 5)
+          | id [32]
           | size uvarint                    if flags.SIZE    (then size != 0)
           | label_len uvarint | label UTF-8  if tier != public (scope / embargo id)
           | fallback [32]                   if flags.FALLBACK
@@ -118,7 +123,10 @@ flags   = bit 0 DIR · bit 1 EXECUTABLE · bit 2 SIZE · bit 3 FALLBACK
           bit 6 CONFLICT (format 4): `id` names a conflict object (§3.6);
                 every other bit must be clear (a conflict entry has no
                 size, executable bit, label or fallback of its own)
-          bit 7 reserved
+          bit 7 KIND (format 5): a kind byte follows the flags,
+                1 symlink, 2 gitlink (0 and 3–255 `Unsupported`);
+                DIR, EXECUTABLE and CONFLICT must be clear, SIZE,
+                FALLBACK and the tier keep their meaning (§3.7)
 uvarint = unsigned LEB128, shortest form
 ```
 
@@ -137,13 +145,16 @@ uvarint = unsigned LEB128, shortest form
   every repository of every format, and unrelated histories can still meet.
 * **Size.** On the 20k-file benchmark layout the 1,201 trees take 882 KiB
   instead of 2,449 KiB.
-* A reserved tier or flag bit is `Unsupported`. (Before format 4, bit 6
-  was reserved: a format-3 reader refuses a conflict entry as
-  `Unsupported`, never misreading it.)
+* A reserved tier, or an unknown kind byte, is `Unsupported`. (Before
+  format 4, bit 6 was reserved: a format-3 reader refuses a conflict entry
+  as `Unsupported`, never misreading it; before format 5, bit 7 was: a
+  format-4 reader refuses a symlink or gitlink entry the same way.)
 * In JSON (format-1) trees a conflict entry is `"kind":"conflict"` with no
   other optional field. Only a format-4 repository may store a tree holding
   one, whatever its encoding (`Object::min_repo_format` decodes trees to
-  check), and a format-4 repository writes binary trees anyway.
+  check), and a format-4 repository writes binary trees anyway. Likewise
+  `"kind":"symlink"` and `"kind":"gitlink"` (never `executable`) need
+  format 5.
 
 ### 3.3 Snapshots
 
@@ -180,18 +191,23 @@ work, which the engine avoids:
   set by `Repo::open` from `repo.json`) and its `put_raw` **refuses** a
   binary tree in a format-1 repository, and an AES-SIV sealed object
   (`veil:sea2`) in a format-1 or 2 one (`Object::min_repo_format`,
-  `check_storable`; the pack sink of incremental sync calls it too), and a
-  conflict object or a tree holding a conflict entry below format 4. The
+  `check_storable`; the pack sink of incremental sync calls it too), a
+  conflict object or a tree holding a conflict entry below format 4, and
+  below format 5 a tree holding a symlink or gitlink, a conflict with
+  such a term and an annotated tag (`ObjectStore::put` checks the same on
+  the value, so engine code cannot write them either). The
   keychain follows the same format: it wraps keys with HPKE only from
   format 3 and refuses to store a format-3 ring below it. Push and pull copy objects with
   `put_raw`, so a format-1 remote or clone can never receive an object an
   older vl could not read: the push fails with "upgrade it with `vl upgrade
   --remote <name>`", and nothing is recorded.
 * `fsck` reports a binary tree in a format-1 repository, an AES-SIV object
-  or an HPKE ring in a format-1/2 repository, and a conflict object or
-  conflict entry below format 4, as corruption, and a repository format
-  newer than it knows. It checks every version a conflict names as it
-  checks a file.
+  or an HPKE ring in a format-1/2 repository, a conflict object or
+  conflict entry below format 4, and any format-5 object or view field
+  below format 5, as corruption, and a repository format newer than it
+  knows. It checks every version a conflict names as it checks a file, a
+  symlink or gitlink's object as a file's (and, when readable, its
+  content: §3.7), and every annotated tag a view names (§3.8).
 * `Object::encode()` is the format-1 encoding (unchanged API);
   `Object::encode_with(TreeEncoding)` and `ObjectStore::encode` give the
   encoding of a particular repository.
@@ -211,7 +227,9 @@ term     = 0x00                                    (no file)
            | label_len uvarint | label UTF-8       if tier != public
            | fallback [32]                         if flags.FALLBACK
 flags    = bit 0 PRESENT (set) · bit 1 EXECUTABLE · bit 2 SIZE ·
-           bit 3 FALLBACK · bits 4–5 tier (as in trees) · bits 6–7 reserved
+           bit 3 FALLBACK · bits 4–5 tier (as in trees) ·
+           bits 6–7 term kind (format 5): 0 file, 1 symlink, 2 gitlink,
+           3 reserved (`Unsupported`); EXECUTABLE clear unless a file
 ```
 
 * A term is what a file entry holds, without the name: each version keeps
@@ -227,6 +245,62 @@ flags    = bit 0 PRESENT (set) · bit 1 EXECUTABLE · bit 2 SIZE ·
   merely redundant. A reserved flag bit or tier, or a version byte from
   the reserved range, is `Unsupported`.
 * The tree entry naming it has kind `conflict` (flag bit 6) and nothing else.
+* **Format 5:** a term may be a symlink or a gitlink (a link/file or
+  link/link conflict). Before format 5 bits 6–7 were reserved, so a
+  format-4 reader refuses such a term as `Unsupported`; a conflict with one
+  needs format 5. Link targets are never merged by line: two different
+  targets are a conflict, and a conflict with a link term is never written
+  out as a file of markers (a target would become file content).
+
+### 3.7 Symlinks and gitlinks (format 5)
+
+* **Symlink** (`EntryKind::Symlink`, kind byte 1): `id` names the blob of
+  the link's *target bytes* (UTF-8, no NUL, at most 4096 bytes; `size` is
+  its length), plaintext or sealed exactly like file content under the
+  policy of the link's own path. Never executable; a fallback is allowed.
+* **Gitlink** (`EntryKind::Gitlink`, kind byte 2): a Git submodule pointer;
+  `id` names the blob `"<40 or 64 lowercase hex digits>\n"`, plaintext or
+  sealed like a file. Never executable, never descended into.
+* Both are leaves: `walk_files` and `diff_trees` list them, `lookup` never
+  goes through them, and sync, gc, fsck, `push --dry-run` and embargo
+  sealing treat their object as a file's (sealed, withheld, listed,
+  published by the same rules). fsck warns about a readable target or
+  pointer that breaks the rules above.
+* Until the working-copy and Git-bridge streams implement them, checkout
+  leaves them out (`CheckoutReport::failed`, "cannot check out or record
+  yet", removing a file version it had written), the builder carries them
+  unchanged, tree views and mounts do not serve them, `vl cat` refuses
+  them, and the Git export refuses a public one (a sealed one is omitted
+  like a sealed file).
+
+### 3.8 Annotated tags (`veil:atag`, format 5)
+
+```text
+atag = "veil:atag\n" ‖ canonical JSON, exactly what serde_json writes for
+  {"name": tag name, "target": hex snapshot id,
+   "kind": "annotated" | "lightweight-git",
+   "message": {"plain": text} | {"sealed": envelope},
+   "tagger": text, "timestamp": ms since the epoch,
+   "signature"?: {"signer", "key", "sig"},
+   "git"?: {"oid": lowercase hex 40|64, "raw": lowercase hex}}
+```
+
+* Canonical (a re-encoding must give the same bytes) and closed: unknown
+  fields are refused. `name` passes the tag-name rules; the message is at
+  most 1 MiB, the tagger at most 1 KiB without control characters, `raw`
+  at most 1 MiB + 64 KiB; a lightweight Git tag has no `git` object.
+* `signature`: Ed25519 over the atag's unsigned id, context `tag`
+  (CRYPTO.md C5). A view's `Tag.annotation` must name an atag of the same
+  `name` and `target` (`Atag::verify`): a push refuses a tag whose
+  annotation is missing, not an atag, or names another tag or target, and
+  a pull receives such a tag without its annotation (with a warning).
+* A cloaked tag's message is sealed under its scope (CRYPTO.md C2). Push
+  sends an atag only with its tag, after the tag's checks (cloaked tags
+  and tags on embargo-withheld history stay here, their atags with them),
+  and never sends an atag with a sealed message to a public remote,
+  whichever tag names it.
+* `View.remote_release_tags` names atags of Git release tags (the Git
+  bridge). gc keeps every atag a retained view names and its target.
 
 ## 4. Rules for changing a format
 
@@ -324,6 +398,22 @@ still waiting for its admin.
 * **Downgrades** are not supported: an older vl refuses a format-2
   repository with a message naming the release it needs.
 
+### Format 5 (Git parity)
+
+* **Nothing is rewritten** (`4 → 5` has no step): a format-4 snapshot never
+  holds a link (links were never recorded), so every object, operation,
+  id and signature stays as it is. `repo.json` gets the new format and
+  `min_vl`.
+* **Remotes and clones.** A format-4 remote or clone refuses symlink and
+  gitlink trees, link-term conflicts and annotated tags ("upgrade it with
+  `vl upgrade --remote <name>`"), and its operation store refuses a view
+  naming one; an older vl refuses a format-5 repository or remote outright
+  (so it never drops `Tag.annotation` by rewriting a view). The order for
+  a team is the usual one.
+* **Colocated directories** carry the `colocated` marker only at format 5:
+  an older vl refuses the directory, and never snapshots it without the
+  Git-side guards.
+
 ### Format 4 (first-class conflicts)
 
 * **Decision: conflicts recorded before the upgrade stay as they are.** A
@@ -376,7 +466,10 @@ regenerated (from format 3 on, `generate.sh <vl> <out> <format-(N-1)>`, which
 adds `home-dave`, a legacy identity granted to the scope, and `upgraded/`,
 the previous set after `vl upgrade` with one more commit pushed, mixing old
 and new constructions; from format 4 also a merge with conflict entries at
-the tag `conflicted`, one resolved with `vl resolve`): three identities (`home-alice`, `home-bob`, `home-carol`), the
+the tag `conflicted`, one resolved with `vl resolve`; from format 5 also
+symlinks and gitlinks, public and sealed, a link/file conflict and
+annotated tags, written through the engine by `write_format_5_extras` in
+`format_compat.rs`): three identities (`home-alice`, `home-bob`, `home-carol`), the
 project `alice/` (packed and loose objects, a cloaked directory, a ring with
 a grant, a revocation and a rotation (key generation 2), a released and an
 unreleased embargo, a cloaked tag, a vault, gc pending list, pruned ops,
@@ -403,7 +496,13 @@ this build:
 * reads the format-4 set's conflict entries as each identity's audience
   allows (members both sides, the revoked member and the public mirror's
   readers neither), never lets a conflict reach a format-3 repository, and
-  upgrades 3→4 keeping marker conflicts and every id.
+  upgrades 3→4 keeping marker conflicts and every id;
+* reads the format-5 set's links, gitlinks, link conflict and annotated
+  tags as each identity's audience allows, verifies the signed atags,
+  finds no sealed target, pointer or tag message on the public mirror,
+  never lets a format-5 object reach a format-4 repository (push, pull,
+  API), upgrades 4→5 rewriting nothing, and refuses the `colocated`
+  marker below format 5.
 
 Two checks make format changes impossible to miss:
 
@@ -412,7 +511,9 @@ Two checks make format changes impossible to miss:
 * `encodings_match_the_golden_file` pins the bytes of every object encoding
   in `tests/fixtures/encodings.txt` (blob, empty tree, JSON and binary
   trees, root and full snapshots with a signature, sealed, sealed with
-  AES-SIV, a conflict object, a binary tree with a conflict entry). Changing what is
+  AES-SIV, a conflict object, a binary tree with a conflict entry, binary
+  trees with a symlink and with a gitlink, a conflict with a symlink term,
+  and annotated tags: signed, sealed, imported from Git). Changing what is
   written fails until the change becomes a new format; then new lines are
   appended (`VEIL_BLESS_ENCODINGS=1`), never edited.
 

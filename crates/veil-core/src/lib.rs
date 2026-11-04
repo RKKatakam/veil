@@ -83,6 +83,7 @@ pub mod secrets;
 pub mod selection;
 pub mod statcache;
 pub mod store;
+pub mod tag_object;
 pub mod team_vault;
 pub mod transaction;
 pub mod textmerge;

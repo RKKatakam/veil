@@ -688,6 +688,32 @@ fn apply_changes(
             report.nested.push((c.path.clone(), repo));
             continue;
         }
+        if new.kind.is_special() || special_conflict(store, new) {
+            // Format 5: symlinks and gitlinks are not materialised yet (the
+            // working-copy stream adds them). The path is left out and
+            // reported as failed, which records it as never materialised,
+            // so the builder carries the entry instead of recording a
+            // deletion. The previous version, if checkout wrote it, is
+            // removed, or the next snapshot would revert the link to it.
+            if c.old.is_some() && fs.metadata(&c.path)?.is_some_and(|m| m.kind == NodeKind::File) {
+                if holds(store, fs, &c.path, c.old.as_ref(), cache.as_deref())? {
+                    fs.remove_file(&c.path)?;
+                    forget(&mut cache, &c.path);
+                    report.removed += 1;
+                    prune_empty_parents(fs, &c.path)?;
+                } else {
+                    report.kept_local.push(c.path.clone());
+                }
+            }
+            let kind = if new.kind.is_special() { new.kind } else { EntryKind::Symlink };
+            let why = kind.not_supported_yet(c.path.as_str()).to_string();
+            let why = match new.kind {
+                EntryKind::Conflict => why.replace(" is a symlink entry", " is a conflict with a symlink or gitlink side"),
+                _ => why,
+            };
+            report.failed.push((c.path.clone(), why));
+            continue;
+        }
         // A file where the tree has a directory (a quarantined or untracked
         // `cfg` where the tree has `cfg/settings.json`): checkout removed
         // every file `from` put there, so this one is the user's. Keep it.
@@ -772,6 +798,12 @@ fn apply_changes(
         }
     }
     Ok(report)
+}
+
+/// A conflict entry with a symlink or gitlink term (format 5), which is
+/// not materialised yet.
+pub(crate) fn special_conflict(store: &ObjectStore, e: &TreeEntry) -> bool {
+    e.kind == EntryKind::Conflict && store.conflict(&e.id).is_ok_and(|c| c.has_special_terms())
 }
 
 /// A write or removal of `path` failed. A filesystem that refuses this one

@@ -589,7 +589,7 @@ fn update_tag(
                 ));
                 return Ok(());
             }
-            tx.view.tags.insert(branch.to_string(), Tag { target: sid, cloak: None });
+            tx.view.tags.insert(branch.to_string(), Tag::new(sid, None));
             report.tags_updated.push((branch.to_string(), sid));
         }
         Some(t) if t.target == sid => {}
@@ -597,10 +597,7 @@ fn update_tag(
             if tx.repo().is_ancestor(&t.target, &sid)? {
                 tx.view.tags.insert(
                     branch.to_string(),
-                    Tag {
-                        target: sid,
-                        cloak: t.cloak,
-                    },
+                    Tag::new(sid, t.cloak),
                 );
                 report.tags_updated.push((branch.to_string(), sid));
             } else if !tx.repo().is_ancestor(&sid, &t.target)? {

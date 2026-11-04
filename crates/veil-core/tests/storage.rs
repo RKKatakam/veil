@@ -90,7 +90,7 @@ fn assert_history_intact(repo: &Repo) {
         for e in &t.entries {
             match e.kind {
                 EntryKind::Dir => trees.push(e.id),
-                EntryKind::File => {
+                EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink => {
                     for id in std::iter::once(e.id).chain(e.fallback) {
                         let raw = store
                             .get_raw(&id)
@@ -433,7 +433,7 @@ fn gc_keeps_embargo_fallbacks_that_are_the_only_reference() {
         .unwrap();
     tx.view
         .tags
-        .insert("main".into(), veil_core::oplog::Tag { target: s, cloak: None });
+        .insert("main".into(), veil_core::oplog::Tag::new(s, None));
     tx.commit().unwrap();
 
     let r = gc(&mut repo, &now_gc()).unwrap();

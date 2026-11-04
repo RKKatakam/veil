@@ -170,7 +170,7 @@ pub fn evil_remote_on_disk(dest: &Path, description: &str, tags: &[&str], build:
         .unwrap();
     let mut tx = r.transaction("evil").unwrap();
     for t in tags {
-        tx.view.tags.insert(t.to_string(), Tag { target: s, cloak: None });
+        tx.view.tags.insert(t.to_string(), Tag::new(s, None));
     }
     tx.view.heads.insert(s);
     tx.commit().unwrap();

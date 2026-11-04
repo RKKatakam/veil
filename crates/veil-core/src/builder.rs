@@ -565,7 +565,7 @@ pub fn object_visibility(raw: &[u8]) -> Option<Visibility> {
 /// for. A tree entry whose label disagrees with its object is hostile (or
 /// corrupt) and must never decide how new content is sealed.
 pub fn verify_sealing(store: &ObjectStore, e: &TreeEntry) -> Result<Sealing> {
-    if e.kind != EntryKind::File {
+    if !e.kind.holds_blob() {
         return Ok(Sealing::Verified);
     }
     let raw = match store.get_raw(&e.id) {
@@ -1131,6 +1131,11 @@ impl Builder<'_> {
                         Ok(Err(Some(e.clone())))
                     }
                 }
+                // Format 5: checkout does not materialise symlinks and
+                // gitlinks yet, so their absence is never a deletion: they
+                // are carried unchanged (the working-copy stream records
+                // and removes them).
+                EntryKind::Symlink | EntryKind::Gitlink => Ok(Err(Some(e.clone()))),
                 EntryKind::Dir => match b.store.tree(&e.id) {
                     Ok(tree) if depth < MAX_TREE_DEPTH => Ok(Ok(Frame {
                         entry: e.clone(),
@@ -1231,6 +1236,12 @@ impl Builder<'_> {
             }
             Err(e) => return Err(e),
         };
+        if conflict.has_special_terms() {
+            // Format 5: a conflict with a symlink or gitlink side is not
+            // materialised yet, so whatever is at its path is not a copy of
+            // it: carried unchanged.
+            return Ok(Some(ce.clone()));
+        }
         let meta = match self.fs.metadata(path) {
             Ok(m) => m,
             Err(e) => return self.unreadable(path, e, Some(ce)),
@@ -1319,6 +1330,7 @@ impl Builder<'_> {
                 let term = |bytes: &[u8], exec: bool| -> Result<Option<crate::object::ConflictTerm>> {
                     let id = self.store.store_file(bytes, &r.visibility)?;
                     Ok(Some(crate::object::ConflictTerm {
+                        kind: crate::object::TermKind::File,
                         id,
                         size: bytes.len() as u64,
                         executable: exec,

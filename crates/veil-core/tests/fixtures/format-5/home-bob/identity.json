@@ -1,0 +1,8 @@
+{
+  "format": 2,
+  "name": "bob",
+  "public": "veil1afd1f54ce3e1df10db5ba0115e243d40dddd9daf366446184abd61182ad3af5d",
+  "signing": "6b6d532cf0e1d97af26d7319984090928ca337fb6e72b90b3f8762793ae61584",
+  "encryption_secret": "2fb8f5f47aeb7f7d2a8ae25e77e35a59efe25ca78631bf58f693f9409ff7edc9",
+  "signing_secret": "fc038569bcec6bede5de3b0a8f0afb7819510767fc14144ed1e8a88fc9a2dbdc"
+}

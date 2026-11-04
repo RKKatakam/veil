@@ -41,8 +41,10 @@ pub fn lookup(store: &ObjectStore, root: &ObjectId, path: &VPath) -> Result<Opti
 /// the host's `PATH_MAX`. Git's `core.maxTreeDepth` serves the same purpose.
 pub const MAX_TREE_DEPTH: usize = 1024;
 
-/// All file entries below `root` (files and conflicts), in tree order
-/// (depth first, entries sorted by name within a directory).
+/// All leaf entries below `root` (files and conflicts, and in format 5
+/// symlinks and gitlinks), in tree order (depth first, entries sorted by
+/// name within a directory). Callers that read content check the kind:
+/// a symlink's or gitlink's blob is not file content.
 pub fn walk_files(store: &ObjectStore, root: &ObjectId) -> Result<Vec<(VPath, TreeEntry)>> {
     let mut out = Vec::new();
     // Explicit stack: tree depth is attacker-controlled.
@@ -55,7 +57,7 @@ pub fn walk_files(store: &ObjectStore, root: &ObjectId) -> Result<Vec<(VPath, Tr
         *i += 1;
         let p = dir.join(&e.name);
         match e.kind {
-            EntryKind::File | EntryKind::Conflict => out.push((p, e.clone())),
+            EntryKind::File | EntryKind::Conflict | EntryKind::Symlink | EntryKind::Gitlink => out.push((p, e.clone())),
             EntryKind::Dir => {
                 let child = store.tree(&e.id)?;
                 stack.push((p, child, 0));
@@ -82,7 +84,8 @@ impl TreeChange {
     }
 }
 
-/// File-level differences between two trees. Identical subtrees are skipped
+/// Leaf-level differences between two trees (files, conflicts, and in
+/// format 5 symlinks and gitlinks). Identical subtrees are skipped
 /// by id without being loaded.
 pub fn diff_trees(store: &ObjectStore, from: Option<&ObjectId>, to: Option<&ObjectId>) -> Result<Vec<TreeChange>> {
     let mut out = Vec::new();
@@ -155,8 +158,9 @@ fn diff_dir(store: &ObjectStore, a: Option<Arc<Tree>>, b: Option<Arc<Tree>>, out
         let path = f.dir.join(name);
         let da = load_dir(store, ea.as_ref())?;
         let db = load_dir(store, eb.as_ref())?;
-        let fa = ea.filter(|e| e.kind.is_file_like());
-        let fb = eb.filter(|e| e.kind.is_file_like());
+        // Every leaf: files, conflicts, and (format 5) symlinks and gitlinks.
+        let fa = ea.filter(|e| e.kind != EntryKind::Dir);
+        let fb = eb.filter(|e| e.kind != EntryKind::Dir);
         let file_change = (fa.is_some() || fb.is_some()).then(|| TreeChange {
             path: path.clone(),
             old: fa,
@@ -208,6 +212,7 @@ impl StorageBackend for TreeView {
     fn read(&self, path: &VPath) -> Result<Vec<u8>> {
         match self.entry(path)? {
             Some(e) if e.kind.is_file_like() => crate::conflict::read_file_like(&self.store, &e),
+            Some(e) if e.kind.is_special() => Err(e.kind.not_supported_yet(path.as_str())),
             Some(_) => Err(VeilError::InvalidPath(format!("{path} is a directory"))),
             None => Err(VeilError::NotFound(path.to_string())),
         }
@@ -239,13 +244,15 @@ impl StorageBackend for TreeView {
                 .tree(&e.id)?
                 .entries
                 .iter()
-                // unreadable entries are invisible in a materialised view
-                .filter(|c| self.store.entry_readable(c))
+                // unreadable entries are invisible in a materialised view,
+                // and so are format-5 symlinks and gitlinks, which are not
+                // materialised yet (the builder carries them)
+                .filter(|c| !c.kind.is_special() && !crate::checkout::special_conflict(&self.store, c) && self.store.entry_readable(c))
                 .map(|c| DirEntry {
                     name: c.name.clone(),
                     kind: match c.kind {
                         EntryKind::Dir => NodeKind::Dir,
-                        EntryKind::File | EntryKind::Conflict => NodeKind::File,
+                        EntryKind::File | EntryKind::Conflict | EntryKind::Symlink | EntryKind::Gitlink => NodeKind::File,
                     },
                 })
                 .collect()),
@@ -260,11 +267,15 @@ impl StorageBackend for TreeView {
         Ok(Some(match e.kind {
             EntryKind::Dir => Metadata::unstamped(NodeKind::Dir, e.size, e.executable),
             EntryKind::File => Metadata::unstamped(NodeKind::File, e.size, e.executable),
+            // Not materialised yet (see `list_dir`).
+            EntryKind::Conflict if crate::checkout::special_conflict(&self.store, &e) => return Ok(None),
             // What a reader of the view gets is the materialised conflict.
             EntryKind::Conflict => {
                 let m = crate::conflict::materialize_entry(&self.store, &e, crate::conflict::Audience::Reader)?;
                 Metadata::unstamped(NodeKind::File, m.content.len() as u64, m.executable)
             }
+            // Not materialised yet (see `list_dir`).
+            EntryKind::Symlink | EntryKind::Gitlink => return Ok(None),
         }))
     }
 

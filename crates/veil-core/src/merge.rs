@@ -309,6 +309,13 @@ fn merge_dir(
             } else if mode == Mode::VirtualBase {
                 // Modify/delete or file/directory: the base's version.
                 be.cloned()
+            } else if oe.is_some_and(|e| e.kind != EntryKind::Dir) && te.is_some_and(|e| e.kind != EntryKind::Dir) {
+                // Two different versions where one is a symlink or gitlink
+                // (format 5) and no conflict entry can be recorded here:
+                // our side as it is, flagged. A link target never becomes
+                // a file of markers.
+                conflicts.push(path.clone());
+                oe.cloned()
             } else if let (Some(oe), Some(te)) = (oe, te) {
                 // File/directory conflict (BUG-243): both sides survive. The
                 // directory keeps the name; the file moves aside to
@@ -399,6 +406,11 @@ fn merge_terms(
 /// never moved between scopes). `None`: a real conflict.
 fn resolve_by_content(store: &ObjectStore, path: &VPath, name: &str, m: &Merge) -> Result<Option<TreeEntry>> {
     if m.adds.iter().any(Option::is_none) || (m.adds.len() > 2 && m.removes.iter().any(Option::is_none)) {
+        return Ok(None);
+    }
+    // Link targets and gitlink pointers are never merged line by line: two
+    // different ones are a conflict (format 5).
+    if m.adds.iter().chain(&m.removes).flatten().any(|t| t.kind != crate::object::TermKind::File) {
         return Ok(None);
     }
     let entry = |t: &Term| t.as_ref().map(|t| t.entry(name));

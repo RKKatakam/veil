@@ -10,6 +10,7 @@
 //! | released embargoed objects      | ✓           | ✓             |
 //! | merged-in history of an unreleased embargoed merge | cloaked under the embargo's scope, not building on withheld history | ✗ |
 //! | cloaked tags                    | ✓           | ✗             |
+//! | annotated tag objects (`veil:atag`, format 5) | ✓ with their tag | ✓ with their tag, never one with a sealed message |
 //! | key rings                       | ✓           | ✗ (they name the members) |
 //! | embargo records                 | ✓           | ✓ (encrypted, signed) |
 //! | team vault (`vl secret --scope`) | ✓ (sealed, signed records) | ✗ |
@@ -427,6 +428,11 @@ struct Transfer<'a> {
 
 impl Transfer<'_> {
     fn allowed(&self, raw: &[u8]) -> bool {
+        // An annotated tag's message is sealed for a cloaked tag: such an
+        // atag never reaches a public remote, whichever route names it.
+        if self.public && raw.starts_with(crate::object::ATAG_TAG) {
+            return matches!(Object::decode(raw), Ok(Object::Atag(a)) if !a.is_sealed());
+        }
         match Object::sealed_scope(raw) {
             None => true,
             Some(scope) if scope == LOCAL_SCOPE => false,
@@ -562,7 +568,10 @@ impl Transfer<'_> {
             // object (`allowed`), so a public receiver never gets a sealed
             // side, only the conflict naming it.
             Object::Conflict(c) => (false, c.referenced_ids().into_iter().map(|id| (id, path.to_string())).collect()),
-            Object::Blob(_) | Object::Sealed(_) => (false, Vec::new()),
+            // An annotated tag is sent with its tag ([`copy_annotations`]),
+            // whose target went through the tag checks; nothing below it
+            // is reached through it.
+            Object::Blob(_) | Object::Sealed(_) | Object::Atag(_) => (false, Vec::new()),
         }))
     }
 }
@@ -1453,6 +1462,10 @@ pub fn push_with(
             report = push_incremental(local, &tx.view.refs(), &dst, ids, public, report, None)?;
         }
     }
+    // Annotated tag objects of the tags sent (format 5): after the history
+    // they point at, before the operation that names them.
+    let annotations: Vec<ObjectId> = selected.iter().filter_map(|(_, t)| t.annotation).collect();
+    copy_annotations(local.store(), tx.repo().store(), &annotations, public)?;
     // Releases staged by `vl embargo release` reach the record only now,
     // as it leaves: before this, `vl undo` could still take them back
     // (BUG-109). Objects sealed under their keys may already have been
@@ -1460,7 +1473,13 @@ pub fn push_with(
     report.releases_published = local.keys().publish_staged_releases()?;
     sync_meta(local.keys(), tx.repo().keys(), public, false, &mut report.warnings)?;
     for (name, tag) in selected {
-        if tx.view.tags.get(&name).is_some_and(|existing| existing.target == tag.target) {
+        // A push never strips the annotation the remote's tag has for the
+        // same target (a clone that has not received it yet).
+        let existing = tx.view.tags.get(&name).cloned();
+        let annotation = tag
+            .annotation
+            .or(existing.as_ref().filter(|e| e.target == tag.target).and_then(|e| e.annotation));
+        if existing.as_ref().is_some_and(|e| e.target == tag.target && e.annotation == annotation) {
             report.remote_tags.push((name, tag.target));
             continue;
         }
@@ -1474,6 +1493,7 @@ pub fn push_with(
             Tag {
                 target: tag.target,
                 cloak,
+                annotation,
             },
         );
         report.remote_tags.push((name.clone(), tag.target));
@@ -1506,6 +1526,10 @@ pub(crate) fn sendable_tags(
                 .push((name.clone(), "cloaked tag is never pushed to a public remote".into()));
             continue;
         }
+        if let Some(why) = annotation_problem(local.store(), name, tag, public)? {
+            report.tags_skipped.push((name.clone(), why));
+            continue;
+        }
         selected.push((name.clone(), tag.clone()));
     }
     for t in only_tags {
@@ -1524,6 +1548,113 @@ pub(crate) fn sendable_tags(
         }
     }
     Ok((sendable, withheld))
+}
+
+/// Why the tag `name` may not be pushed because of its annotation (format
+/// 5), if it may not: the atag is missing or not an atag, names another tag
+/// or target (a transplanted or re-targeted annotation, which would
+/// publish a release tag the signer never made), or (`public`) has a
+/// sealed message, which only a cloaked tag has.
+pub(crate) fn annotation_problem(store: &ObjectStore, name: &str, tag: &Tag, public: bool) -> Result<Option<String>> {
+    let Some(a) = tag.annotation else { return Ok(None) };
+    let atag = match store.get(&a) {
+        Ok(Object::Atag(atag)) => atag,
+        Ok(other) => return Ok(Some(format!("its annotation {} is a {}, not an annotated tag", a.short(), other.kind_name()))),
+        Err(VeilError::Missing(_)) => return Ok(Some(format!("its annotation {} is missing", a.short()))),
+        Err(VeilError::Corrupt(..) | VeilError::Json(_)) => {
+            return Ok(Some(format!("its annotation {} is damaged", a.short())))
+        }
+        Err(e) => return Err(e),
+    };
+    if atag.name != name || atag.target != tag.target {
+        return Ok(Some(format!(
+            "its annotation {} belongs to another tag or target ({})",
+            a.short(),
+            atag.verify(name, &tag.target).describe()
+        )));
+    }
+    if public && atag.is_sealed() {
+        return Ok(Some("its annotation's message is sealed; it is never pushed to a public remote".into()));
+    }
+    Ok(None)
+}
+
+/// Copy the annotated tag objects `ids` (format 5) from `src` to `dst`
+/// with `put_raw`, so a destination below format 5 refuses them with the
+/// upgrade hint. On a `public` destination an atag with a sealed message
+/// is never written (the tag checks already skip its tag; this is the
+/// second line).
+fn copy_annotations(src: &ObjectStore, dst: &ObjectStore, ids: &[ObjectId], public: bool) -> Result<usize> {
+    let mut copied = 0;
+    for id in ids {
+        if dst.has(id) {
+            continue;
+        }
+        let raw = src.get_raw(id)?;
+        match Object::decode(&raw)? {
+            Object::Atag(a) if public && a.is_sealed() => continue,
+            Object::Atag(_) => {}
+            other => {
+                return Err(VeilError::Corrupt(
+                    id.hex(),
+                    format!("expected an annotated tag, found a {}", other.kind_name()),
+                ))
+            }
+        }
+        if dst.put_raw(id, &raw)? {
+            copied += 1;
+        }
+    }
+    Ok(copied)
+}
+
+/// Fetch the annotation `id` of the remote tag `name → target` from
+/// `remote` into `local`, checking it on the way: hash, canonical atag,
+/// and the same name and target as the tag (a hostile remote cannot
+/// transplant a signed annotation onto another tag). `Ok(None)` with a
+/// warning in `warnings` when the annotation is not usable; the tag is
+/// then received without it.
+fn fetch_annotation(
+    local: &ObjectStore,
+    remote: &ObjectStore,
+    name: &str,
+    tag: &Tag,
+    warnings: &mut Vec<String>,
+) -> Result<Option<ObjectId>> {
+    let Some(id) = tag.annotation else { return Ok(None) };
+    let raw = match local.get_raw(&id) {
+        Ok(raw) => raw,
+        Err(VeilError::Missing(_)) => match remote.get_raw(&id) {
+            Ok(raw) => raw,
+            Err(VeilError::Missing(_)) => {
+                warnings.push(format!("remote tag '{name}': its annotation {} is missing; received without it", id.short()));
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        },
+        Err(e) => return Err(e),
+    };
+    if ObjectId::hash(&raw) != id {
+        warnings.push(format!("remote tag '{name}': its annotation {} is damaged; received without it", id.short()));
+        return Ok(None);
+    }
+    let atag = match Object::decode(&raw) {
+        Ok(Object::Atag(a)) => a,
+        Ok(_) | Err(VeilError::Corrupt(..)) | Err(VeilError::Json(_)) => {
+            warnings.push(format!("remote tag '{name}': its annotation {} is not a valid annotated tag; received without it", id.short()));
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    if atag.name != name || atag.target != tag.target {
+        warnings.push(format!(
+            "remote tag '{name}': its annotation {} belongs to another tag or target; received without it",
+            id.short()
+        ));
+        return Ok(None);
+    }
+    local.put_raw(&id, &raw)?;
+    Ok(Some(id))
 }
 
 /// Of `sendable`, the tags the remote (holding `remote_tags`) takes; the
@@ -1867,7 +1998,7 @@ pub fn pull_with(
              Delete it again, or delete it there too with `vl push {remote_name} --delete {name}`"
         ));
     }
-    for (name, tag) in tags {
+    for (name, mut tag) in tags {
         // Tag names and targets come from the remote: a name may carry
         // terminal escapes or path tricks, and a target may be missing or
         // not a snapshot, which would break every later graph query.
@@ -1883,6 +2014,8 @@ pub fn pull_with(
                 .push(format!("skipped remote tag '{name}': target {} {why}", tag.target.short()));
             continue;
         }
+        // Its annotation (format 5), checked against the tag.
+        tag.annotation = fetch_annotation(tx.repo().store(), remote.store(), &name, &tag, &mut report.warnings)?;
         tx.view.remote_tags.insert(format!("{remote_name}/{name}"), tag.target);
         match tx.view.tags.get(&name).cloned() {
             None if stay_deleted.contains(&name) => report.tags_kept_deleted.push(name),
@@ -1901,7 +2034,19 @@ pub fn pull_with(
                 tx.view.tags.insert(name.clone(), tag.clone());
                 report.tags_updated.push((name, tag.target));
             }
-            Some(existing) if existing.target == tag.target => {}
+            Some(existing) if existing.target == tag.target => {
+                // The remote's annotation for the same target, if this tag
+                // has none yet.
+                if existing.annotation.is_none() && tag.annotation.is_some() {
+                    tx.view.tags.insert(
+                        name.clone(),
+                        Tag {
+                            annotation: tag.annotation,
+                            ..existing
+                        },
+                    );
+                }
+            }
             Some(existing) => {
                 if tx.repo().is_ancestor(&existing.target, &tag.target)? {
                     tx.view.tags.insert(
@@ -1909,6 +2054,7 @@ pub fn pull_with(
                         Tag {
                             target: tag.target,
                             cloak: existing.cloak,
+                            annotation: tag.annotation,
                         },
                     );
                     report.tags_updated.push((name, tag.target));

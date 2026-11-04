@@ -56,14 +56,14 @@ fn a_live_lock_holder_is_never_robbed() {
             let mut b = Repo::open(fs, None, "bob").unwrap();
             let mut tx_b = b.transaction("op by B").unwrap();
             let entered = Instant::now();
-            tx_b.view.tags.insert("from-b".into(), veil_core::oplog::Tag { target: base, cloak: None });
+            tx_b.view.tags.insert("from-b".into(), veil_core::oplog::Tag::new(base, None));
             tx_b.commit().unwrap();
             entered
         }
     });
     std::thread::sleep(Duration::from_millis(1500));
     assert!(!b.is_finished(), "B entered while A held the lock");
-    tx_a.view.tags.insert("from-a".into(), veil_core::oplog::Tag { target: base, cloak: None });
+    tx_a.view.tags.insert("from-a".into(), veil_core::oplog::Tag::new(base, None));
     tx_a.commit().expect("A's lock was not taken over");
     let committed = Instant::now();
     let b_entered = b.join().unwrap();
@@ -96,9 +96,9 @@ fn a_tampered_lock_is_reclaimed_and_its_holder_cannot_commit() {
     let mut tx_a = a.transaction("op by A").unwrap();
     fs.write(&p(LOCK), format!("{} {}", std::process::id(), now_millis() - 121_000).as_bytes()).unwrap();
     let mut tx_b = b.transaction("op by B").expect("a tokenless lock of this process is reclaimed");
-    tx_b.view.tags.insert("from-b".into(), veil_core::oplog::Tag { target: base, cloak: None });
+    tx_b.view.tags.insert("from-b".into(), veil_core::oplog::Tag::new(base, None));
     tx_b.commit().unwrap();
-    tx_a.view.tags.insert("from-a".into(), veil_core::oplog::Tag { target: base, cloak: None });
+    tx_a.view.tags.insert("from-a".into(), veil_core::oplog::Tag::new(base, None));
     let err = tx_a.commit().expect_err("A must notice that it lost the lock");
     assert!(matches!(err, VeilError::Locked(_)), "{err}");
     let head = Repo::open(fs.clone(), None, "x").unwrap();
@@ -174,7 +174,7 @@ fn concurrent_writers_never_lose_operations() {
                 let mut r = Repo::open(fs, None, &format!("t{t}")).unwrap();
                 for i in 0..per {
                     let mut tx = r.transaction(format!("t{t}-{i}")).unwrap();
-                    tx.view.tags.insert(format!("t{t}-{i}"), veil_core::oplog::Tag { target: base, cloak: None });
+                    tx.view.tags.insert(format!("t{t}-{i}"), veil_core::oplog::Tag::new(base, None));
                     tx.commit().unwrap();
                 }
             })
@@ -276,7 +276,7 @@ fn slow_snapshot_serialises_with_a_concurrent_writer() {
             let start = Instant::now();
             let mut tx = r.transaction("concurrent tag").unwrap();
             let root = tx.repo().root_id();
-            tx.view.tags.insert("b".into(), veil_core::oplog::Tag { target: root, cloak: None });
+            tx.view.tags.insert("b".into(), veil_core::oplog::Tag::new(root, None));
             tx.commit().unwrap();
             start.elapsed()
         }

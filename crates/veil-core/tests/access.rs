@@ -492,10 +492,7 @@ fn signature_stripping_and_transplants_are_detected() {
         let mut tx = bad.transaction("plant").unwrap();
         tx.view.tags.insert(
             "evil".into(),
-            veil_core::oplog::Tag {
-                target: bad_id,
-                cloak: None,
-            },
+            veil_core::oplog::Tag::new(bad_id, None),
         );
         tx.commit().unwrap();
     }

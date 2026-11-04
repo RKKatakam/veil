@@ -405,6 +405,8 @@ impl Checker {
         if first && need > self.store.format() {
             let what = if raw.starts_with(b"veil:conf\n") {
                 "conflict object"
+            } else if raw.starts_with(b"veil:atag\n") {
+                "annotated tag"
             } else if Object::tree_encoding(&raw).is_some() {
                 "tree"
             } else {
@@ -641,6 +643,7 @@ impl Checker {
                 EntryKind::Dir => next.push((e.id, child, !e.visibility.is_public())),
                 EntryKind::File => self.check_file(e, &child),
                 EntryKind::Conflict => self.check_conflict(e, &child),
+                EntryKind::Symlink | EntryKind::Gitlink => self.check_special(e, &child),
             }
         }
         next
@@ -683,6 +686,74 @@ impl Checker {
         }
     }
 
+    /// A symlink or gitlink (format 5): its object is checked as a file's,
+    /// then, when this reader can read it, its content: a link target is
+    /// UTF-8 without NUL and at most [`MAX_LINK_TARGET`] bytes; a gitlink
+    /// holds `"<40 or 64 lowercase hex digits>\n"`.
+    fn check_special(&mut self, e: &TreeEntry, path: &str) {
+        self.check_file(e, path);
+        let Ok(data) = self.store.read_blob(&e.id) else { return };
+        let why = match e.kind {
+            EntryKind::Symlink => special_content_problem_symlink(&data),
+            _ => special_content_problem_gitlink(&data),
+        };
+        if let Some(why) = why {
+            self.push(Severity::Warning, format!("{} {path}: {why}", e.kind.name()));
+        }
+    }
+
+    /// The annotated tags a view names (format 5): each must be an atag,
+    /// and its target is a root. For the current view (`check_names`), a
+    /// tag whose atag names another tag or target, or whose signature does
+    /// not verify, is reported.
+    fn check_annotations(&mut self, view: &crate::oplog::View, check_names: bool, roots: &mut Vec<(ObjectId, String)>, seen: &mut HashSet<ObjectId>) {
+        let mut named: Vec<(Option<(&str, ObjectId)>, ObjectId)> = view
+            .tags
+            .iter()
+            .filter_map(|(n, t)| t.annotation.map(|a| (Some((n.as_str(), t.target)), a)))
+            .collect();
+        named.extend(view.remote_release_tags.values().map(|a| (None, *a)));
+        for (tag, id) in named {
+            let first = seen.insert(id);
+            if !first && !check_names {
+                continue;
+            }
+            let atag = match self.load(&id) {
+                Load::Obj(Object::Atag(a)) => a,
+                Load::Obj(o) => {
+                    if first {
+                        self.push(Severity::Corrupt, format!("annotated tag {}: is a {}", id.short(), o.kind_name()));
+                    }
+                    continue;
+                }
+                Load::Missing => {
+                    if first {
+                        self.note_missing(id, Severity::Corrupt, format!("annotated tag {id} is missing"));
+                    }
+                    continue;
+                }
+                Load::Bad => continue,
+            };
+            if first {
+                roots.push((atag.target, format!("annotated tag {}", id.short())));
+            }
+            if let (true, Some((name, target))) = (check_names, tag) {
+                let v = atag.verify(name, &target);
+                if !matches!(
+                    v,
+                    crate::tag_object::AtagVerification::Signed { .. }
+                        | crate::tag_object::AtagVerification::Unsigned
+                        | crate::tag_object::AtagVerification::GitSignatureNotVerified
+                ) {
+                    self.push(
+                        Severity::Warning,
+                        format!("tag '{}': its annotation {} is {}", crate::fsck::printable(name), id.short(), v.describe()),
+                    );
+                }
+            }
+        }
+    }
+
     fn check_file(&mut self, e: &TreeEntry, path: &str) {
         self.report.files += 1;
         let (missing_as, why) = match &e.visibility {
@@ -702,7 +773,7 @@ impl Checker {
                 (Severity::Redacted, why)
             }
         };
-        let label = format!("file {path}");
+        let label = format!("{} {path}", if e.kind.is_special() { e.kind.name() } else { "file" });
         self.check_blob(e.id, &label, missing_as, &why, Some(e.visibility.key_scope()));
         if let Some(fb) = e.fallback {
             // An embargoed entry's pre-merge version, or the last public
@@ -1136,6 +1207,27 @@ impl Checker {
                 );
             }
         }
+        // Format 5: annotated tags and remote release tags.
+        let format = self.store.format();
+        if format < crate::object::GIT_PARITY_REPO_FORMAT {
+            if let Some(op) = ops.iter().find(|(_, op)| op.view.uses_format_5()).map(|(id, _)| *id) {
+                self.push(
+                    Severity::Corrupt,
+                    format!("operation {}: records annotated or release tags in a format-{format} repository (older vl cannot keep them)", op.short()),
+                );
+            }
+        }
+        let mut seen = HashSet::new();
+        if let Some(h) = head {
+            let view = ops[&h].view.clone();
+            self.check_annotations(&view, true, &mut roots, &mut seen);
+        }
+        let others: Vec<crate::oplog::View> = ops.iter().filter(|(id, _)| Some(**id) != head).map(|(_, op)| op.view.clone()).collect();
+        for view in others {
+            if view.uses_format_5() {
+                self.check_annotations(&view, false, &mut roots, &mut seen);
+            }
+        }
         Ok(roots)
     }
 
@@ -1204,4 +1296,35 @@ impl Checker {
         }
         Ok(())
     }
+}
+
+/// Longest symlink target checkout will write (`PATH_MAX` on Linux).
+pub const MAX_LINK_TARGET: usize = 4096;
+
+/// Why `data` is not a valid symlink target, if it is not.
+pub fn special_content_problem_symlink(data: &[u8]) -> Option<String> {
+    if data.is_empty() {
+        Some("empty link target".into())
+    } else if data.len() > MAX_LINK_TARGET {
+        Some(format!("link target over {MAX_LINK_TARGET} bytes"))
+    } else if data.contains(&0) {
+        Some("link target contains NUL".into())
+    } else if std::str::from_utf8(data).is_err() {
+        Some("link target is not UTF-8".into())
+    } else {
+        None
+    }
+}
+
+/// Why `data` is not a valid gitlink pointer, if it is not.
+pub fn special_content_problem_gitlink(data: &[u8]) -> Option<String> {
+    let ok = data.last() == Some(&b'\n')
+        && matches!(data.len(), 41 | 65)
+        && data[..data.len() - 1].iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    (!ok).then(|| "not a Git commit id (40 or 64 lowercase hex digits and a newline)".into())
+}
+
+/// `s` with control characters escaped, for findings that quote names.
+fn printable(s: &str) -> String {
+    s.chars().flat_map(|c| if c.is_control() { c.escape_default().collect::<Vec<_>>() } else { vec![c] }).collect()
 }

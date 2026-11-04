@@ -126,6 +126,8 @@ impl ReaderView {
         match lookup(&self.store, &self.view.root(), path) {
             Ok(Some(e)) if path.is_root() => Ok(Some(e)),
             Ok(Some(e)) if e.kind == EntryKind::Dir => Ok(self.dir_visible(&e)?.then_some(e)),
+            // Format-5 symlinks and gitlinks are not served yet (carried).
+            Ok(Some(e)) if e.kind.is_special() => Ok(None),
             Ok(Some(e)) if self.store.entry_readable(&e) => Ok(Some(e)),
             Ok(_) => Ok(None),
             Err(e) if e.is_unreadable() => Ok(None),
@@ -146,7 +148,7 @@ impl ReaderView {
             for c in tree.entries.iter().rev() {
                 match c.kind {
                     EntryKind::Dir => stack.push(c.id),
-                    _ if self.store.entry_readable(c) => return Ok(true),
+                    _ if !c.kind.is_special() && self.store.entry_readable(c) => return Ok(true),
                     _ => {}
                 }
             }
@@ -172,7 +174,7 @@ impl Lower for ReaderView {
                     Ok(t) => stack.extend(t.entries.iter().map(|c| (p.join(&c.name), c.clone()))),
                     Err(_) => out.push(p),
                 },
-                _ if self.store.entry_readable(&e) => {}
+                _ if !e.kind.is_special() && self.store.entry_readable(&e) => {}
                 _ => out.push(p),
             }
         }

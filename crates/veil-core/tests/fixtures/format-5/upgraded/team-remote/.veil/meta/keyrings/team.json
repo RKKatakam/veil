@@ -1,0 +1,191 @@
+{
+  "scope": "team",
+  "format": 3,
+  "log": [
+    {
+      "seq": 0,
+      "prev": "",
+      "timestamp": 1793794577968,
+      "signer": "veil107cb59858a0e2758711854cfec049aa2a021b3568dd8fc0f6f6895f77337fa1b",
+      "signing_key": "58aa3f8bcd0312b2a9f445a152e3ea4fa4795ea58bf3e672f2f64480416f1e39",
+      "op": {
+        "kind": "genesis",
+        "key_id": "d0de32d7d9c0849d",
+        "members": [
+          {
+            "id": "veil107cb59858a0e2758711854cfec049aa2a021b3568dd8fc0f6f6895f77337fa1b",
+            "name": "alice",
+            "signing_key": "58aa3f8bcd0312b2a9f445a152e3ea4fa4795ea58bf3e672f2f64480416f1e39",
+            "binding": "8a3b067099db5d6119a7849903ec50edd2027f82ccbf94f49ec95f197c3da4a42b86134986b53daea0d43ed5c962240afa962960be9eeffdb3948f092e4b3401",
+            "role": "admin",
+            "generation": 0,
+            "wrapped": {
+              "hpke": "base/x25519-hkdf-sha256/hkdf-sha256/chacha20poly1305",
+              "enc": "0d5597a69d0a118b3b3ad183eff2ef0b5e81435c3e0c822647e4bcc986e8726f",
+              "ct": "2b765b80f6e55dce1cef049fd212e6e52e8be331a6c35edd3d63951e0b88233d0e459246dd331cc3b008b81f9157d9cb"
+            }
+          }
+        ],
+        "proof": "19d63f39419f913af2861b7ce08e9b182b656f62e09d0031b2d0ddda4c4df780"
+      },
+      "signature": "ceabd234b5a60c26ee485955f86f8c3b742d38a7c4aaf0e0c2aed79cd2df127947dc9c8d2027e08bae7c95c60684bf64e9f6c6a6e84fe3a70454fd10bf16c709"
+    },
+    {
+      "seq": 1,
+      "prev": "771f68dfc9fc5b09627b7bd3d92cfb20",
+      "timestamp": 1793794578158,
+      "signer": "veil107cb59858a0e2758711854cfec049aa2a021b3568dd8fc0f6f6895f77337fa1b",
+      "signing_key": "58aa3f8bcd0312b2a9f445a152e3ea4fa4795ea58bf3e672f2f64480416f1e39",
+      "op": {
+        "kind": "grant",
+        "member": {
+          "id": "veil13fff8aa888da1d1d87f2e14594e74401abdd407909ef38859aa2fdb884b47035",
+          "name": "bob",
+          "signing_key": "70798844c06637f494f288b06e6fee8cbbd490fe92d5ed1cd57766d025521a61",
+          "binding": "f3633df82f10abffc66bbabfd61a6ce1a7a6eb30f4a59fa3ed3a4ac4dade8962f25a55f575dea64b385e20f062064fa6ab5a59a762aacd673f8a2782386cb905",
+          "role": "member",
+          "generation": 0,
+          "wrapped": {
+            "hpke": "base/x25519-hkdf-sha256/hkdf-sha256/chacha20poly1305",
+            "enc": "67b8ab76bfcd3aa234299616b9cf3d415b872ccdabe3098eecc4fff536a7f22d",
+            "ct": "7d3a73de08ac8cff1556bfd5043fdf6252334ac001f41638d4905b7b6f1344236fcad2db4af73bfc49241cd12cbeb598"
+          }
+        }
+      },
+      "signature": "73d554cdddf2f43576f13ac11848bda90dc6947abc831db0cd5ccd1acc12ded6fe950ff2a4d433ec97aacefdb28a53e10047b6d085c564f7dcf8f66a86434c0b"
+    },
+    {
+      "seq": 2,
+      "prev": "e44067808b65e14e2999a5b513be5131",
+      "timestamp": 1793794578256,
+      "signer": "veil107cb59858a0e2758711854cfec049aa2a021b3568dd8fc0f6f6895f77337fa1b",
+      "signing_key": "58aa3f8bcd0312b2a9f445a152e3ea4fa4795ea58bf3e672f2f64480416f1e39",
+      "op": {
+        "kind": "grant",
+        "member": {
+          "id": "veil1d56588c3a2dca1290111ce15cd9da34a45b3dfe0e892a461b134c210239c0b4b",
+          "name": "carol",
+          "signing_key": "9ec991a13d75c17ef22be2b7af6730f20b64efd585c5103267fda4806c629e9e",
+          "binding": "820b76930e82c4dd6dd6e02d1b48c68ec1e884e240702407fa66ee1c63a3feb51bd123c267d6d28afa155fe83b4a8dee4a9c98f00a77fac7b63ff815ca02860a",
+          "role": "member",
+          "generation": 0,
+          "wrapped": {
+            "hpke": "base/x25519-hkdf-sha256/hkdf-sha256/chacha20poly1305",
+            "enc": "2dcecf58cc22a641ec20b29d03bc2d0d6951a5f666180d0f72deda45ef4e9c59",
+            "ct": "49aa3d35965d617a7f5bc2015463f11d8469ddec5eceffc9d87da7abf379b82fbaccffe4ee9534ea1a589cde8cfdad6d"
+          }
+        }
+      },
+      "signature": "153adfec037de14f971dc1eb231d21cdd056912a3ab1361b2d8273c886be9c2da5758a487a2f6a83a685c675b77a143373a8261d2ebf02c6ab51ecaecac5f300"
+    },
+    {
+      "seq": 3,
+      "prev": "346cee30a448b8fa1d0cc3070721445a",
+      "timestamp": 1793794578398,
+      "signer": "veil107cb59858a0e2758711854cfec049aa2a021b3568dd8fc0f6f6895f77337fa1b",
+      "signing_key": "58aa3f8bcd0312b2a9f445a152e3ea4fa4795ea58bf3e672f2f64480416f1e39",
+      "op": {
+        "kind": "grant",
+        "member": {
+          "id": "veil1f6882e1ae218d06eff9877170c18c903c5f849a3c052e4358255589542430974",
+          "name": "dave",
+          "signing_key": "92d7ad45b9555ab436608d2cbb068562ee5bf62bbe5da8feb3afaa3cb890519e",
+          "binding": "affdeb5ecf023afec35b0fbb1e5e95b935def3ad15344fe80a7ba2fc3223ae4d9d6faacd685f674952d26d9cb7c754e1005f8b6bd6e6de36a976bb0f2d47d706",
+          "role": "member",
+          "generation": 0,
+          "wrapped": {
+            "hpke": "base/x25519-hkdf-sha256/hkdf-sha256/chacha20poly1305",
+            "enc": "28286b3c361a7a50e1f376111e683a33e53be87acf5e57cb325077b0f93a5f5b",
+            "ct": "492f95b28f350d11b6f0f894ea3d7235ae31801474383085fcae7021db8a377cf5e808b52bd9872c0d0a5d036129451b"
+          }
+        }
+      },
+      "signature": "a59b5d96ae5678b004c158da55c5db986ee620e6547285e2abd9d3b9f48fd7df9e3ec471e79aacf1383dfeb7a7304ec5f7e57b030a8856091bc8a9587a18b90f"
+    },
+    {
+      "seq": 4,
+      "prev": "c3c930e9945ef13082db0cccaa0ae774",
+      "timestamp": 1793794578565,
+      "signer": "veil107cb59858a0e2758711854cfec049aa2a021b3568dd8fc0f6f6895f77337fa1b",
+      "signing_key": "58aa3f8bcd0312b2a9f445a152e3ea4fa4795ea58bf3e672f2f64480416f1e39",
+      "op": {
+        "kind": "revoke",
+        "member": "veil1d56588c3a2dca1290111ce15cd9da34a45b3dfe0e892a461b134c210239c0b4b",
+        "rotation": {
+          "generation": 1,
+          "key_id": "8c54ef903f60ae8a",
+          "previous": [
+            {
+              "key_id": "d0de32d7d9c0849d",
+              "sealed": {
+                "scope": "prev-key:team#8c54ef903f60ae8a",
+                "nonce": "c579191614bef99f5aace893aec5d045f541bea9f34c16e7",
+                "ciphertext": "8c89a36c4d1df2385132f2143c5a38d03304a2deb7086b1959786f3a494a495002522473abce68d058d06e5ffe2bc5a1"
+              }
+            }
+          ],
+          "wrapped": {
+            "veil107cb59858a0e2758711854cfec049aa2a021b3568dd8fc0f6f6895f77337fa1b": {
+              "hpke": "base/x25519-hkdf-sha256/hkdf-sha256/chacha20poly1305",
+              "enc": "65e28615c7d6a1a11fc397fc0be77cb48ffd457430c1665d227162bc4ee5b14b",
+              "ct": "37620bd746855b7b2799c75fcc5a4622f0f5041afd03896361f59b5b26cac09948d01354e8a59eb37f47e659d1f638e2"
+            },
+            "veil13fff8aa888da1d1d87f2e14594e74401abdd407909ef38859aa2fdb884b47035": {
+              "hpke": "base/x25519-hkdf-sha256/hkdf-sha256/chacha20poly1305",
+              "enc": "2508f3fe1edac1290f22aa5e1d1478dac0122dd35d287e9847a6838df269b92b",
+              "ct": "9b42cd0e5549bb34f2d3bbdf000b84324e3a815627f074a7b35c680c05e0f925284910227c34587ea4ad203550f81de1"
+            },
+            "veil1f6882e1ae218d06eff9877170c18c903c5f849a3c052e4358255589542430974": {
+              "hpke": "base/x25519-hkdf-sha256/hkdf-sha256/chacha20poly1305",
+              "enc": "f72f72c267c9da02aedd743435a68996599d1c0dd89dbe50c5c19373d5412f02",
+              "ct": "b2c38359dd88c467bc3bb234b56dd6244023bb2e5e60803a6d06b2ff283350ee2b134477aea24947b2e2b7c9e27b5754"
+            }
+          }
+        }
+      },
+      "signature": "088436e327c949caf9f053a5747c06edefc4a8524ae2051f5f47ffebe3f7ec33100192bd31f789aa9845997758d5c78fea8220ccf9230a772ef856ee1820fb08"
+    },
+    {
+      "seq": 5,
+      "prev": "9aca2dc0b941a0e816bfa7789fb63da5",
+      "timestamp": 1793794578819,
+      "signer": "veil107cb59858a0e2758711854cfec049aa2a021b3568dd8fc0f6f6895f77337fa1b",
+      "signing_key": "58aa3f8bcd0312b2a9f445a152e3ea4fa4795ea58bf3e672f2f64480416f1e39",
+      "op": {
+        "kind": "rotate",
+        "rotation": {
+          "generation": 2,
+          "key_id": "60505b6b7d5537fb",
+          "previous": [
+            {
+              "key_id": "8c54ef903f60ae8a",
+              "sealed": {
+                "scope": "prev-key:team#60505b6b7d5537fb",
+                "nonce": "ce43c48ddc61896f02374ba5f121abd17d39fb0dc8e46ae2",
+                "ciphertext": "261a167f921a866074ad7fdccb1bc833cf265dfe633a7937b8662b4a30049980545e6a9f6fb0742b0c460953831c6a35"
+              }
+            }
+          ],
+          "wrapped": {
+            "veil107cb59858a0e2758711854cfec049aa2a021b3568dd8fc0f6f6895f77337fa1b": {
+              "hpke": "base/x25519-hkdf-sha256/hkdf-sha256/chacha20poly1305",
+              "enc": "cf590a75153a24d9c0beca49f957d42eda41d19d1bf215e0f3efd25f89dca123",
+              "ct": "ef1afa491287ae1b5c9510ff834f842a9c3f182a59b0cdb76dd918bc431b263807122112afd764550e3843871e531656"
+            },
+            "veil13fff8aa888da1d1d87f2e14594e74401abdd407909ef38859aa2fdb884b47035": {
+              "hpke": "base/x25519-hkdf-sha256/hkdf-sha256/chacha20poly1305",
+              "enc": "15b4bf22732f928e2c74784caa98079143ce7852107bceb27c933ded00784e2a",
+              "ct": "9be0decbb4c5fe9aef6641f0bea1dee2b85abf6bd01064d3b71714778ae99d654b2c72eb052dbd4f96d0abec1cbd30ce"
+            },
+            "veil1f6882e1ae218d06eff9877170c18c903c5f849a3c052e4358255589542430974": {
+              "hpke": "base/x25519-hkdf-sha256/hkdf-sha256/chacha20poly1305",
+              "enc": "1429c11ac007836cc12d3756ad00a3d7c987fc5726009dc3a8ef783708390006",
+              "ct": "3dbb48c8bcf6cf18453e7f63e5145eb0c4688468867b282fccae6f3d97df8a584eeec369a38ac47b37834a88c5f7e58f"
+            }
+          }
+        }
+      },
+      "signature": "3c16fe68dc9eb83bf1c0a432342aaa3d94a66e39231406caf48f25cdca4a0986debbe7bd27a1aaf7734706fd83b442430e2ac95a128b844efa80accc5167460c"
+    }
+  ]
+}
