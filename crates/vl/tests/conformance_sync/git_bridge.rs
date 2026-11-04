@@ -650,7 +650,7 @@ fn git_push_of_an_embargo_before_and_after_release() {
         .next()
         .unwrap()
         .to_string();
-    env.ok("alice", &proj, &["embargo", "release", &id]);
+    env.ok("alice", &proj, &["embargo", "release", &id, "--yes"]);
     env.ok("alice", &proj, &["git", "push"]);
     assert_eq!(git(&bare, &["show", "main:auth.rs"]), "GIT-FIX-7720");
     assert!(

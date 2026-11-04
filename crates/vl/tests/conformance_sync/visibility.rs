@@ -370,7 +370,7 @@ fn an_unreleased_embargo_reaches_no_remote_and_the_release_keeps_snapshot_ids() 
     }
     let main_before = open_repo(&mirror).view().tags["main"].target;
     let id = embargo_id(&env, &proj);
-    env.ok("alice", &proj, &["embargo", "release", &id]);
+    env.ok("alice", &proj, &["embargo", "release", &id, "--yes"]);
     env.ok("alice", &proj, &["push", "mirror"]);
     let all = everything_in(&mirror);
     assert!(
@@ -425,7 +425,7 @@ fn a_mirror_clone_from_before_the_release_catches_up() {
     assert_eq!(read(&carol, "auth.rs"), "fn check() -> bool { true }\n");
     assert!(!carol.join("verify.rs").exists());
     let id = embargo_id(&env, &proj);
-    env.ok("alice", &proj, &["embargo", "release", &id]);
+    env.ok("alice", &proj, &["embargo", "release", &id, "--yes"]);
     env.ok("alice", &proj, &["push", "mirror"]);
     env.ok("carol", &carol, &["pull"]);
     assert_eq!(read(&carol, "verify.rs"), "NEW-FILE-4471\n");
