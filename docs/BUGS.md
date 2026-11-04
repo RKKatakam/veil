@@ -958,6 +958,7 @@ chose, a teammate's vault entry), not only a hostile remote.
 
 ## Round 8 hypotheses (not demonstrated)
 
+* **`vl restore --from <embargoed fix> PATH` on a public line** probably publishes the names and sizes of the files the fix touches (inferred from the code by the Git-parity threat review; untested). For the next adversarial pass.
 * **Mount, gc'd `base`.** `Recorder::open` falls back to the current snapshot but `state.base` keeps the id gc removed; the next `follow` then has `old_tree = None` and skips the overlap check, so upper edits silently shadow the workspace's change. Needs gc to prune a snapshot the op log still references (`--keep-ops-days`).
 * **Mount, unlink race.** A file deleted between `with_view` and `reconcile` of a recording comes back.
 * **Mount, whole-file buffers.** A large file is decrypted into memory under the global lock on open, stalling every other request meanwhile (a same-user slowdown; see also BUG-536).
