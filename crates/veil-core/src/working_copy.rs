@@ -121,7 +121,19 @@ impl Repo {
                 snapshot: target,
             });
             state.save(fs)?;
-            self.checkout_tree_recorded(fs, Some(&from), &to, &mut record, cache)?
+            match self.checkout_tree_recorded(fs, Some(&from), &to, &mut record, cache) {
+                Ok(report) => report,
+                // Refused before any file was touched (the target's paths
+                // collide on this filesystem): there is no move to finish,
+                // and leaving it pending would make every later command,
+                // `vl --no-snapshot undo` included, retry it and fail.
+                Err(e @ VeilError::NameCollision(_)) => {
+                    state.pending = None;
+                    state.save(fs)?;
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             CheckoutReport::default()
         };
