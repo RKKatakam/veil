@@ -76,7 +76,7 @@ be undone. Add to that per-file encryption and engine-level secret handling.
 ### `vl commit` moves the tags at the parent
 
 `vl commit` moves **every tag that pointed at the parent of `@`** onto the
-change it commits. It does so in any workspace, cloaked or not:
+change it commits, in any workspace (a cloaked one excepted, below):
 
 ```text
 $ vl new main
@@ -89,9 +89,16 @@ main: vnuopxqm 39c00acd Other line
 
 That is what you want on `main`. It is not what you want when the work
 must stay off `main` for now: a security fix, an experiment you intend to
-merge later. On such a line, use `vl describe` instead of `vl commit`
-(there is then nothing to move), or tag the line's base yourself. The
-[embargo guide](embargoes.md) shows the workflow.
+merge later. For those:
+
+* In a **cloaked workspace** (`vl ws new NAME --cloak`), `vl commit` moves
+  only tags cloaked under the same scope. `main` and other uncloaked tags
+  stay, and `vl` says so (`note: main not moved: this is a line cloaked
+  for 'team' …`). Cloaked work reaches `main` only through `vl merge`
+  (optionally `--embargo`) or `vl tag set`. The [embargo guide](embargoes.md)
+  shows the workflow.
+* Anywhere, `vl commit --no-advance` moves no tag, and `vl describe`
+  records a message without committing.
 
 ### Tags don't move by themselves otherwise
 

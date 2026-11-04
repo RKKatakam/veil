@@ -189,9 +189,13 @@ Veil exports the author it recorded. Set
 
 ### A file disappeared on GitHub or the public mirror
 
-It was edited in a cloaked workspace (so recorded cloaked) and that change
-reached a pushed tag. To the public, a cloaked file is absent. See the
-warning under [Cloaking for a team](secrets-and-visibility.md#cloaking-for-a-team).
+It was cloaked by policy (`vl cloak`, or a `cloak` rule in `.veilpolicy`)
+and that change reached a pushed tag: to the public, a cloaked file is
+absent. A public file merely *edited* in a cloaked workspace does not
+disappear: public readers keep its last public version (see
+[Cloaking for a team](secrets-and-visibility.md#cloaking-for-a-team)).
+(Cloaked edits recorded by Veil builds older than this rule carry no public
+version and still show as deleted.)
 
 ### `vl upgrade --remote` on an SSH remote
 

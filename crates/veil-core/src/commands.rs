@@ -16,7 +16,8 @@ use crate::{
     policy::{Policy, POLICY_FILE},
     repo::Repo,
     store::ObjectStore,
-    tree::TreeView,
+    tree::{lookup, TreeView},
+    vpath::VPath,
 };
 
 #[derive(Debug, Clone)]
@@ -40,6 +41,41 @@ pub struct MergeResult {
     pub quarantined: Vec<String>,
     /// Visibility changes the merge refused to make silently.
     pub warnings: Vec<String>,
+}
+
+/// What [`Repo::commit`] did.
+#[derive(Debug, Clone)]
+pub struct CommitResult {
+    /// The committed change.
+    pub committed: ObjectId,
+    /// The workspace's new (empty) working-copy change.
+    pub wc: ObjectId,
+    /// Tags that pointed at the committed change's parent and moved to it.
+    pub advanced: Vec<String>,
+    /// Tags that pointed at the parent but stayed, with the reason.
+    pub kept: Vec<(String, TagKept)>,
+}
+
+/// Why a tag at the parent of a commit did not move with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagKept {
+    /// The commit is on a cloaked line (this scope) and the tag is not
+    /// cloaked under that scope: cloaked work never moves it.
+    CloakedLine(String),
+    /// The caller asked for no tag to move (`vl commit --no-advance`).
+    NoAdvance,
+}
+
+/// Which tags a commit moves (see [`Repo::commit`]): `None` if `tag` may
+/// advance, else why it stays.
+fn tag_kept(tag: &Tag, line_cloak: Option<&str>, advance: bool) -> Option<TagKept> {
+    if !advance {
+        return Some(TagKept::NoAdvance);
+    }
+    match line_cloak {
+        Some(scope) if tag.cloak.as_deref() != Some(scope) => Some(TagKept::CloakedLine(scope.to_string())),
+        _ => None,
+    }
 }
 
 /// `tree` with its root entry `name` replaced by `entry` (or removed).
@@ -133,10 +169,30 @@ impl Repo {
         Ok(new)
     }
 
-    /// Describe the working copy and start a fresh change on top of it.
-    /// Tags pointing at the working copy's parent advance to the commit.
-    /// Returns `(committed, new working copy)`.
+    /// Describe the working copy and start a fresh change on top of it,
+    /// moving tags as [`Repo::commit`] does with `advance`. Returns
+    /// `(committed, new working copy)`.
     pub fn commit_working_copy(&mut self, ws: &str, message: &str) -> Result<(ObjectId, ObjectId)> {
+        let r = self.commit(ws, message, true)?;
+        Ok((r.committed, r.wc))
+    }
+
+    /// Describe the working copy of `ws` and start a fresh change on top of
+    /// it.
+    ///
+    /// **Tags.** A tag pointing at the working copy's (first) parent moves
+    /// to the commit, so committing on `main` moves `main`, except:
+    ///
+    /// * on a **cloaked line** (the workspace, or the change itself, is
+    ///   cloaked under scope `S`), only tags cloaked under `S` move. An
+    ///   uncloaked tag such as `main` stays: it is what public remotes and
+    ///   Git receive, and cloaked work reaches it only through an explicit
+    ///   `vl merge` (which publishes it after a secret scan, or embargoes
+    ///   it) or `vl tag set`;
+    /// * with `advance == false` (`vl commit --no-advance`), no tag moves.
+    ///
+    /// Tags that stayed are reported in [`CommitResult::kept`].
+    pub fn commit(&mut self, ws: &str, message: &str, advance: bool) -> Result<CommitResult> {
         let mut tx = self.transaction("commit")?;
         let wc_id = tx.view.workspace(ws)?.wc;
         let cloak = tx.view.workspace(ws)?.cloak.clone();
@@ -149,16 +205,30 @@ impl Repo {
         ns.predecessors = vec![wc_id];
         ns.timestamp = now_millis();
         let committed = tx.rewrite(wc_id, ns)?;
-        for tag in tx.view.tags.values_mut() {
-            if s.parents.first() == Some(&tag.target) {
-                tag.target = committed;
+        let line_cloak = cloak.clone().or_else(|| s.cloak.clone());
+        let (mut advanced, mut kept) = (Vec::new(), Vec::new());
+        for (name, tag) in tx.view.tags.iter_mut() {
+            if s.parents.first() != Some(&tag.target) {
+                continue;
+            }
+            match tag_kept(tag, line_cloak.as_deref(), advance) {
+                None => {
+                    tag.target = committed;
+                    advanced.push(name.clone());
+                }
+                Some(why) => kept.push((name.clone(), why)),
             }
         }
         let wc = tx.new_change(vec![committed], "", cloak)?;
         tx.set_workspace_wc(ws, wc)?;
         tx.set_description(format!("commit change {}", s.change_id.short()));
         tx.commit()?;
-        Ok((committed, wc))
+        Ok(CommitResult {
+            committed,
+            wc,
+            advanced,
+            kept,
+        })
     }
 
     pub fn edit(&mut self, ws: &str, id: ObjectId) -> Result<()> {
@@ -228,6 +298,20 @@ impl Repo {
             np.tree = seal_introduced(&tx.repo().store, &np.tree, Some(base), scope)?;
         }
         np.predecessors = vec![*parent, id];
+        // A path stays conflicted only if the result still has the
+        // conflict: the parent's conflicted files the squashed change left
+        // untouched, and the squashed change's own.
+        let store = tx.repo().store.clone();
+        let mut conflicts = BTreeSet::new();
+        for c in &p.conflicts {
+            let Ok(path) = VPath::new(c) else { continue };
+            let before = lookup(&store, &p.tree, &path).ok().flatten();
+            if before.is_some() && before == lookup(&store, &s.tree, &path).ok().flatten() {
+                conflicts.insert(c.clone());
+            }
+        }
+        conflicts.extend(s.conflicts.iter().cloned());
+        np.conflicts = recordable_conflicts(&store, &np.tree, conflicts.into_iter().collect())?;
         let pd = tx.repo().description(&p);
         let sd = tx.repo().description(&s);
         if !sd.trim().is_empty() {

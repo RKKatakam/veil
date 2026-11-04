@@ -656,7 +656,17 @@ impl Builder<'_> {
                     // Readable and absent is a deletion, unless it was never
                     // materialised (it became readable since checkout).
                     let never_materialised = b.opts.materialised.is_some_and(|m| m.hidden(path));
-                    if b.store.entry_readable(e) && !never_materialised {
+                    // A cloaked file this reader only sees as its last public
+                    // version (fallback): deleting that copy must not delete
+                    // the sealed content it cannot read.
+                    let readable = match &e.visibility {
+                        Visibility::Cloaked { .. } => b.store.entry_readable(&TreeEntry {
+                            fallback: None,
+                            ..e.clone()
+                        }),
+                        _ => b.store.entry_readable(e),
+                    };
+                    if readable && !never_materialised {
                         Ok(Err(None))
                     } else {
                         b.report.carried.push(path.clone());
@@ -781,6 +791,25 @@ impl Builder<'_> {
             }
         }
 
+        // A public file sealed only because of the line it is edited on (a
+        // cloaked workspace, or sealed content keeping its audience; the
+        // policy itself says public) keeps its last public version as
+        // `fallback`: readers without the key (public remotes, Git, members
+        // of other scopes) go on seeing that version instead of losing the
+        // file. A file the policy cloaks has none: hiding it is the point.
+        let cloak_fallback = match (&desired, parent_file) {
+            (Visibility::Cloaked { .. }, Some(pe)) if class.tier == Tier::Public => {
+                if pe.visibility.is_public() && pe.fallback.is_none() {
+                    Some(pe.id)
+                } else if pe.visibility == desired {
+                    pe.fallback
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
         // Fast path: overlay/tree-view says the file is byte-identical.
         if let Some(pe) = parent_file {
             if self.use_hints && self.fs.known_id(path) == Some(pe.id) {
@@ -799,7 +828,7 @@ impl Builder<'_> {
         // With injected secrets every changed file must be read and checked.
         let cacheable = !parent_embargoed && self.opts.injected.is_none();
         if let (Some(m), true) = (&meta, cacheable) {
-            if let Some(e) = self.cached_entry(path, name, m, &desired, class.allow_secrets, parent_file)? {
+            if let Some(e) = self.cached_entry(path, name, m, &desired, cloak_fallback, class.allow_secrets, parent_file)? {
                 return Ok(Some(e));
             }
         }
@@ -857,6 +886,20 @@ impl Builder<'_> {
                         }
                     }
                 }
+            }
+        }
+
+        if fallback.is_none() {
+            fallback = cloak_fallback;
+        }
+        if let (Some(fb), Some(pe), Visibility::Cloaked { scope }) = (cloak_fallback, parent_file, &desired) {
+            if pe.executable == executable && content == fb && pe.visibility == desired && !self.store.keys.has(scope) {
+                // A reader without the key was shown the last public version
+                // and did not touch it.
+                return Ok(Some(TreeEntry {
+                    name: name.to_string(),
+                    ..pe.clone()
+                }));
             }
         }
 
@@ -940,9 +983,38 @@ impl Builder<'_> {
             }
         }
 
+        // A sealed edit of a public file, edited back to its last public
+        // version: nothing to seal, that content is public already.
+        if let (Some(fb), Visibility::Cloaked { .. }) = (cloak_fallback, &desired) {
+            if content == fb && !self.policy_changed && !self.rescan {
+                return Ok(Some(TreeEntry {
+                    name: name.to_string(),
+                    kind: EntryKind::File,
+                    id: fb,
+                    size: data.len() as u64,
+                    executable,
+                    visibility: Visibility::Public,
+                    fallback: None,
+                }));
+            }
+        }
+
         let id = match self.store.store_file(&data, &desired) {
             Ok(id) => id,
             Err(VeilError::Redacted { scope }) => {
+                // A tracked file keeps its recorded entry: this reader cannot
+                // seal the edit, and recording a deletion instead would drop
+                // content it may not even be able to read.
+                if let Some(pe) = parent_file {
+                    self.report.cloak_failures.push((
+                        path.clone(),
+                        format!("no key for scope '{scope}'; the edit stays local, history keeps the recorded version"),
+                    ));
+                    return Ok(Some(TreeEntry {
+                        name: name.to_string(),
+                        ..pe.clone()
+                    }));
+                }
                 self.report
                     .cloak_failures
                     .push((path.clone(), format!("no key for scope '{scope}'")));
@@ -950,7 +1022,7 @@ impl Builder<'_> {
             }
             Err(e) => return Err(e),
         };
-        if fallback.is_none() {
+        if fallback.is_none() || matches!(desired, Visibility::Cloaked { .. }) {
             let sealed = match &desired {
                 Visibility::Cloaked { scope } => Some((scope.clone(), id)),
                 _ => None,
@@ -998,20 +1070,28 @@ impl Builder<'_> {
 
     /// The entry for an unchanged file, built from cached content facts
     /// instead of reading it. `None` means "read the file".
+    #[allow(clippy::too_many_arguments)]
     fn cached_entry(
         &mut self,
         path: &VPath,
         name: &str,
         meta: &Metadata,
         desired: &Visibility,
+        cloak_fallback: Option<ObjectId>,
         allow_secrets: bool,
         parent_file: Option<&TreeEntry>,
     ) -> Result<Option<TreeEntry>> {
         let Some(rec) = self.cache.as_ref().and_then(|c| c.trusted(path, meta)).cloned() else {
             return Ok(None);
         };
+        // Only cloaked entries carry a fallback here (a sealed edit of a
+        // public file); embargoed ones never come from the cache.
+        let fallback = match desired {
+            Visibility::Cloaked { .. } => cloak_fallback,
+            _ => None,
+        };
         let same_as_parent = |id: &ObjectId| {
-            parent_file.filter(|pe| pe.id == *id && pe.visibility == *desired && pe.executable == meta.executable && pe.fallback.is_none())
+            parent_file.filter(|pe| pe.id == *id && pe.visibility == *desired && pe.executable == meta.executable && pe.fallback == fallback)
         };
         let entry = match desired {
             Visibility::Public => {
@@ -1027,7 +1107,10 @@ impl Builder<'_> {
             Visibility::Cloaked { scope } => match &rec.sealed {
                 Some((s, id)) if s == scope && self.store.keys.has(scope) => match same_as_parent(id) {
                     Some(pe) => Some(pe.clone()),
-                    None if self.store.has(id) => Some(self.fresh_entry(name, *id, meta, desired)),
+                    None if self.store.has(id) => Some(TreeEntry {
+                        fallback,
+                        ..self.fresh_entry(name, *id, meta, desired)
+                    }),
                     None => None,
                 },
                 _ => None,
