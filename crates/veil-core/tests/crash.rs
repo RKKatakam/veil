@@ -54,7 +54,7 @@ use veil_core::{
     upgrade::{upgrade, UpgradeOptions, JOURNAL_PATH},
     working_copy::CheckoutState,
     workspace::SnapshotOptions,
-    tree::walk_files,
+    tree::{lookup, walk_files},
     vfs::{DirEntry, Metadata, StatClock},
     Identity, MemoryBackend, ObjectId, Repo, Result, StorageBackend, VPath, VeilError,
 };
@@ -434,7 +434,7 @@ fn files_of(repo: &Repo, id: &ObjectId) -> Files {
     walk_files(repo.store(), &tree)
         .unwrap()
         .into_iter()
-        .map(|(path, e)| (path.to_string(), repo.store().read_entry(&e).ok()))
+        .map(|(path, e)| (path.to_string(), veil_core::conflict::read_file_like(repo.store(), &e).ok()))
         .collect()
 }
 
@@ -903,6 +903,87 @@ fn crash_during_workspace_switch() {
     assert!(crashes > 10, "the sweep crashed only {crashes} times");
 }
 
+/// First-class conflicts: `vl ws switch` onto a workspace whose change holds
+/// conflict entries, killed at any point. The markers are only rendered
+/// when checkout writes the files; after recovery the directory holds
+/// exactly the rendering, and the workspace's change still holds the
+/// conflicts as data (the copy on disk never turns into a marker file, a
+/// resolution or a deletion), with the other workspace's edits intact.
+#[test]
+fn crash_during_switch_onto_conflict_entries() {
+    let id = Identity::generate("alice");
+    let base_disk = Arc::new(MemoryBackend::new());
+    let mut repo = Repo::init(base_disk.clone(), Some(id.clone()), "alice").unwrap();
+    base_disk.write(&p("a.txt"), b"one\ntwo\nthree\n").unwrap();
+    base_disk.write(&p("gone.txt"), b"modified on one side, deleted on the other\n").unwrap();
+    repo.snapshot_workspace(WS, &*base_disk).unwrap();
+    let (base, _) = repo.commit_working_copy(WS, "base").unwrap();
+    let side = |repo: &mut Repo, name: &str, text: &[u8], gone: Option<&[u8]>| {
+        repo.create_workspace(name, vec![base], None).unwrap();
+        let o = repo.workspace_overlay(name).unwrap();
+        o.write(&p("a.txt"), text).unwrap();
+        match gone {
+            Some(g) => o.write(&p("gone.txt"), g).unwrap(),
+            None => o.remove_file(&p("gone.txt")).unwrap(),
+        }
+        repo.snapshot_workspace(name, &o).unwrap();
+        repo.workspace_wc(name).unwrap()
+    };
+    let x = side(&mut repo, "x", b"one\nTWO-X\nthree\n", Some(b"edited\n"));
+    let y = side(&mut repo, "y", b"one\nTWO-Y\nthree\n", None);
+    repo.create_workspace("agent", vec![x, y], None).unwrap();
+    let agent_wc = repo.workspace_wc("agent").unwrap();
+    let agent_tree = repo.snapshot(&agent_wc).unwrap().tree;
+    for f in ["a.txt", "gone.txt"] {
+        let e = lookup(repo.store(), &agent_tree, &p(f)).unwrap().unwrap();
+        assert_eq!(e.kind, veil_core::EntryKind::Conflict, "{f}");
+    }
+    let agent_files = wc_files(&repo, "agent");
+    assert!(String::from_utf8_lossy(&agent_files["a.txt"]).contains("<<<<<<<"));
+    base_disk.write(&p("default.txt"), b"default work\n").unwrap();
+    let wc = repo.workspace_wc(WS).unwrap();
+    CheckoutState::new(WS, wc, Default::default()).save(&*base_disk).unwrap();
+    drop(repo);
+    let default_files = disk_files(&*base_disk);
+
+    let mut crashes = 0;
+    for mode in [Crash::BeforeWrite, Crash::AfterWrite, Crash::PowerLoss] {
+        for budget in 0..10_000 {
+            let disk = Arc::new(base_disk.fork());
+            let faulty = Arc::new(FaultyBackend::new(disk.clone(), budget, mode));
+            let ctx = format!("switch onto conflicts: {mode:?} after {budget} writes");
+            let result = wc_session(faulty.clone(), &id, Some("agent"));
+            let completed = result.is_ok() && !faulty.crashed();
+            if let Err(e) = &result {
+                assert!(faulty.crashed(), "{ctx}: failed without a crash: {e}");
+            }
+            crashes += usize::from(!completed);
+            let disk: Arc<dyn StorageBackend> = disk;
+            for _ in 0..2 {
+                wc_session(disk.clone(), &id, None).unwrap_or_else(|e| panic!("{ctx}: the next command fails: {e}"));
+            }
+            assert_healthy(disk.clone(), &id, &ctx);
+            let repo = Repo::open(disk.clone(), Some(id.clone()), "alice").unwrap();
+            let st = CheckoutState::load(&*disk).unwrap().unwrap();
+            assert!(st.pending.is_none(), "{ctx}: the move was not finished");
+            assert_eq!(wc_files(&repo, WS), default_files, "{ctx}: default's working copy");
+            assert_eq!(wc_files(&repo, "agent"), agent_files, "{ctx}: agent's working copy");
+            let tree = repo.snapshot(&repo.workspace_wc("agent").unwrap()).unwrap().tree;
+            for f in ["a.txt", "gone.txt"] {
+                let e = lookup(repo.store(), &tree, &p(f)).unwrap().unwrap_or_else(|| panic!("{ctx}: {f} lost"));
+                assert_eq!(e.kind, veil_core::EntryKind::Conflict, "{ctx}: {f} is no longer a conflict");
+            }
+            let expect = if st.workspace == "agent" { agent_files.clone() } else { default_files.clone() };
+            assert_eq!(disk_files(&*disk), expect, "{ctx}: the directory, attached to '{}'", st.workspace);
+            if completed {
+                assert_eq!(st.workspace, "agent", "{ctx}");
+                break;
+            }
+        }
+    }
+    assert!(crashes > 5, "the sweep crashed only {crashes} times");
+}
+
 // ---- vl upgrade ------------------------------------------------------------------
 
 /// A repository at `format` (1 or 2): history with cloaked files under
@@ -929,7 +1010,7 @@ fn upgrade_world(format: u32, alice: &Identity, bob: &Identity) -> MemoryBackend
 /// The upgrade finished: format 3, no journal, the ring's current key
 /// HPKE-wrapped (Bob still holds it), history unchanged and readable.
 fn assert_upgraded(disk: &Arc<dyn StorageBackend>, alice: &Identity, bob: &Identity, before: &BTreeMap<ObjectId, Files>, ctx: &str) {
-    assert_eq!(read_config(&**disk).unwrap().format, 3, "{ctx}");
+    assert_eq!(read_config(&**disk).unwrap().format, veil_core::repo::REPO_FORMAT, "{ctx}");
     assert!(!disk.exists(&p(JOURNAL_PATH)).unwrap(), "{ctx}: journal left behind");
     let repo = Repo::open(disk.clone(), Some(alice.clone()), "alice").unwrap();
     let ring = repo.keys().load_ring("team").unwrap().unwrap();
@@ -977,12 +1058,12 @@ fn upgrade_sweep(from: u32) {
 
             // Reboot: either format, never anything in between.
             let format = read_config(&*disk).unwrap().format;
-            assert!(format == from || format == 3, "{ctx}: format {format}");
+            assert!(format == from || format == veil_core::repo::REPO_FORMAT, "{ctx}: format {format}");
             let repo = Repo::open(disk.clone(), Some(alice.clone()), "alice")
                 .unwrap_or_else(|e| panic!("{ctx}: repository does not open: {e}"));
             assert_eq!(history(&repo), before, "{ctx}: history changed");
             let ring = repo.keys().load_ring("team").unwrap().unwrap();
-            if format == 3 && current_key_has_legacy_wraps(&ring, &ring.verify().unwrap()) {
+            if format == veil_core::repo::REPO_FORMAT && current_key_has_legacy_wraps(&ring, &ring.verify().unwrap()) {
                 in_ring_step += 1;
             }
             drop(repo);
@@ -991,7 +1072,7 @@ fn upgrade_sweep(from: u32) {
             // `vl upgrade` again resumes and finishes.
             let r = upgrade(disk.clone(), Some(alice.clone()), &UpgradeOptions::default())
                 .unwrap_or_else(|e| panic!("{ctx}: resuming failed: {e}"));
-            assert!(!r.up_to_date || format == 3, "{ctx}: {r:?}");
+            assert!(!r.up_to_date || format == veil_core::repo::REPO_FORMAT, "{ctx}: {r:?}");
             assert_upgraded(&disk, &alice, &bob, &before, &format!("{ctx}, after resuming"));
         }
     }

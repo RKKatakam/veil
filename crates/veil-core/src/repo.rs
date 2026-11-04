@@ -47,10 +47,11 @@ pub const VEIL_DIR: &str = ".veil";
 /// | 1 | vl 0.1.0 | JSON trees |
 /// | 2 | vl 1.0.0 | binary trees (`TreeEncoding::Binary`) |
 /// | 3 | vl 1.0.0 | standard crypto: AES-SIV sealed objects (`veil:sea2`), HPKE-wrapped ring keys (ring format 3) |
+/// | 4 | vl 1.0.0 | first-class conflicts: conflict objects (`veil:conf`) and conflict tree entries |
 ///
 /// Every format up to this one is read; see `docs/FORMAT.md` and
 /// `docs/CRYPTO.md`.
-pub const REPO_FORMAT: u32 = 3;
+pub const REPO_FORMAT: u32 = 4;
 
 /// Oldest repository format this build reads (and keeps writing, unchanged,
 /// until `vl upgrade`).
@@ -60,7 +61,7 @@ pub const MIN_REPO_FORMAT: u32 = 1;
 pub fn min_vl_for_format(format: u32) -> &'static str {
     match format {
         0 | 1 => "0.1.0",
-        2 | 3 => "1.0.0",
+        2..=4 => "1.0.0",
         _ => "a newer release",
     }
 }
@@ -489,6 +490,13 @@ impl Repo {
     /// the merge base of the parents merged so far and that parent
     /// ([`Repo::merge_base_tree`]: a virtual base when there are several).
     pub fn parents_tree(&self, parents: &[ObjectId]) -> Result<MergeOutcome> {
+        self.parents_tree_with(parents, false)
+    }
+
+    /// [`Repo::parents_tree`]; with `markers`, conflicts are written as
+    /// markers into the files whatever the repository format (for a merge
+    /// about to go under an embargo, see [`crate::merge::merge_trees_with_markers`]).
+    pub fn parents_tree_with(&self, parents: &[ObjectId], markers: bool) -> Result<MergeOutcome> {
         match parents {
             [] => Ok(MergeOutcome {
                 tree: self.store.empty_tree()?,
@@ -507,7 +515,10 @@ impl Repo {
                     // unreleased embargo) contributes nothing we can see.
                     let Some(ps) = self.snapshot_opt(p)? else { continue };
                     let base = self.merge_base_tree(&merged, &[*p])?;
-                    let out = merge_trees(&self.store, Some(base), acc, ps.tree)?;
+                    let out = match markers {
+                        true => crate::merge::merge_trees_with_markers(&self.store, Some(base), acc, ps.tree)?,
+                        false => merge_trees(&self.store, Some(base), acc, ps.tree)?,
+                    };
                     acc = out.tree;
                     conflicts.extend(out.conflicts);
                     merged.push(*p);

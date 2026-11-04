@@ -18,6 +18,7 @@ text:
 | [`vl scan`](scan.md) | [`veil.scan/1`](#veilscan1) |
 | [`vl secret list`](secret.md#vl-secret-list) | [`veil.secret.list/1`](#veilsecretlist1) |
 | [`vl ls`](ls.md) | [`veil.ls/1`](#veills1) |
+| [`vl resolve --list`](resolve.md) | [`veil.resolve.list/1`](#veilresolvelist1) |
 | [`vl push --dry-run`](push.md) | [`veil.push.plan/1`](#veilpushplan1) |
 | any of them, on failure | [`veil.error/1`](#veilerror1) |
 
@@ -176,6 +177,22 @@ A changed path, as `vl status` lists it.
 | `visibility` | [visibility](#visibility) | Of the new version (of the old one, for a deletion) |
 | `redacted` | bool | The new version is unreadable here |
 | `tier` | string | Its [tier](#tier) for this reader: `public`, `cloaked`, `embargoed` or `redacted` (`[redacted]` in the text, followed by the label of whom it is sealed for) |
+| `conflict` | [conflict](#conflict) or null | The new version is an unresolved conflict (`[conflict]` in the text); `visibility` and `tier` are then those of the file with markers you are shown |
+
+### Conflict
+
+An unresolved conflict recorded as data (repository format 4): the versions
+of a file a merge could not combine. It never carries content. Null for a
+file, and for a conflict recorded as markers in the file (older formats,
+merges under an embargo), which is resolved by editing the file.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `sides` | number | Versions being combined (2 for an ordinary conflict) |
+| `bases` | number | Base versions (1 for an ordinary conflict) |
+| `versions` | array | Every version, sides and bases interleaved (side 1, base 1, side 2, …): `role` (`side` or `base`), `number` (1-based, per role), `visibility` ([visibility](#visibility) or null: null when this version has no file, i.e. added on one side only, or deleted) and `readable` (bool: you can read it) |
+| `redacted` | bool | Some version is not shown in the file you are shown: sealed for another audience than that file's, or unreadable here |
+| `unreadable_side` | bool | A side cannot be read here: you cannot resolve it (your edits of it are held back) |
 
 ### Tier
 
@@ -211,6 +228,7 @@ An entry (`old`, `new`):
 | `executable` | bool | The executable bit |
 | `mode` | string | `100644` or `100755`, as Git writes it |
 | `readable` | bool | This reader can materialise this version (for an embargoed file: its pre-merge fallback counts) |
+| `conflict` | [conflict](#conflict) or null | This version is an unresolved conflict; its content (and `visibility`, `executable`, `readable`) is that of the file with markers you are shown (`unresolved conflict` in the text) |
 
 `content`:
 
@@ -263,7 +281,7 @@ this command found.
 | `policy_held_back` | array | Local paths that keep the protection you accepted because `.veilpolicy` would weaken it (`vl policy accept` applies it): `path` (with a trailing `/` for a directory), `dir` (bool: a directory held back as a whole), `accepted` and `wanted` (strings: policy keywords such as `isolate`, `cloak ops`, `public!`), `tier` (the [tier](#tier) the accepted classification gives it: `isolated`, `ignored`, `cloaked` or `public`) and `scope` (string or null: of `cloaked`) |
 | `nested` | array of strings | Directories that are repositories of their own; nothing in them is recorded here |
 | `redacted` | array | Files of `@` that are absent on disk because you cannot read them: `path`, `redaction` (a [redaction](#redaction)) and `tier` (`redacted`, or for `unwritable` the file's own [tier](#tier)) |
-| `conflicts` | array | Unresolved conflicts: `path`, and `recorded_on` (string or null: the short change id of the parent, a merge, that recorded it; null if recorded on `@` itself) |
+| `conflicts` | array | Unresolved conflicts: `path`, `recorded_on` (string or null: the short change id of the parent, a merge, that recorded it with the same version; null if recorded on `@` itself) and `conflict` (a [conflict](#conflict), or null for markers in the file) |
 
 ## `veil.log/1`
 
@@ -415,6 +433,23 @@ the working copy its local-only files.
 | `fallback` | bool | What you can read is the file's last public version: it was edited on a cloaked line of a scope you are not in |
 | `redaction` | [redaction](#redaction) or null | Why a `redacted` file cannot be read. Never content |
 | `quarantine` | object or null | A `quarantined` file: `rule` (string), `line` (number) and `state` (`never_recorded`, or `held_back`: history keeps the previous, recorded version) |
+| `conflict` | [conflict](#conflict) or null | An unresolved conflict (`conflict: 2 sides` in the text); `tier`, `scope`, `visibility`, `size` and `executable` are those of the file with markers you are shown, `readable` says whether you can read every side |
+
+## `veil.resolve.list/1`
+
+`vl resolve --list --json` (also `vl resolve --json`): the unresolved
+conflicts of a snapshot (`-r`, default `@`).
+
+```json
+{"schema":"veil.resolve.list/1","snapshot":{"snapshot_id":"ee72…02c8",…},
+ "conflicts":[{"path":"src/app.rs","conflict":{"sides":2,"bases":1,"versions":[{"role":"side","number":1,"visibility":{"kind":"public","scope":null,"embargo":null},"readable":true},…],"redacted":false,"unreadable_side":false}}]}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `veil.resolve.list/1` |
+| `snapshot` | [snapshot reference](#snapshot-reference) | The snapshot listed |
+| `conflicts` | array | In path order: `path`, and `conflict` (a [conflict](#conflict); null for a conflict recorded as markers in the file, or a file moved aside by a file/directory conflict) |
 
 ## `veil.push.plan/1`
 

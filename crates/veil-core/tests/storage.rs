@@ -98,6 +98,13 @@ fn assert_history_intact(repo: &Repo) {
                         assert_eq!(ObjectId::hash(&raw), id);
                     }
                 }
+                EntryKind::Conflict => {
+                    let c = store.conflict(&e.id).unwrap_or_else(|err| panic!("{} conflict: {err}", e.name));
+                    for id in c.referenced_ids() {
+                        let raw = store.get_raw(&id).unwrap_or_else(|err| panic!("{} {}: {err}", e.name, id.short()));
+                        assert_eq!(ObjectId::hash(&raw), id);
+                    }
+                }
             }
         }
     }

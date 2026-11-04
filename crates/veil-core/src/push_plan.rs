@@ -461,6 +461,15 @@ fn walk_public(
                 match e.kind {
                     EntryKind::Dir => stack.push((e.id, p, depth + 1)),
                     EntryKind::File => visit(&p, e),
+                    // Each version as a file: the plan shows what of it is
+                    // sent and what is withheld.
+                    EntryKind::Conflict => {
+                        if let Ok(c) = store.conflict(&e.id) {
+                            for t in c.interleaved().flatten() {
+                                visit(&p, &t.entry(&e.name));
+                            }
+                        }
+                    }
                 }
             }
         }

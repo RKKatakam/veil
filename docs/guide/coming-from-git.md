@@ -20,7 +20,7 @@ be undone. Add to that per-file encryption and engine-level secret handling.
 | reflog | **operation log** | Repository-wide, includes tags and workspaces: `vl op log`, `vl undo`, `vl op restore` |
 | `.gitignore` | **`.veilpolicy`** | Also says what is cloaked (encrypted), isolated (local-only) or public ([Secrets and visibility](secrets-and-visibility.md)) |
 | `git-crypt`, separate private repos | **cloaking** | `vl cloak secrets/`: encrypted for a scope, in the same repository |
-| merge conflict state | conflicted snapshot | Conflicts are recorded in the snapshot and marked `×`; nothing blocks you |
+| merge conflict state | conflicted snapshot | Conflicts are recorded in the snapshot as data and marked `×`; nothing blocks you. `vl resolve --list` lists them, `vl resolve PATH --ours` (or `--theirs`) picks a side |
 | remote | remote | A Veil repository at a path or over SSH. Git remotes are separate: `vl git remote` |
 
 ## Cheat sheet

@@ -8,7 +8,7 @@
 //! | Crypto | [`crypto`], [`identity`], [`keychain`] | XChaCha20-Poly1305 envelopes, X25519 identity rings, scope keys |
 //! | CAS | [`id`], [`object`], [`store`], [`pack`], [`gc`] | BLAKE3 content-addressed objects, sealed (encrypted) nodes, packfiles, garbage collection |
 //! | Policy | [`policy`], [`secrets`] | per-path visibility tiers, engine-level secret detection |
-//! | Trees | [`tree`], [`builder`], [`checkout`], [`merge`], [`statcache`] | tree views, snapshotting, materialisation, 3-way merge, stat cache |
+//! | Trees | [`tree`], [`builder`], [`checkout`], [`merge`], [`conflict`], [`statcache`] | tree views, snapshotting, materialisation, 3-way merge, first-class conflicts, stat cache |
 //! | Graph | [`oplog`], [`repo`], [`transaction`], [`revset`] | snapshot DAG, change ids, operation log, undo |
 //! | Features | [`workspace`], [`commands`], [`embargo`], [`remote`], [`vault`], [`upgrade`] | workspaces, cloaking, embargoes, sync, secrets vault, format migrations |
 //!
@@ -52,6 +52,7 @@ pub mod cache;
 pub mod checkout;
 pub mod clock;
 pub mod commands;
+pub mod conflict;
 pub mod crypto;
 pub mod embargo;
 pub mod error;
@@ -88,7 +89,7 @@ pub mod workspace;
 pub use error::{Result, VeilError};
 pub use id::{ChangeId, ObjectId};
 pub use identity::Identity;
-pub use object::{EntryKind, Snapshot, Tree, TreeEntry, Visibility};
+pub use object::{Conflict, ConflictTerm, EntryKind, Snapshot, Tree, TreeEntry, Visibility};
 pub use repo::Repo;
 pub use vfs::{MemoryBackend, OverlayBackend, SshUrl, StorageBackend};
 #[cfg(feature = "os")]

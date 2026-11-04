@@ -1,0 +1,21 @@
+{
+  "id": "4185dfd538",
+  "scope": "team",
+  "wrapped": {
+    "scope": "embargo-wrap:4185dfd538",
+    "nonce": "f380d954262decf7fad8544c8f2d93a75fa9723f4a5f9619",
+    "ciphertext": "c368f11a903c0130e5448232b0744697fdf1d033f7168f7bcf177e450f55861bf1c6e2007319185b17d2af4aa9df35e1"
+  },
+  "until": 4070908800000,
+  "released_key": null,
+  "released_at": null,
+  "created": 1793761725167,
+  "description": "",
+  "scope_key": "team#0766a53879cedb5a",
+  "key_id": "7df89f038763b7c9",
+  "signature": {
+    "signer": "veil1888a86b539fdd07822c13e9760843418325a1c055628a2f235bd0266bff85f22",
+    "key": "8c024c99c4ee48cfc988bae73645ef96f4d05dd49cf39f219b7f6eca8fae890d",
+    "sig": "8cdb523cfc8c61c5f987fcd91f9abe8cb8a46f26d8020330111ba9f6c81bc4dd2acc10f745738c2f71adce8e30b9ba517dbcdef03317373dc5f0c266a5376c06"
+  }
+}

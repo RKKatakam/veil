@@ -508,11 +508,19 @@ edit for `team`. If the policy you checked out re-keys the file and your
 accepted policy holds that back, the report points to `vl policy accept`
 instead.
 
-Conflict markers normally include the version both sides started from
-(the `||||||| original` section). If that version was sealed for an
-audience the merged file does not have (say it was cloaked for `team` and
-both sides made the file public), the markers leave that section out and
-show only the two sides.
+A conflict keeps every version as it was sealed: a conflict between a
+public version and one sealed for `team` names both, and a public remote
+receives the public version and the conflict, never the sealed one. The
+markers are written only into your working copy, for you. A version sealed
+for an audience the file with markers does not have is never shown in it:
+the base (the `||||||| original` section) is left out when it was sealed
+for an audience the merged file does not have (say it was cloaked for
+`team` and both sides made the file public), and a side you cannot read is
+a `(not shown: …)` line. GitHub (the Git export) gets the same file as a
+public reader would see it: public versions, and a `(not shown: this
+version is not public)` line for every other one. The file with markers is
+sealed like a merged file (never wider than a side it shows), so a
+resolution is sealed the same way.
 
 > **Public files edited in a cloaked workspace.** A public file you *edit*
 > in a cloaked workspace is recorded cloaked, together with its last public

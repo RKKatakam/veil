@@ -557,6 +557,10 @@ impl Transfer<'_> {
                 }
                 (true, children)
             }
+            // Every version a conflict names: each is checked like any
+            // object (`allowed`), so a public receiver never gets a sealed
+            // side, only the conflict naming it.
+            Object::Conflict(c) => (false, c.referenced_ids().into_iter().map(|id| (id, path.to_string())).collect()),
             Object::Blob(_) | Object::Sealed(_) => (false, Vec::new()),
         }))
     }

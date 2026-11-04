@@ -45,9 +45,50 @@ pub fn file_entry(repo: &Repo, rev: &ObjectId, path: &str) -> Option<TreeEntry> 
     lookup(repo.store(), &tree, &p(path)).unwrap()
 }
 
+/// What a reader gets for `path` at `rev`: a file's content, or a
+/// conflict's materialisation (the file with markers) for this reader.
 pub fn read_at(repo: &Repo, rev: &ObjectId, path: &str) -> Vec<u8> {
     let e = file_entry(repo, rev, path).unwrap_or_else(|| panic!("{path} missing"));
-    repo.store().read_entry(&e).unwrap()
+    veil_core::conflict::read_file_like(repo.store(), &e).unwrap()
+}
+
+/// The audience and content a reader sees for entry `e`: a file's own, or
+/// the materialised conflict's (repository format 4).
+pub fn seen(repo: &Repo, e: &TreeEntry) -> (Visibility, Vec<u8>) {
+    match e.kind {
+        EntryKind::Conflict => {
+            let m = veil_core::conflict::materialize_entry(repo.store(), e, veil_core::conflict::Audience::Reader).unwrap();
+            (m.visibility, m.content)
+        }
+        _ => (e.visibility.clone(), repo.store().read_entry(e).unwrap()),
+    }
+}
+
+/// Every version a file-like entry holds, each with the visibility its
+/// object really has and its plaintext when this reader can open it: one
+/// version for a file, every term for a conflict.
+pub fn versions(repo: &Repo, e: &TreeEntry) -> Vec<(Visibility, Option<Vec<u8>>)> {
+    let terms: Vec<TreeEntry> = match e.kind {
+        EntryKind::Conflict => repo
+            .store()
+            .conflict(&e.id)
+            .unwrap()
+            .interleaved()
+            .flatten()
+            .map(|t| t.entry(&e.name))
+            .collect(),
+        _ => vec![e.clone()],
+    };
+    terms
+        .into_iter()
+        .map(|t| {
+            let real = match repo.store().get_raw(&t.id) {
+                Ok(raw) => veil_core::builder::object_visibility(&raw).unwrap_or(t.visibility.clone()),
+                Err(_) => t.visibility.clone(),
+            };
+            (real, repo.store().read_blob(&t.id).ok())
+        })
+        .collect()
 }
 
 /// Commit `files` on top of the current working copy and return the commit.

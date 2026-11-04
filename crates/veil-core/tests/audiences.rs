@@ -286,16 +286,14 @@ fn mal_main(alice: &Repo, main: ObjectId) -> ObjectId {
     raw_snapshot(alice, vec![main], store.put_tree(&root).unwrap(), "rotate")
 }
 
+/// Every version at `secrets/db.yml` holding Alice's edit is sealed for
+/// `team` (a conflict keeps each version as it was).
 fn assert_mine_stays_team(alice: &Repo, rev: &ObjectId) {
     let e = file_entry(alice, rev, "secrets/db.yml").unwrap();
-    let data = alice.store().read_blob(&e.id).unwrap();
-    if String::from_utf8_lossy(&data).contains("ALICE-ROTATED") {
-        assert_eq!(
-            e.visibility,
-            team(),
-            "Alice's edit moved to {}",
-            e.visibility.label()
-        );
+    for (vis, data) in versions(alice, &e) {
+        if data.is_some_and(|d| String::from_utf8_lossy(&d).contains("ALICE-ROTATED")) {
+            assert_eq!(vis, team(), "Alice's edit moved to {}", vis.label());
+        }
     }
 }
 
@@ -340,13 +338,19 @@ fn a_merge_of_two_audiences_is_a_conflict_not_a_rekey() {
         );
         assert_mine_stays_team(&alice, &res.snapshot);
         let e = file_entry(&alice, &res.snapshot, "secrets/db.yml").unwrap();
-        if e.visibility == team() {
-            let data = alice.store().read_blob(&e.id).unwrap();
-            assert!(
-                !String::from_utf8_lossy(&data).contains("from-the-mal-scope"),
-                "{mine_is_ours}: mal content moved to team"
-            );
+        for (vis, data) in versions(&alice, &e) {
+            if vis == team() {
+                assert!(
+                    !data.is_some_and(|d| String::from_utf8_lossy(&d).contains("from-the-mal-scope")),
+                    "{mine_is_ours}: mal content moved to team"
+                );
+            }
         }
+        // What Alice is shown holds one side only, as it is.
+        let (vis, text) = seen(&alice, &e);
+        let text = String::from_utf8_lossy(&text);
+        assert!(!(text.contains("from-the-mal-scope") && text.contains("ALICE-ROTATED")), "{text}");
+        assert!(vis == team() || !text.contains("ALICE-ROTATED"), "{text}");
     }
 }
 
@@ -426,9 +430,40 @@ fn conflict_over(bv: Visibility, ov: Visibility, tv: Visibility) -> (TreeEntry, 
     let out = veil_core::merge::merge_trees(store, Some(base), ours, theirs).unwrap();
     assert_eq!(out.conflicts.len(), 1, "a conflict");
     let e = store.tree(&out.tree).unwrap().get("notes.txt").unwrap().clone();
-    let text = String::from_utf8(store.read_entry(&e).unwrap()).unwrap();
+    // Format 4: a conflict entry keeping every version sealed as it was;
+    // the markers are only rendered when the file is materialised.
+    assert_eq!(e.kind, veil_core::EntryKind::Conflict);
+    let vs = versions(&alice, &e);
+    assert_eq!(vs.iter().map(|v| v.0.clone()).collect::<Vec<_>>(), vec![ov, bv, tv]);
+    let (vis, text) = seen(&alice, &e);
+    let text = String::from_utf8(text).unwrap();
     assert!(text.contains("OURS") && text.contains("THEIRS") && text.contains("<<<<<<<"), "{text}");
-    (e, text)
+    (TreeEntry { visibility: vis, ..e }, text)
+}
+
+/// The same merge in a format-3 repository: markers in a stored file.
+#[test]
+fn a_format_3_conflict_never_shows_a_sealed_base_in_a_public_result() {
+    let fs = Arc::new(MemoryBackend::new());
+    let alice = veil_core::Repo::init_for_clone_at(fs, Some(Identity::generate("alice")), "alice", 3).unwrap();
+    alice.keys().create_scope("team").unwrap();
+    let store = alice.store();
+    let tree = |text: &str, v: &Visibility| {
+        let id = store.store_file(text.as_bytes(), v).unwrap();
+        let mut e = file("notes.txt", id);
+        e.size = text.len() as u64;
+        e.visibility = v.clone();
+        raw_tree(&alice, vec![e])
+    };
+    let base = tree(&format!("intro\n{BASE_LINE}\noutro\n"), &team());
+    let ours = tree("intro\nOURS\noutro\n", &Visibility::Public);
+    let theirs = tree("intro\nTHEIRS\noutro\n", &Visibility::Public);
+    let out = veil_core::merge::merge_trees(store, Some(base), ours, theirs).unwrap();
+    let e = store.tree(&out.tree).unwrap().get("notes.txt").unwrap().clone();
+    assert_eq!(e.kind, veil_core::EntryKind::File);
+    assert!(e.visibility.is_public());
+    let text = String::from_utf8(store.read_entry(&e).unwrap()).unwrap();
+    assert!(text.contains("<<<<<<<") && !text.contains(BASE_LINE), "{text}");
 }
 
 #[test]

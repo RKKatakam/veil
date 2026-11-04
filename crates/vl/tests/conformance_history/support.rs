@@ -243,14 +243,14 @@ impl R<'_> {
         veil_core::tree::walk_files(repo.store(), &s.tree)
             .unwrap()
             .into_iter()
-            .filter(|(_, e)| e.kind == EntryKind::File)
-            .map(|(p, e)| {
-                (
-                    p.to_string(),
-                    repo.store().read_entry(&e).ok(),
-                    e.visibility.clone(),
-                    e.executable,
-                )
+            .filter(|(_, e)| e.kind.is_file_like())
+            .map(|(p, e)| match e.kind {
+                // A conflict: the file with markers a member is shown.
+                EntryKind::Conflict => {
+                    let m = veil_core::conflict::materialize_entry(repo.store(), &e, veil_core::conflict::Audience::Reader).unwrap();
+                    (p.to_string(), Some(m.content), m.visibility, m.executable)
+                }
+                _ => (p.to_string(), repo.store().read_entry(&e).ok(), e.visibility.clone(), e.executable),
             })
             .collect()
     }
@@ -267,10 +267,17 @@ impl R<'_> {
         let repo = self.core();
         let id = veil_core::revset::resolve(&repo, rev, "default").unwrap();
         let s = repo.snapshot(&id).unwrap();
-        veil_core::tree::lookup(repo.store(), &s.tree, &VPath::new(path).unwrap())
+        let e = veil_core::tree::lookup(repo.store(), &s.tree, &VPath::new(path).unwrap())
             .unwrap()
-            .unwrap_or_else(|| panic!("{path} not in {rev}"))
-            .visibility
+            .unwrap_or_else(|| panic!("{path} not in {rev}"));
+        // A conflict entry (format 4): the audience of the file with
+        // markers a member is shown.
+        match e.kind {
+            EntryKind::Conflict => {
+                veil_core::conflict::materialize_entry(repo.store(), &e, veil_core::conflict::Audience::Reader).unwrap().visibility
+            }
+            _ => e.visibility,
+        }
     }
 
     pub fn tag_target(&self, name: &str) -> Option<String> {
@@ -364,6 +371,18 @@ impl R<'_> {
                 continue;
             };
             for (p, e) in files {
+                // An outsider's view of a conflict: what it is shown, and
+                // every version it can open.
+                if e.kind == EntryKind::Conflict {
+                    let mut seen = vec![veil_core::conflict::read_file_like(repo.store(), &e).unwrap_or_default()];
+                    if let Ok(c) = repo.store().conflict(&e.id) {
+                        seen.extend(c.interleaved().flatten().filter_map(|t| repo.store().read_blob(&t.id).ok()));
+                    }
+                    if seen.iter().any(|d| d.windows(needle.len()).any(|w| w == needle.as_bytes())) {
+                        hits.push(format!("{p} (conflict) in {}", id.short()));
+                    }
+                    continue;
+                }
                 if e.kind != EntryKind::File {
                     continue;
                 }

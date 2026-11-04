@@ -29,7 +29,7 @@ use anyhow::Result;
 use serde::Serialize;
 use veil_core::{
     keychain::{split_label, ReleaseState, SignatureStatus},
-    object::{Snapshot, Text, Visibility},
+    object::{EntryKind, Snapshot, Text, Visibility},
     policy::{Policy, Tier},
     secrets::{self, looks_binary},
     tree::{diff_trees, lookup, TreeChange},
@@ -53,6 +53,7 @@ pub const SECRET_LIST_SCHEMA: &str = "veil.secret.list/1";
 pub const ERROR_SCHEMA: &str = "veil.error/1";
 pub const LS_SCHEMA: &str = "veil.ls/1";
 pub const PUSH_PLAN_SCHEMA: &str = "veil.push.plan/1";
+pub const RESOLVE_LIST_SCHEMA: &str = "veil.resolve.list/1";
 
 // ---- JSON output -------------------------------------------------------------
 
@@ -281,6 +282,74 @@ fn status_word(c: &TreeChange) -> &'static str {
     }
 }
 
+/// A conflict entry (repository format 4) as this reader sees it: the
+/// versions a merge could not combine. Labels are public metadata; no
+/// content is ever included.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct ConflictInfo {
+    /// Versions being combined (2 for a three-way conflict).
+    pub sides: usize,
+    /// Base versions (1 for a three-way conflict).
+    pub bases: usize,
+    /// Every version, sides and bases interleaved as stored.
+    pub versions: Vec<ConflictVersion>,
+    /// Some version is not shown in the file materialised here (sealed for
+    /// another audience than the file's, or unreadable here).
+    pub redacted: bool,
+    /// A side cannot be read here: this reader cannot resolve it.
+    pub unreadable_side: bool,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct ConflictVersion {
+    /// `side` or `base`.
+    pub role: &'static str,
+    /// 1-based, per role.
+    pub number: usize,
+    /// Null when this version has no file (added on one side only, or
+    /// deleted).
+    pub visibility: Option<Vis>,
+    /// This reader can read the version.
+    pub readable: bool,
+}
+
+/// [`ConflictInfo`] of `e`, `None` unless it is a conflict entry.
+pub fn conflict_info(repo: &Repo, e: &TreeEntry) -> Option<ConflictInfo> {
+    if e.kind != EntryKind::Conflict {
+        return None;
+    }
+    let c = repo.store().conflict(&e.id).ok()?;
+    let m = veil_core::conflict::materialize(repo.store(), &c, veil_core::conflict::Audience::Reader).ok()?;
+    let versions = c
+        .interleaved()
+        .enumerate()
+        .map(|(i, t)| ConflictVersion {
+            role: if i % 2 == 0 { "side" } else { "base" },
+            number: i / 2 + 1,
+            visibility: t.as_ref().map(|t| Vis::from(&t.visibility)),
+            readable: t.as_ref().is_none_or(|t| id_readable(repo, &t.id)),
+        })
+        .collect();
+    Some(ConflictInfo { sides: c.adds.len(), bases: c.removes.len(), versions, redacted: m.redacted, unreadable_side: m.unreadable_side })
+}
+
+/// What a reader sees of a conflict entry: the materialised file's
+/// visibility, size and executable bit, and whether every side is
+/// readable here.
+fn conflict_view(repo: &Repo, e: &TreeEntry) -> Option<(Visibility, u64, bool, bool)> {
+    if e.kind != EntryKind::Conflict {
+        return None;
+    }
+    let m = veil_core::conflict::materialize_entry(repo.store(), e, veil_core::conflict::Audience::Reader).ok()?;
+    Some((m.visibility, m.content.len() as u64, m.executable, !m.unreadable_side))
+}
+
+/// The visibility a reader should be told for `e`: a conflict's is that of
+/// its materialised file.
+fn shown_visibility(repo: &Repo, e: &TreeEntry) -> Visibility {
+    conflict_view(repo, e).map_or_else(|| e.visibility.clone(), |v| v.0)
+}
+
 /// One changed path, as `vl status` and `vl diff --stat` list it.
 #[derive(Serialize, Debug, Clone)]
 pub struct Change {
@@ -295,6 +364,8 @@ pub struct Change {
     /// `vl ls` shows it: `public`, `cloaked`, `embargoed` or `redacted`
     /// (this reader cannot read it; `visibility` says for whom it is).
     pub tier: &'static str,
+    /// The new version is an unresolved conflict (null otherwise).
+    pub conflict: Option<ConflictInfo>,
 }
 
 pub fn change(repo: &Repo, c: &TreeChange) -> Change {
@@ -302,9 +373,10 @@ pub fn change(repo: &Repo, c: &TreeChange) -> Change {
     Change {
         path: path(&c.path),
         status: status_word(c),
-        visibility: Vis::from(&e.visibility),
+        visibility: Vis::from(&shown_visibility(repo, e)),
         redacted: c.new.as_ref().is_some_and(|e| !repo.store().entry_readable(e)),
         tier: entry_tier(repo, e),
+        conflict: c.new.as_ref().and_then(|e| conflict_info(repo, e)),
     }
 }
 
@@ -316,6 +388,17 @@ pub fn change(repo: &Repo, c: &TreeChange) -> Change {
 /// (sealed for someone else, or withheld here). The local-only tiers
 /// (`isolated`, `ignored`, `quarantined`) come from the working copy.
 pub fn entry_tier(repo: &Repo, e: &TreeEntry) -> &'static str {
+    // A conflict: the tier of its materialised file, `redacted` when a
+    // side cannot be read here.
+    if let Some((v, _, _, all_readable)) = conflict_view(repo, e) {
+        return match v {
+            _ if !all_readable => "redacted",
+            Visibility::Public => "public",
+            Visibility::Embargoed { embargo } if repo.keys().embargo_released(&embargo) => "public",
+            Visibility::Cloaked { .. } => "cloaked",
+            Visibility::Embargoed { .. } => "embargoed",
+        };
+    }
     match &e.visibility {
         Visibility::Public => "public",
         Visibility::Embargoed { embargo } if repo.keys().embargo_released(embargo) => "public",
@@ -353,6 +436,12 @@ fn keyword_tier(keyword: &str) -> (&'static str, Option<String>) {
 /// Why `e` cannot be materialised here, in the words of `vl status`
 /// (`render::hidden_reason`).
 fn redaction_for_listing(repo: &Repo, e: &TreeEntry) -> Option<Redaction> {
+    if e.kind == EntryKind::Conflict {
+        return Some(Redaction {
+            reason: "conflict_side",
+            message: "a conflict with a version you cannot read (shown redacted)".into(),
+        });
+    }
     let present = repo.store().has(&e.id);
     Some(match &e.visibility {
         Visibility::Public => return None,
@@ -456,6 +545,10 @@ pub struct Conflict {
     /// Short change id of the parent the conflict was recorded on (a
     /// merge), or null if recorded on the working-copy change itself.
     pub recorded_on: Option<String>,
+    /// The conflict as data (repository format 4); null for a conflict
+    /// recorded as markers in the file (older formats, embargoes) or a
+    /// file moved aside by a file/directory conflict.
+    pub conflict: Option<ConflictInfo>,
 }
 
 pub fn status(ctx: &Ctx) -> Result<Status> {
@@ -483,14 +576,27 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
     }
     // Conflicts recorded on `@`, and those of its parents (a merge records
     // them on the merge, `@-`) whose file `@` has not touched since.
-    let mut conflicts: Vec<Conflict> = s.conflicts.iter().map(|c| Conflict { path: c.clone(), recorded_on: None }).collect();
-    for p in &s.parents {
-        let ps = repo.snapshot(p)?;
+    // A conflict entry `@` has unchanged from a parent that records it was
+    // recorded there.
+    let parents: Vec<_> = s.parents.iter().map(|p| repo.snapshot(p)).collect::<std::result::Result<_, _>>()?;
+    let mut conflicts: Vec<Conflict> = Vec::new();
+    for c in &s.conflicts {
+        let entry = VPath::new(c).ok().and_then(|cp| lookup(repo.store(), &s.tree, &cp).ok().flatten());
+        let recorded_on = parents.iter().find_map(|ps| {
+            let cp = VPath::new(c).ok()?;
+            let before = lookup(repo.store(), &ps.tree, &cp).ok().flatten();
+            (ps.conflicts.contains(c) && before.is_some() && before == entry).then(|| ps.change_id.short())
+        });
+        let conflict = entry.as_ref().and_then(|e| conflict_info(repo, e));
+        conflicts.push(Conflict { path: c.clone(), recorded_on, conflict });
+    }
+    for ps in &parents {
         for c in &ps.conflicts {
             let Ok(cp) = VPath::new(c) else { continue };
             let before = lookup(repo.store(), &ps.tree, &cp)?;
             if before.is_some() && before == lookup(repo.store(), &s.tree, &cp)? && !conflicts.iter().any(|x| x.path == *c) {
-                conflicts.push(Conflict { path: c.clone(), recorded_on: Some(ps.change_id.short()) });
+                let conflict = before.as_ref().and_then(|e| conflict_info(repo, e));
+                conflicts.push(Conflict { path: c.clone(), recorded_on: Some(ps.change_id.short()), conflict });
             }
         }
     }
@@ -737,6 +843,9 @@ pub struct EntryInfo {
     pub mode: &'static str,
     /// This reader can materialise the file.
     pub readable: bool,
+    /// An unresolved conflict (null otherwise); its content is the file
+    /// with markers this reader is shown.
+    pub conflict: Option<ConflictInfo>,
 }
 
 #[derive(Serialize, Debug)]
@@ -770,11 +879,21 @@ pub struct HunkLine {
 /// `readable` costs a read of the object: the text output, which never
 /// shows it, skips it (`check_readable: false` leaves it true).
 fn entry_info(repo: &Repo, e: &TreeEntry, check_readable: bool) -> EntryInfo {
+    if let Some((v, _, executable, all_readable)) = conflict_view(repo, e) {
+        return EntryInfo {
+            visibility: Vis::from(&v),
+            executable,
+            mode: if executable { "100755" } else { "100644" },
+            readable: all_readable,
+            conflict: conflict_info(repo, e),
+        };
+    }
     EntryInfo {
         visibility: Vis::from(&e.visibility),
         executable: e.executable,
         mode: if e.executable { "100755" } else { "100644" },
         readable: !check_readable || repo.store().entry_readable(e),
+        conflict: None,
     }
 }
 
@@ -809,7 +928,7 @@ fn content(repo: &Repo, c: &TreeChange) -> Content {
     let read = |e: &Option<TreeEntry>| -> Result<Vec<u8>, Redaction> {
         match e {
             None => Ok(Vec::new()),
-            Some(e) => match repo.store().read_entry(e) {
+            Some(e) => match veil_core::conflict::read_file_like(repo.store(), e) {
                 Ok(d) => Ok(d),
                 Err(err) if err.is_unreadable() => Err(redaction_for_diff(repo, e, &err)),
                 Err(err) => Err(Redaction { reason: "error", message: err.to_string() }),
@@ -1328,6 +1447,10 @@ pub struct LsEntry {
     /// history keeps an earlier version (`held_back`) or none
     /// (`never_recorded`).
     pub quarantine: Option<LsQuarantine>,
+    /// An unresolved conflict (null otherwise): `tier`, `visibility`,
+    /// `size` and `executable` are those of the file with markers this
+    /// reader is shown.
+    pub conflict: Option<ConflictInfo>,
 }
 
 #[derive(Serialize, Debug)]
@@ -1376,7 +1499,11 @@ pub fn ls(ctx: &Ctx, rev: &str, paths: &[String], all: bool, local_files: bool) 
             continue;
         }
         let mut tier = entry_tier(repo, &e);
-        let readable = id_readable(repo, &e.id);
+        let view = conflict_view(repo, &e);
+        let readable = match &view {
+            Some(v) => v.3,
+            None => id_readable(repo, &e.id),
+        };
         let fallback = !readable && e.fallback.is_some_and(|f| id_readable(repo, &f));
         let redaction = match tier {
             "redacted" => redaction_for_listing(repo, &e).map(|mut r| {
@@ -1391,7 +1518,11 @@ pub fn ls(ctx: &Ctx, rev: &str, paths: &[String], all: bool, local_files: bool) 
         if q.is_some() {
             tier = "quarantined";
         }
-        let (scope, embargo) = vis_parts(&e.visibility);
+        let (vis, size, executable) = match &view {
+            Some((v, size, exec, _)) => (v.clone(), *size, *exec),
+            None => (e.visibility.clone(), e.size, e.executable),
+        };
+        let (scope, embargo) = vis_parts(&vis);
         entries.push((
             p.clone(),
             LsEntry {
@@ -1401,13 +1532,14 @@ pub fn ls(ctx: &Ctx, rev: &str, paths: &[String], all: bool, local_files: bool) 
                 scope,
                 embargo,
                 recorded: true,
-                visibility: Some(Vis::from(&e.visibility)),
-                size: Some(e.size),
-                executable: e.executable,
+                visibility: Some(Vis::from(&vis)),
+                size: Some(size),
+                executable,
                 readable: readable || fallback,
                 fallback,
                 redaction,
                 quarantine: q,
+                conflict: conflict_info(repo, &e),
             },
         ));
     }
@@ -1447,6 +1579,7 @@ pub fn ls(ctx: &Ctx, rev: &str, paths: &[String], all: bool, local_files: bool) 
                     fallback: false,
                     redaction: None,
                     quarantine: if tier == "quarantined" { quarantine(&p) } else { None },
+                    conflict: None,
                 },
             ));
         }
@@ -1464,6 +1597,53 @@ pub fn ls(ctx: &Ctx, rev: &str, paths: &[String], all: bool, local_files: bool) 
     // Tree order: by path components.
     entries.sort_by(|(a, _), (b, _)| a.as_str().split('/').cmp(b.as_str().split('/')));
     Ok(Ls { schema: LS_SCHEMA, snapshot: snapshot_ref(repo, &id), working_copy, all, entries: entries.into_iter().map(|(_, e)| e).collect() })
+}
+
+// ---- resolve --list -----------------------------------------------------------------
+
+/// `vl resolve --list --json` (`veil.resolve.list/1`).
+#[derive(Serialize, Debug)]
+pub struct ResolveList {
+    pub schema: &'static str,
+    pub snapshot: SnapshotRef,
+    /// In path order.
+    pub conflicts: Vec<ResolveItem>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct ResolveItem {
+    pub path: String,
+    /// The conflict as data; null for a conflict recorded as markers in the
+    /// file (older repository formats, embargoes) or a file moved aside by
+    /// a file/directory conflict: those are resolved by editing the file.
+    pub conflict: Option<ConflictInfo>,
+}
+
+/// `vl resolve [--list] [-r REV] [PATHS…]`.
+pub fn resolve_list(ctx: &Ctx, rev: &str, paths: &[String]) -> Result<ResolveList> {
+    let repo = &ctx.repo;
+    let id = ctx.rev(rev)?;
+    let snap = repo.snapshot(&id)?;
+    let filters: Vec<VPath> = paths.iter().map(|p| ctx.repo_path(p)).collect::<Result<_>>()?;
+    let mut conflicts: Vec<ResolveItem> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for p in veil_core::conflict::conflict_paths(repo.store(), &snap.tree)? {
+        if !under(&filters, &p, false) {
+            continue;
+        }
+        let e = lookup(repo.store(), &snap.tree, &p)?.expect("listed");
+        seen.insert(p.to_string());
+        conflicts.push(ResolveItem { path: path(&p), conflict: conflict_info(repo, &e) });
+    }
+    for c in &snap.conflicts {
+        let Ok(p) = VPath::new(c) else { continue };
+        if seen.contains(c) || !under(&filters, &p, false) {
+            continue;
+        }
+        conflicts.push(ResolveItem { path: c.clone(), conflict: None });
+    }
+    conflicts.sort_by(|a, b| a.path.split('/').cmp(b.path.split('/')));
+    Ok(ResolveList { schema: RESOLVE_LIST_SCHEMA, snapshot: snapshot_ref(repo, &id), conflicts })
 }
 
 // ---- push --dry-run ----------------------------------------------------------------

@@ -128,12 +128,18 @@ fn sig() -> Value {
     nullable(json!({"status": "string", "signer": "string|null", "key": "string|null", "key_short": "string|null"}))
 }
 
+/// A conflict entry's description (`ConflictInfo`), or null.
+fn conflict_info() -> Value {
+    let version = json!({"role": "string", "number": "number", "visibility": nullable(vis()), "readable": "bool"});
+    nullable(json!({"sides": "number", "bases": "number", "versions": [version], "redacted": "bool", "unreadable_side": "bool"}))
+}
+
 fn change() -> Value {
-    json!({"path": "string", "status": "string", "visibility": vis(), "redacted": "bool", "tier": "string"})
+    json!({"path": "string", "status": "string", "visibility": vis(), "redacted": "bool", "tier": "string", "conflict": conflict_info()})
 }
 
 fn diff_files() -> Value {
-    let entry = nullable(json!({"visibility": vis(), "executable": "bool", "mode": "string", "readable": "bool"}));
+    let entry = nullable(json!({"visibility": vis(), "executable": "bool", "mode": "string", "readable": "bool", "conflict": conflict_info()}));
     let line = json!({"kind": "string", "text": "string", "newline": "bool"});
     let hunk = json!({"old_start": "number", "old_lines": "number", "new_start": "number", "new_lines": "number", "lines": [line]});
     json!([{
@@ -173,7 +179,7 @@ fn specs() -> Vec<(&'static str, Value)> {
             }],
             "nested": ["string"],
             "redacted": [{"path": "string", "redaction": redaction(), "tier": "string"}],
-            "conflicts": [{"path": "string", "recorded_on": "string|null"}],
+            "conflicts": [{"path": "string", "recorded_on": "string|null", "conflict": conflict_info()}],
         })),
         ("veil.log/1", json!({"schema": "string", "entries": [log_entry], "truncated": "bool"})),
         ("veil.diff/1", json!({"schema": "string", "stat": "bool", "files": diff_files()})),
@@ -211,7 +217,12 @@ fn specs() -> Vec<(&'static str, Value)> {
                 "recorded": "bool", "visibility": nullable(vis()), "size": "number|null", "executable": "bool",
                 "readable": "bool", "fallback": "bool", "redaction": nullable(redaction()),
                 "quarantine": nullable(json!({"rule": "string", "line": "number", "state": "string"})),
+                "conflict": conflict_info(),
             }],
+        })),
+        ("veil.resolve.list/1", json!({
+            "schema": "string", "snapshot": snapshot_ref(),
+            "conflicts": [{"path": "string", "conflict": conflict_info()}],
         })),
         ("veil.push.plan/1", {
             let snap = json!({"snapshot_id": "string", "snapshot_short": "string", "embargo": "string"});
@@ -386,6 +397,8 @@ fn read_commands() -> Vec<(Vec<&'static str>, &'static str)> {
         (vec!["ls", "--json"], "veil.ls/1"),
         (vec!["ls", "--all", "--json"], "veil.ls/1"),
         (vec!["push", "--dry-run", "--json"], "veil.push.plan/1"),
+        (vec!["resolve", "--list", "--json"], "veil.resolve.list/1"),
+        (vec!["resolve", "--json"], "veil.resolve.list/1"),
     ]
 }
 
@@ -495,6 +508,25 @@ fn status_shape_with_conflicts() {
     check_doc(&v, "veil.log/1");
     let merge = v["entries"].as_array().unwrap().iter().find(|e| e["parents"].as_array().unwrap().len() == 2).expect("a merge");
     assert_eq!(merge["conflicts"], json!(["a.txt"]));
+    // Format 4: the conflict is data, described in every listing.
+    assert_eq!(c[0]["conflict"]["sides"], 2, "{v}");
+    let roles: Vec<&str> = c[0]["conflict"]["versions"].as_array().unwrap().iter().map(|x| x["role"].as_str().unwrap()).collect();
+    assert_eq!(roles, ["side", "base", "side"]);
+    let v = json_ok(&env, "alice", &proj, &["ls", "--json"]);
+    check_doc(&v, "veil.ls/1");
+    let a = v["entries"].as_array().unwrap().iter().find(|e| e["path"] == "a.txt").unwrap();
+    assert_eq!(a["conflict"]["sides"], 2, "{a}");
+    assert_eq!(a["tier"], "public");
+    let v = json_ok(&env, "alice", &proj, &["resolve", "--list", "--json"]);
+    check_doc(&v, "veil.resolve.list/1");
+    assert_eq!(v["conflicts"][0]["path"], "a.txt");
+    let v = json_ok(&env, "alice", &proj, &["diff", "-r", "@-", "--json"]);
+    check_doc(&v, "veil.diff/1");
+    let out = env.ok("alice", &proj, &["resolve", "a.txt", "--theirs"]);
+    assert!(out.contains("Resolved a.txt"), "{out}");
+    assert_eq!(std::fs::read_to_string(proj.join("a.txt")).unwrap(), "theirs\n");
+    let v = json_ok(&env, "alice", &proj, &["status", "--json"]);
+    assert!(v["conflicts"].as_array().unwrap().is_empty(), "{v}");
 }
 
 #[test]

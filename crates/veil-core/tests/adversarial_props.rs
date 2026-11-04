@@ -123,7 +123,7 @@ fn files_of(repo: &Repo, snapshot: &ObjectId) -> Vec<(VPath, Vec<u8>)> {
         .unwrap()
         .into_iter()
         .map(|(p, e)| {
-            let d = repo.store().read_entry(&e).unwrap();
+            let d = veil_core::conflict::read_file_like(repo.store(), &e).unwrap();
             (p, d)
         })
         .collect()
@@ -195,9 +195,7 @@ impl Harness {
         for id in self.visible(true) {
             let snap = self.repo.snapshot(&id).unwrap_or_else(|e| panic!("[{ctx}] {id:?} unreadable: {e}"));
             for (path, e) in walk_files(self.repo.store(), &snap.tree).unwrap() {
-                self.repo
-                    .store()
-                    .read_entry(&e)
+                veil_core::conflict::read_file_like(self.repo.store(), &e)
                     .unwrap_or_else(|err| panic!("[{ctx}] {path} in {id:?} unreadable: {err}"));
             }
         }
@@ -210,6 +208,20 @@ impl Harness {
                 }
                 let base = self.repo.parents_tree(&snap.parents).unwrap().tree;
                 for c in diff_trees(self.repo.store(), Some(&base), Some(&snap.tree)).unwrap() {
+                    if let Some(e) = c.new.as_ref().filter(|e| e.kind == veil_core::EntryKind::Conflict) {
+                        // A conflict introduces no content: a public version
+                        // in it is one some public line already holds.
+                        let public = public_blobs(&self.repo);
+                        for t in self.repo.store().conflict(&e.id).unwrap().interleaved().flatten() {
+                            assert!(
+                                !t.visibility.is_public() || public.contains(&t.id) || c.path.as_str() == ".veilpolicy",
+                                "[{ctx}] cloaked change {id:?} introduces a public conflict version at {}\nlog: {:#?}",
+                                c.path,
+                                self.log
+                            );
+                        }
+                        continue;
+                    }
                     if let Some(e) = &c.new {
                         assert!(
                             !e.visibility.is_public() || c.path.as_str() == ".veilpolicy",
@@ -426,6 +438,23 @@ impl Harness {
             }
         }
     }
+}
+
+/// Every plaintext file version held by an uncloaked snapshot in the store.
+fn public_blobs(repo: &Repo) -> BTreeSet<ObjectId> {
+    let mut out = BTreeSet::new();
+    for id in repo.store().list_objects().unwrap() {
+        let Ok(s) = repo.store().snapshot(&id) else { continue };
+        if s.cloak.is_some() {
+            continue;
+        }
+        for (_, e) in walk_files(repo.store(), &s.tree).unwrap() {
+            if e.kind == veil_core::EntryKind::File && e.visibility.is_public() {
+                out.insert(e.id);
+            }
+        }
+    }
+    out
 }
 
 fn files_of_tree_of(repo: &Repo, id: &ObjectId) -> usize {

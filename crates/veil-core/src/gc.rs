@@ -286,8 +286,26 @@ impl Mark<'_> {
                             }
                         }
                     }
+                    EntryKind::Conflict => self.conflict(e.id, &p),
                 }
             }
+        }
+    }
+
+    /// A conflict object and every version it names.
+    fn conflict(&mut self, id: ObjectId, path: &str) {
+        if !self.reach.insert(id) {
+            return;
+        }
+        match self.store.conflict(&id) {
+            Ok(c) => {
+                for t in c.referenced_ids() {
+                    if self.reach.insert(t) {
+                        self.hint(HINT_FILE, path, t);
+                    }
+                }
+            }
+            Err(e) => self.incomplete.push(format!("conflict {} at '{path}': {e}", id.short())),
         }
     }
 
@@ -310,6 +328,7 @@ impl Mark<'_> {
                 self.trees_of_snapshots();
             }
             Ok(Object::Tree(_)) => self.tree(id, String::new()),
+            Ok(Object::Conflict(_)) => self.conflict(id, ""),
             Ok(Object::Blob(_)) => {
                 self.reach.insert(id);
             }

@@ -274,7 +274,10 @@ Nothing is recorded when this happens. Your options:
   itself) is skipped by `vl push`.
 * Conflicts on an embargoed line are reported by the command that produced
   them but not recorded on the snapshot (conflicted file names would tell
-  outsiders what the fix touches).
+  outsiders what the fix touches). They are written as markers into the
+  file, never as a conflict entry (whose versions keep their own sealing,
+  outside the embargo); an unresolved conflict the embargoed merge takes in
+  goes under the embargo as its file of markers.
 
 ## Limitations in 1.0
 

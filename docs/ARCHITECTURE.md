@@ -801,6 +801,20 @@ CAS, and it applies these rules in order:
      destination's audience only when it was public; content sealed for
      another scope is not resealed, and the destination keeps its own
      entry (reported).
+   * **Conflicts never move content between audiences** (format 4). A
+     conflict entry keeps every version sealed as it was, so a public
+     conflict may name a sealed version: its object is withheld from public
+     remotes and readers without its key see it redacted. The file with
+     markers is rendered per reader (`conflict::materialize`): its audience
+     is that of a file merged from the sides (never wider than any side it
+     shows), a side or base is shown only when it is public (or under a
+     released embargo) or verifiably sealed exactly as that file, anything
+     else is a `(not shown: …)` line, and with two scopes only the side the
+     merge rule keeps (the base's scope, else ours) is shown. The rules
+     below for markers apply to that rendering as they did to stored
+     marker files. Merge normalisation never reseals or publishes a
+     conflict entry, and an embargo takes in a changed conflict only as its
+     file of markers, sealed like a file.
    * **Conflict markers show the base only to its own audience**
      (BUG-126). A conflicted text merge writes diff3 markers, whose
      "original" section is the merge base's version. That section is
@@ -951,7 +965,7 @@ struct Snapshot {
     parents: Vec<ObjectId>, change_id: ChangeId, tree: ObjectId,
     description: Text /* Plain | Sealed */, author, timestamp,
     predecessors: Vec<ObjectId>,   // evolution log
-    conflicts: Vec<String>,        // paths with unresolved markers
+    conflicts: Vec<String>,        // conflicted paths (format 4: an index of the tree's conflict entries)
     cloak: Option<String>,         // cloaked line of work
     embargo: Option<String>,       // embargo introduced here
 }
@@ -1019,11 +1033,71 @@ struct Snapshot {
   operation (BUG-246). A parent named twice (`vl new X X`, `vl rebase -d X
   -d X`) is recorded once, and `vl merge X --into X` is refused (BUG-240).
 * **Merging** is tree-level. Identical subtrees resolve by id, and files
-  changed on both sides go through diff3 (`diffy`). Conflicts are written as
-  markers and recorded on the snapshot until the file is edited. `vl merge`
-  records them on the merge and continues on a new change on top, so
-  `vl status` lists the conflicts of `@` and those of its parents whose
-  file `@` has not touched yet.
+  changed on both sides go through diff3 (`diffy`).
+  * **First-class conflicts** (repository format 4, `conflict.rs`). A file
+    that does not merge becomes a tree entry of kind `conflict` naming a
+    conflict object: the versions involved as Jujutsu records them, an
+    alternating sum of adds and removes (`ours − base + theirs`), each
+    version a file entry without its name (id, executable bit, visibility,
+    fallback) or "no file". Nothing is written into content. Merging
+    flattens its inputs (any of which may be a conflict) into one sum,
+    cancels equal adds and removes, and takes jj's trivial resolution (one
+    add left, or every side made the same change); only then does it try
+    diff3 by content (every version readable text, each further side
+    merging cleanly into the result so far). So rebasing a conflicted change
+    onto a parent that already holds its change, or back where it was,
+    resolves it, and rebases and auto-rebases carry conflicts instead of
+    stopping. A modify/delete conflict is a sum with a "no file" side.
+    Versions are recorded with their verified sealing (BUG-103), so a
+    forged label is not carried into a conflict.
+  * **Materialisation** (`conflict::materialize`) happens only when a file
+    is written: checkout, `vl cat`, `vl restore`, a tree view, a diff. It
+    renders for one audience (§4 rule 5): two readable text sides get
+    diffy's diff3 markers (`<<<<<<< ours`, `||||||| original` when the base
+    is shown, `=======`, `>>>>>>> theirs`, longer than 7 characters when a
+    line of the content already starts with as many marker characters);
+    more sides, or a side this reader cannot read, get every side whole in
+    one block, an unreadable side as a `(not shown: …)` line; modify/delete,
+    binary content and two scopes show one side as it is, without markers.
+    A copy written while a side was unreadable is recorded like a fallback
+    (`Materialised`), so it is not taken for an edit and is rewritten once
+    the side becomes readable.
+  * **Snapshots** (`Builder::conflict_entry`): a copy exactly as checkout
+    wrote it keeps the conflict entry. Markers removed (or no longer
+    parseable): a resolution, built as an edit of the side that decided the
+    materialised file's audience, so every rule for edits applies (scanning,
+    sealed content keeping its audience, held-back edits). Markers partly
+    edited but parseable: still a conflict, its sides parsed back from the
+    copy as jj does (text outside the markers belongs to every side; a base
+    that was not shown is empty there, BUG-127), each sealed as a
+    resolution would be; a copy that simplifies (both sides edited to the
+    same text) is recorded as it is. More-than-two-sided copies are not
+    parsed back: any edit resolves them as the file is. A reader who cannot
+    read every side cannot resolve: an edit is held back
+    (`cloak_failures`), a deletion carried. Deleting the file otherwise
+    resolves the conflict as a deletion.
+  * **`Snapshot::conflicts`** stays the list `vl log` and `vl status` read.
+    From format 4 every snapshot a transaction writes gets it as an index
+    (`Transaction::indexed`, `conflict::index_conflicts`): the conflict
+    entries of its tree, found by a tree diff from the snapshot it was
+    derived from (the one it rewrites, else its first parent), plus the
+    older kinds the operation carried (marker conflicts from before the
+    upgrade, files moved aside by a file/directory conflict), less those
+    resolved since. A change on top of a conflicted merge therefore holds
+    the conflict too (`vl status` says which parent recorded it); an empty,
+    undescribed change that only inherits conflicts is abandoned like any.
+  * **`vl resolve PATHS --ours|--theirs|--base|--side N`**
+    (`Repo::resolve_conflicts`) replaces conflict entries of the working
+    copy by one version exactly as recorded (no content is read or sealed,
+    so a version keeps its audience); `vl resolve --list` lists them.
+  * **Below format 4**, and for merges under an unreleased embargo (whose
+    sealed trees never hold a conflict entry), conflicts are written as
+    markers into the file and recorded on the snapshot until the file is
+    edited, as before; a conflict entry such a merge meets is replaced by
+    its file of markers first (refused when a version cannot be read).
+    `vl merge` records them on the merge and continues on a new change on
+    top, so `vl status` lists the conflicts of `@` and those of its parents
+    whose file `@` has not touched yet.
   * **Merge base.** Each further parent is merged into the result so far
     against the merge base of the parents merged so far and that parent
     (`Repo::merge_bases`: common ancestors that are not ancestors of another
@@ -1401,7 +1475,13 @@ nothing is ever transferred under the `local` scope. Isolated content cannot
 be pushed at all, because it was never in the graph. File fallbacks are
 plaintext and travel with their entries: a clone of a public remote checks
 out the last public version of a file edited on a cloaked line (§4 rule 5),
-and records it as shown from a fallback (§6), never as deleted.
+and records it as shown from a fallback (§6), never as deleted. A conflict
+object (format 4) is plaintext and travels with its entry; the walk then
+visits every version it names as any object, so a public remote receives
+the conflict and its public versions, never a sealed one (a public clone
+renders it with that version redacted), and `vl push --dry-run` lists each
+version as published or withheld. `gc` keeps, and `fsck` checks, every
+version a reachable conflict names.
 
 **Embargoed history.** Before walking, `push` computes, for every
 unreleased embargoed merge in the local graph, the snapshots that only its
@@ -1982,7 +2062,20 @@ how each object is *sealed*, never by which keys this replica holds:
   Git cannot hold, is left out with a warning, in every spelling that
   names it on macOS (any case, HFS+-ignorable code points such as
   `.g\u{200C}it`, as Git's `is_hfs_dotgit`); import refuses them too. Isolated files were never in
-  the graph.
+  the graph. A **conflict entry** becomes the file of markers a public
+  reader is shown (`conflict::materialize` with `Audience::Public`): only
+  plaintext versions appear (content under an embargo, even a released
+  one, does not, so a pinned pre-release commit cannot depend on a
+  release), every other version is a `(not shown: this version is not
+  public)` line, and a conflict with no public side shows the newest public
+  version a side carries as its fallback, else nothing. Exporting conflicts
+  was chosen over refusing conflicted snapshots: a conflict recorded on a
+  merge would otherwise block the export of all later history. On import,
+  a Git commit's edit of such a file applies to the conflict (the
+  projection's file stands for the conflict in the merge when every
+  version was shown), so a resolution made on GitHub resolves it; where a
+  version was hidden the edit becomes one more side instead, never a
+  silent loss of what Git could not see.
 * **Which message.** Plain descriptions as they are. A description sealed
   for a scope becomes `(description withheld: cloaked)`, one sealed under
   an unreleased embargo `(description withheld: under embargo)`. Only
@@ -2470,7 +2563,11 @@ the scenario takes about 50 ms.
   already seal their trees, §7); a "require signed snapshots" policy;
   pinning a ring head out of band; automatic re-application of concurrent
   ring changes.
-* First-class conflicts (jj-style) instead of conflict markers.
+* Conflicts (format 4): parsing back partly edited copies of conflicts of
+  more than two sides (today any edit of such a copy resolves it as the
+  file is), hunk-level rendering of many-sided conflicts, directory or
+  symlink versions in a conflict (file/directory conflicts still move the
+  file aside), and an external merge tool for `vl resolve`.
 * Front-ends: a FUSE mount of `TreeView` plus overlay for zero-copy
   checkouts. (The WASM build of `veil-core` exists, §13; a browser
   front-end on it, a persistent browser `StorageBackend` and a lock that

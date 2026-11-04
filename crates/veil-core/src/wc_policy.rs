@@ -73,10 +73,11 @@ impl Repo {
             return Ok(Some(None));
         };
         // A directory (only a hostile tree records one, BUG-121): no text.
-        if e.kind != crate::object::EntryKind::File {
+        // A conflict: the text checkout wrote for it (with its markers).
+        if !e.kind.is_file_like() {
             return Ok(None);
         }
-        match self.store.read_entry(&e) {
+        match crate::conflict::read_file_like(&self.store, &e) {
             Ok(b) => Ok(Some(Some(b))),
             Err(err) if err.is_unreadable() => Ok(None),
             Err(err) => Err(err),

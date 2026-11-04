@@ -140,6 +140,12 @@ fn transition_steps(from: u32) -> Vec<&'static str> {
         // AES-SIV and HPKE: nothing to rewrite either (old sealed objects
         // keep their bytes, ids and the legacy construction).
         2 => vec![],
+        // First-class conflicts: nothing to rewrite. Conflicts recorded
+        // before the upgrade stay as they are (markers in the file, the
+        // path listed on the snapshot): rewriting them would change the
+        // ids and signatures of every snapshot above them. Merges made
+        // after the upgrade record conflicts as conflict entries.
+        3 => vec![],
         _ => vec![],
     }
 }
@@ -221,6 +227,18 @@ fn notes_for(from: u32, to: u32, report: &UpgradeReport) -> Vec<String> {
         notes.push(
             "a remote still at format 1 or 2 refuses AES-SIV objects and HPKE key rings: upgrade it with \
              `vl upgrade --remote <name>`; a member's clone at format 2 cannot pull them until it is upgraded"
+                .into(),
+        );
+    }
+    if from < crate::object::CONFLICT_REPO_FORMAT && to >= crate::object::CONFLICT_REPO_FORMAT {
+        notes.push(
+            "merges now record conflicts as data (conflict entries; `vl resolve`); conflicts recorded before \
+             the upgrade stay as they are, as markers in their files, and are resolved by editing them"
+                .into(),
+        );
+        notes.push(
+            "a remote or clone still at format 3 refuses conflict entries: upgrade it with `vl upgrade --remote <name>` \
+             before pushing a change that holds an unresolved conflict"
                 .into(),
         );
     }
@@ -311,6 +329,17 @@ pub fn upgrade(
     }
     plan.push("set-format".into());
     plan.extend(post_commit_steps(report.from, report.to));
+    // From format 3 on (3 → 4): the ring step is not tied to the 2 → 3
+    // transition (BUG-071); run it too when one of this identity's rings
+    // still needs it, as `vl upgrade` at the newest format would.
+    let ring_step = format!("{HPKE_REPO_FORMAT}:hpke-ring-keys");
+    if report.from >= HPKE_REPO_FORMAT && !plan.contains(&ring_step) && identity.is_some() {
+        let keys = Keychain::new(backend.clone(), identity.clone(), config.repo_id.clone());
+        keys.set_format(config.format);
+        if keys.hpke_migration_pending()?.iter().any(|(_, mine)| *mine) || journal.as_ref().is_some_and(|j| j.done.iter().any(|d| d == &ring_step)) {
+            plan.push(ring_step);
+        }
+    }
 
     let mut j = journal.unwrap_or(Journal {
         from: report.from,

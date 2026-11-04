@@ -318,6 +318,14 @@ fn seal_dir(
             f.out.insert(e);
             continue;
         }
+        // A conflict's versions keep their own sealing, so under an embargo
+        // they would be readable outside it before the release: a changed
+        // conflict goes under it as its file of markers, sealed like any
+        // file (merges under an embargo record conflicts as markers too).
+        let e = match e.kind {
+            EntryKind::Conflict => crate::conflict::as_marker_file(store, &e, &f.dir.join(&e.name))?,
+            _ => e,
+        };
         match e.kind {
             EntryKind::Dir => {
                 let path = f.dir.join(&e.name);
@@ -328,6 +336,8 @@ fn seal_dir(
                 let child = seal_frame(store, &e.id, sub_base, path)?;
                 stack.push(child);
             }
+            // Converted to its file of markers above.
+            EntryKind::Conflict => unreachable!("conflict entries are converted first"),
             EntryKind::File => {
                 // A public label is a claim: content that is really sealed
                 // (a forged label) keeps its sealing, under its real label.
@@ -514,6 +524,10 @@ fn normalize_dir(
                 let ne = normalize_file(store, &e, de.as_ref(), &path, opts, report)?;
                 settle(f, &e, ne);
             }
+            // A conflict is never resealed or published by a merge: each of
+            // its versions keeps the sealing it has, and its resolution is
+            // sealed by the builder's rules for edits.
+            EntryKind::Conflict => settle(f, &e, Some(e.clone())),
         }
     }
 }
@@ -794,7 +808,7 @@ fn seal_paths(store: &ObjectStore, tree: &ObjectId, dest: Option<&ObjectId>, pat
                     ..e
                 }
             }
-            EntryKind::File => continue,
+            EntryKind::File | EntryKind::Conflict => continue,
         };
         t.insert(ne);
     }
@@ -934,7 +948,9 @@ fn seal_introduced_dir(store: &ObjectStore, tree: &ObjectId, base: Option<Object
                         }
                     }
                 }
-                EntryKind::File => {}
+                // Its versions keep their sealing: none is public content
+                // this line introduces (that would be sealed when written).
+                EntryKind::File | EntryKind::Conflict => {}
             }
         }
         f.changed |= ne != e;

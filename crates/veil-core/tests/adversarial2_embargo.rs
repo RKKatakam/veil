@@ -48,6 +48,7 @@ fn readable_containing(r: &Repo, needle: &[u8]) -> Vec<String> {
                 b.extend(serde_json::to_vec(&s).unwrap());
                 b
             }
+            Object::Conflict(c) => format!("{c:?}").into_bytes(),
             Object::Sealed(_) => continue,
         };
         if bytes.windows(needle.len()).any(|w| w == needle) {

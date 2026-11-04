@@ -22,10 +22,11 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use crate::{
     builder::{verify_sealing, Sealing},
+    conflict::{Merge, Term},
     embargo::{overlap_error, public_view, unreleased_wrapper, wrap},
     error::{Result, VeilError},
     id::ObjectId,
-    object::{EntryKind, Tree, TreeEntry, Visibility},
+    object::{ConflictTerm, EntryKind, Tree, TreeEntry, Visibility},
     secrets::looks_binary,
     store::ObjectStore,
     tree::MAX_TREE_DEPTH,
@@ -50,8 +51,21 @@ enum Mode {
     VirtualBase,
 }
 
+/// Three-way merge of trees. In a repository of format 4 or later, files
+/// that do not merge become conflict entries ([`crate::conflict`]); below
+/// format 4, and for trees under an unreleased embargo, they get conflict
+/// markers in their content, as before.
 pub fn merge_trees(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, theirs: ObjectId) -> Result<MergeOutcome> {
-    merge_trees_in(store, base, ours, theirs, Mode::Merge)
+    let markers = store.format() < crate::object::CONFLICT_REPO_FORMAT;
+    merge_trees_in(store, base, ours, theirs, Mode::Merge, markers)
+}
+
+/// [`merge_trees`] that writes conflicts as markers in the file whatever
+/// the repository format (a merge about to be put under an embargo: sealed
+/// trees never hold conflict entries). Conflict entries met on the way are
+/// replaced by their marker files.
+pub fn merge_trees_with_markers(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, theirs: ObjectId) -> Result<MergeOutcome> {
+    merge_trees_in(store, base, ours, theirs, Mode::Merge, true)
 }
 
 /// The virtual merge base of two merge bases `ours` and `theirs` (whose
@@ -61,10 +75,11 @@ pub fn merge_trees(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, 
 /// silently (BUG-244). Markers in the virtual base, as Git writes them,
 /// would line up with one side's resolution in a line diff and let it win.
 pub fn virtual_merge_base(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, theirs: ObjectId) -> Result<ObjectId> {
-    Ok(merge_trees_in(store, base, ours, theirs, Mode::VirtualBase)?.tree)
+    let markers = store.format() < crate::object::CONFLICT_REPO_FORMAT;
+    Ok(merge_trees_in(store, base, ours, theirs, Mode::VirtualBase, markers)?.tree)
 }
 
-fn merge_trees_in(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, theirs: ObjectId, mode: Mode) -> Result<MergeOutcome> {
+fn merge_trees_in(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, theirs: ObjectId, mode: Mode, markers: bool) -> Result<MergeOutcome> {
     if ours == theirs || Some(theirs) == base {
         return Ok(MergeOutcome { tree: ours, conflicts: vec![] });
     }
@@ -89,14 +104,16 @@ fn merge_trees_in(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, t
             }
         }
     }
-    let full = merge_resolved(store, base, ours, theirs, mode)?;
+    // Trees under an embargo never hold conflict entries.
+    let markers = markers || wrapped.is_some();
+    let full = merge_resolved(store, base, ours, theirs, mode, markers)?;
     let Some(w) = wrapped else {
         return Ok(full);
     };
     // What readers without the key see: the same merge of what they see.
     let pv = |id: ObjectId| public_view(store, &id);
     let (pb, po, pt) = (base.map(pv).transpose()?, pv(ours)?, pv(theirs)?);
-    let fallback = match merge_resolved(store, pb, po, pt, mode) {
+    let fallback = match merge_resolved(store, pb, po, pt, mode, markers) {
         Ok(m) => m.tree,
         Err(_) => po,
     };
@@ -106,7 +123,7 @@ fn merge_trees_in(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, t
     })
 }
 
-fn merge_resolved(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, theirs: ObjectId, mode: Mode) -> Result<MergeOutcome> {
+fn merge_resolved(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, theirs: ObjectId, mode: Mode, markers: bool) -> Result<MergeOutcome> {
     if ours == theirs || Some(theirs) == base {
         return Ok(MergeOutcome { tree: ours, conflicts: vec![] });
     }
@@ -117,7 +134,7 @@ fn merge_resolved(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, t
     let o = store.tree(&ours)?;
     let t = store.tree(&theirs)?;
     let mut conflicts = Vec::new();
-    let tree = match merge_dir(store, b, Some((o, ours)), Some((t, theirs)), mode, &mut conflicts)? {
+    let tree = match merge_dir(store, b, Some((o, ours)), Some((t, theirs)), mode, markers, &mut conflicts)? {
         Some(id) => id,
         None => store.empty_tree()?,
     };
@@ -209,6 +226,7 @@ fn merge_dir(
     o: Option<(Arc<Tree>, ObjectId)>,
     t: Option<(Arc<Tree>, ObjectId)>,
     mode: Mode,
+    markers: bool,
     conflicts: &mut Vec<VPath>,
 ) -> Result<Option<ObjectId>> {
     let mut stack = vec![MergeFrame::new(VPath::root(), b, o, t)];
@@ -231,10 +249,36 @@ fn merge_dir(
             continue;
         };
         f.next += 1;
-        let be = f.b.as_ref().and_then(|x| x.get(&name));
-        let oe = f.o.as_ref().and_then(|x| x.0.get(&name));
-        let te = f.t.as_ref().and_then(|x| x.0.get(&name));
         let path = f.dir.join(&name);
+        let mut be = f.b.as_ref().and_then(|x| x.get(&name)).cloned();
+        let mut oe = f.o.as_ref().and_then(|x| x.0.get(&name)).cloned();
+        let mut te = f.t.as_ref().and_then(|x| x.0.get(&name)).cloned();
+        if !markers {
+            // A copy of a conflict as a public reader sees it (the Git
+            // export's marker file, which a Git commit then edits) stands
+            // for that conflict, so the edit applies to the conflict.
+            for side in [&oe, &te] {
+                if let (Some(b), Some(c)) = (&be, side) {
+                    if b.kind == EntryKind::File && c.kind == EntryKind::Conflict && crate::conflict::publicly_renders_as(store, c, b)? {
+                        be = Some(TreeEntry {
+                            name: b.name.clone(),
+                            ..c.clone()
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+        if markers && !(same(oe.as_ref(), te.as_ref()) || same(be.as_ref(), te.as_ref()) || same(be.as_ref(), oe.as_ref())) {
+            // Where something must be merged, a conflict entry becomes the
+            // file of markers a reader sees (no conflict entries here).
+            for e in [&mut be, &mut oe, &mut te] {
+                if let Some(c) = e.as_ref().filter(|c| c.kind == EntryKind::Conflict) {
+                    *e = Some(crate::conflict::as_marker_file(store, c, &path)?);
+                }
+            }
+        }
+        let (be, oe, te) = (be.as_ref(), oe.as_ref(), te.as_ref());
         let mut aside = None;
         let pick = if same(oe, te) || same(be, te) {
             oe.cloned()
@@ -255,6 +299,10 @@ fn merge_dir(
                 f.waiting = Some(name);
                 stack.push(MergeFrame::new(path, bs, os, ts));
                 continue;
+            } else if !markers && !kinds.contains(&EntryKind::Dir) && (kinds.contains(&EntryKind::Conflict) || mode == Mode::Merge) {
+                // Conflicts as data (format 4): files, absent files and
+                // conflicts merge algebraically, then by content.
+                merge_terms(store, &path, &name, be, oe, te, mode, conflicts)?
             } else if let (Some(oe), Some(te), [EntryKind::File, EntryKind::File]) = (oe, te, kinds.as_slice()) {
                 let be = be.filter(|e| e.kind == EntryKind::File);
                 Some(merge_file(store, &path, be, oe, te, mode, conflicts)?)
@@ -289,6 +337,84 @@ fn merge_dir(
             f.out.insert(e);
         }
     }
+}
+
+/// Merge the versions at `path` as a [`Merge`] (repository format 4):
+/// each input may be a file, a conflict or nothing (a directory in the base
+/// counts as nothing). Flattened and simplified first, so a conflict whose
+/// change the other side already holds resolves, then merged by content
+/// ([`resolve_by_content`]); what still conflicts is stored as a conflict
+/// entry and reported in `conflicts`. In a virtual merge base, what
+/// conflicts takes the base's version instead (nothing is recorded).
+#[allow(clippy::too_many_arguments)]
+fn merge_terms(
+    store: &ObjectStore,
+    path: &VPath,
+    name: &str,
+    be: Option<&TreeEntry>,
+    oe: Option<&TreeEntry>,
+    te: Option<&TreeEntry>,
+    mode: Mode,
+    conflicts: &mut Vec<VPath>,
+) -> Result<Option<TreeEntry>> {
+    let be = be.filter(|e| e.kind != EntryKind::Dir);
+    let m = Merge::three_way(Merge::of_entry(store, be)?, Merge::of_entry(store, oe)?, Merge::of_entry(store, te)?).simplify();
+    if let Some(t) = m.trivial() {
+        return Ok(t.map(|t| t.entry(name)));
+    }
+    if let Some(e) = resolve_by_content(store, path, name, &m)? {
+        return Ok(Some(e));
+    }
+    if mode == Mode::VirtualBase {
+        return Ok(be.cloned());
+    }
+    // The versions are recorded as they really are sealed (BUG-103): a
+    // forged label is not carried into the conflict.
+    let relabel = |t: &Term| -> Result<Term> {
+        let Some(t) = t else { return Ok(None) };
+        Ok(Some(match verify_sealing(store, &t.entry(name))? {
+            Sealing::Relabelled(actual) => ConflictTerm {
+                visibility: actual,
+                ..t.clone()
+            },
+            _ => t.clone(),
+        }))
+    };
+    let m = Merge {
+        adds: m.adds.iter().map(relabel).collect::<Result<_>>()?,
+        removes: m.removes.iter().map(relabel).collect::<Result<_>>()?,
+    }
+    .simplify();
+    if let Some(t) = m.trivial() {
+        return Ok(t.map(|t| t.entry(name)));
+    }
+    conflicts.push(path.clone());
+    crate::conflict::entry_for(store, name, m)
+}
+
+/// The file `m` merges to by content, if it does: every version present,
+/// readable and text, and each further side merging cleanly (diff3) into
+/// the result so far against its base. Its audience is the merged
+/// audience of the sides, as for any merged file (never wider than either,
+/// never moved between scopes). `None`: a real conflict.
+fn resolve_by_content(store: &ObjectStore, path: &VPath, name: &str, m: &Merge) -> Result<Option<TreeEntry>> {
+    if m.adds.iter().any(Option::is_none) || (m.adds.len() > 2 && m.removes.iter().any(Option::is_none)) {
+        return Ok(None);
+    }
+    let entry = |t: &Term| t.as_ref().map(|t| t.entry(name));
+    let mut acc = entry(&m.adds[0]).expect("present");
+    for i in 1..m.adds.len() {
+        let base = entry(&m.removes[i - 1]);
+        let side = entry(&m.adds[i]).expect("present");
+        let mut found = Vec::new();
+        let merged = merge_file_content(store, path, base.as_ref(), &acc, &side, &mut found)?;
+        match merged {
+            Some(e) if found.is_empty() => acc = e,
+            _ => return Ok(None),
+        }
+    }
+    acc.executable = crate::conflict::merged_executable(m);
+    Ok(Some(acc))
 }
 
 /// diff3 of `ours` and `theirs` where each conflicting hunk takes the
@@ -358,6 +484,66 @@ fn aside_name(f: &MergeFrame, name: &str, side: &str) -> String {
     candidate
 }
 
+/// The clean content merge of two file versions (format 4): `Some` with
+/// the merged file, or `None` (and the path in `conflicts`) when the two
+/// do not merge. No markers are ever written.
+fn merge_file_content(
+    store: &ObjectStore,
+    path: &VPath,
+    be: Option<&TreeEntry>,
+    oe: &TreeEntry,
+    te: &TreeEntry,
+    conflicts: &mut Vec<VPath>,
+) -> Result<Option<TreeEntry>> {
+    let base = match be.filter(|e| e.kind == EntryKind::File) {
+        Some(e) => read_for_merge(store, e, path)?,
+        None => Vec::new(),
+    };
+    let ours = read_for_merge(store, oe, path)?;
+    let theirs = read_for_merge(store, te, path)?;
+    let executable = if be.is_some_and(|b| b.executable == oe.executable) {
+        te.executable
+    } else {
+        oe.executable
+    };
+    if let Some(keep) = audience_clash(store, be, oe, te)? {
+        if ours == theirs {
+            return Ok(Some(TreeEntry { executable, ..keep }));
+        }
+        conflicts.push(path.clone());
+        return Ok(None);
+    }
+    if ours == theirs {
+        return Ok(Some(TreeEntry { executable, ..oe.clone() }));
+    }
+    let (oe, te) = (&checked(store, oe, path)?, &checked(store, te, path)?);
+    if looks_binary(&ours) || looks_binary(&theirs) || looks_binary(&base) {
+        conflicts.push(path.clone());
+        return Ok(None);
+    }
+    let merged = match diffy::merge_bytes(&base, &ours, &theirs) {
+        Ok(m) => m,
+        Err(_) => {
+            conflicts.push(path.clone());
+            return Ok(None);
+        }
+    };
+    let (visibility, fallback) = merged_visibility(store, oe, te);
+    let id = store.store_file(&merged, &visibility)?;
+    Ok(Some(TreeEntry {
+        name: oe.name.clone(),
+        kind: EntryKind::File,
+        id,
+        size: merged.len() as u64,
+        executable,
+        visibility,
+        fallback,
+    }))
+}
+
+/// The three-way merge of two file versions that records a conflict as
+/// markers in the content (repository formats 1 to 3, trees under an
+/// embargo, and virtual merge bases).
 fn merge_file(
     store: &ObjectStore,
     path: &VPath,

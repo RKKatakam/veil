@@ -21,6 +21,10 @@
 #   home-dave/      a *legacy* identity (copied from the previous set's
 #                   carol: signing key derived from the encryption key),
 #                   granted to `team` in alice/ next to the new identities
+# From format 4 on, alice/ also holds a merge with conflict entries (tag
+# `conflicted`): a cloaked file's conflict left unresolved, a public one
+# resolved with `vl resolve`.
+#
 #   upgraded/       the previous set's alice/ and team-remote/ (and their
 #                   identities) after `vl upgrade --remote origin`,
 #                   `vl upgrade` and one more commit pushed: old sealed
@@ -42,7 +46,7 @@ as() { # as <user> <args…>   (runs vl in alice/ as that user)
     shift
     VEIL_HOME="$OUT/home-$who" VEIL_USER=$who "$VL" -R "$OUT/alice" "$@"
 }
-pubkey() { VEIL_HOME="$OUT/home-$1" VEIL_USER=$1 "$VL" identity show | grep -o 'veil1[0-9a-f]\{128\}' | head -1; }
+pubkey() { VEIL_HOME="$OUT/home-$1" VEIL_USER=$1 "$VL" identity show | awk '/^public key/ {print $3}'; }
 
 mkdir -p "$OUT/alice"
 cd "$OUT/alice"
@@ -103,6 +107,25 @@ as alice embargo release "$EA" --yes >/dev/null  # vl ≥ 1.0 asks without --yes
 printf 'fn main() {\n    println!("v3");\n}\n' > src/main.rs
 as alice commit -m "third: loose objects" >/dev/null
 as alice tag set main -r @- >/dev/null
+
+# Format 4 on: first-class conflicts. A merge of two lines that edit the
+# same lines of a public file and of a cloaked one records conflict
+# entries (one side of the cloaked file sealed under the new generation);
+# the public one is resolved with `vl resolve --theirs`, the cloaked one
+# stays unresolved at the tag `conflicted`.
+if "$VL" resolve --help >/dev/null 2>&1; then
+    as alice ws new side-a -r main >/dev/null
+    as alice ws new side-b -r main >/dev/null
+    printf 'pub fn shout(s: &str) -> String {\n    s.to_uppercase() + "!"\n}\n' | as alice ws write side-a src/util/strings.rs >/dev/null
+    printf 'team-only notes (side a)\n' | as alice ws write side-a secrets/notes.txt >/dev/null
+    printf 'pub fn shout(s: &str) -> String {\n    s.to_ascii_uppercase()\n}\n' | as alice ws write side-b src/util/strings.rs >/dev/null
+    printf 'team-only notes (side b)\n' | as alice ws write side-b secrets/notes.txt >/dev/null
+    as alice new side-a@ side-b@ -m "conflicted merge" >/dev/null 2>&1
+    as alice resolve src/util/strings.rs --theirs >/dev/null
+    as alice commit -m "keep side b's strings.rs" >/dev/null
+    as alice tag set conflicted -r @- >/dev/null
+    as alice new main >/dev/null
+fi
 
 # Unreleased embargo with a deadline far in the future.
 as alice ws new fix-b -r main --cloak team >/dev/null
