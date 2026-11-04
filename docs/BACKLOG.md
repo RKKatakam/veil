@@ -31,8 +31,14 @@ fixed**. Severity: high / medium / low.
   - concurrent op-log merging instead of one repository lock.
 
 ### Gaps compared with Git and GitHub (core, before the Hub)
-- **Colocated Git mode:** a real `.git` next to `.veil` (as Jujutsu does) so
-  IDEs, GUIs, `git blame`, pre-commit and other Git tools keep working.
+- **Colocated Git mode: experimental.** Shipped behind `--experimental`
+  (`vl init --colocate`, `vl git colocate`; `docs/guide/colocated-git.md`).
+  Left before it loses the flag: a dedicated adversarial pass, the
+  Git-version matrix on 2.25 / 2.39 / latest and on macOS (tested with Git
+  2.53 on Linux only), `vl serve`'s watch loop following Git, local Git tags
+  imported as release tags (Git-side tags are not followed yet), and the
+  skip-worktree entry for excluded paths present in other exported commits
+  (design threat 8).
 - **Missing everyday commands:** `archive` (tarball of a snapshot).
 - **Directory-rename detection in merges** (Git's `ort`: a file added on one
   side inside a directory the other side renamed goes to the new

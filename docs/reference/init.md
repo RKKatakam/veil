@@ -19,7 +19,8 @@ Options:
 
 | | |
 |---|---|
-| `--colocate` | Create (or adopt) a real `.git` beside the working copy, kept in step with Veil (not implemented yet) |
+| `--colocate` | Create (or adopt) a real `.git` beside the working copy, kept in step with Veil (experimental: needs `--experimental`) |
+| `--experimental` | Accept that colocated Git mode is experimental |
 
 ---
 

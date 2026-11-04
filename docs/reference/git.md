@@ -15,9 +15,9 @@ Subcommands:
 * [`vl git pull`](#vl-git-pull): Fetch, then create or fast-forward local tags from the branches, and create a local release tag for each new Git tag (an existing one never moves)
 * [`vl git push`](#vl-git-push): Export tags (all by default) and push them: plain tags as branches, annotated release tags as Git tags (never forced)
 * [`vl git export`](#vl-git-export): Export tags into the local bridge repository without pushing, and print the commit of each
-* [`vl git colocate`](#vl-git-colocate): Keep a real `.git` beside this working copy, in step with Veil (experimental; not implemented yet)
-* [`vl git uncolocate`](#vl-git-uncolocate): Stop mirroring into `.git`, leaving it a plain Git repository (not implemented yet)
-* [`vl git check-push`](#vl-git-check-push): The `pre-push` guard of colocated mode: refuse a direct `git push` of commits holding private content (not implemented yet)
+* [`vl git colocate`](#vl-git-colocate): Keep a real `.git` beside this working copy, in step with Veil (experimental: needs `--experimental`)
+* [`vl git uncolocate`](#vl-git-uncolocate): Stop mirroring into `.git`, leaving it a plain Git repository
+* [`vl git check-push`](#vl-git-check-push): The `pre-push` guard of colocated mode: refuse a direct `git push` of commits holding private content
 
 ## `vl git import`
 
@@ -169,7 +169,7 @@ Options:
 
 ## `vl git colocate`
 
-Keep a real `.git` beside this working copy, in step with Veil (experimental; not implemented yet)
+Keep a real `.git` beside this working copy, in step with Veil (experimental: needs `--experimental`)
 
 ```text
 vl git colocate [OPTIONS]
@@ -181,11 +181,11 @@ Options:
 |---|---|
 | `--experimental` | Required while colocated mode is experimental |
 | `--status` | Report the guards instead: exclude block, skip-worktree count, held local commits, Git version, `pre-push` hook |
-| `--prune` | Expire the reflogs of superseded local commits and run `git gc --prune=now` |
+| `--prune` | Expire the reflogs of superseded local commits and run `git gc --prune=now` (every unreachable reflog entry of `.git` is expired) |
 
 ## `vl git uncolocate`
 
-Stop mirroring into `.git`, leaving it a plain Git repository (not implemented yet)
+Stop mirroring into `.git`, leaving it a plain Git repository
 
 ```text
 vl git uncolocate [OPTIONS]
@@ -193,7 +193,7 @@ vl git uncolocate [OPTIONS]
 
 ## `vl git check-push`
 
-The `pre-push` guard of colocated mode: refuse a direct `git push` of commits holding private content (not implemented yet)
+The `pre-push` guard of colocated mode: refuse a direct `git push` of commits holding private content
 
 ```text
 vl git check-push [OPTIONS] [REMOTE] [URL]

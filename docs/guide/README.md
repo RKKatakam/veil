@@ -26,6 +26,7 @@ trimmed where marked (`…`); some paths and host names were shortened
 | 14. [Investigating history](investigating-history.md) | You want to know who wrote a line, when a string appeared, or which change broke something (`blame`, `grep`, `log -S`, `bisect`, renames) |
 | 15. [Copying changes, and merges that follow renames](copying-changes.md) | You want a change on another line too (`vl duplicate`, `vl cherry-pick`), or wonder what a merge does with a moved file |
 | 16. [Line endings and attributes](line-endings-and-attributes.md) | Your project has `.gitattributes`, Windows line endings, binary files, or wants its own diff or merge driver |
+| 17. [Colocated Git mode](colocated-git.md) (experimental) | You want a real `.git` next to your working copy, for IDEs, Git GUIs and Git tools, without Git ever seeing what Veil keeps private |
 
 The [command reference](../reference/README.md) lists every command and
 flag. It is generated from `vl` itself and cannot drift from it.

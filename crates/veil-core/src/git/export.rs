@@ -99,13 +99,22 @@ impl GitBridge {
     /// the operation log.
     pub fn export(&mut self, repo: &mut Repo, only_tags: &[String]) -> Result<ExportReport> {
         let tx = repo.transaction("git export")?;
-        let report = self.export_in(tx.repo(), only_tags)?;
+        let report = self.export_in(tx.repo(), only_tags, true)?;
         self.save(&**tx.repo().backend())?;
         tx.commit()?;
         Ok(report)
     }
 
-    fn export_in(&mut self, repo: &Repo, only_tags: &[String]) -> Result<ExportReport> {
+    /// Export every tag like [`GitBridge::export`], but write no ref:
+    /// colocated mode's mirror moves `refs/heads/*` and `refs/tags/*` itself,
+    /// each by compare-and-swap against what Git last held, so that a
+    /// concurrent `git commit` is never overwritten. The objects are
+    /// written; the report says which ref should hold what.
+    pub(crate) fn export_without_refs(&mut self, repo: &Repo) -> Result<ExportReport> {
+        self.export_in(repo, &[], false)
+    }
+
+    fn export_in(&mut self, repo: &Repo, only_tags: &[String], write_refs: bool) -> Result<ExportReport> {
         let mut report = ExportReport::default();
         // Git holds plaintext: a release staged by `vl embargo release` is
         // published as its content leaves (it cannot be undone after this).
@@ -160,10 +169,14 @@ impl GitBridge {
                 continue;
             };
             if let Some(a) = tag.annotation {
-                match self.export_release_tag(repo, &name, &tag, a, commit)? {
+                match self.export_release_tag(repo, &name, &tag, a, commit, write_refs)? {
                     Ok(t) => report.tags.push(t),
                     Err(why) => report.skipped.push((name, why)),
                 }
+                continue;
+            }
+            if !write_refs {
+                report.branches.push((name, commit));
                 continue;
             }
             // e.g. tags `a` and `a/b`, which cannot both be Git branches.
@@ -272,6 +285,7 @@ impl GitBridge {
         tag: &Tag,
         a: ObjectId,
         commit: GitOid,
+        write_ref: bool,
     ) -> Result<std::result::Result<ExportedTag, String>> {
         let atag = match repo.store().atag(&a) {
             Ok(t) => t,
@@ -301,8 +315,10 @@ impl GitBridge {
             Some((kind, data)) => self.write_raw(kind, &data)?,
             None => commit,
         };
-        if let Err(e) = self.set_ref(&format!("refs/tags/{name}"), git) {
-            return Ok(Err(format!("cannot be a Git tag: {e}")));
+        if write_ref {
+            if let Err(e) = self.set_ref(&format!("refs/tags/{name}"), git) {
+                return Ok(Err(format!("cannot be a Git tag: {e}")));
+            }
         }
         self.map.record_tag(git, a);
         Ok(Ok(ExportedTag {
@@ -365,7 +381,7 @@ impl GitBridge {
         Ok((oid, p.pending))
     }
 
-    fn export_snapshot(
+    pub(crate) fn export_snapshot(
         &mut self,
         repo: &Repo,
         sid: ObjectId,

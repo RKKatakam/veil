@@ -3211,6 +3211,91 @@ builder gave the merged file (repository format 4 and later; before, the
 file keeps its markers). The path is listed in `Snapshot::conflicts`.
 Symlinks and gitlinks are never merged.
 
+### Colocated Git mode (`git/colocate.rs`, `git/index.rs`; experimental)
+
+`vl init --colocate` / `vl git colocate --experimental` put a real `.git`
+beside the working copy (design: `docs/design/git-parity/9-colocated-git.md`;
+guide: `docs/guide/colocated-git.md`). The bridge's two premises, *Git only
+sees the projection* and *everything from Git is public*, no longer hold by
+construction there, so the mode restores them:
+
+```text
+.veil/repo.json          colocated: {git_dir: ".git"}  (format 5; an older vl refuses the directory)
+.git                     the bridge repository (`git::default_git_dir` reads repo.json)
+  info/exclude             # BEGIN veil … # END veil: policy rules, protected paths, `*` when frozen
+  index                    HEAD's tree, skip-worktree on hidden paths (all when frozen)
+  hooks/pre-push           vl git check-push        (a prior hook → pre-push.veil-chained, run first)
+  hooks/pre-commit         vl git check-push --pre-commit
+.veil/.git               empty bare repository: Git treats .veil as nested (git clean -fdx, stash -a skip it)
+.veil/git/colocated.json last HEAD and refs, held commits, index key, skip set, frozen, local-only paths
+.veil/git/colocate.lock  flock serialising follow and mirror between vl processes
+```
+
+**Follow** (`colocate_cmd::open_session`, from `Ctx::open` before the
+snapshot; `GitBridge::follow_local`):
+
+1. Nothing while a Git operation is in progress (`rebase-merge`,
+   `rebase-apply`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`,
+   `BISECT_LOG`, `index.lock`).
+2. `refs/heads/*` and a detached `HEAD` are imported (`import_tips`,
+   `ImportOrigin::Local`). Each new commit not reachable from a
+   remote-tracking ref is **local**: it stands only if its tree equals what
+   `fresh_commit` would export for its snapshot on its first parent, and its
+   parents stand. Otherwise its snapshot's mapping is dropped and exported
+   afresh, the branch (and a detached `HEAD`) moves to the replacement by
+   compare-and-swap, and the original is *held*. A held commit's snapshot is
+   represented by the replacement (`map.current`), so export never carries
+   over from it and `check-push` refuses it; a commit superseded by an
+   interrupted run is recognised from the map alone (its snapshot's current
+   commit is a Veil export).
+3. Tags follow branches (a non-fast-forward move keeps the old target as a
+   visible head); a branch deleted in Git deletes its tag unless Veil moved
+   the tag since.
+4. `HEAD` moved: the paths Git manages (stage-0 index entries without
+   skip-worktree that Veil did not hide, public plain in the target) keep
+   Git's disk content. The others are snapshotted into the old `@` first
+   (`SnapshotOptions::only`), then `colocate::plan_head_move` chooses per
+   path among base, old `@` and target (carry an edit Git could not see,
+   take the target's version, or keep the edit in the old change), never
+   across a cloak or embargo boundary; `apply_head_move` writes the new
+   change and abandons the old one only if nothing of it is lost;
+   `checkout::restore_paths` (the no-follow writer) moves the hidden files.
+   The snapshot that follows takes `.veilpolicy` as *incoming*: a pulled
+   weakening is held back by the accepted policy.
+
+**Mirror** (`colocate_cmd::finish_session`, from `Ctx::finish`;
+`GitBridge::mirror`): tags are exported without refs
+(`export_without_refs`), `@-` (or its nearest exportable ancestor) is
+exported, and `refs/heads/*`, `refs/tags/*` and `HEAD` are written by
+compare-and-swap against what Git last held (`state.refs`; a ref Git moved
+since is skipped and imported by the next command; gix transactions with
+`Fail::Immediately`, so Veil never waits for a Git lock). `HEAD` keeps its
+branch while that branch is the export of `@-`, else takes the one tag at
+`@-`, else detaches. **Frozen mode**, every index entry skip-worktree and
+`*` excluded, holds when the workspace or `@` is cloaked, `@` carries an
+unreleased embargo, or `@-` cannot be exported. Outside it, every Git path
+whose entry in `@` is not plain public content (sealed, fallback,
+embargo-wrapped, a conflict, absent, or a quarantined edit) is
+skip-worktree. The index (`git/index.rs`, encoded and decoded by
+`gix-index`) is written to an exclusively created `index.lock` and renamed;
+an existing `index.lock` means Git is busy and the write is skipped, never
+waited for or removed. It is rewritten only when `HEAD`, the skip set or
+frozen mode changed, or when Git cleared a skip-worktree bit (re-asserted
+every command); staged entries of paths Git may see survive while `HEAD`
+stays. The exclude block (`policy_gitignore::policy_lines`: every
+protective rule of the effective and accepted policies, no negation,
+case-folded where Veil matches case-insensitively, braces expanded,
+artefact variants of protected names) is written last, on every command.
+
+**Gates.** `GitBridge::check_push` walks each pushed ref back to commits
+that are Veil exports or the current commit of their snapshot; a held
+commit, a commit Veil has not imported, and `refs/stash` are refused.
+`GitBridge::check_staged` refuses, in what `$GIT_INDEX_FILE` stages, any
+change while frozen, a hidden path, a path the policy does not make
+public, and public content the scanner flags. The hooks are fixed scripts
+written by `vl` (device-local, like the hooks of §15; no repository content
+defines them); `git push --no-verify` is the documented residual hole.
+
 ## 12. Read commands: one API, text or JSON (`crates/vl/src/api.rs`)
 
 The read commands (`status`, `log`, `diff`, `show`, `ls`, `workspace list`,

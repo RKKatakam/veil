@@ -231,6 +231,6 @@ process group is stopped when it exits.
 * `vl push --dry-run` sends nothing, so it runs no `pre-push`.
 * `vl serve` runs the same hooks for `commit` and `describe` of `@`, with
   their output on the server's stderr; it has no method to trust hooks.
-* Colocated Git mode will be able to hand `pre-commit` and `pre-push` to
-  `.git/hooks`; until then, call the pre-commit framework from a
-  device-local hook.
+* In [colocated Git mode](colocated-git.md) (experimental), Veil installs
+  its own `pre-commit` and `pre-push` guards into `.git/hooks` (a hook
+  already there is kept and runs first); Git runs those, not `.veilhooks`.

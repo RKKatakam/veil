@@ -40,6 +40,9 @@ pub struct ImportReport {
     /// Imported commits whose snapshot records conflicts.
     pub conflicts: Vec<(GitOid, Vec<String>)>,
     pub warnings: Vec<String>,
+    /// Every commit this import mapped (new snapshots, and commits found
+    /// to be an earlier import or Veil's own), parents first.
+    pub new_commits: Vec<GitOid>,
 }
 
 /// The change id a `change-id` header claims (Jujutsu, or a Veil export).
@@ -143,11 +146,12 @@ impl GitBridge {
     /// reported with the reason, together with its descendants; the other
     /// commits are imported, and nothing is half-imported.
     pub(crate) fn import_tips(&mut self, tx: &mut Transaction<'_>, tips: &[GitOid], origin: ImportOrigin) -> Result<ImportReport> {
-        // Only commits fetched from a Git remote are imported today; the
-        // colocated mode (stream C) gives `Local` its carry-over rule.
-        let ImportOrigin::Remote = origin else {
-            return Err(VeilError::Unsupported("importing local Git commits is not implemented yet".into()));
-        };
+        // Both origins import alike. What differs is what happens next: a
+        // `Local` commit (made in a colocated `.git`) is not public, so the
+        // colocated mode checks each one against the public projection of
+        // its snapshot before anything may build on it (`colocate::follow`,
+        // which reads `new_commits`).
+        let _ = origin;
         let mut report = ImportReport::default();
         let mut index = ChangeIndex::default();
         // Failed commits → the root cause.
@@ -197,8 +201,11 @@ impl GitBridge {
                 failed.insert(c, root);
             } else {
                 match self.import_one(tx, &c, commit, &mut report, &mut index) {
-                    Ok(Imported::New) => report.imported += 1,
-                    Ok(Imported::Known) => {}
+                    Ok(Imported::New) => {
+                        report.imported += 1;
+                        report.new_commits.push(c);
+                    }
+                    Ok(Imported::Known) => report.new_commits.push(c),
                     Err(e) if is_fatal(&e) => return Err(e),
                     Err(e) => {
                         let why = match e {

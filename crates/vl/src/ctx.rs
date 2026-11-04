@@ -195,6 +195,9 @@ pub struct Ctx {
     /// working copy. Only commands that read history, and `gc`, run here
     /// (BUG-284); nothing is snapshotted or checked out.
     pub bare: bool,
+    /// Colocated Git mode: what the follow at the start of this command saw
+    /// (`None` when the directory is not colocated).
+    pub(crate) git: Option<crate::colocate_cmd::Session>,
 }
 
 pub fn find_root(start: &Path) -> Option<PathBuf> {
@@ -280,6 +283,7 @@ impl Ctx {
                 checkout,
                 report: BuildReport::default(),
                 bare: true,
+                git: None,
             });
         }
         for id in repo.auto_release_embargoes()? {
@@ -297,7 +301,11 @@ impl Ctx {
             report: BuildReport::default(),
             cache,
             bare: false,
+            git: None,
         };
+        // Colocated Git mode: follow what Git did since the last command
+        // (new commits, a checkout) before the working copy is recorded.
+        crate::colocate_cmd::open_session(&mut ctx, snapshot)?;
         if snapshot {
             ctx.snapshot()?;
         }
@@ -611,8 +619,15 @@ impl Ctx {
         Ok(())
     }
 
-    /// Bring the project directory in line with the attached workspace.
+    /// Bring the project directory in line with the attached workspace,
+    /// then (colocated Git mode) mirror it into `.git` and write the Git
+    /// excludes before control returns to the user.
     pub fn finish(&mut self) -> Result<()> {
+        self.finish_working_copy()?;
+        crate::colocate_cmd::finish_session(self)
+    }
+
+    fn finish_working_copy(&mut self) -> Result<()> {
         if self.bare {
             return Ok(());
         }
@@ -702,6 +717,44 @@ impl Ctx {
         print_failed(&r.failed);
         print_checkout_warnings(&r.warnings);
         Ok(r)
+    }
+
+    /// Record the directory into the attached workspace, but only the
+    /// paths of `only` (colocated Git mode, before following a Git
+    /// checkout: the paths Git manages hold Git's new content already).
+    pub(crate) fn snapshot_only(&mut self, only: &veil_core::vfs::SparseSet) -> Result<()> {
+        self.resume()?;
+        let view_wc = self.wc()?;
+        if self.checkout.workspace != self.ws || self.checkout.snapshot != view_wc {
+            // Behind: the ordinary snapshot recovers first.
+            return self.snapshot();
+        }
+        let disk = self.fs.clone();
+        let out = self.repo.snapshot_workspace_with(
+            &self.ws,
+            &*disk,
+            SnapshotOptions {
+                cache: Some(&mut self.cache),
+                materialised: Some(&self.checkout.materialised),
+                expected_wc: Some(view_wc),
+                only: Some(only),
+                ..Default::default()
+            },
+        )?;
+        self.save_cache();
+        if !out.superseded && self.checkout.snapshot != out.snapshot {
+            self.checkout.snapshot = out.snapshot;
+            save_checkout(&self.fs, &self.checkout)?;
+        }
+        Ok(())
+    }
+
+    /// The directory now holds `snapshot` (the follow of a Git checkout
+    /// moved the workspace there and wrote what differs).
+    pub(crate) fn set_materialised_snapshot(&mut self, snapshot: ObjectId) -> Result<()> {
+        self.checkout.snapshot = snapshot;
+        save_checkout(&self.fs, &self.checkout)?;
+        Ok(())
     }
 
     /// Persist the stat cache if it changed. It is only an accelerator, so

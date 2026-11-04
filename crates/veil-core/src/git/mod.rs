@@ -65,7 +65,7 @@
 pub mod colocate;
 mod export;
 mod import;
-mod index;
+pub mod index;
 pub mod map;
 mod project;
 mod tags;
@@ -101,9 +101,14 @@ pub(crate) fn gerr(e: impl std::fmt::Display) -> VeilError {
     VeilError::Repo(format!("git: {e}"))
 }
 
-/// Where the bridge repository lives below a project directory.
+/// Where the bridge repository lives below a project directory: the
+/// colocated `.git` when the directory is colocated with Git (`repo.json`
+/// says so, see [`colocate`]), else `.veil/git/repo.git`.
 pub fn default_git_dir(project_root: &Path) -> PathBuf {
-    project_root.join(".veil").join("git").join("repo.git")
+    match colocate::colocated_git_dir(project_root) {
+        Some(dir) => dir,
+        None => project_root.join(".veil").join("git").join("repo.git"),
+    }
 }
 
 /// The bare Git repository Veil exchanges objects through, with the
@@ -136,6 +141,8 @@ fn open_git(dir: &Path) -> Result<gix::Repository> {
     let opts = gix::open::Options::isolated();
     match gix::open_opts(dir, opts.clone()) {
         Ok(r) => Ok(r),
+        // A colocated `.git` is the user's: never re-created (bare) here.
+        Err(e) if dir.file_name().is_some_and(|n| n == ".git") => Err(gerr(format!("cannot open {}: {e}", dir.display()))),
         Err(_) => {
             // A repository that never talked to Git has no `.veil/git/` yet
             // (BUG-640): `gix::init_bare` creates only the last component.
@@ -268,16 +275,43 @@ impl GitBridge {
     }
 
     pub(crate) fn set_ref(&self, name: &str, oid: GitOid) -> Result<()> {
-        self.git
-            .reference(name, oid, gix::refs::transaction::PreviousValue::Any, "veil")
-            .map_err(gerr)?;
-        Ok(())
+        use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+        // With Veil's own committer for the reflog: a colocated `.git`
+        // keeps reflogs, and the isolated configuration names nobody.
+        self.edit_refs(RefEdit {
+            change: Change::Update {
+                log: LogChange {
+                    mode: RefLog::AndReference,
+                    force_create_reflog: false,
+                    message: "veil".into(),
+                },
+                expected: PreviousValue::Any,
+                new: gix::refs::Target::Object(oid),
+            },
+            name: gix::refs::FullName::try_from(name).map_err(gerr)?,
+            deref: false,
+        })
     }
 
     pub(crate) fn delete_ref(&self, name: &str) -> Result<()> {
-        if let Some(r) = self.git.try_find_reference(name).map_err(gerr)? {
-            r.delete().map_err(gerr)?;
+        use gix::refs::transaction::{Change, PreviousValue, RefEdit, RefLog};
+        if self.git.try_find_reference(name).map_err(gerr)?.is_none() {
+            return Ok(());
         }
+        self.edit_refs(RefEdit {
+            change: Change::Delete {
+                expected: PreviousValue::MustExist,
+                log: RefLog::AndReference,
+            },
+            name: gix::refs::FullName::try_from(name).map_err(gerr)?,
+            deref: false,
+        })
+    }
+
+    fn edit_refs(&self, edit: gix::refs::transaction::RefEdit) -> Result<()> {
+        let sig = colocate::veil_signature();
+        let mut buf = gix::date::parse::TimeBuf::default();
+        self.git.edit_references_as([edit], Some(sig.to_ref(&mut buf))).map_err(gerr)?;
         Ok(())
     }
 

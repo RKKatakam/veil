@@ -836,8 +836,7 @@ pub enum PolicyCmd {
         workspace: Option<String>,
     },
     /// Add an `ignore` rule for each `.gitignore` pattern that matches a
-    /// file here, so files Git ignores are not recorded (not implemented
-    /// yet).
+    /// file here, so files Git ignores are not recorded.
     ImportGitignore(colocate_cmd::ImportGitignoreArgs),
 }
 
@@ -1225,13 +1224,12 @@ pub enum GitCmd {
         tag: Vec<String>,
     },
     /// Keep a real `.git` beside this working copy, in step with Veil
-    /// (experimental; not implemented yet).
+    /// (experimental: needs `--experimental`).
     Colocate(colocate_cmd::ColocateArgs),
-    /// Stop mirroring into `.git`, leaving it a plain Git repository (not
-    /// implemented yet).
+    /// Stop mirroring into `.git`, leaving it a plain Git repository.
     Uncolocate(colocate_cmd::UncolocateArgs),
     /// The `pre-push` guard of colocated mode: refuse a direct `git push`
-    /// of commits holding private content (not implemented yet).
+    /// of commits holding private content.
     CheckPush(colocate_cmd::CheckPushArgs),
 }
 
