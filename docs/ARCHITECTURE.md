@@ -650,8 +650,35 @@ CAS, and it applies these rules in order:
 5. Cloaked files are sealed under their scope. In a cloaked workspace, every
    public file it introduces is sealed under the workspace scope, and the
    description is too.
+   * **Labels are claims; objects are authority** (BUG-103). The parent
+     entry's visibility label comes from history, which anyone who can push
+     to a team remote (or a Git import) writes. Before new content is
+     sealed, the builder checks the label against the object it points to
+     (`builder::verify_sealing`: plaintext blob → public, envelope label
+     `s` or `s#<key-id>` → cloaked under `s`, `embargo/<id>` → embargoed;
+     a public entry whose id is the blob id of the file's content is
+     plaintext by construction, so unchanged files cost nothing). A
+     mismatch (Mallory relabels Alice's `team` file `cloaked:embargo/<a
+     released id>`, or `cloaked:mal`, or `public`) is reported
+     (`BuildReport::relabelled`, with a warning) and the decision is taken
+     on the object's real sealing. A label whose object is absent (a
+     public remote withheld it) or sealed under no audience never decides
+     the sealing of an edit: the edit is held back
+     (`cloak_failures`). The same check runs wherever history decides the
+     audience of new content: three-way merges and rebases
+     (`merge::merge_file`; a scope's seal also beats an embargo's, and a
+     released embargo counts as public), merge normalisation and
+     declassification (`embargo::normalize_tree`: only a *verified*
+     `cloaked:s` of a merged-in line of `s` is published), embargo
+     wrapping (`seal_dir`), squash into a cloaked change
+     (`seal_introduced`), and the Git bridge's import (which goes through
+     the builder and the merge). A snapshot's `cloak` field is used only if
+     it names a scope (`builder::trusted_cloak`): never an embargo label,
+     `local` or a key generation, for files and for descriptions
+     (`embargo::description_scope`). As a backstop, the builder never seals
+     under a released embargo or a cloak label that is not a scope.
    * **Sealed content keeps its audience.** A tracked file the parent holds
-     sealed under scope `s` stays sealed under `s`, edited or not, whatever
+     sealed under scope `s` stays sealed under `s` (as verified above), edited or not, whatever
      the workspace or the current policy says, unless this very snapshot
      edits `.veilpolicy` so that the path's classification changes. That is
      how `vl expose` and `vl cloak --scope` work, and an expose to `public`
@@ -723,7 +750,19 @@ cannot record a copy under another name. The values are: each `KEY=value`
 value that looks like a secret (8+ characters, and either 20+ characters or a
 mix of character classes, so `localhost` or `3000` never match), plus the
 whole content and every whitespace-free line of 24+ characters (key
-material).
+material). Binary files (PKCS#12 bundles, Java keystores, DER keys:
+anything that is not UTF-8), and the DER inside every PEM block of a text
+file, are matched as bytes (BUG-099): the whole content, plus 32-byte
+windows every 16 positions of the raw bytes, of their base64 (the three
+alignments) and of their hex (both cases). So a verbatim or partial copy
+(47+ bytes), a `base64`/PEM/`xxd -p` re-encoding, and a PEM key converted
+to DER are all quarantined. Only windows over distinctive bytes (3/4
+distinct) count, so padding and the ASN.1 structure every key of a kind
+shares never match an unrelated keystore or certificate. Matching is one
+rolling-hash pass per checked file, behind a 128 KiB bit filter; each
+injected file contributes at most about 74 000 windows (larger files get
+a proportionally larger stride, up to 16 MiB of content) and all together
+at most 2^18.
 
 ## 5. The snapshot graph
 
@@ -1835,6 +1874,20 @@ repository lock.
   nesting, dangling tags and terminal escape sequences in names and
   descriptions (the CLI escapes control and bidi characters) are refused
   (§2, §8).
+* **forged visibility metadata from a remote or an import** (BUG-103).
+  Visibility labels of tree entries and a snapshot's `cloak` field are
+  written by whoever produced the snapshot (anyone who can push to a team
+  remote, a Git import), so they are *claims*, never authority. The
+  audience of **new** content (an edit, merged or rebased content, a
+  description) is decided from trusted inputs only: the accepted policy
+  pin, the line's cloak if it names a scope, and the *verified* sealing of
+  the parent entry, i.e. the scope in the envelope label of the object
+  itself (bound to the ciphertext by the AEAD), checked against the label
+  the entry claims. A mismatch is hostile: the snapshot warns
+  (`BuildReport::relabelled`) and seals under what the object really is.
+  New content is never sealed under a released embargo's (public) key, a
+  key generation (`team#<old>`, which a revoked member holds), `local`, or
+  a scope the label merely names (§4, rule 5).
 
 **Not protected against (yet), and documented honestly:**
 

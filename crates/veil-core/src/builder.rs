@@ -52,7 +52,7 @@ use crate::{
     error::{Result, VeilError},
     id::ObjectId,
     object::{EntryKind, Object, Tree, TreeEntry, Visibility},
-    policy::{tier_keyword, HeldBack, Policy, PolicyFile, Tier, POLICY_FILE},
+    policy::{tier_keyword, Classification, HeldBack, Policy, PolicyFile, Tier, POLICY_FILE},
     secrets::{self, Finding},
     statcache::{CacheKey, CacheRun, StatCache},
     store::ObjectStore,
@@ -107,22 +107,261 @@ pub struct BuildOptions<'a> {
 pub const INJECTED_RULE: &str = "injected-isolated-secret";
 
 /// Values the engine injected from the vault (isolated files such as
-/// `.env`, keys, quarantined files) into a sandbox. Built from the files'
-/// contents: every `KEY=value` / `key: value` value that looks like a secret
-/// (at least 8 characters, and either 20+ characters or a mix of character
-/// classes, so `localhost`, `production` or `3000` never match), plus the
-/// whole content and every whitespace-free line of 24+ characters (key
-/// material, bare tokens).
+/// `.env`, keys, keystores, quarantined files) into a sandbox.
+///
+/// Built from the files' contents, as text: every `KEY=value` /
+/// `key: value` value that looks like a secret (at least 8 characters, and
+/// either 20+ characters or a mix of character classes, so `localhost`,
+/// `production` or `3000` never match), plus the whole content and every
+/// whitespace-free line of 24+ characters (key material, bare tokens).
+///
+/// And as bytes (BUG-099): a file that is not UTF-8 (a PKCS#12 bundle, a
+/// Java keystore, a DER key), and the DER inside every PEM block of a text
+/// file, yields its whole content (16+ bytes) plus [`WINDOW`]-byte windows
+/// of its key material: of the raw bytes, of its base64 encoding (all three
+/// alignments, so any copied segment is covered) and of its hex encoding
+/// (lower and upper case). Windows are taken every [`STRIDE`] positions, so
+/// any copied run of 47+ bytes, and any base64 or hex copy wrapped at 48+
+/// characters per line (`base64`, PEM, `xxd -p`), contains one. Only
+/// windows over *distinctive* bytes count (at least 3/4 distinct bytes in
+/// the source span): padding and the ASN.1 structure every key of a kind
+/// shares (OIDs, length headers) never match unrelated files. Memory and
+/// time are bounded: windows are matched with a rolling hash behind a bit
+/// filter (one pass over each checked file), each file contributes at most
+/// about 74 000 windows (the stride grows for larger files) and all files
+/// together at most [`MAX_WINDOWS`].
 #[derive(Debug, Default, Clone)]
 pub struct InjectedSecrets {
     /// (needle, the injected file it came from)
     needles: Vec<(Vec<u8>, String)>,
     matcher: Option<regex::bytes::Regex>,
+    /// Whole contents of binary injected files (and DER decoded from PEM),
+    /// matched as raw bytes.
+    raw: Vec<(Vec<u8>, String)>,
+    windows: WindowIndex,
+}
+
+/// Length of a binary window (bytes of raw content, or characters of its
+/// base64 / hex encoding).
+pub const WINDOW: usize = 32;
+/// Distance between consecutive windows of one encoding (for files up to
+/// 128 KiB; larger files use a proportionally larger stride).
+pub const STRIDE: usize = 16;
+/// Upper bound on the windows of all injected files together.
+pub const MAX_WINDOWS: usize = 1 << 18;
+/// Binary files contribute at most this many bytes of content.
+const MAX_BINARY: usize = 16 << 20;
+/// Bits of the window filter (2^20 bits = 128 KiB).
+const FILTER_BITS: u32 = 20;
+const HASH_BASE: u64 = 0x100_0000_01b3;
+
+/// How a window encodes the injected bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Encoding {
+    Raw,
+    Base64,
+    Hex,
+}
+
+#[derive(Debug, Default, Clone)]
+struct WindowIndex {
+    windows: Vec<([u8; WINDOW], u32, Encoding)>,
+    sources: Vec<String>,
+    by_hash: HashMap<u64, Vec<u32>>,
+    filter: Vec<u64>,
+    /// `HASH_BASE^(WINDOW-1)`, to roll the hash.
+    top: u64,
+}
+
+fn window_hash(w: &[u8]) -> u64 {
+    w.iter().fold(0u64, |h, &b| h.wrapping_mul(HASH_BASE).wrapping_add(u64::from(b) + 1))
+}
+
+fn filter_slot(h: u64) -> (usize, u64) {
+    let i = (h.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - FILTER_BITS)) as usize;
+    (i / 64, 1u64 << (i % 64))
+}
+
+/// At least three quarters of the bytes are distinct.
+fn distinctive(span: &[u8]) -> bool {
+    let mut seen = [false; 256];
+    let mut n = 0;
+    for &b in span {
+        if !std::mem::replace(&mut seen[b as usize], true) {
+            n += 1;
+        }
+    }
+    n * 4 >= span.len() * 3
+}
+
+impl WindowIndex {
+    fn len(&self) -> usize {
+        self.windows.len()
+    }
+
+    fn add(&mut self, w: &[u8], src: u32, enc: Encoding) -> bool {
+        if self.windows.len() >= MAX_WINDOWS {
+            return false;
+        }
+        let arr: [u8; WINDOW] = w.try_into().expect("window length");
+        let h = window_hash(&arr);
+        let bucket = self.by_hash.entry(h).or_default();
+        if bucket.iter().any(|&i| self.windows[i as usize].0 == arr) {
+            return true;
+        }
+        bucket.push(self.windows.len() as u32);
+        self.windows.push((arr, src, enc));
+        if self.filter.is_empty() {
+            self.filter = vec![0; (1usize << FILTER_BITS) / 64];
+            self.top = (1..WINDOW).fold(1u64, |t, _| t.wrapping_mul(HASH_BASE));
+        }
+        let (i, bit) = filter_slot(h);
+        self.filter[i] |= bit;
+        true
+    }
+
+    /// Windows of `data` (one binary secret) in every encoding.
+    fn add_source(&mut self, data: &[u8], src: u32) {
+        let data = &data[..data.len().min(MAX_BINARY)];
+        if data.len() < WINDOW / 2 {
+            return;
+        }
+        // ~9 windows per STRIDE bytes over all encodings: keep one file
+        // under ~74k windows.
+        let stride = STRIDE.max(data.len().div_ceil(8192)).next_multiple_of(2);
+        // Raw bytes.
+        let mut i = 0;
+        while i + WINDOW <= data.len() {
+            if distinctive(&data[i..i + WINDOW]) && !self.add(&data[i..i + WINDOW], src, Encoding::Raw) {
+                return;
+            }
+            i += stride;
+        }
+        // Base64, in each of the three alignments a copied segment can have.
+        for align in 0..3.min(data.len()) {
+            let text = base64_encode(&data[align..]);
+            let mut i = 0;
+            while i + WINDOW <= text.len() {
+                // 4 characters encode 3 bytes.
+                let from = align + i / 4 * 3;
+                let to = (align + (i + WINDOW).div_ceil(4) * 3).min(data.len());
+                if distinctive(&data[from..to]) && !self.add(&text[i..i + WINDOW], src, Encoding::Base64) {
+                    return;
+                }
+                i += stride;
+            }
+        }
+        // Hex, in both cases.
+        for upper in [false, true] {
+            let mut text = hex::encode(data).into_bytes();
+            if upper {
+                text.make_ascii_uppercase();
+            }
+            let mut i = 0;
+            while i + WINDOW <= text.len() {
+                if distinctive(&data[i / 2..(i + WINDOW) / 2]) && !self.add(&text[i..i + WINDOW], src, Encoding::Hex) {
+                    return;
+                }
+                i += stride;
+            }
+        }
+    }
+
+    /// Position and window index of the first window found in `data`.
+    fn find(&self, data: &[u8]) -> Option<(usize, u32)> {
+        if self.windows.is_empty() || data.len() < WINDOW {
+            return None;
+        }
+        let mut h = window_hash(&data[..WINDOW]);
+        let mut at = 0;
+        loop {
+            let (i, bit) = filter_slot(h);
+            if self.filter[i] & bit != 0 {
+                if let Some(b) = self.by_hash.get(&h) {
+                    if let Some(&w) = b.iter().find(|&&w| self.windows[w as usize].0[..] == data[at..at + WINDOW]) {
+                        return Some((at, w));
+                    }
+                }
+            }
+            if at + WINDOW >= data.len() {
+                return None;
+            }
+            let (out, inp) = (u64::from(data[at]) + 1, u64::from(data[at + WINDOW]) + 1);
+            h = h
+                .wrapping_sub(out.wrapping_mul(self.top))
+                .wrapping_mul(HASH_BASE)
+                .wrapping_add(inp);
+            at += 1;
+        }
+    }
+}
+
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64, without padding (a window never needs it).
+fn base64_encode(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = (u32::from(c[0]) << 16) | (u32::from(*c.get(1).unwrap_or(&0)) << 8) | u32::from(*c.get(2).unwrap_or(&0));
+        for k in 0..=c.len() {
+            out.push(BASE64[(n >> (18 - 6 * k) & 63) as usize]);
+        }
+    }
+    out
+}
+
+/// The DER inside each PEM block of `text` (`-----BEGIN …-----` to
+/// `-----END …-----`; header lines such as `Proc-Type:` are skipped).
+fn pem_bodies(text: &str) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut body: Option<Vec<u8>> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("-----BEGIN ") {
+            body = Some(Vec::new());
+        } else if line.starts_with("-----END ") {
+            if let Some(b) = body.take() {
+                if let Some(der) = base64_decode(&b) {
+                    out.push(der);
+                }
+            }
+        } else if let Some(b) = body.as_mut() {
+            if !line.contains(':') {
+                b.extend(line.bytes());
+            }
+        }
+    }
+    out
+}
+
+fn base64_decode(text: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let (mut acc, mut bits) = (0u32, 0);
+    for &c in text {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => break,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
 }
 
 impl InjectedSecrets {
     pub fn from_files<'a>(files: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> InjectedSecrets {
         let mut needles: Vec<(Vec<u8>, String)> = Vec::new();
+        let mut raw: Vec<(Vec<u8>, String)> = Vec::new();
+        let mut windows = WindowIndex::default();
         let mut add = |v: &str, src: &str| {
             let v = v.trim();
             if secret_like(v) && !needles.iter().any(|(n, _)| n == v.as_bytes()) {
@@ -145,6 +384,23 @@ impl InjectedSecrets {
                     add(v, src);
                 }
             }
+            // Binary content (BUG-099), and the DER of PEM blocks (a key
+            // converted to DER by the command).
+            let binary: Vec<Vec<u8>> = match std::str::from_utf8(data) {
+                Err(_) => vec![data[..data.len().min(MAX_BINARY)].to_vec()],
+                Ok(t) => pem_bodies(t),
+            };
+            for b in binary {
+                if b.len() < WINDOW / 2 {
+                    continue;
+                }
+                windows.sources.push(src.to_string());
+                let id = (windows.sources.len() - 1) as u32;
+                windows.add_source(&b, id);
+                if !raw.iter().any(|(n, _)| *n == b) {
+                    raw.push((b, src.to_string()));
+                }
+            }
         }
         // Longest first, so the leftmost match reports the most specific value.
         needles.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
@@ -161,30 +417,52 @@ impl InjectedSecrets {
                     .ok()
             })
             .flatten();
-        InjectedSecrets { needles, matcher }
+        InjectedSecrets {
+            needles,
+            matcher,
+            raw,
+            windows,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.needles.is_empty()
+        self.needles.is_empty() && self.raw.is_empty() && self.windows.len() == 0
     }
 
     /// The first injected value contained in `data`, as a printable finding.
     pub fn find(&self, data: &[u8]) -> Option<Finding> {
-        let (start, needle) = match &self.matcher {
-            Some(re) => {
-                let m = re.find(data)?;
-                (m.start(), self.needles.iter().find(|(n, _)| n == m.as_bytes())?)
-            }
-            // Pattern too large for the regex engine: plain substring search.
-            None => self.needles.iter().find_map(|n| {
-                data.windows(n.0.len()).position(|w| w == n.0.as_slice()).map(|i| (i, n))
-            })?,
-        };
-        Some(Finding {
+        let found = |start: usize, excerpt: String| Finding {
             rule: INJECTED_RULE,
             line: data[..start].iter().filter(|&&b| b == b'\n').count() + 1,
-            excerpt: format!("content of {} injected into the sandbox", needle.1),
-        })
+            excerpt,
+        };
+        let text = match &self.matcher {
+            Some(re) => re
+                .find(data)
+                .and_then(|m| Some((m.start(), self.needles.iter().find(|(n, _)| n == m.as_bytes())?))),
+            // Pattern too large for the regex engine: plain substring search.
+            None => self
+                .needles
+                .iter()
+                .find_map(|n| memchr::memmem::find(data, &n.0).map(|i| (i, n))),
+        };
+        if let Some((start, needle)) = text {
+            return Some(found(start, format!("content of {} injected into the sandbox", needle.1)));
+        }
+        if let Some((start, (_, src))) = self.raw.iter().find_map(|n| memchr::memmem::find(data, &n.0).map(|i| (i, n))) {
+            return Some(found(start, format!("content of {src} injected into the sandbox")));
+        }
+        let (start, w) = self.windows.find(data)?;
+        let (_, src, enc) = &self.windows.windows[w as usize];
+        let how = match enc {
+            Encoding::Raw => "part of the content",
+            Encoding::Base64 => "part of the content (base64)",
+            Encoding::Hex => "part of the content (hex)",
+        };
+        Some(found(
+            start,
+            format!("{how} of {} injected into the sandbox", self.windows.sources[*src as usize]),
+        ))
     }
 }
 
@@ -223,6 +501,92 @@ fn assignment_value(line: &str) -> Option<&str> {
     Some(v)
 }
 
+// ---- trusted sealing decisions (BUG-103) ---------------------------------------
+
+/// What the object behind a file entry says about the entry's visibility
+/// label (see [`verify_sealing`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sealing {
+    /// The object is sealed exactly as the label says (plaintext for a
+    /// public label, under scope `s` for `cloaked:s`, under `embargo/<id>`
+    /// for `embargo:<id>`).
+    Verified,
+    /// The object is sealed for another audience than the label claims: its
+    /// real visibility. The label is hostile or corrupt.
+    Relabelled(Visibility),
+    /// Nothing can be checked: the object is not here (withheld by a public
+    /// remote, not fetched), or it is sealed under a label that is no
+    /// audience (`local`, not a scope name) or is not file content.
+    Unverifiable,
+}
+
+/// The visibility a raw stored object really has, from its own envelope
+/// label: plaintext blob → public, sealed under `embargo/<id>` → embargoed,
+/// sealed under `scope` or `scope#<key-id>` → cloaked under `scope`.
+/// `None` for anything else.
+pub fn object_visibility(raw: &[u8]) -> Option<Visibility> {
+    if Object::is_blob_raw(raw) {
+        return Some(Visibility::Public);
+    }
+    let label = Object::sealed_scope(raw)?;
+    if let Some(id) = label.strip_prefix("embargo/") {
+        return (!id.is_empty()).then(|| Visibility::Embargoed { embargo: id.to_string() });
+    }
+    let scope = crate::keychain::split_label(&label).0;
+    crate::keychain::validate_scope_name(scope)
+        .is_ok()
+        .then(|| Visibility::Cloaked { scope: scope.to_string() })
+}
+
+/// Check a file entry's visibility label against the object it points to.
+///
+/// Visibility labels in trees, like every other field of history, are
+/// written by whoever produced the snapshot: a teammate, a remote anyone
+/// with write access can push to, a Git import. They are a *claim*. The
+/// envelope label of a sealed object is bound to its ciphertext (it is the
+/// AEAD's associated data), so it is what the content really is sealed
+/// for. A tree entry whose label disagrees with its object is hostile (or
+/// corrupt) and must never decide how new content is sealed.
+pub fn verify_sealing(store: &ObjectStore, e: &TreeEntry) -> Result<Sealing> {
+    if e.kind != EntryKind::File {
+        return Ok(Sealing::Verified);
+    }
+    let raw = match store.get_raw(&e.id) {
+        Ok(r) => r,
+        Err(err) if err.is_unreadable() || err.is_not_found() => return Ok(Sealing::Unverifiable),
+        Err(err) => return Err(err),
+    };
+    Ok(match object_visibility(&raw) {
+        None => Sealing::Unverifiable,
+        Some(actual) if actual == e.visibility => Sealing::Verified,
+        Some(actual) => Sealing::Relabelled(actual),
+    })
+}
+
+/// The cloak of a line of work, as recorded in a snapshot's `cloak` field,
+/// if it may decide how new content is sealed: a valid scope name. Never
+/// `local`, an embargo label (a released embargo's key is public) or a key
+/// generation (`team#<old key>`, which a revoked member still holds). The
+/// field comes from whoever wrote the snapshot, so anything else is a
+/// forged claim and is ignored. Sealing under a valid scope still needs
+/// the key: for a scope the member is not in, edits are held back.
+pub fn trusted_cloak(cloak: Option<&str>) -> Option<&str> {
+    cloak.filter(|c| crate::keychain::validate_scope_name(c).is_ok())
+}
+
+/// Human description of a relabelled entry, for reports.
+pub fn relabel_note(claimed: &Visibility, actual: &Visibility) -> String {
+    format!(
+        "recorded as {} but its content is {}; treated as {} (a remote or an import may have forged the label)",
+        claimed.label(),
+        match actual {
+            Visibility::Public => "plaintext".to_string(),
+            v => format!("sealed as {}", v.label()),
+        },
+        actual.label()
+    )
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct BuildReport {
     /// Files kept local-only by policy.
@@ -243,8 +607,15 @@ pub struct BuildReport {
     /// The member's own edit of `.veilpolicy` waits for `vl policy accept`
     /// (see [`Policy::own_edit_pending`]).
     pub policy_edit_pending: bool,
-    /// Files that should have been cloaked but no key was available.
+    /// Files that should have been cloaked but no key was available, or
+    /// whose recorded sealing could not be verified (the edit stays local).
     pub cloak_failures: Vec<(VPath, String)>,
+    /// Tracked files whose recorded visibility label disagrees with the
+    /// sealing of the object it points to (a hostile or corrupt label from
+    /// a remote or an import), with what was found. Their audience was
+    /// decided from the object's real sealing, never from the label (see
+    /// [`verify_sealing`]). Also reported in `policy_warnings`.
+    pub relabelled: Vec<(VPath, String)>,
     /// Edits held back on a line under an unreleased embargo this reader
     /// holds no key for (recording them would revert the hidden fix), with
     /// the embargo's id. They are recorded once the embargo is released.
@@ -308,6 +679,8 @@ struct Builder<'a> {
     report: BuildReport,
     /// How `fs` compares names (read once per build).
     folding: NameFolding,
+    /// The line's cloak, if it may decide sealing ([`trusted_cloak`]).
+    cloak: Option<&'a str>,
 }
 
 /// Build a tree from `fs`, returning its id and a report.
@@ -375,7 +748,13 @@ pub fn build_tree_cached(
             ..Default::default()
         },
         folding: fs.name_folding(),
+        cloak: trusted_cloak(opts.cloak),
     };
+    if let (Some(c), None) = (opts.cloak, b.cloak) {
+        b.report.policy_warnings.push(format!(
+            "this change claims to be on a line cloaked under '{c}', which is not a scope; the claim is ignored (a remote or an import may have forged it)"
+        ));
+    }
     let root_parent = parent.clone().zip(opts.parent_tree);
     let id = match b.build_dir(&VPath::root(), root_parent)? {
         Some(id) => id,
@@ -773,7 +1152,7 @@ impl Builder<'_> {
                 return Ok(Some(pe.clone()));
             }
         }
-        let mut desired = match &class.tier {
+        match &class.tier {
             Tier::Ignored => {
                 self.report.ignored += 1;
                 return Ok(None);
@@ -782,51 +1161,14 @@ impl Builder<'_> {
                 self.report.isolated.push(path.clone());
                 return Ok(None);
             }
-            Tier::Public => Visibility::Public,
-            Tier::Cloaked(s) => Visibility::Cloaked { scope: s.clone() },
-        };
-        if let (Some(scope), Visibility::Public) = (self.opts.cloak, &desired) {
-            if path.as_str() != POLICY_FILE {
-                desired = Visibility::Cloaked {
-                    scope: scope.to_string(),
-                };
-            }
+            Tier::Public | Tier::Cloaked(_) => {}
         }
-        // Sealed content keeps its audience. Neither a change of workspace
-        // (`vl new <cloaked change>`), nor a rebase, nor a policy that arrived
-        // by merge may re-key it or make it public: only an edit of
-        // `.veilpolicy` in this very snapshot that reclassifies the path
-        // (`vl expose`, `vl cloak --scope`) is a deliberate decision to.
-        if let Some(pe) = parent_file.filter(|pe| matches!(pe.visibility, Visibility::Cloaked { .. })) {
-            if desired != pe.visibility {
-                let reclassified = self
-                    .parent_policy
-                    .as_ref()
-                    .is_some_and(|old| old.classify(path, false) != class);
-                if !reclassified || class.held_back.is_some() {
-                    desired = pe.visibility.clone();
-                }
-            }
-        }
-
-        // A public file sealed only because of the line it is edited on (a
-        // cloaked workspace, or sealed content keeping its audience; the
-        // policy itself says public) keeps its last public version as
-        // `fallback`: readers without the key (public remotes, Git, members
-        // of other scopes) go on seeing that version instead of losing the
-        // file. A file the policy cloaks has none: hiding it is the point.
-        let cloak_fallback = match (&desired, parent_file) {
-            (Visibility::Cloaked { .. }, Some(pe)) if class.tier == Tier::Public => {
-                if pe.visibility.is_public() && pe.fallback.is_none() {
-                    Some(pe.id)
-                } else if pe.visibility == desired {
-                    pe.fallback
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
+        // Decided on the parent entry's label as recorded. Before any new
+        // content is sealed (below, once the file is read), the label is
+        // checked against its object and the decision taken again on what
+        // the object really is (BUG-103). The fast paths in between only
+        // ever reuse existing objects.
+        let (mut desired, mut cloak_fallback) = self.audience(path, &class, parent_file);
 
         // Fast path: overlay/tree-view says the file is byte-identical.
         if let Some(pe) = parent_file {
@@ -857,6 +1199,53 @@ impl Builder<'_> {
         };
         self.report.hashed += 1;
         let content = Object::blob_id(&data);
+
+        // The parent's visibility label is a claim (it comes from whoever
+        // wrote the snapshot: a remote, an import). Only the sealing of its
+        // object may decide the audience of new content. A public entry
+        // whose id is the blob id of this very content is plaintext by
+        // construction, so the common unchanged case costs nothing.
+        let corrected;
+        let mut parent_file = parent_file;
+        if let Some(pe) = parent_file.filter(|pe| !(pe.visibility.is_public() && pe.id == content)) {
+            match verify_sealing(self.store, pe)? {
+                Sealing::Verified => {}
+                Sealing::Relabelled(actual) => {
+                    let note = relabel_note(&pe.visibility, &actual);
+                    self.report.policy_warnings.push(format!("{path}: {note}"));
+                    self.report.relabelled.push((path.clone(), note));
+                    corrected = TreeEntry {
+                        visibility: actual,
+                        ..pe.clone()
+                    };
+                    parent_file = Some(&corrected);
+                    (desired, cloak_fallback) = self.audience(path, &class, parent_file);
+                }
+                Sealing::Unverifiable if !pe.visibility.is_public() => {
+                    // Shown the recorded fallback and left untouched.
+                    if pe.fallback == Some(content) && pe.executable == executable {
+                        return Ok(Some(TreeEntry {
+                            name: name.to_string(),
+                            ..pe.clone()
+                        }));
+                    }
+                    // The claim would decide the sealing of this edit:
+                    // without its object, it cannot be trusted.
+                    let (trusted, _) = self.audience(path, &class, None);
+                    let keeps_embargo = matches!(pe.visibility, Visibility::Embargoed { .. })
+                        && trusted.is_public()
+                        && pe.visibility.key_scope().is_some_and(|l| self.store.keys.has(&l));
+                    if desired != trusted || keeps_embargo {
+                        let why = format!(
+                            "its recorded version is labelled {} and its content is not in this repository to verify that; the edit stays local, history keeps the recorded version",
+                            pe.visibility.label()
+                        );
+                        return self.cannot_seal(path, name, Some(pe), why);
+                    }
+                }
+                Sealing::Unverifiable => {}
+            }
+        }
 
         // Embargoes are sticky until released.
         let mut fallback = None;
@@ -941,7 +1330,7 @@ impl Builder<'_> {
         // entry (as the overlay fast path above does) rather than sealing a
         // copy of public bytes.
         if let Some(pe) = parent_file {
-            if self.opts.cloak.is_some()
+            if self.cloak.is_some()
                 && class.tier == Tier::Public
                 && pe.visibility.is_public()
                 && pe.id == content
@@ -1017,26 +1406,34 @@ impl Builder<'_> {
             }
         }
 
+        // Backstop: new content is never sealed under a key that is not an
+        // audience: a released embargo's key is public, and a cloak label
+        // must name a scope (never `embargo/…`, `local` or a generation).
+        let unsealable = match &desired {
+            Visibility::Public => None,
+            Visibility::Cloaked { scope } => crate::keychain::validate_scope_name(scope)
+                .is_err()
+                .then(|| format!("'{scope}' is not a scope")),
+            Visibility::Embargoed { embargo } => self
+                .store
+                .keys
+                .embargo_released(embargo)
+                .then(|| format!("embargo {embargo} is released and its key is public")),
+        };
+        if let Some(why) = unsealable {
+            return self.cannot_seal(path, name, parent_file, format!("{why}; the edit stays local"));
+        }
         let id = match self.store.store_file(&data, &desired) {
             Ok(id) => id,
             Err(VeilError::Redacted { scope }) => {
                 // A tracked file keeps its recorded entry: this reader cannot
                 // seal the edit, and recording a deletion instead would drop
                 // content it may not even be able to read.
-                if let Some(pe) = parent_file {
-                    self.report.cloak_failures.push((
-                        path.clone(),
-                        format!("no key for scope '{scope}'; the edit stays local, history keeps the recorded version"),
-                    ));
-                    return Ok(Some(TreeEntry {
-                        name: name.to_string(),
-                        ..pe.clone()
-                    }));
-                }
-                self.report
-                    .cloak_failures
-                    .push((path.clone(), format!("no key for scope '{scope}'")));
-                return Ok(None);
+                let why = match parent_file {
+                    Some(_) => format!("no key for scope '{scope}'; the edit stays local, history keeps the recorded version"),
+                    None => format!("no key for scope '{scope}'"),
+                };
+                return self.cannot_seal(path, name, parent_file, why);
             }
             Err(e) => return Err(e),
         };
@@ -1056,6 +1453,72 @@ impl Builder<'_> {
             visibility: desired,
             fallback,
         }))
+    }
+
+    /// The edit of `path` cannot be sealed (no key, or no trustworthy
+    /// audience): it stays local, reported in `cloak_failures`. A tracked
+    /// file keeps its recorded entry, never a deletion.
+    fn cannot_seal(&mut self, path: &VPath, name: &str, parent_file: Option<&TreeEntry>, why: String) -> Result<Option<TreeEntry>> {
+        self.report.cloak_failures.push((path.clone(), why));
+        Ok(parent_file.map(|pe| TreeEntry {
+            name: name.to_string(),
+            ..pe.clone()
+        }))
+    }
+
+    /// The audience of new content at `path` (classified `class`, not
+    /// ignored or isolated), given its parent entry: the visibility to seal
+    /// it under, and the last public version to show readers without the
+    /// key. Inputs: the policy (with the accepted pin), the line's trusted
+    /// cloak, and the parent entry, whose label the caller must have
+    /// verified before content is sealed under the result.
+    fn audience(&self, path: &VPath, class: &Classification, parent_file: Option<&TreeEntry>) -> (Visibility, Option<ObjectId>) {
+        let mut desired = match &class.tier {
+            Tier::Cloaked(s) => Visibility::Cloaked { scope: s.clone() },
+            _ => Visibility::Public,
+        };
+        if let (Some(scope), Visibility::Public) = (self.cloak, &desired) {
+            if path.as_str() != POLICY_FILE {
+                desired = Visibility::Cloaked {
+                    scope: scope.to_string(),
+                };
+            }
+        }
+        // Sealed content keeps its audience. Neither a change of workspace
+        // (`vl new <cloaked change>`), nor a rebase, nor a policy that arrived
+        // by merge may re-key it or make it public: only an edit of
+        // `.veilpolicy` in this very snapshot that reclassifies the path
+        // (`vl expose`, `vl cloak --scope`) is a deliberate decision to.
+        if let Some(pe) = parent_file.filter(|pe| matches!(pe.visibility, Visibility::Cloaked { .. })) {
+            if desired != pe.visibility {
+                let reclassified = self
+                    .parent_policy
+                    .as_ref()
+                    .is_some_and(|old| old.classify(path, false) != *class);
+                if !reclassified || class.held_back.is_some() {
+                    desired = pe.visibility.clone();
+                }
+            }
+        }
+        // A public file sealed only because of the line it is edited on (a
+        // cloaked workspace, or sealed content keeping its audience; the
+        // policy itself says public) keeps its last public version as
+        // `fallback`: readers without the key (public remotes, Git, members
+        // of other scopes) go on seeing that version instead of losing the
+        // file. A file the policy cloaks has none: hiding it is the point.
+        let cloak_fallback = match (&desired, parent_file) {
+            (Visibility::Cloaked { .. }, Some(pe)) if class.tier == Tier::Public => {
+                if pe.visibility.is_public() && pe.fallback.is_none() {
+                    Some(pe.id)
+                } else if pe.visibility == desired {
+                    pe.fallback
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        (desired, cloak_fallback)
     }
 
     /// Hold the edit back, but do not record a deletion: keep the previously

@@ -16,6 +16,7 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use crate::{
+    builder::{verify_sealing, Sealing},
     embargo::{overlap_error, public_view, unreleased_wrapper, wrap},
     error::{Result, VeilError},
     id::ObjectId,
@@ -269,7 +270,12 @@ fn merge_file(
             }
         }
     };
-    let (visibility, fallback) = merged_visibility(oe, te);
+    // The merged content is new: its audience is decided on what both
+    // sides' objects really are sealed for, never on their labels alone
+    // (BUG-103: a forged `cloaked:embargo/<released>` or `cloaked:<scope of
+    // the attacker's>` label on one side would re-key it).
+    let (oe, te) = (&checked(store, oe, path)?, &checked(store, te, path)?);
+    let (visibility, fallback) = merged_visibility(store, oe, te);
     let id = store.store_file(&merged, &visibility)?;
     Ok(TreeEntry {
         name: oe.name.clone(),
@@ -289,20 +295,47 @@ fn merge_file(
 /// (it has a fallback) shows the other side's public version as its
 /// fallback if there is one (the newest public version), else the
 /// sealed side's own.
-fn merged_visibility(oe: &TreeEntry, te: &TreeEntry) -> (Visibility, Option<ObjectId>) {
+///
+/// A scope's sealing beats an embargo's (the release would publish the
+/// scope's content), and a released embargo counts as public: its key is
+/// public, so nothing new is ever sealed under it.
+fn merged_visibility(store: &ObjectStore, oe: &TreeEntry, te: &TreeEntry) -> (Visibility, Option<ObjectId>) {
     let public_other = |sealed: &TreeEntry, other: &TreeEntry| match (sealed.fallback, other.visibility.is_public() && other.fallback.is_none()) {
         (Some(_), true) => Some(other.id),
         (fb, _) => fb,
     };
-    if !oe.visibility.is_public() {
-        return match oe.visibility {
-            Visibility::Cloaked { .. } => (oe.visibility.clone(), public_other(oe, te)),
-            _ => (oe.visibility.clone(), oe.fallback),
-        };
+    let rank = |e: &TreeEntry| match &e.visibility {
+        Visibility::Cloaked { .. } => 2,
+        Visibility::Embargoed { embargo } if !store.keys.embargo_released(embargo) => 1,
+        _ => 0,
+    };
+    let ours_wins = rank(oe) >= rank(te);
+    let (sealed, other) = if ours_wins { (oe, te) } else { (te, oe) };
+    match rank(sealed) {
+        2 => (sealed.visibility.clone(), public_other(sealed, other)),
+        // An embargoed result shows ours (its fallback, or ours itself when
+        // public) to readers without the key.
+        1 if ours_wins => (oe.visibility.clone(), oe.fallback),
+        1 if oe.visibility.is_public() => (te.visibility.clone(), Some(oe.id)),
+        1 => (te.visibility.clone(), te.fallback),
+        _ => (Visibility::Public, None),
     }
-    match &te.visibility {
-        Visibility::Public => (Visibility::Public, None),
-        Visibility::Cloaked { .. } => (te.visibility.clone(), public_other(te, oe)),
-        Visibility::Embargoed { .. } => (te.visibility.clone(), Some(oe.id)),
+}
+
+/// `e` with the visibility its object really has (BUG-103). A sealed label
+/// whose object is sealed under no audience (`local`, not a scope) is
+/// refused: merging would seal the result on the label's word.
+fn checked(store: &ObjectStore, e: &TreeEntry, path: &VPath) -> Result<TreeEntry> {
+    match verify_sealing(store, e)? {
+        Sealing::Verified => Ok(e.clone()),
+        Sealing::Relabelled(actual) => Ok(TreeEntry {
+            visibility: actual,
+            ..e.clone()
+        }),
+        Sealing::Unverifiable if e.visibility.is_public() => Ok(e.clone()),
+        Sealing::Unverifiable => Err(VeilError::Policy(format!(
+            "cannot merge {path}: it is labelled {} but its sealing cannot be verified",
+            e.visibility.label()
+        ))),
     }
 }
