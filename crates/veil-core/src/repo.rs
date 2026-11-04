@@ -555,18 +555,13 @@ impl Repo {
     /// about to go under an embargo, see [`crate::merge::merge_trees_with_markers`]).
     pub fn parents_tree_with(&self, parents: &[ObjectId], markers: bool) -> Result<MergeOutcome> {
         match parents {
-            [] => Ok(MergeOutcome {
-                tree: self.store.empty_tree()?,
-                conflicts: vec![],
-            }),
-            [p] => Ok(MergeOutcome {
-                tree: self.snapshot(p)?.tree,
-                conflicts: vec![],
-            }),
+            [] => Ok(MergeOutcome::clean(self.store.empty_tree()?)),
+            [p] => Ok(MergeOutcome::clean(self.snapshot(p)?.tree)),
             [first, rest @ ..] => {
                 let mut acc = self.snapshot(first)?.tree;
                 let mut merged = vec![*first];
                 let mut conflicts = Vec::new();
+                let mut renames = Vec::new();
                 for p in rest {
                     // A redacted extra parent (the withheld source of an
                     // unreleased embargo) contributes nothing we can see.
@@ -578,9 +573,10 @@ impl Repo {
                     };
                     acc = out.tree;
                     conflicts.extend(out.conflicts);
+                    renames.extend(out.renames);
                     merged.push(*p);
                 }
-                Ok(MergeOutcome { tree: acc, conflicts })
+                Ok(MergeOutcome { tree: acc, conflicts, renames })
             }
         }
     }
@@ -677,7 +673,10 @@ impl Repo {
     /// parent's diff alone (BUG-251).
     ///
     /// Conflicts are those of applying the change, plus those of the new
-    /// parents' own merge whose markers reach the result unchanged.
+    /// parents' own merge whose markers reach the result unchanged. Renames
+    /// are followed ([`crate::merge`]): a file the new parents renamed gets
+    /// the change's edit at its new name; `renames` reports those of
+    /// applying the change.
     ///
     /// A change on a cloaked line (`cloak`) never introduces public content:
     /// what the result holds publicly that the new parents' merge does not
@@ -701,7 +700,7 @@ impl Repo {
             Some(scope) => crate::embargo::seal_introduced(&self.store, &out.tree, Some(onto.tree), scope)?,
             None => out.tree,
         };
-        Ok(MergeOutcome { tree, conflicts })
+        Ok(MergeOutcome { tree, conflicts, renames: out.renames })
     }
 
     /// No content change relative to its parents.

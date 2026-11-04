@@ -12,24 +12,36 @@
 //! Conflict markers show the base's version only where its audience is the
 //! result's (BUG-126).
 //!
+//! Renames are followed (see [`follow_renames`]): when one side renamed a
+//! file and the other edited it, the edit is merged at the new path instead
+//! of being a modify/delete conflict. Pairs are found by
+//! [`crate::rename::detect`] as a public mirror reads the trees, and only
+//! between versions of the same (verified) audience, so the result never
+//! depends on the merger's keys and never moves content between audiences.
+//!
 //! Trees under an unreleased embargo (see [`crate::embargo`]) stay under it:
 //! the result is re-wrapped under the same embargo, with the merge of the
 //! inputs' public views as its fallback. Merging them needs the embargo key,
 //! and trees under two different unreleased embargoes are never merged
 //! (embargoes cannot overlap in Veil 1.0).
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashSet},
+    sync::Arc,
+};
 
 use crate::{
+    blame::Reader,
     builder::{verify_sealing, Sealing},
     conflict::{Merge, Term},
     embargo::{overlap_error, public_view, unreleased_wrapper, wrap},
     error::{Result, VeilError},
     id::ObjectId,
     object::{ConflictTerm, EntryKind, Tree, TreeEntry, Visibility},
+    rename::{Pair, RenameOptions},
     secrets::looks_binary,
     store::ObjectStore,
-    tree::MAX_TREE_DEPTH,
+    tree::{lookup, TreeChange, MAX_TREE_DEPTH},
     vpath::VPath,
 };
 
@@ -37,6 +49,16 @@ use crate::{
 pub struct MergeOutcome {
     pub tree: ObjectId,
     pub conflicts: Vec<VPath>,
+    /// Renames the merge followed, for this reader's report only: never
+    /// stored (threat review 1 of `docs/design/git-parity/2-renames.md`).
+    pub renames: Vec<FollowedRename>,
+}
+
+impl MergeOutcome {
+    /// A merge that needed no work: `tree`, nothing conflicted or renamed.
+    pub fn clean(tree: ObjectId) -> MergeOutcome {
+        MergeOutcome { tree, conflicts: vec![], renames: vec![] }
+    }
 }
 
 /// How conflicts are resolved.
@@ -81,10 +103,10 @@ pub fn virtual_merge_base(store: &ObjectStore, base: Option<ObjectId>, ours: Obj
 
 fn merge_trees_in(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, theirs: ObjectId, mode: Mode, markers: bool) -> Result<MergeOutcome> {
     if ours == theirs || Some(theirs) == base {
-        return Ok(MergeOutcome { tree: ours, conflicts: vec![] });
+        return Ok(MergeOutcome::clean(ours));
     }
     if Some(ours) == base {
-        return Ok(MergeOutcome { tree: theirs, conflicts: vec![] });
+        return Ok(MergeOutcome::clean(theirs));
     }
     let mut wrapped: Option<crate::embargo::EmbargoWrapper> = None;
     for id in [Some(ours), Some(theirs), base].into_iter().flatten() {
@@ -120,25 +142,33 @@ fn merge_trees_in(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, t
     Ok(MergeOutcome {
         tree: wrap(store, &w.embargo, &full.tree, &fallback)?,
         conflicts: full.conflicts,
+        renames: full.renames,
     })
 }
 
 fn merge_resolved(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, theirs: ObjectId, mode: Mode, markers: bool) -> Result<MergeOutcome> {
     if ours == theirs || Some(theirs) == base {
-        return Ok(MergeOutcome { tree: ours, conflicts: vec![] });
+        return Ok(MergeOutcome::clean(ours));
     }
     if Some(ours) == base {
-        return Ok(MergeOutcome { tree: theirs, conflicts: vec![] });
+        return Ok(MergeOutcome::clean(theirs));
     }
-    let b = base.map(|id| store.tree(&id)).transpose()?;
-    let o = store.tree(&ours)?;
-    let t = store.tree(&theirs)?;
+    // Renames first: the trees with each followed rename applied to the
+    // side (and base) that did not make it.
+    let plan = match base {
+        Some(b) => follow_renames(store, b, ours, theirs)?,
+        None => RenamePlan::none(base, ours, theirs),
+    };
+    let b = plan.base.map(|id| store.tree(&id)).transpose()?;
+    let o = store.tree(&plan.ours)?;
+    let t = store.tree(&plan.theirs)?;
     let mut conflicts = Vec::new();
-    let tree = match merge_dir(store, b, Some((o, ours)), Some((t, theirs)), mode, markers, &mut conflicts)? {
+    let tree = match merge_dir(store, b, Some((o, plan.ours)), Some((t, plan.theirs)), mode, markers, &mut conflicts)? {
         Some(id) => id,
         None => store.empty_tree()?,
     };
-    Ok(MergeOutcome { tree, conflicts })
+    let (tree, renames) = finish_renames(store, tree, plan.renames, mode, markers, &mut conflicts)?;
+    Ok(MergeOutcome { tree, conflicts, renames })
 }
 
 fn same(a: Option<&TreeEntry>, b: Option<&TreeEntry>) -> bool {
@@ -377,16 +407,7 @@ fn merge_terms(
     }
     // The versions are recorded as they really are sealed (BUG-103): a
     // forged label is not carried into the conflict.
-    let relabel = |t: &Term| -> Result<Term> {
-        let Some(t) = t else { return Ok(None) };
-        Ok(Some(match verify_sealing(store, &t.entry(name))? {
-            Sealing::Relabelled(actual) => ConflictTerm {
-                visibility: actual,
-                ..t.clone()
-            },
-            _ => t.clone(),
-        }))
-    };
+    let relabel = |t: &Term| relabelled(store, t, name);
     let m = Merge {
         adds: m.adds.iter().map(relabel).collect::<Result<_>>()?,
         removes: m.removes.iter().map(relabel).collect::<Result<_>>()?,
@@ -397,6 +418,18 @@ fn merge_terms(
     }
     conflicts.push(path.clone());
     crate::conflict::entry_for(store, name, m)
+}
+
+/// `t` with the visibility its object really has (BUG-103).
+fn relabelled(store: &ObjectStore, t: &Term, name: &str) -> Result<Term> {
+    let Some(t) = t else { return Ok(None) };
+    Ok(Some(match verify_sealing(store, &t.entry(name))? {
+        Sealing::Relabelled(actual) => ConflictTerm {
+            visibility: actual,
+            ..t.clone()
+        },
+        _ => t.clone(),
+    }))
 }
 
 /// The file `m` merges to by content, if it does: every version present,
@@ -742,6 +775,406 @@ fn checked(store: &ObjectStore, e: &TreeEntry, path: &VPath) -> Result<TreeEntry
             e.visibility.label()
         ))),
     }
+}
+
+// ---- rename-aware merging ------------------------------------------------------
+//
+// Before the directory walk, renames are detected base → ours and base →
+// theirs ([`crate::rename::detect`]) and each one the other side cares about
+// is applied to the trees that did not make it, so the walk merges the
+// versions of a file at one path. The pairing only decides *which* entries
+// are combined; their audiences are decided by the content merge itself
+// (`merged_visibility`, `audience_clash`, BUG-123/126), exactly as for a
+// file that was not renamed (threat review 2 of
+// `docs/design/git-parity/2-renames.md`).
+
+/// Which side of a merge renamed a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameSide {
+    Ours,
+    Theirs,
+    Both,
+}
+
+/// What a merge did with a rename it detected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenameMerge {
+    /// One side renamed the file and the other edited it: the edit was
+    /// merged at the new path.
+    Followed,
+    /// Both sides renamed it to the same path: the two versions were merged
+    /// there.
+    Both,
+    /// One side renamed it, the other deleted it: a conflict at the new
+    /// path (the renamed version against no file).
+    RenameDelete,
+    /// The sides renamed it to two different paths (`to` is ours, `other`
+    /// theirs): a conflict at both, each holding its side's version against
+    /// no file, so either name can be kept with `vl resolve`.
+    RenameRename { other: VPath },
+}
+
+/// A rename a merge followed. Reported to this reader only; never stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowedRename {
+    pub from: VPath,
+    pub to: VPath,
+    /// Similarity in percent (100: the same object).
+    pub score: u8,
+    pub side: RenameSide,
+    pub how: RenameMerge,
+    /// The result at `to` is sealed for this audience: it stays sealed at
+    /// its new path, whatever the policy says there; only `vl expose`
+    /// publishes it.
+    pub sealed: Option<Visibility>,
+}
+
+/// Is rename following on in merges? On unless `VEIL_MERGE_RENAMES=0`
+/// (an escape hatch for one release; any other value, or none, means on).
+pub fn merge_renames_enabled() -> bool {
+    !matches!(std::env::var_os("VEIL_MERGE_RENAMES"), Some(v) if v == "0")
+}
+
+/// The trees a merge walks after renames were applied, and what was done.
+struct RenamePlan {
+    base: Option<ObjectId>,
+    ours: ObjectId,
+    theirs: ObjectId,
+    renames: Vec<PlannedRename>,
+}
+
+impl RenamePlan {
+    fn none(base: Option<ObjectId>, ours: ObjectId, theirs: ObjectId) -> RenamePlan {
+        RenamePlan { base, ours, theirs, renames: vec![] }
+    }
+}
+
+/// One rename the plan uses, with the versions a conflict would record.
+struct PlannedRename {
+    r: FollowedRename,
+    /// The base's version (at `from`).
+    base: TreeEntry,
+    /// The renamed version(s): ours (at `to`) and theirs (at `to`, or at
+    /// `other` for rename/rename).
+    ours: Option<TreeEntry>,
+    theirs: Option<TreeEntry>,
+}
+
+/// The renames of `changes` (base → one side) a merge may follow: real
+/// renames (not copies) between versions of the same kind and the same
+/// verified audience. Detection reads as a public mirror does
+/// ([`Reader::Public`]): the inexact pass only reads plaintext, sealed
+/// content pairs by exact object id only (an equality every reader of the
+/// trees already sees), so the pairing never depends on the merger's keys
+/// and never reads what the merger cannot (threat review 5).
+fn side_renames(store: &ObjectStore, changes: &[TreeChange]) -> Result<BTreeMap<VPath, Pair>> {
+    let mut out = BTreeMap::new();
+    let d = crate::rename::detect(store, changes, Reader::Public, &RenameOptions::default())?;
+    for p in d.pairs {
+        if !p.copy && same_audience(store, &p.old, &p.new)? {
+            out.insert(p.from.clone(), p);
+        }
+    }
+    Ok(out)
+}
+
+/// May `a` and `b` be paired: the same kind and the same audience, checked
+/// on their objects (labels are claims, BUG-103)? A conflict pairs only
+/// with the same conflict object.
+fn same_audience(store: &ObjectStore, a: &TreeEntry, b: &TreeEntry) -> Result<bool> {
+    if a.kind != b.kind {
+        return Ok(false);
+    }
+    if a.kind == EntryKind::Conflict {
+        return Ok(a.id == b.id);
+    }
+    if a.kind != EntryKind::File {
+        return Ok(false);
+    }
+    Ok(match (verified_visibility(store, a)?, verified_visibility(store, b)?) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    })
+}
+
+/// Does `cx` (base → one side) hold a rename the other side (`other`, the
+/// paths it changed) could care about: a deleted file the other side
+/// changed, and an added file? Most merges have none, and detection is
+/// skipped.
+fn may_matter(cx: &[TreeChange], other: &HashSet<&VPath>) -> bool {
+    let deleted = cx.iter().any(|c| c.new.is_none() && c.old.as_ref().is_some_and(|e| e.kind.is_file_like()) && other.contains(&c.path));
+    deleted && cx.iter().any(|c| c.old.is_none() && c.new.as_ref().is_some_and(|e| e.kind.is_file_like()))
+}
+
+/// Detect the renames each side made and apply those the other side cares
+/// about (see [`RenameMerge`]). Unchanged trees when following is off, or
+/// nothing applies. A rename whose new path is taken on the other side
+/// (rename/add), or cannot be placed there (a file where a directory is
+/// needed), is not followed: the merge does what it did before.
+fn follow_renames(store: &ObjectStore, base: ObjectId, ours: ObjectId, theirs: ObjectId) -> Result<RenamePlan> {
+    let mut plan = RenamePlan::none(Some(base), ours, theirs);
+    if !merge_renames_enabled() {
+        return Ok(plan);
+    }
+    let co = crate::tree::diff_trees(store, Some(&base), Some(&ours))?;
+    let ct = crate::tree::diff_trees(store, Some(&base), Some(&theirs))?;
+    let (po, pt) = {
+        let touched_o: HashSet<&VPath> = co.iter().map(|c| &c.path).collect();
+        let touched_t: HashSet<&VPath> = ct.iter().map(|c| &c.path).collect();
+        let po = if may_matter(&co, &touched_t) { side_renames(store, &co)? } else { BTreeMap::new() };
+        let pt = if may_matter(&ct, &touched_o) { side_renames(store, &ct)? } else { BTreeMap::new() };
+        (po, pt)
+    };
+    if po.is_empty() && pt.is_empty() {
+        return Ok(plan);
+    }
+    let froms: BTreeSet<&VPath> = po.keys().chain(pt.keys()).collect();
+    let mut claimed: HashSet<VPath> = HashSet::new();
+    let (mut b, mut o, mut t) = (base, ours, theirs);
+    for from in froms {
+        let rename = |p: &Pair, side, how| FollowedRename {
+            from: p.from.clone(),
+            to: p.to.clone(),
+            score: p.score,
+            side,
+            how,
+            sealed: None,
+        };
+        match (po.get(from), pt.get(from)) {
+            (Some(x), Some(y)) if x.to == y.to => {
+                // Both renamed it the same way: merge the two versions there.
+                if claimed.contains(&x.to) {
+                    continue;
+                }
+                let Some(nb) = move_entry(store, &b, from, &x.to, &x.old)? else { continue };
+                b = nb;
+                claimed.insert(x.to.clone());
+                plan.renames.push(PlannedRename {
+                    r: FollowedRename { score: x.score.min(y.score), ..rename(x, RenameSide::Both, RenameMerge::Both) },
+                    base: x.old.clone(),
+                    ours: Some(x.new.clone()),
+                    theirs: Some(y.new.clone()),
+                });
+            }
+            (Some(x), Some(y)) => {
+                // rename/rename to two names: each keeps its name; a
+                // conflict at both (see `finish_renames`).
+                if claimed.contains(&x.to) || claimed.contains(&y.to) {
+                    continue;
+                }
+                claimed.insert(x.to.clone());
+                claimed.insert(y.to.clone());
+                plan.renames.push(PlannedRename {
+                    r: rename(x, RenameSide::Both, RenameMerge::RenameRename { other: y.to.clone() }),
+                    base: x.old.clone(),
+                    ours: Some(x.new.clone()),
+                    theirs: Some(y.new.clone()),
+                });
+            }
+            (Some(p), None) | (None, Some(p)) => {
+                let side = if po.contains_key(from) { RenameSide::Ours } else { RenameSide::Theirs };
+                if claimed.contains(&p.to) {
+                    continue;
+                }
+                let other = if side == RenameSide::Ours { t } else { o };
+                if lookup(store, &other, &p.to)?.is_some() {
+                    // rename/add: the other side has its own file there.
+                    continue;
+                }
+                let (ours_v, theirs_v) = match side {
+                    RenameSide::Ours => (Some(p.new.clone()), None),
+                    _ => (None, Some(p.new.clone())),
+                };
+                match lookup(store, &other, from)? {
+                    // The other side left the file alone: the rename is
+                    // merged as it is (deleted at `from`, added at `to`).
+                    Some(e) if e.same_content(&p.old) => continue,
+                    Some(e) if e.kind == EntryKind::Dir => continue,
+                    Some(e) => {
+                        // Edited on the other side: the edit follows.
+                        let Some(nb) = move_entry(store, &b, from, &p.to, &p.old)? else { continue };
+                        let Some(nother) = move_entry(store, &other, from, &p.to, &e)? else { continue };
+                        b = nb;
+                        match side {
+                            RenameSide::Ours => t = nother,
+                            _ => o = nother,
+                        }
+                        claimed.insert(p.to.clone());
+                        plan.renames.push(PlannedRename {
+                            r: rename(p, side, RenameMerge::Followed),
+                            base: p.old.clone(),
+                            ours: ours_v,
+                            theirs: theirs_v,
+                        });
+                    }
+                    None => {
+                        claimed.insert(p.to.clone());
+                        plan.renames.push(PlannedRename {
+                            r: rename(p, side, RenameMerge::RenameDelete),
+                            base: p.old.clone(),
+                            ours: ours_v,
+                            theirs: theirs_v,
+                        });
+                    }
+                }
+            }
+            (None, None) => {}
+        }
+    }
+    plan.base = Some(b);
+    plan.ours = o;
+    plan.theirs = t;
+    Ok(plan)
+}
+
+/// After the walk: record rename/delete and rename/rename as conflicts (a
+/// real merge only; a virtual merge base records nothing, and below format
+/// 4 the files stay as they are and are flagged), and note which followed
+/// renames are sealed at their new path.
+fn finish_renames(
+    store: &ObjectStore,
+    mut tree: ObjectId,
+    planned: Vec<PlannedRename>,
+    mode: Mode,
+    markers: bool,
+    conflicts: &mut Vec<VPath>,
+) -> Result<(ObjectId, Vec<FollowedRename>)> {
+    let mut out = Vec::with_capacity(planned.len());
+    for p in planned {
+        let mut r = p.r;
+        if mode == Mode::Merge {
+            // (path, the version found there, ours' and theirs' versions)
+            let sites: Vec<(VPath, &TreeEntry, Option<&TreeEntry>, Option<&TreeEntry>)> = match (&r.how, &p.ours, &p.theirs) {
+                (RenameMerge::RenameDelete, Some(oe), None) => vec![(r.to.clone(), oe, Some(oe), None)],
+                (RenameMerge::RenameDelete, None, Some(te)) => vec![(r.to.clone(), te, None, Some(te))],
+                (RenameMerge::RenameRename { other }, Some(oe), Some(te)) => {
+                    vec![(r.to.clone(), oe, Some(oe), None), (other.clone(), te, None, Some(te))]
+                }
+                _ => vec![],
+            };
+            for (path, expect, oe, te) in sites {
+                // Only where the walk left the renamed version as it was.
+                if !lookup(store, &tree, &path)?.is_some_and(|e| e.same_content(expect)) {
+                    continue;
+                }
+                if !markers {
+                    let name = path.file_name().to_string();
+                    let m = Merge::three_way(Merge::of_entry(store, Some(&p.base))?, Merge::of_entry(store, oe)?, Merge::of_entry(store, te)?);
+                    let m = Merge {
+                        adds: m.adds.iter().map(|x| relabelled(store, x, &name)).collect::<Result<_>>()?,
+                        removes: m.removes.iter().map(|x| relabelled(store, x, &name)).collect::<Result<_>>()?,
+                    };
+                    let Some(c) = m.into_conflict()? else { continue };
+                    let entry = TreeEntry::conflict(&name, store.put_conflict(&c)?);
+                    tree = crate::conflict::set_entry(store, &tree, &path, Some(entry))?;
+                }
+                if !conflicts.contains(&path) {
+                    conflicts.push(path);
+                }
+            }
+        }
+        if let Some(e) = lookup(store, &tree, &r.to)?.filter(|e| e.kind == EntryKind::File) {
+            r.sealed = match verified_visibility(store, &e)? {
+                Some(Visibility::Public) | None => None,
+                Some(Visibility::Embargoed { embargo }) if store.keys.embargo_released(&embargo) => None,
+                Some(v) => Some(v),
+            };
+        }
+        out.push(r);
+    }
+    Ok((tree, out))
+}
+
+/// For `vl merge`, after it re-derived audiences
+/// ([`crate::embargo::normalize_tree`]): a file whose edit followed a rename
+/// and that the merge left sealed keeps its sealed entry from `merged` at
+/// its new path, even where the policy would publish the merged-in line's
+/// files (or quarantine them): the rename put it there, not the line being
+/// merged, and only `vl expose` publishes it. Such paths leave
+/// `declassified` and `quarantined`, and `warnings` says why.
+pub fn keep_followed_sealed(
+    store: &ObjectStore,
+    mut tree: ObjectId,
+    merged: ObjectId,
+    renames: &[FollowedRename],
+    declassified: &mut Vec<VPath>,
+    quarantined: &mut Vec<(VPath, Vec<crate::secrets::Finding>)>,
+    warnings: &mut Vec<String>,
+) -> Result<ObjectId> {
+    for r in renames {
+        let Some(vis) = &r.sealed else { continue };
+        let was_declassified = declassified.contains(&r.to);
+        let was_quarantined = quarantined.iter().any(|(p, _)| *p == r.to);
+        if !was_declassified && !was_quarantined {
+            continue;
+        }
+        declassified.retain(|p| *p != r.to);
+        quarantined.retain(|(p, _)| *p != r.to);
+        let Some(sealed) = lookup(store, &merged, &r.to)? else { continue };
+        let now = lookup(store, &tree, &r.to)?;
+        if now.as_ref() != Some(&sealed) && unreleased_wrapper(store, &tree)?.is_none() {
+            tree = crate::conflict::set_entry(store, &tree, &r.to, Some(sealed))?;
+        }
+        warnings.push(format!(
+            "{} followed the rename of {} and stays sealed ({}) at its new path; `vl expose {}` publishes it",
+            r.to,
+            r.from,
+            vis.label(),
+            r.to
+        ));
+    }
+    Ok(tree)
+}
+
+/// `tree` with `entry` moved from `from` to `to` (directories created as
+/// needed, emptied ones removed). `None` when `to` is taken or a component
+/// of it is not a directory: the rename cannot be applied there.
+fn move_entry(store: &ObjectStore, tree: &ObjectId, from: &VPath, to: &VPath, entry: &TreeEntry) -> Result<Option<ObjectId>> {
+    let Some(t) = put_at(store, tree, from, None)? else { return Ok(None) };
+    put_at(store, &t, to, Some(entry.clone()))
+}
+
+/// `root` with `entry` at `path` (`None` removes it). Missing directories
+/// are created; one left empty disappears. `None` when a component of
+/// `path` is not a directory, or (adding) `path` is taken. Iterative.
+fn put_at(store: &ObjectStore, root: &ObjectId, path: &VPath, entry: Option<TreeEntry>) -> Result<Option<ObjectId>> {
+    let comps: Vec<&str> = path.components().collect();
+    let Some((last, dirs)) = comps.split_last() else { return Ok(None) };
+    let mut chain: Vec<Tree> = vec![(*store.tree(root)?).clone()];
+    for d in dirs {
+        let next = match chain.last().expect("non-empty").get(d) {
+            Some(e) if e.kind == EntryKind::Dir => (*store.tree(&e.id)?).clone(),
+            Some(_) => return Ok(None),
+            None if entry.is_some() => Tree::default(),
+            None => return Ok(Some(*root)),
+        };
+        chain.push(next);
+    }
+    let mut leaf = chain.pop().expect("non-empty");
+    match entry {
+        Some(_) if leaf.get(last).is_some() => return Ok(None),
+        Some(e) => leaf.insert(TreeEntry {
+            name: last.to_string(),
+            ..e
+        }),
+        None => {
+            leaf.remove(last);
+        }
+    }
+    let mut child: Option<ObjectId> = (!leaf.is_empty()).then(|| store.put_tree(&leaf)).transpose()?;
+    for (mut t, name) in chain.into_iter().rev().zip(dirs.iter().rev()) {
+        match child {
+            Some(id) => t.insert(TreeEntry::dir(name, id)),
+            None => {
+                t.remove(name);
+            }
+        }
+        child = (!t.is_empty()).then(|| store.put_tree(&t)).transpose()?;
+    }
+    Ok(Some(match child {
+        Some(id) => id,
+        None => store.empty_tree()?,
+    }))
 }
 
 #[cfg(test)]
