@@ -131,8 +131,11 @@ impl GitBridge {
                 report.skipped.push((name, "nothing to export".into()));
                 continue;
             };
-            self.set_ref(&format!("refs/heads/{name}"), commit)?;
-            report.branches.push((name, commit));
+            // e.g. tags `a` and `a/b`, which cannot both be Git branches.
+            match self.set_ref(&format!("refs/heads/{name}"), commit) {
+                Ok(()) => report.branches.push((name, commit)),
+                Err(e) => report.skipped.push((name, format!("cannot be a Git branch: {e}"))),
+            }
         }
         report.warnings.append(&mut self.warnings);
         report.warnings.sort();
@@ -301,7 +304,7 @@ impl GitBridge {
             (Some(x), Some(y)) => x.mode == y.mode && x.oid == y.oid,
             _ => false,
         };
-        let tree_or_none = |x: Option<&gix::objs::tree::Entry>| x.is_none_or(|e| e.mode.is_tree());
+        let tree_or_none = |x: Option<&gix::objs::tree::Entry>| x.map_or(true, |e| e.mode.is_tree());
         let mut out = Vec::new();
         for name in names {
             let (bx, ox, tx) = (be.get(name), oe.get(name), te.get(name));

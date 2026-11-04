@@ -134,13 +134,17 @@ fn git_sees_only_what_a_public_remote_sees() {
     let out = r.snapshot_workspace("priv", &ov).unwrap();
     let c2 = r.describe(out.snapshot, "CLOAKED-DESCRIPTION-0b1d").unwrap();
     r.set_tag("main", c2, None, false).unwrap();
+    // `a` and `a/b` cannot both be Git branches: one is skipped, not fatal.
+    r.set_tag("a", c1, None, false).unwrap();
+    r.set_tag("a/b", c1, None, false).unwrap();
     // A cloaked tag is never exported.
     r.set_tag("secret-tag", c1, Some("team".into()), false).unwrap();
 
     env.connect(&mut r);
     let rep = env.push(&mut r);
     assert!(rep.export.skipped.iter().any(|(t, _)| t == "secret-tag"), "{:?}", rep.export.skipped);
-    assert_eq!(rep.outcome.refs, vec![("main".to_string(), RefStatus::Created)]);
+    assert!(rep.export.skipped.iter().any(|(t, _)| t == "a/b"), "{:?}", rep.export.skipped);
+    assert!(rep.outcome.refs.contains(&("main".to_string(), RefStatus::Created)));
 
     for dir in [&env.bare, &env.bridge] {
         let objects = all_git_objects(dir);
@@ -157,7 +161,7 @@ fn git_sees_only_what_a_public_remote_sees() {
         assert!(contains(&objects, b"(description withheld: cloaked)"));
     }
     let refs = git(&env.bare, &["for-each-ref", "--format=%(refname)"]);
-    assert_eq!(refs, "refs/heads/main");
+    assert_eq!(refs, "refs/heads/a\nrefs/heads/main");
     let files = git(&env.bare, &["ls-tree", "-r", "--name-only", "main"]);
     assert_eq!(files.lines().collect::<Vec<_>>(), vec![".veilpolicy", "README.md"]);
 }

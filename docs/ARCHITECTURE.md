@@ -7,7 +7,7 @@ below it, and nothing above the VFS layer knows a disk exists.
 ┌──────────────────────────────────────────────────────────────────────┐
 │ vl CLI   (clap grammar, auto-snapshot, checkout pointer, rendering)  │
 ├──────────────────────────────────────────────────────────────────────┤
-│ Features  workspace · commands · embargo · remote · vault            │
+│ Features  workspace · commands · embargo · remote · git · vault      │
 ├──────────────────────────────────────────────────────────────────────┤
 │ Graph     repo · transaction (auto-rebase) · oplog (views) · revset  │
 ├──────────────────────────────────────────────────────────────────────┤
@@ -863,6 +863,152 @@ pruned. Reading every object costs about 2.3 µs each loose and 6.5 µs each
 packed, with a warm page cache. The packed cost is zstd decompression, the
 BLAKE3 verification that loose reads skip, and the loose-first probe.
 
+## 11. Git interop (`git/`)
+
+Teams keep GitHub or GitLab, their CI and their code review: Veil tags
+become Git branches and Git commits become snapshots. The module is behind
+the `git` cargo feature (on by default); it needs a disk-backed repository
+because Git does.
+
+```text
+.veil/git/repo.git      bare Git repository (gix), the bridge
+  refs/heads/<tag>          what Veil last exported for the tag
+  refs/remotes/<r>/<b>      branch <b> of Git remote <r>, as last fetched or pushed
+.veil/git/map           c <commit> <snapshot>                         every pair
+                        s <snapshot> <commit> <import|export|publish> <pending embargoes>
+.veil/git/cache         projection and conversion memo (safe to delete)
+.veil/git/remotes.json  Git remote name → URL
+```
+
+### Export: what Git may see
+
+Git sees exactly what a clone of a `--public` Veil remote sees, decided by
+how each object is *sealed*, never by which keys this replica holds:
+
+* **Which snapshots.** The public push's own functions select them
+  (`remote::embargo_withheld`, `remote::push_closure`). Cloaked tags are
+  never exported. The merged-in history of an unreleased embargoed merge is
+  withheld: the merge's extra parents are dropped from its Git commit. A tag
+  that would publish withheld history (a tag on the fix, a commit building
+  on it) is skipped with the same reason `vl push` gives.
+* **Which tree** (`git/project.rs`, the *public projection*). Plaintext
+  objects are visible. Objects sealed under a scope or `local` are not:
+  their entries are left out and a directory left empty disappears. An
+  embargo wrapper resolves to its sealed side once released, otherwise to
+  its fallback; an embargoed file shows its fallback. A `.git` entry, which
+  Git cannot hold, is left out with a warning. Isolated files were never in
+  the graph.
+* **Which message.** Plain descriptions as they are. A description sealed
+  for a scope becomes `(description withheld: cloaked)`, one sealed under
+  an unreleased embargo `(description withheld: under embargo)`. Only
+  released embargo keys are ever used to open anything.
+
+Tests check this by dumping every object of the produced Git repositories
+(`git cat-file --batch-all-objects --batch`) and grepping for the
+plaintext of cloaked files, isolated files, cloaked descriptions and
+embargoed fixes.
+
+**Commits are deterministic.** Tree, parents (the commits of the Git-visible
+parents, root dropped), author and committer both set to the snapshot's
+author (`Name <email>` is split; a bare name gets an empty email) at its
+timestamp in UTC, the message, and a `change-id` header holding the change
+id in reverse hex, as Jujutsu writes it. No signature, no other header. Two
+machines exporting the same snapshot produce the same commit.
+
+**Exported commits are pinned.** Once exported, a snapshot keeps its commit
+(the mapping), so Veil only ever appends to Git history. The one case where
+the public view of an existing snapshot changes is an embargo release. Each
+exported commit records the unreleased embargoes that shaped it; when one is
+released, export recomputes that snapshot and, if Git would now see
+something different, writes a **publication commit** on top of the pinned
+one: the released tree, parents `[pinned commit, newly visible parents…]`
+(that is, the fix's own history), the released description, no `change-id`
+header (it would make the change look divergent to Jujutsu). Descendants
+exported before the release (they were sealed by stickiness) get one too,
+linking to their parent's publication commit. `vl git push` is then a
+fast-forward. Commits that came from Git are never recomputed.
+
+**Carry-over in the other direction.** Paths Git has but Veil never
+recorded, because Veil isolated or quarantined them at import, or because
+Veil cannot represent them (symlinks, submodules), must not be deleted by
+the next Veil commit. The exported tree is a path-wise three-way merge of
+Git trees: `base` = the public projection of the first parent's snapshot,
+`ours` = the first parent's Git commit, `theirs` = the public projection of
+this snapshot. Paths Veil did not change keep Git's version; paths Veil
+changed (deleted included) take Veil's. For a parent Veil exported itself,
+`ours == base` and the result is the projection exactly.
+
+### Import: Git commits that never saw everything
+
+`git/import.rs` imports every commit reachable from the fetched branches
+that is not mapped yet, parents first (Kahn's algorithm, oldest first).
+Each commit becomes a snapshot:
+
+* **parents**: the parents' snapshots (the root for a root commit);
+* **author / timestamp**: `Name <email>` and the author time (UTC, ms);
+* **description**: the message, plaintext (it is public in Git already);
+* **change id**: the `change-id` header (Jujutsu or an earlier Veil export),
+  otherwise derived from the commit id, so re-importing gives the same
+  snapshot id (the importer's signature is deterministic too);
+* **tree**, as a three-way merge (`merge::merge_trees`):
+  * `ours` = the parents' Veil tree (`Repo::parents_tree`): everything,
+    cloaked and embargoed content included;
+  * `base` = its public projection: what Git saw;
+  * `theirs` = the Git commit built **through the policy gate**: a
+    read-only `StorageBackend` over the Git tree is snapshotted by the
+    builder on top of `base`, so isolation, secret scanning and cloaking
+    apply exactly as for a working copy. Reuse hints (unchanged
+    subdirectories and blobs, proven by content identity) keep this
+    O(changes).
+
+  Entries Git never saw are in `ours` only, so they are carried over
+  untouched, just as the builder carries entries a reader cannot see. Git's
+  edits apply. A file both sides changed is diff3-merged and keeps `ours`'
+  sealing, so nothing sealed is widened. Under an unreleased embargo the
+  result is re-wrapped (key holder) or the commit is **held back** with
+  its descendants (no key), as the builder does for edits on top of an
+  embargo.
+* A Git commit that edits `.veilpolicy` so that sealed files would change
+  audience (`secrets/ cloak team` → `public!`) is not taken: the Veil
+  policy is kept and the import warns, as `vl merge` does.
+* What Veil refused (isolated, quarantined, no key for the scope, not
+  representable) is reported per path. It stays in Git (see carry-over).
+
+### Remotes, divergence and transport
+
+`vl git fetch` runs `git fetch --prune <url> +refs/heads/*:refs/remotes/<r>/*`
+in the bridge, imports, and records `<r>/<branch>` remote tags. A branch
+whose new tip does not descend from the previous one was **force-pushed**
+on the Git side: it is reported, the snapshots it dropped stay in Veil, and
+local tags never move backwards. `vl git pull` also creates or
+fast-forwards local tags; a diverged tag is left alone with a hint (`vl
+merge <r>/<branch>`). `vl git push` exports, then pushes
+`<commit>:refs/heads/<tag>` for each tag. A branch that moved on the Git
+side is rejected (non-fast-forward). `--force` uses
+`--force-with-lease=<branch>:<last fetched>`, so it can only overwrite what
+this replica has seen.
+
+Network transport is the system **`git` binary** (`$VEIL_GIT` overrides the
+path), with gix for all object reading and writing:
+
+* gix (0.90) has fetch but no push;
+* `git2`/libgit2 would bring its own credential callbacks and SSH
+  implementation (libssh2), which ignore `~/.ssh/config`, `ProxyJump`,
+  FIDO keys and most credential helpers;
+* the `git` binary uses exactly what the user already configured:
+  credential helpers (osxkeychain, libsecret, `gh auth git-credential`),
+  SSH config and agent, `insteadOf`, proxies. Jujutsu moved to the same
+  approach. Veil passes `--git-dir` and explicit refspecs, removes
+  `GIT_DIR`-style variables, disables auto-gc in the bridge (exported
+  commits may be referenced only by the mapping), and refuses URLs that
+  `git` could read as options.
+
+Every mapped object is re-checked before use; one that has gone (Veil gc
+of an abandoned import, Git gc) is treated as unmapped and recomputed,
+which gives the same result. A crash between writing objects and the map
+therefore only costs recomputation. Export and import run under the
+repository lock.
+
 ## Threat model
 
 **Protected against:**
@@ -870,6 +1016,9 @@ BLAKE3 verification that loose reads skip, and the loose-first probe.
 * accidental commits of secrets (engine rules plus the scanner, with no ignore
   file to forget);
 * leaking cloaked content or names of cloaked tags to public remotes;
+* leaking cloaked, isolated or embargoed content, cloaked descriptions or
+  cloaked tags to a Git remote (Git sees what a public remote sees, §11),
+  and losing cloaked files when a commit made in Git is imported;
 * readers of a team remote who are not in a scope (they get ciphertext only);
 * pre-release disclosure of embargoed changes to non-members: their
   content, their messages, their history, and their file names, sizes and
@@ -941,6 +1090,11 @@ BLAKE3 verification that loose reads skip, and the loose-first probe.
   copy, and the next snapshot records them as deleted. The CLI must check
   the working copy out again when it learns of a release; that is not done
   yet.
+* *Git sees what a public remote sees*, including the metadata a public
+  remote keeps: names of public files, that a cloaked snapshot or an
+  embargoed merge exists (an empty-looking commit with a placeholder
+  message), its author and time. History imported from Git is public by
+  definition; cloaking a path later does not hide its Git history.
 * Content committed in plaintext **before** a path was cloaked stays readable
   in those older snapshots. `vl cloak` warns when this applies.
 
@@ -965,3 +1119,7 @@ BLAKE3 verification that loose reads skip, and the loose-first probe.
 * Front-ends: a FUSE mount of `TreeView` plus overlay for zero-copy
   checkouts, and a WASM build of `veil-core` with `MemoryBackend`.
 * Symlink support in `DiskBackend`.
+* Git interop: Git tags (annotated or not) are not imported or exported,
+  only branches; Git authors' time zones are not kept (export writes UTC);
+  carry-over of Git-only paths follows the first parent only; `vl git`
+  does not check out after a pull (use `vl new <tag>` or `vl edit`).

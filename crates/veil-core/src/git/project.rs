@@ -42,6 +42,8 @@ pub(crate) fn label_is_public(keys: &Keychain, label: &str) -> bool {
 }
 
 /// An object as a public reader gets it.
+// Transient values, like `Object` itself (see there).
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Public {
     /// Readable; `sealed` if it had to be opened (released embargo).
     Visible { obj: Object, sealed: bool },
