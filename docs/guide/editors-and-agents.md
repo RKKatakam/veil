@@ -29,7 +29,9 @@ serving. If a server was killed, the next one replaces the socket it left.
 
 `vl` commands keep working as usual while the server runs, in the same
 directory and at the same time. The server reads the repository afresh for
-every request, so it never answers from a stale view.
+every request, so it never answers from a stale view. If you move or rename
+the repository, the server stops (it never serves whatever is at the old
+path); start it again in the new place.
 
 ## Try it from the shell
 
@@ -172,7 +174,11 @@ parameters and results, and the error codes.
   method runs a program (`vl run` and `vl ws exec` are not served).
 * **Listen on the network.** It is a Unix socket; there is no TCP mode.
 
-Requests are limited to 1 MiB, and to 32 clients at once.
+Requests are limited to 1 MiB, and to 32 clients at once. A connection
+must send its first request within 30 seconds; after that it may stay open
+and quiet, but when all 32 slots are taken, the connection quiet longest
+(10 seconds or more, and not watching) is closed to let a new client in, so
+a client that keeps its connection should reconnect when it is closed.
 
 ---
 

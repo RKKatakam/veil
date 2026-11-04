@@ -200,6 +200,9 @@ pub struct Split {
 }
 
 pub fn split(ctx: &mut Ctx, rev: &str, choice: &Choice, message: Option<&str>, picker: Option<PickFn<'_>>) -> Result<Split> {
+    if let Some(m) = message {
+        super::check_message(m)?;
+    }
     let id = ctx.rev(rev)?;
     if picker.is_none() && choice.is_empty() {
         bail!("choose what goes in the first change: name files or directories, or use -i, --hunks or --plan");

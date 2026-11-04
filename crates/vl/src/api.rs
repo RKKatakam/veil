@@ -1906,7 +1906,18 @@ pub struct Described {
     pub(crate) id: ObjectId,
 }
 
+/// A description must be one the command line could give (BUG-486): no
+/// NUL, which no argument can carry and no Git commit may hold
+/// (`nulInCommit`).
+pub fn check_message(message: &str) -> Result<()> {
+    if message.contains('\0') {
+        anyhow::bail!("a description cannot contain a NUL character");
+    }
+    Ok(())
+}
+
 pub fn describe(ctx: &mut Ctx, rev: &str, message: &str) -> Result<Described> {
+    check_message(message)?;
     let id = ctx.rev(rev)?;
     let new = ctx.repo.describe(id, message)?;
     Ok(Described { schema: DESCRIBE_SCHEMA, described: snapshot_ref(&ctx.repo, &new), operation: op_ref(&ctx.repo), id: new })
@@ -1922,6 +1933,7 @@ pub struct NewChange {
 }
 
 pub fn new_change(ctx: &mut Ctx, revs: &[String], message: &str) -> Result<NewChange> {
+    check_message(message)?;
     let parents = if revs.is_empty() { vec![ctx.wc()?] } else { revs.iter().map(|r| ctx.rev(r)).collect::<Result<_>>()? };
     let ws = ctx.ws.clone();
     let id = ctx.repo.new_change(&ws, parents, message)?;
@@ -1955,6 +1967,7 @@ pub struct KeptTag {
 
 pub fn commit(ctx: &mut Ctx, message: &str, advance: bool) -> Result<Committed> {
     use veil_core::commands::TagKept;
+    check_message(message)?;
     let ws = ctx.ws.clone();
     let r = ctx.repo.commit(&ws, message, advance)?;
     let repo = &ctx.repo;

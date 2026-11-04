@@ -269,12 +269,12 @@ fn policy_pr_cannot_rekey_cloaked_files_to_an_attacker_scope() {
     mfs.write(&p(".veilpolicy"), b"prod/ cloak opz\n").unwrap();
     let wc = snap(&mut mallory, &mfs);
     let pr = mallory.describe(wc, "tidy policy").unwrap(); // `main` stays put
-    mallory.set_tag("pr", pr, None, false).unwrap();
+    mallory.set_tag("pr-1", pr, None, false).unwrap();
     remote::push(&mut mallory, team.clone(), false, &[], false).unwrap();
 
     // Alice merges the PR and pushes.
     remote::pull(&mut alice, "origin", team.clone()).unwrap();
-    let pr = alice.view().tags["pr"].target;
+    let pr = alice.view().tags["pr-1"].target;
     alice.merge(WS, main, vec![pr], "merge PR", None).unwrap();
     remote::push(&mut alice, team.clone(), false, &["main".to_string()], false).unwrap();
 

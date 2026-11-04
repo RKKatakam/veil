@@ -16,6 +16,20 @@
 //! **Freshness and locking.** Every request opens the repository afresh
 //! (`Ctx::open`), exactly as a `vl` process would, so nothing is cached
 //! between requests and nothing a CLI command did in between is missed.
+//!
+//! **Bound to one repository, not to a path** (BUG-485). The server
+//! records, at start, the `(dev, ino)` of the repository's root and of its
+//! `.veil` directory, and the repository id of `repo.json`. Every request
+//! checks the first two before it opens the repository by path, and all
+//! three once it is open (before any snapshot); the accept loop checks them,
+//! and that the socket at `<root>/.veil/local/sock` is still the one it
+//! bound, every second. When the path no longer names the repository the
+//! server started in (`mv proj proj-old`, another repository put at
+//! `proj`, `.veil` replaced, the socket or `.veil/local` moved), the request
+//! is refused and the server stops. A directory handle would not do: the
+//! engine works on paths, and a moved server would still serve a socket
+//! nobody finds. What remains is the race every `vl` process has: a move
+//! *during* a request.
 //! The repository lock is only ever held inside a request's transactions.
 //! Requests that touch the working copy (a snapshot, a write) are also
 //! serialised inside this server; pure reads (`"snapshot": false`) run in
@@ -26,7 +40,8 @@
 //! symlink), and every connection's peer credentials (`SO_PEERCRED`,
 //! `getpeereid`) must name the same user. The client checks the server's
 //! credentials the same way. A request is at most [`MAX_REQUEST`] bytes,
-//! and at most [`MAX_CONNECTIONS`] clients are served at once. No parameter
+//! and at most [`MAX_CONNECTIONS`] clients are served at once. No string
+//! parameter may hold a NUL, as no command-line argument can (BUG-486). No parameter
 //! names a path outside the repository: methods take revisions, messages
 //! and limits, and `scan`'s `policy_from` must lie inside the repository.
 //!
@@ -37,6 +52,7 @@
 //! (only if it is still its own), and waits for requests in flight.
 
 use std::{
+    collections::HashMap,
     ffi::CString,
     fs::File,
     io::{self, BufRead, BufReader, Write},
@@ -49,7 +65,7 @@ use std::{
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{
-        atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard,
     },
     time::{Duration, Instant},
@@ -81,6 +97,16 @@ pub const MAX_BATCH: usize = 64;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a stopping server waits for requests in flight.
 const DRAIN: Duration = Duration::from_secs(30);
+/// How long a new connection may wait before its first complete request
+/// (`VEIL_SERVE_IDLE_MS`).
+const FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a request may take to arrive once its first byte has
+/// (`VEIL_SERVE_REQUEST_MS`).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// When every slot is taken, a connection silent for this long (between
+/// requests, not subscribed to `watch`) gives its slot to a new client
+/// (`VEIL_SERVE_EVICT_MS`).
+const EVICT_AFTER: Duration = Duration::from_secs(10);
 
 pub const SERVER_INFO_SCHEMA: &str = "veil.server.info/1";
 pub const WATCH_SCHEMA: &str = "veil.watch/1";
@@ -299,16 +325,106 @@ pub fn socket_path(root: &Path) -> PathBuf {
     root.join(VEIL_DIR).join("local").join(SOCKET)
 }
 
+/// `(dev, ino)` of `p` itself (never through a symlink).
+fn dev_ino(p: &Path) -> io::Result<(u64, u64)> {
+    let m = std::fs::symlink_metadata(p)?;
+    Ok((m.dev(), m.ino()))
+}
+
+/// The repository a server serves, by identity (BUG-485): what its path
+/// must still name for a request to be carried out.
+struct Identity {
+    /// `(dev, ino)` of the root directory.
+    root: (u64, u64),
+    /// `(dev, ino)` of `.veil`.
+    veil: (u64, u64),
+    /// `repo_id` of `.veil/repo.json`.
+    repo_id: String,
+}
+
+impl Identity {
+    fn of(root: &Path) -> Result<Identity> {
+        let config = veil_core::repo::read_config(&DiskBackend::new(root))?;
+        Ok(Identity {
+            root: dev_ino(root).with_context(|| format!("reading {}", root.display()))?,
+            veil: dev_ino(&root.join(VEIL_DIR)).with_context(|| format!("reading {}", root.join(VEIL_DIR).display()))?,
+            repo_id: config.repo_id,
+        })
+    }
+}
+
+/// The connection timeouts (each overridable, in milliseconds, through the
+/// environment, for tests).
+#[derive(Clone, Copy, Debug)]
+struct Limits {
+    first_request: Duration,
+    request: Duration,
+    evict_after: Duration,
+}
+
+impl Limits {
+    fn from_env() -> Limits {
+        let ms = |name: &str, default: Duration| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|&ms| ms > 0)
+                .map_or(default, Duration::from_millis)
+        };
+        Limits {
+            first_request: ms("VEIL_SERVE_IDLE_MS", FIRST_REQUEST_TIMEOUT),
+            request: ms("VEIL_SERVE_REQUEST_MS", REQUEST_TIMEOUT),
+            evict_after: ms("VEIL_SERVE_EVICT_MS", EVICT_AFTER),
+        }
+    }
+}
+
+/// A slot's state: waiting for (or reading) a request.
+const IDLE: u8 = 0;
+/// Carrying out a request.
+const BUSY: u8 = 1;
+/// Given away to another client: the connection is being closed.
+const EVICTED: u8 = 2;
+
+/// One connected client, as the accept loop sees it.
+struct Slot {
+    /// A handle on the connection, to close it when the slot is given away.
+    stream: UnixStream,
+    state: AtomicU8,
+    /// Subscribed to `watch`: waiting for the server, never evicted.
+    watching: AtomicBool,
+    /// When it last sent something or was last answered.
+    last: Mutex<Instant>,
+}
+
+impl Slot {
+    fn touch(&self) {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    }
+
+    fn silent_for(&self) -> Duration {
+        self.last.lock().unwrap_or_else(|e| e.into_inner()).elapsed()
+    }
+}
+
 struct Server {
     root: PathBuf,
+    /// What `root` must still name (BUG-485).
+    identity: Identity,
     /// Requests snapshot the working copy first unless they say otherwise
     /// (`vl --no-snapshot serve --local` flips the default).
     snapshot_default: bool,
     /// Serialises the requests that touch the working copy.
     writes: Mutex<()>,
-    connections: AtomicUsize,
+    /// The connected clients, by connection number.
+    slots: Mutex<HashMap<u64, Arc<Slot>>>,
+    /// Threads telling a client the server is full.
+    hanging_up: AtomicUsize,
+    limits: Limits,
     in_flight: AtomicUsize,
     stopping: AtomicBool,
+    /// Why the server stopped itself (its repository moved).
+    gone: Mutex<Option<String>>,
 }
 
 /// Decrements a counter when dropped.
@@ -327,10 +443,77 @@ impl Drop for Count<'_> {
     }
 }
 
+impl Server {
+    /// Does `root` still name the repository this server started in? On
+    /// the first no, the server stops: no client can be served correctly
+    /// any more (and its socket is not where the repository's is).
+    fn check_identity(&self) -> Result<()> {
+        let here = dev_ino(&self.root).ok() == Some(self.identity.root)
+            && dev_ino(&self.root.join(VEIL_DIR)).ok() == Some(self.identity.veil);
+        if here {
+            return Ok(());
+        }
+        Err(self.moved(format!("{} is no longer the repository this server started in (it was moved or replaced)", self.root.display())))
+    }
+
+    /// Stop the server because its repository is gone from its path.
+    fn moved(&self, why: String) -> anyhow::Error {
+        let mut gone = self.gone.lock().unwrap_or_else(|e| e.into_inner());
+        if gone.is_none() {
+            *gone = Some(why.clone());
+        }
+        self.stopping.store(true, Ordering::SeqCst);
+        anyhow!("{why}: the server has stopped; start `vl serve --local` again in the repository")
+    }
+
+    /// The accept loop's once-a-second look: the repository, and the socket
+    /// clients find at its path, are still this server's.
+    fn still_reachable(&self, ours: Option<(u64, u64)>) -> Option<String> {
+        if let Err(e) = self.check_identity() {
+            return Some(format!("{e:#}"));
+        }
+        if dev_ino(&socket_path(&self.root)).ok() != ours {
+            return Some("the socket was moved, removed or replaced".into());
+        }
+        None
+    }
+
+    /// Take a slot for a new connection. When all are taken, the one
+    /// silent longest (at least `evict_after`, not in a request, not
+    /// watching) is closed to make room; with none, `false`.
+    fn admit(&self, id: u64, slot: Arc<Slot>) -> bool {
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        if slots.len() >= MAX_CONNECTIONS {
+            let victim = slots
+                .iter()
+                .filter(|(_, s)| s.state.load(Ordering::SeqCst) == IDLE && !s.watching.load(Ordering::SeqCst))
+                .map(|(k, s)| (*k, s.silent_for()))
+                .filter(|(_, d)| *d >= self.limits.evict_after)
+                .max_by_key(|(_, d)| *d)
+                .map(|(k, _)| k);
+            let Some(k) = victim else { return false };
+            let s = &slots[&k];
+            // A request that arrived just now keeps its slot.
+            if s.state.compare_exchange(IDLE, EVICTED, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+                return false;
+            }
+            let _ = s.stream.shutdown(std::net::Shutdown::Both);
+            slots.remove(&k);
+        }
+        slots.insert(id, slot);
+        true
+    }
+
+    fn release(&self, id: u64) {
+        self.slots.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    }
+}
+
 /// `vl serve --local`.
 pub fn run(repo_arg: Option<&Path>, snapshot_default: bool) -> Result<ExitCode> {
     let root = repo_root(repo_arg)?;
     let sock = socket_path(&root);
+    let identity = Identity::of(&root)?;
     let dir = local_dir(&root, true)?;
     // A first use creates the identity now, not in two racing requests.
     crate::ctx::load_identity()?;
@@ -397,11 +580,15 @@ pub fn run(repo_arg: Option<&Path>, snapshot_default: bool) -> Result<ExitCode> 
 
     let server = Arc::new(Server {
         root: root.clone(),
+        identity,
         snapshot_default,
         writes: Mutex::new(()),
-        connections: AtomicUsize::new(0),
+        slots: Mutex::new(HashMap::new()),
+        hanging_up: AtomicUsize::new(0),
+        limits: Limits::from_env(),
         in_flight: AtomicUsize::new(0),
         stopping: AtomicBool::new(false),
+        gone: Mutex::new(None),
     });
     eprintln!(
         "{} {} on {} (JSON-RPC 2.0, one request per line; Ctrl-C to stop)",
@@ -427,11 +614,12 @@ pub fn run(repo_arg: Option<&Path>, snapshot_default: bool) -> Result<ExitCode> 
     Ok(ExitCode::SUCCESS)
 }
 
-/// Accept clients until a signal arrives or the socket is taken away.
-/// Returns why it stopped.
+/// Accept clients until a signal arrives, the socket is taken away or the
+/// repository is no longer at its path. Returns why it stopped.
 fn accept_loop(server: &Arc<Server>, listener: &UnixListener, signals: &UnixStream, dir: &File, ours: Option<(u64, u64)>) -> String {
     let owner = euid();
     let mut last_check = Instant::now();
+    let mut next_id = 0u64;
     loop {
         let mut fds = [
             libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 },
@@ -444,12 +632,22 @@ fn accept_loop(server: &Arc<Server>, listener: &UnixListener, signals: &UnixStre
         if fds[1].revents != 0 {
             return "signal".into();
         }
+        // A request found the repository gone (BUG-485).
+        if let Some(why) = server.gone.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            return why;
+        }
         if last_check.elapsed() >= Duration::from_secs(1) {
             last_check = Instant::now();
             // Removed or replaced (the repository deleted, `rm sock`): no
             // client can reach this server any more.
             if stat_at(dir, SOCKET).ok().flatten().map(|(d, i, _)| (d, i)) != ours {
                 return "the socket was removed or replaced".into();
+            }
+            // Moved with the repository, or the repository's path names
+            // another one now: clients there would reach the wrong server,
+            // and this one would act on the wrong repository.
+            if let Some(why) = server.still_reachable(ours) {
+                return why;
             }
         }
         loop {
@@ -473,28 +671,55 @@ fn accept_loop(server: &Arc<Server>, listener: &UnixListener, signals: &UnixStre
             if !peer_is(&stream, owner) {
                 continue;
             }
-            if server.connections.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
-                let mut s = stream;
-                let _ = s.set_write_timeout(Some(Duration::from_secs(1)));
-                let line = error_line("null", SERVER_BUSY, &format!("too many clients (at most {MAX_CONNECTIONS})"), None);
-                let _ = s.write_all(format!("{line}\n").as_bytes());
-                // Off the accept loop: hanging up takes a moment.
-                let _ = std::thread::Builder::new().spawn(move || hang_up(s));
+            let Ok(handle) = stream.try_clone() else { continue };
+            next_id += 1;
+            let id = next_id;
+            let slot = Arc::new(Slot {
+                stream: handle,
+                state: AtomicU8::new(IDLE),
+                watching: AtomicBool::new(false),
+                last: Mutex::new(Instant::now()),
+            });
+            if !server.admit(id, slot.clone()) {
+                refuse_busy(server, stream);
                 continue;
             }
-            let server = server.clone();
-            server.connections.fetch_add(1, Ordering::SeqCst);
             let spawned = std::thread::Builder::new().name("vl-serve-client".into()).spawn({
                 let server = server.clone();
                 move || {
-                    let _count = Count(&server.connections);
-                    serve_client(&server, stream);
+                    serve_client(&server, stream, &slot);
+                    server.release(id);
                 }
             });
             if spawned.is_err() {
-                server.connections.fetch_sub(1, Ordering::SeqCst);
+                server.release(id);
             }
         }
+    }
+}
+
+/// Tell a client the server is full and hang up, off the accept loop (a
+/// client that reads nothing must not hold it up). Past [`MAX_CONNECTIONS`]
+/// such goodbyes at once, a client is just disconnected.
+fn refuse_busy(server: &Arc<Server>, stream: UnixStream) {
+    if server.hanging_up.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
+        return;
+    }
+    server.hanging_up.fetch_add(1, Ordering::SeqCst);
+    let spawned = std::thread::Builder::new().spawn({
+        let server = server.clone();
+        move || {
+            let _count = Count(&server.hanging_up);
+            let mut s = stream;
+            let _ = s.set_write_timeout(Some(Duration::from_secs(1)));
+            let line = error_line("null", SERVER_BUSY, &format!("too many clients (at most {MAX_CONNECTIONS})"), None);
+            if s.write_all(format!("{line}\n").as_bytes()).is_ok() {
+                hang_up(s);
+            }
+        }
+    });
+    if spawned.is_err() {
+        server.hanging_up.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -505,16 +730,26 @@ enum Line {
     Request(Vec<u8>),
     TooLong,
     Closed,
+    /// Nothing more arrived in time; `partial`: in the middle of a line.
+    TimedOut { partial: bool },
 }
 
 /// Read up to the next `\n`, refusing (without buffering it) a line over
-/// `max` bytes.
-fn read_line(r: &mut impl BufRead, max: usize) -> io::Result<Line> {
+/// `max` bytes. `wait(r, partial)` runs before each read (to set its
+/// timeout; an error is a timeout), `partial` saying whether part of the
+/// line has arrived.
+fn read_line<R: BufRead>(r: &mut R, max: usize, mut wait: impl FnMut(&mut R, bool) -> io::Result<()>) -> io::Result<Line> {
     let mut line = Vec::new();
     loop {
+        if wait(r, !line.is_empty()).is_err() {
+            return Ok(Line::TimedOut { partial: !line.is_empty() });
+        }
         let buf = match r.fill_buf() {
             Ok(b) => b,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                return Ok(Line::TimedOut { partial: !line.is_empty() })
+            }
             Err(e) => return Err(e),
         };
         if buf.is_empty() {
@@ -565,12 +800,43 @@ struct Client {
     watch: Option<Watch>,
 }
 
-fn serve_client(server: &Arc<Server>, stream: UnixStream) {
+/// The deadline of the next read: the first request must arrive within
+/// `first_request` of the connection, and each request within `request`
+/// of its first byte. Between requests a connection may stay silent (an
+/// editor keeps one open); when the server is full, the one silent longest
+/// gives its slot away ([`Server::admit`]).
+fn read_deadline(limits: &Limits, connected: Instant, served_one: bool, line_started: Option<Instant>) -> Option<Instant> {
+    let first = (!served_one).then(|| connected + limits.first_request);
+    let partial = line_started.map(|t| t + limits.request);
+    match (first, partial) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+fn serve_client(server: &Arc<Server>, stream: UnixStream, slot: &Slot) {
     let Ok(w) = stream.try_clone() else { return };
     let mut client = Client { server: server.clone(), writer: Arc::new(Mutex::new(w)), watch: None };
     let mut reader = BufReader::new(stream);
+    let connected = Instant::now();
+    let mut served_one = false;
     loop {
-        let line = match read_line(&mut reader, MAX_REQUEST) {
+        let mut line_started: Option<Instant> = None;
+        let read = read_line(&mut reader, MAX_REQUEST, |r: &mut BufReader<UnixStream>, partial| {
+            slot.touch();
+            if partial && line_started.is_none() {
+                line_started = Some(Instant::now());
+            }
+            let timeout = match read_deadline(&server.limits, connected, served_one, line_started) {
+                None => None,
+                Some(d) => match d.checked_duration_since(Instant::now()) {
+                    Some(left) if !left.is_zero() => Some(left),
+                    _ => return Err(io::ErrorKind::TimedOut.into()),
+                },
+            };
+            r.get_ref().set_read_timeout(timeout)
+        });
+        let line = match read {
             Ok(Line::Request(l)) => l,
             Ok(Line::TooLong) => {
                 // Where the next request starts is unknown: hang up.
@@ -579,7 +845,14 @@ fn serve_client(server: &Arc<Server>, stream: UnixStream) {
                 hang_up(reader.into_inner());
                 return end(client);
             }
-            Ok(Line::Closed) | Err(_) => break,
+            Ok(Line::TimedOut { partial: true }) => {
+                let msg = format!("request incomplete after {} ms: closing the connection", server.limits.request.as_millis());
+                let _ = send(&client.writer, &error_line("null", INVALID_REQUEST, &msg, None));
+                hang_up(reader.into_inner());
+                return end(client);
+            }
+            // Connected, and never asked anything.
+            Ok(Line::TimedOut { partial: false }) | Ok(Line::Closed) | Err(_) => break,
         };
         if server.stopping.load(Ordering::SeqCst) {
             break;
@@ -587,14 +860,21 @@ fn serve_client(server: &Arc<Server>, stream: UnixStream) {
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
+        // The slot was given to another client while this line arrived.
+        if slot.state.compare_exchange(IDLE, BUSY, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            break;
+        }
+        served_one = true;
         let response = {
             let _busy = Count::up(&server.in_flight);
             server.handle_line(&line, &mut client)
         };
-        if let Some(r) = response {
-            if send(&client.writer, &r).is_err() {
-                break;
-            }
+        slot.watching.store(client.watch.is_some(), Ordering::SeqCst);
+        let sent = response.is_none_or(|r| send(&client.writer, &r).is_ok());
+        slot.touch();
+        slot.state.store(IDLE, Ordering::SeqCst);
+        if !sent {
+            break;
         }
     }
     end(client);
@@ -724,10 +1004,36 @@ impl Server {
             Some(p @ Value::Object(_)) => p,
             Some(_) => return reply(Err(RpcError::new(INVALID_PARAMS, "params must be an object (named parameters)")))
         };
+        if let Err(e) = check_strings(&params, "") {
+            return reply(Err(e));
+        }
         // A bug here must not take the server down with it.
         let r = std::panic::catch_unwind(AssertUnwindSafe(|| self.call(&method, params, client)))
             .unwrap_or_else(|_| Err(RpcError::new(INTERNAL_ERROR, "internal error (see the server's standard error)")));
         reply(r)
+    }
+}
+
+/// Every string in the params (and every member name) must be one a
+/// command-line argument could hold (BUG-486): a request does nothing the
+/// CLI could not. JSON already guarantees UTF-8; what remains is NUL, which
+/// no argument can carry and no Git commit may hold (`nulInCommit`).
+fn check_strings(v: &Value, at: &str) -> Result<(), RpcError> {
+    let bad = |what: &str| {
+        let what = if what.is_empty() { "params".to_string() } else { format!("`{what}`") };
+        Err(RpcError::new(INVALID_PARAMS, format!("invalid params: {what} contains a NUL character, which no command-line argument can hold")))
+    };
+    match v {
+        Value::String(s) if s.contains('\0') => bad(at),
+        Value::Array(a) => a.iter().enumerate().try_for_each(|(i, v)| check_strings(v, &format!("{at}[{i}]"))),
+        Value::Object(o) => o.iter().try_for_each(|(k, v)| {
+            let at = if at.is_empty() { k.clone() } else { format!("{at}.{k}") };
+            if k.contains('\0') {
+                return bad(&at);
+            }
+            check_strings(v, &at)
+        }),
+        _ => Ok(()),
     }
 }
 
@@ -998,10 +1304,22 @@ impl Server {
     }
 
     /// Open the repository as a `vl` process would, refusing what a bare
-    /// repository cannot do.
+    /// repository cannot do, and anything once the path names another
+    /// repository than the one this server started in (BUG-485): checked
+    /// before it is opened, and again once it is, before the snapshot.
     fn open(&self, snapshot: bool, runs_bare: bool) -> Result<Ctx> {
-        let ctx = Ctx::open(Some(&self.root), snapshot)?;
+        self.check_identity()?;
+        let mut ctx = Ctx::open(Some(&self.root), false)?;
+        if ctx.root != self.root || ctx.repo.repo_id() != self.identity.repo_id {
+            return Err(self.moved(format!("{} now holds another repository than this server started in", self.root.display())));
+        }
+        self.check_identity()?;
         crate::refuse_bare(&ctx, runs_bare)?;
+        // As `Ctx::open(…, true)` does: a bare repository has nothing to
+        // snapshot.
+        if snapshot && !ctx.bare {
+            ctx.snapshot()?;
+        }
         Ok(ctx)
     }
 
@@ -1022,6 +1340,7 @@ impl Server {
     /// `scan` with `policy_from`: the CI gate, with a policy file that must
     /// lie inside the repository (and outside `.veil`).
     fn scan_gate(&self, file: &str) -> Result<String, RpcError> {
+        self.check_identity()?;
         let given = Path::new(file);
         let full = if given.is_absolute() { given.to_path_buf() } else { self.root.join(given) };
         let real = full.canonicalize().with_context(|| format!("reading the trusted policy {}", safe(file)))?;
@@ -1080,6 +1399,7 @@ impl Server {
             // not on every tick.
             drop(self.open(false, false)?);
         }
+        self.check_identity()?;
         let ops = OpStore::new(Arc::new(DiskBackend::new(&self.root)));
         let head = ops.head().map_err(|e| RpcError::failed(e.into()))?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -1150,6 +1470,11 @@ fn watch_loop(
                 Err(_) => ctx = None,
                 Ok(()) => last_error.clear(),
             }
+        }
+        // The operation log read by path is another repository's once this
+        // one moved (BUG-485): stop rather than report its operations.
+        if server.check_identity().is_err() {
+            return;
         }
         let Ok(now) = ops.head() else { continue };
         if now == head {
@@ -1301,15 +1626,60 @@ mod tests {
 
     #[test]
     fn lines_are_capped_without_being_buffered() {
+        fn no_wait<R>(_: &mut R, _: bool) -> io::Result<()> {
+            Ok(())
+        }
         let mut r = io::Cursor::new(b"{\"a\":1}\n\nxyz".to_vec());
-        assert!(matches!(read_line(&mut r, 100).unwrap(), Line::Request(l) if l == b"{\"a\":1}"));
-        assert!(matches!(read_line(&mut r, 100).unwrap(), Line::Request(l) if l.is_empty()));
-        assert!(matches!(read_line(&mut r, 100).unwrap(), Line::Request(l) if l == b"xyz"));
-        assert!(matches!(read_line(&mut r, 100).unwrap(), Line::Closed));
+        assert!(matches!(read_line(&mut r, 100, no_wait).unwrap(), Line::Request(l) if l == b"{\"a\":1}"));
+        assert!(matches!(read_line(&mut r, 100, no_wait).unwrap(), Line::Request(l) if l.is_empty()));
+        assert!(matches!(read_line(&mut r, 100, no_wait).unwrap(), Line::Request(l) if l == b"xyz"));
+        assert!(matches!(read_line(&mut r, 100, no_wait).unwrap(), Line::Closed));
         let mut big = io::BufReader::with_capacity(16, io::Cursor::new(vec![b'x'; 1000]));
-        assert!(matches!(read_line(&mut big, 100).unwrap(), Line::TooLong));
+        assert!(matches!(read_line(&mut big, 100, no_wait).unwrap(), Line::TooLong));
         let mut exact = io::Cursor::new([vec![b'x'; 100], b"\n".to_vec()].concat());
-        assert!(matches!(read_line(&mut exact, 100).unwrap(), Line::Request(l) if l.len() == 100));
+        assert!(matches!(read_line(&mut exact, 100, no_wait).unwrap(), Line::Request(l) if l.len() == 100));
+    }
+
+    #[test]
+    fn a_timeout_says_whether_a_line_had_started() {
+        let mut r = io::Cursor::new(b"{\"a\"".to_vec());
+        let mut calls = 0;
+        let line = read_line(&mut r, 100, |_, partial| {
+            calls += 1;
+            if partial { Err(io::ErrorKind::TimedOut.into()) } else { Ok(()) }
+        });
+        assert!(matches!(line.unwrap(), Line::TimedOut { partial: true }));
+        assert_eq!(calls, 2);
+        let mut r = io::Cursor::new(b"x\n".to_vec());
+        assert!(matches!(read_line(&mut r, 100, |_, _| Err(io::ErrorKind::TimedOut.into())).unwrap(), Line::TimedOut { partial: false }));
+    }
+
+    #[test]
+    fn deadlines_bound_the_first_request_and_each_line() {
+        let limits = Limits { first_request: Duration::from_secs(30), request: Duration::from_secs(5), evict_after: Duration::from_secs(1) };
+        let t = Instant::now();
+        assert_eq!(read_deadline(&limits, t, false, None), Some(t + Duration::from_secs(30)));
+        assert_eq!(read_deadline(&limits, t, false, Some(t)), Some(t + Duration::from_secs(5)));
+        assert_eq!(read_deadline(&limits, t, true, Some(t)), Some(t + Duration::from_secs(5)));
+        // Between requests, a connection may stay quiet.
+        assert_eq!(read_deadline(&limits, t, true, None), None);
+    }
+
+    #[test]
+    fn strings_with_a_nul_are_refused_wherever_they_are() {
+        assert!(check_strings(&serde_json::json!({"message": "fine\u{1}", "revs": ["@", "main"]}), "").is_ok());
+        for bad in [
+            serde_json::json!({"message": "a\u{0}b"}),
+            serde_json::json!({"revs": ["@", "x\u{0}"]}),
+            serde_json::json!({"files": [{"path": "a\u{0}"}]}),
+            serde_json::json!({"files": [{"path": "a", "hunks": ["1\u{0}"]}]}),
+            serde_json::json!({"k\u{0}": 1}),
+        ] {
+            let e = check_strings(&bad, "").unwrap_err();
+            assert_eq!(e.code, INVALID_PARAMS, "{bad}");
+        }
+        let e = check_strings(&serde_json::json!({"files": [{"path": "a\u{0}"}]}), "").unwrap_err();
+        assert!(e.message.contains("`files[0].path`"), "{}", e.message);
     }
 
     #[test]
