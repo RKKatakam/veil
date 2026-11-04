@@ -1021,9 +1021,25 @@ and, once renewed, when it was acquired on the backend's own stamp clock.
   renewed before this machine booted. A dead pid is taken over **at once**,
   without waiting for the lease: the pid may be reused, but never by the
   process that wrote that token. That makes recovery from `kill -9` or
-  Ctrl-C instant. A holder on another host, or a live process that stopped
-  renewing (suspended, stuck), is never robbed. The contender times out
-  with an error naming the holder. Legacy `"<pid> <millis>"` lock files
+  Ctrl-C instant. A zombie (killed or exited, not yet reaped by its parent,
+  such as an IDE or agent harness that killed a hung `vl`) is dead too: on
+  Linux every thread in `/proc/<pid>/task` shows state `Z` or `X` (the main
+  thread alone shows `Z` after a `pthread_exit` while others still run), on
+  macOS `proc_pidinfo` reports `SZOMB`. A holder on another host, or a live
+  process that stopped renewing (suspended, stuck), is never robbed. The
+  contender times out with an error naming the holder.
+* "No longer runs" needs proof: a zombie, or `kill(pid, 0)` failing with
+  `ESRCH`. A missing `/proc/<pid>` alone is not, because `/proc` may hide
+  other users' processes (`hidepid=2`, systemd's `ProtectProc=invisible`):
+  `kill` then answers `EPERM` for another user's live holder, which is
+  waited for. `/proc` is only consulted when it describes this process's
+  own pid namespace (`/proc/self` names our pid); a `/proc` mounted for
+  another one (`unshare -p` without `--mount-proc`) would describe other
+  processes under the same pids, so `kill` alone decides and start times
+  are not used. `hidepid=1` (entries visible, contents not) counts as
+  running. These setups need root to build, so the tests inject what such
+  a `/proc` shows through `LockContext::probe` (`ProcessProbe`), and the
+  production decision (`process_alive_with`) runs on it. Legacy `"<pid> <millis>"` lock files
   (from local-only earlier versions) are judged as locks of this machine.
 * A reused pid does not keep a dead holder's lock. The lock records the
   holder's start time (`pid_start`: `starttime` from `/proc/<pid>/stat` on
@@ -1054,8 +1070,13 @@ and, once renewed, when it was acquired on the backend's own stamp clock.
   (one level further down if its holder crashed too). Those bytes are
   never written again (they hold a random token), so each dead guard has
   one winner, and every guard file is removed only by its holder. A
-  sub-guard is left behind only if a contender crashes while holding one.
-  It is harmless and may be deleted while no command runs.
+  sub-guard is left behind only if a contender crashes while holding one;
+  if the guard it was named after is gone by then, nobody contends for it
+  again. It is harmless. `vl fsck` reports every leftover guard and
+  sub-guard, and the next takeover (after its recovery) and `vl doctor`
+  clear the provably stale ones (`lock::clear_stale_guards`), each by
+  *claiming* it under the protocol above and then releasing it, so a live
+  contender's guard is never touched.
 * **Network remotes: fencing leases.** On an `is_network()` backend
   (SFTP), other hosts can never prove a holder gone, so a client that
   crashed mid-push would lock the remote forever. Its lock is a *fencing*
@@ -1176,6 +1197,21 @@ repository.
   usable stamps (SFTP), fall back to the holder's wall-clock `acquired`
   time minus an hour, or to every loose object. If recovery fails, the
   lock is left flagged for the next contender rather than released.
+* A recovery that fails or dies must not narrow the next one (BUG-096).
+  The new holder's own `since_stamp` only covers its own writes, not the
+  dead holder's objects it had not reached yet. So the window it is
+  recovering is written into its lock file with the takeover itself
+  (`"recover_window"`: `{"stamp": …}`, `{"wall": …}` or `"all"`), and
+  renewed with it, until the recovery has succeeded; only then is it
+  dropped. The next contender recovers the union of that window and the
+  holder's own (the earlier stamp; mixing a stamp with a wall-clock time
+  means every loose object). The lock is marked to be left behind from
+  the takeover until recovery succeeds, so an error or a panic in between
+  leaves it flagged. `adversarial5_durability` sweeps a failed barrier
+  with unremovable objects, then a takeover whose every mutation in turn
+  fails once or crashes the process (with and without a power loss
+  before the next process, and twice in a row), then a retry, an
+  acknowledged commit and a power loss.
   Until then `fsck` reports torn unreachable objects under a leftover lock
   as a note.
 * Undo is unaffected.

@@ -375,10 +375,44 @@ fn check_lock(r: &mut Report, fs: &dyn StorageBackend) {
         },
         Err(e) => r.fail(format!(".veil/lock cannot be read: {e}"), &[]),
     }
-    if fs.exists(&VPath::new(STEAL_PATH).expect("valid path")).unwrap_or(false) {
+    check_takeover_guards(r, fs);
+}
+
+/// Takeover guards (`.veil/lock.steal`, sub-guards `.veil/lock.steal.<hash>`)
+/// are held for milliseconds; one that stays was left by a `vl` that
+/// crashed mid-takeover. Provably stale ones are removed (by the takeover
+/// protocol, so a live contender's guard is never touched).
+fn check_takeover_guards(r: &mut Report, fs: &dyn StorageBackend) {
+    let guards = match veil_core::lock::takeover_guards(fs) {
+        Ok(g) => g,
+        Err(e) => return r.warn(format!("takeover guards cannot be listed: {e}"), &[]),
+    };
+    if guards.is_empty() {
+        return;
+    }
+    let stale = guards.iter().filter(|g| g.stale.is_some()).count();
+    let cleared = if stale > 0 {
+        veil_core::lock::clear_stale_guards(fs, &LockContext::for_backend(fs)).unwrap_or(0)
+    } else {
+        0
+    };
+    let left = veil_core::lock::takeover_guards(fs).unwrap_or_default();
+    if cleared > 0 {
+        r.note(
+            format!("removed {cleared} stale lock takeover guard(s) left by an interrupted vl"),
+            &guards
+                .iter()
+                .filter(|g| g.stale.is_some() && !left.iter().any(|l| l.path == g.path))
+                .map(|g| format!("{} ({})", g.path, g.stale.as_deref().unwrap_or_default()))
+                .collect::<Vec<_>>(),
+        );
+    }
+    for g in &left {
+        let holder = g.holder.as_ref().map_or_else(|| "unreadable content".into(), |h| h.describe());
+        let name = if g.path.as_str() == STEAL_PATH { "" } else { " sub-guard" };
         r.warn(
-            format!("{STEAL_PATH} exists"),
-            &["left by a takeover that was interrupted; if no vl process is running, remove it".into()],
+            format!("lock takeover{name} {} is left ({holder})", g.path),
+            &["left by a takeover that was interrupted; harmless, but if no vl process runs on any machine sharing this repository, you may remove it".into()],
         );
     }
 }

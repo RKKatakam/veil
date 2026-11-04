@@ -52,6 +52,10 @@
 //!   lock records that moment on the backend's own stamp clock
 //!   (`since_stamp`, or the lock file's stamp if it was never renewed).
 //!   If recovery fails, the lock is left behind for the next contender.
+//!   Until it succeeds, the new holder's lock file also records the window
+//!   it is recovering (`recover_window`), so a recovery that fails or dies
+//!   hands the next holder the dead holder's objects too, not only its own
+//!   writes (BUG-096).
 //! * **Left for recovery.** A holder whose objects may not be durable and
 //!   could not be removed (a failed write barrier, see
 //!   [`crate::store::ObjectStore::sync_barrier`]) leaves the lock file
@@ -125,8 +129,15 @@
 //! | host | `/proc/sys/kernel/hostname` | `LocalHostName` (stable across networks), else `gethostname` | `gethostname` |
 //! | boot identity | `boot_id` + pid namespace | `kern.bootsessionuuid` | none (host name only) |
 //! | boot time | `btime` in `/proc/stat` | `kern.boottime` | unknown |
-//! | pid alive | `/proc/<pid>` | `kill(pid, 0)` | `kill(pid, 0)` |
+//! | pid alive | `/proc/<pid>/stat` (not a zombie), else `kill(pid, 0)` | `proc_pidinfo` (not a zombie), else `kill(pid, 0)` | `kill(pid, 0)` |
 //! | process start | `starttime` in `/proc/<pid>/stat` | `proc_pidinfo` | unknown |
+//!
+//! "Not running" needs proof (see [`process_alive_with`]): a zombie, or
+//! `kill` answering `ESRCH`. A `/proc/<pid>` that is missing because
+//! `/proc` hides other users' processes (`hidepid=2`,
+//! `ProtectProc=invisible`) or belongs to another pid namespace never
+//! counts: such a holder is treated as running, waited for and never
+//! robbed.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -209,6 +220,9 @@ pub struct LockContext {
     pub clock: Arc<dyn LockClock>,
     /// Pretend to be this machine (tests); `None`: the real one.
     pub host: Option<HostIdentity>,
+    /// How holders' processes are looked up ([`SystemProbe`]; tests
+    /// simulate restricted `/proc` setups).
+    pub probe: Arc<dyn ProcessProbe>,
 }
 
 impl Default for LockContext {
@@ -219,6 +233,7 @@ impl Default for LockContext {
             skew: Duration::from_secs(120),
             clock: Arc::new(SystemClock),
             host: None,
+            probe: Arc::new(SystemProbe),
         }
     }
 }
@@ -275,6 +290,14 @@ struct Extras {
     /// the next contender takes it over at once and recovers.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     recover: bool,
+    /// A crash recovery this holder took on and has not finished: the
+    /// window of objects a holder before it may have left unsynced. Set
+    /// from the takeover write on, and cleared once the recovery succeeds,
+    /// so that the next holder still checks them when this one dies or
+    /// fails mid-recovery (BUG-096); `since` only covers this holder's own
+    /// writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recover_window: Option<RecoveryWindow>,
 }
 
 /// The lock file: [`LockInfo`] plus [`Extras`].
@@ -464,7 +487,7 @@ fn assess_full(info: &LockInfo, extra: &Extras, now: i64, unchanged_for: Option<
     // alone identifies the machine.
     let same_machine = !me.host.is_empty() && info.host == me.host && info.boot == me.boot;
     if same_machine && info.pid == std::process::id() {
-        if extra.start.is_some() && process_start(info.pid).is_some_and(|s| Some(s.id) != extra.start) {
+        if extra.start.is_some() && process_start_with(&*ctx.probe, info.pid).is_some_and(|s| Some(s.id) != extra.start) {
             return Verdict::Steal(format!("holder pid {} was reused by this process", info.pid));
         }
         return if live_tokens().contains_key(&info.token) {
@@ -478,10 +501,10 @@ fn assess_full(info: &LockInfo, extra: &Extras, now: i64, unchanged_for: Option<
     // so there is nothing to wait for (this is what makes recovery from
     // `kill -9` or Ctrl-C instant). Checked before the lease on purpose.
     if same_machine {
-        match process_alive(info.pid) {
+        match process_alive_with(&*ctx.probe, info.pid) {
             Some(false) => return Verdict::Steal(format!("holder pid {} is no longer running", info.pid)),
             Some(true) => {
-                if let Some(why) = pid_reused(info, extra, now) {
+                if let Some(why) = pid_reused(info, extra, now, &*ctx.probe) {
                     return Verdict::Steal(why);
                 }
             }
@@ -514,7 +537,7 @@ fn assess_full(info: &LockInfo, extra: &Extras, now: i64, unchanged_for: Option<
         return Verdict::Wait;
     }
     if same_machine {
-        return match process_alive(info.pid) {
+        return match process_alive_with(&*ctx.probe, info.pid) {
             Some(false) => Verdict::Steal(format!("holder pid {} is no longer running", info.pid)),
             Some(true) => Verdict::Stuck(format!(
                 "held by {}, which is still running but no longer renews its lease",
@@ -548,7 +571,8 @@ pub struct RepoLock {
     /// What the lock file says (as first written; the heartbeat renews its
     /// own copy). [`RepoLock::abandon`] rewrites it.
     info: LockInfo,
-    extra: Extras,
+    /// Shared with the heartbeat, which writes it at every renewal.
+    extra: Arc<Mutex<Extras>>,
     lost: Arc<AtomicBool>,
     heartbeat: Option<Heartbeat>,
     /// A handle from [`RepoLock::acquire_reentrant`] inside an outer one:
@@ -614,6 +638,13 @@ fn stamp_of(backend: &dyn StorageBackend, path: &VPath) -> Option<i64> {
 /// Which loose objects the holder of the stale lock `info` may have left
 /// unsynced, for [`crate::fsck::recover_interrupted_writes`].
 fn recovery_window(backend: &dyn StorageBackend, path: &VPath, info: &LockInfo, extra: &Extras) -> RecoveryWindow {
+    let own = own_window(backend, path, info, extra);
+    // A recovery the holder had not finished is still owed.
+    extra.recover_window.map_or(own, |pending| own.union(pending))
+}
+
+/// The objects the holder of `info` itself may have written unsynced.
+fn own_window(backend: &dyn StorageBackend, path: &VPath, info: &LockInfo, extra: &Extras) -> RecoveryWindow {
     if let Some(since) = extra.since {
         return RecoveryWindow::Stamp(since);
     }
@@ -652,7 +683,7 @@ impl RepoLock {
                     path,
                     token: info.token.clone(),
                     info,
-                    extra,
+                    extra: Arc::new(Mutex::new(extra)),
                     lost: Arc::new(AtomicBool::new(false)),
                     heartbeat: None,
                     nested: true,
@@ -730,18 +761,30 @@ impl RepoLock {
             }
             if let Some(window) = takeover {
                 let attempt = clock.now();
+                // The window stays in our lock file until the recovery has
+                // succeeded: if we fail or die before that, the next holder
+                // recovers it too, not only what we wrote (BUG-096).
+                let extra = Extras {
+                    recover_window: Some(window),
+                    ..extra.clone()
+                };
                 let ours = encode(&info, &extra);
                 match take_over(&*backend, &path, &raw, &ours, ctx, &mut guards_seen)? {
                     TakeOver::Ours => {
                         let mut lock = Self::held(backend, path, info, extra, token, opts, ctx, attempt);
                         // Under our lock, before anyone builds on what the
                         // previous holder left: discard its torn objects and
-                        // make its intact ones durable. If that fails, the
-                        // lock is left for the next holder to try again.
-                        if let Err(e) = crate::fsck::recover_interrupted_writes(&*lock.backend, window) {
-                            lock.abandon();
-                            return Err(e);
-                        }
+                        // make its intact ones durable. Until that succeeds
+                        // the lock is marked to be left for the next holder
+                        // (also if recovery panics).
+                        lock.abandon();
+                        crate::fsck::recover_interrupted_writes(&*lock.backend, window)?;
+                        lock.abandoned = false;
+                        lock.extras().recover_window = None;
+                        // A contender that crashed mid-takeover may have
+                        // left takeover sub-guards nobody will contend for
+                        // again; clear those that are provably stale.
+                        let _ = clear_stale_guards(&*lock.backend, ctx);
                         return Ok(lock);
                     }
                     TakeOver::Retry => continue,
@@ -778,6 +821,7 @@ impl RepoLock {
             confirmed: Arc::new(Mutex::new(attempt)),
             paused: Arc::new(AtomicBool::new(false)),
         });
+        let extra = Arc::new(Mutex::new(extra));
         let heartbeat = Heartbeat::spawn(
             backend.clone(),
             path.clone(),
@@ -800,6 +844,10 @@ impl RepoLock {
             fence,
             abandoned: false,
         }
+    }
+
+    fn extras(&self) -> std::sync::MutexGuard<'_, Extras> {
+        self.extra.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The current holder of the repository lock, if any.
@@ -885,7 +933,7 @@ impl Drop for RepoLock {
                     info.renewed = now_millis().max(info.acquired);
                     let extra = Extras {
                         recover: true,
-                        ..self.extra.clone()
+                        ..self.extras().clone()
                     };
                     let _ = self.backend.write(&self.path, &encode(&info, &extra));
                 } else {
@@ -903,7 +951,7 @@ impl Heartbeat {
         backend: Arc<dyn StorageBackend>,
         path: VPath,
         mut info: LockInfo,
-        extra: Extras,
+        extra: Arc<Mutex<Extras>>,
         every: Duration,
         lost: Arc<AtomicBool>,
         clock: Arc<dyn LockClock>,
@@ -935,6 +983,7 @@ impl Heartbeat {
                     match backend.read_opt(&path) {
                         Ok(Some(raw)) if LockInfo::parse(&raw).is_some_and(|i| i.token == info.token) => {
                             info.renewed = clock.wall_ms();
+                            let extra = extra.lock().unwrap_or_else(|e| e.into_inner()).clone();
                             // A failed renewal is retried on the next tick;
                             // a fencing holder's lease runs out meanwhile.
                             if backend.write(&path, &encode(&info, &extra)).is_ok() {
@@ -1058,7 +1107,8 @@ impl Guard {
 ///
 /// Sub-guards are removed by their holders too; one is left behind only
 /// when a contender crashes while holding it. It is harmless (no later
-/// guard hashes to its name) and can be deleted when no command runs.
+/// guard hashes to its name once the guard it was named after is gone);
+/// [`clear_stale_guards`] removes it through this same protocol.
 fn claim(
     backend: &dyn StorageBackend,
     path: &VPath,
@@ -1124,6 +1174,92 @@ fn claim(
     let won = won?;
     released?;
     Ok(won.then_some(guard))
+}
+
+/// A takeover guard file found in `.veil/` (see [`takeover_guards`]).
+#[derive(Clone, Debug)]
+pub struct GuardFile {
+    /// `.veil/lock.steal`, or a sub-guard `.veil/lock.steal.<hash>…`.
+    pub path: VPath,
+    /// How many `.<hash>` levels below [`STEAL_PATH`] it is.
+    pub depth: usize,
+    /// Who holds it, if its content parses.
+    pub holder: Option<LockInfo>,
+    /// Whether its holder is provably gone (so the guard is stale), with
+    /// the reason; `None` while it may still be in use.
+    pub stale: Option<String>,
+}
+
+/// The takeover guard and sub-guards present in `.veil/`, shallowest
+/// first, each judged by the takeover rules (for `vl fsck` and
+/// `vl doctor`). A guard is only ever held for the few milliseconds of a
+/// takeover; one that stays was left by a contender that crashed. A
+/// leftover top-level guard is cleared by the next takeover, and stale
+/// sub-guards by [`clear_stale_guards`].
+pub fn takeover_guards(backend: &dyn StorageBackend) -> Result<Vec<GuardFile>> {
+    takeover_guards_in(backend, &LockContext::for_backend(backend))
+}
+
+fn takeover_guards_in(backend: &dyn StorageBackend, ctx: &LockContext) -> Result<Vec<GuardFile>> {
+    let dir = VPath::new(".veil")?;
+    let Some(base) = STEAL_PATH.strip_prefix(".veil/") else { return Ok(Vec::new()) };
+    let mut out = Vec::new();
+    let entries = match backend.list_dir(&dir) {
+        Ok(e) => e,
+        Err(_) if !backend.exists(&dir)? => return Ok(out),
+        Err(e) => return Err(e),
+    };
+    for e in entries {
+        let Some(rest) = e.name.strip_prefix(base) else { continue };
+        // `""` or `.<16 hex>` repeated: anything else is not ours.
+        let levels: Vec<&str> = rest.split('.').skip(1).collect();
+        let well_formed = rest.is_empty()
+            || (rest.starts_with('.') && levels.iter().all(|l| l.len() == 16 && l.bytes().all(|b| b.is_ascii_hexdigit())));
+        if !well_formed || e.kind != crate::vfs::NodeKind::File {
+            continue;
+        }
+        let path = dir.join(&e.name);
+        let Some(raw) = backend.read_opt(&path)? else { continue };
+        let parsed = parse_file(&raw);
+        let stale = match &parsed {
+            Some((info, extra)) => match assess_full(info, extra, ctx.clock.wall_ms(), None, ctx) {
+                Verdict::Steal(why) => Some(why),
+                Verdict::Wait | Verdict::Stuck(_) => None,
+            },
+            None => None,
+        };
+        out.push(GuardFile {
+            path,
+            depth: levels.len(),
+            holder: parsed.map(|(i, _)| i),
+            stale,
+        });
+    }
+    out.sort_by(|a, b| (a.depth, a.path.as_str()).cmp(&(b.depth, b.path.as_str())));
+    Ok(out)
+}
+
+/// Remove the takeover guards whose holders are provably gone (see
+/// [`takeover_guards`]); returns how many. Run after every takeover.
+///
+/// A guard is never removed by check-then-remove (BUG-049): each one is
+/// *claimed* by the takeover protocol (replaced in one write under a
+/// sub-guard named after its bytes, see `claim`), and then released like
+/// any guard its holder is done with. So a guard a live contender holds,
+/// or claims meanwhile, is never touched.
+pub fn clear_stale_guards(backend: &dyn StorageBackend, ctx: &LockContext) -> Result<usize> {
+    let mut seen = GuardsSeen::new();
+    let mut cleared = 0;
+    for g in takeover_guards_in(backend, ctx)? {
+        if g.stale.is_none() || !backend.exists(&g.path)? {
+            continue; // in use, or already cleared through a parent
+        }
+        if let Some(guard) = claim(backend, &g.path, ctx, &mut seen, g.depth)? {
+            guard.release(backend, &g.path)?;
+            cleared += 1;
+        }
+    }
+    Ok(cleared)
 }
 
 // ---- process-local registry of live tokens ----------------------------------
@@ -1412,33 +1548,96 @@ fn sysctl_bytes(name: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// Whether `pid` is a running process on this machine (zombies count as
-/// running); `None` if that cannot be told.
+// ---- process liveness ---------------------------------------------------------
+
+/// What this machine's process table shows about one pid (see
+/// [`ProcessProbe::entry`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProcEntry {
+    /// No process table that describes this process's own pid namespace:
+    /// not Linux or macOS, no `/proc`, or a `/proc` mounted for another
+    /// pid namespace (`unshare -p` without `--mount-proc`), whose
+    /// `/proc/<pid>` names some other process.
+    Unavailable,
+    /// The table has no entry for the pid: the process is gone, *or* it is
+    /// hidden from this user (`/proc` mounted with `hidepid=2`, systemd's
+    /// `ProtectProc=invisible`). Not proof of death on its own.
+    Absent,
+    /// An entry. `zombie`: the process has exited and only waits to be
+    /// reaped by its parent (`None`: cannot tell, e.g. `hidepid=1`);
+    /// `start`: when it started, if readable.
+    Present {
+        zombie: Option<bool>,
+        start: Option<ProcessStart>,
+    },
+}
+
+/// The answer to `kill(pid, 0)`, which asks the kernel directly, in this
+/// process's own pid namespace, whatever `/proc` shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Signal {
+    /// The pid exists (possibly as a zombie).
+    Delivered,
+    /// `ESRCH`: no process with this pid.
+    NoProcess,
+    /// `EPERM`: a process with this pid exists but belongs to another user.
+    NotPermitted,
+    /// Not asked (no `kill` on this platform, an invalid pid) or another
+    /// error.
+    Unknown,
+}
+
+/// How the lock asks the operating system about other processes:
+/// [`SystemProbe`] in production; tests substitute what restricted setups
+/// (`hidepid`, foreign pid namespaces, zombies) show, so that the decision
+/// in [`process_alive_with`] is tested as it runs.
+pub trait ProcessProbe: Send + Sync + std::fmt::Debug {
+    /// The process table's entry for `pid`: `/proc/<pid>` on Linux,
+    /// `proc_pidinfo` on macOS.
+    fn entry(&self, pid: u32) -> ProcEntry;
+    /// `kill(pid, 0)`.
+    fn signal(&self, pid: u32) -> Signal;
+}
+
+/// The real operating system.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemProbe;
+
+impl ProcessProbe for SystemProbe {
+    fn entry(&self, pid: u32) -> ProcEntry {
+        system_entry(pid)
+    }
+    fn signal(&self, pid: u32) -> Signal {
+        system_signal(pid)
+    }
+}
+
+/// Whether `pid` is a running process on this machine; `None` if that
+/// cannot be told. A zombie (killed or exited, not yet reaped) is not
+/// running (BUG-097): it can never renew its lease or touch the
+/// repository again.
+///
+/// Only proof counts as "not running": an entry that is a zombie, or
+/// `kill(pid, 0)` failing with `ESRCH`. A missing `/proc/<pid>` alone is
+/// not, since `/proc` may hide other users' processes or belong to another
+/// pid namespace; `kill` then decides (`EPERM` means another user's live
+/// process), so the lock falls back to its lease instead of being taken
+/// from a live holder.
+pub fn process_alive_with(probe: &dyn ProcessProbe, pid: u32) -> Option<bool> {
+    match probe.entry(pid) {
+        ProcEntry::Present { zombie: Some(true), .. } => Some(false),
+        ProcEntry::Present { .. } => Some(true),
+        ProcEntry::Absent | ProcEntry::Unavailable => match probe.signal(pid) {
+            Signal::NoProcess => Some(false),
+            Signal::Delivered | Signal::NotPermitted => Some(true),
+            Signal::Unknown => None,
+        },
+    }
+}
+
+/// [`process_alive_with`] the real operating system.
 pub fn process_alive(pid: u32) -> Option<bool> {
-    #[cfg(target_os = "linux")]
-    if std::path::Path::new("/proc/self").exists() {
-        return Some(std::path::Path::new(&format!("/proc/{pid}")).exists());
-    }
-    #[cfg(unix)]
-    {
-        // pid 0 and negative values address process groups, not a process.
-        let Ok(raw) = libc::pid_t::try_from(pid) else { return None };
-        if raw <= 0 {
-            return None;
-        }
-        // SAFETY: signal 0 performs only the existence and permission checks.
-        if unsafe { libc::kill(raw, 0) } == 0 {
-            return Some(true);
-        }
-        return match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::ESRCH) => Some(false),
-            // Exists, but belongs to someone else.
-            Some(libc::EPERM) => Some(true),
-            _ => None,
-        };
-    }
-    #[allow(unreachable_code)]
-    None
+    process_alive_with(&SystemProbe, pid)
 }
 
 /// When a process started: `id` identifies the process together with its
@@ -1452,32 +1651,104 @@ pub struct ProcessStart {
 
 /// When `pid` started, if it runs and the platform can tell (Linux: clock
 /// ticks since boot from `/proc/<pid>/stat`; macOS: the start time
-/// `proc_pidinfo` reports).
+/// `proc_pidinfo` reports). `None` too when `/proc` belongs to another
+/// pid namespace, where it would describe another process.
 pub fn process_start(pid: u32) -> Option<ProcessStart> {
-    process_start_impl(pid)
+    process_start_with(&SystemProbe, pid)
+}
+
+/// [`process_start`] through `probe`.
+pub fn process_start_with(probe: &dyn ProcessProbe, pid: u32) -> Option<ProcessStart> {
+    match probe.entry(pid) {
+        ProcEntry::Present { start, .. } => start,
+        ProcEntry::Absent | ProcEntry::Unavailable => None,
+    }
+}
+
+/// Whether `/proc` describes this process's own pid namespace: then
+/// `/proc/self` names our own pid. In a `/proc` of an ancestor namespace
+/// it names our pid there, in one of another namespace nothing.
+#[cfg(target_os = "linux")]
+fn proc_is_ours() -> bool {
+    std::fs::read_link("/proc/self")
+        .ok()
+        .and_then(|p| p.to_str()?.parse::<u32>().ok())
+        == Some(std::process::id())
+}
+
+/// The state letter and `starttime` of a `/proc/<pid>/stat` line.
+#[cfg(target_os = "linux")]
+fn parse_stat(stat: &str) -> (Option<char>, Option<u64>) {
+    // Field 2, `comm`, is parenthesised and may contain spaces and
+    // parentheses; field 3 is the state and field 22, `starttime`, the
+    // 20th after it.
+    let Some(close) = stat.rfind(')') else { return (None, None) };
+    let mut fields = stat[close + 1..].split_whitespace();
+    let state = fields.next().and_then(|s| s.chars().next());
+    let ticks = fields.nth(18).and_then(|t| t.parse().ok());
+    (state, ticks)
 }
 
 #[cfg(target_os = "linux")]
-fn process_start_impl(pid: u32) -> Option<ProcessStart> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // Field 2, `comm`, is parenthesised and may contain spaces and
-    // parentheses; field 22, `starttime`, is the 20th after it.
-    let rest = &stat[stat.rfind(')')? + 1..];
-    let ticks: u64 = rest.split_whitespace().nth(19)?.parse().ok()?;
-    // SAFETY: `sysconf` only reads a configuration value.
-    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    let hz = u64::try_from(hz).ok().filter(|&h| h > 0).unwrap_or(100);
-    let wall_ms = boot_time_ms().and_then(|b| b.checked_add(i64::try_from(ticks.checked_mul(1000)? / hz).ok()?));
-    Some(ProcessStart { id: ticks, wall_ms })
+fn exited(state: Option<char>) -> bool {
+    matches!(state, Some('Z' | 'X'))
+}
+
+#[cfg(target_os = "linux")]
+fn system_entry(pid: u32) -> ProcEntry {
+    if !proc_is_ours() {
+        return ProcEntry::Unavailable;
+    }
+    let dir = format!("/proc/{pid}");
+    let Ok(stat) = std::fs::read_to_string(format!("{dir}/stat")) else {
+        // Visible but unreadable (`hidepid=1`), or gone (or hidden).
+        return if std::path::Path::new(&dir).exists() {
+            ProcEntry::Present {
+                zombie: None,
+                start: None,
+            }
+        } else {
+            ProcEntry::Absent
+        };
+    };
+    let (state, ticks) = parse_stat(&stat);
+    // The main thread of a process whose other threads still run shows
+    // `Z` too (it called `pthread_exit`): only a process none of whose
+    // threads runs is a zombie.
+    let zombie = match state {
+        None => None,
+        Some(_) if !exited(state) => Some(false),
+        Some(_) => std::fs::read_dir(format!("{dir}/task")).ok().map(|tasks| {
+            tasks.flatten().all(|t| {
+                // A task that vanished meanwhile has exited too.
+                std::fs::read_to_string(t.path().join("stat")).map_or(true, |s| exited(parse_stat(&s).0))
+            })
+        }),
+    };
+    let start = ticks.map(|ticks| {
+        // SAFETY: `sysconf` only reads a configuration value.
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        let hz = u64::try_from(hz).ok().filter(|&h| h > 0).unwrap_or(100);
+        let wall_ms = boot_time_ms().and_then(|b| b.checked_add(i64::try_from(ticks.checked_mul(1000)? / hz).ok()?));
+        ProcessStart { id: ticks, wall_ms }
+    });
+    ProcEntry::Present { zombie, start }
 }
 
 #[cfg(target_os = "macos")]
-fn process_start_impl(pid: u32) -> Option<ProcessStart> {
-    let raw = libc::c_int::try_from(pid).ok().filter(|&p| p > 0)?;
+fn system_entry(pid: u32) -> ProcEntry {
+    /// `SZOMB` in XNU's `<sys/proc.h>`.
+    const SZOMB: u32 = 5;
+    let Some(raw) = libc::c_int::try_from(pid).ok().filter(|&p| p > 0) else {
+        return ProcEntry::Unavailable;
+    };
     // SAFETY: `proc_bsdinfo` is plain data; all-zero is a valid value.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
-    // SAFETY: the buffer is a writable `proc_bsdinfo` of exactly `size` bytes.
+    let Ok(size) = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()) else {
+        return ProcEntry::Unavailable;
+    };
+    // SAFETY: the buffer is a writable `proc_bsdinfo` of exactly `size`
+    // bytes. XNU answers this flavour for zombies too.
     let n = unsafe {
         libc::proc_pidinfo(
             raw,
@@ -1488,21 +1759,49 @@ fn process_start_impl(pid: u32) -> Option<ProcessStart> {
         )
     };
     if n != size {
-        return None;
+        // Gone, or not ours to inspect: `kill` decides.
+        return ProcEntry::Unavailable;
     }
-    let us = info
+    let start = info
         .pbi_start_tvsec
-        .checked_mul(1_000_000)?
-        .checked_add(info.pbi_start_tvusec)?;
-    Some(ProcessStart {
-        id: us,
-        wall_ms: i64::try_from(us / 1000).ok(),
-    })
+        .checked_mul(1_000_000)
+        .and_then(|s| s.checked_add(info.pbi_start_tvusec))
+        .map(|us| ProcessStart {
+            id: us,
+            wall_ms: i64::try_from(us / 1000).ok(),
+        });
+    ProcEntry::Present {
+        zombie: Some(info.pbi_status == SZOMB),
+        start,
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn process_start_impl(_pid: u32) -> Option<ProcessStart> {
-    None
+fn system_entry(_pid: u32) -> ProcEntry {
+    ProcEntry::Unavailable
+}
+
+#[cfg(unix)]
+fn system_signal(pid: u32) -> Signal {
+    // pid 0 and negative values address process groups, not a process.
+    let Ok(raw) = libc::pid_t::try_from(pid) else { return Signal::Unknown };
+    if raw <= 0 {
+        return Signal::Unknown;
+    }
+    // SAFETY: signal 0 performs only the existence and permission checks.
+    if unsafe { libc::kill(raw, 0) } == 0 {
+        return Signal::Delivered;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => Signal::NoProcess,
+        Some(libc::EPERM) => Signal::NotPermitted,
+        _ => Signal::Unknown,
+    }
+}
+
+#[cfg(not(unix))]
+fn system_signal(_pid: u32) -> Signal {
+    Signal::Unknown
 }
 
 /// This process's [`ProcessStart::id`], recorded in its lock files.
@@ -1515,8 +1814,8 @@ fn my_start() -> Option<u64> {
 /// else: it started at another time than the holder (locks that record
 /// it), or, for locks that do not (older versions), well after the lock was
 /// acquired and the lease has expired. `Some(reason)` if so.
-fn pid_reused(info: &LockInfo, extra: &Extras, now: i64) -> Option<String> {
-    let running = process_start(info.pid)?;
+fn pid_reused(info: &LockInfo, extra: &Extras, now: i64, probe: &dyn ProcessProbe) -> Option<String> {
+    let running = process_start_with(probe, info.pid)?;
     let reused = match extra.start {
         Some(start) => start != running.id,
         None => {

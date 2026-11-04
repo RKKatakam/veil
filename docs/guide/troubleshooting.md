@@ -325,6 +325,18 @@ taken over automatically. If you're sure nothing is running, delete
 means an old `vl` wrote it; `lease renewal time unreadable: N` means the
 file holds no valid time (it is damaged or was written by hand).
 
+### `error: repository is locked: held by …, which is still running but no longer renews its lease`
+
+The process named holds the lock and still exists, but stopped renewing
+it: it is suspended (`Ctrl-Z`, a stopped debugger) or stuck on a hung
+disk. Resume or end it; its lock is taken over as soon as it exits. A
+`vl` that was killed but not yet reaped by its parent (a zombie, `Z` in
+`ps`) counts as exited. On systems that hide other users' processes
+(`/proc` mounted with `hidepid=2`, systemd's `ProtectProc=invisible`), a
+lock held by another user's `vl` is never taken over while that process
+exists, since a missing `/proc` entry is no proof that the holder is gone;
+if it stops renewing, it is reported this way.
+
 ### `error: repository is locked: this process's repository lock was taken over; the operation was not recorded`
 
 This `vl` stalled long enough (suspended laptop, frozen network mount) for

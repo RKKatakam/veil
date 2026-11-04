@@ -72,6 +72,11 @@ note: 2 predecessor snapshot(s) of the evolution log are not present (normal aft
   `vl fsck -R ../hub`.
 * To repair missing or damaged objects, fetch them from a remote that has
   them: `vl pull --full`. To repair a remote, `vl push --full`.
+* Notes about a leftover lock, `.veil/lock.steal` or a sub-guard
+  `.veil/lock.steal.<hash>` mean a `vl` was interrupted. They are
+  harmless: the next command takes a dead holder's lock over (and first
+  re-checks the objects it may have left unsynced), and the next takeover
+  or `vl doctor` removes stale guards.
 
 ## `vl doctor`
 
@@ -104,8 +109,11 @@ Everything looks good.
 ```
 
 It checks your identity (readable, valid, mode `0600`, retired identities
-too), `VEIL_HOME`, leftover sandboxes, the repository's format and lock,
-the stat cache, the vault, the filesystem (network mounts, `fsync`, case and
+too), `VEIL_HOME`, leftover sandboxes, the repository's format and lock
+(including lock takeover guards, `.veil/lock.steal` and
+`.veil/lock.steal.<hash>`, that a `vl` crashing mid-takeover left behind:
+it removes those whose holder has provably exited, which is the one thing
+it changes, and names the rest), the stat cache, the vault, the filesystem (network mounts, `fsync`, case and
 Unicode folding, see the README's [platform notes](../../README.md#platform-notes))
 and the clock. `vl doctor --remotes` also checks that each path remote is a
 Veil repository. SSH remotes are not contacted by `doctor` in 1.0

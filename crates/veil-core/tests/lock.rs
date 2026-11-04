@@ -8,7 +8,7 @@ use std::{
 };
 
 use veil_core::{
-    lock::{LockInfo, LockOptions, RepoLock, LOCK_PATH},
+    lock::{LockContext, LockInfo, LockOptions, ProcEntry, ProcessProbe, RepoLock, Signal, SystemProbe, LOCK_PATH},
     now_millis, DiskBackend, MemoryBackend, StorageBackend, VPath, VeilError,
 };
 
@@ -515,4 +515,245 @@ fn a_holder_that_crashed_before_renewing_is_recovered_from_its_lock_stamp() {
     let counter = fs.clone();
     drop(RepoLock::acquire_with(fs, &quick(2_000)).unwrap());
     assert_eq!(counter.object_reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+// ---- restricted /proc (hidepid, foreign pid namespaces) -----------------------------
+//
+// `hidepid=2` / `ProtectProc=invisible` and a `/proc` of another pid
+// namespace cannot be set up without root here, so these tests inject what
+// such a `/proc` shows through `LockContext::probe`. The decision
+// (`process_alive_with`) is the production code; only the observations of
+// `/proc/<pid>` for the holder are simulated, `kill(pid, 0)` is real unless
+// stated otherwise.
+
+/// What a restricted `/proc` shows about one pid.
+#[derive(Debug)]
+struct Restricted {
+    pid: u32,
+    entry: ProcEntry,
+    /// `None`: the real `kill(pid, 0)`.
+    signal: Option<Signal>,
+}
+
+impl ProcessProbe for Restricted {
+    fn entry(&self, pid: u32) -> ProcEntry {
+        if pid == self.pid {
+            self.entry.clone()
+        } else {
+            SystemProbe.entry(pid)
+        }
+    }
+    fn signal(&self, pid: u32) -> Signal {
+        match self.signal {
+            Some(s) if pid == self.pid => s,
+            _ => SystemProbe.signal(pid),
+        }
+    }
+}
+
+/// Plant the expired lock of `pid` (a current `vl`, start time recorded)
+/// and try to take it over through `probe`. `Ok(true)`: taken over.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn taken_over_through(pid: u32, start: u64, probe: Restricted) -> bool {
+    let fs: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    plant_with(&*fs, &lock_path(), &foreign_lock(pid, 60_000), serde_json::json!({ "pid_start": start }));
+    let before = fs.read(&lock_path()).unwrap();
+    let ctx = LockContext {
+        probe: Arc::new(probe),
+        ..LockContext::default()
+    };
+    match RepoLock::acquire_in(fs.clone(), &quick(300), &ctx) {
+        Ok(lock) => {
+            drop(lock);
+            true
+        }
+        Err(e) => {
+            assert!(matches!(e, VeilError::Locked(_)), "{e}");
+            assert_eq!(fs.read(&lock_path()).unwrap(), before, "the lock was left alone");
+            false
+        }
+    }
+}
+
+/// Under `hidepid=2` another user's live holder has no `/proc/<pid>`; it
+/// used to be judged dead at once and robbed. `kill(pid, 0)` answers
+/// `EPERM` for it, so it is running: waited for, never taken over. The
+/// same holder, gone (`ESRCH`), is still taken over at once.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_holder_hidden_by_hidepid_is_not_taken_over() {
+    let mut alive = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+    let start = veil_core::lock::process_start(alive.id()).expect("start time").id;
+    let hidden = |signal| Restricted {
+        pid: alive.id(),
+        entry: ProcEntry::Absent,
+        signal: Some(signal),
+    };
+    assert!(!taken_over_through(alive.id(), start, hidden(Signal::NotPermitted)), "another user's live holder");
+    assert!(taken_over_through(alive.id(), start, hidden(Signal::NoProcess)), "a holder that is gone");
+    // `hidepid=1`: the entry is visible, its files are not.
+    let unreadable = Restricted {
+        pid: alive.id(),
+        entry: ProcEntry::Present {
+            zombie: None,
+            start: None,
+        },
+        signal: None,
+    };
+    assert!(!taken_over_through(alive.id(), start, unreadable), "an entry whose state cannot be read");
+    alive.kill().unwrap();
+    alive.wait().unwrap();
+}
+
+/// With a `/proc` of another pid namespace (`unshare -p` without
+/// `--mount-proc`), `/proc/<pid>` names some other process; the probe then
+/// reports no usable entry (`/proc/self` is not our pid) and `kill`, which
+/// works in our own namespace, decides.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_foreign_proc_falls_back_to_kill() {
+    let mut alive = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+    let start = veil_core::lock::process_start(alive.id()).expect("start time").id;
+    let foreign = |pid| Restricted {
+        pid,
+        entry: ProcEntry::Unavailable,
+        signal: None,
+    };
+    assert!(!taken_over_through(alive.id(), start, foreign(alive.id())), "live holder");
+    alive.kill().unwrap();
+    alive.wait().unwrap();
+    assert!(taken_over_through(alive.id(), start, foreign(alive.id())), "holder gone (ESRCH)");
+}
+
+/// The decision table, including what the real `/proc` shows this process.
+#[test]
+fn liveness_needs_proof_of_death() {
+    use veil_core::lock::process_alive_with;
+    let probe = |entry, signal| Restricted {
+        pid: 4242,
+        entry,
+        signal: Some(signal),
+    };
+    let zombie = |z| ProcEntry::Present { zombie: z, start: None };
+    let cases = [
+        (zombie(Some(true)), Signal::Delivered, Some(false)),
+        (zombie(Some(false)), Signal::NoProcess, Some(true)),
+        (zombie(None), Signal::Unknown, Some(true)),
+        (ProcEntry::Absent, Signal::NotPermitted, Some(true)),
+        (ProcEntry::Absent, Signal::NoProcess, Some(false)),
+        (ProcEntry::Absent, Signal::Unknown, None),
+        (ProcEntry::Unavailable, Signal::Delivered, Some(true)),
+        (ProcEntry::Unavailable, Signal::NotPermitted, Some(true)),
+        (ProcEntry::Unavailable, Signal::NoProcess, Some(false)),
+        (ProcEntry::Unavailable, Signal::Unknown, None),
+    ];
+    for (entry, signal, want) in cases {
+        let p = probe(entry.clone(), signal);
+        assert_eq!(process_alive_with(&p, 4242), want, "{entry:?}, {signal:?}");
+    }
+    #[cfg(target_os = "linux")]
+    assert!(matches!(
+        SystemProbe.entry(std::process::id()),
+        ProcEntry::Present {
+            zombie: Some(false),
+            start: Some(_)
+        }
+    ));
+}
+
+// ---- leftover takeover sub-guards ------------------------------------------------------
+
+fn guard_names(fs: &dyn StorageBackend) -> Vec<String> {
+    let mut names: Vec<String> = fs
+        .list_dir(&VPath::new(".veil").unwrap())
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .filter(|n| n.starts_with("lock.steal"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// A contender that crashed after winning a dead guard but before
+/// releasing the sub-guard it used leaves `lock.steal.<hash>` behind, which
+/// no later takeover contends for. It is reported, and the next takeover
+/// clears it through the takeover protocol; a sub-guard whose holder still
+/// runs is left alone.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn orphaned_sub_guards_are_reported_and_cleared_by_the_next_takeover() {
+    let mut alive = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+    let start = veil_core::lock::process_start(alive.id()).expect("start time").id;
+    for (fs, _tmp) in backends() {
+        let dead = |s: &str| VPath::new(&format!("{}.{s}", veil_core::lock::STEAL_PATH)).unwrap();
+        plant(&*fs, &foreign_lock(dead_pid(), 0));
+        plant_with(&*fs, &dead("0123456789abcdef"), &foreign_lock(dead_pid(), 0), serde_json::json!({}));
+        plant_with(
+            &*fs,
+            &dead("0123456789abcdef.fedcba9876543210"),
+            &foreign_lock(dead_pid(), 0),
+            serde_json::json!({}),
+        );
+        let live = dead("00000000ffffffff");
+        plant_with(&*fs, &live, &foreign_lock(alive.id(), 0), serde_json::json!({ "pid_start": start }));
+        fs.write(&dead("not-a-guard"), b"x").unwrap();
+
+        let guards = veil_core::lock::takeover_guards(&*fs).unwrap();
+        let stale: Vec<(&str, bool)> = guards.iter().map(|g| (g.path.as_str(), g.stale.is_some())).collect();
+        assert_eq!(
+            stale,
+            [
+                (".veil/lock.steal.00000000ffffffff", false),
+                (".veil/lock.steal.0123456789abcdef", true),
+                (".veil/lock.steal.0123456789abcdef.fedcba9876543210", true),
+            ],
+            "({})",
+            fs.kind()
+        );
+        let lock = RepoLock::acquire_with(fs.clone(), &quick(2_000)).unwrap();
+        assert_eq!(
+            guard_names(&*fs),
+            ["lock.steal.00000000ffffffff", "lock.steal.not-a-guard"],
+            "({})",
+            fs.kind()
+        );
+        drop(lock);
+    }
+    alive.kill().unwrap();
+    alive.wait().unwrap();
+}
+
+/// `vl doctor` clears stale guards without any takeover (the lock is free):
+/// a dead top-level guard and a dead orphan, nothing else left behind.
+#[cfg(unix)]
+#[test]
+fn stale_guards_are_cleared_without_a_takeover() {
+    for (fs, _tmp) in backends() {
+        let steal = VPath::new(veil_core::lock::STEAL_PATH).unwrap();
+        plant_with(&*fs, &steal, &foreign_lock(dead_pid(), 0), serde_json::json!({}));
+        let orphan = VPath::new(&format!("{}.abcdefabcdefabcd", veil_core::lock::STEAL_PATH)).unwrap();
+        plant_with(&*fs, &orphan, &foreign_lock(dead_pid(), 0), serde_json::json!({}));
+        let n = veil_core::lock::clear_stale_guards(&*fs, &LockContext::default()).unwrap();
+        assert_eq!(n, 2, "({})", fs.kind());
+        assert!(guard_names(&*fs).is_empty(), "{:?} ({})", guard_names(&*fs), fs.kind());
+        assert!(!fs.exists(&lock_path()).unwrap());
+    }
+}
+
+/// `vl fsck` names leftover sub-guards, not only `.veil/lock.steal`.
+#[cfg(unix)]
+#[test]
+fn fsck_reports_leftover_sub_guards() {
+    let fs: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let id = veil_core::Identity::generate("alice");
+    drop(veil_core::Repo::init(fs.clone(), Some(id.clone()), "alice").unwrap());
+    let orphan = VPath::new(&format!("{}.abcdefabcdefabcd", veil_core::lock::STEAL_PATH)).unwrap();
+    plant_with(&*fs, &orphan, &foreign_lock(dead_pid(), 0), serde_json::json!({}));
+    let report = veil_core::fsck::fsck(fs.clone(), Some(id)).unwrap();
+    let notes: Vec<String> = report.findings.iter().map(|f| f.to_string()).collect();
+    assert!(
+        notes.iter().any(|n| n.contains(".veil/lock.steal.abcdefabcdefabcd present") && n.contains("stale")),
+        "{notes:#?}"
+    );
 }
