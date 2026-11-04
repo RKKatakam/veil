@@ -74,6 +74,8 @@ be undone. Add to that per-file encryption and engine-level secret handling.
 | `.git/hooks/pre-commit` | `.veil/hooks/pre-commit`, or a repository's `.veilhooks` once you `vl hooks trust` it ([Hooks](hooks.md)) |
 | `git commit --no-verify` | `vl commit --no-verify` |
 | `git blame`, `git grep`, `git bisect`, `git log -S`/`-G`/`--follow`/`-- PATH` | `vl blame`, `vl grep`, `vl bisect`, `vl log -S`/`-G`/`--follow`/`-- PATH` ([Investigating history](investigating-history.md)) |
+| `git format-patch A..B` | `vl format-patch A..B` (the public view: what `vl git push` would show; [details](github.md#patches-by-mail-vl-format-patch-and-vl-am)) |
+| `git am FILE` | `vl am FILE` (new changes on `@-`, all or nothing) |
 | `git revert`, `git cherry-pick` | *(no equivalent in 1.0)* |
 
 ## Pitfalls

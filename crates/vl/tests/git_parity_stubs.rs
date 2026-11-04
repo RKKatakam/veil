@@ -94,14 +94,6 @@ fn new_commands_parse_their_documented_flags_and_refuse() {
         (&["duplicate", "@-", "--keep-description"], "vl duplicate"),
         (&["cherry-pick", "@-", "-x", "--json"], "vl cherry-pick"),
         (&["cherry-pick", "@-", "-m", "copy"], "vl cherry-pick"),
-        // stream P: format-patch, am
-        (&["format-patch", "@-"], "vl format-patch"),
-        (&["format-patch", "root()..@", "-o", "out", "--cover-letter", "--binary", "-M"], "vl format-patch"),
-        (&["format-patch", "@-", "--stdout", "--audience", "me", "--include-embargoed", "e1", "--yes"], "vl format-patch"),
-        (&["format-patch", "@-", "--audience", "public"], "vl format-patch"),
-        (&["am", "-"], "vl am"),
-        (&["am", "series.mbox", "-d", "@", "--3way", "--keep-author", "--signoff"], "vl am"),
-        (&["am", "patches/", "--author-as-me"], "vl am"),
         // stream G: submodules
         (&["submodule", "status"], "vl submodule"),
         (&["submodule", "status", "vendor/a"], "vl submodule"),

@@ -25,9 +25,11 @@ fixed**. Severity: high / medium / low.
 - **Colocated Git mode:** a real `.git` next to `.veil` (as Jujutsu does) so
   IDEs, GUIs, `git blame`, pre-commit and other Git tools keep working.
 - **Missing everyday commands:** cherry-pick/duplicate,
-  `archive` (tarball of a snapshot), patch export/import.
+  `archive` (tarball of a snapshot).
 - **Rename-aware merges** (`diff`, `status`, `show` and `log --follow`
   detect renames; merges still see a delete plus an add).
+- **Patches, phase 2:** `vl format-patch -M` renames, symlinks and
+  submodules in `vl am`, binary literals both ways, `vl am --3way`.
 - **Repository attributes:** line-ending normalisation (CRLF), per-path diff
   and merge drivers, binary handling (`.gitattributes` equivalents).
 - **Symlinks** are ignored; non-UTF-8 names are not recorded; submodules are
