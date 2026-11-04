@@ -275,16 +275,43 @@ impl GitBridge {
     }
 
     pub(crate) fn set_ref(&self, name: &str, oid: GitOid) -> Result<()> {
-        self.git
-            .reference(name, oid, gix::refs::transaction::PreviousValue::Any, "veil")
-            .map_err(gerr)?;
-        Ok(())
+        use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+        // With Veil's own committer for the reflog: a colocated `.git`
+        // keeps reflogs, and the isolated configuration names nobody.
+        self.edit_refs(RefEdit {
+            change: Change::Update {
+                log: LogChange {
+                    mode: RefLog::AndReference,
+                    force_create_reflog: false,
+                    message: "veil".into(),
+                },
+                expected: PreviousValue::Any,
+                new: gix::refs::Target::Object(oid),
+            },
+            name: gix::refs::FullName::try_from(name).map_err(gerr)?,
+            deref: false,
+        })
     }
 
     pub(crate) fn delete_ref(&self, name: &str) -> Result<()> {
-        if let Some(r) = self.git.try_find_reference(name).map_err(gerr)? {
-            r.delete().map_err(gerr)?;
+        use gix::refs::transaction::{Change, PreviousValue, RefEdit, RefLog};
+        if self.git.try_find_reference(name).map_err(gerr)?.is_none() {
+            return Ok(());
         }
+        self.edit_refs(RefEdit {
+            change: Change::Delete {
+                expected: PreviousValue::MustExist,
+                log: RefLog::AndReference,
+            },
+            name: gix::refs::FullName::try_from(name).map_err(gerr)?,
+            deref: false,
+        })
+    }
+
+    fn edit_refs(&self, edit: gix::refs::transaction::RefEdit) -> Result<()> {
+        let sig = colocate::veil_signature();
+        let mut buf = gix::date::parse::TimeBuf::default();
+        self.git.edit_references_as([edit], Some(sig.to_ref(&mut buf))).map_err(gerr)?;
         Ok(())
     }
 

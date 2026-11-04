@@ -318,7 +318,8 @@ impl PushLine {
     }
 }
 
-fn sig() -> gix::actor::Signature {
+/// The committer of Veil's reflog entries.
+pub(crate) fn veil_signature() -> gix::actor::Signature {
     gix::actor::Signature {
         name: "Veil".into(),
         email: "veil@localhost".into(),
@@ -433,7 +434,7 @@ impl GitBridge {
             // A lock held by Git, or a value that moved: skipped.
             Err(_) => return Ok(false),
         };
-        let s = sig();
+        let s = veil_signature();
         let mut buf = gix::date::parse::TimeBuf::default();
         match prepared.commit(Some(s.to_ref(&mut buf))) {
             Ok(_) => Ok(true),
@@ -772,6 +773,7 @@ impl GitBridge {
                     Ok(vp) => match crate::tree::lookup(repo.store(), &s.tree, &vp) {
                         Ok(Some(e)) if !e.visibility.is_public() => e.visibility.label(),
                         Ok(Some(e)) if e.fallback.is_some() => "edited on a cloaked line".into(),
+                        Ok(Some(_)) => "differs from what Veil records".into(),
                         _ => "not public in Veil".into(),
                     },
                     Err(_) => "not representable in Veil".into(),
@@ -915,8 +917,15 @@ impl GitBridge {
                 _ => None,
             };
             let same = now.commit == Some(hc) && now.symbolic == want_sym;
+            // The branch HEAD names moved in Git since Veil last saw it (a
+            // `git commit` racing this command): HEAD stays, or the next
+            // commit would land on a detached HEAD.
+            let branch_moved = now.symbolic.as_ref().is_some_and(|b| {
+                let seen = state.refs.get(b).and_then(|h| GitOid::from_hex(h.as_bytes()).ok());
+                seen != now.commit && !(seen.is_none() && now.commit.is_none())
+            });
             if !same {
-                if expected.is_some_and(|e| *e != now) {
+                if expected.is_some_and(|e| *e != now) || branch_moved {
                     report
                         .notes
                         .push("HEAD changed in Git since this command started; Veil follows it next command".into());

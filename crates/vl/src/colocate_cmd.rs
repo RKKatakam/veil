@@ -348,6 +348,10 @@ fn follow_head(ctx: &mut Ctx, bridge: &GitBridge, state: &State, target: ObjectI
         ctx.restore(&old_tree, &plan.tree, &|p: &VPath| write.contains(p))?;
     }
     ctx.set_materialised_snapshot(new)?;
+    // Recorded now, with `.veilpolicy` as incoming: Git wrote it (a pull,
+    // a checkout), so it is guarded by the accepted policy like any
+    // incoming change, never taken as the member's own edit (threat 16).
+    ctx.snapshot_restored("follow a Git checkout".into(), true, &[])?;
     let change = ctx.repo.snapshot(&new)?.change_id;
     eprintln!(
         "{} Git HEAD to {}: the working copy is now change {} on it",

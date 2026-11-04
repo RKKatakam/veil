@@ -431,7 +431,9 @@ pub fn gitignore_to_policy(dir: &str, pattern: &str) -> Option<String> {
 /// imported: they are this user's, not the project's.
 pub fn import_gitignore(root: &Path, git_dir: &Path) -> Result<Vec<ImportedPattern>> {
     let mut ls = git_cmd(root, git_dir);
-    ls.args(["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory", "--no-empty-directory"]);
+    // Every file (not `--directory`: an untracked directory would hide
+    // the ignored ones inside it).
+    ls.args(["ls-files", "-z", "--others", "--ignored", "--exclude-standard"]);
     let listed = run_git(ls, None, "ls-files")?;
     let paths: Vec<&[u8]> = listed.split(|b| *b == 0).filter(|p| !p.is_empty()).collect();
     if paths.is_empty() {
