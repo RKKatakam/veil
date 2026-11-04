@@ -22,6 +22,7 @@ Options:
 | `-t, --tag <TAG>` | Only push these tags |
 | `--force` | Overwrite tags that diverged on the remote |
 | `--full` | Walk and verify every object instead of skipping what the remote provably has (repairs damaged or missing objects on the remote) |
+| `-d, --delete <TAG>` | Delete this tag on the remote (repeatable). Delete it here first with `vl tag delete`. Refused if someone moved it there since (unless --force). With no --tag, nothing else is pushed |
 
 ---
 

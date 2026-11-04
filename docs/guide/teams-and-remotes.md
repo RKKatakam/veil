@@ -34,7 +34,14 @@ origin  team  ../hub
 | SSH URL | `ssh://alice@build.example.com:2222/srv/veil/proj`, `ssh://host/~/repos/proj` |
 
 * The remote doesn't need to exist: the first `vl push` creates it (also
-  when several people push to the new remote at once).
+  when several people push to the new remote at once). It creates one only
+  in a new or empty directory: a push to a directory that holds other files
+  and is not a Veil repository (a typo, `../proj` for `../proj.veil`) is
+  refused.
+* A remote name is letters, digits, `-`, `_` and `.` (not first), as in
+  `origin`: it becomes the `NAME/` of the remote tags. A Veil remote and a
+  [Git remote](github.md) can't share a name, since both record
+  `NAME/TAG` remote tags.
 * `~` and `~/` mean your home directory on the server, as with Git and
   `scp`. `~user` (another account's home) is refused: write the absolute
   path.
@@ -43,8 +50,8 @@ origin  team  ../hub
   replaces the command.
 * Cloaked content is encrypted before it leaves your machine. The server
   only ever stores ciphertext for it.
-* `vl remote rm NAME` removes a remote from the configuration (not the
-  remote's data).
+* `vl remote rm NAME` removes a remote from the configuration, and its
+  `NAME/TAG` remote tags (not the remote's data).
 
 ## Team remotes and public remotes
 
@@ -79,7 +86,8 @@ Pulled 3 object(s) from origin
 |---|---|
 | `vl push [REMOTE] [-t TAG…]` | Send tags (all by default) and their history. `REMOTE` defaults to `origin` |
 | `vl push --force` | Overwrite tags that diverged on the remote |
-| `vl pull [REMOTE]` | Fetch tags and history; update `REMOTE/TAG` and fast-forward local tags |
+| `vl push --delete TAG` | Delete `TAG` on the remote (delete it here first with `vl tag delete TAG`). See [Deleting a tag](#deleting-a-tag) |
+| `vl pull [REMOTE]` | Fetch tags and history; update `REMOTE/TAG` (removing those of tags gone from the remote) and create or fast-forward local tags |
 | `vl push --full` / `vl pull --full` | Walk and verify every object instead of trusting what the other side has; repairs damaged or missing objects |
 
 Like everywhere in Veil, **only tags travel**, and **a pull never moves
@@ -90,7 +98,7 @@ your working copy**: `vl rebase -d main` after pulling.
 ```text
 $ vl push
   rejected main (remote has diverged: not a fast-forward)
-Pushed 23 object(s) to origin
+Pushed 0 object(s) to origin
 error: 1 tag was rejected (main): origin has changes you don't have. Run `vl pull origin`, `vl merge origin/main`, and push again (or `vl push --force` to overwrite them)
 $ vl pull
 warning: tag 'main' has diverged from origin/main; merge with `vl merge origin/main`
@@ -107,6 +115,41 @@ does, so a script can tell "partially rejected" (1) from "nothing to do"
 push of all tags (a cloaked tag on a public remote, a tag that would
 publish an unreleased embargo), but a tag you named with `-t` that is
 held back does.
+
+The history of a rejected tag is not sent: which tags the remote takes is
+decided before anything is uploaded, so retrying a rejected push doesn't
+grow the remote.
+
+### Deleting a tag
+
+A plain `vl push` never deletes anything on the remote. To delete a tag
+there, delete it here, then push the deletion:
+
+```text
+$ vl tag delete experiment
+Deleted tag experiment
+$ vl push --delete experiment
+  deleted experiment on origin
+```
+
+* **A tag you deleted stays deleted.** The next `vl pull` doesn't bring it
+  back while the remote's tag is still where it was (`kept deleted
+  experiment`), and `origin/experiment` keeps showing what the remote holds
+  until you delete it there. If a teammate moves the tag on the remote to
+  work you haven't seen, the pull brings it back and says so: new work is
+  never hidden by an old deletion.
+* **Deleting on the remote is refused if someone moved the tag since** (to
+  work you haven't seen): pull first, or add `--force`. A tag the remote
+  doesn't have is not an error.
+* **A pull removes `REMOTE/TAG` for tags the remote no longer has**
+  (`pruned origin/experiment`). Your own tag of that name is kept, with a
+  warning: delete it too, or your next `vl push` publishes it again.
+* History is not deleted. The remote's snapshots stay until nothing
+  references them and `vl -R <remote> gc` prunes them (see
+  [Maintenance](maintenance.md)); every clone keeps what it pulled.
+
+The same holds for GitHub: `vl git push --delete BRANCH` (see
+[Using Veil with GitHub](github.md)).
 
 Concurrent pushes to one remote are serialised by a lock on the remote. A
 client that crashes mid-push leaves a lease that the next push takes over

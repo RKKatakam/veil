@@ -1364,7 +1364,10 @@ what the other provably has (`remote.rs` has the details):
   remote's pack directory inside its transaction: the pack unsynced, a
   barrier, then the index durably. A crash leaves at worst an invisible
   pack (no index) or a complete one whose operation never landed. Tag
-  fast-forward checks run on the local graph too.
+  fast-forward checks run on the local graph too, under the remote's lock
+  and **before anything is sent**: the history of a rejected tag is not
+  uploaded, since the remote's committed view would never reach it and
+  every retry would send it again as a new pack (BUG-288).
 * **Pull** lists the remote's objects (pack indexes and loose fan-out
   directories, many requests in flight), skips every snapshot the local
   committed view reaches, and at the first object it lacks downloads, in
@@ -1414,6 +1417,30 @@ that shared subtrees cannot hide depth. Remote tags with an invalid name, or
 whose target is missing or not a snapshot, are skipped with a warning. Tags
 fast-forward. A diverged tag is reported and left alone
 (`--force` overrides on push).
+
+**Deleting tags (BUG-280).** A plain push never deletes anything remotely;
+`remote::delete_remote_tags` (`vl push --delete`) and
+`git::push_with_deletions` (`vl git push --delete`) do, for tags already
+deleted locally, leased: refused when the remote's tag moved to work the
+deleting repository has not seen (Git: a `--force-with-lease` delete). On a
+Veil remote the deleted tag's target also leaves `heads`, so `vl -R
+<remote> gc` can prune it. Pull prunes `<remote>/<tag>` for tags gone from
+the remote and keeps a local tag of that name (a teammate's deletion never
+deletes yours). A local deletion sticks, the way jj tracks a deleted
+bookmark against its remote bookmark: `vl tag delete` records the tag and
+its target in `.veil/local/deleted_tags.json` (`remote::deleted_tags`;
+repository-local, outside the view, so no format change), and pull and
+`vl git pull` do not recreate the tag while the remote's tag is that
+target or behind it. When the remote moved past it, the tag comes back
+with a warning and the record goes. Records are dropped once the tag
+exists locally again.
+
+**Removing remotes.** `vl remote rm` and `vl git remote rm` drop the
+remote tags `<name>/*` (and the bridge's tracking refs) in one operation,
+then remove the remote from its configuration, so an interruption leaves
+a configured remote to remove again, never remote tags of a remote that is
+gone. Remote names are validated (`remote::validate_remote_name`), and a
+Veil remote and a Git remote never share a name.
 
 **Names a remote cannot hijack.** Revsets resolve tags before change ids,
 and change ids are visible to every reader of a remote. So `pull` (like
@@ -1896,8 +1923,14 @@ Each commit becomes a snapshot:
 * **description**: the message, plaintext (it is public in Git already);
 * **change id**: the `change-id` header (Jujutsu), unless a visible change
   already has that id (a forged header must not make the user's change
-  divergent), otherwise derived from the commit id, so re-importing gives
-  the same snapshot id (the importer's signature is deterministic too);
+  divergent), otherwise derived from the commit id;
+* **no signature**: the snapshot is a function of the commit and of what
+  Veil holds for its parents, never of who imported it or when. Every
+  member who imports the same commit (each from GitHub, before syncing
+  with the others) gets the same snapshot id, so the team remote sees one
+  change, not two divergent copies that a merge would then export to Git
+  twice (BUG-285). Re-importing after the mapping was lost gives the same
+  id too;
 * **tree**, as a three-way merge (`merge::merge_trees`):
   * `ours` = the parents' Veil tree (`Repo::parents_tree`): everything,
     cloaked and embargoed content included;

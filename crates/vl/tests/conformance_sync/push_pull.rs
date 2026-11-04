@@ -70,7 +70,6 @@ fn the_first_push_creates_the_remote_including_parent_directories() {
 
 // Scenario from git t5516-fetch-push.sh: "push to a non-repository" fails rather than creating one.
 #[test]
-#[ignore = "BUG-283: `vl push` to an existing non-empty directory that is not a Veil repository turns it into one"]
 fn push_to_a_non_empty_directory_that_is_not_a_repository_is_refused() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a", "a\n")]);
@@ -222,7 +221,6 @@ fn after_a_rejection_merge_and_push_again() {
 // Scenario from git t5404 / jj test_git_push.rs: a retried rejected push does not re-send
 // what the first attempt already sent.
 #[test]
-#[ignore = "BUG-288: every rejected push re-sends the rejected tag's objects as a new pack on the remote"]
 fn a_retried_rejected_push_sends_nothing_new() {
     let env = Env::new();
     let (alice, hub, bob) = team(&env);
@@ -346,9 +344,10 @@ fn a_rejected_push_leaves_the_remote_tag_alone() {
 }
 
 // Scenario from git t5404-tracking-branches.sh: "deleted branches have their tracking branches
-// removed"; jj test_git_push.rs: `jj git push --deleted`. Veil has no way to delete a remote tag.
+// removed"; jj test_git_push.rs: `jj git push --deleted`. Deleting on the remote is explicit
+// (`vl push --delete`, as `git push --delete`): a plain push never deletes there (control:
+// `deleting_a_local_tag_never_removes_history_from_the_remote`).
 #[test]
-#[ignore = "BUG-280: a deleted tag is never deleted on the remote, and the next pull recreates it locally"]
 fn a_deleted_tag_stays_deleted_after_push_and_pull() {
     let env = Env::new();
     let (alice, hub, bob) = team(&env);
@@ -356,7 +355,18 @@ fn a_deleted_tag_stays_deleted_after_push_and_pull() {
     env.ok("alice", &alice, &["push"]);
     env.ok("bob", &bob, &["pull"]);
     env.ok("alice", &alice, &["tag", "delete", "feature"]);
+    // A plain push and pull leave the remote's tag alone, and the local deletion sticks.
     env.ok("alice", &alice, &["push"]);
+    let out = env.ok("alice", &alice, &["pull"]);
+    assert!(
+        !env.tags("alice", &alice).contains(&"feature".to_string()),
+        "pull recreated the deleted tag: {out}"
+    );
+    assert!(open_repo(&hub).view().tags.contains_key("feature"));
+    env.ok("alice", &alice, &["push", "--delete", "feature"]);
+    assert!(!env
+        .tags("alice", &alice)
+        .contains(&"origin/feature".to_string()));
     env.ok("alice", &alice, &["pull"]);
     assert!(
         !env.tags("alice", &alice).contains(&"feature".to_string()),
@@ -374,10 +384,65 @@ fn a_deleted_tag_stays_deleted_after_push_and_pull() {
     );
 }
 
-// Scenario from git t5510-fetch.sh: "fetch --prune" removes remote-tracking refs gone on the remote.
-// Here the remote is replaced by one without the tag (Veil cannot delete a remote tag, BUG-280).
+// Veil (BUG-280 design, after jj's deleted-but-tracked bookmarks): a tag deleted here comes
+// back when a teammate moves it on the remote to work this repository has not seen.
 #[test]
-#[ignore = "BUG-280: remote tags of tags gone from the remote are never pruned by `vl pull`"]
+fn a_deleted_tag_comes_back_when_a_teammate_moves_it_on_the_remote() {
+    let env = Env::new();
+    let (alice, _hub, bob) = team(&env);
+    env.ok("alice", &alice, &["tag", "set", "feature", "-r", "main"]);
+    env.ok("alice", &alice, &["push"]);
+    env.ok("bob", &bob, &["pull"]);
+    env.ok("alice", &alice, &["tag", "delete", "feature"]);
+    let out = env.ok("alice", &alice, &["pull"]);
+    assert!(out.contains("kept deleted feature"), "{out}");
+    env.commit("bob", &bob, "more", &[("f.txt", "f\n")]);
+    env.ok("bob", &bob, &["tag", "set", "feature", "-r", "@-"]);
+    env.ok("bob", &bob, &["push"]);
+    let out = env.ok("alice", &alice, &["pull"]);
+    assert!(out.contains("it is back"), "{out}");
+    assert_eq!(
+        env.tag_target("alice", &alice, "feature"),
+        env.tag_target("bob", &bob, "feature")
+    );
+}
+
+// Veil (BUG-280 design, like `git push --force-with-lease --delete`): deleting a tag that a
+// teammate moved since is refused without --force.
+#[test]
+fn push_delete_is_refused_when_the_remote_moved_the_tag() {
+    let env = Env::new();
+    let (alice, hub, bob) = team(&env);
+    env.ok("alice", &alice, &["tag", "set", "feature", "-r", "main"]);
+    env.ok("alice", &alice, &["push"]);
+    env.ok("bob", &bob, &["pull"]);
+    env.commit("bob", &bob, "more", &[("f.txt", "f\n")]);
+    env.ok("bob", &bob, &["tag", "set", "feature", "-r", "@-"]);
+    env.ok("bob", &bob, &["push"]);
+    env.ok("alice", &alice, &["tag", "delete", "feature"]);
+    let (code, out) = env.code("alice", &alice, &["push", "--delete", "feature"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(open_repo(&hub).view().tags.contains_key("feature"));
+    env.ok("alice", &alice, &["push", "--delete", "feature", "--force"]);
+    assert!(!open_repo(&hub).view().tags.contains_key("feature"));
+    // Deleting again is not an error: the remote is as asked.
+    env.ok("alice", &alice, &["push", "--delete", "feature"]);
+}
+
+// Veil: `vl push --delete` of a tag that still exists here is refused (the next push would
+// publish it again), and touches nothing.
+#[test]
+fn push_delete_of_a_tag_that_still_exists_here_is_refused() {
+    let env = Env::new();
+    let (alice, hub, _bob) = team(&env);
+    let out = env.fails("alice", &alice, &["push", "--delete", "main"]);
+    assert!(out.contains("vl tag delete main"), "{out}");
+    assert!(open_repo(&hub).view().tags.contains_key("main"));
+}
+
+// Scenario from git t5510-fetch.sh: "fetch --prune" removes remote-tracking refs gone on the remote.
+// Here the remote is replaced by one without the tag.
+#[test]
 fn pull_prunes_remote_tags_that_are_gone_from_the_remote() {
     let env = Env::new();
     let (alice, _hub, _bob) = team(&env);
@@ -611,7 +676,6 @@ fn push_into_a_repository_with_a_working_copy_moves_tags_only() {
 
 // Scenario from git t5516-fetch-push.sh: "fetch/push from a bare repository" with `-R`.
 #[test]
-#[ignore = "BUG-284: `vl -R <bare remote>` fails for every command but fsck (`not found: workspace 'default'`)"]
 fn read_only_commands_and_gc_work_on_a_bare_remote() {
     let env = Env::new();
     let (_alice, hub, _bob) = team(&env);
@@ -621,6 +685,29 @@ fn read_only_commands_and_gc_work_on_a_bare_remote() {
     assert!(tags.contains("main"), "{tags}");
     env.ok("alice", &env.root, &["-R", h, "log"]);
     env.ok("alice", &env.root, &["-R", h, "gc"]);
+}
+
+// Veil (BUG-284): commands that need a working copy are refused in a bare repository with a
+// clear message, and nothing is written there.
+#[test]
+fn working_copy_commands_are_refused_on_a_bare_remote() {
+    let env = Env::new();
+    let (_alice, hub, _bob) = team(&env);
+    let h = hub.to_str().unwrap();
+    let ops = op_count(&hub);
+    for args in [
+        &["status"][..],
+        &["new", "main"],
+        &["tag", "set", "x", "-r", "main"],
+    ] {
+        let mut full = vec!["-R", h];
+        full.extend_from_slice(args);
+        let out = env.fails("alice", &env.root, &full);
+        assert!(out.contains("bare repository"), "{args:?}: {out}");
+    }
+    assert_eq!(op_count(&hub), ops);
+    let out = env.ok("alice", &env.root, &["-R", h, "show", "main"]);
+    assert!(out.contains("Change"), "{out}");
 }
 
 // Scenario from jj test_git_push.rs: pushing from two workspaces of one repository.

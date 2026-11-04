@@ -353,6 +353,11 @@ pub enum Cmd {
         /// provably has (repairs damaged or missing objects on the remote).
         #[arg(long)]
         full: bool,
+        /// Delete this tag on the remote (repeatable). Delete it here first
+        /// with `vl tag delete`. Refused if someone moved it there since
+        /// (unless --force). With no --tag, nothing else is pushed.
+        #[arg(short, long, value_name = "TAG")]
+        delete: Vec<String>,
     },
     /// Fetch tags and history from a remote.
     Pull {
@@ -735,6 +740,12 @@ pub enum GitCmd {
         /// hold what was last fetched).
         #[arg(long)]
         force: bool,
+        /// Delete this branch on the Git remote (repeatable). Delete its tag
+        /// here first with `vl tag delete`. Refused if the branch moved since
+        /// the last fetch (unless --force). With no --tag, nothing else is
+        /// pushed.
+        #[arg(short, long, value_name = "BRANCH")]
+        delete: Vec<String>,
     },
     /// Export tags into the local bridge repository without pushing, and
     /// print the commit of each.

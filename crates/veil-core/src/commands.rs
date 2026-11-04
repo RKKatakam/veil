@@ -630,10 +630,13 @@ impl Repo {
 
     pub fn delete_tag(&mut self, name: &str) -> Result<()> {
         let mut tx = self.transaction(format!("delete tag {name}"))?;
-        tx.view
+        let old = tx
+            .view
             .tags
             .remove(name)
             .ok_or_else(|| VeilError::NotFound(format!("tag '{name}'")))?;
+        // So that the next pull does not bring it back (BUG-280).
+        crate::remote::record_tag_deletion(&**tx.repo().backend(), name, old.target)?;
         tx.commit()?;
         Ok(())
     }

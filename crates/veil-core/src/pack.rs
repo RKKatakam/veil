@@ -535,6 +535,42 @@ fn decompress(data: &[u8], raw_len: u64, dict: Option<&[u8]>) -> std::result::Re
 
 // ---- writing ----------------------------------------------------------------
 
+/// Above this much base plus object, a delta is compressed with the base
+/// as a *prefix* and long-distance matching (see [`delta_compress`]).
+const LONG_DELTA: usize = 2 << 20;
+
+/// Largest zstd window a delta may use: 2^27 (128 MiB) is the most every
+/// zstd decoder accepts by default, so packs stay readable by every vl.
+const MAX_DELTA_WINDOW_LOG: u32 = 27;
+
+/// zstd-compress `raw` against `base` (a delta entry; read back with
+/// `base` as a raw-content dictionary).
+///
+/// A dictionary is only indexed as far as the compression level's tables
+/// reach: at the default level its matches stop a few MiB back, so for a
+/// large file a small edit compressed no better than the file alone
+/// (BUG-290). For large inputs the base is therefore referenced as a prefix
+/// (what `zstd --patch-from` does): the window is sized to cover base and
+/// object (up to [`MAX_DELTA_WINDOW_LOG`]) and long-distance matching finds
+/// matches anywhere in it. Decoding is unchanged: a prefix and a raw-content
+/// dictionary are the same history to the decoder. Memory stays bounded by
+/// the window cap: the long-distance table adds a few MiB per delta being
+/// compressed, on top of the base and object already in memory.
+fn delta_compress(level: i32, base: &[u8], raw: &[u8]) -> std::io::Result<Vec<u8>> {
+    if base.len() + raw.len() <= LONG_DELTA {
+        return zstd::bulk::Compressor::with_dictionary(level, base)?.compress(raw);
+    }
+    use zstd::zstd_safe::CParameter;
+    let zerr = |code: usize| std::io::Error::other(zstd::zstd_safe::get_error_name(code));
+    let total = base.len() + raw.len();
+    let window_log = (usize::BITS - total.leading_zeros()).clamp(10, MAX_DELTA_WINDOW_LOG);
+    let mut c = zstd::bulk::Compressor::new(level)?;
+    c.set_parameter(CParameter::WindowLog(window_log))?;
+    c.set_parameter(CParameter::EnableLongDistanceMatching(true))?;
+    c.context_mut().ref_prefix(base).map_err(zerr)?;
+    c.compress(raw)
+}
+
 /// What a pack ended up containing.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PackStats {
@@ -622,8 +658,7 @@ impl PackBuilder {
                     && bdepth.is_some_and(|d| d < self.max_depth)
                     && Object::sealed_scope(braw).is_none();
                 if usable {
-                    let mut c = zstd::bulk::Compressor::with_dictionary(self.level, braw).map_err(zerr)?;
-                    let delta = c.compress(raw).map_err(zerr)?;
+                    let delta = delta_compress(self.level, braw, raw).map_err(zerr)?;
                     // Worth a dependency only if clearly smaller.
                     if delta.len() + 32 + delta.len() / 8 < best.1.len() {
                         best = (EntryKind::Delta, delta, Some(*bid), bdepth.unwrap() + 1);
@@ -700,6 +735,39 @@ mod tests {
         assert!(PackIndex::decode(&enc[..enc.len() - 1]).is_err());
     }
 
+    /// BUG-290: a small edit of a large file is stored as a small delta,
+    /// and reads back.
+    #[test]
+    fn large_deltas_are_small() {
+        let fs = MemoryBackend::new();
+        let dir = VPath::new("p").unwrap();
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let base: Vec<u8> = (0..6 << 20)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect();
+        let mut edited = base.clone();
+        for b in &mut edited[1000..1064] {
+            *b ^= 0x5a;
+        }
+        let (b_id, b_raw) = blob(&base);
+        let (e_id, e_raw) = blob(&edited);
+        let mut pb = PackBuilder::new(DEFAULT_LEVEL).unwrap();
+        pb.add(b_id, &b_raw, None).unwrap();
+        pb.add(e_id, &e_raw, Some((&b_id, &b_raw))).unwrap();
+        let (name, stats) = pb.finish(&fs, &dir).unwrap().unwrap();
+        assert_eq!(stats.deltas, 1);
+        assert!(stats.pack_bytes < (6 << 20) + (64 << 10), "{stats:?}");
+        let pack = Pack::open(&fs, &dir, &name).unwrap();
+        let cache = LruCache::new(1 << 20);
+        assert_eq!(pack.get(&fs, &e_id, &cache).unwrap().unwrap(), e_raw);
+        pack.verify(&fs).unwrap();
+    }
+
     #[test]
     fn deltas_round_trip() {
         let fs = MemoryBackend::new();
@@ -721,3 +789,4 @@ mod tests {
         pack.verify(&fs).unwrap();
     }
 }
+

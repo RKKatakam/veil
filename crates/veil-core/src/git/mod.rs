@@ -291,18 +291,10 @@ fn save_remotes(repo: &Repo, r: &BTreeMap<String, String>) -> Result<()> {
 }
 
 /// Check a Git remote name: it becomes part of ref names and of Veil
-/// remote-tag names (`<remote>/<branch>`).
+/// remote-tag names (`<remote>/<branch>`). The same rule as for Veil
+/// remotes ([`crate::remote::validate_remote_name`]).
 pub fn validate_remote_name(name: &str) -> Result<()> {
-    let ok = !name.is_empty()
-        && !name.starts_with(['-', '.'])
-        && !name.ends_with(".lock")
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-        && !name.contains("..");
-    if ok {
-        Ok(())
-    } else {
-        Err(VeilError::repo(format!("invalid Git remote name '{name}'")))
-    }
+    crate::remote::validate_remote_name(name)
 }
 
 /// Is `url` a local path to `git` (not `scheme://…` nor scp-style
@@ -354,7 +346,7 @@ pub fn remote_add(repo: &mut Repo, name: &str, url: &str) -> Result<()> {
             "Git remote path {url:?} is relative; give an absolute path"
         )));
     }
-    if repo.config().remotes.contains_key(name) {
+    if crate::repo::read_config(&**repo.backend())?.remotes.contains_key(name) {
         return Err(VeilError::repo(format!(
             "'{name}' is already the name of a Veil remote; Git remotes share its `{name}/<branch>` names, pick another"
         )));
@@ -368,22 +360,48 @@ pub fn remote_add(repo: &mut Repo, name: &str, url: &str) -> Result<()> {
     save_remotes(repo, &r)
 }
 
+/// Remove Git remote `name`: its remote tags `<name>/*` and the bridge's
+/// tracking refs first, in one operation, then the remote itself, so that
+/// an interruption leaves the remote configured (a retry finishes the
+/// job), never remote tags of a remote that is gone (BUG-291).
 pub fn remote_remove(repo: &mut Repo, git_dir: &Path, name: &str) -> Result<()> {
-    let _lock = crate::lock::RepoLock::acquire_reentrant(repo.backend().clone())?;
-    let mut r = remotes(repo)?;
-    if r.remove(name).is_none() {
-        return Err(VeilError::NotFound(format!("Git remote '{name}'")));
+    let url = remotes(repo)?
+        .get(name)
+        .cloned()
+        .ok_or_else(|| VeilError::NotFound(format!("Git remote '{name}'")))?;
+    let mut tx = repo.transaction(format!("remove Git remote {name}"))?;
+    let prefix = format!("{name}/");
+    tx.view.remote_tags.retain(|k, _| !k.starts_with(&prefix));
+    tx.manual_undo(format!(
+        "Git remotes live in .veil/git/remotes.json, outside the operation log; add it back with \
+         `vl git remote add {name} {}` (its remote tags come back with the next fetch)",
+        redact_url(&url)
+    ));
+    drop_tracking_refs(tx.repo(), git_dir, name)?;
+    tx.commit()?;
+    forget_remote(repo, name)
+}
+
+/// Delete the bridge's `refs/remotes/<name>/*` (a cache of what was last
+/// fetched; nothing else refers to it).
+fn drop_tracking_refs(repo: &Repo, git_dir: &Path, name: &str) -> Result<()> {
+    if !git_dir.exists() {
+        return Ok(());
     }
-    save_remotes(repo, &r)?;
     let bridge = GitBridge::open(repo, git_dir)?;
     for b in bridge.refs_under(&format!("refs/remotes/{name}/"))?.keys() {
         bridge.delete_ref(&format!("refs/remotes/{name}/{b}"))?;
     }
-    drop(bridge);
-    let mut tx = repo.transaction(format!("remove Git remote {name}"))?;
-    let prefix = format!("{name}/");
-    tx.view.remote_tags.retain(|k, _| !k.starts_with(&prefix));
-    tx.commit()?;
+    Ok(())
+}
+
+/// Remove `name` from `.veil/git/remotes.json` (under the repository lock).
+fn forget_remote(repo: &Repo, name: &str) -> Result<()> {
+    let _lock = crate::lock::RepoLock::acquire(repo.backend().clone())?;
+    let mut r = remotes(repo)?;
+    if r.remove(name).is_some() {
+        save_remotes(repo, &r)?;
+    }
     Ok(())
 }
 
@@ -446,7 +464,17 @@ pub fn import(repo: &mut Repo, git_dir: &Path, url: &str, remote: &str) -> Resul
                 redact_url(u)
             )))
         }
-        None => remote_add(repo, remote, url)?,
+        None => {
+            remote_add(repo, remote, url)?;
+            // A failed first import (a typo in the URL, a network error)
+            // takes back the remote it added, so that a retry with the
+            // right URL is not refused (BUG-292). Nothing else was recorded:
+            // the pull's transaction never committed.
+            return pull(repo, git_dir, remote).inspect_err(|_| {
+                let _ = drop_tracking_refs(repo, git_dir, remote);
+                let _ = forget_remote(repo, remote);
+            });
+        }
     }
     pull(repo, git_dir, remote)
 }
@@ -474,6 +502,23 @@ fn fetch_inner(repo: &mut Repo, git_dir: &Path, remote: &str, update_tags: bool)
         .collect();
     let tips: Vec<GitOid> = after.values().copied().collect();
     report.import = bridge.import_tips(&mut tx, &tips)?;
+    // Tags deleted here stay deleted while their branch has not moved
+    // (`remote::deleted_tags`, BUG-280).
+    let (stay_deleted, recreated) = if update_tags {
+        let imported: Vec<(String, ObjectId)> = after
+            .iter()
+            .filter_map(|(b, oid)| bridge.snapshot_of(oid).map(|sid| (b.clone(), sid)))
+            .collect();
+        crate::remote::tags_staying_deleted(&tx, &imported)?
+    } else {
+        Default::default()
+    };
+    for name in recreated {
+        report.warnings.push(format!(
+            "tag '{name}', deleted here, has new commits on Git branch {remote}/{name}: it is back. \
+             Delete it again, or delete the branch too with `vl git push {remote} --delete {name}`"
+        ));
+    }
     let mut revisions = RevisionNames::default();
     for (branch, oid) in &after {
         let name = format!("{remote}/{branch}");
@@ -509,7 +554,7 @@ fn fetch_inner(repo: &mut Repo, git_dir: &Path, remote: &str, update_tags: bool)
         }
         tx.view.remote_tags.insert(name.clone(), sid);
         report.branches.push((name, sid));
-        if update_tags {
+        if update_tags && !(stay_deleted.contains(branch) && !tx.view.tags.contains_key(branch)) {
             update_tag(&mut tx, remote, branch, sid, &mut revisions, &mut report)?;
         }
     }
@@ -581,15 +626,54 @@ pub struct PushReport {
 /// and merge first); with `force` it is overwritten, but only if it still
 /// holds what was last fetched (`--force-with-lease`).
 pub fn push(repo: &mut Repo, git_dir: &Path, remote: &str, only_tags: &[String], force: bool) -> Result<PushReport> {
+    push_with_deletions(repo, git_dir, remote, only_tags, force, &[])
+}
+
+/// [`push`], also deleting the branches `delete` on the remote (`vl git
+/// push --delete`, BUG-280); their tags must already be deleted here
+/// (`vl tag delete`). When no tag is named, only the deletions are pushed.
+/// A deletion is leased like a forced push: it is rejected if the branch
+/// has moved since it was last fetched (`force` deletes it regardless).
+/// The branch's remote tag goes too; local tags deleted here stay deleted
+/// on the next pull (`remote::deleted_tags`).
+pub fn push_with_deletions(
+    repo: &mut Repo,
+    git_dir: &Path,
+    remote: &str,
+    only_tags: &[String],
+    force: bool,
+    delete: &[String],
+) -> Result<PushReport> {
+    for d in delete {
+        if repo.view().tags.contains_key(d) {
+            return Err(VeilError::repo(format!(
+                "tag '{d}' still exists here; delete it first with `vl tag delete {d}` (a later `vl git push` would push it again)"
+            )));
+        }
+        validate_tag_name(d)?;
+    }
     let url = remote_url(repo, git_dir, remote)?;
     let mut bridge = GitBridge::open(repo, git_dir)?;
-    let export = bridge.export(repo, only_tags)?;
+    let export = if delete.is_empty() || !only_tags.is_empty() {
+        bridge.export(repo, only_tags)?
+    } else {
+        ExportReport::default()
+    };
     let mut updates = Vec::new();
     for (branch, commit) in &export.branches {
         let tracking = format!("refs/remotes/{remote}/{branch}");
         updates.push(transport::PushRef {
             branch: branch.clone(),
-            commit: *commit,
+            commit: Some(*commit),
+            force,
+            lease: bridge.get_ref(&tracking)?,
+        });
+    }
+    for d in delete {
+        let tracking = format!("refs/remotes/{remote}/{d}");
+        updates.push(transport::PushRef {
+            branch: d.clone(),
+            commit: None,
             force,
             lease: bridge.get_ref(&tracking)?,
         });
@@ -603,8 +687,13 @@ pub fn push(repo: &mut Repo, git_dir: &Path, remote: &str, only_tags: &[String],
             continue;
         }
         let Some(u) = updates.iter().find(|u| &u.branch == branch) else { continue };
-        bridge.set_ref(&format!("refs/remotes/{remote}/{branch}"), u.commit)?;
-        if let Some(sid) = bridge.snapshot_of(&u.commit) {
+        let Some(commit) = u.commit else {
+            bridge.delete_ref(&format!("refs/remotes/{remote}/{branch}"))?;
+            tx.view.remote_tags.remove(&format!("{remote}/{branch}"));
+            continue;
+        };
+        bridge.set_ref(&format!("refs/remotes/{remote}/{branch}"), commit)?;
+        if let Some(sid) = bridge.snapshot_of(&commit) {
             tx.view.remote_tags.insert(format!("{remote}/{branch}"), sid);
         }
     }

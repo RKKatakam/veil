@@ -125,11 +125,27 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Scan { policy_from: Some(file) } => cmd_scan_gate(cli.repository.as_deref(), file),
         _ => {
             let mut ctx = open(&cli)?;
+            if ctx.bare && !runs_in_a_bare_repository(&cli.cmd) {
+                bail!(
+                    "{} is a bare repository (a remote): it has no working copy. Here `vl -R` runs only \
+                     `log`, `show`, `tag list`, `op log`, `gc` and `fsck`",
+                    ctx.root.display()
+                );
+            }
             let code = dispatch(&mut ctx, &cli)?;
             ctx.finish()?;
             Ok(code)
         }
     }
+}
+
+/// The commands that work in a bare repository (BUG-284): they read
+/// history, or garbage-collect it, and never need a working copy.
+fn runs_in_a_bare_repository(cmd: &Cmd) -> bool {
+    matches!(
+        cmd,
+        Cmd::Log { .. } | Cmd::Show { .. } | Cmd::Tag(TagCmd::List) | Cmd::Op(OpCmd::Log { .. }) | Cmd::Gc { .. }
+    )
 }
 
 fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
@@ -350,7 +366,13 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         }
         Cmd::Watch { interval_ms } => cmd_watch(ctx, *interval_ms)?,
         Cmd::Remote(c) => cmd_remote(ctx, c)?,
-        Cmd::Push { remote, tag, force, full } => return cmd_push(ctx, remote, tag, *force, *full),
+        Cmd::Push {
+            remote,
+            tag,
+            force,
+            full,
+            delete,
+        } => return cmd_push(ctx, remote, tag, *force, *full, delete),
         Cmd::Pull { remote, full } => cmd_pull(ctx, remote, *full)?,
         Cmd::Git(c) => return cmd_git(ctx, c),
         Cmd::Gc {
@@ -2234,25 +2256,7 @@ fn cmd_remote(ctx: &mut Ctx, c: &RemoteCmd) -> Result<()> {
             if let Some(parsed) = SshUrl::parse(url) {
                 parsed?;
             }
-            // Under the repository lock: a concurrent `vl remote add` must
-            // not be lost to our read-modify-write of repo.json.
-            ctx.repo.update_config(|config| {
-                if config.remotes.contains_key(name) {
-                    return Err(veil_core::VeilError::repo(format!("remote '{name}' already exists")));
-                }
-                config.remotes.insert(
-                    name.clone(),
-                    RemoteConfig {
-                        url: url.clone(),
-                        public: *public,
-                    },
-                );
-                Ok(())
-            })?;
-            ctx.repo.record_outside_view(
-                format!("add remote {name}"),
-                format!("remotes live in .veil/repo.json, outside the operation log; run `vl remote rm {name}`"),
-            )?;
+            remote::add_remote(&mut ctx.repo, name, url, *public)?;
             println!(
                 "Added {} remote {} → {}",
                 if *public { "public" } else { "team" },
@@ -2267,28 +2271,38 @@ fn cmd_remote(ctx: &mut Ctx, c: &RemoteCmd) -> Result<()> {
             }
         }
         RemoteCmd::Rm { name } => {
-            let removed = ctx.repo.update_config(|config| {
-                config
-                    .remotes
-                    .remove(name)
-                    .ok_or_else(|| veil_core::VeilError::repo(format!("no remote named '{name}'")))
-            })?;
-            ctx.repo.record_outside_view(
-                format!("remove remote {name}"),
-                format!(
-                    "remotes live in .veil/repo.json, outside the operation log; add it back with `vl remote add {name} {}{}` \
-                     (what was last seen there is kept until the next pull)",
-                    removed.url,
-                    if removed.public { " --public" } else { "" }
-                ),
-            )?;
-            println!("Removed remote {}", safe(name));
+            remote::remove_remote(&mut ctx.repo, name)?;
+            println!("Removed remote {} and its remote tags", safe(name));
         }
     }
     Ok(())
 }
 
-fn cmd_push(ctx: &mut Ctx, name: &str, tags: &[String], force: bool, full: bool) -> Result<ExitCode> {
+fn cmd_push(ctx: &mut Ctx, name: &str, tags: &[String], force: bool, full: bool, delete: &[String]) -> Result<ExitCode> {
+    if !delete.is_empty() {
+        let (backend, _) = remote_backend(ctx, name)?;
+        let d = remote::delete_remote_tags(&mut ctx.repo, name, backend, delete, force)?;
+        for t in &d.tags_deleted {
+            println!("  {} {} on {name}", red("deleted"), cyan(&safe(t)));
+        }
+        for (t, why) in &d.tags_skipped {
+            println!("  {} deleting {} ({})", red("rejected"), safe(t), safe(why));
+        }
+        for w in &d.warnings {
+            warn_untrusted(w);
+        }
+        if tags.is_empty() {
+            return Ok(push_status(
+                &d.tags_rejected,
+                &format!("{name} has work on them you have not seen. Run `vl pull {name}` first (or `vl push --delete --force`)"),
+                &[],
+            ));
+        }
+        if !d.tags_rejected.is_empty() {
+            push_status(&d.tags_rejected, &format!("run `vl pull {name}` first"), &[]);
+            return Ok(ExitCode::FAILURE);
+        }
+    }
     let (backend, cfg) = remote_backend(ctx, name)?;
     let opts = remote::SyncOptions { full };
     let r = remote::push_with(&mut ctx.repo, backend, cfg.public, tags, force, &opts)?;
@@ -2377,6 +2391,17 @@ fn cmd_pull(ctx: &mut Ctx, name: &str, full: bool) -> Result<()> {
     for (t, id) in &r.tags_updated {
         println!("  {} {} → {}", green("updated"), cyan(&safe(t)), id.short());
     }
+    for t in &r.remote_tags_removed {
+        println!("  {} {} (gone from {name})", yellow("pruned"), safe(t));
+    }
+    for t in &r.tags_kept_deleted {
+        println!(
+            "  {} {} (deleted here; still on {name}: `vl push {name} --delete {}` deletes it there)",
+            dim("kept deleted"),
+            safe(t),
+            safe(t)
+        );
+    }
     for w in &r.warnings {
         warn_untrusted(w);
     }
@@ -2436,8 +2461,13 @@ fn cmd_git(ctx: &mut Ctx, c: &GitCmd) -> Result<ExitCode> {
             let r = git::pull(&mut ctx.repo, &git_dir, remote)?;
             print_git_fetch(&r, remote);
         }
-        GitCmd::Push { remote, tag, force } => {
-            let r = git::push(&mut ctx.repo, &git_dir, remote, tag, *force)?;
+        GitCmd::Push {
+            remote,
+            tag,
+            force,
+            delete,
+        } => {
+            let r = git::push_with_deletions(&mut ctx.repo, &git_dir, remote, tag, *force, delete)?;
             print_git_export(&r.export);
             let withheld: Vec<String> = r
                 .export
@@ -2461,6 +2491,7 @@ fn cmd_git(ctx: &mut Ctx, c: &GitCmd) -> Result<ExitCode> {
                     git::RefStatus::FastForward => println!("  {} {b} → {commit}", green("pushed")),
                     git::RefStatus::Forced => println!("  {} {b} → {commit} (forced)", yellow("pushed")),
                     git::RefStatus::UpToDate => println!("  {} {b}", dim("up to date")),
+                    git::RefStatus::Deleted => println!("  {} {b}", red("deleted")),
                     git::RefStatus::Rejected(why) => {
                         rejected.push(branch.clone());
                         println!("  {} {b} ({})", red("rejected"), safe(why));

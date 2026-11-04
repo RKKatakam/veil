@@ -418,7 +418,6 @@ fn a_replica_recognises_exports_made_by_another_replica() {
 // Veil + jj test_git_fetch.rs (two clones fetching the same new commits): the same GitHub
 // commit imported by two members must be one snapshot, not two divergent copies.
 #[test]
-#[ignore = "BUG-285: two members importing the same Git commit get two snapshots (same change id); a merge then duplicates it on GitHub"]
 fn the_same_github_commit_pulled_by_two_members_is_one_snapshot() {
     let env = Env::new();
     let (bare, wc) = git_upstream(&env, "gh.git", &[("a.txt", "a\n")]);

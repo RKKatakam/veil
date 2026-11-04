@@ -106,6 +106,15 @@ pub(crate) fn validate_url(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// `git`'s error output as one line, credentials redacted: the CLI shows
+/// control characters escaped, so its newlines would read as a literal
+/// `\n` (BUG-292).
+fn git_stderr(stderr: &[u8], url: &str) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    redact_in(&lines.join("; "), url)
+}
+
 /// Fetch every branch of `url` into `refs/remotes/<remote>/*`, following
 /// force-pushes and deletions (they are reported by the caller).
 pub(crate) fn fetch(git_dir: &Path, url: &str, remote: &str) -> Result<()> {
@@ -119,7 +128,7 @@ pub(crate) fn fetch(git_dir: &Path, url: &str, remote: &str) -> Result<()> {
         return Err(VeilError::repo(format!(
             "git fetch from {} failed: {}",
             redact_url(url),
-            redact_in(String::from_utf8_lossy(&out.stderr).trim(), url)
+            git_stderr(&out.stderr, url)
         )));
     }
     Ok(())
@@ -128,7 +137,8 @@ pub(crate) fn fetch(git_dir: &Path, url: &str, remote: &str) -> Result<()> {
 #[derive(Debug, Clone)]
 pub(crate) struct PushRef {
     pub branch: String,
-    pub commit: GitOid,
+    /// `None` deletes the branch.
+    pub commit: Option<GitOid>,
     pub force: bool,
     /// What we last saw on the remote (for `--force-with-lease`).
     pub lease: Option<GitOid>,
@@ -140,6 +150,7 @@ pub enum RefStatus {
     FastForward,
     Forced,
     UpToDate,
+    Deleted,
     Rejected(String),
 }
 
@@ -162,7 +173,14 @@ pub(crate) fn push(git_dir: &Path, url: &str, updates: &[PushRef]) -> Result<Pus
     }
     let mut c = git(git_dir);
     c.args(["push", "--porcelain"]);
-    for u in updates.iter().filter(|u| u.force) {
+    // A forced update is leased (`--force-with-lease`), and so is a
+    // deletion unless forced: it must not delete commits pushed since the
+    // last fetch.
+    let leased = |u: &&PushRef| match u.commit {
+        Some(_) => u.force,
+        None => !u.force,
+    };
+    for u in updates.iter().filter(leased) {
         match u.lease {
             Some(l) => c.arg(format!("--force-with-lease=refs/heads/{}:{l}", u.branch)),
             None => c.arg(format!("--force-with-lease=refs/heads/{}:", u.branch)),
@@ -170,7 +188,10 @@ pub(crate) fn push(git_dir: &Path, url: &str, updates: &[PushRef]) -> Result<Pus
     }
     c.arg("--").arg(url);
     for u in updates {
-        c.arg(format!("{}:refs/heads/{}", u.commit, u.branch));
+        match u.commit {
+            Some(commit) => c.arg(format!("{commit}:refs/heads/{}", u.branch)),
+            None => c.arg(format!(":refs/heads/{}", u.branch)),
+        };
     }
     let out = run(c, "push")?;
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -190,6 +211,7 @@ pub(crate) fn push(git_dir: &Path, url: &str, updates: &[PushRef]) -> Result<Pus
             " " => RefStatus::FastForward,
             "+" => RefStatus::Forced,
             "=" => RefStatus::UpToDate,
+            "-" => RefStatus::Deleted,
             _ => RefStatus::Rejected(if summary.is_empty() { "rejected".into() } else { summary }),
         };
         outcome.refs.push((branch.to_string(), status));
@@ -198,7 +220,7 @@ pub(crate) fn push(git_dir: &Path, url: &str, updates: &[PushRef]) -> Result<Pus
         return Err(VeilError::repo(format!(
             "git push to {} failed: {}",
             redact_url(url),
-            redact_in(String::from_utf8_lossy(&out.stderr).trim(), url)
+            git_stderr(&out.stderr, url)
         )));
     }
     Ok(outcome)

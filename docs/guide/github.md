@@ -26,7 +26,7 @@ Working copy now at: krqvyyzm 692245f1 (no description set)
 $ vl log
 @  krqvyyzm alice ✓ 2026-11-04 04:10:07 default@ 692245f1
 │  (no description set)
-○  qzknoozp Alice <a@x> ✓alice 2026-11-04 04:10:07 main origin/main 80a91b59
+○  qzknoozp Alice <a@x> unsigned 2026-11-04 04:10:07 main origin/main 80a91b59
 │  Initial commit
 ◆  zzzzzzzz 72edc798
    root()
@@ -40,8 +40,12 @@ $ vl log
 * on a fresh `vl init`, moves the working copy on top of `main` (or
   `master`/`trunk`), keeping its files. The new `.veilpolicy` from `vl init`
   is then a change of yours on top of `main`;
-* signs the imported snapshots with your key (`✓alice` above: authored by
-  `Alice <a@x>`, signed by alice, who imported it);
+* leaves the imported snapshots **unsigned** (`unsigned` above): a snapshot
+  imported from Git is a function of the Git commit and of what Veil holds
+  for its parents, nothing about who imported it. So every member who
+  imports the same commit gets the same snapshot, and two members pulling
+  from GitHub before they sync with each other don't end up with two copies
+  of one change;
 * applies your policy to everything it imports. A committed `.env`, or a file
   the scanner flags, is **not recorded** and is reported (it stays in Git):
 
@@ -74,6 +78,7 @@ Exported 1 commit(s)
 |---|---|
 | `vl git push [REMOTE] [-t TAG…]` | Export tags (all by default, except cloaked ones) as branches and push them |
 | `vl git push --force` | Overwrite branches that moved on the Git side, but only if they still hold what you last fetched |
+| `vl git push --delete BRANCH` | Delete a branch on the Git side (delete its tag first with `vl tag delete`); refused if it moved since you last fetched, unless `--force` |
 | `vl git fetch [REMOTE]` | Import new commits; update `REMOTE/BRANCH` remote tags. Local tags don't move |
 | `vl git pull [REMOTE]` | Fetch, then create or fast-forward local tags from the branches |
 | `vl git export [-t TAG…]` | Export into the local bridge without pushing; print each branch's commit |
@@ -186,6 +191,12 @@ Exported 1 commit(s)
 * A branch **force-pushed on GitHub** is reported by `vl git fetch`. The
   Veil history it dropped is kept, and your tags don't move backwards.
 * A branch **deleted on GitHub** is reported; your local tag is kept.
+* A tag you **deleted here** is not brought back by `vl git pull` while its
+  branch hasn't moved (see
+  [Deleting a tag](teams-and-remotes.md#deleting-a-tag)). Delete the branch
+  with `vl git push --delete BRANCH`.
+* A failed `vl git import` (a typo in the URL) leaves no Git remote behind:
+  retry with the right URL.
 * `vl git push --force` only overwrites what you last fetched
   (`--force-with-lease`), so it cannot clobber commits you never saw.
 
