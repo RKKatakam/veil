@@ -12,7 +12,7 @@ mod colocated_support;
 
 use std::path::{Path, PathBuf};
 
-pub use colocated_support::*;
+pub(crate) use colocated_support::*;
 
 mod policy_injection;
 mod controls;
