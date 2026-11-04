@@ -1,23 +1,44 @@
 //! History read tools: `vl blame`, `vl grep`, `vl bisect`, the `vl log`
 //! filters and the rename flags of `vl diff` / `vl show`.
 //!
-//! Owned by stream H of the Git-parity round (features 1, 2 and 3:
-//! `docs/design/git-parity/1-blame-bisect-duplicate.md`,
-//! `2-renames.md`, `3-history-search-grep.md`). Stream 0 wired the CLI
-//! surface; every handler here still refuses with "not implemented yet".
+//! Stream H of the Git-parity round (features 1, 2 and 3:
+//! `docs/design/git-parity/1-blame-bisect-duplicate.md`, `2-renames.md`,
+//! `3-history-search-grep.md`). The engines are in `veil_core::{blame,
+//! bisect, grep, search, rename}`; every one reads history as this reader
+//! may see it (`veil_core::blame::readable_version`), and none reads the
+//! working copy.
 
-use std::process::ExitCode;
+use std::{
+    io::{Read as _, Write as _},
+    path::PathBuf,
+    process::{Command, ExitCode},
+};
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand};
+use serde::{Deserialize, Serialize};
+use veil_core::{
+    bisect::{self, Step, Verdict},
+    blame::Reader,
+    grep::GrepOptions,
+    rename::RenameOptions,
+    revset,
+    search::{compile_regex, LogFilter, Pickaxe},
+    vfs::{SandboxFs, StorageBackend},
+    ObjectId, VPath,
+};
 
-use crate::{cli::JsonOut, ctx::Ctx};
+use crate::{
+    api::{self, Renames},
+    cli::JsonOut,
+    ctx::Ctx,
+    render::{dim, one_line, safe, warn},
+};
 
 // ---- vl blame -----------------------------------------------------------------
 
 /// `vl blame PATH [-r REV] [-L START,END] [--follow] [--max-changes N] [--public] [--json]`.
 #[derive(Args, Debug)]
-#[expect(dead_code, reason = "stream-0 stub: stream H reads these")]
 pub struct BlameArgs {
     /// File to annotate.
     pub path: String,
@@ -41,16 +62,41 @@ pub struct BlameArgs {
     pub out: JsonOut,
 }
 
+/// `START,END` of `-L`.
+fn line_range(s: &str) -> Result<(usize, usize)> {
+    let (a, b) = s.split_once(',').ok_or_else(|| anyhow!("-L {}: give START,END (for example -L 10,20)", safe(s)))?;
+    let parse = |x: &str| x.trim().parse::<usize>().map_err(|_| anyhow!("-L {}: START and END are line numbers", safe(s)));
+    let (a, b) = (parse(a)?, parse(b)?);
+    if a == 0 || b < a {
+        bail!("-L {}: give START,END with 1 <= START <= END", safe(s));
+    }
+    Ok((a, b))
+}
+
+/// The `veil.blame/1` document of `a` (`vl blame`, and `vl serve`'s
+/// `blame` method).
+pub fn blame_doc(ctx: &Ctx, a: &BlameArgs) -> Result<api::BlameDoc> {
+    let lines = a.lines.as_deref().map(line_range).transpose()?;
+    if a.max_changes == 0 {
+        bail!("--max-changes must be at least 1");
+    }
+    api::blame(ctx, &api::BlameRequest { path: &a.path, rev: &a.rev, lines, follow: a.follow, max_changes: a.max_changes, public: a.public })
+}
+
 /// `vl blame`.
-pub fn blame(_ctx: &mut Ctx, _args: &BlameArgs) -> Result<ExitCode> {
-    bail!("`vl blame` is not implemented yet")
+pub fn blame(ctx: &mut Ctx, a: &BlameArgs) -> Result<ExitCode> {
+    let doc = blame_doc(ctx, a)?;
+    match a.out.json {
+        true => api::emit_json(&doc)?,
+        false => api::text::blame(&doc),
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 // ---- vl grep ------------------------------------------------------------------
 
 /// `vl grep PATTERN [-r REV] [-i] [-F] [-w] [-n] [-l] [-c] [--max-count N] [-a] [--json] [--] [PATH…]`.
 #[derive(Args, Debug)]
-#[expect(dead_code, reason = "stream-0 stub: stream H reads these")]
 pub struct GrepArgs {
     /// Regular expression (or, with -F, literal string) to search for.
     pub pattern: String,
@@ -87,16 +133,192 @@ pub struct GrepArgs {
     pub out: JsonOut,
 }
 
-/// `vl grep`.
-pub fn grep(_ctx: &mut Ctx, _args: &GrepArgs) -> Result<ExitCode> {
-    bail!("`vl grep` is not implemented yet")
+/// The `veil.grep/1` document of `a` (`vl grep`, and `vl serve`'s `grep`
+/// method).
+pub fn grep_doc(ctx: &Ctx, a: &GrepArgs) -> Result<api::GrepDoc> {
+    let opts = GrepOptions {
+        ignore_case: a.ignore_case,
+        fixed: a.fixed_strings,
+        word: a.word_regexp,
+        max_count: a.max_count,
+        text: a.text,
+        paths: Vec::new(),
+        reader: Reader::Me,
+    };
+    api::grep(ctx, api::GrepRequest { pattern: &a.pattern, rev: &a.rev, paths: &a.paths, opts })
+}
+
+/// `vl grep`: exit 0 when something matched, 1 when nothing did.
+pub fn grep(ctx: &mut Ctx, a: &GrepArgs) -> Result<ExitCode> {
+    let doc = grep_doc(ctx, a)?;
+    match a.out.json {
+        true => api::emit_json(&doc)?,
+        false => api::text::grep(
+            &doc,
+            api::text::GrepStyle { line_number: a.line_number, files_with_matches: a.files_with_matches, count: a.count },
+        ),
+    }
+    Ok(if doc.files.is_empty() { ExitCode::from(1) } else { ExitCode::SUCCESS })
+}
+
+// ---- vl log filters -----------------------------------------------------------
+
+/// The filters `vl log` gains:
+/// `[-r REVSET] [--author PAT] [--signed-by MEMBER] [-S STRING | -G REGEX] [-i] [--pickaxe-all]
+/// [--show-skipped] [--max-changes N] [--follow] [--] [PATH…]`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct LogFilterArgs {
+    /// Only snapshots that change these files or directories.
+    pub paths: Vec<String>,
+    /// Snapshots to show: `X`, `A..B`, `::B`, `..B` or `A..`.
+    #[arg(short, long = "rev", value_name = "REVSET")]
+    pub revset: Option<String>,
+    /// Only snapshots whose author matches this regular expression. The
+    /// author is a claim anyone who can push writes; --signed-by is the
+    /// authenticated filter.
+    #[arg(long, value_name = "PAT")]
+    pub author: Option<String>,
+    /// Only snapshots with a good signature by MEMBER (a member name or
+    /// member id, as verified by your key rings).
+    #[arg(long, value_name = "MEMBER")]
+    pub signed_by: Option<String>,
+    /// Only snapshots that change the number of occurrences of STRING in a
+    /// file you can read.
+    #[arg(short = 'S', value_name = "STRING", conflicts_with = "pickaxe_regex")]
+    pub pickaxe_string: Option<String>,
+    /// Only snapshots that add or remove a line matching REGEX in a file
+    /// you can read.
+    #[arg(short = 'G', value_name = "REGEX")]
+    pub pickaxe_regex: Option<String>,
+    /// Match -S, -G and --author case-insensitively.
+    #[arg(short, long)]
+    pub ignore_case: bool,
+    /// With -S or -G, list every changed file of a matching snapshot.
+    #[arg(long)]
+    pub pickaxe_all: bool,
+    /// List snapshots that could not be searched (sealed for you) instead of
+    /// leaving them out.
+    #[arg(long)]
+    pub show_skipped: bool,
+    /// Stop searching after this many snapshots (default with -S or -G:
+    /// 100000).
+    #[arg(long, value_name = "N")]
+    pub max_changes: Option<usize>,
+    /// Follow a single file across renames.
+    #[arg(long)]
+    pub follow: bool,
+}
+
+/// Default `--max-changes` of a pickaxe search.
+const PICKAXE_MAX_CHANGES: usize = 100_000;
+
+impl LogFilterArgs {
+    /// The query these flags ask for.
+    pub fn query(&self, ctx: &Ctx, limit: Option<usize>) -> Result<api::LogQuery> {
+        let ids = self.revset.as_deref().map(|r| revset::resolve_set(&ctx.repo, r, &ctx.ws)).transpose()?;
+        let paths: Vec<VPath> = self.paths.iter().map(|p| ctx.repo_path(p)).collect::<Result<_>>()?;
+        if self.follow && paths.len() != 1 {
+            bail!("--follow follows exactly one file: give one PATH");
+        }
+        let pickaxe = match (&self.pickaxe_string, &self.pickaxe_regex) {
+            (Some(s), _) => Some(Pickaxe::string(s, self.ignore_case)?),
+            (_, Some(r)) => Some(Pickaxe::regex(r, self.ignore_case)?),
+            _ => None,
+        };
+        if self.pickaxe_all && pickaxe.is_none() {
+            bail!("--pickaxe-all goes with -S or -G");
+        }
+        if self.max_changes == Some(0) {
+            bail!("--max-changes must be at least 1");
+        }
+        let author = self.author.as_deref().map(|a| compile_regex(a, self.ignore_case)).transpose()?;
+        let max_changes = self.max_changes.or(pickaxe.is_some().then_some(PICKAXE_MAX_CHANGES));
+        let filter = LogFilter {
+            paths,
+            author,
+            signed_by: self.signed_by.clone(),
+            pickaxe,
+            pickaxe_all: self.pickaxe_all,
+            follow: self.follow,
+            reader: Reader::Me,
+            renames: RenameOptions::default(),
+        };
+        Ok(api::LogQuery { limit, ids, filter: Some(filter), show_skipped: self.show_skipped, max_changes })
+    }
+}
+
+/// `vl log`, with or without filters.
+pub fn log(ctx: &Ctx, limit: Option<usize>, f: &LogFilterArgs, json: bool) -> Result<()> {
+    let q = f.query(ctx, limit)?;
+    match json {
+        true => api::emit_json(&api::log_with(&ctx.repo, &ctx.ws, q)?),
+        false => api::text::log(api::log_entries_with(&ctx.repo, &ctx.ws, q)?),
+    }
+}
+
+// ---- rename detection flags (vl diff, vl show) --------------------------------
+
+/// Rename and copy detection in `vl diff` and `vl show`:
+/// `[--no-renames | -M[=N] | -C]`. Detection is on by default.
+#[derive(Args, Debug, Clone, Default)]
+pub struct RenameArgs {
+    /// Do not detect renames.
+    #[arg(long, conflicts_with_all = ["find_renames", "find_copies"])]
+    pub no_renames: bool,
+    /// Detect renames; `-M=N` (or `--find-renames=N`) sets the similarity
+    /// threshold in percent, default 50.
+    #[arg(
+        short = 'M',
+        long,
+        value_name = "N",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "50",
+        value_parser = clap::value_parser!(u8).range(0..=100)
+    )]
+    pub find_renames: Option<u8>,
+    /// Detect copies as well as renames.
+    #[arg(short = 'C', long)]
+    pub find_copies: bool,
+}
+
+impl RenameArgs {
+    pub fn renames(&self) -> Renames {
+        if self.no_renames {
+            return Renames::off();
+        }
+        let mut r = Renames::default();
+        if let Some(n) = self.find_renames {
+            r.opts.threshold = n.max(1);
+        }
+        r.opts.copies = self.find_copies;
+        r
+    }
+}
+
+/// `vl diff`.
+pub fn diff(ctx: &Ctx, rev: Option<&str>, from: Option<&str>, to: Option<&str>, stat: bool, r: &RenameArgs, json: bool) -> Result<()> {
+    let (a, b) = api::diff_trees_for(ctx, rev, from, to)?;
+    let renames = r.renames();
+    match json {
+        true => api::emit_json(&api::diff_with(&ctx.repo, &a, &b, stat, &renames)?),
+        false => api::text::diff(&ctx.repo, &a, &b, stat, &renames),
+    }
+}
+
+/// `vl show`.
+pub fn show(ctx: &Ctx, rev: &str, stat: bool, r: &RenameArgs, json: bool) -> Result<()> {
+    let renames = r.renames();
+    match json {
+        true => api::emit_json(&api::show_with(ctx, rev, stat, &renames)?),
+        false => api::text::show(&ctx.repo, &api::show_header(ctx, rev, stat)?, &renames),
+    }
 }
 
 // ---- vl bisect ----------------------------------------------------------------
 
 /// `vl bisect start|good|bad|skip|run|reset|log`.
 #[derive(Subcommand, Debug)]
-#[expect(dead_code, reason = "stream-0 stub: stream H reads these")]
 pub enum BisectCmd {
     /// Start a bisection between a bad and one or more good snapshots.
     Start {
@@ -136,6 +358,7 @@ pub enum BisectCmd {
     },
     /// Bisect automatically: run CMD on each candidate in a throwaway
     /// sandbox (exit 0 good, 125 skip, 1-127 bad, anything else aborts).
+    /// The working copy is never touched, and nothing is recorded.
     Run {
         /// Copy local-only (isolated) files such as .env into each sandbox.
         #[arg(long)]
@@ -154,141 +377,418 @@ pub enum BisectCmd {
     Log,
 }
 
+/// Format of `.veil/local/bisect.json`.
+const STATE_VERSION: u32 = 1;
+/// Larger state files are damaged (a bisection has a few hundred steps).
+const MAX_STATE: u64 = 1 << 20;
+
+/// `.veil/local/bisect.json`: device-local, read by `vl bisect` only.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+struct State {
+    version: u32,
+    workspace: String,
+    /// The working copy when the bisection started, and its parents (if
+    /// it was empty and abandoned on the way, `reset` starts a new change
+    /// on them instead).
+    started_from: String,
+    started_parents: Vec<String>,
+    bad: String,
+    good: Vec<String>,
+    #[serde(default)]
+    skip: Vec<String>,
+    /// The candidate being tested by hand, and the change id of the
+    /// working-copy change made on it.
+    #[serde(default)]
+    current: Option<String>,
+    #[serde(default)]
+    step_change: Option<String>,
+    #[serde(default)]
+    found: Option<String>,
+    #[serde(default)]
+    log: Vec<LogLine>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+struct LogLine {
+    /// `start-bad`, `start-good`, `good`, `bad`, `skip`, `found`.
+    action: String,
+    snapshot: String,
+    /// `run`: the command's exit code.
+    #[serde(default)]
+    code: Option<i32>,
+}
+
+fn state_path(ctx: &Ctx) -> PathBuf {
+    ctx.root.join(veil_core::repo::VEIL_DIR).join("local").join("bisect.json")
+}
+
+const RESET_HINT: &str = "run `vl bisect reset` to end it";
+
+fn damaged(why: &str) -> anyhow::Error {
+    anyhow!("the bisection state (.veil/local/bisect.json) {why}; {RESET_HINT}")
+}
+
+/// The bisection in progress, if any. Anything unexpected in the file
+/// (another version, bad JSON, not a regular file, too large, unknown
+/// snapshots) is refused with the reset hint; nothing else reads it.
+fn load(ctx: &Ctx) -> Result<Option<(State, Ids)>> {
+    let path = state_path(ctx);
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(damaged(&format!("cannot be read ({e})"))),
+    };
+    if !meta.is_file() {
+        return Err(damaged("is not a regular file"));
+    }
+    let mut raw = Vec::new();
+    std::fs::File::open(&path)
+        .and_then(|f| f.take(MAX_STATE + 1).read_to_end(&mut raw))
+        .map_err(|e| damaged(&format!("cannot be read ({e})")))?;
+    if raw.len() as u64 > MAX_STATE {
+        return Err(damaged("is too large"));
+    }
+    let s: State = serde_json::from_slice(&raw).map_err(|_| damaged("is damaged or from another version of vl"))?;
+    if s.version != STATE_VERSION {
+        return Err(damaged(&format!("has version {}, this vl reads version {STATE_VERSION}", s.version)));
+    }
+    if s.workspace != ctx.ws {
+        bail!(
+            "the bisection runs in workspace {} (this is {}): switch to it, or {RESET_HINT} there",
+            safe(&s.workspace),
+            safe(&ctx.ws)
+        );
+    }
+    let ids = Ids::of(ctx, &s)?;
+    Ok(Some((s, ids)))
+}
+
+/// The snapshots a state names, checked to still exist here.
+struct Ids {
+    bad: ObjectId,
+    good: Vec<ObjectId>,
+    skip: Vec<ObjectId>,
+}
+
+impl Ids {
+    fn of(ctx: &Ctx, s: &State) -> Result<Ids> {
+        let one = |h: &str| -> Result<ObjectId> {
+            let id = ObjectId::from_hex(h).map_err(|_| damaged("names something that is not a snapshot id"))?;
+            match ctx.repo.snapshot_opt(&id) {
+                Ok(Some(_)) => Ok(id),
+                _ => Err(anyhow!(
+                    "snapshot {} of the bisection is no longer in this repository (abandoned and collected by `vl gc`?); {RESET_HINT}",
+                    id.short()
+                )),
+            }
+        };
+        let many = |v: &[String]| v.iter().map(|h| one(h)).collect::<Result<Vec<_>>>();
+        Ok(Ids { bad: one(&s.bad)?, good: many(&s.good)?, skip: many(&s.skip)? })
+    }
+}
+
+/// Write the state durably (temp file, fsync, rename), readable by the
+/// user only.
+fn save(ctx: &Ctx, s: &State) -> Result<()> {
+    let path = state_path(ctx);
+    let dir = path.parent().expect("a parent");
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(".bisect.json.{}.tmp", std::process::id()));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&tmp).with_context(|| format!("writing {}", tmp.display()))?;
+    f.write_all(serde_json::to_string_pretty(s)?.as_bytes())?;
+    f.write_all(b"\n")?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+fn note(s: &mut State, action: &str, id: &ObjectId, code: Option<i32>) {
+    s.log.push(LogLine { action: action.to_string(), snapshot: id.hex(), code });
+}
+
+/// Files of `tree` this reader cannot read as they are (redacted, or shown
+/// as an embargo fallback): a verdict there may be misleading.
+fn unreadable_files(ctx: &Ctx, tree: &ObjectId) -> Result<usize> {
+    let store = ctx.repo.store();
+    let (_, fell_back) = veil_core::checkout::resolve_view(store, tree)?;
+    let mut n = usize::from(fell_back);
+    for (_, e) in veil_core::tree::walk_files(store, tree)? {
+        // Readable as it is (its fallback does not count).
+        let own = veil_core::TreeEntry { fallback: None, ..e };
+        if own.kind == veil_core::EntryKind::File && !store.entry_readable(&own) {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// Act on `step`: check out the next candidate by hand (unless `run`),
+/// or report the result. Returns the candidate to test.
+fn take_step(ctx: &mut Ctx, s: &mut State, step: Step, by_hand: bool) -> Result<Option<ObjectId>> {
+    match step {
+        Step::Test { candidate, remaining, steps } => {
+            println!(
+                "Bisecting: {} snapshot(s) left to test after this one (about {steps} step(s))",
+                remaining.saturating_sub(1) / 2
+            );
+            println!("Testing {}", one_line(&ctx.repo, &candidate));
+            let tree = ctx.repo.snapshot(&candidate)?.tree;
+            let hidden = unreadable_files(ctx, &tree)?;
+            if hidden > 0 {
+                warn(&format!(
+                    "{hidden} file(s) of this snapshot are sealed for you (left out, or shown as their last public version): \
+                     a verdict here may be misleading{}",
+                    if by_hand { "; `vl bisect skip` if you cannot tell" } else { "" }
+                ));
+            }
+            s.current = Some(candidate.hex());
+            if by_hand {
+                let ws = ctx.ws.clone();
+                let wc = ctx.repo.new_change(&ws, vec![candidate], "")?;
+                s.step_change = Some(ctx.repo.snapshot(&wc)?.change_id.display());
+            }
+            Ok(Some(candidate))
+        }
+        Step::Found(id) => {
+            println!("The first bad snapshot is {}", one_line(&ctx.repo, &id));
+            note(s, "found", &id, None);
+            s.found = Some(id.hex());
+            s.current = None;
+            Ok(None)
+        }
+        Step::Undecided { bad, skipped } => {
+            println!("Only skipped snapshots are left: the first bad snapshot is one of");
+            for id in std::iter::once(&bad).chain(&skipped) {
+                println!("  {}", one_line(&ctx.repo, id));
+            }
+            s.current = None;
+            Ok(None)
+        }
+    }
+}
+
+fn mark(ids: &mut Ids, s: &mut State, verdict: Verdict, id: ObjectId, code: Option<i32>) {
+    match verdict {
+        Verdict::Good => {
+            ids.good.push(id);
+            s.good.push(id.hex());
+            note(s, "good", &id, code);
+        }
+        Verdict::Bad => {
+            ids.bad = id;
+            s.bad = id.hex();
+            note(s, "bad", &id, code);
+        }
+        Verdict::Skip => {
+            ids.skip.push(id);
+            s.skip.push(id.hex());
+            note(s, "skip", &id, code);
+        }
+        Verdict::Abort => {}
+    }
+}
+
 /// `vl bisect`.
-pub fn bisect(_ctx: &mut Ctx, _cmd: &BisectCmd) -> Result<ExitCode> {
-    bail!("`vl bisect` is not implemented yet")
-}
-
-// ---- vl log filters -----------------------------------------------------------
-
-/// The filters `vl log` gains:
-/// `[-r REVSET] [--author PAT] [--signed-by MEMBER] [-S STRING | -G REGEX] [-i] [--pickaxe-all]
-/// [--show-skipped] [--max-changes N] [--follow] [--] [PATH…]`.
-#[derive(Args, Debug, Clone, Default)]
-pub struct LogFilterArgs {
-    /// Only snapshots that change these files or directories (not
-    /// implemented yet).
-    pub paths: Vec<String>,
-    /// Snapshots to show: `A..B` or `::B` (not implemented yet).
-    #[arg(short, long = "rev", value_name = "REVSET")]
-    pub revset: Option<String>,
-    /// Only snapshots whose author matches this regular expression. The
-    /// author is a claim anyone can write; see --signed-by (not implemented
-    /// yet).
-    #[arg(long, value_name = "PAT")]
-    pub author: Option<String>,
-    /// Only snapshots with a verified signature by MEMBER (not implemented
-    /// yet).
-    #[arg(long, value_name = "MEMBER")]
-    pub signed_by: Option<String>,
-    /// Only snapshots that change the number of occurrences of STRING (not
-    /// implemented yet).
-    #[arg(short = 'S', value_name = "STRING", conflicts_with = "pickaxe_regex")]
-    pub pickaxe_string: Option<String>,
-    /// Only snapshots that add or remove a line matching REGEX (not
-    /// implemented yet).
-    #[arg(short = 'G', value_name = "REGEX")]
-    pub pickaxe_regex: Option<String>,
-    /// Match -G case-insensitively (not implemented yet).
-    #[arg(short, long)]
-    pub ignore_case: bool,
-    /// With -S or -G, show every changed file of a matching snapshot (not
-    /// implemented yet).
-    #[arg(long)]
-    pub pickaxe_all: bool,
-    /// List snapshots that could not be searched (sealed for you) instead of
-    /// leaving them out (not implemented yet).
-    #[arg(long)]
-    pub show_skipped: bool,
-    /// Stop searching after this many snapshots (not implemented yet).
-    #[arg(long, value_name = "N")]
-    pub max_changes: Option<usize>,
-    /// Follow a single file across renames (not implemented yet).
-    #[arg(long)]
-    pub follow: bool,
-}
-
-impl LogFilterArgs {
-    /// The filters given on the command line, as their flags.
-    fn given(&self) -> Vec<&'static str> {
-        let LogFilterArgs {
-            paths,
-            revset,
-            author,
-            signed_by,
-            pickaxe_string,
-            pickaxe_regex,
-            ignore_case,
-            pickaxe_all,
-            show_skipped,
-            max_changes,
-            follow,
-        } = self;
-        [
-            (!paths.is_empty(), "PATH"),
-            (revset.is_some(), "-r"),
-            (author.is_some(), "--author"),
-            (signed_by.is_some(), "--signed-by"),
-            (pickaxe_string.is_some(), "-S"),
-            (pickaxe_regex.is_some(), "-G"),
-            (*ignore_case, "-i"),
-            (*pickaxe_all, "--pickaxe-all"),
-            (*show_skipped, "--show-skipped"),
-            (max_changes.is_some(), "--max-changes"),
-            (*follow, "--follow"),
-        ]
-        .into_iter()
-        .filter_map(|(set, flag)| set.then_some(flag))
-        .collect()
+pub fn bisect(ctx: &mut Ctx, cmd: &BisectCmd) -> Result<ExitCode> {
+    match cmd {
+        BisectCmd::Start { bad, good } => {
+            match load(ctx) {
+                Ok(None) => {}
+                Ok(Some(_)) => bail!("a bisection is already in progress (`vl bisect log` shows it); {RESET_HINT}"),
+                Err(e) => return Err(e),
+            }
+            let bad = ctx.rev(bad)?;
+            let good: Vec<ObjectId> = good.iter().map(|g| ctx.rev(g)).collect::<Result<_>>()?;
+            let wc = ctx.wc()?;
+            let mut s = State {
+                version: STATE_VERSION,
+                workspace: ctx.ws.clone(),
+                started_from: wc.hex(),
+                started_parents: ctx.repo.snapshot(&wc)?.parents.iter().map(|p| p.hex()).collect(),
+                bad: bad.hex(),
+                good: good.iter().map(|g| g.hex()).collect(),
+                skip: Vec::new(),
+                current: None,
+                step_change: None,
+                found: None,
+                log: Vec::new(),
+            };
+            note(&mut s, "start-bad", &bad, None);
+            for g in &good {
+                note(&mut s, "start-good", g, None);
+            }
+            let step = bisect::next(&ctx.repo, &bad, &good, &[])?;
+            take_step(ctx, &mut s, step, true)?;
+            save(ctx, &s)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        BisectCmd::Good { rev, discard } | BisectCmd::Bad { rev, discard } | BisectCmd::Skip { rev, discard } => {
+            let verdict = match cmd {
+                BisectCmd::Good { .. } => Verdict::Good,
+                BisectCmd::Bad { .. } => Verdict::Bad,
+                _ => Verdict::Skip,
+            };
+            let (mut s, mut ids) = load(ctx)?.ok_or_else(|| anyhow!("no bisection in progress (`vl bisect start --bad REV --good REV`)"))?;
+            let id = match rev {
+                Some(r) => ctx.rev(r)?,
+                None => match &s.current {
+                    Some(h) => ObjectId::from_hex(h).map_err(|_| damaged("names something that is not a snapshot id"))?,
+                    None => bail!("no candidate is being tested: give the snapshot to mark"),
+                },
+            };
+            // Edits made on the candidate stay in its change: refuse to
+            // move off it unless asked (they are never lost either way).
+            let wc = ctx.wc()?;
+            let here = ctx.repo.snapshot(&wc)?;
+            if !discard && s.step_change.as_deref() == Some(here.change_id.display().as_str()) && !ctx.repo.is_empty_change(&wc)? {
+                bail!(
+                    "the working-copy change {} holds edits made while testing: record them elsewhere first (`vl new`, `vl squash`), \
+                     or pass --discard to move on and leave them in that change",
+                    here.change_id.short()
+                );
+            }
+            mark(&mut ids, &mut s, verdict, id, None);
+            let step = bisect::next(&ctx.repo, &ids.bad, &ids.good, &ids.skip)?;
+            s.step_change = None;
+            take_step(ctx, &mut s, step, true)?;
+            save(ctx, &s)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        BisectCmd::Run { with_isolated, trust_partial, command } => {
+            let (mut s, mut ids) = load(ctx)?.ok_or_else(|| anyhow!("no bisection in progress (`vl bisect start --bad REV --good REV`)"))?;
+            loop {
+                let step = bisect::next(&ctx.repo, &ids.bad, &ids.good, &ids.skip)?;
+                let Some(candidate) = take_step(ctx, &mut s, step, false)? else {
+                    save(ctx, &s)?;
+                    return Ok(ExitCode::SUCCESS);
+                };
+                let (code, partial) = run_on(ctx, &candidate, *with_isolated, command)?;
+                let mut verdict = bisect::verdict(code);
+                if verdict == Verdict::Abort {
+                    s.current = None;
+                    save(ctx, &s)?;
+                    bail!(
+                        "bisect run stopped: `{}` exited with {code} on {} (0 good, 125 skip, 1-127 bad; anything else aborts)",
+                        safe(&command.join(" ")),
+                        candidate.short()
+                    );
+                }
+                if partial && !trust_partial && verdict != Verdict::Skip {
+                    eprintln!("{}", dim("  skipped: you cannot read every file of this snapshot (--trust-partial keeps the verdict)"));
+                    verdict = Verdict::Skip;
+                }
+                let word = match verdict {
+                    Verdict::Good => "good",
+                    Verdict::Bad => "bad",
+                    _ => "skip",
+                };
+                println!("  {word} (exit {code})");
+                mark(&mut ids, &mut s, verdict, candidate, Some(code));
+                save(ctx, &s)?;
+            }
+        }
+        BisectCmd::Reset => {
+            let state = match load(ctx) {
+                Ok(s) => s,
+                Err(e) => {
+                    // A damaged state: remove it, leave the working copy.
+                    let path = state_path(ctx);
+                    if std::fs::symlink_metadata(&path).is_ok() {
+                        std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+                        println!("Removed the bisection state ({}); the working copy stays where it is", e.root_cause());
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    return Err(e);
+                }
+            };
+            let Some((s, _)) = state else {
+                println!("No bisection in progress");
+                return Ok(ExitCode::SUCCESS);
+            };
+            let ws = ctx.ws.clone();
+            let from = ObjectId::from_hex(&s.started_from).ok();
+            let visible = ctx.repo.visible_snapshots()?;
+            match from.filter(|f| visible.contains(f)) {
+                Some(f) => ctx.repo.edit(&ws, f)?,
+                None => {
+                    let parents: Vec<ObjectId> = s
+                        .started_parents
+                        .iter()
+                        .filter_map(|h| ObjectId::from_hex(h).ok())
+                        .filter(|p| ctx.repo.snapshot_opt(p).ok().flatten().is_some())
+                        .collect();
+                    if !parents.is_empty() {
+                        ctx.repo.new_change(&ws, parents, "")?;
+                    }
+                }
+            }
+            std::fs::remove_file(state_path(ctx))?;
+            println!("Bisection ended; working copy now at {}", one_line(&ctx.repo, &ctx.wc()?));
+            Ok(ExitCode::SUCCESS)
+        }
+        BisectCmd::Log => {
+            let (s, _) = load(ctx)?.ok_or_else(|| anyhow!("no bisection in progress"))?;
+            for l in &s.log {
+                let id = ObjectId::from_hex(&l.snapshot).map_err(|_| damaged("names something that is not a snapshot id"))?;
+                let code = l.code.map(|c| format!(" (exit {c})")).unwrap_or_default();
+                println!("{:<10} {}{code}", safe(&l.action), one_line(&ctx.repo, &id));
+            }
+            if let Some(c) = &s.current {
+                if let Ok(id) = ObjectId::from_hex(c) {
+                    println!("{:<10} {}", "testing", one_line(&ctx.repo, &id));
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 
-/// `vl log` without filters runs as before; any filter is refused until
-/// stream H implements them.
-pub fn require_no_log_filter(f: &LogFilterArgs) -> Result<()> {
-    let given = f.given();
-    if !given.is_empty() {
-        bail!("`vl log {}` is not implemented yet", given.join(" "));
+/// Run `command` on `candidate` in a throwaway sandbox (`vl ws exec
+/// --ephemeral`'s directory: `0700` under `$TMPDIR`, removed afterwards,
+/// a reaper removes it if `vl` dies), recording nothing. Returns the exit
+/// code (128 + the signal for a killed command) and whether this reader
+/// could not materialise every file.
+fn run_on(ctx: &Ctx, candidate: &ObjectId, with_isolated: bool, command: &[String]) -> Result<(i32, bool)> {
+    let tree = ctx.repo.snapshot(candidate)?.tree;
+    let sb = crate::sandbox::Sandbox::create("bisect")?;
+    let dir = sb.path().to_path_buf();
+    let fs = SandboxFs::new(&dir, None, false);
+    let report = ctx.repo.checkout_tree(&fs, None, &tree)?;
+    let (_, fell_back) = veil_core::checkout::resolve_view(ctx.repo.store(), &tree)?;
+    let partial = fell_back || !report.redacted.is_empty() || !report.from_fallback.is_empty() || !report.failed.is_empty();
+    if with_isolated {
+        // The vault copies of local-only files (`ws exec --with-isolated`).
+        for (p, hexdata) in ctx.repo.vault_load()?.files {
+            fs.write(&VPath::new(&p)?, &hex::decode(hexdata)?)?;
+        }
     }
-    Ok(())
-}
-
-// ---- rename detection flags (vl diff, vl show) --------------------------------
-
-/// Rename and copy detection in `vl diff` and `vl show`:
-/// `[--no-renames | -M[N] | -C]`.
-#[derive(Args, Debug, Clone, Default)]
-pub struct RenameArgs {
-    /// Do not detect renames (not implemented yet).
-    #[arg(long, conflicts_with_all = ["find_renames", "find_copies"])]
-    pub no_renames: bool,
-    /// Detect renames; `-M=N` (or `--find-renames=N`) sets the similarity
-    /// threshold in percent, default 50 (not implemented yet).
-    #[arg(
-        short = 'M',
-        long,
-        value_name = "N",
-        num_args = 0..=1,
-        require_equals = true,
-        default_missing_value = "50",
-        value_parser = clap::value_parser!(u8).range(0..=100)
-    )]
-    pub find_renames: Option<u8>,
-    /// Detect copies as well as renames (not implemented yet).
-    #[arg(short = 'C', long)]
-    pub find_copies: bool,
-}
-
-/// `vl diff` / `vl show` without rename flags run as before; any is refused
-/// until stream H implements them.
-pub fn require_no_rename_flags(r: &RenameArgs) -> Result<()> {
-    let RenameArgs { no_renames, find_renames, find_copies } = r;
-    let given: Vec<&str> = [(*no_renames, "--no-renames"), (find_renames.is_some(), "-M"), (*find_copies, "-C")]
-        .into_iter()
-        .filter_map(|(set, flag)| set.then_some(flag))
-        .collect();
-    if !given.is_empty() {
-        bail!("rename detection ({}) is not implemented yet", given.join(" "));
+    sb.make_private()?;
+    eprintln!("{} {} in {}", dim("running"), safe(&command.join(" ")), dir.display());
+    let status = Command::new(&command[0])
+        .args(&command[1..])
+        .current_dir(&dir)
+        // Git run inside must not find the repository above the sandbox.
+        .env("GIT_CEILING_DIRECTORIES", &dir)
+        .status()
+        .with_context(|| format!("failed to run {}", safe(&command[0])));
+    drop(sb);
+    let status = status?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return Ok((128 + sig, partial));
+        }
     }
-    Ok(())
+    Ok((status.code().unwrap_or(1), partial))
 }

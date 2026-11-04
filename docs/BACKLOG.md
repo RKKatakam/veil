@@ -24,12 +24,10 @@ fixed**. Severity: high / medium / low.
 ### Gaps compared with Git and GitHub (core, before the Hub)
 - **Colocated Git mode:** a real `.git` next to `.veil` (as Jujutsu does) so
   IDEs, GUIs, `git blame`, pre-commit and other Git tools keep working.
-- **Missing everyday commands:** `blame`/annotate, `bisect`,
-  cherry-pick/duplicate, history
-  search (`log -S`/`-G`, path and author filters), `grep` over a snapshot,
+- **Missing everyday commands:** cherry-pick/duplicate,
   `archive` (tarball of a snapshot), patch export/import.
-- **Rename and copy detection** in `diff`, `log` and merge (today a rename is
-  a delete plus an add, and merges are not rename-aware).
+- **Rename-aware merges** (`diff`, `status`, `show` and `log --follow`
+  detect renames; merges still see a delete plus an add).
 - **Repository attributes:** line-ending normalisation (CRLF), per-path diff
   and merge drivers, binary handling (`.gitattributes` equivalents).
 - **Symlinks** are ignored; non-UTF-8 names are not recorded; submodules are

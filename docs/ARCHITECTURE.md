@@ -2850,8 +2850,8 @@ in two:
   commands always had, byte for byte; `render::one_line` delegates to it) or
   into one JSON document (`api::emit_json`) when `--json` is given.
 
-`log` and `diff` are also lazy (`api::log_entries`, `api::file_diff` per
-change), so the text output still stops early when its reader goes away
+`log` and `diff` are also lazy (`api::log_entries_with`, `api::item_diff`
+per change), so the text output still stops early when its reader goes away
 (`vl log | head`); `--json` collects everything into one document.
 
 **The results hold raw data**: paths, names, descriptions and file lines as
@@ -2893,6 +2893,88 @@ still carries only the document. A failure under `--json` prints a
 `veil.error/1` document on stdout too, unless the command had already
 printed its own (`api::json_emitted`), so stdout carries at most one
 document; clap's usage errors (exit 2) stay text.
+
+### History read tools (`blame`, `grep`, `search`, `rename`, `bisect`)
+
+`vl blame`, `vl grep`, the `vl log` filters, `vl bisect` and rename
+detection (Git-parity stream H; designs in `docs/design/git-parity/1-…`,
+`2-…`, `3-…`) are read commands like the others: engines in `veil-core`,
+results in `api` (`veil.blame/1`, `veil.grep/1`, additive fields in
+`veil.log/1`, `veil.diff/1`, `veil.status/1`), `crates/vl/src/history.rs`
+for the CLI, and `blame`/`grep` methods in `vl serve`.
+
+* **One reader of content.** Every one of them reads file content through
+  `blame::readable_version(store, entry, reader)`: `Plain` (public, or
+  sealed for a key this reader holds: the envelope's label is checked
+  *before* the decrypter is called), `Fallback` (the entry's last public
+  version, for a reader who cannot open it: what `vl cat` and a checkout
+  show) or `Redacted` (a reason and for whom, never bytes). `Reader::Public`
+  reads as a public mirror (plaintext and released embargoes only): `vl
+  blame --public`. Trees come through `ObjectStore::tree`, which resolves an
+  embargo wrapper to its fallback for non-holders, so the path filter,
+  `-S`/`-G`, blame and rename detection see an unreleased fix as "nothing
+  changed". The engines count what they opened (`ReadStats`); the tests
+  assert outsiders open nothing sealed.
+* **`rename.rs`** (computed, never stored). An exact pass pairs deleted and
+  added entries of the same kind and id (sealed objects only with the same
+  sealed id, conflicts with the same conflict id, never empty files) in
+  linear time; an inexact pass (Git's span hash: line chunks of at most 64
+  bytes, score = shared bytes / larger size) runs only on `Plain` content,
+  only while `sources × destinations ≤ limit²` (1000²), within a 1 GiB
+  byte budget, a 16 MiB file cap and a comparison budget; past any of them
+  only exact pairs are reported (`truncated`). Destinations are assigned
+  greedily by score then path; a deleted source is renamed once. `vl diff`,
+  `vl show` and `vl status` detect renames by default (`-M=N`, `-C`,
+  `--no-renames`); `vl log -S/-G` pairs renames before counting;
+  `--follow` (log, blame) follows the rename source where a path appears.
+* **`blame.rs`.** Lines open at the starting snapshot walk the ancestors in
+  topological order (each snapshot once, whatever the timestamps); a
+  parent whose readable version is identical takes every line without a
+  diff, so a cloaked change whose readable version is its fallback, or an
+  embargoed merge, gets nothing for a non-holder. A line goes to the first
+  parent that holds it; a parent whose version is redacted stops the lines
+  it might hold (unattributed, "sealed"). Line diffs use
+  `textmerge::fits` (BUG-484): past the limit only the shared start and end
+  map and the result is `coarse`. The walk stops at `--max-changes`
+  (default 100 000) or when its work passes 2²⁹ (lines compared plus what
+  each diff's search cost: `D²` for `D` edits, the whole work limit for a
+  coarse diff; about 2 s of the worst case in a release build); open lines
+  are reported unattributed.
+* **`search.rs`.** `Searcher::check` per log entry, so `vl log` stays lazy
+  and `-n` stops the search. Paths compare entries against every parent (a
+  merge is listed only where it differs from all of them); `-S` counts with
+  `memchr::memmem` (or an escaped case-insensitive regex), memoised per
+  object id in memory only (counts, no plaintext, never on disk); `-G`
+  checks added and removed lines of the bounded diff; merges are not
+  pickaxe-searched (as `git log` without `-m`). A snapshot whose versions to
+  read are redacted is `Skipped`, never counted on ciphertext. Regexes use
+  the `regex` crate (linear time) with a 1 MiB program and 8 MiB DFA limit;
+  patterns over 64 KiB are refused. `--author` matches the claim,
+  `--signed-by` the signer the keychain verifies.
+* **`grep.rs`** searches the files of a snapshot (`tree::walk_files`), never
+  the working copy: local-only files are in no snapshot, so they are neither
+  searched nor counted. `Fallback` hits are labelled `fallback`; `Redacted`
+  files are counted in `skipped.sealed`. Files over 256 MiB are skipped,
+  matching lines over 1 MiB are cut; worker threads (with the `os` feature)
+  and results sorted by path.
+* **`revset::resolve_set`**: `X`, `::B`, `A..B`, `..B`, `A..` (DAG
+  differences, children first); `vl log -r`, `vl bisect`, `vl format-patch`.
+* **`bisect.rs`** holds the pure graph functions: candidates are the
+  ancestors of the bad snapshot that are not ancestors of a good one (the
+  root never), the next candidate splits them most evenly (exact ancestor
+  counts up to 2048 candidates, a topological sum beyond), and `verdict`
+  maps exit codes as Git does. The state is device-local
+  (`.veil/local/bisect.json`, `deny_unknown_fields`, at most 1 MiB, a
+  regular file only); anything unexpected makes `vl bisect` refuse with
+  "run `vl bisect reset`", and nothing else reads it. Interactive steps
+  check the candidate out with `Repo::new_change` (the empty step change is
+  abandoned when the user moves on); `good`/`bad` refuse to leave a step
+  change holding edits without `--discard`. `vl bisect run` never touches
+  the working copy and records nothing: each candidate is checked out into
+  `sandbox::Sandbox` (the `ws exec --ephemeral` directory, reaped if `vl`
+  dies), with no isolated file and no vault value unless `--with-isolated`;
+  a candidate with hidden or fallback files is skipped unless
+  `--trust-partial`. `vl serve` never offers `bisect`.
 
 ## 13. Builds without an operating system (WASM)
 

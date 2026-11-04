@@ -13,23 +13,23 @@ Arguments:
 
 | | |
 |---|---|
-| `<PATHS>…` | Only snapshots that change these files or directories (not implemented yet) |
+| `<PATHS>…` | Only snapshots that change these files or directories |
 
 Options:
 
 | | |
 |---|---|
 | `-n, --limit <LIMIT>` | Maximum number of snapshots to show |
-| `-r, --rev <REVSET>` | Snapshots to show: `A..B` or `::B` (not implemented yet) |
-| `--author <PAT>` | Only snapshots whose author matches this regular expression. The author is a claim anyone can write; see --signed-by (not implemented yet) |
-| `--signed-by <MEMBER>` | Only snapshots with a verified signature by MEMBER (not implemented yet) |
-| `-S <STRING>` | Only snapshots that change the number of occurrences of STRING (not implemented yet) |
-| `-G <REGEX>` | Only snapshots that add or remove a line matching REGEX (not implemented yet) |
-| `-i, --ignore-case` | Match -G case-insensitively (not implemented yet) |
-| `--pickaxe-all` | With -S or -G, show every changed file of a matching snapshot (not implemented yet) |
-| `--show-skipped` | List snapshots that could not be searched (sealed for you) instead of leaving them out (not implemented yet) |
-| `--max-changes <N>` | Stop searching after this many snapshots (not implemented yet) |
-| `--follow` | Follow a single file across renames (not implemented yet) |
+| `-r, --rev <REVSET>` | Snapshots to show: `X`, `A..B`, `::B`, `..B` or `A..` |
+| `--author <PAT>` | Only snapshots whose author matches this regular expression. The author is a claim anyone who can push writes; --signed-by is the authenticated filter |
+| `--signed-by <MEMBER>` | Only snapshots with a good signature by MEMBER (a member name or member id, as verified by your key rings) |
+| `-S <STRING>` | Only snapshots that change the number of occurrences of STRING in a file you can read |
+| `-G <REGEX>` | Only snapshots that add or remove a line matching REGEX in a file you can read |
+| `-i, --ignore-case` | Match -S, -G and --author case-insensitively |
+| `--pickaxe-all` | With -S or -G, list every changed file of a matching snapshot |
+| `--show-skipped` | List snapshots that could not be searched (sealed for you) instead of leaving them out |
+| `--max-changes <N>` | Stop searching after this many snapshots (default with -S or -G: 100000) |
+| `--follow` | Follow a single file across renames |
 | `--json` | Print one JSON document instead of text (its schema is named in its `schema` field; see docs/reference/json.md). Errors then also print a `veil.error/1` document |
 
 ---

@@ -22,6 +22,8 @@ text:
 | [`vl push --dry-run`](push.md) | [`veil.push.plan/1`](#veilpushplan1) |
 | [`vl split`](split.md) (a write command) | [`veil.split/1`](#veilsplit1) |
 | [`vl squash`](squash.md) (a write command) | [`veil.squash/1`](#veilsquash1) |
+| [`vl blame`](blame.md) | [`veil.blame/1`](#veilblame1) |
+| [`vl grep`](grep.md) | [`veil.grep/1`](#veilgrep1) |
 | any of them, on failure | [`veil.error/1`](#veilerror1) |
 
 ```sh
@@ -43,7 +45,10 @@ like every command, a read command first snapshots the working copy unless
 * **`schema`** is the first field of every document: `veil.<command>/<version>`.
 * **Field names** are `snake_case`. Every field documented here is always
   present; a field that has no value is `null`, and a list with no items is
-  `[]`.
+  `[]`. The exceptions are marked *(optional)*: they were added to an
+  existing schema for a new feature (renames, the `vl log` filters) and are
+  absent, rather than `null`, when that feature does not apply, so documents
+  without it are unchanged.
 * **Enumerations** are lower-case strings (`added`, `no_key`, …). A consumer
   should treat a value it does not know as "other": new values may be added
   without a version bump.
@@ -174,8 +179,10 @@ A changed path, as `vl status` lists it.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `path` | string | The file |
-| `status` | string | `added`, `deleted` or `modified` |
+| `path` | string | The file (for a rename or copy: its new path) |
+| `status` | string | `added`, `deleted`, `modified`, `renamed` or `copied` (`R old -> new` and `C old -> new` in the text; `R087` with the score in `vl diff --stat`) |
+| `from` | string *(optional)* | Renamed or copied: the path it came from |
+| `score` | number *(optional)* | Renamed or copied: the similarity in percent (100 for an exact move) |
 | `visibility` | [visibility](#visibility) | Of the new version (of the old one, for a deletion) |
 | `redacted` | bool | The new version is unreadable here |
 | `tier` | string | Its [tier](#tier) for this reader: `public`, `cloaked`, `embargoed` or `redacted` (`[redacted]` in the text, followed by the label of whom it is sealed for) |
@@ -217,8 +224,10 @@ One file of `vl diff` and `vl show`.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `path` | string | The file |
-| `status` | string | `added`, `deleted` or `modified` |
+| `path` | string | The file (for a rename or copy: its new path) |
+| `status` | string | `added`, `deleted`, `modified`, `renamed` or `copied` |
+| `from` | string *(optional)* | Renamed or copied: the path it came from; `old` is that file's version |
+| `score` | number *(optional)* | Renamed or copied: the similarity in percent |
 | `old`, `new` | entry or null | The two versions; `old` is null for an added file, `new` for a deleted one |
 | `content` | object or null | The changed lines; null with `--stat` |
 
@@ -317,6 +326,15 @@ An entry:
 | `description` | string or null | The full description; null if sealed for a scope you are not in |
 | `description_hidden` | [hidden description](#hidden-description) or null | Why `description` is null |
 | `parents` | array | The parents, first parent first: `snapshot_id`, `snapshot_short`, `change_short` (string or null) and `withheld` (bool: the parent is not in this repository, as with an unreleased embargo on a public clone; its `change_short` is then null) |
+| `files` | array of strings *(optional)* | With `-S` or `-G`: the files that matched (every changed file with `--pickaxe-all`) |
+| `not_searched` | array of [visibilities](#visibility) *(optional)* | With `--show-skipped`: this snapshot was not searched, because the versions `-S`/`-G` would read are sealed for these audiences |
+
+With a filter (paths, `-r` excepted, `--author`, `--signed-by`, `-S`,
+`-G`), the document has *(optional)* `search`: `searched` (number:
+snapshots looked at), `skipped` (number: snapshots not searched because
+what they change is sealed for you; listed in `entries` only with
+`--show-skipped`) and `stopped` (bool: `--max-changes` ended the search).
+`truncated` then means that `-n` stopped the search with snapshots left.
 
 ## `veil.diff/1`
 
@@ -327,6 +345,7 @@ An entry:
 | `schema` | string | `veil.diff/1` |
 | `stat` | bool | `--stat` was given: every file's `content` is null |
 | `files` | array of [file diffs](#file-diff) | The changed files, in path order |
+| `renames_skipped` | bool *(optional)* | Present (and true) when inexact rename detection was skipped because of its limits (too many files): only exact renames are listed |
 
 ## `veil.show/1`
 
@@ -556,6 +575,63 @@ from what was asked.
 | `source_abandoned` | bool | Everything moved: the source was abandoned and its description joined to the destination's |
 | `moved` | array | What moved, as `chosen` in [`veil.split/1`](#veilsplit1) (every changed file, `whole`, for a squash of the whole change) |
 | `operation` | object | The head of the operation log afterwards: `op_id`, `op_short` |
+
+## `veil.blame/1`
+
+`vl blame --json` (also `vl annotate`): who introduced each line of a file,
+reading every version as you may see it. A version you cannot read is never
+guessed through: lines whose history is sealed for you are unattributed.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `veil.blame/1` |
+| `path` | string | The file |
+| `rev` | [snapshot reference](#snapshot-reference) | The snapshot whose version is annotated (`-r`) |
+| `version` | string | `plain`, or `fallback`: you cannot read the file at `rev`, and its last public version (what your checkout shows) is annotated |
+| `public` | bool | `--public`: annotated as a public mirror sees the history |
+| `coarse` | bool | Some two versions differed too much to compare line by line: their differing middle is attributed whole |
+| `stopped` | string or null | `max_changes` (`--max-changes` was reached) or `budget` (the work budget was spent); null when the walk finished |
+| `visited` | number | Snapshot visits of the walk |
+| `unattributed` | number | Lines with no change |
+| `lines` | array of lines | One per line (of `-L START,END` only, if given) |
+| `changes` | array of [snapshot references](#snapshot-reference) | Every change a line is attributed to, once, newest first (descriptions sealed for you are hidden, as everywhere) |
+
+A line:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `line` | number | Its number, from 1 |
+| `text` | string | The line, without its line break |
+| `change`, `change_short` | string or null | The change that introduced it |
+| `snapshot` | string or null | That change's snapshot id |
+| `path` | string or null | The file's path there (another name with `--follow`) |
+| `author` | string or null | That change's author: a claim, written by whoever made the snapshot |
+| `timestamp` | string or null | When that snapshot was made |
+| `unattributed` | object or null | Why there is no change: `reason` (`sealed`: the history it would move into is sealed for you; `max_changes`; `budget`) and `sealed_for` ([visibility](#visibility) or null: with `sealed`, for whom) |
+
+## `veil.grep/1`
+
+`vl grep --json`: the matches of a pattern in the files of a snapshot
+(`-r`, default `@`, which the command snapshots first). It never searches
+the working copy's local-only files (isolated, quarantined, ignored): they
+are in no snapshot, and are not counted either. `-l`, `-c` and `-n` change
+the text only; the document always lists every match.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `veil.grep/1` |
+| `rev` | [snapshot reference](#snapshot-reference) | The snapshot searched |
+| `matches` | array | Every matching line, by path then line: `path`, `line` (number, from 1), `text` (the line without its break, cut at 1 MiB), `truncated` (bool: it was cut) and `tier` (below) |
+| `files` | array | Every file with a match: `path`, `tier`, `scope` (string or null: of a cloaked file, or the embargo of an embargoed one), `count` (number: matching lines, up to `--max-count`), `binary` (bool: its lines are not listed unless `-a`) and `conflict` (bool: an unresolved conflict, searched as the file with markers you are shown) |
+| `skipped` | object | What was not searched: `sealed` (files you cannot read and have no public version of), `binary` (binary files that matched, lines not listed), `too_large` (files over 256 MiB) |
+| `searched` | number | Files of the snapshot considered |
+
+`tier` is `public`, `cloaked` or `embargoed` (sealed, and you hold the
+key), or `fallback`: the last public version of a file you cannot read.
+Members see newer content there.
+
+The exit status is 0 when something matched and 1 when nothing did, with
+the document printed either way.
 
 ## `veil.error/1`
 

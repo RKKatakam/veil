@@ -57,17 +57,17 @@ fn deleting_a_directory_records_every_file_in_it() {
 }
 
 // Scenario from git t7001-mv.sh "moving the file out of subdirectory":
-// a move is a delete and an add (rename detection is a pending feature),
-// and the content is the same.
+// a move is shown as a rename (detected, never stored), and the content
+// is the same.
 #[test]
-fn moving_a_file_is_a_delete_and_an_add() {
+fn moving_a_file_is_a_rename() {
     let env = Env::new();
     let r = env.repo("p");
     r.write("path0/COPYING", "license text\n");
     r.commit("one");
     let wc = r.change("@");
     std::fs::rename(r.path("path0/COPYING"), r.path("COPYING")).unwrap();
-    assert_eq!(r.changes(), vec!["A COPYING", "D path0/COPYING"]);
+    assert_eq!(r.changes(), vec!["R path0/COPYING -> COPYING"]);
     assert_eq!(r.cat("COPYING", "@"), "license text\n");
     assert_eq!(r.change("@"), wc, "the same change");
 }

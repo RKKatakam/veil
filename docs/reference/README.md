@@ -37,9 +37,9 @@ Global options (accepted by every command):
 | [`vl fsck`](fsck.md) | Verify repository integrity: object hashes, reachability, key rings, embargo records and the operation log. Exits 1 on corruption |
 | [`vl upgrade`](upgrade.md) | Upgrade the repository (or a remote) to the newest format |
 | [`vl evolog`](evolog.md) | Show how a change evolved (amends, rewrites, rebases) |
-| [`vl blame`](blame.md) | Show which change last touched each line of a file (not implemented yet) |
-| [`vl grep`](grep.md) | Search the files of a snapshot (never the working copy's local-only files) for a pattern (not implemented yet) |
-| [`vl bisect`](bisect.md) | Find the change that introduced a problem by binary search (not implemented yet) |
+| [`vl blame`](blame.md) | Show which change last touched each line of a file |
+| [`vl grep`](grep.md) | Search the files of a snapshot (never the working copy's local-only files) for a pattern |
+| [`vl bisect`](bisect.md) | Find the change that introduced a problem by binary search |
 | [`vl describe`](describe.md) | Set the description of a change |
 | [`vl new`](new.md) | Start a new change on top of REVS (default: @). Several = merge |
 | [`vl commit`](commit.md) | Describe the working-copy change and start a new one on top |

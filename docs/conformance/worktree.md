@@ -290,14 +290,14 @@ reason share a line.
 | t7520-ignored-hook-warning | not applicable | commit hooks (deferred to 1.1) |
 | t7521-ignored-mode | ported | `status::status_does_not_show_ignored_files` |
 | t7524-commit-summary | ported | `commit::commit_summary_names_the_committed_and_the_new_change` |
-| t7525-status-rename | pending feature | rename detection (`status::status_shows_a_rename_as_delete_and_add` records today's behaviour) |
+| t7525-status-rename | ported | `status::status_shows_a_rename` (rename detection, Git-parity stream H) |
 | t7526-commit-pathspec-file | not applicable | `commit -p`, `--pathspec-from-file` |
 | t7527-builtin-fsmonitor | not applicable | fsmonitor (Veil has `vl watch`: `snapshot::watch_records_edits_as_they_happen`) |
 | t7528-signed-commit-ssh | not applicable | GPG/SSH-signed commits (Veil signs every snapshot with the identity key; covered elsewhere) |
 | t7600-merge … t7615-diff-algo-with-mergy-operations (15 scripts) | not applicable | other conformance agent (merge) |
 | t7700-repack … t7706-repack-drop-filtered (7 scripts) | not applicable | other conformance agent (storage: repack/gc) |
 | t7800-difftool | not applicable | difftool |
-| t7810-grep … t7817-grep-sparse-checkout (8 scripts) | pending feature | `grep` over a snapshot (deferred: "grep") |
+| t7810-grep … t7817-grep-sparse-checkout (8 scripts) | feature built, not ported | `vl grep` over a snapshot (`history_cli.rs`); the scripts' option matrix is still to port |
 | t7900-maintenance | not applicable | maintenance scheduling (`vl gc` belongs to the storage agent) |
 
 ## Jujutsu test files

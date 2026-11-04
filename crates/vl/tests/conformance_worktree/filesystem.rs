@@ -81,15 +81,15 @@ fn unicode_collision_is_refused_only_where_the_filesystem_normalises() {
 }
 
 // Scenario from git t0050-filesystem.sh "rename (case change)": on a
-// case-sensitive filesystem a case-only rename is a delete and an add.
+// case-sensitive filesystem a case-only rename is a rename.
 #[test]
-fn case_only_rename_on_linux_is_a_delete_and_an_add() {
+fn case_only_rename_on_linux_is_a_rename() {
     let env = Env::new();
     let r = env.repo("p");
     r.write("README.md", "doc\n");
     r.commit("one");
     std::fs::rename(r.path("README.md"), r.path("Readme.md")).unwrap();
-    assert_eq!(r.changes(), vec!["D README.md", "A Readme.md"]);
+    assert_eq!(r.changes(), vec!["R README.md -> Readme.md"]);
     r.commit("rename");
     assert_eq!(r.paths("@-"), vec!["Readme.md"]);
 }

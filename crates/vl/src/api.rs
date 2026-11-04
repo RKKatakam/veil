@@ -29,7 +29,10 @@ use std::{
 use anyhow::Result;
 use serde::Serialize;
 use veil_core::{
+    blame::Reader,
     keychain::{split_label, ReleaseState, SignatureStatus},
+    rename::{Item, Pair, RenameOptions},
+    search::{LogFilter, Match, Searcher},
     object::{EntryKind, Snapshot, Text, Visibility},
     policy::{Policy, Tier},
     secrets::{self, looks_binary},
@@ -59,6 +62,8 @@ pub const SNAPSHOT_SCHEMA: &str = "veil.snapshot/1";
 pub const DESCRIBE_SCHEMA: &str = "veil.describe/1";
 pub const NEW_SCHEMA: &str = "veil.new/1";
 pub const COMMIT_SCHEMA: &str = "veil.commit/1";
+pub const BLAME_SCHEMA: &str = "veil.blame/1";
+pub const GREP_SCHEMA: &str = "veil.grep/1";
 
 // ---- JSON output -------------------------------------------------------------
 
@@ -279,6 +284,43 @@ fn sig(status: &SignatureStatus, s: &Snapshot) -> Sig {
     Sig { status, signer, key, key_short }
 }
 
+/// Rename and copy detection for `vl diff`, `vl show` and `vl status`
+/// (`veil_core::rename`): on by default, as in Git; computed for this
+/// reader, never stored.
+#[derive(Clone, Debug)]
+pub struct Renames {
+    pub detect: bool,
+    pub opts: RenameOptions,
+}
+
+impl Default for Renames {
+    fn default() -> Self {
+        Renames { detect: true, opts: RenameOptions::default() }
+    }
+}
+
+impl Renames {
+    pub fn off() -> Renames {
+        Renames { detect: false, opts: RenameOptions::default() }
+    }
+}
+
+/// `changes` with renames (and copies) detected as `r` says, in their
+/// order; and whether a limit stopped the inexact pass.
+pub fn detect_renames(repo: &Repo, changes: Vec<TreeChange>, r: &Renames) -> Result<(Vec<Item>, bool)> {
+    if !r.detect {
+        return Ok((changes.into_iter().map(Item::Change).collect(), false));
+    }
+    let d = veil_core::rename::detect(repo.store(), &changes, Reader::Me, &r.opts)?;
+    Ok((d.items(), d.truncated))
+}
+
+/// A detected pair as the change it stands for (the destination's path,
+/// the source as the old side).
+fn pair_change(p: &Pair) -> TreeChange {
+    TreeChange { path: p.to.clone(), old: Some(p.old.clone()), new: Some(p.new.clone()) }
+}
+
 fn status_word(c: &TreeChange) -> &'static str {
     match c.status() {
         'A' => "added",
@@ -372,8 +414,14 @@ pub fn verified_visibility(repo: &Repo, e: &TreeEntry) -> Visibility {
 #[derive(Serialize, Debug, Clone)]
 pub struct Change {
     pub path: String,
-    /// `added`, `deleted` or `modified`.
+    /// `added`, `deleted`, `modified`, `renamed` or `copied`.
     pub status: &'static str,
+    /// Renamed or copied: the source path (absent otherwise).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Renamed or copied: the similarity in percent (absent otherwise).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<u8>,
     /// Of the new version (of the old one for a deletion).
     pub visibility: Vis,
     /// The new version is unreadable here (`(redacted)` in the text).
@@ -395,12 +443,29 @@ pub fn change(repo: &Repo, c: &TreeChange) -> Change {
     Change {
         path: path(&c.path),
         status: status_word(c),
+        from: None,
+        score: None,
         visibility: Vis::from(&visibility),
         redacted: c.new.as_ref().is_some_and(|e| !repo.store().entry_readable(e)),
         tier,
         // The conflict of the new version only (`e` is the old one for a
         // deletion).
         conflict: if c.new.is_some() { looked.map(|l| l.info) } else { None },
+    }
+}
+
+/// A [`Change`] for each item: a pair is listed at its destination, with
+/// its source in `from`.
+pub fn item_change(repo: &Repo, item: &Item) -> Change {
+    match item {
+        Item::Change(c) => change(repo, c),
+        Item::Pair(p) => {
+            let mut c = change(repo, &pair_change(p));
+            c.status = if p.copy { "copied" } else { "renamed" };
+            c.from = Some(path(&p.from));
+            c.score = Some(p.score);
+            c
+        }
     }
 }
 
@@ -586,6 +651,7 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
     let s = repo.snapshot(&wc)?;
     let base = repo.parents_tree(&s.parents)?.tree;
     let changes = diff_trees(repo.store(), Some(&base), Some(&s.tree))?;
+    let (changes, _) = detect_renames(repo, changes, &Renames::default())?;
     let report = &ctx.report;
     let mut redacted = Vec::new();
     for p in &report.carried {
@@ -634,7 +700,7 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
         workspace: WorkspaceInfo { name: ctx.ws.clone(), cloak: repo.view().workspace(&ctx.ws)?.cloak.clone() },
         working_copy: snapshot_ref(repo, &wc),
         parents: s.parents.iter().map(|p| snapshot_ref(repo, p)).collect(),
-        changes: changes.iter().map(|c| change(repo, c)).collect(),
+        changes: changes.iter().map(|c| item_change(repo, c)).collect(),
         isolated: report.isolated.iter().map(path).collect(),
         quarantined: report
             .quarantined
@@ -669,8 +735,24 @@ pub struct Log {
     pub schema: &'static str,
     /// Children before parents, newest first among unrelated snapshots.
     pub entries: Vec<LogEntry>,
-    /// `-n` cut the log short.
+    /// `-n` cut the log short (with a filter: snapshots were left
+    /// unsearched).
     pub truncated: bool,
+    /// With a filter (paths, `--author`, `--signed-by`, `-S`, `-G`): how
+    /// the search went. Absent without one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search: Option<LogSearch>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct LogSearch {
+    /// Snapshots looked at.
+    pub searched: usize,
+    /// Snapshots not searched because the versions to read are sealed for
+    /// this reader (listed in `entries` only with `--show-skipped`).
+    pub skipped: usize,
+    /// `--max-changes` stopped the search.
+    pub stopped: bool,
 }
 
 #[derive(Serialize, Debug)]
@@ -698,6 +780,14 @@ pub struct LogEntry {
     pub description: Option<String>,
     pub description_hidden: Option<HiddenText>,
     pub parents: Vec<ParentRef>,
+    /// With `-S` / `-G`: the files that matched (every changed file with
+    /// `--pickaxe-all`). Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<Vec<String>>,
+    /// With `--show-skipped`: this snapshot was not searched, because the
+    /// versions to read are sealed for these audiences. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_searched: Option<Vec<Vis>>,
     #[serde(skip)]
     pub(crate) id: ObjectId,
     #[serde(skip)]
@@ -741,12 +831,39 @@ pub struct LogEntries<'a> {
     root: ObjectId,
     /// More snapshots exist than `limit` lets through.
     pub truncated: bool,
+    limit: Option<usize>,
+    yielded: usize,
+    searcher: Option<Searcher<'a>>,
+    show_skipped: bool,
+    max_changes: Option<usize>,
+    skipped: usize,
+    stopped: bool,
 }
 
-pub fn log_entries<'a>(repo: &'a Repo, ws: &str, limit: Option<usize>) -> Result<LogEntries<'a>> {
-    let mut ids = repo.visible_snapshots()?;
-    let truncated = limit.is_some_and(|l| ids.len() > l);
-    if let Some(l) = limit {
+/// What `vl log` shows: which snapshots (`-r`), how many (`-n`), and the
+/// filters.
+#[derive(Default)]
+pub struct LogQuery {
+    pub limit: Option<usize>,
+    /// Snapshot ids in log order (`revset::resolve_set`); all visible
+    /// snapshots when `None`.
+    pub ids: Option<Vec<ObjectId>>,
+    pub filter: Option<LogFilter>,
+    pub show_skipped: bool,
+    /// Stop searching after this many snapshots.
+    pub max_changes: Option<usize>,
+}
+
+pub fn log_entries_with<'a>(repo: &'a Repo, ws: &str, q: LogQuery) -> Result<LogEntries<'a>> {
+    let mut ids = match q.ids {
+        Some(ids) => ids,
+        None => repo.visible_snapshots()?,
+    };
+    let searcher = q.filter.filter(|f| !f.is_empty()).map(|f| Searcher::new(repo, f));
+    // Without a filter `-n` is known at once; with one, only once enough
+    // snapshots matched.
+    let truncated = searcher.is_none() && q.limit.is_some_and(|l| ids.len() > l);
+    if let (None, Some(l)) = (&searcher, q.limit) {
         ids.truncate(l);
     }
     let mut tags: HashMap<ObjectId, Vec<TagLabel>> = HashMap::new();
@@ -772,6 +889,13 @@ pub fn log_entries<'a>(repo: &'a Repo, ws: &str, limit: Option<usize>) -> Result
         current: repo.view().workspaces.get(ws).map(|w| w.wc),
         root: repo.root_id(),
         truncated,
+        limit: q.limit,
+        yielded: 0,
+        searcher,
+        show_skipped: q.show_skipped,
+        max_changes: q.max_changes,
+        skipped: 0,
+        stopped: false,
     })
 }
 
@@ -779,12 +903,62 @@ impl Iterator for LogEntries<'_> {
     type Item = Result<LogEntry>;
 
     fn next(&mut self) -> Option<Result<LogEntry>> {
-        let id = self.ids.next()?;
-        Some(self.entry(id))
+        if self.searcher.is_none() {
+            let id = self.ids.next()?;
+            return Some(self.entry(id));
+        }
+        loop {
+            if self.limit.is_some_and(|l| self.yielded >= l) {
+                self.truncated = self.ids.len() > 0;
+                return None;
+            }
+            let searcher = self.searcher.as_mut().expect("a filter");
+            if self.max_changes.is_some_and(|m| searcher.searched >= m) {
+                self.stopped = self.ids.len() > 0;
+                return None;
+            }
+            let id = self.ids.next()?;
+            let pickaxe = searcher.filter().pickaxe.is_some();
+            match searcher.check(&id) {
+                Err(e) => return Some(Err(e.into())),
+                Ok(Match::No) => continue,
+                Ok(Match::Yes { files }) => {
+                    self.yielded += 1;
+                    return Some(self.entry(id).map(|mut e| {
+                        if pickaxe {
+                            e.files = Some(files.iter().map(path).collect());
+                        }
+                        e
+                    }));
+                }
+                Ok(Match::Skipped { sealed_for }) => {
+                    self.skipped += 1;
+                    if !self.show_skipped {
+                        continue;
+                    }
+                    self.yielded += 1;
+                    return Some(self.entry(id).map(|mut e| {
+                        e.not_searched = Some(sealed_for.iter().map(Vis::from).collect());
+                        e
+                    }));
+                }
+            }
+        }
     }
 }
 
 impl LogEntries<'_> {
+    /// `--show-skipped`: skipped snapshots are entries.
+    pub fn lists_skipped(&self) -> bool {
+        self.show_skipped
+    }
+
+    /// How the search went (`None` without a filter). Complete once the
+    /// iterator is done.
+    pub fn search(&self) -> Option<LogSearch> {
+        self.searcher.as_ref().map(|s| LogSearch { searched: s.searched, skipped: self.skipped, stopped: self.stopped })
+    }
+
     fn entry(&mut self, id: ObjectId) -> Result<LogEntry> {
         let repo = self.repo;
         let s = repo.snapshot(&id)?;
@@ -823,6 +997,8 @@ impl LogEntries<'_> {
             description,
             description_hidden,
             parents,
+            files: None,
+            not_searched: None,
             id,
             timestamp_ms: s.timestamp,
         })
@@ -830,9 +1006,13 @@ impl LogEntries<'_> {
 }
 
 pub fn log(repo: &Repo, ws: &str, limit: Option<usize>) -> Result<Log> {
-    let mut it = log_entries(repo, ws, limit)?;
+    log_with(repo, ws, LogQuery { limit, ..LogQuery::default() })
+}
+
+pub fn log_with(repo: &Repo, ws: &str, q: LogQuery) -> Result<Log> {
+    let mut it = log_entries_with(repo, ws, q)?;
     let entries = it.by_ref().collect::<Result<Vec<_>>>()?;
-    Ok(Log { schema: LOG_SCHEMA, entries, truncated: it.truncated })
+    Ok(Log { schema: LOG_SCHEMA, entries, truncated: it.truncated, search: it.search() })
 }
 
 // ---- diff ------------------------------------------------------------------------
@@ -850,13 +1030,24 @@ pub struct DiffBody {
     /// `--stat`: paths only, every `content` is null.
     pub stat: bool,
     pub files: Vec<FileDiff>,
+    /// Inexact rename detection was skipped: too many files (only exact
+    /// renames are shown). Absent otherwise.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub renames_skipped: bool,
 }
 
 #[derive(Serialize, Debug)]
 pub struct FileDiff {
     pub path: String,
-    /// `added`, `deleted` or `modified`.
+    /// `added`, `deleted`, `modified`, `renamed` or `copied`.
     pub status: &'static str,
+    /// Renamed or copied: the source path; `old` is the source's version
+    /// (absent otherwise).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Renamed or copied: the similarity in percent (absent otherwise).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<u8>,
     /// Null for an added (old) or deleted (new) file.
     pub old: Option<EntryInfo>,
     pub new: Option<EntryInfo>,
@@ -927,29 +1118,46 @@ fn entry_info(repo: &Repo, e: &TreeEntry, check_readable: bool) -> EntryInfo {
 }
 
 /// The changes between two trees, each turned into a [`FileDiff`] by
-/// [`file_diff`] (lazily, for the text output).
+/// [`item_diff`] (lazily, for the text output).
 pub fn diff_changes(repo: &Repo, from: &ObjectId, to: &ObjectId) -> Result<Vec<TreeChange>> {
     Ok(diff_trees(repo.store(), Some(from), Some(to))?)
-}
-
-pub fn file_diff(repo: &Repo, c: &TreeChange, stat: bool) -> FileDiff {
-    file_diff_with(repo, c, stat, true)
-}
-
-/// [`file_diff`] for the text output of a full diff, which does not show
-/// `readable`: each entry's `readable` is left true instead of costing a
-/// second read of every object.
-pub(crate) fn file_diff_for_text(repo: &Repo, c: &TreeChange) -> FileDiff {
-    file_diff_with(repo, c, false, false)
 }
 
 fn file_diff_with(repo: &Repo, c: &TreeChange, stat: bool, check_readable: bool) -> FileDiff {
     FileDiff {
         path: path(&c.path),
         status: status_word(c),
+        from: None,
+        score: None,
         old: c.old.as_ref().map(|e| entry_info(repo, e, check_readable)),
         new: c.new.as_ref().map(|e| entry_info(repo, e, check_readable)),
         content: (!stat).then(|| content(repo, c)),
+    }
+}
+
+/// The [`FileDiff`] of a detected item (a pair: the source's version against
+/// the destination's).
+pub fn item_diff(repo: &Repo, item: &Item, stat: bool) -> FileDiff {
+    item_diff_with(repo, item, stat, true)
+}
+
+/// [`item_diff`] for the text output of a full diff, which does not show
+/// `readable`: each entry's `readable` is left true instead of costing a
+/// second read of every object.
+pub(crate) fn item_diff_for_text(repo: &Repo, item: &Item) -> FileDiff {
+    item_diff_with(repo, item, false, false)
+}
+
+fn item_diff_with(repo: &Repo, item: &Item, stat: bool, check_readable: bool) -> FileDiff {
+    match item {
+        Item::Change(c) => file_diff_with(repo, c, stat, check_readable),
+        Item::Pair(p) => {
+            let mut f = file_diff_with(repo, &pair_change(p), stat, check_readable);
+            f.status = if p.copy { "copied" } else { "renamed" };
+            f.from = Some(path(&p.from));
+            f.score = Some(p.score);
+            f
+        }
     }
 }
 
@@ -1007,13 +1215,18 @@ fn hunks(patch: &diffy::Patch<'_, str>) -> Vec<Hunk> {
         .collect()
 }
 
-pub fn diff_body(repo: &Repo, from: &ObjectId, to: &ObjectId, stat: bool) -> Result<DiffBody> {
-    let changes = diff_changes(repo, from, to)?;
-    Ok(DiffBody { stat, files: changes.iter().map(|c| file_diff(repo, c, stat)).collect() })
+pub fn diff_body_with(repo: &Repo, from: &ObjectId, to: &ObjectId, stat: bool, r: &Renames) -> Result<DiffBody> {
+    let (items, renames_skipped) = detect_renames(repo, diff_changes(repo, from, to)?, r)?;
+    Ok(DiffBody { stat, files: items.iter().map(|c| item_diff(repo, c, stat)).collect(), renames_skipped })
 }
 
+/// `vl diff --json` with rename detection on (the default).
 pub fn diff(repo: &Repo, from: &ObjectId, to: &ObjectId, stat: bool) -> Result<Diff> {
-    Ok(Diff { schema: DIFF_SCHEMA, body: diff_body(repo, from, to, stat)? })
+    diff_with(repo, from, to, stat, &Renames::default())
+}
+
+pub fn diff_with(repo: &Repo, from: &ObjectId, to: &ObjectId, stat: bool, r: &Renames) -> Result<Diff> {
+    Ok(Diff { schema: DIFF_SCHEMA, body: diff_body_with(repo, from, to, stat, r)? })
 }
 
 /// The two trees `vl diff` compares: a snapshot's parents and the snapshot
@@ -1083,9 +1296,14 @@ pub struct EmbargoInfo {
     pub(crate) until_ms: Option<i64>,
 }
 
+/// `vl show --json` with rename detection on (the default).
 pub fn show(ctx: &Ctx, rev: &str, stat: bool) -> Result<Show> {
+    show_with(ctx, rev, stat, &Renames::default())
+}
+
+pub fn show_with(ctx: &Ctx, rev: &str, stat: bool, r: &Renames) -> Result<Show> {
     let mut s = show_header(ctx, rev, stat)?;
-    s.diff = diff_body(&ctx.repo, &s.base_tree, &s.tree, stat)?;
+    s.diff = diff_body_with(&ctx.repo, &s.base_tree, &s.tree, stat, r)?;
     Ok(s)
 }
 
@@ -1129,7 +1347,7 @@ pub fn show_header(ctx: &Ctx, rev: &str, stat: bool) -> Result<Show> {
         conflicts: s.conflicts.clone(),
         description,
         description_hidden,
-        diff: DiffBody { stat, files: Vec::new() },
+        diff: DiffBody { stat, files: Vec::new(), renames_skipped: false },
         base_tree: base,
         tree: s.tree,
         timestamp_ms: s.timestamp,
@@ -2167,4 +2385,276 @@ mod cli_tests {
         assert!(Cli::try_parse_from(["vl", "push", "--dry-run", "--full"]).is_err());
         assert!(Cli::try_parse_from(["vl", "push", "--dry-run", "--delete", "x"]).is_err());
     }
+}
+
+// ---- blame -----------------------------------------------------------------------
+
+/// `vl blame --json` (`veil.blame/1`).
+#[derive(Serialize, Debug)]
+pub struct BlameDoc {
+    pub schema: &'static str,
+    pub path: String,
+    pub rev: SnapshotRef,
+    /// `plain`, or `fallback`: this reader cannot read the file at `rev`,
+    /// and its last public version is annotated instead.
+    pub version: &'static str,
+    /// Annotated as a public mirror sees the history (`--public`).
+    pub public: bool,
+    /// A diff was past its work limit somewhere: a differing middle was
+    /// attributed whole to one change.
+    pub coarse: bool,
+    /// Why the walk stopped early: `max_changes` or `budget` (null: it
+    /// did not).
+    pub stopped: Option<&'static str>,
+    /// Snapshot visits of the walk.
+    pub visited: usize,
+    /// How many lines have no change.
+    pub unattributed: usize,
+    pub lines: Vec<BlameLineDoc>,
+    /// Every change a line is attributed to, once, newest first.
+    pub changes: Vec<SnapshotRef>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct BlameLineDoc {
+    /// 1-based.
+    pub line: usize,
+    /// The line, without its line break.
+    pub text: String,
+    /// The change that introduced the line (null when unattributed).
+    pub change: Option<String>,
+    pub change_short: Option<String>,
+    pub snapshot: Option<String>,
+    /// The file's path in that change (another name with `--follow`).
+    pub path: Option<String>,
+    /// The author claim of that change (anyone who can push writes it).
+    pub author: Option<String>,
+    pub timestamp: Option<String>,
+    /// Why there is no change (null when attributed).
+    pub unattributed: Option<UnattributedDoc>,
+    #[serde(skip)]
+    pub(crate) timestamp_ms: i64,
+}
+
+#[derive(Serialize, Debug)]
+pub struct UnattributedDoc {
+    /// `sealed` (the history it would move into is sealed for this
+    /// reader), `max_changes` or `budget`.
+    pub reason: &'static str,
+    /// With `sealed`: for whom.
+    pub sealed_for: Option<Vis>,
+}
+
+/// What `vl blame` annotates.
+pub struct BlameRequest<'a> {
+    pub path: &'a str,
+    pub rev: &'a str,
+    pub lines: Option<(usize, usize)>,
+    pub follow: bool,
+    pub max_changes: usize,
+    pub public: bool,
+}
+
+pub fn blame(ctx: &Ctx, req: &BlameRequest<'_>) -> Result<BlameDoc> {
+    use veil_core::blame::{BlameOptions, Origin, Stop, Unattributed};
+    let repo = &ctx.repo;
+    let id = ctx.rev(req.rev)?;
+    let p = ctx.repo_path(req.path)?;
+    let tree = repo.snapshot(&id)?.tree;
+    let reader = if req.public { Reader::Public } else { Reader::Me };
+    let e = match lookup(repo.store(), &tree, &p)? {
+        Some(e) if e.kind.is_file_like() => e,
+        Some(_) => anyhow::bail!("{} is a directory in {}, not a file", crate::render::safe(p.as_str()), id.short()),
+        None => anyhow::bail!("{} does not exist in {}", crate::render::safe(p.as_str()), id.short()),
+    };
+    if let veil_core::blame::Readable::Redacted(_) = veil_core::blame::readable_version(repo.store(), &e, reader)? {
+        let why = match req.public {
+            true => None,
+            false => crate::render::hidden_explanation(repo, &p, &e),
+        };
+        anyhow::bail!(
+            "{}",
+            why.unwrap_or_else(|| format!("{} cannot be read as the public sees it (it is not public)", crate::render::safe(p.as_str())))
+        );
+    }
+    if let Some((a, b)) = req.lines {
+        if a == 0 || b < a {
+            anyhow::bail!("-L {a},{b}: give START,END with 1 <= START <= END");
+        }
+    }
+    let o = BlameOptions {
+        reader,
+        follow: req.follow,
+        max_changes: req.max_changes,
+        lines: req.lines,
+        ..BlameOptions::default()
+    };
+    let b = veil_core::blame::blame(repo, &id, &p, &o)?;
+    if let Some((a, _)) = req.lines {
+        if b.lines.is_empty() && a > 1 {
+            anyhow::bail!("-L {a},…: {} has fewer than {a} lines", crate::render::safe(p.as_str()));
+        }
+    }
+    let mut changes: Vec<ObjectId> = Vec::new();
+    let mut lines = Vec::with_capacity(b.lines.len());
+    for l in &b.lines {
+        let text = String::from_utf8_lossy(l.text.strip_suffix(b"\n").unwrap_or(&l.text)).into_owned();
+        let mut doc = BlameLineDoc {
+            line: l.number,
+            text,
+            change: None,
+            change_short: None,
+            snapshot: None,
+            path: None,
+            author: None,
+            timestamp: None,
+            unattributed: None,
+            timestamp_ms: 0,
+        };
+        match &l.origin {
+            Origin::Snapshot { id, path: at } => {
+                let s = repo.snapshot(id)?;
+                if !changes.contains(id) {
+                    changes.push(*id);
+                }
+                doc.change = Some(s.change_id.display());
+                doc.change_short = Some(s.change_id.short());
+                doc.snapshot = Some(id.hex());
+                doc.path = Some(path(at));
+                doc.author = Some(s.author.clone());
+                doc.timestamp = rfc3339(s.timestamp);
+                doc.timestamp_ms = s.timestamp;
+            }
+            Origin::Unattributed(u) => {
+                doc.unattributed = Some(UnattributedDoc {
+                    reason: u.as_str(),
+                    sealed_for: match u {
+                        Unattributed::Sealed(v) => Some(Vis::from(v)),
+                        _ => None,
+                    },
+                })
+            }
+        }
+        lines.push(doc);
+    }
+    // Newest first.
+    let mut stamped: Vec<(i64, ObjectId)> = changes.iter().map(|c| (repo.snapshot(c).map_or(0, |s| s.timestamp), *c)).collect();
+    stamped.sort_by(|a, b| b.cmp(a));
+    Ok(BlameDoc {
+        schema: BLAME_SCHEMA,
+        path: path(&p),
+        rev: snapshot_ref(repo, &id),
+        version: if b.fallback { "fallback" } else { "plain" },
+        public: req.public,
+        coarse: b.coarse,
+        stopped: b.stopped.map(|s| match s {
+            Stop::MaxChanges => "max_changes",
+            Stop::Budget => "budget",
+        }),
+        visited: b.visited,
+        unattributed: b.unattributed(),
+        lines,
+        changes: stamped.iter().map(|(_, c)| snapshot_ref(repo, c)).collect(),
+    })
+}
+
+// ---- grep ------------------------------------------------------------------------
+
+/// `vl grep --json` (`veil.grep/1`).
+#[derive(Serialize, Debug)]
+pub struct GrepDoc {
+    pub schema: &'static str,
+    /// The snapshot searched (never the working copy's local-only files).
+    pub rev: SnapshotRef,
+    /// Every matching line, by path then line.
+    pub matches: Vec<GrepMatchDoc>,
+    /// Every file with a match.
+    pub files: Vec<GrepFileDoc>,
+    pub skipped: GrepSkipped,
+    /// Files of the snapshot searched or skipped.
+    pub searched: usize,
+}
+
+#[derive(Serialize, Debug)]
+pub struct GrepMatchDoc {
+    pub path: String,
+    /// 1-based.
+    pub line: usize,
+    /// The line without its line break (cut at 1 MiB).
+    pub text: String,
+    /// `public`, `cloaked`, `embargoed` (sealed, and this reader holds the
+    /// key) or `fallback` (the last public version of a file this reader
+    /// cannot read; members see newer content).
+    pub tier: &'static str,
+    /// The line was longer than 1 MiB and is cut.
+    pub truncated: bool,
+}
+
+#[derive(Serialize, Debug)]
+pub struct GrepFileDoc {
+    pub path: String,
+    pub tier: &'static str,
+    /// The scope of a cloaked file, the embargo of an embargoed one.
+    pub scope: Option<String>,
+    /// Matching lines (up to `--max-count`).
+    pub count: usize,
+    /// Binary content: its lines are not listed (unless `-a`).
+    pub binary: bool,
+    /// An unresolved conflict, searched in its rendering for this reader.
+    pub conflict: bool,
+}
+
+#[derive(Serialize, Debug)]
+pub struct GrepSkipped {
+    /// Files this reader cannot read (and has no public version of).
+    pub sealed: usize,
+    /// Binary files that matched, whose lines are not listed.
+    pub binary: usize,
+    /// Files over 256 MiB.
+    pub too_large: usize,
+}
+
+/// What `vl grep` searches.
+pub struct GrepRequest<'a> {
+    pub pattern: &'a str,
+    pub rev: &'a str,
+    pub paths: &'a [String],
+    pub opts: veil_core::grep::GrepOptions,
+}
+
+pub fn grep(ctx: &Ctx, req: GrepRequest<'_>) -> Result<GrepDoc> {
+    use veil_core::grep::Tier;
+    let repo = &ctx.repo;
+    let id = ctx.rev(req.rev)?;
+    let tree = repo.snapshot(&id)?.tree;
+    let mut o = req.opts;
+    o.paths = req.paths.iter().map(|p| ctx.repo_path(p)).collect::<Result<_>>()?;
+    let re = veil_core::grep::compile(req.pattern, &o)?;
+    let g = veil_core::grep::grep(repo.store(), &tree, &re, &o)?;
+    let mut matches = Vec::new();
+    let mut files = Vec::new();
+    for f in &g.files {
+        let scope = match &f.tier {
+            Tier::Cloaked(s) | Tier::Embargoed(s) => Some(s.clone()),
+            _ => None,
+        };
+        files.push(GrepFileDoc { path: path(&f.path), tier: f.tier.as_str(), scope, count: f.count, binary: f.binary, conflict: f.conflict });
+        for l in &f.lines {
+            matches.push(GrepMatchDoc {
+                path: path(&f.path),
+                line: l.number,
+                text: String::from_utf8_lossy(&l.text).into_owned(),
+                tier: f.tier.as_str(),
+                truncated: l.truncated,
+            });
+        }
+    }
+    Ok(GrepDoc {
+        schema: GREP_SCHEMA,
+        rev: snapshot_ref(repo, &id),
+        matches,
+        files,
+        skipped: GrepSkipped { sealed: g.skipped.sealed, binary: g.skipped.binary, too_large: g.skipped.too_large },
+        searched: g.searched,
+    })
 }

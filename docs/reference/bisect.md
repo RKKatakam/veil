@@ -3,7 +3,9 @@
 
 # `vl bisect`
 
-Find the change that introduced a problem by binary search (not implemented yet)
+Find the change that introduced a problem by binary search.
+
+`start` checks out the first candidate (as `vl new` does); mark each one `good`, `bad` or `skip`; `reset` returns to where you started. `run` tests every candidate in a throwaway sandbox instead and never touches the working copy. The state is device-local (`.veil/local/bisect.json`).
 
 Subcommands:
 
@@ -11,7 +13,7 @@ Subcommands:
 * [`vl bisect good`](#vl-bisect-good): Mark the current candidate (or REV) good
 * [`vl bisect bad`](#vl-bisect-bad): Mark the current candidate (or REV) bad
 * [`vl bisect skip`](#vl-bisect-skip): Skip the current candidate (or REV): it cannot be tested
-* [`vl bisect run`](#vl-bisect-run): Bisect automatically: run CMD on each candidate in a throwaway sandbox (exit 0 good, 125 skip, 1-127 bad, anything else aborts)
+* [`vl bisect run`](#vl-bisect-run): Bisect automatically: run CMD on each candidate in a throwaway sandbox (exit 0 good, 125 skip, 1-127 bad, anything else aborts). The working copy is never touched, and nothing is recorded
 * [`vl bisect reset`](#vl-bisect-reset): End the bisection and return to where it started
 * [`vl bisect log`](#vl-bisect-log): Show the bisection's steps so far
 
@@ -92,7 +94,7 @@ Options:
 
 ## `vl bisect run`
 
-Bisect automatically: run CMD on each candidate in a throwaway sandbox (exit 0 good, 125 skip, 1-127 bad, anything else aborts)
+Bisect automatically: run CMD on each candidate in a throwaway sandbox (exit 0 good, 125 skip, 1-127 bad, anything else aborts). The working copy is never touched, and nothing is recorded
 
 ```text
 vl bisect run [OPTIONS] -- <COMMAND>...

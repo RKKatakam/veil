@@ -315,7 +315,7 @@ impl<'a> R<'a> {
                 continue;
             }
             if on {
-                if l.len() > 2 && matches!(&l[..2], "A " | "M " | "D ") {
+                if l.len() > 2 && matches!(&l[..2], "A " | "M " | "D " | "R " | "C ") {
                     out.push(l.to_string());
                 } else {
                     break;

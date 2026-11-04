@@ -52,6 +52,8 @@ documents described [below](#write-results).
 | `log` | `vl log` | `limit` (number) | [`veil.log/1`](json.md#veillog1) |
 | `diff` | `vl diff` | `rev`, or `from` and `to` (revisions); `stat` (bool) | [`veil.diff/1`](json.md#veildiff1) |
 | `show` | `vl show` | `rev` (default `@`), `stat` (bool) | [`veil.show/1`](json.md#veilshow1) |
+| `blame` | `vl blame` | `path` (required), `rev` (default `@`), `lines` (`[START, END]`), `follow` (bool), `max_changes` (number), `public` (bool) | [`veil.blame/1`](json.md#veilblame1) |
+| `grep` | `vl grep` | `pattern` (required), `rev` (default `@`), `paths` (list), `ignore_case`, `fixed_strings`, `word_regexp`, `text` (bools), `max_count` (number) | [`veil.grep/1`](json.md#veilgrep1) |
 | `ws.list` (also `workspace.list`) | `vl workspace list` | | [`veil.workspace.list/1`](json.md#veilworkspacelist1) |
 | `tag.list` | `vl tag list` | | [`veil.tag.list/1`](json.md#veiltaglist1) |
 | `op.log` | `vl op log` | `limit` (number, default 20) | [`veil.op.log/1`](json.md#veiloplog1) |
@@ -81,6 +83,12 @@ repository if the request moved it. `false` is `vl --no-snapshot`, with one
 difference: such a request also never writes to the working copy, so a read
 with `"snapshot": false` changes nothing at all. A server started as
 `vl --no-snapshot serve --local` defaults to `false`.
+
+**`blame` and `grep`** read history as the server's identity may see it,
+exactly as the commands do: sealed content it holds no key for is never
+read (lines are unattributed, files are counted in `skipped.sealed`), and
+`grep` searches the snapshot, never the working copy's local-only files.
+`vl bisect` is not served: `bisect run` executes code.
 
 **`policy_from`** (`scan`): the CI gate of `vl scan --policy-from`, with
 the rules taken from that file. It must name a file inside the repository

@@ -73,7 +73,8 @@ be undone. Add to that per-file encryption and engine-level secret handling.
 | `git gc`, `git fsck` | `vl gc`, `vl fsck` |
 | `.git/hooks/pre-commit` | `.veil/hooks/pre-commit`, or a repository's `.veilhooks` once you `vl hooks trust` it ([Hooks](hooks.md)) |
 | `git commit --no-verify` | `vl commit --no-verify` |
-| `git revert`, `git cherry-pick`, `git blame`, `git bisect`, `git log -- PATH` | *(no equivalent in 1.0)* |
+| `git blame`, `git grep`, `git bisect`, `git log -S`/`-G`/`--follow`/`-- PATH` | `vl blame`, `vl grep`, `vl bisect`, `vl log -S`/`-G`/`--follow`/`-- PATH` ([Investigating history](investigating-history.md)) |
+| `git revert`, `git cherry-pick` | *(no equivalent in 1.0)* |
 
 ## Pitfalls
 

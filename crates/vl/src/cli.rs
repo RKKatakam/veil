@@ -192,15 +192,31 @@ pub enum Cmd {
         #[arg(short, long, default_value = "@")]
         rev: String,
     },
-    /// Show which change last touched each line of a file (not implemented
-    /// yet).
+    /// Show which change last touched each line of a file.
+    ///
+    /// History is read as you may see it: a version cloaked for a scope you
+    /// are not in is never opened (a public file edited on a cloaked line
+    /// is read as its last public version), and lines whose history is
+    /// sealed for you are reported unattributed, never guessed. Prints
+    /// change ids, never descriptions.
     #[command(visible_alias = "annotate")]
     Blame(history::BlameArgs),
     /// Search the files of a snapshot (never the working copy's local-only
-    /// files) for a pattern (not implemented yet).
+    /// files) for a pattern.
+    ///
+    /// Searches recorded files only (default `@`, snapshotted first):
+    /// isolated, quarantined and ignored files are never searched or
+    /// counted. Files you cannot read are skipped; a file you can read only
+    /// as its last public version is searched and labelled so. Exits 1
+    /// when nothing matches.
     Grep(history::GrepArgs),
-    /// Find the change that introduced a problem by binary search (not
-    /// implemented yet).
+    /// Find the change that introduced a problem by binary search.
+    ///
+    /// `start` checks out the first candidate (as `vl new` does); mark each
+    /// one `good`, `bad` or `skip`; `reset` returns to where you started.
+    /// `run` tests every candidate in a throwaway sandbox instead and never
+    /// touches the working copy. The state is device-local
+    /// (`.veil/local/bisect.json`).
     #[command(subcommand)]
     Bisect(history::BisectCmd),
 
