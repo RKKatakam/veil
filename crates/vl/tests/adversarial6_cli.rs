@@ -334,3 +334,123 @@ fn an_unreadable_policy_file_does_not_brick_the_cli() {
     let out = env.vl(U, &proj, &["status"]);
     assert!(out.status.success(), "vl status failed on a directory named .veilpolicy: {}", text(&out));
 }
+
+// ---- undo that does not undo ---------------------------------------------------------
+
+/// `vl embargo release` is recorded as an operation (`Repo::release_embargo`
+/// commits a `release embargo <id>` op with `record_always`), so `vl undo`
+/// reports `Undid: release embargo <id>`. But the release lives in the
+/// embargo *record* (`.veil/meta/embargoes/<id>.json`, the published key),
+/// not in the view the operation log restores, so nothing is undone: the
+/// embargo stays released, and the next `vl push mirror` publishes the
+/// security fix. The guide promises "Undo anything" and lists every
+/// repository-changing command as an operation; the one command whose
+/// accidental use publishes a vulnerability is the one undo lies about.
+#[test]
+#[ignore = "BUG-109: `vl undo` after `vl embargo release` says it undid the release, but the embargo stays released and the next push publishes the fix"]
+fn undo_of_an_embargo_release_keeps_the_fix_embargoed() {
+    let env = Env::new();
+    let proj = env.dir("proj");
+    env.ok(U, &proj, &["init"]);
+    write(&proj, "auth.rs", "fn check() { true }\n");
+    env.ok(U, &proj, &["commit", "-m", "v1"]);
+    env.ok(U, &proj, &["tag", "set", "main", "-r", "@-"]);
+    let mirror = env.dir("mirror");
+    env.ok(U, &proj, &["remote", "add", "mirror", mirror.to_str().unwrap(), "--public"]);
+    env.ok(U, &proj, &["push", "mirror"]);
+    env.ok(U, &proj, &["ws", "new", "fix", "-r", "main", "--cloak", "team"]);
+    let mut c = env.cmd(U, &proj, &["ws", "write", "fix", "auth.rs"]);
+    c.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    use std::io::Write as _;
+    child.stdin.take().unwrap().write_all(b"fn check() { verify_signature_secretfix() }\n").unwrap();
+    assert!(child.wait_with_output().unwrap().status.success());
+    env.ok(U, &proj, &["merge", "fix@", "--into", "main", "--embargo", "-m", "Fix CVE"]);
+    let id = env.stdout(U, &proj, &["embargo", "list"]).split_whitespace().next().unwrap().to_string();
+    env.ok(U, &proj, &["embargo", "release", &id]);
+    let undo = env.ok(U, &proj, &["undo"]);
+    assert!(undo.contains("release embargo"), "{undo}");
+    let list = env.stdout(U, &proj, &["embargo", "list"]);
+    assert!(!list.contains("released"), "undo reported success but the embargo is still released:\n{list}");
+    env.ok(U, &proj, &["push", "mirror"]);
+    assert!(mirror_reads(&mirror, "auth.rs").is_none_or(|d| !d.windows(9).any(|w| w == b"secretfix")), "the fix was published after the release was undone");
+}
+
+// ---- checkout over local-only directories -------------------------------------------
+
+/// Checkout never overwrites a *file* it did not write (`holds`), but
+/// when the target tree has a file where the working copy has a directory
+/// it runs `remove_dir_all` on that directory without looking inside
+/// (`checkout.rs`, `apply_changes`). An isolated directory (`private/
+/// isolate`) and an ignored one (`target/`, `node_modules/`) hold content
+/// that is in no snapshot, and the file entry `private` does not match the
+/// directory rule `private/`, so `is_local_only` does not protect it. One
+/// `vl new <rev>` (a teammate's change, or a hostile remote's) deletes the
+/// user's private notes and the build tree, and the next snapshot prunes
+/// the vault's backup of the notes because they no longer exist.
+#[test]
+#[ignore = "BUG-110: checkout deletes an isolated or ignored directory (never recorded) when the target tree has a file at its path"]
+fn checkout_does_not_delete_a_local_only_directory_to_place_a_file() {
+    let env = Env::new();
+    let proj = env.dir("proj");
+    env.ok(U, &proj, &["init"]);
+    write(&proj, ".veilpolicy", "private/ isolate\ntarget/ ignore\n");
+    write(&proj, "a.txt", "a\n");
+    env.ok(U, &proj, &["commit", "-m", "v1"]);
+    env.ok(U, &proj, &["tag", "set", "main", "-r", "@-"]);
+    write(&proj, "private/notes.md", "my private notes\n");
+    write(&proj, "target/out.o", "build junk\n");
+    let status = env.ok(U, &proj, &["status"]);
+    assert!(status.contains("private/notes.md"), "control: the notes are isolated:\n{status}");
+    env.ok(U, &proj, &["ws", "new", "t"]);
+    for name in ["private", "target"] {
+        let mut c = env.cmd(U, &proj, &["ws", "write", "t", name]);
+        c.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        let mut child = c.spawn().unwrap();
+        use std::io::Write as _;
+        child.stdin.take().unwrap().write_all(b"x\n").unwrap();
+        assert!(child.wait_with_output().unwrap().status.success());
+    }
+    let out = env.vl(U, &proj, &["new", "t@"]);
+    assert!(
+        proj.join("private/notes.md").is_file() && read(&proj, "private/notes.md") == "my private notes\n",
+        "the isolated directory was deleted by the checkout ({})",
+        text(&out).trim()
+    );
+    assert!(proj.join("target/out.o").is_file(), "the ignored directory was deleted by the checkout");
+}
+
+/// The opposite swap: a *file* in the working copy (here a quarantined
+/// `cfg`, never recorded; any untracked file works) where the target tree
+/// has a directory `cfg/`. Checkout writes `cfg/settings.json`;
+/// `DiskBackend::write` fails with `File exists` on the parent, the
+/// checkout aborts half way, and the error is returned **after the view
+/// already moved**. From then on every command fails the same way: each
+/// one finds the working copy stale and retries the same checkout
+/// (`Ctx::record`). Only `vl --no-snapshot undo`, or deleting the file by
+/// hand, gets out. The documented behaviour for a file in the way is to
+/// keep it and report it (`CheckoutReport::blocked` / `kept_local`).
+#[test]
+#[ignore = "BUG-111: a file in the way of a directory makes a checkout fail half way and bricks every later command"]
+fn a_file_in_the_way_of_a_directory_is_kept_and_reported() {
+    let env = Env::new();
+    let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
+    write(&proj, "cfg", "k = \"AKIAIOSFODNN7EXAMPLE\"\n");
+    assert!(env.ok(U, &proj, &["status"]).contains("Q cfg"));
+    env.ok(U, &proj, &["ws", "new", "t"]);
+    let mut c = env.cmd(U, &proj, &["ws", "write", "t", "cfg/settings.json"]);
+    c.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    use std::io::Write as _;
+    child.stdin.take().unwrap().write_all(b"{}\n").unwrap();
+    assert!(child.wait_with_output().unwrap().status.success());
+    let out = env.vl(U, &proj, &["new", "t@"]);
+    let status = env.vl(U, &proj, &["status"]);
+    assert!(
+        out.status.success() && status.status.success(),
+        "checkout: {}\nnext command: {}",
+        text(&out).trim(),
+        text(&status).trim()
+    );
+    assert_eq!(read(&proj, "cfg"), "k = \"AKIAIOSFODNN7EXAMPLE\"\n", "the quarantined file was lost");
+}
