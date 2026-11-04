@@ -159,8 +159,11 @@ fn injected_secrets_are_taken_out_after_the_run() {
     assert_eq!(env.stdout("alice", &proj, &["ws", "cat", "agent", "a.txt"]), "a\n");
 }
 
+/// `kill -9` of `vl` during an injected run: the reaper takes the injected
+/// file out again, and deletes nothing else (BUG-550: what the command
+/// left is its output, and the next run records it first).
 #[test]
-fn the_reaper_wipes_a_sandbox_whose_run_was_killed() {
+fn the_reaper_takes_injected_files_out_of_a_run_that_was_killed() {
     let env = Env::new();
     let proj = project(&env);
     exec(&env, &proj, &["--", "sh", "-c", "mkdir -p target; echo o > target/o"]);
@@ -175,9 +178,10 @@ fn the_reaper_wipes_a_sandbox_whose_run_was_killed() {
     }
     let dir = files_dir(&proj, "agent");
     assert!(wait_for(Duration::from_secs(10), || !dir.join(".env").exists()), "injected secret left after kill -9");
-    // The next run rebuilds it and works.
-    let out = exec(&env, &proj, &["--", "sh", "-c", "test ! -e target/o && cat a.txt"]);
-    assert!(out.contains("a\n"), "{out}");
+    // The next run records what the killed one left (nothing new here),
+    // keeps the build output and works.
+    let out = exec(&env, &proj, &["--", "sh", "-c", "test -e target/o && cat a.txt"]);
+    assert!(out.contains("Recording the output of an earlier run") && out.contains("a\n"), "{out}");
 }
 
 #[test]

@@ -96,8 +96,10 @@ Each workspace keeps one sandbox, .veil/local/sandboxes/NAME/files, between runs
 
 With --only, the sandbox holds just the given files and directories (and .veilpolicy): everything else is recorded exactly as the workspace has it, and files the command writes elsewhere are not recorded (a warning lists them) and are removed from the sandbox.
 
+The command's output is never deleted when something fails: if vl is killed or the result cannot be recorded (the repository is busy), it stays in the sandbox, and the next run (or --record-only) records it first. SIGTERM and SIGHUP are forwarded to the command, as Ctrl-C is, and vl records what it left.
+
 ```text
-vl workspace exec [OPTIONS] [NAME] -- <COMMAND>...
+vl workspace exec [OPTIONS] [NAME] [-- <COMMAND>...]
 ```
 
 Arguments:
@@ -105,7 +107,7 @@ Arguments:
 | | |
 |---|---|
 | `<NAME>` | Workspace to run in (or use --ephemeral) |
-| `<COMMAND>…` | Command and arguments (required; after `--`) |
+| `<COMMAND>…` | Command and arguments (after `--`) |
 
 Options:
 
@@ -116,6 +118,7 @@ Options:
 | `-m, --message <MESSAGE>` | Description to record (default: empty) |
 | `--with-isolated` | Copy local-only (isolated) files such as .env into the sandbox for this run (they are taken out again afterwards) |
 | `--only <PATH>` | Sparse sandbox: hold only these paths (files or directories of the workspace, relative to the current directory) |
+| `--record-only` | Run nothing: record what an earlier run left unrecorded (vl was killed, or recording failed) |
 
 ## `vl workspace cat`
 

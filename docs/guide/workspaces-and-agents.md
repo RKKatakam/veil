@@ -164,6 +164,11 @@ a copy of the repository: `vl ws new agent`, then
   cloaked files outside keep their sealing.
 * **Inside the paths, it is an ordinary run**: edits, new files and
   deletions are recorded, through the policy and the secret scanner.
+  Deleting `.veilpolicy`, or leaving it unreadable, a symlink or a
+  directory, is not an edit of the policy, in any sandbox: the workspace
+  keeps its recorded policy (with a warning, and a deleted one is put
+  back), so no cloaked file is ever declassified that way. To change the
+  rules, edit the file.
 * **Files the command writes outside the paths are not recorded.**
   `vl` lists them (`not recorded: … written outside --only`) and removes
   them from the sandbox, so a later run with more paths never mistakes
@@ -175,7 +180,12 @@ a copy of the repository: `vl ws new agent`, then
 * **`.veilpolicy` is always there** (the snapshot needs it to classify
   anything). If the command edits it, the new policy applies to every
   file of the workspace, inside the paths or not, as for a full run: a
-  newly cloaked directory outside the paths is recorded cloaked.
+  newly cloaked directory outside the paths is recorded cloaked. Files
+  that were ignored or isolated before the edit are never removed as
+  "written outside --only".
+* **Removing a directory in the sandbox** (`rm -rf src` with
+  `--only src/lib.rs`) deletes only the files of the paths under it;
+  the rest of `src/` stays as the workspace has it.
 * **Paths** follow the usual rules: relative to the current directory,
   never outside the repository (`..` that climbs out, or an absolute path
   elsewhere, is refused). Each must name a file or directory in the
@@ -227,13 +237,22 @@ the point); quarantine only keeps them out of history.
 
 **Injected files live for one run.** After the run is recorded, the
 injected files are taken out of the sandbox again (a file the sandbox had
-at that path before is put back), and so is every file quarantined
-because it holds an injected value: a tracked file gets its recorded
-version back, a new one is removed (`cleaned leaked.txt (they held an
-injected secret; …)`). So no copy is left for a later run, which no longer
-guards against the injected values, to record. Copies in ignored or
-isolated files (a build log under `target/`) are never recorded and stay.
-Pass `--with-isolated` on every run that needs the files.
+at that path before is put back), and so is every file that holds an
+injected value, wherever it is: quarantined files, but also ignored or
+isolated ones the snapshot never looks at (a build log under `target/`,
+a `.env.bak`). A tracked file gets its recorded version back, anything
+else is removed (`cleaned leaked.txt, target/app.log (they held an
+injected secret; …)`). Pass `--with-isolated` on every run that needs the
+files.
+
+**The guard stays.** A sandbox that was given isolated files remembers
+them (sealed, in `.veil/local/sandboxes/NAME/guard.sealed`), and every
+later run in it guards against them, with or without `--with-isolated`:
+a copy that turns up after the run (a dev server the command started in
+the background, which writes its environment to a log a minute later) is
+quarantined and taken out by the next run, never recorded. `vl` does not
+kill background processes a command leaves running; `vl ws rm` forgets
+the guard with the sandbox.
 
 Other quarantined files (the scanner found what looks like a secret in
 something the command wrote) stay in the sandbox, as they would in your
@@ -254,13 +273,32 @@ Use the vault for secrets an agent needs (`vl run`), not files it writes.
   directory are cloned instead of copied: no time, no extra space until one
   side changes. Elsewhere (ext4, tmpfs) they are written normally, so a
   sandbox takes as much space as the workspace's files.
-* **Crashes.** If `vl` dies during a run (`kill -9`, a crash, a power cut),
-  the sandbox is wiped: by a small reaper process that watches `vl`, or by
-  the next run, which finds the run unfinished (`Rebuilding the sandbox of
-  workspace agent: the previous run did not finish`) and starts from a
-  fresh copy. What the dead run changed is lost; what earlier runs recorded
-  is not. The same happens after a reboot, and to a sandbox whose files
-  were tampered with in a way Veil cannot trust.
+* **Nothing a command wrote is ever lost to a failure.** If `vl` is
+  killed while the command runs (`kill -9`, a crash), or its result cannot
+  be recorded (another `vl` held the repository for too long:
+  `the command's output was not recorded: …; it stays in the sandbox`),
+  the files stay where they are. The next run records them first
+  (`Recording the output of an earlier run in workspace agent, which was
+  not recorded`), or `vl ws exec agent --record-only` does, without
+  running anything. If the run had `--with-isolated`, a small reaper
+  process that watches `vl` takes the injected files out again.
+* **SIGTERM and SIGHUP** (an IDE stopping a task, `kill`, closing the
+  terminal) are passed on to the command, like Ctrl-C: it stops, and `vl`
+  records what it left.
+* **Rebuilds.** After a reboot (sandbox files are written without
+  flushing them to disk, so a power cut can tear them), or when a run died
+  before its command started (`Rebuilding the sandbox of workspace agent:
+  the previous run did not finish`), or when the sandbox was tampered with
+  in a way Veil cannot trust, the sandbox is rebuilt from the workspace.
+  Work that is in no snapshot survives it: quarantined files and files
+  kept outside `--only` paths are put back (`kept 2 file(s) of unrecorded
+  work across the rebuild: …`), and if other files differ from the
+  workspace (your own edits, or files the crash tore), or a run that was
+  interrupted by a reboot was never recorded, the previous files are moved
+  whole to `.veil/local/sandboxes/agent/unrecorded-…/`, with a warning:
+  copy back what you need, then delete it. `vl doctor` lists them, and
+  `vl ws rm` refuses to delete them without `--force`. Ignored build
+  output (`target/`) does not survive a rebuild.
 * Files you edit in the sandbox yourself, between runs, are recorded by
   the next run, as if the command had written them.
 * Tools that look in parent directories (Node's `node_modules` lookup,
@@ -271,7 +309,7 @@ Use the vault for secrets an agent needs (`vl run`), not files it writes.
   `veil-ws-ephemeral-<pid>-<random>`, private to you and removed when `vl`
   exits, including after `kill -9`.
 * `vl doctor` reports leftover throwaway sandboxes, sandboxes of removed
-  workspaces and interrupted runs.
+  workspaces, interrupted and unrecorded runs, and files a rebuild kept.
 * A sandbox is an isolation of **files**, not a security boundary: the
   command runs as you, with your network and your home directory. Run
   untrusted agents inside your own container or VM.
