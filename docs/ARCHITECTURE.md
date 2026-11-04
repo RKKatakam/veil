@@ -717,6 +717,30 @@ CAS, and it applies these rules in order:
      still goes through the secret scanner below. A policy that arrived by
      merge, `vl new <cloaked change>` in an ordinary workspace, rebases and
      squashes never move sealed content to another audience.
+     **The rule only ever keeps a file out of public view; it never takes
+     an audience the policy does not name** (BUG-125). When the policy (as
+     pinned by the accepted policy) cloaks the path under `P` and the
+     parent's verified sealing is another scope `Q`, with no edit of
+     `.veilpolicy` in this snapshot re-keying it, an *edit* is sealed for
+     neither: it is held back (`cloak_failures`; the file stays local,
+     history keeps the recorded entry as it is), and unchanged content
+     keeps its entry. That state has no honest route of its own (a re-key
+     edits the policy in the same snapshot, and an incoming re-key the
+     member has not accepted is a held-back policy, which waits for `vl
+     policy accept` like any other); Mallory, who can push, produces it by
+     replacing `secrets/db.yml` on `main` with a genuine object sealed for
+     `mal`, a scope Alice is also in. Sealing Alice's edit for `Q` hands it
+     to whoever put the object there. Sealing it for `P` with a warning was
+     the alternative, and is rejected for the same reason as in merges
+     (next rule): the edit holds the `Q` content it was made from, and
+     membership is not ordered, so neither scope is safe to pick for the
+     other's content; it would also undo, on the member's next edit, a
+     teammate's genuine re-key the member has not yet accepted. The report
+     names the way out: `vl cloak --scope P PATH` (a deliberate re-key, by
+     this rule's own exception) or, for an incoming re-key, `vl policy
+     accept`. A file the policy leaves public (sealed only by a cloaked
+     line or by an earlier `vl cloak --scope` that the policy no longer
+     names) is not affected: it keeps its parent's scope as before.
    * **Merging never moves content between scopes** (BUG-123). When the two
      sides of a file are (verifiably) sealed for different scopes,
      `merge::merge_file` seals nothing for either audience: the result

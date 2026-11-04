@@ -1406,6 +1406,28 @@ impl Builder<'_> {
             }
         }
 
+        // The policy names one scope, the parent's (verified) sealing another,
+        // and no edit of `.veilpolicy` in this snapshot re-keyed the path
+        // (BUG-125). No honest route leaves that state behind (a re-key edits
+        // the policy in the same snapshot); Mallory, who can push, can, with
+        // a genuine object of a scope Alice is also in. Neither audience is
+        // taken: sealing for the parent's would hand the edit to whoever put
+        // that object there, sealing for the policy's would hand the old
+        // content to the policy's scope. Unchanged content was kept above.
+        if let (Tier::Cloaked(named), Visibility::Cloaked { scope }) = (&class.tier, &desired) {
+            if named != scope {
+                let why = match &class.held_back {
+                    Some(_) => format!(
+                        "its recorded version is sealed for '{scope}', and so would be the edit, but your accepted policy seals it for '{named}'; the edit stays local, history keeps the recorded version (if '{scope}' is meant, `vl policy accept`)"
+                    ),
+                    None => format!(
+                        "the policy seals it for '{named}' but its recorded version is sealed for '{scope}' (a remote may have replaced it); the edit stays local, history keeps the recorded version (`vl cloak --scope {named} {path}` seals it for '{named}')"
+                    ),
+                };
+                return self.cannot_seal(path, name, parent_file, why);
+            }
+        }
+
         // Backstop: new content is never sealed under a key that is not an
         // audience: a released embargo's key is public, and a cloak label
         // must name a scope (never `embargo/…`, `local` or a generation).

@@ -14,7 +14,13 @@
 //! replaces the file with her own content, really sealed under `mal`, a
 //! scope Alice is also a member of. Merging and rebasing Alice's pending
 //! `team` edit against it is a merge of two sides sealed for different
-//! scopes, which must never move Alice's edit to `mal` (BUG-123).
+//! scopes, which must never move Alice's edit to `mal` (BUG-123). Editing
+//! it after `vl new main` or `vl edit main` must not either (BUG-125): the
+//! policy says `team`, the object says `mal`, and Alice's edit is held back
+//! (the file stays local, history keeps Mallory's entry) rather than sealed
+//! for either audience. `Label::GenuineMalPolicy` is the same object with
+//! `.veilpolicy` re-keyed to `secrets/ cloak mal` as well, which Alice's
+//! accepted policy holds back.
 
 mod adversarial_support;
 
@@ -41,6 +47,14 @@ enum Label {
     Local,
     Unchanged,
     GenuineMal,
+    GenuineMalPolicy,
+}
+
+impl Label {
+    /// Mallory's own content, genuinely sealed under `mal`.
+    fn genuine(self) -> bool {
+        matches!(self, Label::GenuineMal | Label::GenuineMalPolicy)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -78,7 +92,7 @@ fn label_vis(l: Label, ids: &Ids) -> Visibility {
         },
         Label::OldGeneration => cloaked("team#0000000000000000"),
         Label::Local => cloaked("local"),
-        Label::Unchanged | Label::GenuineMal => cloaked("team"),
+        Label::Unchanged | Label::GenuineMal | Label::GenuineMalPolicy => cloaked("team"),
     }
 }
 
@@ -109,7 +123,7 @@ fn mallory_pushes(hub: Arc<MemoryBackend>, main: ObjectId, alice_pub: &str, mall
     let mut secrets = (*store.tree(&secrets_id).unwrap()).clone();
     let mut e = secrets.get("db.yml").unwrap().clone();
     e.visibility = label_vis(label, &ids);
-    if let Label::GenuineMal = label {
+    if label.genuine() {
         let mal = Visibility::Cloaked { scope: "mal".into() };
         e.id = store.store_file(MALLORYS, &mal).unwrap();
         e.size = MALLORYS.len() as u64;
@@ -117,6 +131,13 @@ fn mallory_pushes(hub: Arc<MemoryBackend>, main: ObjectId, alice_pub: &str, mall
     }
     secrets.insert(e);
     root.insert(veil_core::TreeEntry::dir("secrets", store.put_tree(&secrets).unwrap()));
+    if let Label::GenuineMalPolicy = label {
+        let mut pe = root.get(".veilpolicy").unwrap().clone();
+        let policy = b"secrets/ cloak mal\n";
+        pe.id = store.store_file(policy, &Visibility::Public).unwrap();
+        pe.size = policy.len() as u64;
+        root.insert(pe);
+    }
     let tree = store.put_tree(&root).unwrap();
     let evil = store
         .put_snapshot(&Snapshot {
@@ -168,10 +189,39 @@ fn run(label: Label, cloak: Cloak, route: Route, n: u32) {
                 _ => alice.edit(WS, new_main).unwrap(),
             }
             checkout_wc(&mut alice, &fs, old);
-            assert_eq!(fs.read(&p("secrets/db.yml")).unwrap(), OLD);
+            // Alice does see the content change on checkout.
+            let shown = if label.genuine() { MALLORYS } else { OLD };
+            assert_eq!(fs.read(&p("secrets/db.yml")).unwrap(), shown);
             fs.write(&p("secrets/db.yml"), edited.as_bytes()).unwrap();
-            snap(&mut alice, &*fs);
-            alice.commit_working_copy(WS, "rotate").unwrap().0
+            let report = alice.snapshot_workspace(WS, &*fs).unwrap().report;
+            let committed = alice.commit_working_copy(WS, "rotate").unwrap().0;
+            if label.genuine() {
+                // BUG-125: the policy (pinned by Alice's accepted policy)
+                // says `team`, the parent object is sealed for `mal`. The
+                // edit is sealed for neither: it stays local, reported, and
+                // history keeps Mallory's entry as it is.
+                assert!(
+                    report.cloak_failures.iter().any(|(q, _)| q.as_str() == "secrets/db.yml"),
+                    "{label:?}/{cloak:?}/{route:?}: the edit was not held back: {:?}",
+                    report.cloak_failures
+                );
+                let e = file_entry(&alice, &committed, "secrets/db.yml").expect("recorded");
+                assert_eq!(e.visibility, Visibility::Cloaked { scope: "mal".into() });
+                assert_eq!(read_at(&alice, &committed, "secrets/db.yml"), MALLORYS);
+                assert_eq!(fs.read(&p("secrets/db.yml")).unwrap(), edited.as_bytes(), "the edit stays local");
+                leak_check(&mut alice, &hub, &mallory, &secret, committed, &format!("{label:?}/{cloak:?}/{route:?}"));
+                // The way out the report names: `vl cloak --scope team
+                // secrets/db.yml`, an edit of `.veilpolicy` that re-keys the
+                // file deliberately.
+                let mut policy = fs.read(&p(".veilpolicy")).unwrap();
+                policy.extend_from_slice(b"secrets/db.yml cloak team\n");
+                fs.write(&p(".veilpolicy"), &policy).unwrap();
+                let report = alice.snapshot_workspace(WS, &*fs).unwrap().report;
+                assert!(report.cloak_failures.is_empty(), "{label:?}/{cloak:?}/{route:?}: {:?}", report.cloak_failures);
+                alice.commit_working_copy(WS, "re-key").unwrap().0
+            } else {
+                committed
+            }
         }
         Route::Rebase => {
             // A pending edit, rebased onto the pulled main.
@@ -206,16 +256,27 @@ fn run(label: Label, cloak: Cloak, route: Route, n: u32) {
         e.visibility.label()
     );
 
+    leak_check(&mut alice, &hub, &mallory, &secret, committed, &format!("{label:?}/{cloak:?}/{route:?}"));
+    // The commit message is never sealed under an embargo key.
+    if let Text::Sealed(env) = &alice.snapshot(&committed).unwrap().description {
+        assert!(!env.scope.starts_with("embargo/"), "message sealed under {}", env.scope);
+    }
+}
+
+/// Publish Alice's `committed` to the team remote and a public mirror at
+/// `main`: her new `secret` is readable on neither, by Mallory or anyone.
+fn leak_check(alice: &mut Repo, hub: &Arc<MemoryBackend>, mallory: &Identity, secret: &str, committed: ObjectId, case: &str) {
+    let e = file_entry(alice, &committed, "secrets/db.yml").expect("recorded");
     // Publish: the team remote, and a public mirror at `main`.
-    remote::push(&mut alice, hub.clone(), false, &[], false).unwrap();
+    remote::push(alice, hub.clone(), false, &[], false).unwrap();
     let _ = alice.set_tag("main", committed, None, true);
     let mirror = Arc::new(MemoryBackend::new());
     // A refused public push publishes nothing; either way, check.
-    let _ = remote::push(&mut alice, mirror.clone(), true, &["main".into()], false);
+    let _ = remote::push(alice, mirror.clone(), true, &["main".into()], false);
 
-    for (what, backend) in [("team remote", &hub), ("public mirror", &mirror)] {
+    for (what, backend) in [("team remote", hub), ("public mirror", &mirror)] {
         let hits = backend_contains(&**backend, secret.as_bytes());
-        assert!(hits.is_empty(), "{label:?}/{cloak:?}/{route:?}: plaintext on the {what}: {hits:?}");
+        assert!(hits.is_empty(), "{case}: plaintext on the {what}: {hits:?}");
     }
     // Mallory (in `mal`, holding every embargo key she made) and an
     // anonymous reader open everything they can reach.
@@ -230,21 +291,17 @@ fn run(label: Label, cloak: Cloak, route: Route, n: u32) {
             };
             if let Ok(data) = r.store().read_entry(&e) {
                 assert!(
-                    !String::from_utf8_lossy(&data).contains(&secret),
-                    "{label:?}/{cloak:?}/{route:?}: {who} reads Alice's new secret at {name}"
+                    !String::from_utf8_lossy(&data).contains(secret),
+                    "{case}: {who} reads Alice's new secret at {name}"
                 );
             }
         }
         if let Ok(data) = r.store().read_entry(&e) {
             assert!(
-                !String::from_utf8_lossy(&data).contains(&secret),
-                "{label:?}/{cloak:?}/{route:?}: {who} reads Alice's committed entry"
+                !String::from_utf8_lossy(&data).contains(secret),
+                "{case}: {who} reads Alice's committed entry"
             );
         }
-    }
-    // The commit message is never sealed under an embargo key.
-    if let Text::Sealed(env) = &alice.snapshot(&committed).unwrap().description {
-        assert!(!env.scope.starts_with("embargo/"), "message sealed under {}", env.scope);
     }
 }
 
@@ -258,6 +315,8 @@ fn label() -> impl Strategy<Value = Label> {
         Just(Label::OldGeneration),
         Just(Label::Local),
         Just(Label::Unchanged),
+        Just(Label::GenuineMal),
+        Just(Label::GenuineMalPolicy),
     ]
 }
 
@@ -292,8 +351,12 @@ proptest! {
 /// Both merging routes against a genuine `mal` object, on every run.
 #[test]
 fn a_genuine_other_scope_object_is_neutralised_by_rebase_and_merge() {
-    for (i, r) in [Route::Rebase, Route::Merge].into_iter().enumerate() {
-        run(Label::GenuineMal, Cloak::None, r, 200 + i as u32);
+    let mut n = 200;
+    for l in [Label::GenuineMal, Label::GenuineMalPolicy] {
+        for r in [Route::Rebase, Route::Merge] {
+            n += 1;
+            run(l, Cloak::None, r, n);
+        }
     }
 }
 
@@ -325,6 +388,23 @@ fn every_hostile_cloak_field_is_neutralised() {
         for r in [Route::New, Route::Edit, Route::Rebase, Route::Merge] {
             n += 1;
             run(Label::Unchanged, c, r, n);
+        }
+    }
+}
+
+/// BUG-125: Mallory's genuine `mal` object under a policy that says `team`
+/// (and, with `GenuineMalPolicy`, a `.veilpolicy` re-keyed to `mal` that
+/// Alice's accepted policy holds back), edited after `vl new main` or
+/// `vl edit main`: the edit is never sealed for `mal`.
+#[test]
+fn a_genuine_other_scope_object_is_never_the_audience_of_an_edit() {
+    let mut n = 300;
+    for l in [Label::GenuineMal, Label::GenuineMalPolicy] {
+        for c in [Cloak::None, Cloak::Mal] {
+            for r in [Route::New, Route::Edit] {
+                n += 1;
+                run(l, c, r, n);
+            }
         }
     }
 }

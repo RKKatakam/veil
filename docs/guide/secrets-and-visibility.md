@@ -434,6 +434,16 @@ either: the file is a conflict, and the side that kept the scope it had
 before (else the destination's) is kept as it is. Reconcile them
 deliberately (`vl cloak --scope`).
 
+**Editing does not either.** If `.veilpolicy` cloaks a file under `team`
+but the version you checked out is sealed for another scope, say `mal`
+(someone who can push replaced it; an honest re-key edits the policy at
+the same time), your edit is sealed for neither. It stays local and every
+snapshot says so; history keeps the recorded version. Look at what
+changed the file, then decide: `vl cloak --scope team PATH` seals your
+edit for `team`. If the policy you checked out re-keys the file and your
+accepted policy holds that back, the report points to `vl policy accept`
+instead.
+
 > **Public files edited in a cloaked workspace.** A public file you *edit*
 > in a cloaked workspace is recorded cloaked, together with its last public
 > version. Anyone who cannot read the scope (a public remote, GitHub,
