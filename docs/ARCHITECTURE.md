@@ -743,8 +743,9 @@ fast-forward. A diverged tag is reported and left alone
 
 **The repository lock** (`lock.rs`) is the file `.veil/lock`, created with
 `create_new`, so it behaves the same on every backend. It holds JSON: a random
-per-acquisition token, the holder's pid, host name, boot identity (Linux boot
-id plus pid namespace) and a lease (10 s by default).
+per-acquisition token, the holder's pid and process start time, host name,
+boot identity (Linux boot id plus pid namespace), a lease (10 s by default)
+and, once renewed, when it was acquired on the backend's own stamp clock.
 
 * While a `RepoLock` lives, a heartbeat thread renews the lease every 2.5 s.
   However long a transaction runs, its lock never looks stale. (The MVP stole
@@ -759,6 +760,13 @@ id plus pid namespace) and a lease (10 s by default).
   renewing (suspended, stuck), is never robbed. The contender times out
   with an error naming the holder. Legacy `"<pid> <millis>"` lock files
   (from local-only earlier versions) are judged as locks of this machine.
+* A reused pid does not keep a dead holder's lock. The lock records the
+  holder's start time (`pid_start`: `starttime` from `/proc/<pid>/stat` on
+  Linux, `proc_pidinfo` on macOS). A live process under that pid with
+  another start time is someone else, so the holder is gone and the lock
+  is taken over at once. Locks without it (older versions) are taken over
+  once their lease has expired if the process under their pid started more
+  than a minute after the lock's `acquired` time.
 * Each process keeps a registry of the tokens its live locks hold, and of
   the thread holding each. A lock file with this process's pid and an
   unregistered token was leaked, for example by a crash that prevented the
@@ -772,6 +780,17 @@ id plus pid namespace) and a lease (10 s by default).
   has the exact bytes that were judged stale, replaces it with its own lock
   in one atomic write. Two contenders can never both win, and no third
   process can slip in between the removal and the new lock.
+  A guard left by a contender that crashed mid-takeover is never removed
+  by anyone else. Check-then-remove would let two contenders that both
+  judged it dead each remove "it", the second one deleting the guard the
+  first had just created, and both would take over. Instead it is
+  *replaced* in one write by a contender holding a sub-guard named after the
+  dead guard's bytes, `.veil/lock.steal.<hash>`, claimed by the same rule
+  (one level further down if its holder crashed too). Those bytes are
+  never written again (they hold a random token), so each dead guard has
+  one winner, and every guard file is removed only by its holder. A
+  sub-guard is left behind only if a contender crashes while holding one.
+  It is harmless and may be deleted while no command runs.
 * **Network remotes: fencing leases.** On an `is_network()` backend
   (SFTP), other hosts can never prove a holder gone, so a client that
   crashed mid-push would lock the remote forever. Its lock is a *fencing*
@@ -835,6 +854,22 @@ repository.
   unsynced either. Barriers on one backend are serialised, so a barrier
   never returns while another thread is still syncing writes the caller
   depends on.
+* **A failed barrier voids what it covered.** After an `fsync` error, Linux
+  marks the failed pages clean: the files read back intact from the page
+  cache but are not on disk, and a retried `fsync` succeeds without
+  writing anything. Reusing such an object (the store skips objects that
+  exist and verify) in a later, acknowledged transaction would lose it at
+  the next power loss. So the object store remembers which loose objects
+  it wrote unsynced since the last successful barrier, and when a barrier
+  fails it removes them and syncs the removals. Nothing references them
+  yet, and a retry writes fresh copies. If they cannot be removed, the
+  transaction does not release the lock. It leaves the lock file behind,
+  flagged `"recover": true`, and any contender (this process, another, any
+  host) takes it over at once and runs crash recovery, which rewrites them
+  as new files or removes them. Push and pull use the same store barrier
+  before writing a pack index. `crash.rs` sweeps this with a failing
+  barrier at every point of snapshot, merge, push and pull, with and
+  without removals failing too, followed by a retry and a power loss.
 * So after a crash at any point, `op_head` names a complete operation whose
   view references only complete, durable objects. The worst leftovers are
   unreachable objects, an operation that never became the head, temp files
@@ -845,9 +880,18 @@ repository.
   names. A later transaction must not reuse such an object instead of
   writing its own copy (the store skips objects that exist). So right after
   a takeover, the new holder runs `fsck::recover_interrupted_writes` under
-  the lock: it re-hashes the loose objects modified since shortly before the
-  dead holder took the lock (or all of them when the backend's clock is not
-  a wall clock), removes those that fail, and rewrites and syncs the rest.
+  the lock. It re-hashes the loose objects modified since the dead holder
+  took the lock, removes those that fail, and rewrites (as new files) and
+  syncs the rest. That moment is known on the backend's own stamp clock:
+  the holder stats its lock file right after acquiring it and records the
+  stamp in every renewal (`since_stamp`). A lock never renewed is still the
+  file written at acquisition, so its own stamp serves. The window then
+  starts five minutes earlier on wall-clock filesystems (clock steps) and
+  exactly there on generation-stamped ones. Fanout directories not modified
+  since are skipped without listing them. Older locks, and backends without
+  usable stamps (SFTP), fall back to the holder's wall-clock `acquired`
+  time minus an hour, or to every loose object. If recovery fails, the
+  lock is left flagged for the next contender rather than released.
   Until then `fsck` reports torn unreachable objects under a leftover lock
   as a note.
 * Undo is unaffected.
@@ -880,7 +924,9 @@ entry that references it:
 later one, with the fatal write either lost or applied. The barrier is a
 mutation too. In a third mode, *power loss*, the fatal write is lost and
 every write not yet covered by a barrier is torn (removed, emptied or
-truncated). For snapshot, commit,
+truncated). A separate sweep (`EioBackend`) fails one barrier at a
+time with Linux's post-error semantics, retries the command, then cuts the
+power (see above). For snapshot, commit,
 rebase, merge, embargoed merge, push, public push, pull and init, the tests
 sweep every N. After each crash the repository must open and pass `fsck`.
 The operation must appear either not at all or exactly once on top of the old

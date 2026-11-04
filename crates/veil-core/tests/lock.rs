@@ -283,3 +283,236 @@ fn disk_create_new_is_exclusive_and_complete() {
     fs.write(&path, b"third").unwrap();
     assert_eq!(fs.read(&path).unwrap(), b"third");
 }
+
+// ---- pid reuse, locks left for recovery, takeover guards, recovery window ----
+
+/// `info` with extra lock-file fields (`pid_start`, `since_stamp`,
+/// `recover`), as the current version writes them.
+fn plant_with(fs: &dyn StorageBackend, path: &VPath, info: &LockInfo, extra: serde_json::Value) {
+    let mut v = serde_json::to_value(info).unwrap();
+    for (k, x) in extra.as_object().unwrap() {
+        v[k] = x.clone();
+    }
+    fs.write(path, &serde_json::to_vec(&v).unwrap()).unwrap();
+}
+
+/// A current lock records its holder's start time: a live process under
+/// the holder's pid that started at another time is someone else (the pid
+/// was reused), and the lock is taken over at once, even with a fresh lease.
+/// With the right start time, the same lock is waited for.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_recorded_start_time_tells_a_reused_pid_from_the_holder() {
+    let mut alive = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+    let start = veil_core::lock::process_start(alive.id()).expect("start time of a live child");
+    for (fs, _tmp) in backends() {
+        let info = LockInfo {
+            lease_ms: 60_000,
+            ..foreign_lock(alive.id(), 0)
+        };
+        plant_with(&*fs, &lock_path(), &info, serde_json::json!({ "pid_start": start.id }));
+        let err = RepoLock::acquire_with(fs.clone(), &quick(300)).unwrap_err();
+        assert!(matches!(err, VeilError::Locked(_)), "{err}");
+
+        plant_with(&*fs, &lock_path(), &info, serde_json::json!({ "pid_start": start.id + 1 }));
+        let t = Instant::now();
+        let lock = RepoLock::acquire_with(fs.clone(), &quick(5_000)).unwrap();
+        assert!(t.elapsed() < Duration::from_secs(2), "taken over at once");
+        drop(lock);
+    }
+    let _ = alive.kill();
+    let _ = alive.wait();
+}
+
+/// A lock left behind for recovery (`RepoLock::abandon`) is taken over at
+/// once, from any host and whatever its lease says, and the new holder runs
+/// crash recovery first: a torn object is removed, an intact one kept.
+#[test]
+fn a_lock_left_for_recovery_is_taken_over_at_once_and_recovered() {
+    for (fs, _tmp) in backends() {
+        let good = b"intact object".to_vec();
+        let good_path = object_path(&veil_core::ObjectId::hash(&good));
+        let torn_path = object_path(&veil_core::ObjectId::hash(b"whole object"));
+        let info = LockInfo {
+            host: "elsewhere".into(),
+            boot: "simulated-elsewhere".into(),
+            lease_ms: 600_000,
+            ..foreign_lock(1, 0)
+        };
+        plant_with(&*fs, &lock_path(), &info, serde_json::json!({ "recover": true }));
+        fs.write_unsynced(&good_path, &good).unwrap();
+        fs.write_unsynced(&torn_path, b"whole").unwrap();
+        let lock = RepoLock::acquire_with(fs.clone(), &quick(300)).unwrap();
+        assert_eq!(RepoLock::holder(&*fs).unwrap().unwrap().pid, std::process::id());
+        assert!(!fs.exists(&torn_path).unwrap(), "torn object removed ({})", fs.kind());
+        assert_eq!(fs.read(&good_path).unwrap(), good);
+        drop(lock);
+    }
+}
+
+/// `abandon` leaves the lock behind, flagged; the next acquisition, in this
+/// process too, takes it over at once.
+#[test]
+fn an_abandoned_lock_is_left_flagged_and_reclaimed() {
+    for (fs, _tmp) in backends() {
+        let mut lock = RepoLock::acquire(fs.clone()).unwrap();
+        lock.abandon();
+        drop(lock);
+        let raw = fs.read(&lock_path()).expect("left behind");
+        assert!(veil_core::lock::needs_recovery(&raw));
+        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert!(v["since_stamp"].is_i64(), "acquisition stamp recorded: {v}");
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            assert!(v["pid_start"].is_u64(), "holder start time recorded: {v}");
+        }
+        let t = Instant::now();
+        drop(RepoLock::acquire_with(fs.clone(), &quick(5_000)).unwrap());
+        assert!(t.elapsed() < Duration::from_secs(2));
+        assert!(!fs.exists(&lock_path()).unwrap());
+    }
+}
+
+fn object_path(id: &veil_core::ObjectId) -> VPath {
+    let hex = id.hex();
+    VPath::new(&format!(".veil/objects/{}/{}", &hex[..2], &hex[2..])).unwrap()
+}
+
+/// A contender crashed holding the takeover guard, and another one crashed
+/// while replacing that guard (holding its sub-guard). Both are cleared
+/// without ever removing a guard file of someone else, and nothing is
+/// left behind.
+#[cfg(unix)]
+#[test]
+fn crashed_takeover_guards_at_two_levels_are_cleared() {
+    for (fs, _tmp) in backends() {
+        plant(&*fs, &foreign_lock(dead_pid(), 0));
+        let guard = foreign_lock(dead_pid(), 0);
+        let steal = VPath::new(veil_core::lock::STEAL_PATH).unwrap();
+        plant_with(&*fs, &steal, &guard, serde_json::json!({}));
+        let raw = fs.read(&steal).unwrap();
+        let sub = VPath::new(&format!(
+            "{}.{}",
+            veil_core::lock::STEAL_PATH,
+            &veil_core::ObjectId::hash(&raw).hex()[..16]
+        ))
+        .unwrap();
+        plant_with(&*fs, &sub, &foreign_lock(dead_pid(), 0), serde_json::json!({}));
+        let lock = RepoLock::acquire_with(fs.clone(), &quick(2_000)).unwrap();
+        let left: Vec<String> = fs
+            .list_dir(&VPath::new(".veil").unwrap())
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .filter(|n| n.starts_with("lock.steal"))
+            .collect();
+        assert!(left.is_empty(), "{left:?} ({})", fs.kind());
+        drop(lock);
+    }
+}
+
+/// A backend that counts reads of loose objects.
+#[derive(Debug)]
+struct CountingReads {
+    inner: MemoryBackend,
+    object_reads: std::sync::atomic::AtomicUsize,
+}
+
+impl StorageBackend for CountingReads {
+    fn kind(&self) -> &'static str {
+        "counting"
+    }
+    fn read(&self, path: &VPath) -> veil_core::Result<Vec<u8>> {
+        if path.as_str().starts_with(".veil/objects/") {
+            self.object_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.inner.read(path)
+    }
+    fn write(&self, path: &VPath, data: &[u8]) -> veil_core::Result<()> {
+        self.inner.write(path, data)
+    }
+    fn create_new(&self, path: &VPath, data: &[u8]) -> veil_core::Result<bool> {
+        self.inner.create_new(path, data)
+    }
+    fn remove_file(&self, path: &VPath) -> veil_core::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &VPath) -> veil_core::Result<()> {
+        self.inner.remove_dir_all(path)
+    }
+    fn create_dir_all(&self, path: &VPath) -> veil_core::Result<()> {
+        self.inner.create_dir_all(path)
+    }
+    fn list_dir(&self, path: &VPath) -> veil_core::Result<Vec<veil_core::vfs::DirEntry>> {
+        self.inner.list_dir(path)
+    }
+    fn metadata(&self, path: &VPath) -> veil_core::Result<Option<veil_core::vfs::Metadata>> {
+        self.inner.metadata(path)
+    }
+    fn set_executable(&self, path: &VPath, executable: bool) -> veil_core::Result<()> {
+        self.inner.set_executable(path, executable)
+    }
+    fn stat_clock(&self) -> Option<veil_core::vfs::StatClock> {
+        self.inner.stat_clock()
+    }
+}
+
+/// Crash recovery after a takeover only re-reads the objects written since
+/// the dead holder took the lock (recorded on the backend's own clock), not
+/// every object of the last hour or of the whole repository.
+#[cfg(unix)]
+#[test]
+fn recovery_after_a_takeover_reads_only_the_dead_holders_writes() {
+    let fs = Arc::new(CountingReads {
+        inner: MemoryBackend::new(),
+        object_reads: Default::default(),
+    });
+    for i in 0..200 {
+        let data = format!("old object {i}");
+        fs.write(&object_path(&veil_core::ObjectId::hash(data.as_bytes())), data.as_bytes())
+            .unwrap();
+    }
+    // A holder takes the lock (its first renewal records when, on the
+    // backend's clock), writes three objects unsynced, and dies.
+    let holder = foreign_lock(dead_pid(), 0);
+    plant(&*fs, &holder);
+    let since = fs.metadata(&lock_path()).unwrap().unwrap().mtime.unwrap();
+    let renewed = LockInfo {
+        renewed: holder.renewed + 2500,
+        ..holder
+    };
+    plant_with(&*fs, &lock_path(), &renewed, serde_json::json!({ "since_stamp": since }));
+    for i in 0..3 {
+        let data = format!("new object {i}");
+        fs.write_unsynced(&object_path(&veil_core::ObjectId::hash(data.as_bytes())), data.as_bytes())
+            .unwrap();
+    }
+    fs.object_reads.store(0, std::sync::atomic::Ordering::SeqCst);
+    let counter = fs.clone();
+    drop(RepoLock::acquire_with(fs, &quick(2_000)).unwrap());
+    let reads = counter.object_reads.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(reads, 3, "only the dead holder's objects are re-read");
+}
+
+/// The same holder, crashed before its first renewal (no recorded stamp):
+/// the lock file is still the one written at acquisition, and its own
+/// stamp bounds the window.
+#[cfg(unix)]
+#[test]
+fn a_holder_that_crashed_before_renewing_is_recovered_from_its_lock_stamp() {
+    let fs = Arc::new(CountingReads {
+        inner: MemoryBackend::new(),
+        object_reads: Default::default(),
+    });
+    for i in 0..50 {
+        let data = format!("old object {i}");
+        fs.write(&object_path(&veil_core::ObjectId::hash(data.as_bytes())), data.as_bytes())
+            .unwrap();
+    }
+    plant(&*fs, &foreign_lock(dead_pid(), 0));
+    let data = b"new object";
+    fs.write_unsynced(&object_path(&veil_core::ObjectId::hash(data)), data).unwrap();
+    fs.object_reads.store(0, std::sync::atomic::Ordering::SeqCst);
+    let counter = fs.clone();
+    drop(RepoLock::acquire_with(fs, &quick(2_000)).unwrap());
+    assert_eq!(counter.object_reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+}

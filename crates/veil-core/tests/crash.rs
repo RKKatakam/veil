@@ -15,6 +15,14 @@
 //! its final name. The retry must then not build on a torn object: the lock
 //! takeover discards them first (`fsck::recover_interrupted_writes`).
 //!
+//! A fourth fault is not a crash: a barrier that fails with EIO
+//! (`EioBackend`), with Linux's semantics afterwards (the failed files stay
+//! readable but never reach the disk, and a retried barrier succeeds without
+//! writing them). The command reports the error, the user runs it again, then
+//! the power fails: nothing the retry acknowledged may be lost. Swept over
+//! every barrier of every operation, also with a disk that refuses to remove
+//! files right after the failure (the lock is then left for recovery).
+//!
 //! Each operation is swept across every N until it completes. After every
 //! simulated crash the "disk" is reopened and must:
 //!
@@ -29,7 +37,7 @@
 //!   reclaimed), after which `fsck` still passes.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     io,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -43,7 +51,7 @@ use veil_core::{
     remote,
     repo::is_repo,
     tree::walk_files,
-    vfs::{DirEntry, Metadata},
+    vfs::{DirEntry, Metadata, StatClock},
     Identity, MemoryBackend, ObjectId, Repo, Result, StorageBackend, VPath, VeilError,
 };
 
@@ -188,6 +196,132 @@ impl StorageBackend for FaultyBackend {
     }
     fn set_executable(&self, path: &VPath, executable: bool) -> Result<()> {
         self.mutate(|| self.inner.set_executable(path, executable))
+    }
+}
+
+// ---- failing barriers ----------------------------------------------------------
+
+/// A disk whose `fail_at`-th barrier (counting from 0) fails once with EIO.
+/// Like Linux since 4.13, the error is reported once and the failed pages
+/// are marked clean: the files read back fine but are not on disk, and no
+/// later barrier writes them. Only rewriting a file (a new copy) makes it
+/// durable again. `power_loss` tears whatever is not durable.
+#[derive(Debug)]
+struct EioBackend {
+    inner: Arc<MemoryBackend>,
+    fail_at: usize,
+    barriers: AtomicUsize,
+    failed: AtomicBool,
+    /// While set, removing an object fails too (the lock file can still be
+    /// removed, so only a lock deliberately left behind triggers recovery).
+    refuse_removes: AtomicBool,
+    /// Written unsynced since the last successful barrier.
+    volatile: Mutex<HashSet<VPath>>,
+    /// Covered by the failed barrier: never durable unless rewritten.
+    lost: Mutex<HashSet<VPath>>,
+}
+
+impl EioBackend {
+    fn new(inner: Arc<MemoryBackend>, fail_at: usize, refuse_removes: bool) -> Self {
+        EioBackend {
+            inner,
+            fail_at,
+            barriers: AtomicUsize::new(0),
+            failed: AtomicBool::new(false),
+            refuse_removes: AtomicBool::new(refuse_removes),
+            volatile: Mutex::default(),
+            lost: Mutex::default(),
+        }
+    }
+
+    fn durable(&self, path: &VPath) {
+        self.volatile.lock().unwrap().remove(path);
+        self.lost.lock().unwrap().remove(path);
+    }
+
+    fn eio() -> VeilError {
+        VeilError::Io {
+            path: "<simulated disk>".into(),
+            source: io::Error::other("EIO: writeback failed"),
+        }
+    }
+
+    /// Tear every file that is not durable, as `FaultyBackend` does.
+    fn power_loss(&self) {
+        let mut gone: Vec<VPath> = self.volatile.lock().unwrap().drain().collect();
+        gone.extend(self.lost.lock().unwrap().drain());
+        gone.sort();
+        for (i, path) in gone.iter().enumerate() {
+            let Some(data) = self.inner.read_opt(path).unwrap() else { continue };
+            match i % 3 {
+                0 => self.inner.remove_file(path).unwrap(),
+                1 => self.inner.write(path, b"").unwrap(),
+                _ => self.inner.write(path, &data[..data.len() / 2]).unwrap(),
+            }
+        }
+    }
+}
+
+impl StorageBackend for EioBackend {
+    fn kind(&self) -> &'static str {
+        "eio"
+    }
+    fn read(&self, path: &VPath) -> Result<Vec<u8>> {
+        self.inner.read(path)
+    }
+    fn write(&self, path: &VPath, data: &[u8]) -> Result<()> {
+        self.inner.write(path, data)?;
+        self.durable(path);
+        Ok(())
+    }
+    fn write_unsynced(&self, path: &VPath, data: &[u8]) -> Result<()> {
+        self.inner.write(path, data)?;
+        self.lost.lock().unwrap().remove(path);
+        self.volatile.lock().unwrap().insert(path.clone());
+        Ok(())
+    }
+    fn sync_barrier(&self) -> Result<()> {
+        let mut volatile = self.volatile.lock().unwrap();
+        if self.barriers.fetch_add(1, Ordering::SeqCst) == self.fail_at {
+            self.failed.store(true, Ordering::SeqCst);
+            self.lost.lock().unwrap().extend(volatile.drain());
+            return Err(Self::eio());
+        }
+        volatile.clear();
+        Ok(())
+    }
+    fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool> {
+        let created = self.inner.create_new(path, data)?;
+        if created {
+            self.durable(path);
+        }
+        Ok(created)
+    }
+    fn remove_file(&self, path: &VPath) -> Result<()> {
+        if self.refuse_removes.load(Ordering::SeqCst) && path.as_str().starts_with(".veil/objects/") {
+            return Err(Self::eio());
+        }
+        self.inner.remove_file(path)?;
+        self.durable(path);
+        Ok(())
+    }
+    fn remove_dir_all(&self, path: &VPath) -> Result<()> {
+        self.inner.remove_dir_all(path)
+    }
+    fn create_dir_all(&self, path: &VPath) -> Result<()> {
+        self.inner.create_dir_all(path)
+    }
+    fn list_dir(&self, path: &VPath) -> Result<Vec<DirEntry>> {
+        self.inner.list_dir(path)
+    }
+    fn metadata(&self, path: &VPath) -> Result<Option<Metadata>> {
+        self.inner.metadata(path)
+    }
+    fn set_executable(&self, path: &VPath, executable: bool) -> Result<()> {
+        self.inner.set_executable(path, executable)
+    }
+    fn stat_clock(&self) -> Option<StatClock> {
+        self.inner.stat_clock()
     }
 }
 
@@ -403,6 +537,71 @@ fn sweep(name: &str, target: Target, op: Op) {
     assert!(torn > 0, "{name}: no power loss ever tore an unsynced write");
 }
 
+/// Sweep `op` across every barrier failing in turn (see `EioBackend`): the
+/// command may fail, the user runs it again, which must succeed, then the
+/// power fails. The repository must be healthy, with every earlier snapshot
+/// intact, and everything the retry recorded must still be readable (a
+/// reachable torn object is corruption for `fsck`).
+fn eio_sweep(name: &str, target: Target, op: Op) {
+    let w = world();
+    for refuse_removes in [false, true] {
+        let mut failures = 0;
+        for fail_at in 0..1000 {
+            let local = Arc::new(w.local.fork());
+            let stale = Arc::new(w.stale.fork());
+            let remote_old = Arc::new(w.remote_old.fork());
+            let target_disk = match target {
+                Target::Local => local.clone(),
+                Target::Stale => stale.clone(),
+                Target::RemoteOld => remote_old.clone(),
+            };
+            let eio = Arc::new(EioBackend::new(target_disk.clone(), fail_at, refuse_removes));
+            let pick = |t: Target, plain: Arc<MemoryBackend>| -> Arc<dyn StorageBackend> {
+                if t == target {
+                    eio.clone()
+                } else {
+                    plain
+                }
+            };
+            let env = Env {
+                id: w.id.clone(),
+                local: pick(Target::Local, local),
+                stale: pick(Target::Stale, stale),
+                remote_old: pick(Target::RemoteOld, remote_old),
+                remote: Arc::new(w.remote.fork()),
+                v3: w.v3,
+                side: w.side,
+            };
+            let ctx = format!("{name}: barrier {fail_at} fails (removals refused: {refuse_removes})");
+            let disk: Arc<dyn StorageBackend> = eio.clone();
+            let before = env.open(&disk).unwrap();
+            let before_history = history(&before);
+            drop(before);
+
+            let first = op(&env);
+            if !eio.failed.load(Ordering::SeqCst) {
+                first.unwrap_or_else(|e| panic!("{ctx}: failed without a fault: {e}"));
+                break;
+            }
+            failures += 1;
+            eio.refuse_removes.store(false, Ordering::SeqCst);
+            op(&env).unwrap_or_else(|e| panic!("{ctx}: the retry failed: {e}"));
+            drop(env);
+
+            eio.power_loss();
+            let repo = Repo::open(disk.clone(), Some(w.id.clone()), "alice")
+                .unwrap_or_else(|e| panic!("{ctx}: repository does not open after power loss: {e}"));
+            for (id, files) in &before_history {
+                assert_eq!(&files_of(&repo, id), files, "{ctx}: snapshot {} changed", id.short());
+            }
+            let _ = history(&repo);
+            drop(repo);
+            assert_healthy(disk, &w.id, &ctx);
+        }
+        assert!(failures >= 1, "{name}: no barrier ever failed");
+    }
+}
+
 // ---- the operations --------------------------------------------------------------
 
 #[test]
@@ -480,6 +679,43 @@ fn crash_during_pull() {
         let mut repo = env.open(&env.stale)?;
         let report = remote::pull(&mut repo, "origin", env.remote.clone())?;
         assert!(report.warnings.is_empty(), "{report:?}");
+        assert_eq!(repo.view().tags["main"].target, env.v3);
+        Ok(())
+    });
+}
+
+#[test]
+fn eio_during_snapshot() {
+    eio_sweep("snapshot", Target::Local, |env| {
+        let mut repo = env.open(&env.local)?;
+        repo.snapshot_workspace(WS, &*env.local)?;
+        Ok(())
+    });
+}
+
+#[test]
+fn eio_during_merge() {
+    eio_sweep("merge", Target::Local, |env| {
+        let mut repo = env.open(&env.local)?;
+        repo.merge(WS, env.v3, vec![env.side], "merge side", None)?;
+        Ok(())
+    });
+}
+
+#[test]
+fn eio_during_push() {
+    eio_sweep("push", Target::RemoteOld, |env| {
+        let mut repo = env.open(&env.local)?;
+        remote::push(&mut repo, env.remote_old.clone(), false, &[], false)?;
+        Ok(())
+    });
+}
+
+#[test]
+fn eio_during_pull() {
+    eio_sweep("pull", Target::Stale, |env| {
+        let mut repo = env.open(&env.stale)?;
+        remote::pull(&mut repo, "origin", env.remote.clone())?;
         assert_eq!(repo.view().tags["main"].target, env.v3);
         Ok(())
     });

@@ -239,7 +239,7 @@ impl<'a> PackSink<'a> {
             // `finish` writes the pack, then its index: the pack unsynced,
             // then a barrier, then the index durably. A crash before the
             // index leaves a pack nobody finds; the index is never torn.
-            if let Some((_, stats)) = b.finish(&PackWrites(self.backend), &self.dir)? {
+            if let Some((_, stats)) = b.finish(&PackWrites(self.backend, self.dest), &self.dir)? {
                 self.packs += 1;
                 self.bytes += stats.pack_bytes;
             }
@@ -270,9 +270,10 @@ impl<'a> PackSink<'a> {
 }
 
 /// The backend as `PackBuilder::finish` sees it: data files are written
-/// unsynced, and an index only after a barrier, durably.
+/// unsynced, and an index only after a barrier, durably. The barrier is the
+/// destination store's, which voids its own unsynced objects if it fails.
 #[derive(Debug)]
-struct PackWrites<'a>(&'a dyn StorageBackend);
+struct PackWrites<'a>(&'a dyn StorageBackend, &'a ObjectStore);
 
 impl StorageBackend for PackWrites<'_> {
     fn kind(&self) -> &'static str {
@@ -283,7 +284,7 @@ impl StorageBackend for PackWrites<'_> {
     }
     fn write(&self, path: &VPath, data: &[u8]) -> Result<()> {
         if path.as_str().ends_with(".idx") {
-            self.0.sync_barrier()?;
+            self.1.sync_barrier()?;
             self.0.write(path, data)
         } else {
             self.0.write_unsynced(path, data)

@@ -665,6 +665,8 @@ impl StorageBackend for SftpBackend {
             Ok(())
         })();
         if res.is_err() {
+            // As on disk: retried later, but the caller must rewrite or
+            // remove what failed (a retried fsync may prove nothing).
             self.unsynced.lock().unwrap().extend(batch);
         }
         res

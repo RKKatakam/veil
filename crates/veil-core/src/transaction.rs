@@ -315,10 +315,19 @@ impl<'r> Transaction<'r> {
 impl Drop for Transaction<'_> {
     /// Also on abort or error, so unsynced objects do not outlive the lock
     /// (released after this, when `_lock` drops): only a holder that dies
-    /// leaves any, and the next holder recovers them. (If this barrier
-    /// fails, the backend keeps the files queued for the next one.)
+    /// leaves any, and the next holder recovers them.
+    ///
+    /// A failed barrier (here or in `commit`) voids the objects it covered:
+    /// the store removes them, so neither this process nor the next lock
+    /// holder reuses a copy that may never reach the disk. If they cannot
+    /// be removed, the lock is left behind flagged for recovery instead of
+    /// being released, and the next holder (in any process) rewrites or
+    /// removes them before doing anything else.
     fn drop(&mut self) {
         self.repo.store.end_unsynced();
         let _ = self.repo.store.sync_barrier();
+        if self.repo.store.take_needs_recovery() {
+            self._lock.abandon();
+        }
     }
 }

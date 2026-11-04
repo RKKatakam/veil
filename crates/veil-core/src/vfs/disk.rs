@@ -481,8 +481,12 @@ impl StorageBackend for DiskBackend {
         })
         .and_then(|()| flush_drive_cache(&batch.files, &dirs));
         if let Err(e) = res {
-            // Keep the batch for the next barrier; nothing that depends on it
-            // may be written by the caller, which gets the error.
+            // Keep the batch for the next barrier: its directories still need
+            // syncing. A retried fsync of a file whose write-back failed
+            // proves nothing (the pages were marked clean), so the caller
+            // must rewrite or remove those files; the object store does
+            // (`ObjectStore::sync_barrier`). Nothing that depends on them may
+            // be written by the caller, which gets the error.
             let mut u = self.unsynced.lock().unwrap_or_else(|e| e.into_inner());
             u.files.extend(batch.files);
             u.dirs.extend(batch.dirs);

@@ -19,6 +19,13 @@
 //!   contender times out with a message naming the holder instead. Legacy
 //!   `"<pid> <millis>"` files (written by local-only earlier versions) are
 //!   read as locks of this machine.
+//! * **Reused pids.** The lock records its holder's start time
+//!   (`pid_start`, see [`process_start`]). A live process under the
+//!   holder's pid with another start time is someone else: the holder is
+//!   gone and the lock is taken over at once. For locks without it (older
+//!   versions), a live process that started more than a minute after the
+//!   lock's `acquired` time, once the lease has expired, cannot be the
+//!   holder either.
 //! * **Same process.** Every token held by a live `RepoLock` in this process
 //!   is in a registry, with the thread holding it. A lock file carrying this
 //!   process's pid but an unregistered token was leaked (its owner dropped
@@ -32,12 +39,24 @@
 //!   `create_new` file, `.veil/lock.steal`. Under it, the contender re-reads
 //!   the lock and, only if it still holds the exact bytes that were judged
 //!   stale, replaces it with its own in one atomic write, so two contenders
-//!   can never both win and no third one slips in between.
+//!   can never both win and no third one slips in between. A guard left by
+//!   a contender that crashed is never removed by others (check-then-remove
+//!   could delete a live contender's fresh guard, BUG-049) but replaced the
+//!   same way, under a sub-guard named after its bytes (see `claim`).
 //! * **Crash recovery.** The previous holder may have died between writing
 //!   objects unsynced and its durability barrier. Right after a takeover,
 //!   still under the lock, the new holder runs
 //!   [`crate::fsck::recover_interrupted_writes`]: torn objects are removed
-//!   and intact ones made durable, before anyone can reuse them.
+//!   and intact ones made durable, before anyone can reuse them. Only
+//!   objects modified since the dead holder took the lock are read: the
+//!   lock records that moment on the backend's own stamp clock
+//!   (`since_stamp`, or the lock file's stamp if it was never renewed).
+//!   If recovery fails, the lock is left behind for the next contender.
+//! * **Left for recovery.** A holder whose objects may not be durable and
+//!   could not be removed (a failed write barrier, see
+//!   [`crate::store::ObjectStore::sync_barrier`]) leaves the lock file
+//!   behind flagged `"recover": true` ([`RepoLock::abandon`]). Any
+//!   contender takes such a lock over at once and recovers.
 //! * **Fencing.** [`RepoLock::ensure_held`] re-reads the file and fails if the
 //!   token is no longer ours. Transactions call it right before moving the
 //!   operation head.
@@ -87,9 +106,10 @@
 //! | boot identity | `boot_id` + pid namespace | `kern.bootsessionuuid` | none (host name only) |
 //! | boot time | `btime` in `/proc/stat` | `kern.boottime` | unknown |
 //! | pid alive | `/proc/<pid>` | `kill(pid, 0)` | `kill(pid, 0)` |
+//! | process start | `starttime` in `/proc/<pid>/stat` | `proc_pidinfo` | unknown |
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex, OnceLock,
@@ -105,6 +125,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     crypto::random_bytes,
     error::{Result, VeilError},
+    fsck::RecoveryWindow,
+    id::ObjectId,
     now_millis,
     vfs::StorageBackend,
     vpath::VPath,
@@ -209,30 +231,66 @@ pub struct LockInfo {
     pub lease_ms: i64,
 }
 
-/// The lock file: [`LockInfo`] plus the fencing flag (kept out of
-/// `LockInfo` so its shape stays what older versions and callers know).
+/// What the lock file records beyond [`LockInfo`] (kept out of `LockInfo`
+/// so its shape stays what older versions and callers know; every field is
+/// omitted when unset, and older versions ignore them).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct Extras {
+    /// A fencing lock (see the module documentation).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    fencing: bool,
+    /// The holder process's start time, as [`process_start`] reports it:
+    /// with the pid, it identifies the process, so a reused pid is told
+    /// apart from the holder.
+    #[serde(default, rename = "pid_start", skip_serializing_if = "Option::is_none")]
+    start: Option<u64>,
+    /// When the lock was acquired, on the *backend's* stamp clock (the
+    /// lock file's own modification stamp right after it was written).
+    /// Crash recovery after a takeover only re-checks objects modified
+    /// since then.
+    #[serde(default, rename = "since_stamp", skip_serializing_if = "Option::is_none")]
+    since: Option<i64>,
+    /// The holder left the lock behind on purpose because objects it wrote
+    /// may not be durable (a failed write barrier, or a failed recovery):
+    /// the next contender takes it over at once and recovers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    recover: bool,
+}
+
+/// The lock file: [`LockInfo`] plus [`Extras`].
 #[derive(Serialize, Deserialize)]
 struct LockFile {
     #[serde(flatten)]
     info: LockInfo,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    fencing: bool,
+    #[serde(flatten)]
+    extra: Extras,
 }
 
-fn encode(info: &LockInfo, fencing: bool) -> Vec<u8> {
-    if !fencing {
-        return info.encode();
-    }
+fn encode(info: &LockInfo, extra: &Extras) -> Vec<u8> {
     serde_json::to_vec(&LockFile {
         info: info.clone(),
-        fencing,
+        extra: extra.clone(),
     })
     .expect("lock info serialises")
 }
 
+/// Parse a lock file, legacy formats included (their extras are empty).
+fn parse_file(raw: &[u8]) -> Option<(LockInfo, Extras)> {
+    if let Ok(f) = serde_json::from_slice::<LockFile>(raw) {
+        return Some((f.info, f.extra));
+    }
+    LockInfo::parse(raw).map(|i| (i, Extras::default()))
+}
+
 /// Whether a lock file is a fencing lock.
 pub fn is_fencing(raw: &[u8]) -> bool {
-    serde_json::from_slice::<LockFile>(raw).is_ok_and(|f| f.fencing)
+    serde_json::from_slice::<LockFile>(raw).is_ok_and(|f| f.extra.fencing)
+}
+
+/// Whether a lock file was left behind for crash recovery (see
+/// [`RepoLock::abandon`]).
+pub fn needs_recovery(raw: &[u8]) -> bool {
+    serde_json::from_slice::<LockFile>(raw).is_ok_and(|f| f.extra.recover)
 }
 
 impl LockInfo {
@@ -248,10 +306,6 @@ impl LockInfo {
             renewed: now,
             lease_ms: lease.as_millis() as i64,
         }
-    }
-
-    fn encode(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("lock info serialises")
     }
 
     /// Parse a lock file. Also accepts the legacy `"<pid> <millis>"` format
@@ -329,11 +383,41 @@ pub fn assess_in(
     unchanged_for: Option<Duration>,
     ctx: &LockContext,
 ) -> Verdict {
+    let extra = Extras {
+        fencing,
+        ..Extras::default()
+    };
+    assess_full(info, &extra, now, unchanged_for, ctx)
+}
+
+/// Decide about the lock file `raw` (any format) at time `now`; `None` if
+/// it cannot be parsed. Unlike [`assess`], this sees everything the file
+/// records, such as the holder's process start time.
+pub fn assess_raw(raw: &[u8], now: i64) -> Option<Verdict> {
+    let (info, extra) = parse_file(raw)?;
+    Some(assess_full(&info, &extra, now, None, &LockContext::default()))
+}
+
+/// How much later than the lock's `acquired` time a process must have
+/// started before it is taken not to be the holder, for locks that do not
+/// record the holder's start time (older versions). Generous, because both
+/// times are wall-clock readings, which NTP may have stepped in between.
+const REUSED_PID_SLACK_MS: i64 = 60_000;
+
+fn assess_full(info: &LockInfo, extra: &Extras, now: i64, unchanged_for: Option<Duration>, ctx: &LockContext) -> Verdict {
+    // Its holder gave it up on purpose, for the next holder to recover.
+    if extra.recover {
+        return Verdict::Steal("left behind for crash recovery".into());
+    }
+    let fencing = extra.fencing;
     let me = ctx.me();
     // On platforms without a boot id both sides are empty and the host name
     // alone identifies the machine.
     let same_machine = !me.host.is_empty() && info.host == me.host && info.boot == me.boot;
     if same_machine && info.pid == std::process::id() {
+        if extra.start.is_some() && process_start(info.pid).is_some_and(|s| Some(s.id) != extra.start) {
+            return Verdict::Steal(format!("holder pid {} was reused by this process", info.pid));
+        }
         return if live_tokens().contains_key(&info.token) {
             Verdict::Wait
         } else {
@@ -344,8 +428,16 @@ pub fn assess_in(
     // the pid can be reused, but never by the process that wrote this token,
     // so there is nothing to wait for (this is what makes recovery from
     // `kill -9` or Ctrl-C instant). Checked before the lease on purpose.
-    if same_machine && process_alive(info.pid) == Some(false) {
-        return Verdict::Steal(format!("holder pid {} is no longer running", info.pid));
+    if same_machine {
+        match process_alive(info.pid) {
+            Some(false) => return Verdict::Steal(format!("holder pid {} is no longer running", info.pid)),
+            Some(true) => {
+                if let Some(why) = pid_reused(info, extra, now) {
+                    return Verdict::Steal(why);
+                }
+            }
+            None => {}
+        }
     }
     if fencing {
         // The holder stops publishing once its lease lapses (it measures
@@ -404,6 +496,10 @@ pub struct RepoLock {
     backend: Arc<dyn StorageBackend>,
     path: VPath,
     token: String,
+    /// What the lock file says (as first written; the heartbeat renews its
+    /// own copy). [`RepoLock::abandon`] rewrites it.
+    info: LockInfo,
+    extra: Extras,
     lost: Arc<AtomicBool>,
     heartbeat: Option<Heartbeat>,
     /// A handle from [`RepoLock::acquire_reentrant`] inside an outer one:
@@ -412,6 +508,9 @@ pub struct RepoLock {
     /// Fencing locks only: the lease, and when (holder's monotonic clock)
     /// the last successful renewal started.
     fence: Option<Fence>,
+    /// Leave the lock file behind, flagged for recovery, instead of
+    /// removing it (see [`RepoLock::abandon`]).
+    abandoned: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -453,6 +552,34 @@ impl Observed {
     }
 }
 
+/// [`Observed`] for each takeover guard file, by path.
+type GuardsSeen = HashMap<String, Observed>;
+
+/// The modification stamp of `path` on the backend's stat clock, if the
+/// backend has a usable one.
+fn stamp_of(backend: &dyn StorageBackend, path: &VPath) -> Option<i64> {
+    backend.stat_clock()?;
+    backend.metadata(path).ok()??.mtime
+}
+
+/// Which loose objects the holder of the stale lock `info` may have left
+/// unsynced, for [`crate::fsck::recover_interrupted_writes`].
+fn recovery_window(backend: &dyn StorageBackend, path: &VPath, info: &LockInfo, extra: &Extras) -> RecoveryWindow {
+    if let Some(since) = extra.since {
+        return RecoveryWindow::Stamp(since);
+    }
+    // Never renewed: the file is still the one written when the lock was
+    // acquired, so its own stamp is the acquisition time. (The caller
+    // replaces it only if it still holds the bytes it judged, so this is
+    // the stamp of that version.)
+    if info.renewed == info.acquired {
+        if let Some(stamp) = stamp_of(backend, path) {
+            return RecoveryWindow::Stamp(stamp);
+        }
+    }
+    RecoveryWindow::Wall(info.acquired)
+}
+
 impl RepoLock {
     /// Acquire the lock with the timings and takeover rules for this kind
     /// of backend ([`LockOptions::for_backend`], [`LockContext::for_backend`]).
@@ -469,16 +596,19 @@ impl RepoLock {
     /// and inside transactions. Transactions themselves never nest.
     pub fn acquire_reentrant(backend: Arc<dyn StorageBackend>) -> Result<RepoLock> {
         let path = VPath::new(LOCK_PATH)?;
-        if let Some(info) = backend.read_opt(&path)?.and_then(|raw| LockInfo::parse(&raw)) {
+        if let Some((info, extra)) = backend.read_opt(&path)?.and_then(|raw| parse_file(&raw)) {
             if held_by_this_thread(&info.token) {
                 return Ok(RepoLock {
                     backend,
                     path,
-                    token: info.token,
+                    token: info.token.clone(),
+                    info,
+                    extra,
                     lost: Arc::new(AtomicBool::new(false)),
                     heartbeat: None,
                     nested: true,
                     fence: None,
+                    abandoned: false,
                 });
             }
         }
@@ -502,8 +632,13 @@ impl RepoLock {
         // reclaimed once it has stayed unchanged for a whole lease; a
         // fencing lock once it has not been renewed for lease + grace.
         let mut observed = Observed::default();
-        let mut guard_observed = Observed::default();
+        let mut guards_seen = GuardsSeen::new();
         let mut reason = String::from("another process holds the lock");
+        let extra = Extras {
+            fencing: ctx.fencing,
+            start: my_start(),
+            ..Extras::default()
+        };
         loop {
             let info = LockInfo::new_in(opts.lease, ctx);
             // Register before creating the file so no thread of this process
@@ -511,48 +646,53 @@ impl RepoLock {
             let token = Registered::new(info.token.clone());
             // The lease runs from before the write that may grant it.
             let attempt = clock.now();
-            if backend.create_new(&path, &encode(&info, ctx.fencing))? {
-                return Ok(Self::held(backend, path, info, token, opts, ctx, attempt));
+            if backend.create_new(&path, &encode(&info, &extra))? {
+                return Ok(Self::held(backend, path, info, extra, token, opts, ctx, attempt));
             }
             let Some(raw) = backend.read_opt(&path)? else {
                 continue; // released between our attempts
             };
             let unchanged_for = observed.see(&raw, clock.now());
-            // `Some(since)`: the stale lock may be replaced by ours. Its
+            // `Some(window)`: the stale lock may be replaced by ours. Its
             // holder may have died half-way through a batch of unsynced
-            // writes made after `since` (`None`: unknown).
-            let mut takeover: Option<Option<i64>> = None;
-            match LockInfo::parse(&raw) {
-                Some(holder) => {
-                    let fencing = is_fencing(&raw);
-                    if fencing {
+            // writes, made within `window`.
+            let mut takeover: Option<RecoveryWindow> = None;
+            match parse_file(&raw) {
+                Some((holder, holder_extra)) => {
+                    if holder_extra.fencing {
                         // Wait long enough to see an expired lease through.
                         let lease = Duration::from_millis(holder.lease_ms.clamp(0, 600_000) as u64);
                         wait = wait.max(lease + ctx.grace + Duration::from_secs(2));
                     }
-                    match assess_in(&holder, fencing, clock.wall_ms(), Some(unchanged_for), ctx) {
+                    match assess_full(&holder, &holder_extra, clock.wall_ms(), Some(unchanged_for), ctx) {
                         Verdict::Wait => {}
                         Verdict::Stuck(r) => reason = r,
-                        Verdict::Steal(_) => takeover = Some(Some(holder.acquired)),
+                        Verdict::Steal(_) => {
+                            takeover = Some(recovery_window(&*backend, &path, &holder, &holder_extra));
+                        }
                     }
                 }
                 None => {
                     if unchanged_for >= opts.lease {
-                        takeover = Some(None);
+                        takeover = Some(RecoveryWindow::All);
                     }
                     reason = format!("{LOCK_PATH} holds unreadable content");
                 }
             }
-            if let Some(since) = takeover {
+            if let Some(window) = takeover {
                 let attempt = clock.now();
-                let ours = encode(&info, ctx.fencing);
-                match take_over(&*backend, &path, &raw, &ours, ctx, &mut guard_observed)? {
+                let ours = encode(&info, &extra);
+                match take_over(&*backend, &path, &raw, &ours, ctx, &mut guards_seen)? {
                     TakeOver::Ours => {
-                        let lock = Self::held(backend, path, info, token, opts, ctx, attempt);
+                        let mut lock = Self::held(backend, path, info, extra, token, opts, ctx, attempt);
                         // Under our lock, before anyone builds on what the
                         // previous holder left: discard its torn objects and
-                        // make its intact ones durable.
-                        crate::fsck::recover_interrupted_writes(&*lock.backend, since)?;
+                        // make its intact ones durable. If that fails, the
+                        // lock is left for the next holder to try again.
+                        if let Err(e) = crate::fsck::recover_interrupted_writes(&*lock.backend, window) {
+                            lock.abandon();
+                            return Err(e);
+                        }
                         return Ok(lock);
                     }
                     TakeOver::Retry => continue,
@@ -568,15 +708,20 @@ impl RepoLock {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn held(
         backend: Arc<dyn StorageBackend>,
         path: VPath,
         info: LockInfo,
+        mut extra: Extras,
         token: Registered,
         opts: &LockOptions,
         ctx: &LockContext,
         attempt: Duration,
     ) -> RepoLock {
+        // Our acquisition time on the backend's own clock: renewals record
+        // it, so a takeover after our crash knows which objects to check.
+        extra.since = stamp_of(&*backend, &path);
         let lost = Arc::new(AtomicBool::new(false));
         let fence = ctx.fencing.then(|| Fence {
             lease: opts.lease,
@@ -587,7 +732,8 @@ impl RepoLock {
         let heartbeat = Heartbeat::spawn(
             backend.clone(),
             path.clone(),
-            info,
+            info.clone(),
+            extra.clone(),
             opts.renew_every,
             lost.clone(),
             ctx.clock.clone(),
@@ -597,10 +743,13 @@ impl RepoLock {
             backend,
             path,
             token: token.keep(),
+            info,
+            extra,
             lost,
             heartbeat,
             nested: false,
             fence,
+            abandoned: false,
         }
     }
 
@@ -637,6 +786,17 @@ impl RepoLock {
         ))
     }
 
+    /// On release, leave the lock file behind, flagged for crash recovery,
+    /// instead of removing it: objects written under this lock may not be
+    /// durable and could not be cleaned up (a failed write barrier whose
+    /// files could not be removed, or a failed recovery). The next
+    /// contender, in this process or another, on any host, takes it over
+    /// at once and runs [`crate::fsck::recover_interrupted_writes`] before
+    /// anything else. No effect on a nested handle (it releases nothing).
+    pub fn abandon(&mut self) {
+        self.abandoned = true;
+    }
+
     /// Tests: stop renewing the lease, as a suspended or partitioned holder
     /// would, while the handle stays alive.
     #[doc(hidden)]
@@ -663,7 +823,20 @@ impl Drop for RepoLock {
         // between the check and the removal.
         if let Ok(Some(raw)) = self.backend.read_opt(&self.path) {
             if LockInfo::parse(&raw).is_some_and(|i| i.token == self.token) {
-                let _ = self.backend.remove_file(&self.path);
+                if self.abandoned {
+                    // Durably flagged; if even that fails, the file stays as
+                    // it is, which a contender reclaims once this process
+                    // is gone (or at once, within this process).
+                    let mut info = self.info.clone();
+                    info.renewed = now_millis().max(info.acquired);
+                    let extra = Extras {
+                        recover: true,
+                        ..self.extra.clone()
+                    };
+                    let _ = self.backend.write(&self.path, &encode(&info, &extra));
+                } else {
+                    let _ = self.backend.remove_file(&self.path);
+                }
             }
         }
         unregister(&self.token);
@@ -671,17 +844,18 @@ impl Drop for RepoLock {
 }
 
 impl Heartbeat {
+    #[allow(clippy::too_many_arguments)]
     fn spawn(
         backend: Arc<dyn StorageBackend>,
         path: VPath,
         mut info: LockInfo,
+        extra: Extras,
         every: Duration,
         lost: Arc<AtomicBool>,
         clock: Arc<dyn LockClock>,
         fence: Option<Fence>,
     ) -> Option<Heartbeat> {
         let (stop, rx) = mpsc::channel::<()>();
-        let fencing = fence.is_some();
         let thread = std::thread::Builder::new()
             .name("veil-lock-heartbeat".into())
             .spawn(move || {
@@ -709,7 +883,7 @@ impl Heartbeat {
                             info.renewed = clock.wall_ms();
                             // A failed renewal is retried on the next tick;
                             // a fencing holder's lease runs out meanwhile.
-                            if backend.write(&path, &encode(&info, fencing)).is_ok() {
+                            if backend.write(&path, &encode(&info, &extra)).is_ok() {
                                 if let Some(f) = &fence {
                                     *f.confirmed.lock().unwrap_or_else(|e| e.into_inner()) = started;
                                 }
@@ -742,40 +916,28 @@ enum TakeOver {
 /// (plus grace) is cleared by other contenders.
 const GUARD_LEASE: Duration = Duration::from_secs(5);
 
+/// How many crashed guard holders in a row [`claim`] works through.
+const MAX_GUARD_DEPTH: usize = 8;
+
 /// Replace `path` by `ours` if it still holds exactly `observed`, serialised
-/// against other contenders through [`STEAL_PATH`]. The stale lock is
-/// replaced in one atomic write rather than removed, so no third process can
-/// slip in between and skip the crash recovery the new holder performs.
+/// against other contenders through the guard [`STEAL_PATH`]. The stale
+/// lock is replaced in one atomic write rather than removed, so no third
+/// process can slip in between and skip the crash recovery the new holder
+/// performs.
 fn take_over(
     backend: &dyn StorageBackend,
     path: &VPath,
     observed: &[u8],
     ours: &[u8],
     ctx: &LockContext,
-    guard_seen: &mut Observed,
+    seen: &mut GuardsSeen,
 ) -> Result<TakeOver> {
     let guard_path = VPath::new(STEAL_PATH)?;
-    let guard = LockInfo::new_in(GUARD_LEASE, ctx);
-    let token = Registered::new(guard.token.clone());
     let started = ctx.clock.now();
-    if !backend.create_new(&guard_path, &encode(&guard, ctx.fencing))? {
-        // Another contender is stealing. If it crashed mid-steal, clear its
-        // guard (only when it is provably gone or, for a fencing guard,
-        // expired, like any other lock).
-        if let Some(raw) = backend.read_opt(&guard_path)? {
-            let unchanged = guard_seen.see(&raw, ctx.clock.now());
-            if let Some(other) = LockInfo::parse(&raw) {
-                let verdict = assess_in(&other, is_fencing(&raw), ctx.clock.wall_ms(), Some(unchanged), ctx);
-                if let Verdict::Steal(_) = verdict {
-                    if backend.read_opt(&guard_path)?.as_deref() == Some(&raw[..]) {
-                        backend.remove_file(&guard_path)?;
-                    }
-                }
-            }
-        }
+    let Some(guard) = claim(backend, &guard_path, ctx, seen, 0)? else {
         return Ok(TakeOver::Busy);
-    }
-    let result = (|| {
+    };
+    let result = (|| -> Result<TakeOver> {
         if backend.read_opt(path)?.as_deref() == Some(observed) {
             // A contender that stalled inside its guard may have lost it.
             if ctx.fencing && ctx.clock.now().saturating_sub(started) >= GUARD_LEASE {
@@ -786,9 +948,113 @@ fn take_over(
         }
         Ok(TakeOver::Retry)
     })();
-    backend.remove_file(&guard_path)?;
-    drop(token);
-    result
+    let released = guard.release(backend, &guard_path);
+    let result = result?;
+    released?;
+    Ok(result)
+}
+
+/// A takeover guard this contender holds: its bytes, and its token
+/// (registered as live until the guard is released).
+struct Guard {
+    raw: Vec<u8>,
+    _token: Registered,
+}
+
+impl Guard {
+    /// Remove the guard file if it is still ours. Nobody replaces a live
+    /// holder's guard (see [`claim`]), so the check cannot race.
+    fn release(self, backend: &dyn StorageBackend, path: &VPath) -> Result<()> {
+        if backend.read_opt(path)?.as_deref() == Some(&self.raw[..]) {
+            backend.remove_file(path)?;
+        }
+        Ok(())
+    }
+}
+
+/// Take the guard file `path`: create it, or replace a guard whose holder
+/// is provably gone (a contender that crashed mid-takeover). `None`: held
+/// by someone else, try later.
+///
+/// A dead holder's guard is never *removed*: with check-then-remove, two
+/// contenders that both judged it dead could each remove it, the second one
+/// deleting the guard the first had meanwhile created, and both would take
+/// over (BUG-049). Instead it is replaced in one write, under a guard of
+/// its own, `<path>.<hash of the dead guard's bytes>`, claimed the same way
+/// (a crashed holder of that one is handled one level further down). Only
+/// a contender holding that sub-guard writes `path`, and only while `path`
+/// still holds those exact dead bytes, which no one ever writes again
+/// (they contain a random token). So at most one contender wins each dead
+/// guard, and every guard is removed only by its own holder.
+///
+/// Sub-guards are removed by their holders too; one is left behind only
+/// when a contender crashes while holding it. It is harmless (no later
+/// guard hashes to its name) and can be deleted when no command runs.
+fn claim(
+    backend: &dyn StorageBackend,
+    path: &VPath,
+    ctx: &LockContext,
+    seen: &mut GuardsSeen,
+    depth: usize,
+) -> Result<Option<Guard>> {
+    let mine = LockInfo::new_in(GUARD_LEASE, ctx);
+    let token = Registered::new(mine.token.clone());
+    let raw_mine = encode(
+        &mine,
+        &Extras {
+            fencing: ctx.fencing,
+            start: my_start(),
+            ..Extras::default()
+        },
+    );
+    let guard = Guard {
+        raw: raw_mine,
+        _token: token,
+    };
+    let started = ctx.clock.now();
+    if backend.create_new(path, &guard.raw)? {
+        return Ok(Some(guard));
+    }
+    if depth >= MAX_GUARD_DEPTH {
+        return Ok(None);
+    }
+    let Some(theirs) = backend.read_opt(path)? else {
+        return Ok(None); // released meanwhile: the caller retries
+    };
+    let unchanged = seen
+        .entry(path.as_str().to_string())
+        .or_default()
+        .see(&theirs, ctx.clock.now());
+    let dead = match parse_file(&theirs) {
+        Some((other, extra)) => matches!(
+            assess_full(&other, &extra, ctx.clock.wall_ms(), Some(unchanged), ctx),
+            Verdict::Steal(_)
+        ),
+        // A torn guard (non-atomic fallback of `create_new`).
+        None => unchanged >= GUARD_LEASE * 2,
+    };
+    if !dead {
+        return Ok(None);
+    }
+    let sub_path = VPath::new(&format!("{}.{}", path.as_str(), &ObjectId::hash(&theirs).hex()[..16]))?;
+    let Some(sub) = claim(backend, &sub_path, ctx, seen, depth + 1)? else {
+        return Ok(None);
+    };
+    let won = (|| -> Result<bool> {
+        if backend.read_opt(path)?.as_deref() != Some(&theirs[..]) {
+            return Ok(false);
+        }
+        // A contender that stalled holding the sub-guard may have lost it.
+        if ctx.fencing && ctx.clock.now().saturating_sub(started) >= GUARD_LEASE {
+            return Ok(false);
+        }
+        backend.write(path, &guard.raw)?;
+        Ok(true)
+    })();
+    let released = sub.release(backend, &sub_path);
+    let won = won?;
+    released?;
+    Ok(won.then_some(guard))
 }
 
 // ---- process-local registry of live tokens ----------------------------------
@@ -1104,6 +1370,99 @@ pub fn process_alive(pid: u32) -> Option<bool> {
     }
     #[allow(unreachable_code)]
     None
+}
+
+/// When a process started: `id` identifies the process together with its
+/// pid (exact, never compared across machines or boots), `wall_ms` is an
+/// approximate wall-clock time, if known.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessStart {
+    pub id: u64,
+    pub wall_ms: Option<i64>,
+}
+
+/// When `pid` started, if it runs and the platform can tell (Linux: clock
+/// ticks since boot from `/proc/<pid>/stat`; macOS: the start time
+/// `proc_pidinfo` reports).
+pub fn process_start(pid: u32) -> Option<ProcessStart> {
+    process_start_impl(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_impl(pid: u32) -> Option<ProcessStart> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Field 2, `comm`, is parenthesised and may contain spaces and
+    // parentheses; field 22, `starttime`, is the 20th after it.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let ticks: u64 = rest.split_whitespace().nth(19)?.parse().ok()?;
+    // SAFETY: `sysconf` only reads a configuration value.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let hz = u64::try_from(hz).ok().filter(|&h| h > 0).unwrap_or(100);
+    let wall_ms = boot_time_ms().and_then(|b| b.checked_add(i64::try_from(ticks.checked_mul(1000)? / hz).ok()?));
+    Some(ProcessStart { id: ticks, wall_ms })
+}
+
+#[cfg(target_os = "macos")]
+fn process_start_impl(pid: u32) -> Option<ProcessStart> {
+    let raw = libc::c_int::try_from(pid).ok().filter(|&p| p > 0)?;
+    // SAFETY: `proc_bsdinfo` is plain data; all-zero is a valid value.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: the buffer is a writable `proc_bsdinfo` of exactly `size` bytes.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            raw,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if n != size {
+        return None;
+    }
+    let us = info
+        .pbi_start_tvsec
+        .checked_mul(1_000_000)?
+        .checked_add(info.pbi_start_tvusec)?;
+    Some(ProcessStart {
+        id: us,
+        wall_ms: i64::try_from(us / 1000).ok(),
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_start_impl(_pid: u32) -> Option<ProcessStart> {
+    None
+}
+
+/// This process's [`ProcessStart::id`], recorded in its lock files.
+fn my_start() -> Option<u64> {
+    static START: OnceLock<Option<u64>> = OnceLock::new();
+    *START.get_or_init(|| process_start(std::process::id()).map(|s| s.id))
+}
+
+/// Whether the live process running under the holder's pid is someone
+/// else: it started at another time than the holder (locks that record
+/// it), or, for locks that do not (older versions), well after the lock was
+/// acquired and the lease has expired. `Some(reason)` if so.
+fn pid_reused(info: &LockInfo, extra: &Extras, now: i64) -> Option<String> {
+    let running = process_start(info.pid)?;
+    let reused = match extra.start {
+        Some(start) => start != running.id,
+        None => {
+            info.lease_expired(now)
+                && running
+                    .wall_ms
+                    .is_some_and(|w| w > info.acquired.saturating_add(REUSED_PID_SLACK_MS))
+        }
+    };
+    reused.then(|| {
+        format!(
+            "holder pid {} now belongs to another process, started after the lock was taken",
+            info.pid
+        )
+    })
 }
 
 #[cfg(test)]
