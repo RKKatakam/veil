@@ -15,7 +15,7 @@
 //! * the new index is written to `index.lock`, created **exclusively**
 //!   (`O_CREAT | O_EXCL`), and renamed over `index`;
 //! * if `index.lock` already exists, Git (or another tool) is using the
-//!   index: nothing is written and [`write`] says so. Veil never waits for
+//!   index: nothing is written and [`write()`] says so. Veil never waits for
 //!   it and never removes it;
 //! * the stat data of an entry whose content is unchanged is carried over
 //!   from the old index, so `git status` does not rehash the whole tree.
@@ -48,7 +48,7 @@ pub struct IndexEntry {
     pub intent_to_add: bool,
 }
 
-/// One entry for [`write`].
+/// One entry for [`write()`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewEntry {
     pub path: Vec<u8>,

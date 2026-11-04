@@ -532,7 +532,7 @@ impl GitBridge {
         let changed = heads.iter().any(|(k, v)| state.refs.get(k) != Some(&v.to_string()))
             || state.refs.keys().any(|k| k.starts_with("refs/heads/") && !heads.contains_key(k))
             || head.commit.map(|c| c.to_string()) != state.last_head
-            || tips.iter().any(|t| self.map.commits.get(t).is_none());
+            || tips.iter().any(|t| !self.map.commits.contains_key(t));
         if !changed {
             return Ok(report);
         }
@@ -811,6 +811,27 @@ impl GitBridge {
         local_only: &BTreeSet<String>,
     ) -> Result<MirrorReport> {
         let mut report = MirrorReport::default();
+        // Nothing changed since the last mirror (same operation, same Git
+        // refs and HEAD, same local-only files): only the skip-worktree
+        // bits are checked, which Git may have cleared.
+        let key = self.mirror_key(repo, ws, local_only)?;
+        if state.mirrored.as_deref() == Some(key.as_str()) && expected.is_some() && !index::is_locked(self.git_dir()) {
+            let intact = index::read(&index::index_path(self.git_dir())).ok().flatten().is_some_and(|cur| {
+                if state.frozen {
+                    cur.iter().all(|e| e.skip_worktree || e.stage != 0)
+                } else {
+                    let flagged: HashSet<String> =
+                        cur.iter().filter(|e| e.skip_worktree).map(|e| escape_git_path(&e.path)).collect();
+                    state.skip.iter().all(|p| flagged.contains(p))
+                }
+            });
+            if intact {
+                report.frozen = state.frozen;
+                report.frozen_reason = state.frozen_reason.clone();
+                report.head = self.head()?.commit;
+                return Ok(report);
+            }
+        }
         let tx = repo.transaction("git: mirror into the colocated .git")?;
         let r = tx.repo();
         let wc = r.workspace_wc(ws)?;
@@ -969,7 +990,31 @@ impl GitBridge {
         }
         self.save(&**r.backend())?;
         tx.commit()?;
+        if report.index_written.is_some() && report.notes.is_empty() {
+            state.mirrored = Some(self.mirror_key(repo, ws, local_only)?);
+        } else {
+            state.mirrored = None;
+        }
         Ok(report)
+    }
+
+    /// What a mirror depends on: the operation, Git's refs and `HEAD`, the
+    /// workspace, the local-only files.
+    fn mirror_key(&self, repo: &Repo, ws: &str, local_only: &BTreeSet<String>) -> Result<String> {
+        let mut h = blake3::Hasher::new();
+        h.update(repo.op_id().to_string().as_bytes());
+        h.update(ws.as_bytes());
+        let head = self.head()?;
+        h.update(format!("{:?}{:?}", head.symbolic, head.commit).as_bytes());
+        for (k, v) in self.local_refs()? {
+            h.update(k.as_bytes());
+            h.update(v.as_bytes());
+        }
+        for p in local_only {
+            h.update(p.as_bytes());
+            h.update(b"\0");
+        }
+        Ok(h.finalize().to_hex().to_string())
     }
 
     fn public_plain_paths(&self, repo: &Repo, tree: &ObjectId) -> HashSet<Vec<u8>> {
@@ -1203,29 +1248,29 @@ impl GitBridge {
 /// may see the disk version of. Unreadable directories count as not
 /// public.
 pub fn public_plain(repo: &Repo, tree: &ObjectId) -> HashSet<Vec<u8>> {
-        let mut out = HashSet::new();
-        let store = repo.store();
-        let mut stack: Vec<(String, ObjectId, usize)> = vec![(String::new(), *tree, 0)];
-        while let Some((prefix, t, depth)) = stack.pop() {
-            if depth > crate::tree::MAX_TREE_DEPTH {
-                continue;
-            }
-            let Ok(tr) = store.tree(&t) else { continue };
-            for e in &tr.entries {
-                let p = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
-                match e.kind {
-                    EntryKind::Dir if e.visibility.is_public() => stack.push((p, e.id, depth + 1)),
-                    EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink
-                        if matches!(e.visibility, Visibility::Public) && e.fallback.is_none() =>
-                    {
-                        out.insert(p.into_bytes());
-                    }
-                    _ => {}
+    let mut out = HashSet::new();
+    let store = repo.store();
+    let mut stack: Vec<(String, ObjectId, usize)> = vec![(String::new(), *tree, 0)];
+    while let Some((prefix, t, depth)) = stack.pop() {
+        if depth > crate::tree::MAX_TREE_DEPTH {
+            continue;
+        }
+        let Ok(tr) = store.tree(&t) else { continue };
+        for e in &tr.entries {
+            let p = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+            match e.kind {
+                EntryKind::Dir if e.visibility.is_public() => stack.push((p, e.id, depth + 1)),
+                EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink
+                    if matches!(e.visibility, Visibility::Public) && e.fallback.is_none() =>
+                {
+                    out.insert(p.into_bytes());
                 }
+                _ => {}
             }
         }
-        out
     }
+    out
+}
 
 // ---- following a Git checkout ------------------------------------------------------------
 
@@ -1233,18 +1278,18 @@ pub fn public_plain(repo: &Repo, tree: &ObjectId) -> HashSet<Vec<u8>> {
 /// follow; see [`plan_head_move`]).
 #[derive(Debug)]
 pub struct HeadPlan {
-    /// The tree of the new working-copy change: `target`'s, with the hidden
-    /// edits that can be carried over.
-    pub tree: ObjectId,
-    /// Hidden paths whose file must change on disk (to `target`'s
-    /// version); everything else on disk stays as it is.
-    pub write: BTreeSet<VPath>,
-    /// Hidden paths edited here that `target` changed too: the edit stays
-    /// in the old change (which is kept), the disk takes `target`'s.
-    pub conflicts: Vec<VPath>,
-    /// Whether hidden edits could be carried at all (same cloak, no
-    /// embargo between the two lines).
-    pub carry: bool,
+/// The tree of the new working-copy change: `target`'s, with the hidden
+/// edits that can be carried over.
+pub tree: ObjectId,
+/// Hidden paths whose file must change on disk (to `target`'s
+/// version); everything else on disk stays as it is.
+pub write: BTreeSet<VPath>,
+/// Hidden paths edited here that `target` changed too: the edit stays
+/// in the old change (which is kept), the disk takes `target`'s.
+pub conflicts: Vec<VPath>,
+/// Whether hidden edits could be carried at all (same cloak, no
+/// embargo between the two lines).
+pub carry: bool,
 }
 
 /// Plan the follow of a Git checkout: the working copy `old` (already

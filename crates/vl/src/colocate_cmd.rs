@@ -172,6 +172,18 @@ pub fn open_session(ctx: &mut Ctx, snapshot: bool) -> Result<()> {
     Ok(())
 }
 
+/// Follow Git now, for a session opened without a snapshot that records
+/// one after all (`vl serve` opens every request so).
+pub fn follow_now(ctx: &mut Ctx) -> Result<()> {
+    let Some(mut session) = ctx.git.take() else { return Ok(()) };
+    if session.in_progress.is_none() && !session.followed {
+        let _lock = FollowLock::acquire(&ctx.root)?;
+        follow(ctx, &mut session)?;
+    }
+    ctx.git = Some(session);
+    Ok(())
+}
+
 /// End of every command (`Ctx::finish`): mirror into `.git` and write the
 /// exclude block, before control returns to the user.
 pub fn finish_session(ctx: &mut Ctx) -> Result<()> {
