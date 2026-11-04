@@ -29,14 +29,47 @@ use crate::{
     tree::MAX_TREE_DEPTH,
 };
 
+/// Embargoes to treat as unreleased on top of the keychain's own state:
+/// what Git saw of a snapshot *before* a release (an exported commit
+/// pinned while the embargo held, or a Git commit made on such a view).
+/// The default veils nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Veil {
+    /// Every embargo (used to find which ones a projection depends on).
+    pub all: bool,
+    pub set: BTreeSet<String>,
+}
+
+impl Veil {
+    pub fn of(set: BTreeSet<String>) -> Veil {
+        Veil { all: false, set }
+    }
+
+    pub fn all() -> Veil {
+        Veil {
+            all: true,
+            set: BTreeSet::new(),
+        }
+    }
+
+    pub fn is_none(&self) -> bool {
+        !self.all && self.set.is_empty()
+    }
+
+    /// Is embargo `e` released, as seen through this veil?
+    pub fn released(&self, keys: &Keychain, e: &str) -> bool {
+        !self.all && !self.set.contains(e) && keys.embargo_released(e)
+    }
+}
+
 /// The public-remote rule for a sealed object's envelope label (mirrors
-/// `remote::Transfer::allowed` for `public: true`).
-pub(crate) fn label_is_public(keys: &Keychain, label: &str) -> bool {
+/// `remote::Transfer::allowed` for `public: true`), through `veil`.
+pub(crate) fn label_is_public(keys: &Keychain, veil: &Veil, label: &str) -> bool {
     if label == LOCAL_SCOPE {
         return false;
     }
     match label.strip_prefix("embargo/") {
-        Some(id) => keys.embargo_released(id),
+        Some(id) => veil.released(keys, id),
         None => false,
     }
 }
@@ -56,7 +89,7 @@ pub(crate) enum Public {
 /// Open `id` the way a public reader can: sealed layers are peeled only if
 /// every label is public. Keys this replica holds for cloak scopes are
 /// never used.
-pub(crate) fn public_open(store: &ObjectStore, id: &ObjectId) -> Result<Public> {
+pub(crate) fn public_open(store: &ObjectStore, veil: &Veil, id: &ObjectId) -> Result<Public> {
     let raw = match store.get_raw(id) {
         Ok(r) => r,
         Err(VeilError::Missing(_)) => return Ok(Public::Missing),
@@ -67,7 +100,7 @@ pub(crate) fn public_open(store: &ObjectStore, id: &ObjectId) -> Result<Public> 
     loop {
         match obj {
             Object::Sealed(env) => {
-                if !label_is_public(&store.keys, &env.scope) {
+                if !label_is_public(&store.keys, veil, &env.scope) {
                     return Ok(Public::Hidden(env.scope.strip_prefix("embargo/").map(str::to_string)));
                 }
                 let Some(key) = store.keys.key(&env.scope) else {
@@ -103,11 +136,11 @@ pub(crate) const EMBARGOED_DESCRIPTION: &str = "(description withheld: under emb
 /// The description a public reader sees, and the unreleased embargo that
 /// hides it, if any. Only plaintext and released embargo keys are used:
 /// a description sealed for a scope is never opened, even if we hold the key.
-pub(crate) fn public_text(store: &ObjectStore, t: &Text) -> (String, Option<String>) {
+pub(crate) fn public_text(store: &ObjectStore, veil: &Veil, t: &Text) -> (String, Option<String>) {
     match t {
         Text::Plain(s) => (s.clone(), None),
         Text::Sealed(env) => {
-            if label_is_public(&store.keys, &env.scope) {
+            if label_is_public(&store.keys, veil, &env.scope) {
                 if let Some(s) = store.keys.key(&env.scope).and_then(|k| env.open(&k).ok()) {
                     if let Ok(s) = String::from_utf8(s) {
                         return (s, None);
@@ -115,18 +148,39 @@ pub(crate) fn public_text(store: &ObjectStore, t: &Text) -> (String, Option<Stri
                 }
             }
             match env.scope.strip_prefix("embargo/") {
-                Some(e) if !store.keys.embargo_released(e) => (EMBARGOED_DESCRIPTION.into(), Some(e.to_string())),
+                Some(e) if !veil.released(&store.keys, e) => (EMBARGOED_DESCRIPTION.into(), Some(e.to_string())),
                 _ => (CLOAKED_DESCRIPTION.into(), None),
             }
         }
     }
 }
 
-fn is_git_dir_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case(".git")
+/// Is `name` a spelling of `.git`, which Git refuses as a tree entry (and
+/// a colocated working copy would take as its repository)? Any ASCII case,
+/// and with HFS+-ignorable code points anywhere (`.g\u{200C}it`), as Git's
+/// `is_hfs_dotgit` does: on macOS those all name the same directory.
+pub(crate) fn is_git_dir_name(name: &str) -> bool {
+    if name.is_ascii() {
+        return name.eq_ignore_ascii_case(".git");
+    }
+    let mut folded = name.chars().filter(|c| !crate::vpath::is_hfs_ignorable(*c));
+    ".git".chars().all(|r| folded.next().is_some_and(|c| c.eq_ignore_ascii_case(&r))) && folded.next().is_none()
 }
 
 impl GitBridge {
+    /// Run `f` with projections computed through `veil` (see [`Veil`]).
+    pub(crate) fn with_veil<T>(&mut self, veil: Veil, f: impl FnOnce(&mut GitBridge) -> Result<T>) -> Result<T> {
+        if veil == self.veil {
+            return f(self);
+        }
+        let saved = std::mem::replace(&mut self.veil, veil);
+        let memo = std::mem::take(&mut self.run_projected);
+        let out = f(self);
+        self.veil = saved;
+        self.run_projected = memo;
+        out
+    }
+
     /// The public projection of Veil tree `id` (see the module docs).
     pub(crate) fn project(&mut self, store: &ObjectStore, id: &ObjectId) -> Result<Projection> {
         self.project_at(store, id, 0)
@@ -136,12 +190,14 @@ impl GitBridge {
         if depth > MAX_TREE_DEPTH + 1 {
             return Err(VeilError::Corrupt(id.hex(), "tree nested too deeply".into()));
         }
-        if let Some(p) = self.cache.projected.get(id) {
-            return Ok(Projection {
-                tree: *p,
-                pending: BTreeSet::new(),
-                complete: true,
-            });
+        if self.veil.is_none() {
+            if let Some(p) = self.cache.projected.get(id) {
+                return Ok(Projection {
+                    tree: *p,
+                    pending: BTreeSet::new(),
+                    complete: true,
+                });
+            }
         }
         if let Some(p) = self.run_projected.get(id) {
             return Ok(p.clone());
@@ -153,7 +209,7 @@ impl GitBridge {
         let mut cur = *id;
         // Resolve embargo wrappers the way a public reader's store does.
         let (tree, plain) = loop {
-            match public_open(store, &cur)? {
+            match public_open(store, &self.veil, &cur)? {
                 Public::Missing => {
                     out.complete = false;
                     return Ok(self.remember(id, out));
@@ -168,9 +224,12 @@ impl GitBridge {
                 } => match wrapper_parts(&t) {
                     None => break (t, !sealed),
                     Some(w) => {
-                        let released = store.keys.embargo_released(&w.embargo);
+                        let released = self.veil.released(&store.keys, &w.embargo);
                         let inner_ok = released
-                            && matches!(public_open(store, &w.inner)?, Public::Visible { obj: Object::Tree(_), .. });
+                            && matches!(
+                                public_open(store, &self.veil, &w.inner)?,
+                                Public::Visible { obj: Object::Tree(_), .. }
+                            );
                         if !released {
                             out.pending.insert(w.embargo.clone());
                         }
@@ -219,7 +278,9 @@ impl GitBridge {
     }
 
     fn remember(&mut self, id: &ObjectId, p: Projection) -> Projection {
-        if p.complete && p.pending.is_empty() {
+        // `run_projected` holds the results for the current veil only
+        // (`with_veil` clears it); the cache, those for no veil.
+        if self.veil.is_none() && p.complete && p.pending.is_empty() {
             self.cache.projected.insert(*id, p.tree);
             self.cache.mark_dirty();
         } else {
@@ -230,7 +291,7 @@ impl GitBridge {
 
     /// The entry a public reader materialises for file entry `e`, if any.
     fn public_file(&mut self, store: &ObjectStore, e: &TreeEntry, out: &mut Projection) -> Result<Option<TreeEntry>> {
-        match public_open(store, &e.id)? {
+        match public_open(store, &self.veil, &e.id)? {
             Public::Visible { obj: Object::Blob(_), .. } => return Ok(Some(e.clone())),
             Public::Visible { obj, .. } => {
                 return Err(VeilError::Corrupt(
@@ -242,7 +303,7 @@ impl GitBridge {
             Public::Missing => out.complete = false,
         }
         let Some(fb) = e.fallback else { return Ok(None) };
-        match public_open(store, &fb)? {
+        match public_open(store, &self.veil, &fb)? {
             Public::Visible { obj: Object::Blob(b), sealed } => Ok(Some(TreeEntry {
                 name: e.name.clone(),
                 kind: EntryKind::File,
@@ -278,7 +339,9 @@ impl GitBridge {
         if depth > MAX_TREE_DEPTH + 1 {
             return Err(VeilError::Corrupt(id.hex(), "tree nested too deeply".into()));
         }
-        let tree = match public_open(store, id)? {
+        // Whatever a projection holds is readable through any veil, so
+        // through none.
+        let tree = match public_open(store, &Veil::default(), id)? {
             Public::Visible { obj: Object::Tree(t), .. } => t,
             _ => return Err(VeilError::Corrupt(id.hex(), "public projection is not readable".into())),
         };
@@ -314,7 +377,7 @@ impl GitBridge {
                 return Ok(*g);
             }
         }
-        let data = match public_open(store, id)? {
+        let data = match public_open(store, &Veil::default(), id)? {
             Public::Visible { obj: Object::Blob(b), .. } => b,
             _ => return Err(VeilError::Corrupt(id.hex(), "public file is not readable".into())),
         };

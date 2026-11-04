@@ -2,8 +2,8 @@
 //! `.veil/git/` on the repository's backend.
 //!
 //! ```text
-//! .veil/git/map     veil-git-map 1
-//!                   c <commit> <snapshot>                  every pair ever made
+//! .veil/git/map     veil-git-map 2
+//!                   c <commit> <snapshot> <veiled>         every pair ever made
 //!                   s <snapshot> <commit> <origin> <pending>
 //!                                                          the commit that currently
 //!                                                          represents the snapshot
@@ -16,13 +16,19 @@
 //!
 //! `origin` is `import` (the commit came from Git: it is the truth for that
 //! snapshot), `export` (computed from the snapshot) or `publish` (written
-//! after an embargo release on top of an earlier export). `pending` lists
-//! the unreleased embargoes that shaped an exported commit (`-` if none):
-//! only such commits are ever recomputed, when one of them is released.
+//! after an embargo release on top of an earlier one). `veiled` (and the
+//! current commit's `pending`, the same set) lists the embargoes that were
+//! unreleased in the view the commit shows (`-` if none): an exported
+//! commit pinned while they held, or a Git commit made on top of such a
+//! view. Only such commits are ever recomputed, when one of them is
+//! released, and a Git commit made on top of one is imported against that
+//! older view (what its author saw), so it never reads as a revert.
 //!
-//! Everything here can be recomputed: export is deterministic and import of
-//! the same commit yields the same snapshot id. A mapped object that has
-//! gone missing (Veil gc, Git gc) is simply treated as unmapped.
+//! Everything here can be recomputed: export is deterministic, an exported
+//! commit found in Git without a mapping is recognised by exporting its
+//! snapshot again, and importing the same commit yields the same snapshot.
+//! A mapped object that has gone missing (Veil gc, Git gc) is simply
+//! treated as unmapped. Format 1 (no `veiled` field) is still read.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -35,7 +41,8 @@ use crate::{
 
 pub type GitOid = gix::ObjectId;
 
-const MAP_HEADER: &str = "veil-git-map 1";
+const MAP_HEADER: &str = "veil-git-map 2";
+const MAP_HEADER_V1: &str = "veil-git-map 1";
 /// Bump when the projection or conversion rules change: cached results
 /// computed by older rules are then discarded.
 const CACHE_HEADER: &str = "veil-git-cache 1";
@@ -91,6 +98,9 @@ pub struct GitMap {
     pub commits: HashMap<GitOid, ObjectId>,
     /// Snapshot → the commit that currently represents it in Git.
     pub current: HashMap<ObjectId, Current>,
+    /// Commit → the embargoes unreleased in the view it shows (only
+    /// non-empty sets are kept).
+    pub veiled: HashMap<GitOid, BTreeSet<String>>,
     dirty: bool,
 }
 
@@ -102,6 +112,21 @@ fn parse_id(s: &str) -> Option<ObjectId> {
     ObjectId::from_hex(s).ok()
 }
 
+fn parse_set(s: &str) -> BTreeSet<String> {
+    match s {
+        "-" => BTreeSet::new(),
+        p => p.split(',').map(str::to_string).collect(),
+    }
+}
+
+fn format_set(s: &BTreeSet<String>) -> String {
+    if s.is_empty() {
+        "-".to_string()
+    } else {
+        s.iter().cloned().collect::<Vec<_>>().join(",")
+    }
+}
+
 impl GitMap {
     pub fn load(backend: &dyn StorageBackend) -> Result<GitMap> {
         let mut map = GitMap::default();
@@ -111,31 +136,44 @@ impl GitMap {
         let text = String::from_utf8_lossy(&raw);
         let corrupt = |n: usize| VeilError::Corrupt(".veil/git/map".into(), format!("unreadable line {n}"));
         let mut lines = text.lines().enumerate();
-        match lines.next() {
-            Some((_, MAP_HEADER)) => {}
+        let v1 = match lines.next() {
+            Some((_, MAP_HEADER)) => false,
+            Some((_, MAP_HEADER_V1)) => true,
             _ => return Err(VeilError::Corrupt(".veil/git/map".into(), "unknown format".into())),
-        }
+        };
         for (n, line) in lines {
             let f: Vec<&str> = line.split(' ').collect();
             match f.as_slice() {
-                ["c", c, s] => {
+                ["c", c, s] if v1 => {
                     let (c, s) = (parse_oid(c).ok_or_else(|| corrupt(n + 1))?, parse_id(s).ok_or_else(|| corrupt(n + 1))?);
                     map.commits.insert(c, s);
+                }
+                ["c", c, s, veiled] if !v1 => {
+                    let (c, s) = (parse_oid(c).ok_or_else(|| corrupt(n + 1))?, parse_id(s).ok_or_else(|| corrupt(n + 1))?);
+                    map.commits.insert(c, s);
+                    let veiled = parse_set(veiled);
+                    if !veiled.is_empty() {
+                        map.veiled.insert(c, veiled);
+                    }
                 }
                 ["s", s, c, origin, pending] => {
                     let s = parse_id(s).ok_or_else(|| corrupt(n + 1))?;
                     let commit = parse_oid(c).ok_or_else(|| corrupt(n + 1))?;
                     let origin = Origin::parse(origin).ok_or_else(|| corrupt(n + 1))?;
-                    let pending = match *pending {
-                        "-" => BTreeSet::new(),
-                        p => p.split(',').map(str::to_string).collect(),
-                    };
+                    let pending = parse_set(pending);
                     map.current.insert(s, Current { commit, origin, pending });
                 }
                 [""] => {}
                 _ => return Err(corrupt(n + 1)),
             }
         }
+        // Format 1 kept the set for current commits only.
+        for cur in map.current.values() {
+            if !cur.pending.is_empty() {
+                map.veiled.entry(cur.commit).or_insert_with(|| cur.pending.clone());
+            }
+        }
+        map.dirty = v1;
         Ok(map)
     }
 
@@ -148,17 +186,15 @@ impl GitMap {
         out.push('\n');
         let mut commits: Vec<_> = self.commits.iter().collect();
         commits.sort();
+        let none = BTreeSet::new();
         for (c, s) in commits {
-            out.push_str(&format!("c {c} {}\n", s.hex()));
+            let veiled = format_set(self.veiled.get(c).unwrap_or(&none));
+            out.push_str(&format!("c {c} {} {veiled}\n", s.hex()));
         }
         let mut current: Vec<_> = self.current.iter().collect();
         current.sort_by_key(|(s, _)| **s);
         for (s, cur) in current {
-            let pending = if cur.pending.is_empty() {
-                "-".to_string()
-            } else {
-                cur.pending.iter().cloned().collect::<Vec<_>>().join(",")
-            };
+            let pending = format_set(&cur.pending);
             out.push_str(&format!("s {} {} {} {pending}\n", s.hex(), cur.commit, cur.origin.as_str()));
         }
         backend.write(&map_path(), out.as_bytes())?;
@@ -166,22 +202,67 @@ impl GitMap {
         Ok(())
     }
 
+    /// Make `current` the commit representing `snapshot`.
     pub fn record(&mut self, snapshot: ObjectId, current: Current) {
-        self.commits.insert(current.commit, snapshot);
+        self.record_commit(current.commit, snapshot, current.pending.clone());
         self.current.insert(snapshot, current);
+    }
+
+    /// Record that `commit` corresponds to `snapshot` and shows a view in
+    /// which the embargoes `veiled` were unreleased.
+    pub fn record_commit(&mut self, commit: GitOid, snapshot: ObjectId, veiled: BTreeSet<String>) {
+        self.commits.insert(commit, snapshot);
+        if veiled.is_empty() {
+            self.veiled.remove(&commit);
+        } else {
+            self.veiled.insert(commit, veiled);
+        }
         self.dirty = true;
     }
 
     /// Record that `commit` (imported) corresponds to `snapshot`. The
     /// snapshot's current commit is set only if it has none.
-    pub fn record_import(&mut self, commit: GitOid, snapshot: ObjectId) {
-        self.commits.insert(commit, snapshot);
+    pub fn record_import(&mut self, commit: GitOid, snapshot: ObjectId, veiled: BTreeSet<String>) {
+        self.record_commit(commit, snapshot, veiled.clone());
         self.current.entry(snapshot).or_insert(Current {
             commit,
             origin: Origin::Imported,
-            pending: BTreeSet::new(),
+            pending: veiled,
         });
-        self.dirty = true;
+    }
+
+    /// Record a commit found in Git to be Veil's own (exported or
+    /// published by another replica, or before the mapping was lost). It
+    /// becomes the snapshot's current commit if the snapshot has none, or
+    /// if it is a publication on top of the current one (`replaces`).
+    pub fn record_found(
+        &mut self,
+        commit: GitOid,
+        snapshot: ObjectId,
+        origin: Origin,
+        veiled: BTreeSet<String>,
+        replaces: Option<GitOid>,
+    ) {
+        self.record_commit(commit, snapshot, veiled.clone());
+        let keep = match self.current.get(&snapshot) {
+            None => false,
+            Some(cur) => origin != Origin::Published || Some(cur.commit) != replaces,
+        };
+        if !keep {
+            self.current.insert(
+                snapshot,
+                Current {
+                    commit,
+                    origin,
+                    pending: veiled,
+                },
+            );
+        }
+    }
+
+    /// The embargoes unreleased in the view `commit` shows.
+    pub fn veiled(&self, commit: &GitOid) -> BTreeSet<String> {
+        self.veiled.get(commit).cloned().unwrap_or_default()
     }
 
     pub fn forget_current(&mut self, snapshot: &ObjectId) {
@@ -191,6 +272,7 @@ impl GitMap {
     }
 
     pub fn forget_commit(&mut self, commit: &GitOid) {
+        self.veiled.remove(commit);
         if self.commits.remove(commit).is_some() {
             self.dirty = true;
         }

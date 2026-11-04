@@ -5,7 +5,13 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use super::{export::CHANGE_ID_HEADER, gerr, map::GitOid, short, GitBridge};
+use super::{
+    export::CHANGE_ID_HEADER,
+    gerr,
+    map::{GitOid, Origin},
+    project::{is_git_dir_name, public_text, Veil},
+    short, GitBridge,
+};
 use crate::{
     builder::{build_tree, BuildOptions},
     embargo::policy_rekeys,
@@ -14,6 +20,7 @@ use crate::{
     merge::merge_trees,
     object::{validate_entry_name, EntryKind, Object, Snapshot, Text, Tree},
     policy::{Policy, POLICY_FILE},
+    repo::Repo,
     store::ObjectStore,
     transaction::Transaction,
     vfs::{DirEntry, DirListing, Metadata, NodeKind, StorageBackend},
@@ -35,21 +42,23 @@ pub struct ImportReport {
     pub warnings: Vec<String>,
 }
 
-/// The change id of an imported commit: its `change-id` header (Jujutsu,
-/// or an earlier Veil export), else one derived from the commit id, so
-/// that importing the same commit twice gives the same snapshot.
-fn change_id_of(oid: &GitOid, commit: &gix::objs::Commit) -> ChangeId {
-    let header = commit
+/// The change id a `change-id` header claims (Jujutsu, or a Veil export).
+fn header_change_id(commit: &gix::objs::Commit) -> Option<ChangeId> {
+    commit
         .extra_headers
         .iter()
         .find(|(k, _)| k == CHANGE_ID_HEADER)
         .and_then(|(_, v)| std::str::from_utf8(v).ok())
         .and_then(|v| ChangeId::parse(v.trim()).ok())
-        .filter(|c| *c != ChangeId::ROOT);
-    header.unwrap_or_else(|| {
-        let h = blake3::derive_key(crate::crypto::domains::GIT_CHANGE_ID, oid.as_bytes());
-        ChangeId(h[..16].try_into().unwrap())
-    })
+        .filter(|c| *c != ChangeId::ROOT)
+}
+
+/// The change id of a Git commit whose header cannot be trusted (or that
+/// has none): derived from the commit id, so importing the same commit
+/// twice gives the same change, and nothing else can claim it.
+fn derived_change_id(oid: &GitOid) -> ChangeId {
+    let h = blake3::derive_key(crate::crypto::domains::GIT_CHANGE_ID, oid.as_bytes());
+    ChangeId(h[..16].try_into().unwrap())
 }
 
 fn author_of(commit: &gix::objs::Commit) -> (String, i64) {
@@ -64,22 +73,84 @@ fn author_of(commit: &gix::objs::Commit) -> (String, i64) {
     (who, a.time.seconds.saturating_mul(1000))
 }
 
+/// Errors that are about this machine, not about the Git data: they abort
+/// the whole import. Anything else (a hostile tree, an unreadable commit, a
+/// policy refusal) fails only the commit concerned and its descendants.
+fn is_fatal(e: &VeilError) -> bool {
+    matches!(e, VeilError::Io { .. } | VeilError::Locked(_) | VeilError::ReadOnly)
+}
+
+/// Visible snapshots by change id, built on first use during one import.
+#[derive(Default)]
+struct ChangeIndex(Option<HashMap<ChangeId, Vec<ObjectId>>>);
+
+impl ChangeIndex {
+    fn get(&mut self, repo: &Repo, c: &ChangeId) -> Result<Vec<ObjectId>> {
+        if self.0.is_none() {
+            let mut m: HashMap<ChangeId, Vec<ObjectId>> = HashMap::new();
+            for id in repo.visible_snapshots()? {
+                m.entry(repo.snapshot(&id)?.change_id).or_default().push(id);
+            }
+            self.0 = Some(m);
+        }
+        Ok(self.0.as_ref().unwrap().get(c).cloned().unwrap_or_default())
+    }
+
+    fn add(&mut self, c: ChangeId, id: ObjectId) {
+        if let Some(m) = &mut self.0 {
+            m.entry(c).or_default().push(id);
+        }
+    }
+}
+
+/// Every subset of `items` (at most 2^4 of them; beyond that, only the
+/// empty set and the whole), smallest first.
+fn subsets(items: &[String]) -> Vec<BTreeSet<String>> {
+    if items.len() > 4 {
+        return vec![BTreeSet::new(), items.iter().cloned().collect()];
+    }
+    let mut out: Vec<BTreeSet<String>> = (0..1u32 << items.len())
+        .map(|m| (0..items.len()).filter(|i| m & (1 << i) != 0).map(|i| items[i].clone()).collect())
+        .collect();
+    out.sort_by_key(|s| s.len());
+    out
+}
+
+/// What [`GitBridge::import_one`] did with a commit.
+enum Imported {
+    New,
+    /// Already in Veil: Veil's own export, or an earlier import of it.
+    Known,
+}
+
 impl GitBridge {
     /// Import every commit reachable from `tips` that is not mapped yet,
-    /// parents first. A commit that cannot be imported (its parent is under
-    /// an embargo whose key we lack) is reported, together with its
-    /// descendants; nothing is half-imported.
+    /// parents first. A commit that cannot be imported (a hostile or
+    /// unreadable tree, its parent under an embargo whose key we lack, …) is
+    /// reported with the reason, together with its descendants; the other
+    /// commits are imported, and nothing is half-imported.
     pub(crate) fn import_tips(&mut self, tx: &mut Transaction<'_>, tips: &[GitOid]) -> Result<ImportReport> {
         let mut report = ImportReport::default();
+        let mut index = ChangeIndex::default();
+        // Failed commits → the root cause.
+        let mut failed: HashMap<GitOid, String> = HashMap::new();
         let mut todo: HashMap<GitOid, gix::objs::Commit> = HashMap::new();
         let mut stack: Vec<GitOid> = tips.to_vec();
         while let Some(c) = stack.pop() {
-            if todo.contains_key(&c) || self.mapped(tx, &c)?.is_some() {
+            if todo.contains_key(&c) || failed.contains_key(&c) || self.mapped(tx, &c)?.is_some() {
                 continue;
             }
-            let commit = self.read_commit(&c)?;
-            stack.extend(commit.parents.iter().copied());
-            todo.insert(c, commit);
+            match self.read_commit(&c) {
+                Ok(commit) => {
+                    stack.extend(commit.parents.iter().copied());
+                    todo.insert(c, commit);
+                }
+                Err(e) if is_fatal(&e) => return Err(e),
+                Err(e) => {
+                    report.failed.push((c, e.to_string()));
+                    failed.insert(c, e.to_string());
+                }
+            }
         }
         // Parents first (Kahn), oldest first among the ready ones.
         let mut pending_parents: HashMap<GitOid, usize> = HashMap::new();
@@ -97,21 +168,28 @@ impl GitBridge {
         let key = |c: &GitOid| (todo[c].committer.time.seconds, *c);
         let mut ready: BTreeSet<(i64, GitOid)> =
             pending_parents.iter().filter(|(_, n)| **n == 0).map(|(c, _)| key(c)).collect();
-        let mut failed: HashSet<GitOid> = HashSet::new();
         while let Some(k) = ready.pop_first() {
             let c = k.1;
             let commit = &todo[&c];
-            if let Some(p) = commit.parents.iter().find(|p| failed.contains(*p)) {
-                failed.insert(c);
-                report.failed.push((c, format!("its parent {} was not imported", short(p))));
+            if let Some(p) = commit.parents.iter().find(|p| failed.contains_key(*p)) {
+                let root = failed[p].clone();
+                report
+                    .failed
+                    .push((c, format!("its parent {} was not imported ({root})", short(p))));
+                failed.insert(c, root);
             } else {
-                match self.import_one(tx, &c, commit, &mut report) {
-                    Ok(()) => report.imported += 1,
-                    Err(VeilError::Policy(why)) => {
-                        failed.insert(c);
-                        report.failed.push((c, why));
+                match self.import_one(tx, &c, commit, &mut report, &mut index) {
+                    Ok(Imported::New) => report.imported += 1,
+                    Ok(Imported::Known) => {}
+                    Err(e) if is_fatal(&e) => return Err(e),
+                    Err(e) => {
+                        let why = match e {
+                            VeilError::Policy(why) => why,
+                            e => e.to_string(),
+                        };
+                        report.failed.push((c, why.clone()));
+                        failed.insert(c, why);
                     }
-                    Err(e) => return Err(e),
                 }
             }
             for ch in children.get(&c).into_iter().flatten() {
@@ -139,25 +217,165 @@ impl GitBridge {
         Ok(None)
     }
 
+    /// Is `commit` a commit Veil itself exported (or published), whose
+    /// mapping was lost or never made on this machine (another replica
+    /// exported it)? Recognised by exporting the candidate snapshot again
+    /// and comparing commit ids, so nothing but the exact commit matches: a
+    /// `change-id` header alone proves nothing. `git_parents` are the
+    /// snapshots of the commit's Git parents, in order. Returns the
+    /// snapshot, the origin, and the embargoes veiled in the commit's view.
+    fn recognise_export(
+        &mut self,
+        repo: &Repo,
+        oid: &GitOid,
+        commit: &gix::objs::Commit,
+        git_parents: &[ObjectId],
+        index: &mut ChangeIndex,
+    ) -> Result<Option<(ObjectId, Origin, BTreeSet<String>)>> {
+        let distinct = commit.parents.iter().collect::<HashSet<_>>().len() == commit.parents.len();
+        if !distinct {
+            return Ok(None);
+        }
+        if let Some(h) = header_change_id(commit) {
+            for cand in index.get(repo, &h)? {
+                let s = repo.snapshot(&cand)?;
+                if !git_parents.iter().all(|p| s.parents.contains(p)) {
+                    continue;
+                }
+                let first = commit.parents.first().map(|c| (git_parents[0], *c));
+                let parents: Vec<GitOid> = commit.parents.to_vec();
+                // As exported now, then as exported before releases that
+                // shaped it.
+                let (c, pending) = self.with_veil(Veil::default(), |b| b.fresh_commit(repo, &s, first, parents.clone()))?;
+                if Self::commit_id(&c)? == *oid {
+                    return Ok(Some((cand, Origin::Exported, pending)));
+                }
+                for veil in self.released_veils(repo, &s, first.map(|f| f.0))? {
+                    let (c, pending) = self.with_veil(veil, |b| b.fresh_commit(repo, &s, first, parents.clone()))?;
+                    if Self::commit_id(&c)? == *oid {
+                        return Ok(Some((cand, Origin::Exported, pending)));
+                    }
+                }
+            }
+            return Ok(None);
+        }
+        // A publication commit: on top of a commit whose view a release
+        // has changed since.
+        let Some(c0) = commit.parents.first() else { return Ok(None) };
+        let old_veiled = self.map.veiled(c0);
+        let released: Vec<String> = old_veiled
+            .iter()
+            .filter(|e| repo.keys().embargo_released(e))
+            .cloned()
+            .collect();
+        if released.is_empty() {
+            return Ok(None);
+        }
+        let sid = git_parents[0];
+        let s = repo.snapshot(&sid)?;
+        if !git_parents[1..].iter().all(|p| s.parents.contains(p)) {
+            return Ok(None);
+        }
+        let oc = self.read_commit(c0)?;
+        let still: BTreeSet<String> = old_veiled.iter().filter(|e| !released.contains(e)).cloned().collect();
+        for kept in subsets(&released) {
+            if kept.len() == released.len() {
+                continue;
+            }
+            let mut set = still.clone();
+            set.extend(kept);
+            let extra = commit.parents[1..].to_vec();
+            let (c, pending) = self.with_veil(Veil::of(set), |b| {
+                b.publication_commit(repo, &s, *c0, &oc, &old_veiled, extra, BTreeSet::new())
+            })?;
+            if let Some(c) = c {
+                if Self::commit_id(&c)? == *oid {
+                    return Ok(Some((sid, Origin::Published, pending)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Veils to try when re-exporting `s` as it was exported before some
+    /// release: every combination of the released embargoes that shape its
+    /// view (or its first parent's), none-veiled excluded.
+    fn released_veils(&mut self, repo: &Repo, s: &Snapshot, first: Option<ObjectId>) -> Result<Vec<Veil>> {
+        if !repo.keys().embargoes()?.iter().any(|r| repo.keys().embargo_released(&r.id)) {
+            return Ok(Vec::new());
+        }
+        let store = repo.store().clone();
+        let mut shaping = self.with_veil(Veil::all(), |b| {
+            let mut p = b.project(&store, &s.tree)?.pending;
+            if let Some(f) = first {
+                p.extend(b.project(&store, &repo.snapshot(&f)?.tree)?.pending);
+            }
+            p.extend(public_text(&store, &b.veil, &s.description).1);
+            Ok(p)
+        })?;
+        shaping.extend(s.embargo.clone());
+        let released: Vec<String> = shaping.into_iter().filter(|e| repo.keys().embargo_released(e)).collect();
+        Ok(subsets(&released)
+            .into_iter()
+            .filter(|v| !v.is_empty())
+            .map(Veil::of)
+            .collect())
+    }
+
     fn import_one(
         &mut self,
         tx: &mut Transaction<'_>,
         oid: &GitOid,
         commit: &gix::objs::Commit,
         report: &mut ImportReport,
-    ) -> Result<()> {
+        index: &mut ChangeIndex,
+    ) -> Result<Imported> {
         let store = tx.repo().store().clone();
-        let mut parents: Vec<ObjectId> = Vec::new();
+        let mut git_parents: Vec<ObjectId> = Vec::new();
         for p in &commit.parents {
             let sid = self
                 .mapped(tx, p)?
                 .ok_or_else(|| VeilError::repo(format!("git import: parent {} of {} is not mapped", short(p), short(oid))))?;
+            git_parents.push(sid);
+        }
+        // Veil's own commit, exported here or by another replica.
+        if let Some((sid, origin, veiled)) = self.recognise_export(tx.repo(), oid, commit, &git_parents, index)? {
+            self.map.record_found(*oid, sid, origin, veiled, commit.parents.first().copied());
+            return Ok(Imported::Known);
+        }
+        let mut parents: Vec<ObjectId> = Vec::new();
+        for sid in git_parents {
             if !parents.contains(&sid) {
                 parents.push(sid);
             }
         }
         if parents.is_empty() {
             parents.push(tx.repo().root_id());
+        }
+        let (author, timestamp) = author_of(commit);
+        let text = String::from_utf8_lossy(&commit.message).trim_end_matches('\n').to_string();
+        let same_commit = |s: &Snapshot| {
+            s.parents == parents && s.author == author && s.timestamp == timestamp && s.description == Text::Plain(text.clone())
+        };
+        // What this commit's author saw of its parents: the view their
+        // commits show. After an embargo release, a commit made on top of
+        // the pre-release view (the merge as exported before, or a Git
+        // commit made on it) still shows the pre-fix files: against the
+        // released tree they would read as a revert of the fix.
+        let mut veil = Veil::default();
+        for p in &commit.parents {
+            veil.set.extend(self.map.veiled(p));
+        }
+        // An earlier import of this very commit (its mapping was lost): the
+        // derived change id is a function of the commit id.
+        let derived = derived_change_id(oid);
+        for x in index.get(tx.repo(), &derived)? {
+            let s = tx.repo().snapshot(&x)?;
+            if same_commit(&s) {
+                let veiled = self.with_veil(veil.clone(), |b| b.project(&store, &s.tree))?.pending;
+                self.map.record_import(*oid, x, veiled);
+                return Ok(Imported::Known);
+            }
         }
         let held = |e: VeilError| match e {
             VeilError::Policy(why) => VeilError::Policy(format!("held back: {why}")),
@@ -167,7 +385,7 @@ impl GitBridge {
         let outcome = tx.repo().parents_tree(&parents).map_err(held)?;
         let ours = outcome.tree;
         // … what Git saw of it …
-        let base = match self.project(&store, &ours)?.tree {
+        let base = match self.with_veil(veil.clone(), |b| b.project(&store, &ours))?.tree {
             Some(t) => t,
             None => store.empty_tree()?,
         };
@@ -213,16 +431,44 @@ impl GitBridge {
         let merged = merge_trees(&store, Some(base), ours, theirs).map_err(held)?;
         let mut conflicts: BTreeSet<String> = outcome.conflicts.iter().map(|p| p.to_string()).collect();
         conflicts.extend(merged.conflicts.iter().map(|p| p.to_string()));
+        // The embargoes unreleased in the view this commit shows.
+        let veiled = self.with_veil(veil, |b| b.project(&store, &merged.tree))?.pending;
+        // A `change-id` header is taken only if no visible change has that
+        // id: a commit from Git must never make one of the user's changes
+        // divergent (a forged header), and Veil's own commits were
+        // recognised above.
+        let change_id = match header_change_id(commit) {
+            Some(h) => {
+                let holders = index.get(tx.repo(), &h)?;
+                for x in &holders {
+                    let s = tx.repo().snapshot(x)?;
+                    if same_commit(&s) && s.tree == merged.tree {
+                        // Imported before (the mapping was lost).
+                        self.map.record_import(*oid, *x, veiled);
+                        return Ok(Imported::Known);
+                    }
+                }
+                if holders.is_empty() {
+                    h
+                } else {
+                    report.warnings.push(format!(
+                        "Git commit {} claims change id {} of an existing change; imported as a change of its own",
+                        short(oid),
+                        h.short()
+                    ));
+                    derived
+                }
+            }
+            None => derived,
+        };
         if !conflicts.is_empty() {
             report.conflicts.push((*oid, conflicts.iter().cloned().collect()));
         }
-        let (author, timestamp) = author_of(commit);
-        let text = String::from_utf8_lossy(&commit.message);
         let snap = Snapshot {
             parents,
-            change_id: change_id_of(oid, commit),
+            change_id,
             tree: merged.tree,
-            description: Text::Plain(text.trim_end_matches('\n').to_string()),
+            description: Text::Plain(text),
             author,
             timestamp,
             predecessors: vec![],
@@ -232,8 +478,9 @@ impl GitBridge {
             signature: None,
         };
         let sid = tx.write_snapshot(&snap)?;
-        self.map.record_import(*oid, sid);
-        Ok(())
+        index.add(change_id, sid);
+        self.map.record_import(*oid, sid, veiled);
+        Ok(Imported::New)
     }
 
     /// A Git commit may edit `.veilpolicy` like any file. An edit that would
@@ -389,7 +636,7 @@ impl GitTreeFs {
         };
         for e in tree.entries {
             match String::from_utf8(e.filename.to_vec()) {
-                Ok(name) if validate_entry_name(&name).is_ok() && !name.eq_ignore_ascii_case(".git") => {
+                Ok(name) if validate_entry_name(&name).is_ok() && !is_git_dir_name(&name) => {
                     d.entries.insert(name, (e.mode.kind(), e.oid));
                 }
                 Ok(name) => d.bad.push(name.escape_debug().to_string()),
