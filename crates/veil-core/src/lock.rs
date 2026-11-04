@@ -43,8 +43,15 @@
 //!   operation head.
 //!
 //! Detecting a dead pid, the host name and the boot id requires asking the
-//! host OS (`/proc` on Linux, `ps` elsewhere). That is process introspection,
-//! not repository storage, so it lives here rather than behind the VFS.
+//! host OS. That is process introspection, not repository storage, so it
+//! lives here rather than behind the VFS:
+//!
+//! | | Linux | macOS | other Unix |
+//! |---|---|---|---|
+//! | host | `/proc/sys/kernel/hostname` | `LocalHostName` (stable across networks), else `gethostname` | `gethostname` |
+//! | boot identity | `boot_id` + pid namespace | `kern.bootsessionuuid` | none (host name only) |
+//! | boot time | `btime` in `/proc/stat` | `kern.boottime` | unknown |
+//! | pid alive | `/proc/<pid>` | `kill(pid, 0)` | `kill(pid, 0)` |
 
 use std::{
     collections::BTreeMap,
@@ -550,7 +557,17 @@ fn command_output(cmd: &str, args: &[&str]) -> Option<String> {
 }
 
 fn host_name() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        // The kernel host name follows DHCP and VPNs on macOS; a lock must
+        // not look foreign because the network changed. `LocalHostName`
+        // (the Bonjour name) only changes when the user renames the Mac.
+        if let Some(h) = command_output("/usr/sbin/scutil", &["--get", "LocalHostName"]) {
+            return h;
+        }
+    }
     read_trimmed("/proc/sys/kernel/hostname")
+        .or_else(gethostname)
         .or_else(|| std::env::var("COMPUTERNAME").ok())
         .or_else(|| {
             if cfg!(unix) {
@@ -562,49 +579,123 @@ fn host_name() -> String {
         .unwrap_or_default()
 }
 
+#[cfg(unix)]
+fn gethostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: the buffer is valid for its length; the result is NUL-terminated
+    // unless truncated, which the `position` below copes with.
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let s = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+#[cfg(not(unix))]
+fn gethostname() -> Option<String> {
+    None
+}
+
 /// Identifies one boot of one machine *and* the pid namespace, so a pid is
 /// only compared against processes it could actually refer to.
 fn boot_identity() -> String {
-    if !cfg!(target_os = "linux") {
-        return String::new();
+    #[cfg(target_os = "linux")]
+    {
+        let boot = read_trimmed("/proc/sys/kernel/random/boot_id");
+        let ns = std::fs::read_link("/proc/self/ns/pid")
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned());
+        match (boot, ns) {
+            (Some(b), Some(n)) => format!("{b}/{n}"),
+            _ => String::new(),
+        }
     }
-    let boot = read_trimmed("/proc/sys/kernel/random/boot_id");
-    let ns = std::fs::read_link("/proc/self/ns/pid")
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned());
-    match (boot, ns) {
-        (Some(b), Some(n)) => format!("{b}/{n}"),
-        _ => String::new(),
+    #[cfg(target_os = "macos")]
+    {
+        // A random UUID per boot (macOS has no pid namespaces).
+        sysctl_bytes("kern.bootsessionuuid")
+            .map(|b| String::from_utf8_lossy(&b).trim_end_matches('\0').trim().to_string())
+            .map(|u| if u.is_empty() { u } else { format!("macos-boot/{u}") })
+            .unwrap_or_default()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        String::new()
     }
 }
 
 /// When this machine booted (ms since the epoch), if known.
 fn boot_time_ms() -> Option<i64> {
-    let stat = std::fs::read_to_string("/proc/stat").ok()?;
-    let secs: i64 = stat
-        .lines()
-        .find_map(|l| l.strip_prefix("btime "))?
-        .trim()
-        .parse()
-        .ok()?;
-    Some(secs * 1000)
+    #[cfg(target_os = "macos")]
+    {
+        let raw = sysctl_bytes("kern.boottime")?;
+        if raw.len() < std::mem::size_of::<libc::timeval>() {
+            return None;
+        }
+        // SAFETY: `kern.boottime` is a `struct timeval`; the length was checked.
+        let tv: libc::timeval = unsafe { std::ptr::read_unaligned(raw.as_ptr().cast()) };
+        Some(i64::from(tv.tv_sec) * 1000 + i64::from(tv.tv_usec) / 1000)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let stat = std::fs::read_to_string("/proc/stat").ok()?;
+        let secs: i64 = stat
+            .lines()
+            .find_map(|l| l.strip_prefix("btime "))?
+            .trim()
+            .parse()
+            .ok()?;
+        Some(secs * 1000)
+    }
 }
 
-/// Whether `pid` is a running process on this machine; `None` if unknown.
-fn process_alive(pid: u32) -> Option<bool> {
-    if cfg!(target_os = "linux") && std::path::Path::new("/proc/self").exists() {
+/// Raw value of a `sysctl` by name.
+#[cfg(target_os = "macos")]
+fn sysctl_bytes(name: &str) -> Option<Vec<u8>> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut len: libc::size_t = 0;
+    // SAFETY: size query with a null buffer, then a read into a buffer of
+    // exactly the reported size; `len` is updated to what was written.
+    unsafe {
+        if libc::sysctlbyname(cname.as_ptr(), std::ptr::null_mut(), &mut len, std::ptr::null_mut(), 0) != 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; len];
+        if libc::sysctlbyname(cname.as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) != 0 {
+            return None;
+        }
+        buf.truncate(len);
+        Some(buf)
+    }
+}
+
+/// Whether `pid` is a running process on this machine (zombies count as
+/// running); `None` if that cannot be told.
+pub fn process_alive(pid: u32) -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    if std::path::Path::new("/proc/self").exists() {
         return Some(std::path::Path::new(&format!("/proc/{pid}")).exists());
     }
-    if cfg!(unix) {
-        // `ps -p` exits 0 iff the process exists, whoever owns it.
-        let status = std::process::Command::new("ps")
-            .args(["-p", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .ok()?;
-        return Some(status.success());
+    #[cfg(unix)]
+    {
+        // pid 0 and negative values address process groups, not a process.
+        let Ok(raw) = libc::pid_t::try_from(pid) else { return None };
+        if raw <= 0 {
+            return None;
+        }
+        // SAFETY: signal 0 performs only the existence and permission checks.
+        if unsafe { libc::kill(raw, 0) } == 0 {
+            return Some(true);
+        }
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => Some(false),
+            // Exists, but belongs to someone else.
+            Some(libc::EPERM) => Some(true),
+            _ => None,
+        };
     }
+    #[allow(unreachable_code)]
     None
 }
 

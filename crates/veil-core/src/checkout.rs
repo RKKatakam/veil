@@ -14,8 +14,14 @@
 //! /shared/vendor` link therefore never receives files from a pulled tree.
 //! (The builder keeps such tracked entries unchanged, so this is not
 //! recorded as a deletion.)
+//!
+//! On a backend that folds names (a macOS volume: `README` and `readme`, or
+//! NFC and NFD spellings, are one entry) checkout refuses a tree with two
+//! such names in one directory, before writing anything: materialising both
+//! would make one silently overwrite the other and corrupt the working copy
+//! (see [`name_collisions`]).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::{
     error::{Result, VeilError},
@@ -24,9 +30,9 @@ use crate::{
     policy::{Policy, Tier},
     statcache::StatCache,
     store::ObjectStore,
-    tree::{diff_trees, TreeView},
+    tree::{diff_trees, lookup, TreeView},
     vfs::{NodeKind, StorageBackend},
-    vpath::VPath,
+    vpath::{NameFolding, VPath},
 };
 
 #[derive(Debug, Default, Clone)]
@@ -138,6 +144,23 @@ pub fn checkout_cached(
     // checkout must never write repository metadata whatever the tree says.
     if let Some(c) = changes.iter().find(|c| c.path.components().any(is_reserved_name)) {
         return Err(VeilError::InvalidPath(format!("{:?} is inside reserved .veil", c.path.as_str())));
+    }
+    let folding = fs.name_folding();
+    if folding.folds() {
+        // Only directories on the way to something new can hold a new pair.
+        let dirs: BTreeSet<VPath> = changes
+            .iter()
+            .filter(|c| c.new.is_some())
+            .flat_map(|c| {
+                let mut d = c.path.ancestors();
+                d.insert(0, VPath::root());
+                d
+            })
+            .collect();
+        let found = name_collisions(store, to, folding, Some(&dirs))?;
+        if !found.is_empty() {
+            return Err(collision_error(&found, folding));
+        }
     }
     let policy = Policy::load(&TreeView::new(store.clone(), *to))?;
     let mut guard = SpecialGuard::new(fs);
@@ -271,4 +294,79 @@ fn prune_empty_parents(fs: &dyn StorageBackend, path: &VPath) -> Result<()> {
         cur = dir.parent();
     }
     Ok(())
+}
+
+/// Pairs of entries of tree `root` that a backend with `folding` would
+/// store as a single file or directory, looking only at the directories in
+/// `dirs` (every directory of the tree when `None`). Directories this
+/// reader cannot open (sealed without a key) are skipped: nothing in them
+/// is materialised.
+pub fn name_collisions(
+    store: &ObjectStore,
+    root: &ObjectId,
+    folding: NameFolding,
+    dirs: Option<&BTreeSet<VPath>>,
+) -> Result<Vec<(VPath, VPath)>> {
+    let mut out = Vec::new();
+    if !folding.folds() {
+        return Ok(out);
+    }
+    let open = |id: &ObjectId| match store.tree(id) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.is_unreadable() => Ok(None),
+        Err(e) => Err(e),
+    };
+    let check = |dir: &VPath, tree: &crate::object::Tree, out: &mut Vec<(VPath, VPath)>| {
+        let mut seen: HashMap<std::borrow::Cow<'_, str>, &str> = HashMap::new();
+        for e in &tree.entries {
+            if let Some(other) = seen.insert(folding.key(&e.name), &e.name) {
+                out.push((dir.join(other), dir.join(&e.name)));
+            }
+        }
+    };
+    match dirs {
+        Some(dirs) => {
+            for dir in dirs {
+                let entry = match lookup(store, root, dir) {
+                    Ok(e) => e,
+                    Err(e) if e.is_unreadable() => continue,
+                    Err(e) => return Err(e),
+                };
+                if let Some(tree) = entry.filter(|e| e.kind == EntryKind::Dir).map(|e| open(&e.id)).transpose()?.flatten() {
+                    check(dir, &tree, &mut out);
+                }
+            }
+        }
+        None => {
+            // Explicit stack: tree depth is attacker-controlled.
+            let mut stack = vec![(VPath::root(), *root)];
+            while let Some((dir, id)) = stack.pop() {
+                let Some(tree) = open(&id)? else { continue };
+                check(&dir, &tree, &mut out);
+                for e in tree.entries.iter().filter(|e| e.kind == EntryKind::Dir) {
+                    stack.push((dir.join(&e.name), e.id));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The error checkout returns for [`name_collisions`].
+pub fn collision_error(found: &[(VPath, VPath)], folding: NameFolding) -> VeilError {
+    const SHOWN: usize = 10;
+    let mut pairs: Vec<String> = found
+        .iter()
+        .take(SHOWN)
+        .map(|(a, b)| format!("'{a}' and '{b}'"))
+        .collect();
+    if found.len() > SHOWN {
+        pairs.push(format!("and {} more", found.len() - SHOWN));
+    }
+    VeilError::NameCollision(format!(
+        "cannot check out this snapshot here: the working copy's filesystem is {}, so these tracked paths would be the same file: {}. \
+         Nothing in the working copy was changed. Rename one of each pair (on a case-sensitive machine, e.g. Linux) and commit that",
+        folding.describe(),
+        pairs.join("; ")
+    ))
 }

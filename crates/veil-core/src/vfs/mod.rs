@@ -13,10 +13,11 @@ mod disk;
 mod memory;
 mod overlay;
 
-pub use disk::DiskBackend;
+pub use disk::{parse_folding, probe_folding, DiskBackend, FOLDING_ENV};
 pub use memory::MemoryBackend;
 pub use overlay::{OverlayBackend, OverlayChanges};
 
+pub use crate::vpath::NameFolding;
 use crate::{error::Result, id::ObjectId, vpath::VPath};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,6 +185,15 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
     /// (which disables stat caching).
     fn stat_clock(&self) -> Option<StatClock> {
         None
+    }
+
+    /// How this backend compares names: whether `README` and `readme`, or
+    /// NFC and NFD spellings of one name, refer to the same entry. The
+    /// builder keeps recorded spellings stable across such aliases and
+    /// checkout refuses trees whose names would collide (see
+    /// [`NameFolding`]). Exact by default.
+    fn name_folding(&self) -> NameFolding {
+        NameFolding::EXACT
     }
 
     fn exists(&self, path: &VPath) -> Result<bool> {

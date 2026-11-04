@@ -14,7 +14,12 @@
 //!   group, so a Ctrl-C aimed at the command does not kill it too.
 //! * As a last resort (reaper killed as well, power loss), every `ws exec`
 //!   first sweeps sandboxes of the same user whose owning `vl` process no
-//!   longer exists. The owner's pid is part of the directory name.
+//!   longer exists. The owner's pid is part of the directory name; liveness
+//!   is `/proc/<pid>` on Linux and `kill(pid, 0)` on macOS
+//!   ([`veil_core::lock::process_alive`]). `vl doctor` lists them too.
+//!
+//! On macOS `$TMPDIR` is a per-user directory under `/var/folders` (which
+//! the system cleans after three days without access) rather than `/tmp`.
 
 use std::{
     io::Read,
@@ -146,32 +151,47 @@ pub fn reaper_main(dir: Option<&std::ffi::OsStr>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Remove sandboxes of this user whose owning `vl` process is gone (only
-/// where that can be told reliably: Linux `/proc`).
-fn sweep_stale(base: &Path) {
-    #[cfg(target_os = "linux")]
+/// A sandbox directory left behind by a `vl` process that no longer runs.
+#[derive(Debug)]
+pub struct StaleSandbox {
+    pub path: PathBuf,
+    pub pid: u32,
+}
+
+/// Sandboxes in `base` owned by this user whose owning `vl` process is gone
+/// (only where that can be told: a Unix with a working pid check).
+pub fn stale_sandboxes(base: &Path) -> Vec<StaleSandbox> {
+    let mut out = Vec::new();
+    #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let Ok(me) = std::fs::metadata("/proc/self") else { return };
-        let Ok(entries) = std::fs::read_dir(base) else { return };
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        let Ok(entries) = std::fs::read_dir(base) else { return out };
         for entry in entries.flatten() {
             let Some(name) = entry.file_name().to_str().map(str::to_string) else { continue };
             let Some(rest) = name.strip_prefix(PREFIX) else { continue };
             let mut parts = rest.rsplitn(3, '-');
             let (Some(_rand), Some(pid), Some(_label)) = (parts.next(), parts.next(), parts.next()) else { continue };
             let Ok(pid) = pid.parse::<u32>() else { continue };
-            if pid == std::process::id() || Path::new(&format!("/proc/{pid}")).exists() {
+            if pid == std::process::id() || veil_core::lock::process_alive(pid) != Some(false) {
                 continue;
             }
             let path = entry.path();
             match std::fs::symlink_metadata(&path) {
-                Ok(m) if m.is_dir() && m.uid() == me.uid() => {
-                    let _ = std::fs::remove_dir_all(&path);
-                }
+                Ok(m) if m.is_dir() && m.uid() == me => out.push(StaleSandbox { path, pid }),
                 _ => {}
             }
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     let _ = base;
+    out
+}
+
+/// Remove sandboxes of this user whose owning `vl` process is gone.
+fn sweep_stale(base: &Path) {
+    for s in stale_sandboxes(base) {
+        let _ = std::fs::remove_dir_all(&s.path);
+    }
 }
