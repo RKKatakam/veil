@@ -11,3 +11,6 @@ mod support;
 mod remotes;
 mod clone;
 mod push_pull;
+mod visibility;
+mod integrity;
+mod gc;
