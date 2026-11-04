@@ -226,7 +226,10 @@ $ vl evolog -r @-
 Use change ids in day-to-day work. Use snapshot ids when you mean one exact
 version (to compare with `vl diff --from`, or after a change became
 *divergent*: two visible snapshots with the same change id, which `vl`
-reports when you use the change id).
+reports when you use the change id). Every id `vl evolog` prints is a
+revision, earlier versions included: `vl show ecdb49a1`, `vl cat -r ecdb49a1
+FILE` and `vl restore --from ecdb49a1 FILE` reach a file as it was a few
+snapshots ago. A change id always names the current version.
 
 ## Revisions
 

@@ -6,7 +6,8 @@
 //! root         the universal root snapshot
 //! main         a tag;  origin/main  a remote tag
 //! kxqz…        change-id prefix (letters k–z)
-//! 3f9a…        snapshot-id prefix (hex)
+//! 3f9a…        snapshot-id prefix (hex): visible snapshots first, then
+//!              hidden ones the op log or an evolution log reaches
 //! X-  X--      first parent, grandparent, …
 //! ```
 //!
@@ -112,8 +113,72 @@ fn resolve_base(repo: &Repo, base: &str, ws: &str) -> Result<ObjectId> {
             [] => {}
             _ => return Err(VeilError::Revset(format!("snapshot id prefix '{base}' is ambiguous"))),
         }
+        // An earlier version of a change (`vl evolog`), or a snapshot an
+        // undone operation made: hidden, but recorded (BUG-207).
+        match recorded_snapshots_with_prefix(repo, &lower)?.as_slice() {
+            [one] => return Ok(*one),
+            [] => {}
+            _ => return Err(VeilError::Revset(format!("snapshot id prefix '{base}' is ambiguous"))),
+        }
     }
     Err(VeilError::Revset(format!("revision '{base}' not found")))
+}
+
+/// The snapshots in the store whose id starts with `prefix` (lowercase hex)
+/// and that the repository has recorded: reachable, through parents and
+/// predecessors (the evolution log), from the view of some operation still
+/// in the operation log. Hidden snapshots are revisions too, by snapshot id
+/// only (a change id names the visible version), so that the ids `vl
+/// evolog` and `vl op log` lead to can be shown, diffed and restored from.
+/// Only called once the visible snapshots had no match.
+fn recorded_snapshots_with_prefix(repo: &Repo, prefix: &str) -> Result<Vec<ObjectId>> {
+    let store = repo.store();
+    let mut candidates: Vec<ObjectId> = Vec::new();
+    // Loose objects live in `<root>/<first two hex digits>/<the rest>`.
+    if let Ok(files) = store.backend().list_dir(&store.root().join(&prefix[..2])) {
+        for f in files {
+            if let Ok(id) = ObjectId::from_hex(&format!("{}{}", &prefix[..2], f.name)) {
+                candidates.push(id);
+            }
+        }
+    }
+    for p in store.packs()? {
+        candidates.extend(p.index().ids().iter().filter(|id| id.hex().starts_with(prefix)));
+    }
+    candidates.retain(|id| id.hex().starts_with(prefix));
+    candidates.sort();
+    candidates.dedup();
+    candidates.retain(|id| repo.snapshot(id).is_ok());
+    if candidates.is_empty() {
+        return Ok(candidates);
+    }
+    // Walk from every recorded view until each candidate is found (or
+    // everything recorded was seen).
+    let mut wanted: std::collections::HashSet<ObjectId> = candidates.iter().copied().collect();
+    let mut found = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut stack: Vec<ObjectId> = Vec::new();
+    for (_, op) in repo.op_log(usize::MAX)? {
+        stack.extend(op.view.refs());
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if wanted.remove(&id) {
+                found.push(id);
+                if wanted.is_empty() {
+                    return Ok(found);
+                }
+            }
+            // Objects stripped by a public remote, or sealed for a scope
+            // this reader lacks, end the walk there.
+            if let Ok(s) = repo.snapshot(&id) {
+                stack.extend(s.parents.iter().chain(&s.predecessors).copied());
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
 }
 
 /// Snapshots reachable from this repository's own heads and working copies,

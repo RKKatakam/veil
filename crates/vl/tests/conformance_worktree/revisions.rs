@@ -213,9 +213,8 @@ fn an_abandoned_change_id_no_longer_resolves() {
 // snapshot ids `vl evolog` prints for earlier versions of a change are
 // the documented way to name "one exact version" (getting-started guide:
 // "Use snapshot ids when you mean one exact version (to compare with
-// `vl diff --from` …)"), but only visible snapshots resolve by prefix.
+// `vl diff --from` …)"), hidden ones included (BUG-207).
 #[test]
-#[ignore = "BUG-207: snapshot ids that `vl evolog` prints for earlier versions do not resolve as revisions"]
 fn evolog_snapshot_ids_resolve_as_revisions() {
     let env = Env::new();
     let r = env.repo("p");
