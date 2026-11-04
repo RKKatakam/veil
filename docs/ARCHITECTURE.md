@@ -695,10 +695,22 @@ what the other provably has (`remote.rs` has the details):
 
 Benchmark (`cargo test --release -p veil-core --test sftp_bench --
 --ignored --nocapture`): 3,000 files, 300 snapshots, about 7,850 objects,
-through a local OpenSSH `sftp-server` with an artificial delay; see the
-table in the test's output. The full walk needs about 63,000 requests for
-the first push and 41,000 for a clone, almost all of them one round trip
-each; the incremental path needs about 140 and 80.
+through a local OpenSSH `sftp-server` with an artificial delay in both
+directions (release build):
+
+| operation | full walk, 2 ms RTT | incremental, 2 ms RTT | incremental, 50 ms RTT |
+|---|---|---|---|
+| first push | 87.5 s, 63,720 requests, 41 MiB sent | 0.51 s, 122 requests, 2.6 MiB | 5.3 s |
+| clone | 52.7 s, 40,904 requests, 37 MiB | 0.41 s, 80 requests, 2.6 MiB | 2.4 s |
+| push, up to date | 68.3 s, 47,400 requests | 0.08 s, 58 requests | 1.9 s |
+| push of 1 new snapshot | 68.4 s | 0.14 s, 85 requests | 3.1 s |
+| pull of 1 new snapshot | 52.9 s | 0.11 s, 75 requests | 2.2 s |
+
+The full walk's requests are almost all one round trip each, so at 50 ms
+it would take about 25 times its 2 ms time (not run). The incremental
+costs at 50 ms are a fixed number of round trips: opening the remote,
+the lock, metadata, the operation; a pull also reads every remote pack
+index (0.4 MiB here).
 
 Key rings are signed
 logs that only fast-forward (§3). Stale, tampered or forged rings are
