@@ -395,9 +395,16 @@ impl Ctx {
             let base = self.checkout.snapshot;
             let base_snap = self.repo.snapshot(&base)?;
             let target_tree = self.repo.snapshot(&view_wc)?.tree;
-            let (tree, report) =
-                self.repo
-                    .build_amending(fs, &base, Some(&mut self.cache), Some(&self.checkout.materialised))?;
+            // What a command put back (`vl restore`) is judged against the
+            // entries it was written from, as in the ordinary snapshot
+            // below: a sealed version restored stays sealed (BUG-492).
+            let (tree, report) = self.repo.build_amending_carried(
+                fs,
+                &base,
+                Some(&mut self.cache),
+                Some(&self.checkout.materialised),
+                carried,
+            )?;
             // The snapshot the directory now holds: what it was checked out
             // from, the edits saved on top of it, or already the target.
             let mut holds = base;
@@ -405,9 +412,14 @@ impl Ctx {
                 // Directory already matches (e.g. interrupted after checkout).
                 holds = view_wc;
             } else if tree != base_snap.tree {
-                let (saved, _) = self
-                    .repo
-                    .commit_fs_as_child(base, fs, "recovered working-copy edits")?;
+                let (saved, _) = self.repo.commit_fs_as_child_with(
+                    base,
+                    fs,
+                    "recovered working-copy edits",
+                    None,
+                    Some(&self.checkout.materialised),
+                    carried,
+                )?;
                 let s = self.repo.snapshot(&saved)?;
                 holds = saved;
                 warn(&format!(

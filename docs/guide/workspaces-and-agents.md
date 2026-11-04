@@ -299,9 +299,13 @@ stays where it is.
 * **What you see** is what a checkout of the workspace would give you, as
   you: cloaked files you are a member for, in plaintext; cloaked files you
   are not, absent (or their last public version, as for an embargoed
-  fix); conflicted files with their markers. Nobody else on the machine,
-  not even root, can enter the mount, and its files are `0600` (`0700`
-  for executables).
+  fix); conflicted files with their markers. When you are granted a
+  scope (or an embargo is released) and pull, the files you can now read
+  appear in the mount within about a second. Files you never saw are never
+  recorded as deleted: if you delete a directory that held some, they
+  stay in the workspace (and out of the mount). Nobody else on the
+  machine, not even root, can enter the mount, and its files are `0600`
+  (`0700` for executables).
 * **What you write** (new files, edits, deletions, renames, `mkdir`,
   `chmod +x`, truncation) goes to a copy-on-write overlay in
   `.veil/local/mounts/NAME/`, private to you, and is recorded into the
@@ -316,7 +320,10 @@ stays where it is.
   `vl merge agent@` or `vl commit` see what you wrote; every 60 seconds
   while there are changes (`--record-every SECS`, `0` to turn it off);
   and when something else unmounts it (`fusermount -u`). Edits reach the
-  overlay on disk when the file is closed (or `fsync`ed).
+  overlay on disk when the file is closed (or `fsync`ed). These
+  recordings are not commands: `vl undo` (and `vl redo`, `vl op
+  restore`) skips them and keeps what they recorded, as it keeps your
+  project directory's edits.
 * **One process serves a mount**: a background `vl` (its messages go to
   `.veil/local/mounts/NAME/log`), or `vl ws mount --foreground`, which
   serves until Ctrl-C (or `vl ws unmount`). A second mount of the same
@@ -338,8 +345,10 @@ stays where it is.
   ignored, quarantined) are kept in `.veil/local/mounts/NAME/` and are
   there again at the next mount. `vl ws rm --force NAME` deletes them.
 * You can't mount the workspace your directory is attached to, mount
-  inside the project directory (every snapshot would walk into it), or on
-  a directory that is not empty. `vl ws switch` to a mounted workspace is
+  inside the project directory or inside any other Veil repository (its
+  snapshots would walk into the mount and record what it shows, cloaked
+  files in plaintext, as its own), or on a directory that is not empty.
+  A repository created around a mount later never records it either. `vl ws switch` to a mounted workspace is
   refused: unmount it first.
 * `vl ws unmount` refuses while something has a file open in the mount or
   a shell is `cd`ed in it (`… is busy`); everything is recorded anyway.
@@ -347,7 +356,10 @@ stays where it is.
 * `vl` itself does not work from inside a mount (there is no `.veil`
   there): use `vl -R <project> …`.
 * Renaming a directory copies its files into the overlay (a large tree
-  costs a copy); an open file is held in memory while it is open.
+  costs a copy); an open file is held in memory while it is open, and no
+  file in a mount can grow past the largest object Veil records
+  (`VEIL_MAX_OBJECT`, 4 GiB): a larger `truncate` or write fails with
+  `File too large`.
 
 **Requirements.** Linux: `/dev/fuse` and `fusermount3` (the `fuse3`
 package), nothing else; `vl` mounts without libfuse. macOS: install

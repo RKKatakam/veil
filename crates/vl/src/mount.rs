@@ -58,14 +58,16 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use veil_core::{
     builder::BuildReport,
+    checkout::Materialised,
+    object::EntryKind,
     sandbox::{dir_name, workspace_of},
-    tree::diff_trees,
-    vfs::{private_dir, remove_tree, DiskBackend, SandboxLock, StorageBackend},
-    workspace::SnapshotOptions,
+    tree::{diff_trees, lookup},
+    vfs::{private_dir, remove_tree, walk_files, DiskBackend, NodeKind, SandboxLock, StorageBackend},
+    workspace::{mount_record_op_description, SnapshotOptions},
     ObjectId, Repo, VPath,
 };
 
-use self::fs::{Journal, MountFs, ReaderView};
+use self::fs::{Journal, Lower, MountFs, ReaderView};
 use crate::{
     ctx::{load_identity, user_for, Ctx},
     render::{bold, one_line, safe, warn},
@@ -92,6 +94,9 @@ pub struct Paths {
     pub dir: PathBuf,
     pub upper: PathBuf,
     whiteouts: PathBuf,
+    /// The files the whiteouts hide that the mount never showed
+    /// ([`MountFs::unseen`]), one JSON string per line.
+    unseen: PathBuf,
     lock: PathBuf,
     pub log: PathBuf,
 }
@@ -107,6 +112,7 @@ impl Paths {
         Paths {
             upper: dir.join("upper"),
             whiteouts: dir.join("whiteouts"),
+            unseen: dir.join("unseen"),
             lock: dir.join("lock"),
             log: dir.join("log"),
             dir,
@@ -139,15 +145,26 @@ impl Paths {
     }
 
     fn load_whiteouts(&self) -> Vec<VPath> {
-        let Ok(data) = std::fs::read_to_string(&self.whiteouts) else { return Vec::new() };
-        // One JSON string per line; a torn last line (a crash while
-        // appending) is skipped: the file it hid comes back, nothing is lost.
-        data.lines()
-            .filter_map(|l| serde_json::from_str::<String>(l).ok())
-            .filter_map(|s| VPath::new(&s).ok().filter(|p| !p.is_root()))
-            .collect()
+        load_paths(&self.whiteouts)
     }
 
+    fn load_unseen(&self) -> Vec<VPath> {
+        load_paths(&self.unseen)
+    }
+}
+
+/// A journal of paths (whiteouts, unseen files).
+fn load_paths(file: &Path) -> Vec<VPath> {
+    let Ok(data) = std::fs::read_to_string(file) else { return Vec::new() };
+    // One JSON string per line; a torn last line (a crash while appending)
+    // is skipped: the file it hid comes back, nothing is lost.
+    data.lines()
+        .filter_map(|l| serde_json::from_str::<String>(l).ok())
+        .filter_map(|s| VPath::new(&s).ok().filter(|p| !p.is_root()))
+        .collect()
+}
+
+impl Paths {
     /// Does the overlay hold anything (files kept from earlier mounts)?
     fn upper_files(&self) -> Vec<VPath> {
         if !self.upper.is_dir() {
@@ -197,6 +214,20 @@ impl Journal for DiskJournal {
     }
 
     fn rewrite(&mut self, all: &[VPath]) -> std::io::Result<()> {
+        self.write_all("whiteouts", all)
+    }
+
+    fn unseen(&mut self, all: &[VPath]) -> std::io::Result<()> {
+        if all.is_empty() && !self.paths.unseen.exists() {
+            return Ok(());
+        }
+        self.write_all("unseen", all)
+    }
+}
+
+impl DiskJournal {
+    /// Durably replace journal `name` with `all`.
+    fn write_all(&self, name: &str, all: &[VPath]) -> std::io::Result<()> {
         let mut out = String::new();
         for p in all {
             out.push_str(&serde_json::to_string(p.as_str()).map_err(std::io::Error::other)?);
@@ -204,7 +235,7 @@ impl Journal for DiskJournal {
         }
         self.paths
             .backend()
-            .write(&VPath::new("whiteouts").expect("valid"), out.as_bytes())
+            .write(&VPath::new(name).map_err(|e| std::io::Error::other(e.to_string()))?, out.as_bytes())
             .map_err(|e| std::io::Error::other(e.to_string()))
     }
 }
@@ -215,9 +246,53 @@ fn open_repo(root: &Path) -> Result<Repo> {
     Ok(Repo::open(Arc::new(DiskBackend::new(root)), Some(identity), &user)?)
 }
 
-fn lower_of(repo: &Repo, snapshot: &ObjectId) -> Result<Arc<dyn StorageBackend>> {
+/// Snapshot `snapshot` as `repo`'s reader sees it now (with the keys
+/// `repo` was opened with).
+fn lower_of(repo: &Repo, snapshot: &ObjectId) -> Result<Arc<dyn Lower>> {
     let tree = repo.snapshot(snapshot)?.tree;
     Ok(Arc::new(ReaderView::new(repo.store().clone(), tree)))
+}
+
+/// What the overlay over `snapshot` shows, for the builder: everything as
+/// read now, except the files the mount never showed (`unseen`, see
+/// [`MountFs::unseen`]), which are carried (BUG-534).
+fn shown_record(repo: &Repo, snapshot: &ObjectId, unseen: &[VPath]) -> Result<Materialised> {
+    if unseen.is_empty() {
+        return Ok(Materialised::default());
+    }
+    let tree = repo.snapshot(snapshot)?.tree;
+    let store = repo.store();
+    let mut hidden = Vec::new();
+    for u in unseen {
+        match lookup(store, &tree, u) {
+            Ok(Some(e)) if e.kind == EntryKind::Dir => {
+                // Unreadable: carried by the builder anyway.
+                if let Ok(files) = veil_core::tree::walk_files(store, &e.id) {
+                    hidden.extend(files.into_iter().filter_map(|(p, _)| VPath::new(&format!("{u}/{p}")).ok()));
+                }
+            }
+            Ok(Some(_)) => hidden.push(u.clone()),
+            Ok(None) | Err(_) => {}
+        }
+    }
+    Ok(Materialised::hiding(hidden))
+}
+
+/// Do `ov` and `tree` hold the same at `p`: nothing, the same file, or a
+/// directory of the same files? (A recording that reached the workspace
+/// but not `state.json`, BUG-539, leaves the overlay agreeing with it.)
+fn agrees(ov: &dyn StorageBackend, tree: &dyn StorageBackend, p: &VPath) -> bool {
+    match (ov.metadata(p), tree.metadata(p)) {
+        (Ok(None), Ok(None)) => true,
+        (Ok(Some(a)), Ok(Some(b))) if a.kind == NodeKind::File && b.kind == NodeKind::File => same_file(ov, tree, p),
+        (Ok(Some(a)), Ok(Some(b))) if a.kind == NodeKind::Dir && b.kind == NodeKind::Dir => {
+            match (walk_files(ov, p, &|_| false), walk_files(tree, p, &|_| false)) {
+                (Ok(x), Ok(y)) => x == y && x.iter().all(|f| same_file(ov, tree, f)),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Do `a` and `b` hold the same file (content and executable bit) at `p`?
@@ -282,7 +357,7 @@ impl Recorder {
             bail!("{} belongs to workspace '{}'", paths.dir.display(), safe(&state.workspace));
         }
         let base = state.base()?;
-        let lower: Arc<dyn StorageBackend> = match lower_of(&repo, &base) {
+        let lower: Arc<dyn Lower> = match lower_of(&repo, &base) {
             Ok(l) => l,
             // The snapshot is gone (gc after the workspace moved on): the
             // overlay goes over the workspace as it is now, keeping all of
@@ -291,7 +366,9 @@ impl Recorder {
         };
         let upper: Arc<dyn StorageBackend> = Arc::new(DiskBackend::new(&paths.upper));
         let whiteouts = paths.load_whiteouts();
-        let fs = Arc::new(MountFs::new(lower, upper, whiteouts, Some(Box::new(DiskJournal { paths: paths.clone() }))));
+        let fs = Arc::new(
+            MountFs::new(lower, upper, whiteouts, Some(Box::new(DiskJournal { paths: paths.clone() }))).with_unseen(paths.load_unseen()),
+        );
         Ok(Recorder {
             root: root.to_path_buf(),
             ws: ws.to_string(),
@@ -314,10 +391,26 @@ impl Recorder {
         self.paths.save_state(&self.state)
     }
 
+    /// Read the overlay's base again with `repo`'s keys: a grant or an
+    /// embargo release since shows in the mount, and the recording that
+    /// follows judges what the mount shows with the keys the builder uses.
+    fn refresh(&self, repo: &Repo) -> Result<()> {
+        if let Ok(lower) = lower_of(repo, &self.base()?) {
+            self.fs.refresh_lower(lower);
+        }
+        Ok(())
+    }
+
+    /// What the overlay over `snapshot` shows, for the builder.
+    fn shown(&self, repo: &Repo, snapshot: &ObjectId) -> Result<Materialised> {
+        shown_record(repo, snapshot, &self.fs.unseen())
+    }
+
     /// The workspace moved from the overlay's base to `wc` (another command
     /// recorded or rewrote it): put the overlay over `wc`'s tree.
     fn follow(&mut self, repo: &mut Repo, wc: ObjectId, notes: &mut Vec<String>) -> Result<()> {
         let old = self.base()?;
+        self.refresh(repo)?;
         let new_tree = repo.snapshot(&wc)?.tree;
         let old_tree = repo.snapshot(&old).ok().map(|s| s.tree);
         let changed: Vec<VPath> = match &old_tree {
@@ -328,7 +421,18 @@ impl Recorder {
         if old_tree.is_some() && !changed.is_empty() {
             let (_, whiteouts) = self.fs.region();
             let overlaps = |x: &VPath| changed.iter().any(|d| d.starts_with(x) || x.starts_with(d));
-            drop = self.fs.upper_files().into_iter().chain(whiteouts).filter(|x| overlaps(x)).collect();
+            // Where the overlay already shows what the move brought (the
+            // mount's own recording, whose `base` a crash kept from
+            // `state.json`; the same edit made twice) there is no conflict:
+            // nothing to save (BUG-539).
+            let target = lower_of(repo, &wc)?;
+            drop = self
+                .fs
+                .upper_files()
+                .into_iter()
+                .chain(whiteouts)
+                .filter(|x| overlaps(x) && !self.fs.with_view(|ov| agrees(ov, &*target, x)))
+                .collect();
             drop.sort();
             drop.dedup();
             // Ancestors cover their descendants.
@@ -338,7 +442,8 @@ impl Recorder {
         if !drop.is_empty() {
             self.fs.persist_all().map_err(fs_err)?;
             let desc = format!("edits made in the mount of workspace {} (they conflicted with a change to the workspace)", self.ws);
-            let (id, _) = self.fs.with_view(|ov| repo.commit_fs_as_child(old, ov, &desc))?;
+            let shown = self.shown(repo, &old)?;
+            let (id, _) = self.fs.with_view(|ov| repo.commit_fs_as_child_with(old, ov, &desc, None, Some(&shown), &[]))?;
             let change = repo.snapshot(&id)?.change_id.short();
             // Give up only what the saved change holds: an upper file it
             // left out (quarantined, held back) stays, over the new tree.
@@ -392,6 +497,7 @@ impl Recorder {
                 self.follow(&mut repo, wc, &mut notes)?;
                 continue;
             }
+            self.refresh(&repo)?;
             if self.recorded_gen == Some(generation) {
                 return Ok(notes);
             }
@@ -401,24 +507,35 @@ impl Recorder {
             }
             self.fs.persist_all().map_err(fs_err)?;
             let ws = self.ws.clone();
-            let out = self.fs.with_view(|ov| {
-                repo.snapshot_workspace_with(
+            let shown = self.shown(&repo, &wc)?;
+            // Recorded and reconciled with requests waiting throughout.
+            let out = self.fs.record_with(|ov| {
+                let out = repo.snapshot_workspace_with(
                     &ws,
                     ov,
                     SnapshotOptions {
                         expected_wc: Some(wc),
+                        // Never a command of the user's: `vl undo` skips it
+                        // and keeps what it recorded (BUG-538).
+                        description: Some(mount_record_op_description(&ws)),
+                        materialised: Some(&shown),
                         ..Default::default()
                     },
-                )
+                )?;
+                let lower = if out.superseded { None } else { Some(lower_of(&repo, &out.snapshot)?) };
+                Ok((out, lower))
             })?;
             if out.superseded {
                 continue;
             }
             if out.changed {
+                // A crash before this point leaves `base` behind the
+                // workspace: recovery follows the mount's own recording,
+                // finds the overlay agreeing with it and saves nothing
+                // (BUG-539).
                 self.set_base(out.snapshot)?;
                 notes.push(format!("Recorded {}", one_line(&repo, &out.snapshot)));
             }
-            self.fs.reconcile(lower_of(&repo, &out.snapshot)?).map_err(fs_err)?;
             self.left_out(&out.report, &mut notes);
             self.report = out.report;
             self.recorded_gen = Some(generation);
@@ -462,7 +579,9 @@ impl Recorder {
             let saved = (|| -> Result<String> {
                 self.fs.persist_all().map_err(fs_err)?;
                 let base = self.base()?;
-                let (id, _) = self.fs.with_view(|ov| repo.commit_fs_as_child(base, ov, &desc))?;
+                self.refresh(repo)?;
+                let shown = self.shown(repo, &base)?;
+                let (id, _) = self.fs.with_view(|ov| repo.commit_fs_as_child_with(base, ov, &desc, None, Some(&shown), &[]))?;
                 Ok(repo.snapshot(&id)?.change_id.short())
             })();
             notes.push(match saved {
@@ -887,10 +1006,34 @@ fn mountpoint(root: &Path, dir: &Path) -> Result<PathBuf> {
             root.display()
         );
     }
+    // Inside another Veil repository (or a nested one), that repository's
+    // snapshots would record what the mount shows, cloaked files in
+    // plaintext, as its own files (BUG-535). The rule of BUG-200: a
+    // directory holding a `.veil` is a repository.
+    if let Some(repo) = abs.ancestors().find(|a| holds_veil(a)) {
+        bail!(
+            "{} is inside the Veil repository {}: its snapshots would record what the mount shows (cloaked files in plaintext) \
+             as its own files. Mount it outside every repository",
+            abs.display(),
+            repo.display()
+        );
+    }
     if std::fs::read_dir(&abs)?.next().is_some() {
         bail!("{} is not empty; mount on an empty directory", abs.display());
     }
     Ok(abs)
+}
+
+/// Does directory `dir` hold a `.veil` (a directory, or a symlink to one,
+/// in any case of the name)?
+fn holds_veil(dir: &Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return std::fs::symlink_metadata(dir.join(veil_core::repo::VEIL_DIR)).is_ok();
+    };
+    rd.filter_map(|e| e.ok()).any(|e| {
+        e.file_name().to_str().is_some_and(veil_core::object::is_reserved_name)
+            && e.file_type().is_ok_and(|t| t.is_dir() || t.is_symlink())
+    })
 }
 
 /// Start the serving process in the background and wait until it serves.
@@ -1179,7 +1322,8 @@ fn follow_only(rec: &mut Recorder) -> Result<Vec<String>> {
     match repo.view().workspaces.get(&rec.ws).map(|w| w.wc) {
         None => rec.orphan(&mut repo, &mut notes)?,
         Some(wc) if wc != rec.base()? => rec.follow(&mut repo, wc, &mut notes)?,
-        Some(_) => {}
+        // A grant or a release shows within a tick.
+        Some(_) => rec.refresh(&repo)?,
     }
     Ok(notes)
 }
@@ -1334,5 +1478,13 @@ mod tests {
         assert!(ok.is_absolute() && ok.is_dir());
         std::fs::write(ok.join("f"), "x").unwrap();
         assert!(mountpoint(&root, &ok).is_err(), "not empty");
+        // BUG-535: inside another repository, or a nested one, at any depth.
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(other.join(".veil")).unwrap();
+        assert!(mountpoint(&root, &other.join("a/b/mnt")).is_err());
+        let nested = tmp.path().join("plain/vendor");
+        std::fs::create_dir_all(nested.join(".VEIL")).unwrap();
+        assert!(mountpoint(&root, &nested.join("mnt")).is_err());
+        assert!(mountpoint(&root, &tmp.path().join("plain/mnt")).is_ok());
     }
 }

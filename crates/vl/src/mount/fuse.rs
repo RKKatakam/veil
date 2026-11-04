@@ -42,6 +42,13 @@ fn err(e: i32) -> Errno {
     Errno::from_i32(e)
 }
 
+/// Run one request of [`MountFs`]. A panic in it (a bug) fails that request
+/// with `EIO` and leaves the mount serving: every other open file keeps
+/// what was written to it (BUG-536).
+fn guard<T>(f: impl FnOnce() -> Result<T, i32>) -> Result<T, i32> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(Err(libc::EIO))
+}
+
 impl Adapter {
     fn attr(&self, a: &Attr) -> FileAttr {
         let (kind, perm, nlink) = match a.kind {
@@ -100,18 +107,21 @@ pub fn mount(fs: Arc<MountFs>, dir: &Path, ws: &str, upper: &Path) -> std::io::R
 
 impl Filesystem for Adapter {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        match self.fs.lookup(parent.0, name) {
+        match guard(|| self.fs.lookup(parent.0, name)) {
             Ok(a) => reply.entry(&TTL, &self.attr(&a), Generation(0)),
             Err(e) => reply.error(err(e)),
         }
     }
 
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
-        self.fs.forget(ino.0, nlookup);
+        let _ = guard(|| {
+            self.fs.forget(ino.0, nlookup);
+            Ok(())
+        });
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        match self.fs.getattr(ino.0) {
+        match guard(|| self.fs.getattr(ino.0)) {
             Ok(a) => reply.attr(&TTL, &self.attr(&a)),
             Err(e) => reply.error(err(e)),
         }
@@ -139,7 +149,7 @@ impl Filesystem for Adapter {
             TimeOrNow::SpecificTime(t) => t,
             TimeOrNow::Now => SystemTime::now(),
         });
-        match self.fs.setattr(ino.0, size, mode, mtime) {
+        match guard(|| self.fs.setattr(ino.0, size, mode, mtime)) {
             Ok(a) => reply.attr(&TTL, &self.attr(&a)),
             Err(e) => reply.error(err(e)),
         }
@@ -152,21 +162,21 @@ impl Filesystem for Adapter {
     }
 
     fn mkdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
-        match self.fs.mkdir(parent.0, name) {
+        match guard(|| self.fs.mkdir(parent.0, name)) {
             Ok(a) => reply.entry(&TTL, &self.attr(&a), Generation(0)),
             Err(e) => reply.error(err(e)),
         }
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        match self.fs.unlink(parent.0, name) {
+        match guard(|| self.fs.unlink(parent.0, name)) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(err(e)),
         }
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        match self.fs.rmdir(parent.0, name) {
+        match guard(|| self.fs.rmdir(parent.0, name)) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(err(e)),
         }
@@ -190,7 +200,7 @@ impl Filesystem for Adapter {
         if flags.intersects(RenameFlags::RENAME_EXCHANGE | RenameFlags::RENAME_WHITEOUT) {
             return reply.error(err(libc::EINVAL));
         }
-        match self.fs.rename(parent.0, name, newparent.0, newname, flags.contains(RenameFlags::RENAME_NOREPLACE)) {
+        match guard(|| self.fs.rename(parent.0, name, newparent.0, newname, flags.contains(RenameFlags::RENAME_NOREPLACE))) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(err(e)),
         }
@@ -203,7 +213,7 @@ impl Filesystem for Adapter {
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let write = !matches!(flags.acc_mode(), OpenAccMode::O_RDONLY);
         let truncate = flags.0 & libc::O_TRUNC != 0;
-        match self.fs.open(ino.0, write, truncate) {
+        match guard(|| self.fs.open(ino.0, write, truncate)) {
             Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
             Err(e) => reply.error(err(e)),
         }
@@ -220,7 +230,7 @@ impl Filesystem for Adapter {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        match self.fs.read(fh.0, offset, size) {
+        match guard(|| self.fs.read(fh.0, offset, size)) {
             Ok(d) => reply.data(&d),
             Err(e) => reply.error(err(e)),
         }
@@ -238,14 +248,14 @@ impl Filesystem for Adapter {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        match self.fs.write(fh.0, offset, data) {
+        match guard(|| self.fs.write(fh.0, offset, data)) {
             Ok(n) => reply.written(n),
             Err(e) => reply.error(err(e)),
         }
     }
 
     fn flush(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
-        match self.fs.flush(fh.0) {
+        match guard(|| self.fs.flush(fh.0)) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(err(e)),
         }
@@ -261,44 +271,54 @@ impl Filesystem for Adapter {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        match self.fs.release(fh.0) {
+        match guard(|| self.fs.release(fh.0)) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(err(e)),
         }
     }
 
     fn fsync(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
-        match self.fs.flush(fh.0) {
+        match guard(|| self.fs.flush(fh.0)) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(err(e)),
         }
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        match self.fs.getattr(ino.0) {
-            Ok(a) if a.kind == NodeKind::Dir => reply.opened(FileHandle(0), FopenFlags::empty()),
-            Ok(_) => reply.error(err(libc::ENOTDIR)),
+        let opened = guard(|| match self.fs.getattr(ino.0)? {
+            a if a.kind == NodeKind::Dir => self.fs.opendir(ino.0),
+            _ => Err(libc::ENOTDIR),
+        });
+        match opened {
+            Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
             Err(e) => reply.error(err(e)),
         }
     }
 
-    fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
-        let entries = match self.fs.readdir(ino.0) {
+    /// From the listing `opendir` took: offsets stay put while entries are
+    /// deleted (BUG-537).
+    fn readdir(&self, _req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
+        let entries = match guard(|| self.fs.readdir_at(fh.0, ino.0, offset)) {
             Ok(e) => e,
             Err(e) => return reply.error(err(e)),
         };
-        let all = [(ino.0, ".".to_string(), NodeKind::Dir), (ino.0, "..".to_string(), NodeKind::Dir)]
-            .into_iter()
-            .chain(entries);
-        for (i, (child, name, kind)) in all.enumerate().skip(offset as usize) {
+        for (child, next, name, kind) in entries {
             let kind = match kind {
                 NodeKind::Dir => FileType::Directory,
                 NodeKind::File => FileType::RegularFile,
             };
-            if reply.add(INodeNo(child), (i + 1) as u64, kind, name) {
+            if reply.add(INodeNo(child), next, kind, name) {
                 break;
             }
         }
+        reply.ok();
+    }
+
+    fn releasedir(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _flags: OpenFlags, reply: ReplyEmpty) {
+        let _ = guard(|| {
+            self.fs.releasedir(fh.0);
+            Ok(())
+        });
         reply.ok();
     }
 
@@ -329,14 +349,14 @@ impl Filesystem for Adapter {
 
     fn create(&self, _req: &Request, parent: INodeNo, name: &OsStr, mode: u32, _umask: u32, flags: i32, reply: ReplyCreate) {
         let exclusive = flags & libc::O_EXCL != 0;
-        match self.fs.create(parent.0, name, mode & 0o111 != 0, exclusive) {
+        match guard(|| self.fs.create(parent.0, name, mode & 0o111 != 0, exclusive)) {
             Ok((a, fh)) => {
                 if flags & libc::O_TRUNC != 0 && a.size > 0 {
-                    if let Err(e) = self.fs.setattr(a.ino, Some(0), None, None) {
+                    if let Err(e) = guard(|| self.fs.setattr(a.ino, Some(0), None, None)) {
                         return reply.error(err(e));
                     }
                 }
-                let a = self.fs.getattr(a.ino).unwrap_or(a);
+                let a = guard(|| self.fs.getattr(a.ino)).unwrap_or(a);
                 reply.created(&TTL, &self.attr(&a), Generation(0), FileHandle(fh), FopenFlags::empty())
             }
             Err(e) => reply.error(err(e)),

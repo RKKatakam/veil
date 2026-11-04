@@ -244,6 +244,92 @@ fn fullfsync_unsupported(e: &io::Error) -> bool {
     )
 }
 
+/// The file system name a `vl ws mount` gives its FUSE mounts
+/// (`veil:<workspace>`): what [`is_workspace_mount`] looks for.
+pub const MOUNT_FS_PREFIX: &str = "veil:";
+
+/// Is directory `dir`, whose device is `dev`, the root of a FUSE mount of
+/// a Veil workspace (`vl ws mount`, possibly of another project)? Such a
+/// directory is never followed by a walk of a working copy: what it shows
+/// is another workspace (its cloaked files in plaintext), which no
+/// enclosing repository may record (BUG-535), as with a nested repository
+/// (BUG-200). Only asked of a directory on another device than its parent,
+/// so an ordinary walk pays one `lstat` per directory.
+#[cfg(unix)]
+fn is_workspace_mount(dir: &Path, dev: u64) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = dir;
+        // Field 3 is the device (`major:minor`); after the ` - ` separator
+        // come the file system type and the source.
+        let want = format!("{}:{}", libc::major(dev as libc::dev_t), libc::minor(dev as libc::dev_t));
+        let Ok(info) = fs::read_to_string("/proc/self/mountinfo") else { return false };
+        info.lines().any(|l| {
+            let mut fields = l.split(' ');
+            if fields.nth(2) != Some(want.as_str()) {
+                return false;
+            }
+            let mut rest = l.split(" - ").nth(1).unwrap_or("").split(' ');
+            let (fstype, source) = (rest.next().unwrap_or(""), rest.next().unwrap_or(""));
+            fstype.starts_with("fuse") && (fstype == "fuse.veil" || source.starts_with(MOUNT_FS_PREFIX))
+        })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = dev;
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else { return false };
+        // SAFETY: `c` is a valid C string and `s` a writable statfs.
+        let mut s: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statfs(c.as_ptr(), &mut s) } != 0 {
+            return false;
+        }
+        // SAFETY: the kernel NUL-terminates both names.
+        let from = unsafe { std::ffi::CStr::from_ptr(s.f_mntfromname.as_ptr()) };
+        let on = unsafe { std::ffi::CStr::from_ptr(s.f_mntonname.as_ptr()) };
+        // `dir` is on another device than its parent: the root of the
+        // mount `statfs` describes.
+        from.to_bytes().starts_with(MOUNT_FS_PREFIX.as_bytes())
+            && (on.to_bytes() == dir.as_os_str().as_bytes() || fs::canonicalize(dir).is_ok_and(|d| d.as_os_str().as_bytes() == on.to_bytes()))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (dir, dev);
+        false
+    }
+}
+
+/// Is `dir` (a directory below `parent_dev`'s directory) a workspace mount
+/// (see [`is_workspace_mount`])?
+#[cfg(unix)]
+fn mounted_workspace(dir: &Path, parent_dev: Option<u64>) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Some(parent_dev) = parent_dev else { return false };
+    match fs::symlink_metadata(dir) {
+        Ok(m) => m.is_dir() && m.dev() != parent_dev && is_workspace_mount(dir, m.dev()),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn mounted_workspace(_: &Path, _: Option<u64>) -> bool {
+    false
+}
+
+/// The device of directory `dir`.
+fn device_of(dir: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        fs::symlink_metadata(dir).ok().map(|m| m.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
 fn create_exclusive(full: &Path, data: &[u8]) -> io::Result<bool> {
     let mut f = match fs::OpenOptions::new().write(true).create_new(true).open(full) {
         Ok(f) => f,
@@ -670,6 +756,7 @@ impl StorageBackend for DiskBackend {
     fn list_dir_full(&self, path: &VPath) -> Result<DirListing> {
         let full = self.full_path(path);
         let mut out = DirListing::default();
+        let mut parent_dev = None;
         for entry in fs::read_dir(&full).map_err(|e| read_err(&full, e))? {
             let entry = entry.map_err(|e| io_err(&full, e))?;
             let name = match entry.file_name().into_string() {
@@ -682,6 +769,13 @@ impl StorageBackend for DiskBackend {
             };
             let ft = entry.file_type().map_err(|e| io_err(&full, e))?;
             let kind = if ft.is_dir() {
+                // A `vl ws mount` here: shown to the engine as a special
+                // entry, never followed, recorded or written through.
+                let dev = *parent_dev.get_or_insert_with(|| device_of(&full));
+                if mounted_workspace(&entry.path(), dev) {
+                    out.special.push(name);
+                    continue;
+                }
                 NodeKind::Dir
             } else if ft.is_file() {
                 NodeKind::File
@@ -701,6 +795,9 @@ impl StorageBackend for DiskBackend {
         let full = self.full_path(path);
         match fs::symlink_metadata(&full) {
             Ok(m) if m.file_type().is_symlink() => Ok(Some("a symlink")),
+            Ok(m) if m.is_dir() && !path.is_root() && mounted_workspace(&full, full.parent().and_then(device_of)) => {
+                Ok(Some("a mount of a Veil workspace"))
+            }
             Ok(m) if m.is_file() || m.is_dir() => Ok(None),
             Ok(_) => Ok(Some("neither a file nor a directory")),
             Err(e) if is_missing(&e) => Ok(None),

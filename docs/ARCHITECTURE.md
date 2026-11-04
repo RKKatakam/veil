@@ -1576,16 +1576,35 @@ A workspace is only a named pointer in the view. It owns no directory.
     shown as its public fallback has the fallback's size; conflicts are
     materialised with markers for this reader. A non-member never
     receives sealed bytes: they are never decrypted, and a fallback or a
-    redacted conflict is all there is to read.
+    redacted conflict is all there is to read. The `ReaderView` is built
+    again with the repository's current keys every time the server looks
+    at the workspace (every second, and before every recording), so a
+    grant or an embargo release pulled meanwhile shows in the mount, and a
+    recording always judges what the mount shows with the keys the builder
+    uses (BUG-534).
   * *Requests.* `MountFs` is the whole file system in terms of inode
     numbers, handles and errno (so it is unit-tested over
     `MemoryBackend`s, without a kernel); the adapter only translates. An
     open file's content is a buffer (one decryption per open, writes at
     any offset in memory) that reaches the upper layer, durably (temp
     file, fsync, rename), on `flush` (every `close`), `fsync` and
-    `release`. Deletions append a whiteout to the journal
+    `release`. No file grows past the largest object Veil records
+    (`VEIL_MAX_OBJECT`, 4 GiB): a larger `truncate` or write offset is
+    `EFBIG`, a buffer that cannot be allocated `ENOMEM`, and a panic in a
+    request fails that request with `EIO`; the mount and the other open
+    files go on (BUG-536). Deletions append a whiteout to the journal
     `.veil/local/mounts/<ws>/whiteouts` before they take effect, so a
-    crash can only resurrect a deleted file, never lose one. A rename
+    crash can only resurrect a deleted file, never lose one. A whiteout
+    that hides files this reader cannot read (a directory deleted with
+    files it never showed) first records them in
+    `.veil/local/mounts/<ws>/unseen`; every recording passes them to the
+    builder as never materialised (`Materialised::hiding`), so they are
+    carried, never recorded as deleted, even after a grant made them
+    readable (BUG-534). They are forgotten once no whiteout hides them.
+    `opendir` takes the directory's listing and `readdir` reads from it,
+    so offsets stay put while entries are deleted (`rm -rf`,
+    `remove_dir_all`); `readdir` from offset 0 (`rewinddir`) lists afresh
+    (BUG-537). A rename
     copies the source (a directory: its whole subtree) into the upper
     layer, then removes it. `.veil` cannot be created, symlinks, hard
     links and special files are refused (`EPERM`), only the executable
@@ -1605,7 +1624,12 @@ A workspace is only a named pointer in the view. It owns no directory.
     ends (unmounted by `vl ws unmount`, by a signal or by `fusermount -u`)
     it records once more and cleans up.
   * *Recording* is `Repo::snapshot_workspace_with` over the merged overlay,
-    with `expected_wc = base`, the path of `vl ws write` and `ws exec`:
+    with `expected_wc = base`, the path of `vl ws write` and `ws exec`,
+    as the operation "record the mount of workspace '<ws>'"
+    (`mount_record_op_description`), which `vl undo`, `vl redo` and `vl op
+    restore` skip like the automatic snapshot of the attached workspace,
+    whichever workspace is attached, carrying what it recorded over
+    (BUG-538):
     policy, scanner, sealing (the cloaked-workspace rules included),
     isolation and quarantine all apply, and `known_id` hints keep it
     O(changes). Requests wait while it reads the overlay. Afterwards
@@ -1629,9 +1653,13 @@ A workspace is only a named pointer in the view. It owns no directory.
     the other command's change. Overlap (both changed a file since the
     mount last recorded, which the recording before every command makes
     rare): the overlay as it is is first saved with
-    `Repo::commit_fs_as_child` as a change on top of `base`, the
+    `Repo::commit_fs_as_child_with` as a change on top of `base`, the
     overlapping parts are dropped from it, then it follows; the warning
-    names the change. Nothing is lost either way. Only `vl ws switch` to a
+    names the change. Where the overlay already shows exactly what the
+    new tree has (the mount's own recording, whose `base` a crash kept
+    from `state.json`; the same edit made twice) there is no conflict and
+    nothing is saved, so recovery after a crash between a recording and
+    `state.json` is idempotent (BUG-539). Nothing is lost either way. Only `vl ws switch` to a
     mounted workspace is refused (the directory and the mount would both
     record into it), and `vl ws rm` while it is mounted. A workspace that
     disappears (undo of its `vl ws new`) gets the overlay saved as a
@@ -1646,8 +1674,15 @@ A workspace is only a named pointer in the view. It owns no directory.
     holds files (isolated, ignored, quarantined) stays for the next mount;
     `vl ws rm` wants `--force` for it.
   * *The mountpoint* must be an empty directory outside the project
-    directory: the builder walking the project directory would otherwise
-    walk into the mount and record another workspace's files.
+    directory and outside every other Veil repository (no ancestor holds a
+    `.veil`, the rule of BUG-200): the builder walking a repository would
+    otherwise walk into the mount and record another workspace's files,
+    cloaked ones in plaintext (BUG-535). And whatever repository is made
+    around a mount later, `DiskBackend::list_dir_full` lists a directory
+    on another device than its parent that is a FUSE mount of a Veil
+    workspace (`/proc/self/mountinfo`: type `fuse.veil` or source
+    `veil:<ws>`; `statfs` on macOS) as a special entry, like a symlink:
+    never followed, recorded or written through.
 * **Ephemeral workspaces** (`Repo::ephemeral_workspace`) are an
   `OverlayBackend` over a `TreeView`. Creating one is O(1) and committing one
   is O(changes). They never touch disk and are dropped afterwards. This is

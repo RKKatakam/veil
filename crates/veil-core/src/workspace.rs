@@ -19,6 +19,7 @@ use crate::{
     oplog::{View, WorkspaceState},
     repo::Repo,
     statcache::StatCache,
+    store::ObjectStore,
     tree::{lookup, TreeView},
     vfs::{OverlayBackend, StorageBackend},
     vpath::VPath,
@@ -112,6 +113,38 @@ pub fn snapshot_op_description(ws: &str) -> String {
     format!("snapshot working copy of '{ws}'")
 }
 
+/// Description of the operation a `vl ws mount` of workspace `ws` records
+/// its overlay with (before another command runs, every `--record-every`
+/// seconds, on unmount). Like the automatic snapshot of the attached
+/// workspace it is never a command of the user's: `vl undo`, `vl redo` and
+/// `vl op restore` skip it, whichever workspace is attached, and carry what
+/// it recorded over (BUG-538).
+pub fn mount_record_op_description(ws: &str) -> String {
+    format!("{MOUNT_RECORD_OP_PREFIX}{ws}'")
+}
+
+const MOUNT_RECORD_OP_PREFIX: &str = "record the mount of workspace '";
+
+/// Is `description` that of an automatic recording undo skips in workspace
+/// `ws`: `ws`'s automatic snapshot, or any mount's recording?
+fn is_automatic_recording(description: &str, ws: &str) -> bool {
+    description == snapshot_op_description(ws)
+        || description
+            .strip_prefix(MOUNT_RECORD_OP_PREFIX)
+            .and_then(|rest| rest.strip_suffix('\''))
+            .is_some_and(|name| validate_workspace_name(name).is_ok())
+}
+
+/// `tree` with the `carried` entries put in (see
+/// [`SnapshotOptions::carried`]).
+fn with_carried(store: &ObjectStore, tree: ObjectId, carried: &[(VPath, crate::object::TreeEntry)]) -> Result<ObjectId> {
+    let mut out = tree;
+    for (p, e) in carried {
+        out = crate::conflict::set_entry(store, &out, p, Some(e.clone()))?;
+    }
+    Ok(out)
+}
+
 pub fn validate_workspace_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 64
@@ -194,10 +227,7 @@ impl Repo {
         let rescan = scanner_outdated(&*tx.repo().backend, ws)?;
         // What `fs` was materialised from: the working copy, with the
         // entries a command put back in place of its own.
-        let mut parent_tree = wc.tree;
-        for (p, e) in carried {
-            parent_tree = crate::conflict::set_entry(&store, &parent_tree, p, Some(e.clone()))?;
-        }
+        let parent_tree = with_carried(&store, wc.tree, carried)?;
         let repo = tx.repo();
         let line_base = || Ok(repo.parents_tree(&wc.parents)?.tree);
         let (tree, report) = build_tree_cached(
@@ -274,15 +304,31 @@ impl Repo {
         cache: Option<&mut StatCache>,
         materialised: Option<&Materialised>,
     ) -> Result<(ObjectId, BuildReport)> {
+        self.build_amending_carried(fs, snapshot, cache, materialised, &[])
+    }
+
+    /// [`Repo::build_amending`] for a working copy into which a command put
+    /// back `carried` entries from another revision (`vl restore`, see
+    /// [`SnapshotOptions::carried`]): the files at those paths are judged
+    /// against those entries, so a sealed version put back stays sealed.
+    pub fn build_amending_carried(
+        &self,
+        fs: &dyn StorageBackend,
+        snapshot: &ObjectId,
+        cache: Option<&mut StatCache>,
+        materialised: Option<&Materialised>,
+        carried: &[(VPath, crate::object::TreeEntry)],
+    ) -> Result<(ObjectId, BuildReport)> {
         let snap = self.snapshot(snapshot)?;
         let policy = self.snapshot_policy(fs, None)?.policy;
         let line_base = || Ok(self.parents_tree(&snap.parents)?.tree);
+        let parent_tree = with_carried(&self.store, snap.tree, carried)?;
         build_tree_cached(
             &self.store,
             fs,
             &BuildOptions {
                 policy: &policy,
-                parent_tree: Some(snap.tree),
+                parent_tree: Some(parent_tree),
                 cloak: snap.cloak.as_deref(),
                 injected: None,
                 rescan: false,
@@ -419,22 +465,39 @@ impl Repo {
         description: &str,
         injected: Option<&InjectedSecrets>,
     ) -> Result<(ObjectId, BuildReport)> {
+        self.commit_fs_as_child_with(base, fs, description, injected, None, &[])
+    }
+
+    /// [`Repo::commit_fs_as_child_injected`] for a backend materialised as
+    /// `materialised` records (a path it never showed is carried, not
+    /// deleted; see [`BuildOptions::materialised`]) into which a command
+    /// put back `carried` entries (see [`SnapshotOptions::carried`]).
+    pub fn commit_fs_as_child_with(
+        &mut self,
+        base: ObjectId,
+        fs: &dyn StorageBackend,
+        description: &str,
+        injected: Option<&InjectedSecrets>,
+        materialised: Option<&Materialised>,
+        carried: &[(VPath, crate::object::TreeEntry)],
+    ) -> Result<(ObjectId, BuildReport)> {
         let mut tx = self.transaction("record ephemeral workspace")?;
         let parent = tx.repo().snapshot(&base)?;
         let wp = tx.repo().snapshot_policy(fs, None)?;
         let store = tx.repo().store.clone();
         // The new change's base is `base` itself.
         let line_base = || Ok(parent.tree);
+        let parent_tree = with_carried(&store, parent.tree, carried)?;
         let (tree, report) = build_tree_cached(
             &store,
             fs,
             &BuildOptions {
                 policy: &wp.policy,
-                parent_tree: Some(parent.tree),
+                parent_tree: Some(parent_tree),
                 cloak: parent.cloak.as_deref(),
                 injected,
                 rescan: false,
-                materialised: None,
+                materialised,
                 line_base: Some(&line_base),
             },
             None,
@@ -660,14 +723,14 @@ impl Repo {
     }
 
     /// `start`, or the newest operation before it that is not an automatic
-    /// snapshot of `ws`.
+    /// recording: a snapshot of `ws`, or a mount's recording of any
+    /// workspace (see [`mount_record_op_description`]).
     fn command_at(&self, start: ObjectId, ws: &str) -> Result<ObjectId> {
-        let auto = snapshot_op_description(ws);
         let mut cur = start;
         loop {
             let op = self.op_or_pruned(&cur, "undo")?;
             match op.parents.first() {
-                Some(p) if op.description == auto => cur = *p,
+                Some(p) if is_automatic_recording(&op.description, ws) => cur = *p,
                 _ => return Ok(cur),
             }
         }

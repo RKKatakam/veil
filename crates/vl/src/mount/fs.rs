@@ -17,10 +17,19 @@
 //! **Open files** keep their content in a buffer while open (a read never
 //! decrypts a file twice; writes at any offset are cheap). A written
 //! buffer goes to the upper layer on `flush` (every `close`), `fsync` and
-//! `release`.
+//! `release`. A file never grows past the largest object Veil records
+//! ([`max_file_size`]): a larger size or offset is `EFBIG`, and a buffer
+//! that cannot be allocated is `ENOMEM`, never the end of the mount
+//! (BUG-536).
+//!
+//! **What the mount never showed.** Deleting a directory hides the lower
+//! layer's whole subtree, including files this reader could not read and
+//! so never saw. Those are remembered ([`MountFs::unseen`], persisted with
+//! the whiteouts) and carried by every recording, never recorded as
+//! deleted, even once a grant has made them readable (BUG-534).
 //!
 //! **Moving the base.** After the overlay was recorded, or when the
-//! workspace moved under the mount, [`MountFs::reconcile`] and
+//! workspace moved under the mount, [`MountFs::record_with`] (which reconciles) and
 //! [`MountFs::switch_lower`] put the overlay over the new tree, keeping
 //! what it shows.
 
@@ -64,7 +73,30 @@ pub trait Journal: Send {
     fn whiteout(&mut self, path: &VPath) -> std::io::Result<()>;
     /// The whiteouts are exactly `all` now (compaction, after a rebase).
     fn rewrite(&mut self, all: &[VPath]) -> std::io::Result<()>;
+    /// The files the mount never showed are exactly `all` now (see
+    /// [`MountFs::unseen`]). Written before the whiteout that hides them.
+    fn unseen(&mut self, _all: &[VPath]) -> std::io::Result<()> {
+        Ok(())
+    }
 }
+
+/// The largest file the mount holds: the largest object Veil records
+/// (`VEIL_MAX_OBJECT`, 4 GiB by default).
+pub fn max_file_size() -> u64 {
+    veil_core::pack::max_object_size()
+}
+
+/// A mount's lower layer.
+pub trait Lower: StorageBackend {
+    /// The files of the tree at or below `path` that this layer does not
+    /// show (a directory it cannot open stands for every file below it).
+    fn unseen_under(&self, _path: &VPath) -> Vec<VPath> {
+        Vec::new()
+    }
+}
+
+#[cfg(test)]
+impl Lower for veil_core::vfs::MemoryBackend {}
 
 /// The lower layer of a mount: a snapshot tree as this reader may see it.
 ///
@@ -120,6 +152,33 @@ impl ReaderView {
             }
         }
         Ok(false)
+    }
+}
+
+impl Lower for ReaderView {
+    /// Files of the tree this reader cannot read (when in doubt, the path
+    /// itself: being carried is the safe side).
+    fn unseen_under(&self, path: &VPath) -> Vec<VPath> {
+        let top = match lookup(&self.store, &self.view.root(), path) {
+            Ok(Some(e)) => e,
+            Ok(None) => return Vec::new(),
+            Err(_) => return vec![path.clone()],
+        };
+        let mut out = Vec::new();
+        let mut stack = vec![(path.clone(), top)];
+        while let Some((p, e)) = stack.pop() {
+            match e.kind {
+                EntryKind::Dir => match self.store.tree(&e.id) {
+                    Ok(t) => stack.extend(t.entries.iter().map(|c| (p.join(&c.name), c.clone()))),
+                    Err(_) => out.push(p),
+                },
+                _ if self.store.entry_readable(&e) => {}
+                _ => out.push(p),
+            }
+        }
+        out.retain(|p| !p.is_root());
+        out.sort();
+        out
     }
 }
 
@@ -211,6 +270,14 @@ struct Handle {
 
 struct Inner {
     overlay: OverlayBackend,
+    /// The overlay's lower layer, as a [`Lower`].
+    lower: Arc<dyn Lower>,
+    /// Files of the lower layer that whiteouts hide and that the mount
+    /// never showed (see the module documentation).
+    unseen: BTreeSet<VPath>,
+    /// Open directories: the listing each `opendir` handed out, so offsets
+    /// stay put while entries are deleted (BUG-537).
+    dirs: HashMap<u64, Vec<(u64, String, NodeKind)>>,
     journal: Option<Box<dyn Journal>>,
     nodes: HashMap<u64, Node>,
     by_path: HashMap<VPath, u64>,
@@ -356,6 +423,20 @@ impl Inner {
         }
     }
 
+    /// The entries of directory `ino` (without `.` and `..`).
+    fn listing(&mut self, ino: u64) -> FsResult<Vec<(u64, String, NodeKind)>> {
+        let dir = self.path(ino)?;
+        let entries = self.overlay.list_dir(&dir).map_err(|e| errno(&e))?;
+        Ok(entries
+            .into_iter()
+            .filter(|e| !is_temp_name(&e.name) && !is_reserved_name(&e.name))
+            .map(|e| {
+                let p = dir.join(&e.name);
+                (self.ino_for(&p), e.name, e.kind)
+            })
+            .collect())
+    }
+
     fn child(&self, parent: u64, name: &std::ffi::OsStr) -> FsResult<VPath> {
         let dir = self.path(parent)?;
         let name = component(name)?;
@@ -421,6 +502,13 @@ impl Inner {
     fn remove(&mut self, path: &VPath, dir: bool) -> FsResult<()> {
         let hides = self.lower_has(path);
         if hides {
+            // What the whiteout hides that the mount never showed is
+            // remembered first: a crash in between carries it anyway.
+            let unseen = self.lower.unseen_under(path);
+            if unseen.iter().any(|u| !self.unseen.contains(u)) {
+                self.unseen.extend(unseen);
+                self.journal_unseen()?;
+            }
             // Journal first: a crash in between resurrects nothing.
             self.journal_whiteout(path)?;
         }
@@ -472,19 +560,51 @@ impl Inner {
         Ok(())
     }
 
+    fn journal_unseen(&mut self) -> FsResult<()> {
+        let all: Vec<VPath> = self.unseen.iter().cloned().collect();
+        if let Some(j) = self.journal.as_mut() {
+            j.unseen(&all).map_err(|e| io_errno(&e))?;
+        }
+        Ok(())
+    }
+
     fn rewrite_journal(&mut self) -> FsResult<()> {
+        // Unseen files no whiteout hides any more are shown again (or
+        // gone): nothing to carry. Forgotten after the whiteouts are
+        // rewritten, so a crash in between carries them once more.
         let all = self.overlay.whiteouts();
         if let Some(j) = self.journal.as_mut() {
             j.rewrite(&all).map_err(|e| io_errno(&e))?;
+        }
+        let before = self.unseen.len();
+        self.unseen.retain(|u| all.iter().any(|w| u.starts_with(w)));
+        if self.unseen.len() != before {
+            self.journal_unseen()?;
         }
         Ok(())
     }
 
     /// Replace the lower layer, keeping the upper one and the whiteouts.
-    fn set_lower(&mut self, lower: Arc<dyn StorageBackend>) {
+    fn set_lower(&mut self, lower: Arc<dyn Lower>) {
         let upper = self.overlay.upper().clone();
         let whiteouts = self.overlay.whiteouts();
-        self.overlay = OverlayBackend::with_upper(lower, upper, whiteouts);
+        self.overlay = OverlayBackend::with_upper(lower.clone(), upper, whiteouts);
+        self.lower = lower;
+    }
+
+    /// Grow or shrink open node `ino`'s buffer to `len` bytes, within
+    /// [`max_file_size`] and without aborting on a failed allocation.
+    fn resize(&mut self, ino: u64, len: u64) -> FsResult<()> {
+        if len > max_file_size() {
+            return Err(libc::EFBIG);
+        }
+        let len = usize::try_from(len).map_err(|_| libc::EFBIG)?;
+        let buf = self.load(ino)?;
+        if len > buf.data.len() {
+            buf.data.try_reserve_exact(len - buf.data.len()).map_err(|_| libc::ENOMEM)?;
+        }
+        buf.data.resize(len, 0);
+        Ok(())
     }
 
     /// Drop the cached content of closed-but-cached nodes at `paths`, and
@@ -529,14 +649,17 @@ impl MountFs {
     /// A mount over `lower` whose writes go to `upper`, hiding `whiteouts`
     /// of the lower layer. `journal` persists new whiteouts.
     pub fn new(
-        lower: Arc<dyn StorageBackend>,
+        lower: Arc<dyn Lower>,
         upper: Arc<dyn StorageBackend>,
         whiteouts: Vec<VPath>,
         journal: Option<Box<dyn Journal>>,
     ) -> MountFs {
         MountFs {
             inner: Mutex::new(Inner {
-                overlay: OverlayBackend::with_upper(lower, upper, whiteouts),
+                overlay: OverlayBackend::with_upper(lower.clone(), upper, whiteouts),
+                lower,
+                unseen: BTreeSet::new(),
+                dirs: HashMap::new(),
                 journal,
                 nodes: HashMap::new(),
                 by_path: HashMap::new(),
@@ -548,6 +671,13 @@ impl MountFs {
                 generation: 0,
             }),
         }
+    }
+
+    /// The files the whiteouts hide that the mount never showed, as
+    /// persisted by an earlier mount process (see [`MountFs::unseen`]).
+    pub fn with_unseen(self, unseen: Vec<VPath>) -> MountFs {
+        self.lock().unseen.extend(unseen);
+        self
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -593,18 +723,50 @@ impl MountFs {
     }
 
     /// The entries of directory `ino` (without `.` and `..`).
+    #[cfg(test)]
     pub fn readdir(&self, ino: u64) -> FsResult<Vec<(u64, String, NodeKind)>> {
+        self.lock().listing(ino)
+    }
+
+    /// Open directory `ino`: its listing is taken now, and every
+    /// [`MountFs::readdir_at`] of the handle reads from it, so an offset
+    /// means the same entry however many were deleted meanwhile (`rm -rf`,
+    /// `remove_dir_all` delete while they read). Reading from offset 0
+    /// again (`rewinddir`) takes a fresh listing.
+    pub fn opendir(&self, ino: u64) -> FsResult<u64> {
         let mut g = self.lock();
-        let dir = g.path(ino)?;
-        let entries = g.overlay.list_dir(&dir).map_err(|e| errno(&e))?;
-        Ok(entries
+        let listing = g.listing(ino)?;
+        let fh = g.next_fh;
+        g.next_fh += 1;
+        g.dirs.insert(fh, listing);
+        Ok(fh)
+    }
+
+    /// The entries of open directory `fh` from `offset` on (`.` and `..`
+    /// first), each with the offset of the next one.
+    pub fn readdir_at(&self, fh: u64, ino: u64, offset: u64) -> FsResult<Vec<(u64, u64, String, NodeKind)>> {
+        let mut g = self.lock();
+        if offset == 0 || !g.dirs.contains_key(&fh) {
+            let listing = g.listing(ino)?;
+            g.dirs.insert(fh, listing);
+        }
+        let parent = match g.path(ino)?.parent() {
+            Some(p) => g.ino_for(&p),
+            None => ROOT,
+        };
+        let entries = g.dirs.get(&fh).ok_or(libc::EBADF)?;
+        let all = [(ino, ".".to_string(), NodeKind::Dir), (parent, "..".to_string(), NodeKind::Dir)]
             .into_iter()
-            .filter(|e| !is_temp_name(&e.name) && !is_reserved_name(&e.name))
-            .map(|e| {
-                let p = dir.join(&e.name);
-                (g.ino_for(&p), e.name, e.kind)
-            })
+            .chain(entries.iter().cloned());
+        Ok(all
+            .enumerate()
+            .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+            .map(|(i, (child, name, kind))| (child, i as u64 + 1, name, kind))
             .collect())
+    }
+
+    pub fn releasedir(&self, fh: u64) {
+        self.lock().dirs.remove(&fh);
     }
 
     pub fn open(&self, ino: u64, write: bool, truncate: bool) -> FsResult<u64> {
@@ -673,13 +835,16 @@ impl MountFs {
             return Err(libc::EBADF);
         }
         let ino = h.ino;
-        let start = usize::try_from(offset).map_err(|_| libc::EFBIG)?;
-        let end = start.checked_add(data.len()).ok_or(libc::EFBIG)?;
-        let buf = g.load(ino)?;
-        if buf.data.len() < end {
-            buf.data.resize(end, 0);
+        let end = offset.checked_add(data.len() as u64).ok_or(libc::EFBIG)?;
+        if end > max_file_size() {
+            return Err(libc::EFBIG);
         }
-        buf.data[start..end].copy_from_slice(data);
+        if g.load(ino)?.data.len() < end as usize {
+            g.resize(ino, end)?;
+        }
+        let buf = g.load(ino)?;
+        let start = offset as usize;
+        buf.data[start..start + data.len()].copy_from_slice(data);
         buf.dirty = true;
         if let Ok(p) = g.path(ino) {
             g.touch(&p);
@@ -726,12 +891,19 @@ impl MountFs {
             if m.kind == NodeKind::Dir {
                 return Err(libc::EISDIR);
             }
-            let size = usize::try_from(size).map_err(|_| libc::EFBIG)?;
+            if size > max_file_size() {
+                return Err(libc::EFBIG);
+            }
             let open = g.nodes.get(&ino).is_some_and(|n| n.open > 0);
-            let buf = g.load(ino)?;
-            if buf.data.len() != size {
-                buf.data.resize(size, 0);
-                buf.dirty = true;
+            if g.load(ino)?.data.len() as u64 != size {
+                let r = g.resize(ino, size);
+                if r.is_err() && !open {
+                    if let Some(n) = g.nodes.get_mut(&ino) {
+                        n.buf = None;
+                    }
+                }
+                r?;
+                g.load(ino)?.dirty = true;
             }
             // Through a path (`truncate(1)`), or by a handle: either way
             // the upper layer has it now.
@@ -920,12 +1092,34 @@ impl MountFs {
         walk_files(&**g.overlay.upper(), &VPath::root(), &|_| false).unwrap_or_default()
     }
 
+    /// The same tree as the lower layer, read with keys that may have
+    /// changed since (a grant, an embargo release): what became readable
+    /// shows from now on, except where a whiteout hides it (it stays
+    /// [unseen](MountFs::unseen)). The overlay is unchanged.
+    pub fn refresh_lower(&self, lower: Arc<dyn Lower>) {
+        let mut g = self.lock();
+        g.set_lower(lower);
+        for n in g.nodes.values_mut() {
+            if n.open == 0 {
+                n.buf = None;
+            }
+        }
+    }
+
+    /// Files of the lower layer that whiteouts hide and that the mount never
+    /// showed: a directory deleted in the mount held them, unreadable to
+    /// this reader then. A recording carries them (it never records them
+    /// as deleted), whatever this reader can read now.
+    pub fn unseen(&self) -> Vec<VPath> {
+        self.lock().unseen.iter().cloned().collect()
+    }
+
     /// Put the overlay over `lower` (the workspace moved under the mount):
     /// `changed` are the paths that differ between the old and the new
     /// lower layer, `drop` the parts of the overlay to give up first (they
     /// conflict with the move; the caller saved them). Everything else the
     /// overlay holds stays as it is.
-    pub fn switch_lower(&self, lower: Arc<dyn StorageBackend>, changed: &[VPath], drop: &[VPath]) -> FsResult<()> {
+    pub fn switch_lower(&self, lower: Arc<dyn Lower>, changed: &[VPath], drop: &[VPath]) -> FsResult<()> {
         let mut g = self.lock();
         g.persist_under(&VPath::root())?;
         let upper = g.overlay.upper().clone();
@@ -962,8 +1156,31 @@ impl MountFs {
     /// recording left out: isolated, ignored, quarantined or held-back
     /// ones; deletions it did not record). What the mount shows does not
     /// change.
-    pub fn reconcile(&self, lower: Arc<dyn StorageBackend>) -> FsResult<()> {
+    #[cfg(test)]
+    pub fn reconcile(&self, lower: Arc<dyn Lower>) -> FsResult<()> {
+        self.lock().reconcile(lower)
+    }
+
+    /// Record: run `f` on the merged view, and put the overlay over the
+    /// lower layer it returns (reconciling it: only what still differs from the new tree stays), with every request
+    /// waiting meanwhile: a file deleted (or written) between the two would
+    /// otherwise come back (or be dropped) as if recorded.
+    pub fn record_with<R>(
+        &self,
+        f: impl FnOnce(&OverlayBackend) -> anyhow::Result<(R, Option<Arc<dyn Lower>>)>,
+    ) -> anyhow::Result<R> {
         let mut g = self.lock();
+        let (r, lower) = f(&g.overlay)?;
+        if let Some(lower) = lower {
+            g.reconcile(lower).map_err(|e| anyhow::anyhow!(std::io::Error::from_raw_os_error(e)))?;
+        }
+        Ok(r)
+    }
+}
+
+impl Inner {
+    fn reconcile(&mut self, lower: Arc<dyn Lower>) -> FsResult<()> {
+        let g = self;
         g.persist_under(&VPath::root())?;
         let upper = g.overlay.upper().clone();
         let e = |e: VeilError| errno(&e);
@@ -1018,7 +1235,8 @@ impl MountFs {
                 upper.remove_dir_all(&d).map_err(e)?;
             }
         }
-        g.overlay = OverlayBackend::with_upper(lower, upper, kept);
+        g.overlay = OverlayBackend::with_upper(lower.clone(), upper, kept);
+        g.lower = lower;
         g.rewrite_journal()?;
         // Cached content of closed files may be stale.
         for n in g.nodes.values_mut() {
@@ -1064,6 +1282,72 @@ mod tests {
             j.clear();
             j.extend(all.iter().map(|p| format!("={p}")));
             Ok(())
+        }
+        fn unseen(&mut self, all: &[VPath]) -> std::io::Result<()> {
+            let list: Vec<String> = all.iter().map(|p| p.to_string()).collect();
+            self.0.lock().unwrap().push(format!("unseen {}", list.join(",")));
+            Ok(())
+        }
+    }
+
+    /// A lower layer that does not show `hidden` (files this reader cannot
+    /// read), as a [`ReaderView`] does.
+    #[derive(Debug)]
+    struct Hiding {
+        inner: MemoryBackend,
+        hidden: Vec<VPath>,
+    }
+
+    impl Hiding {
+        fn shows(&self, path: &VPath) -> bool {
+            !self.hidden.iter().any(|h| path.starts_with(h))
+                && (self.inner.metadata(path).ok().flatten().is_some_and(|m| m.kind == NodeKind::File)
+                    || walk_files(&self.inner, path, &|_| false).is_ok_and(|f| f.iter().any(|f| self.shows(f))))
+        }
+    }
+
+    impl StorageBackend for Hiding {
+        fn kind(&self) -> &'static str {
+            "hiding"
+        }
+        fn read(&self, path: &VPath) -> VResult<Vec<u8>> {
+            if !self.shows(path) {
+                return Err(VeilError::NotFound(path.to_string()));
+            }
+            self.inner.read(path)
+        }
+        fn write(&self, _: &VPath, _: &[u8]) -> VResult<()> {
+            Err(VeilError::ReadOnly)
+        }
+        fn create_new(&self, _: &VPath, _: &[u8]) -> VResult<bool> {
+            Err(VeilError::ReadOnly)
+        }
+        fn remove_file(&self, _: &VPath) -> VResult<()> {
+            Err(VeilError::ReadOnly)
+        }
+        fn remove_dir_all(&self, _: &VPath) -> VResult<()> {
+            Err(VeilError::ReadOnly)
+        }
+        fn create_dir_all(&self, _: &VPath) -> VResult<()> {
+            Err(VeilError::ReadOnly)
+        }
+        fn set_executable(&self, _: &VPath, _: bool) -> VResult<()> {
+            Err(VeilError::ReadOnly)
+        }
+        fn list_dir(&self, path: &VPath) -> VResult<Vec<DirEntry>> {
+            Ok(self.inner.list_dir(path)?.into_iter().filter(|e| self.shows(&path.join(&e.name))).collect())
+        }
+        fn metadata(&self, path: &VPath) -> VResult<Option<Metadata>> {
+            if !path.is_root() && !self.shows(path) {
+                return Ok(None);
+            }
+            self.inner.metadata(path)
+        }
+    }
+
+    impl Lower for Hiding {
+        fn unseen_under(&self, path: &VPath) -> Vec<VPath> {
+            self.hidden.iter().filter(|h| h.starts_with(path)).cloned().collect()
         }
     }
 
@@ -1327,5 +1611,87 @@ mod tests {
         assert_eq!(m.fs.lookup(ROOT, os("..")).err(), Some(libc::EINVAL));
         let long = "x".repeat(300);
         assert_eq!(m.fs.create(ROOT, os(&long), false, false).err(), Some(libc::ENAMETOOLONG));
+    }
+
+    /// BUG-537: entries deleted while a directory is read shift nothing.
+    #[test]
+    fn readdir_offsets_survive_deletions() {
+        let files: Vec<(String, Vec<u8>)> = (0..50).map(|i| (format!("d/f{i:02}"), b"x".to_vec())).collect();
+        let m = mem(&files.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect::<Vec<_>>());
+        let d = m.ino("d").unwrap();
+        let fh = m.fs.opendir(d).unwrap();
+        let mut seen = Vec::new();
+        let mut offset = 0;
+        loop {
+            // A small buffer: the kernel asks again from the last offset.
+            let batch: Vec<_> = m.fs.readdir_at(fh, d, offset).unwrap().into_iter().take(7).collect();
+            if batch.is_empty() {
+                break;
+            }
+            for (_, next, name, _) in batch {
+                offset = next;
+                if name != "." && name != ".." {
+                    m.fs.unlink(d, os(&name)).unwrap();
+                    seen.push(name);
+                }
+            }
+        }
+        m.fs.releasedir(fh);
+        assert_eq!(seen.len(), 50);
+        assert!(m.names("d").is_empty());
+        m.fs.rmdir(ROOT, os("d")).unwrap();
+        // Offset 0 again (`rewinddir`) lists afresh.
+        let fh = m.fs.opendir(ROOT).unwrap();
+        m.put("new", b"n").unwrap();
+        let names: Vec<String> = m.fs.readdir_at(fh, ROOT, 0).unwrap().into_iter().map(|e| e.2).collect();
+        assert_eq!(names, [".", "..", "new"]);
+    }
+
+    /// BUG-536: a size or an offset past the largest file is `EFBIG`, and
+    /// the mount goes on serving.
+    #[test]
+    fn huge_sizes_and_offsets_are_refused() {
+        let m = mem(&[("a", b"keep")]);
+        let ino = m.ino("a").unwrap();
+        assert_eq!(m.fs.setattr(ino, Some(1 << 40), None, None).err(), Some(libc::EFBIG));
+        assert_eq!(m.fs.setattr(ino, Some(u64::MAX), None, None).err(), Some(libc::EFBIG));
+        let fh = m.fs.open(ino, true, false).unwrap();
+        assert_eq!(m.fs.write(fh, 1 << 40, b"x").err(), Some(libc::EFBIG));
+        assert_eq!(m.fs.write(fh, u64::MAX, b"x").err(), Some(libc::EFBIG));
+        assert_eq!(m.fs.setattr(ino, Some(max_file_size() + 1), None, None).err(), Some(libc::EFBIG));
+        m.fs.write(fh, 4, b"!").unwrap();
+        m.fs.release(fh).unwrap();
+        assert_eq!(m.cat("a").unwrap(), b"keep!");
+    }
+
+    /// BUG-534: deleting a directory that held files this reader could not
+    /// read remembers them (before the whiteout), and forgets them once no
+    /// whiteout hides them.
+    #[test]
+    fn deleted_directories_remember_what_they_never_showed() {
+        let inner = MemoryBackend::from_files([("dir/a", &b"a"[..]), ("dir/secret", b"s"), ("b", b"b")]).unwrap();
+        let lower = Arc::new(Hiding { inner, hidden: vec![p("dir/secret")] });
+        let journal = Arc::new(Mutex::new(Vec::new()));
+        let fs = MountFs::new(lower, Arc::new(MemoryBackend::new()), Vec::new(), Some(Box::new(VecJournal(journal.clone()))));
+        let m = Mem { fs, lower: Arc::new(MemoryBackend::new()), upper: Arc::new(MemoryBackend::new()), journal };
+        assert_eq!(m.names("dir"), ["a"]);
+        let dir = m.ino("dir").unwrap();
+        m.fs.unlink(dir, os("a")).unwrap();
+        assert!(m.fs.unseen().is_empty(), "a was shown");
+        m.fs.rmdir(ROOT, os("dir")).unwrap();
+        assert_eq!(m.fs.unseen(), [p("dir/secret")]);
+        assert_eq!(*m.journal.lock().unwrap(), ["+dir/a", "unseen dir/secret", "+dir"], "remembered before the whiteout");
+        // Still hidden under the whiteout after a refresh that can read it.
+        let inner = MemoryBackend::from_files([("dir/a", &b"a"[..]), ("dir/secret", b"s"), ("b", b"b")]).unwrap();
+        m.fs.refresh_lower(Arc::new(Hiding { inner, hidden: Vec::new() }));
+        assert!(m.ino("dir").is_err());
+        assert_eq!(m.fs.unseen(), [p("dir/secret")]);
+        // Recorded: the new tree holds only the carried file, which this
+        // reader still cannot read; no whiteout is needed, nothing to carry.
+        let inner = MemoryBackend::from_files([("dir/secret", &b"s"[..]), ("b", b"b")]).unwrap();
+        m.fs.reconcile(Arc::new(Hiding { inner, hidden: vec![p("dir/secret")] })).unwrap();
+        assert!(m.fs.is_clean());
+        assert!(m.fs.unseen().is_empty());
+        assert_eq!(m.journal.lock().unwrap().last().unwrap(), "unseen ");
     }
 }
