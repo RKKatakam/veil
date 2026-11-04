@@ -229,7 +229,7 @@ impl Repo {
     pub fn create_workspace(&mut self, name: &str, bases: Vec<ObjectId>, cloak: Option<String>) -> Result<ObjectId> {
         validate_workspace_name(name)?;
         if let Some(scope) = &cloak {
-            if !self.keys().has(scope) {
+            if !self.keys().is_member(scope) {
                 return Err(VeilError::Policy(format!("you hold no key for scope '{scope}'")));
             }
         }
