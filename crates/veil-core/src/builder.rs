@@ -52,7 +52,7 @@ use crate::{
     error::{Result, VeilError},
     id::ObjectId,
     object::{EntryKind, Object, Tree, TreeEntry, Visibility},
-    policy::{tier_keyword, HeldBack, Policy, Tier, POLICY_FILE},
+    policy::{tier_keyword, Classification, HeldBack, Policy, Tier, POLICY_FILE},
     secrets::{self, Finding},
     statcache::{CacheKey, CacheRun, StatCache},
     store::ObjectStore,
@@ -501,6 +501,92 @@ fn assignment_value(line: &str) -> Option<&str> {
     Some(v)
 }
 
+// ---- trusted sealing decisions (BUG-103) ---------------------------------------
+
+/// What the object behind a file entry says about the entry's visibility
+/// label (see [`verify_sealing`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sealing {
+    /// The object is sealed exactly as the label says (plaintext for a
+    /// public label, under scope `s` for `cloaked:s`, under `embargo/<id>`
+    /// for `embargo:<id>`).
+    Verified,
+    /// The object is sealed for another audience than the label claims: its
+    /// real visibility. The label is hostile or corrupt.
+    Relabelled(Visibility),
+    /// Nothing can be checked: the object is not here (withheld by a public
+    /// remote, not fetched), or it is sealed under a label that is no
+    /// audience (`local`, not a scope name) or is not file content.
+    Unverifiable,
+}
+
+/// The visibility a raw stored object really has, from its own envelope
+/// label: plaintext blob → public, sealed under `embargo/<id>` → embargoed,
+/// sealed under `scope` or `scope#<key-id>` → cloaked under `scope`.
+/// `None` for anything else.
+pub fn object_visibility(raw: &[u8]) -> Option<Visibility> {
+    if Object::is_blob_raw(raw) {
+        return Some(Visibility::Public);
+    }
+    let label = Object::sealed_scope(raw)?;
+    if let Some(id) = label.strip_prefix("embargo/") {
+        return (!id.is_empty()).then(|| Visibility::Embargoed { embargo: id.to_string() });
+    }
+    let scope = crate::keychain::split_label(&label).0;
+    crate::keychain::validate_scope_name(scope)
+        .is_ok()
+        .then(|| Visibility::Cloaked { scope: scope.to_string() })
+}
+
+/// Check a file entry's visibility label against the object it points to.
+///
+/// Visibility labels in trees, like every other field of history, are
+/// written by whoever produced the snapshot: a teammate, a remote anyone
+/// with write access can push to, a Git import. They are a *claim*. The
+/// envelope label of a sealed object is bound to its ciphertext (it is the
+/// AEAD's associated data), so it is what the content really is sealed
+/// for. A tree entry whose label disagrees with its object is hostile (or
+/// corrupt) and must never decide how new content is sealed.
+pub fn verify_sealing(store: &ObjectStore, e: &TreeEntry) -> Result<Sealing> {
+    if e.kind != EntryKind::File {
+        return Ok(Sealing::Verified);
+    }
+    let raw = match store.get_raw(&e.id) {
+        Ok(r) => r,
+        Err(err) if err.is_unreadable() || err.is_not_found() => return Ok(Sealing::Unverifiable),
+        Err(err) => return Err(err),
+    };
+    Ok(match object_visibility(&raw) {
+        None => Sealing::Unverifiable,
+        Some(actual) if actual == e.visibility => Sealing::Verified,
+        Some(actual) => Sealing::Relabelled(actual),
+    })
+}
+
+/// The cloak of a line of work, as recorded in a snapshot's `cloak` field,
+/// if it may decide how new content is sealed: a valid scope name. Never
+/// `local`, an embargo label (a released embargo's key is public) or a key
+/// generation (`team#<old key>`, which a revoked member still holds). The
+/// field comes from whoever wrote the snapshot, so anything else is a
+/// forged claim and is ignored. Sealing under a valid scope still needs
+/// the key: for a scope the member is not in, edits are held back.
+pub fn trusted_cloak(cloak: Option<&str>) -> Option<&str> {
+    cloak.filter(|c| crate::keychain::validate_scope_name(c).is_ok())
+}
+
+/// Human description of a relabelled entry, for reports.
+pub fn relabel_note(claimed: &Visibility, actual: &Visibility) -> String {
+    format!(
+        "recorded as {} but its content is {}; treated as {} (a remote or an import may have forged the label)",
+        claimed.label(),
+        match actual {
+            Visibility::Public => "plaintext".to_string(),
+            v => format!("sealed as {}", v.label()),
+        },
+        actual.label()
+    )
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct BuildReport {
     /// Files kept local-only by policy.
@@ -521,8 +607,15 @@ pub struct BuildReport {
     /// The member's own edit of `.veilpolicy` waits for `vl policy accept`
     /// (see [`Policy::own_edit_pending`]).
     pub policy_edit_pending: bool,
-    /// Files that should have been cloaked but no key was available.
+    /// Files that should have been cloaked but no key was available, or
+    /// whose recorded sealing could not be verified (the edit stays local).
     pub cloak_failures: Vec<(VPath, String)>,
+    /// Tracked files whose recorded visibility label disagrees with the
+    /// sealing of the object it points to (a hostile or corrupt label from
+    /// a remote or an import), with what was found. Their audience was
+    /// decided from the object's real sealing, never from the label (see
+    /// [`verify_sealing`]). Also reported in `policy_warnings`.
+    pub relabelled: Vec<(VPath, String)>,
     /// Edits held back on a line under an unreleased embargo this reader
     /// holds no key for (recording them would revert the hidden fix), with
     /// the embargo's id. They are recorded once the embargo is released.
@@ -586,6 +679,8 @@ struct Builder<'a> {
     report: BuildReport,
     /// How `fs` compares names (read once per build).
     folding: NameFolding,
+    /// The line's cloak, if it may decide sealing ([`trusted_cloak`]).
+    cloak: Option<&'a str>,
 }
 
 /// Build a tree from `fs`, returning its id and a report.
@@ -650,7 +745,13 @@ pub fn build_tree_cached(
             ..Default::default()
         },
         folding: fs.name_folding(),
+        cloak: trusted_cloak(opts.cloak),
     };
+    if let (Some(c), None) = (opts.cloak, b.cloak) {
+        b.report.policy_warnings.push(format!(
+            "this change claims to be on a line cloaked under '{c}', which is not a scope; the claim is ignored (a remote or an import may have forged it)"
+        ));
+    }
     let root_parent = parent.clone().zip(opts.parent_tree);
     let id = match b.build_dir(&VPath::root(), root_parent)? {
         Some(id) => id,
@@ -1048,7 +1149,7 @@ impl Builder<'_> {
                 return Ok(Some(pe.clone()));
             }
         }
-        let mut desired = match &class.tier {
+        match &class.tier {
             Tier::Ignored => {
                 self.report.ignored += 1;
                 return Ok(None);
@@ -1057,51 +1158,14 @@ impl Builder<'_> {
                 self.report.isolated.push(path.clone());
                 return Ok(None);
             }
-            Tier::Public => Visibility::Public,
-            Tier::Cloaked(s) => Visibility::Cloaked { scope: s.clone() },
-        };
-        if let (Some(scope), Visibility::Public) = (self.opts.cloak, &desired) {
-            if path.as_str() != POLICY_FILE {
-                desired = Visibility::Cloaked {
-                    scope: scope.to_string(),
-                };
-            }
+            Tier::Public | Tier::Cloaked(_) => {}
         }
-        // Sealed content keeps its audience. Neither a change of workspace
-        // (`vl new <cloaked change>`), nor a rebase, nor a policy that arrived
-        // by merge may re-key it or make it public: only an edit of
-        // `.veilpolicy` in this very snapshot that reclassifies the path
-        // (`vl expose`, `vl cloak --scope`) is a deliberate decision to.
-        if let Some(pe) = parent_file.filter(|pe| matches!(pe.visibility, Visibility::Cloaked { .. })) {
-            if desired != pe.visibility {
-                let reclassified = self
-                    .parent_policy
-                    .as_ref()
-                    .is_some_and(|old| old.classify(path, false) != class);
-                if !reclassified || class.held_back.is_some() {
-                    desired = pe.visibility.clone();
-                }
-            }
-        }
-
-        // A public file sealed only because of the line it is edited on (a
-        // cloaked workspace, or sealed content keeping its audience; the
-        // policy itself says public) keeps its last public version as
-        // `fallback`: readers without the key (public remotes, Git, members
-        // of other scopes) go on seeing that version instead of losing the
-        // file. A file the policy cloaks has none: hiding it is the point.
-        let cloak_fallback = match (&desired, parent_file) {
-            (Visibility::Cloaked { .. }, Some(pe)) if class.tier == Tier::Public => {
-                if pe.visibility.is_public() && pe.fallback.is_none() {
-                    Some(pe.id)
-                } else if pe.visibility == desired {
-                    pe.fallback
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
+        // Decided on the parent entry's label as recorded. Before any new
+        // content is sealed (below, once the file is read), the label is
+        // checked against its object and the decision taken again on what
+        // the object really is (BUG-103). The fast paths in between only
+        // ever reuse existing objects.
+        let (mut desired, mut cloak_fallback) = self.audience(path, &class, parent_file);
 
         // Fast path: overlay/tree-view says the file is byte-identical.
         if let Some(pe) = parent_file {
@@ -1132,6 +1196,53 @@ impl Builder<'_> {
         };
         self.report.hashed += 1;
         let content = Object::blob_id(&data);
+
+        // The parent's visibility label is a claim (it comes from whoever
+        // wrote the snapshot: a remote, an import). Only the sealing of its
+        // object may decide the audience of new content. A public entry
+        // whose id is the blob id of this very content is plaintext by
+        // construction, so the common unchanged case costs nothing.
+        let corrected;
+        let mut parent_file = parent_file;
+        if let Some(pe) = parent_file.filter(|pe| !(pe.visibility.is_public() && pe.id == content)) {
+            match verify_sealing(self.store, pe)? {
+                Sealing::Verified => {}
+                Sealing::Relabelled(actual) => {
+                    let note = relabel_note(&pe.visibility, &actual);
+                    self.report.policy_warnings.push(format!("{path}: {note}"));
+                    self.report.relabelled.push((path.clone(), note));
+                    corrected = TreeEntry {
+                        visibility: actual,
+                        ..pe.clone()
+                    };
+                    parent_file = Some(&corrected);
+                    (desired, cloak_fallback) = self.audience(path, &class, parent_file);
+                }
+                Sealing::Unverifiable if !pe.visibility.is_public() => {
+                    // Shown the recorded fallback and left untouched.
+                    if pe.fallback == Some(content) && pe.executable == executable {
+                        return Ok(Some(TreeEntry {
+                            name: name.to_string(),
+                            ..pe.clone()
+                        }));
+                    }
+                    // The claim would decide the sealing of this edit:
+                    // without its object, it cannot be trusted.
+                    let (trusted, _) = self.audience(path, &class, None);
+                    let keeps_embargo = matches!(pe.visibility, Visibility::Embargoed { .. })
+                        && trusted.is_public()
+                        && pe.visibility.key_scope().is_some_and(|l| self.store.keys.has(&l));
+                    if desired != trusted || keeps_embargo {
+                        let why = format!(
+                            "its recorded version is labelled {} and its content is not in this repository to verify that; the edit stays local, history keeps the recorded version",
+                            pe.visibility.label()
+                        );
+                        return self.cannot_seal(path, name, Some(pe), why);
+                    }
+                }
+                Sealing::Unverifiable => {}
+            }
+        }
 
         // Embargoes are sticky until released.
         let mut fallback = None;
@@ -1216,7 +1327,7 @@ impl Builder<'_> {
         // entry (as the overlay fast path above does) rather than sealing a
         // copy of public bytes.
         if let Some(pe) = parent_file {
-            if self.opts.cloak.is_some()
+            if self.cloak.is_some()
                 && class.tier == Tier::Public
                 && pe.visibility.is_public()
                 && pe.id == content
@@ -1292,26 +1403,34 @@ impl Builder<'_> {
             }
         }
 
+        // Backstop: new content is never sealed under a key that is not an
+        // audience: a released embargo's key is public, and a cloak label
+        // must name a scope (never `embargo/…`, `local` or a generation).
+        let unsealable = match &desired {
+            Visibility::Public => None,
+            Visibility::Cloaked { scope } => crate::keychain::validate_scope_name(scope)
+                .is_err()
+                .then(|| format!("'{scope}' is not a scope")),
+            Visibility::Embargoed { embargo } => self
+                .store
+                .keys
+                .embargo_released(embargo)
+                .then(|| format!("embargo {embargo} is released and its key is public")),
+        };
+        if let Some(why) = unsealable {
+            return self.cannot_seal(path, name, parent_file, format!("{why}; the edit stays local"));
+        }
         let id = match self.store.store_file(&data, &desired) {
             Ok(id) => id,
             Err(VeilError::Redacted { scope }) => {
                 // A tracked file keeps its recorded entry: this reader cannot
                 // seal the edit, and recording a deletion instead would drop
                 // content it may not even be able to read.
-                if let Some(pe) = parent_file {
-                    self.report.cloak_failures.push((
-                        path.clone(),
-                        format!("no key for scope '{scope}'; the edit stays local, history keeps the recorded version"),
-                    ));
-                    return Ok(Some(TreeEntry {
-                        name: name.to_string(),
-                        ..pe.clone()
-                    }));
-                }
-                self.report
-                    .cloak_failures
-                    .push((path.clone(), format!("no key for scope '{scope}'")));
-                return Ok(None);
+                let why = match parent_file {
+                    Some(_) => format!("no key for scope '{scope}'; the edit stays local, history keeps the recorded version"),
+                    None => format!("no key for scope '{scope}'"),
+                };
+                return self.cannot_seal(path, name, parent_file, why);
             }
             Err(e) => return Err(e),
         };
@@ -1331,6 +1450,72 @@ impl Builder<'_> {
             visibility: desired,
             fallback,
         }))
+    }
+
+    /// The edit of `path` cannot be sealed (no key, or no trustworthy
+    /// audience): it stays local, reported in `cloak_failures`. A tracked
+    /// file keeps its recorded entry, never a deletion.
+    fn cannot_seal(&mut self, path: &VPath, name: &str, parent_file: Option<&TreeEntry>, why: String) -> Result<Option<TreeEntry>> {
+        self.report.cloak_failures.push((path.clone(), why));
+        Ok(parent_file.map(|pe| TreeEntry {
+            name: name.to_string(),
+            ..pe.clone()
+        }))
+    }
+
+    /// The audience of new content at `path` (classified `class`, not
+    /// ignored or isolated), given its parent entry: the visibility to seal
+    /// it under, and the last public version to show readers without the
+    /// key. Inputs: the policy (with the accepted pin), the line's trusted
+    /// cloak, and the parent entry, whose label the caller must have
+    /// verified before content is sealed under the result.
+    fn audience(&self, path: &VPath, class: &Classification, parent_file: Option<&TreeEntry>) -> (Visibility, Option<ObjectId>) {
+        let mut desired = match &class.tier {
+            Tier::Cloaked(s) => Visibility::Cloaked { scope: s.clone() },
+            _ => Visibility::Public,
+        };
+        if let (Some(scope), Visibility::Public) = (self.cloak, &desired) {
+            if path.as_str() != POLICY_FILE {
+                desired = Visibility::Cloaked {
+                    scope: scope.to_string(),
+                };
+            }
+        }
+        // Sealed content keeps its audience. Neither a change of workspace
+        // (`vl new <cloaked change>`), nor a rebase, nor a policy that arrived
+        // by merge may re-key it or make it public: only an edit of
+        // `.veilpolicy` in this very snapshot that reclassifies the path
+        // (`vl expose`, `vl cloak --scope`) is a deliberate decision to.
+        if let Some(pe) = parent_file.filter(|pe| matches!(pe.visibility, Visibility::Cloaked { .. })) {
+            if desired != pe.visibility {
+                let reclassified = self
+                    .parent_policy
+                    .as_ref()
+                    .is_some_and(|old| old.classify(path, false) != *class);
+                if !reclassified || class.held_back.is_some() {
+                    desired = pe.visibility.clone();
+                }
+            }
+        }
+        // A public file sealed only because of the line it is edited on (a
+        // cloaked workspace, or sealed content keeping its audience; the
+        // policy itself says public) keeps its last public version as
+        // `fallback`: readers without the key (public remotes, Git, members
+        // of other scopes) go on seeing that version instead of losing the
+        // file. A file the policy cloaks has none: hiding it is the point.
+        let cloak_fallback = match (&desired, parent_file) {
+            (Visibility::Cloaked { .. }, Some(pe)) if class.tier == Tier::Public => {
+                if pe.visibility.is_public() && pe.fallback.is_none() {
+                    Some(pe.id)
+                } else if pe.visibility == desired {
+                    pe.fallback
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        (desired, cloak_fallback)
     }
 
     /// Hold the edit back, but do not record a deletion: keep the previously

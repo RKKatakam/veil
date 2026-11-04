@@ -63,6 +63,7 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use crate::{
+    builder::{relabel_note, trusted_cloak, verify_sealing, Sealing},
     error::{Result, VeilError},
     id::ObjectId,
     object::{EntryKind, Object, Tree, TreeEntry, Visibility},
@@ -158,8 +159,11 @@ pub fn overlap_error(a: &str, b: &str) -> VeilError {
 /// under: the line's cloak if it is a cloaked line of work, else the
 /// embargo key if `tree` is under an unreleased embargo whose key we hold
 /// (a key holder's follow-up messages describe the hidden fix), else none.
+/// `cloak` comes from a snapshot's `cloak` field, so only a
+/// [`trusted_cloak`] counts: a forged `embargo/<released id>` would seal
+/// the message under a public key.
 pub fn description_scope(store: &ObjectStore, tree: &ObjectId, cloak: Option<&str>) -> Result<Option<String>> {
-    if let Some(c) = cloak {
+    if let Some(c) = trusted_cloak(cloak) {
         return Ok(Some(c.to_string()));
     }
     Ok(unreleased_wrapper(store, tree)?
@@ -294,6 +298,12 @@ fn seal_dir(
                 stack.push(child);
             }
             EntryKind::File => {
+                // A public label is a claim: content that is really sealed
+                // (a forged label) keeps its sealing, under its real label.
+                let e = match e.visibility.is_public() {
+                    true => verified_entry(store, &e)?.unwrap_or(e),
+                    false => e,
+                };
                 if let (Visibility::Embargoed { embargo: other }, Visibility::Embargoed { embargo: this }) = (&e.visibility, vis) {
                     if other != this && !store.keys.embargo_released(other) {
                         return Err(overlap_error(other, this));
@@ -365,7 +375,7 @@ pub fn normalize_tree(store: &ObjectStore, tree: &ObjectId, opts: &NormalizeOpti
 
 fn desired_visibility(policy: &Policy, path: &VPath, cloak: Option<&str>) -> Option<Visibility> {
     match policy.classify(path, false).tier {
-        Tier::Public => Some(match cloak {
+        Tier::Public => Some(match trusted_cloak(cloak) {
             Some(s) if path.as_str() != POLICY_FILE => Visibility::Cloaked { scope: s.to_string() },
             _ => Visibility::Public,
         }),
@@ -487,10 +497,60 @@ fn normalize_file(
     report: &mut NormalizeReport,
 ) -> Result<Option<TreeEntry>> {
     let path = path.clone();
-    let mut ne = Some(e.clone());
     let unchanged_from_dest = de.is_some_and(|x| x.same_content(e));
-    let dest_sealed = de.filter(|d| d.kind == EntryKind::File && matches!(d.visibility, Visibility::Cloaked { .. }));
     let desired = desired_visibility(opts.policy, &path, opts.cloak);
+    let differs_from_dest_seal = |e: &TreeEntry, de: Option<&TreeEntry>| {
+        de.is_some_and(|d| d.kind == EntryKind::File && matches!(d.visibility, Visibility::Cloaked { .. }) && d.visibility != e.visibility)
+    };
+    // Labels are claims (BUG-103). Whenever this entry may be resealed,
+    // published, or resealed for the destination's audience, both labels
+    // are checked against their objects first, and the decision is taken on
+    // what the objects really are. A label that cannot be verified is left
+    // exactly as it is: no new content is sealed or published on its word.
+    let acts = desired.as_ref().is_some_and(|w| *w != e.visibility) || (!unchanged_from_dest && differs_from_dest_seal(e, de));
+    if !acts {
+        return Ok(Some(e.clone()));
+    }
+    let checked_e;
+    let e = match verify_sealing(store, e)? {
+        Sealing::Verified => e,
+        Sealing::Relabelled(actual) => {
+            report.kept_sealed.push((path.clone(), relabel_note(&e.visibility, &actual)));
+            checked_e = TreeEntry {
+                visibility: actual,
+                ..e.clone()
+            };
+            &checked_e
+        }
+        Sealing::Unverifiable => return Ok(Some(e.clone())),
+    };
+    let checked_d;
+    let de = match de {
+        Some(d) if d.kind == EntryKind::File && !d.visibility.is_public() && !unchanged_from_dest => match verify_sealing(store, d)? {
+            Sealing::Verified => Some(d),
+            Sealing::Relabelled(actual) => {
+                checked_d = TreeEntry {
+                    visibility: actual,
+                    ..d.clone()
+                };
+                Some(&checked_d)
+            }
+            // The destination's sealing cannot be checked: keep its entry.
+            Sealing::Unverifiable => {
+                report.kept_sealed.push((
+                    path.clone(),
+                    format!(
+                        "keeps the destination's version: it is labelled {} and its content is not here to verify that",
+                        d.visibility.label()
+                    ),
+                ));
+                return Ok(Some(d.clone()));
+            }
+        },
+        d => d,
+    };
+    let mut ne = Some(e.clone());
+    let dest_sealed = de.filter(|d| d.kind == EntryKind::File && matches!(d.visibility, Visibility::Cloaked { .. }));
     match (&e.visibility, desired) {
         // The destination holds this file sealed and the merged
         // side would widen or move its audience (e.g. a PR whose
@@ -661,7 +721,13 @@ pub(crate) fn public_fallback(prev: Option<&TreeEntry>, vis: &Visibility) -> Opt
 /// Seal, under `scope`, every public file of `tree` that differs from
 /// `base` (what a cloaked line of work introduces must be sealed). The
 /// policy file stays public. Used when a change is folded into a cloaked one.
+///
+/// `scope` comes from the cloaked change's `cloak` field: unless it is a
+/// [`trusted_cloak`], nothing is sealed (the claim is not a line's cloak).
 pub fn seal_introduced(store: &ObjectStore, tree: &ObjectId, base: Option<ObjectId>, scope: &str) -> Result<ObjectId> {
+    if trusted_cloak(Some(scope)).is_none() {
+        return Ok(*tree);
+    }
     seal_introduced_dir(store, tree, base, &VPath::root(), scope)
 }
 
@@ -729,13 +795,20 @@ fn seal_introduced_dir(store: &ObjectStore, tree: &ObjectId, base: Option<Object
                         continue;
                     }
                 }
+                // A public label is a claim: content that is really sealed
+                // keeps its own sealing (under its real label).
                 EntryKind::File if e.visibility.is_public() && path.as_str() != POLICY_FILE => {
-                    let data = store.read_entry(&e)?;
-                    ne.id = store.store_file(&data, &vis)?;
-                    ne.visibility = vis.clone();
-                    // Its last public version stays what readers without
-                    // the key see (see `public_fallback`).
-                    ne.fallback = public_fallback(be.as_ref(), &vis);
+                    match verified_entry(store, &e)? {
+                        Some(real) => ne = real,
+                        None => {
+                            let data = store.read_entry(&e)?;
+                            ne.id = store.store_file(&data, &vis)?;
+                            ne.visibility = vis.clone();
+                            // Its last public version stays what readers
+                            // without the key see (see `public_fallback`).
+                            ne.fallback = public_fallback(be.as_ref(), &vis);
+                        }
+                    }
                 }
                 EntryKind::File => {}
             }
@@ -743,4 +816,17 @@ fn seal_introduced_dir(store: &ObjectStore, tree: &ObjectId, base: Option<Object
         f.changed |= ne != e;
         f.out.insert(ne);
     }
+}
+
+/// `e` with the visibility of its object, if its label disagrees with it
+/// (a forged or corrupt label). `None`: the label is right, or cannot be
+/// checked.
+fn verified_entry(store: &ObjectStore, e: &TreeEntry) -> Result<Option<TreeEntry>> {
+    Ok(match verify_sealing(store, e)? {
+        Sealing::Relabelled(actual) => Some(TreeEntry {
+            visibility: actual,
+            ..e.clone()
+        }),
+        _ => None,
+    })
 }

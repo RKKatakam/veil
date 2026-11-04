@@ -150,7 +150,6 @@ fn alice_edits_and_publishes(alice: &mut Repo, fs: &Arc<MemoryBackend>, hub: Arc
 /// under the embargo key, which is public, and the public mirror accepts
 /// such objects as "released": anyone reads her new secret.
 #[test]
-#[ignore = "BUG-103: a hostile tree entry's visibility label re-keys the victim's next edit of a cloaked file (to a released embargo key or an attacker's scope)"]
 fn a_relabelled_entry_cannot_seal_the_victims_edit_under_a_public_key() {
     let (mut alice, fs, hub, main) = alice_with_hub();
     mallory_relabels(hub.clone(), main, |m| {
@@ -178,7 +177,6 @@ fn a_relabelled_entry_cannot_seal_the_victims_edit_under_a_public_key() {
 /// merge path refuses exactly this (`normalize_tree`, BUG-009); `vl new`
 /// and `vl rebase` after a pull do not.
 #[test]
-#[ignore = "BUG-103: a hostile tree entry's visibility label re-keys the victim's next edit of a cloaked file (to a released embargo key or an attacker's scope)"]
 fn a_relabelled_entry_cannot_rekey_the_victims_edit_to_an_attacker_scope() {
     let (mut alice, fs, hub, main) = alice_with_hub();
     let alice_pub = alice.identity().unwrap().public_id();
@@ -373,7 +371,6 @@ fn a_pulled_snapshot_with_a_forged_change_id_does_not_make_the_change_divergent(
 /// her working copy; every public file she then touches, and her commit
 /// message, is sealed under the embargo key, which is public.
 #[test]
-#[ignore = "BUG-103: a hostile tree entry's visibility label re-keys the victim's next edit of a cloaked file (to a released embargo key or an attacker's scope)"]
 fn a_hostile_cloak_field_cannot_seal_the_victims_work_under_a_public_key() {
     let (mut alice, fs, _) = new_repo("alice");
     let main = commit_files(&mut alice, &*fs, &[("README", "hi\n")], "v1");
