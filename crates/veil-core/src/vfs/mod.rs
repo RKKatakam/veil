@@ -98,7 +98,8 @@ pub struct DirListing {
 }
 
 /// Prefix and suffix of the temp files [`DiskBackend`] writes before the
-/// atomic rename: `.<name>.vltmp<8 hex digits>`.
+/// atomic rename: `.<name>.vltmp<8 hex digits>` (`<name>` cut to its first
+/// 32 bytes).
 const TEMP_MARKER: &str = ".vltmp";
 
 /// Is `name` a temp file left behind by an interrupted [`DiskBackend`]
@@ -298,4 +299,31 @@ pub fn walk_files(
     }
     out.sort();
     Ok(out)
+}
+
+/// Does a directory with this listing hold a Veil repository of its own: a
+/// `.veil` that is a directory, or a symlink (to one, possibly)? Asked of
+/// every directory but a working copy's root. Such a nested repository
+/// (a vendored project, a monorepo member, `vl init` run in the wrong
+/// place) is never recorded by the enclosing repository, as Git never
+/// records an embedded repository's files: its cloaked files are plaintext
+/// on disk, and only its own policy knows they are secret (BUG-200).
+/// Checkout never writes or removes anything inside one either.
+pub fn holds_repository(listing: &DirListing) -> bool {
+    use crate::object::is_reserved_name;
+    listing
+        .entries
+        .iter()
+        .any(|e| e.kind == NodeKind::Dir && is_reserved_name(&e.name))
+        || listing.special.iter().any(|n| is_reserved_name(n))
+}
+
+/// Is `dir` of `fs` (never the root) the top of a nested Veil repository
+/// (see [`holds_repository`])? `false` for anything that is not a
+/// directory, or that cannot be listed.
+pub fn is_nested_repository(fs: &dyn StorageBackend, dir: &VPath) -> Result<bool> {
+    if dir.is_root() || !matches!(fs.metadata(dir), Ok(Some(m)) if m.kind == NodeKind::Dir) {
+        return Ok(false);
+    }
+    Ok(fs.list_dir_full(dir).is_ok_and(|l| holds_repository(&l)))
 }

@@ -378,9 +378,14 @@ impl Repo {
         let cloak = into_snap.cloak.as_deref();
         let merged = tx.repo().parents_tree(&parents)?;
         let outer = unreleased_wrapper(&store, &merged.tree)?;
-        let dest_policy = Policy::load(&TreeView::new(store.clone(), into_snap.tree))?;
-        let mut policy = Policy::load(&TreeView::new(store.clone(), merged.tree))?;
-        let mut warnings = Vec::new();
+        // An unreadable `.veilpolicy` on either side (a hostile tree's
+        // directory, BUG-121) never blocks the merge: the accepted policy
+        // applies there, with a warning.
+        let accepted = crate::policy::load_accepted(&*tx.repo().backend).ok().flatten();
+        let (dest_policy, w1) = Policy::load_or_accepted(&TreeView::new(store.clone(), into_snap.tree), accepted.as_deref())?;
+        let (mut policy, w2) = Policy::load_or_accepted(&TreeView::new(store.clone(), merged.tree), accepted.as_deref())?;
+        let mut warnings: Vec<String> = w1.into_iter().chain(w2).collect();
+        warnings.dedup();
         let mut tree = merged.tree;
 
         // A merged `.veilpolicy` that would move existing cloaked content to

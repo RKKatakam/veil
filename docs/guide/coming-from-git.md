@@ -43,7 +43,7 @@ be undone. Add to that per-file encryption and engine-level secret handling.
 | `git diff --stat` | `vl diff --stat` |
 | `git ls-files` | `vl files` (with each file's visibility) |
 | `git show REV:PATH` | `vl cat PATH -r REV` |
-| `git checkout -- PATH`, `git restore PATH` | `vl restore PATH` (from `@-`; `--from REV` for another) |
+| `git checkout -- PATH`, `git restore PATH` | `vl restore PATH` (from `@-`, or a merge's merged parents; `--from REV` for another) |
 | `git reset --hard` | `vl restore` (every path, from `@-`) |
 | `git switch BRANCH` | `vl new BRANCH` (start on top of it) or `vl edit REV` (edit it in place) |
 | `git switch -c NAME` | `vl new main`, work, then `vl tag set NAME -r @-` after committing |

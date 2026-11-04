@@ -88,16 +88,24 @@ fn builder_never_records_dot_veil_directories() {
     let (mut repo, fs, _) = new_repo("v");
     fs.write(&p("sub/.veil/repo.json"), b"{}").unwrap();
     fs.write(&p("sub/.VEIL/x"), b"x").unwrap();
+    fs.write(&p("sub/nested.txt"), b"nested\n").unwrap();
     fs.write(&p("sub/kept.txt"), b"kept\n").unwrap();
-    let wc = snap(&mut repo, &*fs);
+    // A directory holding a `.veil` is a repository of its own, left out
+    // as a whole (BUG-200); a stray `.veil` file is skipped alone.
+    fs.write(&p("other/.veil"), b"not a repository\n").unwrap();
+    fs.write(&p("other/kept.txt"), b"kept\n").unwrap();
+    let out = repo.snapshot_workspace(WS, &*fs).unwrap();
+    assert_eq!(out.report.nested, vec![p("sub")]);
+    let wc = out.snapshot;
     let tree = repo.snapshot(&wc).unwrap().tree;
     let files: Vec<String> = walk_files(repo.store(), &tree)
         .unwrap()
         .into_iter()
         .map(|(p, _)| p.as_str().to_string())
         .collect();
-    assert!(files.contains(&"sub/kept.txt".to_string()), "{files:?}");
-    assert!(!files.iter().any(|f| f.to_ascii_lowercase().contains(".veil/")), "{files:?}");
+    assert!(files.contains(&"other/kept.txt".to_string()), "{files:?}");
+    assert!(!files.iter().any(|f| f.starts_with("sub/")), "{files:?}");
+    assert!(!files.iter().any(|f| f.to_ascii_lowercase().contains(".veil")), "{files:?}");
 }
 
 // ---- verified reads and repair --------------------------------------------------

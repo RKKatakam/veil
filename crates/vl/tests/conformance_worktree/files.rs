@@ -127,7 +127,6 @@ fn cat_of_a_missing_path_fails() {
 // error, not a crash) / git `cat-file` of a tree: a directory is not a
 // file; the message must not claim the repository is corrupt.
 #[test]
-#[ignore = "BUG-205: `vl cat <directory>` reports `corrupt object … expected blob, found tree`"]
 fn cat_of_a_directory_is_a_clear_error() {
     let env = Env::new();
     let r = env.repo("p");
@@ -142,7 +141,7 @@ fn cat_of_a_directory_is_a_clear_error() {
     assert!(!err.contains("corrupt"), "ws cat: {err}");
     // And the repository is fine.
     let fsck = r.ok(&["fsck"]);
-    assert!(!fsck.contains("corrupt"), "{fsck}");
+    assert!(fsck.contains("No corruption found"), "{fsck}");
 }
 
 // Scenario from git t3005-ls-files-relative.sh: `vl cat` takes paths

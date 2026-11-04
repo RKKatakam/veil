@@ -72,6 +72,10 @@ impl Repo {
         let Some(e) = self.store.tree(tree)?.get(POLICY_FILE).cloned() else {
             return Ok(Some(None));
         };
+        // A directory (only a hostile tree records one, BUG-121): no text.
+        if e.kind != crate::object::EntryKind::File {
+            return Ok(None);
+        }
         match self.store.read_entry(&e) {
             Ok(b) => Ok(Some(Some(b))),
             Err(err) if err.is_unreadable() => Ok(None),
@@ -104,7 +108,10 @@ impl Repo {
                 let is_dir = child.kind == NodeKind::Dir;
                 let c = policy.classify(&path, is_dir);
                 if is_dir && c.tier != Tier::Ignored {
-                    stack.push(path);
+                    // Never recorded here, so nothing to hold back (BUG-200).
+                    if !crate::vfs::is_nested_repository(fs, &path)? {
+                        stack.push(path);
+                    }
                 } else if let Some((tier, force)) = &c.held_back {
                     out.push(HeldBack {
                         path,

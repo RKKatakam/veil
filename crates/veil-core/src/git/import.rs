@@ -392,6 +392,9 @@ impl GitBridge {
         // … and the Git commit, through the policy gate.
         let hints = self.import_hints(&store, &base, &commit.tree)?;
         let fs = GitTreeFs::new(self.git.clone(), commit.tree, hints);
+        // A Git commit whose `.veilpolicy` is not a regular file is
+        // refused, and its branch named with the reason (BUG-058); other
+        // branches import as usual.
         let policy = Policy::load(&fs)?;
         let (theirs, build) = build_tree(
             &store,
@@ -504,6 +507,7 @@ impl GitBridge {
         }
         let read = |e: Option<&crate::object::TreeEntry>| -> Result<Policy> {
             Ok(match e {
+                Some(e) if e.kind != crate::object::EntryKind::File => Policy::builtin(),
                 Some(e) => match store.read_entry(e) {
                     Ok(b) => Policy::parse(&String::from_utf8_lossy(&b)),
                     Err(err) if err.is_unreadable() => Policy::builtin(),
@@ -572,6 +576,9 @@ impl GitBridge {
 struct GitDir {
     entries: BTreeMap<String, (gix::objs::tree::EntryKind, GitOid)>,
     bad: Vec<String>,
+    /// The directory holds a `.veil` directory: a Veil repository of its
+    /// own, which the builder leaves out as a whole (BUG-200).
+    nested: bool,
 }
 
 /// Read-only view of a Git tree, so that the builder (the policy gate)
@@ -633,8 +640,14 @@ impl GitTreeFs {
         let mut d = GitDir {
             entries: BTreeMap::new(),
             bad: Vec::new(),
+            nested: false,
         };
         for e in tree.entries {
+            // Still listed as not representable (below): at the root that
+            // is all it is; anywhere else the directory is left out whole.
+            if e.mode.is_tree() && crate::object::is_reserved_name(&String::from_utf8_lossy(&e.filename)) {
+                d.nested = true;
+            }
             match String::from_utf8(e.filename.to_vec()) {
                 Ok(name) if validate_entry_name(&name).is_ok() && !is_git_dir_name(&name) => {
                     d.entries.insert(name, (e.mode.kind(), e.oid));
@@ -728,6 +741,10 @@ impl StorageBackend for GitTreeFs {
                     out.special.push(name.clone());
                 }
             }
+        }
+        if d.nested {
+            // Never listed as a directory: nothing may be read below it.
+            out.special.push(crate::repo::VEIL_DIR.to_string());
         }
         for b in &d.bad {
             out.unrepresentable.push(if path.is_root() { b.clone() } else { format!("{path}/{b}") });

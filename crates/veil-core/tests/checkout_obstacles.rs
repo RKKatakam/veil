@@ -152,3 +152,55 @@ fn undo_refuses_a_command_whose_effect_is_outside_the_view() {
     repo.snapshot_workspace("default", &*fs).unwrap();
     assert!(repo.undo_keeping_edits("default").is_err());
 }
+
+/// BUG-202: no file name can wedge a working copy. A tree from a remote
+/// may hold a name this filesystem cannot (here 300 bytes, beyond every
+/// common filesystem's 255-byte limit). Checkout writes everything else,
+/// reports that one path, records it as left out, and the next snapshot
+/// keeps it in history instead of recording it deleted.
+#[test]
+fn a_name_the_filesystem_refuses_is_reported_and_the_checkout_goes_on() {
+    let repo = mem_repo();
+    let long = "n".repeat(300);
+    let store = repo.store();
+    let blob = |d: &[u8]| store.put(&veil_core::object::Object::Blob(d.to_vec())).unwrap();
+    let entry = |name: &str, id| veil_core::TreeEntry {
+        name: name.to_string(),
+        kind: veil_core::object::EntryKind::File,
+        id,
+        size: 1,
+        executable: false,
+        visibility: veil_core::object::Visibility::Public,
+        fallback: None,
+    };
+    let mut t = veil_core::object::Tree::default();
+    t.insert(entry(&long, blob(b"long\n")));
+    t.insert(entry("ok.txt", blob(b"ok\n")));
+    let to = store.put_tree(&t).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let fs = DiskBackend::new(dir.path());
+    let mut record = veil_core::checkout::Materialised::default();
+    let report = veil_core::checkout::checkout_recorded(store, &fs, None, &to, &mut record, None).expect("checkout stopped");
+    assert_eq!(fs.read(&p("ok.txt")).unwrap(), b"ok\n");
+    assert_eq!(report.failed.len(), 1, "{report:?}");
+    assert_eq!(report.failed[0].0.as_str(), long);
+    assert!(record.hidden(&p(&long)));
+    // No temp file is left behind either.
+    let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(left, vec![std::ffi::OsString::from("ok.txt")]);
+    // The next snapshot keeps the entry it could not write.
+    let (built, _) = repo.build_from_recorded(&fs, Some(to), None, None, Some(&record)).unwrap();
+    assert_eq!(built, to, "the unwritable file was recorded as deleted");
+}
+
+/// BUG-202: a name of 250 bytes (legal on ext4, APFS, btrfs, XFS) is
+/// written: the temp file it goes through has a short name.
+#[test]
+fn a_name_near_the_filesystem_limit_is_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = DiskBackend::new(dir.path());
+    let name = "é".repeat(125); // 250 bytes, cut on a character boundary
+    fs.write(&p(&name), b"x\n").unwrap();
+    assert_eq!(fs.read(&p(&name)).unwrap(), b"x\n");
+}

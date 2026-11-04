@@ -156,7 +156,6 @@ fn funny_names_round_trip_through_a_checkout() {
 // character in a file name on Linux and macOS; commands that take a path
 // must address that file, not `back/slash`.
 #[test]
-#[ignore = "BUG-204: path arguments have `\\` rewritten to `/`, so `vl cat`/`vl restore` address a different file"]
 fn a_backslash_in_a_path_argument_names_that_file() {
     let env = Env::new();
     let r = env.repo("p");
@@ -247,7 +246,6 @@ fn a_name_of_240_bytes_round_trips() {
 // which exceeds the limit: every later command fails on the stale working
 // copy.
 #[test]
-#[ignore = "BUG-202: a file name of 241–255 bytes is recorded but can never be checked out; the working copy is then stuck"]
 fn a_name_of_250_bytes_round_trips() {
     let env = Env::new();
     let r = env.repo("p");
@@ -264,7 +262,6 @@ fn a_name_of_250_bytes_round_trips() {
 
 // Scenario from git t3300-funny-names.sh: restore writes long names too.
 #[test]
-#[ignore = "BUG-202: `vl restore` of a file with a 250-byte name fails with ENAMETOOLONG"]
 fn restore_of_a_250_byte_name() {
     let env = Env::new();
     let r = env.repo("p");

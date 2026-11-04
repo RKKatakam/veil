@@ -207,9 +207,10 @@ pub enum Cmd {
     Restore {
         /// Paths to restore (default: every path).
         paths: Vec<String>,
-        /// Source snapshot (default: @-).
-        #[arg(long, default_value = "@-")]
-        from: String,
+        /// Source snapshot (default: the parent of @; for a merge, its
+        /// merged parents, which is what `vl status` compares with).
+        #[arg(long)]
+        from: Option<String>,
     },
     /// Merge REVS into the current line of work.
     Merge {

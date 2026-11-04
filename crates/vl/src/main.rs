@@ -167,8 +167,17 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Cat { path, rev } => {
             let id = ctx.rev(rev)?;
             let p = ctx.repo_path(path)?;
-            let e = lookup(ctx.repo.store(), &ctx.repo.snapshot(&id)?.tree, &p)?
-                .ok_or_else(|| anyhow!("{p} does not exist in {}", id.short()))?;
+            let e = match p.is_root() {
+                true => None,
+                false => lookup(ctx.repo.store(), &ctx.repo.snapshot(&id)?.tree, &p)?,
+            };
+            match &e {
+                Some(e) if e.kind == veil_core::EntryKind::File => {}
+                Some(_) => bail!("{} is a directory in {}, not a file (`vl files -r {}` lists its files)", safe(p.as_str()), id.short(), id.short()),
+                None if p.is_root() => bail!("'{}' is the repository's root directory, not a file", safe(path)),
+                None => bail!("{} does not exist in {}", safe(p.as_str()), id.short()),
+            }
+            let e = e.expect("a file");
             let data = read_file(&ctx.repo, &p, &e)?;
             render::Out.write_all(&data)?;
         }
@@ -232,7 +241,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             let p = ctx.repo.squash(id)?;
             println!("Squashed into {}", one_line(&ctx.repo, &p));
         }
-        Cmd::Restore { paths, from } => cmd_restore(ctx, paths, from)?,
+        Cmd::Restore { paths, from } => cmd_restore(ctx, paths, from.as_deref())?,
         Cmd::Merge {
             revs,
             into,
@@ -824,11 +833,23 @@ fn cmd_status(ctx: &mut Ctx) -> Result<()> {
             println!("  {} {}  ({}; .veilpolicy says {})", yellow("P"), safe(&h.shown_path()), h.accepted, h.wanted);
         }
     }
+    if !ctx.report.nested.is_empty() {
+        println!("{}", dim("Nested repositories (repositories of their own; nothing in them is recorded here):"));
+        for p in &ctx.report.nested {
+            println!("  {} {}/", dim("N"), safe(p.as_str()));
+        }
+    }
     if !ctx.report.carried.is_empty() {
         println!("{}", dim("Redacted (unreadable here; kept in history, absent on disk):"));
         for p in &ctx.report.carried {
-            let why = veil_core::tree::lookup(ctx.repo.store(), &s.tree, p)?.and_then(|e| render::hidden_reason(&ctx.repo, &e));
-            println!("  {} {}  ({})", dim("R"), safe(p.as_str()), why.unwrap_or_else(|| "no key".into()));
+            let entry = veil_core::tree::lookup(ctx.repo.store(), &s.tree, p)?;
+            let why = entry.as_ref().and_then(|e| render::hidden_reason(&ctx.repo, e));
+            // Readable, yet never materialised: the filesystem refused it.
+            let fallback = match entry {
+                Some(e) if ctx.repo.store().entry_readable(&e) => "this filesystem could not hold it",
+                _ => "no key",
+            };
+            println!("  {} {}  ({})", dim("R"), safe(p.as_str()), why.unwrap_or_else(|| fallback.into()));
         }
     }
     // Conflicts recorded on `@`, and those of its parents (a merge records
@@ -908,35 +929,34 @@ fn cmd_show(ctx: &mut Ctx, rev: &str, stat: bool) -> Result<()> {
     print_diff(&ctx.repo, &base, &s.tree, stat)
 }
 
-fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: &str) -> Result<()> {
-    let src = ctx.rev(from)?;
-    let src_tree = ctx.repo.snapshot(&src)?.tree;
-    let wc_tree = ctx.repo.snapshot(&ctx.wc()?)?.tree;
+fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()> {
+    let wc = ctx.repo.snapshot(&ctx.wc()?)?;
+    let wc_tree = wc.tree;
+    // By default, what `vl status` compares with: the parents of `@`,
+    // merged for a merge (BUG-208).
+    let (src_tree, shown, label) = match from {
+        Some(rev) => {
+            let src = ctx.rev(rev)?;
+            (ctx.repo.snapshot(&src)?.tree, one_line(&ctx.repo, &src), rev.to_string())
+        }
+        None => {
+            let shown = match wc.parents.as_slice() {
+                [p] => one_line(&ctx.repo, p),
+                ps => format!("the {} merged parents of @", ps.len()),
+            };
+            (ctx.repo.parents_tree(&wc.parents)?.tree, shown, "@-".to_string())
+        }
+    };
     let filters: Vec<VPath> = paths.iter().map(|p| ctx.repo_path(p)).collect::<Result<_>>()?;
-    let changes = veil_core::tree::diff_trees(ctx.repo.store(), Some(&wc_tree), Some(&src_tree))?;
     let wanted = |p: &VPath| filters.is_empty() || filters.iter().any(|f| p.starts_with(f));
-    let mut n = 0;
-    let mut done = std::collections::HashSet::new();
     let policy_path = VPath::new(POLICY_FILE)?;
-    for c in changes {
-        if !wanted(&c.path) {
-            continue;
-        }
-        done.insert(c.path.clone());
-        if behind_special(&*ctx.fs, &c.path)? {
-            skipped_special(&c.path);
-            continue;
-        }
-        match &c.new {
-            Some(e) => {
-                let data = read_file(&ctx.repo, &c.path, e)?;
-                ctx.fs.write(&c.path, &data)?;
-                ctx.fs.set_executable(&c.path, e.executable)?;
-            }
-            None => ctx.fs.remove_file(&c.path)?,
-        }
-        n += 1;
-    }
+    let changes = veil_core::tree::diff_trees(ctx.repo.store(), Some(&wc_tree), Some(&src_tree))?;
+    let mut done: std::collections::HashSet<VPath> = changes.iter().filter(|c| wanted(&c.path)).map(|c| c.path.clone()).collect();
+    // Removals before writes, nothing in the way deleted, emptied
+    // directories removed: checkout's rules (BUG-201, BUG-209).
+    let r = ctx.restore(&wc_tree, &src_tree, &wanted)?;
+    let skipped: usize = r.kept_local.len() + r.blocked.len() + r.obstructed.len() + r.nested.len() + r.failed.len() + r.redacted.len();
+    let mut n = done.len().saturating_sub(skipped);
     // A quarantined edit is not in the working-copy tree (it keeps the
     // previous version), so the diff above cannot see it: restore it too.
     for p in ctx.report.quarantine_kept.clone() {
@@ -948,19 +968,23 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: &str) -> Result<()> {
             skipped_special(&p);
             continue;
         }
-        match veil_core::tree::lookup(ctx.repo.store(), &src_tree, &p)? {
+        let res = match veil_core::tree::lookup(ctx.repo.store(), &src_tree, &p)? {
             Some(e) if e.kind == veil_core::EntryKind::File => {
-                ctx.fs.write(&p, &read_file(&ctx.repo, &p, &e)?)?;
-                ctx.fs.set_executable(&p, e.executable)?;
+                let data = read_file(&ctx.repo, &p, &e)?;
+                ctx.fs.write(&p, &data).and_then(|_| ctx.fs.set_executable(&p, e.executable))
             }
-            _ => ctx.fs.remove_file(&p)?,
+            _ => ctx.fs.remove_file(&p),
+        };
+        match res {
+            Ok(()) => n += 1,
+            Err(veil_core::VeilError::Io { source, .. }) => ctx::print_failed(&[(p.clone(), source.to_string())]),
+            Err(e) => return Err(e.into()),
         }
-        n += 1;
     }
     // A command of its own (not an automatic snapshot), so `vl undo` brings
     // the discarded edits back.
     let what = if paths.is_empty() { "everything".to_string() } else { paths.join(" ") };
-    let description = format!("restore {what} from {from}");
+    let description = format!("restore {what} from {label}");
     // A `.veilpolicy` put back from REV arrived from REV, not from the
     // member's hand: it goes through the accepted policy like a pulled one.
     // (`done` holds every path restore wrote or removed, or skipped.)
@@ -969,7 +993,7 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: &str) -> Result<()> {
     } else {
         ctx.snapshot_as(description)?;
     }
-    println!("Restored {n} path(s) from {}", one_line(&ctx.repo, &src));
+    println!("Restored {n} path(s) from {shown}");
     Ok(())
 }
 
@@ -1485,6 +1509,35 @@ fn cmd_policy(ctx: &mut Ctx, c: &PolicyCmd) -> Result<()> {
         PolicyCmd::Check { paths } => {
             for p in paths {
                 let vp = ctx.repo_path(p)?;
+                // As a snapshot walks: it never looks inside an ignored
+                // directory (Git's rule), so no later rule re-includes a
+                // file below one, nor inside a nested repository (BUG-203).
+                let mut skipped = None;
+                for a in vp.ancestors() {
+                    let c = policy.classify(&a, true);
+                    if c.tier == Tier::Ignored {
+                        let via = c.rule.map(|r| format!("rule '{r}'")).unwrap_or_else(|| "default".into());
+                        skipped = Some(format!(
+                            "{} via {via} (on its directory {}/: a snapshot never looks inside it, so no later rule can \
+                             re-include a file below it)",
+                            bold(&c.tier.label()),
+                            safe(a.as_str())
+                        ));
+                        break;
+                    }
+                    if veil_core::vfs::is_nested_repository(&*ctx.fs, &a)? {
+                        skipped = Some(format!(
+                            "{}: {}/ is a Veil repository of its own, which this one never records",
+                            bold("not recorded"),
+                            safe(a.as_str())
+                        ));
+                        break;
+                    }
+                }
+                if let Some(why) = skipped {
+                    println!("{}: {why}", safe(vp.as_str()));
+                    continue;
+                }
                 let is_dir = ctx.fs.metadata(&vp)?.is_some_and(|m| m.kind == NodeKind::Dir);
                 let c = policy.classify(&vp, is_dir);
                 let why = match (&c.rule, c.builtin_secret) {
@@ -1521,12 +1574,26 @@ fn cmd_policy(ctx: &mut Ctx, c: &PolicyCmd) -> Result<()> {
 
 fn cmd_scan(ctx: &mut Ctx) -> Result<ExitCode> {
     let policy = ctx.repo.effective_policy(&*ctx.fs)?;
+    // A nested repository is never recorded here (BUG-200): its files are
+    // that repository's to scan.
+    let nested = std::cell::RefCell::new(Vec::new());
     let skip = |p: &VPath| {
-        p.as_str() == ".veil" || policy.classify(p, true).tier == Tier::Ignored
+        if p.as_str() == ".veil" || policy.classify(p, true).tier == Tier::Ignored {
+            return true;
+        }
+        let n = veil_core::vfs::is_nested_repository(&*ctx.fs, p).unwrap_or(false);
+        if n {
+            nested.borrow_mut().push(p.clone());
+        }
+        n
     };
+    let files = walk_files(&*ctx.fs, &VPath::root(), &skip)?;
+    for p in nested.into_inner() {
+        println!("{} {}/  (a repository of its own, never recorded here; run `vl scan` in it)", dim("nested   "), safe(p.as_str()));
+    }
     let mut exposed = 0;
     let mut contained = 0;
-    for path in walk_files(&*ctx.fs, &VPath::root(), &skip)? {
+    for path in files {
         let class = policy.classify(&path, false);
         if class.tier == Tier::Ignored || class.allow_secrets {
             continue;
@@ -1953,6 +2020,9 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
             let wc = ctx.repo.workspace_wc(name)?;
             let view = ctx.repo.tree_view(&wc)?;
             let p = VPath::new(path)?;
+            if p.is_root() || view.metadata(&p).ok().flatten().is_some_and(|m| m.kind == veil_core::vfs::NodeKind::Dir) {
+                bail!("'{}' is a directory in workspace {}, not a file", safe(path), safe(name));
+            }
             let data = match view.read(&p) {
                 Err(err) if err.is_unreadable() => {
                     let tree = ctx.repo.snapshot(&wc)?.tree;

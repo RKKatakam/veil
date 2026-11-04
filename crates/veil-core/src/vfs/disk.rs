@@ -66,11 +66,17 @@ fn io_err(path: &Path, e: io::Error) -> VeilError {
     }
 }
 
-/// "Nothing there": the path is missing, or an ancestor is a file (ENOTDIR).
+/// "Nothing there": the path is missing, an ancestor is a file (ENOTDIR), or
+/// the name is too long to exist.
 /// Read, metadata and removal paths treat both alike, as every other
 /// backend does.
 fn is_missing(e: &io::Error) -> bool {
-    matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
+    // A name too long for the filesystem (ENAMETOOLONG) cannot exist there
+    // either; only writing it is an error (BUG-202).
+    matches!(
+        e.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory | io::ErrorKind::InvalidFilename
+    )
 }
 
 /// [`io_err`] for read paths: ENOTDIR is "not found" too.
@@ -174,10 +180,22 @@ fn is_exec(_m: &fs::Metadata) -> bool {
     false
 }
 
+/// Longest prefix of a file's name kept in its temp file's name.
+const TEMP_NAME_PREFIX: usize = 32;
+
+/// The temp file a write of `path` goes through before the atomic rename,
+/// in the same directory: `.<name>.vltmp<8 hex digits>`, with `<name>` cut
+/// to [`TEMP_NAME_PREFIX`] bytes so that a name near the filesystem's
+/// 255-byte limit still has a temp name that fits (BUG-202).
 fn temp_path(parent: &Path, path: &VPath) -> PathBuf {
+    let name = path.file_name();
+    let mut cut = name.len().min(TEMP_NAME_PREFIX);
+    while !name.is_char_boundary(cut) {
+        cut -= 1;
+    }
     parent.join(format!(
         ".{}.vltmp{}",
-        path.file_name(),
+        &name[..cut],
         hex::encode(crate::crypto::random_bytes::<4>())
     ))
 }

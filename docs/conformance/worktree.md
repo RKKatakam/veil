@@ -25,16 +25,16 @@ cargo test -p vl --test conformance_worktree -- --ignored    # the 15 bug reprod
 
 | ID | Sev. | One line |
 |---|---|---|
-| BUG-200 | high | A nested Veil repository's cloaked (and isolated/ignored-by-rule) files are recorded as public plaintext by the enclosing repository |
-| BUG-201 | medium | `vl restore` fails half way across a file ↔ directory swap (and deletes the directory's files in one direction) |
-| BUG-202 | medium | File names of 241–255 bytes are recorded but cannot be checked out or restored; the working copy is then stuck |
+| BUG-200 | high (fixed, working-copy wave 2) | A nested Veil repository's cloaked (and isolated/ignored-by-rule) files are recorded as public plaintext by the enclosing repository |
+| BUG-201 | medium (fixed, working-copy wave 2) | `vl restore` fails half way across a file ↔ directory swap (and deletes the directory's files in one direction) |
+| BUG-202 | medium (fixed, working-copy wave 2) | File names of 241–255 bytes are recorded but cannot be checked out or restored; the working copy is then stuck |
 | BUG-206 | medium | A second `vl undo` redoes the first instead of going further back, as the guide says |
 | BUG-207 | medium | Snapshot ids printed by `vl evolog` for earlier versions do not resolve as revisions |
-| BUG-208 | medium | `vl restore` in a merge working copy restores from the first parent only, deleting the other parent's files |
-| BUG-203 | low | A file re-included below an ignored directory: `vl policy check` says public, the snapshot never records it |
-| BUG-204 | low | Path arguments: `\` is rewritten to `/`; an absolute path outside the repository is taken relative to its root |
-| BUG-205 | low | `vl cat <directory>` reports a corrupt object |
-| BUG-209 | low | `vl restore` leaves the directories it empties behind |
+| BUG-208 | medium (fixed, working-copy wave 2) | `vl restore` in a merge working copy restores from the first parent only, deleting the other parent's files |
+| BUG-203 | low (fixed, working-copy wave 2) | A file re-included below an ignored directory: `vl policy check` says public, the snapshot never records it |
+| BUG-204 | low (fixed, working-copy wave 2) | Path arguments: `\` is rewritten to `/`; an absolute path outside the repository is taken relative to its root |
+| BUG-205 | low (fixed, working-copy wave 2) | `vl cat <directory>` reports a corrupt object |
+| BUG-209 | low (fixed, working-copy wave 2) | `vl restore` leaves the directories it empties behind |
 | BUG-210 | low | `vl tag set --cloak SCOPE` accepts unknown, non-member, reserved and malformed scopes |
 
 ### Deliberate differences from Git (documented Veil behaviour, tested as such)

@@ -324,6 +324,9 @@ impl Ctx {
             print_kept_local(&co.kept_local);
             print_blocked(&co.blocked);
             print_obstructed(&co.obstructed);
+            print_nested(&co.nested);
+            print_failed(&co.failed);
+            print_checkout_warnings(&co.warnings);
             self.save_cache();
             return Ok(true);
         }
@@ -376,6 +379,9 @@ impl Ctx {
             print_kept_local(&r.kept_local);
             print_blocked(&r.blocked);
             print_obstructed(&r.obstructed);
+            print_nested(&r.nested);
+            print_failed(&r.failed);
+            print_checkout_warnings(&r.warnings);
         }
         self.save_cache();
         Ok(())
@@ -476,6 +482,9 @@ impl Ctx {
             print_kept_local(&r.kept_local);
             print_blocked(&r.blocked);
             print_obstructed(&r.obstructed);
+            print_nested(&r.nested);
+            print_failed(&r.failed);
+            print_checkout_warnings(&r.warnings);
         }
         // A `.veilpolicy` that arrived with this checkout: say now (not at
         // the next snapshot) which local files keep their protection.
@@ -487,6 +496,31 @@ impl Ctx {
             eprintln!("Working copy now at: {}", render::one_line(&self.repo, &target));
         }
         Ok(())
+    }
+
+    /// `vl restore`: bring the paths `wanted` selects from `from` (the tree
+    /// the working copy was just snapshotted as) to `to`, through
+    /// checkout's rules ([`veil_core::checkout::restore_paths`]), keeping
+    /// the record of what was materialised and the stat cache in step. The
+    /// caller records the result with a snapshot.
+    pub fn restore(&mut self, from: &ObjectId, to: &ObjectId, wanted: &dyn Fn(&VPath) -> bool) -> Result<CheckoutReport> {
+        let mut record = self.checkout.materialised.clone();
+        let r = veil_core::checkout::restore_paths(self.repo.store(), &*self.fs, from, to, wanted, &mut record, Some(&mut self.cache))?;
+        if record != self.checkout.materialised {
+            self.checkout.materialised = record;
+            save_checkout(&self.fs, &self.checkout)?;
+        }
+        self.save_cache();
+        for p in &r.redacted {
+            eprintln!("  {} {} (unreadable here; not restored)", render::yellow("redacted"), safe(p.as_str()));
+        }
+        print_kept_local(&r.kept_local);
+        print_blocked(&r.blocked);
+        print_obstructed(&r.obstructed);
+        print_nested(&r.nested);
+        print_failed(&r.failed);
+        print_checkout_warnings(&r.warnings);
+        Ok(r)
     }
 
     /// Persist the stat cache if it changed. It is only an accelerator, so
@@ -505,19 +539,49 @@ impl Ctx {
         Ok(())
     }
 
-    /// Convert a user path (relative to cwd) to a repository path.
+    /// Convert a user path to a repository path: relative to the current
+    /// directory when that is inside the repository, otherwise (`-R` from
+    /// elsewhere) relative to the repository's root. An absolute path, or a
+    /// relative one that climbs out with `..`, must lie inside the
+    /// repository: anything else is refused, never taken as a path of the
+    /// repository's own (BUG-204). `\` is an ordinary character in a name
+    /// on Linux and macOS.
     pub fn repo_path(&self, user: &str) -> Result<VPath> {
         let cwd = std::env::current_dir()?;
-        let abs = if Path::new(user).is_absolute() {
-            PathBuf::from(user)
-        } else {
-            cwd.join(user)
+        let mut roots = vec![normalize(&self.root)];
+        if let Ok(c) = std::fs::canonicalize(&self.root) {
+            if c != roots[0] {
+                roots.push(c);
+            }
+        }
+        let inside = |p: &Path| roots.iter().find_map(|r| p.strip_prefix(r).ok().map(Path::to_path_buf));
+        // The same path with symlinks resolved, as far as it exists.
+        let resolved = |p: &Path| -> Option<PathBuf> {
+            let mut tail = Vec::new();
+            let mut cur = p.to_path_buf();
+            loop {
+                if let Ok(c) = std::fs::canonicalize(&cur) {
+                    return Some(tail.iter().rev().fold(c, |acc: PathBuf, n: &std::ffi::OsString| acc.join(n)));
+                }
+                tail.push(cur.file_name()?.to_os_string());
+                cur = cur.parent()?.to_path_buf();
+            }
         };
-        let rel = normalize(&abs)
-            .strip_prefix(normalize(&self.root))
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|_| PathBuf::from(user));
-        Ok(VPath::new(&rel.to_string_lossy().replace('\\', "/"))?)
+        let given = Path::new(user);
+        let abs = if given.is_absolute() {
+            normalize(given)
+        } else if inside(&normalize(&cwd)).is_some() {
+            normalize(&cwd.join(given))
+        } else {
+            normalize(&roots[0].join(given))
+        };
+        let outside = || anyhow!("'{user}' escapes the repository: it is outside {}", self.root.display());
+        let rel = match inside(&abs) {
+            Some(rel) => rel,
+            None => resolved(&abs).and_then(|r| inside(&r)).ok_or_else(outside)?,
+        };
+        let rel = rel.to_str().ok_or_else(outside)?;
+        Ok(VPath::new(rel)?)
     }
 }
 
@@ -562,6 +626,48 @@ fn print_filled_in(r: &CheckoutReport) {
     print_kept_local(&r.kept_local);
     print_blocked(&r.blocked);
     print_obstructed(&r.obstructed);
+    print_nested(&r.nested);
+    print_failed(&r.failed);
+    print_checkout_warnings(&r.warnings);
+}
+
+/// Paths checkout left alone because they lie in a nested repository
+/// (grouped by repository).
+fn print_nested(paths: &[(VPath, VPath)]) {
+    let mut by_repo: std::collections::BTreeMap<&VPath, usize> = Default::default();
+    for (_, repo) in paths {
+        *by_repo.entry(repo).or_default() += 1;
+    }
+    for (repo, n) in by_repo {
+        eprintln!(
+            "  {} {}/ (a Veil repository of its own, which this one never records; {n} path(s) of the snapshot below it were \
+             neither written nor removed)",
+            render::yellow("kept"),
+            safe(repo.as_str())
+        );
+    }
+}
+
+/// Paths the filesystem refused to write or remove (one bad name never
+/// stops a checkout).
+pub fn print_failed(paths: &[(VPath, String)]) {
+    for (p, why) in paths {
+        eprintln!(
+            "  {} {} ({}; left out of the working copy and kept in history as it is; every command tries again. \
+             Rename it where it can be checked out)",
+            render::red("failed"),
+            safe(p.as_str()),
+            safe(why)
+        );
+    }
+}
+
+/// Problems that did not stop a checkout (an unreadable `.veilpolicy` in the
+/// target, BUG-121). They come from history someone else wrote.
+fn print_checkout_warnings(warnings: &[String]) {
+    for w in warnings {
+        warn_untrusted(w);
+    }
 }
 
 /// Paths checkout did not write because something it did not write is in

@@ -25,7 +25,11 @@ when it records a snapshot, so no command, merge or push can get around it.
 | `ignore` | never, not even locally | nothing | nothing |
 
 `.veilpolicy` is a tracked file at the root of the repository. One rule per
-line, **the last matching rule wins**:
+line, **the last matching rule wins**, with one exception, as in Git: a
+snapshot never looks inside an ignored directory, so `build/ ignore`
+followed by `build/keep.txt public` records nothing below `build/`
+(`vl policy check build/keep.txt` says so). Ignore the files instead
+(`build/** ignore`) to re-include one of them:
 
 ```text
 # <pattern>        <tier> [scope]

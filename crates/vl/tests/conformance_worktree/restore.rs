@@ -47,7 +47,6 @@ fn restore_without_paths_resets_everything() {
 // Scenario from git t7101-reset-empty-subdirs.sh: directories that a
 // restore leaves empty are removed (as a checkout removes them).
 #[test]
-#[ignore = "BUG-209: `vl restore` leaves the directories it empties behind"]
 fn restore_removes_directories_it_empties() {
     let env = Env::new();
     let (r, _) = base(&env);
@@ -146,7 +145,6 @@ fn restore_of_a_path_outside_the_repository_is_refused() {
 // work tree is an error in Git). Veil takes `/etc/passwd` as the
 // repository's own `etc/passwd`.
 #[test]
-#[ignore = "BUG-204: an absolute path outside the repository is taken relative to the repository root"]
 fn restore_of_an_absolute_path_outside_the_repository_is_refused() {
     let env = Env::new();
     let r = env.repo("p");
@@ -253,7 +251,6 @@ fn restore_from_two_back_applies_the_whole_difference() {
 // Scenario from git t2022-checkout-paths.sh / t2000: restoring a path
 // that is a file in the working copy and a directory in the source.
 #[test]
-#[ignore = "BUG-201: `vl restore` fails half way when a path is a file on one side and a directory on the other"]
 fn restore_a_directory_over_a_file() {
     let env = Env::new();
     let r = env.repo("p");
@@ -270,7 +267,6 @@ fn restore_a_directory_over_a_file() {
 // working copy, a file in the source. Today the restore removes the
 // directory's files, then fails to write the file, and every retry fails.
 #[test]
-#[ignore = "BUG-201: `vl restore` fails half way when a path is a file on one side and a directory on the other"]
 fn restore_a_file_over_a_directory() {
     let env = Env::new();
     let r = env.repo("p");
@@ -290,7 +286,6 @@ fn restore_a_file_over_a_directory() {
 // `vl status` compares against. Today it restores from the first parent
 // only and deletes the other parent's files.
 #[test]
-#[ignore = "BUG-208: `vl restore` in a merge working copy restores from the first parent only, deleting the other parent's files"]
 fn restore_in_a_merge_goes_back_to_the_merged_parents() {
     let env = Env::new();
     let r = env.repo("p");

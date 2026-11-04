@@ -24,6 +24,12 @@
 //! records the working copy as it is, so the user's layout wins, as with
 //! [`CheckoutReport::kept_local`].
 //!
+//! Checkout never writes or removes anything inside a nested Veil
+//! repository (a directory holding a `.veil` of its own): the enclosing
+//! repository does not record it either (see
+//! [`crate::vfs::holds_repository`]); such paths are reported in
+//! [`CheckoutReport::nested`].
+//!
 //! On a backend that folds names (a macOS volume: `README` and `readme`, or
 //! NFC and NFD spellings, are one entry) checkout refuses a tree with two
 //! such names in one directory, before writing anything: materialising both
@@ -70,6 +76,21 @@ pub struct CheckoutReport {
     /// directory (a quarantined or untracked `cfg` where the tree has
     /// `cfg/settings.json`). The obstacle is left exactly as it is.
     pub obstructed: Vec<(VPath, VPath)>,
+    /// Paths of the diff inside a nested Veil repository (a directory that
+    /// holds a `.veil` of its own, see [`crate::vfs::holds_repository`]),
+    /// with that repository's directory: never written or removed, as the
+    /// enclosing repository never records them either.
+    pub nested: Vec<(VPath, VPath)>,
+    /// Paths the working copy's filesystem refused (a name it cannot hold,
+    /// permission denied on a directory, …), with the error. The rest of
+    /// the checkout went ahead; a file that could not be written is left
+    /// out of the working copy and recorded as such ([`Materialised`]), so
+    /// the next snapshot keeps it in history instead of recording it
+    /// deleted, and the next command tries again.
+    pub failed: Vec<(VPath, String)>,
+    /// Problems that did not stop the checkout (the target tree's
+    /// `.veilpolicy` could not be read, so the accepted policy applied).
+    pub warnings: Vec<String>,
 }
 
 /// What a working copy holds where it differs from its tree as this reader
@@ -205,7 +226,7 @@ impl Materialised {
             self.hidden.remove(&c.path);
             self.fallback.remove(&c.path);
         }
-        for p in &report.redacted {
+        for p in report.redacted.iter().chain(report.failed.iter().map(|(p, _)| p)) {
             // Left absent (a kept local edit is the user's file, not ours).
             if fs.metadata(p)?.is_none_or(|m| m.kind != NodeKind::File) {
                 self.hidden.insert(p.clone());
@@ -359,6 +380,39 @@ pub fn checkout_recorded(
     Ok(report)
 }
 
+/// `vl restore`: bring the paths of `fs` that `wanted` selects from tree
+/// `from` to tree `to`, with every rule of a checkout: removals before
+/// writes, so a file and a directory can trade places in either direction;
+/// nothing in the way that checkout did not write is deleted (it is
+/// reported in [`CheckoutReport::obstructed`]); directories the restore
+/// empties are removed; local-only, special and nested-repository paths
+/// are left alone; a path the filesystem refuses is reported and the rest
+/// goes ahead (BUG-201, BUG-209).
+///
+/// `from` must be what `fs` holds: the caller snapshots the working copy
+/// first, so every edit it can record is in `from`, and is what the restore
+/// discards (a file that holds anything else is kept and reported in
+/// [`CheckoutReport::kept_local`]). `record` describes `fs` relative to
+/// `from` on entry, and on return relative to the tree the restore leaves
+/// (the caller's next snapshot).
+pub fn restore_paths(
+    store: &std::sync::Arc<ObjectStore>,
+    fs: &dyn StorageBackend,
+    from: &ObjectId,
+    to: &ObjectId,
+    wanted: &dyn Fn(&VPath) -> bool,
+    record: &mut Materialised,
+    cache: Option<&mut StatCache>,
+) -> Result<CheckoutReport> {
+    let changes: Vec<TreeChange> = diff_trees(store, Some(from), Some(to))?
+        .into_iter()
+        .filter(|c| wanted(&c.path))
+        .collect();
+    let report = apply_changes(store, fs, to, &changes, cache)?;
+    record.absorb(fs, &changes, &report)?;
+    Ok(report)
+}
+
 impl CheckoutReport {
     fn merge(&mut self, o: CheckoutReport) {
         self.written += o.written;
@@ -369,6 +423,18 @@ impl CheckoutReport {
         self.blocked.extend(o.blocked);
         self.from_fallback.extend(o.from_fallback);
         self.obstructed.extend(o.obstructed);
+        self.nested.extend(o.nested);
+        // `fill_in` right after a checkout retries what it could not write.
+        for f in o.failed {
+            if !self.failed.iter().any(|(p, _)| *p == f.0) {
+                self.failed.push(f);
+            }
+        }
+        for w in o.warnings {
+            if !self.warnings.contains(&w) {
+                self.warnings.push(w);
+            }
+        }
     }
 }
 
@@ -381,6 +447,9 @@ struct SpecialGuard<'a> {
     /// Directories already seen to be real directories (checkout itself only
     /// ever creates real ones).
     real_dirs: HashSet<VPath>,
+    /// Directories already checked for a nested repository (checkout never
+    /// creates a `.veil`, so the answer holds for the whole run).
+    nested: HashMap<VPath, bool>,
 }
 
 /// Is `path`, or any directory above it, a symlink or other special entry
@@ -396,7 +465,27 @@ impl<'a> SpecialGuard<'a> {
             fs,
             special: HashMap::new(),
             real_dirs: HashSet::new(),
+            nested: HashMap::new(),
         }
+    }
+
+    /// The nested repository `path` lies in, if any: the outermost
+    /// directory above it that holds a `.veil` of its own.
+    fn nested_repository(&mut self, path: &VPath) -> Result<Option<VPath>> {
+        for p in path.ancestors() {
+            let n = match self.nested.get(&p) {
+                Some(n) => *n,
+                None => {
+                    let n = crate::vfs::is_nested_repository(self.fs, &p)?;
+                    self.nested.insert(p.clone(), n);
+                    n
+                }
+            };
+            if n {
+                return Ok(Some(p));
+            }
+        }
+        Ok(None)
     }
 
     fn is_special(&mut self, path: &VPath) -> Result<bool> {
@@ -516,7 +605,13 @@ fn apply_changes(
             return Err(collision_error(&found, folding));
         }
     }
-    let policy = Policy::load(&TreeView::new(store.clone(), *to))?;
+    // A hostile tree's unreadable `.veilpolicy` (BUG-121) never blocks a
+    // checkout: the policy accepted in this working copy (it holds the
+    // repository's `.veil/` when it is the member's own) decides what is
+    // local-only instead.
+    let accepted = crate::policy::load_accepted(fs).ok().flatten();
+    let (policy, warning) = Policy::load_or_accepted(&TreeView::new(store.clone(), *to), accepted.as_deref())?;
+    report.warnings.extend(warning);
     let mut guard = SpecialGuard::new(fs);
 
     // Removals first so file<->directory swaps work.
@@ -528,12 +623,19 @@ fn apply_changes(
             report.blocked.push(c.path.clone());
             continue;
         }
+        if let Some(repo) = guard.nested_repository(&c.path)? {
+            report.nested.push((c.path.clone(), repo));
+            continue;
+        }
         if fs.metadata(&c.path)?.is_some_and(|m| m.kind == NodeKind::File) {
             if !holds(store, fs, &c.path, c.old.as_ref(), cache.as_deref())? {
                 report.kept_local.push(c.path.clone());
                 continue;
             }
-            fs.remove_file(&c.path)?;
+            if let Err(e) = fs.remove_file(&c.path) {
+                per_file(&mut report, &c.path, e)?;
+                continue;
+            }
             forget(&mut cache, &c.path);
             report.removed += 1;
         }
@@ -552,6 +654,10 @@ fn apply_changes(
         }
         if guard.blocks(&c.path)? {
             report.blocked.push(c.path.clone());
+            continue;
+        }
+        if let Some(repo) = guard.nested_repository(&c.path)? {
+            report.nested.push((c.path.clone(), repo));
             continue;
         }
         // A file where the tree has a directory (a quarantined or untracked
@@ -585,8 +691,16 @@ fn apply_changes(
                         continue;
                     }
                 }
-                fs.write(&c.path, &data)?;
-                fs.set_executable(&c.path, new.executable)?;
+                if let Err(e) = fs.write(&c.path, &data).and_then(|_| fs.set_executable(&c.path, new.executable)) {
+                    forget(&mut cache, &c.path);
+                    // Never leave the previous version where the new one
+                    // belongs, or the next snapshot would revert it.
+                    if c.old.is_some() && !local_edit && fs.metadata(&c.path)?.is_some_and(|m| m.kind == NodeKind::File) {
+                        let _ = fs.remove_file(&c.path);
+                    }
+                    per_file(&mut report, &c.path, e)?;
+                    continue;
+                }
                 forget(&mut cache, &c.path);
                 report.written += 1;
                 if let Some(fb) = via_fallback {
@@ -613,6 +727,27 @@ fn apply_changes(
         }
     }
     Ok(report)
+}
+
+/// A write or removal of `path` failed. A filesystem that refuses this one
+/// path (a name too long for it, a character it cannot hold, permission
+/// denied on one directory) must not stop the checkout, or wedge every
+/// later command retrying it (BUG-202): the path is reported in
+/// [`CheckoutReport::failed`] and the checkout goes on. A full or
+/// read-only filesystem fails every path alike: that stops it.
+fn per_file(report: &mut CheckoutReport, path: &VPath, e: VeilError) -> Result<()> {
+    match e {
+        VeilError::Io { source, .. } if !whole_filesystem(&source) => {
+            report.failed.push((path.clone(), source.to_string()));
+            Ok(())
+        }
+        e => Err(e),
+    }
+}
+
+fn whole_filesystem(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind as K;
+    matches!(e.kind(), K::StorageFull | K::ReadOnlyFilesystem | K::QuotaExceeded)
 }
 
 /// The bytes checkout writes for file entry `e`, and the embargo fallback

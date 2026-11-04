@@ -298,6 +298,28 @@ snapshot records the working copy as it is (`vl status` shows the
 snapshot's file as deleted). To take the snapshot's version instead, move
 `X` out of the way and run `vl restore X`.
 
+### `N inner/` in `vl status`, `kept inner/ (a Veil repository of its own, …)`
+
+`inner/` holds a `.veil` directory: it is a repository of its own (a
+vendored project, a monorepo member, or `vl init` run in the wrong place).
+As Git does with an embedded repository, this repository records nothing
+in it, whatever `.veilpolicy` says: its cloaked files are plaintext on
+disk, and only its own policy knows they are secret. Commit and push its
+files from inside it. If this repository recorded files there before,
+they show as deleted (they stay on disk), and a checkout never writes or
+removes anything inside `inner/`. `vl scan` skips it (run `vl scan` in
+it). If `inner/.veil` was a mistake, remove it (`rm -r inner/.veil`) and
+the files are recorded again.
+
+### `failed X (File name too long …; left out of the working copy …)`
+
+The filesystem refused that one path: a name longer than it can hold
+(255 bytes on most filesystems), a character it does not accept, or a
+directory you cannot write to. The rest of the checkout went ahead, and
+the file stays in history as it is (`vl status` lists it as `R`); every
+command tries again. Rename it on a machine that can check it out, and
+commit that.
+
 ### `Finished the interrupted move of the working copy to workspace 'X'`
 
 An earlier `vl ws switch`, `vl new`, `vl edit` or `vl undo` was killed (or
