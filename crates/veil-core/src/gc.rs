@@ -203,16 +203,20 @@ struct Mark<'a> {
 
 impl Mark<'_> {
     fn snapshots(&mut self, roots: impl IntoIterator<Item = ObjectId>) {
-        let mut stack: Vec<ObjectId> = roots.into_iter().collect();
-        while let Some(id) = stack.pop() {
+        // The flag marks the merged-in parent of an unreleased embargoed
+        // merge, which a public remote (and its clones) legitimately lacks.
+        let mut stack: Vec<(ObjectId, bool)> = roots.into_iter().map(|id| (id, false)).collect();
+        while let Some((id, withheld)) = stack.pop() {
             if !self.reach.insert(id) {
                 continue;
             }
             match self.store.snapshot(&id) {
                 Ok(s) => {
-                    stack.extend(s.parents.iter().copied());
+                    let embargoed = s.embargo.as_deref().is_some_and(|e| !self.store.keys.embargo_released(e));
+                    stack.extend(s.parents.iter().enumerate().map(|(i, p)| (*p, embargoed && i > 0)));
                     self.snaps.push((s.timestamp, id, s.tree));
                 }
+                Err(VeilError::Missing(_)) if withheld => {}
                 Err(e) => self.incomplete.push(format!("snapshot {}: {e}", id.short())),
             }
         }
@@ -237,13 +241,23 @@ impl Mark<'_> {
                 continue;
             }
             self.hint(HINT_DIR, &path, id);
-            let t = match self.store.tree(&id) {
+            let t = match self.store.tree_object(&id) {
                 Ok(t) => t,
                 Err(e) => {
                     self.incomplete.push(format!("tree {} at '{path}': {e}", id.short()));
                     continue;
                 }
             };
+            // An embargo wrapper lists every object reachable only through its
+            // sealed side (which gc may be unable to open); the rest is
+            // reachable through the fallback.
+            if let Some(w) = crate::embargo::wrapper_parts(&t) {
+                self.reach.insert(id);
+                self.reach.insert(w.inner);
+                self.reach.extend(w.listed.iter().copied());
+                stack.push((w.fallback, path));
+                continue;
+            }
             for e in &t.entries {
                 let p = if path.is_empty() {
                     e.name.clone()

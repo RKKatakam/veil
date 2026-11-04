@@ -474,7 +474,6 @@ proptest! {
 
     /// Same random operations with cloaked virtual workspaces.
     #[test]
-    #[ignore = "BUG-005/BUG-006: rebase and `new` on cloaked changes declassify cloaked content to public"]
     fn cloaked_lines_of_work_never_hold_public_entries(ops in proptest::collection::vec(arb_op(), 1..30)) {
         let r = run_ops_with(&ops, true);
         prop_assert!(r.is_ok(), "{}", r.unwrap_err());

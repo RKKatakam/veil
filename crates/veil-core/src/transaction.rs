@@ -94,6 +94,11 @@ impl<'r> Transaction<'r> {
     }
 
     /// Create a new change on top of `parents` (merging them if several).
+    ///
+    /// The change takes the workspace's `cloak`, not its parents'. Sealed
+    /// entries it inherits from a cloaked parent stay sealed regardless: the
+    /// builder never moves sealed content to a wider audience (see
+    /// `builder.rs`), so `vl new <cloaked change>` cannot declassify it.
     pub fn new_change(&mut self, parents: Vec<ObjectId>, description: &str, cloak: Option<String>) -> Result<ObjectId> {
         let merged = self.repo.parents_tree(&parents)?;
         let snap = Snapshot {

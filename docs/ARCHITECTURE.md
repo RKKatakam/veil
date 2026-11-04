@@ -258,7 +258,7 @@ rotation = { generation, key_id, previous: [{key_id, sealed}], wrapped: {id → 
 | `cloak <scope>` | ciphertext | ✓ (ciphertext) | ✗ withheld (entry kept, redacted) |
 | `isolate` | **never** | ✗ | ✗ |
 | `ignore` | never | ✗ | ✗ |
-| embargoed (merge) | ciphertext + plaintext fallback | ✓ | fallback only until release |
+| embargoed (merge) | sealed tree + pre-merge fallback | ✓ (merged-in history: cloaked part only) | fallback only until release |
 
 The **builder** (`builder.rs`) is the single point where content enters the
 CAS, and it applies these rules in order:
@@ -293,8 +293,18 @@ CAS, and it applies these rules in order:
      it again on top of the new tree. `vl restore <path>` deliberately
      discards a quarantined edit.
 4. Cloaked files are sealed under their scope. In a cloaked workspace, every
-   public file is sealed under the workspace scope, and the description is too.
-5. Embargoed entries stay embargoed until their embargo is released.
+   public file it introduces is sealed under the workspace scope, and the
+   description is too.
+   * **Sealed content keeps its audience.** A tracked file the parent holds
+     sealed under scope `s` stays sealed under `s`, edited or not, whatever
+     the workspace or the current policy says, unless this very snapshot
+     edits `.veilpolicy` so that the path's classification changes. That is
+     how `vl expose` and `vl cloak --scope` work, and an expose to `public`
+     still goes through the secret scanner below. A policy that arrived by
+     merge, `vl new <cloaked change>` in an ordinary workspace, rebases and
+     squashes never move sealed content to another audience.
+5. Embargoed entries stay embargoed until their embargo is released, and a
+   tree under an unreleased embargo stays under it (§7).
 6. Entries this reader cannot materialise (no key, or withheld by a public
    remote) are **carried over** instead of being treated as deletions. A
    partial view can never accidentally delete hidden content.
@@ -339,9 +349,33 @@ struct Snapshot {
   from are abandoned automatically.
 * **Merging** is tree-level. Identical subtrees resolve by id, and files
   changed on both sides go through diff3 (`diffy`). Conflicts are written as
-  markers and recorded on the snapshot until the file is edited. Visibility
-  is preserved, and merges re-normalise visibility against the destination
-  policy.
+  markers and recorded on the snapshot until the file is edited.
+* **Visibility never silently widens.** Declassification (any move from
+  cloaked or embargoed to more visible) is an explicit act by a member: a
+  `vl merge` of a cloaked line of work, or a `vl expose`, both of which go
+  through the secret scanner. It is never a side effect:
+  * a file merged by diff3 keeps the sealing of whichever side is sealed
+    (ours first). This matters for auto-rebase, where "ours" is the new,
+    possibly public, parent;
+  * `vl merge` (`embargo::normalize_tree`) may seal content, but never
+    re-keys sealed content or makes it public, with one exception. Files of a
+    merged-in **cloaked line of work** become public when both the
+    destination's policy and the merged policy say so. Each is scanned
+    first: a hit is left out of the merge (the destination keeps its own
+    version), and `vl merge` lists what it published and what it
+    quarantined. A file the destination holds sealed keeps that audience
+    even if the merged side exposed or re-keyed it;
+  * a merged `.veilpolicy` that would change the audience of existing
+    sealed files (`prod/ cloak ops` → `prod/ cloak opz`, or → `public!`)
+    is **not taken**. The destination's policy is kept and `vl merge` warns.
+    Applying it is a deliberate edit on the destination. So a pull request
+    that only edits the policy cannot re-encrypt files to a scope its author
+    controls;
+  * squashing a cloaked change into a public parent seals the joined
+    description; squashing anything into a cloaked change seals what it
+    brings;
+  * the builder rule above (sealed content keeps its audience) covers
+    working copies.
 
 ## 6. Workspaces
 
@@ -420,16 +454,52 @@ benchmark with
 `vl merge X --embargo [--until T] [--scope S]`:
 
 1. Creates an embargo record holding a fresh key, wrapped under scope `S`,
-   plus an optional deadline.
-2. Builds the merged tree. Then every file that differs from the first parent
-   is sealed under `embargo/<id>`, with the first parent's version kept as
-   that entry's `fallback`.
-3. Readers without the key (a public mirror, non-members) see the main line
-   exactly as it was before the merge. Members see the merge.
-4. **Release** (manual, or automatic on the first `vl` run by a key holder
+   plus an optional deadline. Records are synced to every remote, so the
+   record carries **no message**. The merge snapshot's description is sealed
+   under the embargo key instead, and becomes readable on release.
+2. Builds the merged tree and stores it as an **embargo wrapper**
+   (`embargo.rs`). This is a small plaintext tree whose marker entry `embargo`
+   points at the merged tree, **sealed whole** under `embargo/<id>`, with the
+   first parent's tree as its `fallback`. Inside the sealed side, every
+   directory that differs from the fallback is itself a sealed tree, and
+   every public file that differs is sealed under the embargo key, with the
+   pre-merge version as its fallback. Content that was already sealed
+   (cloaked under a scope) stays as it is, so releasing the embargo never
+   declassifies cloaked files. The wrapper's other entries list, by id,
+   every object reachable only through the sealed side. Relays, `gc` and
+   `fsck` cannot open sealed trees, and the list is how they find, keep and
+   transfer those objects.
+3. `ObjectStore::tree` resolves a wrapper transparently: key holders see the
+   merge, everyone else sees the pre-merge tree **exactly**. The fix's new
+   file names, the new sizes and even *which* files changed are hidden.
+4. **The merged-in history is withheld** until release (§8). The fix's own
+   snapshots are ancestors of the merge, so pushing the merge would
+   otherwise publish the fix in plaintext.
+5. An unreleased embargo is **sticky**. A key holder's later snapshots,
+   merges and rebases on top of it are re-wrapped under the same embargo,
+   with the merge of the inputs' public views as their fallback. A reader
+   without the key cannot record edits on top of it: the builder holds them
+   back (reported like cloak failures), because that reader sees only the
+   pre-merge tree and recording on top of it would silently revert the fix
+   for everyone. Merging such history without the key is refused.
+6. **Release** (manual, or automatic on the first `vl` run by a key holder
    after the deadline) publishes the key in the record. Snapshot ids do not
    change, nothing is rewritten, and the next push carries the
-   now-releasable objects.
+   now-releasable objects *and the withheld history*.
+
+**Trade-offs.**
+* Until release, outsiders see the main line's pre-merge tree. That
+  includes commits that key holders make on top of the merge: their public
+  changes also stay hidden until release, because everything below the
+  embargoed root is sealed. Release early, or keep unrelated public work on
+  another line and merge it after the release.
+* Non-holders (outsiders and team members outside `S`) cannot commit on top
+  of the embargoed merge until release; they can work on its first parent.
+* The public sees the merge snapshot and its first-parent history, with the
+  extra parents redacted: their ids, but no objects. `vl log` shows the
+  merge as merging a snapshot it does not have.
+* Cost: every key holder's snapshot on an embargoed line re-seals the
+  directories it changes, a cost in proportion to the changed region.
 
 ## 8. Synchronisation
 
@@ -437,7 +507,28 @@ benchmark with
 happens *during the object walk*: a public remote never receives sealed
 objects except those of released embargoes, never receives cloaked tags, and
 nothing is ever transferred under the `local` scope. Isolated content cannot
-be pushed at all, because it was never in the graph. Key rings are signed
+be pushed at all, because it was never in the graph.
+
+**Embargoed history.** Before walking, `push` computes, for every
+unreleased embargoed merge in the local graph, the snapshots that only its
+merged-in (non-first) parents reach: the fix, and how it was made.
+* A public remote receives none of them. A team remote receives only the
+  cloaked ones (content and descriptions sealed for the scope): plaintext
+  history is withheld there too, because team remotes are also read by
+  people outside the embargo's scope.
+* The merge reaches the remote with those parents **redacted**. If a tag
+  would publish withheld history any other way (a tag on the fix itself, or
+  a commit that builds on the fix without going through the embargoed
+  merge), that tag is skipped with a reason; the rest of the push goes
+  ahead.
+* Graph walks (`Repo::snapshot_opt`, `ancestors`, `topo_children_first`,
+  `parents_tree`, `gc`, `fsck`) treat a missing parent as absent. `fsck`
+  reports a withheld parent as an expected redaction, so clones of such a
+  remote work normally.
+* After the release, the next push fills the parents in, with unchanged
+  snapshot ids.
+
+Key rings are signed
 logs that only fast-forward (§3). Stale, tampered or forged rings are
 ignored or rejected with a warning, and membership is never merged as a
 union. Embargo records are accepted only if signed by a scope member, or as
@@ -634,7 +725,13 @@ BLAKE3 verification that loose reads skip, and the loose-first probe.
   file to forget);
 * leaking cloaked content or names of cloaked tags to public remotes;
 * readers of a team remote who are not in a scope (they get ciphertext only);
-* pre-release disclosure of embargoed changes to non-members;
+* pre-release disclosure of embargoed changes to non-members: their
+  content, their messages, their history, and their file names, sizes and
+  set of changed files (the embargoed tree is sealed whole);
+* declassification as a side effect. Rebase, `new`, squash, a policy edit
+  that arrives by merge, and push never move cloaked or embargoed content
+  to a wider audience. Only an explicit merge of a cloaked line or an
+  `expose` does, with the secret scanner applied;
 * tampering with ciphertext or moving it between scopes or key generations
   (AEAD bound to the envelope label);
 * **revoked members reading new content.** Revocation rotates the scope key,
@@ -676,6 +773,23 @@ BLAKE3 verification that loose reads skip, and the loose-first probe.
   identity) cannot check the genesis proof. Members check it when they pull.
 * *Time-based embargo release* relies on key holders' engines and is not
   time-lock cryptography.
+* *Embargo metadata that remains visible:* that an embargoed merge exists,
+  its parents' ids (the merged-in ones are redacted, not hidden), its
+  author, its timestamp, the embargo's scope and deadline, and the
+  ciphertext sizes on team remotes. The embargo record and the wrapper do
+  not name files. Two embargoes merged together before either is released
+  are wrapped under the first: if it is released first, the names (not the
+  content) of the second's files become visible.
+* *History withheld by an embargo* is computed from the local graph. If the
+  embargoed merge is undone or abandoned before a push, nothing protects
+  the fix branch any more; it is then an ordinary change.
+* *Stale working copies after a release.* A working copy materialised by a
+  non-holder before the release still holds the pre-merge files. The
+  builder recognises unchanged fallback content and does not record it as a
+  revert of the fix. But files the fix *added* are absent from that working
+  copy, and the next snapshot records them as deleted. The CLI must check
+  the working copy out again when it learns of a release; that is not done
+  yet.
 * Content committed in plaintext **before** a path was cloaked stays readable
   in those older snapshots. `vl cloak` warns when this applies.
 
@@ -692,7 +806,8 @@ BLAKE3 verification that loose reads skip, and the loose-first probe.
   memory; incremental packing (small packs merged geometrically), streaming
   pack writes and cross-pack deltas are next. Sync sends canonical objects,
   not packs.
-* Sealed directory nodes (hide names); a "require signed snapshots" policy;
+* Sealed directory nodes for cloaked paths, to hide their names (embargoes
+  already seal their trees, §7); a "require signed snapshots" policy;
   pinning a ring head out of band; automatic re-application of concurrent
   ring changes.
 * First-class conflicts (jj-style) instead of conflict markers.

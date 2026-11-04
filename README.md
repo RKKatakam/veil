@@ -12,7 +12,7 @@ working tree *is* the host filesystem. Veil drops all three assumptions:
 |---|---|
 | `.env` leaks when `.gitignore` is wrong | `.env`, `*.pem`, SSH keys… are **isolated by the engine**; every public file is secret-scanned and **quarantined** on a hit |
 | Private files need separate repos or submodules | **Cloaked** paths are encrypted per scope inside one repo; public remotes never receive them |
-| Security fixes leak the moment they're merged | **Embargoed merges**: the main line shows pre-merge content to outsiders until release |
+| Security fixes leak the moment they're merged | **Embargoed merges**: outsiders see the pre-merge tree, and none of the fix's history, until release |
 | `git add` / index / detached HEAD | Every command **auto-snapshots** the working copy; stable **change ids**; undoable **op log** |
 | Worktrees lock directories hostage | **Virtual workspaces** live in the DAG; agents get **in-memory overlays** in microseconds |
 | Tied to the OS filesystem | Engine runs on any `StorageBackend`: disk, memory, overlay |
@@ -59,10 +59,20 @@ vl remote add mirror ../public-mirror --public
 vl push origin        # team members receive ciphertext + key rings
 vl push mirror        # cloaked blobs and cloaked tags are withheld
 
-# Delayed-visibility merge (e.g. a security fix).
-vl merge fix-cve --into main --embargo --until +7d
-vl push mirror        # the public mirror still shows the pre-merge files
-vl embargo release <id>   # (or automatically after 7 days) — same snapshot ids, now readable
+# Delayed-visibility merge (e.g. a security fix), developed out of sight.
+vl ws new fix-cve -r main --cloak team            # or any change not on `main`
+vl merge fix-cve@ --into main --embargo --until +7d -m "Fix CVE-…"
+vl push mirror        # the mirror shows main's pre-merge tree: no new names, sizes or message,
+                      # and the fix's own history is withheld (the merge's extra parent is redacted)
+vl embargo release <id>   # (or automatically after 7 days)
+vl push mirror        # same snapshot ids, now readable, and the fix's history follows
+# Until release, outsiders keep seeing the pre-merge tree, even for commits made on
+# top of the merge, and cannot commit on top of it; a tag that would publish the fix
+# by another route is skipped by `vl push`.
+
+# Visibility never widens by accident: rebase, `vl new`, squash and policy edits that
+# arrive by merge keep sealed files sealed. Publishing is explicit: `vl merge` of a
+# cloaked line (secret-scanned; it lists what it published) or `vl expose`.
 
 # Virtual workspaces: no directories, no collisions.
 vl ws new agent                                   # exists only in the DAG
