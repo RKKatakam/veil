@@ -70,3 +70,6 @@ Global options (accepted by every command):
 | [`vl doctor`](doctor.md) | Check this machine's setup and explain every problem found: identity, VEIL_HOME, the repository and its lock, the stat cache, the filesystem (case sensitivity, fsync, network mounts), the clock, the vault and leftover sandboxes. Exits 1 if anything is broken |
 | [`vl completions`](completions.md) | Print a shell completion script, e.g. `vl completions zsh > ~/.zfunc/_vl` |
 | [`vl man`](man.md) | Print the man page (`vl man \| man -l -`), or write one page per command into DIR |
+
+The read commands (`status`, `log`, `diff`, `show`, `workspace list`, `tag list`, `op log`,
+`scan`, `secret list`) take `--json`: their schemas are in [JSON output](json.md).

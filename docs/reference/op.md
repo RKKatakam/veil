@@ -23,6 +23,7 @@ Options:
 | | |
 |---|---|
 | `-n, --limit <LIMIT>` | Number of operations to show (default: `20`) |
+| `--json` | Print one JSON document instead of text (its schema is named in its `schema` field; see docs/reference/json.md). Errors then also print a `veil.error/1` document |
 
 ## `vl op restore`
 

@@ -19,6 +19,7 @@ macro_rules! eprintln {
     };
 }
 
+mod api;
 mod cli;
 mod ctx;
 mod doctor;
@@ -45,9 +46,8 @@ use veil_core::{
     policy::{escape_field, escape_literal, format_rule, has_glob_syntax, Policy, Tier, POLICY_FILE},
     remote,
     repo::{RemoteConfig, DEFAULT_WORKSPACE},
-    secrets,
     tree::lookup,
-    vfs::{walk_files, NodeKind},
+    vfs::NodeKind,
     DiskBackend, Identity, Repo, SftpBackend, SshUrl, StorageBackend, VPath,
 };
 
@@ -85,20 +85,28 @@ fn main() -> ExitCode {
         return sandbox::reaper_main(args.next().as_deref());
     }
     let cli = Cli::parse();
+    let json = cli.cmd.wants_json();
     render::exit_status(match run(cli) {
         Ok(code) => code,
         Err(e) => {
+            let message = format!("{e:#}");
             // Errors may quote repository data (names, paths): escape them.
-            eprintln!("{} {}", red("error:"), safe(&format!("{e:#}")));
-            if e
+            eprintln!("{} {}", red("error:"), safe(&message));
+            let hint = e
                 .chain()
                 .any(|c| matches!(c.downcast_ref::<veil_core::VeilError>(), Some(veil_core::VeilError::NameCollision(_))))
-            {
-                eprintln!(
-                    "{} the repository already moved to that snapshot. To work here meanwhile, move the working copy \
+                .then_some(
+                    "the repository already moved to that snapshot. To work here meanwhile, move the working copy \
                      back without touching files: `vl --no-snapshot undo` (or `vl --no-snapshot edit <rev>`)",
-                    yellow("hint:")
                 );
+            if let Some(h) = hint {
+                eprintln!("{} {h}", yellow("hint:"));
+            }
+            // `--json`: the failure as this invocation's one document,
+            // unless the command already printed its own (then only stderr
+            // and the exit status tell).
+            if json && !api::json_emitted() {
+                let _ = api::emit_json(&api::ErrorDoc::new(message, hint.map(String::from)));
             }
             ExitCode::FAILURE
         }
@@ -122,7 +130,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         Cmd::Man { out_dir } => cmd_man(out_dir.as_deref()),
         Cmd::Upgrade { dry_run, remote, force } => cmd_upgrade(cli.repository.as_deref(), *dry_run, remote.as_deref(), *force),
-        Cmd::Scan { policy_from: Some(file) } => cmd_scan_gate(cli.repository.as_deref(), file),
+        Cmd::Scan { policy_from: Some(file), out } => cmd_scan_gate(cli.repository.as_deref(), file, out.json),
         _ => {
             let mut ctx = open(&cli)?;
             if ctx.bare && !runs_in_a_bare_repository(&cli.cmd) {
@@ -144,7 +152,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
 fn runs_in_a_bare_repository(cmd: &Cmd) -> bool {
     matches!(
         cmd,
-        Cmd::Log { .. } | Cmd::Show { .. } | Cmd::Tag(TagCmd::List) | Cmd::Op(OpCmd::Log { .. }) | Cmd::Gc { .. }
+        Cmd::Log { .. } | Cmd::Show { .. } | Cmd::Tag(TagCmd::List { .. }) | Cmd::Op(OpCmd::Log { .. }) | Cmd::Gc { .. }
     )
 }
 
@@ -158,23 +166,26 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         | Cmd::Completions { .. }
         | Cmd::Man { .. }
         | Cmd::Upgrade { .. } => unreachable!(),
-        Cmd::Status => cmd_status(ctx)?,
-        Cmd::Log { limit } => print_log(&ctx.repo, &ctx.ws, *limit)?,
-        Cmd::Show { rev, stat } => cmd_show(ctx, rev, *stat)?,
-        Cmd::Diff { rev, from, to, stat } => {
-            let (a, b) = match (from, to) {
-                (None, None) => {
-                    let id = ctx.rev(rev.as_deref().unwrap_or("@"))?;
-                    let s = ctx.repo.snapshot(&id)?;
-                    (ctx.repo.parents_tree(&s.parents)?.tree, s.tree)
-                }
-                _ => {
-                    let a = ctx.rev(from.as_deref().unwrap_or("@"))?;
-                    let b = ctx.rev(to.as_deref().unwrap_or("@"))?;
-                    (ctx.repo.snapshot(&a)?.tree, ctx.repo.snapshot(&b)?.tree)
-                }
-            };
-            print_diff(&ctx.repo, &a, &b, *stat)?;
+        // The read commands: a structured result (`api`), shown as text or
+        // as one JSON document.
+        Cmd::Status { out } => match out.json {
+            true => api::emit_json(&api::status(ctx)?)?,
+            false => api::text::status(&api::status(ctx)?),
+        },
+        Cmd::Log { limit, out } => match out.json {
+            true => api::emit_json(&api::log(&ctx.repo, &ctx.ws, *limit)?)?,
+            false => api::text::log(api::log_entries(&ctx.repo, &ctx.ws, *limit)?)?,
+        },
+        Cmd::Show { rev, stat, out } => match out.json {
+            true => api::emit_json(&api::show(ctx, rev, *stat)?)?,
+            false => api::text::show(&ctx.repo, &api::show_header(ctx, rev, *stat)?)?,
+        },
+        Cmd::Diff { rev, from, to, stat, out } => {
+            let (a, b) = api::diff_trees_for(ctx, rev.as_deref(), from.as_deref(), to.as_deref())?;
+            match out.json {
+                true => api::emit_json(&api::diff(&ctx.repo, &a, &b, *stat)?)?,
+                false => api::text::diff(&ctx.repo, &a, &b, *stat)?,
+            }
         }
         Cmd::Files { rev } => {
             let id = ctx.rev(rev)?;
@@ -279,22 +290,22 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Expose { patterns, force } => cmd_policy_rules(ctx, patterns, Tier::Public, *force)?,
         Cmd::Ignore { patterns } => cmd_policy_rules(ctx, patterns, Tier::Ignored, false)?,
         Cmd::Policy(c) => cmd_policy(ctx, c)?,
-        Cmd::Scan { .. } => return cmd_scan(ctx),
+        Cmd::Scan { out, .. } => {
+            let scan = api::scan(ctx)?;
+            match out.json {
+                true => api::emit_json(&scan)?,
+                false => api::text::scan(&scan),
+            }
+            return Ok(scan_status(&scan));
+        }
         Cmd::Secret(c) => cmd_secret(ctx, c)?,
         Cmd::Run { command } => return cmd_run(ctx, command),
         Cmd::Scope(c) => cmd_scope(ctx, c)?,
         Cmd::Workspace(c) => return cmd_ws(ctx, c),
-        Cmd::Op(OpCmd::Log { limit }) => {
-            for (id, op) in ctx.repo.op_log(*limit)? {
-                println!(
-                    "{} {} {} {}",
-                    blue(&id.short()),
-                    dim(&fmt_time(op.timestamp)),
-                    yellow(&safe(&op.user)),
-                    safe(&op.description)
-                );
-            }
-        }
+        Cmd::Op(OpCmd::Log { limit, out }) => match out.json {
+            true => api::emit_json(&api::op_log(&ctx.repo, *limit)?)?,
+            false => api::text::op_log(&api::op_log(&ctx.repo, *limit)?),
+        },
         // Both keep uncommitted working-copy edits: the automatic snapshot
         // taken before the command is not what the user wants to undo.
         Cmd::Op(OpCmd::Restore { id }) => {
@@ -835,150 +846,6 @@ fn print_tags_kept(repo: &Repo, r: &CommitResult) {
     }
 }
 
-fn cmd_status(ctx: &mut Ctx) -> Result<()> {
-    let wc = ctx.wc()?;
-    let s = ctx.repo.snapshot(&wc)?;
-    let base = ctx.repo.parents_tree(&s.parents)?.tree;
-    let changes = veil_core::tree::diff_trees(ctx.repo.store(), Some(&base), Some(&s.tree))?;
-    if changes.is_empty() {
-        println!("The working copy has no changes.");
-    } else {
-        println!("Working copy changes:");
-        print_changes_summary(&ctx.repo, &changes);
-    }
-    println!("Workspace    : {}{}", green(&safe(&ctx.ws)), match &ctx.repo.view().workspace(&ctx.ws)?.cloak {
-        Some(c) => magenta(&format!(" [cloaked:{}]", safe(c))),
-        None => String::new(),
-    });
-    println!("Working copy : {} {}", bold(&green("@")), one_line(&ctx.repo, &wc));
-    for p in &s.parents {
-        println!("Parent       : {}", one_line(&ctx.repo, p));
-    }
-    if !ctx.report.isolated.is_empty() {
-        println!("{}", dim("Local-only (isolated; never snapshotted or pushed):"));
-        for p in &ctx.report.isolated {
-            println!("  {} {}", dim("L"), safe(p.as_str()));
-        }
-    }
-    if !ctx.report.quarantined.is_empty() {
-        println!("{}", yellow("Quarantined (secrets detected; kept local):"));
-        for (p, f) in &ctx.report.quarantined {
-            let state = if ctx.report.quarantine_kept.contains(p) {
-                "edit held back; history keeps the previous version"
-            } else {
-                "never recorded"
-            };
-            println!("  {} {}  ({}; {state})", yellow("Q"), safe(p.as_str()), f[0].rule);
-        }
-    }
-    if !ctx.report.policy_held_back.is_empty() {
-        println!("{}", yellow("Policy change not accepted (protection kept; `vl policy accept` applies it):"));
-        for h in &ctx.report.policy_held_back {
-            println!("  {} {}  ({}; .veilpolicy says {})", yellow("P"), safe(&h.shown_path()), h.accepted, h.wanted);
-        }
-    }
-    if !ctx.report.nested.is_empty() {
-        println!("{}", dim("Nested repositories (repositories of their own; nothing in them is recorded here):"));
-        for p in &ctx.report.nested {
-            println!("  {} {}/", dim("N"), safe(p.as_str()));
-        }
-    }
-    if !ctx.report.carried.is_empty() {
-        println!("{}", dim("Redacted (unreadable here; kept in history, absent on disk):"));
-        for p in &ctx.report.carried {
-            let entry = veil_core::tree::lookup(ctx.repo.store(), &s.tree, p)?;
-            let why = entry.as_ref().and_then(|e| render::hidden_reason(&ctx.repo, e));
-            // Readable, yet never materialised: the filesystem refused it.
-            let fallback = match entry {
-                Some(e) if ctx.repo.store().entry_readable(&e) => "this filesystem could not hold it",
-                _ => "no key",
-            };
-            println!("  {} {}  ({})", dim("R"), safe(p.as_str()), why.unwrap_or_else(|| fallback.into()));
-        }
-    }
-    // Conflicts recorded on `@`, and those of its parents (a merge records
-    // them on the merge, `@-`) whose file `@` has not touched since.
-    let mut conflicts: Vec<(String, Option<String>)> = s.conflicts.iter().map(|c| (c.clone(), None)).collect();
-    for p in &s.parents {
-        let ps = ctx.repo.snapshot(p)?;
-        for c in &ps.conflicts {
-            let Ok(path) = VPath::new(c) else { continue };
-            let before = lookup(ctx.repo.store(), &ps.tree, &path)?;
-            if before.is_some() && before == lookup(ctx.repo.store(), &s.tree, &path)? && !conflicts.iter().any(|(x, _)| x == c) {
-                conflicts.push((c.clone(), Some(ps.change_id.short())));
-            }
-        }
-    }
-    if !conflicts.is_empty() {
-        println!("{}", red("Unresolved conflicts:"));
-        for (c, from) in &conflicts {
-            match from {
-                Some(change) => println!("  {} {}  (recorded on {change})", red("C"), safe(c)),
-                None => println!("  {} {}", red("C"), safe(c)),
-            }
-        }
-        println!(
-            "  {} edit the files to resolve the conflict markers; a conflict is resolved once its file is edited. Fold the resolution into the merge with `vl squash`, or `vl commit` it",
-            dim("hint:")
-        );
-    }
-    Ok(())
-}
-
-fn cmd_show(ctx: &mut Ctx, rev: &str, stat: bool) -> Result<()> {
-    let id = ctx.rev(rev)?;
-    let s = ctx.repo.snapshot(&id)?;
-    println!("Change ID : {}", bold(&magenta(&s.change_id.display())));
-    println!("Snapshot  : {}", blue(&id.hex()));
-    println!("Author    : {} at {}", safe(&s.author), fmt_time(s.timestamp));
-    if id != ctx.repo.root_id() {
-        println!("Signature : {}", signature_detail(&ctx.repo.keys().snapshot_status(&s), &s));
-    }
-    if s.parents.len() > 1 {
-        for p in &s.parents {
-            println!("Parent    : {}", one_line(&ctx.repo, p));
-        }
-    }
-    let tags: Vec<&String> = ctx.repo.view().tags.iter().filter(|(_, t)| t.target == id).map(|(n, _)| n).collect();
-    if !tags.is_empty() {
-        println!("Tags      : {}", cyan(&tags.iter().map(|t| safe(t)).collect::<Vec<_>>().join(", ")));
-    }
-    if let Some(c) = &s.cloak {
-        println!("Cloaked   : {}", magenta(&safe(c)));
-    }
-    if let Some(e) = &s.embargo {
-        let rec = ctx.repo.keys().load_embargo(e)?;
-        let state = match rec {
-            Some(_) if ctx.repo.keys().release_state(e) == ReleaseState::Released => "released".to_string(),
-            Some(_) if ctx.repo.keys().release_state(e) == ReleaseState::Staged => "released here, not pushed yet".to_string(),
-            Some(r) => match r.until {
-                Some(u) => format!("until {}", fmt_deadline(u)),
-                None => "until manually released".into(),
-            },
-            None => "unknown".into(),
-        };
-        println!("Embargo   : {} ({state})", yellow(&safe(e)));
-    }
-    // As `vl log` marks it and `vl status` lists them (BUG-245). A merge's
-    // own diff is relative to the merged parents, so it shows no markers.
-    if !s.conflicts.is_empty() {
-        let paths: Vec<String> = s.conflicts.iter().map(|c| safe(c).into_owned()).collect();
-        println!("Conflicts : {}", red(&paths.join(", ")));
-    }
-    println!();
-    let desc = ctx.repo.description(&s);
-    if desc.trim().is_empty() {
-        println!("    {}", dim("(no description set)"));
-    } else {
-        for l in safe_lines(&desc) {
-            println!("    {l}");
-        }
-    }
-    println!();
-    let base = ctx.repo.parents_tree(&s.parents)?.tree;
-    print_diff(&ctx.repo, &base, &s.tree, stat)
-}
-
 fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()> {
     let wc = ctx.repo.snapshot(&ctx.wc()?)?;
     let wc_tree = wc.tree;
@@ -1326,19 +1193,10 @@ fn cmd_embargo_release(ctx: &mut Ctx, id: &str, yes: bool) -> Result<()> {
 
 fn cmd_tag(ctx: &mut Ctx, c: &TagCmd) -> Result<()> {
     match c {
-        TagCmd::List => {
-            for (name, t) in &ctx.repo.view().tags {
-                let cloak = t
-                    .cloak
-                    .as_ref()
-                    .map(|c| magenta(&format!(" [cloaked:{}]", safe(c))))
-                    .unwrap_or_default();
-                println!("{}{cloak}: {}", cyan(&safe(name)), one_line(&ctx.repo, &t.target));
-            }
-            for (name, t) in &ctx.repo.view().remote_tags {
-                println!("{}: {}", dim(&safe(name)), one_line(&ctx.repo, t));
-            }
-        }
+        TagCmd::List { out } => match out.json {
+            true => api::emit_json(&api::tag_list(&ctx.repo))?,
+            false => api::text::tag_list(&api::tag_list(&ctx.repo)),
+        },
         TagCmd::Set {
             name,
             rev,
@@ -1622,59 +1480,11 @@ fn cmd_policy(ctx: &mut Ctx, c: &PolicyCmd) -> Result<()> {
     Ok(())
 }
 
-fn cmd_scan(ctx: &mut Ctx) -> Result<ExitCode> {
-    let policy = ctx.repo.effective_policy(&*ctx.fs)?;
-    // A nested repository is never recorded here (BUG-200): its files are
-    // that repository's to scan.
-    let nested = std::cell::RefCell::new(Vec::new());
-    let skip = |p: &VPath| {
-        if p.as_str() == ".veil" || policy.classify(p, true).tier == Tier::Ignored {
-            return true;
-        }
-        let n = veil_core::vfs::is_nested_repository(&*ctx.fs, p).unwrap_or(false);
-        if n {
-            nested.borrow_mut().push(p.clone());
-        }
-        n
-    };
-    let files = walk_files(&*ctx.fs, &VPath::root(), &skip)?;
-    for p in nested.into_inner() {
-        println!("{} {}/  (a repository of its own, never recorded here; run `vl scan` in it)", dim("nested   "), safe(p.as_str()));
-    }
-    let mut exposed = 0;
-    let mut contained = 0;
-    for path in files {
-        let class = policy.classify(&path, false);
-        if class.tier == Tier::Ignored || class.allow_secrets {
-            continue;
-        }
-        let findings = secrets::scan(&ctx.fs.read(&path)?);
-        if findings.is_empty() {
-            continue;
-        }
-        let (label, protected) = match &class.tier {
-            Tier::Public => (red("PUBLIC   "), false),
-            Tier::Cloaked(s) => (magenta(&format!("cloaked:{}", safe(s))), true),
-            _ => (dim("isolated "), true),
-        };
-        for f in &findings {
-            println!("{label} {}:{}  {} {}", safe(path.as_str()), f.line, f.rule, dim(&safe(&f.excerpt)));
-        }
-        if protected {
-            contained += 1;
-        } else {
-            exposed += 1;
-        }
-    }
-    if exposed == 0 {
-        println!("{} no secrets in public files ({contained} protected file(s) contain secrets)", green("ok:"));
-        Ok(ExitCode::SUCCESS)
-    } else {
-        println!(
-            "{} {exposed} public file(s) contain secrets; they are quarantined from snapshots until cloaked, isolated or fixed",
-            red("found:")
-        );
-        Ok(ExitCode::from(1))
+/// `vl scan` exits 1 when a public file contains a secret.
+fn scan_status(scan: &api::Scan) -> ExitCode {
+    match scan.clean {
+        true => ExitCode::SUCCESS,
+        false => ExitCode::from(1),
     }
 }
 
@@ -1685,7 +1495,7 @@ fn cmd_scan(ctx: &mut Ctx) -> Result<ExitCode> {
 /// Git whatever a `.veilpolicy` says, so only FILE's `public!` paths are
 /// exempt; isolated, cloaked and ignored paths are scanned too, and only
 /// VCS metadata (`.git`, …) and `.veil/` are skipped.
-fn cmd_scan_gate(repo_arg: Option<&Path>, file: &Path) -> Result<ExitCode> {
+fn cmd_scan_gate(repo_arg: Option<&Path>, file: &Path, json: bool) -> Result<ExitCode> {
     let rules = std::fs::read(file).with_context(|| format!("reading the trusted policy {}", file.display()))?;
     let policy = Policy::parse(&String::from_utf8_lossy(&rules));
     for w in &policy.warnings {
@@ -1697,47 +1507,12 @@ fn cmd_scan_gate(repo_arg: Option<&Path>, file: &Path) -> Result<ExitCode> {
     };
     let root = ctx::find_root(&start).unwrap_or(start);
     let fs = DiskBackend::new(&root);
-    let skip = |p: &VPath| {
-        p.as_str() == ".veil" || veil_core::policy::vcs_metadata_name(p.file_name()).is_some()
-    };
-    let mut exposed = 0;
-    for path in walk_files(&fs, &VPath::root(), &skip)? {
-        let class = policy.classify(&path, false);
-        if class.tier == Tier::Public && class.allow_secrets {
-            continue;
-        }
-        let data = match fs.read(&path) {
-            Ok(d) => d,
-            Err(e) => {
-                println!("{} {}  cannot read it ({}); not scanned", red("UNREAD   "), safe(path.as_str()), safe(&e.to_string()));
-                exposed += 1;
-                continue;
-            }
-        };
-        let findings = secrets::scan(&data);
-        if findings.is_empty() {
-            continue;
-        }
-        let note = match &class.tier {
-            Tier::Public => String::new(),
-            _ => dim(&format!("  ({} by {}: in a checkout it is published anyway)", class.tier.label(), file.display())),
-        };
-        for f in &findings {
-            println!("{} {}:{}  {} {}{note}", red("PUBLIC   "), safe(path.as_str()), f.line, f.rule, dim(&safe(&f.excerpt)));
-        }
-        exposed += 1;
+    let scan = api::scan_gate(&fs, &policy, &file.display().to_string())?;
+    match json {
+        true => api::emit_json(&scan)?,
+        false => api::text::scan(&scan),
     }
-    if exposed == 0 {
-        println!("{} no secrets outside the `public!` paths of {}", green("ok:"), file.display());
-        Ok(ExitCode::SUCCESS)
-    } else {
-        println!(
-            "{} {exposed} file(s) contain secrets (or could not be scanned); only the `public!` paths of {} may",
-            red("found:"),
-            file.display()
-        );
-        Ok(ExitCode::from(1))
-    }
+    Ok(scan_status(&scan))
 }
 
 // ---- secrets & identities ------------------------------------------------
@@ -1771,11 +1546,11 @@ fn cmd_secret(ctx: &mut Ctx, c: &SecretCmd) -> Result<()> {
             let v = vault.secrets.get(name).ok_or_else(|| anyhow!("no secret named '{name}'"))?;
             println!("{v}");
         }
-        SecretCmd::List => {
-            for k in ctx.repo.vault_load()?.secrets.keys() {
-                println!("{k}");
-            }
-        }
+        // Names only: no value ever enters the result.
+        SecretCmd::List { out } => match out.json {
+            true => api::emit_json(&api::secret_list(&ctx.repo)?)?,
+            false => api::text::secret_list(&api::secret_list(&ctx.repo)?),
+        },
         SecretCmd::Rm { name } => {
             if !ctx.repo.vault_update(|vault| Ok(vault.secrets.remove(name).is_some()))? {
                 bail!("no secret named '{name}'");
@@ -2023,17 +1798,10 @@ fn run_in(dir: &Path, command: &[String]) -> Result<i32> {
 
 fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
     match c {
-        WsCmd::List => {
-            for (name, w) in &ctx.repo.view().workspaces {
-                let here = if *name == ctx.ws { green("* ") } else { "  ".into() };
-                let cloak = w
-                    .cloak
-                    .as_ref()
-                    .map(|c| magenta(&format!(" [cloaked:{}]", safe(c))))
-                    .unwrap_or_default();
-                println!("{here}{}{cloak}: {}", bold(&safe(name)), one_line(&ctx.repo, &w.wc));
-            }
-        }
+        WsCmd::List { out } => match out.json {
+            true => api::emit_json(&api::workspace_list(&ctx.repo, &ctx.ws))?,
+            false => api::text::workspace_list(&api::workspace_list(&ctx.repo, &ctx.ws)),
+        },
         WsCmd::New { name, rev, cloak } => {
             let bases = match rev {
                 Some(r) => vec![ctx.rev(r)?],

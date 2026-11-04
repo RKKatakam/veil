@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 /// `vl -V`: version, the commit it was built from and the repository format
 /// it reads and writes.
@@ -68,12 +68,17 @@ pub enum Cmd {
     // ---- inspecting -------------------------------------------------------
     /// Show working-copy changes, local-only files and conflicts.
     #[command(visible_alias = "st")]
-    Status,
+    Status {
+        #[command(flatten)]
+        out: JsonOut,
+    },
     /// Show the snapshot graph.
     Log {
         /// Maximum number of snapshots to show.
         #[arg(short = 'n', long)]
         limit: Option<usize>,
+        #[command(flatten)]
+        out: JsonOut,
     },
     /// Show a snapshot's metadata and diff.
     Show {
@@ -83,6 +88,8 @@ pub enum Cmd {
         /// Only list changed paths.
         #[arg(long)]
         stat: bool,
+        #[command(flatten)]
+        out: JsonOut,
     },
     /// Show changes in a snapshot, or between two snapshots.
     Diff {
@@ -99,6 +106,8 @@ pub enum Cmd {
         /// Only list changed paths.
         #[arg(long)]
         stat: bool,
+        #[command(flatten)]
+        out: JsonOut,
     },
     /// List the files of a snapshot with their visibility.
     Files {
@@ -288,6 +297,8 @@ pub enum Cmd {
         /// `.veilpolicy`, so a pull request cannot switch the scan off.
         #[arg(long, value_name = "FILE")]
         policy_from: Option<PathBuf>,
+        #[command(flatten)]
+        out: JsonOut,
     },
 
     // ---- secrets & identities ---------------------------------------------
@@ -427,10 +438,42 @@ pub enum Cmd {
     },
 }
 
+/// `--json`, on every read command.
+#[derive(Args, Debug, Clone, Copy, Default)]
+pub struct JsonOut {
+    /// Print one JSON document instead of text (its schema is named in its
+    /// `schema` field; see docs/reference/json.md). Errors then also print a
+    /// `veil.error/1` document.
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl Cmd {
+    /// Did the command ask for JSON output?
+    pub fn wants_json(&self) -> bool {
+        let out = match self {
+            Cmd::Status { out }
+            | Cmd::Log { out, .. }
+            | Cmd::Show { out, .. }
+            | Cmd::Diff { out, .. }
+            | Cmd::Scan { out, .. }
+            | Cmd::Tag(TagCmd::List { out })
+            | Cmd::Secret(SecretCmd::List { out })
+            | Cmd::Workspace(WsCmd::List { out })
+            | Cmd::Op(OpCmd::Log { out, .. }) => out,
+            _ => return false,
+        };
+        out.json
+    }
+}
+
 #[derive(Subcommand, Debug)]
 pub enum TagCmd {
     /// List tags.
-    List,
+    List {
+        #[command(flatten)]
+        out: JsonOut,
+    },
     /// Create or move a tag.
     Set {
         /// Tag name.
@@ -499,7 +542,10 @@ pub enum SecretCmd {
         name: String,
     },
     /// List secret names.
-    List,
+    List {
+        #[command(flatten)]
+        out: JsonOut,
+    },
     /// Delete a secret.
     Rm {
         /// Secret name.
@@ -603,7 +649,10 @@ pub enum ScopeCmd {
 #[derive(Subcommand, Debug)]
 pub enum WsCmd {
     /// List workspaces.
-    List,
+    List {
+        #[command(flatten)]
+        out: JsonOut,
+    },
     /// Create a virtual workspace (no directory is created).
     New {
         /// Workspace name.
@@ -669,6 +718,8 @@ pub enum OpCmd {
         /// Number of operations to show.
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
+        #[command(flatten)]
+        out: JsonOut,
     },
     /// Restore the repository to the state after operation ID.
     Restore {

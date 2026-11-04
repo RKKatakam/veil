@@ -2070,6 +2070,49 @@ which gives the same result. A crash between writing objects and the map
 therefore only costs recomputation. Export and import run under the
 repository lock.
 
+## 12. Read commands: one API, text or JSON (`crates/vl/src/api.rs`)
+
+The read commands (`status`, `log`, `diff`, `show`, `workspace list`,
+`tag list`, `op log`, `scan`, `secret list`) are split in two:
+
+* **A function in `api`** takes the repository context (`&Ctx`, or `&Repo`
+  where nothing else is needed) and returns a typed result: plain Rust
+  structs deriving `serde::Serialize`. It prints nothing. `vl serve --local`
+  is meant to call exactly these functions.
+* **A renderer** turns the result into text (`api::text`, the output the
+  commands always had, byte for byte; `render::one_line` delegates to it) or
+  into one JSON document (`api::emit_json`) when `--json` is given.
+
+`log` and `diff` are also lazy (`api::log_entries`, `api::file_diff` per
+change), so the text output still stops early when its reader goes away
+(`vl log | head`); `--json` collects everything into one document.
+
+**The results hold raw data**: paths, names, descriptions and file lines as
+stored. The text renderer escapes them (`render::safe`) at the last moment;
+the JSON writer relies on JSON's own escaping and additionally writes DEL,
+the C1 controls and the bidirectional overrides as `\uXXXX`, so neither
+output can drive a terminal (`api::to_json`).
+
+**Confidentiality is structural.** A result is built from the same reads
+the text output made, so it holds no more than the text shows: content this
+reader cannot decrypt becomes a `Redaction` (a reason and the text's
+message, never bytes); a description sealed for a scope the reader is not in
+becomes `null` plus a `HiddenText` naming the scope; `secret list` reads the
+vault's key set only, so a value never enters a result; scan findings carry
+the scanner's already-redacted excerpt. `crates/vl/tests/json_cli.rs` runs
+every read command on every revision as a non-member, a public-mirror
+reader and the owner, and checks no cloaked, embargoed or isolated
+plaintext, sealed description or vault value appears.
+
+**Schemas** are named `veil.<command>/<n>` in a leading `schema` field and
+documented in `docs/reference/json.md` (hand-written; `docgen` keeps it
+when it regenerates the reference). Additive changes keep the version;
+anything else bumps it. The shape tests pin every key and type, and fail if
+a key is missing from `json.md`. A failure under `--json` prints a
+`veil.error/1` document on stdout too, unless the command had already
+printed its own (`api::json_emitted`), so stdout carries at most one
+document; clap's usage errors (exit 2) stay text.
+
 ## Threat model
 
 **Protected against:**
