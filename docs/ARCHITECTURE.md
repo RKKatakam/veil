@@ -2511,6 +2511,24 @@ reads with `"snapshot": false` skip both the snapshot and `finish`, never
 write, and run in parallel. Against other processes the server is just
 another `vl`.
 
+**Bound to a repository, not to a path** (BUG-485). Opening by path every
+time means a moved repository (`mv proj proj-old`) would leave the server
+acting on whatever `proj` names next: another repository, or the nearest
+one above it. So the server records at start the `(dev, ino)` of the root
+and of `.veil`, and `repo.json`'s `repo_id`. Each request checks the two
+inodes before `Ctx::open` (opened without its snapshot), then the root
+`find_root` found, the `repo_id` and the inodes again, and only then
+snapshots; the `watch` thread checks the inodes before each read of the
+operation head, and `policy_from` is resolved only after the check. The
+accept loop checks, every second, the inodes and that
+`<root>/.veil/local/sock` *by path* is still the socket it bound (its
+`.veil/local` descriptor follows a move, so it alone cannot tell). Any
+mismatch refuses the request and stops the server, which unlinks its socket
+through that descriptor. The engine works on paths, so a directory
+descriptor cannot be threaded through it, and a server that followed its
+repository would still listen where no client looks; what remains is the
+race every `vl` process has, a move during a request.
+
 **Access control** has three layers, each sufficient against another local
 user:
 
@@ -2531,7 +2549,10 @@ started it, through the same functions, so redactions, hidden descriptions
 and the absence of secret values carry over unchanged (section 12). No
 parameter is a path except `scan`'s `policy_from`, which is canonicalised
 and must lie inside the repository, outside `.veil/`; nothing runs a
-program.
+program. No string in the params (member names included) may hold a NUL,
+which no command-line argument can (BUG-486: a NUL in a description made
+the change unpushable to a Git remote that checks objects); `api` refuses
+one in a description too (`api::check_message`).
 
 **Limits.** A request line is read up to 1 MiB without buffering more
 (`read_line`); a longer one is refused and the connection closed (after a
@@ -2541,6 +2562,21 @@ does not read its answers for 60 s is dropped; JSON nesting is bounded by
 `serde_json`'s recursion limit. A panic in a request is caught and answered
 as an internal error.
 
+Connections are bounded in time too (BUG-495): a connection must send its
+first request within 30 s, and every request must arrive within 30 s of its
+first byte (each read gets `SO_RCVTIMEO` set to what is left), or it is
+closed (with a `-32600` for a half-sent request). Between requests a client
+may stay silent, as an editor does. Each connection has a slot in a table
+(state idle, busy or evicted, `watch` subscription, last activity); when
+all 32 are taken, a newcomer takes the slot of the idle connection silent
+longest, if it has been silent 10 s and is not subscribed to `watch`: the
+slot is marked evicted under a compare-and-swap (so a request that just
+arrived keeps it) and the connection shut down. Otherwise the newcomer gets
+`-32001`, written by a thread of its own (at most 32 at once) so a client
+that reads nothing never holds up the accept loop. The three durations can
+be set in milliseconds through `VEIL_SERVE_IDLE_MS`,
+`VEIL_SERVE_REQUEST_MS` and `VEIL_SERVE_EVICT_MS` (for tests).
+
 **Lifetime.** The server holds an exclusive `flock` on
 `.veil/local/serve.lock` for its life, so a second server refuses to start,
 and a socket found at start-up is necessarily a dead server's: it is
@@ -2549,7 +2585,7 @@ is left alone. SIGINT, SIGTERM and SIGHUP write to a self-pipe watched by
 the accept loop's `poll`; the server then stops accepting, unlinks the
 socket if it is still the inode it bound, and waits up to 30 s for requests
 in flight. It also exits if its socket disappears (the repository was
-deleted).
+deleted), or if the repository is no longer at its path (see above).
 
 **Notifications.** `watch` starts a thread per subscribed connection that
 polls the operation head (one small file read) every `interval_ms` and

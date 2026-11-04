@@ -1,10 +1,11 @@
 //! `vl serve --local`.
 
 use std::{
+    io::{BufRead, BufReader, Read, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
-    process::Child,
-    time::Duration,
+    process::{Child, Command},
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -19,7 +20,11 @@ struct Server {
 
 impl Server {
     fn start(env: &Env, dir: &Path) -> Server {
-        let mut child = env.spawn(U, dir, &["serve", "--local"]);
+        Server::start_cmd(env.cmd(U, dir, &["serve", "--local"]), dir)
+    }
+
+    fn start_cmd(mut cmd: Command, dir: &Path) -> Server {
+        let mut child = cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
         let sock: PathBuf = dir.join(".veil/local/sock");
         let up = wait_for(Duration::from_secs(20), || UnixStream::connect(&sock).is_ok());
         if let Ok(Some(_)) = child.try_wait() {
@@ -27,6 +32,19 @@ impl Server {
         }
         assert!(up, "vl serve did not start");
         Server { child }
+    }
+}
+
+impl Server {
+    /// Wait up to `secs` for the server to exit on its own; its standard
+    /// error if it did.
+    fn exits_within(&mut self, secs: u64) -> Option<String> {
+        if !wait_for(Duration::from_secs(secs), || matches!(self.child.try_wait(), Ok(Some(_)))) {
+            return None;
+        }
+        let mut err = String::new();
+        self.child.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+        Some(err)
     }
 }
 
@@ -49,7 +67,6 @@ impl Drop for Server {
 /// (With nothing at the old path, the nearest enclosing repository is
 /// served.) The client cannot tell.
 #[test]
-#[ignore = "BUG-485: a moved repository's server serves whatever repository is at its old path"]
 fn a_moved_repositorys_server_never_serves_another_repository() {
     let env = Env::new();
     let proj = env.project(U, "proj", &[("old.txt", "old\n")]);
@@ -85,7 +102,6 @@ fn a_served_commit_lands_in_the_served_repository() {
 /// `nulInCommit`), and `vl git push` reports that as "has commits you don't
 /// have". A message the CLI could not have given should be refused.
 #[test]
-#[ignore = "BUG-486: serve records a NUL byte in a description that the CLI cannot give"]
 fn serve_refuses_a_nul_in_a_message() {
     let env = Env::new();
     let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
@@ -94,4 +110,192 @@ fn serve_refuses_a_nul_in_a_message() {
     drop(server);
     let log = env.stdout(U, &proj, &["--no-snapshot", "log", "--json"]);
     assert!(!out.status.success() && !log.contains("\\u0000"), "a NUL was recorded: {}\n{log}", text(&out));
+}
+
+/// BUG-485, the other ways a path stops naming the server's repository:
+/// the server stops (and says why) within its once-a-second check, rather
+/// than serve whatever the path names now.
+#[test]
+fn a_server_stops_when_its_repository_or_socket_moves() {
+    let env = Env::new();
+    // The repository moved, nothing put in its place: the enclosing
+    // directory is not served.
+    let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
+    let mut server = Server::start(&env, &proj);
+    std::fs::rename(&proj, env.root.join("moved")).unwrap();
+    let err = server.exits_within(10).expect("the server kept running after its repository moved");
+    assert!(err.contains("moved or replaced"), "{err}");
+
+    // `.veil/local` moved inside the repository: the socket clients look
+    // for is gone, though the server's directory handle still sees it.
+    let proj = env.project(U, "proj2", &[("a.txt", "a\n")]);
+    let mut server = Server::start(&env, &proj);
+    std::fs::rename(proj.join(".veil/local"), proj.join(".veil/local-old")).unwrap();
+    let err = server.exits_within(10).expect("the server kept running after its socket moved");
+    assert!(err.contains("socket"), "{err}");
+
+    // `.veil` replaced in place by another repository's.
+    let proj = env.project(U, "proj3", &[("a.txt", "a\n")]);
+    let other = env.project(U, "other", &[("b.txt", "b\n")]);
+    let mut server = Server::start(&env, &proj);
+    std::fs::rename(proj.join(".veil"), env.root.join("veil-old")).unwrap();
+    std::fs::rename(other.join(".veil"), proj.join(".veil")).unwrap();
+    let err = server.exits_within(10).expect("the server kept running after .veil was replaced");
+    assert!(err.contains("moved or replaced"), "{err}");
+    // And it did not leave its socket behind for a new server to trip on.
+    let restarted = Server::start(&env, &proj);
+    drop(restarted);
+}
+
+/// BUG-485: a request that arrives before the once-a-second check is
+/// refused by the request's own check, and stops the server.
+#[test]
+fn a_request_after_a_move_is_refused_at_once() {
+    let env = Env::new();
+    let proj = env.project(U, "proj", &[("old.txt", "old\n")]);
+    let mut server = Server::start(&env, &proj);
+    // A connection made before the move goes with the server.
+    let mut c = UnixStream::connect(proj.join(".veil/local/sock")).unwrap();
+    std::fs::rename(&proj, env.root.join("proj-old")).unwrap();
+    let newcomer = env.project(U, "proj", &[("new.txt", "new\n")]);
+    c.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"commit\",\"params\":{\"message\":\"meant for old\"}}\n").unwrap();
+    let mut answer = String::new();
+    BufReader::new(&c).read_line(&mut answer).unwrap();
+    assert!(answer.contains("\"error\"") && answer.contains("moved or replaced"), "{answer}");
+    assert!(server.exits_within(10).is_some(), "the server kept running");
+    let log = env.stdout(U, &newcomer, &["--no-snapshot", "log"]);
+    assert!(!log.contains("meant for old"), "{log}");
+}
+
+/// A server whose connection timeouts are `idle`, `request` and `evict`
+/// milliseconds.
+fn start_with_timeouts(env: &Env, dir: &Path, idle: u64, request: u64, evict: u64) -> Server {
+    let mut cmd = env.cmd(U, dir, &["serve", "--local"]);
+    cmd.env("VEIL_SERVE_IDLE_MS", idle.to_string())
+        .env("VEIL_SERVE_REQUEST_MS", request.to_string())
+        .env("VEIL_SERVE_EVICT_MS", evict.to_string());
+    Server::start_cmd(cmd, dir)
+}
+
+fn status_works(sock: &Path) -> bool {
+    let Ok(mut c) = UnixStream::connect(sock) else { return false };
+    c.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    if c.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server.info\"}\n").is_err() {
+        return false;
+    }
+    let mut line = String::new();
+    BufReader::new(&c).read_line(&mut line).is_ok() && line.contains("\"result\"")
+}
+
+/// BUG-495: 32 connections that never send (and one that sends half a
+/// request) used to hold every slot forever, so the user's editor got
+/// `-32001 too many clients` until the server restarted. With the default
+/// timeouts, a newcomer takes the slot of a connection silent for 10 s.
+#[test]
+fn silent_connections_never_lock_other_clients_out() {
+    let env = Env::new();
+    let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
+    let server = Server::start(&env, &proj);
+    let sock = proj.join(".veil/local/sock");
+    let mut hogs: Vec<UnixStream> = (0..31).map(|_| UnixStream::connect(&sock).unwrap()).collect();
+    let mut half = UnixStream::connect(&sock).unwrap();
+    half.write_all(b"{\"jsonrpc\":\"2.0\",").unwrap();
+    hogs.push(half);
+    // Full: a newcomer is told so while the others have been quiet briefly.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!status_works(&sock), "the 33rd client was served at once");
+    // Past the eviction age, it is served.
+    let start = Instant::now();
+    assert!(wait_for(Duration::from_secs(25), || status_works(&sock)), "a newcomer is still locked out");
+    assert!(start.elapsed() < Duration::from_secs(20));
+    drop(server);
+    drop(hogs);
+}
+
+/// BUG-495: a connection that never asks anything is closed after the
+/// first-request timeout, and half a request after the request timeout
+/// (told why); a connection between requests stays open.
+#[test]
+fn idle_and_incomplete_connections_time_out() {
+    let env = Env::new();
+    let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
+    let server = start_with_timeouts(&env, &proj, 400, 400, 60_000);
+    let sock = proj.join(".veil/local/sock");
+    let closed = |c: &mut UnixStream| {
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut out = String::new();
+        let _ = c.read_to_string(&mut out);
+        out
+    };
+    let mut silent = UnixStream::connect(&sock).unwrap();
+    let start = Instant::now();
+    assert_eq!(closed(&mut silent), "", "a silent connection is closed without a word");
+    assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
+
+    let mut half = UnixStream::connect(&sock).unwrap();
+    half.write_all(b"{\"jsonrpc\":\"2.0\",").unwrap();
+    let out = closed(&mut half);
+    assert!(out.contains("-32600") && out.contains("incomplete"), "{out}");
+
+    // After its first request, a client may stay quiet.
+    let mut kept = UnixStream::connect(&sock).unwrap();
+    kept.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server.info\"}\n").unwrap();
+    let mut r = BufReader::new(kept.try_clone().unwrap());
+    let mut line = String::new();
+    r.read_line(&mut line).unwrap();
+    assert!(line.contains("\"result\""), "{line}");
+    std::thread::sleep(Duration::from_millis(1500));
+    kept.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"server.info\"}\n").unwrap();
+    line.clear();
+    r.read_line(&mut line).unwrap();
+    assert!(line.contains("\"result\""), "a quiet client between requests was cut off: {line}");
+    drop(server);
+}
+
+/// BUG-495: when the server is full, the newcomer takes the slot of the
+/// connection silent longest, never one that is subscribed to `watch`
+/// or one that spoke recently.
+#[test]
+fn a_full_server_evicts_the_quietest_idle_client_only() {
+    let env = Env::new();
+    let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
+    let server = start_with_timeouts(&env, &proj, 60_000, 60_000, 1000);
+    let sock = proj.join(".veil/local/sock");
+    let ask = |c: &mut UnixStream, line: &str| {
+        c.write_all(format!("{line}\n").as_bytes()).unwrap();
+        let mut r = BufReader::new(c.try_clone().unwrap());
+        let mut out = String::new();
+        r.read_line(&mut out).unwrap();
+        assert!(out.contains("\"result\""), "{out}");
+    };
+    // 31 watchers and one plain client, all quiet.
+    let mut watchers: Vec<UnixStream> = (0..31)
+        .map(|_| {
+            let mut c = UnixStream::connect(&sock).unwrap();
+            ask(&mut c, r#"{"jsonrpc":"2.0","id":1,"method":"watch","params":{"interval_ms":60000}}"#);
+            c
+        })
+        .collect();
+    let mut plain = UnixStream::connect(&sock).unwrap();
+    ask(&mut plain, r#"{"jsonrpc":"2.0","id":1,"method":"server.info"}"#);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(status_works(&sock), "the newcomer was refused");
+    // The plain client lost its slot; the watchers kept theirs.
+    plain.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut buf = [0u8; 1];
+    assert!(matches!(plain.read(&mut buf), Ok(0)), "the quiet client was not the one evicted");
+    // Watchers and a client that just spoke: a newcomer is told the
+    // server is full.
+    let mut recent = UnixStream::connect(&sock).unwrap();
+    ask(&mut recent, r#"{"jsonrpc":"2.0","id":1,"method":"server.info"}"#);
+    let mut c = UnixStream::connect(&sock).unwrap();
+    let mut out = String::new();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let _ = c.read_to_string(&mut out);
+    assert!(out.contains("-32001"), "{out}");
+    for w in &mut watchers {
+        w.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        assert!(w.read(&mut buf).is_err(), "a watcher was cut off");
+    }
+    drop(server);
 }

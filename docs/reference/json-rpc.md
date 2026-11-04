@@ -202,9 +202,9 @@ interleave within a line.
 | Code | Meaning |
 |---|---|
 | -32700 | Parse error: the line is not one JSON value in UTF-8 (also: nested too deeply) |
-| -32600 | Invalid request: not a request object, `jsonrpc` is not `"2.0"`, `method` not a string, a bad `id`, an unknown member, an empty or too large batch, or a line over 1 MiB (the server then closes the connection) |
+| -32600 | Invalid request: not a request object, `jsonrpc` is not `"2.0"`, `method` not a string, a bad `id`, an unknown member, an empty or too large batch, or a line over 1 MiB or not finished within 30 seconds (in these two cases the server then closes the connection) |
 | -32601 | No such method |
-| -32602 | Invalid parameters: positional parameters, an unknown or mistyped parameter, a missing required one, `rev` together with `from`/`to`, a `policy_from` outside the repository |
+| -32602 | Invalid parameters: positional parameters, an unknown or mistyped parameter, a missing required one, `rev` together with `from`/`to`, a `policy_from` outside the repository, a string holding a NUL character (no command-line argument can) |
 | -32603 | Internal error (a bug; the server keeps running and logs it on its standard error) |
 | -32000 | The command failed. `message` is what `vl` prints after `error:`, and `data` is its [`veil.error/1`](json.md#veilerror1) document |
 | -32001 | Too many clients: sent instead of serving the connection, which is then closed |
@@ -245,6 +245,18 @@ interleave within a line.
   that runs a program (`vl run`, `vl ws exec` are not served).
 * **Limits:** a request line is at most 1 MiB; at most 32 clients at once; a
   client that does not read its answers for 60 seconds is disconnected.
+* **Timeouts:** a connection that sends no request within 30 seconds is
+  closed, and so is one whose request line is not complete 30 seconds after
+  its first byte (answered with `-32600` first). Between requests a client
+  may stay quiet as long as it likes, unless the server is full: then a new
+  client takes the slot of the connection that has been quiet longest, if
+  that is at least 10 seconds and it is not subscribed to `watch`, and that
+  connection is closed. A client that keeps a connection open should
+  reconnect when it is closed. (`VEIL_SERVE_IDLE_MS`,
+  `VEIL_SERVE_REQUEST_MS` and `VEIL_SERVE_EVICT_MS` in the server's
+  environment set the three durations, in milliseconds, for tests.)
+* **Strings** in the parameters cannot hold a NUL character, as no
+  command-line argument can.
 
 ## Lifetime
 
@@ -255,7 +267,12 @@ interleave within a line.
   refuses to start.
 * On SIGINT (Ctrl-C), SIGTERM or SIGHUP the server stops accepting, removes
   its socket, lets requests in flight finish (up to 30 seconds) and exits 0.
-  If its socket is removed or replaced underneath it, it exits too.
+  If its socket is removed, moved or replaced underneath it, it exits too.
+* The server serves the repository it started in, not a path. If the
+  repository is moved or renamed, or another one is put in its place
+  (`.veil` included), the server refuses the next request with `-32000`
+  ("… was moved or replaced …"), stops within a second, and removes its
+  socket. Start it again where the repository is now.
 
 ## `vl serve --call`
 
