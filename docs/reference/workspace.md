@@ -92,6 +92,8 @@ Run a command in a workspace's sandbox and record the result.
 
 Each workspace keeps one sandbox, .veil/local/sandboxes/NAME/files, between runs: a run rewrites only what changed since the last one (copy-on-write clones where the filesystem has them), and files the command leaves that are not recorded (ignored build output) stay for the next run. A second run in the same workspace waits for the first. With --ephemeral, a one-shot workspace on REV runs in a throwaway directory instead.
 
+With --only, the sandbox holds just the given files and directories (and .veilpolicy): everything else is recorded exactly as the workspace has it, and files the command writes elsewhere are not recorded (a warning lists them) and are removed from the sandbox.
+
 ```text
 vl workspace exec [OPTIONS] [NAME] -- <COMMAND>...
 ```
@@ -111,6 +113,7 @@ Options:
 | `-r, --rev <REV>` | Base revision for --ephemeral (default: `@-`) |
 | `-m, --message <MESSAGE>` | Description to record (default: empty) |
 | `--with-isolated` | Copy local-only (isolated) files such as .env into the sandbox for this run (they are taken out again afterwards) |
+| `--only <PATH>` | Sparse sandbox: hold only these paths (files or directories of the workspace, relative to the current directory) |
 
 ## `vl workspace cat`
 

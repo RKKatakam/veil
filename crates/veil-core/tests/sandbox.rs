@@ -240,7 +240,6 @@ fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
 /// entry without recording what it verified. A sandbox (or a fresh clone)
 /// with many cloaked files pays for them on every run.
 #[test]
-#[ignore = "BUG-300: unchanged cloaked files are re-read on every snapshot after a checkout"]
 fn unchanged_cloaked_files_are_cached_after_a_checkout() {
     let mut repo = repo();
     let overlay = repo.workspace_overlay(WS).unwrap();
@@ -263,4 +262,227 @@ fn unchanged_cloaked_files_are_cached_after_a_checkout() {
         hashed.push(out.report.hashed);
     }
     assert_eq!(hashed[2], 0, "the cloaked file is read on every snapshot: {hashed:?}");
+}
+
+// ---- sparse sandboxes -------------------------------------------------------
+
+/// Paths of the sparse property test (no file is another's directory).
+/// `g/` is cloaked.
+const SPARSE_PATHS: &[&str] = &["a", "b/c", "b/d", "b/e/f", "b/e/g", "g/h", "g/i/j", "k.bin"];
+/// Candidate `--only` paths (only those in the workspace's tree are used).
+const SPARSE_ONLY: &[&str] = &["a", "b", "b/d", "b/e", "b/e/f", "g", "g/i", "k.bin"];
+const SPARSE_POLICY: &[u8] = b"g/ cloak team\n";
+
+use std::collections::BTreeMap;
+use veil_core::vfs::{SparseSet, SparseView};
+
+fn sparse_content(i: usize, n: u8) -> Vec<u8> {
+    format!("{}={n}\n", SPARSE_PATHS[i]).into_bytes()
+}
+
+/// Every file of `tree` with its (decrypted) content.
+fn flatten(repo: &Repo, tree: &ObjectId) -> BTreeMap<String, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    let mut stack = vec![(VPath::root(), *tree)];
+    while let Some((dir, id)) = stack.pop() {
+        for e in &repo.store().tree(&id).unwrap().entries {
+            let p = dir.join(&e.name);
+            match e.kind {
+                veil_core::object::EntryKind::Dir => stack.push((p, e.id)),
+                _ => {
+                    out.insert(p.as_str().to_string(), repo.store().read_entry(e).unwrap());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Every file under `dir` on disk, relative to it.
+fn flatten_dir(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+    walk(dir)
+        .into_iter()
+        .map(|f| (f.strip_prefix(dir).unwrap().to_str().unwrap().to_string(), std::fs::read(&f).unwrap()))
+        .collect()
+}
+
+fn sparse_repo(files: &[(usize, u8)]) -> Repo {
+    let mut repo = repo();
+    let overlay = repo.workspace_overlay(WS).unwrap();
+    overlay.write(&p(".veilpolicy"), SPARSE_POLICY).unwrap();
+    for &(i, n) in files {
+        overlay.write(&p(SPARSE_PATHS[i]), &sparse_content(i, n)).unwrap();
+    }
+    repo.snapshot_workspace(WS, &overlay).unwrap();
+    repo
+}
+
+fn sparse_op() -> impl Strategy<Value = Op> {
+    prop_oneof![
+        (0..SPARSE_PATHS.len(), 0u8..4).prop_map(|(i, n)| Op::Write(i, n)),
+        (0..SPARSE_PATHS.len()).prop_map(Op::Remove),
+        (0..SPARSE_PATHS.len(), 0u8..4).prop_map(|(i, n)| Op::Sneaky(i, n)),
+    ]
+}
+
+fn apply_sparse_command(dir: &Path, ops: &[Op], model: &mut BTreeMap<String, Vec<u8>>) {
+    for o in ops {
+        match *o {
+            Op::Write(i, n) => {
+                let f = dir.join(SPARSE_PATHS[i]);
+                std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+                std::fs::write(&f, sparse_content(i, n)).unwrap();
+                model.insert(SPARSE_PATHS[i].to_string(), sparse_content(i, n));
+            }
+            Op::Remove(i) => {
+                let _ = std::fs::remove_file(dir.join(SPARSE_PATHS[i]));
+                model.remove(SPARSE_PATHS[i]);
+            }
+            Op::Sneaky(i, n) => {
+                let f = dir.join(SPARSE_PATHS[i]);
+                let Ok(m) = std::fs::metadata(&f) else { continue };
+                let mtime = m.modified().unwrap();
+                std::fs::write(&f, sparse_content(i, n)).unwrap();
+                std::fs::File::options().write(true).open(&f).unwrap().set_modified(mtime).unwrap();
+                model.insert(SPARSE_PATHS[i].to_string(), sparse_content(i, n));
+            }
+        }
+    }
+}
+
+fn apply_sparse_workspace(repo: &mut Repo, ops: &[Op]) {
+    let overlay = repo.workspace_overlay(WS).unwrap();
+    for o in ops {
+        match *o {
+            Op::Write(i, n) | Op::Sneaky(i, n) => overlay.write(&p(SPARSE_PATHS[i]), &sparse_content(i, n)).unwrap(),
+            Op::Remove(i) => {
+                if overlay.metadata(&p(SPARSE_PATHS[i])).unwrap().is_some() {
+                    overlay.remove_file(&p(SPARSE_PATHS[i])).unwrap();
+                }
+            }
+        }
+    }
+    repo.snapshot_workspace(WS, &overlay).unwrap();
+}
+
+/// The `--only` set a run uses: the chosen candidates that the tree has
+/// (as the CLI refuses the others); `None` (the whole tree) if none.
+fn choose_set(repo: &Repo, tree: &ObjectId, chosen: &[usize]) -> Option<SparseSet> {
+    let paths = chosen
+        .iter()
+        .map(|&i| p(SPARSE_ONLY[i]))
+        .filter(|vp| veil_core::tree::lookup(repo.store(), tree, vp).unwrap().is_some());
+    SparseSet::new(paths)
+}
+
+fn in_set(set: Option<&SparseSet>, path: &str) -> bool {
+    set.is_none_or(|s| s.contains(&p(path)))
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 32, ..ProptestConfig::default() })]
+
+    /// Random workspaces, random `--only` sets (changing from run to run)
+    /// and random commands writing inside and outside the set: the sandbox
+    /// holds exactly the set's files, the recorded tree is the workspace's
+    /// with exactly the edits inside the set applied, and what was written
+    /// outside is reported and removed.
+    #[test]
+    fn sparse_sandboxes_record_the_workspace_plus_exactly_the_edits_inside(
+        initial in prop::collection::vec((0..SPARSE_PATHS.len(), 0u8..4), 1..8),
+        runs in prop::collection::vec(
+            (
+                prop::collection::vec(sparse_op(), 0..3),
+                prop::collection::vec(0..SPARSE_ONLY.len(), 0..3),
+                prop::collection::vec(sparse_op(), 0..6),
+            ),
+            1..5,
+        )
+    ) {
+        let mut repo = sparse_repo(&initial);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("files");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut m = Manifest::new(WS);
+        let mut cache = StatCache::new();
+        for (ws_ops, chosen, cmd_ops) in runs {
+            apply_sparse_workspace(&mut repo, &ws_ops);
+            let synced = wc_tree(&repo);
+            let set = choose_set(&repo, &synced, &chosen);
+            let fs = SandboxFs::new(&dir, None, true);
+            let r = sandbox::sync_to(&repo, &fs, &mut m, &synced, set.as_ref(), &mut cache).unwrap();
+            sandbox::vouch_written(repo.store(), &fs, &synced, &r, &mut cache, VouchWait::Always).unwrap();
+            prop_assert!(r.kept_local.is_empty() && r.obstructed.is_empty(), "{:?}", r);
+            // The sandbox holds exactly the set's files.
+            let ws = flatten(&repo, &synced);
+            let mut model: BTreeMap<String, Vec<u8>> = ws.iter().filter(|(k, _)| in_set(set.as_ref(), k)).map(|(k, v)| (k.clone(), v.clone())).collect();
+            prop_assert_eq!(&flatten_dir(&dir), &model);
+
+            apply_sparse_command(&dir, &cmd_ops, &mut model);
+            let view = set.as_ref().map(|s| SparseView::new(&fs, repo.store().clone(), synced, s));
+            let rec: &dyn StorageBackend = match &view { Some(v) => v, None => &fs };
+            let out = repo
+                .snapshot_workspace_with(WS, rec, SnapshotOptions { cache: Some(&mut cache), expected_wc: Some(repo.workspace_wc(WS).unwrap()), ..Default::default() })
+                .unwrap();
+            prop_assert!(!out.superseded);
+            let recorded = repo.snapshot(&out.snapshot).unwrap().tree;
+            // The workspace, with exactly the edits inside the set.
+            let mut expected: BTreeMap<String, Vec<u8>> = ws.iter().filter(|(k, _)| !in_set(set.as_ref(), k)).map(|(k, v)| (k.clone(), v.clone())).collect();
+            expected.extend(model.iter().filter(|(k, _)| in_set(set.as_ref(), k)).map(|(k, v)| (k.clone(), v.clone())));
+            prop_assert_eq!(&flatten(&repo, &recorded), &expected);
+            // Cloaked stays cloaked, inside and out.
+            for (path, _) in expected.iter().filter(|(k, _)| k.starts_with("g/")) {
+                let e = veil_core::tree::lookup(repo.store(), &recorded, &p(path)).unwrap().unwrap();
+                prop_assert!(!e.visibility.is_public(), "{} lost its cloak", path);
+            }
+            m.tree = Some(recorded);
+            if let Some(set) = &set {
+                let strays = sandbox::strays(&fs, set, &veil_core::policy::Policy::load(&fs).unwrap()).unwrap();
+                let want: Vec<VPath> = model.keys().filter(|k| !set.contains(&p(k))).map(|k| p(k)).collect();
+                prop_assert_eq!(&strays, &want);
+                prop_assert!(sandbox::remove_strays(&fs, set, &strays, &mut cache).is_empty());
+                model.retain(|k, _| set.contains(&p(k)));
+            }
+            prop_assert_eq!(&flatten_dir(&dir), &model);
+        }
+    }
+}
+
+#[test]
+fn a_sparse_run_reuses_everything_outside_the_set_without_reading_it() {
+    let mut repo = repo();
+    let overlay = repo.workspace_overlay(WS).unwrap();
+    for d in 0..20 {
+        for i in 0..20 {
+            overlay.write(&p(&format!("d{d}/f{i}.rs")), format!("fn f{d}_{i}() {{}}\n").as_bytes()).unwrap();
+        }
+    }
+    repo.snapshot_workspace(WS, &overlay).unwrap();
+    let synced = wc_tree(&repo);
+    let tmp = tempfile::tempdir().unwrap();
+    let fs = SandboxFs::new(tmp.path(), None, true);
+    let mut m = Manifest::new(WS);
+    let mut cache = StatCache::new();
+    let set = SparseSet::new([p("d3")]).unwrap();
+    let r = sandbox::sync_to(&repo, &fs, &mut m, &synced, Some(&set), &mut cache).unwrap();
+    assert_eq!(r.written, 20, "only the set is written");
+    sandbox::vouch_written(repo.store(), &fs, &synced, &r, &mut cache, VouchWait::Always).unwrap();
+    std::fs::write(tmp.path().join("d3/f0.rs"), b"edited\n").unwrap();
+    let view = SparseView::new(&fs, repo.store().clone(), synced, &set);
+    let out = repo
+        .snapshot_workspace_with(WS, &view, SnapshotOptions { cache: Some(&mut cache), ..Default::default() })
+        .unwrap();
+    assert!(out.changed);
+    assert_eq!(out.report.hashed, 1, "only the edited file is read");
+    let tree = repo.snapshot(&out.snapshot).unwrap().tree;
+    assert_eq!(flatten(&repo, &tree).len(), 400);
+    m.tree = Some(tree);
+    // Widening to the whole tree writes the rest, and leaves the set alone.
+    let r = sandbox::sync_to(&repo, &fs, &mut m, &tree, None, &mut cache).unwrap();
+    assert_eq!((r.written, r.removed), (380, 0));
+    assert_eq!(std::fs::read(tmp.path().join("d3/f0.rs")).unwrap(), b"edited\n");
+    // And narrowing removes it again.
+    let r = sandbox::sync_to(&repo, &fs, &mut m, &tree, Some(&SparseSet::new([p("d7/f1.rs")]).unwrap()), &mut cache).unwrap();
+    assert_eq!((r.written, r.removed), (0, 399));
+    assert_eq!(walk(tmp.path()).len(), 1);
 }

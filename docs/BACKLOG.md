@@ -10,7 +10,6 @@ fixed**. Severity: high / medium / low.
 - **Copy-on-write file clones for project-directory checkouts** (`vl ws
   switch`, `vl edit`): `ws exec` sandboxes clone already
   (`StorageBackend::clone_known`); the project directory does not.
-- **Sparse sandboxes:** `vl ws exec --only src/ tests/`.
 - **Virtual filesystem working copy** (FUSE/NFS mount of `TreeView` +
   overlay): instant workspaces with real files, edits only use space.
 - **Scale benchmark** at 1 GB and ~5 GB (init, status, commit, gc, push,

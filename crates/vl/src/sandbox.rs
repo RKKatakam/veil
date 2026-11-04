@@ -47,11 +47,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use veil_core::{
     builder::{BuildReport, INJECTED_RULE},
     checkout::CheckoutReport,
+    policy::Policy,
     sandbox::{self as core, Loaded, Manifest, SandboxPaths},
     statcache::StatCache,
-    vfs::{private_dir, CloneSources, SandboxFs, SandboxLock, StorageBackend},
+    vfs::{private_dir, restrict as restrict_tree, CloneSources, SandboxFs, SandboxLock, SparseSet, SparseView, StorageBackend},
     workspace::SnapshotOptions,
-    Repo, VPath,
+    ObjectId, Repo, VPath,
 };
 
 use crate::{
@@ -75,7 +76,57 @@ pub struct Exec<'a> {
     pub rev: &'a str,
     pub message: &'a str,
     pub with_isolated: bool,
+    /// `--only`: the paths of a sparse sandbox, as the user gave them.
+    pub only: &'a [String],
     pub command: &'a [String],
+}
+
+/// The `--only` paths as a set of `tree` (`what` names it in errors):
+/// repository paths by the CLI's rules (relative to the current directory,
+/// never outside the repository), each naming something in `tree`. `None`
+/// for none, or for one that is the whole tree.
+fn sparse_set(ctx: &Ctx, only: &[String], tree: &ObjectId, what: &str) -> Result<Option<SparseSet>> {
+    let mut paths = Vec::new();
+    for user in only {
+        let p = ctx.repo_path(user).with_context(|| format!("--only {}", safe(user)))?;
+        if !p.is_root() && veil_core::tree::lookup(ctx.repo.store(), tree, &p)?.is_none() {
+            bail!(
+                "--only {}: there is no file or directory {} in {what}",
+                safe(user),
+                safe(p.as_str())
+            );
+        }
+        paths.push(p);
+    }
+    Ok(SparseSet::new(paths))
+}
+
+/// How a sparse set is shown: `src, tests/unit.rs`.
+fn show_set(set: Option<&SparseSet>) -> String {
+    match set {
+        Some(s) => s.paths().iter().map(|p| safe(p.as_str()).into_owned()).collect::<Vec<_>>().join(", "),
+        None => "the whole tree".into(),
+    }
+}
+
+/// Say which files the command wrote outside the `--only` paths (they are
+/// not recorded).
+fn warn_strays(set: &SparseSet, strays: &[VPath], removed: bool) {
+    if strays.is_empty() {
+        return;
+    }
+    const SHOWN: usize = 20;
+    let mut list: Vec<String> = strays.iter().take(SHOWN).map(|p| safe(p.as_str()).into_owned()).collect();
+    if strays.len() > SHOWN {
+        list.push(format!("and {} more", strays.len() - SHOWN));
+    }
+    warn(&format!(
+        "not recorded: {} file(s) written outside --only {}{}: {}",
+        strays.len(),
+        show_set(Some(set)),
+        if removed { " (removed from the sandbox)" } else { "" },
+        list.join(", ")
+    ));
 }
 
 pub fn exec(ctx: &mut Ctx, a: &Exec<'_>) -> Result<ExitCode> {
@@ -196,6 +247,8 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>) -> Result<ExitCode> 
     // The workspace may have moved, or gone, while we waited.
     ctx.repo.reload()?;
     let base = ctx.repo.workspace_wc(name)?;
+    let synced = ctx.repo.snapshot(&base)?.tree;
+    let set = sparse_set(ctx, a.only, &synced, &format!("workspace '{}'", safe(name)))?;
 
     let loaded = paths.load_manifest();
     let (mut m, mut cache) = match core::rebuild_reason(&ctx.repo, &paths, name, &loaded) {
@@ -227,18 +280,28 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>) -> Result<ExitCode> 
         Some(CloneSources::new((*ctx.fs).clone(), ctx.stat_cache().clone())),
         true,
     );
-    let synced = ctx.repo.snapshot(&base)?.tree;
-    let (co, injection) = {
+    let was = m.tree.map(|_| m.only.clone());
+    let (co, kept, injection) = {
         let _umask = PrivateUmask::set();
         private_dir(&paths.files)?;
-        let co = core::sync(&ctx.repo, &fs, &mut m, &synced, &mut cache)?;
+        let co = core::sync_to(&ctx.repo, &fs, &mut m, &synced, set.as_ref(), &mut cache)?;
         core::vouch_written(ctx.repo.store(), &fs, &synced, &co, &mut cache, core::VouchWait::IfCheaper)?;
+        // Files outside the set before the command runs are not its output:
+        // edits made in the sandbox by hand, or kept by a narrower set
+        // because they held something else. They stay (unrecorded).
+        let kept = match &set {
+            Some(s) => core::strays(&fs, s, &Policy::load(&fs)?)?,
+            None => Vec::new(),
+        };
         let injection = match a.with_isolated {
             true => Some(core::inject(&fs, &vault_files(&ctx.repo)?)?),
             false => None,
         };
-        (co, injection)
+        (co, kept, injection)
     };
+    if was.as_ref() != Some(&m.only) && (set.is_some() || was.is_some()) {
+        eprintln!("{} sandbox holds {}", dim("sparse:"), show_set(set.as_ref()));
+    }
     print_sync(&co, &fs);
     if let Some(inj) = &injection {
         for (p, why) in &inj.skipped {
@@ -268,9 +331,15 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>) -> Result<ExitCode> 
     };
 
     let injected = injection.as_ref().map(|i| &i.secrets);
+    // Sparse: everything outside the set is recorded as `synced` has it.
+    let view = set.as_ref().map(|s| SparseView::new(&fs, ctx.repo.store().clone(), synced, s));
+    let recorded_fs: &dyn StorageBackend = match &view {
+        Some(v) => v,
+        None => &fs,
+    };
     let out = ctx.repo.snapshot_workspace_with(
         name,
-        &fs,
+        recorded_fs,
         SnapshotOptions {
             cache: Some(&mut cache),
             injected,
@@ -284,7 +353,7 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>) -> Result<ExitCode> 
         // sandbox now would revert what they did. Keep the result as a
         // change of its own, on top of what the command started from.
         let desc = if a.message.is_empty() { "`vl ws exec` result" } else { a.message };
-        let (id, report) = ctx.repo.commit_fs_as_child_injected(base, &fs, desc, injected)?;
+        let (id, report) = ctx.repo.commit_fs_as_child_injected(base, recorded_fs, desc, injected)?;
         let change = ctx.repo.snapshot(&id)?.change_id.short();
         warn(&format!(
             "workspace '{}' moved while the command ran; its result was saved as change {change} on top of the snapshot it started from, \
@@ -328,16 +397,60 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>) -> Result<ExitCode> 
         }
     }
 
+    // Quarantined files of earlier runs that are now outside the set stay
+    // (they are in no snapshot), and so does `vl ws rm`'s guard for them.
+    let mut quarantined: Vec<String> = match &set {
+        Some(set) => m
+            .quarantined
+            .iter()
+            .filter(|q| VPath::new(q).is_ok_and(|p| !set.contains(&p) && fs.metadata(&p).ok().flatten().is_some()))
+            .cloned()
+            .collect(),
+        None => Vec::new(),
+    };
+    if let Some(set) = &set {
+        // What the command wrote outside the set is not the workspace's.
+        let policy = Policy::load(&fs)?;
+        let (strays, left): (Vec<VPath>, Vec<VPath>) = core::strays(&fs, set, &policy)?
+            .into_iter()
+            .filter(|p| !quarantined.iter().any(|q| q == p.as_str()))
+            .partition(|p| !kept.contains(p));
+        if !left.is_empty() {
+            let shown: Vec<String> = left.iter().take(20).map(|p| safe(p.as_str()).into_owned()).collect();
+            warn(&format!(
+                "not recorded: {} file(s) in the sandbox outside --only {} that the command did not write (kept; a run whose paths hold them records them): {}",
+                left.len(),
+                show_set(Some(set)),
+                shown.join(", ")
+            ));
+        }
+        let failed = core::remove_strays(&fs, set, &strays, &mut cache);
+        // An injected file outside the set, put back as recorded, is ours.
+        let by_command: Vec<VPath> = strays
+            .into_iter()
+            .filter(|p| !injection.as_ref().is_some_and(|i| i.paths.contains(p)))
+            .collect();
+        warn_strays(set, &by_command, true);
+        for (p, why) in &failed {
+            warn(&format!(
+                "could not remove {} from the sandbox ({why}); it is outside --only and is not recorded",
+                safe(p.as_str())
+            ));
+        }
+    }
+
     m.tree = Some(recorded_tree);
     // After a superseded run the files are the saved change's: the next run
     // syncs them to the workspace.
     m.snapshot = Some(if out.superseded { recorded } else { ctx.repo.workspace_wc(name)? });
-    m.quarantined = report
-        .quarantined
-        .iter()
-        .filter(|(_, f)| !f.iter().any(|f| f.rule == INJECTED_RULE))
-        .map(|(p, _)| p.as_str().to_string())
-        .collect();
+    quarantined.extend(
+        report
+            .quarantined
+            .iter()
+            .filter(|(_, f)| !f.iter().any(|f| f.rule == INJECTED_RULE))
+            .map(|(p, _)| p.as_str().to_string()),
+    );
+    m.quarantined = quarantined;
     m.running = None;
     paths.save_manifest(&m)?;
     if let Err(e) = paths.save_cache(&mut cache) {
@@ -491,12 +604,17 @@ impl Drop for Interrupts {
 
 fn exec_ephemeral(ctx: &mut Ctx, a: &Exec<'_>) -> Result<ExitCode> {
     let base_snapshot = ctx.rev(a.rev)?;
+    let tree = ctx.repo.snapshot(&base_snapshot)?.tree;
+    let set = sparse_set(ctx, a.only, &tree, &safe(a.rev))?;
     let sb = Sandbox::create("ephemeral")?;
     let dir = sb.path().to_path_buf();
     let sandbox = SandboxFs::new(&dir, None, false);
     let result = (|| -> Result<i32> {
-        let tree = ctx.repo.snapshot(&base_snapshot)?.tree;
-        ctx.repo.checkout_tree(&sandbox, None, &tree)?;
+        let to = match &set {
+            Some(s) => restrict_tree(ctx.repo.store(), &tree, s)?,
+            None => tree,
+        };
+        ctx.repo.checkout_tree(&sandbox, None, &to)?;
         let mut injected = None;
         if a.with_isolated {
             let files = vault_files(&ctx.repo)?;
@@ -512,9 +630,25 @@ fn exec_ephemeral(ctx: &mut Ctx, a: &Exec<'_>) -> Result<ExitCode> {
         sb.make_private()?;
         eprintln!("{} {} in {}", dim("running"), a.command.join(" "), dir.display());
         let code = run_command(&dir, &dir, a.command)?;
+        let view = set.as_ref().map(|s| SparseView::new(&sandbox, ctx.repo.store().clone(), tree, s));
+        let recorded_fs: &dyn StorageBackend = match &view {
+            Some(v) => v,
+            None => &sandbox,
+        };
         let (id, report) = ctx
             .repo
-            .commit_fs_as_child_injected(base_snapshot, &sandbox, a.message, injected.as_ref())?;
+            .commit_fs_as_child_injected(base_snapshot, recorded_fs, a.message, injected.as_ref())?;
+        if let Some(set) = &set {
+            let injected_paths: Vec<VPath> = match a.with_isolated {
+                true => vault_files(&ctx.repo)?.iter().filter_map(|(p, _)| VPath::new(p).ok()).collect(),
+                false => Vec::new(),
+            };
+            let strays: Vec<VPath> = core::strays(&sandbox, set, &Policy::load(&sandbox)?)?
+                .into_iter()
+                .filter(|p| !injected_paths.contains(p))
+                .collect();
+            warn_strays(set, &strays, false);
+        }
         print_build_warnings(&report);
         print_working_copy_warnings(&report);
         eprintln!("Recorded {}", one_line(&ctx.repo, &id));
@@ -777,7 +911,21 @@ pub fn persistent_status(root: &Path, repo: Option<&Repo>) -> Vec<(bool, String)
                 format!("{shown}: holds {} quarantined file(s) that are in no snapshot", m.quarantined.len()),
             )),
             Loaded::Corrupt(why) => out.push((true, format!("{shown}: unreadable manifest ({why}); the next run rebuilds it"))),
-            _ => out.push((false, format!("{shown}: workspace '{}'{}", safe(&ws), if busy { " (a run is in progress)" } else { "" }))),
+            loaded => {
+                let sparse = match loaded {
+                    Loaded::Found(m) => m.only.map(|o| format!(" (sparse: {})", o.iter().map(|p| safe(p).into_owned()).collect::<Vec<_>>().join(", "))),
+                    _ => None,
+                };
+                out.push((
+                    false,
+                    format!(
+                        "{shown}: workspace '{}'{}{}",
+                        safe(&ws),
+                        sparse.unwrap_or_default(),
+                        if busy { " (a run is in progress)" } else { "" }
+                    ),
+                ))
+            }
         }
     }
     out

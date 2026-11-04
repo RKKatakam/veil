@@ -1316,7 +1316,7 @@ A workspace is only a named pointer in the view. It owns no directory.
   (`tree`: synced to, then recorded as), the materialisation record
   (`Materialised`, as for the project directory), the boot they were
   written in, a `running` marker, the quarantined files the last run left,
-  and `only` (reserved for sparse sandboxes: `None` is the whole tree). The
+  and `only`, the paths of a sparse sandbox (`None`: the whole tree). The
   per-file half of the manifest is the sandbox's own stat cache: blob id
   and stamp (size, mtime, ctime, inode, executable bit) of every file.
   A run:
@@ -1325,8 +1325,9 @@ A workspace is only a named pointer in the view. It owns no directory.
   2. decides whether the sandbox can be trusted (`rebuild_reason`): no
      manifest, an unreadable or other-version one, another workspace's, a
      `running` marker left by a run that died, another boot (sandbox files
-     are never fsynced, so after a power loss they may be torn), a subset,
-     a tree gc removed, `files/` missing or replaced (a symlink). Any of
+     are never fsynced, so after a power loss they may be torn), an
+     invalid `only` path, a tree gc removed, `files/` missing or replaced
+     (a symlink). Any of
      these: wipe and rebuild. When in doubt, rebuild;
   3. writes `running` and the boot durably, and starts the reaper;
   4. **syncs**: `checkout_recorded` from the manifest's tree to the
@@ -1368,6 +1369,49 @@ A workspace is only a named pointer in the view. It owns no directory.
   manifest lists quarantined files, then removes the whole directory.
   `vl doctor` lists sandboxes, flags interrupted runs and sandboxes of
   removed workspaces.
+
+  **Sparse sandboxes** (`--only PATH…`, `vfs::SparseSet`,
+  `vfs::SparseView`). The paths are resolved by the CLI's path rules
+  (`Ctx::repo_path`, BUG-204) and must name something in the workspace's
+  tree (so a nested repository, never in a tree, cannot be chosen); the
+  set is normalised (sorted, a path inside another dropped, the root
+  meaning the whole tree) and always holds `.veilpolicy`, which the
+  snapshot needs to classify anything. Step 4 checks out
+  `restrict(tree, set)` (the tree with only the set's entries and the
+  directories leading to them; new tree objects are written to the store
+  as any build writes them) from `restrict(manifest tree, manifest set)`:
+  a different set (or none) is the same incremental checkout, adding and
+  removing only what differs. Step 7 records a `SparseView` of the
+  sandbox instead of the sandbox: inside the set it is the sandbox;
+  outside it is a `TreeView` of the synced tree whose `known_id` vouches
+  for every entry, so the builder reuses whole directories outside the
+  set by id without listing them (it gives `.veilpolicy` its blob id, so
+  an unchanged public policy keeps these hints on); directories leading
+  into the set are merged (the sandbox's entries that lead in, the tree's
+  that do not). Everything the builder decides (policy, cloaked lines,
+  embargoes, conflicts, quarantine) is decided as for a full working copy
+  whose files outside the set did not change: a policy edit, or a scanner
+  upgrade, turns the hints off and the builder reads the outside files
+  from the tree to reclassify them (slow, exact). A superseded run (step
+  7) saves the same view as a child of the snapshot it started from.
+  After step 8, `strays` lists the files the command wrote outside the
+  set that a full snapshot would record (not ignored, not isolated, not a
+  nested repository, special file or crash debris, not quarantined by an
+  earlier run); they are reported, never recorded, and removed from the
+  sandbox (with the directories that leaves empty), so a later, wider set
+  never mistakes them for workspace content. The same listing taken
+  right after the sync (before injection) names what was outside the set
+  before the command ran: hand edits in the sandbox, and files a narrower
+  set's checkout kept because they held something else. Those are not
+  the command's output: they stay, unrecorded, reported on every run,
+  until a run whose set holds them records them. Quarantined files of earlier
+  runs that a narrower set leaves outside stay, and stay in the manifest
+  for `vl ws rm`'s guard. `--with-isolated` injects every isolated file,
+  inside the set or not: they are what the command runs with (`.env` at
+  the root), not what it edits, and outside the set nothing is recorded
+  anyway; the injected-secret guard and `remove_injected` work unchanged.
+  `--ephemeral --only` checks out `restrict(REV's tree, set)` and records
+  a `SparseView` the same way.
 
   `--ephemeral` runs use a throwaway directory instead, created `0700`
   under `$TMPDIR` and restricted to the user before the command runs, and

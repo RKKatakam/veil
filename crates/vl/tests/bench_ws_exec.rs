@@ -15,7 +15,9 @@
 //! Measured: the first and the following runs of `true`, a run whose
 //! command edits 10 files, a run after 10 files were changed in the
 //! workspace from outside (`vl ws write`), and the disk the sandboxes use
-//! between runs.
+//! between runs. Then the same for a sparse sandbox of one module
+//! (`--only src/m042`, 100 files) in a second workspace, a change of its
+//! set, and a sparse `--ephemeral` run.
 
 use std::{
     io::Write,
@@ -191,4 +193,50 @@ fn ws_exec_on_20k_files() {
     eprintln!("ws exec -- true after 10 `ws write`s      {:9.1} ms", ms(after_ws_write10));
     eprintln!("ws exec -- true again                    {:9.1} ms", ms(steady_again));
     eprintln!("disk kept between runs: sandboxes {} MiB, $TMPDIR {} MiB", disk_after / 1024, tmp_after / 1024);
+
+    // Sparse: one module of 200.
+    b.vl(&["ws", "new", "sparse"]);
+    fn sparse<'a>(extra: &[&'a str]) -> Vec<&'a str> {
+        let mut args = vec!["ws", "exec", "sparse", "--only", "src/m042"];
+        args.extend_from_slice(extra);
+        args
+    }
+    let sp_first = b.timed(&sparse(&["--", "true"]));
+    let sp_second = b.timed(&sparse(&["--", "true"]));
+    let mut more: Vec<Duration> = (0..3).map(|_| b.timed(&sparse(&["--", "true"]))).collect();
+    more.sort();
+    let sp_steady = more[1];
+    let sp_disk = du_kib(&b.root.join(".veil/local/sandboxes/sparse"));
+    let mut edit = String::new();
+    for i in 0..10 {
+        edit.push_str(&format!("echo edit >> src/m042/s{}/f{:02}.rs; ", i % SUBDIRS, i));
+    }
+    let sp_edit10 = b.timed(&sparse(&["--", "sh", "-c", &edit]));
+    let sp_after_edit = b.timed(&sparse(&["--", "true"]));
+    let sp_widen = b.timed(&["ws", "exec", "sparse", "--only", "src/m042", "src/m043", "--", "true"]);
+    let sp_narrow = b.timed(&sparse(&["--", "true"]));
+    let sp_eph = b.timed(&["ws", "exec", "--ephemeral", "-r", "@-", "--only", "src/m042", "--", "true"]);
+    let full_eph = b.timed(&["ws", "exec", "--ephemeral", "-r", "@-", "--", "true"]);
+    // A new workspace's first snapshot re-scans its whole tree once (the
+    // per-workspace scanner marker): split that from the sparse sync.
+    b.vl(&["ws", "new", "sparse2"]);
+    let t = Instant::now();
+    b.ws_write("sparse2", "NOTE.md", "note\n");
+    let first_scan = t.elapsed();
+    let sp2_first = b.timed(&["ws", "exec", "sparse2", "--only", "src/m042", "--", "true"]);
+
+    eprintln!();
+    eprintln!("sparse (--only src/m042, 100 of 20,000 files):");
+    eprintln!("ws exec -- true, first run               {:9.1} ms", ms(sp_first));
+    eprintln!("ws exec -- true, second run              {:9.1} ms", ms(sp_second));
+    eprintln!("ws exec -- true, later runs (median of 3){:9.1} ms", ms(sp_steady));
+    eprintln!("ws exec, command edits 10 files          {:9.1} ms", ms(sp_edit10));
+    eprintln!("ws exec -- true after that               {:9.1} ms", ms(sp_after_edit));
+    eprintln!("widen to src/m042 src/m043               {:9.1} ms", ms(sp_widen));
+    eprintln!("narrow back to src/m042                  {:9.1} ms", ms(sp_narrow));
+    eprintln!("--ephemeral --only src/m042 -- true      {:9.1} ms", ms(sp_eph));
+    eprintln!("--ephemeral -- true (whole tree)         {:9.1} ms", ms(full_eph));
+    eprintln!("new workspace's first snapshot (re-scan)  {:9.1} ms", ms(first_scan));
+    eprintln!("first sparse run after it                {:9.1} ms", ms(sp2_first));
+    eprintln!("disk kept between runs: sparse sandbox {} MiB", sp_disk / 1024);
 }

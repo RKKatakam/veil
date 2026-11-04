@@ -12,6 +12,8 @@
 //!   the user's `ssh` and its `sftp` subsystem (remotes).
 //! * [`SandboxFs`]      — a `vl ws exec` sandbox directory: unsynced writes,
 //!   copy-on-write clones of the project directory's files.
+//! * [`SparseView`]     — a sparse working copy (a sandbox holding a
+//!   [`SparseSet`] of paths) seen as the whole tree it was synced from.
 
 #[cfg(feature = "os")]
 mod disk;
@@ -19,6 +21,7 @@ mod memory;
 mod overlay;
 #[cfg(feature = "os")]
 mod sandbox;
+mod sparse;
 #[cfg(feature = "os")]
 mod sftp;
 #[cfg(feature = "os")]
@@ -34,6 +37,7 @@ pub use sandbox::{clone_file, private_dir, reflink_supported, remove_tree, Clone
 #[cfg(feature = "os")]
 pub use sftp::{SftpBackend, SftpOptions, SftpStats};
 pub use sftp_url::SshUrl;
+pub use sparse::{restrict, SparseSet, SparseView};
 
 pub use crate::vpath::NameFolding;
 use crate::{error::Result, id::ObjectId, vpath::VPath};
