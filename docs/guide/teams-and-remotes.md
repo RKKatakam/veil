@@ -50,7 +50,7 @@ origin  team  ../hub
 | Cloaked files | ciphertext, for members to decrypt | withheld (the entry shows as redacted) |
 | Cloaked descriptions and tags | ciphertext / ✓ | placeholders / never sent |
 | Unreleased embargoes | the fix, for the embargo's scope | the pre-merge tree only |
-| Key rings | ✓ | ✓: they hold no usable keys, but **scope names, member names and member ids are visible** (`vl scope list` on a clone of the mirror lists them) |
+| Key rings | ✓ | ✗: never sent (since BUG-077). Still visible: scope names, and the member id and signing key of whoever signed public snapshots or embargo records. Rings an older `vl` already pushed stay there; each public push warns about them |
 | Isolated files | never (they are not in history) | never |
 
 A teammate outside a scope who pulls from a team remote gets ciphertext
