@@ -2332,6 +2332,12 @@ agents" (`vfs/mod.rs`), and a WASM build is on the roadmap. A survey of
 | `getrandom` | `crypto.rs`, `identity.rs` | needs its WebCrypto (`wasm_js`) backend enabled for this target | build configuration |
 | AES (AES-SIV) without AES-NI | `aes-siv`, `aes` | software AES: slower, constant-time bitsliced in RustCrypto | measure; WebCrypto has no AES-SIV, and composing one from WebCrypto's AES-CBC and AES-CTR would be a homemade construction, which Veil does not do (CRYPTO.md §1) |
 
+**Status:** done for every row but the last: the `os` feature holds the
+disk, SFTP, process and thread code, `zstd` the C library (packs are read
+with `ruzstd` and written with stored entries without it), the clock is
+injectable, and the lock has a no-OS mode (ARCHITECTURE.md §13). AES-SIV
+runs as software AES; it has not been measured in a browser yet.
+
 Everything else (store, packs, trees, merge, embargo resolution, keychain,
 HPKE, Ed25519, BLAKE3, the secret scanner, policy) is plain Rust over
 `StorageBackend`. A CI job running `cargo check --target
@@ -2475,8 +2481,8 @@ ordered by how much it costs to wait.
 |---|---|---|---|
 | C1 | **Make "projections are key-independent" an explicit engine invariant**, with a test that computes the public projection and the transfer filter in a repository with no identity and compares | §2.2: every server-side feature rests on it | High: one feature that filters by "which keys this replica holds" breaks the Hub's design |
 | C2 | **Extract validation from `remote.rs`** into a transport-independent API (`receive::validate(store, pack, updates, rings, records) -> Report`) used by `pull`, `push` and the server | §4.5: client and server must run the same checks, or the repository splits | Medium; grows with every new check |
-| C3 | **Clock injection** instead of `SystemTime::now()` / `Instant::now()` in the engine (`now_millis` in `lib.rs`, `store.rs`, `lock.rs`) | WASM (§9.1), trusted time for embargo deadlines (§8.2), deterministic tests | Low now, grows with every new call site |
-| C4 | **A WASM target in CI**: `cargo check --target wasm32-unknown-unknown -p veil-core --no-default-features`, with threads, `DiskBackend`, SFTP and the lock behind features | §9.1 | Medium: unnoticed OS calls accumulate |
+| C3 | **Clock injection** instead of `SystemTime::now()` / `Instant::now()` in the engine (`now_millis` in `lib.rs`, `store.rs`, `lock.rs`) | WASM (§9.1), trusted time for embargo deadlines (§8.2), deterministic tests | Low now, grows with every new call site. **Done:** `veil_core::clock` (`set_clock`, `monotonic`), ARCHITECTURE.md §13 |
+| C4 | **A WASM target in CI**: `cargo check --target wasm32-unknown-unknown -p veil-core --no-default-features`, with threads, `DiskBackend`, SFTP and the lock behind features | §9.1 | Medium: unnoticed OS calls accumulate. **Done:** features `os` / `zstd` / `ruzstd` / `wasm`, CI job `wasm` (`scripts/check-wasm.sh`), ARCHITECTURE.md §13 |
 | C5 | **Sealed directory nodes** (on the roadmap), designed with the Hub in mind: a sealed directory must still let a keyless relay gc and transfer what is below it (as embargo wrappers list "every object reachable only through the sealed side", ARCHITECTURE.md §7) and must still change id when anything below changes (approval routing, §5.3) | Hides cloaked file names from the Hub, the largest metadata leak (§3.3) | High: names pushed before it are visible forever |
 | C6 | **Decide size padding for sealed objects** (a padded plaintext inside `veil:sea2`, or a new sealed tag) | Sizes leak content type and edits (§3.3) | Medium: a format change; old objects stay unpadded |
 | C7 | **"Not fetched" distinct from "redacted"** (`Missing` vs a new state) | Partial clones, the web client (§9.7) | Medium |

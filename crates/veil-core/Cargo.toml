@@ -29,16 +29,42 @@ thiserror.workspace = true
 unicode-normalization.workspace = true
 x25519-dalek.workspace = true
 zeroize.workspace = true
-zstd.workspace = true
+zstd = { workspace = true, optional = true }
+ruzstd = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
-libc.workspace = true
+libc = { workspace = true, optional = true }
 
+# Features (see docs/ARCHITECTURE.md, "Builds without an operating system").
+# The defaults are the native build `vl` ships; `--no-default-features
+# --features wasm` is the portable engine that builds for
+# wasm32-unknown-unknown (scripts/check-wasm.sh).
 [features]
-default = ["git"]
+default = ["git", "os", "zstd"]
 # Two-way Git interop (`veil_core::git`): needs a disk-backed repository.
-git = ["dep:gix"]
+git = ["os", "dep:gix"]
+# A real operating system: `DiskBackend`, `SftpBackend` (spawns `ssh`),
+# process checks in the repository lock and its heartbeat thread, worker
+# threads, and the system clock as the default clock.
+os = ["dep:libc"]
+# The zstd C library: compressed and delta pack entries are written (gc,
+# sync) and read with it.
+zstd = ["dep:zstd"]
+# The pure-Rust zstd decoder: reads every pack entry without the C library.
+# Without `zstd`, packs are written with stored entries only.
+ruzstd = ["dep:ruzstd"]
+# The portable engine for wasm32-unknown-unknown: the pure-Rust decoder and
+# WebCrypto randomness (getrandom's `wasm_js` backend; no effect elsewhere).
+# Use with `--no-default-features`.
+wasm = ["ruzstd", "getrandom/wasm_js"]
 
-[dev-dependencies]
+# Native only: neither builds for wasm32-unknown-unknown, and the WASM
+# example (`examples/wasm_smoke.rs`) needs none of them.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 tempfile.workspace = true
 proptest = "1"
+
+[lints.rust]
+# `examples/wasm_smoke.rs` supplies randomness itself when built with
+# `--cfg getrandom_backend="custom"` (scripts/check-wasm.sh).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(getrandom_backend, values("custom"))'] }

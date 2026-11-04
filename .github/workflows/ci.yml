@@ -2,6 +2,9 @@
 #
 #   test       cargo build / test (incl. doc tests) / clippy / cargo doc, all -D warnings
 #   musl       the static Linux binaries releases ship (x86_64 and aarch64)
+#   wasm       veil-core without an OS or the zstd C library: built for
+#              wasm32-unknown-unknown, tested natively with the same
+#              features, and the example run under node (scripts/check-wasm.sh)
 #   packaging  completions, man pages, Homebrew formula, dist config, actionlint
 #
 # The deeper property tests and the benchmarks run in nightly.yml; releases
@@ -123,6 +126,28 @@ jobs:
           "$GITHUB_WORKSPACE/$vl" commit -m "first"
           "$GITHUB_WORKSPACE/$vl" log
           "$GITHUB_WORKSPACE/$vl" doctor
+
+  wasm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Node (preinstalled on the runner) runs the example's WebAssembly
+      # module; it needs no other tool (no wasm-bindgen).
+      - name: Install Rust and the wasm32 target
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --target wasm32-unknown-unknown
+          rustup default stable
+          node --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: wasm
+      - name: Portable engine (build for wasm32, test natively, run under node)
+        run: scripts/check-wasm.sh
 
   packaging:
     runs-on: ubuntu-24.04

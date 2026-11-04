@@ -34,6 +34,7 @@ binaries, so they run on any Linux distribution), `x86_64-apple-darwin` and
 | `LICENSE-MIT`, `LICENSE-APACHE` | the licence texts (`MIT OR Apache-2.0`); dist puts them in every archive by itself |
 | `.github/dependabot.yml` | weekly updates of the pinned action SHAs and the Cargo dependencies |
 | `SECURITY.md` | how to report a vulnerability, supported versions |
+| `scripts/check-wasm.sh`, `scripts/wasm-smoke.mjs` | CI's `wasm` job: the portable `veil-core` build and its smoke run under node |
 
 `release.yml` also runs on pull requests, where it only runs `dist plan`.
 CI's `packaging` job runs `dist plan` on every push too, which fails if
@@ -86,7 +87,12 @@ an invalid `uses: $/...` path.
 ### 1. Everything is green
 
 * CI on `main` (Linux and macOS: build, tests, doc tests, clippy, `cargo doc`, musl,
-  packaging).
+  packaging, wasm). The `wasm` job is `scripts/check-wasm.sh`: `veil-core`
+  built for `wasm32-unknown-unknown` without the OS or the zstd C library,
+  the same feature set tested natively, and `examples/wasm_smoke.rs` run
+  under node. Run the script locally after touching anything in
+  `veil-core` that could need the OS (it installs the target with
+  `rustup target add wasm32-unknown-unknown`).
 * The latest **Nightly** run (deep property tests). Run it by hand from the
   Actions tab if the last one is old.
 

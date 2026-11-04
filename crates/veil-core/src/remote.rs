@@ -564,9 +564,10 @@ impl Transfer<'_> {
 
 /// `f` over `items` on up to `threads` threads, results in order. Network
 /// backends answer many requests at once (the SFTP client pipelines
-/// whatever several threads send).
+/// whatever several threads send). Without the `os` feature (WASM has no
+/// threads) always on the calling thread.
 fn par_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
-    if threads <= 1 || items.len() <= 1 {
+    if threads <= 1 || items.len() <= 1 || cfg!(not(feature = "os")) {
         return items.iter().map(f).collect();
     }
     let next = AtomicUsize::new(0);

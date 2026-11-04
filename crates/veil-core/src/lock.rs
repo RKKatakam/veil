@@ -132,6 +132,13 @@
 //! | pid alive | `/proc/<pid>/stat` (not a zombie), else `kill(pid, 0)` | `proc_pidinfo` (not a zombie), else `kill(pid, 0)` | `kill(pid, 0)` |
 //! | process start | `starttime` in `/proc/<pid>/stat` | `proc_pidinfo` | unknown |
 //!
+//! **Without the `os` feature** (WASM) there is no host to ask: every
+//! engine instance is its own "host" with a random name and pid 0, so a
+//! lock is only ever taken over by the instance that wrote it (leaked or
+//! left for recovery), never by another; a held lock fails at once (the
+//! default wait is zero) and there is no heartbeat thread
+//! (docs/ARCHITECTURE.md §13).
+//!
 //! "Not running" needs proof (see [`process_alive_with`]): a zombie, or
 //! `kill` answering `ESRCH`. A `/proc/<pid>` that is missing because
 //! `/proc` hides other users' processes (`hidepid=2`,
@@ -182,7 +189,14 @@ impl Default for LockOptions {
         LockOptions {
             lease: Duration::from_secs(10),
             renew_every: Duration::from_millis(2500),
-            wait: Duration::from_secs(15),
+            // Without an operating system (WASM) the engine runs on one
+            // thread: a held lock is held by an instance that cannot
+            // release it while we wait, so fail at once.
+            wait: if cfg!(feature = "os") {
+                Duration::from_secs(15)
+            } else {
+                Duration::ZERO
+            },
         }
     }
 }
@@ -342,7 +356,7 @@ impl LockInfo {
         let now = ctx.clock.wall_ms();
         LockInfo {
             token: hex::encode(random_bytes::<16>()),
-            pid: std::process::id(),
+            pid: my_pid(),
             host: h.host.clone(),
             boot: h.boot.clone(),
             acquired: now,
@@ -486,7 +500,7 @@ fn assess_full(info: &LockInfo, extra: &Extras, now: i64, unchanged_for: Option<
     // On platforms without a boot id both sides are empty and the host name
     // alone identifies the machine.
     let same_machine = !me.host.is_empty() && info.host == me.host && info.boot == me.boot;
-    if same_machine && info.pid == std::process::id() {
+    if same_machine && info.pid == my_pid() {
         if extra.start.is_some() && process_start_with(&*ctx.probe, info.pid).is_some_and(|s| Some(s.id) != extra.start) {
             return Verdict::Steal(format!("holder pid {} was reused by this process", info.pid));
         }
@@ -972,6 +986,12 @@ impl Heartbeat {
         clock: Arc<dyn LockClock>,
         fence: Option<Fence>,
     ) -> Option<Heartbeat> {
+        // No threads without an operating system (WASM): the lease is not
+        // renewed. Harmless there: nobody else ever takes over this
+        // instance's lock (see `host_identity`).
+        if cfg!(not(feature = "os")) {
+            return None;
+        }
         let (stop, rx) = mpsc::channel::<()>();
         let thread = std::thread::Builder::new()
             .name("veil-lock-heartbeat".into())
@@ -1337,10 +1357,7 @@ impl Drop for Registered {
 // ---- clocks -------------------------------------------------------------------
 
 mod clock {
-    use std::{
-        sync::{Mutex, OnceLock},
-        time::{Duration, Instant},
-    };
+    use std::{sync::Mutex, time::Duration};
 
     /// The two clocks a lock needs: wall time (written into the lock file
     /// for other hosts, compared only with a skew allowance) and monotonic
@@ -1366,11 +1383,16 @@ mod clock {
             crate::now_millis()
         }
         fn now(&self) -> Duration {
-            static ORIGIN: OnceLock<Instant> = OnceLock::new();
-            ORIGIN.get_or_init(Instant::now).elapsed()
+            crate::clock::monotonic()
         }
+        /// Without the `os` feature there is nothing to wait for (no other
+        /// thread can release the lock on WASM) and no way to sleep: a
+        /// no-op (lock waits are then zero, see [`super::LockOptions`]).
         fn sleep(&self, d: Duration) {
-            std::thread::sleep(d)
+            #[cfg(feature = "os")]
+            std::thread::sleep(d);
+            #[cfg(not(feature = "os"))]
+            let _ = d;
         }
     }
 
@@ -1410,6 +1432,7 @@ mod clock {
             self.state.lock().unwrap().1
         }
         fn sleep(&self, d: Duration) {
+            #[cfg(feature = "os")]
             std::thread::sleep(Duration::from_micros(500));
             self.advance(d);
         }
@@ -1443,6 +1466,7 @@ impl HostIdentity {
     }
 }
 
+#[cfg(feature = "os")]
 fn host_identity() -> &'static HostIdentity {
     static ID: OnceLock<HostIdentity> = OnceLock::new();
     ID.get_or_init(|| HostIdentity {
@@ -1451,12 +1475,45 @@ fn host_identity() -> &'static HostIdentity {
     })
 }
 
+/// Without an operating system (WASM) there is no host name, boot or pid to
+/// tell holders apart: every instance of the engine is its own "host", with
+/// a random name. Its locks are therefore never taken over by another
+/// instance sharing the same storage (a lock of another host is never
+/// robbed, see the module documentation), only by itself, through the
+/// same-process rules (a leaked token, a lock left for recovery).
+#[cfg(not(feature = "os"))]
+fn host_identity() -> &'static HostIdentity {
+    static ID: OnceLock<HostIdentity> = OnceLock::new();
+    ID.get_or_init(|| {
+        let name = format!("instance-{}", hex::encode(random_bytes::<8>()));
+        HostIdentity {
+            host: name.clone(),
+            boot: name,
+        }
+    })
+}
+
+/// This process's pid; 0 without the `os` feature (a WASM instance has
+/// none, `std::process::id()` panics there; see [`host_identity`]).
+fn my_pid() -> u32 {
+    #[cfg(feature = "os")]
+    {
+        std::process::id()
+    }
+    #[cfg(not(feature = "os"))]
+    {
+        0
+    }
+}
+
+#[cfg(feature = "os")]
 fn read_trimmed(path: &str) -> Option<String> {
     let s = std::fs::read_to_string(path).ok()?;
     let s = s.trim();
     (!s.is_empty()).then(|| s.to_string())
 }
 
+#[cfg(feature = "os")]
 fn command_output(cmd: &str, args: &[&str]) -> Option<String> {
     let out = std::process::Command::new(cmd).args(args).output().ok()?;
     let s = String::from_utf8(out.stdout).ok()?;
@@ -1464,6 +1521,7 @@ fn command_output(cmd: &str, args: &[&str]) -> Option<String> {
     (out.status.success() && !s.is_empty()).then(|| s.to_string())
 }
 
+#[cfg(feature = "os")]
 fn host_name() -> String {
     #[cfg(target_os = "macos")]
     {
@@ -1487,7 +1545,7 @@ fn host_name() -> String {
         .unwrap_or_default()
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "os", unix))]
 fn gethostname() -> Option<String> {
     let mut buf = [0u8; 256];
     // SAFETY: the buffer is valid for its length; the result is NUL-terminated
@@ -1500,11 +1558,12 @@ fn gethostname() -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
-#[cfg(not(unix))]
+#[cfg(all(feature = "os", not(unix)))]
 fn gethostname() -> Option<String> {
     None
 }
 
+#[cfg(feature = "os")]
 /// Identifies one boot of one machine *and* the pid namespace, so a pid is
 /// only compared against processes it could actually refer to.
 fn boot_identity() -> String {
@@ -1535,7 +1594,7 @@ fn boot_identity() -> String {
 
 /// When this machine booted (ms since the epoch), if known.
 fn boot_time_ms() -> Option<i64> {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(feature = "os", target_os = "macos"))]
     {
         let raw = sysctl_bytes("kern.boottime")?;
         if raw.len() < std::mem::size_of::<libc::timeval>() {
@@ -1545,7 +1604,7 @@ fn boot_time_ms() -> Option<i64> {
         let tv: libc::timeval = unsafe { std::ptr::read_unaligned(raw.as_ptr().cast()) };
         Some(i64::from(tv.tv_sec) * 1000 + i64::from(tv.tv_usec) / 1000)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(feature = "os", not(target_os = "macos")))]
     {
         let stat = std::fs::read_to_string("/proc/stat").ok()?;
         let secs: i64 = stat
@@ -1556,10 +1615,14 @@ fn boot_time_ms() -> Option<i64> {
             .ok()?;
         Some(secs * 1000)
     }
+    #[cfg(not(feature = "os"))]
+    {
+        None
+    }
 }
 
 /// Raw value of a `sysctl` by name.
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "os", target_os = "macos"))]
 fn sysctl_bytes(name: &str) -> Option<Vec<u8>> {
     let cname = std::ffi::CString::new(name).ok()?;
     let mut len: libc::size_t = 0;
@@ -1698,7 +1761,7 @@ pub fn process_start_with(probe: &dyn ProcessProbe, pid: u32) -> Option<ProcessS
 /// Whether `/proc` describes this process's own pid namespace: then
 /// `/proc/self` names our own pid. In a `/proc` of an ancestor namespace
 /// it names our pid there, in one of another namespace nothing.
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "os", target_os = "linux"))]
 fn proc_is_ours() -> bool {
     std::fs::read_link("/proc/self")
         .ok()
@@ -1707,7 +1770,7 @@ fn proc_is_ours() -> bool {
 }
 
 /// The state letter and `starttime` of a `/proc/<pid>/stat` line.
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "os", target_os = "linux"))]
 fn parse_stat(stat: &str) -> (Option<char>, Option<u64>) {
     // Field 2, `comm`, is parenthesised and may contain spaces and
     // parentheses; field 3 is the state and field 22, `starttime`, the
@@ -1719,12 +1782,12 @@ fn parse_stat(stat: &str) -> (Option<char>, Option<u64>) {
     (state, ticks)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "os", target_os = "linux"))]
 fn exited(state: Option<char>) -> bool {
     matches!(state, Some('Z' | 'X'))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "os", target_os = "linux"))]
 fn system_entry(pid: u32) -> ProcEntry {
     if !proc_is_ours() {
         return ProcEntry::Unavailable;
@@ -1765,7 +1828,7 @@ fn system_entry(pid: u32) -> ProcEntry {
     ProcEntry::Present { zombie, start }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "os", target_os = "macos"))]
 fn system_entry(pid: u32) -> ProcEntry {
     /// `SZOMB` in XNU's `<sys/proc.h>`.
     const SZOMB: u32 = 5;
@@ -1806,12 +1869,12 @@ fn system_entry(pid: u32) -> ProcEntry {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(all(feature = "os", any(target_os = "linux", target_os = "macos"))))]
 fn system_entry(_pid: u32) -> ProcEntry {
     ProcEntry::Unavailable
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "os", unix))]
 fn system_signal(pid: u32) -> Signal {
     // pid 0 and negative values address process groups, not a process.
     let Ok(raw) = libc::pid_t::try_from(pid) else { return Signal::Unknown };
@@ -1829,7 +1892,7 @@ fn system_signal(pid: u32) -> Signal {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(all(feature = "os", unix)))]
 fn system_signal(_pid: u32) -> Signal {
     Signal::Unknown
 }
@@ -1837,7 +1900,7 @@ fn system_signal(_pid: u32) -> Signal {
 /// This process's [`ProcessStart::id`], recorded in its lock files.
 fn my_start() -> Option<u64> {
     static START: OnceLock<Option<u64>> = OnceLock::new();
-    *START.get_or_init(|| process_start(std::process::id()).map(|s| s.id))
+    *START.get_or_init(|| process_start(my_pid()).map(|s| s.id))
 }
 
 /// Whether the live process running under the holder's pid is someone
