@@ -153,10 +153,13 @@ pub fn open_session(ctx: &mut Ctx, snapshot: bool) -> Result<()> {
     if let Some(op) = colocate::operation_in_progress(&session.git_dir) {
         // Inside a Git hook (`git commit` holds index.lock), or a rebase:
         // the command works as usual; nothing is followed or mirrored.
-        eprintln!(
+        // (Quiet for `--no-snapshot`: the guards Git runs use it.)
+        if snapshot {
+            eprintln!(
             "{} Git operation in progress ({op}); Veil mirrors into .git when it ends",
             dim("note:")
-        );
+            );
+        }
         session.in_progress = Some(op);
         ctx.git = Some(session);
         return Ok(());

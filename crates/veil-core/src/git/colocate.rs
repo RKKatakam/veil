@@ -900,45 +900,58 @@ impl GitBridge {
         // `HEAD`.
         let now = self.head()?;
         let mut head_ok = true;
-        if let Some(hc) = head_commit {
-            let branch: Vec<&String> = exported
-                .branches
-                .iter()
-                .filter(|(n, c)| {
-                    *c == hc
-                        && at == head_snap
-                        && r.view().tags.get(n).is_some_and(|t| Some(t.target) == at && t.cloak.is_none())
-                        && self.get_ref(&format!("refs/heads/{n}")).ok().flatten() == Some(hc)
-                })
-                .map(|(n, _)| n)
-                .collect();
-            let want_sym = match branch.as_slice() {
-                [one] => Some(format!("refs/heads/{one}")),
-                _ => None,
-            };
-            let same = now.commit == Some(hc) && now.symbolic == want_sym;
-            // The branch HEAD names moved in Git since Veil last saw it (a
-            // `git commit` racing this command): HEAD stays, or the next
-            // commit would land on a detached HEAD.
-            let branch_moved = now.symbolic.as_ref().is_some_and(|b| {
+        // Git moved HEAD (or the branch it names, by a `git commit` racing
+        // this command) since the follow at the start: HEAD stays where Git
+        // put it, and the next command follows it. Veil's own branch moves
+        // of this mirror are in `state.refs`.
+        let moved_in_git = match (expected, &now.symbolic) {
+            (None, _) => true,
+            (Some(e), Some(b)) => {
                 let seen = state.refs.get(b).and_then(|h| GitOid::from_hex(h.as_bytes()).ok());
-                seen != now.commit && !(seen.is_none() && now.commit.is_none())
+                e.symbolic.as_ref() != Some(b) || (seen != now.commit && now.commit.is_some())
+            }
+            (Some(e), None) => e.symbolic.is_some() || e.commit != now.commit,
+        };
+        if let Some(hc) = head_commit {
+            let on_branch = |n: &str| {
+                at == head_snap
+                    && r.view().tags.get(n).is_some_and(|t| Some(t.target) == at && t.cloak.is_none() && t.annotation.is_none())
+                    && self.get_ref(&format!("refs/heads/{n}")).ok().flatten() == Some(hc)
+            };
+            // The branch HEAD is on, if it still fits; else the one tag at @-.
+            let current = now
+                .symbolic
+                .as_deref()
+                .and_then(|s| s.strip_prefix("refs/heads/"))
+                .filter(|b| on_branch(b))
+                .map(|b| format!("refs/heads/{b}"));
+            let want_sym = current.or_else(|| {
+                let names: Vec<&String> = exported.branches.iter().filter(|(n, c)| *c == hc && on_branch(n)).map(|(n, _)| n).collect();
+                match names.as_slice() {
+                    [one] => Some(format!("refs/heads/{one}")),
+                    _ => None,
+                }
             });
+            let same = now.commit == Some(hc) && now.symbolic == want_sym;
             if !same {
-                if expected.is_some_and(|e| *e != now) || branch_moved {
+                if moved_in_git {
                     report
                         .notes
-                        .push("HEAD changed in Git since this command started; Veil follows it next command".into());
+                        .push("HEAD changed in Git while this command ran; Veil follows it next command".into());
                     head_ok = false;
                 } else if !self.cas_head(&now, want_sym.as_deref(), hc)? {
                     report.notes.push("HEAD is locked in Git; mirrored by the next command".into());
                     head_ok = false;
                 }
             }
+        } else if moved_in_git {
+            head_ok = false;
         }
         let head = self.head()?;
-        state.last_head = head.commit.map(|c| c.to_string());
-        state.last_head_ref = head.symbolic.clone();
+        if head_ok {
+            state.last_head = head.commit.map(|c| c.to_string());
+            state.last_head_ref = head.symbolic.clone();
+        }
         report.head = head.commit;
         state.frozen = frozen;
         state.frozen_reason = frozen_reason;
