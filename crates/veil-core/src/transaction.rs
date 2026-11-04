@@ -32,6 +32,7 @@ pub struct Transaction<'r> {
     rewritten: HashMap<ObjectId, Rewrite>,
     description: String,
     record_always: bool,
+    manual_undo: Option<String>,
     _lock: RepoLock,
 }
 
@@ -48,6 +49,7 @@ impl<'r> Transaction<'r> {
             rewritten: HashMap::new(),
             description,
             record_always: false,
+            manual_undo: None,
             _lock: lock,
         }
     }
@@ -64,6 +66,14 @@ impl<'r> Transaction<'r> {
     /// release, which changes shared metadata rather than the view).
     pub fn record_always(&mut self) {
         self.record_always = true;
+    }
+
+    /// Record this operation (even with an unchanged view) as one whose
+    /// effect `vl undo` cannot reach: `how` says how to reverse it by hand
+    /// (see [`crate::oplog::Operation::manual_undo`]).
+    pub fn manual_undo(&mut self, how: impl Into<String>) {
+        self.record_always = true;
+        self.manual_undo = Some(how.into());
     }
 
     pub fn add_head(&mut self, id: ObjectId) -> Result<()> {
@@ -306,6 +316,7 @@ impl<'r> Transaction<'r> {
             user: self.repo.user.clone(),
             description: self.description.clone(),
             view: self.view.clone(),
+            manual_undo: self.manual_undo.clone(),
         };
         let id = self.repo.ops.put(&op)?;
         // Fencing: never move the head unless we still hold the lock.

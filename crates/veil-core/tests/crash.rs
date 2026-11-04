@@ -52,6 +52,8 @@ use veil_core::{
     remote,
     repo::{is_repo, read_config},
     upgrade::{upgrade, UpgradeOptions, JOURNAL_PATH},
+    working_copy::CheckoutState,
+    workspace::SnapshotOptions,
     tree::walk_files,
     vfs::{DirEntry, Metadata, StatClock},
     Identity, MemoryBackend, ObjectId, Repo, Result, StorageBackend, VPath, VeilError,
@@ -748,6 +750,157 @@ fn crash_during_init() {
             }
         }
     }
+}
+
+// ---- `vl ws switch`: the project directory moves to another workspace -------------
+
+/// What one `vl` command does with the project directory, as the CLI's
+/// `Ctx` does it: finish an interrupted move, record the directory into the
+/// workspace it belongs to (only if that workspace still points where the
+/// directory came from), then, for `vl ws switch TO`, record the switch and
+/// move the directory, journalled.
+fn wc_session(disk: Arc<dyn StorageBackend>, id: &Identity, switch_to: Option<&str>) -> Result<()> {
+    let mut repo = Repo::open(disk.clone(), Some(id.clone()), "alice")?;
+    let mut st = CheckoutState::load(&*disk)?.expect("a checkout record");
+    repo.resume_working_copy(&*disk, &mut st, None)?;
+    let ws = st.attached().to_string();
+    let wc = repo.workspace_wc(&ws)?;
+    if st.snapshot != wc {
+        // The last command recorded the directory and died before saving
+        // the pointer (the CLI's "stale, but the directory already
+        // matches" case). Anything else would be a real stale directory,
+        // which nothing here produces.
+        let base = repo.snapshot(&st.snapshot)?.tree;
+        let (tree, _) = repo.build_from_recorded(&*disk, Some(base), None, None, Some(&st.materialised))?;
+        assert_eq!(tree, repo.snapshot(&wc)?.tree, "the directory is behind its workspace");
+        st.snapshot = wc;
+        st.save(&*disk)?;
+    }
+    let out = repo.snapshot_workspace_with(
+        &ws,
+        &*disk,
+        SnapshotOptions {
+            materialised: Some(&st.materialised),
+            expected_wc: Some(wc),
+            ..Default::default()
+        },
+    )?;
+    assert!(!out.superseded);
+    if out.snapshot != st.snapshot {
+        st.snapshot = out.snapshot;
+        st.save(&*disk)?;
+    }
+    if let Some(to) = switch_to {
+        repo.record_workspace_switch(&ws, to)?;
+        let target = repo.workspace_wc(to)?;
+        repo.move_working_copy(&*disk, &mut st, to, target, None)?;
+    }
+    Ok(())
+}
+
+/// Files of the working copy (`.veil/` aside), with their content.
+fn disk_files(fs: &dyn StorageBackend) -> BTreeMap<String, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    let mut stack = vec![VPath::root()];
+    while let Some(dir) = stack.pop() {
+        for e in fs.list_dir(&dir).unwrap() {
+            let path = dir.join(&e.name);
+            if path.as_str() == ".veil" {
+                continue;
+            }
+            match fs.metadata(&path).unwrap().unwrap().kind {
+                veil_core::vfs::NodeKind::Dir => stack.push(path),
+                _ => {
+                    out.insert(path.to_string(), fs.read(&path).unwrap());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn wc_files(repo: &Repo, ws: &str) -> BTreeMap<String, Vec<u8>> {
+    files_of(repo, &repo.workspace_wc(ws).unwrap())
+        .into_iter()
+        .map(|(p, d)| (p, d.expect("readable")))
+        .collect()
+}
+
+/// BUG-113: `vl ws switch` killed at any point (before, during or after the
+/// checkout that replaces the directory's files) never records a mix of
+/// both workspaces into either of them, never loses the edits of the
+/// workspace it leaves or a local-only file, and the next command leaves
+/// the directory holding exactly the workspace it is attached to.
+#[test]
+fn crash_during_workspace_switch() {
+    let id = Identity::generate("alice");
+    let base_disk = Arc::new(MemoryBackend::new());
+    let mut repo = Repo::init(base_disk.clone(), Some(id.clone()), "alice").unwrap();
+    for (path, data) in [("a.txt", "shared\n"), ("dir/old.txt", "default only\n"), ("cfg", "plain file\n")] {
+        base_disk.write(&p(path), data.as_bytes()).unwrap();
+    }
+    repo.snapshot_workspace(WS, &*base_disk).unwrap();
+    let (base, _) = repo.commit_working_copy(WS, "base").unwrap();
+    repo.create_workspace("agent", vec![base], None).unwrap();
+    let overlay = repo.workspace_overlay("agent").unwrap();
+    overlay.write(&p("agent.txt"), b"agent only\n").unwrap();
+    overlay.remove_file(&p("dir/old.txt")).unwrap();
+    overlay.remove_file(&p("cfg")).unwrap();
+    overlay.write(&p("cfg/settings.json"), b"{}\n").unwrap();
+    overlay.write(&p("a.txt"), b"shared, edited by the agent\n").unwrap();
+    repo.snapshot_workspace("agent", &overlay).unwrap();
+    let agent_files = wc_files(&repo, "agent");
+    // Default's unrecorded edits, and a local-only file.
+    base_disk.write(&p("default.txt"), b"default work\n").unwrap();
+    base_disk.write(&p(".env"), b"TOKEN=local\n").unwrap();
+    let wc = repo.workspace_wc(WS).unwrap();
+    CheckoutState::new(WS, wc, Default::default()).save(&*base_disk).unwrap();
+    drop(repo);
+    let mut default_files = disk_files(&*base_disk);
+    default_files.remove(".env");
+
+    let mut crashes = 0;
+    for mode in [Crash::BeforeWrite, Crash::AfterWrite, Crash::PowerLoss] {
+        for budget in 0..10_000 {
+            let disk = Arc::new(base_disk.fork());
+            let faulty = Arc::new(FaultyBackend::new(disk.clone(), budget, mode));
+            let ctx = format!("ws switch: {mode:?} after {budget} writes");
+            let result = wc_session(faulty.clone(), &id, Some("agent"));
+            let completed = result.is_ok() && !faulty.crashed();
+            if let Err(e) = &result {
+                assert!(faulty.crashed(), "{ctx}: failed without a crash: {e}");
+            }
+            crashes += usize::from(!completed);
+            let disk: Arc<dyn StorageBackend> = disk;
+            // Reboot, then the next command; twice, so a recovery that is
+            // itself interrupted later is covered by the second.
+            for _ in 0..2 {
+                wc_session(disk.clone(), &id, None).unwrap_or_else(|e| panic!("{ctx}: the next command fails: {e}"));
+            }
+            assert_healthy(disk.clone(), &id, &ctx);
+            let repo = Repo::open(disk.clone(), Some(id.clone()), "alice").unwrap();
+            let st = CheckoutState::load(&*disk).unwrap().unwrap();
+            assert!(st.pending.is_none(), "{ctx}: the move was not finished");
+            assert_eq!(wc_files(&repo, WS), default_files, "{ctx}: default's working copy");
+            assert_eq!(wc_files(&repo, "agent"), agent_files, "{ctx}: agent's working copy");
+            let mut expect = if st.workspace == "agent" { agent_files.clone() } else { default_files.clone() };
+            expect.insert(".env".into(), b"TOKEN=local\n".to_vec());
+            assert_eq!(disk_files(&*disk), expect, "{ctx}: the directory, attached to '{}'", st.workspace);
+            if completed {
+                assert_eq!(st.workspace, "agent", "{ctx}");
+                break;
+            }
+            // The user runs the switch again: it completes.
+            drop(repo);
+            wc_session(disk.clone(), &id, Some("agent")).unwrap_or_else(|e| panic!("{ctx}: switching again: {e}"));
+            let repo = Repo::open(disk.clone(), Some(id.clone()), "alice").unwrap();
+            assert_eq!(wc_files(&repo, WS), default_files, "{ctx}: default after switching again");
+            let mut expect = agent_files.clone();
+            expect.insert(".env".into(), b"TOKEN=local\n".to_vec());
+            assert_eq!(disk_files(&*disk), expect, "{ctx}: the directory after switching again");
+        }
+    }
+    assert!(crashes > 10, "the sweep crashed only {crashes} times");
 }
 
 // ---- vl upgrade ------------------------------------------------------------------

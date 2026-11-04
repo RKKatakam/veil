@@ -75,6 +75,15 @@ pub struct Operation {
     pub user: String,
     pub description: String,
     pub view: View,
+    /// Set on an operation whose effect lies outside the [`View`] (a key
+    /// ring, the remotes in `repo.json`, the local vault, which workspace
+    /// the project directory is attached to): restoring an older view does
+    /// not revert it, so `vl undo` refuses to "undo" it and shows this
+    /// instead, which says how to reverse it by hand (or that it cannot be
+    /// reversed). Absent on every other operation, and on every operation
+    /// written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_undo: Option<String>,
 }
 
 #[derive(Debug)]

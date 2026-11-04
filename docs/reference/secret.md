@@ -11,6 +11,8 @@ Subcommands:
 * [`vl secret get`](#vl-secret-get): Print a secret
 * [`vl secret list`](#vl-secret-list): List secret names
 * [`vl secret rm`](#vl-secret-rm): Delete a secret
+* [`vl secret files`](#vl-secret-files): List the vault's backups of isolated files (`.env` & co), including those of files gone from the working copy (kept 30 days)
+* [`vl secret recover`](#vl-secret-recover): Write the vault's backup of an isolated file back into the working copy (never over an existing file)
 * [`vl secret import`](#vl-secret-import): Import KEY=VALUE lines from a dotenv file
 
 ## `vl secret set`
@@ -63,6 +65,28 @@ Arguments:
 | | |
 |---|---|
 | `<NAME>` | Secret name (required) |
+
+## `vl secret files`
+
+List the vault's backups of isolated files (`.env` & co), including those of files gone from the working copy (kept 30 days)
+
+```text
+vl secret files [OPTIONS]
+```
+
+## `vl secret recover`
+
+Write the vault's backup of an isolated file back into the working copy (never over an existing file)
+
+```text
+vl secret recover [OPTIONS] <PATH>
+```
+
+Arguments:
+
+| | |
+|---|---|
+| `<PATH>` | Path of the isolated file (required) |
 
 ## `vl secret import`
 

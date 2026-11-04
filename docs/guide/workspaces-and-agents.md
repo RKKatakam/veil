@@ -29,11 +29,25 @@ $ vl ws list
 |---|---|
 | `vl ws new NAME [-r REV] [--cloak [S]]` | A workspace whose working copy is a new change on `REV` (default: the parents of `@`, like a fresh checkout). `--cloak` seals everything recorded in it (default scope `team`) |
 | `vl ws list` | Workspaces and their working copies; `*` marks the one your directory is attached to |
-| `vl ws switch NAME` | Attach the project directory to `NAME`: your files are recorded in the current workspace first, then replaced by `NAME`'s |
+| `vl ws switch NAME` | Attach the project directory to `NAME`: your files are recorded in the current workspace first, then replaced by `NAME`'s. `vl undo` right after it switches back |
 | `vl ws exec NAME -- CMD…` | Run `CMD` in a sandbox holding `NAME`'s files, and record the result in `NAME` |
 | `vl ws cat NAME PATH` | Print a file from a workspace |
-| `vl ws write NAME PATH < FILE` | Write stdin to a file in a workspace and record it, in memory |
+| `vl ws write NAME PATH < FILE` | Write stdin to a file in a workspace and record it, in memory. Fails, saying why, if the policy keeps the path out (an isolated `.env`, an ignored path) or the scanner quarantines it |
 | `vl ws rm NAME` | Delete a workspace (not the one your directory is attached to) |
+
+**Switching is safe to interrupt.** Before `vl ws switch` touches a file
+it notes in `.veil/local/checkout.json` where the directory is going. If it
+is killed half way (or the disk fills up), the next `vl` command finishes
+the move (`Finished the interrupted move of the working copy to workspace
+'NAME'`) before it records anything, so neither workspace ever records a
+mix of both. Files that are in no snapshot (isolated, ignored, untracked,
+quarantined) stay where they are; see
+[the working copy and the filesystem](troubleshooting.md#the-working-copy-and-the-filesystem).
+
+**Undo and switching.** `vl ws switch` is an operation of its own, and
+`vl undo` right after it switches back: the edits you had made in the
+workspace you left were recorded there and stay there. Each workspace keeps
+its own unrecorded edits whatever you undo.
 
 In revisions, `NAME@` is a workspace's working copy: `vl diff -r agent@`,
 `vl merge agent@`, `vl show fix-cve@`. In `vl log`, `agent@` marks it.

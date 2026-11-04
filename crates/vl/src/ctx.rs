@@ -18,7 +18,6 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde::{Deserialize, Serialize};
 use veil_core::{
     builder::BuildReport,
     checkout::{CheckoutReport, Materialised},
@@ -92,30 +91,10 @@ pub fn user_for(id: &Identity) -> String {
     std::env::var("VEIL_USER").unwrap_or_else(|_| id.name.clone())
 }
 
-/// Which workspace the project directory is attached to, which snapshot
-/// was last materialised there, and what was materialised from what (files
-/// left out because they were unreadable, files written from an embargo
-/// fallback; see [`Materialised`]). Device-local.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct CheckoutState {
-    pub workspace: String,
-    pub snapshot: ObjectId,
-    #[serde(default, skip_serializing_if = "Materialised::is_empty")]
-    pub materialised: Materialised,
-}
-
-impl CheckoutState {
-    pub fn new(workspace: &str, snapshot: ObjectId, materialised: Materialised) -> CheckoutState {
-        CheckoutState {
-            workspace: workspace.to_string(),
-            snapshot,
-            materialised,
-        }
-    }
-}
+pub use veil_core::working_copy::CheckoutState;
 
 pub fn checkout_path() -> VPath {
-    VPath::new(".veil/local/checkout.json").unwrap()
+    CheckoutState::path()
 }
 
 pub struct Ctx {
@@ -142,8 +121,39 @@ pub fn find_root(start: &Path) -> Option<PathBuf> {
 }
 
 pub fn save_checkout(fs: &DiskBackend, st: &CheckoutState) -> Result<()> {
-    fs.write(&checkout_path(), &serde_json::to_vec_pretty(st)?)?;
+    st.save(fs)?;
     Ok(())
+}
+
+/// How long `vl watch` leaves a working copy that another command moved
+/// alone before recovering it itself (that command may still be checking
+/// it out; see [`Ctx::behind`]).
+pub const WATCH_YIELD: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The checkout record of the directory, or a fresh one for `default`.
+fn load_state(fs: &DiskBackend, repo: &Repo) -> Result<CheckoutState> {
+    Ok(match CheckoutState::load(fs)? {
+        Some(st) => st,
+        None => CheckoutState::new(DEFAULT_WORKSPACE, repo.workspace_wc(DEFAULT_WORKSPACE)?, Materialised::default()),
+    })
+}
+
+/// The workspace the directory belongs to, or another one if that one was
+/// removed.
+fn attached_workspace(repo: &Repo, st: &CheckoutState) -> Result<String> {
+    let ws = st.attached().to_string();
+    if repo.view().workspaces.contains_key(&ws) {
+        return Ok(ws);
+    }
+    let fallback = repo
+        .view()
+        .workspaces
+        .keys()
+        .next()
+        .cloned()
+        .ok_or_else(|| anyhow!("repository has no workspaces"))?;
+    warn_untrusted(&format!("workspace '{ws}' no longer exists; attaching to '{fallback}'"));
+    Ok(fallback)
 }
 
 impl Ctx {
@@ -161,23 +171,9 @@ impl Ctx {
         for id in repo.auto_release_embargoes()? {
             eprintln!("{} embargo {id}: its release time has passed", render::green("Released"));
         }
-        let checkout = match fs.read_opt(&checkout_path())? {
-            Some(raw) => serde_json::from_slice(&raw)?,
-            None => CheckoutState::new(DEFAULT_WORKSPACE, repo.workspace_wc(DEFAULT_WORKSPACE)?, Materialised::default()),
-        };
-        let cache = StatCache::load(&*fs, &cache_path(&checkout.workspace));
-        let mut ws = checkout.workspace.clone();
-        if !repo.view().workspaces.contains_key(&ws) {
-            let fallback = repo
-                .view()
-                .workspaces
-                .keys()
-                .next()
-                .cloned()
-                .ok_or_else(|| anyhow!("repository has no workspaces"))?;
-            warn_untrusted(&format!("workspace '{ws}' no longer exists; attaching to '{fallback}'"));
-            ws = fallback;
-        }
+        let checkout = load_state(&fs, &repo)?;
+        let ws = attached_workspace(&repo, &checkout)?;
+        let cache = StatCache::load(&*fs, &cache_path(&ws));
         let mut ctx = Ctx {
             root,
             fs,
@@ -215,6 +211,26 @@ impl Ctx {
     }
 
     fn record(&mut self, description: Option<String>) -> Result<()> {
+        // A move of the directory that a previous command started and did
+        // not finish (killed, disk full): finish it before recording
+        // anything, or the half-moved directory would be recorded as the
+        // edit of the workspace it was leaving.
+        self.resume()?;
+        // Another process may move the workspace between our look at it and
+        // the snapshot's transaction; the snapshot then records nothing, and
+        // we look again (the directory is stale now).
+        for _ in 0..3 {
+            if self.record_once(description.clone())? {
+                return Ok(());
+            }
+            self.repo.reload()?;
+        }
+        bail!("the working copy keeps moving under this command (another `vl` is running here?); try again")
+    }
+
+    /// One attempt of [`Ctx::record`]; `false` if the workspace moved
+    /// before the snapshot could be recorded.
+    fn record_once(&mut self, description: Option<String>) -> Result<bool> {
         let view_wc = self.wc()?;
         let disk = self.fs.clone();
         let fs: &dyn StorageBackend = &*disk;
@@ -238,16 +254,18 @@ impl Ctx {
                 Some(&mut self.cache),
                 Some(&self.checkout.materialised),
             )?;
-            let mut from = base_snap.tree;
+            // The snapshot the directory now holds: what it was checked out
+            // from, the edits saved on top of it, or already the target.
+            let mut holds = base;
             if tree == target_tree {
                 // Directory already matches (e.g. interrupted after checkout).
-                from = target_tree;
+                holds = view_wc;
             } else if tree != base_snap.tree {
                 let (saved, _) = self
                     .repo
                     .commit_fs_as_child(base, fs, "recovered working-copy edits")?;
                 let s = self.repo.snapshot(&saved)?;
-                from = s.tree;
+                holds = saved;
                 warn(&format!(
                     "the working copy was stale; your edits were saved as change {}",
                     s.change_id.short()
@@ -255,17 +273,18 @@ impl Ctx {
             }
             print_working_copy_warnings(&report);
             self.report = report;
-            let to = self.repo.snapshot(&view_wc)?.tree;
-            let mut record = std::mem::take(&mut self.checkout.materialised);
+            // Journalled like any move: a crash half way is finished by the
+            // next command instead of being saved as another "recovery".
+            self.checkout.snapshot = holds;
+            let ws = self.ws.clone();
             let co = self
                 .repo
-                .checkout_tree_recorded(fs, Some(&from), &to, &mut record, Some(&mut self.cache))?;
+                .move_working_copy(fs, &mut self.checkout, &ws, view_wc, Some(&mut self.cache))?;
             print_kept_local(&co.kept_local);
             print_blocked(&co.blocked);
-            self.checkout = CheckoutState::new(&self.ws, view_wc, record);
-            save_checkout(&self.fs, &self.checkout)?;
+            print_obstructed(&co.obstructed);
             self.save_cache();
-            return Ok(());
+            return Ok(true);
         }
         let out = self.repo.snapshot_workspace_with(
             &self.ws,
@@ -274,9 +293,13 @@ impl Ctx {
                 cache: Some(&mut self.cache),
                 materialised: Some(&self.checkout.materialised),
                 description,
+                expected_wc: Some(view_wc),
                 ..Default::default()
             },
         )?;
+        if out.superseded {
+            return Ok(false);
+        }
         self.save_cache();
         self.repo.capture_local_files(fs, &out.report)?;
         render::print_build_warnings(&out.report);
@@ -286,7 +309,59 @@ impl Ctx {
             self.checkout.snapshot = out.snapshot;
             save_checkout(&self.fs, &self.checkout)?;
         }
+        Ok(true)
+    }
+
+    /// Finish a move of the directory that was interrupted (see
+    /// [`veil_core::working_copy`]).
+    fn resume(&mut self) -> Result<()> {
+        if self.checkout.pending.is_none() {
+            return Ok(());
+        }
+        let target = self.checkout.attached().to_string();
+        if let Some(r) = self
+            .repo
+            .resume_working_copy(&*self.fs, &mut self.checkout, Some(&mut self.cache))?
+        {
+            eprintln!(
+                "{} the interrupted move of the working copy to workspace '{}'",
+                render::green("Finished"),
+                safe(&target)
+            );
+            if r.written + r.removed > 0 {
+                eprintln!("Updated {} files, removed {}", r.written, r.removed);
+            }
+            print_kept_local(&r.kept_local);
+            print_blocked(&r.blocked);
+            print_obstructed(&r.obstructed);
+        }
+        self.save_cache();
         Ok(())
+    }
+
+    /// Re-read the view and the directory's checkout record: another `vl`
+    /// command may have moved the working copy since this session started
+    /// (`vl watch` runs for hours).
+    pub fn refresh(&mut self) -> Result<()> {
+        self.repo.reload()?;
+        self.checkout = load_state(&self.fs, &self.repo)?;
+        let ws = attached_workspace(&self.repo, &self.checkout)?;
+        if ws != self.ws {
+            self.cache = StatCache::load(&*self.fs, &cache_path(&ws));
+            self.ws = ws;
+        }
+        Ok(())
+    }
+
+    /// Is the directory behind the repository: is a move of it unfinished,
+    /// or does the attached workspace point elsewhere than what was last
+    /// materialised? Right after another command moved the working copy,
+    /// that command may still be checking it out.
+    pub fn behind(&self) -> Result<bool> {
+        let view_wc = self.wc()?;
+        Ok(self.checkout.pending.is_some()
+            || self.checkout.workspace != self.ws
+            || (self.checkout.snapshot != view_wc && self.repo.store().has(&self.checkout.snapshot)))
     }
 
     /// Materialise what was unreadable when the directory was checked out
@@ -312,6 +387,9 @@ impl Ctx {
 
     /// Bring the project directory in line with the attached workspace.
     pub fn finish(&mut self) -> Result<()> {
+        if self.checkout.pending.is_some() {
+            self.resume()?;
+        }
         let target = self.wc()?;
         let moved = target != self.checkout.snapshot || self.checkout.workspace != self.ws;
         if !moved && self.checkout.materialised.is_empty() {
@@ -325,21 +403,13 @@ impl Ctx {
         let from = self.repo.snapshot(&self.checkout.snapshot)?.tree;
         let to_snap = self.repo.snapshot(&target)?;
         let previous = self.checkout.snapshot;
-        let mut record = std::mem::take(&mut self.checkout.materialised);
-        let report = if from != to_snap.tree || !record.is_empty() {
-            Some(self.repo.checkout_tree_recorded(
-                &*self.fs,
-                Some(&from),
-                &to_snap.tree,
-                &mut record,
-                Some(&mut self.cache),
-            )?)
-        } else {
-            None
-        };
-        // Persist the pointer before printing anything.
-        self.checkout = CheckoutState::new(&self.ws, target, record);
-        save_checkout(&self.fs, &self.checkout)?;
+        let needs_checkout = from != to_snap.tree || !self.checkout.materialised.is_empty();
+        // Journalled: a crash half way is finished by the next command.
+        let ws = self.ws.clone();
+        let r = self
+            .repo
+            .move_working_copy(&*self.fs, &mut self.checkout, &ws, target, Some(&mut self.cache))?;
+        let report = needs_checkout.then_some(r);
         self.save_cache();
         if let Some(r) = report {
             if r.written + r.removed > 0 {
@@ -363,6 +433,7 @@ impl Ctx {
             }
             print_kept_local(&r.kept_local);
             print_blocked(&r.blocked);
+            print_obstructed(&r.obstructed);
         }
         // A `.veilpolicy` that arrived with this checkout: say now (not at
         // the next snapshot) which local files keep their protection.
@@ -447,6 +518,41 @@ fn print_filled_in(r: &CheckoutReport) {
     }
     print_kept_local(&r.kept_local);
     print_blocked(&r.blocked);
+    print_obstructed(&r.obstructed);
+}
+
+/// Paths checkout did not write because something it did not write is in
+/// the way (grouped by obstacle). The obstacle is the user's: kept as is.
+fn print_obstructed(paths: &[(VPath, VPath)]) {
+    let mut by_obstacle: std::collections::BTreeMap<&VPath, Vec<&VPath>> = Default::default();
+    for (p, obstacle) in paths {
+        by_obstacle.entry(obstacle).or_default().push(p);
+    }
+    for (obstacle, ps) in by_obstacle {
+        let what = if ps.len() == 1 && ps[0] == obstacle {
+            format!(
+                "{}/ holds files that are in no snapshot (isolated, ignored or untracked), so the snapshot's file {} was not written",
+                safe(obstacle.as_str()),
+                safe(obstacle.as_str())
+            )
+        } else {
+            let shown: Vec<String> = ps.iter().take(3).map(|p| safe(p.as_str()).into_owned()).collect();
+            let more = if ps.len() > 3 { format!(" and {} more", ps.len() - 3) } else { String::new() };
+            format!(
+                "{} is a file that is in no snapshot, so the snapshot's {}{more} below it {} not written",
+                safe(obstacle.as_str()),
+                shown.join(", "),
+                if ps.len() == 1 { "was" } else { "were" }
+            )
+        };
+        eprintln!(
+            "  {} {} ({what}; the next snapshot records the working copy as it is. To take the snapshot's version, \
+             move {} out of the way and run `vl restore`)",
+            render::yellow("kept"),
+            safe(obstacle.as_str()),
+            safe(obstacle.as_str())
+        );
+    }
 }
 
 fn print_blocked(paths: &[VPath]) {

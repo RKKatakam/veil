@@ -42,7 +42,27 @@ pub struct VaultData {
     /// Isolated file path → hex-encoded content.
     #[serde(default)]
     pub files: BTreeMap<String, String>,
+    /// Backups of isolated files that are no longer in the working copy,
+    /// kept for [`REMOVED_RETENTION_MS`] after they were first seen missing
+    /// (`vl secret recover` writes one back). Whoever removed the file (the
+    /// user, a tool, a checkout), the backup is the last copy of content
+    /// that is in no snapshot, so it is not dropped at the next snapshot.
+    /// Never injected into sandboxes: the file is gone from the working copy.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub removed: BTreeMap<String, RemovedFile>,
 }
+
+/// The backup of an isolated file that disappeared from the working copy.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovedFile {
+    /// Hex-encoded content.
+    pub content: String,
+    /// When a snapshot first found the file missing (ms since the epoch).
+    pub removed_at: i64,
+}
+
+/// How long the backup of a vanished isolated file is kept: 30 days.
+pub const REMOVED_RETENTION_MS: i64 = 30 * 24 * 3600 * 1000;
 
 pub const VAULT_PATH: &str = ".veil/local/vault.sealed";
 
@@ -163,15 +183,66 @@ impl Repo {
             }
         }
         let keep: std::collections::HashSet<&str> = local.iter().map(|p| p.as_str()).collect();
+        // A backup whose file is still there (no longer local-only, say) is
+        // not the last copy; one whose file is gone is kept for a while.
+        let mut gone = std::collections::HashSet::new();
+        if let Stored::Open(v) = self.vault_read(&self.local_key()?)? {
+            for p in v.files.keys().filter(|p| !keep.contains(p.as_str())) {
+                let vanished = match VPath::new(p) {
+                    Ok(vp) => !fs.exists(&vp)?,
+                    Err(_) => false,
+                };
+                if vanished {
+                    gone.insert(p.clone());
+                }
+            }
+        }
+        let now = crate::now_millis();
         let res = self.vault_update(|vault| {
-            let before = vault.files.clone();
-            vault.files.retain(|p, _| keep.contains(p.as_str()));
+            let before = vault.clone();
+            let dropped: Vec<(String, String)> = std::mem::take(&mut vault.files)
+                .into_iter()
+                .filter_map(|(p, c)| {
+                    if keep.contains(p.as_str()) {
+                        vault.files.insert(p, c);
+                        None
+                    } else {
+                        Some((p, c))
+                    }
+                })
+                .collect();
+            for (p, content) in dropped {
+                if gone.contains(&p) {
+                    vault.removed.insert(p, RemovedFile { content, removed_at: now });
+                }
+            }
+            vault.removed.retain(|p, r| !keep.contains(p.as_str()) && now - r.removed_at < REMOVED_RETENTION_MS);
             vault.files.extend(contents);
-            Ok(vault.files != before)
+            Ok(*vault != before)
         });
         match res {
             Err(_) if self.vault_unreadable()? => Ok(false),
             r => r,
         }
+    }
+
+    /// Write the vault's backup of the isolated file `path` back into the
+    /// working copy `fs` (the latest backup, or the one kept after the file
+    /// vanished). Refuses if anything exists at `path`: a backup never
+    /// overwrites. Returns whether there was a backup.
+    pub fn vault_recover_file(&self, fs: &dyn StorageBackend, path: &VPath) -> Result<bool> {
+        let vault = self.vault_load()?;
+        let key = path.as_str();
+        let Some(hexdata) = vault.files.get(key).or_else(|| vault.removed.get(key).map(|r| &r.content)) else {
+            return Ok(false);
+        };
+        if fs.metadata(path)?.is_some() || crate::checkout::behind_special(fs, path)? {
+            return Err(VeilError::AlreadyExists(format!(
+                "{key} exists in the working copy; move it away first (the backup never overwrites)"
+            )));
+        }
+        let data = hex::decode(hexdata).map_err(|e| VeilError::Corrupt(VAULT_PATH.into(), e.to_string()))?;
+        fs.write(path, &data)?;
+        Ok(true)
     }
 }

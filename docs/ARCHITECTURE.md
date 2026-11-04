@@ -652,7 +652,10 @@ snapshot (and with it every command), and nothing is dropped silently:
 
 Local-only files (isolated and quarantined) are backed up into the vault, so
 `vl ws exec --with-isolated` can inject `.env` into a sandbox without it ever
-touching history. The sandbox is then snapshotted with those contents as
+touching history. The backup of a file that disappears from the working
+copy, whatever removed it, moves to `VaultData::removed` for 30 days instead
+of being pruned at the next snapshot (`vl secret files`, `vl secret
+recover PATH`); it is the last copy of content that is in no snapshot. The sandbox is then snapshotted with those contents as
 `InjectedSecrets`. Any new or changed file, of any tier, that contains one of
 the injected values is quarantined (`injected-isolated-secret`), so a command
 cannot record a copy under another name. The values are: each `KEY=value`
@@ -751,7 +754,48 @@ A workspace is only a named pointer in the view. It owns no directory.
   last materialised, which gives *stale working copy* detection. If the view
   moved underneath the directory (an undo, another process, an interrupted
   command), any local edits are saved as their own change before catching up.
-  Nothing is lost.
+  Nothing is lost. The snapshot itself is checked against the pointer
+  under the repository lock (`SnapshotOptions::expected_wc`): if another
+  process moved the workspace between the session's look and the
+  snapshot's transaction, nothing is recorded and the session looks again,
+  so a directory is never recorded into a working copy it was not checked
+  out from.
+* **Moving the directory is journalled** (`working_copy.rs`,
+  `Repo::move_working_copy`). Before checkout touches a file, the target
+  workspace and snapshot are written to `checkout.json` as `pending`;
+  afterwards the record says the directory holds the target. A command
+  killed in between (or a checkout that fails half way) leaves "somewhere
+  between `snapshot` and `pending`", and the next command finishes the move
+  (`Repo::resume_working_copy`) before it records anything. Checkout only
+  writes a file that still holds what `snapshot` put there or already holds
+  the target, and keeps anything else, so running it again from `snapshot`
+  is deterministic. The directory belongs to the pending workspace from the
+  moment the journal is written. Before this, `vl ws switch` (whose
+  attachment exists only in `checkout.json`) could be interrupted after
+  replacing files, and the next command recorded the mix into the workspace
+  it was leaving (BUG-113). The crash harness sweeps `ws switch` across
+  every write (`crash_during_workspace_switch`). gc keeps the pending
+  snapshot as well as the materialised one.
+* **Checkout never deletes what it did not write.** A file is overwritten
+  or removed only if it holds what `from` put there. A directory where the
+  target has a file is removed only once checkout has emptied it (a
+  directory holding an isolated `private/notes.md`, an ignored build tree,
+  untracked work, even only a symlink, is left as is); a file where the
+  target has a directory (a quarantined `cfg` where the tree has
+  `cfg/settings.json`) is kept too. Both are reported as
+  `CheckoutReport::obstructed` and the paths they stand in the way of are
+  not written; the next snapshot records the directory as it is, as for a
+  kept local edit (BUG-110, BUG-111). Before this, the first case ran
+  `remove_dir_all` on never-recorded content and the second failed the
+  checkout half way, after the view had moved, bricking every command.
+* **`vl watch` re-reads the pointer every tick** (`Ctx::refresh`). One
+  long-lived session judged the directory against the pointer it read at
+  start, so after another command moved the working copy it "recovered"
+  the user's new files into a stray change and removed them from disk
+  (BUG-117). When the directory is behind the view (another command has
+  moved it and may still be checking it out), the watcher yields; only if
+  it stays behind for 10 s (or two intervals) does it recover it as any
+  command would.
 * **What was materialised from what.** `checkout.json` also records
   (`checkout::Materialised`) the files checkout left out because this reader
   could not read them (no key for their scope yet), the files it wrote from
@@ -771,6 +815,21 @@ A workspace is only a named pointer in the view. It owns no directory.
   automatic snapshot that `vl undo` skips as "the user's uncommitted
   edits". So `vl undo` reverts them (an accidental `vl expose` above all),
   and edits made after them are kept as usual.
+* **Undo and commands outside the view.** An operation may carry
+  `manual_undo`: its effect lies outside the view (a key ring, the remotes
+  in `repo.json`, the local vault, the accepted policy, the directory's
+  attachment), so restoring an older view does not revert it. `vl scope
+  create|grant|revoke|rotate`, `vl remote add|rm`, `vl secret
+  set|rm|import`, `vl policy accept` and `vl ws switch` record such an
+  operation (`Repo::record_outside_view`, `Repo::record_workspace_switch`).
+  `Repo::undo_keeping_edits` refuses to undo one and returns its
+  instructions, instead of skipping it and undoing an unrelated, earlier
+  operation (BUG-116); `vl op restore` warns about each one it passes. A
+  switch is the exception the CLI can reverse: `vl undo` right after `vl ws
+  switch` switches back, so it never undoes the automatic snapshot of the
+  workspace just left, which held that workspace's last edits (BUG-100).
+  A property test drives random switch/edit/commit/undo sequences through
+  the binary and checks that no edit is ever lost.
 * **Virtual workspaces** (`vl ws new`) exist only in the DAG. They are edited
   through overlays (`vl ws write`), materialised into a throwaway directory
   for one command (`vl ws exec`), or attached to the project directory

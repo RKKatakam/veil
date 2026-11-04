@@ -473,6 +473,15 @@ pub enum SecretCmd {
         /// Secret name.
         name: String,
     },
+    /// List the vault's backups of isolated files (`.env` & co), including
+    /// those of files gone from the working copy (kept 30 days).
+    Files,
+    /// Write the vault's backup of an isolated file back into the working
+    /// copy (never over an existing file).
+    Recover {
+        /// Path of the isolated file.
+        path: String,
+    },
     /// Import KEY=VALUE lines from a dotenv file.
     Import {
         /// Dotenv file to read.

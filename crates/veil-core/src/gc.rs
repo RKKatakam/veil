@@ -176,15 +176,25 @@ fn op_path(id: &ObjectId) -> VPath {
     VPath::new(".veil/ops").unwrap().join(&id.hex())
 }
 
-/// Snapshot recorded in the project directory's checkout pointer, if any.
-/// The CLI diffs the working copy against it, so it must survive gc even if
-/// no retained view references it any more.
-fn checkout_snapshot(backend: &dyn StorageBackend) -> Option<ObjectId> {
-    let raw = backend
-        .read_opt(&VPath::new(".veil/local/checkout.json").ok()?)
-        .ok()??;
-    let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
-    ObjectId::from_hex(v.get("snapshot")?.as_str()?).ok()
+/// Snapshots recorded in the project directory's checkout pointer: the one
+/// last materialised and the target of an unfinished move (its journal).
+/// The CLI diffs the working copy against them, so they must survive gc even
+/// if no retained view references them any more.
+fn checkout_snapshots(backend: &dyn StorageBackend) -> Vec<ObjectId> {
+    let Some(raw) = VPath::new(crate::working_copy::CHECKOUT_STATE_PATH)
+        .ok()
+        .and_then(|p| backend.read_opt(&p).ok().flatten())
+    else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+        return Vec::new();
+    };
+    let id = |v: Option<&serde_json::Value>| v.and_then(|s| s.as_str()).and_then(|s| ObjectId::from_hex(s).ok());
+    [id(v.get("snapshot")), id(v.get("pending").and_then(|p| p.get("snapshot")))]
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 const HINT_DIR: u8 = 0;
@@ -411,7 +421,7 @@ pub fn gc(repo: &mut Repo, opts: &GcOptions) -> Result<GcReport> {
         }
     }
     roots.extend(opts.extra_roots.iter().copied());
-    roots.extend(checkout_snapshot(&*backend));
+    roots.extend(checkout_snapshots(&*backend));
     roots.sort();
     roots.dedup();
     let mut mark = Mark {

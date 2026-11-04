@@ -52,7 +52,6 @@ fn undo_after_a_commit_keeps_the_edits_made_since() {
 /// snapshot working copy of 'default'"), and the directory, now attached
 /// to `agent`, no longer holds them. They survive only in the op log.
 #[test]
-#[ignore = "BUG-100: `vl undo` right after `vl ws switch` discards the previous workspace's last edits instead of undoing a command"]
 fn undo_after_a_workspace_switch_does_not_discard_the_previous_workspaces_edits() {
     let env = Env::new();
     let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
@@ -148,7 +147,6 @@ fn restore_from_a_revision_does_not_accept_its_policy() {
 /// believes the file is in the workspace; `vl ws cat` then says it does
 /// not exist.
 #[test]
-#[ignore = "BUG-102: `vl ws write` of an isolated path says `Recorded` although the file was dropped"]
 fn ws_write_of_an_isolated_path_does_not_claim_it_was_recorded() {
     let env = Env::new();
     let proj = env.project(U, "proj", &[("app.py", "x\n")]);
@@ -392,7 +390,6 @@ fn undo_of_an_embargo_release_keeps_the_fix_embargoed() {
 /// user's private notes and the build tree, and the next snapshot prunes
 /// the vault's backup of the notes because they no longer exist.
 #[test]
-#[ignore = "BUG-110: checkout deletes an isolated or ignored directory (never recorded) when the target tree has a file at its path"]
 fn checkout_does_not_delete_a_local_only_directory_to_place_a_file() {
     let env = Env::new();
     let proj = env.dir("proj");
@@ -434,7 +431,6 @@ fn checkout_does_not_delete_a_local_only_directory_to_place_a_file() {
 /// hand, gets out. The documented behaviour for a file in the way is to
 /// keep it and report it (`CheckoutReport::blocked` / `kept_local`).
 #[test]
-#[ignore = "BUG-111: a file in the way of a directory makes a checkout fail half way and bricks every later command"]
 fn a_file_in_the_way_of_a_directory_is_kept_and_reported() {
     let env = Env::new();
     let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
@@ -525,7 +521,6 @@ fn the_identity_file_is_never_world_readable_even_briefly() {
 /// (the view moved, so the directory is detected as stale and its state is
 /// saved as a change); `ws switch` does not.
 #[test]
-#[ignore = "BUG-113: a `vl ws switch` whose checkout fails or is interrupted records the half-switched directory as the old workspace's working copy"]
 fn an_interrupted_workspace_switch_does_not_corrupt_the_old_workspace() {
     let env = Env::new();
     let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
@@ -603,7 +598,6 @@ fn the_ci_scan_recipe_cannot_be_switched_off_by_the_scanned_policy() {
 /// `Undid: set tag main` is all that says so. A member who granted the
 /// wrong key, "undid" it, and pushes, ships the ring with that key in it.
 #[test]
-#[ignore = "BUG-116: `vl undo` after `vl scope grant` (or `remote add`, `secret set`) undoes the previous unrelated operation and leaves the grant in place"]
 fn undo_after_a_scope_grant_does_not_undo_an_unrelated_operation() {
     let env = Env::new();
     let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
@@ -618,6 +612,48 @@ fn undo_after_a_scope_grant_does_not_undo_an_unrelated_operation() {
         "undo after the grant: {}\ntags:\n{tags}scope:\n{scope}",
         text(&out).trim()
     );
+}
+
+/// BUG-116, the other commands that change things outside the view: each
+/// is an operation, and `vl undo` right after it explains how to reverse it
+/// instead of undoing the tag set before it.
+#[test]
+fn undo_after_remote_secret_or_policy_commands_names_them_and_undoes_nothing_else() {
+    let env = Env::new();
+    let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
+    let remote = env.dir("remote");
+    let cases: Vec<(Vec<String>, &str)> = vec![
+        (vec!["remote".into(), "add".into(), "origin".into(), remote.display().to_string()], "vl remote rm origin"),
+        (vec!["remote".into(), "rm".into(), "origin".into()], "vl remote add origin"),
+        (vec!["secret".into(), "set".into(), "API".into(), "v".into()], "vl secret rm API"),
+        (vec!["secret".into(), "rm".into(), "API".into()], "vl secret set API"),
+        (vec!["policy".into(), "accept".into()], "vl policy accept"),
+    ];
+    for (args, hint) in cases {
+        let a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        env.ok(U, &proj, &a);
+        let ops = env.stdout(U, &proj, &["op", "log", "-n", "3"]);
+        let out = env.vl(U, &proj, &["undo"]);
+        assert!(!out.status.success() && text(&out).contains(hint), "undo after {args:?}:\n{}\nops:\n{ops}", text(&out));
+        assert!(env.stdout(U, &proj, &["tag", "list"]).contains("main"), "undo after {args:?} undid `tag set main`");
+    }
+}
+
+/// The backup of an isolated file that disappeared is kept and can be
+/// written back.
+#[test]
+fn a_vanished_isolated_file_can_be_recovered_from_the_vault() {
+    let env = Env::new();
+    let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
+    write(&proj, ".env", "TOKEN=abc\n");
+    env.ok(U, &proj, &["status"]);
+    std::fs::remove_file(proj.join(".env")).unwrap();
+    env.ok(U, &proj, &["status"]);
+    env.ok(U, &proj, &["status"]);
+    assert!(env.stdout(U, &proj, &["secret", "files"]).contains(".env"));
+    env.ok(U, &proj, &["secret", "recover", ".env"]);
+    assert_eq!(read(&proj, ".env"), "TOKEN=abc\n");
+    assert!(!env.vl(U, &proj, &["secret", "recover", ".env"]).status.success(), "never overwrites");
 }
 
 // ---- `vl watch` next to other commands ----------------------------------------------
@@ -635,7 +671,6 @@ fn undo_after_a_scope_grant_does_not_undo_an_unrelated_operation() {
 /// **removes those files from disk**. The user's new file vanishes while
 /// they are editing; it survives only in a stray change.
 #[test]
-#[ignore = "BUG-117: `vl watch` next to another `vl` command moves the user's new files off disk into a stray change on an obsolete snapshot"]
 fn watch_does_not_move_new_files_off_disk_after_a_concurrent_command() {
     let env = Env::new();
     let proj = env.project(U, "proj", &[("a.txt", "a\n")]);

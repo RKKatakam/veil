@@ -326,6 +326,8 @@ db=postgres://app:Xk29vLq8sPz@db/prod token=s3cr3t-value
 | `vl secret get NAME` | Print it |
 | `vl secret list` / `vl secret rm NAME` | List names / delete one |
 | `vl secret import FILE` | Import `KEY=VALUE` lines from a dotenv file (`export` prefixes and quotes are stripped) |
+| `vl secret files` | List the vault's backups of isolated files, including those of files gone from the working copy (kept 30 days) |
+| `vl secret recover PATH` | Write the backup of an isolated file back into the working copy (never over an existing file) |
 | `vl run -- CMD…` | Run `CMD` with every vault secret in its environment; exits with its status |
 
 The vault is per repository and per device. A teammate's clone has its own.
