@@ -111,8 +111,12 @@ object      = tag || payload            id = BLAKE3(object)
 veil:blob\n   raw bytes
 veil:tree\n   0x02 binary entries (format 2)  |  JSON { entries: [ {name, kind, id, size, executable, visibility, fallback} ] } (format 1)
 veil:snap\n   JSON Snapshot
-veil:seal\n   u16 scope_len | scope | nonce[24] | XChaCha20-Poly1305(ciphertext of an encoded object)
+veil:sea2\n   u16 scope_len | scope | AES-SIV(ciphertext of an encoded object)        (format 3)
+veil:seal\n   u16 scope_len | scope | nonce[24] | XChaCha20-Poly1305(ciphertext)  (formats 1–2, legacy)
 ```
+
+Every cryptographic construction, its standard and its limits are in
+[CRYPTO.md](CRYPTO.md).
 
 The first payload byte of a tree or snapshot is its encoding version (`{`
 for JSON), and a repository writes trees in the encoding of its format
@@ -160,26 +164,30 @@ it. `ObjectStore::open` peels sealed layers using the keychain. A missing key
 and a wrong key both surface as `Redacted`. A missing object surfaces as
 `Missing`. Callers treat both as "exists, but not for you".
 
-**Deterministic sealing.** The nonce is
-`BLAKE3-keyed(derive(key), scope ‖ 0 ‖ plaintext)[..24]` (SIV-style).
+**Deterministic sealing.** Format-3 repositories seal objects with AES-SIV
+(RFC 5297, CMAC-AES-256 + CTR-AES-256 under `HKDF-SHA256(scope key)`, the
+label as associated data, no nonce); formats 1–2 used, and still write, a
+keyed-BLAKE3-derived XChaCha20-Poly1305 nonce (CRYPTO.md C1, C1L).
 Re-snapshotting an unchanged cloaked file therefore gives the same id. That
 means deduplication and no-op snapshots still work for encrypted content. The
 cost is that equal plaintexts under the same scope are linkable, the same
-trade-off convergent-encryption backups make. Descriptions and wrapped keys
-use random nonces.
+trade-off convergent-encryption backups make. Descriptions, sealed keys and
+the vault use XChaCha20-Poly1305 with random nonces.
 
 ## 3. Identities, scopes and the keychain
 
 ### Identities
 
-* An **identity** is one 32-byte secret, stored outside the repository
-  (`$VEIL_HOME/identity.json`, mode 0600). Two keypairs come from it:
-  * **X25519** (the secret itself) for receiving wrapped scope keys. Its
-    public key `veil1<hex64>` is the **member id**.
-  * **Ed25519** for signing. The seed is
-    `BLAKE3-derive("veil 2026 ed25519-seed v1", secret)`, so identity files
-    written before signatures existed load unchanged and get a stable
-    signing key.
+* An **identity** has two keypairs, stored outside the repository
+  (`$VEIL_HOME/identity.json`, mode 0600):
+  * **X25519** for receiving wrapped scope keys (HPKE, RFC 9180, in format
+    3; a legacy sealed box in formats 1–2; CRYPTO.md C3, C3L). Its public
+    key `veil1<hex64>` is the **member id**.
+  * **Ed25519** for signing. Identities created by this release have an
+    independent random seed. Older identity files derive it as
+    `BLAKE3-derive("veil 2026 ed25519-seed v1", x25519_secret)`; they load
+    unchanged, keep their signing key, and `vl identity show` marks them
+    legacy (CRYPTO.md C4).
 * The **full public identity** is `veil1<x25519-hex><ed25519-hex>` (128 hex
   digits). `vl identity show` prints it, and `vl scope grant` should be
   given it. A grant made with the short member id still works for

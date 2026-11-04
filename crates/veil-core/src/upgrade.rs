@@ -11,13 +11,22 @@
 //! 1. **verify**: `fsck` the repository; any corruption stops the upgrade
 //!    before anything is written (unless forced), and a census counts the
 //!    trees in each encoding;
-//! 2. one **step per format transition** (`1 → 2` has none: existing
-//!    objects keep their bytes and ids, only what is written from now on
-//!    changes);
+//! 2. one **step per format transition** (`1 → 2` and `2 → 3` have none:
+//!    existing objects keep their bytes and ids, only what is written from
+//!    now on changes);
 //! 3. **set-format**: write `repo.json` with the new format, atomically.
 //!    This is the commit point: before it the repository is entirely the old
 //!    format, after it entirely the new one;
-//! 4. remove the journal.
+//! 4. steps that need the new format (`3:hpke-ring-keys`: move every scope
+//!    this identity administers to HPKE key wrapping by appending a signed
+//!    rotation to its ring, see [`Keychain::migrate_to_hpke`]);
+//! 5. remove the journal.
+//!
+//! **Sealed history is not re-sealed** by `2 → 3`: re-sealing would change
+//! object ids, and with them every tree, snapshot id and signature above
+//! them. Objects sealed before the upgrade stay in the legacy construction
+//! (readable forever); new objects are sealed with AES-SIV. See
+//! `docs/CRYPTO.md`, "Migration".
 //!
 //! Each finished step is recorded in the journal before the next starts, so a
 //! crashed upgrade resumes where it stopped (`vl upgrade` again). Old data is
@@ -31,6 +40,7 @@ use crate::{
     error::{Result, VeilError},
     fsck::{fsck, Severity},
     identity::Identity,
+    keychain::{HpkeMigration, Keychain, HPKE_REPO_FORMAT},
     lock::RepoLock,
     now_millis,
     object::{Object, TreeEncoding},
@@ -91,6 +101,8 @@ pub struct UpgradeReport {
     pub corrupt: Vec<String>,
     /// What the upgrade means for this repository and its users.
     pub notes: Vec<String>,
+    /// What the steps did (e.g. which key rings were re-keyed).
+    step_notes: Vec<String>,
 }
 
 fn journal_path() -> VPath {
@@ -117,12 +129,71 @@ fn transition_steps(from: u32) -> Vec<&'static str> {
         // Binary trees: nothing to rewrite. Existing JSON trees keep their
         // bytes and ids (and with them every snapshot id and signature).
         1 => vec![],
+        // AES-SIV and HPKE: nothing to rewrite either (old sealed objects
+        // keep their bytes, ids and the legacy construction).
+        2 => vec![],
         _ => vec![],
     }
 }
 
+/// Steps that run after the commit point, in the new format (each must be
+/// idempotent). Named `<format>:<step>`.
+fn post_commit_steps(from: u32, to: u32) -> Vec<String> {
+    let mut out = Vec::new();
+    if from < HPKE_REPO_FORMAT && to >= HPKE_REPO_FORMAT {
+        out.push(format!("{HPKE_REPO_FORMAT}:hpke-ring-keys"));
+    }
+    out
+}
+
+/// `3:hpke-ring-keys`: rotate every ring this identity may change whose
+/// current key was wrapped with the legacy sealed box. Returns notes.
+fn hpke_ring_keys(backend: &Arc<dyn StorageBackend>, identity: Option<&Identity>, repo_id: &str) -> Result<Vec<String>> {
+    let Some(identity) = identity else {
+        return Ok(vec![
+            "key rings were not re-keyed here (no identity: a remote is upgraded structurally); \
+             they move to HPKE when an admin who has upgraded their clone pushes"
+                .into(),
+        ]);
+    };
+    let keys = Keychain::new(backend.clone(), Some(identity.clone()), repo_id.to_string());
+    keys.set_format(HPKE_REPO_FORMAT);
+    let mut notes = Vec::new();
+    for ring in keys.rings()? {
+        let scope = ring.scope.clone();
+        match keys.migrate_to_hpke(&scope)? {
+            HpkeMigration::AlreadyHpke => {}
+            HpkeMigration::Rotated(g) => notes.push(format!(
+                "scope '{scope}': new key generation {g}, wrapped to every member with HPKE; \
+                 earlier generations stay reachable (and stay under the legacy key wrapping already published)"
+            )),
+            HpkeMigration::NotAdmin => notes.push(format!(
+                "scope '{scope}': its key is still wrapped with the legacy construction; \
+                 an admin should run `vl upgrade` (or `vl scope rotate {scope}`) in an upgraded clone"
+            )),
+            HpkeMigration::Unverifiable(e) => {
+                notes.push(format!("scope '{scope}': key ring does not verify ({e}); left unchanged"))
+            }
+        }
+    }
+    Ok(notes)
+}
+
 fn notes_for(from: u32, to: u32, report: &UpgradeReport) -> Vec<String> {
     let mut notes = Vec::new();
+    if from < HPKE_REPO_FORMAT && to >= HPKE_REPO_FORMAT {
+        notes.push(
+            "new content is sealed with AES-SIV and scope keys are wrapped with HPKE; existing sealed objects \
+             keep the legacy construction, their bytes and their ids (nothing is re-sealed), so snapshot ids \
+             and signatures do not change"
+                .into(),
+        );
+        notes.push(
+            "a remote still at format 1 or 2 refuses AES-SIV objects and HPKE key rings: upgrade it with \
+             `vl upgrade --remote <name>`; a member's clone at format 2 cannot pull them until it is upgraded"
+                .into(),
+        );
+    }
     if from < 2 && to >= 2 {
         notes.push(format!(
             "{} existing JSON tree(s) keep their bytes and ids, so snapshot ids, change ids and signatures do not change; \
@@ -181,6 +252,7 @@ pub fn upgrade(
         plan.extend(transition_steps(f).into_iter().map(|s| format!("{f}->{}:{s}", f + 1)));
     }
     plan.push("set-format".into());
+    plan.extend(post_commit_steps(report.from, report.to));
 
     let mut j = journal.unwrap_or(Journal {
         from: report.from,
@@ -225,6 +297,10 @@ pub fn upgrade(
             config.min_vl = (report.to > 1).then(|| min_vl_for_format(report.to).to_string());
             write_config(&*backend, &config)?;
         }
+        if step.ends_with(":hpke-ring-keys") {
+            let notes = hpke_ring_keys(&backend, identity.as_ref(), &config.repo_id)?;
+            report.step_notes.extend(notes);
+        }
         j.done.push(step);
         write_journal(&*backend, &j)?;
     }
@@ -233,6 +309,7 @@ pub fn upgrade(
         census(&backend, &mut report)?;
     }
     report.notes = notes_for(report.from, report.to, &report);
+    report.notes.append(&mut report.step_notes);
     if !opts.dry_run {
         backend.remove_file(&journal_path())?;
     }

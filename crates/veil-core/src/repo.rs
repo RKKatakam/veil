@@ -46,9 +46,11 @@ pub const VEIL_DIR: &str = ".veil";
 /// |---|---|---|
 /// | 1 | vl 0.1.0 | JSON trees |
 /// | 2 | vl 1.0.0 | binary trees (`TreeEncoding::Binary`) |
+/// | 3 | vl 1.0.0 | standard crypto: AES-SIV sealed objects (`veil:sea2`), HPKE-wrapped ring keys (ring format 3) |
 ///
-/// Every format up to this one is read; see `docs/FORMAT.md`.
-pub const REPO_FORMAT: u32 = 2;
+/// Every format up to this one is read; see `docs/FORMAT.md` and
+/// `docs/CRYPTO.md`.
+pub const REPO_FORMAT: u32 = 3;
 
 /// Oldest repository format this build reads (and keeps writing, unchanged,
 /// until `vl upgrade`).
@@ -58,7 +60,7 @@ pub const MIN_REPO_FORMAT: u32 = 1;
 pub fn min_vl_for_format(format: u32) -> &'static str {
     match format {
         0 | 1 => "0.1.0",
-        2 => "1.0.0",
+        2 | 3 => "1.0.0",
         _ => "a newer release",
     }
 }

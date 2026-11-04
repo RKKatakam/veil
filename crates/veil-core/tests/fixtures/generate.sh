@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Generate a golden fixture set with a given `vl` binary.
 #
-#   generate.sh <path/to/vl> <output-dir>
+#   generate.sh <path/to/vl> <output-dir> [<previous-fixture-set>]
 #
 # Every repository format must have a fixture set produced by the release
 # that introduced it (see docs/FORMAT.md, "Compatibility fixtures"). Never
@@ -16,10 +16,20 @@
 #                   state, an isolated file
 #   team-remote/    bare remote alice pushed to (ciphertext and rings)
 #   public-mirror/  bare public remote (cloaked content withheld)
+#
+# With a previous fixture set (format 3 on: pass format-2), also:
+#   home-dave/      a *legacy* identity (copied from the previous set's
+#                   carol: signing key derived from the encryption key),
+#                   granted to `team` in alice/ next to the new identities
+#   upgraded/       the previous set's alice/ and team-remote/ (and their
+#                   identities) after `vl upgrade --remote origin`,
+#                   `vl upgrade` and one more commit pushed: old sealed
+#                   objects and ring changes next to new ones
 set -euo pipefail
 
 VL=$(realpath "$1")
 OUT=$2
+PREV=${3:+$(realpath "$3")}
 mkdir -p "$OUT"
 OUT=$(realpath "$OUT")
 if [ -e "$OUT/alice" ]; then
@@ -57,6 +67,12 @@ as alice tag set main -r @- >/dev/null
 # Ring: grant bob, grant and revoke carol (generation 1), rotate (generation 2).
 as alice scope grant team "$BOB" --name bob >/dev/null
 as alice scope grant team "$CAROL" --name carol >/dev/null
+if [ -n "$PREV" ]; then
+    mkdir -p "$OUT/home-dave"
+    cp "$PREV/home-carol/identity.json" "$OUT/home-dave/identity.json"
+    DAVE=$(pubkey dave)
+    as alice scope grant team "$DAVE" --name dave >/dev/null
+fi
 as alice scope revoke team "$CAROL" >/dev/null
 as alice scope rotate team >/dev/null
 
@@ -108,5 +124,27 @@ sed -i.bak -e "s#$OUT/#../#g" "$OUT/alice/.veil/repo.json" && rm "$OUT/alice/.ve
 # A lock file must not be left behind; the pointer and caches are kept.
 test ! -e "$OUT/alice/.veil/lock"
 as alice log > "$OUT/alice-log.txt"
+
+if [ -n "$PREV" ]; then
+    U="$OUT/upgraded"
+    mkdir -p "$U"
+    for part in alice team-remote home-alice home-bob home-carol; do
+        cp -R "$PREV/$part" "$U/$part"
+    done
+    up() { # up <user> <args…>   (runs vl in upgraded/alice as that user)
+        local who=$1
+        shift
+        VEIL_HOME="$U/home-$who" VEIL_USER=$who "$VL" -R "$U/alice" "$@"
+    }
+    up alice upgrade --remote origin >/dev/null
+    up alice upgrade >/dev/null
+    printf 'team-only notes v3 (after the upgrade)\n' > "$U/alice/secrets/notes.txt"
+    printf 'after the upgrade\n' > "$U/alice/UPGRADED.md"
+    up alice commit -m "fourth: after the upgrade" >/dev/null
+    up alice tag set main -r @- >/dev/null
+    up alice push origin >/dev/null 2>&1
+    test ! -e "$U/alice/.veil/lock"
+    test ! -e "$U/alice/.veil/upgrade.json"
+fi
 "$VL" --version > "$OUT/VERSION"
 echo "fixture written to $OUT"

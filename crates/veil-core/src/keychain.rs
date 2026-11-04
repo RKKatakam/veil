@@ -34,28 +34,60 @@
 //! The special scope `local` is derived from the identity secret and the
 //! repository id; it never exists anywhere on disk and therefore cannot be
 //! synchronised.
+//!
+//! ## Constructions by repository format
+//!
+//! Scope keys are wrapped to members with HPKE in repository format 3 and
+//! with the legacy sealed box in formats 1–2 (see `identity`); the keychain
+//! learns the format from its store ([`Keychain::set_format`]). A ring that
+//! holds any HPKE-wrapped key is ring format 3, which older vl refuse (no
+//! keys) instead of misreading, and which a format-1/2 repository refuses to
+//! store ("run `vl upgrade`"). Older generation keys (`prev-key:`) and
+//! embargo keys (`embargo-wrap:`) are sealed with XChaCha20-Poly1305 under a
+//! random nonce in every format. Every domain-separation string is in
+//! [`crate::crypto::domains`]; `docs/CRYPTO.md` reviews them.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, RwLock,
+    },
 };
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::{
-    crypto::{parse_key_hex, random_bytes, random_key, Envelope, Key},
+    crypto::{domains, parse_key_hex, random_bytes, random_key, Envelope, Key},
     error::{Result, VeilError},
-    identity::{format_public_key, parse_public_identity, parse_public_key, wrap_key, Identity, Signature, WrappedKey},
+    identity::{
+        format_public_key, parse_public_identity, parse_public_key, wrap_key, wrap_key_legacy, Identity, Signature,
+        WrappedKey,
+    },
     lock::RepoLock,
     object::Snapshot,
     vfs::StorageBackend,
     vpath::VPath,
 };
 
-pub const LOCAL_SCOPE: &str = "local";
-/// Ring file format with a signed change log.
-pub const RING_FORMAT: u32 = 2;
+pub const LOCAL_SCOPE: &str = domains::LOCAL_LABEL;
+/// Ring file format with a signed change log (legacy sealed-box wraps only).
+pub const RING_FORMAT_SIGNED: u32 = 2;
+/// Ring file format whose log may hold HPKE-wrapped keys (repository format
+/// 3); the newest this build reads.
+pub const RING_FORMAT: u32 = 3;
+/// Repository format that may hold HPKE-wrapped keys and ring format 3.
+pub const HPKE_REPO_FORMAT: u32 = 3;
+
+/// Newest ring format a repository of `repo_format` may store.
+pub fn max_ring_format(repo_format: u32) -> u32 {
+    if repo_format >= HPKE_REPO_FORMAT {
+        RING_FORMAT
+    } else {
+        RING_FORMAT_SIGNED
+    }
+}
 
 /// Embargo record format. Format-1 records carry no `format` field; a later
 /// format adds `"format": N`, which this build refuses (see
@@ -76,23 +108,23 @@ pub fn check_embargo_format(raw: &[u8]) -> Result<()> {
     }
 }
 
-const RING_SIG_CONTEXT: &str = "ring-change";
-const EMBARGO_SIG_CONTEXT: &str = "embargo";
-const RELEASE_SIG_CONTEXT: &str = "embargo-release";
+const RING_SIG_CONTEXT: &str = domains::SIG_CONTEXT_RING_CHANGE;
+const EMBARGO_SIG_CONTEXT: &str = domains::SIG_CONTEXT_EMBARGO;
+const RELEASE_SIG_CONTEXT: &str = domains::SIG_CONTEXT_EMBARGO_RELEASE;
 
 /// Public fingerprint of a scope key.
 pub fn key_fingerprint(key: &Key) -> String {
-    hex::encode(&blake3::derive_key("veil 2026 key-fingerprint v1", key)[..8])
+    hex::encode(&blake3::derive_key(domains::KEY_FINGERPRINT, key)[..8])
 }
 
 /// Envelope label for a scope key generation.
 pub fn generation_label(scope: &str, key_id: &str) -> String {
-    format!("{scope}#{key_id}")
+    format!("{scope}{}{key_id}", domains::GENERATION_SEPARATOR)
 }
 
 /// Split an envelope label into `(scope, key id)`; a bare scope has no id.
 pub fn split_label(label: &str) -> (&str, Option<&str>) {
-    match label.split_once('#') {
+    match label.split_once(domains::GENERATION_SEPARATOR) {
         Some((s, k)) => (s, Some(k)),
         None => (label, None),
     }
@@ -226,7 +258,7 @@ impl RingChange {
 
     /// Chain hash of this change (covers the signature too).
     pub fn hash(&self, scope: &str) -> String {
-        let mut h = blake3::Hasher::new_derive_key("veil 2026 ring-change v1");
+        let mut h = blake3::Hasher::new_derive_key(domains::RING_CHANGE_HASH);
         h.update(&self.signing_body(scope));
         h.update(self.signature.as_bytes());
         h.finalize().to_hex()[..32].to_string()
@@ -328,7 +360,36 @@ fn check_rotation(state: &RingState, r: &Rotation, members: &BTreeSet<&String>) 
 
 impl KeyRing {
     pub fn is_legacy(&self) -> bool {
-        self.format < RING_FORMAT
+        self.format < RING_FORMAT_SIGNED
+    }
+
+    /// Every wrapped key in the ring (legacy members and the whole log).
+    fn wrapped_keys(&self) -> impl Iterator<Item = &WrappedKey> {
+        let legacy = self.members.values().map(|m| &m.wrapped);
+        let logged = self.log.iter().flat_map(|c| -> Box<dyn Iterator<Item = &WrappedKey> + '_> {
+            match &c.op {
+                RingOp::Genesis { members, .. } => Box::new(members.iter().map(|m| &m.wrapped)),
+                RingOp::Grant { member } => Box::new(std::iter::once(&member.wrapped)),
+                RingOp::Revoke { rotation, .. } | RingOp::Rotate { rotation } => Box::new(rotation.wrapped.values()),
+            }
+        });
+        legacy.chain(logged)
+    }
+
+    /// Does the ring hold HPKE-wrapped keys (so it needs ring format 3)?
+    pub fn has_hpke_keys(&self) -> bool {
+        self.wrapped_keys().any(WrappedKey::is_hpke)
+    }
+
+    /// The lowest ring format that can hold this ring's content.
+    pub fn required_format(&self) -> u32 {
+        if self.has_hpke_keys() {
+            RING_FORMAT
+        } else if self.is_legacy() {
+            self.format
+        } else {
+            RING_FORMAT_SIGNED
+        }
     }
 
     /// Replay and verify the ring: chain links, signatures, and that every
@@ -340,6 +401,15 @@ impl KeyRing {
                 "ring format {} needs a newer vl (this is vl {}, which reads ring formats up to {RING_FORMAT})",
                 self.format,
                 env!("CARGO_PKG_VERSION")
+            ));
+        }
+        // An HPKE-wrapped key in a ring labelled older than format 3 would
+        // reach vl releases that cannot read it (and a repository that
+        // must not hold it).
+        if self.format < RING_FORMAT && self.has_hpke_keys() {
+            return Err(format!(
+                "ring format {} cannot hold HPKE-wrapped keys (needs ring format {RING_FORMAT})",
+                self.format
             ));
         }
         if self.is_legacy() {
@@ -480,7 +550,7 @@ fn add_member(st: &mut RingState, m: &MemberGrant) {
 }
 
 fn genesis_proof(key: &Key, scope: &str, key_id: &str, signer: &str, signing_key: &str) -> String {
-    let k = Zeroizing::new(blake3::derive_key("veil 2026 ring-proof v1", key));
+    let k = Zeroizing::new(blake3::derive_key(domains::RING_PROOF, key));
     let mut h = blake3::Hasher::new_keyed(&k);
     for part in [scope, key_id, signer, signing_key] {
         h.update(part.as_bytes());
@@ -629,11 +699,43 @@ pub enum RingMerge {
     Rejected(String),
 }
 
+/// Result of [`Keychain::migrate_to_hpke`] for one scope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HpkeMigration {
+    /// The current generation key was only ever wrapped with HPKE.
+    AlreadyHpke,
+    /// Rotated to this new generation, HPKE-wrapped to every member.
+    Rotated(u32),
+    /// Needs an admin of the scope (a legacy ring: a member).
+    NotAdmin,
+    /// The ring does not verify; left alone.
+    Unverifiable(String),
+}
+
+/// Was the current generation's key ever wrapped with the legacy sealed box
+/// (to anyone, at any point of the log)?
+pub fn current_key_has_legacy_wraps(ring: &KeyRing, state: &RingState) -> bool {
+    if ring.is_legacy() {
+        return true;
+    }
+    let g = state.generation;
+    ring.log.iter().any(|c| match &c.op {
+        RingOp::Genesis { members, .. } => g == 0 && members.iter().any(|m| !m.wrapped.is_hpke()),
+        RingOp::Grant { member } => member.generation == g && !member.wrapped.is_hpke(),
+        RingOp::Revoke { rotation, .. } | RingOp::Rotate { rotation } => {
+            rotation.generation == g && rotation.wrapped.values().any(|w| !w.is_hpke())
+        }
+    })
+}
+
 pub struct Keychain {
     backend: Arc<dyn StorageBackend>,
     identity: Option<Identity>,
     repo_id: String,
     access: RwLock<HashMap<String, Arc<ScopeAccess>>>,
+    /// Repository format: decides how keys are wrapped and which ring
+    /// formats may be stored.
+    format: AtomicU32,
 }
 
 impl std::fmt::Debug for Keychain {
@@ -649,6 +751,28 @@ impl Keychain {
             identity,
             repo_id,
             access: RwLock::new(HashMap::new()),
+            format: AtomicU32::new(crate::repo::REPO_FORMAT),
+        }
+    }
+
+    /// Set the repository format (default: the newest). The object store
+    /// forwards its own ([`crate::store::ObjectStore::set_format`]).
+    pub fn set_format(&self, repo_format: u32) {
+        self.format.store(repo_format, Ordering::SeqCst);
+    }
+
+    /// The repository format this keychain writes.
+    pub fn format(&self) -> u32 {
+        self.format.load(Ordering::Relaxed)
+    }
+
+    /// Wrap a scope key to a member with the construction of this
+    /// repository's format: HPKE from format 3, the legacy sealed box before.
+    pub fn wrap_for(&self, recipient: &[u8; 32], key: &Key, scope: &str) -> Result<WrappedKey> {
+        if self.format() >= HPKE_REPO_FORMAT {
+            wrap_key(recipient, key, scope)
+        } else {
+            wrap_key_legacy(recipient, key, scope)
         }
     }
 
@@ -668,7 +792,7 @@ impl Keychain {
         if label == LOCAL_SCOPE {
             return self.identity.as_ref().map(|i| i.local_key(&self.repo_id));
         }
-        if let Some(id) = label.strip_prefix("embargo/") {
+        if let Some(id) = label.strip_prefix(domains::EMBARGO_LABEL_PREFIX) {
             return self.embargo_key(id);
         }
         let (scope, kid) = split_label(label);
@@ -691,7 +815,10 @@ impl Keychain {
     /// generation. Labels that already name a generation (and `local`,
     /// `embargo/…`) are used as they are.
     pub fn sealing_key(&self, scope: &str) -> Result<(String, Key)> {
-        if scope == LOCAL_SCOPE || scope.starts_with("embargo/") || scope.contains('#') {
+        if scope == LOCAL_SCOPE
+            || scope.starts_with(domains::EMBARGO_LABEL_PREFIX)
+            || scope.contains(domains::GENERATION_SEPARATOR)
+        {
             return Ok((scope.to_string(), self.require(scope)?));
         }
         let access = self.scope_access(scope);
@@ -840,6 +967,16 @@ impl Keychain {
     pub fn save_ring(&self, ring: &KeyRing) -> Result<()> {
         let _lock = self.lock_meta()?;
         validate_scope_name(&ring.scope)?;
+        let have = self.format();
+        if ring.format.max(ring.required_format()) > max_ring_format(have) {
+            return Err(VeilError::Unsupported(format!(
+                "this repository is at format {have} and cannot store the key ring of scope '{}' \
+                 (ring format {RING_FORMAT}: HPKE-wrapped keys); upgrade it with `vl upgrade` \
+                 (a remote: `vl upgrade --remote <name>`) once everyone who uses it runs vl {} or later",
+                ring.scope,
+                crate::repo::min_vl_for_format(HPKE_REPO_FORMAT)
+            )));
+        }
         self.backend
             .write(&Self::ring_path(&ring.scope), &serde_json::to_vec_pretty(ring)?)?;
         self.invalidate();
@@ -892,6 +1029,7 @@ impl Keychain {
     fn append(&self, mut ring: KeyRing, op: RingOp) -> Result<KeyRing> {
         let c = self.signed_change(&ring, op)?;
         ring.log.push(c);
+        ring.format = ring.format.max(ring.required_format());
         ring.verify().map_err(|e| VeilError::Policy(format!("refusing to write an invalid key ring: {e}")))?;
         self.save_ring(&ring)?;
         Ok(ring)
@@ -903,7 +1041,7 @@ impl Keychain {
         let proof = genesis_proof(key, scope, &key_id, &me.public_hex(), &me.verifying_hex());
         let ring = KeyRing {
             scope: scope.to_string(),
-            format: RING_FORMAT,
+            format: RING_FORMAT_SIGNED,
             ..Default::default()
         };
         self.append(ring, RingOp::Genesis { key_id, members, proof })
@@ -924,7 +1062,7 @@ impl Keychain {
             signing_key: Some(me.verifying_hex()),
             role: Role::Admin,
             generation: 0,
-            wrapped: wrap_key(&me.public_key(), &key, scope)?,
+            wrapped: self.wrap_for(&me.public_key(), &key, scope)?,
         }];
         self.genesis(scope, &key, members)?;
         Ok(())
@@ -993,7 +1131,7 @@ impl Keychain {
             signing_key: pk.signing_hex().or(existing_key),
             role,
             generation: state.generation,
-            wrapped: wrap_key(&pk.x25519, &key, scope)?,
+            wrapped: self.wrap_for(&pk.x25519, &key, scope)?,
         };
         self.append(ring, RingOp::Grant { member })?;
         Ok(())
@@ -1005,14 +1143,18 @@ impl Keychain {
         let new_id = key_fingerprint(&new);
         let mut wrapped = BTreeMap::new();
         for m in members {
-            wrapped.insert((*m).clone(), wrap_key(&parse_public_key(m)?, &new, scope)?);
+            wrapped.insert((*m).clone(), self.wrap_for(&parse_public_key(m)?, &new, scope)?);
         }
         Ok(Rotation {
             generation: state.generation + 1,
             key_id: new_id.clone(),
             previous: vec![SealedKey {
                 key_id: state.key_id().to_string(),
-                sealed: Envelope::seal(&new, &format!("prev-key:{scope}#{new_id}"), &*old, false)?,
+                sealed: Envelope::seal_random(
+                    &new,
+                    &format!("{}{}", domains::PREV_KEY_LABEL_PREFIX, generation_label(scope, &new_id)),
+                    &*old,
+                )?,
             }],
             wrapped,
         })
@@ -1043,6 +1185,46 @@ impl Keychain {
         let g = rotation.generation;
         self.append(ring, RingOp::Rotate { rotation })?;
         Ok(g)
+    }
+
+    /// Move a scope's key wrapping to HPKE (`vl upgrade` to format 3): if
+    /// the current key generation was ever wrapped with the legacy sealed
+    /// box, start a new generation whose key is HPKE-wrapped to every
+    /// current member (a signed `Rotate` change; the previous key stays
+    /// reachable through the rotation, so history stays readable).
+    ///
+    /// The legacy wraps already in the log stay there: the log is
+    /// append-only and signed, and removing them would not un-publish them.
+    /// Content sealed under generations up to now therefore keeps depending
+    /// on the legacy construction; content sealed from now on does not.
+    pub fn migrate_to_hpke(&self, scope: &str) -> Result<HpkeMigration> {
+        let _lock = self.lock_meta()?;
+        if self.format() < HPKE_REPO_FORMAT {
+            return Err(VeilError::repo(format!(
+                "this repository is at format {}; HPKE key wrapping needs format {HPKE_REPO_FORMAT}",
+                self.format()
+            )));
+        }
+        let Some(ring) = self.load_ring(scope)? else {
+            return Err(VeilError::NotFound(format!("scope '{scope}'")));
+        };
+        let state = match ring.verify() {
+            Ok(st) => st,
+            Err(e) => return Ok(HpkeMigration::Unverifiable(e)),
+        };
+        if !current_key_has_legacy_wraps(&ring, &state) {
+            return Ok(HpkeMigration::AlreadyHpke);
+        }
+        let me = self.me()?;
+        let allowed = if ring.is_legacy() {
+            self.is_member(scope)
+        } else {
+            state.is_admin(&me.public_hex(), &me.verifying_hex())
+        };
+        if !allowed {
+            return Ok(HpkeMigration::NotAdmin);
+        }
+        Ok(HpkeMigration::Rotated(self.rotate(scope)?))
     }
 
     /// Checks only key holders can make: the genesis proof, and that every
@@ -1303,7 +1485,7 @@ impl Keychain {
         let mut rec = EmbargoRecord {
             id: id.clone(),
             scope: scope.to_string(),
-            wrapped: Envelope::seal(&scope_key, &format!("embargo-wrap:{id}"), &*key, false)?,
+            wrapped: Envelope::seal_random(&scope_key, &format!("{}{id}", domains::EMBARGO_WRAP_LABEL_PREFIX), &*key)?,
             until,
             released_key: None,
             released_at: None,
@@ -1329,7 +1511,7 @@ impl Keychain {
             return Ok(());
         }
         let key = self
-            .key(&format!("embargo/{id}"))
+            .key(&format!("{}{id}", domains::EMBARGO_LABEL_PREFIX))
             .ok_or_else(|| VeilError::Policy(format!("you do not hold the key for embargo '{id}'")))?;
         rec.released_key = Some(hex::encode(key));
         rec.released_at = Some(crate::now_millis());

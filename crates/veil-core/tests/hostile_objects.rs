@@ -254,9 +254,16 @@ fn pull_skips_tags_with_hostile_names_or_non_snapshot_targets() {
 #[test]
 fn envelope_scope_length_limit_is_exact() {
     let k = random_key();
-    let env = Envelope::seal(&k, &"s".repeat(MAX_SCOPE_LEN), b"hi", true).unwrap();
-    assert_eq!(Envelope::from_bytes(&env.to_bytes()).unwrap(), env);
-    assert!(Envelope::seal(&k, &"s".repeat(MAX_SCOPE_LEN + 1), b"hi", true).is_err());
+    for deterministic in [true, false] {
+        let env = Envelope::seal(&k, &"s".repeat(MAX_SCOPE_LEN), b"hi", deterministic).unwrap();
+        // The object tag says which construction the bytes hold.
+        let obj = Object::Sealed(env.clone());
+        assert_eq!(Object::decode(&obj.encode()).unwrap(), obj);
+        assert!(Envelope::seal(&k, &"s".repeat(MAX_SCOPE_LEN + 1), b"hi", deterministic).is_err());
+    }
+    let legacy = Envelope::seal_deterministic_legacy(&k, &"s".repeat(MAX_SCOPE_LEN), b"hi").unwrap();
+    assert_eq!(Envelope::from_bytes(&legacy.to_bytes()).unwrap(), legacy);
+    assert!(Envelope::seal_deterministic_legacy(&k, &"s".repeat(MAX_SCOPE_LEN + 1), b"hi").is_err());
 }
 
 #[test]

@@ -47,7 +47,7 @@ fn change_id_of(oid: &GitOid, commit: &gix::objs::Commit) -> ChangeId {
         .and_then(|v| ChangeId::parse(v.trim()).ok())
         .filter(|c| *c != ChangeId::ROOT);
     header.unwrap_or_else(|| {
-        let h = blake3::derive_key("veil 2026 git change-id v1", oid.as_bytes());
+        let h = blake3::derive_key(crate::crypto::domains::GIT_CHANGE_ID, oid.as_bytes());
         ChangeId(h[..16].try_into().unwrap())
     })
 }
