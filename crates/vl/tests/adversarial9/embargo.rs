@@ -89,7 +89,6 @@ fn am_three_way_never_copies_the_withheld_fix_onto_a_public_line() {
 /// `[Draft(0,true), Draft(0,false), SquashIntoSealed(false,None),
 /// SquashIntoSealed(true,None)]`, with its publish step after each.
 #[test]
-#[ignore = "BUG-682: a public draft squashed into a cloaked change reaches the public mirror"]
 fn a_draft_squashed_into_a_cloaked_change_stays_off_the_mirror() {
     let env = Env::new();
     let proj = env.project(U, "proj", &[("a.txt", "one\ntwo\nthree\n"), ("b.txt", "b\n")]);
@@ -130,7 +129,6 @@ fn a_draft_squashed_into_a_cloaked_change_stays_off_the_mirror() {
 /// side of the merge as "the newest public version". Pushing the cloaked
 /// line publishes the draft in plaintext as that fallback.
 #[test]
-#[ignore = "BUG-707: vl duplicate onto a cloaked line publishes the duplicated draft as the sealed file's fallback"]
 fn a_draft_duplicated_onto_a_cloaked_line_stays_off_the_mirror() {
     let env = Env::new();
     let proj = env.project(U, "proj", &[("a.txt", "1\n2\n3\n4\n5\n6\n7\n8\n9\n")]);

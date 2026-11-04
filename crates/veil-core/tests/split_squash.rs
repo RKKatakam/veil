@@ -269,6 +269,39 @@ fn cloaked_hunks_stay_sealed_with_the_public_fallback() {
     assert!(matches!(repo.snapshot(&r.first).unwrap().description, veil_core::object::Text::Sealed(_)), "and its description is sealed");
 }
 
+/// BUG-682: a public edit never published (the working copy), squashed
+/// whole into a cloaked change that seals another edit of the same file,
+/// merges into a sealed version. Its fallback, what readers without the
+/// key see, stays the last public version the line's base shows: never
+/// the draft's plaintext, which a push of the cloaked change would
+/// otherwise put on a public remote.
+#[test]
+fn a_draft_squashed_into_a_sealed_edit_never_becomes_its_fallback() {
+    let (mut repo, fs, _) = new_repo("alice");
+    let base = commit_files(&mut repo, &*fs, &[("a.txt", OLD)], "base");
+    repo.create_workspace("t", vec![base], Some("team".into())).unwrap();
+    let o = repo.workspace_overlay("t").unwrap();
+    o.write(&p("a.txt"), OLD.replacen("2\n", "SECRET-682\n", 1).as_bytes()).unwrap();
+    let sealed = repo.snapshot_workspace("t", &o).unwrap().snapshot;
+    fs.write(&p("a.txt"), OLD.replacen("19\n", "DRAFT-682\n", 1).as_bytes()).unwrap();
+    let draft = snap(&mut repo, &*fs);
+    let r = repo.squash_into(draft, Some(sealed), None).unwrap();
+    let e = file_entry(&repo, &r.destination, "a.txt").unwrap();
+    assert_eq!(e.visibility, team(), "the merged version is sealed for the line");
+    let (_, data) = versions(&repo, &e).remove(0);
+    let data = String::from_utf8(data.unwrap()).unwrap();
+    assert!(data.contains("SECRET-682") && data.contains("DRAFT-682"), "both edits are merged: {data}");
+    let old_e = file_entry(&repo, &base, "a.txt").unwrap();
+    assert_eq!(e.fallback, Some(old_e.id), "readers without the key see the base's version, not the draft");
+    repo.set_tag("s", r.destination, None, false).unwrap();
+    let mirror = std::sync::Arc::new(veil_core::MemoryBackend::new());
+    veil_core::remote::push(&mut repo, mirror.clone(), true, &[], false).unwrap();
+    for needle in [&b"DRAFT-682"[..], b"SECRET-682"] {
+        let hits = backend_contains(&*mirror, needle);
+        assert!(hits.is_empty(), "{} is on the public mirror: {hits:?}", String::from_utf8_lossy(needle));
+    }
+}
+
 /// A change that moves a file to another audience offers it whole only:
 /// the lines of the sealed version never land in a public file.
 #[test]

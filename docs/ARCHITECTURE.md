@@ -1440,7 +1440,11 @@ struct Snapshot {
     what it gains (`seal_introduced`), the public versions of a conflict
     entry it gains included (each version readers without the key could
     not already see at that path is sealed, the conflict keeping its
-    shape, BUG-480). Where the source keeps its own tree (into its parent
+    shape, BUG-480). A version it seals, or already held sealed, shows
+    readers without the key only what the destination's base already shows
+    them at that path: a merge gives a sealed result the other side's
+    public version as fallback, and here that side is the work being
+    moved, never published (BUG-682). Where the source keeps its own tree (into its parent
     or an ancestor), what the destination sealed is sealed in the source
     too (`embargo::seal_moved`, BUG-483): a file the source holds as it
     gave it takes the destination's sealed entry (so the moved part
@@ -1549,6 +1553,13 @@ A workspace is only a named pointer in the view. It owns no directory.
   snapshot's transaction, nothing is recorded and the session looks again,
   so a directory is never recorded into a working copy it was not checked
   out from. Looking again re-reads the checkout record too (BUG-362).
+  A session looks up to ten times, backing off between looks (5 ms
+  doubling to 200 ms, with jitter, about a second in all), before it gives
+  up with "the working copy keeps moving under this command": each lost
+  look means another command really moved the workspace, so only that many
+  commands running at once in the same directory can exhaust it (three
+  looks were too few for a handful of concurrent `vl new` and `vl describe`
+  under load).
   A view that moved *with* the directory is not a stale directory: another
   command recorded it (or moved `@` to the same tree, `commit`, `new`) and
   has not rewritten `checkout.json` yet. `Ctx::directory_holds` checks that

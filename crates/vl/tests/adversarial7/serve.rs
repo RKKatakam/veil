@@ -187,6 +187,16 @@ fn status_works(sock: &Path) -> bool {
     BufReader::new(&c).read_line(&mut line).is_ok() && line.contains("\"result\"")
 }
 
+/// Was connection `c` refused or closed by the server (it sent something,
+/// the `-32001` goodbye, or hung up)? `false` while it holds its slot.
+fn hung_up(c: &UnixStream) -> bool {
+    c.set_nonblocking(true).unwrap();
+    let mut buf = [0u8; 256];
+    let gone = !matches!((&*c).read(&mut buf), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock);
+    c.set_nonblocking(false).unwrap();
+    gone
+}
+
 /// BUG-495: 32 connections that never send (and one that sends half a
 /// request) used to hold every slot forever, so the user's editor got
 /// `-32001 too many clients` until the server restarted. With the default
@@ -197,13 +207,33 @@ fn silent_connections_never_lock_other_clients_out() {
     let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
     let server = Server::start(&env, &proj);
     let sock = proj.join(".veil/local/sock");
-    let mut hogs: Vec<UnixStream> = (0..31).map(|_| UnixStream::connect(&sock).unwrap()).collect();
-    let mut half = UnixStream::connect(&sock).unwrap();
-    half.write_all(b"{\"jsonrpc\":\"2.0\",").unwrap();
-    hogs.push(half);
-    // Full: a newcomer is told so while the others have been quiet briefly.
-    std::thread::sleep(Duration::from_millis(500));
-    assert!(!status_works(&sock), "the 33rd client was served at once");
+    let mut hogs: Vec<UnixStream> = Vec::new();
+    let mut tries = 0;
+    loop {
+        // 31 connections that never send and one with half a request.
+        hogs.clear();
+        hogs.extend((0..31).map(|_| UnixStream::connect(&sock).unwrap()));
+        let mut half = UnixStream::connect(&sock).unwrap();
+        half.write_all(b"{\"jsonrpc\":\"2.0\",").unwrap();
+        hogs.push(half);
+        // Full: a newcomer is told so while the others have been quiet
+        // briefly.
+        std::thread::sleep(Duration::from_millis(500));
+        let served = status_works(&sock);
+        // Unless the hogs did not all get a slot: one was refused (the
+        // connection `Server::start` probed with still held its slot on a
+        // loaded machine) and tells us so. Then the observation is made
+        // again; served at once with every hog in place is the bug.
+        std::thread::sleep(Duration::from_millis(200));
+        if !hogs.iter().any(hung_up) {
+            assert!(!served, "the 33rd client was served at once");
+            break;
+        }
+        tries += 1;
+        assert!(tries < 5, "the hogs never all got a slot");
+        hogs.clear();
+        std::thread::sleep(Duration::from_millis(500));
+    }
     // Past the eviction age, it is served.
     let start = Instant::now();
     assert!(wait_for(Duration::from_secs(25), || status_works(&sock)), "a newcomer is still locked out");
@@ -259,40 +289,71 @@ fn idle_and_incomplete_connections_time_out() {
 fn a_full_server_evicts_the_quietest_idle_client_only() {
     let env = Env::new();
     let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
-    let server = start_with_timeouts(&env, &proj, 60_000, 60_000, 1000);
+    // Eviction after 3 s of silence: wide enough that a loaded machine
+    // does not age the client that just spoke past it.
+    let evict = Duration::from_millis(3000);
+    let server = start_with_timeouts(&env, &proj, 60_000, 60_000, evict.as_millis() as u64);
     let sock = proj.join(".veil/local/sock");
-    let ask = |c: &mut UnixStream, line: &str| {
+    let ask = |c: &mut UnixStream, line: &str| -> String {
         c.write_all(format!("{line}\n").as_bytes()).unwrap();
         let mut r = BufReader::new(c.try_clone().unwrap());
         let mut out = String::new();
         r.read_line(&mut out).unwrap();
-        assert!(out.contains("\"result\""), "{out}");
+        out
     };
+    let info = r#"{"jsonrpc":"2.0","id":1,"method":"server.info"}"#;
     // 31 watchers and one plain client, all quiet.
     let mut watchers: Vec<UnixStream> = (0..31)
         .map(|_| {
             let mut c = UnixStream::connect(&sock).unwrap();
-            ask(&mut c, r#"{"jsonrpc":"2.0","id":1,"method":"watch","params":{"interval_ms":60000}}"#);
+            let out = ask(&mut c, r#"{"jsonrpc":"2.0","id":1,"method":"watch","params":{"interval_ms":60000}}"#);
+            assert!(out.contains("\"result\""), "{out}");
             c
         })
         .collect();
     let mut plain = UnixStream::connect(&sock).unwrap();
-    ask(&mut plain, r#"{"jsonrpc":"2.0","id":1,"method":"server.info"}"#);
-    std::thread::sleep(Duration::from_millis(1500));
-    assert!(status_works(&sock), "the newcomer was refused");
+    let asked = Instant::now();
+    let out = ask(&mut plain, info);
+    assert!(out.contains("\"result\""), "{out}");
+    // The newcomer is served once the plain client has been silent for
+    // the eviction age, and not before.
+    let mut served = false;
+    while !served && asked.elapsed() < Duration::from_secs(30) {
+        std::thread::sleep(Duration::from_millis(100));
+        served = status_works(&sock);
+    }
+    assert!(served, "the newcomer was refused");
+    assert!(asked.elapsed() >= evict, "a client silent for {:?} only was evicted", asked.elapsed());
     // The plain client lost its slot; the watchers kept theirs.
     plain.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let mut buf = [0u8; 1];
     assert!(matches!(plain.read(&mut buf), Ok(0)), "the quiet client was not the one evicted");
     // Watchers and a client that just spoke: a newcomer is told the
-    // server is full.
-    let mut recent = UnixStream::connect(&sock).unwrap();
-    ask(&mut recent, r#"{"jsonrpc":"2.0","id":1,"method":"server.info"}"#);
-    let mut c = UnixStream::connect(&sock).unwrap();
-    let mut out = String::new();
-    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let _ = c.read_to_string(&mut out);
-    assert!(out.contains("-32001"), "{out}");
+    // server is full. Should the newcomer get a slot after all, that is
+    // right only if the client that spoke was silent for the eviction age
+    // by the time the newcomer was answered (the machine stalled for that
+    // long): then the observation is made again.
+    let mut tries = 0;
+    loop {
+        let mut recent = UnixStream::connect(&sock).unwrap();
+        // The server hears `recent` no earlier than this.
+        let spoke = Instant::now();
+        let out = ask(&mut recent, info);
+        if out.contains("\"result\"") {
+            let mut c = UnixStream::connect(&sock).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+            let out = ask(&mut c, info);
+            if out.contains("-32001") {
+                break;
+            }
+            assert!(spoke.elapsed() >= evict, "a client that spoke {:?} ago was evicted: {out}", spoke.elapsed());
+        }
+        // (A refused `recent`: the slot the stalled round's newcomer held
+        // was not given back yet.)
+        tries += 1;
+        assert!(tries < 5, "the server was never seen full: {out}");
+        std::thread::sleep(Duration::from_millis(500));
+    }
     for w in &mut watchers {
         w.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
         assert!(w.read(&mut buf).is_err(), "a watcher was cut off");
