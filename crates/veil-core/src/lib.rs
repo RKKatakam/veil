@@ -53,6 +53,7 @@ pub mod object;
 pub mod oplog;
 pub mod pack;
 pub mod policy;
+pub mod push_plan;
 pub mod remote;
 pub mod repo;
 pub mod revset;

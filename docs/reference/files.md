@@ -3,7 +3,9 @@
 
 # `vl files`
 
-List the files of a snapshot with their visibility
+List the files of a snapshot with their visibility.
+
+The plain listing of recorded files, kept unchanged for scripts. `vl ls` shows more: tiers as this reader sees them, and the working copy's local-only files.
 
 ```text
 vl files [OPTIONS]

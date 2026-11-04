@@ -17,6 +17,8 @@ text:
 | [`vl op log`](op.md#vl-op-log) | [`veil.op.log/1`](#veiloplog1) |
 | [`vl scan`](scan.md) | [`veil.scan/1`](#veilscan1) |
 | [`vl secret list`](secret.md#vl-secret-list) | [`veil.secret.list/1`](#veilsecretlist1) |
+| [`vl ls`](ls.md) | [`veil.ls/1`](#veills1) |
+| [`vl push --dry-run`](push.md) | [`veil.push.plan/1`](#veilpushplan1) |
 | any of them, on failure | [`veil.error/1`](#veilerror1) |
 
 ```sh
@@ -172,7 +174,23 @@ A changed path, as `vl status` lists it.
 | `path` | string | The file |
 | `status` | string | `added`, `deleted` or `modified` |
 | `visibility` | [visibility](#visibility) | Of the new version (of the old one, for a deletion) |
-| `redacted` | bool | The new version is unreadable here (`(redacted)` in the text) |
+| `redacted` | bool | The new version is unreadable here |
+| `tier` | string | Its [tier](#tier) for this reader: `public`, `cloaked`, `embargoed` or `redacted` (`[redacted]` in the text, followed by the label of whom it is sealed for) |
+
+### Tier
+
+Where a file stands, for this reader, as `vl ls` shows it and `vl status`
+marks it (`[cloaked:team]`; public files carry no mark):
+
+| Tier | Meaning |
+|---|---|
+| `public` | Plaintext, sent to every remote (also a file of a released embargo) |
+| `cloaked` | Encrypted for a scope you are in (`scope` names it); team remotes get the ciphertext, public remotes nothing |
+| `embargoed` | Under an unreleased embargo whose key you hold (`embargo` names it) |
+| `redacted` | Recorded, but sealed for someone else or withheld from this repository: you cannot read it (a [redaction](#redaction) says why) |
+| `isolated` | Local only: never snapshotted, never pushed |
+| `quarantined` | Kept out of the snapshot because it looks like it contains a secret |
+| `ignored` | Not tracked at all |
 
 ### File diff
 
@@ -227,7 +245,7 @@ this command found.
 {"schema":"veil.status/1","workspace":{"name":"default","cloak":null},
  "working_copy":{"snapshot_id":"ee72…02c8","snapshot_short":"ee720280","change_id":"kxqp…slxt","change_short":"kxqpvmkk","available":true,"empty":false,"description":"","description_hidden":null},
  "parents":[{"snapshot_id":"37cd…e8f2","snapshot_short":"37cdc51f","change_id":"pqmv…ynro","change_short":"pqmvvlvm","available":true,"empty":false,"description":"Add the README","description_hidden":null}],
- "changes":[{"path":"README.md","status":"modified","visibility":{"kind":"public","scope":null,"embargo":null},"redacted":false}],
+ "changes":[{"path":"README.md","status":"modified","visibility":{"kind":"public","scope":null,"embargo":null},"redacted":false,"tier":"public"}],
  "isolated":[".env"],"quarantined":[],"policy_held_back":[],"nested":[],"redacted":[],"conflicts":[]}
 ```
 
@@ -240,11 +258,11 @@ this command found.
 | `working_copy` | [snapshot reference](#snapshot-reference) | The working-copy change, `@` |
 | `parents` | array of [snapshot references](#snapshot-reference) | Its parents (two or more for a merge) |
 | `changes` | array of [changes](#change) | What `@` changes, compared with its parents |
-| `isolated` | array of strings | Local-only files (isolated): never snapshotted or pushed |
-| `quarantined` | array | Public files kept out of the snapshot because they look like they contain a secret: `path`; `rule` (string: the first scanner rule that matched) and `line` (number: where); `state`: `never_recorded`, or `held_back` (an edit of a file history already has; history keeps the previous version) |
-| `policy_held_back` | array | Local paths that keep the protection you accepted because `.veilpolicy` would weaken it (`vl policy accept` applies it): `path` (with a trailing `/` for a directory), `dir` (bool: a directory held back as a whole), `accepted` and `wanted` (strings: policy keywords such as `isolate`, `cloak ops`, `public!`) |
+| `isolated` | array of strings | Local-only files (isolated): never snapshotted or pushed. Their [tier](#tier) is `isolated` |
+| `quarantined` | array | Public files kept out of the snapshot because they look like they contain a secret: `path`; `rule` (string: the first scanner rule that matched) and `line` (number: where); `state`: `never_recorded`, or `held_back` (an edit of a file history already has; history keeps the previous version); `tier`: always `quarantined` |
+| `policy_held_back` | array | Local paths that keep the protection you accepted because `.veilpolicy` would weaken it (`vl policy accept` applies it): `path` (with a trailing `/` for a directory), `dir` (bool: a directory held back as a whole), `accepted` and `wanted` (strings: policy keywords such as `isolate`, `cloak ops`, `public!`), `tier` (the [tier](#tier) the accepted classification gives it: `isolated`, `ignored`, `cloaked` or `public`) and `scope` (string or null: of `cloaked`) |
 | `nested` | array of strings | Directories that are repositories of their own; nothing in them is recorded here |
-| `redacted` | array | Files of `@` that are absent on disk because you cannot read them: `path`, and `redaction` (a [redaction](#redaction)) |
+| `redacted` | array | Files of `@` that are absent on disk because you cannot read them: `path`, `redaction` (a [redaction](#redaction)) and `tier` (`redacted`, or for `unwritable` the file's own [tier](#tier)) |
 | `conflicts` | array | Unresolved conflicts: `path`, and `recorded_on` (string or null: the short change id of the parent, a merge, that recorded it; null if recorded on `@` itself) |
 
 ## `veil.log/1`
@@ -365,6 +383,77 @@ are never part of the document; `vl secret get NAME` prints one.
 |---|---|---|
 | `schema` | string | `veil.secret.list/1` |
 | `secrets` | array | By name: `name` (the environment variable `vl run` sets) |
+
+## `veil.ls/1`
+
+`vl ls --json`: the files of a snapshot with their [tier](#tier), and for
+the working copy its local-only files.
+
+```json
+{"schema":"veil.ls/1","snapshot":{"snapshot_id":"ee72…02c8","snapshot_short":"ee720280",…},"working_copy":true,"all":false,
+ "entries":[{"path":".env","dir":false,"tier":"isolated","scope":null,"embargo":null,"recorded":false,"visibility":null,"size":21,"executable":false,"readable":true,"fallback":false,"redaction":null,"quarantine":null},
+            {"path":"ops/keys.yml","dir":false,"tier":"redacted","scope":"ops","embargo":null,"recorded":true,"visibility":{"kind":"cloaked","scope":"ops","embargo":null},"size":310,"executable":false,"readable":false,"fallback":false,"redaction":{"reason":"no_key","message":"cloaked:ops; no key"},"quarantine":null}]}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `veil.ls/1` |
+| `snapshot` | [snapshot reference](#snapshot-reference) | The snapshot listed (`-r`, default `@`) |
+| `working_copy` | bool | It is the working copy, just snapshotted: local-only files are listed too (false with `--no-snapshot`) |
+| `all` | bool | `--all`: ignored paths are listed |
+| `entries` | array | In tree order (depth first, by name within a directory), each: |
+| `path` | string | The file (an ignored directory: the directory) |
+| `dir` | bool | An ignored directory, listed as a whole (`--all`; never descended into) |
+| `tier` | string | Its [tier](#tier): `public`, `cloaked`, `embargoed`, `redacted`, `isolated`, `quarantined` or `ignored` |
+| `scope` | string or null | The scope of a cloaked file (also when `redacted`) |
+| `embargo` | string or null | The embargo of an embargoed file (also when `redacted`) |
+| `recorded` | bool | In the snapshot; false for local-only files |
+| `visibility` | [visibility](#visibility) or null | The recorded entry's label; null when not recorded |
+| `size` | number or null | Bytes: the recorded size, or the size on disk of a local-only file; null for a directory |
+| `executable` | bool | The executable bit (`*` in the text) |
+| `readable` | bool | You can read the content (for a local-only file: it is on disk) |
+| `fallback` | bool | What you can read is the file's last public version: it was edited on a cloaked line of a scope you are not in |
+| `redaction` | [redaction](#redaction) or null | Why a `redacted` file cannot be read. Never content |
+| `quarantine` | object or null | A `quarantined` file: `rule` (string), `line` (number) and `state` (`never_recorded`, or `held_back`: history keeps the previous, recorded version) |
+
+## `veil.push.plan/1`
+
+`vl push --dry-run [REMOTE] --json`: what a push would send, per remote
+(every configured remote when none is named). Nothing is written to any
+remote. The objects and tags listed are exactly what the push then sends,
+unless someone else pushes in between.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `veil.push.plan/1` |
+| `remotes` | array | One plan per remote, by name: |
+| `name` | string | The remote |
+| `url` | string | Its URL, as configured |
+| `public` | bool | A public remote: no cloaked content, cloaked tags or key rings |
+| `error` | string or null | This remote could not be planned (unreachable, not a repository, a tag that builds on withheld history): the push would fail the same way. The other fields are then empty |
+| `creates_remote` | bool | Nothing is there yet: the push would create the repository |
+| `tags` | array | Each tag the push considers, by name: `name`; `action` (`create`, `update`, `unchanged`, `rejected`: the remote diverged and `--force` was not given, or `skipped`: held back by design, such as a cloaked tag on a public remote or a tag that would publish an unreleased embargo's history); `target` and `target_short` (the local target); `remote_target` (string or null: where the remote's tag is now); `message` (string or null: why it is rejected or skipped); `cloak` (string or null: the scope of a cloaked tag) |
+| `snapshots` | number | Snapshots that would be sent |
+| `objects` | number | Objects that would be sent, snapshots included |
+| `trees` | number | Of which directory trees |
+| `blobs` | number | Of which plaintext file contents |
+| `sealed` | number | Of which ciphertext (cloaked or embargoed content, sealed trees) |
+| `object_bytes` | number | Size of those objects before packing |
+| `pack_bytes` | number | Size of the pack(s) the push would write: compressed, with deltas (what crosses the wire) |
+| `snapshot_ids` | array of strings | The snapshots, in hex |
+| `object_ids` | array of strings | Every object, in hex, in the order it would be sent |
+| `withheld_objects` | number | Objects the visibility filter holds back (cloaked or embargoed content, on a public remote) |
+| `withheld_snapshots` | array | History that stays here: snapshots reachable from the pushed tags only through an unreleased embargo (`snapshot_id`, `snapshot_short`, and `embargo`). Sent once the embargo is released |
+| `releases` | array of strings | Embargoes whose staged release this push would publish (`vl embargo release`): afterwards it cannot be taken back |
+| `files` | object or null | Public remotes only (null for a team remote): `published`, `withheld`, `embargoed_trees`, below |
+| `published` | array | Each file whose content becomes public on this remote, by path: `path`; `exposure` (`new`: the path was never public there; `exposed`: it was there but withheld, cloaked or embargoed, until now; `modified`: already public there, new content); `size` (number or null: unknown for the last public version of a file edited on a cloaked line); `released_embargo` (string or null: public because this embargo was released) |
+| `withheld` | array | Each file of the pushed history whose new content stays withheld: `path`; `reason` (`cloaked`: public remotes never receive it; `cloaked_edit`: edited on a cloaked line, the remote keeps its last public version; `embargoed`: under an unreleased embargo, the remote shows the pre-merge version); `scope` and `embargo` (strings or null); `message` (what the text prints) |
+| `embargoed_trees` | array | Snapshots whose tree is under an unreleased embargo you hold no key for (`snapshot_id`, `snapshot_short`, `embargo`): the remote sees their pre-merge tree, and the files the embargo changes cannot be listed |
+| `warnings` | array of strings | What the push would warn about |
+
+The exit status is 1 where the push would fail: a remote that cannot be
+planned, a tag the remote would reject, or a tag named with `-t` that
+would be held back.
 
 ## `veil.error/1`
 

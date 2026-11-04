@@ -162,6 +162,11 @@ enum Sink<'a> {
     /// Loose objects through `put_raw` (which re-verifies existing copies).
     Store(&'a ObjectStore),
     Pack(Box<PackSink<'a>>),
+    /// A dry run (`vl push --dry-run`, [`crate::push_plan`]): every object
+    /// is recorded, and packed exactly as [`Sink::Pack`] would pack it
+    /// (so the byte count is the real one), into a backend that drops
+    /// what it is given.
+    Plan(Box<PackSink<'a>>, &'a RefCell<Vec<PlannedObject>>),
 }
 
 impl Sink<'_> {
@@ -169,16 +174,89 @@ impl Sink<'_> {
         match self {
             Sink::Store(s) => s.put_raw(&id, &raw),
             Sink::Pack(p) => p.put(id, raw, path),
+            Sink::Plan(p, record) => {
+                record.borrow_mut().push(PlannedObject {
+                    id,
+                    bytes: raw.len() as u64,
+                    sealed: Object::sealed_scope(&raw).is_some(),
+                    blob: Object::is_blob_raw(&raw),
+                    path: path.to_string(),
+                });
+                p.put(id, raw, path)
+            }
         }
     }
 
     fn finish(self, report: &mut SyncReport) -> Result<()> {
-        if let Sink::Pack(p) = self {
+        if let Sink::Pack(p) | Sink::Plan(p, _) = self {
             p.finish(report)?;
         }
         Ok(())
     }
 }
+
+/// One object a push would send (recorded by a dry run).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedObject {
+    pub id: ObjectId,
+    /// Size of its canonical encoding (before packing).
+    pub bytes: u64,
+    /// Ciphertext (cloaked or embargoed content, or a sealed tree).
+    pub sealed: bool,
+    /// A plaintext file's content.
+    pub blob: bool,
+    /// Where the transfer met it first (`""` for snapshots and root trees).
+    pub path: String,
+}
+
+/// What a dry run of [`push_incremental`] collects besides the report.
+#[derive(Default)]
+pub(crate) struct PlanRecord {
+    pub objects: RefCell<Vec<PlannedObject>>,
+    /// Snapshots the remote's committed view reaches (never sent).
+    pub known_snapshots: HashSet<ObjectId>,
+    /// The snapshots that would be sent, in transfer order.
+    pub sent_snapshots: Vec<ObjectId>,
+}
+
+/// The backend a dry run's packs are "written" to: nothing is kept.
+#[derive(Debug)]
+struct Discard;
+
+impl StorageBackend for Discard {
+    fn kind(&self) -> &'static str {
+        "discard"
+    }
+    fn read(&self, path: &VPath) -> Result<Vec<u8>> {
+        Err(VeilError::NotFound(path.to_string()))
+    }
+    fn write(&self, _: &VPath, _: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    fn create_new(&self, _: &VPath, _: &[u8]) -> Result<bool> {
+        Ok(true)
+    }
+    fn remove_file(&self, _: &VPath) -> Result<()> {
+        Ok(())
+    }
+    fn remove_dir_all(&self, _: &VPath) -> Result<()> {
+        Ok(())
+    }
+    fn create_dir_all(&self, _: &VPath) -> Result<()> {
+        Ok(())
+    }
+    fn list_dir(&self, _: &VPath) -> Result<Vec<crate::vfs::DirEntry>> {
+        Ok(Vec::new())
+    }
+    fn metadata(&self, _: &VPath) -> Result<Option<crate::vfs::Metadata>> {
+        Ok(None)
+    }
+    fn set_executable(&self, _: &VPath, _: bool) -> Result<()> {
+        Ok(())
+    }
+}
+
+static DISCARD: Discard = Discard;
 
 /// A pack holding at most about this much (uncompressed) data is written
 /// before the next one is started.
@@ -800,7 +878,7 @@ fn too_deep(root: ObjectId) -> VeilError {
     )
 }
 
-fn ancestors_in(store: &ObjectStore, tips: &[ObjectId]) -> Result<Vec<ObjectId>> {
+pub(crate) fn ancestors_in(store: &ObjectStore, tips: &[ObjectId]) -> Result<Vec<ObjectId>> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     let mut stack: Vec<ObjectId> = tips.to_vec();
@@ -1285,59 +1363,12 @@ pub fn push_with(
 ) -> Result<SyncReport> {
     let mut remote = open_or_init_remote(&remote_backend)?;
     let mut report = SyncReport::default();
-    let mut selected: Vec<(String, Tag)> = Vec::new();
-    for (name, tag) in &local.view().tags {
-        if !only_tags.is_empty() && !only_tags.contains(name) {
-            continue;
-        }
-        if public && tag.cloak.is_some() {
-            report
-                .tags_skipped
-                .push((name.clone(), "cloaked tag is never pushed to a public remote".into()));
-            continue;
-        }
-        selected.push((name.clone(), tag.clone()));
-    }
-    for t in only_tags {
-        if !local.view().tags.contains_key(t) {
-            return Err(VeilError::NotFound(format!("tag '{t}'")));
-        }
-    }
-    // The merged-in history of an unreleased embargoed merge stays here, and
-    // so does any tag that would publish it by another route.
-    let withheld = embargo_withheld(local, public)?;
-    let mut sendable = Vec::new();
-    for (name, tag) in selected {
-        match push_closure(local.store(), local.keys(), &[tag.target], &withheld)? {
-            Ok(_) => sendable.push((name, tag)),
-            Err(why) => report.tags_skipped.push((name, why)),
-        }
-    }
+    let (sendable, withheld) = sendable_tags(local, public, only_tags, &mut report)?;
     // Objects and metadata are copied under the remote's lock: metadata
     // merges are read-modify-writes, and objects must land before the
     // operation that references them.
     let mut tx = remote.transaction(format!("push from {}", local.repo_id()))?;
-    // Which tags the remote takes is decided before anything is sent: the
-    // history of a rejected tag is not uploaded (BUG-288). Nothing the
-    // remote's committed view does not reach would tell a retry that the
-    // remote already holds it, so every retry would send it again as one
-    // more pack. Decided on the local graph: it holds the whole history of
-    // each tag, and walking the remote's would cost a round trip per
-    // snapshot.
-    let mut accepted = Vec::new();
-    for (name, tag) in sendable {
-        if let Some(existing) = tx.view.tags.get(&name) {
-            if existing.target != tag.target && !force && !local.is_ancestor(&existing.target, &tag.target)? {
-                report.tags_rejected.push(name.clone());
-                report
-                    .tags_skipped
-                    .push((name, "remote has diverged (non-fast-forward; use --force)".into()));
-                continue;
-            }
-        }
-        accepted.push((name, tag));
-    }
-    let selected = accepted;
+    let selected = accepted_tags(local, sendable, &tx.view.tags, force, &mut report)?;
     let tips: Vec<ObjectId> = selected.iter().map(|(_, t)| t.target).collect();
     let ids = push_closure(local.store(), local.keys(), &tips, &withheld)?
         .map_err(|why| VeilError::repo(format!("push: {why}")))?;
@@ -1360,7 +1391,7 @@ pub fn push_with(
             }
             report = xfer.report;
         } else {
-            report = push_incremental(local, &tx.view.refs(), &dst, ids, public, report)?;
+            report = push_incremental(local, &tx.view.refs(), &dst, ids, public, report, None)?;
         }
     }
     // Releases staged by `vl embargo release` reach the record only now,
@@ -1393,6 +1424,82 @@ pub fn push_with(
     Ok(report)
 }
 
+/// The tags a push of `only_tags` (all if empty) may send, before the
+/// remote is consulted, and the embargo-withheld history. Cloaked tags
+/// (on a public remote) and tags that would publish withheld history are
+/// recorded in `report.tags_skipped` with the reason. Shared by
+/// [`push_with`] and its dry run ([`crate::push_plan`]), so the two agree.
+#[allow(clippy::type_complexity)]
+pub(crate) fn sendable_tags(
+    local: &Repo,
+    public: bool,
+    only_tags: &[String],
+    report: &mut SyncReport,
+) -> Result<(Vec<(String, Tag)>, HashMap<ObjectId, String>)> {
+    let mut selected: Vec<(String, Tag)> = Vec::new();
+    for (name, tag) in &local.view().tags {
+        if !only_tags.is_empty() && !only_tags.contains(name) {
+            continue;
+        }
+        if public && tag.cloak.is_some() {
+            report
+                .tags_skipped
+                .push((name.clone(), "cloaked tag is never pushed to a public remote".into()));
+            continue;
+        }
+        selected.push((name.clone(), tag.clone()));
+    }
+    for t in only_tags {
+        if !local.view().tags.contains_key(t) {
+            return Err(VeilError::NotFound(format!("tag '{t}'")));
+        }
+    }
+    // The merged-in history of an unreleased embargoed merge stays here, and
+    // so does any tag that would publish it by another route.
+    let withheld = embargo_withheld(local, public)?;
+    let mut sendable = Vec::new();
+    for (name, tag) in selected {
+        match push_closure(local.store(), local.keys(), &[tag.target], &withheld)? {
+            Ok(_) => sendable.push((name, tag)),
+            Err(why) => report.tags_skipped.push((name, why)),
+        }
+    }
+    Ok((sendable, withheld))
+}
+
+/// Of `sendable`, the tags the remote (holding `remote_tags`) takes; the
+/// others are rejected (non-fast-forward without `force`) in `report`.
+///
+/// Which tags the remote takes is decided before anything is sent: the
+/// history of a rejected tag is not uploaded (BUG-288). Nothing the
+/// remote's committed view does not reach would tell a retry that the
+/// remote already holds it, so every retry would send it again as one
+/// more pack. Decided on the local graph: it holds the whole history of
+/// each tag, and walking the remote's would cost a round trip per
+/// snapshot.
+pub(crate) fn accepted_tags(
+    local: &Repo,
+    sendable: Vec<(String, Tag)>,
+    remote_tags: &std::collections::BTreeMap<String, Tag>,
+    force: bool,
+    report: &mut SyncReport,
+) -> Result<Vec<(String, Tag)>> {
+    let mut accepted = Vec::new();
+    for (name, tag) in sendable {
+        if let Some(existing) = remote_tags.get(&name) {
+            if existing.target != tag.target && !force && !local.is_ancestor(&existing.target, &tag.target)? {
+                report.tags_rejected.push(name.clone());
+                report
+                    .tags_skipped
+                    .push((name, "remote has diverged (non-fast-forward; use --force)".into()));
+                continue;
+            }
+        }
+        accepted.push((name, tag));
+    }
+    Ok(accepted)
+}
+
 /// After a push to the remote named `remote_name`, record the tags it now
 /// holds (`report.remote_tags`) as `<remote_name>/<tag>`, as `vl pull` does
 /// and as Git and jj update remote-tracking refs on push (BUG-248). One
@@ -1412,13 +1519,17 @@ pub fn record_pushed_tags(local: &mut Repo, remote_name: &str, report: &SyncRepo
 
 /// Send `ids` (snapshots) and what they reference, except what the
 /// remote's committed view (`remote_refs`) provably holds, as packs.
-fn push_incremental(
+///
+/// With `plan` (a dry run), nothing is written: the same objects are
+/// recorded there and packed into [`Discard`], and `dst` is only read.
+pub(crate) fn push_incremental(
     local: &Repo,
     remote_refs: &[ObjectId],
     dst: &ObjectStore,
     ids: Vec<ObjectId>,
     public: bool,
     report: SyncReport,
+    mut plan: Option<&mut PlanRecord>,
 ) -> Result<SyncReport> {
     let store = local.store();
     let mut warnings = Vec::new();
@@ -1444,6 +1555,10 @@ fn push_incremental(
         return Err(e);
     }
     let to_send: Vec<ObjectId> = ids.into_iter().filter(|i| !known_snaps.contains(i)).collect();
+    if let Some(p) = plan.as_deref_mut() {
+        p.known_snapshots = known_snaps.clone();
+        p.sent_snapshots = to_send.clone();
+    }
     // Trees of the known snapshots the new ones build on.
     let mut boundary = HashSet::new();
     for id in &to_send {
@@ -1474,9 +1589,17 @@ fn push_incremental(
     let inventory = inventory.into_inner();
     let src = StoreSource(store);
     let pack_dir = dst.pack_dir();
+    let sink = match plan {
+        None => Sink::Pack(Box::new(PackSink::new(dst, pack_dir, None, 0))),
+        Some(p) => {
+            let mut pack = PackSink::new(dst, pack_dir, None, 0);
+            pack.backend = &DISCARD;
+            Sink::Plan(Box::new(pack), &p.objects)
+        }
+    };
     let mut xfer = Transfer {
         src: &src,
-        sink: Sink::Pack(Box::new(PackSink::new(dst, pack_dir, None, 0))),
+        sink,
         src_keys: local.keys(),
         public,
         known: Box::new(|id| known.contains(id)),
@@ -1562,7 +1685,7 @@ fn open_or_init_remote(backend: &Arc<dyn StorageBackend>) -> Result<Repo> {
 /// push left). Anything else is somebody's files, most likely a typo in the
 /// remote's URL (`../proj` for `../proj.veil`), and turning it into a bare
 /// repository would break every `vl` command run there (BUG-283).
-fn refuse_foreign_directory(backend: &dyn StorageBackend) -> Result<()> {
+pub(crate) fn refuse_foreign_directory(backend: &dyn StorageBackend) -> Result<()> {
     let listing = match backend.list_dir_full(&VPath::root()) {
         Ok(listing) => listing,
         Err(e) if e.is_not_found() => return Ok(()),

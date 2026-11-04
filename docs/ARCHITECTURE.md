@@ -1432,6 +1432,45 @@ what the other provably has (`remote.rs` has the details):
   damaged object, and fills content a push receiver lacks below snapshots
   it already has (a gap a plain push does not detect).
 
+### Dry runs (`push_plan.rs`)
+
+`vl push --dry-run` (`push_plan::plan_push`) is the push stopped before it
+writes, not a second implementation of it. It runs the same steps as
+`remote::push_with`: tag selection and the embargo-withheld history
+(`remote::sendable_tags`), the fast-forward check against the remote's
+tags (`remote::accepted_tags`), the push closure, and the incremental
+transfer (`remote::push_incremental`) with its visibility filter. Only the
+sink differs: `Sink::Plan` records every object and packs it exactly as
+the real sink would, into a backend that drops the bytes, so the plan's
+object ids, counts and pack size are the push's own. A property test
+(`veil-core/tests/push_plan.rs`) runs random histories of public, cloaked
+and exposed files, cloaked tags, rewound tags, embargoed merges and
+releases against a team and a public remote, and checks after every push
+that its new packs hold exactly the planned objects, its report the
+planned byte count, and its tags the planned actions; `vl/tests/
+tiers_cli.rs` does the same through the binary and a path remote.
+
+The remote is only read. It is opened through `push_plan::ReadOnly`, which
+turns every write into an error, and no lock is taken: the real push takes
+the lock and re-reads the same view under it (a push by someone else in
+between changes the push, and the plan with it). An empty or missing remote
+is planned as the empty repository the push would create; a foreign
+directory fails as the push would (BUG-283).
+
+For a public remote the plan also lists the files whose content becomes
+public there and those withheld, computed as the remote's readers see the
+trees: cloaked entries redacted (or shown as their last public version),
+unreleased wrappers replaced by their fallback. "Already there" is the
+public view of every snapshot the remote's committed view reaches, under
+the releases the remote's records carry; "after the push" uses this
+repository's releases, and revisits already-pushed wrappers whose embargo
+was released since (as the transfer does). A file is listed when its
+content object is in the plan, or its path was never public there:
+`new`, `exposed` (it was there withheld, or cloaked earlier in the same
+push), `modified`. Paths changed under an unreleased embargo are listed as
+withheld only for a reader holding its key; others get the snapshot id and
+the embargo, nothing about which files it changes.
+
 Benchmark (`cargo test --release -p veil-core --test sftp_bench --
 --ignored --nocapture`): 3,000 files, 300 snapshots, about 7,850 objects,
 through a local OpenSSH `sftp-server` with an artificial delay in both
@@ -2072,8 +2111,9 @@ repository lock.
 
 ## 12. Read commands: one API, text or JSON (`crates/vl/src/api.rs`)
 
-The read commands (`status`, `log`, `diff`, `show`, `workspace list`,
-`tag list`, `op log`, `scan`, `secret list`) are split in two:
+The read commands (`status`, `log`, `diff`, `show`, `ls`, `workspace list`,
+`tag list`, `op log`, `scan`, `secret list`, and `push --dry-run`) are split
+in two:
 
 * **A function in `api`** takes the repository context (`&Ctx`, or `&Repo`
   where nothing else is needed) and returns a typed result: plain Rust
@@ -2103,6 +2143,16 @@ the scanner's already-redacted excerpt. `crates/vl/tests/json_cli.rs` runs
 every read command on every revision as a non-member, a public-mirror
 reader and the owner, and checks no cloaked, embargoed or isolated
 plaintext, sealed description or vault value appears.
+
+**Tiers.** `vl ls` and `vl status` name each file's tier as *this reader*
+sees it (`api::entry_tier`): `public` (plaintext, or a released embargo),
+`cloaked` / `embargoed` (sealed, and the reader holds the key), `redacted`
+(sealed for someone else, or withheld here: decided by opening the object,
+never by the label alone), and from the working copy's build report the
+local-only `isolated`, `quarantined` and `ignored` (the builder records
+ignored paths, a directory once, in `BuildReport::ignored_paths`). `vl ls`
+merges the snapshot's files with the local-only ones for `-r @`; `vl
+files` keeps its older format for scripts.
 
 **Schemas** are named `veil.<command>/<n>` in a leading `schema` field and
 documented in `docs/reference/json.md` (hand-written; `docgen` keeps it

@@ -623,6 +623,9 @@ pub struct BuildReport {
     /// Entries carried over because this reader cannot materialise them.
     pub carried: Vec<VPath>,
     pub ignored: usize,
+    /// The ignored paths (`vl ls --all`), each with whether it is a
+    /// directory (ignored as a whole, never descended into).
+    pub ignored_paths: Vec<(VPath, bool)>,
     pub files: usize,
     /// Files whose content was read (and hashed) during this build.
     pub hashed: usize,
@@ -846,6 +849,7 @@ impl Builder<'_> {
                     let pdir = parent_entry.filter(|e| e.kind == EntryKind::Dir);
                     if class.tier == Tier::Ignored {
                         self.report.ignored += 1;
+                        self.report.ignored_paths.push((path.clone(), true));
                         // Ignored only by the accepted policy: reported, and
                         // not a deletion.
                         if let Some((t, force)) = &class.held_back {
@@ -1168,6 +1172,7 @@ impl Builder<'_> {
         match &class.tier {
             Tier::Ignored => {
                 self.report.ignored += 1;
+                self.report.ignored_paths.push((path.clone(), false));
                 return Ok(None);
             }
             Tier::Isolated => {

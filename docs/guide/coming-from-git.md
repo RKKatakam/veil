@@ -41,7 +41,8 @@ be undone. Add to that per-file encryption and engine-level secret handling.
 | `git diff` | `vl diff` |
 | `git diff A B` | `vl diff --from A --to B` |
 | `git diff --stat` | `vl diff --stat` |
-| `git ls-files` | `vl files` (with each file's visibility) |
+| `git ls-files` | `vl ls` (with each file's tier: public, cloaked, isolated, …) |
+| `git push --dry-run` | `vl push --dry-run` (also: what would become public, and what is withheld) |
 | `git show REV:PATH` | `vl cat PATH -r REV` |
 | `git checkout -- PATH`, `git restore PATH` | `vl restore PATH` (from `@-`, or a merge's merged parents; `--from REV` for another) |
 | `git reset --hard` | `vl restore` (every path, from `@-`) |

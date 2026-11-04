@@ -132,7 +132,7 @@ fn status_reports_local_only_and_quarantined_files() {
     r.write("app.py", "print(1)\n");
     let st = r.status();
     assert!(st.contains("Local-only (isolated; never snapshotted or pushed):\n  L .env"), "{st}");
-    assert!(st.contains("Q cfg.js  (aws-access-key-id; never recorded)"), "{st}");
+    assert!(st.contains("Q cfg.js [quarantined]  (aws-access-key-id; never recorded)"), "{st}");
     assert!(st.contains("warning: cfg.js quarantined"), "{st}");
     assert_eq!(r.changes(), vec!["A app.py"]);
     assert!(!st.contains("Xk29vLq8sPz") && !st.contains("AKIAIOSFODNN7EXAMPLE"), "no secret values: {st}");

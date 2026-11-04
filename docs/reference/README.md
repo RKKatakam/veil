@@ -32,6 +32,7 @@ Global options (accepted by every command):
 | [`vl show`](show.md) | Show a snapshot's metadata and diff |
 | [`vl diff`](diff.md) | Show changes in a snapshot, or between two snapshots |
 | [`vl files`](files.md) | List the files of a snapshot with their visibility |
+| [`vl ls`](ls.md) | List a snapshot's files with their tier: who can read each one, and what never leaves this machine |
 | [`vl cat`](cat.md) | Print a file's content at a snapshot |
 | [`vl fsck`](fsck.md) | Verify repository integrity: object hashes, reachability, key rings, embargo records and the operation log. Exits 1 on corruption |
 | [`vl upgrade`](upgrade.md) | Upgrade the repository (or a remote) to the newest format |

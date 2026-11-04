@@ -191,6 +191,13 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             let id = ctx.rev(rev)?;
             print_files(&ctx.repo, &ctx.repo.snapshot(&id)?.tree)?;
         }
+        Cmd::Ls { paths, rev, all, out } => {
+            let ls = api::ls(ctx, rev, paths, *all, !cli.no_snapshot)?;
+            match out.json {
+                true => api::emit_json(&ls)?,
+                false => api::text::ls(&ls),
+            }
+        }
         Cmd::Cat { path, rev } => {
             let id = ctx.rev(rev)?;
             let p = ctx.repo_path(path)?;
@@ -381,9 +388,18 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             remote,
             tag,
             force,
+            dry_run: true,
+            json,
+            ..
+        } => return cmd_push_dry_run(ctx, remote.as_deref(), tag, *force, *json),
+        Cmd::Push {
+            remote,
+            tag,
+            force,
             full,
             delete,
-        } => return cmd_push(ctx, remote, tag, *force, *full, delete),
+            ..
+        } => return cmd_push(ctx, remote.as_deref().unwrap_or("origin"), tag, *force, *full, delete),
         Cmd::Pull { remote, full } => cmd_pull(ctx, remote, *full)?,
         Cmd::Git(c) => return cmd_git(ctx, c),
         Cmd::Gc {
@@ -2119,6 +2135,22 @@ fn cmd_push(ctx: &mut Ctx, name: &str, tags: &[String], force: bool, full: bool,
         ),
         &withheld,
     ))
+}
+
+/// `vl push --dry-run`: the plan, per remote. Exits 1 where the push would
+/// fail: a remote that cannot be planned, a tag the remote would reject, or
+/// a tag named with `-t` that would be held back.
+fn cmd_push_dry_run(ctx: &mut Ctx, remote: Option<&str>, tags: &[String], force: bool, json: bool) -> Result<ExitCode> {
+    let doc = api::push_plan(ctx, remote, tags, force)?;
+    match json {
+        true => api::emit_json(&doc)?,
+        false => api::text::push_plan(&doc),
+    }
+    let fails = doc.remotes.iter().any(|r| {
+        r.error.is_some()
+            || r.tags.iter().any(|t| t.action == "rejected" || (t.action == "skipped" && tags.contains(&t.name)))
+    });
+    Ok(if fails { ExitCode::FAILURE } else { ExitCode::SUCCESS })
 }
 
 /// Exit status of a push that did not send every tag it was asked to:

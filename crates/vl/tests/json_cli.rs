@@ -129,7 +129,7 @@ fn sig() -> Value {
 }
 
 fn change() -> Value {
-    json!({"path": "string", "status": "string", "visibility": vis(), "redacted": "bool"})
+    json!({"path": "string", "status": "string", "visibility": vis(), "redacted": "bool", "tier": "string"})
 }
 
 fn diff_files() -> Value {
@@ -166,10 +166,13 @@ fn specs() -> Vec<(&'static str, Value)> {
             "parents": [snapshot_ref()],
             "changes": [change()],
             "isolated": ["string"],
-            "quarantined": [{"path": "string", "rule": "string", "line": "number", "state": "string"}],
-            "policy_held_back": [{"path": "string", "dir": "bool", "accepted": "string", "wanted": "string"}],
+            "quarantined": [{"path": "string", "rule": "string", "line": "number", "state": "string", "tier": "string"}],
+            "policy_held_back": [{
+                "path": "string", "dir": "bool", "accepted": "string", "wanted": "string",
+                "tier": "string", "scope": "string|null",
+            }],
             "nested": ["string"],
-            "redacted": [{"path": "string", "redaction": redaction()}],
+            "redacted": [{"path": "string", "redaction": redaction(), "tier": "string"}],
             "conflicts": [{"path": "string", "recorded_on": "string|null"}],
         })),
         ("veil.log/1", json!({"schema": "string", "entries": [log_entry], "truncated": "bool"})),
@@ -201,6 +204,39 @@ fn specs() -> Vec<(&'static str, Value)> {
             "files": [scan_file], "exposed": "number", "protected": "number", "clean": "bool",
         })),
         ("veil.secret.list/1", json!({"schema": "string", "secrets": [{"name": "string"}]})),
+        ("veil.ls/1", json!({
+            "schema": "string", "snapshot": snapshot_ref(), "working_copy": "bool", "all": "bool",
+            "entries": [{
+                "path": "string", "dir": "bool", "tier": "string", "scope": "string|null", "embargo": "string|null",
+                "recorded": "bool", "visibility": nullable(vis()), "size": "number|null", "executable": "bool",
+                "readable": "bool", "fallback": "bool", "redaction": nullable(redaction()),
+                "quarantine": nullable(json!({"rule": "string", "line": "number", "state": "string"})),
+            }],
+        })),
+        ("veil.push.plan/1", {
+            let snap = json!({"snapshot_id": "string", "snapshot_short": "string", "embargo": "string"});
+            json!({
+                "schema": "string",
+                "remotes": [{
+                    "name": "string", "url": "string", "public": "bool", "error": "string|null",
+                    "creates_remote": "bool",
+                    "tags": [{
+                        "name": "string", "action": "string", "target": "string", "target_short": "string",
+                        "remote_target": "string|null", "message": "string|null", "cloak": "string|null",
+                    }],
+                    "snapshots": "number", "objects": "number", "trees": "number", "blobs": "number",
+                    "sealed": "number", "object_bytes": "number", "pack_bytes": "number",
+                    "snapshot_ids": ["string"], "object_ids": ["string"], "withheld_objects": "number",
+                    "withheld_snapshots": [snap], "releases": ["string"],
+                    "files": nullable(json!({
+                        "published": [{"path": "string", "exposure": "string", "size": "number|null", "released_embargo": "string|null"}],
+                        "withheld": [{"path": "string", "reason": "string", "scope": "string|null", "embargo": "string|null", "message": "string"}],
+                        "embargoed_trees": [snap],
+                    })),
+                    "warnings": ["string"],
+                }],
+            })
+        }),
         ("veil.error/1", json!({"schema": "string", "error": {"message": "string", "hint": "string|null"}})),
     ]
 }
@@ -347,6 +383,9 @@ fn read_commands() -> Vec<(Vec<&'static str>, &'static str)> {
         (vec!["op", "log", "--json"], "veil.op.log/1"),
         (vec!["scan", "--json"], "veil.scan/1"),
         (vec!["secret", "list", "--json"], "veil.secret.list/1"),
+        (vec!["ls", "--json"], "veil.ls/1"),
+        (vec!["ls", "--all", "--json"], "veil.ls/1"),
+        (vec!["push", "--dry-run", "--json"], "veil.push.plan/1"),
     ]
 }
 
@@ -361,7 +400,8 @@ fn all_json(env: &Env, user: &str, dir: &Path) -> String {
         let id = e["snapshot_id"].as_str().unwrap().to_string();
         cmds.push(vec!["show".into(), id.clone(), "--json".into()]);
         cmds.push(vec!["diff".into(), "-r".into(), id.clone(), "--json".into()]);
-        cmds.push(vec!["diff".into(), "--from".into(), "root()".into(), "--to".into(), id, "--json".into()]);
+        cmds.push(vec!["diff".into(), "--from".into(), "root()".into(), "--to".into(), id.clone(), "--json".into()]);
+        cmds.push(vec!["ls".into(), "-r".into(), id, "--all".into(), "--json".into()]);
     }
     for c in &cmds {
         let args: Vec<&str> = c.iter().map(String::as_str).collect();
@@ -578,6 +618,79 @@ fn list_shapes() {
     let v = json_ok(env, "alice", alice, &["secret", "list", "--json"]);
     check_doc(&v, "veil.secret.list/1");
     assert_eq!(v["secrets"], json!([{"name": "API_TOKEN"}]));
+}
+
+#[test]
+fn ls_shape() {
+    let w = world();
+    let (env, alice) = (&w.env, &w.alice);
+    write(alice, "cfg.py", &format!("token = '{TOKEN}'\n"));
+    std::fs::create_dir_all(alice.join("target")).unwrap();
+    write(alice, "target/out.o", "x\n");
+    let v = json_ok(env, "alice", alice, &["ls", "--all", "--json"]);
+    check_doc(&v, "veil.ls/1");
+    assert_eq!((v["working_copy"].clone(), v["all"].clone()), (json!(true), json!(true)));
+    let entries = nonempty(&v, "entries");
+    let get = |p: &str| entries.iter().find(|e| e["path"] == p).unwrap_or_else(|| panic!("{p} not listed: {v}")).clone();
+    assert_eq!(get("logo.bin")["tier"], "public");
+    assert_eq!(get("README.md")["tier"], "embargoed", "@ is on the embargoed merge, whose key Alice holds");
+    let plan = get("internal/plan.md");
+    assert_eq!((plan["tier"].clone(), plan["scope"].clone(), plan["readable"].clone()), (json!("cloaked"), json!("team"), json!(true)));
+    let env_file = get(".env");
+    assert_eq!((env_file["tier"].clone(), env_file["recorded"].clone()), (json!("isolated"), json!(false)));
+    let q = get("cfg.py");
+    assert_eq!((q["tier"].clone(), q["quarantine"]["state"].clone()), (json!("quarantined"), json!("never_recorded")));
+    let t = get("target");
+    assert_eq!((t["tier"].clone(), t["dir"].clone(), t["size"].clone()), (json!("ignored"), json!(true), Value::Null));
+    assert_eq!(get("run.sh")["executable"], true);
+
+    // Bob holds no key: the cloaked file is redacted, with the reason.
+    let v = json_ok(env, "bob", &w.bob, &["ls", "--json"]);
+    check_doc(&v, "veil.ls/1");
+    let entries = nonempty(&v, "entries");
+    let plan = entries.iter().find(|e| e["path"] == "internal/plan.md").unwrap();
+    assert_eq!((plan["tier"].clone(), plan["readable"].clone()), (json!("redacted"), json!(false)), "{v}");
+    assert_eq!(plan["redaction"]["reason"], "no_key");
+    // Alice holds the embargo key: main's README.md is embargoed for her.
+    let v = json_ok(env, "alice", alice, &["ls", "-r", "main", "README.md", "--json"]);
+    check_doc(&v, "veil.ls/1");
+    assert_eq!(v["working_copy"], false);
+    let e = &nonempty(&v, "entries")[0];
+    assert_eq!(e["tier"], "embargoed", "{v}");
+    assert!(e["embargo"].is_string());
+}
+
+#[test]
+fn push_plan_shape() {
+    let w = world();
+    let (env, alice) = (&w.env, &w.alice);
+    write(alice, "new.txt", "new\n");
+    env.ok("alice", alice, &["commit", "-m", "next"]);
+    env.ok("alice", alice, &["tag", "set", "next", "-r", "@-"]);
+    let v = json_ok(env, "alice", alice, &["push", "--dry-run", "--json"]);
+    check_doc(&v, "veil.push.plan/1");
+    let remotes = nonempty(&v, "remotes");
+    assert_eq!(remotes.len(), 2, "every configured remote: {v}");
+    let mirror = remotes.iter().find(|r| r["name"] == "mirror").unwrap();
+    assert_eq!(mirror["public"], true);
+    let next = mirror["tags"].as_array().unwrap().iter().find(|t| t["name"] == "next").unwrap();
+    assert_eq!(next["action"], "create");
+    // `@` builds on the embargoed merge: new work there is sealed under the
+    // embargo, so the mirror does not get it yet.
+    let withheld = mirror["files"]["withheld"].as_array().unwrap();
+    assert!(withheld.iter().any(|f| f["path"] == "new.txt" && f["reason"] == "embargoed"), "{mirror}");
+    assert!(mirror["files"]["published"].as_array().unwrap().is_empty(), "{mirror}");
+    assert!(!nonempty(mirror, "withheld_snapshots").is_empty());
+    let skipped = mirror["tags"].as_array().unwrap().iter().find(|t| t["name"] == "plan-tag").unwrap();
+    assert_eq!(skipped["action"], "skipped");
+    let origin = remotes.iter().find(|r| r["name"] == "origin").unwrap();
+    assert!(origin["files"].is_null(), "file lists are for public remotes");
+    assert!(origin["objects"].as_u64().unwrap() >= 3);
+    assert_eq!(origin["object_ids"].as_array().unwrap().len() as u64, origin["objects"].as_u64().unwrap());
+    // One remote; --json needs --dry-run.
+    let v = json_ok(env, "alice", alice, &["push", "origin", "--dry-run", "--json"]);
+    assert_eq!(nonempty(&v, "remotes").len(), 1);
+    assert!(!env.vl("alice", alice, &["push", "--json"]).status.success());
 }
 
 #[test]
