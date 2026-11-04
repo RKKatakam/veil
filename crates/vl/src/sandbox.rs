@@ -5,12 +5,17 @@
 //! runs, synced to the workspace's tree before each run (only what changed
 //! is rewritten, by copy-on-write clones where the filesystem has them) and
 //! removed by `vl ws rm`. A run holds the sandbox's lock from start to end:
-//! a second `vl ws exec` in the same workspace waits for it. A run that
-//! cannot finish (an error, `kill -9`, a crash) leaves the sandbox marked as
-//! running, and it is wiped: by this process on an error, by the reaper (see
-//! below) when the process dies, or by the next run when both died. Ctrl-C
-//! reaches the command only; `vl` then records what it left, like any other
-//! exit.
+//! a second `vl ws exec` in the same workspace waits for it.
+//!
+//! **No failure deletes the command's output.** Just before the command
+//! starts, the manifest says (durably) that the files hold unrecorded
+//! output ([`Pending`]). Whatever happens next (recording fails because the
+//! repository is busy, `vl` is killed, the machine restarts), the files
+//! stay: the next run, or `vl ws exec NAME --record-only`, records them
+//! first. A sandbox that must be rebuilt keeps its unrecorded work
+//! ([`core::set_aside`]). Ctrl-C, Ctrl-\, SIGTERM and SIGHUP reach the
+//! command only (`vl` forwards the last two to it); `vl` then records what
+//! it left, like any other exit.
 //!
 //! **`--ephemeral`** gets a throwaway directory under `$TMPDIR`, removed
 //! when `vl` exits:
@@ -33,9 +38,19 @@
 //! re-executed with [`REAPER_ARG`]) watches a pipe whose only writer is this
 //! process. When `vl` exits for any reason, `kill -9` included, the kernel
 //! closes the pipe; unless `vl` said it finished cleanly, the reaper removes
-//! the throwaway directory, or wipes the persistent sandbox if the run that
-//! died still owns it. It runs in its own process group, so a Ctrl-C aimed
-//! at the command does not kill it too.
+//! the throwaway directory, or, for a persistent sandbox whose run injected
+//! secrets, takes the injected files that are still unchanged out again
+//! (it never deletes anything else: the rest is the command's output). It
+//! runs in its own process group, so a Ctrl-C aimed at the command does not
+//! kill it too.
+//!
+//! **Background processes** a command leaves running (a dev server, a
+//! watcher) are not killed when it exits: that is often the point. They
+//! can keep writing into the sandbox. A sandbox that was ever given
+//! injected secrets keeps its guard ([`core::Guard`]) and applies it to
+//! every later recording, and checks every file changed since for copies
+//! of them ([`core::scrub`]), so nothing such a process writes can be
+//! recorded or stay for a later command to read.
 
 use std::{
     io::{Read, Write},
@@ -47,9 +62,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use veil_core::{
     builder::{BuildReport, INJECTED_RULE},
     checkout::CheckoutReport,
-    policy::Policy,
-    sandbox::{self as core, Loaded, Manifest, SandboxPaths},
+    policy::{Policy, POLICY_FILE},
+    sandbox::{self as core, Loaded, Manifest, Pending, SandboxPaths, SetAside},
     statcache::StatCache,
+    tree::TreeView,
     vfs::{private_dir, restrict as restrict_tree, CloneSources, SandboxFs, SandboxLock, SparseSet, SparseView, StorageBackend},
     workspace::SnapshotOptions,
     ObjectId, Repo, VPath,
@@ -66,6 +82,9 @@ pub const REAPER_ARG: &str = "__veil-sandbox-reaper";
 const PERSISTENT_ARG: &str = "--persistent";
 /// What `vl` writes to the reaper when the run finished cleanly.
 const KEEP: u8 = b'K';
+/// First byte of the line telling a persistent run's reaper what it
+/// injected ([`tell_reaper`]).
+const INJECTED: u8 = b'I';
 
 const PREFIX: &str = "veil-ws-";
 
@@ -78,6 +97,8 @@ pub struct Exec<'a> {
     pub with_isolated: bool,
     /// `--only`: the paths of a sparse sandbox, as the user gave them.
     pub only: &'a [String],
+    /// `--record-only`: record what an earlier run left unrecorded, run nothing.
+    pub record_only: bool,
     pub command: &'a [String],
 }
 
@@ -143,34 +164,25 @@ pub fn exec(ctx: &mut Ctx, a: &Exec<'_>) -> Result<ExitCode> {
 
 // ---- persistent sandboxes --------------------------------------------------
 
-/// A run of a persistent sandbox. Unless [`PersistentRun::finish`] is called
-/// it wipes the sandbox when dropped (an error part way: the files may be
-/// anything, injected secrets included).
+/// A run of a persistent sandbox: holds its lock, and the reaper of a run
+/// that injected secrets. Dropped without [`PersistentRun::finish`] (an
+/// error, a panic), it deletes nothing: the manifest says what is left to
+/// do (`running`: the sync did not finish, the next run rebuilds keeping
+/// unrecorded work; `pending`: the command's output is not recorded yet,
+/// the next run records it), and the reaper only takes injected files
+/// that are still unchanged out again.
 struct PersistentRun {
-    paths: SandboxPaths,
     reaper: Option<Child>,
     lock: Option<SandboxLock>,
-    done: bool,
 }
 
 impl PersistentRun {
     fn finish(&mut self) {
-        self.done = true;
-        self.release(true);
-    }
-
-    /// Tell the reaper (with `KEEP` if nothing is left for it to do) and
-    /// let the lock go.
-    fn release(&mut self, keep: bool) {
         if let Some(mut r) = self.reaper.take() {
             if let Some(mut stdin) = r.stdin.take() {
-                if keep {
-                    let _ = stdin.write_all(&[KEEP]);
-                }
+                let _ = stdin.write_all(&[KEEP]);
             }
-            if keep {
-                let _ = r.wait();
-            }
+            let _ = r.wait();
         }
         self.lock = None;
     }
@@ -178,22 +190,10 @@ impl PersistentRun {
 
 impl Drop for PersistentRun {
     fn drop(&mut self) {
-        if self.done {
-            return;
-        }
-        match core::wipe(&self.paths) {
-            Ok(()) => self.release(true),
-            Err(e) => {
-                warn(&format!(
-                    "could not remove the sandbox {} after a failed run: {e}; the next `vl ws exec` rebuilds it",
-                    self.paths.files.display()
-                ));
-                // Lock first: the reaper takes it before trying again.
-                self.lock = None;
-                if let Some(mut r) = self.reaper.take() {
-                    drop(r.stdin.take());
-                }
-            }
+        // Lock first: the reaper takes it before cleaning up.
+        self.lock = None;
+        if let Some(mut r) = self.reaper.take() {
+            drop(r.stdin.take());
         }
     }
 }
@@ -232,6 +232,7 @@ fn vault_files(repo: &Repo) -> Result<Vec<(String, Vec<u8>)>> {
 fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>) -> Result<ExitCode> {
     // Throwaway sandboxes of dead `vl` processes may hold secrets.
     sweep_stale(&std::env::temp_dir());
+    let started = core::now_ns();
     let paths = SandboxPaths::new(&ctx.root, name);
     let base_dir = core::sandboxes_dir(&ctx.root);
     private_dir(&base_dir).with_context(|| format!("creating {}", base_dir.display()))?;
@@ -244,61 +245,161 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>) -> Result<ExitCode> 
         )
     })
     .with_context(|| format!("locking {}", paths.lock.display()))?;
+    let mut run = PersistentRun { reaper: None, lock: Some(lock) };
     // The workspace may have moved, or gone, while we waited.
     ctx.repo.reload()?;
-    let base = ctx.repo.workspace_wc(name)?;
-    let synced = ctx.repo.snapshot(&base)?.tree;
-    let set = sparse_set(ctx, a.only, &synced, &format!("workspace '{}'", safe(name)))?;
+    ctx.repo.workspace_wc(name)?;
 
     let loaded = paths.load_manifest();
-    let (mut m, mut cache) = match core::rebuild_reason(&ctx.repo, &paths, name, &loaded) {
+    let (mut m, mut cache, aside) = match core::rebuild_reason(&ctx.repo, &paths, name, &loaded) {
         None => match loaded {
-            Loaded::Found(m) => (*m, paths.load_cache()),
+            Loaded::Found(m) => (*m, paths.load_cache(), SetAside::Nothing),
             _ => unreachable!("only a found manifest is reused"),
         },
+        Some(why) if a.record_only => {
+            let what = match &loaded {
+                Loaded::Found(m) if m.pending.is_some() => format!(
+                    "it cannot be recorded ({why}); the next run keeps its files aside, whole"
+                ),
+                _ => "it holds no unrecorded run".to_string(),
+            };
+            eprintln!("Nothing to record in the sandbox of workspace {}: {what}", safe(name));
+            run.finish();
+            return Ok(ExitCode::SUCCESS);
+        }
         Some(why) => {
             if !why.is_empty() {
                 eprintln!("{} the sandbox of workspace {}: {why}", yellow("Rebuilding"), safe(name));
             }
-            core::wipe(&paths).with_context(|| format!("removing {}", paths.files.display()))?;
-            (Manifest::new(name), StatCache::new())
+            let target = ctx.repo.snapshot(&ctx.repo.workspace_wc(name)?)?.tree;
+            let aside = core::set_aside(&ctx.repo, &paths, name, &loaded, Some(&target))
+                .with_context(|| format!("setting the files of {} aside", paths.files.display()))?;
+            if let SetAside::Kept { dir } = &aside {
+                warn(&format!(
+                    "the sandbox's previous files may hold work that is in no snapshot (the output of a run that was \
+                     interrupted by a restart, files that differ from its snapshot, or a sandbox whose manifest cannot be \
+                     read); they were moved, whole, to {}. Copy back what you need, then delete it",
+                    dir.display()
+                ));
+            }
+            (Manifest::new(name), StatCache::new(), aside)
         }
     };
-    let run_id = hex::encode(veil_core::crypto::random_bytes::<8>());
-    m.running = Some(run_id.clone());
-    m.boot = veil_core::lock::boot_identity();
-    paths.save_manifest(&m)?;
-    let mut run = PersistentRun {
-        reaper: spawn_reaper(&[PERSISTENT_ARG.as_ref(), paths.dir.as_os_str(), run_id.as_ref()]),
-        paths: paths.clone(),
-        lock: Some(lock),
-        done: false,
-    };
-
     let fs = SandboxFs::new(
         &paths.files,
         Some(CloneSources::new((*ctx.fs).clone(), ctx.stat_cache().clone())),
         true,
     );
+    // The output of an earlier run that was never recorded (`vl` was
+    // killed, or recording it failed) is recorded first, as it is.
+    let recovered = m.pending.is_some();
+    if recovered {
+        eprintln!(
+            "{} the output of an earlier run in workspace {}, which was not recorded",
+            yellow("Recording"),
+            safe(name)
+        );
+        finish(ctx, name, &paths, &mut m, &mut cache, &fs, None, None)?;
+    }
+    if a.record_only {
+        if !recovered {
+            eprintln!("Nothing to record: the sandbox of workspace {} holds no unrecorded run", safe(name));
+        }
+        run.finish();
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let base = ctx.repo.workspace_wc(name)?;
+    let synced = ctx.repo.snapshot(&base)?.tree;
+    let set = sparse_set(ctx, a.only, &synced, &format!("workspace '{}'", safe(name)))?;
+    let run_id = hex::encode(veil_core::crypto::random_bytes::<8>());
+    m.running = Some(run_id.clone());
+    m.boot = veil_core::lock::boot_identity();
+    paths.save_manifest(&m)?;
+
     let was = m.tree.map(|_| m.only.clone());
     let (co, kept, injection) = {
         let _umask = PrivateUmask::set();
         private_dir(&paths.files)?;
         let co = core::sync_to(&ctx.repo, &fs, &mut m, &synced, set.as_ref(), &mut cache)?;
         core::vouch_written(ctx.repo.store(), &fs, &synced, &co, &mut cache, core::VouchWait::IfCheaper)?;
+        if let SetAside::Reimport {
+            from,
+            paths: keep,
+            quarantined,
+            keep_whole,
+        } = &aside
+        {
+            let (failed, left) = core::reimport(&fs, from, keep, *keep_whole, &mut cache);
+            let shown: Vec<String> = keep.iter().take(10).map(|p| safe(p.as_str()).into_owned()).collect();
+            eprintln!(
+                "  {} {} file(s) of unrecorded work across the rebuild: {}{}",
+                yellow("kept"),
+                keep.len() - failed.len(),
+                shown.join(", "),
+                if keep.len() > 10 { ", …" } else { "" }
+            );
+            for (p, why) in &failed {
+                warn(&format!("{} could not be put back into the rebuilt sandbox ({why})", safe(p.as_str())));
+            }
+            if let Some(dir) = left {
+                let why = match keep_whole {
+                    true => "other files of the sandbox differed from its snapshot (hand edits, or files a crash tore)",
+                    false => "not everything could be put back",
+                };
+                warn(&format!(
+                    "{why}; the previous files were kept, whole, in {}: copy back what you need, then delete it",
+                    dir.display()
+                ));
+            }
+            m.quarantined = quarantined.clone();
+        }
         // Files outside the set before the command runs are not its output:
         // edits made in the sandbox by hand, or kept by a narrower set
         // because they held something else. They stay (unrecorded).
         let kept = match &set {
-            Some(s) => core::strays(&fs, s, &Policy::load(&fs)?)?,
+            Some(s) => {
+                let pin = core::PolicyPin::new(&fs, ctx.repo.store(), &synced)?;
+                core::strays(&fs, s, &[&Policy::load_or_accepted(&pin, None)?.0])?
+            }
             None => Vec::new(),
         };
         let injection = match a.with_isolated {
-            true => Some(core::inject(&fs, &vault_files(&ctx.repo)?)?),
+            true => {
+                let files = vault_files(&ctx.repo)?;
+                let mut inj = core::plan_injection(&fs, &files)?;
+                // Durably, before anything is written: the guard every later
+                // recording of this sandbox applies, and what the injection
+                // replaces (for a cleanup after `vl` dies).
+                let mut guard = paths.load_guard(&ctx.repo)?.unwrap_or_default();
+                guard.add(&files);
+                guard.injection = Some(inj.to_saved(&run_id));
+                paths.save_guard(&ctx.repo, &guard)?;
+                run.reaper = spawn_reaper(&[PERSISTENT_ARG.as_ref(), paths.dir.as_os_str(), run_id.as_ref()]);
+                if let Some(r) = &mut run.reaper {
+                    tell_reaper(r, &inj, &files);
+                }
+                core::write_injection(&fs, &mut inj, &files);
+                Some(inj)
+            }
             false => None,
         };
         (co, kept, injection)
     };
+    // From here on the files are the command's output: never wiped, recorded
+    // by this run or, if it cannot, by the next one.
+    m.pending = Some(Pending {
+        run: run_id,
+        base,
+        message: a.message.to_string(),
+        started,
+        kept: kept.iter().map(|p| p.as_str().to_string()).collect(),
+        injected: injection.is_some(),
+        recorded: None,
+    });
+    m.running = None;
+    m.snapshot = Some(base);
+    paths.save_manifest(&m)?;
     if was.as_ref() != Some(&m.only) && (set.is_some() || was.is_some()) {
         eprintln!("{} sandbox holds {}", dim("sparse:"), show_set(set.as_ref()));
     }
@@ -310,113 +411,199 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>) -> Result<ExitCode> 
     }
 
     eprintln!("{} {} in {}", dim("running"), a.command.join(" "), paths.files.display());
-    let code = match run_command(&paths.files, &paths.dir, a.command) {
-        Ok(code) => code,
-        Err(e) => {
-            // Nothing ran: the sandbox is still the workspace's tree. Take
-            // the injected files out again and keep it.
-            if let Some(inj) = &injection {
-                let c = core::remove_injected(ctx.repo.store(), &fs, &synced, &synced, inj, &BuildReport::default(), &mut cache)?;
-                if !c.failed.is_empty() {
-                    return Err(e);
+    let code = run_command(&paths.files, &paths.dir, a.command);
+    // Nothing may have run (the command was not found): recording finds no
+    // change and the injected files are taken out as after any run.
+    finish(ctx, name, &paths, &mut m, &mut cache, &fs, injection.as_ref(), Some(&kept))?;
+    run.finish();
+    let code = code?;
+    Ok(ExitCode::from(code.clamp(0, 255) as u8))
+}
+
+/// The error of a run whose output could not be recorded: it stays.
+fn not_recorded(name: &str, paths: &SandboxPaths, e: impl std::fmt::Display) -> anyhow::Error {
+    anyhow!(
+        "the command's output was not recorded: {e}. It stays in the sandbox ({}); the next `vl ws exec {n}` records it \
+         first, or run `vl ws exec {n} --record-only`",
+        paths.files.display(),
+        n = safe(name)
+    )
+}
+
+/// Record the command's output ([`Manifest::pending`]) and clean up after
+/// it: injected files and every copy of an injected value taken out,
+/// files written outside a sparse set removed. `injection`: the run's own
+/// (else the one the guard file saved, for a run that died); `kept`: the
+/// files outside the set before the command (else the manifest's).
+///
+/// Never deletes unrecorded output: whatever fails, the manifest still
+/// says `pending` (recorded or not), and the next run, or
+/// `vl ws exec --record-only`, finishes the job.
+#[allow(clippy::too_many_arguments)]
+fn finish(
+    ctx: &mut Ctx,
+    name: &str,
+    paths: &SandboxPaths,
+    m: &mut Manifest,
+    cache: &mut StatCache,
+    fs: &SandboxFs,
+    injection: Option<&core::Injection>,
+    kept: Option<&[VPath]>,
+) -> Result<()> {
+    let p = m.pending.clone().expect("a pending run");
+    let store = ctx.repo.store().clone();
+    let synced = m.tree.ok_or_else(|| anyhow!("the sandbox's manifest names no tree"))?;
+    let set = m.only_set()?;
+    let mut guard = paths.load_guard(&ctx.repo).map_err(|e| not_recorded(name, paths, e))?;
+    let secrets = guard.as_ref().map(core::Guard::secrets);
+
+    let pin = core::PolicyPin::new(fs, &store, &synced)?;
+    let (recorded, recorded_tree, report, outcome) = {
+        // Sparse: everything outside the set is recorded as `synced` has it.
+        let view = set.as_ref().map(|s| SparseView::new(&pin, store.clone(), synced, s));
+        let recorded_fs: &dyn StorageBackend = match &view {
+            Some(v) => v,
+            None => &pin,
+        };
+        match p.recorded {
+            Some((snap, tree)) => (snap, tree, None, Outcome::Resumed),
+            None => {
+                let out = ctx
+                    .repo
+                    .snapshot_workspace_with(
+                        name,
+                        recorded_fs,
+                        SnapshotOptions {
+                            cache: Some(&mut *cache),
+                            injected: secrets.as_ref(),
+                            materialised: Some(&m.materialised),
+                            expected_wc: Some(p.base),
+                            ..Default::default()
+                        },
+                    )
+                    .map_err(|e| not_recorded(name, paths, e))?;
+                let (recorded, report, outcome) = if out.superseded {
+                    // Someone moved the workspace while the command ran:
+                    // recording the sandbox now would revert what they did.
+                    // Keep the result as a change of its own, on top of what
+                    // the command started from.
+                    let desc = if p.message.is_empty() { "`vl ws exec` result" } else { p.message.as_str() };
+                    let (id, report) = ctx
+                        .repo
+                        .commit_fs_as_child_injected(p.base, recorded_fs, desc, secrets.as_ref())
+                        .map_err(|e| not_recorded(name, paths, e))?;
+                    (id, report, Outcome::Saved)
+                } else {
+                    let outcome = if out.changed { Outcome::Recorded } else { Outcome::Unchanged };
+                    (out.snapshot, out.report, outcome)
+                };
+                let tree = ctx.repo.snapshot(&recorded)?.tree;
+                // Durably recorded: from here on only the cleanup is left.
+                if let Some(pp) = &mut m.pending {
+                    pp.recorded = Some((recorded, tree));
                 }
+                paths.save_manifest(m)?;
+                print_build_warnings(&report);
+                print_working_copy_warnings(&report);
+                if outcome == Outcome::Saved {
+                    let change = ctx.repo.snapshot(&recorded)?.change_id.short();
+                    warn(&format!(
+                        "workspace '{}' moved while the command ran; its result was saved as change {change} on top of the snapshot it started from, \
+                         not into the workspace",
+                        safe(name)
+                    ));
+                } else if !p.message.is_empty() {
+                    if let Err(e) = ctx.repo.describe(recorded, &p.message) {
+                        warn(&format!("the result was recorded, but could not be described: {e}"));
+                    }
+                }
+                (recorded, tree, Some(report), outcome)
             }
-            m.snapshot = Some(base);
-            m.running = None;
-            paths.save_manifest(&m)?;
-            let _ = paths.save_cache(&mut cache);
-            run.finish();
-            return Err(e);
         }
     };
 
-    let injected = injection.as_ref().map(|i| &i.secrets);
-    // Sparse: everything outside the set is recorded as `synced` has it.
-    let view = set.as_ref().map(|s| SparseView::new(&fs, ctx.repo.store().clone(), synced, s));
-    let recorded_fs: &dyn StorageBackend = match &view {
-        Some(v) => v,
-        None => &fs,
-    };
-    let out = ctx.repo.snapshot_workspace_with(
-        name,
-        recorded_fs,
-        SnapshotOptions {
-            cache: Some(&mut cache),
-            injected,
-            materialised: Some(&m.materialised),
-            expected_wc: Some(base),
-            ..Default::default()
-        },
-    )?;
-    let (recorded, report, changed) = if out.superseded {
-        // Someone moved the workspace while the command ran: recording the
-        // sandbox now would revert what they did. Keep the result as a
-        // change of its own, on top of what the command started from.
-        let desc = if a.message.is_empty() { "`vl ws exec` result" } else { a.message };
-        let (id, report) = ctx.repo.commit_fs_as_child_injected(base, recorded_fs, desc, injected)?;
-        let change = ctx.repo.snapshot(&id)?.change_id.short();
+    if let Some(why) = &pin.why {
         warn(&format!(
-            "workspace '{}' moved while the command ran; its result was saved as change {change} on top of the snapshot it started from, \
-             not into the workspace",
+            "{POLICY_FILE} {why} in the sandbox: workspace '{}' keeps its recorded policy (in a sandbox, only a regular, readable \
+             {POLICY_FILE} is an edit of it; a deleted or unreadable one never lifts protection)",
             safe(name)
         ));
-        (id, report, false)
-    } else {
-        (out.snapshot, out.report, out.changed)
-    };
-    print_build_warnings(&report);
-    print_working_copy_warnings(&report);
-    let recorded_tree = ctx.repo.snapshot(&recorded)?.tree;
-    if !out.superseded && !a.message.is_empty() {
-        ctx.repo.describe(recorded, a.message)?;
+        if let (true, Some(text)) = (pin.deleted, pin.pinned_text()) {
+            let vp = VPath::new(POLICY_FILE)?;
+            if !veil_core::checkout::behind_special(fs, &vp)? && fs.metadata(&vp)?.is_none() && fs.write(&vp, text).is_ok() {
+                cache.invalidate(&vp);
+                eprintln!("  {} {POLICY_FILE} in the sandbox", yellow("put back"));
+            }
+        }
     }
 
-    if let Some(inj) = &injection {
-        let c = core::remove_injected(ctx.repo.store(), &fs, &synced, &recorded_tree, inj, &report, &mut cache)?;
-        if let Some((p, why)) = c.failed.first() {
-            // The secret may still be there: the sandbox goes (`run` drops
-            // unfinished).
+    // Injected paths (skipped by the scrub) and the copies taken out.
+    let mut scrub: Option<(Vec<VPath>, Vec<String>)> = None;
+    if let (Some(g), Some(_)) = (&mut guard, &secrets) {
+        let saved;
+        let empty = core::Injection::default();
+        let inj = match injection {
+            Some(i) => i,
+            None => match g.injection.as_ref().filter(|s| s.run == p.run) {
+                Some(s) => {
+                    saved = core::Injection::from_saved(s, Default::default());
+                    &saved
+                }
+                None => &empty,
+            },
+        };
+        let none = BuildReport::default();
+        let c = core::remove_injected(&store, fs, &synced, &recorded_tree, inj, report.as_ref().unwrap_or(&none), cache)?;
+        if let Some((q, why)) = c.failed.first() {
             bail!(
-                "could not take the injected file {} out of the sandbox again ({why}); the sandbox was removed",
-                safe(p.as_str())
+                "could not take the injected file {} out of the sandbox again ({why}); the run is recorded, and the next \
+                 `vl ws exec {n}` (or `vl ws exec {n} --record-only`) tries again",
+                safe(q.as_str()),
+                n = safe(name)
             );
         }
         let copies: Vec<String> = c
             .removed
             .iter()
             .chain(&c.restored)
-            .filter(|p| !inj.paths.contains(p))
-            .map(|p| safe(p.as_str()).into_owned())
+            .filter(|q| !inj.paths.contains(q))
+            .map(|q| safe(q.as_str()).into_owned())
             .collect();
-        if !copies.is_empty() {
-            eprintln!(
-                "  {} {} (they held an injected secret; quarantined and taken out of the sandbox)",
-                yellow("cleaned"),
-                copies.join(", ")
-            );
+        scrub = Some((inj.paths.clone(), copies));
+        if g.injection.is_some() {
+            g.injection = None;
+            paths.save_guard(&ctx.repo, g)?;
         }
     }
 
     // Quarantined files of earlier runs that are now outside the set stay
     // (they are in no snapshot), and so does `vl ws rm`'s guard for them.
-    let mut quarantined: Vec<String> = match &set {
-        Some(set) => m
+    let mut quarantined: Vec<String> = match (&set, &report) {
+        (_, None) => m.quarantined.clone(),
+        (Some(set), _) => m
             .quarantined
             .iter()
             .filter(|q| VPath::new(q).is_ok_and(|p| !set.contains(&p) && fs.metadata(&p).ok().flatten().is_some()))
             .cloned()
             .collect(),
-        None => Vec::new(),
+        (None, _) => Vec::new(),
     };
     if let Some(set) = &set {
         // What the command wrote outside the set is not the workspace's.
-        let policy = Policy::load(&fs)?;
-        let (strays, left): (Vec<VPath>, Vec<VPath>) = core::strays(&fs, set, &policy)?
+        // Ignored or isolated under the policy it started with or the one
+        // it left: not its output to remove (BUG-549).
+        let before = Policy::load_or_accepted(&TreeView::new(store.clone(), synced), None)?.0;
+        let after = Policy::load_or_accepted(&pin, None)?.0;
+        let kept_before: Vec<VPath> = match kept {
+            Some(k) => k.to_vec(),
+            None => p.kept.iter().filter_map(|k| VPath::new(k).ok()).collect(),
+        };
+        let (strays, left): (Vec<VPath>, Vec<VPath>) = core::strays(fs, set, &[&before, &after])?
             .into_iter()
-            .filter(|p| !quarantined.iter().any(|q| q == p.as_str()))
-            .partition(|p| !kept.contains(p));
+            .filter(|q| !quarantined.iter().any(|x| x == q.as_str()))
+            .partition(|q| !kept_before.contains(q));
         if !left.is_empty() {
-            let shown: Vec<String> = left.iter().take(20).map(|p| safe(p.as_str()).into_owned()).collect();
+            let shown: Vec<String> = left.iter().take(20).map(|q| safe(q.as_str()).into_owned()).collect();
             warn(&format!(
                 "not recorded: {} file(s) in the sandbox outside --only {} that the command did not write (kept; a run whose paths hold them records them): {}",
                 left.len(),
@@ -424,48 +611,98 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>) -> Result<ExitCode> 
                 shown.join(", ")
             ));
         }
-        let failed = core::remove_strays(&fs, set, &strays, &mut cache);
+        let failed = core::remove_strays(fs, set, &strays, cache);
         // An injected file outside the set, put back as recorded, is ours.
         let by_command: Vec<VPath> = strays
             .into_iter()
-            .filter(|p| !injection.as_ref().is_some_and(|i| i.paths.contains(p)))
+            .filter(|q| !injection.is_some_and(|i| i.paths.contains(q)))
             .collect();
         warn_strays(set, &by_command, true);
-        for (p, why) in &failed {
+        for (q, why) in &failed {
             warn(&format!(
                 "could not remove {} from the sandbox ({why}); it is outside --only and is not recorded",
-                safe(p.as_str())
+                safe(q.as_str())
             ));
         }
     }
+    if let (Some((skip, mut copies)), Some(secrets)) = (scrub, &secrets) {
+        // Copies the builder never saw: ignored and isolated files, outside
+        // a sparse set, written after an earlier injected run (BUG-546/547).
+        let since = m.guard_checked.map_or(p.started, |g| g.min(p.started));
+        let found = core::scrub(fs, since, secrets, cache, &skip);
+        let c = core::clean_copies(&store, fs, &recorded_tree, secrets, &found.found, cache);
+        if let Some((_, why)) = c.failed.first() {
+            bail!(
+                "could not take a copy of an injected secret out of the sandbox ({why}); the run is recorded, and the next \
+                 `vl ws exec {n}` (or `vl ws exec {n} --record-only`) tries again",
+                n = safe(name)
+            );
+        }
+        for (q, why) in &found.unchecked {
+            warn(&format!(
+                "{} in the sandbox could not be checked for copies of injected secrets ({why})",
+                safe(&q.to_string_lossy())
+            ));
+        }
+        copies.extend(found.found.iter().map(|q| safe(&q.to_string_lossy()).into_owned()));
+        copies.sort();
+        copies.dedup();
+        if !copies.is_empty() {
+            eprintln!(
+                "  {} {} (they held an injected secret; taken out of the sandbox)",
+                yellow("cleaned"),
+                copies.join(", ")
+            );
+        }
+        m.guard_checked = Some(p.started);
+    }
+    drop(pin);
 
     m.tree = Some(recorded_tree);
     // After a superseded run the files are the saved change's: the next run
     // syncs them to the workspace.
-    m.snapshot = Some(if out.superseded { recorded } else { ctx.repo.workspace_wc(name)? });
-    quarantined.extend(
-        report
-            .quarantined
-            .iter()
-            .filter(|(_, f)| !f.iter().any(|f| f.rule == INJECTED_RULE))
-            .map(|(p, _)| p.as_str().to_string()),
-    );
+    m.snapshot = Some(match outcome {
+        Outcome::Saved => recorded,
+        _ => ctx.repo.workspace_wc(name)?,
+    });
+    if let Some(report) = &report {
+        quarantined.extend(
+            report
+                .quarantined
+                .iter()
+                .filter(|(_, f)| !f.iter().any(|f| f.rule == INJECTED_RULE))
+                .map(|(q, _)| q.as_str().to_string()),
+        );
+    }
+    quarantined.sort();
+    quarantined.dedup();
     m.quarantined = quarantined;
+    m.pending = None;
     m.running = None;
-    paths.save_manifest(&m)?;
-    if let Err(e) = paths.save_cache(&mut cache) {
+    paths.save_manifest(m)?;
+    if let Err(e) = paths.save_cache(cache) {
         warn(&format!("could not save the sandbox's stat cache: {e}"));
     }
-    run.finish();
 
-    let wc = ctx.repo.workspace_wc(name)?;
     // stderr: stdout belongs to the sandboxed command.
-    if out.superseded {
-        eprintln!("Saved {}", one_line(&ctx.repo, &recorded));
-    } else {
-        eprintln!("{} {}", if changed { "Recorded" } else { "No changes in" }, one_line(&ctx.repo, &wc));
+    match outcome {
+        Outcome::Saved => eprintln!("Saved {}", one_line(&ctx.repo, &recorded)),
+        Outcome::Recorded => eprintln!("Recorded {}", one_line(&ctx.repo, &ctx.repo.workspace_wc(name)?)),
+        Outcome::Unchanged => eprintln!("No changes in {}", one_line(&ctx.repo, &ctx.repo.workspace_wc(name)?)),
+        Outcome::Resumed => eprintln!("Finished cleaning up after the run recorded as {}", one_line(&ctx.repo, &recorded)),
     }
-    Ok(ExitCode::from(code.clamp(0, 255) as u8))
+    Ok(())
+}
+
+/// What recording a run did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    Recorded,
+    Unchanged,
+    /// Saved as a change of its own (the workspace moved).
+    Saved,
+    /// Recorded by an earlier attempt; only the cleanup was left.
+    Resumed,
 }
 
 fn print_sync(r: &CheckoutReport, fs: &SandboxFs) {
@@ -495,7 +732,25 @@ pub fn remove_workspace(ctx: &mut Ctx, name: &str, force: bool) -> Result<bool> 
     } else {
         None
     };
+    if let (true, false) = (exists, force) {
+        let kept = core::kept_dirs(&paths);
+        if let Some(d) = kept.first() {
+            bail!(
+                "the sandbox of workspace '{n}' holds files a rebuild kept because they may be work that is in no snapshot ({}). \
+                 Look at them, copy back what you need; `vl ws rm --force {n}` removes the workspace and them",
+                d.display(),
+                n = safe(name)
+            );
+        }
+    }
     if let (true, false, Loaded::Found(m)) = (exists, force, paths.load_manifest()) {
+        if m.pending.is_some() {
+            bail!(
+                "the sandbox of workspace '{n}' holds the output of a run that was not recorded. \
+                 `vl ws exec {n} --record-only` records it; `vl ws rm --force {n}` removes the workspace and it",
+                n = safe(name)
+            );
+        }
         if m.running.is_none() && !m.quarantined.is_empty() {
             let shown: Vec<String> = m.quarantined.iter().take(10).map(|p| safe(p).into_owned()).collect();
             bail!(
@@ -525,7 +780,9 @@ pub fn remove_workspace(ctx: &mut Ctx, name: &str, force: bool) -> Result<bool> 
 /// Run `command` in `dir` and return its exit status (128 + n for a
 /// signal). Git never looks above `ceiling` for a repository (the sandbox
 /// lives inside the project directory). Ctrl-C and Ctrl-\ go to the command
-/// only: `vl` waits for it and records what it left.
+/// only, and SIGTERM and SIGHUP sent to `vl` (an IDE stopping a task, a
+/// closed terminal) are forwarded to it: `vl` waits for it and records what
+/// it left (BUG-550).
 fn run_command(dir: &Path, ceiling: &Path, command: &[String]) -> Result<i32> {
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..]).current_dir(dir);
@@ -536,7 +793,15 @@ fn run_command(dir: &Path, ceiling: &Path, command: &[String]) -> Result<i32> {
     }
     cmd.env("GIT_CEILING_DIRECTORIES", ceilings);
     let interrupts = Interrupts::to_child(&mut cmd);
-    let status = cmd.status().with_context(|| format!("failed to run {}", command[0]));
+    let status = cmd
+        .spawn()
+        .with_context(|| format!("failed to run {}", command[0]))
+        .and_then(|mut child| {
+            interrupts.started(child.id());
+            let s = child.wait().context("waiting for the command");
+            interrupts.started(0);
+            s
+        });
     drop(interrupts);
     let status = status?;
     #[cfg(unix)]
@@ -549,31 +814,75 @@ fn run_command(dir: &Path, ceiling: &Path, command: &[String]) -> Result<i32> {
     Ok(status.code().unwrap_or(1))
 }
 
-/// While it lives, `vl` ignores SIGINT and SIGQUIT; the child gets the
-/// dispositions `vl` had.
+/// The command a SIGTERM or SIGHUP to `vl` is forwarded to (0: none).
+#[cfg(unix)]
+static FORWARD_TO: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+/// The last signal forwarded (or received before the command started).
+#[cfg(unix)]
+static FORWARDED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+#[cfg(unix)]
+extern "C" fn forward_signal(sig: libc::c_int) {
+    use std::sync::atomic::Ordering;
+    FORWARDED.store(sig, Ordering::SeqCst);
+    let pid = FORWARD_TO.load(Ordering::SeqCst);
+    if pid > 0 {
+        // SAFETY: kill(2) is async-signal-safe.
+        unsafe {
+            libc::kill(pid, sig);
+        }
+    }
+}
+
+/// While it lives, `vl` ignores SIGINT and SIGQUIT (the terminal sends them
+/// to the command too) and forwards SIGTERM and SIGHUP to the command; the
+/// child gets the dispositions `vl` had.
 struct Interrupts {
     #[cfg(unix)]
-    old: [(libc::c_int, libc::sighandler_t); 2],
+    old: Vec<(libc::c_int, libc::sigaction)>,
 }
+
+#[cfg(unix)]
+const IGNORED: [libc::c_int; 2] = [libc::SIGINT, libc::SIGQUIT];
+#[cfg(unix)]
+const FORWARDED_SIGNALS: [libc::c_int; 2] = [libc::SIGTERM, libc::SIGHUP];
 
 impl Interrupts {
     fn to_child(cmd: &mut Command) -> Interrupts {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            let mut old = [(libc::SIGINT, libc::SIG_DFL), (libc::SIGQUIT, libc::SIG_DFL)];
-            for (sig, prev) in old.iter_mut() {
-                // SAFETY: installs SIG_IGN, restored on drop; no handler code runs.
-                let p = unsafe { libc::signal(*sig, libc::SIG_IGN) };
-                *prev = if p == libc::SIG_ERR { libc::SIG_DFL } else { p };
+            FORWARDED.store(0, std::sync::atomic::Ordering::SeqCst);
+            let mut old = Vec::new();
+            let mut restore = Vec::new();
+            for sig in IGNORED.into_iter().chain(FORWARDED_SIGNALS) {
+                // SAFETY: plain sigaction(2) calls on a zeroed struct; the
+                // handler only touches atomics and calls kill(2).
+                unsafe {
+                    let mut new: libc::sigaction = std::mem::zeroed();
+                    new.sa_sigaction = if IGNORED.contains(&sig) {
+                        libc::SIG_IGN
+                    } else {
+                        forward_signal as extern "C" fn(libc::c_int) as libc::sighandler_t
+                    };
+                    new.sa_flags = libc::SA_RESTART;
+                    libc::sigemptyset(&mut new.sa_mask);
+                    let mut prev: libc::sigaction = std::mem::zeroed();
+                    if libc::sigaction(sig, &new, &mut prev) == 0 {
+                        // A handler does not survive exec anyway: the child
+                        // gets SIG_IGN if `vl` had it (`nohup`), else the default.
+                        let child = if prev.sa_sigaction == libc::SIG_IGN { libc::SIG_IGN } else { libc::SIG_DFL };
+                        restore.push((sig, child));
+                        old.push((sig, prev));
+                    }
+                }
             }
-            let restore = old;
             // SAFETY: the closure only calls signal(2), which is
             // async-signal-safe, between fork and exec.
             unsafe {
                 cmd.pre_exec(move || {
-                    for (sig, prev) in restore {
-                        libc::signal(sig, prev);
+                    for (sig, disp) in &restore {
+                        libc::signal(*sig, *disp);
                     }
                     Ok(())
                 });
@@ -586,15 +895,37 @@ impl Interrupts {
             Interrupts {}
         }
     }
+
+    /// The command runs as `pid` (0: it has exited): forward to it, and
+    /// pass on a signal that came before it started.
+    fn started(&self, pid: u32) {
+        #[cfg(unix)]
+        {
+            use std::sync::atomic::Ordering;
+            FORWARD_TO.store(pid as i32, Ordering::SeqCst);
+            let sig = FORWARDED.load(Ordering::SeqCst);
+            if pid > 0 && sig != 0 {
+                // SAFETY: signals our own child.
+                unsafe {
+                    libc::kill(pid as i32, sig);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = pid;
+    }
 }
 
 impl Drop for Interrupts {
     fn drop(&mut self) {
         #[cfg(unix)]
-        for (sig, prev) in self.old {
-            // SAFETY: restores the disposition saved above.
-            unsafe {
-                libc::signal(sig, prev);
+        {
+            FORWARD_TO.store(0, std::sync::atomic::Ordering::SeqCst);
+            for (sig, prev) in &self.old {
+                // SAFETY: restores the disposition saved above.
+                unsafe {
+                    libc::sigaction(*sig, prev, std::ptr::null_mut());
+                }
             }
         }
     }
@@ -630,20 +961,30 @@ fn exec_ephemeral(ctx: &mut Ctx, a: &Exec<'_>) -> Result<ExitCode> {
         sb.make_private()?;
         eprintln!("{} {} in {}", dim("running"), a.command.join(" "), dir.display());
         let code = run_command(&dir, &dir, a.command)?;
-        let view = set.as_ref().map(|s| SparseView::new(&sandbox, ctx.repo.store().clone(), tree, s));
+        // A deleted or unreadable `.veilpolicy` keeps the recorded one.
+        let pin = core::PolicyPin::new(&sandbox, ctx.repo.store(), &tree)?;
+        let view = set.as_ref().map(|s| SparseView::new(&pin, ctx.repo.store().clone(), tree, s));
         let recorded_fs: &dyn StorageBackend = match &view {
             Some(v) => v,
-            None => &sandbox,
+            None => &pin,
         };
         let (id, report) = ctx
             .repo
             .commit_fs_as_child_injected(base_snapshot, recorded_fs, a.message, injected.as_ref())?;
+        if let Some(why) = &pin.why {
+            warn(&format!(
+                "{POLICY_FILE} {why} in the sandbox: the recorded policy is kept (in a sandbox, only a regular, readable \
+                 {POLICY_FILE} is an edit of it)"
+            ));
+        }
         if let Some(set) = &set {
             let injected_paths: Vec<VPath> = match a.with_isolated {
                 true => vault_files(&ctx.repo)?.iter().filter_map(|(p, _)| VPath::new(p).ok()).collect(),
                 false => Vec::new(),
             };
-            let strays: Vec<VPath> = core::strays(&sandbox, set, &Policy::load(&sandbox)?)?
+            let before = Policy::load_or_accepted(&TreeView::new(ctx.repo.store().clone(), tree), None)?.0;
+            let after = Policy::load_or_accepted(&pin, None)?.0;
+            let strays: Vec<VPath> = core::strays(&sandbox, set, &[&before, &after])?
                 .into_iter()
                 .filter(|p| !injected_paths.contains(p))
                 .collect();
@@ -787,17 +1128,56 @@ fn is_persistent_sandbox(dir: &Path) -> bool {
     }
 }
 
+/// Tell the reaper of a persistent run which files it injected (one line
+/// on its pipe, before the files are written): if `vl` dies, it takes out
+/// those that still hold what was injected, putting back what they replaced.
+fn tell_reaper(r: &mut Child, inj: &core::Injection, files: &[(String, Vec<u8>)]) {
+    let entries: Vec<serde_json::Value> = inj
+        .paths
+        .iter()
+        .filter_map(|p| {
+            let (_, data) = files.iter().find(|(f, _)| VPath::new(f).is_ok_and(|q| q == *p))?;
+            let stash = inj.stashed(p).map(|(d, x)| serde_json::json!([hex::encode(d), x]));
+            Some(serde_json::json!([p.as_str(), veil_core::object::Object::blob_id(data).hex(), stash]))
+        })
+        .collect();
+    if let Some(stdin) = r.stdin.as_mut() {
+        let mut line = vec![INJECTED];
+        line.extend(serde_json::to_vec(&entries).unwrap_or_default());
+        line.push(b'\n');
+        let _ = stdin.write_all(&line);
+    }
+}
+
+/// The injected files a reaper was told about ([`tell_reaper`]).
+fn reaper_entries(line: &[u8]) -> Vec<core::ReaperEntry> {
+    let Ok(v) = serde_json::from_slice::<Vec<serde_json::Value>>(line) else { return Vec::new() };
+    v.iter()
+        .filter_map(|e| {
+            let p = VPath::new(e.get(0)?.as_str()?).ok()?;
+            let id = ObjectId::from_hex(e.get(1)?.as_str()?).ok()?;
+            let stash = match e.get(2) {
+                Some(serde_json::Value::Array(s)) => Some((hex::decode(s.first()?.as_str()?).ok()?, s.get(1)?.as_bool()?)),
+                _ => None,
+            };
+            Some((p, id, stash))
+        })
+        .collect()
+}
+
 /// Body of the reaper process: wait for the parent to go away, then clean
 /// up unless it said it finished cleanly.
 pub fn reaper_main(args: Vec<std::ffi::OsString>) -> ExitCode {
-    let mut buf = [0u8; 64];
+    let mut all = Vec::new();
+    let _ = std::io::stdin().lock().read_to_end(&mut all);
     let mut keep = false;
-    let mut stdin = std::io::stdin().lock();
-    while let Ok(n) = stdin.read(&mut buf) {
-        if n == 0 {
-            break;
+    let mut injected = Vec::new();
+    for line in all.split(|b| *b == b'\n') {
+        match line.first() {
+            Some(&INJECTED) => injected = reaper_entries(&line[1..]),
+            Some(_) => keep |= line.contains(&KEEP),
+            None => {}
         }
-        keep |= buf[..n].contains(&KEEP);
     }
     if keep {
         return ExitCode::SUCCESS;
@@ -805,8 +1185,8 @@ pub fn reaper_main(args: Vec<std::ffi::OsString>) -> ExitCode {
     match args.as_slice() {
         [mode, dir, run] if mode == PERSISTENT_ARG => {
             let dir = Path::new(dir);
-            if is_persistent_sandbox(dir) {
-                reap_persistent(dir, &run.to_string_lossy());
+            if is_persistent_sandbox(dir) && !injected.is_empty() {
+                reap_persistent(dir, &run.to_string_lossy(), &injected);
             }
         }
         [dir] => {
@@ -820,14 +1200,18 @@ pub fn reaper_main(args: Vec<std::ffi::OsString>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// The run `run` of the sandbox in `dir` died: wipe the sandbox, unless a
-/// later run has already taken it over (it rebuilds it itself).
-fn reap_persistent(dir: &Path, run: &str) {
+/// The run `run` of the sandbox in `dir`, which injected `injected`, died
+/// (or failed): take the injected files that are unchanged out again,
+/// unless a later run has already taken the sandbox over (it cleans up
+/// itself). Nothing else is touched: the rest is the command's output, which
+/// the next run records (under the guard).
+fn reap_persistent(dir: &Path, run: &str, injected: &[core::ReaperEntry]) {
     let paths = SandboxPaths::at(dir.to_path_buf());
     let Ok(_lock) = SandboxLock::acquire(&paths.lock, || {}) else { return };
     if let Loaded::Found(m) = paths.load_manifest() {
-        if m.running.as_deref() == Some(run) {
-            let _ = core::wipe(&paths);
+        let ours = m.running.as_deref() == Some(run) || m.pending.as_ref().is_some_and(|p| p.run == run);
+        if ours && std::fs::symlink_metadata(&paths.files).is_ok_and(|md| md.is_dir()) {
+            core::take_out_unchanged(&SandboxFs::new(&paths.files, None, false), injected);
         }
     }
 }
@@ -901,10 +1285,32 @@ pub fn persistent_status(root: &Path, repo: Option<&Repo>) -> Vec<(bool, String)
             }
         }
         let busy = matches!(SandboxLock::try_acquire(&paths.lock), Ok(None));
+        for d in core::kept_dirs(&paths) {
+            out.push((
+                true,
+                format!(
+                    "{}: files a rebuild of the sandbox of workspace '{}' kept, because they may be work that is in no snapshot; \
+                     copy back what you need, then delete it",
+                    d.display(),
+                    safe(&ws)
+                ),
+            ));
+        }
         match paths.load_manifest() {
+            Loaded::Found(m) if m.pending.is_some() && !busy => out.push((
+                true,
+                format!(
+                    "{shown}: holds the output of a run that was not recorded; `vl ws exec {} --record-only` records it",
+                    safe(&ws)
+                ),
+            )),
             Loaded::Found(m) if m.running.is_some() && !busy => out.push((
                 true,
-                format!("{shown}: a run was interrupted; the next `vl ws exec {}` rebuilds it", safe(&ws)),
+                format!(
+                    "{shown}: a run was interrupted before its command started; the next `vl ws exec {}` rebuilds it \
+                     (keeping unrecorded work)",
+                    safe(&ws)
+                ),
             )),
             Loaded::Found(m) if !m.quarantined.is_empty() => out.push((
                 false,

@@ -58,7 +58,6 @@ fn work_kept(env: &Env, proj: &Path, path: &str, content: &str) -> bool {
 /// the secret in the sandbox, readable by every later run that was not
 /// given it.
 #[test]
-#[ignore = "BUG-546: injected secrets copied into ignored or isolated paths survive the run"]
 fn injected_secret_copies_in_ignored_or_isolated_paths_are_taken_out() {
     let env = Env::new();
     let proj = project(&env);
@@ -95,7 +94,6 @@ fn injected_secret_copies_in_ignored_or_isolated_paths_are_taken_out() {
 /// an arbitrary value; only the injected guard knows it. `vl` has the vault
 /// in every run and could always guard against its contents.
 #[test]
-#[ignore = "BUG-547: a later ws exec records an isolated secret the injected run left behind"]
 fn a_secret_that_lands_after_an_injected_run_is_never_recorded() {
     let env = Env::new();
     let proj = project(&env);
@@ -134,7 +132,6 @@ fn a_secret_that_lands_after_an_injected_run_is_never_recorded() {
 /// goes for hand edits a narrower `--only` set keeps "until a run whose set
 /// holds them records them".
 #[test]
-#[ignore = "BUG-548: a sandbox rebuild silently deletes quarantined work and kept hand edits"]
 fn a_rebuild_keeps_quarantined_work() {
     let env = Env::new();
     let proj = project(&env);
@@ -172,7 +169,6 @@ fn a_rebuild_keeps_quarantined_work() {
 /// command never touched: build caches, local configs, an isolated
 /// credentials file. They are in no snapshot.
 #[test]
-#[ignore = "BUG-549: a policy edit in a sparse run makes vl delete outside files the command never wrote"]
 fn a_policy_edit_in_a_sparse_run_never_deletes_files_the_command_did_not_write() {
     let env = Env::new();
     let proj = project(&env);
@@ -205,7 +201,6 @@ fn ignored_output_outside_a_sparse_set_stays() {
 /// itself (not signalled) keeps running in a deleted directory. Nothing was
 /// injected here, so there is no secret to protect by wiping.
 #[test]
-#[ignore = "BUG-550: SIGTERM to vl ws exec wipes the command's unrecorded work while it still runs"]
 fn sigterm_to_vl_keeps_the_commands_work() {
     let env = Env::new();
     let proj = project(&env);
@@ -239,7 +234,6 @@ fn sigterm_to_vl_keeps_the_commands_work() {
 /// command's whole output is destroyed because of lock contention. Nothing
 /// was injected; the files could simply stay for the next run to record.
 #[test]
-#[ignore = "BUG-551: lock contention when recording a ws exec run wipes the command's output"]
 fn a_busy_repository_lock_at_record_time_keeps_the_run() {
     let env = Env::new();
     let proj = project(&env);
@@ -276,7 +270,6 @@ fn a_busy_repository_lock_at_record_time_keeps_the_run() {
 /// `src/` as deleted, including `src/other.rs` and `src/deep/d.rs`, which
 /// were never in the set or the sandbox.
 #[test]
-#[ignore = "BUG-552: removing a spine directory in a sparse run deletes files outside the set"]
 fn removing_the_last_file_of_a_spine_directory_keeps_the_rest_of_it() {
     let env = Env::new();
     let proj = env.project(
@@ -319,7 +312,6 @@ fn deleting_a_file_of_the_set_keeps_its_siblings() {
 /// the next public push. Sparse runs do the same to cloaked files outside
 /// their set.
 #[test]
-#[ignore = "BUG-553: deleting .veilpolicy in a ws exec sandbox records every cloaked file as public plaintext"]
 fn deleting_the_policy_in_a_sandbox_never_declassifies_cloaked_files() {
     let env = Env::new();
     let proj = env.project(U, "proj", &[("src/lib.rs", "lib\n"), ("secret/plan.md", "TOP-SECRET-PLAN-5521\n")]);
@@ -348,7 +340,6 @@ fn deleting_the_policy_in_a_sandbox_never_declassifies_cloaked_files() {
 /// a policy) into an error; the run fails and, because any error wipes the
 /// sandbox (BUG-551), the command's work is destroyed.
 #[test]
-#[ignore = "BUG-554: an unreadable .veilpolicy left by the command fails the ws exec recording and wipes the work"]
 fn an_unreadable_policy_in_the_sandbox_neither_fails_the_run_nor_loses_its_work() {
     let env = Env::new();
     let proj = project(&env);

@@ -645,7 +645,13 @@ CAS, and it applies these rules in order:
      `vl ws exec`, overlays, ephemeral workspaces and imported trees hold
      no local-only files of the member (injected secrets are caught by
      `InjectedSecrets`) and use their own `.veilpolicy`; an agent editing
-     `.veilpolicy` in a sandbox cannot accept it for the member. The
+     `.veilpolicy` in a sandbox cannot accept it for the member. In a
+     `ws exec` sandbox only a regular, readable `.veilpolicy` is an edit:
+     a deleted, unreadable, symlinked or directory one is replaced, for the
+     snapshot, by the `.veilpolicy` of the tree the sandbox was synced from
+     (`sandbox::PolicyPin`), which is applied and recorded unchanged, with
+     a warning (BUG-553/554). A sandbox has no accepted pin of its own that
+     could keep guarding its next run, so the recorded policy is the pin. The
      stale-checkout recovery path (`build_from`, `commit_fs_as_child` on the
      working copy) is guarded but never treats a policy difference as the
      member's edit.
@@ -1490,11 +1496,14 @@ A workspace is only a named pointer in the view. It owns no directory.
   CLI's `sandbox.rs`). Each virtual workspace has one persistent sandbox,
   `.veil/local/sandboxes/<ws>/` (`0700`; `.` and `..` are spelt `%2e`,
   `%2e%2e`): `files/` (the command's working directory), `manifest.json`,
-  `statcache` and `lock`. The **manifest** says which tree the files are
+  `statcache`, `lock`, and `guard.sealed` once secrets were injected. The
+  **manifest** says which tree the files are
   (`tree`: synced to, then recorded as), the materialisation record
   (`Materialised`, as for the project directory), the boot they were
-  written in, a `running` marker, the quarantined files the last run left,
-  and `only`, the paths of a sparse sandbox (`None`: the whole tree). The
+  written in, a `running` marker (a run is syncing), a `pending` record
+  (the files hold a command's output that is not recorded yet), the
+  quarantined files the last run left, `guard_checked`, and `only`, the
+  paths of a sparse sandbox (`None`: the whole tree). The
   per-file half of the manifest is the sandbox's own stat cache: blob id
   and stamp (size, mtime, ctime, inode, executable bit) of every file.
   A run:
@@ -1502,12 +1511,24 @@ A workspace is only a named pointer in the view. It owns no directory.
      reloads the view;
   2. decides whether the sandbox can be trusted (`rebuild_reason`): no
      manifest, an unreadable or other-version one, another workspace's, a
-     `running` marker left by a run that died, another boot (sandbox files
-     are never fsynced, so after a power loss they may be torn), an
-     invalid `only` path, a tree gc removed, `files/` missing or replaced
-     (a symlink). Any of
-     these: wipe and rebuild. When in doubt, rebuild;
-  3. writes `running` and the boot durably, and starts the reaper;
+     `running` marker left by a run that died in its sync, another boot
+     (sandbox files are never fsynced, so after a power loss they may be
+     torn), an invalid `only` path, a tree gc removed, `files/` missing or
+     replaced (a symlink). Any of these: rebuild. **A rebuild never
+     deletes unrecorded work** (`set_aside`, BUG-548): quarantined files
+     and files outside a sparse set that the tree does not have as they
+     are are copied back into the rebuilt sandbox (`reimport`); when other
+     files differ from both the previous tree and the new one (hand edits,
+     or torn files: Veil cannot tell them apart), when the manifest cannot
+     be read, or when it records a `pending` run that cannot be recorded
+     (another boot), the previous files are moved whole to
+     `unrecorded-<ms>-<rand>/` with a warning (`vl doctor` lists these, `vl
+     ws rm` refuses without `--force`). What goes is the tree's own
+     content, ignored and isolated output, and injected files. A trusted
+     sandbox whose manifest records a `pending` run is not rebuilt: that
+     run's output is recorded first (steps 7 to 9, from the manifest and
+     the guard file), then this run goes on. `--record-only` stops there;
+  3. writes `running` and the boot durably;
   4. **syncs**: `checkout_recorded` from the manifest's tree to the
      workspace's, with the sandbox's stat cache, so only the diff is
      touched and every checkout rule holds (files that hold something else
@@ -1523,30 +1544,61 @@ A workspace is only a named pointer in the view. It owns no directory.
      window costs less than re-reading them it waits, re-stats them, and
      records those whose stamp did not move. Cloaked and embargoed files
      are left to the builder, which verifies their sealing (BUG-103);
-  6. injects `--with-isolated` files (never through a symlink or over a
-     directory, remembering what each replaced), runs the command with
+  6. with `--with-isolated`, plans the injection (never through a symlink
+     or over a directory; what each path holds now is the stash), adds the
+     files to the sandbox's **guard** and saves it with the planned
+     injection, durably (`guard.sealed`, sealed under `local`), starts the
+     reaper and tells it on its pipe what it injected (path, blob id,
+     stash), then writes the files. It then writes `pending` (the run, the
+     snapshot synced to, `-m`, the start time, the files outside the set)
+     and clears `running`, durably: **from here on the files are the
+     command's output and are never wiped**. It runs the command with
      `GIT_CEILING_DIRECTORIES` set to the sandbox (and `find_root` never
      resolves a repository from inside `.veil/`), with SIGINT/SIGQUIT
-     ignored by `vl` so Ctrl-C reaches the command only;
-  7. records with `expected_wc` = the snapshot it synced to. If the
+     ignored by `vl` and SIGTERM/SIGHUP forwarded to the command (BUG-550),
+     so they stop the command, not the recording;
+  7. records with `expected_wc` = the snapshot it synced to, through
+     `PolicyPin` (the recorded `.veilpolicy` when the sandbox's is not a
+     regular, readable file) and with the guard of every isolated file
+     ever injected into the sandbox (not only this run's: BUG-547). If the
      workspace moved meanwhile, the result is saved as a child of that
-     snapshot instead of reverting the move;
-  8. takes injected files out again (`remove_injected`): each injected
-     path, and each file quarantined by the injected-secret guard, gets
-     what the snapshot recorded there if that is new, else what was there
-     before the injection, else the recorded version, else nothing. A
-     failure here wipes the sandbox;
-  9. writes the manifest without `running`, saves the stat cache, tells the
-     reaper it finished (`K` on the pipe) and releases the lock.
-  Any error between 3 and 9 wipes the sandbox in-process. If `vl` dies,
-  the reaper (the `vl` binary re-executed, in its own process group,
-  waiting on a pipe only `vl` holds) takes the lock and wipes the sandbox
-  if the manifest still names the dead run; if the reaper dies too, the
-  next run finds the marker and rebuilds. `vl ws rm` takes the lock
-  (refusing while a run holds it), refuses without `--force` if the
-  manifest lists quarantined files, then removes the whole directory.
-  `vl doctor` lists sandboxes, flags interrupted runs and sandboxes of
-  removed workspaces.
+     snapshot instead of reverting the move. The snapshot it was recorded
+     as goes into `pending` at once (durably), so a cleanup that fails
+     later is resumed without recording twice. A recording that fails
+     (the repository lock busy past its 15 s wait, BUG-551) leaves
+     `pending` as it is: the error says the output stays;
+  8. cleans up: injected files out again (`remove_injected`: each
+     injected path, and each file quarantined by the injected-secret
+     guard, gets what the snapshot recorded there if that is new, else
+     what was there before the injection, else the recorded version, else
+     nothing); for a sparse run, the strays (below); then, in a sandbox
+     with a guard, `scrub`: every file changed since the last check
+     (ctime ≥ `guard_checked`, or this run's start), wherever it is
+     (ignored, isolated, outside the set, nested repositories, names that
+     are not UTF-8) and not vouched for by the stat cache, is read, and
+     each one holding an injected value is put back to its recorded
+     version or removed (BUG-546). The guard's saved injection is then
+     dropped;
+  9. writes the manifest without `pending` (and the new `guard_checked`),
+     saves the stat cache, tells the reaper it finished (`K` on the pipe)
+     and releases the lock.
+  **No failure path deletes unrecorded output.** An error (or a panic)
+  before step 6 leaves `running`: the next run rebuilds, keeping
+  unrecorded work as above. After it, `pending` stays until steps 7 to 9
+  are done, by this run or the next one (or `--record-only`). If `vl`
+  dies, the reaper (the `vl` binary re-executed, in its own process
+  group, waiting on a pipe only `vl` holds) takes the lock and, if the
+  manifest still names the dead run, takes out each injected file that
+  still holds exactly what was injected (putting back the stash); it
+  touches nothing else. **Background processes** the command leaves
+  running are not killed (a dev server is often the point): the guard
+  that every later recording applies, and the scrub, are what keep
+  anything they write out of history and out of later commands' reach.
+  `vl ws rm` takes the lock (refusing while a run holds it), refuses
+  without `--force` if the manifest lists quarantined files or a
+  `pending` run, or a rebuild kept files aside, then removes the whole
+  directory. `vl doctor` lists sandboxes, flags interrupted runs,
+  unrecorded runs, kept directories and sandboxes of removed workspaces.
 
   **Sparse sandboxes** (`--only PATH…`, `vfs::SparseSet`,
   `vfs::SparseView`). The paths are resolved by the CLI's path rules
@@ -1566,14 +1618,17 @@ A workspace is only a named pointer in the view. It owns no directory.
   set by id without listing them (it gives `.veilpolicy` its blob id, so
   an unchanged public policy keeps these hints on); directories leading
   into the set are merged (the sandbox's entries that lead in, the tree's
-  that do not). Everything the builder decides (policy, cloaked lines,
+  that do not; a spine directory of the tree stays whatever the sandbox
+  has in its place, so removing it in the sandbox deletes only the set's
+  files under it, BUG-552). Everything the builder decides (policy, cloaked lines,
   embargoes, conflicts, quarantine) is decided as for a full working copy
   whose files outside the set did not change: a policy edit, or a scanner
   upgrade, turns the hints off and the builder reads the outside files
   from the tree to reclassify them (slow, exact). A superseded run (step
   7) saves the same view as a child of the snapshot it started from.
-  After step 8, `strays` lists the files the command wrote outside the
-  set that a full snapshot would record (not ignored, not isolated, not a
+  In step 8, `strays` lists the files the command wrote outside the
+  set that a full snapshot would record (ignored or isolated by neither
+  the policy the command started with nor the one it left, BUG-549; not a
   nested repository, special file or crash debris, not quarantined by an
   earlier run); they are reported, never recorded, and removed from the
   sandbox (with the directories that leaves empty), so a later, wider set

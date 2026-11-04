@@ -437,7 +437,7 @@ proptest! {
             }
             m.tree = Some(recorded);
             if let Some(set) = &set {
-                let strays = sandbox::strays(&fs, set, &veil_core::policy::Policy::load(&fs).unwrap()).unwrap();
+                let strays = sandbox::strays(&fs, set, &[&veil_core::policy::Policy::load(&fs).unwrap()]).unwrap();
                 let want: Vec<VPath> = model.keys().filter(|k| !set.contains(&p(k))).map(|k| p(k)).collect();
                 prop_assert_eq!(&strays, &want);
                 prop_assert!(sandbox::remove_strays(&fs, set, &strays, &mut cache).is_empty());

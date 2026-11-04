@@ -912,6 +912,12 @@ pub enum WsCmd {
     /// (and .veilpolicy): everything else is recorded exactly as the
     /// workspace has it, and files the command writes elsewhere are not
     /// recorded (a warning lists them) and are removed from the sandbox.
+    ///
+    /// The command's output is never deleted when something fails: if vl
+    /// is killed or the result cannot be recorded (the repository is busy),
+    /// it stays in the sandbox, and the next run (or --record-only)
+    /// records it first. SIGTERM and SIGHUP are forwarded to the command,
+    /// as Ctrl-C is, and vl records what it left.
     Exec {
         /// Workspace to run in (or use --ephemeral).
         name: Option<String>,
@@ -930,8 +936,11 @@ pub enum WsCmd {
         /// Sparse sandbox: hold only these paths (files or directories of the workspace, relative to the current directory).
         #[arg(long, value_name = "PATH", num_args = 1..)]
         only: Vec<String>,
+        /// Run nothing: record what an earlier run left unrecorded (vl was killed, or recording failed).
+        #[arg(long, conflicts_with_all = ["ephemeral", "with_isolated", "only", "command"])]
+        record_only: bool,
         /// Command and arguments.
-        #[arg(last = true, required = true)]
+        #[arg(last = true, required_unless_present = "record_only")]
         command: Vec<String>,
     },
     /// Print a file from a workspace.

@@ -191,7 +191,26 @@ impl<'a> SparseView<'a> {
         if let Some(e) = crate::tree::lookup(&self.store, &self.tree.root(), dir)?.filter(|e| e.kind == EntryKind::Dir) {
             found = true;
             for c in &self.store.tree(&e.id)?.entries {
-                if !self.set.is_outside(&dir.join(&c.name)) || !self.store.entry_readable(c) {
+                let p = dir.join(&c.name);
+                // A spine directory of the tree that the sandbox no longer
+                // has (the command removed it, or put a file there): it
+                // still holds files outside the set, which are the tree's.
+                // Its own listing keeps those and drops the set's paths, so
+                // deletions only count inside the set, file by file
+                // (BUG-552).
+                if c.kind == EntryKind::Dir
+                    && self.set.is_spine(&p)
+                    && !out.entries.iter().any(|x| x.name == c.name && x.kind == NodeKind::Dir)
+                {
+                    out.entries.retain(|x| x.name != c.name);
+                    out.special.retain(|n| *n != c.name);
+                    out.entries.push(DirEntry {
+                        name: c.name.clone(),
+                        kind: NodeKind::Dir,
+                    });
+                    continue;
+                }
+                if !self.set.is_outside(&p) || !self.store.entry_readable(c) {
                     continue;
                 }
                 out.entries.push(DirEntry {
