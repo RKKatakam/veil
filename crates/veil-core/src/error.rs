@@ -33,6 +33,12 @@ pub enum VeilError {
     Repo(String),
     #[error("repository is locked: {0}")]
     Locked(String),
+    /// Data written in a format this build cannot read, or that the
+    /// destination repository's format does not allow (see
+    /// `docs/FORMAT.md`). Never a redaction: it must not be treated as
+    /// "exists, but not for you".
+    #[error("unsupported format: {0}")]
+    Unsupported(String),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }

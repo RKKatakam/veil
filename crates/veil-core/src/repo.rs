@@ -39,6 +39,43 @@ use crate::{
 };
 
 pub const VEIL_DIR: &str = ".veil";
+
+/// Repository format written by `vl init` and by [`crate::upgrade`].
+///
+/// | format | introduced | adds |
+/// |---|---|---|
+/// | 1 | vl 0.1.0 | JSON trees |
+/// | 2 | vl 1.0.0 | binary trees (`TreeEncoding::Binary`) |
+///
+/// Every format up to this one is read; see `docs/FORMAT.md`.
+pub const REPO_FORMAT: u32 = 2;
+
+/// Oldest repository format this build reads (and keeps writing, unchanged,
+/// until `vl upgrade`).
+pub const MIN_REPO_FORMAT: u32 = 1;
+
+/// The first vl release that reads repository format `format`.
+pub fn min_vl_for_format(format: u32) -> &'static str {
+    match format {
+        0 | 1 => "0.1.0",
+        2 => "1.0.0",
+        _ => "a newer release",
+    }
+}
+
+/// `Ok` if this build can read and write a repository of `format`.
+pub fn check_format_supported(format: u32) -> Result<()> {
+    if format > REPO_FORMAT {
+        return Err(VeilError::Unsupported(format!(
+            "this repository uses format {format}, which needs a newer vl (this is vl {}, which reads formats {MIN_REPO_FORMAT} to {REPO_FORMAT})",
+            env!("CARGO_PKG_VERSION")
+        )));
+    }
+    if format < MIN_REPO_FORMAT {
+        return Err(VeilError::Corrupt("repo.json".into(), format!("invalid repository format {format}")));
+    }
+    Ok(())
+}
 pub const DEFAULT_WORKSPACE: &str = "default";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -52,10 +89,45 @@ pub struct RemoteConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RepoConfig {
+    /// Repository format ([`REPO_FORMAT`]). A reader refuses a format newer
+    /// than it knows before reading anything else, so newer data is never
+    /// half-understood or rewritten by an older vl.
     pub format: u32,
     pub repo_id: String,
     #[serde(default)]
     pub remotes: BTreeMap<String, RemoteConfig>,
+    /// The first vl release that reads this format, for the error message
+    /// of releases that do not know the format yet ("needs vl ≥ X").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_vl: Option<String>,
+}
+
+impl RepoConfig {
+    /// Error if this build cannot use the repository, naming the vl release
+    /// it needs when the configuration says so.
+    pub fn check_supported(&self) -> Result<()> {
+        check_format_supported(self.format).map_err(|e| match (&e, &self.min_vl) {
+            (VeilError::Unsupported(_), Some(v)) => VeilError::Unsupported(format!(
+                "this repository uses format {} and needs vl {v} or later (this is vl {})",
+                self.format,
+                env!("CARGO_PKG_VERSION")
+            )),
+            _ => e,
+        })
+    }
+}
+
+/// Read and parse `.veil/repo.json` on `backend`.
+pub fn read_config(backend: &dyn StorageBackend) -> Result<RepoConfig> {
+    let raw = backend
+        .read(&config_path())
+        .map_err(|_| VeilError::NotFound("Veil repository (run `vl init`)".into()))?;
+    Ok(serde_json::from_slice(&raw)?)
+}
+
+/// Write `.veil/repo.json` (atomically and durably on disk).
+pub(crate) fn write_config(backend: &dyn StorageBackend, config: &RepoConfig) -> Result<()> {
+    backend.write(&config_path(), &serde_json::to_vec_pretty(config)?)
 }
 
 pub struct Repo {
@@ -87,18 +159,37 @@ impl Repo {
     /// Create a repository with a `default` workspace. If an identity is
     /// given, a `team` scope is created with that identity as its first member.
     pub fn init(backend: Arc<dyn StorageBackend>, identity: Option<Identity>, user: &str) -> Result<Repo> {
-        Self::init_with(backend, identity, user, false, true)
+        Self::init_with(backend, identity, user, false, true, REPO_FORMAT)
     }
 
     /// Like [`Repo::init`] but without creating the default `team` scope —
     /// used when cloning, where scopes arrive with the remote's key rings.
     pub fn init_for_clone(backend: Arc<dyn StorageBackend>, identity: Option<Identity>, user: &str) -> Result<Repo> {
-        Self::init_with(backend, identity, user, false, false)
+        Self::init_with(backend, identity, user, false, false, REPO_FORMAT)
+    }
+
+    /// [`Repo::init_for_clone`] at a given repository format. A clone takes
+    /// its source's format, so that what it writes can be pushed back and
+    /// read by everyone who reads the source.
+    pub fn init_for_clone_at(
+        backend: Arc<dyn StorageBackend>,
+        identity: Option<Identity>,
+        user: &str,
+        format: u32,
+    ) -> Result<Repo> {
+        check_format_supported(format)?;
+        Self::init_with(backend, identity, user, false, false, format)
     }
 
     /// Create a repository without workspaces (used for remotes).
     pub fn init_bare(backend: Arc<dyn StorageBackend>) -> Result<Repo> {
-        Self::init_with(backend, None, "remote", true, false)
+        Self::init_with(backend, None, "remote", true, false, REPO_FORMAT)
+    }
+
+    /// [`Repo::init_bare`] at a given repository format.
+    pub fn init_bare_at(backend: Arc<dyn StorageBackend>, format: u32) -> Result<Repo> {
+        check_format_supported(format)?;
+        Self::init_with(backend, None, "remote", true, false, format)
     }
 
     fn init_with(
@@ -107,18 +198,21 @@ impl Repo {
         user: &str,
         bare: bool,
         default_scope: bool,
+        format: u32,
     ) -> Result<Repo> {
         if is_repo(&*backend) {
             return Err(VeilError::AlreadyExists("a Veil repository".into()));
         }
         let config = RepoConfig {
-            format: 1,
+            format,
             repo_id: hex::encode(random_bytes::<16>()),
             remotes: BTreeMap::new(),
+            min_vl: (format > 1).then(|| min_vl_for_format(format).to_string()),
         };
         let has_identity = identity.is_some();
         let keys = Arc::new(Keychain::new(backend.clone(), identity, config.repo_id.clone()));
         let store = Arc::new(ObjectStore::new(backend.clone(), VPath::new(".veil/objects")?, keys.clone()));
+        store.set_format(format);
         let empty = store.empty_tree()?;
         let root_id = store.put_snapshot(&Snapshot::root(empty))?;
         // A crashed earlier `init` may have left the ring behind.
@@ -156,7 +250,7 @@ impl Repo {
         ops.set_head(&op_id)?;
         // `repo.json` is what makes this a repository, so it is written last:
         // a crash before this point leaves no half-initialised repository.
-        backend.write(&config_path(), &serde_json::to_vec_pretty(&config)?)?;
+        write_config(&*backend, &config)?;
         Ok(Repo {
             backend,
             store,
@@ -170,12 +264,13 @@ impl Repo {
     }
 
     pub fn open(backend: Arc<dyn StorageBackend>, identity: Option<Identity>, user: &str) -> Result<Repo> {
-        let raw = backend
-            .read(&config_path())
-            .map_err(|_| VeilError::NotFound("Veil repository (run `vl init`)".into()))?;
-        let config: RepoConfig = serde_json::from_slice(&raw)?;
+        let config = read_config(&*backend)?;
+        // Before reading anything else: a newer format is never
+        // half-understood, and never rewritten by this build.
+        config.check_supported()?;
         let keys = Arc::new(Keychain::new(backend.clone(), identity, config.repo_id.clone()));
         let store = Arc::new(ObjectStore::new(backend.clone(), VPath::new(".veil/objects")?, keys));
+        store.set_format(config.format);
         let root_id = store.put_snapshot(&Snapshot::root(store.empty_tree()?))?;
         let ops = OpStore::new(backend.clone());
         let op_id = ops.head()?;
@@ -245,9 +340,16 @@ impl Repo {
     }
 
     pub fn save_config(&mut self, config: RepoConfig) -> Result<()> {
-        self.backend.write(&config_path(), &serde_json::to_vec_pretty(&config)?)?;
+        config.check_supported()?;
+        write_config(&*self.backend, &config)?;
+        self.store.set_format(config.format);
         self.config = config;
         Ok(())
+    }
+
+    /// Repository format (see [`REPO_FORMAT`]).
+    pub fn format(&self) -> u32 {
+        self.config.format
     }
 
     pub fn snapshot(&self, id: &ObjectId) -> Result<Arc<Snapshot>> {

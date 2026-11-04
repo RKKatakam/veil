@@ -10,6 +10,12 @@
 //! Decoded trees and snapshots, and decompressed delta bases, are kept in
 //! weight-bounded LRU caches (see [`CacheLimits`]).
 //!
+//! **Formats.** Reads accept every object encoding this build knows. Writes
+//! use the encoding of the repository's format ([`ObjectStore::set_format`]):
+//! a format-1 repository writes JSON trees and refuses binary ones, also
+//! from [`ObjectStore::put_raw`], so it stays readable by every vl that can
+//! read format 1. See `docs/FORMAT.md`.
+//!
 //! **Cooperation with `gc`.** Objects that the last `vl gc` found
 //! unreachable are listed in `<root>/gc/pending`. If this process touches
 //! such an object (`has`, `get_raw`, `put`, `put_raw`), it *freshens* it:
@@ -21,7 +27,7 @@ use std::{
     collections::HashSet,
     fmt,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
         Arc, RwLock,
     },
     time::{Duration, Instant},
@@ -33,7 +39,7 @@ use crate::{
     error::{Result, VeilError},
     id::ObjectId,
     keychain::Keychain,
-    object::{EntryKind, Object, Snapshot, Text, Tree, TreeEntry, Visibility},
+    object::{EntryKind, Object, Snapshot, Text, Tree, TreeEncoding, TreeEntry, Visibility},
     pack::{name_from_index_file, Pack},
     vfs::{NodeKind, StorageBackend},
     vpath::VPath,
@@ -102,6 +108,8 @@ pub struct ObjectStore {
     gc: GcHints,
     /// Open [`ObjectStore::begin_unsynced`] scopes (see there).
     unsynced: AtomicUsize,
+    /// Repository format: decides the tree encoding written and accepted.
+    format: AtomicU32,
 }
 
 impl fmt::Debug for ObjectStore {
@@ -141,7 +149,47 @@ impl ObjectStore {
                 freshened: RwLock::new(HashSet::new()),
             },
             unsynced: AtomicUsize::new(0),
+            format: AtomicU32::new(crate::repo::REPO_FORMAT),
         }
+    }
+
+    /// Set the repository format this store writes (default: the newest,
+    /// [`crate::repo::REPO_FORMAT`]). `Repo::open` sets it from `repo.json`.
+    pub fn set_format(&self, repo_format: u32) {
+        self.format.store(repo_format, Ordering::SeqCst);
+    }
+
+    /// The repository format this store writes.
+    pub fn format(&self) -> u32 {
+        self.format.load(Ordering::Relaxed)
+    }
+
+    /// The tree encoding this store writes.
+    pub fn tree_encoding(&self) -> TreeEncoding {
+        TreeEncoding::for_repo_format(self.format())
+    }
+
+    /// The canonical encoding `obj` has in this repository (its id is the
+    /// BLAKE3 of these bytes).
+    pub fn encode(&self, obj: &Object) -> Vec<u8> {
+        obj.encode_with(self.tree_encoding())
+    }
+
+    /// Refuse objects this repository's format may not hold (a format-1
+    /// repository must stay readable by every vl that reads format 1).
+    fn check_storable(&self, raw: &[u8]) -> Result<()> {
+        if let Some(enc) = Object::tree_encoding(raw) {
+            let need = enc.min_repo_format();
+            let have = self.format();
+            if need > have {
+                return Err(VeilError::Unsupported(format!(
+                    "this repository is at format {have} and cannot store format-{need} (binary) trees; \
+                     upgrade it with `vl upgrade` (a remote: `vl upgrade --remote <name>`) once everyone who uses it runs vl {} or later",
+                    crate::repo::min_vl_for_format(need)
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// From now until the matching [`ObjectStore::end_unsynced`], new loose
@@ -405,11 +453,13 @@ impl ObjectStore {
         if ObjectId::hash(raw) != *id {
             return Err(VeilError::Corrupt(id.hex(), "hash mismatch".into()));
         }
+        self.check_storable(raw)?;
         self.write_if_absent(id, raw)
     }
 
+    /// Store `obj` in this repository's encoding (see [`ObjectStore::encode`]).
     pub fn put(&self, obj: &Object) -> Result<ObjectId> {
-        let raw = obj.encode();
+        let raw = self.encode(obj);
         let id = ObjectId::hash(&raw);
         self.write_if_absent(&id, &raw)?;
         Ok(id)
@@ -636,7 +686,7 @@ impl ObjectStore {
     /// a label that already names a generation is used as is.
     pub fn seal(&self, inner: &Object, scope: &str) -> Result<Object> {
         let (label, key) = self.keys.sealing_key(scope)?;
-        Ok(Object::Sealed(Envelope::seal(&key, &label, &inner.encode(), true)?))
+        Ok(Object::Sealed(Envelope::seal(&key, &label, &self.encode(inner), true)?))
     }
 
     /// Store file content with the given visibility, returning its id.
