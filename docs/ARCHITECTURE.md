@@ -755,6 +755,23 @@ CAS, and it applies these rules in order:
      destination's audience only when it was public; content sealed for
      another scope is not resealed, and the destination keeps its own
      entry (reported).
+   * **Conflict markers show the base only to its own audience**
+     (BUG-126). A conflicted text merge writes diff3 markers, whose
+     "original" section is the merge base's version. That section is
+     written only when the base is public (or under a released embargo) or
+     is verifiably sealed exactly as the result is. Otherwise, for example
+     with a base sealed for `team` and two sides that both exposed the file,
+     or a base sealed for `ops` and two `team` sides, the markers show the
+     two sides only (Git's `merge` conflict style). Before the fix, the
+     public result carried the `team` text into the snapshot, public
+     remotes and the Git export. The alternative, sealing the conflicted
+     result for the narrowest audience involved, is rejected: scopes are
+     not ordered (see the previous rule), so there is often no narrowest,
+     and it would hide both sides' public edits from public readers
+     because of a section that only helps the person resolving the
+     conflict. That person can still read the base (`vl cat -r` on the
+     merge base). A clean merge never holds a line of the base that neither
+     side has, so only the markers are affected.
    * **"Now sealed" never reads as "deleted".** A file the policy says is
      public but that is sealed because of the line it is edited on (a
      cloaked workspace, or sealed content keeping its audience) carries its

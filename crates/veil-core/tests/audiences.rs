@@ -9,6 +9,8 @@
 //!   (BUG-123).
 //! * A cloaked workspace is cloaked under a scope, never an embargo or
 //!   `local` (BUG-124).
+//! * Conflict markers show the merge base's version only to the base's own
+//!   audience (BUG-126).
 
 mod adversarial_support;
 
@@ -396,4 +398,63 @@ fn a_workspace_cannot_be_cloaked_under_an_embargo_or_a_reserved_name() {
     alice
         .create_workspace("ok", vec![main], Some("team".into()))
         .unwrap();
+}
+
+// ---- BUG-126: the base section of conflict markers ----------------------
+
+const BASE_LINE: &str = "BASE-ONLY-LINE-5521";
+
+/// Merge a one-file tree whose `notes.txt` is `base` (sealed as `bv`)
+/// against two sides that edit the same line (sealed as `ov` and `tv`):
+/// the merged entry and its content.
+fn conflict_over(bv: Visibility, ov: Visibility, tv: Visibility) -> (TreeEntry, String) {
+    let (alice, _fs, _) = new_repo("alice");
+    alice.keys().create_scope("ops").unwrap();
+    let store = alice.store();
+    let tree = |text: &str, v: &Visibility| {
+        let id = store.store_file(text.as_bytes(), v).unwrap();
+        let mut e = file("notes.txt", id);
+        e.size = text.len() as u64;
+        e.visibility = v.clone();
+        raw_tree(&alice, vec![e])
+    };
+    let base = tree(&format!("intro\n{BASE_LINE}\noutro\n"), &bv);
+    let ours = tree("intro\nOURS\noutro\n", &ov);
+    let theirs = tree("intro\nTHEIRS\noutro\n", &tv);
+    let out = veil_core::merge::merge_trees(store, Some(base), ours, theirs).unwrap();
+    assert_eq!(out.conflicts.len(), 1, "a conflict");
+    let e = store.tree(&out.tree).unwrap().get("notes.txt").unwrap().clone();
+    let text = String::from_utf8(store.read_entry(&e).unwrap()).unwrap();
+    assert!(text.contains("OURS") && text.contains("THEIRS") && text.contains("<<<<<<<"), "{text}");
+    (e, text)
+}
+
+#[test]
+fn a_conflict_never_shows_a_sealed_base_in_a_public_result() {
+    let (e, text) = conflict_over(team(), Visibility::Public, Visibility::Public);
+    assert!(e.visibility.is_public());
+    assert!(!text.contains(BASE_LINE), "{text}");
+    assert!(!text.contains("|||||||"), "{text}");
+}
+
+#[test]
+fn a_conflict_never_shows_another_scopes_base() {
+    let ops = Visibility::Cloaked { scope: "ops".into() };
+    let (e, text) = conflict_over(ops, team(), team());
+    assert_eq!(e.visibility, team());
+    assert!(!text.contains(BASE_LINE), "{text}");
+}
+
+#[test]
+fn a_conflict_shows_the_base_to_its_own_audience() {
+    // Same audience: diff3 markers, as before.
+    let (e, text) = conflict_over(team(), team(), team());
+    assert_eq!(e.visibility, team());
+    assert!(text.contains(BASE_LINE) && text.contains("|||||||"), "{text}");
+    // A public base may show anywhere.
+    let (e, text) = conflict_over(Visibility::Public, team(), Visibility::Public);
+    assert_eq!(e.visibility, team());
+    assert!(text.contains(BASE_LINE), "{text}");
+    let (_, text) = conflict_over(Visibility::Public, Visibility::Public, Visibility::Public);
+    assert!(text.contains(BASE_LINE), "{text}");
 }

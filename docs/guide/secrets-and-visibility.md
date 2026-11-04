@@ -444,6 +444,12 @@ edit for `team`. If the policy you checked out re-keys the file and your
 accepted policy holds that back, the report points to `vl policy accept`
 instead.
 
+Conflict markers normally include the version both sides started from
+(the `||||||| original` section). If that version was sealed for an
+audience the merged file does not have (say it was cloaked for `team` and
+both sides made the file public), the markers leave that section out and
+show only the two sides.
+
 > **Public files edited in a cloaked workspace.** A public file you *edit*
 > in a cloaked workspace is recorded cloaked, together with its last public
 > version. Anyone who cannot read the scope (a public remote, GitHub,
