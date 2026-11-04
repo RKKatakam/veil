@@ -102,8 +102,13 @@ pub fn print_build_warnings(r: &BuildReport) {
     }
     for (p, findings) in &r.quarantined {
         let f = &findings[0];
+        let held = if r.quarantine_kept.contains(p) {
+            "this edit was not snapshotted (history keeps the previous version)"
+        } else {
+            "not snapshotted"
+        };
         warn(&format!(
-            "{} quarantined: looks like a secret ({} at line {}: {}); not snapshotted. Fix it, or `vl cloak|isolate|expose --force {p}`",
+            "{} quarantined: looks like a secret ({} at line {}: {}); {held}. Fix it, or `vl cloak|isolate|expose --force {p}`",
             bold(p.as_str()),
             f.rule,
             f.line,

@@ -16,7 +16,7 @@
 //! never enter the snapshot graph. They *may* be `cloak`ed (encrypted for a
 //! team) or deliberately published with `public!`.
 
-use globset::{GlobBuilder, GlobMatcher};
+use globset::{GlobBuilder, GlobMatcher, GlobSet, GlobSetBuilder};
 
 use crate::{error::Result, vfs::StorageBackend, vpath::VPath};
 
@@ -79,6 +79,19 @@ pub struct Rule {
     exact: GlobMatcher,
     under: GlobMatcher,
 }
+
+/// All rules' globs compiled into one set (`2i` = rule `i` exact, `2i + 1` =
+/// rule `i` under), so classifying a path is one match instead of two per
+/// rule. Classification runs for every path on every snapshot.
+fn compile_set(rules: &[Rule]) -> GlobSet {
+    let mut b = GlobSetBuilder::new();
+    for r in rules {
+        b.add(r.exact.glob().clone());
+        b.add(r.under.glob().clone());
+    }
+    b.build().expect("globs were already validated individually")
+}
+
 
 impl Rule {
     fn new(pattern: &str, tier: Tier, force: bool, builtin: bool, secret: bool) -> Result<Rule, String> {
@@ -151,6 +164,7 @@ pub struct Classification {
 #[derive(Clone, Debug)]
 pub struct Policy {
     rules: Vec<Rule>,
+    set: GlobSet,
     pub warnings: Vec<String>,
 }
 
@@ -170,6 +184,7 @@ impl Policy {
             rules.push(Rule::new(p, Tier::Public, false, true, false).unwrap());
         }
         Policy {
+            set: compile_set(&rules),
             rules,
             warnings: vec![],
         }
@@ -208,6 +223,7 @@ impl Policy {
                 Err(e) => policy.warnings.push(format!("{POLICY_FILE}:{}: {e}", n + 1)),
             }
         }
+        policy.set = compile_set(&policy.rules);
         policy
     }
 
@@ -236,10 +252,15 @@ impl Policy {
         if path.as_str() == POLICY_FILE {
             return c;
         }
-        for r in &self.rules {
-            if !r.matches(path, is_dir) {
-                continue;
+        let hits = self.set.matches(path.as_str());
+        let mut matched = vec![false; self.rules.len()];
+        for i in hits {
+            let r = &self.rules[i / 2];
+            if i % 2 == 1 || !r.dir_only || is_dir {
+                matched[i / 2] = true;
             }
+        }
+        for (r, _) in self.rules.iter().zip(&matched).filter(|(_, m)| **m) {
             if r.builtin {
                 c.builtin_secret = r.secret;
                 c.tier = r.tier.clone();

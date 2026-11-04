@@ -198,13 +198,13 @@ impl StorageBackend for TreeView {
     }
 
     fn metadata(&self, path: &VPath) -> Result<Option<Metadata>> {
-        Ok(self.entry(path)?.map(|e| Metadata {
-            kind: match e.kind {
+        // Immutable content is identified by `known_id`, not by stamps.
+        Ok(self.entry(path)?.map(|e| {
+            let kind = match e.kind {
                 EntryKind::Dir => NodeKind::Dir,
                 EntryKind::File => NodeKind::File,
-            },
-            len: e.size,
-            executable: e.executable,
+            };
+            Metadata::unstamped(kind, e.size, e.executable)
         }))
     }
 

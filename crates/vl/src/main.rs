@@ -371,7 +371,12 @@ fn cmd_status(ctx: &mut Ctx) -> Result<()> {
     if !ctx.report.quarantined.is_empty() {
         println!("{}", yellow("Quarantined (secrets detected; kept local):"));
         for (p, f) in &ctx.report.quarantined {
-            println!("  {} {p}  ({})", yellow("Q"), f[0].rule);
+            let state = if ctx.report.quarantine_kept.contains(p) {
+                "edit held back; history keeps the previous version"
+            } else {
+                "never recorded"
+            };
+            println!("  {} {p}  ({}; {state})", yellow("Q"), f[0].rule);
         }
     }
     if !ctx.report.carried.is_empty() {
@@ -439,11 +444,14 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: &str) -> Result<()> {
     let wc_tree = ctx.repo.snapshot(&ctx.wc()?)?.tree;
     let filters: Vec<VPath> = paths.iter().map(|p| ctx.repo_path(p)).collect::<Result<_>>()?;
     let changes = veil_core::tree::diff_trees(ctx.repo.store(), Some(&wc_tree), Some(&src_tree))?;
+    let wanted = |p: &VPath| filters.is_empty() || filters.iter().any(|f| p.starts_with(f));
     let mut n = 0;
+    let mut done = std::collections::HashSet::new();
     for c in changes {
-        if !filters.is_empty() && !filters.iter().any(|f| c.path.starts_with(f)) {
+        if !wanted(&c.path) {
             continue;
         }
+        done.insert(c.path.clone());
         match &c.new {
             Some(e) => {
                 let data = ctx.repo.store().read_entry(e)?;
@@ -451,6 +459,21 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: &str) -> Result<()> {
                 ctx.fs.set_executable(&c.path, e.executable)?;
             }
             None => ctx.fs.remove_file(&c.path)?,
+        }
+        n += 1;
+    }
+    // A quarantined edit is not in the working-copy tree (it keeps the
+    // previous version), so the diff above cannot see it: restore it too.
+    for p in ctx.report.quarantine_kept.clone() {
+        if done.contains(&p) || !wanted(&p) {
+            continue;
+        }
+        match veil_core::tree::lookup(ctx.repo.store(), &src_tree, &p)? {
+            Some(e) if e.kind == veil_core::EntryKind::File => {
+                ctx.fs.write(&p, &ctx.repo.store().read_entry(&e)?)?;
+                ctx.fs.set_executable(&p, e.executable)?;
+            }
+            _ => ctx.fs.remove_file(&p)?,
         }
         n += 1;
     }

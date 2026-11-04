@@ -30,6 +30,42 @@ pub struct Metadata {
     pub kind: NodeKind,
     pub len: u64,
     pub executable: bool,
+    /// Modification stamp on the backend's [`StatClock`]: nanoseconds since
+    /// the Unix epoch for [`DiskBackend`], a write-generation counter for
+    /// [`MemoryBackend`]. `None` means "unknown": stat caches must re-read.
+    pub mtime: Option<i64>,
+    /// Inode-change stamp (Unix `ctime`, same clock as `mtime`), if known.
+    /// Catches edits whose `mtime` was restored afterwards.
+    pub ctime: Option<i64>,
+    /// File identity (inode number), if the backend has one. Atomic
+    /// replace-by-rename changes it even when size and mtime collide.
+    pub inode: Option<u64>,
+}
+
+impl Metadata {
+    /// Metadata with no change-detection stamps (always re-read).
+    pub fn unstamped(kind: NodeKind, len: u64, executable: bool) -> Metadata {
+        Metadata {
+            kind,
+            len,
+            executable,
+            mtime: None,
+            ctime: None,
+            inode: None,
+        }
+    }
+}
+
+/// The clock [`Metadata::mtime`] is measured on, read *now*. Stat caches use
+/// it to recognise "racily clean" files: a file whose stamp is too close to
+/// the moment it was verified could change again without its stamp moving.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatClock {
+    pub now: i64,
+    /// `true` when every write is guaranteed a strictly larger stamp (a
+    /// generation counter): there is no racy window at all. `false` for wall
+    /// clocks with filesystem-dependent granularity.
+    pub exact: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,6 +111,13 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
     /// id. Tree views and overlays implement this so snapshotting an
     /// ephemeral workspace only touches what actually changed.
     fn known_id(&self, _path: &VPath) -> Option<ObjectId> {
+        None
+    }
+
+    /// Current reading of the clock `Metadata::mtime` stamps come from, or
+    /// `None` if this backend's stamps cannot be trusted for change detection
+    /// (which disables stat caching).
+    fn stat_clock(&self) -> Option<StatClock> {
         None
     }
 

@@ -1,5 +1,9 @@
 //! CLI session: locate the repository, load the identity, auto-snapshot the
 //! working copy, and keep the project directory in sync with the view.
+//!
+//! The session owns the project directory's stat cache
+//! (`.veil/local/statcache/<workspace>.cache`). It is loaded once, used by
+//! every snapshot and checkout of the session, and saved only when it changed.
 
 use std::{
     path::{Path, PathBuf},
@@ -11,7 +15,9 @@ use serde::{Deserialize, Serialize};
 use veil_core::{
     builder::BuildReport,
     repo::{DEFAULT_WORKSPACE, VEIL_DIR},
-    revset, DiskBackend, Identity, ObjectId, Repo, StorageBackend, VPath,
+    revset,
+    statcache::{cache_path, StatCache},
+    DiskBackend, Identity, ObjectId, Repo, StorageBackend, VPath,
 };
 
 use crate::render::{self, warn};
@@ -94,6 +100,9 @@ pub struct Ctx {
     pub ws: String,
     checkout: CheckoutState,
     pub report: BuildReport,
+    /// Stat cache of the project directory (it follows the directory when
+    /// another workspace is attached).
+    cache: StatCache,
 }
 
 pub fn find_root(start: &Path) -> Option<PathBuf> {
@@ -134,6 +143,7 @@ impl Ctx {
                 snapshot: repo.workspace_wc(DEFAULT_WORKSPACE)?,
             },
         };
+        let cache = StatCache::load(&*fs, &cache_path(&checkout.workspace));
         let mut ws = checkout.workspace.clone();
         if !repo.view().workspaces.contains_key(&ws) {
             let fallback = repo
@@ -153,6 +163,7 @@ impl Ctx {
             ws,
             checkout,
             report: BuildReport::default(),
+            cache,
         };
         if snapshot {
             ctx.snapshot()?;
@@ -171,7 +182,8 @@ impl Ctx {
     /// Record the project directory into the attached workspace.
     pub fn snapshot(&mut self) -> Result<()> {
         let view_wc = self.wc()?;
-        let fs: &dyn StorageBackend = &*self.fs;
+        let disk = self.fs.clone();
+        let fs: &dyn StorageBackend = &*disk;
         let stale = self.checkout.workspace != self.ws
             || (self.checkout.snapshot != view_wc && self.repo.store().has(&self.checkout.snapshot));
         if stale {
@@ -181,7 +193,12 @@ impl Ctx {
             let base = self.checkout.snapshot;
             let base_snap = self.repo.snapshot(&base)?;
             let target_tree = self.repo.snapshot(&view_wc)?.tree;
-            let (tree, report) = self.repo.build_from(fs, Some(base_snap.tree), base_snap.cloak.as_deref())?;
+            let (tree, report) = self.repo.build_from_cached(
+                fs,
+                Some(base_snap.tree),
+                base_snap.cloak.as_deref(),
+                Some(&mut self.cache),
+            )?;
             let mut from = base_snap.tree;
             if tree == target_tree {
                 // Directory already matches (e.g. interrupted after checkout).
@@ -199,15 +216,20 @@ impl Ctx {
             }
             self.report = report;
             let to = self.repo.snapshot(&view_wc)?.tree;
-            self.repo.checkout_tree(fs, Some(&from), &to)?;
+            let co = self.repo.checkout_tree_cached(fs, Some(&from), &to, Some(&mut self.cache))?;
+            print_kept_local(&co.kept_local);
             self.checkout = CheckoutState {
                 workspace: self.ws.clone(),
                 snapshot: view_wc,
             };
             save_checkout(&self.fs, &self.checkout)?;
+            self.save_cache();
             return Ok(());
         }
-        let out = self.repo.snapshot_workspace(&self.ws, fs)?;
+        let out = self
+            .repo
+            .snapshot_workspace_cached(&self.ws, fs, Some(&mut self.cache))?;
+        self.save_cache();
         self.repo.capture_local_files(fs, &out.report)?;
         render::print_build_warnings(&out.report);
         self.report = out.report;
@@ -228,7 +250,10 @@ impl Ctx {
         let to_snap = self.repo.snapshot(&target)?;
         let previous = self.checkout.snapshot;
         let report = if from != to_snap.tree {
-            Some(self.repo.checkout_tree(&*self.fs, Some(&from), &to_snap.tree)?)
+            Some(
+                self.repo
+                    .checkout_tree_cached(&*self.fs, Some(&from), &to_snap.tree, Some(&mut self.cache))?,
+            )
         } else {
             None
         };
@@ -238,6 +263,7 @@ impl Ctx {
             snapshot: target,
         };
         save_checkout(&self.fs, &self.checkout)?;
+        self.save_cache();
         if let Some(r) = report {
             if r.written + r.removed > 0 {
                 eprintln!("Updated {} files, removed {}", r.written, r.removed);
@@ -248,11 +274,20 @@ impl Ctx {
             for p in &r.protected {
                 eprintln!("  {} {p} (local-only file kept as is)", render::yellow("protected"));
             }
+            print_kept_local(&r.kept_local);
         }
         if previous != target {
             eprintln!("Working copy now at: {}", render::one_line(&self.repo, &target));
         }
         Ok(())
+    }
+
+    /// Persist the stat cache if it changed. It is only an accelerator, so
+    /// failing to write it is a warning, not an error.
+    fn save_cache(&mut self) {
+        if let Err(e) = self.cache.save(&*self.fs, &cache_path(&self.ws)) {
+            warn(&format!("could not save the stat cache: {e}"));
+        }
     }
 
     pub fn attach(&mut self, ws: &str) -> Result<()> {
@@ -276,6 +311,15 @@ impl Ctx {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|_| PathBuf::from(user));
         Ok(VPath::new(&rel.to_string_lossy().replace('\\', "/"))?)
+    }
+}
+
+fn print_kept_local(paths: &[VPath]) {
+    for p in paths {
+        eprintln!(
+            "  {} {p} (local edit not in history, e.g. quarantined; left as is instead of being overwritten)",
+            render::yellow("kept")
+        );
     }
 }
 

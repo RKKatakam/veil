@@ -195,13 +195,18 @@ impl StorageBackend for OverlayBackend {
     }
 
     fn metadata(&self, path: &VPath) -> Result<Option<Metadata>> {
-        if path.is_root() {
-            return self.upper.metadata(path);
-        }
-        if let Some(m) = self.upper.metadata(path)? {
-            return Ok(Some(m));
-        }
-        self.lower_meta(path)
+        let m = if path.is_root() {
+            self.upper.metadata(path)?
+        } else {
+            match self.upper.metadata(path)? {
+                Some(m) => Some(m),
+                None => self.lower_meta(path)?,
+            }
+        };
+        // Upper and lower stamps come from unrelated clocks, so the merged
+        // view reports none (and `stat_clock` stays `None`): overlays rely on
+        // `known_id` hints instead of a stat cache.
+        Ok(m.map(|m| Metadata::unstamped(m.kind, m.len, m.executable)))
     }
 
     fn set_executable(&self, path: &VPath, executable: bool) -> Result<()> {
