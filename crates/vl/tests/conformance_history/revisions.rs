@@ -16,7 +16,11 @@ fn dash_suffix_walks_first_parents() {
     assert_eq!(r.cid("@--"), a);
     r.tag("t", "@-");
     assert_eq!(r.cid("t-"), a);
-    assert_eq!(r.snap("@---").change, "z".repeat(32), "three steps from @ reach the root");
+    assert_eq!(
+        r.snap("@---").change,
+        "z".repeat(32),
+        "three steps from @ reach the root"
+    );
     assert!(r.fails(&["show", "@----"]).contains("past the root"));
 }
 
@@ -34,7 +38,12 @@ fn walking_past_the_root_fails() {
 #[test]
 fn dash_of_a_merge_is_its_first_parent() {
     let env = Env::new();
-    let r = fork(&env, &[("k", "k\n")], |r: &R| r.write("l", "l\n"), |r: &R| r.write("r", "r\n"));
+    let r = fork(
+        &env,
+        &[("k", "k\n")],
+        |r: &R| r.write("l", "l\n"),
+        |r: &R| r.write("r", "r\n"),
+    );
     let right = r.cid("right");
     r.ok(&["merge", "left"]);
     assert_eq!(r.cid("@--"), right);
@@ -49,7 +58,11 @@ fn id_prefixes_resolve() {
     let s = r.sid("@-");
     assert_eq!(r.cid(&c[..12]), c);
     assert_eq!(r.cid(&s[..10]), c);
-    assert_eq!(r.cid(&s.to_uppercase()[..10]), c, "hex prefixes are case-insensitive");
+    assert_eq!(
+        r.cid(&s.to_uppercase()[..10]),
+        c,
+        "hex prefixes are case-insensitive"
+    );
     assert_eq!(r.cid(&s), c, "full snapshot id");
     let out = r.out(&["show", &c[..12]]);
     assert!(out.contains(&format!("Change ID : {c}")), "{out}");
@@ -80,7 +93,10 @@ fn ambiguous_change_prefix_is_reported() {
         let c = repo.snapshot(&id).unwrap().change_id.display();
         *firsts.entry(c[..1].to_string()).or_insert(0) += 1;
     }
-    let (letter, _) = firsts.iter().find(|(_, n)| **n > 1).expect("40 changes share a first letter");
+    let (letter, _) = firsts
+        .iter()
+        .find(|(_, n)| **n > 1)
+        .expect("40 changes share a first letter");
     let err = r.fails(&["show", letter]);
     assert!(err.contains("ambiguous"), "{err}");
 }
@@ -151,7 +167,11 @@ fn revset_operators_are_rejected_not_misread() {
     r.tag("main", "@-");
     for expr in ["main..@", "::main", "main|@", "all()", "main~1", "main^"] {
         let out = r.run(&["show", expr]);
-        assert!(!out.status.success(), "{expr:?} was accepted:\n{}", text(&out));
+        assert!(
+            !out.status.success(),
+            "{expr:?} was accepted:\n{}",
+            text(&out)
+        );
         assert!(exited_cleanly(&out));
     }
 }
@@ -173,7 +193,10 @@ fn merge_uses_the_nearest_common_ancestor() {
     r.commit("right", &[("f", &nearer.replace("l9\n", "nine\n"))]);
     let out = r.ok(&["merge", "left"]);
     assert!(!out.contains("conflict"), "{out}");
-    assert_eq!(r.read("f"), nearer.replace("l1\n", "one\n").replace("l9\n", "nine\n"));
+    assert_eq!(
+        r.read("f"),
+        nearer.replace("l1\n", "one\n").replace("l9\n", "nine\n")
+    );
 }
 
 // Scenario from Veil tag-name rules: names that would be read as revision syntax are refused.
@@ -187,7 +210,11 @@ fn tag_names_that_clash_with_revision_syntax_are_refused() {
         assert!(!out.status.success(), "tag {bad:?} accepted");
     }
     r.ok(&["tag", "set", "release-1.0", "-r", "@-"]);
-    assert_eq!(r.cid("release-1.0-"), "z".repeat(32), "tag with a dash then a parent step");
+    assert_eq!(
+        r.cid("release-1.0-"),
+        "z".repeat(32),
+        "tag with a dash then a parent step"
+    );
 }
 
 // Scenario from jj test_revset (remote bookmarks): origin/main names the remote tag after a pull.
@@ -218,6 +245,8 @@ fn remote_tags_are_recorded_by_push() {
     let remote = env.root.join("remote");
     r.ok(&["remote", "add", "origin", remote.to_str().unwrap()]);
     r.ok(&["push", "origin", "-t", "main"]);
-    let s = r.try_snap("origin/main").expect("origin/main does not resolve after `vl push`");
+    let s = r
+        .try_snap("origin/main")
+        .expect("origin/main does not resolve after `vl push`");
     assert_eq!(s.change, a);
 }

@@ -56,19 +56,31 @@ impl Env {
     /// A new, empty repository (`vl init`) owned by alice.
     pub fn repo(&self, name: &str) -> R<'_> {
         let dir = self.dir(name);
-        let r = R { env: self, dir, user: U.into() };
+        let r = R {
+            env: self,
+            dir,
+            user: U.into(),
+        };
         r.ok(&["init"]);
         r
     }
 
     /// The same directory, driven as another user.
     pub fn as_user<'a>(&'a self, dir: &Path, user: &str) -> R<'a> {
-        R { env: self, dir: dir.to_path_buf(), user: user.into() }
+        R {
+            env: self,
+            dir: dir.to_path_buf(),
+            user: user.into(),
+        }
     }
 }
 
 pub fn text(out: &Output) -> String {
-    format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
 }
 
 /// Exit code set, not 101 (a Rust panic), no panic message.
@@ -82,6 +94,9 @@ pub struct R<'a> {
     pub dir: PathBuf,
     pub user: String,
 }
+
+/// `(visible snapshots, tags → target, workspaces → working copy)`.
+pub type State = (Vec<String>, Vec<(String, String)>, Vec<(String, String)>);
 
 /// What `veil-core` says about one snapshot.
 #[derive(Debug, Clone)]
@@ -122,7 +137,10 @@ impl R<'_> {
     pub fn fails(&self, args: &[&str]) -> String {
         let out = self.run(args);
         let t = text(&out);
-        assert!(!out.status.success(), "vl {args:?} unexpectedly succeeded:\n{t}");
+        assert!(
+            !out.status.success(),
+            "vl {args:?} unexpectedly succeeded:\n{t}"
+        );
         assert!(exited_cleanly(&out), "vl {args:?} crashed:\n{t}");
         t
     }
@@ -178,18 +196,26 @@ impl R<'_> {
     /// Open the repository through `veil-core` with this user's identity.
     pub fn core(&self) -> Repo {
         let id_path = self.env.home(&self.user).join("identity.json");
-        let identity = std::fs::read_to_string(&id_path).ok().map(|s| Identity::from_json(&s).unwrap());
+        let identity = std::fs::read_to_string(&id_path)
+            .ok()
+            .map(|s| Identity::from_json(&s).unwrap());
         Repo::open(Arc::new(DiskBackend::new(&self.dir)), identity, &self.user).unwrap()
     }
 
     /// Open the repository as an outsider who holds no key.
     pub fn core_anon(&self) -> Repo {
-        Repo::open(Arc::new(DiskBackend::new(&self.dir)), Some(Identity::generate("anon")), "anon").unwrap()
+        Repo::open(
+            Arc::new(DiskBackend::new(&self.dir)),
+            Some(Identity::generate("anon")),
+            "anon",
+        )
+        .unwrap()
     }
 
     pub fn snap(&self, rev: &str) -> Snap {
         let repo = self.core();
-        let id = veil_core::revset::resolve(&repo, rev, "default").unwrap_or_else(|e| panic!("{rev}: {e}"));
+        let id = veil_core::revset::resolve(&repo, rev, "default")
+            .unwrap_or_else(|e| panic!("{rev}: {e}"));
         snap_of(&repo, &id)
     }
 
@@ -218,7 +244,14 @@ impl R<'_> {
             .unwrap()
             .into_iter()
             .filter(|(_, e)| e.kind == EntryKind::File)
-            .map(|(p, e)| (p.to_string(), repo.store().read_entry(&e).ok(), e.visibility.clone(), e.executable))
+            .map(|(p, e)| {
+                (
+                    p.to_string(),
+                    repo.store().read_entry(&e).ok(),
+                    e.visibility.clone(),
+                    e.executable,
+                )
+            })
             .collect()
     }
 
@@ -262,18 +295,32 @@ impl R<'_> {
 
     /// Visible snapshot ids, sorted (a fingerprint of the graph).
     pub fn graph(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.core().visible_snapshots().unwrap().iter().map(|i| i.hex()).collect();
+        let mut v: Vec<String> = self
+            .core()
+            .visible_snapshots()
+            .unwrap()
+            .iter()
+            .map(|i| i.hex())
+            .collect();
         v.sort();
         v
     }
 
     /// Visible snapshots, tags and workspace pointers: everything undo must
     /// restore.
-    pub fn state(&self) -> (Vec<String>, Vec<(String, String)>, Vec<(String, String)>) {
+    pub fn state(&self) -> State {
         let repo = self.core();
         let view = repo.view();
-        let tags = view.tags.iter().map(|(n, t)| (n.clone(), t.target.hex())).collect();
-        let wss = view.workspaces.iter().map(|(n, w)| (n.clone(), w.wc.hex())).collect();
+        let tags = view
+            .tags
+            .iter()
+            .map(|(n, t)| (n.clone(), t.target.hex()))
+            .collect();
+        let wss = view
+            .workspaces
+            .iter()
+            .map(|(n, w)| (n.clone(), w.wc.hex()))
+            .collect();
         (self.graph(), tags, wss)
     }
 
@@ -303,7 +350,9 @@ impl R<'_> {
             if !seen.insert(id) {
                 continue;
             }
-            let Some(s) = repo.snapshot_opt(&id).unwrap() else { continue };
+            let Some(s) = repo.snapshot_opt(&id).unwrap() else {
+                continue;
+            };
             stack.extend(s.parents.iter().copied());
             stack.extend(s.predecessors.iter().copied());
             if let veil_core::object::Text::Plain(d) = &s.description {
@@ -311,7 +360,9 @@ impl R<'_> {
                     hits.push(format!("description of {}", id.short()));
                 }
             }
-            let Ok(files) = veil_core::tree::walk_files(repo.store(), &s.tree) else { continue };
+            let Ok(files) = veil_core::tree::walk_files(repo.store(), &s.tree) else {
+                continue;
+            };
             for (p, e) in files {
                 if e.kind != EntryKind::File {
                     continue;
@@ -336,7 +387,12 @@ pub fn snap_of(repo: &Repo, id: &veil_core::ObjectId) -> Snap {
         parent_changes: s
             .parents
             .iter()
-            .map(|p| repo.snapshot_opt(p).unwrap().map(|x| x.change_id.display()).unwrap_or_default())
+            .map(|p| {
+                repo.snapshot_opt(p)
+                    .unwrap()
+                    .map(|x| x.change_id.display())
+                    .unwrap_or_default()
+            })
             .collect(),
         conflicts: s.conflicts.clone(),
         description: repo.store().read_text(&s.description),
@@ -364,7 +420,9 @@ pub fn store_contains(dir: &Path, needle: &[u8]) -> Vec<String> {
     if let Ok(entries) = fs.list_dir(&pdir) {
         let bases = LruCache::new(64 << 20);
         for e in entries {
-            let Some(name) = pack::name_from_index_file(&e.name) else { continue };
+            let Some(name) = pack::name_from_index_file(&e.name) else {
+                continue;
+            };
             let p = pack::Pack::open(&fs, &pdir, name).unwrap();
             for id in p.index().ids() {
                 if let Some(raw) = p.get(&fs, id, &bases).unwrap() {

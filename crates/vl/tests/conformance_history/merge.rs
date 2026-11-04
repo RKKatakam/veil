@@ -7,7 +7,12 @@ use crate::support::*;
 /// `base` → `left` and `base` → `right`, tagged; `@` is an empty change
 /// on `right`, so `vl merge left` merges left ("theirs") into right
 /// ("ours").
-pub fn fork<'a>(env: &'a Env, base: &[(&str, &str)], left: impl FnOnce(&R), right: impl FnOnce(&R)) -> R<'a> {
+pub fn fork<'a>(
+    env: &'a Env,
+    base: &[(&str, &str)],
+    left: impl FnOnce(&R),
+    right: impl FnOnce(&R),
+) -> R<'a> {
     let r = env.repo("p");
     r.commit("base", base);
     r.tag("base", "@-");
@@ -57,7 +62,11 @@ fn disjoint_edits_in_one_file_merge_cleanly() {
     assert_eq!(r.cat("@-", "f"), merged);
     let m = r.snap("@-");
     assert!(m.conflicts.is_empty());
-    assert_eq!(m.parents, vec![right, left], "first parent is the destination");
+    assert_eq!(
+        m.parents,
+        vec![right, left],
+        "first parent is the destination"
+    );
     assert_eq!(m.description.as_deref(), Some("merge left"));
 }
 
@@ -65,7 +74,12 @@ fn disjoint_edits_in_one_file_merge_cleanly() {
 #[test]
 fn changes_to_different_files_merge_cleanly() {
     let env = Env::new();
-    let r = fork(&env, &[("a", "a\n"), ("b", "b\n")], w(&[("a", "A\n"), ("new-left", "nl\n")]), w(&[("b", "B\n")]));
+    let r = fork(
+        &env,
+        &[("a", "a\n"), ("b", "b\n")],
+        w(&[("a", "A\n"), ("new-left", "nl\n")]),
+        w(&[("b", "B\n")]),
+    );
     r.ok(&["merge", "left"]);
     assert_eq!(r.read("a"), "A\n");
     assert_eq!(r.read("b"), "B\n");
@@ -77,7 +91,12 @@ fn changes_to_different_files_merge_cleanly() {
 #[test]
 fn same_line_conflict_writes_diff3_markers() {
     let env = Env::new();
-    let r = fork(&env, &[("f", "top\nmid\nend\n")], w(&[("f", "top\nLEFT\nend\n")]), w(&[("f", "top\nRIGHT\nend\n")]));
+    let r = fork(
+        &env,
+        &[("f", "top\nmid\nend\n")],
+        w(&[("f", "top\nLEFT\nend\n")]),
+        w(&[("f", "top\nRIGHT\nend\n")]),
+    );
     let out = r.ok(&["merge", "left"]);
     assert!(out.contains("conflicts in: f"), "{out}");
     let f = r.read("f");
@@ -86,7 +105,10 @@ fn same_line_conflict_writes_diff3_markers() {
     let s = f.find("=======").expect("separator");
     let t = f.find(">>>>>>> theirs").expect("theirs marker");
     assert!(o < b && b < s && s < t, "{f}");
-    assert!(f[o..b].contains("RIGHT") && f[b..s].contains("mid") && f[s..t].contains("LEFT"), "{f}");
+    assert!(
+        f[o..b].contains("RIGHT") && f[b..s].contains("mid") && f[s..t].contains("LEFT"),
+        "{f}"
+    );
     assert!(f.starts_with("top\n") && f.ends_with("end\n"), "{f}");
     assert_eq!(r.snap("@-").conflicts, vec!["f".to_string()]);
     let log = r.out(&["log"]);
@@ -97,7 +119,12 @@ fn same_line_conflict_writes_diff3_markers() {
 #[test]
 fn editing_the_file_in_the_merge_clears_the_conflict() {
     let env = Env::new();
-    let r = fork(&env, &[("f", "x\n")], w(&[("f", "left\n")]), w(&[("f", "right\n")]));
+    let r = fork(
+        &env,
+        &[("f", "x\n")],
+        w(&[("f", "left\n")]),
+        w(&[("f", "right\n")]),
+    );
     r.ok(&["merge", "left"]);
     let merge = r.cid("@-");
     r.ok(&["edit", &merge]);
@@ -114,7 +141,12 @@ fn editing_the_file_in_the_merge_clears_the_conflict() {
 #[test]
 fn editing_another_file_keeps_the_conflict() {
     let env = Env::new();
-    let r = fork(&env, &[("f", "x\n"), ("g", "g\n")], w(&[("f", "left\n")]), w(&[("f", "right\n")]));
+    let r = fork(
+        &env,
+        &[("f", "x\n"), ("g", "g\n")],
+        w(&[("f", "left\n")]),
+        w(&[("f", "right\n")]),
+    );
     r.ok(&["merge", "left"]);
     let merge = r.cid("@-");
     r.ok(&["edit", &merge]);
@@ -127,7 +159,12 @@ fn editing_another_file_keeps_the_conflict() {
 #[test]
 fn squashing_a_resolution_clears_the_conflict() {
     let env = Env::new();
-    let r = fork(&env, &[("f", "x\n")], w(&[("f", "left\n")]), w(&[("f", "right\n")]));
+    let r = fork(
+        &env,
+        &[("f", "x\n")],
+        w(&[("f", "left\n")]),
+        w(&[("f", "right\n")]),
+    );
     r.ok(&["merge", "left"]);
     let st = r.out(&["status"]);
     assert!(st.contains("C f") && st.contains("recorded on"), "{st}");
@@ -142,7 +179,12 @@ fn squashing_a_resolution_clears_the_conflict() {
 #[test]
 fn add_add_identical_is_clean() {
     let env = Env::new();
-    let r = fork(&env, &[("a", "a\n")], w(&[("new", "same\n")]), w(&[("new", "same\n")]));
+    let r = fork(
+        &env,
+        &[("a", "a\n")],
+        w(&[("new", "same\n")]),
+        w(&[("new", "same\n")]),
+    );
     let out = r.ok(&["merge", "left"]);
     assert!(!out.contains("conflict"), "{out}");
     assert_eq!(r.read("new"), "same\n");
@@ -152,18 +194,31 @@ fn add_add_identical_is_clean() {
 #[test]
 fn add_add_different_conflicts() {
     let env = Env::new();
-    let r = fork(&env, &[("a", "a\n")], w(&[("new", "from left\n")]), w(&[("new", "from right\n")]));
+    let r = fork(
+        &env,
+        &[("a", "a\n")],
+        w(&[("new", "from left\n")]),
+        w(&[("new", "from right\n")]),
+    );
     let out = r.ok(&["merge", "left"]);
     assert!(out.contains("conflicts in: new"), "{out}");
     let f = r.read("new");
-    assert!(f.contains("from left") && f.contains("from right") && f.contains("<<<<<<<"), "{f}");
+    assert!(
+        f.contains("from left") && f.contains("from right") && f.contains("<<<<<<<"),
+        "{f}"
+    );
 }
 
 // Scenario from git t6430 / jj test_edit_delete_conflict_input_files: modify/delete keeps the modified file, flagged.
 #[test]
 fn modify_delete_conflict_keeps_the_modified_side() {
     let env = Env::new();
-    let r = fork(&env, &[("f", "orig\n"), ("k", "k\n")], w(&[("f", "modified\n")]), |r: &R| r.rm("f"));
+    let r = fork(
+        &env,
+        &[("f", "orig\n"), ("k", "k\n")],
+        w(&[("f", "modified\n")]),
+        |r: &R| r.rm("f"),
+    );
     let out = r.ok(&["merge", "left"]);
     assert!(out.contains("conflicts in: f"), "{out}");
     assert_eq!(r.read("f"), "modified\n");
@@ -174,7 +229,12 @@ fn modify_delete_conflict_keeps_the_modified_side() {
 #[test]
 fn delete_modify_conflict_keeps_the_modified_side() {
     let env = Env::new();
-    let r = fork(&env, &[("f", "orig\n"), ("k", "k\n")], |r: &R| r.rm("f"), w(&[("f", "modified\n")]));
+    let r = fork(
+        &env,
+        &[("f", "orig\n"), ("k", "k\n")],
+        |r: &R| r.rm("f"),
+        w(&[("f", "modified\n")]),
+    );
     let out = r.ok(&["merge", "left"]);
     assert!(out.contains("conflicts in: f"), "{out}");
     assert_eq!(r.read("f"), "modified\n");
@@ -184,7 +244,12 @@ fn delete_modify_conflict_keeps_the_modified_side() {
 #[test]
 fn deleting_resolves_a_modify_delete_conflict() {
     let env = Env::new();
-    let r = fork(&env, &[("f", "orig\n"), ("k", "k\n")], w(&[("f", "modified\n")]), |r: &R| r.rm("f"));
+    let r = fork(
+        &env,
+        &[("f", "orig\n"), ("k", "k\n")],
+        w(&[("f", "modified\n")]),
+        |r: &R| r.rm("f"),
+    );
     r.ok(&["merge", "left"]);
     r.rm("f");
     r.ok(&["squash"]);
@@ -197,7 +262,12 @@ fn deleting_resolves_a_modify_delete_conflict() {
 #[test]
 fn delete_delete_is_clean() {
     let env = Env::new();
-    let r = fork(&env, &[("f", "x\n"), ("k", "k\n")], |r: &R| r.rm("f"), |r: &R| r.rm("f"));
+    let r = fork(
+        &env,
+        &[("f", "x\n"), ("k", "k\n")],
+        |r: &R| r.rm("f"),
+        |r: &R| r.rm("f"),
+    );
     let out = r.ok(&["merge", "left"]);
     assert!(!out.contains("conflict"), "{out}");
     assert!(!r.exists("f"));
@@ -207,7 +277,12 @@ fn delete_delete_is_clean() {
 #[test]
 fn identical_changes_on_both_sides_are_clean() {
     let env = Env::new();
-    let r = fork(&env, &[("f", "1\n2\n3\n")], w(&[("f", "1\nTWO\n3\n")]), w(&[("f", "1\nTWO\n3\n")]));
+    let r = fork(
+        &env,
+        &[("f", "1\n2\n3\n")],
+        w(&[("f", "1\nTWO\n3\n")]),
+        w(&[("f", "1\nTWO\n3\n")]),
+    );
     let out = r.ok(&["merge", "left"]);
     assert!(!out.contains("conflict"), "{out}");
     assert_eq!(r.read("f"), "1\nTWO\n3\n");
@@ -246,7 +321,7 @@ fn merging_a_descendant_takes_its_content() {
 
 // Scenario from jj test_merge_trees (duplicate parents): merging a snapshot with itself.
 #[test]
-#[ignore = "BUG-240: `vl merge X --into X` (and `vl merge X X`) records a snapshot whose parents are duplicates"]
+#[ignore = "BUG-240: `vl merge X --into X` (and `vl new X X`) records a snapshot whose parents are duplicates"]
 fn merging_a_snapshot_into_itself_records_no_duplicate_parent() {
     let env = Env::new();
     let r = env.repo("p");
@@ -258,7 +333,33 @@ fn merging_a_snapshot_into_itself_records_no_duplicate_parent() {
         let m = r.snap("main");
         let mut uniq = m.parents.clone();
         uniq.dedup();
-        assert_eq!(uniq.len(), m.parents.len(), "duplicate parents recorded: {m:?}");
+        assert_eq!(
+            uniq.len(),
+            m.parents.len(),
+            "duplicate parents recorded: {m:?}"
+        );
+    }
+}
+
+// Scenario from jj test_new (duplicate parents): `vl new X X` with work in progress.
+#[test]
+#[ignore = "BUG-240: `vl merge X --into X` (and `vl new X X`) records a snapshot whose parents are duplicates"]
+fn new_with_a_repeated_parent_records_one_parent() {
+    let env = Env::new();
+    let r = env.repo("p");
+    r.commit("one", &[("f", "1\n")]);
+    r.tag("one", "@-");
+    r.write("wip.txt", "keep me\n");
+    let out = r.run(&["new", "one", "one"]);
+    if out.status.success() {
+        let s = r.snap("@");
+        let mut uniq = s.parents.clone();
+        uniq.dedup();
+        assert_eq!(
+            uniq.len(),
+            s.parents.len(),
+            "duplicate parents recorded: {s:?}"
+        );
     }
 }
 
@@ -278,7 +379,11 @@ fn binary_conflict_keeps_ours_without_markers() {
     r.ok(&["commit", "--no-advance", "-m", "right"]);
     let out = r.ok(&["merge", "left"]);
     assert!(out.contains("conflicts in: b.bin"), "{out}");
-    assert_eq!(r.read_bytes("b.bin"), vec![0u8, 7, 7, 7], "ours kept, unmarked");
+    assert_eq!(
+        r.read_bytes("b.bin"),
+        vec![0u8, 7, 7, 7],
+        "ours kept, unmarked"
+    );
     assert_eq!(r.snap("@-").conflicts, vec!["b.bin".to_string()]);
 }
 
@@ -307,10 +412,19 @@ fn binary_changed_on_one_side_is_clean() {
 #[test]
 fn mode_change_and_content_change_combine() {
     let env = Env::new();
-    let r = fork(&env, &[("run.sh", "echo 1\n")], |r: &R| r.chmod_x("run.sh", true), w(&[("run.sh", "echo 2\n")]));
+    let r = fork(
+        &env,
+        &[("run.sh", "echo 1\n")],
+        |r: &R| r.chmod_x("run.sh", true),
+        w(&[("run.sh", "echo 2\n")]),
+    );
     let out = r.ok(&["merge", "left"]);
     assert!(!out.contains("conflict"), "{out}");
-    let f = r.tree_files("@-").into_iter().find(|f| f.0 == "run.sh").unwrap();
+    let f = r
+        .tree_files("@-")
+        .into_iter()
+        .find(|f| f.0 == "run.sh")
+        .unwrap();
     assert_eq!(f.1.as_deref(), Some(&b"echo 2\n"[..]));
     assert!(f.3, "executable bit from the other side was lost");
 }
@@ -319,9 +433,18 @@ fn mode_change_and_content_change_combine() {
 #[test]
 fn mode_change_on_one_side_merges() {
     let env = Env::new();
-    let r = fork(&env, &[("run.sh", "x\n"), ("o", "o\n")], w(&[("o", "O\n")]), |r: &R| r.chmod_x("run.sh", true));
+    let r = fork(
+        &env,
+        &[("run.sh", "x\n"), ("o", "o\n")],
+        w(&[("o", "O\n")]),
+        |r: &R| r.chmod_x("run.sh", true),
+    );
     r.ok(&["merge", "left"]);
-    let f = r.tree_files("@-").into_iter().find(|f| f.0 == "run.sh").unwrap();
+    let f = r
+        .tree_files("@-")
+        .into_iter()
+        .find(|f| f.0 == "run.sh")
+        .unwrap();
     assert!(f.3);
 }
 
@@ -339,7 +462,11 @@ fn file_directory_conflict_is_flagged() {
         w(&[("thing", "file edited\n")]),
     );
     let out = r.run(&["merge", "left"]);
-    assert!(out.status.success() && exited_cleanly(&out), "{}", text(&out));
+    assert!(
+        out.status.success() && exited_cleanly(&out),
+        "{}",
+        text(&out)
+    );
     assert!(text(&out).contains("conflicts in: thing"), "{}", text(&out));
     assert!(r.snap("@-").conflicts.contains(&"thing".to_string()));
 }
@@ -359,10 +486,18 @@ fn file_directory_conflict_keeps_both_sides_content() {
         w(&[("thing", "file edited\n")]),
     );
     r.ok(&["merge", "left"]);
-    let all: Vec<u8> = r.tree_files("@-").into_iter().filter_map(|f| f.1).flatten().collect();
+    let all: Vec<u8> = r
+        .tree_files("@-")
+        .into_iter()
+        .filter_map(|f| f.1)
+        .flatten()
+        .collect();
     let all = String::from_utf8_lossy(&all);
     assert!(all.contains("file edited"), "ours lost");
-    assert!(all.contains("dir content"), "the directory side's inner.txt vanished from the merge result");
+    assert!(
+        all.contains("dir content"),
+        "the directory side's inner.txt vanished from the merge result"
+    );
 }
 
 // Scenario from git t6400-merge-df.sh: directory on ours, file on theirs.
@@ -406,7 +541,12 @@ fn deleted_file_replaced_by_directory_merges() {
 #[test]
 fn both_sides_add_files_in_the_same_new_directory() {
     let env = Env::new();
-    let r = fork(&env, &[("k", "k\n")], w(&[("new/a", "a\n")]), w(&[("new/b", "b\n")]));
+    let r = fork(
+        &env,
+        &[("k", "k\n")],
+        w(&[("new/a", "a\n")]),
+        w(&[("new/b", "b\n")]),
+    );
     let out = r.ok(&["merge", "left"]);
     assert!(!out.contains("conflict"), "{out}");
     assert_eq!(r.read("new/a"), "a\n");
@@ -420,7 +560,12 @@ fn deep_directories_merge_recursively() {
     let d = "a/b/c/d/e/f/g/h";
     let fa = format!("{d}/x.txt");
     let fb = format!("{d}/y.txt");
-    let r = fork(&env, &[(&fa, "x\n"), (&fb, "y\n")], w(&[(&fa, "X\n")]), w(&[(&fb, "Y\n")]));
+    let r = fork(
+        &env,
+        &[(&fa, "x\n"), (&fb, "y\n")],
+        w(&[(&fa, "X\n")]),
+        w(&[(&fb, "Y\n")]),
+    );
     r.ok(&["merge", "left"]);
     assert_eq!(r.read(&fa), "X\n");
     assert_eq!(r.read(&fb), "Y\n");
@@ -445,7 +590,12 @@ fn crlf_files_merge() {
 #[test]
 fn no_trailing_newline_merges() {
     let env = Env::new();
-    let r = fork(&env, &[("f", "1\n2\n3\n4\n5")], w(&[("f", "ONE\n2\n3\n4\n5")]), w(&[("f", "1\n2\n3\n4\nFIVE")]));
+    let r = fork(
+        &env,
+        &[("f", "1\n2\n3\n4\n5")],
+        w(&[("f", "ONE\n2\n3\n4\n5")]),
+        w(&[("f", "1\n2\n3\n4\nFIVE")]),
+    );
     r.ok(&["merge", "left"]);
     assert_eq!(r.read("f"), "ONE\n2\n3\n4\nFIVE");
 }
@@ -454,11 +604,19 @@ fn no_trailing_newline_merges() {
 #[test]
 fn no_trailing_newline_conflict_has_markers() {
     let env = Env::new();
-    let r = fork(&env, &[("f", "1\nlast")], w(&[("f", "1\nleft")]), w(&[("f", "1\nright")]));
+    let r = fork(
+        &env,
+        &[("f", "1\nlast")],
+        w(&[("f", "1\nleft")]),
+        w(&[("f", "1\nright")]),
+    );
     let out = r.ok(&["merge", "left"]);
     assert!(out.contains("conflicts in: f"), "{out}");
     let f = r.read("f");
-    assert!(f.contains("left") && f.contains("right") && f.contains(">>>>>>> theirs"), "{f:?}");
+    assert!(
+        f.contains("left") && f.contains("right") && f.contains(">>>>>>> theirs"),
+        "{f:?}"
+    );
 }
 
 // Scenario from git t6430 / jj test_merged_tree: conflicted file names with spaces and Unicode.
@@ -485,7 +643,12 @@ fn conflicts_in_unusual_names() {
 #[test]
 fn emptied_file_against_an_edit_conflicts() {
     let env = Env::new();
-    let r = fork(&env, &[("f", "content\n")], w(&[("f", "")]), w(&[("f", "content changed\n")]));
+    let r = fork(
+        &env,
+        &[("f", "content\n")],
+        w(&[("f", "")]),
+        w(&[("f", "content changed\n")]),
+    );
     let out = r.ok(&["merge", "left"]);
     assert!(out.contains("conflicts in: f"), "{out}");
 }
@@ -543,7 +706,10 @@ fn criss_cross_merge_with_agreeing_resolutions_is_clean() {
     r.ok(&["commit", "--no-advance", "-m", "on r2"]);
     let out = r.ok(&["merge", "l2"]);
     assert!(!out.contains("conflict"), "{out}");
-    assert_eq!(r.read("f"), base.replace("l2\n", "B\n").replace("l8\n", "C\n"));
+    assert_eq!(
+        r.read("f"),
+        base.replace("l2\n", "B\n").replace("l8\n", "C\n")
+    );
     assert_eq!(r.read("other"), "o\n");
 }
 
@@ -564,7 +730,10 @@ fn octopus_merge_of_three_lines() {
     let out = r.ok(&["merge", "b", "c", "-m", "octopus"]);
     assert!(!out.contains("conflict"), "{out}");
     let m = r.snap("@-");
-    assert_eq!(m.parents, want, "parents in argument order, destination first");
+    assert_eq!(
+        m.parents, want,
+        "parents in argument order, destination first"
+    );
     for f in ["a", "b", "c", "k"] {
         assert!(r.exists(f), "{f} missing after the octopus merge");
     }
@@ -581,7 +750,11 @@ fn octopus_merge_with_a_conflict() {
     r.tag("base", "@-");
     for name in ["a", "b", "c"] {
         r.ok(&["new", "base"]);
-        let content = if name == "c" { "c wins\n".to_string() } else { format!("{name}-{name}\n") };
+        let content = if name == "c" {
+            "c wins\n".to_string()
+        } else {
+            format!("{name}-{name}\n")
+        };
         if name == "b" {
             r.commit(name, &[("only-b", "b\n")]);
         } else {
@@ -627,7 +800,12 @@ fn unrelated_lines_adding_the_same_path_conflict() {
 #[test]
 fn new_with_two_parents_merges_and_records_conflicts() {
     let env = Env::new();
-    let r = fork(&env, &[("f", "x\n"), ("k", "k\n")], w(&[("f", "left\n")]), w(&[("f", "right\n"), ("k", "K\n")]));
+    let r = fork(
+        &env,
+        &[("f", "x\n"), ("k", "k\n")],
+        w(&[("f", "left\n")]),
+        w(&[("f", "right\n"), ("k", "K\n")]),
+    );
     r.ok(&["new", "right", "left"]);
     let s = r.snap("@");
     assert_eq!(s.parents.len(), 2);
@@ -642,7 +820,12 @@ fn new_with_two_parents_merges_and_records_conflicts() {
 #[test]
 fn merge_message_defaults_to_the_merged_revisions() {
     let env = Env::new();
-    let r = fork(&env, &[("a", "a\n")], w(&[("l", "l\n")]), w(&[("r", "r\n")]));
+    let r = fork(
+        &env,
+        &[("a", "a\n")],
+        w(&[("l", "l\n")]),
+        w(&[("r", "r\n")]),
+    );
     r.ok(&["merge", "left"]);
     assert_eq!(r.snap("@-").description.as_deref(), Some("merge left"));
 }
@@ -651,11 +834,20 @@ fn merge_message_defaults_to_the_merged_revisions() {
 #[test]
 fn merge_moves_tags_at_the_destination_only() {
     let env = Env::new();
-    let r = fork(&env, &[("a", "a\n")], w(&[("l", "l\n")]), w(&[("r", "r\n")]));
+    let r = fork(
+        &env,
+        &[("a", "a\n")],
+        w(&[("l", "l\n")]),
+        w(&[("r", "r\n")]),
+    );
     let left_before = r.tag_target("left");
     r.ok(&["merge", "left"]);
     let merge = r.sid("@-");
-    assert_eq!(r.tag_target("right"), Some(merge), "the destination's tag did not follow the merge");
+    assert_eq!(
+        r.tag_target("right"),
+        Some(merge),
+        "the destination's tag did not follow the merge"
+    );
     assert_eq!(r.tag_target("left"), left_before, "the merged-in tag moved");
 }
 
@@ -663,12 +855,20 @@ fn merge_moves_tags_at_the_destination_only() {
 #[test]
 fn merge_into_a_non_empty_working_copy_merges_into_it() {
     let env = Env::new();
-    let r = fork(&env, &[("a", "a\n")], w(&[("l", "l\n")]), w(&[("r", "r\n")]));
+    let r = fork(
+        &env,
+        &[("a", "a\n")],
+        w(&[("l", "l\n")]),
+        w(&[("r", "r\n")]),
+    );
     r.write("wip", "work in progress\n");
     let wc_change = r.cid("@");
     r.ok(&["merge", "left"]);
     let m = r.snap("@-");
-    assert_eq!(m.parent_changes[0], wc_change, "merged into something other than the non-empty @");
+    assert_eq!(
+        m.parent_changes[0], wc_change,
+        "merged into something other than the non-empty @"
+    );
     assert_eq!(r.read("wip"), "work in progress\n");
     assert_eq!(r.read("l"), "l\n");
 }
@@ -677,7 +877,12 @@ fn merge_into_a_non_empty_working_copy_merges_into_it() {
 #[test]
 fn merge_of_an_unknown_revision_records_nothing() {
     let env = Env::new();
-    let r = fork(&env, &[("a", "a\n")], w(&[("l", "l\n")]), w(&[("r", "r\n")]));
+    let r = fork(
+        &env,
+        &[("a", "a\n")],
+        w(&[("l", "l\n")]),
+        w(&[("r", "r\n")]),
+    );
     r.ok(&["status"]);
     let before = r.op_head();
     let err = r.fails(&["merge", "nosuch"]);
@@ -692,7 +897,12 @@ fn merge_of_an_unknown_revision_records_nothing() {
 #[test]
 fn merging_a_conflicted_snapshot_carries_the_markers() {
     let env = Env::new();
-    let r = fork(&env, &[("f", "x\n"), ("g", "g\n")], w(&[("f", "left\n")]), w(&[("f", "right\n")]));
+    let r = fork(
+        &env,
+        &[("f", "x\n"), ("g", "g\n")],
+        w(&[("f", "left\n")]),
+        w(&[("f", "right\n")]),
+    );
     r.ok(&["merge", "left", "-m", "conflicted"]);
     r.tag("conflicted", "@-");
     r.ok(&["new", "base"]);
@@ -717,14 +927,23 @@ fn large_file_merge() {
     let t = std::time::Instant::now();
     r.ok(&["merge", "left"]);
     assert!(t.elapsed().as_secs() < 30);
-    assert_eq!(r.read("big"), base.replace("row 10\n", "ROW 10\n").replace("row 19990\n", "ROW 19990\n"));
+    assert_eq!(
+        r.read("big"),
+        base.replace("row 10\n", "ROW 10\n")
+            .replace("row 19990\n", "ROW 19990\n")
+    );
 }
 
 // Scenario from git t6436-merge-overwrite.sh: an untracked-but-ignored file in the way is not clobbered.
 #[test]
 fn ignored_file_in_the_way_is_not_clobbered() {
     let env = Env::new();
-    let r = fork(&env, &[("a", "a\n")], w(&[("target/out.txt", "tracked?\n"), ("l", "l\n")]), w(&[("r", "r\n")]));
+    let r = fork(
+        &env,
+        &[("a", "a\n")],
+        w(&[("target/out.txt", "tracked?\n"), ("l", "l\n")]),
+        w(&[("r", "r\n")]),
+    );
     // target/ is ignored by the default policy: left never recorded it.
     assert!(!r.paths("left").contains(&"target/out.txt".to_string()));
     r.write("target/out.txt", "my local build output\n");
@@ -736,7 +955,12 @@ fn ignored_file_in_the_way_is_not_clobbered() {
 #[test]
 fn isolated_file_survives_a_merge() {
     let env = Env::new();
-    let r = fork(&env, &[("a", "a\n")], w(&[("l", "l\n")]), w(&[("r", "r\n")]));
+    let r = fork(
+        &env,
+        &[("a", "a\n")],
+        w(&[("l", "l\n")]),
+        w(&[("r", "r\n")]),
+    );
     r.write(".env", "API_KEY=supersecret-local-value\n");
     r.ok(&["merge", "left"]);
     assert_eq!(r.read(".env"), "API_KEY=supersecret-local-value\n");

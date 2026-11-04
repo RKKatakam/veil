@@ -8,7 +8,9 @@ use crate::support::*;
 fn row_of(log: &str, change: &str) -> usize {
     let short = &change[..8];
     log.lines()
-        .position(|l| l.split_whitespace().any(|w| w == short) && (l.contains(" alice ") || l.contains("◆")))
+        .position(|l| {
+            l.split_whitespace().any(|w| w == short) && (l.contains(" alice ") || l.contains("◆"))
+        })
         .unwrap_or_else(|| panic!("{short} not in log:\n{log}"))
 }
 
@@ -37,10 +39,19 @@ fn log_of_a_fresh_repository() {
     let env = Env::new();
     let r = env.repo("p");
     let log = r.out(&["log"]);
-    let nodes: Vec<&str> = log.lines().filter(|l| l.starts_with('@') || l.starts_with('◆') || l.starts_with('○')).collect();
+    let nodes: Vec<&str> = log
+        .lines()
+        .filter(|l| l.starts_with('@') || l.starts_with('◆') || l.starts_with('○'))
+        .collect();
     assert_eq!(nodes.len(), 2, "{log}");
-    assert!(nodes[0].starts_with('@') && nodes[0].contains("default@"), "{log}");
-    assert!(nodes[1].starts_with('◆') && nodes[1].contains("zzzzzzzz"), "{log}");
+    assert!(
+        nodes[0].starts_with('@') && nodes[0].contains("default@"),
+        "{log}"
+    );
+    assert!(
+        nodes[1].starts_with('◆') && nodes[1].contains("zzzzzzzz"),
+        "{log}"
+    );
     assert!(log.trim_end().ends_with("root()"), "{log}");
 }
 
@@ -48,7 +59,12 @@ fn log_of_a_fresh_repository() {
 #[test]
 fn log_is_in_topological_order() {
     let env = Env::new();
-    let r = fork(&env, &[("k", "k\n")], |r: &R| r.write("l", "l\n"), |r: &R| r.write("r", "r\n"));
+    let r = fork(
+        &env,
+        &[("k", "k\n")],
+        |r: &R| r.write("l", "l\n"),
+        |r: &R| r.write("r", "r\n"),
+    );
     r.ok(&["merge", "left"]);
     r.commit("after", &[("z", "z\n")]);
     r.ok(&["new", "base"]);
@@ -66,7 +82,10 @@ fn log_limit_elides_the_rest() {
         r.commit(&format!("c{i}"), &[("f", &format!("{i}\n"))]);
     }
     let log = r.out(&["log", "-n", "2"]);
-    let nodes = log.lines().filter(|l| l.starts_with('@') || l.starts_with('○')).count();
+    let nodes = log
+        .lines()
+        .filter(|l| l.starts_with('@') || l.starts_with('○'))
+        .count();
     assert_eq!(nodes, 2, "{log}");
     assert!(log.contains("more snapshots elided"), "{log}");
     assert!(log.contains("c4") && !log.contains("c3"), "{log}");
@@ -103,11 +122,17 @@ fn log_names_the_parents_of_a_merge() {
         r.tag(n, "@-");
     }
     r.ok(&["new", "a"]);
-    let ids: Vec<String> = ["a", "b", "c", "d"].iter().map(|t| r.cid(t)[..8].to_string()).collect();
+    let ids: Vec<String> = ["a", "b", "c", "d"]
+        .iter()
+        .map(|t| r.cid(t)[..8].to_string())
+        .collect();
     r.ok(&["merge", "b", "c", "d", "-m", "octopus"]);
     let log = r.out(&["log"]);
     let line = log.lines().find(|l| l.contains("octopus")).unwrap();
-    assert!(line.contains(&format!("⇠ merges {}", ids.join(", "))), "{log}");
+    assert!(
+        line.contains(&format!("⇠ merges {}", ids.join(", "))),
+        "{log}"
+    );
     assert_topological(&r, &log);
 }
 
@@ -131,7 +156,11 @@ fn log_of_skewed_crossing_merges() {
     let m13 = r.sid("@");
     r.ok(&["new", &m13, &m02, "-m", "top"]);
     let out = r.run(&["log"]);
-    assert!(out.status.success() && exited_cleanly(&out), "{}", text(&out));
+    assert!(
+        out.status.success() && exited_cleanly(&out),
+        "{}",
+        text(&out)
+    );
     let log = String::from_utf8_lossy(&out.stdout).into_owned();
     assert_topological(&r, &log);
 }
@@ -184,8 +213,14 @@ fn log_hides_abandoned_and_rewritten_snapshots() {
     r.ok(&["abandon", &dropped]);
     r.ok(&["describe", "-r", "@-", "-m", "kept, reworded"]);
     let log = r.out(&["log"]);
-    assert!(!log.contains("drop me") && !log.contains(&dropped[..8]), "{log}");
-    assert!(!log.contains(&old_keep[..8]), "rewritten snapshot still listed:\n{log}");
+    assert!(
+        !log.contains("drop me") && !log.contains(&dropped[..8]),
+        "{log}"
+    );
+    assert!(
+        !log.contains(&old_keep[..8]),
+        "rewritten snapshot still listed:\n{log}"
+    );
     assert!(log.contains("kept, reworded"), "{log}");
 }
 
@@ -197,7 +232,10 @@ fn log_shows_placeholder_for_blank_descriptions() {
     r.write("f", "x\n");
     r.ok(&["describe", "-m", "   "]);
     let log = r.out(&["log"]);
-    assert!(log.lines().nth(1).unwrap().contains("(no description set)"), "{log}");
+    assert!(
+        log.lines().nth(1).unwrap().contains("(no description set)"),
+        "{log}"
+    );
 }
 
 // Scenario from git t4205-log-pretty-formats.sh (control characters): descriptions are escaped.
@@ -216,7 +254,12 @@ fn log_escapes_control_characters_in_descriptions() {
 #[test]
 fn log_marks_conflicted_snapshots() {
     let env = Env::new();
-    let r = fork(&env, &[("f", "x\n")], |r: &R| r.write("f", "l\n"), |r: &R| r.write("f", "r\n"));
+    let r = fork(
+        &env,
+        &[("f", "x\n")],
+        |r: &R| r.write("f", "l\n"),
+        |r: &R| r.write("f", "r\n"),
+    );
     r.ok(&["merge", "left", "-m", "the merge"]);
     let log = r.out(&["log"]);
     let row = log.lines().find(|l| l.contains(&r.cid("@-")[..8])).unwrap();
@@ -255,4 +298,23 @@ fn divergent_change_is_reported_when_used() {
     assert!(err.contains("divergent"), "{err}");
     let log = r.out(&["log"]);
     assert_eq!(log.matches(&change[..8]).count(), 2, "{log}");
+}
+
+// Scenario from the getting-started guide ("Conflicts"), checked against the behaviour
+// (`merge::squashing_a_resolution_clears_the_conflict`) and `vl status`'s own hint.
+#[test]
+#[ignore = "BUG-250: the guide says squashing a resolution into a merge leaves it marked (conflict); squash clears it, as `vl status` says"]
+fn guide_describes_squashing_a_resolution_correctly() {
+    let guide = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/guide/getting-started.md"
+    ))
+    .unwrap();
+    let flat = guide.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        !flat.contains(
+            "running `vl squash` gives the right content but leaves the merge marked `(conflict)`"
+        ),
+        "getting-started.md still says squash leaves the conflict mark"
+    );
 }

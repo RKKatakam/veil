@@ -38,7 +38,10 @@ fn modified_line_shows_minus_and_plus() {
     let l = body(&out);
     assert_eq!(l[0], "diff --veil a/f.txt b/f.txt", "{out}");
     assert!(l.contains(&"-two") && l.contains(&"+TWO"), "{out}");
-    assert!(l.contains(&" one") && l.contains(&" three"), "context lines: {out}");
+    assert!(
+        l.contains(&" one") && l.contains(&" three"),
+        "context lines: {out}"
+    );
     assert_eq!(l.iter().filter(|x| x.starts_with("@@")).count(), 1, "{out}");
     assert!(l.iter().any(|x| x.starts_with("@@ -1,3 +1,3 @@")), "{out}");
 }
@@ -52,13 +55,23 @@ fn added_and_deleted_files_are_labelled() {
     r.rm("gone.txt");
     r.write("new.txt", "hello\n");
     let out = r.out(&["diff"]);
-    assert!(out.contains("diff --veil a/gone.txt b/gone.txt\ndeleted file\n"), "{out}");
+    assert!(
+        out.contains("diff --veil a/gone.txt b/gone.txt\ndeleted file\n"),
+        "{out}"
+    );
     assert!(out.contains("-bye"), "{out}");
-    assert!(out.contains("diff --veil a/new.txt b/new.txt\nadded file"), "{out}");
+    assert!(
+        out.contains("diff --veil a/new.txt b/new.txt\nadded file"),
+        "{out}"
+    );
     assert!(out.contains("+hello"), "{out}");
     assert!(!out.contains("keep.txt"), "{out}");
     let stat = r.out(&["diff", "--stat"]);
-    assert_eq!(stat.lines().collect::<Vec<_>>(), vec!["D gone.txt", "A new.txt"], "{stat}");
+    assert_eq!(
+        stat.lines().collect::<Vec<_>>(),
+        vec!["D gone.txt", "A new.txt"],
+        "{stat}"
+    );
 }
 
 // Scenario from git t4013-diff-various.sh: several hunks in one file.
@@ -68,11 +81,20 @@ fn distant_edits_make_separate_hunks() {
     let r = env.repo("p");
     let base = lines("line", 40);
     r.commit("first", &[("f.txt", &base)]);
-    let edited = base.replace("line2\n", "LINE2\n").replace("line38\n", "LINE38\n");
+    let edited = base
+        .replace("line2\n", "LINE2\n")
+        .replace("line38\n", "LINE38\n");
     r.write("f.txt", &edited);
     let out = r.out(&["diff"]);
-    assert_eq!(out.lines().filter(|l| l.starts_with("@@")).count(), 2, "{out}");
-    assert!(!out.contains(" line20\n"), "far context must not be printed: {out}");
+    assert_eq!(
+        out.lines().filter(|l| l.starts_with("@@")).count(),
+        2,
+        "{out}"
+    );
+    assert!(
+        !out.contains(" line20\n"),
+        "far context must not be printed: {out}"
+    );
 }
 
 // Scenario from git t4055-diff-context.sh: nearby edits merge into one hunk.
@@ -82,9 +104,16 @@ fn nearby_edits_share_one_hunk() {
     let r = env.repo("p");
     let base = lines("l", 20);
     r.commit("first", &[("f.txt", &base)]);
-    r.write("f.txt", base.replace("l5\n", "L5\n").replace("l9\n", "L9\n"));
+    r.write(
+        "f.txt",
+        base.replace("l5\n", "L5\n").replace("l9\n", "L9\n"),
+    );
     let out = r.out(&["diff"]);
-    assert_eq!(out.lines().filter(|l| l.starts_with("@@")).count(), 1, "{out}");
+    assert_eq!(
+        out.lines().filter(|l| l.starts_with("@@")).count(),
+        1,
+        "{out}"
+    );
 }
 
 // Scenario from git t4101-apply-nonl.sh / jj test_diff_missing_newline: final line without newline.
@@ -167,7 +196,10 @@ fn stat_lists_binary_and_text_changes() {
     r.write("a.bin", [0u8, 1]);
     r.write("b.txt", "t\n");
     let stat = r.out(&["diff", "--stat"]);
-    assert!(stat.contains("A a.bin") && stat.contains("A b.txt"), "{stat}");
+    assert!(
+        stat.contains("A a.bin") && stat.contains("A b.txt"),
+        "{stat}"
+    );
 }
 
 // Scenario from git t4006-diff-mode.sh / jj test_diff_file_mode: an executable-bit change is a change.
@@ -179,7 +211,10 @@ fn mode_only_change_is_listed_by_stat() {
     r.chmod_x("run.sh", true);
     assert_eq!(r.out(&["diff", "--stat"]).trim(), "M run.sh");
     let files = r.tree_files("@");
-    assert!(files.iter().any(|f| f.0 == "run.sh" && f.3), "executable bit not recorded");
+    assert!(
+        files.iter().any(|f| f.0 == "run.sh" && f.3),
+        "executable bit not recorded"
+    );
 }
 
 // Scenario from git t4006-diff-mode.sh / jj test_diff_file_mode: the full diff names the mode change.
@@ -193,7 +228,9 @@ fn mode_only_change_is_described_in_the_diff() {
     let out = r.out(&["diff"]);
     let after_header: Vec<&str> = out.lines().skip(1).collect();
     assert!(
-        after_header.iter().any(|l| l.contains("mode") || l.contains("executable")),
+        after_header
+            .iter()
+            .any(|l| l.contains("mode") || l.contains("executable")),
         "the diff of a chmod +x says nothing beyond its header:\n{out}"
     );
 }
@@ -253,7 +290,10 @@ fn empty_files_are_added_and_removed() {
     let r = env.repo("p");
     r.write("empty", "");
     let out = r.out(&["diff"]);
-    assert!(out.contains("diff --veil a/empty b/empty\nadded file"), "{out}");
+    assert!(
+        out.contains("diff --veil a/empty b/empty\nadded file"),
+        "{out}"
+    );
     r.ok(&["commit", "-m", "e"]);
     r.rm("empty");
     assert_eq!(r.out(&["diff", "--stat"]).trim(), "D empty");
@@ -285,7 +325,10 @@ fn file_replaced_by_directory() {
     assert!(stat.contains("D thing\n"), "{stat}");
     assert!(stat.contains("A thing/inner.txt"), "{stat}");
     let out = r.out(&["diff"]);
-    assert!(out.contains("-i am a file") && out.contains("+i am inside"), "{out}");
+    assert!(
+        out.contains("-i am a file") && out.contains("+i am inside"),
+        "{out}"
+    );
 }
 
 // Scenario from git t4037-diff-r-t-dirs.sh / jj test_diff_types: a directory replaced by a file.
@@ -293,7 +336,10 @@ fn file_replaced_by_directory() {
 fn directory_replaced_by_file() {
     let env = Env::new();
     let r = env.repo("p");
-    r.commit("first", &[("thing/a.txt", "a\n"), ("thing/sub/b.txt", "b\n")]);
+    r.commit(
+        "first",
+        &[("thing/a.txt", "a\n"), ("thing/sub/b.txt", "b\n")],
+    );
     r.rm("thing");
     r.write("thing", "now a file\n");
     let stat = r.out(&["diff", "--stat"]);
@@ -308,14 +354,24 @@ fn directory_replaced_by_file() {
 fn unusual_names_appear_in_the_diff() {
     let env = Env::new();
     let r = env.repo("p");
-    let names = ["with space.txt", "-leading-dash", "ünïcödé.txt", "日本語.md", "a\"quote", "tab\there"];
+    let names = [
+        "with space.txt",
+        "-leading-dash",
+        "ünïcödé.txt",
+        "日本語.md",
+        "a\"quote",
+        "tab\there",
+    ];
     for n in names {
         r.write(n, "x\n");
     }
     let stat = r.out(&["diff", "--stat"]);
     for n in names {
         let shown = n.replace('\t', "\\t");
-        assert!(stat.contains(n) || stat.contains(&shown), "{n:?} missing from:\n{stat}");
+        assert!(
+            stat.contains(n) || stat.contains(&shown),
+            "{n:?} missing from:\n{stat}"
+        );
     }
     r.ok(&["commit", "-m", "names"]);
     assert_eq!(r.out(&["cat", "-r", "@-", "--", "-leading-dash"]), "x\n");
@@ -329,7 +385,10 @@ fn newline_in_a_file_name_is_escaped() {
     r.write("evil\n+forged", "x\n");
     let out = r.out(&["diff"]);
     assert!(!out.lines().any(|l| l == "+forged b/evil"), "{out}");
-    assert!(!out.lines().any(|l| l.starts_with("+forged")), "a file name forged a diff line:\n{out}");
+    assert!(
+        !out.lines().any(|l| l.starts_with("+forged")),
+        "a file name forged a diff line:\n{out}"
+    );
 }
 
 // Scenario from git t4013-diff-various.sh: deep paths.
@@ -337,7 +396,11 @@ fn newline_in_a_file_name_is_escaped() {
 fn deep_paths_are_diffed() {
     let env = Env::new();
     let r = env.repo("p");
-    let deep = (0..40).map(|i| format!("d{i}")).collect::<Vec<_>>().join("/") + "/leaf.txt";
+    let deep = (0..40)
+        .map(|i| format!("d{i}"))
+        .collect::<Vec<_>>()
+        .join("/")
+        + "/leaf.txt";
     r.write(&deep, "deep\n");
     let stat = r.out(&["diff", "--stat"]);
     assert!(stat.contains(&deep), "{stat}");
@@ -352,10 +415,16 @@ fn diff_from_to_and_its_reverse() {
     r.commit("two", &[("f", "2\n"), ("g", "g\n")]);
     r.commit("three", &[("f", "3\n")]);
     let fwd = r.out(&["diff", "--from", "@---", "--to", "@-"]);
-    assert!(fwd.contains("-1") && fwd.contains("+3") && fwd.contains("+g"), "{fwd}");
+    assert!(
+        fwd.contains("-1") && fwd.contains("+3") && fwd.contains("+g"),
+        "{fwd}"
+    );
     assert!(!fwd.contains("2\n"), "intermediate version shown: {fwd}");
     let back = r.out(&["diff", "--from", "@-", "--to", "@---"]);
-    assert!(back.contains("-3") && back.contains("+1") && back.contains("-g"), "{back}");
+    assert!(
+        back.contains("-3") && back.contains("+1") && back.contains("-g"),
+        "{back}"
+    );
     let stat = r.out(&["diff", "--from", "@-", "--to", "@---", "--stat"]);
     assert!(stat.contains("D g") && stat.contains("M f"), "{stat}");
 }
@@ -366,7 +435,10 @@ fn diff_of_a_snapshot_with_itself_is_empty() {
     let env = Env::new();
     let r = env.repo("p");
     r.commit("one", &[("f", "1\n")]);
-    assert_eq!(r.out(&["diff", "--from", "@-", "--to", "@-"]).trim(), "(no changes)");
+    assert_eq!(
+        r.out(&["diff", "--from", "@-", "--to", "@-"]).trim(),
+        "(no changes)"
+    );
 }
 
 // Scenario from jj test_diff_revisions: only --from given compares against @.
@@ -436,7 +508,10 @@ fn diff_of_a_conflicted_merge_and_its_resolution() {
     assert_eq!(r.out(&["diff", "-r", "@-"]).trim(), "(no changes)");
     r.write("f", "resolved\n");
     let d = r.out(&["diff"]);
-    assert!(d.contains("-<<<<<<< ours") && d.contains("+resolved"), "{d}");
+    assert!(
+        d.contains("-<<<<<<< ours") && d.contains("+resolved"),
+        "{d}"
+    );
 }
 
 // Scenario from jj test_diff_conflict_* / test_log (conflict marker): `vl show` of a conflicted snapshot says so.
@@ -454,7 +529,10 @@ fn show_of_a_conflicted_merge_names_the_conflicts() {
     r.ok(&["merge", "left"]);
     assert_eq!(r.snap("@-").conflicts, vec!["f".to_string()]);
     let show = r.out(&["show", "@-"]);
-    assert!(show.to_lowercase().contains("conflict"), "show says nothing about the conflict in f:\n{show}");
+    assert!(
+        show.to_lowercase().contains("conflict"),
+        "show says nothing about the conflict in f:\n{show}"
+    );
 }
 
 // Scenario from git t4013-diff-various.sh (show): metadata then diff.
@@ -466,11 +544,17 @@ fn show_prints_metadata_then_the_diff() {
     let out = r.out(&["show", "@-"]);
     let change = r.cid("@-");
     assert!(out.contains(&format!("Change ID : {change}")), "{out}");
-    assert!(out.contains("    Add greeting\n") && out.contains("    Longer body."), "{out}");
+    assert!(
+        out.contains("    Add greeting\n") && out.contains("    Longer body."),
+        "{out}"
+    );
     let d = out.find("diff --veil a/hello.txt").expect("diff part");
     assert!(out.find("Add greeting").unwrap() < d);
     let stat = r.out(&["show", "@-", "--stat"]);
-    assert!(stat.contains("A hello.txt") && !stat.contains("+hi"), "{stat}");
+    assert!(
+        stat.contains("A hello.txt") && !stat.contains("+hi"),
+        "{stat}"
+    );
 }
 
 // Scenario from git t4013-diff-various.sh: diff of an older change with -r.
@@ -496,7 +580,13 @@ fn large_file_with_one_edit() {
     let start = std::time::Instant::now();
     let out = r.out(&["diff"]);
     assert!(start.elapsed().as_secs() < 30);
-    assert_eq!(out.lines().filter(|l| l.starts_with('+') || l.starts_with('-')).count(), 2, "{out}");
+    assert_eq!(
+        out.lines()
+            .filter(|l| l.starts_with('+') || l.starts_with('-'))
+            .count(),
+        2,
+        "{out}"
+    );
 }
 
 // Scenario from git t4013-diff-various.sh: non-UTF-8 text is shown without crashing.
@@ -508,9 +598,17 @@ fn latin1_text_is_diffed() {
     r.ok(&["commit", "-m", "l1"]);
     r.write("l1.txt", b"caf\xe9 au lait\n");
     let out = r.run(&["diff"]);
-    assert!(out.status.success() && exited_cleanly(&out), "{}", text(&out));
+    assert!(
+        out.status.success() && exited_cleanly(&out),
+        "{}",
+        text(&out)
+    );
     assert_eq!(r.read_bytes("l1.txt"), b"caf\xe9 au lait\n");
-    assert_eq!(r.run(&["cat", "l1.txt", "-r", "@-"]).stdout, b"caf\xe9\n", "cat must return the raw bytes");
+    assert_eq!(
+        r.run(&["cat", "l1.txt", "-r", "@-"]).stdout,
+        b"caf\xe9\n",
+        "cat must return the raw bytes"
+    );
 }
 
 // Scenario from git t4016-diff-quote.sh: terminal escapes in content are neutralised.

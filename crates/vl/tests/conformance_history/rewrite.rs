@@ -22,7 +22,12 @@ fn chain(env: &Env) -> R<'_> {
 #[test]
 fn rebase_moves_a_change_and_keeps_its_change_id() {
     let env = Env::new();
-    let r = fork(&env, &[("f", "1\n2\n3\n")], |r: &R| r.write("f", "1\n2\nLEFT3\n"), |r: &R| r.write("f", "RIGHT1\n2\n3\n"));
+    let r = fork(
+        &env,
+        &[("f", "1\n2\n3\n")],
+        |r: &R| r.write("f", "1\n2\nLEFT3\n"),
+        |r: &R| r.write("f", "RIGHT1\n2\n3\n"),
+    );
     let change = r.cid("right");
     let old = r.sid("right");
     let out = r.ok(&["rebase", "-s", "right", "-d", "left"]);
@@ -67,7 +72,11 @@ fn rebase_onto_a_descendant_or_itself_is_refused() {
     let err = r.fails(&["rebase", "-s", "a", "-d", "c"]);
     assert!(err.contains("descendant"), "{err}");
     r.fails(&["rebase", "-s", "b", "-d", "b"]);
-    assert_eq!(r.op_head(), before, "a refused rebase recorded an operation");
+    assert_eq!(
+        r.op_head(),
+        before,
+        "a refused rebase recorded an operation"
+    );
 }
 
 // Scenario from git t3412-rebase-root.sh / jj test_rebase_invalid: the root cannot be moved.
@@ -106,9 +115,8 @@ fn rebase_onto_two_destinations_creates_a_merge() {
     assert_eq!(p, vec!["a", "b", "c", "side"]);
 }
 
-// Scenario from jj test_rebase_multiple_destinations (duplicate destination).
+// Scenario from jj test_rebase_multiple_destinations (duplicate destination): one parent recorded.
 #[test]
-#[ignore = "BUG-240: `vl rebase -d X -d X` records a snapshot whose parents are duplicates"]
 fn rebase_with_a_repeated_destination_records_one_parent() {
     let env = Env::new();
     let r = chain(&env);
@@ -126,7 +134,12 @@ fn rebase_with_a_repeated_destination_records_one_parent() {
 #[test]
 fn rebase_a_merge_onto_one_destination() {
     let env = Env::new();
-    let r = fork(&env, &[("k", "k\n")], |r: &R| r.write("l", "l\n"), |r: &R| r.write("r", "r\n"));
+    let r = fork(
+        &env,
+        &[("k", "k\n")],
+        |r: &R| r.write("l", "l\n"),
+        |r: &R| r.write("r", "r\n"),
+    );
     r.ok(&["merge", "left", "-m", "M"]);
     r.write("m-own", "m\n");
     r.ok(&["squash"]);
@@ -137,20 +150,31 @@ fn rebase_a_merge_onto_one_destination() {
     // The merge's own change (m-own) is kept; what came from its parents is not.
     let p = r.paths(&m);
     assert!(p.contains(&"m-own".to_string()), "{p:?}");
-    assert!(!p.contains(&"l".to_string()) && !p.contains(&"r".to_string()), "{p:?}");
+    assert!(
+        !p.contains(&"l".to_string()) && !p.contains(&"r".to_string()),
+        "{p:?}"
+    );
 }
 
 // Scenario from git t3400 / jj test_rebase (conflicts): a conflicting rebase still succeeds and is recorded.
 #[test]
 fn conflicting_rebase_records_the_conflict() {
     let env = Env::new();
-    let r = fork(&env, &[("f", "x\n")], |r: &R| r.write("f", "left\n"), |r: &R| r.write("f", "right\n"));
+    let r = fork(
+        &env,
+        &[("f", "x\n")],
+        |r: &R| r.write("f", "left\n"),
+        |r: &R| r.write("f", "right\n"),
+    );
     let out = r.ok(&["rebase", "-s", "right", "-d", "left"]);
     assert!(out.contains("conflicts in: f"), "{out}");
     let s = r.snap("right");
     assert_eq!(s.conflicts, vec!["f".to_string()]);
     let f = r.read("f");
-    assert!(f.contains("<<<<<<<") && f.contains("left") && f.contains("right"), "{f}");
+    assert!(
+        f.contains("<<<<<<<") && f.contains("left") && f.contains("right"),
+        "{f}"
+    );
     assert!(r.out(&["log"]).contains("(conflict)"));
 }
 
@@ -158,7 +182,12 @@ fn conflicting_rebase_records_the_conflict() {
 #[test]
 fn descendants_of_a_conflicted_rebase_follow() {
     let env = Env::new();
-    let r = fork(&env, &[("f", "x\n"), ("g", "g\n")], |r: &R| r.write("f", "left\n"), |r: &R| r.write("f", "right\n"));
+    let r = fork(
+        &env,
+        &[("f", "x\n"), ("g", "g\n")],
+        |r: &R| r.write("f", "left\n"),
+        |r: &R| r.write("f", "right\n"),
+    );
     r.commit("child", &[("g", "G\n")]);
     let child = r.cid("@-");
     r.ok(&["rebase", "-s", "right", "-d", "left"]);
@@ -171,15 +200,27 @@ fn descendants_of_a_conflicted_rebase_follow() {
 #[test]
 fn change_already_upstream_becomes_empty() {
     let env = Env::new();
-    let r = fork(&env, &[("f", "x\n")], |r: &R| r.write("f", "same\n"), |r: &R| r.write("f", "same\n"));
+    let r = fork(
+        &env,
+        &[("f", "x\n")],
+        |r: &R| r.write("f", "same\n"),
+        |r: &R| r.write("f", "same\n"),
+    );
     let change = r.cid("right");
     r.ok(&["rebase", "-s", "right", "-d", "left"]);
     assert_eq!(r.cid("right"), change);
     assert!(r.snap("right").conflicts.is_empty());
     let log = r.out(&["log"]);
-    let line = log.lines().find(|l| l.contains("right ") || l.contains(" right")).unwrap_or_default();
+    let line = log
+        .lines()
+        .find(|l| l.contains("right ") || l.contains(" right"))
+        .unwrap_or_default();
     assert!(line.contains("(empty)"), "{log}");
-    assert_eq!(r.snap("right").description.as_deref(), Some("right"), "description kept");
+    assert_eq!(
+        r.snap("right").description.as_deref(),
+        Some("right"),
+        "description kept"
+    );
 }
 
 // Scenario from jj test_rebase_skip_if_on_destination: rebasing onto the current parent changes nothing.
@@ -190,7 +231,11 @@ fn rebase_onto_the_current_parent_is_a_no_op() {
     let r = chain(&env);
     let before = (r.sid("b"), r.sid("c"));
     r.ok(&["rebase", "-s", "b", "-d", "a"]);
-    assert_eq!((r.sid("b"), r.sid("c")), before, "snapshots rewritten by a rebase that moved nothing");
+    assert_eq!(
+        (r.sid("b"), r.sid("c")),
+        before,
+        "snapshots rewritten by a rebase that moved nothing"
+    );
 }
 
 // Scenario from jj test_rebase_bookmark: tags on rebased changes follow them.
@@ -202,7 +247,11 @@ fn tags_follow_rebased_changes() {
     r.commit("side", &[("side", "s\n")]);
     r.tag("side", "@-");
     r.ok(&["rebase", "-s", "b", "-d", "side"]);
-    assert_eq!(r.snap("b").parents, vec![r.sid("side")], "tag b no longer points at the rebased change");
+    assert_eq!(
+        r.snap("b").parents,
+        vec![r.sid("side")],
+        "tag b no longer points at the rebased change"
+    );
     assert_eq!(r.snap("c").parents, vec![r.sid("b")]);
 }
 
@@ -226,8 +275,12 @@ fn rebase_with_unknown_revisions_fails() {
     let r = chain(&env);
     r.ok(&["status"]);
     let before = r.op_head();
-    assert!(r.fails(&["rebase", "-s", "nosuch", "-d", "a"]).contains("not found"));
-    assert!(r.fails(&["rebase", "-s", "a", "-d", "nosuch"]).contains("not found"));
+    assert!(r
+        .fails(&["rebase", "-s", "nosuch", "-d", "a"])
+        .contains("not found"));
+    assert!(r
+        .fails(&["rebase", "-s", "a", "-d", "nosuch"])
+        .contains("not found"));
     r.fails(&["rebase", "-s", "a"]);
     assert_eq!(r.op_head(), before);
 }
@@ -236,9 +289,18 @@ fn rebase_with_unknown_revisions_fails() {
 #[test]
 fn rebase_across_a_mode_change() {
     let env = Env::new();
-    let r = fork(&env, &[("run.sh", "echo 1\n")], |r: &R| r.chmod_x("run.sh", true), |r: &R| r.write("run.sh", "echo 2\n"));
+    let r = fork(
+        &env,
+        &[("run.sh", "echo 1\n")],
+        |r: &R| r.chmod_x("run.sh", true),
+        |r: &R| r.write("run.sh", "echo 2\n"),
+    );
     r.ok(&["rebase", "-s", "right", "-d", "left"]);
-    let f = r.tree_files("right").into_iter().find(|f| f.0 == "run.sh").unwrap();
+    let f = r
+        .tree_files("right")
+        .into_iter()
+        .find(|f| f.0 == "run.sh")
+        .unwrap();
     assert_eq!(f.1.as_deref(), Some(&b"echo 2\n"[..]));
     assert!(f.3, "the upstream chmod +x was lost by the rebase");
 }
@@ -257,8 +319,16 @@ fn rebase_across_a_file_directory_swap() {
         |r: &R| r.write("thing", "edited file\n"),
     );
     let out = r.run(&["rebase", "-s", "right", "-d", "left"]);
-    assert!(out.status.success() && exited_cleanly(&out), "{}", text(&out));
-    assert!(r.snap("right").conflicts.contains(&"thing".to_string()), "{}", text(&out));
+    assert!(
+        out.status.success() && exited_cleanly(&out),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        r.snap("right").conflicts.contains(&"thing".to_string()),
+        "{}",
+        text(&out)
+    );
 }
 
 // Scenario from jj test_rebase_with_child_and_descendant_bug_2600: a merge of a change and its own ancestor.
@@ -273,7 +343,11 @@ fn rebase_and_abandon_with_a_merge_of_child_and_ancestor() {
     let m = r.cid("@-");
     r.ok(&["abandon", "b"]);
     let s = r.snap(&m);
-    assert_eq!(s.parents, vec![r.sid("a")], "parents not simplified after abandoning b: {s:?}");
+    assert_eq!(
+        s.parents,
+        vec![r.sid("a")],
+        "parents not simplified after abandoning b: {s:?}"
+    );
     let mut p = r.paths(&m);
     p.retain(|x| x != ".veilpolicy");
     assert_eq!(p, vec!["a", "m"]);
@@ -297,8 +371,15 @@ fn squash_folds_the_working_copy_into_its_parent() {
     assert_ne!(r.cid("@"), wc_change, "@ is a fresh change");
     assert_eq!(r.cat("@-", "c"), "c fixed\n");
     assert_eq!(r.read("c"), "c fixed\n");
-    assert!(r.try_snap(&wc_change).is_none(), "the squashed change is still visible");
-    assert_eq!(r.snap("@-").description.as_deref(), Some("c"), "an empty description adds nothing");
+    assert!(
+        r.try_snap(&wc_change).is_none(),
+        "the squashed change is still visible"
+    );
+    assert_eq!(
+        r.snap("@-").description.as_deref(),
+        Some("c"),
+        "an empty description adds nothing"
+    );
 }
 
 // Scenario from jj test_squash_description: both descriptions are kept.
@@ -309,7 +390,10 @@ fn squash_joins_descriptions() {
     r.ok(&["describe", "-m", "fixup for c"]);
     r.write("c", "c2\n");
     r.ok(&["squash"]);
-    assert_eq!(r.snap("@-").description.as_deref(), Some("c\n\nfixup for c"));
+    assert_eq!(
+        r.snap("@-").description.as_deref(),
+        Some("c\n\nfixup for c")
+    );
 }
 
 // Scenario from jj test_squash -r / git t3415-rebase-autosquash.sh: squash a middle change; descendants keep their content.
@@ -336,7 +420,12 @@ fn squash_a_middle_change() {
 #[test]
 fn squashing_a_merge_is_refused() {
     let env = Env::new();
-    let r = fork(&env, &[("k", "k\n")], |r: &R| r.write("l", "l\n"), |r: &R| r.write("r", "r\n"));
+    let r = fork(
+        &env,
+        &[("k", "k\n")],
+        |r: &R| r.write("l", "l\n"),
+        |r: &R| r.write("r", "r\n"),
+    );
     r.ok(&["merge", "left"]);
     r.ok(&["status"]);
     let before = r.op_head();
@@ -359,7 +448,12 @@ fn squashing_into_the_root_is_refused() {
 #[test]
 fn squash_into_a_merge() {
     let env = Env::new();
-    let r = fork(&env, &[("k", "k\n")], |r: &R| r.write("l", "l\n"), |r: &R| r.write("r", "r\n"));
+    let r = fork(
+        &env,
+        &[("k", "k\n")],
+        |r: &R| r.write("l", "l\n"),
+        |r: &R| r.write("r", "r\n"),
+    );
     r.ok(&["merge", "left", "-m", "M"]);
     r.write("extra", "e\n");
     r.ok(&["squash"]);
@@ -409,7 +503,11 @@ fn abandon_a_middle_change_rebases_descendants() {
     assert_eq!(p, vec!["a", "c"], "b's file survived its abandon");
     assert!(!r.exists("b"));
     assert!(r.try_snap(&cb).is_none(), "abandoned change still resolves");
-    assert_eq!(r.tag_target("b"), Some(r.sid("a")), "tag on the abandoned change moves to its parent");
+    assert_eq!(
+        r.tag_target("b"),
+        Some(r.sid("a")),
+        "tag on the abandoned change moves to its parent"
+    );
 }
 
 // Scenario from jj test_abandon (working copy).
@@ -422,7 +520,10 @@ fn abandon_the_working_copy_starts_a_fresh_change() {
     r.ok(&["abandon"]);
     assert_ne!(r.cid("@"), wc);
     assert_eq!(r.snap("@").parents, vec![r.sid("c")]);
-    assert!(!r.exists("scratch"), "abandoned working-copy file still on disk");
+    assert!(
+        !r.exists("scratch"),
+        "abandoned working-copy file still on disk"
+    );
 }
 
 // Scenario from jj test_abandon (root).
@@ -438,7 +539,12 @@ fn abandoning_the_root_is_refused() {
 #[test]
 fn abandon_a_merge_reparents_its_child_onto_both_sides() {
     let env = Env::new();
-    let r = fork(&env, &[("k", "k\n")], |r: &R| r.write("l", "l\n"), |r: &R| r.write("r", "r\n"));
+    let r = fork(
+        &env,
+        &[("k", "k\n")],
+        |r: &R| r.write("l", "l\n"),
+        |r: &R| r.write("r", "r\n"),
+    );
     let (right, left) = (r.sid("right"), r.sid("left"));
     r.ok(&["merge", "left", "-m", "M"]);
     r.commit("child", &[("c", "c\n")]);
@@ -525,7 +631,10 @@ fn multi_line_descriptions_survive_a_rebase() {
     r.ok(&["rebase", "-s", "c", "-d", "a"]);
     assert_eq!(r.snap("c").description.as_deref(), Some(msg));
     let log = r.out(&["log"]);
-    assert!(log.contains("Subject line") && !log.contains("Body paragraph"), "{log}");
+    assert!(
+        log.contains("Subject line") && !log.contains("Body paragraph"),
+        "{log}"
+    );
 }
 
 // Scenario from jj test_edit / git t3404 (edit): editing an older change rebases its descendants automatically.
@@ -565,7 +674,11 @@ fn undo_restores(r: &R, args: &[&str], op_desc: &str) {
     assert!(log.contains(op_desc), "op log for {args:?}:\n{log}");
     let out = r.ok(&["undo"]);
     assert!(out.contains(op_desc), "{out}");
-    assert_eq!(r.state(), before, "undo of {args:?} did not restore the prior state");
+    assert_eq!(
+        r.state(),
+        before,
+        "undo of {args:?} did not restore the prior state"
+    );
     assert_ne!(r.op_head(), before_op, "undo is itself an operation");
 }
 
@@ -592,7 +705,10 @@ fn undo_restores_the_state_before_an_abandon() {
     let env = Env::new();
     let r = chain(&env);
     undo_restores(&r, &["abandon", "b"], "abandon change");
-    assert!(r.exists("b"), "the abandoned file did not come back on disk");
+    assert!(
+        r.exists("b"),
+        "the abandoned file did not come back on disk"
+    );
 }
 
 // Scenario from jj test_undo (describe).
@@ -607,9 +723,18 @@ fn undo_restores_the_state_before_a_describe() {
 #[test]
 fn undo_restores_the_state_before_a_merge() {
     let env = Env::new();
-    let r = fork(&env, &[("f", "x\n")], |r: &R| r.write("f", "left\n"), |r: &R| r.write("f", "right\n"));
+    let r = fork(
+        &env,
+        &[("f", "x\n")],
+        |r: &R| r.write("f", "left\n"),
+        |r: &R| r.write("f", "right\n"),
+    );
     undo_restores(&r, &["merge", "left"], "merge");
-    assert_eq!(r.read("f"), "right\n", "conflict markers left on disk after undo");
+    assert_eq!(
+        r.read("f"),
+        "right\n",
+        "conflict markers left on disk after undo"
+    );
 }
 
 // Scenario from jj test_op_restore: restoring an older operation after several rewrites.
@@ -642,7 +767,11 @@ fn repeated_undo_walks_back_through_rewrites() {
     r.ok(&["undo"]);
     assert_eq!(r.state(), s1);
     r.ok(&["undo"]);
-    assert_eq!(r.snap("a").description.as_deref(), Some("a"), "the second undo re-applied `two`");
+    assert_eq!(
+        r.snap("a").description.as_deref(),
+        Some("a"),
+        "the second undo re-applied `two`"
+    );
     assert_eq!(r.state(), s0);
 }
 
@@ -689,8 +818,17 @@ fn each_rewrite_records_one_named_operation() {
         let before = r.core().op_log(1000).unwrap().len();
         r.ok(&args);
         let ops = r.core().op_log(1000).unwrap();
-        assert_eq!(ops.len(), before + 1, "{args:?} recorded {} operations", ops.len() - before);
-        assert!(ops[0].1.description.contains(desc), "{args:?}: {}", ops[0].1.description);
+        assert_eq!(
+            ops.len(),
+            before + 1,
+            "{args:?} recorded {} operations",
+            ops.len() - before
+        );
+        assert!(
+            ops[0].1.description.contains(desc),
+            "{args:?}: {}",
+            ops[0].1.description
+        );
     }
 }
 
@@ -731,4 +869,122 @@ fn evolog_of_the_root() {
     let r = env.repo("p");
     let out = r.out(&["evolog", "-r", "root"]);
     assert_eq!(out.lines().count(), 1, "{out}");
+}
+
+// Scenario from jj test_abandon / test_rebase (workspaces): another workspace's working copy follows rewrites.
+#[test]
+fn another_workspaces_working_copy_follows_a_rebase() {
+    let env = Env::new();
+    let r = chain(&env);
+    r.ok(&["ws", "new", "agent", "-r", "b"]);
+    let agent = r.cid("agent@");
+    r.ok(&["rebase", "-s", "b", "-d", "root"]);
+    assert_eq!(r.cid("agent@"), agent);
+    assert_eq!(r.snap("agent@").parents, vec![r.sid("b")]);
+    r.ok(&["abandon", "b"]);
+    let s = r.snap("agent@");
+    assert_eq!(
+        s.parent_changes,
+        vec!["z".repeat(32)],
+        "agent@ not moved onto b's parent"
+    );
+}
+
+// Scenario from jj test_abandon (workspace working copy): abandoning another workspace's working copy gives it a new one.
+#[test]
+fn abandoning_another_workspaces_working_copy() {
+    let env = Env::new();
+    let r = chain(&env);
+    r.ok(&["ws", "new", "agent", "-r", "c"]);
+    let old = r.cid("agent@");
+    r.ok(&["abandon", "agent@"]);
+    let s = r.snap("agent@");
+    assert_ne!(s.change, old);
+    assert_eq!(s.parents, vec![r.sid("c")]);
+}
+
+// Scenario from git t3425-rebase-topology-merges.sh / jj test_rebase_with_descendants: a merge among the
+// descendants is carried along, and still holds what its untouched other parent holds.
+#[test]
+#[ignore = "BUG-251: auto-rebasing a merge when one parent moves drops files the other parent still has (a merge's tree is rebased one parent at a time)"]
+fn rebase_carries_a_descendant_merge() {
+    let env = Env::new();
+    let r = chain(&env);
+    r.ok(&["new", "a"]);
+    r.commit("side", &[("side", "s\n")]);
+    r.tag("side", "@-");
+    r.ok(&["new", "c", "side", "-m", "merge c+side"]);
+    r.write("m", "m\n");
+    r.ok(&["new"]);
+    let m = r.cid("@-");
+    r.ok(&["new", "root"]);
+    r.commit("new base", &[("nb", "nb\n")]);
+    r.tag("nb", "@-");
+    r.ok(&["rebase", "-s", "b", "-d", "nb"]);
+    let s = r.snap(&m);
+    assert_eq!(s.parents, vec![r.sid("c"), r.sid("side")]);
+    let p = r.paths(&m);
+    for f in ["nb", "b", "c", "side", "m", "a"] {
+        assert!(
+            p.contains(&f.to_string()),
+            "{f} missing from the carried merge: {p:?}"
+        );
+    }
+}
+
+// Same topology, files the moved line never touched: the carried merge keeps them.
+#[test]
+fn rebase_carries_a_descendant_merge_with_disjoint_files() {
+    let env = Env::new();
+    let r = chain(&env);
+    r.ok(&["new", "a"]);
+    r.commit("side", &[("side", "s\n")]);
+    r.tag("side", "@-");
+    r.ok(&["new", "c", "side", "-m", "merge c+side"]);
+    r.write("m", "m\n");
+    r.ok(&["new"]);
+    let m = r.cid("@-");
+    r.ok(&["new", "a"]);
+    r.commit("new base", &[("nb", "nb\n")]);
+    r.tag("nb", "@-");
+    r.ok(&["rebase", "-s", "b", "-d", "nb"]);
+    let s = r.snap(&m);
+    assert_eq!(s.parents, vec![r.sid("c"), r.sid("side")]);
+    let p = r.paths(&m);
+    for f in ["nb", "b", "c", "side", "m", "a"] {
+        assert!(
+            p.contains(&f.to_string()),
+            "{f} missing from the carried merge: {p:?}"
+        );
+    }
+}
+
+// Scenario from jj test_evolog (abandoned): an abandoned change has no visible evolution.
+#[test]
+fn evolog_of_an_abandoned_change_fails() {
+    let env = Env::new();
+    let r = chain(&env);
+    let b = r.cid("b");
+    r.ok(&["abandon", "b"]);
+    r.fails(&["evolog", "-r", &b[..12]]);
+}
+
+// Scenario from git t3400 (rebase onto a conflicted base): conflicts propagate to the rebased change.
+#[test]
+fn rebase_onto_a_conflicted_change() {
+    let env = Env::new();
+    let r = fork(
+        &env,
+        &[("f", "x\n"), ("g", "g\n")],
+        |r: &R| r.write("f", "left\n"),
+        |r: &R| r.write("f", "right\n"),
+    );
+    r.ok(&["merge", "left", "-m", "conflicted"]);
+    let m = r.cid("@-");
+    r.ok(&["new", "base"]);
+    r.commit("g edit", &[("g", "G\n")]);
+    let g = r.cid("@-");
+    r.ok(&["rebase", "-s", &g, "-d", &m]);
+    assert!(r.cat(&g, "f").contains("<<<<<<<"));
+    assert_eq!(r.cat(&g, "g"), "G\n");
 }
