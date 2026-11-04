@@ -263,7 +263,7 @@ encoding (binary and UTF-16 files included). It looks for:
 | `google-api-key` | `AIza…` |
 | `jwt` | JSON Web Tokens |
 | `url-password` | `postgres://app:<password>@db` |
-| `generic-secret-assignment` | `password = …`, `API_KEY=…`, `JWT_SECRET: …`, `client_secret`, `APP_KEY`, `RAILS_MASTER_KEY`, `<password>…</password>` and similar, with a credential-looking value; also `define('DB_PASSWORD', '…')`, `env["API_KEY"] = …`, Kubernetes `name:`/`value:` pairs, `<add key="DbPassword" value="…"/>`, plist entries, SQL `WITH PASSWORD '…'` / `IDENTIFIED BY '…'`, Google app passwords |
+| `generic-secret-assignment` | `password = …`, `API_KEY=…`, `JWT_SECRET: …`, `client_secret`, `APP_KEY`, `RAILS_MASTER_KEY`, `<password>…</password>` and similar, with a credential-looking value; camelCase and PascalCase keys in JSON, YAML and JS/TS objects and properties (`githubToken: …`, `"stripeSecret": …`, `this.accessKey = …`, `apiKeyProd`, `apiKey: string = "…"`, `` const authToken = `…` ``); `*_KEY` names (`STRIPE_API_KEY`, `MINIO_ACCESS_KEY`, `SIDEKIQ_LICENSE_KEY`, and any `<WORD>_KEY` or `<word>Key` whose value is a random 16+ characters, such as `MAPBOX_KEY`, `stripeKey`); `DB_PWD`, `Pwd=` in connection strings; XML attributes on any element (`password="…"`, `secret="…"`, `apiKey="…"`, `connectionString="…;Password=…"`), `<add key="DbPassword" value="…"/>`, `<entry key="db.password">…</entry>`, Spring and .NET `<value>` elements; also `define('DB_PASSWORD', '…')`, `env["API_KEY"] = …`, Rust/Python typed constants (`API_KEY: &str = "…"`), Kubernetes `name:`/`value:` pairs, Dockerfile `ENV`, plist entries, SQL `WITH PASSWORD '…'` / `IDENTIFIED BY '…'`, Google app passwords |
 | `scan-limit` | input crafted against the scanner (it would take far longer than ordinary text): reported rather than scanned to the end |
 | `injected-isolated-secret` | the value of an isolated file copied into a `ws exec` sandbox (see [Workspaces](workspaces-and-agents.md#with-isolated)) |
 
@@ -271,20 +271,26 @@ The assignment rule tries hard not to fire on code: references (`$X`,
 `${X}`), placeholders (`<key>`), words (`settings.SECRET_KEY`), code
 (`os.getenv("PW")`), hashes and encrypted values (`$2b$…`, `ENC(…)`,
 `{cipher}…`) and non-credentials (`password_hash`, `token_url`,
-`csrf_token`) don't count. A random password is found whatever symbols it
-has, including `$`, `%`, quotes and brackets.
+`csrf_token`, `nextPageToken`, `tokenizer`, `passwordField`, `PRIMARY_KEY`,
+`cacheKey`, `PUBLIC_KEY`, `KEY_PREFIX`) don't count. The camelCase and
+`<WORD>_KEY` rules ask more of a value: a quoted literal or one token on its
+key's line, not code, not made of words (`BCryptGenerateKeyFn`), not a
+UUID. A random password is found whatever symbols it has, including `$`,
+`%`, quotes and brackets.
 
 **Known misses** (see [`docs/BACKLOG.md`](../BACKLOG.md)): word-only
-passphrases and passwords with spaces, weak passwords, camelCase generic
-tokens (`githubToken: …`), URL passwords that are words or numbers, keys
-not on the keyword list (`*_KEY` names beyond the common ones,
-`credentials`), credentials in other XML attributes than `value`,
-values whose key is on another line (except Kubernetes `value:`),
-values longer than 256 characters are judged on their first 256, and
-compressed archives (`.zip`, `.tar.gz`, `.docx`, `.jar`), which are not
-decompressed. About 1 random 16-character password in 3,000–5,000 is
-still taken for a word, hash or code. The scanner is a safety net, not a
-guarantee: keep real secrets in isolated files or the vault.
+passphrases and passwords with spaces, weak passwords, URL passwords that
+are words or numbers, keys not on the keyword list (`credentials`,
+`pass`), values whose key is on another line (except Kubernetes `value:` and XML
+elements), unquoted values in code under camelCase keys, values more than
+16 KiB of blanks after their key, values longer than 256 characters are
+judged on their first 256, and compressed archives (`.zip`, `.tar.gz`,
+`.docx`, `.jar`), which are not decompressed. About 1 random 16-character
+password in 3,000–5,000 is still taken for a word, hash or code; under a
+camelCase or `<WORD>_KEY` key, about 1 in 300–1,000 at 16 characters (1 in
+1,000 at 20; 1 in 100 if only upper-case letters and digits). The scanner is
+a safety net, not a guarantee: keep real secrets in isolated files or the
+vault.
 
 Cloaked files are not scanned (they are encrypted anyway), and `public!`
 paths are deliberately not scanned.

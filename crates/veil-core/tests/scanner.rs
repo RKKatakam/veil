@@ -667,6 +667,9 @@ fn scanning_time_is_linear_on_crafted_input() {
         "<password>", "<password a=\"b\">", "'password', '", "- name: password\n  value: ", "with password '", "password_x_x_x_x_x_x_x=",
         "xapp_key=", "a", "password", " ", "\\", "\"", "${{", "%(", "password: x\n", "password=a(b)\n", "xtoken=Xk9mQ2vL7pR4wZt8,",
         "<key>password</key><string>", "identified by '", "password=:", "password: [", "password: abcd ",
+        // scanner v6
+        "xKey=", "aKey=\"", "a_key=", "githubToken=", "githubToken: '", "KeY3=", "pwd=", "a=`", "apiKey: string = \"",
+        "<entry key=\"password\">", "<a key=\"password\" b=\"c\">", "tokenizer=", "passwordX=", "\nkey=", "\na_key=x",
     ];
     let time = |data: &[u8]| {
         let t = Instant::now();
@@ -684,6 +687,270 @@ fn scanning_time_is_linear_on_crafted_input() {
         }
     }
     assert!(report.is_empty(), "superlinear:\n{}", report.join("\n"));
+}
+
+// ---- scanner v6: camelCase keys, more `*_KEY` names, XML attributes ------------------
+
+const V6_VALUE: &str = "Xk9mQ2vL7pR4wZt8uY3n";
+
+/// `key` = `v` in every format the v6 key rules cover: JSON, YAML, JS and
+/// TS objects and properties, a typed TS property, a template literal,
+/// `.properties`, an XML attribute.
+fn v6_formats(key: &str, v: &str) -> Vec<String> {
+    vec![
+        format!("{{\"{key}\": \"{v}\"}}\n"),
+        format!("{{\n  \"name\": \"app\",\n  \"{key}\": \"{v}\",\n  \"debug\": false\n}}\n"),
+        format!("{key}: {v}\n"),
+        format!("services:\n  github:\n    {key}: '{v}'\n"),
+        format!("const config = {{ {key}: \"{v}\", debug: false }};\n"),
+        format!("module.exports = {{\n  {key}: '{v}',\n}};\n"),
+        format!("this.{key} = \"{v}\";\n"),
+        format!("config.{key} = '{v}';\n"),
+        format!("  private readonly {key}: string = \"{v}\";\n"),
+        format!("export const {key} = `{v}`;\n"),
+        format!("app.{key}={v}\n"),
+        format!("<config {key}=\"{v}\" />\n"),
+    ]
+}
+
+/// Generic token keys in camelCase and PascalCase (`githubToken: …`), in
+/// every format (scanner v6).
+#[test]
+fn camel_case_keys_are_found_in_every_format() {
+    let keys = [
+        "githubToken", "GithubToken", "apiKey", "ApiKey", "stripeSecret", "authToken", "accessKey", "clientSecret", "slackBotToken",
+        "npmAuthToken", "sessionSecret", "refreshToken", "stripeSecretKey", "licenseKey", "signingKey", "masterKey", "apiKeyProd",
+        "dbPasswordProd", "githubTokenV2", "openAIKey", "APIToken", "dbPwd",
+    ];
+    let mut missed = Vec::new();
+    for key in keys {
+        for c in v6_formats(key, V6_VALUE) {
+            if scan(c.as_bytes()).is_empty() {
+                missed.push(c);
+            }
+        }
+    }
+    assert!(missed.is_empty(), "missed:\n{}", missed.join(""));
+}
+
+/// `*_KEY` names beyond the common ones, and any `<WORD>_KEY` with a random
+/// value, in dotenv, shell, YAML, JSON, Python and Kubernetes form.
+#[test]
+fn more_key_names_are_found() {
+    let keys = [
+        "STRIPE_API_KEY", "AWS_SECRET_KEY", "JWT_PRIVATE_KEY", "MINIO_ACCESS_KEY", "COSIGN_SIGNING_KEY", "VAULT_MASTER_KEY",
+        "DB_ENCRYPTION_KEY", "SIDEKIQ_LICENSE_KEY", "MAPBOX_KEY", "SENDGRID_KEY", "OPENAI_KEY", "ALGOLIA_ADMIN_KEY", "SEGMENT_WRITE_KEY",
+        "TWILIO_KEY", "SESSION_KEY", "WEBHOOK_KEY",
+    ];
+    let mut missed = Vec::new();
+    for key in keys {
+        let v = V6_VALUE;
+        for c in [
+            format!("{key}={v}\n"),
+            format!("export {key}=\"{v}\"\n"),
+            format!("{key}: {v}\n"),
+            format!("{{\"{key}\": \"{v}\"}}\n"),
+            format!("{key} = \"{v}\"\n"),
+            format!("os.environ[\"{key}\"] = \"{v}\"\n"),
+            format!("environment:\n  - {key}={v}\n"),
+            format!("env:\n  - name: {key}\n    value: \"{v}\"\n"),
+            format!("ENV {key}={v}\n"),
+        ] {
+            if scan(c.as_bytes()).is_empty() {
+                missed.push(c);
+            }
+        }
+    }
+    assert!(missed.is_empty(), "missed:\n{}", missed.join(""));
+}
+
+/// XML attributes other than `value` on any element, connection strings,
+/// and elements whose key is an attribute (Java's `<entry key=…>`, Spring,
+/// .NET settings).
+#[test]
+fn xml_attributes_and_connection_strings_are_found() {
+    let v = "Xk9mQ2vL7pR4wZt8";
+    let cases = [
+        format!("<user name=\"admin\" password=\"{v}\"/>\n"),
+        format!("<datasource url=\"jdbc:postgresql://db/app\" password='{v}' />\n"),
+        format!("<credentials secret=\"{v}uY3n\"/>\n"),
+        format!("<auth token=\"{v}uY3n\"></auth>\n"),
+        format!("<service apiKey=\"{v}uY3n\" />\n"),
+        format!("<Credential Password=\"{v}\" />\n"),
+        format!("<smtp\n    host=\"mail.example.com\"\n    password=\"{v}\"/>\n"),
+        format!("<add name=\"Default\" connectionString=\"Server=db;Database=app;User Id=sa;Password={v};\" providerName=\"System.Data.SqlClient\"/>\n"),
+        format!("<add name=\"Default\" connectionString=\"Data Source=db;Initial Catalog=app;User ID=sa;Pwd={v}\" />\n"),
+        format!("<entry key=\"db.password\">{v}</entry>\n"),
+        format!("<entry key=\"apiToken\">{v}uY3n</entry>\n"),
+        format!("<property name=\"password\"><value>{v}</value></property>\n"),
+        format!("<setting name=\"ApiKey\" serializeAs=\"String\">\n  <value>{v}uY3n</value>\n</setting>\n"),
+        format!("<add key=\"StripeSecretKey\" value=\"{v}uY3n\"/>\n"),
+    ];
+    let missed: Vec<&String> = cases.iter().filter(|c| scan(c.as_bytes()).is_empty()).collect();
+    assert!(missed.is_empty(), "missed: {missed:#?}");
+}
+
+/// Declarations with a string type (Rust, TypeScript, Python, Kotlin).
+#[test]
+fn typed_declarations_are_found() {
+    let v = V6_VALUE;
+    let cases = [
+        format!("const API_KEY: &str = \"{v}\";\n"),
+        format!("pub const API_KEY: &'static str = \"{v}\";\n"),
+        format!("    api_key: str = \"{v}\"\n"),
+        format!("    api_key: SecretStr = \"{v}\"\n"),
+        format!("  apiKey: string = '{v}';\n"),
+        format!("val githubToken: String = \"{v}\"\n"),
+        format!("let apiKey: String = \"{v}\"\n"),
+    ];
+    let missed: Vec<&String> = cases.iter().filter(|c| scan(c.as_bytes()).is_empty()).collect();
+    assert!(missed.is_empty(), "missed: {missed:#?}");
+}
+
+/// Look-alikes of the v6 rules (`RULES_VERSION` 6): identifiers that only
+/// contain a keyword, camelCase names of things other than credentials,
+/// Hungarian notation, type annotations, schemas, keys that are not
+/// secrets, base64 that looks like camelCase, HTML's `accesskey`.
+const LOOKALIKES_V6: &[&str] = &[
+    // camelCase
+    "const tokenizer = new Tokenizer(options);",
+    "tokenizer: \"Xk9mQ2vL7pR4wZt8uY3n\"",
+    "passwordless = \"Xk9mQ2vL7pR4wZt8uY3n\"",
+    "const passwordField = \"Xk9mQ2vL7pR4wZt8uY3n\";",
+    "keyboard: \"Xk9mQ2vL7pR4wZt8uY3n\"",
+    "monkey = \"Xk9mQ2vL7pR4wZt8uY3n\"",
+    "hotkey: \"ctrl+shift+k\"",
+    "csrfToken: \"a8f5f167f44f4964e6c998dee827110c\"",
+    "XSRFToken = \"a8f5f167f44f4964e6c998dee827110c\"",
+    "cancellationToken = CancellationToken.None;",
+    "tokenType: \"Bearer\"",
+    "passwordHash: \"$2b$12$KIXQJbXk9mQ2vL7pR4wZt8eOuLmNp3qRsTuVwXyZaBcDeFgHiJkL\"",
+    "tokenUrl: \"https://auth.example.com/oauth/token\"",
+    "passwordMinLength: 12",
+    "maxTokens: 4096",
+    "isSecret: true",
+    "secretName: \"prod-db-credentials\"",
+    "authTokenHeader: \"X-Auth-Token-Primary\"",
+    "lastSignificantToken = \"?InterpolationInTemplate\";",
+    "const looseLowPriorityKey = \"@babel/plugin-class-features/looseLowPriorityKey\";",
+    "var keysFunc=isFull?isFlat?getAllKeysIn:getAllKeys:isFlat?keysIn:keys;",
+    "\"TokenValue\":{\"type\":\"long\"},",
+    "\"EncryptionKey\":{\"shape\":\"EncryptionKey\"},",
+    "\"PasswordLastUsed\": \"2016-09-08T21:47:36Z\",",
+    "\"ClientToken\": \"abcd12f2-46da-4fdb-b8d5-fbd4c466928f\",",
+    "\"SecretString\": \"{\\\"username\\\":\\\"david\\\",\\\"password\\\":\\\"EXAMPLE-PASSWORD\\\"}\"",
+    // Hungarian notation and code on a line of its own
+    "  nToken = pOp->p4.nToken;",
+    "  pKeyInfo = pOp->p4.pKeyInfo;",
+    "  iKey = sqlite3VdbeIntValue(pIn1);",
+    "    primary_result_key = self.result_keys[0]",
+    "    data__readme_keys = set(data__readme.keys())",
+    "    self._invoking_user_pwd = pwd.getpwuid(os.getuid())",
+    "    redacted_key_value = f\"{key}=REDACTED\"",
+    // type annotations
+    "    pub GenerateKey: BCryptGenerateSymmetricKeyFn,",
+    "    pub PresentHistoryToken: D3DKMT_PRESENTHISTORYTOKEN,",
+    "    pub CompleteAuthToken: SpCompleteAuthTokenFn,",
+    "  apiKey: string;",
+    "  apiKey?: string,",
+    "const API_KEY: &str = env!(\"API_KEY\");",
+    "    api_key: Optional[str] = None",
+    "export const githubToken = `${process.env.GITHUB_TOKEN}`;",
+    // `pwd`
+    "OLDPWD=/home/user/src",
+    "PWD=/home/user/src/app",
+    "PWD: &#39;/Users/maciej&#39;,",
+    // base64 that looks like a camelCase key
+    "  integrity sha1-UcM5S2Lmjke+eUE6xXD5KeY3ImI=\n\n\"@babel/core@^7.21.0\":",
+    "  integrity sha1-UcM5S2LmjkeAbcKey3=\n\n\"@babel/core@^7.21.0\":",
+    // keys that are not secrets
+    "PRIMARY_KEY = \"user_id\"",
+    "SORT_KEY: created_at",
+    "FOREIGN_KEY_CHECKS=0",
+    "KEY_PREFIX = \"myapp:sessions:\"",
+    "REDIS_KEY_PREFIX=app_cache_v2_",
+    "partitionKey: \"/tenantId\"",
+    "primaryKey: true",
+    "sortKey: \"createdAt#2024\"",
+    "hashKey: 'pk'",
+    "publicKey: \"BEl62iUYgUivxIkv69yViEuiBIa-Ib9-SkvMeAtA3LFgDzkrxZJjSgSnfckjBJuBkr3qBUYIHBQFLXYp5Nksh8U\"",
+    "VAPID_PUBLIC_KEY=BEl62iUYgUivxIkv69yViEuiBIa-Ib9-SkvMeAtA3LFgDzkrxZJjSgSnfckjBJuBkr3qBUYIHBQFLXYp5Nksh8U",
+    "STRIPE_PUBLISHABLE_KEY=pk_live_51H8xXk9mQ2vL7pR4wZt8uY3n",
+    "RECAPTCHA_SITE_KEY=6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI",
+    "GPG_KEY=0D96DF4D4110E5C43FBFB17F2D347EA6AA65421D",
+    "idempotencyKey: \"123e4567-e89b-12d3-a456-426614174000\"",
+    "ROW_KEY = \"123e4567-e89b-12d3-a456-426614174000\"",
+    "objectKey: \"uploads/2024/01/avatar.png\"",
+    "routing_key = \"events.user.created\"",
+    "translationKey: 'settings.password.title'",
+    "storageKey: \"app.preferences.v2\"",
+    "S3_KEY=my-app/22a0-stage-150819_185942.war",
+    "MAPBOX_KEY=changeme-in-production",
+    "STRIPE_KEY=sk_test_xxxxxxxxxxxxxxxxxxxxxxxx",
+    "DEPLOY_KEY_PATH=/etc/keys/deploy",
+    "ssh_key_fingerprint: \"SHA256:nThbg6kXUpJWGl7E1IGOCspRomTxdCARLviKw6E5SY8\"",
+    "LICENSE_KEY_URL=https://example.com/license",
+    "SIGNING_KEY_ID=7F2D347EA6AA65421D",
+    "\"result_key\": \"Ipv6CidrAssociations\"",
+    "_key = \"Xk9mQ2vL7pR4wZt8uY3n\"",
+    "<li><a href=\"genindex.html\" accesskey=\"I\">index</a></li>",
+    // XML
+    "<entry key=\"password.min.length\">12</entry>",
+    "<entry key=\"db.password\">${DB_PASSWORD}</entry>",
+    "<label for=\"password\">Password</label>",
+    "<div class=\"token\">Xk9mQ2vL7pR4wZt8uY3n</div>",
+    "<property name=\"passwordEncoder\" ref=\"bcrypt\"/>",
+    "<add key=\"ApiKeyHeader\" value=\"X-Api-Key-Primary-2024\"/>",
+    "<add name=\"Default\" connectionString=\"Server=db;Database=app;Integrated Security=true\"/>",
+    "<user name=\"admin\" password=\"${ADMIN_PASSWORD}\"/>",
+];
+
+#[test]
+fn credential_lookalikes_of_v6_rules_are_not_flagged() {
+    for l in LOOKALIKES_V6 {
+        assert_clean(l, l.as_bytes());
+    }
+    assert_clean("all v6 look-alikes", LOOKALIKES_V6.join("\n").as_bytes());
+}
+
+/// A window of the chunked passes that starts inside a line does not make
+/// the rest of that line a configuration line: every chunk boundary of a
+/// file of code lines is tried.
+#[test]
+fn a_chunk_boundary_inside_a_code_line_is_not_a_configuration_line() {
+    let line = "    client = Client(api_key=api_key, password=password, auth_token=access_token)\n";
+    for shift in 0..line.len() {
+        let mut data = " ".repeat(shift);
+        while data.len() < (256 << 10) + 4 * line.len() {
+            data.push_str(line);
+        }
+        assert_clean(&format!("shift {shift}"), data.as_bytes());
+    }
+}
+
+/// The v6 rules hold in UTF-16 and in binary data (a `.tar` of a dotenv
+/// file), and where the pre-filter limits the search: the only keyword at
+/// the very start or end of a large file, a Kubernetes `value:` after the
+/// last keyword line.
+#[test]
+fn v6_rules_hold_in_every_encoding_and_place() {
+    let v = V6_VALUE;
+    let utf16: Vec<u8> = format!("{{\r\n  \"githubToken\": \"{v}\"\r\n}}\r\n").encode_utf16().flat_map(u16::to_le_bytes).collect();
+    assert!(!scan(&utf16).is_empty(), "utf-16");
+    let mut tar = b"deploy/.env\0".to_vec();
+    tar.resize(512, 0);
+    tar.extend_from_slice(format!("MAPBOX_KEY={v}\nspring.datasource.password=Xk9(mQ2)vL7[pR4]wZt8\n").as_bytes());
+    tar.resize(2048, 0);
+    let f = scan(&tar);
+    assert_eq!(f.len(), 2, "tar: {f:?}");
+    let filler = "let a = b + c; // ordinary code without credentials\n".repeat((1 << 20) / 50);
+    for (name, data) in [
+        ("first line", format!("apiKeyProd: \"{v}\"\n{filler}")),
+        ("last line", format!("{filler}MAPBOX_KEY={v}")),
+        ("k8s after the last keyword", format!("{filler}env:\n  - name: DB_PASSWORD\n    value: \"{v}\"\n{filler}")),
+    ] {
+        assert!(!scan(data.as_bytes()).is_empty(), "{name}");
+    }
 }
 
 // ---- throughput ------------------------------------------------------------------------
@@ -768,3 +1035,4 @@ fn scanner_real_world() {
     let secs = t.elapsed().as_secs_f64() / 3.0;
     println!("{} files, {:.1} MiB, {:.1} ms, {:.1} MiB/s", files.len(), total as f64 / 1048576.0, secs * 1e3, total as f64 / 1048576.0 / secs);
 }
+

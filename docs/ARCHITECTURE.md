@@ -597,18 +597,34 @@ CAS, and it applies these rules in order:
      (`settings.SECRET_KEY`; long words are judged by letter-pair
      frequencies, so `qzvxkwprmtfhjlnb` is no word) do not count, and the
      entropy bar is lower for short, hex and lower-case values. The rest of
-     a line counts only where the key starts a configuration line. A PEM
+     a line counts only where the key starts a configuration line (after a
+     newline or NUL, indentation, `export`/`set`/`ENV`/`ARG`, `- `, a
+     quote); each chunk's window starts at a line start, so a chunk
+     boundary inside a code line does not make one. A PEM
      header inside binary data needs key material after it (after a real
      or an escaped `\n`, as in a service-account JSON key inside a `.tar`).
      Uncompressed archives (`.tar`, stored `.zip` entries) are scanned as
      their bytes are; compressed ones (`.tar.gz`, deflated `.zip`, `.docx`,
      `.jar`) are not decompressed.
+   * Pre-filter (scanner v6): an Aho-Corasick pass over the lowercased chunk
+     finds the eight keyword words (`password`, `passwd`, `secret`,
+     `token`, `key`, `salt`, `pwd`, `identified`). A chunk without one is
+     not searched by the assignment rule, and the search is limited to
+     from the first to 16 KiB past the line of the last. On each line with
+     a keyword, the `:`/`=` that ends a configuration key is replaced by a
+     stand-in (`C`/`E`, upper-case letters never occur in the lowercased
+     copy), and the rest-of-line value only matches after one: code lines
+     like `let secret = config.secret_key.clone();` are no longer
+     candidates. A keyword its left context rules out (`mytoken`,
+     `monkey`) is dropped before capture groups are computed, with their
+     work still counted.
    * Time is linear in the input: repetitions that could hold another match
      are bounded, so a search reads at most about 1 KiB past its match, and
      the work redone after restarting inside a rejected match is counted;
      past 16 times the input the file is reported (`scan-limit`) and
-     quarantined. Crafted input scans at 24+ MiB/s, ordinary text at
-     300–450 MiB/s (dense synthetic corpus) or ~1.5 GiB/s (real source).
+     quarantined. Crafted input scans at 25+ MiB/s, ordinary text at
+     590–860 MiB/s (dense synthetic corpus) or 2.2–2.5 GiB/s (real
+     source; 1.9 GiB/s JavaScript): 1.4–2.4× the previous scanner (v5).
    * Keys: the credential keywords match anywhere in an identifier
      (`DB_PASSWORD`, `spring.datasource.password`), plural or numbered
      (`API_KEYS`, `PASSWORD2`), plus up to six suffix words
@@ -617,12 +633,28 @@ CAS, and it applies these rules in order:
      `token_url`, `secret_name`, `…_file`, `…_path`). The generic `secret`
      and `token` only count as a word of their own (`JWT_SECRET`, not
      `mytoken`), and `token` not after a word that names a non-credential
-     (`csrf_token`, `next_page_token`, `cancellation_token`). `key` alone
-     is no keyword; a short list of `*_KEY` / `*_SALT` names is (`APP_KEY`,
-     `RAILS_MASTER_KEY`, `ENCRYPTION_KEY`, `SIGNING_KEY`, `AccountKey`,
-     WordPress's `AUTH_KEY` … `NONCE_SALT`), as a word or camelCase hump. camelCase
-     generic tokens (`githubToken`) are not matched; `authToken`,
-     `accessToken`, `apiKey`, `clientSecret` are. A URL password must not
+     (`csrf_token`, `next_page_token`, `cancellation_token`). Keys are
+     split into words at `_`, `-` and camelCase humps (scanner v6): `secret`,
+     `token` and `pwd` also count at a hump (`githubToken`, `stripeSecret`,
+     `dbPwd`, not after a one-letter Hungarian prefix: `nToken`), and so
+     do suffix words (`apiKeyProd`; not `tokenizer`, `passwordless`), with
+     the same exclusions (`tokenUrl`, `passwordHash`). `key` and `salt` need
+     a word before them: a secret's (`APP_KEY`, `RAILS_MASTER_KEY`,
+     `accessKey`, `LICENSE_KEY`, WordPress's `AUTH_KEY` … `NONCE_SALT`), or
+     any word but a non-secret's (`primary`, `cache`, `public`, `sort`,
+     `partition`, …), and then the value must be 16+ random characters (32
+     hex) and not a UUID. The pre-v6 compound keywords (`api_?key`,
+     `secret_?access_?key`, `client_?secret`, `access_?token`, …) still
+     count anywhere in an identifier. Keys found by a v6 rule (at a hump,
+     with camelCase suffix words, `pwd`, the newer `*_KEY` names, any
+     `<WORD>_KEY`) need a value that is clearly a literal: quoted or one
+     token on the key's line, not an unquoted name in code (`Key:
+     TypeName,`, except after `;` in a connection string), not made of
+     words (two thirds of its letters in words of 3+ letters), not a UUID.
+     Typed declarations (`API_KEY: &str = "…"`, `apiKey: string = "…"`,
+     `api_key: str = "…"`), template literals, XML attributes on any
+     element, `<entry key="…">` / `<property name="…"><value>` elements and
+     Dockerfile `ENV`/`ARG` lines count. A URL password must not
      be a word, a number or a reference (`user:password@`,
      `postgres:postgres@`, `${USER}:${PASS}@` do not count); it is judged
      percent-decoded, may contain `:`, and `:\/\/` (JSON) counts as `://`.

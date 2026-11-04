@@ -836,3 +836,9 @@ fails). Coverage: `docs/conformance/sync.md`. Line numbers refer to
   simulate a dropped TCP connection exactly: cutting the server's output
   leaves the server process alive, which `vl` sees as a server that
   stopped answering (the documented 300 s timeout, shortened in the test).
+
+## Findings from the local-tooling round
+
+| ID | Sev. | Area | Finding | Root cause | Reproducing tests |
+|---|---|---|---|---|---|
+| BUG-400 | low (**fixed**, feature 9) | scanner | **Fixed** (scanner v6): every chunk's window starts at the start of a line. Originally: where a 256 KiB chunk of the assignment pass started inside a line of code, the rest of that line counted as a configuration line, so `    client = Client(…, auth_token=access_token)` cut after `a` reported `access_token)` as a credential (the file was quarantined). Depends only on where the chunk boundary falls, so it came and went as a file grew. | `secrets.rs` (`scan`): the window began at the chunk start, and `config_line` takes the start of the window for the start of a line (`None if from == 0`). | `scanner`: `a_chunk_boundary_inside_a_code_line_is_not_a_configuration_line` |
