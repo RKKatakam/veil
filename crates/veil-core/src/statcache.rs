@@ -35,7 +35,7 @@ use crate::{
     id::ObjectId,
     keychain::{key_fingerprint, Keychain},
     object::Object,
-    policy::POLICY_FILE,
+    policy::{PolicyFile, POLICY_FILE},
     vfs::{Metadata, NodeKind, StatClock, StorageBackend},
     vpath::VPath,
 };
@@ -147,7 +147,11 @@ pub struct CacheKey {
 
 impl CacheKey {
     pub fn compute(fs: &dyn StorageBackend, keys: &Keychain, clock: StatClock) -> Result<CacheKey> {
-        let policy = fs.read_opt(&VPath::new(POLICY_FILE)?)?.map(|b| Object::blob_id(&b));
+        let policy = match crate::policy::read_policy_file(fs)? {
+            PolicyFile::File(b) | PolicyFile::Linked(b) => Some(Object::blob_id(&b)),
+            PolicyFile::Absent => None,
+            PolicyFile::Unavailable(why) => Some(Object::blob_id(format!("\0unreadable {POLICY_FILE}: {why}").as_bytes())),
+        };
         Ok(CacheKey {
             policy,
             keys: key_state(keys)?,

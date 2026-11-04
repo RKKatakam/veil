@@ -509,6 +509,36 @@ CAS, and it applies these rules in order:
      recorded does not fold the same edit twice. Anything else waits for
      `vl policy accept`, which lists the local files whose protection it
      weakens.
+   * Only a real edit counts as the member's. A command that writes
+     `.veilpolicy` from another revision without moving the working copy
+     (`vl restore [--from REV]`, BUG-101) snapshots with
+     `SnapshotOptions::policy_incoming`, so what it brought in is guarded
+     like a pulled policy. Every other route (`vl new`, `edit`, `ws switch`,
+     `undo`, `op restore`, `merge`, `rebase`, `git pull`) moves the working
+     copy to a tree that holds the incoming policy, so there is no
+     difference to mistake for an edit (`policy_routes_cli.rs` covers each).
+   * What is at `.veilpolicy` never makes a snapshot less protected than
+     the accepted policy (`policy::read_policy_file`, BUG-106/107). A
+     **missing** file is not taken as the member's edit (deleting every rule
+     at once is an accident far more often than a decision): the accepted
+     policy guards the built-in rules, every snapshot warns, and
+     `vl policy accept` accepts having none. A **symlink** (a dotfiles
+     manager, `stow`, a monorepo's shared policy) is followed, inside or
+     outside the repository, to a regular file of at most 1 MiB whose name
+     says it is a policy (`*veilpolicy*`: `.veilpolicy`, `dot_veilpolicy`,
+     `shared.veilpolicy`), so a hostile Git checkout's
+     `.veilpolicy -> /proc/self/environ` is never parsed and echoed in
+     warnings (FIFOs and devices are refused, the open is non-blocking), but a change in its
+     target is never the member's edit, since it changes by routes Veil
+     does not see: strengthening applies at once, weakening waits for
+     `vl policy accept`. Its tracked entry is kept as for any symlink (the
+     warning says teammates do not get the change), and `vl cloak|isolate|
+     expose|ignore` refuse to write over the link. Following was chosen
+     over refusing to snapshot: "nothing in the working copy can fail a
+     snapshot", and the pin already makes following safe. An **unreadable**
+     file, a directory, a dangling or looping link: the accepted policy
+     applies as it is, every snapshot warns, nothing is accepted, and
+     `vl policy accept` refuses until it is fixed.
    * Only the repository's own directory (the backend it was opened on)
      is guarded and can move the accepted policy. Sandboxes of
      `vl ws exec`, overlays, ephemeral workspaces and imported trees hold
@@ -522,7 +552,10 @@ CAS, and it applies these rules in order:
      wanted tier) and `vl status` lists `P` entries; a checkout that
      changes `.veilpolicy` warns at once; `vl policy show` lists pending
      weakenings, `vl policy check <path>` says when a classification is
-     the accepted one, and `vl scan` uses the effective policy.
+     the accepted one, and `vl scan` uses the effective policy. As a CI
+     gate, `vl scan --policy-from FILE` takes its rules from FILE only (the
+     base branch's policy), needs no repository, and counts every file of
+     the checkout as public except FILE's `public!` paths (BUG-115).
    * Considered and rejected: refusing the incoming `.veilpolicy` at merge
      time (as for sealed content). Merge cannot see the working copy's
      isolated files, and pull + `vl new`, checkout, rebase, Git import and

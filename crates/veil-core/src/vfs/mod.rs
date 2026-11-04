@@ -229,6 +229,19 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
         slice_range(path, &data, offset, len).map(<[u8]>::to_vec)
     }
 
+    /// Read a symlink at `path` through to the regular file it leads to (at
+    /// most `limit` bytes), with that file's resolved path (for display and
+    /// checks): `Ok(None)` when nothing special is at `path`
+    /// (read it as usual), `Err` for a symlink that dangles, loops, or does
+    /// not lead to a regular file of at most `limit` bytes, and for any other
+    /// special file (a FIFO, a socket). Only the working copy's policy file
+    /// is read this way (see [`crate::policy::read_policy_file`]): every
+    /// other read treats symlinks as invisible. Backends without symlinks
+    /// keep the default.
+    fn read_through_link(&self, _path: &VPath, _limit: u64) -> Result<Option<(String, Vec<u8>)>> {
+        Ok(None)
+    }
+
     fn read_opt(&self, path: &VPath) -> Result<Option<Vec<u8>>> {
         match self.read(path) {
             Ok(d) => Ok(Some(d)),

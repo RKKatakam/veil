@@ -52,7 +52,7 @@ use crate::{
     error::{Result, VeilError},
     id::ObjectId,
     object::{EntryKind, Object, Tree, TreeEntry, Visibility},
-    policy::{tier_keyword, HeldBack, Policy, Tier, POLICY_FILE},
+    policy::{tier_keyword, HeldBack, Policy, PolicyFile, Tier, POLICY_FILE},
     secrets::{self, Finding},
     statcache::{CacheKey, CacheRun, StatCache},
     store::ObjectStore,
@@ -336,11 +336,14 @@ pub fn build_tree_cached(
         _ => false,
     };
     let use_hints = use_hints && !opts.rescan;
-    let policy_changed = match (fs.read_opt(&policy_path)?, parent_policy) {
-            (Some(now), Some(p)) => !store.matches_encoding(&p, &now)?,
-            (None, None) => false,
-            _ => true,
-        };
+    // Read as the policy is (a symlink followed, see `read_policy_file`).
+    let policy_changed = match (crate::policy::read_policy_file(fs)?, parent_policy) {
+        (PolicyFile::File(now) | PolicyFile::Linked(now), Some(p)) => !store.matches_encoding(&p, &now)?,
+        (PolicyFile::File(_) | PolicyFile::Linked(_), None) => true,
+        (PolicyFile::Absent, p) => p.is_some(),
+        // Unreadable: the accepted policy applies, nothing to reclassify.
+        (PolicyFile::Unavailable(_), _) => false,
+    };
     // The cache only works on backends whose stamps can be trusted. The
     // clock is read before any file is stat'ed (see `statcache`).
     let mut cache = cache;
