@@ -120,3 +120,33 @@ fn a_sole_admin_can_hand_over_after_replacing_the_identity() {
     let out = env.ok("alice", &proj, &["identity", "recover-admin"]);
     assert!(out.contains("you are already an admin"), "{out}");
 }
+
+/// BUG-360: several `vl` processes starting at once on a fresh `VEIL_HOME`
+/// agree on one identity. Each used to generate and store its own; only
+/// the last write survived, so every other process had worked (signed,
+/// been granted) under an identity that no longer existed.
+#[test]
+fn concurrent_first_runs_create_one_identity() {
+    for round in 0..3 {
+        let env = Env::new();
+        let user = format!("fresh{round}");
+        let children: Vec<_> = (0..12).map(|_| env.spawn(&user, &env.root, &["identity", "show"])).collect();
+        let mut keys = std::collections::BTreeSet::new();
+        let mut created = 0;
+        for child in children {
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success(), "{}", text(&out));
+            created += String::from_utf8_lossy(&out.stderr).matches("new identity").count();
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            let key = stdout.lines().find(|l| l.starts_with("public key")).unwrap().to_string();
+            keys.insert(key);
+        }
+        let stored = env.stdout(&user, &env.root, &["identity", "show"]);
+        assert_eq!(keys.len(), 1, "round {round}: {} identities from 12 concurrent first runs: {keys:#?}", keys.len());
+        assert!(stored.contains(keys.first().unwrap()), "round {round}: the stored identity is not the one used");
+        assert_eq!(created, 1, "round {round}: {created} processes announced a new identity");
+        let home = env.root.join(format!("home-{user}"));
+        let leftovers: Vec<_> = std::fs::read_dir(&home).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(leftovers.len(), 1, "round {round}: temp files left behind: {leftovers:?}");
+    }
+}

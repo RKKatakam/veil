@@ -41,7 +41,9 @@ stored at   /home/alice/.config/veil/identity.json
 
 * **`public key`** is what you give teammates so they can grant you access
   to cloaked files (`vl scope grant`). Always share the full key.
-* **`identity.json` holds your private keys.** It is created mode `0600`.
+* **`identity.json` holds your private keys.** It is created mode `0600`,
+  once: several `vl` commands starting at the same time on a new machine
+  all end up with the same identity.
   Back it up somewhere safe: without it you lose access to everything
   cloaked for you, and to your local secret vault (see
   [Maintenance](maintenance.md#backups)).

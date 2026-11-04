@@ -141,6 +141,60 @@ fn squashing_into_a_cloaked_change_keeps_the_public_version_as_fallback() {
     assert_eq!((e.visibility, e.fallback), (cloaked(), Some(entry(&alice, &main, "README.md").id)));
 }
 
+/// Write `files` in workspace `ws` and record them (no commit). Returns
+/// the working-copy change.
+fn record_in(repo: &mut Repo, ws: &str, files: &[(&str, &str)]) -> ObjectId {
+    let overlay: OverlayBackend = repo.workspace_overlay(ws).unwrap();
+    for (path, data) in files {
+        overlay.write(&p(path), data.as_bytes()).unwrap();
+    }
+    repo.snapshot_workspace(ws, &overlay).unwrap().snapshot
+}
+
+/// The entry `path` has in the merged tree of `rev`'s parents.
+fn base_entry(repo: &Repo, rev: &ObjectId, path: &str) -> Option<TreeEntry> {
+    let parents = repo.snapshot(rev).unwrap().parents.clone();
+    let base = repo.parents_tree(&parents).unwrap().tree;
+    veil_core::tree::lookup(repo.store(), &base, &p(path)).unwrap()
+}
+
+/// Control for BUG-128: editing a sealed edit back to the public version
+/// its base holds records nothing new; the entry is the base's again.
+#[test]
+fn a_cloaked_edit_reverted_to_the_bases_public_version_is_the_bases_entry() {
+    let Setup { mut alice, main, .. } = setup();
+    record_in(&mut alice, "p", &[("README.md", "hello\nsecret\n")]);
+    let wc = record_in(&mut alice, "p", &[("README.md", "hello\n")]);
+    assert_eq!(entry(&alice, &wc, "README.md"), entry(&alice, &main, "README.md"));
+}
+
+/// BUG-128: a sealed edit whose fallback is a public version its line's
+/// base does *not* hold (the change was rebased onto a base without the
+/// file), edited back to that version, stays sealed: a public entry there
+/// would be public content the cloaked line introduces.
+#[test]
+fn a_cloaked_edit_reverted_to_a_fallback_its_base_lacks_stays_sealed() {
+    let Setup { mut alice, fs, main } = setup();
+    let public = entry(&alice, &main, "README.md");
+    record_in(&mut alice, "p", &[("README.md", "hello\nsecret\n")]);
+    let wc = alice.workspace_wc("p").unwrap();
+    // Onto a public change that removed README.md.
+    fs.remove_file(&p("README.md")).unwrap();
+    let no_readme = commit_files(&mut alice, &*fs, &[], "drop the readme");
+    assert!(file_entry(&alice, &no_readme, "README.md").is_none());
+    let r = alice.rebase(wc, vec![no_readme]).unwrap();
+    assert_eq!(alice.workspace_wc("p").unwrap(), r);
+    let e = file_entry(&alice, &r, "README.md");
+    // However the rebase settled it, editing back to the old public version
+    // must not put a public entry on the line that its base lacks.
+    let wc = record_in(&mut alice, "p", &[("README.md", "hello\n")]);
+    let e2 = entry(&alice, &wc, "README.md");
+    assert_eq!(base_entry(&alice, &wc, "README.md"), None);
+    assert_eq!(e2.visibility, cloaked(), "before: {e:?}");
+    assert_eq!(e2.fallback, Some(public.id));
+    assert_eq!(read_at(&alice, &wc, "README.md"), b"hello\n");
+}
+
 #[test]
 fn a_file_cloaked_by_policy_has_no_public_fallback() {
     let Setup { mut alice, fs, .. } = setup();
