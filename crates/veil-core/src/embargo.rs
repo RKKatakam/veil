@@ -1,96 +1,494 @@
 //! Delayed-visibility (embargoed) merges and visibility normalisation.
 //!
-//! An embargoed merge seals every file that differs from the first parent
-//! under a fresh embargo key, keeping the first parent's version as the
-//! entry's `fallback`. Readers without the key — e.g. a public mirror — see
-//! the main line exactly as it was before the merge; members of the
-//! embargo's scope see the merged content. Releasing publishes the key and
-//! everyone sees the merge, with no history rewrite.
+//! # Embargo wrappers
+//!
+//! An embargoed tree is stored as a small plaintext **wrapper** tree:
+//!
+//! ```text
+//! embargo        dir   [embargo:<id>]  → Sealed(tree)     fallback → pre-merge tree
+//! <hex id>       file  [embargo:<id>]  → every object only reachable from the sealed side
+//! …
+//! ```
+//!
+//! * The marker entry `embargo` points at the merged tree, **sealed** under
+//!   `embargo/<id>`, and names the pre-merge tree as its `fallback`.
+//!   [`ObjectStore::tree`] resolves a wrapper transparently: key holders see
+//!   the merged tree, everyone else sees the fallback. Non-holders therefore
+//!   learn nothing about the fix: no new names, no new sizes, not even
+//!   which files changed.
+//! * Inside the sealed side, every directory that differs from the fallback
+//!   is itself a sealed tree, and every public file that differs is sealed
+//!   under the embargo key (with the pre-merge version as its `fallback`).
+//! * The other entries list, by id, every object that is reachable *only*
+//!   through the sealed side. Relays, `gc` and `fsck` cannot open sealed
+//!   trees, so this list is how they find (and keep, and transfer) the
+//!   sealed subtrees and blobs. All listed objects are sealed, or are the
+//!   public pre-merge versions. A public remote withholds the sealed ones
+//!   until release.
+//!
+//! Releasing publishes the key; the wrapper then resolves to the merged tree
+//! for everyone, with no history rewrite (snapshot ids do not change).
+//!
+//! While an embargo is unreleased its wrapper is sticky: a key holder's
+//! later snapshots, merges and rebases on top of it are re-wrapped under the
+//! same embargo (non-holders keep seeing the pre-merge tree), and a
+//! non-holder cannot record edits on top of it (the builder holds them back)
+//! because they cannot see what they would be editing.
 //!
 //! Time-based release is enforced by the engines of key holders: the first
 //! `vl` invocation by a key holder after the deadline publishes the key.
 //! (True time-lock cryptography is out of scope.)
+//!
+//! # Normalisation
+//!
+//! [`normalize_tree`] re-derives visibility after a merge. It may *seal*
+//! content (public → cloaked), but it never moves content that is already
+//! sealed to a wider or different audience, with one exception: an explicit
+//! merge of a cloaked line of work into a public line publishes that line's
+//! files, after secret scanning them.
+
+use std::collections::BTreeSet;
 
 use crate::{
-    error::Result,
+    error::{Result, VeilError},
     id::ObjectId,
-    object::{EntryKind, Tree, TreeEntry, Visibility},
-    policy::{Policy, Tier},
+    object::{EntryKind, Object, Tree, TreeEntry, Visibility},
+    policy::{Policy, Tier, POLICY_FILE},
+    secrets::{self, Finding},
     store::ObjectStore,
     vpath::VPath,
 };
 
-/// Seal every file of `tree` that differs from `base` under `embargo`.
-pub fn apply_embargo(store: &ObjectStore, tree: &ObjectId, base: &ObjectId, embargo: &str) -> Result<ObjectId> {
-    let t = store.tree(tree)?;
-    let b = store.tree(base)?;
+/// Name of the marker entry of an embargo wrapper tree.
+pub const WRAPPER_ENTRY: &str = "embargo";
+
+/// The parts of an embargo wrapper tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmbargoWrapper {
+    pub embargo: String,
+    /// The merged tree, sealed under `embargo/<id>`.
+    pub inner: ObjectId,
+    /// What readers without the key see (the pre-merge tree, possibly
+    /// itself a wrapper of an older embargo).
+    pub fallback: ObjectId,
+    /// Objects reachable only through `inner`.
+    pub listed: Vec<ObjectId>,
+}
+
+impl EmbargoWrapper {
+    pub fn key_label(&self) -> String {
+        format!("embargo/{}", self.embargo)
+    }
+}
+
+/// Recognise an embargo wrapper. Ordinary directory entries are always
+/// public, so a directory entry marked embargoed with a fallback can only
+/// come from [`wrap`].
+pub fn wrapper_parts(t: &Tree) -> Option<EmbargoWrapper> {
+    let marker = t.get(WRAPPER_ENTRY)?;
+    let Visibility::Embargoed { embargo } = &marker.visibility else {
+        return None;
+    };
+    if marker.kind != EntryKind::Dir {
+        return None;
+    }
+    let fallback = marker.fallback?;
+    let mut listed = Vec::new();
+    for e in &t.entries {
+        if e.name == WRAPPER_ENTRY {
+            continue;
+        }
+        if e.kind != EntryKind::File || e.visibility != marker.visibility || e.fallback.is_some() {
+            return None;
+        }
+        listed.push(e.id);
+    }
+    Some(EmbargoWrapper {
+        embargo: embargo.clone(),
+        inner: marker.id,
+        fallback,
+        listed,
+    })
+}
+
+/// The wrapper parts of tree `id`, if it is one.
+pub fn wrapper_of(store: &ObjectStore, id: &ObjectId) -> Result<Option<EmbargoWrapper>> {
+    Ok(wrapper_parts(&*store.tree_object(id)?))
+}
+
+/// The wrapper parts of tree `id` if it is a wrapper of an embargo that has
+/// not been released.
+pub fn unreleased_wrapper(store: &ObjectStore, id: &ObjectId) -> Result<Option<EmbargoWrapper>> {
+    Ok(wrapper_of(store, id)?.filter(|w| !store.keys.embargo_released(&w.embargo)))
+}
+
+/// The tree a reader holding no unreleased embargo key sees: every
+/// unreleased wrapper is replaced by its fallback.
+pub fn public_view(store: &ObjectStore, id: &ObjectId) -> Result<ObjectId> {
+    let mut id = *id;
+    while let Some(w) = unreleased_wrapper(store, &id)? {
+        id = w.fallback;
+    }
+    Ok(id)
+}
+
+/// Seal `tree` under `embargo`, showing `fallback` to everyone without the
+/// key. Public files that differ from the fallback are sealed under the
+/// embargo key. Content that is already sealed (cloaked under a scope, or
+/// under another embargo) stays sealed as it is: releasing this embargo
+/// never declassifies it. Returns `fallback` itself when `tree` holds
+/// nothing to hide.
+pub fn wrap(store: &ObjectStore, embargo: &str, tree: &ObjectId, fallback: &ObjectId) -> Result<ObjectId> {
+    if tree == fallback {
+        return Ok(*fallback);
+    }
+    let base = public_view(store, fallback)?;
     let vis = Visibility::Embargoed {
         embargo: embargo.to_string(),
     };
+    let mut listed = BTreeSet::new();
+    let inner = seal_dir(store, &vis, tree, Some(base), &mut listed)?;
+    let mut w = Tree::default();
+    w.insert(TreeEntry {
+        name: WRAPPER_ENTRY.to_string(),
+        kind: EntryKind::Dir,
+        id: inner,
+        size: 0,
+        executable: false,
+        visibility: vis.clone(),
+        fallback: Some(*fallback),
+    });
+    for id in listed {
+        w.insert(TreeEntry {
+            name: id.hex(),
+            kind: EntryKind::File,
+            id,
+            size: 0,
+            executable: false,
+            visibility: vis.clone(),
+            fallback: None,
+        });
+    }
+    store.put_tree(&w)
+}
+
+fn seal_dir(
+    store: &ObjectStore,
+    vis: &Visibility,
+    tree: &ObjectId,
+    base: Option<ObjectId>,
+    listed: &mut BTreeSet<ObjectId>,
+) -> Result<ObjectId> {
+    let t = store.tree(tree)?;
+    let b = base.map(|b| store.tree(&b)).transpose()?;
     let mut out = Tree::default();
     for e in &t.entries {
-        let be = b.get(&e.name);
+        let be = b.as_deref().and_then(|b| b.get(&e.name));
         if be.is_some_and(|x| x.same_content(e)) {
+            // Reachable through the fallback; nothing to hide.
             out.insert(e.clone());
             continue;
         }
         match e.kind {
             EntryKind::Dir => {
-                let base_sub = match be.filter(|x| x.kind == EntryKind::Dir) {
-                    Some(x) => x.id,
-                    None => store.empty_tree()?,
-                };
-                out.insert(TreeEntry::dir(&e.name, apply_embargo(store, &e.id, &base_sub, embargo)?));
+                let sub_base = be.filter(|x| x.kind == EntryKind::Dir).map(|x| x.id);
+                let id = seal_dir(store, vis, &e.id, sub_base, listed)?;
+                out.insert(TreeEntry::dir(&e.name, id));
             }
             EntryKind::File => {
-                let data = store.read_entry(e)?;
-                out.insert(TreeEntry {
-                    id: store.store_file(&data, &vis)?,
-                    visibility: vis.clone(),
-                    fallback: be.filter(|x| x.kind == EntryKind::File).map(|x| x.id),
-                    ..e.clone()
-                });
+                let ne = if e.visibility.is_public() {
+                    let data = store.read_entry(e)?;
+                    TreeEntry {
+                        id: store.store_file(&data, vis)?,
+                        visibility: vis.clone(),
+                        fallback: be.filter(|x| x.kind == EntryKind::File).map(|x| x.id),
+                        ..e.clone()
+                    }
+                } else {
+                    e.clone()
+                };
+                listed.insert(ne.id);
+                if let Some(fb) = ne.fallback {
+                    listed.insert(fb);
+                }
+                out.insert(ne);
             }
         }
     }
-    store.put_tree(&out)
+    let scope = vis.key_scope().expect("embargo visibility has a key scope");
+    let sealed = store.put(&store.seal(&Object::Tree(out), &scope)?)?;
+    listed.insert(sealed);
+    Ok(sealed)
 }
 
-/// Re-seal entries whose visibility no longer matches policy (e.g. after
-/// merging a cloaked line of work into a public one). Embargoed entries and
-/// entries this reader cannot decrypt are left as they are.
-pub fn normalize_tree(store: &ObjectStore, tree: &ObjectId, policy: &Policy, cloak: Option<&str>) -> Result<ObjectId> {
-    normalize_dir(store, tree, &VPath::root(), policy, cloak)
+/// Embargo the merged `tree`: readers without the key see `base` (the first
+/// parent's tree) exactly, and learn nothing about what changed.
+pub fn apply_embargo(store: &ObjectStore, tree: &ObjectId, base: &ObjectId, embargo: &str) -> Result<ObjectId> {
+    wrap(store, embargo, tree, base)
 }
 
-fn normalize_dir(store: &ObjectStore, tree: &ObjectId, dir: &VPath, policy: &Policy, cloak: Option<&str>) -> Result<ObjectId> {
+// ---- normalisation after a merge -------------------------------------------
+
+/// Inputs of [`normalize_tree`].
+pub struct NormalizeOptions<'a> {
+    /// Policy of the merge result.
+    pub policy: &'a Policy,
+    /// Policy of the destination before the merge (rules the member already
+    /// lives under).
+    pub dest_policy: &'a Policy,
+    /// The destination's tree (a quarantined file keeps its version).
+    pub dest_tree: ObjectId,
+    /// Cloak of the destination line, if it is a cloaked line of work.
+    pub cloak: Option<&'a str>,
+    /// Scopes of the cloaked lines of work being merged in. Their files may
+    /// become public: merging them is the explicit act of declassification.
+    pub declassify: &'a BTreeSet<String>,
+}
+
+/// What [`normalize_tree`] did.
+#[derive(Debug, Default, Clone)]
+pub struct NormalizeReport {
+    /// Files of a merged-in cloaked line that are now public (scanned clean).
+    pub declassified: Vec<VPath>,
+    /// Files that would have become public but contain secrets: left out of
+    /// the merge (or kept at the destination's version).
+    pub quarantined: Vec<(VPath, Vec<Finding>)>,
+    /// Sealed files whose audience the merge did not change, with the reason.
+    pub kept_sealed: Vec<(VPath, String)>,
+}
+
+/// Re-derive visibility after merging (e.g. a cloaked line of work into a
+/// public one). See the module documentation for the rules.
+pub fn normalize_tree(store: &ObjectStore, tree: &ObjectId, opts: &NormalizeOptions, report: &mut NormalizeReport) -> Result<ObjectId> {
+    let dest = Some(opts.dest_tree);
+    normalize_dir(store, tree, dest, &VPath::root(), opts, report)
+}
+
+fn desired_visibility(policy: &Policy, path: &VPath, cloak: Option<&str>) -> Option<Visibility> {
+    match policy.classify(path, false).tier {
+        Tier::Public => Some(match cloak {
+            Some(s) if path.as_str() != POLICY_FILE => Visibility::Cloaked { scope: s.to_string() },
+            _ => Visibility::Public,
+        }),
+        Tier::Cloaked(s) => Some(Visibility::Cloaked { scope: s }),
+        Tier::Isolated | Tier::Ignored => None,
+    }
+}
+
+fn normalize_dir(
+    store: &ObjectStore,
+    tree: &ObjectId,
+    dest: Option<ObjectId>,
+    dir: &VPath,
+    opts: &NormalizeOptions,
+    report: &mut NormalizeReport,
+) -> Result<ObjectId> {
     let t = store.tree(tree)?;
+    let d = match dest {
+        Some(id) => match store.tree(&id) {
+            Ok(t) => Some(t),
+            Err(e) if e.is_unreadable() => None,
+            Err(e) => return Err(e),
+        },
+        None => None,
+    };
     let mut out = Tree::default();
     let mut changed = false;
     for e in &t.entries {
         let path = dir.join(&e.name);
-        let mut ne = e.clone();
+        let de = d.as_deref().and_then(|d| d.get(&e.name));
+        let mut ne = Some(e.clone());
         match e.kind {
             EntryKind::Dir => {
-                ne.id = normalize_dir(store, &e.id, &path, policy, cloak)?;
+                let sub_dest = de.filter(|x| x.kind == EntryKind::Dir).map(|x| x.id);
+                let id = normalize_dir(store, &e.id, sub_dest, &path, opts, report)?;
+                // Everything in it was quarantined: no empty directory.
+                let emptied = id != e.id && store.tree(&id)?.is_empty();
+                ne = if emptied { None } else { Some(TreeEntry { id, ..e.clone() }) };
             }
             EntryKind::File => {
-                let desired = match policy.classify(&path, false).tier {
-                    Tier::Public => match cloak {
-                        Some(s) => Visibility::Cloaked { scope: s.to_string() },
-                        None => Visibility::Public,
-                    },
-                    Tier::Cloaked(s) => Visibility::Cloaked { scope: s },
-                    Tier::Isolated | Tier::Ignored => e.visibility.clone(),
-                };
-                if !matches!(e.visibility, Visibility::Embargoed { .. }) && desired != e.visibility {
-                    if let Ok(data) = store.read_entry(e) {
-                        if let Ok(id) = store.store_file(&data, &desired) {
-                            ne.id = id;
-                            ne.visibility = desired;
+                let unchanged_from_dest = de.is_some_and(|x| x.same_content(e));
+                let dest_sealed = de.filter(|d| d.kind == EntryKind::File && matches!(d.visibility, Visibility::Cloaked { .. }));
+                let desired = desired_visibility(opts.policy, &path, opts.cloak);
+                match (&e.visibility, desired) {
+                    // The destination holds this file sealed and the merged
+                    // side would widen or move its audience (e.g. a PR whose
+                    // author exposed it): keep the destination's audience,
+                    // with the merged content if we can read it.
+                    (v, _) if !unchanged_from_dest && !matches!(v, Visibility::Embargoed { .. }) && dest_sealed.is_some_and(|d| d.visibility != *v) => {
+                        let d = dest_sealed.expect("checked");
+                        let resealed = match store.read_entry(e) {
+                            Ok(data) => Some(TreeEntry {
+                                id: store.store_file(&data, &d.visibility)?,
+                                size: data.len() as u64,
+                                visibility: d.visibility.clone(),
+                                fallback: None,
+                                ..e.clone()
+                            }),
+                            Err(err) if err.is_unreadable() => None,
+                            Err(err) => return Err(err),
+                        };
+                        ne = Some(resealed.unwrap_or_else(|| d.clone()));
+                        report.kept_sealed.push((
+                            path.clone(),
+                            format!(
+                                "stays {}: the merged side would make it {}; a merge never widens or moves the audience of content the destination keeps sealed",
+                                d.visibility.label(),
+                                v.label()
+                            ),
+                        ));
+                    }
+                    (Visibility::Embargoed { .. }, _) | (_, None) => {}
+                    (v, Some(want)) if *v == want => {}
+                    (Visibility::Public, Some(want)) => {
+                        // Sealing is never a downgrade. Without the key the
+                        // entry stays as it was in its source.
+                        if let Ok(data) = store.read_entry(e) {
+                            if let Ok(id) = store.store_file(&data, &want) {
+                                ne = Some(TreeEntry {
+                                    id,
+                                    visibility: want,
+                                    fallback: None,
+                                    ..e.clone()
+                                });
+                            }
                         }
                     }
+                    (Visibility::Cloaked { scope: have }, Some(Visibility::Cloaked { scope: want })) => {
+                        if !unchanged_from_dest {
+                            report.kept_sealed.push((
+                                path.clone(),
+                                format!("stays cloaked under '{have}' (policy says '{want}'); a merge never re-keys cloaked content, re-cloak it deliberately"),
+                            ));
+                        }
+                    }
+                    (Visibility::Cloaked { scope: have }, Some(Visibility::Public)) => {
+                        let dest_public = opts.dest_policy.classify(&path, false).tier == Tier::Public;
+                        if !opts.declassify.contains(have) || !dest_public {
+                            if !unchanged_from_dest {
+                                report.kept_sealed.push((
+                                    path.clone(),
+                                    format!("stays cloaked under '{have}'; a merge only publishes files of the cloaked line being merged (use `vl expose` to publish deliberately)"),
+                                ));
+                            }
+                        } else {
+                            ne = declassify(store, e, de, &path, opts, report)?;
+                        }
+                    }
+                    (Visibility::Cloaked { .. }, Some(Visibility::Embargoed { .. })) => {}
                 }
+            }
+        }
+        match ne {
+            Some(ne) => {
+                changed |= ne != *e;
+                out.insert(ne);
+            }
+            None => changed = true,
+        }
+    }
+    if !changed {
+        return Ok(*tree);
+    }
+    if out.is_empty() {
+        return store.empty_tree();
+    }
+    store.put_tree(&out)
+}
+
+/// Publish one file of a merged-in cloaked line, unless it holds a secret.
+fn declassify(
+    store: &ObjectStore,
+    e: &TreeEntry,
+    dest: Option<&TreeEntry>,
+    path: &VPath,
+    opts: &NormalizeOptions,
+    report: &mut NormalizeReport,
+) -> Result<Option<TreeEntry>> {
+    let data = match store.read_entry(e) {
+        Ok(d) => d,
+        Err(err) if err.is_unreadable() => {
+            return Err(VeilError::Policy(format!(
+                "cannot merge {path}: it is sealed and you do not hold the key"
+            )))
+        }
+        Err(err) => return Err(err),
+    };
+    let allow = opts.policy.classify(path, false).allow_secrets && opts.dest_policy.classify(path, false).allow_secrets;
+    if !allow {
+        let findings = secrets::scan(&data);
+        if !findings.is_empty() {
+            report.quarantined.push((path.clone(), findings));
+            // Keep what the destination already had at this path.
+            return Ok(dest.filter(|d| d.kind == EntryKind::File).cloned());
+        }
+    }
+    report.declassified.push(path.clone());
+    Ok(Some(TreeEntry {
+        id: store.store_file(&data, &Visibility::Public)?,
+        visibility: Visibility::Public,
+        fallback: None,
+        ..e.clone()
+    }))
+}
+
+/// Sealed files of `tree` whose audience a change from `old` to `new`
+/// policy would widen or move: `(path, current visibility, new visibility)`.
+pub fn policy_rekeys(
+    store: &ObjectStore,
+    tree: &ObjectId,
+    old: &Policy,
+    new: &Policy,
+    cloak: Option<&str>,
+) -> Result<Vec<(VPath, Visibility, Visibility)>> {
+    let mut out = Vec::new();
+    for (path, e) in crate::tree::walk_files(store, tree)? {
+        let Visibility::Cloaked { .. } = &e.visibility else { continue };
+        if old.classify(&path, false) == new.classify(&path, false) {
+            continue;
+        }
+        if let Some(want) = desired_visibility(new, &path, cloak) {
+            if want != e.visibility {
+                out.push((path, e.visibility.clone(), want));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Seal, under `scope`, every public file of `tree` that differs from
+/// `base` (what a cloaked line of work introduces must be sealed). The
+/// policy file stays public. Used when a change is folded into a cloaked one.
+pub fn seal_introduced(store: &ObjectStore, tree: &ObjectId, base: Option<ObjectId>, scope: &str) -> Result<ObjectId> {
+    seal_introduced_dir(store, tree, base, &VPath::root(), scope)
+}
+
+fn seal_introduced_dir(store: &ObjectStore, tree: &ObjectId, base: Option<ObjectId>, dir: &VPath, scope: &str) -> Result<ObjectId> {
+    if Some(*tree) == base {
+        return Ok(*tree);
+    }
+    let t = store.tree(tree)?;
+    let b = base.map(|b| store.tree(&b)).transpose()?;
+    let vis = Visibility::Cloaked { scope: scope.to_string() };
+    let mut out = Tree::default();
+    let mut changed = false;
+    for e in &t.entries {
+        let be = b.as_deref().and_then(|b| b.get(&e.name));
+        let path = dir.join(&e.name);
+        let mut ne = e.clone();
+        if !be.is_some_and(|x| x.same_content(e)) {
+            match e.kind {
+                EntryKind::Dir => {
+                    let sub = be.filter(|x| x.kind == EntryKind::Dir).map(|x| x.id);
+                    ne.id = seal_introduced_dir(store, &e.id, sub, &path, scope)?;
+                }
+                EntryKind::File if e.visibility.is_public() && path.as_str() != POLICY_FILE => {
+                    let data = store.read_entry(e)?;
+                    ne.id = store.store_file(&data, &vis)?;
+                    ne.visibility = vis.clone();
+                    ne.fallback = None;
+                }
+                EntryKind::File => {}
             }
         }
         changed |= ne != *e;

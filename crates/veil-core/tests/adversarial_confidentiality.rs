@@ -35,7 +35,6 @@ fn clone_as(id: &Identity, from: Arc<MemoryBackend>) -> Repo {
 /// The README flow: develop the fix as an ordinary change, merge it with
 /// `--embargo`, push the main line to the public mirror.
 #[test]
-#[ignore = "BUG-003: pushing an embargoed merge ships its second parent (the fix itself) in plaintext to public remotes"]
 fn embargoed_merge_does_not_push_the_fix_branch_to_a_public_mirror() {
     let (mut alice, fs, _) = new_repo("alice");
     let main = commit_files(&mut alice, &*fs, &[("auth.rs", "fn check() -> bool { true }\n")], "v1");
@@ -54,7 +53,6 @@ fn embargoed_merge_does_not_push_the_fix_branch_to_a_public_mirror() {
 }
 
 #[test]
-#[ignore = "BUG-016: embargoed merge message and embargo record description are published in plaintext before release"]
 fn embargo_messages_are_not_public_before_release() {
     let (mut alice, fs, _) = new_repo("alice");
     let main = commit_files(&mut alice, &*fs, &[("auth.rs", "v1\n")], "v1");
@@ -82,7 +80,6 @@ fn embargo_messages_are_not_public_before_release() {
 // ---- cloaked lines of work becoming public -----------------------------------
 
 #[test]
-#[ignore = "BUG-004: merging a cloaked line of work re-stores its files as public without secret scanning"]
 fn merging_a_cloaked_workspace_scans_files_that_become_public() {
     let (mut alice, fs, _) = new_repo("alice");
     let main = commit_files(&mut alice, &*fs, &[("README", "hi\n")], "v1");
@@ -105,7 +102,6 @@ fn merging_a_cloaked_workspace_scans_files_that_become_public() {
 /// amended; auto-rebase three-way-merges the cloaked file and stores the
 /// result with the *parent's* visibility, i.e. in plaintext.
 #[test]
-#[ignore = "BUG-005: auto-rebase/merge stores a merged cloaked file with the other side's (public) visibility"]
 fn auto_rebase_never_downgrades_cloaked_content_to_public() {
     let (mut alice, fs, _) = new_repo("alice");
     alice.keys().create_scope("ops").unwrap();
@@ -149,7 +145,6 @@ fn auto_rebase_never_downgrades_cloaked_content_to_public() {
 /// inherits the sealed entries, and the very next auto-snapshot re-stores
 /// them as public plaintext (the workspace is not cloaked). No warning.
 #[test]
-#[ignore = "BUG-006: starting a change on top of a cloaked change in a public workspace declassifies its files at the next snapshot"]
 fn new_change_on_a_cloaked_change_does_not_declassify_it() {
     let (mut alice, fs, _) = new_repo("alice");
     let main = commit_files(&mut alice, &*fs, &[("README", "hi\n")], "v1");
@@ -176,7 +171,6 @@ fn new_change_on_a_cloaked_change_does_not_declassify_it() {
 }
 
 #[test]
-#[ignore = "BUG-017: squashing a cloaked change into a public parent writes its description in plaintext"]
 fn squash_keeps_cloaked_descriptions_sealed() {
     let (mut alice, fs, _) = new_repo("alice");
     let base = commit_files(&mut alice, &*fs, &[("README", "hi\n")], "public base");
@@ -248,7 +242,6 @@ fn policy_rejects_reserved_and_malformed_scope_names() {
 /// that only changes `.veilpolicy`: `prod/ cloak ops` → `prod/ cloak opz`.
 /// Alice merges the PR. Nothing warns her; `prod/` is re-encrypted to Mallory.
 #[test]
-#[ignore = "BUG-009: merging a .veilpolicy change silently re-encrypts cloaked files to any scope named in the PR"]
 fn policy_pr_cannot_rekey_cloaked_files_to_an_attacker_scope() {
     let alice_id = Identity::generate("alice");
     let (mut alice, fs) = repo_for("alice", &alice_id);
@@ -295,7 +288,6 @@ fn policy_pr_cannot_rekey_cloaked_files_to_an_attacker_scope() {
 /// `secrets/ public!`. Merging it decrypts every existing cloaked file into
 /// public blobs; `vl merge` neither warns nor asks.
 #[test]
-#[ignore = "BUG-009: merging a .veilpolicy change silently declassifies existing cloaked files"]
 fn merging_a_policy_change_does_not_silently_declassify_cloaked_files() {
     let (mut alice, fs, _) = new_repo("alice");
     let main = commit_files(
@@ -318,7 +310,6 @@ fn merging_a_policy_change_does_not_silently_declassify_cloaked_files() {
 /// pre-merge tree. It reveals which files the fix touches, their new sizes,
 /// and the names of files it adds.
 #[test]
-#[ignore = "BUG-018: an embargoed merge reveals changed/added file names and new sizes to public mirrors before release"]
 fn embargoed_tree_reveals_nothing_about_the_fix() {
     let (mut alice, fs, _) = new_repo("alice");
     let main = commit_files(&mut alice, &*fs, &[("auth.rs", "fn check() -> bool { true }\n"), ("lib.rs", "x\n")], "v1");

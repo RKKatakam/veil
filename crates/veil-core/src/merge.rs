@@ -1,14 +1,23 @@
 //! Three-way tree merge. Works at the tree level (identical subtrees are
 //! resolved by id without reading content) and falls back to line-based
-//! diff3 for files changed on both sides. Visibility is preserved: a cloaked
-//! file stays cloaked in the merge result.
+//! diff3 for files changed on both sides.
+//!
+//! Visibility never widens: a file merged from a sealed side stays sealed
+//! (ours' sealing if ours is sealed, else theirs'), whichever side "ours"
+//! happens to be. This matters for auto-rebase, where "ours" is the new
+//! (possibly public) parent and "theirs" the (possibly cloaked) child.
+//!
+//! Trees under an unreleased embargo (see [`crate::embargo`]) stay under it:
+//! the result is re-wrapped under the same embargo, with the merge of the
+//! inputs' public views as its fallback. Merging them needs the embargo key.
 
 use std::collections::BTreeSet;
 
 use crate::{
+    embargo::{public_view, unreleased_wrapper, wrap},
     error::{Result, VeilError},
     id::ObjectId,
-    object::{EntryKind, Tree, TreeEntry},
+    object::{EntryKind, Tree, TreeEntry, Visibility},
     secrets::looks_binary,
     store::ObjectStore,
     vpath::VPath,
@@ -21,6 +30,42 @@ pub struct MergeOutcome {
 }
 
 pub fn merge_trees(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, theirs: ObjectId) -> Result<MergeOutcome> {
+    if ours == theirs || Some(theirs) == base {
+        return Ok(MergeOutcome { tree: ours, conflicts: vec![] });
+    }
+    if Some(ours) == base {
+        return Ok(MergeOutcome { tree: theirs, conflicts: vec![] });
+    }
+    let mut wrapped = None;
+    for id in [Some(ours), Some(theirs), base].into_iter().flatten() {
+        if let Some(w) = unreleased_wrapper(store, &id)? {
+            if !store.keys.has(&w.key_label()) {
+                return Err(VeilError::Policy(format!(
+                    "cannot merge: part of this history is under unreleased embargo {} and you do not hold its key",
+                    w.embargo
+                )));
+            }
+            wrapped.get_or_insert(w);
+        }
+    }
+    let full = merge_resolved(store, base, ours, theirs)?;
+    let Some(w) = wrapped else {
+        return Ok(full);
+    };
+    // What readers without the key see: the same merge of what they see.
+    let pv = |id: ObjectId| public_view(store, &id);
+    let (pb, po, pt) = (base.map(pv).transpose()?, pv(ours)?, pv(theirs)?);
+    let fallback = match merge_resolved(store, pb, po, pt) {
+        Ok(m) => m.tree,
+        Err(_) => po,
+    };
+    Ok(MergeOutcome {
+        tree: wrap(store, &w.embargo, &full.tree, &fallback)?,
+        conflicts: full.conflicts,
+    })
+}
+
+fn merge_resolved(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, theirs: ObjectId) -> Result<MergeOutcome> {
     if ours == theirs || Some(theirs) == base {
         return Ok(MergeOutcome { tree: ours, conflicts: vec![] });
     }
@@ -145,14 +190,29 @@ fn merge_file(
             }
         }
     };
-    let id = store.store_file(&merged, &oe.visibility)?;
+    let (visibility, fallback) = merged_visibility(oe, te);
+    let id = store.store_file(&merged, &visibility)?;
     Ok(TreeEntry {
         name: oe.name.clone(),
         kind: EntryKind::File,
         id,
         size: merged.len() as u64,
         executable,
-        visibility: oe.visibility.clone(),
-        fallback: oe.fallback,
+        visibility,
+        fallback,
     })
+}
+
+/// The visibility of a file merged from `oe` and `te`: never wider than
+/// either side. Ours' sealing wins if ours is sealed; otherwise theirs'.
+/// An embargoed result taken from theirs shows ours (public) as fallback.
+fn merged_visibility(oe: &TreeEntry, te: &TreeEntry) -> (Visibility, Option<ObjectId>) {
+    if !oe.visibility.is_public() {
+        return (oe.visibility.clone(), oe.fallback);
+    }
+    match &te.visibility {
+        Visibility::Public => (Visibility::Public, None),
+        Visibility::Cloaked { .. } => (te.visibility.clone(), None),
+        Visibility::Embargoed { .. } => (te.visibility.clone(), Some(oe.id)),
+    }
 }

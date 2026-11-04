@@ -1,15 +1,21 @@
 //! High-level history operations. Each is one transaction → one op-log entry.
 
+use std::collections::BTreeSet;
+
 use crate::{
-    embargo::{apply_embargo, normalize_tree},
+    embargo::{
+        apply_embargo, normalize_tree, policy_rekeys, seal_introduced, unreleased_wrapper, wrap, NormalizeOptions,
+        NormalizeReport,
+    },
     error::{Result, VeilError},
     id::{ChangeId, ObjectId},
     merge::merge_trees,
     now_millis,
-    object::Snapshot,
+    object::{Snapshot, TreeEntry},
     oplog::Tag,
-    policy::Policy,
+    policy::{Policy, POLICY_FILE},
     repo::Repo,
+    store::ObjectStore,
     tree::TreeView,
 };
 
@@ -26,6 +32,26 @@ pub struct MergeResult {
     pub snapshot: ObjectId,
     pub conflicts: Vec<String>,
     pub embargo: Option<String>,
+    /// Files of a merged-in cloaked line of work that this merge made public
+    /// (each was secret-scanned first).
+    pub declassified: Vec<String>,
+    /// Files that would have become public but hold a secret: left out of
+    /// the merge (the destination keeps its own version, if any).
+    pub quarantined: Vec<String>,
+    /// Visibility changes the merge refused to make silently.
+    pub warnings: Vec<String>,
+}
+
+/// `tree` with its root entry `name` replaced by `entry` (or removed).
+fn with_root_entry(store: &ObjectStore, tree: &ObjectId, name: &str, entry: Option<TreeEntry>) -> Result<ObjectId> {
+    let mut t = (*store.tree(tree)?).clone();
+    match entry {
+        Some(e) => t.insert(e),
+        None => {
+            t.remove(name);
+        }
+    }
+    store.put_tree(&t)
 }
 
 pub fn validate_tag_name(name: &str) -> Result<()> {
@@ -153,12 +179,28 @@ impl Repo {
         let p = tx.repo().snapshot(parent)?;
         let mut np = (*p).clone();
         np.tree = s.tree;
+        // Folding into a cloaked change: what the result introduces is part
+        // of the cloaked line and must be sealed like the rest of it.
+        if let Some(scope) = &p.cloak {
+            let base = tx.repo().parents_tree(&p.parents)?.tree;
+            np.tree = seal_introduced(&tx.repo().store, &np.tree, Some(base), scope)?;
+        }
         np.predecessors = vec![*parent, id];
         let pd = tx.repo().description(&p);
         let sd = tx.repo().description(&s);
         if !sd.trim().is_empty() {
             let joined = if pd.trim().is_empty() { sd } else { format!("{pd}\n\n{sd}") };
-            np.description = tx.repo().store.make_text(&joined, p.cloak.as_deref())?;
+            // A cloaked change's description stays sealed for its scope, even
+            // when folded into a public parent (the joined text is sealed).
+            let scope = match (&p.cloak, &s.cloak) {
+                (Some(a), Some(b)) if a != b => {
+                    return Err(VeilError::Policy(format!(
+                        "cannot squash a change cloaked under '{b}' into one cloaked under '{a}'"
+                    )))
+                }
+                (a, b) => a.as_deref().or(b.as_deref()),
+            };
+            np.description = tx.repo().store.make_text(&joined, scope)?;
         }
         let new_parent = tx.rewrite(*parent, np)?;
         tx.abandon(id)?;
@@ -181,26 +223,92 @@ impl Repo {
         if others.is_empty() {
             return Err(VeilError::repo("nothing to merge"));
         }
+        // Embargo records are synced to every remote, public ones included,
+        // so the record carries no message; the merge's description is
+        // sealed under the embargo key instead.
         let embargo_id = match &embargo {
-            Some(spec) => Some(self.keys().create_embargo(&spec.scope, spec.until, message)?),
+            Some(spec) => Some(self.keys().create_embargo(&spec.scope, spec.until, "")?),
             None => None,
         };
         let mut tx = self.transaction("merge")?;
         let mut parents = vec![into];
-        parents.extend(others);
+        parents.extend(others.iter().copied());
         let into_snap = tx.repo().snapshot(&into)?;
         let store = tx.repo().store.clone();
+        let cloak = into_snap.cloak.as_deref();
         let merged = tx.repo().parents_tree(&parents)?;
-        let policy = Policy::load(&TreeView::new(store.clone(), merged.tree))?;
-        let mut tree = normalize_tree(&store, &merged.tree, &policy, into_snap.cloak.as_deref())?;
+        let outer = unreleased_wrapper(&store, &merged.tree)?;
+        let dest_policy = Policy::load(&TreeView::new(store.clone(), into_snap.tree))?;
+        let mut policy = Policy::load(&TreeView::new(store.clone(), merged.tree))?;
+        let mut warnings = Vec::new();
+        let mut tree = merged.tree;
+
+        // A merged `.veilpolicy` that would move existing cloaked content to
+        // another audience (re-key it, or make it public) is not taken: the
+        // destination's policy is kept and the member is told. Applying it
+        // is a deliberate edit, not a side effect of merging someone's PR.
+        let mut rekeys = policy_rekeys(&store, &into_snap.tree, &dest_policy, &policy, cloak)?;
+        for r in policy_rekeys(&store, &tree, &dest_policy, &policy, cloak)? {
+            if !rekeys.iter().any(|(p, _, _)| *p == r.0) {
+                rekeys.push(r);
+            }
+        }
+        if !rekeys.is_empty() {
+            let dest_entry = store.tree(&into_snap.tree)?.get(POLICY_FILE).cloned();
+            tree = with_root_entry(&store, &tree, POLICY_FILE, dest_entry)?;
+            policy = dest_policy.clone();
+            let list: Vec<String> = rekeys
+                .iter()
+                .map(|(p, from, to)| format!("{p}: {} → {}", from.label(), to.label()))
+                .collect();
+            warnings.push(format!(
+                "kept the destination's {POLICY_FILE}: the merged one would change the audience of existing cloaked files ({}); review it and apply it deliberately",
+                list.join(", ")
+            ));
+        }
+
+        // Merging a cloaked line of work into this one is the explicit act
+        // that may publish its files (secret-scanned).
+        let mut declassify = BTreeSet::new();
+        for o in &others {
+            if let Some(c) = tx.repo().snapshot(o)?.cloak.clone() {
+                if Some(c.as_str()) != cloak {
+                    declassify.insert(c);
+                }
+            }
+        }
+        let mut report = NormalizeReport::default();
+        tree = normalize_tree(
+            &store,
+            &tree,
+            &NormalizeOptions {
+                policy: &policy,
+                dest_policy: &dest_policy,
+                dest_tree: into_snap.tree,
+                cloak,
+                declassify: &declassify,
+            },
+            &mut report,
+        )?;
+        // The destination is under an unreleased embargo: stay under it.
+        if let Some(w) = &outer {
+            if tree != merged.tree {
+                tree = wrap(&store, &w.embargo, &tree, &w.fallback)?;
+            }
+        }
         if let Some(e) = &embargo_id {
             tree = apply_embargo(&store, &tree, &into_snap.tree, e)?;
         }
+        let description = match (&embargo_id, cloak) {
+            (Some(e), None) => store.make_text(message, Some(&format!("embargo/{e}")))?,
+            _ => store.make_text(message, cloak)?,
+        };
+        warnings.extend(report.kept_sealed.iter().map(|(p, why)| format!("{p} {why}")));
         let snap = Snapshot {
             parents,
             change_id: ChangeId::random(),
             tree,
-            description: store.make_text(message, into_snap.cloak.as_deref())?,
+            description,
             author: tx.repo().user.clone(),
             timestamp: now_millis(),
             predecessors: vec![],
@@ -227,6 +335,16 @@ impl Repo {
             snapshot: m,
             conflicts: snap.conflicts,
             embargo: embargo_id,
+            declassified: report.declassified.iter().map(|p| p.to_string()).collect(),
+            quarantined: report
+                .quarantined
+                .iter()
+                .map(|(p, f)| {
+                    let rules: Vec<&str> = f.iter().map(|f| f.rule).collect();
+                    format!("{p} ({})", rules.join(", "))
+                })
+                .collect(),
+            warnings,
         })
     }
 

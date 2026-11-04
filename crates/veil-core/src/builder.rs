@@ -239,6 +239,13 @@ struct Builder<'a> {
     /// since the parent must still be re-scanned, because the parent may
     /// have been built under rules (e.g. `public!`) that no longer apply.
     policy_changed: bool,
+    /// The parent's policy, when `policy_changed`: only a path whose
+    /// classification *this* snapshot's policy edit changed may leave the
+    /// audience it is sealed for (see `file_entry`).
+    parent_policy: Option<Policy>,
+    /// Re-scan unchanged public content (scanner rules changed since this
+    /// device last scanned). Affects secret scanning only, never visibility.
+    rescan: bool,
     cache: Option<CacheRun>,
     report: BuildReport,
 }
@@ -269,8 +276,7 @@ pub fn build_tree_cached(
         _ => false,
     };
     let use_hints = use_hints && !opts.rescan;
-    let policy_changed = opts.rescan
-        || match (fs.read_opt(&policy_path)?, parent_policy) {
+    let policy_changed = match (fs.read_opt(&policy_path)?, parent_policy) {
             (Some(now), Some(p)) => !store.matches_encoding(&p, &now)?,
             (None, None) => false,
             _ => true,
@@ -282,12 +288,23 @@ pub fn build_tree_cached(
         (Some(c), Some(clock)) => Some(c.begin_run(CacheKey::compute(fs, &store.keys, clock)?, clock)),
         _ => None,
     };
+    let parent_policy = match parent.as_ref().and_then(|t| t.get(POLICY_FILE)) {
+        Some(e) if policy_changed => match store.read_entry(e) {
+            Ok(b) => Some(Policy::parse(&String::from_utf8_lossy(&b))),
+            Err(err) if err.is_unreadable() => None,
+            Err(err) => return Err(err),
+        },
+        None if policy_changed => Some(Policy::builtin()),
+        _ => None,
+    };
     let mut b = Builder {
         store,
         fs,
         opts,
         use_hints,
         policy_changed,
+        parent_policy,
+        rescan: opts.rescan,
         cache: run,
         report: BuildReport {
             policy_warnings: opts.policy.warnings.clone(),
@@ -299,6 +316,7 @@ pub fn build_tree_cached(
         Some(id) => id,
         None => store.empty_tree()?,
     };
+    let id = b.keep_embargo(id)?;
     if let (Some(c), Some(run)) = (cache, b.cache.take()) {
         c.end_run(run);
     }
@@ -306,6 +324,34 @@ pub fn build_tree_cached(
 }
 
 impl Builder<'_> {
+    /// A line under an unreleased embargo stays under it. A key holder's new
+    /// tree is re-wrapped under the same embargo (readers without the key
+    /// keep seeing the pre-merge tree). A reader without the key only sees
+    /// that pre-merge tree, so recording edits on top of it would silently
+    /// revert the hidden change for everyone else: such edits are held back
+    /// (reported as cloak failures) until the embargo is released.
+    fn keep_embargo(&mut self, id: ObjectId) -> Result<ObjectId> {
+        let Some(parent) = self.opts.parent_tree.filter(|p| *p != id) else {
+            return Ok(id);
+        };
+        let Some(w) = crate::embargo::unreleased_wrapper(self.store, &parent)? else {
+            return Ok(id);
+        };
+        if self.store.keys.has(&w.key_label()) {
+            return crate::embargo::wrap(self.store, &w.embargo, &id, &w.fallback);
+        }
+        for c in crate::tree::diff_trees(self.store, Some(&parent), Some(&id))? {
+            self.report.cloak_failures.push((
+                c.path,
+                format!(
+                    "held back: embargo {} hides this line's current content from you; edits are recorded after its release",
+                    w.embargo
+                ),
+            ));
+        }
+        Ok(parent)
+    }
+
     /// `parent` is the parent's tree for `dir` and its id.
     fn build_dir(&mut self, dir: &VPath, parent: Option<(&Tree, ObjectId)>) -> Result<Option<ObjectId>> {
         let parent_id = parent.map(|(_, id)| id);
@@ -478,6 +524,22 @@ impl Builder<'_> {
                 };
             }
         }
+        // Sealed content keeps its audience. Neither a change of workspace
+        // (`vl new <cloaked change>`), nor a rebase, nor a policy that arrived
+        // by merge may re-key it or make it public: only an edit of
+        // `.veilpolicy` in this very snapshot that reclassifies the path
+        // (`vl expose`, `vl cloak --scope`) is a deliberate decision to.
+        if let Some(pe) = parent_file.filter(|pe| matches!(pe.visibility, Visibility::Cloaked { .. })) {
+            if desired != pe.visibility {
+                let reclassified = self
+                    .parent_policy
+                    .as_ref()
+                    .is_some_and(|old| old.classify(path, false) != class);
+                if !reclassified {
+                    desired = pe.visibility.clone();
+                }
+            }
+        }
 
         // Fast path: overlay/tree-view says the file is byte-identical.
         if let Some(pe) = parent_file {
@@ -519,6 +581,17 @@ impl Builder<'_> {
                     if pe.executable == executable && self.store.matches_encoding(&pe.id, &data)? {
                         return Ok(Some(pe.clone()));
                     }
+                    // Still the fallback this reader was shown before the
+                    // release: not an edit, and recording it would revert the
+                    // fix. (The working copy is stale until checked out again.)
+                    if let Some(fb) = pe.fallback {
+                        if pe.executable == executable && self.store.matches_encoding(&fb, &data)? {
+                            return Ok(Some(TreeEntry {
+                                name: name.to_string(),
+                                ..pe.clone()
+                            }));
+                        }
+                    }
                 } else {
                     if self.store.keys.has(&format!("embargo/{embargo}")) {
                         desired = pe.visibility.clone();
@@ -551,10 +624,26 @@ impl Builder<'_> {
             }
         }
 
+        // A cloaked line of work seals what it *introduces*. A file left
+        // exactly as its public parent had it is already public; keep the
+        // entry (as the overlay fast path above does) rather than sealing a
+        // copy of public bytes.
+        if let Some(pe) = parent_file {
+            if self.opts.cloak.is_some()
+                && class.tier == Tier::Public
+                && pe.visibility.is_public()
+                && pe.id == content
+                && pe.executable == executable
+                && !self.policy_changed
+            {
+                return Ok(Some(pe.clone()));
+            }
+        }
+
         let mut scanned_clean = false;
         if desired.is_public() {
             if let Some(pe) = parent_file {
-                if !self.policy_changed && pe.id == content && pe.visibility.is_public() && pe.executable == executable {
+                if !self.policy_changed && !self.rescan && pe.id == content && pe.visibility.is_public() && pe.executable == executable {
                     self.learn(path, meta.as_ref(), content, false, None, parent_embargoed);
                     return Ok(Some(pe.clone())); // unchanged; scanned before
                 }
@@ -663,7 +752,7 @@ impl Builder<'_> {
                 match same_as_parent(&id) {
                     // Same rule as the uncached path: unchanged public content
                     // was scanned when it entered the parent.
-                    Some(pe) if !self.policy_changed => Some(pe.clone()),
+                    Some(pe) if !self.policy_changed && !self.rescan => Some(pe.clone()),
                     _ if (allow_secrets || rec.scanned_clean) && self.store.has(&id) => Some(self.fresh_entry(name, id, meta, desired)),
                     _ => None,
                 }

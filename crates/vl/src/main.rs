@@ -734,6 +734,22 @@ fn cmd_merge(
             }
         );
     }
+    if !res.declassified.is_empty() {
+        println!(
+            "  {} (secret-scanned): {}",
+            yellow("published from the cloaked line"),
+            res.declassified.join(", ")
+        );
+    }
+    if !res.quarantined.is_empty() {
+        warn(&format!(
+            "quarantined, left out of the merge (they hold secrets): {}",
+            res.quarantined.join(", ")
+        ));
+    }
+    for w in &res.warnings {
+        warn(w);
+    }
     if !res.conflicts.is_empty() {
         warn_untrusted(&format!("conflicts in: {}", res.conflicts.join(", ")));
     }

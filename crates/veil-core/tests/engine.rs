@@ -304,7 +304,9 @@ fn embargoed_merge_hides_changes_until_release() {
     let mirror = Repo::open(public_backend.clone(), Some(Identity::generate("public")), "public").unwrap();
     let e_pub = file_entry(&mirror, &res.snapshot, "auth.rs").unwrap();
     assert_eq!(mirror.store().read_entry(&e_pub).unwrap(), b"fn check() -> bool { true }\n", "public sees pre-merge content");
-    assert!(!mirror.store().entry_readable(&file_entry(&mirror, &res.snapshot, "CVE.md").unwrap()));
+    // The embargoed tree is sealed whole: the mirror does not even learn the
+    // name of the file the fix adds (BUG-018).
+    assert!(file_entry(&mirror, &res.snapshot, "CVE.md").is_none());
 
     // Release and push again: the public now sees the fix, same snapshot ids.
     alice.release_embargo(&embargo).unwrap();

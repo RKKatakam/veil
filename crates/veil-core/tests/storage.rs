@@ -430,11 +430,11 @@ fn gc_keeps_embargo_fallbacks_that_are_the_only_reference() {
     tx.commit().unwrap();
 
     let r = gc(&mut repo, &now_gc()).unwrap();
-    assert!(
-        r.deleted >= 3,
-        "the base tree, merged tree and plain new blob were garbage"
-    );
-    assert!(!store.has(&base_tree) && !store.has(&merged_tree) && !store.has(&new));
+    assert!(r.deleted >= 2, "the merged tree and plain new blob were garbage");
+    assert!(!store.has(&merged_tree) && !store.has(&new));
+    // The embargoed tree is sealed whole (BUG-018); its fallback is the
+    // pre-merge tree, which therefore stays reachable along with its blob.
+    assert!(store.has(&base_tree), "fallback tree kept");
     assert!(store.has(&old), "fallback-only blob kept");
     let e = lookup(&store, &sealed_tree, &p("auth.rs")).unwrap().unwrap();
     assert_eq!(e.fallback, Some(old));

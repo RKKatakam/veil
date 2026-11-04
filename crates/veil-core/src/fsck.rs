@@ -384,8 +384,10 @@ impl Checker {
     // ---- graph ----------------------------------------------------------------
 
     fn walk_snapshots(&mut self, roots: Vec<(ObjectId, String)>) {
-        let mut stack: Vec<(ObjectId, String)> = roots.into_iter().rev().collect();
-        while let Some((id, from)) = stack.pop() {
+        // The flag marks a parent a public remote withholds: the merged-in
+        // side of an embargoed merge, until the embargo is released.
+        let mut stack: Vec<(ObjectId, String, bool)> = roots.into_iter().rev().map(|(id, from)| (id, from, false)).collect();
+        while let Some((id, from, withheld)) = stack.pop() {
             if !self.seen_snapshots.insert(id) {
                 continue;
             }
@@ -395,6 +397,14 @@ impl Checker {
                     self.push(
                         Severity::Corrupt,
                         format!("{from} refers to {id} as a snapshot, but it is a {}", o.kind_name()),
+                    );
+                    continue;
+                }
+                Load::Missing if withheld => {
+                    self.note_missing(
+                        id,
+                        Severity::Redacted,
+                        format!("snapshot {id} (merged by {from}) is withheld until its embargo is released"),
                     );
                     continue;
                 }
@@ -410,8 +420,12 @@ impl Checker {
             };
             self.report.snapshots += 1;
             let me = format!("snapshot {}", id.short());
-            for p in s.parents.iter().rev() {
-                stack.push((*p, me.clone()));
+            let embargoed = s
+                .embargo
+                .as_ref()
+                .is_some_and(|e| !self.embargoes.get(e).copied().unwrap_or(false));
+            for (i, p) in s.parents.iter().enumerate().rev() {
+                stack.push((*p, me.clone(), embargoed && i > 0));
             }
             for p in &s.predecessors {
                 if !self.store.has(p) {
@@ -466,6 +480,14 @@ impl Checker {
             None => return,
         };
         self.report.trees += 1;
+        // An embargo wrapper: its sealed side (withheld until release) and
+        // its fallback, plus the listed objects only the sealed side reaches.
+        if let Some(w) = crate::embargo::wrapper_parts(&tree) {
+            self.check_embargo_known(&w.embargo);
+            self.check_tree(w.inner, &format!("{path} (under embargo {})", w.embargo), true);
+            self.check_tree(w.fallback, path, false);
+            return;
+        }
         let mut prev: Option<&str> = None;
         for e in &tree.entries {
             let bad_name = e.name.is_empty() || e.name == "." || e.name == ".." || e.name.contains(['/', '\0']);

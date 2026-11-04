@@ -254,6 +254,17 @@ impl Repo {
         self.store.snapshot(id)
     }
 
+    /// Like [`Repo::snapshot`], but `None` for a snapshot this replica does
+    /// not hold. Graph walks use it: a public remote withholds the merged-in
+    /// history of an unreleased embargoed merge, so such parents are absent.
+    pub fn snapshot_opt(&self, id: &ObjectId) -> Result<Option<Arc<Snapshot>>> {
+        match self.store.snapshot(id) {
+            Ok(s) => Ok(Some(s)),
+            Err(VeilError::Missing(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn workspace_wc(&self, ws: &str) -> Result<ObjectId> {
         Ok(self.view.workspace(ws)?.wc)
     }
@@ -280,13 +291,15 @@ impl Repo {
             if nodes.contains_key(&id) {
                 continue;
             }
-            let s = self.snapshot(&id)?;
+            // A redacted parent (withheld by an unreleased embargo) is simply
+            // not part of this replica's graph.
+            let Some(s) = self.snapshot_opt(&id)? else { continue };
             stack.extend(s.parents.iter().copied());
             nodes.insert(id, s);
         }
         let mut child_count: HashMap<ObjectId, usize> = HashMap::new();
         for s in nodes.values() {
-            for p in &s.parents {
+            for p in s.parents.iter().filter(|p| nodes.contains_key(*p)) {
                 *child_count.entry(*p).or_default() += 1;
             }
         }
@@ -298,7 +311,7 @@ impl Repo {
         let mut out = Vec::with_capacity(nodes.len());
         while let Some((_, id)) = heap.pop() {
             out.push(id);
-            for p in &nodes[&id].parents {
+            for p in nodes[&id].parents.iter().filter(|p| nodes.contains_key(*p)) {
                 let c = child_count.get_mut(p).unwrap();
                 *c -= 1;
                 if *c == 0 {
@@ -318,7 +331,9 @@ impl Repo {
         let mut stack = vec![*id];
         while let Some(x) = stack.pop() {
             if seen.insert(x) {
-                stack.extend(self.snapshot(&x)?.parents.iter().copied());
+                if let Some(s) = self.snapshot_opt(&x)? {
+                    stack.extend(s.parents.iter().copied());
+                }
             }
         }
         Ok(seen)
@@ -338,7 +353,9 @@ impl Repo {
                 return Ok(x);
             }
             if seen.insert(x) {
-                queue.extend(self.snapshot(&x)?.parents.iter().copied());
+                if let Some(s) = self.snapshot_opt(&x)? {
+                    queue.extend(s.parents.iter().copied());
+                }
             }
         }
         Ok(self.root_id)
@@ -359,6 +376,11 @@ impl Repo {
                 let mut acc = self.snapshot(first)?.tree;
                 let mut conflicts = Vec::new();
                 for p in rest {
+                    // A redacted extra parent (the withheld source of an
+                    // unreleased embargo) contributes nothing we can see.
+                    if self.snapshot_opt(p)?.is_none() {
+                        continue;
+                    }
                     let base = self.common_ancestor(first, p)?;
                     let out = merge_trees(
                         &self.store,

@@ -559,7 +559,30 @@ impl ObjectStore {
         Ok(obj)
     }
 
+    /// The tree `id` as this reader sees it. An embargo wrapper (see
+    /// [`crate::embargo`]) resolves to its sealed content for key holders
+    /// and to its fallback for everyone else; any other tree is returned as
+    /// stored. The resolution is not cached: it depends on keys and release
+    /// state, which change.
     pub fn tree(&self, id: &ObjectId) -> Result<Arc<Tree>> {
+        let t = self.tree_object(id)?;
+        match crate::embargo::wrapper_parts(&t) {
+            None => Ok(t),
+            Some(w) => {
+                if self.keys.has(&w.key_label()) {
+                    match self.tree(&w.inner) {
+                        Err(e) if e.is_unreadable() => {}
+                        r => return r,
+                    }
+                }
+                self.tree(&w.fallback)
+            }
+        }
+    }
+
+    /// The tree object `id` exactly as stored (unsealed, but an embargo
+    /// wrapper is *not* resolved). For code that walks raw objects.
+    pub fn tree_object(&self, id: &ObjectId) -> Result<Arc<Tree>> {
         if let Some(t) = self.trees.get(id) {
             return Ok(t);
         }
