@@ -282,37 +282,48 @@ fn a_directory_swapped_for_a_link_mid_write_never_redirects_it() {
 /// outside.
 #[test]
 fn a_directory_swapped_for_a_link_mid_checkout_receives_nothing_outside() {
-    let d = disk();
-    let (repo, _, _) = new_repo("alice");
-    let leaves: Vec<(String, TreeEntry)> = (0..400).map(|i| (format!("a/sub/f{i}"), file(&repo, &format!("f{i}"), "payload\n"))).collect();
-    let tree = tree_of(&repo, leaves.iter().map(|(p, e)| (p.as_str(), e.clone())).collect());
-    std::fs::create_dir_all(d.root.join("a/sub")).unwrap();
-    let stop = Arc::new(AtomicBool::new(false));
-    let (root, outside) = (d.root.clone(), d.outside.clone());
-    let swapper = {
-        let stop = stop.clone();
-        std::thread::spawn(move || {
-            let (a, aside) = (root.join("a/sub"), root.join("a/sub.real"));
-            while !stop.load(Ordering::Relaxed) {
-                if std::fs::rename(&a, &aside).is_ok() {
-                    let _ = std::os::unix::fs::symlink(&outside, &a);
-                    std::thread::yield_now();
-                    let _ = std::fs::remove_file(&a);
-                    let _ = std::fs::rename(&aside, &a);
+    // The safety property (nothing outside) is checked on every attempt.
+    // Liveness (some file written despite the race) depends on scheduling:
+    // a swapper that wins every race makes every write refused, which is
+    // safe, so a few attempts are allowed before it counts as a failure.
+    let mut wrote = false;
+    for _ in 0..5 {
+        let d = disk();
+        let (repo, _, _) = new_repo("alice");
+        let leaves: Vec<(String, TreeEntry)> = (0..400).map(|i| (format!("a/sub/f{i}"), file(&repo, &format!("f{i}"), "payload\n"))).collect();
+        let tree = tree_of(&repo, leaves.iter().map(|(p, e)| (p.as_str(), e.clone())).collect());
+        std::fs::create_dir_all(d.root.join("a/sub")).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (root, outside) = (d.root.clone(), d.outside.clone());
+        let swapper = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let (a, aside) = (root.join("a/sub"), root.join("a/sub.real"));
+                while !stop.load(Ordering::Relaxed) {
+                    if std::fs::rename(&a, &aside).is_ok() {
+                        let _ = std::os::unix::fs::symlink(&outside, &a);
+                        std::thread::yield_now();
+                        let _ = std::fs::remove_file(&a);
+                        let _ = std::fs::rename(&aside, &a);
+                    }
                 }
-            }
-        })
-    };
-    let r = repo.checkout_tree(&d.fs, None, &tree);
-    stop.store(true, Ordering::Relaxed);
-    swapper.join().unwrap();
-    // Never an error that aborts it half-way (a refused write is per path).
-    let r = r.unwrap();
-    assert!(r.written > 0);
-    if d.is_link("a/sub") {
-        std::fs::remove_file(d.root.join("a/sub")).unwrap();
+            })
+        };
+        let r = repo.checkout_tree(&d.fs, None, &tree);
+        stop.store(true, Ordering::Relaxed);
+        swapper.join().unwrap();
+        // Never an error that aborts it half-way (a refused write is per path).
+        let r = r.unwrap();
+        if d.is_link("a/sub") {
+            std::fs::remove_file(d.root.join("a/sub")).unwrap();
+        }
+        d.assert_outside_untouched();
+        if r.written > 0 {
+            wrote = true;
+            break;
+        }
     }
-    d.assert_outside_untouched();
+    assert!(wrote, "no attempt wrote anything: the checkout never made progress against the swapper");
 }
 
 // ---- recording links (threats 2-6, 9, 11, 14) -------------------------------------
