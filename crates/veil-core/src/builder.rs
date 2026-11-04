@@ -117,6 +117,12 @@ pub struct BuildOptions<'a> {
 /// Rule name of a [`Finding`] for content copied from an injected secret.
 pub const INJECTED_RULE: &str = "injected-isolated-secret";
 
+/// The "scope" under which a stat cache record notes that a file is the
+/// rendering of a conflict entry (`sealed` = `(CONFLICT_COPY, conflict
+/// id)`). No scope can have this name, so the fact is never taken for a
+/// sealing.
+const CONFLICT_COPY: &str = ":conflict";
+
 /// Values the engine injected from the vault (isolated files such as
 /// `.env`, keys, keystores, quarantined files) into a sandbox.
 ///
@@ -1113,7 +1119,7 @@ impl Builder<'_> {
                     // but only for a reader who sees every side of it (and
                     // was shown it): a version it cannot read is carried.
                     let never_materialised = b.opts.materialised.is_some_and(|m| m.hidden(path));
-                    let all_seen = match crate::conflict::materialize_entry(b.store, e, crate::conflict::Audience::Reader) {
+                    let all_seen = match crate::conflict::inspect_entry(b.store, e, crate::conflict::Audience::Reader) {
                         Ok(m) => !m.unreadable_side,
                         Err(err) if err.is_unreadable() || err.is_not_found() || matches!(err, VeilError::Corrupt(..) | VeilError::Unsupported(_)) => false,
                         Err(err) => return Err(err),
@@ -1225,20 +1231,38 @@ impl Builder<'_> {
             }
             Err(e) => return Err(e),
         };
-        let m = crate::conflict::materialize(self.store, &conflict, crate::conflict::Audience::Reader)?;
         let meta = match self.fs.metadata(path) {
             Ok(m) => m,
             Err(e) => return self.unreadable(path, e, Some(ce)),
         };
+        let class = self.opts.policy.classify(path, false);
+        let local_only = matches!(class.tier, Tier::Ignored | Tier::Isolated);
+        // A copy whose stat has not moved since it was found to be exactly
+        // this conflict's rendering is still that: no need to render the
+        // conflict again to compare (BUG-484). The stat cache is dropped
+        // whenever keys change, which could change the rendering.
+        let rendered_as = |id: &ObjectId| Some((CONFLICT_COPY.to_string(), *id));
+        if let (false, Some(meta)) = (local_only, meta.as_ref()) {
+            if let Some(rec) = self.cache.as_ref().and_then(|c| c.trusted(path, meta)).cloned() {
+                if rec.sealed == rendered_as(&ce.id) {
+                    if let Some(run) = self.cache.as_mut() {
+                        run.keep(path, rec);
+                    }
+                    return Ok(Some(ce.clone()));
+                }
+            }
+        }
+        let m = crate::conflict::materialize(self.store, &conflict, crate::conflict::Audience::Reader)?;
         let executable = meta.as_ref().is_some_and(|m| m.executable);
         let data = match self.fs.read(path) {
             Ok(d) => d,
             Err(e) => return self.unreadable(path, e, Some(ce)),
         };
         self.report.hashed += 1;
-        let class = self.opts.policy.classify(path, false);
-        let local_only = matches!(class.tier, Tier::Ignored | Tier::Isolated);
         if !local_only && data == m.content && executable == m.executable {
+            if let (Some(run), Some(meta)) = (self.cache.as_mut(), meta.as_ref()) {
+                run.learn(path, meta, Object::blob_id(&data), false, rendered_as(&ce.id));
+            }
             return Ok(Some(ce.clone()));
         }
         if let Some(rec) = self.opts.materialised {

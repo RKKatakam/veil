@@ -477,6 +477,15 @@ conflicts with its new parent holds the conflict, and its descendants move
 with it. Rebasing it again onto a parent that already has the change (or
 back where it was) resolves it, as in Jujutsu.
 
+Very different versions of a large file (two regenerated lockfiles, a
+rewritten bundle) are not compared line by line: past a fixed amount of
+work the file gets one conflict holding each version whole between the
+markers, after the lines all of them share at the start and end. The same
+limit applies to clean merges (such a file then conflicts) and to `vl
+diff` (one hunk replaces the differing middle), so no file can stall a
+command. `vl status`, `vl ls` and `vl resolve --list` never render a
+conflict at all (`vl ls` shows no size for one).
+
 A version you cannot read (sealed for a scope you are not in) is shown in
 the markers as a `(not shown: …)` line. You cannot resolve such a conflict:
 an edit of the file is held back (it stays local), and deleting it is not a
@@ -503,6 +512,7 @@ other way round), then delete the moved-aside copy.
 | `VEIL_GIT` | The `git` binary used by `vl git` |
 | `VEIL_SSH` | The `ssh` command used for SSH remotes |
 | `VEIL_FS_FOLDING` | Override the detected filename case/Unicode folding (see the README's platform notes) |
+| `VEIL_MAX_OBJECT` | Largest object a pack may hold when read (default `4G`; a larger declared size is refused as damaged or hostile) |
 | `NO_COLOR` | Disable colours (they are off anyway when output is not a terminal) |
 
 Next: [Coming from Git](coming-from-git.md).

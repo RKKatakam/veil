@@ -68,7 +68,7 @@ use super::{
         FXP_READ, FXP_READDIR, FXP_REMOVE, FXP_RENAME, FXP_RMDIR, FXP_SETSTAT, FXP_WRITE, FX_EOF, FX_NO_SUCH_FILE,
     },
     sftp_url::SshUrl,
-    DirEntry, Metadata, NodeKind, StorageBackend,
+    parse_size, DirEntry, Metadata, NodeKind, StorageBackend,
 };
 pub use super::sftp_client::SftpStats;
 use crate::{
@@ -146,24 +146,6 @@ impl SftpOptions {
         }
         Ok(o)
     }
-}
-
-/// `123`, `64K`, `512M`, `8G`, `1T` (binary multiples; `KiB`, `MB` … and
-/// lower case also accepted).
-fn parse_size(v: &str) -> Option<u64> {
-    let v = v.trim();
-    let digits = v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len());
-    let (n, unit) = v.split_at(digits);
-    let n: u64 = n.parse().ok()?;
-    let shift = match unit.trim().to_ascii_lowercase().as_str() {
-        "" | "b" => 0,
-        "k" | "kb" | "kib" => 10,
-        "m" | "mb" | "mib" => 20,
-        "g" | "gb" | "gib" => 30,
-        "t" | "tb" | "tib" => 40,
-        _ => return None,
-    };
-    n.checked_mul(1u64 << shift).filter(|n| *n > 0)
 }
 
 /// The error for a read or listing that passed one of the limits.

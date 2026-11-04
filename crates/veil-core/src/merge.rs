@@ -417,6 +417,9 @@ fn resolve_by_content(store: &ObjectStore, path: &VPath, name: &str, m: &Merge) 
     Ok(Some(acc))
 }
 
+/// Git's (and diffy's default) conflict marker length.
+const MARKER_LEN: usize = 7;
+
 /// diff3 of `ours` and `theirs` where each conflicting hunk takes the
 /// `base`'s lines (for a virtual merge base, see [`Mode::VirtualBase`]).
 fn merge_keeping_base(base: &[u8], ours: &[u8], theirs: &[u8]) -> Vec<u8> {
@@ -438,11 +441,7 @@ fn merge_keeping_base(base: &[u8], ours: &[u8], theirs: &[u8]) -> Vec<u8> {
         m
     };
     let (start, orig, mid, end) = (marker(b'<', b" ours"), marker(b'|', b" original"), marker(b'=', b""), marker(b'>', b" theirs"));
-    let merged = match diffy::MergeOptions::new()
-        .set_conflict_marker_length(n)
-        .set_conflict_style(diffy::ConflictStyle::Diff3)
-        .merge_bytes(base, ours, theirs)
-    {
+    let merged = match crate::textmerge::merge(base, ours, theirs, n, crate::textmerge::Style::Diff3) {
         Ok(m) => return m,
         Err(m) => m,
     };
@@ -521,7 +520,7 @@ fn merge_file_content(
         conflicts.push(path.clone());
         return Ok(None);
     }
-    let merged = match diffy::merge_bytes(&base, &ours, &theirs) {
+    let merged = match crate::textmerge::merge(&base, &ours, &theirs, MARKER_LEN, crate::textmerge::Style::Diff3) {
         Ok(m) => m,
         Err(_) => {
             conflicts.push(path.clone());
@@ -588,8 +587,8 @@ fn merge_file(
     // public result, or in one sealed for another audience.
     let base_ok = base_shown(store, be, &visibility)?;
     let style = match base_ok {
-        true => diffy::ConflictStyle::Diff3,
-        false => diffy::ConflictStyle::Merge,
+        true => crate::textmerge::Style::Diff3,
+        false => crate::textmerge::Style::Merge,
     };
     let merged = if mode == Mode::VirtualBase {
         // A virtual base keeps the base's version where the two merge
@@ -608,7 +607,7 @@ fn merge_file(
         conflicts.push(path.clone());
         ours
     } else {
-        match diffy::MergeOptions::new().set_conflict_style(style).merge_bytes(&base, &ours, &theirs) {
+        match crate::textmerge::merge(&base, &ours, &theirs, MARKER_LEN, style) {
             Ok(m) => m,
             Err(m) => {
                 conflicts.push(path.clone());

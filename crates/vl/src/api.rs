@@ -320,11 +320,24 @@ pub struct ConflictVersion {
 
 /// [`ConflictInfo`] of `e`, `None` unless it is a conflict entry.
 pub fn conflict_info(repo: &Repo, e: &TreeEntry) -> Option<ConflictInfo> {
+    look(repo, e).map(|l| l.info)
+}
+
+/// A conflict entry as this reader is told about it: what its
+/// materialised file would be ([`veil_core::conflict::inspect`]: the
+/// sides' text is never merged, BUG-484) and its [`ConflictInfo`]. Each
+/// listing computes it once per entry.
+struct Looked {
+    view: veil_core::conflict::View,
+    info: ConflictInfo,
+}
+
+fn look(repo: &Repo, e: &TreeEntry) -> Option<Looked> {
     if e.kind != EntryKind::Conflict {
         return None;
     }
     let c = repo.store().conflict(&e.id).ok()?;
-    let m = veil_core::conflict::materialize(repo.store(), &c, veil_core::conflict::Audience::Reader).ok()?;
+    let m = veil_core::conflict::inspect(repo.store(), &c, veil_core::conflict::Audience::Reader).ok()?;
     let versions = c
         .interleaved()
         .enumerate()
@@ -335,24 +348,8 @@ pub fn conflict_info(repo: &Repo, e: &TreeEntry) -> Option<ConflictInfo> {
             readable: t.as_ref().is_none_or(|t| id_readable(repo, &t.id)),
         })
         .collect();
-    Some(ConflictInfo { sides: c.adds.len(), bases: c.removes.len(), versions, redacted: m.redacted, unreadable_side: m.unreadable_side })
-}
-
-/// What a reader sees of a conflict entry: the materialised file's
-/// visibility, size and executable bit, and whether every side is
-/// readable here.
-fn conflict_view(repo: &Repo, e: &TreeEntry) -> Option<(Visibility, u64, bool, bool)> {
-    if e.kind != EntryKind::Conflict {
-        return None;
-    }
-    let m = veil_core::conflict::materialize_entry(repo.store(), e, veil_core::conflict::Audience::Reader).ok()?;
-    Some((m.visibility, m.content.len() as u64, m.executable, !m.unreadable_side))
-}
-
-/// The visibility a reader should be told for `e`: a conflict's is that of
-/// its materialised file.
-fn shown_visibility(repo: &Repo, e: &TreeEntry) -> Visibility {
-    conflict_view(repo, e).map_or_else(|| e.visibility.clone(), |v| v.0)
+    let info = ConflictInfo { sides: c.adds.len(), bases: c.removes.len(), versions, redacted: m.redacted, unreadable_side: m.unreadable_side };
+    Some(Looked { view: m, info })
 }
 
 /// One changed path, as `vl status` and `vl diff --stat` list it.
@@ -375,13 +372,19 @@ pub struct Change {
 
 pub fn change(repo: &Repo, c: &TreeChange) -> Change {
     let e = c.new.as_ref().or(c.old.as_ref()).expect("a change has a side");
+    let looked = look(repo, e);
+    // A conflict's visibility is that of its materialised file.
+    let visibility = looked.as_ref().map_or_else(|| e.visibility.clone(), |l| l.view.visibility.clone());
+    let tier = entry_tier_with(repo, e, looked.as_ref());
     Change {
         path: path(&c.path),
         status: status_word(c),
-        visibility: Vis::from(&shown_visibility(repo, e)),
+        visibility: Vis::from(&visibility),
         redacted: c.new.as_ref().is_some_and(|e| !repo.store().entry_readable(e)),
-        tier: entry_tier(repo, e),
-        conflict: c.new.as_ref().and_then(|e| conflict_info(repo, e)),
+        tier,
+        // The conflict of the new version only (`e` is the old one for a
+        // deletion).
+        conflict: if c.new.is_some() { looked.map(|l| l.info) } else { None },
     }
 }
 
@@ -393,13 +396,18 @@ pub fn change(repo: &Repo, c: &TreeChange) -> Change {
 /// (sealed for someone else, or withheld here). The local-only tiers
 /// (`isolated`, `ignored`, `quarantined`) come from the working copy.
 pub fn entry_tier(repo: &Repo, e: &TreeEntry) -> &'static str {
+    entry_tier_with(repo, e, look(repo, e).as_ref())
+}
+
+/// [`entry_tier`] with `e`'s [`look`] already computed.
+fn entry_tier_with(repo: &Repo, e: &TreeEntry, looked: Option<&Looked>) -> &'static str {
     // A conflict: the tier of its materialised file, `redacted` when a
     // side cannot be read here.
-    if let Some((v, _, _, all_readable)) = conflict_view(repo, e) {
-        return match v {
-            _ if !all_readable => "redacted",
+    if let Some(l) = looked {
+        return match &l.view.visibility {
+            _ if l.view.unreadable_side => "redacted",
             Visibility::Public => "public",
-            Visibility::Embargoed { embargo } if repo.keys().embargo_released(&embargo) => "public",
+            Visibility::Embargoed { embargo } if repo.keys().embargo_released(embargo) => "public",
             Visibility::Cloaked { .. } => "cloaked",
             Visibility::Embargoed { .. } => "embargoed",
         };
@@ -884,13 +892,13 @@ pub struct HunkLine {
 /// `readable` costs a read of the object: the text output, which never
 /// shows it, skips it (`check_readable: false` leaves it true).
 fn entry_info(repo: &Repo, e: &TreeEntry, check_readable: bool) -> EntryInfo {
-    if let Some((v, _, executable, all_readable)) = conflict_view(repo, e) {
+    if let Some(Looked { view, info }) = look(repo, e) {
         return EntryInfo {
-            visibility: Vis::from(&v),
-            executable,
-            mode: if executable { "100755" } else { "100644" },
-            readable: all_readable,
-            conflict: conflict_info(repo, e),
+            visibility: Vis::from(&view.visibility),
+            executable: view.executable,
+            mode: if view.executable { "100755" } else { "100644" },
+            readable: !view.unreadable_side,
+            conflict: Some(info),
         };
     }
     EntryInfo {
@@ -950,7 +958,9 @@ fn content(repo: &Repo, c: &TreeChange) -> Content {
     }
     let old_s = String::from_utf8_lossy(&old);
     let new_s = String::from_utf8_lossy(&new);
-    Content { binary: false, hidden: None, hunks: hunks(&diffy::create_patch(&old_s, &new_s)) }
+    // Bounded (BUG-484), as `vl diff`'s text output is.
+    let mut scratch = String::new();
+    Content { binary: false, hidden: None, hunks: hunks(&veil_core::textmerge::create_patch(&old_s, &new_s, &mut scratch)) }
 }
 
 fn hunks(patch: &diffy::Patch<'_, str>) -> Vec<Hunk> {
@@ -1438,7 +1448,8 @@ pub struct LsEntry {
     /// The recorded entry's visibility label (null when not recorded).
     pub visibility: Option<Vis>,
     /// In bytes: the recorded size, or the file's on disk for a local-only
-    /// file. Null for an ignored directory.
+    /// file. Null for an ignored directory, and for an unresolved conflict
+    /// (its file is only rendered when checked out, BUG-484).
     pub size: Option<u64>,
     pub executable: bool,
     /// This reader can read the content (a local-only file: it is on disk).
@@ -1503,10 +1514,10 @@ pub fn ls(ctx: &Ctx, rev: &str, paths: &[String], all: bool, local_files: bool) 
         if !under(&filters, &p, false) {
             continue;
         }
-        let mut tier = entry_tier(repo, &e);
-        let view = conflict_view(repo, &e);
-        let readable = match &view {
-            Some(v) => v.3,
+        let looked = look(repo, &e);
+        let mut tier = entry_tier_with(repo, &e, looked.as_ref());
+        let readable = match &looked {
+            Some(l) => !l.view.unreadable_side,
             None => id_readable(repo, &e.id),
         };
         let fallback = !readable && e.fallback.is_some_and(|f| id_readable(repo, &f));
@@ -1523,9 +1534,11 @@ pub fn ls(ctx: &Ctx, rev: &str, paths: &[String], all: bool, local_files: bool) 
         if q.is_some() {
             tier = "quarantined";
         }
-        let (vis, size, executable) = match &view {
-            Some((v, size, exec, _)) => (v.clone(), *size, *exec),
-            None => (e.visibility.clone(), e.size, e.executable),
+        // A conflict's size is its materialised file's, which only a
+        // checkout renders (BUG-484): unknown here.
+        let (vis, size, executable) = match &looked {
+            Some(l) => (l.view.visibility.clone(), None, l.view.executable),
+            None => (e.visibility.clone(), Some(e.size), e.executable),
         };
         let (scope, embargo) = vis_parts(&vis);
         entries.push((
@@ -1538,13 +1551,13 @@ pub fn ls(ctx: &Ctx, rev: &str, paths: &[String], all: bool, local_files: bool) 
                 embargo,
                 recorded: true,
                 visibility: Some(Vis::from(&vis)),
-                size: Some(size),
+                size,
                 executable,
                 readable: readable || fallback,
                 fallback,
                 redaction,
                 quarantine: q,
-                conflict: conflict_info(repo, &e),
+                conflict: looked.map(|l| l.info),
             },
         ));
     }

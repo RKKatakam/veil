@@ -78,7 +78,34 @@ pub const MAX_DELTA_DEPTH: u32 = 10;
 const MAX_READ_CHAIN: usize = 64;
 /// Objects larger than this are decompressed by streaming instead of into a
 /// pre-sized buffer, so a corrupt length can never trigger a huge allocation.
+/// They are decoded twice: once into a hash (in [`STREAM_CHUNK`]s), and
+/// only once that matched the id into memory, so a frame that inflates to
+/// gigabytes of anything else costs time but never memory (BUG-490).
 const BULK_LIMIT: u64 = 64 << 20;
+/// Output buffer of a streamed decode.
+const STREAM_CHUNK: usize = 1 << 20;
+
+/// Largest object a pack entry may hold by default: the ceiling one file
+/// read from an SFTP remote has (`VEIL_SFTP_MAX_FILE`), and the Veil Hub's
+/// object limit. `VEIL_MAX_OBJECT` (bytes, or a `K`/`M`/`G` suffix)
+/// overrides it. An entry declaring more is refused before anything is
+/// decoded (BUG-490).
+pub const DEFAULT_MAX_OBJECT: u64 = 4 << 30;
+
+/// Most entries one pack may hold: far more than any pack vl writes (sync
+/// packs close at about 128 MiB, see `remote.rs`), so an index claiming
+/// more is damaged or hostile.
+pub const MAX_PACK_ENTRIES: usize = 1 << 25;
+
+/// The largest object a pack entry may declare in this process:
+/// `VEIL_MAX_OBJECT`, or [`DEFAULT_MAX_OBJECT`] (also when the setting
+/// does not parse).
+pub fn max_object_size() -> u64 {
+    static MAX: OnceLock<u64> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("VEIL_MAX_OBJECT").ok().and_then(|v| crate::vfs::parse_size(&v)).unwrap_or(DEFAULT_MAX_OBJECT)
+    })
+}
 /// Deltas are only tried for objects at least this large.
 #[cfg(feature = "zstd")]
 const MIN_DELTA_SIZE: usize = 64;
@@ -203,6 +230,9 @@ impl PackIndex {
             return Err(bad("bad header"));
         }
         let n = u32_at(raw, 8) as usize;
+        if n > MAX_PACK_ENTRIES {
+            return Err(bad(&format!("{n} entries, more than a pack may hold ({MAX_PACK_ENTRIES})")));
+        }
         let expected = n
             .checked_mul(IDX_ENTRY_LEN)
             .and_then(|x| x.checked_add(HEADER_LEN + FANOUT_LEN + 2 * SUM_LEN));
@@ -239,6 +269,13 @@ impl PackIndex {
             lens: (0..n).map(|i| u64_at(raw, lens_at + i * 8)).collect(),
             pack_sum: raw[sum_at..sum_at + 32].try_into().unwrap(),
         })
+    }
+
+    /// The size of the pack data file this index describes: its header,
+    /// every entry and the checksum (a pack vl writes has no gaps).
+    pub fn pack_len(&self) -> u64 {
+        let end = self.offsets.iter().zip(&self.lens).map(|(o, l)| o.saturating_add(*l)).max().unwrap_or(HEADER_LEN as u64);
+        end.saturating_add(SUM_LEN as u64)
     }
 
     pub fn find(&self, id: &ObjectId) -> Option<usize> {
@@ -285,6 +322,8 @@ pub struct Pack {
     size: u64,
     reads: AtomicUsize,
     data: OnceLock<Vec<u8>>,
+    /// Largest object an entry may declare ([`max_object_size`]).
+    max_object: u64,
 }
 
 impl Pack {
@@ -333,7 +372,15 @@ impl Pack {
             size,
             reads: AtomicUsize::new(0),
             data: OnceLock::new(),
+            max_object: max_object_size(),
         })
+    }
+
+    /// The same pack, refusing entries that declare more than `bytes`
+    /// (instead of [`max_object_size`]).
+    pub fn with_max_object(mut self, bytes: u64) -> Pack {
+        self.max_object = bytes;
+        self
     }
 
     pub fn name(&self) -> &str {
@@ -403,6 +450,15 @@ impl Pack {
             }
         })?;
         let raw_len = u64_at(raw, 1);
+        if raw_len > self.max_object {
+            return Err(corrupt(
+                self.what(),
+                format!(
+                    "an entry declares {raw_len} bytes unpacked, more than the {} bytes an object may have here (VEIL_MAX_OBJECT raises the limit)",
+                    self.max_object
+                ),
+            ));
+        }
         let (base, data_at) = match kind {
             EntryKind::Delta if raw.len() >= 41 => (Some(id_at(raw, 9)), 41),
             EntryKind::Delta => return Err(corrupt(self.what(), "truncated delta entry")),
@@ -451,7 +507,7 @@ impl Pack {
                 }
                 (EntryKind::Stored, _) => break Arc::new(self.check(&cur, e.raw_len, e.data)?),
                 _ => {
-                    let raw = decompress(&e.data, e.raw_len, None).map_err(|m| corrupt(cur.hex(), m))?;
+                    let raw = decompress(&e.data, e.raw_len, None, &cur).map_err(|m| corrupt(cur.hex(), m))?;
                     break Arc::new(self.check(&cur, e.raw_len, raw)?);
                 }
             }
@@ -459,7 +515,7 @@ impl Pack {
         let mut base_id = cur;
         while let Some((oid, e)) = chain.pop() {
             bases.insert(base_id, base.clone(), base.len());
-            let raw = decompress(&e.data, e.raw_len, Some(&base)).map_err(|m| corrupt(oid.hex(), m))?;
+            let raw = decompress(&e.data, e.raw_len, Some(&base), &oid).map_err(|m| corrupt(oid.hex(), m))?;
             base = Arc::new(self.check(&oid, e.raw_len, raw)?);
             base_id = oid;
         }
@@ -494,55 +550,108 @@ impl Pack {
     }
 }
 
+/// Decode one zstd frame of exactly `raw_len` bytes (optionally against
+/// `dict`) that must hash to `id`. Small objects are decoded into a buffer
+/// of their size at once; above [`BULK_LIMIT`] the frame is first streamed
+/// into the hash only, and decoded into memory once that matched (BUG-490).
+/// Neither pass ever produces more than `raw_len` bytes.
+fn decompress(data: &[u8], raw_len: u64, dict: Option<&[u8]>, id: &ObjectId) -> std::result::Result<Vec<u8>, String> {
+    if raw_len <= BULK_LIMIT {
+        return decompress_bulk(data, raw_len, dict);
+    }
+    let mut hasher = blake3::Hasher::new();
+    stream(data, raw_len, dict, &mut |chunk| {
+        hasher.update(chunk);
+    })?;
+    if hasher.finalize().as_bytes() != &id.0 {
+        return Err("content does not match its id".into());
+    }
+    let limit = usize::try_from(raw_len).map_err(|_| "object too large for this platform".to_string())?;
+    let mut out = Vec::with_capacity(limit);
+    stream(data, raw_len, dict, &mut |chunk| out.extend_from_slice(chunk))?;
+    Ok(out)
+}
+
 #[cfg(feature = "zstd")]
-fn decompress(data: &[u8], raw_len: u64, dict: Option<&[u8]>) -> std::result::Result<Vec<u8>, String> {
+fn decompress_bulk(data: &[u8], raw_len: u64, dict: Option<&[u8]>) -> std::result::Result<Vec<u8>, String> {
     let frame_len = zstd::bulk::Decompressor::upper_bound(data);
     if frame_len.map(|n| n as u64) != Some(raw_len) {
         return Err("compressed frame does not match the recorded length".into());
     }
-    let out = if raw_len <= BULK_LIMIT {
-        // Creating a zstd context per object dominates small reads; reuse
-        // one per thread.
-        thread_local! {
-            static DCTX: std::cell::RefCell<Option<zstd::bulk::Decompressor<'static>>> =
-                const { std::cell::RefCell::new(None) };
+    // Creating a zstd context per object dominates small reads; reuse
+    // one per thread. The output buffer is `raw_len` bytes: decoding fails
+    // rather than grow it.
+    thread_local! {
+        static DCTX: std::cell::RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let out = DCTX.with(|cell| -> std::result::Result<Vec<u8>, String> {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(zstd::bulk::Decompressor::new().map_err(|e| e.to_string())?);
         }
-        DCTX.with(|cell| -> std::result::Result<Vec<u8>, String> {
-            let mut slot = cell.borrow_mut();
-            if slot.is_none() {
-                *slot = Some(zstd::bulk::Decompressor::new().map_err(|e| e.to_string())?);
-            }
-            let d = slot.as_mut().unwrap();
-            d.set_dictionary(dict.unwrap_or(&[])).map_err(|e| e.to_string())?;
-            let out = d.decompress(data, raw_len as usize).map_err(|e| e.to_string());
-            if dict.is_some() {
-                d.set_dictionary(&[]).map_err(|e| e.to_string())?;
-            }
-            out
-        })?
-    } else {
-        use std::io::Read;
-        let mut out = Vec::new();
-        let dec = match dict {
-            Some(dict) => zstd::stream::read::Decoder::with_dictionary(data, dict),
-            None => zstd::stream::read::Decoder::with_buffer(data),
+        let d = slot.as_mut().unwrap();
+        d.set_dictionary(dict.unwrap_or(&[])).map_err(|e| e.to_string())?;
+        let out = d.decompress(data, raw_len as usize).map_err(|e| e.to_string());
+        if dict.is_some() {
+            d.set_dictionary(&[]).map_err(|e| e.to_string())?;
         }
-        .map_err(|e| e.to_string())?;
-        dec.take(raw_len + 1).read_to_end(&mut out).map_err(|e| e.to_string())?;
         out
-    };
+    })?;
     if out.len() as u64 != raw_len {
         return Err("decompressed length does not match the recorded length".into());
     }
     Ok(out)
 }
 
-/// Without the zstd C library, every entry is read with the pure-Rust
-/// decoder (identical results: the content is re-hashed either way).
+/// Stream the frame's content to `sink` in chunks of at most
+/// [`STREAM_CHUNK`] bytes: exactly `raw_len` bytes, or an error as soon as
+/// it would be more (or ends short).
+#[cfg(feature = "zstd")]
+fn stream(data: &[u8], raw_len: u64, dict: Option<&[u8]>, sink: &mut dyn FnMut(&[u8])) -> std::result::Result<(), String> {
+    use std::io::Read;
+    if zstd::bulk::Decompressor::upper_bound(data).map(|n| n as u64) != Some(raw_len) {
+        return Err("compressed frame does not match the recorded length".into());
+    }
+    let mut dec = match dict {
+        Some(dict) => zstd::stream::read::Decoder::with_dictionary(data, dict),
+        None => zstd::stream::read::Decoder::with_buffer(data),
+    }
+    .map_err(|e| e.to_string())?;
+    // One frame only: data after it is not this object's.
+    dec = dec.single_frame();
+    dec.window_log_max(MAX_DELTA_WINDOW_LOG).map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; STREAM_CHUNK];
+    let mut total = 0u64;
+    loop {
+        let n = dec.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if total > raw_len {
+            return Err("decompressed length does not match the recorded length".into());
+        }
+        sink(&buf[..n]);
+    }
+    if total != raw_len {
+        return Err("decompressed length does not match the recorded length".into());
+    }
+    Ok(())
+}
+
 #[cfg(not(feature = "zstd"))]
-fn decompress(data: &[u8], raw_len: u64, dict: Option<&[u8]>) -> std::result::Result<Vec<u8>, String> {
+fn decompress_bulk(data: &[u8], raw_len: u64, dict: Option<&[u8]>) -> std::result::Result<Vec<u8>, String> {
     pure::decompress(data, raw_len, dict)
 }
+
+#[cfg(not(feature = "zstd"))]
+fn stream(data: &[u8], raw_len: u64, dict: Option<&[u8]>, sink: &mut dyn FnMut(&[u8])) -> std::result::Result<(), String> {
+    pure::stream(data, raw_len, dict, sink)
+}
+
+// Without the zstd C library, every entry is read with the pure-Rust
+// decoder (identical results: the content is re-hashed either way).
 
 /// Reading zstd frames with `ruzstd`, the pure-Rust decoder (no C library:
 /// builds without `zstd`, such as WASM). With both features the C library
@@ -584,7 +693,19 @@ pub(crate) mod pure {
     /// `dict` as raw-content history. Same checks as the libzstd path: the
     /// frame must declare `raw_len`, and decoding stops as soon as the
     /// output would exceed it.
+    #[cfg_attr(feature = "zstd", allow(dead_code))]
     pub(crate) fn decompress(data: &[u8], raw_len: u64, dict: Option<&[u8]>) -> std::result::Result<Vec<u8>, String> {
+        let limit = usize::try_from(raw_len).map_err(|_| "object too large for this platform".to_string())?;
+        let mut out = Vec::with_capacity(limit.min(super::BULK_LIMIT as usize));
+        stream(data, raw_len, dict, &mut |chunk| out.extend_from_slice(chunk))?;
+        Ok(out)
+    }
+
+    /// Stream the frame's content to `sink` in chunks of about
+    /// [`super::STREAM_CHUNK`] bytes: exactly `raw_len` bytes, or an error
+    /// as soon as it would be more (or ends short). The decoder holds at
+    /// most its window ([`MAX_WINDOW`]) besides.
+    pub(crate) fn stream(data: &[u8], raw_len: u64, dict: Option<&[u8]>, sink: &mut dyn FnMut(&[u8])) -> std::result::Result<(), String> {
         let mut d = FrameDecoder::new();
         d.set_max_window_size(MAX_WINDOW);
         if let Some(base) = dict {
@@ -604,27 +725,30 @@ pub(crate) mod pure {
         if dict.is_some() {
             d.force_dict(DICT_ID).map_err(|e| e.to_string())?;
         }
-        let limit = usize::try_from(raw_len).map_err(|_| "object too large for this platform".to_string())?;
-        let mut out = Vec::with_capacity(limit.min(super::BULK_LIMIT as usize));
-        loop {
-            d.decode_blocks(&mut src, BlockDecodingStrategy::UptoBytes(1 << 20)).map_err(|e| e.to_string())?;
-            if let Some(chunk) = d.collect() {
-                if out.len() + chunk.len() > limit {
-                    return Err("decompressed length does not match the recorded length".into());
+        let too_long = || "decompressed length does not match the recorded length".to_string();
+        let mut total = 0u64;
+        let mut take = |chunk: Option<Vec<u8>>| -> std::result::Result<(), String> {
+            if let Some(chunk) = chunk {
+                total += chunk.len() as u64;
+                if total > raw_len {
+                    return Err(too_long());
                 }
-                out.extend_from_slice(&chunk);
+                sink(&chunk);
             }
+            Ok(())
+        };
+        loop {
+            d.decode_blocks(&mut src, BlockDecodingStrategy::UptoBytes(super::STREAM_CHUNK)).map_err(|e| e.to_string())?;
+            take(d.collect())?;
             if d.is_finished() {
                 break;
             }
         }
-        if let Some(rest) = d.collect() {
-            out.extend_from_slice(&rest);
+        take(d.collect())?;
+        if total != raw_len {
+            return Err(too_long());
         }
-        if out.len() != limit {
-            return Err("decompressed length does not match the recorded length".into());
-        }
-        Ok(out)
+        Ok(())
     }
 
     /// Does the frame header carry a content size? (`content_size()` is 0
@@ -1013,6 +1137,43 @@ mod tests {
             let d = delta_compress(DEFAULT_LEVEL, &base, &raw).unwrap();
             assert!(pure::decompress(&d, n, None).map_or(true, |out| out != raw));
             assert!(pure::decompress(&d, n, Some(&noise(100_000, 9))).map_or(true, |out| out != raw));
+        }
+
+        /// A zstd frame declaring `size` bytes of RLE blocks (4 bytes per
+        /// 128 KiB), producing `size + extra`.
+        fn rle_frame(size: u64, extra: u64) -> Vec<u8> {
+            let mut f = vec![0x28, 0xb5, 0x2f, 0xfd, 0xc0, 7 << 3];
+            f.extend_from_slice(&size.to_le_bytes());
+            let mut left = size + extra;
+            while left > 0 {
+                let n = left.min(128 << 10);
+                left -= n;
+                let header = (left == 0) as u32 | (1 << 1) | ((n as u32) << 3);
+                f.extend_from_slice(&header.to_le_bytes()[..3]);
+                f.push(b'A');
+            }
+            f
+        }
+
+        /// BUG-490 in the pure-Rust decoder: a bomb streams in bounded
+        /// chunks, stops at the declared size, and one that is not its
+        /// object is refused by the hash pass, before anything is kept.
+        #[test]
+        fn bombs_stream_in_bounded_chunks_and_stop_at_the_declared_size() {
+            let size = 96u64 << 20;
+            let (mut total, mut largest) = (0u64, 0usize);
+            pure::stream(&rle_frame(size, 0), size, None, &mut |c| {
+                total += c.len() as u64;
+                largest = largest.max(c.len());
+            })
+            .unwrap();
+            assert_eq!(total, size);
+            assert!(largest <= 2 * crate::pack::STREAM_CHUNK, "{largest}");
+            let mut seen = 0u64;
+            assert!(pure::stream(&rle_frame(size, 32 << 20), size, None, &mut |c| seen += c.len() as u64).is_err());
+            assert!(seen <= size);
+            let err = crate::pack::decompress(&rle_frame(size, 0), size, None, &crate::id::ObjectId([7; 32])).unwrap_err();
+            assert!(err.contains("does not match its id"), "{err}");
         }
 
         proptest! {
