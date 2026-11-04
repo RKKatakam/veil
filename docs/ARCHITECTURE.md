@@ -27,14 +27,27 @@ below it, and nothing above the VFS layer knows a disk exists.
 
 `StorageBackend` is a small synchronous trait (`read`, `write`,
 `create_new`, `list_dir`, `metadata`, `remove_*`, `set_executable`, plus an
-optional `known_id` hint). The trait takes `&self`, so a backend can be
-shared as `Arc<dyn StorageBackend>`.
+optional `known_id` hint and an optional `stat_clock`). The trait takes
+`&self`, so a backend can be shared as `Arc<dyn StorageBackend>`.
+
+`Metadata` carries change-detection stamps next to kind, size and the
+executable bit: `mtime`, `ctime` and `inode`, each `Option`al. `None`
+means "unknown, always re-read". `stat_clock()` returns the current reading
+of the clock those stamps are measured on, or `None` if the backend's stamps
+must not be trusted (which disables stat caching):
+
+| Backend | `mtime` / `ctime` / `inode` | `stat_clock` |
+|---|---|---|
+| `DiskBackend` | ns since the epoch / ns / inode number (Unix; mtime only elsewhere) | wall clock, ns, `exact: false` |
+| `MemoryBackend` | per-backend write-generation counter / – / – | current generation, `exact: true` |
+| `OverlayBackend`, `TreeView` | – (mixed or immutable sources) | `None` (they use `known_id`) |
 
 * **DiskBackend** does atomic writes (temp file plus rename) and ignores
   symlinks.
 * **MemoryBackend** is a flat `BTreeMap<VPath, Node>`. Because the
   descendants of `a/` are contiguous in string order, directory listings are
-  range scans. File buffers are `Arc`-shared.
+  range scans. File buffers are `Arc`-shared. Every file write takes a fresh
+  value from a monotonic generation counter, reported as `mtime`.
 * **OverlayBackend** is copy-on-write. An in-memory upper layer and a
   whiteout set sit over any read-only lower layer. Ancestor whiteouts hide
   whole subtrees.
@@ -112,8 +125,27 @@ CAS, and it applies these rules in order:
    explicit `public!`.
 3. Public files are scanned for credentials (AWS, GitHub, GitLab, Slack,
    Stripe, Anthropic, OpenAI, Google, JWT, private keys, and high-entropy
-   `password = "…"` assignments). A hit **quarantines** the file: it stays
-   local and is not snapshotted.
+   `password = "…"` assignments). A hit **quarantines** the file: the
+   offending content stays local and is not snapshotted.
+   * A **never-tracked** file is left out of the tree.
+   * A **tracked** file keeps the parent's entry, so history still holds
+     the previous, safe version. The edit is *held back*, not recorded as a
+     deletion (`BuildReport::quarantine_kept`; `vl status` shows
+     `Q path (rule; edit held back; history keeps the previous version)`).
+     The previous entry is only kept if it is itself safe. Encrypted
+     entries always are. A public one is re-scanned, because it may date from
+     a `public!` rule that has since been removed. If it fails, the file is
+     dropped from the new snapshot as before.
+   * Unchanged public content is normally not re-scanned ("scanned when it
+     entered the parent"). That shortcut is disabled whenever `.veilpolicy`
+     differs from the parent's, so dropping `public!` re-checks everything.
+   * **Checkout never overwrites or removes local content it did not
+     materialise.** A path in the diff is only written or deleted if the file
+     currently holds exactly the `from` version (checked through the stat
+     cache, or by reading it). Anything else, above all a quarantined edit,
+     is left in place and reported as `kept`. The next snapshot quarantines
+     it again on top of the new tree. `vl restore <path>` deliberately
+     discards a quarantined edit.
 4. Cloaked files are sealed under their scope. In a cloaked workspace, every
    public file is sealed under the workspace scope, and the description is too.
 5. Embargoed entries stay embargoed until their embargo is released.
@@ -184,6 +216,59 @@ A workspace is only a named pointer in the view. It owns no directory.
   is O(changes). They never touch disk and are dropped afterwards. This is
   the primitive for agent sandboxes and parallel CI tasks.
 
+### The stat cache
+
+Every `vl` command snapshots the project directory. Without help that means
+reading and hashing every file. The stat cache (`statcache.rs`) avoids it.
+The CLI keeps one per workspace as device-local state in
+`.veil/local/statcache/<workspace>.cache`. It is loaded once per session, used
+by every snapshot and checkout (`snapshot_workspace_cached`,
+`build_from_cached`, `checkout_tree_cached`), and rewritten only when it
+changed. The in-memory cache follows the directory when another workspace is
+attached.
+
+* **Records are content facts, not policy decisions.** Each record holds
+  path → stamp (mtime, ctime, inode, size, executable), the blob id of the
+  plaintext, whether the scanner found it clean, and (for cloaked files)
+  which object it seals to under which scope. The builder still classifies
+  every path against the current policy every time. A fact is only used where
+  the builder would otherwise need the bytes: a public file reuses the
+  parent's entry, or the cached blob if it was scanned clean; a cloaked file
+  reuses the cached sealed id for the same scope. Embargoed entries, cloak
+  failures and quarantined files are never served from the cache.
+* **Keyed on policy and keys.** As defence in depth the whole cache is
+  dropped when the `.veilpolicy` blob id changes, or when a fingerprint of
+  the identity, every scope's key fingerprint and every embargo's
+  released/readable state changes.
+* **Racy mtime.** Each record stores `verified_at`, the clock reading taken
+  before the build stat'ed and read the file. A record is trusted only if
+  `max(mtime, ctime) + window ≤ verified_at`. The window is 2 s for
+  whole-second stamps (ext3, HFS+, FAT, many network filesystems) and 100 ms
+  for sub-second stamps (the kernel's coarse clock, exFAT's 10 ms). On a
+  generation clock it is 0. A file written in the same tick it was verified
+  is therefore re-read on the next run, which records a later `verified_at`.
+  A file with a future stamp is never trusted.
+* **Checkout invalidates** every path it writes or removes. It does not
+  insert records for what it wrote: through the generic backend API it
+  cannot stat *the* file it wrote, so a concurrent edit between the write and
+  the stat would be recorded under the checked-out content. Written files are
+  re-read once by the next snapshot instead.
+* The cache is binary with a trailing BLAKE3 checksum. A missing, corrupt or
+  foreign-version cache is just empty. It only accelerates; failing to save
+  it is a warning.
+* Two further cheap wins make the cached path fast. Unchanged directories
+  reuse the parent's tree id instead of re-encoding, re-hashing and
+  re-checking it. `Policy` matches all rules with one `GlobSet` instead of
+  two matchers per rule.
+
+`vl status` on a clean 20,000-file working copy (1,000 cloaked, 500 ignored;
+ext4, warm page cache, release build) went from about 145 ms to about
+55 ms. After a one-file edit it went from about 150 ms to about 74 ms.
+What remains is mostly the one `lstat` per file and the per-directory
+`readdir`, plus decoding the parent's ~1,200 tree objects (JSON). Run the
+benchmark with
+`cargo test --release -p vl --test bench_status -- --ignored --nocapture`.
+
 ## 7. Delayed-visibility (embargoed) merges
 
 `vl merge X --embargo [--until T] [--scope S]`:
@@ -238,9 +323,11 @@ diverged tag is reported and left alone (`--force` overrides on push).
 * Network transport: remotes are paths to other repositories (any
   `StorageBackend`). Next is an HTTP/QUIC object protocol with
   have/want negotiation.
-* Performance: a stat cache (mtime and size → entry) for `DiskBackend`
-  snapshots, packfiles with zstd, and incremental push instead of a full
-  graph walk.
+* Performance: packfiles with zstd, a binary tree encoding (decoding the
+  parent's JSON trees is now a large share of a cached `vl status`),
+  incremental push instead of a full graph walk, and recording checked-out
+  files in the stat cache (needs a backend write that returns the stat of
+  the file it wrote).
 * Sealed directory nodes (hide names), scope key rotation, and per-snapshot
   signatures with the identity key.
 * First-class conflicts (jj-style) instead of conflict markers.

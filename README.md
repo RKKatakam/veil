@@ -162,5 +162,5 @@ drop(ws);                                       // vanishes; the snapshot remain
 This is an MVP of the architecture: the full engine and CLI work end-to-end
 and are covered by tests (`cargo test`). See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#limitations-and-roadmap) for
-known limitations and what comes next (network transport, stat cache, sealed
+known limitations and what comes next (network transport, sealed
 tree names, key rotation, FUSE/WASM front-ends).
