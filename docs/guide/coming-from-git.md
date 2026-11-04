@@ -32,7 +32,7 @@ be undone. Add to that per-file encryption and engine-level secret handling.
 | `git clone` (a Veil repo) | `vl clone SRC [DEST]` |
 | `git status` | `vl status` (`vl st`) |
 | `git add …` | *(nothing to do)* |
-| `git add -p` | *(no equivalent in 1.0)*: split work by committing in steps |
+| `git add -p` | *(nothing to stage)*: `vl split -i` afterwards, to cut the change into the hunks you choose and the rest |
 | `git commit -m MSG` | `vl commit -m MSG` |
 | `git commit --amend` | keep editing, or edit `@-` with `vl edit @-`; fold `@` into it with `vl squash` |
 | `git commit --amend -m MSG` | `vl describe -r @- -m MSG` |
@@ -54,7 +54,8 @@ be undone. Add to that per-file encryption and engine-level secret handling.
 | `git merge X` | `vl merge X` |
 | `git rebase main` | `vl rebase -s FIRST -d main`, where `FIRST` is the first change of your line (`vl rebase -d main` alone moves only `@` and its descendants) |
 | `git rebase --onto D X` | `vl rebase -s X -d D` |
-| `git rebase -i` (squash) | `vl squash -r REV` |
+| `git rebase -i` (squash) | `vl squash -r REV` (`vl squash -i`, or `vl squash PATHS`, moves only part) |
+| `git rebase -i` (edit, to split a commit) | `vl split -r REV PATHS…` or `vl split -r REV -i` |
 | `git rebase -i` (drop) | `vl abandon REV` |
 | `git rebase -i` (reword) | `vl describe -r REV -m MSG` |
 | `git stash` / `git stash pop` | `vl new @-` / `vl edit <change>` |

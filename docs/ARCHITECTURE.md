@@ -761,8 +761,9 @@ CAS, and it applies these rules in order:
      edits `.veilpolicy` so that the path's classification changes. That is
      how `vl expose` and `vl cloak --scope` work, and an expose to `public`
      still goes through the secret scanner below. A policy that arrived by
-     merge, `vl new <cloaked change>` in an ordinary workspace, rebases and
-     squashes never move sealed content to another audience.
+     merge, `vl new <cloaked change>` in an ordinary workspace, rebases,
+     squashes and splits never move sealed content to another audience
+     (splitting by hunk: §5, "Shaping history").
      **The rule only ever keeps a file out of public view; it never takes
      an audience the policy does not name** (BUG-125). When the policy (as
      pinned by the accepted policy) cloaks the path under `P` and the
@@ -1120,6 +1121,66 @@ struct Snapshot {
     `NAME~theirs` (the side it came from; `NAME~theirs~2`, … if taken).
     Both paths are recorded as conflicted. Two directories (or two files)
     merge as such even when the base had the other kind at that name.
+* **Shaping history: `vl split` and partial `vl squash`** (`selection.rs`,
+  `hunks.rs`, `Repo::split`, `Repo::squash_into`). A change from its base
+  (the merge of its parents) to its tree is listed as *units*: one per
+  changed file, or one per file/directory swap (a file replaced by a
+  directory of that name, or the reverse, whose halves cannot be taken
+  apart). A *text* unit offers its hunks (exactly `vl diff`'s hunks, so
+  scripts number them from `vl diff --json`), each hunk's *blocks* (runs of
+  edits separated by unchanged lines: the picker's `s`, a spec's `N.M`) and
+  its executable-bit change; every other unit is *whole* and is moved as
+  recorded, never read or resealed. A selection gives two trees on the
+  base: the base with what was chosen, and the base with the rest
+  (`selection::halves`), each file being the old text with the chosen
+  blocks applied, byte for byte.
+  * **Split** writes the first change (chosen tree, the original's
+    parents and cloak, a new change id, `-m`'s description) and rewrites
+    the original onto it with **its tree unchanged**. The remainder keeps
+    the change id and description, as in Jujutsu: it is the change being
+    worked on (when it is `@`, nothing on disk moves), its tags and
+    descendants follow it through the rewrite map, and nothing needs a
+    rebase, because a snapshot holds a full tree, not a diff. The first
+    part is the new, smaller piece, which is what the user names and
+    describes. A split that leaves either part empty is refused: an empty
+    first part is `vl new REV-`, an empty second part `vl describe`.
+  * **Squash** moves the chosen part into the destination. Into the
+    parent: the parent gets the chosen tree, the source keeps its tree.
+    Into an ancestor: the chosen part is merged into it, the changes in
+    between are rebased (in the transaction, `Transaction::rebase_now`),
+    and the source is then set back to its own tree (it held everything
+    already). Into a descendant: the source gets the rest, the changes in
+    between are rebased without the chosen part, and the destination keeps
+    its tree. Into an unrelated change: the source gets the rest and the
+    chosen part is merged into the destination. A source left with nothing
+    is abandoned and its description joined, as a whole squash always did;
+    otherwise both keep their descriptions. A cloaked destination seals
+    what it gains (`seal_introduced`).
+  * **Audiences** (§4 rule 5). Hunks are offered only when the reader can
+    read both versions (a version it cannot read makes the file whole:
+    nobody chooses lines they cannot see), both labels are verified against
+    their objects, neither is under an embargo, and the new version's
+    audience holds the old one's (old public, or sealed exactly as the
+    new). A file in between holds lines of both versions and is sealed
+    exactly as the new one, with its fallback (the last public version),
+    so a hunk of a cloaked file stays sealed for its scope in both halves
+    and the public fallback rules still hold; a half equal to a version is
+    that version's entry itself. An exposure or re-key, `.veilpolicy`,
+    conflicts (entries, and older marker conflicts), binary and non-UTF-8
+    files are whole. A conflict therefore moves whole, keeping its
+    entry and its place in the conflict index; it cannot be split by hunk
+    (resolve it first).
+  * Each is one transaction: `vl undo` restores the view exactly. A
+    selection is made before the transaction (an interactive pick can take
+    minutes), so the transaction re-checks that the change and destination
+    are still in the history and unchanged, and refuses otherwise. Trees
+    under an embargo wrapper are only squashed whole into their parent.
+    A property test (`veil-core/tests/split_squash.rs`) checks, over random
+    edits (text, binary, adds, deletes, executable bits, cloaked paths) and
+    random selections, that the halves are the selection and its complement,
+    that every entry keeps one of its versions' audiences, that squashing
+    the halves together gives the original tree, and that undo restores the
+    view.
 * **Visibility never silently widens.** Declassification (any move from
   cloaked or embargoed to more visible) is an explicit act by a member: a
   `vl merge` of a cloaked line of work, or a `vl expose`, both of which go
@@ -2298,7 +2359,11 @@ files` keeps its older format for scripts.
 documented in `docs/reference/json.md` (hand-written; `docgen` keeps it
 when it regenerates the reference). Additive changes keep the version;
 anything else bumps it. The shape tests pin every key and type, and fail if
-a key is missing from `json.md`. A failure under `--json` prints a
+a key is missing from `json.md`. Two write commands take `--json` too,
+`vl split` and `vl squash` (`api::shape`, `veil.split/1`, `veil.squash/1`),
+because scripts and agents need to know which change got what; their
+interactive picker (`crates/vl/src/picker.rs`) writes to stderr, so stdout
+still carries only the document. A failure under `--json` prints a
 `veil.error/1` document on stdout too, unless the command had already
 printed its own (`api::json_emitted`), so stdout carries at most one
 document; clap's usage errors (exit 2) stay text.
@@ -2423,8 +2488,11 @@ same `api` function `vl <command> --json` calls and serialises it with the
 same writer (`api::to_json`), so a result is the CLI's line byte for byte;
 `serve_cli.rs` compares them for every read command and every revision, as
 a member and as a non-member. The write methods (`snapshot`, `describe`,
-`new`, `commit`) are `api::recorded`, `api::describe`, `api::new_change`
-and `api::commit`, which `vl describe`, `vl new` and `vl commit` call too.
+`new`, `commit`, `split`, `squash`) are `api::recorded`, `api::describe`,
+`api::new_change`, `api::commit` and `api::shape::{split, squash}`, which
+`vl describe`, `vl new`, `vl commit`, `vl split` and `vl squash` call too
+(`split` and `squash` take a plan's `files`; there is no picker over the
+socket).
 Each calls one `Repo` method, i.e. one transaction under the repository
 lock, so the server takes the lock exactly as the command does and records
 the same operation (`vl undo`, `vl op restore` work on it). Server-only

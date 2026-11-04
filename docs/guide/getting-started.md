@@ -330,11 +330,94 @@ Other ways to reshape history:
 |---|---|
 | `vl edit REV` | Make `REV` the working copy: edit an older change in place. Its descendants are rebased automatically |
 | `vl abandon [REV]` | Drop a change. Its descendants move onto its parent |
-| `vl squash [-r REV]` | Fold a change into its parent |
+| `vl squash [-r REV] [--into DEST] [PATHS…] [-i]` | Fold a change, or the files or hunks you choose, into its parent (or `DEST`) |
+| `vl split [-r REV] PATHS…`, `vl split -i` | Split a change in two (see [Shaping history after the fact](#shaping-history-after-the-fact)) |
 | `vl rebase -s REV -d DEST` | Move a change and its descendants onto `DEST` (several `-d` for a merge) |
 | `vl restore [PATHS…] [--from REV]` | Put files back as they are in `REV` (default: the parent of `@`, or for a merge its merged parents, as `vl status` compares): discards edits, and removes the directories it empties |
 | `vl merge REVS… [-m MSG]` | Merge into `@` (or into `@-` when `@` is empty), then start a new change on top |
 | `vl resolve [--list]`, `vl resolve PATHS --ours\|--theirs\|--base` | List unresolved conflicts, or keep one version of each (see [Conflicts](#conflicts)) |
+
+### Shaping history after the fact
+
+You never have to plan commits up front. Work in one change, then cut it
+into pieces, or move pieces between changes, when you know what the pieces
+are.
+
+**`vl split`** cuts a change in two. What you choose goes into a new first
+change on the original's parents; the rest stays in the change you split,
+which becomes its child:
+
+```text
+$ vl split src/parser.rs -m "Parser: accept trailing commas"
+First part:  vulponvr ebef2181 Parser: accept trailing commas
+Second part: xzolylpw 4985bcf6 Teach the CLI about config files
+```
+
+The second part keeps the change id and the description: it is still the
+change you were working on (if it was `@`, you are still on it, and nothing
+in your directory changes), its tags and descendants stay on it, and
+nothing needs rebasing, because its files are exactly what they were. Only
+the first part is new; `-m` describes it.
+
+To choose by hunk, add `-i`. Each hunk is shown with a question, as
+`git add -p` asks:
+
+```text
+$ vl split -i
+diff src/config.rs (modified)
+@@ -10,7 +10,9 @@
+ …
+(1/3) Put this hunk in the first change [y,n,q,a,d,s,?]?
+```
+
+`y` takes the hunk, `n` leaves it, `s` splits it into smaller hunks where
+unchanged lines separate its edits, `a` and `d` take or leave the rest of
+the file, `q` leaves everything after it, and `?` lists the answers. A
+change of the executable bit is a question of its own. `vl split -i PATHS`
+asks only about those files.
+
+**`vl squash`** moves the other way. With no arguments it folds `@` into
+its parent, as always. Name paths, or use `-i`, to move only part of a
+change; the rest stays where it was, with its description. `--into DEST`
+moves into any change instead of the parent (an ancestor, a descendant or a
+sibling); the changes in between are rebased:
+
+```sh
+vl squash src/parser.rs              # the parser fix belongs in @-
+vl squash -i --into @--             # some hunks belong two changes down
+```
+
+Each split or squash is one operation: `vl undo` takes it back exactly.
+
+**Without a terminal.** The picker reads one answer per line from standard
+input, terminal or not, so a script can pipe answers in
+(`printf 'y\nn\ns\ny\n' | vl split -i`). If the answers run out before every
+question is answered, nothing changes (answer `q` to leave the rest). Agents
+and scripts can name hunks instead: `--hunks src/config.rs:1,3` takes hunks
+1 and 3 of that file, `2.1` the first edit of hunk 2, `mode` its
+executable-bit change. The numbers are the hunks `vl diff -r REV --json`
+lists (from 1). `--plan FILE` (or `-` for standard input) takes the same as
+JSON, and `vl serve --local` offers `split` and `squash` taking that plan;
+with `--json`, both commands print what they made
+([`veil.split/1`, `veil.squash/1`](../reference/json.md#veilsplit1)).
+
+**What can be split by hunk.** Visibility never changes: a hunk of a
+cloaked file goes into the other change sealed for the same scope, and an
+edit made on a cloaked line keeps showing its last public version to
+everyone else. Some files only move whole, and the picker says why:
+
+* a file you cannot read (sealed for a scope you are not in): you can move
+  it, but not choose lines you cannot see;
+* a conflicted file (resolve it first, or move the conflict as it is);
+* a file whose visibility this change alters (exposed, cloaked or moved to
+  another scope), and `.veilpolicy` itself;
+* binary files, files that are not UTF-8 text, and a file replaced by a
+  directory of the same name (or the reverse).
+
+**Nothing empty.** A split that would leave either part empty is refused
+(`vl describe` changes a description; `vl new REV-` starts an empty change
+before one). A squash that moves everything abandons the source and joins
+its description to the destination's, like a whole `vl squash`.
 
 ### Conflicts
 

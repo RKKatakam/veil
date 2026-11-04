@@ -14,6 +14,7 @@ output: it is written for people and may change. The read commands take
 | `vl scan --json` | secret-scan findings, also as a CI gate (`--policy-from`) |
 | `vl secret list --json` | the names in the local vault (never the values) |
 | `vl resolve --list --json` | unresolved conflicts, each version with who can read it (never content) |
+| `vl split --json`, `vl squash --json` | what the split or squash made, and which files and hunks it took (these two write commands take `--json` too) |
 
 Every field is documented in the [JSON reference](../reference/json.md).
 
@@ -66,6 +67,15 @@ vl secret list --json
 
 ```text
 {"schema":"veil.secret.list/1","secrets":[{"name":"DB_PASSWORD"}]}
+```
+
+Splitting a change by hunk without a terminal: read the hunk numbers from
+`vl diff`, then name them (see [Shaping history after the
+fact](getting-started.md#shaping-history-after-the-fact)):
+
+```sh
+vl diff -r @ --json | jq -r '.files[] | "\(.path): \(.content.hunks | length) hunks"'
+vl split --hunks src/config.rs:1,3 -m "Config: read the new keys" --json | jq -r .first.change_short
 ```
 
 ## What a script can rely on

@@ -20,6 +20,8 @@ text:
 | [`vl ls`](ls.md) | [`veil.ls/1`](#veills1) |
 | [`vl resolve --list`](resolve.md) | [`veil.resolve.list/1`](#veilresolvelist1) |
 | [`vl push --dry-run`](push.md) | [`veil.push.plan/1`](#veilpushplan1) |
+| [`vl split`](split.md) (a write command) | [`veil.split/1`](#veilsplit1) |
+| [`vl squash`](squash.md) (a write command) | [`veil.squash/1`](#veilsquash1) |
 | any of them, on failure | [`veil.error/1`](#veilerror1) |
 
 ```sh
@@ -489,6 +491,56 @@ unless someone else pushes in between.
 The exit status is 1 where the push would fail: a remote that cannot be
 planned, a tag the remote would reject, or a tag named with `-t` that
 would be held back.
+
+## `veil.split/1`
+
+`vl split … --json`: the change was split, as one operation (`vl undo`
+takes it back). Also the result of the `split` method of
+[`vl serve --local`](json-rpc.md).
+
+```json
+{"schema":"veil.split/1","first":{"snapshot_id":"ebef…","change_short":"vulponvr","description":"part one",…},
+ "second":{"snapshot_id":"4985…","change_short":"xzolylpw",…},
+ "chosen":[{"path":"src/config.rs","whole":false,"hunks":["1","3.2"]},{"path":"README.md","whole":true,"hunks":[]}],
+ "operation":{"op_id":"9135…","op_short":"9135cd1c"}}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `veil.split/1` |
+| `first` | [snapshot reference](#snapshot-reference) | The new change holding what was chosen, on the original's parents (a new change id) |
+| `second` | [snapshot reference](#snapshot-reference) | The change that was split, now holding the rest, on top of `first`: the same change id and description, and exactly the same files as before |
+| `chosen` | array | What went into `first`, in `vl diff` order: `path`; `whole` (bool: the file's whole change, or a file that can only move whole); `hunks` (array of strings, empty when `whole`: `"N"` for hunk N as `vl diff --json` lists it, from 1, `"N.M"` for the M-th edit of hunk N, `"mode"` for the executable-bit change) |
+| `operation` | object | The head of the operation log afterwards: `op_id`, `op_short` |
+
+**Choosing without a terminal.** `--hunks PATH:LIST` names hunks as in
+`hunks` above (`src/config.rs:1,3.2,mode`); `--plan FILE` (`-` for standard
+input) takes a plan document, whose paths are relative to the repository
+root:
+
+```json
+{"schema":"veil.plan/1","files":[{"path":"src/config.rs","hunks":[1,"3.2"]},{"path":"docs"}]}
+```
+
+`schema` is optional; `files` lists `path` (a file, or a directory for
+everything under it) and `hunks` (numbers or strings as above; leave it
+out for the whole file). Unknown fields are refused. A path, hunk or edit
+the change does not have is an error, so nothing is ever split differently
+from what was asked.
+
+## `veil.squash/1`
+
+`vl squash … --json`: what moved, as one operation. Also the result of the
+`squash` method of [`vl serve --local`](json-rpc.md).
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `veil.squash/1` |
+| `destination` | [snapshot reference](#snapshot-reference) | The destination (the parent, or `--into`) with what moved |
+| `source` | [snapshot reference](#snapshot-reference) or null | The source with what stayed (its change id and description); null when everything moved and it was abandoned |
+| `source_abandoned` | bool | Everything moved: the source was abandoned and its description joined to the destination's |
+| `moved` | array | What moved, as `chosen` in [`veil.split/1`](#veilsplit1) (every changed file, `whole`, for a squash of the whole change) |
+| `operation` | object | The head of the operation log afterwards: `op_id`, `op_short` |
 
 ## `veil.error/1`
 

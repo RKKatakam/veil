@@ -249,6 +249,17 @@ fn specs() -> Vec<(&'static str, Value)> {
             })
         }),
         ("veil.error/1", json!({"schema": "string", "error": {"message": "string", "hint": "string|null"}})),
+        ("veil.split/1", {
+            let taken = json!([{"path": "string", "whole": "bool", "hunks": ["string"]}]);
+            json!({"schema": "string", "first": snapshot_ref(), "second": snapshot_ref(), "chosen": taken, "operation": {"op_id": "string", "op_short": "string"}})
+        }),
+        ("veil.squash/1", {
+            let taken = json!([{"path": "string", "whole": "bool", "hunks": ["string"]}]);
+            json!({
+                "schema": "string", "destination": snapshot_ref(), "source": nullable(snapshot_ref()),
+                "source_abandoned": "bool", "moved": taken, "operation": {"op_id": "string", "op_short": "string"},
+            })
+        }),
     ]
 }
 
@@ -856,4 +867,30 @@ fn every_schema_field_is_documented() {
         }
     }
     assert!(missing.is_empty(), "undocumented fields in docs/reference/json.md:\n  {}", missing.join("\n  "));
+}
+
+/// `vl split --json` and `vl squash --json` (write commands with a result
+/// document).
+#[test]
+fn split_and_squash_shapes() {
+    let env = Env::new();
+    let p = env.project("alice", "p", &[("a.txt", "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n"), ("b.txt", "b\n")]);
+    write(&p, "a.txt", "ONE\n2\n3\n4\n5\n6\n7\n8\n9\nTEN\n");
+    write(&p, "b.txt", "B\n");
+    let v = json_ok(&env, "alice", &p, &["split", "--hunks", "a.txt:1", "-m", "first", "--json"]);
+    check_doc(&v, "veil.split/1");
+    assert_eq!(v["chosen"], json!([{"path": "a.txt", "whole": false, "hunks": ["1"]}]));
+    assert_eq!(v["first"]["description"], "first");
+    let v = json_ok(&env, "alice", &p, &["squash", "b.txt", "--json"]);
+    check_doc(&v, "veil.squash/1");
+    assert_eq!(v["source_abandoned"], false);
+    assert_eq!(v["moved"], json!([{"path": "b.txt", "whole": true, "hunks": []}]));
+    let v = json_ok(&env, "alice", &p, &["squash", "--json"]);
+    check_doc(&v, "veil.squash/1");
+    assert_eq!(v["source"], Value::Null);
+    assert_eq!(v["source_abandoned"], true);
+    // A refusal is a `veil.error/1` document.
+    let (v, code) = json_doc(&env, "alice", &p, &["split", "nothing-here", "--json"]);
+    assert_eq!(code, Some(1));
+    check_doc(&v, "veil.error/1");
 }

@@ -101,6 +101,8 @@ pub const METHODS: &[&str] = &[
     "describe",
     "new",
     "commit",
+    "split",
+    "squash",
     "watch",
     "unwatch",
     "server.info",
@@ -807,6 +809,26 @@ struct CommitParams {
     snapshot: Option<bool>,
 }
 
+/// `split`: what goes in the first change, as a `--plan` lists it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SplitParams {
+    rev: Option<String>,
+    message: Option<String>,
+    files: Vec<api::shape::PlanFile>,
+    snapshot: Option<bool>,
+}
+
+/// `squash`: without `files`, the whole change.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SquashParams {
+    rev: Option<String>,
+    into: Option<String>,
+    files: Option<Vec<api::shape::PlanFile>>,
+    snapshot: Option<bool>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WatchParams {
@@ -821,6 +843,8 @@ enum WriteOp {
     Describe { rev: String, message: String },
     New { revs: Vec<String>, message: String },
     Commit { message: String, advance: bool },
+    Split { rev: String, message: Option<String>, files: Vec<api::shape::PlanFile> },
+    Squash { rev: String, into: Option<String>, files: Option<Vec<api::shape::PlanFile>> },
 }
 
 const JSON: JsonOut = JsonOut { json: true };
@@ -926,6 +950,16 @@ impl Server {
                 let p: CommitParams = params(p)?;
                 self.write(WriteOp::Commit { message: p.message, advance: !p.no_advance }, self.snap(p.snapshot))
             }
+            "split" => {
+                let p: SplitParams = params(p)?;
+                let rev = p.rev.unwrap_or_else(|| "@".into());
+                self.write(WriteOp::Split { rev, message: p.message, files: p.files }, self.snap(p.snapshot))
+            }
+            "squash" => {
+                let p: SquashParams = params(p)?;
+                let rev = p.rev.unwrap_or_else(|| "@".into());
+                self.write(WriteOp::Squash { rev, into: p.into, files: p.files }, self.snap(p.snapshot))
+            }
             "watch" => {
                 let p: WatchParams = params(p)?;
                 self.watch(p, client)
@@ -1009,6 +1043,21 @@ impl Server {
             WriteOp::Describe { rev, message } => json(&api::describe(&mut ctx, &rev, &message)?),
             WriteOp::New { revs, message } => json(&api::new_change(&mut ctx, &revs, &message)?),
             WriteOp::Commit { message, advance } => json(&api::commit(&mut ctx, &message, advance)?),
+            // No picker: what to take is always given.
+            WriteOp::Split { rev, message, files } => {
+                let choice = plan_choice(files)?;
+                json(&api::shape::split(&mut ctx, &rev, &choice, message.as_deref(), None)?)
+            }
+            WriteOp::Squash { rev, into, files } => {
+                let choice = match files {
+                    Some(f) if f.is_empty() => {
+                        return Err(RpcError::new(INVALID_PARAMS, "invalid params: `files` is empty (leave it out to squash the whole change)"))
+                    }
+                    Some(f) => plan_choice(f)?,
+                    None => api::shape::Choice::default(),
+                };
+                json(&api::shape::squash(&mut ctx, &rev, into.as_deref(), &choice, None)?)
+            }
         };
         ctx.finish()?;
         Ok(doc)
@@ -1053,6 +1102,12 @@ impl Server {
             working_copy: p.working_copy,
         }))
     }
+}
+
+/// `files` of `split` and `squash`, as a `--plan` would give them.
+fn plan_choice(files: Vec<api::shape::PlanFile>) -> Result<api::shape::Choice, RpcError> {
+    let specs = api::shape::Plan { schema: None, files }.specs().map_err(|e| RpcError::new(INVALID_PARAMS, format!("invalid params: {e:#}")))?;
+    Ok(api::shape::Choice { paths: vec![], specs })
 }
 
 fn watch_loop(

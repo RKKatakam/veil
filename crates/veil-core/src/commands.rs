@@ -1,6 +1,6 @@
 //! High-level history operations. Each is one transaction → one op-log entry.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use crate::{
     builder::trusted_cloak,
@@ -16,8 +16,9 @@ use crate::{
     oplog::Tag,
     policy::{Policy, POLICY_FILE},
     repo::Repo,
+    selection::{self, Selection, Unit},
     store::ObjectStore,
-    transaction::dedup_parents,
+    transaction::{dedup_parents, Transaction},
     tree::{lookup, TreeView},
     vpath::VPath,
 };
@@ -123,6 +124,72 @@ fn same_description(store: &ObjectStore, text: &Text, message: &str, scope: Opti
         }
         _ => false,
     }
+}
+
+/// A change taken apart for [`Repo::split`] and [`Repo::squash_into`]
+/// ([`Repo::change_parts`]).
+#[derive(Clone, Debug)]
+pub struct ChangeParts {
+    pub id: ObjectId,
+    /// The merge of its parents' trees.
+    pub base: ObjectId,
+    pub tree: ObjectId,
+    pub units: Vec<Unit>,
+}
+
+/// What [`Repo::split`] made.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitResult {
+    /// The new change with the chosen part, on the original's parents.
+    pub first: ObjectId,
+    /// The original change (same change id) with the rest, on `first`.
+    pub second: ObjectId,
+}
+
+/// What [`Repo::squash_into`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SquashResult {
+    /// The destination, with the moved part.
+    pub destination: ObjectId,
+    /// The source with what stayed; `None` when everything moved (it was
+    /// abandoned).
+    pub source: Option<ObjectId>,
+    /// Everything moved.
+    pub emptied: bool,
+}
+
+/// Refuse to rewrite from a stale reading: every one of `ids` must still be
+/// in the history, and `parts` must still describe `s` (an interactive
+/// choice can take minutes, and `vl watch` or another command may have
+/// rewritten the change meanwhile).
+fn check_current(repo: &Repo, ids: &[ObjectId], parts: &ChangeParts, s: &Snapshot) -> Result<()> {
+    let visible: HashSet<ObjectId> = repo.visible_snapshots()?.into_iter().collect();
+    for i in ids {
+        if !visible.contains(i) {
+            return Err(VeilError::repo(format!(
+                "snapshot {} is no longer in the history (it was rewritten meanwhile): run the command again",
+                i.short()
+            )));
+        }
+    }
+    if s.tree != parts.tree || repo.parents_tree(&s.parents)?.tree != parts.base {
+        return Err(VeilError::repo("the change moved while its parts were being chosen: run the command again"));
+    }
+    Ok(())
+}
+
+/// The conflicts `s` records whose entry `tree` holds exactly as `s` does
+/// (moved there whole, or untouched).
+fn moved_conflicts(store: &ObjectStore, s: &Snapshot, tree: &ObjectId) -> Vec<String> {
+    s.conflicts
+        .iter()
+        .filter(|c| {
+            let Ok(path) = VPath::new(c) else { return false };
+            let there = lookup(store, &s.tree, &path).ok().flatten();
+            there.is_some() && there == lookup(store, tree, &path).ok().flatten()
+        })
+        .cloned()
+        .collect()
 }
 
 pub fn validate_tag_name(name: &str) -> Result<()> {
@@ -310,63 +377,258 @@ impl Repo {
 
     /// Fold a change into its (single) parent.
     pub fn squash(&mut self, id: ObjectId) -> Result<ObjectId> {
-        let mut tx = self.transaction("squash")?;
-        let s = tx.repo().snapshot(&id)?;
-        let [parent] = s.parents.as_slice() else {
-            return Err(VeilError::repo("can only squash a change with exactly one parent"));
-        };
-        if *parent == tx.repo().root_id {
-            return Err(VeilError::repo("cannot squash into the root snapshot"));
+        Ok(self.squash_into(id, None, None)?.destination)
+    }
+
+    /// A change taken apart for [`Repo::split`] and [`Repo::squash_into`]:
+    /// its base (the merge of its parents), its tree and its
+    /// [`selection::Unit`]s. With `by_hunk`, every unit is classified
+    /// (`selection::classify`, which reads the files), so its hunks can be
+    /// chosen; without, units are taken whole and no content is read.
+    pub fn change_parts(&self, id: &ObjectId, by_hunk: bool) -> Result<ChangeParts> {
+        if *id == self.root_id {
+            return Err(VeilError::repo("the root snapshot has no changes"));
         }
-        let p = tx.repo().snapshot(parent)?;
-        let mut np = (*p).clone();
-        np.tree = s.tree;
-        // Folding into a cloaked change: what the result introduces is part
-        // of the cloaked line and must be sealed like the rest of it.
-        if let Some(scope) = &p.cloak {
-            let base = tx.repo().parents_tree(&p.parents)?.tree;
-            np.tree = seal_introduced(&tx.repo().store, &np.tree, Some(base), scope)?;
-        }
-        np.predecessors = vec![*parent, id];
-        // A path stays conflicted only if the result still has the
-        // conflict: the parent's conflicted files the squashed change left
-        // untouched, and the squashed change's own.
-        let store = tx.repo().store.clone();
-        let mut conflicts = BTreeSet::new();
-        for c in &p.conflicts {
-            let Ok(path) = VPath::new(c) else { continue };
-            let before = lookup(&store, &p.tree, &path).ok().flatten();
-            if before.is_some() && before == lookup(&store, &s.tree, &path).ok().flatten() {
-                conflicts.insert(c.clone());
+        let s = self.snapshot(id)?;
+        let base = self.parents_tree(&s.parents)?.tree;
+        let mut units = selection::units(&self.store, &base, &s.tree)?;
+        if by_hunk {
+            for u in &mut units {
+                selection::classify(&self.store, u, &s.conflicts)?;
             }
         }
-        conflicts.extend(s.conflicts.iter().cloned());
-        np.conflicts = recordable_conflicts(&store, &np.tree, conflicts.into_iter().collect())?;
-        let pd = tx.repo().description(&p);
-        let sd = tx.repo().description(&s);
-        if !sd.trim().is_empty() {
-            let joined = if pd.trim().is_empty() { sd } else { format!("{pd}\n\n{sd}") };
-            // A cloaked change's description stays sealed for its scope, even
-            // when folded into a public parent (the joined text is sealed).
-            let scope = match (&p.cloak, &s.cloak) {
-                (Some(a), Some(b)) if a != b => {
-                    return Err(VeilError::Policy(format!(
-                        "cannot squash a change cloaked under '{b}' into one cloaked under '{a}'"
-                    )))
-                }
-                (a, b) => a.as_deref().or(b.as_deref()),
-            };
-            // Folded into (or from) a line under an unreleased embargo: the
-            // joined text stays sealed under the embargo key.
-            let store = &tx.repo().store;
-            let scope = description_scope(store, &np.tree, scope)?;
-            np.description = store.make_text(&joined, scope.as_deref())?;
+        Ok(ChangeParts { id: *id, base, tree: s.tree, units })
+    }
+
+    /// `vl split`: split change `parts.id` in two. The **first** change, on
+    /// the original's parents, holds what `sel` chooses and gets a new
+    /// change id and `message` (empty by default). The **second**, its
+    /// child, holds the rest and stays the original change: the same
+    /// change id, description, cloak, and the same tree, so its descendants,
+    /// tags and working copies follow it with nothing to rebase. Nothing's
+    /// audience changes (see [`selection`]).
+    ///
+    /// Refused when either change would be empty (nothing chosen, or
+    /// everything), for an embargoed merge, and when the change moved since
+    /// `parts` was read.
+    pub fn split(&mut self, parts: &ChangeParts, sel: &Selection, message: Option<&str>) -> Result<SplitResult> {
+        let id = parts.id;
+        let mut tx = self.transaction("split")?;
+        let s = tx.repo().snapshot(&id)?;
+        check_current(tx.repo(), &[id], parts, &s)?;
+        if s.embargo.is_some() {
+            return Err(VeilError::Policy("an embargoed merge cannot be split".into()));
         }
-        let new_parent = tx.rewrite(*parent, np)?;
-        tx.abandon(id)?;
-        tx.set_description(format!("squash {} into {}", s.change_id.short(), p.change_id.short()));
+        let store = tx.repo().store.clone();
+        let h = selection::halves(&store, &parts.base, &parts.tree, &parts.units, sel)?;
+        if !h.any {
+            return Err(VeilError::repo(
+                "nothing chosen: the first change would be empty (choose at least one file or hunk; `vl new -B` is not needed to start an empty change before it, `vl new REV-` does that)",
+            ));
+        }
+        if h.all {
+            return Err(VeilError::repo(
+                "everything chosen: the second change would be empty (to change only the description, use `vl describe`)",
+            ));
+        }
+        let scope = description_scope(&store, &h.chosen, s.cloak.as_deref())?;
+        let first = Snapshot {
+            parents: s.parents.clone(),
+            change_id: ChangeId::random(),
+            tree: h.chosen,
+            description: store.make_text(message.unwrap_or(""), scope.as_deref())?,
+            author: s.author.clone(),
+            timestamp: s.timestamp,
+            predecessors: vec![id],
+            conflicts: recordable_conflicts(&store, &h.chosen, moved_conflicts(&store, &s, &h.chosen))?,
+            cloak: s.cloak.clone(),
+            embargo: None,
+            signature: None,
+        };
+        let first_id = tx.write_snapshot(&first)?;
+        let mut second = (*s).clone();
+        second.parents = vec![first_id];
+        second.predecessors = vec![id];
+        let second_id = tx.rewrite(id, second)?;
+        tx.set_description(format!("split change {}", s.change_id.short()));
         tx.commit()?;
-        Ok(new_parent)
+        Ok(SplitResult { first: first_id, second: second_id })
+    }
+
+    /// `vl squash`: move what `part` chooses of change `id` (all of it for
+    /// `None`) into `into`, by default its single parent. The source keeps
+    /// its change id and description and holds the rest; when nothing is
+    /// left it is abandoned and its description is joined to the
+    /// destination's, as a whole squash always did.
+    ///
+    /// * into its **parent**: the parent gets the chosen part; the source's
+    ///   own tree is unchanged (it already held everything);
+    /// * into an **ancestor**: the chosen part is merged into it, the
+    ///   changes in between are rebased onto it, and the source keeps its
+    ///   tree;
+    /// * into a **descendant**: the source keeps the rest, the changes in
+    ///   between are rebased without the chosen part, and the destination
+    ///   keeps its tree;
+    /// * into an **unrelated** change: the source keeps the rest and the
+    ///   chosen part is merged into the destination.
+    ///
+    /// Descendants are rebased, and a cloaked destination seals what it is
+    /// given (as [`crate::embargo::seal_introduced`] does for a whole
+    /// squash). One transaction: `vl undo` restores everything.
+    pub fn squash_into(&mut self, id: ObjectId, into: Option<ObjectId>, part: Option<(&ChangeParts, &Selection)>) -> Result<SquashResult> {
+        let mut tx = self.transaction("squash")?;
+        let s = tx.repo().snapshot(&id)?;
+        if id == tx.repo().root_id {
+            return Err(VeilError::repo("the root snapshot cannot be squashed"));
+        }
+        let dest = match into {
+            Some(d) => d,
+            None => match s.parents.as_slice() {
+                [p] => *p,
+                _ => return Err(VeilError::repo("can only squash a change with exactly one parent (name a destination with --into)")),
+            },
+        };
+        if dest == tx.repo().root_id {
+            return Err(VeilError::repo("cannot squash into the root snapshot"));
+        }
+        if dest == id {
+            return Err(VeilError::repo("cannot squash a change into itself"));
+        }
+        let store = tx.repo().store.clone();
+        let into_parent = s.parents == [dest];
+        let (base, chosen, rest, all) = match part {
+            Some((parts, sel)) => {
+                if parts.id != id {
+                    return Err(VeilError::repo("internal: the selection is of another change"));
+                }
+                check_current(tx.repo(), &[id, dest], parts, &s)?;
+                let h = selection::halves(&store, &parts.base, &parts.tree, &parts.units, sel)?;
+                if !h.any {
+                    return Err(VeilError::repo("nothing chosen: nothing to squash"));
+                }
+                (parts.base, h.chosen, h.rest, h.all)
+            }
+            None if into_parent => (tx.repo().snapshot(&dest)?.tree, s.tree, s.tree, true),
+            None => {
+                let base = tx.repo().parents_tree(&s.parents)?.tree;
+                check_current(tx.repo(), &[id, dest], &ChangeParts { id, base, tree: s.tree, units: vec![] }, &s)?;
+                (base, s.tree, base, true)
+            }
+        };
+        let general = !into_parent || part.is_some();
+        if general {
+            let d = tx.repo().snapshot(&dest)?;
+            for t in [&s.tree, &base, &d.tree] {
+                if crate::embargo::wrapper_of(&store, t)?.is_some() {
+                    return Err(VeilError::Policy(
+                        "a change under an embargo can only be squashed whole into its parent (`vl squash` with no paths)".into(),
+                    ));
+                }
+            }
+        }
+        let d = tx.repo().snapshot(&dest)?;
+        // The destination as it ends up: `tree`, conflicts, and (if the
+        // source is emptied) the joined description.
+        let finish_dest = |tx: &Transaction, cur: ObjectId, tree: ObjectId, extra: Vec<String>| -> Result<Snapshot> {
+            let now = tx.repo().snapshot(&cur)?;
+            let mut nd = (*now).clone();
+            nd.tree = match &now.cloak {
+                // Folding into a cloaked change: what it introduces is part
+                // of the cloaked line and is sealed like the rest of it.
+                Some(scope) => {
+                    let pbase = tx.repo().parents_tree(&now.parents)?.tree;
+                    seal_introduced(&store, &tree, Some(pbase), scope)?
+                }
+                None => tree,
+            };
+            nd.predecessors = vec![cur, id];
+            // A path stays conflicted only if the result still has the
+            // conflict: the destination's conflicted files the squash left
+            // untouched, and the source's own that moved.
+            let mut conflicts = BTreeSet::new();
+            for c in &now.conflicts {
+                let Ok(path) = VPath::new(c) else { continue };
+                let before = lookup(&store, &now.tree, &path).ok().flatten();
+                if before.is_some() && before == lookup(&store, &nd.tree, &path).ok().flatten() {
+                    conflicts.insert(c.clone());
+                }
+            }
+            conflicts.extend(moved_conflicts(&store, &s, &nd.tree));
+            conflicts.extend(extra);
+            nd.conflicts = recordable_conflicts(&store, &nd.tree, conflicts.into_iter().collect())?;
+            if all {
+                let pd = tx.repo().description(&now);
+                let sd = tx.repo().description(&s);
+                if !sd.trim().is_empty() {
+                    let joined = if pd.trim().is_empty() { sd } else { format!("{pd}\n\n{sd}") };
+                    // A cloaked change's description stays sealed for its
+                    // scope, even when folded into a public one (the
+                    // joined text is sealed).
+                    let scope = match (&now.cloak, &s.cloak) {
+                        (Some(a), Some(b)) if a != b => {
+                            return Err(VeilError::Policy(format!(
+                                "cannot squash a change cloaked under '{b}' into one cloaked under '{a}'"
+                            )))
+                        }
+                        (a, b) => a.as_deref().or(b.as_deref()),
+                    };
+                    // Folded into (or from) a line under an unreleased
+                    // embargo: the joined text stays sealed under its key.
+                    let scope = description_scope(&store, &nd.tree, scope)?;
+                    nd.description = store.make_text(&joined, scope.as_deref())?;
+                }
+            }
+            Ok(nd)
+        };
+        // The source as it ends up, with `tree`; abandoned if emptied.
+        let finish_source = |tx: &mut Transaction, cur: ObjectId, parents: Option<Vec<ObjectId>>, tree: ObjectId| -> Result<Option<ObjectId>> {
+            if all {
+                tx.abandon(cur)?;
+                return Ok(None);
+            }
+            let mut ns = (*tx.repo().snapshot(&cur)?).clone();
+            if let Some(p) = parents {
+                ns.parents = p;
+            }
+            ns.tree = tree;
+            ns.predecessors = vec![cur];
+            ns.conflicts = s.conflicts.clone();
+            ns.conflicts = recordable_conflicts(&store, &tree, ns.conflicts)?;
+            Ok(Some(tx.rewrite(cur, ns)?))
+        };
+        let merge_into = |tree: ObjectId| -> Result<(ObjectId, Vec<String>)> {
+            let out = crate::merge::merge_trees(&store, Some(base), tree, chosen)?;
+            Ok((out.tree, out.conflicts.iter().map(|p| p.to_string()).collect()))
+        };
+        let (destination, source) = if into_parent {
+            let nd = finish_dest(&tx, dest, chosen, vec![])?;
+            let new_dest = tx.rewrite(dest, nd)?;
+            let source = finish_source(&mut tx, id, Some(vec![new_dest]), s.tree)?;
+            (new_dest, source)
+        } else if tx.repo().is_ancestor(&dest, &id)? {
+            let (tree, extra) = merge_into(d.tree)?;
+            let nd = finish_dest(&tx, dest, tree, extra)?;
+            let new_dest = tx.rewrite(dest, nd)?;
+            tx.rebase_now()?;
+            let cur = tx.current(id).ok_or_else(|| VeilError::repo("the change to squash disappeared while rebasing"))?;
+            let source = finish_source(&mut tx, cur, None, s.tree)?;
+            (new_dest, source)
+        } else if tx.repo().is_ancestor(&id, &dest)? {
+            let source = finish_source(&mut tx, id, None, rest)?;
+            tx.rebase_now()?;
+            let cur = tx.current(dest).ok_or_else(|| VeilError::repo("the destination disappeared while rebasing"))?;
+            let nd = finish_dest(&tx, cur, d.tree, vec![])?;
+            let new_dest = tx.rewrite(cur, nd)?;
+            (new_dest, source)
+        } else {
+            let source = finish_source(&mut tx, id, None, rest)?;
+            let (tree, extra) = merge_into(d.tree)?;
+            let nd = finish_dest(&tx, dest, tree, extra)?;
+            (tx.rewrite(dest, nd)?, source)
+        };
+        tx.set_description(format!("squash {} into {}", s.change_id.short(), d.change_id.short()));
+        tx.commit()?;
+        Ok(SquashResult { destination, source, emptied: all })
     }
 
     /// Merge `others` into `into`, producing a described merge snapshot; the

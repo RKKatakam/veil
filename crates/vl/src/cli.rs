@@ -271,11 +271,58 @@ pub enum Cmd {
         #[command(flatten)]
         out: JsonOut,
     },
-    /// Fold a change into its parent.
-    Squash {
-        /// Change to fold into its parent.
+    /// Split a change in two: what you choose, then the rest.
+    ///
+    /// The first change, on the original's parents, holds what you choose:
+    /// the changes at PATHS, the hunks named by `--hunks` or `--plan`, or
+    /// the hunks you pick with `-i`. It gets a new change id and the
+    /// description given with `-m` (none by default). The second change,
+    /// its child, holds the rest and stays the change you split: the same
+    /// change id, description and files, so its descendants, tags and the
+    /// working copy follow it with nothing to rebase. No file changes
+    /// visibility: a cloaked file's hunks stay sealed for its scope in both
+    /// halves. Hunks of a file you cannot read, of a binary or conflicted
+    /// file, or of a file whose visibility this change alters cannot be
+    /// chosen one by one: such a file moves whole. A split that would leave
+    /// either change empty is refused.
+    Split {
+        /// Files or directories whose changes go in the first change (with
+        /// `-i`: the files to ask about).
+        paths: Vec<String>,
+        /// Change to split.
         #[arg(short, long, default_value = "@")]
         rev: String,
+        /// Description of the first change.
+        #[arg(short, long)]
+        message: Option<String>,
+        #[command(flatten)]
+        pick: PickArgs,
+        #[command(flatten)]
+        out: JsonOut,
+    },
+    /// Move a change, or part of it, into its parent or another change.
+    ///
+    /// With no PATHS and no `-i`, `--hunks` or `--plan`, the whole change
+    /// moves and is abandoned, its description joined to the destination's.
+    /// Otherwise only what you choose moves; the change keeps the rest (and
+    /// its description), and is abandoned only if nothing is left.
+    /// Descendants are rebased. Squashing into a cloaked change seals what
+    /// it brings for that change's scope.
+    Squash {
+        /// Files or directories whose changes move (with `-i`: the files to
+        /// ask about).
+        paths: Vec<String>,
+        /// Change to fold into its parent (or into `--into`).
+        #[arg(short, long, default_value = "@")]
+        rev: String,
+        /// Move into this change instead of the parent (an ancestor, a
+        /// descendant or an unrelated change).
+        #[arg(long, value_name = "REV")]
+        into: Option<String>,
+        #[command(flatten)]
+        pick: PickArgs,
+        #[command(flatten)]
+        out: JsonOut,
     },
     /// Restore paths in the working copy from another snapshot.
     Restore {
@@ -544,6 +591,29 @@ pub enum Cmd {
     },
 }
 
+/// How `vl split` and `vl squash` choose hunks.
+#[derive(Args, Debug, Clone, Default)]
+pub struct PickArgs {
+    /// Choose hunk by hunk: each hunk is shown with a question (y, n, s to
+    /// split it, q, a, d, ? for help). Answers are read from standard input,
+    /// one per line, so they can be piped in; questions go to standard
+    /// error.
+    #[arg(short, long)]
+    pub interactive: bool,
+    /// Choose hunks without asking: PATH:LIST, where LIST is hunk numbers
+    /// as `vl diff -r REV --json` lists them (from 1), `N.M` for the M-th
+    /// edit of hunk N, or `mode` for the executable bit, separated by
+    /// commas (`--hunks src/main.rs:1,3.2`). Repeat for more files.
+    #[arg(long, value_name = "PATH:LIST", conflicts_with = "interactive")]
+    pub hunks: Vec<String>,
+    /// Choose from a JSON plan in FILE (`-` for standard input):
+    /// `{"files": [{"path": "src/main.rs", "hunks": [1, "3.2"]}, {"path": "docs"}]}`
+    /// with paths relative to the repository root; a file without `hunks`
+    /// is taken whole.
+    #[arg(long, value_name = "FILE", conflicts_with = "interactive")]
+    pub plan: Option<PathBuf>,
+}
+
 /// `--json`, on every read command.
 #[derive(Args, Debug, Clone, Copy, Default)]
 pub struct JsonOut {
@@ -568,7 +638,9 @@ impl Cmd {
             | Cmd::Workspace(WsCmd::List { out })
             | Cmd::Op(OpCmd::Log { out, .. })
             | Cmd::Ls { out, .. }
-            | Cmd::Resolve { out, .. } => out,
+            | Cmd::Resolve { out, .. }
+            | Cmd::Split { out, .. }
+            | Cmd::Squash { out, .. } => out,
             Cmd::Push { json, .. } => return *json,
             _ => return false,
         };

@@ -58,6 +58,7 @@ pub mod embargo;
 pub mod error;
 pub mod fsck;
 pub mod gc;
+pub mod hunks;
 #[cfg(feature = "git")]
 pub mod git;
 pub mod id;
@@ -74,6 +75,7 @@ pub mod remote;
 pub mod repo;
 pub mod revset;
 pub mod secrets;
+pub mod selection;
 pub mod statcache;
 pub mod store;
 pub mod transaction;

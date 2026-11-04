@@ -55,5 +55,5 @@ gates below hold.
 Colocated Git mode (a real `.git` beside `.veil`, so IDEs and Git tools keep
 working) as 1.1's headline; Windows; partial and sparse clones; content-defined
 chunking for large files; first-class conflicts; `bisect`, hooks, submodules,
-signed tags, `split`, `grep`, `archive`, patch export/import; the Veil Hub
+signed tags, `grep`, `archive`, patch export/import; the Veil Hub
 (`docs/HUB.md`).

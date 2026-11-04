@@ -44,7 +44,8 @@ Global options (accepted by every command):
 | [`vl abandon`](abandon.md) | Discard a change; descendants are rebased onto its parent |
 | [`vl rebase`](rebase.md) | Move a change (and its descendants) onto new parents |
 | [`vl resolve`](resolve.md) | List unresolved conflicts, or resolve one by keeping one of its versions |
-| [`vl squash`](squash.md) | Fold a change into its parent |
+| [`vl split`](split.md) | Split a change in two: what you choose, then the rest |
+| [`vl squash`](squash.md) | Move a change, or part of it, into its parent or another change |
 | [`vl restore`](restore.md) | Restore paths in the working copy from another snapshot |
 | [`vl merge`](merge.md) | Merge REVS into the current line of work |
 | [`vl embargo`](embargo.md) | Manage embargoes created by delayed-visibility merges |
@@ -75,4 +76,5 @@ Global options (accepted by every command):
 | [`vl man`](man.md) | Print the man page (`vl man \| man -l -`), or write one page per command into DIR |
 
 The read commands (`status`, `log`, `diff`, `show`, `workspace list`, `tag list`, `op log`,
-`scan`, `secret list`, `ls`, `resolve --list`) take `--json`: their schemas are in [JSON output](json.md).
+`scan`, `secret list`, `ls`, `resolve --list`) take `--json`, and so do `split` and `squash`:
+their schemas are in [JSON output](json.md).

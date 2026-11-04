@@ -787,6 +787,10 @@ fn the_protocol_is_documented() {
     env.ok("alice", &p, &["describe", "-m", "e"]);
     docs.push(c.recv()["params"].clone());
     docs.push(c.ok("unwatch", json!({})));
+    write(&p, "y.txt", "y\n");
+    write(&p, "z.txt", "z\n");
+    docs.push(c.ok("split", json!({"files": [{"path": "y.txt"}]})));
+    docs.push(c.ok("squash", json!({"files": [{"path": "z.txt", "hunks": [1]}]})));
     fn keys(v: &Value, out: &mut Vec<String>) {
         match v {
             Value::Object(o) => {
@@ -898,4 +902,34 @@ fn bug_362_edits_survive_a_concurrent_snapshot() {
     write(&p, "README.md", "edited again\n");
     let out = env.ok("alice", &p, &["status"]);
     assert!(out.contains("stale"), "a real move is still recovered: {out}");
+}
+
+/// `split` and `squash` take what to move as a plan's `files` (no picker),
+/// answer with the CLI's `--json` documents, and record one operation each.
+#[test]
+fn split_and_squash_from_a_plan() {
+    let env = Env::new();
+    let p = env.project("alice", "p", &[("a.txt", "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n"), ("b.txt", "b\n")]);
+    write(&p, "a.txt", "ONE\n2\n3\n4\n5\n6\n7\n8\n9\nTEN\n");
+    write(&p, "b.txt", "B\n");
+    write(&p, "c.txt", "c\n");
+    let server = Server::start(&env, "alice", &p);
+    let mut c = server.conn();
+    let v = c.ok("split", json!({"message": "from the server", "files": [{"path": "a.txt", "hunks": [2]}]}));
+    assert_eq!(v["schema"], "veil.split/1");
+    assert_eq!(v["first"]["description"], "from the server");
+    assert_eq!(env.stdout("alice", &p, &["cat", "-r", "@-", "a.txt"]), "1\n2\n3\n4\n5\n6\n7\n8\n9\nTEN\n");
+    let v = c.ok("squash", json!({"files": [{"path": "c.txt"}]}));
+    assert_eq!(v["schema"], "veil.squash/1");
+    assert_eq!(v["source_abandoned"], false);
+    assert_eq!(env.stdout("alice", &p, &["cat", "-r", "@-", "c.txt"]), "c\n");
+    let (code, _) = c.err("squash", json!({"files": []}));
+    assert_eq!(code, -32602);
+    let (code, e) = c.err("split", json!({"files": [{"path": "a.txt", "hunks": [7]}]}));
+    assert_eq!(code, -32000, "{e}");
+    assert!(e["data"]["error"]["message"].as_str().unwrap().contains("has no hunk 7"), "{e}");
+    let v = c.ok("squash", json!({}));
+    assert_eq!(v["source_abandoned"], true);
+    env.ok("alice", &p, &["undo"]);
+    assert_eq!(read(&p, "a.txt"), "ONE\n2\n3\n4\n5\n6\n7\n8\n9\nTEN\n", "the working copy never changed");
 }

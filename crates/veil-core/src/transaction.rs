@@ -314,6 +314,26 @@ impl<'r> Transaction<'r> {
         }
     }
 
+    /// Rebase the descendants of what was rewritten so far now, rather than
+    /// at commit: for a rewrite that then edits one of them (`vl squash
+    /// --into` a descendant, or from a descendant into an ancestor). Commit
+    /// rebases again whatever is rewritten after this.
+    pub(crate) fn rebase_now(&mut self) -> Result<()> {
+        if self.rewritten.is_empty() {
+            return Ok(());
+        }
+        self.rebase_descendants()
+    }
+
+    /// The snapshot `id` is now, if it was rewritten into exactly one (or
+    /// left alone); `None` if it was abandoned.
+    pub(crate) fn current(&self, id: ObjectId) -> Option<ObjectId> {
+        match self.resolve(id) {
+            (r, false) if r.len() == 1 => Some(r[0]),
+            _ => None,
+        }
+    }
+
     fn rebase_descendants(&mut self) -> Result<()> {
         let mut roots = self.start_view.refs();
         roots.extend(self.view.refs());

@@ -30,7 +30,7 @@ fixed**. Severity: high / medium / low.
 - **Colocated Git mode:** a real `.git` next to `.veil` (as Jujutsu does) so
   IDEs, GUIs, `git blame`, pre-commit and other Git tools keep working.
 - **Missing everyday commands:** `blame`/annotate, `bisect`,
-  cherry-pick/duplicate, `split` (and interactive squash/split), history
+  cherry-pick/duplicate, history
   search (`log -S`/`-G`, path and author filters), `grep` over a snapshot,
   `archive` (tarball of a snapshot), patch export/import.
 - **Rename and copy detection** in `diff`, `log` and merge (today a rename is

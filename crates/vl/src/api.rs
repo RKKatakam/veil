@@ -18,6 +18,7 @@
 //! Adding a field keeps the version; renaming, removing or retyping one, or
 //! changing what a value means, bumps it.
 
+pub mod shape;
 pub mod text;
 
 use std::{
