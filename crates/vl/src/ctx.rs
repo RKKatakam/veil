@@ -285,7 +285,12 @@ impl Ctx {
             if self.record_once(description.clone(), policy_incoming)? {
                 return Ok(());
             }
-            self.repo.reload()?;
+            // The process that moved it also recorded what the directory
+            // now holds: read that too, or the directory would be judged
+            // against the snapshot it held before, look stale, and have
+            // its newest edits moved out of it (BUG-362).
+            self.refresh()?;
+            self.resume()?;
         }
         bail!("the working copy keeps moving under this command (another `vl` is running here?); try again")
     }
@@ -300,8 +305,19 @@ impl Ctx {
         // (a grant, an embargo release) is filled in first; otherwise the
         // snapshot would record it as deleted, or reverted to the fallback.
         self.fill_in()?;
-        let stale = self.checkout.workspace != self.ws
+        let mut stale = self.checkout.workspace != self.ws
             || (self.checkout.snapshot != view_wc && self.repo.store().has(&self.checkout.snapshot));
+        // The repository moved on, but everything it changed is already in
+        // the directory: another command recorded this very directory (a
+        // snapshot), or moved `@` to the same tree (`commit`, `new`), and
+        // has not rewritten the checkout record yet. The directory is not
+        // behind; edits made since belong in `@`, on disk, not in a side
+        // change taken out of the directory (BUG-361, BUG-362).
+        if stale && self.directory_holds(view_wc)? {
+            self.checkout.snapshot = view_wc;
+            save_checkout(&self.fs, &self.checkout)?;
+            stale = false;
+        }
         if stale {
             // The directory reflects `checkout.snapshot`, but the repository
             // moved on (undo, another process, removed workspace). Preserve
@@ -374,6 +390,34 @@ impl Ctx {
         if self.checkout.snapshot != out.snapshot {
             self.checkout.snapshot = out.snapshot;
             save_checkout(&self.fs, &self.checkout)?;
+        }
+        Ok(true)
+    }
+
+    /// Does the directory already hold every change from the snapshot it
+    /// was last recorded at to `target`, the attached workspace's `@`?
+    fn directory_holds(&mut self, target: ObjectId) -> Result<bool> {
+        if self.checkout.workspace != self.ws || self.checkout.pending.is_some() {
+            return Ok(false);
+        }
+        let base = self.repo.snapshot(&self.checkout.snapshot)?;
+        let to = self.repo.snapshot(&target)?.tree;
+        if base.tree == to {
+            return Ok(true);
+        }
+        let disk = self.fs.clone();
+        let (now, _) = self.repo.build_from_recorded(
+            &*disk,
+            Some(base.tree),
+            base.cloak.as_deref(),
+            Some(&mut self.cache),
+            Some(&self.checkout.materialised),
+        )?;
+        let store = self.repo.store();
+        for c in veil_core::tree::diff_trees(store, Some(&base.tree), Some(&to))? {
+            if lookup(store, &now, &c.path)? != c.new {
+                return Ok(false);
+            }
         }
         Ok(true)
     }
