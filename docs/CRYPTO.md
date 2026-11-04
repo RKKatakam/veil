@@ -277,6 +277,32 @@ against the ring log (ARCHITECTURE §3).
   and a published key is still checked against `key_id` and then by the
   AEAD of the content it opens. A record a ring later shows to be signed by
   a member replaces an unverified local one.
+* **Who may release (BUG-108).** A valid release signature is not enough.
+  Where a repository holds a verified signed ring for the embargo's scope,
+  it accepts a release only if its signer is a **current** member of that
+  scope, signing with the key the ring registers for them, or if the
+  record's (good-signed) deadline has passed. The check runs on every
+  lookup, not only on pull, so a release accepted before a revocation
+  arrived stops counting once it does; a pull drops an unaccepted release
+  from the incoming record with a warning, and an accepted one replaces it
+  later. Without such a ring (public clones, legacy rings) the release is
+  judged by `key_id` alone, as before. A member granted by short member id
+  has no registered signing key and cannot release before the deadline.
+  What this does not prevent: a revoked member still holds the embargo key
+  (revocation is forward-only, and rotating the scope does not re-key an
+  embargo whose content is already sealed), so they can leak the key or
+  the fix out of band. What it prevents is an in-protocol release that
+  honest replicas act on, publishing the fix with their next public push.
+* **Staged release (BUG-109).** `Repo::release_embargo` (`vl embargo
+  release`) does not write the record. It stores the signed release fields
+  in device-local state (`.veil/local/releases/<id>.json`), which no sync
+  or remote reads, and which only the identity that signed it honours. The
+  next push or Git export copies them into the record before the record is
+  synced (`Keychain::publish_staged_releases`). So until then the key has
+  not left the repository through vl, and `vl undo` deletes the staged
+  release outright. After it, undo refuses: a published key cannot be
+  taken back. No construction changes; the signed release body is the
+  same.
 * Known limits: time-based release is enforced by key holders' engines, not
   cryptography (threat model).
 

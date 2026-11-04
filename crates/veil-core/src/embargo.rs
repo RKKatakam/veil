@@ -7,6 +7,7 @@
 //! ```text
 //! embargo        dir   [embargo:<id>]  → Sealed(tree)     fallback → pre-merge tree
 //! <hex id>       file  [embargo:<id>]  → every object only reachable from the sealed side
+//!                                         (and not from the fallback)
 //! …
 //! ```
 //!
@@ -22,9 +23,13 @@
 //! * The other entries list, by id, every object that is reachable *only*
 //!   through the sealed side. Relays, `gc` and `fsck` cannot open sealed
 //!   trees, so this list is how they find (and keep, and transfer) the
-//!   sealed subtrees and blobs. All listed objects are sealed, or are the
-//!   public pre-merge versions. A public remote withholds the sealed ones
-//!   until release.
+//!   sealed subtrees and blobs. Nothing the public view (the fallback)
+//!   reaches is listed: the pre-merge versions of changed files are found
+//!   through the fallback, and naming them would tell an outsider which
+//!   files the fix touches (BUG-104). So every listed id is ciphertext the
+//!   outsider has never seen. A public remote withholds them until
+//!   release. (Wrappers written before this rule also list the fallbacks
+//!   of changed files; readers handle both.)
 //!
 //! Releasing publishes the key; the wrapper then resolves to the merged tree
 //! for everyone, with no history rewrite (snapshot ids do not change).
@@ -205,7 +210,20 @@ pub fn wrap(store: &ObjectStore, embargo: &str, tree: &ObjectId, fallback: &Obje
         embargo: embargo.to_string(),
     };
     let mut listed = BTreeSet::new();
-    let inner = seal_dir(store, &vis, tree, Some(base), &mut listed)?;
+    let mut maybe_public = BTreeSet::new();
+    let inner = seal_dir(store, &vis, tree, Some(base), &mut listed, &mut maybe_public)?;
+    // Ids the sealed side shares with the public view need no listing (the
+    // fallback reaches them), and listing them would tell an outsider which
+    // of the files they can see the fix touches (BUG-104). Only content
+    // sealed under a scope can be one: walk the public view for those.
+    if !maybe_public.is_empty() {
+        let mut public = BTreeSet::new();
+        for (_, e) in crate::tree::walk_files(store, &base)? {
+            public.insert(e.id);
+            public.extend(e.fallback);
+        }
+        listed.extend(maybe_public.into_iter().filter(|id| !public.contains(id)));
+    }
     let mut w = Tree::default();
     w.insert(TreeEntry {
         name: WRAPPER_ENTRY.to_string(),
@@ -249,12 +267,23 @@ fn seal_frame(store: &ObjectStore, tree: &ObjectId, base: Option<ObjectId>, dir:
 }
 
 /// Iterative (tree depth is not trusted).
+///
+/// `listed` collects the objects only the sealed side reaches and that are
+/// new: the sealed trees and the files sealed under the embargo key. Their
+/// ids reveal nothing (fresh ciphertext under a fresh key). The fallback of
+/// a file sealed here is the base's entry at the same path, so the wrapper's
+/// fallback reaches it and it is **not** listed: listing it would name the
+/// pre-merge version of every changed file (BUG-104). Content that stays
+/// sealed under a scope may also appear in the public view (a moved or
+/// unchanged-but-retagged file), so its ids go to `maybe_public`, for
+/// [`wrap`] to list only the ones the public view does not reach.
 fn seal_dir(
     store: &ObjectStore,
     vis: &Visibility,
     tree: &ObjectId,
     base: Option<ObjectId>,
     listed: &mut BTreeSet<ObjectId>,
+    maybe_public: &mut BTreeSet<ObjectId>,
 ) -> Result<ObjectId> {
     let scope = vis.key_scope().expect("embargo visibility has a key scope");
     let mut stack = vec![seal_frame(store, tree, base, VPath::root())?];
@@ -301,19 +330,25 @@ fn seal_dir(
                 }
                 let ne = if e.visibility.is_public() {
                     let data = store.read_entry(&e)?;
-                    TreeEntry {
+                    let ne = TreeEntry {
                         id: store.store_file(&data, vis)?,
                         visibility: vis.clone(),
                         fallback: be.filter(|x| x.kind == EntryKind::File).map(|x| x.id),
                         ..e.clone()
-                    }
+                    };
+                    // New ciphertext; its fallback is in the base (above).
+                    listed.insert(ne.id);
+                    ne
                 } else {
+                    if e.visibility == *vis {
+                        // Already under this embargo's key: new to outsiders.
+                        listed.insert(e.id);
+                    } else {
+                        maybe_public.insert(e.id);
+                    }
+                    maybe_public.extend(e.fallback);
                     e.clone()
                 };
-                listed.insert(ne.id);
-                if let Some(fb) = ne.fallback {
-                    listed.insert(fb);
-                }
                 f.out.insert(ne);
             }
         }

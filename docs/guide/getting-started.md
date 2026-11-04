@@ -270,7 +270,9 @@ Undid: commit change yyntkszx
 Working copy now at: yyntkszx 4094f80d (no description set)
 ```
 
-* `vl undo` undoes the last operation. Run it again to go further back.
+* `vl undo` undoes the last operation. Running it again undoes the undo
+  (a redo); to go further back, find the operation in `vl op log` and use
+  `vl op restore`.
 * `vl op restore <id>` returns the whole repository (changes, tags,
   workspaces) to the state after operation `<id>`.
 * Both **keep the files on disk that you had not recorded yet**: the
@@ -294,6 +296,9 @@ take the access back with `vl scope revoke team 7f3a…` (until you push, nobody
 
   `vl op restore <id>` still goes back to an earlier operation, and warns
   about each such command it cannot revert.
+* What already left the repository cannot be undone. An **embargo
+  release** can be undone only until your next push or Git export; after
+  that `vl undo` refuses it ([Embargoes](embargoes.md#the-workflow)).
 
 Other ways to reshape history:
 

@@ -97,7 +97,7 @@ as alice ws new fix-a -r main --cloak team >/dev/null
 printf 'pub fn fix_a() {}\n' | as alice ws write fix-a src/fix_a.rs >/dev/null
 as alice merge fix-a@ --into main --embargo -m "Fix A (released)" >/dev/null
 EA=$(as alice embargo list | awk '/manual release/ {print $1}' | head -1)
-as alice embargo release "$EA" >/dev/null
+as alice embargo release "$EA" --yes >/dev/null  # vl ≥ 1.0 asks without --yes
 
 # Loose objects after the pack.
 printf 'fn main() {\n    println!("v3");\n}\n' > src/main.rs

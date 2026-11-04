@@ -344,7 +344,7 @@ rotation = { generation, key_id, previous: [{key_id, sealed}], wrapped: {id → 
 |---|---|---|
 | ring change | its body (above) | on every load; rejected on pull if invalid |
 | embargo record | `(id, scope, wrapped, until, created, description, scope_key, key_id)` (`description` is always empty) | on pull; signer must be (or have been) a member of the scope |
-| embargo release | `(id, released_key, released_at)`; the key must also match the committed `key_id` fingerprint | on pull and on every key lookup |
+| embargo release | `(id, released_key, released_at)`; the key must also match the committed `key_id` fingerprint | on pull and on every key lookup; where a verified ring for the scope is held, the signer must be a **current** member of it (or the deadline must have passed), §7 |
 | snapshot | its **unsigned id** (BLAKE3 of the encoding without `signature`) | shown by `vl log` / `vl show`; invalid ones reported on pull |
 
 * **Snapshot signatures and content ids.** `Snapshot.signature` is part of
@@ -984,9 +984,21 @@ remains is mostly the one `lstat` per file and the per-directory
    pre-merge version as its fallback. Content that was already sealed
    (cloaked under a scope) stays as it is, so releasing the embargo never
    declassifies cloaked files. The wrapper's other entries list, by id,
-   every object reachable only through the sealed side. Relays, `gc` and
-   `fsck` cannot open sealed trees, and the list is how they find, keep and
-   transfer those objects.
+   every object reachable only through the sealed side **and not through
+   the fallback**. Relays, `gc` and `fsck` cannot open sealed trees, and
+   the list is how they find, keep and transfer those objects. The
+   fallbacks of changed files are the pre-merge tree's entries at the same
+   paths, so the wrapper's fallback already reaches them, and they are not
+   listed: an outsider holds the pre-merge tree, and listed pre-merge ids
+   would map back to the paths the fix touches (BUG-104). Scope-sealed
+   content inside the sealed side is listed only if the pre-merge tree does
+   not hold the same id (a moved cloaked file would otherwise be named).
+   Every listed id is therefore ciphertext an outsider has never seen.
+   Their *number* is visible (roughly the changed files plus the changed
+   directories); see the threat model. Wrappers written before this rule
+   also list those fallbacks; readers treat both the same (the encoding did
+   not change, so this is not a format change: an older vl reading a new
+   wrapper keeps the fallbacks through the fallback tree, FORMAT.md §4).
 3. `ObjectStore::tree` resolves a wrapper transparently: key holders see the
    merge, everyone else sees the pre-merge tree **exactly**. The fix's new
    file names, the new sizes and even *which* files changed are hidden.
@@ -1011,6 +1023,42 @@ remains is mostly the one `lstat` per file and the per-directory
    after the deadline) publishes the key in the record. Snapshot ids do not
    change, nothing is rewritten, and the next push carries the
    now-releasable objects *and the withheld history*.
+   * **Staged until it leaves (BUG-109).** `vl embargo release` (and the
+     automatic release) first *stages* the release: the signed release
+     fields go to device-local state (`.veil/local/releases/<id>.json`),
+     honoured only by the identity that signed them, and never read by a
+     sync. This repository treats the embargo as released at once. The
+     next push (to any remote) or Git export writes them into the synced
+     record, just before the record is sent (`publish_staged_releases`).
+     Until then the key has not left the repository through vl, so
+     `vl undo` right after the release deletes the staged release: the
+     embargo is unreleased again, and nothing reached any remote. Once it
+     is published, `vl undo` of the release is refused with an
+     explanation, and changes nothing: a published key cannot be taken
+     back. `vl op restore` to an operation before a staged release takes it
+     back too, and warns about published ones, which stay released.
+     Undoing the undo of a release is refused: undo never releases. What
+     vl cannot know: someone copying the repository directory by other
+     means (a backup, a file sync service) copies the embargo key with the
+     scope keys anyway.
+   * **Preview.** `vl embargo release` shows the embargoed merge, the
+     withheld history it publishes, the tags that carry it and the remotes
+     the next push goes to, and asks for confirmation (`--yes` skips it,
+     and is required when stdin is not a terminal).
+   * **Who may release (BUG-108).** A release counts only if it is signed
+     by a current member of the embargo's scope, with the signing key the
+     ring registers for them, or if the record's deadline has passed. This
+     is judged against the ring wherever a verified signed ring for the
+     scope is held (members' clones, team remotes), on every lookup: a
+     release accepted before a revocation arrived stops counting when it
+     does. A pull drops a release it does not accept, with a warning, and a
+     current member's release replaces it later. A member revoked after the
+     embargo was created keeps its key (revocation is forward-only) and can
+     still leak it out of band, but not release it in-protocol: honest
+     replicas keep the embargo and do not publish the fix. Clones of public
+     remotes hold no rings and judge a release by its fingerprint only;
+     they hold none of the sealed content a release would open unless a
+     key holder pushed it, which a key holder can do out of band anyway.
 7. After the release, the builder records what the working copy holds: a
    file written back to its pre-embargo content is a revert, and is
    recorded. The builder does not guess whether a working copy is stale. A
@@ -1837,11 +1885,20 @@ repository lock.
   identity) cannot check the genesis proof. Members check it when they pull.
 * *Time-based embargo release* relies on key holders' engines and is not
   time-lock cryptography.
+* *Embargo keys after a revocation.* A member revoked after an embargo was
+  created keeps the embargo key and can leak it, or the fix, out of band.
+  Their in-protocol release is refused by every replica that holds the
+  scope's ring (§7); a clone of a public remote, which has no ring, cannot
+  judge it.
+* *An embargo release is final once pushed.* Until the next push or Git
+  export it is staged locally and `vl undo` takes it back (§7).
 * *Embargo metadata that remains visible:* that an embargoed merge exists,
   its parents' ids (the merged-in ones are redacted, not hidden), its
   author, its timestamp, the embargo's scope and deadline, and the
-  ciphertext sizes on team remotes. The embargo record and the wrapper do
-  not name files, and the record carries no description (the field is
+  ciphertext sizes on team remotes, and the *number* of objects the
+  wrapper lists (about the number of changed files and directories). The
+  embargo record and the wrapper do not name files, and the wrapper lists
+  no id an outsider can map to a path (BUG-104), and the record carries no description (the field is
   always empty). (Overlapping embargoes, which used to reveal one
   another's files, are refused in 1.0, §7.)
 * *History withheld by an embargo* is computed from the local graph. If the

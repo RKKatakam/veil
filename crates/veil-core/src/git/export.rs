@@ -87,6 +87,9 @@ impl GitBridge {
 
     fn export_in(&mut self, repo: &Repo, only_tags: &[String]) -> Result<ExportReport> {
         let mut report = ExportReport::default();
+        // Git holds plaintext: a release staged by `vl embargo release` is
+        // published as its content leaves (it cannot be undone after this).
+        repo.keys().publish_staged_releases()?;
         for t in only_tags {
             if !repo.view().tags.contains_key(t) {
                 return Err(VeilError::NotFound(format!("tag '{t}'")));

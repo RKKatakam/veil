@@ -913,7 +913,7 @@ impl Checker {
                             );
                         }
                     }
-                    self.embargoes.insert(rec.id.clone(), rec.is_released());
+                    self.embargoes.insert(rec.id.clone(), self.keys.embargo_released(&rec.id));
                 }
             }
         }

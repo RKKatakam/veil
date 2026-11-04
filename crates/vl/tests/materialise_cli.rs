@@ -153,7 +153,7 @@ fn an_embargoed_merge_is_filled_in_after_its_release() {
     env.ok("carol", &carol, &["status"]);
 
     let id = embargo_id(&env, "alice", &proj);
-    env.ok("alice", &proj, &["embargo", "release", &id]);
+    env.ok("alice", &proj, &["embargo", "release", &id, "--yes"]);
     env.ok("alice", &proj, &["push", "mirror", "-t", "main"]);
     let out = env.ok("carol", &carol, &["pull"]);
     assert_eq!(read(&carol, "auth.rs"), "fn check() -> bool { verify() }\n", "pull output:\n{out}");
@@ -193,7 +193,7 @@ fn a_local_edit_over_an_embargo_fallback_survives_the_release() {
     assert!(!out.contains("could not cloak"), "{out}");
 
     let id = embargo_id(&env, "alice", &proj);
-    env.ok("alice", &proj, &["embargo", "release", &id]);
+    env.ok("alice", &proj, &["embargo", "release", &id, "--yes"]);
     env.ok("alice", &proj, &["push", "mirror", "-t", "main"]);
     env.ok("carol", &carol, &["pull"]);
     assert_eq!(read(&carol, "auth.rs"), "carol's v1 edit\n", "the local edit was overwritten");

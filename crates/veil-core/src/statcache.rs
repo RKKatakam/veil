@@ -188,7 +188,7 @@ pub fn key_state(keys: &Keychain) -> Result<ObjectId> {
     h.update(b"embargoes\0");
     for e in keys.embargoes()? {
         h.update(e.id.as_bytes());
-        h.update(&[e.is_released() as u8, keys.has(&format!("embargo/{}", e.id)) as u8, 0]);
+        h.update(&[keys.embargo_released(&e.id) as u8, keys.has(&format!("embargo/{}", e.id)) as u8, 0]);
     }
     Ok(ObjectId(*h.finalize().as_bytes()))
 }

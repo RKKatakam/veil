@@ -111,6 +111,9 @@ pub struct SyncReport {
     /// Object bytes that crossed: packs written (push), packs and loose
     /// objects downloaded (pull).
     pub bytes_transferred: u64,
+    /// Embargo releases staged here that this push published (written into
+    /// their records and sent): from now on they cannot be taken back.
+    pub releases_published: Vec<String>,
 }
 
 /// How to synchronise.
@@ -804,6 +807,19 @@ fn ancestors_in(store: &ObjectStore, tips: &[ObjectId]) -> Result<Vec<ObjectId>>
     Ok(out)
 }
 
+/// The snapshots that unreleased embargo `embargo` withholds from a
+/// public remote (its fix history): what releasing it publishes, beside
+/// the merge's content.
+pub fn withheld_by_embargo(local: &Repo, embargo: &str) -> Result<Vec<ObjectId>> {
+    let mut out: Vec<ObjectId> = embargo_withheld(local, true)?
+        .into_iter()
+        .filter(|(_, e)| e == embargo)
+        .map(|(id, _)| id)
+        .collect();
+    out.sort();
+    Ok(out)
+}
+
 /// History that must not leave this repository yet: for every unreleased
 /// embargoed merge in the local graph, the snapshots reachable only through
 /// its merged-in (non-first) parents — the fix itself, and how it was made.
@@ -1039,6 +1055,11 @@ pub fn push_with(
             report = push_incremental(local, &tx.view.refs(), &dst, ids, public, report)?;
         }
     }
+    // Releases staged by `vl embargo release` reach the record only now,
+    // as it leaves: before this, `vl undo` could still take them back
+    // (BUG-109). Objects sealed under their keys may already have been
+    // sent above; without the key they are unreadable.
+    report.releases_published = local.keys().publish_staged_releases()?;
     sync_meta(local.keys(), tx.repo().keys(), public, &mut report.warnings)?;
     for (name, tag) in selected {
         if let Some(existing) = tx.view.tags.get(&name) {
