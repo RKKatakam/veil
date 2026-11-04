@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 pub use colocated_support::*;
 
 mod policy_injection;
+mod switch_race;
+mod stash;
+mod clean;
 mod adopt;
 mod uncolocate;
 mod prune;
