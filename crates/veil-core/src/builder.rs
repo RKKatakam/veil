@@ -10,7 +10,8 @@
 //! * public files are secret-scanned and quarantined on a hit. A quarantined
 //!   file that was already tracked keeps its previous (safe) entry, so the
 //!   local edit is held back instead of being recorded as a deletion;
-//! * embargoed entries stay embargoed until released;
+//! * embargoed entries stay embargoed until released, and a key holder's edit
+//!   of one is secret-scanned (the release will publish it);
 //! * entries this reader cannot see (no key, or stripped by a public remote)
 //!   are carried over untouched instead of being treated as deletions.
 //!
@@ -788,21 +789,24 @@ impl Builder<'_> {
                     if pe.executable == executable && self.store.matches_encoding(&pe.id, &data)? {
                         return Ok(Some(pe.clone()));
                     }
-                    // Still the fallback this reader was shown before the
-                    // release: not an edit, and recording it would revert the
-                    // fix. (The working copy is stale until checked out again.)
-                    if let Some(fb) = pe.fallback {
-                        if pe.executable == executable && self.store.matches_encoding(&fb, &data)? {
-                            return Ok(Some(TreeEntry {
-                                name: name.to_string(),
-                                ..pe.clone()
-                            }));
-                        }
-                    }
+                    // Anything else is an edit, including content equal to
+                    // the pre-embargo version (a deliberate revert, BUG-050).
+                    // The builder records what the working copy holds and
+                    // does not guess whether it is stale: a working copy
+                    // still holding a fallback materialised before the
+                    // release must be refreshed by its owner (the CLI
+                    // records which paths it materialised from a fallback
+                    // and checks them out again) before it is snapshotted.
                 } else {
                     if self.store.keys.has(&format!("embargo/{embargo}")) {
-                        desired = pe.visibility.clone();
-                        fallback = pe.fallback;
+                        // Stays under the embargo only if the path is public
+                        // anyway (the release publishes it). A path the
+                        // policy now cloaks is sealed under its scope: the
+                        // release must never publish it.
+                        if desired.is_public() {
+                            desired = pe.visibility.clone();
+                            fallback = pe.fallback;
+                        }
                     } else if let Some(fb) = pe.fallback {
                         if self.store.matches_encoding(&fb, &data)? {
                             // We were shown the fallback and did not touch it.
@@ -844,6 +848,22 @@ impl Builder<'_> {
                 && !self.policy_changed
             {
                 return Ok(Some(pe.clone()));
+            }
+        }
+
+        // Content sealed under an embargo key is published by the release:
+        // it goes through the scanner like public content (BUG-042). A hit
+        // holds the edit back; the previous (sealed) entry stays.
+        if matches!(desired, Visibility::Embargoed { .. }) && !class.allow_secrets {
+            let unchanged = match parent_file {
+                Some(pe) => pe.executable == executable && self.store.matches_encoding(&pe.id, &data)?,
+                None => false,
+            };
+            if !unchanged {
+                let findings = secrets::scan(&data);
+                if !findings.is_empty() {
+                    return self.quarantine(path, findings, parent_file);
+                }
             }
         }
 

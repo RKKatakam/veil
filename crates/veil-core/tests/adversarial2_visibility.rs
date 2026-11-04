@@ -136,9 +136,11 @@ fn prune(r: &mut Repo) {
     assert!(rep.incomplete.is_empty(), "{:?}", rep.incomplete);
 }
 
-/// Nested and sticky embargoes, follow-up commits, releases in both orders,
-/// with gc --prune-now after every step: nothing a key holder can see may
-/// be collected, and fsck stays clean.
+/// Two embargoes, follow-up commits, releases in both orders, with gc
+/// --prune-now after every step: nothing a key holder can see may be
+/// collected, and fsck stays clean. (Overlapping embargoes are refused in
+/// Veil 1.0, so the second fix is embargoed on a separate line cut from the
+/// pre-merge `main`, where it may legitimately coexist with the first.)
 #[test]
 fn gc_on_a_store_full_of_wrappers_keeps_everything_readable() {
     for release_first in [0usize, 1] {
@@ -152,12 +154,15 @@ fn gc_on_a_store_full_of_wrappers_keeps_everything_readable() {
         alice.set_tag("main", main, None, false).unwrap();
         let mut embargoes = Vec::new();
         for (i, path) in ["a/x.rs", "b/z.rs"].into_iter().enumerate() {
-            let tip = alice.view().tags["main"].target;
+            let tip = if i == 0 { alice.view().tags["main"].target } else { main };
             let ws = alice.ephemeral_workspace(main).unwrap();
             ws.write(path, format!("fixed {i}\n")).unwrap();
             ws.write(&format!("a/new{i}/deep/file.rs"), format!("new {i}\n")).unwrap();
             let (fix, _) = alice.commit_ephemeral(&ws, "fix").unwrap();
             let r = alice.merge(WS, tip, vec![fix], "fix", embargo("team")).unwrap();
+            if i == 1 {
+                alice.set_tag("release", r.snapshot, None, false).unwrap();
+            }
             embargoes.push(r.embargo.unwrap());
             prune(&mut alice);
             assert!(all_readable(&alice).is_ok(), "{:?}", all_readable(&alice));
@@ -223,7 +228,6 @@ fn gc_by_a_non_holder_keeps_what_the_release_will_reveal() {
 /// `main` itself ("builds on … withheld"), so main cannot be pushed to the
 /// team at all until the release.
 #[test]
-#[ignore = "BUG-054: an embargoed fix with a plaintext ancestor blocks pushing main to a team remote"]
 fn main_can_be_pushed_to_the_team_when_the_fix_line_starts_in_plaintext() {
     let (mut alice, fs, _) = new_repo("alice");
     let main = commit_files(&mut alice, &*fs, &[("auth.rs", "v1\n")], "v1");

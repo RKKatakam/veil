@@ -258,7 +258,10 @@ impl Repo {
             parents: vec![base],
             change_id: ChangeId::random(),
             tree,
-            description: store.make_text(description, parent.cloak.as_deref())?,
+            description: store.make_text(
+                description,
+                crate::embargo::description_scope(&store, &tree, parent.cloak.as_deref())?.as_deref(),
+            )?,
             author: tx.repo().user.clone(),
             timestamp: now_millis(),
             predecessors: vec![],
