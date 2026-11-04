@@ -1606,7 +1606,8 @@ repository lock.
 
 * Network transport: remotes are paths or SSH remotes (`SftpBackend`, §1,
   §8); no smart server protocol (have/want negotiation, server-side
-  packing) is planned for 1.0. Remote packs accumulate, one per push, and a
+  packing) is planned for 1.0; the post-1.0 protocol is designed in
+  [HUB.md §4](HUB.md#4-the-smart-sync-protocol). Remote packs accumulate, one per push, and a
   pull reads every index, so consolidating small remote packs (by the
   pushing client, which holds their objects) is next. A plain push does not
   notice content a remote lacks below snapshots it already has

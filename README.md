@@ -28,7 +28,8 @@ working tree *is* the host filesystem. Veil drops all three assumptions:
 * **[Command reference](docs/reference/README.md)**, generated from the CLI
   (also `vl <command> --help` and `vl man`).
 * Design, for developers and reviewers: [architecture and threat model](docs/ARCHITECTURE.md),
-  [formats](docs/FORMAT.md), [cryptography](docs/CRYPTO.md), [releasing](docs/RELEASING.md).
+  [formats](docs/FORMAT.md), [cryptography](docs/CRYPTO.md), [releasing](docs/RELEASING.md),
+  and the post-1.0 [Veil Hub design](docs/HUB.md).
 
 ## Install
 
