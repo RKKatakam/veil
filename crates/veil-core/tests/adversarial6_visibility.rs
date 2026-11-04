@@ -48,7 +48,6 @@ fn an_injected_text_secret_is_recognised_in_a_copy() {
 /// history, where the scanner (no PEM header, no assignment) finds nothing
 /// either, and the next push ships it to every remote.
 #[test]
-#[ignore = "BUG-099: binary isolated files (keystores, PKCS#12, DER keys) injected into a sandbox are not recognised when copied"]
 fn an_injected_binary_secret_is_recognised_in_a_copy() {
     let p12 = binary_secret();
     let inj = InjectedSecrets::from_files([("server.p12", &p12[..])]);
@@ -60,7 +59,6 @@ fn an_injected_binary_secret_is_recognised_in_a_copy() {
 
 /// The same, end to end: the copy is quarantined, never recorded.
 #[test]
-#[ignore = "BUG-099: binary isolated files (keystores, PKCS#12, DER keys) injected into a sandbox are not recognised when copied"]
 fn a_copy_of_an_injected_keystore_is_quarantined() {
     let (mut repo, fs, _) = new_repo("alice");
     let base = commit_files(&mut repo, &*fs, &[("app.py", "x\n")], "init");

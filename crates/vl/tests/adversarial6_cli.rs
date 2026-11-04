@@ -230,7 +230,6 @@ fn a_copied_text_secret_is_quarantined_in_the_sandbox() {
 /// public name, and the copy is recorded (see
 /// `adversarial6_visibility::an_injected_binary_secret_is_recognised_in_a_copy`).
 #[test]
-#[ignore = "BUG-099: binary isolated files (keystores, PKCS#12, DER keys) injected into a sandbox are not recognised when copied"]
 fn a_copied_keystore_is_quarantined_in_the_sandbox() {
     let env = Env::new();
     let proj = env.project(U, "proj", &[("app.py", "x\n")]);

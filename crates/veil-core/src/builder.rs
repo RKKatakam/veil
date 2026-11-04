@@ -107,22 +107,261 @@ pub struct BuildOptions<'a> {
 pub const INJECTED_RULE: &str = "injected-isolated-secret";
 
 /// Values the engine injected from the vault (isolated files such as
-/// `.env`, keys, quarantined files) into a sandbox. Built from the files'
-/// contents: every `KEY=value` / `key: value` value that looks like a secret
-/// (at least 8 characters, and either 20+ characters or a mix of character
-/// classes, so `localhost`, `production` or `3000` never match), plus the
-/// whole content and every whitespace-free line of 24+ characters (key
-/// material, bare tokens).
+/// `.env`, keys, keystores, quarantined files) into a sandbox.
+///
+/// Built from the files' contents, as text: every `KEY=value` /
+/// `key: value` value that looks like a secret (at least 8 characters, and
+/// either 20+ characters or a mix of character classes, so `localhost`,
+/// `production` or `3000` never match), plus the whole content and every
+/// whitespace-free line of 24+ characters (key material, bare tokens).
+///
+/// And as bytes (BUG-099): a file that is not UTF-8 (a PKCS#12 bundle, a
+/// Java keystore, a DER key), and the DER inside every PEM block of a text
+/// file, yields its whole content (16+ bytes) plus [`WINDOW`]-byte windows
+/// of its key material: of the raw bytes, of its base64 encoding (all three
+/// alignments, so any copied segment is covered) and of its hex encoding
+/// (lower and upper case). Windows are taken every [`STRIDE`] positions, so
+/// any copied run of 47+ bytes, and any base64 or hex copy wrapped at 48+
+/// characters per line (`base64`, PEM, `xxd -p`), contains one. Only
+/// windows over *distinctive* bytes count (at least 3/4 distinct bytes in
+/// the source span): padding and the ASN.1 structure every key of a kind
+/// shares (OIDs, length headers) never match unrelated files. Memory and
+/// time are bounded: windows are matched with a rolling hash behind a bit
+/// filter (one pass over each checked file), each file contributes at most
+/// about 74 000 windows (the stride grows for larger files) and all files
+/// together at most [`MAX_WINDOWS`].
 #[derive(Debug, Default, Clone)]
 pub struct InjectedSecrets {
     /// (needle, the injected file it came from)
     needles: Vec<(Vec<u8>, String)>,
     matcher: Option<regex::bytes::Regex>,
+    /// Whole contents of binary injected files (and DER decoded from PEM),
+    /// matched as raw bytes.
+    raw: Vec<(Vec<u8>, String)>,
+    windows: WindowIndex,
+}
+
+/// Length of a binary window (bytes of raw content, or characters of its
+/// base64 / hex encoding).
+pub const WINDOW: usize = 32;
+/// Distance between consecutive windows of one encoding (for files up to
+/// 128 KiB; larger files use a proportionally larger stride).
+pub const STRIDE: usize = 16;
+/// Upper bound on the windows of all injected files together.
+pub const MAX_WINDOWS: usize = 1 << 18;
+/// Binary files contribute at most this many bytes of content.
+const MAX_BINARY: usize = 16 << 20;
+/// Bits of the window filter (2^20 bits = 128 KiB).
+const FILTER_BITS: u32 = 20;
+const HASH_BASE: u64 = 0x100_0000_01b3;
+
+/// How a window encodes the injected bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Encoding {
+    Raw,
+    Base64,
+    Hex,
+}
+
+#[derive(Debug, Default, Clone)]
+struct WindowIndex {
+    windows: Vec<([u8; WINDOW], u32, Encoding)>,
+    sources: Vec<String>,
+    by_hash: HashMap<u64, Vec<u32>>,
+    filter: Vec<u64>,
+    /// `HASH_BASE^(WINDOW-1)`, to roll the hash.
+    top: u64,
+}
+
+fn window_hash(w: &[u8]) -> u64 {
+    w.iter().fold(0u64, |h, &b| h.wrapping_mul(HASH_BASE).wrapping_add(u64::from(b) + 1))
+}
+
+fn filter_slot(h: u64) -> (usize, u64) {
+    let i = (h.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - FILTER_BITS)) as usize;
+    (i / 64, 1u64 << (i % 64))
+}
+
+/// At least three quarters of the bytes are distinct.
+fn distinctive(span: &[u8]) -> bool {
+    let mut seen = [false; 256];
+    let mut n = 0;
+    for &b in span {
+        if !std::mem::replace(&mut seen[b as usize], true) {
+            n += 1;
+        }
+    }
+    n * 4 >= span.len() * 3
+}
+
+impl WindowIndex {
+    fn len(&self) -> usize {
+        self.windows.len()
+    }
+
+    fn add(&mut self, w: &[u8], src: u32, enc: Encoding) -> bool {
+        if self.windows.len() >= MAX_WINDOWS {
+            return false;
+        }
+        let arr: [u8; WINDOW] = w.try_into().expect("window length");
+        let h = window_hash(&arr);
+        let bucket = self.by_hash.entry(h).or_default();
+        if bucket.iter().any(|&i| self.windows[i as usize].0 == arr) {
+            return true;
+        }
+        bucket.push(self.windows.len() as u32);
+        self.windows.push((arr, src, enc));
+        if self.filter.is_empty() {
+            self.filter = vec![0; (1usize << FILTER_BITS) / 64];
+            self.top = (1..WINDOW).fold(1u64, |t, _| t.wrapping_mul(HASH_BASE));
+        }
+        let (i, bit) = filter_slot(h);
+        self.filter[i] |= bit;
+        true
+    }
+
+    /// Windows of `data` (one binary secret) in every encoding.
+    fn add_source(&mut self, data: &[u8], src: u32) {
+        let data = &data[..data.len().min(MAX_BINARY)];
+        if data.len() < WINDOW / 2 {
+            return;
+        }
+        // ~9 windows per STRIDE bytes over all encodings: keep one file
+        // under ~74k windows.
+        let stride = STRIDE.max(data.len().div_ceil(8192)).next_multiple_of(2);
+        // Raw bytes.
+        let mut i = 0;
+        while i + WINDOW <= data.len() {
+            if distinctive(&data[i..i + WINDOW]) && !self.add(&data[i..i + WINDOW], src, Encoding::Raw) {
+                return;
+            }
+            i += stride;
+        }
+        // Base64, in each of the three alignments a copied segment can have.
+        for align in 0..3.min(data.len()) {
+            let text = base64_encode(&data[align..]);
+            let mut i = 0;
+            while i + WINDOW <= text.len() {
+                // 4 characters encode 3 bytes.
+                let from = align + i / 4 * 3;
+                let to = (align + (i + WINDOW).div_ceil(4) * 3).min(data.len());
+                if distinctive(&data[from..to]) && !self.add(&text[i..i + WINDOW], src, Encoding::Base64) {
+                    return;
+                }
+                i += stride;
+            }
+        }
+        // Hex, in both cases.
+        for upper in [false, true] {
+            let mut text = hex::encode(data).into_bytes();
+            if upper {
+                text.make_ascii_uppercase();
+            }
+            let mut i = 0;
+            while i + WINDOW <= text.len() {
+                if distinctive(&data[i / 2..(i + WINDOW) / 2]) && !self.add(&text[i..i + WINDOW], src, Encoding::Hex) {
+                    return;
+                }
+                i += stride;
+            }
+        }
+    }
+
+    /// Position and window index of the first window found in `data`.
+    fn find(&self, data: &[u8]) -> Option<(usize, u32)> {
+        if self.windows.is_empty() || data.len() < WINDOW {
+            return None;
+        }
+        let mut h = window_hash(&data[..WINDOW]);
+        let mut at = 0;
+        loop {
+            let (i, bit) = filter_slot(h);
+            if self.filter[i] & bit != 0 {
+                if let Some(b) = self.by_hash.get(&h) {
+                    if let Some(&w) = b.iter().find(|&&w| self.windows[w as usize].0[..] == data[at..at + WINDOW]) {
+                        return Some((at, w));
+                    }
+                }
+            }
+            if at + WINDOW >= data.len() {
+                return None;
+            }
+            let (out, inp) = (u64::from(data[at]) + 1, u64::from(data[at + WINDOW]) + 1);
+            h = h
+                .wrapping_sub(out.wrapping_mul(self.top))
+                .wrapping_mul(HASH_BASE)
+                .wrapping_add(inp);
+            at += 1;
+        }
+    }
+}
+
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64, without padding (a window never needs it).
+fn base64_encode(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = (u32::from(c[0]) << 16) | (u32::from(*c.get(1).unwrap_or(&0)) << 8) | u32::from(*c.get(2).unwrap_or(&0));
+        for k in 0..=c.len() {
+            out.push(BASE64[(n >> (18 - 6 * k) & 63) as usize]);
+        }
+    }
+    out
+}
+
+/// The DER inside each PEM block of `text` (`-----BEGIN …-----` to
+/// `-----END …-----`; header lines such as `Proc-Type:` are skipped).
+fn pem_bodies(text: &str) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut body: Option<Vec<u8>> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("-----BEGIN ") {
+            body = Some(Vec::new());
+        } else if line.starts_with("-----END ") {
+            if let Some(b) = body.take() {
+                if let Some(der) = base64_decode(&b) {
+                    out.push(der);
+                }
+            }
+        } else if let Some(b) = body.as_mut() {
+            if !line.contains(':') {
+                b.extend(line.bytes());
+            }
+        }
+    }
+    out
+}
+
+fn base64_decode(text: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let (mut acc, mut bits) = (0u32, 0);
+    for &c in text {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => break,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
 }
 
 impl InjectedSecrets {
     pub fn from_files<'a>(files: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> InjectedSecrets {
         let mut needles: Vec<(Vec<u8>, String)> = Vec::new();
+        let mut raw: Vec<(Vec<u8>, String)> = Vec::new();
+        let mut windows = WindowIndex::default();
         let mut add = |v: &str, src: &str| {
             let v = v.trim();
             if secret_like(v) && !needles.iter().any(|(n, _)| n == v.as_bytes()) {
@@ -145,6 +384,23 @@ impl InjectedSecrets {
                     add(v, src);
                 }
             }
+            // Binary content (BUG-099), and the DER of PEM blocks (a key
+            // converted to DER by the command).
+            let binary: Vec<Vec<u8>> = match std::str::from_utf8(data) {
+                Err(_) => vec![data[..data.len().min(MAX_BINARY)].to_vec()],
+                Ok(t) => pem_bodies(t),
+            };
+            for b in binary {
+                if b.len() < WINDOW / 2 {
+                    continue;
+                }
+                windows.sources.push(src.to_string());
+                let id = (windows.sources.len() - 1) as u32;
+                windows.add_source(&b, id);
+                if !raw.iter().any(|(n, _)| *n == b) {
+                    raw.push((b, src.to_string()));
+                }
+            }
         }
         // Longest first, so the leftmost match reports the most specific value.
         needles.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
@@ -161,30 +417,52 @@ impl InjectedSecrets {
                     .ok()
             })
             .flatten();
-        InjectedSecrets { needles, matcher }
+        InjectedSecrets {
+            needles,
+            matcher,
+            raw,
+            windows,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.needles.is_empty()
+        self.needles.is_empty() && self.raw.is_empty() && self.windows.len() == 0
     }
 
     /// The first injected value contained in `data`, as a printable finding.
     pub fn find(&self, data: &[u8]) -> Option<Finding> {
-        let (start, needle) = match &self.matcher {
-            Some(re) => {
-                let m = re.find(data)?;
-                (m.start(), self.needles.iter().find(|(n, _)| n == m.as_bytes())?)
-            }
-            // Pattern too large for the regex engine: plain substring search.
-            None => self.needles.iter().find_map(|n| {
-                data.windows(n.0.len()).position(|w| w == n.0.as_slice()).map(|i| (i, n))
-            })?,
-        };
-        Some(Finding {
+        let found = |start: usize, excerpt: String| Finding {
             rule: INJECTED_RULE,
             line: data[..start].iter().filter(|&&b| b == b'\n').count() + 1,
-            excerpt: format!("content of {} injected into the sandbox", needle.1),
-        })
+            excerpt,
+        };
+        let text = match &self.matcher {
+            Some(re) => re
+                .find(data)
+                .and_then(|m| Some((m.start(), self.needles.iter().find(|(n, _)| n == m.as_bytes())?))),
+            // Pattern too large for the regex engine: plain substring search.
+            None => self
+                .needles
+                .iter()
+                .find_map(|n| memchr::memmem::find(data, &n.0).map(|i| (i, n))),
+        };
+        if let Some((start, needle)) = text {
+            return Some(found(start, format!("content of {} injected into the sandbox", needle.1)));
+        }
+        if let Some((start, (_, src))) = self.raw.iter().find_map(|n| memchr::memmem::find(data, &n.0).map(|i| (i, n))) {
+            return Some(found(start, format!("content of {src} injected into the sandbox")));
+        }
+        let (start, w) = self.windows.find(data)?;
+        let (_, src, enc) = &self.windows.windows[w as usize];
+        let how = match enc {
+            Encoding::Raw => "part of the content",
+            Encoding::Base64 => "part of the content (base64)",
+            Encoding::Hex => "part of the content (hex)",
+        };
+        Some(found(
+            start,
+            format!("{how} of {} injected into the sandbox", self.windows.sources[*src as usize]),
+        ))
     }
 }
 
