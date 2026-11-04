@@ -52,8 +52,12 @@ fn clone_cannot_overwrite_repository_metadata() {
     let out = env.vl("victim", &work, &["clone", remote.to_str().unwrap(), "dest"]);
     let cfg = std::fs::read_to_string(work.join("dest/.veil/repo.json")).unwrap_or_default();
     assert!(!cfg.contains("attacker-controlled"), "remote rewrote .veil/repo.json:\n{cfg}\n{}", text(&out));
-    let remotes = env.vl("victim", &work.join("dest"), &["remote", "list"]);
-    assert!(!text(&remotes).contains("attacker"), "{}", text(&remotes));
+    // A refused clone removes its destination; only a clone that exists
+    // can hold a configuration to check.
+    if work.join("dest").exists() {
+        let remotes = env.vl("victim", &work.join("dest"), &["remote", "list"]);
+        assert!(!text(&remotes).contains("attacker"), "{}", text(&remotes));
+    }
 }
 
 #[test]

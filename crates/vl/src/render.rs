@@ -187,6 +187,13 @@ pub fn print_build_warnings(r: &BuildReport) {
     for (p, why) in &r.cloak_failures {
         warn_untrusted(&format!("could not cloak {p} ({why}); it was kept local-only"));
     }
+    for (p, embargo) in &r.held_back {
+        warn_untrusted(&format!(
+            "edit of {p} not recorded: this line is under embargo {embargo}, whose content you cannot read, \
+             so recording it would revert the hidden fix. Your edit stays in the working copy and is recorded \
+             after the release (or work on the embargoed merge's first parent instead)"
+        ));
+    }
 }
 
 // ---- log -----------------------------------------------------------------

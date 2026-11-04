@@ -238,12 +238,12 @@ fn an_outsider_cannot_record_edits_on_top_of_an_embargo_or_merge_it() {
     assert_eq!(cfs.read(&p("auth.rs")).unwrap(), b"fn check() -> bool { true }\n");
     // Unchanged: nothing to record, nothing held back.
     let out = carol.snapshot_workspace(WS, &*cfs).unwrap();
-    assert!(!out.changed && out.report.cloak_failures.is_empty());
+    assert!(!out.changed && out.report.held_back.is_empty() && out.report.cloak_failures.is_empty());
     // Recording this edit would revert the hidden fix for everyone: held back.
     cfs.write(&p("auth.rs"), b"fn check() -> bool { false }\n").unwrap();
     let out = carol.snapshot_workspace(WS, &*cfs).unwrap();
     assert!(!out.changed, "an outsider's edit on top of the embargo was recorded");
-    assert!(out.report.cloak_failures.iter().any(|(p, _)| p.as_str() == "auth.rs"));
+    assert!(out.report.held_back.iter().any(|(p, _)| p.as_str() == "auth.rs"));
 
     let ws = carol.ephemeral_workspace(e.main).unwrap();
     ws.write("other.rs", "x\n").unwrap();

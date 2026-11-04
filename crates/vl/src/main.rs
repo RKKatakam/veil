@@ -15,7 +15,7 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser};
 use veil_core::{
-    checkout::behind_special,
+    checkout::{behind_special, Materialised},
     commands::EmbargoSpec,
     now_millis,
     keychain::validate_scope_name,
@@ -292,13 +292,7 @@ fn cmd_init(path: Option<&Path>) -> Result<ExitCode> {
     }
     let out = repo.snapshot_workspace(DEFAULT_WORKSPACE, &*fs)?;
     repo.capture_local_files(&*fs, &out.report)?;
-    save_checkout(
-        &fs,
-        &CheckoutState {
-            workspace: DEFAULT_WORKSPACE.into(),
-            snapshot: out.snapshot,
-        },
-    )?;
+    save_checkout(&fs, &CheckoutState::new(DEFAULT_WORKSPACE, out.snapshot, Materialised::default()))?;
     println!("Initialized Veil repository in {}", root.join(".veil").display());
     println!("  identity   {} ({})", identity.name, dim(&identity.public_hex()));
     println!("  scope      team (you are the only member)");
@@ -351,15 +345,46 @@ fn connect_sftp(url: &SshUrl) -> Result<Arc<dyn StorageBackend>> {
     ))
 }
 
-/// Clone the repository on `backend` (configured as `origin` → `url`) into `dest`.
+/// Clone the repository on `backend` (configured as `origin` → `url`) into
+/// `dest`. On failure, whatever the clone created is removed: the whole
+/// destination if it did not exist, otherwise its contents (it was empty).
 fn clone_into(backend: Arc<dyn StorageBackend>, url: String, shown: String, dest: &Path) -> Result<ExitCode> {
     if dest.exists() && std::fs::read_dir(dest)?.next().is_some() {
         bail!("destination {} is not empty", dest.display());
     }
+    let created = !dest.exists();
     std::fs::create_dir_all(dest)?;
     let dest = dest.canonicalize()?;
+    let result = clone_populate(backend, url, shown, &dest);
+    if result.is_err() {
+        let cleaned = if created {
+            std::fs::remove_dir_all(&dest)
+        } else {
+            empty_dir(&dest)
+        };
+        if let Err(e) = cleaned {
+            warn(&format!("could not remove the partial clone in {}: {e}", dest.display()));
+        }
+    }
+    result
+}
+
+/// Remove everything inside `dir` (not following symlinks).
+fn empty_dir(dir: &Path) -> std::io::Result<()> {
+    for e in std::fs::read_dir(dir)? {
+        let e = e?;
+        if e.file_type()?.is_dir() {
+            std::fs::remove_dir_all(e.path())?;
+        } else {
+            std::fs::remove_file(e.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn clone_populate(backend: Arc<dyn StorageBackend>, url: String, shown: String, dest: &Path) -> Result<ExitCode> {
     let identity = load_identity()?;
-    let fs = Arc::new(DiskBackend::new(&dest));
+    let fs = Arc::new(DiskBackend::new(dest));
     // Same format as the source, so that what the clone writes can be
     // pushed back and read by everyone who reads the source.
     let source_config = veil_core::repo::read_config(&*backend)?;
@@ -379,14 +404,13 @@ fn clone_into(backend: Arc<dyn StorageBackend>, url: String, shown: String, dest
         .unwrap_or(repo.root_id());
     let wc = repo.new_change(DEFAULT_WORKSPACE, vec![target], "")?;
     let to = repo.snapshot(&wc)?.tree;
-    let co = repo.checkout_tree(&*fs, None, &to)?;
-    save_checkout(
-        &fs,
-        &CheckoutState {
-            workspace: DEFAULT_WORKSPACE.into(),
-            snapshot: wc,
-        },
-    )?;
+    // Remember what could not be materialised (no key yet, an unreleased
+    // embargo), so it is filled in once it becomes readable instead of
+    // being recorded as deleted.
+    let mut record = Materialised::default();
+    let co = repo.checkout_tree_recorded(&*fs, None, &to, &mut record, None)?;
+    let hidden_by_embargo = record.view().is_some();
+    save_checkout(&fs, &CheckoutState::new(DEFAULT_WORKSPACE, wc, record))?;
     println!(
         "Cloned {} into {} ({} objects, {} files)",
         safe(&shown),
@@ -396,10 +420,16 @@ fn clone_into(backend: Arc<dyn StorageBackend>, url: String, shown: String, dest
     );
     if !co.redacted.is_empty() {
         println!(
-            "  {} {} cloaked file(s) you hold no key for. Share your public key ({}) with a member\n  and ask them to run `vl scope grant team <key>` and push.",
+            "  {} {} cloaked file(s) you hold no key for. Share your public key ({}) with a member\n  and ask them to run `vl scope grant team <key>` and push. They appear here on your next `vl pull` after that.",
             yellow("note:"),
             co.redacted.len(),
             identity.public_id()
+        );
+    }
+    if hidden_by_embargo {
+        println!(
+            "  {} an embargoed merge is not readable to you yet; you see its pre-merge content until it is released.",
+            yellow("note:")
         );
     }
     Ok(ExitCode::SUCCESS)
@@ -682,13 +712,16 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: &str) -> Result<()> {
         }
         n += 1;
     }
-    ctx.snapshot()?;
+    // A command of its own (not an automatic snapshot), so `vl undo` brings
+    // the discarded edits back.
+    let what = if paths.is_empty() { "everything".to_string() } else { paths.join(" ") };
+    ctx.snapshot_as(format!("restore {what} from {from}"))?;
     println!("Restored {n} path(s) from {}", one_line(&ctx.repo, &src));
     Ok(())
 }
 
 fn skipped_special(p: &VPath) {
-    warn(&format!("skipped {p}: a symlink or special file is in the way; Veil never writes through or over it"));
+    warn_untrusted(&format!("skipped {p}: a symlink or special file is in the way; Veil never writes through or over it"));
 }
 
 /// The furthest an embargo deadline may lie in the future.
@@ -797,7 +830,7 @@ fn cmd_merge(
         );
     }
     if !res.quarantined.is_empty() {
-        warn(&format!(
+        warn_untrusted(&format!(
             "quarantined, left out of the merge (they hold secrets): {}",
             res.quarantined.join(", ")
         ));
@@ -904,7 +937,7 @@ fn rule_pattern(ctx: &Ctx, arg: &str) -> (String, bool) {
             return (format!("{lead}{}{trail}", escape_literal(core)), true);
         }
         if arg.contains(['[', ']', '{', '}']) {
-            warn(&format!(
+            warn_untrusted(&format!(
                 "'{arg}' is not an existing path, so it is a glob pattern; to match a file with this literal name, escape the characters with '\\' (e.g. {})",
                 escape_literal(arg)
             ));
@@ -946,7 +979,7 @@ fn cmd_policy_rules(ctx: &mut Ctx, patterns: &[String], tier: Tier, force: bool)
                 .map(|(p, _)| p)
                 .collect();
             if !exposed.is_empty() {
-                warn(&format!(
+                warn_untrusted(&format!(
                     "{} matching file(s) already exist in plaintext in earlier snapshots (e.g. {}). New snapshots are protected; rotate any secrets they contain.",
                     exposed.len(),
                     exposed[0]
@@ -955,7 +988,14 @@ fn cmd_policy_rules(ctx: &mut Ctx, patterns: &[String], tier: Tier, force: bool)
         }
     }
     ctx.fs.write(&path, text.as_bytes())?;
-    ctx.snapshot()?;
+    // A command of its own (not an automatic snapshot), so `vl undo` reverts it.
+    let verb = match &tier {
+        Tier::Public => "expose",
+        Tier::Cloaked(_) => "cloak",
+        Tier::Isolated => "isolate",
+        Tier::Ignored => "ignore",
+    };
+    ctx.snapshot_as(format!("{verb} {}", patterns.join(" ")))?;
     Ok(())
 }
 
@@ -1011,15 +1051,15 @@ fn cmd_scan(ctx: &mut Ctx) -> Result<ExitCode> {
         if findings.is_empty() {
             continue;
         }
-        let (label, safe) = match &class.tier {
+        let (label, protected) = match &class.tier {
             Tier::Public => (red("PUBLIC   "), false),
-            Tier::Cloaked(s) => (magenta(&format!("cloaked:{s}")), true),
+            Tier::Cloaked(s) => (magenta(&format!("cloaked:{}", safe(s))), true),
             _ => (dim("isolated "), true),
         };
         for f in &findings {
-            println!("{label} {path}:{}  {} {}", f.line, f.rule, dim(&f.excerpt));
+            println!("{label} {}:{}  {} {}", safe(path.as_str()), f.line, f.rule, dim(&safe(&f.excerpt)));
         }
-        if safe {
+        if protected {
             contained += 1;
         } else {
             exposed += 1;
@@ -1405,40 +1445,50 @@ fn remote_backend(ctx: &Ctx, name: &str) -> Result<(Arc<dyn StorageBackend>, Rem
 }
 
 fn cmd_remote(ctx: &mut Ctx, c: &RemoteCmd) -> Result<()> {
-    let mut config = ctx.repo.config().clone();
     match c {
         RemoteCmd::Add { name, url, public } => {
-            if config.remotes.contains_key(name) {
-                bail!("remote '{name}' already exists");
-            }
             if let Some(parsed) = SshUrl::parse(url) {
                 parsed?;
             }
-            config.remotes.insert(
-                name.clone(),
-                RemoteConfig {
-                    url: url.clone(),
-                    public: *public,
-                },
+            // Under the repository lock: a concurrent `vl remote add` must
+            // not be lost to our read-modify-write of repo.json.
+            ctx.repo.update_config(|config| {
+                if config.remotes.contains_key(name) {
+                    return Err(veil_core::VeilError::repo(format!("remote '{name}' already exists")));
+                }
+                config.remotes.insert(
+                    name.clone(),
+                    RemoteConfig {
+                        url: url.clone(),
+                        public: *public,
+                    },
+                );
+                Ok(())
+            })?;
+            println!(
+                "Added {} remote {} → {}",
+                if *public { "public" } else { "team" },
+                safe(name),
+                safe(url)
             );
-            println!("Added {} remote {name} → {url}", if *public { "public" } else { "team" });
         }
         RemoteCmd::List => {
-            for (name, r) in &config.remotes {
+            for (name, r) in &ctx.repo.config().remotes {
                 let kind = if r.public { yellow("public") } else { green("team") };
-                println!("{}  {kind}  {}", bold(name), r.url);
+                println!("{}  {kind}  {}", bold(&safe(name)), safe(&r.url));
             }
-            return Ok(());
         }
         RemoteCmd::Rm { name } => {
-            config
-                .remotes
-                .remove(name)
-                .ok_or_else(|| anyhow!("no remote named '{name}'"))?;
-            println!("Removed remote {name}");
+            ctx.repo.update_config(|config| {
+                config
+                    .remotes
+                    .remove(name)
+                    .map(|_| ())
+                    .ok_or_else(|| veil_core::VeilError::repo(format!("no remote named '{name}'")))
+            })?;
+            println!("Removed remote {}", safe(name));
         }
     }
-    ctx.repo.save_config(config)?;
     Ok(())
 }
 

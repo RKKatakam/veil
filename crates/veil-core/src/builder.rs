@@ -47,6 +47,7 @@ use std::{
 };
 
 use crate::{
+    checkout::Materialised,
     error::{Result, VeilError},
     id::ObjectId,
     object::{EntryKind, Object, Tree, TreeEntry, Visibility},
@@ -91,6 +92,14 @@ pub struct BuildOptions<'a> {
     /// scanner's rules change, so files an older scanner let through are
     /// caught. Also disables reuse hints for that build.
     pub rescan: bool,
+    /// What the working copy `fs` was materialised from, relative to
+    /// `parent_tree` (see [`Materialised`]): which files were left out
+    /// because this reader could not read them, and which were written from
+    /// an embargo fallback. A path that was never materialised is never
+    /// recorded as deleted, even once it has become readable. `None` when
+    /// `fs` is not a checked-out working copy (overlays, sandboxes) or the
+    /// caller keeps no record.
+    pub materialised: Option<&'a Materialised>,
 }
 
 /// Rule name of a [`Finding`] for content copied from an injected secret.
@@ -226,6 +235,10 @@ pub struct BuildReport {
     pub blocked_exposures: Vec<VPath>,
     /// Files that should have been cloaked but no key was available.
     pub cloak_failures: Vec<(VPath, String)>,
+    /// Edits held back on a line under an unreleased embargo this reader
+    /// holds no key for (recording them would revert the hidden fix), with
+    /// the embargo's id. They are recorded once the embargo is released.
+    pub held_back: Vec<(VPath, String)>,
     /// Entries carried over because this reader cannot materialise them.
     pub carried: Vec<VPath>,
     pub ignored: usize,
@@ -258,6 +271,7 @@ impl BuildReport {
         let mut v: Vec<VPath> = self.isolated.clone();
         v.extend(self.quarantined.iter().map(|(p, _)| p.clone()));
         v.extend(self.cloak_failures.iter().map(|(p, _)| p.clone()));
+        v.extend(self.held_back.iter().map(|(p, _)| p.clone()));
         v.sort();
         v.dedup();
         v
@@ -366,7 +380,7 @@ impl Builder<'_> {
     /// keep seeing the pre-merge tree). A reader without the key only sees
     /// that pre-merge tree, so recording edits on top of it would silently
     /// revert the hidden change for everyone else: such edits are held back
-    /// (reported as cloak failures) until the embargo is released.
+    /// (reported in [`BuildReport::held_back`]) until the embargo is released.
     fn keep_embargo(&mut self, id: ObjectId) -> Result<ObjectId> {
         let Some(parent) = self.opts.parent_tree.filter(|p| *p != id) else {
             return Ok(id);
@@ -378,13 +392,7 @@ impl Builder<'_> {
             return crate::embargo::wrap(self.store, &w.embargo, &id, &w.fallback);
         }
         for c in crate::tree::diff_trees(self.store, Some(&parent), Some(&id))? {
-            self.report.cloak_failures.push((
-                c.path,
-                format!(
-                    "held back: embargo {} hides this line's current content from you; edits are recorded after its release",
-                    w.embargo
-                ),
-            ));
+            self.report.held_back.push((c.path, w.embargo.clone()));
         }
         Ok(parent)
     }
@@ -635,7 +643,10 @@ impl Builder<'_> {
         let open = |b: &mut Self, e: &TreeEntry, path: &VPath, depth: usize| -> Result<std::result::Result<Frame, Option<TreeEntry>>> {
             match e.kind {
                 EntryKind::File => {
-                    if b.store.entry_readable(e) {
+                    // Readable and absent is a deletion, unless it was never
+                    // materialised (it became readable since checkout).
+                    let never_materialised = b.opts.materialised.is_some_and(|m| m.hidden(path));
+                    if b.store.entry_readable(e) && !never_materialised {
                         Ok(Err(None))
                     } else {
                         b.report.carried.push(path.clone());

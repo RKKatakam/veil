@@ -514,6 +514,25 @@ A workspace is only a named pointer in the view. It owns no directory.
   moved underneath the directory (an undo, another process, an interrupted
   command), any local edits are saved as their own change before catching up.
   Nothing is lost.
+* **What was materialised from what.** `checkout.json` also records
+  (`checkout::Materialised`) the files checkout left out because this reader
+  could not read them (no key for their scope yet), the files it wrote from
+  an embargo fallback, and, when the snapshot's tree is an embargo wrapper
+  this reader saw as its fallback, the tree actually materialised. When
+  such content becomes readable (`vl scope grant` + `vl pull`, an embargo
+  release), the next command fills it in before snapshotting, and again at
+  its end, so a grant or release that arrives during the command shows at
+  once. Local edits are never overwritten. Without the record the next
+  snapshot would see the files as deleted, or reverted to the pre-embargo
+  content. The builder also consults it (`BuildOptions::materialised`): a
+  file that was never materialised is never recorded as deleted. The
+  clone-then-grant onboarding flow depends on this.
+* **Commands that edit the working copy are operations of their own.**
+  `vl expose`, `cloak`, `isolate`, `ignore` and `restore` write files and
+  record the result under their own operation description, not as the
+  automatic snapshot that `vl undo` skips as "the user's uncommitted
+  edits". So `vl undo` reverts them (an accidental `vl expose` above all),
+  and edits made after them are kept as usual.
 * **Virtual workspaces** (`vl ws new`) exist only in the DAG. They are edited
   through overlays (`vl ws write`), materialised into a throwaway directory
   for one command (`vl ws exec`), or attached to the project directory
@@ -618,9 +637,10 @@ remains is mostly the one `lstat` per file and the per-directory
    merges and rebases on top of it are re-wrapped under the same embargo,
    with the merge of the inputs' public views as their fallback. A reader
    without the key cannot record edits on top of it: the builder holds them
-   back (reported like cloak failures), because that reader sees only the
-   pre-merge tree and recording on top of it would silently revert the fix
-   for everyone. Merging such history without the key is refused.
+   back (`BuildReport::held_back`, reported with the embargo's id), because
+   that reader sees only the pre-merge tree and recording on top of it would
+   silently revert the fix for everyone. After the release they are
+   recorded. Merging such history without the key is refused.
 6. **Release** (manual, or automatic on the first `vl` run by a key holder
    after the deadline) publishes the key in the record. Snapshot ids do not
    change, nothing is rewritten, and the next push carries the
@@ -1111,7 +1131,10 @@ whose new tip does not descend from the previous one was **force-pushed**
 on the Git side: it is reported, the snapshots it dropped stay in Veil, and
 local tags never move backwards. `vl git pull` also creates or
 fast-forwards local tags; a diverged tag is left alone with a hint (`vl
-merge <r>/<branch>`). `vl git push` exports, then pushes
+merge <r>/<branch>`). Like `vl pull`, it never moves the working copy (a
+change of the user's own; rewriting it under them would be surprising):
+`vl rebase -d <tag>` does. The usual working-copy handling still runs at
+the end of the command (§6: anything that became readable is filled in). `vl git push` exports, then pushes
 `<commit>:refs/heads/<tag>` for each tag. A branch that moved on the Git
 side is rejected (non-fast-forward). `--force` uses
 `--force-with-lease=<branch>:<last fetched>`, so it can only overwrite what
