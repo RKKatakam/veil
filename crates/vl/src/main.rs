@@ -1,6 +1,7 @@
 mod cli;
 mod ctx;
 mod render;
+mod sandbox;
 
 use std::{
     io::{Read, Write},
@@ -13,6 +14,7 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use veil_core::{
+    checkout::behind_special,
     commands::EmbargoSpec,
     now_millis,
     policy::{format_rule, Policy, Tier, POLICY_FILE},
@@ -26,7 +28,7 @@ use veil_core::{
 
 use crate::{
     cli::*,
-    ctx::{load_identity, save_checkout, user_for, CheckoutState, Ctx},
+    ctx::{load_identity, print_working_copy_warnings, save_checkout, user_for, CheckoutState, Ctx},
     render::*,
 };
 
@@ -50,6 +52,10 @@ node_modules/            ignore
 ";
 
 fn main() -> ExitCode {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().is_some_and(|a| a == sandbox::REAPER_ARG) {
+        return sandbox::reaper_main(args.next().as_deref());
+    }
     let cli = Cli::parse();
     match run(cli) {
         Ok(code) => code,
@@ -208,14 +214,17 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
                 );
             }
         }
+        // Both keep uncommitted working-copy edits: the automatic snapshot
+        // taken before the command is not what the user wants to undo.
         Cmd::Op(OpCmd::Restore { id }) => {
             let op = ctx.repo.ops().resolve_prefix(id)?;
-            ctx.repo.restore_operation(op)?;
+            let ws = ctx.ws.clone();
+            ctx.repo.restore_operation_keeping_edits(&ws, op)?;
             println!("Restored to operation {}", op.short());
         }
         Cmd::Undo => {
-            let undone = ctx.repo.op_log(1)?[0].1.description.clone();
-            ctx.repo.undo()?;
+            let ws = ctx.ws.clone();
+            let (_, undone) = ctx.repo.undo_keeping_edits(&ws)?;
             println!("Undid: {undone}");
         }
         Cmd::Watch { interval_ms } => cmd_watch(ctx, *interval_ms)?,
@@ -471,6 +480,10 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: &str) -> Result<()> {
             continue;
         }
         done.insert(c.path.clone());
+        if behind_special(&*ctx.fs, &c.path)? {
+            skipped_special(&c.path);
+            continue;
+        }
         match &c.new {
             Some(e) => {
                 let data = ctx.repo.store().read_entry(e)?;
@@ -487,6 +500,10 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: &str) -> Result<()> {
         if done.contains(&p) || !wanted(&p) {
             continue;
         }
+        if behind_special(&*ctx.fs, &p)? {
+            skipped_special(&p);
+            continue;
+        }
         match veil_core::tree::lookup(ctx.repo.store(), &src_tree, &p)? {
             Some(e) if e.kind == veil_core::EntryKind::File => {
                 ctx.fs.write(&p, &ctx.repo.store().read_entry(&e)?)?;
@@ -499,6 +516,10 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: &str) -> Result<()> {
     ctx.snapshot()?;
     println!("Restored {n} path(s) from {}", one_line(&ctx.repo, &src));
     Ok(())
+}
+
+fn skipped_special(p: &VPath) {
+    warn(&format!("skipped {p}: a symlink or special file is in the way; Veil never writes through or over it"));
 }
 
 fn parse_time(s: &str) -> Result<i64> {
@@ -947,13 +968,6 @@ fn cmd_scope(ctx: &mut Ctx, c: &ScopeCmd) -> Result<()> {
 
 // ---- workspaces ----------------------------------------------------------
 
-fn tempdir_for(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "veil-ws-{name}-{}",
-        hex::encode(veil_core::crypto::random_bytes::<4>())
-    ))
-}
-
 fn run_in(dir: &Path, command: &[String]) -> Result<i32> {
     let status = std::process::Command::new(&command[0])
         .args(&command[1..])
@@ -1030,31 +1044,48 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
                 }
                 (name.to_string(), ctx.repo.workspace_wc(name)?)
             };
-            let dir = tempdir_for(&label);
-            std::fs::create_dir_all(&dir)?;
+            let sb = sandbox::Sandbox::create(&label)?;
+            let dir = sb.path().to_path_buf();
             let sandbox = DiskBackend::new(&dir);
             let result = (|| -> Result<i32> {
                 let tree = ctx.repo.snapshot(&base_snapshot)?.tree;
                 ctx.repo.checkout_tree(&sandbox, None, &tree)?;
+                let mut injected = None;
                 if *with_isolated {
+                    let mut files = Vec::new();
                     for (p, hexdata) in ctx.repo.vault_load()?.files {
-                        sandbox.write(&VPath::new(&p)?, &hex::decode(hexdata)?)?;
+                        let data = hex::decode(hexdata)?;
+                        sandbox.write(&VPath::new(&p)?, &data)?;
+                        files.push((p, data));
                     }
+                    // Whatever the command does with these, they must not be
+                    // recorded under another name.
+                    injected = Some(veil_core::builder::InjectedSecrets::from_files(
+                        files.iter().map(|(p, d)| (p.as_str(), d.as_slice())),
+                    ));
                 }
+                sb.make_private()?;
                 eprintln!("{} {} in {}", dim("running"), command.join(" "), dir.display());
                 let code = run_in(&dir, command)?;
                 if *ephemeral {
-                    let (id, report) = ctx.repo.commit_fs_as_child(base_snapshot, &sandbox, message)?;
+                    let (id, report) =
+                        ctx.repo
+                            .commit_fs_as_child_injected(base_snapshot, &sandbox, message, injected.as_ref())?;
                     print_build_warnings(&report);
-                    println!("Recorded {}", one_line(&ctx.repo, &id));
+                    print_working_copy_warnings(&report);
+                    eprintln!("Recorded {}", one_line(&ctx.repo, &id));
                 } else {
-                    let out = ctx.repo.snapshot_workspace(&label, &sandbox)?;
+                    let out = ctx
+                        .repo
+                        .snapshot_workspace_injected(&label, &sandbox, None, injected.as_ref())?;
                     print_build_warnings(&out.report);
+                    print_working_copy_warnings(&out.report);
                     if !message.is_empty() {
                         ctx.repo.describe(out.snapshot, message)?;
                     }
                     let wc = ctx.repo.workspace_wc(&label)?;
-                    println!(
+                    // stderr: stdout belongs to the sandboxed command.
+                    eprintln!(
                         "{} {}",
                         if out.changed { "Recorded" } else { "No changes in" },
                         one_line(&ctx.repo, &wc)
@@ -1062,7 +1093,7 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
                 }
                 Ok(code)
             })();
-            let _ = std::fs::remove_dir_all(&dir);
+            drop(sb);
             let code = result?;
             return Ok(ExitCode::from(code.clamp(0, 255) as u8));
         }

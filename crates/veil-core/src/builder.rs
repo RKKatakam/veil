@@ -17,6 +17,21 @@
 //! With a [`StatCache`] the builder skips reading files whose stat data is
 //! unchanged, using content facts recorded on an earlier run. Classification
 //! still runs for every path, every time.
+//!
+//! The working copy is untrusted ground, so nothing in it can fail a build
+//! or slip through silently:
+//!
+//! * crash leftovers of interrupted writes (`.name.vltmpXXXXXXXX`) are
+//!   skipped;
+//! * an unreadable file or directory keeps its previous entry (or stays out
+//!   if it was never tracked) and is reported;
+//! * names that are not valid UTF-8 cannot be recorded and are reported;
+//! * a tracked path that became a symlink (or socket, device…) is never
+//!   followed: its tracked entry is kept and reported.
+//!
+//! With [`InjectedSecrets`] (the isolated files a `ws exec` sandbox was given)
+//! any new content that contains one of those values is quarantined, so a
+//! command cannot launder an injected secret into history under another name.
 
 use std::collections::HashSet;
 
@@ -28,7 +43,7 @@ use crate::{
     secrets::{self, Finding},
     statcache::{CacheKey, CacheRun, StatCache},
     store::ObjectStore,
-    vfs::{Metadata, NodeKind, StorageBackend},
+    vfs::{is_temp_name, Metadata, NodeKind, StorageBackend},
     vpath::VPath,
 };
 
@@ -38,6 +53,130 @@ pub struct BuildOptions<'a> {
     pub parent_tree: Option<ObjectId>,
     /// Cloak every public file under this scope (cloaked line of work).
     pub cloak: Option<&'a str>,
+    /// Secret content the engine handed to whoever wrote `fs` (the isolated
+    /// files injected into a sandbox). New content containing any of it is
+    /// quarantined, whatever its path and tier.
+    pub injected: Option<&'a InjectedSecrets>,
+}
+
+/// Rule name of a [`Finding`] for content copied from an injected secret.
+pub const INJECTED_RULE: &str = "injected-isolated-secret";
+
+/// Values the engine injected from the vault (isolated files such as
+/// `.env`, keys, quarantined files) into a sandbox. Built from the files'
+/// contents: every `KEY=value` / `key: value` value that looks like a secret
+/// (at least 8 characters, and either 20+ characters or a mix of character
+/// classes, so `localhost`, `production` or `3000` never match), plus the
+/// whole content and every whitespace-free line of 24+ characters (key
+/// material, bare tokens).
+#[derive(Debug, Default, Clone)]
+pub struct InjectedSecrets {
+    /// (needle, the injected file it came from)
+    needles: Vec<(Vec<u8>, String)>,
+    matcher: Option<regex::bytes::Regex>,
+}
+
+impl InjectedSecrets {
+    pub fn from_files<'a>(files: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> InjectedSecrets {
+        let mut needles: Vec<(Vec<u8>, String)> = Vec::new();
+        let mut add = |v: &str, src: &str| {
+            let v = v.trim();
+            if secret_like(v) && !needles.iter().any(|(n, _)| n == v.as_bytes()) {
+                needles.push((v.as_bytes().to_vec(), src.to_string()));
+            }
+        };
+        for (src, data) in files {
+            let text = String::from_utf8_lossy(data);
+            if text.trim().len() >= LONG_NEEDLE {
+                add(&text, src);
+            }
+            for line in text.lines() {
+                // Whole lines only when long and unbroken (key material,
+                // tokens), not ordinary `MODE=production` or code lines.
+                let line_t = line.trim();
+                if line_t.len() >= LONG_NEEDLE && !line_t.contains(char::is_whitespace) {
+                    add(line_t, src);
+                }
+                if let Some(v) = assignment_value(line) {
+                    add(v, src);
+                }
+            }
+        }
+        // Longest first, so the leftmost match reports the most specific value.
+        needles.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+        let matcher = (!needles.is_empty())
+            .then(|| {
+                let alts: Vec<String> = needles
+                    .iter()
+                    .map(|(n, _)| regex::escape(std::str::from_utf8(n).expect("needles are UTF-8")))
+                    .collect();
+                regex::bytes::RegexBuilder::new(&alts.join("|"))
+                    .size_limit(256 << 20)
+                    .dfa_size_limit(64 << 20)
+                    .build()
+                    .ok()
+            })
+            .flatten();
+        InjectedSecrets { needles, matcher }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.needles.is_empty()
+    }
+
+    /// The first injected value contained in `data`, as a printable finding.
+    pub fn find(&self, data: &[u8]) -> Option<Finding> {
+        let (start, needle) = match &self.matcher {
+            Some(re) => {
+                let m = re.find(data)?;
+                (m.start(), self.needles.iter().find(|(n, _)| n == m.as_bytes())?)
+            }
+            // Pattern too large for the regex engine: plain substring search.
+            None => self.needles.iter().find_map(|n| {
+                data.windows(n.0.len()).position(|w| w == n.0.as_slice()).map(|i| (i, n))
+            })?,
+        };
+        Some(Finding {
+            rule: INJECTED_RULE,
+            line: data[..start].iter().filter(|&&b| b == b'\n').count() + 1,
+            excerpt: format!("content of {} injected into the sandbox", needle.1),
+        })
+    }
+}
+
+/// Minimum length of whole-file and whole-line needles.
+const LONG_NEEDLE: usize = 24;
+
+/// Long enough, and not a plain word or number.
+fn secret_like(v: &str) -> bool {
+    if v.len() < 8 || v.contains('\u{fffd}') {
+        return false;
+    }
+    let classes = [
+        v.bytes().any(|b| b.is_ascii_lowercase()),
+        v.bytes().any(|b| b.is_ascii_uppercase()),
+        v.bytes().any(|b| b.is_ascii_digit()),
+        v.bytes().any(|b| !b.is_ascii_alphanumeric()),
+    ];
+    v.len() >= 20 || classes.iter().filter(|&&c| c).count() >= 2
+}
+
+/// `value` of `KEY=value`, `export KEY="value"` or `key: value`.
+fn assignment_value(line: &str) -> Option<&str> {
+    let line = line.trim();
+    let line = line.strip_prefix("export ").unwrap_or(line);
+    let at = line.find(['=', ':'])?;
+    let key = line[..at].trim();
+    if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')) {
+        return None;
+    }
+    let v = line[at + 1..].trim();
+    let v = v
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .or_else(|| v.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+        .unwrap_or(v);
+    Some(v)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -62,6 +201,16 @@ pub struct BuildReport {
     /// Files whose entry came from the stat cache without reading them.
     pub cache_hits: usize,
     pub policy_warnings: Vec<String>,
+    /// Files or directories that could not be read (e.g. permission
+    /// denied), with the reason. A tracked one keeps its previous entry; an
+    /// untracked one is left out. Never fatal.
+    pub unreadable: Vec<(VPath, String)>,
+    /// Entries whose names are not valid UTF-8 (escaped for display, with
+    /// their directory). They cannot be recorded.
+    pub unrepresentable: Vec<String>,
+    /// Tracked paths that are now a symlink or another special file. Veil
+    /// never follows them; the tracked entry is kept unchanged.
+    pub shadowed: Vec<VPath>,
 }
 
 impl BuildReport {
@@ -155,10 +304,46 @@ impl Builder<'_> {
     fn build_dir(&mut self, dir: &VPath, parent: Option<(&Tree, ObjectId)>) -> Result<Option<ObjectId>> {
         let parent_id = parent.map(|(_, id)| id);
         let parent = parent.map(|(t, _)| t);
+        let listing = match self.fs.list_dir_full(dir) {
+            Ok(l) => l,
+            // Vanished while we were building: a deletion like any other.
+            Err(e) if e.is_not_found() && !dir.is_root() => return Ok(None),
+            // Unreadable (e.g. permission denied): keep what was tracked.
+            Err(VeilError::Io { source, .. }) if !dir.is_root() => {
+                self.report.unreadable.push((dir.clone(), source.to_string()));
+                return Ok(parent_id);
+            }
+            Err(e) => return Err(e),
+        };
+        for name in &listing.unrepresentable {
+            self.report.unrepresentable.push(match dir.is_root() {
+                true => name.clone(),
+                false => format!("{dir}/{name}"),
+            });
+        }
         let mut out = Tree::default();
         let mut seen = HashSet::new();
-        for child in self.fs.list_dir(dir)? {
+        // A tracked path that is now a symlink (or socket, device…) is never
+        // followed, and is not a deletion either: keep the tracked entry.
+        for name in &listing.special {
+            if let Some(pe) = parent.and_then(|t| t.get(name)) {
+                let path = dir.join(name);
+                let tier = self.opts.policy.classify(&path, pe.kind == EntryKind::Dir).tier;
+                if matches!(tier, Tier::Ignored | Tier::Isolated) {
+                    continue; // no longer tracked by policy anyway
+                }
+                seen.insert(name.clone());
+                self.report.shadowed.push(path);
+                out.insert(pe.clone());
+            }
+        }
+        for child in listing.entries {
             if dir.is_root() && child.name == ".veil" {
+                continue;
+            }
+            // Crash debris of an interrupted atomic write, never content.
+            if child.kind == NodeKind::File && is_temp_name(&child.name) {
+                self.report.ignored += 1;
                 continue;
             }
             seen.insert(child.name.clone());
@@ -245,6 +430,21 @@ impl Builder<'_> {
         }
     }
 
+    /// A working-copy file could not be stat'ed or read. Vanished meanwhile:
+    /// a deletion. Unreadable (e.g. permission denied): a tracked file keeps
+    /// its previous entry, an untracked one stays out; both are reported.
+    /// Errors of the store are never swallowed here.
+    fn unreadable(&mut self, path: &VPath, e: VeilError, parent_file: Option<&TreeEntry>) -> Result<Option<TreeEntry>> {
+        match e {
+            e if e.is_not_found() => Ok(None),
+            VeilError::Io { source, .. } => {
+                self.report.unreadable.push((path.clone(), source.to_string()));
+                Ok(parent_file.cloned())
+            }
+            e => Err(e),
+        }
+    }
+
     fn file_entry(&mut self, path: &VPath, name: &str, parent_entry: Option<&TreeEntry>) -> Result<Option<TreeEntry>> {
         let parent_file = parent_entry.filter(|e| e.kind == EntryKind::File);
         let class = self.opts.policy.classify(path, false);
@@ -278,18 +478,26 @@ impl Builder<'_> {
             }
         }
 
-        let meta = self.fs.metadata(path)?;
+        let meta = match self.fs.metadata(path) {
+            Ok(m) => m,
+            Err(e) => return self.unreadable(path, e, parent_file),
+        };
         let executable = meta.as_ref().is_some_and(|m| m.executable);
         // Embargoed entries depend on the parent entry and on embargo state,
         // not only on content: always take the slow path for them.
         let parent_embargoed = parent_file.is_some_and(|pe| matches!(pe.visibility, Visibility::Embargoed { .. }));
-        if let (Some(m), false) = (&meta, parent_embargoed) {
+        // With injected secrets every changed file must be read and checked.
+        let cacheable = !parent_embargoed && self.opts.injected.is_none();
+        if let (Some(m), true) = (&meta, cacheable) {
             if let Some(e) = self.cached_entry(path, name, m, &desired, class.allow_secrets, parent_file)? {
                 return Ok(Some(e));
             }
         }
 
-        let data = self.fs.read(path)?;
+        let data = match self.fs.read(path) {
+            Ok(d) => d,
+            Err(e) => return self.unreadable(path, e, parent_file),
+        };
         self.report.hashed += 1;
         let content = Object::blob_id(&data);
 
@@ -320,6 +528,21 @@ impl Builder<'_> {
             }
         }
 
+        // Content the engine injected (e.g. `.env` in a sandbox) never
+        // enters history under another name, whatever the tier. Unchanged
+        // tracked content predates the injection and is left alone.
+        if let Some(inj) = self.opts.injected {
+            let unchanged = match parent_file {
+                Some(pe) => pe.executable == executable && self.store.matches_encoding(&pe.id, &data)?,
+                None => false,
+            };
+            if !unchanged {
+                if let Some(f) = inj.find(&data) {
+                    return self.quarantine(path, vec![f], parent_file);
+                }
+            }
+        }
+
         let mut scanned_clean = false;
         if desired.is_public() {
             if let Some(pe) = parent_file {
@@ -331,16 +554,7 @@ impl Builder<'_> {
             if !class.allow_secrets {
                 let findings = secrets::scan(&data);
                 if !findings.is_empty() {
-                    self.report.quarantined.push((path.clone(), findings));
-                    // Hold the edit back, but do not record a deletion: keep
-                    // the previously tracked version if it is itself safe.
-                    if let Some(pe) = parent_file {
-                        if self.previous_is_safe(pe)? {
-                            self.report.quarantine_kept.push(path.clone());
-                            return Ok(Some(pe.clone()));
-                        }
-                    }
-                    return Ok(None);
+                    return self.quarantine(path, findings, parent_file);
                 }
                 scanned_clean = true;
             }
@@ -388,6 +602,19 @@ impl Builder<'_> {
             visibility: desired,
             fallback,
         }))
+    }
+
+    /// Hold the edit back, but do not record a deletion: keep the previously
+    /// tracked version if it is itself safe.
+    fn quarantine(&mut self, path: &VPath, findings: Vec<Finding>, parent_file: Option<&TreeEntry>) -> Result<Option<TreeEntry>> {
+        self.report.quarantined.push((path.clone(), findings));
+        if let Some(pe) = parent_file {
+            if self.previous_is_safe(pe)? {
+                self.report.quarantine_kept.push(path.clone());
+                return Ok(Some(pe.clone()));
+            }
+        }
+        Ok(None)
     }
 
     /// Record content facts for a file that was just read.

@@ -9,13 +9,14 @@
 use std::sync::Arc;
 
 use crate::{
-    builder::{build_tree, build_tree_cached, BuildOptions, BuildReport},
+    builder::{build_tree_cached, BuildOptions, BuildReport, InjectedSecrets},
     checkout::{checkout_cached, CheckoutReport},
     error::{Result, VeilError},
     id::{ChangeId, ObjectId},
+    merge::merge_trees,
     now_millis,
     object::Snapshot,
-    oplog::WorkspaceState,
+    oplog::{View, WorkspaceState},
     policy::Policy,
     repo::Repo,
     statcache::StatCache,
@@ -65,6 +66,12 @@ impl EphemeralWorkspace {
     }
 }
 
+/// Description of the operation that records workspace `ws`'s working copy
+/// (the automatic snapshot every CLI command takes first).
+pub fn snapshot_op_description(ws: &str) -> String {
+    format!("snapshot working copy of '{ws}'")
+}
+
 pub fn validate_workspace_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 64
@@ -94,7 +101,20 @@ impl Repo {
         fs: &dyn StorageBackend,
         cache: Option<&mut StatCache>,
     ) -> Result<WcSnapshot> {
-        let mut tx = self.transaction(format!("snapshot working copy of '{ws}'"))?;
+        self.snapshot_workspace_injected(ws, fs, cache, None)
+    }
+
+    /// [`Repo::snapshot_workspace_cached`] for a backend that was handed
+    /// `injected` secrets (a `ws exec --with-isolated` sandbox): content
+    /// containing them is quarantined instead of recorded.
+    pub fn snapshot_workspace_injected(
+        &mut self,
+        ws: &str,
+        fs: &dyn StorageBackend,
+        cache: Option<&mut StatCache>,
+        injected: Option<&InjectedSecrets>,
+    ) -> Result<WcSnapshot> {
+        let mut tx = self.transaction(snapshot_op_description(ws))?;
         let wc_id = tx.view.workspace(ws)?.wc;
         let wc = tx.repo().snapshot(&wc_id)?;
         let policy = Policy::load(fs)?;
@@ -106,6 +126,7 @@ impl Repo {
                 policy: &policy,
                 parent_tree: Some(wc.tree),
                 cloak: wc.cloak.as_deref(),
+                injected,
             },
             cache,
         )?;
@@ -151,7 +172,7 @@ impl Repo {
         cache: Option<&mut StatCache>,
     ) -> Result<(ObjectId, BuildReport)> {
         let policy = Policy::load(fs)?;
-        build_tree_cached(&self.store, fs, &BuildOptions { policy: &policy, parent_tree, cloak }, cache)
+        build_tree_cached(&self.store, fs, &BuildOptions { policy: &policy, parent_tree, cloak, injected: None }, cache)
     }
 
     /// Materialise the difference between two trees onto `fs`.
@@ -193,18 +214,32 @@ impl Repo {
 
     /// Snapshot an arbitrary backend as a new child of `base`.
     pub fn commit_fs_as_child(&mut self, base: ObjectId, fs: &dyn StorageBackend, description: &str) -> Result<(ObjectId, BuildReport)> {
+        self.commit_fs_as_child_injected(base, fs, description, None)
+    }
+
+    /// [`Repo::commit_fs_as_child`] for a backend that was handed `injected`
+    /// secrets (see [`Repo::snapshot_workspace_injected`]).
+    pub fn commit_fs_as_child_injected(
+        &mut self,
+        base: ObjectId,
+        fs: &dyn StorageBackend,
+        description: &str,
+        injected: Option<&InjectedSecrets>,
+    ) -> Result<(ObjectId, BuildReport)> {
         let mut tx = self.transaction("record ephemeral workspace")?;
         let parent = tx.repo().snapshot(&base)?;
         let policy = Policy::load(fs)?;
         let store = tx.repo().store.clone();
-        let (tree, report) = build_tree(
+        let (tree, report) = build_tree_cached(
             &store,
             fs,
             &BuildOptions {
                 policy: &policy,
                 parent_tree: Some(parent.tree),
                 cloak: parent.cloak.as_deref(),
+                injected,
             },
+            None,
         )?;
         let snap = Snapshot {
             parents: vec![base],
@@ -253,6 +288,88 @@ impl Repo {
         tx.maybe_abandon_empty(st.wc)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Undo the most recent *command* without discarding working-copy edits.
+    ///
+    /// Every CLI command first snapshots the working copy, so the newest
+    /// operations are usually automatic snapshots of `ws`, i.e. the user's
+    /// uncommitted edits. Those are not commands: they are skipped, the
+    /// operation before them is undone, and the edits they recorded are
+    /// re-applied on top of the restored working copy (a 3-way merge, so
+    /// what the undone command changed is reverted and the edits stay).
+    /// Returns the new operation and the description of the undone one.
+    pub fn undo_keeping_edits(&mut self, ws: &str) -> Result<(ObjectId, String)> {
+        self.reload()?;
+        let command = self.last_command_op(ws)?;
+        let op = self.ops.get(&command)?;
+        let parent = *op
+            .parents
+            .first()
+            .ok_or_else(|| VeilError::repo("nothing to undo"))?;
+        let view = self.ops.get(&parent)?.view;
+        let id = self.restore_view_keeping_edits(ws, view, &op.view, format!("undo: {}", op.description))?;
+        Ok((id, op.description))
+    }
+
+    /// [`Repo::restore_operation`] that keeps the uncommitted edits of `ws`
+    /// (see [`Repo::undo_keeping_edits`]).
+    pub fn restore_operation_keeping_edits(&mut self, ws: &str, op: ObjectId) -> Result<ObjectId> {
+        self.reload()?;
+        let command = self.last_command_op(ws)?;
+        let before_edits = self.ops.get(&command)?.view;
+        let view = self.ops.get(&op)?.view;
+        self.restore_view_keeping_edits(ws, view, &before_edits, format!("restore to operation {}", op.short()))
+    }
+
+    /// The newest operation that is not an automatic snapshot of `ws`.
+    fn last_command_op(&self, ws: &str) -> Result<ObjectId> {
+        let auto = snapshot_op_description(ws);
+        let mut cur = self.op_id;
+        loop {
+            let op = self.ops.get(&cur)?;
+            match op.parents.first() {
+                Some(p) if op.description == auto => cur = *p,
+                _ => return Ok(cur),
+            }
+        }
+    }
+
+    /// Install `view`, then carry the edits of `ws` recorded since
+    /// `before_edits` (its working copy there vs. now) over to the working
+    /// copy `view` restores.
+    fn restore_view_keeping_edits(&mut self, ws: &str, view: View, before_edits: &View, description: String) -> Result<ObjectId> {
+        let wc_of = |v: &View| v.workspaces.get(ws).map(|w| w.wc);
+        let edits = match (wc_of(before_edits), wc_of(&self.view), wc_of(&view)) {
+            (Some(base), Some(now), Some(restored)) if base != now => Some((base, now, restored)),
+            _ => None,
+        };
+        let mut tx = self.transaction(description)?;
+        tx.view = view;
+        tx.record_always();
+        if let Some((base, now, restored)) = edits {
+            let base_tree = tx.repo().snapshot(&base)?.tree;
+            let now_tree = tx.repo().snapshot(&now)?.tree;
+            let target = tx.repo().snapshot(&restored)?;
+            if base_tree != now_tree {
+                let store = tx.repo().store.clone();
+                let merged = merge_trees(&store, Some(base_tree), target.tree, now_tree)?;
+                if merged.tree != target.tree {
+                    let mut new = (*target).clone();
+                    new.tree = merged.tree;
+                    new.predecessors = vec![restored];
+                    new.timestamp = now_millis();
+                    for c in merged.conflicts {
+                        let c = c.to_string();
+                        if !new.conflicts.contains(&c) {
+                            new.conflicts.push(c);
+                        }
+                    }
+                    tx.rewrite(restored, new)?;
+                }
+            }
+        }
+        Ok(tx.commit()?.expect("recorded"))
     }
 
     /// Overlay over a workspace's current working copy (for editing a

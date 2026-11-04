@@ -522,28 +522,6 @@ fn ancestors(p: &str) -> Vec<String> {
 }
 
 impl Model {
-    /// Would `op` fail only because a *file* is in the way of a directory?
-    /// Overlays deliberately white such files out (BUG-034), so overlay runs
-    /// skip these operations and check everything else.
-    /// Does `op` address a path *below* an existing file? DiskBackend reports
-    /// ENOTDIR there instead of "missing" (BUG-035); disk runs skip these.
-    fn under_a_file(&self, op: &FsOp) -> bool {
-        let i = match op {
-            FsOp::RemoveFile(i) | FsOp::RemoveDirAll(i) | FsOp::Probe(i) | FsOp::SetExec(i, _) => *i,
-            _ => return false,
-        };
-        ancestors(FPATHS[i]).iter().any(|a| self.files.contains_key(a))
-    }
-
-    fn file_in_the_way(&self, op: &FsOp) -> bool {
-        let p = match op {
-            FsOp::Write(i, _) | FsOp::CreateDirAll(i) => FPATHS[*i],
-            _ => return false,
-        };
-        ancestors(p).iter().any(|a| self.files.contains_key(a))
-            || (matches!(op, FsOp::CreateDirAll(_)) && self.files.contains_key(p))
-    }
-
     /// `None` = behaviour unspecified by the trait docs (skipped everywhere).
     fn apply(&mut self, op: &FsOp) -> Option<bool> {
         match op {
@@ -656,15 +634,8 @@ fn seed(fs: &dyn StorageBackend, model: &mut Model, init: &[(usize, u8, bool)]) 
 }
 
 fn check_equivalence(name: &str, fs: &dyn StorageBackend, base: Model, ops: &[FsOp]) -> Result<(), String> {
-    let lenient = name.starts_with("overlay/") && name != "overlay/empty";
     let mut model = base;
     for (n, op) in ops.iter().enumerate() {
-        if lenient && model.file_in_the_way(op) {
-            continue;
-        }
-        if name == "disk" && model.under_a_file(op) {
-            continue;
-        }
         let mut probe = model.clone();
         let Some(expect) = probe.apply(op) else { continue };
         let got = apply_fs(fs, op);
@@ -743,7 +714,6 @@ proptest! {
 // Deterministic reproductions of divergences found by the model tests.
 
 #[test]
-#[ignore = "BUG-034: OverlayBackend::write silently replaces a lower-layer file with a directory where Memory/Disk return an error"]
 fn overlay_does_not_replace_a_lower_file_with_a_directory() {
     let lower = Arc::new(MemoryBackend::from_files([("a", &b"file"[..])]).unwrap());
     let o = OverlayBackend::new(lower);
@@ -753,7 +723,6 @@ fn overlay_does_not_replace_a_lower_file_with_a_directory() {
 }
 
 #[test]
-#[ignore = "BUG-035: DiskBackend treats ENOTDIR as an error: metadata/exists/remove_* fail for paths below a file"]
 fn disk_paths_below_a_file_are_simply_missing() {
     let tmp = tempfile::tempdir().unwrap();
     let d = DiskBackend::new(tmp.path());

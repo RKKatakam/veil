@@ -43,14 +43,21 @@ must not be trusted (which disables stat caching):
 | `OverlayBackend`, `TreeView` | – (mixed or immutable sources) | `None` (they use `known_id`) |
 
 * **DiskBackend** does atomic, durable writes (temp file, fsync, rename,
-  fsync of the directory; see §9) and ignores symlinks.
+  fsync of the directory; see §9) and ignores symlinks: `metadata` reports
+  nothing at one and `read` refuses one. A path below a file is simply
+  missing (ENOTDIR is "not found"), as on every backend. `list_dir_full`
+  additionally reports what `list_dir` leaves out: *special* entries
+  (symlinks, sockets, devices) and names that are not valid UTF-8, which a
+  `VPath` cannot represent. The builder warns about the latter and checkout
+  never writes through or over the former (§4).
 * **MemoryBackend** is a flat `BTreeMap<VPath, Node>`. Because the
   descendants of `a/` are contiguous in string order, directory listings are
   range scans. File buffers are `Arc`-shared. Every file write takes a fresh
   value from a monotonic generation counter, reported as `mtime`.
 * **OverlayBackend** is copy-on-write. An in-memory upper layer and a
   whiteout set sit over any read-only lower layer. Ancestor whiteouts hide
-  whole subtrees.
+  whole subtrees. A file in the way of a directory is an error, exactly as
+  on the other backends; it is never whited out implicitly.
 * **TreeView** (in `tree.rs`) is a lazy, read-only backend over a snapshot
   tree. It only loads and decrypts the nodes that are actually read.
 
@@ -299,9 +306,32 @@ CAS, and it applies these rules in order:
    remote) are **carried over** instead of being treated as deletions. A
    partial view can never accidentally delete hidden content.
 
+The working copy itself is untrusted ground. Nothing in it can fail a
+snapshot (and with it every command), and nothing is dropped silently:
+
+* Leftovers of an interrupted `DiskBackend` write (`.name.vltmpXXXXXXXX`)
+  are crash debris and are skipped.
+* An unreadable file or directory (permission denied) is reported. A tracked
+  one keeps its previous entry, an untracked one stays out, and the command
+  goes on, so `vl ignore` still works.
+* Names that are not valid UTF-8 cannot be recorded and are reported on
+  every snapshot.
+* A tracked path that is now a symlink (or socket, device) is never
+  followed. Its tracked entry is kept and reported. Checkout and
+  `vl restore` never write, remove or prune at or below such an entry
+  (`CheckoutReport::blocked`), so an untracked `vendor -> /shared/vendor`
+  link never receives pulled files.
+
 Local-only files (isolated and quarantined) are backed up into the vault, so
 `vl ws exec --with-isolated` can inject `.env` into a sandbox without it ever
-touching history.
+touching history. The sandbox is then snapshotted with those contents as
+`InjectedSecrets`. Any new or changed file, of any tier, that contains one of
+the injected values is quarantined (`injected-isolated-secret`), so a command
+cannot record a copy under another name. The values are: each `KEY=value`
+value that looks like a secret (8+ characters, and either 20+ characters or a
+mix of character classes, so `localhost` or `3000` never match), plus the
+whole content and every whitespace-free line of 24+ characters (key
+material).
 
 ## 5. The snapshot graph
 
@@ -328,8 +358,12 @@ struct Snapshot {
 * **Views and the operation log.** A `View` holds the visible heads,
   workspaces (`name → working copy`), tags and remote tags. Every transaction
   writes one `Operation { parents, user, time, description, view }`. Undo and
-  `op restore` simply reinstate an older view, and then the CLI checks out
-  the difference.
+  `op restore` reinstate an older view, and then the CLI checks out the
+  difference. Uncommitted edits survive both: the automatic snapshots of the
+  attached workspace at the top of the op log are not commands, so undo
+  skips them and undoes the operation before. The edits they recorded are
+  re-applied on the restored working copy with a 3-way merge
+  (`Repo::undo_keeping_edits`, `Repo::restore_operation_keeping_edits`).
 * **Transactions auto-rebase.** Rewrites and abandons go into a
   `rewritten` map. On commit, every visible descendant is rebased in
   topological order with a 3-way tree merge
@@ -357,6 +391,16 @@ A workspace is only a named pointer in the view. It owns no directory.
   through overlays (`vl ws write`), materialised into a throwaway directory
   for one command (`vl ws exec`), or attached to the project directory
   (`vl ws switch`). Two tasks can never fight over a directory.
+* **The `ws exec` sandbox** holds plaintext (cloaked files and, with
+  `--with-isolated`, vault secrets), so it is private and never outlives
+  `vl`. It is created `0700` under `$TMPDIR` and everything in it is
+  restricted to the user before the command runs. A reaper process (the `vl`
+  binary re-executed, in its own process group) waits on a pipe that only
+  `vl` holds. When `vl` exits for any reason, `kill -9` included, the pipe
+  closes and the reaper removes the directory. As a last resort, each
+  `ws exec` sweeps the same user's sandboxes whose owning process (the pid
+  is in the name) no longer exists (Linux). The command's stdout is its own:
+  `vl` reports on stderr.
 * **Ephemeral workspaces** (`Repo::ephemeral_workspace`) are an
   `OverlayBackend` over a `TreeView`. Creating one is O(1) and committing one
   is O(changes). They never touch disk and are dropped afterwards. This is

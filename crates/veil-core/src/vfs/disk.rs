@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::{DirEntry, Metadata, NodeKind, StatClock, StorageBackend};
+use super::{DirEntry, DirListing, Metadata, NodeKind, StatClock, StorageBackend};
 use crate::{
     error::{Result, VeilError},
     vpath::VPath,
@@ -15,7 +15,9 @@ use crate::{
 /// or `create_new` returns, the data survives a crash, so the order of
 /// writes is the order in which they become durable (the engine relies on
 /// this: objects, then the operation, then the operation head). Symlinks are
-/// not followed and are invisible to the engine in this MVP.
+/// not followed and are invisible to the engine in this MVP: `metadata`
+/// reports nothing at a symlink, `read` refuses one, and `list_dir_full`
+/// reports them as `special` so callers never write through or over them.
 #[derive(Debug, Clone)]
 pub struct DiskBackend {
     root: PathBuf,
@@ -29,6 +31,49 @@ fn io_err(path: &Path, e: io::Error) -> VeilError {
             path: path.display().to_string(),
             source: e,
         }
+    }
+}
+
+/// "Nothing there": the path is missing, or an ancestor is a file (ENOTDIR).
+/// Read, metadata and removal paths treat both alike, as every other
+/// backend does.
+fn is_missing(e: &io::Error) -> bool {
+    matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
+}
+
+/// [`io_err`] for read paths: ENOTDIR is "not found" too.
+fn read_err(path: &Path, e: io::Error) -> VeilError {
+    if is_missing(&e) {
+        VeilError::NotFound(path.display().to_string())
+    } else {
+        io_err(path, e)
+    }
+}
+
+/// Display form of a file name that is not valid UTF-8: valid runs as-is
+/// (control characters escaped), every invalid byte as `\xNN`.
+fn escape_name(name: &std::ffi::OsStr) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let mut out = String::new();
+        for chunk in name.as_bytes().utf8_chunks() {
+            // Control characters too: the result is printed to terminals.
+            for c in chunk.valid().chars() {
+                match c.is_control() {
+                    true => out.extend(c.escape_default()),
+                    false => out.push(c),
+                }
+            }
+            for b in chunk.invalid() {
+                out.push_str(&format!("\\x{b:02x}"));
+            }
+        }
+        out
+    }
+    #[cfg(not(unix))]
+    {
+        name.to_string_lossy().into_owned()
     }
 }
 
@@ -155,13 +200,18 @@ impl StorageBackend for DiskBackend {
 
     fn read(&self, path: &VPath) -> Result<Vec<u8>> {
         let full = self.full_path(path);
-        fs::read(&full).map_err(|e| io_err(&full, e))
+        // Symlinks are invisible: `metadata` reports nothing there, so
+        // reading must not follow one either.
+        if fs::symlink_metadata(&full).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(VeilError::NotFound(full.display().to_string()));
+        }
+        fs::read(&full).map_err(|e| read_err(&full, e))
     }
 
     fn read_range(&self, path: &VPath, offset: u64, len: usize) -> Result<Vec<u8>> {
         use std::io::{Read, Seek, SeekFrom};
         let full = self.full_path(path);
-        let mut f = fs::File::open(&full).map_err(|e| io_err(&full, e))?;
+        let mut f = fs::File::open(&full).map_err(|e| read_err(&full, e))?;
         f.seek(SeekFrom::Start(offset)).map_err(|e| io_err(&full, e))?;
         let mut buf = vec![0; len];
         f.read_exact(&mut buf).map_err(|e| io_err(&full, e))?;
@@ -226,7 +276,7 @@ impl StorageBackend for DiskBackend {
     fn remove_file(&self, path: &VPath) -> Result<()> {
         let full = self.full_path(path);
         match fs::remove_file(&full) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(io_err(&full, e)),
+            Err(e) if !is_missing(&e) => Err(io_err(&full, e)),
             _ => Ok(()),
         }
     }
@@ -237,7 +287,7 @@ impl StorageBackend for DiskBackend {
         }
         let full = self.full_path(path);
         match fs::remove_dir_all(&full) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(io_err(&full, e)),
+            Err(e) if !is_missing(&e) => Err(io_err(&full, e)),
             _ => Ok(()),
         }
     }
@@ -248,12 +298,21 @@ impl StorageBackend for DiskBackend {
     }
 
     fn list_dir(&self, path: &VPath) -> Result<Vec<DirEntry>> {
+        Ok(self.list_dir_full(path)?.entries)
+    }
+
+    fn list_dir_full(&self, path: &VPath) -> Result<DirListing> {
         let full = self.full_path(path);
-        let mut out = Vec::new();
-        for entry in fs::read_dir(&full).map_err(|e| io_err(&full, e))? {
+        let mut out = DirListing::default();
+        for entry in fs::read_dir(&full).map_err(|e| read_err(&full, e))? {
             let entry = entry.map_err(|e| io_err(&full, e))?;
-            let Ok(name) = entry.file_name().into_string() else {
-                continue; // non-UTF-8 names are not representable in VPath
+            let name = match entry.file_name().into_string() {
+                Ok(name) => name,
+                // Not representable as a VPath: reported, never recorded.
+                Err(raw) => {
+                    out.unrepresentable.push(escape_name(&raw));
+                    continue;
+                }
             };
             let ft = entry.file_type().map_err(|e| io_err(&full, e))?;
             let kind = if ft.is_dir() {
@@ -261,11 +320,14 @@ impl StorageBackend for DiskBackend {
             } else if ft.is_file() {
                 NodeKind::File
             } else {
-                continue; // symlinks, sockets, devices
+                out.special.push(name); // symlinks, sockets, devices
+                continue;
             };
-            out.push(DirEntry { name, kind });
+            out.entries.push(DirEntry { name, kind });
         }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out.entries.sort_by(|a, b| a.name.cmp(&b.name));
+        out.special.sort();
+        out.unrepresentable.sort();
         Ok(out)
     }
 
@@ -285,7 +347,7 @@ impl StorageBackend for DiskBackend {
                 }))
             }
             Ok(_) => Ok(None),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) if is_missing(&e) => Ok(None),
             Err(e) => Err(io_err(&full, e)),
         }
     }
