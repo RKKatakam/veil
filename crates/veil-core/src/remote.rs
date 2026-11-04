@@ -141,7 +141,7 @@ impl Source for StoreSource<'_> {
 enum Sink<'a> {
     /// Loose objects through `put_raw` (which re-verifies existing copies).
     Store(&'a ObjectStore),
-    Pack(PackSink<'a>),
+    Pack(Box<PackSink<'a>>),
 }
 
 impl Sink<'_> {
@@ -1080,7 +1080,7 @@ fn push_incremental(
     let pack_dir = dst.pack_dir();
     let mut xfer = Transfer {
         src: &src,
-        sink: Sink::Pack(PackSink::new(&**dst.backend(), pack_dir, None, 0)),
+        sink: Sink::Pack(Box::new(PackSink::new(&**dst.backend(), pack_dir, None, 0))),
         src_keys: local.keys(),
         public,
         known: Box::new(|id| known.contains(id)),
@@ -1112,8 +1112,9 @@ fn push_incremental(
     let Transfer { sink, mut report, .. } = xfer;
     sink.finish(&mut report)?;
     report.warnings.append(&mut warnings);
-    // The new packs are visible to the remote store from now on.
-    dst.reload_packs()?;
+    // Nothing reads the remote store after this (the tag checks run on the
+    // local graph), so its pack list is not reloaded: that would download
+    // every remote index.
     Ok(report)
 }
 
@@ -1295,7 +1296,7 @@ fn pull_incremental(
     }
     let mut xfer = Transfer {
         src: &src,
-        sink: Sink::Pack(PackSink::new(&**local.backend(), local.pack_dir(), Some(&**local), 256)),
+        sink: Sink::Pack(Box::new(PackSink::new(&**local.backend(), local.pack_dir(), Some(&**local), 256))),
         src_keys: remote.keys(),
         public: false,
         known: Box::new(|_| false),
