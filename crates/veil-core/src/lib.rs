@@ -58,6 +58,7 @@ pub mod cache;
 pub mod checkout;
 pub mod clock;
 pub mod commands;
+pub mod confinement;
 pub mod conflict;
 pub mod crypto;
 pub mod duplicate;

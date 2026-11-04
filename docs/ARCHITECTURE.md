@@ -2119,6 +2119,26 @@ remains is mostly the one `lstat` per file and the per-directory
    a fallback (or could not materialise) and checks them out again once it
    learns of the release, before snapshotting.
 
+**Nothing copies the fix out (BUG-681).** `confinement.rs` judges every
+route that copies content from one revision into another. A snapshot is
+*confined* to an unreleased embargo when it is the embargo's withheld
+history, builds on it (what `push_closure` refuses: the extra parents of
+the embargoed merge do not count), or has a tree under its wrapper. Content
+of a confined snapshot goes only into a change confined to the same
+embargo: `vl restore --from` checks the source against `@`, `squash_into`
+the source against the destination, `duplicate` the source against the new
+parents (which must be on the fix line, not the embargoed one), and
+`format-patch` refuses confined sources outright (its `--include-embargoed`
+escape aside). `Transaction::commit` checks every rewrite that changed a
+snapshot's parents: a confined change must still be confined to its
+embargo in the view the transaction ends with, so `vl rebase` of work on
+the fix onto a public line, or `vl abandon` of the fix under such work, is
+refused (that rebase carried the fix's versions out as conflict entries),
+while rebasing or splitting the fix itself is fine: the embargoed merge is
+rebased with it and the result is still withheld. The refusals name the
+change and the embargo only. `vl resolve` picks among versions already in
+the change, so it needs no check of its own.
+
 **Embargoes never overlap (1.0).** At most one unreleased embargo per line:
 
 * `vl merge --embargo` is refused if the line it merges into, or any line it
@@ -3645,10 +3665,14 @@ tags instead. `vl` started inside a hook runs no hooks (no recursion).
 
 **Input never carries sealed content.** No hook input carries file content.
 `pre-push` lines come from the push's own plan (`push_plan::plan_push`) or,
-for Git, from the export the push then sends: only tags created, updated or
-rejected; never a cloaked tag on a public remote, never a snapshot in
-`withheld_snapshots`; for Git, the snapshot is `-` when the exported commit
-is a projection. A trusted hook runs as the user in the project directory
+for Git, from the export the push then sends (`hooks::git_push_lines`
+mirrors `git::push_with`): only tags created, updated or rejected; never a
+cloaked tag on a public remote, never a snapshot in `withheld_snapshots`;
+for Git, the snapshot is `-` when the exported commit is a projection, and
+the release tags the push sends follow in Git's own format
+(`refs/tags/<name> <object> refs/tags/<name> <remote-object-or-zeros>`,
+`(delete) …` for `--delete-tag`; only exported tags, so never a cloaked or
+embargo-held one, BUG-641). A trusted hook runs as the user in the project directory
 and can read what the user can: that is the documented trust boundary.
 
 **Where hooks do not run.** `ws exec` sandboxes and FUSE mounts record

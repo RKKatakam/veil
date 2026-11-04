@@ -116,11 +116,14 @@ content into a wider audience, and never publish anything.
   same), with the last public version as the fallback readers without the
   key see.
 - **A conflict is copied as recorded**: each version keeps its own sealing.
-- **A change an unreleased embargo withholds** (the fix and the changes
-  that made it) is refused, unless every new parent is inside the same
+- **A change an unreleased embargo withholds** (the fix, the changes
+  that made it, work built on it, and the changes on the embargoed line)
+  is refused, unless every new parent is on the fix line of the same
   embargo: a copy elsewhere would publish the fix's file names before the
   release. Merge it with `vl merge --embargo` instead. The embargoed merge
-  itself cannot be copied before its release.
+  itself cannot be copied before its release. See [Embargoes](embargoes.md#working-on-an-embargoed-line)
+  for the other commands that copy content (`vl restore --from`,
+  `vl squash`, `vl rebase`).
 - **Renames are paired only within one audience.** A public file and a
   sealed one are never a rename, so an edit never moves from one into the
   other. Pairing reads only public content (sealed files pair only when

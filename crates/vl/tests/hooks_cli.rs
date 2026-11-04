@@ -387,6 +387,69 @@ fn git_push_pre_push_input_names_exported_commits_only_and_redacts_the_url() {
     assert!(a.contains("***") && !a.contains("s3cr3t-token"), "{a}");
 }
 
+/// BUG-641: `vl git push` tells `pre-push` about the Git tags it pushes, in
+/// Git's own format (`refs/tags/<name> <local> refs/tags/<name> <remote>`),
+/// including a tag-only push and a tag deletion, and never about a cloaked
+/// release tag or one an unreleased embargo holds back.
+#[test]
+fn git_push_pre_push_input_lists_git_tags_in_gits_format() {
+    if Command::new("git").arg("--version").output().is_err() {
+        return;
+    }
+    let env = Env::new();
+    std::fs::create_dir_all(env.root.join("markers")).unwrap();
+    let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
+    let bare = env.dir("bare.git");
+    assert!(Command::new("git").args(["init", "-q", "--bare"]).arg(&bare).status().unwrap().success());
+    env.ok(U, &proj, &["git", "remote", "add", "gh", bare.to_str().unwrap()]);
+    let git_ref = |r: &str| {
+        let o = Command::new("git").args(["--git-dir", bare.to_str().unwrap(), "rev-parse", r]).output().unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    let zeros = "0".repeat(40);
+    env.ok(U, &proj, &["tag", "set", "v1.0", "-r", "@-", "-a", "-m", "Release 1.0"]);
+    env.ok(U, &proj, &["tag", "set", "v-cloaked-rel", "-r", "@-", "-a", "-m", "team notes", "--cloak"]);
+    let (_, input) = capture_push(&env, &proj);
+    env.ok(U, &proj, &["git", "push", "gh"]);
+    let stdin = marked(&input);
+    let line = format!("refs/tags/v1.0 {} refs/tags/v1.0 {zeros}", git_ref("refs/tags/v1.0"));
+    assert!(stdin.lines().any(|l| l == line), "{line} missing from:\n{stdin}");
+    assert!(stdin.lines().any(|l| l.starts_with("main ")), "{stdin}");
+    assert!(!stdin.contains("v-cloaked-rel"), "a cloaked release tag reached the hook:\n{stdin}");
+
+    // A tag-only push: the hook sees the tag, and no branch.
+    env.ok(U, &proj, &["tag", "set", "v1.1", "-r", "@-", "-a", "-m", "Release 1.1"]);
+    env.ok(U, &proj, &["git", "push", "gh", "--tag", "v1.1"]);
+    let stdin = marked(&input);
+    assert_eq!(stdin, format!("refs/tags/v1.1 {} refs/tags/v1.1 {zeros}\n", git_ref("refs/tags/v1.1")), "{stdin}");
+
+    // Pushed again, a tag the remote already holds names what it holds.
+    env.ok(U, &proj, &["git", "push", "gh", "--tag", "v1.1"]);
+    let held = git_ref("refs/tags/v1.1");
+    assert_eq!(marked(&input), format!("refs/tags/v1.1 {held} refs/tags/v1.1 {held}\n"));
+
+    // A release tag an unreleased embargo holds back is never named.
+    env.ok(U, &proj, &["new", "main"]);
+    write(&proj, "fix.txt", "the fix\n");
+    env.ok(U, &proj, &["commit", "--no-advance", "-m", "fix"]);
+    env.ok(U, &proj, &["tag", "set", "fix-line", "-r", "@-", "--cloak", "team"]);
+    env.ok(U, &proj, &["merge", "fix-line", "--into", "main", "--embargo", "-m", "Fix CVE"]);
+    env.ok(U, &proj, &["tag", "set", "v2.0-held", "-r", "main", "-a", "-m", "Release 2.0"]);
+    let out = env.ok(U, &proj, &["git", "push", "gh"]);
+    assert!(out.contains("skipped v2.0-held"), "{out}");
+    let stdin = marked(&input);
+    assert!(!stdin.contains("v2.0-held") && !stdin.contains("fix-line"), "{stdin}");
+    let out = env.vl(U, &proj, &["git", "push", "gh", "--tag", "v2.0-held"]);
+    assert!(!out.status.success() && text(&out).contains("skipped v2.0-held"), "{}", text(&out));
+    assert_eq!(marked(&input), "", "a held-back tag reached the hook");
+
+    // A tag deletion, alone: Git's `(delete)` line, naming what the remote held.
+    let old = git_ref("refs/tags/v1.0");
+    env.ok(U, &proj, &["tag", "delete", "v1.0"]);
+    env.ok(U, &proj, &["git", "push", "gh", "--delete-tag", "v1.0"]);
+    assert_eq!(marked(&input), format!("(delete) {zeros} refs/tags/v1.0 {old}\n"));
+}
+
 #[test]
 fn a_failing_or_tag_moving_pre_push_hook_stops_the_push() {
     let env = Env::new();

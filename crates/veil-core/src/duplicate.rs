@@ -22,10 +22,12 @@
 //! * the description is kept as stored: a sealed one stays sealed for its
 //!   scope and is never re-written as plaintext;
 //! * a source an unreleased embargo withholds (the fix and how it was
-//!   made) is refused unless every new parent is inside that same embargo:
-//!   a copy elsewhere would publish the fix's file names, sizes and
-//!   existence before the release. An embargoed merge itself is refused
-//!   (release it first).
+//!   made, work built on it, and the embargoed line:
+//!   [`crate::confinement`]) is refused unless every new parent is inside
+//!   that same embargo: a copy elsewhere would publish the fix's file
+//!   names, sizes and existence before the release (BUG-681: a change
+//!   built on the fix that edits its files carried them out as conflicts).
+//!   An embargoed merge itself is refused (release it first).
 //!
 //! One transaction per command: `vl undo` removes every duplicate (and, for
 //! cherry-pick, puts `@` and the tags back) exactly.
@@ -223,8 +225,9 @@ fn duplicate_in(tx: &mut Transaction, sources: &[ObjectId], placement: &Placemen
     }
     let root = tx.repo().root_id();
     let order = parents_first(tx, sources)?;
-    // What unreleased embargoes withhold from a public remote, by embargo.
-    let withheld = crate::remote::embargo_withheld(tx.repo(), true)?;
+    // Which unreleased embargo each source and parent belongs to: its
+    // withheld history, what builds on it, and its wrapped line (BUG-681).
+    let mut confined = crate::confinement::Confinement::new(tx.repo())?;
     let store = tx.repo().store.clone();
     let mut copy_of: HashMap<ObjectId, ObjectId> = HashMap::new();
     // Duplicates made inside an embargo (their source was withheld by it).
@@ -264,15 +267,20 @@ fn duplicate_in(tx: &mut Transaction, sources: &[ObjectId], placement: &Placemen
         // Threat review 11: never copy withheld fix history out of its
         // embargo.
         let mut within: Option<String> = None;
-        if let Some(e) = withheld.get(&src) {
-            let all_inside = parents.iter().all(|p| withheld.get(p) == Some(e) || inside.get(p) == Some(e));
+        if let Some(e) = confined.of(tx.repo(), &src)? {
+            // Inside: on the fix line (withheld or built on it), not on
+            // the embargoed line, whose merge already holds the fix.
+            let mut all_inside = true;
+            for p in &parents {
+                all_inside &= inside.get(p) == Some(&e) || confined.of_history(tx.repo(), p)?.as_ref() == Some(&e);
+            }
             if !all_inside {
                 return Err(VeilError::Policy(format!(
-                    "cannot duplicate {}: unreleased embargo {e} withholds it (it is part of the fix), and a copy outside the embargo would publish its file names before the release; duplicate it onto a change inside the embargo, or merge the fix with `vl merge --embargo`",
+                    "cannot duplicate {}: unreleased embargo {e} withholds it (it is part of the fix, built on it, or on the embargoed line), and a copy outside the embargo would publish its file names before the release; duplicate it onto a change inside the embargo, or merge the fix with `vl merge --embargo`",
                     src.short()
                 )));
             }
-            within = Some(e.clone());
+            within = Some(e);
         }
         let out = tx.repo().rebase_tree(&s.parents, &parents, s.tree, cloak.as_deref())?;
         let description = match &o.message {

@@ -272,6 +272,18 @@ Nothing is recorded when this happens. Your options:
   warning naming the embargo. Work on the merge's first parent instead.
 * A tag that would publish the fix by another route (a tag on the fix line
   itself) is skipped by `vl push`.
+* **Nothing copies the fix out of its embargo.** Until the release, the fix,
+  work built on it and the embargoed line stay inside the embargo, and every
+  command that would copy their content into a change outside it refuses,
+  naming the change and the embargo (never a file): `vl restore --from`
+  (with or without paths), `vl squash` (`--into` another line, or into the
+  fix's own public parent), `vl duplicate` and `vl cherry-pick`, `vl rebase`
+  of work built on the fix onto another line, `vl abandon` of the fix while
+  work is built on it, and `vl format-patch` (so `vl am` never gets it).
+  Inside the embargo they all work: restore from the fix into a change on
+  the fix line, squash work on the fix into it, rebase or split the fix
+  itself (the embargoed merge follows). `vl cat -r` reads it and changes
+  nothing.
 * Conflicts on an embargoed line are reported by the command that produced
   them but not recorded on the snapshot (conflicted file names would tell
   outsiders what the fix touches). They are written as markers into the

@@ -188,12 +188,23 @@ remote will reject it):
 <tag> <snapshot> <remote-snapshot-or-0>            # vl push
 <tag> <snapshot-or--> <remote-snapshot-or-0> <git-commit>   # vl git push
 <tag> 0 <remote-snapshot-or-0>                     # vl push --delete
+refs/tags/<name> <git-object> refs/tags/<name> <remote-object-or-zeros>  # vl git push, a release tag
+(delete) <zeros> refs/tags/<name> <remote-object-or-zeros>             # vl git push --delete-tag
 ```
+
+The Git tag lines are in Git's own `pre-push` format, so a check written for
+Git reads them as it is: `<git-object>` is what `refs/tags/<name>` holds (the
+tag object of an annotated tag), the remote side is what the bridge last
+fetched from or pushed to that remote, and `<zeros>` is 40 zeros. A tag-only
+push (`--tag v1.0`, `--delete-tag v1.0`) lists just the tag; a tag the push
+refuses before sending (another target there, without `--force-tags`) is
+not listed.
 
 On a public remote, and on Git, the lines never name a cloaked tag, and
 never a snapshot that an unreleased embargo holds back: exactly what the
-remote receives. For `vl git push`, the snapshot is `-` when the Git commit
-is a projection (an embargo's pre-merge tree).
+remote receives. A release tag waiting for an embargo's release is not
+exported, so it is not listed either. For `vl git push`, the snapshot is
+`-` when the Git commit is a projection (an embargo's pre-merge tree).
 
 ## A hook cannot change what you commit
 
