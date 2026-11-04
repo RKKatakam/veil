@@ -16,7 +16,7 @@ From `integration` @ 4a62259. This round is Scion phase 0 (`docs/design/scion-fo
 
 **Rules for builders:**
 - Every builder brief appends its item's numbered threat review. Each point is a required test: a property, race, crash or hostile-input test. The adversarial passes start from the same lists.
-- Suggested bug range: **BUG-700 to BUG-799**.
+- Suggested bug range: **BUG-800 to BUG-899 (700–769 are the Git-parity adversarial passes)**.
 
 ## 1. One combined format-6 proposal
 
