@@ -18,10 +18,16 @@
 //!
 //! The *member id* of an identity is `veil1<x25519-hex>` (64 hex digits, the
 //! historical public key form). The *full public identity* appends the
-//! Ed25519 verifying key: `veil1<x25519-hex><ed25519-hex>` (128 hex digits).
-//! Only the full form lets a key ring bind a member to a signing key, so it is
-//! what `vl identity show` prints. The format is the same whether the signing
-//! key is independent or derived: a verifier cannot (and need not) tell.
+//! Ed25519 verifying key and a **binding**, the Ed25519 signature (context
+//! `member-binding`) over the X25519 public key:
+//! `veil1<x25519-hex><ed25519-hex><binding-hex>` (256 hex digits). The
+//! binding proves that the holder of the signing key chose this encryption
+//! key, so nobody can register their own encryption key with someone else's
+//! signing key (BUG-069). Only the full form lets a key ring bind a member to
+//! a signing key, so it is what `vl identity show` prints. The format is the
+//! same whether the signing key is independent or derived: a verifier cannot
+//! (and need not) tell. The earlier, unbound form `veil1<x25519><ed25519>`
+//! (128 hex digits) still parses, but a grant refuses it.
 
 use std::fmt;
 
@@ -156,11 +162,15 @@ fn wrap_label(scope: &str) -> String {
 }
 
 /// A parsed public identity: the X25519 key, plus the Ed25519 verifying key
-/// when the full form was given.
+/// when the full form was given, plus the binding (a verified signature by
+/// that key over the X25519 key) when the current full form was given.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PublicIdentity {
     pub x25519: [u8; 32],
     pub ed25519: Option<[u8; 32]>,
+    /// Ed25519 signature (context [`domains::SIG_CONTEXT_MEMBER_BINDING`])
+    /// over `x25519`, already verified by [`parse_public_identity`].
+    pub binding: Option<[u8; 64]>,
 }
 
 impl PublicIdentity {
@@ -171,29 +181,59 @@ impl PublicIdentity {
     pub fn signing_hex(&self) -> Option<String> {
         self.ed25519.map(hex::encode)
     }
+
+    pub fn binding_hex(&self) -> Option<String> {
+        self.binding.map(hex::encode)
+    }
+
+    /// The unbound full form (`veil1<x25519><ed25519>`, written by earlier
+    /// builds): a signing key with no proof that its holder chose this
+    /// encryption key.
+    pub fn is_unbound(&self) -> bool {
+        self.ed25519.is_some() && self.binding.is_none()
+    }
 }
 
-/// Parse `veil1<x25519>` or the full `veil1<x25519><ed25519>`.
+/// Parse `veil1<x25519>`, the full `veil1<x25519><ed25519><binding>`, or the
+/// earlier unbound `veil1<x25519><ed25519>`. A binding that does not verify
+/// is refused.
 pub fn parse_public_identity(s: &str) -> Result<PublicIdentity> {
     let s = s.trim().trim_start_matches("veil1");
     let v = hex::decode(s).map_err(|_| VeilError::Crypto(format!("invalid public key '{s}'")))?;
-    match v.len() {
-        32 => Ok(PublicIdentity {
-            x25519: v.try_into().unwrap(),
-            ed25519: None,
-        }),
-        64 => {
-            let ed: [u8; 32] = v[32..].try_into().unwrap();
-            VerifyingKey::from_bytes(&ed).map_err(|_| VeilError::Crypto("invalid Ed25519 verifying key".into()))?;
-            Ok(PublicIdentity {
-                x25519: v[..32].try_into().unwrap(),
-                ed25519: Some(ed),
-            })
-        }
-        _ => Err(VeilError::Crypto(
-            "public key must be veil1 + 64 hex digits (or 128 for the full identity)".into(),
-        )),
+    if !matches!(v.len(), 32 | 64 | 128) {
+        return Err(VeilError::Crypto(
+            "public key must be veil1 + 64 hex digits (or 256 for the full identity `vl identity show` prints)".into(),
+        ));
     }
+    let x25519: [u8; 32] = v[..32].try_into().unwrap();
+    let mut id = PublicIdentity {
+        x25519,
+        ed25519: None,
+        binding: None,
+    };
+    if v.len() >= 64 {
+        let ed: [u8; 32] = v[32..64].try_into().unwrap();
+        VerifyingKey::from_bytes(&ed).map_err(|_| VeilError::Crypto("invalid Ed25519 verifying key".into()))?;
+        id.ed25519 = Some(ed);
+    }
+    if v.len() == 128 {
+        let b: [u8; 64] = v[64..].try_into().unwrap();
+        if !verify_binding(&x25519, &hex::encode(id.ed25519.unwrap()), &hex::encode(b)) {
+            return Err(VeilError::Crypto(
+                "the public identity's signing key does not vouch for its encryption key (damaged or forged identity)"
+                    .into(),
+            ));
+        }
+        id.binding = Some(b);
+    }
+    Ok(id)
+}
+
+/// Does `binding` (hex) prove that the holder of `signing_key` (hex) chose
+/// the X25519 key `x25519`? (Ed25519, context `member-binding`, strict
+/// verification.)
+pub fn verify_binding(x25519: &[u8; 32], signing_key: &str, binding: &str) -> bool {
+    verify_signature(signing_key, domains::SIG_CONTEXT_MEMBER_BINDING, x25519, binding)
 }
 
 /// Is `pk` a low-order X25519 point (the DH result with it is all zeros
@@ -381,9 +421,15 @@ impl Identity {
         hex::encode(self.verifying_key())
     }
 
-    /// `veil1<x25519><ed25519>` — the full shareable public identity.
+    /// The binding: this identity's signing key signs its X25519 public key
+    /// (hex). Ed25519 is deterministic, so it never changes.
+    pub fn binding_hex(&self) -> String {
+        self.sign(domains::SIG_CONTEXT_MEMBER_BINDING, &self.public_key())
+    }
+
+    /// `veil1<x25519><ed25519><binding>` — the full shareable public identity.
     pub fn public_id(&self) -> String {
-        format!("{}{}", self.public_hex(), self.verifying_hex())
+        format!("{}{}{}", self.public_hex(), self.verifying_hex(), self.binding_hex())
     }
 
     /// Sign `msg` under a domain-separation `context`; returns hex.
@@ -655,11 +701,66 @@ mod tests {
             let full = parse_public_identity(&a.public_id()).unwrap();
             assert_eq!(full.member_id(), a.public_hex());
             assert_eq!(full.ed25519, Some(a.verifying_key()));
+            assert_eq!(full.binding_hex(), Some(a.binding_hex()));
+            assert!(!full.is_unbound());
+            assert_eq!(a.public_id().len(), 5 + 256);
             let short = parse_public_identity(&a.public_hex()).unwrap();
             assert_eq!(short.ed25519, None);
             assert_eq!(parse_public_key(&a.public_id()).unwrap(), a.public_key());
+            // The earlier unbound form still parses, flagged as unbound.
+            let unbound = parse_public_identity(&format!("{}{}", a.public_hex(), a.verifying_hex())).unwrap();
+            assert!(unbound.is_unbound());
+            assert_eq!(unbound.ed25519, Some(a.verifying_key()));
         }
         assert!(parse_public_identity("veil1abcd").is_err());
+    }
+
+    /// BUG-069: the binding ties the two halves together. Pasting someone
+    /// else's signing key (with or without their binding) after your own
+    /// encryption key is refused, for new and legacy identities alike.
+    #[test]
+    fn public_identities_bind_their_two_keys() {
+        let mallory = Identity::generate("mallory");
+        for alice in [Identity::generate("alice"), Identity::from_json(LEGACY).unwrap()] {
+            assert!(verify_binding(&alice.public_key(), &alice.verifying_hex(), &alice.binding_hex()));
+            // Alice's binding is over Alice's X25519 key, not Mallory's.
+            let forged = format!("{}{}{}", mallory.public_hex(), alice.verifying_hex(), alice.binding_hex());
+            assert!(parse_public_identity(&forged).is_err());
+            assert!(!verify_binding(&mallory.public_key(), &alice.verifying_hex(), &alice.binding_hex()));
+            // Mallory cannot sign for Alice's key either.
+            let forged = format!(
+                "{}{}{}",
+                mallory.public_hex(),
+                alice.verifying_hex(),
+                mallory.sign(domains::SIG_CONTEXT_MEMBER_BINDING, &mallory.public_key())
+            );
+            assert!(parse_public_identity(&forged).is_err());
+            // The binding is only valid in its own context.
+            let other_ctx = alice.sign(domains::SIG_CONTEXT_SNAPSHOT, &alice.public_key());
+            assert!(!verify_binding(&alice.public_key(), &alice.verifying_hex(), &other_ctx));
+            // Damaged bindings are refused.
+            let mut damaged = alice.public_id().into_bytes();
+            let last = damaged.len() - 1;
+            damaged[last] = if damaged[last] == b'0' { b'1' } else { b'0' };
+            assert!(parse_public_identity(std::str::from_utf8(&damaged).unwrap()).is_err());
+        }
+    }
+
+    /// Pinned: the binding of the legacy test identity (Ed25519 is
+    /// deterministic). Changing the message or context would invalidate every
+    /// binding already recorded in rings.
+    #[test]
+    fn binding_known_answer() {
+        let a = Identity::from_json(LEGACY).unwrap();
+        // Spelled out: Ed25519 over prefix ‖ "member-binding" ‖ 0 ‖ X25519 key.
+        let mut msg = b"veil 2026 sig v1\0member-binding\0".to_vec();
+        msg.extend_from_slice(&a.public_key());
+        let sk = SigningKey::from_bytes(&blake3::derive_key("veil 2026 ed25519-seed v1", &[1u8; 32]));
+        assert_eq!(a.binding_hex(), hex::encode(sk.sign(&msg).to_bytes()));
+        assert_eq!(
+            a.binding_hex(),
+            "74333796751adc283d5d8fbb7e18962f3be1a2aaa72cf12c8939f94ef586bb6b847dc1e839c79c75928559084aa1555c7b1fa095c5deff9afe30063f146f5a0d"
+        );
     }
 
     /// The HPKE secret key Veil derives from an identity is the X25519 key

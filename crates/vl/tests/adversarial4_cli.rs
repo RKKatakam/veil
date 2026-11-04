@@ -72,7 +72,6 @@ fn public_key(env: &Env, user: &str) -> String {
 /// while the real remote stays at format 2 and keeps refusing AES-SIV
 /// objects and HPKE rings.
 #[test]
-#[ignore = "BUG-072: `vl upgrade --remote` treats SSH remote URLs as local paths (upgrades `<project>/host:path`, reports success)"]
 fn upgrade_remote_does_not_treat_an_ssh_url_as_a_local_path() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("fx");

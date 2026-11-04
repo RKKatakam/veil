@@ -10,7 +10,8 @@
 //! | released embargoed objects      | ✓           | ✓             |
 //! | merged-in history of an unreleased embargoed merge | cloaked under the embargo's scope, not building on withheld history | ✗ |
 //! | cloaked tags                    | ✓           | ✗             |
-//! | key rings / embargo records     | ✓           | ✓ (encrypted, signed) |
+//! | key rings                       | ✓           | ✗ (they name the members) |
+//! | embargo records                 | ✓           | ✓ (encrypted, signed) |
 //! | isolated files, vault, `local`  | never — not in the graph at all |
 //!
 //! Redacted tree entries keep their names and ids, so a later push to a
@@ -920,10 +921,28 @@ pub(crate) fn push_closure(
 /// signatures are checked against ring membership. Runs inside the
 /// destination's transaction: each merge is a read-modify-write under its
 /// lock (the keychain takes it reentrantly).
-fn sync_meta(src: &Keychain, dst: &Keychain, warnings: &mut Vec<String>) -> Result<()> {
-    for ring in src.rings()? {
-        if let RingMerge::Rejected(w) = dst.merge_ring(&ring)? {
-            warnings.push(w);
+///
+/// A public destination gets no rings (they name every member, BUG-077).
+/// Its readers hold no scope key, so they only need embargo records, whose
+/// released keys they check against the record's fingerprint
+/// ([`Keychain::merge_embargo`]). Rings an earlier vl pushed there are left
+/// alone (removing them would lock members out of a team remote that was
+/// added as public by mistake), with a warning.
+fn sync_meta(src: &Keychain, dst: &Keychain, public: bool, warnings: &mut Vec<String>) -> Result<()> {
+    if public {
+        let left = dst.rings()?.len();
+        if left > 0 {
+            warnings.push(format!(
+                "this public remote holds {left} key ring(s), pushed by an earlier vl, that name the members of \
+                 their scopes; vl no longer pushes rings to public remotes. If it really is public, delete \
+                 .veil/meta/keyrings/ there"
+            ));
+        }
+    } else {
+        for ring in src.rings()? {
+            if let RingMerge::Rejected(w) = dst.merge_ring(&ring)? {
+                warnings.push(w);
+            }
         }
     }
     for rec in src.embargoes()? {
@@ -1019,7 +1038,7 @@ pub fn push_with(
             report = push_incremental(local, &tx.view.refs(), &dst, ids, public, report)?;
         }
     }
-    sync_meta(local.keys(), tx.repo().keys(), &mut report.warnings)?;
+    sync_meta(local.keys(), tx.repo().keys(), public, &mut report.warnings)?;
     for (name, tag) in selected {
         if let Some(existing) = tx.view.tags.get(&name) {
             if existing.target == tag.target {
@@ -1219,7 +1238,7 @@ pub fn pull_with(
         let local_refs = tx.view.refs();
         report = pull_incremental(tx.repo().store(), &local_refs, &remote, &remote_backend, &tags, report)?;
     }
-    sync_meta(remote.keys(), tx.repo().keys(), &mut report.warnings)?;
+    sync_meta(remote.keys(), tx.repo().keys(), false, &mut report.warnings)?;
     tx.repo().keys().invalidate();
     for (name, tag) in tags {
         // Tag names and targets come from the remote: a name may carry

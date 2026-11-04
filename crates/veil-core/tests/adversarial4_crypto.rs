@@ -64,7 +64,6 @@ fn append_signed(repo: &Repo, scope: &str, signer: &Identity, op: RingOp) -> Key
 /// every reader, and Alice's timed embargoes never auto-release (only a
 /// "good" creation signature may trigger a release).
 #[test]
-#[ignore = "BUG-069: a grant can bind another member's signing key; that member's signatures turn 'unknown' and their embargoes never auto-release"]
 fn a_grant_cannot_rebind_another_members_signing_key() {
     let alice = Identity::generate("alice");
     let mallory = Identity::generate("mallory");
@@ -98,17 +97,56 @@ fn a_grant_cannot_rebind_another_members_signing_key() {
 
 /// Control for BUG-069: the forged binding cannot be used to sign ring
 /// changes as Alice (Mallory lacks the secret), and Alice stays admin.
+///
+/// Adapted with the fix: the forged grant used to be accepted (and this
+/// control checked what it could not do); it is now refused outright, in
+/// every form, and an admin-signed grant that binds Alice's key to Mallory
+/// anyway (a hostile admin, or a ring written by an earlier vl) fails
+/// replay. The original checks still run on the ring.
 #[test]
 fn a_forged_signing_half_does_not_let_mallory_sign() {
     let alice = Identity::generate("alice");
     let mallory = Identity::generate("mallory");
     let (repo, _fs) = repo_at(3, &alice);
     let forged = format!("{}{}", mallory.public_hex(), alice.verifying_hex());
-    repo.keys().grant_role("team", &forged, "mallory", Role::Admin).unwrap();
+    assert!(repo.keys().grant_role("team", &forged, "mallory", Role::Admin).is_err());
+    let with_alices_binding = format!("{forged}{}", alice.binding_hex());
+    assert!(repo.keys().grant_role("team", &with_alices_binding, "mallory", Role::Admin).is_err());
     let st = ring(&repo, "team").verify().unwrap();
     assert!(st.is_admin(&alice.public_hex(), &alice.verifying_hex()));
     // Mallory signing with her own key is not her registered key.
     assert!(!st.is_admin(&mallory.public_hex(), &mallory.verifying_hex()));
+
+    // Hand-crafted: Alice's key (unbound, as earlier grants were) for Mallory.
+    let mut r = ring(&repo, "team");
+    let st = r.verify().unwrap();
+    let wrapped = match &r.log[0].op {
+        RingOp::Genesis { members, .. } => members[0].wrapped.clone(),
+        _ => unreachable!(),
+    };
+    let mut c = RingChange {
+        seq: r.log.len() as u64,
+        prev: r.log.last().unwrap().hash("team"),
+        timestamp: 1,
+        signer: alice.public_hex(),
+        signing_key: alice.verifying_hex(),
+        op: RingOp::Grant {
+            member: MemberGrant {
+                id: mallory.public_hex(),
+                name: "mallory".into(),
+                signing_key: Some(alice.verifying_hex()),
+                binding: None,
+                role: Role::Admin,
+                generation: st.generation,
+                wrapped,
+            },
+        },
+        signature: String::new(),
+    };
+    c.signature = alice.sign("ring-change", &c.signing_body("team"));
+    r.log.push(c);
+    let err = r.verify().unwrap_err();
+    assert!(err.contains("already belongs to member"), "{err}");
 }
 
 // ---- low-order member keys ----------------------------------------------
@@ -122,7 +160,6 @@ fn a_forged_signing_half_does_not_let_mallory_sign() {
 /// * `vl upgrade` to format 3 fails *after* its commit point, at
 ///   `3:hpke-ring-keys`, and fails again on every resume.
 #[test]
-#[ignore = "BUG-070: a low-order member key in a ring blocks every rotation: revoking anyone else and `vl upgrade`'s ring step fail forever"]
 fn a_low_order_member_does_not_block_revocation_or_upgrade() {
     let alice = Identity::generate("alice");
     let bob = Identity::generate("bob");
@@ -146,6 +183,7 @@ fn a_low_order_member_does_not_block_revocation_or_upgrade() {
                 id: low.clone(),
                 name: "typo".into(),
                 signing_key: None,
+                binding: None,
                 role: Role::Member,
                 generation: st.generation,
                 wrapped: bobs_wrap,
@@ -180,7 +218,6 @@ fn a_low_order_member_does_not_block_revocation_or_upgrade() {
 /// part of a 2 → 3 transition. The scope keeps sealing new content under a
 /// key that was published under the legacy key wrap, and nothing says so.
 #[test]
-#[ignore = "BUG-071: `vl upgrade` in a clone that is already at format 3 never moves the admin's legacy-wrapped rings to HPKE, though the notes tell the admin to do exactly that"]
 fn an_admin_upgrading_an_upgraded_clone_moves_their_rings_to_hpke() {
     let alice = Identity::generate("alice");
     let (mut a2, afs) = repo_at(2, &alice);

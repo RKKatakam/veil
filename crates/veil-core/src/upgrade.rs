@@ -22,6 +22,14 @@
 //!    rotation to its ring, see [`Keychain::migrate_to_hpke`]);
 //! 5. remove the journal.
 //!
+//! `3:hpke-ring-keys` is also run on its own, whenever it is pending, in a
+//! repository that is already at format 3 (BUG-071): a fresh clone of an
+//! upgraded remote, or a clone a non-admin upgraded, still holds rings whose
+//! current key was wrapped with the legacy box, and their admin is told to
+//! run `vl upgrade`. A scope the step cannot rotate (a member no key can be
+//! wrapped to is skipped, BUG-070; anything else) is reported in a note and
+//! never blocks the upgrade after its commit point.
+//!
 //! **Sealed history is not re-sealed** by `2 → 3`: re-sealing would change
 //! object ids, and with them every tree, snapshot id and signature above
 //! them. Objects sealed before the upgrade stay in the legacy construction
@@ -152,7 +160,8 @@ fn hpke_ring_keys(backend: &Arc<dyn StorageBackend>, identity: Option<&Identity>
     let Some(identity) = identity else {
         return Ok(vec![
             "key rings were not re-keyed here (no identity: a remote is upgraded structurally); \
-             they move to HPKE when an admin who has upgraded their clone pushes"
+             they move to HPKE when an admin who has upgraded their clone pushes (in a clone that is already \
+             at format 3, `vl upgrade` still moves the admin's rings)"
                 .into(),
         ]);
     };
@@ -161,12 +170,33 @@ fn hpke_ring_keys(backend: &Arc<dyn StorageBackend>, identity: Option<&Identity>
     let mut notes = Vec::new();
     for ring in keys.rings()? {
         let scope = ring.scope.clone();
-        match keys.migrate_to_hpke(&scope)? {
+        let outcome = match keys.migrate_to_hpke(&scope) {
+            Ok(o) => o,
+            // The disk failing is not the scope's fault: stop, and resume.
+            Err(e @ (VeilError::Io { .. } | VeilError::Locked(_))) => return Err(e),
+            // Past the commit point a scope must never block the upgrade
+            // (BUG-070): report it; `vl upgrade` retries the step.
+            Err(e) => {
+                notes.push(format!(
+                    "scope '{scope}': its key could not be moved to HPKE ({e}); fix that and run `vl upgrade` again"
+                ));
+                continue;
+            }
+        };
+        match outcome {
             HpkeMigration::AlreadyHpke => {}
-            HpkeMigration::Rotated(g) => notes.push(format!(
-                "scope '{scope}': new key generation {g}, wrapped to every member with HPKE; \
-                 earlier generations stay reachable (and stay under the legacy key wrapping already published)"
-            )),
+            HpkeMigration::Rotated(g) => {
+                notes.push(format!(
+                    "scope '{scope}': new key generation {g}, wrapped to every member with HPKE; \
+                     earlier generations stay reachable (and stay under the legacy key wrapping already published)"
+                ));
+                for (id, name) in keys.unreachable_members(&scope) {
+                    notes.push(format!(
+                        "scope '{scope}': member {name} ({id}) has an invalid (low-order) key and received no key; \
+                         revoke it with `vl scope revoke {scope} {id}`"
+                    ));
+                }
+            }
             HpkeMigration::NotAdmin => notes.push(format!(
                 "scope '{scope}': its key is still wrapped with the legacy construction; \
                  an admin should run `vl upgrade` (or `vl scope rotate {scope}`) in an upgraded clone"
@@ -243,7 +273,35 @@ pub fn upgrade(
         )));
     }
     if config.format == report.to && journal.is_none() {
-        report.up_to_date = true;
+        // BUG-071: the ring step is not tied to the format transition. It is
+        // pending whenever a ring's current key still has legacy wraps.
+        let keys = Keychain::new(backend.clone(), identity.clone(), config.repo_id.clone());
+        keys.set_format(config.format);
+        let pending = if config.format >= HPKE_REPO_FORMAT {
+            keys.hpke_migration_pending()?
+        } else {
+            Vec::new()
+        };
+        let step = format!("{HPKE_REPO_FORMAT}:hpke-ring-keys");
+        if !pending.iter().any(|(_, mine)| *mine) {
+            report.up_to_date = true;
+            report.notes = pending
+                .iter()
+                .map(|(scope, _)| {
+                    format!(
+                        "scope '{scope}': its key is still wrapped with the legacy construction; \
+                         an admin of the scope should run `vl upgrade` (or `vl scope rotate {scope}`)"
+                    )
+                })
+                .collect();
+            return Ok(report);
+        }
+        report.steps.push(step);
+        if !opts.dry_run {
+            // Idempotent, and each rotation is atomic: no journal needed.
+            report.notes = hpke_ring_keys(&backend, identity.as_ref(), &config.repo_id)?;
+        }
+        census(&backend, &mut report)?;
         return Ok(report);
     }
 

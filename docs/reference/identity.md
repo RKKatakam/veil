@@ -10,6 +10,7 @@ Subcommands:
 * [`vl identity show`](#vl-identity-show): Show your identity and public key
 * [`vl identity new`](#vl-identity-new): Create a new identity (replaces the existing one with --force; the replaced one is kept so local vaults can be re-keyed)
 * [`vl identity recover-vault`](#vl-identity-recover-vault): Re-key this repository's local vault, sealed by an identity that was replaced, to the current identity
+* [`vl identity recover-admin`](#vl-identity-recover-admin): Hand the scope admin rights of a replaced identity over to the current one, in this repository: the replaced identity signs a grant that makes the current identity an admin. Push to share it
 
 ## `vl identity show`
 
@@ -47,6 +48,21 @@ Options:
 | | |
 |---|---|
 | `--from <FROM>` | Identity file to recover from (default: every identity replaced by `vl identity new --force`) |
+
+## `vl identity recover-admin`
+
+Hand the scope admin rights of a replaced identity over to the current one, in this repository: the replaced identity signs a grant that makes the current identity an admin. Push to share it
+
+```text
+vl identity recover-admin [OPTIONS]
+```
+
+Options:
+
+| | |
+|---|---|
+| `--from <FROM>` | Identity file to recover from (default: every identity replaced by `vl identity new --force`, newest first) |
+| `--revoke-old` | Then revoke the replaced identity from those scopes (rotates their keys). Leave it out while another device still uses it |
 
 ---
 

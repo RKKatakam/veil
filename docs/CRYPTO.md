@@ -156,7 +156,12 @@ repositories at format 1 or 2 (so that older vl can read them), see §5.
   weaker binding.
 * **Known limits.** HPKE refuses low-order recipient keys (all-zero DH;
   BUG-010), and the legacy box now does too (`was_contributory`). Both are
-  tested. Not post-quantum: the `hpke` crate offers X-Wing
+  tested. A ring may still list such a member (granted before that fix, or
+  by a hostile admin; replay accepts grants without opening wraps).
+  Rotations leave that member out, and replay allows exactly that omission,
+  so revocations and `vl upgrade` keep working (BUG-070); `vl scope rotate`,
+  `revoke` and `upgrade` name the member, and `fsck` warns until it is
+  revoked. Not post-quantum: the `hpke` crate offers X-Wing
   (ML-KEM-768 + X25519); moving to it later is a new suite string and ring
   format.
 
@@ -194,18 +199,43 @@ Read forever; written only into format-1/2 repositories.
   show`. They keep working and are rewritten in their own shape. Replacing
   one (`vl identity new --force`) means admins must grant the new public
   identity.
-* **Public identity** `veil1<x25519-hex><ed25519-hex>` is the same for both
-  kinds. Rings bind member id ↔ signing key in the signed `MemberGrant`;
-  the derivation is invisible to verifiers.
+* **Public identity** `veil1<x25519-hex><ed25519-hex><binding-hex>` (256
+  hex digits) is the same for both kinds. The **binding** is the identity's
+  Ed25519 signature, context `member-binding` (C5), over the 32 raw bytes of
+  its X25519 public key: proof that whoever holds the signing key chose this
+  encryption key (BUG-069). Without it, anyone could paste their own X25519
+  key in front of someone else's public signing key and have the ring
+  attribute that person's signatures to them. Legacy identities make it the
+  same way with their derived key (a verifier cannot tell the kinds apart;
+  their two keys are bound by construction, and the binding makes that
+  checkable). Ed25519 is deterministic, so a public identity never changes.
+* **Rings bind member id ↔ signing key** in the signed `MemberGrant`:
+  * `vl scope grant` refuses a full identity whose binding does not verify,
+    and the earlier unbound form `veil1<x25519><ed25519>`; the short member
+    id `veil1<x25519>` still grants read access without a signing key.
+  * From repository format 3 the grant records the binding (`binding`, ring
+    format 3), and replay checks it. Grants recorded earlier, and in
+    format-1/2 repositories (whose readers include vl 0.1.0, which would
+    drop the field and then fail the signature), carry none: the admin's vl
+    checked it, but readers cannot.
+  * Replay refuses a grant or genesis member whose signing key already
+    belongs (now or earlier) to another member of that ring.
+  * Across rings, `known_signers` gives a key to the member whose binding a
+    ring proved; a key that unbound grants in different rings give to
+    different members is attributed to nobody (its signatures show as
+    unknown, never as someone else's).
 * **Known limits.** One identity per device file, unencrypted at rest (mode
   0600). A legacy identity's two keys are not independent: a break of the
-  X25519 secret is also a signing-key compromise.
+  X25519 secret is also a signing-key compromise. A hostile admin of a
+  format-1/2 ring (or of a ring written before bindings) can still record an
+  unbound grant of a key nobody in that ring holds yet; it is only believed
+  where no ring proves a binding for that key.
 
 ### C5. Signatures (all)
 
 `Ed25519(signing_key, SIG_PREFIX ‖ context ‖ 0x00 ‖ payload)`, contexts
-`snapshot`, `ring-change`, `embargo`, `embargo-release` (see the domains
-table). Payloads are fixed encodings (FORMAT.md §2, "signed bodies never
+`snapshot`, `ring-change`, `embargo`, `embargo-release`, `member-binding`
+(see the domains table). Payloads are fixed encodings (FORMAT.md §2, "signed bodies never
 change"). What a valid signature *means* (who may sign what) is decided
 against the ring log (ARCHITECTURE §3).
 
@@ -241,6 +271,12 @@ against the ring log (ARCHITECTURE §3).
 * Goal: before release only scope members (holders of the generation key)
   can read embargoed content; after release everyone can, and nobody can
   publish a different key.
+* Who may sign a record is judged against the scope's ring. A public
+  remote holds no rings (BUG-077), so its clones accept records unverified:
+  they hold no scope key, so a record can never trigger a release there,
+  and a published key is still checked against `key_id` and then by the
+  AEAD of the content it opens. A record a ring later shows to be signed by
+  a member replaces an unverified local one.
 * Known limits: time-based release is enforced by key holders' engines, not
   cryptography (threat model).
 
@@ -295,6 +331,7 @@ are distinct and pins their exact bytes.
 | `SIG_CONTEXT_RING_CHANGE` | `ring-change` | Ed25519 context | C5, C6 |
 | `SIG_CONTEXT_EMBARGO` | `embargo` | Ed25519 context | C5, C7 |
 | `SIG_CONTEXT_EMBARGO_RELEASE` | `embargo-release` | Ed25519 context | C5, C7 |
+| `SIG_CONTEXT_MEMBER_BINDING` | `member-binding` | Ed25519 context | C4, C5 |
 | `WRAP_LABEL_PREFIX` | `wrap:` | AEAD associated data | C3, C3L |
 | `PREV_KEY_LABEL_PREFIX` | `prev-key:` | AEAD associated data | C2 |
 | `EMBARGO_WRAP_LABEL_PREFIX` | `embargo-wrap:` | AEAD associated data | C2, C7 |
@@ -352,9 +389,14 @@ Signature contexts never contain NUL and are followed by `0x00`, so
   whose key is HPKE-wrapped to every current member and carries the
   previous key (C2), so history stays readable. A member who is not an
   admin gets a note asking an admin to run `vl upgrade` or `vl scope
-  rotate`. A remote (`--remote`, no identity) is upgraded structurally; its
-  rings move to HPKE when an upgraded admin pushes. The step is idempotent
-  and journaled (resumes after a crash).
+  rotate`. A remote (`--remote`, no identity; SSH remotes over SFTP) is
+  upgraded structurally; its rings move to HPKE when an upgraded admin
+  pushes. The step is idempotent and journaled (resumes after a crash; the
+  `crash.rs` sweep covers 1→3 and 2→3). It also runs on its own in a
+  repository already at format 3 whenever one of this identity's rings is
+  pending (BUG-071: a fresh clone of an upgraded remote, or a clone a
+  non-admin upgraded). A scope it cannot rotate becomes a note; it never
+  blocks the upgrade after its commit point.
 * **Nothing is re-sealed.** Re-sealing history would change object ids, so
   every tree and snapshot above them, every snapshot signature, change id
   and Git-bridge mapping would change. Unchanged cloaked files also keep
@@ -391,7 +433,8 @@ every file would get new content off them, never old content.
   * Plus pinned known answers for Veil's own compositions: the AES-SIV
     envelope (also in `tests/fixtures/encodings.txt` as `sealed-aes-siv`),
     an HPKE key wrap with fixed randomness, the legacy derived signing key,
-    and the domain strings.
+    the binding of a legacy identity, and the domain strings and signature
+    contexts.
 * **Round trip and tampering** for every construction: AES-SIV, random and
   legacy XChaCha20-Poly1305 (bit flips, truncation, relabelling,
   construction swap, wrong key), HPKE (enc/ct bit flips, truncation,
@@ -420,6 +463,10 @@ every file would get new content off them, never old content.
 4. The X25519 secret of an identity serves both C3 (HPKE) and the legacy
    C3L box, and derives the vault key (C8): the same DH key in two KEMs,
    with distinct KDFs.
+8. The binding (C4) is a plain Ed25519 signature over the X25519 key under
+   its own context. It does not cover a name, a scope or a time: it says
+   "this signing key goes with this encryption key", which is all replay
+   needs. Agree?
 5. Whether `vl upgrade` should also offer to re-key a **legacy identity**
    (derived signing key). Today that needs `vl identity new` and fresh
    grants.

@@ -280,6 +280,8 @@ fn forged_member_addition_is_rejected() {
         m.name = "mallory".into();
         m.role = Role::Admin;
         m.signing_key = Some(mallory.verifying_hex());
+        // A forger signs their own binding (the copied one is Alice's).
+        m.binding = Some(mallory.binding_hex());
         members.push(m);
     }
     hijack.log[0].signer = mallory.public_hex();

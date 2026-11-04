@@ -79,3 +79,44 @@ fn a_vault_without_its_identity_never_bricks_the_repository() {
     env.ok("alice", &proj, &["secret", "set", "K", "v"]);
     assert_eq!(env.stdout("alice", &proj, &["secret", "get", "K"]).trim(), "v");
 }
+
+/// BUG-089: replacing the identity of a scope's only admin warns first, and
+/// `vl identity recover-admin` lets the replaced identity hand the admin
+/// rights over (then, with `--revoke-old`, revokes it).
+#[test]
+fn a_sole_admin_can_hand_over_after_replacing_the_identity() {
+    let env = Env::new();
+    let proj = env.project("alice", "proj", &[("a.txt", "a\n")]);
+    env.ok("alice", &proj, &["scope", "create", "ops"]);
+    let old_member = env.stdout("alice", &proj, &["identity", "show"]);
+    let old_member = old_member
+        .lines()
+        .find(|l| l.starts_with("member id"))
+        .unwrap()
+        .split_whitespace()
+        .last()
+        .unwrap()
+        .to_string();
+
+    let out = env.ok("alice", &proj, &["identity", "new", "--force"]);
+    assert!(out.contains("only admin of scope(s)") && out.contains("ops") && out.contains("recover-admin"), "{out}");
+    env.ok("bob", &env.root, &["identity", "new"]);
+    let bob = env.stdout("bob", &env.root, &["identity", "show"]);
+    let bob = bob.lines().find(|l| l.starts_with("public key")).unwrap().split_whitespace().last().unwrap().to_string();
+    let frozen = env.vl("alice", &proj, &["scope", "grant", "ops", &bob, "--name", "bob"]);
+    assert!(!frozen.status.success() && text(&frozen).contains("only an admin"), "{}", text(&frozen));
+
+    let out = env.ok("alice", &proj, &["identity", "recover-admin"]);
+    assert!(out.contains("Scope ops:") && out.contains("granted you admin rights"), "{out}");
+    assert!(out.contains("--revoke-old"), "{out}");
+    env.ok("alice", &proj, &["scope", "grant", "ops", &bob, "--name", "bob"]);
+    let list = env.ok("alice", &proj, &["scope", "list"]);
+    assert!(list.contains(&old_member), "the replaced identity is still listed:\n{list}");
+
+    let out = env.ok("alice", &proj, &["identity", "recover-admin", "--revoke-old"]);
+    assert!(out.contains("it was then revoked"), "{out}");
+    let list = env.ok("alice", &proj, &["scope", "list"]);
+    assert!(!list.contains(&old_member), "{list}");
+    let out = env.ok("alice", &proj, &["identity", "recover-admin"]);
+    assert!(out.contains("you are already an admin"), "{out}");
+}

@@ -82,6 +82,14 @@ usually because you ran `vl init` and then pulled instead of cloning. The
 rings can't be merged. Delete the directory and `vl clone` the remote. See
 [Use `vl clone`](teams-and-remotes.md#use-vl-clone-not-vl-init--pull).
 
+### `error: … that public identity has a signing key but no proof that it belongs to …`
+
+The key you were given is the shorter form an earlier `vl` printed (member
+id plus signing key, 128 hex digits), or was pieced together. The current
+form adds a signature that ties the two keys together, so nobody can claim
+someone else's signing key. Ask for the `public key` line of `vl identity
+show` from this `vl` (256 hex digits) and grant again.
+
 ### `warning: that is a short public key without a signing key: their signatures will show as unknown.`
 
 You granted with a member id instead of the full public key. Ask for the
@@ -195,12 +203,11 @@ warning under [Cloaking for a team](secrets-and-visibility.md#cloaking-for-a-tea
 
 ### `vl upgrade --remote` on an SSH remote
 
-In 1.0 `vl upgrade --remote NAME` only handles **path** remotes. For an SSH
-remote it fails with `not found: Veil repository (run `vl init`)`, and it
-leaves an empty directory named after the URL (`ssh:/…` or `user@host:…`)
-in your working copy. Delete that directory. Upgrade the remote on the
-server with `vl upgrade -R /path/to/remote`, or from a machine that mounts
-it as a path.
+`vl upgrade --remote NAME` reaches an SSH remote over SFTP, like `vl push`
+and `vl pull`. Releases before this fix treated the URL as a local path:
+they failed with `not found: Veil repository (run `vl init`)` and left an
+empty directory named after the URL (`ssh:/…` or `user@host:…`) in your
+working copy. Delete such a directory if you find one.
 
 ## The working copy and the filesystem
 

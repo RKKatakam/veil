@@ -116,14 +116,14 @@ key is not secret; send it any way you like, but make sure it's really his
 bob$ vl identity show
 Created new identity for 'bob' at /home/bob/.config/veil/identity.json
 name        bob
-public key  veil16a988eb735d62860962e1e092f14b8676952fa35228f9d45c891b6cbc2fedc6083fdcc46d8ad95d11987bfa36ebd3b643ab4cdc4b278eee04057492477d73420
+public key  veil1e75c0889f1c686c2af33c77446eff375283023c36ebdab2cda63c5aaedccdd370990f1e1afad9a5d72d744b2e5ed2682ff8c0df65fd66c7e3b5269927b27450709ca3335b6fa2c165dc7d5835c515e552701a1e7fb30aa23803dd042f5370554c532440362f00f34032895977cd394ff82e27e7fb8c603d0cfc6c2acb8f3c00a
 …
 ```
 
 **2. Alice grants him the scope and pushes** the updated key ring:
 
 ```text
-alice$ vl scope grant team veil16a988eb735d62860962e1e092f14b8676952fa35228f9d45c891b6cbc2fedc6083fdcc46d8ad95d11987bfa36ebd3b643ab4cdc4b278eee04057492477d73420 --name bob
+alice$ vl scope grant team veil1e75c0889f1c686c2af33c77446eff375283023c36ebdab2cda63c5aaedccdd370990f1e1afad9a5d72d744b2e5ed2682ff8c0df65fd66c7e3b5269927b27450709ca3335b6fa2c165dc7d5835c515e552701a1e7fb30aa23803dd042f5370554c532440362f00f34032895977cd394ff82e27e7fb8c603d0cfc6c2acb8f3c00a --name bob
 Granted scope team to bob; push to share the updated key ring
 alice$ vl push
 Pushed 0 object(s) to origin
@@ -147,7 +147,7 @@ grant:
 ```text
 bob$ vl clone ../hub bobwc
 Cloned /tmp/vdoc/hub into /tmp/vdoc/bobwc (6 objects, 2 files)
-  note: 1 cloaked file(s) you hold no key for. Share your public key (veil16a98…3420) with a member
+  note: 1 cloaked file(s) you hold no key for. Share your public key (veil1e75c…c00a) with a member
   and ask them to run `vl scope grant team <key>` and push. They appear here on your next `vl pull` after that.
 bob$ vl status
 …
@@ -194,7 +194,7 @@ re-apply the other's change.
 ## Removing a teammate
 
 ```text
-alice$ vl scope revoke team veil16a988eb…3420
+alice$ vl scope revoke team veil1e75c0889…c00a
 Revoked. Scope team rotated to key generation 1: new content is sealed with a key
 the revoked identity never receives. Content they already decrypted cannot be recalled; rotate secrets.
 Push to share the updated key ring.

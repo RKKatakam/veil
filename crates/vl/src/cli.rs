@@ -494,6 +494,19 @@ pub enum IdentityCmd {
         #[arg(long)]
         from: Option<std::path::PathBuf>,
     },
+    /// Hand the scope admin rights of a replaced identity over to the
+    /// current one, in this repository: the replaced identity signs a grant
+    /// that makes the current identity an admin. Push to share it.
+    RecoverAdmin {
+        /// Identity file to recover from (default: every identity replaced
+        /// by `vl identity new --force`, newest first).
+        #[arg(long)]
+        from: Option<std::path::PathBuf>,
+        /// Then revoke the replaced identity from those scopes (rotates
+        /// their keys). Leave it out while another device still uses it.
+        #[arg(long)]
+        revoke_old: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

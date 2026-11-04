@@ -63,6 +63,19 @@ pub const SIG_CONTEXT_RING_CHANGE: &str = "ring-change";
 pub const SIG_CONTEXT_EMBARGO: &str = "embargo";
 /// Signature context: embargo release (over `(id, released_key, released_at)`).
 pub const SIG_CONTEXT_EMBARGO_RELEASE: &str = "embargo-release";
+/// Signature context: an identity's binding of its Ed25519 key to its
+/// X25519 key (over the 32 raw bytes of the X25519 public key). Proves that
+/// whoever holds the signing key chose that encryption key (BUG-069).
+pub const SIG_CONTEXT_MEMBER_BINDING: &str = "member-binding";
+
+/// Every signature context, for the uniqueness test.
+pub const SIG_CONTEXTS: &[&str] = &[
+    SIG_CONTEXT_SNAPSHOT,
+    SIG_CONTEXT_RING_CHANGE,
+    SIG_CONTEXT_EMBARGO,
+    SIG_CONTEXT_EMBARGO_RELEASE,
+    SIG_CONTEXT_MEMBER_BINDING,
+];
 
 // ---- key rings and embargoes (keychain.rs) --------------------------------
 
@@ -134,6 +147,14 @@ mod tests {
             &pinned[..16],
             "bdd6da15d799062f",
             "a domain-separation string changed; that breaks existing data. Add a new constant instead."
+        );
+        let contexts: std::collections::BTreeSet<&str> = SIG_CONTEXTS.iter().copied().collect();
+        assert_eq!(contexts.len(), SIG_CONTEXTS.len(), "duplicate signature context");
+        assert!(SIG_CONTEXTS.iter().all(|c| !c.contains('\0')));
+        assert_eq!(
+            &blake3::hash(SIG_CONTEXTS.join("\n").as_bytes()).to_hex()[..16],
+            "028e842fb2475981",
+            "a signature context changed; that breaks existing signatures. Add a new constant instead."
         );
         let labels = [
             WRAP_LABEL_PREFIX,

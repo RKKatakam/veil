@@ -456,6 +456,7 @@ fn cmd_identity(c: &IdentityCmd) -> Result<ExitCode> {
                 if !force {
                     bail!("an identity already exists (use --force to replace it; you will lose access to scopes granted to it)");
                 }
+                warn_sole_admin_scopes();
                 Some(retire_identity(&path)?)
             } else {
                 None
@@ -478,7 +479,72 @@ fn cmd_identity(c: &IdentityCmd) -> Result<ExitCode> {
                 }
                 warn(
                     "other repositories' local vaults are still sealed by the replaced identity; run \
-                     `vl identity recover-vault` in each. Scope admins must grant the new public key again.",
+                     `vl identity recover-vault` in each. Scope admins must grant the new public key again; \
+                     where you were an admin, `vl identity recover-admin` hands your admin rights over.",
+                );
+            }
+        }
+        IdentityCmd::RecoverAdmin { from, revoke_old } => {
+            use veil_core::keychain::AdminRecovery;
+            let id = load_identity()?;
+            let cwd = std::env::current_dir()?;
+            let root = ctx::find_root(&cwd)
+                .ok_or_else(|| anyhow!("no Veil repository found in {} or its parents", cwd.display()))?;
+            let repo = Repo::open(Arc::new(DiskBackend::new(&root)), Some(id.clone()), &user_for(&id))?;
+            let candidates: Vec<PathBuf> = match from {
+                Some(f) => vec![f.clone()],
+                None => retired_identities()?,
+            };
+            let mut handed = 0;
+            let mut not_admin = Vec::new();
+            let mut tried = 0;
+            for path in &candidates {
+                let Some(old) = std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|s| Identity::from_json(&s).ok())
+                else {
+                    continue;
+                };
+                if old.public_hex() == id.public_hex() {
+                    continue;
+                }
+                tried += 1;
+                for (scope, outcome) in repo.keys().recover_admin(&old, *revoke_old)? {
+                    let scope = safe(&scope).to_string();
+                    match outcome {
+                        AdminRecovery::HandedOver { revoked } => {
+                            handed += 1;
+                            println!(
+                                "Scope {scope}: {} granted you admin rights{}",
+                                path.display(),
+                                if revoked { "; it was then revoked (key rotated)" } else { "" }
+                            );
+                        }
+                        AdminRecovery::AlreadyAdmin => println!("Scope {scope}: you are already an admin"),
+                        AdminRecovery::RetiredNotAdmin => not_admin.push(scope),
+                        AdminRecovery::Unverifiable => warn(&format!("scope {scope}: its key ring does not verify; left alone")),
+                    }
+                }
+            }
+            for scope in &not_admin {
+                println!("Scope {scope}: the replaced identity was a member, not an admin; ask an admin to grant your new public key");
+            }
+            if handed > 0 {
+                println!("Push to share the updated key rings.");
+                if !revoke_old {
+                    println!(
+                        "The replaced identity is still a member; once no device uses it, run `vl identity recover-admin --revoke-old` \
+                         (or `vl scope revoke <scope> <its member id>`)."
+                    );
+                }
+            } else if tried == 0 {
+                bail!(
+                    "no replaced identity found{}",
+                    if from.is_none() {
+                        format!(" (looked in {}; pass --from <identity.json>)", retired_dir().display())
+                    } else {
+                        String::new()
+                    }
                 );
             }
         }
@@ -520,6 +586,32 @@ fn cmd_identity(c: &IdentityCmd) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Before `vl identity new --force`: in the repository we are in, name the
+/// scopes whose only admin is the identity about to be replaced (BUG-089).
+fn warn_sole_admin_scopes() {
+    use veil_core::keychain::Role;
+    let Ok(id) = load_identity() else { return };
+    let Some(root) = std::env::current_dir().ok().and_then(|d| ctx::find_root(&d)) else { return };
+    let Ok(repo) = Repo::open(Arc::new(DiskBackend::new(&root)), Some(id.clone()), &user_for(&id)) else { return };
+    let mut sole = Vec::new();
+    for ring in repo.keys().rings().unwrap_or_default() {
+        let Ok(st) = ring.verify() else { continue };
+        let admins: Vec<&String> = st.members.iter().filter(|(_, m)| m.role == Role::Admin).map(|(k, _)| k).collect();
+        if admins == [&id.public_hex()] {
+            sole.push(safe(&ring.scope).to_string());
+        }
+    }
+    if !sole.is_empty() {
+        warn(&format!(
+            "you are the only admin of scope(s) {} in {}: the new identity will not be. Afterwards run \
+             `vl identity recover-admin` here (the replaced identity, kept in {}, signs the hand-over), then push",
+            sole.join(", "),
+            root.display(),
+            retired_dir().display()
+        ));
+    }
 }
 
 /// Where `vl identity new --force` keeps replaced identities.
@@ -1247,7 +1339,7 @@ fn cmd_scope(ctx: &mut Ctx, c: &ScopeCmd) -> Result<()> {
         } => {
             let role = if *admin { Role::Admin } else { Role::Member };
             keys.grant_role(scope, public_key, name, role)?;
-            println!("Granted scope {scope} to {name}; push to share the updated key ring");
+            println!("Granted scope {scope} to {}; push to share the updated key ring", safe(name));
             if veil_core::identity::parse_public_identity(public_key)?.ed25519.is_none() {
                 warn("that is a short public key without a signing key: their signatures will show as unknown.\n  Ask them for the full key from `vl identity show` and grant again.");
             }
@@ -1260,6 +1352,7 @@ fn cmd_scope(ctx: &mut Ctx, c: &ScopeCmd) -> Result<()> {
                      the revoked identity never receives. Content they already decrypted cannot be recalled; rotate secrets.\n\
                      Push to share the updated key ring."
                 );
+                warn_unreachable_members(keys, scope);
             } else {
                 bail!("that key is not a member of '{scope}'");
             }
@@ -1267,6 +1360,7 @@ fn cmd_scope(ctx: &mut Ctx, c: &ScopeCmd) -> Result<()> {
         ScopeCmd::Rotate { scope } => {
             let g = keys.rotate(scope)?;
             println!("Scope {scope} rotated to key generation {g}; push to share the updated key ring");
+            warn_unreachable_members(keys, scope);
         }
         ScopeCmd::Log { scope } => {
             let ring = keys
@@ -1312,6 +1406,17 @@ fn cmd_scope(ctx: &mut Ctx, c: &ScopeCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// After a rotation: name the members who received no key (BUG-070).
+fn warn_unreachable_members(keys: &veil_core::keychain::Keychain, scope: &str) {
+    for (id, name) in keys.unreachable_members(scope) {
+        warn(&format!(
+            "member {} ({id}) of scope {scope} has an invalid (low-order) key and received no key; \
+             revoke it with `vl scope revoke {scope} {id}`",
+            safe(&name)
+        ));
+    }
 }
 
 // ---- workspaces ----------------------------------------------------------
@@ -1776,21 +1881,31 @@ fn cmd_upgrade(repo_arg: Option<&Path>, dry_run: bool, remote_name: Option<&str>
     };
     let root = ctx::find_root(&start)
         .ok_or_else(|| anyhow!("no Veil repository found in {} or its parents", start.display()))?;
-    let (target, label, identity) = match remote_name {
-        None => (root.clone(), "this repository".to_string(), Some(load_identity()?)),
+    let (backend, label, identity) = match remote_name {
+        None => (
+            Arc::new(DiskBackend::new(&root)) as Arc<dyn StorageBackend>,
+            "this repository".to_string(),
+            Some(load_identity()?),
+        ),
         Some(name) => {
             let config = veil_core::repo::read_config(&DiskBackend::new(&root))?;
             let r = config
                 .remotes
                 .get(name)
                 .ok_or_else(|| anyhow!("no remote named '{name}'"))?;
-            let path = PathBuf::from(&r.url);
-            let path = if path.is_absolute() { path } else { root.join(path) };
-            // A remote is checked structurally: its sealed content is not ours to open.
-            (path, format!("remote '{name}'"), None)
+            // A remote is checked structurally: its sealed content is not ours
+            // to open. SSH remotes are resolved as push and pull do (BUG-072).
+            let backend: Arc<dyn StorageBackend> = match SshUrl::parse(&r.url) {
+                Some(url) => connect_sftp(&url?)?,
+                None => {
+                    let path = PathBuf::from(&r.url);
+                    let path = if path.is_absolute() { path } else { root.join(path) };
+                    Arc::new(DiskBackend::new(path))
+                }
+            };
+            (backend, format!("remote '{name}' ({})", safe(&r.url)), None)
         }
     };
-    let backend: Arc<dyn StorageBackend> = Arc::new(DiskBackend::new(&target));
     let opts = UpgradeOptions {
         dry_run,
         force,
@@ -1799,15 +1914,27 @@ fn cmd_upgrade(repo_arg: Option<&Path>, dry_run: bool, remote_name: Option<&str>
     let r = upgrade(backend, identity, &opts)?;
     if r.up_to_date {
         println!("{label} is already at format {} (the newest)", r.to);
+        for n in &r.notes {
+            println!("  {} {n}", dim("note:"));
+        }
         return Ok(ExitCode::SUCCESS);
     }
-    let verb = if dry_run { "Would upgrade" } else { "Upgraded" };
-    println!(
-        "{verb} {label} from format {} to format {}{}",
-        r.from,
-        r.to,
-        if r.resumed { " (resumed an interrupted upgrade)" } else { "" }
-    );
+    if r.from == r.to {
+        // Already at the format; only the key-ring step was pending (BUG-071).
+        println!(
+            "{} the key rings of {label} (format {}) to HPKE key wrapping",
+            if dry_run { "Would move" } else { "Moved" },
+            r.to
+        );
+    } else {
+        let verb = if dry_run { "Would upgrade" } else { "Upgraded" };
+        println!(
+            "{verb} {label} from format {} to format {}{}",
+            r.from,
+            r.to,
+            if r.resumed { " (resumed an interrupted upgrade)" } else { "" }
+        );
+    }
     println!(
         "  objects    {} ({} JSON tree(s), {} binary tree(s))",
         r.objects, r.trees_json, r.trees_binary

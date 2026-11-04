@@ -57,6 +57,7 @@ not be understood.
 | pruned-ops list `.veil/ops_pruned` | one hex id per line | fixed | no | append-only |
 | key rings `.veil/meta/keyrings/<scope>.json` | pretty JSON `KeyRing` | `format` (0/1 legacy, 2 signed log, 3 signed log that may hold HPKE-wrapped keys) | yes | readers reject `format > 3` (no keys, a warning on sync); a ring with an HPKE wrap must say 3, and a format-1/2 repository refuses to store it |
 | — wrapped key (in a ring change) | JSON: legacy `{ephemeral, sealed}` or HPKE `{hpke, enc, ct}` | shape + `hpke` suite string | yes | legacy written by format 1–2, HPKE by format 3 (CRYPTO.md C3/C3L); unknown fields or suites refused |
+| — member binding (in a genesis member or grant) | `"binding": hex(Ed25519 signature)`, after `signing_key`; absent when not recorded | ring format 3 | yes | written from repository format 3 only (CRYPTO.md C4); a ring with one must say format 3, so format-1/2 repositories and older vl never receive it. Added to ring format 3 before any release wrote that format; the format-3 fixtures predate it and carry none |
 | embargo records `.veil/meta/embargoes/<id>.json` | pretty JSON `EmbargoRecord` | implicit 1; a later format adds `"format": N` | yes | readers reject `format > 1` |
 | vault `.veil/local/vault.sealed` | envelope (label `local`) around JSON `VaultData` | repository format | no (device-local) | |
 | stat cache `.veil/local/statcache/<ws>.cache` | `veil:statcache\n` ‖ version u32 ‖ … ‖ BLAKE3 | `VERSION` (1) | no | any mismatch reads as empty: a cache, never data |
@@ -67,6 +68,7 @@ not be understood.
 | gc pending `.veil/objects/gc/pending` | `VEILGCP1` ‖ count u32 ‖ (id, ms)* ‖ BLAKE3 | magic | no | damaged/unknown reads as empty: only restarts the grace period |
 | gc keep markers `.veil/objects/gc/keep/<id>` | empty files | none | no | |
 | upgrade journal `.veil/upgrade.json` | pretty JSON `{from, to, started, done[]}` | — | no | present only during `vl upgrade` |
+| public identity (what `vl identity show` prints and `vl scope grant` takes) | `veil1` ‖ hex(X25519 32) ‖ hex(Ed25519 32) ‖ hex(binding 64); the short `veil1` ‖ hex(X25519) is a member id; the earlier `veil1` ‖ hex(X25519) ‖ hex(Ed25519) still parses, but a grant refuses it | length | no (pasted between people) | the binding is deterministic, so the string never changes |
 | identity `$VEIL_HOME/identity.json`, `retired/` | legacy JSON `{name, public, secret, signing?}` (signing key derived); format 2 `{format: 2, name, public, signing, encryption_secret, signing_secret}` (independent keys) | `format` (absent = legacy) | no | outside the repository; new identities are format 2 whatever the repository format; format 2 has no `secret` so older vl refuse it; readers reject `format > 2` |
 | `.veilpolicy` | text, one rule per line | grammar is fail-safe: unknown tiers isolate | yes (it is a tracked file) | |
 
@@ -220,14 +222,26 @@ vl upgrade [--dry-run] [--remote NAME] [--force]
    identity administers whose current key was ever wrapped with the legacy
    box, append a signed `Rotate` (a new generation, HPKE-wrapped to every
    member, carrying the previous key). Idempotent; a non-admin gets a note
-   naming who can finish it; skipped for `--remote` (no identity).
+   naming who can finish it; skipped for `--remote` (no identity). A
+   member whose key is a low-order point gets no key and is named in a
+   note; any other scope that cannot be rotated becomes a note too, never an
+   error after the commit point (only I/O errors stop the step, and it
+   resumes).
 6. Removes the journal.
 
 Each finished step is journaled before the next starts, so `vl upgrade`
 after a crash resumes (it skips verification if it already passed, and
-notices a commit point already reached). Old data is never removed. A
-remote is upgraded with `--remote NAME` (checked structurally, without
-opening sealed content).
+notices a commit point already reached; `tests/crash.rs` crashes 1→3 and
+2→3 at every write). Old data is never removed. A remote is upgraded with
+`--remote NAME` (checked structurally, without opening sealed content);
+an SSH remote is reached over SFTP, as push and pull reach it.
+
+In a repository that is already at the newest format, `vl upgrade` still
+runs `3:hpke-ring-keys` when one of this identity's rings needs it (a fresh
+clone of an upgraded remote, or a clone a non-admin upgraded), and says so:
+"Moved the key rings of this repository (format 3) to HPKE key wrapping".
+Otherwise it reports "already at format 3", with a note for each scope
+still waiting for its admin.
 
 ### Consequences
 
