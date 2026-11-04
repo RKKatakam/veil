@@ -336,6 +336,12 @@ pub fn print_working_copy_warnings(r: &BuildReport) {
             "{p} is tracked but is now a symlink or special file; Veil never follows it and keeps the recorded version"
         ));
     }
+    for (a, b) in &r.name_collisions {
+        warn(&format!(
+            "{a} and {b} differ only in case or Unicode normalisation; a checkout on a case-insensitive \
+             filesystem (macOS by default) will refuse this snapshot. Rename one of them"
+        ));
+    }
 }
 
 fn print_blocked(paths: &[VPath]) {
