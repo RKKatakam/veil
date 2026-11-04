@@ -468,6 +468,8 @@ pub fn gc(repo: &mut Repo, opts: &GcOptions) -> Result<GcReport> {
     }
 
     // 6. The new pack is in place: delete pruned ops, then old objects.
+    // Record the pruning first so fsck can tell it apart from loss.
+    crate::oplog::record_pruned_ops(&*backend, &pruned_ops)?;
     for id in &pruned_ops {
         backend.remove_file(&op_path(id))?;
     }

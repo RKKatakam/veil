@@ -711,8 +711,16 @@ impl Checker {
             },
         };
 
+        let pruned = crate::oplog::pruned_ops(&*self.backend).unwrap_or_default();
         for (id, op) in &ops {
             for p in &op.parents {
+                if pruned.contains(p) {
+                    self.push(
+                        Severity::Note,
+                        format!("operation {}: parent operation {} was pruned by gc", id.short(), p.short()),
+                    );
+                    continue;
+                }
                 if !ops.contains_key(p) && !damaged.contains(p) {
                     let msg = format!("operation {}: parent operation {} is missing", id.short(), p.short());
                     self.report.findings.push(Finding {

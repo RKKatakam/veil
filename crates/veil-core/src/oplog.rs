@@ -152,3 +152,35 @@ impl OpStore {
         }
     }
 }
+
+const PRUNED_OPS: &str = ".veil/ops_pruned";
+
+/// Record operations deliberately removed by `gc --keep-ops-days`, so that
+/// integrity checks can tell pruning apart from loss. Must be called (and is
+/// durable) before the operation files are deleted.
+pub fn record_pruned_ops(backend: &dyn StorageBackend, ids: &[ObjectId]) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let path = VPath::new(PRUNED_OPS)?;
+    let mut text = backend
+        .read_opt(&path)?
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    for id in ids {
+        text.push_str(&id.hex());
+        text.push('\n');
+    }
+    backend.write(&path, text.as_bytes())
+}
+
+/// Operations recorded as pruned by `gc`.
+pub fn pruned_ops(backend: &dyn StorageBackend) -> Result<std::collections::HashSet<ObjectId>> {
+    let Some(raw) = backend.read_opt(&VPath::new(PRUNED_OPS)?)? else {
+        return Ok(Default::default());
+    };
+    Ok(String::from_utf8_lossy(&raw)
+        .lines()
+        .filter_map(|l| ObjectId::from_hex(l.trim()).ok())
+        .collect())
+}
