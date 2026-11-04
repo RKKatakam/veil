@@ -591,3 +591,31 @@ fn the_ci_scan_recipe_cannot_be_switched_off_by_the_scanned_policy() {
         text(&out)
     );
 }
+
+// ---- undo reaching past commands that are not operations -------------------------
+
+/// "Every command that changes the repository is an operation in the
+/// operation log" (guide). `vl scope grant|revoke|rotate`, `vl remote
+/// add|rm` and `vl secret set|rm|import` change the repository but record
+/// no operation, so `vl undo` right after one of them undoes the *previous*
+/// operation instead: here `set tag main` (it could as well be the last
+/// commit or a merge). The grant stays, `main` is gone, and the one-line
+/// `Undid: set tag main` is all that says so. A member who granted the
+/// wrong key, "undid" it, and pushes, ships the ring with that key in it.
+#[test]
+#[ignore = "BUG-116: `vl undo` after `vl scope grant` (or `remote add`, `secret set`) undoes the previous unrelated operation and leaves the grant in place"]
+fn undo_after_a_scope_grant_does_not_undo_an_unrelated_operation() {
+    let env = Env::new();
+    let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
+    let bob = env.stdout("bob", &proj, &["identity", "show"]);
+    let key = bob.lines().find(|l| l.starts_with("public key")).unwrap().split_whitespace().last().unwrap().to_string();
+    env.ok(U, &proj, &["scope", "grant", "team", &key, "--name", "bob"]);
+    let out = env.vl(U, &proj, &["undo"]);
+    let tags = env.stdout(U, &proj, &["tag", "list"]);
+    let scope = env.stdout(U, &proj, &["scope", "list"]);
+    assert!(
+        tags.contains("main") && (!out.status.success() || !scope.contains("bob")),
+        "undo after the grant: {}\ntags:\n{tags}scope:\n{scope}",
+        text(&out).trim()
+    );
+}
