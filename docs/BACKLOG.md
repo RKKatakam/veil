@@ -74,6 +74,9 @@ fixed**. Severity: high / medium / low.
   back.
 - **`DiskBackend::write` follows symlinked parent directories** if called
   directly (checkout and restore guard against it).
+- **Tags carry no provenance:** a hostile tag created by an older `vl pull`
+  (before the BUG-105 fix) keeps shadowing a change id until the user
+  deletes it; pulled tags are not attributed to the remote that sent them.
 - **Retired identities stay on disk** (`$VEIL_HOME/retired/`, 0600) until
   the user deletes them, so vaults can be re-keyed.
 
