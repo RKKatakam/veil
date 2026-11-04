@@ -6,6 +6,15 @@ fixed**. Severity: high / medium / low.
 
 ## Before the Hub (owner-approved order: after all bugs are fixed)
 
+> **Scion for developers** (`docs/design/scion-for-developers.md`, added
+> 2026-11-04): a server-centred, agent-scale roadmap on top of the Hub.
+> Its **phase 0** belongs here, in the scale round after Git parity:
+> lock-free SFTP writes (pack first, lock only for the branch update),
+> a lock-free op log, a history (commit-graph) index, the scale
+> benchmark (including a mostly-cloaked profile), background cleanup
+> instead of whole-store `gc`, and streaming Git import. Phases 1–4 are
+> Hub work.
+
 ### Agent workspaces and scale
 - **Copy-on-write file clones for project-directory checkouts** (`vl ws
   switch`, `vl edit`): `ws exec` sandboxes clone already
