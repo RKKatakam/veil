@@ -94,7 +94,6 @@ fn bob_without_the_key(env: &Env) -> (PathBuf, PathBuf) {
 /// showed as **deleted**: the mount records without a materialisation
 /// record, so the builder takes "readable and absent" for a deletion.
 #[test]
-#[ignore = "BUG-534: a grant during a mount makes its next recording delete the cloaked files it never showed"]
 fn a_grant_during_a_mount_never_deletes_the_files_it_never_showed() {
     if !fuse_available() {
         return;
@@ -264,7 +263,6 @@ fn control_a_closed_edit_overlapping_a_concurrent_change_is_saved() {
 /// process aborts. The mount is gone (`ENOTCONN`), and every other file
 /// open there loses what was written to it and not yet closed.
 #[test]
-#[ignore = "BUG-536: a huge truncate (or a write at a huge offset) aborts the mount process"]
 fn a_huge_truncate_does_not_kill_the_mount() {
     if !fuse_available() {
         return;
@@ -290,7 +288,6 @@ fn a_huge_truncate_does_not_kill_the_mount() {
 
 /// The same through `pwrite` at a 1 TiB offset.
 #[test]
-#[ignore = "BUG-536: a write at a huge offset aborts the mount process"]
 fn a_write_at_a_huge_offset_does_not_kill_the_mount() {
     if !fuse_available() {
         return;
@@ -351,7 +348,6 @@ fn a_sealed_conflict_side_never_reaches_a_non_member_through_the_mount() {
 /// mount and records the mounted workspace, cloaked plaintext included, as
 /// its own public files; its next push publishes them.
 #[test]
-#[ignore = "BUG-535: a mount inside another Veil project is recorded (cloaked plaintext and all) by that project"]
 fn a_mount_inside_another_project_is_never_recorded_by_it() {
     if !fuse_available() {
         return;
@@ -390,7 +386,6 @@ fn a_mount_inside_another_project_is_never_recorded_by_it() {
 /// leaves a third of them (ext4 and tmpfs: none). Renaming while listing
 /// can likewise visit an entry twice.
 #[test]
-#[ignore = "BUG-537: readdir offsets shift when entries are deleted; remove_dir_all fails on large directories"]
 fn deleting_while_listing_skips_nothing() {
     if !fuse_available() {
         return;
@@ -415,7 +410,6 @@ fn deleting_while_listing_skips_nothing() {
 /// and the commit the user meant to undo stays. For the project directory
 /// undo skips the automatic snapshot and keeps the edits (BUG-116).
 #[test]
-#[ignore = "BUG-538: vl undo undoes the mount's own pre-command recording, wiping the mount's new work"]
 fn undo_never_throws_away_the_mounts_new_work() {
     if !fuse_available() {
         return;
@@ -445,7 +439,6 @@ fn undo_never_throws_away_the_mounts_new_work() {
 /// the overlay overlapping it, and saves the same edits again as a spurious
 /// conflict change ("they conflicted with a change to the workspace").
 #[test]
-#[ignore = "BUG-539: a crash between a recording and saving state.json makes recovery save a spurious conflict change"]
 fn recovery_after_a_crash_mid_recording_saves_no_spurious_change() {
     if !fuse_available() {
         return;

@@ -168,6 +168,17 @@ impl From<Materialised> for MaterialisedRaw {
 }
 
 impl Materialised {
+    /// A record of a working copy that shows its tree as this reader reads
+    /// it, except that it never showed the files at `hidden` (a `vl ws
+    /// mount` whose deleted directories held files it could not read then):
+    /// those are carried by the builder, never recorded as deleted.
+    pub fn hiding(hidden: impl IntoIterator<Item = VPath>) -> Materialised {
+        Materialised {
+            hidden: hidden.into_iter().filter(|p| !p.is_root()).collect(),
+            ..Materialised::default()
+        }
+    }
+
     /// Nothing hidden, nothing from a fallback.
     pub fn is_empty(&self) -> bool {
         self.view.is_none() && self.hidden.is_empty() && self.fallback.is_empty()
