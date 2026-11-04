@@ -73,7 +73,7 @@ fn metadata_writes_inside_and_outside_transactions_interleave_safely() {
     let remote_fs: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     remote::push(&mut repo, remote_fs.clone(), false, &[], false).unwrap();
     let embargoes: Vec<String> = (0..4)
-        .map(|i| repo.keys().create_embargo("team", None, &format!("e{i}")).unwrap())
+        .map(|_| repo.keys().create_embargo("team", None).unwrap())
         .collect();
     drop(repo);
 

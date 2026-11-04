@@ -50,7 +50,11 @@ must not be trusted (which disables stat caching):
   additionally reports what `list_dir` leaves out: *special* entries
   (symlinks, sockets, devices) and names that are not valid UTF-8, which a
   `VPath` cannot represent. The builder warns about the latter and checkout
-  never writes through or over the former (§4).
+  never writes through or over the former (§4). `write`, `write_unsynced`
+  and `create_new` themselves also refuse a path below a symlinked
+  directory, whoever calls them (one `lstat` per directory above the path),
+  except under the engine's own `.veil/`, which may be a link to another
+  disk.
 * **MemoryBackend** is a flat `BTreeMap<VPath, Node>`. Because the
   descendants of `a/` are contiguous in string order, directory listings are
   range scans. File buffers are `Arc`-shared. Every file write takes a fresh
@@ -339,7 +343,7 @@ rotation = { generation, key_id, previous: [{key_id, sealed}], wrapped: {id → 
 | Object | What is signed | Checked |
 |---|---|---|
 | ring change | its body (above) | on every load; rejected on pull if invalid |
-| embargo record | `(id, scope, wrapped, until, created, description, scope_key, key_id)` | on pull; signer must be (or have been) a member of the scope |
+| embargo record | `(id, scope, wrapped, until, created, description, scope_key, key_id)` (`description` is always empty) | on pull; signer must be (or have been) a member of the scope |
 | embargo release | `(id, released_key, released_at)`; the key must also match the committed `key_id` fingerprint | on pull and on every key lookup |
 | snapshot | its **unsigned id** (BLAKE3 of the encoding without `signature`) | shown by `vl log` / `vl show`; invalid ones reported on pull |
 
@@ -401,7 +405,44 @@ CAS, and it applies these rules in order:
    Lifting that ignore counts as weakening for the accepted policy below.
    Checkout never writes VCS metadata that an older snapshot recorded, nor
    removes it.
-2. Isolated paths, including the built-in secret rules (`.env`, `.env.*`,
+   **Editor scratch files** are ignored too, built in and at any depth
+   (`policy::editor_artefact`, any ASCII case of the fixed parts): Vim,
+   Neovim and nano swap files `.B.swp` … `.B.swa`, Vim undo files `.B.un~`,
+   Kate swap files `.B.kate-swp`, backups `B~` and `B.~N~` (Emacs, Vim with
+   `backup`, gedit), Emacs auto-save `#B#` and lock links `.#B`, JetBrains
+   safe-write files `B___jb_tmp___` / `B___jb_old___`, LibreOffice locks
+   `.~lock.B#`. Only an `isolate` rule, or a `public!` rule whose own file
+   name spells such a file (`*~ public!`, `*.sw? public!`), applies to one;
+   lifting the ignore is a weakening. Every `vl` command snapshots, so
+   without this an open editor's swap file would be recorded (BUG-098).
+2. **Protection follows the name** (BUG-098). An *editor or backup
+   artefact* of a file `D/B` is a file in the same directory `D` named as
+   one of the scratch files above (Vim's swap file of `B` is `.B.swp`,
+   but of `.env` it is `.env.swp`: both `B` and `.B` are tried), or a
+   backup copy `B.orig`, `B.rej`, `B.bak`, `B.backup`, `B.old`, `B.tmp`,
+   `B.temp`, `B.save`, `B.sav` (also numbered: `B.bak2`, `B.save.1`). Names
+   are unwrapped up to four layers (`.env.bak~` → `.env.bak` → `.env`). The
+   artefact gets the base's protection where its own is weaker, whatever
+   its own rules say (no rule of the artefact's undoes it; only a change of
+   the base's classification does):
+   * base **isolated** (a built-in secret, or a user rule) → the artefact
+     is isolated: local-only, listed by `vl status` as `L`, backed up in
+     the vault like the file;
+   * base **cloaked** under `s` → the artefact is cloaked under `s` (never
+     another scope), unless its own classification keeps it on the device:
+     scratch files stay ignored, backup copies are sealed under `s`;
+   * base **ignored** → the artefact is ignored (unless isolated);
+   * base public → the artefact's own classification (a scratch file stays
+     ignored, a backup copy of a public file is an ordinary file).
+
+   Directories are never artefacts. `vl policy check` names the base
+   (`… an editor or backup artefact of deploy/id_ed25519`). The derivation
+   is part of classification, so the accepted policy below pins it: an
+   incoming policy that would publish an artefact (by lifting the scratch
+   rule, or by publishing its base) is held back. The secret scanner also
+   reads NUL-separated text such as Vim's swap format (rule 4), as defence
+   in depth.
+3. Isolated paths, including the built-in secret rules (`.env`, `.env.*`,
    `*.pem`, `*.key`, SSH private keys, `*.tfstate`, …), are reported back and
    never hashed into the store. A user's plain `public` rule cannot override a
    built-in secret (the warning about it stops once a later rule decides
@@ -420,10 +461,13 @@ CAS, and it applies these rules in order:
      (`.veil/local/accepted-policy`). Snapshots of the repository's own
      directory classify every path under both; where `.veilpolicy`
      **weakens** the accepted classification, the accepted one applies and
-     the path is reported as held back (`BuildReport::policy_held_back`).
+     the path is reported as held back (`BuildReport::policy_held_back`; a
+     directory the accepted policy ignores, such as `.git/`, is reported
+     once, as a whole).
      Weakening is: isolated → cloaked or public; cloaked → public or
      another scope; `public` → `public!` (scanning off); `ignore` lifted
-     from a built-in secret or from VCS metadata. Moving to `isolate` or
+     from a built-in secret, from VCS metadata or from an editor scratch
+     file (or from an artefact of an ignored built-in secret). Moving to `isolate` or
      `ignore` never weakens (the file stays on the device either way), and
      strengthening applies at once. A held-back tracked file keeps its
      entry: an incoming
@@ -459,7 +503,8 @@ CAS, and it applies these rules in order:
      budget. When the fold is refused, only the `isolate`/`ignore` rules the
      member added are appended to the accepted policy (that never weakens
      anything), and every snapshot warns that the rest of the edit waits for
-     `vl policy accept`. The accepted policy's first line (a comment)
+     `vl policy accept` (the held-back warning then says that a path may be
+     held back by the member's own edit, not only by the pending change). The accepted policy's first line (a comment)
      records which edit it folded, so a snapshot that saved it but was not
      recorded does not fold the same edit twice. Anything else waits for
      `vl policy accept`, which lists the local files whose protection it
@@ -483,7 +528,7 @@ CAS, and it applies these rules in order:
      isolated files, and pull + `vl new`, checkout, rebase, Git import and
      undo bypass merge entirely; the working-copy snapshot is the one place
      every route meets.
-3. Public files are scanned for credentials (AWS, GitHub, GitLab, Slack,
+4. Public files are scanned for credentials (AWS, GitHub, GitLab, Slack,
    Stripe, Anthropic, OpenAI, Google, JWT, private keys, passwords in URLs
    (`postgres://app:<password>@db`), and high-entropy `password = …` /
    `API_KEY=…` / `JWT_SECRET: …` / `GITLAB_TOKEN=…` assignments, quoted or
@@ -496,7 +541,12 @@ CAS, and it applies these rules in order:
      as such text if the file has a BOM, if 1/32 of its bytes are NUL, or
      if the chunk or its overlap holds a run of 8 ASCII characters in
      UTF-16 (text in a non-Latin script has almost no NULs in UTF-16, and
-     UTF-16 may start near the end of a chunk). Token rules run as one
+     UTF-16 may start near the end of a chunk). Text whose lines end in NUL
+     instead of newline (Vim's swap files store each line NUL-terminated,
+     a block's lines last to first) is searched again with its lines joined
+     by newlines, in file order and in reverse, when such lines hold at
+     least half of the file's non-NUL bytes; it counts as binary data for
+     the PEM rule. Token rules run as one
      alternation, so the regex literal prefilter makes a single pass.
      The assignment rule runs on an ASCII-lowercased copy of each chunk,
      because `(?i)` keywords defeat the prefilter. Unquoted values must
@@ -536,7 +586,7 @@ CAS, and it applies these rules in order:
      is left in place and reported as `kept`. The next snapshot quarantines
      it again on top of the new tree. `vl restore <path>` deliberately
      discards a quarantined edit.
-4. Cloaked files are sealed under their scope. In a cloaked workspace, every
+5. Cloaked files are sealed under their scope. In a cloaked workspace, every
    public file it introduces is sealed under the workspace scope, and the
    description is too.
    * **Sealed content keeps its audience.** A tracked file the parent holds
@@ -569,10 +619,10 @@ CAS, and it applies these rules in order:
      it is held back (`BuildReport::cloak_failures`; the file stays local)
      and the recorded entry is kept, as is any tracked file this reader
      cannot seal. Deleting the copy shown is not a deletion of the sealed
-     content (it is carried, rule 6). Before this rule (BUG-074), such an
+     content (it is carried, rule 7). Before this rule (BUG-074), such an
      edit made the public side see the file deleted, on GitHub as a commit
      deleting it.
-5. Embargoed entries stay embargoed until their embargo is released, and a
+6. Embargoed entries stay embargoed until their embargo is released, and a
    tree under an unreleased embargo stays under it (§7). A key holder's
    edit of an embargoed file is secret-scanned like a public one, because
    the release publishes it; a hit is quarantined and the previous (sealed)
@@ -580,7 +630,7 @@ CAS, and it applies these rules in order:
    path would be public anyway: once the policy (or the line's cloak) seals
    the path under a scope, an edit, or a merge, seals it under that scope
    instead, so the release never publishes it.
-6. Entries this reader cannot materialise (no key, or withheld by a public
+7. Entries this reader cannot materialise (no key, or withheld by a public
    remote) are **carried over** instead of being treated as deletions. A
    partial view can never accidentally delete hidden content.
 
@@ -687,7 +737,7 @@ struct Snapshot {
   * squashing a cloaked change into a public parent seals the joined
     description; squashing anything into a cloaked change seals what it
     brings (a public file keeping its last public version as fallback,
-    §4 rule 4). A squash keeps a recorded conflict only if the squashed
+    §4 rule 5). A squash keeps a recorded conflict only if the squashed
     change left the file untouched, or has the conflict itself;
   * the builder rule above (sealed content keeps its audience) covers
     working copies.
@@ -801,7 +851,9 @@ remains is mostly the one `lstat` per file and the per-directory
 
 1. Creates an embargo record holding a fresh key, wrapped under scope `S`,
    plus an optional deadline. Records are synced to every remote, so the
-   record carries **no message**. The merge snapshot's description is sealed
+   record carries **no message**: its `description` field is always empty
+   (the engine takes none; the field stays, signed, so records remain
+   readable and verifiable by every version). The merge snapshot's description is sealed
    under the embargo key instead, and becomes readable on release.
 2. Builds the merged tree and stores it as an **embargo wrapper**
    (`embargo.rs`). This is a small plaintext tree whose marker entry `embargo`
@@ -906,7 +958,7 @@ objects except those of released embargoes, never receives cloaked tags, and
 nothing is ever transferred under the `local` scope. Isolated content cannot
 be pushed at all, because it was never in the graph. File fallbacks are
 plaintext and travel with their entries: a clone of a public remote checks
-out the last public version of a file edited on a cloaked line (§4 rule 4),
+out the last public version of a file edited on a cloaked line (§4 rule 5),
 and records it as shown from a fallback (§6), never as deleted.
 
 **Embargoed history.** Before walking, `push` computes, for every
@@ -1356,7 +1408,7 @@ how each object is *sealed*, never by which keys this replica holds:
   embargo wrapper resolves to its sealed side once released, otherwise to
   its fallback; a file whose content is hidden shows its fallback if it has
   one: an embargoed file its pre-merge version, a public file edited on a
-  cloaked line its last public version (§4 rule 4). So a cloaked edit is
+  cloaked line its last public version (§4 rule 5). So a cloaked edit is
   exported as a commit that leaves the file as it was, never one that
   deletes it, and a Git commit made on that view imports as an edit of it
   (the import's `base` is the same projection). A `.git` entry, which
@@ -1610,7 +1662,8 @@ repository lock.
   its parents' ids (the merged-in ones are redacted, not hidden), its
   author, its timestamp, the embargo's scope and deadline, and the
   ciphertext sizes on team remotes. The embargo record and the wrapper do
-  not name files. (Overlapping embargoes, which used to reveal one
+  not name files, and the record carries no description (the field is
+  always empty). (Overlapping embargoes, which used to reveal one
   another's files, are refused in 1.0, §7.)
 * *History withheld by an embargo* is computed from the local graph. If the
   embargoed merge is undone or abandoned before a push, nothing protects

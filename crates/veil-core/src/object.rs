@@ -169,7 +169,7 @@ pub struct TreeEntry {
     /// The object shown to readers who cannot read `id`: for embargoed
     /// entries the pre-merge version (until they hold the embargo key); for
     /// a public file sealed only because it was edited on a cloaked line,
-    /// its last public version (ARCHITECTURE §4, rule 4).
+    /// its last public version (ARCHITECTURE §4, rule 5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<ObjectId>,
 }

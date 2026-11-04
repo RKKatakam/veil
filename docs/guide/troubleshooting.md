@@ -29,12 +29,19 @@ such as `*.pem`. It has no effect, and the warning repeats on every command
 **until you delete the rule from `.veilpolicy`**, even if a later `public!`
 rule now applies. Use `vl undo` right after `vl expose`, or edit the file.
 
-### `warning: N local file(s) keep the protection you accepted: .veilpolicy would weaken it, and that change came from a merge, pull, checkout or undo rather than your own edit (…)`
+### `warning: N local path(s) keep the protection you accepted: .veilpolicy would weaken it, and that change came from a merge, pull, checkout or undo rather than your own edit (…)`
 
 Someone else's `.veilpolicy` change would publish, uncloak or stop scanning
 one of your local files. Your files keep their protection. Review with
 `vl policy show`; apply with `vl policy accept`, or remove the rule
 yourself. See [the accepted policy](secrets-and-visibility.md#the-accepted-policy-when-an-incoming-change-is-held-back).
+A directory listed with a trailing `/` (`.git/`) is held back as a whole.
+
+When the warning says instead that the paths are held back "through a
+change … that you have not accepted, or through your own edit", you edited
+`.veilpolicy` on top of such a change and your edit could not be applied
+without it (the warning before it says why). `vl policy show` lists both;
+`vl policy accept` applies the file as it is.
 
 ### `warning: N matching file(s) already exist in plaintext in earlier snapshots (e.g. X). New snapshots are protected; rotate any secrets they contain.`
 
@@ -62,10 +69,12 @@ The policy says to cloak `X` under `S`, but you don't hold `S`'s key, so
 Veil can't seal it. It is not recorded (and never published). Ask an admin
 for access, then the next command records it.
 
-### `R` files in `vl status`, `redacted X (no key; left out of the working copy)`
+### `R` files in `vl status`, `redacted X (cloaked:S; no key; left out of the working copy)`
 
 Cloaked files you can't read are kept in history and left out of your
-working copy. They appear automatically (`Filled in N file(s) that became
+working copy. The reason in brackets says why: `no key` (you are not a
+member of `S`), `withheld by a public remote` (see the next entry) or
+`embargo …; not released`. They appear automatically (`Filled in N file(s) that became
 readable`) after an admin grants you the scope and pushes, and you pull.
 From a **public** remote they never appear: public remotes don't carry
 cloaked content at all.

@@ -75,7 +75,7 @@ fn a_grant_cannot_rebind_another_members_signing_key() {
     let reader = Repo::open(fs.clone(), None, "reader").unwrap();
     assert!(reader.keys().snapshot_status(&alices).is_good());
     let until = veil_core::now_millis() + 50;
-    let embargo = repo.keys().create_embargo("team", Some(until), "fix").unwrap();
+    let embargo = repo.keys().create_embargo("team", Some(until)).unwrap();
     let rec = repo.keys().load_embargo(&embargo).unwrap().unwrap();
     assert!(repo.keys().embargo_trusted(&rec), "control: Alice's record is trusted");
 

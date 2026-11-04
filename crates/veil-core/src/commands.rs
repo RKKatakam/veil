@@ -448,7 +448,7 @@ impl Repo {
                         other_scopes.join(", ")
                     )));
                 }
-                let e = tx.repo().keys().create_embargo(&spec.scope, spec.until, "")?;
+                let e = tx.repo().keys().create_embargo(&spec.scope, spec.until)?;
                 tree = apply_embargo(&store, &tree, &into_snap.tree, &e)?;
                 Some(e)
             }

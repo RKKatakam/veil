@@ -649,15 +649,15 @@ impl Checker {
         let label = format!("file {path}");
         self.check_blob(e.id, &label, missing_as, &why, Some(e.visibility.key_scope()));
         if let Some(fb) = e.fallback {
-            // The pre-merge version may itself have been cloaked and withheld,
-            // which this entry cannot tell; hence only a warning.
-            self.check_blob(
-                fb,
-                &format!("{label} (embargo fallback)"),
-                Severity::Warning,
-                " (withheld if the pre-merge file was cloaked)",
-                None,
-            );
+            // An embargoed entry's pre-merge version, or the last public
+            // version a sealed edit keeps for readers without the key. The
+            // former may itself have been cloaked and withheld, which this
+            // entry cannot tell; hence only a warning.
+            let (what, why) = match &e.visibility {
+                Visibility::Embargoed { .. } => ("embargo fallback", " (withheld if the pre-merge file was cloaked)"),
+                _ => ("last public version, shown to readers without the key", ""),
+            };
+            self.check_blob(fb, &format!("{label} ({what})"), Severity::Warning, why, None);
         }
     }
 

@@ -93,6 +93,16 @@ built-in      .git                     ignore  (dirs and files, any depth)
 built-in      .jj                      ignore  (dirs, any depth)
 built-in      .hg                      ignore  (dirs, any depth)
 built-in      .svn                     ignore  (dirs, any depth)
+built-in      .*.sw[a-p]               ignore  (editor scratch files)
+built-in      .*.un~                   ignore  (editor scratch files)
+built-in      .*.kate-swp              ignore  (editor scratch files)
+built-in      *~                       ignore  (editor scratch files)
+built-in      #*#                      ignore  (editor scratch files)
+built-in      .#*                      ignore  (editor scratch files)
+built-in      *___jb_tmp___            ignore  (editor scratch files)
+built-in      *___jb_old___            ignore  (editor scratch files)
+built-in      .~lock.*#                ignore  (editor scratch files)
+built-in      editor and backup artefacts of an isolated, cloaked or ignored file (.x.swp, x~, x.bak, …) take its protection
 built-in      .env                     isolate
 built-in      .env.*                   isolate
 built-in      .envrc                   isolate
@@ -127,6 +137,41 @@ rule of yours records them, not even `** public` or `vendor/ public!`; only
 a `public!` rule that names the directory itself does
 (`fixtures/repo/.git/ public!`), for a test fixture that really is a
 repository.
+
+### Editor swap and backup files
+
+Every `vl` command records the working copy, so a file your editor keeps
+next to the one you have open would be recorded too. The next nine rules
+keep editor scratch files out: Vim's and nano's swap files (`.x.swp`,
+`.x.swo`, …), Vim undo files (`.x.un~`), Kate's `.x.kate-swp`, backups
+(`x~`, `x.~1~`), Emacs's `#x#` and `.#x`, JetBrains's `x___jb_tmp___` /
+`x___jb_old___` and LibreOffice's `.~lock.x#`. Only an `isolate` rule, or a
+`public!` rule that names such files itself (`*~ public!`), changes that.
+
+**Protection follows the name.** A swap, backup or lock file of a
+protected file, or a backup copy (`x.orig`, `x.rej`, `x.bak`, `x.backup`,
+`x.old`, `x.tmp`, `x.temp`, `x.save`, `x.sav`, also numbered), takes that
+file's protection, whatever your rules say about the copy:
+
+| The file | Its artefacts (`.x.swp`, `x~`, `x.bak`, …) |
+|---|---|
+| isolated (`.env`, `id_ed25519`, `vl isolate`) | isolated: local-only, `L` in `vl status` |
+| cloaked under `S` | cloaked under `S` (scratch files stay ignored) |
+| ignored | ignored |
+| public | scratch files ignored; `x.bak` & co. are ordinary files |
+
+```text
+$ vl status
+…
+Local-only (isolated; never snapshotted or pushed):
+  L deploy/.id_ed25519.swp
+  L deploy/id_ed25519
+$ vl policy check deploy/.id_ed25519.swp
+deploy/.id_ed25519.swp: isolated via built-in secret rule 'id_ed25519' (an editor or backup artefact of deploy/id_ed25519, so it has that file's protection)
+```
+
+Copies under another name (`cp .env env-old`) are not recognised: isolate
+them yourself.
 
 A plain `public` rule on a built-in secret is ignored, and every command
 warns until you remove it or settle it with a later `public!`
@@ -367,7 +412,7 @@ $ vl rebase -d main
 Rebased mykuvxmu c13e04ed (empty) (no description set)
 Updated 1 files, removed 0
   kept .env (local edit not in history, e.g. quarantined; left as is instead of being overwritten)
-warning: 1 local file(s) keep the protection you accepted: .veilpolicy would weaken it, and that change came from a merge, pull, checkout or undo rather than your own edit (.env (isolate → public!)). Review it with `vl policy show`; apply it with `vl policy accept`
+warning: 1 local path(s) keep the protection you accepted: .veilpolicy would weaken it, and that change came from a merge, pull, checkout or undo rather than your own edit (.env (isolate → public!)). Review it with `vl policy show`; apply it with `vl policy accept`
 
 $ vl status
 …

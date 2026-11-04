@@ -52,6 +52,7 @@ fn an_incoming_weakening_is_held_back_reported_and_applied_only_once_accepted() 
         path: p(".env"),
         accepted: "isolate".into(),
         wanted: "public!".into(),
+        dir: false,
     };
     assert_eq!(report.policy_held_back, vec![want]);
     assert!(report.isolated.contains(&p(".env")), "still local-only (and backed up)");
@@ -270,4 +271,27 @@ fn checking_out_a_snapshot_that_recorded_git_metadata_leaves_the_git_directory_a
     assert!(!fs.exists(&p(".git/index.lock")).unwrap(), "nothing written into .git");
     let wc = snap(&mut repo, &*fs);
     assert!(file_entry(&repo, &wc, ".git/HEAD").is_none(), "no longer recorded");
+}
+
+/// An incoming policy that would record the member's `.git/` (or any
+/// directory the accepted policy ignores) is held back for the directory as
+/// a whole, and reported as such (not only files are).
+#[test]
+fn an_ignored_directory_held_back_is_reported() {
+    let (mut repo, fs, main) = setup();
+    fs.write(&p(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+    fs.write(&p(".git/config"), b"[remote]\n").unwrap();
+    let pr = incoming(&mut repo, main, &[(".veilpolicy", ".git/ public!\n")]);
+    let report = move_to(&mut repo, &*fs, pr);
+    let want = HeldBack {
+        path: p(".git"),
+        accepted: "ignore".into(),
+        wanted: "public!".into(),
+        dir: true,
+    };
+    assert_eq!(report.policy_held_back, vec![want.clone()]);
+    assert_eq!(want.shown_path(), ".git/");
+    assert_eq!(repo.policy_held_back(&*fs).unwrap(), vec![want]);
+    let wc = snap(&mut repo, &*fs);
+    assert!(file_entry(&repo, &wc, ".git/HEAD").is_none());
 }

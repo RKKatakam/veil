@@ -599,7 +599,7 @@ fn embargo_on_a_legacy_ring_upgrades_it_so_the_record_is_attributable() {
         },
     );
     repo.keys().save_ring(&legacy).unwrap();
-    let id = repo.keys().create_embargo("team", Some(1), "x").unwrap();
+    let id = repo.keys().create_embargo("team", Some(1)).unwrap();
     assert!(!repo.keys().load_ring("team").unwrap().unwrap().is_legacy());
     let rec = repo.keys().load_embargo(&id).unwrap().unwrap();
     assert!(repo.keys().embargo_trusted(&rec));

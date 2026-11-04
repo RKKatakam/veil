@@ -27,7 +27,13 @@
 //!   chunk or its overlap: text in a non-Latin script has almost no NULs
 //!   in UTF-16), not for compressed or random binary data.
 //!
-//! Memory use beyond the input is bounded by the chunk size. Rules are
+//! * Text whose lines end in NUL instead of newline (Vim's swap files) is
+//!   searched again with its lines joined by newlines, in file order and in
+//!   reverse (see `scan_nul_separated`). This needs up to twice the input
+//!   in memory, and only happens when such lines hold at least half of the
+//!   file's non-NUL bytes.
+//!
+//! Memory use beyond the input is otherwise bounded by the chunk size. Rules are
 //! matched on bytes with Unicode disabled, so they behave the same on valid
 //! and invalid UTF-8. Token boundaries are checked in code instead of in the
 //! patterns, which keeps each literal prefix visible to the prefilter.
@@ -38,7 +44,7 @@ use regex::bytes::Regex;
 
 /// Bumped whenever the rules change, so cached "scanned clean" facts (see
 /// `statcache`) from an older scanner are not reused.
-pub const RULES_VERSION: u32 = 3;
+pub const RULES_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Finding {
@@ -525,6 +531,90 @@ fn lowercase_into(buf: &mut Vec<u8>, s: &[u8]) {
     buf.extend(s.iter().map(u8::to_ascii_lowercase));
 }
 
+// ---- NUL-separated text ------------------------------------------------------
+
+/// Is `line` (between two NUL bytes) a line of text: valid UTF-8 without
+/// control characters other than tab and CR?
+fn text_line(line: &[u8]) -> bool {
+    std::str::from_utf8(line).is_ok_and(|s| !s.chars().any(|c| c.is_control() && c != '\t' && c != '\r'))
+}
+
+/// The NUL-terminated lines of text in `data`, with their offsets, if such
+/// lines carry at least half of its non-NUL bytes. That is text whose lines
+/// are separated by NUL instead of newline, as in Vim's swap files
+/// (`.name.swp`: each line NUL-terminated, the lines of a block stored last
+/// to first, between binary headers and NUL padding), not code or
+/// compressed data, nor UTF-16 (whose "lines" are single characters, so
+/// only lines of 2 or more bytes count towards the share).
+fn nul_separated_lines(data: &[u8]) -> Option<Vec<(usize, &[u8])>> {
+    memchr::memchr(0, data)?;
+    let (mut lines, mut text, mut other) = (Vec::new(), 0usize, 0usize);
+    let mut start = 0;
+    for end in memchr::memchr_iter(0, data) {
+        let line = &data[start..end];
+        if !line.is_empty() {
+            if text_line(line) {
+                lines.push((start, line));
+                if line.len() >= 2 {
+                    text += line.len();
+                }
+            } else {
+                other += line.len();
+            }
+        }
+        start = end + 1;
+    }
+    other += data.len() - start;
+    (text > 0 && text >= other).then_some(lines)
+}
+
+/// Defence in depth for NUL-separated text ([`nul_separated_lines`]): its
+/// lines are searched again joined by newlines, in file order and in
+/// reverse (a Vim swap file stores the last line of a block first), so a
+/// PEM header followed by its key material, or a `KEY=value` line ended by
+/// NUL, is found. The joined text counts as binary data for the PEM rule
+/// (key material must follow the header), as the NUL-stripped pass does.
+/// Findings carry the line number of the line they start in.
+fn scan_nul_separated(data: &[u8]) -> Vec<Finding> {
+    let Some(lines) = nul_separated_lines(data) else { return Vec::new() };
+    let mut found = Vec::new();
+    let (mut lower, mut hits) = (Vec::new(), Vec::new());
+    for order in [false, true] {
+        let mut text = Vec::new();
+        // (offset in `text`, offset in `data`) of every line.
+        let mut starts = Vec::with_capacity(lines.len());
+        let mut push = |(at, line): &(usize, &[u8])| {
+            starts.push((text.len(), *at));
+            text.extend_from_slice(line);
+            text.push(b'\n');
+        };
+        match order {
+            false => lines.iter().for_each(&mut push),
+            true => lines.iter().rev().for_each(&mut push),
+        }
+        let mut start = 0;
+        while start < text.len() && found.len() < MAX_FINDINGS {
+            let end = (start + CHUNK).min(text.len());
+            let window = &text[start..(end + OVERLAP).min(text.len())];
+            hits.clear();
+            search_tokens(window, end - start, true, &mut hits);
+            lowercase_into(&mut lower, window);
+            search_assignments(window, &lower, end - start, &mut hits);
+            for h in hits.drain(..) {
+                let at = start + h.offset;
+                let i = starts.partition_point(|&(t, _)| t <= at) - 1;
+                let line = 1 + newlines(&data[..starts[i].1]);
+                let f = Finding { rule: h.rule, line, excerpt: h.excerpt };
+                if !found.contains(&f) {
+                    found.push(f);
+                }
+            }
+            start = end;
+        }
+    }
+    found
+}
+
 /// Scan file content for likely credentials.
 pub fn scan(data: &[u8]) -> Vec<Finding> {
     // Token rules over the raw bytes, in one go (offsets into `data`).
@@ -570,6 +660,10 @@ pub fn scan(data: &[u8]) -> Vec<Finding> {
         start = end;
     }
 
+    if hits.len() + stripped_found.len() < MAX_FINDINGS {
+        stripped_found.extend(scan_nul_separated(data));
+    }
+
     hits.sort_by_key(|h| h.offset);
     let (mut pos, mut line) = (0, 1);
     let mut found: Vec<Finding> = Vec::new();
@@ -592,6 +686,51 @@ pub fn scan(data: &[u8]) -> Vec<Finding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PEM: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACBGqZt3YkVvQ2mR8sXlN0pWcF4hTj7uK9eAoD1bLyS6xQAAAJgVb1oKFW9a
+-----END OPENSSH PRIVATE KEY-----
+";
+
+    /// A Vim-like swap file: a binary header block, then `text`'s lines
+    /// NUL-terminated, in file order or (as Vim stores them) last first.
+    fn swap(text: &str, reversed: bool) -> Vec<u8> {
+        let mut out = b"b0VIM 9.1".to_vec();
+        out.resize(1024, 0);
+        out.extend_from_slice(&[b't', b'p', 0, 0, 7, 0, 0, 0, 0x10, 0x20, 0, 0]);
+        out.resize(2048, 0);
+        let mut lines: Vec<&str> = text.lines().collect();
+        if reversed {
+            lines.reverse();
+        }
+        for l in lines {
+            out.extend_from_slice(l.as_bytes());
+            out.push(0);
+        }
+        out
+    }
+
+    #[test]
+    fn nul_separated_text_is_scanned() {
+        for reversed in [false, true] {
+            let f = scan(&swap(PEM, reversed));
+            assert!(f.iter().any(|f| f.rule == "private-key"), "reversed: {reversed}: {f:?}");
+            let f = scan(&swap("x = 1\nDB_PASSWORD=Xk9mQ2vL7pR4wZt8\n", reversed));
+            assert!(!f.is_empty(), "reversed: {reversed}");
+        }
+        // A PEM header in binary data still needs key material after it.
+        let f = scan(&swap("-----BEGIN RSA PRIVATE KEY-----\nPEM_read_bio\n", false));
+        assert!(f.is_empty(), "{f:?}");
+        assert!(scan(&swap("hello\nworld\n", true)).is_empty());
+        // Not NUL-separated text: code-like binary, and UTF-16.
+        let mut bin: Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        bin.extend_from_slice(b"short\0");
+        assert!(nul_separated_lines(&bin).is_none());
+        let utf16: Vec<u8> = "some text in UTF-16".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert!(nul_separated_lines(&utf16).is_none());
+        assert!(nul_separated_lines(b"no nul at all").is_none());
+    }
 
     #[test]
     fn detects_common_secrets() {

@@ -346,10 +346,12 @@ impl Ctx {
                 eprintln!("Updated {} files, removed {}", r.written, r.removed);
             }
             for p in &r.redacted {
+                let why = lookup(self.repo.store(), &to_snap.tree, p)?.and_then(|e| render::hidden_reason(&self.repo, &e));
                 eprintln!(
-                    "  {} {} (no key; left out of the working copy)",
+                    "  {} {} ({}; left out of the working copy)",
                     render::yellow("redacted"),
-                    safe(p.as_str())
+                    safe(p.as_str()),
+                    why.unwrap_or_else(|| "no key".into())
                 );
             }
             for p in &r.protected {
@@ -366,7 +368,7 @@ impl Ctx {
         // the next snapshot) which local files keep their protection.
         let policy_of = |t: &ObjectId| lookup(self.repo.store(), t, &VPath::new(POLICY_FILE).expect("valid"));
         if policy_of(&from)? != policy_of(&to_snap.tree)? {
-            render::print_policy_held_back(&self.repo.policy_held_back(&*self.fs)?);
+            render::print_policy_held_back(&self.repo.policy_held_back(&*self.fs)?, false);
         }
         if previous != target {
             eprintln!("Working copy now at: {}", render::one_line(&self.repo, &target));
