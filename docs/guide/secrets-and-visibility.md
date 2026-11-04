@@ -290,24 +290,44 @@ $ echo $?
 1
 ```
 
-`vl scan` needs a Veil repository, and a CI checkout from GitHub is a Git
-checkout. Create a throwaway one: `vl init` keeps the `.veilpolicy` that is
-checked out, and a temporary `VEIL_HOME` keeps the CI identity out of the
-way:
+### As a CI gate: `--policy-from`
+
+In CI, do **not** take the rules from the checkout you are scanning: the
+pull request that adds a leaked key can add `leak.js public!` (or
+`** public!`, or `leak.js cloak`) to its `.veilpolicy` in the same commit.
+`vl scan --policy-from FILE` takes its rules from FILE, a policy the pull
+request cannot edit (the base branch's), and disregards the checkout's
+own `.veilpolicy`. It needs no Veil repository (no `vl init`, no identity)
+and changes nothing on disk.
+
+A Git checkout publishes every file in it, whatever a policy says, so in
+this mode every file counts as public: only FILE's `public!` paths (your
+reviewed test fixtures) are exempt. `isolate`, `cloak` and `ignore` paths
+are scanned too; only `.git/` (and other VCS metadata) is skipped. A file
+that cannot be read fails the gate.
 
 ```sh
-export VEIL_HOME="$(mktemp -d)" VEIL_USER=ci
-vl init > /dev/null
-vl --no-snapshot scan
+# Pull requests: the base branch's policy (empty when it has none, which
+# means the built-in rules only).
+git fetch --depth=1 origin "$GITHUB_BASE_REF"
+git show FETCH_HEAD:.veilpolicy > "$RUNNER_TEMP/base.veilpolicy" 2>/dev/null \
+  || : > "$RUNNER_TEMP/base.veilpolicy"
+vl scan --policy-from "$RUNNER_TEMP/base.veilpolicy"
 ```
 
 ```text
 PUBLIC    leak.js:1  aws-access-key-id AKIA…(20 chars)
-found: 1 public file(s) contain secrets; they are quarantined from snapshots until cloaked, isolated or fixed
+found: 1 file(s) contain secrets (or could not be scanned); only the `public!` paths of base.veilpolicy may
 ```
 
-In a GitHub Actions step this fails the job on a hit. `vl init` in a Git
-checkout never records `.git/` (see the built-in rules above).
+In a GitHub Actions step this fails the job on a hit (exit 1; a missing
+FILE is an error and fails it too). For pushes to a protected branch, whose
+`.veilpolicy` was reviewed when it merged, `--policy-from .veilpolicy`
+works the same way.
+
+Plain `vl scan` (no `--policy-from`) applies the working copy's own
+policy, guarded by the policy you accepted on this device: right for your
+own working copy, not for a gate.
 
 ## The vault: `vl secret` and `vl run`
 
@@ -421,7 +441,7 @@ $ vl rebase -d main
 Rebased mykuvxmu c13e04ed (empty) (no description set)
 Updated 1 files, removed 0
   kept .env (local edit not in history, e.g. quarantined; left as is instead of being overwritten)
-warning: 1 local path(s) keep the protection you accepted: .veilpolicy would weaken it, and that change came from a merge, pull, checkout or undo rather than your own edit (.env (isolate → public!)). Review it with `vl policy show`; apply it with `vl policy accept`
+warning: 1 local path(s) keep the protection you accepted: .veilpolicy would weaken it, and that change came from a merge, pull, checkout, restore or undo (or a symlinked policy file) rather than your own edit (.env (isolate → public!)). Review it with `vl policy show`; apply it with `vl policy accept`
 
 $ vl status
 …
@@ -446,7 +466,29 @@ What counts as weakening: isolated → cloaked or public; cloaked → public or
 another scope; `public` → `public!`; un-ignoring a built-in secret. New
 `isolate` and `ignore` rules from others, and anything that strengthens
 protection, apply at once. The check covers every route a policy arrives
-by: merge, pull, checkout, rebase, Git import and undo.
+by: merge, pull, checkout (`vl new`, `vl edit`, `vl ws switch`), rebase,
+Git import, `vl restore [--from REV]`, undo and `vl op restore`. Only your
+own edit of the file (by hand, or with `vl cloak|isolate|expose|ignore`)
+applies at once; putting back another revision's policy with `vl restore`
+is not your edit.
+
+**The policy file itself never lowers protection** below the policy you
+accepted:
+
+* **Deleted:** your accepted policy still applies, and every command says
+  `.veilpolicy is missing`. `vl restore .veilpolicy` brings it back;
+  `vl policy accept` accepts having none.
+* **A symlink** (dotfiles managers, `stow`, a monorepo's shared policy):
+  Veil applies the rules of the file it points to (if its name says it is
+  a policy file: `.veilpolicy`, `dot_veilpolicy`, `team.veilpolicy`), but a change there is
+  never taken as your edit (it can come from a sync or a pull Veil does not
+  see): new protection applies at once, anything weaker waits for
+  `vl policy accept`. History keeps the recorded `.veilpolicy`, so
+  teammates do not get changes made through the link; replace it with a
+  copy to share them. `vl cloak` and friends refuse to write over the link.
+* **Unreadable, a directory, a dangling or looping link:** your accepted
+  policy applies as it is, every command warns `cannot read .veilpolicy`,
+  and `vl policy accept` refuses until you fix it.
 
 ## What is protected, and what isn't
 

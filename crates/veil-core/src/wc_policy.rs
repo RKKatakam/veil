@@ -23,10 +23,10 @@
 use std::sync::Arc;
 
 use crate::{
-    error::Result,
+    error::{Result, VeilError},
     id::ObjectId,
     object::is_reserved_name,
-    policy::{self, HeldBack, Policy, Tier, WorkingCopyPolicy, POLICY_FILE},
+    policy::{self, HeldBack, Policy, PolicyFile, Tier, WorkingCopyPolicy, POLICY_FILE},
     repo::Repo,
     vfs::{is_temp_name, NodeKind, StorageBackend},
     vpath::VPath,
@@ -42,7 +42,8 @@ impl Repo {
     /// The policy a snapshot of `fs` applies. `checked_out_from`: the tree
     /// `fs` was checked out from, when `fs` can only differ from it by the
     /// member's own edits (then an edit of `.veilpolicy` is theirs, and is
-    /// accepted).
+    /// accepted). `None` when anything else may have written `.veilpolicy`
+    /// since: a difference is then guarded like any incoming change.
     pub(crate) fn snapshot_policy(&self, fs: &dyn StorageBackend, checked_out_from: Option<&ObjectId>) -> Result<WorkingCopyPolicy> {
         if !self.is_own_working_copy(fs) {
             return Ok(WorkingCopyPolicy {
@@ -122,8 +123,16 @@ impl Repo {
     /// from the next snapshot on it applies in full. Returns the files whose
     /// protection this weakens (until now held back).
     pub fn accept_policy(&self, fs: &dyn StorageBackend) -> Result<Vec<HeldBack>> {
+        let text = match policy::read_policy_file(fs)? {
+            PolicyFile::File(t) | PolicyFile::Linked(t) => t,
+            PolicyFile::Absent => Vec::new(),
+            // Accepting "no policy" for a file that is there but cannot be
+            // read would lift every rule.
+            PolicyFile::Unavailable(why) => {
+                return Err(VeilError::Policy(format!("cannot accept {POLICY_FILE}: cannot read it ({why}); fix it first")))
+            }
+        };
         let held = self.policy_held_back(fs)?;
-        let text = fs.read_opt(&VPath::new(POLICY_FILE)?)?.unwrap_or_default();
         policy::save_accepted(&*self.backend, &text)?;
         Ok(held)
     }

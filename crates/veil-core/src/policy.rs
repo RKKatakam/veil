@@ -681,12 +681,16 @@ impl Policy {
         policy
     }
 
-    /// Load `.veilpolicy` from the root of a working copy.
+    /// Load `.veilpolicy` from the root of a tree or of a backend that is
+    /// not the member's working copy (a symlink is followed, see
+    /// [`read_policy_file`]). A policy file that cannot be read is an error:
+    /// without the accepted policy there is nothing safe to fall back to.
+    /// The member's own working copy goes through [`working_copy_policy`].
     pub fn load(fs: &dyn StorageBackend) -> Result<Policy> {
-        let path = VPath::new(POLICY_FILE)?;
-        Ok(match fs.read_opt(&path)? {
-            Some(b) => Self::parse(&String::from_utf8_lossy(&b)),
-            None => Self::builtin(),
+        Ok(match read_policy_file(fs)? {
+            PolicyFile::File(b) | PolicyFile::Linked(b) => Self::parse(&String::from_utf8_lossy(&b)),
+            PolicyFile::Absent => Self::builtin(),
+            PolicyFile::Unavailable(why) => return Err(VeilError::Policy(format!("cannot read {POLICY_FILE}: {why}"))),
         })
     }
 
@@ -1276,6 +1280,74 @@ fn fold_protection_only(accepted: &Policy, parent: &Policy, current: &Policy) ->
     out.iter().map(|l| format!("{l}\n")).collect()
 }
 
+// ---- reading the policy file ------------------------------------------------------
+
+/// The largest policy file read through a symlink (a regular `.veilpolicy`
+/// is read whatever its size, like any file of the working copy).
+pub const MAX_LINKED_POLICY: u64 = 1 << 20;
+
+/// What is at `.veilpolicy` in a working copy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PolicyFile {
+    /// Nothing.
+    Absent,
+    /// A regular file.
+    File(Vec<u8>),
+    /// A symlink (a dotfiles manager, `stow`, a monorepo's shared policy),
+    /// followed to the regular file it leads to, inside or outside the
+    /// repository. Its rules apply, but a change in it is never taken as
+    /// the member's own edit (see [`working_copy_policy`]): the target can
+    /// change by routes Veil does not see.
+    Linked(Vec<u8>),
+    /// Something that cannot be read as a policy (why): an unreadable file,
+    /// a directory, a dangling or looping symlink, a FIFO. Never "no
+    /// policy": snapshots fall back to the accepted policy.
+    Unavailable(String),
+}
+
+/// Read `.veilpolicy` at the root of `fs`. Errors reading it are reported
+/// as [`PolicyFile::Unavailable`], never propagated: nothing in the working
+/// copy may fail a snapshot.
+pub fn read_policy_file(fs: &dyn StorageBackend) -> Result<PolicyFile> {
+    let path = VPath::new(POLICY_FILE)?;
+    match fs.read_through_link(&path, MAX_LINKED_POLICY) {
+        // Only to a file whose name says it is a policy: a hostile Git
+        // checkout's `.veilpolicy -> /proc/self/environ` (or
+        // `~/.aws/credentials`) must not be parsed, and its lines echoed
+        // in warnings, by `vl init` in CI.
+        Ok(Some((target, _)))
+            if !std::path::Path::new(&target)
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().to_lowercase().contains("veilpolicy")) =>
+        {
+            return Ok(PolicyFile::Unavailable(format!(
+                "a symlink to {target}, whose name does not say it is a policy file; Veil only follows a link to a \
+                 file named like `.veilpolicy`"
+            )))
+        }
+        Ok(Some((_, b))) => return Ok(PolicyFile::Linked(b)),
+        Ok(None) => {}
+        Err(e) => return Ok(PolicyFile::Unavailable(e.to_string())),
+    }
+    Ok(match fs.metadata(&path) {
+        // Nothing, or something the backend cannot show (a symlink in a
+        // Git tree): its `read` says which.
+        Ok(None) => match fs.read_opt(&path) {
+            Ok(None) => PolicyFile::Absent,
+            Ok(Some(b)) => PolicyFile::File(b),
+            Err(e) => PolicyFile::Unavailable(e.to_string()),
+        },
+        Ok(Some(m)) if m.kind == crate::vfs::NodeKind::Dir => PolicyFile::Unavailable("it is a directory".into()),
+        Ok(Some(_)) => match fs.read(&path) {
+            Ok(b) => PolicyFile::File(b),
+            // Gone since `metadata`: a concurrent `rm`.
+            Err(e) if e.is_not_found() => PolicyFile::Absent,
+            Err(e) => PolicyFile::Unavailable(e.to_string()),
+        },
+        Err(e) => PolicyFile::Unavailable(e.to_string()),
+    })
+}
+
 // ---- the accepted policy of a working copy -------------------------------------
 
 /// Device-local copy of the `.veilpolicy` the member of this working copy
@@ -1325,22 +1397,79 @@ pub struct WorkingCopyPolicy {
 ///   only the `isolate`/`ignore` rules it adds are accepted, the rest waits
 ///   for `vl policy accept`, and the policy carries a warning saying so.
 ///   Pass `None` when it is not known that the working copy's file can
-///   only differ from that tree by a local edit.
+///   only differ from that tree by a local edit (a command wrote
+///   `.veilpolicy` from another revision, as `vl restore --from` does).
 ///
 /// Otherwise, notably when the policy came from someone else by any route,
 /// it is guarded until the member runs `vl policy accept`.
+///
+/// What is at `.veilpolicy` never makes a snapshot less protected than the
+/// accepted policy says ([`read_policy_file`]):
+/// * a **missing** file is not taken as the member's edit (deleting every
+///   rule at once is an accident far more often than a decision): the
+///   accepted policy guards the built-in rules until `vl policy accept`;
+/// * a **symlink** is followed, but a change in the file it leads to is
+///   never taken as the member's edit (a dotfiles sync or a monorepo pull
+///   changes it by routes Veil does not see): what weakens the accepted
+///   policy waits for `vl policy accept`;
+/// * an **unreadable** file, a directory, a dangling or looping symlink:
+///   the accepted policy applies as it is, with a warning, and nothing is
+///   accepted.
 pub fn working_copy_policy(
     local: &dyn StorageBackend,
     fs: &dyn StorageBackend,
     parent_policy: Option<Option<&[u8]>>,
 ) -> Result<WorkingCopyPolicy> {
-    let text = fs.read_opt(&VPath::new(POLICY_FILE)?)?.unwrap_or_default();
+    let acc = load_accepted(local)?;
+    let (text, own_edit) = match read_policy_file(fs)? {
+        PolicyFile::File(t) => (t, parent_policy),
+        PolicyFile::Linked(t) => {
+            let mut wp = guarded_policy(acc, t, None);
+            wp.policy.warnings.push(format!(
+                "{POLICY_FILE} is a symlink: Veil applies the rules of the file it leads to, but records no change \
+                 to it (history keeps the recorded version, so teammates do not get your edits), and a change there \
+                 that weakens the policy you accepted on this device waits for `vl policy accept`. Replace the link \
+                 with a copy to record and share the policy"
+            ));
+            return Ok(wp);
+        }
+        PolicyFile::Absent => {
+            let mut wp = guarded_policy(acc, Vec::new(), None);
+            if wp.policy.accepted().is_some_and(|a| !a.rule_lines().is_empty()) {
+                wp.policy.warnings.push(format!(
+                    "{POLICY_FILE} is missing: the policy you accepted on this device still applies (a deleted \
+                     policy file never lifts protection). `vl restore {POLICY_FILE}` brings it back; \
+                     `vl policy accept` accepts having none"
+                ));
+            }
+            return Ok(wp);
+        }
+        PolicyFile::Unavailable(why) => {
+            let (policy, what) = match (&acc, parent_policy) {
+                (Some(a), _) => (Policy::parse(&String::from_utf8_lossy(a)), "the policy you accepted on this device"),
+                (None, Some(Some(p))) => (Policy::parse(&String::from_utf8_lossy(p)), "the recorded version"),
+                (None, _) => (Policy::builtin(), "the built-in rules only"),
+            };
+            let mut policy = policy.unguarded();
+            policy.warnings.push(format!(
+                "cannot read {POLICY_FILE} ({why}); until it is fixed, snapshots apply {what}"
+            ));
+            return Ok(WorkingCopyPolicy { policy, accept: None });
+        }
+    };
+    Ok(guarded_policy(acc, text, own_edit))
+}
+
+/// [`working_copy_policy`] for a readable `.veilpolicy` (`text`; empty for
+/// none), the accepted policy `acc` and, when the member may have edited
+/// the file, the policy of the tree it was checked out from.
+fn guarded_policy(acc: Option<Vec<u8>>, text: Vec<u8>, parent_policy: Option<Option<&[u8]>>) -> WorkingCopyPolicy {
     let current = Policy::parse(&String::from_utf8_lossy(&text));
-    let Some(acc) = load_accepted(local)? else {
-        return Ok(WorkingCopyPolicy {
+    let Some(acc) = acc else {
+        return WorkingCopyPolicy {
             policy: current,
             accept: Some(text),
-        });
+        };
     };
     let accepted = Policy::parse(&String::from_utf8_lossy(&acc));
     let take_all = || WorkingCopyPolicy {
@@ -1348,12 +1477,12 @@ pub fn working_copy_policy(
         accept: (acc != text).then(|| text.clone()),
     };
     if current.same_rules(&accepted) || current.only_adds_protection_to(&accepted) {
-        return Ok(take_all());
+        return take_all();
     }
     let parent = parent_policy.map(|p| Policy::parse(&String::from_utf8_lossy(p.unwrap_or_default())));
     if let Some(parent) = parent.filter(|p| !p.same_rules(&current)) {
         if parent.same_rules(&accepted) {
-            return Ok(take_all());
+            return take_all();
         }
         // Folded already (a snapshot that saved the accepted policy but was
         // not recorded): the accepted policy says which edit it holds.
@@ -1378,15 +1507,15 @@ pub fn working_copy_policy(
                  protection you accepted (the `isolate`/`ignore` rules you added apply). Review with `vl policy show`"
             ));
         }
-        return Ok(WorkingCopyPolicy {
+        return WorkingCopyPolicy {
             policy,
             accept: pin.map(String::into_bytes),
-        });
+        };
     }
-    Ok(WorkingCopyPolicy {
+    WorkingCopyPolicy {
         policy: current.guarded_by(accepted),
         accept: None,
-    })
+    }
 }
 
 #[cfg(test)]

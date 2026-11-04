@@ -40,6 +40,12 @@ pub struct SnapshotOptions<'a> {
     /// (`vl expose`, `vl restore`, …) names its operation instead, so `vl
     /// undo` reverts that command.
     pub description: Option<String>,
+    /// A command wrote `.veilpolicy` into `fs` from another revision without
+    /// moving the working copy (`vl restore --from`): a difference from the
+    /// working copy's tree is then not the member's own edit, and is
+    /// guarded by the accepted policy like any incoming change (see
+    /// [`crate::policy::working_copy_policy`]).
+    pub policy_incoming: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -149,12 +155,14 @@ impl Repo {
             injected,
             materialised,
             description,
+            policy_incoming,
         } = opts;
         let mut tx = self.transaction(description.unwrap_or_else(|| snapshot_op_description(ws)))?;
         let wc_id = tx.view.workspace(ws)?.wc;
         let wc = tx.repo().snapshot(&wc_id)?;
-        // `fs` was checked out from `wc.tree`: a `.veilpolicy` edit is the member's.
-        let wp = tx.repo().snapshot_policy(fs, Some(&wc.tree))?;
+        // `fs` was checked out from `wc.tree`: a `.veilpolicy` edit is the
+        // member's, unless a command wrote it from elsewhere.
+        let wp = tx.repo().snapshot_policy(fs, (!policy_incoming).then_some(&wc.tree))?;
         let store = tx.repo().store.clone();
         let rescan = scanner_outdated(&*tx.repo().backend, ws)?;
         let (tree, report) = build_tree_cached(

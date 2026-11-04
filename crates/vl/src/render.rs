@@ -349,8 +349,8 @@ pub fn print_policy_held_back(held: &[HeldBack], own_edit_pending: bool) {
         list.push(format!("and {} more", held.len() - SHOWN));
     }
     let origin = match own_edit_pending {
-        false => "and that change came from a merge, pull, checkout or undo rather than your own edit",
-        true => "through a change from a merge, pull, checkout or undo that you have not accepted, or through your \
+        false => "and that change came from a merge, pull, checkout, restore or undo (or a symlinked policy file) rather than your own edit",
+        true => "through a change from a merge, pull, checkout, restore or undo that you have not accepted, or through your \
                  own edit, which waits for `vl policy accept` because it could not be applied without that change",
     };
     warn(&format!(

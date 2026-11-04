@@ -122,6 +122,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         Cmd::Man { out_dir } => cmd_man(out_dir.as_deref()),
         Cmd::Upgrade { dry_run, remote, force } => cmd_upgrade(cli.repository.as_deref(), *dry_run, remote.as_deref(), *force),
+        Cmd::Scan { policy_from: Some(file) } => cmd_scan_gate(cli.repository.as_deref(), file),
         _ => {
             let mut ctx = open(&cli)?;
             let code = dispatch(&mut ctx, &cli)?;
@@ -253,7 +254,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Expose { patterns, force } => cmd_policy_rules(ctx, patterns, Tier::Public, *force)?,
         Cmd::Ignore { patterns } => cmd_policy_rules(ctx, patterns, Tier::Ignored, false)?,
         Cmd::Policy(c) => cmd_policy(ctx, c)?,
-        Cmd::Scan => return cmd_scan(ctx),
+        Cmd::Scan { .. } => return cmd_scan(ctx),
         Cmd::Secret(c) => cmd_secret(ctx, c)?,
         Cmd::Run { command } => return cmd_run(ctx, command),
         Cmd::Scope(c) => cmd_scope(ctx, c)?,
@@ -311,7 +312,8 @@ fn cmd_init(path: Option<&Path>) -> Result<ExitCode> {
     let fs = Arc::new(DiskBackend::new(&root));
     let mut repo = Repo::init(fs.clone(), Some(identity.clone()), &user_for(&identity))?;
     let policy = VPath::new(POLICY_FILE)?;
-    if !fs.exists(&policy)? {
+    // Anything there (a symlinked or unreadable policy too) is kept.
+    if std::fs::symlink_metadata(root.join(POLICY_FILE)).is_err() {
         fs.write(&policy, DEFAULT_POLICY.as_bytes())?;
     }
     let out = repo.snapshot_workspace(DEFAULT_WORKSPACE, &*fs)?;
@@ -880,6 +882,7 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: &str) -> Result<()> {
     let wanted = |p: &VPath| filters.is_empty() || filters.iter().any(|f| p.starts_with(f));
     let mut n = 0;
     let mut done = std::collections::HashSet::new();
+    let policy_path = VPath::new(POLICY_FILE)?;
     for c in changes {
         if !wanted(&c.path) {
             continue;
@@ -905,6 +908,7 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: &str) -> Result<()> {
         if done.contains(&p) || !wanted(&p) {
             continue;
         }
+        done.insert(p.clone());
         if behind_special(&*ctx.fs, &p)? {
             skipped_special(&p);
             continue;
@@ -921,7 +925,15 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: &str) -> Result<()> {
     // A command of its own (not an automatic snapshot), so `vl undo` brings
     // the discarded edits back.
     let what = if paths.is_empty() { "everything".to_string() } else { paths.join(" ") };
-    ctx.snapshot_as(format!("restore {what} from {from}"))?;
+    let description = format!("restore {what} from {from}");
+    // A `.veilpolicy` put back from REV arrived from REV, not from the
+    // member's hand: it goes through the accepted policy like a pulled one.
+    // (`done` holds every path restore wrote or removed, or skipped.)
+    if done.contains(&policy_path) {
+        ctx.snapshot_as_incoming_policy(description)?;
+    } else {
+        ctx.snapshot_as(description)?;
+    }
     println!("Restored {n} path(s) from {}", one_line(&ctx.repo, &src));
     Ok(())
 }
@@ -1210,10 +1222,34 @@ fn not_a_member(ctx: &Ctx, scope: &str) -> Result<String> {
 }
 
 fn cmd_policy_rules(ctx: &mut Ctx, patterns: &[String], tier: Tier, force: bool) -> Result<()> {
+    use veil_core::policy::{read_policy_file, PolicyFile};
     let path = VPath::new(POLICY_FILE)?;
-    let mut text = match ctx.fs.read_opt(&path)? {
-        Some(b) => String::from_utf8_lossy(&b).into_owned(),
-        None => DEFAULT_POLICY.to_string(),
+    let mut text = match read_policy_file(&*ctx.fs)? {
+        PolicyFile::File(b) => String::from_utf8_lossy(&b).into_owned(),
+        // Writing would replace the link (and its rules) with a new file.
+        PolicyFile::Linked(_) => bail!(
+            "{POLICY_FILE} is a symlink; Veil reads its rules but never writes through or over it. Add the rule to \
+             the file it leads to, or replace the link with a copy"
+        ),
+        PolicyFile::Unavailable(why) => bail!("cannot read {POLICY_FILE} ({why}); fix it first"),
+        // Missing: start from the recorded version, so that adding one rule
+        // does not drop every other.
+        PolicyFile::Absent => {
+            // The working copy's snapshot has recorded the deletion already.
+            let wc = ctx.repo.snapshot(&ctx.wc()?)?;
+            let recorded = match lookup(ctx.repo.store(), &wc.tree, &path)? {
+                Some(e) => Some(e),
+                None => lookup(ctx.repo.store(), &ctx.repo.parents_tree(&wc.parents)?.tree, &path)?,
+            };
+            match recorded {
+                Some(e) => {
+                    let b = read_file(&ctx.repo, &path, &e)?;
+                    eprintln!("{} {POLICY_FILE} was missing; restored the recorded version", dim("note:"));
+                    String::from_utf8_lossy(&b).into_owned()
+                }
+                None => DEFAULT_POLICY.to_string(),
+            }
+        }
     };
     if !text.ends_with('\n') {
         text.push('\n');
@@ -1385,6 +1421,68 @@ fn cmd_scan(ctx: &mut Ctx) -> Result<ExitCode> {
         println!(
             "{} {exposed} public file(s) contain secrets; they are quarantined from snapshots until cloaked, isolated or fixed",
             red("found:")
+        );
+        Ok(ExitCode::from(1))
+    }
+}
+
+/// `vl scan --policy-from FILE`: the CI gate. It bypasses `Ctx::open` (no
+/// identity, no snapshot, no repository needed) and takes nothing from the
+/// scanned directory but its files: the rules come from FILE, a policy the
+/// pull request cannot edit. In a Git checkout every file is published by
+/// Git whatever a `.veilpolicy` says, so only FILE's `public!` paths are
+/// exempt; isolated, cloaked and ignored paths are scanned too, and only
+/// VCS metadata (`.git`, …) and `.veil/` are skipped.
+fn cmd_scan_gate(repo_arg: Option<&Path>, file: &Path) -> Result<ExitCode> {
+    let rules = std::fs::read(file).with_context(|| format!("reading the trusted policy {}", file.display()))?;
+    let policy = Policy::parse(&String::from_utf8_lossy(&rules));
+    for w in &policy.warnings {
+        warn_untrusted(&format!("{}: {w}", file.display()));
+    }
+    let start = match repo_arg {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir()?,
+    };
+    let root = ctx::find_root(&start).unwrap_or(start);
+    let fs = DiskBackend::new(&root);
+    let skip = |p: &VPath| {
+        p.as_str() == ".veil" || veil_core::policy::vcs_metadata_name(p.file_name()).is_some()
+    };
+    let mut exposed = 0;
+    for path in walk_files(&fs, &VPath::root(), &skip)? {
+        let class = policy.classify(&path, false);
+        if class.tier == Tier::Public && class.allow_secrets {
+            continue;
+        }
+        let data = match fs.read(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                println!("{} {}  cannot read it ({}); not scanned", red("UNREAD   "), safe(path.as_str()), safe(&e.to_string()));
+                exposed += 1;
+                continue;
+            }
+        };
+        let findings = secrets::scan(&data);
+        if findings.is_empty() {
+            continue;
+        }
+        let note = match &class.tier {
+            Tier::Public => String::new(),
+            _ => dim(&format!("  ({} by {}: in a checkout it is published anyway)", class.tier.label(), file.display())),
+        };
+        for f in &findings {
+            println!("{} {}:{}  {} {}{note}", red("PUBLIC   "), safe(path.as_str()), f.line, f.rule, dim(&safe(&f.excerpt)));
+        }
+        exposed += 1;
+    }
+    if exposed == 0 {
+        println!("{} no secrets outside the `public!` paths of {}", green("ok:"), file.display());
+        Ok(ExitCode::SUCCESS)
+    } else {
+        println!(
+            "{} {exposed} file(s) contain secrets (or could not be scanned); only the `public!` paths of {} may",
+            red("found:"),
+            file.display()
         );
         Ok(ExitCode::from(1))
     }

@@ -118,7 +118,6 @@ fn a_pulled_policy_is_held_back_after_a_rebase() {
 /// a seventh route, and "put files back as they are in REV" does not read
 /// as "and accept its policy".
 #[test]
-#[ignore = "BUG-101: `vl restore --from REV` accepts REV's .veilpolicy as the member's own edit, bypassing the policy pin"]
 fn restore_from_a_revision_does_not_accept_its_policy() {
     let env = Env::new();
     let proj = hostile_policy_on_main(&env);
@@ -295,7 +294,6 @@ fn project_with_cloaked_secret(env: &Env) -> std::path::PathBuf {
 /// the recorded version`, which says the opposite of what happens: the
 /// recorded *entry* is kept, the rules are not.
 #[test]
-#[ignore = "BUG-106: a symlinked .veilpolicy is ignored and previously cloaked files are re-recorded in plaintext"]
 fn a_symlinked_policy_file_still_applies() {
     let env = Env::new();
     let proj = project_with_cloaked_secret(&env);
@@ -323,7 +321,6 @@ fn a_symlinked_policy_file_still_applies() {
 /// `.veilpolicy`) every command fails, `vl ignore` and `vl status`
 /// included; only `--no-snapshot` gets through.
 #[test]
-#[ignore = "BUG-107: an unreadable (or directory) .veilpolicy makes every command fail"]
 fn an_unreadable_policy_file_does_not_brick_the_cli() {
     use std::os::unix::fs::PermissionsExt;
     let env = Env::new();
@@ -572,24 +569,57 @@ fn the_ci_scan_recipe_fails_on_a_leaked_key() {
 /// `ignore`) rules, so the same pull request that adds the leaked key can
 /// add `leak.js public!` (or `** public!`) next to it, and the gate
 /// reports `ok: no secrets in public files`. A CI scan whose rules come
-/// from the artefact it scans is not a gate; `vl scan` has no option to
-/// ignore `public!` or to require the policy from a trusted ref.
+/// from the artefact it scans is not a gate.
+///
+/// Fixed by changing the recipe (adapted from the original reproduction,
+/// which ran `vl init && vl --no-snapshot scan`): the gate is now
+/// `vl scan --policy-from <the base branch's .veilpolicy>`, which takes no
+/// rule from the scanned checkout. The attack is unchanged; the gate must
+/// fail with and without the `vl init` of the old recipe, and for every
+/// way the pull request's policy could try to exempt the file.
 #[test]
-#[ignore = "BUG-115: the CI recipe `vl init && vl --no-snapshot scan` is switched off by a `public!` rule in the scanned checkout's .veilpolicy"]
 fn the_ci_scan_recipe_cannot_be_switched_off_by_the_scanned_policy() {
+    for (n, rule) in ["leak.js public!", "** public!", "leak.js cloak", "leak.js isolate", "leak.js ignore"].iter().enumerate() {
+        for init in [false, true] {
+            let env = Env::new();
+            let co = env.dir("checkout");
+            write(&co, "README.md", "# project\n");
+            write(&co, "leak.js", "const k = \"AKIAIOSFODNN7EXAMPLE\";\n");
+            write(&co, ".veilpolicy", &format!("{rule}\n"));
+            // The base branch had no `.veilpolicy`: built-in rules only.
+            let base = env.root.join(format!("base-{n}.veilpolicy"));
+            std::fs::write(&base, "").unwrap();
+            if init {
+                env.ok("ci", &co, &["init"]);
+            }
+            let out = env.vl("ci", &co, &["--no-snapshot", "scan", "--policy-from", base.to_str().unwrap()]);
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "the scan passed with a leaked key, because the checkout's own policy says `{rule}` (init: {init}):\n{}",
+                text(&out)
+            );
+        }
+    }
+}
+
+/// Control for the gate: the base branch's own `public!` rules (reviewed
+/// test fixtures) still exempt what they name, and a clean checkout passes.
+#[test]
+fn the_ci_scan_gate_honours_the_base_branchs_public_bang_rules() {
     let env = Env::new();
     let co = env.dir("checkout");
     write(&co, "README.md", "# project\n");
-    write(&co, "leak.js", "const k = \"AKIAIOSFODNN7EXAMPLE\";\n");
-    write(&co, ".veilpolicy", "leak.js public!\n");
-    env.ok("ci", &co, &["init"]);
-    let out = env.vl("ci", &co, &["--no-snapshot", "scan"]);
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "the scan passed with a leaked key, because the checkout's own policy says so:\n{}",
-        text(&out)
-    );
+    write(&co, "fixtures/fake.js", "const k = \"AKIAIOSFODNN7EXAMPLE\";\n");
+    write(&co, ".git/config", "token = ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+    let base = env.root.join("base.veilpolicy");
+    std::fs::write(&base, "fixtures/ public!\n").unwrap();
+    let out = env.vl("ci", &co, &["scan", "--policy-from", base.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(!co.join(".veil").exists(), "the gate needs no repository and creates none");
+    // A missing trusted policy fails the job instead of scanning with nothing.
+    let out = env.vl("ci", &co, &["scan", "--policy-from", env.root.join("nope").to_str().unwrap()]);
+    assert!(!out.status.success(), "{}", text(&out));
 }
 
 // ---- undo reaching past commands that are not operations -------------------------

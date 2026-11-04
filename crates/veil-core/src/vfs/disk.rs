@@ -418,6 +418,53 @@ impl StorageBackend for DiskBackend {
         fs::read(&full).map_err(|e| read_err(&full, e))
     }
 
+    fn read_through_link(&self, path: &VPath, limit: u64) -> Result<Option<(String, Vec<u8>)>> {
+        use std::io::Read;
+        let full = self.full_path(path);
+        let refuse = |why: &str| VeilError::Io {
+            path: full.display().to_string(),
+            source: io::Error::other(why.to_string()),
+        };
+        match fs::symlink_metadata(&full) {
+            Ok(m) if m.file_type().is_symlink() => {}
+            Ok(m) if m.is_file() || m.is_dir() => return Ok(None),
+            Ok(_) => return Err(refuse("not a regular file (a FIFO, socket or device)")),
+            Err(_) => return Ok(None),
+        }
+        // Follows every link; a loop is ELOOP, a dangling link ENOENT. What
+        // is checked and read is the resolved path.
+        let resolved = fs::canonicalize(&full).map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => refuse("a symlink to a file that does not exist"),
+            _ => io_err(&full, e),
+        })?;
+        let target = fs::metadata(&resolved).map_err(|e| io_err(&resolved, e))?;
+        if !target.is_file() {
+            return Err(refuse("a symlink to something other than a regular file"));
+        }
+        if target.len() > limit {
+            return Err(refuse(&format!("a symlink to a file larger than {limit} bytes")));
+        }
+        // Non-blocking, so a FIFO swapped in after the check cannot hang
+        // the command; checked again on the open file.
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NONBLOCK);
+        }
+        let f = opts.open(&resolved).map_err(|e| read_err(&resolved, e))?;
+        if !f.metadata().map_err(|e| io_err(&full, e))?.is_file() {
+            return Err(refuse("a symlink to something other than a regular file"));
+        }
+        let mut data = Vec::new();
+        f.take(limit + 1).read_to_end(&mut data).map_err(|e| io_err(&full, e))?;
+        if data.len() as u64 > limit {
+            return Err(refuse(&format!("a symlink to a file larger than {limit} bytes")));
+        }
+        Ok(Some((resolved.display().to_string(), data)))
+    }
+
     fn read_range(&self, path: &VPath, offset: u64, len: usize) -> Result<Vec<u8>> {
         use std::io::{Read, Seek, SeekFrom};
         let full = self.full_path(path);

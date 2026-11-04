@@ -275,7 +275,18 @@ pub enum Cmd {
     #[command(subcommand)]
     Policy(PolicyCmd),
     /// Scan the working copy for secrets that would become public.
-    Scan,
+    ///
+    /// With `--policy-from`, scan as a CI gate on a checkout (no Veil
+    /// repository needed): every file counts as public, because a Git
+    /// checkout publishes all of them, except what FILE marks `public!`.
+    Scan {
+        /// CI gate: take the rules from FILE (the base branch's
+        /// `.veilpolicy`, e.g. from `git show`; an empty file for the
+        /// built-in rules only) and disregard the scanned directory's own
+        /// `.veilpolicy`, so a pull request cannot switch the scan off.
+        #[arg(long, value_name = "FILE")]
+        policy_from: Option<PathBuf>,
+    },
 
     // ---- secrets & identities ---------------------------------------------
     /// Device-local encrypted secret vault.

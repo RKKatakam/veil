@@ -29,7 +29,7 @@ such as `*.pem`. It has no effect, and the warning repeats on every command
 **until you delete the rule from `.veilpolicy`**, even if a later `public!`
 rule now applies. Use `vl undo` right after `vl expose`, or edit the file.
 
-### `warning: N local path(s) keep the protection you accepted: .veilpolicy would weaken it, and that change came from a merge, pull, checkout or undo rather than your own edit (…)`
+### `warning: N local path(s) keep the protection you accepted: .veilpolicy would weaken it, and that change came from a merge, pull, checkout, restore or undo (or a symlinked policy file) rather than your own edit (…)`
 
 Someone else's `.veilpolicy` change would publish, uncloak or stop scanning
 one of your local files. Your files keep their protection. Review with
@@ -42,6 +42,27 @@ change … that you have not accepted, or through your own edit", you edited
 `.veilpolicy` on top of such a change and your edit could not be applied
 without it (the warning before it says why). `vl policy show` lists both;
 `vl policy accept` applies the file as it is.
+
+### `warning: .veilpolicy is missing: the policy you accepted on this device still applies …`
+
+`.veilpolicy` was deleted (or a change you pulled deleted it). Deleting it
+never lifts protection. `vl restore .veilpolicy` brings it back;
+`vl policy accept` accepts having no policy.
+
+### `warning: .veilpolicy is a symlink: Veil applies the rules of the file it leads to …`
+
+Veil follows the link, but records no change to it, and a change in the
+target that weakens what you accepted waits for `vl policy accept`. Replace
+the link with a copy (`cp --remove-destination "$(readlink .veilpolicy)" .veilpolicy`)
+to record and share the policy.
+
+### `warning: cannot read .veilpolicy (…); until it is fixed, snapshots apply the policy you accepted on this device`
+
+`.veilpolicy` is unreadable (permissions), a directory, a symlink that
+dangles or loops, or a symlink to a file whose name does not contain
+`veilpolicy` (Veil never parses an arbitrary file as a policy). Commands go on under the policy you accepted; fix the
+file (`chmod 644 .veilpolicy`). `vl policy accept` and `vl cloak` refuse
+until then.
 
 ### `warning: N matching file(s) already exist in plaintext in earlier snapshots (e.g. X). New snapshots are protected; rotate any secrets they contain.`
 

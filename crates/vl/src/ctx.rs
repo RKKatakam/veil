@@ -203,7 +203,7 @@ impl Ctx {
 
     /// Record the project directory into the attached workspace.
     pub fn snapshot(&mut self) -> Result<()> {
-        self.record(None)
+        self.record(None, false)
     }
 
     /// Record the project directory as operation `description`: for commands
@@ -211,10 +211,17 @@ impl Ctx {
     /// so that `vl undo` reverts them instead of skipping them as the
     /// user's uncommitted edits.
     pub fn snapshot_as(&mut self, description: String) -> Result<()> {
-        self.record(Some(description))
+        self.record(Some(description), false)
     }
 
-    fn record(&mut self, description: Option<String>) -> Result<()> {
+    /// [`Ctx::snapshot_as`] after the command wrote `.veilpolicy` from
+    /// another revision (`vl restore --from`): it is guarded by the accepted
+    /// policy like any incoming change, never taken as the member's edit.
+    pub fn snapshot_as_incoming_policy(&mut self, description: String) -> Result<()> {
+        self.record(Some(description), true)
+    }
+
+    fn record(&mut self, description: Option<String>, policy_incoming: bool) -> Result<()> {
         let view_wc = self.wc()?;
         let disk = self.fs.clone();
         let fs: &dyn StorageBackend = &*disk;
@@ -274,6 +281,7 @@ impl Ctx {
                 cache: Some(&mut self.cache),
                 materialised: Some(&self.checkout.materialised),
                 description,
+                policy_incoming,
                 ..Default::default()
             },
         )?;
@@ -422,7 +430,8 @@ pub fn print_working_copy_warnings(r: &BuildReport) {
             "skipped {name}: the file name is not valid UTF-8, so Veil cannot record it. Rename it to keep it under version control"
         ));
     }
-    for p in &r.shadowed {
+    // A symlinked `.veilpolicy` is followed: its policy warning says so.
+    for p in r.shadowed.iter().filter(|p| p.as_str() != POLICY_FILE) {
         warn_untrusted(&format!(
             "{p} is tracked but is now a symlink or special file; Veil never follows it and keeps the recorded version"
         ));
