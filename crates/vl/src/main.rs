@@ -27,6 +27,7 @@ mod doctor;
 mod docgen;
 mod render;
 mod sandbox;
+mod serve;
 
 use std::{
     io::{IsTerminal, Read, Write},
@@ -92,13 +93,7 @@ fn main() -> ExitCode {
             let message = format!("{e:#}");
             // Errors may quote repository data (names, paths): escape them.
             eprintln!("{} {}", red("error:"), safe(&message));
-            let hint = e
-                .chain()
-                .any(|c| matches!(c.downcast_ref::<veil_core::VeilError>(), Some(veil_core::VeilError::NameCollision(_))))
-                .then_some(
-                    "the repository already moved to that snapshot. To work here meanwhile, move the working copy \
-                     back without touching files: `vl --no-snapshot undo` (or `vl --no-snapshot edit <rev>`)",
-                );
+            let hint = error_hint(&e);
             if let Some(h) = hint {
                 eprintln!("{} {h}", yellow("hint:"));
             }
@@ -111,6 +106,17 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     })
+}
+
+/// The `hint:` printed after an error, if it has one (also the `hint` of
+/// its `veil.error/1` document, on the command line and over `vl serve`).
+fn error_hint(e: &anyhow::Error) -> Option<&'static str> {
+    e.chain()
+        .any(|c| matches!(c.downcast_ref::<veil_core::VeilError>(), Some(veil_core::VeilError::NameCollision(_))))
+        .then_some(
+            "the repository already moved to that snapshot. To work here meanwhile, move the working copy \
+             back without touching files: `vl --no-snapshot undo` (or `vl --no-snapshot edit <rev>`)",
+        )
 }
 
 fn open(cli: &Cli) -> Result<Ctx> {
@@ -131,20 +137,30 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Man { out_dir } => cmd_man(out_dir.as_deref()),
         Cmd::Upgrade { dry_run, remote, force } => cmd_upgrade(cli.repository.as_deref(), *dry_run, remote.as_deref(), *force),
         Cmd::Scan { policy_from: Some(file), out } => cmd_scan_gate(cli.repository.as_deref(), file, out.json),
+        // Bypasses `Ctx::open` too: the server opens the repository afresh
+        // for every request.
+        Cmd::Serve { call: Some(method), params, .. } => serve::call(cli.repository.as_deref(), method, params.as_deref()),
+        Cmd::Serve { .. } => serve::run(cli.repository.as_deref(), !cli.no_snapshot),
         _ => {
             let mut ctx = open(&cli)?;
-            if ctx.bare && !runs_in_a_bare_repository(&cli.cmd) {
-                bail!(
-                    "{} is a bare repository (a remote): it has no working copy. Here `vl -R` runs only \
-                     `log`, `show`, `tag list`, `op log`, `gc` and `fsck`",
-                    ctx.root.display()
-                );
-            }
+            refuse_bare(&ctx, runs_in_a_bare_repository(&cli.cmd))?;
             let code = dispatch(&mut ctx, &cli)?;
             ctx.finish()?;
             Ok(code)
         }
     }
+}
+
+/// Refuse a command that needs a working copy in a bare repository.
+fn refuse_bare(ctx: &Ctx, runs_bare: bool) -> Result<()> {
+    if ctx.bare && !runs_bare {
+        bail!(
+            "{} is a bare repository (a remote): it has no working copy. Here `vl -R` runs only \
+             `log`, `show`, `tag list`, `op log`, `gc` and `fsck`",
+            ctx.root.display()
+        );
+    }
+    Ok(())
 }
 
 /// The commands that work in a bare repository (BUG-284): they read
@@ -165,7 +181,8 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         | Cmd::Doctor { .. }
         | Cmd::Completions { .. }
         | Cmd::Man { .. }
-        | Cmd::Upgrade { .. } => unreachable!(),
+        | Cmd::Upgrade { .. }
+        | Cmd::Serve { .. } => unreachable!(),
         // The read commands: a structured result (`api`), shown as text or
         // as one JSON document.
         Cmd::Status { out } => match out.json {
@@ -222,25 +239,18 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
                 cur = s.predecessors.first().copied();
             }
         }
+        // Shared with `vl serve --local` (`api`, write methods).
         Cmd::Describe { rev, message } => {
-            let id = ctx.rev(rev)?;
-            let new = ctx.repo.describe(id, message)?;
-            println!("Described {}", one_line(&ctx.repo, &new));
+            let d = api::describe(ctx, rev, message)?;
+            println!("Described {}", one_line(&ctx.repo, &d.id));
         }
         Cmd::New { revs, message } => {
-            let parents = if revs.is_empty() {
-                vec![ctx.wc()?]
-            } else {
-                revs.iter().map(|r| ctx.rev(r)).collect::<Result<_>>()?
-            };
-            let ws = ctx.ws.clone();
-            ctx.repo.new_change(&ws, parents, message)?;
+            api::new_change(ctx, revs, message)?;
         }
         Cmd::Commit { message, no_advance } => {
-            let ws = ctx.ws.clone();
-            let r = ctx.repo.commit(&ws, message, !*no_advance)?;
-            println!("Committed {}", one_line(&ctx.repo, &r.committed));
-            print_tags_kept(&ctx.repo, &r);
+            let c = api::commit(ctx, message, !*no_advance)?;
+            println!("Committed {}", one_line(&ctx.repo, &c.result.committed));
+            print_tags_kept(&ctx.repo, &c.result);
         }
         Cmd::Edit { rev } => {
             let id = ctx.rev(rev)?;
@@ -1496,23 +1506,28 @@ fn scan_status(scan: &api::Scan) -> ExitCode {
 /// exempt; isolated, cloaked and ignored paths are scanned too, and only
 /// VCS metadata (`.git`, …) and `.veil/` are skipped.
 fn cmd_scan_gate(repo_arg: Option<&Path>, file: &Path, json: bool) -> Result<ExitCode> {
-    let rules = std::fs::read(file).with_context(|| format!("reading the trusted policy {}", file.display()))?;
-    let policy = Policy::parse(&String::from_utf8_lossy(&rules));
-    for w in &policy.warnings {
-        warn_untrusted(&format!("{}: {w}", file.display()));
-    }
     let start = match repo_arg {
         Some(p) => p.to_path_buf(),
         None => std::env::current_dir()?,
     };
     let root = ctx::find_root(&start).unwrap_or(start);
-    let fs = DiskBackend::new(&root);
-    let scan = api::scan_gate(&fs, &policy, &file.display().to_string())?;
+    let scan = scan_gate(&root, file, &file.display().to_string())?;
     match json {
         true => api::emit_json(&scan)?,
         false => api::text::scan(&scan),
     }
     Ok(scan_status(&scan))
+}
+
+/// The gate scan of the files under `root`, with the rules of `file`
+/// (shown as `shown`). Shared with `vl serve --local`.
+fn scan_gate(root: &Path, file: &Path, shown: &str) -> Result<api::Scan> {
+    let rules = std::fs::read(file).with_context(|| format!("reading the trusted policy {shown}"))?;
+    let policy = Policy::parse(&String::from_utf8_lossy(&rules));
+    for w in &policy.warnings {
+        warn_untrusted(&format!("{shown}: {w}"));
+    }
+    api::scan_gate(&DiskBackend::new(root), &policy, shown)
 }
 
 // ---- secrets & identities ------------------------------------------------
@@ -1967,27 +1982,37 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// One tick of `vl watch` (and of a `vl serve` watch with
+/// `working_copy`): snapshot the directory, unless another command moved
+/// the working copy and may still be checking it out. `false` if it yielded.
+fn watch_step(ctx: &mut Ctx, behind_since: &mut Option<std::time::Instant>, interval_ms: u64) -> Result<bool> {
+    // Another command may have moved the working copy since the last
+    // tick: never judge the directory against a pointer read earlier
+    // (BUG-117).
+    ctx.refresh()?;
+    if ctx.behind()? {
+        // That command may still be checking the directory out. Leave it
+        // alone; only if it stays behind (the command died) recover it
+        // as any command would.
+        let since = *behind_since.get_or_insert_with(std::time::Instant::now);
+        if since.elapsed() < ctx::WATCH_YIELD.max(Duration::from_millis(interval_ms.saturating_mul(2))) {
+            return Ok(false);
+        }
+    }
+    *behind_since = None;
+    ctx.snapshot()?;
+    Ok(true)
+}
+
 fn cmd_watch(ctx: &mut Ctx, interval_ms: u64) -> Result<()> {
     eprintln!("Watching {} (Ctrl-C to stop)", ctx.root.display());
     let mut last = ctx.wc()?;
     let mut behind_since: Option<std::time::Instant> = None;
     loop {
         std::thread::sleep(Duration::from_millis(interval_ms));
-        // Another command may have moved the working copy since the last
-        // tick: never judge the directory against a pointer read earlier
-        // (BUG-117).
-        ctx.refresh()?;
-        if ctx.behind()? {
-            // That command may still be checking the directory out. Leave it
-            // alone; only if it stays behind (the command died) recover it
-            // as any command would.
-            let since = *behind_since.get_or_insert_with(std::time::Instant::now);
-            if since.elapsed() < ctx::WATCH_YIELD.max(Duration::from_millis(interval_ms.saturating_mul(2))) {
-                continue;
-            }
+        if !watch_step(ctx, &mut behind_since, interval_ms)? {
+            continue;
         }
-        behind_since = None;
-        ctx.snapshot()?;
         let now = ctx.wc()?;
         if now != last {
             println!("{}  snapshot {}", dim(&fmt_time(now_millis())), one_line(&ctx.repo, &now));

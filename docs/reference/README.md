@@ -62,6 +62,7 @@ Global options (accepted by every command):
 | [`vl undo`](undo.md) | Undo the last operation; run again to go further back |
 | [`vl redo`](redo.md) | Re-apply what the latest `vl undo` took back |
 | [`vl watch`](watch.md) | Snapshot continuously as files change |
+| [`vl serve`](serve.md) | Serve this repository to editors and agents over a local socket |
 | [`vl remote`](remote.md) | Manage remotes |
 | [`vl push`](push.md) | Send tags and their history to a remote (visibility-filtered) |
 | [`vl pull`](pull.md) | Fetch tags and history from a remote |

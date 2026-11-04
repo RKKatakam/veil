@@ -1,5 +1,5 @@
 //! Structured results of the read commands, shared by their text output,
-//! their `--json` output and (later) `vl serve --local`.
+//! their `--json` output and `vl serve --local` (`crate::serve`).
 //!
 //! Every read command is split in two: a function here computes a typed
 //! result from the repository context and prints nothing, and a renderer
@@ -51,6 +51,10 @@ pub const OP_LOG_SCHEMA: &str = "veil.op.log/1";
 pub const SCAN_SCHEMA: &str = "veil.scan/1";
 pub const SECRET_LIST_SCHEMA: &str = "veil.secret.list/1";
 pub const ERROR_SCHEMA: &str = "veil.error/1";
+pub const SNAPSHOT_SCHEMA: &str = "veil.snapshot/1";
+pub const DESCRIBE_SCHEMA: &str = "veil.describe/1";
+pub const NEW_SCHEMA: &str = "veil.new/1";
+pub const COMMIT_SCHEMA: &str = "veil.commit/1";
 
 // ---- JSON output -------------------------------------------------------------
 
@@ -1213,6 +1217,119 @@ pub fn scan_gate(fs: &dyn StorageBackend, policy: &Policy, policy_from: &str) ->
         exposed,
         protected: 0,
         clean: exposed == 0,
+    })
+}
+
+// ---- the write methods of `vl serve --local` ----------------------------------------
+//
+// `vl describe`, `vl new` and `vl commit` call these too, so the CLI and the
+// server make the same calls under the same repository lock (each `Repo`
+// method is one transaction) and record the same operations. Their results
+// are documented in `docs/reference/json-rpc.md`; the CLI prints text.
+
+/// The operation a write ended at (the head of the operation log).
+#[derive(Serialize, Debug, Clone)]
+pub struct OpRef {
+    pub op_id: String,
+    pub op_short: String,
+}
+
+pub fn op_ref(repo: &Repo) -> OpRef {
+    let id = repo.op_id();
+    OpRef { op_id: id.hex(), op_short: id.short() }
+}
+
+/// `snapshot` (`veil.snapshot/1`): the working copy was recorded.
+#[derive(Serialize, Debug)]
+pub struct Recorded {
+    pub schema: &'static str,
+    pub working_copy: SnapshotRef,
+    pub operation: OpRef,
+}
+
+/// The result of the automatic snapshot every command starts with.
+pub fn recorded(ctx: &Ctx) -> Result<Recorded> {
+    Ok(Recorded { schema: SNAPSHOT_SCHEMA, working_copy: snapshot_ref(&ctx.repo, &ctx.wc()?), operation: op_ref(&ctx.repo) })
+}
+
+/// `vl describe` (`veil.describe/1`).
+#[derive(Serialize, Debug)]
+pub struct Described {
+    pub schema: &'static str,
+    /// The change with its new description (a new snapshot of it).
+    pub described: SnapshotRef,
+    pub operation: OpRef,
+    #[serde(skip)]
+    pub(crate) id: ObjectId,
+}
+
+pub fn describe(ctx: &mut Ctx, rev: &str, message: &str) -> Result<Described> {
+    let id = ctx.rev(rev)?;
+    let new = ctx.repo.describe(id, message)?;
+    Ok(Described { schema: DESCRIBE_SCHEMA, described: snapshot_ref(&ctx.repo, &new), operation: op_ref(&ctx.repo), id: new })
+}
+
+/// `vl new` (`veil.new/1`).
+#[derive(Serialize, Debug)]
+pub struct NewChange {
+    pub schema: &'static str,
+    /// The new change, now the working copy.
+    pub working_copy: SnapshotRef,
+    pub operation: OpRef,
+}
+
+pub fn new_change(ctx: &mut Ctx, revs: &[String], message: &str) -> Result<NewChange> {
+    let parents = if revs.is_empty() { vec![ctx.wc()?] } else { revs.iter().map(|r| ctx.rev(r)).collect::<Result<_>>()? };
+    let ws = ctx.ws.clone();
+    let id = ctx.repo.new_change(&ws, parents, message)?;
+    Ok(NewChange { schema: NEW_SCHEMA, working_copy: snapshot_ref(&ctx.repo, &id), operation: op_ref(&ctx.repo) })
+}
+
+/// `vl commit` (`veil.commit/1`).
+#[derive(Serialize)]
+pub struct Committed {
+    pub schema: &'static str,
+    pub committed: SnapshotRef,
+    /// The new, empty working-copy change on top of it.
+    pub working_copy: SnapshotRef,
+    /// Tags that moved from the parent to the committed change.
+    pub advanced: Vec<String>,
+    /// Tags at the parent that stayed.
+    pub kept: Vec<KeptTag>,
+    pub operation: OpRef,
+    #[serde(skip)]
+    pub(crate) result: veil_core::commands::CommitResult,
+}
+
+#[derive(Serialize, Debug)]
+pub struct KeptTag {
+    pub name: String,
+    /// `cloaked_line` (a commit on a line cloaked for `scope` never moves
+    /// an uncloaked tag) or `no_advance`.
+    pub reason: &'static str,
+    pub scope: Option<String>,
+}
+
+pub fn commit(ctx: &mut Ctx, message: &str, advance: bool) -> Result<Committed> {
+    use veil_core::commands::TagKept;
+    let ws = ctx.ws.clone();
+    let r = ctx.repo.commit(&ws, message, advance)?;
+    let repo = &ctx.repo;
+    Ok(Committed {
+        schema: COMMIT_SCHEMA,
+        committed: snapshot_ref(repo, &r.committed),
+        working_copy: snapshot_ref(repo, &r.wc),
+        advanced: r.advanced.clone(),
+        kept: r
+            .kept
+            .iter()
+            .map(|(name, why)| match why {
+                TagKept::CloakedLine(s) => KeptTag { name: name.clone(), reason: "cloaked_line", scope: Some(s.clone()) },
+                TagKept::NoAdvance => KeptTag { name: name.clone(), reason: "no_advance", scope: None },
+            })
+            .collect(),
+        operation: op_ref(repo),
+        result: r,
     })
 }
 

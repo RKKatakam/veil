@@ -22,7 +22,7 @@ clap_mangen.workspace = true
 diffy = { workspace = true }
 hex.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

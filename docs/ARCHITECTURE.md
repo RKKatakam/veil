@@ -1049,7 +1049,14 @@ A workspace is only a named pointer in the view. It owns no directory.
   process moved the workspace between the session's look and the
   snapshot's transaction, nothing is recorded and the session looks again,
   so a directory is never recorded into a working copy it was not checked
-  out from.
+  out from. Looking again re-reads the checkout record too (BUG-362).
+  A view that moved *with* the directory is not a stale directory: another
+  command recorded it (or moved `@` to the same tree, `commit`, `new`) and
+  has not rewritten `checkout.json` yet. `Ctx::directory_holds` checks that
+  every change from the recorded snapshot to `@` is already on disk; if so
+  the directory is taken to hold `@` and edits are recorded into it,
+  instead of being moved into a side change and out of the directory
+  (BUG-361).
 * **Moving the directory is journalled** (`working_copy.rs`,
   `Repo::move_working_copy`). Before checkout touches a file, the target
   workspace and snapshot are written to `checkout.json` as `pending`;
@@ -2078,7 +2085,7 @@ The read commands (`status`, `log`, `diff`, `show`, `workspace list`,
 * **A function in `api`** takes the repository context (`&Ctx`, or `&Repo`
   where nothing else is needed) and returns a typed result: plain Rust
   structs deriving `serde::Serialize`. It prints nothing. `vl serve --local`
-  is meant to call exactly these functions.
+  calls exactly these functions (section 13).
 * **A renderer** turns the result into text (`api::text`, the output the
   commands always had, byte for byte; `render::one_line` delegates to it) or
   into one JSON document (`api::emit_json`) when `--json` is given.
@@ -2112,6 +2119,88 @@ a key is missing from `json.md`. A failure under `--json` prints a
 `veil.error/1` document on stdout too, unless the command had already
 printed its own (`api::json_emitted`), so stdout carries at most one
 document; clap's usage errors (exit 2) stay text.
+
+## 13. The local server (`vl serve --local`, `crates/vl/src/serve.rs`)
+
+A long-running process that serves one repository to editors and agents
+over a Unix socket, `.veil/local/sock`, in newline-delimited JSON-RPC 2.0
+(the contract: `docs/reference/json-rpc.md`).
+
+**One code path with the CLI.** A read method builds its result with the
+same `api` function `vl <command> --json` calls and serialises it with the
+same writer (`api::to_json`), so a result is the CLI's line byte for byte;
+`serve_cli.rs` compares them for every read command and every revision, as
+a member and as a non-member. The write methods (`snapshot`, `describe`,
+`new`, `commit`) are `api::recorded`, `api::describe`, `api::new_change`
+and `api::commit`, which `vl describe`, `vl new` and `vl commit` call too.
+Each calls one `Repo` method, i.e. one transaction under the repository
+lock, so the server takes the lock exactly as the command does and records
+the same operation (`vl undo`, `vl op restore` work on it). Server-only
+glue reuses `main.rs`: the bare-repository refusal, the gate scan, the error
+hint, and the `vl watch` tick.
+
+**No state between requests.** Each request runs `Ctx::open` on the
+repository root, exactly as a `vl` process does (identity, view, checkout
+record, stat cache, embargo auto-release, the automatic snapshot), then
+`Ctx::finish` if it snapshotted or wrote. Nothing is cached, so no request
+can see a view older than the last operation that finished before it, and
+the lock is never held between requests. Within the server, requests that
+touch the working copy are serialised by a mutex (two in-process snapshots
+racing would only retry, but the checkout record is read-modify-write);
+reads with `"snapshot": false` skip both the snapshot and `finish`, never
+write, and run in parallel. Against other processes the server is just
+another `vl`.
+
+**Access control** has three layers, each sufficient against another local
+user:
+
+1. `.veil/local` is opened with `O_DIRECTORY | O_NOFOLLOW`, must belong to
+   the user (and so must `.veil`), and is made `0700`.
+2. The socket is bound under `umask 0177` (no moment where it is wider than
+   `0600`). It is bound and probed by its relative name after `fchdir` into
+   the checked directory descriptor, which also lifts the ~104-byte limit on
+   socket paths; this happens before any thread starts (the client is
+   single-threaded).
+3. Each accepted connection's peer credentials (`SO_PEERCRED` on Linux,
+   `getpeereid` on macOS) must name the server's effective uid; others are
+   closed unanswered. The client checks the server's credentials the same
+   way, so it never sends a commit message to someone else's socket.
+
+**Confidentiality** is the CLI's: the server answers as the user who
+started it, through the same functions, so redactions, hidden descriptions
+and the absence of secret values carry over unchanged (section 12). No
+parameter is a path except `scan`'s `policy_from`, which is canonicalised
+and must lie inside the repository, outside `.veil/`; nothing runs a
+program.
+
+**Limits.** A request line is read up to 1 MiB without buffering more
+(`read_line`); a longer one is refused and the connection closed (after a
+short drain, so the close does not reset the connection before the client
+reads the error). At most 32 clients, 64 requests per batch; a client that
+does not read its answers for 60 s is dropped; JSON nesting is bounded by
+`serde_json`'s recursion limit. A panic in a request is caught and answered
+as an internal error.
+
+**Lifetime.** The server holds an exclusive `flock` on
+`.veil/local/serve.lock` for its life, so a second server refuses to start,
+and a socket found at start-up is necessarily a dead server's: it is
+removed if it is a socket nobody accepts on, and anything else at that path
+is left alone. SIGINT, SIGTERM and SIGHUP write to a self-pipe watched by
+the accept loop's `poll`; the server then stops accepting, unlinks the
+socket if it is still the inode it bound, and waits up to 30 s for requests
+in flight. It also exits if its socket disappears (the repository was
+deleted).
+
+**Notifications.** `watch` starts a thread per subscribed connection that
+polls the operation head (one small file read) every `interval_ms` and
+sends `changed` with the new head's `op.log` entry. With `working_copy` it
+first runs the `vl watch` tick (snapshot, yielding to a command that is
+checking the directory out), under the server's working-copy mutex. There
+is no filesystem notification (inotify, FSEvents); a saved file is seen at
+the next snapshot.
+
+**Not served** (future work): `vl ws exec` and `vl run` (they run
+programs), push/pull, and filesystem-event based notifications.
 
 ## Threat model
 

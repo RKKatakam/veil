@@ -20,6 +20,7 @@ trimmed where marked (`…`); some paths and host names were shortened
 | 8. [Maintenance](maintenance.md) | Housekeeping: `gc`, `fsck`, `doctor`, `upgrade`, backups, recovery |
 | 9. [Troubleshooting and FAQ](troubleshooting.md) | A command printed a warning or an error you want explained |
 | 10. [Scripting with `--json`](scripting.md) | An editor, CI job, agent or script needs `vl`'s output as data |
+| 11. [Editors and agents](editors-and-agents.md) | An editor or agent talks to Veil all the time and should keep one connection open (`vl serve --local`) |
 
 The [command reference](../reference/README.md) lists every command and
 flag. It is generated from `vl` itself and cannot drift from it.

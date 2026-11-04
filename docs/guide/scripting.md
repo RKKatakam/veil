@@ -16,6 +16,10 @@ output: it is written for people and may change. The read commands take
 
 Every field is documented in the [JSON reference](../reference/json.md).
 
+A tool that asks many questions (an editor, an agent) can keep one
+connection open instead of starting `vl` each time: [`vl serve
+--local`](editors-and-agents.md) answers with the same documents.
+
 ## Examples
 
 Changed files, one per line:
@@ -94,4 +98,4 @@ protects.
 
 ---
 
-[User guide](README.md) · [JSON reference](../reference/json.md)
+[User guide](README.md) · [JSON reference](../reference/json.md) · Next: [Editors and agents](editors-and-agents.md)
