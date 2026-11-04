@@ -1,0 +1,18 @@
+@  volyqprr alice ✓ 2026-11-04 03:08:45 default@ e05745ec (empty)
+│  (no description set)
+○  qnvknnvx alice ✓ 2026-11-04 03:08:45 main cbc2b1dd [embargo:4185dfd538]
+│ │  Fix B (embargoed)  ⇠ merges nuutvsyu, ymwxopmr
+│ ○  ymwxopmr alice ✓ 2026-11-04 03:08:45 fix-b@ b67c0d9c [cloaked:team]
+│ │  (no description set)
+○    nuutvsyu alice ✓ 2026-11-04 03:08:44 4594e848
+│  third: loose objects
+○  ytqwzwrw alice ✓ 2026-11-04 03:08:44 e80b7dc1 [embargo:6da8d545d2 released]
+│ │  Fix A (released)  ⇠ merges onpvpvvr, tkyyosuu
+│ ○  tkyyosuu alice ✓ 2026-11-04 03:08:44 fix-a@ team-only[cloaked:team] 1f2a35b8 [cloaked:team]
+│ │  (no description set)
+○    onpvpvvr alice ✓ 2026-11-04 03:08:44 c8668fd0
+│  second: edit docs and notes
+○  wxpszzmo alice ✓ 2026-11-04 03:08:43 3ab4cc98
+│  initial import
+◆  zzzzzzzz 72edc798
+   root()

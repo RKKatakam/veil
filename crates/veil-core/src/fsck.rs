@@ -762,6 +762,26 @@ impl Checker {
                             ),
                         );
                     }
+                    // BUG-010: a key wrapped to a low-order point is public.
+                    let mut granted: Vec<&String> = ring.members.keys().collect();
+                    for c in &ring.log {
+                        match &c.op {
+                            crate::keychain::RingOp::Genesis { members, .. } => granted.extend(members.iter().map(|m| &m.id)),
+                            crate::keychain::RingOp::Grant { member } => granted.push(&member.id),
+                            _ => {}
+                        }
+                    }
+                    for id in granted {
+                        if parse_public_key(id).is_ok_and(|pk| crate::identity::is_low_order_public_key(&pk)) {
+                            self.push(
+                                Severity::Warning,
+                                format!(
+                                    "key ring {path}: member {id} is a low-order key, so the scope key wrapped to it \
+                                     is readable by anyone; revoke it (which rotates the key)"
+                                ),
+                            );
+                        }
+                    }
                     for (member, m) in &ring.members {
                         let bad_wrap = match &m.wrapped {
                             crate::identity::WrappedKey::Legacy(l) => l.sealed.scope != format!("wrap:{}", ring.scope),

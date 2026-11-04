@@ -154,9 +154,9 @@ repositories at format 1 or 2 (so that older vl can read them), see §5.
   a ring change signed by an admin authorised at that point of the log
   (C5). So base mode is enough, and auth mode would only add a second,
   weaker binding.
-* **Known limits.** HPKE refuses low-order recipient keys (all-zero DH).
-  The legacy box did not (see BUGS.md), and HPKE closes that by
-  construction (tested). Not post-quantum: the `hpke` crate offers X-Wing
+* **Known limits.** HPKE refuses low-order recipient keys (all-zero DH;
+  BUG-010), and the legacy box now does too (`was_contributory`). Both are
+  tested. Not post-quantum: the `hpke` crate offers X-Wing
   (ML-KEM-768 + X25519); moving to it later is a new suite string and ring
   format.
 
@@ -172,7 +172,9 @@ associated data, and its crate pulls in much more code.
 
 `ephemeral X25519 → kek = BLAKE3-derive_key(LEGACY_KEY_WRAP, shared ‖ eph_pk ‖ recipient_pk) → XChaCha20-Poly1305(kek, random nonce, aad = "wrap:" ‖ scope)`,
 encoded `{"ephemeral": hex, "sealed": {scope, nonce, ciphertext}}`. ECIES
-in shape, with a non-standard KDF and no rejection of low-order points.
+in shape, with a non-standard KDF. Until this change it did not reject
+low-order recipient points (BUG-010, reopened: wraps made that way before
+the fix publish their key to anyone; `vl fsck` does not detect them yet).
 Read forever; written only into format-1/2 repositories.
 
 ### C4. Identities and signing keys

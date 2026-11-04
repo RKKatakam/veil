@@ -196,6 +196,14 @@ pub fn parse_public_identity(s: &str) -> Result<PublicIdentity> {
     }
 }
 
+/// Is `pk` a low-order X25519 point (the DH result with it is all zeros
+/// whatever the secret)? A key wrapped to one is readable by anyone.
+pub fn is_low_order_public_key(pk: &[u8; 32]) -> bool {
+    !StaticSecret::from(random_bytes::<32>())
+        .diffie_hellman(&PublicKey::from(*pk))
+        .was_contributory()
+}
+
 /// The X25519 part of a public identity (either form).
 pub fn parse_public_key(s: &str) -> Result<[u8; 32]> {
     Ok(parse_public_identity(s)?.x25519)
@@ -570,7 +578,9 @@ mod tests {
         // output zero; RFC 9180 requires the sender to abort.
         let mut one = [0u8; 32];
         one[0] = 1;
+        assert!(!is_low_order_public_key(&Identity::generate("x").public_key()));
         for low in [[0u8; 32], one] {
+            assert!(is_low_order_public_key(&low));
             assert!(wrap_key(&low, &[1; 32], "team").is_err());
             assert!(wrap_key_legacy(&low, &[1; 32], "team").is_err(), "BUG-010 in the legacy box");
         }

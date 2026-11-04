@@ -425,6 +425,34 @@ fn granting_a_low_order_public_key_is_refused_by_the_legacy_wrapping_too() {
     assert_eq!(ring.log.len(), 1, "only the genesis");
 }
 
+/// A ring written before the fix may already hold a key wrapped to a
+/// low-order point: `fsck` must point it out.
+#[test]
+fn fsck_warns_about_low_order_ring_members() {
+    let alice = Identity::generate("alice");
+    let fs = Arc::new(MemoryBackend::new());
+    let repo = Repo::init_for_clone_at(fs.clone(), Some(alice.clone()), "alice", 2).unwrap();
+    let low = format!("veil1{}", "00".repeat(32));
+    let mut ring = KeyRing {
+        scope: "team".into(),
+        ..Default::default()
+    };
+    for id in [alice.public_hex(), low.clone()] {
+        ring.members.insert(
+            id,
+            veil_core::keychain::RingMember {
+                name: "m".into(),
+                wrapped: veil_core::identity::wrap_key_legacy(&alice.public_key(), &[7; 32], "team").unwrap(),
+            },
+        );
+    }
+    repo.keys().save_ring(&ring).unwrap();
+    let report = veil_core::fsck::fsck(fs, Some(alice)).unwrap();
+    let hits: Vec<_> = report.findings.iter().filter(|f| f.message.contains("low-order")).collect();
+    assert_eq!(hits.len(), 1, "{:#?}", report.findings);
+    assert!(hits[0].message.contains(&low));
+}
+
 /// Alice grants Bob `ops`, pushes, then revokes Bob *before he ever pulled*
 /// and pushes again. Bob clones afterwards. Push unions key rings, so the
 /// remote still wraps the key for Bob.
