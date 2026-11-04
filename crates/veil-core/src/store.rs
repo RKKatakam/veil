@@ -21,7 +21,7 @@ use std::{
     collections::HashSet,
     fmt,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, RwLock,
     },
     time::{Duration, Instant},
@@ -100,6 +100,8 @@ pub struct ObjectStore {
     bases: LruCache<Arc<Vec<u8>>>,
     packs: RwLock<PackSet>,
     gc: GcHints,
+    /// Open [`ObjectStore::begin_unsynced`] scopes (see there).
+    unsynced: AtomicUsize,
 }
 
 impl fmt::Debug for ObjectStore {
@@ -128,6 +130,33 @@ impl ObjectStore {
                 pending: RwLock::new(None),
                 freshened: RwLock::new(HashSet::new()),
             },
+            unsynced: AtomicUsize::new(0),
+        }
+    }
+
+    /// From now until the matching [`ObjectStore::end_unsynced`], new loose
+    /// objects are written with [`StorageBackend::write_unsynced`]. The
+    /// caller must call [`ObjectStore::sync_barrier`] before writing
+    /// anything that references them, and before releasing the repository
+    /// lock (transactions do both; see `lock.rs` for crash recovery).
+    pub(crate) fn begin_unsynced(&self) {
+        self.unsynced.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn end_unsynced(&self) {
+        self.unsynced.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Make every object written so far durable.
+    pub fn sync_barrier(&self) -> Result<()> {
+        self.backend.sync_barrier()
+    }
+
+    fn write_loose(&self, id: &ObjectId, raw: &[u8]) -> Result<()> {
+        if self.unsynced.load(Ordering::SeqCst) > 0 {
+            self.backend.write_unsynced(&self.loose_path(id), raw)
+        } else {
+            self.backend.write(&self.loose_path(id), raw)
         }
     }
 
@@ -307,12 +336,12 @@ impl ObjectStore {
             // make sure we have our own loose copy (in that order).
             self.write_keep_marker(id);
             if !self.loose_exists(id) {
-                self.backend.write(&self.loose_path(id), raw)?;
+                self.write_loose(id, raw)?;
             }
             return Ok(());
         }
         if !self.has_cached(id) {
-            self.backend.write(&self.loose_path(id), raw)?;
+            self.write_loose(id, raw)?;
         }
         Ok(())
     }

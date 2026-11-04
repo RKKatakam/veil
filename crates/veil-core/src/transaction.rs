@@ -37,6 +37,9 @@ pub struct Transaction<'r> {
 
 impl<'r> Transaction<'r> {
     pub(crate) fn new(repo: &'r mut Repo, description: String, lock: RepoLock) -> Self {
+        // Objects are written unsynced and made durable by one barrier in
+        // `commit` (or `drop`), before the operation that references them.
+        repo.store.begin_unsynced();
         let view = repo.view.clone();
         Transaction {
             repo,
@@ -281,6 +284,9 @@ impl<'r> Transaction<'r> {
         if !self.rewritten.is_empty() {
             self.rebase_descendants()?;
         }
+        // Durability barrier: every object this transaction wrote is on
+        // stable storage before the operation that references it is written.
+        self.repo.store.sync_barrier()?;
         if self.view == self.start_view && !self.record_always {
             return Ok(None);
         }
@@ -298,5 +304,16 @@ impl<'r> Transaction<'r> {
         self.repo.op_id = id;
         self.repo.view = std::mem::take(&mut self.view);
         Ok(Some(id))
+    }
+}
+
+impl Drop for Transaction<'_> {
+    /// Also on abort or error, so unsynced objects do not outlive the lock
+    /// (released after this, when `_lock` drops): only a holder that dies
+    /// leaves any, and the next holder recovers them. (If this barrier
+    /// fails, the backend keeps the files queued for the next one.)
+    fn drop(&mut self) {
+        self.repo.store.end_unsynced();
+        let _ = self.repo.store.sync_barrier();
     }
 }

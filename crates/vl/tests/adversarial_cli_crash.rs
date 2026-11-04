@@ -103,7 +103,6 @@ fn kill_9_mid_command_never_corrupts_the_repository() {
 /// A process killed while holding the repository lock blocks every later
 /// command for two minutes.
 #[test]
-#[ignore = "BUG-026: a lock left by a crashed process blocks every command for 2 minutes (no PID liveness check)"]
 fn repository_is_usable_right_after_a_crash_while_locked() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a", "a\n")]);

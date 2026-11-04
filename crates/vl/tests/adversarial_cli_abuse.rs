@@ -115,7 +115,6 @@ fn path_like_scope_and_embargo_names_do_not_panic() {
 }
 
 #[test]
-#[ignore = "BUG-024: `--until +Nd` multiplies without overflow checks: panics in debug, wraps to a past time (instant release) in release"]
 fn embargo_deadline_overflow_is_rejected() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a.txt", "a\n")]);
@@ -459,7 +458,6 @@ fn cloaking_a_file_with_glob_metacharacters_cloaks_that_file() {
 }
 
 #[test]
-#[ignore = "BUG-027: replacing the identity makes every command fail ('authentication failed for scope local') once a vault exists"]
 fn rotating_the_identity_does_not_brick_the_repository() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a.txt", "a\n")]);

@@ -8,46 +8,109 @@ use std::{
 };
 
 use adversarial_support::*;
-use veil_core::{now_millis, MemoryBackend, Repo, StorageBackend};
+use veil_core::{
+    lock::{LockInfo, LockOptions, RepoLock},
+    now_millis, MemoryBackend, Repo, StorageBackend, VeilError,
+};
 
 const LOCK: &str = ".veil/lock";
 
 /// A slow transaction (e.g. snapshotting a huge tree) holds the lock for more
-/// than two minutes. A second process considers the lock stale purely by its
-/// age, steals it, and both commit: one operation silently disappears from the
-/// op log. (Simulated by back-dating the live holder's lock file.)
+/// than two minutes. The MVP judged staleness by age alone, so a second
+/// process stole the lock and one operation silently disappeared.
+///
+/// Adapted to the renewed-lease lock (the original planted a legacy
+/// `"<pid> <millis>"` file over the live lock, which the current lock
+/// rightly treats as tampering; see the next test). Here A's lock file is
+/// rewritten in the current format to look like a lease that expired two
+/// minutes ago, held by another process on this machine that is still
+/// running (a live child). B, a separate handle in its own thread, must
+/// wait rather than steal, and both operations must be recorded.
 #[test]
-#[ignore = "BUG-013: lock staleness is judged by age only (no liveness/heartbeat); a live holder's lock is stolen and an operation is lost"]
+#[cfg(unix)]
 fn a_live_lock_holder_is_never_robbed() {
     let (mut a, fs, _) = new_repo("alice");
     let base = commit_files(&mut a, &*fs, &[("f", "1\n")], "base");
-    let mut b = Repo::open(fs.clone(), None, "bob").unwrap();
+    let mut alive = std::process::Command::new("sleep").arg("60").spawn().expect("spawn `sleep`");
 
     let mut tx_a = a.transaction("slow op by A").unwrap();
-    // ...A is still working, 121 s later:
-    let mine = fs.read(&p(LOCK)).unwrap();
-    let pid = String::from_utf8_lossy(&mine).split_whitespace().next().unwrap().to_string();
-    fs.write(&p(LOCK), format!("{pid} {}", now_millis() - 121_000).as_bytes()).unwrap();
+    // ...A is still working, 121 s after its lease was last renewed:
+    let mut info = LockInfo::parse(&fs.read(&p(LOCK)).unwrap()).expect("current lock format");
+    info.pid = alive.id();
+    info.acquired = now_millis() - 121_000;
+    info.renewed = info.acquired;
+    fs.write(&p(LOCK), &serde_json::to_vec(&info).unwrap()).unwrap();
 
-    let start = Instant::now();
-    let stolen = b.transaction("op by B").map(|mut tx_b| {
-        tx_b.view.tags.insert("from-b".into(), veil_core::oplog::Tag { target: base, cloak: None });
-        tx_b.commit().unwrap();
+    let b = std::thread::spawn({
+        let fs = fs.clone();
+        move || {
+            let mut b = Repo::open(fs, None, "bob").unwrap();
+            let mut tx_b = b.transaction("op by B").unwrap();
+            let entered = Instant::now();
+            tx_b.view.tags.insert("from-b".into(), veil_core::oplog::Tag { target: base, cloak: None });
+            tx_b.commit().unwrap();
+            entered
+        }
     });
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(!b.is_finished(), "B entered while A held the lock");
     tx_a.view.tags.insert("from-a".into(), veil_core::oplog::Tag { target: base, cloak: None });
-    tx_a.commit().unwrap();
+    tx_a.commit().expect("A's lock was not taken over");
+    let committed = Instant::now();
+    let b_entered = b.join().unwrap();
+    let _ = alive.kill();
+    let _ = alive.wait();
 
+    assert!(b_entered >= committed, "B entered before A released the lock");
     let head = Repo::open(fs.clone(), None, "x").unwrap();
     assert!(
         head.view().tags.contains_key("from-a") && head.view().tags.contains_key("from-b"),
         "an operation was lost: tags = {:?}",
         head.view().tags.keys().collect::<Vec<_>>()
     );
-    assert!(stolen.is_err() || start.elapsed() >= Duration::from_secs(1), "B entered while A held the lock");
+    let log: Vec<String> = head.op_log(3).unwrap().into_iter().map(|(_, op)| op.description).collect();
+    assert_eq!(log[..2], ["op by B".to_string(), "slow op by A".to_string()], "linear op log");
+}
+
+/// A lock file replaced behind the holder's back (tampering, or a legacy
+/// `"<pid> <millis>"` file naming this process with no token) may be
+/// reclaimed. Nothing is lost silently: the original holder can no longer
+/// commit and gets an error, and the new holder's operation is recorded.
+/// A legacy lock naming a live process is never reclaimed.
+#[test]
+#[cfg(unix)]
+fn a_tampered_lock_is_reclaimed_and_its_holder_cannot_commit() {
+    let (mut a, fs, _) = new_repo("alice");
+    let base = commit_files(&mut a, &*fs, &[("f", "1\n")], "base");
+    let mut b = Repo::open(fs.clone(), None, "bob").unwrap();
+
+    let mut tx_a = a.transaction("op by A").unwrap();
+    fs.write(&p(LOCK), format!("{} {}", std::process::id(), now_millis() - 121_000).as_bytes()).unwrap();
+    let mut tx_b = b.transaction("op by B").expect("a tokenless lock of this process is reclaimed");
+    tx_b.view.tags.insert("from-b".into(), veil_core::oplog::Tag { target: base, cloak: None });
+    tx_b.commit().unwrap();
+    tx_a.view.tags.insert("from-a".into(), veil_core::oplog::Tag { target: base, cloak: None });
+    let err = tx_a.commit().expect_err("A must notice that it lost the lock");
+    assert!(matches!(err, VeilError::Locked(_)), "{err}");
+    let head = Repo::open(fs.clone(), None, "x").unwrap();
+    assert!(head.view().tags.contains_key("from-b") && !head.view().tags.contains_key("from-a"));
+
+    // Legacy format, live holder on this machine: never robbed.
+    let mut alive = std::process::Command::new("sleep").arg("60").spawn().expect("spawn `sleep`");
+    let legacy = format!("{} {}", alive.id(), now_millis() - 600_000);
+    fs.write(&p(LOCK), legacy.as_bytes()).unwrap();
+    let quick = LockOptions {
+        wait: Duration::from_millis(300),
+        ..LockOptions::default()
+    };
+    let err = RepoLock::acquire_with(fs.clone(), &quick).unwrap_err();
+    let _ = alive.kill();
+    let _ = alive.wait();
+    assert!(err.to_string().contains("still running"), "{err}");
+    assert_eq!(fs.read(&p(LOCK)).unwrap(), legacy.as_bytes(), "lock untouched");
 }
 
 #[test]
-#[ignore = "BUG-013: RepoLock::drop removes the lock file unconditionally, releasing a lock that belongs to someone else"]
 fn dropping_a_lock_never_releases_someone_elses_lock() {
     let (mut a, fs, _) = new_repo("alice");
     let tx = a.transaction("A").unwrap();
@@ -76,7 +139,6 @@ fn garbage_lock_file_is_treated_as_stale() {
 /// After `kill -9` the lock of a dead process blocks every command for two
 /// minutes (each command waits 15 s and then fails).
 #[test]
-#[ignore = "BUG-026: a lock left by a crashed process blocks the repository for 2 minutes (no PID liveness check)"]
 fn lock_of_a_dead_process_does_not_block_for_minutes() {
     let (mut a, fs, _) = new_repo("alice");
     // PID 2^22+1 is above Linux's pid_max default and never alive.

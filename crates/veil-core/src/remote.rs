@@ -129,7 +129,9 @@ fn ancestors_in(store: &ObjectStore, tips: &[ObjectId]) -> Result<Vec<ObjectId>>
 /// log that only ever fast-forwards (see [`Keychain::merge_ring`]), so a
 /// revocation cannot be undone by syncing with a replica that still lists
 /// the member. Rings are merged before embargo records because the records'
-/// signatures are checked against ring membership.
+/// signatures are checked against ring membership. Runs inside the
+/// destination's transaction: each merge is a read-modify-write under its
+/// lock (the keychain takes it reentrantly).
 fn sync_meta(src: &Keychain, dst: &Keychain, warnings: &mut Vec<String>) -> Result<()> {
     for ring in src.rings()? {
         if let RingMerge::Rejected(w) = dst.merge_ring(&ring)? {
@@ -178,9 +180,13 @@ pub fn push(
         }
     }
     let tips: Vec<ObjectId> = selected.iter().map(|(_, t)| t.target).collect();
+    // Objects and metadata are copied under the remote's lock: metadata
+    // merges are read-modify-writes, and objects go through the
+    // transaction's durability barrier.
+    let mut tx = remote.transaction(format!("push from {}", local.repo_id()))?;
     let mut xfer = Transfer {
         src: local.store(),
-        dst: remote.store(),
+        dst: tx.repo().store(),
         src_keys: local.keys(),
         public,
         seen: HashSet::new(),
@@ -190,9 +196,7 @@ pub fn push(
         xfer.copy(id)?;
     }
     let mut report = xfer.report;
-    sync_meta(local.keys(), remote.keys(), &mut report.warnings)?;
-
-    let mut tx = remote.transaction(format!("push from {}", local.repo_id()))?;
+    sync_meta(local.keys(), tx.repo().keys(), &mut report.warnings)?;
     for (name, tag) in selected {
         if let Some(existing) = tx.view.tags.get(&name) {
             if existing.target == tag.target {
@@ -229,9 +233,11 @@ pub fn pull(local: &mut Repo, remote_name: &str, remote_backend: Arc<dyn Storage
     let remote = Repo::open(remote_backend, None, "remote")?;
     let tags: Vec<(String, Tag)> = remote.view().tags.clone().into_iter().collect();
     let tips: Vec<ObjectId> = tags.iter().map(|(_, t)| t.target).collect();
+    // Under the local lock, like push (see there).
+    let mut tx = local.transaction(format!("pull from {remote_name}"))?;
     let mut xfer = Transfer {
         src: remote.store(),
-        dst: local.store(),
+        dst: tx.repo().store(),
         src_keys: remote.keys(),
         public: false,
         seen: HashSet::new(),
@@ -241,10 +247,8 @@ pub fn pull(local: &mut Repo, remote_name: &str, remote_backend: Arc<dyn Storage
         xfer.copy(id)?;
     }
     let mut report = xfer.report;
-    sync_meta(remote.keys(), local.keys(), &mut report.warnings)?;
-    local.keys().invalidate();
-
-    let mut tx = local.transaction(format!("pull from {remote_name}"))?;
+    sync_meta(remote.keys(), tx.repo().keys(), &mut report.warnings)?;
+    tx.repo().keys().invalidate();
     for (name, tag) in tags {
         tx.view.remote_tags.insert(format!("{remote_name}/{name}"), tag.target);
         match tx.view.tags.get(&name).cloned() {

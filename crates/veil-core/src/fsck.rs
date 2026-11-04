@@ -20,7 +20,12 @@
 //!
 //! State an interrupted command leaves behind (an operation that never became
 //! the head, unreachable objects, temp files, a leftover lock) is reported
-//! as a note: it is harmless and the repository works normally.
+//! as a note: it is harmless and the repository works normally. That
+//! includes unreachable objects torn by a power loss while a lock was held
+//! (see [`recover_interrupted_writes`]), as long as that lock is still there.
+//!
+//! [`recover_interrupted_writes`] is the one function here that writes: the
+//! lock runs it when it takes over from a crashed holder.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
@@ -112,6 +117,82 @@ impl FsckReport {
 }
 
 /// Check the repository a `Repo` was opened on, with its identity's keys.
+/// Files modified this long before the crashed holder took its lock are
+/// still checked by [`recover_interrupted_writes`] (wall-clock adjustments).
+const RECOVERY_MARGIN_MS: i64 = 60 * 60 * 1000;
+
+/// Clean up after a lock holder that died, run by the new holder under the
+/// lock before anything else touches the repository.
+///
+/// Transactions write objects *unsynced* and make them durable with one
+/// barrier before writing the operation (see
+/// [`StorageBackend::write_unsynced`]). A holder that dies before its
+/// barrier can leave loose objects that
+///
+/// * are intact but not yet durable (the process died, the OS did not):
+///   they are rewritten and synced, because a later transaction may reuse
+///   them instead of writing its own copy; or
+/// * are empty or truncated (the machine lost power): they are removed, so
+///   that nobody mistakes them for the object they are named after.
+///
+/// Neither kind can be referenced by an operation: the operation is only
+/// written after the barrier. On backends with wall-clock stamps only files
+/// modified since shortly before `since_ms` (when the dead holder took the
+/// lock) are read; otherwise, or when `since_ms` is unknown, every loose
+/// object is. Returns the number of objects removed.
+pub fn recover_interrupted_writes(backend: &dyn StorageBackend, since_ms: Option<i64>) -> Result<usize> {
+    let root = vpath(".veil/objects");
+    if !backend.exists(&root)? {
+        return Ok(0);
+    }
+    let cutoff_ns = match (since_ms, backend.stat_clock()) {
+        (Some(ms), Some(clock)) if !clock.exact => {
+            Some(ms.saturating_sub(RECOVERY_MARGIN_MS).saturating_mul(1_000_000))
+        }
+        _ => None,
+    };
+    let mut removed = 0;
+    for d in backend.list_dir(&root)? {
+        if !is_fanout(&d) {
+            continue;
+        }
+        let dir = root.join(&d.name);
+        for f in backend.list_dir(&dir)? {
+            let Some(id) = loose_id(&d.name, &f) else { continue };
+            let path = dir.join(&f.name);
+            if let Some(cut) = cutoff_ns {
+                let Some(m) = backend.metadata(&path)? else { continue };
+                let old = |t: Option<i64>| t.is_some_and(|t| t < cut);
+                if old(m.mtime) && (m.ctime.is_none() || old(m.ctime)) {
+                    continue;
+                }
+            }
+            let Some(raw) = backend.read_opt(&path)? else { continue };
+            if ObjectId::hash(&raw) == id {
+                backend.write_unsynced(&path, &raw)?;
+            } else {
+                backend.remove_file(&path)?;
+                removed += 1;
+            }
+        }
+    }
+    backend.sync_barrier()?;
+    Ok(removed)
+}
+
+fn is_fanout(d: &crate::vfs::DirEntry) -> bool {
+    d.kind == NodeKind::Dir && d.name.len() == 2 && d.name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The id a loose object file `<fanout>/<name>` is filed under, if it is one.
+fn loose_id(fanout: &str, f: &crate::vfs::DirEntry) -> Option<ObjectId> {
+    if f.kind != NodeKind::File || is_temp(&f.name) {
+        return None;
+    }
+    let hex = format!("{fanout}{}", f.name);
+    ObjectId::from_hex(&hex).ok().filter(|id| id.hex() == hex)
+}
+
 pub fn fsck_repo(repo: &Repo) -> Result<FsckReport> {
     fsck(repo.backend().clone(), repo.identity().cloned())
 }
@@ -147,6 +228,7 @@ pub fn fsck(backend: Arc<dyn StorageBackend>, identity: Option<Identity>) -> Res
         unknown_embargoes: BTreeSet::new(),
         missing_predecessors: 0,
         temp_files: 0,
+        torn: 0,
     };
     c.check_meta()?;
     let roots = c.check_ops()?;
@@ -191,6 +273,8 @@ struct Checker {
     unknown_embargoes: BTreeSet<String>,
     missing_predecessors: usize,
     temp_files: usize,
+    /// Unreachable objects that fail their hash while a lock is left over.
+    torn: usize,
 }
 
 impl Checker {
@@ -532,10 +616,12 @@ impl Checker {
     /// Verify every loose object file, including unreachable ones. Unknown
     /// directories (e.g. packs owned by another layer) are skipped.
     fn scan_loose_objects(&mut self) -> Result<()> {
+        // A leftover lock means its holder may have died before its sync
+        // barrier: unreachable objects it wrote may be torn, and the next
+        // holder removes them (see `recover_interrupted_writes`).
+        let interrupted = RepoLock::holder(&*self.backend)?.is_some();
         for d in self.list(".veil/objects")? {
-            let is_fanout =
-                d.kind == NodeKind::Dir && d.name.len() == 2 && d.name.bytes().all(|b| b.is_ascii_hexdigit());
-            if !is_fanout {
+            if !is_fanout(&d) {
                 continue;
             }
             for f in self.backend.list_dir(&vpath(".veil/objects").join(&d.name))? {
@@ -543,21 +629,29 @@ impl Checker {
                     self.temp_files += 1;
                     continue;
                 }
-                let id = match ObjectId::from_hex(&format!("{}{}", d.name, f.name)) {
-                    Ok(id) if f.kind == NodeKind::File && id.hex() == format!("{}{}", d.name, f.name) => id,
-                    _ => {
-                        self.push(
-                            Severity::Note,
-                            format!("unexpected entry .veil/objects/{}/{}", d.name, f.name),
-                        );
-                        continue;
-                    }
+                let Some(id) = loose_id(&d.name, &f) else {
+                    self.push(
+                        Severity::Note,
+                        format!("unexpected entry .veil/objects/{}/{}", d.name, f.name),
+                    );
+                    continue;
                 };
-                if !self.verified.contains(&id) {
-                    self.report.objects_unreachable += 1;
-                    if let Load::Missing = self.load(&id) {
-                        self.report.objects_unreachable -= 1;
+                if self.verified.contains(&id) {
+                    continue;
+                }
+                if interrupted {
+                    let path = vpath(".veil/objects").join(&d.name).join(&f.name);
+                    if let Some(raw) = self.backend.read_opt(&path)? {
+                        if ObjectId::hash(&raw) != id {
+                            self.first_visit(&id);
+                            self.torn += 1;
+                            continue;
+                        }
                     }
+                }
+                self.report.objects_unreachable += 1;
+                if let Load::Missing = self.load(&id) {
+                    self.report.objects_unreachable -= 1;
                 }
             }
         }
@@ -802,6 +896,15 @@ impl Checker {
                 format!(
                     "{} unreachable object(s) (rewritten history or interrupted commands; harmless)",
                     self.report.objects_unreachable
+                ),
+            );
+        }
+        if self.torn > 0 {
+            self.push(
+                Severity::Note,
+                format!(
+                    "{} unreachable object(s) torn by an interrupted write; the next command removes them",
+                    self.torn
                 ),
             );
         }

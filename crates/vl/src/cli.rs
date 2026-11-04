@@ -325,12 +325,21 @@ pub enum SecretCmd {
 pub enum IdentityCmd {
     /// Show your identity and public key.
     Show,
-    /// Create a new identity (replaces the existing one with --force).
+    /// Create a new identity (replaces the existing one with --force; the
+    /// replaced one is kept so local vaults can be re-keyed).
     New {
         #[arg(long)]
         name: Option<String>,
         #[arg(long)]
         force: bool,
+    },
+    /// Re-key this repository's local vault, sealed by an identity that was
+    /// replaced, to the current identity.
+    RecoverVault {
+        /// Identity file to recover from (default: every identity replaced
+        /// by `vl identity new --force`).
+        #[arg(long)]
+        from: Option<std::path::PathBuf>,
     },
 }
 
