@@ -65,7 +65,7 @@
 pub mod colocate;
 mod export;
 mod import;
-mod index;
+pub mod index;
 pub mod map;
 mod project;
 mod tags;
@@ -101,9 +101,14 @@ pub(crate) fn gerr(e: impl std::fmt::Display) -> VeilError {
     VeilError::Repo(format!("git: {e}"))
 }
 
-/// Where the bridge repository lives below a project directory.
+/// Where the bridge repository lives below a project directory: the
+/// colocated `.git` when the directory is colocated with Git (`repo.json`
+/// says so, see [`colocate`]), else `.veil/git/repo.git`.
 pub fn default_git_dir(project_root: &Path) -> PathBuf {
-    project_root.join(".veil").join("git").join("repo.git")
+    match colocate::colocated_git_dir(project_root) {
+        Some(dir) => dir,
+        None => project_root.join(".veil").join("git").join("repo.git"),
+    }
 }
 
 /// The bare Git repository Veil exchanges objects through, with the
@@ -136,6 +141,8 @@ fn open_git(dir: &Path) -> Result<gix::Repository> {
     let opts = gix::open::Options::isolated();
     match gix::open_opts(dir, opts.clone()) {
         Ok(r) => Ok(r),
+        // A colocated `.git` is the user's: never re-created (bare) here.
+        Err(e) if dir.file_name().is_some_and(|n| n == ".git") => Err(gerr(format!("cannot open {}: {e}", dir.display()))),
         Err(_) => {
             // A repository that never talked to Git has no `.veil/git/` yet
             // (BUG-640): `gix::init_bare` creates only the last component.

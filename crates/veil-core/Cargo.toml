@@ -17,7 +17,7 @@ getrandom.workspace = true
 globset.workspace = true
 hkdf.workspace = true
 hpke.workspace = true
-gix = { workspace = true, optional = true }
+gix = { workspace = true, optional = true, features = ["index"] }
 hex.workspace = true
 memchr.workspace = true
 aho-corasick.workspace = true

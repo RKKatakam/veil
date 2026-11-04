@@ -136,10 +136,8 @@ fn open(cli: &Cli) -> Result<Ctx> {
 
 fn run(cli: Cli) -> Result<ExitCode> {
     match &cli.cmd {
-        Cmd::Init { path, colocate } => {
-            colocate_cmd::require_no_init_colocate(colocate)?;
-            cmd_init(path.as_deref())
-        }
+        Cmd::Init { path, colocate } if colocate.colocate => colocate_cmd::init_colocate(path.as_deref(), colocate),
+        Cmd::Init { path, .. } => cmd_init(path.as_deref()),
         Cmd::Clone { source, dest } => cmd_clone(source, dest.as_deref()),
         Cmd::Identity(c) => cmd_identity(c),
         Cmd::Fsck { verbose } => cmd_fsck(cli.repository.as_deref(), *verbose),
@@ -219,7 +217,10 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         // as one JSON document.
         Cmd::Status { out } => match out.json {
             true => api::emit_json(&api::status(ctx)?)?,
-            false => api::text::status(&api::status(ctx)?),
+            false => {
+                api::text::status(&api::status(ctx)?);
+                colocate_cmd::status_notes(ctx);
+            }
         },
         Cmd::Log { limit, filter, out } => history::log(ctx, *limit, filter, out.json)?,
         Cmd::Show { rev, stat, renames, out } => history::show(ctx, rev, *stat, renames, out.json)?,
