@@ -169,6 +169,7 @@ fn many_to_one_pairs_are_assigned_greedily_and_linearly() {
     }
     let t = Instant::now();
     let d = detect(r.store(), &changes, Reader::Me, &copies()).unwrap();
+    eprintln!("measured: 10 000 copies of one file: {:?}", t.elapsed());
     assert_eq!(d.pairs.len(), 10_000);
     assert_eq!(d.pairs.iter().filter(|p| !p.copy).count(), 1, "renamed once");
     assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
@@ -196,6 +197,7 @@ fn a_hostile_number_of_files_skips_the_inexact_pass() {
     let t = Instant::now();
     let d = detect(r.store(), &changes, Reader::Me, &opts()).unwrap();
     let took = t.elapsed();
+    eprintln!("measured: rename detection over 50 000 deletions + 50 000 additions: {took:?}");
     assert!(d.truncated);
     assert_eq!(pairs(&d), [("x/same".into(), "y/same".into(), 100, false)]);
     assert_eq!(d.changes.len(), 100_000);

@@ -194,11 +194,18 @@ fn status_of(sig: &Sig) -> SignatureStatus {
 pub fn log(entries: LogEntries<'_>) -> Result<()> {
     let mut entries = entries;
     let mut lanes: Vec<Option<ObjectId>> = Vec::new();
+    // A filtered log leaves snapshots out, so the graph's lines would not
+    // join: it is drawn as a flat list.
+    let flat = entries.search().is_some();
     for e in entries.by_ref() {
         if stdout_closed() {
             return Ok(());
         }
-        log_entry(&e?, &mut lanes);
+        let e = e?;
+        if flat {
+            lanes = vec![Some(e.id)];
+        }
+        log_entry(&e, &mut lanes);
     }
     if entries.truncated && !stdout_closed() {
         println!("{}", dim("~  (more snapshots elided)"));

@@ -5,7 +5,7 @@
 //!   ([`walk_files`]), so isolated, quarantined and ignored files, which
 //!   never enter a snapshot, are never searched, and not counted either
 //!   (no existence oracle). There is no option to read the disk.
-//! * **One reader.** Content is read through [`readable_version`]:
+//! * **One reader.** Content is read through [`readable_version`](crate::blame::readable_version):
 //!   [`Readable::Plain`] is searched, [`Readable::Fallback`] (the last
 //!   public version of a file this reader cannot open) is searched and
 //!   labelled [`Tier::Fallback`], [`Readable::Redacted`] is counted in

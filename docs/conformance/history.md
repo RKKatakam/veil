@@ -84,9 +84,17 @@ with `-- --ignored`. Baseline: `integration` @ `8dbdb61`.
 
 ## Pending features (acceptance scenarios for the feature wave)
 
+The Git-parity round built rename and copy detection (in `diff`, `show`,
+`status` and `log --follow`; not yet in merges), path-limited `log`, the
+`-r` ranges `A..B`, `::B`, `..B` and `A..`, blame, `log -S`/`-G`, `grep` and
+bisect (`crates/vl/tests/history_cli.rs`,
+`crates/veil-core/tests/history_tools.rs`, `history_rename.rs`). Their
+scenarios below are still to port; until then their rows keep the status
+`pending feature`.
+
 | Feature | Scenarios to port when it lands |
 |---|---|
-| Rename / copy detection | t4001, t4003, t4005, t4007, t4008, t4009, t4023, t4043, t4206, t4219 (`log --follow`), t6402, t6412, t6414, t6422, t6423, t6425, t6429, t6434, t3401, t4130; jj test_diff_renamed_file_and_dir, test_diff_rename_in_merge_commit. Veil shows a rename as D + A, and a rename on one side of a merge plus an edit on the other is a modify/delete conflict today. |
+| Rename / copy detection | t4001, t4003, t4005, t4007, t4008, t4009, t4023, t4043, t4206, t4219 (`log --follow`), t6402, t6412, t6414, t6422, t6423, t6425, t6429, t6434, t3401, t4130; jj test_diff_renamed_file_and_dir, test_diff_rename_in_merge_commit. Veil detects renames in diffs, status and `log --follow`; a rename on one side of a merge plus an edit on the other is still a modify/delete conflict. |
 | Path-limited diff and log (`diff -- PATH`, `log -- PATH`) | t4010, t4045 (`--relative`), t4208, t4216 (bloom), t6004, t6012, t6016, t6111, t6130–t6137 (pathspecs); jj test_log_filtered_by_path, test_diff_relative_paths. |
 | Revset language (ranges, ancestry, set operators, functions) | t6000, t6003 (`--topo-order`/`--date-order` choices), t6005 (`--count`), t6009, t6013 (`--reverse`), t6014 (`--all`), t6017, t6018 (globs), t6019 (`--ancestry-path`), t6100, t6600 (reachability); jj test_revset_output.rs, lib test_revset.rs, test_revset_optimized.rs, test_default_revset_graph_iterator.rs. |
 | Log/diff output formats and templates | t4205, t4207, t4026, t4013 option matrix (`--name-only`, `--name-status`, `-p --stat` combos), t4047 (dirstat), t4049, t4052, t4073 (stat widths); jj template tests in test_log_command.rs and test_evolog_command.rs. |

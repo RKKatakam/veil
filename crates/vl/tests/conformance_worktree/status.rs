@@ -138,16 +138,15 @@ fn status_reports_local_only_and_quarantined_files() {
     assert!(!st.contains("Xk29vLq8sPz") && !st.contains("AKIAIOSFODNN7EXAMPLE"), "no secret values: {st}");
 }
 
-// Scenario from git t7525-status-rename.sh: rename detection is a pending
-// feature, so a rename shows as a delete and an add today.
+// Scenario from git t7525-status-rename.sh: a rename shows as one.
 #[test]
-fn status_shows_a_rename_as_delete_and_add() {
+fn status_shows_a_rename() {
     let env = Env::new();
     let r = env.repo("p");
     r.write("old.txt", "same content\n");
     r.commit("one");
     std::fs::rename(r.path("old.txt"), r.path("new.txt")).unwrap();
-    assert_eq!(r.changes(), vec!["A new.txt", "D old.txt"]);
+    assert_eq!(r.changes(), vec!["R old.txt -> new.txt"]);
 }
 
 // Scenario from git t7508-status.sh (type change): a file replaced by a

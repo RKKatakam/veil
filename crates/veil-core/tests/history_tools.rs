@@ -163,10 +163,19 @@ fn hostile_histories_are_bounded_by_the_budget() {
     let t = Instant::now();
     let b = blame(&r, &keep_one, &p("f"), &o).unwrap();
     let took = t.elapsed();
+    eprintln!("measured: blame of a hostile 300-snapshot, 2 000-line history (budget 5e7): {took:?}, {} visits", b.visited);
     assert!(b.visited < 300);
     assert_eq!(b.stopped, Some(Stop::Budget));
     assert_eq!(b.lines.last().unwrap().origin, Origin::Unattributed(Unattributed::Budget));
     assert!(took < Duration::from_secs(if cfg!(debug_assertions) { 30 } else { 2 }), "{took:?}");
+    // The default budget, in a release build: bounded in time too.
+    if !cfg!(debug_assertions) {
+        let t = Instant::now();
+        let b = blame(&r, &keep_one, &p("f"), &me()).unwrap();
+        eprintln!("measured: the same with the default budget: {:?}, {} visits", t.elapsed(), b.visited);
+        assert_eq!(b.stopped, Some(Stop::Budget));
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    }
     // --max-changes.
     let o = BlameOptions { max_changes: 3, ..me() };
     let b = blame(&r, &keep_one, &p("f"), &o).unwrap();
@@ -189,6 +198,7 @@ fn blame_time_is_linear_in_the_history() {
     let time = |id: &ObjectId| {
         let t = Instant::now();
         let b = blame(&r, id, &p("f"), &me()).unwrap();
+        assert!(b.stopped.is_none(), "ordinary edits stay far below the budget");
         std::hint::black_box(b);
         t.elapsed()
     };
@@ -229,6 +239,7 @@ fn octopus_and_criss_cross_histories_visit_each_snapshot_once() {
     }
     let t = Instant::now();
     let b = blame(&r, &a, &p("f"), &me()).unwrap();
+    eprintln!("measured: blame through a 1 000-rung criss-cross: {:?}, {} visits", t.elapsed(), b.visited);
     assert!(b.stopped.is_none());
     assert!(b.visited <= 2_002, "each snapshot at most once: {}", b.visited);
     assert!(t.elapsed() < Duration::from_secs(if cfg!(debug_assertions) { 30 } else { 2 }), "{:?}", t.elapsed());
@@ -380,6 +391,7 @@ fn grep_is_linear_on_hostile_patterns_and_input() {
     for pattern in ["(a*)*b", "(a|aa)+$b", "a{1,1000}b"] {
         let t = Instant::now();
         let g = grep_of(&r, &c, pattern, &GrepOptions::default());
+        eprintln!("measured: grep {pattern:?} over {mb} MiB: {:?}", t.elapsed());
         assert!(g.files.is_empty(), "{pattern}");
         assert!(t.elapsed() < Duration::from_secs(if cfg!(debug_assertions) { 60 } else { 2 }), "{pattern}: {:?}", t.elapsed());
     }
@@ -624,4 +636,38 @@ proptest! {
         }
         let _ = (last, Visibility::Public);
     }
+}
+
+/// Design 3, threat 7: `-S` over a long history with large files is lazy
+/// (the first match comes back without searching the rest) and linear in
+/// the size of what it reads.
+#[test]
+fn pickaxe_is_lazy_and_linear() {
+    let (r, _, _) = new_repo("alice");
+    let big = blob(&r, &vec![b'y'; 1 << 20]);
+    let mut parent = r.root_id();
+    for i in 0..10_000 {
+        let small = blob(&r, format!("{i}{}\n", if i == 9_999 { " needle" } else { "" }).as_bytes());
+        let tree = raw_tree(&r, vec![file("big", big), file("small", small)]);
+        parent = raw_snapshot(&r, vec![parent], tree, "x");
+    }
+    let mut s = Searcher::new(&r, LogFilter { pickaxe: Some(Pickaxe::string("needle", false).unwrap()), ..LogFilter::default() });
+    let t = Instant::now();
+    assert!(matches!(s.check(&parent).unwrap(), Match::Yes { .. }));
+    assert_eq!(s.searched, 1);
+    eprintln!("measured: log -S first match in a 10 000-snapshot history with a 1 MiB file: {:?}", t.elapsed());
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    // Counting is linear in the blob size.
+    let time = |n: usize| {
+        let (r, fs, _) = new_repo("bob");
+        let _ = fs;
+        let a = raw_snapshot(&r, vec![r.root_id()], raw_tree(&r, vec![file("f", blob(&r, &vec![b'a'; n]))]), "a");
+        let b = raw_snapshot(&r, vec![a], raw_tree(&r, vec![file("f", blob(&r, &[vec![b'a'; n], b"needle".to_vec()].concat()))]), "b");
+        let mut s = Searcher::new(&r, LogFilter { pickaxe: Some(Pickaxe::string("aaneedle", true).unwrap()), ..LogFilter::default() });
+        let t = Instant::now();
+        assert!(matches!(s.check(&b).unwrap(), Match::Yes { .. }));
+        t.elapsed()
+    };
+    let (ts, tl) = (time(1 << 20).min(time(1 << 20)), time(8 << 20));
+    assert!(tl < ts * 24 + Duration::from_millis(300), "superlinear: 1 MiB {ts:?}, 8 MiB {tl:?}");
 }

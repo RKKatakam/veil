@@ -2,10 +2,10 @@
 //! `-S`, `-G`, `--follow`).
 //!
 //! **As this reader sees history.** Trees are read through
-//! [`ObjectStore::tree`], which resolves an embargo wrapper to its fallback
+//! [`ObjectStore::tree`](crate::store::ObjectStore::tree), which resolves an embargo wrapper to its fallback
 //! for a non-holder: an embargoed merge is unchanged at every path for
 //! them, so neither a path filter nor `-S`/`-G` lists it (threat review
-//! 4). File content is read through [`readable_version`] only, so the
+//! 4). File content is read through [`readable_version`](crate::blame::readable_version) only, so the
 //! pickaxe never runs on ciphertext; a snapshot whose relevant version is
 //! redacted is not listed (with [`Match::Skipped`] the caller may say "not
 //! searched") rather than counted on something the reader cannot read

@@ -20,9 +20,9 @@ Options:
 | | |
 |---|---|
 | `--stat` | Only list changed paths |
-| `--no-renames` | Do not detect renames (not implemented yet) |
-| `-M, --find-renames [<N>]` | Detect renames; `-M=N` (or `--find-renames=N`) sets the similarity threshold in percent, default 50 (not implemented yet) |
-| `-C, --find-copies` | Detect copies as well as renames (not implemented yet) |
+| `--no-renames` | Do not detect renames |
+| `-M, --find-renames [<N>]` | Detect renames; `-M=N` (or `--find-renames=N`) sets the similarity threshold in percent, default 50 |
+| `-C, --find-copies` | Detect copies as well as renames |
 | `--json` | Print one JSON document instead of text (its schema is named in its `schema` field; see docs/reference/json.md). Errors then also print a `veil.error/1` document |
 
 ---

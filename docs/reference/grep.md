@@ -3,7 +3,9 @@
 
 # `vl grep`
 
-Search the files of a snapshot (never the working copy's local-only files) for a pattern (not implemented yet)
+Search the files of a snapshot (never the working copy's local-only files) for a pattern.
+
+Searches recorded files only (default `@`, snapshotted first): isolated, quarantined and ignored files are never searched or counted. Files you cannot read are skipped; a file you can read only as its last public version is searched and labelled so. Exits 1 when nothing matches.
 
 ```text
 vl grep [OPTIONS] <PATTERN> [PATHS]...

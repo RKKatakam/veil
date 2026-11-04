@@ -71,7 +71,8 @@ be undone. Add to that per-file encryption and engine-level secret handling.
 | `git rm --cached PATH` | `vl ignore PATH` (the file stays on disk, the next snapshot drops it) |
 | `git mv A B` | `mv A B` |
 | `git gc`, `git fsck` | `vl gc`, `vl fsck` |
-| `git revert`, `git cherry-pick`, `git blame`, `git bisect`, `git log -- PATH` | *(no equivalent in 1.0)* |
+| `git blame`, `git grep`, `git bisect`, `git log -S`/`-G`/`--follow`/`-- PATH` | `vl blame`, `vl grep`, `vl bisect`, `vl log -S`/`-G`/`--follow`/`-- PATH` ([Investigating history](investigating-history.md)) |
+| `git revert`, `git cherry-pick` | *(no equivalent in 1.0)* |
 
 ## Pitfalls
 

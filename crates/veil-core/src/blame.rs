@@ -43,10 +43,12 @@
 //! Each diff is bounded as in [`crate::textmerge`] (BUG-484): past its work
 //! limit the differing middle is attributed whole to the snapshot, and the
 //! result says [`Blame::coarse`]. The walk stops after
-//! [`BlameOptions::max_changes`] visits or when its work (lines compared,
-//! plus the worst-case cost of every diff) passes
+//! [`BlameOptions::max_changes`] visits or when its work passes
 //! [`BlameOptions::work_budget`]; lines still open are reported
-//! unattributed.
+//! unattributed. Work is what each step really cost: the lines read and
+//! compared, plus each diff's search (`D²` for `D` differing lines, the
+//! whole [`textmerge::work_limit`] for a diff past it). A single diff is
+//! bounded, so the budget is overshot by at most one.
 
 use std::{
     cmp::Ordering,
@@ -356,9 +358,12 @@ pub(crate) fn map_lines(old: &[u8], new: &[u8], new_lines: usize) -> (Vec<Option
 
 /// Default for [`BlameOptions::max_changes`].
 pub const DEFAULT_MAX_CHANGES: usize = 100_000;
-/// Default for [`BlameOptions::work_budget`] (threat review 4: lines ×
-/// snapshots visited ≤ 2³²).
-pub const DEFAULT_WORK_BUDGET: u64 = 1 << 32;
+/// Default for [`BlameOptions::work_budget`]: about 2 s of the worst case
+/// (every step a diff past its work limit) in a release build, and some
+/// ten thousand steps of ordinary edits to a 20 000-line file. (Threat
+/// review 4 asks for lines × snapshots ≤ 2³²; this is tighter, because
+/// it also counts the diffs.)
+pub const DEFAULT_WORK_BUDGET: u64 = 1 << 29;
 
 #[derive(Clone, Debug)]
 pub struct BlameOptions {
@@ -611,15 +616,23 @@ pub fn blame(repo: &Repo, rev: &ObjectId, path: &VPath, o: &BlameOptions) -> Res
             let passed: Vec<(u32, u32)> = if pver.id == cur.id || pver.data == cur.data {
                 std::mem::take(&mut open)
             } else {
-                let lines = (pver.lines.len() + cur.lines.len()) as u64;
-                let cost = lines.saturating_add(textmerge::work_limit(lines as usize));
-                if work.saturating_add(cost) > budget {
+                if work >= budget {
                     result.stopped = Some(Stop::Budget);
                     pending.insert((q.id, q.path.clone()), Pending { lines: open, version: cur });
                     break 'walk;
                 }
-                work += cost;
+                let lines = (pver.lines.len() + cur.lines.len()) as u64;
                 let (map, coarse) = map_lines(&pver.data, &cur.data, cur.lines.len());
+                // What the diff cost: past its limit the whole limit was
+                // spent measuring; within it, about D² for D edits.
+                let search = if coarse {
+                    textmerge::work_limit(lines as usize)
+                } else {
+                    let kept = map.iter().filter(|m| m.is_some()).count() as u64;
+                    let d = lines.saturating_sub(2 * kept);
+                    d.saturating_mul(d)
+                };
+                work = work.saturating_add(lines).saturating_add(search);
                 result.coarse |= coarse;
                 let mut passed = Vec::new();
                 open.retain(|&(fin, local)| match map.get(local as usize).copied().flatten() {
