@@ -82,6 +82,14 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
         Ok(self.metadata(path)?.is_some())
     }
 
+    /// Read `len` bytes starting at `offset` (used for packfiles). The
+    /// default reads the whole file; backends override it to avoid that.
+    /// Reading past the end of the file is an error.
+    fn read_range(&self, path: &VPath, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let data = self.read(path)?;
+        slice_range(path, &data, offset, len).map(<[u8]>::to_vec)
+    }
+
     fn read_opt(&self, path: &VPath) -> Result<Option<Vec<u8>>> {
         match self.read(path) {
             Ok(d) => Ok(Some(d)),
@@ -89,6 +97,18 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
             Err(e) => Err(e),
         }
     }
+}
+
+/// Bounds-checked `data[offset..offset + len]` for [`StorageBackend::read_range`].
+pub(crate) fn slice_range<'a>(path: &VPath, data: &'a [u8], offset: u64, len: usize) -> Result<&'a [u8]> {
+    usize::try_from(offset)
+        .ok()
+        .and_then(|start| Some(start..start.checked_add(len)?))
+        .and_then(|r| data.get(r))
+        .ok_or_else(|| crate::error::VeilError::Io {
+            path: path.to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "read past the end of the file"),
+        })
 }
 
 /// Recursively list every file below `dir` (depth-first, sorted), skipping

@@ -385,7 +385,13 @@ impl Repo {
             if out.len() >= limit {
                 break;
             }
-            let op = self.ops.get(&id)?;
+            // The current operation must exist; older ones may have been
+            // pruned by gc, which simply ends the log.
+            let op = match self.ops.try_get(&id)? {
+                Some(op) => op,
+                None if !out.is_empty() => break,
+                None => return Err(VeilError::NotFound(format!("operation {}", id.short()))),
+            };
             cur = op.parents.first().copied();
             out.push((id, op));
         }

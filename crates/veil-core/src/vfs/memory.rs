@@ -112,6 +112,14 @@ impl StorageBackend for MemoryBackend {
         }
     }
 
+    fn read_range(&self, path: &VPath, offset: u64, len: usize) -> Result<Vec<u8>> {
+        match self.nodes.read().unwrap().get(path) {
+            Some(Node::File { data, .. }) => super::slice_range(path, data, offset, len).map(<[u8]>::to_vec),
+            Some(Node::Dir) => Err(VeilError::InvalidPath(format!("{path} is a directory"))),
+            None => Err(VeilError::NotFound(path.to_string())),
+        }
+    }
+
     fn write(&self, path: &VPath, data: &[u8]) -> Result<()> {
         if path.is_root() {
             return Err(VeilError::InvalidPath("cannot write to the root".into()));

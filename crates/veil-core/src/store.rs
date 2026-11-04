@@ -1,27 +1,105 @@
 //! Content-addressable store with transparent decryption of sealed nodes.
+//!
+//! Objects live either *loose* (`<root>/ab/cdef…`, the canonical encoding
+//! as-is) or in *packs* (`<root>/pack/pack-<sum>.{pack,idx}`, see
+//! [`crate::pack`]). Lookups check loose objects first, then packs. Ids are
+//! always the BLAKE3 of the canonical, uncompressed encoding, and
+//! [`ObjectStore::get_raw`] / [`ObjectStore::put_raw`] always speak that
+//! encoding, wherever the object is stored.
+//!
+//! Decoded trees and snapshots, and decompressed delta bases, are kept in
+//! weight-bounded LRU caches (see [`CacheLimits`]).
+//!
+//! **Cooperation with `gc`.** Objects that the last `vl gc` found
+//! unreachable are listed in `<root>/gc/pending`. If this process touches
+//! such an object (`has`, `get_raw`, `put`, `put_raw`), it *freshens* it:
+//! it writes a keep marker `<root>/gc/keep/<id>` and makes sure a loose copy
+//! exists. A concurrent or later `gc` then keeps the object. See
+//! [`crate::gc`] for the full protocol.
 
 use std::{
-    collections::HashMap,
+    collections::HashSet,
     fmt,
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
+    },
+    time::{Duration, Instant},
 };
 
 use crate::{
+    cache::{CacheStats, LruCache},
     crypto::Envelope,
     error::{Result, VeilError},
     id::ObjectId,
     keychain::Keychain,
     object::{EntryKind, Object, Snapshot, Text, Tree, TreeEntry, Visibility},
-    vfs::StorageBackend,
+    pack::{name_from_index_file, Pack},
+    vfs::{NodeKind, StorageBackend},
     vpath::VPath,
 };
+
+/// Bounds for the in-memory caches of one [`ObjectStore`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheLimits {
+    /// Total tree entries held across cached trees (each tree weighs
+    /// `entries + 1`).
+    pub tree_entries: usize,
+    /// Number of cached snapshots.
+    pub snapshots: usize,
+    /// Bytes of decompressed delta bases.
+    pub delta_base_bytes: usize,
+}
+
+impl Default for CacheLimits {
+    fn default() -> Self {
+        CacheLimits {
+            tree_entries: 200_000,
+            snapshots: 20_000,
+            delta_base_bytes: 64 << 20,
+        }
+    }
+}
+
+/// Where and how objects are stored right now.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StoreStats {
+    pub loose_objects: usize,
+    pub loose_bytes: u64,
+    pub packs: usize,
+    pub packed_objects: usize,
+    pub pack_bytes: u64,
+    pub trees: CacheStats,
+    pub snapshots: CacheStats,
+    pub delta_bases: CacheStats,
+}
+
+#[derive(Default)]
+struct PackSet {
+    loaded: bool,
+    packs: Vec<Arc<Pack>>,
+    /// Packs whose index or data could not be opened: name → reason.
+    broken: Vec<(String, String)>,
+}
+
+/// How long a loaded copy of the gc pending list is trusted before re-reading.
+const PENDING_TTL: Duration = Duration::from_secs(30);
+
+struct GcHints {
+    enabled: AtomicBool,
+    pending: RwLock<Option<(Instant, Arc<HashSet<ObjectId>>)>>,
+    freshened: RwLock<HashSet<ObjectId>>,
+}
 
 pub struct ObjectStore {
     backend: Arc<dyn StorageBackend>,
     root: VPath,
     pub keys: Arc<Keychain>,
-    trees: RwLock<HashMap<ObjectId, Arc<Tree>>>,
-    snapshots: RwLock<HashMap<ObjectId, Arc<Snapshot>>>,
+    trees: LruCache<Arc<Tree>>,
+    snapshots: LruCache<Arc<Snapshot>>,
+    bases: LruCache<Arc<Vec<u8>>>,
+    packs: RwLock<PackSet>,
+    gc: GcHints,
 }
 
 impl fmt::Debug for ObjectStore {
@@ -30,32 +108,213 @@ impl fmt::Debug for ObjectStore {
     }
 }
 
+fn is_hex(s: &str) -> bool {
+    s.bytes().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
 impl ObjectStore {
     pub fn new(backend: Arc<dyn StorageBackend>, root: VPath, keys: Arc<Keychain>) -> Self {
+        let limits = CacheLimits::default();
         ObjectStore {
             backend,
             root,
             keys,
-            trees: RwLock::new(HashMap::new()),
-            snapshots: RwLock::new(HashMap::new()),
+            trees: LruCache::new(limits.tree_entries),
+            snapshots: LruCache::new(limits.snapshots),
+            bases: LruCache::new(limits.delta_base_bytes),
+            packs: RwLock::new(PackSet::default()),
+            gc: GcHints {
+                enabled: AtomicBool::new(true),
+                pending: RwLock::new(None),
+                freshened: RwLock::new(HashSet::new()),
+            },
         }
     }
 
-    fn path(&self, id: &ObjectId) -> VPath {
+    pub fn set_cache_limits(&self, limits: CacheLimits) {
+        self.trees.set_capacity(limits.tree_entries);
+        self.snapshots.set_capacity(limits.snapshots);
+        self.bases.set_capacity(limits.delta_base_bytes);
+    }
+
+    pub fn backend(&self) -> &Arc<dyn StorageBackend> {
+        &self.backend
+    }
+
+    /// The store's directory on its backend (`.veil/objects`).
+    pub fn root(&self) -> &VPath {
+        &self.root
+    }
+
+    pub fn pack_dir(&self) -> VPath {
+        self.root.join("pack")
+    }
+
+    pub(crate) fn gc_dir(&self) -> VPath {
+        self.root.join("gc")
+    }
+
+    pub(crate) fn keep_marker(&self, id: &ObjectId) -> VPath {
+        self.gc_dir().join("keep").join(&id.hex())
+    }
+
+    pub(crate) fn loose_path(&self, id: &ObjectId) -> VPath {
         let h = id.hex();
         self.root.join(&h[..2]).join(&h[2..])
     }
 
+    // ---- packs -----------------------------------------------------------
+
+    fn ensure_packs(&self) -> Result<()> {
+        if !self.packs.read().unwrap().loaded {
+            self.reload_packs()?;
+        }
+        Ok(())
+    }
+
+    /// Re-scan the pack directory: open new packs, forget removed ones.
+    /// Returns true if the set of packs changed.
+    pub fn reload_packs(&self) -> Result<bool> {
+        let dir = self.pack_dir();
+        let names: Vec<String> = match self.backend.list_dir(&dir) {
+            Ok(entries) => entries
+                .into_iter()
+                .filter(|e| e.kind == NodeKind::File)
+                .filter_map(|e| name_from_index_file(&e.name).map(str::to_string))
+                .collect(),
+            Err(e) if e.is_not_found() => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        let mut set = self.packs.write().unwrap();
+        let unchanged = set.loaded
+            && names.len() == set.packs.len() + set.broken.len()
+            && names
+                .iter()
+                .all(|n| set.packs.iter().any(|p| p.name() == n) || set.broken.iter().any(|(b, _)| b == n));
+        if unchanged {
+            return Ok(false);
+        }
+        let mut packs = Vec::new();
+        let mut broken = Vec::new();
+        for name in names {
+            if let Some(p) = set.packs.iter().find(|p| p.name() == name) {
+                packs.push(p.clone());
+                continue;
+            }
+            match Pack::open(&*self.backend, &dir, &name) {
+                Ok(p) => packs.push(Arc::new(p)),
+                // Removed by a concurrent gc between listing and opening.
+                Err(e) if e.is_not_found() => {}
+                Err(e) => broken.push((name, e.to_string())),
+            }
+        }
+        *set = PackSet {
+            loaded: true,
+            packs,
+            broken,
+        };
+        Ok(true)
+    }
+
+    /// Currently known packs (loading them if needed).
+    pub fn packs(&self) -> Result<Vec<Arc<Pack>>> {
+        self.ensure_packs()?;
+        Ok(self.packs.read().unwrap().packs.clone())
+    }
+
+    /// Packs that could not be opened, with the reason.
+    pub fn broken_packs(&self) -> Result<Vec<(String, String)>> {
+        self.ensure_packs()?;
+        Ok(self.packs.read().unwrap().broken.clone())
+    }
+
+    fn in_loaded_packs(&self, id: &ObjectId) -> bool {
+        self.packs.read().unwrap().packs.iter().any(|p| p.contains(id))
+    }
+
+    /// Look `id` up in the packs. A pack that vanished (a concurrent gc
+    /// replaced it) triggers one rescan.
+    fn read_packed(&self, id: &ObjectId) -> Result<Option<Vec<u8>>> {
+        self.ensure_packs()?;
+        let mut corrupt = None;
+        for attempt in 0..2 {
+            let packs = self.packs.read().unwrap().packs.clone();
+            for p in packs.iter().filter(|p| p.contains(id)) {
+                match p.get(&*self.backend, id, &self.bases) {
+                    Ok(Some(raw)) => return Ok(Some(raw)),
+                    Ok(None) => {}
+                    Err(e) if e.is_not_found() => {}
+                    Err(e) => corrupt = Some(e),
+                }
+            }
+            if attempt == 0 && !self.reload_packs()? {
+                break;
+            }
+        }
+        if let Some(e) = corrupt {
+            return Err(e);
+        }
+        if let Some((name, why)) = self.packs.read().unwrap().broken.first() {
+            return Err(VeilError::Corrupt(
+                id.hex(),
+                format!("not found, and pack {} is unreadable: {why}", &name[..12]),
+            ));
+        }
+        Ok(None)
+    }
+
+    // ---- raw access ------------------------------------------------------
+
+    fn loose_exists(&self, id: &ObjectId) -> bool {
+        self.backend.exists(&self.loose_path(id)).unwrap_or(false)
+    }
+
     pub fn has(&self, id: &ObjectId) -> bool {
-        self.backend.exists(&self.path(id)).unwrap_or(false)
+        self.freshen(id);
+        if self.loose_exists(id) {
+            return true;
+        }
+        if self.ensure_packs().is_err() {
+            return false;
+        }
+        self.in_loaded_packs(id) || (self.reload_packs().unwrap_or(false) && self.in_loaded_packs(id))
+    }
+
+    /// Like `has`, without rescanning packs: used to skip redundant writes,
+    /// where a false negative only costs a duplicate loose copy.
+    fn has_cached(&self, id: &ObjectId) -> bool {
+        self.loose_exists(id) || (self.ensure_packs().is_ok() && self.in_loaded_packs(id))
     }
 
     pub fn get_raw(&self, id: &ObjectId) -> Result<Vec<u8>> {
-        match self.backend.read(&self.path(id)) {
-            Ok(b) => Ok(b),
-            Err(e) if e.is_not_found() => Err(VeilError::Missing(*id)),
-            Err(e) => Err(e),
+        self.freshen(id);
+        self.read_raw(id)
+    }
+
+    /// `get_raw` without gc freshening (used by gc itself).
+    pub(crate) fn read_raw(&self, id: &ObjectId) -> Result<Vec<u8>> {
+        match self.backend.read(&self.loose_path(id)) {
+            Ok(b) => return Ok(b),
+            Err(e) if e.is_not_found() => {}
+            Err(e) => return Err(e),
         }
+        self.read_packed(id)?.ok_or(VeilError::Missing(*id))
+    }
+
+    fn write_if_absent(&self, id: &ObjectId, raw: &[u8]) -> Result<()> {
+        if self.is_gc_candidate(id) {
+            // A gc may be about to delete the existing copy: mark it, then
+            // make sure we have our own loose copy (in that order).
+            self.write_keep_marker(id);
+            if !self.loose_exists(id) {
+                self.backend.write(&self.loose_path(id), raw)?;
+            }
+            return Ok(());
+        }
+        if !self.has_cached(id) {
+            self.backend.write(&self.loose_path(id), raw)?;
+        }
+        Ok(())
     }
 
     /// Insert an already-encoded object, verifying its address.
@@ -63,20 +322,141 @@ impl ObjectStore {
         if ObjectId::hash(raw) != *id {
             return Err(VeilError::Corrupt(id.hex(), "hash mismatch".into()));
         }
-        if !self.has(id) {
-            self.backend.write(&self.path(id), raw)?;
-        }
-        Ok(())
+        self.write_if_absent(id, raw)
     }
 
     pub fn put(&self, obj: &Object) -> Result<ObjectId> {
         let raw = obj.encode();
         let id = ObjectId::hash(&raw);
-        if !self.has(&id) {
-            self.backend.write(&self.path(&id), &raw)?;
-        }
+        self.write_if_absent(&id, &raw)?;
         Ok(id)
     }
+
+    /// Every loose object id (`<root>/ab/cdef…`).
+    pub fn list_loose(&self) -> Result<Vec<ObjectId>> {
+        let mut out = Vec::new();
+        let dirs = match self.backend.list_dir(&self.root) {
+            Ok(d) => d,
+            Err(e) if e.is_not_found() => return Ok(out),
+            Err(e) => return Err(e),
+        };
+        for d in dirs {
+            if d.kind != NodeKind::Dir || d.name.len() != 2 || !is_hex(&d.name) {
+                continue;
+            }
+            for f in self.backend.list_dir(&self.root.join(&d.name))? {
+                if f.kind == NodeKind::File && f.name.len() == 62 && is_hex(&f.name) {
+                    out.push(ObjectId::from_hex(&format!("{}{}", d.name, f.name))?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every object id in the store, loose or packed, sorted.
+    pub fn list_objects(&self) -> Result<Vec<ObjectId>> {
+        let mut ids = self.list_loose()?;
+        for p in self.packs()? {
+            ids.extend_from_slice(p.index().ids());
+        }
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    /// Fully verify every pack (checksums and every object's hash). Returns
+    /// one `(pack, problem)` per damaged pack; empty means all good.
+    pub fn verify_packs(&self) -> Result<Vec<(String, String)>> {
+        self.reload_packs()?;
+        let mut problems = self.broken_packs()?;
+        for p in self.packs()? {
+            if let Err(e) = p.verify(&*self.backend) {
+                problems.push((p.name().to_string(), e.to_string()));
+            }
+        }
+        Ok(problems)
+    }
+
+    pub fn stats(&self) -> Result<StoreStats> {
+        let loose = self.list_loose()?;
+        let mut loose_bytes = 0;
+        for id in &loose {
+            loose_bytes += self.backend.metadata(&self.loose_path(id))?.map_or(0, |m| m.len);
+        }
+        let packs = self.packs()?;
+        Ok(StoreStats {
+            loose_objects: loose.len(),
+            loose_bytes,
+            packs: packs.len(),
+            packed_objects: packs.iter().map(|p| p.index().len()).sum(),
+            pack_bytes: packs.iter().map(|p| p.disk_size()).sum(),
+            trees: self.trees.stats(),
+            snapshots: self.snapshots.stats(),
+            delta_bases: self.bases.stats(),
+        })
+    }
+
+    /// Drop every cache and re-scan packs (after gc changed the store).
+    pub fn invalidate(&self) -> Result<()> {
+        self.trees.clear();
+        self.snapshots.clear();
+        self.bases.clear();
+        *self.gc.pending.write().unwrap() = None;
+        self.gc.freshened.write().unwrap().clear();
+        *self.packs.write().unwrap() = PackSet::default();
+        self.reload_packs()?;
+        Ok(())
+    }
+
+    // ---- gc cooperation --------------------------------------------------
+
+    /// Disable freshening while gc itself walks the store.
+    pub(crate) fn set_freshening(&self, on: bool) {
+        self.gc.enabled.store(on, Ordering::SeqCst);
+    }
+
+    fn is_gc_candidate(&self, id: &ObjectId) -> bool {
+        if !self.gc.enabled.load(Ordering::Relaxed) {
+            return false;
+        }
+        {
+            let p = self.gc.pending.read().unwrap();
+            if let Some((at, set)) = &*p {
+                if at.elapsed() < PENDING_TTL {
+                    return set.contains(id);
+                }
+            }
+        }
+        let set = Arc::new(
+            crate::gc::read_pending(&*self.backend, &self.gc_dir())
+                .map(|m| m.into_keys().collect::<HashSet<ObjectId>>())
+                .unwrap_or_default(),
+        );
+        let hit = set.contains(id);
+        *self.gc.pending.write().unwrap() = Some((Instant::now(), set));
+        hit
+    }
+
+    fn write_keep_marker(&self, id: &ObjectId) {
+        let _ = self.backend.write(&self.keep_marker(id), b"");
+    }
+
+    /// If `id` is a gc candidate, mark it as in use and make sure a loose copy
+    /// exists, so that no gc deletes it from under us.
+    fn freshen(&self, id: &ObjectId) {
+        if !self.is_gc_candidate(id) || self.gc.freshened.read().unwrap().contains(id) {
+            return;
+        }
+        self.write_keep_marker(id);
+        if !self.loose_exists(id) {
+            if let Ok(Some(raw)) = self.read_packed(id) {
+                let _ = self.backend.write(&self.loose_path(id), &raw);
+            }
+        }
+        self.gc.freshened.write().unwrap().insert(*id);
+    }
+
+    // ---- typed access ----------------------------------------------------
 
     /// Decode without decrypting.
     pub fn get(&self, id: &ObjectId) -> Result<Object> {
@@ -97,14 +477,14 @@ impl ObjectStore {
     }
 
     pub fn tree(&self, id: &ObjectId) -> Result<Arc<Tree>> {
-        if let Some(t) = self.trees.read().unwrap().get(id) {
-            return Ok(t.clone());
+        if let Some(t) = self.trees.get(id) {
+            return Ok(t);
         }
         let t = match self.open(id)? {
             Object::Tree(t) => Arc::new(t),
             o => return Err(VeilError::Corrupt(id.hex(), format!("expected tree, found {}", o.kind_name()))),
         };
-        self.trees.write().unwrap().insert(*id, t.clone());
+        self.trees.insert(*id, t.clone(), t.entries.len() + 1);
         Ok(t)
     }
 
@@ -117,8 +497,8 @@ impl ObjectStore {
     }
 
     pub fn snapshot(&self, id: &ObjectId) -> Result<Arc<Snapshot>> {
-        if let Some(s) = self.snapshots.read().unwrap().get(id) {
-            return Ok(s.clone());
+        if let Some(s) = self.snapshots.get(id) {
+            return Ok(s);
         }
         let s = match self.get(id)? {
             Object::Snapshot(s) => Arc::new(s),
@@ -129,7 +509,7 @@ impl ObjectStore {
                 ))
             }
         };
-        self.snapshots.write().unwrap().insert(*id, s.clone());
+        self.snapshots.insert(*id, s.clone(), 1);
         Ok(s)
     }
 

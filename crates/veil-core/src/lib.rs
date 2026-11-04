@@ -6,7 +6,7 @@
 //! |-------|---------|----------------|
 //! | VFS | [`vfs`], [`vpath`] | `StorageBackend` trait + disk / memory / overlay backends |
 //! | Crypto | [`crypto`], [`identity`], [`keychain`] | XChaCha20-Poly1305 envelopes, X25519 identity rings, scope keys |
-//! | CAS | [`id`], [`object`], [`store`] | BLAKE3 content-addressed objects, sealed (encrypted) nodes |
+//! | CAS | [`id`], [`object`], [`store`], [`pack`], [`gc`] | BLAKE3 content-addressed objects, sealed (encrypted) nodes, packfiles, garbage collection |
 //! | Policy | [`policy`], [`secrets`] | per-path visibility tiers, engine-level secret detection |
 //! | Trees | [`tree`], [`builder`], [`checkout`], [`merge`] | tree views, snapshotting, materialisation, 3-way merge |
 //! | Graph | [`oplog`], [`repo`], [`transaction`], [`revset`] | snapshot DAG, change ids, operation log, undo |
@@ -34,11 +34,13 @@
 //! ```
 
 pub mod builder;
+pub mod cache;
 pub mod checkout;
 pub mod commands;
 pub mod crypto;
 pub mod embargo;
 pub mod error;
+pub mod gc;
 pub mod id;
 pub mod identity;
 pub mod keychain;
@@ -46,6 +48,7 @@ pub mod lock;
 pub mod merge;
 pub mod object;
 pub mod oplog;
+pub mod pack;
 pub mod policy;
 pub mod remote;
 pub mod repo;
