@@ -19,8 +19,24 @@ fn rich_git_history(env: &Env) -> (PathBuf, PathBuf) {
     write(&wc, "run.sh", "#!/bin/sh\necho hi\n");
     set_mode(&wc.join("run.sh"), 0o755);
     git(&wc, &["add", "-A"]);
-    git_env(&wc, &[("GIT_AUTHOR_NAME", "Zoë Ünicode"), ("GIT_AUTHOR_EMAIL", "zoe@example.com"), ("GIT_AUTHOR_DATE", "1700000000 +0000")], &["commit", "-q", "-m", "odd names\n\nA body paragraph.\n\nSigned-off-by: Zoë <zoe@example.com>"]);
-    git(&wc, &["commit", "-q", "--allow-empty", "-m", "an empty commit"]);
+    git_env(
+        &wc,
+        &[
+            ("GIT_AUTHOR_NAME", "Zoë Ünicode"),
+            ("GIT_AUTHOR_EMAIL", "zoe@example.com"),
+            ("GIT_AUTHOR_DATE", "1700000000 +0000"),
+        ],
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "odd names\n\nA body paragraph.\n\nSigned-off-by: Zoë <zoe@example.com>",
+        ],
+    );
+    git(
+        &wc,
+        &["commit", "-q", "--allow-empty", "-m", "an empty commit"],
+    );
     git(&wc, &["checkout", "-q", "-b", "side"]);
     write(&wc, "side.txt", "side\n");
     git(&wc, &["add", "-A"]);
@@ -51,11 +67,18 @@ fn changes(env: &Env, user: &str, dir: &Path) -> Vec<(String, String)> {
         if l.contains("default@") || body.starts_with("zzzzzzzz") {
             continue;
         }
-        let Some(change) = body.split_whitespace().next().filter(|w| w.len() == 8 && w.chars().all(|c| ('k'..='z').contains(&c))) else {
+        let Some(change) = body
+            .split_whitespace()
+            .next()
+            .filter(|w| w.len() == 8 && w.chars().all(|c| ('k'..='z').contains(&c)))
+        else {
             continue;
         };
         if l.contains('○') || l.contains('◆') || l.contains('@') {
-            let desc = lines.get(i + 1).map(|d| d.trim_start_matches(|c: char| "│ ".contains(c)).to_string()).unwrap_or_default();
+            let desc = lines
+                .get(i + 1)
+                .map(|d| d.trim_start_matches(|c: char| "│ ".contains(c)).to_string())
+                .unwrap_or_default();
             out.push((change.to_string(), desc));
         }
     }
@@ -70,10 +93,22 @@ fn git_import_preserves_the_fast_export_scenarios() {
     let env = Env::new();
     let (bare, _wc) = rich_git_history(&env);
     let proj = import(&env, "alice", "proj", &bare);
-    for f in ["dir with space/f i le.txt", "ünïcödé.txt", "-dash.txt", "nonl.txt", "empty", "bin.dat", "side.txt"] {
+    for f in [
+        "dir with space/f i le.txt",
+        "ünïcödé.txt",
+        "-dash.txt",
+        "nonl.txt",
+        "empty",
+        "bin.dat",
+        "side.txt",
+    ] {
         assert_eq!(
             std::fs::read(proj.join(f)).unwrap(),
-            git_cmd(&bare).args(["show", &format!("main:{f}")]).output().unwrap().stdout,
+            git_cmd(&bare)
+                .args(["show", &format!("main:{f}")])
+                .output()
+                .unwrap()
+                .stdout,
             "{f}"
         );
     }
@@ -82,7 +117,10 @@ fn git_import_preserves_the_fast_export_scenarios() {
     assert!(!is_executable(&proj.join("nonl.txt")));
     let log = env.stdout("alice", &proj, &["log"]);
     assert!(log.contains("Zoë Ünicode <zoe@example.com>"), "{log}");
-    assert!(log.contains("an empty commit") && log.contains("(empty)"), "{log}");
+    assert!(
+        log.contains("an empty commit") && log.contains("(empty)"),
+        "{log}"
+    );
     assert!(log.contains("merges"), "the merge has two parents: {log}");
     let show = env.stdout("alice", &proj, &["show", "main--"]);
     let _ = show;
@@ -105,11 +143,17 @@ fn a_multi_paragraph_message_survives_import() {
         .lines()
         .zip(log.lines().skip(1))
         .find(|(_, d)| d.contains("odd names"))
-        .and_then(|(l, _)| l.split_whitespace().find(|w| w.len() == 8 && w.chars().all(|c| ('k'..='z').contains(&c))))
+        .and_then(|(l, _)| {
+            l.split_whitespace()
+                .find(|w| w.len() == 8 && w.chars().all(|c| ('k'..='z').contains(&c)))
+        })
         .expect("the odd-names change")
         .to_string();
     let show = env.stdout("alice", &proj, &["show", &change]);
-    assert!(show.contains("A body paragraph.") && show.contains("Signed-off-by: Zoë"), "{show}");
+    assert!(
+        show.contains("A body paragraph.") && show.contains("Signed-off-by: Zoë"),
+        "{show}"
+    );
 }
 
 // Scenario from git t9350-fast-export.sh ("fast-export | fast-import" gives identical
@@ -120,14 +164,28 @@ fn git_to_veil_to_git_keeps_every_commit_id() {
     let (bare, _wc) = rich_git_history(&env);
     let proj = import(&env, "alice", "proj", &bare);
     let other = env.path("other.git");
-    git(&env.root, &["init", "-q", "--bare", other.to_str().unwrap()]);
-    env.ok("alice", &proj, &["git", "remote", "add", "other", other.to_str().unwrap()]);
+    git(
+        &env.root,
+        &["init", "-q", "--bare", other.to_str().unwrap()],
+    );
+    env.ok(
+        "alice",
+        &proj,
+        &["git", "remote", "add", "other", other.to_str().unwrap()],
+    );
     env.ok("alice", &proj, &["git", "push", "other"]);
     for b in ["main", "side"] {
-        assert_eq!(git(&other, &["rev-parse", b]), git(&bare, &["rev-parse", b]), "{b}");
+        assert_eq!(
+            git(&other, &["rev-parse", b]),
+            git(&bare, &["rev-parse", b]),
+            "{b}"
+        );
     }
     let out = env.ok("alice", &proj, &["git", "push"]);
-    assert!(out.contains("up to date main") && out.contains("up to date side"), "{out}");
+    assert!(
+        out.contains("up to date main") && out.contains("up to date side"),
+        "{out}"
+    );
 }
 
 // Scenario from git t9350-fast-export.sh, Veil → Git: every Veil commit becomes one Git
@@ -135,9 +193,15 @@ fn git_to_veil_to_git_keeps_every_commit_id() {
 #[test]
 fn veil_history_exports_with_change_ids_authors_merges_and_modes() {
     let env = Env::new();
-    let (proj, bare) = veil_with_git_remote(&env, "Alice Doe <alice@example.com>", "proj", "gh.git");
+    let (proj, bare) =
+        veil_with_git_remote(&env, "Alice Doe <alice@example.com>", "proj", "gh.git");
     let u = "Alice Doe <alice@example.com>";
-    env.commit(u, &proj, "base", &[("a.txt", "a\n"), ("tool.sh", "#!/bin/sh\n")]);
+    env.commit(
+        u,
+        &proj,
+        "base",
+        &[("a.txt", "a\n"), ("tool.sh", "#!/bin/sh\n")],
+    );
     set_mode(&proj.join("tool.sh"), 0o755);
     env.commit(u, &proj, "make it executable", &[]);
     env.ok(u, &proj, &["tag", "set", "main", "-r", "@-"]);
@@ -147,11 +211,18 @@ fn veil_history_exports_with_change_ids_authors_merges_and_modes() {
     env.ok(u, &proj, &["tag", "set", "side", "-r", "@-"]);
     env.ok(u, &proj, &["new", "main"]);
     env.commit(u, &proj, "main work", &[("m.txt", "m\n")]);
-    env.ok(u, &proj, &["merge", "side", "--into", "main", "-m", "merge side"]);
+    env.ok(
+        u,
+        &proj,
+        &["merge", "side", "--into", "main", "-m", "merge side"],
+    );
     env.ok(u, &proj, &["git", "push"]);
     let parents = git(&bare, &["log", "-1", "--format=%P", "main"]);
     assert_eq!(parents.split_whitespace().count(), 2, "{parents}");
-    assert_eq!(git(&bare, &["log", "-1", "--format=%an <%ae>", "main"]), "Alice Doe <alice@example.com>");
+    assert_eq!(
+        git(&bare, &["log", "-1", "--format=%an <%ae>", "main"]),
+        "Alice Doe <alice@example.com>"
+    );
     let raw = git(&bare, &["cat-file", "commit", "main"]);
     assert!(raw.lines().any(|l| l.starts_with("change-id ")), "{raw}");
     let mode = git(&bare, &["ls-tree", "main", "tool.sh"]);
@@ -170,8 +241,14 @@ fn an_empty_veil_commit_exports_as_an_empty_git_commit() {
     env.ok("alice", &proj, &["commit", "-m", "nothing changed"]);
     env.ok("alice", &proj, &["tag", "set", "main", "-r", "@-"]);
     env.ok("alice", &proj, &["git", "push"]);
-    assert_eq!(git(&bare, &["log", "-1", "--format=%s", "main"]), "nothing changed");
-    assert_eq!(git(&bare, &["rev-parse", "main^{tree}"]), git(&bare, &["rev-parse", "main~1^{tree}"]));
+    assert_eq!(
+        git(&bare, &["log", "-1", "--format=%s", "main"]),
+        "nothing changed"
+    );
+    assert_eq!(
+        git(&bare, &["rev-parse", "main^{tree}"]),
+        git(&bare, &["rev-parse", "main~1^{tree}"])
+    );
 }
 
 // Scenario from git t9350-fast-export.sh: deletions, a file replaced by a directory and
@@ -181,7 +258,18 @@ fn deletions_and_type_changes_export_correctly() {
     let env = Env::new();
     let (proj, bare) = veil_with_git_remote(&env, "alice", "proj", "gh.git");
     let deep = format!("{}leaf.txt", "d/".repeat(30));
-    env.commit("alice", &proj, "base", &[("x", "file x\n"), ("gone.txt", "g\n"), (deep.as_str(), "deep\n"), ("sp ace/ü.txt", "u\n"), ("empty", "")]);
+    env.commit(
+        "alice",
+        &proj,
+        "base",
+        &[
+            ("x", "file x\n"),
+            ("gone.txt", "g\n"),
+            (deep.as_str(), "deep\n"),
+            ("sp ace/ü.txt", "u\n"),
+            ("empty", ""),
+        ],
+    );
     write_bytes(&proj, "bin", &[0, 1, 2, 0xff]);
     std::fs::remove_file(proj.join("gone.txt")).unwrap();
     std::fs::remove_file(proj.join("x")).unwrap();
@@ -191,15 +279,32 @@ fn deletions_and_type_changes_export_correctly() {
     env.ok("alice", &proj, &["git", "push"]);
     let files = git(&bare, &["ls-tree", "-r", "--name-only", "main"]);
     assert!(!files.contains("gone.txt"), "{files}");
-    assert!(files.contains("x/inside.txt") && files.contains(&deep) && files.contains("sp ace/ü.txt") && files.contains("empty") && files.contains("bin"), "{files}");
-    assert_eq!(git_cmd(&bare).args(["show", "main:bin"]).output().unwrap().stdout, vec![0, 1, 2, 0xff]);
+    assert!(
+        files.contains("x/inside.txt")
+            && files.contains(&deep)
+            && files.contains("sp ace/ü.txt")
+            && files.contains("empty")
+            && files.contains("bin"),
+        "{files}"
+    );
+    assert_eq!(
+        git_cmd(&bare)
+            .args(["show", "main:bin"])
+            .output()
+            .unwrap()
+            .stdout,
+        vec![0, 1, 2, 0xff]
+    );
     // And back to a file.
     std::fs::remove_dir_all(proj.join("x")).unwrap();
     write(&proj, "x", "a file again\n");
     env.ok("alice", &proj, &["commit", "-m", "x is a file again"]);
     env.ok("alice", &proj, &["git", "push"]);
     assert_eq!(git(&bare, &["show", "main:x"]), "a file again");
-    assert!(git(&bare, &["fsck", "--no-progress"]).is_empty() || git_ok(&bare, &["fsck", "--no-progress"]));
+    assert!(
+        git(&bare, &["fsck", "--no-progress"]).is_empty()
+            || git_ok(&bare, &["fsck", "--no-progress"])
+    );
 }
 
 // Scenario from git t9300-fast-import.sh: a Git commit replacing a file by a directory imports.
@@ -212,7 +317,10 @@ fn a_git_file_to_directory_change_imports() {
     write(&wc, "x/y.txt", "dir now\n");
     git_commit_push(&wc, "x becomes a directory");
     env.ok("alice", &proj, &["git", "pull"]);
-    assert_eq!(env.stdout("alice", &proj, &["cat", "x/y.txt", "-r", "main"]), "dir now\n");
+    assert_eq!(
+        env.stdout("alice", &proj, &["cat", "x/y.txt", "-r", "main"]),
+        "dir now\n"
+    );
     env.ok("alice", &proj, &["rebase", "-d", "main"]);
     assert_eq!(read(&proj, "x/y.txt"), "dir now\n");
 }
@@ -267,10 +375,17 @@ fn two_replicas_export_the_same_commits() {
     let gb = env.path("b.git");
     for (who, dir, g) in [("alice", &alice, &ga), ("bob", &bob, &gb)] {
         git(&env.root, &["init", "-q", "--bare", g.to_str().unwrap()]);
-        env.ok(who, dir, &["git", "remote", "add", "gh", g.to_str().unwrap()]);
+        env.ok(
+            who,
+            dir,
+            &["git", "remote", "add", "gh", g.to_str().unwrap()],
+        );
         env.ok(who, dir, &["git", "push", "gh", "-t", "main"]);
     }
-    assert_eq!(git(&ga, &["rev-parse", "main"]), git(&gb, &["rev-parse", "main"]));
+    assert_eq!(
+        git(&ga, &["rev-parse", "main"]),
+        git(&gb, &["rev-parse", "main"])
+    );
 }
 
 // Veil: a second replica pulling Alice's export from GitHub recognises it (same snapshots).
@@ -280,13 +395,24 @@ fn a_replica_recognises_exports_made_by_another_replica() {
     let (alice, hub) = env.project_with_hub("alice", "alice", "hub", &[("a.txt", "a\n")]);
     let gh = env.path("gh.git");
     git(&env.root, &["init", "-q", "--bare", gh.to_str().unwrap()]);
-    env.ok("alice", &alice, &["git", "remote", "add", "gh", gh.to_str().unwrap()]);
+    env.ok(
+        "alice",
+        &alice,
+        &["git", "remote", "add", "gh", gh.to_str().unwrap()],
+    );
     env.ok("alice", &alice, &["git", "push", "gh"]);
     let bob = env.clone("bob", &hub, "bob");
-    env.ok("bob", &bob, &["git", "remote", "add", "gh", gh.to_str().unwrap()]);
+    env.ok(
+        "bob",
+        &bob,
+        &["git", "remote", "add", "gh", gh.to_str().unwrap()],
+    );
     let out = env.ok("bob", &bob, &["git", "pull", "gh"]);
     assert!(out.contains("Imported 0 commit(s)"), "{out}");
-    assert_eq!(env.tag_target("bob", &bob, "main"), env.tag_target("bob", &bob, "gh/main"));
+    assert_eq!(
+        env.tag_target("bob", &bob, "main"),
+        env.tag_target("bob", &bob, "gh/main")
+    );
 }
 
 // Veil + jj test_git_fetch.rs (two clones fetching the same new commits): the same GitHub
@@ -300,7 +426,11 @@ fn the_same_github_commit_pulled_by_two_members_is_one_snapshot() {
     env.ok("alice", &alice, &["remote", "add", "hub", "../hub"]);
     env.ok("alice", &alice, &["push", "hub"]);
     let bob = env.clone("bob", &env.path("hub"), "bob");
-    env.ok("bob", &bob, &["git", "remote", "add", "gh", bare.to_str().unwrap()]);
+    env.ok(
+        "bob",
+        &bob,
+        &["git", "remote", "add", "gh", bare.to_str().unwrap()],
+    );
     env.ok("bob", &bob, &["git", "pull", "gh"]);
     // A commit lands on GitHub; both members `vl git pull` before syncing with each other.
     write(&wc, "b.txt", "from github\n");
@@ -309,8 +439,14 @@ fn the_same_github_commit_pulled_by_two_members_is_one_snapshot() {
     env.ok("bob", &bob, &["git", "pull", "gh"]);
     env.ok("alice", &alice, &["push", "hub"]);
     let out = env.ok("bob", &bob, &["pull"]);
-    assert!(!out.contains("diverged"), "the same Git commit diverged: {out}");
-    assert_eq!(env.tag_target("bob", &bob, "main"), env.tag_target("bob", &bob, "origin/main"));
+    assert!(
+        !out.contains("diverged"),
+        "the same Git commit diverged: {out}"
+    );
+    assert_eq!(
+        env.tag_target("bob", &bob, "main"),
+        env.tag_target("bob", &bob, "origin/main")
+    );
 }
 
 // Deliberate difference (docs/guide/github.md "Times are exported in UTC"): Git time zones
@@ -321,14 +457,27 @@ fn author_time_survives_but_the_time_zone_becomes_utc() {
     let (bare, wc) = git_upstream(&env, "gh.git", &[("a", "a\n")]);
     write(&wc, "b", "b\n");
     git(&wc, &["add", "-A"]);
-    git_env(&wc, &[("GIT_AUTHOR_DATE", "1700000000 +0530"), ("GIT_COMMITTER_DATE", "1700000000 +0530")], &["commit", "-q", "-m", "in India"]);
+    git_env(
+        &wc,
+        &[
+            ("GIT_AUTHOR_DATE", "1700000000 +0530"),
+            ("GIT_COMMITTER_DATE", "1700000000 +0530"),
+        ],
+        &["commit", "-q", "-m", "in India"],
+    );
     git(&wc, &["push", "-q", "origin", "HEAD:main"]);
     let proj = import(&env, "alice", "proj", &bare);
     env.commit("alice", &proj, "on top", &[("c", "c\n")]);
     env.ok("alice", &proj, &["tag", "set", "main", "-r", "@-"]);
     env.ok("alice", &proj, &["git", "push"]);
     // The imported commit itself is GitHub's own (unchanged); Veil's new commit is UTC.
-    assert_eq!(git(&bare, &["log", "-1", "--format=%ad", "--date=raw", "main~1"]), "1700000000 +0530");
+    assert_eq!(
+        git(
+            &bare,
+            &["log", "-1", "--format=%ad", "--date=raw", "main~1"]
+        ),
+        "1700000000 +0530"
+    );
     assert!(git(&bare, &["log", "-1", "--format=%ad", "--date=raw", "main"]).ends_with("+0000"));
 }
 
@@ -345,8 +494,14 @@ fn a_change_id_header_from_git_is_honoured() {
     );
     let path = env.path("commit.raw");
     std::fs::write(&path, raw).unwrap();
-    let id = git(&wc, &["hash-object", "-t", "commit", "-w", path.to_str().unwrap()]);
-    git(&wc, &["push", "-q", "origin", &format!("{id}:refs/heads/main")]);
+    let id = git(
+        &wc,
+        &["hash-object", "-t", "commit", "-w", path.to_str().unwrap()],
+    );
+    git(
+        &wc,
+        &["push", "-q", "origin", &format!("{id}:refs/heads/main")],
+    );
     let proj = import(&env, "alice", "proj", &bare);
     let show = env.stdout("alice", &proj, &["show", "main"]);
     assert!(show.contains("zzzzkkkkzzzzkkkkzzzzkkkkzzzzkkkk"), "{show}");
@@ -357,19 +512,45 @@ fn a_change_id_header_from_git_is_honoured() {
 fn names_with_quotes_and_backslashes_round_trip() {
     let env = Env::new();
     let (proj, bare) = veil_with_git_remote(&env, "alice", "proj", "gh.git");
-    for name in ["q\"uote.txt", "back\\slash.txt", "tab\tname.txt", "new\nline.txt"] {
+    for name in [
+        "q\"uote.txt",
+        "back\\slash.txt",
+        "tab\tname.txt",
+        "new\nline.txt",
+    ] {
         write(&proj, name, "odd\n");
     }
     env.ok("alice", &proj, &["commit", "-m", "odd names"]);
     env.ok("alice", &proj, &["tag", "set", "main", "-r", "@-"]);
     env.ok("alice", &proj, &["git", "push"]);
-    let files = git_cmd(&bare).args(["ls-tree", "-r", "-z", "--name-only", "main"]).output().unwrap().stdout;
-    let names: Vec<String> = files.split(|b| *b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned()).collect();
-    for name in ["q\"uote.txt", "back\\slash.txt", "tab\tname.txt", "new\nline.txt"] {
-        assert!(names.contains(&name.to_string()), "{name:?} missing from {names:?}");
+    let files = git_cmd(&bare)
+        .args(["ls-tree", "-r", "-z", "--name-only", "main"])
+        .output()
+        .unwrap()
+        .stdout;
+    let names: Vec<String> = files
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    for name in [
+        "q\"uote.txt",
+        "back\\slash.txt",
+        "tab\tname.txt",
+        "new\nline.txt",
+    ] {
+        assert!(
+            names.contains(&name.to_string()),
+            "{name:?} missing from {names:?}"
+        );
     }
     let back = import(&env, "bob", "back", &bare);
-    for name in ["q\"uote.txt", "back\\slash.txt", "tab\tname.txt", "new\nline.txt"] {
+    for name in [
+        "q\"uote.txt",
+        "back\\slash.txt",
+        "tab\tname.txt",
+        "new\nline.txt",
+    ] {
         assert_eq!(read(&back, name), "odd\n", "{name:?}");
     }
 }
@@ -387,10 +568,20 @@ fn nfc_and_nfd_names_round_trip_byte_for_byte() {
     assert_eq!(read(&proj, "caf\u{e9}.txt"), "nfc\n");
     assert_eq!(read(&proj, "cafe\u{301}.txt"), "nfd\n");
     let other = env.path("other.git");
-    git(&env.root, &["init", "-q", "--bare", other.to_str().unwrap()]);
-    env.ok("alice", &proj, &["git", "remote", "add", "other", other.to_str().unwrap()]);
+    git(
+        &env.root,
+        &["init", "-q", "--bare", other.to_str().unwrap()],
+    );
+    env.ok(
+        "alice",
+        &proj,
+        &["git", "remote", "add", "other", other.to_str().unwrap()],
+    );
     env.ok("alice", &proj, &["git", "push", "other"]);
-    assert_eq!(git(&other, &["rev-parse", "main"]), git(&bare, &["rev-parse", "main"]));
+    assert_eq!(
+        git(&other, &["rev-parse", "main"]),
+        git(&bare, &["rev-parse", "main"])
+    );
 }
 
 // Scenario from git t9300-fast-import.sh: a symlink in Git (pending feature in Veil) is
@@ -407,7 +598,10 @@ fn a_git_symlink_is_reported_and_survives_a_veil_push() {
     env.commit("alice", &proj, "veil edit", &[("target.txt", "t2\n")]);
     env.ok("alice", &proj, &["git", "push"]);
     let mode = git(&bare, &["ls-tree", "main", "link"]);
-    assert!(mode.starts_with("120000"), "the symlink was dropped from Git: {mode:?}");
+    assert!(
+        mode.starts_with("120000"),
+        "the symlink was dropped from Git: {mode:?}"
+    );
 }
 
 // Veil: export of a cloaked file's public neighbour edits keeps Git history linear, and a
@@ -418,7 +612,15 @@ fn veil_never_reimports_its_own_exports() {
     let (proj, _bare) = veil_with_git_remote(&env, "alice", "proj", "gh.git");
     env.ok("alice", &proj, &["cloak", "secrets/"]);
     for i in 0..3 {
-        env.commit("alice", &proj, &format!("c{i}"), &[("pub.txt", &format!("{i}\n")), ("secrets/s.txt", &format!("s{i}\n"))]);
+        env.commit(
+            "alice",
+            &proj,
+            &format!("c{i}"),
+            &[
+                ("pub.txt", &format!("{i}\n")),
+                ("secrets/s.txt", &format!("s{i}\n")),
+            ],
+        );
     }
     env.ok("alice", &proj, &["tag", "set", "main", "-r", "@-"]);
     env.ok("alice", &proj, &["git", "push"]);

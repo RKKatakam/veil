@@ -13,7 +13,10 @@ fn gc(env: &Env, dir: &Path, args: &[&str]) -> String {
 
 /// `N pending deletion` / `N deleted` from gc's summary line.
 fn count(out: &str, what: &str) -> usize {
-    let line = out.lines().find(|l| l.starts_with("Objects:")).unwrap_or_else(|| panic!("{out}"));
+    let line = out
+        .lines()
+        .find(|l| l.starts_with("Objects:"))
+        .unwrap_or_else(|| panic!("{out}"));
     line.split(',')
         .find(|p| p.trim().ends_with(what))
         .and_then(|p| p.split_whitespace().next())
@@ -63,14 +66,26 @@ fn gc_keeps_all_reachable_history_and_packs_it() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a.txt", "v0\n")]);
     for i in 1..6 {
-        env.commit("alice", &proj, &format!("v{i}"), &[("a.txt", &format!("v{i}\n"))]);
+        env.commit(
+            "alice",
+            &proj,
+            &format!("v{i}"),
+            &[("a.txt", &format!("v{i}\n"))],
+        );
     }
     gc(&env, &proj, &["--prune-now"]);
-    assert!(loose_objects(&proj).is_empty(), "{:?}", loose_objects(&proj));
+    assert!(
+        loose_objects(&proj).is_empty(),
+        "{:?}",
+        loose_objects(&proj)
+    );
     assert_eq!(packs(&proj).len(), 1);
     for i in 0..6 {
         let rev = format!("main{}", "-".repeat(5 - i));
-        assert_eq!(env.stdout("alice", &proj, &["cat", "a.txt", "-r", &rev]), format!("v{i}\n"));
+        assert_eq!(
+            env.stdout("alice", &proj, &["cat", "a.txt", "-r", &rev]),
+            format!("v{i}\n")
+        );
     }
     env.ok("alice", &proj, &["fsck"]);
 }
@@ -106,8 +121,14 @@ fn prune_now_deletes_unreachable_objects_at_once() {
     env.commit("alice", &proj, "later still", &[("later2.txt", "later\n")]);
     let out = gc(&env, &proj, &["--keep-ops-days", "0", "--prune-now"]);
     assert!(count(&out, "deleted") > 0, "{out}");
-    assert!(!contains(&everything_in(&proj), "abandoned experiment 9090"));
-    assert_eq!(env.stdout("alice", &proj, &["cat", "keep.txt", "-r", "main"]), "kept\n");
+    assert!(!contains(
+        &everything_in(&proj),
+        "abandoned experiment 9090"
+    ));
+    assert_eq!(
+        env.stdout("alice", &proj, &["cat", "keep.txt", "-r", "main"]),
+        "kept\n"
+    );
 }
 
 // Scenario from git t5304-prune.sh: "gc --prune=never" — with the whole op log kept
@@ -161,12 +182,20 @@ fn gc_keeps_what_only_a_remote_tag_reaches() {
     let env = Env::new();
     let (alice, hub) = env.project_with_hub("alice", "alice", "hub", &[("a.txt", "a\n")]);
     let bob = env.clone("bob", &hub, "bob");
-    env.commit("alice", &alice, "remote only", &[("r.txt", "only on origin/main\n")]);
+    env.commit(
+        "alice",
+        &alice,
+        "remote only",
+        &[("r.txt", "only on origin/main\n")],
+    );
     env.ok("alice", &alice, &["push"]);
     env.ok("bob", &bob, &["pull"]);
     env.ok("bob", &bob, &["tag", "delete", "main"]);
     env.ok("bob", &bob, &["gc", "--keep-ops-days", "0", "--prune-now"]);
-    assert_eq!(env.stdout("bob", &bob, &["cat", "r.txt", "-r", "origin/main"]), "only on origin/main\n");
+    assert_eq!(
+        env.stdout("bob", &bob, &["cat", "r.txt", "-r", "origin/main"]),
+        "only on origin/main\n"
+    );
     env.ok("bob", &bob, &["fsck"]);
 }
 
@@ -176,9 +205,26 @@ fn gc_keeps_every_workspace_and_its_unrecorded_base() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a", "a\n")]);
     env.ok("alice", &proj, &["ws", "new", "agent", "-r", "main"]);
-    env.ok("alice", &proj, &["ws", "exec", "agent", "-m", "agent work", "--", "sh", "-c", "echo agent-only > agent.txt"]);
+    env.ok(
+        "alice",
+        &proj,
+        &[
+            "ws",
+            "exec",
+            "agent",
+            "-m",
+            "agent work",
+            "--",
+            "sh",
+            "-c",
+            "echo agent-only > agent.txt",
+        ],
+    );
     gc(&env, &proj, &["--keep-ops-days", "0", "--prune-now"]);
-    assert_eq!(env.stdout("alice", &proj, &["ws", "cat", "agent", "agent.txt"]), "agent-only\n");
+    assert_eq!(
+        env.stdout("alice", &proj, &["ws", "cat", "agent", "agent.txt"]),
+        "agent-only\n"
+    );
     env.ok("alice", &proj, &["fsck"]);
 }
 
@@ -196,15 +242,26 @@ fn gc_keeps_cloaked_content_and_content_it_cannot_read() {
     env.ok("alice", &proj, &["remote", "add", "origin", "../hub"]);
     env.ok("alice", &proj, &["push"]);
     gc(&env, &proj, &["--keep-ops-days", "0", "--prune-now"]);
-    assert_eq!(env.stdout("alice", &proj, &["cat", "secrets/s.txt", "-r", "main"]), "sealed\n");
+    assert_eq!(
+        env.stdout("alice", &proj, &["cat", "secrets/s.txt", "-r", "main"]),
+        "sealed\n"
+    );
     let bob = env.clone("bob", &env.path("hub"), "bob");
     env.ok("bob", &bob, &["gc", "--keep-ops-days", "0", "--prune-now"]);
     env.ok("bob", &bob, &["fsck"]);
     let key = env.pubkey("bob");
-    env.ok("alice", &proj, &["scope", "grant", "team", &key, "--name", "bob"]);
+    env.ok(
+        "alice",
+        &proj,
+        &["scope", "grant", "team", &key, "--name", "bob"],
+    );
     env.ok("alice", &proj, &["push"]);
     env.ok("bob", &bob, &["pull"]);
-    assert_eq!(read(&bob, "secrets/s.txt"), "sealed\n", "gc deleted the ciphertext Bob could not read yet");
+    assert_eq!(
+        read(&bob, "secrets/s.txt"),
+        "sealed\n",
+        "gc deleted the ciphertext Bob could not read yet"
+    );
 }
 
 // Scenario from git t6500-gc.sh: "background auto gc respects lock" — gc next to running commands.
@@ -219,13 +276,35 @@ fn gc_concurrent_with_commits_loses_nothing() {
     let mut children = Vec::new();
     for (i, w) in ws.iter().enumerate() {
         let script = format!("echo work-{i} > work-{i}.txt");
-        children.push(env.spawn("alice", &proj, &["ws", "exec", w, "-m", &format!("work {i}"), "--", "sh", "-c", &script]));
-        children.push(env.spawn("alice", &proj, &["gc", "--keep-ops-days", "0", "--prune-now"]));
+        children.push(env.spawn(
+            "alice",
+            &proj,
+            &[
+                "ws",
+                "exec",
+                w,
+                "-m",
+                &format!("work {i}"),
+                "--",
+                "sh",
+                "-c",
+                &script,
+            ],
+        ));
+        children.push(env.spawn(
+            "alice",
+            &proj,
+            &["gc", "--keep-ops-days", "0", "--prune-now"],
+        ));
     }
     for c in children {
         let out = c.wait_with_output().unwrap();
         assert!(exited_cleanly(&out), "{}", text(&out));
-        assert!(out.status.success() || text(&out).contains("locked"), "{}", text(&out));
+        assert!(
+            out.status.success() || text(&out).contains("locked"),
+            "{}",
+            text(&out)
+        );
     }
     let (code, out) = env.code("alice", &proj, &["fsck"]);
     assert_eq!(code, 0, "{out}");
@@ -246,7 +325,10 @@ fn push_and_pull_work_after_gc_on_both_sides() {
     env.commit("alice", &alice, "after gc", &[("a.txt", "after gc\n")]);
     env.ok("alice", &alice, &["push"]);
     env.ok("bob", &bob, &["pull"]);
-    assert_eq!(env.stdout("bob", &bob, &["cat", "a.txt", "-r", "main"]), "after gc\n");
+    assert_eq!(
+        env.stdout("bob", &bob, &["cat", "a.txt", "-r", "main"]),
+        "after gc\n"
+    );
     env.commit("bob", &bob, "bob after gc", &[("b.txt", "b\n")]);
     let _ = env.vl("bob", &bob, &["rebase", "-d", "main"]);
     env.ok("bob", &bob, &["fsck"]);
@@ -260,7 +342,10 @@ fn gc_compression_options_keep_the_repository_usable() {
     env.commit("alice", &proj, "two", &[("a.txt", &"line\n".repeat(1001))]);
     gc(&env, &proj, &["--level", "19"]);
     gc(&env, &proj, &["--no-deltas", "--level", "1"]);
-    assert_eq!(env.stdout("alice", &proj, &["cat", "a.txt", "-r", "main-"]), "line\n".repeat(1000));
+    assert_eq!(
+        env.stdout("alice", &proj, &["cat", "a.txt", "-r", "main-"]),
+        "line\n".repeat(1000)
+    );
     env.ok("alice", &proj, &["fsck"]);
 }
 
@@ -274,16 +359,25 @@ fn gc_deletes_nothing_when_history_cannot_be_read() {
         .into_iter()
         .find(|p| {
             let b = std::fs::read(p).unwrap();
-            b.starts_with(b"veil:tree") && contains(&b, "keep.txt") && !contains(&b, "experiment.txt")
+            b.starts_with(b"veil:tree")
+                && contains(&b, "keep.txt")
+                && !contains(&b, "experiment.txt")
         })
         .expect("main's root tree");
     std::fs::remove_file(&f).unwrap();
     let before = listing(&proj.join(".veil/objects")).len();
-    let out = env.vl("alice", &proj, &["--no-snapshot", "gc", "--keep-ops-days", "0", "--prune-now"]);
+    let out = env.vl(
+        "alice",
+        &proj,
+        &["--no-snapshot", "gc", "--keep-ops-days", "0", "--prune-now"],
+    );
     let t = text(&out);
     assert!(exited_cleanly(&out), "{t}");
     if out.status.success() {
         assert_eq!(count(&t, "deleted"), 0, "{t}");
     }
-    assert!(contains(&everything_in(&proj), "abandoned experiment 9090"), "deleted although history is damaged ({before} files before): {t}");
+    assert!(
+        contains(&everything_in(&proj), "abandoned experiment 9090"),
+        "deleted although history is damaged ({before} files before): {t}"
+    );
 }

@@ -19,13 +19,20 @@ pub struct Env {
     pub root: PathBuf,
     /// `VEIL_SSH` for every `vl` this environment runs (a stand-in).
     pub ssh: Option<String>,
+    /// Extra environment variables for every `vl`.
+    pub envs: Vec<(String, String)>,
 }
 
 impl Env {
     pub fn new() -> Env {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
-        Env { tmp, root, ssh: None }
+        Env {
+            tmp,
+            root,
+            ssh: None,
+            envs: Vec::new(),
+        }
     }
 
     /// An environment whose `ssh` is a script serving the local
@@ -40,23 +47,30 @@ impl Env {
     /// around the server, for example `| head -c 4000` (the connection
     /// drops after 4,000 bytes from the server).
     pub fn with_sftp_wrapper(filter: &str) -> Option<Env> {
-        let server = sftp_server()?;
+        sftp_server()?;
         let mut env = Env::new();
-        let home = env.dir("sshhome");
-        let script = env.root.join("fake-ssh");
+        env.ssh = Some(env.sftp_script("fake-ssh", filter));
+        Some(env)
+    }
+
+    /// Write a stand-in `ssh` script `<root>/<name>` (see [`Env::with_sftp`])
+    /// and return its path, for `VEIL_SSH`.
+    pub fn sftp_script(&self, name: &str, filter: &str) -> String {
+        let server = sftp_server().expect("sftp-server");
+        let home = self.dir("sshhome");
+        let script = self.root.join(name);
         std::fs::write(
             &script,
             format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\ncd '{home}' || exit 255\nexec sh -c '{server} {filter}'\n",
-                log = env.root.join("ssh.log").display(),
+                log = self.root.join("ssh.log").display(),
                 home = home.display(),
                 server = server.display(),
             ),
         )
         .unwrap();
         set_mode(&script, 0o755);
-        env.ssh = Some(script.display().to_string());
-        Some(env)
+        script.display().to_string()
     }
 
     pub fn ssh_log(&self) -> String {
@@ -91,6 +105,7 @@ impl Env {
         if let Some(ssh) = &self.ssh {
             c.env("VEIL_SSH", ssh);
         }
+        c.envs(self.envs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         c
     }
 
@@ -119,7 +134,10 @@ impl Env {
     pub fn fails(&self, user: &str, cwd: &Path, args: &[&str]) -> String {
         let out = self.vl(user, cwd, args);
         let t = text(&out);
-        assert!(!out.status.success(), "vl {args:?} unexpectedly succeeded:\n{t}");
+        assert!(
+            !out.status.success(),
+            "vl {args:?} unexpectedly succeeded:\n{t}"
+        );
         assert!(exited_cleanly(&out), "vl {args:?} crashed:\n{t}");
         t
     }
@@ -151,10 +169,20 @@ impl Env {
     }
 
     /// `project` plus a team remote `origin` at `<root>/<hub>`, pushed.
-    pub fn project_with_hub(&self, user: &str, name: &str, hub: &str, files: &[(&str, &str)]) -> (PathBuf, PathBuf) {
+    pub fn project_with_hub(
+        &self,
+        user: &str,
+        name: &str,
+        hub: &str,
+        files: &[(&str, &str)],
+    ) -> (PathBuf, PathBuf) {
         let proj = self.project(user, name, files);
         let hub = self.path(hub);
-        self.ok(user, &proj, &["remote", "add", "origin", hub.to_str().unwrap()]);
+        self.ok(
+            user,
+            &proj,
+            &["remote", "add", "origin", hub.to_str().unwrap()],
+        );
         self.ok(user, &proj, &["push"]);
         (proj, hub)
     }
@@ -171,7 +199,11 @@ impl Env {
     /// Clone `src` to `<root>/<dest>` as `user`.
     pub fn clone(&self, user: &str, src: &Path, dest: &str) -> PathBuf {
         let d = self.path(dest);
-        self.ok(user, &self.root, &["clone", src.to_str().unwrap(), d.to_str().unwrap()]);
+        self.ok(
+            user,
+            &self.root,
+            &["clone", src.to_str().unwrap(), d.to_str().unwrap()],
+        );
         d
     }
 
@@ -202,7 +234,11 @@ impl Env {
 }
 
 pub fn text(out: &Output) -> String {
-    format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
 }
 
 /// Did the process end normally (exit code, no signal, no Rust panic)?
@@ -316,7 +352,11 @@ pub fn contains(hay: &[u8], needle: &str) -> bool {
 
 /// Assert that nothing in the repository at `dir` contains `needle`.
 pub fn assert_absent(dir: &Path, needle: &str, what: &str) {
-    assert!(!contains(&everything_in(dir), needle), "{what}: '{needle}' found in {}", dir.display());
+    assert!(
+        !contains(&everything_in(dir), needle),
+        "{what}: '{needle}' found in {}",
+        dir.display()
+    );
 }
 
 /// Names of the key rings stored in a repository's `.veil/meta/keyrings`.
@@ -327,7 +367,9 @@ pub fn keyrings(dir: &Path) -> Vec<String> {
 /// Loose object files of the repository at `dir`.
 pub fn loose_objects(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir.join(".veil/objects")) else { return out };
+    let Ok(rd) = std::fs::read_dir(dir.join(".veil/objects")) else {
+        return out;
+    };
     for d in rd {
         let d = d.unwrap();
         if d.file_name().len() == 2 && d.file_type().unwrap().is_dir() {
@@ -342,7 +384,12 @@ pub fn loose_objects(dir: &Path) -> Vec<PathBuf> {
 
 pub fn packs(dir: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = std::fs::read_dir(dir.join(".veil/objects/pack"))
-        .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "pack")).collect())
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "pack"))
+                .collect()
+        })
         .unwrap_or_default();
     out.sort();
     out
@@ -359,7 +406,11 @@ pub fn loose_object_containing(dir: &Path, needle: &str) -> Option<PathBuf> {
 /// Flip one bit of the byte at `pos` (negative: from the end).
 pub fn flip_byte(p: &Path, pos: isize) {
     let mut b = std::fs::read(p).unwrap();
-    let i = if pos < 0 { (b.len() as isize + pos) as usize } else { pos as usize };
+    let i = if pos < 0 {
+        (b.len() as isize + pos) as usize
+    } else {
+        pos as usize
+    };
     b[i] ^= 0x01;
     std::fs::write(p, b).unwrap();
 }
@@ -384,16 +435,20 @@ pub fn copy_dir(from: &Path, to: &Path) {
 }
 
 pub fn repo_format(dir: &Path) -> u64 {
-    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(".veil/repo.json")).unwrap()).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join(".veil/repo.json")).unwrap()).unwrap();
     v["format"].as_u64().unwrap()
 }
 
 pub fn op_count(dir: &Path) -> usize {
-    std::fs::read_dir(dir.join(".veil/ops")).map(|d| d.count()).unwrap_or(0)
+    std::fs::read_dir(dir.join(".veil/ops"))
+        .map(|d| d.count())
+        .unwrap_or(0)
 }
 
 pub fn fixture(format: u32) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../veil-core/tests/fixtures/format-{format}"))
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("../veil-core/tests/fixtures/format-{format}"))
 }
 
 // ---- git -------------------------------------------------------------------
@@ -407,20 +462,39 @@ pub fn git_cmd(dir: &Path) -> Command {
         .env("GIT_AUTHOR_EMAIL", "gita@example.com")
         .env("GIT_COMMITTER_NAME", "Gita Hub")
         .env("GIT_COMMITTER_EMAIL", "gita@example.com")
-        .args(["-c", "init.defaultBranch=main", "-c", "commit.gpgsign=false", "-c", "core.quotePath=false"]);
+        .args([
+            "-c",
+            "init.defaultBranch=main",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.quotePath=false",
+        ]);
     c
 }
 
 /// Run git; assert success; trimmed stdout.
 pub fn git(dir: &Path, args: &[&str]) -> String {
     let out = git_cmd(dir).args(args).output().unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 pub fn git_env(dir: &Path, envs: &[(&str, &str)], args: &[&str]) -> String {
-    let out = git_cmd(dir).envs(envs.iter().copied()).args(args).output().unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    let out = git_cmd(dir)
+        .envs(envs.iter().copied())
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -462,7 +536,11 @@ pub fn git_all_objects(repo: &Path) -> Vec<u8> {
 }
 
 pub fn assert_absent_in_git(repo: &Path, needle: &str, what: &str) {
-    assert!(!contains(&git_all_objects(repo), needle), "{what}: '{needle}' found in Git objects of {}", repo.display());
+    assert!(
+        !contains(&git_all_objects(repo), needle),
+        "{what}: '{needle}' found in Git objects of {}",
+        repo.display()
+    );
 }
 
 /// A plain Veil `init` repository wired to a fresh bare Git remote `origin`.
@@ -473,7 +551,11 @@ pub fn veil_with_git_remote(env: &Env, user: &str, name: &str, bare: &str) -> (P
     }
     let proj = env.dir(name);
     env.ok(user, &proj, &["init"]);
-    env.ok(user, &proj, &["git", "remote", "add", "origin", bare.to_str().unwrap()]);
+    env.ok(
+        user,
+        &proj,
+        &["git", "remote", "add", "origin", bare.to_str().unwrap()],
+    );
     (proj, bare)
 }
 

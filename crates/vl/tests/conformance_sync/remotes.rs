@@ -9,13 +9,27 @@ fn remote_add_list_shows_kind_and_url() {
     let proj = env.project("alice", "proj", &[("a", "a\n")]);
     let out = env.ok("alice", &proj, &["remote", "add", "origin", "../hub"]);
     assert!(out.contains("Added team remote origin"), "{out}");
-    let out = env.ok("alice", &proj, &["remote", "add", "mirror", "../mirror", "--public"]);
+    let out = env.ok(
+        "alice",
+        &proj,
+        &["remote", "add", "mirror", "../mirror", "--public"],
+    );
     assert!(out.contains("Added public remote mirror"), "{out}");
     let list = env.stdout("alice", &proj, &["remote", "list"]);
     let lines: Vec<&str> = list.lines().collect();
     assert_eq!(lines.len(), 2, "{list}");
-    assert!(lines.iter().any(|l| l.starts_with("mirror") && l.contains("public") && l.contains("../mirror")), "{list}");
-    assert!(lines.iter().any(|l| l.starts_with("origin") && l.contains("team") && l.contains("../hub")), "{list}");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("mirror") && l.contains("public") && l.contains("../mirror")),
+        "{list}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("origin") && l.contains("team") && l.contains("../hub")),
+        "{list}"
+    );
 }
 
 // Scenario from git t5505-remote.sh: adding a remote whose name already exists fails.
@@ -24,10 +38,17 @@ fn remote_add_refuses_a_duplicate_name_and_keeps_the_original() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a", "a\n")]);
     env.ok("alice", &proj, &["remote", "add", "origin", "../hub"]);
-    let out = env.fails("alice", &proj, &["remote", "add", "origin", "../other", "--public"]);
+    let out = env.fails(
+        "alice",
+        &proj,
+        &["remote", "add", "origin", "../other", "--public"],
+    );
     assert!(out.contains("already exists"), "{out}");
     let list = env.stdout("alice", &proj, &["remote", "list"]);
-    assert!(list.contains("../hub") && !list.contains("../other") && list.contains("team"), "{list}");
+    assert!(
+        list.contains("../hub") && !list.contains("../other") && list.contains("team"),
+        "{list}"
+    );
 }
 
 // Scenario from git t5505-remote.sh: "remove remote".
@@ -37,7 +58,10 @@ fn remote_rm_removes_the_configuration_but_not_the_remote_data() {
     let (proj, hub) = env.project_with_hub("alice", "proj", "hub", &[("a", "a\n")]);
     env.ok("alice", &proj, &["remote", "rm", "origin"]);
     assert_eq!(env.stdout("alice", &proj, &["remote", "list"]).trim(), "");
-    assert!(hub.join(".veil/repo.json").exists(), "the remote's data stays");
+    assert!(
+        hub.join(".veil/repo.json").exists(),
+        "the remote's data stays"
+    );
     let out = env.fails("alice", &proj, &["push"]);
     assert!(out.contains("no remote named 'origin'"), "{out}");
 }
@@ -58,10 +82,15 @@ fn remote_rm_drops_its_remote_tags() {
     let env = Env::new();
     let (proj, _hub) = env.project_with_hub("alice", "proj", "hub", &[("a", "a\n")]);
     env.ok("alice", &proj, &["pull"]);
-    assert!(env.tags("alice", &proj).contains(&"origin/main".to_string()));
+    assert!(env
+        .tags("alice", &proj)
+        .contains(&"origin/main".to_string()));
     env.ok("alice", &proj, &["remote", "rm", "origin"]);
     let tags = env.tags("alice", &proj);
-    assert!(!tags.iter().any(|t| t.starts_with("origin/")), "stale remote tags after `remote rm`: {tags:?}");
+    assert!(
+        !tags.iter().any(|t| t.starts_with("origin/")),
+        "stale remote tags after `remote rm`: {tags:?}"
+    );
 }
 
 // Scenario from git t5505-remote.sh: "rename errors out early when new name is invalid".
@@ -72,7 +101,11 @@ fn remote_add_refuses_invalid_names() {
     let proj = env.project("alice", "proj", &[("a", "a\n")]);
     for bad in ["", "has space", "origin/main", "../evil", "-x"] {
         let out = env.vl("alice", &proj, &["remote", "add", "--", bad, "../hub"]);
-        assert!(!out.status.success(), "remote name {bad:?} was accepted: {}", text(&out));
+        assert!(
+            !out.status.success(),
+            "remote name {bad:?} was accepted: {}",
+            text(&out)
+        );
     }
 }
 
@@ -86,7 +119,11 @@ fn remote_add_refuses_the_name_of_a_git_remote() {
     let proj = env.project("alice", "proj", &[("a", "a\n")]);
     let bare = env.path("gh.git");
     git(&env.root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
-    env.ok("alice", &proj, &["git", "remote", "add", "origin", bare.to_str().unwrap()]);
+    env.ok(
+        "alice",
+        &proj,
+        &["git", "remote", "add", "origin", bare.to_str().unwrap()],
+    );
     env.fails("alice", &proj, &["remote", "add", "origin", "../hub"]);
 }
 
@@ -98,7 +135,11 @@ fn git_remote_add_refuses_the_name_of_a_veil_remote() {
     env.ok("alice", &proj, &["remote", "add", "origin", "../hub"]);
     let bare = env.path("gh.git");
     git(&env.root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
-    let out = env.fails("alice", &proj, &["git", "remote", "add", "origin", bare.to_str().unwrap()]);
+    let out = env.fails(
+        "alice",
+        &proj,
+        &["git", "remote", "add", "origin", bare.to_str().unwrap()],
+    );
     assert!(out.contains("already the name of a Veil remote"), "{out}");
 }
 
@@ -131,7 +172,10 @@ fn a_relative_remote_path_resolves_against_the_repository_root_from_a_subdirecto
     let proj = env.project("alice", "proj", &[("sub/deep/a", "a\n")]);
     env.ok("alice", &proj, &["remote", "add", "origin", "../hub"]);
     env.ok("alice", &proj.join("sub/deep"), &["push"]);
-    assert!(env.path("hub/.veil/repo.json").exists(), "created next to the repository");
+    assert!(
+        env.path("hub/.veil/repo.json").exists(),
+        "created next to the repository"
+    );
     assert!(!proj.join("sub/hub").exists() && !proj.join("hub").exists());
     env.ok("alice", &proj.join("sub"), &["pull"]);
 }
@@ -141,7 +185,12 @@ fn a_relative_remote_path_resolves_against_the_repository_root_from_a_subdirecto
 fn unsupported_url_schemes_are_refused() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a", "a\n")]);
-    for url in ["file:///tmp/x", "http://example.com/r", "https://example.com/r", "git://example.com/r"] {
+    for url in [
+        "file:///tmp/x",
+        "http://example.com/r",
+        "https://example.com/r",
+        "git://example.com/r",
+    ] {
         let out = env.fails("alice", &proj, &["remote", "add", "r", url]);
         assert!(out.contains("unsupported scheme"), "{url}: {out}");
     }
@@ -204,9 +253,16 @@ fn a_colon_after_a_slash_is_a_local_path() {
     let proj = env.project("alice", "proj", &[("a", "a\n")]);
     env.ok("alice", &proj, &["remote", "add", "odd", "./odd:name"]);
     env.ok("alice", &proj, &["push", "odd"]);
-    assert!(proj.join("odd:name/.veil/repo.json").exists(), "pushed to a local directory named odd:name");
+    assert!(
+        proj.join("odd:name/.veil/repo.json").exists(),
+        "pushed to a local directory named odd:name"
+    );
     let abs = env.path("abs:dir");
-    env.ok("alice", &proj, &["remote", "add", "abs", abs.to_str().unwrap()]);
+    env.ok(
+        "alice",
+        &proj,
+        &["remote", "add", "abs", abs.to_str().unwrap()],
+    );
     env.ok("alice", &proj, &["push", "abs"]);
     assert!(abs.join(".veil/repo.json").exists());
 }
@@ -227,7 +283,14 @@ fn a_removed_remote_name_can_be_added_again_with_another_kind() {
     let proj = env.project("alice", "proj", &[("a", "a\n")]);
     env.ok("alice", &proj, &["remote", "add", "origin", "../hub"]);
     env.ok("alice", &proj, &["remote", "rm", "origin"]);
-    env.ok("alice", &proj, &["remote", "add", "origin", "../mirror", "--public"]);
+    env.ok(
+        "alice",
+        &proj,
+        &["remote", "add", "origin", "../mirror", "--public"],
+    );
     let list = env.stdout("alice", &proj, &["remote", "list"]);
-    assert!(list.contains("public") && list.contains("../mirror"), "{list}");
+    assert!(
+        list.contains("public") && list.contains("../mirror"),
+        "{list}"
+    );
 }

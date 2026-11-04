@@ -7,7 +7,12 @@ use crate::support::*;
 #[test]
 fn clone_copies_history_tags_and_files_and_sets_origin() {
     let env = Env::new();
-    let (proj, hub) = env.project_with_hub("alice", "proj", "hub", &[("a.txt", "a\n"), ("d/b.txt", "b\n")]);
+    let (proj, hub) = env.project_with_hub(
+        "alice",
+        "proj",
+        "hub",
+        &[("a.txt", "a\n"), ("d/b.txt", "b\n")],
+    );
     env.commit("alice", &proj, "second", &[("a.txt", "a2\n")]);
     env.ok("alice", &proj, &["push"]);
     let copy = env.clone("bob", &hub, "copy");
@@ -18,8 +23,14 @@ fn clone_copies_history_tags_and_files_and_sets_origin() {
     let tags = env.tags("bob", &copy);
     assert_eq!(tags, vec!["main".to_string(), "origin/main".to_string()]);
     let remotes = env.stdout("bob", &copy, &["remote", "list"]);
-    assert!(remotes.starts_with("origin") && remotes.contains("team"), "{remotes}");
-    assert!(remotes.contains(hub.to_str().unwrap()), "the clone stores the absolute source path: {remotes}");
+    assert!(
+        remotes.starts_with("origin") && remotes.contains("team"),
+        "{remotes}"
+    );
+    assert!(
+        remotes.contains(hub.to_str().unwrap()),
+        "the clone stores the absolute source path: {remotes}"
+    );
     // The working copy is a new, empty change on main.
     let st = env.ok("bob", &copy, &["status"]);
     assert!(st.contains("no changes"), "{st}");
@@ -81,7 +92,12 @@ fn a_failed_clone_into_an_existing_empty_directory_leaves_it_empty() {
     env.fails("bob", &env.root, &["clone", "does-not-exist", "dest"]);
     assert!(dest.exists() && listing(&dest).is_empty());
     // A source that fails half way (a corrupt object) cleans up too.
-    let (proj, hub) = env.project_with_hub("alice", "proj", "hub", &[("big.txt", &"payload ".repeat(400))]);
+    let (proj, hub) = env.project_with_hub(
+        "alice",
+        "proj",
+        "hub",
+        &[("big.txt", &"payload ".repeat(400))],
+    );
     let _ = proj;
     let corrupt = env.path("corrupt");
     copy_dir(&hub, &corrupt);
@@ -89,7 +105,11 @@ fn a_failed_clone_into_an_existing_empty_directory_leaves_it_empty() {
     let len = std::fs::metadata(&pack).unwrap().len() as isize;
     flip_byte(&pack, len / 2);
     env.fails("bob", &env.root, &["clone", "corrupt", "dest"]);
-    assert!(dest.exists() && listing(&dest).is_empty(), "{:?}", listing(&dest));
+    assert!(
+        dest.exists() && listing(&dest).is_empty(),
+        "{:?}",
+        listing(&dest)
+    );
 }
 
 // Scenario from git t5601-clone.sh: cloning into a non-empty directory fails without touching it.
@@ -111,7 +131,11 @@ fn clone_into_an_existing_empty_directory_works() {
     let env = Env::new();
     let (_proj, hub) = env.project_with_hub("alice", "proj", "hub", &[("a", "a\n")]);
     let dest = env.dir("dest");
-    env.ok("bob", &env.root, &["clone", hub.to_str().unwrap(), dest.to_str().unwrap()]);
+    env.ok(
+        "bob",
+        &env.root,
+        &["clone", hub.to_str().unwrap(), dest.to_str().unwrap()],
+    );
     assert_eq!(read(&dest, "a"), "a\n");
 }
 
@@ -134,7 +158,10 @@ fn clone_of_an_empty_repository_then_push_back() {
     let out = env.ok("bob", &copy, &["push"]);
     assert!(out.contains("pushed main"), "{out}");
     env.ok("alice", &proj, &["pull"]);
-    assert_eq!(env.stdout("alice", &proj, &["cat", "b.txt", "-r", "main"]), "b\n");
+    assert_eq!(
+        env.stdout("alice", &proj, &["cat", "b.txt", "-r", "main"]),
+        "b\n"
+    );
 }
 
 // Scenario from git t5609-clone-branch.sh: "vanilla clone chooses HEAD"; Veil picks main,
@@ -155,15 +182,27 @@ fn clone_starts_on_main_then_trunk_then_master_then_the_first_tag() {
     make("master", "master.txt");
     env.ok("alice", &proj, &["push"]);
     let c1 = env.clone("bob", &env.path("hub"), "c1");
-    assert!(c1.join("master.txt").exists() && !c1.join("alpha.txt").exists(), "{:?}", listing(&c1));
+    assert!(
+        c1.join("master.txt").exists() && !c1.join("alpha.txt").exists(),
+        "{:?}",
+        listing(&c1)
+    );
     make("trunk", "trunk.txt");
     env.ok("alice", &proj, &["push"]);
     let c2 = env.clone("bob", &env.path("hub"), "c2");
-    assert!(c2.join("trunk.txt").exists() && !c2.join("master.txt").exists(), "{:?}", listing(&c2));
+    assert!(
+        c2.join("trunk.txt").exists() && !c2.join("master.txt").exists(),
+        "{:?}",
+        listing(&c2)
+    );
     make("main", "main.txt");
     env.ok("alice", &proj, &["push"]);
     let c3 = env.clone("bob", &env.path("hub"), "c3");
-    assert!(c3.join("main.txt").exists() && !c3.join("trunk.txt").exists(), "{:?}", listing(&c3));
+    assert!(
+        c3.join("main.txt").exists() && !c3.join("trunk.txt").exists(),
+        "{:?}",
+        listing(&c3)
+    );
 }
 
 // Scenario from git t5609-clone-branch.sh: a repository without the usual names starts on its first tag.
@@ -209,7 +248,10 @@ fn a_clone_is_complete_and_independent_of_its_source() {
     env.ok("bob", &c, &["gc", "--prune-now"]);
     env.ok("bob", &c, &["fsck"]);
     let out = env.fails("bob", &c, &["pull"]);
-    assert!(out.contains("not found") || out.contains("No such file"), "{out}");
+    assert!(
+        out.contains("not found") || out.contains("No such file"),
+        "{out}"
+    );
 }
 
 // Scenario from git t5601-clone.sh: special characters in file names survive a clone.
@@ -232,12 +274,27 @@ fn clone_preserves_odd_names_modes_and_bytes() {
     env.ok("alice", &proj, &["remote", "add", "origin", "../hub"]);
     env.ok("alice", &proj, &["push"]);
     let c = env.clone("bob", &env.path("hub"), "c");
-    for f in ["with space.txt", "-leading-dash", "ünïcödé/naïve.txt", "empty", "nonl", "bin.dat", "run.sh"] {
-        assert_eq!(std::fs::read(c.join(f)).unwrap(), std::fs::read(proj.join(f)).unwrap(), "{f}");
+    for f in [
+        "with space.txt",
+        "-leading-dash",
+        "ünïcödé/naïve.txt",
+        "empty",
+        "nonl",
+        "bin.dat",
+        "run.sh",
+    ] {
+        assert_eq!(
+            std::fs::read(c.join(f)).unwrap(),
+            std::fs::read(proj.join(f)).unwrap(),
+            "{f}"
+        );
     }
     assert!(is_executable(&c.join("run.sh")));
     assert!(!is_executable(&c.join("nonl")));
-    let deep: Vec<String> = listing(&c).into_iter().filter(|p| p.starts_with("deep/")).collect();
+    let deep: Vec<String> = listing(&c)
+        .into_iter()
+        .filter(|p| p.starts_with("deep/"))
+        .collect();
     assert_eq!(deep.len(), 1);
     assert_eq!(deep[0].matches('/').count(), 39);
 }
@@ -286,7 +343,11 @@ fn clone_before_a_grant_gets_redactions_then_the_file_after_grant_and_pull() {
     let st = env.ok("bob", &c, &["status"]);
     assert!(st.contains("secrets/notes.md"), "{st}");
     let key = env.pubkey("bob");
-    env.ok("alice", &proj, &["scope", "grant", "team", &key, "--name", "bob"]);
+    env.ok(
+        "alice",
+        &proj,
+        &["scope", "grant", "team", &key, "--name", "bob"],
+    );
     env.ok("alice", &proj, &["push"]);
     let out = env.ok("bob", &c, &["pull"]);
     assert!(out.contains("Filled in 1 file"), "{out}");

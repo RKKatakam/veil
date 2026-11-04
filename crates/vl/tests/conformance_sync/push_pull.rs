@@ -21,7 +21,10 @@ fn push_fast_forwards_a_tag_and_reports_it() {
     assert!(out.contains("pushed main"), "{out}");
     let out = env.ok("bob", &bob, &["pull"]);
     assert!(out.contains("updated main"), "{out}");
-    assert_eq!(env.stdout("bob", &bob, &["cat", "a.txt", "-r", "main"]), "a2\n");
+    assert_eq!(
+        env.stdout("bob", &bob, &["cat", "a.txt", "-r", "main"]),
+        "a2\n"
+    );
     let out = env.ok("alice", &alice, &["fsck", "-R", hub.to_str().unwrap()]);
     assert!(out.contains("No corruption found"), "{out}");
 }
@@ -34,11 +37,20 @@ fn push_and_pull_with_nothing_new_are_no_ops() {
     let ops = op_count(&hub);
     let (code, out) = env.code("alice", &alice, &["push"]);
     assert_eq!(code, 0, "{out}");
-    assert!(out.contains("Pushed 0 object(s)") && !out.contains("pushed main"), "{out}");
+    assert!(
+        out.contains("Pushed 0 object(s)") && !out.contains("pushed main"),
+        "{out}"
+    );
     let (code, out) = env.code("bob", &bob, &["pull"]);
     assert_eq!(code, 0, "{out}");
-    assert!(out.contains("Pulled 0 object(s)") && !out.contains("updated"), "{out}");
-    assert!(op_count(&hub) <= ops + 1, "an empty push records at most one operation");
+    assert!(
+        out.contains("Pulled 0 object(s)") && !out.contains("updated"),
+        "{out}"
+    );
+    assert!(
+        op_count(&hub) <= ops + 1,
+        "an empty push records at most one operation"
+    );
 }
 
 // Scenario from git t5516-fetch-push.sh: "push to a remote that does not exist yet" (Veil creates it).
@@ -46,7 +58,11 @@ fn push_and_pull_with_nothing_new_are_no_ops() {
 fn the_first_push_creates_the_remote_including_parent_directories() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a", "a\n")]);
-    env.ok("alice", &proj, &["remote", "add", "origin", "../srv/deep/hub"]);
+    env.ok(
+        "alice",
+        &proj,
+        &["remote", "add", "origin", "../srv/deep/hub"],
+    );
     env.ok("alice", &proj, &["push"]);
     assert!(env.path("srv/deep/hub/.veil/repo.json").exists());
     assert_eq!(repo_format(&env.path("srv/deep/hub")), repo_format(&proj));
@@ -60,10 +76,21 @@ fn push_to_a_non_empty_directory_that_is_not_a_repository_is_refused() {
     let proj = env.project("alice", "proj", &[("a", "a\n")]);
     let other = env.dir("other-project");
     write(&other, "notes.txt", "my own files\n");
-    env.ok("alice", &proj, &["remote", "add", "origin", other.to_str().unwrap()]);
+    env.ok(
+        "alice",
+        &proj,
+        &["remote", "add", "origin", other.to_str().unwrap()],
+    );
     let out = env.vl("alice", &proj, &["push"]);
-    assert!(!out.status.success(), "pushed into a non-Veil directory: {}", text(&out));
-    assert!(!other.join(".veil").exists(), "created .veil inside an unrelated directory");
+    assert!(
+        !out.status.success(),
+        "pushed into a non-Veil directory: {}",
+        text(&out)
+    );
+    assert!(
+        !other.join(".veil").exists(),
+        "created .veil inside an unrelated directory"
+    );
 }
 
 // Scenario from git t5516-fetch-push.sh: push to a path that is a regular file fails cleanly.
@@ -89,10 +116,16 @@ fn a_diverged_push_is_rejected_with_exit_1_and_a_recovery_hint() {
     let (code, out) = env.code("alice", &alice, &["push"]);
     assert_eq!(code, 1, "{out}");
     assert!(out.contains("rejected main"), "{out}");
-    assert!(out.contains("vl pull origin") && out.contains("vl merge origin/main"), "{out}");
+    assert!(
+        out.contains("vl pull origin") && out.contains("vl merge origin/main"),
+        "{out}"
+    );
     // The remote still has Bob's main.
     let hub_main = open_repo(&hub).view().tags["main"].target;
-    assert_eq!(env.tag_target("bob", &bob, "main").unwrap(), hub_main.short());
+    assert_eq!(
+        env.tag_target("bob", &bob, "main").unwrap(),
+        hub_main.short()
+    );
 }
 
 // Scenario from git t5405-send-pack-rewind.sh: "forced push should succeed".
@@ -107,13 +140,23 @@ fn force_push_overwrites_a_diverged_tag_and_keeps_the_old_history_on_the_remote(
     let out = env.ok("alice", &alice, &["push", "--force"]);
     assert!(out.contains("pushed main"), "{out}");
     let remote = open_repo(&hub);
-    assert_eq!(remote.view().tags["main"].target.short(), env.tag_target("alice", &alice, "main").unwrap());
+    assert_eq!(
+        remote.view().tags["main"].target.short(),
+        env.tag_target("alice", &alice, "main").unwrap()
+    );
     // Bob's snapshot is still on the remote (a head), not lost.
     let heads: Vec<String> = remote.view().heads.iter().map(|h| h.short()).collect();
-    assert!(heads.contains(&bobs), "Bob's overwritten work is gone from the remote: {heads:?}");
+    assert!(
+        heads.contains(&bobs),
+        "Bob's overwritten work is gone from the remote: {heads:?}"
+    );
     let out = env.ok("bob", &bob, &["pull"]);
     assert!(out.contains("diverged"), "{out}");
-    assert_eq!(env.tag_target("bob", &bob, "main").unwrap(), bobs, "Bob's tag does not move backwards");
+    assert_eq!(
+        env.tag_target("bob", &bob, "main").unwrap(),
+        bobs,
+        "Bob's tag does not move backwards"
+    );
 }
 
 // Scenario from git t5516-fetch-push.sh: "push rejected when the local branch is behind".
@@ -143,7 +186,10 @@ fn a_partially_rejected_push_sends_the_other_tags_and_exits_1() {
     env.ok("alice", &alice, &["tag", "set", "feature", "-r", "@-"]);
     let (code, out) = env.code("alice", &alice, &["push"]);
     assert_eq!(code, 1, "{out}");
-    assert!(out.contains("pushed feature") && out.contains("rejected main"), "{out}");
+    assert!(
+        out.contains("pushed feature") && out.contains("rejected main"),
+        "{out}"
+    );
     assert!(open_repo(&hub).view().tags.contains_key("feature"));
 }
 
@@ -158,12 +204,19 @@ fn after_a_rejection_merge_and_push_again() {
     env.commit("alice", &alice, "alice", &[("c.txt", "c\n")]);
     env.fails("alice", &alice, &["push"]);
     env.ok("alice", &alice, &["pull"]);
-    env.ok("alice", &alice, &["merge", "origin/main", "--into", "main", "-m", "merge bob"]);
+    env.ok(
+        "alice",
+        &alice,
+        &["merge", "origin/main", "--into", "main", "-m", "merge bob"],
+    );
     let out = env.ok("alice", &alice, &["push"]);
     assert!(out.contains("pushed main"), "{out}");
     env.ok("bob", &bob, &["pull"]);
     let files = env.stdout("bob", &bob, &["files", "-r", "main"]);
-    assert!(files.contains("b.txt") && files.contains("c.txt"), "{files}");
+    assert!(
+        files.contains("b.txt") && files.contains("c.txt"),
+        "{files}"
+    );
 }
 
 // Scenario from git t5404 / jj test_git_push.rs: a retried rejected push does not re-send
@@ -175,7 +228,12 @@ fn a_retried_rejected_push_sends_nothing_new() {
     let (alice, hub, bob) = team(&env);
     env.commit("bob", &bob, "bob", &[("b.txt", "b\n")]);
     env.ok("bob", &bob, &["push"]);
-    env.commit("alice", &alice, "alice", &[("c.txt", &"alice's work\n".repeat(50))]);
+    env.commit(
+        "alice",
+        &alice,
+        "alice",
+        &[("c.txt", &"alice's work\n".repeat(50))],
+    );
     env.fails("alice", &alice, &["push"]);
     let packs_after_first = packs(&hub).len();
     let out = env.fails("alice", &alice, &["--no-snapshot", "push"]);
@@ -200,13 +258,20 @@ fn a_tag_moved_backwards_needs_force_to_reach_the_remote() {
     let (alice, hub, _bob) = team(&env);
     env.commit("alice", &alice, "two", &[("a.txt", "a2\n")]);
     env.ok("alice", &alice, &["push"]);
-    env.ok("alice", &alice, &["tag", "set", "main", "-r", "main-", "--allow-backwards"]);
+    env.ok(
+        "alice",
+        &alice,
+        &["tag", "set", "main", "-r", "main-", "--allow-backwards"],
+    );
     env.fails("alice", &alice, &["push"]);
     let before = open_repo(&hub).view().tags["main"].target;
     env.ok("alice", &alice, &["push", "--force"]);
     let after = open_repo(&hub).view().tags["main"].target;
     assert_ne!(before, after);
-    assert_eq!(after.short(), env.tag_target("alice", &alice, "main").unwrap());
+    assert_eq!(
+        after.short(),
+        env.tag_target("alice", &alice, "main").unwrap()
+    );
 }
 
 // Scenario from git t5516-fetch-push.sh: "push with a refspec" pushes only that branch.
@@ -218,7 +283,11 @@ fn push_dash_t_sends_only_the_named_tags() {
     env.ok("alice", &alice, &["tag", "set", "two", "-r", "main"]);
     env.ok("alice", &alice, &["push", "-t", "one"]);
     let tags = open_repo(&hub).view().tags.clone();
-    assert!(tags.contains_key("one") && !tags.contains_key("two"), "{:?}", tags.keys());
+    assert!(
+        tags.contains_key("one") && !tags.contains_key("two"),
+        "{:?}",
+        tags.keys()
+    );
     env.ok("alice", &alice, &["push", "-t", "two", "-t", "one"]);
     assert!(open_repo(&hub).view().tags.contains_key("two"));
 }
@@ -252,10 +321,15 @@ fn push_updates_the_remote_tags() {
     env.ok("alice", &alice, &["pull"]);
     env.commit("alice", &alice, "two", &[("a.txt", "a2\n")]);
     env.ok("alice", &alice, &["push"]);
-    assert_eq!(env.tag_target("alice", &alice, "origin/main"), env.tag_target("alice", &alice, "main"));
+    assert_eq!(
+        env.tag_target("alice", &alice, "origin/main"),
+        env.tag_target("alice", &alice, "main")
+    );
     env.ok("alice", &alice, &["tag", "set", "fresh", "-r", "main"]);
     env.ok("alice", &alice, &["push"]);
-    assert!(env.tags("alice", &alice).contains(&"origin/fresh".to_string()));
+    assert!(env
+        .tags("alice", &alice)
+        .contains(&"origin/fresh".to_string()));
 }
 
 // Scenario from git t5404-tracking-branches.sh: "check tracking branches not updated for failed refs".
@@ -285,10 +359,20 @@ fn a_deleted_tag_stays_deleted_after_push_and_pull() {
     env.ok("alice", &alice, &["tag", "delete", "feature"]);
     env.ok("alice", &alice, &["push"]);
     env.ok("alice", &alice, &["pull"]);
-    assert!(!env.tags("alice", &alice).contains(&"feature".to_string()), "pull recreated the deleted tag");
-    assert!(!open_repo(&hub).view().tags.contains_key("feature"), "the remote still has the deleted tag");
+    assert!(
+        !env.tags("alice", &alice).contains(&"feature".to_string()),
+        "pull recreated the deleted tag"
+    );
+    assert!(
+        !open_repo(&hub).view().tags.contains_key("feature"),
+        "the remote still has the deleted tag"
+    );
     env.ok("bob", &bob, &["pull"]);
-    assert!(!env.tags("bob", &bob).contains(&"origin/feature".to_string()), "Bob's remote tag is never pruned");
+    assert!(
+        !env.tags("bob", &bob)
+            .contains(&"origin/feature".to_string()),
+        "Bob's remote tag is never pruned"
+    );
 }
 
 // Scenario from git t5510-fetch.sh: "fetch --prune" removes remote-tracking refs gone on the remote.
@@ -305,12 +389,22 @@ fn pull_prunes_remote_tags_that_are_gone_from_the_remote() {
     let other = env.project("carol", "carol", &[("c", "c\n")]);
     let _ = other;
     let fresh = env.path("hub2");
-    env.ok("alice", &alice, &["remote", "add", "tmp", fresh.to_str().unwrap()]);
+    env.ok(
+        "alice",
+        &alice,
+        &["remote", "add", "tmp", fresh.to_str().unwrap()],
+    );
     env.ok("alice", &alice, &["push", "tmp", "-t", "main"]);
     env.ok("alice", &alice, &["remote", "rm", "origin"]);
-    env.ok("alice", &alice, &["remote", "add", "origin", fresh.to_str().unwrap()]);
+    env.ok(
+        "alice",
+        &alice,
+        &["remote", "add", "origin", fresh.to_str().unwrap()],
+    );
     env.ok("alice", &alice, &["pull"]);
-    assert!(!env.tags("alice", &alice).contains(&"origin/feature".to_string()));
+    assert!(!env
+        .tags("alice", &alice)
+        .contains(&"origin/feature".to_string()));
 }
 
 // Scenario from jj test_bookmark_command.rs: deleting a local tag that exists on the remote,
@@ -338,7 +432,11 @@ fn pull_moves_tags_but_never_the_working_copy() {
     env.ok("bob", &bob, &["push"]);
     let out = env.ok("alice", &alice, &["pull"]);
     assert!(out.contains("updated main"), "{out}");
-    assert_eq!(read(&alice, "a.txt"), "a\n", "the working copy was not moved");
+    assert_eq!(
+        read(&alice, "a.txt"),
+        "a\n",
+        "the working copy was not moved"
+    );
     assert_eq!(read(&alice, "wip.txt"), "alice's unfinished work\n");
     env.ok("alice", &alice, &["rebase", "-d", "main"]);
     assert_eq!(read(&alice, "a.txt"), "from bob\n");
@@ -351,18 +449,34 @@ fn pull_moves_tags_but_never_the_working_copy() {
 fn pull_creates_new_tags_and_remote_tags() {
     let env = Env::new();
     let (alice, _hub, bob) = team(&env);
-    env.ok("alice", &alice, &["tag", "set", "release/1.0", "-r", "main"]);
-    env.ok("alice", &alice, &["tag", "set", "v1.0.0-rc.1", "-r", "main"]);
+    env.ok(
+        "alice",
+        &alice,
+        &["tag", "set", "release/1.0", "-r", "main"],
+    );
+    env.ok(
+        "alice",
+        &alice,
+        &["tag", "set", "v1.0.0-rc.1", "-r", "main"],
+    );
     // Deliberate difference: Git allows any UTF-8 ref name; Veil tag names are ASCII.
     env.fails("alice", &alice, &["tag", "set", "ünï-tag", "-r", "main"]);
     env.ok("alice", &alice, &["push"]);
     let out = env.ok("bob", &bob, &["pull"]);
     assert!(out.contains("updated release/1.0"), "{out}");
     let tags = env.tags("bob", &bob);
-    for t in ["release/1.0", "origin/release/1.0", "v1.0.0-rc.1", "origin/v1.0.0-rc.1"] {
+    for t in [
+        "release/1.0",
+        "origin/release/1.0",
+        "v1.0.0-rc.1",
+        "origin/v1.0.0-rc.1",
+    ] {
         assert!(tags.contains(&t.to_string()), "{t} missing: {tags:?}");
     }
-    assert_eq!(env.stdout("bob", &bob, &["cat", "a.txt", "-r", "release/1.0"]), "a\n");
+    assert_eq!(
+        env.stdout("bob", &bob, &["cat", "a.txt", "-r", "release/1.0"]),
+        "a\n"
+    );
 }
 
 // Scenario from git t5510-fetch.sh: a remote branch rewound by someone else; the local
@@ -375,12 +489,23 @@ fn pull_after_the_remote_moved_backwards_keeps_the_local_tag() {
     env.ok("alice", &alice, &["push"]);
     env.ok("bob", &bob, &["pull"]);
     let bobs = env.tag_target("bob", &bob, "main").unwrap();
-    env.ok("alice", &alice, &["tag", "set", "main", "-r", "main-", "--allow-backwards"]);
+    env.ok(
+        "alice",
+        &alice,
+        &["tag", "set", "main", "-r", "main-", "--allow-backwards"],
+    );
     env.ok("alice", &alice, &["push", "--force"]);
     let (code, out) = env.code("bob", &bob, &["pull"]);
     assert_eq!(code, 0, "{out}");
-    assert_eq!(env.tag_target("bob", &bob, "main").unwrap(), bobs, "never moved backwards");
-    assert_eq!(env.tag_target("bob", &bob, "origin/main"), env.tag_target("alice", &alice, "main"));
+    assert_eq!(
+        env.tag_target("bob", &bob, "main").unwrap(),
+        bobs,
+        "never moved backwards"
+    );
+    assert_eq!(
+        env.tag_target("bob", &bob, "origin/main"),
+        env.tag_target("alice", &alice, "main")
+    );
 }
 
 // Scenario from git t5520-pull.sh: pull with diverged history warns, exits 0 and changes nothing local.
@@ -394,9 +519,15 @@ fn pull_of_a_diverged_tag_warns_and_keeps_both_sides() {
     let mine = env.tag_target("alice", &alice, "main").unwrap();
     let (code, out) = env.code("alice", &alice, &["pull"]);
     assert_eq!(code, 0, "{out}");
-    assert!(out.contains("diverged") && out.contains("vl merge origin/main"), "{out}");
+    assert!(
+        out.contains("diverged") && out.contains("vl merge origin/main"),
+        "{out}"
+    );
     assert_eq!(env.tag_target("alice", &alice, "main").unwrap(), mine);
-    assert_eq!(env.tag_target("alice", &alice, "origin/main"), env.tag_target("bob", &bob, "main"));
+    assert_eq!(
+        env.tag_target("alice", &alice, "origin/main"),
+        env.tag_target("bob", &bob, "main")
+    );
 }
 
 // Scenario from git t5520-pull.sh: pulling from a remote that does not exist (any more).
@@ -440,9 +571,18 @@ fn two_remotes_have_separate_remote_tags() {
     let out = env.ok("alice", &alice, &["pull", "other"]);
     assert!(out.contains("diverged"), "unrelated main: {out}");
     let tags = env.tags("alice", &alice);
-    assert!(tags.contains(&"origin/main".to_string()) && tags.contains(&"other/main".to_string()), "{tags:?}");
-    assert_ne!(env.tag_target("alice", &alice, "origin/main"), env.tag_target("alice", &alice, "other/main"));
-    assert_eq!(env.stdout("alice", &alice, &["cat", "c.txt", "-r", "other/main"]), "carol\n");
+    assert!(
+        tags.contains(&"origin/main".to_string()) && tags.contains(&"other/main".to_string()),
+        "{tags:?}"
+    );
+    assert_ne!(
+        env.tag_target("alice", &alice, "origin/main"),
+        env.tag_target("alice", &alice, "other/main")
+    );
+    assert_eq!(
+        env.stdout("alice", &alice, &["cat", "c.txt", "-r", "other/main"]),
+        "carol\n"
+    );
 }
 
 // Scenario from git t5516-fetch-push.sh: push into a repository that has a working copy
@@ -454,11 +594,18 @@ fn push_into_a_repository_with_a_working_copy_moves_tags_only() {
     write(&bob, "bob-wip.txt", "bob is editing\n");
     env.ok("bob", &bob, &["status"]);
     env.commit("alice", &alice, "two", &[("a.txt", "a2\n")]);
-    env.ok("alice", &alice, &["remote", "add", "bob", bob.to_str().unwrap()]);
+    env.ok(
+        "alice",
+        &alice,
+        &["remote", "add", "bob", bob.to_str().unwrap()],
+    );
     env.ok("alice", &alice, &["push", "bob"]);
     assert_eq!(read(&bob, "a.txt"), "a\n");
     assert_eq!(read(&bob, "bob-wip.txt"), "bob is editing\n");
-    assert_eq!(env.stdout("bob", &bob, &["cat", "a.txt", "-r", "main"]), "a2\n");
+    assert_eq!(
+        env.stdout("bob", &bob, &["cat", "a.txt", "-r", "main"]),
+        "a2\n"
+    );
     let st = env.ok("bob", &bob, &["status"]);
     assert!(st.contains("bob-wip.txt"), "{st}");
 }
@@ -495,7 +642,18 @@ fn push_and_pull_of_many_tags() {
     let env = Env::new();
     let (alice, hub, bob) = team(&env);
     for i in 0..60 {
-        env.ok("alice", &alice, &["--no-snapshot", "tag", "set", &format!("t{i:02}"), "-r", "main"]);
+        env.ok(
+            "alice",
+            &alice,
+            &[
+                "--no-snapshot",
+                "tag",
+                "set",
+                &format!("t{i:02}"),
+                "-r",
+                "main",
+            ],
+        );
     }
     env.ok("alice", &alice, &["push"]);
     assert_eq!(open_repo(&hub).view().tags.len(), 61);
@@ -509,7 +667,12 @@ fn incremental_push_and_pull_send_only_what_is_new() {
     let env = Env::new();
     let (alice, _hub, bob) = team(&env);
     for i in 0..10 {
-        env.commit("alice", &alice, &format!("c{i}"), &[(&format!("f{i}.txt"), &format!("{i}\n"))]);
+        env.commit(
+            "alice",
+            &alice,
+            &format!("c{i}"),
+            &[(&format!("f{i}.txt"), &format!("{i}\n"))],
+        );
     }
     env.ok("alice", &alice, &["push"]);
     env.ok("bob", &bob, &["pull"]);
@@ -530,7 +693,10 @@ fn full_push_and_pull_on_healthy_repositories_change_nothing() {
     env.ok("alice", &alice, &["push", "--full"]);
     env.ok("bob", &bob, &["pull", "--full"]);
     let tags_after = open_repo(&hub).view().tags.clone();
-    assert_eq!(tags_before.keys().collect::<Vec<_>>(), tags_after.keys().collect::<Vec<_>>());
+    assert_eq!(
+        tags_before.keys().collect::<Vec<_>>(),
+        tags_after.keys().collect::<Vec<_>>()
+    );
     env.ok("bob", &bob, &["fsck"]);
 }
 
@@ -546,4 +712,26 @@ fn pull_with_unrecorded_edits_keeps_them() {
     assert_eq!(read(&alice, "a.txt"), "alice's local edit\n");
     let diff = env.ok("alice", &alice, &["diff"]);
     assert!(diff.contains("alice's local edit"), "{diff}");
+}
+
+// Scenario from jj test_operations.rs / test_git_fetch.rs ("undo a fetch"): a pull is an
+// operation; undo puts the tags back, and pulling again redoes it.
+#[test]
+fn undo_reverts_a_pull_and_a_second_pull_redoes_it() {
+    let env = Env::new();
+    let (alice, _hub, bob) = team(&env);
+    let before = env.tag_target("bob", &bob, "main");
+    env.commit("alice", &alice, "two", &[("a.txt", "a2\n")]);
+    env.ok("alice", &alice, &["push"]);
+    env.ok("bob", &bob, &["pull"]);
+    let after = env.tag_target("bob", &bob, "main");
+    assert_ne!(before, after);
+    let ops = env.stdout("bob", &bob, &["op", "log", "-n", "3"]);
+    assert!(ops.contains("pull from origin"), "{ops}");
+    let out = env.ok("bob", &bob, &["undo"]);
+    assert!(out.contains("pull from origin"), "{out}");
+    assert_eq!(env.tag_target("bob", &bob, "main"), before);
+    env.ok("bob", &bob, &["pull"]);
+    assert_eq!(env.tag_target("bob", &bob, "main"), after);
+    env.ok("bob", &bob, &["fsck"]);
 }

@@ -8,12 +8,15 @@
 
 mod support;
 
-mod remotes;
 mod clone;
-mod push_pull;
-mod visibility;
-mod integrity;
+mod concurrency;
+mod formats;
 mod gc;
-mod large;
 mod git_bridge;
 mod git_roundtrip;
+mod integrity;
+mod large;
+mod push_pull;
+mod remotes;
+mod sftp;
+mod visibility;

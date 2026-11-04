@@ -46,7 +46,10 @@ fn fsck_reports_a_loose_object_whose_content_does_not_match_its_hash() {
         f.parent().unwrap().file_name().unwrap().to_string_lossy(),
         f.file_name().unwrap().to_string_lossy()
     );
-    assert!(out.contains("does not match its hash") && out.contains(&id), "{out}");
+    assert!(
+        out.contains("does not match its hash") && out.contains(&id),
+        "{out}"
+    );
 }
 
 // Scenario from git t1450-fsck.sh: "missing blob" referenced by an old commit.
@@ -60,7 +63,14 @@ fn fsck_reports_a_missing_object_of_old_history() {
     assert_eq!(code, 1, "{out}");
     assert!(out.to_lowercase().contains("missing"), "{out}");
     // The current version is still readable.
-    assert_eq!(env.stdout("alice", &proj, &["--no-snapshot", "cat", "a.txt", "-r", "main"]), "second version of a\n");
+    assert_eq!(
+        env.stdout(
+            "alice",
+            &proj,
+            &["--no-snapshot", "cat", "a.txt", "-r", "main"]
+        ),
+        "second version of a\n"
+    );
 }
 
 // Scenario from git t1450-fsck.sh: "zero-length object" / truncated object file.
@@ -81,7 +91,10 @@ fn fsck_reports_a_damaged_snapshot() {
     let proj = repo_with_history(&env);
     let f = loose_objects(&proj)
         .into_iter()
-        .find(|p| std::fs::read(p).unwrap().starts_with(b"veil:snap") && contains(&std::fs::read(p).unwrap(), "\"one\""))
+        .find(|p| {
+            std::fs::read(p).unwrap().starts_with(b"veil:snap")
+                && contains(&std::fs::read(p).unwrap(), "\"one\"")
+        })
         .expect("the snapshot of `one`");
     let raw = String::from_utf8(std::fs::read(&f).unwrap()).unwrap();
     std::fs::write(&f, raw.replace("\"one\"", "\"0ne\"")).unwrap();
@@ -97,7 +110,10 @@ fn fsck_notes_garbage_files_in_the_object_store() {
     write(&proj, ".veil/objects/ab/not-an-object", "junk");
     let (code, out) = env.code("alice", &proj, &["--no-snapshot", "fsck", "-v"]);
     assert_eq!(code, 0, "{out}");
-    assert!(out.contains("unexpected entry .veil/objects/ab/not-an-object"), "{out}");
+    assert!(
+        out.contains("unexpected entry .veil/objects/ab/not-an-object"),
+        "{out}"
+    );
 }
 
 // Scenario from git t1450-fsck.sh: a broken operation log (Veil's refs) is corruption.
@@ -117,7 +133,11 @@ fn fsck_reports_a_damaged_operation() {
 fn fsck_reports_a_damaged_key_ring() {
     let env = Env::new();
     let proj = repo_with_history(&env);
-    std::fs::write(proj.join(".veil/meta/keyrings/team.json"), "{\"garbage\": 1}").unwrap();
+    std::fs::write(
+        proj.join(".veil/meta/keyrings/team.json"),
+        "{\"garbage\": 1}",
+    )
+    .unwrap();
     let (code, out) = fsck(&env, &proj);
     assert_eq!(code, 1, "{out}");
 }
@@ -143,10 +163,16 @@ fn fsck_counts_unreachable_objects_after_gc_packed_them() {
     let proj = repo_with_history(&env);
     env.ok("alice", &proj, &["abandon", "main"]);
     let out = env.ok("alice", &proj, &["gc", "--keep-ops-days", "0"]);
-    assert!(!out.contains(" 0 pending deletion"), "gc kept some unreachable objects: {out}");
+    assert!(
+        !out.contains(" 0 pending deletion"),
+        "gc kept some unreachable objects: {out}"
+    );
     let (code, out) = fsck(&env, &proj);
     assert_eq!(code, 0, "{out}");
-    assert!(!out.contains("; 0 unreachable)"), "fsck sees no unreachable object although gc kept them: {out}");
+    assert!(
+        !out.contains("; 0 unreachable)"),
+        "fsck sees no unreachable object although gc kept them: {out}"
+    );
 }
 
 // Scenario from git t1450-fsck.sh / t5303-pack-corruption-resilience.sh: a damaged pack.
@@ -183,7 +209,10 @@ fn pull_full_repairs_a_damaged_local_object() {
     env.ok("alice", &proj, &["--no-snapshot", "pull", "--full"]);
     let (code, out) = fsck(&env, &proj);
     assert_eq!(code, 0, "pull --full did not repair: {out}");
-    assert_eq!(env.stdout("alice", &proj, &["cat", "a.txt", "-r", "main-"]), "first version of a\n");
+    assert_eq!(
+        env.stdout("alice", &proj, &["cat", "a.txt", "-r", "main-"]),
+        "first version of a\n"
+    );
 }
 
 // Veil: `vl push --full` repairs a remote that lost a pack.
@@ -192,7 +221,11 @@ fn push_full_repairs_a_remote_that_lost_objects() {
     let env = Env::new();
     let proj = repo_with_history(&env);
     let hub = env.path("hub");
-    env.ok("alice", &proj, &["remote", "add", "origin", hub.to_str().unwrap()]);
+    env.ok(
+        "alice",
+        &proj,
+        &["remote", "add", "origin", hub.to_str().unwrap()],
+    );
     env.ok("alice", &proj, &["push"]);
     for p in packs(&hub) {
         std::fs::remove_file(&p).unwrap();
@@ -215,21 +248,36 @@ fn a_corrupt_object_on_the_remote_is_detected_by_pull_and_not_propagated() {
     let (alice, hub) = env.project_with_hub("alice", "alice", "hub", &[("a.txt", "a\n")]);
     let bob = env.clone("bob", &hub, "bob");
     let packs_before = packs(&hub);
-    env.commit("alice", &alice, "big", &[("big.txt", &"new content 12345 ".repeat(500))]);
+    env.commit(
+        "alice",
+        &alice,
+        "big",
+        &[("big.txt", &"new content 12345 ".repeat(500))],
+    );
     env.ok("alice", &alice, &["push"]);
-    let new_pack = packs(&hub).into_iter().find(|p| !packs_before.contains(p)).expect("a new pack");
+    let new_pack = packs(&hub)
+        .into_iter()
+        .find(|p| !packs_before.contains(p))
+        .expect("a new pack");
     let len = std::fs::metadata(&new_pack).unwrap().len() as isize;
     flip_byte(&new_pack, len / 2);
     let before = env.tag_target("bob", &bob, "main");
     let out = env.fails("bob", &bob, &["--no-snapshot", "pull"]);
     assert!(out.contains("corrupt"), "{out}");
-    assert_eq!(env.tag_target("bob", &bob, "main"), before, "a tag moved onto damaged history");
+    assert_eq!(
+        env.tag_target("bob", &bob, "main"),
+        before,
+        "a tag moved onto damaged history"
+    );
     let (code, out) = fsck(&env, &bob);
     assert_eq!(code, 0, "the damage reached Bob's repository: {out}");
     // Alice repairs the remote, Bob's pull then succeeds.
     env.ok("alice", &alice, &["push", "--full"]);
     env.ok("bob", &bob, &["pull"]);
-    assert_eq!(env.stdout("bob", &bob, &["cat", "big.txt", "-r", "main"]), "new content 12345 ".repeat(500));
+    assert_eq!(
+        env.stdout("bob", &bob, &["cat", "big.txt", "-r", "main"]),
+        "new content 12345 ".repeat(500)
+    );
 }
 
 // Veil: a damaged local object is detected by push and never sent.
@@ -245,7 +293,11 @@ fn a_corrupt_local_object_is_detected_by_push_and_not_sent() {
     assert!(out.contains("corrupt"), "{out}");
     let (code, out) = env.code("alice", &env.root, &["fsck", "-R", hub.to_str().unwrap()]);
     assert_eq!(code, 0, "{out}");
-    assert!(!open_repo(&hub).view().tags.values().any(|t| t.target.short() == env.tag_target("alice", &alice, "main").unwrap()));
+    assert!(!open_repo(&hub)
+        .view()
+        .tags
+        .values()
+        .any(|t| t.target.short() == env.tag_target("alice", &alice, "main").unwrap()));
 }
 
 // Veil: a remote whose operation head is garbage fails pull cleanly and changes nothing.
@@ -259,7 +311,11 @@ fn a_remote_with_a_broken_op_head_fails_pull_cleanly() {
     let ops = op_count(&bob);
     env.fails("bob", &bob, &["--no-snapshot", "pull"]);
     assert_eq!(op_count(&bob), ops);
-    env.fails("carol", &env.root, &["clone", hub.to_str().unwrap(), "carol"]);
+    env.fails(
+        "carol",
+        &env.root,
+        &["clone", hub.to_str().unwrap(), "carol"],
+    );
     assert!(!env.path("carol").exists());
 }
 
@@ -283,7 +339,10 @@ fn a_push_killed_midway_leaves_a_consistent_remote() {
     }
     env.ok("alice", &alice, &["push"]);
     let bob = env.clone("bob", &hub, "bob");
-    assert_eq!(std::fs::read(bob.join("bulk/f3.bin")).unwrap(), noise(400_000, 4));
+    assert_eq!(
+        std::fs::read(bob.join("bulk/f3.bin")).unwrap(),
+        noise(400_000, 4)
+    );
 }
 
 // Interrupted transfer: kill -9 during a pull leaves a consistent local repository.
@@ -307,7 +366,10 @@ fn a_pull_killed_midway_leaves_a_consistent_repository() {
     }
     env.ok("bob", &bob, &["pull"]);
     env.ok("bob", &bob, &["rebase", "-d", "main"]);
-    assert_eq!(std::fs::read(bob.join("bulk/f0.bin")).unwrap(), noise(400_000, 100));
+    assert_eq!(
+        std::fs::read(bob.join("bulk/f0.bin")).unwrap(),
+        noise(400_000, 100)
+    );
 }
 
 // Interrupted clone: kill -9 mid-clone, then a fresh clone into the same place works.
@@ -321,7 +383,11 @@ fn a_clone_killed_midway_can_be_redone() {
     env.ok("alice", &alice, &["commit", "-m", "bulk"]);
     env.ok("alice", &alice, &["push"]);
     let dest = env.path("bob");
-    let mut child = env.spawn("bob", &env.root, &["clone", hub.to_str().unwrap(), dest.to_str().unwrap()]);
+    let mut child = env.spawn(
+        "bob",
+        &env.root,
+        &["clone", hub.to_str().unwrap(), dest.to_str().unwrap()],
+    );
     std::thread::sleep(Duration::from_millis(60));
     let _ = child.kill();
     let _ = child.wait();
@@ -329,7 +395,10 @@ fn a_clone_killed_midway_can_be_redone() {
         std::fs::remove_dir_all(&dest).unwrap();
     }
     env.clone("bob", &hub, "bob");
-    assert_eq!(std::fs::read(dest.join("bulk/f9.bin")).unwrap(), noise(400_000, 209));
+    assert_eq!(
+        std::fs::read(dest.join("bulk/f9.bin")).unwrap(),
+        noise(400_000, 209)
+    );
     let (code, out) = env.code("bob", &dest, &["fsck"]);
     assert_eq!(code, 0, "{out}");
 }
