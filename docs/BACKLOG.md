@@ -4,28 +4,6 @@ Collected from the agents' reports during rounds 1–2. Fixed adversarial
 findings are in `docs/BUGS.md`; this file lists what is known and **not yet
 fixed**. Severity: high / medium / low.
 
-## Planned next: replace custom crypto constructions with standards
-
-Approved to run right after round 3 merges, before the format is final.
-The primitives are standard crates (`chacha20poly1305`, `x25519-dalek`,
-`ed25519-dalek`, `blake3`); the risk is in how Veil combines them:
-
-1. Deterministic sealing (`crypto.rs`, keyed-BLAKE3 nonce + XChaCha20-Poly1305,
-   a homemade SIV) → a standard misuse-resistant AEAD: AES-GCM-SIV (RFC 8452)
-   or AES-SIV (RFC 5297), RustCrypto crates.
-2. Key wrapping to a recipient (`identity.rs`, homemade sealed box) → HPKE
-   (RFC 9180) or the `age` format.
-3. One secret for both X25519 and Ed25519 (derived) → independent encryption
-   and signing keys per identity.
-4. Keep, but isolate and document for review: the signed hash-chained ring
-   log, the genesis MAC, embargo key wrapping and release, and every BLAKE3
-   derivation context.
-
-Requires: a format version bump and a migration (`vl upgrade`) that
-re-seals content and re-wraps ring keys without losing access to history,
-compatibility with the round-3 fixtures, and the adversarial and crash suites
-staying green.
-
 ## Correctness
 
 - **Medium: undo right after stale-working-copy recovery hides the
@@ -51,16 +29,32 @@ staying green.
 
 ## Usability
 
-- **`vl commit` on top of a tagged change advances the tag:** developing a
-  fix with `vl new main` + `vl commit` publishes it on `main` before any
-  embargo. Use a separate workspace (the README tour does).
 - **A quarantined file written by `ws exec` disappears with the sandbox.**
 - **Non-UTF-8 file names are reported but not recorded.**
 
+## Recorded limitations (later rounds)
+
+- **Other scopes on an embargoed line:** later edits on an embargoed line to
+  files cloaked under a *different* scope are readable by that scope's
+  members before the release. Workaround: cloak and embargo under the same
+  scope.
+- **Old content keeps the old crypto:** `vl upgrade` to format 3 re-wraps
+  ring keys under HPKE but never re-seals history; content sealed before the
+  upgrade stays under the pre-standard construction (`docs/CRYPTO.md` §5).
+- **The policy pin does not forget an accepted weakening** when a teammate
+  later reverts it (only dropped `public!` rules are forgotten).
+- **Git tags are not synced** by the Git bridge (branches only); author time
+  zones are exported as UTC.
+- **Git maps from before the BUG-063 fix** carry no embargo "veil" for
+  imported commits; delete `.veil/git/map` once to rebuild it.
+- **SFTP lease renewals can stall on slow uplinks** (below roughly 4 Mbit/s,
+  behind large pack writes), fencing the push; a per-operation in-flight cap
+  would fix it.
+- **A hostile SFTP server can still force up to the 4 GiB read ceiling**
+  (`VEIL_SFTP_MAX_FILE`), since sizes come from the server.
+
 ## Performance
 
-- **Crash recovery after a takeover re-hashes up to an hour of loose
-  objects** (clock-adjustment margin).
 - **`gc` always rewrites everything into one in-memory pack;** no
   incremental or streaming packing yet.
 - **Concurrent op-log merging:** writers serialise on the repository lock.

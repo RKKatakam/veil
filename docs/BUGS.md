@@ -534,3 +534,32 @@ them.
 * **Policy pin** (`adversarial4_cli`): the member's own edit with and without a pending change. Reviewed by hand and found sound: the "rules unchanged" comparison (comments, spacing, escapes, NFC/NFD, tier aliases, invalid rules that fail safe), the auto-advance rule (appended isolate/ignore, dropped `public!`, including the `builtin_secret` interplay), merge-conflict markers in `.veilpolicy`, undo, stale-working-copy recovery and crash ordering in `Ctx::record`/`finish`.
 * **Materialisation record:** fill-in of hidden and fallback paths over a user's own file was reviewed and is kept (`holds`). Path validation of `checkout.json` was reviewed. No test was written beyond the existing suites.
 * **Not covered this round:** scanner v3 bypass work, the durability and lock paths (failed barriers, `recover` locks, `since_stamp` tampering, nested `lock.steal.<hash>`), the `crash.rs` sweep of `vl upgrade`, and concurrent upgrade plus push.
+
+---
+
+# Round 4 documentation findings (BUG-074 … BUG-089)
+
+Found by the agent writing the user guide (`docs/guide/`), which ran every
+example against the real binary at `integration` @ `d034203`. They have no
+reproduction tests yet; the fix wave adds them. (A further finding duplicated
+BUG-072, and one — `vl doctor --remotes` skipping SSH remotes — was fixed by
+the SFTP wave.)
+
+| ID | Sev. | Area | Finding |
+|---|---|---|---|
+| BUG-074 | high | workspaces / Git export | Editing a *public* file in a cloaked workspace and committing seals it; the commit lands on `main` (BUG-075), and `vl git push` then sends a commit that **deletes** that file on GitHub; a public-mirror clone also loses it on its next update. Repro: `vl ws new p -r main --cloak team; vl ws switch p; echo x >> README.md; vl commit -m m; vl git push`. |
+| BUG-075 | medium | commit / tags | `vl commit` advances every tag at the parent, whatever workspace it runs in (including cloaked ones), so committing in a separate fix workspace publishes the fix on `main` before any embargo. |
+| BUG-076 | medium | init / policy | `vl init` inside a Git checkout records the whole `.git/` directory as public content (56 files in the test), which would be pushed to Veil remotes. `.jj/`, `.hg/` likewise. |
+| BUG-077 | medium | sync / privacy | Key rings are synced to public remotes (public readers need them to verify embargo records), so `vl scope list` on a public-mirror clone shows member names and ids. Not in the threat model. |
+| BUG-089 | medium | identity | Replacing your identity (`vl identity new --force`) while being a scope's only admin freezes the scope: no command restores admin rights; only a manual restore of the retired identity file works. |
+| BUG-078 | low | CLI | `vl log \| head` (any truncated pipe) panics with exit code 101. |
+| BUG-079 | low | status | `vl status` never shows the conflicts of a merge (they are recorded on `@-`; status only lists `@`'s). |
+| BUG-080 | low | squash | `vl squash` of a conflict resolution into the merge keeps the `(conflict)` mark. |
+| BUG-081 | low | push | A push that skips diverged tags exits 0 (Git exits non-zero). |
+| BUG-082 | low | doctor | A legacy-format stale lock shows a nonsense time in `vl doctor` (`lease renewed -1793763700901071.5s ago`). |
+| BUG-083 | low | policy | After `vl expose t.pem` the ignored `public` rule warns on every command, even after `vl expose --force` adds `public!`; `vl policy check` shows both. |
+| BUG-084 | low | messages | `vl cat` of a cloaked file in a public-mirror clone says `object … is not present in this store` instead of "withheld/redacted". |
+| BUG-085 | low | messages | `vl cloak x` by a non-member of an existing `team` scope suggests `vl scope create team`. |
+| BUG-086 | low | messages | A clone from a public mirror suggests asking for a grant, but public remotes never deliver cloaked content. |
+| BUG-087 | low | messages | `vl merge --embargo` reports embargoed files as "published from the cloaked line" and prints `until +7d` literally rather than the date. |
+| BUG-088 | low | docs | The README Quick start log shows a `main` tag that `vl init` + `vl commit` never creates. |
