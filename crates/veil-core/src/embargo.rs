@@ -63,7 +63,9 @@
 //! content (public → cloaked), but it never moves content that is already
 //! sealed to a wider or different audience, with one exception: an explicit
 //! merge of a cloaked line of work into a public line publishes that line's
-//! files, after secret scanning them.
+//! files, after secret scanning them: only what the merge brings in, and
+//! only for a line whose merged-in snapshots are all signed by current
+//! members of its scope (BUG-122; the caller decides the second part).
 
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -386,7 +388,15 @@ pub struct NormalizeOptions<'a> {
     pub cloak: Option<&'a str>,
     /// Scopes of the cloaked lines of work being merged in. Their files may
     /// become public: merging them is the explicit act of declassification.
+    /// Only scopes whose merged-in snapshots are all signed by current
+    /// members belong here (BUG-122, see `Repo::merge`), and only content
+    /// the merge brings in (it differs from the destination's) is published.
     pub declassify: &'a BTreeSet<String>,
+    /// The merge result goes under an embargo (a new one, or the
+    /// destination's): a declassified file is scanned and reported, but its
+    /// entry is left sealed as it is, for [`seal_declassified`] to seal under
+    /// the embargo key. Its plaintext is never written to the store (BUG-249).
+    pub defer_declassify: bool,
 }
 
 /// What [`normalize_tree`] did.
@@ -595,7 +605,11 @@ fn normalize_file(
             let d = dest_sealed.expect("checked");
             // The entry's own content, never its fallback: resealing the
             // last public version would revert the merged side's edit.
+            // Content sealed for another scope is never resealed for the
+            // destination's (BUG-123): that would hand one scope's content
+            // to the other's members. The destination keeps its version.
             let resealed = match store.read_blob(&e.id) {
+                Ok(_) if matches!(v, Visibility::Cloaked { .. }) => None,
                 Ok(data) => Some(TreeEntry {
                     id: store.store_file(&data, &d.visibility)?,
                     size: data.len() as u64,
@@ -606,15 +620,20 @@ fn normalize_file(
                 Err(err) if err.is_unreadable() => None,
                 Err(err) => return Err(err),
             };
-            ne = Some(resealed.unwrap_or_else(|| d.clone()));
-            report.kept_sealed.push((
-                path.clone(),
-                format!(
+            let why = match (&resealed, v) {
+                (None, Visibility::Cloaked { .. }) => format!(
+                    "keeps the destination's version, {}: the merged side holds it sealed as {}, and a merge never moves content from one scope to another; reconcile them deliberately",
+                    d.visibility.label(),
+                    v.label()
+                ),
+                _ => format!(
                     "stays {}: the merged side would make it {}; a merge never widens or moves the audience of content the destination keeps sealed",
                     d.visibility.label(),
                     v.label()
                 ),
-            ));
+            };
+            ne = Some(resealed.unwrap_or_else(|| d.clone()));
+            report.kept_sealed.push((path.clone(), why));
         }
         // Under an (unreleased) embargo but cloaked by policy: seal it under
         // the scope (narrower), so the release never publishes it. Without
@@ -658,7 +677,10 @@ fn normalize_file(
         }
         (Visibility::Cloaked { scope: have }, Some(Visibility::Public)) => {
             let dest_public = opts.dest_policy.classify(&path, false).tier == Tier::Public;
-            if !opts.declassify.contains(have) || !dest_public {
+            // Only what the merged-in line brings in: content the
+            // destination already holds sealed at this path is not part
+            // of it, whoever put it there (BUG-122).
+            if !opts.declassify.contains(have) || !dest_public || unchanged_from_dest {
                 if !unchanged_from_dest {
                     report.kept_sealed.push((
                         path.clone(),
@@ -704,12 +726,79 @@ fn declassify(
         }
     }
     report.declassified.push(path.clone());
+    if opts.defer_declassify {
+        return Ok(Some(e.clone()));
+    }
     Ok(Some(TreeEntry {
         id: store.store_file(&data, &Visibility::Public)?,
         visibility: Visibility::Public,
         fallback: None,
         ..e.clone()
     }))
+}
+
+/// Seal the files at `paths` of `tree` (declassifications deferred by
+/// [`NormalizeOptions::defer_declassify`]) under `embargo`, each with its
+/// public version in `dest` (the destination's tree) as fallback, as
+/// [`wrap`] does for a public file. The content goes from sealed under the
+/// cloaked line's scope straight to sealed under the embargo key: no
+/// plaintext copy of the fix is written at rest (BUG-249).
+pub fn seal_declassified(store: &ObjectStore, tree: &ObjectId, paths: &[VPath], embargo: &str, dest: &ObjectId) -> Result<ObjectId> {
+    if paths.is_empty() {
+        return Ok(*tree);
+    }
+    let vis = Visibility::Embargoed {
+        embargo: embargo.to_string(),
+    };
+    let split: Vec<Vec<&str>> = paths.iter().map(|p| p.as_str().split('/').collect()).collect();
+    let refs: Vec<&[&str]> = split.iter().map(|p| p.as_slice()).collect();
+    seal_paths(store, tree, Some(dest), &refs, &vis)
+}
+
+/// Recursive over the components of `paths`, which come from a walk that
+/// bounded their depth ([`MAX_TREE_DEPTH`]).
+fn seal_paths(store: &ObjectStore, tree: &ObjectId, dest: Option<&ObjectId>, paths: &[&[&str]], vis: &Visibility) -> Result<ObjectId> {
+    let mut t = (*store.tree(tree)?).clone();
+    let d = match dest {
+        Some(id) => match store.tree(id) {
+            Ok(d) => Some(d),
+            Err(e) if e.is_unreadable() => None,
+            Err(e) => return Err(e),
+        },
+        None => None,
+    };
+    let mut groups: std::collections::BTreeMap<&str, Vec<&[&str]>> = std::collections::BTreeMap::new();
+    for p in paths {
+        if let Some((first, rest)) = p.split_first() {
+            groups.entry(first).or_default().push(rest);
+        }
+    }
+    for (name, rest) in groups {
+        let Some(e) = t.get(name).cloned() else { continue };
+        let de = d.as_deref().and_then(|d| d.get(name)).cloned();
+        let ne = match e.kind {
+            EntryKind::File if rest.iter().any(|r| r.is_empty()) => {
+                let data = store.read_blob(&e.id)?;
+                TreeEntry {
+                    id: store.store_file(&data, vis)?,
+                    visibility: vis.clone(),
+                    fallback: public_fallback(de.as_ref(), vis),
+                    ..e
+                }
+            }
+            EntryKind::Dir => {
+                let sub_dest = de.filter(|x| x.kind == EntryKind::Dir).map(|x| x.id);
+                let rest: Vec<&[&str]> = rest.into_iter().filter(|r| !r.is_empty()).collect();
+                TreeEntry {
+                    id: seal_paths(store, &e.id, sub_dest.as_ref(), &rest, vis)?,
+                    ..e
+                }
+            }
+            EntryKind::File => continue,
+        };
+        t.insert(ne);
+    }
+    store.put_tree(&t)
 }
 
 /// Sealed files of `tree` whose audience a change from `old` to `new`

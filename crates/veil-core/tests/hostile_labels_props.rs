@@ -9,6 +9,12 @@
 //! rebase of a pending edit, a merge), her next secret is never readable by
 //! Mallory, by an anonymous reader of the team remote, or by anyone reading
 //! the public mirror (checked on decoded packs with `backend_contains`).
+//!
+//! `Label::GenuineMal` is not a forged label but a genuine object: Mallory
+//! replaces the file with her own content, really sealed under `mal`, a
+//! scope Alice is also a member of. Merging and rebasing Alice's pending
+//! `team` edit against it is a merge of two sides sealed for different
+//! scopes, which must never move Alice's edit to `mal` (BUG-123).
 
 mod adversarial_support;
 
@@ -22,6 +28,7 @@ use veil_core::{
 };
 
 const OLD: &[u8] = b"password: old-team-secret\n";
+const MALLORYS: &[u8] = b"password: mallorys-own-mal-secret\n";
 
 #[derive(Debug, Clone, Copy)]
 enum Label {
@@ -33,6 +40,7 @@ enum Label {
     OldGeneration,
     Local,
     Unchanged,
+    GenuineMal,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -70,7 +78,7 @@ fn label_vis(l: Label, ids: &Ids) -> Visibility {
         },
         Label::OldGeneration => cloaked("team#0000000000000000"),
         Label::Local => cloaked("local"),
-        Label::Unchanged => cloaked("team"),
+        Label::Unchanged | Label::GenuineMal => cloaked("team"),
     }
 }
 
@@ -101,6 +109,12 @@ fn mallory_pushes(hub: Arc<MemoryBackend>, main: ObjectId, alice_pub: &str, mall
     let mut secrets = (*store.tree(&secrets_id).unwrap()).clone();
     let mut e = secrets.get("db.yml").unwrap().clone();
     e.visibility = label_vis(label, &ids);
+    if let Label::GenuineMal = label {
+        let mal = Visibility::Cloaked { scope: "mal".into() };
+        e.id = store.store_file(MALLORYS, &mal).unwrap();
+        e.size = MALLORYS.len() as u64;
+        e.visibility = mal;
+    }
     secrets.insert(e);
     root.insert(veil_core::TreeEntry::dir("secrets", store.put_tree(&secrets).unwrap()));
     let tree = store.put_tree(&root).unwrap();
@@ -261,6 +275,25 @@ proptest! {
     #[test]
     fn hostile_labels_never_make_new_plaintext_readable_outside_its_audience(l in label(), c in cloak(), r in route(), n in 0u32..10_000) {
         run(l, c, r, n);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 16, ..ProptestConfig::default() })]
+
+    /// Two sides sealed for different scopes (Alice's `team` edit against
+    /// Mallory's genuine `mal` object), through the routes that merge them.
+    #[test]
+    fn a_merge_of_two_scopes_never_moves_the_pending_edit(c in cloak(), r in prop_oneof![Just(Route::Rebase), Just(Route::Merge)], n in 0u32..10_000) {
+        run(Label::GenuineMal, c, r, n);
+    }
+}
+
+/// Both merging routes against a genuine `mal` object, on every run.
+#[test]
+fn a_genuine_other_scope_object_is_neutralised_by_rebase_and_merge() {
+    for (i, r) in [Route::Rebase, Route::Merge].into_iter().enumerate() {
+        run(Label::GenuineMal, Cloak::None, r, 200 + i as u32);
     }
 }
 

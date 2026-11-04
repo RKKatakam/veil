@@ -449,7 +449,6 @@ fn cloaked_fix_line_is_encrypted_at_rest_before_the_merge() {
 
 // Scenario from git t6430 (merge) with Veil's embargo: the embargoed merge writes no plaintext of the fix.
 #[test]
-#[ignore = "BUG-249: an embargoed merge of a cloaked line stores the merged file's plaintext as an unreferenced public blob"]
 fn embargoed_merge_stores_no_plaintext_of_the_fix() {
     let env = Env::new();
     let r = embargoed(&env);

@@ -89,6 +89,7 @@ fn normalisation_and_embargo_sealing_of_deep_trees_do_not_overflow() {
         dest_tree: base,
         cloak: Some("team"),
         declassify: &none,
+        defer_declassify: false,
     };
     let ok = chain(s, MAX_TREE_DEPTH - 24, b"x");
     normalize_tree(s, &ok, &opts, &mut NormalizeReport::default()).unwrap();

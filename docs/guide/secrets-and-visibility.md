@@ -414,12 +414,25 @@ member id works for encryption, but then their signatures show as unknown
 workspace in which everything recorded is cloaked, descriptions included.
 `vl commit` there moves only tags cloaked under the same scope, never
 `main` or another uncloaked tag. `vl tag set NAME --cloak [S]` makes a tag
-that public remotes never receive.
+that public remotes never receive. Both need a scope you are a member of
+(`local` and `embargo/…` are not scopes).
 
 **Visibility never widens by accident.** Rebase, `vl new`, squash, and
 policy edits that arrive by merge keep sealed files sealed. Publishing is
 explicit: `vl merge` of a cloaked line (secret-scanned; it lists what it
-published) or `vl expose`.
+published) or `vl expose`. That merge publishes only what the line brings
+in (not what your destination already holds sealed), and only if every
+snapshot it brings in is signed by a current member of the line's scope.
+Otherwise it warns, and the files stay cloaked: a teammate outside the
+scope can copy your sealed files into a snapshot that claims to be a
+`team` line, but cannot sign as a member.
+
+**Content never moves between scopes by merging.** When the two sides of
+a merge, rebase or auto-rebase hold a file sealed for different scopes
+(say `team` and `ops`), `vl` does not seal the combined content for
+either: the file is a conflict, and the side that kept the scope it had
+before (else the destination's) is kept as it is. Reconcile them
+deliberately (`vl cloak --scope`).
 
 > **Public files edited in a cloaked workspace.** A public file you *edit*
 > in a cloaked workspace is recorded cloaked, together with its last public
