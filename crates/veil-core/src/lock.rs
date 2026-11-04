@@ -10,21 +10,34 @@
 //!   rewrites the file every `renew_every` with a fresh `renewed` time. A
 //!   long transaction (snapshotting a huge working copy) therefore never
 //!   looks stale, however long it takes.
-//! * **Stealing.** A contender only removes someone else's lock when the
-//!   lease has expired *and* the holder is provably gone: same host and boot
-//!   (and pid namespace) with a dead pid, or the lease was last renewed
-//!   before this machine booted. A holder on another host, or a live but
-//!   stuck process, is never robbed; the contender times out with a message
-//!   naming the holder instead.
+//! * **Stealing.** A contender only takes over someone else's lock when the
+//!   holder is provably gone: same host, boot and pid namespace with a pid
+//!   that no longer runs (taken over at once, whatever the lease says: the
+//!   pid may be reused, but never by the process that wrote the token), or
+//!   an expired lease last renewed before this machine booted. A holder on
+//!   another host, or a live but stuck process, is never robbed; the
+//!   contender times out with a message naming the holder instead. Legacy
+//!   `"<pid> <millis>"` files (written by local-only earlier versions) are
+//!   read as locks of this machine.
 //! * **Same process.** Every token held by a live `RepoLock` in this process
-//!   is in a registry. A lock file carrying this process's pid but an
-//!   unregistered token was leaked (its owner dropped without being able to
-//!   remove the file, e.g. after a simulated crash), so it is reclaimed
-//!   immediately, without waiting for the lease.
-//! * **Atomic steal.** Steals are serialised through a second
+//!   is in a registry, with the thread holding it. A lock file carrying this
+//!   process's pid but an unregistered token was leaked (its owner dropped
+//!   without being able to remove the file, e.g. after a simulated crash),
+//!   so it is reclaimed immediately, without waiting for the lease.
+//! * **Reentrancy.** [`RepoLock::acquire_reentrant`] returns a nested handle
+//!   when the calling thread already holds the lock, so metadata writers can
+//!   run both on their own and inside a transaction. Plain
+//!   [`RepoLock::acquire`] never nests.
+//! * **Atomic takeover.** Takeovers are serialised through a second
 //!   `create_new` file, `.veil/lock.steal`. Under it, the contender re-reads
-//!   the lock and removes it only if it still holds the exact bytes that were
-//!   judged stale, so two contenders can never both "steal" and both win.
+//!   the lock and, only if it still holds the exact bytes that were judged
+//!   stale, replaces it with its own in one atomic write, so two contenders
+//!   can never both win and no third one slips in between.
+//! * **Crash recovery.** The previous holder may have died between writing
+//!   objects unsynced and its durability barrier. Right after a takeover,
+//!   still under the lock, the new holder runs
+//!   [`crate::fsck::recover_interrupted_writes`]: torn objects are removed
+//!   and intact ones made durable, before anyone can reuse them.
 //! * **Fencing.** [`RepoLock::ensure_held`] re-reads the file and fails if the
 //!   token is no longer ours. Transactions call it right before moving the
 //!   operation head.
@@ -34,12 +47,12 @@
 //! not repository storage, so it lives here rather than behind the VFS.
 
 use std::{
-    collections::BTreeSet,
+    collections::BTreeMap,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex, OnceLock,
     },
-    thread::JoinHandle,
+    thread::{JoinHandle, ThreadId},
     time::{Duration, Instant},
 };
 
@@ -174,11 +187,18 @@ pub fn assess(info: &LockInfo, now: i64) -> Verdict {
     // alone identifies the machine.
     let same_machine = !me.host.is_empty() && info.host == me.host && info.boot == me.boot;
     if same_machine && info.pid == std::process::id() {
-        return if live_tokens().contains(&info.token) {
+        return if live_tokens().contains_key(&info.token) {
             Verdict::Wait
         } else {
             Verdict::Steal("left behind by this process".into())
         };
+    }
+    // A holder on this machine whose pid no longer runs is gone for good:
+    // the pid can be reused, but never by the process that wrote this token,
+    // so there is nothing to wait for (this is what makes recovery from
+    // `kill -9` or Ctrl-C instant). Checked before the lease on purpose.
+    if same_machine && process_alive(info.pid) == Some(false) {
+        return Verdict::Steal(format!("holder pid {} is no longer running", info.pid));
     }
     if !info.lease_expired(now) {
         return Verdict::Wait;
@@ -217,6 +237,9 @@ pub struct RepoLock {
     token: String,
     lost: Arc<AtomicBool>,
     heartbeat: Option<Heartbeat>,
+    /// A handle from [`RepoLock::acquire_reentrant`] inside an outer one:
+    /// dropping it releases nothing.
+    nested: bool,
 }
 
 #[derive(Debug)]
@@ -228,6 +251,28 @@ struct Heartbeat {
 impl RepoLock {
     pub fn acquire(backend: Arc<dyn StorageBackend>) -> Result<RepoLock> {
         Self::acquire_with(backend, &LockOptions::default())
+    }
+
+    /// Like [`RepoLock::acquire`], but when the calling *thread* already
+    /// holds the lock (an open transaction, say), returns a nested handle
+    /// that neither renews nor releases it. Used by the metadata writers
+    /// (key rings, embargo records, the vault), which run both on their own
+    /// and inside transactions. Transactions themselves never nest.
+    pub fn acquire_reentrant(backend: Arc<dyn StorageBackend>) -> Result<RepoLock> {
+        let path = VPath::new(LOCK_PATH)?;
+        if let Some(info) = backend.read_opt(&path)?.and_then(|raw| LockInfo::parse(&raw)) {
+            if held_by_this_thread(&info.token) {
+                return Ok(RepoLock {
+                    backend,
+                    path,
+                    token: info.token,
+                    lost: Arc::new(AtomicBool::new(false)),
+                    heartbeat: None,
+                    nested: true,
+                });
+            }
+        }
+        Self::acquire(backend)
     }
 
     pub fn acquire_with(backend: Arc<dyn StorageBackend>, opts: &LockOptions) -> Result<RepoLock> {
@@ -244,46 +289,70 @@ impl RepoLock {
             // ever sees our fresh lock with an unregistered token.
             let token = Registered::new(info.token.clone());
             if backend.create_new(&path, &info.encode())? {
-                let lost = Arc::new(AtomicBool::new(false));
-                let heartbeat = Heartbeat::spawn(backend.clone(), path.clone(), info, opts.renew_every, lost.clone());
-                return Ok(RepoLock {
-                    backend,
-                    path,
-                    token: token.keep(),
-                    lost,
-                    heartbeat,
-                });
+                return Ok(Self::held(backend, path, info, token, opts));
+            }
+            let Some(raw) = backend.read_opt(&path)? else {
+                continue; // released between our attempts
+            };
+            // `Some(since)`: the stale lock may be replaced by ours. Its
+            // holder may have died half-way through a batch of unsynced
+            // writes made after `since` (`None`: unknown).
+            let mut takeover: Option<Option<i64>> = None;
+            match LockInfo::parse(&raw) {
+                Some(holder) => match assess(&holder, now_millis()) {
+                    Verdict::Wait => {}
+                    Verdict::Stuck(r) => reason = r,
+                    Verdict::Steal(_) => takeover = Some(Some(holder.acquired)),
+                },
+                None => match &garbage {
+                    Some((seen, since)) if *seen == raw => {
+                        if since.elapsed() >= opts.lease {
+                            takeover = Some(None);
+                        }
+                        reason = format!("{LOCK_PATH} holds unreadable content");
+                    }
+                    _ => garbage = Some((raw.clone(), Instant::now())),
+                },
+            }
+            if let Some(since) = takeover {
+                match take_over(&*backend, &path, &raw, &info.encode())? {
+                    TakeOver::Ours => {
+                        let lock = Self::held(backend, path, info, token, opts);
+                        // Under our lock, before anyone builds on what the
+                        // previous holder left: discard its torn objects and
+                        // make its intact ones durable.
+                        crate::fsck::recover_interrupted_writes(&*lock.backend, since)?;
+                        return Ok(lock);
+                    }
+                    TakeOver::Retry => continue,
+                    TakeOver::Busy => {}
+                }
             }
             drop(token);
-            if let Some(raw) = backend.read_opt(&path)? {
-                match LockInfo::parse(&raw) {
-                    Some(holder) => match assess(&holder, now_millis()) {
-                        Verdict::Wait => {}
-                        Verdict::Stuck(r) => reason = r,
-                        Verdict::Steal(_) => {
-                            if steal(&*backend, &path, &raw)? {
-                                continue;
-                            }
-                        }
-                    },
-                    None => match &garbage {
-                        Some((seen, since)) if *seen == raw => {
-                            if since.elapsed() >= opts.lease && steal(&*backend, &path, &raw)? {
-                                continue;
-                            }
-                            reason = format!("{LOCK_PATH} holds unreadable content");
-                        }
-                        _ => garbage = Some((raw, Instant::now())),
-                    },
-                }
-            } else {
-                continue; // released between our attempts
-            }
             if start.elapsed() >= opts.wait {
                 return Err(VeilError::Locked(reason));
             }
             std::thread::sleep(backoff);
             backoff = (backoff * 2).min(Duration::from_millis(50));
+        }
+    }
+
+    fn held(
+        backend: Arc<dyn StorageBackend>,
+        path: VPath,
+        info: LockInfo,
+        token: Registered,
+        opts: &LockOptions,
+    ) -> RepoLock {
+        let lost = Arc::new(AtomicBool::new(false));
+        let heartbeat = Heartbeat::spawn(backend.clone(), path.clone(), info, opts.renew_every, lost.clone());
+        RepoLock {
+            backend,
+            path,
+            token: token.keep(),
+            lost,
+            heartbeat,
+            nested: false,
         }
     }
 
@@ -313,6 +382,9 @@ impl RepoLock {
 
 impl Drop for RepoLock {
     fn drop(&mut self) {
+        if self.nested {
+            return;
+        }
         if let Some(hb) = self.heartbeat.take() {
             drop(hb.stop);
             let _ = hb.thread.join();
@@ -363,10 +435,20 @@ impl Heartbeat {
     }
 }
 
-/// Remove `path` if it still holds exactly `observed`, serialised against
-/// other stealers through [`STEAL_PATH`]. Returns `true` if the caller should
-/// retry acquiring immediately.
-fn steal(backend: &dyn StorageBackend, path: &VPath, observed: &[u8]) -> Result<bool> {
+enum TakeOver {
+    /// `path` now holds our lock.
+    Ours,
+    /// The stale lock was gone or changed: try to acquire again at once.
+    Retry,
+    /// Another contender is taking over: wait.
+    Busy,
+}
+
+/// Replace `path` by `ours` if it still holds exactly `observed`, serialised
+/// against other contenders through [`STEAL_PATH`]. The stale lock is
+/// replaced in one atomic write rather than removed, so no third process can
+/// slip in between and skip the crash recovery the new holder performs.
+fn take_over(backend: &dyn StorageBackend, path: &VPath, observed: &[u8], ours: &[u8]) -> Result<TakeOver> {
     let guard_path = VPath::new(STEAL_PATH)?;
     let guard = LockInfo::new_local(Duration::from_secs(5));
     let token = Registered::new(guard.token.clone());
@@ -382,13 +464,14 @@ fn steal(backend: &dyn StorageBackend, path: &VPath, observed: &[u8]) -> Result<
                 }
             }
         }
-        return Ok(false);
+        return Ok(TakeOver::Busy);
     }
     let result = (|| {
         if backend.read_opt(path)?.as_deref() == Some(observed) {
-            backend.remove_file(path)?;
+            backend.write(path, ours)?;
+            return Ok(TakeOver::Ours);
         }
-        Ok(true)
+        Ok(TakeOver::Retry)
     })();
     backend.remove_file(&guard_path)?;
     drop(token);
@@ -397,14 +480,21 @@ fn steal(backend: &dyn StorageBackend, path: &VPath, observed: &[u8]) -> Result<
 
 // ---- process-local registry of live tokens ----------------------------------
 
-static LIVE: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+/// Token → the thread that holds it.
+static LIVE: Mutex<BTreeMap<String, ThreadId>> = Mutex::new(BTreeMap::new());
 
-fn live_tokens() -> std::sync::MutexGuard<'static, BTreeSet<String>> {
+fn live_tokens() -> std::sync::MutexGuard<'static, BTreeMap<String, ThreadId>> {
     LIVE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn unregister(token: &str) {
     live_tokens().remove(token);
+}
+
+/// Tokens are random, so a registered token in the lock file proves that
+/// this process wrote it; the thread decides reentrancy.
+fn held_by_this_thread(token: &str) -> bool {
+    !token.is_empty() && live_tokens().get(token) == Some(&std::thread::current().id())
 }
 
 /// A token registered as live for as long as this guard exists (or forever,
@@ -413,7 +503,7 @@ struct Registered(Option<String>);
 
 impl Registered {
     fn new(token: String) -> Registered {
-        live_tokens().insert(token.clone());
+        live_tokens().insert(token.clone(), std::thread::current().id());
         Registered(Some(token))
     }
 

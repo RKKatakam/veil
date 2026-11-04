@@ -119,6 +119,27 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
     /// Write a file, creating parent directories as needed.
     fn write(&self, path: &VPath, data: &[u8]) -> Result<()>;
 
+    /// Like [`StorageBackend::write`] (atomic, immediately visible), except
+    /// that the data only has to be durable once a later
+    /// [`StorageBackend::sync_barrier`] returns. Until then a power loss may
+    /// leave the file missing, empty or truncated under its final name.
+    ///
+    /// Transactions write objects this way and issue one barrier before
+    /// writing the operation that references them. Backends whose writes
+    /// are always durable (or never are) keep the default.
+    fn write_unsynced(&self, path: &VPath, data: &[u8]) -> Result<()> {
+        self.write(path, data)
+    }
+
+    /// Make every [`StorageBackend::write_unsynced`] that returned before
+    /// this call durable: file contents, their names, and any directories
+    /// created for them. Barriers on one backend value are serialised, so a
+    /// caller never returns while writes it depends on are still being
+    /// synced by another thread's barrier.
+    fn sync_barrier(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Atomically create a file only if it does not exist. Returns `false`
     /// when the path already exists. Used for repository locks.
     fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool>;

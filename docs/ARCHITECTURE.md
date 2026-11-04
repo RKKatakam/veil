@@ -174,6 +174,16 @@ use random nonces.
 * The **`local` scope** key is derived from the identity secret and the
   repository id. It is never stored and protects only device-local state:
   the vault.
+* **Replacing the identity** (`vl identity new --force`) changes that key.
+  A vault sealed by the previous identity is never overwritten and never
+  stops a command that does not need it. Snapshots skip backing up isolated
+  files into it, and `vl secret`, `vl run` and `ws exec --with-isolated`
+  fail with an explanation. The replaced identity is kept
+  (`$VEIL_HOME/retired/`, mode 0600) so the vault can be **re-keyed**:
+  `identity new --force` re-keys the vault of the repository it runs in, and
+  `vl identity recover-vault [--from FILE]` re-keys any other one. Deleting
+  the retired file (and the vault) is the way to really forget the old
+  identity.
 
 ### Key rings: a signed membership log
 
@@ -546,43 +556,86 @@ id plus pid namespace) and a lease (10 s by default).
 * While a `RepoLock` lives, a heartbeat thread renews the lease every 2.5 s.
   However long a transaction runs, its lock never looks stale. (The MVP stole
   any lock older than 120 s, even from a live process.)
-* A contender removes someone else's lock only when the lease has expired
-  **and** the holder is provably gone. That means either the same machine
-  (same host, boot id and pid namespace) with a pid that no longer runs, or a
-  lease last renewed before this machine booted. A holder on another host,
-  or a live process that stopped renewing (suspended, stuck), is never robbed.
-  The contender times out with an error naming the holder.
-* Each process keeps a registry of the tokens its live locks hold. A lock
-  file with this process's pid and an unregistered token was leaked, for
-  example by a crash that prevented the file from being removed. It is
-  reclaimed immediately.
-* Steals are serialised through `.veil/lock.steal` (also `create_new`).
-  Under that guard, the stealer re-reads the lock and removes it only if it
-  still has the exact bytes that were judged stale. Two stealers can never
-  both win.
+* A contender takes over someone else's lock only when the holder is
+  provably gone. That means either the same machine (same host, boot id and
+  pid namespace) with a pid that no longer runs, or an expired lease last
+  renewed before this machine booted. A dead pid is taken over **at once**,
+  without waiting for the lease: the pid may be reused, but never by the
+  process that wrote that token. That makes recovery from `kill -9` or
+  Ctrl-C instant. A holder on another host, or a live process that stopped
+  renewing (suspended, stuck), is never robbed. The contender times out
+  with an error naming the holder. Legacy `"<pid> <millis>"` lock files
+  (from local-only earlier versions) are judged as locks of this machine.
+* Each process keeps a registry of the tokens its live locks hold, and of
+  the thread holding each. A lock file with this process's pid and an
+  unregistered token was leaked, for example by a crash that prevented the
+  file from being removed. It is reclaimed immediately.
+* `RepoLock::acquire_reentrant` returns a nested handle (which neither
+  renews nor releases) when the calling thread already holds the lock.
+  Metadata writers use it, so they work both on their own and inside a
+  transaction. Transactions themselves never nest.
+* Takeovers are serialised through `.veil/lock.steal` (also `create_new`).
+  Under that guard, the contender re-reads the lock and, only if it still
+  has the exact bytes that were judged stale, replaces it with its own lock
+  in one atomic write. Two contenders can never both win, and no third
+  process can slip in between the removal and the new lock.
 * Fencing: before moving `op_head`, a transaction checks that the lock still
-  carries its token (`RepoLock::ensure_held`).
+  carries its token (`RepoLock::ensure_held`). A holder whose lock file was
+  replaced behind its back (tampering) fails with `Locked` instead of
+  recording its operation over someone else's.
 * On disk, `create_new` writes the content to a synced temp file and
   hard-links it into place. A contender therefore never sees a half-written
   lock. Unparseable content (left by older versions or a non-atomic fallback)
   is reclaimed only after it stays unchanged for a full lease.
 
-**Crash ordering.** Every transaction writes in this order: objects (the
-snapshot, trees and blobs it references), then the operation, then
-`op_head`. Pull and push copy objects and shared metadata (key rings,
-embargo records) before the transaction that references them. `init` writes
-`repo.json` last, because it is what makes a directory a repository.
-`DiskBackend::write` and `create_new` return only once the data is durable:
-the file is fsynced, renamed, and its directory fsynced, and new directories
-are synced into their parents. So the program order of writes is also their
-durability order. After a crash at any point, `op_head` names a complete
-operation whose view references only complete objects. The worst leftovers
-are unreachable objects, an operation that never became the head, temp files
-and a lock that will be reclaimed. Undo is unaffected.
+**Shared metadata under the lock.** Every read-modify-write of key rings,
+embargo records and the vault holds the repository lock (`Keychain` and
+`Repo::vault_update` take it reentrantly). Push and pull copy objects and
+merge metadata *inside* their transaction, under the destination's lock.
+Two concurrent `grant`s, or a `grant` racing a `pull`, cannot lose an
+update.
 
-The cost is a few fsyncs per object written. A batched barrier (sync every
-touched directory once before writing the operation) is the obvious
-optimisation once packs land.
+**Crash ordering.** Every transaction writes in this order: objects (the
+snapshot, trees and blobs it references), then a durability barrier, then
+the operation, then `op_head`. Pull and push copy objects and shared metadata
+(key rings, embargo records) before the operation that references them.
+`init` writes `repo.json` last, because it is what makes a directory a
+repository.
+
+* `DiskBackend::write` and `create_new` return only once the data is
+  durable: the file is fsynced, renamed, and its directory fsynced, and new
+  directories are synced into their parents.
+* Inside a transaction, objects are written with
+  `StorageBackend::write_unsynced` instead: temp file, rename, no fsync. The
+  backend remembers each file. `StorageBackend::sync_barrier` then fsyncs
+  all of them, several at a time so that ext4 or XFS share journal commits,
+  and every touched directory once. `Transaction::commit` runs the barrier
+  before writing the operation, and `Transaction`'s `Drop` runs it again,
+  before the lock is released, so an aborted transaction leaves nothing
+  unsynced either. Barriers on one backend are serialised, so a barrier
+  never returns while another thread is still syncing writes the caller
+  depends on.
+* So after a crash at any point, `op_head` names a complete operation whose
+  view references only complete, durable objects. The worst leftovers are
+  unreachable objects, an operation that never became the head, temp files
+  and a lock that will be reclaimed.
+* Unsynced objects can outlive their writer only if it dies holding the
+  lock. A process that is killed leaves intact but possibly not yet durable
+  objects. A power loss can leave them empty or truncated under their final
+  names. A later transaction must not reuse such an object instead of
+  writing its own copy (the store skips objects that exist). So right after
+  a takeover, the new holder runs `fsck::recover_interrupted_writes` under
+  the lock: it re-hashes the loose objects modified since shortly before the
+  dead holder took the lock (or all of them when the backend's clock is not
+  a wall clock), removes those that fail, and rewrites and syncs the rest.
+  Until then `fsck` reports torn unreachable objects under a leftover lock
+  as a note.
+* Undo is unaffected.
+
+Cost: `vl init` of 2,000 small files on ext4 went from 1.6–2.0 s to
+0.11–0.14 s, and of 20,000 files from 17–19.6 s to 1.0–1.05 s (release
+build). The number of fsyncs is about the same; they now run concurrently
+instead of one after the other, and each directory is synced once.
 
 **`vl fsck`** (`fsck.rs`) is read-only and works without `Repo::open`, so it
 can diagnose a damaged `op_head`. It re-hashes and decodes every object,
@@ -604,7 +657,10 @@ entry that references it:
 
 **Crash-injection tests** (`crates/veil-core/tests/crash.rs`). A
 `FaultyBackend` wraps `MemoryBackend` and fails the N+1-th mutation and every
-later one, with the fatal write either lost or applied. For snapshot, commit,
+later one, with the fatal write either lost or applied. The barrier is a
+mutation too. In a third mode, *power loss*, the fatal write is lost and
+every write not yet covered by a barrier is torn (removed, emptied or
+truncated). For snapshot, commit,
 rebase, merge, embargoed merge, push, public push, pull and init, the tests
 sweep every N. After each crash the repository must open and pass `fsck`.
 The operation must appear either not at all or exactly once on top of the old

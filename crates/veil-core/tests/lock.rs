@@ -136,24 +136,26 @@ fn long_transaction_keeps_its_lock() {
     held.ensure_held().unwrap();
 }
 
+/// A holder on this machine whose pid no longer runs is gone for good (the
+/// pid may be reused, but never by the process that wrote the token), so its
+/// lock is taken over at once, whatever its lease says (BUG-026).
 #[test]
 #[cfg(unix)]
-fn dead_holder_is_stolen_after_its_lease_expires() {
+fn dead_holder_is_stolen_immediately() {
     for (fs, _tmp) in backends() {
         let pid = dead_pid();
-        // Fresh lease: even a dead holder is left alone until it expires.
-        plant(&*fs, &foreign_lock(pid, 0));
-        let start = Instant::now();
-        let l = RepoLock::acquire_with(fs.clone(), &quick(5000)).unwrap();
-        assert!(start.elapsed() >= Duration::from_millis(150), "waited for the lease");
-        assert_eq!(RepoLock::holder(&*fs).unwrap().unwrap().pid, std::process::id());
-        drop(l);
-
-        // Expired lease and dead pid: taken over at once.
-        plant(&*fs, &foreign_lock(pid, 60_000));
-        let start = Instant::now();
-        drop(RepoLock::acquire_with(fs.clone(), &quick(5000)).unwrap());
-        assert!(start.elapsed() < Duration::from_secs(2));
+        for renewed_ago in [0, 60_000] {
+            plant(&*fs, &foreign_lock(pid, renewed_ago));
+            let start = Instant::now();
+            let l = RepoLock::acquire_with(fs.clone(), &quick(5000)).unwrap();
+            assert!(
+                start.elapsed() < Duration::from_millis(150),
+                "did not wait for the lease ({:?})",
+                start.elapsed()
+            );
+            assert_eq!(RepoLock::holder(&*fs).unwrap().unwrap().pid, std::process::id());
+            drop(l);
+        }
     }
 }
 

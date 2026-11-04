@@ -1,7 +1,9 @@
 use std::{
+    collections::BTreeSet,
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 use super::{DirEntry, DirListing, Metadata, NodeKind, StatClock, StorageBackend};
@@ -18,9 +20,26 @@ use crate::{
 /// not followed and are invisible to the engine in this MVP: `metadata`
 /// reports nothing at a symlink, `read` refuses one, and `list_dir_full`
 /// reports them as `special` so callers never write through or over them.
+///
+/// [`StorageBackend::write_unsynced`] skips both fsyncs and remembers the
+/// file; [`StorageBackend::sync_barrier`] then syncs every remembered file
+/// (several at a time, so the filesystem can share journal commits) and
+/// every touched directory once. Clones share that state.
 #[derive(Debug, Clone)]
 pub struct DiskBackend {
     root: PathBuf,
+    unsynced: Arc<Mutex<Unsynced>>,
+    /// Serialises barriers (see [`StorageBackend::sync_barrier`]).
+    barrier: Arc<Mutex<()>>,
+}
+
+/// Writes made durable by the next barrier.
+#[derive(Debug, Default)]
+struct Unsynced {
+    files: Vec<PathBuf>,
+    /// Directories whose entries changed: parents of the files, and parents
+    /// of newly created directories.
+    dirs: BTreeSet<PathBuf>,
 }
 
 fn io_err(path: &Path, e: io::Error) -> VeilError {
@@ -79,7 +98,11 @@ fn escape_name(name: &std::ffi::OsStr) -> String {
 
 impl DiskBackend {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        DiskBackend { root: root.into() }
+        DiskBackend {
+            root: root.into(),
+            unsynced: Arc::default(),
+            barrier: Arc::default(),
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -175,6 +198,70 @@ fn create_dir_all_durable(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// `create_dir_all` that reports the directories it created (shallowest
+/// first), without syncing anything.
+fn create_dir_all_tracked(dir: &Path, created: &mut Vec<PathBuf>) -> io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    let mut missing = Vec::new();
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        if d.is_dir() {
+            break;
+        }
+        missing.push(d.to_path_buf());
+        cur = d.parent();
+    }
+    fs::create_dir_all(dir)?;
+    created.extend(missing.into_iter().rev());
+    Ok(())
+}
+
+/// fsync an existing file.
+fn sync_file(path: &Path) -> io::Result<()> {
+    // Windows needs write access to flush; Unix flushes through any handle.
+    fs::OpenOptions::new()
+        .read(true)
+        .write(cfg!(windows))
+        .open(path)?
+        .sync_all()
+}
+
+/// Run `f` on every item, on up to `max_workers` threads. Concurrent
+/// fsyncs let filesystems such as ext4 and XFS commit many files in one
+/// journal transaction instead of one each.
+fn for_each_parallel<T: Sync>(
+    items: &[T],
+    max_workers: usize,
+    f: impl Fn(&T) -> io::Result<()> + Sync,
+) -> io::Result<()> {
+    const PER_WORKER: usize = 16;
+    let workers = items.len().div_ceil(PER_WORKER).clamp(1, max_workers);
+    if workers == 1 {
+        return items.iter().try_for_each(f);
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    match items.get(i) {
+                        Some(item) => f(item)?,
+                        None => return Ok(()),
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .try_for_each(|h| h.join().unwrap_or_else(|_| Err(io::Error::other("sync worker panicked"))))
+    })
+}
+
+const SYNC_WORKERS: usize = 32;
+
 /// `(mtime, ctime, inode)` change-detection stamps, nanoseconds since the epoch.
 #[cfg(unix)]
 fn stamps(m: &fs::Metadata) -> (Option<i64>, Option<i64>, Option<u64>) {
@@ -239,6 +326,76 @@ impl StorageBackend for DiskBackend {
         if let Err(e) = res {
             let _ = fs::remove_file(&tmp);
             return Err(io_err(&full, e));
+        }
+        Ok(())
+    }
+
+    fn write_unsynced(&self, path: &VPath, data: &[u8]) -> Result<()> {
+        if path.is_root() {
+            return Err(VeilError::InvalidPath("cannot write to the root".into()));
+        }
+        let full = self.full_path(path);
+        let parent = full.parent().expect("non-root path has a parent");
+        let mut created = Vec::new();
+        create_dir_all_tracked(parent, &mut created).map_err(|e| io_err(parent, e))?;
+        // Record the new directories before anything can fail, so the next
+        // barrier syncs them even if this write does not complete.
+        if !created.is_empty() {
+            let mut u = self.unsynced.lock().unwrap_or_else(|e| e.into_inner());
+            u.dirs.extend(created.iter().filter_map(|d| d.parent().map(Path::to_path_buf)));
+        }
+        let tmp = temp_path(parent, path);
+        let res = (|| {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?
+                .write_all(data)?;
+            #[cfg(unix)]
+            if let Ok(old) = fs::metadata(&full) {
+                fs::set_permissions(&tmp, old.permissions())?;
+            }
+            fs::rename(&tmp, &full)
+        })();
+        if let Err(e) = res {
+            let _ = fs::remove_file(&tmp);
+            return Err(io_err(&full, e));
+        }
+        let parent = parent.to_path_buf();
+        let mut u = self.unsynced.lock().unwrap_or_else(|e| e.into_inner());
+        u.files.push(full);
+        u.dirs.insert(parent);
+        Ok(())
+    }
+
+    fn sync_barrier(&self) -> Result<()> {
+        // Held until our batch is durable: a concurrent barrier waits for
+        // it rather than returning early with nothing left to sync.
+        let _serial = self.barrier.lock().unwrap_or_else(|e| e.into_inner());
+        let batch = std::mem::take(&mut *self.unsynced.lock().unwrap_or_else(|e| e.into_inner()));
+        if batch.files.is_empty() && batch.dirs.is_empty() {
+            return Ok(());
+        }
+        let dirs: Vec<PathBuf> = batch.dirs.iter().cloned().collect();
+        let res = for_each_parallel(&batch.files, SYNC_WORKERS, |f| match sync_file(f) {
+            // Removed since (by gc, or by crash recovery as torn): the
+            // directory sync below makes the removal durable instead.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            r => r,
+        })
+        .and_then(|()| {
+            for_each_parallel(&dirs, SYNC_WORKERS, |d| match sync_dir(d) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                r => r,
+            })
+        });
+        if let Err(e) = res {
+            // Keep the batch for the next barrier; nothing that depends on it
+            // may be written by the caller, which gets the error.
+            let mut u = self.unsynced.lock().unwrap_or_else(|e| e.into_inner());
+            u.files.extend(batch.files);
+            u.dirs.extend(batch.dirs);
+            return Err(io_err(&self.root, e));
         }
         Ok(())
     }

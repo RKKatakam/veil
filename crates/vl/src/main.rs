@@ -361,15 +361,123 @@ fn cmd_identity(c: &IdentityCmd) -> Result<ExitCode> {
             println!("stored at   {}", ctx::identity_path().display());
         }
         IdentityCmd::New { name, force } => {
-            if ctx::identity_path().exists() && !force {
-                bail!("an identity already exists (use --force to replace it; you will lose access to scopes granted to it)");
-            }
+            let path = ctx::identity_path();
+            let previous = if path.exists() {
+                if !force {
+                    bail!("an identity already exists (use --force to replace it; you will lose access to scopes granted to it)");
+                }
+                Some(retire_identity(&path)?)
+            } else {
+                None
+            };
             let id = Identity::generate(&name.clone().unwrap_or_else(ctx::default_user_name));
             ctx::write_identity(&id)?;
             println!("Created identity {} {}", id.name, id.public_id());
+            if let Some((kept, old)) = previous {
+                println!(
+                    "The replaced identity was kept at {} (delete it once no vault needs it)",
+                    kept.display()
+                );
+                // The vault key is derived from the identity: re-key the vault
+                // of the repository we are in now, while the old one is at hand.
+                if let (Some(old), Some(root)) = (old, std::env::current_dir().ok().and_then(|d| ctx::find_root(&d))) {
+                    let repo = Repo::open(Arc::new(DiskBackend::new(&root)), Some(id.clone()), &user_for(&id))?;
+                    if repo.vault_rekey(&old)? {
+                        println!("Re-keyed the local vault of {}", root.display());
+                    }
+                }
+                warn(
+                    "other repositories' local vaults are still sealed by the replaced identity; run \
+                     `vl identity recover-vault` in each. Scope admins must grant the new public key again.",
+                );
+            }
+        }
+        IdentityCmd::RecoverVault { from } => {
+            let id = load_identity()?;
+            let cwd = std::env::current_dir()?;
+            let root = ctx::find_root(&cwd)
+                .ok_or_else(|| anyhow!("no Veil repository found in {} or its parents", cwd.display()))?;
+            let repo = Repo::open(Arc::new(DiskBackend::new(&root)), Some(id.clone()), &user_for(&id))?;
+            if !repo.vault_unreadable()? {
+                println!("The local vault already opens with the current identity; nothing to do");
+                return Ok(ExitCode::SUCCESS);
+            }
+            let candidates: Vec<PathBuf> = match from {
+                Some(f) => vec![f.clone()],
+                None => retired_identities()?,
+            };
+            for path in &candidates {
+                let Some(old) = std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|s| Identity::from_json(&s).ok())
+                else {
+                    continue;
+                };
+                if repo.vault_rekey(&old)? {
+                    println!("Re-keyed the local vault with the identity in {}", path.display());
+                    return Ok(ExitCode::SUCCESS);
+                }
+            }
+            bail!(
+                "none of {} identity file(s) opens the local vault{}",
+                candidates.len(),
+                if from.is_none() {
+                    format!(" (looked in {}; pass --from <identity.json>)", retired_dir().display())
+                } else {
+                    String::new()
+                }
+            );
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Where `vl identity new --force` keeps replaced identities.
+fn retired_dir() -> PathBuf {
+    ctx::veil_home().join("retired")
+}
+
+fn retired_identities() -> Result<Vec<PathBuf>> {
+    let dir = retired_dir();
+    if !dir.is_dir() {
+        return Ok(vec![]);
+    }
+    let mut out: Vec<PathBuf> = std::fs::read_dir(&dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    out.sort();
+    out.reverse(); // newest first
+    Ok(out)
+}
+
+/// Copy the identity file at `path` into [`retired_dir`] (owner-only, never
+/// world-readable, not even briefly) before it is replaced. Returns where it
+/// went and the identity, if the file parses.
+fn retire_identity(path: &Path) -> Result<(PathBuf, Option<Identity>)> {
+    let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let dir = retired_dir();
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let dest = dir.join(format!("identity-{}.json", now_millis()));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&dest).with_context(|| format!("creating {}", dest.display()))?;
+    f.write_all(&raw)?;
+    f.sync_all()?;
+    let old = std::str::from_utf8(&raw).ok().and_then(|s| Identity::from_json(s).ok());
+    Ok((dest, old))
 }
 
 // ---- inspection ----------------------------------------------------------
@@ -528,12 +636,21 @@ fn skipped_special(p: &VPath) {
     warn(&format!("skipped {p}: a symlink or special file is in the way; Veil never writes through or over it"));
 }
 
+/// The furthest an embargo deadline may lie in the future.
+const MAX_DEADLINE_MS: i64 = 100 * 366 * 86_400_000;
+
 fn parse_time(s: &str) -> Result<i64> {
+    parse_time_at(s, now_millis())
+}
+
+/// Parse an embargo deadline (`+7d`, RFC 3339 or `YYYY-MM-DD`) relative to
+/// `now`. Deadlines in the past or more than a century ahead are rejected:
+/// either would be a typo, and a past deadline releases the embargo at once.
+fn parse_time_at(s: &str, now: i64) -> Result<i64> {
     use chrono::{Local, NaiveDate};
-    if let Some(rest) = s.strip_prefix('+') {
+    let t = if let Some(rest) = s.strip_prefix('+') {
         let (num, unit) = rest.split_at(rest.len().saturating_sub(1));
-        let n: i64 = num.parse().with_context(|| format!("bad duration '{s}'"))?;
-        let mult = match unit {
+        let mult: i64 = match unit {
             "s" => 1_000,
             "m" => 60_000,
             "h" => 3_600_000,
@@ -541,17 +658,34 @@ fn parse_time(s: &str) -> Result<i64> {
             "w" => 7 * 86_400_000,
             _ => bail!("bad duration unit in '{s}' (use s, m, h, d or w)"),
         };
-        return Ok(now_millis() + n * mult);
-    }
-    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Ok(t.timestamp_millis());
-    }
-    if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        if let Some(t) = d.and_hms_opt(0, 0, 0).and_then(|t| t.and_local_timezone(Local).single()) {
-            return Ok(t.timestamp_millis());
+        if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+            bail!("bad duration '{s}' (expected a whole number such as +7d)");
         }
+        let too_far = || anyhow!("duration '{s}' is too far in the future (at most 100 years)");
+        let n: i64 = num.parse().map_err(|_| too_far())?;
+        let ms = n.checked_mul(mult).filter(|ms| *ms <= MAX_DEADLINE_MS).ok_or_else(too_far)?;
+        now.checked_add(ms).ok_or_else(too_far)?
+    } else if let Ok(t) = chrono::DateTime::parse_from_rfc3339(s) {
+        t.timestamp_millis()
+    } else if let Some(t) = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .and_then(|t| t.and_local_timezone(Local).single())
+    {
+        t.timestamp_millis()
+    } else {
+        bail!("cannot parse time '{s}' (use RFC 3339, YYYY-MM-DD or +7d/+12h/+30m)")
+    };
+    if t <= now {
+        bail!(
+            "'{s}' is in the past; an embargo deadline must be in the future \
+             (use `vl embargo release` to publish now)"
+        );
     }
-    bail!("cannot parse time '{s}' (use RFC 3339, YYYY-MM-DD or +7d/+12h/+30m)")
+    if t - now > MAX_DEADLINE_MS {
+        bail!("'{s}' is too far in the future (at most 100 years)");
+    }
+    Ok(t)
 }
 
 fn cmd_merge(
@@ -835,7 +969,6 @@ fn cmd_scan(ctx: &mut Ctx) -> Result<ExitCode> {
 // ---- secrets & identities ------------------------------------------------
 
 fn cmd_secret(ctx: &mut Ctx, c: &SecretCmd) -> Result<()> {
-    let mut vault = ctx.repo.vault_load()?;
     match c {
         SecretCmd::Set { name, value } => {
             let value = match value {
@@ -846,29 +979,31 @@ fn cmd_secret(ctx: &mut Ctx, c: &SecretCmd) -> Result<()> {
                     s.trim_end_matches(['\n', '\r']).to_string()
                 }
             };
-            vault.secrets.insert(name.clone(), value);
-            ctx.repo.vault_save(&vault)?;
+            ctx.repo.vault_update(|vault| {
+                vault.secrets.insert(name.clone(), value);
+                Ok(())
+            })?;
             println!("Stored secret {name} in the local vault");
         }
         SecretCmd::Get { name } => {
+            let vault = ctx.repo.vault_load()?;
             let v = vault.secrets.get(name).ok_or_else(|| anyhow!("no secret named '{name}'"))?;
             println!("{v}");
         }
         SecretCmd::List => {
-            for k in vault.secrets.keys() {
+            for k in ctx.repo.vault_load()?.secrets.keys() {
                 println!("{k}");
             }
         }
         SecretCmd::Rm { name } => {
-            if vault.secrets.remove(name).is_none() {
+            if !ctx.repo.vault_update(|vault| Ok(vault.secrets.remove(name).is_some()))? {
                 bail!("no secret named '{name}'");
             }
-            ctx.repo.vault_save(&vault)?;
             println!("Removed secret {name}");
         }
         SecretCmd::Import { file } => {
             let text = std::fs::read_to_string(file)?;
-            let mut n = 0;
+            let mut pairs = Vec::new();
             for line in text.lines() {
                 let line = line.trim();
                 if line.is_empty() || line.starts_with('#') {
@@ -877,11 +1012,14 @@ fn cmd_secret(ctx: &mut Ctx, c: &SecretCmd) -> Result<()> {
                 let line = line.strip_prefix("export ").unwrap_or(line);
                 if let Some((k, v)) = line.split_once('=') {
                     let v = v.trim().trim_matches('"').trim_matches('\'');
-                    vault.secrets.insert(k.trim().to_string(), v.to_string());
-                    n += 1;
+                    pairs.push((k.trim().to_string(), v.to_string()));
                 }
             }
-            ctx.repo.vault_save(&vault)?;
+            let n = pairs.len();
+            ctx.repo.vault_update(|vault| {
+                vault.secrets.extend(pairs);
+                Ok(())
+            })?;
             println!("Imported {n} secret(s) from {}", file.display());
         }
     }
@@ -1374,4 +1512,43 @@ fn cmd_gc(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: i64 = 1_790_000_000_000;
+    const DAY: i64 = 86_400_000;
+
+    #[test]
+    fn durations_are_checked() {
+        assert_eq!(parse_time_at("+7d", NOW).unwrap(), NOW + 7 * DAY);
+        assert_eq!(parse_time_at("+90m", NOW).unwrap(), NOW + 90 * 60_000);
+        assert_eq!(parse_time_at("+36500d", NOW).unwrap(), NOW + 36_500 * DAY);
+        for bad in [
+            "+213503955787d",       // overflows i64 milliseconds (BUG-024)
+            "+9223372036854775807s", // n * 1000 overflows
+            "+99999999999999999999w", // does not fit an i64 at all
+            "+36700d",               // more than a century
+            "+-5d",                  // negative: would release at once
+            "+0s",                   // not in the future
+            "+d",
+            "+5x",
+            "+",
+        ] {
+            assert!(parse_time_at(bad, NOW).is_err(), "{bad} accepted");
+        }
+    }
+
+    #[test]
+    fn absolute_times_must_be_in_the_near_future() {
+        let ok = chrono::DateTime::from_timestamp_millis(NOW + DAY).unwrap().to_rfc3339();
+        assert_eq!(parse_time_at(&ok, NOW).unwrap(), NOW + DAY);
+        let past = chrono::DateTime::from_timestamp_millis(NOW - DAY).unwrap().to_rfc3339();
+        assert!(parse_time_at(&past, NOW).is_err());
+        assert!(parse_time_at("1954-01-01", NOW).is_err());
+        assert!(parse_time_at("9999-12-31", NOW).is_err());
+        assert!(parse_time_at("+262143-12-31T00:00:00Z", NOW).is_err());
+    }
 }

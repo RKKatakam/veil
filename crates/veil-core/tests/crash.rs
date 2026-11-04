@@ -7,6 +7,14 @@
 //! `MemoryBackend` writes are atomic, which models `DiskBackend`'s durable
 //! temp-file + fsync + rename + fsync-dir writes.
 //!
+//! Transactions write objects with `write_unsynced` and make them durable
+//! with one `sync_barrier` (itself a mutation that can crash) before writing
+//! the operation. The third crash mode, `PowerLoss`, models the machine
+//! losing power: besides losing the fatal write, every unsynced write since
+//! the last barrier is torn (removed, emptied or truncated, in turn) under
+//! its final name. The retry must then not build on a torn object: the lock
+//! takeover discards them first (`fsck::recover_interrupted_writes`).
+//!
 //! Each operation is swept across every N until it completes. After every
 //! simulated crash the "disk" is reopened and must:
 //!
@@ -53,6 +61,9 @@ enum Crash {
     BeforeWrite,
     /// The fatal write reaches the disk, then the process dies.
     AfterWrite,
+    /// The fatal write is lost and so is every write not yet covered by a
+    /// sync barrier: those files are torn.
+    PowerLoss,
 }
 
 #[derive(Debug)]
@@ -63,6 +74,9 @@ struct FaultyBackend {
     left: Mutex<usize>,
     crashed: AtomicBool,
     mutations: AtomicUsize,
+    /// Unsynced writes since the last barrier.
+    volatile: Mutex<Vec<VPath>>,
+    tore: AtomicBool,
 }
 
 impl FaultyBackend {
@@ -73,6 +87,28 @@ impl FaultyBackend {
             left: Mutex::new(budget),
             crashed: AtomicBool::new(false),
             mutations: AtomicUsize::new(0),
+            volatile: Mutex::new(Vec::new()),
+            tore: AtomicBool::new(false),
+        }
+    }
+
+    fn tore_anything(&self) -> bool {
+        self.tore.load(Ordering::SeqCst)
+    }
+
+    /// Power loss: what never reached stable storage is torn.
+    fn tear_volatile(&self) {
+        let mut volatile = self.volatile.lock().unwrap();
+        self.tore.fetch_or(!volatile.is_empty(), Ordering::SeqCst);
+        for (i, path) in volatile.drain(..).enumerate() {
+            match i % 3 {
+                0 => self.inner.remove_file(&path).unwrap(),
+                1 => self.inner.write(&path, b"").unwrap(),
+                _ => {
+                    let data = self.inner.read(&path).unwrap();
+                    self.inner.write(&path, &data[..data.len() / 2]).unwrap();
+                }
+            }
         }
     }
 
@@ -94,8 +130,12 @@ impl FaultyBackend {
         }
         if *left == 0 {
             self.crashed.store(true, Ordering::SeqCst);
-            if self.mode == Crash::AfterWrite {
-                let _ = f();
+            match self.mode {
+                Crash::AfterWrite => {
+                    let _ = f();
+                }
+                Crash::PowerLoss => self.tear_volatile(),
+                Crash::BeforeWrite => {}
             }
             return Err(Self::crash_error());
         }
@@ -114,6 +154,19 @@ impl StorageBackend for FaultyBackend {
     }
     fn write(&self, path: &VPath, data: &[u8]) -> Result<()> {
         self.mutate(|| self.inner.write(path, data))
+    }
+    fn write_unsynced(&self, path: &VPath, data: &[u8]) -> Result<()> {
+        self.mutate(|| {
+            self.inner.write(path, data)?;
+            self.volatile.lock().unwrap().push(path.clone());
+            Ok(())
+        })
+    }
+    fn sync_barrier(&self) -> Result<()> {
+        self.mutate(|| {
+            self.volatile.lock().unwrap().clear();
+            Ok(())
+        })
     }
     fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool> {
         self.mutate(|| self.inner.create_new(path, data))
@@ -262,7 +315,8 @@ fn assert_healthy(fs: Arc<dyn StorageBackend>, id: &Identity, ctx: &str) {
 fn sweep(name: &str, target: Target, op: Op) {
     let w = world();
     let mut crashes = 0;
-    for mode in [Crash::BeforeWrite, Crash::AfterWrite] {
+    let mut torn = 0;
+    for mode in [Crash::BeforeWrite, Crash::AfterWrite, Crash::PowerLoss] {
         for budget in 0..10_000 {
             let local = Arc::new(w.local.fork());
             let stale = Arc::new(w.stale.fork());
@@ -299,6 +353,7 @@ fn sweep(name: &str, target: Target, op: Op) {
 
             let result = op(&env);
             drop(env);
+            torn += usize::from(mode == Crash::PowerLoss && faulty.crashed() && faulty.tore_anything());
             match result {
                 Ok(()) if !faulty.crashed() => {
                     assert!(budget > 0, "{name}: the operation wrote nothing");
@@ -345,6 +400,7 @@ fn sweep(name: &str, target: Target, op: Op) {
         }
     }
     assert!(crashes >= 2, "{name}: too few crash points ({crashes})");
+    assert!(torn > 0, "{name}: no power loss ever tore an unsynced write");
 }
 
 // ---- the operations --------------------------------------------------------------
@@ -434,7 +490,7 @@ fn crash_during_pull() {
 #[test]
 fn crash_during_init() {
     let id = Identity::generate("alice");
-    for mode in [Crash::BeforeWrite, Crash::AfterWrite] {
+    for mode in [Crash::BeforeWrite, Crash::AfterWrite, Crash::PowerLoss] {
         for budget in 0..1000 {
             let disk = Arc::new(MemoryBackend::new());
             let faulty = Arc::new(FaultyBackend::new(disk.clone(), budget, mode));

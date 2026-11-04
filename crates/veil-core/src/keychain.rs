@@ -11,6 +11,11 @@
 //!   its release condition, signed by the scope member who created it; on
 //!   release the plaintext key is published.
 //!
+//! Every write of these files, and the read that decides it, runs under the
+//! repository lock (reentrantly, so also inside transactions): two
+//! concurrent `grant`s, or a `grant` racing a `pull`, can never lose an
+//! update.
+//!
 //! ## Key generations
 //!
 //! A scope starts at generation 0. Every revocation (and `vl scope rotate`)
@@ -42,6 +47,7 @@ use crate::{
     crypto::{parse_key_hex, random_bytes, random_key, Envelope, Key},
     error::{Result, VeilError},
     identity::{format_public_key, parse_public_identity, parse_public_key, wrap_key, Identity, Signature, WrappedKey},
+    lock::RepoLock,
     object::Snapshot,
     vfs::StorageBackend,
     vpath::VPath,
@@ -769,6 +775,19 @@ impl Keychain {
         access
     }
 
+    // ---- locking -----------------------------------------------------------
+
+    /// Take the repository lock for a read-modify-write of shared metadata
+    /// (key rings, embargo records). Reentrant, so it also works inside a
+    /// transaction on this thread (push and pull merge metadata there).
+    /// Cached keys are dropped: another process may have changed the rings
+    /// since they were derived.
+    fn lock_meta(&self) -> Result<RepoLock> {
+        let lock = RepoLock::acquire_reentrant(self.backend.clone())?;
+        self.invalidate();
+        Ok(lock)
+    }
+
     // ---- key rings -------------------------------------------------------
 
     fn ring_path(scope: &str) -> VPath {
@@ -793,6 +812,7 @@ impl Keychain {
     }
 
     pub fn save_ring(&self, ring: &KeyRing) -> Result<()> {
+        let _lock = self.lock_meta()?;
         validate_scope_name(&ring.scope)?;
         self.backend
             .write(&Self::ring_path(&ring.scope), &serde_json::to_vec_pretty(ring)?)?;
@@ -865,6 +885,7 @@ impl Keychain {
 
     /// Create a new scope whose only member (and admin) is this identity.
     pub fn create_scope(&self, scope: &str) -> Result<()> {
+        let _lock = self.lock_meta()?;
         validate_scope_name(scope)?;
         if self.load_ring(scope)?.is_some() {
             return Err(VeilError::AlreadyExists(format!("scope '{scope}'")));
@@ -935,6 +956,7 @@ impl Keychain {
     }
 
     pub fn grant_role(&self, scope: &str, public_key: &str, name: &str, role: Role) -> Result<()> {
+        let _lock = self.lock_meta()?;
         let pk = parse_public_identity(public_key)?;
         let (ring, state) = self.ring_for_admin(scope, "grant access")?;
         let key = Zeroizing::new(self.require(&generation_label(scope, state.key_id()))?);
@@ -974,6 +996,7 @@ impl Keychain {
     /// uses a new generation the revoked member never receives. They keep
     /// whatever they could already decrypt.
     pub fn revoke(&self, scope: &str, public_key: &str) -> Result<bool> {
+        let _lock = self.lock_meta()?;
         let id = format_public_key(&parse_public_key(public_key)?);
         let (ring, state) = self.ring_for_admin(scope, "revoke access")?;
         if !state.members.contains_key(&id) {
@@ -987,6 +1010,7 @@ impl Keychain {
 
     /// Start a new key generation for the current members.
     pub fn rotate(&self, scope: &str) -> Result<u32> {
+        let _lock = self.lock_meta()?;
         let (ring, state) = self.ring_for_admin(scope, "rotate the key")?;
         let all: Vec<&String> = state.members.keys().collect();
         let rotation = self.rotation(scope, &state, &all)?;
@@ -1034,6 +1058,7 @@ impl Keychain {
     /// diverged log keeps the local ring and reports it. Unsigned legacy
     /// rings never override a signed ring and are never merged as a union.
     pub fn merge_ring(&self, incoming: &KeyRing) -> Result<RingMerge> {
+        let _lock = self.lock_meta()?;
         let scope = incoming.scope.as_str();
         let reject = |m: String| Ok(RingMerge::Rejected(format!("key ring for scope '{scope}': {m}")));
         let inc = match incoming.verify() {
@@ -1164,6 +1189,7 @@ impl Keychain {
     }
 
     pub fn save_embargo(&self, rec: &EmbargoRecord) -> Result<()> {
+        let _lock = self.lock_meta()?;
         self.backend
             .write(&Self::embargo_path(&rec.id)?, &serde_json::to_vec_pretty(rec)?)?;
         self.invalidate();
@@ -1233,6 +1259,7 @@ impl Keychain {
     }
 
     pub fn create_embargo(&self, scope: &str, until: Option<i64>, description: &str) -> Result<String> {
+        let _lock = self.lock_meta()?;
         // Signed records are attributed through the ring, so a legacy
         // (unsigned) ring is upgraded first.
         if let Some(ring) = self.load_ring(scope)? {
@@ -1267,6 +1294,7 @@ impl Keychain {
 
     /// Publish the embargo key, making the embargoed content readable to all.
     pub fn release_embargo(&self, id: &str) -> Result<()> {
+        let _lock = self.lock_meta()?;
         let mut rec = self
             .load_embargo(id)?
             .ok_or_else(|| VeilError::NotFound(format!("embargo '{id}'")))?;
@@ -1288,6 +1316,7 @@ impl Keychain {
     /// Merge an embargo record received from another repository. Returns a
     /// warning when (part of) the record was rejected.
     pub fn merge_embargo(&self, incoming: &EmbargoRecord) -> Result<Option<String>> {
+        let _lock = self.lock_meta()?;
         let id = &incoming.id;
         if Self::embargo_path(id).is_err() {
             return Ok(Some(format!("embargo record with invalid id '{id}' rejected")));
