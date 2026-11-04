@@ -47,6 +47,17 @@ fixed**. Severity: high / medium / low.
 
 ## Security and confidentiality
 
+- **The identity file is protected only by file permissions:**
+  `$VEIL_HOME/identity.json` (0600) holds the private keys in the clear.
+  Anyone who copies it decrypts everything that member can, and an admin's
+  file can grant others. Add an optional passphrase (Argon2id-wrapped keys)
+  and OS keychain / hardware-key storage (macOS Keychain, Secret Service,
+  FIDO2/age-plugin style), with a `vl identity protect` migration.
+- **Names of cloaked files are visible:** tree entries keep their names in
+  plaintext for anyone who can read the repository; only contents are
+  sealed (sealed directory names need a future format bump, see
+  `docs/HUB.md`). Until then, keep secrets out of file and directory names.
+
 - **Trust on first use for key rings:** a fresh clone from a malicious remote
   can be served a valid but outdated ring. Needs a ring-head pin shared out of
   band.
