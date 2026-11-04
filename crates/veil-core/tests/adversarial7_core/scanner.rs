@@ -25,7 +25,6 @@ fn camel_case_credential_keys_at_a_line_start_are_found() {
 /// `.npmrc` line every npm user has, and credentials in URL query strings,
 /// are no longer found.
 #[test]
-#[ignore = "BUG-487: scanner v6 misses .npmrc _authToken and ?apiKey= in URLs (v5 found them)"]
 fn npmrc_tokens_and_query_string_credentials_are_found() {
     let lines = [
         "//registry.npmjs.org/:_authToken=npm_aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5\n".to_string(),
@@ -44,7 +43,6 @@ fn npmrc_tokens_and_query_string_credentials_are_found() {
 /// `github.token`, `mail.smtp.password` are found, `api.key` and the like
 /// are not (the compound keywords and `<WORD>_KEY` only look across `_`).
 #[test]
-#[ignore = "BUG-488: dotted *.key properties (api.key, stripe.api.key) are missed"]
 fn dotted_key_properties_are_found() {
     for key in ["api.key", "stripe.api.key", "aws.secret.key", "google.maps.api.key", "API.KEY"] {
         let text = format!("{key}={S}\n");
@@ -57,7 +55,6 @@ fn dotted_key_properties_are_found() {
 /// these lines quarantines its file (seen in botocore, twisted, Python's
 /// own style), in scanner v5 as in v6.
 #[test]
-#[ignore = "BUG-489: ordinary code lines are taken for credentials"]
 fn ordinary_code_is_not_a_credential() {
     for text in [
         "def check(user):\n    password = lookup(user)\n    return password\n",

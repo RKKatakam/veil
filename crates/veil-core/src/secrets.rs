@@ -23,9 +23,9 @@
 //!   only place the rest-of-line value counts (code has thousands of
 //!   `key = expr` lines per MiB, see `lowercase_into`). Candidate matches
 //!   are rejected as cheaply as possible (the regex itself checks how an
-//!   unquoted value ends, and a match made only of words, or whose keyword
-//!   its left context rules out, is dropped before its capture groups are
-//!   computed).
+//!   unquoted value ends, and a match made only of words, whose keyword
+//!   its left context rules out, or whose value no key's rule could accept,
+//!   is dropped before its capture groups are computed).
 //! * Text in a NUL-padded encoding (UTF-16 LE/BE, UTF-32, with or without a
 //!   BOM) is searched again, chunk by chunk, with its NUL bytes removed,
 //!   which turns the ASCII range of those encodings back into ASCII. This
@@ -70,7 +70,7 @@ use regex::bytes::Regex;
 
 /// Bumped whenever the rules change, so cached "scanned clean" facts (see
 /// `statcache`) from an older scanner are not reused.
-pub const RULES_VERSION: u32 = 6;
+pub const RULES_VERSION: u32 = 7;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Finding {
@@ -159,7 +159,9 @@ struct Rule {
 /// suffix words: up to six `_x` / `-x` (`DB_PASSWORD_PROD_EU_WEST_1`,
 /// `aws_secret_access_key`), and camelCase words glued to it (`apiKeyProd`,
 /// not `tokenizer`), unless one of them says the value is something else
-/// ([`NOT_A_CREDENTIAL`]: `password_hash`, `tokenUrl`, `secretName`).
+/// ([`NOT_A_CREDENTIAL`]: `password_hash`, `tokenUrl`, `secretName`). In
+/// the key of a configuration line or an XML entry, `.` separates words too
+/// (`stripe.api.key`, see [`lowercase_into`]).
 /// `identified by` only counts in SQL (`IDENTIFIED BY '…'`).
 const KEYWORDS: &str = r"password|passwd|(?P<gk>key|salt)|secret|token|pwd|identified[ \t]{1,8}by";
 
@@ -863,10 +865,158 @@ fn not_a_secret(v: &[u8]) -> bool {
         || (v[0] == b'{' && prefix(1, b'}', SCHEMES))
         || v.starts_with(b"vault:v")
         || v.starts_with(b"AQICAH")
-        || ((v.starts_with(b"{\"") || v.starts_with(b"{\\\"")) && v.ends_with(b"}"))
+        || json(v)
         || timestamp(v)
-        || (v.starts_with(b"[\"") && v.ends_with(b"]"))
         || code_like(v)
+        || expression(v)
+}
+
+/// A JSON object or array (maybe JSON-escaped), maybe followed by the `,`
+/// of its line: `{"type":"string"},` (JSON Schema), `["a","b"]`.
+fn json(v: &[u8]) -> bool {
+    let v = v.strip_suffix(b",").unwrap_or(v);
+    ((v.starts_with(b"{\"") || v.starts_with(b"{\\\"")) && v.ends_with(b"}")) || (v.starts_with(b"[\"") && v.ends_with(b"]"))
+}
+
+/// Code made of names (BUG-489): a call, an index or a list, with every
+/// name in it made of words and every string in it a name or short
+/// (`lookup(user)`, `len(self._input_token)`, `self.dirdbm[c.username]`,
+/// `[output_token]`, `cfg.get("password")`). Values have no blanks, so
+/// neither has the expression, and it has no operators. A random password
+/// practically never has this shape: its runs of letters and digits are no
+/// words (`Xk9m`, `q8Zr4`), and its punctuation is no grammar.
+#[inline(never)]
+fn expression(v: &[u8]) -> bool {
+    let v = v.strip_suffix(b";").or_else(|| v.strip_suffix(b",")).unwrap_or(v);
+    let mut p = Expr { v, i: 0, structure: false };
+    p.term(0) && p.i == v.len() && p.structure
+}
+
+/// A parser for [`expression`].
+struct Expr<'a> {
+    v: &'a [u8],
+    i: usize,
+    /// Has it seen a call, an index or a list?
+    structure: bool,
+}
+
+impl Expr<'_> {
+    const DEPTH: usize = 16;
+
+    fn peek(&self) -> Option<u8> {
+        self.v.get(self.i).copied()
+    }
+
+    fn eat(&mut self, s: &[u8]) -> bool {
+        let ok = self.v[self.i..].starts_with(s);
+        if ok {
+            self.i += s.len();
+        }
+        ok
+    }
+
+    /// A name, string, number (`-1`), `(…)` or `[…]`, maybe after one `&`,
+    /// `*` or `!`; then any `.name`, `::name`, `->name`, `(…)`, `[…]`, `?`
+    /// (not after a number).
+    fn term(&mut self, depth: usize) -> bool {
+        if depth > Self::DEPTH {
+            return false;
+        }
+        if matches!(self.peek(), Some(b'&' | b'*' | b'!')) {
+            self.i += 1;
+        }
+        let ok = match self.peek() {
+            Some(b'(') => self.list(b')', depth),
+            Some(b'[') => {
+                self.structure = true;
+                self.list(b']', depth)
+            }
+            Some(b'"' | b'\'') => self.string(),
+            Some(b'-') => {
+                self.i += 1;
+                return self.peek().is_some_and(|b| b.is_ascii_digit()) && self.number();
+            }
+            Some(b) if b.is_ascii_digit() => return self.number(),
+            // Python's `b"…"`, `r'…'`, `rb"…"`, `f"…"`.
+            Some(b'b' | b'r' | b'u' | b'f' | b'B' | b'R' | b'U' | b'F')
+                if (1..=2).any(|n| self.v.get(self.i + n).is_some_and(|b| matches!(b, b'"' | b'\'')) && self.v[self.i..self.i + n].iter().all(|b| b"brufBRUF".contains(b))) =>
+            {
+                while !matches!(self.peek(), Some(b'"' | b'\'')) {
+                    self.i += 1;
+                }
+                self.string()
+            }
+            Some(_) => self.name(),
+            None => false,
+        };
+        if !ok {
+            return false;
+        }
+        loop {
+            if self.eat(b".") || self.eat(b"::") || self.eat(b"->") {
+                if !self.name() {
+                    return false;
+                }
+            } else if matches!(self.peek(), Some(b'(' | b'[')) {
+                self.structure = true;
+                let close = if self.peek() == Some(b'(') { b')' } else { b']' };
+                if !self.list(close, depth) {
+                    return false;
+                }
+            } else if self.peek() == Some(b'?') {
+                self.i += 1;
+            } else {
+                return true;
+            }
+        }
+    }
+
+    /// `(a,b)` or `[a,b]`, maybe empty, maybe with `name=value` arguments.
+    fn list(&mut self, close: u8, depth: usize) -> bool {
+        self.i += 1;
+        while self.peek() != Some(close) {
+            // A keyword argument.
+            let at = self.i;
+            if !(self.name() && self.eat(b"=") && self.peek() != Some(b'=')) {
+                self.i = at;
+            }
+            if !self.term(depth + 1) {
+                return false;
+            }
+            if !self.eat(b",") {
+                break;
+            }
+        }
+        self.eat(&[close])
+    }
+
+    /// An identifier made of words (`_input_token`, `dirdbm`, `ed25519`).
+    fn name(&mut self) -> bool {
+        let rest = &self.v[self.i..];
+        let n = rest.iter().take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$')).count();
+        let name = &rest[..n];
+        let ok = name.first().is_some_and(|b| !b.is_ascii_digit())
+            && name.split(|b| matches!(b, b'_' | b'$')).all(|w| wordlike(w, true));
+        self.i += n;
+        ok
+    }
+
+    fn number(&mut self) -> bool {
+        let rest = &self.v[self.i..];
+        let n = rest.iter().take_while(|b| b.is_ascii_alphanumeric() || **b == b'_').count();
+        self.i += n;
+        number(&rest[..n])
+    }
+
+    /// A string literal holding a name, a path or a few characters, maybe
+    /// with Python's prefixes (`b"…"`, `r'…'`).
+    fn string(&mut self) -> bool {
+        let q = self.v[self.i];
+        let Some(n) = memchr::memchr(q, &self.v[self.i + 1..]) else { return false };
+        let inner = &self.v[self.i + 1..self.i + 1 + n];
+        self.i += n + 2;
+        inner.len() < 8 || identifier(inner)
+    }
 }
 
 /// An ISO 8601 date or time stamp (`2016-09-08T21:47:36Z`).
@@ -1024,6 +1174,12 @@ enum Key {
     /// `apiKeyProd`, `LICENSE_KEY`, `DB_PWD`, see [`credential_key`]): its
     /// value is held to more than [`plausible_value`] (see `search_with`).
     Strict,
+    /// A credential found by an older rule, written in camelCase
+    /// (`dbPassword`, `apiKey`, `_authToken`): held to what `Key::Strict`
+    /// is, except that an unquoted value in code counts (`.npmrc`'s
+    /// `//host/:_authToken=…`, `?accessToken=…` in a URL, kwargs), as it
+    /// did before scanner v6 (BUG-487).
+    Hump,
 }
 
 /// Is `b` part of a word in the lowercased text? (Not
@@ -1108,16 +1264,22 @@ fn words(s: &[u8]) -> impl Iterator<Item = &[u8]> {
 /// `secretsManager`), or nothing? Not a longer word (`tokenizer`,
 /// `PASSWORDLESS`). `last` is the keyword's last character.
 fn glued_ok(glued: &[u8], last: u8) -> bool {
-    let plural = match glued {
-        [b's'] => 1,
-        [b'S'] if last.is_ascii_uppercase() => 1,
-        [b's', next, ..] if next.is_ascii_uppercase() => 1,
-        _ => glued.iter().take(3).take_while(|b| b.is_ascii_digit()).count(),
-    };
+    let plural = plural_len(glued, last);
     let before = if plural > 0 { glued[plural - 1] } else { last };
     match glued.get(plural) {
         None => true,
         Some(b) => b.is_ascii_uppercase() && (before.is_ascii_lowercase() || before.is_ascii_digit()),
+    }
+}
+
+/// How many bytes of `glued` (see [`glued_ok`]) make the keyword plural or
+/// numbered (`s`, `S` after an upper-case keyword, up to three digits).
+fn plural_len(glued: &[u8], last: u8) -> usize {
+    match glued {
+        [b's'] => 1,
+        [b'S'] if last.is_ascii_uppercase() => 1,
+        [b's', next, ..] if next.is_ascii_uppercase() => 1,
+        _ => glued.iter().take(3).take_while(|b| b.is_ascii_digit()).count(),
     }
 }
 
@@ -1202,6 +1364,11 @@ fn credential_key(caps: &regex::bytes::Captures, g: &AssignGroups, lower: &[u8],
         return Key::No;
     }
     let mut kind = Key::Credential;
+    // Found by a rule older than scanner v6 (`password` anywhere, a compound,
+    // a `KEY_NAMES` key, `secret` / `token` as a word of their own): at a
+    // camelCase hump (`dbPassword`, `apiKey`, `_authToken`) that is
+    // `Key::Hump`, not `Key::Strict` (BUG-487).
+    let mut old_rule = matches!(k, b"password" | b"passwd") || compound || (matches!(k, b"secret" | b"token") && !after_ident);
     if compound {
         if k == b"token" && word_end.is_some_and(|e| TOKEN_NOT_CREDENTIAL.iter().any(|w| w.as_bytes() == word_before(lower, text, e))) {
             return Key::No;
@@ -1235,8 +1402,8 @@ fn credential_key(caps: &regex::bytes::Captures, g: &AssignGroups, lower: &[u8],
                 }
                 kind = Key::Generic;
             }
-        } else if hump {
-            kind = Key::Credential; // (as before scanner v6: `appKey`)
+        } else {
+            old_rule = true; // (as before scanner v6: `appKey`)
         }
     }
     // The suffix words, from the original text (for camelCase).
@@ -1260,15 +1427,17 @@ fn credential_key(caps: &regex::bytes::Captures, g: &AssignGroups, lower: &[u8],
     // capitalised or upper-case, maybe with digits after it, and those of
     // the keyword have two letters or more (`Key`, `KEY`, `ApiKey`, not
     // `KeY`).
-    let camel_tail = glued.iter().any(u8::is_ascii_uppercase);
+    // camelCase words glued to the keyword (`tokenProd`; not the plural of `API_KEYS`).
+    let camel_tail = glued[plural_len(glued, text[kw.end() - 1])..].iter().any(u8::is_ascii_uppercase);
     if kind != Key::Credential || at_hump || camel_tail {
         let start = kw.start() - text[kw.start().saturating_sub(64)..kw.start()].iter().rev().take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')).count();
         let keyword_words = words(&text[kw.range()]).all(|w| w.len() >= 2);
         if !keyword_words || !words(&text[start..sfx_end]).all(|w| wordlike(w, false)) {
             return Key::No;
         }
+        // (`pub GetToken: GetTokenFn,`, `tokenProd`; `accessToken`: `Key::Hump`.)
         if kind == Key::Credential && (at_hump || camel_tail) {
-            kind = Key::Strict; // (also `accessToken`: `pub GetToken: GetTokenFn,`)
+            kind = if camel_tail || !old_rule { Key::Strict } else { Key::Hump };
         }
     }
     if let Some(el) = caps.get(g.el) {
@@ -1305,20 +1474,68 @@ fn assignment_value(caps: &regex::bytes::Captures, g: &AssignGroups, text: &[u8]
     if line && !config_line(text, caps.get(g.kw).expect("keyword group").start()) {
         span.end = span.start + code_token(&text[span.clone()])?;
     } else if line || g.k8s.iter().any(|&i| caps.get(i).is_some()) {
-        let v = &text[span.clone()];
-        // `"…",` in JSON-like lines; otherwise a trailing `,` / `;` is kept,
-        // as it tells code (`f(x,`, `g(x);`).
-        let bare = v.strip_suffix(b",").or_else(|| v.strip_suffix(b";")).unwrap_or(v);
-        let quoted = bare.len() > 1 && matches!(bare[0], b'"' | b'\'') && bare.last() == Some(&bare[0]);
-        let v = if quoted { &bare[..bare.len() - 1] } else { v.strip_suffix(b"\"").or_else(|| v.strip_suffix(b"'")).unwrap_or(v) };
-        span.end = span.start + v.len();
-        span.start += usize::from(quoted);
+        let r = line_value(&text[span.clone()]);
+        span = span.start + r.start..span.start + r.end;
     }
     // `Token::Str(…)` (a path in code) is not `token: value`.
     if text[span.start] == b':' && text[span.start - 1] == b':' {
         return None;
     }
+    // In a URL's query string (`?apiKey=…&x=1`) the value ends at `&`.
+    let kw = caps.get(g.kw).expect("keyword group").start();
+    let key = kw - text[..kw].iter().rev().take(256).take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')).count();
+    if key > 0 && matches!(text[key - 1], b'?' | b'&') {
+        if let Some(n) = memchr::memchr(b'&', &text[span.clone()]) {
+            span.end = span.start + n;
+        }
+    }
+    // A type, not a value: `ENCRYPTION_KEY: KeyUsageFlags = 2i32;` (BUG-489).
+    if [g.u, g.ut].iter().any(|&i| caps.get(i).is_some()) {
+        let blanks = text[span.end..].iter().take(64).take_while(|b| matches!(b, b' ' | b'\t')).count();
+        let after = &text[span.end + blanks..];
+        if after.first() == Some(&b'=') && !matches!(after.get(1), Some(b'=' | b'>')) {
+            return None;
+        }
+    }
     Some(span)
+}
+
+/// The part of a value that runs to the end of its line to judge (relative
+/// to it): without its quotes (`- "DB_PASSWORD=…"`), and without the `,` /
+/// `;` after a quoted one (`"token": "…",` in JSON-like lines); otherwise a
+/// trailing `,` / `;` is kept, as it tells code (`f(x,`, `g(x);`).
+fn line_value(v: &[u8]) -> std::ops::Range<usize> {
+    let bare = v.strip_suffix(b",").or_else(|| v.strip_suffix(b";")).unwrap_or(v);
+    let quoted = bare.len() > 1 && matches!(bare[0], b'"' | b'\'') && bare.last() == Some(&bare[0]);
+    let end = if quoted { bare.len() - 1 } else { v.strip_suffix(b"\"").or_else(|| v.strip_suffix(b"'")).unwrap_or(v).len() };
+    usize::from(quoted)..end
+}
+
+/// Is the value of a match that runs to the end of its line, `rest` (from
+/// [`value_start`], without the line end), certainly no credential, whatever
+/// its key? Then its capture groups need not be computed (they cost more
+/// than the rest of the search: most such matches in code and configuration
+/// are references and code). Only where `rest` has no blanks: then the value
+/// is all of it, as the rest of a configuration line ([`line_value`]) or an
+/// unquoted token (if it is made of their characters), and
+/// [`plausible_value`] rejects both (every key's value must pass it). `kw`:
+/// where the key starts in `text`.
+fn line_value_rejected(text: &[u8], kw: usize, rest: &[u8], config: bool) -> bool {
+    if rest.len() < 12 || rest.iter().any(u8::is_ascii_whitespace) {
+        return false;
+    }
+    // (In a query string the value ends at `&`: see `assignment_value`.)
+    let key = kw - text[..kw].iter().rev().take(256).take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')).count();
+    if key > 0 && matches!(text[key - 1], b'?' | b'&') {
+        return false;
+    }
+    let line = match config {
+        true => &rest[line_value(rest)],
+        false => &rest[..code_token(rest).unwrap_or(rest.len())],
+    };
+    // (An unquoted token is made of these, and does not start with `:`.)
+    let token = rest[0] != b':' && rest.iter().all(|b| b.is_ascii_alphanumeric() || b"!#$%&*+./:=?@^_~|-".contains(b));
+    (line.is_empty() || !plausible_value(line)) && (!token || !plausible_value(rest))
 }
 
 /// The token an unquoted value in code is: the run of credential characters
@@ -1334,7 +1551,8 @@ fn code_token(v: &[u8]) -> Option<usize> {
 /// if the key is not followed by a separator on the same line (an element,
 /// a Kubernetes `value:`, SQL).
 fn value_start(m: &[u8]) -> Option<usize> {
-    let mut i = m.iter().take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')).count();
+    // (Not `is_ascii_alphanumeric`: the stand-ins are upper-case letters.)
+    let mut i = m.iter().take_while(|&&b| word_byte(b) || matches!(b, b'_' | b'-')).count();
     i += usize::from(matches!(m.get(i), Some(b'"' | b'\'')));
     let blanks = |i: usize| i + m[i..].iter().take_while(|b| matches!(b, b' ' | b'\t')).count();
     i = blanks(i);
@@ -1588,12 +1806,21 @@ fn search_with<'r>(
         // has many lines like `secret = config.secret_key.clone();`: where
         // the key does not start the line, reject such a match unless its
         // value starts with a token, before computing capture groups. Other
-        // keys on the line may still match.
+        // keys on the line may still match. A value that no key's rule
+        // could accept (`os.environ["X"]`, `${X}`, `<your-key>`) is rejected
+        // there too ([`line_value_rejected`]).
         if assign.is_some() && (hay[whole.end() - 1] == b'\n' || whole.end() == hay.len()) {
             let m = &hay[whole.range()];
             if let Some(v) = value_start(m) {
-                if !config_line(text, whole.start()) && code_token(&text[whole.start() + v..whole.end()]).is_none() {
+                let config = config_line(text, whole.start());
+                let rest = &text[whole.start() + v..whole.end()];
+                if !config && code_token(rest).is_none() {
                     at = whole.start() + v;
+                    continue;
+                }
+                let rest = rest.strip_suffix(b"\n").unwrap_or(rest);
+                let rest = rest.strip_suffix(b"\r").unwrap_or(rest);
+                if line_value_rejected(text, whole.start(), rest, config) {
                     continue;
                 }
             }
@@ -1641,27 +1868,32 @@ fn search_with<'r>(
             },
             None => values.iter().find_map(|&g| caps.get(g)).unwrap_or(whole).range(),
         };
-        // A key found by a v6 rule (`Key::Strict`, `Key::Generic`) needs a
-        // value that is clearly a literal: on the same line (base64 can
-        // look like `…abcKey=`, and the next line be anything) unless the
-        // shape is multi-line by nature (a Kubernetes `value:`, an XML
-        // element); quoted, or one token (not code: `nKey = pOp->p4.z;`,
-        // `keys = set(d.keys())`); not made of words (type names,
+        // A key found by a v6 rule (`Key::Strict`, `Key::Generic`) or in
+        // camelCase (`Key::Hump`) needs a value that is clearly a literal:
+        // on the same line (base64 can look like `…abcKey=`, and the next
+        // line be anything) unless the shape is multi-line by nature (a
+        // Kubernetes `value:`, an XML element); quoted, or one token (not
+        // code: `nKey = pOp->p4.z;`, `keys = set(d.keys())`; an unquoted
+        // token in code only for `Key::Hump`); not made of words (type names,
         // `Ipv6CidrAssociations`, `"?NonExpressionParenKeyword"`); not a
         // UUID (`ChangeToken`, an identifier).
-        if let (Some(g), Some(Key::Generic | Key::Strict)) = (assign, key) {
+        if let (Some(g), Some(Key::Generic | Key::Strict | Key::Hump)) = (assign, key) {
             let kw_end = caps.get(g.kw).expect("keyword group").end();
             let multi = [g.k8q, g.k8s[0], g.k8s[1], g.el].iter().any(|&i| caps.get(i).is_some());
             let v = &text[span.clone()];
             let literal = g.literal.iter().any(|&i| caps.get(i).is_some());
-            let token = v.iter().all(|b| b.is_ascii_alphanumeric() || b"!#$%&*+./:=?@^_~|-".contains(b));
+            let bare = v.strip_suffix(b";").or_else(|| v.strip_suffix(b",")).unwrap_or(v);
+            let token = bare.iter().all(|b| b.is_ascii_alphanumeric() || b"!#$%&*+./:=?@^_~|-".contains(b));
             // An unquoted token in code is a name (`Key: TypeName,`,
             // `isFlat?getAllKeys:keys`), except in a connection string
             // (`;Pwd=…`).
             let ident = whole.start() - text[..whole.start()].iter().rev().take(256).take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')).count();
             let unquoted = [g.u, g.ut].iter().any(|&i| caps.get(i).is_some());
-            let code = unquoted && !config_line(text, whole.start()) && ident.checked_sub(1).map(|i| text[i]) != Some(b';');
+            let code = key != Some(Key::Hump) && unquoted && !config_line(text, whole.start()) && ident.checked_sub(1).map(|i| text[i]) != Some(b';');
             if (!multi && text[kw_end..span.start].contains(&b'\n')) || !(literal || token) || code || wordy(v) || uuid(trim_code_end(unquote(v))) {
+                // A keyword inside may still count, under an older rule
+                // (`secretKey`: `key` after `secret`; `ACCESS_KEY_SECRET`).
+                at = restart;
                 continue;
             }
         }
@@ -1807,13 +2039,23 @@ fn strip_nuls(out: &mut Vec<u8>, data: &[u8], from: usize, to: usize, units: Opt
 /// the rest-of-line value of [`assignment_pattern`] only matches there: in
 /// code (`let secret = config.secret_key.clone();`) it would match every
 /// line with a keyword before `=`, only to be rejected (the pre-filter for
-/// code lines).
+/// code lines). The dots of that key become `_` (`stripe.api.key=`), as do
+/// those of the `key` and `name` attributes of an XML line
+/// ([`xml_key_attributes`]).
 fn lowercase_into(buf: &mut Vec<u8>, s: &[u8]) -> Option<(usize, usize)> {
     buf.clear();
     buf.extend(s.iter().map(|&b| if b == b'-' { b'_' } else { b.to_ascii_lowercase() }));
     let mark = |buf: &mut Vec<u8>, line: usize| {
-        if let Some(i) = config_separator(&s[line..]) {
-            buf[line + i] = if s[line + i] == b':' { CONFIG_COLON } else { CONFIG_EQUALS };
+        match key_separator(&s[line..]) {
+            Ok(i) => {
+                buf[line + i] = if s[line + i] == b':' { CONFIG_COLON } else { CONFIG_EQUALS };
+                // A dotted configuration key (`stripe.api.key=`, Spring's
+                // `spring.datasource.password`) is words, as `_` makes them
+                // (BUG-488). (What comes before the key has no `.`.)
+                dots_to_underscores(&mut buf[line..line + i]);
+            }
+            Err(first) if s.get(line + first) == Some(&b'<') => xml_key_attributes(buf, s, line),
+            Err(_) => {}
         }
     };
     // Looking at every line costs more than finding the keywords (most
@@ -1841,6 +2083,38 @@ fn lowercase_into(buf: &mut Vec<u8>, s: &[u8]) -> Option<(usize, usize)> {
     first.map(|first| (first, pos))
 }
 
+fn dots_to_underscores(key: &mut [u8]) {
+    key.iter_mut().filter(|b| **b == b'.').for_each(|b| *b = b'_');
+}
+
+/// In an XML line (`<` after blanks), the dots in the values of `key`
+/// and `name` attributes become `_` in `buf`, the lowercased `s`: they name
+/// a configuration key (`<entry key="api.key">`, `<add key="Stripe.Api.Key"
+/// value="…"/>`, `<property name="db.password">`). Looks at most 512 bytes
+/// into the line.
+#[inline(never)]
+fn xml_key_attributes(buf: &mut [u8], s: &[u8], line: usize) {
+    let end = (line + 512).min(s.len());
+    // One pass over the `=` of the line (it is mostly HTML or XML text).
+    for i in memchr::memchr2_iter(b'=', b'\n', &s[line..end]).map(|i| line + i) {
+        if s[i] == b'\n' {
+            break;
+        }
+        let q = match s.get(i + 1) {
+            Some(&q) if q == b'"' || q == b'\'' => q,
+            _ => continue,
+        };
+        let name = &buf[line..i];
+        let attr = [&b"key"[..], b"name"].iter().any(|a| name.strip_suffix(*a).is_some_and(|r| r.last().is_some_and(u8::is_ascii_whitespace)));
+        if attr {
+            let open = i + 2;
+            if let Some(n) = memchr::memchr(q, &s[open..end]) {
+                dots_to_underscores(&mut buf[open..open + n]);
+            }
+        }
+    }
+}
+
 /// The words each keyword of [`KEYWORDS`] starts with.
 const KEYWORD_PARTS: &[&str] = &["password", "passwd", "secret", "token", "key", "salt", "pwd", "identified"];
 
@@ -1850,12 +2124,18 @@ const KEYWORD_PARTS: &[&str] = &["password", "passwd", "secret", "token", "key",
 const CONFIG_COLON: u8 = b'C';
 const CONFIG_EQUALS: u8 = b'E';
 
+#[cfg(test)]
+fn config_separator(line: &[u8]) -> Option<usize> {
+    key_separator(line).ok()
+}
+
 /// Where the `:` or `=` after the key of a configuration line is, if `line`
 /// (to the end of the text) starts with one: what [`config_line`] accepts
 /// before a key, more key characters, maybe a quote and blanks, then the
 /// separator. Lines whose key starts more than 256 bytes in are marked too;
-/// `config_line` rejects them after the match.
-fn config_separator(line: &[u8]) -> Option<usize> {
+/// `config_line` rejects them after the match. Otherwise, where the line's
+/// first byte other than a blank is.
+fn key_separator(line: &[u8]) -> Result<usize, usize> {
     // (Hand-rolled, with a table: this runs on every line.) A key that
     // starts more than 256 bytes in does not count anyway (`config_line`);
     // one that ends after 512 bytes does not either.
@@ -1886,6 +2166,7 @@ fn config_separator(line: &[u8]) -> Option<usize> {
         i
     };
     let mut i = skip(0, BLANK);
+    let first = i;
     match line.get(i) {
         Some(b'-') => i = skip(i + 1, BLANK),
         Some(b'e') if line[i..].starts_with(b"export ") => i = skip(i + 7, BLANK),
@@ -1897,7 +2178,11 @@ fn config_separator(line: &[u8]) -> Option<usize> {
     let quote = |i: usize| i + usize::from(matches!(line.get(i), Some(b'"' | b'\'')));
     i = skip(quote(i), KEY);
     i = skip(quote(i), SPACE);
-    matches!(line.get(i), Some(b':' | b'=')).then_some(i)
+    if matches!(line.get(i), Some(b':' | b'=')) {
+        Ok(i)
+    } else {
+        Err(first)
+    }
 }
 
 // ---- NUL-separated text ------------------------------------------------------
@@ -2344,6 +2629,76 @@ QyNTUxOQAAACBGqZt3YkVvQ2mR8sXlN0pWcF4hTj7uK9eAoD1bLyS6xQAAAJgVb1oKFW9a
         assert!((min_entropy(&[b'x'; 16]) - 2.6).abs() < 1e-9, "lower-case");
         assert!((min_entropy(&[b'a'; 32]) - 2.9).abs() < 1e-9, "hex");
         assert_eq!(min_entropy(&[b'X'; 64]), 3.2);
+    }
+
+    #[test]
+    fn code_expressions() {
+        for v in [
+            &b"lookup(user)"[..],
+            b"self.dirdbm[c.username]",
+            b"[output_token]",
+            b"len(self._input_token)",
+            b"cfg.get(\"password\",default)",
+            b"Jobs[-1].JobId",
+            b"getpass.getpass(b'Password:')",
+            b"self.get_signing_keys(refresh=True)",
+            b"str(token_response);",
+        ] {
+            assert!(expression(v), "{}", String::from_utf8_lossy(v));
+        }
+        // Random passwords with brackets, and code that holds a literal.
+        for v in [
+            &b"Xk9(mQ2)vL7pR4wZt8"[..],
+            b"q8Zr4XvT2mLpW9nB7kYd3HsJ",
+            b"t.mz>vn<VS99",
+            b"vf<Q81(nvpF)",
+            b"(OK.DZG%bqF)",
+            b"p(emv)>KY*We",
+            b"0(wRyqrF/Wl)",
+            b"Secret(\"Xk9mQ2vL7pR4wZt8\")",
+            b"self.password",
+            b"a+b(c)",
+        ] {
+            assert!(!expression(v), "{}", String::from_utf8_lossy(v));
+        }
+        assert!(json(b"{\"type\":\"string\"},") && json(b"[\"a\",\"b\"]") && !json(b"{\"type\""));
+    }
+
+    /// The check before capture groups (`line_value_rejected`) only rejects
+    /// what the full check rejects, over generated lines.
+    #[test]
+    fn line_value_rejection_agrees_with_the_full_check() {
+        let keys = ["password", "DB_PASSWORD", "apiKey", "secret_key", "_authToken", "MAPBOX_KEY", "db.password", "githubToken", "API_KEYS"];
+        let lines = ["{k}={v}", "  {k}: {v}", "export {k}={v}", "x = f({k}={v}", "x = f(a, {k}={v})", "GET /?{k}={v}", "//h/:{k}={v}", "  - \"{k}={v}\"", "\"{k}\": {v}"];
+        let values = [
+            "Xk9mQ2vL7pR4wZt8", "${DATABASE_PASSWORD}", "os.environ[\"X\"]", "lookup(user)", "<your-key-here>", "\"Xk9mQ2vL7pR4wZt8\",",
+            "'q8Zr4XvT2mLpW9nB7kYd3HsJ';", "Xk9mQ2vL7pR4wZt8;", "Xk9mQ2vL7pR4wZt8,", "\"Xk9mQ2vL7pR4wZt8", "Xk9mQ2vL7pR4&a=b", "abc&x=Xk9mQ2vL7pR4wZt8",
+            "self.password_value", "{\"type\":\"string\"},", "[output_token]", "Xk9(mQ2)vL7pR4wZt8", "*default_password_x", "$2b$12$KIXQJbXk9mQ2vL7pR4wZt8",
+        ];
+        let rules = rules();
+        let (mut fired, mut lower) = (0, Vec::new());
+        for k in keys {
+            for l in lines {
+                for v in values {
+                    let line = format!("{}\n", l.replace("{k}", k).replace("{v}", v));
+                    let text = line.as_bytes();
+                    lowercase_into(&mut lower, text);
+                    for m in rules.assignment_re.find_iter(&lower) {
+                        let Some(vs) = value_start(&lower[m.range()]).filter(|_| lower[m.end() - 1] == b'\n') else { continue };
+                        let rest = &text[m.start() + vs..m.end() - 1];
+                        if !line_value_rejected(text, m.start(), rest, config_line(text, m.start())) {
+                            continue;
+                        }
+                        fired += 1;
+                        let caps = rules.assignment_caps.captures_at(&lower[..m.end()], m.start()).expect("same match");
+                        if let Some(span) = assignment_value(&caps, &rules.assign, text) {
+                            assert!(!plausible_value(&text[span]), "{line:?}");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(fired > 300, "{fired}");
     }
 
     #[test]
