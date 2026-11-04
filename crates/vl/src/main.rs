@@ -939,10 +939,59 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()
     let policy_path = VPath::new(POLICY_FILE)?;
     let changes = veil_core::tree::diff_trees(ctx.repo.store(), Some(&wc_tree), Some(&src_tree))?;
     let mut done: std::collections::HashSet<VPath> = changes.iter().filter(|c| wanted(&c.path)).map(|c| c.path.clone()).collect();
+    // A version put back keeps its audience: a sealed version, or a
+    // conflict, is recorded as the entry it was written from, never as a
+    // public edit of `@`'s (BUG-481). A sealed version this reader cannot
+    // read is not put back at all (its last public version is not it).
+    let mut unreadable: Vec<VPath> = Vec::new();
+    let mut moves_audience = false;
+    for c in changes.iter().filter(|c| wanted(&c.path)) {
+        let Some(e) = &c.new else { continue };
+        if e.kind == veil_core::EntryKind::File && !ctx.repo.store().entry_readable(e) {
+            unreadable.push(c.path.clone());
+        } else if restored_as_recorded(&ctx.repo, e)? {
+            let same = c.old.as_ref().is_some_and(|o| {
+                o.kind == veil_core::EntryKind::File && e.kind == veil_core::EntryKind::File && o.visibility == e.visibility
+            });
+            moves_audience |= !same;
+        }
+    }
+    // Under an unreleased embargo, the working copy's tree is the
+    // embargo's; a version with another audience cannot be put into it as
+    // it is, and taking it in as an edit would seal it under the embargo
+    // (whose release publishes it).
+    let embargoed = veil_core::embargo::unreleased_wrapper(ctx.repo.store(), &wc_tree)?.is_some();
+    if embargoed && moves_audience {
+        bail!(
+            "the working copy is under an unreleased embargo: restoring a version sealed for another audience, or a conflict, into it would put that version under the embargo's key (its release would publish it); restore it into a change outside the embargo"
+        );
+    }
+    for p in &unreadable {
+        eprintln!("  {} {} (unreadable here; not restored)", render::yellow("redacted"), safe(p.as_str()));
+    }
+    let wanted = |p: &VPath| wanted(p) && !unreadable.contains(p);
     // Removals before writes, nothing in the way deleted, emptied
     // directories removed: checkout's rules (BUG-201, BUG-209).
     let r = ctx.restore(&wc_tree, &src_tree, &wanted)?;
-    let skipped: usize = r.kept_local.len() + r.blocked.len() + r.obstructed.len() + r.nested.len() + r.failed.len() + r.redacted.len();
+    let skipped: usize =
+        r.kept_local.len() + r.blocked.len() + r.obstructed.len() + r.nested.len() + r.failed.len() + r.redacted.len() + unreadable.len();
+    let not_written = |p: &VPath| {
+        r.kept_local.contains(p)
+            || r.blocked.contains(p)
+            || r.redacted.contains(p)
+            || r.protected.contains(p)
+            || r.obstructed.iter().any(|(o, _)| p.starts_with(o))
+            || r.nested.iter().any(|(o, _)| p.starts_with(o))
+            || r.failed.iter().any(|(o, _)| p.starts_with(o))
+    };
+    let mut carried: Vec<(VPath, veil_core::TreeEntry)> = Vec::new();
+    for c in changes.iter().filter(|c| !embargoed && wanted(&c.path) && !not_written(&c.path)) {
+        if let Some(e) = c.new.as_ref().filter(|e| e.kind.is_file_like()) {
+            if restored_as_recorded(&ctx.repo, e)? {
+                carried.push((c.path.clone(), with_fallback_of(e, c.old.as_ref())));
+            }
+        }
+    }
     let mut n = done.len().saturating_sub(skipped);
     // A quarantined edit is not in the working-copy tree (it keeps the
     // previous version), so the diff above cannot see it: restore it too.
@@ -955,9 +1004,14 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()
             skipped_special(&p);
             continue;
         }
+        let mut carry = None;
         let res = match veil_core::tree::lookup(ctx.repo.store(), &src_tree, &p)? {
             Some(e) if e.kind.is_file_like() => {
                 let data = read_file(&ctx.repo, &p, &e)?;
+                if !embargoed && restored_as_recorded(&ctx.repo, &e)? {
+                    let was = veil_core::tree::lookup(ctx.repo.store(), &wc_tree, &p)?;
+                    carry = Some((p.clone(), with_fallback_of(&e, was.as_ref())));
+                }
                 let exec = match e.kind {
                     veil_core::EntryKind::Conflict => {
                         veil_core::conflict::materialize_entry(ctx.repo.store(), &e, veil_core::conflict::Audience::Reader)?.executable
@@ -969,7 +1023,10 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()
             _ => ctx.fs.remove_file(&p),
         };
         match res {
-            Ok(()) => n += 1,
+            Ok(()) => {
+                n += 1;
+                carried.extend(carry);
+            }
             Err(veil_core::VeilError::Io { source, .. }) => ctx::print_failed(&[(p.clone(), source.to_string())]),
             Err(e) => return Err(e.into()),
         }
@@ -981,13 +1038,45 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()
     // A `.veilpolicy` put back from REV arrived from REV, not from the
     // member's hand: it goes through the accepted policy like a pulled one.
     // (`done` holds every path restore wrote or removed, or skipped.)
-    if done.contains(&policy_path) {
-        ctx.snapshot_as_incoming_policy(description)?;
-    } else {
-        ctx.snapshot_as(description)?;
-    }
+    ctx.snapshot_restored(description, done.contains(&policy_path), &carried)?;
     println!("Restored {n} path(s) from {shown}");
     Ok(())
+}
+
+/// Sealed version `e` put back over `was`: what readers without its key
+/// see stays what they saw at that path (`was`'s public version, as the
+/// builder carries it for a sealed edit), not the fallback `e` had where
+/// it came from. A conflict is put back as it is.
+fn with_fallback_of(e: &veil_core::TreeEntry, was: Option<&veil_core::TreeEntry>) -> veil_core::TreeEntry {
+    if e.kind != veil_core::EntryKind::File {
+        return e.clone();
+    }
+    let fallback = match was.filter(|w| w.kind == veil_core::EntryKind::File) {
+        Some(w) if w.visibility.is_public() && w.fallback.is_none() => Some(w.id),
+        Some(w) if w.visibility == e.visibility => w.fallback,
+        _ => None,
+    };
+    veil_core::TreeEntry { fallback, ..e.clone() }
+}
+
+/// Is version `e`, put back by `vl restore`, recorded as it is (rather
+/// than judged as an edit of the working copy's file)? A conflict always
+/// is (it is put back as the same conflict); a file whose content is
+/// sealed (cloaked, or under an embargo) is, so that it keeps its
+/// audience. A plaintext file is an ordinary edit: the policy and the
+/// working copy's line decide its sealing, and it may only end up
+/// narrower. Labels are claims: a file labelled sealed whose object is
+/// plaintext is plaintext (`verify_sealing`).
+fn restored_as_recorded(repo: &veil_core::repo::Repo, e: &veil_core::TreeEntry) -> Result<bool> {
+    use veil_core::builder::{verify_sealing, Sealing};
+    Ok(match e.kind {
+        veil_core::EntryKind::Conflict => true,
+        veil_core::EntryKind::File => match verify_sealing(repo.store(), e)? {
+            Sealing::Relabelled(actual) => !actual.is_public(),
+            _ => !e.visibility.is_public(),
+        },
+        veil_core::EntryKind::Dir => false,
+    })
 }
 
 fn skipped_special(p: &VPath) {

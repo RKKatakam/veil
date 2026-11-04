@@ -37,7 +37,6 @@ fn forged(env: &Env) -> std::path::PathBuf {
 /// run says the file is withheld, `vl ls` says it is cloaked, and the push
 /// publishes it. The dry run exists to be read before a push.
 #[test]
-#[ignore = "BUG-482: push --dry-run and vl ls trust a forged cloaked label the push ignores"]
 fn the_dry_run_never_calls_withheld_what_the_push_publishes() {
     let env = Env::new();
     let proj = forged(&env);

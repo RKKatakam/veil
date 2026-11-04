@@ -84,12 +84,59 @@ fn plan_then_push(local: &mut Repo, remote_fs: &Arc<MemoryBackend>, public: bool
     assert_eq!(planned_skipped, skipped);
     let snaps: BTreeSet<ObjectId> = plan.snapshots.iter().copied().collect();
     assert!(snaps.is_subset(&planned), "every planned snapshot is sent");
+    if public {
+        never_withheld_but_sent(local, &plan, &planned);
+    }
 
     // Nothing changed since: a second plan sends nothing.
     let again = plan_push(local, remote_fs.clone(), public, tags, force).unwrap();
     assert!(again.objects.is_empty(), "{again:#?}");
     assert!(again.tags.iter().all(|t| t.action != TagAction::Create && t.action != TagAction::Update));
     plan
+}
+
+/// The plan never calls a file withheld (and not published) while the
+/// push sends a plaintext object at that path: labels are claims, and the
+/// push sends an object by what it is (BUG-482).
+fn never_withheld_but_sent(local: &Repo, plan: &PushPlan, sent: &BTreeSet<ObjectId>) {
+    let files = plan.files.as_ref().expect("a public plan lists files");
+    let published: BTreeSet<String> = files.published.iter().map(|f| f.path.to_string()).collect();
+    for w in &files.withheld {
+        let path = w.path.to_string();
+        if published.contains(&path) {
+            continue;
+        }
+        for s in &plan.snapshots {
+            let tree = local.snapshot(s).unwrap().tree;
+            let Ok(Some(e)) = veil_core::tree::lookup(local.store(), &tree, &w.path) else { continue };
+            if e.kind != veil_core::EntryKind::File || !sent.contains(&e.id) {
+                continue;
+            }
+            let raw = local.store().get_raw(&e.id).unwrap();
+            assert!(
+                veil_core::builder::object_visibility(&raw) != Some(veil_core::Visibility::Public),
+                "the plan calls {path} withheld, but the push sends its plaintext ({:?} label): {plan:#?}",
+                e.visibility
+            );
+        }
+    }
+}
+
+/// Commit, on top of `parent`, a tree with `forged-f{i}` whose label lies:
+/// `cloaked:team` over a plaintext blob, or `public` over an object sealed
+/// for `team` (a writer of a remote, or an import, can record either).
+fn forge(repo: &Repo, parent: ObjectId, i: u8, cloaked_label: bool) -> ObjectId {
+    use veil_core::{object::Visibility, TreeEntry};
+    let data = format!("forged {i} {cloaked_label}\n");
+    let team = Visibility::Cloaked { scope: "team".into() };
+    let (id, visibility) = match cloaked_label {
+        true => (blob(repo, data.as_bytes()), team),
+        false => (repo.store().store_file(data.as_bytes(), &team).unwrap(), Visibility::Public),
+    };
+    let e = TreeEntry { size: data.len() as u64, visibility, ..file(&format!("forged-f{i}"), id) };
+    let tree = repo.snapshot(&parent).unwrap().tree;
+    let tree = veil_core::conflict::set_entry(repo.store(), &tree, &p(&format!("forged-f{i}")), Some(e)).unwrap();
+    raw_snapshot(repo, vec![parent], tree, "forged")
 }
 
 const POLICY: &str = "secrets/ cloak team\n";
@@ -285,6 +332,10 @@ enum Op {
     Embargo(u8, u8),
     /// Release every embargo.
     Release,
+    /// Commit a forged label (index; a `cloaked` label over plaintext, or
+    /// a `public` one over a sealed object) on top of the last commit, and
+    /// point tag (index) at it.
+    Forged(u8, bool, u8),
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -298,6 +349,7 @@ fn op() -> impl Strategy<Value = Op> {
             .prop_map(|(public, tag, force)| Op::Push { public, tag, force }),
         1 => (0..3u8, any::<u8>()).prop_map(|(t, s)| Op::Embargo(t, s)),
         1 => Just(Op::Release),
+        1 => (0..2u8, any::<bool>(), 0..3u8).prop_map(|(i, c, t)| Op::Forged(i, c, t)),
     ]
 }
 
@@ -360,6 +412,17 @@ proptest! {
                         alice.set_tag(&name, r.snapshot, cl, true).unwrap();
                     }
                 }
+                Op::Forged(i, cloaked_label, t) => {
+                    let Some(base) = commits.last().copied() else { continue };
+                    if alice.store().tree_object(&alice.snapshot(&base).unwrap().tree).is_ok_and(|t| veil_core::embargo::wrapper_parts(&t).is_some()) {
+                        continue;
+                    }
+                    let f = forge(&alice, base, i, cloaked_label);
+                    commits.push(f);
+                    let name = format!("t{t}");
+                    let cl = alice.view().tags.get(&name).and_then(|x| x.cloak.clone());
+                    alice.set_tag(&name, f, cl, true).unwrap();
+                }
                 Op::Release => {
                     for rec in alice.keys().embargoes().unwrap() {
                         if !alice.keys().embargo_released(&rec.id) {
@@ -380,4 +443,22 @@ proptest! {
         plan_then_push(&mut alice, &team, false, &[], true);
         plan_then_push(&mut alice, &mirror, true, &[], true);
     }
+}
+
+/// BUG-482: a `cloaked:team` label over a plaintext blob is published by
+/// the push, and the plan says so; a `public` label over a sealed object
+/// is withheld by the push, and is never sent.
+#[test]
+fn forged_labels_are_planned_as_the_push_treats_them() {
+    let (mut alice, fs, _) = new_repo("alice");
+    let c = commit_files(&mut alice, &*fs, &[("src/a.rs", "fn a() {}\n")], "one");
+    let f = forge(&alice, c, 0, true);
+    let g = forge(&alice, f, 1, false);
+    alice.set_tag("main", g, None, false).unwrap();
+    let mirror = Arc::new(MemoryBackend::new());
+    let m = plan_then_push(&mut alice, &mirror, true, &[], false);
+    assert!(published(&m).contains_key("forged-f0"), "{m:#?}");
+    assert!(!withheld(&m).contains_key("forged-f0"), "{m:#?}");
+    assert!(!backend_contains(&*mirror, b"forged 0 true").is_empty(), "setup: the plaintext is sent");
+    assert!(backend_contains(&*mirror, b"forged 1 false").is_empty());
 }

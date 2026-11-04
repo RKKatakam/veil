@@ -352,7 +352,23 @@ fn conflict_view(repo: &Repo, e: &TreeEntry) -> Option<(Visibility, u64, bool, b
 /// The visibility a reader should be told for `e`: a conflict's is that of
 /// its materialised file.
 fn shown_visibility(repo: &Repo, e: &TreeEntry) -> Visibility {
-    conflict_view(repo, e).map_or_else(|| e.visibility.clone(), |v| v.0)
+    conflict_view(repo, e).map_or_else(|| verified_visibility(repo, e), |v| v.0)
+}
+
+/// The visibility of file entry `e` as its object proves it: labels are
+/// claims (BUG-103), and a push sends an object by what it is, so a sealed
+/// label whose object is plaintext is public (BUG-482), as the builder and
+/// `vl push` take it (`builder::verify_sealing`). A public label is taken
+/// as it is (a push withholds a sealed object whatever it is called, so
+/// believing it can only overstate what is public).
+pub fn verified_visibility(repo: &Repo, e: &TreeEntry) -> Visibility {
+    match &e.visibility {
+        Visibility::Public => Visibility::Public,
+        claimed => match veil_core::builder::verify_sealing(repo.store(), e) {
+            Ok(veil_core::builder::Sealing::Relabelled(actual)) => actual,
+            _ => claimed.clone(),
+        },
+    }
 }
 
 /// One changed path, as `vl status` and `vl diff --stat` list it.
@@ -404,7 +420,7 @@ pub fn entry_tier(repo: &Repo, e: &TreeEntry) -> &'static str {
             Visibility::Embargoed { .. } => "embargoed",
         };
     }
-    match &e.visibility {
+    match &verified_visibility(repo, e) {
         Visibility::Public => "public",
         Visibility::Embargoed { embargo } if repo.keys().embargo_released(embargo) => "public",
         _ if !id_readable(repo, &e.id) => "redacted",
@@ -894,7 +910,7 @@ fn entry_info(repo: &Repo, e: &TreeEntry, check_readable: bool) -> EntryInfo {
         };
     }
     EntryInfo {
-        visibility: Vis::from(&e.visibility),
+        visibility: Vis::from(&verified_visibility(repo, e)),
         executable: e.executable,
         mode: if e.executable { "100755" } else { "100644" },
         readable: !check_readable || repo.store().entry_readable(e),
@@ -1525,7 +1541,7 @@ pub fn ls(ctx: &Ctx, rev: &str, paths: &[String], all: bool, local_files: bool) 
         }
         let (vis, size, executable) = match &view {
             Some((v, size, exec, _)) => (v.clone(), *size, *exec),
-            None => (e.visibility.clone(), e.size, e.executable),
+            None => (verified_visibility(repo, &e), e.size, e.executable),
         };
         let (scope, embargo) = vis_parts(&vis);
         entries.push((

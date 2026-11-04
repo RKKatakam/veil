@@ -455,7 +455,9 @@ pub fn print_files(repo: &Repo, tree: &ObjectId) -> Result<()> {
             break;
         }
         let readable = repo.store().entry_readable(&e);
-        let vis = match &e.visibility {
+        // What the object proves, not the label alone (BUG-482).
+        let shown = crate::api::verified_visibility(repo, &e);
+        let vis = match &shown {
             Visibility::Public => "public".to_string(),
             v => safe(&v.label()).into_owned(),
         };
@@ -468,7 +470,7 @@ pub fn print_files(repo: &Repo, tree: &ObjectId) -> Result<()> {
         } else {
             String::new()
         };
-        let vis = match e.visibility {
+        let vis = match shown {
             Visibility::Public => dim(&format!("{vis:<18}")),
             Visibility::Cloaked { .. } => magenta(&format!("{vis:<18}")),
             Visibility::Embargoed { .. } => yellow(&format!("{vis:<18}")),

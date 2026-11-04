@@ -379,8 +379,22 @@ enum Seen {
 /// Whether a public reader can read embargo `e`'s content.
 type Released<'a> = &'a dyn Fn(&str) -> bool;
 
-fn seen_as_public(released: Released, e: &crate::object::TreeEntry) -> (Option<Seen>, Option<Seen>) {
-    match &e.visibility {
+/// Labels are claims (BUG-482): the push sends an object by what it is
+/// (`remote.rs`, a plaintext blob goes to a public remote whatever its
+/// label says), so a sealed label is checked against its object
+/// ([`crate::builder::verify_sealing`]) before it is believed. A public
+/// label is taken as it is: if its object is in fact sealed, the push
+/// withholds it and the plan only overstates what is published, never
+/// the reverse.
+fn seen_as_public(store: &ObjectStore, released: Released, e: &crate::object::TreeEntry) -> (Option<Seen>, Option<Seen>) {
+    let vis = match &e.visibility {
+        Visibility::Public => Visibility::Public,
+        claimed => match crate::builder::verify_sealing(store, e) {
+            Ok(crate::builder::Sealing::Relabelled(actual)) => actual,
+            _ => claimed.clone(),
+        },
+    };
+    match &vis {
         Visibility::Public => (Some(Seen::Public { id: e.id, size: Some(e.size), released: None }), None),
         Visibility::Embargoed { embargo } if released(embargo) => {
             (Some(Seen::Public { id: e.id, size: Some(e.size), released: Some(embargo.clone()) }), None)
@@ -492,7 +506,7 @@ fn public_files(
     let mut known_list: Vec<ObjectId> = known.iter().copied().collect();
     known_list.sort();
     walk_public(local, remote_released, &known_list, &mut base_pairs, &HashSet::new(), |p, e| {
-        let (shown, held) = seen_as_public(remote_released, e);
+        let (shown, held) = seen_as_public(local.store(), remote_released, e);
         if shown.is_some() {
             base_public.insert(p.clone());
         }
@@ -520,7 +534,7 @@ fn public_files(
         }
     }
     walk_public(local, &local_released, &walk, &mut pairs, &base_pairs, |p, e| {
-        let (shown, held) = seen_as_public(&local_released, e);
+        let (shown, held) = seen_as_public(local.store(), &local_released, e);
         if let Some(Seen::Public { id, size, released }) = shown {
             // Walked newest first: the first version met is the latest.
             if sent.contains(&id) || !base_public.contains(p) {

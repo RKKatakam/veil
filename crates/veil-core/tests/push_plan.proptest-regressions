@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 03c4c64680b4a2f49b609429d6ed54ebdd019aba946a8b34ce40bd7e0f66c7b6 # shrinks to ops = [Commit(0, false), Embargo(0, 0), Push { public: false, tag: None, force: false }, Release, Commit(0, false), Embargo(0, 0)]
+cc 4732d6346b44a911954cce87dfaff5d5f279d1a83b899e110de324f6e1d22770 # shrinks to ops = [Commit(0, false), Forged(0, false, 0)]
+cc 874c01b8ea99bfd2b28a32d5babe6344ea20a2afbf3ff0590cbbd2add8a0b9e5 # shrinks to ops = [Commit(0, false), Forged(0, true, 0)]

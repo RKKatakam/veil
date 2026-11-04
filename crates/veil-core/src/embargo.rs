@@ -73,7 +73,7 @@ use crate::{
     builder::{relabel_note, trusted_cloak, verify_sealing, Sealing},
     error::{Result, VeilError},
     id::ObjectId,
-    object::{EntryKind, Object, Tree, TreeEntry, Visibility},
+    object::{ConflictTerm, EntryKind, Object, Tree, TreeEntry, Visibility},
     policy::{Policy, Tier, POLICY_FILE},
     secrets::{self, Finding},
     store::ObjectStore,
@@ -869,6 +869,56 @@ pub fn seal_introduced(store: &ObjectStore, tree: &ObjectId, base: Option<Object
     seal_introduced_dir(store, tree, base, &VPath::root(), scope)
 }
 
+/// The tree of a change that keeps what it gave a cloaked change: `src`
+/// (the giver's tree), where the receiver's tree went from `pre` (what it
+/// was given) to `post` (as [`seal_introduced`] sealed it). Each path
+/// `post` sealed is sealed in `src` too: unchanged since `pre`, it takes
+/// `post`'s entry (the giver holds what it gave as the receiver does, so
+/// the giver's own change no longer touches it); edited further, the edit
+/// is on top of sealed content and is sealed under `scope` like it, with
+/// the last public version as its fallback (BUG-483). Nothing else changes.
+pub fn seal_moved(store: &ObjectStore, src: ObjectId, pre: ObjectId, post: ObjectId, scope: &str) -> Result<ObjectId> {
+    if pre == post || trusted_cloak(Some(scope)).is_none() {
+        return Ok(src);
+    }
+    let vis = Visibility::Cloaked { scope: scope.to_string() };
+    let mut tree = src;
+    for c in crate::tree::diff_trees(store, Some(&pre), Some(&post))? {
+        let (Some(was), Some(now)) = (&c.old, &c.new) else { continue };
+        let Some(cur) = crate::tree::lookup(store, &tree, &c.path)? else { continue };
+        if cur.kind == EntryKind::Dir || now.kind == EntryKind::Dir {
+            continue;
+        }
+        let replaced = if cur.same_content(was) {
+            Some(now.clone())
+        } else {
+            match cur.kind {
+                EntryKind::File if cur.visibility.is_public() && c.path.as_str() != POLICY_FILE && now.visibility == vis => {
+                    match verified_entry(store, &cur)? {
+                        Some(real) => Some(real),
+                        None => match store.read_entry(&cur) {
+                            Ok(data) => Some(TreeEntry {
+                                id: store.store_file(&data, &vis)?,
+                                visibility: vis.clone(),
+                                fallback: public_fallback(Some(now), &vis),
+                                ..cur.clone()
+                            }),
+                            Err(err) if err.is_unreadable() || err.is_not_found() => None,
+                            Err(err) => return Err(err),
+                        },
+                    }
+                }
+                EntryKind::Conflict => seal_conflict_terms(store, &cur, Some(now), &vis)?,
+                _ => None,
+            }
+        };
+        if let Some(e) = replaced.filter(|e| *e != cur) {
+            tree = crate::conflict::set_entry(store, &tree, &c.path, Some(e))?;
+        }
+    }
+    Ok(tree)
+}
+
 struct IntroFrame {
     id: ObjectId,
     t: Arc<Tree>,
@@ -948,14 +998,90 @@ fn seal_introduced_dir(store: &ObjectStore, tree: &ObjectId, base: Option<Object
                         }
                     }
                 }
-                // Its versions keep their sealing: none is public content
-                // this line introduces (that would be sealed when written).
-                EntryKind::File | EntryKind::Conflict => {}
+                // A conflict brought into the line: every public version of
+                // it that readers without the key could not already see at
+                // this path is content the line introduces, and is sealed
+                // like a file (BUG-480). The conflict's shape is kept.
+                EntryKind::Conflict => {
+                    if let Some(sealed) = seal_conflict_terms(store, &e, be.as_ref(), &vis)? {
+                        ne = sealed;
+                    }
+                }
+                // Sealed content keeps its sealing.
+                EntryKind::File => {}
             }
         }
         f.changed |= ne != e;
         f.out.insert(ne);
     }
+}
+
+/// The public versions readers without a key already see in `e` (a file,
+/// or each version of a conflict): plaintext content and the last public
+/// version a sealed file carries.
+fn publicly_seen(store: &ObjectStore, e: Option<&TreeEntry>) -> Result<BTreeSet<ObjectId>> {
+    let mut out = BTreeSet::new();
+    let Some(e) = e else { return Ok(out) };
+    let mut terms = Vec::new();
+    match e.kind {
+        EntryKind::File => terms.push(ConflictTerm::of(e)),
+        EntryKind::Conflict => match store.conflict(&e.id) {
+            Ok(c) => terms.extend(c.interleaved().flatten().cloned()),
+            Err(err) if err.is_unreadable() || err.is_not_found() || matches!(err, VeilError::Corrupt(..)) => {}
+            Err(err) => return Err(err),
+        },
+        EntryKind::Dir => {}
+    }
+    for t in terms {
+        if t.visibility.is_public() && verify_sealing(store, &t.entry(""))? == Sealing::Verified {
+            out.insert(t.id);
+        }
+        out.extend(t.fallback);
+    }
+    Ok(out)
+}
+
+/// Conflict entry `e` with every public version that `base` (the entry at
+/// the same path in the line's base) does not already show readers
+/// without the key sealed as `vis`; a version whose public label is
+/// forged gets its real label. `None`: nothing to change. The conflict
+/// keeps its shape (the same sides, in the same places).
+pub(crate) fn seal_conflict_terms(store: &ObjectStore, e: &TreeEntry, base: Option<&TreeEntry>, vis: &Visibility) -> Result<Option<TreeEntry>> {
+    let mut c = match store.conflict(&e.id) {
+        Ok(c) => c,
+        // Not a conflict this reader can open: kept as it is (nothing of it
+        // can be read to seal, and nothing of it is plaintext here).
+        Err(err) if err.is_unreadable() || err.is_not_found() || matches!(err, VeilError::Corrupt(..)) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let seen = publicly_seen(store, base)?;
+    let mut changed = false;
+    for t in c.adds.iter_mut().chain(c.removes.iter_mut()).flatten() {
+        if !t.visibility.is_public() {
+            continue;
+        }
+        match verify_sealing(store, &t.entry(""))? {
+            Sealing::Relabelled(actual) => {
+                t.visibility = actual;
+                changed = true;
+            }
+            Sealing::Verified if !seen.contains(&t.id) => {
+                let data = store.read_blob(&t.id)?;
+                t.id = store.store_file(&data, vis)?;
+                t.visibility = vis.clone();
+                t.fallback = None;
+                changed = true;
+            }
+            _ => {}
+        }
+    }
+    if !changed {
+        return Ok(None);
+    }
+    Ok(Some(TreeEntry {
+        id: store.put_conflict(&c)?,
+        ..e.clone()
+    }))
 }
 
 /// `e` with the visibility of its object, if its label disagrees with it
