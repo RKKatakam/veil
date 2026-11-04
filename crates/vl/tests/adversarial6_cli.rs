@@ -702,3 +702,30 @@ fn scp_style_tilde_paths_resolve_to_the_home_directory() {
         adversarial_support::tree_listing(&home).into_iter().take(4).collect::<Vec<_>>()
     );
 }
+
+/// The hostile-server side of BUG-119 (see
+/// `adversarial6_lock::a_symlinked_lock_file_does_not_spin_for_ever`): a
+/// remote whose `.veil/lock` is a dangling symlink wedges `vl push` for
+/// ever at full CPU. Skipped without an `sftp-server` binary.
+#[test]
+#[ignore = "BUG-119: a symlinked .veil/lock (local or on an SFTP remote) makes every command spin at full CPU for ever"]
+fn a_push_to_a_remote_with_a_symlinked_lock_fails_instead_of_spinning() {
+    let env = Env::new();
+    let home = env.dir("serverhome");
+    let Some(ssh) = fake_ssh(&env, &home) else { return };
+    let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
+    env.ok(U, &proj, &["remote", "add", "origin", "fakehost:repo"]);
+    let mut c = env.cmd(U, &proj, &["push", "origin"]);
+    c.env("VEIL_SSH", &ssh);
+    assert!(c.output().unwrap().status.success());
+    std::os::unix::fs::symlink("/nonexistent", home.join("repo/.veil/lock")).unwrap();
+    write(&proj, "b.txt", "b\n");
+    let mut c = env.cmd(U, &proj, &["push", "origin"]);
+    c.env("VEIL_SSH", &ssh).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    let finished = adversarial_support::wait_for(Duration::from_secs(120), || child.try_wait().unwrap().is_some());
+    if !finished {
+        let _ = child.kill();
+    }
+    assert!(finished, "`vl push` was still running after 120 s against a remote whose lock is a symlink");
+}
