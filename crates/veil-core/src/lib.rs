@@ -10,9 +10,12 @@
 //! | Policy | [`policy`], [`secrets`] | per-path visibility tiers, engine-level secret detection |
 //! | Trees | [`tree`], [`builder`], [`checkout`], [`merge`], [`conflict`], [`statcache`] | tree views, snapshotting, materialisation, 3-way merge, first-class conflicts, stat cache |
 //! | Graph | [`oplog`], [`repo`], [`transaction`], [`revset`] | snapshot DAG, change ids, operation log, undo |
-//! | Features | [`workspace`], [`commands`], [`embargo`], [`remote`], [`vault`], [`upgrade`] | workspaces, cloaking, embargoes, sync, secrets vault, format migrations |
+//! | Features | [`workspace`], [`sandbox`], [`commands`], [`embargo`], [`remote`], [`vault`], [`upgrade`] | workspaces, `ws exec` sandboxes, cloaking, embargoes, sync, secrets vault, format migrations |
 //!
-//! Nothing in the engine touches `std::fs` directly except `vfs::DiskBackend`:
+//! Nothing in the engine touches `std::fs` directly except the [`vfs`] layer
+//! (`vfs::DiskBackend`, and the host primitives of `vfs::SandboxFs`) and
+//! `sandbox`'s directory housekeeping, all of them only with the `os`
+//! feature:
 //! every repository, working copy and remote is just a `StorageBackend`, so the
 //! whole engine runs unchanged in memory, over overlays, or inside a sandbox.
 //!
@@ -74,6 +77,8 @@ pub mod push_plan;
 pub mod remote;
 pub mod repo;
 pub mod revset;
+#[cfg(feature = "os")]
+pub mod sandbox;
 pub mod secrets;
 pub mod selection;
 pub mod statcache;

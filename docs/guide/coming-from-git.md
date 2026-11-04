@@ -59,7 +59,7 @@ be undone. Add to that per-file encryption and engine-level secret handling.
 | `git rebase -i` (drop) | `vl abandon REV` |
 | `git rebase -i` (reword) | `vl describe -r REV -m MSG` |
 | `git stash` / `git stash pop` | `vl new @-` / `vl edit <change>` |
-| `git worktree add` | `vl ws new NAME` + `vl ws switch NAME` or `vl ws exec NAME -- CMD` |
+| `git worktree add` | `vl ws new NAME` + `vl ws switch NAME` or `vl ws exec NAME -- CMD` (each workspace keeps its own sandbox directory, synced incrementally) |
 | `git reflog`, `git reset HEAD@{1}` | `vl op log`, `vl undo`, `vl op restore ID` |
 | `git remote add NAME URL` | `vl remote add NAME URL` (Veil) / `vl git remote add NAME URL` (Git) |
 | `git fetch` | `vl pull` / `vl git fetch` |

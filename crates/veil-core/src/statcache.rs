@@ -82,6 +82,18 @@ impl Stamp {
         })
     }
 
+    /// The earliest clock reading at which a record of a file stat'ing
+    /// as this, verified then, is trusted (see the racy-mtime rule in the
+    /// module documentation).
+    pub fn trusted_from(&self, exact: bool) -> i64 {
+        let window = match (exact, self.whole_seconds()) {
+            (true, _) => 0,
+            (false, true) => COARSE_WINDOW_NS,
+            (false, false) => FINE_WINDOW_NS,
+        };
+        self.latest().saturating_add(window)
+    }
+
     fn latest(&self) -> i64 {
         self.ctime.map_or(self.mtime, |c| c.max(self.mtime))
     }
@@ -262,6 +274,32 @@ impl StatCache {
             self.records.retain(|p, _| !p.as_str().starts_with(&prefix));
         }
         self.dirty |= self.records.len() != before;
+    }
+
+    /// Every record, in no particular order.
+    pub fn records(&self) -> impl Iterator<Item = (&VPath, &Record)> {
+        self.records.iter()
+    }
+
+    /// Vouch for files whose content the caller knows without reading them
+    /// (a sandbox's checkout just wrote them, and nothing else can have
+    /// written them since). Each record must be one the racy-mtime rule
+    /// trusts at once: its `verified_at` a clock reading taken after
+    /// [`Stamp::trusted_from`] and before the file was stat'ed as `stamp`.
+    /// Records kept under another key are dropped first, as at the start
+    /// of a build.
+    pub fn vouch(&mut self, key: CacheKey, records: impl IntoIterator<Item = (VPath, Record)>) {
+        if self.key.as_ref() != Some(&key) {
+            self.records.clear();
+            self.key = Some(key);
+        }
+        let exact = self.key.as_ref().is_some_and(|k| k.exact);
+        for (path, rec) in records {
+            if rec.vouches_for(&rec.stamp, exact) {
+                self.records.insert(path, rec);
+            }
+        }
+        self.dirty = true;
     }
 
     pub fn clear(&mut self) {

@@ -1308,16 +1308,72 @@ A workspace is only a named pointer in the view. It owns no directory.
   through overlays (`vl ws write`), materialised into a throwaway directory
   for one command (`vl ws exec`), or attached to the project directory
   (`vl ws switch`). Two tasks can never fight over a directory.
-* **The `ws exec` sandbox** holds plaintext (cloaked files and, with
-  `--with-isolated`, vault secrets), so it is private and never outlives
-  `vl`. It is created `0700` under `$TMPDIR` and everything in it is
-  restricted to the user before the command runs. A reaper process (the `vl`
-  binary re-executed, in its own process group) waits on a pipe that only
-  `vl` holds. When `vl` exits for any reason, `kill -9` included, the pipe
-  closes and the reaper removes the directory. As a last resort, each
-  `ws exec` sweeps the same user's sandboxes whose owning process (the pid
-  is in the name) no longer exists (Linux). The command's stdout is its own:
-  `vl` reports on stderr.
+* **`ws exec` sandboxes** (`veil_core::sandbox`, `vfs::SandboxFs`, the
+  CLI's `sandbox.rs`). Each virtual workspace has one persistent sandbox,
+  `.veil/local/sandboxes/<ws>/` (`0700`; `.` and `..` are spelt `%2e`,
+  `%2e%2e`): `files/` (the command's working directory), `manifest.json`,
+  `statcache` and `lock`. The **manifest** says which tree the files are
+  (`tree`: synced to, then recorded as), the materialisation record
+  (`Materialised`, as for the project directory), the boot they were
+  written in, a `running` marker, the quarantined files the last run left,
+  and `only` (reserved for sparse sandboxes: `None` is the whole tree). The
+  per-file half of the manifest is the sandbox's own stat cache: blob id
+  and stamp (size, mtime, ctime, inode, executable bit) of every file.
+  A run:
+  1. takes the sandbox's `flock` (a second run in the workspace waits) and
+     reloads the view;
+  2. decides whether the sandbox can be trusted (`rebuild_reason`): no
+     manifest, an unreadable or other-version one, another workspace's, a
+     `running` marker left by a run that died, another boot (sandbox files
+     are never fsynced, so after a power loss they may be torn), a subset,
+     a tree gc removed, `files/` missing or replaced (a symlink). Any of
+     these: wipe and rebuild. When in doubt, rebuild;
+  3. writes `running` and the boot durably, and starts the reaper;
+  4. **syncs**: `checkout_recorded` from the manifest's tree to the
+     workspace's, with the sandbox's stat cache, so only the diff is
+     touched and every checkout rule holds (files that hold something else
+     are kept and reported, nothing is written through a symlink). Writes
+     go through `SandboxFs`: atomic but unsynced, and, where the project
+     directory's stat cache vouches that one of its files holds the
+     object, a copy-on-write clone of it (`StorageBackend::clone_known`:
+     `FICLONE` on Linux, `fclonefileat` on macOS; the source is fstat'ed
+     before and after the clone, and the first `EOPNOTSUPP`/`EXDEV`
+     switches cloning off for the run);
+  5. **vouches** for the public files it just wrote (`vouch_written`):
+     their content ids are known, so if waiting out the stat cache's racy
+     window costs less than re-reading them it waits, re-stats them, and
+     records those whose stamp did not move. Cloaked and embargoed files
+     are left to the builder, which verifies their sealing (BUG-103);
+  6. injects `--with-isolated` files (never through a symlink or over a
+     directory, remembering what each replaced), runs the command with
+     `GIT_CEILING_DIRECTORIES` set to the sandbox (and `find_root` never
+     resolves a repository from inside `.veil/`), with SIGINT/SIGQUIT
+     ignored by `vl` so Ctrl-C reaches the command only;
+  7. records with `expected_wc` = the snapshot it synced to. If the
+     workspace moved meanwhile, the result is saved as a child of that
+     snapshot instead of reverting the move;
+  8. takes injected files out again (`remove_injected`): each injected
+     path, and each file quarantined by the injected-secret guard, gets
+     what the snapshot recorded there if that is new, else what was there
+     before the injection, else the recorded version, else nothing. A
+     failure here wipes the sandbox;
+  9. writes the manifest without `running`, saves the stat cache, tells the
+     reaper it finished (`K` on the pipe) and releases the lock.
+  Any error between 3 and 9 wipes the sandbox in-process. If `vl` dies,
+  the reaper (the `vl` binary re-executed, in its own process group,
+  waiting on a pipe only `vl` holds) takes the lock and wipes the sandbox
+  if the manifest still names the dead run; if the reaper dies too, the
+  next run finds the marker and rebuilds. `vl ws rm` takes the lock
+  (refusing while a run holds it), refuses without `--force` if the
+  manifest lists quarantined files, then removes the whole directory.
+  `vl doctor` lists sandboxes, flags interrupted runs and sandboxes of
+  removed workspaces.
+
+  `--ephemeral` runs use a throwaway directory instead, created `0700`
+  under `$TMPDIR` and restricted to the user before the command runs, and
+  removed when `vl` exits (by `vl`, by the reaper, or by the next `ws exec`
+  sweeping sandboxes whose owning process, the pid in the name, is gone).
+  The command's stdout is its own: `vl` reports on stderr.
 * **Ephemeral workspaces** (`Repo::ephemeral_workspace`) are an
   `OverlayBackend` over a `TreeView`. Creating one is O(1) and committing one
   is O(changes). They never touch disk and are dropped afterwards. This is

@@ -5,8 +5,27 @@
 
 use crate::*;
 
+/// Everything under `.veil` except the `vl ws exec` sandboxes, which are
+/// working copies (like the project directory, they hold the plaintext of
+/// cloaked files for the member who runs the command).
 fn objects(r: &R) -> Vec<u8> {
-    all_bytes(&r.path(".veil"))
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(r.path(".veil")).unwrap().flatten() {
+        if e.file_name() == "local" {
+            for l in std::fs::read_dir(e.path()).unwrap().flatten() {
+                if l.path().is_file() {
+                    out.extend(std::fs::read(l.path()).unwrap_or_default());
+                } else if l.file_name() != "sandboxes" {
+                    out.extend(all_bytes(&l.path()));
+                }
+            }
+        } else if e.path().is_file() {
+            out.extend(std::fs::read(e.path()).unwrap_or_default());
+        } else {
+            out.extend(all_bytes(&e.path()));
+        }
+    }
+    out
 }
 
 const DB_PASSWORD: &str = "Xk29vLq8sPz";

@@ -111,6 +111,7 @@ pub fn run(repo_arg: Option<&Path>, remotes: bool) -> Result<ExitCode> {
             let repo = check_repo(&mut r, &fs, identity);
             check_lock(&mut r, &*fs);
             check_stat_cache(&mut r, &*fs, repo.as_ref());
+            check_ws_sandboxes(&mut r, &root, repo.as_ref());
             if let Some(repo) = &repo {
                 check_vault(&mut r, repo);
             }
@@ -278,6 +279,22 @@ fn check_sandboxes(r: &mut Report) {
         .collect();
     detail.push("they may hold plaintext of cloaked files or injected secrets; the next `vl ws exec` removes them, or delete them with `rm -rf`".into());
     r.warn(format!("{} leftover `ws exec` sandbox(es)", stale.len()), &detail);
+}
+
+/// The repository's persistent `ws exec` sandboxes.
+fn check_ws_sandboxes(r: &mut Report, root: &Path, repo: Option<&Repo>) {
+    let status = sandbox::persistent_status(root, repo);
+    if status.is_empty() {
+        return;
+    }
+    let (problems, fine): (Vec<_>, Vec<_>) = status.into_iter().partition(|(p, _)| *p);
+    if !fine.is_empty() {
+        r.ok(format!("{} `ws exec` sandbox(es) in .veil/local/sandboxes", fine.len()));
+    }
+    if !problems.is_empty() {
+        let detail: Vec<String> = problems.into_iter().map(|(_, l)| l).collect();
+        r.warn(format!("{} `ws exec` sandbox(es) need attention", detail.len()), &detail);
+    }
 }
 
 // ---- repository -------------------------------------------------------------------

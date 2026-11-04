@@ -10,11 +10,15 @@
 //!   O(1) workspace creation and O(changes) snapshots.
 //! * [`SftpBackend`]    — a repository on another machine, reached through
 //!   the user's `ssh` and its `sftp` subsystem (remotes).
+//! * [`SandboxFs`]      — a `vl ws exec` sandbox directory: unsynced writes,
+//!   copy-on-write clones of the project directory's files.
 
 #[cfg(feature = "os")]
 mod disk;
 mod memory;
 mod overlay;
+#[cfg(feature = "os")]
+mod sandbox;
 #[cfg(feature = "os")]
 mod sftp;
 #[cfg(feature = "os")]
@@ -25,6 +29,8 @@ mod sftp_url;
 pub use disk::{parse_folding, probe_folding, DiskBackend, FOLDING_ENV};
 pub use memory::MemoryBackend;
 pub use overlay::{OverlayBackend, OverlayChanges};
+#[cfg(feature = "os")]
+pub use sandbox::{clone_file, private_dir, reflink_supported, remove_tree, CloneSources, SandboxFs, SandboxLock, WrittenFile};
 #[cfg(feature = "os")]
 pub use sftp::{SftpBackend, SftpOptions, SftpStats};
 pub use sftp_url::SshUrl;
@@ -205,6 +211,17 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
     /// ephemeral workspace only touches what actually changed.
     fn known_id(&self, _path: &VPath) -> Option<ObjectId> {
         None
+    }
+
+    /// Materialise at `path` the file whose content is object `id` (a blob,
+    /// or the sealed object of a cloaked file) without being handed its
+    /// bytes, if this backend knows an identical copy it can clone cheaply:
+    /// a [`SandboxFs`] reflinks the project directory's file. `Ok(false)`
+    /// means nothing was done and the bytes must be written as usual.
+    /// Checkout only asks where it would otherwise write `id`'s content
+    /// over nothing it needs to protect.
+    fn clone_known(&self, _path: &VPath, _id: &ObjectId) -> Result<bool> {
+        Ok(false)
     }
 
     /// Current reading of the clock `Metadata::mtime` stamps come from, or

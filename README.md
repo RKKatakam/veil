@@ -179,7 +179,7 @@ vl push mirror        # same snapshot ids, now readable, and the fix's history f
 
 # Virtual workspaces: no directories, no collisions.
 vl ws new agent                                   # exists only in the DAG
-vl ws exec agent -m "lint fixes" -- cargo fmt     # runs in a throwaway sandbox, records the result
+vl ws exec agent -m "lint fixes" -- cargo fmt     # runs in the workspace's sandbox, records the result
 vl ws exec --ephemeral -r main -- ./codegen.sh    # one-shot agent task on main
 vl ws switch agent                                # attach the project dir to another workspace
 
@@ -356,9 +356,11 @@ that the detection is wrong.
   PID namespace on Linux, and a per-boot UUID and the local host name
   (stable across network changes) on macOS. On a network filesystem a lock
   can only be proven stale from the machine that took it.
-* `vl ws exec` sandboxes live in `$TMPDIR`: `/tmp` on Linux, a per-user
-  directory under `/var/folders` on macOS. They are private to you and
-  removed when `vl` exits, even after `kill -9`.
+* A workspace's `vl ws exec` sandbox lives in `.veil/local/sandboxes/`
+  (private to you) and is kept between runs; it is wiped if a run is
+  killed, and removed by `vl ws rm`. `--ephemeral` sandboxes live in
+  `$TMPDIR` (`/tmp` on Linux, a per-user directory under `/var/folders` on
+  macOS) and are removed when `vl` exits, even after `kill -9`.
 
 ### `vl doctor`
 

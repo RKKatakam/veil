@@ -7,11 +7,9 @@ fixed**. Severity: high / medium / low.
 ## Before the Hub (owner-approved order: after all bugs are fixed)
 
 ### Agent workspaces and scale
-- **Persistent `ws exec` sandboxes:** keep one sandbox folder per workspace
-  between runs and update only changed files (as a Git worktree does); wipe
-  it on `vl ws rm`. Today every run re-copies the whole tree.
-- **Copy-on-write file clones** (APFS, btrfs, XFS reflinks) when writing
-  sandboxes and checkouts: near-instant, near-zero extra disk.
+- **Copy-on-write file clones for project-directory checkouts** (`vl ws
+  switch`, `vl edit`): `ws exec` sandboxes clone already
+  (`StorageBackend::clone_known`); the project directory does not.
 - **Sparse sandboxes:** `vl ws exec --only src/ tests/`.
 - **Virtual filesystem working copy** (FUSE/NFS mount of `TreeView` +
   overlay): instant workspaces with real files, edits only use space.
@@ -81,7 +79,6 @@ fixed**. Severity: high / medium / low.
 
 ## Usability
 
-- **A quarantined file written by `ws exec` disappears with the sandbox.**
 - **Non-UTF-8 file names are reported but not recorded.**
 
 ## Recorded limitations (later rounds)
