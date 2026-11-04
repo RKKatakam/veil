@@ -1,0 +1,2 @@
+veil:tree
+{"entries":[{"name":"fix_a.rs","kind":"file","id":"48b737589aaa81f91acee44850b56c737fb3d51386fe8a5f5b51dc415a04918b","size":18,"visibility":{"tier":"embargoed","embargo":"a7cd4009b9"}},{"name":"fix_b.rs","kind":"file","id":"9c2811498d88bd7a9a79f5b91b118ab9e188c1d676c139730f70e6963453a3db","size":18,"visibility":{"tier":"cloaked","scope":"team"}},{"name":"main.rs","kind":"file","id":"69a72a72ad7552f3a298ef0c0a25380269718282e54bb0dff0a71781774894cc","size":34},{"name":"util","kind":"dir","id":"86347599ecc3c596074e335a3efb62f3ac200acfe310ee796752b13ca7f1bd21"}]}
