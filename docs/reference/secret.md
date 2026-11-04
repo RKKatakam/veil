@@ -3,14 +3,14 @@
 
 # `vl secret`
 
-Device-local encrypted secret vault
+Encrypted secrets: the device-local vault, or a scope's team vault (`--scope`), shared with the scope's members through team remotes
 
 Subcommands:
 
 * [`vl secret set`](#vl-secret-set): Store a secret (reads VALUE from stdin if omitted)
-* [`vl secret get`](#vl-secret-get): Print a secret
-* [`vl secret list`](#vl-secret-list): List secret names
-* [`vl secret rm`](#vl-secret-rm): Delete a secret
+* [`vl secret get`](#vl-secret-get): Print a secret's value to stdout
+* [`vl secret list`](#vl-secret-list): List secret names (never values)
+* [`vl secret rm`](#vl-secret-rm): Delete a secret (in a team vault: a signed deletion that syncs)
 * [`vl secret files`](#vl-secret-files): List the vault's backups of isolated files (`.env` & co), including those of files gone from the working copy (kept 30 days)
 * [`vl secret recover`](#vl-secret-recover): Write the vault's backup of an isolated file back into the working copy (never over an existing file)
 * [`vl secret import`](#vl-secret-import): Import KEY=VALUE lines from a dotenv file
@@ -28,11 +28,17 @@ Arguments:
 | | |
 |---|---|
 | `<NAME>` | Secret name (the environment variable `vl run` sets) (required) |
-| `<VALUE>` | Secret value (default: read from stdin) |
+| `<VALUE>` | Secret value (default: read from stdin, which keeps it out of your shell history) |
+
+Options:
+
+| | |
+|---|---|
+| `--scope <SCOPE>` | Store it in this scope's team vault (sealed for its members, pushed to team remotes) instead of the local vault |
 
 ## `vl secret get`
 
-Print a secret
+Print a secret's value to stdout
 
 ```text
 vl secret get [OPTIONS] <NAME>
@@ -44,17 +50,30 @@ Arguments:
 |---|---|
 | `<NAME>` | Secret name (required) |
 
+Options:
+
+| | |
+|---|---|
+| `--scope <SCOPE>` | Read it from this scope's team vault |
+
 ## `vl secret list`
 
-List secret names
+List secret names (never values)
 
 ```text
 vl secret list [OPTIONS]
 ```
 
+Options:
+
+| | |
+|---|---|
+| `--scope <SCOPE>` | List this scope's team vault, with who last set each name and when |
+| `--exposed-to <MEMBER>` | Only the names MEMBER (public key, member id or name; current or revoked) could read: the secrets to rotate when they leave |
+
 ## `vl secret rm`
 
-Delete a secret
+Delete a secret (in a team vault: a signed deletion that syncs)
 
 ```text
 vl secret rm [OPTIONS] <NAME>
@@ -65,6 +84,12 @@ Arguments:
 | | |
 |---|---|
 | `<NAME>` | Secret name (required) |
+
+Options:
+
+| | |
+|---|---|
+| `--scope <SCOPE>` | Delete it from this scope's team vault |
 
 ## `vl secret files`
 

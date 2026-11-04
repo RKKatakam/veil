@@ -3,7 +3,9 @@
 
 # `vl run`
 
-Run a command with vault secrets injected as environment variables
+Run a command with vault secrets injected as environment variables.
+
+Loads the team vaults of your scopes first, then the local vault, whose secrets override a team secret of the same name. Variables already in the environment are overridden by both.
 
 ```text
 vl run [OPTIONS] <COMMAND>...
@@ -14,6 +16,13 @@ Arguments:
 | | |
 |---|---|
 | `<COMMAND>…` | Command and arguments (put them after `--`) (required) |
+
+Options:
+
+| | |
+|---|---|
+| `--scope <SCOPE>` | Load only these scopes' team vaults (repeatable). Default: every scope you are a member of. A name set in two loaded scopes is an error unless the local vault overrides it |
+| `--local-only` | Load only the local vault, no team vault |
 
 ---
 

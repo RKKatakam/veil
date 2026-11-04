@@ -7,7 +7,7 @@ below it, and nothing above the VFS layer knows a disk exists.
 ┌──────────────────────────────────────────────────────────────────────┐
 │ vl CLI   (clap grammar, auto-snapshot, checkout pointer, rendering)  │
 ├──────────────────────────────────────────────────────────────────────┤
-│ Features  workspace · commands · embargo · remote · git · vault      │
+│ Features  workspace · commands · embargo · remote · git · vaults     │
 ├──────────────────────────────────────────────────────────────────────┤
 │ Graph     repo · transaction (auto-rebase) · oplog (views) · revset  │
 ├──────────────────────────────────────────────────────────────────────┤
@@ -380,6 +380,64 @@ rotation = { generation, key_id, previous: [{key_id, sealed}], wrapped: {id → 
   holder's engine would otherwise publish the key early. If the local
   record differs from an incoming one in any signed field, the local record
   is kept.
+
+### The team vault (`team_vault.rs`)
+
+`vl secret … --scope S` keeps secrets for the members of a scope, as
+shared metadata that syncs like rings: `.veil/meta/vault/<scope>/<id>.json`,
+one **immutable record per write**.
+
+* **Record.** Compact JSON `{format, scope, sealed, timestamp, signature}`.
+  `sealed` is the entry's name *and* value (`null` for a deletion), plus
+  `since` (below), as JSON padded to a multiple of 128 bytes and sealed
+  with XChaCha20-Poly1305 under a random nonce. The key is the scope's
+  current generation key, and the label `vault:<scope>#<key-id>` is
+  authenticated (CRYPTO.md C12). `signature` is the writer's Ed25519
+  signature (context `vault-entry`) over `{format, scope, sealed,
+  timestamp, signer}`. The file name is BLAKE3 of the file's bytes, which
+  must be the record's canonical encoding. Names are sealed, so `STRIPE_LIVE_KEY`
+  is not visible to a team remote's operator.
+* **What counts.** The vault is a function of (records, verified ring),
+  so replicas with the same records and ring agree, whatever order the
+  records arrived in. A record counts if its signature verifies, its label
+  names a generation of the ring, it opens to a valid entry, and its signer
+  is a **current** member whose registered signing key made the signature.
+  Per name, the counting record with the greatest `(timestamp, signing key,
+  record id)` wins; a winning deletion hides the name. A writer stamps
+  `max(now, winner + 1)` (a Lamport bump), so a write beats everything its
+  writer had pulled, whatever the clocks.
+* **Compaction** deletes a record only when a newer record by the *same
+  signer* for the same name exists. Whatever a later ring says about that
+  signer, the newer record decides both or neither, so compaction never
+  changes the vault and replicas still converge (property-tested in
+  `team_vault_props.rs` against an uncompacted archive). It runs after each
+  write and, for scopes the pusher can open, on the remote after a push.
+* **Revocation** (`Keychain::revoke_with_vault`, used by `vl scope revoke`).
+  The revoked member's records stop counting at once (not "from now on":
+  their timestamps are self-asserted, so a revoked member could backdate a
+  write). Entries whose winning record they wrote are re-signed by the
+  revoking admin under the new generation (deletions too), so they don't
+  vanish or fall back to an older value. The report lists every live entry
+  they could read: `since ≤` the last generation they held. `since` is the
+  generation under which that exact value was first sealed, carried over
+  when the same value is written again (re-signing, re-sealing after a
+  rotation), so re-signing doesn't hide an exposure but a new value does.
+  `vl secret list --scope S --exposed-to M` recomputes it at any time.
+* **Rotation.** New writes use the current generation; existing records keep
+  theirs (members walk the key chain) and are re-sealed on their next write.
+* **Sync** (`sync_meta`, §8): team destinations only, after the rings are
+  merged. A record the receiver lacks is copied if it passes the checks
+  above against the receiver's ring, except that records of *former*
+  members are copied (they would count again after a re-grant) and reported
+  once. Records with a bad signature, an unknown generation, a signer who
+  was never a member, a timestamp more than a day ahead, or (where the
+  local identity can open them) content that does not decrypt, are refused,
+  and `pull` warns. A non-member relays records it cannot read.
+* **Older vl** never looks at `.veil/meta/vault/`: it neither reads nor
+  rewrites records, and it does not relay them (FORMAT.md §2). No format
+  change was needed.
+* **Undo.** Writes are outside the view, like ring changes: `manual_undo`
+  operations whose message says how to reverse them by hand.
 
 ## 4. Visibility policy, and where it is enforced
 
@@ -1362,7 +1420,9 @@ readable by anyone else must not be part of it:
 `remote::push` and `remote::pull` work between any two backends. Filtering
 happens *during the object walk*: a public remote never receives sealed
 objects except those of released embargoes, never receives cloaked tags, and
-nothing is ever transferred under the `local` scope. Isolated content cannot
+nothing is ever transferred under the `local` scope. Metadata follows
+(`sync_meta`): key rings and team-vault records go to team remotes only
+(§3, "The team vault"), and embargo records go everywhere. Isolated content cannot
 be pushed at all, because it was never in the graph. File fallbacks are
 plaintext and travel with their entries: a clone of a public remote checks
 out the last public version of a file edited on a cloaked line (§4 rule 5),
@@ -1642,7 +1702,7 @@ and, once renewed, when it was acquired on the backend's own stamp clock.
   (BUG-119).
 
 **Shared metadata under the lock.** Every read-modify-write of key rings,
-embargo records and the vault holds the repository lock (`Keychain` and
+embargo records, team-vault records and the vault holds the repository lock (`Keychain` and
 `Repo::vault_update` take it reentrantly). Push and pull copy objects and
 merge metadata *inside* their transaction, under the destination's lock.
 Two concurrent `grant`s, or a `grant` racing a `pull`, cannot lose an
@@ -2132,6 +2192,13 @@ repository lock.
   revocation, and with it all history sealed before it (including unchanged
   files that are still sealed under an old generation). They also keep
   anything they already decrypted. Rotate the underlying secrets.
+* *Team-vault metadata* (§3): a team remote's operator sees how many
+  records a scope has, their sizes in 128-byte steps, write times and
+  signers, though no names or values. They can also withhold records, so a
+  fresh clone may see an older value or a deleted secret come back; replicas
+  that already hold the newer record keep it. A current member can write
+  any value, and stamp it up to a day ahead (it still loses to any later
+  write by someone who pulled it).
 * *First contact is trust-on-first-use.* A fresh clone accepts the first
   valid ring it sees. A malicious remote can serve a **fork** created by an
   admin who was revoked later: the fork is valid at its fork point. Also, a

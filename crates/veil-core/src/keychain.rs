@@ -10,6 +10,8 @@
 //! * `embargoes/<id>.json`   — an embargo key wrapped under a scope key, plus
 //!   its release condition, signed by the scope member who created it; on
 //!   release the plaintext key is published.
+//! * `vault/<scope>/<id>.json` — team-vault records (`crate::team_vault`):
+//!   secrets sealed for a scope's members, each signed by its writer.
 //!
 //! Every write of these files, and the read that decides it, runs under the
 //! repository lock (reentrantly, so also inside transactions): two
@@ -889,6 +891,11 @@ impl Keychain {
         self.identity.as_ref()
     }
 
+    /// The backend holding this keychain's metadata (`.veil/meta/`).
+    pub(crate) fn backend(&self) -> &Arc<dyn StorageBackend> {
+        &self.backend
+    }
+
     /// Forget cached keys (after pulling new rings or embargo records).
     pub fn invalidate(&self) {
         self.access.write().unwrap().clear();
@@ -1051,7 +1058,7 @@ impl Keychain {
     /// transaction on this thread (push and pull merge metadata there).
     /// Cached keys are dropped: another process may have changed the rings
     /// since they were derived.
-    fn lock_meta(&self) -> Result<RepoLock> {
+    pub(crate) fn lock_meta(&self) -> Result<RepoLock> {
         let lock = RepoLock::acquire_reentrant(self.backend.clone())?;
         self.invalidate();
         Ok(lock)

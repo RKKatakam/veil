@@ -10,7 +10,7 @@
 //! | Policy | [`policy`], [`secrets`] | per-path visibility tiers, engine-level secret detection |
 //! | Trees | [`tree`], [`builder`], [`checkout`], [`merge`], [`statcache`] | tree views, snapshotting, materialisation, 3-way merge, stat cache |
 //! | Graph | [`oplog`], [`repo`], [`transaction`], [`revset`] | snapshot DAG, change ids, operation log, undo |
-//! | Features | [`workspace`], [`commands`], [`embargo`], [`remote`], [`vault`], [`upgrade`] | workspaces, cloaking, embargoes, sync, secrets vault, format migrations |
+//! | Features | [`workspace`], [`commands`], [`embargo`], [`remote`], [`vault`], [`team_vault`], [`upgrade`] | workspaces, cloaking, embargoes, sync, local and team secret vaults, format migrations |
 //!
 //! Nothing in the engine touches `std::fs` directly except [`vfs::DiskBackend`]:
 //! every repository, working copy and remote is just a `StorageBackend`, so the
@@ -59,6 +59,7 @@ pub mod revset;
 pub mod secrets;
 pub mod statcache;
 pub mod store;
+pub mod team_vault;
 pub mod transaction;
 pub mod tree;
 pub mod upgrade;

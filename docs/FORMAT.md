@@ -59,6 +59,7 @@ not be understood.
 | — wrapped key (in a ring change) | JSON: legacy `{ephemeral, sealed}` or HPKE `{hpke, enc, ct}` | shape + `hpke` suite string | yes | legacy written by format 1–2, HPKE by format 3 (CRYPTO.md C3/C3L); unknown fields or suites refused |
 | — member binding (in a genesis member or grant) | `"binding": hex(Ed25519 signature)`, after `signing_key`; absent when not recorded | ring format 3 | yes | written from repository format 3 only (CRYPTO.md C4); a ring with one must say format 3, so format-1/2 repositories and older vl never receive it. Added to ring format 3 before any release wrote that format; the format-3 fixtures predate it and carry none |
 | embargo records `.veil/meta/embargoes/<id>.json` | pretty JSON `EmbargoRecord` | implicit 1; a later format adds `"format": N` | yes | readers reject `format > 1` |
+| team-vault records `.veil/meta/vault/<scope>/<id>.json` | compact JSON `VaultRecord {format, scope, sealed, timestamp, signature}`; `sealed` is the JSON envelope (C2) of the padded JSON `{name, value, since}` under label `vault:<scope>#<key-id>`; `<id>` = hex BLAKE3 of the file, which must be exactly the canonical encoding | `format` (1); unknown fields refused | yes, team remotes only | immutable, never rewritten: a write adds a record, compaction deletes superseded ones (ARCHITECTURE §3). A newer `format`, unknown fields or a non-canonical file make the record not count, with a warning; nothing is rewritten. Older vl never read, write or relay the directory, so no repository format change |
 | staged embargo releases `.veil/local/releases/<id>.json` | pretty JSON `{released_key, released_at, release_signature}` (the record's release fields) | none: unknown or invalid content is ignored (the embargo stays unreleased) | no (device-local; honoured only by the identity that signed it) | written by `vl embargo release`, moved into the record by the next push or Git export, deleted by `vl undo` (BUG-109); an older vl ignores it, i.e. the release is not yet made |
 | vault `.veil/local/vault.sealed` | envelope (label `local`) around JSON `VaultData {secrets, files, removed?}` | repository format | no (device-local) | `removed`: backups of vanished isolated files with `removed_at`, kept 30 days; older readers ignore it |
 | deleted tags `.veil/local/deleted_tags.json` | pretty JSON object: tag name → hex snapshot id | none (a missing file is empty) | no | written by `vl tag delete`, read and pruned by pull (`remote::deleted_tags`). Outside the view and the op log; an older vl ignores the file and never rewrites it, so no repository format change |
@@ -76,7 +77,8 @@ not be understood.
 
 Signed bodies have their own fixed encodings and must never change: the ring
 change body (`RingChange::signing_body`), the embargo body
-(`EmbargoRecord::body`) and the snapshot's *unsigned id* (the id of its
+(`EmbargoRecord::body`), the team-vault record body
+(`VaultRecord::signing_body`, pinned by a unit test) and the snapshot's *unsigned id* (the id of its
 encoding without `signature`). A format change that touches a signed type
 needs a new signing context.
 
@@ -192,7 +194,10 @@ work, which the engine avoids:
    `put_raw` rule for what the new format permits.
 4. **Rings and embargo records** may only raise their `format` together
    with the repository format; readers reject newer ones (fail closed: no
-   keys, no release).
+   keys, no release). **Team-vault records** are immutable and never
+   rewritten, so a later record format needs no repository format: readers
+   skip records with a newer `format` (fail closed: the entry is not
+   shown, with a warning) and never delete them.
 5. **Signed bodies never change** (§2); use a new context instead.
 6. **Every format change ships with a fixture set** written by the release
    that introduces it (`crates/veil-core/tests/fixtures/generate.sh`), and

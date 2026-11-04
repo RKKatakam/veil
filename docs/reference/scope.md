@@ -10,7 +10,7 @@ Subcommands:
 * [`vl scope list`](#vl-scope-list): List scopes and members
 * [`vl scope create`](#vl-scope-create): Create a scope with you as the only member
 * [`vl scope grant`](#vl-scope-grant): Give an identity access to a scope (admins only). Use the full public key from `vl identity show` so the member's signatures are recognised
-* [`vl scope revoke`](#vl-scope-revoke): Remove an identity from a scope and rotate its key (admins only)
+* [`vl scope revoke`](#vl-scope-revoke): Remove an identity from a scope and rotate its key (admins only). Lists the scope's team-vault secrets they could read: rotate them
 * [`vl scope rotate`](#vl-scope-rotate): Start a new key generation for the current members (admins only)
 * [`vl scope log`](#vl-scope-log): Show the signed membership log of a scope
 
@@ -60,7 +60,7 @@ Options:
 
 ## `vl scope revoke`
 
-Remove an identity from a scope and rotate its key (admins only)
+Remove an identity from a scope and rotate its key (admins only). Lists the scope's team-vault secrets they could read: rotate them
 
 ```text
 vl scope revoke [OPTIONS] <SCOPE> <PUBLIC_KEY>
