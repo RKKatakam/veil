@@ -200,6 +200,84 @@ proptest! {
     }
 }
 
+/// Format-5 leaves from a hostile tree (symlinks design, threat 13): link
+/// and gitlink entries whose object is a hostile target (NUL, over
+/// `PATH_MAX`, not UTF-8, empty), a tree, a missing object, with the
+/// executable bit set or not. Storing may refuse (canonical by
+/// construction); checking out and snapshotting what was stored never
+/// panics, and never writes a link with an invalid target.
+fn exercise_link_tree(entries: Vec<(String, u8, Vec<u8>)>) {
+    let (repo, _fs, _) = new_repo("v");
+    let store = repo.store().clone();
+    let sub = raw_tree(&repo, vec![file("leaf", blob(&repo, b"x"))]);
+    let mut tree = Tree::default();
+    for (name, k, target) in entries {
+        tree.insert(TreeEntry {
+            name,
+            kind: match k % 3 {
+                0 => EntryKind::Symlink,
+                1 => EntryKind::Gitlink,
+                _ => EntryKind::File,
+            },
+            id: match k % 4 {
+                1 => sub,
+                2 => ObjectId([k; 32]),
+                _ => blob(&repo, &target),
+            },
+            size: target.len() as u64,
+            executable: k % 5 == 0,
+            visibility: Visibility::Public,
+            fallback: None,
+        });
+    }
+    let Ok(root) = store.put(&Object::Tree(tree)) else { return };
+    let wc = MemoryBackend::new();
+    let _ = walk_files(&store, &root);
+    let _ = checkout(&store, &wc, None, &root);
+    for (path, kind) in veil_core::vfs::walk_leaves(&wc, &VPath::root(), &|_| false).unwrap() {
+        if kind == veil_core::vfs::NodeKind::Symlink {
+            let t = wc.read_link(&path).unwrap();
+            assert!(veil_core::vfs::check_link_target(&t).is_ok(), "{path}: an invalid target was written");
+        }
+    }
+    let _ = veil_core::builder::build_tree(
+        &store,
+        &wc,
+        &veil_core::builder::BuildOptions {
+            policy: &veil_core::policy::Policy::builtin(),
+            parent_tree: Some(root),
+            cloak: None,
+            injected: None,
+            rescan: false,
+            materialised: None,
+            line_base: None,
+        },
+    );
+    let _ = veil_core::tree::TreeView::new(store.clone(), root).list_dir(&VPath::root());
+}
+
+fn arb_target() -> impl Strategy<Value = Vec<u8>> {
+    prop_oneof![
+        "[a-z./]{0,12}".prop_map(String::into_bytes),
+        proptest::collection::vec(any::<u8>(), 0..16),
+        (4090usize..4100).prop_map(|n| vec![b'a'; n]),
+        Just(b"a\0b".to_vec()),
+        Just(vec![0xff, 0xfe]),
+    ]
+}
+
+proptest! {
+    #![proptest_config(cfg(300))]
+
+    #[test]
+    fn link_trees_never_panic_and_never_write_invalid_targets(
+        entries in proptest::collection::vec(("[a-c.]{1,3}".prop_filter("dots", |s| s != "." && s != ".."), any::<u8>(), arb_target()), 0..6)
+    ) {
+        let r = catch_unwind(AssertUnwindSafe(|| exercise_link_tree(entries.clone())));
+        prop_assert!(r.is_ok(), "panic on {entries:?}");
+    }
+}
+
 // ---- crypto misuse --------------------------------------------------------------------
 
 #[test]

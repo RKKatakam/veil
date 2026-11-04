@@ -389,8 +389,15 @@ fn a_symlinked_submodule_path_is_refused() {
     std::fs::create_dir_all(&outside).unwrap();
     let _ = std::fs::remove_dir_all(dir.join("vendor"));
     std::os::unix::fs::symlink(&outside, dir.join("vendor")).unwrap();
-    let out = env.fails(&dir, &["submodule", "update", "--allow-local"]);
+    // `--no-snapshot`: the submodule is still in the tree while the link sits
+    // on disk (format 5 would otherwise record the link, replacing the
+    // submodule, and leave nothing to update).
+    let out = env.fails(&dir, &["--no-snapshot", "submodule", "update", "--allow-local"]);
     assert!(out.contains("symlink"), "{out}");
+    assert!(std::fs::read_dir(&outside).unwrap().next().is_none(), "the clone went through the link");
+    // With a snapshot, the link replaces the submodule: nothing to clone,
+    // and still nothing goes through the link.
+    env.ok(&dir, &["submodule", "update", "--allow-local"]);
     assert!(std::fs::read_dir(&outside).unwrap().next().is_none(), "the clone went through the link");
 }
 

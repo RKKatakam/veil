@@ -369,7 +369,8 @@ impl Recorder {
         let fs = Arc::new(
             MountFs::new(lower, upper, whiteouts, Some(Box::new(DiskJournal { paths: paths.clone() })))
                 .with_files(Arc::new(DiskFiles::new(&paths.upper)))
-                .with_unseen(paths.load_unseen()),
+                .with_unseen(paths.load_unseen())
+                .with_links(repo.format() >= veil_core::object::GIT_PARITY_REPO_FORMAT),
         );
         Ok(Recorder {
             root: root.to_path_buf(),

@@ -63,7 +63,10 @@ fn working_copy_warnings_escape_file_names() {
     let all = text(&out);
     assert!(out.status.success(), "{all}");
     assert!(!all.contains('\x1b') && !all.contains('\x07'), "raw control characters in the output: {all:?}");
-    assert!(all.contains("a\\x1b]0;pwned\\x07.txt is tracked but is now a symlink"), "{all}");
+    // Format 5 records the link (a type change), and warns about its
+    // target: both escaped.
+    assert!(all.contains("T a\\x1b]0;pwned\\x07.txt (file → symlink)"), "{all}");
+    assert!(all.contains("symlink a\\x1b]0;pwned\\x07.txt points outside the repository (/etc/hostname)"), "{all}");
     if unreadable {
         assert!(all.contains("skipped b\\x1b[2J.txt: cannot read it"), "{all}");
     }

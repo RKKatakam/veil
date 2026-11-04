@@ -47,17 +47,30 @@ must not be trusted (which disables stat caching):
 | `SftpBackend` | – (another machine's clock) | `None` |
 
 * **DiskBackend** does atomic, durable writes (temp file, fsync, rename,
-  fsync of the directory; see §9) and ignores symlinks: `metadata` reports
-  nothing at one and `read` refuses one. A path below a file is simply
-  missing (ENOTDIR is "not found"), as on every backend. `list_dir_full`
-  additionally reports what `list_dir` leaves out: *special* entries
-  (symlinks, sockets, devices) and names that are not valid UTF-8, which a
-  `VPath` cannot represent. The builder warns about the latter and checkout
-  never writes through or over the former (§4). `write`, `write_unsynced`
-  and `create_new` themselves also refuse a path below a symlinked
-  directory, whoever calls them (one `lstat` per directory above the path),
-  except under the engine's own `.veil/`, which may be a link to another
-  disk.
+  fsync of the directory; see §9) and never follows a symlink. A link is a
+  leaf of its own: `NodeKind::Symlink` in `metadata` and listings, its
+  target from `read_link`, created atomically by `write_link` (`symlinkat`
+  to a temp name, `renameat`); `read` never reads through one. A path below
+  a file is simply missing (ENOTDIR is "not found"), as on every backend.
+  `list_dir_full` additionally reports what `list_dir` leaves out:
+  *special* entries (sockets, FIFOs, devices, a `vl ws mount`) and names
+  that are not valid UTF-8, which a `VPath` cannot represent. The builder
+  warns about the latter and checkout never writes through or over the
+  former (§4). **Every write, removal and read below the root** resolves
+  its path with `openat(…, O_NOFOLLOW | O_DIRECTORY)` on each component,
+  relative to the directory before it (`vfs::beneath`; the same walk on
+  Linux and macOS): a path below a symlinked directory is refused, and a
+  directory swapped for a link mid-write cannot redirect the write, which
+  lands in the very directory that was checked (symlinks design, threat
+  1; this replaced an `lstat` loop with a check-to-use window). Removing a
+  directory empties it through descriptors opened the same way. The
+  engine's own `.veil/` is written by path: it may be a link to another
+  disk, and nothing from a tree is written there. `metadata` and listings
+  stay plain `lstat`s (they only ever lead to such a read or write).
+  `MemoryBackend`, `OverlayBackend`, `TreeView`, `SparseView` and
+  `SandboxFs` hold links the same way; `SftpBackend` holds none (remotes
+  hold objects only), and a backend without them says so
+  (`supports_links`), which checkout reports per link.
 * **MemoryBackend** is a flat `BTreeMap<VPath, Node>`. Because the
   descendants of `a/` are contiguous in string order, directory listings are
   range scans. File buffers are `Arc`-shared. Every file write takes a fresh
@@ -1087,11 +1100,52 @@ snapshot (and with it every command), and nothing is dropped silently:
   goes on, so `vl ignore` still works.
 * Names that are not valid UTF-8 cannot be recorded and are reported on
   every snapshot.
-* A tracked path that is now a symlink (or socket, device) is never
-  followed. Its tracked entry is kept and reported. Checkout and
-  `vl restore` never write, remove or prune at or below such an entry
-  (`CheckoutReport::blocked`), so an untracked `vendor -> /shared/vendor`
+* A tracked path that is now a socket or device (or, below format 5, a
+  symlink) is never followed. Its tracked entry is kept and reported.
+  Checkout and `vl restore` never write, remove or prune at or below such
+  an entry (`CheckoutReport::blocked`), so a `vendor -> /shared/vendor`
   link never receives pulled files.
+* **Symlinks (format 5)** are recorded as symlink entries whose object is
+  the target string, read with `readlinkat`, never followed: a link is
+  classified by its own path (`Policy::classify_link`: as a file, and a
+  link spelling `.git`, `.jj`, `.hg` or `.svn` is VCS metadata), scanned,
+  and sealed under its scope exactly as file content (a cloaked link's
+  target never reaches a public remote; a link named `id_rsa` is
+  isolated; a token in a target is quarantined). A target that is not
+  UTF-8, holds a NUL or exceeds `PATH_MAX` is unrepresentable (reported,
+  a tracked link keeps its entry). A new target outside the repository,
+  or at a path the policy isolates, is reported
+  (`BuildReport::link_warnings`). Only a parent entry of the same kind is
+  a link's previous version: a file replaced by a link is a new leaf
+  (`T` in `vl status`), its old version kept in history. `.veilpolicy` is
+  never recorded as a link (it is read through, BUG-058), and a link named
+  `.veil` makes its directory a nested repository. The stat cache is not
+  used for links (one `readlinkat` costs less). A **gitlink** entry is
+  carried: a directory at its path is never descended into (whatever it
+  holds, its own repository decides), and only `vl submodule set` or a Git
+  import moves the pinned commit; an absent directory that was
+  materialised is a deletion.
+* **Checkout of links** writes them with `write_link` (the target as it
+  is) through the no-follow walk. A link at a path is replaced or removed
+  only when it is the version `from` materialised (same `readlink`
+  bytes); any other link is the user's and is kept (`kept_local`, or
+  `blocked` where a file of the tree would replace it). A gitlink becomes
+  an empty directory, never removed while it holds anything. A hostile
+  target (NUL, over `PATH_MAX`, empty) fails that path only. A link is
+  never written from an embargo fallback. A conflict with a symlink or
+  gitlink side is materialised as its **shown side, as it is**
+  (`conflict::shown_side`: ours, unless ours deleted it), never as a file
+  of markers, which would turn a link target into file content a later
+  edit could publish (threat 12); the builder keeps the conflict while
+  that side is untouched, and anything else at the path resolves it (only
+  for a reader of every side). `name_collisions` counts links as names, so
+  `A -> …` and `a/` in one tree are refused on a folding filesystem
+  (CVE-2021-21300's shape).
+* **Protection follows content across a rename** (renames design,
+  builder hardening): a new public file or link whose plaintext equals
+  that of a cloaked entry the same snapshot deletes (verified sealing,
+  key held) is sealed as that entry was, unless a rule of the policy
+  explicitly classifies the new path (`Builder::protect_moves`).
 * A path the working copy's filesystem refuses (a name too long for it,
   a character it cannot hold, permission denied on one directory) never
   stops a checkout and never wedges the working copy: it is reported
@@ -1522,6 +1576,21 @@ A workspace is only a named pointer in the view. It owns no directory.
   through overlays (`vl ws write`), materialised into a throwaway directory
   for one command (`vl ws exec`), or attached to the project directory
   (`vl ws switch`). Two tasks can never fight over a directory.
+* **Restricted snapshots** (`SnapshotOptions::only`, a `SparseSet`)
+  record only some paths of a working copy: everything else keeps the
+  working copy's recorded entries, through the same `SparseView` that
+  records a sparse sandbox (colocated Git mode records only the paths Git
+  does not manage).
+* **Links in sandboxes** (symlinks design, threat 7). `SandboxFs` never
+  materialises a tree's symlink whose target, resolved lexically against
+  the link's directory, leaves the sandbox (`x -> ../../../../../.env`
+  reaches the project's isolated `.env` from
+  `.veil/local/sandboxes/<ws>/files/`), or whose absolute target lies in a
+  forbidden root (the project directory and `$VEIL_HOME`, given by the
+  CLI). Checkout reports it `failed`, so the materialisation record keeps
+  it hidden and recording the run carries the link; full, `--only` and
+  `--ephemeral` sandboxes alike. Reflink clones are made in the
+  destination's directory opened without following links.
 * **`ws exec` sandboxes** (`veil_core::sandbox`, `vfs::SandboxFs`, the
   CLI's `sandbox.rs`). Each virtual workspace has one persistent sandbox,
   `.veil/local/sandboxes/<ws>/` (`0700`; `.` and `..` are spelt `%2e`,
@@ -1741,8 +1810,12 @@ A workspace is only a named pointer in the view. It owns no directory.
     copies the source (a directory: its whole subtree) into the upper
     layer, then removes it; a file the upper layer already holds is
     renamed in it instead (O(1), holes kept; an open one follows), so only
-    files the lower layer alone has are copied. `.veil` cannot be created, symlinks, hard
-    links and special files are refused (`EPERM`), only the executable
+    files the lower layer alone has are copied. `.veil` cannot be created; a
+    symlink is created as it is in format 5 (`EPERM` below it) and served
+    as a leaf inode (`readlink`; `MountFs` never resolves a path through a
+    link: a lookup below one is `ENOTDIR`, an `open` of one `ELOOP`, so a
+    link to `../../.veil/local/vault.sealed` leads nowhere inside the
+    mount); hard links and special files are refused (`EPERM`), only the executable
     bit of a mode is kept. No `allow_other` (the kernel keeps every other
     user, root included, out), `default_permissions`, modes `0700`/`0600`,
     `nosuid`, `nodev`; names and attributes are cached by the kernel for
@@ -3655,16 +3728,15 @@ finds no repository (`find_root`). `push --dry-run` runs nothing.
   ring changes.
 * Conflicts (format 4): parsing back partly edited copies of conflicts of
   more than two sides (today any edit of such a copy resolves it as the
-  file is), hunk-level rendering of many-sided conflicts, directory or
-  symlink versions in a conflict (file/directory conflicts still move the
-  file aside), and an external merge tool for `vl resolve`.
+  file is), hunk-level rendering of many-sided conflicts, directory
+  versions in a conflict (file/directory conflicts still move the file
+  aside), and an external merge tool for `vl resolve`.
 * Front-ends: the FUSE mount (§6) has no NFS fallback for machines
   without FUSE, holds an open file in memory, renames a directory by
   copying it, and is not tested on macOS in CI; the project directory
   itself is never a mount. (The WASM build of `veil-core` exists, §13; a
   browser front-end on it, a persistent browser `StorageBackend` and a
   lock that works across tabs do not yet.)
-* Symlink support in `DiskBackend`.
 * Git interop: Git tags (annotated or not) are not imported or exported,
   only branches; Git authors' time zones are not kept (export writes UTC);
   carry-over of Git-only paths follows the first parent only; `vl git`

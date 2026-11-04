@@ -464,7 +464,8 @@ pub fn strays(fs: &dyn StorageBackend, set: &SparseSet, policies: &[&Policy]) ->
             continue;
         }
         for e in listing.entries {
-            if is_reserved_name(&e.name) || (e.kind == NodeKind::File && is_temp_name(&e.name)) {
+            // Symlinks are never strays: never followed, never removed.
+            if is_reserved_name(&e.name) || (e.kind == NodeKind::File && is_temp_name(&e.name)) || e.kind == NodeKind::Symlink {
                 continue;
             }
             let p = dir.join(&e.name);
@@ -1222,6 +1223,22 @@ impl StorageBackend for PolicyPin<'_> {
         }
     }
 
+    fn read_link(&self, path: &VPath) -> Result<Vec<u8>> {
+        match self.pins(path) {
+            Some(_) => Err(VeilError::InvalidPath(format!("{path} is not a symlink"))),
+            None => self.inner.read_link(path),
+        }
+    }
+
+    fn write_link(&self, path: &VPath, target: &[u8]) -> Result<()> {
+        self.refuse(path)?;
+        self.inner.write_link(path, target)
+    }
+
+    fn supports_links(&self) -> bool {
+        self.inner.supports_links()
+    }
+
     fn read_range(&self, path: &VPath, offset: u64, len: usize) -> Result<Vec<u8>> {
         match self.pins(path) {
             Some(_) => {
@@ -1528,6 +1545,20 @@ fn differs_from_trees(
                 continue;
             }
             if skip.contains(&p) {
+                continue;
+            }
+            if e.kind == NodeKind::Symlink {
+                // A link (format 5) is work unless it is one of the trees'
+                // links, target for target.
+                let have = fs.read_link(&p).ok();
+                let same_link = |tree: Option<&ObjectId>| -> bool {
+                    let Some(tree) = tree else { return false };
+                    let e = lookup(store, tree, &p).ok().flatten().filter(|e| e.kind == EntryKind::Symlink);
+                    have.is_some() && e.and_then(|e| store.read_entry(&e).ok()) == have
+                };
+                if !same_link(old) && !same_link(target) {
+                    return Ok(true);
+                }
                 continue;
             }
             let rec = fs.metadata(&p)?.and_then(|md| cache.trusted(&p, &md).cloned());

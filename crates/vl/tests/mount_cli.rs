@@ -118,8 +118,9 @@ fn reads_writes_and_unmount_records_through_the_policy() {
     assert_eq!(std::fs::metadata(mnt.join("a.txt")).unwrap().permissions().mode() & 0o777, 0o600);
     // No `.veil` can be made in the mount.
     assert!(std::fs::create_dir(mnt.join(".veil")).is_err());
-    // Symlinks are refused (Veil records none).
-    assert!(std::os::unix::fs::symlink("a.txt", mnt.join("link")).is_err());
+    // Symlinks are created as they are (format 5 records them).
+    std::os::unix::fs::symlink("a.txt", mnt.join("link")).unwrap();
+    assert_eq!(std::fs::read_link(mnt.join("link")).unwrap(), std::path::PathBuf::from("a.txt"));
 
     // Another command records the mount first.
     let diff = env.ok("alice", &proj, &["diff", "-r", "agent@", "--stat"]);

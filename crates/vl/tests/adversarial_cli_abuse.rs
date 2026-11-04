@@ -265,11 +265,34 @@ fn symlinks_are_never_followed_when_snapshotting() {
     std::os::unix::fs::symlink("/", proj.join("rootfs")).unwrap();
     std::os::unix::fs::symlink(proj.join("loop"), proj.join("loop")).unwrap();
     env.ok("alice", &proj, &["commit", "-m", "links"]);
+    // Format 5 records the links themselves: their targets, never what
+    // they point at.
     let files = env.stdout("alice", &proj, &["files", "-r", "@-"]);
-    assert!(!files.contains("notes.txt") && !files.contains("vendor") && !files.contains("rootfs"), "{files}");
+    assert!(files.contains("notes.txt") && files.contains("vendor") && files.contains("rootfs"), "{files}");
+    let target = env.stdout("alice", &proj, &["cat", "-r", "@-", "notes.txt"]);
+    assert_eq!(target, outside.join("id_ed25519_copy").to_str().unwrap());
+    fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            match e.file_type() {
+                Ok(t) if t.is_dir() => out.extend(walk(&p)),
+                Ok(t) if t.is_file() => out.push(p),
+                _ => {}
+            }
+        }
+        out
+    }
+    for d in walk(&proj.join(".veil")) {
+        if let Ok(data) = std::fs::read(&d) {
+            assert!(!String::from_utf8_lossy(&data).contains("OUTSIDE-SECRET"), "{} holds the link's target content", d.display());
+        }
+    }
     env.ok("alice", &proj, &["tag", "set", "main", "-r", "@-", "--allow-backwards"]);
     let dest = roundtrip_via_clone(&env, &proj, "links");
-    assert!(!dest.join("notes.txt").exists() && !dest.join("vendor").exists());
+    for (name, target) in [("notes.txt", outside.join("id_ed25519_copy")), ("vendor", outside.clone()), ("rootfs", "/".into())] {
+        assert_eq!(std::fs::read_link(dest.join(name)).unwrap(), target, "{name}");
+    }
 }
 
 /// The victim has an (untracked, invisible to Veil) symlinked directory, e.g.

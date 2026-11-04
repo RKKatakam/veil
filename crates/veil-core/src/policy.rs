@@ -791,6 +791,22 @@ impl Policy {
         self.classify_depth(path, is_dir, ARTEFACT_DEPTH)
     }
 
+    /// The classification of a symlink at `path` (repository format 5):
+    /// that of a file there (a link is a leaf, so directory-only rules such
+    /// as `build/` do not match it, as in Git), except that a link spelling
+    /// a VCS metadata directory (`.git`, `.jj`, `.hg`, `.svn`, a Git
+    /// worktree's `.git -> …`) is that metadata, never recorded or written
+    /// (see [`BUILTIN_VCS_DIRS`]).
+    pub fn classify_link(&self, path: &VPath) -> Classification {
+        let mut c = self.classify(path, false);
+        if !c.builtin_vcs {
+            if let Some(n) = vcs_metadata(path, true) {
+                c.mark_vcs(n);
+            }
+        }
+        c
+    }
+
     /// [`Policy::classify_rules`], then, for an editor or backup artefact
     /// ([`editor_artefact`]), the protection of the file it belongs to
     /// ([`Classification::inherit`]), unwrapping up to `depth` layers.
@@ -1419,6 +1435,9 @@ pub fn read_policy_file(fs: &dyn StorageBackend) -> Result<PolicyFile> {
             Err(e) => PolicyFile::Unavailable(e.to_string()),
         },
         Ok(Some(m)) if m.kind == crate::vfs::NodeKind::Dir => PolicyFile::Unavailable("it is a directory".into()),
+        // A symlink entry (a hostile format-5 tree, or one swapped in since
+        // `read_through_link`): never "no policy" (BUG-121, threat 14).
+        Ok(Some(m)) if m.kind == crate::vfs::NodeKind::Symlink => PolicyFile::Unavailable("it is a symlink entry".into()),
         Ok(Some(_)) => match fs.read(&path) {
             Ok(b) => PolicyFile::File(b),
             // Gone since `metadata`: a concurrent `rm`.

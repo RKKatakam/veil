@@ -135,11 +135,11 @@ fn conflict_info() -> Value {
 }
 
 fn change() -> Value {
-    json!({"path": "string", "status": "string", "visibility": vis(), "redacted": "bool", "tier": "string", "conflict": conflict_info()})
+    json!({"path": "string", "status": "string", "visibility": vis(), "redacted": "bool", "tier": "string", "conflict": conflict_info(), "kind": "string", "old_kind": "string|null"})
 }
 
 fn diff_files() -> Value {
-    let entry = nullable(json!({"visibility": vis(), "executable": "bool", "mode": "string", "readable": "bool", "conflict": conflict_info()}));
+    let entry = nullable(json!({"visibility": vis(), "executable": "bool", "mode": "string", "readable": "bool", "conflict": conflict_info(), "kind": "string", "target": "string|null"}));
     let line = json!({"kind": "string", "text": "string", "newline": "bool"});
     let hunk = json!({"old_start": "number", "old_lines": "number", "new_start": "number", "new_lines": "number", "lines": [line]});
     json!([{
@@ -226,7 +226,7 @@ fn specs() -> Vec<(&'static str, Value)> {
                 "recorded": "bool", "visibility": nullable(vis()), "size": "number|null", "executable": "bool",
                 "readable": "bool", "fallback": "bool", "redaction": nullable(redaction()),
                 "quarantine": nullable(json!({"rule": "string", "line": "number", "state": "string"})),
-                "conflict": conflict_info(),
+                "conflict": conflict_info(), "kind": "string", "target": "string|null",
             }],
         })),
         ("veil.resolve.list/1", json!({

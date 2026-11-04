@@ -145,10 +145,15 @@ fn disk_backend_never_reads_through_a_symlink() {
     std::fs::write(outside.path().join("secret"), "outside").unwrap();
     std::os::unix::fs::symlink(outside.path().join("secret"), tmp.path().join("link")).unwrap();
     let fs = DiskBackend::new(tmp.path());
-    assert_eq!(fs.metadata(&p("link")).unwrap(), None);
+    // A link is a leaf of its own: never read as what it points at.
+    let m = fs.metadata(&p("link")).unwrap().unwrap();
+    assert_eq!(m.kind, veil_core::vfs::NodeKind::Symlink);
     assert!(fs.read(&p("link")).unwrap_err().is_not_found());
     assert_eq!(fs.read_opt(&p("link")).unwrap(), None);
-    assert_eq!(fs.list_dir_full(&VPath::root()).unwrap().special, vec!["link".to_string()]);
+    assert_eq!(fs.read_link(&p("link")).unwrap(), outside.path().join("secret").as_os_str().as_encoded_bytes());
+    let l = fs.list_dir_full(&VPath::root()).unwrap();
+    assert!(l.special.is_empty());
+    assert_eq!(l.entries.iter().map(|e| (e.name.as_str(), e.kind)).collect::<Vec<_>>(), vec![("link", veil_core::vfs::NodeKind::Symlink)]);
 }
 
 /// `write` (and `write_unsynced`, `create_new`) refuse a path below a
@@ -177,6 +182,7 @@ fn disk_backend_never_writes_through_a_symlinked_directory() {
     assert_eq!(std::fs::read(store.path().join("local/state")).unwrap(), b"s");
 }
 
+/// Below repository format 5 a symlink is a special file: never recorded.
 #[cfg(unix)]
 #[test]
 fn a_tracked_path_replaced_by_a_symlink_keeps_its_entry() {
@@ -186,7 +192,7 @@ fn a_tracked_path_replaced_by_a_symlink_keeps_its_entry() {
     let fs = DiskBackend::new(tmp.path());
     fs.write(&p("vendor/x"), b"tracked").unwrap();
     fs.write(&p("notes.txt"), b"notes").unwrap();
-    let mut repo = mem_repo();
+    let mut repo = Repo::init_for_clone_at(Arc::new(MemoryBackend::new()), Some(Identity::generate("alice")), "alice", 4).unwrap();
     repo.snapshot_workspace(WS, &fs).unwrap();
     let before = wc_tree(&repo);
     std::fs::remove_dir_all(tmp.path().join("vendor")).unwrap();
@@ -198,6 +204,34 @@ fn a_tracked_path_replaced_by_a_symlink_keeps_its_entry() {
     assert_eq!(wc_tree(&repo), before);
     let shadowed: Vec<&str> = out.report.shadowed.iter().map(|p| p.as_str()).collect();
     assert_eq!(shadowed, vec!["notes.txt", "vendor"]);
+}
+
+/// In format 5 the links are recorded as links (their targets only), and
+/// the old versions stay in history.
+#[cfg(unix)]
+#[test]
+fn a_tracked_path_replaced_by_a_symlink_is_recorded_as_the_link() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("x"), "outside-content").unwrap();
+    let fs = DiskBackend::new(tmp.path());
+    fs.write(&p("vendor/x"), b"tracked").unwrap();
+    fs.write(&p("notes.txt"), b"notes").unwrap();
+    let mut repo = mem_repo();
+    repo.snapshot_workspace(WS, &fs).unwrap();
+    std::fs::remove_dir_all(tmp.path().join("vendor")).unwrap();
+    std::fs::remove_file(tmp.path().join("notes.txt")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), tmp.path().join("vendor")).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("x"), tmp.path().join("notes.txt")).unwrap();
+    let out = repo.snapshot_workspace(WS, &fs).unwrap();
+    assert!(out.changed && out.report.shadowed.is_empty());
+    let tree = wc_tree(&repo);
+    for (path, target) in [("vendor", outside.path().to_path_buf()), ("notes.txt", outside.path().join("x"))] {
+        let e = entry(&repo, &tree, path).unwrap();
+        assert_eq!(e.kind, veil_core::EntryKind::Symlink);
+        assert_eq!(repo.store().read_entry(&e).unwrap(), target.as_os_str().as_encoded_bytes());
+    }
+    assert!(entry(&repo, &tree, "vendor/x").is_none());
 }
 
 #[cfg(unix)]

@@ -32,7 +32,7 @@ fixed**. Severity: high / medium / low.
   submodules in `vl am`, binary literals both ways, `vl am --3way`.
 - **Repository attributes:** line-ending normalisation (CRLF), per-path diff
   and merge drivers, binary handling (`.gitattributes` equivalents).
-- **Symlinks** are ignored; non-UTF-8 names are not recorded.
+- **Non-UTF-8 names** are not recorded.
 - **Git bridge gaps:** author time zones become UTC; Veil does not sign Git
   tags (GitHub shows release tags unverified).
 - **Windows** support.
@@ -76,8 +76,6 @@ fixed**. Severity: high / medium / low.
   tokens (≤ 0.1 % at 20, up to 1.3 % if upper-case and digits only) are
   taken for words; `<WORD>_KEY` values need 16+ characters (32 hex).
   Keys not on the list (`credentials`, `pass`) are not seen.
-- **`DiskBackend::write` follows symlinked parent directories** if called
-  directly (checkout and restore guard against it).
 - **Tags carry no provenance:** a hostile tag created by an older `vl pull`
   (before the BUG-105 fix) keeps shadowing a change id until the user
   deletes it; pulled tags are not attributed to the remote that sent them.

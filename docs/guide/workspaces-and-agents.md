@@ -337,6 +337,15 @@ Use the vault for secrets an agent needs (`vl run`), not files it writes.
   exits, including after `kill -9`.
 * `vl doctor` reports leftover throwaway sandboxes, sandboxes of removed
   workspaces, interrupted and unrecorded runs, and files a rebuild kept.
+* A sandbox never hands its command a **symlink that leads out of it**: a
+  tree's link whose target climbs out of the sandbox
+  (`x -> ../../../../../.env`, which would reach the project's isolated
+  `.env` without `--with-isolated`), or points by absolute path into the
+  project directory or `$VEIL_HOME`, is not materialised (`failed: x ->
+  …: it leads outside the sandbox`), and recording the run keeps the
+  link as it is. Other links (`bin/tool -> ../lib/tool.sh`,
+  `/usr/share/dict/words`) are written as links. This holds for full,
+  `--only` and `--ephemeral` sandboxes alike.
 * A sandbox is an isolation of **files**, not a security boundary: the
   command runs as you, with your network and your home directory. Run
   untrusted agents inside your own container or VM.
@@ -381,8 +390,10 @@ stays where it is.
   and agents write in mounts too, so an edit of `.veilpolicy` there is
   judged as in a sandbox: what weakens the policy is held back, stays in
   the mount, and `vl policy accept --workspace NAME` records it.
-  Symlinks, hard links and special files are refused: Veil records files
-  and directories only.
+  Symlinks are created as they are and recorded as links (repository
+  format 5; refused below it); the mount itself never follows one (the
+  kernel resolves a link for the program that uses it). Hard links and
+  special files are refused.
 * **When it is recorded:** by `vl ws unmount`; before every other `vl`
   command (as your project directory is), so `vl diff -r agent@`,
   `vl merge agent@` or `vl commit` see what you wrote; every 60 seconds

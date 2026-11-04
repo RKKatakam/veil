@@ -652,6 +652,7 @@ fn observe(fs: &dyn StorageBackend) -> Model {
                     let meta = fs.metadata(&c).unwrap().unwrap();
                     m.files.insert(c.as_str().to_string(), (fs.read(&c).unwrap(), meta.executable));
                 }
+                NodeKind::Symlink => {}
             }
         }
     }

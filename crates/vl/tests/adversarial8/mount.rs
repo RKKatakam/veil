@@ -579,7 +579,10 @@ fn control_mount_options_and_reserved_names() {
         assert!(std::fs::write(mnt.join(bad), "x").is_err(), "{bad}");
         assert!(std::fs::rename(mnt.join("a.txt"), mnt.join(bad)).is_err(), "{bad}");
     }
-    assert!(std::os::unix::fs::symlink("/etc/passwd", mnt.join("l")).is_err());
+    // Format 5 records symlinks: the mount creates one as it is (the
+    // kernel, never the mount, resolves it).
+    std::os::unix::fs::symlink("/etc/passwd", mnt.join("l")).unwrap();
+    assert_eq!(std::fs::read_link(mnt.join("l")).unwrap(), std::path::PathBuf::from("/etc/passwd"));
     assert!(std::fs::hard_link(mnt.join("a.txt"), mnt.join("h")).is_err());
     env.ok(U, &proj, &["ws", "unmount", "agent"]);
 }

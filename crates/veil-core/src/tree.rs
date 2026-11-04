@@ -202,6 +202,32 @@ impl TreeView {
     fn entry(&self, path: &VPath) -> Result<Option<TreeEntry>> {
         lookup(&self.store, &self.root, path)
     }
+
+    /// What entry `e` is materialised as: a conflict with a symlink or
+    /// gitlink side (format 5) as its shown side, as it is
+    /// ([`crate::conflict::shown_side`]); anything else as itself.
+    pub(crate) fn shown(&self, e: TreeEntry) -> TreeEntry {
+        if e.kind != EntryKind::Conflict {
+            return e;
+        }
+        match self.store.conflict(&e.id) {
+            Ok(c) if c.has_special_terms() => match crate::conflict::shown_side(&c) {
+                Some((_, t)) => t.entry(&e.name),
+                None => e,
+            },
+            _ => e,
+        }
+    }
+
+    /// The node kind entry `e` is materialised as (see [`TreeView::shown`]):
+    /// a gitlink is the (empty) directory of a submodule.
+    pub(crate) fn node_kind(&self, e: &TreeEntry) -> NodeKind {
+        match self.shown(e.clone()).kind {
+            EntryKind::Dir | EntryKind::Gitlink => NodeKind::Dir,
+            EntryKind::Symlink => NodeKind::Symlink,
+            EntryKind::File | EntryKind::Conflict => NodeKind::File,
+        }
+    }
 }
 
 impl StorageBackend for TreeView {
@@ -210,12 +236,25 @@ impl StorageBackend for TreeView {
     }
 
     fn read(&self, path: &VPath) -> Result<Vec<u8>> {
-        match self.entry(path)? {
+        match self.entry(path)?.map(|e| self.shown(e)) {
             Some(e) if e.kind.is_file_like() => crate::conflict::read_file_like(&self.store, &e),
-            Some(e) if e.kind.is_special() => Err(e.kind.not_supported_yet(path.as_str())),
+            // A link is never read through, as on disk.
+            Some(e) if e.kind == EntryKind::Symlink => Err(VeilError::NotFound(path.to_string())),
             Some(_) => Err(VeilError::InvalidPath(format!("{path} is a directory"))),
             None => Err(VeilError::NotFound(path.to_string())),
         }
+    }
+
+    fn read_link(&self, path: &VPath) -> Result<Vec<u8>> {
+        match self.entry(path)?.map(|e| self.shown(e)) {
+            Some(e) if e.kind == EntryKind::Symlink => self.store.read_entry(&e),
+            Some(_) => Err(VeilError::InvalidPath(format!("{path} is not a symlink"))),
+            None => Err(VeilError::NotFound(path.to_string())),
+        }
+    }
+
+    fn special_at(&self, path: &VPath) -> Result<Option<&'static str>> {
+        Ok(self.entry(path)?.is_some_and(|e| self.node_kind(&e) == NodeKind::Symlink).then_some("a symlink"))
     }
 
     fn write(&self, _: &VPath, _: &[u8]) -> Result<()> {
@@ -238,24 +277,21 @@ impl StorageBackend for TreeView {
     }
 
     fn list_dir(&self, path: &VPath) -> Result<Vec<DirEntry>> {
-        match self.entry(path)? {
+        match self.entry(path)?.map(|e| self.shown(e)) {
             Some(e) if e.kind == EntryKind::Dir => Ok(self
                 .store
                 .tree(&e.id)?
                 .entries
                 .iter()
-                // unreadable entries are invisible in a materialised view,
-                // and so are format-5 symlinks and gitlinks, which are not
-                // materialised yet (the builder carries them)
-                .filter(|c| !c.kind.is_special() && !crate::checkout::special_conflict(&self.store, c) && self.store.entry_readable(c))
+                // unreadable entries are invisible in a materialised view
+                .filter(|c| self.store.entry_readable(&self.shown((*c).clone())))
                 .map(|c| DirEntry {
                     name: c.name.clone(),
-                    kind: match c.kind {
-                        EntryKind::Dir => NodeKind::Dir,
-                        EntryKind::File | EntryKind::Conflict | EntryKind::Symlink | EntryKind::Gitlink => NodeKind::File,
-                    },
+                    kind: self.node_kind(c),
                 })
                 .collect()),
+            // A submodule's directory, as checkout leaves it: empty.
+            Some(e) if e.kind == EntryKind::Gitlink => Ok(Vec::new()),
             Some(_) => Err(VeilError::InvalidPath(format!("{path} is not a directory"))),
             None => Err(VeilError::NotFound(path.to_string())),
         }
@@ -263,19 +299,16 @@ impl StorageBackend for TreeView {
 
     fn metadata(&self, path: &VPath) -> Result<Option<Metadata>> {
         // Immutable content is identified by `known_id`, not by stamps.
-        let Some(e) = self.entry(path)? else { return Ok(None) };
+        let Some(e) = self.entry(path)?.map(|e| self.shown(e)) else { return Ok(None) };
         Ok(Some(match e.kind {
-            EntryKind::Dir => Metadata::unstamped(NodeKind::Dir, e.size, e.executable),
+            EntryKind::Dir | EntryKind::Gitlink => Metadata::unstamped(NodeKind::Dir, 0, false),
             EntryKind::File => Metadata::unstamped(NodeKind::File, e.size, e.executable),
-            // Not materialised yet (see `list_dir`).
-            EntryKind::Conflict if crate::checkout::special_conflict(&self.store, &e) => return Ok(None),
             // What a reader of the view gets is the materialised conflict.
             EntryKind::Conflict => {
                 let m = crate::conflict::materialize_entry(&self.store, &e, crate::conflict::Audience::Reader)?;
                 Metadata::unstamped(NodeKind::File, m.content.len() as u64, m.executable)
             }
-            // Not materialised yet (see `list_dir`).
-            EntryKind::Symlink | EntryKind::Gitlink => return Ok(None),
+            EntryKind::Symlink => Metadata::unstamped(NodeKind::Symlink, e.size, false),
         }))
     }
 

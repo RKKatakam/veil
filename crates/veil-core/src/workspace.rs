@@ -73,6 +73,14 @@ pub struct SnapshotOptions<'a> {
     /// sealed version stays sealed, a conflict stays the same conflict,
     /// BUG-481); an edit made on top of it is sealed as an edit of it.
     pub carried: &'a [(VPath, crate::object::TreeEntry)],
+    /// Record only these paths of `fs` (and `.veilpolicy`, which classifies
+    /// them); everything else keeps the working copy's recorded entries,
+    /// whatever `fs` holds there (colocated Git mode snapshots only the
+    /// paths Git does not manage). `fs` is seen through a
+    /// [`crate::vfs::SparseView`] of the working copy's tree, exactly as a
+    /// sparse sandbox is recorded: a file outside the set is never read,
+    /// recorded or deleted.
+    pub only: Option<&'a crate::vfs::SparseSet>,
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +271,7 @@ impl Repo {
             policy_from_command,
             expected_wc,
             carried,
+            only,
         } = opts;
         let mut tx = self.transaction(description.unwrap_or_else(|| snapshot_op_description(ws)))?;
         let wc_id = tx.view.workspace(ws)?.wc;
@@ -280,6 +289,14 @@ impl Repo {
         // What `fs` was materialised from: the working copy, with the
         // entries a command put back in place of its own.
         let parent_tree = with_carried(&store, wc.tree, carried)?;
+        let restricted;
+        let fs: &dyn StorageBackend = match only {
+            Some(set) => {
+                restricted = crate::vfs::SparseView::new(fs, store.clone(), parent_tree, set);
+                &restricted
+            }
+            None => fs,
+        };
         // `fs` was checked out from `wc.tree`: a `.veilpolicy` edit is the
         // member's, unless a command wrote it from elsewhere (or wrote the
         // files at all).

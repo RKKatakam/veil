@@ -8,12 +8,24 @@
 //! next snapshot then quarantines it again on top of the new tree.
 //!
 //! Checkout also never writes *through* or *over* something the engine does
-//! not manage: if a path, or any directory above it, is a symlink (or a
-//! socket, device…) in the working copy, the path is left alone and
-//! reported in [`CheckoutReport::blocked`]. An untracked `vendor ->
-//! /shared/vendor` link therefore never receives files from a pulled tree.
-//! (The builder keeps such tracked entries unchanged, so this is not
-//! recorded as a deletion.)
+//! not manage: if a directory above a path is a symlink (or a socket,
+//! device…) in the working copy, the path is left alone and reported in
+//! [`CheckoutReport::blocked`]. An untracked `vendor -> /shared/vendor` link
+//! therefore never receives files from a pulled tree. Every write and
+//! removal also resolves its path without following any symlink (see
+//! `vfs::beneath`), so a directory swapped for a link while checkout runs
+//! cannot redirect it either.
+//!
+//! In repository format 5 symlink entries are materialised as symlinks
+//! ([`StorageBackend::write_link`]; the target is written as it is, never
+//! resolved), and gitlink entries as the empty directory of a submodule.
+//! A symlink at a path is replaced or removed only when it is the version
+//! `from` materialised there (same target); a link checkout did not write
+//! is never replaced or removed (`kept_local`, or `blocked` where a file of
+//! the tree would replace it). A submodule's directory is never removed
+//! unless empty. A conflict with a symlink or gitlink side is materialised
+//! as its shown side, as it is ([`crate::conflict::shown_side`]): never a
+//! file of markers, which would turn a link target into file content.
 //!
 //! Checkout never deletes what it did not write. A directory where the tree
 //! now has a file is only removed once checkout has emptied it; a directory
@@ -279,8 +291,8 @@ impl Materialised {
         for p in self.hidden.clone() {
             match lookup_opt(store, tree, &p)? {
                 Lookup::Unreadable => {}
-                Lookup::Entry(e) if e.kind == EntryKind::File => {
-                    if store.entry_readable(&e) {
+                Lookup::Entry(e) if e.kind.holds_blob() || e.kind == EntryKind::Conflict => {
+                    if store.entry_readable(&e) && (e.kind != EntryKind::Conflict || Form::of(store, &e).entry().is_some_and(|f| f.kind != EntryKind::File && store.entry_readable(f))) {
                         changes.push(TreeChange {
                             path: p,
                             old: None,
@@ -484,7 +496,7 @@ struct SpecialGuard<'a> {
 /// of `fs`? Anything that writes to a working copy outside [`checkout`]
 /// (e.g. `vl restore`) must skip such paths.
 pub fn behind_special(fs: &dyn StorageBackend, path: &VPath) -> Result<bool> {
-    SpecialGuard::new(fs).blocks(path)
+    Ok(SpecialGuard::new(fs).blocks(path)? || fs.metadata(path)?.is_some_and(|m| m.kind == NodeKind::Symlink))
 }
 
 impl<'a> SpecialGuard<'a> {
@@ -549,9 +561,11 @@ impl<'a> SpecialGuard<'a> {
         Ok(None)
     }
 
-    /// Is `path` or any of its ancestors a special entry? Only the topmost
-    /// component that is not a real directory needs checking: below a
-    /// missing directory nothing can exist yet.
+    /// Is `path` a special entry (a socket, device…), or is any of its
+    /// ancestors one, or a symlink? A symlink at `path` itself is the
+    /// caller's to judge (it may be the version checkout wrote). Only the
+    /// topmost component that is not a real directory needs checking:
+    /// below a missing directory nothing can exist yet.
     fn blocks(&mut self, path: &VPath) -> Result<bool> {
         for p in path.ancestors().into_iter().chain(std::iter::once(path.clone())) {
             if self.real_dirs.contains(&p) {
@@ -561,11 +575,60 @@ impl<'a> SpecialGuard<'a> {
                 Some(m) if m.kind == NodeKind::Dir => {
                     self.real_dirs.insert(p);
                 }
+                Some(m) if m.kind == NodeKind::Symlink => return Ok(&p != path),
                 Some(_) => return Ok(false),
                 None => return self.is_special(&p),
             }
         }
         Ok(false)
+    }
+
+    /// Checkout replaced the node at `path` (a directory by a link or the
+    /// reverse): forget what was learnt about it and below it.
+    fn forget(&mut self, path: &VPath) {
+        let prefix = path.child_prefix();
+        self.real_dirs.retain(|d| d != path && !d.as_str().starts_with(&prefix));
+    }
+}
+
+/// What checkout materialises for an entry: a file (or a conflict's file
+/// of markers), a symlink, a submodule's directory, or nothing (a hostile
+/// conflict with no side).
+#[derive(Clone, Debug)]
+enum Form {
+    /// A file entry, or a conflict rendered as a file.
+    File(TreeEntry),
+    Symlink(TreeEntry),
+    Gitlink(TreeEntry),
+    Nothing,
+}
+
+impl Form {
+    /// The form of `e`: a conflict with a symlink or gitlink side is its
+    /// shown side, as it is ([`crate::conflict::shown_side`]).
+    fn of(store: &ObjectStore, e: &TreeEntry) -> Form {
+        let e = match e.kind {
+            EntryKind::Conflict => match store.conflict(&e.id) {
+                Ok(c) if c.has_special_terms() => match crate::conflict::shown_side(&c) {
+                    Some((_, t)) => t.entry(&e.name),
+                    None => return Form::Nothing,
+                },
+                _ => return Form::File(e.clone()),
+            },
+            _ => e.clone(),
+        };
+        match e.kind {
+            EntryKind::Symlink => Form::Symlink(e),
+            EntryKind::Gitlink => Form::Gitlink(e),
+            _ => Form::File(e),
+        }
+    }
+
+    fn entry(&self) -> Option<&TreeEntry> {
+        match self {
+            Form::File(e) | Form::Symlink(e) | Form::Gitlink(e) => Some(e),
+            Form::Nothing => None,
+        }
     }
 }
 
@@ -655,17 +718,36 @@ fn apply_changes(
             report.nested.push((c.path.clone(), repo));
             continue;
         }
-        if fs.metadata(&c.path)?.is_some_and(|m| m.kind == NodeKind::File) {
-            if !holds(store, fs, &c.path, c.old.as_ref(), cache.as_deref())? {
-                report.kept_local.push(c.path.clone());
-                continue;
+        let old = c.old.as_ref().map(|o| Form::of(store, o));
+        match fs.metadata(&c.path)?.map(|m| m.kind) {
+            Some(NodeKind::File | NodeKind::Symlink) => {
+                if !holds(store, fs, &c.path, c.old.as_ref(), cache.as_deref())? {
+                    // A link checkout did not write is never removed.
+                    report.kept_local.push(c.path.clone());
+                    continue;
+                }
+                if let Err(e) = fs.remove_file(&c.path) {
+                    per_file(&mut report, &c.path, e)?;
+                    continue;
+                }
+                forget(&mut cache, &c.path);
+                report.removed += 1;
             }
-            if let Err(e) = fs.remove_file(&c.path) {
-                per_file(&mut report, &c.path, e)?;
-                continue;
+            // A submodule's directory: removed only if empty (never what
+            // `vl submodule update` put there).
+            Some(NodeKind::Dir) if matches!(old, Some(Form::Gitlink(_))) => {
+                if !is_empty_dir(fs, &c.path)? {
+                    report.kept_local.push(c.path.clone());
+                    continue;
+                }
+                if let Err(e) = fs.remove_dir_all(&c.path) {
+                    per_file(&mut report, &c.path, e)?;
+                    continue;
+                }
+                guard.forget(&c.path);
+                report.removed += 1;
             }
-            forget(&mut cache, &c.path);
-            report.removed += 1;
+            _ => {}
         }
         prune_empty_parents(fs, &c.path)?;
     }
@@ -688,32 +770,15 @@ fn apply_changes(
             report.nested.push((c.path.clone(), repo));
             continue;
         }
-        if new.kind.is_special() || special_conflict(store, new) {
-            // Format 5: symlinks and gitlinks are not materialised yet (the
-            // working-copy stream adds them). The path is left out and
-            // reported as failed, which records it as never materialised,
-            // so the builder carries the entry instead of recording a
-            // deletion. The previous version, if checkout wrote it, is
-            // removed, or the next snapshot would revert the link to it.
-            if c.old.is_some() && fs.metadata(&c.path)?.is_some_and(|m| m.kind == NodeKind::File) {
-                if holds(store, fs, &c.path, c.old.as_ref(), cache.as_deref())? {
-                    fs.remove_file(&c.path)?;
-                    forget(&mut cache, &c.path);
-                    report.removed += 1;
-                    prune_empty_parents(fs, &c.path)?;
-                } else {
-                    report.kept_local.push(c.path.clone());
-                }
-            }
-            let kind = if new.kind.is_special() { new.kind } else { EntryKind::Symlink };
-            let why = kind.not_supported_yet(c.path.as_str()).to_string();
-            let why = match new.kind {
-                EntryKind::Conflict => why.replace(" is a symlink entry", " is a conflict with a symlink or gitlink side"),
-                _ => why,
-            };
-            report.failed.push((c.path.clone(), why));
+        let form = Form::of(store, new);
+        if matches!(form, Form::Nothing) {
             continue;
         }
+        if let Form::Symlink(_) | Form::Gitlink(_) = &form {
+            apply_special(store, fs, c, &form, &policy, &mut guard, &mut report, cache.as_deref_mut())?;
+            continue;
+        }
+        let new = form.entry().expect("a form with an entry");
         // A file where the tree has a directory (a quarantined or untracked
         // `cfg` where the tree has `cfg/settings.json`): checkout removed
         // every file `from` put there, so this one is the user's. Keep it.
@@ -722,6 +787,20 @@ fn apply_changes(
             continue;
         }
         let mut current = fs.metadata(&c.path)?;
+        if current.as_ref().is_some_and(|m| m.kind == NodeKind::Symlink) {
+            // A link where the tree has a file: replaced only when it is
+            // the version checkout wrote (the write renames over the link
+            // itself, never through it). A link of the user's stays.
+            if !holds(store, fs, &c.path, c.old.as_ref(), cache.as_deref())? {
+                report.blocked.push(c.path.clone());
+                continue;
+            }
+            if let Err(e) = fs.remove_file(&c.path) {
+                per_file(&mut report, &c.path, e)?;
+                continue;
+            }
+            current = None;
+        }
         if current.as_ref().is_some_and(|m| m.kind == NodeKind::Dir) && new.kind.is_file_like() {
             // A directory where the tree has a file. Everything `from` put
             // in it was removed above (and the directory with it, if that
@@ -732,6 +811,7 @@ fn apply_changes(
                 continue;
             }
             fs.remove_dir_all(&c.path)?;
+            guard.forget(&c.path);
             current = None;
         }
         let local_edit = current.as_ref().is_some_and(|m| m.kind == NodeKind::File)
@@ -800,10 +880,183 @@ fn apply_changes(
     Ok(report)
 }
 
-/// A conflict entry with a symlink or gitlink term (format 5), which is
-/// not materialised yet.
-pub(crate) fn special_conflict(store: &ObjectStore, e: &TreeEntry) -> bool {
-    e.kind == EntryKind::Conflict && store.conflict(&e.id).is_ok_and(|c| c.has_special_terms())
+/// Materialise change `c` whose new version is a symlink or a gitlink
+/// (`form`, format 5): see the module documentation. `None` when nothing
+/// was done (reported).
+#[allow(clippy::too_many_arguments)]
+fn apply_special(
+    store: &ObjectStore,
+    fs: &dyn StorageBackend,
+    c: &TreeChange,
+    form: &Form,
+    policy: &Policy,
+    guard: &mut SpecialGuard<'_>,
+    report: &mut CheckoutReport,
+    mut cache: Option<&mut StatCache>,
+) -> Result<Option<()>> {
+    let path = &c.path;
+    let current = fs.metadata(path)?;
+    let ours = |fs: &dyn StorageBackend| holds(store, fs, path, c.old.as_ref(), None);
+    match form {
+        Form::Symlink(e) => {
+            // A link named like VCS metadata (`.git -> …`) is never written.
+            if policy.classify_link(path).builtin_vcs {
+                return Ok(None);
+            }
+            // Nor is a `.veilpolicy` link (only a hostile tree has one): the
+            // policy would be read from wherever it points (threat 14).
+            if path.as_str() == crate::policy::POLICY_FILE {
+                report.failed.push((path.clone(), "a .veilpolicy symlink is never written; the policy must be a file".into()));
+                return Ok(None);
+            }
+            if let Some(obstacle) = guard.file_in_the_way(path)? {
+                report.obstructed.push((path.clone(), obstacle));
+                return Ok(None);
+            }
+            let target = match read_materialised(store, e) {
+                Ok((t, None)) => t,
+                // A link is never written from an embargo fallback (the
+                // pre-merge version may be a file); left out, as unreadable.
+                Ok((_, Some(_))) => {
+                    remove_ours(store, fs, c, current.as_ref(), report, &mut cache)?;
+                    report.redacted.push(path.clone());
+                    return Ok(None);
+                }
+                Err(err) if err.is_unreadable() => {
+                    // Never leave a readable old version where hidden
+                    // content now lives.
+                    remove_ours(store, fs, c, current.as_ref(), report, &mut cache)?;
+                    report.redacted.push(path.clone());
+                    return Ok(None);
+                }
+                Err(err) => return Err(err),
+            };
+            // A hostile tree's target (a NUL, over PATH_MAX, not UTF-8) is
+            // refused for this path only, never written.
+            if let Err(err) = crate::vfs::check_link_target(&target) {
+                remove_ours(store, fs, c, current.as_ref(), report, &mut cache)?;
+                report.failed.push((path.clone(), err.to_string()));
+                return Ok(None);
+            }
+            if !fs.supports_links() {
+                remove_ours(store, fs, c, current.as_ref(), report, &mut cache)?;
+                report.failed.push((
+                    path.clone(),
+                    format!("this working copy's storage ({}) cannot hold symlinks; the link stays recorded, untouched", fs.kind()),
+                ));
+                return Ok(None);
+            }
+            match current.as_ref().map(|m| m.kind) {
+                None => {}
+                Some(NodeKind::Symlink) => {
+                    if fs.read_link(path).is_ok_and(|t| t == target) {
+                        return Ok(Some(()));
+                    }
+                    if !ours(fs)? {
+                        report.kept_local.push(path.clone());
+                        return Ok(None);
+                    }
+                }
+                Some(NodeKind::File) => {
+                    if !ours(fs)? {
+                        report.kept_local.push(path.clone());
+                        return Ok(None);
+                    }
+                }
+                Some(NodeKind::Dir) => {
+                    // Everything `from` put in it was removed above.
+                    if !is_empty_dir(fs, path)? {
+                        report.obstructed.push((path.clone(), path.clone()));
+                        return Ok(None);
+                    }
+                    fs.remove_dir_all(path)?;
+                    guard.forget(path);
+                }
+            }
+            if let Err(err) = fs.write_link(path, &target) {
+                forget(&mut cache, path);
+                // The backend will not hold this link (a sandbox refusing a
+                // target that leads out of it): nothing is written, and the
+                // path is recorded as never materialised (`failed`), so
+                // recording the working copy carries the link instead of
+                // deleting it.
+                if let VeilError::Policy(why) = err {
+                    if c.old.is_some() && current.as_ref().is_some_and(|m| m.kind != NodeKind::Dir) && ours(fs)? {
+                        let _ = fs.remove_file(path);
+                    }
+                    report.failed.push((path.clone(), why));
+                    return Ok(None);
+                }
+                if c.old.is_some() && current.as_ref().is_some_and(|m| m.kind != NodeKind::Dir) && ours(fs)? {
+                    let _ = fs.remove_file(path);
+                }
+                per_file(report, path, err)?;
+                return Ok(None);
+            }
+            forget(&mut cache, path);
+            guard.forget(path);
+            report.written += 1;
+            Ok(Some(()))
+        }
+        Form::Gitlink(_) => {
+            if policy.classify(path, true).builtin_vcs {
+                return Ok(None);
+            }
+            if let Some(obstacle) = guard.file_in_the_way(path)? {
+                report.obstructed.push((path.clone(), obstacle));
+                return Ok(None);
+            }
+            match current.as_ref().map(|m| m.kind) {
+                // Whatever the user (or `vl submodule update`) put there
+                // stays.
+                Some(NodeKind::Dir) => return Ok(Some(())),
+                Some(NodeKind::File | NodeKind::Symlink) => {
+                    if !ours(fs)? {
+                        report.kept_local.push(path.clone());
+                        return Ok(None);
+                    }
+                    if let Err(err) = fs.remove_file(path) {
+                        per_file(report, path, err)?;
+                        return Ok(None);
+                    }
+                    forget(&mut cache, path);
+                }
+                None => {}
+            }
+            if let Err(err) = fs.create_dir_all(path) {
+                per_file(report, path, err)?;
+                return Ok(None);
+            }
+            report.written += 1;
+            Ok(Some(()))
+        }
+        Form::File(_) | Form::Nothing => Ok(None),
+    }
+}
+
+/// The old version of `c`, if checkout wrote it and it is still there
+/// unchanged, is removed (the new one cannot be written here): the next
+/// snapshot must not take it for an edit reverting the new one.
+fn remove_ours(
+    store: &ObjectStore,
+    fs: &dyn StorageBackend,
+    c: &TreeChange,
+    current: Option<&crate::vfs::Metadata>,
+    report: &mut CheckoutReport,
+    cache: &mut Option<&mut StatCache>,
+) -> Result<()> {
+    if c.old.is_none() || !current.is_some_and(|m| matches!(m.kind, NodeKind::File | NodeKind::Symlink)) {
+        return Ok(());
+    }
+    if holds(store, fs, &c.path, c.old.as_ref(), cache.as_deref())? {
+        fs.remove_file(&c.path)?;
+        forget(cache, &c.path);
+        report.removed += 1;
+        prune_empty_parents(fs, &c.path)?;
+    } else {
+        report.kept_local.push(c.path.clone());
+    }
+    Ok(())
 }
 
 /// A write or removal of `path` failed. A filesystem that refuses this one
@@ -816,6 +1069,17 @@ fn per_file(report: &mut CheckoutReport, path: &VPath, e: VeilError) -> Result<(
     match e {
         VeilError::Io { source, .. } if !whole_filesystem(&source) => {
             report.failed.push((path.clone(), source.to_string()));
+            Ok(())
+        }
+        // The write found a symlink on its way (a directory swapped for
+        // one while checkout ran): nothing was written through it. Or the
+        // path vanished under it (a concurrent removal).
+        VeilError::InvalidPath(why) => {
+            report.failed.push((path.clone(), why));
+            Ok(())
+        }
+        e if e.is_not_found() => {
+            report.failed.push((path.clone(), e.to_string()));
             Ok(())
         }
         e => Err(e),
@@ -853,7 +1117,9 @@ fn read_materialised(store: &ObjectStore, e: &TreeEntry) -> Result<(Vec<u8>, Opt
     }
 }
 
-/// Does the file at `path` hold exactly the content of `entry`?
+/// Does the node at `path` hold exactly what checkout materialises for
+/// `entry`: a file's content, a conflict's rendering, a symlink's target
+/// (`readlink`, never followed)?
 fn holds(
     store: &ObjectStore,
     fs: &dyn StorageBackend,
@@ -861,7 +1127,23 @@ fn holds(
     entry: Option<&TreeEntry>,
     cache: Option<&StatCache>,
 ) -> Result<bool> {
-    let Some(entry) = entry.filter(|e| e.kind.is_file_like()) else {
+    let form = entry.map(|e| Form::of(store, e));
+    let entry = match &form {
+        Some(Form::Symlink(e)) => {
+            if !fs.metadata(path)?.is_some_and(|m| m.kind == NodeKind::Symlink) {
+                return Ok(false);
+            }
+            let Ok(target) = fs.read_link(path) else { return Ok(false) };
+            return match store.read_blob(&e.id) {
+                Ok(want) => Ok(want == target),
+                Err(err) if err.is_unreadable() || err.is_not_found() => Ok(false),
+                Err(err) => Err(err),
+            };
+        }
+        Some(Form::File(e)) => e,
+        _ => return Ok(false),
+    };
+    let Some(entry) = Some(entry).filter(|e| e.kind.is_file_like()) else {
         return Ok(false);
     };
     if entry.kind == EntryKind::Conflict {

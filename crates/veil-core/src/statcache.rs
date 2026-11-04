@@ -352,6 +352,12 @@ impl CacheRun {
         self.new.insert(path.clone(), rec);
     }
 
+    /// Drop what this run learnt about `path` (the builder recorded it
+    /// otherwise than the facts say, e.g. sealed after a move).
+    pub(crate) fn forget(&mut self, path: &VPath) {
+        self.changed |= self.new.remove(path).is_some();
+    }
+
     /// Record facts learned by reading a file that stat'ed as `meta` (stat
     /// taken before the read).
     pub(crate) fn learn(

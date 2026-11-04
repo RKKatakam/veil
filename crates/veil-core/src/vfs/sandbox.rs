@@ -34,7 +34,7 @@ use std::{
 };
 
 use super::{
-    disk::{file_metadata, temp_path},
+    disk::{file_metadata, temp_name},
     DirEntry, DirListing, Metadata, NameFolding, StatClock, StorageBackend,
 };
 use crate::{error::Result, id::ObjectId, object::Object, statcache::StatCache, vpath::VPath};
@@ -97,9 +97,60 @@ pub struct SandboxFs {
     log: Mutex<Option<HashMap<VPath, WrittenFile>>>,
     cloned: AtomicU64,
     cloned_bytes: AtomicU64,
+    /// Absolute symlink targets inside these directories are never
+    /// materialised (see [`SandboxFs::with_forbidden_targets`]).
+    forbidden: Vec<PathBuf>,
 }
 
 impl SandboxFs {
+    /// Never materialise a symlink whose absolute target lies inside one of
+    /// `roots` (the project directory, `$VEIL_HOME`): a command run in the
+    /// sandbox would reach through it what the sandbox promised not to
+    /// give it (the project's isolated `.env`, without `--with-isolated`;
+    /// the identity). Relative targets that climb out of the sandbox are
+    /// refused whatever this says. Symlinks design, threat 7.
+    pub fn with_forbidden_targets(mut self, roots: impl IntoIterator<Item = PathBuf>) -> SandboxFs {
+        for r in roots {
+            if let Ok(c) = fs::canonicalize(&r) {
+                if c != r {
+                    self.forbidden.push(c);
+                }
+            }
+            self.forbidden.push(r);
+        }
+        self
+    }
+
+    /// May a tree's symlink `path -> target` be materialised here? Refused
+    /// (`Policy`, which checkout reports as blocked) when the target,
+    /// resolved lexically against the link's directory, leaves the sandbox
+    /// (`../../.env`), or is absolute and inside a forbidden root.
+    fn guard_link(&self, path: &VPath, target: &[u8]) -> Result<()> {
+        let t = super::check_link_target(target)?;
+        let refuse = |why: String| {
+            crate::error::VeilError::Policy(format!("{path} -> {t}: {why}; the link is not materialised in this sandbox"))
+        };
+        if !t.starts_with('/') {
+            if super::link_escapes(path, t) {
+                return Err(refuse("it leads outside the sandbox".into()));
+            }
+            return Ok(());
+        }
+        let mut abs = PathBuf::from("/");
+        for c in Path::new(t).components() {
+            match c {
+                std::path::Component::ParentDir => {
+                    abs.pop();
+                }
+                std::path::Component::Normal(n) => abs.push(n),
+                _ => {}
+            }
+        }
+        if let Some(root) = self.forbidden.iter().find(|r| abs.starts_with(r)) {
+            return Err(refuse(format!("it points into {}, which the sandbox does not give its commands", root.display())));
+        }
+        Ok(())
+    }
     /// A sandbox rooted at `root`. With `sources`, checkout clones files
     /// from them where it can; with `log_writes`, every write is remembered
     /// for [`SandboxFs::take_written`].
@@ -111,6 +162,7 @@ impl SandboxFs {
             log: Mutex::new(log_writes.then(HashMap::new)),
             cloned: AtomicU64::new(0),
             cloned_bytes: AtomicU64::new(0),
+            forbidden: Vec::new(),
         }
     }
 
@@ -155,9 +207,22 @@ impl SandboxFs {
         if path.is_root() {
             return Ok(false);
         }
-        self.disk.refuse_symlinked_parent(path)?;
-        let dst = self.disk.full_path(path);
-        let parent = dst.parent().expect("non-root path has a parent").to_path_buf();
+        #[cfg(not(unix))]
+        {
+            let _ = candidates;
+            Ok(false)
+        }
+        #[cfg(unix)]
+        self.try_clone_beneath(path, candidates, id)
+    }
+
+    /// [`SandboxFs::try_clone`]: the clone is made in the destination's
+    /// directory, opened without following a symlink (see
+    /// `vfs::beneath`), and renamed into place there.
+    #[cfg(unix)]
+    fn try_clone_beneath(&self, path: &VPath, candidates: &[VPath], id: &ObjectId) -> Result<bool> {
+        let Some(src) = &self.sources else { return Ok(false) };
+        let mut dir: Option<super::beneath::Dir> = None;
         for cand in candidates {
             let Some(meta) = src.fs.metadata(cand)? else { continue };
             let Some(rec) = src.cache.trusted(cand, &meta) else { continue };
@@ -168,11 +233,15 @@ impl SandboxFs {
             if !unchanged(&file, &meta) {
                 continue;
             }
-            if fs::create_dir_all(&parent).is_err() {
-                return Ok(false);
+            if dir.is_none() {
+                match super::beneath::open_parent(self.disk.root(), path, true, false, &mut Vec::new()) {
+                    Ok(d) => dir = Some(d),
+                    Err(_) => return Ok(false),
+                }
             }
-            let tmp = temp_path(&parent, path);
-            match clone_file(&file, &tmp) {
+            let d = dir.as_ref().expect("opened above");
+            let tmp = temp_name(path);
+            match clone_file_at(&file, d, &tmp) {
                 Ok(true) => {}
                 Ok(false) => {
                     self.reflink.store(REFLINK_UNSUPPORTED, Ordering::Relaxed);
@@ -182,8 +251,8 @@ impl SandboxFs {
             }
             // The source changed while it was cloned: the clone may hold
             // anything. Try the next copy, or write the object.
-            if !unchanged(&file, &meta) || fs::rename(&tmp, &dst).is_err() {
-                let _ = fs::remove_file(&tmp);
+            if !unchanged(&file, &meta) || d.rename(&tmp, path.file_name()).is_err() {
+                let _ = d.unlink(&tmp, false);
                 continue;
             }
             self.reflink.store(REFLINK_WORKS, Ordering::Relaxed);
@@ -219,6 +288,24 @@ impl StorageBackend for SandboxFs {
 
     fn read_range(&self, path: &VPath, offset: u64, len: usize) -> Result<Vec<u8>> {
         self.disk.read_range(path, offset, len)
+    }
+
+    fn read_link(&self, path: &VPath) -> Result<Vec<u8>> {
+        self.disk.read_link(path)
+    }
+
+    /// Never through a symlink, like every write (see `vfs::beneath`).
+    fn write_link(&self, path: &VPath, target: &[u8]) -> Result<()> {
+        self.guard_link(path, target)?;
+        self.disk.write_link(path, target)?;
+        self.logged(|log| {
+            log.remove(path);
+        });
+        Ok(())
+    }
+
+    fn supports_links(&self) -> bool {
+        self.disk.supports_links()
     }
 
     /// Atomic (temp file and rename) but not durable: see the module
@@ -393,6 +480,61 @@ pub fn clone_file(src: &fs::File, dst: &Path) -> io::Result<bool> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (src, dst);
+        Ok(false)
+    }
+}
+
+/// [`clone_file`] to the new name `name` of directory `dir`, never through a
+/// symlink.
+#[cfg(unix)]
+fn clone_file_at(src: &fs::File, dir: &super::beneath::Dir, name: &str) -> io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let out = dir.open_file(name, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o600)?;
+        // SAFETY: both descriptors stay open for the duration of the call.
+        let r = unsafe { libc::ioctl(out.as_raw_fd(), libc::FICLONE, src.as_raw_fd()) };
+        if r == 0 {
+            return Ok(true);
+        }
+        let e = io::Error::last_os_error();
+        drop(out);
+        let _ = dir.unlink(name, false);
+        if cannot_clone(&e) {
+            Ok(false)
+        } else {
+            Err(e)
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::{fs::PermissionsExt, io::AsRawFd};
+        const CLONE_NOFOLLOW: u32 = 0x0001;
+        const CLONE_NOOWNERCOPY: u32 = 0x0002;
+        let c = std::ffi::CString::new(name).map_err(io::Error::other)?;
+        // SAFETY: `src` and `dir` are open and `c` is a NUL-terminated name
+        // for the duration of the call.
+        let r = unsafe { libc::fclonefileat(src.as_raw_fd(), dir.raw(), c.as_ptr(), CLONE_NOFOLLOW | CLONE_NOOWNERCOPY) };
+        if r == 0 {
+            let res = dir
+                .open_file(name, libc::O_RDONLY, 0)
+                .and_then(|f| f.set_permissions(fs::Permissions::from_mode(0o600)));
+            if let Err(e) = res {
+                let _ = dir.unlink(name, false);
+                return Err(e);
+            }
+            return Ok(true);
+        }
+        let e = io::Error::last_os_error();
+        if cannot_clone(&e) {
+            Ok(false)
+        } else {
+            Err(e)
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (src, dir, name);
         Ok(false)
     }
 }

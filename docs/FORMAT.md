@@ -266,12 +266,13 @@ flags    = bit 0 PRESENT (set) · bit 1 EXECUTABLE · bit 2 SIZE ·
   sealing treat their object as a file's (sealed, withheld, listed,
   published by the same rules). fsck warns about a readable target or
   pointer that breaks the rules above.
-* Until the working-copy and Git-bridge streams implement them, checkout
-  leaves them out (`CheckoutReport::failed`, "cannot check out or record
-  yet", removing a file version it had written), the builder carries them
-  unchanged, tree views and mounts do not serve them, `vl cat` refuses
-  them, and the Git export refuses a public one (a sealed one is omitted
-  like a sealed file).
+* The builder records a working copy's symlinks as symlink entries
+  (their targets, read with `readlinkat`, never followed) and carries
+  gitlinks; checkout writes symlinks as symlinks and gitlinks as empty
+  directories (see ARCHITECTURE §4). A conflict with a symlink or gitlink
+  term is materialised as one side, as it is, never as markers. Until the
+  Git-bridge stream implements them, the Git export refuses a public one
+  (a sealed one is omitted like a sealed file).
 
 ### 3.8 Annotated tags (`veil:atag`, format 5)
 

@@ -289,7 +289,8 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>) -> Result<ExitCode> 
         &paths.files,
         Some(CloneSources::new((*ctx.fs).clone(), ctx.stat_cache().clone())),
         true,
-    );
+    )
+    .with_forbidden_targets([ctx.root.clone(), crate::ctx::veil_home()]);
     // The output of an earlier run that was never recorded (`vl` was
     // killed, or recording it failed) is recorded first, as it is.
     let recovered = m.pending.is_some();
@@ -946,13 +947,18 @@ fn exec_ephemeral(ctx: &mut Ctx, a: &Exec<'_>) -> Result<ExitCode> {
     let set = sparse_set(ctx, a.only, &tree, &safe(a.rev))?;
     let sb = Sandbox::create("ephemeral")?;
     let dir = sb.path().to_path_buf();
-    let sandbox = SandboxFs::new(&dir, None, false);
+    let sandbox = SandboxFs::new(&dir, None, false).with_forbidden_targets([ctx.root.clone(), crate::ctx::veil_home()]);
     let result = (|| -> Result<i32> {
         let to = match &set {
             Some(s) => restrict_tree(ctx.repo.store(), &tree, s)?,
             None => tree,
         };
-        ctx.repo.checkout_tree(&sandbox, None, &to)?;
+        // What could not be materialised (a link the sandbox refuses, a
+        // file it cannot hold) is recorded as such, so recording the run
+        // carries it instead of deleting it.
+        let mut record = veil_core::checkout::Materialised::default();
+        let checked_out = ctx.repo.checkout_tree_recorded(&sandbox, None, &to, &mut record, None)?;
+        crate::ctx::print_failed(&checked_out.failed);
         let mut injected = None;
         if a.with_isolated {
             let files = vault_files(&ctx.repo)?;
@@ -977,7 +983,7 @@ fn exec_ephemeral(ctx: &mut Ctx, a: &Exec<'_>) -> Result<ExitCode> {
         };
         let (id, report) = ctx
             .repo
-            .commit_fs_as_child_with(base_snapshot, recorded_fs, a.message, injected.as_ref(), None, &[], true)?;
+            .commit_fs_as_child_with(base_snapshot, recorded_fs, a.message, injected.as_ref(), Some(&record), &[], true)?;
         if let Some(why) = &pin.why {
             warn(&format!(
                 "{POLICY_FILE} {why} in the sandbox: the recorded policy is kept (in a sandbox, only a regular, readable \

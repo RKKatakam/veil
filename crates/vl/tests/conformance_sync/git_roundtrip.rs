@@ -583,8 +583,8 @@ fn nfc_and_nfd_names_round_trip_byte_for_byte() {
     );
 }
 
-// Scenario from git t9300-fast-import.sh: a symlink in Git (pending feature in Veil) is
-// reported, stays in Git, and is not deleted by the next Veil push.
+// Scenario from git t9300-fast-import.sh: a symlink in Git is imported as a Veil symlink
+// (format 5), checked out as a link, and kept as a link by the next Veil push.
 #[test]
 fn a_git_symlink_is_reported_and_survives_a_veil_push() {
     let env = Env::new();
@@ -592,7 +592,9 @@ fn a_git_symlink_is_reported_and_survives_a_veil_push() {
     std::os::unix::fs::symlink("target.txt", wc.join("link")).unwrap();
     git_commit_push(&wc, "a symlink");
     let proj = import(&env, "alice", "proj", &bare);
-    assert!(!proj.join("link").exists());
+    let meta = std::fs::symlink_metadata(proj.join("link")).unwrap();
+    assert!(meta.file_type().is_symlink(), "the Git symlink is checked out as a link");
+    assert_eq!(std::fs::read_link(proj.join("link")).unwrap(), std::path::Path::new("target.txt"));
     env.ok("alice", &proj, &["new", "main"]);
     env.commit("alice", &proj, "veil edit", &[("target.txt", "t2\n")]);
     env.ok("alice", &proj, &["git", "push"]);
