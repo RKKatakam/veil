@@ -878,6 +878,13 @@ impl Builder<'_> {
             let path = f.dir.join(&child.name);
             let parent_entry = f.parent.as_ref().and_then(|(t, _)| t.get(&child.name)).cloned();
             match child.kind {
+                // A submodule (format 5): nothing below a gitlink is ever
+                // recorded, whatever is checked out there (its own
+                // repository decides where that is published); the pin
+                // changes only with `vl submodule set` or a Git import.
+                NodeKind::Dir if parent_entry.as_ref().is_some_and(|e| e.kind == EntryKind::Gitlink) => {
+                    f.out.insert(parent_entry.expect("checked"));
+                }
                 NodeKind::Dir => {
                     let class = self.opts.policy.classify(&path, true);
                     let pdir = parent_entry.filter(|e| e.kind == EntryKind::Dir);

@@ -3,7 +3,7 @@
 
 # `vl submodule`
 
-Git submodules: pinned commits of other Git repositories (not implemented yet)
+Git submodules: pinned commits of other Git repositories, fetched with `git` only when you run `vl submodule update`
 
 Subcommands:
 
@@ -75,6 +75,13 @@ Arguments:
 |---|---|
 | `<URL>` | URL of the submodule's repository (written to `.gitmodules`) (required) |
 | `<PATH>` | Where the submodule lives (default: the URL's last component) |
+
+Options:
+
+| | |
+|---|---|
+| `--name <NAME>` | The submodule's name in `.gitmodules` (default: its path) |
+| `--allow-local` | Allow a URL that is a local path or `file://` |
 
 ---
 

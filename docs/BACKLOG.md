@@ -32,10 +32,10 @@ fixed**. Severity: high / medium / low.
   a delete plus an add, and merges are not rename-aware).
 - **Repository attributes:** line-ending normalisation (CRLF), per-path diff
   and merge drivers, binary handling (`.gitattributes` equivalents).
-- **Symlinks** are ignored; non-UTF-8 names are not recorded; submodules are
-  not supported.
-- **Hooks** (pre-commit / pre-push) and signed tags and releases.
-- **Git bridge gaps:** tags are not synced; author time zones become UTC.
+- **Symlinks** are ignored; non-UTF-8 names are not recorded.
+- **Hooks** (pre-commit / pre-push).
+- **Git bridge gaps:** author time zones become UTC; Veil does not sign Git
+  tags (GitHub shows release tags unverified).
 - **Windows** support.
 - **Maturity:** days of history versus Git's two decades; unaudited; no
   community, tutorials or Stack Overflow answers yet.
@@ -97,8 +97,7 @@ fixed**. Severity: high / medium / low.
   upgrade stays under the pre-standard construction (`docs/CRYPTO.md` §5).
 - **The policy pin does not forget an accepted weakening** when a teammate
   later reverts it (only dropped `public!` rules are forgotten).
-- **Git tags are not synced** by the Git bridge (branches only); author time
-  zones are exported as UTC.
+- **Author time zones** are exported to Git as UTC.
 - **Git maps from before the BUG-063 fix** carry no embargo "veil" for
   imported commits; delete `.veil/git/map` once to rebuild it.
 - **SFTP lease renewals can stall on slow uplinks** (below roughly 4 Mbit/s,

@@ -11,9 +11,9 @@ Subcommands:
 
 * [`vl git import`](#vl-git-import): Import a Git repository's history (path or URL): adds it as a Git remote and creates a tag for every branch
 * [`vl git remote`](#vl-git-remote): Manage Git remotes
-* [`vl git fetch`](#vl-git-fetch): Fetch a Git remote's branches as `<remote>/<branch>` (local tags stay)
-* [`vl git pull`](#vl-git-pull): Fetch, then create or fast-forward local tags from the branches
-* [`vl git push`](#vl-git-push): Export tags (all by default) as branches and push them
+* [`vl git fetch`](#vl-git-fetch): Fetch a Git remote's branches as `<remote>/<branch>` and its Git tags as `tag:<remote>/<tag>` (local tags stay)
+* [`vl git pull`](#vl-git-pull): Fetch, then create or fast-forward local tags from the branches, and create a local release tag for each new Git tag (an existing one never moves)
+* [`vl git push`](#vl-git-push): Export tags (all by default) and push them: plain tags as branches, annotated release tags as Git tags (never forced)
 * [`vl git export`](#vl-git-export): Export tags into the local bridge repository without pushing, and print the commit of each
 * [`vl git colocate`](#vl-git-colocate): Keep a real `.git` beside this working copy, in step with Veil (experimental; not implemented yet)
 * [`vl git uncolocate`](#vl-git-uncolocate): Stop mirroring into `.git`, leaving it a plain Git repository (not implemented yet)
@@ -88,7 +88,7 @@ Arguments:
 
 ## `vl git fetch`
 
-Fetch a Git remote's branches as `<remote>/<branch>` (local tags stay)
+Fetch a Git remote's branches as `<remote>/<branch>` and its Git tags as `tag:<remote>/<tag>` (local tags stay)
 
 ```text
 vl git fetch [OPTIONS] [REMOTE]
@@ -104,12 +104,12 @@ Options:
 
 | | |
 |---|---|
-| `--no-tags` | Do not fetch the remote's Git tags (not implemented yet) |
-| `--prune-tags` | Forget remote Git tags that the remote deleted (not implemented yet) |
+| `--no-tags` | Do not fetch the remote's Git tags |
+| `--prune-tags` | Forget remote Git tags (`<remote>/<tag>`) that the remote deleted. Local release tags are never deleted |
 
 ## `vl git pull`
 
-Fetch, then create or fast-forward local tags from the branches
+Fetch, then create or fast-forward local tags from the branches, and create a local release tag for each new Git tag (an existing one never moves)
 
 ```text
 vl git pull [OPTIONS] [REMOTE]
@@ -125,12 +125,12 @@ Options:
 
 | | |
 |---|---|
-| `--no-tags` | Do not fetch the remote's Git tags (not implemented yet) |
-| `--prune-tags` | Forget remote Git tags that the remote deleted (not implemented yet) |
+| `--no-tags` | Do not fetch the remote's Git tags |
+| `--prune-tags` | Forget remote Git tags (`<remote>/<tag>`) that the remote deleted. Local release tags are never deleted |
 
 ## `vl git push`
 
-Export tags (all by default) as branches and push them
+Export tags (all by default) and push them: plain tags as branches, annotated release tags as Git tags (never forced)
 
 ```text
 vl git push [OPTIONS] [REMOTE]
@@ -149,8 +149,8 @@ Options:
 | `-t, --tag <TAG>` | Only push these tags |
 | `--force` | Overwrite branches that moved on the Git side (only if they still hold what was last fetched) |
 | `-d, --delete <BRANCH>` | Delete this branch on the Git remote (repeatable). Delete its tag here first with `vl tag delete`. Refused if the branch moved since the last fetch (unless --force). With no --tag, nothing else is pushed |
-| `--force-tags` | Replace Git tags that exist on the remote with another target (not implemented yet) |
-| `--delete-tag <TAG>` | Delete this Git tag (`refs/tags/TAG`) on the remote (repeatable; not implemented yet) |
+| `--force-tags` | Replace Git tags that exist on the remote with another target (only if they still hold what was last fetched) |
+| `--delete-tag <TAG>` | Delete this Git tag (`refs/tags/TAG`) on the remote (repeatable). Delete the release tag here first with `vl tag delete`. With no --tag, nothing else is pushed |
 | `--no-verify` | Do not run hooks for this command (not implemented yet) |
 
 ## `vl git export`

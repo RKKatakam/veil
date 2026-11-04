@@ -381,7 +381,11 @@ impl<'r> Transaction<'r> {
         let heads: Vec<ObjectId> = self.view.heads.iter().copied().collect();
         self.view.heads = heads.into_iter().flat_map(|h| self.resolve(h).0).collect();
         let root = self.repo.root_id;
-        let tags: Vec<(String, ObjectId)> = self.view.tags.iter().map(|(n, t)| (n.clone(), t.target)).collect();
+        // A release tag (annotated, format 5) is immutable: it stays on the
+        // snapshot it was made for, which it keeps visible, and its signed
+        // annotation keeps matching it.
+        let tags: Vec<(String, ObjectId)> =
+            self.view.tags.iter().filter(|(_, t)| t.annotation.is_none()).map(|(n, t)| (n.clone(), t.target)).collect();
         for (name, target) in tags {
             if self.rewritten.contains_key(&target) {
                 let r = self.resolve(target).0;

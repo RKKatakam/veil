@@ -67,6 +67,12 @@ be undone. Add to that per-file encryption and engine-level secret handling.
 | `git push` | `vl push` / `vl git push` |
 | `git push --force` | `vl push --force` / `vl git push --force` |
 | `git tag v1.0` | `vl tag set v1.0 -r REV` (a Veil tag; exported to Git as a **branch**) |
+| `git tag -a v1.0 -m MSG` | `vl tag set v1.0 -r REV -a -m MSG` (a signed, immutable **release tag**; a Git tag on `vl git push`) |
+| `git tag -v v1.0` | `vl tag verify v1.0` |
+| `git push --tags` | `vl git push` (release tags the remote lacks are pushed; never forced: `--force-tags`) |
+| `git push origin :refs/tags/v1.0` | `vl tag delete v1.0`, then `vl git push --delete-tag v1.0` |
+| `git submodule update --init` | `vl submodule update` |
+| `git submodule add URL PATH` | `vl submodule add URL PATH` |
 | `.gitignore` entry | `vl ignore PATTERN` |
 | `git rm --cached PATH` | `vl ignore PATH` (the file stays on disk, the next snapshot drops it) |
 | `git mv A B` | `mv A B` |

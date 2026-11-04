@@ -485,12 +485,22 @@ pub fn workspace_list(w: &WorkspaceList) {
 }
 
 pub fn tag_list(t: &TagList) {
+    let release = |a: &Option<crate::api::AnnotationItem>| match a {
+        None => String::new(),
+        Some(a) if a.verified => green(" [release, signed]"),
+        Some(a) if a.kind == "lightweight-git" => yellow(" [release, from Git]"),
+        Some(_) => yellow(" [release]"),
+    };
     for tag in &t.tags {
         let cloak = tag.cloak.as_ref().map(|c| magenta(&format!(" [cloaked:{}]", safe(c)))).unwrap_or_default();
-        println!("{}{cloak}: {}", cyan(&safe(&tag.name)), one_line(&tag.target));
+        println!("{}{}{cloak}: {}", cyan(&safe(&tag.name)), release(&tag.annotation), one_line(&tag.target));
     }
     for tag in &t.remote_tags {
         println!("{}: {}", dim(&safe(&tag.name)), one_line(&tag.target));
+    }
+    for tag in &t.remote_release_tags {
+        let target = tag.target.as_ref().map(one_line).unwrap_or_else(|| dim("(unreadable)"));
+        println!("{}{}: {}", dim(&format!("tag:{}", safe(&tag.name))), release(&tag.annotation), target);
     }
 }
 

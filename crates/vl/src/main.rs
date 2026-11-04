@@ -973,8 +973,12 @@ fn print_tags_kept(repo: &Repo, r: &CommitResult) {
             dim("hint:")
         );
     }
+    let (release, plain): (Vec<_>, Vec<_>) = plain.into_iter().partition(|(_, why)| matches!(why, TagKept::Release));
     if !plain.is_empty() {
         eprintln!("{} {} not moved (--no-advance)", dim("note:"), names(&plain));
+    }
+    if !release.is_empty() {
+        eprintln!("{} {} not moved (annotated release tags are immutable)", dim("note:"), names(&release));
     }
 }
 
@@ -1434,14 +1438,65 @@ fn cmd_tag(ctx: &mut Ctx, c: &TagCmd) -> Result<()> {
             message,
             force,
         } => {
-            if *annotate || message.is_some() || *force {
-                bail!("annotated tags (`vl tag set -a`, `-m`, `--force`) are not implemented yet");
-            }
             let id = ctx.rev(rev)?;
-            ctx.repo.set_tag(name, id, cloak.clone(), *allow_backwards)?;
-            println!("Tag {} → {}", cyan(name), one_line(&ctx.repo, &id));
+            let spec = veil_core::commands::TagSpec {
+                cloak: cloak.clone(),
+                allow_backwards: *allow_backwards,
+                annotate: (*annotate || message.is_some()).then(|| message.clone().unwrap_or_default()),
+                force: *force,
+            };
+            let out = ctx.repo.set_tag_with(name, id, &spec)?;
+            match out.annotation {
+                Some(_) if out.unchanged => println!("Release tag {} already → {}", cyan(name), one_line(&ctx.repo, &id)),
+                Some(_) => println!(
+                    "Release tag {} → {} ({})",
+                    cyan(name),
+                    one_line(&ctx.repo, &id),
+                    if out.signed { "signed" } else { "unsigned: no identity" }
+                ),
+                None => println!("Tag {} → {}", cyan(name), one_line(&ctx.repo, &id)),
+            }
+            if out.replaced.is_some() {
+                eprintln!(
+                    "{} replaced release tag {name}; a Git remote that has it keeps its copy until `vl git push --force-tags`",
+                    dim("note:")
+                );
+            }
         }
-        TagCmd::Verify { .. } => bail!("`vl tag verify` is not implemented yet"),
+        TagCmd::Verify { name } => {
+            let Some(c) = ctx.repo.tag_annotation(name)? else {
+                bail!("tag '{name}' is a plain tag, not an annotated release tag: there is nothing to verify");
+            };
+            let target = ctx.repo.view().tags[name.as_str()].target;
+            println!("{} {} → {}", bold("tag"), cyan(&safe(name)), one_line(&ctx.repo, &target));
+            let kind = match c.atag.kind {
+                veil_core::tag_object::AtagKind::Annotated => "annotated",
+                veil_core::tag_object::AtagKind::LightweightGit => "lightweight Git tag",
+            };
+            println!("{}   {kind}", dim("kind:"));
+            if !c.atag.tagger.is_empty() {
+                println!("{} {} {}", dim("tagger:"), safe(&c.atag.tagger), dim(&fmt_time(c.atag.timestamp)));
+            }
+            match &c.message {
+                Some(m) if !m.is_empty() => {
+                    for l in m.lines() {
+                        println!("    {}", safe(l));
+                    }
+                }
+                Some(_) => {}
+                None => println!("    {}", dim("(message sealed)")),
+            }
+            match (&c.signer, c.verified) {
+                (Some(who), true) => println!("{} good signature by {}", green("verified:"), safe(who)),
+                _ => {
+                    let why = match c.verification {
+                        veil_core::tag_object::AtagVerification::Signed { .. } => "signed by a key no ring of this repository knows".to_string(),
+                        ref v => v.describe(),
+                    };
+                    bail!("tag '{name}' is not verified: {why}");
+                }
+            }
+        }
         TagCmd::Delete { name } => {
             ctx.repo.delete_tag(name)?;
             println!("Deleted tag {name}");
@@ -2540,14 +2595,13 @@ fn cmd_git(ctx: &mut Ctx, c: &GitCmd) -> Result<ExitCode> {
             git::remote_remove(&mut ctx.repo, &git_dir, name)?;
             println!("Removed Git remote {name}");
         }
-        GitCmd::Fetch { remote, no_tags, prune_tags } => {
-            require_no_git_tag_flags(*no_tags, *prune_tags)?;
-            let r = git::fetch(&mut ctx.repo, &git_dir, remote)?;
-            print_git_fetch(&r, remote);
-        }
-        GitCmd::Pull { remote, no_tags, prune_tags } => {
-            require_no_git_tag_flags(*no_tags, *prune_tags)?;
-            let r = git::pull(&mut ctx.repo, &git_dir, remote)?;
+        GitCmd::Fetch { remote, no_tags, prune_tags } | GitCmd::Pull { remote, no_tags, prune_tags } => {
+            let opts = git::FetchOptions {
+                pull: matches!(c, GitCmd::Pull { .. }),
+                no_tags: *no_tags,
+                prune_tags: *prune_tags,
+            };
+            let r = git::fetch_with(&mut ctx.repo, &git_dir, remote, &opts)?;
             print_git_fetch(&r, remote);
         }
         GitCmd::Push {
@@ -2559,11 +2613,15 @@ fn cmd_git(ctx: &mut Ctx, c: &GitCmd) -> Result<ExitCode> {
             delete_tag,
             hooks,
         } => {
-            if *force_tags || !delete_tag.is_empty() {
-                bail!("Git tags (`--force-tags`, `--delete-tag`) are not implemented yet");
-            }
             hooks::require_no_verify_unset(hooks)?;
-            let r = git::push_with_deletions(&mut ctx.repo, &git_dir, remote, tag, *force, delete)?;
+            let opts = git::PushOptions {
+                only_tags: tag.clone(),
+                force: *force,
+                delete: delete.clone(),
+                force_tags: *force_tags,
+                delete_tags: delete_tag.clone(),
+            };
+            let r = git::push_with(&mut ctx.repo, &git_dir, remote, &opts)?;
             print_git_export(&r.export);
             let withheld: Vec<String> = r
                 .export
@@ -2594,6 +2652,35 @@ fn cmd_git(ctx: &mut Ctx, c: &GitCmd) -> Result<ExitCode> {
                     }
                 }
             }
+            let mut tags_rejected = Vec::new();
+            for (name, status) in &r.outcome.tags {
+                let t = cyan(&format!("tag {}", safe(name)));
+                let commit = r
+                    .export
+                    .tags
+                    .iter()
+                    .find(|x| &x.name == name)
+                    .map(|x| x.commit.to_hex_with_len(10).to_string())
+                    .unwrap_or_default();
+                match status {
+                    git::RefStatus::Created => println!("  {} {t} → {commit} (new tag)", green("pushed")),
+                    git::RefStatus::FastForward | git::RefStatus::Forced => println!("  {} {t} → {commit} (replaced)", yellow("pushed")),
+                    git::RefStatus::UpToDate => println!("  {} {t}", dim("up to date")),
+                    git::RefStatus::Deleted => println!("  {} {t}", red("deleted")),
+                    git::RefStatus::Rejected(why) => {
+                        tags_rejected.push(name.clone());
+                        println!("  {} {t} ({})", red("rejected"), safe(why));
+                    }
+                }
+            }
+            if !tags_rejected.is_empty() && rejected.is_empty() {
+                eprintln!(
+                    "{} Git tags are immutable: {remote} keeps its {}. Check why it differs (`vl git fetch {remote}`), then replace it with `vl git push {remote} --force-tags` only if yours is right",
+                    yellow("note:"),
+                    tags_rejected.iter().map(|t| safe(t).into_owned()).collect::<Vec<_>>().join(", ")
+                );
+                rejected.extend(tags_rejected);
+            }
             let first = rejected.first().map(|t| safe(t).into_owned()).unwrap_or_default();
             return Ok(push_status(
                 &rejected,
@@ -2613,18 +2700,12 @@ fn cmd_git(ctx: &mut Ctx, c: &GitCmd) -> Result<ExitCode> {
             for (b, c) in &r.branches {
                 println!("{}  {c}", cyan(&safe(b)));
             }
+            for t in &r.tags {
+                println!("{}  {}", cyan(&format!("tag {}", safe(&t.name))), t.git);
+            }
         }
     }
     Ok(ExitCode::SUCCESS)
-}
-
-/// `vl git fetch` / `pull` run as before without `--no-tags` and
-/// `--prune-tags`; they are refused until stream G implements Git tags.
-fn require_no_git_tag_flags(no_tags: bool, prune_tags: bool) -> Result<()> {
-    if no_tags || prune_tags {
-        bail!("Git tags (`--no-tags`, `--prune-tags`) are not implemented yet");
-    }
-    Ok(())
 }
 
 fn print_git_export(r: &veil_core::git::ExportReport) {
@@ -2669,6 +2750,35 @@ fn print_git_fetch(r: &veil_core::git::FetchReport, remote: &str) {
     }
     for (t, id) in &r.tags_updated {
         println!("  {} {} → {}", green("updated"), cyan(&safe(t)), id.short());
+    }
+    for (t, from, to) in &r.tags_moved {
+        warn_untrusted(&format!(
+            "{remote} moved Git tag {t} from {} to {}: Git tags should never move (was it rewritten, or is the remote compromised?). Your release tag {t}, if any, stays where it is; inspect it with `vl show tag:{remote}/{t}`",
+            from.short(),
+            to.short()
+        ));
+    }
+    for (t, id) in &r.release_tags_created {
+        println!("  {} {} → {}", green("new release tag"), cyan(&safe(t)), id.short());
+    }
+    for (t, local, theirs) in &r.release_tags_kept {
+        warn_untrusted(&format!(
+            "release tag {t} stays at {}; {remote} has it at {} (release tags never move; compare with `vl diff --from {t} --to tag:{remote}/{t}`)",
+            local.short(),
+            theirs.short()
+        ));
+    }
+    for (t, why) in &r.tags_skipped {
+        println!("  {} Git tag {} ({})", yellow("skipped"), safe(t), safe(why));
+    }
+    for t in &r.tags_deleted {
+        println!("  {} Git tag {} was deleted on {remote} (kept as {remote}/{t}; `--prune-tags` forgets it)", dim("note:"), safe(t));
+    }
+    for t in &r.tags_pruned {
+        println!("  {} {remote}/{}", dim("forgot Git tag"), safe(t));
+    }
+    if !r.release_tags.is_empty() {
+        println!("Recorded {} Git tag(s) from {remote}", r.release_tags.len());
     }
     for w in r.import.warnings.iter().chain(&r.warnings) {
         warn_untrusted(w);

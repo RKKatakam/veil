@@ -18,10 +18,52 @@ use crate::{
     repo::Repo,
     selection::{self, Selection, Unit},
     store::ObjectStore,
+    tag_object::{Atag, AtagVerification},
     transaction::{dedup_parents, Transaction},
     tree::{lookup, TreeView},
     vpath::VPath,
 };
+
+/// How [`Repo::set_tag_with`] sets a tag (`vl tag set`).
+#[derive(Debug, Clone, Default)]
+pub struct TagSpec {
+    /// Cloak the tag under this scope (kept from the existing tag if unset).
+    pub cloak: Option<String>,
+    /// Allow moving a plain tag to a snapshot that is not a descendant.
+    pub allow_backwards: bool,
+    /// Make an annotated release tag with this message (`-a`, `-m`).
+    pub annotate: Option<String>,
+    /// Replace an existing release tag, or turn a plain tag into one.
+    pub force: bool,
+}
+
+/// What [`Repo::set_tag_with`] did.
+#[derive(Debug, Clone, Default)]
+pub struct SetTagOutcome {
+    /// The tag's atag, for a release tag.
+    pub annotation: Option<ObjectId>,
+    /// The atag a `--force` replaced.
+    pub replaced: Option<ObjectId>,
+    /// The new atag is signed with this repository's identity.
+    pub signed: bool,
+    /// Nothing changed: the release tag already points there.
+    pub unchanged: bool,
+}
+
+/// A release tag's annotation as [`Repo::tag_annotation`] reads it.
+#[derive(Debug, Clone)]
+pub struct TagCheck {
+    pub id: ObjectId,
+    pub atag: Atag,
+    pub verification: AtagVerification,
+    /// The ring's name for the signer, when the signing key is a known
+    /// member's (or this identity's).
+    pub signer: Option<String>,
+    /// A valid Veil signature by a known key.
+    pub verified: bool,
+    /// The message, `None` if sealed for a scope you are not in.
+    pub message: Option<String>,
+}
 
 /// Description prefix of the operation that releases an embargo.
 pub const RELEASE_OP_PREFIX: &str = "release embargo ";
@@ -70,11 +112,17 @@ pub enum TagKept {
     CloakedLine(String),
     /// The caller asked for no tag to move (`vl commit --no-advance`).
     NoAdvance,
+    /// An annotated release tag: immutable (`vl tag set --force` moves it).
+    Release,
 }
 
 /// Which tags a commit moves (see [`Repo::commit`]): `None` if `tag` may
 /// advance, else why it stays.
 fn tag_kept(tag: &Tag, line_cloak: Option<&str>, advance: bool) -> Option<TagKept> {
+    if tag.annotation.is_some() {
+        // A release tag is immutable: commits never move it.
+        return Some(TagKept::Release);
+    }
     if !advance {
         return Some(TagKept::NoAdvance);
     }
@@ -824,7 +872,8 @@ impl Repo {
         };
         let m = tx.write_snapshot(&snap)?;
         for tag in tx.view.tags.values_mut() {
-            if tag.target == into {
+            // Release tags are immutable: a merge never moves one.
+            if tag.target == into && tag.annotation.is_none() {
                 tag.target = m;
             }
         }
@@ -873,8 +922,36 @@ impl Repo {
         Ok(true)
     }
 
+    /// Create or move a plain (branch-like) tag. See [`Repo::set_tag_with`].
     pub fn set_tag(&mut self, name: &str, target: ObjectId, cloak: Option<String>, allow_backwards: bool) -> Result<()> {
+        self.set_tag_with(
+            name,
+            target,
+            &TagSpec {
+                cloak,
+                allow_backwards,
+                ..TagSpec::default()
+            },
+        )
+        .map(|_| ())
+    }
+
+    /// Create or move tag `name` (`vl tag set`).
+    ///
+    /// An annotated tag (`spec.annotate`, repository format 5) is a
+    /// **release tag**: it names a `veil:atag` object holding the message,
+    /// the tagger, the time and (when this repository has an identity) an
+    /// Ed25519 signature over all of it, name and target included. A
+    /// release tag is immutable: setting it again is refused unless
+    /// `spec.force`, which writes a new atag (moving it anywhere, like `git
+    /// tag -f`). The annotation is never dropped silently: forcing without
+    /// a message keeps the old one, and turning a release tag back into a
+    /// plain tag takes `vl tag delete` first. Commits and merges never
+    /// advance a release tag. A cloaked tag's message is sealed under its
+    /// scope.
+    pub fn set_tag_with(&mut self, name: &str, target: ObjectId, spec: &TagSpec) -> Result<SetTagOutcome> {
         validate_tag_name(name)?;
+        let cloak = spec.cloak.clone();
         // A cloaked tag names a scope you can use, as `vl ws new --cloak`
         // and `vl cloak --scope` require: a typo or a reserved name would
         // leave a tag no cloaked line ever advances (BUG-210).
@@ -893,18 +970,136 @@ impl Repo {
             }
             Err(e) => return Err(e),
         }
-        if let Some(t) = self.view.tags.get(name) {
-            if !allow_backwards && !self.is_ancestor(&t.target, &target)? {
+        let existing = self.view.tags.get(name).cloned();
+        if spec.annotate.is_some() && self.format() < crate::object::GIT_PARITY_REPO_FORMAT {
+            return Err(VeilError::Unsupported(format!(
+                "annotated tags need repository format {}; this one is at format {}: upgrade it with `vl upgrade`",
+                crate::object::GIT_PARITY_REPO_FORMAT,
+                self.format()
+            )));
+        }
+        let mut old_annotation = None;
+        if let Some(t) = &existing {
+            match t.annotation {
+                Some(a) => {
+                    let unchanged = t.target == target
+                        && spec.annotate.is_none()
+                        && spec.cloak.as_ref().is_none_or(|c| t.cloak.as_ref() == Some(c));
+                    if unchanged && !spec.force {
+                        return Ok(SetTagOutcome {
+                            annotation: Some(a),
+                            unchanged: true,
+                            ..SetTagOutcome::default()
+                        });
+                    }
+                    if !spec.force {
+                        return Err(VeilError::repo(format!(
+                            "tag '{name}' is an annotated release tag, and release tags are immutable; replace it with                              `vl tag set {name} --force` (a Git remote that has it keeps its copy unless you push with                              `--force-tags`), or delete it first with `vl tag delete {name}`"
+                        )));
+                    }
+                    old_annotation = Some(a);
+                }
+                None if spec.annotate.is_some() && !spec.force => {
+                    return Err(VeilError::repo(format!(
+                        "tag '{name}' already exists as a plain tag (a branch in Git); make it an annotated release tag                          with --force, or pick another name"
+                    )));
+                }
+                None => {}
+            }
+            if !spec.allow_backwards && !spec.force && !self.is_ancestor(&t.target, &target)? {
                 return Err(VeilError::repo(format!(
                     "moving tag '{name}' would go backwards or sideways (use --allow-backwards)"
                 )));
             }
         }
+        let cloak = cloak.or_else(|| existing.as_ref().and_then(|t| t.cloak.clone()));
+        // The annotation: a new message, or (forcing a release tag without
+        // one) the old message, never dropped.
+        let message = match (&spec.annotate, old_annotation) {
+            (Some(m), _) => Some(m.clone()),
+            (None, Some(a)) => {
+                let old = self.store().atag(&a)?;
+                Some(self.store().read_text(&old.message).ok_or_else(|| {
+                    VeilError::repo(format!(
+                        "the message of release tag '{name}' is sealed and you cannot read it; give a new one with -m"
+                    ))
+                })?)
+            }
+            (None, None) => None,
+        };
+        let mut signed = false;
+        let annotation = match message {
+            None => None,
+            Some(m) => {
+                let text = self.store().make_text(&m, cloak.as_deref())?;
+                let tagger: String = self.user.chars().filter(|c| !c.is_control()).take(crate::tag_object::MAX_TAGGER).collect();
+                let mut a = Atag::annotated(name, target, text, &tagger, now_millis());
+                if let Some(id) = self.identity() {
+                    a.sign(id);
+                    signed = true;
+                }
+                Some(self.store().put_atag(&a)?)
+            }
+        };
         let mut tx = self.transaction(format!("set tag {name}"))?;
-        let cloak = cloak.or_else(|| tx.view.tags.get(name).and_then(|t| t.cloak.clone()));
-        tx.view.tags.insert(name.to_string(), Tag::new(target, cloak));
+        tx.view.tags.insert(
+            name.to_string(),
+            Tag {
+                target,
+                cloak,
+                annotation,
+            },
+        );
         tx.commit()?;
-        Ok(())
+        Ok(SetTagOutcome {
+            annotation,
+            replaced: old_annotation,
+            signed,
+            unchanged: false,
+        })
+    }
+
+    /// The annotation of tag `name` and what its signature proves, or
+    /// `None` for a plain tag (`vl tag verify`, `vl tag list`). `verified`
+    /// is true only for a valid Veil signature by a key some ring of this
+    /// repository registers for the member it names; a Git signature kept
+    /// from an import never counts.
+    pub fn tag_annotation(&self, name: &str) -> Result<Option<TagCheck>> {
+        let t = self
+            .view
+            .tags
+            .get(name)
+            .ok_or_else(|| VeilError::NotFound(format!("tag '{name}'")))?;
+        let Some(a) = t.annotation else { return Ok(None) };
+        Ok(Some(self.check_atag(name, &t.target, &a)?))
+    }
+
+    /// [`Repo::tag_annotation`] for atag `id` shown as `name → target`.
+    pub fn check_atag(&self, name: &str, target: &ObjectId, id: &ObjectId) -> Result<TagCheck> {
+        let atag = self.store().atag(id)?;
+        let verification = atag.verify(name, target);
+        let signer = match &verification {
+            AtagVerification::Signed { signer, key } => {
+                let known = self.keys().known_signers();
+                match known.get(key) {
+                    Some((member, who)) if member == signer => Some(who.clone()),
+                    _ => match self.identity() {
+                        Some(me) if me.verifying_hex() == *key && me.public_hex() == *signer => Some(self.user.clone()),
+                        _ => None,
+                    },
+                }
+            }
+            _ => None,
+        };
+        let message = self.store().read_text(&atag.message);
+        Ok(TagCheck {
+            id: *id,
+            verified: signer.is_some(),
+            signer,
+            verification,
+            message,
+            atag,
+        })
     }
 
     pub fn delete_tag(&mut self, name: &str) -> Result<()> {

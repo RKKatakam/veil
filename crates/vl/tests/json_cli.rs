@@ -196,11 +196,20 @@ fn specs() -> Vec<(&'static str, Value)> {
             "schema": "string",
             "workspaces": [{"name": "string", "current": "bool", "cloak": "string|null", "working_copy": snapshot_ref()}],
         })),
-        ("veil.tag.list/1", json!({
-            "schema": "string",
-            "tags": [{"name": "string", "cloak": "string|null", "target": snapshot_ref()}],
-            "remote_tags": [{"name": "string", "target": snapshot_ref()}],
-        })),
+        ("veil.tag.list/1", {
+            let annotation = json!({
+                "?": true, "id": "string", "kind": "string", "tagger": "string", "timestamp": "string|null",
+                "message": "string|null", "signer": "string|null", "verified": "bool", "status": "string",
+            });
+            let mut maybe_target = snapshot_ref();
+            maybe_target["?"] = json!(true);
+            json!({
+                "schema": "string",
+                "tags": [{"name": "string", "cloak": "string|null", "target": snapshot_ref(), "kind": "string", "git_ref": "string", "annotation": annotation}],
+                "remote_tags": [{"name": "string", "target": snapshot_ref()}],
+                "remote_release_tags": [{"name": "string", "target": maybe_target, "annotation": annotation}],
+            })
+        }),
         ("veil.op.log/1", json!({
             "schema": "string",
             "operations": [{"op_id": "string", "op_short": "string", "timestamp": "string|null", "user": "string", "description": "string"}],

@@ -157,6 +157,21 @@ pub(crate) fn public_text(store: &ObjectStore, veil: &Veil, t: &Text) -> (String
     }
 }
 
+/// The commit a gitlink's content `"<40 hex>\n"` names (lowercase hex,
+/// SHA-1 only: the bridge repository is SHA-1).
+pub(crate) fn gitlink_commit(data: &[u8]) -> Option<GitOid> {
+    let hex = data.strip_suffix(b"\n")?;
+    if hex.len() != 40 || !hex.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    GitOid::from_hex(hex).ok()
+}
+
+/// The content of a gitlink entry naming `commit`.
+pub(crate) fn gitlink_content(commit: &GitOid) -> Vec<u8> {
+    format!("{commit}\n").into_bytes()
+}
+
 /// Is `name` a spelling of `.git`, which Git refuses as a tree entry (and
 /// a colocated working copy would take as its repository)? Any ASCII case,
 /// and with HFS+-ignorable code points anywhere (`.g\u{200C}it`), as Git's
@@ -270,13 +285,13 @@ impl GitBridge {
                         kept.insert(ne);
                     }
                 }
-                // Format 5: what a sealed link would show is omitted like a
-                // sealed file (never exported); a public one cannot be
-                // exported yet (mode 120000 / 160000 is the Git-bridge
-                // stream's), and is refused rather than exported wrong.
+                // Format 5: a public link is exported as mode 120000 or
+                // 160000; a sealed one is omitted like a sealed file.
                 EntryKind::Symlink | EntryKind::Gitlink => {
-                    if self.public_file(store, e, &mut out)?.is_some() {
-                        return Err(e.kind.not_supported_yet(&e.name));
+                    if let Some(ne) = self.public_file(store, e, &mut out)? {
+                        if let Some(ne) = self.exportable_link(store, ne)? {
+                            kept.insert(ne);
+                        }
                     }
                 }
             }
@@ -329,8 +344,11 @@ impl GitBridge {
             }
         };
         if c.has_special_terms() {
-            // Format 5: not exported yet (never as a file of markers).
-            return Err(EntryKind::Symlink.not_supported_yet(&e.name));
+            // Format 5: a conflict with a symlink or gitlink side is never
+            // shown as a file of markers (that would turn a link target
+            // into file content). Git gets our side as it is, if public,
+            // else nothing, like a sealed file.
+            return self.public_special_conflict(store, e, &c, out);
         }
         for t in c.interleaved().flatten() {
             if store.get_raw(&t.id).is_err() {
@@ -372,6 +390,64 @@ impl GitBridge {
         }))
     }
 
+    /// Git's view of a conflict that has a symlink or gitlink side: the
+    /// first side (ours) as its own kind, when a public reader can read it.
+    fn public_special_conflict(
+        &mut self,
+        store: &ObjectStore,
+        e: &TreeEntry,
+        c: &crate::object::Conflict,
+        out: &mut Projection,
+    ) -> Result<Option<TreeEntry>> {
+        use crate::object::TermKind;
+        let Some(Some(t)) = c.adds.first() else { return Ok(None) };
+        let kind = match t.kind {
+            TermKind::File => EntryKind::File,
+            TermKind::Symlink => EntryKind::Symlink,
+            TermKind::Gitlink => EntryKind::Gitlink,
+        };
+        let side = TreeEntry {
+            name: e.name.clone(),
+            kind,
+            id: t.id,
+            size: t.size,
+            executable: t.executable && kind == EntryKind::File,
+            visibility: t.visibility.clone(),
+            fallback: t.fallback,
+        };
+        let Some(ne) = self.public_file(store, &side, out)? else { return Ok(None) };
+        if kind == EntryKind::File {
+            return Ok(Some(ne));
+        }
+        self.exportable_link(store, ne)
+    }
+
+    /// `e` (a public symlink or gitlink) if Git can carry it, else `None`
+    /// with a warning: a symlink target must be non-empty and hold no NUL,
+    /// a gitlink must name a SHA-1 commit (the bridge is a SHA-1
+    /// repository), and `.gitmodules` is never a symlink (Git's fsck
+    /// refuses one, CVE-2018-11235).
+    fn exportable_link(&mut self, store: &ObjectStore, e: TreeEntry) -> Result<Option<TreeEntry>> {
+        let data = match public_open(store, &Veil::default(), &e.id)? {
+            Public::Visible { obj: Object::Blob(b), .. } => b,
+            _ => return Ok(None),
+        };
+        let why = match e.kind {
+            EntryKind::Symlink if e.name.eq_ignore_ascii_case(".gitmodules") => {
+                Some("a symlink named .gitmodules is refused by Git")
+            }
+            EntryKind::Symlink if data.is_empty() || data.contains(&0) => Some("its target is empty or holds a NUL"),
+            EntryKind::Gitlink if gitlink_commit(&data).is_none() => Some("it does not name a SHA-1 commit"),
+            _ => None,
+        };
+        if let Some(why) = why {
+            self.warnings
+                .push(format!("{} '{}' is not exported to Git: {why}", e.kind.name(), e.name));
+            return Ok(None);
+        }
+        Ok(Some(e))
+    }
+
     /// The entry a public reader materialises for file entry `e`, if any.
     fn public_file(&mut self, store: &ObjectStore, e: &TreeEntry, out: &mut Projection) -> Result<Option<TreeEntry>> {
         match public_open(store, &self.veil, &e.id)? {
@@ -389,10 +465,11 @@ impl GitBridge {
         match public_open(store, &self.veil, &fb)? {
             Public::Visible { obj: Object::Blob(b), sealed } => Ok(Some(TreeEntry {
                 name: e.name.clone(),
-                kind: EntryKind::File,
+                // A link's last public version is a link target.
+                kind: if e.kind.is_special() { e.kind } else { EntryKind::File },
                 id: fb,
                 size: b.len() as u64,
-                executable: e.executable,
+                executable: e.executable && !e.kind.is_special(),
                 visibility: match (sealed, &e.visibility) {
                     (true, v) => v.clone(),
                     (false, _) => Visibility::Public,
@@ -443,8 +520,15 @@ impl GitBridge {
                 EntryKind::Conflict => {
                     return Err(VeilError::Corrupt(id.hex(), "a public projection never holds a conflict entry".into()))
                 }
-                EntryKind::Symlink | EntryKind::Gitlink => {
-                    return Err(VeilError::Corrupt(id.hex(), "a public projection never holds a symlink or gitlink yet".into()))
+                EntryKind::Symlink => (gix::objs::tree::EntryKind::Link, self.git_blob(store, &e.id)?),
+                EntryKind::Gitlink => {
+                    let data = match public_open(store, &Veil::default(), &e.id)? {
+                        Public::Visible { obj: Object::Blob(b), .. } => b,
+                        _ => return Err(VeilError::Corrupt(e.id.hex(), "public gitlink is not readable".into())),
+                    };
+                    let commit = gitlink_commit(&data)
+                        .ok_or_else(|| VeilError::Corrupt(e.id.hex(), "gitlink does not name a commit".into()))?;
+                    (gix::objs::tree::EntryKind::Commit, commit)
                 }
             };
             entries.push(gix::objs::tree::Entry {

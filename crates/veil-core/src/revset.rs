@@ -66,6 +66,21 @@ fn resolve_base(repo: &Repo, base: &str, ws: &str) -> Result<ObjectId> {
     if let Some(t) = view.remote_tags.get(base) {
         return Ok(*t);
     }
+    // Release tags (format 5): `tag:<name>` names a release tag, local or
+    // `<remote>/<name>` fetched from Git, when a branch has the same name;
+    // `<remote>/<name>` alone names the Git tag when no branch does.
+    if let Some(rest) = base.strip_prefix("tag:") {
+        if let Some(t) = view.tags.get(rest).filter(|t| t.annotation.is_some()) {
+            return Ok(t.target);
+        }
+        return match view.remote_release_tags.get(rest) {
+            Some(a) => Ok(repo.store().atag(a)?.target),
+            None => Err(VeilError::Revset(format!("no release tag '{rest}'"))),
+        };
+    }
+    if let Some(a) = view.remote_release_tags.get(base) {
+        return Ok(repo.store().atag(a)?.target);
+    }
     if base.len() == 64 {
         if let Ok(id) = ObjectId::from_hex(base) {
             // Only snapshots are revisions (not blobs or trees).

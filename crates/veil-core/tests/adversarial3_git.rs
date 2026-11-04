@@ -287,8 +287,9 @@ fn a_github_commit_on_a_stale_github_commit_after_the_release_does_not_revert_th
 }
 
 /// The publication commit written for a GitHub commit applies only the
-/// release: what that commit holds that Veil never recorded (a symlink)
-/// stays on GitHub.
+/// release: what that commit holds that Veil never recorded (a symlink
+/// with a NUL in its target) stays on GitHub, and so does a symlink Veil
+/// records (format 5).
 #[test]
 fn publishing_past_a_github_commit_keeps_what_veil_never_recorded() {
     let (env, mut alice, _fs, embargo) = embargoed_merge_exported();
@@ -296,16 +297,35 @@ fn publishing_past_a_github_commit_keeps_what_veil_never_recorded() {
     std::os::unix::fs::symlink("README", work.join("link")).unwrap();
     std::fs::write(work.join("README"), "r2 from GitHub\n").unwrap();
     git(&work, &["add", "-A"]);
+    let nul = git_stdin(&work, &["hash-object", "-w", "--stdin"], b"a\0b");
+    git(&work, &["update-index", "--add", "--cacheinfo", &format!("120000,{nul},badlink")]);
     git(&work, &["commit", "-q", "-m", "a symlink"]);
     git(&work, &["push", "-q", "origin", "main"]);
     let rep = env.pull(&mut alice);
-    assert!(rep.import.left_in_git.contains_key("link"), "{rep:?}");
+    assert!(rep.import.left_in_git.contains_key("badlink"), "{rep:?}");
+    assert!(!rep.import.left_in_git.contains_key("link"), "{rep:?}");
     alice.release_embargo(&embargo).unwrap();
     let rep = env.push(&mut alice);
     assert!(rep.outcome.refs.iter().all(|(_, s)| s.accepted()), "{:?}", rep.outcome);
     assert_eq!(env.show("main", "auth.rs"), "FIXED-v2");
     let tree = git(&env.bare, &["ls-tree", "main"]);
     assert!(tree.contains("120000") && tree.contains("\tlink"), "{tree}");
+    assert!(tree.contains("\tbadlink"), "{tree}");
+}
+
+fn git_stdin(dir: &std::path::Path, args: &[&str], input: &[u8]) -> String {
+    use std::io::Write;
+    let mut child = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
 // ---- BUG-064, the cases around it -------------------------------------------------

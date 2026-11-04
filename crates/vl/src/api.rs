@@ -1179,6 +1179,8 @@ pub struct TagList {
     pub schema: &'static str,
     pub tags: Vec<TagItem>,
     pub remote_tags: Vec<RemoteTagItem>,
+    /// Git tags fetched from Git remotes (`<remote>/<name>`), format 5.
+    pub remote_release_tags: Vec<RemoteReleaseTagItem>,
 }
 
 #[derive(Serialize, Debug)]
@@ -1187,6 +1189,62 @@ pub struct TagItem {
     /// Cloaked tags are never pushed to public remotes.
     pub cloak: Option<String>,
     pub target: SnapshotRef,
+    /// `release` (annotated: immutable, a Git tag) or `branch`.
+    pub kind: &'static str,
+    /// What the Git bridge exports it as: `refs/tags/<name>` or
+    /// `refs/heads/<name>`.
+    pub git_ref: String,
+    /// The annotation of a release tag (`null` for a plain tag).
+    pub annotation: Option<AnnotationItem>,
+}
+
+/// An annotated tag object as `vl tag list --json` shows it.
+#[derive(Serialize, Debug)]
+pub struct AnnotationItem {
+    pub id: String,
+    /// `annotated` or `lightweight-git`.
+    pub kind: &'static str,
+    pub tagger: String,
+    pub timestamp: Option<String>,
+    /// The message; `null` when sealed for a scope you are not in.
+    pub message: Option<String>,
+    /// The signer's name, when signed by a key a ring knows.
+    pub signer: Option<String>,
+    /// A valid Veil signature by a known key (a Git signature never is).
+    pub verified: bool,
+    /// What the check found (`signed by …`, `unsigned`, `Git signature,
+    /// not verified by Veil`, `unverified (…)`).
+    pub status: String,
+}
+
+#[derive(Serialize, Debug)]
+pub struct RemoteReleaseTagItem {
+    /// `remote/tag`.
+    pub name: String,
+    pub target: Option<SnapshotRef>,
+    pub annotation: Option<AnnotationItem>,
+}
+
+/// The annotation `id` shown as `name → target`.
+pub fn annotation_item(repo: &Repo, name: &str, target: &ObjectId, id: &ObjectId) -> Option<AnnotationItem> {
+    let c = repo.check_atag(name, target, id).ok()?;
+    Some(AnnotationItem {
+        id: id.hex(),
+        kind: match c.atag.kind {
+            veil_core::tag_object::AtagKind::Annotated => "annotated",
+            veil_core::tag_object::AtagKind::LightweightGit => "lightweight-git",
+        },
+        tagger: c.atag.tagger.clone(),
+        timestamp: rfc3339(c.atag.timestamp),
+        message: c.message.clone(),
+        signer: c.signer.clone(),
+        verified: c.verified,
+        status: match (&c.signer, c.verification.is_signed()) {
+            (Some(who), true) => format!("good signature by {who}"),
+            (None, true) => "signed by a key no ring knows".into(),
+            _ => c.verification.describe(),
+        },
+    })
 }
 
 #[derive(Serialize, Debug)]
@@ -1203,13 +1261,34 @@ pub fn tag_list(repo: &Repo) -> TagList {
             .view()
             .tags
             .iter()
-            .map(|(name, t)| TagItem { name: name.clone(), cloak: t.cloak.clone(), target: snapshot_ref(repo, &t.target) })
+            .map(|(name, t)| TagItem {
+                name: name.clone(),
+                cloak: t.cloak.clone(),
+                target: snapshot_ref(repo, &t.target),
+                kind: if t.annotation.is_some() { "release" } else { "branch" },
+                git_ref: format!("refs/{}/{name}", if t.annotation.is_some() { "tags" } else { "heads" }),
+                annotation: t.annotation.and_then(|a| annotation_item(repo, name, &t.target, &a)),
+            })
             .collect(),
         remote_tags: repo
             .view()
             .remote_tags
             .iter()
             .map(|(name, t)| RemoteTagItem { name: name.clone(), target: snapshot_ref(repo, t) })
+            .collect(),
+        remote_release_tags: repo
+            .view()
+            .remote_release_tags
+            .iter()
+            .map(|(key, a)| {
+                let atag = repo.store().atag(a).ok();
+                let short = key.split_once('/').map_or(key.as_str(), |(_, n)| n);
+                RemoteReleaseTagItem {
+                    name: key.clone(),
+                    target: atag.as_ref().map(|t| snapshot_ref(repo, &t.target)),
+                    annotation: atag.as_ref().and_then(|t| annotation_item(repo, short, &t.target, a)),
+                }
+            })
             .collect(),
     }
 }
@@ -2090,6 +2169,7 @@ pub fn commit(ctx: &mut Ctx, message: &str, advance: bool) -> Result<Committed> 
             .map(|(name, why)| match why {
                 TagKept::CloakedLine(s) => KeptTag { name: name.clone(), reason: "cloaked_line", scope: Some(s.clone()) },
                 TagKept::NoAdvance => KeptTag { name: name.clone(), reason: "no_advance", scope: None },
+                TagKept::Release => KeptTag { name: name.clone(), reason: "release_tag", scope: None },
             })
             .collect(),
         operation: op_ref(repo),

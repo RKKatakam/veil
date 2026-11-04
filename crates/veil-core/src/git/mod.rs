@@ -68,6 +68,7 @@ mod import;
 mod index;
 pub mod map;
 mod project;
+mod tags;
 mod transport;
 
 use std::{
@@ -75,10 +76,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub use export::ExportReport;
-pub use import::ImportReport;
+pub use export::{ExportReport, ExportedTag};
+pub use import::{ImportOrigin, ImportReport};
 pub use map::{GitMap, GitOid, Origin};
 pub use transport::{redact_url, PushOutcome, RefStatus};
+pub(crate) use transport::redact_in as redact_in_text;
 
 use crate::{
     commands::validate_tag_name,
@@ -112,6 +114,10 @@ pub struct GitBridge {
     /// Embargoes projections treat as unreleased (see `project::Veil`).
     pub(crate) veil: project::Veil,
     pub(crate) warnings: Vec<String>,
+    /// Symlinks and gitlinks below a Git tree, for this run (import).
+    pub(crate) git_link_memo: HashMap<GitOid, import::GitLinks>,
+    /// Veil trees known to hold no symlink or gitlink, for this run.
+    pub(crate) no_links: std::collections::HashSet<ObjectId>,
 }
 
 impl std::fmt::Debug for GitBridge {
@@ -127,6 +133,14 @@ fn open_git(dir: &Path) -> Result<gix::Repository> {
     match gix::open_opts(dir, opts.clone()) {
         Ok(r) => Ok(r),
         Err(_) => {
+            // A repository that never talked to Git has no `.veil/git/` yet
+            // (BUG-640): `gix::init_bare` creates only the last component.
+            if let Some(parent) = dir.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| VeilError::Io {
+                    path: parent.display().to_string(),
+                    source: e,
+                })?;
+            }
             gix::init_bare(dir).map_err(gerr)?;
             gix::open_opts(dir, opts).map_err(gerr)
         }
@@ -144,6 +158,8 @@ impl GitBridge {
             run_projected: HashMap::new(),
             veil: project::Veil::default(),
             warnings: Vec::new(),
+            git_link_memo: HashMap::new(),
+            no_links: Default::default(),
         })
     }
 
@@ -228,6 +244,13 @@ impl GitBridge {
 
     pub(crate) fn write_commit(&self, commit: &gix::objs::Commit) -> Result<GitOid> {
         Ok(self.git.write_object(commit).map_err(gerr)?.detach())
+    }
+
+    /// Write an object of `kind` from its raw encoding (a Git tag object
+    /// kept byte for byte).
+    pub(crate) fn write_raw(&self, kind: gix::objs::Kind, data: &[u8]) -> Result<GitOid> {
+        use gix::objs::Write;
+        self.git.objects.write_buf(kind, data).map_err(gerr)
     }
 
     // ---- refs ------------------------------------------------------------
@@ -439,20 +462,71 @@ pub struct FetchReport {
     pub deleted: Vec<String>,
     /// Local tags created or fast-forwarded (pull only).
     pub tags_updated: Vec<(String, ObjectId)>,
+    /// Git tags recorded (new or changed) as remote release tags
+    /// `<remote>/<name>` → atag (format 5).
+    pub release_tags: Vec<(String, ObjectId)>,
+    /// Git tags the remote moved since they were last recorded: (name, old
+    /// snapshot, new snapshot). A supply-chain warning: local release tags
+    /// never follow.
+    pub tags_moved: Vec<(String, ObjectId, ObjectId)>,
+    /// Local release tags created from Git tags (pull only).
+    pub release_tags_created: Vec<(String, ObjectId)>,
+    /// Local release tags left where they are although the Git tag of the
+    /// same name points elsewhere: (name, local target, remote target).
+    pub release_tags_kept: Vec<(String, ObjectId, ObjectId)>,
+    /// Git tags not imported, with the reason.
+    pub tags_skipped: Vec<(String, String)>,
+    /// Git tags the remote deleted: forgotten with `--prune-tags`
+    /// (`tags_pruned`), else kept and listed here.
+    pub tags_deleted: Vec<String>,
+    pub tags_pruned: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+/// How [`fetch_with`] fetches.
+#[derive(Debug, Clone, Default)]
+pub struct FetchOptions {
+    /// Also create or fast-forward local tags (`vl git pull`).
+    pub pull: bool,
+    /// Do not fetch Git tags (`--no-tags`).
+    pub no_tags: bool,
+    /// Forget remote release tags the remote no longer has (`--prune-tags`).
+    pub prune_tags: bool,
 }
 
 /// `vl git fetch`: download a Git remote's branches and import new commits.
 /// Records `<remote>/<branch>` remote tags; local tags are not moved.
 pub fn fetch(repo: &mut Repo, git_dir: &Path, remote: &str) -> Result<FetchReport> {
-    fetch_inner(repo, git_dir, remote, false)
+    fetch_with(repo, git_dir, remote, &FetchOptions::default())
+}
+
+/// [`fetch`] or [`pull`] with options (`--no-tags`, `--prune-tags`).
+///
+/// Git tags (format 5) are fetched to the bridge's `refs/veil/tags/<remote>/`,
+/// peeled (at most 8 levels; they must reach a commit that imports) and
+/// recorded as `View::remote_release_tags["<remote>/<name>"]`, each an
+/// annotated tag object (`veil:atag`): a Git annotated tag keeps its tagger,
+/// message and raw bytes (its GPG or SSH signature is kept, never verified),
+/// a lightweight one becomes `kind: lightweight-git`. A pull then creates a
+/// local release tag where none of that name exists; it **never moves** an
+/// existing one, and a tag the remote moved is reported.
+pub fn fetch_with(repo: &mut Repo, git_dir: &Path, remote: &str, opts: &FetchOptions) -> Result<FetchReport> {
+    fetch_inner(repo, git_dir, remote, opts)
 }
 
 /// `vl git pull`: [`fetch`], then create or fast-forward local tags like
 /// `vl pull` does. A tag that has diverged from its branch is left alone
 /// with a warning.
 pub fn pull(repo: &mut Repo, git_dir: &Path, remote: &str) -> Result<FetchReport> {
-    fetch_inner(repo, git_dir, remote, true)
+    fetch_with(
+        repo,
+        git_dir,
+        remote,
+        &FetchOptions {
+            pull: true,
+            ..FetchOptions::default()
+        },
+    )
 }
 
 /// `vl git import`: add `remote` for `url` (or reuse it if it already
@@ -481,16 +555,48 @@ pub fn import(repo: &mut Repo, git_dir: &Path, url: &str, remote: &str) -> Resul
     pull(repo, git_dir, remote)
 }
 
-fn fetch_inner(repo: &mut Repo, git_dir: &Path, remote: &str, update_tags: bool) -> Result<FetchReport> {
+fn fetch_inner(repo: &mut Repo, git_dir: &Path, remote: &str, opts: &FetchOptions) -> Result<FetchReport> {
+    let update_tags = opts.pull;
     let url = remote_url(repo, git_dir, remote)?;
     let mut bridge = GitBridge::open(repo, git_dir)?;
     let prefix = format!("refs/remotes/{remote}/");
+    let tag_prefix_ref = transport::tag_tracking_prefix(remote);
     let before = bridge.refs_under(&prefix)?;
-    transport::fetch(git_dir, &url, remote)?;
+    let tags_before = bridge.refs_under(&tag_prefix_ref)?;
+    let fetch_tags = !opts.no_tags;
+    transport::fetch(git_dir, &url, remote, fetch_tags)?;
     bridge.reopen()?;
     let after = bridge.refs_under(&prefix)?;
+    let tags_after = match fetch_tags {
+        true => bridge.refs_under(&tag_prefix_ref)?,
+        false => BTreeMap::new(),
+    };
+    let release = repo.format() >= crate::object::GIT_PARITY_REPO_FORMAT;
 
     let mut report = FetchReport::default();
+    if !release && !tags_after.is_empty() {
+        report.warnings.push(format!(
+            "{remote} has Git tags; they are imported as release tags from repository format {} on: upgrade with `vl upgrade`",
+            crate::object::GIT_PARITY_REPO_FORMAT
+        ));
+    }
+    // Peel the remote's tags first: the commits they name are imported
+    // with the branches.
+    let mut peeled: Vec<(String, GitOid, tags::Peeled)> = Vec::new();
+    if release {
+        for (name, oid) in &tags_after {
+            if validate_tag_name(name).is_err() || validate_tag_name(&format!("{remote}/{name}")).is_err() {
+                report
+                    .tags_skipped
+                    .push((name.escape_debug().to_string(), "not a valid Veil tag name".into()));
+                continue;
+            }
+            match bridge.peel_tag(oid)? {
+                Ok(p) => peeled.push((name.clone(), *oid, p)),
+                Err(why) => report.tags_skipped.push((name.clone(), why)),
+            }
+        }
+    }
     let mut tx = repo.transaction(format!("git fetch from {remote}"))?;
     // What Veil last recorded for each branch. The bridge's tracking refs
     // cannot tell: `git fetch` has already moved them (and pruned deleted
@@ -502,8 +608,9 @@ fn fetch_inner(repo: &mut Repo, git_dir: &Path, remote: &str, update_tags: bool)
         .iter()
         .filter_map(|(k, v)| k.strip_prefix(&tag_prefix).map(|b| (b.to_string(), *v)))
         .collect();
-    let tips: Vec<GitOid> = after.values().copied().collect();
-    report.import = bridge.import_tips(&mut tx, &tips)?;
+    let mut tips: Vec<GitOid> = after.values().copied().collect();
+    tips.extend(peeled.iter().map(|(_, _, p)| p.commit));
+    report.import = bridge.import_tips(&mut tx, &tips, ImportOrigin::Remote)?;
     // Tags deleted here stay deleted while their branch has not moved
     // (`remote::deleted_tags`, BUG-280).
     let (stay_deleted, recreated) = if update_tags {
@@ -563,6 +670,18 @@ fn fetch_inner(repo: &mut Repo, git_dir: &Path, remote: &str, update_tags: bool)
     for branch in recorded.keys().filter(|b| !after.contains_key(*b)) {
         tx.view.remote_tags.remove(&format!("{remote}/{branch}"));
         report.deleted.push(branch.clone());
+    }
+    if release {
+        let ctx = tags::TagFetch {
+            remote,
+            pull: update_tags,
+            prune: opts.prune_tags,
+            fetched: fetch_tags,
+            branches: &after,
+            tags_before: &tags_before,
+            tags_after: &tags_after,
+        };
+        bridge.record_release_tags(&mut tx, &ctx, peeled, &mut revisions, &mut report)?;
     }
     report.warnings.append(&mut bridge.warnings);
     bridge.save(&**tx.repo().backend())?;
@@ -643,6 +762,53 @@ pub fn push_with_deletions(
     force: bool,
     delete: &[String],
 ) -> Result<PushReport> {
+    push_with(
+        repo,
+        git_dir,
+        remote,
+        &PushOptions {
+            only_tags: only_tags.to_vec(),
+            force,
+            delete: delete.to_vec(),
+            ..PushOptions::default()
+        },
+    )
+}
+
+/// What [`push_with`] pushes.
+#[derive(Debug, Clone, Default)]
+pub struct PushOptions {
+    /// Only these tags (default: all).
+    pub only_tags: Vec<String>,
+    /// Overwrite branches that moved on the Git side (leased).
+    pub force: bool,
+    /// Delete these branches on the remote.
+    pub delete: Vec<String>,
+    /// Replace Git tags that exist on the remote with another target
+    /// (`--force-tags`, leased on what was last fetched).
+    pub force_tags: bool,
+    /// Delete these Git tags (`refs/tags/<name>`) on the remote.
+    pub delete_tags: Vec<String>,
+}
+
+/// `vl git push` with every option: branches as [`push_with_deletions`],
+/// and release tags (annotated, format 5) as `refs/tags/<name>`, **never
+/// forced**: a tag the remote has with another target is rejected ("tag
+/// exists with another target") unless `force_tags`, which replaces it
+/// only if it still holds what was last fetched. Every exported release
+/// tag the remote lacks is pushed (Git's `push.followTags`). Deleting a
+/// Git tag (`delete_tags`) needs the local tag deleted first, like a
+/// branch.
+pub fn push_with(repo: &mut Repo, git_dir: &Path, remote: &str, opts: &PushOptions) -> Result<PushReport> {
+    let (only_tags, force, delete) = (&opts.only_tags[..], opts.force, &opts.delete[..]);
+    for d in &opts.delete_tags {
+        if repo.view().tags.contains_key(d) {
+            return Err(VeilError::repo(format!(
+                "tag '{d}' still exists here; delete it first with `vl tag delete {d}` (a later `vl git push` would push it again)"
+            )));
+        }
+        validate_tag_name(d)?;
+    }
     for d in delete {
         if repo.view().tags.contains_key(d) {
             return Err(VeilError::repo(format!(
@@ -653,7 +819,7 @@ pub fn push_with_deletions(
     }
     let url = remote_url(repo, git_dir, remote)?;
     let mut bridge = GitBridge::open(repo, git_dir)?;
-    let export = if delete.is_empty() || !only_tags.is_empty() {
+    let export = if (delete.is_empty() && opts.delete_tags.is_empty()) || !only_tags.is_empty() {
         bridge.export(repo, only_tags)?
     } else {
         ExportReport::default()
@@ -663,6 +829,7 @@ pub fn push_with_deletions(
         let tracking = format!("refs/remotes/{remote}/{branch}");
         updates.push(transport::PushRef {
             branch: branch.clone(),
+            tag: false,
             commit: Some(*commit),
             force,
             lease: bridge.get_ref(&tracking)?,
@@ -672,20 +839,68 @@ pub fn push_with_deletions(
         let tracking = format!("refs/remotes/{remote}/{d}");
         updates.push(transport::PushRef {
             branch: d.clone(),
+            tag: false,
             commit: None,
             force,
             lease: bridge.get_ref(&tracking)?,
         });
     }
-    let outcome = transport::push(git_dir, &url, &updates)?;
+    let tag_prefix_ref = transport::tag_tracking_prefix(remote);
+    let mut refused: Vec<(String, RefStatus)> = Vec::new();
+    for t in &export.tags {
+        let fetched = bridge.get_ref(&format!("{tag_prefix_ref}{}", t.name))?;
+        match fetched {
+            Some(f) if f != t.git && !opts.force_tags => refused.push((
+                t.name.clone(),
+                RefStatus::Rejected("tag exists with another target; `--force-tags` replaces it".into()),
+            )),
+            _ => updates.push(transport::PushRef {
+                branch: t.name.clone(),
+                tag: true,
+                commit: Some(t.git),
+                force: opts.force_tags && fetched.is_some_and(|f| f != t.git),
+                lease: fetched,
+            }),
+        }
+    }
+    for d in &opts.delete_tags {
+        updates.push(transport::PushRef {
+            branch: d.clone(),
+            tag: true,
+            commit: None,
+            force: opts.force_tags,
+            lease: bridge.get_ref(&format!("{tag_prefix_ref}{d}"))?,
+        });
+    }
+    let mut outcome = transport::push(git_dir, &url, &updates)?;
+    outcome.tags.extend(refused);
     bridge.reopen()?;
     // Record what the remote now holds.
     let mut tx = repo.transaction(format!("git push to {remote}"))?;
+    for (name, status) in &outcome.tags {
+        if !status.accepted() {
+            continue;
+        }
+        let Some(u) = updates.iter().find(|u| u.tag && &u.branch == name) else { continue };
+        let key = format!("{remote}/{name}");
+        match u.commit {
+            None => {
+                bridge.delete_ref(&format!("{tag_prefix_ref}{name}"))?;
+                tx.view.remote_release_tags.remove(&key);
+            }
+            Some(git) => {
+                bridge.set_ref(&format!("{tag_prefix_ref}{name}"), git)?;
+                if let Some(t) = export.tags.iter().find(|t| &t.name == name) {
+                    tx.view.remote_release_tags.insert(key, t.atag);
+                }
+            }
+        }
+    }
     for (branch, status) in &outcome.refs {
         if !status.accepted() {
             continue;
         }
-        let Some(u) = updates.iter().find(|u| &u.branch == branch) else { continue };
+        let Some(u) = updates.iter().find(|u| !u.tag && &u.branch == branch) else { continue };
         let Some(commit) = u.commit else {
             bridge.delete_ref(&format!("refs/remotes/{remote}/{branch}"))?;
             tx.view.remote_tags.remove(&format!("{remote}/{branch}"));

@@ -80,7 +80,7 @@ Global options (accepted by every command):
 | [`vl format-patch`](format-patch.md) | Export snapshots as patch emails in Git's format, public view by default (not implemented yet) |
 | [`vl am`](am.md) | Apply patch emails as new changes on top of a snapshot (not implemented yet) |
 | [`vl hooks`](hooks.md) | Hooks run before commits and pushes; repository-suggested ones only once this device trusts them (not implemented yet) |
-| [`vl submodule`](submodule.md) | Git submodules: pinned commits of other Git repositories (not implemented yet) |
+| [`vl submodule`](submodule.md) | Git submodules: pinned commits of other Git repositories, fetched with `git` only when you run `vl submodule update` |
 | [`vl gc`](gc.md) | Pack objects and delete those no retained operation can reach |
 | [`vl doctor`](doctor.md) | Check this machine's setup and explain every problem found: identity, VEIL_HOME, the repository and its lock, the stat cache, the filesystem (case sensitivity, fsync, network mounts), the clock, the vault and leftover sandboxes. Exits 1 if anything is broken |
 | [`vl completions`](completions.md) | Print a shell completion script, e.g. `vl completions zsh > ~/.zfunc/_vl` |

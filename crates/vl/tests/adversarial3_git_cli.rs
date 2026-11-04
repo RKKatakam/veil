@@ -346,8 +346,9 @@ fn a_relative_git_remote_is_the_same_repository_from_a_subdirectory() {
 
 // ---- controls: hostile tree names never reach the working copy ------------------------
 
-/// `.veil`, `.VEIL`, `..`, `.Git`, symlinks and gitlinks from Git are not
-/// recorded and not checked out; nothing is written into `.veil/`.
+/// `.veil`, `.VEIL`, `..` and `.Git` from Git are not recorded and not
+/// checked out; nothing is written into `.veil/`. Symlinks and gitlinks
+/// are recorded as such (format 5), never as files.
 #[test]
 fn control_hostile_git_tree_names_are_not_checked_out() {
     let env = Env::new();
@@ -373,9 +374,10 @@ fn control_hostile_git_tree_names_are_not_checked_out() {
     let proj = env.dir("proj");
     env.ok(U, &proj, &["init"]);
     let out = env.ok(U, &proj, &["git", "import", bare.to_str().unwrap()]);
-    for name in [".veil", ".VEIL", "..", ".Git", "link", "sub"] {
+    for name in [".veil", ".VEIL", "..", ".Git"] {
         assert!(out.contains(&format!("not recorded {name} ")), "{name}: {out}");
     }
+    assert!(!proj.join("link").is_file() && !proj.join("sub").is_file(), "a link was written as a file");
     assert!(proj.join("ok.txt").exists());
     assert!(!proj.join(".VEIL").exists());
     assert!(!proj.join(".veil/op_head").exists() || std::fs::read(proj.join(".veil/op_head")).unwrap() != b"hostile\n");
