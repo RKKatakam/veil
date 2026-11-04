@@ -57,6 +57,11 @@ pub struct BuildOptions<'a> {
     /// files injected into a sandbox). New content containing any of it is
     /// quarantined, whatever its path and tier.
     pub injected: Option<&'a InjectedSecrets>,
+    /// Re-scan unchanged public files (normally trusted because they were
+    /// scanned when they entered the parent). Set once after the secret
+    /// scanner's rules change, so files an older scanner let through are
+    /// caught. Also disables reuse hints for that build.
+    pub rescan: bool,
 }
 
 /// Rule name of a [`Finding`] for content copied from an injected secret.
@@ -263,8 +268,9 @@ pub fn build_tree_cached(
         (None, None) => !fs.exists(&policy_path)?,
         _ => false,
     };
-    let policy_changed = !use_hints
-        && match (fs.read_opt(&policy_path)?, parent_policy) {
+    let use_hints = use_hints && !opts.rescan;
+    let policy_changed = opts.rescan
+        || match (fs.read_opt(&policy_path)?, parent_policy) {
             (Some(now), Some(p)) => !store.matches_encoding(&p, &now)?,
             (None, None) => false,
             _ => true,

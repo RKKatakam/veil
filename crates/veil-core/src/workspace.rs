@@ -119,6 +119,7 @@ impl Repo {
         let wc = tx.repo().snapshot(&wc_id)?;
         let policy = Policy::load(fs)?;
         let store = tx.repo().store.clone();
+        let rescan = scanner_outdated(&*tx.repo().backend, ws)?;
         let (tree, report) = build_tree_cached(
             &store,
             fs,
@@ -127,10 +128,15 @@ impl Repo {
                 parent_tree: Some(wc.tree),
                 cloak: wc.cloak.as_deref(),
                 injected,
+                rescan,
             },
             cache,
         )?;
         if tree == wc.tree {
+            // Nothing to record; the re-scan (if any) found nothing new.
+            if rescan {
+                mark_scanned(&*tx.repo().backend, ws)?;
+            }
             return Ok(WcSnapshot {
                 snapshot: wc_id,
                 changed: false,
@@ -149,7 +155,13 @@ impl Repo {
             old.is_some() && old == cur
         });
         let id = tx.rewrite(wc_id, new)?;
+        let backend = tx.repo().backend.clone();
         tx.commit()?;
+        // Only after the re-scanned tree is durable: a crash before this
+        // point simply re-scans again next time.
+        if rescan {
+            mark_scanned(&*backend, ws)?;
+        }
         Ok(WcSnapshot {
             snapshot: id,
             changed: true,
@@ -172,7 +184,7 @@ impl Repo {
         cache: Option<&mut StatCache>,
     ) -> Result<(ObjectId, BuildReport)> {
         let policy = Policy::load(fs)?;
-        build_tree_cached(&self.store, fs, &BuildOptions { policy: &policy, parent_tree, cloak, injected: None }, cache)
+        build_tree_cached(&self.store, fs, &BuildOptions { policy: &policy, parent_tree, cloak, injected: None, rescan: false }, cache)
     }
 
     /// Materialise the difference between two trees onto `fs`.
@@ -238,6 +250,7 @@ impl Repo {
                 parent_tree: Some(parent.tree),
                 cloak: parent.cloak.as_deref(),
                 injected,
+                rescan: false,
             },
             None,
         )?;
@@ -378,4 +391,22 @@ impl Repo {
         let wc = self.workspace_wc(ws)?;
         Ok(OverlayBackend::new(Arc::new(self.tree_view(&wc)?)))
     }
+}
+
+fn scanned_marker(ws: &str) -> Result<VPath> {
+    Ok(VPath::new(".veil/local/scanned")?.join(&format!("{ws}.version")))
+}
+
+/// Has the working copy of `ws` on this device been fully scanned by the
+/// current secret-scanner rules? (Device-local: each machine re-scans once
+/// after an upgrade that changes the rules.)
+fn scanner_outdated(backend: &dyn StorageBackend, ws: &str) -> Result<bool> {
+    let current = crate::secrets::RULES_VERSION.to_string();
+    Ok(backend
+        .read_opt(&scanned_marker(ws)?)?
+        .map_or(true, |v| String::from_utf8_lossy(&v).trim() != current))
+}
+
+fn mark_scanned(backend: &dyn StorageBackend, ws: &str) -> Result<()> {
+    backend.write(&scanned_marker(ws)?, crate::secrets::RULES_VERSION.to_string().as_bytes())
 }
