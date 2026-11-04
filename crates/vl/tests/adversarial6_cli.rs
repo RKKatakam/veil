@@ -657,3 +657,48 @@ fn watch_does_not_move_new_files_off_disk_after_a_concurrent_command() {
         text(&out).trim()
     );
 }
+
+// ---- SSH remote paths -----------------------------------------------------------------
+
+/// A fake `ssh` that ignores its arguments and serves SFTP from `home`
+/// (the OpenSSH `sftp-server`, as `ssh -s host sftp` would run it on the
+/// server). `None` if no `sftp-server` is installed.
+fn fake_ssh(env: &Env, home: &Path) -> Option<std::path::PathBuf> {
+    let server = ["/usr/lib/openssh/sftp-server", "/usr/libexec/openssh/sftp-server", "/usr/libexec/sftp-server"]
+        .into_iter()
+        .find(|p| Path::new(p).exists())?;
+    let script = env.root.join("fake-ssh");
+    std::fs::write(&script, format!("#!/bin/sh\ncd '{}' && exec {server}\n", home.display())).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    Some(script)
+}
+
+/// Git, `scp` and `sftp` all take `host:~/path` as the home directory
+/// (`~` is expanded by the shell `scp` runs, or by `sftp`). Veil's
+/// scp-style parsing hands the path to the SFTP server verbatim, and
+/// OpenSSH's `sftp-server` does not expand `~`: `vl push` creates a
+/// directory literally named `~` in the login directory and the
+/// repository under it. Push and pull keep working against that path, so
+/// nothing is lost, but the repository is not where the admin looks for it
+/// (and backs it up), and `ssh host ls '~/repo'` says it does not exist.
+/// The documented form `ssh://host/~/repo` is resolved. Skipped without an
+/// `sftp-server` binary.
+#[test]
+#[ignore = "BUG-118: scp-style `host:~/path` creates a directory literally named `~` on the server"]
+fn scp_style_tilde_paths_resolve_to_the_home_directory() {
+    let env = Env::new();
+    let home = env.dir("serverhome");
+    let Some(ssh) = fake_ssh(&env, &home) else { return };
+    let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
+    env.ok(U, &proj, &["remote", "add", "origin", "fakehost:~/repo"]);
+    let mut c = env.cmd(U, &proj, &["push", "origin"]);
+    c.env("VEIL_SSH", &ssh);
+    let out = c.output().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        home.join("repo/.veil/repo.json").is_file() && !home.join("~").exists(),
+        "the repository landed in {:?}",
+        adversarial_support::tree_listing(&home).into_iter().take(4).collect::<Vec<_>>()
+    );
+}
