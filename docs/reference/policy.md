@@ -10,7 +10,7 @@ Subcommands:
 * [`vl policy show`](#vl-policy-show): Show all rules, built-in first, and any change not yet accepted
 * [`vl policy check`](#vl-policy-check): Explain how paths are classified
 * [`vl policy accept`](#vl-policy-accept): Apply the working copy's .veilpolicy in full, including changes that arrived by merge, pull or checkout and weaken the protection of local files (until now held back on this device)
-* [`vl policy import-gitignore`](#vl-policy-import-gitignore): Add an `ignore` rule for each `.gitignore` pattern that matches a file here, so files Git ignores are not recorded (not implemented yet)
+* [`vl policy import-gitignore`](#vl-policy-import-gitignore): Add an `ignore` rule for each `.gitignore` pattern that matches a file here, so files Git ignores are not recorded
 
 ## `vl policy show`
 
@@ -50,7 +50,7 @@ Options:
 
 ## `vl policy import-gitignore`
 
-Add an `ignore` rule for each `.gitignore` pattern that matches a file here, so files Git ignores are not recorded (not implemented yet)
+Add an `ignore` rule for each `.gitignore` pattern that matches a file here, so files Git ignores are not recorded
 
 ```text
 vl policy import-gitignore [OPTIONS]
