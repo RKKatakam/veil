@@ -565,7 +565,7 @@ fn merge_file_content(
         conflicts.push(path.clone());
         return Ok(None);
     }
-    let merged = match crate::textmerge::merge(&base, &ours, &theirs, MARKER_LEN, crate::textmerge::Style::Diff3) {
+    let merged = match content_merge(path, &base, &ours, &theirs, crate::textmerge::Style::Diff3) {
         Ok(m) => m,
         Err(_) => {
             conflicts.push(path.clone());
@@ -652,7 +652,7 @@ fn merge_file(
         conflicts.push(path.clone());
         ours
     } else {
-        match crate::textmerge::merge(&base, &ours, &theirs, MARKER_LEN, style) {
+        match content_merge(path, &base, &ours, &theirs, style) {
             Ok(m) => m,
             Err(m) => {
                 conflicts.push(path.clone());
@@ -670,6 +670,23 @@ fn merge_file(
         visibility,
         fallback,
     })
+}
+
+/// The line merge of one file's three readable text versions: `Ok` when
+/// clean, `Err` with conflict markers otherwise (see
+/// [`crate::textmerge::merge`]).
+///
+/// The seam for per-path merge drivers (`.gitattributes` `merge=`, stream
+/// W2 of the Git-parity round): a driver chosen for `path` would run here.
+/// Until then every path merges with the built-in diff3, whose clean result
+/// never holds a line of the base that neither side has. A driver can
+/// output anything it is given, so it must not be given a base whose
+/// audience is not the result's (design 7, threat review 6): check
+/// [`base_shown`] against the result's visibility first, and pass an empty
+/// base otherwise (BUG-126).
+fn content_merge(path: &VPath, base: &[u8], ours: &[u8], theirs: &[u8], style: crate::textmerge::Style) -> std::result::Result<Vec<u8>, Vec<u8>> {
+    let _ = path;
+    crate::textmerge::merge(base, ours, theirs, MARKER_LEN, style)
 }
 
 /// The visibility `e`'s object really has (BUG-103), if it can be checked.

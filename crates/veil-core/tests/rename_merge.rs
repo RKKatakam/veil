@@ -609,3 +609,31 @@ fn merging_a_cloaked_line_never_publishes_a_followed_rename() {
     remote::push(&mut r, mirror.clone(), true, &[], false).unwrap();
     assert!(backend_contains(mirror.as_ref(), b"ROTATED-Q8").is_empty(), "never published");
 }
+
+/// Threat review 9: a conflict entry is renamed only as the very same
+/// conflict object; the other side's resolution then follows it.
+#[test]
+fn conflict_entries_pair_only_by_their_own_id() {
+    let r = repo();
+    let body = lines("a", 10);
+    let (b, o, t) = (
+        tree(&r, &[("f", fe(&r, &body, &Visibility::Public))]),
+        tree(&r, &[("f", fe(&r, &edit_line(&body, 1, "O"), &Visibility::Public))]),
+        tree(&r, &[("f", fe(&r, &edit_line(&body, 1, "T"), &Visibility::Public))]),
+    );
+    let c = merge_trees(r.store(), Some(b), o, t).unwrap();
+    let ce = at(&r, &c.tree, "f").unwrap();
+    assert_eq!(ce.kind, EntryKind::Conflict);
+    let base = tree(&r, &[("f", ce.clone())]);
+    let renamed = tree(&r, &[("g", ce.clone())]);
+    let resolved_body = edit_line(&body, 1, "RESOLVED");
+    let resolved = tree(&r, &[("f", fe(&r, &resolved_body, &Visibility::Public))]);
+    let m = merge_trees(r.store(), Some(base), renamed, resolved).unwrap();
+    assert!(m.conflicts.is_empty(), "{:?}", m.conflicts);
+    assert_eq!(content(&r, &m.tree, "g"), resolved_body, "the resolution followed the renamed conflict");
+    // A file with the conflict's rendered text is not its rename.
+    let rendered = veil_core::conflict::read_file_like(r.store(), &ce).unwrap();
+    let as_file = tree(&r, &[("g", fe(&r, std::str::from_utf8(&rendered).unwrap(), &Visibility::Public))]);
+    let m = merge_trees(r.store(), Some(base), as_file, resolved).unwrap();
+    assert!(m.renames.is_empty());
+}

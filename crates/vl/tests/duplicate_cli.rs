@@ -254,3 +254,25 @@ fn restoring_from_an_embargoed_fix_onto_another_line_publishes_nothing() {
     assert!(store_contains(&mirror, b"FIXNAME-K7").is_empty(), "the fix's name reached the public remote");
     assert!(store_contains(&mirror, b"FIXBODY-K7").is_empty(), "the fix's content reached the public remote");
 }
+
+/// Design 2, threat review 1: renames are reported, never stored: not in
+/// the snapshots, trees or operations a merge that followed one writes.
+#[test]
+fn followed_renames_are_never_recorded() {
+    let env = Env::new();
+    let r = env.repo("p");
+    let base = lines10("l");
+    r.commit("base", &[("before-RN7.txt", &base)]);
+    r.tag("base", "@-");
+    std::fs::rename(r.dir.join("before-RN7.txt"), r.dir.join("after-RN7.txt")).unwrap();
+    r.ok(&["commit", "--no-advance", "-m", "mv"]);
+    r.tag("mv", "@-");
+    r.ok(&["new", "base"]);
+    r.commit("edit", &[("before-RN7.txt", &format!("EDIT\n{base}"))]);
+    let out = r.ok(&["merge", "mv", "-m", "plain message"]);
+    assert!(out.contains("followed rename"), "{out}");
+    let ops = r.ok(&["op", "log", "--json"]);
+    assert!(!ops.contains("before-RN7") && !ops.contains("followed"), "{ops}");
+    assert!(r.store_contains("followed").is_empty());
+    assert!(r.store_contains("before-RN7.txt -> after-RN7.txt").is_empty());
+}
