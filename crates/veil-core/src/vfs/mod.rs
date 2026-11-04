@@ -8,14 +8,21 @@
 //! * [`OverlayBackend`] — copy-on-write layer over any read-only lower
 //!   backend (typically a [`crate::tree::TreeView`] of a snapshot), giving
 //!   O(1) workspace creation and O(changes) snapshots.
+//! * [`SftpBackend`]    — a repository on another machine, reached through
+//!   the user's `ssh` and its `sftp` subsystem (remotes).
 
 mod disk;
 mod memory;
 mod overlay;
+mod sftp;
+mod sftp_client;
+mod sftp_url;
 
 pub use disk::DiskBackend;
 pub use memory::MemoryBackend;
 pub use overlay::{OverlayBackend, OverlayChanges};
+pub use sftp::{SftpBackend, SftpStats};
+pub use sftp_url::SshUrl;
 
 use crate::{error::Result, id::ObjectId, vpath::VPath};
 
@@ -111,8 +118,16 @@ pub fn is_temp_name(name: &str) -> bool {
 /// mutability so a backend can be shared (`Arc<dyn StorageBackend>`) between
 /// the repository, its working copies and concurrent tasks.
 pub trait StorageBackend: Send + Sync + std::fmt::Debug {
-    /// Human-readable backend kind (`disk`, `memory`, `overlay`, `tree`).
+    /// Human-readable backend kind (`disk`, `memory`, `overlay`, `tree`, `sftp`).
     fn kind(&self) -> &'static str;
+
+    /// Storage reached over a network and shared with clients on other
+    /// hosts ([`SftpBackend`]). Its repository lock uses lease-based
+    /// takeover with fencing (see `lock.rs`), and sync batches requests
+    /// instead of probing object by object.
+    fn is_network(&self) -> bool {
+        false
+    }
 
     fn read(&self, path: &VPath) -> Result<Vec<u8>>;
 
