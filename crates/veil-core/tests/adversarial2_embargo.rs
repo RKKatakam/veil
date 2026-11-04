@@ -12,7 +12,7 @@ use std::sync::Arc;
 use adversarial_support::*;
 use veil_core::{
     commands::EmbargoSpec,
-    object::{Object, Visibility},
+    object::Object,
     remote,
     tree::walk_files,
     Identity, MemoryBackend, ObjectId, Repo, StorageBackend,
@@ -42,7 +42,7 @@ fn readable_containing(r: &Repo, needle: &[u8]) -> Vec<String> {
             Object::Blob(b) => b,
             Object::Tree(t) => serde_json::to_vec(&t).unwrap(),
             Object::Snapshot(s) => {
-                let mut b = serde_json::to_vec(&*s_desc(r, &s)).unwrap();
+                let mut b = serde_json::to_vec(&s_desc(r, &s)).unwrap();
                 b.extend(serde_json::to_vec(&s).unwrap());
                 b
             }
@@ -55,8 +55,8 @@ fn readable_containing(r: &Repo, needle: &[u8]) -> Vec<String> {
     out
 }
 
-fn s_desc(r: &Repo, s: &veil_core::object::Snapshot) -> Box<String> {
-    Box::new(r.store().read_text(&s.description).unwrap_or_default())
+fn s_desc(r: &Repo, s: &veil_core::object::Snapshot) -> String {
+    r.store().read_text(&s.description).unwrap_or_default()
 }
 
 fn wc_checkout(repo: &mut Repo, fs: &dyn StorageBackend, from: ObjectId) {
@@ -245,6 +245,38 @@ fn a_new_file_on_an_embargoed_line_is_secret_scanned() {
     fs.write(&p("new.rs"), b"const AWS: &str = \"AKIAIOSFODNN7EXAMPLE\";\n").unwrap();
     let out = alice.snapshot_workspace(WS, &*fs).unwrap();
     assert!(out.report.quarantined.iter().any(|(p, _)| p.as_str() == "new.rs"));
+}
+
+// ---- edits after a release ---------------------------------------------------------
+
+/// A file edited on an embargoed line carries the pre-embargo object as its
+/// fallback. After the release, writing the file back to that old content
+/// is a real edit (a revert), but the snapshot takes it for a stale working
+/// copy and keeps the embargoed version. On `.veilpolicy` this silently
+/// drops a re-cloak: disk says `cloak`, history says `public` (and the
+/// `adversarial2_props` model turns that into a public leak of cloaked
+/// content).
+#[test]
+#[ignore = "BUG-050: after a release, reverting a file to its pre-embargo content is silently not recorded"]
+fn reverting_a_file_to_its_pre_embargo_content_after_release_is_recorded() {
+    let (mut alice, fs, _) = new_repo("alice");
+    let main = commit_files(&mut alice, &*fs, &[("a.txt", "v1\n")], "v1");
+    let ws = alice.ephemeral_workspace(main).unwrap();
+    ws.write("fix.rs", "fix\n").unwrap();
+    let (fix, _) = alice.commit_ephemeral(&ws, "fix").unwrap();
+    let r = alice.merge(WS, main, vec![fix], "fix", embargo("team")).unwrap();
+    wc_checkout(&mut alice, &*fs, main);
+    // An edit on the embargoed line: sealed under the embargo, fallback v1.
+    fs.write(&p("a.txt"), b"v2\n").unwrap();
+    snap(&mut alice, &*fs);
+    alice.commit_working_copy(WS, "v2").unwrap();
+    alice.release_embargo(r.embargo.as_deref().unwrap()).unwrap();
+    // Deliberately revert to v1.
+    fs.write(&p("a.txt"), b"v1\n").unwrap();
+    snap(&mut alice, &*fs);
+    let wc = alice.workspace_wc(WS).unwrap();
+    let recorded = String::from_utf8(read_at(&alice, &wc, "a.txt")).unwrap();
+    assert_eq!(recorded, "v1\n", "the revert on disk was not recorded; history still says {recorded:?}");
 }
 
 // ---- metadata in the merge snapshot ------------------------------------------------
