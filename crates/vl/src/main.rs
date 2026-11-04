@@ -28,7 +28,7 @@ mod render;
 mod sandbox;
 
 use std::{
-    io::{Read, Write},
+    io::{IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
@@ -39,9 +39,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser};
 use veil_core::{
     checkout::{behind_special, Materialised},
-    commands::{CommitResult, EmbargoSpec, TagKept},
+    commands::{CommitResult, EmbargoSpec, TagKept, RELEASE_OP_PREFIX},
     now_millis,
-    keychain::validate_scope_name,
+    keychain::{validate_scope_name, ReleaseState},
     policy::{escape_field, escape_literal, format_rule, has_glob_syntax, Policy, Tier, POLICY_FILE},
     remote,
     repo::{RemoteConfig, DEFAULT_WORKSPACE},
@@ -274,13 +274,31 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Op(OpCmd::Restore { id }) => {
             let op = ctx.repo.ops().resolve_prefix(id)?;
             let ws = ctx.ws.clone();
+            // Releases are not in the view: take back the staged ones made
+            // since, and say which published ones stay (BUG-109).
+            let (staged, published) = ctx.repo.releases_after(&op)?;
             ctx.repo.restore_operation_keeping_edits(&ws, op)?;
+            for e in &staged {
+                ctx.repo.keys().take_back_release(e)?;
+            }
             println!("Restored to operation {}", op.short());
+            for e in &staged {
+                println!("  embargo {}: release taken back (its key had not left this repository)", safe(e));
+            }
+            for e in &published {
+                warn(&format!(
+                    "embargo {} stays released: its key was published after that operation, and a published key cannot be taken back",
+                    safe(e)
+                ));
+            }
         }
         Cmd::Undo => {
             let ws = ctx.ws.clone();
             let (_, undone) = ctx.repo.undo_keeping_edits(&ws)?;
             println!("Undid: {}", safe(&undone));
+            if let Some(e) = undone.strip_prefix(RELEASE_OP_PREFIX) {
+                println!("Embargo {} is unreleased again: its key had not left this repository.", safe(e));
+            }
         }
         Cmd::Watch { interval_ms } => cmd_watch(ctx, *interval_ms)?,
         Cmd::Remote(c) => cmd_remote(ctx, c)?,
@@ -848,7 +866,8 @@ fn cmd_show(ctx: &mut Ctx, rev: &str, stat: bool) -> Result<()> {
     if let Some(e) = &s.embargo {
         let rec = ctx.repo.keys().load_embargo(e)?;
         let state = match rec {
-            Some(r) if r.is_released() => "released".to_string(),
+            Some(_) if ctx.repo.keys().release_state(e) == ReleaseState::Released => "released".to_string(),
+            Some(_) if ctx.repo.keys().release_state(e) == ReleaseState::Staged => "released here, not pushed yet".to_string(),
             Some(r) => match r.until {
                 Some(u) => format!("until {}", fmt_deadline(u)),
                 None => "until manually released".into(),
@@ -1080,13 +1099,19 @@ fn cmd_embargo(ctx: &mut Ctx, c: &EmbargoCmd) -> Result<()> {
                 println!("No embargoes.");
             }
             for r in list {
-                let state = if r.is_released() {
-                    green("released")
-                } else {
-                    match r.until {
-                        Some(u) => yellow(&format!("until {}", fmt_deadline(u))),
-                        None => yellow("manual release"),
-                    }
+                let pending = || match r.until {
+                    Some(u) => yellow(&format!("until {}", fmt_deadline(u))),
+                    None => yellow("manual release"),
+                };
+                let state = match ctx.repo.keys().release_state(&r.id) {
+                    ReleaseState::Released => green("released"),
+                    ReleaseState::Staged => format!(
+                        "{} {}",
+                        green("released"),
+                        yellow("(not pushed yet: `vl undo` takes it back)")
+                    ),
+                    ReleaseState::Rejected(why) => format!("{} {}", pending(), red(&format!("(release ignored: {})", safe(&why)))),
+                    ReleaseState::Unreleased => pending(),
                 };
                 let key = if ctx.repo.keys().has(&format!("embargo/{}", r.id)) {
                     ""
@@ -1102,11 +1127,98 @@ fn cmd_embargo(ctx: &mut Ctx, c: &EmbargoCmd) -> Result<()> {
                 println!("{}  scope:{}  {state}{key}{desc}", bold(&safe(&r.id)), safe(&r.scope));
             }
         }
-        EmbargoCmd::Release { id } => {
-            ctx.repo.release_embargo(id)?;
-            println!("Released embargo {id}; push to publish it.");
+        EmbargoCmd::Release { id, yes } => cmd_embargo_release(ctx, id, *yes)?,
+    }
+    Ok(())
+}
+
+/// `vl embargo release`: a previewed, confirmed release (BUG-109). The
+/// release is staged in this repository; the next push or Git export
+/// publishes the key, and until then `vl undo` takes it back.
+fn cmd_embargo_release(ctx: &mut Ctx, id: &str, yes: bool) -> Result<()> {
+    let keys = ctx.repo.keys();
+    let Some(rec) = keys.load_embargo(id)? else {
+        bail!("no embargo '{}' (see `vl embargo list`)", safe(id));
+    };
+    match keys.release_state(id) {
+        ReleaseState::Released => {
+            println!("Embargo {} is already released.", safe(id));
+            return Ok(());
+        }
+        ReleaseState::Staged => {
+            println!("Embargo {} is already released here; your next push publishes it (`vl undo` right after the release takes it back).", safe(id));
+            return Ok(());
+        }
+        ReleaseState::Unreleased | ReleaseState::Rejected(_) => {}
+    }
+    // What becomes public.
+    println!(
+        "Releasing embargo {} (scope {}) publishes its key: everyone who receives your next push can read the fix.",
+        bold(&safe(id)),
+        safe(&rec.scope)
+    );
+    let mut merges = Vec::new();
+    let mut tags = Vec::new();
+    for sid in ctx.repo.visible_snapshots()? {
+        let s = ctx.repo.snapshot(&sid)?;
+        if s.embargo.as_deref() == Some(id) {
+            merges.push((sid, first_line(&ctx.repo.description(&s)).to_string()));
         }
     }
+    for (name, t) in &ctx.repo.view().tags {
+        if ctx.repo.carried_embargo(&t.target)?.as_deref() == Some(id) {
+            tags.push(safe(name).into_owned());
+        }
+    }
+    for (sid, d) in &merges {
+        println!("  {} {} {}", yellow("merge"), blue(&sid.short()), safe(d));
+    }
+    let history = remote::withheld_by_embargo(&ctx.repo, id)?;
+    if !history.is_empty() {
+        println!("  {} snapshot(s) of the fix's history, withheld until now:", history.len());
+        for sid in history.iter().take(10) {
+            let d = ctx.repo.snapshot(sid).map(|s| first_line(&ctx.repo.description(&s)).to_string()).unwrap_or_default();
+            let d = if d.trim().is_empty() { dim("(no description set)") } else { safe(&d).into_owned() };
+            println!("    {} {d}", blue(&sid.short()));
+        }
+        if history.len() > 10 {
+            println!("    … and {} more", history.len() - 10);
+        }
+    }
+    if !tags.is_empty() {
+        println!("  on: {}", cyan(&tags.join(", ")));
+    }
+    let remotes: Vec<String> = ctx
+        .repo
+        .config()
+        .remotes
+        .iter()
+        .map(|(n, r)| if r.public { format!("{} (public)", safe(n)) } else { safe(n).into_owned() })
+        .collect();
+    if remotes.is_empty() {
+        println!("  No remote is configured yet; the first push or Git export publishes it.");
+    } else {
+        println!("  Your next push to any remote publishes it (remotes: {}).", remotes.join(", "));
+    }
+    println!("  Until you push (or export to Git), `vl undo` takes the release back. After that it cannot be undone.");
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            bail!("not released: confirm with `vl embargo release {} --yes`", safe(id));
+        }
+        eprint!("Release embargo {}? [y/N] ", safe(id));
+        std::io::stderr().flush().ok();
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("Not released.");
+            return Ok(());
+        }
+    }
+    ctx.repo.release_embargo(id)?;
+    println!(
+        "Released embargo {} in this repository. Your next push (or Git export) publishes the key; until then `vl undo` takes it back.",
+        safe(id)
+    );
     Ok(())
 }
 
@@ -1854,6 +1966,13 @@ fn cmd_push(ctx: &mut Ctx, name: &str, tags: &[String], force: bool, full: bool)
     }
     for w in &r.warnings {
         warn_untrusted(w);
+    }
+    for e in &r.releases_published {
+        println!(
+            "  {} embargo {} (its key is in the pushed record now; the release can no longer be undone)",
+            green("published"),
+            safe(e)
+        );
     }
     println!(
         "Pushed {} object(s) to {}{name}{}",

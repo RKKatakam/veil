@@ -9,6 +9,7 @@ use crate::{
     },
     error::{Result, VeilError},
     id::{ChangeId, ObjectId},
+    keychain::{ReleaseState, StageOutcome, TakeBack},
     merge::merge_trees,
     now_millis,
     object::{EntryKind, Snapshot, TreeEntry, Visibility},
@@ -19,6 +20,9 @@ use crate::{
     tree::{lookup, TreeView},
     vpath::VPath,
 };
+
+/// Description prefix of the operation that releases an embargo.
+pub const RELEASE_OP_PREFIX: &str = "release embargo ";
 
 #[derive(Debug, Clone)]
 pub struct EmbargoSpec {
@@ -547,12 +551,78 @@ impl Repo {
         Ok(())
     }
 
+    /// Release embargo `id`, recorded as the operation `release embargo
+    /// <id>`. The release is **staged** ([`Keychain::stage_release`]): this
+    /// repository treats the embargo as released at once, and the key
+    /// reaches the synced record with the next push or Git export. Until
+    /// then `vl undo` takes the release back completely; afterwards it
+    /// cannot be undone (BUG-109).
+    ///
+    /// [`Keychain::stage_release`]: crate::keychain::Keychain::stage_release
     pub fn release_embargo(&mut self, id: &str) -> Result<()> {
-        self.keys().release_embargo(id)?;
-        let mut tx = self.transaction(format!("release embargo {id}"))?;
+        if self.keys().stage_release(id)? != StageOutcome::Staged {
+            return Ok(());
+        }
+        let mut tx = self.transaction(format!("{RELEASE_OP_PREFIX}{id}"))?;
         tx.record_always();
         tx.commit()?;
         Ok(())
+    }
+
+    /// Undoing the operation `description`, as far as embargo releases go.
+    /// A release lives in the embargo record (or, until pushed, in
+    /// device-local state), not in the view an undo restores. So undoing
+    /// `release embargo <id>` takes back a release that is only staged
+    /// (returns its id, for [`Repo::finish_undo_release`] once the view is
+    /// restored), and is **refused**, before anything changes, when the key
+    /// has been published: nothing can unpublish it. Undoing the undo of a
+    /// release is refused too: undo never releases an embargo.
+    pub fn check_undo_release(&self, description: &str) -> Result<Option<String>> {
+        if let Some(id) = description.strip_prefix("undo: ").and_then(|d| d.strip_prefix(RELEASE_OP_PREFIX)) {
+            return Err(VeilError::Policy(format!(
+                "the last command took back the release of embargo {id}, and `vl undo` never releases an embargo; run `vl embargo release {id}` to release it again (nothing was changed)"
+            )));
+        }
+        let Some(id) = description.strip_prefix(RELEASE_OP_PREFIX) else {
+            return Ok(None);
+        };
+        match self.keys().release_state(id) {
+            ReleaseState::Released => Err(VeilError::Policy(format!(
+                "cannot undo `{description}`: the embargo key has been published (pushed, exported to Git, or received from a remote), and a published key cannot be taken back. Nothing was changed. Treat the fix as public"
+            ))),
+            ReleaseState::Staged => Ok(Some(id.to_string())),
+            ReleaseState::Unreleased | ReleaseState::Rejected(_) => Ok(None),
+        }
+    }
+
+    /// Take back the staged release [`Repo::check_undo_release`] returned.
+    pub fn finish_undo_release(&self, id: Option<String>) -> Result<()> {
+        if let Some(id) = id {
+            if self.keys().take_back_release(&id)? == TakeBack::Published {
+                return Err(VeilError::Policy(format!(
+                    "embargo {id} was published while undoing its release; it stays released"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Releases made after operation `op` was recorded, which restoring it
+    /// cannot reach through the view: `(staged, published)` embargo ids.
+    /// Staged ones can be taken back ([`Keychain::take_back_release`]);
+    /// published ones stay released.
+    ///
+    /// [`Keychain::take_back_release`]: crate::keychain::Keychain::take_back_release
+    pub fn releases_after(&self, op: &ObjectId) -> Result<(Vec<String>, Vec<String>)> {
+        let at = self.ops.get(op)?.timestamp;
+        let staged: Vec<String> = self.keys().staged_releases()?.into_iter().filter(|(_, t)| *t > at).map(|(id, _)| id).collect();
+        let mut published = Vec::new();
+        for rec in self.keys().embargoes()? {
+            if self.keys().release_state(&rec.id) == ReleaseState::Released && rec.released_at.is_some_and(|t| t > at) {
+                published.push(rec.id);
+            }
+        }
+        Ok((staged, published))
     }
 
     /// Release every embargo whose deadline passed and for which we hold the
@@ -562,7 +632,7 @@ impl Repo {
         let mut released = Vec::new();
         for rec in self.keys().embargoes()? {
             // Only a deadline signed by a scope member may trigger a release.
-            if rec.is_released() || rec.until.is_none_or(|u| u > now) || !self.keys().embargo_trusted(&rec) {
+            if self.keys().embargo_released(&rec.id) || rec.until.is_none_or(|u| u > now) || !self.keys().embargo_trusted(&rec) {
                 continue;
             }
             if self.keys().has(&format!("embargo/{}", rec.id)) {
@@ -582,19 +652,28 @@ impl Repo {
             .first()
             .ok_or_else(|| VeilError::repo("nothing to undo"))?;
         let undone = op.description.clone();
+        let release = self.check_undo_release(&undone)?;
         let view = self.ops.get(&parent)?.view;
         let mut tx = self.transaction(format!("undo: {undone}"))?;
         tx.view = view;
         tx.record_always();
-        Ok(tx.commit()?.expect("recorded"))
+        let id = tx.commit()?.expect("recorded");
+        self.finish_undo_release(release)?;
+        Ok(id)
     }
 
-    /// Restore the view as of an earlier operation.
+    /// Restore the view as of an earlier operation. Releases staged after
+    /// it are taken back; published ones stay ([`Repo::releases_after`]).
     pub fn restore_operation(&mut self, op: ObjectId) -> Result<ObjectId> {
+        let (staged, _) = self.releases_after(&op)?;
         let view = self.ops.get(&op)?.view;
         let mut tx = self.transaction(format!("restore to operation {}", op.short()))?;
         tx.view = view;
         tx.record_always();
-        Ok(tx.commit()?.expect("recorded"))
+        let id = tx.commit()?.expect("recorded");
+        for e in staged {
+            self.keys().take_back_release(&e)?;
+        }
+        Ok(id)
     }
 }

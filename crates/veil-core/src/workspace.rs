@@ -418,8 +418,11 @@ impl Repo {
             .parents
             .first()
             .ok_or_else(|| VeilError::repo("nothing to undo"))?;
+        // An embargo release is not in the view (see `check_undo_release`).
+        let release = self.check_undo_release(&op.description)?;
         let view = self.ops.get(&parent)?.view;
         let id = self.restore_view_keeping_edits(ws, view, &op.view, format!("undo: {}", op.description))?;
+        self.finish_undo_release(release)?;
         Ok((id, op.description))
     }
 

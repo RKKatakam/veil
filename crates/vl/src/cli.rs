@@ -429,10 +429,15 @@ pub enum TagCmd {
 pub enum EmbargoCmd {
     /// List embargoes.
     List,
-    /// Publish an embargo key now.
+    /// Release an embargo: show what becomes public, ask, and release it in
+    /// this repository. The next push (or Git export) publishes the key;
+    /// until then `vl undo` takes the release back.
     Release {
         /// Embargo id, from `vl embargo list`.
         id: String,
+        /// Do not ask for confirmation (required when stdin is not a terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 

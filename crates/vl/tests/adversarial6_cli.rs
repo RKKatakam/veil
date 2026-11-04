@@ -350,7 +350,6 @@ fn an_unreadable_policy_file_does_not_brick_the_cli() {
 /// repository-changing command as an operation; the one command whose
 /// accidental use publishes a vulnerability is the one undo lies about.
 #[test]
-#[ignore = "BUG-109: `vl undo` after `vl embargo release` says it undid the release, but the embargo stays released and the next push publishes the fix"]
 fn undo_of_an_embargo_release_keeps_the_fix_embargoed() {
     let env = Env::new();
     let proj = env.dir("proj");
@@ -370,7 +369,7 @@ fn undo_of_an_embargo_release_keeps_the_fix_embargoed() {
     assert!(child.wait_with_output().unwrap().status.success());
     env.ok(U, &proj, &["merge", "fix@", "--into", "main", "--embargo", "-m", "Fix CVE"]);
     let id = env.stdout(U, &proj, &["embargo", "list"]).split_whitespace().next().unwrap().to_string();
-    env.ok(U, &proj, &["embargo", "release", &id]);
+    env.ok(U, &proj, &["embargo", "release", &id, "--yes"]);
     let undo = env.ok(U, &proj, &["undo"]);
     assert!(undo.contains("release embargo"), "{undo}");
     let list = env.stdout(U, &proj, &["embargo", "list"]);

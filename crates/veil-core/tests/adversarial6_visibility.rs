@@ -222,7 +222,6 @@ fn a_relabelled_entry_cannot_rekey_the_victims_edit_to_an_attacker_scope() {
 /// the fix touches, which the threat model says is hidden ("their file
 /// names, sizes and set of changed files").
 #[test]
-#[ignore = "BUG-104: the embargo wrapper lists the pre-merge ids of every changed file, revealing which files the fix touches"]
 fn the_wrapper_does_not_reveal_which_files_the_fix_changed() {
     let (mut alice, fs, _) = new_repo("alice");
     let main = commit_files(
@@ -281,7 +280,6 @@ fn the_wrapper_does_not_reveal_which_files_the_fix_changed() {
 /// embargo guide says "nobody can force a key holder to release"; a
 /// revoked member does exactly that.
 #[test]
-#[ignore = "BUG-108: a revoked member can release an embargo, and every replica accepts the release"]
 fn a_revoked_member_cannot_release_an_embargo() {
     let (mut alice, fs, _) = new_repo("alice");
     let bob = Identity::generate("bob");

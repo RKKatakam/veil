@@ -272,6 +272,9 @@ Working copy now at: yyntkszx 4094f80d (no description set)
   workspaces) to the state after operation `<id>`.
 * Both **keep the files on disk that you had not recorded yet**: the
   automatic snapshot taken before `undo` is not what gets undone.
+* What already left the repository cannot be undone. An **embargo
+  release** can be undone only until your next push or Git export; after
+  that `vl undo` refuses it ([Embargoes](embargoes.md#the-workflow)).
 
 Other ways to reshape history:
 

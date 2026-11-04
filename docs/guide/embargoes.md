@@ -103,14 +103,41 @@ Pushed 2 object(s) to public remote mirror; 2 cloaked/embargoed object(s) withhe
 ```
 
 **5. Release** when the advisory goes out (or let the deadline do it), and
-push again:
+push again. `vl embargo release` first shows what becomes public and asks:
 
 ```text
 $ vl embargo release 77932133a2
-Released embargo 77932133a2; push to publish it.
+Releasing embargo 77932133a2 (scope team) publishes its key: everyone who receives your next push can read the fix.
+  merge af765f31 Fix CVE-2026-1234
+  1 snapshot(s) of the fix's history, withheld until now:
+    2be318b2 Fix CVE-2026-1234: empty buffer crash
+  on: main
+  Your next push to any remote publishes it (remotes: mirror (public), origin).
+  Until you push (or export to Git), `vl undo` takes the release back. After that it cannot be undone.
+Release embargo 77932133a2? [y/N] y
+Released embargo 77932133a2 in this repository. Your next push (or Git export) publishes the key; until then `vl undo` takes it back.
 $ vl push mirror
+  published embargo 77932133a2 (its key is in the pushed record now; the release can no longer be undone)
 Pushed 6 object(s) to public remote mirror; 1 cloaked/embargoed object(s) withheld
 ```
+
+In a script, pass `--yes` (without it, a release from a non-terminal is
+refused).
+
+**Released by mistake?** Until your next push or Git export, the release
+exists only in your repository: the key is kept in device-local state that
+no sync reads. `vl undo` right after it takes it back completely:
+
+```text
+$ vl undo
+Undid: release embargo 77932133a2
+Embargo 77932133a2 is unreleased again: its key had not left this repository.
+```
+
+(`vl embargo list` shows such a release as `released (not pushed yet)`.)
+Once a push or Git export has published the key, `vl undo` refuses and
+changes nothing: a published key cannot be taken back, so treat the fix
+as public.
 
 For GitHub, `vl git push` after the release adds one commit on top of the
 branch that publishes the fix and links its history (a fast-forward).
@@ -198,6 +225,18 @@ Released embargo af4a705f61: its release time has passed
 Release is not time-lock cryptography: a key holder can release early, and
 nobody can force a key holder to release.
 
+**Who may release.** Only a *current* member of the embargo's scope (or
+anyone's `vl`, once the deadline has passed). If you revoke someone who
+was in the scope when the embargo was created, they still hold its key,
+and could leak it or the fix by other means (revocation is forward-only).
+But a release they make is ignored by every member's `vl` and by the team
+remote: the embargo stays in force, and your next public push does not
+publish the fix. `vl pull` warns about such a release
+(`release ignored: … not a current member`), and `vl embargo list` shows
+it next to the embargo. A member granted by short member id (without
+their full identity) cannot release before the deadline either: re-grant
+them with the identity `vl identity show` prints.
+
 ## One embargo per line
 
 Veil 1.0 keeps **at most one unreleased embargo per line**. A second
@@ -239,6 +278,12 @@ Nothing is recorded when this happens. Your options:
   remotes.
 * **One embargo per line** (above).
 * **Release time is enforced by key holders' `vl`**, not by cryptography.
+* **A pushed release is final.** Only an unpushed release can be undone
+  (above).
+* **A revoked member still holds the key.** Their release is refused, but
+  nothing stops them leaking the key or the fix out of band.
+* **The wrapper's size is visible**: outsiders cannot tell *which* files
+  changed, but can estimate *how many* files and directories did.
 * **Undoing the merge undoes the protection.** If the embargoed merge is
   undone or abandoned before a push, the fix line is an ordinary change
   again: only its cloak protects it.
