@@ -352,7 +352,12 @@ pub fn print_log(repo: &Repo, ws: &str, limit: Option<usize>) -> Result<()> {
                     "  ⇠ merges {}",
                     parents
                         .iter()
-                        .map(|p| repo.snapshot(p).map(|s| s.change_id.short()).unwrap_or_default())
+                        // A parent may be withheld (unreleased embargo on a
+                        // public clone): name it by snapshot id instead.
+                        .map(|p| match repo.snapshot_opt(p) {
+                            Ok(Some(s)) => s.change_id.short(),
+                            _ => format!("{} (withheld)", p.short()),
+                        })
                         .collect::<Vec<_>>()
                         .join(", ")
                 ))
