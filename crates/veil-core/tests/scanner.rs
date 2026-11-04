@@ -953,6 +953,166 @@ fn v6_rules_hold_in_every_encoding_and_place() {
     }
 }
 
+// ---- scanner v7 (BUG-487 … BUG-489) --------------------------------------------------
+
+/// Credential keys, as words, in the shapes `v5_key_spellings` writes them.
+const V5_KEYS: &[&str] = &[
+    "password", "passwd", "secret", "token", "api key", "secret key", "secret access key", "aws secret access key", "client secret",
+    "access token", "auth token", "private key", "app key", "master key", "rails master key", "encryption key", "signing key", "auth key",
+    "db password", "smtp password", "jwt secret", "github token", "gitlab token", "slack token", "stripe secret key", "x api key",
+    "my api key", "refresh token", "bearer token", "oauth token", "session secret", "client secret prod", "account key",
+    "shared access key", "admin password", "secret token", "api token", "personal access token", "npm token", "auth token prod",
+    "db password 2", "api keys", "passwords", "app secret", "consumer secret", "access key secret", "hmac key", "logged in salt",
+    "nonce salt", "webhook secret", "root password", "mysql root password",
+];
+
+/// Spellings of `V5_KEYS` scanner v5 did not take for credentials: a
+/// generic `secret` / `token` glued to another word (`githubtoken`, a
+/// camelCase `githubToken`), and `railsmasterkey`.
+const V5_MISSED_KEYS: &[&str] = &[
+    "AccessKeySecret", "ApiToken", "AppSecret", "AuthTokenProd", "BearerToken", "ClientSecretProd", "ConsumerSecret", "GithubToken",
+    "GitlabToken", "JwtSecret", "NpmToken", "RefreshToken", "SecretToken", "SessionSecret", "SlackToken", "WebhookSecret",
+    "_accessKeySecret", "_apiToken", "_appSecret", "_authTokenProd", "_bearerToken", "_clientSecretProd", "_consumerSecret",
+    "_githubToken", "_gitlabToken", "_jwtSecret", "_npmToken", "_refreshToken", "_secretToken", "_sessionSecret", "_slackToken",
+    "_webhookSecret", "accessKeySecret", "accesskeysecret", "apiToken", "apitoken", "appSecret", "appsecret", "authTokenProd",
+    "authtokenprod", "bearerToken", "bearertoken", "clientSecretProd", "clientsecretprod", "consumerSecret", "consumersecret",
+    "githubToken", "githubtoken", "gitlabToken", "gitlabtoken", "jwtSecret", "jwtsecret", "npmToken", "npmtoken", "railsmasterkey",
+    "refreshToken", "refreshtoken", "secretToken", "secrettoken", "sessionSecret", "sessionsecret", "slackToken", "slacktoken",
+    "webhookSecret", "webhooksecret",
+];
+
+/// Where keys and values occur: configuration, code, URLs, `.npmrc`, XML.
+const V5_CONTEXTS: &[&str] = &[
+    "{k}={v}", "{k}: {v}", "  {k}: \"{v}\"", "\"{k}\": \"{v}\",", "export {k}=\"{v}\"", "{k} = '{v}'", "    {k} = \"{v}\"",
+    "const {k} = \"{v}\";", "client = Client({k}=\"{v}\")", "client = Client({k}={v})", "https://api.example.com/x?{k}={v}&a=b",
+    "curl \"https://api.example.com/x?a=b&{k}={v}\"", "//registry.npmjs.org/:{k}={v}", "<{k}>{v}</{k}>", "<add key=\"{k}\" value=\"{v}\"/>",
+    "    '{k}' => '{v}',", "ENV {k}={v}", "set {k}={v}", "{k}:={v}", "obj.{k} = \"{v}\"", "this.{k} = '{v}';", "config['{k}'] = '{v}'",
+    "os.environ[\"{k}\"] = \"{v}\"", "define('{k}', '{v}');", "- name: {k}\n  value: \"{v}\"", "{k}={v} # comment", "{\"{k}\":\"{v}\"}",
+    "--{k}={v}", "  - \"{k}={v}\"", "  {k}: {v}", "$ {k}={v} ./run", "<property name=\"{k}\" value=\"{v}\"/>", "{k} := \"{v}\"",
+    "let {k} = \"{v}\";", "headers = {\"{k}\": \"{v}\"}", "{k} = {v}", "fetch(url + \"?{k}={v}\")", "\"url\": \"https://x.com/?{k}={v}\"",
+    "  url: https://api.example.com/v1?{k}={v}", "GET /v1/items?{k}={v} HTTP/1.1", "webhook=https://example.com/hook?{k}={v}",
+    "x = f(a, {k}={v})", "{k}=\"{v}\"", "[default]\n{k} = {v}", "<{k} type=\"plain\">{v}</{k}>", "  {k}={v}", "\t{k}\t=\t{v}", "{k}={v};",
+    "{k}: '{v}'", "server.{k}={v}", "spring.datasource.{k}={v}",
+];
+
+/// Random credentials of several kinds: alphanumeric, with symbols, hex,
+/// base64, lower-case, an npm token, short, dashed.
+const V5_VALUES: &[&str] = &[
+    "q8Zr4XvT2mLpW9nB7kYd3HsJ", "Xk9#mQ2$vL7pR4wZ", "9f86d081884c7d659a2feaa0c55ad015", "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2Rl",
+    "qzvxkwprmtfhjlnb", "npm_aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5", "Xk9mQ2vL7pR4", "Xk9m-Q2vL-7pR4-wZt8",
+];
+
+/// `words` as `snake_case`, `SNAKE_CASE`, `kebab-case`, `camelCase`,
+/// `PascalCase`, `flatcase` and `_camelCase`.
+fn v5_key_spellings(words: &[&str]) -> Vec<String> {
+    let cap = |w: &str| w[..1].to_uppercase() + &w[1..];
+    let camel = words[0].to_string() + &words[1..].iter().map(|w| cap(w)).collect::<String>();
+    let mut out = vec![
+        words.join("_"),
+        words.join("_").to_uppercase(),
+        words.join("-"),
+        camel.clone(),
+        words.iter().map(|w| cap(w)).collect(),
+        words.concat(),
+        format!("_{camel}"),
+    ];
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// BUG-487: every shape scanner v5 found is still found. The corpus is
+/// every spelling of `V5_KEYS` in every context of `V5_CONTEXTS` (2,700
+/// shapes, 14,200 lines with the value rotating); scanner v5 found every
+/// one but the `V5_MISSED_KEYS` spellings, whatever the value (measured
+/// with v5's `secrets.rs`, commit `bf824d0~1`, on all 8 values of each
+/// shape), and v6 missed 1,176 of them (unquoted values of camelCase keys:
+/// `.npmrc`, query strings, kwargs; `secretKey`; `API_KEYS`).
+#[test]
+fn every_shape_scanner_v5_found_is_found() {
+    let mut missed = Vec::new();
+    let mut n = 0;
+    for (ki, key) in V5_KEYS.iter().flat_map(|k| v5_key_spellings(&k.split(' ').collect::<Vec<_>>())).enumerate() {
+        if V5_MISSED_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        for (ci, context) in V5_CONTEXTS.iter().enumerate() {
+            let v = V5_VALUES[(ki + ci) % V5_VALUES.len()];
+            let line = format!("{}\n", context.replace("{k}", &key).replace("{v}", v));
+            n += 1;
+            if scan(line.as_bytes()).is_empty() {
+                missed.push(line);
+            }
+        }
+    }
+    assert!(n > 14_000, "{n}");
+    assert!(missed.is_empty(), "{} of {n} missed, e.g. {:?}", missed.len(), &missed[..missed.len().min(10)]);
+}
+
+/// BUG-488: dotted keys count where a key starts a configuration line or
+/// names an XML entry, not in code (`obj.key = …`) unless the value is a
+/// literal random enough for a key.
+#[test]
+fn dotted_keys_count_in_configuration_only() {
+    let v = "q8Zr4XvT2mLpW9nB7kYd3HsJ";
+    for text in [
+        format!("api.key={v}\n"),
+        format!("  stripe.api.key: \"{v}\"\n"),
+        format!("app.encryption.key = {v}\n"),
+        format!("csrf.token.secret={v}\n"),
+        format!("<add key=\"Stripe.Api.Key\" value=\"{v}\" />\n"),
+        format!("<property name=\"mail.api.key\" value=\"{v}\"/>\n"),
+        format!("<entry key='aws.secret.key'>{v}</entry>\n"),
+    ] {
+        assert!(!scan(text.as_bytes()).is_empty(), "{text}");
+    }
+    for text in [
+        "obj.key = getKey();\n",
+        "self.key = key\n",
+        "this.key = options.key;\n",
+        "item.key = \"user-profile-cache\"\n",
+        "cache.key = make_key(user.id, 'profile')\n",
+        "csrf.token=abcdefghijklmnopqrstuvwxyz0123456789\n",
+        "primary.key=customer_id_and_order_number\n",
+        "jwt.secret.path=/run/secrets/jwt_signing_secret\n",
+        "if (obj.api.key == expected) { return obj.api.key; }\n",
+        "<entry key=\"api.key.header\">X-Api-Key-Header-Name</entry>\n",
+    ] {
+        assert_clean(text, text.as_bytes());
+    }
+}
+
+/// BUG-489: code made of names is no credential, in any line: calls,
+/// indexes, lists, JSON Schema objects, type annotations.
+#[test]
+fn code_values_are_not_credentials() {
+    for text in [
+        "    password = lookup(user)\n",
+        "    password = self.dirdbm[c.username]\n",
+        "    output_token = [output_token]\n",
+        "    len_input_token = len(self._input_token)\n",
+        "    password = cfg.get(\"password\", default_password)\n",
+        "    identity_token = self._web_identity_token_loader()\n",
+        "    \"output_token\": \"Jobs[-1].JobId\",\n",
+        "    \"Token\":{\"type\":\"string\"},\n",
+        "    \"EncryptionKey\":{\"shape\":\"EncryptionKey\"},\n",
+        "pub const XCN_NCRYPT_PCP_ENCRYPTION_KEY: X509HardwareKeyUsageFlags = 2i32;\n",
+        "    signing_keys = self.get_signing_keys(refresh=True)\n",
+        "    passwd = getpass.getpass(b'Password: ')\n",
+    ] {
+        assert_clean(text, text.as_bytes());
+    }
+    // Real credentials in the same places are still found, also wrapped.
+    for text in [
+        "    password = \"Xk9(mQ2)vL7pR4wZt8\"\n",
+        "    password = Xk9mQ2vL7pR4wZt8(x)\n",
+        "pub const ENCRYPTION_KEY: &str = \"q8Zr4XvT2mLpW9nB7kYd3HsJ\";\n",
+        "client = Client(password=Xk9mQ2vL7pR4wZt8)\n",
+    ] {
+        assert!(!scan(text.as_bytes()).is_empty(), "{text}");
+    }
+}
+
 // ---- throughput ------------------------------------------------------------------------
 
 fn bench(name: &str, data: &[u8]) {

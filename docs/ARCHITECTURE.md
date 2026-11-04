@@ -596,7 +596,9 @@ CAS, and it applies these rules in order:
      credentials: whole references (`$X`, `${X}`; a `$` *inside* a random
      password is no reference), placeholders (`<key>`), hashes and
      encrypted values (`$2b$…`, `ENC(…)`), code (`os.getenv("X")`,
-     `Option<String>,`) and identifiers made of words
+     `Option<String>,`; scanner v7: any call, index or list made of names,
+     `lookup(user)`, `self.users[c.name]`, `[token]`, a type annotation
+     `KEY: Flags = 2`, a JSON object followed by `,`) and identifiers made of words
      (`settings.SECRET_KEY`; long words are judged by letter-pair
      frequencies, so `qzvxkwprmtfhjlnb` is no word) do not count, and the
      entropy bar is lower for short, hex and lower-case values. The rest of
@@ -620,7 +622,13 @@ CAS, and it applies these rules in order:
      like `let secret = config.secret_key.clone();` are no longer
      candidates. A keyword its left context rules out (`mytoken`,
      `monkey`) is dropped before capture groups are computed, with their
-     work still counted.
+     work still counted, and so is (scanner v7) a match running to the end
+     of its line whose value, without blanks, no key's rule could accept
+     (references and code: `os.environ["X"]`, `${X}`; capture groups cost
+     more than the rest of the search, and these are most matches in code
+     and configuration). On such a configuration line, the dots of the key
+     become `_` (`stripe.api.key` → `stripe_api_key`), as do those of the
+     `key="…"` / `name="…"` attributes of an XML line.
    * Time is linear in the input: repetitions that could hold another match
      are bounded, so a search reads at most about 1 KiB past its match, and
      the work redone after restarting inside a rejected match is counted;
@@ -628,6 +636,8 @@ CAS, and it applies these rules in order:
      quarantined. Crafted input scans at 25+ MiB/s, ordinary text at
      590–860 MiB/s (dense synthetic corpus) or 2.2–2.5 GiB/s (real
      source; 1.9 GiB/s JavaScript): 1.4–2.4× the previous scanner (v5).
+     Scanner v7 is level with v6 on clean code and binary data, and 8–12 %
+     faster on the mixed corpus (the value check before capture groups).
    * Keys: the credential keywords match anywhere in an identifier
      (`DB_PASSWORD`, `spring.datasource.password`), plural or numbered
      (`API_KEYS`, `PASSWORD2`), plus up to six suffix words
@@ -637,7 +647,9 @@ CAS, and it applies these rules in order:
      and `token` only count as a word of their own (`JWT_SECRET`, not
      `mytoken`), and `token` not after a word that names a non-credential
      (`csrf_token`, `next_page_token`, `cancellation_token`). Keys are
-     split into words at `_`, `-` and camelCase humps (scanner v6): `secret`,
+     split into words at `_`, `-` and camelCase humps (scanner v6), and at
+     `.` in the key of a configuration line or an XML entry (scanner v7:
+     `api.key=`, `<entry key="api.key">`, not `obj.key = …` in code): `secret`,
      `token` and `pwd` also count at a hump (`githubToken`, `stripeSecret`,
      `dbPwd`, not after a one-letter Hungarian prefix: `nToken`), and so
      do suffix words (`apiKeyProd`; not `tokenizer`, `passwordless`), with
@@ -657,7 +669,14 @@ CAS, and it applies these rules in order:
      Typed declarations (`API_KEY: &str = "…"`, `apiKey: string = "…"`,
      `api_key: str = "…"`), template literals, XML attributes on any
      element, `<entry key="…">` / `<property name="…"><value>` elements and
-     Dockerfile `ENV`/`ARG` lines count. A URL password must not
+     Dockerfile `ENV`/`ARG` lines count. A camelCase spelling of a key an
+     older rule found (`dbPassword`, `apiKey`, `_authToken`, `clientSecret`;
+     scanner v7) is held to the same, except that an unquoted token in code
+     counts, as before v6: `.npmrc`'s `//host/:_authToken=…`, a URL's query
+     string (`?accessToken=…&`, the value ending at `&`), keyword arguments.
+     A key a v6 rule rejects restarts the search inside it, so an older
+     keyword there still counts (`secretKey`: `key` after `secret`;
+     `ACCESS_KEY_SECRET`). A URL password must not
      be a word, a number or a reference (`user:password@`,
      `postgres:postgres@`, `${USER}:${PASS}@` do not count); it is judged
      percent-decoded, may contain `:`, and `:\/\/` (JSON) counts as `://`.

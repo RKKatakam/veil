@@ -263,26 +263,33 @@ encoding (binary and UTF-16 files included). It looks for:
 | `google-api-key` | `AIza…` |
 | `jwt` | JSON Web Tokens |
 | `url-password` | `postgres://app:<password>@db` |
-| `generic-secret-assignment` | `password = …`, `API_KEY=…`, `JWT_SECRET: …`, `client_secret`, `APP_KEY`, `RAILS_MASTER_KEY`, `<password>…</password>` and similar, with a credential-looking value; camelCase and PascalCase keys in JSON, YAML and JS/TS objects and properties (`githubToken: …`, `"stripeSecret": …`, `this.accessKey = …`, `apiKeyProd`, `apiKey: string = "…"`, `` const authToken = `…` ``); `*_KEY` names (`STRIPE_API_KEY`, `MINIO_ACCESS_KEY`, `SIDEKIQ_LICENSE_KEY`, and any `<WORD>_KEY` or `<word>Key` whose value is a random 16+ characters, such as `MAPBOX_KEY`, `stripeKey`); `DB_PWD`, `Pwd=` in connection strings; XML attributes on any element (`password="…"`, `secret="…"`, `apiKey="…"`, `connectionString="…;Password=…"`), `<add key="DbPassword" value="…"/>`, `<entry key="db.password">…</entry>`, Spring and .NET `<value>` elements; also `define('DB_PASSWORD', '…')`, `env["API_KEY"] = …`, Rust/Python typed constants (`API_KEY: &str = "…"`), Kubernetes `name:`/`value:` pairs, Dockerfile `ENV`, plist entries, SQL `WITH PASSWORD '…'` / `IDENTIFIED BY '…'`, Google app passwords |
+| `generic-secret-assignment` | `password = …`, `API_KEY=…`, `JWT_SECRET: …`, `client_secret`, `APP_KEY`, `RAILS_MASTER_KEY`, `<password>…</password>` and similar, with a credential-looking value; camelCase and PascalCase keys in JSON, YAML and JS/TS objects and properties (`githubToken: …`, `"stripeSecret": …`, `this.accessKey = …`, `apiKeyProd`, `apiKey: string = "…"`, `` const authToken = `…` ``); `*_KEY` names (`STRIPE_API_KEY`, `MINIO_ACCESS_KEY`, `SIDEKIQ_LICENSE_KEY`, and any `<WORD>_KEY` or `<word>Key` whose value is a random 16+ characters, such as `MAPBOX_KEY`, `stripeKey`); `DB_PWD`, `Pwd=` in connection strings; XML attributes on any element (`password="…"`, `secret="…"`, `apiKey="…"`, `connectionString="…;Password=…"`), `<add key="DbPassword" value="…"/>`, `<entry key="db.password">…</entry>`, Spring and .NET `<value>` elements; dotted keys of configuration lines and XML entries (`stripe.api.key=…`, `<entry key="api.key">`); `.npmrc` tokens (`//registry.npmjs.org/:_authToken=…`) and credentials in URL query strings (`?apiKey=…&`); also `define('DB_PASSWORD', '…')`, `env["API_KEY"] = …`, Rust/Python typed constants (`API_KEY: &str = "…"`), Kubernetes `name:`/`value:` pairs, Dockerfile `ENV`, plist entries, SQL `WITH PASSWORD '…'` / `IDENTIFIED BY '…'`, Google app passwords |
 | `scan-limit` | input crafted against the scanner (it would take far longer than ordinary text): reported rather than scanned to the end |
 | `injected-isolated-secret` | the value of an isolated file copied into a `ws exec` sandbox (see [Workspaces](workspaces-and-agents.md#with-isolated)) |
 
 The assignment rule tries hard not to fire on code: references (`$X`,
 `${X}`), placeholders (`<key>`), words (`settings.SECRET_KEY`), code
-(`os.getenv("PW")`), hashes and encrypted values (`$2b$…`, `ENC(…)`,
+(`os.getenv("PW")`, `lookup(user)`, `self.users[name]`, `[token]`, a
+type annotation such as `ENCRYPTION_KEY: KeyFlags = 2`), JSON objects
+(`"password":{"type":"string"}`), hashes and encrypted values (`$2b$…`, `ENC(…)`,
 `{cipher}…`) and non-credentials (`password_hash`, `token_url`,
 `csrf_token`, `nextPageToken`, `tokenizer`, `passwordField`, `PRIMARY_KEY`,
 `cacheKey`, `PUBLIC_KEY`, `KEY_PREFIX`) don't count. The camelCase and
 `<WORD>_KEY` rules ask more of a value: a quoted literal or one token on its
 key's line, not code, not made of words (`BCryptGenerateKeyFn`), not a
-UUID. A random password is found whatever symbols it has, including `$`,
+UUID. (A camelCase spelling of an older keyword, such as `dbPassword`,
+`apiKey` or `_authToken`, may also have an unquoted token in code: a URL's
+query string, `.npmrc`, a keyword argument.) A dotted key (`api.key`)
+counts only where it starts a configuration line or names an XML entry,
+not in code (`obj.key = …`). A random password is found whatever symbols it has, including `$`,
 `%`, quotes and brackets.
 
 **Known misses** (see [`docs/BACKLOG.md`](../BACKLOG.md)): word-only
 passphrases and passwords with spaces, weak passwords, URL passwords that
 are words or numbers, keys not on the keyword list (`credentials`,
 `pass`), values whose key is on another line (except Kubernetes `value:` and XML
-elements), unquoted values in code under camelCase keys, values more than
+elements), unquoted values in code under camelCase keys that only scanner
+v6 knows (`githubToken`, `stripeKey`), values more than
 16 KiB of blanks after their key, values longer than 256 characters are
 judged on their first 256, and compressed archives (`.zip`, `.tar.gz`,
 `.docx`, `.jar`), which are not decompressed. About 1 random 16-character
