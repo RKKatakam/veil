@@ -2,7 +2,7 @@
 //! snapshot tree. A `TreeView` is lazy: it only loads (and decrypts) the
 //! trees and blobs that are actually read.
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::sync::Arc;
 
 use crate::{
     error::{Result, VeilError},
@@ -34,23 +34,35 @@ pub fn lookup(store: &ObjectStore, root: &ObjectId, path: &VPath) -> Result<Opti
     unreachable!()
 }
 
-/// All file entries below `root`, sorted by path.
+/// Deepest directory nesting accepted from a remote (see
+/// `remote::Transfer`). Every walk in this module is iterative and copes
+/// with any depth; the bound protects the remaining recursive algorithms
+/// (merge, embargo normalisation, the builder) and keeps paths well below
+/// the host's `PATH_MAX`. Git's `core.maxTreeDepth` serves the same purpose.
+pub const MAX_TREE_DEPTH: usize = 1024;
+
+/// All file entries below `root`, in tree order (depth first, entries
+/// sorted by name within a directory).
 pub fn walk_files(store: &ObjectStore, root: &ObjectId) -> Result<Vec<(VPath, TreeEntry)>> {
     let mut out = Vec::new();
-    walk_into(store, root, &VPath::root(), &mut out)?;
-    Ok(out)
-}
-
-fn walk_into(store: &ObjectStore, id: &ObjectId, dir: &VPath, out: &mut Vec<(VPath, TreeEntry)>) -> Result<()> {
-    let tree = store.tree(id)?;
-    for e in &tree.entries {
+    // Explicit stack: tree depth is attacker-controlled.
+    let mut stack: Vec<(VPath, Arc<Tree>, usize)> = vec![(VPath::root(), store.tree(root)?, 0)];
+    while let Some((dir, tree, i)) = stack.last_mut() {
+        let Some(e) = tree.entries.get(*i) else {
+            stack.pop();
+            continue;
+        };
+        *i += 1;
         let p = dir.join(&e.name);
         match e.kind {
-            EntryKind::Dir => walk_into(store, &e.id, &p, out)?,
             EntryKind::File => out.push((p, e.clone())),
+            EntryKind::Dir => {
+                let child = store.tree(&e.id)?;
+                stack.push((p, child, 0));
+            }
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,7 +91,7 @@ pub fn diff_trees(store: &ObjectStore, from: Option<&ObjectId>, to: Option<&Obje
     }
     let a = from.map(|id| store.tree(id)).transpose()?;
     let b = to.map(|id| store.tree(id)).transpose()?;
-    diff_dir(store, &VPath::root(), a.as_deref(), b.as_deref(), &mut out)?;
+    diff_dir(store, a, b, &mut out)?;
     Ok(out)
 }
 
@@ -90,33 +102,78 @@ fn load_dir(store: &ObjectStore, e: Option<&TreeEntry>) -> Result<Option<Arc<Tre
     }
 }
 
-fn diff_dir(store: &ObjectStore, dir: &VPath, a: Option<&Tree>, b: Option<&Tree>, out: &mut Vec<TreeChange>) -> Result<()> {
-    let mut names = BTreeSet::new();
-    for t in [a, b].into_iter().flatten() {
-        names.extend(t.entries.iter().map(|e| e.name.as_str()));
-    }
-    for name in names {
-        let ea = a.and_then(|t| t.get(name));
-        let eb = b.and_then(|t| t.get(name));
-        if let (Some(x), Some(y)) = (ea, eb) {
+/// One directory being compared: both sides, and a merge-join cursor into
+/// each (entries are sorted, see [`Tree::validate`]).
+struct DiffFrame {
+    dir: VPath,
+    a: Option<Arc<Tree>>,
+    b: Option<Arc<Tree>>,
+    ia: usize,
+    ib: usize,
+    /// File change for the entry whose directory side is being walked on
+    /// top of this frame; emitted once that walk is done, so the output
+    /// order matches a depth-first recursion.
+    pending: Option<TreeChange>,
+}
+
+fn entry_at(t: &Option<Arc<Tree>>, i: usize) -> Option<&TreeEntry> {
+    t.as_ref().and_then(|t| t.entries.get(i))
+}
+
+fn diff_dir(store: &ObjectStore, a: Option<Arc<Tree>>, b: Option<Arc<Tree>>, out: &mut Vec<TreeChange>) -> Result<()> {
+    // Explicit stack: tree depth is attacker-controlled.
+    let mut stack = vec![DiffFrame {
+        dir: VPath::root(),
+        a,
+        b,
+        ia: 0,
+        ib: 0,
+        pending: None,
+    }];
+    while let Some(f) = stack.last_mut() {
+        if let Some(c) = f.pending.take() {
+            out.push(c);
+        }
+        let (ea, eb) = match (entry_at(&f.a, f.ia), entry_at(&f.b, f.ib)) {
+            (None, None) => {
+                stack.pop();
+                continue;
+            }
+            (Some(x), Some(y)) if x.name == y.name => (Some(x.clone()), Some(y.clone())),
+            (Some(x), Some(y)) if x.name < y.name => (Some(x.clone()), None),
+            (Some(_), Some(y)) => (None, Some(y.clone())),
+            (x, y) => (x.cloned(), y.cloned()),
+        };
+        f.ia += usize::from(ea.is_some());
+        f.ib += usize::from(eb.is_some());
+        if let (Some(x), Some(y)) = (&ea, &eb) {
             if x.same_content(y) {
                 continue;
             }
         }
-        let path = dir.join(name);
-        let da = load_dir(store, ea)?;
-        let db = load_dir(store, eb)?;
+        let name = ea.as_ref().or(eb.as_ref()).map(|e| e.name.as_str()).unwrap_or_default();
+        let path = f.dir.join(name);
+        let da = load_dir(store, ea.as_ref())?;
+        let db = load_dir(store, eb.as_ref())?;
+        let fa = ea.filter(|e| e.kind == EntryKind::File);
+        let fb = eb.filter(|e| e.kind == EntryKind::File);
+        let file_change = (fa.is_some() || fb.is_some()).then(|| TreeChange {
+            path: path.clone(),
+            old: fa,
+            new: fb,
+        });
         if da.is_some() || db.is_some() {
-            diff_dir(store, &path, da.as_deref(), db.as_deref(), out)?;
-        }
-        let fa = ea.filter(|e| e.kind == EntryKind::File).cloned();
-        let fb = eb.filter(|e| e.kind == EntryKind::File).cloned();
-        if fa.is_some() || fb.is_some() {
-            out.push(TreeChange {
-                path,
-                old: fa,
-                new: fb,
+            f.pending = file_change;
+            stack.push(DiffFrame {
+                dir: path,
+                a: da,
+                b: db,
+                ia: 0,
+                ib: 0,
+                pending: None,
             });
+        } else if let Some(c) = file_change {
+            out.push(c);
         }
     }
     Ok(())

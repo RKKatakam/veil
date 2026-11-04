@@ -4,7 +4,10 @@
 //! BLAKE3 hash of the whole encoding:
 //!
 //! * `Blob`     — raw file bytes.
-//! * `Tree`     — sorted directory listing ([`TreeEntry`]s).
+//! * `Tree`     — sorted directory listing ([`TreeEntry`]s). Only the
+//!   canonical encoding is accepted on decode (see [`Tree::validate`]):
+//!   entry names are valid path components, strictly sorted (hence
+//!   unique), and never the reserved `.veil`.
 //! * `Snapshot` — immutable node of the history DAG.
 //! * `Sealed`   — a [`crate::crypto::Envelope`] wrapping the encoding of any
 //!   other object. Sealed objects are self-describing: the envelope names the
@@ -118,6 +121,46 @@ impl TreeEntry {
     }
 }
 
+/// Directory name reserved for repository metadata. Like Git's `.git`, it
+/// is refused as a tree entry name at every depth, compared ASCII
+/// case-insensitively (`.VEIL` is the same directory on case-insensitive
+/// filesystems).
+pub const RESERVED_NAME: &str = ".veil";
+
+/// Is `name` the reserved metadata directory name (in any ASCII case)?
+pub fn is_reserved_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case(RESERVED_NAME)
+}
+
+/// Check that `name` is a single, safe path component for a tree entry: not
+/// empty, not `.` or `..`, no `/` or NUL, and not [`RESERVED_NAME`].
+pub fn validate_entry_name(name: &str) -> Result<()> {
+    let why = if name.is_empty() {
+        "empty name"
+    } else if name == "." || name == ".." {
+        "relative path component"
+    } else if name.contains('/') {
+        "contains '/'"
+    } else if name.contains('\0') {
+        "contains NUL"
+    } else if is_reserved_name(name) {
+        "reserved for repository metadata"
+    } else {
+        return Ok(());
+    };
+    Err(VeilError::Corrupt(
+        "tree".into(),
+        format!("invalid entry name {:?} ({why})", truncate_for_error(name)),
+    ))
+}
+
+fn truncate_for_error(s: &str) -> &str {
+    match s.char_indices().nth(64) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tree {
     pub entries: Vec<TreeEntry>,
@@ -147,6 +190,31 @@ impl Tree {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Structural validity: every name passes [`validate_entry_name`] and
+    /// the entries are strictly sorted by name (so no duplicates). Lookups
+    /// use binary search, so an unsorted tree would show different files to
+    /// `walk_files` and to `lookup`/`diff_trees`/checkout.
+    pub fn validate(&self) -> Result<()> {
+        let mut prev: Option<&str> = None;
+        for e in &self.entries {
+            validate_entry_name(&e.name)?;
+            if let Some(p) = prev {
+                if p >= e.name.as_str() {
+                    return Err(VeilError::Corrupt(
+                        "tree".into(),
+                        format!(
+                            "entries are not sorted and unique ({:?} before {:?})",
+                            truncate_for_error(p),
+                            truncate_for_error(&e.name)
+                        ),
+                    ));
+                }
+            }
+            prev = Some(&e.name);
+        }
+        Ok(())
     }
 }
 
@@ -272,7 +340,16 @@ impl Object {
         if let Some(b) = raw.strip_prefix(BLOB_TAG) {
             Ok(Object::Blob(b.to_vec()))
         } else if let Some(b) = raw.strip_prefix(TREE_TAG) {
-            Ok(Object::Tree(serde_json::from_slice(b)?))
+            // Trees come from remotes and from `.veil/`: both are hostile.
+            // Only the canonical form is accepted, so that every reader
+            // (listing, lookup, diff, checkout) sees the same entries and
+            // one logical tree has exactly one id.
+            let t: Tree = serde_json::from_slice(b)?;
+            t.validate()?;
+            if serde_json::to_vec(&t)? != b {
+                return Err(corrupt("tree is not in canonical encoding"));
+            }
+            Ok(Object::Tree(t))
         } else if let Some(b) = raw.strip_prefix(SNAP_TAG) {
             Ok(Object::Snapshot(serde_json::from_slice(b)?))
         } else if let Some(b) = raw.strip_prefix(SEAL_TAG) {

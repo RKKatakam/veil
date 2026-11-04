@@ -15,9 +15,13 @@
 //! Redacted tree entries keep their names and ids, so a later push to a
 //! team remote or a key grant fills them in without any history rewrite.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use crate::{
+    commands::validate_tag_name,
     error::{Result, VeilError},
     id::ObjectId,
     keychain::{Keychain, RingMerge, LOCAL_SCOPE},
@@ -25,6 +29,7 @@ use crate::{
     oplog::Tag,
     repo::{is_repo, Repo},
     store::ObjectStore,
+    tree::MAX_TREE_DEPTH,
     vfs::StorageBackend,
 };
 
@@ -44,6 +49,8 @@ struct Transfer<'a> {
     src_keys: &'a Keychain,
     public: bool,
     seen: HashSet<ObjectId>,
+    /// Tree height of every object copied so far (0 for non-trees).
+    heights: HashMap<ObjectId, usize>,
     report: SyncReport,
 }
 
@@ -61,48 +68,121 @@ impl Transfer<'_> {
     }
 
     /// Copy one object and everything it references (not snapshot parents).
-    fn copy(&mut self, id: ObjectId) -> Result<()> {
-        if !self.seen.insert(id) {
-            return Ok(());
+    ///
+    /// The walk is iterative (the remote controls the depth) and rejects
+    /// trees nested deeper than [`MAX_TREE_DEPTH`]. Depth is measured as
+    /// each tree's *height* (longest chain of trees below it, memoised per
+    /// id), because content-addressed trees are shared: the same subtree
+    /// may first be met shallowly and later deep inside another tree.
+    fn copy(&mut self, root: ObjectId) -> Result<()> {
+        struct Frame {
+            id: ObjectId,
+            is_tree: bool,
+            children: Vec<ObjectId>,
+            next: usize,
+            height: usize,
         }
+        let mut stack: Vec<Frame> = Vec::new();
+        let mut trees_on_stack = 0usize;
+        let mut pending = Some(root);
+        loop {
+            if let Some(id) = pending.take() {
+                if let Some(frame) = self.enter(id)? {
+                    if frame.0 {
+                        trees_on_stack += 1;
+                        if trees_on_stack > MAX_TREE_DEPTH {
+                            return Err(too_deep(root));
+                        }
+                    }
+                    stack.push(Frame {
+                        id,
+                        is_tree: frame.0,
+                        children: frame.1,
+                        next: 0,
+                        height: 0,
+                    });
+                } else if let Some(top) = stack.last_mut() {
+                    let h = self.heights.get(&id).copied().unwrap_or(0);
+                    top.height = top.height.max(h);
+                }
+            }
+            let Some(top) = stack.last_mut() else {
+                return Ok(());
+            };
+            if let Some(child) = top.children.get(top.next) {
+                top.next += 1;
+                pending = Some(*child);
+                continue;
+            }
+            let done = stack.pop().unwrap();
+            let height = done.height + usize::from(done.is_tree);
+            if done.is_tree {
+                trees_on_stack -= 1;
+                if height > MAX_TREE_DEPTH {
+                    return Err(too_deep(root));
+                }
+            }
+            self.heights.insert(done.id, height);
+            if let Some(parent) = stack.last_mut() {
+                parent.height = parent.height.max(height);
+            }
+        }
+    }
+
+    /// Fetch, check and store one object. Returns `None` if there is
+    /// nothing to descend into (already seen, missing or redacted), else
+    /// whether it is a tree and the ids it references.
+    fn enter(&mut self, id: ObjectId) -> Result<Option<(bool, Vec<ObjectId>)>> {
+        if !self.seen.insert(id) {
+            return Ok(None);
+        }
+        // `get_raw` verifies the content against `id`.
         let raw = match self.src.get_raw(&id) {
             Ok(r) => r,
             Err(VeilError::Missing(_)) => {
                 self.report.missing += 1;
-                return Ok(());
+                return Ok(None);
             }
             Err(e) => return Err(e),
         };
         if !self.allowed(&raw) {
             self.report.redacted += 1;
-            return Ok(());
+            return Ok(None);
         }
+        // Decoding validates structure: canonical trees with safe names.
         let obj = Object::decode(&raw)?;
-        if !self.dst.has(&id) {
-            self.dst.put_raw(&id, &raw)?;
+        if self.dst.put_raw(&id, &raw)? {
             self.report.objects_copied += 1;
         }
-        match obj {
+        Ok(Some(match obj {
             Object::Snapshot(s) => {
                 if s.signature_valid() == Some(false) {
                     self.report
                         .warnings
                         .push(format!("snapshot {} carries an invalid signature", id.short()));
                 }
-                self.copy(s.tree)?
+                (false, vec![s.tree])
             }
             Object::Tree(t) => {
+                let mut children = Vec::with_capacity(t.entries.len());
                 for e in &t.entries {
-                    self.copy(e.id)?;
+                    children.push(e.id);
                     if let (EntryKind::File, Some(fb)) = (e.kind, e.fallback) {
-                        self.copy(fb)?;
+                        children.push(fb);
                     }
                 }
+                (true, children)
             }
-            Object::Blob(_) | Object::Sealed(_) => {}
-        }
-        Ok(())
+            Object::Blob(_) | Object::Sealed(_) => (false, Vec::new()),
+        }))
     }
+}
+
+fn too_deep(root: ObjectId) -> VeilError {
+    VeilError::Corrupt(
+        root.hex(),
+        format!("directory nesting exceeds {MAX_TREE_DEPTH} levels; refusing hostile tree"),
+    )
 }
 
 fn ancestors_in(store: &ObjectStore, tips: &[ObjectId]) -> Result<Vec<ObjectId>> {
@@ -184,6 +264,7 @@ pub fn push(
         src_keys: local.keys(),
         public,
         seen: HashSet::new(),
+        heights: HashMap::new(),
         report,
     };
     for id in ancestors_in(local.store(), &tips)? {
@@ -220,6 +301,17 @@ pub fn push(
     Ok(report)
 }
 
+/// Why `target` cannot be the target of a tag, if it cannot.
+fn unusable_target(store: &ObjectStore, target: &ObjectId) -> Result<Option<&'static str>> {
+    match store.snapshot(target) {
+        Ok(_) => Ok(None),
+        Err(VeilError::Missing(_)) => Ok(Some("is missing")),
+        Err(VeilError::Corrupt(..)) | Err(VeilError::Json(_)) => Ok(Some("is not a valid snapshot")),
+        Err(e) if e.is_unreadable() => Ok(Some("is not readable")),
+        Err(e) => Err(e),
+    }
+}
+
 /// Fetch every tag from `remote`, record them as `<remote_name>/<tag>`, and
 /// create or fast-forward local tags.
 pub fn pull(local: &mut Repo, remote_name: &str, remote_backend: Arc<dyn StorageBackend>) -> Result<SyncReport> {
@@ -228,13 +320,23 @@ pub fn pull(local: &mut Repo, remote_name: &str, remote_backend: Arc<dyn Storage
     }
     let remote = Repo::open(remote_backend, None, "remote")?;
     let tags: Vec<(String, Tag)> = remote.view().tags.clone().into_iter().collect();
-    let tips: Vec<ObjectId> = tags.iter().map(|(_, t)| t.target).collect();
+    // Only snapshot targets are fetched; tags on anything else (missing,
+    // a tree, a blob) are skipped with a warning below.
+    let mut tips = Vec::new();
+    for (_, t) in &tags {
+        match remote.store().get(&t.target) {
+            Ok(Object::Snapshot(_)) => tips.push(t.target),
+            Ok(_) | Err(VeilError::Missing(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
     let mut xfer = Transfer {
         src: remote.store(),
         dst: local.store(),
         src_keys: remote.keys(),
         public: false,
         seen: HashSet::new(),
+        heights: HashMap::new(),
         report: SyncReport::default(),
     };
     for id in ancestors_in(remote.store(), &tips)? {
@@ -246,6 +348,21 @@ pub fn pull(local: &mut Repo, remote_name: &str, remote_backend: Arc<dyn Storage
 
     let mut tx = local.transaction(format!("pull from {remote_name}"))?;
     for (name, tag) in tags {
+        // Tag names and targets come from the remote: a name may carry
+        // terminal escapes or path tricks, and a target may be missing or
+        // not a snapshot, which would break every later graph query.
+        if validate_tag_name(&name).is_err() {
+            report
+                .warnings
+                .push(format!("skipped remote tag {name:?}: invalid tag name"));
+            continue;
+        }
+        if let Some(why) = unusable_target(tx.repo().store(), &tag.target)? {
+            report
+                .warnings
+                .push(format!("skipped remote tag '{name}': target {} {why}", tag.target.short()));
+            continue;
+        }
         tx.view.remote_tags.insert(format!("{remote_name}/{name}"), tag.target);
         match tx.view.tags.get(&name).cloned() {
             None => {

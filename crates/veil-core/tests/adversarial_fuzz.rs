@@ -86,7 +86,7 @@ proptest! {
         if let Ok(v) = VPath::new(&s) {
             prop_assert!(!v.as_str().starts_with('/') && !v.as_str().ends_with('/'));
             for c in v.as_str().split('/') {
-                prop_assert!(v.is_root() || (c != "" && c != "." && c != ".."), "{v:?}");
+                prop_assert!(v.is_root() || (!c.is_empty() && c != "." && c != ".."), "{v:?}");
             }
         }
     }
@@ -98,9 +98,8 @@ proptest! {
         let mut bytes = env.to_bytes();
         let i = pos % bytes.len();
         bytes[i] ^= 1 << bit;
-        match Envelope::from_bytes(&bytes) {
-            Ok(e) => prop_assert!(e.open(&k).is_err(), "flipped byte {i} still opened"),
-            Err(_) => {}
+        if let Ok(e) = Envelope::from_bytes(&bytes) {
+            prop_assert!(e.open(&k).is_err(), "flipped byte {i} still opened");
         }
     }
 
@@ -193,7 +192,6 @@ proptest! {
 
     /// Arbitrary names, as a malicious remote may send them.
     #[test]
-    #[ignore = "BUG-001: tree entry names are not validated (empty names / names with '/' panic in VPath::join)"]
     fn tree_operations_never_panic_on_hostile_names(
         entries in proptest::collection::vec(arb_entry("[a/.\\x00]{0,4}".boxed()), 0..6)
     ) {
@@ -257,7 +255,6 @@ fn descriptions_use_random_nonces_but_blobs_are_convergent() {
 }
 
 #[test]
-#[ignore = "BUG-033: Envelope::to_bytes truncates scope length to u16; long scopes encode to a corrupt envelope"]
 fn envelope_encoding_roundtrips_or_refuses_long_scopes() {
     let k = random_key();
     let scope = "s".repeat(70_000);

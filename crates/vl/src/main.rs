@@ -54,7 +54,8 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("{} {e:#}", red("error:"));
+            // Errors may quote repository data (names, paths): escape them.
+            eprintln!("{} {}", red("error:"), safe(&format!("{e:#}")));
             ExitCode::FAILURE
         }
     }
@@ -163,7 +164,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             println!("Rebased {}", one_line(&ctx.repo, &new));
             let s = ctx.repo.snapshot(&new)?;
             if !s.conflicts.is_empty() {
-                warn(&format!("conflicts in: {}", s.conflicts.join(", ")));
+                warn_untrusted(&format!("conflicts in: {}", s.conflicts.join(", ")));
             }
         }
         Cmd::Squash { rev } => {
@@ -203,8 +204,8 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
                     "{} {} {} {}",
                     blue(&id.short()),
                     dim(&fmt_time(op.timestamp)),
-                    yellow(&op.user),
-                    op.description
+                    yellow(&safe(&op.user)),
+                    safe(&op.description)
                 );
             }
         }
@@ -216,7 +217,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Undo => {
             let undone = ctx.repo.op_log(1)?[0].1.description.clone();
             ctx.repo.undo()?;
-            println!("Undid: {undone}");
+            println!("Undid: {}", safe(&undone));
         }
         Cmd::Watch { interval_ms } => cmd_watch(ctx, *interval_ms)?,
         Cmd::Remote(c) => cmd_remote(ctx, c)?,
@@ -300,7 +301,7 @@ fn cmd_clone(source: &Path, dest: Option<&Path>) -> Result<ExitCode> {
     repo.save_config(config)?;
     let report = remote::pull(&mut repo, "origin", Arc::new(DiskBackend::new(&source)))?;
     for w in &report.warnings {
-        warn(w);
+        warn_untrusted(w);
     }
     let target = ["main", "trunk", "master"]
         .iter()
@@ -370,8 +371,8 @@ fn cmd_status(ctx: &mut Ctx) -> Result<()> {
         println!("Working copy changes:");
         print_changes_summary(&ctx.repo, &changes);
     }
-    println!("Workspace    : {}{}", green(&ctx.ws), match &ctx.repo.view().workspace(&ctx.ws)?.cloak {
-        Some(c) => magenta(&format!(" [cloaked:{c}]")),
+    println!("Workspace    : {}{}", green(&safe(&ctx.ws)), match &ctx.repo.view().workspace(&ctx.ws)?.cloak {
+        Some(c) => magenta(&format!(" [cloaked:{}]", safe(c))),
         None => String::new(),
     });
     println!("Working copy : {} {}", bold(&green("@")), one_line(&ctx.repo, &wc));
@@ -381,7 +382,7 @@ fn cmd_status(ctx: &mut Ctx) -> Result<()> {
     if !ctx.report.isolated.is_empty() {
         println!("{}", dim("Local-only (isolated; never snapshotted or pushed):"));
         for p in &ctx.report.isolated {
-            println!("  {} {p}", dim("L"));
+            println!("  {} {}", dim("L"), safe(p.as_str()));
         }
     }
     if !ctx.report.quarantined.is_empty() {
@@ -392,19 +393,19 @@ fn cmd_status(ctx: &mut Ctx) -> Result<()> {
             } else {
                 "never recorded"
             };
-            println!("  {} {p}  ({}; {state})", yellow("Q"), f[0].rule);
+            println!("  {} {}  ({}; {state})", yellow("Q"), safe(p.as_str()), f[0].rule);
         }
     }
     if !ctx.report.carried.is_empty() {
         println!("{}", dim("Redacted (no key; kept in history, absent on disk):"));
         for p in &ctx.report.carried {
-            println!("  {} {p}", dim("R"));
+            println!("  {} {}", dim("R"), safe(p.as_str()));
         }
     }
     if !s.conflicts.is_empty() {
         println!("{}", red("Unresolved conflicts:"));
         for c in &s.conflicts {
-            println!("  {} {c}", red("C"));
+            println!("  {} {}", red("C"), safe(c));
         }
     }
     Ok(())
@@ -415,7 +416,7 @@ fn cmd_show(ctx: &mut Ctx, rev: &str, stat: bool) -> Result<()> {
     let s = ctx.repo.snapshot(&id)?;
     println!("Change ID : {}", bold(&magenta(&s.change_id.display())));
     println!("Snapshot  : {}", blue(&id.hex()));
-    println!("Author    : {} at {}", s.author, fmt_time(s.timestamp));
+    println!("Author    : {} at {}", safe(&s.author), fmt_time(s.timestamp));
     if id != ctx.repo.root_id() {
         println!("Signature : {}", signature_detail(&ctx.repo.keys().snapshot_status(&s), &s));
     }
@@ -426,10 +427,10 @@ fn cmd_show(ctx: &mut Ctx, rev: &str, stat: bool) -> Result<()> {
     }
     let tags: Vec<&String> = ctx.repo.view().tags.iter().filter(|(_, t)| t.target == id).map(|(n, _)| n).collect();
     if !tags.is_empty() {
-        println!("Tags      : {}", cyan(&tags.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", ")));
+        println!("Tags      : {}", cyan(&tags.iter().map(|t| safe(t)).collect::<Vec<_>>().join(", ")));
     }
     if let Some(c) = &s.cloak {
-        println!("Cloaked   : {}", magenta(c));
+        println!("Cloaked   : {}", magenta(&safe(c)));
     }
     if let Some(e) = &s.embargo {
         let rec = ctx.repo.keys().load_embargo(e)?;
@@ -441,14 +442,14 @@ fn cmd_show(ctx: &mut Ctx, rev: &str, stat: bool) -> Result<()> {
             },
             None => "unknown".into(),
         };
-        println!("Embargo   : {} ({state})", yellow(e));
+        println!("Embargo   : {} ({state})", yellow(&safe(e)));
     }
     println!();
     let desc = ctx.repo.description(&s);
     if desc.trim().is_empty() {
         println!("    {}", dim("(no description set)"));
     } else {
-        for l in desc.lines() {
+        for l in safe_lines(&desc) {
             println!("    {l}");
         }
     }
@@ -574,7 +575,7 @@ fn cmd_merge(
         );
     }
     if !res.conflicts.is_empty() {
-        warn(&format!("conflicts in: {}", res.conflicts.join(", ")));
+        warn_untrusted(&format!("conflicts in: {}", res.conflicts.join(", ")));
     }
     Ok(())
 }
@@ -600,7 +601,12 @@ fn cmd_embargo(ctx: &mut Ctx, c: &EmbargoCmd) -> Result<()> {
                 } else {
                     " (no key)"
                 };
-                println!("{}  scope:{}  {state}{key}  {}", bold(&r.id), r.scope, first_line(&r.description));
+                println!(
+                    "{}  scope:{}  {state}{key}  {}",
+                    bold(&safe(&r.id)),
+                    safe(&r.scope),
+                    first_line(&r.description)
+                );
             }
         }
         EmbargoCmd::Release { id } => {
@@ -615,11 +621,15 @@ fn cmd_tag(ctx: &mut Ctx, c: &TagCmd) -> Result<()> {
     match c {
         TagCmd::List => {
             for (name, t) in &ctx.repo.view().tags {
-                let cloak = t.cloak.as_ref().map(|c| magenta(&format!(" [cloaked:{c}]"))).unwrap_or_default();
-                println!("{}{cloak}: {}", cyan(name), one_line(&ctx.repo, &t.target));
+                let cloak = t
+                    .cloak
+                    .as_ref()
+                    .map(|c| magenta(&format!(" [cloaked:{}]", safe(c))))
+                    .unwrap_or_default();
+                println!("{}{cloak}: {}", cyan(&safe(name)), one_line(&ctx.repo, &t.target));
             }
             for (name, t) in &ctx.repo.view().remote_tags {
-                println!("{}: {}", dim(name), one_line(&ctx.repo, t));
+                println!("{}: {}", dim(&safe(name)), one_line(&ctx.repo, t));
             }
         }
         TagCmd::Set {
@@ -695,7 +705,7 @@ fn cmd_policy(ctx: &mut Ctx, c: &PolicyCmd) -> Result<()> {
                 println!("{origin:<12}  {}", r.to_line());
             }
             for w in &policy.warnings {
-                warn(w);
+                warn_untrusted(w);
             }
         }
         PolicyCmd::Check { paths } => {
@@ -840,7 +850,11 @@ fn cmd_scope(ctx: &mut Ctx, c: &ScopeCmd) -> Result<()> {
                 let state = match ring.verify() {
                     Ok(st) => st,
                     Err(e) => {
-                        println!("{}  {}", bold(&ring.scope), red(&format!("INVALID key ring ({e}); no access")));
+                        println!(
+                            "{}  {}",
+                            bold(&safe(&ring.scope)),
+                            red(&safe(&format!("INVALID key ring ({e}); no access")))
+                        );
                         continue;
                     }
                 };
@@ -859,7 +873,7 @@ fn cmd_scope(ctx: &mut Ctx, c: &ScopeCmd) -> Result<()> {
                 } else {
                     dim(&format!("generation {}, {} changes", state.generation, state.len))
                 };
-                println!("{}  {access}  {kind}", bold(&ring.scope));
+                println!("{}  {access}  {kind}", bold(&safe(&ring.scope)));
                 for (pk, m) in &state.members {
                     let you = if *pk == me { cyan(" (you)") } else { String::new() };
                     let role = if m.role == Role::Admin { "admin " } else { "member" };
@@ -868,7 +882,7 @@ fn cmd_scope(ctx: &mut Ctx, c: &ScopeCmd) -> Result<()> {
                     } else {
                         String::new()
                     };
-                    println!("    {:<12} {role} {}{unsigned}{you}", m.name, dim(pk));
+                    println!("    {:<12} {role} {}{unsigned}{you}", safe(&m.name), dim(&safe(pk)));
                 }
             }
         }
@@ -914,7 +928,7 @@ fn cmd_scope(ctx: &mut Ctx, c: &ScopeCmd) -> Result<()> {
                 return Ok(());
             }
             if let Err(e) = ring.verify() {
-                warn(&format!("this ring does not verify: {e}"));
+                warn_untrusted(&format!("this ring does not verify: {e}"));
             }
             let mut names: std::collections::BTreeMap<String, String> = Default::default();
             for c in &ring.log {
@@ -938,7 +952,13 @@ fn cmd_scope(ctx: &mut Ctx, c: &ScopeCmd) -> Result<()> {
                     ),
                     op => op.summary(),
                 };
-                println!("#{:<3} {} {} {what}", c.seq, dim(&fmt_time(c.timestamp)), yellow(&who));
+                println!(
+                    "#{:<3} {} {} {}",
+                    c.seq,
+                    dim(&fmt_time(c.timestamp)),
+                    yellow(&safe(&who)),
+                    safe(&what)
+                );
             }
         }
     }
@@ -968,8 +988,12 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
         WsCmd::List => {
             for (name, w) in &ctx.repo.view().workspaces {
                 let here = if *name == ctx.ws { green("* ") } else { "  ".into() };
-                let cloak = w.cloak.as_ref().map(|c| magenta(&format!(" [cloaked:{c}]"))).unwrap_or_default();
-                println!("{here}{}{cloak}: {}", bold(name), one_line(&ctx.repo, &w.wc));
+                let cloak = w
+                    .cloak
+                    .as_ref()
+                    .map(|c| magenta(&format!(" [cloaked:{}]", safe(c))))
+                    .unwrap_or_default();
+                println!("{here}{}{cloak}: {}", bold(&safe(name)), one_line(&ctx.repo, &w.wc));
             }
         }
         WsCmd::New { name, rev, cloak } => {
@@ -1139,13 +1163,13 @@ fn cmd_push(ctx: &mut Ctx, name: &str, tags: &[String], force: bool) -> Result<(
     let (backend, cfg) = remote_backend(ctx, name)?;
     let r = remote::push(&mut ctx.repo, backend, cfg.public, tags, force)?;
     for (t, id) in &r.tags_updated {
-        println!("  {} {} → {}", green("pushed"), cyan(t), id.short());
+        println!("  {} {} → {}", green("pushed"), cyan(&safe(t)), id.short());
     }
     for (t, why) in &r.tags_skipped {
-        println!("  {} {} ({why})", yellow("skipped"), t);
+        println!("  {} {} ({})", yellow("skipped"), safe(t), safe(why));
     }
     for w in &r.warnings {
-        warn(w);
+        warn_untrusted(w);
     }
     println!(
         "Pushed {} object(s) to {}{name}{}",
@@ -1164,10 +1188,10 @@ fn cmd_pull(ctx: &mut Ctx, name: &str) -> Result<()> {
     let (backend, _) = remote_backend(ctx, name)?;
     let r = remote::pull(&mut ctx.repo, name, backend)?;
     for (t, id) in &r.tags_updated {
-        println!("  {} {} → {}", green("updated"), cyan(t), id.short());
+        println!("  {} {} → {}", green("updated"), cyan(&safe(t)), id.short());
     }
     for w in &r.warnings {
-        warn(w);
+        warn_untrusted(w);
     }
     println!("Pulled {} object(s) from {name}", r.objects_copied);
     Ok(())
@@ -1197,7 +1221,7 @@ fn cmd_fsck(repo_arg: Option<&Path>, verbose: bool) -> Result<ExitCode> {
             Severity::Warning => yellow(f.severity.label()),
             Severity::Redacted | Severity::Note => dim(f.severity.label()),
         };
-        println!("{label}: {}", f.message);
+        println!("{label}: {}", safe(&f.message));
     }
     println!(
         "Checked {} objects ({} snapshots, {} trees, {} files; {} unreachable), {} operations, {} key rings, {} embargo records",

@@ -7,7 +7,6 @@ use std::path::Path;
 use adversarial_support::*;
 
 #[test]
-#[ignore = "BUG-001: tree entry names are not validated; `vl clone` of a hostile remote writes outside the destination"]
 fn clone_cannot_write_outside_the_destination() {
     let env = Env::new();
     let remote = env.dir("remote");
@@ -27,7 +26,6 @@ fn clone_cannot_write_outside_the_destination() {
 }
 
 #[test]
-#[ignore = "BUG-001: tree entry names are not validated; `vl pull` + `vl new` writes outside the working copy"]
 fn pull_and_new_cannot_write_outside_the_working_copy() {
     let env = Env::new();
     let proj = env.project("victim", "proj", &[("a.txt", "a\n")]);
@@ -43,7 +41,6 @@ fn pull_and_new_cannot_write_outside_the_working_copy() {
 }
 
 #[test]
-#[ignore = "BUG-002: checkout writes tree entries named '.veil', so a remote can replace key rings, config and op log"]
 fn clone_cannot_overwrite_repository_metadata() {
     let env = Env::new();
     let remote = env.dir("remote");
@@ -60,7 +57,6 @@ fn clone_cannot_overwrite_repository_metadata() {
 }
 
 #[test]
-#[ignore = "BUG-021: recursive tree walks (Transfer::copy, diff_trees, checkout) overflow the stack on deeply nested hostile trees"]
 fn deeply_nested_remote_tree_does_not_crash_clone() {
     let env = Env::new();
     let remote = env.dir("remote");
@@ -82,7 +78,6 @@ fn deeply_nested_remote_tree_does_not_crash_clone() {
 }
 
 #[test]
-#[ignore = "BUG-036: remote-controlled tag names, descriptions and authors are printed raw; terminal escape sequences are injected"]
 fn remote_metadata_cannot_inject_terminal_escapes() {
     let env = Env::new();
     let remote = env.dir("remote");

@@ -107,7 +107,6 @@ fn local_cycle_in_tampered_store_does_not_hang_graph_queries() {
 }
 
 #[test]
-#[ignore = "BUG-028: objects are never re-verified on read; a tampered local object is served silently"]
 fn tampered_local_object_is_detected_on_read() {
     let (mut repo, fs, _) = new_repo("alice");
     let c = commit_files(&mut repo, &*fs, &[("a.txt", "trusted\n")], "c");
@@ -148,7 +147,6 @@ fn try_pull_checkout(repo: &mut Repo, fs: &DiskBackend, remote: Arc<MemoryBacken
 }
 
 #[test]
-#[ignore = "BUG-001: tree entry names are not validated; '..' entries make checkout write outside the working copy"]
 fn dotdot_entry_cannot_escape_the_working_copy() {
     let (remote, _) = evil_remote(|r| {
         let payload = blob(r, b"owned\n");
@@ -161,7 +159,6 @@ fn dotdot_entry_cannot_escape_the_working_copy() {
 }
 
 #[test]
-#[ignore = "BUG-001: tree entry names are not validated; '..' entries make checkout write outside the working copy"]
 fn dotdot_file_entry_cannot_overwrite_a_sibling_file() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("victim.txt"), "precious\n").unwrap();
@@ -179,7 +176,6 @@ fn dotdot_file_entry_cannot_overwrite_a_sibling_file() {
 }
 
 #[test]
-#[ignore = "BUG-002: checkout writes tree entries named '.veil', letting a remote overwrite key rings, config and the op log"]
 fn remote_tree_cannot_write_into_dot_veil() {
     // Attacker ships `.veil/meta/keyrings/team.json` with a key ring of their
     // own (key substitution) and `.veil/repo.json` with a redirected remote.
@@ -200,7 +196,6 @@ fn remote_tree_cannot_write_into_dot_veil() {
 }
 
 #[test]
-#[ignore = "BUG-001: tree entry names are not validated; names containing '/' or empty names panic (debug) or traverse (release)"]
 fn slash_and_empty_entry_names_are_rejected_without_panicking() {
     for name in ["../../escaped", "a/../../escaped", "/abs", ""] {
         let (remote, _) = evil_remote(|r| {
@@ -228,7 +223,6 @@ fn nul_in_entry_name_does_not_escape() {
 }
 
 #[test]
-#[ignore = "BUG-029: non-canonical trees (unsorted/duplicate entries) are accepted; `files` and `cat` disagree"]
 fn non_canonical_trees_are_rejected_or_consistent() {
     let (remote, main) = evil_remote(|r| {
         let a = blob(r, b"a\n");
@@ -469,7 +463,6 @@ fn forged_embargo_release_does_not_lock_out_key_holders() {
 }
 
 #[test]
-#[ignore = "BUG-031: pull accepts remote tags whose target is missing, after which every graph query fails"]
 fn pulled_tag_pointing_at_missing_object_does_not_brick_the_repo() {
     let remote_fs = Arc::new(MemoryBackend::new());
     let mut remote = Repo::init_bare(remote_fs.clone()).unwrap();
@@ -487,7 +480,6 @@ fn pulled_tag_pointing_at_missing_object_does_not_brick_the_repo() {
 }
 
 #[test]
-#[ignore = "BUG-030: `set_tag` (and `vl tag set`) accepts any object id, e.g. a blob, bricking `vl log`"]
 fn tag_cannot_point_at_a_non_snapshot_object() {
     let (mut repo, fs, _) = new_repo("alice");
     let c = commit_files(&mut repo, &*fs, &[("a.txt", "a\n")], "c");
