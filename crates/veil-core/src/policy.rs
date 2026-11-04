@@ -1237,6 +1237,59 @@ fn verify_fold(accepted: &Policy, current: &Policy, folded: &Policy) -> std::res
     Ok(())
 }
 
+/// How an edit of `.veilpolicy` that a command made (in a `vl ws exec`
+/// sandbox or a mount, where the editor is not the member) relates to the
+/// recorded policy it started from (see [`command_edit`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandEdit {
+    /// Classifies no path more weakly than the recorded policy (the rules
+    /// are the same, or only protect more, or the exhaustive check of
+    /// `verify_fold` proves it): recorded and applied.
+    Strengthens,
+    /// Only inserts `cloak`, `isolate` or `ignore` rules (and drops
+    /// `public!` ones). Such a rule weakens a path only where it overrides
+    /// an earlier, stronger rule for it (`secret/a cloak team` after
+    /// `secret/ isolate`, a cloak rule lifting `target/ ignore`), which
+    /// the paths of the snapshot show: recorded unless one of them is held
+    /// back.
+    Adds,
+    /// Anything else (a rule removed, moved or changed, a `public` rule
+    /// added): it may weaken paths, existing or not, so it is held back.
+    Weakens,
+}
+
+/// Classify the edit `recorded` → `edited` of `.veilpolicy` made by a
+/// command (see [`CommandEdit`]).
+pub fn command_edit(recorded: &Policy, edited: &Policy) -> CommandEdit {
+    if edited.same_rules(recorded) || edited.only_adds_protection_to(recorded) {
+        return CommandEdit::Strengthens;
+    }
+    // `recorded`'s rules, in order, where only `public!` ones may be
+    // missing; every other rule of `edited` an inserted protective one.
+    let rec: Vec<&Rule> = recorded.rules.iter().filter(|r| !r.builtin).collect();
+    let mut i = 0;
+    let mut only_inserts = true;
+    for m in edited.rules.iter().filter(|r| !r.builtin) {
+        while i < rec.len() && rec[i].to_line() != m.to_line() && rec[i].tier == Tier::Public && rec[i].force {
+            i += 1;
+        }
+        if i < rec.len() && rec[i].to_line() == m.to_line() {
+            i += 1;
+        } else if m.tier == Tier::Public {
+            only_inserts = false;
+            break;
+        }
+    }
+    only_inserts &= rec[i.min(rec.len())..].iter().all(|r| r.tier == Tier::Public && r.force);
+    if verify_fold(recorded, recorded, edited).is_ok() {
+        return CommandEdit::Strengthens;
+    }
+    match only_inserts {
+        true => CommandEdit::Adds,
+        false => CommandEdit::Weakens,
+    }
+}
+
 /// The accepted policy (`accepted`) with the member's own edit of
 /// `.veilpolicy` (`parent` → `current`, where `parent` is the policy the
 /// working copy was checked out with) folded in, as the text of a
@@ -1552,6 +1605,32 @@ mod tests {
 
     fn class(p: &Policy, path: &str) -> Tier {
         p.classify(&VPath::new(path).unwrap(), false).tier
+    }
+
+    /// BUG-560: how a command's edit of `.veilpolicy` is judged.
+    #[test]
+    fn command_edits_are_judged_against_the_recorded_policy() {
+        let rec = Policy::parse("target/ ignore\nsecret/ cloak team\ndocs/x.md public!\n");
+        let kind = |text: &str| command_edit(&rec, &Policy::parse(text));
+        // Comments, appended ignores, a dropped `public!`: never weaker.
+        assert_eq!(kind("# c\ntarget/ ignore\nsecret/ cloak team\ndocs/x.md public!\n"), CommandEdit::Strengthens);
+        assert_eq!(kind("target/ ignore\nsecret/ cloak team\ndocs/x.md public!\nbuild/ ignore\n"), CommandEdit::Strengthens);
+        assert_eq!(kind("target/ ignore\nsecret/ cloak team\n"), CommandEdit::Strengthens);
+        // Moving `ignore` last only protects more (the exhaustive check).
+        assert_eq!(kind("secret/ cloak team\ntarget/ ignore\ndocs/x.md public!\n"), CommandEdit::Strengthens);
+        // An inserted cloak rule: up to the snapshot's paths.
+        assert_eq!(kind("target/ ignore\nsecret/ cloak team\ndocs/x.md public!\nsrc/ cloak team\n"), CommandEdit::Adds);
+        // Every weakening shape.
+        for text in [
+            "",
+            "target/ ignore\ndocs/x.md public!\n",
+            "target/ ignore\nsecret/ cloak team\ndocs/x.md public!\nsecret/** public!\n",
+            "target/ ignore\nsecret/ cloak team\ndocs/x.md public!\n** public\n",
+            "target/ ignore\nsecret/ cloak ops\ndocs/x.md public!\n",
+            "target/ ignore\nsecret/ cloak team\nsecret/a.md public\ndocs/x.md public!\n",
+        ] {
+            assert_eq!(kind(text), CommandEdit::Weakens, "{text:?}");
+        }
     }
 
     #[test]

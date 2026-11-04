@@ -739,6 +739,13 @@ accepted:
   policy applies as it is, every command warns `cannot read .veilpolicy`,
   and `vl policy accept` refuses until you fix it.
 
+**Agents can't declassify either.** In a `vl ws exec` sandbox or a
+`vl ws mount`, the command (an agent, a tool) edits `.veilpolicy`, not
+you. An edit there that weakens the workspace's policy is held back the
+same way, against the workspace's recorded policy, until you run
+`vl policy accept --workspace NAME`
+([details](workspaces-and-agents.md)).
+
 ## What is protected, and what isn't
 
 The full threat model is in

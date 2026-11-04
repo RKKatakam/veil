@@ -309,7 +309,48 @@ pub fn print_build_warnings(r: &BuildReport) {
              after the release (or work on the embargoed merge's first parent instead)"
         ));
     }
-    print_policy_held_back(&r.policy_held_back, r.policy_edit_pending);
+    // A command's held-back edit of `.veilpolicy`: the caller says where
+    // it stays and how to accept it (`policy_edit_held_message`).
+    if r.policy_edit_held.is_none() {
+        print_policy_held_back(&r.policy_held_back, r.policy_edit_pending);
+    }
+}
+
+/// What to tell the member about an edit of `.veilpolicy` a command made
+/// that the recording held back (BUG-560), if there is one. `kept`: where
+/// the edit stays (`the sandbox (…)`, `the mount`) and the workspace to
+/// accept it in; `None` for a throwaway sandbox, where it is lost.
+pub fn policy_edit_held_message(r: &BuildReport, kept: Option<(&str, &str)>) -> Option<String> {
+    const SHOWN: usize = 5;
+    let why = r.policy_edit_held.as_ref()?;
+    let held = &r.policy_held_back;
+    let mut list: Vec<String> = held
+        .iter()
+        .take(SHOWN)
+        .map(|h| format!("{} ({} → {})", safe(&h.shown_path()), h.accepted, h.wanted))
+        .collect();
+    if held.len() > SHOWN {
+        list.push(format!("and {} more", held.len() - SHOWN));
+    }
+    let paths = match list.is_empty() {
+        true => String::new(),
+        false => format!("; these keep their recorded protection: {}", list.join(", ")),
+    };
+    let next = match kept {
+        Some((place, ws)) => format!(
+            "It stays in {place}: review it, then `vl policy accept --workspace {}` records it",
+            safe(ws)
+        ),
+        None => format!(
+            "It goes with the throwaway sandbox: to apply it, edit {POLICY_FILE} yourself, or run the command in a \
+             workspace and record its edit with `vl policy accept --workspace NAME`"
+        ),
+    };
+    Some(format!(
+        "{POLICY_FILE}, as the command left it, {}: the edit is not recorded (a command is not you, so the \
+         recorded policy stays, and only the edit's stronger rules apply{paths}). {next}",
+        safe(why)
+    ))
 }
 
 /// Local files kept under the accepted policy because `.veilpolicy` (as

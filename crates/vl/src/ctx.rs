@@ -419,6 +419,7 @@ impl Ctx {
                     None,
                     Some(&self.checkout.materialised),
                     carried,
+                    false,
                 )?;
                 let s = self.repo.snapshot(&saved)?;
                 holds = saved;

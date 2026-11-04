@@ -17,6 +17,7 @@ use crate::{
     now_millis,
     object::Snapshot,
     oplog::{View, WorkspaceState},
+    policy::{CommandEdit, WorkingCopyPolicy},
     repo::Repo,
     statcache::StatCache,
     store::ObjectStore,
@@ -47,6 +48,17 @@ pub struct SnapshotOptions<'a> {
     /// guarded by the accepted policy like any incoming change (see
     /// [`crate::policy::working_copy_policy`]).
     pub policy_incoming: bool,
+    /// The files of `fs` were written by a command, not edited by the
+    /// member (a `vl ws exec` sandbox, a mount): an edit of `.veilpolicy`
+    /// is the command's, so the recorded policy pins it, as the accepted
+    /// policy pins an incoming one in the project directory (BUG-560). An
+    /// edit that weakens it, or could, is held back: the tree keeps the
+    /// recorded `.veilpolicy`, the paths it would weaken keep their
+    /// recorded classification, its stronger rules apply, and
+    /// [`BuildReport::policy_edit_held`] says so. See
+    /// [`Repo::accept_workspace_policy`]. Ignored for the repository's own
+    /// directory, which the accepted policy guards.
+    pub policy_from_command: bool,
     /// The working-copy snapshot `fs` was materialised from. If the
     /// workspace has moved on since (another process committed, undid or
     /// checked out, and has not updated `fs` yet), nothing is recorded and
@@ -145,6 +157,48 @@ fn with_carried(store: &ObjectStore, tree: ObjectId, carried: &[(VPath, crate::o
     Ok(out)
 }
 
+/// The policy a recording of `fs` relative to `parent_tree` applies: the
+/// command policy when a command wrote `fs` (and it is not the project
+/// directory), else `member`'s.
+fn recording_policy(
+    repo: &Repo,
+    fs: &dyn StorageBackend,
+    parent_tree: &ObjectId,
+    from_command: bool,
+    member: impl FnOnce() -> Result<WorkingCopyPolicy>,
+) -> Result<(WorkingCopyPolicy, Option<(CommandEdit, String)>)> {
+    if !from_command || repo.is_own_working_copy(fs) {
+        return Ok((member()?, None));
+    }
+    let c = repo.command_policy(fs, parent_tree)?;
+    Ok((WorkingCopyPolicy { policy: c.policy, accept: None }, c.edit))
+}
+
+/// Hold back a command's edit of `.veilpolicy` (see
+/// [`SnapshotOptions::policy_from_command`]): `tree` gets the
+/// `.veilpolicy` of `parent_tree` back, unless the edit only inserts
+/// protective rules and weakened no path of this snapshot.
+fn hold_command_edit(
+    store: &ObjectStore,
+    tree: ObjectId,
+    parent_tree: &ObjectId,
+    edit: Option<(CommandEdit, String)>,
+    report: &mut BuildReport,
+) -> Result<ObjectId> {
+    let Some((kind, why)) = edit else { return Ok(tree) };
+    let weakened = report.policy_held_back.len();
+    if kind == CommandEdit::Adds && weakened == 0 {
+        return Ok(tree);
+    }
+    report.policy_edit_held = Some(match weakened {
+        0 => why,
+        n => format!("would weaken the protection of {n} path(s)"),
+    });
+    let path = VPath::new(crate::policy::POLICY_FILE)?;
+    let recorded = store.tree(parent_tree)?.get(crate::policy::POLICY_FILE).cloned();
+    crate::conflict::set_entry(store, &tree, &path, recorded)
+}
+
 pub fn validate_workspace_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 64
@@ -206,6 +260,7 @@ impl Repo {
             materialised,
             description,
             policy_incoming,
+            policy_from_command,
             expected_wc,
             carried,
         } = opts;
@@ -220,17 +275,20 @@ impl Repo {
             });
         }
         let wc = tx.repo().snapshot(&wc_id)?;
-        // `fs` was checked out from `wc.tree`: a `.veilpolicy` edit is the
-        // member's, unless a command wrote it from elsewhere.
-        let wp = tx.repo().snapshot_policy(fs, (!policy_incoming).then_some(&wc.tree))?;
         let store = tx.repo().store.clone();
         let rescan = scanner_outdated(&*tx.repo().backend, ws)?;
         // What `fs` was materialised from: the working copy, with the
         // entries a command put back in place of its own.
         let parent_tree = with_carried(&store, wc.tree, carried)?;
+        // `fs` was checked out from `wc.tree`: a `.veilpolicy` edit is the
+        // member's, unless a command wrote it from elsewhere (or wrote the
+        // files at all).
+        let (wp, command_edit) = recording_policy(tx.repo(), fs, &parent_tree, policy_from_command, || {
+            tx.repo().snapshot_policy(fs, (!policy_incoming).then_some(&wc.tree))
+        })?;
         let repo = tx.repo();
         let line_base = || Ok(repo.parents_tree(&wc.parents)?.tree);
-        let (tree, report) = build_tree_cached(
+        let (tree, mut report) = build_tree_cached(
             &store,
             fs,
             &BuildOptions {
@@ -244,6 +302,7 @@ impl Repo {
             },
             cache,
         )?;
+        let tree = hold_command_edit(&store, tree, &parent_tree, command_edit, &mut report)?;
         tx.repo().record_accepted(&wp)?;
         if tree == wc.tree {
             // Nothing to record; the re-scan (if any) found nothing new.
@@ -465,13 +524,16 @@ impl Repo {
         description: &str,
         injected: Option<&InjectedSecrets>,
     ) -> Result<(ObjectId, BuildReport)> {
-        self.commit_fs_as_child_with(base, fs, description, injected, None, &[])
+        self.commit_fs_as_child_with(base, fs, description, injected, None, &[], false)
     }
 
     /// [`Repo::commit_fs_as_child_injected`] for a backend materialised as
     /// `materialised` records (a path it never showed is carried, not
     /// deleted; see [`BuildOptions::materialised`]) into which a command
     /// put back `carried` entries (see [`SnapshotOptions::carried`]).
+    /// `policy_from_command`: a command wrote the files of `fs` (see
+    /// [`SnapshotOptions::policy_from_command`]).
+    #[allow(clippy::too_many_arguments)]
     pub fn commit_fs_as_child_with(
         &mut self,
         base: ObjectId,
@@ -480,15 +542,17 @@ impl Repo {
         injected: Option<&InjectedSecrets>,
         materialised: Option<&Materialised>,
         carried: &[(VPath, crate::object::TreeEntry)],
+        policy_from_command: bool,
     ) -> Result<(ObjectId, BuildReport)> {
         let mut tx = self.transaction("record ephemeral workspace")?;
         let parent = tx.repo().snapshot(&base)?;
-        let wp = tx.repo().snapshot_policy(fs, None)?;
         let store = tx.repo().store.clone();
         // The new change's base is `base` itself.
         let line_base = || Ok(parent.tree);
         let parent_tree = with_carried(&store, parent.tree, carried)?;
-        let (tree, report) = build_tree_cached(
+        let (wp, command_edit) =
+            recording_policy(tx.repo(), fs, &parent_tree, policy_from_command, || tx.repo().snapshot_policy(fs, None))?;
+        let (tree, mut report) = build_tree_cached(
             &store,
             fs,
             &BuildOptions {
@@ -502,6 +566,7 @@ impl Repo {
             },
             None,
         )?;
+        let tree = hold_command_edit(&store, tree, &parent_tree, command_edit, &mut report)?;
         tx.repo().record_accepted(&wp)?;
         let snap = Snapshot {
             parents: vec![base],

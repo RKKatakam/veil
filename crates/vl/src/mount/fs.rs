@@ -14,13 +14,18 @@
 //! (`.veil/local/mounts/<ws>/upper`) and whiteouts are appended to a
 //! journal, so a crash of the mount loses nothing that was closed.
 //!
-//! **Open files** keep their content in a buffer while open (a read never
-//! decrypts a file twice; writes at any offset are cheap). A written
-//! buffer goes to the upper layer on `flush` (every `close`), `fsync` and
-//! `release`. A file never grows past the largest object Veil records
-//! ([`max_file_size`]): a larger size or offset is `EFBIG`, and a buffer
-//! that cannot be allocated is `ENOMEM`, never the end of the mount
-//! (BUG-536).
+//! **Open files** live on disk, not in memory (BUG-561): the first write
+//! (or `truncate`) of a file only the lower layer has copies it up into
+//! the upper layer (atomically and durably: temp file, fsync, rename), and
+//! from then on reads and writes go straight to that upper file, opened
+//! in place ([`UpperFiles`]); `flush` (every `close`), `fsync` and
+//! `release` sync it. A `truncate` to any size is a hole, which costs
+//! nothing until data is written. A file only the lower layer has is read
+//! once while it is open (a read never decrypts a file twice). A file
+//! never grows past the largest object Veil records ([`max_file_size`]): a
+//! larger size or offset is `EFBIG`, never the end of the mount (BUG-536).
+//! A rename moves an upper file (O(1), holes and all) instead of copying
+//! it.
 //!
 //! **What the mount never showed.** Deleting a directory hides the lower
 //! layer's whole subtree, including files this reader could not read and
@@ -76,6 +81,229 @@ pub trait Journal: Send {
     /// The files the mount never showed are exactly `all` now (see
     /// [`MountFs::unseen`]). Written before the whiteout that hides them.
     fn unseen(&mut self, _all: &[VPath]) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A file of the upper layer, open for reading and writing in place: what
+/// an open file of the mount is backed by once the upper layer has it
+/// (BUG-561).
+pub trait UpperFile: Send {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize>;
+    fn write_at(&mut self, data: &[u8], offset: u64) -> std::io::Result<()>;
+    /// Grow (sparsely: a hole costs nothing) or shrink the file.
+    fn set_len(&mut self, len: u64) -> std::io::Result<()>;
+    fn len(&self) -> std::io::Result<u64>;
+    /// Make what was written durable (`fsync`).
+    fn sync(&mut self) -> std::io::Result<()>;
+    /// Its path is about to be unlinked or replaced while the file is
+    /// still open: it keeps its content for the handles still open, and
+    /// what they write reaches no path from now on.
+    fn unlinked(&mut self) {}
+    /// It was renamed to `to`.
+    fn moved(&mut self, _to: &VPath) {}
+}
+
+/// Opens the files of an upper layer in place.
+pub trait UpperFiles: Send + Sync {
+    /// The regular file at `path` of the upper layer.
+    fn open(&self, path: &VPath) -> std::io::Result<Box<dyn UpperFile>>;
+    /// Rename upper file `from` to `to`, whose directory the upper layer
+    /// has: O(1), holes and all, and an open file follows it.
+    fn rename(&self, from: &VPath, to: &VPath) -> std::io::Result<()>;
+}
+
+/// [`UpperFiles`] of an upper layer that is a directory on disk (a real
+/// mount's `.veil/local/mounts/<ws>/upper`).
+pub struct DiskFiles {
+    root: std::path::PathBuf,
+}
+
+impl DiskFiles {
+    pub fn new(root: impl Into<std::path::PathBuf>) -> DiskFiles {
+        DiskFiles { root: root.into() }
+    }
+
+    fn full(&self, p: &VPath) -> std::path::PathBuf {
+        let mut out = self.root.clone();
+        out.extend(p.components());
+        out
+    }
+}
+
+struct DiskFile(std::fs::File);
+
+impl UpperFile for DiskFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        std::os::unix::fs::FileExt::read_at(&self.0, buf, offset)
+    }
+    fn write_at(&mut self, data: &[u8], offset: u64) -> std::io::Result<()> {
+        std::os::unix::fs::FileExt::write_all_at(&self.0, data, offset)
+    }
+    fn set_len(&mut self, len: u64) -> std::io::Result<()> {
+        self.0.set_len(len)
+    }
+    fn len(&self) -> std::io::Result<u64> {
+        Ok(self.0.metadata()?.len())
+    }
+    fn sync(&mut self) -> std::io::Result<()> {
+        self.0.sync_data()
+    }
+}
+
+impl UpperFiles for DiskFiles {
+    fn open(&self, path: &VPath) -> std::io::Result<Box<dyn UpperFile>> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(self.full(path))?;
+        if !f.metadata()?.is_file() {
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
+        Ok(Box::new(DiskFile(f)))
+    }
+
+    fn rename(&self, from: &VPath, to: &VPath) -> std::io::Result<()> {
+        let (a, b) = (self.full(from), self.full(to));
+        std::fs::rename(&a, &b)?;
+        // Durable once both directory entries are (best effort: a crash
+        // before can only leave the file where it was).
+        for dir in [a.parent(), b.parent()].into_iter().flatten() {
+            if let Ok(d) = std::fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
+        Ok(())
+    }
+}
+
+/// [`UpperFiles`] over any [`StorageBackend`]: every write rewrites the
+/// whole file. For upper layers in memory (the unit tests).
+pub struct BackendFiles(pub Arc<dyn StorageBackend>);
+
+struct BackendFile {
+    fs: Arc<dyn StorageBackend>,
+    path: VPath,
+    /// The content, once the path was unlinked.
+    own: Option<Vec<u8>>,
+}
+
+fn veil_io(e: VeilError) -> std::io::Error {
+    std::io::Error::from_raw_os_error(errno(&e))
+}
+
+impl BackendFile {
+    fn data(&self) -> std::io::Result<Vec<u8>> {
+        match &self.own {
+            Some(d) => Ok(d.clone()),
+            None => self.fs.read(&self.path).map_err(veil_io),
+        }
+    }
+    fn store(&mut self, data: Vec<u8>) -> std::io::Result<()> {
+        match &mut self.own {
+            Some(d) => {
+                *d = data;
+                Ok(())
+            }
+            None => self.fs.write(&self.path, &data).map_err(veil_io),
+        }
+    }
+}
+
+/// Grow `data` to `len` bytes without aborting on a failed allocation.
+fn grow(data: &mut Vec<u8>, len: u64) -> std::io::Result<()> {
+    let len = usize::try_from(len).map_err(|_| std::io::Error::from_raw_os_error(libc::EFBIG))?;
+    if len > data.len() {
+        data.try_reserve_exact(len - data.len()).map_err(|_| std::io::Error::from_raw_os_error(libc::ENOMEM))?;
+    }
+    data.resize(len, 0);
+    Ok(())
+}
+
+impl UpperFile for BackendFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        let data = self.data()?;
+        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(data.len());
+        let n = buf.len().min(data.len() - start);
+        buf[..n].copy_from_slice(&data[start..start + n]);
+        Ok(n)
+    }
+    fn write_at(&mut self, bytes: &[u8], offset: u64) -> std::io::Result<()> {
+        let mut data = self.data()?;
+        let end = offset + bytes.len() as u64;
+        if (data.len() as u64) < end {
+            grow(&mut data, end)?;
+        }
+        data[offset as usize..end as usize].copy_from_slice(bytes);
+        self.store(data)
+    }
+    fn set_len(&mut self, len: u64) -> std::io::Result<()> {
+        let mut data = self.data()?;
+        grow(&mut data, len)?;
+        self.store(data)
+    }
+    fn len(&self) -> std::io::Result<u64> {
+        Ok(self.data()?.len() as u64)
+    }
+    fn sync(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn unlinked(&mut self) {
+        if self.own.is_none() {
+            self.own = Some(self.data().unwrap_or_default());
+        }
+    }
+    fn moved(&mut self, to: &VPath) {
+        self.path = to.clone();
+    }
+}
+
+impl UpperFiles for BackendFiles {
+    fn open(&self, path: &VPath) -> std::io::Result<Box<dyn UpperFile>> {
+        Ok(Box::new(BackendFile {
+            fs: self.0.clone(),
+            path: path.clone(),
+            own: None,
+        }))
+    }
+
+    fn rename(&self, from: &VPath, to: &VPath) -> std::io::Result<()> {
+        let m = self.0.metadata(from).map_err(veil_io)?.ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+        let data = self.0.read(from).map_err(veil_io)?;
+        self.0.write(to, &data).map_err(veil_io)?;
+        self.0.set_executable(to, m.executable).map_err(veil_io)?;
+        self.0.remove_file(from).map_err(veil_io)
+    }
+}
+
+/// An open file that lost its path before anything was written to it (it
+/// was unlinked while open): written in memory, reaching no path.
+struct VecFile(Vec<u8>);
+
+impl UpperFile for VecFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(self.0.len());
+        let n = buf.len().min(self.0.len() - start);
+        buf[..n].copy_from_slice(&self.0[start..start + n]);
+        Ok(n)
+    }
+    fn write_at(&mut self, bytes: &[u8], offset: u64) -> std::io::Result<()> {
+        let end = offset + bytes.len() as u64;
+        if (self.0.len() as u64) < end {
+            grow(&mut self.0, end)?;
+        }
+        self.0[offset as usize..end as usize].copy_from_slice(bytes);
+        Ok(())
+    }
+    fn set_len(&mut self, len: u64) -> std::io::Result<()> {
+        grow(&mut self.0, len)
+    }
+    fn len(&self) -> std::io::Result<u64> {
+        Ok(self.0.len() as u64)
+    }
+    fn sync(&mut self) -> std::io::Result<()> {
         Ok(())
     }
 }
@@ -249,18 +477,19 @@ impl StorageBackend for ReaderView {
     }
 }
 
-struct Buf {
-    data: Vec<u8>,
-    dirty: bool,
-}
-
 struct Node {
     /// `None` once unlinked (or replaced by a rename) while still open.
     path: Option<VPath>,
     lookups: u64,
     open: u32,
-    /// The content while the file is open.
-    buf: Option<Buf>,
+    /// While open: the content of a file only the lower layer has, read
+    /// once (a read never decrypts a file twice). Never written to.
+    cache: Option<Vec<u8>>,
+    /// While open: the upper file, in place, once the upper layer has the
+    /// file. Reads and writes go straight to it (BUG-561).
+    file: Option<Box<dyn UpperFile>>,
+    /// Written since `file` was last synced.
+    dirty: bool,
 }
 
 struct Handle {
@@ -279,6 +508,8 @@ struct Inner {
     /// stay put while entries are deleted (BUG-537).
     dirs: HashMap<u64, Vec<(u64, String, NodeKind)>>,
     journal: Option<Box<dyn Journal>>,
+    /// Opens the upper layer's files in place.
+    files: Arc<dyn UpperFiles>,
     nodes: HashMap<u64, Node>,
     by_path: HashMap<VPath, u64>,
     next_ino: u64,
@@ -371,7 +602,9 @@ impl Inner {
                 path: Some(path.clone()),
                 lookups: 0,
                 open: 0,
-                buf: None,
+                cache: None,
+                file: None,
+                dirty: false,
             },
         );
         self.by_path.insert(path.clone(), ino);
@@ -393,14 +626,11 @@ impl Inner {
 
     fn attr(&self, ino: u64, path: &VPath) -> FsResult<Attr> {
         let m = self.meta(path)?.ok_or(libc::ENOENT)?;
-        let size = match self.nodes.get(&ino).and_then(|n| n.buf.as_ref()) {
-            Some(b) if m.kind == NodeKind::File => b.data.len() as u64,
-            _ => m.len,
-        };
+        // An open upper file is written in place: the layer's size is its.
         Ok(Attr {
             ino,
             kind: m.kind,
-            size,
+            size: m.len,
             executable: m.executable,
             mtime: self.mtime(path),
         })
@@ -408,14 +638,16 @@ impl Inner {
 
     /// The attributes of an open node, which may no longer have a path.
     fn attr_of(&self, ino: u64) -> FsResult<Attr> {
+        let unlinked = |size: u64| Attr {
+            ino,
+            kind: NodeKind::File,
+            size,
+            executable: false,
+            mtime: SystemTime::now(),
+        };
         match self.nodes.get(&ino) {
-            Some(Node { path: None, buf: Some(b), .. }) => Ok(Attr {
-                ino,
-                kind: NodeKind::File,
-                size: b.data.len() as u64,
-                executable: false,
-                mtime: SystemTime::now(),
-            }),
+            Some(Node { path: None, file: Some(f), .. }) => Ok(unlinked(f.len().map_err(|e| io_errno(&e))?)),
+            Some(Node { path: None, cache: Some(c), .. }) => Ok(unlinked(c.len() as u64)),
             _ => {
                 let p = self.path(ino)?;
                 self.attr(ino, &p)
@@ -447,29 +679,78 @@ impl Inner {
         }
     }
 
-    /// Load the content of open node `ino` into its buffer.
-    fn load(&mut self, ino: u64) -> FsResult<&mut Buf> {
-        let need = self.nodes.get(&ino).ok_or(libc::EBADF)?.buf.is_none();
+    /// Load the content of open node `ino` (a file only the lower layer
+    /// has) into its cache.
+    fn load(&mut self, ino: u64) -> FsResult<&Vec<u8>> {
+        let need = self.nodes.get(&ino).ok_or(libc::EBADF)?.cache.is_none();
         if need {
             let path = self.path(ino)?;
             let data = self.overlay.read(&path).map_err(|e| errno(&e))?;
-            self.nodes.get_mut(&ino).ok_or(libc::EBADF)?.buf = Some(Buf { data, dirty: false });
+            self.nodes.get_mut(&ino).ok_or(libc::EBADF)?.cache = Some(data);
         }
-        Ok(self.nodes.get_mut(&ino).and_then(|n| n.buf.as_mut()).expect("loaded"))
+        Ok(self.nodes.get(&ino).and_then(|n| n.cache.as_ref()).expect("loaded"))
     }
 
-    /// Write node `ino`'s buffer to the upper layer if it changed.
+    fn upper_has_file(&self, path: &VPath) -> bool {
+        upper_kind(&**self.overlay.upper(), path) == Some(NodeKind::File)
+    }
+
+    /// Back node `ino` with its upper file, if the upper layer has one.
+    /// Is it backed by a file now?
+    fn open_upper(&mut self, ino: u64) -> FsResult<bool> {
+        let node = self.nodes.get(&ino).ok_or(libc::EBADF)?;
+        if node.file.is_some() {
+            return Ok(true);
+        }
+        let Some(path) = node.path.clone() else { return Ok(false) };
+        if !self.upper_has_file(&path) {
+            return Ok(false);
+        }
+        let f = self.files.open(&path).map_err(|e| io_errno(&e))?;
+        let n = self.nodes.get_mut(&ino).ok_or(libc::EBADF)?;
+        n.file = Some(f);
+        n.cache = None;
+        Ok(true)
+    }
+
+    /// Node `ino`'s upper file, made writable: a file only the lower layer
+    /// has is copied up first (atomically and durably), an unlinked one
+    /// that was never written is written in memory.
+    fn writable(&mut self, ino: u64) -> FsResult<&mut Box<dyn UpperFile>> {
+        if !self.open_upper(ino)? {
+            let node = self.nodes.get_mut(&ino).ok_or(libc::EBADF)?;
+            match node.path.clone() {
+                None => {
+                    let data = node.cache.take().unwrap_or_default();
+                    node.file = Some(Box::new(VecFile(data)));
+                }
+                Some(path) => {
+                    let data = match node.cache.take() {
+                        Some(d) => d,
+                        None => self.overlay.read(&path).map_err(|e| errno(&e))?,
+                    };
+                    let exec = self.meta(&path)?.is_some_and(|m| m.executable);
+                    self.overlay.write(&path, &data).map_err(|e| errno(&e))?;
+                    self.overlay.set_executable(&path, exec).map_err(|e| errno(&e))?;
+                    if !self.open_upper(ino)? {
+                        return Err(libc::EIO);
+                    }
+                }
+            }
+        }
+        Ok(self.nodes.get_mut(&ino).and_then(|n| n.file.as_mut()).expect("backed by a file"))
+    }
+
+    /// Make what was written to node `ino` durable.
     fn persist(&mut self, ino: u64) -> FsResult<()> {
-        let Some(node) = self.nodes.get(&ino) else { return Ok(()) };
-        let (Some(path), Some(buf)) = (&node.path, &node.buf) else { return Ok(()) };
-        if !buf.dirty {
+        let Some(node) = self.nodes.get_mut(&ino) else { return Ok(()) };
+        if !node.dirty {
             return Ok(());
         }
-        let path = path.clone();
-        self.overlay.write(&path, &buf.data).map_err(|e| errno(&e))?;
-        if let Some(b) = self.nodes.get_mut(&ino).and_then(|n| n.buf.as_mut()) {
-            b.dirty = false;
+        if let Some(f) = node.file.as_mut() {
+            f.sync().map_err(|e| io_errno(&e))?;
         }
+        node.dirty = false;
         Ok(())
     }
 
@@ -477,7 +758,7 @@ impl Inner {
         let inos: Vec<u64> = self
             .nodes
             .iter()
-            .filter(|(_, n)| n.buf.as_ref().is_some_and(|b| b.dirty) && n.path.as_ref().is_some_and(|p| p.starts_with(root)))
+            .filter(|(_, n)| n.dirty && n.path.as_ref().is_some_and(|p| p.starts_with(root)))
             .map(|(i, _)| *i)
             .collect();
         for i in inos {
@@ -529,10 +810,16 @@ impl Inner {
         for ino in inos {
             let open = self.nodes.get(&ino).is_some_and(|n| n.open > 0);
             if open {
-                // Keep reading what was there, wherever it came from.
-                if self.nodes.get(&ino).is_some_and(|n| n.buf.is_none()) && self.load(ino).is_err() {
+                // Keep reading what was there, wherever it came from: the
+                // upper file (which keeps its content once unlinked), or
+                // the lower layer's content.
+                if self.open_upper(ino).unwrap_or(false) {
+                    if let Some(f) = self.nodes.get_mut(&ino).and_then(|n| n.file.as_mut()) {
+                        f.unlinked();
+                    }
+                } else if self.nodes.get(&ino).is_some_and(|n| n.cache.is_none()) && self.load(ino).is_err() {
                     if let Some(n) = self.nodes.get_mut(&ino) {
-                        n.buf = Some(Buf { data: Vec::new(), dirty: false });
+                        n.cache = Some(Vec::new());
                     }
                 }
             }
@@ -548,10 +835,19 @@ impl Inner {
         Ok(())
     }
 
+    /// Put a copy of `from` at `to`, for a rename: an upper file is moved
+    /// there (O(1), holes and all; an open one follows), a file only the
+    /// lower layer has is copied up.
     fn copy_file(&mut self, from: &VPath, to: &VPath) -> FsResult<()> {
         let m = self.meta(from)?.ok_or(libc::ENOENT)?;
-        let data = match self.by_path.get(from).and_then(|i| self.nodes.get(i)).and_then(|n| n.buf.as_ref()) {
-            Some(b) => b.data.clone(),
+        if self.upper_has_file(from) {
+            if let Some(dir) = to.parent() {
+                self.overlay.create_dir_all(&dir).map_err(|e| errno(&e))?;
+            }
+            return self.files.rename(from, to).map_err(|e| io_errno(&e));
+        }
+        let data = match self.by_path.get(from).and_then(|i| self.nodes.get(i)).and_then(|n| n.cache.as_ref()) {
+            Some(b) => b.clone(),
             None => self.overlay.read(from).map_err(|e| errno(&e))?,
         };
         self.overlay.write(to, &data).map_err(|e| errno(&e))?;
@@ -592,31 +888,30 @@ impl Inner {
         self.lower = lower;
     }
 
-    /// Grow or shrink open node `ino`'s buffer to `len` bytes, within
-    /// [`max_file_size`] and without aborting on a failed allocation.
+    /// Resize node `ino` to `len` bytes (a hole when it grows), within
+    /// [`max_file_size`].
     fn resize(&mut self, ino: u64, len: u64) -> FsResult<()> {
         if len > max_file_size() {
             return Err(libc::EFBIG);
         }
-        let len = usize::try_from(len).map_err(|_| libc::EFBIG)?;
-        let buf = self.load(ino)?;
-        if len > buf.data.len() {
-            buf.data.try_reserve_exact(len - buf.data.len()).map_err(|_| libc::ENOMEM)?;
+        let f = self.writable(ino)?;
+        if f.len().map_err(|e| io_errno(&e))? != len {
+            f.set_len(len).map_err(|e| io_errno(&e))?;
+            if let Some(n) = self.nodes.get_mut(&ino) {
+                n.dirty = true;
+            }
         }
-        buf.data.resize(len, 0);
         Ok(())
     }
 
-    /// Drop the cached content of closed-but-cached nodes at `paths`, and
-    /// give the paths a new modification time.
+    /// Drop the cached lower-layer content of nodes at `paths` (it may have
+    /// changed), and give the paths a new modification time.
     fn changed(&mut self, paths: &[VPath]) {
         for p in paths {
             self.touch(p);
             if let Some(ino) = self.by_path.get(p).copied() {
                 if let Some(n) = self.nodes.get_mut(&ino) {
-                    if n.buf.as_ref().is_some_and(|b| !b.dirty) {
-                        n.buf = None;
-                    }
+                    n.cache = None;
                 }
             }
         }
@@ -656,11 +951,12 @@ impl MountFs {
     ) -> MountFs {
         MountFs {
             inner: Mutex::new(Inner {
-                overlay: OverlayBackend::with_upper(lower.clone(), upper, whiteouts),
+                overlay: OverlayBackend::with_upper(lower.clone(), upper.clone(), whiteouts),
                 lower,
                 unseen: BTreeSet::new(),
                 dirs: HashMap::new(),
                 journal,
+                files: Arc::new(BackendFiles(upper)),
                 nodes: HashMap::new(),
                 by_path: HashMap::new(),
                 next_ino: ROOT + 1,
@@ -671,6 +967,14 @@ impl MountFs {
                 generation: 0,
             }),
         }
+    }
+
+    /// Open the upper layer's files with `files` (a real mount's:
+    /// [`DiskFiles`], in place on disk) instead of through the upper
+    /// backend.
+    pub fn with_files(self, files: Arc<dyn UpperFiles>) -> MountFs {
+        self.lock().files = files;
+        self
     }
 
     /// The files the whiteouts hide that the mount never showed, as
@@ -778,9 +1082,15 @@ impl MountFs {
             None => return Err(libc::ENOENT),
         }
         if truncate && write {
-            let n = g.nodes.get_mut(&ino).ok_or(libc::ENOENT)?;
-            n.buf = Some(Buf { data: Vec::new(), dirty: true });
-            g.persist(ino)?;
+            if g.open_upper(ino)? {
+                let f = g.nodes.get_mut(&ino).and_then(|n| n.file.as_mut()).ok_or(libc::EBADF)?;
+                f.set_len(0).map_err(|e| io_errno(&e))?;
+                f.sync().map_err(|e| io_errno(&e))?;
+            } else {
+                // Durably empty (keeping a lower file's executable bit).
+                g.overlay.write(&path, b"").map_err(|e| errno(&e))?;
+                g.nodes.get_mut(&ino).ok_or(libc::ENOENT)?.cache = None;
+            }
             g.touch(&path);
         }
         g.nodes.get_mut(&ino).ok_or(libc::ENOENT)?.open += 1;
@@ -810,9 +1120,6 @@ impl MountFs {
         let n = g.nodes.get_mut(&ino).expect("just made");
         n.lookups += 1;
         n.open += 1;
-        if !exists {
-            n.buf = Some(Buf { data: Vec::new(), dirty: false });
-        }
         let fh = g.next_fh;
         g.next_fh += 1;
         g.handles.insert(fh, Handle { ino, write: true });
@@ -822,10 +1129,25 @@ impl MountFs {
     pub fn read(&self, fh: u64, offset: u64, size: u32) -> FsResult<Vec<u8>> {
         let mut g = self.lock();
         let ino = g.handles.get(&fh).ok_or(libc::EBADF)?.ino;
+        if g.open_upper(ino)? {
+            let f = g.nodes.get(&ino).and_then(|n| n.file.as_ref()).ok_or(libc::EBADF)?;
+            let len = f.len().map_err(|e| io_errno(&e))?;
+            let n = (size as u64).min(len.saturating_sub(offset)) as usize;
+            let mut out = vec![0; n];
+            let mut done = 0;
+            while done < n {
+                match f.read_at(&mut out[done..], offset + done as u64).map_err(|e| io_errno(&e))? {
+                    0 => break,
+                    k => done += k,
+                }
+            }
+            out.truncate(done);
+            return Ok(out);
+        }
         let buf = g.load(ino)?;
-        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(buf.data.len());
-        let end = start.saturating_add(size as usize).min(buf.data.len());
-        Ok(buf.data[start..end].to_vec())
+        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(buf.len());
+        let end = start.saturating_add(size as usize).min(buf.len());
+        Ok(buf[start..end].to_vec())
     }
 
     pub fn write(&self, fh: u64, offset: u64, data: &[u8]) -> FsResult<u32> {
@@ -839,13 +1161,10 @@ impl MountFs {
         if end > max_file_size() {
             return Err(libc::EFBIG);
         }
-        if g.load(ino)?.data.len() < end as usize {
-            g.resize(ino, end)?;
+        g.writable(ino)?.write_at(data, offset).map_err(|e| io_errno(&e))?;
+        if let Some(n) = g.nodes.get_mut(&ino) {
+            n.dirty = true;
         }
-        let buf = g.load(ino)?;
-        let start = offset as usize;
-        buf.data[start..start + data.len()].copy_from_slice(data);
-        buf.dirty = true;
         if let Ok(p) = g.path(ino) {
             g.touch(&p);
         }
@@ -866,8 +1185,12 @@ impl MountFs {
         let drop_node = match g.nodes.get_mut(&h.ino) {
             Some(n) => {
                 n.open = n.open.saturating_sub(1);
-                if n.open == 0 && n.buf.as_ref().is_none_or(|b| !b.dirty) {
-                    n.buf = None;
+                if n.open == 0 {
+                    // What was written is in the upper file (synced above,
+                    // or as far as the disk allowed).
+                    n.file = None;
+                    n.cache = None;
+                    n.dirty = false;
                 }
                 n.open == 0 && (n.path.is_none() || n.lookups == 0)
             }
@@ -895,24 +1218,17 @@ impl MountFs {
                 return Err(libc::EFBIG);
             }
             let open = g.nodes.get(&ino).is_some_and(|n| n.open > 0);
-            if g.load(ino)?.data.len() as u64 != size {
-                let r = g.resize(ino, size);
-                if r.is_err() && !open {
-                    if let Some(n) = g.nodes.get_mut(&ino) {
-                        n.buf = None;
-                    }
-                }
-                r?;
-                g.load(ino)?.dirty = true;
-            }
             // Through a path (`truncate(1)`), or by a handle: either way
-            // the upper layer has it now.
-            g.persist(ino)?;
+            // the upper layer has it now, durably.
+            let r = g.resize(ino, size).and_then(|_| g.persist(ino));
             if !open {
                 if let Some(n) = g.nodes.get_mut(&ino) {
-                    n.buf = None;
+                    n.file = None;
+                    n.cache = None;
+                    n.dirty = false;
                 }
             }
+            r?;
             g.touch(&path);
         }
         if let Some(mode) = mode {
@@ -1042,6 +1358,9 @@ impl MountFs {
             g.by_path.remove(&p);
             g.by_path.insert(np.clone(), ino);
             if let Some(n) = g.nodes.get_mut(&ino) {
+                if let Some(f) = n.file.as_mut() {
+                    f.moved(&np);
+                }
                 n.path = Some(np);
             }
         }
@@ -1101,7 +1420,7 @@ impl MountFs {
         g.set_lower(lower);
         for n in g.nodes.values_mut() {
             if n.open == 0 {
-                n.buf = None;
+                n.cache = None;
             }
         }
     }
@@ -1136,10 +1455,14 @@ impl MountFs {
                 }
             }
             // The paths stay (now from the new lower layer): the kernel
-            // keeps its inodes, only cached content goes.
+            // keeps its inodes, only cached content (and the dropped upper
+            // file an open node had: what was written to it is in the
+            // saved change) goes.
             for n in g.nodes.values_mut() {
-                if n.open == 0 && n.path.as_ref().is_some_and(|q| q.starts_with(p)) {
-                    n.buf = None;
+                if n.path.as_ref().is_some_and(|q| q.starts_with(p)) {
+                    n.cache = None;
+                    n.file = None;
+                    n.dirty = false;
                 }
             }
         }
@@ -1208,9 +1531,12 @@ impl Inner {
             }
         }
         let hidden = |p: &VPath| kept.contains(p) || p.ancestors().iter().any(|a| kept.contains(a));
+        // Upper files open in place stay while they are open: what is
+        // written to them must keep reaching the upper layer.
+        let open: BTreeSet<VPath> = g.nodes.values().filter(|n| n.file.is_some()).filter_map(|n| n.path.clone()).collect();
         // Upper files identical to the new lower layer go.
         for f in walk_files(&*upper, &VPath::root(), &|_| false).map_err(e)? {
-            if hidden(&f) {
+            if hidden(&f) || open.contains(&f) {
                 continue;
             }
             let (Some(um), Some(lm)) = (upper.metadata(&f).map_err(e)?, lower.metadata(&f).map_err(e)?) else {
@@ -1241,7 +1567,7 @@ impl Inner {
         // Cached content of closed files may be stale.
         for n in g.nodes.values_mut() {
             if n.open == 0 {
-                n.buf = None;
+                n.cache = None;
             }
         }
         Ok(())
@@ -1412,9 +1738,9 @@ mod tests {
         let ino = m.ino("a/x.txt").unwrap();
         let fh = m.fs.open(ino, true, false).unwrap();
         m.fs.write(fh, 6, b"there").unwrap();
-        // Not yet closed: the buffer serves reads, the upper layer is empty.
+        // Copied up on the first write, then written in place (BUG-561).
         assert_eq!(m.fs.getattr(ino).unwrap().size, 11);
-        assert!(m.upper.files().is_empty());
+        assert_eq!(m.upper.read(&p("a/x.txt")).unwrap(), b"hello there");
         m.fs.write(fh, 11, b"!!").unwrap();
         m.fs.flush(fh).unwrap();
         m.fs.release(fh).unwrap();
@@ -1662,6 +1988,41 @@ mod tests {
         m.fs.write(fh, 4, b"!").unwrap();
         m.fs.release(fh).unwrap();
         assert_eq!(m.cat("a").unwrap(), b"keep!");
+    }
+
+    /// BUG-561: open files are their upper file. A truncate past the end
+    /// and a write far out reach the upper layer at once, an open file
+    /// renamed (moved in the upper layer) or unlinked keeps working, and a
+    /// recording's reconcile leaves an open upper file alone.
+    #[test]
+    fn open_files_are_their_upper_file() {
+        let m = mem(&[("a", b"lower")]);
+        let ino = m.ino("a").unwrap();
+        let fh = m.fs.open(ino, true, false).unwrap();
+        m.fs.setattr(ino, Some(10), None, None).unwrap();
+        assert_eq!(m.upper.read(&p("a")).unwrap(), b"lower\0\0\0\0\0");
+        m.fs.write(fh, 12, b"far").unwrap();
+        assert_eq!(m.fs.getattr(ino).unwrap().size, 15);
+        assert_eq!(m.fs.read(fh, 8, 10).unwrap(), b"\0\0\0\0far");
+        // Renamed while open: the handle follows.
+        m.fs.rename(ROOT, os("a"), ROOT, os("b"), false).unwrap();
+        m.fs.write(fh, 0, b"L").unwrap();
+        assert_eq!(m.upper.read(&p("b")).unwrap(), b"Lower\0\0\0\0\0\0\0far");
+        assert!(m.upper.metadata(&p("a")).unwrap().is_none());
+        // A recording that saw the file as it is keeps it while it is open.
+        let recorded = Arc::new(MemoryBackend::from_files([("b", &b"Lower\0\0\0\0\0\0\0far"[..])]).unwrap());
+        m.fs.reconcile(recorded).unwrap();
+        m.fs.write(fh, 1, b"O").unwrap();
+        m.fs.release(fh).unwrap();
+        assert_eq!(m.cat("b").unwrap(), b"LOwer\0\0\0\0\0\0\0far");
+        // Unlinked while open: still readable and writable, reaching no path.
+        let ino = m.ino("b").unwrap();
+        let fh = m.fs.open(ino, true, false).unwrap();
+        m.fs.unlink(ROOT, os("b")).unwrap();
+        m.fs.write(fh, 0, b"gone").unwrap();
+        assert_eq!(m.fs.read(fh, 0, 4).unwrap(), b"gone");
+        assert!(m.upper.metadata(&p("b")).unwrap().is_none());
+        m.fs.release(fh).unwrap();
     }
 
     /// BUG-534: deleting a directory that held files this reader could not

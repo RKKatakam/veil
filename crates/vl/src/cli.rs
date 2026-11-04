@@ -726,7 +726,13 @@ pub enum PolicyCmd {
     /// Apply the working copy's .veilpolicy in full, including changes that
     /// arrived by merge, pull or checkout and weaken the protection of
     /// local files (until now held back on this device).
-    Accept,
+    Accept {
+        /// Record instead the edit of .veilpolicy a command made in this
+        /// virtual workspace's `vl ws exec` sandbox or mount, held back
+        /// because it weakens the workspace's recorded policy.
+        #[arg(long, value_name = "NAME")]
+        workspace: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]

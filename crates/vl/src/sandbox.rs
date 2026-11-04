@@ -73,7 +73,7 @@ use veil_core::{
 
 use crate::{
     ctx::{print_checkout_problems, print_working_copy_warnings, Ctx},
-    render::{dim, one_line, print_build_warnings, safe, warn, yellow},
+    render::{dim, one_line, policy_edit_held_message, print_build_warnings, safe, warn, yellow},
 };
 
 /// Hidden first argument that turns `vl` into a sandbox reaper.
@@ -478,6 +478,9 @@ fn finish(
                             injected: secrets.as_ref(),
                             materialised: Some(&m.materialised),
                             expected_wc: Some(p.base),
+                            // The command edited the files, not the member
+                            // (BUG-560).
+                            policy_from_command: true,
                             ..Default::default()
                         },
                     )
@@ -490,7 +493,7 @@ fn finish(
                     let desc = if p.message.is_empty() { "`vl ws exec` result" } else { p.message.as_str() };
                     let (id, report) = ctx
                         .repo
-                        .commit_fs_as_child_injected(p.base, recorded_fs, desc, secrets.as_ref())
+                        .commit_fs_as_child_with(p.base, recorded_fs, desc, secrets.as_ref(), None, &[], true)
                         .map_err(|e| not_recorded(name, paths, e))?;
                     (id, report, Outcome::Saved)
                 } else {
@@ -505,6 +508,10 @@ fn finish(
                 paths.save_manifest(m)?;
                 print_build_warnings(&report);
                 print_working_copy_warnings(&report);
+                let place = format!("the sandbox ({})", paths.files.display());
+                if let Some(msg) = policy_edit_held_message(&report, Some((&place, name))) {
+                    warn(&msg);
+                }
                 if outcome == Outcome::Saved {
                     let change = ctx.repo.snapshot(&recorded)?.change_id.short();
                     warn(&format!(
@@ -970,7 +977,7 @@ fn exec_ephemeral(ctx: &mut Ctx, a: &Exec<'_>) -> Result<ExitCode> {
         };
         let (id, report) = ctx
             .repo
-            .commit_fs_as_child_injected(base_snapshot, recorded_fs, a.message, injected.as_ref())?;
+            .commit_fs_as_child_with(base_snapshot, recorded_fs, a.message, injected.as_ref(), None, &[], true)?;
         if let Some(why) = &pin.why {
             warn(&format!(
                 "{POLICY_FILE} {why} in the sandbox: the recorded policy is kept (in a sandbox, only a regular, readable \
@@ -992,6 +999,9 @@ fn exec_ephemeral(ctx: &mut Ctx, a: &Exec<'_>) -> Result<ExitCode> {
         }
         print_build_warnings(&report);
         print_working_copy_warnings(&report);
+        if let Some(msg) = policy_edit_held_message(&report, None) {
+            warn(&msg);
+        }
         eprintln!("Recorded {}", one_line(&ctx.repo, &id));
         Ok(code)
     })();

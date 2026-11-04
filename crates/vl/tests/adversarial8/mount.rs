@@ -305,6 +305,68 @@ fn a_write_at_a_huge_offset_does_not_kill_the_mount() {
     let _ = env.vl(U, &proj, &["ws", "unmount", "agent"]);
 }
 
+/// A kernel-reported memory figure of process `pid` (`VmHWM`: peak RSS;
+/// `VmRSS`: now), in KiB.
+fn vm_kib(pid: i32, field: &str) -> u64 {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix(field))
+        .and_then(|v| v.trim_start_matches(':').split_whitespace().next())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("no {field} in /proc/{pid}/status"))
+}
+
+/// BUG-561: a sparse file in the mount (a 2 GiB `truncate`, then a small
+/// write near its end, through the same handle and through another one)
+/// lives on disk, in the overlay's upper file: the serving process's
+/// memory does not grow with it, and the file reads back as written.
+#[test]
+fn a_sparse_file_in_the_mount_costs_no_memory() {
+    if !fuse_available() {
+        return;
+    }
+    use std::os::unix::fs::FileExt;
+    const SIZE: u64 = 2 << 30;
+    let env = Env::new();
+    let proj = agent_project(&env);
+    let (mnt, _g) = mount(&env, U, &proj, "agent");
+    let pid = state_pid(&proj, "agent");
+    let before = vm_kib(pid, "VmRSS");
+    // The kernel splits writes; the file system only ever sees small ones.
+    let f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(mnt.join("sparse.img")).unwrap();
+    f.set_len(SIZE).unwrap();
+    f.write_all_at(b"tail", SIZE - 4).unwrap();
+    f.write_all_at(b"head", 0).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    let g = std::fs::OpenOptions::new().read(true).write(true).open(mnt.join("sparse.img")).unwrap();
+    g.write_all_at(b"middle", SIZE / 2).unwrap();
+    drop(g);
+    // An existing file truncated by path, too.
+    std::fs::OpenOptions::new().write(true).open(mnt.join("a.txt")).unwrap().set_len(SIZE).unwrap();
+    let peak = vm_kib(pid, "VmHWM");
+    let grown = peak.saturating_sub(before);
+    let r = std::fs::File::open(mnt.join("sparse.img")).unwrap();
+    assert_eq!(r.metadata().unwrap().len(), SIZE);
+    let mut buf = [0u8; 6];
+    r.read_exact_at(&mut buf[..4], 0).unwrap();
+    assert_eq!(&buf[..4], b"head");
+    r.read_exact_at(&mut buf, SIZE / 2).unwrap();
+    assert_eq!(&buf, b"middle");
+    r.read_exact_at(&mut buf[..4], SIZE - 4).unwrap();
+    assert_eq!(&buf[..4], b"tail");
+    r.read_exact_at(&mut buf[..4], 4096).unwrap();
+    assert_eq!(&buf[..4], &[0; 4]);
+    drop(r);
+    assert!(grown < 256 * 1024, "the mount process grew by {grown} KiB (peak {peak} KiB, before {before} KiB) for sparse files");
+    assert_eq!(std::fs::metadata(mnt.join("a.txt")).unwrap().len(), SIZE);
+    // Not recorded: a 2 GiB object would be read into memory by the builder.
+    std::fs::remove_file(mnt.join("sparse.img")).unwrap();
+    std::fs::write(mnt.join("a.txt"), "a\n").unwrap();
+    env.ok(U, &proj, &["ws", "unmount", "agent"]);
+}
+
 // ---- what a non-member can read -----------------------------------------------
 
 /// A conflict whose "theirs" side is sealed for `team`, published to a
