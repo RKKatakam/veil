@@ -5,6 +5,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [[bin]]
 name = "vl"
@@ -27,3 +29,8 @@ libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+# Release archives (see dist-workspace.toml): shell completions and man
+# pages generated from this vl by .github/build-setup.yml.
+[package.metadata.dist]
+include = ["../../target/vl-extras/completions", "../../target/vl-extras/man"]

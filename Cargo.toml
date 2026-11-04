@@ -8,6 +8,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.80"
 repository = "https://github.com/veil-vcs/veil"
+homepage = "https://github.com/veil-vcs/veil"
 
 [workspace.dependencies]
 veil-core = { path = "crates/veil-core" }
@@ -37,3 +38,7 @@ zstd = { version = "0.14", default-features = false }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# The profile `dist` builds release archives with (see dist-workspace.toml).
+[profile.dist]
+inherits = "release"

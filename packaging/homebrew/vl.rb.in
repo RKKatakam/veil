@@ -1,0 +1,47 @@
+# Homebrew formula for Veil's `vl`.
+#
+# This is a template: packaging/homebrew/render-formula.sh fills in the
+# version and checksums from a release, and the release workflow
+# (.github/workflows/publish-homebrew.yml) pushes the result to the tap and
+# attaches it to the GitHub Release. Do not edit the copy in the tap.
+class Vl < Formula
+  desc "Snapshot-first version control with per-file cloaking and secret protection"
+  homepage "https://github.com/@REPO@"
+  version "@VERSION@"
+  license any_of: ["MIT", "Apache-2.0"]
+
+  on_macos do
+    on_arm do
+      url "https://github.com/@REPO@/releases/download/@TAG@/vl-aarch64-apple-darwin.tar.xz"
+      sha256 "@SHA256_aarch64-apple-darwin@"
+    end
+    on_intel do
+      url "https://github.com/@REPO@/releases/download/@TAG@/vl-x86_64-apple-darwin.tar.xz"
+      sha256 "@SHA256_x86_64-apple-darwin@"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "https://github.com/@REPO@/releases/download/@TAG@/vl-aarch64-unknown-linux-musl.tar.xz"
+      sha256 "@SHA256_aarch64-unknown-linux-musl@"
+    end
+    on_intel do
+      url "https://github.com/@REPO@/releases/download/@TAG@/vl-x86_64-unknown-linux-musl.tar.xz"
+      sha256 "@SHA256_x86_64-unknown-linux-musl@"
+    end
+  end
+
+  def install
+    bin.install "vl"
+    bash_completion.install "completions/vl.bash" => "vl"
+    zsh_completion.install "completions/_vl"
+    fish_completion.install "completions/vl.fish"
+    man1.install Dir["man/*.1"]
+  end
+
+  test do
+    assert_match "repository format", shell_output("#{bin}/vl --version")
+    assert_match "_vl", shell_output("#{bin}/vl completions bash")
+  end
+end
