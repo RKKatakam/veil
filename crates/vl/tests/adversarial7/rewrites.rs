@@ -97,7 +97,7 @@ fn rev(wc: bool) -> &'static str {
 
 /// Every place `needle` occurs in the repository at `dir`: raw file bytes
 /// and the decoded bytes of every packed object (packs are compressed).
-fn mirror_contains(dir: &Path, needle: &[u8]) -> Vec<String> {
+pub(crate) fn mirror_contains(dir: &Path, needle: &[u8]) -> Vec<String> {
     if !dir.exists() {
         return vec![];
     }
@@ -250,7 +250,12 @@ fn run(ops: Vec<Op>) -> Result<(), TestCaseError> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 24, failure_persistence: None, ..ProptestConfig::default() })]
+    // `PROPTEST_CASES` runs more (every case runs the binary dozens of times).
+    #![proptest_config(ProptestConfig {
+        cases: std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(24),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
 
     #[test]
     fn no_rewrite_publishes_sealed_content(ops in prop::collection::vec(op(), 1..10)) {
@@ -301,4 +306,14 @@ fn a_path_squashed_into_the_cloaked_parent_publishes_nothing_sealed() {
         Op::Restore,
     ])
     .unwrap();
+}
+
+/// BUG-682: a draft committed and squashed into the cloaked change, then
+/// a second draft of the same line (left in `@` as a conflict by the
+/// rebase) squashed in too: the merged sealed version's fallback was the
+/// second draft's plaintext, which the push of the cloaked change sent.
+#[test]
+fn a_draft_squashed_into_a_sealed_edit_publishes_nothing_sealed() {
+    run(vec![Op::Draft(0, true), Op::Draft(0, false), Op::SquashIntoSealed(false, None), Op::SquashIntoSealed(true, None)])
+        .unwrap();
 }

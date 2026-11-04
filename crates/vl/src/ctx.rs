@@ -253,6 +253,20 @@ fn attached_workspace(repo: &Repo, st: &CheckoutState) -> Result<String> {
     Ok(fallback)
 }
 
+/// How many times [`Ctx::record`] looks at the working copy before giving
+/// up because other commands keep moving it.
+const RECORD_ATTEMPTS: u32 = 10;
+
+/// The pause before look `attempt` (from 1) of [`Ctx::record`]: 5 ms
+/// doubling, at most 200 ms, plus up to half again of jitter so that
+/// processes that lost together do not look again together.
+fn record_backoff(attempt: u32) -> std::time::Duration {
+    let base = (5u64 << attempt.saturating_sub(1).min(6)).min(200);
+    let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos() as u64);
+    let jitter = (seed ^ u64::from(std::process::id())) % (base / 2 + 1);
+    std::time::Duration::from_millis(base + jitter)
+}
+
 impl Ctx {
     pub fn open(repo_arg: Option<&Path>, snapshot: bool) -> Result<Ctx> {
         let start = match repo_arg {
@@ -360,8 +374,15 @@ impl Ctx {
         self.resume()?;
         // Another process may move the workspace between our look at it and
         // the snapshot's transaction; the snapshot then records nothing, and
-        // we look again (the directory is stale now).
-        for _ in 0..3 {
+        // we look again (the directory is stale now). Each look loses only
+        // to a command that did move it, so with several `vl` running here
+        // at once (an editor, a script, a hook) a few looks can lose in a
+        // row: up to RECORD_ATTEMPTS, backing off (5 ms doubling to 200 ms,
+        // with jitter, about 1 s in all) so that the racers spread out.
+        for attempt in 0..RECORD_ATTEMPTS {
+            if attempt > 0 {
+                std::thread::sleep(record_backoff(attempt));
+            }
             if self.record_once(description.clone(), policy_incoming, carried)? {
                 return Ok(());
             }

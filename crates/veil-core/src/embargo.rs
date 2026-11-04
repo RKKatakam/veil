@@ -1007,8 +1007,22 @@ fn seal_introduced_dir(store: &ObjectStore, tree: &ObjectId, base: Option<Object
                         ne = sealed;
                     }
                 }
-                // Sealed content keeps its sealing.
-                EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink => {}
+                // Sealed content keeps its sealing. A version the line
+                // seals under its scope shows readers without the key only
+                // what the base already shows them at this path: a
+                // fallback taken from elsewhere (a merge picks the other
+                // side's public version, which a squash brings from a
+                // change never published) would publish what the line
+                // introduces (BUG-682).
+                EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink => {
+                    if e.visibility == vis {
+                        if let Some(fb) = e.fallback {
+                            if !publicly_seen(store, be.as_ref())?.contains(&fb) {
+                                ne.fallback = public_fallback(be.as_ref(), &vis);
+                            }
+                        }
+                    }
+                }
             }
         }
         f.changed |= ne != e;
