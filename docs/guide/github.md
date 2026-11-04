@@ -296,10 +296,79 @@ incoming change does:
 * A cloaked file you can read stays cloaked when a patch edits it; one you
   hold no key for cannot be patched.
 
-**Not yet (phase 2):** rename detection in `format-patch -M` (a rename is a
-deletion and an addition), symlinks and submodules (refused by `vl am`),
-binary files (`Binary files … differ` on export, refused on import),
-`--binary` and `--3way`.
+### Renames, symlinks, submodules and binary files
+
+Both commands speak the rest of Git's patch format too.
+
+* **Renames and copies.** `vl format-patch -M` finds renames (`-M=70`
+  asks for 70 % similarity instead of 50 %), and `-C` finds copies as
+  well, from files changed in the same change. They are written as Git
+  writes them (`similarity index`, `rename from`, `rename to`, and
+  `a.txt => docs/a.txt` in the diffstat). Pairs are looked for **only in
+  what the patch shows**: a cloaked file that becomes a public one is a
+  new file in a public patch, never `rename from secrets/…`.
+* **Symlinks** are mode `120000`, with the target as the content, and
+  **submodules** are mode `160000`, with `Subproject commit <id>`. A file
+  that becomes a symlink (or the reverse) is a deletion and a creation,
+  as in Git.
+* **Binary files.** With `--binary`, a binary file is written as a
+  `GIT binary patch` (a literal, or a delta when that is smaller), which
+  `git am` and `vl am` apply; without it, `Binary files … differ`, which
+  nothing can apply. A **sealed** binary file is never written as binary
+  data, even with `--audience me`: it stays `Binary files … differ`, with
+  a warning.
+
+`vl am` takes all of these:
+
+```text
+$ vl am ../from-github
+Applied 3 patch(es):
+  qkvnwxsy 4b1c0a2e Move the docs
+  zvlpruxo 6e93d3f1 Pin the SDK
+  mtkrnwop 9a1f5c77 Update the logo
+warning: patch 1: symlink docs/current points outside the repository (/srv/www); Veil never follows it, but other tools will
+```
+
+* A **symlink** is recorded as a link, classified, scanned and sealed by
+  its own path like a file. Nothing is ever written *through* a link: a
+  series that adds `link -> /home/you/.ssh` and then writes
+  `link/authorized_keys`, in one patch or two, is refused as a whole
+  ("link is not a directory"). A link may not be named `.veilpolicy`,
+  `.gitmodules`, `.gitattributes`, `.gitignore` or `.mailmap`, and its
+  target must be one Veil can record (UTF-8, no NUL, at most 4 KiB). A
+  target outside the repository is recorded as it is, with a warning.
+* A **submodule** is recorded as a pin, as `vl submodule set` does:
+  nothing is fetched or cloned (`vl submodule update` does that when you
+  ask), and nothing can be written below it.
+* A **binary** section must name the exact versions on its `index` line
+  (`git format-patch --binary` does): the file it applies to must be the
+  one it was made from, and the result the one it names. Its data is
+  checked before anything is decompressed, and never decompressed past
+  the size it declares or `VEIL_MAX_OBJECT`; a series may decompress to
+  2 GiB in all.
+
+### When a patch does not apply: `--3way`
+
+A hunk must match exactly. When the file changed since the patch was
+made, `vl am --3way` (`-3`) looks for the version the patch was made from
+(its `index` line) in this repository's history, applies the patch to
+that, and merges the result with yours:
+
+```text
+$ vl am --3way ../fix.patch
+Applied 1 patch(es):
+  rlpxqzts 0d4e8a61 Fix the parser
+  patch 1: src/parse.rs merged three ways with the version it was made from
+The working copy was rebased onto the last of them.
+```
+
+If both sides changed the same lines, the change is still recorded, with
+a **conflict** in that file, as `vl merge` would record it; the working
+copy shows the markers, and `vl resolve` or an edit resolves it. A sealed
+file stays sealed (every version in the conflict keeps its audience), and
+a version you hold no key for is never used. Without the original
+version in your history (a patch made on something you never had),
+`--3way` changes nothing: the patch does not apply.
 
 ## Releases: Git tags
 

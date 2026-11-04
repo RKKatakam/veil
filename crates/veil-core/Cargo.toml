@@ -29,6 +29,7 @@ thiserror.workspace = true
 unicode-normalization.workspace = true
 x25519-dalek.workspace = true
 zeroize.workspace = true
+zlib-rs.workspace = true
 zstd = { workspace = true, optional = true }
 ruzstd = { workspace = true, optional = true }
 

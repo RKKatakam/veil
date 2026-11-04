@@ -27,8 +27,9 @@ Options:
 | `--include-embargoed <ID>` | With `--audience me`: also include content of this unreleased embargo (repeatable) |
 | `--yes` | With `--audience me --stdout` to a pipe or file: confirm that the output holds cloaked content |
 | `--cover-letter` | Also write a cover letter (patch 0) |
-| `--binary` | Include binary files as `GIT binary patch` literals (not supported yet: binary files are shown as `Binary files … differ`) |
-| `-M, --find-renames` | Detect renames (not available yet: a rename shows as a deletion and an addition) |
+| `--binary` | Write binary files as `GIT binary patch` data, which `git am` and `vl am` apply (without it: `Binary files … differ`). Sealed content is never written this way |
+| `-M, --find-renames [<N>]` | Detect renames, on the exported view only: `-M` or `-M=N` (N: the similarity in percent a pair needs, 50 by default) |
+| `-C, --find-copies [<N>]` | Detect copies (and renames): `-C` or `-C=N`. A copy's source is a file changed in the same snapshot |
 
 ---
 

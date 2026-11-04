@@ -206,6 +206,7 @@ fn public_patches_match_git_format_patch_of_the_git_export() {
                     || l.starts_with("deleted file mode ")
                     || l.starts_with("old mode ")
                     || l.starts_with("new mode ")
+                    || l.starts_with("@@ ")
             })
             .map(str::to_string)
             .collect()
@@ -302,7 +303,11 @@ fn a_moved_cloaked_file_never_shows_its_cloaked_name() {
     assert!(out.status.success(), "{}", text(&out));
     let mbox = String::from_utf8_lossy(&out.stdout);
     assert!(!mbox.contains("rename") && !mbox.contains("payroll-2026") && !mbox.contains("secrets/"), "{mbox}");
-    assert!(text(&out).contains("rename detection is not available yet"), "{}", text(&out));
+    // Rename detection ran on the public sides only. The moved file stays
+    // sealed (protection follows content across a rename), so the public
+    // view did not change at all.
+    assert!(!mbox.contains("diff --git"), "{mbox}");
+    assert!(text(&out).contains("shows no file change") && !text(&out).contains("payroll-2026"), "{}", text(&out));
 }
 
 /// Point 6: a conflict with a sealed side shows only the public side.
@@ -374,12 +379,12 @@ fn hostile_patches_are_refused_and_nothing_is_written_outside() {
         mail("link", "diff --git a/link b/link\nnew file mode 120000\nindex 0000000..1111111\n--- /dev/null\n+++ b/link\n@@ -0,0 +1 @@\n+../../home-u/.ssh\n\\ No newline at end of file\n"),
         mail("write", &new_file("link/authorized_keys")),
     );
-    refused(&env, &proj, &link, "symlinks (mode 120000) cannot be applied yet");
+    refused(&env, &proj, &link, "cannot create link/authorized_keys: link is not a directory");
     assert!(!proj.join("link").exists() && !env.root.join("home-u").exists());
     // Mode tricks (point 14).
-    refused(&env, &proj, &mail("sub", "diff --git a/sub b/sub\nnew file mode 160000\n"), "submodules");
+    refused(&env, &proj, &mail("sub", "diff --git a/sub b/sub\nnew file mode 160000\n"), "a submodule's content must be");
     refused(&env, &proj, &mail("m", "diff --git a/nope b/nope\nold mode 100644\nnew mode 100755\n"), "nope does not exist");
-    refused(&env, &proj, &mail("pol", "diff --git a/.veilpolicy b/.veilpolicy\nold mode 100644\nnew mode 120000\n"), "symlinks");
+    refused(&env, &proj, &mail("pol", "diff --git a/.veilpolicy b/.veilpolicy\nold mode 100644\nnew mode 120000\n"), "change the file's type");
     // CRLF context against LF content (point 16).
     let crlf = mail("crlf", "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,3 +1,3 @@\n one\r\n-two\r\n+TWO\r\n three\r\n");
     refused(&env, &proj, &crlf, "does not apply");
@@ -390,7 +395,7 @@ fn hostile_patches_are_refused_and_nothing_is_written_outside() {
     refused(&env, &proj, &bomb, "declares 17179869184 bytes");
     assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
     // Plain binary sections are refused, naming the file.
-    refused(&env, &proj, &mail("bin", "diff --git a/x.bin b/x.bin\nnew file mode 100644\nBinary files /dev/null and b/x.bin differ\n"), "x.bin: binary patches cannot be applied yet");
+    refused(&env, &proj, &mail("bin", "diff --git a/x.bin b/x.bin\nnew file mode 100644\nBinary files /dev/null and b/x.bin differ\n"), "x.bin: the patch says only 'Binary files … differ' and holds no content");
     assert_eq!(std::fs::read_to_string(proj.join("a.txt")).unwrap(), "one\ntwo\nthree\n");
 }
 

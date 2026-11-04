@@ -28,8 +28,6 @@ fixed**. Severity: high / medium / low.
   `archive` (tarball of a snapshot).
 - **Rename-aware merges** (`diff`, `status`, `show` and `log --follow`
   detect renames; merges still see a delete plus an add).
-- **Patches, phase 2:** `vl format-patch -M` renames, symlinks and
-  submodules in `vl am`, binary literals both ways, `vl am --3way`.
 - **Repository attributes:** line-ending normalisation (CRLF), per-path diff
   and merge drivers, binary handling (`.gitattributes` equivalents).
 - **Non-UTF-8 names** are not recorded.

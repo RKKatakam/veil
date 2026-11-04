@@ -2347,6 +2347,7 @@ dependencies = [
  "unicode-normalization",
  "x25519-dalek",
  "zeroize",
+ "zlib-rs",
  "zstd",
 ]
 

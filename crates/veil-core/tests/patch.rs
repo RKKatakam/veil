@@ -323,9 +323,10 @@ fn edits_of_sealed_files() {
     refused(&mut bob, &create, "already exists (sealed");
 }
 
-/// Point 8, the shape this version can express: whatever a patch writes
-/// lands in the overlay as a regular file; a section writing below a file
-/// is refused, and symlinks cannot be created at all (phase 2).
+/// Point 8 (CVE-2023-23946): patch 1 adds `link -> /home/u/.ssh`, patch 2
+/// writes `link/authorized_keys`. Patch 2 fails ("not a directory": a link
+/// is an entry, never traversed) and nothing at all is recorded. The full
+/// set of link-then-write shapes is in `patch_phase2.rs`.
 #[test]
 fn symlink_then_write_is_refused() {
     let (mut repo, _) = base();
@@ -334,8 +335,7 @@ fn symlink_then_write_is_refused() {
         mail(1, 2, "link", "diff --git a/link b/link\nnew file mode 120000\nindex 0000000..1111111\n--- /dev/null\n+++ b/link\n@@ -0,0 +1 @@\n+/home/u/.ssh\n\\ No newline at end of file\n"),
         mail(2, 2, "write", "diff --git a/link/authorized_keys b/link/authorized_keys\nnew file mode 100644\n--- /dev/null\n+++ b/link/authorized_keys\n@@ -0,0 +1 @@\n+ssh-ed25519 AAAA\n"),
     );
-    let s = patch::parse(series.into_bytes(), &Limits::default());
-    assert!(s.unwrap_err().to_string().contains("symlinks"));
+    refused(&mut repo, &series, "patch 2/2 (write): cannot create link/authorized_keys: link is not a directory");
     // A file standing where a directory would have to be.
     let series = format!(
         "{}{}",

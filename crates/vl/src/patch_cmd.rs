@@ -40,7 +40,7 @@ pub enum Audience {
 }
 
 /// `vl format-patch REVSET [-o DIR | --stdout] [--audience public|me] [--include-embargoed ID]
-/// [--yes] [--cover-letter] [-M]`.
+/// [--yes] [--cover-letter] [--binary] [-M[=N]] [-C[=N]]`.
 #[derive(Args, Debug)]
 pub struct FormatPatchArgs {
     /// Snapshots to export: `A..B` (ancestors of B that are not ancestors
@@ -68,14 +68,21 @@ pub struct FormatPatchArgs {
     /// Also write a cover letter (patch 0).
     #[arg(long)]
     pub cover_letter: bool,
-    /// Include binary files as `GIT binary patch` literals (not supported
-    /// yet: binary files are shown as `Binary files … differ`).
+    /// Write binary files as `GIT binary patch` data, which `git am` and
+    /// `vl am` apply (without it: `Binary files … differ`). Sealed content
+    /// is never written this way.
     #[arg(long)]
     pub binary: bool,
-    /// Detect renames (not available yet: a rename shows as a deletion and
-    /// an addition).
-    #[arg(short = 'M', long)]
-    pub find_renames: bool,
+    /// Detect renames, on the exported view only: `-M` or `-M=N` (N: the
+    /// similarity in percent a pair needs, 50 by default).
+    #[arg(short = 'M', long, value_name = "N", num_args = 0..=1, require_equals = true,
+          default_missing_value = "50", value_parser = clap::value_parser!(u8).range(0..=100))]
+    pub find_renames: Option<u8>,
+    /// Detect copies (and renames): `-C` or `-C=N`. A copy's source is a
+    /// file changed in the same snapshot.
+    #[arg(short = 'C', long, value_name = "N", num_args = 0..=1, require_equals = true,
+          default_missing_value = "50", value_parser = clap::value_parser!(u8).range(0..=100))]
+    pub find_copies: Option<u8>,
 }
 
 /// `vl am INPUT [-d DEST] [--3way] [--keep-author | --author-as-me] [--signoff]`.
@@ -87,9 +94,11 @@ pub struct AmArgs {
     /// Apply the series on top of this snapshot.
     #[arg(short, long, value_name = "DEST", default_value = "@-")]
     pub destination: String,
-    /// Fall back to a three-way merge when a patch's pre-image is known
-    /// (not supported yet).
-    #[arg(long = "3way")]
+    /// When a hunk does not apply, merge three ways with the version the
+    /// patch was made from (its `index` line), if this repository's history
+    /// of the file holds it. A conflict is recorded as a conflict of the new
+    /// change, for `vl resolve`.
+    #[arg(short = '3', long = "3way")]
     pub three_way: bool,
     /// Record each patch's `From:` as the change's author (the default).
     #[arg(long, conflicts_with = "author_as_me")]
@@ -135,9 +144,6 @@ fn resolve_range(ctx: &Ctx, spec: &str) -> Result<Vec<ObjectId>> {
 
 /// `vl format-patch`.
 pub fn format_patch(ctx: &mut Ctx, args: &FormatPatchArgs) -> Result<ExitCode> {
-    if args.binary {
-        bail!("--binary is not supported yet: binary files are written as `Binary files … differ`, which `vl am` and `git am` cannot apply");
-    }
     let me = args.audience == Audience::Me;
     if !args.include_embargoed.is_empty() && !me {
         bail!("--include-embargoed needs --audience me (the public view never holds unreleased embargo content)");
@@ -163,7 +169,10 @@ pub fn format_patch(ctx: &mut Ctx, args: &FormatPatchArgs) -> Result<ExitCode> {
         audience: if me { patch::Audience::Me } else { patch::Audience::Public },
         include_embargoed: args.include_embargoed.iter().cloned().collect::<BTreeSet<_>>(),
         cover_letter: args.cover_letter,
-        find_renames: args.find_renames,
+        find_renames: args.find_renames.is_some() || args.find_copies.is_some(),
+        find_copies: args.find_copies.is_some(),
+        rename_threshold: args.find_copies.or(args.find_renames),
+        binary: args.binary,
         signature: format!("vl {}", env!("CARGO_PKG_VERSION")),
     };
     let export = patch::format_patches(&ctx.repo, &mut bridge, &ids, &opts)?;
@@ -316,9 +325,6 @@ fn read_input(input: &str, limit: usize) -> Result<(Vec<u8>, String)> {
 
 /// `vl am`.
 pub fn am(ctx: &mut Ctx, args: &AmArgs) -> Result<ExitCode> {
-    if args.three_way {
-        bail!("--3way is not supported yet: every hunk must apply exactly (up to its offset)");
-    }
     let limits = Limits::default();
     // Read and parse everything before the repository is locked.
     let (data, name) = read_input(&args.input, limits.max_input)?;
@@ -329,6 +335,7 @@ pub fn am(ctx: &mut Ctx, args: &AmArgs) -> Result<ExitCode> {
         signoff: args.signoff,
         limits,
         default_description: format!("Apply a patch from {name}"),
+        three_way: args.three_way,
     };
     let report = patch::apply_series(&mut ctx.repo, &ws, &args.destination, &series, &opts)?;
     println!("Applied {} patch(es):", report.changes.len());
@@ -340,6 +347,18 @@ pub fn am(ctx: &mut Ctx, args: &AmArgs) -> Result<ExitCode> {
     }
     for n in &report.empty {
         warn(&format!("patch {n} changes no file: recorded as an empty change"));
+    }
+    for (n, p) in &report.merged {
+        println!("  patch {n}: {} merged three ways with the version it was made from", safe(p.as_str()));
+    }
+    for (n, p, why) in &report.link_warnings {
+        warn(&format!("patch {n}: symlink {} {}", safe(p.as_str()), safe(why)));
+    }
+    if !report.conflicts.is_empty() {
+        for (n, p) in &report.conflicts {
+            warn(&format!("patch {n}: {} has a conflict (the patch and this repository changed the same lines)", safe(p.as_str())));
+        }
+        eprintln!("The conflicts are recorded in the new changes: edit the files (or `vl resolve`) to resolve them.");
     }
     if report.rebased.is_some() {
         println!("The working copy was rebased onto the last of them.");
