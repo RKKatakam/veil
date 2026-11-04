@@ -37,8 +37,6 @@ fixed**. Severity: high / medium / low.
 - **Directory-rename detection in merges** (Git's `ort`: a file added on one
   side inside a directory the other side renamed goes to the new
   directory). Merges follow file renames, not directory renames.
-- **Patches, phase 2:** `vl format-patch -M` renames, symlinks and
-  submodules in `vl am`, binary literals both ways, `vl am --3way`.
 - **Repository attributes:** line-ending normalisation (CRLF), per-path diff
   and merge drivers, binary handling (`.gitattributes` equivalents).
 - **Non-UTF-8 names** are not recorded.

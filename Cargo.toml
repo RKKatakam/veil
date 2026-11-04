@@ -33,6 +33,8 @@ thiserror = "2"
 unicode-normalization = "0.1"
 zeroize = { version = "1", features = ["derive"] }
 zstd = { version = "0.14", default-features = false }
+# zlib for `GIT binary patch` data (pure Rust; already what gix uses).
+zlib-rs = { version = "0.6", default-features = false, features = ["rust-allocator"] }
 # Pure-Rust zstd *decoder*, for builds without the C library (WASM).
 ruzstd = { version = "0.9", default-features = false, features = ["std"] }
 

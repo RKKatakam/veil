@@ -3097,7 +3097,23 @@ and `local` is refused. A description line a reader would take
 for patch syntax (`diff --git`, `---`, `-- `, a `From ` postmark, an
 in-body `From:` first in the body) is indented by one space, with a
 warning: a teammate's text never becomes a file section, a forged author or
-a message of its own when someone runs `git am` on the export. The CLI names
+a message of its own when someone runs `git am` on the export.
+
+`-M`/`-C` run `rename::detect` on the **audience's own sides**: for the
+public audience the two projected trees, read as `Reader::Public`, so a
+pair can only join paths and content a public reader sees (a cloaked file
+that became a public one is a new file, never `rename from secrets/…`).
+`rename.rs` pairs files only; `writer::special_renames` adds Git's exact
+renames of symlinks and gitlinks (same kind, same object). Sections follow
+Git's layout (`old mode`/`new mode`, `similarity index`, `rename|copy
+from/to`, `index`), the diffstat names a pair as Git's `pprint_rename`
+does (`dir/{a => b}`), and a type change is written as a deletion and a
+creation with one diffstat entry. Symlinks are mode `120000` with the
+target as content; gitlinks `160000` with `Subproject commit <id>` and the
+commit as their `index` id. `--binary` writes `GIT binary patch` blocks
+(forward and reverse; a Git delta when its deflated form is smaller than
+the literal's) from `patch/binary.rs`, never for a side read from a
+sealed object (`Side::sealed`, audience `me`). The CLI names
 changes by id only in its messages (a description may be sealed), writes `-o DIR` into a private temp
 directory inside `DIR` and renames into place at the end, and requires
 `--yes` for `me` on a non-terminal standard output.
@@ -3107,11 +3123,20 @@ regexes, refusing anything it does not understand exactly (see the module
 documentation for the grammar). Hunks are stored as byte ranges of the
 input and re-read by `Series::hunk_lines`, so memory is the input plus a
 few dozen bytes per hunk; every count and size is capped by `Limits`
-(input 1 GiB, 16 MiB lines, 1 000 000 hunks per file, …), and a binary
-section's declared size is checked before anything is read (nothing is
-ever inflated: binary sections are refused). Paths go through
-`check_path` before they are `VPath`s; decoded headers holding control
-characters or direction overrides are refused.
+(input 1 GiB, 16 MiB lines, 1 000 000 hunks per file, …). A
+`GIT binary patch` block is checked line by line (length character
+against digit count) and kept as a byte range; its declared size is
+checked against `VEIL_MAX_OBJECT`, and the declared sizes of the whole
+series against `Limits::max_inflated` (2 GiB), before anything is
+decoded. Decoding (`patch/binary.rs`, zlib by `zlib-rs`) happens in the
+applier: the inflater writes in 64 KiB steps and stops one byte past the
+declared size, so memory follows the output actually produced; a delta's
+header is checked (base size, result at most `VEIL_MAX_OBJECT`) before
+its output is allocated, and every copy against the base and the room
+left. A type change (deletion and creation of one path, of different
+kinds) is the only way one path appears in two sections. Paths go
+through `check_path` before they are `VPath`s; decoded headers holding
+control characters or direction overrides are refused.
 
 **Apply** (`patch::apply_series`). The input is parsed before the lock is
 taken; then one transaction, in which the destination revision is
@@ -3120,24 +3145,36 @@ is now). For each patch:
 
 1. every section is checked against the *pre-image* tree (all sections of
    a patch read the pre-image, as in Git; each path is claimed by at most
-   one section, a copy's source by any number): a source must be a regular
-   file whose own object this reader can open (never its fallback), a
-   target must be free with directories (or files the same patch deletes)
-   above it, and no name may fold (`NameFolding::MACOS`) onto another of
-   its directory, readable or not;
+   one section, a copy's source by any number): a source must be a file,
+   symlink or gitlink of the kind the section says, whose own object this
+   reader can open (never its fallback), a target must be free (or a leaf
+   the same patch deletes: a type change) with directories (or leaves the
+   same patch deletes) above it, no path the patch writes may lie below
+   another it writes (those are leaves: a link is never written through),
+   and no name may fold (`NameFolding::MACOS`) onto another of its
+   directory, readable or not;
 2. hunks apply exactly, up to `max_offset` lines away, inside a work
-   budget; the results are written to an `OverlayBackend` over a
-   `TreeView` of the pre-image (never the working copy, never an OS path);
+   budget (a binary section checks the pre-image's and the result's Git
+   ids against its full `index` line); the results are written to an
+   `OverlayBackend` over a `TreeView` of the pre-image (never the working
+   copy, never an OS path): files as files, symlinks with `write_link`
+   (targets as `vfs::check_link_target` accepts them; never at
+   `.veilpolicy`, `.gitmodules`, `.gitattributes`, `.gitignore`,
+   `.mailmap`), and a gitlink as a file holding its pin, so that the
+   builder classifies, scans and seals it as any content;
 3. the **builder** records the overlay with the policy guarded by the one
    this device accepted (the pre-image's if none was): a weakening
    `.veilpolicy` is recorded but held back (`P`), nothing is ever
    accepted, and cloaking, isolation and scanning apply as to any
    snapshot; sealed files edited stay sealed under their scope;
 4. the result is checked: anything quarantined, isolated, ignored, not
-   cloakable or held back by an embargo aborts the series, and so does a
-   written file recorded with less protection than the pre-image's own
-   `.veilpolicy` gives it (the accepted policy may predate a stricter
-   rule that arrived since);
+   cloakable, unrepresentable or held back by an embargo aborts the
+   series, and so does a written file recorded with less protection than
+   the pre-image's own `.veilpolicy` gives it (the accepted policy may
+   predate a stricter rule that arrived since), or recorded public when
+   it was made from a sealed version (a rename, a copy, a type change);
+   then the pins become gitlink entries (`conflict::set_entry`), and the
+   conflicts of `--3way` conflict entries;
 5. a new change is written (`Transaction::write_snapshot`: signed by this
    identity; author and time are the patch's claims, description sealed as
    `embargo::description_scope` says).
@@ -3148,10 +3185,22 @@ and the objects already written are unreferenced (gc removes them; a
 quarantined file never reaches the store). `vl undo` takes back a whole
 series.
 
-**Phase 2** adds rename detection on the projected sides (`rename.rs`;
-the seam is marked in `writer::changes`), symlink and submodule entries
-(format 5; `parse_mode` refuses 120000 and 160000 today), binary literals
-both ways, and `--3way`.
+**`--3way`** (`AmOptions::three_way`, `git` feature: it needs Git's blob
+ids). When a section does not apply, `Preimages` looks for the version
+its `index` line names (at least 7 hex digits) among the versions of the
+section's paths in the trees of the destination's history, nearest
+first, then of every other visible head's (at most 10 000 snapshots and
+1 GiB hashed per series): a version this reader can open, or the public
+fallback of one it cannot (what the patch's author saw). The section is
+applied to it exactly, and the result merged with ours by
+`textmerge::merge` (diff3). A clean merge is written as the file; a
+conflict writes the markers to the overlay (so the builder scans every
+side and decides the audience), and once recorded the entry becomes a
+conflict entry of base, ours and theirs: base and ours as they are
+recorded (their own sealing), theirs stored with the audience the
+builder gave the merged file (repository format 4 and later; before, the
+file keeps its markers). The path is listed in `Snapshot::conflicts`.
+Symlinks and gitlinks are never merged.
 
 ## 12. Read commands: one API, text or JSON (`crates/vl/src/api.rs`)
 

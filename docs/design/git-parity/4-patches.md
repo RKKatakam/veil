@@ -1,6 +1,6 @@
 # 4. Patches: `vl format-patch` (export) and `vl am` (import)
 
-Status: design and threat review. No format change. Patches are the first feature whose output is *meant to leave the device*, to mailing lists, issues and other VCSs, so the default audience is the public view.
+Status: shipped (phase 1, then phase 2: `-M`/`-C` on the projected sides, symlinks and submodules both ways, `GIT binary patch` literals and deltas both ways, `vl am --3way`; see ARCHITECTURE §11). No format change. Patches are the first feature whose output is *meant to leave the device*, to mailing lists, issues and other VCSs, so the default audience is the public view.
 
 ## Design sketch
 
@@ -89,4 +89,4 @@ vl am FILE|DIR|- [-d DEST] [--3way] [--keep-author|--author-as-me] [--signoff]
 - **Default audience for `format-patch`.** *Recommendation:* `public`. Patches leave the device, and the owner's invariant is "never publish". A member who wants cloaked content in a patch to a teammate should push to a team remote instead; `--audience me` exists for the rare local case.
 - **Apply into the working copy, or into a new change?** *Recommendation:* new changes on top of `@-`, through the builder over an overlay, as `git am` creates commits. Writing into the working copy would turn the patch into the member's own edit and defeat `policy_incoming`.
 - **`.rej` files and fuzz.** *Recommendation:* no fuzz and no `.rej`, and abort the whole series. That is simpler to reason about for hostile input, and `--3way` covers the common drift.
-- **Binary deltas (`delta` blocks).** *Recommendation:* not this round. Refuse with a clear message: they need the exact pre-image and their own bomb checks.
+- **Binary deltas (`delta` blocks).** *Phase 1:* refused. *Phase 2:* applied, with the exact pre-image checked against the full `index` id, the delta's header (base size, result at most `VEIL_MAX_OBJECT`) checked before its output is allocated, and every copy bounded.

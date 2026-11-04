@@ -18,10 +18,12 @@
 //! * `diff --git` sections with every extended header Git writes (modes,
 //!   new and deleted files, renames, copies, similarity, `index`), Git's
 //!   C-quoted paths, text hunks and "no newline at end of file" markers.
-//!   Symlinks (mode 120000) and submodules (160000) are refused: the
-//!   repository format this round reads has neither (phase 2). Binary
-//!   sections are parsed, with every declared size checked, and refused by
-//!   the applier;
+//!   Symlinks (mode 120000) and submodules (160000) are read as Git writes
+//!   them (the target, or `Subproject commit <id>`, as the content); a type
+//!   change is a deletion and a creation of the same path, as Git writes
+//!   it. `GIT binary patch` sections (literal and delta blocks) are checked
+//!   line by line and their declared sizes bounded before anything is
+//!   inflated (`binary`);
 //! * every path is checked before it becomes a [`VPath`]: no absolute
 //!   path, no empty, `.` or `..` component, no NUL or control character,
 //!   no component spelling `.veil` or a VCS directory (`.git`, `.jj`, …,
@@ -49,16 +51,28 @@
 //! content the builder would not record as written (a secret it
 //! quarantines, an isolated or ignored path) aborts the series.
 //!
+//! Symlinks are written to the overlay as links (never followed, never
+//! written through: a path below a link is "not a directory", in the
+//! patch's own tree or in the one it applies to), with the targets the
+//! recording accepts. A submodule is recorded as a pin only: nothing is
+//! fetched or cloned. With [`AmOptions::three_way`], a hunk that does not
+//! apply falls back to a three-way merge with the pre-image the `index`
+//! line names, when this repository's history of the file holds it, and a
+//! conflict is recorded as a first-class conflict.
+//!
 //! # Export (`vl format-patch`)
 //!
 //! [`format_patches`] writes Git's mbox format. The default audience is
 //! the **public** one: trees go through the Git bridge's public projection
 //! (`GitBridge::project`) and descriptions through the same
 //! placeholder rule as the Git export, so a patch shows exactly what a
-//! public remote or a Git push shows. Snapshots a public push withholds
+//! public remote or a Git push shows. Rename and copy detection (`-M`,
+//! `-C`) runs on those projected sides only, so a pair never involves
+//! content the audience cannot see. Snapshots a public push withholds
 //! (merged-in history of an unreleased embargo) are refused before anything
 //! is written. The `me` audience shows this reader's view and says which
-//! scopes and embargoes it includes.
+//! scopes and embargoes it includes; it never writes sealed content as a
+//! `GIT binary patch`.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -71,7 +85,7 @@ use crate::{
     builder::{build_tree, BuildOptions, BuildReport},
     error::{Result, VeilError},
     id::{ChangeId, ObjectId},
-    object::{EntryKind, Snapshot, TreeEntry},
+    object::{ConflictTerm, EntryKind, Snapshot, TreeEntry},
     policy::{self, Policy},
     repo::Repo,
     store::ObjectStore,
@@ -80,10 +94,15 @@ use crate::{
     vpath::{NameFolding, VPath},
 };
 
+mod binary;
+
 // ---- limits ----------------------------------------------------------------
 
 /// Largest patch input [`parse`] reads by default (1 GiB).
 pub const MAX_INPUT: usize = 1 << 30;
+
+/// Bytes all binary sections of a series may inflate to, by default (2 GiB).
+pub const MAX_INFLATED: u64 = 2 << 30;
 
 /// Bounds on what [`parse`] and the applier accept.
 #[derive(Clone, Debug)]
@@ -113,6 +132,10 @@ pub struct Limits {
     /// or 64-byte runs of them (one try of a hunk at one position costs
     /// its line count plus its bytes / 64).
     pub max_work: u64,
+    /// Bytes the binary sections of a whole series may inflate to (the
+    /// declared sizes are added up while parsing, before anything is
+    /// inflated; the results of deltas are counted as they are made).
+    pub max_inflated: u64,
 }
 
 impl Default for Limits {
@@ -129,6 +152,7 @@ impl Default for Limits {
             max_file_size: crate::pack::max_object_size(),
             max_offset: 1000,
             max_work: 1 << 28,
+            max_inflated: MAX_INFLATED,
         }
     }
 }
@@ -171,11 +195,15 @@ pub enum FileOp {
     Copy,
 }
 
-/// A regular file's mode (the only kinds this round reads).
+/// The mode of a section's file: a regular file, an executable one, a
+/// symlink (its content is the target) or a submodule (a gitlink: its
+/// content is `Subproject commit <id>`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Regular,
     Executable,
+    Symlink,
+    Gitlink,
 }
 
 impl Mode {
@@ -183,6 +211,8 @@ impl Mode {
         match self {
             Mode::Regular => "100644",
             Mode::Executable => "100755",
+            Mode::Symlink => "120000",
+            Mode::Gitlink => "160000",
         }
     }
 
@@ -193,6 +223,60 @@ impl Mode {
             Mode::Regular
         }
     }
+
+    /// The mode of a file, symlink or gitlink entry.
+    fn of_entry(e: &TreeEntry) -> Option<Mode> {
+        match e.kind {
+            EntryKind::File => Some(Mode::of(e.executable)),
+            EntryKind::Symlink => Some(Mode::Symlink),
+            EntryKind::Gitlink => Some(Mode::Gitlink),
+            _ => None,
+        }
+    }
+
+    /// The tree entry kind of this mode.
+    pub fn kind(self) -> EntryKind {
+        match self {
+            Mode::Regular | Mode::Executable => EntryKind::File,
+            Mode::Symlink => EntryKind::Symlink,
+            Mode::Gitlink => EntryKind::Gitlink,
+        }
+    }
+
+    fn noun(self) -> &'static str {
+        match self {
+            Mode::Regular | Mode::Executable => "regular file",
+            Mode::Symlink => "symlink",
+            Mode::Gitlink => "submodule",
+        }
+    }
+}
+
+/// A `literal` or `delta` block of a `GIT binary patch` section. Its data
+/// is a range of the input, decoded only when the applier needs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinaryKind {
+    Literal,
+    Delta,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BinaryBlock {
+    pub kind: BinaryKind,
+    /// The declared size: the file's, for a literal; the delta's, for a
+    /// delta (what the zlib stream inflates to).
+    pub size: usize,
+    /// The base85 lines.
+    data: Range<usize>,
+}
+
+/// A `GIT binary patch` section: the block that makes the new file, and
+/// the one that would make the old one again (only checked: `vl am` reads
+/// the forward block).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BinaryPatch {
+    pub forward: BinaryBlock,
+    pub reverse: Option<BinaryBlock>,
 }
 
 /// One hunk. Its lines are not copied: they are a range of the input, read
@@ -232,6 +316,9 @@ pub struct FilePatch {
     pub index: Option<(String, String)>,
     /// A `Binary files … differ` or `GIT binary patch` section.
     pub binary: bool,
+    /// The data of a `GIT binary patch` section (`None` for `Binary files
+    /// … differ`, which holds none).
+    pub binary_patch: Option<BinaryPatch>,
     pub hunks: Vec<Hunk>,
     /// Input line where the section starts.
     pub line: usize,
@@ -286,6 +373,13 @@ pub struct Series {
 }
 
 impl Series {
+    /// The bytes block `b` inflates to (exactly its declared size), decoded
+    /// from the input now.
+    pub fn binary_data(&self, b: &BinaryBlock) -> Result<Vec<u8>> {
+        let deflated = binary::decode_lines(&self.data[b.data.clone()]).map_err(VeilError::Repo)?;
+        binary::inflate(&deflated, b.size).map_err(VeilError::Repo)
+    }
+
     /// The lines of `h`, each with its `\n` unless a "no newline at end of
     /// file" marker follows it.
     pub fn hunk_lines<'a>(&'a self, h: &Hunk) -> HunkLines<'a> {
@@ -365,6 +459,8 @@ struct Parser<'a> {
     line: usize,
     files: usize,
     hunks: usize,
+    /// Bytes the forward binary blocks so far declare.
+    inflated: u64,
 }
 
 /// Raw extended headers of one `diff --git` section.
@@ -412,6 +508,7 @@ impl<'a> Parser<'a> {
             line: 1,
             files: 0,
             hunks: 0,
+            inflated: 0,
         };
         p.load(0)?;
         Ok(p)
@@ -736,7 +833,15 @@ impl<'a> Parser<'a> {
                 c
             };
             let mine = claims(&f);
-            if let Some(p) = files.iter().flat_map(claims).find(|p| mine.contains(p)) {
+            // Git writes a type change (a file becoming a symlink, …) as a
+            // deletion followed by a creation of the same path.
+            let type_change = |x: &FilePatch| {
+                x.op == FileOp::Delete
+                    && f.op == FileOp::Create
+                    && x.old_path == f.new_path
+                    && x.old_mode.zip(f.new_mode).is_some_and(|(a, b)| a.kind() != b.kind())
+            };
+            if let Some(p) = files.iter().filter(|x| !type_change(x)).flat_map(claims).find(|p| mine.contains(p)) {
                 return Err(malformed(f.line, format!("'{p}' appears in two sections of one patch")));
             }
             files.push(f);
@@ -809,6 +914,7 @@ impl<'a> Parser<'a> {
         let mut minus_plus = None;
         let mut hunks = Vec::new();
         let mut binary = false;
+        let mut binary_patch = None;
         if self.starts(b"--- ") {
             minus_plus = Some(self.minus_plus(false)?);
             hunks = self.hunks()?;
@@ -820,10 +926,12 @@ impl<'a> Parser<'a> {
             binary = true;
             self.bump()?;
         } else if self.cur() == Some(b"GIT binary patch") {
-            self.binary_patch()?;
+            binary_patch = Some(self.binary_patch()?);
             binary = true;
         }
-        self.finish_git(line, names, x, minus_plus, hunks, binary)
+        let mut f = self.finish_git(line, names, x, minus_plus, hunks, binary)?;
+        f.binary_patch = binary_patch;
+        Ok(f)
     }
 
     #[allow(clippy::type_complexity)]
@@ -853,6 +961,14 @@ impl<'a> Parser<'a> {
         }
         if x.old_mode.is_some() != x.new_mode.is_some() {
             return Err(malformed(line, "'old mode' without 'new mode', or the reverse"));
+        }
+        if let (Some(a), Some(b)) = (x.old_mode, x.new_mode) {
+            if a.kind() != b.kind() {
+                return Err(malformed(
+                    line,
+                    "'old mode'/'new mode' change the file's type (Git writes a type change as a deletion and a creation)",
+                ));
+            }
         }
         // Names from the strongest source available.
         let (mut old, mut new): (Option<Vec<u8>>, Option<Vec<u8>>) = match op {
@@ -942,6 +1058,9 @@ impl<'a> Parser<'a> {
         if op == FileOp::Modify && hunks.is_empty() && !binary && !mode_change {
             return Err(malformed(line, "a section that changes nothing"));
         }
+        if binary && [old_mode, new_mode].iter().flatten().any(|m| m.kind() != EntryKind::File) {
+            return Err(malformed(line, "binary data for a symlink or a submodule"));
+        }
         Ok(FilePatch {
             op,
             old_path,
@@ -950,6 +1069,7 @@ impl<'a> Parser<'a> {
             new_mode,
             index: x.index.map(|(a, b, _)| (a, b)),
             binary,
+            binary_patch: None,
             hunks,
             line,
         })
@@ -1024,6 +1144,7 @@ impl<'a> Parser<'a> {
             new_mode: if op == FileOp::Create { Some(Mode::Regular) } else { None },
             index: None,
             binary: false,
+            binary_patch: None,
             hunks,
             line,
         })
@@ -1121,57 +1242,73 @@ impl<'a> Parser<'a> {
     }
 
     /// A `GIT binary patch` section: one or two `literal N`/`delta N`
-    /// blocks of base85 lines, each ended by a blank line. Only the shape
-    /// and the declared sizes are checked (the applier refuses binary
-    /// sections).
-    fn binary_patch(&mut self) -> Result<()> {
+    /// blocks of base85 lines, each ended by a blank line. Each line's
+    /// shape and every declared size are checked (and the forward sizes
+    /// of the whole series added up against [`Limits::max_inflated`]);
+    /// nothing is decoded or inflated here.
+    fn binary_patch(&mut self) -> Result<BinaryPatch> {
         self.bump()?;
+        let mut blocks: Vec<BinaryBlock> = Vec::new();
         for block in 0..2 {
             let at = self.line;
             let Some(l) = self.cur() else {
                 if block == 0 {
                     return Err(malformed(at, "'GIT binary patch' without data"));
                 }
-                return Ok(());
+                break;
             };
-            let size = match l.strip_prefix(b"literal ").or_else(|| l.strip_prefix(b"delta ")) {
-                Some(n) => parse_number(n, at)?,
-                None if block == 1 => return Ok(()),
-                None => return Err(malformed(at, "expected 'literal N' or 'delta N'")),
+            let (kind, n) = match (l.strip_prefix(b"literal "), l.strip_prefix(b"delta ")) {
+                (Some(n), _) => (BinaryKind::Literal, n),
+                (_, Some(n)) => (BinaryKind::Delta, n),
+                _ if block == 1 => break,
+                _ => return Err(malformed(at, "expected 'literal N' or 'delta N'")),
             };
+            let size = parse_number(n, at)?;
             if size as u64 > self.lim.max_file_size {
                 return Err(malformed(
                     at,
                     format!("a binary section declares {size} bytes, more than {} (VEIL_MAX_OBJECT)", self.lim.max_file_size),
                 ));
             }
+            if block == 0 {
+                self.inflated = self.inflated.saturating_add(size as u64);
+                if self.inflated > self.lim.max_inflated {
+                    return Err(malformed(
+                        at,
+                        format!("the binary sections declare more than {} bytes in all", self.lim.max_inflated),
+                    ));
+                }
+            }
             self.bump()?;
+            let data_start = self.start;
             let mut lines = 0usize;
             loop {
                 let Some(l) = self.cur() else {
                     return Err(malformed(self.line, "the patch ends inside binary data"));
                 };
                 if l.is_empty() {
-                    self.bump()?;
                     break;
                 }
-                let valid = l[0].is_ascii_alphabetic() && l[1..].iter().all(|b| is_base85(*b)) && l.len() > 1;
-                if !valid {
+                if !self.has_nl || binary::check_line(l).is_none() {
                     return Err(malformed(self.line, "not a line of base85 binary data"));
                 }
                 lines += 1;
                 self.bump()?;
             }
+            let data = data_start..self.start;
+            self.bump()?;
             if lines == 0 && size > 0 {
                 return Err(malformed(at, "binary data missing"));
             }
+            blocks.push(BinaryBlock { kind, size, data });
         }
-        Ok(())
+        let mut blocks = blocks.into_iter();
+        let forward = blocks.next().expect("one block at least");
+        Ok(BinaryPatch {
+            forward,
+            reverse: blocks.next(),
+        })
     }
-}
-
-fn is_base85(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b"!#$%&()*+-;<=>?@^_`{|}~".contains(&b)
 }
 
 /// `---` alone (trailing whitespace allowed): the end of the message body.
@@ -1550,12 +1687,8 @@ fn parse_mode(v: &[u8], at: usize) -> Result<Mode> {
     match v {
         b"100644" | b"100664" => Ok(Mode::Regular),
         b"100755" => Ok(Mode::Executable),
-        b"120000" => Err(VeilError::Repo(format!(
-            "patch line {at}: symlinks (mode 120000) cannot be applied yet: this version of Veil records no symlinks"
-        ))),
-        b"160000" => Err(VeilError::Repo(format!(
-            "patch line {at}: submodules (mode 160000) cannot be applied yet: this version of Veil records no submodules"
-        ))),
+        b"120000" => Ok(Mode::Symlink),
+        b"160000" => Ok(Mode::Gitlink),
         _ => Err(malformed(at, format!("unknown file mode '{}'", shown(v)))),
     }
 }
@@ -1786,18 +1919,37 @@ pub fn check_path(raw: &[u8], at: usize, lim: &Limits) -> Result<VPath> {
 /// What one patch wrote to its overlay.
 #[derive(Debug, Default)]
 struct Applied {
-    written: Vec<VPath>,
+    /// Paths written, with their mode (a submodule is written as a file
+    /// holding its pin, turned into a gitlink once recorded).
+    written: Vec<(VPath, Mode)>,
     removed: Vec<VPath>,
+    /// Paths written from a version that is sealed (an edit, a rename or a
+    /// copy of a sealed file): never recorded as public.
+    from_sealed: Vec<(VPath, VPath)>,
+    /// Three-way merges that conflicted (recorded as conflicts).
+    conflicts: Vec<Conflicted>,
+    /// Paths a three-way merge wrote cleanly.
+    merged: Vec<VPath>,
+}
+
+/// A three-way merge of `vl am --3way` that conflicted at `path`.
+#[derive(Debug)]
+struct Conflicted {
+    path: VPath,
+    base: ConflictTerm,
+    ours: ConflictTerm,
+    theirs: Vec<u8>,
+    executable: bool,
 }
 
 /// What a tree holds at a path, as the applier needs to know it.
 enum Probe {
     Missing,
-    File(TreeEntry),
-    /// A directory, a conflict, or a kind of entry this version cannot
-    /// patch (never traversed, never written through).
+    /// A file, a symlink or a gitlink.
+    Leaf(TreeEntry),
+    /// A directory or a conflict (never traversed, never written through).
     Other(TreeEntry),
-    /// An ancestor is not a directory.
+    /// An ancestor is not a directory (a file, a symlink, a gitlink).
     Blocked(VPath),
     /// An ancestor is a directory this reader cannot open.
     Sealed(VPath),
@@ -1811,7 +1963,7 @@ fn probe(store: &ObjectStore, root: &ObjectId, path: &VPath) -> Result<Probe> {
         cur = cur.join(c);
         let Some(e) = tree.get(c).cloned() else { return Ok(Probe::Missing) };
         if i + 1 == comps.len() {
-            return Ok(if e.kind == EntryKind::File { Probe::File(e) } else { Probe::Other(e) });
+            return Ok(if e.kind.holds_blob() { Probe::Leaf(e) } else { Probe::Other(e) });
         }
         if e.kind != EntryKind::Dir {
             return Ok(Probe::Blocked(cur));
@@ -1829,12 +1981,21 @@ fn refused(why: String) -> VeilError {
     VeilError::Repo(why)
 }
 
-/// The content and executable bit of the file a section changes, read from
-/// the snapshot itself: never a fallback (which would turn an edit of a
-/// sealed file into a public file), never through anything but a file.
-fn read_source(store: &ObjectStore, root: &ObjectId, path: &VPath, mode: Option<Mode>) -> Result<(Vec<u8>, bool)> {
+/// The version a section changes, read from the snapshot itself.
+struct Source {
+    /// As the patch shows it: a file's bytes, a link's target, or
+    /// `Subproject commit <id>\n` for a submodule.
+    data: Vec<u8>,
+    mode: Mode,
+    entry: TreeEntry,
+}
+
+/// The version at `path` a section changes, read from the snapshot itself:
+/// never a fallback (which would turn an edit of a sealed file into a
+/// public file), never through anything but a directory.
+fn read_source(store: &ObjectStore, root: &ObjectId, path: &VPath, mode: Option<Mode>) -> Result<Source> {
     let e = match probe(store, root, path)? {
-        Probe::File(e) => e,
+        Probe::Leaf(e) => e,
         Probe::Other(e) => {
             return Err(refused(match e.kind {
                 EntryKind::Dir => format!("{path} is a directory"),
@@ -1846,33 +2007,42 @@ fn read_source(store: &ObjectStore, root: &ObjectId, path: &VPath, mode: Option<
         Probe::Blocked(a) => return Err(refused(format!("{path} does not exist ({a} is not a directory)"))),
         Probe::Sealed(d) => return Err(refused(format!("cannot apply to {path}: {d} is sealed and you hold no key for it"))),
     };
-    let data = match store.read_blob(&e.id) {
+    let have = Mode::of_entry(&e).expect("a leaf has a mode");
+    if let Some(m) = mode.filter(|m| *m != have) {
+        return Err(refused(if m.kind() == have.kind() {
+            format!("{path}: the patch expects mode {}, the file has mode {}", m.git(), have.git())
+        } else {
+            format!("{path}: the patch expects a {}, and it is a {}", m.noun(), have.noun())
+        }));
+    }
+    let raw = match store.read_blob(&e.id) {
         Ok(d) => d,
         Err(err) if err.is_unreadable() => {
             return Err(refused(format!(
-                "cannot apply to sealed file {path}: you hold no key for its content (its public fallback is never patched)"
+                "cannot apply to sealed {} {path}: you hold no key for its content (its public fallback is never patched)",
+                if have.kind() == EntryKind::File { "file" } else { have.noun() }
             )))
         }
         Err(err) => return Err(err),
     };
-    if let Some(m) = mode {
-        if m != Mode::of(e.executable) {
-            return Err(refused(format!(
-                "{path}: the patch expects mode {}, the file has mode {}",
-                m.git(),
-                Mode::of(e.executable).git()
-            )));
+    let data = match have {
+        Mode::Gitlink => {
+            let pin = parse_pin(&raw).ok_or_else(|| refused(format!("{path}: its submodule pin is malformed")))?;
+            format!("Subproject commit {pin}\n").into_bytes()
         }
-    }
-    Ok((data, e.executable))
+        _ => raw,
+    };
+    Ok(Source { data, mode: have, entry: e })
 }
 
-/// A path a section creates must be free, and every ancestor a directory
-/// this reader can open (or a file the same patch deletes).
+/// A path a section creates must be free (or a leaf the same patch
+/// deletes: a type change), and every ancestor a directory this reader can
+/// open (or a leaf the same patch deletes).
 fn check_target(store: &ObjectStore, root: &ObjectId, path: &VPath, deleted: &BTreeSet<VPath>) -> Result<()> {
     match probe(store, root, path)? {
         Probe::Missing => Ok(()),
-        Probe::File(e) | Probe::Other(e) => Err(refused(if store.entry_readable(&e) {
+        Probe::Leaf(_) if deleted.contains(path) => Ok(()),
+        Probe::Leaf(e) | Probe::Other(e) => Err(refused(if store.entry_readable(&e) {
             format!("{path} already exists")
         } else {
             format!("{path} already exists (sealed, and you hold no key for it)")
@@ -1881,6 +2051,44 @@ fn check_target(store: &ObjectStore, root: &ObjectId, path: &VPath, deleted: &BT
         Probe::Blocked(a) => Err(refused(format!("cannot create {path}: {a} is not a directory"))),
         Probe::Sealed(d) => Err(refused(format!("cannot create {path}: {d} is sealed and you hold no key for it"))),
     }
+}
+
+/// Names a symlink may not have: Veil's policy file, and the files Git
+/// reads from the work tree (Git refuses them as links too).
+const NO_LINK_NAMES: &[&str] = &[".veilpolicy", ".gitmodules", ".gitattributes", ".gitignore", ".mailmap"];
+
+/// A symlink target a patch writes: what the recording accepts (not
+/// empty, no NUL, UTF-8, at most `PATH_MAX`), and not at a name a link may
+/// not have. A target leaving the repository is recorded as it is (Veil
+/// never follows links), with a warning.
+fn check_link(path: &VPath, target: &[u8]) -> Result<()> {
+    crate::vfs::check_link_target(target).map_err(|e| refused(format!("{path}: {e}")))?;
+    let name = path.file_name().to_ascii_lowercase();
+    if NO_LINK_NAMES.contains(&name.trim_end_matches(['.', ' '])) {
+        return Err(refused(format!("{path}: a symlink may not be named {}", path.file_name())));
+    }
+    Ok(())
+}
+
+/// A submodule pin's commit: what a gitlink's content `<hex>\n` names (as
+/// `submodule::parse_pin` reads it, available without the Git feature).
+fn parse_pin(data: &[u8]) -> Option<String> {
+    let hex = data.strip_suffix(b"\n")?;
+    let ok = matches!(hex.len(), 40 | 64) && hex.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    ok.then(|| String::from_utf8_lossy(hex).into_owned())
+}
+
+/// The pin (`<id>\n`) a submodule section's content names: exactly
+/// `Subproject commit <40 or 64 lowercase hex digits>`, with or without
+/// its newline.
+fn pin_of(path: &VPath, data: &[u8]) -> Result<Vec<u8>> {
+    let bad = || refused(format!("{path}: a submodule's content must be 'Subproject commit <full commit id>'"));
+    let hex = data.strip_prefix(b"Subproject commit ").ok_or_else(bad)?;
+    let hex = hex.strip_suffix(b"\n").unwrap_or(hex);
+    let mut pin = hex.to_vec();
+    pin.push(b'\n');
+    parse_pin(&pin).ok_or_else(bad)?;
+    Ok(pin)
 }
 
 /// No two names of one directory may differ only in case or Unicode
@@ -1949,24 +2157,271 @@ fn probe_dir(store: &ObjectStore, root: &ObjectId, dir: &VPath) -> Result<Option
     }
 }
 
-/// Apply one patch to `fs`, an overlay over the tree `root`.
-fn apply_patch(
+/// The Git blob id of `data` (lowercase hex).
+#[cfg(feature = "git")]
+fn git_blob_id(data: &[u8]) -> String {
+    gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, data)
+        .map(|o| o.to_string())
+        .unwrap_or_else(|_| "0".repeat(40))
+}
+
+/// Is `id` a full (40 hex digit) Git object id?
+#[cfg(feature = "git")]
+fn full_id(id: &str) -> bool {
+    id.len() == 40 && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Most snapshots `vl am --3way` looks through for a pre-image.
+const PREIMAGE_SNAPSHOTS: usize = 10_000;
+/// Most bytes `vl am --3way` hashes looking for pre-images, per series.
+const PREIMAGE_BYTES: u64 = 1 << 30;
+
+/// Where `vl am --3way` looks for a pre-image (the version an `index`
+/// line names): the trees of the destination's history, nearest first,
+/// then those of every other visible head's history (a patch made on a
+/// later version than the destination), read as this reader reads them
+/// (its own versions it can open, and the public fallbacks of the
+/// others), with the Git ids already computed.
+#[cfg_attr(not(feature = "git"), allow(dead_code))]
+struct Preimages {
+    trees: Vec<ObjectId>,
+    hashed: std::collections::HashMap<ObjectId, Option<String>>,
+    budget: u64,
+}
+
+impl Preimages {
+    fn new(repo: &Repo, dest: &ObjectId, heads: impl IntoIterator<Item = ObjectId>) -> Result<Preimages> {
+        let mut trees = Vec::new();
+        let mut seen_trees = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        for start in std::iter::once(*dest).chain(heads) {
+            if !seen.insert(start) {
+                continue;
+            }
+            let mut queue = std::collections::VecDeque::from([start]);
+            while let Some(id) = queue.pop_front() {
+                if seen.len() > PREIMAGE_SNAPSHOTS {
+                    break;
+                }
+                let Ok(s) = repo.snapshot(&id) else { continue };
+                if seen_trees.insert(s.tree) {
+                    trees.push(s.tree);
+                }
+                for p in &s.parents {
+                    if seen.insert(*p) {
+                        queue.push_back(*p);
+                    }
+                }
+            }
+        }
+        Ok(Preimages {
+            trees,
+            hashed: Default::default(),
+            budget: PREIMAGE_BYTES,
+        })
+    }
+
+    /// The version of `paths` (in `current`, then in history) whose Git
+    /// blob id starts with `want`, and the conflict term it is.
+    #[cfg(feature = "git")]
+    fn find(&mut self, store: &ObjectStore, current: &ObjectId, paths: &[&VPath], want: &str) -> Result<Option<(Vec<u8>, ConflictTerm)>> {
+        if want.len() < 7 || !want.bytes().all(|b| b.is_ascii_hexdigit()) || want.bytes().all(|b| b == b'0') {
+            return Ok(None);
+        }
+        let trees: Vec<ObjectId> = std::iter::once(*current).chain(self.trees.iter().copied()).collect();
+        for tree in trees {
+            for path in paths {
+                let e = match crate::tree::lookup(store, &tree, path) {
+                    Ok(Some(e)) if e.kind == EntryKind::File => e,
+                    _ => continue,
+                };
+                let own = ConflictTerm::of(&e);
+                let fallback = e.fallback.map(|fb| ConflictTerm {
+                    kind: Default::default(),
+                    id: fb,
+                    size: 0,
+                    executable: e.executable,
+                    visibility: crate::object::Visibility::Public,
+                    fallback: None,
+                });
+                for term in std::iter::once(own).chain(fallback) {
+                    if let Some(Some(oid)) = self.hashed.get(&term.id) {
+                        if !oid.starts_with(want) {
+                            continue;
+                        }
+                    } else if self.hashed.contains_key(&term.id) {
+                        continue;
+                    }
+                    let data = match store.read_blob(&term.id) {
+                        Ok(d) => d,
+                        Err(_) => {
+                            self.hashed.insert(term.id, None);
+                            continue;
+                        }
+                    };
+                    if !self.hashed.contains_key(&term.id) {
+                        if self.budget < data.len() as u64 {
+                            return Ok(None);
+                        }
+                        self.budget -= data.len() as u64;
+                        let oid = git_blob_id(&data);
+                        let hit = oid.starts_with(want);
+                        self.hashed.insert(term.id, Some(oid));
+                        if !hit {
+                            continue;
+                        }
+                    }
+                    let size = data.len() as u64;
+                    return Ok(Some((data, ConflictTerm { size, ..term })));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Mutable state of one series' application.
+struct State {
+    work: u64,
+    inflated: u64,
+    /// With `--3way`: where pre-images are looked for.
+    preimages: Option<Preimages>,
+}
+
+/// The result of a binary section on `base`: `Ok(Err(why))` when `base`
+/// is not the version the section was made for.
+fn apply_binary(series: &Series, f: &FilePatch, bp: &BinaryPatch, base: &[u8], lim: &Limits, st: &mut State) -> Result<std::result::Result<Vec<u8>, String>> {
+    let what = f.path();
+    #[cfg(feature = "git")]
+    {
+        let Some((old_id, new_id)) = &f.index else {
+            return Err(refused(format!("{what}: a binary section without an 'index' line (Git writes one)")));
+        };
+        if !full_id(old_id) || !full_id(new_id) {
+            return Err(refused(format!(
+                "{what}: a binary section needs full object ids on its 'index' line (`git format-patch --binary` writes them)"
+            )));
+        }
+        if f.old_path.is_some() && git_blob_id(base) != *old_id {
+            return Ok(Err(format!("{what}: the binary patch was made for another version of the file")));
+        }
+    }
+    let data = series.binary_data(&bp.forward).map_err(|e| refused(format!("{what}: {e}")))?;
+    st.inflated = st.inflated.saturating_add(data.len() as u64);
+    let out = match bp.forward.kind {
+        BinaryKind::Literal => data,
+        BinaryKind::Delta => {
+            let r = match binary::apply_delta(base, &data, lim.max_file_size) {
+                Ok(r) => r,
+                Err(e) if e.contains("is for a file of") => return Ok(Err(format!("{what}: {e}"))),
+                Err(e) => return Err(refused(format!("{what}: {e}"))),
+            };
+            st.inflated = st.inflated.saturating_add(r.len() as u64);
+            r
+        }
+    };
+    if st.inflated > lim.max_inflated {
+        return Err(refused(format!("the binary sections of the series make more than {} bytes", lim.max_inflated)));
+    }
+    #[cfg(feature = "git")]
+    if let Some((_, new_id)) = &f.index {
+        if f.new_path.is_some() && git_blob_id(&out) != *new_id {
+            return Err(refused(format!("{what}: the binary patch does not make the file its 'index' line names")));
+        }
+    }
+    Ok(Ok(out))
+}
+
+/// The three-way merge of `vl am --3way`: the content the section makes
+/// from `base` (`theirs`), merged with `ours` from `base`.
+#[cfg_attr(not(feature = "git"), allow(dead_code))]
+enum Merged {
+    Clean(Vec<u8>),
+    /// The content to record for the builder to check (markers, or
+    /// `theirs` for binary content) and the conflict.
+    Conflict(Vec<u8>, Box<Conflicted>),
+}
+
+#[cfg(feature = "git")]
+fn merge3(base: &[u8], ours: &Source, theirs: Vec<u8>, conflict: impl FnOnce(Vec<u8>) -> Conflicted) -> Merged {
+    if ours.data == base || ours.data == theirs {
+        return Merged::Clean(if ours.data == base { theirs } else { ours.data.clone() });
+    }
+    let binary = [base, &ours.data, &theirs].iter().any(|d| crate::secrets::looks_binary(d));
+    if binary {
+        return Merged::Conflict(theirs.clone(), Box::new(conflict(theirs)));
+    }
+    match crate::textmerge::merge(base, &ours.data, &theirs, 7, crate::textmerge::Style::Diff3) {
+        Ok(m) => Merged::Clean(m),
+        Err(markers) => Merged::Conflict(markers, Box::new(conflict(theirs))),
+    }
+}
+
+/// `vl am --3way` for section `f` that did not apply to `ours`: the
+/// pre-image its `index` line names, from this repository's history, the
+/// section applied to it, and the merge (`None`: no pre-image, or the
+/// section does not apply to it either).
+#[allow(clippy::too_many_arguments)]
+fn three_way(
     store: &ObjectStore,
     root: &ObjectId,
-    fs: &OverlayBackend,
     series: &Series,
-    p: &Patch,
+    f: &FilePatch,
+    ours: &Source,
+    new_mode: Mode,
     lim: &Limits,
-    work: &mut u64,
-) -> Result<Applied> {
+    st: &mut State,
+) -> Result<Option<Merged>> {
+    #[cfg(not(feature = "git"))]
+    {
+        let _ = (store, root, series, f, ours, new_mode, lim, st);
+        Ok(None)
+    }
+    #[cfg(feature = "git")]
+    {
+        if ours.mode.kind() != EntryKind::File {
+            return Ok(None);
+        }
+        let (Some((want, _)), Some(new_path)) = (&f.index, &f.new_path) else { return Ok(None) };
+        let Some(pre) = st.preimages.as_mut() else { return Ok(None) };
+        let mut paths: Vec<&VPath> = f.old_path.iter().collect();
+        if f.new_path != f.old_path {
+            paths.push(new_path);
+        }
+        let Some((base, base_term)) = pre.find(store, root, &paths, want)? else { return Ok(None) };
+        let theirs = match &f.binary_patch {
+            Some(bp) => match apply_binary(series, f, bp, &base, lim, st)? {
+                Ok(t) => t,
+                Err(_) => return Ok(None),
+            },
+            None => match apply_hunks(series, f, &base, lim, &mut st.work) {
+                Ok(t) => t,
+                Err(_) => return Ok(None),
+            },
+        };
+        let conflict = |theirs: Vec<u8>| Conflicted {
+            path: new_path.clone(),
+            base: base_term,
+            ours: ConflictTerm::of(&ours.entry),
+            theirs,
+            executable: new_mode == Mode::Executable,
+        };
+        Ok(Some(merge3(&base, ours, theirs, conflict)))
+    }
+}
+
+/// Apply one patch to `fs`, an overlay over the tree `root`.
+fn apply_patch(store: &ObjectStore, root: &ObjectId, fs: &OverlayBackend, series: &Series, p: &Patch, lim: &Limits, st: &mut State) -> Result<Applied> {
     let deleted: BTreeSet<VPath> = p
         .files
         .iter()
         .filter(|f| matches!(f.op, FileOp::Delete | FileOp::Rename))
         .filter_map(|f| f.old_path.clone())
         .collect();
+    let format = store.format();
     let mut out = Applied::default();
-    let mut writes: Vec<(VPath, Vec<u8>, bool)> = Vec::new();
+    let mut writes: Vec<(VPath, Vec<u8>, Mode)> = Vec::new();
+    let mut removals: Vec<(VPath, Mode)> = Vec::new();
     let mut targets: Vec<&VPath> = Vec::new();
     for f in &p.files {
         let what = f.path();
@@ -1974,20 +2429,75 @@ fn apply_patch(
             VeilError::Repo(m) if !m.contains(what.as_str()) => VeilError::Repo(format!("{what}: {m}")),
             e => e,
         };
-        if f.binary {
+        if f.binary && f.binary_patch.is_none() {
             return Err(refused(format!(
-                "{what}: binary patches cannot be applied yet (export with --binary is phase 2 work)"
+                "{what}: the patch says only 'Binary files … differ' and holds no content; ask for one made with \
+                 `git format-patch --binary` (or `vl format-patch --binary`)"
             )));
         }
+        if format < crate::object::GIT_PARITY_REPO_FORMAT {
+            if let Some(m) = [f.old_mode, f.new_mode].into_iter().flatten().find(|m| m.kind() != EntryKind::File) {
+                return Err(refused(format!(
+                    "{what} is a {}: symlinks and submodules need repository format {}, and this one is at format {format} \
+                     (upgrade it with `vl upgrade`)",
+                    m.noun(),
+                    crate::object::GIT_PARITY_REPO_FORMAT
+                )));
+            }
+        }
         let old = f.old_path.as_ref().map(|o| read_source(store, root, o, f.old_mode)).transpose()?;
+        let new_mode = match (f.op, &old) {
+            (FileOp::Delete, _) => None,
+            (_, Some(o)) => Some(f.new_mode.unwrap_or(o.mode)),
+            (_, None) => Some(f.new_mode.unwrap_or(Mode::Regular)),
+        };
+        if let (Some(o), Some(n)) = (&old, new_mode) {
+            if o.mode.kind() != n.kind() {
+                return Err(refused(format!(
+                    "{what}: the section turns a {} into a {} (Git writes a type change as a deletion and a creation)",
+                    o.mode.noun(),
+                    n.noun()
+                )));
+            }
+        }
         if f.op != FileOp::Modify {
             if let Some(n) = &f.new_path {
                 check_target(store, root, n, &deleted)?;
                 targets.push(n);
             }
         }
-        let base = old.as_ref().map_or(&[][..], |(b, _)| b.as_slice());
-        let data = apply_hunks(series, f, base, lim, work).map_err(at)?;
+        if let (Some(o), Some(n)) = (&old, &f.new_path) {
+            if !o.entry.visibility.is_public() {
+                out.from_sealed.push((n.clone(), f.old_path.clone().expect("a source")));
+            }
+        }
+        let empty = Vec::new();
+        let base = old.as_ref().map_or(&empty, |o| &o.data);
+        let applied = match &f.binary_patch {
+            Some(bp) => apply_binary(series, f, bp, base, lim, st)?.map_err(refused),
+            None => apply_hunks(series, f, base, lim, &mut st.work),
+        };
+        let data = match (applied, &old, new_mode) {
+            (Ok(d), _, _) => d,
+            (Err(e), Some(o), Some(m)) if st.preimages.is_some() => match three_way(store, root, series, f, o, m, lim, st)? {
+                Some(Merged::Clean(d)) => {
+                    out.merged.push(f.new_path.clone().expect("a new path"));
+                    d
+                }
+                Some(Merged::Conflict(d, c)) => {
+                    if format < crate::object::CONFLICT_REPO_FORMAT && crate::secrets::looks_binary(&d) {
+                        return Err(refused(format!(
+                            "{what}: the three-way merge of binary content conflicts, and this repository format cannot record \
+                             the conflict (upgrade it with `vl upgrade`)"
+                        )));
+                    }
+                    out.conflicts.push(*c);
+                    d
+                }
+                None => return Err(at(e)),
+            },
+            (Err(e), _, _) => return Err(at(e)),
+        };
         if data.len() as u64 > lim.max_file_size {
             return Err(refused(format!(
                 "{what}: the patched file would be {} bytes, more than {} (VEIL_MAX_OBJECT)",
@@ -1995,32 +2505,70 @@ fn apply_patch(
                 lim.max_file_size
             )));
         }
-        match (&f.new_path, f.op) {
-            (None, _) => {
+        match (&f.new_path, new_mode) {
+            (Some(n), Some(m)) => {
+                let content = match m {
+                    Mode::Symlink => {
+                        check_link(n, &data)?;
+                        data
+                    }
+                    Mode::Gitlink => pin_of(n, &data)?,
+                    Mode::Regular | Mode::Executable => data,
+                };
+                if m.kind() != EntryKind::File && n.as_str() == policy::POLICY_FILE {
+                    return Err(refused(format!("{n} is always a regular file, never a {}", m.noun())));
+                }
+                writes.push((n.clone(), content, m));
+            }
+            _ => {
                 if !data.is_empty() {
                     return Err(refused(format!("{what}: the patch deletes the file, but it holds more than the patch removes")));
                 }
             }
-            (Some(n), _) => {
-                let exec = match f.new_mode {
-                    Some(m) => m == Mode::Executable,
-                    None => old.as_ref().is_some_and(|(_, x)| *x),
-                };
-                writes.push((n.clone(), data, exec));
-            }
         }
         if matches!(f.op, FileOp::Delete | FileOp::Rename) {
-            out.removed.push(f.old_path.clone().expect("a source"));
+            let o = old.as_ref().expect("a source");
+            removals.push((f.old_path.clone().expect("a source"), o.mode));
+        }
+    }
+    // Nothing is written below another path this patch writes: those are
+    // files, symlinks and submodules, never directories (a link is never
+    // written through, CVE-2023-23946).
+    let leaves: BTreeMap<&VPath, Mode> = writes.iter().map(|(p, _, m)| (p, *m)).collect();
+    for (path, _, _) in &writes {
+        if let Some((a, m)) = path.ancestors().iter().find_map(|a| leaves.get_key_value(a)) {
+            return Err(refused(format!(
+                "cannot write {path}: the same patch makes {a} a {} (nothing is ever written through a symlink)",
+                m.noun()
+            )));
         }
     }
     check_collisions(store, root, &targets, &deleted)?;
-    for r in &out.removed {
-        fs.remove_file(r)?;
+    for (r, m) in removals {
+        if m == Mode::Gitlink {
+            fs.remove_dir_all(&r)?;
+        } else {
+            fs.remove_file(&r)?;
+        }
+        out.removed.push(r);
     }
-    for (path, data, exec) in writes {
-        fs.write(&path, &data)?;
-        fs.set_executable(&path, exec)?;
-        out.written.push(path);
+    for (path, data, mode) in writes {
+        match mode {
+            Mode::Regular | Mode::Executable => {
+                fs.write(&path, &data)?;
+                fs.set_executable(&path, mode == Mode::Executable)?;
+            }
+            Mode::Symlink => fs.write_link(&path, &data)?,
+            // Recorded as a file holding the pin (classified, scanned and
+            // sealed as any content), then made a gitlink.
+            Mode::Gitlink => {
+                if fs.metadata(&path)?.is_some_and(|m| m.kind == crate::vfs::NodeKind::Dir) {
+                    fs.remove_dir_all(&path)?;
+                }
+                fs.write(&path, &data)?;
+            }
+        }
+        out.written.push((path, mode));
     }
     Ok(out)
 }
@@ -2147,6 +2695,10 @@ pub struct AmOptions {
     pub limits: Limits,
     /// Description of a patch with no subject or body (a plain diff).
     pub default_description: String,
+    /// When a section does not apply, merge it three ways with the
+    /// pre-image its `index` line names, if this repository's history of
+    /// the file holds it; a conflict is recorded as a first-class conflict.
+    pub three_way: bool,
 }
 
 /// What [`apply_series`] recorded.
@@ -2164,6 +2716,14 @@ pub struct AmReport {
     pub policy_held_back: Vec<policy::HeldBack>,
     /// Patches that change no file (recorded as empty changes).
     pub empty: Vec<usize>,
+    /// With [`AmOptions::three_way`]: files merged cleanly with their
+    /// pre-image (patch number from 1, path).
+    pub merged: Vec<(usize, VPath)>,
+    /// With [`AmOptions::three_way`]: files recorded with a conflict.
+    pub conflicts: Vec<(usize, VPath)>,
+    /// Symlinks recorded whose target leaves the repository or names an
+    /// isolated file (patch number, path, why).
+    pub link_warnings: Vec<(usize, VPath, String)>,
 }
 
 /// Refuse what the builder would not record as the patch wrote it.
@@ -2192,9 +2752,14 @@ fn check_recorded(store: &ObjectStore, tree: &ObjectId, applied: &Applied, r: &B
     if let Some((p, why)) = r.unreadable.first() {
         return Err(refused(format!("{p} could not be read ({why}). Nothing was recorded")));
     }
-    for w in &applied.written {
+    if let Some(what) = r.unrepresentable.first() {
+        return Err(refused(format!("{what} cannot be recorded. Nothing was recorded")));
+    }
+    for (w, mode) in &applied.written {
+        // A submodule is recorded as a file holding its pin first.
+        let want = if *mode == Mode::Symlink { EntryKind::Symlink } else { EntryKind::File };
         match crate::tree::lookup(store, tree, w)? {
-            Some(e) if e.kind == EntryKind::File => {}
+            Some(e) if e.kind == want => {}
             _ => {
                 return Err(VeilError::Policy(format!(
                     "{w} is ignored by the policy (or cannot be recorded): a patch cannot add it. Nothing was recorded"
@@ -2203,7 +2768,7 @@ fn check_recorded(store: &ObjectStore, tree: &ObjectId, applied: &Applied, r: &B
         }
     }
     for d in &applied.removed {
-        if applied.written.contains(d) {
+        if applied.written.iter().any(|(w, _)| w == d) {
             continue;
         }
         // A directory there is what the patch created below it.
@@ -2222,9 +2787,13 @@ fn check_recorded(store: &ObjectStore, tree: &ObjectId, applied: &Applied, r: &B
 /// otherwise record that file as public.
 fn check_not_weakened(store: &ObjectStore, tree: &ObjectId, applied: &Applied, before: &Policy) -> Result<()> {
     use crate::{object::Visibility, policy::Tier};
-    for w in &applied.written {
+    for (w, mode) in &applied.written {
         let Some(e) = crate::tree::lookup(store, tree, w)? else { continue };
-        let wanted = before.classify(w, false).tier;
+        let wanted = match mode {
+            Mode::Symlink => before.classify_link(w),
+            _ => before.classify(w, false),
+        }
+        .tier;
         let weaker = matches!((&wanted, &e.visibility), (Tier::Cloaked(_), Visibility::Public) | (Tier::Isolated | Tier::Ignored, _));
         if weaker {
             return Err(VeilError::Policy(format!(
@@ -2237,6 +2806,68 @@ fn check_not_weakened(store: &ObjectStore, tree: &ObjectId, applied: &Applied, b
         }
     }
     Ok(())
+}
+
+/// Refuse to record content read from a sealed version as public: an edit,
+/// a rename or a copy of a sealed file keeps a sealed audience (the
+/// builder keeps an edit's scope; this holds for every other way a patch
+/// can carry content along).
+fn check_still_sealed(store: &ObjectStore, tree: &ObjectId, applied: &Applied) -> Result<()> {
+    for (w, from) in &applied.from_sealed {
+        if crate::tree::lookup(store, tree, w)?.is_some_and(|e| e.visibility.is_public()) {
+            return Err(VeilError::Policy(format!(
+                "{w}: the patch would record content of the sealed {from} as public. Nothing was recorded"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The tree the builder recorded, made what the patch says: written
+/// submodules become gitlinks (their pin as recorded: classified, scanned
+/// and sealed as content), and the conflicts of `--3way` become
+/// conflict entries (repository format 4 and later; before, the file keeps
+/// its markers). Returns the tree and the conflicted paths.
+fn finish_tree(store: &ObjectStore, mut tree: ObjectId, applied: &Applied) -> Result<(ObjectId, Vec<VPath>)> {
+    use crate::{conflict, object::TermKind};
+    for (w, mode) in &applied.written {
+        if *mode != Mode::Gitlink {
+            continue;
+        }
+        let e = crate::tree::lookup(store, &tree, w)?.ok_or_else(|| refused(format!("{w} was not recorded")))?;
+        let link = TreeEntry {
+            kind: EntryKind::Gitlink,
+            executable: false,
+            ..e
+        };
+        tree = conflict::set_entry(store, &tree, w, Some(link))?;
+    }
+    let mut paths = Vec::new();
+    for c in &applied.conflicts {
+        paths.push(c.path.clone());
+        if store.format() < crate::object::CONFLICT_REPO_FORMAT {
+            continue;
+        }
+        let e = crate::tree::lookup(store, &tree, &c.path)?.ok_or_else(|| refused(format!("{} was not recorded", c.path)))?;
+        // The side the patch brings has the audience the builder gave the
+        // merged file (never wider than ours: a sealed file stays sealed).
+        let theirs = ConflictTerm {
+            kind: TermKind::File,
+            id: store.store_file(&c.theirs, &e.visibility)?,
+            size: c.theirs.len() as u64,
+            executable: c.executable,
+            visibility: e.visibility.clone(),
+            fallback: None,
+        };
+        let m = conflict::Merge::three_way(
+            conflict::Merge::resolved(Some(c.base.clone())),
+            conflict::Merge::resolved(Some(c.ours.clone())),
+            conflict::Merge::resolved(Some(theirs)),
+        );
+        let entry = conflict::entry_for(store, c.path.file_name(), m)?;
+        tree = conflict::set_entry(store, &tree, &c.path, entry)?;
+    }
+    Ok((tree, paths))
 }
 
 /// Apply `series` as new changes, one per patch, on top of the snapshot
@@ -2252,13 +2883,17 @@ pub fn apply_series(repo: &mut Repo, ws: &str, dest: &str, series: &Series, opts
     };
     // Refuse what needs no repository before taking the lock.
     for (i, p) in series.patches.iter().enumerate() {
-        if let Some(f) = p.files.iter().find(|f| f.binary) {
+        if let Some(f) = p.files.iter().find(|f| f.binary && f.binary_patch.is_none()) {
             return Err(refused(format!(
-                "{}: {}: binary patches cannot be applied yet. Nothing was recorded",
+                "{}: {}: the patch says only 'Binary files … differ' and holds no content; ask for one made with \
+                 `git format-patch --binary` (or `vl format-patch --binary`). Nothing was recorded",
                 label(i, p),
                 f.path()
             )));
         }
+    }
+    if opts.three_way && !cfg!(feature = "git") {
+        return Err(VeilError::Unsupported("--3way needs Veil's Git support (the `git` feature)".into()));
     }
     if series.patches.iter().all(Patch::is_cover_letter) {
         return Err(refused("the input holds only a cover letter, no patch".into()));
@@ -2272,7 +2907,16 @@ pub fn apply_series(repo: &mut Repo, ws: &str, dest: &str, series: &Series, opts
     let accepted = policy::load_accepted(&**tx.repo().backend())?;
     let cloak = base.cloak.clone();
     let (mut parent, mut tree, mut conflicts) = (dest, base.tree, base.conflicts.clone());
-    let mut work = 0u64;
+    let mut st = State {
+        work: 0,
+        inflated: 0,
+        preimages: if opts.three_way {
+            let heads: Vec<ObjectId> = tx.view.heads.iter().copied().collect();
+            Some(Preimages::new(tx.repo(), &dest, heads)?)
+        } else {
+            None
+        },
+    };
     for (i, p) in series.patches.iter().enumerate() {
         if p.is_cover_letter() {
             report.skipped.push(i + 1);
@@ -2289,7 +2933,7 @@ pub fn apply_series(repo: &mut Repo, ws: &str, dest: &str, series: &Series, opts
         };
         let lower: Arc<dyn StorageBackend> = Arc::new(TreeView::new(store.clone(), tree));
         let fs = OverlayBackend::new(lower.clone());
-        let applied = apply_patch(&store, &tree, &fs, series, p, &opts.limits, &mut work).map_err(ctx)?;
+        let applied = apply_patch(&store, &tree, &fs, series, p, &opts.limits, &mut st).map_err(ctx)?;
         // An incoming change: its `.veilpolicy` is guarded by the policy
         // this device accepted (the destination's, if none was recorded),
         // and nothing here is ever accepted.
@@ -2315,7 +2959,15 @@ pub fn apply_series(repo: &mut Repo, ws: &str, dest: &str, series: &Series, opts
         .map_err(ctx)?;
         check_recorded(&store, &new_tree, &applied, &built).map_err(ctx)?;
         check_not_weakened(&store, &new_tree, &applied, &Policy::load(&*lower).map_err(ctx)?).map_err(ctx)?;
+        check_still_sealed(&store, &new_tree, &applied).map_err(ctx)?;
+        let (new_tree, conflicted) = finish_tree(&store, new_tree, &applied).map_err(ctx)?;
         report.policy_held_back.extend(built.policy_held_back.iter().cloned());
+        report.link_warnings.extend(built.link_warnings.iter().map(|(p, w)| (i + 1, p.clone(), w.clone())));
+        report.merged.extend(applied.merged.iter().map(|p| (i + 1, p.clone())));
+        report.conflicts.extend(conflicted.iter().map(|p| (i + 1, p.clone())));
+        conflicts.extend(conflicted.iter().map(|p| p.to_string()));
+        conflicts.sort();
+        conflicts.dedup();
         if p.files.is_empty() {
             report.empty.push(i + 1);
         }
@@ -2385,15 +3037,16 @@ pub use writer::{format_patches, Audience, Export, ExportOptions, ExportedPatch}
 mod writer {
     use std::collections::BTreeSet;
 
-    use super::{format_date, Mode, Result, VeilError};
+    use super::{binary, format_date, git_blob_id, Mode, Result, VeilError};
     use crate::{
         git::{public_open, public_text, split_author, GitBridge, Public, Veil},
         id::ObjectId,
         keychain::LOCAL_SCOPE,
         object::{EntryKind, Object, Snapshot, Text, TreeEntry},
+        rename::{self, Item, RenameOptions},
         repo::Repo,
         store::ObjectStore,
-        tree::diff_trees,
+        tree::{diff_trees, TreeChange},
         vpath::VPath,
     };
 
@@ -2416,9 +3069,17 @@ mod writer {
         pub include_embargoed: BTreeSet<String>,
         /// Also write a cover letter (patch 0).
         pub cover_letter: bool,
-        /// Detect renames. Phase 1 has no rename detection (stream H's
-        /// `rename.rs`): every rename is a deletion and an addition.
+        /// Detect renames (`-M`), on the audience's sides only.
         pub find_renames: bool,
+        /// Detect copies too (`-C`; implies renames): a new file made from
+        /// a file changed in the same snapshot.
+        pub find_copies: bool,
+        /// Similarity a pair needs, in percent (`None`: Git's 50).
+        pub rename_threshold: Option<u8>,
+        /// Write binary files as `GIT binary patch` data (`--binary`),
+        /// which `git am` and `vl am` apply. Never for sealed content: a
+        /// sealed binary file is shown as `Binary files … differ`.
+        pub binary: bool,
         /// The text after the `-- ` signature line (`vl 0.1.0`).
         pub signature: String,
     }
@@ -2449,15 +3110,52 @@ mod writer {
     }
 
     /// One side of a changed file, as the audience sees it.
+    #[derive(Clone)]
     pub(super) struct Side {
+        /// A file's bytes, a link's target, a submodule's pin (`<id>\n`).
         pub(super) data: Vec<u8>,
-        pub(super) exec: bool,
+        pub(super) mode: Mode,
+        /// Read from a sealed object (audience `me`): never written as
+        /// binary data.
+        pub(super) sealed: bool,
+    }
+
+    impl Side {
+        #[cfg(test)]
+        pub(super) fn file(data: Vec<u8>, exec: bool) -> Side {
+            Side {
+                data,
+                mode: Mode::of(exec),
+                sealed: false,
+            }
+        }
+
+        /// The content a patch shows (`Subproject commit <id>` for a
+        /// submodule) and its Git object id (the commit, for a submodule).
+        fn shown(&self) -> (Vec<u8>, String) {
+            match self.mode {
+                Mode::Gitlink => {
+                    let pin = String::from_utf8_lossy(&self.data).trim_end().to_string();
+                    (format!("Subproject commit {pin}\n").into_bytes(), pin)
+                }
+                _ => (self.data.clone(), git_blob_id(&self.data)),
+            }
+        }
+    }
+
+    /// The source of a renamed or copied file.
+    #[derive(Clone)]
+    pub(super) struct Renamed {
+        pub(super) from: VPath,
+        pub(super) score: u8,
+        pub(super) copy: bool,
     }
 
     pub(super) struct FileDiff {
         pub(super) path: VPath,
         pub(super) old: Option<Side>,
         pub(super) new: Option<Side>,
+        pub(super) from: Option<Renamed>,
     }
 
     /// Which labels the patch of one snapshot depends on (audience `me`).
@@ -2476,10 +3174,12 @@ mod writer {
     impl Reader<'_> {
         /// Record the label of the sealed object `id` this reader opened,
         /// refusing what may never leave the device.
-        fn note(&self, id: &ObjectId, path: &str, labels: &mut Labels) -> Result<()> {
-            let Ok(raw) = self.store.get_raw(id) else { return Ok(()) };
-            let Some(scope) = Object::sealed_scope(&raw) else { return Ok(()) };
-            self.note_label(&scope, path, labels)
+        /// Returns whether the object is sealed.
+        fn note(&self, id: &ObjectId, path: &str, labels: &mut Labels) -> Result<bool> {
+            let Ok(raw) = self.store.get_raw(id) else { return Ok(false) };
+            let Some(scope) = Object::sealed_scope(&raw) else { return Ok(false) };
+            self.note_label(&scope, path, labels)?;
+            Ok(true)
         }
 
         fn note_label(&self, label: &str, what: &str, labels: &mut Labels) -> Result<()> {
@@ -2509,57 +3209,63 @@ mod writer {
             Ok(())
         }
 
-        /// A file entry as this reader reads it (`None`: no key, and no
-        /// readable fallback).
+        /// A file, symlink or submodule entry as this reader reads it
+        /// (`None`: no key, and no readable fallback).
         fn me_side(&self, path: &VPath, e: &TreeEntry, labels: &mut Labels) -> Result<Option<Side>> {
-            match e.kind {
-                EntryKind::Conflict => {
-                    let m = crate::conflict::materialize_entry(self.store, e, crate::conflict::Audience::Reader)?;
-                    if let Ok(Object::Conflict(c)) = self.store.get(&e.id) {
-                        for t in c.adds.iter().chain(c.removes.iter()).flatten() {
-                            if self.store.read_blob(&t.id).is_ok() {
-                                self.note(&t.id, path.as_str(), labels)?;
-                            }
-                        }
-                    }
-                    Ok(Some(Side {
-                        data: m.content,
-                        exec: m.executable,
-                    }))
-                }
-                EntryKind::File => match self.store.read_blob(&e.id) {
-                    Ok(data) => {
-                        self.note(&e.id, path.as_str(), labels)?;
-                        Ok(Some(Side { data, exec: e.executable }))
-                    }
-                    Err(err) if err.is_unreadable() => match e.fallback.map(|fb| self.store.read_blob(&fb)) {
-                        Some(Ok(data)) => {
-                            self.note(&e.fallback.expect("a fallback"), path.as_str(), labels)?;
-                            Ok(Some(Side { data, exec: e.executable }))
-                        }
-                        Some(Err(err)) if !err.is_unreadable() => Err(err),
-                        _ => Ok(None),
-                    },
-                    Err(err) => Err(err),
+            let mode = match e.kind {
+                EntryKind::Dir => return Ok(None),
+                EntryKind::Conflict => return self.me_conflict(path, e, labels),
+                _ => Mode::of_entry(e).expect("a leaf"),
+            };
+            let (data, sealed) = match self.store.read_blob(&e.id) {
+                Ok(data) => (data, self.note(&e.id, path.as_str(), labels)?),
+                Err(err) if err.is_unreadable() => match e.fallback.map(|fb| self.store.read_blob(&fb)) {
+                    Some(Ok(data)) => (data, self.note(&e.fallback.expect("a fallback"), path.as_str(), labels)?),
+                    Some(Err(err)) if !err.is_unreadable() => return Err(err),
+                    _ => return Ok(None),
                 },
-                EntryKind::Dir => Ok(None),
-                // Patches carry no symlinks or submodules yet (phase 2):
-                // refuse rather than export a link target as file content.
-                EntryKind::Symlink | EntryKind::Gitlink => Err(VeilError::Unsupported(format!(
-                    "{path} is a {}: patches cannot carry symlinks or submodules yet",
-                    if e.kind == EntryKind::Symlink { "symlink" } else { "submodule" }
-                ))),
+                Err(err) => return Err(err),
+            };
+            if mode == Mode::Gitlink && super::parse_pin(&data).is_none() {
+                return Err(VeilError::Corrupt(e.id.hex(), format!("{path}: a submodule pin that names no commit")));
             }
+            Ok(Some(Side { data, mode, sealed }))
+        }
+
+        /// A conflict entry: its markers for this reader, or (a conflict
+        /// with a symlink or submodule side) that side as it is, as the
+        /// working copy holds it.
+        fn me_conflict(&self, path: &VPath, e: &TreeEntry, labels: &mut Labels) -> Result<Option<Side>> {
+            let c = self.store.conflict(&e.id)?;
+            if c.has_special_terms() {
+                let Some((_, t)) = crate::conflict::shown_side(&c) else { return Ok(None) };
+                return self.me_side(path, &t.entry(&e.name), labels);
+            }
+            let m = crate::conflict::materialize_entry(self.store, e, crate::conflict::Audience::Reader)?;
+            let mut sealed = false;
+            for t in c.adds.iter().chain(c.removes.iter()).flatten() {
+                if self.store.read_blob(&t.id).is_ok() {
+                    sealed |= self.note(&t.id, path.as_str(), labels)?;
+                }
+            }
+            Ok(Some(Side {
+                data: m.content,
+                mode: Mode::of(m.executable),
+                sealed,
+            }))
         }
     }
 
     /// A projected entry's content, read the way a public reader can (no
     /// scope key is ever used).
     fn public_side(store: &ObjectStore, e: &TreeEntry) -> Result<Side> {
-        match public_open(store, &Veil::default(), &e.id)? {
-            Public::Visible {
-                obj: Object::Blob(data), ..
-            } if e.kind == EntryKind::File => Ok(Side { data, exec: e.executable }),
+        let mode = Mode::of_entry(e);
+        match (public_open(store, &Veil::default(), &e.id)?, mode) {
+            (Public::Visible { obj: Object::Blob(data), .. }, Some(mode))
+                if mode != Mode::Gitlink || super::parse_pin(&data).is_some() =>
+            {
+                Ok(Side { data, mode, sealed: false })
+            }
             _ => Err(VeilError::Corrupt(e.id.hex(), "a public projection holds an unreadable file".into())),
         }
     }
@@ -2590,9 +3296,6 @@ mod writer {
             }
         }
         let mut out = Export::default();
-        if opts.find_renames {
-            out.warnings.push("rename detection is not available yet: renames show as a deletion and an addition".into());
-        }
         let mut mails: Vec<(Option<ObjectId>, Header, Vec<FileDiff>)> = Vec::new();
         let mut first_parent_tree = None;
         let mut last_tree = None;
@@ -2642,7 +3345,7 @@ mod writer {
         for (n, (id, header, files)) in mails.iter().enumerate() {
             let subject = subject_of(&header.description);
             let mut text = Vec::new();
-            if render(&mut text, header, files, (n + 1, total), &opts.signature) {
+            if render(&mut text, header, files, (n + 1, total), opts) {
                 out.warnings.push(format!(
                     "patch {}: lines of its description that look like patch syntax (a diff, '---', a 'From ' line) \
                      were indented by one space, so no reader takes them for a patch",
@@ -2702,30 +3405,119 @@ mod writer {
             Audience::Me => (Some(*old), Some(*new)),
         };
         let mut out = Vec::new();
-        // Rename detection would pair deletions with additions here, on the
-        // projected sides only (feature 2, point 1). Phase 1: none.
-        for c in diff_trees(store, from.as_ref(), to.as_ref())? {
-            let side = |e: &Option<TreeEntry>, labels: &mut Labels| -> Result<Option<Option<Side>>> {
+        let list = diff_trees(store, from.as_ref(), to.as_ref())?;
+        // Renames and copies pair deletions with additions of the
+        // audience's own sides: for the public audience the projected
+        // trees, read as a public reader (feature 2, point 1), so a pair
+        // never involves a path or content the audience cannot see.
+        let items: Vec<(TreeChange, Option<Renamed>)> = if r.opts.find_renames || r.opts.find_copies {
+            let reader = match r.opts.audience {
+                Audience::Public => crate::blame::Reader::Public,
+                Audience::Me => crate::blame::Reader::Me,
+            };
+            let ro = RenameOptions {
+                copies: r.opts.find_copies,
+                threshold: r.opts.rename_threshold.unwrap_or(rename::DEFAULT_THRESHOLD),
+                ..RenameOptions::default()
+            };
+            let d = rename::detect(store, &list, reader, &ro)?;
+            if d.truncated {
+                let w = "rename detection stopped at its limits: some renames show as a deletion and an addition".to_string();
+                if !warnings.contains(&w) {
+                    warnings.push(w);
+                }
+            }
+            special_renames(d.items())
+        } else {
+            list.into_iter().map(|c| (c, None)).collect()
+        };
+        for (c, renamed) in items {
+            let src = renamed.as_ref().map_or(&c.path, |x| &x.from);
+            let side = |path: &VPath, e: &Option<TreeEntry>, labels: &mut Labels| -> Result<Option<Option<Side>>> {
                 let Some(e) = e else { return Ok(Some(None)) };
                 match r.opts.audience {
                     Audience::Public => Ok(Some(Some(public_side(store, e)?))),
-                    Audience::Me => Ok(r.me_side(&c.path, e, labels)?.map(Some)),
+                    Audience::Me => Ok(r.me_side(path, e, labels)?.map(Some)),
                 }
             };
-            let (Some(old), Some(new)) = (side(&c.old, labels)?, side(&c.new, labels)?) else {
+            let (Some(old), Some(new)) = (side(src, &c.old, labels)?, side(&c.path, &c.new, labels)?) else {
                 warnings.push(format!("{}: you hold no key for one of its versions; left out of the patch", c.path));
                 continue;
             };
             let same = match (&old, &new) {
-                (Some(a), Some(b)) => a.data == b.data && a.exec == b.exec,
+                (Some(a), Some(b)) => a.data == b.data && a.mode == b.mode,
                 (None, None) => true,
                 _ => false,
             };
-            if !same {
-                out.push(FileDiff { path: c.path, old, new });
+            if same && renamed.is_none() {
+                continue;
             }
+            let sealed = [&old, &new].into_iter().flatten().any(|s| s.sealed);
+            let binary = [&old, &new].into_iter().flatten().any(|s| s.mode.kind() == EntryKind::File && is_binary(&s.data));
+            if r.opts.binary && sealed && binary && !same {
+                warnings.push(format!(
+                    "{}: sealed binary content is never written as a binary patch; shown as 'Binary files … differ'",
+                    c.path
+                ));
+            }
+            out.push(FileDiff {
+                path: c.path,
+                old,
+                new,
+                from: renamed,
+            });
         }
         Ok(out)
+    }
+
+    /// The changes and pairs `rename::detect` found, plus Git's exact
+    /// renames of symlinks and submodules (which `rename.rs` leaves to
+    /// files): a deleted and an added entry of the same kind and object,
+    /// a same-named one first. Each pair takes the place of its addition.
+    fn special_renames(items: Vec<Item>) -> Vec<(TreeChange, Option<Renamed>)> {
+        let special = |e: &TreeEntry| matches!(e.kind, EntryKind::Symlink | EntryKind::Gitlink);
+        let mut out: Vec<(TreeChange, Option<Renamed>)> = Vec::with_capacity(items.len());
+        for it in items {
+            match it {
+                Item::Change(c) => out.push((c, None)),
+                Item::Pair(p) => {
+                    let renamed = Renamed {
+                        from: p.from,
+                        score: p.score,
+                        copy: p.copy,
+                    };
+                    out.push((
+                        TreeChange {
+                            path: p.to,
+                            old: Some(p.old),
+                            new: Some(p.new),
+                        },
+                        Some(renamed),
+                    ));
+                }
+            }
+        }
+        let deleted: Vec<usize> = (0..out.len())
+            .filter(|&i| out[i].1.is_none() && out[i].0.new.is_none() && out[i].0.old.as_ref().is_some_and(special))
+            .collect();
+        let mut taken = vec![false; out.len()];
+        let mut drop = vec![false; out.len()];
+        for i in 0..out.len() {
+            let (c, r) = &out[i];
+            let Some(n) = c.new.as_ref().filter(|n| r.is_none() && c.old.is_none() && special(n)) else { continue };
+            let fits = |j: &&usize| !taken[**j] && out[**j].0.old.as_ref().is_some_and(|o| o.kind == n.kind && o.id == n.id);
+            let name = c.path.file_name();
+            let pick = deleted.iter().filter(fits).find(|j| out[**j].0.path.file_name() == name).or_else(|| deleted.iter().find(fits));
+            if let Some(&j) = pick {
+                taken[j] = true;
+                drop[j] = true;
+                let from = out[j].0.path.clone();
+                let old = out[j].0.old.clone();
+                out[i].0.old = old;
+                out[i].1 = Some(Renamed { from, score: 100, copy: false });
+            }
+        }
+        out.into_iter().enumerate().filter(|(i, _)| !drop[*i]).map(|(_, x)| x).collect()
     }
 
     struct Header {
@@ -2885,12 +3677,6 @@ mod writer {
         out
     }
 
-    fn git_oid(data: &[u8]) -> String {
-        gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, data)
-            .map(|o| o.to_string())
-            .unwrap_or_else(|_| "0".repeat(40))
-    }
-
     const NULL_OID: &str = "0000000000000000000000000000000000000000";
 
     /// Does Git take `data` for binary (a NUL in its first 8000 bytes)?
@@ -2954,6 +3740,25 @@ mod writer {
         }]
     }
 
+    /// The text Git writes after a hunk header (its default `funcname`,
+    /// xdiff's `def_ff`): the nearest line before the hunk's first line
+    /// (`first`, from 0) that starts with an ASCII letter, `_` or `$`, cut
+    /// to 80 bytes, without trailing whitespace.
+    fn function_line<'a>(lines: &[&'a [u8]], first: usize) -> Option<&'a [u8]> {
+        let l = lines[..first.min(lines.len())]
+            .iter()
+            .rev()
+            .find(|l| l.first().is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_' || *c == b'$'))?;
+        let mut l = &l[..l.len().min(80)];
+        while let Some((last, rest)) = l.split_last() {
+            if !matches!(last, b' ' | b'\t' | b'\n' | b'\r') {
+                break;
+            }
+            l = rest;
+        }
+        (!l.is_empty()).then_some(l)
+    }
+
     fn range(r: (usize, usize)) -> String {
         if r.1 == 1 {
             format!("{}", r.0)
@@ -2962,31 +3767,140 @@ mod writer {
         }
     }
 
+    /// The sections of one changed file; its diffstat entry. A type change
+    /// (a file becoming a symlink, …) is a deletion and a creation of the
+    /// path, as Git writes it, and one diffstat entry.
+    pub(super) fn section(out: &mut Vec<u8>, f: &FileDiff, binary: bool) -> Stat {
+        if let (Some(o), Some(n)) = (&f.old, &f.new) {
+            if o.mode.kind() != n.mode.kind() {
+                let del = FileDiff {
+                    path: f.path.clone(),
+                    old: Some(o.clone()),
+                    new: None,
+                    from: None,
+                };
+                let add = FileDiff {
+                    path: f.path.clone(),
+                    old: None,
+                    new: Some(n.clone()),
+                    from: None,
+                };
+                let a = one_section(out, &del, binary);
+                let b = one_section(out, &add, binary);
+                return Stat {
+                    name: a.name,
+                    ins: a.ins + b.ins,
+                    del: a.del + b.del,
+                    binary: (a.binary.is_some() || b.binary.is_some()).then_some((o.data.len(), n.data.len())),
+                };
+            }
+        }
+        one_section(out, f, binary)
+    }
+
+    /// Git's name of a rename in a diffstat: the common leading
+    /// directories and trailing components written once, `a/{x => y}/z`
+    /// (`pprint_rename`).
+    fn rename_name(a: &VPath, b: &VPath) -> String {
+        let (qa, qb) = (quote("", a), quote("", b));
+        if qa != a.as_str() || qb != b.as_str() {
+            return format!("{qa} => {qb}");
+        }
+        let (a, b) = (a.as_str().as_bytes(), b.as_str().as_bytes());
+        let mut pfx = 0;
+        let mut i = 0;
+        while i < a.len() && i < b.len() && a[i] == b[i] {
+            if a[i] == b'/' {
+                pfx = i + 1;
+            }
+            i += 1;
+        }
+        // From the end (the terminating NUL included, as in Git), at most
+        // into the slash that ends the prefix.
+        let at = |s: &[u8], k: usize| if k == s.len() { 0 } else { s[k] };
+        let (mut x, mut y) = (a.len() as isize, b.len() as isize);
+        let floor = pfx as isize - if pfx > 0 { 1 } else { 0 };
+        let mut sfx = 0;
+        while x >= floor && y >= floor && at(a, x as usize) == at(b, y as usize) {
+            if at(a, x as usize) == b'/' {
+                sfx = a.len() - x as usize;
+            }
+            x -= 1;
+            y -= 1;
+        }
+        let amid = a.len().saturating_sub(pfx + sfx);
+        let bmid = b.len().saturating_sub(pfx + sfx);
+        let s = |x: &[u8]| String::from_utf8_lossy(x).into_owned();
+        if pfx + sfx > 0 {
+            format!(
+                "{}{{{} => {}}}{}",
+                s(&a[..pfx]),
+                s(&a[pfx..pfx + amid]),
+                s(&b[pfx..pfx + bmid]),
+                s(&a[a.len() - sfx..])
+            )
+        } else {
+            format!("{} => {}", s(&a[pfx..pfx + amid]), s(&b[pfx..pfx + bmid]))
+        }
+    }
+
+    /// One `GIT binary patch` block making `to` from `from`: a delta when
+    /// it deflates smaller than the literal (as Git chooses).
+    fn binary_block(out: &mut Vec<u8>, from: &[u8], to: &[u8]) {
+        let literal = binary::deflate(to);
+        let delta = (!from.is_empty() && !to.is_empty() && from.len().max(to.len()) <= binary::MAX_DELTA_INPUT).then(|| {
+            let d = binary::make_delta(from, to);
+            (d.len(), binary::deflate(&d))
+        });
+        let (head, data) = match delta {
+            Some((n, z)) if z.len() < literal.len() => (format!("delta {n}\n"), z),
+            _ => (format!("literal {}\n", to.len()), literal),
+        };
+        out.extend_from_slice(head.as_bytes());
+        binary::encode_lines(&data, out);
+        out.push(b'\n');
+    }
+
     /// One `diff --git` section; its diffstat entry.
-    pub(super) fn section(out: &mut Vec<u8>, f: &FileDiff) -> Stat {
-        let a = quote("a/", &f.path);
+    fn one_section(out: &mut Vec<u8>, f: &FileDiff, binary: bool) -> Stat {
+        let old_path = f.from.as_ref().map_or(&f.path, |r| &r.from);
+        let a = quote("a/", old_path);
         let b = quote("b/", &f.path);
         let w = |out: &mut Vec<u8>, s: &str| out.extend_from_slice(s.as_bytes());
         w(out, &format!("diff --git {a} {b}\n"));
-        let empty = Vec::new();
-        let old = f.old.as_ref().map_or(&empty, |s| &s.data);
-        let new = f.new.as_ref().map_or(&empty, |s| &s.data);
+        let (old, old_id) = f.old.as_ref().map_or((Vec::new(), NULL_OID.to_string()), Side::shown);
+        let (new, new_id) = f.new.as_ref().map_or((Vec::new(), NULL_OID.to_string()), Side::shown);
         match (&f.old, &f.new) {
-            (None, Some(n)) => w(out, &format!("new file mode {}\nindex {NULL_OID}..{}\n", Mode::of(n.exec).git(), git_oid(new))),
-            (Some(o), None) => w(out, &format!("deleted file mode {}\nindex {}..{NULL_OID}\n", Mode::of(o.exec).git(), git_oid(old))),
+            (None, Some(n)) => w(out, &format!("new file mode {}\nindex {NULL_OID}..{new_id}\n", n.mode.git())),
+            (Some(o), None) => w(out, &format!("deleted file mode {}\nindex {old_id}..{NULL_OID}\n", o.mode.git())),
             (Some(o), Some(n)) => {
-                if o.exec != n.exec {
-                    w(out, &format!("old mode {}\nnew mode {}\n", Mode::of(o.exec).git(), Mode::of(n.exec).git()));
+                if o.mode != n.mode {
+                    w(out, &format!("old mode {}\nnew mode {}\n", o.mode.git(), n.mode.git()));
                 }
-                if old != new {
-                    let mode = if o.exec == n.exec { format!(" {}", Mode::of(n.exec).git()) } else { String::new() };
-                    w(out, &format!("index {}..{}{mode}\n", git_oid(old), git_oid(new)));
+                if let Some(r) = &f.from {
+                    let verb = if r.copy { "copy" } else { "rename" };
+                    w(
+                        out,
+                        &format!(
+                            "similarity index {}%\n{verb} from {}\n{verb} to {}\n",
+                            r.score,
+                            quote("", &r.from),
+                            quote("", &f.path)
+                        ),
+                    );
+                }
+                if old_id != new_id {
+                    let mode = if o.mode == n.mode { format!(" {}", n.mode.git()) } else { String::new() };
+                    w(out, &format!("index {old_id}..{new_id}{mode}\n"));
                 }
             }
             (None, None) => {}
         }
         let mut st = Stat {
-            name: quote("", &f.path),
+            name: match &f.from {
+                Some(r) => rename_name(&r.from, &f.path),
+                None => quote("", &f.path),
+            },
             ins: 0,
             del: 0,
             binary: None,
@@ -2998,14 +3912,28 @@ mod writer {
             if f.old.is_some() { a.clone() } else { "/dev/null".into() },
             if f.new.is_some() { b.clone() } else { "/dev/null".into() },
         );
-        if is_binary(old) || is_binary(new) {
-            w(out, &format!("Binary files {an} and {bn} differ\n"));
+        let files = [&f.old, &f.new].into_iter().flatten().all(|s| s.mode.kind() == EntryKind::File);
+        if files && (is_binary(&old) || is_binary(&new)) {
             st.binary = Some((old.len(), new.len()));
+            if binary && ![&f.old, &f.new].into_iter().flatten().any(|s| s.sealed) {
+                w(out, "GIT binary patch\n");
+                binary_block(out, &old, &new);
+                binary_block(out, &new, &old);
+            } else {
+                w(out, &format!("Binary files {an} and {bn} differ\n"));
+            }
             return st;
         }
         w(out, &format!("--- {an}\n+++ {bn}\n"));
-        for h in hunks(old, new) {
-            w(out, &format!("@@ -{} +{} @@\n", range(h.old), range(h.new)));
+        let old_lines: Vec<&[u8]> = old.split_inclusive(|b| *b == b'\n').collect();
+        for h in hunks(&old, &new) {
+            out.extend_from_slice(format!("@@ -{} +{} @@", range(h.old), range(h.new)).as_bytes());
+            let first = if h.old.1 == 0 { h.old.0 } else { h.old.0 - 1 };
+            if let Some(f) = function_line(&old_lines, first) {
+                out.push(b' ');
+                out.extend_from_slice(f);
+            }
+            out.push(b'\n');
             for (prefix, text) in h.lines {
                 match prefix {
                     b'+' => st.ins += 1,
@@ -3034,13 +3962,15 @@ mod writer {
             return s;
         }
         let name_w = stats.iter().map(|x| x.name.chars().count()).max().unwrap_or(0);
-        let max = stats.iter().map(|x| x.ins + x.del).max().unwrap_or(0);
-        let count_w = max.to_string().len();
+        let max = stats.iter().filter(|x| x.binary.is_none()).map(|x| x.ins + x.del).max().unwrap_or(0);
+        // Counts are aligned with "Bin" when there is a binary file.
+        let bin_w = if stats.iter().any(|x| x.binary.is_some()) { 3 } else { 0 };
+        let count_w = max.to_string().len().max(bin_w);
         let room = 72usize.saturating_sub(name_w + count_w + 5).max(10);
         for x in stats {
             let pad = " ".repeat(name_w - x.name.chars().count());
             match x.binary {
-                Some((a, b)) => s.push_str(&format!(" {}{pad} | Bin {a} -> {b} bytes\n", x.name)),
+                Some((a, b)) => s.push_str(&format!(" {}{pad} | {:>count_w$} {a} -> {b} bytes\n", x.name, "Bin")),
                 None => {
                     let total = x.ins + x.del;
                     let (i, d) = if max > room && total > 0 {
@@ -3063,17 +3993,25 @@ mod writer {
         if del > 0 {
             s.push_str(&format!(", {}", plural(del, "deletion(-)", "deletions(-)")));
         }
+        if ins == 0 && del == 0 {
+            s.push_str(", 0 insertions(+), 0 deletions(-)");
+        }
         s.push('\n');
         for f in files {
             match (&f.old, &f.new) {
-                (None, Some(n)) => s.push_str(&format!(" create mode {} {}\n", Mode::of(n.exec).git(), quote("", &f.path))),
-                (Some(o), None) => s.push_str(&format!(" delete mode {} {}\n", Mode::of(o.exec).git(), quote("", &f.path))),
-                (Some(o), Some(n)) if o.exec != n.exec => s.push_str(&format!(
-                    " mode change {} => {} {}\n",
-                    Mode::of(o.exec).git(),
-                    Mode::of(n.exec).git(),
-                    quote("", &f.path)
-                )),
+                (None, Some(n)) => s.push_str(&format!(" create mode {} {}\n", n.mode.git(), quote("", &f.path))),
+                (Some(o), None) => s.push_str(&format!(" delete mode {} {}\n", o.mode.git(), quote("", &f.path))),
+                (Some(o), Some(n)) => {
+                    if let Some(r) = &f.from {
+                        let verb = if r.copy { "copy" } else { "rename" };
+                        s.push_str(&format!(" {verb} {} ({}%)\n", rename_name(&r.from, &f.path), r.score));
+                        if o.mode != n.mode {
+                            s.push_str(&format!(" mode change {} => {}\n", o.mode.git(), n.mode.git()));
+                        }
+                    } else if o.mode != n.mode {
+                        s.push_str(&format!(" mode change {} => {} {}\n", o.mode.git(), n.mode.git(), quote("", &f.path)));
+                    }
+                }
                 _ => {}
             }
         }
@@ -3106,11 +4044,11 @@ mod writer {
 
     /// Returns whether the body had lines that look like patch syntax
     /// (indented, see [`escape_body`]).
-    fn render(out: &mut Vec<u8>, h: &Header, files: &[FileDiff], (n, total): (usize, usize), signature: &str) -> bool {
+    fn render(out: &mut Vec<u8>, h: &Header, files: &[FileDiff], (n, total): (usize, usize), opts: &ExportOptions) -> bool {
         let subject = subject_of(&h.description);
         let (body, escaped) = escape_body(&body_of(&h.description));
         let mut diff = Vec::new();
-        let stats: Vec<Stat> = files.iter().map(|f| section(&mut diff, f)).collect();
+        let stats: Vec<Stat> = files.iter().map(|f| section(&mut diff, f, opts.binary)).collect();
         let mime = !body.is_ascii() || !subject.is_ascii() || !h.author.is_ascii() || !diff.is_ascii();
         let subject_line = format!("{} {}", prefix(n, total), header_text(&subject));
         mail_headers(out, h.commit.as_deref(), &h.author, h.timestamp, subject_line.trim_end(), mime, h.audience.as_deref());
@@ -3122,7 +4060,7 @@ mod writer {
         out.extend_from_slice(diffstat(&stats, files).as_bytes());
         out.push(b'\n');
         out.extend_from_slice(&diff);
-        out.extend_from_slice(format!("-- \n{signature}\n\n").as_bytes());
+        out.extend_from_slice(format!("-- \n{}\n\n", opts.signature).as_bytes());
         escaped
     }
 
@@ -3151,7 +4089,7 @@ mod writer {
             body.push('\n');
         }
         let mut sink = Vec::new();
-        let stats: Vec<Stat> = range.iter().map(|f| section(&mut sink, f)).collect();
+        let stats: Vec<Stat> = range.iter().map(|f| section(&mut sink, f, false)).collect();
         body.push_str(&diffstat(&stats, range));
         let mut text = Vec::new();
         let me = repo.user().to_string();
@@ -3466,13 +4404,51 @@ index 1234567..89abcde 100644
     }
 
     #[test]
-    fn symlinks_and_submodules_are_refused_for_now() {
-        let e = err(&wrap("diff --git a/link b/link\nnew file mode 120000\nindex 0000000..1111111\n--- /dev/null\n+++ b/link\n@@ -0,0 +1 @@\n+/home/u/.ssh\n\\ No newline at end of file\n"));
-        assert!(e.contains("symlinks"), "{e}");
-        let e = err(&wrap("diff --git a/sub b/sub\nnew file mode 160000\nindex 0000000..1111111\n--- /dev/null\n+++ b/sub\n@@ -0,0 +1 @@\n+Subproject commit 1111111111111111111111111111111111111111\n"));
-        assert!(e.contains("submodules"), "{e}");
+    fn symlinks_submodules_and_type_changes_parse() {
+        let s = parse_str(&wrap("diff --git a/link b/link\nnew file mode 120000\nindex 0000000..1111111\n--- /dev/null\n+++ b/link\n@@ -0,0 +1 @@\n+/home/u/.ssh\n\\ No newline at end of file\n")).unwrap();
+        assert_eq!(s.patches[0].files[0].new_mode, Some(Mode::Symlink));
+        let s = parse_str(&wrap("diff --git a/sub b/sub\nnew file mode 160000\nindex 0000000..1111111\n--- /dev/null\n+++ b/sub\n@@ -0,0 +1 @@\n+Subproject commit 1111111111111111111111111111111111111111\n")).unwrap();
+        assert_eq!(s.patches[0].files[0].new_mode, Some(Mode::Gitlink));
+        // A type change is a deletion and a creation of one path, as Git
+        // writes it; anything else twice is malformed.
+        let tc = "diff --git a/l b/l\ndeleted file mode 120000\n--- a/l\n+++ /dev/null\n@@ -1 +0,0 @@\n-t\n\\ No newline at end of file\n\
+                  diff --git a/l b/l\nnew file mode 100644\n--- /dev/null\n+++ b/l\n@@ -0,0 +1 @@\n+now a file\n";
+        let s = parse_str(&wrap(tc)).unwrap();
+        assert_eq!(s.patches[0].files.len(), 2);
+        let same_kind = tc.replace("new file mode 100644", "new file mode 120000");
+        assert!(err(&wrap(&same_kind)).contains("two sections"));
+        let reversed = "diff --git a/l b/l\nnew file mode 100644\n--- /dev/null\n+++ b/l\n@@ -0,0 +1 @@\n+x\n\
+                        diff --git a/l b/l\ndeleted file mode 120000\n--- a/l\n+++ /dev/null\n@@ -1 +0,0 @@\n-t\n";
+        assert!(err(&wrap(reversed)).contains("two sections"));
+        // A mode change never changes the type.
         let e = err(&wrap("diff --git a/.veilpolicy b/.veilpolicy\nold mode 100644\nnew mode 120000\n"));
-        assert!(e.contains("symlinks"), "{e}");
+        assert!(e.contains("type"), "{e}");
+        // Binary data for a link is malformed.
+        let e = err(&wrap("diff --git a/l b/l\nnew file mode 120000\nGIT binary patch\nliteral 0\nHcmV?d00001\n\n"));
+        assert!(e.contains("binary data for a symlink"), "{e}");
+    }
+
+    #[test]
+    fn binary_blocks_are_checked_line_by_line_and_bounded() {
+        let ok = wrap("diff --git a/b.bin b/b.bin\nindex 0000000000000000000000000000000000000000..1111111111111111111111111111111111111111 100644\nGIT binary patch\nliteral 6\nNcmZQzWJ=1+0{{Yf0X+Z!\n\nliteral 0\nHcmV?d00001\n\n");
+        let s = parse_str(&ok).unwrap();
+        let bp = s.patches[0].files[0].binary_patch.clone().unwrap();
+        assert_eq!(bp.forward.kind, BinaryKind::Literal);
+        assert_eq!(s.binary_data(&bp.forward).unwrap(), b"\x00\x01\x02bin");
+        assert!(bp.reverse.is_some());
+        // A line whose length character disagrees with its digits.
+        assert!(err(&ok.replace("NcmZQzWJ=1+0{{Yf0X+Z!", "NcmZQzWJ=1+0{{Yf0X+Z")).contains("base85"));
+        // The declared sizes of the whole series are bounded.
+        let small = Limits {
+            max_inflated: 10,
+            ..lim()
+        };
+        let two = format!("{ok}{ok}");
+        assert!(parse(two.into_bytes(), &small).unwrap_err().to_string().contains("more than 10 bytes in all"));
+        // A declared size that is not the data's.
+        let s = parse_str(&ok.replace("literal 6", "literal 7")).unwrap();
+        let bp = s.patches[0].files[0].binary_patch.clone().unwrap();
+        assert!(s.binary_data(&bp.forward).unwrap_err().to_string().contains("not the 7"));
     }
 
     #[test]
@@ -3632,12 +4608,13 @@ index 1234567..89abcde 100644
             }
             let f = FileDiff {
                 path: VPath::new("dir/f.txt").unwrap(),
-                old: (kind != 1).then(|| Side { data: old.clone(), exec: old_x }),
-                new: (kind != 2).then(|| Side { data: new.clone(), exec: new_x }),
+                old: (kind != 1).then(|| Side::file(old.clone(), old_x)),
+                new: (kind != 2).then(|| Side::file(new.clone(), new_x)),
+                from: None,
             };
             prop_assume!(kind != 0 || old != new || old_x != new_x);
             let mut diff = Vec::new();
-            section(&mut diff, &f);
+            section(&mut diff, &f, false);
             let mail = wrap(&String::from_utf8(diff).unwrap());
             let s = parse(mail.into_bytes(), &lim()).unwrap();
             let fp = &s.patches[0].files[0];
@@ -3673,6 +4650,147 @@ index 1234567..89abcde 100644
         assert!(s.patches[0].body.contains(" diff --git a/evil b/evil"));
         let (first, _) = super::writer::escape_body("From: forged <f@x>\nok");
         assert!(first.starts_with(' '));
+    }
+
+    /// A one-section mail holding the writer's section for `old` → `new`.
+    #[cfg(feature = "git")]
+    fn binary_mail(old: Option<&[u8]>, new: &[u8]) -> String {
+        use super::writer::{section, FileDiff, Side};
+        let f = FileDiff {
+            path: VPath::new("b.bin").unwrap(),
+            old: old.map(|o| Side::file(o.to_vec(), false)),
+            new: Some(Side::file(new.to_vec(), false)),
+            from: None,
+        };
+        let mut diff = Vec::new();
+        section(&mut diff, &f, true);
+        wrap(&String::from_utf8(diff).unwrap())
+    }
+
+    #[cfg(feature = "git")]
+    fn apply_one(s: &Series, old: &[u8], lim: &Limits) -> Result<Vec<u8>> {
+        let f = &s.patches[0].files[0];
+        let bp = f.binary_patch.as_ref().expect("a binary patch");
+        let mut st = State { work: 0, inflated: 0, preimages: None };
+        apply_binary(s, f, bp, old, lim, &mut st)?.map_err(VeilError::Repo)
+    }
+
+    /// Point 12: a zlib stream that inflates far beyond what it declares
+    /// (64 MiB of zeros in about 64 KB, declared as 1 MiB) is cut off at
+    /// the declared size: refused quickly, never inflated in full.
+    #[cfg(feature = "git")]
+    #[test]
+    fn a_zlib_bomb_stops_at_its_declared_size() {
+        let mut lines = Vec::new();
+        binary::encode_lines(&binary::deflate(&vec![0u8; 64 << 20]), &mut lines);
+        let lines = String::from_utf8(lines).unwrap();
+        let mail = wrap(&format!(
+            "diff --git a/z b/z\nnew file mode 100644\nindex 0000000000000000000000000000000000000000..1111111111111111111111111111111111111111\nGIT binary patch\nliteral {}\n{lines}\nliteral 0\nHcmV?d00001\n\n",
+            1 << 20
+        ));
+        assert!(mail.len() < 200_000, "{}", mail.len());
+        let s = parse(mail.into_bytes(), &Limits::default()).unwrap();
+        let t = std::time::Instant::now();
+        let e = apply_one(&s, b"", &Limits::default()).unwrap_err().to_string();
+        assert!(e.contains("more than the 1048576 bytes it declares"), "{e}");
+        assert!(t.elapsed() < std::time::Duration::from_secs(2), "{:?}", t.elapsed());
+        // A delta whose result is declared larger than VEIL_MAX_OBJECT is
+        // refused before anything is allocated for it.
+        let small = Limits { max_file_size: 1 << 16, ..lim() };
+        let delta = [5u8, 0xff, 0xff, 0xff, 0x7f, 5, b'h', b'e', b'l', b'l', b'o'];
+        let mut lines = Vec::new();
+        binary::encode_lines(&binary::deflate(&delta), &mut lines);
+        let mail = wrap(&format!(
+            "diff --git a/z b/z\nindex {}..1111111111111111111111111111111111111111 100644\nGIT binary patch\ndelta {}\n{}\n",
+            git_blob_id(b"hello"),
+            delta.len(),
+            String::from_utf8(lines).unwrap()
+        ));
+        let s = parse(mail.into_bytes(), &small).unwrap();
+        let e = apply_one(&s, b"hello", &small).unwrap_err().to_string();
+        assert!(e.contains("more than 65536 (VEIL_MAX_OBJECT)"), "{e}");
+    }
+
+    #[cfg(feature = "git")]
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// What the writer emits as `GIT binary patch` (a literal or a
+        /// delta, whichever is smaller) parses and applies back exactly.
+        #[test]
+        fn binary_sections_round_trip(
+            old in proptest::collection::vec(any::<u8>(), 0..3000),
+            edits in proptest::collection::vec((any::<proptest::sample::Index>(), any::<u8>()), 0..8),
+            fresh in any::<bool>(),
+        ) {
+            let mut new = old.clone();
+            for (at, b) in edits {
+                if !new.is_empty() {
+                    let i = at.index(new.len());
+                    new[i] = b;
+                }
+            }
+            new.push(0); // binary for sure
+            let old_side = (!fresh).then_some(old.as_slice());
+            prop_assume!(old_side != Some(new.as_slice()));
+            let mail = binary_mail(old_side, &new);
+            let s = parse(mail.into_bytes(), &lim()).unwrap();
+            let base = if fresh { &[][..] } else { &old[..] };
+            prop_assert_eq!(apply_one(&s, base, &lim()).unwrap(), new);
+        }
+
+        /// The binary decoder on hostile input: arbitrary base85 lines,
+        /// zlib streams and deltas never panic, never produce more than the
+        /// declared or allowed size, and a mutated valid section either
+        /// fails cleanly or makes exactly what it declares.
+        #[test]
+        fn fuzz_the_binary_decoder(
+            digits in proptest::collection::vec(proptest::sample::select(b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~".to_vec()), 0..300),
+            len_char in proptest::sample::select(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz".to_vec()),
+            size in 0usize..5000,
+            delta in proptest::collection::vec(any::<u8>(), 0..200),
+            base in proptest::collection::vec(any::<u8>(), 0..300),
+            edits in proptest::collection::vec((any::<proptest::sample::Index>(), 0u8..3, any::<u8>()), 1..10),
+        ) {
+            // Raw lines and streams.
+            let mut line = vec![len_char];
+            line.extend_from_slice(&digits);
+            line.push(b'\n');
+            if let Ok(bytes) = binary::decode_lines(&line) {
+                if let Ok(out) = binary::inflate(&bytes, size) {
+                    prop_assert_eq!(out.len(), size);
+                }
+            }
+            if let Ok(out) = binary::inflate(&delta, size) {
+                prop_assert_eq!(out.len(), size);
+            }
+            if let Ok(out) = binary::apply_delta(&base, &delta, 4096) {
+                prop_assert!(out.len() <= 4096);
+            }
+            // A valid section, mutated.
+            let mut data = binary_mail(Some(&base), &[&base[..], b"\x00more"].concat()).into_bytes();
+            let start = data.windows(16).position(|w| w == b"GIT binary patch").unwrap();
+            for (at, op, b) in edits {
+                let i = start + at.index(data.len() - start);
+                match op {
+                    0 => data[i] = b,
+                    1 => data.insert(i, b),
+                    _ => { data.remove(i); }
+                }
+            }
+            if let Ok(s) = parse(data, &lim()) {
+                for f in s.patches.iter().flat_map(|p| &p.files) {
+                    if let Some(bp) = &f.binary_patch {
+                        for b in std::iter::once(&bp.forward).chain(&bp.reverse) {
+                            if let Ok(out) = s.binary_data(b) {
+                                prop_assert_eq!(out.len(), b.size);
+                            }
+                        }
+                        let _ = apply_one(&s, &base, &lim());
+                    }
+                }
+            }
+        }
     }
 
     proptest! {
