@@ -8,7 +8,7 @@
 //! | Crypto | [`crypto`], [`identity`], [`keychain`] | XChaCha20-Poly1305 envelopes, X25519 identity rings, scope keys |
 //! | CAS | [`id`], [`object`], [`store`], [`pack`], [`gc`] | BLAKE3 content-addressed objects, sealed (encrypted) nodes, packfiles, garbage collection |
 //! | Policy | [`policy`], [`secrets`] | per-path visibility tiers, engine-level secret detection |
-//! | Trees | [`tree`], [`builder`], [`checkout`], [`merge`] | tree views, snapshotting, materialisation, 3-way merge |
+//! | Trees | [`tree`], [`builder`], [`checkout`], [`merge`], [`statcache`] | tree views, snapshotting, materialisation, 3-way merge, stat cache |
 //! | Graph | [`oplog`], [`repo`], [`transaction`], [`revset`] | snapshot DAG, change ids, operation log, undo |
 //! | Features | [`workspace`], [`commands`], [`embargo`], [`remote`], [`vault`] | workspaces, cloaking, embargoes, sync, secrets vault |
 //!
@@ -55,6 +55,7 @@ pub mod remote;
 pub mod repo;
 pub mod revset;
 pub mod secrets;
+pub mod statcache;
 pub mod store;
 pub mod transaction;
 pub mod tree;

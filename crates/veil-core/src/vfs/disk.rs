@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::{DirEntry, Metadata, NodeKind, StorageBackend};
+use super::{DirEntry, Metadata, NodeKind, StatClock, StorageBackend};
 use crate::{
     error::{Result, VeilError},
     vpath::VPath,
@@ -128,6 +128,24 @@ fn create_dir_all_durable(dir: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `(mtime, ctime, inode)` change-detection stamps, nanoseconds since the epoch.
+#[cfg(unix)]
+fn stamps(m: &fs::Metadata) -> (Option<i64>, Option<i64>, Option<u64>) {
+    use std::os::unix::fs::MetadataExt;
+    let ns = |s: i64, n: i64| s.checked_mul(1_000_000_000).and_then(|v| v.checked_add(n));
+    (ns(m.mtime(), m.mtime_nsec()), ns(m.ctime(), m.ctime_nsec()), Some(m.ino()))
+}
+
+#[cfg(not(unix))]
+fn stamps(m: &fs::Metadata) -> (Option<i64>, Option<i64>, Option<u64>) {
+    let mtime = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| i64::try_from(d.as_nanos()).ok());
+    (mtime, None, None)
 }
 
 impl StorageBackend for DiskBackend {
@@ -254,20 +272,32 @@ impl StorageBackend for DiskBackend {
     fn metadata(&self, path: &VPath) -> Result<Option<Metadata>> {
         let full = self.full_path(path);
         match fs::symlink_metadata(&full) {
-            Ok(m) if m.is_dir() => Ok(Some(Metadata {
-                kind: NodeKind::Dir,
-                len: 0,
-                executable: false,
-            })),
-            Ok(m) if m.is_file() => Ok(Some(Metadata {
-                kind: NodeKind::File,
-                len: m.len(),
-                executable: is_exec(&m),
-            })),
+            Ok(m) if m.is_dir() => Ok(Some(Metadata::unstamped(NodeKind::Dir, 0, false))),
+            Ok(m) if m.is_file() => {
+                let (mtime, ctime, inode) = stamps(&m);
+                Ok(Some(Metadata {
+                    kind: NodeKind::File,
+                    len: m.len(),
+                    executable: is_exec(&m),
+                    mtime,
+                    ctime,
+                    inode,
+                }))
+            }
             Ok(_) => Ok(None),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(io_err(&full, e)),
         }
+    }
+
+    fn stat_clock(&self) -> Option<StatClock> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some(StatClock {
+            now: i64::try_from(now.as_nanos()).ok()?,
+            exact: false,
+        })
     }
 
     #[allow(unused_variables)]

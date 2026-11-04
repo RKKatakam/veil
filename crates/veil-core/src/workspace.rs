@@ -9,8 +9,8 @@
 use std::sync::Arc;
 
 use crate::{
-    builder::{build_tree, BuildOptions, BuildReport},
-    checkout::{checkout, CheckoutReport},
+    builder::{build_tree, build_tree_cached, BuildOptions, BuildReport},
+    checkout::{checkout_cached, CheckoutReport},
     error::{Result, VeilError},
     id::{ChangeId, ObjectId},
     now_millis,
@@ -18,6 +18,7 @@ use crate::{
     oplog::WorkspaceState,
     policy::Policy,
     repo::Repo,
+    statcache::StatCache,
     tree::{lookup, TreeView},
     vfs::{OverlayBackend, StorageBackend},
     vpath::VPath,
@@ -82,12 +83,23 @@ impl Repo {
     /// workspace `ws` (amending it in place, Jujutsu-style). This is the
     /// "automatic micro-snapshot": there is no index and no `add`.
     pub fn snapshot_workspace(&mut self, ws: &str, fs: &dyn StorageBackend) -> Result<WcSnapshot> {
+        self.snapshot_workspace_cached(ws, fs, None)
+    }
+
+    /// [`Repo::snapshot_workspace`] using (and updating) `cache`, the stat
+    /// cache of the working copy `fs`. Unchanged files are not re-read.
+    pub fn snapshot_workspace_cached(
+        &mut self,
+        ws: &str,
+        fs: &dyn StorageBackend,
+        cache: Option<&mut StatCache>,
+    ) -> Result<WcSnapshot> {
         let mut tx = self.transaction(format!("snapshot working copy of '{ws}'"))?;
         let wc_id = tx.view.workspace(ws)?.wc;
         let wc = tx.repo().snapshot(&wc_id)?;
         let policy = Policy::load(fs)?;
         let store = tx.repo().store.clone();
-        let (tree, report) = build_tree(
+        let (tree, report) = build_tree_cached(
             &store,
             fs,
             &BuildOptions {
@@ -95,6 +107,7 @@ impl Repo {
                 parent_tree: Some(wc.tree),
                 cloak: wc.cloak.as_deref(),
             },
+            cache,
         )?;
         if tree == wc.tree {
             return Ok(WcSnapshot {
@@ -126,13 +139,36 @@ impl Repo {
     /// Build a tree from `fs` relative to `parent_tree` without recording
     /// anything (dry run / change detection).
     pub fn build_from(&self, fs: &dyn StorageBackend, parent_tree: Option<ObjectId>, cloak: Option<&str>) -> Result<(ObjectId, BuildReport)> {
+        self.build_from_cached(fs, parent_tree, cloak, None)
+    }
+
+    /// [`Repo::build_from`] using (and updating) the stat cache of `fs`.
+    pub fn build_from_cached(
+        &self,
+        fs: &dyn StorageBackend,
+        parent_tree: Option<ObjectId>,
+        cloak: Option<&str>,
+        cache: Option<&mut StatCache>,
+    ) -> Result<(ObjectId, BuildReport)> {
         let policy = Policy::load(fs)?;
-        build_tree(&self.store, fs, &BuildOptions { policy: &policy, parent_tree, cloak })
+        build_tree_cached(&self.store, fs, &BuildOptions { policy: &policy, parent_tree, cloak }, cache)
     }
 
     /// Materialise the difference between two trees onto `fs`.
     pub fn checkout_tree(&self, fs: &dyn StorageBackend, from: Option<&ObjectId>, to: &ObjectId) -> Result<CheckoutReport> {
-        checkout(&self.store, fs, from, to)
+        self.checkout_tree_cached(fs, from, to, None)
+    }
+
+    /// [`Repo::checkout_tree`] that keeps the stat cache of `fs` consistent
+    /// (every written or removed path is invalidated).
+    pub fn checkout_tree_cached(
+        &self,
+        fs: &dyn StorageBackend,
+        from: Option<&ObjectId>,
+        to: &ObjectId,
+        cache: Option<&mut StatCache>,
+    ) -> Result<CheckoutReport> {
+        checkout_cached(&self.store, fs, from, to, cache)
     }
 
     /// A read-only VFS view of a snapshot's tree.

@@ -1,9 +1,12 @@
 use std::{
     collections::BTreeMap,
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
 };
 
-use super::{DirEntry, Metadata, NodeKind, StorageBackend};
+use super::{DirEntry, Metadata, NodeKind, StatClock, StorageBackend};
 use crate::{
     error::{Result, VeilError},
     vpath::VPath,
@@ -11,16 +14,22 @@ use crate::{
 
 #[derive(Debug, Clone)]
 enum Node {
-    File { data: Arc<Vec<u8>>, executable: bool },
+    /// `stamp` is the write generation that last touched the file.
+    File { data: Arc<Vec<u8>>, executable: bool, stamp: u64 },
     Dir,
 }
 
 /// A pure in-memory file tree. Cloning file contents is avoided by sharing
 /// `Arc` buffers; [`MemoryBackend::fork`] produces an independent copy in
 /// O(n) pointer copies.
+///
+/// Every file write takes a fresh value from a monotonic generation counter
+/// and reports it as `Metadata::mtime`, so stat caches work in memory with
+/// no racy window.
 #[derive(Debug, Default)]
 pub struct MemoryBackend {
     nodes: RwLock<BTreeMap<VPath, Node>>,
+    generation: AtomicU64,
 }
 
 impl MemoryBackend {
@@ -41,7 +50,13 @@ impl MemoryBackend {
     pub fn fork(&self) -> Self {
         MemoryBackend {
             nodes: RwLock::new(self.nodes.read().unwrap().clone()),
+            generation: AtomicU64::new(self.generation.load(Ordering::SeqCst)),
         }
+    }
+
+    /// A new, strictly larger write generation.
+    fn next_stamp(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     /// All file paths currently stored.
@@ -136,6 +151,7 @@ impl StorageBackend for MemoryBackend {
             Node::File {
                 data: Arc::new(data.to_vec()),
                 executable,
+                stamp: self.next_stamp(),
             },
         );
         Ok(())
@@ -152,6 +168,7 @@ impl StorageBackend for MemoryBackend {
             Node::File {
                 data: Arc::new(data.to_vec()),
                 executable: false,
+                stamp: self.next_stamp(),
             },
         );
         Ok(true)
@@ -221,30 +238,39 @@ impl StorageBackend for MemoryBackend {
 
     fn metadata(&self, path: &VPath) -> Result<Option<Metadata>> {
         if path.is_root() {
-            return Ok(Some(Metadata {
-                kind: NodeKind::Dir,
-                len: 0,
-                executable: false,
-            }));
+            return Ok(Some(Metadata::unstamped(NodeKind::Dir, 0, false)));
         }
         Ok(self.nodes.read().unwrap().get(path).map(|n| match n {
-            Node::File { data, executable } => Metadata {
+            Node::File {
+                data,
+                executable,
+                stamp,
+            } => Metadata {
                 kind: NodeKind::File,
                 len: data.len() as u64,
                 executable: *executable,
+                mtime: i64::try_from(*stamp).ok(),
+                ctime: None,
+                inode: None,
             },
-            Node::Dir => Metadata {
-                kind: NodeKind::Dir,
-                len: 0,
-                executable: false,
-            },
+            Node::Dir => Metadata::unstamped(NodeKind::Dir, 0, false),
         }))
+    }
+
+    fn stat_clock(&self) -> Option<StatClock> {
+        Some(StatClock {
+            now: i64::try_from(self.generation.load(Ordering::SeqCst)).ok()?,
+            exact: true,
+        })
     }
 
     fn set_executable(&self, path: &VPath, exec: bool) -> Result<()> {
         match self.nodes.write().unwrap().get_mut(path) {
-            Some(Node::File { executable, .. }) => {
-                *executable = exec;
+            Some(Node::File { executable, stamp, .. }) => {
+                if *executable != exec {
+                    *executable = exec;
+                    *stamp = self.next_stamp();
+                }
                 Ok(())
             }
             Some(Node::Dir) => Err(VeilError::InvalidPath(format!("{path} is a directory"))),

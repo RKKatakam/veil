@@ -7,10 +7,16 @@
 //!   back to the caller and **never** written to the CAS;
 //! * `cloaked` paths, and every file of a cloaked line of work, are sealed
 //!   under their scope key;
-//! * public files are secret-scanned and quarantined on a hit;
+//! * public files are secret-scanned and quarantined on a hit. A quarantined
+//!   file that was already tracked keeps its previous (safe) entry, so the
+//!   local edit is held back instead of being recorded as a deletion;
 //! * embargoed entries stay embargoed until released;
 //! * entries this reader cannot see (no key, or stripped by a public remote)
 //!   are carried over untouched instead of being treated as deletions.
+//!
+//! With a [`StatCache`] the builder skips reading files whose stat data is
+//! unchanged, using content facts recorded on an earlier run. Classification
+//! still runs for every path, every time.
 
 use std::collections::HashSet;
 
@@ -20,8 +26,9 @@ use crate::{
     object::{EntryKind, Object, Tree, TreeEntry, Visibility},
     policy::{Policy, Tier, POLICY_FILE},
     secrets::{self, Finding},
+    statcache::{CacheKey, CacheRun, StatCache},
     store::ObjectStore,
-    vfs::{NodeKind, StorageBackend},
+    vfs::{Metadata, NodeKind, StorageBackend},
     vpath::VPath,
 };
 
@@ -39,6 +46,9 @@ pub struct BuildReport {
     pub isolated: Vec<VPath>,
     /// Public files that contained secrets and were held back.
     pub quarantined: Vec<(VPath, Vec<Finding>)>,
+    /// The subset of `quarantined` that was already tracked: the tree keeps
+    /// the previous (safe) version, and the local edit stays unrecorded.
+    pub quarantine_kept: Vec<VPath>,
     /// Built-in secrets a policy rule tried (and failed) to make public.
     pub blocked_exposures: Vec<VPath>,
     /// Files that should have been cloaked but no key was available.
@@ -47,6 +57,10 @@ pub struct BuildReport {
     pub carried: Vec<VPath>,
     pub ignored: usize,
     pub files: usize,
+    /// Files whose content was read (and hashed) during this build.
+    pub hashed: usize,
+    /// Files whose entry came from the stat cache without reading them.
+    pub cache_hits: usize,
     pub policy_warnings: Vec<String>,
 }
 
@@ -67,11 +81,29 @@ struct Builder<'a> {
     fs: &'a dyn StorageBackend,
     opts: &'a BuildOptions<'a>,
     use_hints: bool,
+    /// `.veilpolicy` differs from the parent's: content that is unchanged
+    /// since the parent must still be re-scanned, because the parent may
+    /// have been built under rules (e.g. `public!`) that no longer apply.
+    policy_changed: bool,
+    cache: Option<CacheRun>,
     report: BuildReport,
 }
 
 /// Build a tree from `fs`, returning its id and a report.
 pub fn build_tree(store: &ObjectStore, fs: &dyn StorageBackend, opts: &BuildOptions) -> Result<(ObjectId, BuildReport)> {
+    build_tree_cached(store, fs, opts, None)
+}
+
+/// [`build_tree`] with a stat cache for `fs`. The cache is consulted and
+/// updated in place (it is only used if `fs` has a [`StatClock`]).
+///
+/// [`StatClock`]: crate::vfs::StatClock
+pub fn build_tree_cached(
+    store: &ObjectStore,
+    fs: &dyn StorageBackend,
+    opts: &BuildOptions,
+    cache: Option<&mut StatCache>,
+) -> Result<(ObjectId, BuildReport)> {
     let parent = opts.parent_tree.map(|t| store.tree(&t)).transpose()?;
     // Hints (reuse of unchanged subtrees by id) are only valid if the policy
     // is unchanged, otherwise reclassification could be skipped.
@@ -82,25 +114,47 @@ pub fn build_tree(store: &ObjectStore, fs: &dyn StorageBackend, opts: &BuildOpti
         (None, None) => !fs.exists(&policy_path)?,
         _ => false,
     };
+    let policy_changed = !use_hints
+        && match (fs.read_opt(&policy_path)?, parent_policy) {
+            (Some(now), Some(p)) => !store.matches_encoding(&p, &now)?,
+            (None, None) => false,
+            _ => true,
+        };
+    // The cache only works on backends whose stamps can be trusted. The
+    // clock is read before any file is stat'ed (see `statcache`).
+    let mut cache = cache;
+    let run = match (cache.as_deref_mut(), fs.stat_clock()) {
+        (Some(c), Some(clock)) => Some(c.begin_run(CacheKey::compute(fs, &store.keys, clock)?, clock)),
+        _ => None,
+    };
     let mut b = Builder {
         store,
         fs,
         opts,
         use_hints,
+        policy_changed,
+        cache: run,
         report: BuildReport {
             policy_warnings: opts.policy.warnings.clone(),
             ..Default::default()
         },
     };
-    let id = match b.build_dir(&VPath::root(), parent.as_deref())? {
+    let root_parent = parent.as_deref().zip(opts.parent_tree);
+    let id = match b.build_dir(&VPath::root(), root_parent)? {
         Some(id) => id,
         None => store.empty_tree()?,
     };
+    if let (Some(c), Some(run)) = (cache, b.cache.take()) {
+        c.end_run(run);
+    }
     Ok((id, b.report))
 }
 
 impl Builder<'_> {
-    fn build_dir(&mut self, dir: &VPath, parent: Option<&Tree>) -> Result<Option<ObjectId>> {
+    /// `parent` is the parent's tree for `dir` and its id.
+    fn build_dir(&mut self, dir: &VPath, parent: Option<(&Tree, ObjectId)>) -> Result<Option<ObjectId>> {
+        let parent_id = parent.map(|(_, id)| id);
+        let parent = parent.map(|(t, _)| t);
         let mut out = Tree::default();
         let mut seen = HashSet::new();
         for child in self.fs.list_dir(dir)? {
@@ -124,10 +178,10 @@ impl Builder<'_> {
                         }
                     }
                     let sub = match parent_entry.filter(|e| e.kind == EntryKind::Dir) {
-                        Some(e) => Some(self.store.tree(&e.id)?),
+                        Some(e) => Some((self.store.tree(&e.id)?, e.id)),
                         None => None,
                     };
-                    if let Some(id) = self.build_dir(&path, sub.as_deref())? {
+                    if let Some(id) = self.build_dir(&path, sub.as_ref().map(|(t, id)| (&**t, *id)))? {
                         out.insert(TreeEntry::dir(&child.name, id));
                     }
                 }
@@ -151,6 +205,13 @@ impl Builder<'_> {
         }
         if out.is_empty() {
             return Ok(None);
+        }
+        // Unchanged directory: same entries, same id, already stored. Skips
+        // encoding, hashing and the existence check for most directories.
+        if let (Some(p), Some(id)) = (parent, parent_id) {
+            if *p == out {
+                return Ok(Some(id));
+            }
         }
         Ok(Some(self.store.put_tree(&out)?))
     }
@@ -218,8 +279,19 @@ impl Builder<'_> {
         }
 
         let meta = self.fs.metadata(path)?;
-        let executable = meta.is_some_and(|m| m.executable);
+        let executable = meta.as_ref().is_some_and(|m| m.executable);
+        // Embargoed entries depend on the parent entry and on embargo state,
+        // not only on content: always take the slow path for them.
+        let parent_embargoed = parent_file.is_some_and(|pe| matches!(pe.visibility, Visibility::Embargoed { .. }));
+        if let (Some(m), false) = (&meta, parent_embargoed) {
+            if let Some(e) = self.cached_entry(path, name, m, &desired, class.allow_secrets, parent_file)? {
+                return Ok(Some(e));
+            }
+        }
+
         let data = self.fs.read(path)?;
+        self.report.hashed += 1;
+        let content = Object::blob_id(&data);
 
         // Embargoes are sticky until released.
         let mut fallback = None;
@@ -248,10 +320,11 @@ impl Builder<'_> {
             }
         }
 
+        let mut scanned_clean = false;
         if desired.is_public() {
-            let id = Object::blob_id(&data);
             if let Some(pe) = parent_file {
-                if pe.id == id && pe.visibility.is_public() && pe.executable == executable {
+                if !self.policy_changed && pe.id == content && pe.visibility.is_public() && pe.executable == executable {
+                    self.learn(path, meta.as_ref(), content, false, None, parent_embargoed);
                     return Ok(Some(pe.clone())); // unchanged; scanned before
                 }
             }
@@ -259,8 +332,17 @@ impl Builder<'_> {
                 let findings = secrets::scan(&data);
                 if !findings.is_empty() {
                     self.report.quarantined.push((path.clone(), findings));
+                    // Hold the edit back, but do not record a deletion: keep
+                    // the previously tracked version if it is itself safe.
+                    if let Some(pe) = parent_file {
+                        if self.previous_is_safe(pe)? {
+                            self.report.quarantine_kept.push(path.clone());
+                            return Ok(Some(pe.clone()));
+                        }
+                    }
                     return Ok(None);
                 }
+                scanned_clean = true;
             }
         }
 
@@ -290,6 +372,13 @@ impl Builder<'_> {
             }
             Err(e) => return Err(e),
         };
+        if fallback.is_none() {
+            let sealed = match &desired {
+                Visibility::Cloaked { scope } => Some((scope.clone(), id)),
+                _ => None,
+            };
+            self.learn(path, meta.as_ref(), content, scanned_clean, sealed, parent_embargoed);
+        }
         Ok(Some(TreeEntry {
             name: name.to_string(),
             kind: EntryKind::File,
@@ -299,5 +388,94 @@ impl Builder<'_> {
             visibility: desired,
             fallback,
         }))
+    }
+
+    /// Record content facts for a file that was just read.
+    fn learn(
+        &mut self,
+        path: &VPath,
+        meta: Option<&Metadata>,
+        content: ObjectId,
+        scanned_clean: bool,
+        sealed: Option<(String, ObjectId)>,
+        parent_embargoed: bool,
+    ) {
+        if let (Some(run), Some(m), false) = (self.cache.as_mut(), meta, parent_embargoed) {
+            run.learn(path, m, content, scanned_clean, sealed);
+        }
+    }
+
+    /// The entry for an unchanged file, built from cached content facts
+    /// instead of reading it. `None` means "read the file".
+    fn cached_entry(
+        &mut self,
+        path: &VPath,
+        name: &str,
+        meta: &Metadata,
+        desired: &Visibility,
+        allow_secrets: bool,
+        parent_file: Option<&TreeEntry>,
+    ) -> Result<Option<TreeEntry>> {
+        let Some(rec) = self.cache.as_ref().and_then(|c| c.trusted(path, meta)).cloned() else {
+            return Ok(None);
+        };
+        let same_as_parent = |id: &ObjectId| {
+            parent_file.filter(|pe| pe.id == *id && pe.visibility == *desired && pe.executable == meta.executable && pe.fallback.is_none())
+        };
+        let entry = match desired {
+            Visibility::Public => {
+                let id = rec.content;
+                match same_as_parent(&id) {
+                    // Same rule as the uncached path: unchanged public content
+                    // was scanned when it entered the parent.
+                    Some(pe) if !self.policy_changed => Some(pe.clone()),
+                    _ if (allow_secrets || rec.scanned_clean) && self.store.has(&id) => Some(self.fresh_entry(name, id, meta, desired)),
+                    _ => None,
+                }
+            }
+            Visibility::Cloaked { scope } => match &rec.sealed {
+                Some((s, id)) if s == scope && self.store.keys.has(scope) => match same_as_parent(id) {
+                    Some(pe) => Some(pe.clone()),
+                    None if self.store.has(id) => Some(self.fresh_entry(name, *id, meta, desired)),
+                    None => None,
+                },
+                _ => None,
+            },
+            Visibility::Embargoed { .. } => None,
+        };
+        if entry.is_some() {
+            self.report.cache_hits += 1;
+            if let Some(run) = self.cache.as_mut() {
+                run.keep(path, rec);
+            }
+        }
+        Ok(entry)
+    }
+
+    fn fresh_entry(&self, name: &str, id: ObjectId, meta: &Metadata, visibility: &Visibility) -> TreeEntry {
+        TreeEntry {
+            name: name.to_string(),
+            kind: EntryKind::File,
+            id,
+            size: meta.len,
+            executable: meta.executable,
+            visibility: visibility.clone(),
+            fallback: None,
+        }
+    }
+
+    /// May a quarantined file keep its previous entry? Encrypted entries
+    /// are safe by construction. A public one is re-scanned: it may have
+    /// been recorded under a rule (e.g. `public!`) that no longer applies,
+    /// and must not be carried into a new snapshot if it holds a secret.
+    fn previous_is_safe(&self, pe: &TreeEntry) -> Result<bool> {
+        if !pe.visibility.is_public() || pe.fallback.is_some() {
+            return Ok(true);
+        }
+        match self.store.read_entry(pe) {
+            Ok(old) => Ok(secrets::scan(&old).is_empty()),
+            Err(e) if e.is_unreadable() => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 }
