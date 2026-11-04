@@ -81,7 +81,6 @@ fn fetching_a_branch_with_an_ordinary_fixture_is_quick() {
 /// repository lock throughout, so every other `vl` command fails with
 /// "locked" meanwhile.
 #[test]
-#[ignore = "BUG-090: a pushed Git branch with a crafted file stalls vl git fetch (quadratic scanner)"]
 fn fetching_a_branch_with_a_crafted_fixture_is_quick() {
     let content = "xgithub_pat_".repeat((128 << 10) / 12);
     let took = fetch_time_with_file(&content, Duration::from_secs(30));

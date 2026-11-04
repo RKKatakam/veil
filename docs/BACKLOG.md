@@ -18,10 +18,18 @@ fixed**. Severity: high / medium / low.
   `author` is unverified.
 - **Embargo metadata still visible:** that an embargo exists, parent ids,
   author, time, scope, deadline, ciphertext sizes on team remotes.
-- **Scanner misses:** word-only passphrases, weak passwords, credentials
-  in XML attributes (`<add key="DbPassword" value="…"/>`), camelCase
-  generic tokens (`githubToken: …`), URL passwords that are words or
-  numbers.
+- **Scanner misses:** word-only passphrases and passwords with spaces,
+  weak passwords, camelCase generic tokens (`githubToken: …`), URL
+  passwords that are words or numbers, `*_KEY` names beyond the common
+  ones, XML attributes other than `value`, values whose key is on another
+  line (except Kubernetes `value:`), compressed archives (not
+  decompressed). ~0.02–0.04 % of random 16-character passwords are still
+  taken for words, hashes or code (0.2 % of 16-character hex).
+- **Scanner throughput:** scanner v4 (BUG-090…095) is ~2× slower than v3
+  on keyword-dense text (300–450 MiB/s vs 700–950 MiB/s; ~1.5 GiB/s on
+  real source trees): every `key = expr` code line is now a candidate for
+  the rest-of-line rule. A cheaper pre-filter for code lines would win it
+  back.
 - **`DiskBackend::write` follows symlinked parent directories** if called
   directly (checkout and restore guard against it).
 - **Retired identities stay on disk** (`$VEIL_HOME/retired/`, 0600) until

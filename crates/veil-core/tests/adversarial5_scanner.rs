@@ -77,7 +77,6 @@ fn ordinary_text_scans_quickly() {
 /// build, 1 MiB about an hour. Every snapshot (`vl status`, `vl commit`)
 /// and `vl scan` in CI stalls on one such public file.
 #[test]
-#[ignore = "BUG-090: crafted runs make the scanner quadratic (vl status / vl scan hang)"]
 fn crafted_token_runs_do_not_make_the_scanner_quadratic() {
     for (name, unit) in [("github_pat", "xgithub_pat_"), ("openai", "xsk-"), ("assignment", "xtoken=")] {
         let data = unit.repeat((256 << 10) / unit.len()).into_bytes();
@@ -154,7 +153,6 @@ fn long_random_alphanumeric_passwords_are_found() {
 /// "camelCase word"), and a Google app password (16 random lower-case
 /// letters) always is.
 #[test]
-#[ignore = "BUG-091: strong random passwords with symbols are missed 7-90% of the time"]
 fn strong_random_passwords_are_found() {
     let symbols: Vec<u8> = [ALNUM, b"!@#$%^&*"].concat();
     let printable: Vec<u8> = (0x21u8..=0x7e).collect();
@@ -209,7 +207,6 @@ fn documented_assignment_shapes_are_found() {
 /// `AUTH_KEY`/`…_SALT` secrets. `key` alone is no keyword, so
 /// `APP_KEY` (Laravel), `RAILS_MASTER_KEY` and `ENCRYPTION_KEY` never count.
 #[test]
-#[ignore = "BUG-092: wp-config define(), env[\"KEY\"] = …, PASSWORD2, API_KEYS, APP_KEY and k8s env shapes are missed"]
 fn common_credential_shapes_are_found() {
     let cases = [
         ("wp-config.php", "define( 'DB_PASSWORD', 'Xk9mQ2vL7pR4wZt8' );\n"),
@@ -257,7 +254,6 @@ fn url_passwords_in_the_documented_form_are_found() {
 ///   first), e.g. `redis://:Xk9mQ2:vL7pR4wZ@cache`;
 /// * a user name longer than 64 characters (`{0,64}`) hides the password.
 #[test]
-#[ignore = "BUG-093: URL passwords starting with %xx, in \\/-escaped JSON, containing ':' or after a long user name are missed"]
 fn url_password_variants_are_found() {
     let long_user = format!("U=https://{}:Xk9mQ2vL7pR4@h.example.com\n", "service-account-for-the-nightly-build-in-region-eu-west-1-x");
     let cases = [
@@ -299,7 +295,6 @@ fn cjk_text_before_a_token_is_found_in_utf8_and_spaced_utf16() {
 /// Windows tools write UTF-16LE (Notepad "Unicode", Excel "Unicode text",
 /// PowerShell 5 `>` redirection). UTF-32 has the same problem.
 #[test]
-#[ignore = "BUG-094: in UTF-16LE/UTF-32 a token right after kana or many CJK ideographs is missed"]
 fn cjk_text_glued_to_a_token_in_utf16_is_found() {
     let mut missed = Vec::new();
     for s in ["アクセスキーAKIAIOSFODNN7EXAMPLE\r\n", "令牌ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ\r\n"] {
@@ -356,7 +351,6 @@ fn a_service_account_key_file_is_found() {
 /// header's NUL padding comes right before the content), a SQLite database
 /// or a core dump.
 #[test]
-#[ignore = "BUG-095: a service-account JSON key inside a .tar (or other binary) is missed"]
 fn a_service_account_key_inside_a_tar_is_found() {
     let mut tar = tar_header("deploy/sa.json", GCP_KEY.len());
     tar.extend_from_slice(GCP_KEY.as_bytes());
