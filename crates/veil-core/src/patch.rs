@@ -3286,16 +3286,22 @@ mod writer {
             store: &store,
             opts,
         };
-        // Withheld history (the merged-in side of an unreleased embargo) is
-        // refused before anything is computed, naming it.
-        let withheld = crate::remote::embargo_withheld(repo, true)?;
+        // Withheld history (the merged-in side of an unreleased embargo),
+        // and work built on it, is refused before anything is computed,
+        // naming it (BUG-681: a patch of a change on the fix line carries
+        // the fix's file names to `vl am` on any other line).
+        let mut confined = crate::confinement::Confinement::new(repo)?;
         for id in ids {
-            if let Some(e) = withheld.get(id) {
-                let allowed = opts.audience == Audience::Me && opts.include_embargoed.contains(e);
+            let s = repo.snapshot(id)?;
+            if crate::embargo::unreleased_wrapper(&store, &s.tree)?.is_some() {
+                continue; // the embargoed line: its sealed files are refused below without --include-embargoed
+            }
+            if let Some(e) = confined.of(repo, id)? {
+                let allowed = opts.audience == Audience::Me && opts.include_embargoed.contains(&e);
                 if !allowed {
                     let change = repo.snapshot(id)?.change_id;
                     return Err(VeilError::Policy(format!(
-                        "change {} is the withheld history of unreleased embargo {e}: a patch would publish the fix. \
+                        "change {} is the withheld history of unreleased embargo {e} (or built on it): a patch would publish the fix. \
                          Nothing was written",
                         change.short()
                     )));

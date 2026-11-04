@@ -980,6 +980,12 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()
     let (src_tree, shown, label) = match from {
         Some(rev) => {
             let src = ctx.rev(rev)?;
+            // A revision an unreleased embargo keeps back (its fix, work on
+            // it, its line) is restored only into a change inside that
+            // embargo: elsewhere it would be an ordinary edit, published
+            // before the release (BUG-681).
+            let wc_id = ctx.wc()?;
+            veil_core::confinement::Confinement::new(&ctx.repo)?.check_copy(&ctx.repo, "cannot restore from", &[src], &[wc_id])?;
             (ctx.repo.snapshot(&src)?.tree, one_line(&ctx.repo, &src), rev.to_string())
         }
         None => {
@@ -2659,7 +2665,6 @@ fn cmd_git(ctx: &mut Ctx, c: &GitCmd) -> Result<ExitCode> {
             hooks,
         } => {
             let url = git::remotes(&ctx.repo)?.get(remote).cloned().unwrap_or_default();
-            hooks::before_push(ctx, hooks, remote, &url, "git", |ctx| hooks::git_push_lines(ctx, &git_dir, remote, tag, delete))?;
             let opts = git::PushOptions {
                 only_tags: tag.clone(),
                 force: *force,
@@ -2667,6 +2672,7 @@ fn cmd_git(ctx: &mut Ctx, c: &GitCmd) -> Result<ExitCode> {
                 force_tags: *force_tags,
                 delete_tags: delete_tag.clone(),
             };
+            hooks::before_push(ctx, hooks, remote, &url, "git", |ctx| hooks::git_push_lines(ctx, &git_dir, remote, &opts))?;
             let r = git::push_with(&mut ctx.repo, &git_dir, remote, &opts)?;
             print_git_export(&r.export);
             let withheld: Vec<String> = r

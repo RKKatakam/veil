@@ -1239,13 +1239,23 @@ pub fn delete_lines(repo: &Repo, remote: &str, delete: &[String], public: bool, 
 }
 
 /// The pre-push lines of `vl git push`: `<tag> <snapshot> <remote-or-0>
-/// <git-commit>`, from an export (exactly what the push then sends). The
-/// snapshot is `-` when the commit is a projection (an unreleased embargo's
-/// pre-merge tree), so a withheld snapshot id is never shown.
-pub fn git_push_lines(ctx: &mut Ctx, git_dir: &Path, remote: &str, tags: &[String], delete: &[String]) -> Result<Vec<String>> {
+/// <git-commit>` per branch, from an export (exactly what the push then
+/// sends). The snapshot is `-` when the commit is a projection (an
+/// unreleased embargo's pre-merge tree), so a withheld snapshot id is never
+/// shown. Then the Git tags the push sends (BUG-641), in Git's own format:
+/// `refs/tags/<name> <local-object> refs/tags/<name> <remote-object-or-zeros>`,
+/// and `(delete) <zeros> refs/tags/<name> <remote-object-or-zeros>` for
+/// `--delete-tag`. Only exported release tags appear (never a cloaked one,
+/// nor one an unreleased embargo holds back), and not one the push refuses
+/// before sending (it exists there with another target, without
+/// `--force-tags`). Mirrors `git::push_with`.
+pub fn git_push_lines(ctx: &mut Ctx, git_dir: &Path, remote: &str, push: &veil_core::git::PushOptions) -> Result<Vec<String>> {
     use veil_core::git::GitBridge;
+    let (tags, delete) = (&push.only_tags[..], &push.delete[..]);
     let mut out = Vec::new();
-    if delete.is_empty() || !tags.is_empty() {
+    let mut tag_lines = Vec::new();
+    let zeros = |len: usize| "0".repeat(len);
+    if (delete.is_empty() && push.delete_tags.is_empty()) || !tags.is_empty() {
         let mut bridge = GitBridge::open(&ctx.repo, git_dir)?;
         let export = bridge.export(&mut ctx.repo, tags)?;
         let view = ctx.repo.view();
@@ -1261,8 +1271,30 @@ pub fn git_push_lines(ctx: &mut Ctx, git_dir: &Path, remote: &str, tags: &[Strin
             let there = view.remote_tags.get(&format!("{remote}/{branch}")).map(|r| r.hex()).unwrap_or_else(|| "0".into());
             out.push(format!("{branch} {snap} {there} {commit}"));
         }
+        for t in &export.tags {
+            if view.tags.get(&t.name).is_some_and(|x| x.cloak.is_some()) {
+                continue;
+            }
+            let fetched = bridge.remote_tag(remote, &t.name)?;
+            if fetched.is_some_and(|f| f != t.git) && !push.force_tags {
+                continue; // refused before anything is sent
+            }
+            let local = t.git.to_string();
+            let there = fetched.map(|f| f.to_string()).unwrap_or_else(|| zeros(local.len()));
+            tag_lines.push(format!("refs/tags/{0} {local} refs/tags/{0} {there}", t.name));
+        }
     }
     out.extend(delete_lines(&ctx.repo, remote, delete, true, true));
+    out.extend(tag_lines);
+    if !push.delete_tags.is_empty() {
+        let bridge = GitBridge::open(&ctx.repo, git_dir)?;
+        for d in &push.delete_tags {
+            let there = bridge.remote_tag(remote, d)?;
+            let len = there.map(|f| f.to_string().len()).unwrap_or(40);
+            let there = there.map(|f| f.to_string()).unwrap_or_else(|| zeros(len));
+            out.push(format!("(delete) {} refs/tags/{d} {there}", zeros(len)));
+        }
+    }
     Ok(out)
 }
 

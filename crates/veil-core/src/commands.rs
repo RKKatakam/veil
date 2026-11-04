@@ -553,6 +553,9 @@ impl Repo {
         if dest == id {
             return Err(VeilError::repo("cannot squash a change into itself"));
         }
+        // Never fold an embargoed fix (or work built on it) into a change
+        // outside its embargo (BUG-681).
+        crate::confinement::Confinement::new(tx.repo())?.check_copy(tx.repo(), "cannot squash", &[id], &[dest])?;
         let store = tx.repo().store.clone();
         let into_parent = s.parents == [dest];
         let (base, chosen, rest, all) = match part {

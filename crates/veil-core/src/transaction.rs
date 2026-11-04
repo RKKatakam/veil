@@ -414,11 +414,82 @@ impl<'r> Transaction<'r> {
         Ok(())
     }
 
+    /// BUG-681: no rewrite moves a change confined to an unreleased embargo
+    /// (its fix, work built on it, its wrapped line) out of it. A rebase,
+    /// or an abandon whose descendants move, that puts such a change onto
+    /// parents outside the embargo would publish the fix's file names (the
+    /// moved change's edits of them, as conflicts) before the release.
+    /// Only rewrites that change parents are judged: confinement follows
+    /// the history, and the tree of a change that keeps its parents keeps
+    /// its embargo wrapper.
+    fn check_confinement(&mut self) -> Result<()> {
+        let mut moved: Vec<(ObjectId, Vec<ObjectId>)> = Vec::new();
+        for (old, r) in &self.rewritten {
+            if !matches!(r, Rewrite::Replaced(_)) {
+                continue;
+            }
+            let (finals, abandoned) = self.resolve(*old);
+            if abandoned {
+                continue;
+            }
+            let Some(before) = self.repo.snapshot_opt(old)? else { continue };
+            let mut changed = Vec::new();
+            for f in finals {
+                if self.repo.snapshot(&f)?.parents != before.parents {
+                    changed.push(f);
+                }
+            }
+            if !changed.is_empty() {
+                moved.push((*old, changed));
+            }
+        }
+        if moved.is_empty() {
+            return Ok(());
+        }
+        // Judged in the view the transaction started from (the repository's)...
+        let mut confined = crate::confinement::Confinement::new(self.repo)?;
+        let mut was: Vec<(ObjectId, String, Vec<ObjectId>)> = Vec::new();
+        for (old, finals) in moved {
+            if let Some(e) = confined.of(self.repo, &old)? {
+                was.push((old, e, finals));
+            }
+        }
+        if was.is_empty() {
+            return Ok(());
+        }
+        // ...and in the one it ends with.
+        std::mem::swap(&mut self.repo.view, &mut self.view);
+        let res = (|repo: &Repo| -> Result<()> {
+            let mut after = crate::confinement::Confinement::new(repo)?;
+            // Abandoning the embargoed merge itself withdraws the embargo
+            // (as undoing the merge does): nothing is moved out of it.
+            let active = crate::confinement::active_embargoes(repo)?;
+            for (old, e, finals) in &was {
+                if !active.contains(e) {
+                    continue;
+                }
+                for f in finals {
+                    if after.of(repo, f)?.as_deref() != Some(e.as_str()) {
+                        let change = repo.snapshot(old)?.change_id;
+                        return Err(VeilError::Policy(format!(
+                            "cannot move change {} off unreleased embargo {e}: it is part of the fix (or built on it, or on the embargoed line), and on parents outside the embargo it would publish the fix's file names before the release; keep it inside the embargo, or release the embargo first (`vl embargo release {e}`)",
+                            change.short()
+                        )));
+                    }
+                }
+            }
+            Ok(())
+        })(self.repo);
+        std::mem::swap(&mut self.repo.view, &mut self.view);
+        res
+    }
+
     /// Finish the transaction. Returns the new operation id, or `None` if
     /// nothing changed.
     pub fn commit(mut self) -> Result<Option<ObjectId>> {
         if !self.rewritten.is_empty() {
             self.rebase_descendants()?;
+            self.check_confinement()?;
         }
         // Durability barrier: every object this transaction wrote is on
         // stable storage before the operation that references it is written.

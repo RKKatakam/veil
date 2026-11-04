@@ -12,7 +12,7 @@ Status: design and threat review. Hooks need no format change. Submodules (gitli
   |---|---|---|---|
   | `pre-commit` | `vl commit`, `vl describe` of `@`, `serve` `commit` | env `VEIL_HOOK`, `VEIL_SNAPSHOT` (the `@` about to be committed), `VEIL_WORKSPACE`; cwd = project root | aborts the commit |
   | `commit-msg` | same, after `pre-commit` | `$1` = a temp file holding the message (`0600`, under `.veil/local/tmp/`) | aborts; an edited message is used |
-  | `pre-push` | `vl push`, `vl git push` | argv: remote name, URL (redacted by `redact_url`), `public` or `team` or `git`; stdin: one line per tag, `<tag> <snapshot> <remote-tag-or-0> <public-commit?>` | aborts the push |
+  | `pre-push` | `vl push`, `vl git push` | argv: remote name, URL (redacted by `redact_url`), `public` or `team` or `git`; stdin: one line per tag, `<tag> <snapshot> <remote-tag-or-0> <public-commit?>`; for `vl git push`, then the Git tags it sends in Git's format, `refs/tags/<n> <object> refs/tags/<n> <remote-or-zeros>` (BUG-641) | aborts the push |
   | `post-checkout` | after `vl new`, `edit`, `ws switch` | old and new snapshot ids | none (warning only) |
 
 - **Where hooks come from.**

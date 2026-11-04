@@ -266,6 +266,12 @@ impl GitBridge {
 
     // ---- refs ------------------------------------------------------------
 
+    /// What `refs/tags/<name>` held on Git remote `remote` when it was
+    /// last fetched or pushed (`None`: not there, as far as we know).
+    pub fn remote_tag(&self, remote: &str, name: &str) -> Result<Option<GitOid>> {
+        self.get_ref(&format!("{}{name}", transport::tag_tracking_prefix(remote)))
+    }
+
     pub fn get_ref(&self, name: &str) -> Result<Option<GitOid>> {
         Ok(self
             .git

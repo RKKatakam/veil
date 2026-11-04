@@ -228,7 +228,6 @@ fn merge_warnings_quoting_hostile_paths_are_escaped() {
 /// content, and the next public push publishes its name and content
 /// before the release. `vl duplicate` refuses the same copy.
 #[test]
-#[ignore = "BUG-681: vl restore --from an embargo-withheld change publishes the fix's files before release"]
 fn restoring_from_an_embargoed_fix_onto_another_line_publishes_nothing() {
     let env = Env::new();
     let r = env.repo("p");
