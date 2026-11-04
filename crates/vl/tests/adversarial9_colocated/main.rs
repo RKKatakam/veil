@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 pub use colocated_support::*;
 
 mod policy_injection;
+mod controls;
+mod ident;
+mod checkout_old;
 mod hookspath;
 mod bundle;
 mod branches;
