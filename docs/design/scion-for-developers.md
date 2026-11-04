@@ -1,6 +1,6 @@
 # Scion for developers: the features Veil would need
 
-> Status: **to do**. This is a roadmap the owner added on 2026-11-04. None of it is built yet; Veil 1.0 is a client plus an SFTP remote. Phase 0 is scheduled with the scale round (after the Git-parity round). Phases 1–4 are built on the Veil Hub (`docs/HUB.md`).
+> Status: **to do**. Scheduled for the scale round (owner, 2026-11-04): phase 0, plus agent attribution (4.6), sandbox resource limits (4.7), and partial clone / fetch on demand over SFTP (4.1, 4.4). The per-machine daemon cache (2.4) is deferred. This is a roadmap the owner added on 2026-11-04. None of it is built yet; Veil 1.0 is a client plus an SFTP remote. Phase 0 is scheduled with the scale round (after the Git-parity round). Phases 1–4 are built on the Veil Hub (`docs/HUB.md`).
 
 ## Summary
 A "Scion for developers" is a source-control service where most of the work happens on a server:
