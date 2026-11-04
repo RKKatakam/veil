@@ -88,12 +88,7 @@ impl Env {
 fn new_commands_parse_their_documented_flags_and_refuse() {
     let env = Env::new();
     let cases: &[(&[&str], &str)] = &[
-        // stream R: duplicate, cherry-pick
-        (&["duplicate", "@-"], "vl duplicate"),
-        (&["duplicate", "@-", "@", "-d", "root()", "-d", "@-", "-m", "copy", "-x", "--json"], "vl duplicate"),
-        (&["duplicate", "@-", "--keep-description"], "vl duplicate"),
-        (&["cherry-pick", "@-", "-x", "--json"], "vl cherry-pick"),
-        (&["cherry-pick", "@-", "-m", "copy"], "vl cherry-pick"),
+        // stream R (duplicate, cherry-pick) landed: `conformance_history/duplicate.rs`, `duplicate_cli.rs`.
         // stream P: format-patch, am
         (&["format-patch", "@-"], "vl format-patch"),
         (&["format-patch", "root()..@", "-o", "out", "--cover-letter", "--binary", "-M"], "vl format-patch"),
