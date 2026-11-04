@@ -222,6 +222,9 @@ pub fn fsck(backend: Arc<dyn StorageBackend>, identity: Option<Identity>) -> Res
     let keys = Arc::new(Keychain::new(backend.clone(), identity, repo_id));
     let store = ObjectStore::new(backend.clone(), vpath(".veil/objects"), keys.clone());
     store.set_format(format);
+    // Read-only: looking at gc-pending objects must not write keep markers
+    // or loose copies (that would also rescue garbage from the next gc).
+    store.set_freshening(false);
     let mut c = Checker {
         backend,
         store,
