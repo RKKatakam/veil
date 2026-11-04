@@ -31,7 +31,6 @@ fn utf16_with_a_bom_and_latin_text_is_scanned() {
 /// `2D 4E`), so a Chinese or Japanese config file in UTF-16 without a BOM
 /// is never decoded, and the credential in it is missed.
 #[test]
-#[ignore = "BUG-056: BOM-less UTF-16 in non-Latin scripts, and UTF-16 starting mid-chunk, bypass the scanner"]
 fn bomless_utf16_with_cjk_text_is_scanned() {
     let comment = "数据库连接设置，请勿修改。生产环境配置文件。".repeat(40);
     let data = utf16le(&format!("{comment}\r\npassword = \"Xk9mQ2vL7pR4wZt8\"\r\n{comment}\r\n"));
@@ -43,7 +42,6 @@ fn bomless_utf16_with_cjk_text_is_scanned() {
 /// a chunk that is mostly ASCII (so not treated as UTF-16) and ends in the
 /// next is found by neither (e.g. a log that switches encoding).
 #[test]
-#[ignore = "BUG-056: BOM-less UTF-16 in non-Latin scripts, and UTF-16 starting mid-chunk, bypass the scanner"]
 fn utf16_starting_just_before_a_chunk_boundary_is_scanned() {
     const CHUNK: usize = 256 << 10;
     let mut data = b"log line\n".repeat(CHUNK / 9);
@@ -57,7 +55,6 @@ fn utf16_starting_just_before_a_chunk_boundary_is_scanned() {
 /// *secret* access key is the half that matters, and it is usually stored
 /// next to (not on the same line as) the key id, often in another file.
 #[test]
-#[ignore = "BUG-055: common credential keywords (aws_secret_access_key, *_secret, *_token, URL passwords) are not detected"]
 fn common_credential_assignments_are_detected() {
     let cases: &[&str] = &[
         "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n",

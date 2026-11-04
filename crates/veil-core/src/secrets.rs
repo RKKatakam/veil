@@ -12,14 +12,20 @@
 //!   engine's SIMD literal prefilter (`AKIA`, `ghp_`, …) makes one pass for
 //!   all of them. There is no size limit. Binary files are not skipped: a
 //!   credential compiled into a binary is still a credential.
-//! * The `key = value` rule works in 256 KiB chunks (16 KiB overlap) on an
-//!   ASCII-lowercased copy of each chunk. Case-insensitive keywords have too
-//!   many case variants for the prefilter; lowercasing is cheaper.
+//! * The `key = value` rule (also `key: value`, `<key>value</key>`) works
+//!   in 256 KiB chunks (16 KiB overlap) on an ASCII-lowercased copy of each
+//!   chunk. Case-insensitive keywords have too many case variants for the
+//!   prefilter; lowercasing is cheaper. Candidate matches are rejected as
+//!   cheaply as possible (the regex itself checks how an unquoted value
+//!   ends, and a match made only of words is dropped before its capture
+//!   groups are computed), because ordinary code has thousands per MiB.
 //! * Text in a NUL-padded encoding (UTF-16 LE/BE, UTF-32, with or without a
 //!   BOM) is searched again, chunk by chunk, with its NUL bytes removed,
 //!   which turns the ASCII range of those encodings back into ASCII. This
-//!   only happens for chunks that look like such text (a BOM, or at least
-//!   1/32 NUL bytes), not for compressed or random binary data.
+//!   only happens for chunks that look like such text (a BOM, at least 1/32
+//!   NUL bytes, or a run of 8 ASCII characters in UTF-16 anywhere in the
+//!   chunk or its overlap: text in a non-Latin script has almost no NULs
+//!   in UTF-16), not for compressed or random binary data.
 //!
 //! Memory use beyond the input is bounded by the chunk size. Rules are
 //! matched on bytes with Unicode disabled, so they behave the same on valid
@@ -32,7 +38,7 @@ use regex::bytes::Regex;
 
 /// Bumped whenever the rules change, so cached "scanned clean" facts (see
 /// `statcache`) from an older scanner are not reused.
-pub const RULES_VERSION: u32 = 2;
+pub const RULES_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Finding {
@@ -73,8 +79,11 @@ enum Check {
     /// Minimum Shannon entropy (bits/char) of the token.
     Entropy(f64),
     /// `key = value` assignment: the value must look like a credential, not
-    /// like code, a reference or a placeholder (see [`plausible_value`]).
+    /// like code, a reference or a placeholder (see [`plausible_value`]),
+    /// and the key must name a credential (see [`credential_key`]).
     Assignment,
+    /// The password of a `scheme://user:password@host` URL.
+    UrlPassword,
     /// A PEM private-key header. In text that is enough; inside binary data
     /// (NUL bytes nearby) it must be followed by key material, because
     /// programs that read keys carry the bare header as a string constant.
@@ -92,20 +101,63 @@ struct Rule {
 /// Keywords for `key = value` assignments, in lower case: they are matched
 /// on lowercased text, so case-insensitively. They match anywhere in an
 /// identifier, so `DB_PASSWORD`, `spring.datasource.password` and `$api_key`
-/// count, but only when the keyword is directly followed by the separator
-/// (`password_hash = …` does not).
-const KEYWORDS: &str = r"api[_-]?key|secret[_-]?key|client[_-]?secret|access[_-]?token|auth[_-]?token|private[_-]?key|password|passwd";
+/// count. The generic `secret` and `token` only count as a whole word or
+/// after `_` / `-` (`JWT_SECRET`, `GITLAB_TOKEN`, not `mytoken`), and not
+/// after a word that names something other than a credential
+/// ([`TOKEN_NOT_CREDENTIAL`]: `csrf_token`, `next_page_token`).
+///
+/// The keyword may carry up to three `_x` / `-x` suffix words
+/// (`DB_PASSWORD_PROD`, `aws_secret_access_key`), unless one of them says
+/// the value is something else ([`NOT_A_CREDENTIAL`]: `password_hash`,
+/// `token_url`, `secret_name`).
+const KEYWORDS: &str = r"api[_-]?key|secret[_-]?access[_-]?key|secret[_-]?key|client[_-]?secret|access[_-]?token|auth[_-]?token|private[_-]?key|password|passwd|secret|token";
+
+/// Suffix words after a keyword that make the value not a credential: its
+/// hash, where it is, what it is called, its policy or metadata.
+const NOT_A_CREDENTIAL: &[&str] = &[
+    "algo", "algorithm", "arn", "cmd", "command", "count", "desc", "description", "digest", "dir", "enabled", "endpoint", "env",
+    "error", "expiration", "expires", "expiry", "field", "file", "flag", "format", "hash", "hashed", "header", "help", "hint", "host",
+    "id", "ids", "input", "kind", "label", "len", "length", "location", "max", "message", "method", "min", "mode", "name", "param",
+    "path", "pattern", "placeholder", "policy", "prompt", "provider", "ref", "regex", "required", "rule", "salt", "size", "source",
+    "store", "text", "timeout", "title", "ttl", "type", "uri", "url", "var", "version",
+];
+
+/// Words before `token` that make it not a credential.
+const TOKEN_NOT_CREDENTIAL: &[&str] = &[
+    "cancel", "cancellation", "continuation", "csrf", "cursor", "device", "idempotency", "lexer", "next", "page", "pagination", "parser",
+    "request", "resume", "sync", "xsrf",
+];
 
 struct Rules {
     /// Token rules, searched together: one alternation of literal-prefixed
     /// patterns is a single SIMD-prefiltered pass instead of one per rule.
-    /// Capture group `i + 1` is `tokens[i]`.
+    /// Capture group `token_groups[i]` is `tokens[i]`.
     tokens: Vec<Rule>,
     token_re: Regex,
+    token_groups: Vec<usize>,
+    /// Groups of `token_re` holding the part to judge and print.
+    token_values: Vec<usize>,
     /// `key = value` assignments, run on ASCII-lowercased text: `(?i)`
     /// keywords have too many case variants for the literal prefilter.
     assignment: Rule,
     assignment_re: Regex,
+    assign: AssignGroups,
+}
+
+/// Capture groups of the assignment rule, by index. (Looking a group up by
+/// name hashes the name, and ordinary text has thousands of candidate
+/// matches per MiB.)
+struct AssignGroups {
+    kw: usize,
+    sfx: usize,
+    /// The value of an XML element.
+    x: usize,
+    /// Groups that hold the value: quoted, unquoted, XML.
+    values: Vec<usize>,
+}
+
+fn group(re: &Regex, name: &str) -> usize {
+    re.capture_names().position(|n| n == Some(name)).expect("named group")
 }
 
 fn rules() -> &'static Rules {
@@ -133,6 +185,9 @@ fn rules() -> &'static Rules {
             r("openai-api-key", r"sk-(?:proj-)?[A-Za-z0-9_\-]{32,}", E::Alnum, E::None, C::Entropy(3.5)),
             r("google-api-key", r"AIza[0-9A-Za-z_\-]{35}", E::Alnum, E::Base64Url, C::None),
             r("jwt", r"eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}", E::Alnum, E::None, C::None),
+            // `postgres://app:<password>@db`: matched from `://` (a literal
+            // for the prefilter); the scheme is not needed.
+            r("url-password", r#"://[^\s:/?#@'"<>]{0,64}:(?P<pw>[^\s:/?#@'"<>]{8,128})@[A-Za-z0-9\[]"#, E::None, E::None, C::UrlPassword),
         ];
         let assignment = r(
             "generic-secret-assignment",
@@ -142,19 +197,34 @@ fn rules() -> &'static Rules {
                 //
                 // Quoted value: any printable non-space bytes. Unquoted value
                 // (YAML, dotenv, .properties, kwargs): a run of credential
-                // characters that must end the token (checked in code:
-                // whitespace, `,;)]}"'` or end of input).
-                r#"(?:{KEYWORDS})["']?(?:\s*(?::=|=>|[:=])\s*["'](?P<q>[!#-&(-~\x80-\xff]{{12,}})["']|[ \t]*(?::=|=>|[:=])[ \t]*(?P<u>[A-Za-z0-9!#$%&*+./:=?@^_~|\-]{{12,}}))"#
+                // characters that must end the token (whitespace, `,;)]}"'`
+                // or the end of the input follow it): `x = a(b)` is code.
+                // Checking that here, not in code, keeps `password_hash =
+                // user.password_hash()` from even being a match.
+                //
+                // XML element: `<db_password>value</db_password>`.
+                r#"(?P<kw>{KEYWORDS})(?P<sfx>(?:[_-][a-z0-9]+){{0,3}})(?:["']?(?:\s*(?::=|=>|[:=])\s*["'](?P<q>[!#-&(-~\x80-\xff]{{12,}})["']|[ \t]*(?::=|=>|[:=])[ \t]*(?P<u>[A-Za-z0-9!#$%&*+./:=?@^_~|\-]{{12,}})(?:[\s,;)\]}}"']|$))|>[ \t]*(?P<x>[!#-&(-;=?-~\x80-\xff]{{12,}})[ \t]*</)"#
             ),
             E::None,
             E::None,
             C::Assignment,
         );
-        let alternation: Vec<String> = tokens.iter().map(|t| format!("({})", t.pattern)).collect();
+        let alternation: Vec<String> = tokens.iter().enumerate().map(|(i, t)| format!("(?P<t{i}>{})", t.pattern)).collect();
         let compile = |p: &str| Regex::new(&format!("(?-u){p}")).expect("valid secret pattern");
+        let token_re = compile(&alternation.join("|"));
+        let assignment_re = compile(&assignment.pattern);
+        let assign = AssignGroups {
+            kw: group(&assignment_re, "kw"),
+            sfx: group(&assignment_re, "sfx"),
+            x: group(&assignment_re, "x"),
+            values: ["q", "u", "x"].iter().map(|n| group(&assignment_re, n)).collect(),
+        };
         Rules {
-            token_re: compile(&alternation.join("|")),
-            assignment_re: compile(&assignment.pattern),
+            token_groups: (0..tokens.len()).map(|i| group(&token_re, &format!("t{i}"))).collect(),
+            token_values: vec![group(&token_re, "pw")],
+            assignment_re,
+            assign,
+            token_re,
             tokens,
             assignment,
         }
@@ -218,6 +288,62 @@ fn plausible_value(v: &[u8]) -> bool {
     !identifier && shannon_entropy(v) >= 3.2
 }
 
+/// Does the key of an assignment name a credential? `caps` is a match of
+/// the assignment rule in `lower` (lowercased text). See [`KEYWORDS`].
+fn credential_key(caps: &regex::bytes::Captures, g: &AssignGroups, lower: &[u8]) -> bool {
+    let kw = caps.get(g.kw).expect("keyword group");
+    let ident = |b: &u8| b.is_ascii_alphanumeric();
+    if matches!(kw.as_bytes(), b"secret" | b"token") {
+        let before = &lower[..kw.start()];
+        if before.last().is_some_and(ident) {
+            return false; // `mytoken`, `topsecret`
+        }
+        if kw.as_bytes() == b"token" {
+            let before = before.strip_suffix(b"_").or_else(|| before.strip_suffix(b"-")).unwrap_or(&[]);
+            let word = &before[before.iter().rposition(|b| !ident(b)).map_or(0, |i| i + 1)..];
+            if TOKEN_NOT_CREDENTIAL.iter().any(|w| w.as_bytes() == word) {
+                return false;
+            }
+        }
+    }
+    let suffix = caps.get(g.sfx).map_or(&b""[..], |m| m.as_bytes());
+    if suffix
+        .split(|b| matches!(b, b'_' | b'-'))
+        .any(|w| NOT_A_CREDENTIAL.iter().any(|n| n.as_bytes() == w))
+    {
+        return false;
+    }
+    // An element: the keyword is part of the name of the tag just opened.
+    if caps.get(g.x).is_some() {
+        let name_start = lower[..kw.start()]
+            .iter()
+            .rposition(|b| !(ident(b) || matches!(b, b'_' | b'-' | b'.' | b':')))
+            .map(|i| lower[i]);
+        return name_start == Some(b'<');
+    }
+    true
+}
+
+/// Is the password of a `scheme://user:password@host` URL a credential,
+/// not a placeholder (`user:password@`, `postgres:postgres@`,
+/// `${USER}:${PASS}@`, `<user>:<password>@`, `****`)?
+fn plausible_url_password(v: &[u8]) -> bool {
+    if matches!(v[0], b'$' | b'%' | b'&' | b'*' | b'<' | b'{' | b'[') || v.windows(2).any(|w| matches!(w, b"${" | b"{{" | b"%(")) {
+        return false;
+    }
+    // A password a person typed is shorter and less random than a token:
+    // a lower bar than `plausible_value`, but never a plain word or number.
+    let identifier = v.split(|b| matches!(b, b'.' | b'_' | b'-')).all(wordlike);
+    !identifier && shannon_entropy(v) >= 2.5
+}
+
+/// Is `s` made only of words (see [`wordlike`]) between `.`, `_`, `-`,
+/// `:`, `/`, whitespace and quotes?
+fn identifier_like(s: &[u8]) -> bool {
+    s.split(|&b| matches!(b, b'.' | b'_' | b'-' | b':' | b'/' | b'"' | b'\'') || b.is_ascii_whitespace())
+        .all(wordlike)
+}
+
 /// Does key material (or an encrypted-PEM header) follow a PEM header?
 fn pem_body_follows(rest: &[u8]) -> bool {
     let rest = rest.strip_prefix(b"\r").unwrap_or(rest);
@@ -256,9 +382,9 @@ struct Hit {
 /// `stripped`: `hay` is NUL-padded data with the NULs removed.
 fn search_tokens(hay: &[u8], limit: usize, stripped: bool, out: &mut Vec<Hit>) {
     let rules = rules();
-    search_with(&rules.token_re, false, stripped, hay, hay, limit, out, |caps| {
-        let i = (1..caps.len()).find(|&g| caps.get(g).is_some()).expect("one alternative matched");
-        &rules.tokens[i - 1]
+    search_with(&rules.token_re, &rules.token_values, false, stripped, hay, hay, limit, out, |caps| {
+        let i = rules.token_groups.iter().position(|&g| caps.get(g).is_some()).expect("one alternative matched");
+        &rules.tokens[i]
     });
 }
 
@@ -267,14 +393,16 @@ fn search_tokens(hay: &[u8], limit: usize, stripped: bool, out: &mut Vec<Hit>) {
 /// prefilter effective, and values are judged on the original `text`.
 fn search_assignments(text: &[u8], lower: &[u8], limit: usize, out: &mut Vec<Hit>) {
     let rules = rules();
-    search_with(&rules.assignment_re, true, false, lower, text, limit, out, |_| &rules.assignment);
+    search_with(&rules.assignment_re, &rules.assign.values, true, false, lower, text, limit, out, |_| &rules.assignment);
 }
 
 /// Run `re` over `hay` and judge each match on `text` (`hay` itself, or the
-/// same bytes before lowercasing).
+/// same bytes before lowercasing). `values`: capture groups that hold the
+/// part of a match to judge (the whole match if none matched).
 #[allow(clippy::too_many_arguments)]
 fn search_with<'r>(
     re: &Regex,
+    values: &[usize],
     assignment: bool,
     stripped: bool,
     hay: &[u8],
@@ -283,10 +411,6 @@ fn search_with<'r>(
     out: &mut Vec<Hit>,
     rule_of: impl Fn(&regex::bytes::Captures) -> &'r Rule,
 ) {
-    let terminates = |b: Option<u8>| match b {
-        None => true,
-        Some(b) => b.is_ascii_whitespace() || matches!(b, b',' | b';' | b')' | b']' | b'}' | b'"' | b'\''),
-    };
     let mut found = 0;
     let mut at = 0;
     while at < limit {
@@ -299,11 +423,22 @@ fn search_with<'r>(
         at = whole.end().max(whole.start() + 1);
         let prev = whole.start().checked_sub(1).map(|i| text[i]);
         let next = text.get(whole.end()).copied();
-        // An unquoted assignment value must be the whole token: `x = a(b)`
-        // is code, not a credential. (Unquoted values never end in a quote.)
-        let quoted = matches!(text[whole.end() - 1], b'"' | b'\'');
-        if assignment && !quoted && !terminates(next) {
-            continue;
+        // `accessToken: this.accessToken` (minified code is full of them):
+        // if the whole match is made of words, so is its value, which is
+        // then not a credential (see `plausible_value`). The value never
+        // contains whitespace or quotes, and a separator glued to it
+        // (`=`, `>`, `</`) makes that segment not a word, so this never
+        // rejects what the full check would accept, nor a match inside it.
+        // (An unquoted value's match ends with the byte that ends it.)
+        if assignment {
+            let m = &text[whole.range()];
+            let body = match m.last() {
+                Some(b',' | b';' | b')' | b']' | b'}') => &m[..m.len() - 1],
+                _ => m,
+            };
+            if identifier_like(body) {
+                continue;
+            }
         }
         let caps = re.captures_at(hay, whole.start()).expect("the same match");
         let rule = rule_of(&caps);
@@ -315,12 +450,18 @@ fn search_with<'r>(
         if !rule.after.allows(next) {
             continue;
         }
-        let span = caps.name("q").or_else(|| caps.name("u")).unwrap_or(whole).range();
+        if matches!(rule.check, Check::Assignment) && !credential_key(&caps, &rules().assign, hay) {
+            // Another keyword may start inside (`mytoken_password = …`).
+            at = whole.start() + 1;
+            continue;
+        }
+        let span = values.iter().find_map(|&g| caps.get(g)).unwrap_or(whole).range();
         let token = &text[span];
         let ok = match rule.check {
             Check::None => true,
             Check::Entropy(min) => shannon_entropy(token) >= min,
             Check::Assignment => plausible_value(token),
+            Check::UrlPassword => plausible_url_password(token),
             Check::PemHeader => {
                 let around = &text[whole.start().saturating_sub(256)..(whole.end() + 256).min(text.len())];
                 let binary = stripped || around.contains(&0);
@@ -345,9 +486,38 @@ fn newlines(s: &[u8]) -> usize {
     s.iter().filter(|&&b| b == b'\n').count()
 }
 
-/// Does this chunk look like text in a NUL-padded encoding?
-fn nul_padded(chunk: &[u8], bom: bool) -> bool {
-    bom || (chunk.contains(&0) && chunk.iter().filter(|&&b| b == 0).count() * 32 >= chunk.len())
+/// Does this chunk look like text in a NUL-padded encoding? `window` is
+/// the chunk followed by its overlap.
+fn nul_padded(chunk: &[u8], window: &[u8], bom: bool) -> bool {
+    if bom {
+        return true;
+    }
+    let nuls = chunk.iter().filter(|&&b| b == 0).count();
+    nuls > 0 && nuls * 32 >= chunk.len() || utf16_run(window)
+}
+
+/// Code units of ASCII text in UTF-16 that make a run.
+const UTF16_RUN: usize = 8;
+
+/// Does `data` contain a run of ASCII text in UTF-16 (`p\0a\0s\0s\0…` or
+/// big-endian)? Catches UTF-16 that the NUL density misses: text in a
+/// non-Latin script (`数` is `70 65`, no NUL) around an ASCII credential,
+/// or UTF-16 that starts near the end of a chunk of plain text. Random and
+/// compressed data practically never has such a run.
+fn utf16_run(data: &[u8]) -> bool {
+    let text = |b: u8| matches!(b, b'\t' | b'\n' | b'\r' | 0x20..=0x7e);
+    let unit = |z: usize, k: usize, le: bool| {
+        let n = z + 2 * k;
+        match le {
+            true => n < data.len() && data[n] == 0 && text(data[n - 1]),
+            false => n + 1 < data.len() && data[n] == 0 && text(data[n + 1]),
+        }
+    };
+    // Both orders need a NUL two bytes on: most NULs fail that at once.
+    memchr::memchr_iter(0, data).any(|z| {
+        data.get(z + 2) == Some(&0)
+            && ((z > 0 && (0..UTF16_RUN).all(|k| unit(z, k, true))) || (0..UTF16_RUN).all(|k| unit(z, k, false)))
+    })
 }
 
 fn lowercase_into(buf: &mut Vec<u8>, s: &[u8]) {
@@ -377,7 +547,7 @@ pub fn scan(data: &[u8]) -> Vec<Finding> {
         search_assignments(window, &lower, end - start, &mut chunk_hits);
         hits.extend(chunk_hits.drain(..).map(|h| Hit { offset: h.offset + start, ..h }));
 
-        if nul_padded(&data[start..end], bom) {
+        if nul_padded(&data[start..end], window, bom) {
             stripped.clear();
             stripped.extend(data[start..end].iter().copied().filter(|&b| b != 0));
             let limit = stripped.len();

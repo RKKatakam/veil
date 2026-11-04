@@ -111,7 +111,6 @@ fn github_clone(env: &Env, bare: &Path, name: &str) -> PathBuf {
 /// sealed; isolated files never are), the next snapshot records the local
 /// `.env` in plaintext, and the next `vl git push` uploads it to GitHub.
 #[test]
-#[ignore = "BUG-057: a .veilpolicy edit made on GitHub makes the next vl git push upload the local isolated .env"]
 fn a_github_policy_edit_cannot_exfiltrate_the_local_dotenv() {
     let env = Env::new();
     let (proj, bare) = exported_project(&env, &[("app.txt", "v1\n")]);

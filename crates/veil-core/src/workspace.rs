@@ -17,7 +17,6 @@ use crate::{
     now_millis,
     object::Snapshot,
     oplog::{View, WorkspaceState},
-    policy::Policy,
     repo::Repo,
     statcache::StatCache,
     tree::{lookup, TreeView},
@@ -154,14 +153,15 @@ impl Repo {
         let mut tx = self.transaction(description.unwrap_or_else(|| snapshot_op_description(ws)))?;
         let wc_id = tx.view.workspace(ws)?.wc;
         let wc = tx.repo().snapshot(&wc_id)?;
-        let policy = Policy::load(fs)?;
+        // `fs` was checked out from `wc.tree`: a `.veilpolicy` edit is the member's.
+        let wp = tx.repo().snapshot_policy(fs, Some(&wc.tree))?;
         let store = tx.repo().store.clone();
         let rescan = scanner_outdated(&*tx.repo().backend, ws)?;
         let (tree, report) = build_tree_cached(
             &store,
             fs,
             &BuildOptions {
-                policy: &policy,
+                policy: &wp.policy,
                 parent_tree: Some(wc.tree),
                 cloak: wc.cloak.as_deref(),
                 injected,
@@ -170,6 +170,7 @@ impl Repo {
             },
             cache,
         )?;
+        tx.repo().record_accepted(&wp)?;
         if tree == wc.tree {
             // Nothing to record; the re-scan (if any) found nothing new.
             if rescan {
@@ -234,7 +235,7 @@ impl Repo {
         cache: Option<&mut StatCache>,
         materialised: Option<&Materialised>,
     ) -> Result<(ObjectId, BuildReport)> {
-        let policy = Policy::load(fs)?;
+        let policy = self.snapshot_policy(fs, None)?.policy;
         build_tree_cached(
             &self.store,
             fs,
@@ -332,13 +333,13 @@ impl Repo {
     ) -> Result<(ObjectId, BuildReport)> {
         let mut tx = self.transaction("record ephemeral workspace")?;
         let parent = tx.repo().snapshot(&base)?;
-        let policy = Policy::load(fs)?;
+        let wp = tx.repo().snapshot_policy(fs, None)?;
         let store = tx.repo().store.clone();
         let (tree, report) = build_tree_cached(
             &store,
             fs,
             &BuildOptions {
-                policy: &policy,
+                policy: &wp.policy,
                 parent_tree: Some(parent.tree),
                 cloak: parent.cloak.as_deref(),
                 injected,
@@ -347,6 +348,7 @@ impl Repo {
             },
             None,
         )?;
+        tx.repo().record_accepted(&wp)?;
         let snap = Snapshot {
             parents: vec![base],
             change_id: ChangeId::random(),

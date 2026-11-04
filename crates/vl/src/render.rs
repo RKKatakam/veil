@@ -11,6 +11,7 @@ use veil_core::{
     builder::BuildReport,
     keychain::SignatureStatus,
     object::{EntryKind, Snapshot, Visibility},
+    policy::{HeldBack, POLICY_FILE},
     secrets::looks_binary,
     tree::{diff_trees, TreeChange},
     ObjectId, Repo, VPath,
@@ -194,6 +195,29 @@ pub fn print_build_warnings(r: &BuildReport) {
              after the release (or work on the embargoed merge's first parent instead)"
         ));
     }
+    print_policy_held_back(&r.policy_held_back);
+}
+
+/// Local files kept under the accepted policy because `.veilpolicy` (as
+/// changed by a merge, pull, checkout, …) would weaken their protection.
+pub fn print_policy_held_back(held: &[HeldBack]) {
+    const SHOWN: usize = 5;
+    if held.is_empty() {
+        return;
+    }
+    let mut list: Vec<String> = held
+        .iter()
+        .take(SHOWN)
+        .map(|h| format!("{} ({} → {})", safe(h.path.as_str()), h.accepted, h.wanted))
+        .collect();
+    if held.len() > SHOWN {
+        list.push(format!("and {} more", held.len() - SHOWN));
+    }
+    warn(&format!(
+        "{} local file(s) keep the protection you accepted: {POLICY_FILE} would weaken it, and that change came from a merge, pull, checkout or undo rather than your own edit ({}). Review it with `vl policy show`; apply it with `vl policy accept`",
+        held.len(),
+        list.join(", ")
+    ));
 }
 
 // ---- log -----------------------------------------------------------------

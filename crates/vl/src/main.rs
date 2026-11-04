@@ -606,6 +606,12 @@ fn cmd_status(ctx: &mut Ctx) -> Result<()> {
             println!("  {} {}  ({}; {state})", yellow("Q"), safe(p.as_str()), f[0].rule);
         }
     }
+    if !ctx.report.policy_held_back.is_empty() {
+        println!("{}", yellow("Policy change not accepted (protection kept; `vl policy accept` applies it):"));
+        for h in &ctx.report.policy_held_back {
+            println!("  {} {}  ({}; .veilpolicy says {})", yellow("P"), safe(h.path.as_str()), h.accepted, h.wanted);
+        }
+    }
     if !ctx.report.carried.is_empty() {
         println!("{}", dim("Redacted (no key; kept in history, absent on disk):"));
         for p in &ctx.report.carried {
@@ -1003,7 +1009,8 @@ fn cmd_policy_rules(ctx: &mut Ctx, patterns: &[String], tier: Tier, force: bool)
 }
 
 fn cmd_policy(ctx: &mut Ctx, c: &PolicyCmd) -> Result<()> {
-    let policy = Policy::load(&*ctx.fs)?;
+    // What snapshots apply: `.veilpolicy`, guarded by the accepted policy.
+    let policy = ctx.repo.effective_policy(&*ctx.fs)?;
     match c {
         PolicyCmd::Show => {
             for r in policy.rules() {
@@ -1013,6 +1020,30 @@ fn cmd_policy(ctx: &mut Ctx, c: &PolicyCmd) -> Result<()> {
             for w in &policy.warnings {
                 warn_untrusted(w);
             }
+            let held = ctx.repo.policy_held_back(&*ctx.fs)?;
+            if !held.is_empty() {
+                println!();
+                println!(
+                    "{} (they keep the protection you accepted on this device):",
+                    bold("Not yet accepted: .veilpolicy would weaken the protection of local files")
+                );
+                for h in &held {
+                    println!("  {}: {} → {}", safe(h.path.as_str()), h.accepted, yellow(&h.wanted));
+                }
+                println!("Run `vl policy accept` to apply .veilpolicy in full.");
+            }
+        }
+        PolicyCmd::Accept => {
+            let held = ctx.repo.accept_policy(&*ctx.fs)?;
+            if held.is_empty() {
+                println!("Accepted {POLICY_FILE}; it weakens the protection of no local file");
+            } else {
+                println!("Accepted {POLICY_FILE}. Protection weakened for {} local file(s):", held.len());
+                for h in &held {
+                    println!("  {}: {} → {}", safe(h.path.as_str()), h.accepted, yellow(&h.wanted));
+                }
+            }
+            ctx.snapshot()?;
         }
         PolicyCmd::Check { paths } => {
             for p in paths {
@@ -1031,6 +1062,12 @@ fn cmd_policy(ctx: &mut Ctx, c: &PolicyCmd) -> Result<()> {
                 if c.allow_secrets {
                     extra.push_str(" (secret scanning disabled)");
                 }
+                if let Some((tier, force)) = &c.held_back {
+                    extra.push_str(&format!(
+                        " (accepted on this device; {POLICY_FILE} says '{}', not yet accepted: `vl policy accept`)",
+                        veil_core::policy::tier_keyword(tier, *force)
+                    ));
+                }
                 println!("{vp}: {} via {why}{extra}", bold(&c.tier.label()));
             }
         }
@@ -1039,7 +1076,7 @@ fn cmd_policy(ctx: &mut Ctx, c: &PolicyCmd) -> Result<()> {
 }
 
 fn cmd_scan(ctx: &mut Ctx) -> Result<ExitCode> {
-    let policy = Policy::load(&*ctx.fs)?;
+    let policy = ctx.repo.effective_policy(&*ctx.fs)?;
     let skip = |p: &VPath| {
         p.as_str() == ".veil" || policy.classify(p, true).tier == Tier::Ignored
     };

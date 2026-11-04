@@ -65,6 +65,7 @@ pub mod upgrade;
 pub mod vault;
 pub mod vfs;
 pub mod vpath;
+pub mod wc_policy;
 pub mod workspace;
 
 pub use error::{Result, VeilError};

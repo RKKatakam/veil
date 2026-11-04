@@ -40,8 +40,10 @@ staying green.
   `author` is unverified.
 - **Embargo metadata still visible:** that an embargo exists, parent ids,
   author, time, scope, deadline, ciphertext sizes on team remotes.
-- **Scanner misses:** word-only passphrases, weak passwords, XML
-  `<password>` elements, suffixed keys (`DB_PASSWORD_PROD=`).
+- **Scanner misses:** word-only passphrases, weak passwords, credentials
+  in XML attributes (`<add key="DbPassword" value="…"/>`), camelCase
+  generic tokens (`githubToken: …`), URL passwords that are words or
+  numbers.
 - **`DiskBackend::write` follows symlinked parent directories** if called
   directly (checkout and restore guard against it).
 - **Retired identities stay on disk** (`$VEIL_HOME/retired/`, 0600) until
