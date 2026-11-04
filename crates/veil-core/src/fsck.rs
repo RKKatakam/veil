@@ -335,17 +335,16 @@ impl Checker {
             }
             return Load::Bad;
         }
-        if let Some(enc) = Object::tree_encoding(&raw) {
-            if first && enc.min_repo_format() > self.store.format() {
-                self.push(
-                    Severity::Corrupt,
-                    format!(
-                        "object {id}: a format-{} tree in a format-{} repository (older vl cannot read it)",
-                        enc.min_repo_format(),
-                        self.store.format()
-                    ),
-                );
-            }
+        let need = Object::min_repo_format(&raw);
+        if first && need > self.store.format() {
+            let what = if Object::tree_encoding(&raw).is_some() { "tree" } else { "sealed object" };
+            self.push(
+                Severity::Corrupt,
+                format!(
+                    "object {id}: a format-{need} {what} in a format-{} repository (older vl cannot read it)",
+                    self.store.format()
+                ),
+            );
         }
         match Object::decode(&raw) {
             Ok(o) => Load::Obj(o),
@@ -752,8 +751,23 @@ impl Checker {
                             ),
                         );
                     }
+                    let max = crate::keychain::max_ring_format(self.store.format());
+                    if ring.format.max(ring.required_format()) > max {
+                        self.push(
+                            Severity::Corrupt,
+                            format!(
+                                "key ring {path} needs ring format {} (HPKE-wrapped keys) in a format-{} repository (older vl cannot read it)",
+                                ring.format.max(ring.required_format()),
+                                self.store.format()
+                            ),
+                        );
+                    }
                     for (member, m) in &ring.members {
-                        let bad_wrap = m.wrapped.sealed.scope != format!("wrap:{}", ring.scope);
+                        let bad_wrap = match &m.wrapped {
+                            crate::identity::WrappedKey::Legacy(l) => l.sealed.scope != format!("wrap:{}", ring.scope),
+                            // Legacy (unsigned) rings predate HPKE.
+                            crate::identity::WrappedKey::Hpke(_) => true,
+                        };
                         if parse_public_key(member).is_err() || bad_wrap {
                             self.push(
                                 Severity::Corrupt,

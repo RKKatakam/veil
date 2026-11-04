@@ -14,13 +14,15 @@ use std::{
 };
 
 use veil_core::{
-    crypto::Envelope,
+    crypto::{Envelope, Suite},
     embargo::wrapper_of,
     fsck::{fsck, Severity},
     id::ChangeId,
     object::{EntryKind, Object, Snapshot, Text, Tree, TreeEncoding, TreeEntry, Visibility},
     pack::{IDX_MAGIC, PACK_MAGIC},
     remote,
+    identity::WrappedKey,
+    keychain::{current_key_has_legacy_wraps, HpkeMigration, KeyRing, RingOp, RING_FORMAT},
     repo::{read_config, MIN_REPO_FORMAT, REPO_FORMAT},
     tree::{lookup, walk_files},
     upgrade::{upgrade, UpgradeOptions, JOURNAL_PATH},
@@ -64,6 +66,12 @@ impl Fixture {
 
     fn identity(&self, who: &str) -> Identity {
         let s = std::fs::read_to_string(self.root.join(format!("home-{who}/identity.json"))).unwrap();
+        Identity::from_json(&s).unwrap()
+    }
+
+    /// An identity of a nested set (`upgraded/home-<who>`).
+    fn identity_at(&self, dir: &str, who: &str) -> Identity {
+        let s = std::fs::read_to_string(self.root.join(format!("{dir}/home-{who}/identity.json"))).unwrap();
         Identity::from_json(&s).unwrap()
     }
 
@@ -227,7 +235,7 @@ fn sample_snapshot() -> Snapshot {
         tree: ObjectId([8; 32]),
         description: Text::Sealed(Envelope {
             scope: "team#0011223344556677".into(),
-            nonce: [3; 24],
+            suite: Suite::XChaCha20Poly1305 { nonce: [3; 24] },
             ciphertext: vec![1, 2, 3],
         }),
         author: "golden".into(),
@@ -262,9 +270,18 @@ fn golden_encodings() -> Vec<(String, Vec<u8>)> {
             "sealed".into(),
             Object::Sealed(Envelope {
                 scope: "embargo/0123456789".into(),
-                nonce: [4; 24],
+                suite: Suite::XChaCha20Poly1305 { nonce: [4; 24] },
                 ciphertext: vec![9; 20],
             })
+            .encode(),
+        ),
+        // Format 3: AES-SIV (computed, so the KDF and the cipher are pinned too).
+        (
+            "sealed-aes-siv".into(),
+            Object::Sealed(
+                Envelope::seal_deterministic(&[0x42; 32], "team#0011223344556677", &Object::Blob(b"hello\n".to_vec()).encode())
+                    .unwrap(),
+            )
             .encode(),
         ),
     ]
@@ -507,7 +524,8 @@ fn upgrade_dry_run_writes_nothing() {
     assert_eq!((r.from, r.to), (1, REPO_FORMAT));
     assert!(r.corrupt.is_empty(), "{:?}", r.corrupt);
     assert!(r.trees_json > 0);
-    assert_eq!(r.steps.last().map(String::as_str), Some("set-format"));
+    assert!(r.steps.contains(&"set-format".to_string()), "{:?}", r.steps);
+    assert_eq!(r.steps.last().map(String::as_str), Some("3:hpke-ring-keys"));
     assert_eq!(veil_files(&root), before, "a dry run changed .veil/");
 }
 
@@ -817,7 +835,7 @@ fn newer_ring_and_embargo_formats_are_refused() {
     let ring_path = root.join("keyrings/team.json");
     let ring = std::fs::read_to_string(&ring_path)
         .unwrap()
-        .replacen("\"format\": 2", "\"format\": 3", 1);
+        .replacen("\"format\": 2", &format!("\"format\": {}", RING_FORMAT + 1), 1);
     std::fs::write(&ring_path, ring).unwrap();
     let rec = std::fs::read_dir(root.join("embargoes"))
         .unwrap()
@@ -834,4 +852,311 @@ fn newer_ring_and_embargo_formats_are_refused() {
     let id = rec.file_stem().unwrap().to_string_lossy().to_string();
     let err = repo.keys().load_embargo(&id).unwrap_err();
     assert!(matches!(err, VeilError::Unsupported(_)), "{err}");
+}
+
+// ---- format 3: standard cryptography (docs/CRYPTO.md) ------------------------
+
+/// `(veil:seal, veil:sea2)` counts of the sealed objects in a store.
+fn sealed_census(repo: &Repo) -> (usize, usize) {
+    let mut n = (0, 0);
+    for id in repo.store().list_objects().unwrap() {
+        let raw = repo.store().get_raw(&id).unwrap();
+        if raw.starts_with(b"veil:seal\n") {
+            n.0 += 1;
+        } else if raw.starts_with(b"veil:sea2\n") {
+            n.1 += 1;
+        }
+    }
+    n
+}
+
+fn ring_of(repo: &Repo, scope: &str) -> KeyRing {
+    repo.keys().load_ring(scope).unwrap().unwrap()
+}
+
+/// Every wrapped key in a ring's log, with the change kind.
+fn wraps(ring: &KeyRing) -> Vec<(&'static str, WrappedKey)> {
+    let mut out = Vec::new();
+    for c in &ring.log {
+        match &c.op {
+            RingOp::Genesis { members, .. } => out.extend(members.iter().map(|m| ("genesis", m.wrapped.clone()))),
+            RingOp::Grant { member } => out.push(("grant", member.wrapped.clone())),
+            RingOp::Revoke { rotation, .. } => out.extend(rotation.wrapped.values().map(|w| ("revoke", w.clone()))),
+            RingOp::Rotate { rotation } => out.extend(rotation.wrapped.values().map(|w| ("rotate", w.clone()))),
+        }
+    }
+    out
+}
+
+fn commit_edit(fx: &Fixture, repo: &mut Repo, files: &[(&str, &str)], msg: &str) -> ObjectId {
+    for (path, text) in files {
+        std::fs::write(fx.root.join("alice").join(path), text).unwrap();
+    }
+    let fs = fx.backend("alice");
+    repo.snapshot_workspace("default", &*fs).unwrap();
+    repo.commit_working_copy("default", msg).unwrap().0
+}
+
+fn entry_id(repo: &Repo, rev: &ObjectId, path: &str) -> ObjectId {
+    let tree = repo.snapshot(rev).unwrap().tree;
+    lookup(repo.store(), &tree, &p(path)).unwrap().unwrap().id
+}
+
+#[test]
+fn format3_fixture_uses_only_the_standard_constructions() {
+    let fx = Fixture::new(3);
+    let alice = fx.open("alice", Some("alice"));
+    let (legacy, siv) = sealed_census(&alice);
+    assert_eq!(legacy, 0, "a format-3 repository wrote legacy sealed objects");
+    assert!(siv > 0);
+    let ring = ring_of(&alice, "team");
+    assert_eq!(ring.format, RING_FORMAT);
+    assert!(wraps(&ring).iter().all(|(_, w)| w.is_hpke()), "legacy key wrapping in a format-3 ring");
+    for who in ["alice", "bob", "carol"] {
+        assert!(!fx.identity(who).signing_key_is_derived(), "{who}: new identities have independent keys");
+    }
+    // Dave keeps a legacy identity (derived signing key): a member like any other.
+    let dave_id = fx.identity("dave");
+    assert!(dave_id.signing_key_is_derived());
+    let state = ring.verify().unwrap();
+    assert_eq!(
+        state.members[&dave_id.public_hex()].signing_key.as_deref(),
+        Some(dave_id.verifying_hex().as_str())
+    );
+    let dave = fx.open("alice", Some("dave"));
+    let main = tag(&dave, "main");
+    assert_eq!(read_str(&dave, &main, "secrets/notes.txt").as_deref(), Some("team-only notes v2\n"));
+    for r in [&alice, &fx.open("team-remote", None)] {
+        assert_eq!(sealed_census(r).0, 0);
+    }
+    // The vault, descriptions, embargo and older-generation keys still use
+    // XChaCha20-Poly1305 with random nonces (unchanged formats).
+    assert_eq!(
+        alice.vault_load().unwrap().secrets.get("API_TOKEN").map(String::as_str),
+        Some("fixture-value")
+    );
+}
+
+#[test]
+fn upgraded_fixture_mixes_constructions_and_everyone_reads_their_share() {
+    let fx = Fixture::new(3);
+    let open = |who: &str| {
+        let s = std::fs::read_to_string(fx.root.join(format!("upgraded/home-{who}/identity.json"))).unwrap();
+        let id = Identity::from_json(&s).unwrap();
+        assert!(id.signing_key_is_derived(), "the format-2 identities are legacy");
+        Repo::open(fx.backend("upgraded/alice"), Some(id), who).unwrap()
+    };
+    let alice = open("alice");
+    assert_eq!(alice.format(), 3);
+    let (legacy, siv) = sealed_census(&alice);
+    assert!(legacy > 0 && siv > 0, "({legacy}, {siv})");
+    let main = tag(&alice, "main");
+    assert_eq!(read_str(&alice, &main, "secrets/notes.txt").as_deref(), Some("team-only notes v3 (after the upgrade)\n"));
+    let ring = ring_of(&alice, "team");
+    let state = ring.verify().unwrap();
+    assert_eq!(state.generation, 3, "the upgrade rotated to a new generation");
+    assert!(matches!(ring.log.last().unwrap().op, RingOp::Rotate { .. }));
+    assert!(!current_key_has_legacy_wraps(&ring, &state));
+    assert!(wraps(&ring).iter().any(|(_, w)| !w.is_hpke()), "old changes keep their legacy wraps");
+    // Bob reads old and new; Carol (revoked before the upgrade) only generation 0.
+    let bob = open("bob");
+    assert_eq!(read_str(&bob, &main, "secrets/notes.txt").as_deref(), Some("team-only notes v3 (after the upgrade)\n"));
+    let carol = open("carol");
+    assert_eq!(read_str(&carol, &main, "secrets/notes.txt"), None);
+    let first = carol
+        .topo_children_first([main])
+        .unwrap()
+        .into_iter()
+        .find(|id| carol.description(&carol.snapshot(id).unwrap()) == "initial import")
+        .unwrap();
+    assert_eq!(read_str(&carol, &first, "secrets/notes.txt").as_deref(), Some("team-only notes v1\n"));
+    for id in alice.topo_children_first([main]).unwrap() {
+        let s = alice.snapshot(&id).unwrap();
+        assert!(s.parents.is_empty() || alice.keys().snapshot_status(&s).is_good());
+    }
+    assert_fsck_clean(fx.backend("upgraded/alice"), Some(fx.identity_at("upgraded", "alice")));
+    let remote = fx.open("upgraded/team-remote", None);
+    assert_eq!(remote.format(), 3);
+    assert_eq!(ring_of(&remote, "team"), ring);
+    assert_fsck_clean(fx.backend("upgraded/team-remote"), None);
+}
+
+#[test]
+fn format2_repository_keeps_writing_the_legacy_constructions() {
+    let fx = Fixture::new(2);
+    let mut repo = fx.open("alice", Some("alice"));
+    let before = sealed_census(&repo);
+    let c = commit_edit(&fx, &mut repo, &[("secrets/notes.txt", "team-only notes v3\n")], "format-2 commit");
+    assert_eq!(read_str(&repo, &c, "secrets/notes.txt").as_deref(), Some("team-only notes v3\n"));
+    let after = sealed_census(&repo);
+    assert!(after.0 > before.0, "new legacy sealed objects were written");
+    assert_eq!(after.1, 0, "a format-2 repository wrote AES-SIV objects");
+    // Granting a new (independent-key) identity wraps with the legacy box.
+    let erin = Identity::generate("erin");
+    repo.keys().grant("team", &erin.public_id(), "erin").unwrap();
+    let ring = ring_of(&repo, "team");
+    assert_eq!(ring.format, 2);
+    assert!(wraps(&ring).iter().all(|(_, w)| !w.is_hpke()));
+    let erins = Repo::open(fx.backend("alice"), Some(erin), "erin").unwrap();
+    assert_eq!(read_str(&erins, &c, "secrets/notes.txt").as_deref(), Some("team-only notes v3\n"));
+    assert_eq!(read_config(&*fx.backend("alice")).unwrap().format, 2);
+    assert_fsck_clean(fx.backend("alice"), Some(fx.identity("alice")));
+}
+
+#[test]
+fn upgrade_to_3_rotates_rings_to_hpke_and_reseals_nothing() {
+    for from in [1, 2] {
+        let fx = Fixture::new(from);
+        let old = fx.open("alice", Some("alice"));
+        let old_view = old.view().clone();
+        let old_ids: Vec<ObjectId> = old.store().list_objects().unwrap();
+        let old_ring = ring_of(&old, "team");
+        let main = tag(&old, "main");
+        drop(old);
+
+        let r = upgrade(fx.backend("alice"), Some(fx.identity("alice")), &UpgradeOptions::default()).unwrap();
+        assert_eq!((r.from, r.to), (from, 3));
+        assert!(r.steps.contains(&"3:hpke-ring-keys".to_string()), "{:?}", r.steps);
+        assert!(r.notes.iter().any(|n| n.contains("scope 'team': new key generation 3")), "{:#?}", r.notes);
+        assert!(r.notes.iter().any(|n| n.contains("nothing is re-sealed")), "{:#?}", r.notes);
+
+        let mut repo = fx.open("alice", Some("alice"));
+        assert_eq!(repo.view(), &old_view);
+        let now: std::collections::BTreeSet<ObjectId> = repo.store().list_objects().unwrap().into_iter().collect();
+        assert!(old_ids.iter().all(|id| now.contains(id)), "an object disappeared");
+        // The ring grew by exactly one signed rotation, wrapped with HPKE.
+        let ring = ring_of(&repo, "team");
+        assert_eq!(ring.format, RING_FORMAT);
+        assert_eq!(ring.log[..old_ring.log.len()], old_ring.log[..]);
+        assert_eq!(ring.log.len(), old_ring.log.len() + 1);
+        let RingOp::Rotate { rotation } = &ring.log.last().unwrap().op else { panic!() };
+        assert!(rotation.wrapped.values().all(WrappedKey::is_hpke));
+        assert_eq!(ring.verify().unwrap().generation, 3);
+
+        // An unchanged cloaked file keeps its legacy sealing (and id); a
+        // changed one is sealed with AES-SIV under the new generation.
+        let old_notes = entry_id(&repo, &main, "secrets/notes.txt");
+        let c = commit_edit(&fx, &mut repo, &[("README.md", "Fixture project, upgraded\n")], "after upgrade");
+        assert_eq!(entry_id(&repo, &c, "secrets/notes.txt"), old_notes);
+        let c = commit_edit(&fx, &mut repo, &[("secrets/notes.txt", "notes after upgrade\n")], "after upgrade 2");
+        let new_notes = repo.store().get_raw(&entry_id(&repo, &c, "secrets/notes.txt")).unwrap();
+        assert!(new_notes.starts_with(b"veil:sea2\n"));
+        assert!(Object::sealed_scope(&new_notes).unwrap().starts_with("team#"));
+        let bob = fx.open("alice", Some("bob"));
+        assert_eq!(read_str(&bob, &c, "secrets/notes.txt").as_deref(), Some("notes after upgrade\n"));
+        assert_eq!(read_str(&bob, &main, "secrets/notes.txt").as_deref(), Some("team-only notes v2\n"));
+        let carol = fx.open("alice", Some("carol"));
+        assert_eq!(read_str(&carol, &c, "secrets/notes.txt"), None, "revoked before the upgrade");
+        assert_fsck_clean(fx.backend("alice"), Some(fx.identity("alice")));
+
+        // Idempotent: nothing left to do, and the step itself is a no-op.
+        assert!(upgrade(fx.backend("alice"), Some(fx.identity("alice")), &UpgradeOptions::default()).unwrap().up_to_date);
+        assert_eq!(repo.keys().migrate_to_hpke("team").unwrap(), HpkeMigration::AlreadyHpke);
+    }
+}
+
+#[test]
+fn upgrade_by_a_non_admin_leaves_the_ring_and_says_who_can_finish() {
+    let fx = Fixture::new(2);
+    let before = ring_of(&fx.open("alice", Some("alice")), "team");
+    let r = upgrade(fx.backend("alice"), Some(fx.identity("bob")), &UpgradeOptions::default()).unwrap();
+    assert!(r.notes.iter().any(|n| n.contains("an admin should run")), "{:#?}", r.notes);
+    let repo = fx.open("alice", Some("alice"));
+    assert_eq!(repo.format(), 3);
+    assert_eq!(ring_of(&repo, "team"), before, "a non-admin changed the ring");
+    // The admin finishes it later (also what `vl scope rotate` does).
+    assert_eq!(repo.keys().migrate_to_hpke("team").unwrap(), HpkeMigration::Rotated(3));
+    assert_fsck_clean(fx.backend("alice"), Some(fx.identity("alice")));
+}
+
+#[test]
+fn interrupted_upgrade_to_3_resumes_the_ring_step() {
+    let fx = Fixture::new(2);
+    let fs = fx.backend("alice");
+    let mut cfg = read_config(&*fs).unwrap();
+    cfg.format = 3;
+    fs.write(&p(".veil/repo.json"), &serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+    fs.write(
+        &p(JOURNAL_PATH),
+        br#"{"from":2,"to":3,"started":1,"done":["verify","set-format"]}"#,
+    )
+    .unwrap();
+    let r = upgrade(fs.clone(), Some(fx.identity("alice")), &UpgradeOptions::default()).unwrap();
+    assert_eq!(r.steps, vec!["3:hpke-ring-keys".to_string()]);
+    assert!(!fs.exists(&p(JOURNAL_PATH)).unwrap());
+    let repo = fx.open("alice", Some("alice"));
+    assert_eq!(ring_of(&repo, "team").verify().unwrap().generation, 3);
+}
+
+#[test]
+fn aes_siv_objects_and_hpke_rings_never_reach_a_format2_repository() {
+    for full in [false, true] {
+        let opts = remote::SyncOptions { full };
+        let fx = Fixture::new(2);
+        upgrade(fx.backend("alice"), Some(fx.identity("alice")), &UpgradeOptions::default()).unwrap();
+        let mut alice = fx.open("alice", Some("alice"));
+        // Ring only (the upgrade's rotation), no new objects yet: refused.
+        let err = remote::push_with(&mut alice, fx.backend("team-remote"), false, &[], false, &opts).unwrap_err();
+        assert!(matches!(err, VeilError::Unsupported(_)) && err.to_string().contains("vl upgrade"), "{err}");
+        // With AES-SIV objects: refused too, by the store (pack sink or put_raw).
+        let c = commit_edit(&fx, &mut alice, &[("secrets/notes.txt", "sealed with AES-SIV\n")], "siv");
+        alice.set_tag("main", c, None, true).unwrap();
+        let err = remote::push_with(&mut alice, fx.backend("team-remote"), false, &[], false, &opts).unwrap_err();
+        assert!(matches!(err, VeilError::Unsupported(_)) && err.to_string().contains("vl upgrade"), "{err}");
+        let team = fx.open("team-remote", None);
+        assert_eq!(team.format(), 2);
+        assert_eq!(sealed_census(&team).1, 0, "an AES-SIV object reached the format-2 remote");
+        assert_eq!(ring_of(&team, "team").format, 2);
+        assert_fsck_clean(fx.backend("team-remote"), None);
+
+        // A format-2 clone cannot pull them either.
+        let mid = Arc::new(MemoryBackend::new());
+        drop(Repo::init_bare(mid.clone()).unwrap());
+        remote::push_with(&mut alice, mid.clone(), false, &[], false, &opts).unwrap();
+        let mut old = Repo::init_for_clone_at(Arc::new(MemoryBackend::new()), Some(fx.identity("bob")), "bob", 2).unwrap();
+        let err = remote::pull_with(&mut old, "origin", mid.clone(), &opts).unwrap_err();
+        assert!(matches!(err, VeilError::Unsupported(_)), "{err}");
+
+        // Once the remote is upgraded, the push goes through and Bob reads it.
+        upgrade(fx.backend("team-remote"), None, &UpgradeOptions::default()).unwrap();
+        remote::push_with(&mut alice, fx.backend("team-remote"), false, &[], false, &opts).unwrap();
+        let mut bob = Repo::init_for_clone(Arc::new(MemoryBackend::new()), Some(fx.identity("bob")), "bob").unwrap();
+        remote::pull(&mut bob, "origin", fx.backend("team-remote")).unwrap();
+        let main = tag(&bob, "main");
+        assert_eq!(read_str(&bob, &main, "secrets/notes.txt").as_deref(), Some("sealed with AES-SIV\n"));
+        assert_fsck_clean(fx.backend("team-remote"), None);
+    }
+}
+
+#[test]
+fn fsck_reports_format3_crypto_in_a_format2_repository() {
+    let fx = Fixture::new(2);
+    let fs = fx.backend("alice");
+    let siv = Object::Sealed(Envelope::seal_deterministic(&[1; 32], "team", b"veil:blob\nx").unwrap()).encode();
+    let id = ObjectId::hash(&siv);
+    let hex = id.hex();
+    fs.write(&p(&format!(".veil/objects/{}/{}", &hex[..2], &hex[2..])), &siv).unwrap();
+    let report = fsck(fs.clone(), None).unwrap();
+    assert!(
+        report.findings.iter().any(|f| f.severity == Severity::Corrupt && f.message.contains("format-3 sealed object")),
+        "{:#?}",
+        report.findings
+    );
+    // The store refuses to accept it, too.
+    let repo = fx.open("alice", Some("alice"));
+    let other = Object::Sealed(Envelope::seal_deterministic(&[2; 32], "team", b"veil:blob\ny").unwrap()).encode();
+    let err = repo.store().put_raw(&ObjectId::hash(&other), &other).unwrap_err();
+    assert!(matches!(err, VeilError::Unsupported(_)), "{err}");
+    // An HPKE ring planted in a format-2 repository is reported, and refused by the keychain.
+    let fx3 = Fixture::new(3);
+    let ring = std::fs::read(fx3.root.join("alice/.veil/meta/keyrings/team.json")).unwrap();
+    let r: KeyRing = serde_json::from_slice(&ring).unwrap();
+    assert!(matches!(repo.keys().save_ring(&r), Err(VeilError::Unsupported(_))));
+    fs.write(&p(".veil/meta/keyrings/team.json"), &ring).unwrap();
+    let report = fsck(fs, None).unwrap();
+    assert!(
+        report.findings.iter().any(|f| f.severity == Severity::Corrupt && f.message.contains("needs ring format 3")),
+        "{:#?}",
+        report.findings
+    );
 }

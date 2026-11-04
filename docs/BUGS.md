@@ -133,6 +133,7 @@ Test files:
 * **Actual:** The test, as an outsider with no identity, decrypts `team-only-api-token`.
 * **Root cause:** `parse_public_key` (`identity.rs:52`) accepts any 32 bytes. `wrap_key` uses `diffie_hellman` without checking `was_contributory()` (`identity.rs:66`).
 * **Test:** `adversarial_confidentiality::granting_a_low_order_public_key_does_not_publish_the_scope_key`
+* **Reopened and fixed (crypto hardening):** the test only inspected the legacy `members` map, so after rings became signed logs it passed without looking at any wrap, and the legacy box still accepted low-order keys. Now HPKE (format 3) and the legacy box (`wrap_key_legacy`, formats 1–2) both refuse them; the test inspects every wrap in the log, and `granting_a_low_order_public_key_is_refused_by_the_legacy_wrapping_too` covers format 2.
 
 ### BUG-011: Revocation never reaches remotes; key rings merge as unions
 * **Category:** access control / forged or replayed key rings

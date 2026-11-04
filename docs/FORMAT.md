@@ -16,6 +16,7 @@ There is one **repository format**, a number in `.veil/repo.json`:
 |---|---|---|
 | 1 | 0.1.0 | everything below, trees in JSON |
 | 2 | 1.0.0 | binary trees (§3) |
+| 3 | 1.0.0 | standard cryptography: AES-SIV sealed objects (`veil:sea2`), HPKE-wrapped ring keys (ring format 3); see [CRYPTO.md](CRYPTO.md) |
 
 * `vl init` writes the newest format (`repo::REPO_FORMAT`). `vl clone` takes
   the format of its source, so that what the clone writes can be pushed
@@ -46,14 +47,16 @@ not be understood.
 | — blob | `veil:blob\n` ‖ bytes | none needed: any bytes are valid | yes | a new blob encoding would be a new tag |
 | — tree | `veil:tree\n` ‖ `{` JSON (v1) or `0x02` binary (v2) | encoding byte | yes | §3 |
 | — snapshot | `veil:snap\n` ‖ `{` JSON (v1) | encoding byte | yes | canonical (§3.3) |
-| — sealed | `veil:seal\n` ‖ u16 **big-endian** label length ‖ label ‖ nonce[24] ‖ XChaCha20-Poly1305 ciphertext | tag | yes | the plaintext is another object's encoding; a new envelope layout would be a new tag |
+| — sealed (formats 1–2) | `veil:seal\n` ‖ u16 **big-endian** label length ‖ label ‖ nonce[24] ‖ XChaCha20-Poly1305 ciphertext | tag | yes | the plaintext is another object's encoding; nonce derived from the plaintext (legacy, CRYPTO.md C1L); still written by format-1/2 repositories |
+| — sealed (format 3) | `veil:sea2\n` ‖ u16 **big-endian** label length ‖ label ‖ SIV[16] ‖ AES-SIV ciphertext | tag | yes | AES-SIV-CMAC-512 under `HKDF-SHA256(scope key)`, AD = `[label]` (CRYPTO.md C1); refused below format 3 |
 | — embargo wrapper | an ordinary tree with an `embargo` marker entry | as trees | yes | `embargo.rs` |
 | packs `.veil/objects/pack/pack-<sum>.pack` | `VEILPAK1` ‖ count u32 ‖ entries ‖ BLAKE3 | magic digit | no (sync sends canonical objects) | entry kinds 0 stored, 1 zstd, 2 delta; 3–15 reserved |
 | pack indexes `pack-<sum>.idx` | `VEILIDX1` ‖ count ‖ fanout ‖ ids ‖ offsets ‖ lengths ‖ pack sum ‖ BLAKE3 | magic digit | no | |
 | operations `.veil/ops/<id>` | JSON `Operation {parents, timestamp, user, description, view}`, id = BLAKE3 of the bytes | repository format | no (device/repository-local) | |
 | `.veil/op_head` | hex id | fixed | no | |
 | pruned-ops list `.veil/ops_pruned` | one hex id per line | fixed | no | append-only |
-| key rings `.veil/meta/keyrings/<scope>.json` | pretty JSON `KeyRing` | `format` (0/1 legacy, 2 signed log) | yes | readers reject `format > 2` (no keys, a warning on sync) |
+| key rings `.veil/meta/keyrings/<scope>.json` | pretty JSON `KeyRing` | `format` (0/1 legacy, 2 signed log, 3 signed log that may hold HPKE-wrapped keys) | yes | readers reject `format > 3` (no keys, a warning on sync); a ring with an HPKE wrap must say 3, and a format-1/2 repository refuses to store it |
+| — wrapped key (in a ring change) | JSON: legacy `{ephemeral, sealed}` or HPKE `{hpke, enc, ct}` | shape + `hpke` suite string | yes | legacy written by format 1–2, HPKE by format 3 (CRYPTO.md C3/C3L); unknown fields or suites refused |
 | embargo records `.veil/meta/embargoes/<id>.json` | pretty JSON `EmbargoRecord` | implicit 1; a later format adds `"format": N` | yes | readers reject `format > 1` |
 | vault `.veil/local/vault.sealed` | envelope (label `local`) around JSON `VaultData` | repository format | no (device-local) | |
 | stat cache `.veil/local/statcache/<ws>.cache` | `veil:statcache\n` ‖ version u32 ‖ … ‖ BLAKE3 | `VERSION` (1) | no | any mismatch reads as empty: a cache, never data |
@@ -63,7 +66,7 @@ not be understood.
 | gc pending `.veil/objects/gc/pending` | `VEILGCP1` ‖ count u32 ‖ (id, ms)* ‖ BLAKE3 | magic | no | damaged/unknown reads as empty: only restarts the grace period |
 | gc keep markers `.veil/objects/gc/keep/<id>` | empty files | none | no | |
 | upgrade journal `.veil/upgrade.json` | pretty JSON `{from, to, started, done[]}` | — | no | present only during `vl upgrade` |
-| identity `$VEIL_HOME/identity.json`, `retired/` | JSON `{name, public, secret, signing?}` | tolerant (legacy files lack `signing`) | no | outside the repository |
+| identity `$VEIL_HOME/identity.json`, `retired/` | legacy JSON `{name, public, secret, signing?}` (signing key derived); format 2 `{format: 2, name, public, signing, encryption_secret, signing_secret}` (independent keys) | `format` (absent = legacy) | no | outside the repository; new identities are format 2 whatever the repository format; format 2 has no `secret` so older vl refuse it; readers reject `format > 2` |
 | `.veilpolicy` | text, one rule per line | grammar is fail-safe: unknown tiers isolate | yes (it is a tracked file) | |
 
 Signed bodies have their own fixed encodings and must never change: the ring
@@ -153,12 +156,17 @@ work, which the engine avoids:
 
 * `ObjectStore` writes trees in its repository's encoding (`set_format`,
   set by `Repo::open` from `repo.json`) and its `put_raw` **refuses** a
-  binary tree in a format-1 repository. Push and pull copy objects with
+  binary tree in a format-1 repository, and an AES-SIV sealed object
+  (`veil:sea2`) in a format-1 or 2 one (`Object::min_repo_format`,
+  `check_storable`; the pack sink of incremental sync calls it too). The
+  keychain follows the same format: it wraps keys with HPKE only from
+  format 3 and refuses to store a format-3 ring below it. Push and pull copy objects with
   `put_raw`, so a format-1 remote or clone can never receive an object an
   older vl could not read: the push fails with "upgrade it with `vl upgrade
   --remote <name>`", and nothing is recorded.
-* `fsck` reports a binary tree in a format-1 repository as corruption, and
-  a repository format newer than it knows.
+* `fsck` reports a binary tree in a format-1 repository, an AES-SIV object
+  or an HPKE ring in a format-1/2 repository as corruption, and a
+  repository format newer than it knows.
 * `Object::encode()` is the format-1 encoding (unchanged API);
   `Object::encode_with(TreeEncoding)` and `ObjectStore::encode` give the
   encoding of a particular repository.
@@ -202,12 +210,17 @@ vl upgrade [--dry-run] [--remote NAME] [--force]
    writes the journal `.veil/upgrade.json`.
 2. **verify**: runs `fsck` and counts trees by encoding. Any corruption
    stops the upgrade before anything changes (`--force` overrides).
-3. One step per format transition. `1 → 2` has none: no object is
-   rewritten.
+3. One step per format transition. `1 → 2` and `2 → 3` have none: no
+   object is rewritten.
 4. **set-format**: rewrites `repo.json` with the new format and `min_vl`,
    atomically and durably. This is the commit point: before it the
    repository is entirely the old format, after it entirely the new one.
-5. Removes the journal.
+5. Steps that need the new format. `3:hpke-ring-keys`: for every scope this
+   identity administers whose current key was ever wrapped with the legacy
+   box, append a signed `Rotate` (a new generation, HPKE-wrapped to every
+   member, carrying the previous key). Idempotent; a non-admin gets a note
+   naming who can finish it; skipped for `--remote` (no identity).
+6. Removes the journal.
 
 Each finished step is journaled before the next starts, so `vl upgrade`
 after a crash resumes (it skips verification if it already passed, and
@@ -237,11 +250,35 @@ opening sealed content).
 * **Downgrades** are not supported: an older vl refuses a format-2
   repository with a message naming the release it needs.
 
+### Format 3 (standard cryptography)
+
+* **Nothing is re-sealed.** Sealed objects written before the upgrade keep
+  the legacy construction, their bytes and their ids; re-sealing would
+  change every tree and snapshot id above them and break every signature.
+  Unchanged cloaked files keep their sealing when re-snapshotted. New and
+  changed content is sealed with AES-SIV. For the security review this
+  means pre-upgrade history stays under the legacy constructions forever
+  (CRYPTO.md §5).
+* **Rings.** The upgrading admin's rotation makes each ring format 3. A
+  remote or clone at format 2 refuses it (and AES-SIV objects) with "run
+  `vl upgrade` / `vl upgrade --remote <name>`". The order for a team is the
+  one above: everyone installs this vl, `vl upgrade --remote origin`, one
+  admin upgrades and pushes (others pull before upgrading, so the rotation
+  is not made twice: two admins rotating concurrently diverge the ring, as
+  any concurrent admin edits do).
+* **Identities** created by this release have independent signing keys
+  (identity format 2). Existing identity files keep their derived key
+  (`vl identity show` says "legacy") and keep working everywhere; an
+  older vl cannot load a new identity file.
+
 ## 6. Compatibility fixtures
 
 `crates/veil-core/tests/fixtures/format-N/` holds the repositories that the
 release introducing format N wrote, generated once by `generate.sh` and never
-regenerated: three identities (`home-alice`, `home-bob`, `home-carol`), the
+regenerated (from format 3 on, `generate.sh <vl> <out> <format-(N-1)>`, which
+adds `home-dave`, a legacy identity granted to the scope, and `upgraded/`,
+the previous set after `vl upgrade` with one more commit pushed, mixing old
+and new constructions): three identities (`home-alice`, `home-bob`, `home-carol`), the
 project `alice/` (packed and loose objects, a cloaked directory, a ring with
 a grant, a revocation and a rotation (key generation 2), a released and an
 unreleased embargo, a cloaked tag, a vault, gc pending list, pruned ops,
@@ -260,7 +297,11 @@ this build:
   refuses a corrupt repository without changing it;
 * syncs across formats as described in §5;
 * refuses newer repository formats, object encodings, flag bits, object
-  kinds, pack versions, ring and embargo-record formats as `Unsupported`.
+  kinds, pack versions, ring and embargo-record formats as `Unsupported`;
+* writes only AES-SIV objects and HPKE wraps at format 3 and only the legacy
+  ones at formats 1–2, upgrades 1→3 and 2→3 (rings rotated to HPKE, every
+  object and id kept), and never lets format-3 cryptography reach a
+  format-1/2 repository (push, pull, incremental and full).
 
 Two checks make format changes impossible to miss:
 
@@ -268,7 +309,8 @@ Two checks make format changes impossible to miss:
   `MIN_REPO_FORMAT` to `REPO_FORMAT` has a fixture set at that format;
 * `encodings_match_the_golden_file` pins the bytes of every object encoding
   in `tests/fixtures/encodings.txt` (blob, empty tree, JSON and binary
-  trees, root and full snapshots with a signature, sealed). Changing what is
+  trees, root and full snapshots with a signature, sealed, sealed with
+  AES-SIV). Changing what is
   written fails until the change becomes a new format; then new lines are
   appended (`VEIL_BLESS_ENCODINGS=1`), never edited.
 

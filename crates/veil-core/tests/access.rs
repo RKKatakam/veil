@@ -515,7 +515,7 @@ fn ring_change_with_stripped_signature_is_rejected() {
     legacy["members"][Identity::generate("m").public_hex()] =
         serde_json::to_value(veil_core::keychain::RingMember {
             name: "mallory".into(),
-            wrapped: veil_core::identity::wrap_key(&[9u8; 32], &[1u8; 32], "team").unwrap(),
+            wrapped: veil_core::identity::wrap_key_legacy(&[9u8; 32], &[1u8; 32], "team").unwrap(),
         })
         .unwrap();
     let legacy: KeyRing = serde_json::from_value(legacy).unwrap();
@@ -529,7 +529,7 @@ fn ring_change_with_stripped_signature_is_rejected() {
 fn legacy_rings_and_envelopes_keep_working_and_upgrade_on_first_change() {
     use veil_core::{
         crypto::{random_key, Envelope},
-        identity::wrap_key,
+        identity::wrap_key_legacy as wrap_key,
         keychain::{key_fingerprint, RingMember},
         object::Object,
     };
@@ -556,7 +556,7 @@ fn legacy_rings_and_envelopes_keep_working_and_upgrade_on_first_change() {
     }
     repo.keys().save_ring(&legacy).unwrap();
     let blob = Object::Blob(b"old secret".to_vec());
-    let sealed = Object::Sealed(Envelope::seal(&key, "team", &blob.encode(), true).unwrap());
+    let sealed = Object::Sealed(Envelope::seal_deterministic_legacy(&key, "team", &blob.encode()).unwrap());
     let old_id = repo.store().put(&sealed).unwrap();
     assert_eq!(repo.store().read_blob(&old_id).unwrap(), b"old secret");
     assert!(repo.keys().is_member("team"));
@@ -579,7 +579,7 @@ fn legacy_rings_and_envelopes_keep_working_and_upgrade_on_first_change() {
 
 #[test]
 fn embargo_on_a_legacy_ring_upgrades_it_so_the_record_is_attributable() {
-    use veil_core::{crypto::random_key, identity::wrap_key, keychain::{key_fingerprint, RingMember}};
+    use veil_core::{crypto::random_key, identity::wrap_key_legacy as wrap_key, keychain::{key_fingerprint, RingMember}};
     let fs = Arc::new(MemoryBackend::new());
     let alice = Identity::generate("alice");
     let repo = Repo::init_for_clone(fs, Some(alice.clone()), "alice").unwrap();

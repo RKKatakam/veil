@@ -238,10 +238,16 @@ fn wrapped_key_moved_between_scopes_or_recipients_fails() {
     let w = wrap_key(&alice.public_key(), &k, "team").unwrap();
     assert!(alice.unwrap_key(&w, "ops").is_err());
     assert!(bob.unwrap_key(&w, "team").is_err());
-    let mut relabelled = w.clone();
-    relabelled.sealed.scope = "wrap:ops".into();
-    assert!(alice.unwrap_key(&relabelled, "ops").is_err());
     assert_eq!(alice.unwrap_key(&w, "team").unwrap(), k);
+    // The legacy sealed box carries its label: relabelling it must not help.
+    let legacy = veil_core::identity::wrap_key_legacy(&alice.public_key(), &k, "team").unwrap();
+    let veil_core::identity::WrappedKey::Legacy(mut relabelled) = legacy.clone() else { panic!() };
+    relabelled.sealed.scope = "wrap:ops".into();
+    let relabelled = veil_core::identity::WrappedKey::Legacy(relabelled);
+    assert!(alice.unwrap_key(&relabelled, "ops").is_err());
+    assert!(alice.unwrap_key(&legacy, "ops").is_err());
+    assert!(bob.unwrap_key(&legacy, "team").is_err());
+    assert_eq!(alice.unwrap_key(&legacy, "team").unwrap(), k);
 }
 
 #[test]

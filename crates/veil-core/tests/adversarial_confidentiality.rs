@@ -12,7 +12,7 @@ use veil_core::{
     commands::EmbargoSpec,
     crypto::Envelope,
     identity::WrappedKey,
-    keychain::KeyRing,
+    keychain::{KeyRing, RingOp},
     object::{Object, Text, Visibility},
     policy::{Policy, Tier},
     remote,
@@ -373,8 +373,22 @@ fn granting_a_low_order_public_key_does_not_publish_the_scope_key() {
     // Outsider: no identity at all, just reads files from the team remote.
     let ring: KeyRing = serde_json::from_slice(&team.read(&p(".veil/meta/keyrings/team.json")).unwrap()).unwrap();
     let mut recovered = None;
-    for m in ring.members.values() {
-        let WrappedKey { ephemeral, sealed } = &m.wrapped;
+    // Every wrapped key anywhere in the ring: the legacy member map and the
+    // signed log (HPKE refuses low-order recipients outright; the legacy box
+    // is what this attack targeted, and it must refuse them too).
+    let mut all: Vec<&WrappedKey> = ring.members.values().map(|m| &m.wrapped).collect();
+    for c in &ring.log {
+        match &c.op {
+            RingOp::Genesis { members, .. } => all.extend(members.iter().map(|m| &m.wrapped)),
+            RingOp::Grant { member } => all.push(&member.wrapped),
+            RingOp::Revoke { rotation, .. } | RingOp::Rotate { rotation } => all.extend(rotation.wrapped.values()),
+        }
+    }
+    assert!(!all.is_empty());
+    for w in all {
+        let WrappedKey::Legacy(veil_core::identity::LegacyWrappedKey { ephemeral, sealed }) = w else {
+            continue;
+        };
         let eph = hex::decode(ephemeral).unwrap();
         let mut material = vec![0u8; 32]; // shared secret with a low-order point
         material.extend_from_slice(&eph);
@@ -391,6 +405,24 @@ fn granting_a_low_order_public_key_does_not_publish_the_scope_key() {
         let plain = env.open(&key).unwrap();
         panic!("outsider decrypted cloaked content: {:?}", String::from_utf8_lossy(&plain));
     }
+}
+
+/// The same attack against a repository still at format 2, which wraps
+/// with the legacy sealed box: the grant must be refused there too.
+#[test]
+fn granting_a_low_order_public_key_is_refused_by_the_legacy_wrapping_too() {
+    let alice = Identity::generate("alice");
+    let repo = Repo::init_for_clone_at(Arc::new(MemoryBackend::new()), Some(alice), "alice", 2).unwrap();
+    repo.keys().create_scope("team").unwrap();
+    let mut one = vec![0u8; 32];
+    one[0] = 1;
+    for low in [vec![0u8; 32], one] {
+        let err = repo.keys().grant("team", &format!("veil1{}", hex::encode(&low)), "new-hire").unwrap_err();
+        assert!(err.to_string().contains("cannot wrap"), "{err}");
+    }
+    let ring = repo.keys().load_ring("team").unwrap().unwrap();
+    assert_eq!(ring.format, 2, "a format-2 repository wrote a newer ring");
+    assert_eq!(ring.log.len(), 1, "only the genesis");
 }
 
 /// Alice grants Bob `ops`, pushes, then revokes Bob *before he ever pulled*

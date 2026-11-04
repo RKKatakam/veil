@@ -11,7 +11,8 @@
 //! * `Snapshot` — immutable node of the history DAG.
 //! * `Sealed`   — a [`crate::crypto::Envelope`] wrapping the encoding of any
 //!   other object. Sealed objects are self-describing: the envelope names the
-//!   scope whose key opens it.
+//!   scope whose key opens it. Two tags: `veil:seal` (XChaCha20-Poly1305,
+//!   formats 1–2) and `veil:sea2` (AES-SIV, format 3; see `docs/CRYPTO.md`).
 //!
 //! # Encodings and their evolution
 //!
@@ -44,6 +45,11 @@ const BLOB_TAG: &[u8] = b"veil:blob\n";
 const TREE_TAG: &[u8] = b"veil:tree\n";
 const SNAP_TAG: &[u8] = b"veil:snap\n";
 const SEAL_TAG: &[u8] = b"veil:seal\n";
+/// Sealed object, AES-SIV envelope (repository format 3).
+const SEAL_AES_SIV_TAG: &[u8] = b"veil:sea2\n";
+
+/// Lowest repository format that may store `veil:sea2` (AES-SIV) objects.
+pub const AES_SIV_REPO_FORMAT: u32 = 3;
 
 /// First payload byte of the format-1 JSON encodings (trees and snapshots).
 pub const ENCODING_JSON: u8 = b'{';
@@ -626,6 +632,7 @@ impl Object {
             Object::Tree(t) if trees == TreeEncoding::Binary && !t.is_empty() => (TREE_TAG, t.encode_binary()),
             Object::Tree(t) => (TREE_TAG, serde_json::to_vec(t).unwrap()),
             Object::Snapshot(s) => (SNAP_TAG, serde_json::to_vec(s).unwrap()),
+            Object::Sealed(e) if e.is_aes_siv() => (SEAL_AES_SIV_TAG, e.to_bytes()),
             Object::Sealed(e) => (SEAL_TAG, e.to_bytes()),
         };
         let mut out = Vec::with_capacity(tag.len() + body.len());
@@ -674,6 +681,8 @@ impl Object {
             }
         } else if let Some(b) = raw.strip_prefix(SEAL_TAG) {
             Ok(Object::Sealed(Envelope::from_bytes(b)?))
+        } else if let Some(b) = raw.strip_prefix(SEAL_AES_SIV_TAG) {
+            Ok(Object::Sealed(Envelope::from_bytes_aes_siv(b)?))
         } else if let Some(kind) = tag_shaped(raw) {
             Err(VeilError::Unsupported(format!(
                 "object kind '{kind}' is unknown to vl {}; this repository needs a newer vl",
@@ -694,6 +703,18 @@ impl Object {
         }
     }
 
+    /// Lowest repository format whose readers can read the raw object
+    /// (binary trees: 2; AES-SIV sealed objects: 3; everything else: 1).
+    pub fn min_repo_format(raw: &[u8]) -> u32 {
+        if let Some(enc) = Object::tree_encoding(raw) {
+            enc.min_repo_format()
+        } else if raw.starts_with(SEAL_AES_SIV_TAG) {
+            AES_SIV_REPO_FORMAT
+        } else {
+            1
+        }
+    }
+
     /// Id a blob with this content would have, without copying it.
     pub fn blob_id(data: &[u8]) -> ObjectId {
         let mut h = blake3::Hasher::new();
@@ -704,7 +725,9 @@ impl Object {
 
     /// Scope of a raw sealed object, `None` for plaintext objects.
     pub fn sealed_scope(raw: &[u8]) -> Option<String> {
-        raw.strip_prefix(SEAL_TAG).and_then(Envelope::peek_scope)
+        raw.strip_prefix(SEAL_TAG)
+            .or_else(|| raw.strip_prefix(SEAL_AES_SIV_TAG))
+            .and_then(Envelope::peek_scope)
     }
 
     pub fn is_blob_raw(raw: &[u8]) -> bool {

@@ -157,6 +157,8 @@ impl ObjectStore {
     /// [`crate::repo::REPO_FORMAT`]). `Repo::open` sets it from `repo.json`.
     pub fn set_format(&self, repo_format: u32) {
         self.format.store(repo_format, Ordering::SeqCst);
+        // Key wrapping and ring formats follow the repository format too.
+        self.keys.set_format(repo_format);
     }
 
     /// The repository format this store writes.
@@ -176,20 +178,35 @@ impl ObjectStore {
     }
 
     /// Refuse objects this repository's format may not hold (a format-1
-    /// repository must stay readable by every vl that reads format 1).
+    /// repository must stay readable by every vl that reads format 1): binary
+    /// trees below format 2, AES-SIV sealed objects below format 3.
     pub(crate) fn check_storable(&self, raw: &[u8]) -> Result<()> {
-        if let Some(enc) = Object::tree_encoding(raw) {
-            let need = enc.min_repo_format();
-            let have = self.format();
-            if need > have {
-                return Err(VeilError::Unsupported(format!(
-                    "this repository is at format {have} and cannot store format-{need} (binary) trees; \
-                     upgrade it with `vl upgrade` (a remote: `vl upgrade --remote <name>`) once everyone who uses it runs vl {} or later",
-                    crate::repo::min_vl_for_format(need)
-                )));
-            }
+        let need = Object::min_repo_format(raw);
+        let have = self.format();
+        if need > have {
+            let what = if Object::tree_encoding(raw).is_some() {
+                "(binary) trees"
+            } else {
+                "(AES-SIV) sealed objects"
+            };
+            return Err(VeilError::Unsupported(format!(
+                "this repository is at format {have} and cannot store format-{need} {what}; \
+                 upgrade it with `vl upgrade` (a remote: `vl upgrade --remote <name>`) once everyone who uses it runs vl {} or later",
+                crate::repo::min_vl_for_format(need)
+            )));
         }
         Ok(())
+    }
+
+    /// Deterministic envelope of this repository's format: AES-SIV from
+    /// format 3, the legacy XChaCha20-Poly1305 construction before (which
+    /// older vl must keep reading).
+    fn seal_deterministic(&self, key: &crate::crypto::Key, label: &str, plaintext: &[u8]) -> Result<Envelope> {
+        if self.format() >= crate::object::AES_SIV_REPO_FORMAT {
+            Envelope::seal_deterministic(key, label, plaintext)
+        } else {
+            Envelope::seal_deterministic_legacy(key, label, plaintext)
+        }
     }
 
     /// From now until the matching [`ObjectStore::end_unsynced`], new loose
@@ -686,7 +703,8 @@ impl ObjectStore {
     /// a label that already names a generation is used as is.
     pub fn seal(&self, inner: &Object, scope: &str) -> Result<Object> {
         let (label, key) = self.keys.sealing_key(scope)?;
-        Ok(Object::Sealed(Envelope::seal(&key, &label, &self.encode(inner), true)?))
+        let key = zeroize::Zeroizing::new(key);
+        Ok(Object::Sealed(self.seal_deterministic(&key, &label, &self.encode(inner))?))
     }
 
     /// Store file content with the given visibility, returning its id.
@@ -751,10 +769,18 @@ impl ObjectStore {
         }
         match Object::sealed_scope(&raw) {
             Some(label) if self.keys.has(&label) => {
-                // Re-seal under the reference's exact label (generation).
-                let key = self.keys.require(&label)?;
-                let sealed = Object::Sealed(Envelope::seal(&key, &label, &Object::Blob(data.to_vec()).encode(), true)?);
-                Ok(ObjectId::hash(&sealed.encode()) == *reference)
+                // Open the reference and compare plaintexts: sealing is
+                // deterministic per construction, so equal plaintext under
+                // the same label means the reference is what this repository
+                // would write (or an older construction's equivalent, which
+                // is kept rather than re-sealed: same content, same id).
+                let Ok(Object::Sealed(env)) = Object::decode(&raw) else {
+                    return Ok(false);
+                };
+                let key = zeroize::Zeroizing::new(self.keys.require(&label)?);
+                let Ok(plain) = env.open(&key) else { return Ok(false) };
+                let plain = zeroize::Zeroizing::new(plain);
+                Ok(plain.strip_prefix(&b"veil:blob\n"[..]) == Some(data))
             }
             _ => Ok(false),
         }
@@ -765,7 +791,8 @@ impl ObjectStore {
             None => Ok(Text::Plain(text.to_string())),
             Some(scope) => {
                 let (label, key) = self.keys.sealing_key(scope)?;
-                Ok(Text::Sealed(Envelope::seal(&key, &label, text.as_bytes(), false)?))
+                let key = zeroize::Zeroizing::new(key);
+                Ok(Text::Sealed(Envelope::seal_random(&key, &label, text.as_bytes())?))
             }
         }
     }

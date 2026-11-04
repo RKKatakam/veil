@@ -413,6 +413,9 @@ fn cmd_identity(c: &IdentityCmd) -> Result<ExitCode> {
             println!("public key  {}", id.public_id());
             println!("member id   {}", id.public_hex());
             println!("signing key {}", id.verifying_hex());
+            if id.signing_key_is_derived() {
+                println!("            (legacy: derived from the encryption key; `vl identity new` creates independent keys)");
+            }
             println!("stored at   {}", ctx::identity_path().display());
         }
         IdentityCmd::New { name, force } => {

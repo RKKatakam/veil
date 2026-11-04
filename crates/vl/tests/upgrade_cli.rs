@@ -60,18 +60,19 @@ fn upgrade_from_the_cli() {
     assert!(ok(&vl(&home, &alice, &["cat", "secrets/notes.txt", "-r", "main"])).contains("team-only notes v2"));
     let dry = ok(&vl(&home, &alice, &["upgrade", "--dry-run"]));
     assert!(
-        dry.contains("Would upgrade this repository from format 1 to format 2"),
+        dry.contains("Would upgrade this repository from format 1 to format 3"),
         "{dry}"
     );
     assert_eq!(format_of(&alice), 1);
 
     let out = ok(&vl(&home, &alice, &["upgrade"]));
     assert!(
-        out.contains("Upgraded this repository from format 1 to format 2"),
+        out.contains("Upgraded this repository from format 1 to format 3"),
         "{out}"
     );
-    assert_eq!(format_of(&alice), 2);
-    assert!(ok(&vl(&home, &alice, &["upgrade"])).contains("already at format 2"));
+    assert!(out.contains("scope 'team': new key generation 3"), "{out}");
+    assert_eq!(format_of(&alice), 3);
+    assert!(ok(&vl(&home, &alice, &["upgrade"])).contains("already at format 3"));
     ok(&vl(&home, &alice, &["fsck"]));
 
     // New commits are binary; the format-1 remote refuses them until upgraded.
@@ -91,7 +92,55 @@ fn upgrade_from_the_cli() {
     let up = ok(&vl(&home, &alice, &["upgrade", "--remote", "origin"]));
     assert!(up.contains("Upgraded remote 'origin'"), "{up}");
     ok(&vl(&home, &alice, &["push", "origin"]));
+    assert_eq!(format_of(&root.join("team-remote")), 3);
+}
+
+#[test]
+fn upgrade_from_format_2_moves_keys_to_hpke_from_the_cli() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("fx");
+    copy_dir(&fixture(2), &root);
+    let (home, alice) = (root.join("home-alice"), root.join("alice"));
+    let show = ok(&vl(&home, &alice, &["identity", "show"]));
+    assert!(show.contains("legacy: derived from the encryption key"), "{show}");
+
+    let out = ok(&vl(&home, &alice, &["upgrade"]));
+    assert!(out.contains("from format 2 to format 3"), "{out}");
+    assert!(out.contains("3:hpke-ring-keys"), "{out}");
+    assert!(out.contains("nothing is re-sealed"), "{out}");
+    assert!(ok(&vl(&home, &alice, &["cat", "secrets/notes.txt", "-r", "main"])).contains("team-only notes v2"));
+    ok(&vl(&home, &alice, &["fsck"]));
+
+    std::fs::write(alice.join("secrets/notes.txt"), "notes after the upgrade\n").unwrap();
+    ok(&vl(&home, &alice, &["commit", "-m", "after upgrade"]));
+    ok(&vl(&home, &alice, &["tag", "set", "main", "-r", "@-", "--allow-backwards"]));
+    // The format-2 remote refuses AES-SIV objects and the HPKE ring.
+    let push = vl(&home, &alice, &["push", "origin"]);
+    assert!(!push.status.success());
+    assert!(String::from_utf8_lossy(&push.stderr).contains("vl upgrade --remote"), "{push:?}");
     assert_eq!(format_of(&root.join("team-remote")), 2);
+    ok(&vl(&home, &alice, &["upgrade", "--remote", "origin"]));
+    ok(&vl(&home, &alice, &["push", "origin"]));
+
+    // Bob (a member, legacy identity) clones the upgraded remote and reads it.
+    let bob_home = root.join("home-bob");
+    let dest = tmp.path().join("bob-clone");
+    ok(&vl(&bob_home, tmp.path(), &["clone", root.join("team-remote").to_str().unwrap(), dest.to_str().unwrap()]));
+    assert_eq!(format_of(&dest), 3);
+    assert!(ok(&vl(&bob_home, &dest, &["cat", "secrets/notes.txt", "-r", "main"])).contains("notes after the upgrade"));
+}
+
+#[test]
+fn new_identities_have_independent_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let out = ok(&vl(&home, tmp.path(), &["identity", "new", "--name", "zoe"]));
+    assert!(out.contains("Created identity zoe"), "{out}");
+    let show = ok(&vl(&home, tmp.path(), &["identity", "show"]));
+    assert!(!show.contains("legacy"), "{show}");
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(home.join("identity.json")).unwrap()).unwrap();
+    assert_eq!(v["format"], 2);
+    assert!(v.get("secret").is_none() && v.get("signing_secret").is_some());
 }
 
 #[test]
