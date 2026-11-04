@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e7707305355e7367ad4129d177c1dc1baaf3ff0085cfa9f757317fcad28f229f # shrinks to ops = [PubEdit(234), Squash, PushTeam, Release(174), PubEdit(165), PushPublic, PushPublic, Embargo { cloaked_line: false, file: 112 }, Expose, Embargo { cloaked_line: true, file: 196 }, PushTeam, CloakEdit(3), Release(234), FollowUp(225), BobRelay, Embargo { cloaked_line: false, file: 227 }, RebaseSide, BobRelay, Release(65), PubEdit(229)]
+cc 9432082c7244fdbba8213699740c6ba58156a0ebca5823efb0739016f03f1b41 # shrinks to ops = [Embargo { cloaked_line: false, file: 0 }, Expose, Release(0), Recloak, CloakEdit(0), Embargo { cloaked_line: true, file: 0 }, Release(0), NewOnMain]
