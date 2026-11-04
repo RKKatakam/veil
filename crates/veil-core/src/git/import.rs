@@ -9,7 +9,7 @@ use super::{
     export::CHANGE_ID_HEADER,
     gerr,
     map::{GitOid, Origin},
-    project::{is_git_dir_name, public_text, Veil},
+    project::{gitlink_content, is_git_dir_name, public_open, public_text, Public, Veil},
     short, GitBridge,
 };
 use crate::{
@@ -18,8 +18,8 @@ use crate::{
     error::{Result, VeilError},
     id::{ChangeId, ObjectId},
     merge::merge_trees,
-    object::{validate_entry_name, EntryKind, Object, Snapshot, Text, Tree},
-    policy::{Policy, POLICY_FILE},
+    object::{validate_entry_name, EntryKind, Object, Snapshot, Text, Tree, TreeEntry, Visibility, GIT_PARITY_REPO_FORMAT},
+    policy::{Policy, Tier, POLICY_FILE},
     repo::Repo,
     store::ObjectStore,
     transaction::Transaction,
@@ -116,6 +116,19 @@ fn subsets(items: &[String]) -> Vec<BTreeSet<String>> {
     out
 }
 
+/// The symlinks and gitlinks below a Git tree: (path, kind, oid).
+pub(crate) type GitLinks = Arc<Vec<(String, gix::objs::tree::EntryKind, GitOid)>>;
+
+/// Where the commits the bridge imports come from (`GitBridge::import_tips`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportOrigin {
+    /// Fetched from a Git remote: everything Veil holds that Git never saw
+    /// is carried over.
+    Remote,
+    /// Made in a colocated `.git` on this machine (stream C).
+    Local,
+}
+
 /// What [`GitBridge::import_one`] did with a commit.
 enum Imported {
     New,
@@ -129,7 +142,12 @@ impl GitBridge {
     /// unreadable tree, its parent under an embargo whose key we lack, …) is
     /// reported with the reason, together with its descendants; the other
     /// commits are imported, and nothing is half-imported.
-    pub(crate) fn import_tips(&mut self, tx: &mut Transaction<'_>, tips: &[GitOid]) -> Result<ImportReport> {
+    pub(crate) fn import_tips(&mut self, tx: &mut Transaction<'_>, tips: &[GitOid], origin: ImportOrigin) -> Result<ImportReport> {
+        // Only commits fetched from a Git remote are imported today; the
+        // colocated mode (stream C) gives `Local` its carry-over rule.
+        let ImportOrigin::Remote = origin else {
+            return Err(VeilError::Unsupported("importing local Git commits is not implemented yet".into()));
+        };
         let mut report = ImportReport::default();
         let mut index = ChangeIndex::default();
         // Failed commits → the root cause.
@@ -428,9 +446,17 @@ impl GitBridge {
                 .left_in_git
                 .insert(p.to_string(), format!("held back: embargo {embargo} hides this line's current content"));
         }
-        for p in build.unrepresentable.iter().chain(fs.special.into_inner().unwrap().iter()) {
+        let links = store.format() >= GIT_PARITY_REPO_FORMAT;
+        let special = fs.special.into_inner().unwrap();
+        for p in build.unrepresentable.iter().chain(special.iter().filter(|_| !links)) {
             report.left_in_git.insert(p.clone(), "not representable in Veil".into());
         }
+        // Format 5: Git's symlinks and submodules, through the same gate.
+        let theirs = if links {
+            self.import_links(&store, &policy, &commit.tree, theirs, report)?
+        } else {
+            theirs
+        };
         let theirs = self.guard_policy(&store, oid, &ours, &base, theirs, report)?;
         let merged = merge_trees(&store, Some(base), ours, theirs).map_err(held)?;
         let mut conflicts: BTreeSet<String> = outcome.conflicts.iter().map(|p| p.to_string()).collect();
@@ -490,6 +516,235 @@ impl GitBridge {
         index.add(change_id, sid);
         self.map.record_import(*oid, sid, veiled);
         Ok(Imported::New)
+    }
+
+    /// Format 5: the symlinks (mode `120000`) and submodules (`160000`) of
+    /// Git tree `git_tree`, recorded in `theirs` (the builder's tree of the
+    /// commit, which never reads them). Each is classified by its own path
+    /// like a file: ignored and isolated ones stay in Git, a cloaked one is
+    /// sealed under its scope (its target can name private paths), and a
+    /// public symlink's target is secret-scanned (`https://u:token@…`).
+    /// Link entries the builder carried from the parent are replaced by
+    /// what Git holds now: Git is the truth for this commit.
+    fn import_links(
+        &mut self,
+        store: &ObjectStore,
+        policy: &Policy,
+        git_tree: &GitOid,
+        theirs: ObjectId,
+        report: &mut ImportReport,
+    ) -> Result<ObjectId> {
+        let mut carried: BTreeMap<String, TreeEntry> = BTreeMap::new();
+        self.veil_links(store, &theirs, &mut String::new(), &mut carried, 0)?;
+        let found = self.git_links(git_tree, 0)?;
+        if carried.is_empty() && found.is_empty() {
+            return Ok(theirs);
+        }
+        let mut edits: BTreeMap<String, Option<TreeEntry>> = carried.keys().map(|p| (p.clone(), None)).collect();
+        'links: for (path, kind, oid) in found.iter() {
+            let Ok(vp) = VPath::new(path) else {
+                report.left_in_git.insert(path.clone(), "not representable in Veil".into());
+                continue;
+            };
+            // Below an ignored or isolated directory, or ignored or
+            // isolated itself: never recorded, as for files.
+            let mut dir = vp.parent();
+            while let Some(d) = dir.filter(|d| !d.is_root()) {
+                if matches!(policy.classify(&d, true).tier, Tier::Ignored | Tier::Isolated) {
+                    continue 'links;
+                }
+                dir = d.parent();
+            }
+            let class = policy.classify(&vp, false);
+            let scope = match &class.tier {
+                Tier::Ignored => continue,
+                Tier::Isolated => {
+                    report.left_in_git.insert(path.clone(), "isolated by policy".into());
+                    continue;
+                }
+                Tier::Cloaked(s) => Some(s.clone()),
+                Tier::Public => None,
+            };
+            let (ekind, content) = match kind {
+                gix::objs::tree::EntryKind::Commit => (EntryKind::Gitlink, gitlink_content(oid)),
+                _ => {
+                    // A symlink: its target is the blob, read with a size
+                    // check first (a hostile remote can send anything).
+                    let target = match self.link_target(oid) {
+                        Ok(t) => t,
+                        Err(why) => {
+                            report.left_in_git.insert(path.clone(), why);
+                            continue;
+                        }
+                    };
+                    if vp.file_name().eq_ignore_ascii_case(".gitmodules") {
+                        report
+                            .left_in_git
+                            .insert(path.clone(), "a symlinked .gitmodules is refused (as Git does)".into());
+                        continue;
+                    }
+                    if scope.is_none() && !class.allow_secrets {
+                        let findings = crate::secrets::scan(&target);
+                        if let Some(f) = findings.first() {
+                            report.left_in_git.insert(path.clone(), format!("quarantined ({})", f.rule));
+                            continue;
+                        }
+                    }
+                    (EntryKind::Symlink, target)
+                }
+            };
+            // The parent's entry, if it holds exactly this: kept as it is
+            // (a sealed one keeps its sealing).
+            if let Some(c) = carried.get(path) {
+                let same = c.kind == ekind
+                    && match &scope {
+                        None => c.visibility.is_public() && c.id == Object::blob_id(&content),
+                        Some(s) => {
+                            c.visibility == (Visibility::Cloaked { scope: s.clone() })
+                                && store.matches_encoding(&c.id, &content).unwrap_or(false)
+                        }
+                    };
+                if same {
+                    edits.remove(path);
+                    continue;
+                }
+            }
+            let vis = match &scope {
+                None => Visibility::Public,
+                Some(s) => Visibility::Cloaked { scope: s.clone() },
+            };
+            let id = match store.store_file(&content, &vis) {
+                Ok(id) => id,
+                Err(VeilError::Redacted { scope }) => {
+                    report.left_in_git.insert(path.clone(), format!("no key for scope '{scope}'"));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let entry = TreeEntry {
+                name: vp.file_name().to_string(),
+                kind: ekind,
+                id,
+                size: content.len() as u64,
+                executable: false,
+                visibility: vis,
+                fallback: None,
+            };
+            edits.insert(path.clone(), Some(entry));
+        }
+        if edits.is_empty() {
+            return Ok(theirs);
+        }
+        let edits: Vec<(VPath, Option<TreeEntry>)> = edits
+            .into_iter()
+            .map(|(p, e)| Ok((VPath::new(&p)?, e)))
+            .collect::<Result<_>>()?;
+        crate::selection::edit_tree(store, &theirs, edits)
+    }
+
+    /// The target bytes of the Git symlink blob `oid`, or why it cannot be
+    /// a Veil symlink: over 4 KiB (`PATH_MAX`), empty, holding a NUL, or not
+    /// UTF-8.
+    fn link_target(&self, oid: &GitOid) -> std::result::Result<Vec<u8>, String> {
+        const MAX_TARGET: usize = 4096;
+        let header = self.git.find_header(*oid).map_err(|e| format!("unreadable symlink: {e}"))?;
+        if header.kind() != gix::objs::Kind::Blob {
+            return Err("a symlink that is not a blob".into());
+        }
+        if header.size() > MAX_TARGET as u64 {
+            return Err(format!("symlink target over {MAX_TARGET} bytes"));
+        }
+        let data = self.read_blob(oid).map_err(|e| e.to_string())?;
+        if data.is_empty() || data.contains(&0) {
+            return Err("symlink target is empty or holds a NUL".into());
+        }
+        if std::str::from_utf8(&data).is_err() {
+            return Err("not representable in Veil (symlink target is not UTF-8)".into());
+        }
+        Ok(data)
+    }
+
+    /// Every symlink and gitlink below Veil tree `id` (`prefix` is its
+    /// path), collected into `out`.
+    fn veil_links(
+        &mut self,
+        store: &ObjectStore,
+        id: &ObjectId,
+        prefix: &mut String,
+        out: &mut BTreeMap<String, TreeEntry>,
+        depth: usize,
+    ) -> Result<()> {
+        if depth > crate::tree::MAX_TREE_DEPTH {
+            return Ok(());
+        }
+        if self.no_links.contains(id) {
+            return Ok(());
+        }
+        let tree = match public_open(store, &Veil::default(), id)? {
+            Public::Visible { obj: Object::Tree(t), .. } => t,
+            // A sealed or embargo-wrapped directory: the builder's tree of
+            // a Git commit never holds one, only carried parent content.
+            _ => return Ok(()),
+        };
+        let before = out.len();
+        for e in &tree.entries {
+            let len = prefix.len();
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(&e.name);
+            match e.kind {
+                EntryKind::Dir => self.veil_links(store, &e.id, prefix, out, depth + 1)?,
+                EntryKind::Symlink | EntryKind::Gitlink => {
+                    out.insert(prefix.clone(), e.clone());
+                }
+                _ => {}
+            }
+            prefix.truncate(len);
+        }
+        if out.len() == before {
+            self.no_links.insert(*id);
+        }
+        Ok(())
+    }
+
+    /// Every symlink and gitlink of Git tree `oid` the builder could have
+    /// reached (valid names, not below `.git` spellings or a nested Veil
+    /// repository), as (path, kind, oid). Memoised per tree for the run.
+    fn git_links(&mut self, oid: &GitOid, depth: usize) -> Result<GitLinks> {
+        use gix::objs::tree::EntryKind as K;
+        if let Some(v) = self.git_link_memo.get(oid) {
+            return Ok(v.clone());
+        }
+        let mut out = Vec::new();
+        if depth <= crate::tree::MAX_TREE_DEPTH {
+            let tree = self.read_tree(oid)?;
+            let nested = depth > 0
+                && tree
+                    .entries
+                    .iter()
+                    .any(|e| e.mode.is_tree() && crate::object::is_reserved_name(&String::from_utf8_lossy(&e.filename)));
+            if !nested {
+                for e in &tree.entries {
+                    let Ok(name) = std::str::from_utf8(&e.filename) else { continue };
+                    if validate_entry_name(name).is_err() || is_git_dir_name(name) {
+                        continue;
+                    }
+                    match e.mode.kind() {
+                        K::Tree => {
+                            for (p, k, o) in self.git_links(&e.oid, depth + 1)?.iter() {
+                                out.push((format!("{name}/{p}"), *k, *o));
+                            }
+                        }
+                        k @ (K::Link | K::Commit) => out.push((name.to_string(), k, e.oid)),
+                        K::Blob | K::BlobExecutable => {}
+                    }
+                }
+            }
+        }
+        let out = Arc::new(out);
+        self.git_link_memo.insert(*oid, out.clone());
+        Ok(out)
     }
 
     /// A Git commit may edit `.veilpolicy` like any file. An edit that would

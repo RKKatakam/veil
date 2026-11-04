@@ -116,13 +116,20 @@ fn git_stderr(stderr: &[u8], url: &str) -> String {
 }
 
 /// Fetch every branch of `url` into `refs/remotes/<remote>/*`, following
-/// force-pushes and deletions (they are reported by the caller).
-pub(crate) fn fetch(git_dir: &Path, url: &str, remote: &str) -> Result<()> {
+/// force-pushes and deletions (they are reported by the caller). With
+/// `tags`, the remote's tags go to `refs/veil/tags/<remote>/*`, a namespace
+/// of their own (a branch `tags/x` cannot collide with tag `x`); Git's
+/// `--prune` drops the ones deleted remotely there, and a moved tag is
+/// followed there too: the caller compares with what it recorded.
+pub(crate) fn fetch(git_dir: &Path, url: &str, remote: &str, tags: bool) -> Result<()> {
     validate_url(url)?;
     let mut c = git(git_dir);
     c.args(["fetch", "--no-tags", "--prune", "--quiet", "--no-write-fetch-head", "--"])
         .arg(url)
         .arg(format!("+refs/heads/*:refs/remotes/{remote}/*"));
+    if tags {
+        c.arg(format!("+refs/tags/*:{}*", tag_tracking_prefix(remote)));
+    }
     let out = run(c, "fetch")?;
     if !out.status.success() {
         return Err(VeilError::repo(format!(
@@ -134,9 +141,18 @@ pub(crate) fn fetch(git_dir: &Path, url: &str, remote: &str) -> Result<()> {
     Ok(())
 }
 
+/// Where the bridge keeps the tags last fetched from (or pushed to) Git
+/// remote `remote`.
+pub(crate) fn tag_tracking_prefix(remote: &str) -> String {
+    format!("refs/veil/tags/{remote}/")
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PushRef {
+    /// The branch name, or the tag name for a tag (`tag: true`).
     pub branch: String,
+    /// `refs/tags/<branch>` rather than `refs/heads/<branch>`.
+    pub tag: bool,
     /// `None` deletes the branch.
     pub commit: Option<GitOid>,
     pub force: bool,
@@ -162,7 +178,10 @@ impl RefStatus {
 
 #[derive(Debug, Default)]
 pub struct PushOutcome {
+    /// Branches.
     pub refs: Vec<(String, RefStatus)>,
+    /// Git tags (`refs/tags/<name>`).
+    pub tags: Vec<(String, RefStatus)>,
 }
 
 /// Push each update as `<commit>:refs/heads/<branch>` in one `git push`.
@@ -180,17 +199,19 @@ pub(crate) fn push(git_dir: &Path, url: &str, updates: &[PushRef]) -> Result<Pus
         Some(_) => u.force,
         None => !u.force,
     };
+    let full = |u: &PushRef| format!("refs/{}/{}", if u.tag { "tags" } else { "heads" }, u.branch);
     for u in updates.iter().filter(leased) {
         match u.lease {
-            Some(l) => c.arg(format!("--force-with-lease=refs/heads/{}:{l}", u.branch)),
-            None => c.arg(format!("--force-with-lease=refs/heads/{}:", u.branch)),
+            Some(l) => c.arg(format!("--force-with-lease={}:{l}", full(u))),
+            None => c.arg(format!("--force-with-lease={}:", full(u))),
         };
     }
     c.arg("--").arg(url);
+    // Never a `+` refspec: a forced update goes through its lease only.
     for u in updates {
         match u.commit {
-            Some(commit) => c.arg(format!("{commit}:refs/heads/{}", u.branch)),
-            None => c.arg(format!(":refs/heads/{}", u.branch)),
+            Some(commit) => c.arg(format!("{commit}:{}", full(u))),
+            None => c.arg(format!(":{}", full(u))),
         };
     }
     let out = run(c, "push")?;
@@ -202,8 +223,11 @@ pub(crate) fn push(git_dir: &Path, url: &str, updates: &[PushRef]) -> Result<Pus
         let (Some(flag), Some(refs), summary) = (parts.next(), parts.next(), parts.next()) else {
             continue;
         };
-        let Some(branch) = refs.split_once(':').and_then(|(_, to)| to.strip_prefix("refs/heads/")) else {
-            continue;
+        let Some(to) = refs.split_once(':').map(|(_, to)| to) else { continue };
+        let (branch, tag) = match (to.strip_prefix("refs/heads/"), to.strip_prefix("refs/tags/")) {
+            (Some(b), _) => (b, false),
+            (_, Some(t)) => (t, true),
+            _ => continue,
         };
         let summary = redact_in(summary.unwrap_or("").trim(), url);
         let status = match flag {
@@ -212,11 +236,15 @@ pub(crate) fn push(git_dir: &Path, url: &str, updates: &[PushRef]) -> Result<Pus
             "+" => RefStatus::Forced,
             "=" => RefStatus::UpToDate,
             "-" => RefStatus::Deleted,
+            _ if tag && summary.contains("already exists") => RefStatus::Rejected("tag exists with another target".into()),
             _ => RefStatus::Rejected(if summary.is_empty() { "rejected".into() } else { summary }),
         };
-        outcome.refs.push((branch.to_string(), status));
+        match tag {
+            true => outcome.tags.push((branch.to_string(), status)),
+            false => outcome.refs.push((branch.to_string(), status)),
+        }
     }
-    if outcome.refs.is_empty() && !out.status.success() {
+    if outcome.refs.is_empty() && outcome.tags.is_empty() && !out.status.success() {
         return Err(VeilError::repo(format!(
             "git push to {} failed: {}",
             redact_url(url),

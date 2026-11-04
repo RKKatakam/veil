@@ -634,8 +634,8 @@ pub enum Cmd {
     /// once this device trusts them (not implemented yet).
     #[command(subcommand)]
     Hooks(hooks::HooksCmd),
-    /// Git submodules: pinned commits of other Git repositories (not
-    /// implemented yet).
+    /// Git submodules: pinned commits of other Git repositories, fetched
+    /// with `git` only when you run `vl submodule update`.
     #[command(subcommand)]
     Submodule(submodule_cmd::SubmoduleCmd),
 
@@ -770,14 +770,15 @@ pub enum TagCmd {
         #[arg(long)]
         allow_backwards: bool,
         /// Make an annotated release tag: immutable, signed when you have
-        /// an identity, exported to Git as `refs/tags/NAME` (not implemented
-        /// yet).
+        /// an identity, exported to Git as `refs/tags/NAME`.
         #[arg(short, long)]
         annotate: bool,
-        /// The annotated tag's message (implies `-a`; not implemented yet).
+        /// The annotated tag's message (implies `-a`; sealed for a cloaked
+        /// tag).
         #[arg(short, long)]
         message: Option<String>,
-        /// Replace an existing annotated tag (not implemented yet).
+        /// Replace an existing annotated tag (or annotate a plain one). A
+        /// release tag moved without `-m` keeps its message.
         #[arg(long)]
         force: bool,
     },
@@ -786,7 +787,9 @@ pub enum TagCmd {
         /// Tag name.
         name: String,
     },
-    /// Verify an annotated tag's signature (not implemented yet).
+    /// Verify an annotated tag's signature: exits 1 unless it is a valid
+    /// Veil signature by a key a ring of this repository knows (a Git
+    /// signature is never verified by Veil).
     Verify {
         /// Tag name.
         name: String,
@@ -1151,33 +1154,37 @@ pub enum GitCmd {
     /// Manage Git remotes.
     #[command(subcommand)]
     Remote(GitRemoteCmd),
-    /// Fetch a Git remote's branches as `<remote>/<branch>` (local tags stay).
+    /// Fetch a Git remote's branches as `<remote>/<branch>` and its Git tags
+    /// as `tag:<remote>/<tag>` (local tags stay).
     Fetch {
         /// Git remote.
         #[arg(default_value = "origin")]
         remote: String,
-        /// Do not fetch the remote's Git tags (not implemented yet).
+        /// Do not fetch the remote's Git tags.
         #[arg(long)]
         no_tags: bool,
-        /// Forget remote Git tags that the remote deleted (not implemented
-        /// yet).
+        /// Forget remote Git tags (`<remote>/<tag>`) that the remote
+        /// deleted. Local release tags are never deleted.
         #[arg(long, conflicts_with = "no_tags")]
         prune_tags: bool,
     },
-    /// Fetch, then create or fast-forward local tags from the branches.
+    /// Fetch, then create or fast-forward local tags from the branches, and
+    /// create a local release tag for each new Git tag (an existing one
+    /// never moves).
     Pull {
         /// Git remote.
         #[arg(default_value = "origin")]
         remote: String,
-        /// Do not fetch the remote's Git tags (not implemented yet).
+        /// Do not fetch the remote's Git tags.
         #[arg(long)]
         no_tags: bool,
-        /// Forget remote Git tags that the remote deleted (not implemented
-        /// yet).
+        /// Forget remote Git tags (`<remote>/<tag>`) that the remote
+        /// deleted. Local release tags are never deleted.
         #[arg(long, conflicts_with = "no_tags")]
         prune_tags: bool,
     },
-    /// Export tags (all by default) as branches and push them.
+    /// Export tags (all by default) and push them: plain tags as branches,
+    /// annotated release tags as Git tags (never forced).
     Push {
         /// Git remote.
         #[arg(default_value = "origin")]
@@ -1196,11 +1203,12 @@ pub enum GitCmd {
         #[arg(short, long, value_name = "BRANCH")]
         delete: Vec<String>,
         /// Replace Git tags that exist on the remote with another target
-        /// (not implemented yet).
+        /// (only if they still hold what was last fetched).
         #[arg(long)]
         force_tags: bool,
-        /// Delete this Git tag (`refs/tags/TAG`) on the remote (repeatable;
-        /// not implemented yet).
+        /// Delete this Git tag (`refs/tags/TAG`) on the remote (repeatable).
+        /// Delete the release tag here first with `vl tag delete`. With no
+        /// --tag, nothing else is pushed.
         #[arg(long, value_name = "TAG")]
         delete_tag: Vec<String>,
         #[command(flatten)]

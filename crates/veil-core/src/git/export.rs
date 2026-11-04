@@ -15,16 +15,36 @@ use crate::{
     oplog::Tag,
     remote::{embargo_withheld, push_closure},
     repo::Repo,
+    tag_object::{AtagKind, AtagVerification},
 };
+
+fn is_unreadable_object(e: &VeilError) -> bool {
+    e.is_unreadable() || matches!(e, VeilError::Corrupt(..) | VeilError::Unsupported(_))
+}
 
 /// Header carrying the Veil change id (the name Jujutsu uses).
 pub const CHANGE_ID_HEADER: &str = "change-id";
+
+/// A release tag as exported (`refs/tags/<name>` in the bridge).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportedTag {
+    pub name: String,
+    /// What `refs/tags/<name>` holds: the Git tag object, or the commit
+    /// for a lightweight tag imported from Git.
+    pub git: GitOid,
+    /// The commit it points at.
+    pub commit: GitOid,
+    /// The annotated tag object (`veil:atag`).
+    pub atag: ObjectId,
+}
 
 #[derive(Debug, Default)]
 pub struct ExportReport {
     /// Tag → commit for every exported tag (also written to
     /// `refs/heads/<tag>` in the bridge repository).
     pub branches: Vec<(String, GitOid)>,
+    /// Release tags (annotated, format 5) exported as Git tags.
+    pub tags: Vec<ExportedTag>,
     /// Tags not exported, with the reason.
     pub skipped: Vec<(String, String)>,
     /// New commits written (including publication commits).
@@ -112,8 +132,12 @@ impl GitBridge {
                 report.skipped.push((name.clone(), "points at the root".into()));
                 continue;
             }
-            if gix::refs::FullName::try_from(format!("refs/heads/{name}")).is_err() {
-                report.skipped.push((name.clone(), "not a valid Git branch name".into()));
+            let (namespace, what) = match tag.annotation {
+                Some(_) => ("tags", "tag"),
+                None => ("heads", "branch"),
+            };
+            if gix::refs::FullName::try_from(format!("refs/{namespace}/{name}")).is_err() {
+                report.skipped.push((name.clone(), format!("not a valid Git {what} name")));
                 continue;
             }
             match push_closure(repo.store(), repo.keys(), &[tag.target], &withheld)? {
@@ -135,16 +159,198 @@ impl GitBridge {
                 report.skipped.push((name, "nothing to export".into()));
                 continue;
             };
+            if let Some(a) = tag.annotation {
+                match self.export_release_tag(repo, &name, &tag, a, commit)? {
+                    Ok(t) => report.tags.push(t),
+                    Err(why) => report.skipped.push((name, why)),
+                }
+                continue;
+            }
             // e.g. tags `a` and `a/b`, which cannot both be Git branches.
             match self.set_ref(&format!("refs/heads/{name}"), commit) {
                 Ok(()) => report.branches.push((name, commit)),
                 Err(e) => report.skipped.push((name, format!("cannot be a Git branch: {e}"))),
             }
         }
+        let tips: BTreeSet<GitOid> = report
+            .branches
+            .iter()
+            .map(|(_, c)| *c)
+            .chain(report.tags.iter().map(|t| t.commit))
+            .collect();
+        for c in tips {
+            self.check_gitmodules(&c)?;
+        }
         report.warnings.append(&mut self.warnings);
         report.warnings.sort();
         report.warnings.dedup();
         Ok(report)
+    }
+
+    /// Export snapshot `sid` and the history a public remote would receive
+    /// with it, without moving any ref (colocated mode's `HEAD`, stream C).
+    /// `Ok(None)`: the root; `Err` names why it cannot be exported (its
+    /// history is withheld).
+    pub fn export_snapshot_for(&mut self, repo: &mut Repo, sid: ObjectId) -> Result<Option<GitOid>> {
+        let tx = repo.transaction("git export")?;
+        let r = tx.repo();
+        r.keys().publish_staged_releases()?;
+        if sid == r.root_id() {
+            return Ok(None);
+        }
+        let withheld = embargo_withheld(r, true)?;
+        let closure: HashSet<ObjectId> = push_closure(r.store(), r.keys(), &[sid], &withheld)?
+            .map_err(|why| VeilError::repo(format!("git export: {why}")))?
+            .into_iter()
+            .collect();
+        let mut report = ExportReport::default();
+        for s in r.topo_children_first([sid])?.into_iter().rev().filter(|s| closure.contains(s)) {
+            self.export_snapshot(r, s, &withheld, &mut report)?;
+        }
+        let commit = self.commit_of(&sid);
+        self.save(&**r.backend())?;
+        tx.commit()?;
+        Ok(commit)
+    }
+
+    /// Warn when the `.gitmodules` of commit `c` names a path Git does not
+    /// get as a submodule (a sealed gitlink is omitted, while the public
+    /// `.gitmodules` still names it and its URL; Veil never rewrites file
+    /// content to hide that).
+    fn check_gitmodules(&mut self, c: &GitOid) -> Result<()> {
+        let tree = self.read_commit(c)?.tree;
+        let Some(e) = self
+            .read_tree(&tree)?
+            .entries
+            .into_iter()
+            .find(|e| e.filename == crate::submodule::GITMODULES && e.mode.is_blob())
+        else {
+            return Ok(());
+        };
+        let Ok(subs) = crate::submodule::parse_gitmodules(&self.read_blob(&e.oid)?) else {
+            return Ok(());
+        };
+        for sm in subs {
+            let Some(path) = sm.path else { continue };
+            let mut cur = Some((gix::objs::tree::EntryKind::Tree, tree));
+            for comp in path.trim_end_matches('/').split('/') {
+                cur = match cur {
+                    Some((gix::objs::tree::EntryKind::Tree, t)) => self
+                        .read_tree(&t)?
+                        .entries
+                        .into_iter()
+                        .find(|e| e.filename == comp)
+                        .map(|e| (e.mode.kind(), e.oid)),
+                    _ => None,
+                };
+            }
+            if !matches!(cur, Some((gix::objs::tree::EntryKind::Commit, _))) {
+                self.warnings.push(format!(
+                    ".gitmodules names '{}' which Git does not receive as a submodule (sealed, or not recorded); its URL is public",
+                    path.escape_debug()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Export release tag `name` (atag `a`, already checked like a branch:
+    /// not cloaked, its history not withheld) as `refs/tags/<name>` on
+    /// `commit`. `Err` gives the reason it is not exported:
+    ///
+    /// * an annotation that does not match the tag (another name or
+    ///   target), or whose signature does not verify;
+    /// * a sealed message (never exported);
+    /// * a target whose export is still shaped by an unreleased embargo:
+    ///   the tag would name the pre-fix fallback view, and Git tags are
+    ///   permanent. It waits for the release, then names the publication
+    ///   commit.
+    pub(crate) fn export_release_tag(
+        &mut self,
+        repo: &Repo,
+        name: &str,
+        tag: &Tag,
+        a: ObjectId,
+        commit: GitOid,
+    ) -> Result<std::result::Result<ExportedTag, String>> {
+        let atag = match repo.store().atag(&a) {
+            Ok(t) => t,
+            Err(e) if is_unreadable_object(&e) => return Ok(Err(format!("its annotation is unreadable ({e})"))),
+            Err(e) => return Err(e),
+        };
+        match atag.verify(name, &tag.target) {
+            AtagVerification::NameMismatch { .. } | AtagVerification::TargetMismatch { .. } => {
+                return Ok(Err("its annotation names another tag or snapshot".into()))
+            }
+            AtagVerification::BadSignature => return Ok(Err("its annotation's signature does not verify".into())),
+            _ => {}
+        }
+        if atag.is_sealed() {
+            return Ok(Err("its message is sealed (cloaked) and is never exported".into()));
+        }
+        if let Some(cur) = self.map.current.get(&tag.target) {
+            if !cur.pending.is_empty() {
+                let list: Vec<&str> = cur.pending.iter().map(String::as_str).collect();
+                return Ok(Err(format!(
+                    "release tag waits for the release of embargo {}: Git would see the code without the fix",
+                    list.join(", ")
+                )));
+            }
+        }
+        let git = match self.release_tag_object(&atag, commit)? {
+            Some((kind, data)) => self.write_raw(kind, &data)?,
+            None => commit,
+        };
+        if let Err(e) = self.set_ref(&format!("refs/tags/{name}"), git) {
+            return Ok(Err(format!("cannot be a Git tag: {e}")));
+        }
+        self.map.record_tag(git, a);
+        Ok(Ok(ExportedTag {
+            name: name.to_string(),
+            git,
+            commit,
+            atag: a,
+        }))
+    }
+
+    /// The Git object `refs/tags/<name>` holds for `atag` on `commit`
+    /// (`None`: a lightweight tag, the ref holds the commit). An atag
+    /// imported from Git is re-written byte for byte (its signature still
+    /// verifies in Git) when it still points at the same commit; anything
+    /// else gets a fresh, deterministic tag object, never signed.
+    pub(crate) fn release_tag_object(
+        &self,
+        atag: &crate::tag_object::Atag,
+        commit: GitOid,
+    ) -> Result<Option<(gix::objs::Kind, Vec<u8>)>> {
+        use gix::objs::WriteTo;
+        if atag.kind == AtagKind::LightweightGit {
+            return Ok(None);
+        }
+        if let (Some(g), Some(raw)) = (&atag.git, atag.git_raw()) {
+            let points_here = gix::objs::TagRef::from_bytes(&raw, gix::hash::Kind::Sha1)
+                .is_ok_and(|t| t.target_kind == gix::objs::Kind::Commit && t.target() == commit);
+            let same_id = gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Tag, &raw)
+                .is_ok_and(|oid| GitOid::from_hex(g.oid.as_bytes()).is_ok_and(|want| want == oid));
+            if points_here && same_id {
+                return Ok(Some((gix::objs::Kind::Tag, raw)));
+            }
+        }
+        let text = match &atag.message {
+            crate::object::Text::Plain(t) => t.clone(),
+            crate::object::Text::Sealed(_) => return Err(VeilError::repo("a sealed tag message is never exported")),
+        };
+        let tag = gix::objs::Tag {
+            target: commit,
+            target_kind: gix::objs::Kind::Commit,
+            name: atag.name.as_str().into(),
+            tagger: Some(signature(&atag.tagger, atag.timestamp)),
+            message: message(&text).into(),
+            signature: None,
+        };
+        let mut buf = Vec::new();
+        tag.write_to(&mut buf).map_err(super::gerr)?;
+        Ok(Some((gix::objs::Kind::Tag, buf)))
     }
 
     /// The Git tree of snapshot tree `tree` as a public reader sees it

@@ -2629,12 +2629,16 @@ because Git does.
 
 ```text
 .veil/git/repo.git      bare Git repository (gix), the bridge
-  refs/heads/<tag>          what Veil last exported for the tag
+  refs/heads/<tag>          what Veil last exported for a plain tag
+  refs/tags/<tag>           what Veil last exported for a release tag (format 5)
   refs/remotes/<r>/<b>      branch <b> of Git remote <r>, as last fetched or pushed
+  refs/veil/tags/<r>/<t>    Git tag <t> of remote <r>, as last fetched or pushed
 .veil/git/map           c <commit> <snapshot> <veiled embargoes>      every pair
                         s <snapshot> <commit> <import|export|publish> <pending embargoes>
+                        t <tag object or commit> <atag>                release tags
 .veil/git/cache         projection and conversion memo (safe to delete)
 .veil/git/remotes.json  Git remote name → URL
+.veil/local/submodules/<hash of name>/  Git directories of `vl submodule` clones
 ```
 
 ### Export: what Git may see
@@ -2718,7 +2722,9 @@ GitHub past any number of GitHub commits.
 
 **Carry-over in the other direction.** Paths Git has but Veil never
 recorded, because Veil isolated or quarantined them at import, or because
-Veil cannot represent them (symlinks, submodules), must not be deleted by
+Veil cannot represent them (below format 5: symlinks and submodules; in
+any format: a symlink whose target is not UTF-8, holds a NUL or is over
+4 KiB, a symlinked `.gitmodules`), must not be deleted by
 the next Veil commit. The exported tree is a path-wise three-way merge of
 Git trees: `base` = the public projection of the first parent's snapshot,
 `ours` = the first parent's Git commit, `theirs` = the public projection of
@@ -2773,9 +2779,108 @@ Each commit becomes a snapshot:
 * What Veil refused (isolated, quarantined, no key for the scope, not
   representable) is reported per path. It stays in Git (see carry-over).
 
+### Symlinks, submodules and release tags (format 5)
+
+Format 5 gives the bridge Git's three remaining object kinds (Git-parity
+designs 5, 6 and 8; `git/tags.rs`, `submodule.rs`).
+
+* **Symlinks and gitlinks.** The public projection keeps a public
+  `symlink` entry (exported as mode `120000`, its target as the blob) and
+  a public `gitlink` (mode `160000`, the commit its `"<hex>\n"` blob
+  names). A sealed one is left out like a sealed file, and its fallback,
+  if any, keeps the entry's kind. A link Git cannot carry (an empty or
+  NUL-holding target, a gitlink that is not a SHA-1 commit, a symlink named
+  `.gitmodules`) is left out with a warning. A conflict with a link side
+  is never exported as a file of markers (that would turn a target into
+  content): Git gets the first side as its own kind when public. When the
+  `.gitmodules` of an exported tip names a path Git does not receive as a
+  gitlink (a sealed submodule), export warns: the URL is public, and Veil
+  never rewrites file content to hide it.
+
+  On import the builder never sees links (`GitTreeFs` lists them as
+  special). `GitBridge::import_links` then walks the Git tree (memoised
+  per Git tree, so consecutive commits cost what changed), drops the link
+  entries the builder carried from the parent, and records each Git link
+  through the same gate as a file of that path: ignored and isolated paths
+  (and anything below an ignored or isolated directory) stay in Git, a
+  cloaked path seals the target (or pin) under its scope, a public
+  symlink's target is secret-scanned (`https://u:token@…` is quarantined),
+  and a target that is not UTF-8, holds a NUL or is over 4 KiB is left in
+  Git. An unchanged entry keeps its sealing.
+
+* **Submodules.** `vl submodule update` is the only thing that runs `git`
+  for a submodule; pulls and checkouts never do. `.gitmodules` is parsed
+  with gix's config parser (no includes) and only `path` and `url` are
+  read, so `update = !command` is never run. URLs must be `https`,
+  `ssh`, `git` or scp-like, with no option-like host; `file://` and local
+  paths need `--allow-local`; every `<helper>::` form, `http`, control
+  characters and a leading `-` are refused (CVE-2017-1000117,
+  CVE-2018-17456). `git` also gets `GIT_ALLOW_PROTOCOL` with the same
+  list, `protocol.file.allow=never`, hooks off, `--` before the URL, and
+  never `--recurse-submodules`. The name is checked like Git's
+  `check_submodule_name` and only ever used hashed: the Git directory is
+  `.veil/local/submodules/<blake3(name)>`, never `.git/modules`
+  (CVE-2018-11235), and the work tree gets a `.git` file. The path must be
+  a gitlink of `@`, reached through no symlink. The checked-out commit is
+  read with gix (isolated), never by running `git` in a work tree whose
+  configuration Veil did not write. The builder never records anything
+  below a gitlink, whatever the policy says: the submodule's own
+  repository decides where its files go.
+
+* **Release tags.** A tag with an annotation (`veil:atag`) is a release
+  tag, exported as `refs/tags/<name>`; every other tag stays a branch.
+  Export applies the branch checks (not cloaked, history not withheld),
+  then refuses an annotation that names another tag or snapshot, has a bad
+  signature or a sealed message, and holds back a tag whose target commit
+  is still shaped by an unreleased embargo (the map's `pending`): a
+  security release tag would otherwise name the fallback view, without
+  the fix, permanently. After the release it names the publication
+  commit. An atag imported from Git is re-written byte for byte (its GPG
+  signature still verifies in Git) when its raw object still names the
+  same commit; any other gets a fresh tag object (tagger and time from
+  the atag, UTC, no signature: Veil never signs Git tags), and a
+  `lightweight-git` atag stays a lightweight tag. Export is deterministic,
+  so a lost map loses nothing.
+
+  Push sends `<oid>:refs/tags/<name>`, never with `+`. A tag the remote
+  holds with another value (as last fetched) is rejected before `git`
+  runs; `--force-tags` replaces it with `--force-with-lease`. `--delete-tag`
+  needs the local tag deleted first. Every exported release tag the remote
+  lacks is pushed (Git's `push.followTags`).
+
+  Fetch adds `+refs/tags/*:refs/veil/tags/<r>/*`, a namespace of its own
+  (a branch `tags/x` cannot collide with tag `x`). Each tag is peeled
+  through at most 8 tag objects to a commit that imports; a tag of a tree
+  or blob, a deeper chain, or a tag object over 1 MiB + 64 KiB (checked
+  from the object header before reading) is skipped and reported. Names
+  pass `validate_tag_name` for `<name>` and `<r>/<name>`. Each becomes an
+  atag (deterministic: two members fetching the same tag get the same id;
+  one equal to Veil's own export, found through the map or by exporting
+  the local release tag again, is recognised, not re-imported) recorded in
+  `View::remote_release_tags["<r>/<name>"]`, apart from `remote_tags`
+  (branches). A snapshot only a tag names becomes a head. A recorded tag
+  whose new value names another snapshot is reported as **moved** (a
+  supply-chain warning). `vl git pull` creates a local release tag only
+  where no tag of that name exists and the name shadows no change or
+  snapshot id; it **never moves** an existing one (reported instead). A
+  name taken by a branch-like tag stays the branch's; `tag:<r>/<name>`
+  names the Git tag in revsets (`<r>/<name>` alone does when no branch
+  has it). Tags the remote deleted are reported and kept as
+  `<r>/<name>` until `--prune-tags`; local tags are never deleted. Below
+  format 5 tags are fetched into the bridge only, with one notice naming
+  `vl upgrade`.
+
+  Commits, merges and rewrites never move a release tag
+  (`commands::tag_kept`, the merge loop and the re-pointing in
+  `Transaction::rebase_descendants` skip it),
+  so its signed annotation always matches it. `vl tag set` over one is
+  refused without `--force`, which writes a new atag keeping the old
+  message unless `-m` gives one; the annotation is never dropped silently.
+
 ### Remotes, divergence and transport
 
 `vl git fetch` runs `git fetch --prune <url> +refs/heads/*:refs/remotes/<r>/*`
+(plus the tag refspec above)
 in the bridge, imports, and records `<r>/<branch>` remote tags. A branch
 whose new tip does not descend from the previous one was **force-pushed**
 on the Git side: it is reported, the snapshots it dropped stay in Veil, and

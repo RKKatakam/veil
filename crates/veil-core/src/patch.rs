@@ -1469,6 +1469,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 }
 
 /// The inverse of [`days_from_civil`]: (year, month, day).
+#[cfg(feature = "git")]
 fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
@@ -1483,6 +1484,7 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 }
 
 /// `millis` as an RFC 2822 date in UTC (`Wed, 4 Nov 2026 18:51:21 +0000`).
+#[cfg(feature = "git")]
 pub(crate) fn format_date(millis: i64) -> String {
     let secs = millis.div_euclid(1000);
     let days = secs.div_euclid(86_400);
@@ -3562,6 +3564,7 @@ index 1234567..89abcde 100644
         assert!(e.to_string().contains("too long"), "{e}");
     }
 
+    #[cfg(feature = "git")]
     #[test]
     fn dates_round_trip() {
         for ms in [0i64, 1_000, 86_399_000, 1_762_282_281_000, 253_402_300_799_000] {

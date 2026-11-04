@@ -9,8 +9,10 @@ snapshots. Git only ever sees what a **public** Veil remote would see.
 3. [What GitHub sees, and never sees](#what-github-sees-and-never-sees)
 4. [Round trips](#round-trips)
 5. [Divergence](#divergence)
-6. [Credentials and authorship](#credentials-and-authorship)
-7. [Limits in 1.0](#limits-in-10)
+6. [Releases: Git tags](#releases-git-tags)
+7. [Symlinks and submodules](#symlinks-and-submodules)
+8. [Credentials and authorship](#credentials-and-authorship)
+9. [Limits in 1.0](#limits-in-10)
 
 ## Start from an existing Git repository
 
@@ -299,6 +301,104 @@ deletion and an addition), symlinks and submodules (refused by `vl am`),
 binary files (`Binary files … differ` on export, refused on import),
 `--binary` and `--3way`.
 
+## Releases: Git tags
+
+A plain Veil tag (`vl tag set main`) is a **branch** in Git. An
+**annotated** tag is a **release tag**: a Git tag, immutable, signed with
+your Veil identity, and what GitHub releases and CI tag triggers act on.
+
+```text
+$ vl tag set v1.2.0 -r main -a -m "Release 1.2.0"
+Release tag v1.2.0 → qzknoozp 80a91b59 Add the parser (signed)
+$ vl tag verify v1.2.0
+tag v1.2.0 → qzknoozp 80a91b59 Add the parser
+kind:   annotated
+tagger: Alice Doe <alice@example.com> 2026-11-04 10:12:03
+    Release 1.2.0
+verified: good signature by Alice Doe
+$ vl git push
+  pushed main → 80a91b59e1 (new branch)
+  pushed tag v1.2.0 → 80a91b59e1 (new tag)
+$ gh release create v1.2.0 --notes-from-tag     # or let CI do it
+```
+
+* **Immutable.** `vl tag set v1.2.0` again is refused; commits, merges and
+  rewrites never move a release tag. `--force` replaces it (keeping its
+  message unless you give `-m`); `vl tag delete` removes it.
+* **Signed.** `vl tag verify` exits 1 unless the tag carries a valid Veil
+  signature by a key one of your scopes knows. A tag imported from Git
+  keeps its GPG or SSH signature (re-exported byte for byte, so it still
+  verifies with `git tag -v`), but Veil never reports it as verified.
+  Veil does not sign Git tags; GitHub shows Veil's as unverified.
+* **Pushed, never forced.** `vl git push` pushes every release tag the
+  remote does not have yet. If the remote has one with another target, the
+  push is **rejected** (`tag exists with another target`): check why, then
+  `vl git push --force-tags` if yours is right (it only replaces what you
+  last fetched). `vl tag delete v1.2.0` then `vl git push --delete-tag
+  v1.2.0` removes one from the remote.
+* **Fetched, never moved.** `vl git fetch` records the remote's tags as
+  `tag:origin/<name>` (`vl tag list`; `origin/<name>` too when no branch
+  has that name). `vl git pull` creates a local release tag for each new
+  one, and **never moves** an existing one. If the remote moved a tag you
+  already have, you get a supply-chain warning:
+
+  ```text
+  warning: origin moved Git tag v1.0 from 3f2a91c0 to 9d81e0b2: Git tags should never move …
+  warning: release tag v1.0 stays at 3f2a91c0; origin has it at 9d81e0b2 …
+  ```
+
+  `--no-tags` fetches branches only; `--prune-tags` forgets `origin/<tag>`
+  for tags the remote deleted (your own release tags are never deleted).
+  A tag of a tree or blob, a chain of more than 8 tag objects, a message
+  over 1 MiB, or a name Veil refuses (or that looks like one of your
+  change ids) is skipped and reported.
+* **Private and embargoed releases.** A cloaked tag (`--cloak`) and its
+  message (sealed for the scope) never reach Git. A release tag on the
+  merge of an unreleased embargo **waits**: the push reports `release tag
+  waits for the release of embargo …`, because GitHub would see the code
+  without the fix, and a tag is permanent. After `vl embargo release`, the
+  next push publishes it on the publication commit, which has the fix.
+  A tag on the fix itself is skipped like the fix.
+
+## Symlinks and submodules
+
+Symlinks import from Git as Veil symlinks and export as Git symlinks
+(mode `120000`), classified by the link's own path like a file: a link in
+a cloaked directory has its target sealed (Git never sees it), a link
+whose target holds a token (`https://u:ghp_…@github.com/…`) is held back,
+and one Veil cannot represent (a non-UTF-8 or NUL target, over 4 KiB, a
+symlinked `.gitmodules`) stays in Git untouched.
+
+Submodules import as **gitlinks**: the pinned commit, never the
+submodule's files. Nothing fetches them by itself, not even `vl git
+pull`:
+
+```text
+$ vl submodule status
+vendor/sdk  8ae1a6a11ad1  not checked out (`vl submodule update`)  https://github.com/acme/sdk.git
+$ vl submodule update
+  cloned vendor/sdk at 8ae1a6a11ad1
+$ cd vendor/sdk && git pull && cd ../..     # work in it with Git
+$ vl submodule set vendor/sdk 515dbe42d25943b4aec154d6dcbea83d65454db5
+Pinned vendor/sdk to 515dbe42d259 (was 8ae1a6a11ad1)
+$ vl submodule add https://github.com/acme/tool.git tools/tool
+Added submodule tools/tool at 1c0ffee12345 (https://github.com/acme/tool.git)
+```
+
+* `.gitmodules` comes from your teammates, so it is untrusted: only `path`
+  and `url` are read (`update = !command` never runs), URLs must be
+  `https`, `ssh`, `git` or `host:path`; local paths and `file://` need
+  `--allow-local`; `ext::` and other helper URLs, option-like values
+  (`--upload-pack=…`) and names with `..` are refused, naming the
+  submodule. A relative URL (`../sdk.git`) is resolved against your Git
+  remote `origin`.
+* The clone's Git directory lives in `.veil/local/submodules/`, never in
+  `.git/modules`; the submodule directory gets a `.git` file.
+* Veil never records files below a submodule, even if your policy names
+  them: that repository decides where its files are published. If the
+  submodule is in a cloaked directory its pin is sealed and Git does not
+  get it; your public `.gitmodules` still names it, and export warns.
+
 ## Credentials and authorship
 
 * `vl git` runs your own **`git` binary** for fetch and push
@@ -324,8 +424,10 @@ binary files (`Binary files … differ` on export, refused on import),
 
 ## Limits in 1.0
 
-* Only branches map to tags; Git tags are not imported or exported.
 * `vl git pull` does not check out (use `vl rebase -d main` or `vl new main`).
+* Release tags are not signed for Git (GitHub shows them unverified).
+* Symlinks and submodules need repository format 5 (`vl upgrade`); the
+  working copy materialises them as the working-copy support lands.
 * Carry-over of Git-only paths follows the first parent only.
 * Git commits are not signed.
 

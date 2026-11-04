@@ -7,6 +7,10 @@
 //!                   s <snapshot> <commit> <origin> <pending>
 //!                                                          the commit that currently
 //!                                                          represents the snapshot
+//!                   t <git tag ref value> <atag>           a release tag (format 5): the
+//!                                                          Git tag object (or, for a
+//!                                                          lightweight tag, the commit)
+//!                                                          and the annotated tag object
 //! .veil/git/cache   veil-git-cache 1                       (safe to delete)
 //!                   p <veil tree> <public veil tree | ->   public projection
 //!                   t <public veil tree> <git tree>        conversion
@@ -101,6 +105,11 @@ pub struct GitMap {
     /// Commit → the embargoes unreleased in the view it shows (only
     /// non-empty sets are kept).
     pub veiled: HashMap<GitOid, BTreeSet<String>>,
+    /// Release tags (format 5): what `refs/tags/<name>` holds in Git (a
+    /// tag object, or the commit of a lightweight tag) → the atag it was
+    /// imported as or exported from. Recomputable: export is deterministic
+    /// and import recognises Veil's own tag objects.
+    pub tags: HashMap<GitOid, ObjectId>,
     dirty: bool,
 }
 
@@ -156,6 +165,11 @@ impl GitMap {
                         map.veiled.insert(c, veiled);
                     }
                 }
+                ["t", g, a] if !v1 => {
+                    let g = parse_oid(g).ok_or_else(|| corrupt(n + 1))?;
+                    let a = parse_id(a).ok_or_else(|| corrupt(n + 1))?;
+                    map.tags.insert(g, a);
+                }
                 ["s", s, c, origin, pending] => {
                     let s = parse_id(s).ok_or_else(|| corrupt(n + 1))?;
                     let commit = parse_oid(c).ok_or_else(|| corrupt(n + 1))?;
@@ -196,6 +210,11 @@ impl GitMap {
         for (s, cur) in current {
             let pending = format_set(&cur.pending);
             out.push_str(&format!("s {} {} {} {pending}\n", s.hex(), cur.commit, cur.origin.as_str()));
+        }
+        let mut tags: Vec<_> = self.tags.iter().collect();
+        tags.sort();
+        for (g, a) in tags {
+            out.push_str(&format!("t {g} {}\n", a.hex()));
         }
         backend.write(&map_path(), out.as_bytes())?;
         self.dirty = false;
@@ -257,6 +276,14 @@ impl GitMap {
                     pending: veiled,
                 },
             );
+        }
+    }
+
+    /// Record that Git ref value `git` (a tag object, or a lightweight
+    /// tag's commit) is the release tag `atag`.
+    pub fn record_tag(&mut self, git: GitOid, atag: ObjectId) {
+        if self.tags.insert(git, atag) != Some(atag) {
+            self.dirty = true;
         }
     }
 

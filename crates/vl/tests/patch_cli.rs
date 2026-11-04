@@ -610,7 +610,6 @@ proptest! {
 /// `.veil/git/` directory around it (`git/mod.rs`, `open_git`). `vl
 /// format-patch` creates the directory itself.
 #[test]
-#[ignore = "BUG-640: vl git export fails before .veil/git exists"]
 fn bug_640_git_export_in_a_fresh_repository() {
     let env = Env::new();
     let proj = env.project(U, "proj", &[("a.txt", "a\n")]);

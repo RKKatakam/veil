@@ -385,8 +385,11 @@ what they change is sealed for you; listed in `entries` only with
 | Field | Type | Meaning |
 |---|---|---|
 | `schema` | string | `veil.tag.list/1` |
-| `tags` | array | Local tags, by name: `name`; `cloak` (string or null: never pushed to public remotes); `target` (a [snapshot reference](#snapshot-reference)) |
+| `tags` | array | Local tags, by name: `name`; `cloak` (string or null: never pushed to public remotes); `target` (a [snapshot reference](#snapshot-reference)); `kind` (`release` for an annotated tag, else `branch`); `git_ref` (what the Git bridge exports it as: `refs/tags/<name>` or `refs/heads/<name>`); `annotation` (null for a plain tag, see below) |
 | `remote_tags` | array | Tags as last seen on remotes: `name` (`remote/tag`) and `target` |
+| `remote_release_tags` | array | Git tags as last fetched from Git remotes: `name` (`remote/tag`), `target` (null if its annotation is unreadable) and `annotation` |
+
+An `annotation` holds `id` (the hex id of the annotated tag object), `kind`, `tagger` (as recorded; a claim, like a snapshot's author), `timestamp` (when it was tagged), `message`, `signer`, `verified` and `status`: `kind` is `annotated` or `lightweight-git` (a lightweight Git tag); `message` is null when sealed for a scope you are not in; `verified` is true only for a valid Veil signature by a key a ring of this repository knows (`signer` names its owner), never for a Git signature; `status` says what the check found (`good signature by …`, `unsigned`, `Git signature, not verified by Veil`, `unverified (name mismatch)`, …).
 
 ## `veil.op.log/1`
 

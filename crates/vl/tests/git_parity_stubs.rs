@@ -94,12 +94,6 @@ fn new_commands_parse_their_documented_flags_and_refuse() {
         (&["duplicate", "@-", "--keep-description"], "vl duplicate"),
         (&["cherry-pick", "@-", "-x", "--json"], "vl cherry-pick"),
         (&["cherry-pick", "@-", "-m", "copy"], "vl cherry-pick"),
-        // stream G: submodules
-        (&["submodule", "status"], "vl submodule"),
-        (&["submodule", "status", "vendor/a"], "vl submodule"),
-        (&["submodule", "update", "vendor/a", "--allow-local"], "vl submodule"),
-        (&["submodule", "set", "vendor/a", "0123456789abcdef0123456789abcdef01234567"], "vl submodule"),
-        (&["submodule", "add", "https://example.com/a.git", "vendor/a"], "vl submodule"),
         // stream W: attributes
         (&["attr", "check", "README.md", "src/x.c"], "vl attr"),
         (&["renormalize"], "vl renormalize"),
@@ -131,15 +125,6 @@ fn new_flags_on_existing_commands_refuse_only_when_given() {
     env.ok(&["tag", "set", "main", "-r", "@-"]);
 
     let cases: &[(&[&str], &str)] = &[
-        // stream G: annotated tags, Git tags
-        (&["tag", "set", "v1", "-a"], "annotated tags"),
-        (&["tag", "set", "v1", "-r", "@-", "-a", "-m", "release 1"], "annotated tags"),
-        (&["tag", "set", "v1", "--force"], "annotated tags"),
-        (&["tag", "verify", "v1"], "vl tag verify"),
-        (&["git", "fetch", "--no-tags"], "--no-tags"),
-        (&["git", "pull", "origin", "--prune-tags"], "--prune-tags"),
-        (&["git", "push", "--force-tags"], "--force-tags"),
-        (&["git", "push", "--delete-tag", "v1"], "--delete-tag"),
     ];
     for (args, what) in cases {
         env.refuses(args, what);
