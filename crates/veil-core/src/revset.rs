@@ -11,6 +11,20 @@
 //! X-  X--      first parent, grandparent, …
 //! ```
 //!
+//! Sets of snapshots ([`resolve_set`], `vl log -r`, `vl bisect`,
+//! `vl format-patch`), children before parents:
+//!
+//! ```text
+//! X            just X
+//! ::B          B and all its ancestors (the root included)
+//! A..B         ancestors of B (B included) that are not ancestors of A
+//! ..B          root()..B
+//! A..          visible snapshots that are not ancestors of A
+//! ```
+//!
+//! Tag names never contain `..` or `:` (`commands::validate_tag_name`), so
+//! the operators are unambiguous.
+//!
 //! Tags are resolved before change ids, so a tag must never be named after
 //! a change: `vl pull` and `vl git pull` do not create a local tag whose
 //! name is a change-id or snapshot-id prefix of the repository
@@ -25,11 +39,46 @@
 //! snapshot can make a change id point nowhere new (BUG-105). The others
 //! keep their snapshot ids and tags.
 
+use std::collections::HashSet;
+
 use crate::{
     error::{Result, VeilError},
     id::{ChangeId, ObjectId},
     repo::Repo,
 };
+
+/// The snapshots `spec` names (see the module docs), children before
+/// parents, newest first among unrelated snapshots. Snapshots withheld here
+/// (an unreleased embargo on a public clone) are not part of the set.
+pub fn resolve_set(repo: &Repo, spec: &str, current_ws: &str) -> Result<Vec<ObjectId>> {
+    let spec = spec.trim();
+    if let Some(b) = spec.strip_prefix("::") {
+        let b = resolve(repo, nonempty(b, spec)?, current_ws)?;
+        return repo.topo_children_first([b]);
+    }
+    let Some((a, b)) = spec.split_once("..") else {
+        return Ok(vec![resolve(repo, spec, current_ws)?]);
+    };
+    if b.contains("..") {
+        return Err(VeilError::Revset(format!("'{spec}': one `..` per range")));
+    }
+    let excluded: HashSet<ObjectId> = match a.trim() {
+        "" => [repo.root_id()].into_iter().collect(),
+        a => repo.ancestors(&resolve(repo, a, current_ws)?)?,
+    };
+    let heads: Vec<ObjectId> = match b.trim() {
+        "" => repo.view().refs().into_iter().collect(),
+        b => vec![resolve(repo, b, current_ws)?],
+    };
+    Ok(repo.topo_children_first(heads)?.into_iter().filter(|id| !excluded.contains(id)).collect())
+}
+
+fn nonempty<'a>(s: &'a str, spec: &str) -> Result<&'a str> {
+    match s.trim() {
+        "" => Err(VeilError::Revset(format!("'{spec}' names no revision"))),
+        s => Ok(s),
+    }
+}
 
 pub fn resolve(repo: &Repo, spec: &str, current_ws: &str) -> Result<ObjectId> {
     let spec = spec.trim();

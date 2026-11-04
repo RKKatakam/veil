@@ -88,28 +88,6 @@ impl Env {
 fn new_commands_parse_their_documented_flags_and_refuse() {
     let env = Env::new();
     let cases: &[(&[&str], &str)] = &[
-        // stream H: blame, grep, bisect
-        (&["blame", "README.md"], "vl blame"),
-        (
-            &["blame", "README.md", "-r", "@-", "-L", "1,2", "--follow", "--max-changes", "10", "--public", "--json"],
-            "vl blame",
-        ),
-        (&["annotate", "README.md"], "vl blame"),
-        (&["grep", "hello"], "vl grep"),
-        (
-            &[
-                "grep", "hello", "-r", "@-", "-i", "-F", "-w", "-n", "-l", "-c", "--max-count", "3", "-a", "--json", "--", "README.md",
-                "src",
-            ],
-            "vl grep",
-        ),
-        (&["bisect", "start", "--bad", "@", "--good", "@-", "--good", "root()"], "vl bisect"),
-        (&["bisect", "good"], "vl bisect"),
-        (&["bisect", "bad", "@-", "--discard"], "vl bisect"),
-        (&["bisect", "skip", "--discard"], "vl bisect"),
-        (&["bisect", "run", "--with-isolated", "--trust-partial", "--", "make", "test", "-k"], "vl bisect"),
-        (&["bisect", "reset"], "vl bisect"),
-        (&["bisect", "log"], "vl bisect"),
         // stream R: duplicate, cherry-pick
         (&["duplicate", "@-"], "vl duplicate"),
         (&["duplicate", "@-", "@", "-d", "root()", "-d", "@-", "-m", "copy", "-x", "--json"], "vl duplicate"),
@@ -164,23 +142,6 @@ fn new_flags_on_existing_commands_refuse_only_when_given() {
     env.ok(&["tag", "set", "main", "-r", "@-"]);
 
     let cases: &[(&[&str], &str)] = &[
-        // stream H: log filters
-        (&["log", "README.md"], "vl log PATH"),
-        (&["log", "--", "README.md"], "vl log PATH"),
-        (&["log", "-r", "root()..@"], "-r"),
-        (&["log", "--author", "alice"], "--author"),
-        (&["log", "--signed-by", "alice"], "--signed-by"),
-        (&["log", "-S", "hello"], "-S"),
-        (&["log", "-G", "hel+o", "-i"], "-G -i"),
-        (&["log", "-S", "hello", "--pickaxe-all", "--show-skipped", "--max-changes", "5"], "--pickaxe-all"),
-        (&["log", "--follow", "README.md", "--json"], "--follow"),
-        // stream H: rename detection
-        (&["diff", "--no-renames"], "--no-renames"),
-        (&["diff", "-M"], "-M"),
-        (&["diff", "-M=80"], "-M"),
-        (&["diff", "--find-renames=30", "-C"], "-M -C"),
-        (&["show", "@-", "-M"], "-M"),
-        (&["show", "-C", "@-", "--json"], "-C"),
         // stream K: --no-verify
         (&["commit", "-m", "x", "--no-verify"], "--no-verify"),
         (&["describe", "-m", "x", "--no-verify"], "--no-verify"),

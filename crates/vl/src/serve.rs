@@ -123,9 +123,8 @@ pub const METHODS: &[&str] = &[
     "op.log",
     "scan",
     "secret.list",
-    // Git-parity round, stream H (read methods; uncomment with the handler):
-    // "blame",
-    // "grep",
+    "blame",
+    "grep",
     // `bisect run` executes code and is never served (design 1, point 17).
     "snapshot",
     "describe",
@@ -1071,6 +1070,43 @@ struct LogParams {
     snapshot: Option<bool>,
 }
 
+/// `blame`: the flags of `vl blame`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BlameParams {
+    path: String,
+    rev: Option<String>,
+    /// `[START, END]`, 1-based and inclusive (`-L START,END`).
+    lines: Option<[usize; 2]>,
+    #[serde(default)]
+    follow: bool,
+    max_changes: Option<usize>,
+    #[serde(default)]
+    public: bool,
+    snapshot: Option<bool>,
+}
+
+/// `grep`: the flags of `vl grep` that change what is found (the
+/// document always lists every match).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrepParams {
+    pattern: String,
+    rev: Option<String>,
+    #[serde(default)]
+    paths: Vec<String>,
+    #[serde(default)]
+    ignore_case: bool,
+    #[serde(default)]
+    fixed_strings: bool,
+    #[serde(default)]
+    word_regexp: bool,
+    max_count: Option<usize>,
+    #[serde(default)]
+    text: bool,
+    snapshot: Option<bool>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DiffParams {
@@ -1224,6 +1260,37 @@ impl Server {
             "show" => {
                 let p: ShowParams = params(p)?;
                 read(Cmd::Show { rev: p.rev.unwrap_or_else(|| "@".into()), stat: p.stat, renames: Default::default(), out: JSON }, p.snapshot)
+            }
+            "blame" => {
+                let p: BlameParams = params(p)?;
+                let args = crate::history::BlameArgs {
+                    path: p.path,
+                    rev: p.rev.unwrap_or_else(|| "@".into()),
+                    lines: p.lines.map(|[a, b]| format!("{a},{b}")),
+                    follow: p.follow,
+                    max_changes: p.max_changes.unwrap_or(veil_core::blame::DEFAULT_MAX_CHANGES),
+                    public: p.public,
+                    out: JSON,
+                };
+                read(Cmd::Blame(args), p.snapshot)
+            }
+            "grep" => {
+                let p: GrepParams = params(p)?;
+                let args = crate::history::GrepArgs {
+                    pattern: p.pattern,
+                    paths: p.paths,
+                    rev: p.rev.unwrap_or_else(|| "@".into()),
+                    ignore_case: p.ignore_case,
+                    fixed_strings: p.fixed_strings,
+                    word_regexp: p.word_regexp,
+                    line_number: false,
+                    files_with_matches: false,
+                    count: false,
+                    max_count: p.max_count,
+                    text: p.text,
+                    out: JSON,
+                };
+                read(Cmd::Grep(args), p.snapshot)
             }
             "ws.list" | "workspace.list" => {
                 let p: Plain = params(p)?;
@@ -1528,6 +1595,8 @@ fn read_document(ctx: &Ctx, cmd: &Cmd) -> Result<String> {
             let (a, b) = api::diff_trees_for(ctx, rev.as_deref(), from.as_deref(), to.as_deref())?;
             api::to_json(&api::diff(&ctx.repo, &a, &b, *stat)?)
         }
+        Cmd::Blame(a) => api::to_json(&crate::history::blame_doc(ctx, a)?),
+        Cmd::Grep(a) => api::to_json(&crate::history::grep_doc(ctx, a)?),
         Cmd::Workspace(WsCmd::List { .. }) => api::to_json(&api::workspace_list(&ctx.repo, &ctx.ws)),
         Cmd::Tag(TagCmd::List { .. }) => api::to_json(&api::tag_list(&ctx.repo)),
         Cmd::Op(OpCmd::Log { limit, .. }) => api::to_json(&api::op_log(&ctx.repo, *limit)?),

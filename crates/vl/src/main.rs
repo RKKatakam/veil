@@ -219,27 +219,10 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             true => api::emit_json(&api::status(ctx)?)?,
             false => api::text::status(&api::status(ctx)?),
         },
-        Cmd::Log { limit, filter, out } => {
-            history::require_no_log_filter(filter)?;
-            match out.json {
-                true => api::emit_json(&api::log(&ctx.repo, &ctx.ws, *limit)?)?,
-                false => api::text::log(api::log_entries(&ctx.repo, &ctx.ws, *limit)?)?,
-            }
-        }
-        Cmd::Show { rev, stat, renames, out } => {
-            history::require_no_rename_flags(renames)?;
-            match out.json {
-                true => api::emit_json(&api::show(ctx, rev, *stat)?)?,
-                false => api::text::show(&ctx.repo, &api::show_header(ctx, rev, *stat)?)?,
-            }
-        }
+        Cmd::Log { limit, filter, out } => history::log(ctx, *limit, filter, out.json)?,
+        Cmd::Show { rev, stat, renames, out } => history::show(ctx, rev, *stat, renames, out.json)?,
         Cmd::Diff { rev, from, to, stat, renames, out } => {
-            history::require_no_rename_flags(renames)?;
-            let (a, b) = api::diff_trees_for(ctx, rev.as_deref(), from.as_deref(), to.as_deref())?;
-            match out.json {
-                true => api::emit_json(&api::diff(&ctx.repo, &a, &b, *stat)?)?,
-                false => api::text::diff(&ctx.repo, &a, &b, *stat)?,
-            }
+            history::diff(ctx, rev.as_deref(), from.as_deref(), to.as_deref(), *stat, renames, out.json)?
         }
         Cmd::Files { rev } => {
             let id = ctx.rev(rev)?;

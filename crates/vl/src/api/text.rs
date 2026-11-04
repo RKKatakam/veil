@@ -39,11 +39,27 @@ fn description_shown(d: &Option<String>, hidden: &Option<HiddenText>) -> String 
 
 // ---- status ----------------------------------------------------------------------
 
+/// One line per change: `A path`, and for a rename `R old -> new`
+/// (`R087 old -> new` with `scores`, as `vl diff --stat` shows it; copies
+/// are `C`).
 pub fn changes_summary(changes: &[Change]) {
+    changes_summary_with(changes, false)
+}
+
+pub fn changes_summary_with(changes: &[Change], scores: bool) {
     for c in changes {
         let status = match c.status {
             "added" => green("A"),
             "deleted" => red("D"),
+            "renamed" | "copied" => {
+                let letter = if c.status == "copied" { "C" } else { "R" };
+                let code = match (scores, c.score) {
+                    (true, Some(n)) => format!("{letter}{n:03}"),
+                    _ => letter.to_string(),
+                };
+                println!("{} {} -> {}{}", cyan(&code), safe(c.from.as_deref().unwrap_or_default()), safe(&c.path), change_mark(c));
+                continue;
+            }
             _ => cyan("M"),
         };
         println!("{status} {}{}", safe(&c.path), change_mark(c));
@@ -187,6 +203,17 @@ pub fn log(entries: LogEntries<'_>) -> Result<()> {
     if entries.truncated && !stdout_closed() {
         println!("{}", dim("~  (more snapshots elided)"));
     }
+    if let Some(s) = entries.search() {
+        if s.stopped {
+            crate::render::warn(&format!("the search stopped after {} snapshots (--max-changes)", s.searched));
+        }
+        if s.skipped > 0 && !entries.lists_skipped() {
+            crate::render::warn(&format!(
+                "{} snapshot(s) not searched: the versions to read are sealed for you (--show-skipped lists them)",
+                s.skipped
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -269,6 +296,10 @@ fn log_entry(e: &LogEntry, lanes: &mut Vec<Option<ObjectId>>) {
     if let Some(em) = &e.embargo {
         header.push(yellow(&format!("[embargo:{}{}]", safe(&em.id), if em.released { " released" } else { "" })));
     }
+    if let Some(v) = &e.not_searched {
+        let who: Vec<String> = v.iter().map(|v| safe(&v.visibility().label()).into_owned()).collect();
+        header.push(dim(&format!("(not searched: sealed for {})", who.join(", "))));
+    }
 
     lanes[col] = e.parents.first().map(|p| p.id);
     for p in e.parents.iter().skip(1) {
@@ -312,6 +343,10 @@ fn log_entry(e: &LogEntry, lanes: &mut Vec<Option<ObjectId>>) {
             String::new()
         };
         println!("{line2_prefix} {desc}{merge}");
+        if let Some(files) = &e.files {
+            let shown: Vec<String> = files.iter().map(|f| safe(f).into_owned()).collect();
+            println!("{line2_prefix} {}", dim(&format!("matched in: {}", shown.join(", "))));
+        }
     }
 }
 
@@ -319,28 +354,42 @@ fn log_entry(e: &LogEntry, lanes: &mut Vec<Option<ObjectId>>) {
 
 /// `vl diff` of the changes between two trees, rendered one file at a time;
 /// stops when stdout goes away.
-pub fn diff(repo: &Repo, from: &ObjectId, to: &ObjectId, stat: bool) -> Result<()> {
+pub fn diff(repo: &Repo, from: &ObjectId, to: &ObjectId, stat: bool, r: &Renames) -> Result<()> {
     let changes = diff_changes(repo, from, to)?;
     if changes.is_empty() {
         println!("{}", dim("(no changes)"));
         return Ok(());
     }
+    let (items, skipped) = detect_renames(repo, changes, r)?;
+    if skipped {
+        crate::render::warn(&format!(
+            "rename detection skipped: too many files (limit {}); only exact renames are shown",
+            r.opts.limit
+        ));
+    }
     if stat {
-        let summary: Vec<Change> = changes.iter().map(|c| change(repo, c)).collect();
-        changes_summary(&summary);
+        let summary: Vec<Change> = items.iter().map(|c| item_change(repo, c)).collect();
+        changes_summary_with(&summary, true);
         return Ok(());
     }
-    for c in &changes {
+    for c in &items {
         if stdout_closed() {
             break;
         }
-        file_diff_text(&file_diff_for_text(repo, c));
+        file_diff_text(&item_diff_for_text(repo, c));
     }
     Ok(())
 }
 
 pub fn file_diff_text(f: &FileDiff) {
-    println!("{}", bold(&format!("diff --veil a/{0} b/{0}", safe(&f.path))));
+    let from = f.from.as_deref().unwrap_or(&f.path);
+    println!("{}", bold(&format!("diff --veil a/{} b/{}", safe(from), safe(&f.path))));
+    if let (Some(src), Some(score)) = (&f.from, f.score) {
+        let word = if f.status == "copied" { "copy" } else { "rename" };
+        println!("{}", dim(&format!("similarity index {score}%")));
+        println!("{}", dim(&format!("{word} from {}", safe(src))));
+        println!("{}", dim(&format!("{word} to {}", safe(&f.path))));
+    }
     match (f.old.as_ref().and_then(|o| o.conflict.as_ref()), f.new.as_ref().and_then(|n| n.conflict.as_ref())) {
         (_, Some(c)) => println!("{}", red(&format!("unresolved conflict ({} sides): content with markers", c.sides))),
         (Some(_), None) => println!("{}", green("conflict resolved")),
@@ -427,7 +476,7 @@ pub fn patch_lines(hunks: &[Hunk]) -> Vec<String> {
 
 /// `vl show`: the header from `s` ([`super::show_header`]), then the diff,
 /// rendered one file at a time.
-pub fn show(repo: &Repo, s: &Show) -> Result<()> {
+pub fn show(repo: &Repo, s: &Show, r: &Renames) -> Result<()> {
     println!("Change ID : {}", bold(&magenta(&s.change_id)));
     println!("Snapshot  : {}", blue(&s.snapshot_id));
     println!("Author    : {} at {}", safe(&s.author), fmt_time(s.timestamp_ms));
@@ -471,7 +520,7 @@ pub fn show(repo: &Repo, s: &Show) -> Result<()> {
         }
     }
     println!();
-    diff(repo, &s.base_tree, &s.tree, s.diff.stat)
+    diff(repo, &s.base_tree, &s.tree, s.diff.stat, r)
 }
 
 // ---- lists -----------------------------------------------------------------------
@@ -811,5 +860,114 @@ mod tests {
             if new_nl && !n.is_empty() { n.push('\n'); }
             check(&o, &n);
         }
+    }
+}
+
+// ---- blame -----------------------------------------------------------------------
+
+/// `vl blame`: `change (author date line) text`, one line per line of the
+/// file; unattributed lines say why. Change ids, never descriptions (a
+/// sealed description cannot leak through blame).
+pub fn blame(b: &BlameDoc) {
+    let width = b.lines.iter().filter_map(|l| l.author.as_deref()).map(|a| a.chars().count().min(20)).max().unwrap_or(0);
+    let digits = b.lines.last().map_or(1, |l| l.line.to_string().len());
+    for l in &b.lines {
+        if stdout_closed() {
+            return;
+        }
+        let text = safe(&l.text);
+        match (&l.change_short, &l.unattributed) {
+            (Some(c), _) => {
+                let author: String = l.author.as_deref().unwrap_or_default().chars().take(20).collect();
+                let date = crate::render::fmt_time(l.timestamp_ms);
+                let date = date.split(' ').next().unwrap_or_default().to_string();
+                println!(
+                    "{} ({} {} {:>digits$}) {text}",
+                    magenta(&c[..c.len().min(8)]),
+                    yellow(&format!("{:<width$}", safe(&author))),
+                    dim(&date),
+                    l.line
+                );
+            }
+            (None, u) => {
+                let why = match u {
+                    Some(UnattributedDoc { reason: "sealed", sealed_for: Some(v) }) => format!("sealed:{}", safe(&v.visibility().label())),
+                    Some(u) => u.reason.replace('_', "-"),
+                    None => "unknown".into(),
+                };
+                println!("{} ({} {:>digits$}) {text}", dim("????????"), dim(&why), l.line);
+            }
+        }
+    }
+    if b.version == "fallback" {
+        crate::render::warn("you cannot read the current version of this file: its last public version is annotated (members see newer content)");
+    }
+    if b.unattributed > 0 {
+        let why = match b.stopped {
+            Some("max_changes") => "the walk stopped at --max-changes; raise it to go further",
+            Some(_) => "the walk ran out of its work budget",
+            None => "the history they come from is sealed for you",
+        };
+        crate::render::warn(&format!("{} line(s) unattributed: {why}", b.unattributed));
+    }
+    if b.coarse {
+        crate::render::warn("some versions differ too much to compare line by line: their changed region is attributed whole");
+    }
+}
+
+// ---- grep ------------------------------------------------------------------------
+
+/// How `vl grep` prints its result.
+#[derive(Clone, Copy, Default)]
+pub struct GrepStyle {
+    pub line_number: bool,
+    pub files_with_matches: bool,
+    pub count: bool,
+}
+
+/// `vl grep`: `path:text` (`path:line:text` with `-n`), `path` with `-l`,
+/// `path:count` with `-c`; "binary file path matches" for binary files.
+pub fn grep(g: &GrepDoc, style: GrepStyle) {
+    let mut lines = g.matches.iter().peekable();
+    for f in &g.files {
+        if stdout_closed() {
+            return;
+        }
+        let p = safe(&f.path);
+        if style.files_with_matches {
+            println!("{}", magenta(&p));
+        } else if style.count {
+            println!("{}:{}", magenta(&p), f.count);
+        }
+        let mine: Vec<&GrepMatchDoc> = std::iter::from_fn(|| lines.next_if(|m| m.path == f.path)).collect();
+        if style.files_with_matches || style.count {
+            continue;
+        }
+        if f.binary && mine.is_empty() {
+            println!("binary file {p} matches");
+            continue;
+        }
+        for m in mine {
+            let text = safe(&m.text);
+            let cut = if m.truncated { "…" } else { "" };
+            match style.line_number {
+                true => println!("{}:{}:{text}{cut}", magenta(&p), green(&m.line.to_string())),
+                false => println!("{}:{text}{cut}", magenta(&p)),
+            }
+        }
+    }
+    let fallback: Vec<String> = g.files.iter().filter(|f| f.tier == "fallback").map(|f| safe(&f.path).into_owned()).collect();
+    if !fallback.is_empty() {
+        crate::render::warn(&format!(
+            "searched the last public version of {} file(s) you cannot read (members see newer content): {}",
+            fallback.len(),
+            fallback.join(", ")
+        ));
+    }
+    if g.skipped.sealed > 0 {
+        crate::render::warn(&format!("{} file(s) not searched: sealed for a scope you are not in", g.skipped.sealed));
+    }
+    if g.skipped.too_large > 0 {
+        crate::render::warn(&format!("{} file(s) over 256 MiB not searched", g.skipped.too_large));
     }
 }

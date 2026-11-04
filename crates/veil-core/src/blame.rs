@@ -24,8 +24,10 @@
 //! # The walk
 //!
 //! Lines of the file at the starting snapshot are open until attributed.
-//! Snapshots are visited newest first (by timestamp, a priority queue), each
-//! with the lines its children passed it. A snapshot's version is compared
+//! Snapshots are visited in topological order, children before parents
+//! ([`Repo::topo_children_first`]), each once, with every line its children
+//! passed it (threat review 5: no snapshot is visited twice, whatever the
+//! timestamps say). A snapshot's version is compared
 //! with each parent's in order; a line the parent holds moves to the first
 //! parent that holds it, the rest are attributed to the snapshot. A parent
 //! whose readable version is identical (same object, or same bytes) takes
@@ -35,10 +37,6 @@
 //! to the pre-merge tree, threat review 3). A parent whose version is
 //! redacted stops the lines it might hold: they are reported unattributed
 //! ("history sealed for …"), never guessed.
-//!
-//! Lines are independent of one another, so visiting a snapshot twice (a
-//! clock skewed so that a parent is newer than its child) is correct, only
-//! slower; every visit counts against the limits.
 //!
 //! # Limits
 //!
@@ -481,16 +479,18 @@ struct Pending {
     version: Arc<Version>,
 }
 
+/// A snapshot (and the file's name there) waiting to be visited; the
+/// heap pops the lowest topological rank (children first) first.
 #[derive(PartialEq, Eq)]
 struct Queued {
-    timestamp: i64,
+    rank: usize,
     id: ObjectId,
     path: VPath,
 }
 
 impl Ord for Queued {
     fn cmp(&self, o: &Self) -> Ordering {
-        self.timestamp.cmp(&o.timestamp).then_with(|| self.id.cmp(&o.id)).then_with(|| self.path.as_str().cmp(o.path.as_str()))
+        o.rank.cmp(&self.rank).then_with(|| o.path.as_str().cmp(self.path.as_str()))
     }
 }
 
@@ -543,9 +543,16 @@ pub fn blame(repo: &Repo, rev: &ObjectId, path: &VPath, o: &BlameOptions) -> Res
     let mut heap: BinaryHeap<Queued> = BinaryHeap::new();
     let mut pending: HashMap<(ObjectId, VPath), Pending> = HashMap::new();
     let open: Vec<(u32, u32)> = (from..to.max(from)).map(|i| (i as u32, i as u32)).collect();
+    // Children before parents: every line a snapshot will receive has
+    // arrived by the time it is popped.
+    let rank: HashMap<ObjectId, usize> = if open.is_empty() {
+        HashMap::new()
+    } else {
+        repo.topo_children_first([*rev])?.into_iter().enumerate().map(|(i, id)| (id, i)).collect()
+    };
     if !open.is_empty() {
         pending.insert((*rev, path.clone()), Pending { lines: open, version: version.clone() });
-        heap.push(Queued { timestamp: top.timestamp, id: *rev, path: path.clone() });
+        heap.push(Queued { rank: 0, id: *rev, path: path.clone() });
     }
     let mut work: u64 = 0;
     let budget = o.work_budget;
@@ -567,6 +574,7 @@ pub fn blame(repo: &Repo, rev: &ObjectId, path: &VPath, o: &BlameOptions) -> Res
             }
             // A parent withheld here (an unreleased embargo on a public
             // clone) is not part of this replica's history.
+            let Some(&prank) = rank.get(parent) else { continue };
             let Some(ps) = repo.snapshot_opt(parent)? else { continue };
             let mut ppath = q.path.clone();
             let mut pv = match pending.get(&(*parent, ppath.clone())) {
@@ -630,7 +638,7 @@ pub fn blame(repo: &Repo, rev: &ObjectId, path: &VPath, o: &BlameOptions) -> Res
                 Some(p) => p.lines.extend(passed),
                 None => {
                     pending.insert((*parent, ppath.clone()), Pending { lines: passed, version: pver });
-                    heap.push(Queued { timestamp: ps.timestamp, id: *parent, path: ppath });
+                    heap.push(Queued { rank: prank, id: *parent, path: ppath });
                 }
             }
         }
