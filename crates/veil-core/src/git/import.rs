@@ -477,7 +477,12 @@ impl GitBridge {
             embargo: None,
             signature: None,
         };
-        let sid = tx.write_snapshot(&snap)?;
+        // Unsigned, so that the snapshot is a function of the Git commit
+        // and what Veil holds for its parents: every member who imports the
+        // same commit gets the same snapshot id (BUG-285). A signature
+        // would say who imported it, and two members' imports would then
+        // be two divergent copies of one change.
+        let sid = tx.write_unsigned_snapshot(&snap)?;
         index.add(change_id, sid);
         self.map.record_import(*oid, sid, veiled);
         Ok(Imported::New)

@@ -141,6 +141,10 @@ pub struct Ctx {
     /// Stat cache of the project directory (it follows the directory when
     /// another workspace is attached).
     cache: StatCache,
+    /// A bare repository (a remote created by `vl push`): no workspace, no
+    /// working copy. Only commands that read history, and `gc`, run here
+    /// (BUG-284); nothing is snapshotted or checked out.
+    pub bare: bool,
 }
 
 pub fn find_root(start: &Path) -> Option<PathBuf> {
@@ -202,6 +206,19 @@ impl Ctx {
         let user = user_for(&identity);
         let fs = Arc::new(DiskBackend::new(&root));
         let mut repo = Repo::open(fs.clone(), Some(identity), &user)?;
+        if repo.view().workspaces.is_empty() {
+            let checkout = CheckoutState::new(DEFAULT_WORKSPACE, repo.root_id(), Materialised::default());
+            return Ok(Ctx {
+                root,
+                cache: StatCache::default(),
+                fs,
+                repo,
+                ws: DEFAULT_WORKSPACE.to_string(),
+                checkout,
+                report: BuildReport::default(),
+                bare: true,
+            });
+        }
         for id in repo.auto_release_embargoes()? {
             eprintln!("{} embargo {id}: its release time has passed", render::green("Released"));
         }
@@ -216,6 +233,7 @@ impl Ctx {
             checkout,
             report: BuildReport::default(),
             cache,
+            bare: false,
         };
         if snapshot {
             ctx.snapshot()?;
@@ -224,6 +242,9 @@ impl Ctx {
     }
 
     pub fn wc(&self) -> Result<ObjectId> {
+        if self.bare {
+            return Err(anyhow!("this is a bare repository (a remote): it has no working copy"));
+        }
         Ok(self.repo.workspace_wc(&self.ws)?)
     }
 
@@ -429,6 +450,9 @@ impl Ctx {
 
     /// Bring the project directory in line with the attached workspace.
     pub fn finish(&mut self) -> Result<()> {
+        if self.bare {
+            return Ok(());
+        }
         if self.checkout.pending.is_some() {
             self.resume()?;
         }

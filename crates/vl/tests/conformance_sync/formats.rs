@@ -40,7 +40,10 @@ fn a_new_repository_cannot_push_into_a_format_1_remote_and_leaves_it_untouched()
         &proj,
         &["remote", "add", "old", remote.to_str().unwrap()],
     );
-    let out = env.fails("zoe", &proj, &["push", "old"]);
+    // A new tag: the remote's `main` is unrelated history, and a diverged tag is refused before
+    // anything is sent (BUG-288), so it would never reach the format check.
+    env.ok("zoe", &proj, &["tag", "set", "zoe-work", "-r", "main"]);
+    let out = env.fails("zoe", &proj, &["push", "old", "-t", "zoe-work"]);
     assert!(out.contains("vl upgrade --remote"), "{out}");
     assert_eq!(
         listing(&remote),

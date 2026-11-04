@@ -157,7 +157,6 @@ fn fsck_writes_nothing_even_with_unrecorded_edits() {
 
 // Scenario from git t1450-fsck.sh: "fsck reports dangling objects" (not an error).
 #[test]
-#[ignore = "BUG-289: fsck neither counts nor verifies unreachable objects once they are packed"]
 fn fsck_counts_unreachable_objects_after_gc_packed_them() {
     let env = Env::new();
     let proj = repo_with_history(&env);

@@ -114,6 +114,14 @@ pub struct SyncReport {
     /// Embargo releases staged here that this push published (written into
     /// their records and sent): from now on they cannot be taken back.
     pub releases_published: Vec<String>,
+    /// Tags deleted on the remote ([`delete_remote_tags`]).
+    pub tags_deleted: Vec<String>,
+    /// Remote tags `<remote>/<tag>` removed because the remote no longer
+    /// has the tag (pull), or because this push deleted it there.
+    pub remote_tags_removed: Vec<String>,
+    /// Local tags that a pull did not recreate: deleted here, and not
+    /// moved on the remote since ([`deleted_tags`]).
+    pub tags_kept_deleted: Vec<String>,
 }
 
 /// How to synchronise.
@@ -975,6 +983,283 @@ fn sync_meta(src: &Keychain, dst: &Keychain, public: bool, warnings: &mut Vec<St
     Ok(())
 }
 
+// ---- remotes -----------------------------------------------------------------
+
+/// Check a remote name (Veil or Git): it becomes the first component of
+/// the remote tags `<remote>/<tag>`, and of Git ref names. ASCII letters,
+/// digits, `-`, `_` and `.`; not empty, no leading `-` or `.`, no `..`, not
+/// ending in `.lock` (BUG-286). A `/` would make `origin/main/<tag>`
+/// collide with remote `origin`'s tag `main/<tag>`.
+pub fn validate_remote_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && !name.starts_with(['-', '.'])
+        && !name.ends_with(".lock")
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        && !name.contains("..");
+    if ok {
+        Ok(())
+    } else {
+        Err(VeilError::repo(format!(
+            "invalid remote name {name:?}: use letters, digits, '-', '_' and '.' (not first), as in `origin`"
+        )))
+    }
+}
+
+/// Names of the configured Git remotes (`.veil/git/remotes.json`), read
+/// directly so that this works without the `git` feature.
+pub(crate) fn git_remote_names(backend: &dyn StorageBackend) -> Result<Vec<String>> {
+    let path = VPath::new(".veil/git/remotes.json").expect("valid path");
+    match backend.read_opt(&path)? {
+        Some(raw) => {
+            let map: std::collections::BTreeMap<String, String> = serde_json::from_slice(&raw)?;
+            Ok(map.into_keys().collect())
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Add Veil remote `name` for `url` (`vl remote add`). Refuses an invalid
+/// name, an existing Veil remote and the name of a Git remote: both kinds
+/// record their tags as `<name>/<tag>` (BUG-287).
+pub fn add_remote(repo: &mut Repo, name: &str, url: &str, public: bool) -> Result<()> {
+    validate_remote_name(name)?;
+    let backend = repo.backend().clone();
+    // Under the repository lock (`update_config`): a concurrent `vl remote
+    // add` must not be lost to this read-modify-write of repo.json.
+    repo.update_config(|config| {
+        if config.remotes.contains_key(name) {
+            return Err(VeilError::repo(format!("remote '{name}' already exists")));
+        }
+        if git_remote_names(&*backend)?.iter().any(|g| g == name) {
+            return Err(VeilError::repo(format!(
+                "'{name}' is already the name of a Git remote; Veil remotes share its `{name}/<tag>` names, pick another"
+            )));
+        }
+        config.remotes.insert(
+            name.to_string(),
+            crate::repo::RemoteConfig {
+                url: url.to_string(),
+                public,
+            },
+        );
+        Ok(())
+    })?;
+    repo.record_outside_view(
+        format!("add remote {name}"),
+        format!("remotes live in .veil/repo.json, outside the operation log; run `vl remote rm {name}`"),
+    )?;
+    Ok(())
+}
+
+/// Remove Veil remote `name` and its remote tags `<name>/*` (`vl remote
+/// rm`, BUG-282). The remote tags go first, in one operation; the remote
+/// itself last, so that an interruption leaves the remote configured (a
+/// retry finishes the job), never remote tags of a remote that is gone.
+pub fn remove_remote(repo: &mut Repo, name: &str) -> Result<crate::repo::RemoteConfig> {
+    let removed = crate::repo::read_config(&**repo.backend())?
+        .remotes
+        .get(name)
+        .cloned()
+        .ok_or_else(|| VeilError::repo(format!("no remote named '{name}'")))?;
+    let mut tx = repo.transaction(format!("remove remote {name}"))?;
+    let prefix = format!("{name}/");
+    tx.view.remote_tags.retain(|k, _| !k.starts_with(&prefix));
+    tx.manual_undo(format!(
+        "remotes live in .veil/repo.json, outside the operation log; add it back with `vl remote add {name} {}{}` \
+         (its remote tags come back with the next pull)",
+        removed.url,
+        if removed.public { " --public" } else { "" }
+    ));
+    tx.commit()?;
+    repo.update_config(|config| {
+        config.remotes.remove(name);
+        Ok(())
+    })?;
+    Ok(removed)
+}
+
+// ---- tag deletion ---------------------------------------------------------------
+
+/// Where [`deleted_tags`] are recorded: repository-local, outside the view
+/// and the operation log, so no repository format changes (an older vl
+/// ignores the file and never rewrites it).
+fn deleted_tags_path() -> VPath {
+    VPath::new(".veil/local/deleted_tags.json").expect("valid path")
+}
+
+/// Tags deleted in this repository with `vl tag delete`: name → the
+/// snapshot it named then.
+///
+/// A pull creates a local tag for every remote tag it has no local tag
+/// for. Without this record the next pull would bring a deleted tag right
+/// back (BUG-280). With it, a pull leaves the tag deleted as long as the
+/// remote's tag is still where it was (or behind it): the deletion is the
+/// newer decision. Once somebody moves the tag on the remote to work this
+/// repository has not seen, the pull recreates it and says so: new work is
+/// never hidden by an old deletion. Like jj's remote-bookmark tracking, the
+/// remote tag `<remote>/<tag>` itself always shows what the remote holds.
+///
+/// An entry is dropped once the tag exists here again (set again, or
+/// brought back by `vl undo`) and a pull sees it, or when a pull recreates
+/// it.
+pub fn deleted_tags(backend: &dyn StorageBackend) -> Result<std::collections::BTreeMap<String, ObjectId>> {
+    match backend.read_opt(&deleted_tags_path())? {
+        Some(raw) => serde_json::from_slice(&raw).map_err(|e| {
+            VeilError::repo(format!(
+                "{} is damaged ({e}); delete it (tags deleted here may then come back with the next pull)",
+                deleted_tags_path()
+            ))
+        }),
+        None => Ok(Default::default()),
+    }
+}
+
+fn save_deleted_tags(backend: &dyn StorageBackend, map: &std::collections::BTreeMap<String, ObjectId>) -> Result<()> {
+    if map.is_empty() {
+        if backend.exists(&deleted_tags_path())? {
+            backend.remove_file(&deleted_tags_path())?;
+        }
+        return Ok(());
+    }
+    backend.write(&deleted_tags_path(), &serde_json::to_vec_pretty(map)?)
+}
+
+/// Record that tag `name`, naming `target`, was deleted here (see
+/// [`deleted_tags`]). Called under the repository lock.
+pub(crate) fn record_tag_deletion(backend: &dyn StorageBackend, name: &str, target: ObjectId) -> Result<()> {
+    let mut map = deleted_tags(backend)?;
+    map.insert(name.to_string(), target);
+    save_deleted_tags(backend, &map)
+}
+
+/// What a pull does about a remote tag `name` (at `remote_target`) that
+/// has no local tag: `true` to leave it deleted here (see
+/// [`deleted_tags`]). Drops the record when the remote moved past it.
+fn stays_deleted(
+    repo: &Repo,
+    deleted: &mut std::collections::BTreeMap<String, ObjectId>,
+    name: &str,
+    remote_target: &ObjectId,
+) -> Result<bool> {
+    let Some(was) = deleted.get(name) else { return Ok(false) };
+    if repo.is_ancestor(remote_target, was)? {
+        return Ok(true);
+    }
+    deleted.remove(name);
+    Ok(false)
+}
+
+/// Apply the pull rules of [`deleted_tags`] for `remote_tags` (name →
+/// target, as the remote has them) in transaction `tx`: returns the names
+/// that stay deleted, and those deleted here that the pull recreates
+/// because the remote moved past the deletion; saves the updated record.
+/// Also drops entries for tags that exist here again.
+pub(crate) fn tags_staying_deleted(
+    tx: &crate::transaction::Transaction<'_>,
+    remote_tags: &[(String, ObjectId)],
+) -> Result<(HashSet<String>, Vec<String>)> {
+    let backend = tx.repo().backend().clone();
+    let mut deleted = deleted_tags(&*backend)?;
+    let mut stay = HashSet::new();
+    let mut recreated = Vec::new();
+    if deleted.is_empty() {
+        return Ok((stay, recreated));
+    }
+    let before = deleted.clone();
+    deleted.retain(|name, _| !tx.view.tags.contains_key(name));
+    for (name, target) in remote_tags {
+        if tx.view.tags.contains_key(name) || !deleted.contains_key(name) {
+            continue;
+        }
+        if stays_deleted(tx.repo(), &mut deleted, name, target)? {
+            stay.insert(name.clone());
+        } else {
+            recreated.push(name.clone());
+        }
+    }
+    if deleted != before {
+        save_deleted_tags(&*backend, &deleted)?;
+    }
+    Ok((stay, recreated))
+}
+
+/// Delete tags `names` on a Veil remote (`vl push --delete`), and the
+/// remote tags `<remote_name>/<name>` here.
+///
+/// Each tag must already be deleted here (`vl tag delete`): otherwise the
+/// next `vl push` would publish it again. A deletion is refused (listed in
+/// `tags_rejected`) when the remote's tag has moved to work beyond what it
+/// named here when it was deleted (a teammate pushed to it since), or, for
+/// a tag never deleted here, to a snapshot this repository does not hold;
+/// `force` deletes it regardless. A tag the remote does not have is
+/// reported in `warnings`, and is not an error.
+///
+/// History is not deleted: the remote's snapshots stay until nothing
+/// references them and `vl -R <remote> gc` prunes them after its grace
+/// period, and every clone keeps what it pulled.
+pub fn delete_remote_tags(
+    local: &mut Repo,
+    remote_name: &str,
+    remote_backend: Arc<dyn StorageBackend>,
+    names: &[String],
+    force: bool,
+) -> Result<SyncReport> {
+    for n in names {
+        if local.view().tags.contains_key(n) {
+            return Err(VeilError::repo(format!(
+                "tag '{n}' still exists here; delete it first with `vl tag delete {n}` (a later `vl push` would publish it again)"
+            )));
+        }
+    }
+    if !is_repo(&*remote_backend) {
+        return Err(VeilError::NotFound(format!("Veil repository at remote '{remote_name}'")));
+    }
+    let deleted = deleted_tags(&**local.backend())?;
+    let mut remote = Repo::open(remote_backend, None, "remote")?;
+    let mut report = SyncReport::default();
+    let mut tx = remote.transaction(format!("delete tags from {}", local.repo_id()))?;
+    for n in names {
+        let Some(existing) = tx.view.tags.get(n).cloned() else {
+            report.warnings.push(format!("tag '{n}' is not on {remote_name}; nothing to delete there"));
+            report.tags_deleted.push(n.clone());
+            continue;
+        };
+        let safe = match deleted.get(n) {
+            Some(was) => local.is_ancestor(&existing.target, was)?,
+            None => local.snapshot_opt(&existing.target)?.is_some(),
+        };
+        if !force && !safe {
+            report.tags_rejected.push(n.clone());
+            report.tags_skipped.push((
+                n.clone(),
+                format!(
+                    "{remote_name} has moved it to {}, which you have not seen; pull first, or use --force",
+                    existing.target.short()
+                ),
+            ));
+            continue;
+        }
+        tx.view.tags.remove(n);
+        // Its history stops being visible there unless something else
+        // reaches it, so that `gc` on the remote can prune an experiment
+        // pushed by mistake.
+        tx.view.heads.remove(&existing.target);
+        report.tags_deleted.push(n.clone());
+    }
+    tx.commit()?;
+    if !report.tags_deleted.is_empty() {
+        let mut ltx = local.transaction(format!("delete tags on {remote_name}"))?;
+        for n in &report.tags_deleted {
+            let key = format!("{remote_name}/{n}");
+            if ltx.view.remote_tags.remove(&key).is_some() {
+                report.remote_tags_removed.push(key);
+            }
+        }
+        ltx.commit()?;
+    }
+    Ok(report)
+}
+
 /// Push tags (all by default) and their history to `remote`.
 pub fn push(
     local: &mut Repo,
@@ -1025,14 +1310,34 @@ pub fn push_with(
             Err(why) => report.tags_skipped.push((name, why)),
         }
     }
-    let selected = sendable;
-    let tips: Vec<ObjectId> = selected.iter().map(|(_, t)| t.target).collect();
-    let ids = push_closure(local.store(), local.keys(), &tips, &withheld)?
-        .map_err(|why| VeilError::repo(format!("push: {why}")))?;
     // Objects and metadata are copied under the remote's lock: metadata
     // merges are read-modify-writes, and objects must land before the
     // operation that references them.
     let mut tx = remote.transaction(format!("push from {}", local.repo_id()))?;
+    // Which tags the remote takes is decided before anything is sent: the
+    // history of a rejected tag is not uploaded (BUG-288). Nothing the
+    // remote's committed view does not reach would tell a retry that the
+    // remote already holds it, so every retry would send it again as one
+    // more pack. Decided on the local graph: it holds the whole history of
+    // each tag, and walking the remote's would cost a round trip per
+    // snapshot.
+    let mut accepted = Vec::new();
+    for (name, tag) in sendable {
+        if let Some(existing) = tx.view.tags.get(&name) {
+            if existing.target != tag.target && !force && !local.is_ancestor(&existing.target, &tag.target)? {
+                report.tags_rejected.push(name.clone());
+                report
+                    .tags_skipped
+                    .push((name, "remote has diverged (non-fast-forward; use --force)".into()));
+                continue;
+            }
+        }
+        accepted.push((name, tag));
+    }
+    let selected = accepted;
+    let tips: Vec<ObjectId> = selected.iter().map(|(_, t)| t.target).collect();
+    let ids = push_closure(local.store(), local.keys(), &tips, &withheld)?
+        .map_err(|why| VeilError::repo(format!("push: {why}")))?;
     {
         let dst = tx.repo().store().clone();
         let src = StoreSource(local.store());
@@ -1062,20 +1367,8 @@ pub fn push_with(
     report.releases_published = local.keys().publish_staged_releases()?;
     sync_meta(local.keys(), tx.repo().keys(), public, &mut report.warnings)?;
     for (name, tag) in selected {
-        if let Some(existing) = tx.view.tags.get(&name) {
-            if existing.target == tag.target {
-                continue;
-            }
-            // Decided on the local graph: it holds the whole history of
-            // `tag`, and walking the remote's would cost a round trip per
-            // snapshot.
-            if !force && !local.is_ancestor(&existing.target, &tag.target)? {
-                report.tags_rejected.push(name.clone());
-                report
-                    .tags_skipped
-                    .push((name, "remote has diverged (non-fast-forward; use --force)".into()));
-                continue;
-            }
+        if tx.view.tags.get(&name).is_some_and(|existing| existing.target == tag.target) {
+            continue;
         }
         for p in &local.snapshot(&tag.target)?.parents {
             tx.view.heads.remove(p);
@@ -1226,6 +1519,7 @@ fn open_or_init_remote(backend: &Arc<dyn StorageBackend>) -> Result<Repo> {
     if backend.exists(&config)? {
         return Repo::open(backend.clone(), None, "remote");
     }
+    refuse_foreign_directory(&**backend)?;
     let lock = crate::lock::RepoLock::acquire(backend.clone())?;
     let repo = if backend.exists(&config)? {
         Repo::open(backend.clone(), None, "remote")
@@ -1239,6 +1533,36 @@ fn open_or_init_remote(backend: &Arc<dyn StorageBackend>) -> Result<Repo> {
         Err(VeilError::AlreadyExists(_)) => Repo::open(backend.clone(), None, "remote"),
         r => r,
     }
+}
+
+/// A push creates a repository only where there is nothing yet: a missing
+/// or empty directory (or one holding only a `.veil/` an interrupted first
+/// push left). Anything else is somebody's files, most likely a typo in the
+/// remote's URL (`../proj` for `../proj.veil`), and turning it into a bare
+/// repository would break every `vl` command run there (BUG-283).
+fn refuse_foreign_directory(backend: &dyn StorageBackend) -> Result<()> {
+    let listing = match backend.list_dir_full(&VPath::root()) {
+        Ok(listing) => listing,
+        Err(e) if e.is_not_found() => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let foreign: Vec<&str> = listing
+        .entries
+        .iter()
+        .map(|e| e.name.as_str())
+        .chain(listing.special.iter().map(String::as_str))
+        .chain(listing.unrepresentable.iter().map(String::as_str))
+        .filter(|n| *n != crate::repo::VEIL_DIR)
+        .collect();
+    if foreign.is_empty() {
+        return Ok(());
+    }
+    Err(VeilError::repo(format!(
+        "the remote is a directory that is not empty and not a Veil repository (it holds {}{}); \
+         a push only creates a repository in a new or empty directory. Check the remote's URL (`vl remote list`)",
+        foreign.iter().take(3).map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", "),
+        if foreign.len() > 3 { ", …" } else { "" }
+    )))
 }
 
 /// Fetch every tag from `remote`, record them as `<remote_name>/<tag>`, and
@@ -1304,6 +1628,41 @@ pub fn pull_with(
             incoming.push(tag.target);
         }
     }
+    // Remote tags of tags the remote no longer has are pruned (as Git's
+    // `fetch --prune` and jj do). A local tag of that name is kept: a
+    // teammate's deletion never deletes your tag (BUG-280).
+    let prefix = format!("{remote_name}/");
+    let on_remote: HashSet<&str> = tags.iter().map(|(n, _)| n.as_str()).collect();
+    let gone: Vec<String> = tx
+        .view
+        .remote_tags
+        .keys()
+        .filter(|k| k.strip_prefix(&prefix).is_some_and(|t| !on_remote.contains(t)))
+        .cloned()
+        .collect();
+    for key in gone {
+        tx.view.remote_tags.remove(&key);
+        let name = &key[prefix.len()..];
+        if tx.view.tags.contains_key(name) {
+            report.warnings.push(format!(
+                "tag '{name}' was deleted on {remote_name}; your tag '{name}' is kept. Delete it with \
+                 `vl tag delete {name}`, or the next `vl push {remote_name}` publishes it again"
+            ));
+        }
+        report.remote_tags_removed.push(key);
+    }
+    let usable: Vec<(String, ObjectId)> = tags
+        .iter()
+        .filter(|(_, t)| incoming.contains(&t.target))
+        .map(|(n, t)| (n.clone(), t.target))
+        .collect();
+    let (stay_deleted, recreated) = tags_staying_deleted(&tx, &usable)?;
+    for name in recreated {
+        report.warnings.push(format!(
+            "tag '{name}', deleted here, has moved on {remote_name} to work you had not seen: it is back. \
+             Delete it again, or delete it there too with `vl push {remote_name} --delete {name}`"
+        ));
+    }
     for (name, tag) in tags {
         // Tag names and targets come from the remote: a name may carry
         // terminal escapes or path tricks, and a target may be missing or
@@ -1322,6 +1681,7 @@ pub fn pull_with(
         }
         tx.view.remote_tags.insert(format!("{remote_name}/{name}"), tag.target);
         match tx.view.tags.get(&name).cloned() {
+            None if stay_deleted.contains(&name) => report.tags_kept_deleted.push(name),
             None => {
                 let refs = || {
                     let mut r = tx.view.refs();

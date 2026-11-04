@@ -77,7 +77,6 @@ fn remote_rm_of_an_unknown_remote_fails() {
 
 // Scenario from git t5505-remote.sh: "remove remote" also removes its remote-tracking branches.
 #[test]
-#[ignore = "BUG-282: `vl remote rm` keeps the removed remote's REMOTE/TAG remote tags"]
 fn remote_rm_drops_its_remote_tags() {
     let env = Env::new();
     let (proj, _hub) = env.project_with_hub("alice", "proj", "hub", &[("a", "a\n")]);
@@ -95,7 +94,6 @@ fn remote_rm_drops_its_remote_tags() {
 
 // Scenario from git t5505-remote.sh: "rename errors out early when new name is invalid".
 #[test]
-#[ignore = "BUG-286: remote names are not validated (empty, spaces, slashes, `..`)"]
 fn remote_add_refuses_invalid_names() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a", "a\n")]);
@@ -113,7 +111,6 @@ fn remote_add_refuses_invalid_names() {
 // namespace; `vl git remote add` refuses a Veil remote's name, the reverse
 // must hold too.
 #[test]
-#[ignore = "BUG-287: `vl remote add` accepts the name of an existing Git remote, so both write `NAME/TAG`"]
 fn remote_add_refuses_the_name_of_a_git_remote() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a", "a\n")]);

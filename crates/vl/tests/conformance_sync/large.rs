@@ -80,7 +80,6 @@ fn gc_stores_a_small_edit_of_a_one_mib_file_as_a_delta() {
 
 // Same, above zstd's default window: the dictionary delta silently stops working.
 #[test]
-#[ignore = "BUG-290: gc's delta compression does nothing for files over a few MiB (zstd window); every version is stored whole"]
 fn gc_stores_a_small_edit_of_a_four_mib_file_as_a_delta() {
     let packed = two_versions_after_gc(4 * MIB);
     assert!(

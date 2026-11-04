@@ -414,7 +414,8 @@ pub fn print_log(repo: &Repo, ws: &str, limit: Option<usize>) -> Result<()> {
     for (name, w) in &repo.view().workspaces {
         wss.entry(w.wc).or_default().push(format!("{}@", safe(name)));
     }
-    let current = repo.workspace_wc(ws)?;
+    // None in a bare repository (no workspace).
+    let current = repo.view().workspaces.get(ws).map(|w| w.wc);
     let root = repo.root_id();
 
     let mut lanes: Vec<Option<ObjectId>> = Vec::new();
@@ -445,7 +446,7 @@ pub fn print_log(repo: &Repo, ws: &str, limit: Option<usize>) -> Result<()> {
                 *l = None;
             }
         }
-        let marker = if *id == current {
+        let marker = if Some(*id) == current {
             bold(&green("@"))
         } else if *id == root {
             "◆".to_string()

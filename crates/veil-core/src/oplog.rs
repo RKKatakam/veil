@@ -112,11 +112,12 @@ impl OpStore {
     }
 
     pub fn get(&self, id: &ObjectId) -> Result<Operation> {
-        let raw = self
-            .backend
-            .read(&Self::op_path(id))
-            .map_err(|_| VeilError::NotFound(format!("operation {}", id.short())))?;
-        Ok(serde_json::from_slice(&raw)?)
+        // Only a missing file is "not found": an I/O error (a lost SFTP
+        // connection, EIO, a permission problem) is reported as itself, so
+        // that the user looks at the network or the disk rather than for a
+        // damaged repository (BUG-293).
+        self.try_get(id)?
+            .ok_or_else(|| VeilError::NotFound(format!("operation {}", id.short())))
     }
 
     /// Like [`OpStore::get`], but `Ok(None)` if the operation does not exist

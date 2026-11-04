@@ -131,6 +131,7 @@ Options:
 |---|---|
 | `-t, --tag <TAG>` | Only push these tags |
 | `--force` | Overwrite branches that moved on the Git side (only if they still hold what was last fetched) |
+| `-d, --delete <BRANCH>` | Delete this branch on the Git remote (repeatable). Delete its tag here first with `vl tag delete`. Refused if the branch moved since the last fetch (unless --force). With no --tag, nothing else is pushed |
 
 ## `vl git export`
 

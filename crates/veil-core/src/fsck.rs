@@ -310,6 +310,7 @@ pub fn fsck(backend: Arc<dyn StorageBackend>, identity: Option<Identity>) -> Res
     let roots = c.check_ops()?;
     c.walk_snapshots(roots);
     c.scan_loose_objects()?;
+    c.scan_packed_objects()?;
     c.finish()?;
     let mut report = c.report;
     report.findings.sort_by_key(|f| f.severity);
@@ -782,6 +783,43 @@ impl Checker {
                 }
                 self.report.objects_unreachable += 1;
                 if let Load::Missing = self.load(&id) {
+                    self.report.objects_unreachable -= 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Verify every packed object the walk did not reach, and report packs
+    /// that cannot be opened (BUG-289). `gc` packs the unreachable objects
+    /// it keeps through their grace period with everything else, so they
+    /// are counted as unreachable here exactly as loose ones are, and
+    /// damage to them is found now rather than by a later `gc`. Each object
+    /// is read through the index and re-hashed, which covers every byte of
+    /// object data in the pack.
+    fn scan_packed_objects(&mut self) -> Result<()> {
+        self.store.reload_packs()?;
+        // A pack that cannot be opened is a warning: if it held anything
+        // reachable, the walk has already reported that object as missing
+        // (corrupt). Otherwise nothing needs it, but `gc` refuses to run
+        // until it is gone.
+        for (name, why) in self.store.broken_packs()? {
+            self.push(
+                Severity::Warning,
+                format!(
+                    "pack {} cannot be opened ({why}); `gc` refuses to run until it is removed. If nothing else is \
+                     reported, nothing reachable needs it: delete .veil/objects/pack/pack-{name}.*",
+                    &name[..name.len().min(12)]
+                ),
+            );
+        }
+        for pack in self.store.packs()? {
+            for id in pack.index().ids() {
+                if self.verified.contains(id) {
+                    continue;
+                }
+                self.report.objects_unreachable += 1;
+                if let Load::Missing = self.load(id) {
                     self.report.objects_unreachable -= 1;
                 }
             }

@@ -39,6 +39,12 @@ Git interop".
     objects), 290 (gc deltas do nothing above a few MiB), 292 (a failed
     `git import` keeps its remote), 293 (I/O errors reported as `not
     found: operation`).
+  * **Status (sync wave):** all fixed except BUG-281, which is BUG-248's
+    duplicate (the CLI wave). Deleting on a remote is explicit (`vl push
+    --delete`, `vl git push --delete`, as `git push --delete`); the two
+    BUG-280 reproductions that expected a plain push to delete were
+    changed accordingly, and new tests cover the lease, the recreation of
+    a tag moved on the remote, and refusals in a bare repository.
 * **Deliberate differences** (documented by Veil; tested as Veil
   behaves): only tags travel and pull never moves the working copy; pull
   *creates* local tags for new remote tags; no atomic push (other tags go,

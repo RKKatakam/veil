@@ -41,7 +41,15 @@ Storage: 0.02 MiB -> 0.01 MiB
 * `--prune-now` deletes them at once. Only use it when no other `vl`
   process is running on the repository.
 * `--level L` sets the zstd level (default 3); `--no-deltas` disables delta
-  compression.
+  compression. A small edit of a large file is stored as a small delta up
+  to about 64 MiB per version (the base and the new version must fit in
+  zstd's 128 MiB window); above that only the parts within the window are
+  shared.
+* **A remote on a path is collected the same way**: `vl -R ../hub gc`.
+  History un-tagged there (`vl push --delete`, `vl push --force`) is pruned
+  after the grace period. In a bare repository such as a remote, `vl -R`
+  runs `log`, `show`, `tag list`, `op log`, `gc` and `fsck`; other commands
+  need a working copy and are refused.
 * If part of the history can't be read, `gc` deletes nothing and says so.
   Run `vl fsck`.
 
@@ -68,6 +76,10 @@ note: 2 predecessor snapshot(s) of the evolution log are not present (normal aft
 
 * `redacted` objects are content you hold no key for, or that a public
   remote withheld: expected.
+* `unreachable` counts objects nothing references, loose or packed (`gc`
+  keeps them, packed, through their grace period); they are verified too.
+  A pack that can't be opened is a warning (`gc` refuses to run until it is
+  removed); any reachable object it held is reported as missing.
 * `-R PATH` checks another repository, including a bare remote on a path:
   `vl fsck -R ../hub`.
 * To repair missing or damaged objects, fetch them from a remote that has

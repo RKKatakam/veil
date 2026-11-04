@@ -330,7 +330,6 @@ fn two_concurrent_ssh_pushes_both_land() {
 
 // Veil: a connection that stops answering is reported as such, not as missing data.
 #[test]
-#[ignore = "BUG-293: an I/O error reading an operation (a lost SFTP connection) is reported as `not found: operation <id>`"]
 fn a_server_that_stops_answering_is_reported_as_a_lost_connection() {
     let mut env = sftp_env!();
     let proj = env.project("alice", "proj", &[("a", "a\n")]);

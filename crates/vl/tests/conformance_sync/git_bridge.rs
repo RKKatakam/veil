@@ -87,7 +87,6 @@ fn git_import_of_a_missing_repository_fails_cleanly() {
 // Scenario from git t5600-clone-fail-cleanup.sh ("failed clone should not leave a directory"):
 // a failed import must not leave its remote behind, so that retrying with the right URL works.
 #[test]
-#[ignore = "BUG-292: a failed `vl git import` keeps the Git remote it added; retrying with the right URL is refused"]
 fn a_failed_git_import_can_be_retried_with_the_right_url() {
     let env = Env::new();
     let (bare, _wc) = git_upstream(&env, "gh.git", &[("a", "a\n")]);
@@ -108,7 +107,6 @@ fn a_failed_git_import_can_be_retried_with_the_right_url() {
 
 // Scenario from jj test_git_remotes.rs ("remove a remote"): removal works and drops its remote tags.
 #[test]
-#[ignore = "BUG-291: `vl git remote rm` deadlocks on its own lock: fails after 15 s, leaving the remote tags"]
 fn git_remote_rm_removes_the_remote_and_its_remote_tags() {
     let env = Env::new();
     let (bare, _wc) = git_upstream(&env, "gh.git", &[("a", "a\n")]);
@@ -358,8 +356,9 @@ fn a_branch_deleted_on_github_is_reported_and_the_local_tag_kept() {
 }
 
 // Scenario from jj test_git_push.rs ("push a deleted bookmark", `--deleted`).
+// Deleting the branch is explicit (`vl git push --delete`); a plain push and pull leave it, and
+// the local deletion sticks.
 #[test]
-#[ignore = "BUG-280: a deleted tag is never deleted on the Git remote, and `vl git pull` recreates it"]
 fn a_deleted_tag_deletes_the_git_branch_or_at_least_stays_deleted() {
     let env = Env::new();
     let (proj, bare) = veil_with_git_remote(&env, "alice", "proj", "gh.git");
@@ -373,6 +372,14 @@ fn a_deleted_tag_deletes_the_git_branch_or_at_least_stays_deleted() {
     assert!(
         !env.tags("alice", &proj).contains(&"feature".to_string()),
         "git pull recreated the deleted tag"
+    );
+    let out = env.ok("alice", &proj, &["git", "push", "--delete", "feature"]);
+    assert!(out.contains("deleted feature"), "{out}");
+    env.ok("alice", &proj, &["git", "pull"]);
+    let tags = env.tags("alice", &proj);
+    assert!(
+        !tags.contains(&"feature".to_string()) && !tags.contains(&"origin/feature".to_string()),
+        "{tags:?}"
     );
     assert!(
         !git_ok(
