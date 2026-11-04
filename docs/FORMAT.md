@@ -58,6 +58,7 @@ not be understood.
 | vault `.veil/local/vault.sealed` | envelope (label `local`) around JSON `VaultData` | repository format | no (device-local) | |
 | stat cache `.veil/local/statcache/<ws>.cache` | `veil:statcache\n` ‖ version u32 ‖ … ‖ BLAKE3 | `VERSION` (1) | no | any mismatch reads as empty: a cache, never data |
 | scanner markers `.veil/local/scanned/<ws>.version` | decimal `secrets::RULES_VERSION` | itself | no | a mismatch re-scans once |
+| accepted policy `.veil/local/accepted-policy` | the text of the `.veilpolicy` this device's member last accepted (empty: none) | as `.veilpolicy` | no (device-local) | missing: the next working-copy snapshot records the current `.veilpolicy` |
 | checkout state `.veil/local/checkout.json` | pretty JSON `{workspace, snapshot}` | repository format | no | gc keeps its snapshot |
 | lock `.veil/lock`, `.veil/lock.steal` | JSON lock info (legacy: `"<pid> <millis>"`) | none: unknown fields are ignored, unparseable content is reclaimed only after a full unchanged lease | no | transient; a live holder rewrites it every 2.5 s, so an older reader never steals a newer holder's lock |
 | gc pending `.veil/objects/gc/pending` | `VEILGCP1` ‖ count u32 ‖ (id, ms)* ‖ BLAKE3 | magic | no | damaged/unknown reads as empty: only restarts the grace period |

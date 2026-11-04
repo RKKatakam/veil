@@ -40,7 +40,6 @@ fn checkout_wc(repo: &mut Repo, fs: &dyn StorageBackend, from_snapshot: ObjectId
 /// recorded in plaintext, unscanned (`public!` turns scanning off), and is
 /// pushed with the next push. No warning is given.
 #[test]
-#[ignore = "BUG-045: a .veilpolicy that arrives by merge or pull publishes isolated files (.env, keys) without warning"]
 fn a_merged_policy_cannot_publish_the_merging_members_isolated_files() {
     let (mut alice, fs, _) = new_repo("alice");
     fs.write(&p(".env"), b"DB_PASSWORD=prod-hunter2-Xk9mQ2vL7pR4\n").unwrap();
@@ -74,7 +73,6 @@ fn a_merged_policy_cannot_publish_the_merging_members_isolated_files() {
 /// shared remote can make every teammate's `.env` part of their next
 /// snapshot.
 #[test]
-#[ignore = "BUG-045: a .veilpolicy that arrives by merge or pull publishes isolated files (.env, keys) without warning"]
 fn a_pulled_policy_cannot_publish_isolated_files() {
     let (mut mallory, mfs, _) = new_repo("mallory");
     let main = commit_files(&mut mallory, &*mfs, &[("README", "hi\n")], "v1");

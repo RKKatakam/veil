@@ -2209,6 +2209,7 @@ dependencies = [
  "globset",
  "hex",
  "libc",
+ "memchr",
  "proptest",
  "regex",
  "serde",

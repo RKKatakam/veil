@@ -133,3 +133,49 @@ fn uppercase_secret_files_are_isolated_and_cloak_rules_ignore_case() {
     // `public!` is case-sensitive: it does not expose `Fixtures/`.
     assert_eq!(tier_of(&files, "Fixtures/key.pem"), None, "{files:?}");
 }
+
+/// BUG-045: a pulled `.veilpolicy` that publishes `.env` is held back on
+/// the receiving member's device, says so, and applies only after
+/// `vl policy accept`.
+#[test]
+fn a_pulled_policy_that_exposes_local_secrets_needs_policy_accept() {
+    let env = Env::new();
+    let proj = env.dir("proj");
+    write(&proj, "README.md", "hello\n");
+    env.ok("alice", &proj, &["init"]);
+    env.ok("alice", &proj, &["commit", "-m", "v1"]);
+    env.ok("alice", &proj, &["tag", "set", "main", "-r", "@-"]);
+    let team = env.root.join("team");
+    env.ok("alice", &proj, &["remote", "add", "origin", team.to_str().unwrap()]);
+    env.ok("alice", &proj, &["push"]);
+    let bob_key = env.ok("bob", &env.root, &["identity", "show"]);
+    let bob_key = bob_key.lines().find(|l| l.starts_with("public key")).unwrap().split_whitespace().last().unwrap().to_string();
+    env.ok("alice", &proj, &["scope", "grant", "team", &bob_key, "--name", "bob"]);
+    env.ok("alice", &proj, &["push"]);
+    env.ok("bob", &env.root, &["clone", "team", "bob"]);
+    let bob = env.root.join("bob");
+    write(&bob, ".env", "DB_PASSWORD=bob-local-Xk9mQ2vL7pR4\n");
+    env.ok("bob", &bob, &["status"]);
+
+    env.ok("alice", &proj, &["expose", "--force", ".env"]);
+    env.ok("alice", &proj, &["commit", "-m", "publish fixtures"]);
+    env.ok("alice", &proj, &["tag", "set", "main", "-r", "@-"]);
+    env.ok("alice", &proj, &["push"]);
+
+    env.ok("bob", &bob, &["pull"]);
+    let out = env.ok("bob", &bob, &["new", "main"]);
+    assert!(out.contains("keep the protection you accepted") && out.contains(".env"), "{out}");
+    let status = env.ok("bob", &bob, &["status"]);
+    assert!(status.contains("Policy change not accepted") && status.contains(".env"), "{status}");
+    let show = env.ok("bob", &bob, &["policy", "show"]);
+    assert!(show.contains("Not yet accepted") && show.contains(".env: isolate → public!"), "{show}");
+    let check = env.ok("bob", &bob, &["policy", "check", ".env"]);
+    assert!(check.contains("isolated") && check.contains("not yet accepted"), "{check}");
+    env.ok("bob", &bob, &["commit", "-m", "work"]);
+    assert_eq!(tier_of(&recorded(&env, &bob), ".env"), None, "held back: not recorded");
+
+    let out = env.ok("bob", &bob, &["policy", "accept"]);
+    assert!(out.contains(".env: isolate → public!"), "{out}");
+    env.ok("bob", &bob, &["commit", "-m", "accepted"]);
+    assert_eq!(tier_of(&recorded(&env, &bob), ".env"), Some("public"), "applied once accepted");
+}

@@ -14,9 +14,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use veil_core::{
     builder::BuildReport,
+    policy::POLICY_FILE,
     repo::{DEFAULT_WORKSPACE, VEIL_DIR},
     revset,
     statcache::{cache_path, StatCache},
+    tree::lookup,
     DiskBackend, Identity, ObjectId, Repo, StorageBackend, VPath,
 };
 
@@ -279,6 +281,12 @@ impl Ctx {
             }
             print_kept_local(&r.kept_local);
             print_blocked(&r.blocked);
+        }
+        // A `.veilpolicy` that arrived with this checkout: say now (not at
+        // the next snapshot) which local files keep their protection.
+        let policy_of = |t: &ObjectId| lookup(self.repo.store(), t, &VPath::new(POLICY_FILE).expect("valid"));
+        if policy_of(&from)? != policy_of(&to_snap.tree)? {
+            render::print_policy_held_back(&self.repo.policy_held_back(&*self.fs)?);
         }
         if previous != target {
             eprintln!("Working copy now at: {}", render::one_line(&self.repo, &target));

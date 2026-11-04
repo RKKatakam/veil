@@ -264,6 +264,88 @@ fn large_mixed_corpus_is_not_flagged() {
     assert_clean("corpus", &corpus(4 << 20, 1));
 }
 
+/// Look-alikes of the rules added for BUG-055 and the backlog: URLs without
+/// credentials or with placeholders, `token` / `secret` as ordinary
+/// identifiers, CSRF and pagination tokens, metadata about a password, and
+/// XML elements that hold no credential.
+const LOOKALIKES: &[&str] = &[
+    // URLs
+    "https://example.com:8443/path?q=1",
+    "postgres://db.internal:5432/prod",
+    "http://[::1]:8080/health",
+    "http://[2001:db8::1]:80/",
+    "git@github.com:org/repo.git",
+    "ssh://git@host.example.com:22/repo.git",
+    "https://user@host.example.com/",
+    "DATABASE_URL=postgres://user:password@localhost/db",
+    "postgres://postgres:postgres@localhost:5432/test",
+    "amqp://guest:guest@rabbitmq:5672//",
+    "https://${GIT_USER}:${GIT_TOKEN}@gitlab.com/org/repo.git",
+    "redis://:${REDIS_PASSWORD}@redis:6379/0",
+    "mysql://root:<password>@127.0.0.1:3306/app",
+    "https://user:********@host.example.com",
+    "http://admin:changeme@localhost:8080",
+    "https://oauth2:$CI_JOB_TOKEN@gitlab.com/group/project.git",
+    "url = \"https://deploy:{{ .Values.gitToken }}@git.example.com\"",
+    "see http://localhost:3000/@user/profile",
+    "mongodb+srv://${MONGO_USER}:${MONGO_PASS}@cluster0.mongodb.net/",
+    // token / secret as identifiers
+    "let token = tokens.next();",
+    "token = lexer.next_token()",
+    "tokens: Vec<Token>,",
+    "max_tokens = 4096",
+    "max_token_length = 2048",
+    "token_type: \"Bearer\"",
+    "token_url: https://auth.example.com/oauth/token",
+    "next_page_token = \"CAESBggBEAEYAQgIEAI\"",
+    "nextPageToken: \"CAESBggBEAEYAQgIEAI\"",
+    "csrf_token = \"a8f5f167f44f4964e6c998dee827110c\"",
+    "<input type=\"hidden\" name=\"csrf_token\" value=\"{{ csrf_token }}\">",
+    "X-CSRF-Token: 4f8d2a1b9c3e7f60a5b2c9d1",
+    "{% csrf_token %}",
+    "let cancellation_token = CancellationToken::new();",
+    "\"token\": \"<your-token-here>\"",
+    "GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}",
+    "token: ${{ secrets.NPM_TOKEN }}",
+    "mytoken = \"Xk9mQ2vL7pR4wZt8uY3n\"",
+    "secret_name: prod-db-credentials",
+    "secretName: my-tls-secret",
+    "secret_arn = \"arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/db-AbCdEf\"",
+    "valueFrom:\n  secretKeyRef:\n    name: db",
+    "is_secret = True",
+    "SECRET_KEY_BASE: <%= ENV[\"SECRET_KEY_BASE\"] %>",
+    "jwt_secret_env: JWT_SECRET_PRODUCTION",
+    "topsecret = \"Xk9mQ2vL7pR4wZt8uY3n\"",
+    // metadata about a password
+    "password_hash = \"$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHQ$RdescudvJCsgt3ub+b+dWRWJTmaaJObG\"",
+    "DB_PASSWORD_FILE=/run/secrets/db_password",
+    "password_min_length: 12",
+    "password_reset_url: https://example.com/account/reset",
+    "PASSWORD_HASHERS = [\"django.contrib.auth.hashers.Argon2PasswordHasher\"]",
+    "password_regex = \"^(?=.*[A-Z])(?=.*[0-9]).{12,}$\"",
+    "API_KEY_HEADER=X-Api-Key-Primary-2024",
+    "DB_PASSWORD_PROD=${DB_PASSWORD_PROD}",
+    // XML
+    "<password></password>",
+    "<password>${db.password}</password>",
+    "<password>changeme</password>",
+    "<label>Password</label>",
+    "<input type=\"password\" name=\"password\">",
+    "<passwordPolicy>StrongPasswordPolicy</passwordPolicy>",
+    "<password-hash>$2b$12$KIXQJbXk9mQ2vL7pR4wZt8eO</password-hash>",
+    "<password>{{ .Values.dbPassword }}</password>",
+    "<span class=\"password\">Xk9mQ2vL7pR4wZt8</span>",
+];
+
+#[test]
+fn credential_lookalikes_are_not_flagged() {
+    for l in LOOKALIKES {
+        assert_clean(l, l.as_bytes());
+    }
+    let all = LOOKALIKES.join("\n");
+    assert_clean("all look-alikes", all.as_bytes());
+}
+
 // ---- detection -------------------------------------------------------------------------
 
 #[test]
@@ -281,6 +363,23 @@ fn detects_secrets_in_many_shapes() {
         b"AWS_KEY_AKIAIOSFODNN7EXAMPLE\n",
         b"token_ghp_0123456789abcdefghijklmnopqrstuvwxyzAB\n",
         b"\x00\x01\x02AKIAIOSFODNN7EXAMPLE\x00\x00",
+        // BUG-055 and backlog
+        b"AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n",
+        b"aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n",
+        b"DB_PASSWORD_PROD=Xk9mQ2vL7pR4wZt8nB3c\n",
+        b"stripe_secret_key_live: Xk9mQ2vL7pR4wZt8nB3c\n",
+        b"export API_TOKEN=Xk9mQ2vL7pR4wZt8uY3n\n",
+        b"refresh_token: \"Xk9mQ2vL7pR4wZt8uY3n\"\n",
+        b"secret: Xk9mQ2vL7pR4wZt8uY3n\n",
+        b"webhook-secret = 'Xk9mQ2vL7pR4wZt8uY3n'\n",
+        b"mytoken_password = \"Xk9mQ2vL7pR4wZt8\"\n",
+        b"<password>Xk9mQ2vL7pR4wZt8</password>\n",
+        b"<DbPassword>Xk9mQ2vL7pR4wZt8</DbPassword>\n",
+        b"<spring.datasource.password> Xk9mQ2vL7pR4wZt8 </spring.datasource.password>\n",
+        b"DATABASE_URL=postgres://app:Xk9mQ2vL7pR4wZt8@db.internal:5432/prod\n",
+        b"redis://:Xk9mQ2vL7pR4wZt8@cache:6379/0\n",
+        b"git clone https://deploy:s3cr3tP4ss@git.example.com/repo.git\n",
+        b"\"url\": \"amqps://svc:Zt8nB3cXk9mQ2vL7@mq.example.com\"\n",
     ];
     for c in cases {
         assert!(!scan(c).is_empty(), "missed: {:?}", String::from_utf8_lossy(c));
@@ -297,6 +396,24 @@ fn detects_utf16_big_endian_and_without_bom() {
         assert_eq!(f.len(), 1, "{name}: {f:?}");
         assert_eq!(f[0].line, 2, "{name}");
     }
+}
+
+#[test]
+fn utf16_without_bom_in_non_latin_scripts_is_scanned() {
+    let comment = "設定ファイル。本番環境のデータベース接続。".repeat(50);
+    let text = format!("{comment}\r\napi_token = \"Xk9mQ2vL7pR4wZt8uY3n\"\r\n{comment}\r\n");
+    for be in [false, true] {
+        let data: Vec<u8> = text
+            .encode_utf16()
+            .flat_map(|u| if be { u.to_be_bytes() } else { u.to_le_bytes() })
+            .collect();
+        let f = scan(&data);
+        assert_eq!(f.len(), 1, "be={be}: {f:?}");
+        assert_eq!(f[0].line, 2, "be={be}");
+    }
+    // Clean CJK text in UTF-16 stays clean.
+    let clean: Vec<u8> = format!("{comment}\r\ntoken = tokens.next()\r\n").encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    assert_clean("utf-16 cjk", &clean);
 }
 
 #[test]

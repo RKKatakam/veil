@@ -356,21 +356,87 @@ CAS, and it applies these rules in order:
    rules fail safe: an invalid scope (`validate_scope_name`), an unknown tier
    or a missing tier isolates the pattern. A protective rule whose glob does
    not compile matches its literal name.
+   * **A policy from someone else never weakens local protection
+     silently** (`policy::working_copy_policy`, `wc_policy.rs`). Isolated
+     files never enter history, so nothing but the policy protects them,
+     and `.veilpolicy` is shared: it arrives by merge, pull, checkout of
+     another change, rebase, Git import or undo. Each working copy keeps,
+     device-locally, the policy its member last *accepted*
+     (`.veil/local/accepted-policy`). Snapshots of the repository's own
+     directory classify every path under both; where `.veilpolicy`
+     **weakens** the accepted classification, the accepted one applies and
+     the path is reported as held back (`BuildReport::policy_held_back`).
+     Weakening is: isolated → cloaked or public; cloaked → public or
+     another scope; `public` → `public!` (scanning off); `ignore` lifted
+     from a built-in secret. Moving to `isolate` or `ignore` never weakens
+     (the file stays on the device either way), and strengthening applies
+     at once. A held-back tracked file keeps its entry: an incoming
+     `.env public!` plus a decoy tracked `.env` cannot get the member's own
+     `.env` recorded as an edit of it, and nothing is recorded as deleted.
+   * The accepted policy moves forward on its own only when that cannot
+     weaken anything the member did not ask for: on first use (a new
+     repository, a clone, the first snapshot after upgrading), when the
+     rules are unchanged (comments and spacing never count), when the only
+     changes are `isolate`/`ignore` rules appended to the accepted ones and
+     dropped `public!` rules (so an exposure a teammate reverted cannot
+     come back silently later), and when the member edits `.veilpolicy` themselves (by hand or with
+     `vl cloak|isolate|expose|ignore`): then exactly their edit (the rule
+     lines they removed and added, relative to the tree the working copy
+     was checked out from) is applied to the accepted policy, so editing a
+     policy that arrived from someone else does not accept what that
+     someone else changed. Anything else waits for `vl policy accept`,
+     which lists the local files whose protection it weakens.
+   * Only the repository's own directory (the backend it was opened on)
+     is guarded and can move the accepted policy. Sandboxes of
+     `vl ws exec`, overlays, ephemeral workspaces and imported trees hold
+     no local-only files of the member (injected secrets are caught by
+     `InjectedSecrets`) and use their own `.veilpolicy`; an agent editing
+     `.veilpolicy` in a sandbox cannot accept it for the member. The
+     stale-checkout recovery path (`build_from`, `commit_fs_as_child` on the
+     working copy) is guarded but never treats a policy difference as the
+     member's edit.
+   * UX: every snapshot that holds something back warns (path, accepted →
+     wanted tier) and `vl status` lists `P` entries; a checkout that
+     changes `.veilpolicy` warns at once; `vl policy show` lists pending
+     weakenings, `vl policy check <path>` says when a classification is
+     the accepted one, and `vl scan` uses the effective policy.
+   * Considered and rejected: refusing the incoming `.veilpolicy` at merge
+     time (as for sealed content). Merge cannot see the working copy's
+     isolated files, and pull + `vl new`, checkout, rebase, Git import and
+     undo bypass merge entirely; the working-copy snapshot is the one place
+     every route meets.
 3. Public files are scanned for credentials (AWS, GitHub, GitLab, Slack,
-   Stripe, Anthropic, OpenAI, Google, JWT, private keys, and high-entropy
-   `password = …` / `API_KEY=…` assignments, quoted or not). A hit
-   **quarantines** the file: the offending content stays local and is not
-   snapshotted.
+   Stripe, Anthropic, OpenAI, Google, JWT, private keys, passwords in URLs
+   (`postgres://app:<password>@db`), and high-entropy `password = …` /
+   `API_KEY=…` / `JWT_SECRET: …` / `GITLAB_TOKEN=…` assignments, quoted or
+   not, and `<password>…</password>` elements). A hit **quarantines** the
+   file: the offending content stays local and is not snapshotted.
    * The scanner (`secrets.rs`) reads every file, whatever its size or
      encoding. Binary files are not skipped. Text in NUL-padded encodings
      (UTF-16/32, with or without a BOM) is scanned a second time with the
-     NULs removed, in 256 KiB chunks with a 16 KiB overlap. Token rules run
-     as one alternation, so the regex literal prefilter makes a single pass.
+     NULs removed, in 256 KiB chunks with a 16 KiB overlap. A chunk counts
+     as such text if the file has a BOM, if 1/32 of its bytes are NUL, or
+     if the chunk or its overlap holds a run of 8 ASCII characters in
+     UTF-16 (text in a non-Latin script has almost no NULs in UTF-16, and
+     UTF-16 may start near the end of a chunk). Token rules run as one
+     alternation, so the regex literal prefilter makes a single pass.
      The assignment rule runs on an ASCII-lowercased copy of each chunk,
      because `(?i)` keywords defeat the prefilter. Unquoted values must
      look like credentials: references (`$X`, `${X}`), placeholders
      (`<key>`) and identifiers made of words (`settings.SECRET_KEY`) do not
      count. A PEM header inside binary data needs key material after it.
+   * Keys: the credential keywords match anywhere in an identifier
+     (`DB_PASSWORD`, `spring.datasource.password`), plus up to three
+     suffix words (`DB_PASSWORD_PROD`, `aws_secret_access_key`) unless one
+     of them says the value is something else (`password_hash`,
+     `token_url`, `secret_name`, `…_file`, `…_path`). The generic `secret`
+     and `token` only count as a word of their own (`JWT_SECRET`, not
+     `mytoken`), and `token` not after a word that names a non-credential
+     (`csrf_token`, `next_page_token`, `cancellation_token`). camelCase
+     generic tokens (`githubToken`) are not matched; `authToken`,
+     `accessToken`, `apiKey`, `clientSecret` are. A URL password must not
+     be a word, a number or a reference (`user:password@`,
+     `postgres:postgres@`, `${USER}:${PASS}@` do not count).
      `secrets::RULES_VERSION` is part of the stat-cache key, so "scanned
      clean" facts from an older scanner are not reused.
    * A **never-tracked** file is left out of the tree.

@@ -181,7 +181,7 @@ History      new [revs…] [-m] · commit -m · describe [-r rev] -m · edit <re
              merge <revs…> [--into rev] [-m] [--embargo] [--until TIME] [--scope S]
              embargo list|release <id> · tag list|set <name> [-r rev] [--cloak [S]]|delete
 Visibility   cloak <pat…> [--scope S] · isolate <pat…> · expose <pat…> [--force] · ignore <pat…>
-             policy show|check <paths…> · scan
+             policy show|check <paths…>|accept · scan
 Secrets      secret set|get|list|rm|import · run -- <cmd…>
 Access       scope list|create <S>|grant <S> <pubkey> [--name] [--admin]|revoke <S> <pubkey>
              scope rotate <S> · scope log <S>
@@ -223,6 +223,17 @@ and `cloak`/`isolate` rules ignore case (`.ENV`, `Secrets/`). `public`,
 `public!` and `ignore` rules are case-sensitive. A rule with an invalid scope
 (`local`, `embargo/…`, `UPPER`), an unknown tier or no tier is treated as
 `isolate`, with a warning.
+
+`.veilpolicy` is shared, but **a change to it that you did not make never
+weakens the protection of your local files silently.** Your device keeps
+the policy you last accepted. When a merge, pull, checkout, rebase, Git
+import or undo brings a `.veilpolicy` that would publish, uncloak, re-scope
+or stop scanning a file in your working copy (say a PR adds `.env public!`),
+that file keeps the protection you accepted, every command warns about it,
+and `vl status` lists it as `P`. Review the change with `vl policy show`.
+Apply it with `vl policy accept`. Your own edits of `.veilpolicy`, by hand
+or with `vl cloak|isolate|expose|ignore`, apply at once, and so do new
+`isolate`/`ignore` rules from others.
 
 ## Git interop: keep GitHub, CI and code review
 

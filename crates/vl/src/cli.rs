@@ -378,13 +378,17 @@ pub enum EmbargoCmd {
 
 #[derive(Subcommand, Debug)]
 pub enum PolicyCmd {
-    /// Show all rules, built-in first.
+    /// Show all rules, built-in first, and any change not yet accepted.
     Show,
     /// Explain how paths are classified.
     Check {
         #[arg(required = true)]
         paths: Vec<String>,
     },
+    /// Apply the working copy's .veilpolicy in full, including changes that
+    /// arrived by merge, pull or checkout and weaken the protection of
+    /// local files (until now held back on this device).
+    Accept,
 }
 
 #[derive(Subcommand, Debug)]

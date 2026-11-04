@@ -31,6 +31,19 @@
 //! `public` rule: `.env`, `*.pem`, private SSH keys, … are `isolated` — they
 //! never enter the snapshot graph. They *may* be `cloak`ed (encrypted for a
 //! team) or deliberately published with `public!`.
+//!
+//! **Accepted policy.** `.veilpolicy` is shared: it arrives by merge, pull,
+//! checkout, rebase, Git import or undo like any other file. Isolated files
+//! never enter history, so their protection lives *only* in the policy, and
+//! a policy that arrives from someone else must not publish them. Each
+//! working copy therefore keeps, device-locally, the policy its member last
+//! accepted ([`ACCEPTED_POLICY`]). A snapshot of the working copy classifies
+//! every path under both, and where the working copy's `.veilpolicy`
+//! [weakens](weakens()) the accepted classification, the accepted one applies
+//! and the path is reported as *held back* ([`Classification::held_back`]).
+//! Strengthening applies at once. See [`working_copy_policy`] for when the
+//! accepted policy moves forward (the member's own edit of `.veilpolicy`, or
+//! an explicit `vl policy accept`).
 
 use globset::{GlobBuilder, GlobMatcher, GlobSet, GlobSetBuilder};
 
@@ -240,14 +253,18 @@ impl Rule {
 }
 
 pub fn format_rule(pattern: &str, tier: &Tier, force: bool) -> String {
-    let t = match tier {
+    format!("{pattern:<24} {}", tier_keyword(tier, force))
+}
+
+/// The tier keyword as written in `.veilpolicy` (`public!`, `cloak ops`, …).
+pub fn tier_keyword(tier: &Tier, force: bool) -> String {
+    match tier {
         Tier::Public if force => "public!".to_string(),
         Tier::Public => "public".to_string(),
         Tier::Cloaked(s) => format!("cloak {s}"),
         Tier::Isolated => "isolate".to_string(),
         Tier::Ignored => "ignore".to_string(),
-    };
-    format!("{pattern:<24} {t}")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -259,6 +276,47 @@ pub struct Classification {
     pub builtin_secret: bool,
     /// A user rule tried to make a built-in secret public without `public!`.
     pub blocked_exposure: bool,
+    /// The working copy's `.veilpolicy` would weaken this path's protection
+    /// (see [`weakens`]), and the member has not accepted it: this is the
+    /// *accepted* classification, and `held_back` holds what the working
+    /// copy's policy wanted (`(tier, public!)`).
+    pub held_back: Option<(Tier, bool)>,
+}
+
+impl Classification {
+    /// `public!`, `cloak ops`, …
+    pub fn keyword(&self) -> String {
+        tier_keyword(&self.tier, self.allow_secrets)
+    }
+}
+
+/// A path kept under its accepted classification because the working
+/// copy's `.veilpolicy` would weaken its protection (see [`weakens`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeldBack {
+    pub path: VPath,
+    /// Accepted classification, as a policy keyword (`isolate`, `cloak ops`).
+    pub accepted: String,
+    /// What the working copy's `.veilpolicy` wants (`public!`, …).
+    pub wanted: String,
+}
+
+/// Does moving a path from the `accepted` classification to `current`
+/// weaken its protection? That is: isolated → cloaked or public, cloaked →
+/// public or to another scope (another audience), secret scanning turned
+/// off (`public` → `public!`), or an `ignore` lifted from a built-in secret
+/// (other than to `isolate`). Moving to `isolate` or `ignore` never weakens
+/// anything: the file stays on this device either way.
+pub fn weakens(accepted: &Classification, current: &Classification) -> bool {
+    match (&accepted.tier, &current.tier) {
+        (_, Tier::Isolated | Tier::Ignored) => false,
+        (Tier::Isolated, _) => true,
+        (Tier::Ignored, _) => accepted.builtin_secret,
+        (Tier::Cloaked(_), Tier::Public) => true,
+        (Tier::Cloaked(a), Tier::Cloaked(c)) => a != c,
+        (Tier::Public, Tier::Public) => current.allow_secrets && !accepted.allow_secrets,
+        (Tier::Public, Tier::Cloaked(_)) => false,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -266,6 +324,9 @@ pub struct Policy {
     rules: Vec<Rule>,
     set: GlobSet,
     pub warnings: Vec<String>,
+    /// The policy the member accepted, if this one is guarded by it (see
+    /// [`Policy::guarded_by`]).
+    accepted: Option<Box<Policy>>,
 }
 
 impl Default for Policy {
@@ -287,6 +348,7 @@ impl Policy {
             set: compile_set(&rules),
             rules,
             warnings: vec![],
+            accepted: None,
         }
     }
 
@@ -354,13 +416,100 @@ impl Policy {
         &self.rules
     }
 
+    /// This policy, except that wherever it [weakens] the classification
+    /// `accepted` gives a path, `accepted`'s classification applies (with
+    /// [`Classification::held_back`] set).
+    pub fn guarded_by(mut self, accepted: Policy) -> Policy {
+        self.accepted = Some(Box::new(accepted.unguarded()));
+        self
+    }
+
+    /// The accepted policy guarding this one, if any.
+    pub fn accepted(&self) -> Option<&Policy> {
+        self.accepted.as_deref()
+    }
+
+    /// This policy's own rules, without the accepted policy guarding them.
+    pub fn unguarded(mut self) -> Policy {
+        self.accepted = None;
+        self
+    }
+
+    /// The user rules, normalised (comments and spacing do not count).
+    fn rule_lines(&self) -> Vec<String> {
+        self.rules.iter().filter(|r| !r.builtin).map(Rule::to_line).collect()
+    }
+
+    /// Do both policies have the same user rules (spacing and comments
+    /// aside)?
+    pub fn same_rules(&self, other: &Policy) -> bool {
+        self.rule_lines() == other.rule_lines()
+    }
+
+    /// This policy's rules with the edit that turned `from` into `to`
+    /// applied: rules `to` dropped are removed, rules it added are appended
+    /// (so they win where they match). The text of a `.veilpolicy`.
+    pub fn with_edit(&self, from: &Policy, to: &Policy) -> String {
+        let (from, to) = (from.rule_lines(), to.rule_lines());
+        let mut removed = from.clone();
+        let mut added = Vec::new();
+        for l in to {
+            match removed.iter().position(|r| *r == l) {
+                Some(i) => {
+                    removed.remove(i);
+                }
+                None => added.push(l),
+            }
+        }
+        let mut out = self.rule_lines();
+        for r in removed {
+            if let Some(i) = out.iter().position(|l| *l == r) {
+                out.remove(i);
+            }
+        }
+        out.extend(added);
+        out.iter().map(|l| format!("{l}\n")).collect()
+    }
+
+    /// Is this policy `accepted` without some of its `public!` rules, plus
+    /// appended rules that only isolate or ignore? Neither can weaken any
+    /// path's protection (see [`weakens`]): a path a removed `public!` rule
+    /// decided was as exposed as it gets, and falls back to an earlier rule.
+    pub fn only_adds_protection_to(&self, accepted: &Policy) -> bool {
+        let mine: Vec<&Rule> = self.rules.iter().filter(|r| !r.builtin).collect();
+        let mut i = 0;
+        for r in accepted.rules.iter().filter(|r| !r.builtin) {
+            if mine.get(i).is_some_and(|m| m.to_line() == r.to_line()) {
+                i += 1;
+            } else if !(r.tier == Tier::Public && r.force) {
+                return false;
+            }
+        }
+        mine[i..].iter().all(|r| matches!(r.tier, Tier::Isolated | Tier::Ignored))
+    }
+
     pub fn classify(&self, path: &VPath, is_dir: bool) -> Classification {
+        let c = self.classify_own(path, is_dir);
+        if let Some(accepted) = &self.accepted {
+            let a = accepted.classify_own(path, is_dir);
+            if weakens(&a, &c) {
+                return Classification {
+                    held_back: Some((c.tier, c.allow_secrets)),
+                    ..a
+                };
+            }
+        }
+        c
+    }
+
+    fn classify_own(&self, path: &VPath, is_dir: bool) -> Classification {
         let mut c = Classification {
             tier: Tier::Public,
             allow_secrets: false,
             rule: None,
             builtin_secret: false,
             blocked_exposure: false,
+            held_back: None,
         };
         // The policy file itself is always public: everyone must agree on it.
         if path.as_str() == POLICY_FILE {
@@ -395,6 +544,92 @@ impl Policy {
         }
         c
     }
+}
+
+// ---- the accepted policy of a working copy -------------------------------------
+
+/// Device-local copy of the `.veilpolicy` the member of this working copy
+/// last accepted (in the repository's `.veil/`, never synced).
+pub const ACCEPTED_POLICY: &str = ".veil/local/accepted-policy";
+
+/// The accepted policy's text, if one was ever recorded.
+pub fn load_accepted(local: &dyn StorageBackend) -> Result<Option<Vec<u8>>> {
+    local.read_opt(&VPath::new(ACCEPTED_POLICY)?)
+}
+
+/// Record `text` (a `.veilpolicy`; empty for none) as the accepted policy.
+pub fn save_accepted(local: &dyn StorageBackend, text: &[u8]) -> Result<()> {
+    local.write(&VPath::new(ACCEPTED_POLICY)?, text)
+}
+
+/// The policy a snapshot of a working copy applies, and what to record as
+/// accepted once it is taken.
+#[derive(Debug)]
+pub struct WorkingCopyPolicy {
+    /// The working copy's `.veilpolicy`, guarded by the accepted policy
+    /// when it would weaken it.
+    pub policy: Policy,
+    /// New accepted-policy text to record ([`save_accepted`]).
+    pub accept: Option<Vec<u8>>,
+}
+
+/// The working copy's `.veilpolicy`, guarded by the accepted one.
+///
+/// The accepted policy moves forward to the working copy's when
+/// * none was recorded yet (a new repository, a fresh clone, or the first
+///   snapshot after upgrading: there is no change to protect against);
+/// * the rules are the same, or the new ones only append `isolate` /
+///   `ignore` rules and drop `public!` rules
+///   ([`Policy::only_adds_protection_to`]; comments and spacing never
+///   matter);
+/// * the member edited `.veilpolicy` themselves (by hand, or with
+///   `vl cloak`, `vl expose`, …): `parent_policy` is given (the text of
+///   `.veilpolicy` in the tree the working copy was checked out from,
+///   `None` inside for no file) and the working copy's differs from it.
+///   Their edit is accepted, and only their edit: the rules it removed and
+///   added are applied to the accepted policy ([`Policy::with_edit`]), so
+///   editing a policy that arrived from someone else does not accept what
+///   that someone else changed. Pass `None` when it is not known that the
+///   working copy's file can only differ from that tree by a local edit.
+///
+/// Otherwise, notably when the policy came from someone else by any route,
+/// it is guarded until the member runs `vl policy accept`.
+pub fn working_copy_policy(
+    local: &dyn StorageBackend,
+    fs: &dyn StorageBackend,
+    parent_policy: Option<Option<&[u8]>>,
+) -> Result<WorkingCopyPolicy> {
+    let text = fs.read_opt(&VPath::new(POLICY_FILE)?)?.unwrap_or_default();
+    let current = Policy::parse(&String::from_utf8_lossy(&text));
+    let Some(acc) = load_accepted(local)? else {
+        return Ok(WorkingCopyPolicy {
+            policy: current,
+            accept: Some(text),
+        });
+    };
+    let accepted = Policy::parse(&String::from_utf8_lossy(&acc));
+    let take_all = || WorkingCopyPolicy {
+        policy: current.clone(),
+        accept: (acc != text).then(|| text.clone()),
+    };
+    if current.same_rules(&accepted) || current.only_adds_protection_to(&accepted) {
+        return Ok(take_all());
+    }
+    let parent = parent_policy.map(|p| Policy::parse(&String::from_utf8_lossy(p.unwrap_or_default())));
+    if let Some(parent) = parent.filter(|p| !p.same_rules(&current)) {
+        if parent.same_rules(&accepted) {
+            return Ok(take_all());
+        }
+        let edited = accepted.with_edit(&parent, &current);
+        return Ok(WorkingCopyPolicy {
+            policy: current.guarded_by(Policy::parse(&edited)),
+            accept: Some(edited.into_bytes()),
+        });
+    }
+    Ok(WorkingCopyPolicy {
+        policy: current.guarded_by(accepted),
+        accept: None,
+    })
 }
 
 #[cfg(test)]
@@ -458,6 +693,48 @@ mod tests {
         assert_eq!(class(&p, "Build/a"), Tier::Public);
         assert_eq!(class(&p, ".Env.Example"), Tier::Isolated, "exceptions to secret rules stay exact");
         assert_eq!(class(&p, ".env.example"), Tier::Public);
+    }
+
+    #[test]
+    fn weakening() {
+        let c = |p: &str, path: &str| Policy::parse(p).classify(&VPath::new(path).unwrap(), false);
+        let w = |a: &str, b: &str, path: &str| weakens(&c(a, path), &c(b, path));
+        assert!(w("", ".env public!\n", ".env"), "isolated → public");
+        assert!(w("", ".env cloak\n", ".env"), "isolated → cloaked");
+        assert!(!w("", ".env ignore\n", ".env"), "isolated → ignored stays local");
+        assert!(w("s/ cloak ops\n", "", "s/a"), "cloaked → public");
+        assert!(w("s/ cloak ops\n", "s/ cloak team\n", "s/a"), "another audience");
+        assert!(!w("s/ cloak ops\n", "s/ isolate\n", "s/a"));
+        assert!(w("", "t/ public!\n", "t/a"), "scanning turned off");
+        assert!(!w("t/ public!\n", "", "t/a"));
+        assert!(w("k/ ignore\n", "k/ public!\n", "k/id_rsa"), "ignore lifted from a built-in secret");
+        assert!(!w("build/ ignore\n", "", "build/out.txt"), "ignore lifted from an ordinary file");
+        assert!(!w("", "x/ cloak\n", "x/a"), "public → cloaked strengthens");
+        let g = Policy::parse(".env public!\nsecrets/ public\n").guarded_by(Policy::parse("secrets/ cloak\n"));
+        let e = g.classify(&VPath::new(".env").unwrap(), false);
+        assert_eq!((e.tier.clone(), e.held_back.clone()), (Tier::Isolated, Some((Tier::Public, true))));
+        assert_eq!(g.classify(&VPath::new("secrets/a").unwrap(), false).tier, Tier::Cloaked("team".into()));
+        assert_eq!(g.classify(&VPath::new("src/a").unwrap(), false).held_back, None);
+    }
+
+    #[test]
+    fn policy_changes_that_cannot_weaken() {
+        let p = Policy::parse;
+        let acc = p("fixtures/ public!\nsecrets/ cloak\n# c\n");
+        assert!(p("fixtures/   public!   # spacing\nsecrets/ cloak\n").same_rules(&acc));
+        assert!(p("fixtures/ public!\nsecrets/ cloak\ndrafts/ isolate\nbuild/ ignore\n").only_adds_protection_to(&acc));
+        assert!(p("secrets/ cloak\n").only_adds_protection_to(&acc), "a public! rule removed");
+        assert!(!p("fixtures/ public!\n").only_adds_protection_to(&acc), "a cloak rule removed");
+        assert!(!p("fixtures/ public!\nsecrets/ cloak\nx/ cloak\n").only_adds_protection_to(&acc));
+        assert!(!p("fixtures/ public!\nsecrets/ cloak\n.env public!\n").only_adds_protection_to(&acc));
+        // The member's edit on top of a policy from someone else.
+        let theirs = p(".env public!\nsecrets/ cloak\n");
+        let mine = p(".env public!\nsecrets/ cloak\nnotes/ public!\n");
+        let edited = p(&acc.with_edit(&theirs, &mine));
+        assert!(edited.same_rules(&p("fixtures/ public!\nsecrets/ cloak\nnotes/ public!\n")), "{:?}", edited.rule_lines());
+        let mine = p(".env public!\n");
+        let edited = p(&acc.with_edit(&theirs, &mine));
+        assert!(edited.same_rules(&p("fixtures/ public!\n")), "the removed rule goes: {:?}", edited.rule_lines());
     }
 
     #[test]

@@ -50,7 +50,7 @@ use crate::{
     error::{Result, VeilError},
     id::ObjectId,
     object::{EntryKind, Object, Tree, TreeEntry, Visibility},
-    policy::{Policy, Tier, POLICY_FILE},
+    policy::{tier_keyword, HeldBack, Policy, Tier, POLICY_FILE},
     secrets::{self, Finding},
     statcache::{CacheKey, CacheRun, StatCache},
     store::ObjectStore,
@@ -224,6 +224,11 @@ pub struct BuildReport {
     pub quarantine_kept: Vec<VPath>,
     /// Built-in secrets a policy rule tried (and failed) to make public.
     pub blocked_exposures: Vec<VPath>,
+    /// Paths whose protection the working copy's `.veilpolicy` would weaken
+    /// and the member has not accepted (see `wc_policy`). They were built
+    /// under the accepted classification; a tracked one the accepted policy
+    /// keeps local keeps its previous entry (never a deletion).
+    pub policy_held_back: Vec<HeldBack>,
     /// Files that should have been cloaked but no key was available.
     pub cloak_failures: Vec<(VPath, String)>,
     /// Entries carried over because this reader cannot materialise them.
@@ -434,11 +439,15 @@ impl Builder<'_> {
             match child.kind {
                 NodeKind::Dir => {
                     let class = self.opts.policy.classify(&path, true);
+                    let pdir = parent_entry.filter(|e| e.kind == EntryKind::Dir);
                     if class.tier == Tier::Ignored {
                         self.report.ignored += 1;
+                        // Ignored only by the accepted policy: not a deletion.
+                        if let (Some(pe), Some(_)) = (&pdir, &class.held_back) {
+                            f.out.insert(pe.clone());
+                        }
                         continue;
                     }
-                    let pdir = parent_entry.filter(|e| e.kind == EntryKind::Dir);
                     if let Some(pe) = &pdir {
                         if self.use_hints && self.fs.known_id(&path) == Some(pe.id) {
                             f.out.insert(pe.clone());
@@ -712,6 +721,18 @@ impl Builder<'_> {
         if class.blocked_exposure {
             self.report.blocked_exposures.push(path.clone());
         }
+        // Held back by the accepted policy: a tracked file it keeps local
+        // keeps its entry (the edit is not recorded, nor is a deletion).
+        if let Some((t, force)) = &class.held_back {
+            self.report.policy_held_back.push(HeldBack {
+                path: path.clone(),
+                accepted: class.keyword(),
+                wanted: tier_keyword(t, *force),
+            });
+            if let (Tier::Isolated | Tier::Ignored, Some(pe)) = (&class.tier, parent_file) {
+                return Ok(Some(pe.clone()));
+            }
+        }
         let mut desired = match &class.tier {
             Tier::Ignored => {
                 self.report.ignored += 1;
@@ -742,7 +763,7 @@ impl Builder<'_> {
                     .parent_policy
                     .as_ref()
                     .is_some_and(|old| old.classify(path, false) != class);
-                if !reclassified {
+                if !reclassified || class.held_back.is_some() {
                     desired = pe.visibility.clone();
                 }
             }
