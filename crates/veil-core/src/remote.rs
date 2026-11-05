@@ -201,16 +201,17 @@ impl Source for StoreSource<'_> {
 /// A push's objects: those in the packs an earlier attempt of the same
 /// push staged (or published) are not sent again, but are still looked
 /// inside, since that attempt may have stopped before staging what they
-/// reference.
+/// reference. Each is taken out of `staged` when the walk meets it: what
+/// is left was staged for a plan that no longer holds (BUG-808).
 struct ResumeSource<'a> {
     store: &'a ObjectStore,
-    staged: &'a HashSet<ObjectId>,
+    staged: &'a RefCell<HashSet<ObjectId>>,
 }
 
 impl Source for ResumeSource<'_> {
     fn fetch(&self, id: &ObjectId) -> Result<Fetched> {
         let raw = self.store.get_raw(id)?;
-        Ok(match self.staged.contains(id) {
+        Ok(match self.staged.borrow_mut().remove(id) {
             true => Fetched::Have(raw),
             false => Fetched::New(raw),
         })
@@ -1209,11 +1210,18 @@ pub fn withheld_by_embargo(local: &Repo, embargo: &str) -> Result<Vec<ObjectId>>
 ///   withheld content, and sending them would leave a dangling parent that
 ///   blocks the push.
 pub(crate) fn embargo_withheld(local: &Repo, public: bool) -> Result<HashMap<ObjectId, String>> {
+    embargo_withheld_given(local, public, &|e| local.keys().embargo_released(e))
+}
+
+/// [`embargo_withheld`], with `released` saying which embargoes are
+/// released (a push decides from one reading of the release state, the one
+/// its phase B checks: BUG-809).
+fn embargo_withheld_given(local: &Repo, public: bool, released: &dyn Fn(&str) -> bool) -> Result<HashMap<ObjectId, String>> {
     let mut out = HashMap::new();
     for id in local.visible_embargoed()? {
         let s = local.snapshot(&id)?;
         let Some(e) = &s.embargo else { continue };
-        if s.parents.len() < 2 || local.keys().embargo_released(e) {
+        if s.parents.len() < 2 || released(e) {
             continue;
         }
         // An unknown record (no scope to compare with) withholds everything.
@@ -2010,8 +2018,7 @@ pub fn push_with(
         // ---- phase A: plan and stage, without the remote's lock.
         remote.reload()?;
         let mut base = SyncReport::default();
-        let (sendable, withheld) = sendable_tags(local, public, only_tags, &mut base)?;
-        let released = released_embargoes(local)?;
+        let (sendable, withheld, released) = sendable_tags(local, public, only_tags, &mut base)?;
         if journal.public != public || !journal.released.iter().all(|e| released.contains(e)) {
             // Staged under other rules: none of it may be published now.
             let _ = remote_backend.remove_dir_all(&staging_dir(&journal.push_id));
@@ -2021,7 +2028,7 @@ pub fn push_with(
         let mut report = base.clone();
         let selected = accepted_tags(local, sendable.clone(), &remote.view().tags, force, opts.force_tags, &mut report)?;
         let tips: Vec<ObjectId> = selected.iter().map(|(_, t)| t.target).collect();
-        let staged = journal.reusable(&*remote_backend)?;
+        let staged = RefCell::new(journal.reusable(&*remote_backend)?);
         let inv = LazyInventory::new(remote_backend.clone());
         let dir = staging_dir(&journal.push_id);
         let journal_cell = RefCell::new(&mut journal);
@@ -2063,6 +2070,19 @@ pub fn push_with(
                 return Err(e);
             }
         };
+        if !tips.is_empty() && !staged.borrow().is_empty() {
+            // An earlier attempt staged objects this plan does not send (the
+            // change was withdrawn, embargoed or cloaked since): none of its
+            // packs may be published. Start again without them (BUG-808).
+            // (A plan that sends nothing publishes nothing: a team push
+            // rejected meanwhile keeps its staging for the merge.)
+            let _ = remote_backend.remove_dir_all(&staging_dir(&journal.push_id));
+            journal = Journal::new(journal.url.clone(), public);
+            if let Some(p) = &path {
+                journal.save(&*local_fs, p)?;
+            }
+            continue;
+        }
         if let Some(hook) = &opts.pause_before_lock {
             (hook.0)();
         }
@@ -2274,7 +2294,7 @@ fn push_full(
     // that decision and the upload (BUG-807).
     let releases_published = local.keys().publish_staged_releases()?;
     let mut report = SyncReport::default();
-    let (sendable, withheld) = sendable_tags(local, public, only_tags, &mut report)?;
+    let (sendable, withheld, _) = sendable_tags(local, public, only_tags, &mut report)?;
     let selected = accepted_tags(local, sendable, &tx.view.tags, force, opts.force_tags, &mut report)?;
     let tips: Vec<ObjectId> = selected.iter().map(|(_, t)| t.target).collect();
     let ids = push_closure(local.store(), local.keys(), &tips, &withheld)?
@@ -2335,7 +2355,7 @@ pub(crate) fn sendable_tags(
     public: bool,
     only_tags: &[String],
     report: &mut SyncReport,
-) -> Result<(Vec<(String, Tag)>, HashMap<ObjectId, String>)> {
+) -> Result<(Vec<(String, Tag)>, HashMap<ObjectId, String>, Vec<String>)> {
     let mut selected: Vec<(String, Tag)> = Vec::new();
     for (name, tag) in &local.view().tags {
         if !only_tags.is_empty() && !only_tags.contains(name) {
@@ -2359,8 +2379,11 @@ pub(crate) fn sendable_tags(
         }
     }
     // The merged-in history of an unreleased embargoed merge stays here, and
-    // so does any tag that would publish it by another route.
-    let withheld = embargo_withheld(local, public)?;
+    // so does any tag that would publish it by another route. Decided from
+    // one reading of the release state, returned for phase B to check: a
+    // release taken back after it is caught there (BUG-809).
+    let released = released_embargoes(local)?;
+    let withheld = embargo_withheld_given(local, public, &|e| released.iter().any(|r| r == e))?;
     let mut sendable = Vec::new();
     for (name, tag) in selected {
         match builds_on_withheld(local, &tag.target, &withheld)? {
@@ -2368,7 +2391,7 @@ pub(crate) fn sendable_tags(
             Some(why) => report.tags_skipped.push((name, why)),
         }
     }
-    Ok((sendable, withheld))
+    Ok((sendable, withheld, released))
 }
 
 /// Why the tag `name` may not be pushed because of its annotation (format
@@ -2555,11 +2578,12 @@ pub(crate) enum Dest<'a> {
     /// packed exactly as a push packs it into a backend that keeps nothing.
     Plan(&'a mut PlanRecord),
     /// Packs staged in `dir` on the remote. `staged`: objects in the packs
-    /// an earlier attempt staged, not sent again. `prepare` runs before
-    /// the first pack, `on_pack` after each.
+    /// an earlier attempt staged, not sent again (each taken out when the
+    /// walk meets it, see [`ResumeSource`]). `prepare` runs before the
+    /// first pack, `on_pack` after each.
     Stage {
         dir: VPath,
-        staged: &'a HashSet<ObjectId>,
+        staged: &'a RefCell<HashSet<ObjectId>>,
         prepare: Box<dyn FnOnce() -> Result<()> + 'a>,
         on_pack: Box<dyn FnMut(StagedPack) -> Result<()> + 'a>,
     },
@@ -2633,7 +2657,7 @@ pub(crate) fn push_incremental(
         }
     }
     let chunk = if chunk == 0 { PUSH_CHUNK } else { chunk };
-    let none = HashSet::new();
+    let none = RefCell::new(HashSet::new());
     let (staged, sink) = match dest {
         Dest::Plan(p) => {
             if public {

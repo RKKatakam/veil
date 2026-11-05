@@ -308,7 +308,7 @@ pub fn plan_push_with(
         Repo::open_remote(ro)?
     };
     let mut report = SyncReport::default();
-    let (sendable, withheld) = remote::sendable_tags(local, public, only_tags, &mut report)?;
+    let (sendable, withheld, _) = remote::sendable_tags(local, public, only_tags, &mut report)?;
     let view = remote.view();
     let accepted = remote::accepted_tags(local, sendable, &view.tags, force, force_tags, &mut report)?;
     let tips: Vec<ObjectId> = accepted.iter().map(|(_, t)| t.target).collect();

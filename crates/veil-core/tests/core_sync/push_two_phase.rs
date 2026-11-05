@@ -807,7 +807,9 @@ proptest! {
                     alice.create_workspace(&ws, vec![main], None).unwrap();
                     let ov = alice.workspace_overlay(&ws).unwrap();
                     ov.write(&p(&format!("fix{n}-{attempts}.txt")), format!("{}\n", marker(fixes.len())).as_bytes()).unwrap();
-                    let fix = alice.snapshot_workspace(&ws, &ov).unwrap().snapshot;
+                    // Refused when `main` combines embargoes whose releases
+                    // were taken back meanwhile, as the merge may be.
+                    let Ok(fix) = alice.snapshot_workspace(&ws, &ov).map(|s| s.snapshot) else { continue };
                     let spec = EmbargoSpec { scope: "team".into(), until: None };
                     if let Ok(r) = alice.merge(WS, main, vec![fix], "merge", Some(spec)) {
                         alice.set_tag("main", r.snapshot, None, true).unwrap();
@@ -911,4 +913,276 @@ fn many_concurrent_pushers_to_one_path_remote() {
         assert_eq!(read_at(&c, tip, &format!("agents/{i}.txt")), body.as_bytes());
     }
     assert!(!root.join(".veil/objects/incoming").exists() || std::fs::read_dir(root.join(".veil/objects/incoming")).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().starts_with("push-")));
+}
+
+// ---- scale round: adversarial pass on stream P ----------------------------------------
+
+/// A local backend that runs `on(path)` before each read, listing or
+/// lookup (another `vl` process acting "meanwhile", at an exact point).
+struct Watched {
+    inner: Arc<MemoryBackend>,
+    on: Box<dyn Fn(&VPath) + Send + Sync>,
+}
+
+impl std::fmt::Debug for Watched {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Watched")
+    }
+}
+
+impl StorageBackend for Watched {
+    fn kind(&self) -> &'static str {
+        "watched"
+    }
+    fn read(&self, path: &VPath) -> Result<Vec<u8>> {
+        (self.on)(path);
+        self.inner.read(path)
+    }
+    fn write(&self, path: &VPath, data: &[u8]) -> Result<()> {
+        self.inner.write(path, data)
+    }
+    fn write_unsynced(&self, path: &VPath, data: &[u8]) -> Result<()> {
+        self.inner.write_unsynced(path, data)
+    }
+    fn rename_unsynced(&self, from: &VPath, to: &VPath) -> Result<()> {
+        self.inner.rename_unsynced(from, to)
+    }
+    fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool> {
+        self.inner.create_new(path, data)
+    }
+    fn remove_file(&self, path: &VPath) -> Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &VPath) -> Result<()> {
+        self.inner.remove_dir_all(path)
+    }
+    fn create_dir_all(&self, path: &VPath) -> Result<()> {
+        self.inner.create_dir_all(path)
+    }
+    fn list_dir(&self, path: &VPath) -> Result<Vec<DirEntry>> {
+        (self.on)(path);
+        self.inner.list_dir(path)
+    }
+    fn metadata(&self, path: &VPath) -> Result<Option<Metadata>> {
+        (self.on)(path);
+        self.inner.metadata(path)
+    }
+    fn set_executable(&self, path: &VPath, executable: bool) -> Result<()> {
+        self.inner.set_executable(path, executable)
+    }
+}
+
+/// The objects in the published packs (`objects/pack/`) of `fs` whose
+/// decoded bytes hold `needle`, or which are `id`.
+fn published_hits(fs: &MemoryBackend, needle: &str, id: &ObjectId) -> Vec<String> {
+    packed_objects(fs)
+        .into_iter()
+        .filter(|(l, raw)| {
+            l.starts_with(".veil/objects/pack/")
+                && (ObjectId::hash(raw) == *id || raw.windows(needle.len()).any(|w| w == needle.as_bytes()))
+        })
+        .map(|(l, _)| l)
+        .collect()
+}
+
+/// BUG-808: a push to a public mirror is interrupted after staging (here
+/// the connection drops in phase B). Before retrying, the member finds the
+/// change is a security fix: the tag is deleted and the change is merged
+/// under an embargo instead. The retry resumes the journal (same remote,
+/// same tags) and publishes every staged pack it names, although its own
+/// plan withholds the fix: the fix lands in a published pack on the public
+/// mirror.
+#[test]
+fn a_resumed_push_never_publishes_what_its_plan_no_longer_sends() {
+    let (mut alice, fs, _) = new_repo("alice");
+    let main = commit_files(&mut alice, &*fs, &[("auth.rs", "fn check() -> bool { true }\n")], "v1");
+    alice.set_tag("main", main, None, false).unwrap();
+    let mirror = Arc::new(MemoryBackend::new());
+    remote::push(&mut alice, mirror.clone(), true, &[], false).unwrap();
+    alice.create_workspace("fix", vec![main], None).unwrap();
+    let ov = alice.workspace_overlay("fix").unwrap();
+    ov.write(&p("auth.rs"), format!("fn check() -> bool {{ {FIX_MARKER}() }}\n").as_bytes()).unwrap();
+    let fix = alice.snapshot_workspace("fix", &ov).unwrap().snapshot;
+    alice.set_tag("wip", fix, None, false).unwrap();
+
+    let cut = Arc::new(AtomicBool::new(true));
+    let cut2 = cut.clone();
+    let flaky: Arc<dyn StorageBackend> = Arc::new(Hooked {
+        inner: mirror.clone(),
+        on: Box::new(move |op, _, _| match op == "rename" && cut2.load(Ordering::SeqCst) {
+            true => Err(dropped()),
+            false => Ok(()),
+        }),
+    });
+    let opts = SyncOptions { journal: Some("ssh://mirror/repo".into()), ..Default::default() };
+    let err = remote::push_with(&mut alice, flaky.clone(), true, &[], false, &opts).unwrap_err();
+    assert!(err.to_string().contains("connection dropped"), "{err}");
+    assert!(published_hits(&mirror, FIX_MARKER, &fix).is_empty(), "control: nothing published yet");
+    assert!(!staging(&mirror).is_empty(), "control: the interrupted push left its staging");
+
+    // It is a security fix: no `wip` tag, merged under an embargo instead.
+    alice.delete_tag("wip").unwrap();
+    let r = alice
+        .merge(WS, main, vec![fix], "merge the fix", Some(EmbargoSpec { scope: "team".into(), until: None }))
+        .unwrap();
+    alice.set_tag("main", r.snapshot, None, false).unwrap();
+    assert_eq!(remote::withheld_by_embargo(&alice, &r.embargo.unwrap()).unwrap(), vec![fix], "control: withheld");
+
+    cut.store(false, Ordering::SeqCst);
+    let rep = remote::push_with(&mut alice, flaky, true, &[], false, &opts).unwrap();
+    assert!(rep.tags_updated.iter().any(|(t, _)| t == "main"), "control: main was pushed: {rep:#?}");
+    let hits = published_hits(&mirror, FIX_MARKER, &fix);
+    assert!(hits.is_empty(), "the retry published the embargoed fix its plan withholds: {hits:?}");
+    let hits = fix_reached(&mirror, &fix);
+    assert!(hits.is_empty(), "the fix stays staged on the public mirror after the push: {hits:?}");
+    assert_clean(mirror.clone(), "after the resumed push");
+}
+
+/// BUG-809: BUG-807's fix checks, under the lock, the embargoes listed as
+/// released when phase A *ended* its reading of the release state, but the
+/// withheld history was decided from an earlier reading (`sendable_tags`).
+/// An undo of the staged release landing between the two (in another
+/// terminal) leaves the fix unwithheld and unchecked: it is published.
+///
+/// The sweep lands the other terminal's commands at every read of the
+/// release state during the push: an undo of a release staged before the
+/// push (`release_first`), or a release and its undo at consecutive reads.
+fn release_race_sweep(release_first: bool) {
+    let mut fired_at_least_once = false;
+    for k in 0.. {
+        let (mut alice, fs, id, mirror, e, fix) = embargoed_fix();
+        if release_first {
+            alice.release_embargo(&e).unwrap();
+        }
+        drop(alice);
+        let armed = Arc::new(AtomicBool::new(false));
+        let (seen, done) = (Arc::new(std::sync::atomic::AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
+        let (armed2, seen2, done2, fs2, id2, e2) = (armed.clone(), seen.clone(), done.clone(), fs.clone(), id.clone(), e.clone());
+        let watched = Arc::new(Watched {
+            inner: fs.clone(),
+            on: Box::new(move |path| {
+                let s = path.as_str();
+                let keychain = s.starts_with(".veil/meta/embargoes") || s.starts_with(".veil/local/releases");
+                if !armed2.load(Ordering::SeqCst) || !keychain {
+                    return;
+                }
+                let n = seen2.fetch_add(1, Ordering::SeqCst);
+                // Another `vl` process on the same repository. Once the
+                // push made the release permanent, the undo is refused.
+                let other = || Repo::open(fs2.clone(), Some(id2.clone()), "alice").unwrap();
+                if !release_first && n == k {
+                    other().release_embargo(&e2).unwrap();
+                }
+                if n == k + usize::from(!release_first) {
+                    if let Err(e) = other().undo() {
+                        assert!(e.to_string().contains("published key cannot be taken back"), "{e}");
+                    }
+                    done2.store(true, Ordering::SeqCst);
+                }
+            }),
+        });
+        let mut alice = Repo::open(watched, Some(id), "alice").unwrap();
+        armed.store(true, Ordering::SeqCst);
+        let res = remote::push(&mut alice, mirror.clone(), true, &[], false);
+        armed.store(false, Ordering::SeqCst);
+        if !done.load(Ordering::SeqCst) {
+            break; // past the last read of the release state
+        }
+        fired_at_least_once = true;
+        alice.keys().invalidate();
+        if alice.keys().embargo_released(&e) {
+            continue; // the push made the release permanent first: the undo did nothing
+        }
+        let hits = fix_reached(&mirror, &fix);
+        assert!(hits.is_empty(), "undo at read {k}: the push published the fix of an unreleased embargo: {hits:?} ({res:?})");
+    }
+    assert!(fired_at_least_once, "control: the undo landed during the push");
+}
+
+#[test]
+fn an_undo_landing_anywhere_in_phase_a_never_publishes_the_fix() {
+    release_race_sweep(true);
+}
+
+#[test]
+fn a_release_and_its_undo_during_phase_a_never_publish_the_fix() {
+    release_race_sweep(false);
+}
+
+/// BUG-810: staging expiry compares the `touched` stamp a pusher wrote
+/// with its own clock against the clock of whoever runs the cleanup (any
+/// other push, without the lock). A teammate whose clock runs more than a
+/// week fast removes every live push's staging whenever their push starts:
+/// here they start one during each of Alice's phase A, and Alice's push
+/// fails after three uploads although nothing about the remote changed.
+#[test]
+#[ignore = "BUG-810: a pusher whose clock is a week fast removes live pushes' staging"]
+fn a_teammate_with_a_fast_clock_never_removes_a_live_push_staging() {
+    const DAY: i64 = 24 * 3600 * 1000;
+    let (mut alice, _fs, _) = alice_with_files(20);
+    let hub = Arc::new(MemoryBackend::new());
+    let (h2, removed) = (hub.clone(), Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+    let removed2 = removed.clone();
+    let opts = SyncOptions {
+        chunk: 16 << 10,
+        // Meanwhile, the teammate's push starts: its cleanup, by its clock.
+        pause_before_lock: hook(move || {
+            removed2.fetch_add(remote::expire_push_staging(&*h2, crate_now() + 8 * DAY).unwrap(), Ordering::SeqCst);
+        }),
+        ..Default::default()
+    };
+    let res = remote::push_with(&mut alice, hub.clone(), false, &[], false, &opts);
+    assert_eq!(removed.load(Ordering::SeqCst), 0, "a live push's staging was removed as abandoned ({res:?})");
+    res.unwrap();
+}
+
+/// BUG-808's check keeps the reuse the journal is for: a team push
+/// rejected under the lock (another member pushed meanwhile) keeps its
+/// staging; after the pull and the merge, the next push builds on what it
+/// staged, publishes those packs and sends only the merge.
+#[test]
+fn a_rejected_team_push_reuses_its_staging_after_the_merge() {
+    let (mut alice, fs, id) = new_repo("alice");
+    let base = commit_files(&mut alice, &*fs, &[("a.txt", "base\n")], "base");
+    alice.set_tag("main", base, None, false).unwrap();
+    let hub = Arc::new(MemoryBackend::new());
+    remote::push(&mut alice, hub.clone(), false, &[], false).unwrap();
+    let mut bob = Repo::init_for_clone(Arc::new(MemoryBackend::new()), Some(Identity::generate("bob")), "bob").unwrap();
+    remote::pull(&mut bob, "origin", hub.clone()).unwrap();
+    let ws = bob.ephemeral_workspace(base).unwrap();
+    ws.write("b.txt", "bob's line\n").unwrap();
+    let (b2, _) = bob.commit_ephemeral(&ws, "bob").unwrap();
+    bob.set_tag("main", b2, None, true).unwrap();
+
+    let files: Vec<(String, String)> = (0..30).map(|i| (format!("src/f{i}.txt"), format!("alice's file {i}: {}\n", "x".repeat(200 + i)))).collect();
+    let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let a2 = commit_files(&mut alice, &*fs, &refs, "alice");
+    alice.set_tag("main", a2, None, true).unwrap();
+    let (h2, bob) = (hub.clone(), Mutex::new(Some(bob)));
+    let opts = SyncOptions {
+        journal: Some("ssh://hub/repo".into()),
+        chunk: 4 << 10,
+        pause_before_lock: hook(move || {
+            if let Some(mut bob) = bob.lock().unwrap().take() {
+                remote::push(&mut bob, h2.clone(), false, &[], false).unwrap();
+            }
+        }),
+        ..Default::default()
+    };
+    let rep = remote::push_with(&mut alice, hub.clone(), false, &[], false, &opts).unwrap();
+    assert!(rep.tags_rejected.contains(&"main".to_string()), "control: Bob won the race: {rep:#?}");
+    let staged_objects = packed_objects(&*hub).iter().filter(|(l, _)| l.contains("/incoming/push-")).count();
+    assert!(staged_objects > 30, "control: the upload stays staged on a team remote ({staged_objects} objects, {:?})", staging(&hub));
+
+    remote::pull(&mut alice, "origin", hub.clone()).unwrap();
+    let m = alice.merge(WS, a2, vec![b2], "merge bob", None).unwrap().snapshot;
+    alice.set_tag("main", m, None, true).unwrap();
+    let _ = &id;
+    let rep = remote::push_with(&mut alice, hub.clone(), false, &[], false, &SyncOptions { journal: opts.journal.clone(), ..Default::default() }).unwrap();
+    assert!(rep.tags_updated.iter().any(|(t, s)| t == "main" && *s == m), "{rep:#?}");
+    assert!(rep.objects_copied < 5, "the push after the merge sent the staged history again ({} objects; {staged_objects} staged)", rep.objects_copied);
+    assert!(staging(&hub).is_empty());
+    assert_clean(hub.clone(), "after the merge was pushed");
+    clone_reads(&hub, "main", "src/f7.txt", &files[7].1);
+    clone_reads(&hub, "main", "b.txt", "bob's line\n");
 }

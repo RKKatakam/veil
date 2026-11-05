@@ -2342,10 +2342,15 @@ what the other provably has (`remote.rs` has the details):
   * **Resume:** a retry finds the journal and reuses the packs it names
     that are complete on the remote: their objects are not sent again,
     but are still looked inside (the interrupted attempt may not have
-    staged what they reference). A journal whose rules no longer hold (a
+    staged what they reference). A staged pack is published only if this
+    attempt's own walk met every object in it: if the plan changed since
+    (a change withdrawn, embargoed or cloaked), the staging is removed and
+    the push plans again (BUG-808). A journal whose rules no longer hold (a
     release taken back, the remote turned public) is discarded with its
-    staging. A crash leaves at worst unpublished staging, or complete
-    packs no operation references; never a partial push.
+    staging. The withheld history is decided from the same one reading of
+    the release state that phase B checks (BUG-809). A crash leaves at
+    worst unpublished staging, or complete packs no operation references;
+    never a partial push.
   * **Staging lifetime:** removed after publication; on a public remote,
     removed under the lock when a tag was rejected meanwhile (what was not
     published stays unpublished); kept for reuse on a team remote. Any

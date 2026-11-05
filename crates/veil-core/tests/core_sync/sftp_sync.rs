@@ -327,7 +327,7 @@ fn a_dropped_push_resumes_without_resending_staged_packs() {
     copy_dir(base.path(), probe.path());
     let b = Arc::new(connect(&server, probe.path()));
     let fresh = remote::SyncOptions { journal: None, ..opts.clone() };
-    remote::push_with(&mut alice, b.clone(), false, &[], false, &fresh).unwrap();
+    let full = remote::push_with(&mut alice, b.clone(), false, &[], false, &fresh).unwrap().objects_copied;
     let total = b.stats().bytes_sent as i64;
 
     let shim = Shim {
@@ -343,9 +343,10 @@ fn a_dropped_push_resumes_without_resending_staged_packs() {
     drop(r);
 
     let b = Arc::new(connect(&server, base.path()));
-    remote::push_with(&mut alice, b.clone(), false, &[], false, &opts).unwrap();
-    let resent = b.stats().bytes_sent as i64;
-    assert!(resent < total / 2, "the retry sent {resent} bytes of {total}: staged packs were sent again");
+    // Counted in objects: the bytes a push sends are mostly the lock, the
+    // metadata and the operation at this size.
+    let resent = remote::push_with(&mut alice, b.clone(), false, &[], false, &opts).unwrap().objects_copied;
+    assert!(resent < full / 2, "the retry sent {resent} objects of {full}: staged packs were sent again");
     let r = assert_remote_healthy(base.path(), "after the resumed push");
     assert_eq!(r.view().tags["main"].target, main);
     let bob = clone_over_sftp(&server, base.path(), "bob");
