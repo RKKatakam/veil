@@ -176,6 +176,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let code = dispatch(&mut ctx, &cli)?;
             ctx.finish()?;
             hooks::post_checkout(&ctx, &cli.cmd, before);
+            if ctx.uncolocated {
+                // Nothing of this command writes the repository any more.
+                let root = ctx.root.clone();
+                drop(ctx);
+                colocate_cmd::finish_uncolocate(&root)?;
+            }
             Ok(code)
         }
     }
@@ -517,6 +523,13 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
 // ---- setup ---------------------------------------------------------------
 
 fn cmd_init(path: Option<&Path>) -> Result<ExitCode> {
+    init_repository(path, true)
+}
+
+/// `vl init`; without `record`, nothing of the directory is recorded yet
+/// (`vl init --colocate` adopting a Git checkout records it once it knows
+/// which local edits Git was told to hide, BUG-745).
+pub(crate) fn init_repository(path: Option<&Path>, record: bool) -> Result<ExitCode> {
     let root = match path {
         Some(p) => p.to_path_buf(),
         None => std::env::current_dir()?,
@@ -530,6 +543,12 @@ fn cmd_init(path: Option<&Path>) -> Result<ExitCode> {
     // Anything there (a symlinked or unreadable policy too) is kept.
     if std::fs::symlink_metadata(root.join(POLICY_FILE)).is_err() {
         fs.write(&policy, DEFAULT_POLICY.as_bytes())?;
+    }
+    if !record {
+        let wc = repo.workspace_wc(DEFAULT_WORKSPACE)?;
+        save_checkout(&fs, &CheckoutState::new(DEFAULT_WORKSPACE, wc, Materialised::default()))?;
+        println!("Initialized Veil repository in {}", root.join(".veil").display());
+        return Ok(ExitCode::SUCCESS);
     }
     let out = repo.snapshot_workspace(DEFAULT_WORKSPACE, &*fs)?;
     repo.capture_local_files(&*fs, &out.report)?;

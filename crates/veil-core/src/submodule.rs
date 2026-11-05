@@ -468,8 +468,7 @@ impl GitRunner {
 /// `.veil/local/submodules/<hash of the name>` (never `.git/modules`).
 pub fn local_git_dir(project_root: &Path, name: &str) -> PathBuf {
     let h = blake3::hash(name.as_bytes());
-    project_root
-        .join(crate::repo::VEIL_DIR)
+    crate::repo::state_dir(project_root)
         .join("local")
         .join("submodules")
         .join(&h.to_hex()[..32])

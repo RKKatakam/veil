@@ -5,7 +5,7 @@
 use crate::*;
 
 #[test]
-#[ignore = "BUG-754: `git checkout` of an old commit that had a now-cloaked file overwrites the member's file; the edit made since the last vl command is lost"]
+#[ignore = "BUG-754 (limitation, documented in the guide): `git checkout` of an old commit that had a now-cloaked file overwrites the member's file; the edit made since the last vl command is lost"]
 fn bug754_an_old_checkout_never_overwrites_a_cloaked_file() {
     need_git!();
     let env = Env::new();

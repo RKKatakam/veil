@@ -434,15 +434,21 @@ fn t13_stash_all_and_clean_never_take_the_veil_repository_or_reach_a_remote() {
     env.write(&dir, ".env", "ISOMARK-stash\n");
     env.ok(&dir, &["status"]);
     env.git_ok(&dir, &["stash", "-a"]);
-    assert!(dir.join(".veil/repo.json").exists(), "git stash -a took .veil");
+    // The repository is in .git/veil, which Git never stashes; at most the
+    // `.veil` symlink went into the stash (and is not put back while the
+    // stash holds it, so that the pop below works).
+    assert!(dir.join(".git/veil/repo.json").exists(), "git stash -a took the Veil repository");
     env.ok(&dir, &["git", "push", "gh"]);
     assert_clean(&env, &remote, &["ISOMARK", "CLOAKMARK"], "remote after git stash -a");
     env.git_ok(&dir, &["stash", "pop", "-q"]);
     assert!(dir.join(".env").exists());
-    // `git clean -fdx` deletes the ignored files (recoverable), never .veil.
+    assert!(dir.join(".veil/repo.json").exists(), "the .veil marker is back after the pop");
+    // `git clean -fdx` deletes the ignored files (recoverable), never the
+    // repository; the marker comes back with the next command.
     let _ = env.git(&dir, &["clean", "-q", "-f", "-d", "-x"]);
-    assert!(dir.join(".veil/repo.json").exists(), "git clean -fdx deleted .veil");
+    assert!(dir.join(".git/veil/repo.json").exists(), "git clean -fdx deleted the Veil repository");
     env.ok(&dir, &["status"]);
+    assert!(dir.join(".veil/repo.json").exists(), "the marker was not restored");
     let rec = env.vl(&dir, &["secret", "recover", ".env"]);
     if rec.status.success() {
         assert!(std::fs::read_to_string(dir.join(".env")).unwrap().contains("ISOMARK-stash"));
@@ -585,8 +591,11 @@ fn t17_a_git_side_symlink_never_redirects_a_hidden_checkout() {
 
 // ---- 18. uncolocate ---------------------------------------------------------------------------------------
 
+/// BUG-744: uncolocate removes the hooks (they need colocation), keeps the
+/// exclude block (protected files stay out of `git add -A`), and moves the
+/// repository back to `.veil`.
 #[test]
-fn t18_uncolocate_removes_every_guard_and_keeps_format_5() {
+fn t18_uncolocate_removes_the_hooks_keeps_the_excludes_and_format_5() {
     let env = Env::new();
     let dir = env.dir("p");
     env.git_ok(&dir, &["init", "-q"]);
@@ -599,9 +608,11 @@ fn t18_uncolocate_removes_every_guard_and_keeps_format_5() {
     assert!(std::fs::read_to_string(dir.join(".git/info/exclude")).unwrap().contains("BEGIN veil"));
     env.ok(&dir, &["git", "uncolocate"]);
     let ex = std::fs::read_to_string(dir.join(".git/info/exclude")).unwrap_or_default();
-    assert!(!ex.contains("BEGIN veil"), "{ex}");
+    assert!(ex.contains("BEGIN veil") && ex.contains("/.veil\n") && !ex.contains("\n*\n"), "{ex}");
     assert_eq!(std::fs::read_to_string(dir.join(".git/hooks/pre-push")).unwrap(), "#!/bin/sh\nexit 0\n");
     assert!(!dir.join(".git/hooks/pre-commit").exists());
+    assert!(!dir.join(".git/veil").exists());
+    assert!(std::fs::symlink_metadata(dir.join(".veil")).unwrap().is_dir(), ".veil is a directory again");
     assert!(!dir.join(".veil/.git").exists());
     let ls = env.git_ok(&dir, &["ls-files", "-v"]);
     assert!(!ls.lines().any(|l| l.starts_with('S')), "{ls}");

@@ -117,7 +117,7 @@ pub fn run(repo_arg: Option<&Path>, remotes: bool) -> Result<ExitCode> {
                 check_vault(&mut r, repo);
             }
             r.section("Filesystem");
-            check_filesystem(&mut r, &root.join(VEIL_DIR).join("local"), Some(&fs));
+            check_filesystem(&mut r, &veil_core::repo::state_dir(&root).join("local"), Some(&fs));
             check_clock(&mut r, repo.as_ref());
             if remotes {
                 r.section("Remotes");

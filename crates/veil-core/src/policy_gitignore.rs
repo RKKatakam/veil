@@ -248,7 +248,9 @@ pub fn policy_lines(policy: &Policy) -> Vec<String> {
             out.push(l);
         }
     };
-    for l in ["/.veil/", ".jj/", ".hg/", ".svn/"] {
+    // `/.veil` without a trailing slash: in a colocated project it is a
+    // symlink (to `.git/veil`), which a directory-only line would miss.
+    for l in ["/.veil", ".jj/", ".hg/", ".svn/"] {
         push(l.to_string(), &mut out);
     }
     for p in SCRATCH_PATTERNS {
@@ -356,6 +358,106 @@ fn finish(out: std::process::Output, what: &str) -> Result<Vec<u8>> {
         return Err(VeilError::repo(format!("git {what} failed: {}", err.trim())));
     }
     Ok(out.stdout)
+}
+
+// ---- negations that un-hide protected paths (BUG-742) ---------------------------------
+
+/// Name of the file a probe path ends in when a pattern only names a
+/// directory, or a wildcard stands for any name.
+const PROBE: &str = "veil-probe";
+
+/// One path each negation (`!pattern`) of the `.gitignore` at `gitignore`
+/// (a repository path, `dir/.gitignore`) would re-include, with where the
+/// line is (`dir/.gitignore:3: !secrets/`). Git ranks a `.gitignore` above
+/// `info/exclude`, so a negation there outranks every line Veil writes; the
+/// caller asks Git ([`not_ignored`]) whether each probe is still excluded.
+/// A wildcard becomes a plain name (`*.md` probes `veil-probe.md`), a
+/// directory pattern a file inside it (`secrets/` probes
+/// `secrets/veil-probe`).
+pub fn negation_probes(gitignore: &str, text: &str) -> Vec<(String, String)> {
+    let dir = gitignore.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    let mut out = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.trim_end_matches('\r');
+        let Some(pat) = line.strip_prefix('!') else { continue };
+        // Trailing spaces are not part of a pattern unless escaped.
+        let pat = pat.trim_end_matches(' ');
+        if pat.is_empty() {
+            continue;
+        }
+        let dir_only = pat.ends_with('/');
+        let pat = pat.trim_end_matches('/');
+        let pat = pat.strip_prefix('/').unwrap_or(pat);
+        let mut name = String::new();
+        let mut chars = pat.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => name.extend(chars.next()),
+                '*' => {
+                    while chars.peek() == Some(&'*') {
+                        chars.next();
+                    }
+                    if !name.ends_with(PROBE) {
+                        name.push_str(PROBE);
+                    }
+                }
+                '?' => name.push('x'),
+                '[' => {
+                    // A character the class matches: its first member, or
+                    // for `[!…]` one it does not list.
+                    let negated = matches!(chars.peek(), Some('!' | '^'));
+                    if negated {
+                        chars.next();
+                    }
+                    let mut members = Vec::new();
+                    for d in chars.by_ref() {
+                        if d == ']' && !members.is_empty() {
+                            break;
+                        }
+                        members.push(d);
+                    }
+                    let pick = if negated {
+                        "qzj0".chars().find(|c| !members.contains(c))
+                    } else {
+                        members.first().copied().filter(|c| *c != '/')
+                    };
+                    name.push(pick.unwrap_or('x'));
+                }
+                c => name.push(c),
+            }
+        }
+        let name: String = name.split('/').filter(|c| !c.is_empty() && *c != "." && *c != "..").collect::<Vec<_>>().join("/");
+        if name.is_empty() {
+            continue;
+        }
+        let mut probe = if dir.is_empty() { name } else { format!("{dir}/{name}") };
+        if dir_only {
+            probe.push('/');
+            probe.push_str(PROBE);
+        }
+        out.push((probe, format!("{gitignore}:{}: {}", i + 1, line.escape_debug())));
+    }
+    out
+}
+
+/// Which of `paths` (repository paths, which need not exist) Git would
+/// **not** ignore in the work tree `root`, by every ignore source it reads
+/// (`.gitignore` files, `info/exclude`, `core.excludesFile`), whether or
+/// not they are tracked (`git check-ignore --no-index`).
+pub fn not_ignored(root: &Path, git_dir: &Path, paths: &[String]) -> Result<Vec<String>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut input = Vec::new();
+    for p in paths {
+        input.extend_from_slice(p.as_bytes());
+        input.push(0);
+    }
+    let mut c = git_cmd(root, git_dir);
+    c.args(["check-ignore", "--no-index", "--stdin", "-z"]);
+    let out = run_git(c, Some(&input), "check-ignore")?;
+    let ignored: BTreeSet<&[u8]> = out.split(|b| *b == 0).filter(|p| !p.is_empty()).collect();
+    Ok(paths.iter().filter(|p| !ignored.contains(p.as_bytes())).cloned().collect())
 }
 
 /// A gitignore pattern from the `.gitignore` in directory `dir` (`""` at
@@ -533,9 +635,19 @@ mod tests {
     }
 
     #[test]
+    fn negations_become_probes() {
+        let p = negation_probes(".gitignore", "*.log\n!secrets/\n!.env\n!*.md\n\\!lit\n!/a/**/b?[!x]c.yml\n!\n");
+        let probes: Vec<&str> = p.iter().map(|(x, _)| x.as_str()).collect();
+        assert_eq!(probes, vec!["secrets/veil-probe", ".env", "veil-probe.md", "a/veil-probe/bxqc.yml"]);
+        assert_eq!(p[0].1, ".gitignore:2: !secrets/");
+        let p = negation_probes("config/.gitignore", "!*.key\n");
+        assert_eq!(p[0].0, "config/veil-probe.key");
+    }
+
+    #[test]
     fn builtin_secrets_are_excluded() {
         let l = policy_lines(&Policy::builtin());
-        assert!(l.contains(&"/.veil/".to_string()));
+        assert!(l.contains(&"/.veil".to_string()));
         assert!(l.contains(&".[eE][nN][vV]".to_string()), "{l:?}");
         assert!(l.contains(&"*.[pP][eE][mM]".to_string()), "{l:?}");
     }

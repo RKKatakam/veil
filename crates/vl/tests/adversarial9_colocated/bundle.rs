@@ -4,7 +4,7 @@
 use crate::*;
 
 #[test]
-#[ignore = "BUG-752: `git bundle create --all` carries refs/stash, so the isolated file `git stash -a` stored goes into a file meant for sharing"]
+#[ignore = "BUG-752 (limitation; reported, see below): `git bundle create --all` carries refs/stash, so the isolated file `git stash -a` stored goes into a file meant for sharing"]
 fn bug752_a_bundle_of_all_refs_carries_no_isolated_file() {
     need_git!();
     let env = Env::new();
@@ -18,4 +18,19 @@ fn bug752_a_bundle_of_all_refs_carries_no_isolated_file() {
     env.git_ok(&other, &["init", "-q"]);
     let _ = env.git(&other, &["fetch", "-q", bundle.to_str().unwrap(), "refs/*:refs/remotes/b/*"]);
     assert_clean(&env, &other.join(".git"), &["ISOLATED-MARKER-8"], "a repository fetched from the bundle");
+}
+
+/// What is fixed: the next command finds the stash holding the isolated
+/// file and says so, with what to do, before anyone bundles it.
+#[test]
+fn bug752_a_stash_of_ignored_protected_files_is_reported() {
+    need_git!();
+    let env = Env::new();
+    let dir = env.project("p");
+    env.write(&dir, ".env", "ISOLATED-MARKER-8\n");
+    env.ok(&dir, &["status"]);
+    env.git_ok(&dir, &["stash", "-a", "-q"]);
+    let out = env.ok(&dir, &["status"]);
+    assert!(out.contains("stash@{0} holds") && out.contains(".env"), "{out}");
+    assert!(out.contains("git bundle"), "{out}");
 }

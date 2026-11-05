@@ -316,7 +316,7 @@ impl LocalDrivers {
             warned: Mutex::new(HashSet::new()),
             problems: Vec::new(),
         };
-        for file in [crate::ctx::veil_home().join(CONFIG_FILE), root.join(".veil/local").join(CONFIG_FILE)] {
+        for file in [crate::ctx::veil_home().join(CONFIG_FILE), veil_core::repo::state_dir(root).join("local").join(CONFIG_FILE)] {
             d.read(&file);
         }
         d
@@ -467,7 +467,7 @@ impl DeviceDrivers for LocalDrivers {
 
     fn merge(&self, name: &str, input: &DriverInput<'_>) -> DriverMerge {
         let Some(argv) = self.merge.get(name) else { return DriverMerge::Conflict };
-        let tmp = self.root.join(".veil/local/tmp");
+        let tmp = veil_core::repo::state_dir(&self.root).join("local").join("tmp");
         if std::fs::create_dir_all(&tmp).is_err() {
             return DriverMerge::Conflict;
         }

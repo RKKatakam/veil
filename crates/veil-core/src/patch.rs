@@ -2957,6 +2957,7 @@ pub fn apply_series(repo: &mut Repo, ws: &str, dest: &str, series: &Series, opts
                 // Git blobs (and patched recorded bytes) are recorded as
                 // they are: line endings are a working-copy matter.
                 line_endings: crate::builder::LineEndings::Off,
+                keep_recorded: None,
             },
         )
         .map_err(ctx)?;

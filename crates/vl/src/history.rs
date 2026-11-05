@@ -421,7 +421,7 @@ struct LogLine {
 }
 
 fn state_path(ctx: &Ctx) -> PathBuf {
-    ctx.root.join(veil_core::repo::VEIL_DIR).join("local").join("bisect.json")
+    veil_core::repo::state_dir(&ctx.root).join("local").join("bisect.json")
 }
 
 const RESET_HINT: &str = "run `vl bisect reset` to end it";

@@ -62,6 +62,11 @@ use crate::{
     vpath::VPath,
 };
 
+/// [`State::user_hidden`]: the user set skip-worktree.
+pub const USER_SKIP: &str = "skip-worktree";
+/// [`State::user_hidden`]: the user set assume-unchanged.
+pub const USER_ASSUME: &str = "assume-unchanged";
+
 /// Version of [`State`] (`colocated.json`).
 pub const STATE_VERSION: u32 = 1;
 
@@ -120,6 +125,9 @@ pub struct State {
     pub frozen: bool,
     /// Why (for `vl git colocate --status`).
     pub frozen_reason: Option<String>,
+    /// The index as Veil last wrote it is frozen (every entry
+    /// skip-worktree), whatever [`State::frozen`] says now.
+    pub index_frozen: bool,
     /// Paths of the working copy no snapshot holds (isolated, quarantined,
     /// held back) as of the last snapshot: excluded literally and, when
     /// Git tracks them, skip-worktree.
@@ -127,6 +135,34 @@ pub struct State {
     /// The operation and `HEAD` the last full mirror ran for: when neither
     /// changed, the mirror only re-asserts the index and the excludes.
     pub mirrored: Option<String>,
+    /// The refs Veil owns: the ones it wrote as the export of a tag. Only
+    /// these are ever deleted by the mirror (a Git branch Veil cannot or
+    /// must not follow is left alone, BUG-750, BUG-751). `None` in a state
+    /// written by an earlier build: the refs exported at the next mirror.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owned: Option<BTreeSet<String>>,
+    /// Paths whose local edit the user told Git to hide (their own
+    /// `skip-worktree` or `assume-unchanged` bit, by Git path): Veil keeps
+    /// their recorded version, never the edit, and keeps the bit, until the
+    /// user clears it (BUG-745). The value is the bit (`skip-worktree` or
+    /// `assume-unchanged`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub user_hidden: BTreeMap<String, String>,
+    /// Protected paths a `.gitignore` negation un-hides from Git (found at
+    /// the last mirror; see `policy_gitignore::exposures`): Git commits are
+    /// frozen while there are any (BUG-742).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exposed: Vec<String>,
+    /// What the stashes hold that Veil keeps from Git, as of the last
+    /// mirror ([`GitBridge::stash_findings`]), and the stash tip then.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stash_findings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stash_seen: Option<String>,
+    /// Size and modification time of `.git/index` when [`State::user_hidden`]
+    /// was last read from it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_stamp: Option<(u64, i128)>,
 }
 
 impl State {
@@ -197,7 +233,7 @@ pub fn escape_git_path(p: &[u8]) -> String {
 /// root). `None` for an unreadable or invalid marker: the bridge then
 /// stays where it always was.
 pub fn colocated_git_dir(root: &Path) -> Option<PathBuf> {
-    let raw = std::fs::read(root.join(".veil").join("repo.json")).ok()?;
+    let raw = std::fs::read(crate::repo::state_dir(root).join("repo.json")).ok()?;
     let cfg: crate::repo::RepoConfig = serde_json::from_slice(&raw).ok()?;
     let c = cfg.colocated?;
     c.validate().ok()?;
@@ -224,7 +260,7 @@ pub struct FollowLock {
 
 impl FollowLock {
     pub fn acquire(root: &Path) -> Result<FollowLock> {
-        let dir = root.join(".veil").join("git");
+        let dir = crate::repo::state_dir(root).join("git");
         std::fs::create_dir_all(&dir).map_err(|e| VeilError::Io {
             path: dir.display().to_string(),
             source: e,
@@ -597,6 +633,13 @@ impl GitBridge {
             }
             match tx.view.tags.get(branch).cloned() {
                 Some(t) if t.target == sid => {}
+                Some(t) if t.cloak.is_some() => {
+                    // A cloaked tag is never a Git branch: a branch of that
+                    // name is Git's own, and never moves it (BUG-750).
+                    report.warnings.push(format!(
+                        "Git branch {branch} has the name of a cloaked Veil tag; the tag is not moved (rename the branch to have Veil follow it)"
+                    ));
+                }
                 Some(t) => {
                     if t.annotation.is_some() {
                         report.warnings.push(format!(
@@ -785,6 +828,7 @@ impl GitBridge {
         ws: &str,
         expected: Option<&Head>,
         local_only: &BTreeSet<String>,
+        extra_freeze: Option<String>,
     ) -> Result<MirrorReport> {
         let mut report = MirrorReport::default();
         // Nothing changed since the last mirror (same operation, same Git
@@ -810,12 +854,7 @@ impl GitBridge {
         let exported = self.export_without_refs(r)?;
         report.warnings.extend(exported.warnings.iter().cloned());
         let withheld = embargo_withheld(r, true)?;
-        let mut frozen_reason: Option<String> = None;
-        if let Some(scope) = r.view().workspace(ws)?.cloak.clone().or_else(|| wsnap.cloak.clone()) {
-            frozen_reason = Some(format!("the working copy is on a line cloaked for '{scope}'"));
-        } else if let Some(e) = r.carried_embargo(&wc)? {
-            frozen_reason = Some(format!("the working copy is under unreleased embargo {e}"));
-        }
+        let mut frozen_reason: Option<String> = freeze_reason(r, ws, wc)?.or(extra_freeze);
         // `@-`, or its nearest exportable ancestor.
         let mut head_snap = at;
         let mut hops = 0usize;
@@ -861,15 +900,27 @@ impl GitBridge {
                 .filter(|k| k.starts_with("refs/heads/") || k.starts_with("refs/tags/"))
                 .cloned(),
         );
+        let mut owned = state.owned.take().unwrap_or_else(|| desired.keys().cloned().collect());
         for name in names {
             let want = desired.get(&name).copied();
             let cur = self.get_ref(&name)?;
             let last = state.refs.get(&name).and_then(|h| GitOid::from_hex(h.as_bytes()).ok());
             if cur == want {
                 match want {
-                    Some(w) => state.refs.insert(name, w.to_string()),
+                    Some(w) => {
+                        owned.insert(name.clone());
+                        state.refs.insert(name, w.to_string())
+                    }
                     None => state.refs.remove(&name),
                 };
+                continue;
+            }
+            if want.is_none() && !owned.contains(&name) {
+                // Git's own ref (a branch Veil does not follow): never
+                // deleted (BUG-751).
+                if let Some(c) = cur {
+                    state.refs.insert(name, c.to_string());
+                }
                 continue;
             }
             if cur != last {
@@ -880,13 +931,20 @@ impl GitBridge {
             }
             if self.cas_ref(&name, cur, want)? {
                 match want {
-                    Some(w) => state.refs.insert(name, w.to_string()),
-                    None => state.refs.remove(&name),
+                    Some(w) => {
+                        owned.insert(name.clone());
+                        state.refs.insert(name, w.to_string())
+                    }
+                    None => {
+                        owned.remove(&name);
+                        state.refs.remove(&name)
+                    }
                 };
             } else {
                 report.notes.push(format!("{name} is locked or moved in Git; mirrored by the next command"));
             }
         }
+        state.owned = Some(owned);
         // `HEAD`.
         let now = self.head()?;
         let mut head_ok = true;
@@ -909,11 +967,17 @@ impl GitBridge {
                     && self.get_ref(&format!("refs/heads/{n}")).ok().flatten() == Some(hc)
             };
             // The branch HEAD is on, if it still fits; else the one tag at @-.
+            // A Git-only branch (no Veil tag exports it) already at `@-`'s
+            // commit keeps HEAD too: Veil never detaches HEAD from a branch
+            // it does not own (BUG-750).
+            let git_only = |b: &str| {
+                !exported.branches.iter().any(|(n, _)| n == b) && self.get_ref(&format!("refs/heads/{b}")).ok().flatten() == Some(hc)
+            };
             let current = now
                 .symbolic
                 .as_deref()
                 .and_then(|s| s.strip_prefix("refs/heads/"))
-                .filter(|b| on_branch(b))
+                .filter(|b| on_branch(b) || git_only(b))
                 .map(|b| format!("refs/heads/{b}"));
             let want_sym = current.or_else(|| {
                 let names: Vec<&String> = exported.branches.iter().filter(|(n, c)| *c == hc && on_branch(n)).map(|(n, _)| n).collect();
@@ -1000,6 +1064,9 @@ impl GitBridge {
         let skip_of = |p: &Vec<u8>| -> bool {
             frozen || !public.contains(p) || local_only.contains(&escape_git_path(p))
         };
+        // The user's own bits (BUG-745): kept, and never in `skip` (which
+        // is what Veil hides).
+        let user_bit = |p: &Vec<u8>| state.user_hidden.get(&escape_git_path(p)).map(String::as_str);
         let skip: BTreeSet<String> = leaves.keys().filter(|p| skip_of(p)).map(|p| escape_git_path(p)).collect();
         report.skip_count = skip.len();
         let mut h = blake3::Hasher::new();
@@ -1007,6 +1074,11 @@ impl GitBridge {
         h.update(if frozen { b"F" } else { b"-" });
         for s in &skip {
             h.update(s.as_bytes());
+            h.update(b"\0");
+        }
+        for (p, bit) in &state.user_hidden {
+            h.update(p.as_bytes());
+            h.update(bit.as_bytes());
             h.update(b"\0");
         }
         let key = h.finalize().to_hex().to_string();
@@ -1039,13 +1111,14 @@ impl GitBridge {
                     path: p.clone(),
                     mode: leaf.mode,
                     oid: leaf.oid,
-                    skip_worktree: skip_of(p),
+                    skip_worktree: skip_of(p) || user_bit(p) == Some(USER_SKIP),
+                    assume_unchanged: user_bit(p) == Some(USER_ASSUME),
                 },
             );
         }
         if same_head && !frozen {
             for e in current.iter().flatten() {
-                if e.stage != 0 || e.intent_to_add || e.mode == 0o040000 || skip_of(&e.path) {
+                if e.stage != 0 || e.intent_to_add || e.mode == 0o040000 || skip_of(&e.path) || user_bit(&e.path).is_some() {
                     continue;
                 }
                 if !public.contains(&e.path) {
@@ -1058,6 +1131,7 @@ impl GitBridge {
                         mode: e.mode,
                         oid: e.oid,
                         skip_worktree: false,
+                        assume_unchanged: false,
                     },
                 );
             }
@@ -1071,8 +1145,93 @@ impl GitBridge {
         }
         state.index_key = Some(key);
         state.index_head = head.map(|c| c.to_string());
+        state.index_frozen = frozen;
         state.skip = if frozen { BTreeSet::new() } else { skip };
         Ok(true)
+    }
+
+    // ---- stashes ---------------------------------------------------------------------
+
+    /// What the stashes of `.git` (`refs/stash` and its reflog) hold that
+    /// Veil keeps from Git: a stash Git made after its skip-worktree bits
+    /// were cleared (BUG-747), `git stash -a` of ignored files or `-u` of
+    /// files a `.gitignore` negation un-hid (BUG-742, BUG-752). Git runs no
+    /// hook for `git stash` or `git bundle`, so this is found after the
+    /// fact, at the next command, and reported (never content). A path is
+    /// hidden if the policy does not make it public, it is local-only, Veil
+    /// hides it from Git (skip-worktree), or the working copy is frozen.
+    pub fn stash_findings(&self, state: &State, policy: &Policy) -> Result<Vec<String>> {
+        let mut tips: Vec<GitOid> = Vec::new();
+        if let Ok(text) = std::fs::read_to_string(self.git_dir().join("logs").join("refs").join("stash")) {
+            for l in text.lines().rev() {
+                if let Some(new) = l.split_whitespace().nth(1).and_then(|h| GitOid::from_hex(h.as_bytes()).ok()) {
+                    tips.push(new);
+                }
+            }
+        }
+        if tips.is_empty() {
+            tips.extend(self.get_ref("refs/stash")?);
+        }
+        let hidden = |p: &[u8]| -> Option<String> {
+            let k = escape_git_path(p);
+            if state.frozen {
+                return Some("Git commits are frozen here".into());
+            }
+            if state.skip.contains(&k) {
+                return Some("Veil hides it from Git".into());
+            }
+            if state.local_only.contains(&k) {
+                return Some("local-only".into());
+            }
+            let first = p.split(|b| *b == b'/').next().unwrap_or_default();
+            if std::str::from_utf8(first).is_ok_and(crate::object::is_reserved_name) {
+                return None;
+            }
+            match std::str::from_utf8(p).ok().and_then(|s| VPath::new(s).ok()) {
+                Some(vp) => match policy.classify(&vp, false).tier {
+                    Tier::Public => None,
+                    t => Some(t.label()),
+                },
+                None => Some("not a path Veil can check".into()),
+            }
+        };
+        let mut out = Vec::new();
+        for (i, w) in tips.iter().enumerate().take(100) {
+            let Ok(wc) = self.read_commit(w) else { continue };
+            let Some(base) = wc.parents.first().and_then(|b| self.read_commit(b).ok()) else { continue };
+            let base_tree = self.flatten_tree(&base.tree)?;
+            let mut found: BTreeMap<String, String> = BTreeMap::new();
+            // Tracked edits (the working tree and the index parts).
+            let mut trees = vec![wc.tree];
+            if let Some(idx) = wc.parents.get(1).and_then(|c| self.read_commit(c).ok()) {
+                trees.push(idx.tree);
+            }
+            for t in trees {
+                for (p, leaf) in self.flatten_tree(&t)? {
+                    if base_tree.get(&p) != Some(&leaf) {
+                        if let Some(why) = hidden(&p) {
+                            found.entry(String::from_utf8_lossy(&p).into_owned()).or_insert(why);
+                        }
+                    }
+                }
+            }
+            // Untracked (and, with `-a`, ignored) files.
+            if let Some(u) = wc.parents.get(2).and_then(|c| self.read_commit(c).ok()) {
+                for p in self.flatten_tree(&u.tree)?.keys() {
+                    if let Some(why) = hidden(p) {
+                        found.entry(String::from_utf8_lossy(p).into_owned()).or_insert(why);
+                    }
+                }
+            }
+            if found.is_empty() {
+                continue;
+            }
+            let n = found.len();
+            let names: Vec<String> = found.into_iter().take(3).map(|(p, why)| format!("{} ({why})", p.escape_debug())).collect();
+            let more = if n > 3 { format!(" and {} more", n - 3) } else { String::new() };
+            out.push(format!("stash@{{{i}}} holds {}{more}", names.join(", ")));
+        }
+        Ok(out)
     }
 
     // ---- gates -----------------------------------------------------------------------
@@ -1143,7 +1302,22 @@ impl GitBridge {
     /// mode; a staged change to a path Veil hides from Git; a path the
     /// policy does not make public; public content holding a secret.
     /// Reasons name paths and rules, never content.
-    pub fn check_staged(&self, state: &State, policy: &Policy, staged: &[IndexEntry]) -> Result<Vec<String>> {
+    ///
+    /// `live` is why the working copy must be frozen *now* (see
+    /// [`freeze_reason`]), computed from the repository by the caller:
+    /// the decision never rests on `colocated.json` alone, which a command
+    /// that could not mirror (Git busy) may have left stale (BUG-748).
+    pub fn check_staged(&self, state: &State, policy: &Policy, staged: &[IndexEntry], live: Option<&str>) -> Result<Vec<String>> {
+        let exposed = (!state.exposed.is_empty()).then(|| {
+            format!(
+                "a .gitignore negation un-hides {} from Git, so Veil cannot keep Git away from it",
+                state.exposed.first().map(String::as_str).unwrap_or("a protected path")
+            )
+        });
+        let frozen: Option<String> = live
+            .map(str::to_string)
+            .or(exposed)
+            .or_else(|| state.frozen.then(|| state.frozen_reason.clone().unwrap_or_else(|| "cloaked or embargoed work".into())));
         let head = self.head()?;
         let leaves = match head.commit {
             Some(h) => self.flatten_tree(&self.read_commit(&h)?.tree)?,
@@ -1159,11 +1333,17 @@ impl GitBridge {
                 continue;
             }
             let shown = String::from_utf8_lossy(&e.path).escape_debug().to_string();
-            if state.frozen {
-                refused.push(format!(
-                    "{shown}: Git commits are frozen here ({}); commit with `vl commit`",
-                    state.frozen_reason.as_deref().unwrap_or("cloaked or embargoed work")
-                ));
+            let first = e.path.split(|b| *b == b'/').next().unwrap_or_default();
+            if std::str::from_utf8(first).is_ok_and(crate::object::is_reserved_name) {
+                refused.push(format!("{shown}: .veil is Veil's own; it never goes to Git"));
+                continue;
+            }
+            if let Some(why) = &frozen {
+                refused.push(format!("{shown}: Git commits are frozen here ({why}); commit with `vl commit`"));
+                continue;
+            }
+            if state.local_only.contains(&escape_git_path(&e.path)) {
+                refused.push(format!("{shown}: Veil keeps this file local (isolated, quarantined or held back)"));
                 continue;
             }
             if state.skip.contains(&escape_git_path(&e.path)) {
@@ -1197,6 +1377,45 @@ impl GitBridge {
         }
         Ok(refused)
     }
+}
+
+/// Why Git must see nothing of workspace `ws` whose working copy is `wc`
+/// (frozen mode), as far as the repository alone says: a cloaked line, or
+/// an unreleased embargo. (The mirror adds "`@-` cannot be exported".)
+pub fn freeze_reason(repo: &Repo, ws: &str, wc: ObjectId) -> Result<Option<String>> {
+    let snap = repo.snapshot(&wc)?;
+    if let Some(scope) = repo.view().workspace(ws)?.cloak.clone().or_else(|| snap.cloak.clone()) {
+        return Ok(Some(format!("the working copy is on a line cloaked for '{scope}'")));
+    }
+    if let Some(e) = repo.carried_embargo(&wc)? {
+        return Ok(Some(format!("the working copy is under unreleased embargo {e}")));
+    }
+    Ok(None)
+}
+
+/// Freeze the index of `git_dir` as it is (every entry skip-worktree),
+/// before Veil writes work Git must not see (BUG-748). `Ok(false)`: it
+/// could not be (locked, unmerged entries, a sparse index); the caller
+/// must then not write that work.
+pub fn freeze_index(git_dir: &Path) -> Result<bool> {
+    let Some(cur) = index::read(&index::index_path(git_dir))? else { return Ok(true) };
+    if cur.iter().all(|e| e.skip_worktree) {
+        return Ok(true);
+    }
+    if cur.iter().any(|e| e.stage != 0 || e.mode == 0o040000) {
+        return Ok(false);
+    }
+    let list: Vec<NewEntry> = cur
+        .iter()
+        .map(|e| NewEntry {
+            path: e.path.clone(),
+            mode: e.mode,
+            oid: e.oid,
+            skip_worktree: true,
+            assume_unchanged: e.assume_unchanged,
+        })
+        .collect();
+    index::write(git_dir, &list)
 }
 
 /// The paths of Veil tree `tree` whose entry is plain public content
@@ -1449,7 +1668,11 @@ pub fn apply_head_move(repo: &mut Repo, ws: &str, old: ObjectId, target: ObjectI
 /// becomes a change on `onto` (Git's `HEAD`) with the tree it has, so
 /// that its first snapshot records the uncommitted Git edits as its
 /// changes. The previous parent stays visible.
-pub fn reparent_working_copy(repo: &mut Repo, ws: &str, onto: ObjectId) -> Result<ObjectId> {
+///
+/// `take_tree`: a working copy with nothing recorded yet (a new
+/// repository) takes `onto`'s tree, so that files whose edit stays
+/// unrecorded (the user's skip-worktree bits) keep `onto`'s version.
+pub fn reparent_working_copy(repo: &mut Repo, ws: &str, onto: ObjectId, take_tree: bool) -> Result<ObjectId> {
     let mut tx = repo.transaction("git: adopt the colocated checkout")?;
     let wc = tx.view.workspace(ws)?.wc;
     let s = tx.repo().snapshot(&wc)?;
@@ -1458,6 +1681,9 @@ pub fn reparent_working_copy(repo: &mut Repo, ws: &str, onto: ObjectId) -> Resul
     }
     let root = tx.repo().root_id();
     let mut ns = (*s).clone();
+    if take_tree && tx.repo().snapshot(&root)?.tree == s.tree {
+        ns.tree = tx.repo().snapshot(&onto)?.tree;
+    }
     ns.parents = vec![onto];
     ns.predecessors = vec![wc];
     let id = tx.rewrite(wc, ns)?;
@@ -1577,6 +1803,52 @@ pub fn remove_exclude(git_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The generated block of `info/attributes`: Git's checkout transforms
+/// that Veil does not model are turned off in the colocated work tree, so
+/// that what Git writes is what the commit holds and is never recorded as
+/// the member's edit (BUG-755). `info/attributes` outranks every
+/// `.gitattributes`. Only `ident` (`$Id$` expansion) for now; filters
+/// (Git LFS) are left on, see the guide.
+pub fn attributes_block() -> String {
+    format!("{EXCLUDE_BEGIN}\n# Veil records files as the commit holds them: Git expands no $Id$ here.\n* -ident\n{EXCLUDE_END}\n")
+}
+
+fn attributes_path(git_dir: &Path) -> PathBuf {
+    git_dir.join("info").join("attributes")
+}
+
+/// Write [`attributes_block`] into `git_dir/info/attributes`, keeping the
+/// user's own lines (see [`write_exclude`]). `Ok(false)`: already there.
+pub fn write_attributes(git_dir: &Path) -> Result<bool> {
+    let path = attributes_path(git_dir);
+    let old = match std::fs::symlink_metadata(&path) {
+        Ok(m) if m.file_type().is_file() => std::fs::read(&path).map_err(io_at(&path))?,
+        _ => Vec::new(),
+    };
+    let old = String::from_utf8_lossy(&old).into_owned();
+    let mut text = without_block(&old);
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&attributes_block());
+    if text == old {
+        return Ok(false);
+    }
+    write_atomic(&path, text.as_bytes())?;
+    Ok(true)
+}
+
+/// Remove the block of [`write_attributes`] (`vl git uncolocate`).
+pub fn remove_attributes(git_dir: &Path) -> Result<()> {
+    let path = attributes_path(git_dir);
+    let Ok(old) = std::fs::read_to_string(&path) else { return Ok(()) };
+    let text = without_block(&old);
+    if text != old {
+        write_atomic(&path, text.as_bytes())?;
+    }
+    Ok(())
+}
+
 /// The generated block currently in `info/exclude`, if any.
 pub fn current_exclude_block(git_dir: &Path) -> Option<String> {
     let text = std::fs::read_to_string(exclude_path(git_dir)).ok()?;
@@ -1623,22 +1895,186 @@ pub fn literal_paths(policy: &Policy, candidates: impl IntoIterator<Item = Strin
         .collect()
 }
 
-/// Mark `.veil/` as a nested repository for Git (an empty bare repository
-/// at `.veil/.git`): `git clean -fdx` and `git stash -a` then leave the
-/// Veil repository alone instead of deleting or stashing it.
-pub fn guard_veil_dir(root: &Path) -> Result<()> {
-    let guard = root.join(".veil").join(".git");
-    if std::fs::symlink_metadata(&guard).is_ok() {
-        return Ok(());
+// ---- where the Veil repository lives ------------------------------------------------------
+
+/// The target of the `.veil` symlink of a colocated project.
+pub const MARKER_TARGET: &str = ".git/veil";
+
+fn io_at(path: &Path) -> impl FnOnce(std::io::Error) -> VeilError + '_ {
+    move |source| VeilError::Io {
+        path: path.display().to_string(),
+        source,
     }
-    gix::init_bare(&guard).map_err(gerr)?;
+}
+
+/// Is `<root>/.veil` the marker Veil leaves in a colocated project: a
+/// symlink to `.git/veil`?
+pub fn is_marker(root: &Path) -> bool {
+    let marker = root.join(crate::repo::VEIL_DIR);
+    std::fs::symlink_metadata(&marker).is_ok_and(|m| m.file_type().is_symlink())
+        && std::fs::read_link(&marker).is_ok_and(|t| t == Path::new(MARKER_TARGET))
+}
+
+/// Make `<root>/.veil` the marker again if it is not (a Git checkout, pull,
+/// `git clean` or `git stash -a` may have deleted it or put something else
+/// there). Whatever is in the way is never read: it is moved into
+/// `.git/veil/local/displaced/` (it may be a hostile `.veil` from a Git
+/// commit, or the user's), and the returned warning says so. Nothing to do
+/// unless the project is colocated ([`crate::repo::colocated_state_dir`]).
+///
+/// Veil does not depend on the marker (the repository is found and opened
+/// in `.git/veil` directly); it is there for people and tools looking for
+/// `.veil`, and it is harmless if Git records it (a symlink, never content).
+pub fn ensure_marker(root: &Path) -> Result<Option<String>> {
+    let Some(state) = crate::repo::colocated_state_dir(root) else { return Ok(None) };
+    let marker = root.join(crate::repo::VEIL_DIR);
+    if is_marker(root) {
+        return Ok(None);
+    }
+    let mut warning = None;
+    match std::fs::symlink_metadata(&marker) {
+        // `git stash -a` took it: put back now, it would make
+        // `git stash pop` fail ("already exists"); the pop restores it.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && stash_holds_marker(root) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io_at(&marker)(e)),
+        Ok(_) => {
+            let dir = state.join("local").join("displaced");
+            std::fs::create_dir_all(&dir).map_err(io_at(&dir))?;
+            let to = dir.join(format!("dot-veil-{}-{}", crate::now_millis(), std::process::id()));
+            match std::fs::rename(&marker, &to) {
+                Ok(()) => {
+                    warning = Some(format!(
+                        "something else was at .veil (a Git checkout or pull wrote it?); it was never read and is kept in {}. \
+                         Veil's repository is in .git/veil, out of Git's reach",
+                        to.display()
+                    ))
+                }
+                // Another `vl` repaired it meanwhile.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io_at(&marker)(e)),
+            }
+        }
+    }
+    #[cfg(unix)]
+    match std::os::unix::fs::symlink(MARKER_TARGET, &marker) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && is_marker(root) => {}
+        Err(e) => return Err(io_at(&marker)(e)),
+    }
+    Ok(warning)
+}
+
+/// Does the newest stash (`refs/stash`) hold `.veil` among its untracked
+/// files (its third parent, `git stash -u` / `-a`)?
+fn stash_holds_marker(root: &Path) -> bool {
+    let Ok(git) = gix::open_opts(root.join(".git"), gix::open::Options::isolated()) else { return false };
+    let Ok(Some(id)) = get_ref_of(&git, "refs/stash") else { return false };
+    let parents_and_tree = |id: GitOid| -> Option<(Vec<GitOid>, GitOid)> {
+        let c = git.find_object(id).ok()?.try_into_commit().ok()?;
+        let parents = c.parent_ids().map(|p| p.detach()).collect();
+        Some((parents, c.tree_id().ok()?.detach()))
+    };
+    let Some(untracked) = parents_and_tree(id).and_then(|(p, _)| p.get(2).copied()) else { return false };
+    let Some((_, tree)) = parents_and_tree(untracked) else { return false };
+    let Some(tree) = git.find_object(tree).ok().and_then(|o| o.try_into_tree().ok()) else { return false };
+    tree.find_entry(crate::repo::VEIL_DIR).is_some()
+}
+
+/// Move the Veil repository of the project at `root` from `.veil` into
+/// `.git/veil` and leave the marker (`vl git colocate`, `vl init
+/// --colocate`, and a project an earlier build colocated with the
+/// repository still in `.veil`). A `.veil` that is the user's own symlink
+/// to another disk stays where its data is: `.git/veil` becomes a symlink
+/// to the same directory. The `.veil/.git` decoy of earlier builds is
+/// removed.
+pub fn move_state_into_git(root: &Path) -> Result<()> {
+    let src = root.join(crate::repo::VEIL_DIR);
+    let dst = root.join(crate::repo::COLOCATED_STATE_DIR);
+    if crate::repo::colocated_state_dir(root).is_none() {
+        if std::fs::symlink_metadata(&dst).is_ok() {
+            return Err(VeilError::repo(format!(
+                "{} exists but is not a Veil repository; move it away first",
+                dst.display()
+            )));
+        }
+        let m = std::fs::symlink_metadata(&src).map_err(io_at(&src))?;
+        if m.file_type().is_symlink() {
+            let target = std::fs::canonicalize(&src).map_err(io_at(&src))?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &dst).map_err(io_at(&dst))?;
+            std::fs::remove_file(&src).map_err(io_at(&src))?;
+        } else if m.is_dir() {
+            std::fs::rename(&src, &dst).map_err(io_at(&src))?;
+        } else {
+            return Err(VeilError::repo(format!("{} is not a directory", src.display())));
+        }
+    }
+    unguard_state_dir(&dst)?;
+    ensure_marker(root)?;
     Ok(())
 }
 
-/// Remove the guard repository of [`guard_veil_dir`] (only if it still
-/// looks like the one Veil made: a bare repository with no refs).
-pub fn unguard_veil_dir(root: &Path) -> Result<()> {
-    let guard = root.join(".veil").join(".git");
+/// Undo [`move_state_into_git`] (`vl git uncolocate`): the repository goes
+/// back to `<root>/.veil`, a real directory again (or the user's symlink).
+pub fn move_state_out_of_git(root: &Path) -> Result<()> {
+    if crate::repo::colocated_state_dir(root).is_none() {
+        return Ok(());
+    }
+    let src = root.join(crate::repo::COLOCATED_STATE_DIR);
+    let dst = root.join(crate::repo::VEIL_DIR);
+    match std::fs::symlink_metadata(&dst) {
+        Ok(m) if m.file_type().is_symlink() => std::fs::remove_file(&dst).map_err(io_at(&dst))?,
+        Ok(_) => {
+            let dir = src.join("local").join("displaced");
+            std::fs::create_dir_all(&dir).map_err(io_at(&dir))?;
+            let to = dir.join(format!("dot-veil-{}-{}", crate::now_millis(), std::process::id()));
+            std::fs::rename(&dst, &to).map_err(io_at(&dst))?;
+        }
+        Err(_) => {}
+    }
+    let m = std::fs::symlink_metadata(&src).map_err(io_at(&src))?;
+    if m.file_type().is_symlink() {
+        let target = std::fs::canonicalize(&src).map_err(io_at(&src))?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &dst).map_err(io_at(&dst))?;
+        std::fs::remove_file(&src).map_err(io_at(&src))?;
+    } else {
+        std::fs::rename(&src, &dst).map_err(io_at(&src))?;
+    }
+    Ok(())
+}
+
+/// A project an earlier build colocated keeps its repository in a real
+/// `.veil` directory: move it into `.git/veil` (see
+/// [`move_state_into_git`]). Then, in any colocated project, repair the
+/// marker ([`ensure_marker`]). Returns a warning to show, if any.
+pub fn ensure_layout(root: &Path) -> Result<Option<String>> {
+    if crate::repo::colocated_state_dir(root).is_none() {
+        let dot = root.join(crate::repo::VEIL_DIR);
+        let real_dir = std::fs::symlink_metadata(&dot).is_ok_and(|m| m.is_dir())
+            && std::fs::symlink_metadata(root.join(".git")).is_ok_and(|m| m.is_dir());
+        let colocated = real_dir
+            && std::fs::read(dot.join("repo.json"))
+                .ok()
+                .and_then(|raw| serde_json::from_slice::<crate::repo::RepoConfig>(&raw).ok())
+                .is_some_and(|c| c.colocated.is_some());
+        if !colocated {
+            return Ok(None);
+        }
+        move_state_into_git(root)?;
+        return Ok(Some(
+            "moved this colocated project's Veil repository from .veil into .git/veil, out of Git's reach (.veil is now a symlink to it)"
+                .into(),
+        ));
+    }
+    ensure_marker(root)
+}
+
+/// Remove the `.git` decoy earlier builds put inside the Veil repository
+/// (an empty bare Git repository), if it is still one.
+fn unguard_state_dir(state: &Path) -> Result<()> {
+    let guard = state.join(".git");
     let Ok(m) = std::fs::symlink_metadata(&guard) else { return Ok(()) };
     if !m.is_dir() {
         return Ok(());
@@ -1648,10 +2084,7 @@ pub fn unguard_veil_dir(root: &Path) -> Result<()> {
         .and_then(|r| r.references().ok().map(|p| p.all().map(|mut i| i.next().is_none()).unwrap_or(false)))
         .unwrap_or(false);
     if empty {
-        std::fs::remove_dir_all(&guard).map_err(|e| VeilError::Io {
-            path: guard.display().to_string(),
-            source: e,
-        })?;
+        std::fs::remove_dir_all(&guard).map_err(io_at(&guard))?;
     }
     Ok(())
 }

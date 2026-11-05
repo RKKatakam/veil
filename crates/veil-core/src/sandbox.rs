@@ -95,18 +95,21 @@ const REBUILD_PREFIX: &str = "files.rebuild-";
 
 /// `.veil/local/sandboxes` of the project directory `root`.
 pub fn sandboxes_dir(root: &Path) -> PathBuf {
-    let mut p = root.to_path_buf();
-    p.extend(SANDBOXES_DIR.split('/'));
+    // In a colocated project, `.git/veil/local/sandboxes`.
+    let mut p = crate::repo::state_dir(root);
+    p.extend(SANDBOXES_DIR.split('/').skip(1));
     p
 }
 
-/// Is `dir` a `.veil/local/sandboxes` directory?
+/// Is `dir` a `.veil/local/sandboxes` directory (or, in a colocated
+/// project, `.git/veil/local/sandboxes`, where `.veil` leads)?
 pub fn is_sandboxes_dir(dir: &Path) -> bool {
-    let names: Vec<_> = dir.ancestors().take(3).map(|a| a.file_name()).collect();
-    names.len() == 3
+    let names: Vec<_> = dir.ancestors().take(4).map(|a| a.file_name()).collect();
+    names.len() >= 3
         && names[0].is_some_and(|n| n == "sandboxes")
         && names[1].is_some_and(|n| n == "local")
-        && names[2].is_some_and(|n| n == crate::repo::VEIL_DIR)
+        && (names[2].is_some_and(|n| n == crate::repo::VEIL_DIR)
+            || (names[2].is_some_and(|n| n == "veil") && names.get(3).copied().flatten().is_some_and(|n| n == ".git")))
 }
 
 /// Name of workspace `ws`'s directory in [`sandboxes_dir`]: the name

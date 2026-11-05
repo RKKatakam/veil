@@ -4,7 +4,6 @@
 use crate::*;
 
 #[test]
-#[ignore = "BUG-750: a Git branch named like a cloaked Veil tag retargets that cloaked tag to the public commit, and the mirror deletes the Git branch"]
 fn bug750_a_branch_named_like_a_cloaked_tag_moves_neither() {
     need_git!();
     let env = Env::new();
@@ -27,7 +26,6 @@ fn bug750_a_branch_named_like_a_cloaked_tag_moves_neither() {
 }
 
 #[test]
-#[ignore = "BUG-751: a Git branch whose name is not a valid Veil tag (`issue#12`) is deleted from .git by the next vl command"]
 fn bug751_a_branch_veil_cannot_follow_is_never_deleted() {
     need_git!();
     let env = Env::new();

@@ -5,7 +5,6 @@
 use crate::*;
 
 #[test]
-#[ignore = "BUG-745: `vl init --colocate` records local edits hidden with skip-worktree/assume-unchanged as public changes, and `vl git push` publishes them"]
 fn bug745_adoption_never_publishes_edits_git_was_told_to_hide() {
     need_git!();
     let env = Env::new();

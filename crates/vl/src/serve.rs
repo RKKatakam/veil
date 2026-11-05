@@ -167,7 +167,7 @@ fn last_os_error<T>(what: &str) -> Result<T> {
 /// owned by this user. The server creates it if missing and makes it `0700`;
 /// the client only checks the owner (the peer check is what it relies on).
 fn local_dir(root: &Path, server: bool) -> Result<File> {
-    let veil = root.join(VEIL_DIR);
+    let veil = veil_core::repo::state_dir(root);
     let m = std::fs::symlink_metadata(&veil).with_context(|| format!("reading {}", veil.display()))?;
     if !m.is_dir() {
         bail!("{} is not a directory", veil.display());
@@ -325,7 +325,7 @@ fn repo_root(repo_arg: Option<&Path>) -> Result<PathBuf> {
 }
 
 pub fn socket_path(root: &Path) -> PathBuf {
-    root.join(VEIL_DIR).join("local").join(SOCKET)
+    veil_core::repo::state_dir(root).join("local").join(SOCKET)
 }
 
 /// `(dev, ino)` of `p` itself (never through a symlink).
@@ -350,7 +350,7 @@ impl Identity {
         let config = veil_core::repo::read_config(&DiskBackend::new(root))?;
         Ok(Identity {
             root: dev_ino(root).with_context(|| format!("reading {}", root.display()))?,
-            veil: dev_ino(&root.join(VEIL_DIR)).with_context(|| format!("reading {}", root.join(VEIL_DIR).display()))?,
+            veil: dev_ino(&veil_core::repo::state_dir(root)).with_context(|| format!("reading {}", veil_core::repo::state_dir(root).display()))?,
             repo_id: config.repo_id,
         })
     }
@@ -452,7 +452,7 @@ impl Server {
     /// any more (and its socket is not where the repository's is).
     fn check_identity(&self) -> Result<()> {
         let here = dev_ino(&self.root).ok() == Some(self.identity.root)
-            && dev_ino(&self.root.join(VEIL_DIR)).ok() == Some(self.identity.veil);
+            && dev_ino(&veil_core::repo::state_dir(&self.root)).ok() == Some(self.identity.veil);
         if here {
             return Ok(());
         }

@@ -252,6 +252,7 @@ fn exercise_link_tree(entries: Vec<(String, u8, Vec<u8>)>) {
             materialised: None,
             line_base: None,
             line_endings: Default::default(),
+            keep_recorded: None,
         },
     );
     let _ = veil_core::tree::TreeView::new(store.clone(), root).list_dir(&VPath::root());
