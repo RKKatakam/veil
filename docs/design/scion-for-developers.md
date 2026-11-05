@@ -42,7 +42,7 @@ What Anthropic tried and dropped:
 
 Caveats from the post:
 - Scion is "by no means a suitable replacement for git for general use". It is built for one very large monorepo. Veil must stay good at the ordinary, Git-sized case and not take on Scion's always-online assumptions by default.
-- Code Claude wrote sometimes broke system constraints, or grew over-engineered after adversarial review, and engineers had to say no. Veil's threat reviews and adversarial passes should reject additions no threat calls for.
+- "What we learned building Scion": agents "will sometimes violate core system constraints", and engineers had to "steer Claude away from over-engineering parts of the system". Often "the role of the engineers was to tell Claude 'no.'" Anthropic "makes extensive use of adversarial review", but one such review "was overly defensive about trusting another internal service". For Veil: adversarial passes stay, but a finding that asks for defence against a component Veil already trusts by design needs a stated threat before it is built.
 - The post does not cover agent attribution, sandboxes, resource limits, offline work, latency, cache sizes or Git migration. Veil's items for those (4.6, 4.7) are Veil's own designs, not taken from Scion.
 
 ## What Veil already has
