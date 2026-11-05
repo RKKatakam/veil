@@ -79,6 +79,7 @@ For each lens, read the diff **against the whole codebase and the brief's intent
    - **Every new enum kind handled in every match.**
    - Error paths, and `Missing` treated as "redacted".
 3. **Concurrency and durability.**
+   - **Run every changed concurrency test under load:** many copies in parallel (e.g. `for i in $(seq 8); do (for j in $(seq 12); do BIN TEST --exact & done; wait) ; done`), not 10 runs alone. BUG-811 passed 10/10 alone and failed 1 in 3 under load.
    - The lock: is it taken, held across a slow scan, or released early?
    - Crash between steps: is the publish order `.pack`, then `.idx`, then the op head?
    - fsync on the file and on its directory.
