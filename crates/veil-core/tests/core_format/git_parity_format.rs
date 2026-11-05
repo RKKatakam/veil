@@ -318,12 +318,7 @@ fn gc_keeps_annotations_their_targets_and_link_objects() {
 fn fsck_checks_link_content() {
     let (mut alice, _fs, main, _) = links_repo("/x");
     let mut tree = alice.snapshot(&main).unwrap().tree;
-    for (path, kind, content) in [
-        ("bad/nul", EntryKind::Symlink, "a\0b"),
-    ] {
-        let name = path.rsplit('/').next().unwrap();
-        tree = put_at(&alice, tree, path, link(&alice, name, kind, content, Visibility::Public));
-    }
+    tree = put_at(&alice, tree, "bad/nul", link(&alice, "nul", EntryKind::Symlink, "a\0b", Visibility::Public));
     let long = "x".repeat(veil_core::fsck::MAX_LINK_TARGET + 1);
     tree = put_at(&alice, tree, "bad/long", link(&alice, "long", EntryKind::Symlink, &long, Visibility::Public));
     let s = snapshot(&alice, main, tree, vec![]);
@@ -370,10 +365,8 @@ fn checkout_writes_links_and_the_builder_keeps_them() {
     tx.commit().unwrap();
     let s = alice.snapshot_workspace(WS, &*fs).unwrap();
     let tree = alice.snapshot(&s.snapshot).unwrap().tree;
-    for path in ["links/readme"] {
-        let want = lookup(alice.store(), &link_tree, &p(path)).unwrap().unwrap();
-        assert_eq!(lookup(alice.store(), &tree, &p(path)).unwrap(), Some(want), "{path} lost by the snapshot");
-    }
+    let want = lookup(alice.store(), &link_tree, &p("links/readme")).unwrap().unwrap();
+    assert_eq!(lookup(alice.store(), &tree, &p("links/readme")).unwrap(), Some(want), "links/readme lost by the snapshot");
 }
 
 /// Merges carry links: one side's change wins trivially; two different

@@ -183,19 +183,18 @@ fn special(kind: EntryKind) -> Vec<u8> {
 
 #[test]
 fn symlink_entries_round_trip_and_need_format_5() {
-    for (kind, byte) in [(EntryKind::Symlink, 1u8)] {
-        let raw = special(kind);
-        // tag(10) | 02 | count | name_len | 'a' | flags (KIND|SIZE) | kind
-        assert_eq!(&raw[10..16], &[0x02, 0x01, 0x01, b'a', 0x84, byte]);
-        let Object::Tree(t) = Object::decode(&raw).unwrap() else { panic!() };
-        assert_eq!(t.entries[0].kind, kind);
-        assert_eq!(Object::min_repo_format(&raw), 5);
-        // JSON trees spell the kind.
-        let json = Object::Tree(t.clone()).encode_with(TreeEncoding::Json);
-        assert!(String::from_utf8_lossy(&json).contains(&format!("\"kind\":\"{}\"", kind.name())));
-        assert_eq!(Object::min_repo_format(&json), 5);
-        assert_eq!(Object::decode(&json).unwrap(), Object::Tree(t));
-    }
+    let (kind, byte) = (EntryKind::Symlink, 1u8);
+    let raw = special(kind);
+    // tag(10) | 02 | count | name_len | 'a' | flags (KIND|SIZE) | kind
+    assert_eq!(&raw[10..16], &[0x02, 0x01, 0x01, b'a', 0x84, byte]);
+    let Object::Tree(t) = Object::decode(&raw).unwrap() else { panic!() };
+    assert_eq!(t.entries[0].kind, kind);
+    assert_eq!(Object::min_repo_format(&raw), 5);
+    // JSON trees spell the kind.
+    let json = Object::Tree(t.clone()).encode_with(TreeEncoding::Json);
+    assert!(String::from_utf8_lossy(&json).contains(&format!("\"kind\":\"{}\"", kind.name())));
+    assert_eq!(Object::min_repo_format(&json), 5);
+    assert_eq!(Object::decode(&json).unwrap(), Object::Tree(t));
     // A plain file tree stays format 2 (and a conflict tree format 4).
     assert_eq!(Object::min_repo_format(&one_entry()), 2);
 }

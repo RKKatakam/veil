@@ -1644,10 +1644,8 @@ fn format_5_fixture_holds_links_and_annotated_tags_for_their_audiences() {
     let sealed_atag = alice.view().tags["team-release"].annotation.unwrap();
     assert!(!mirror.store().has(&sealed_atag), "the sealed atag reached the public mirror");
     let tree = mirror.snapshot(&tag(&mirror, "links")).unwrap().tree;
-    for path in ["secrets/current"] {
-        let e = lookup(mirror.store(), &tree, &p(path)).unwrap().unwrap();
-        assert!(!mirror.store().has(&e.id), "{path}'s sealed object reached the public mirror");
-    }
+    let e = lookup(mirror.store(), &tree, &p("secrets/current")).unwrap().unwrap();
+    assert!(!mirror.store().has(&e.id), "secrets/current's sealed object reached the public mirror");
     assert_eq!(read_str(&mirror, &tag(&mirror, "links"), "links/readme").as_deref(), Some(LINK_TARGET));
     for (id, bytes) in readable_bytes(&mirror) {
         for secret in [SEALED_TARGET, TEAM_RELEASE_NOTES.trim()] {
