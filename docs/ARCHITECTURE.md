@@ -4000,6 +4000,23 @@ afterwards; textconv input on stdin, output never stored.
 
 ## Threat model
 
+**Trust boundary.** Every security finding must name an attacker outside this boundary, what that attacker controls, and the concrete harm. A finding that needs something inside the boundary to be hostile is out of scope: it is recorded as such, not fixed.
+
+*Trusted:*
+
+* the member's device and OS account. Anyone who can run commands as the member, read their process memory or replace the `vl` binary already holds their keys;
+* the member's identity and key files on that device. Protecting them at rest (a passphrase or the keychain) is a backlog item, not a bug;
+* the member's own deliberate commands, including `vl expose`, `public!`, `--force`, `--no-verify` and their own edits to `.veilpolicy`. Veil warns but obeys;
+* the OS, the file system, and the toolchain and dependencies `vl` was built with.
+
+*Not trusted:*
+
+* remotes and their operators (an SFTP server, a Git host, the future Hub). They see everything they store, and may withhold, replay, reorder or fork it;
+* anything that arrives by pull, fetch, merge, patch, bundle or Git import: trees, labels, policies, hooks, names, descriptions and metadata;
+* in colocated mode, anything Git can write: the work tree, the index, `.gitignore` and `.gitattributes`, refs and Git config. A `git pull` puts other people's content there, so a change Git could have made is never taken as the member's own edit (BUG-740, BUG-759);
+* teammates beyond their own scopes, and revoked members after their revocation;
+* other OS users on the same machine.
+
 **Protected against:**
 
 * accidental commits of secrets (engine rules plus the scanner, with no ignore
