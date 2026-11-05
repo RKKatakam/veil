@@ -19,6 +19,7 @@ There is one **repository format**, a number in `.veil/repo.json`:
 | 3 | 1.0.0 | standard cryptography: AES-SIV sealed objects (`veil:sea2`), HPKE-wrapped ring keys (ring format 3); see [CRYPTO.md](CRYPTO.md) |
 | 4 | 1.0.0 | first-class conflicts: conflict objects (`veil:conf`, §3.6) and conflict entries in binary trees (flag bit 6) |
 | 5 | 1.0.0 | symlink tree entries (flag bit 7 and a kind byte, §3.7) and conflict terms (§3.6), annotated tags (`veil:atag`, §3.8; `Tag.annotation`) |
+| 6 | 1.1.0 | the lock-free op log: heads in `.veil/op_heads/` instead of `.veil/op_head`, operations gain `workspace` and `rewritten` (§2, §5 "Format 6"). Unreleased: streams A (snapshot attribution) and C (partial clones) extend it before the release |
 
 * `vl init` writes the newest format (`repo::REPO_FORMAT`). `vl clone` takes
   the format of its source, so that what the clone writes can be pushed
@@ -56,8 +57,12 @@ not be understood.
 | — embargo wrapper | an ordinary tree with an `embargo` marker entry | as trees | yes | `embargo.rs`. Since BUG-104 the listed entries omit ids the fallback tree reaches (the pre-merge versions of changed files); same encoding, and every reader keeps those objects through the fallback, so no new version |
 | packs `.veil/objects/pack/pack-<sum>.pack` | `VEILPAK1` ‖ count u32 ‖ entries ‖ BLAKE3 | magic digit | no (sync sends canonical objects) | entry kinds 0 stored, 1 zstd, 2 delta; 3–15 reserved. A delta is a zstd frame read with its base as a raw-content dictionary; above 2 MiB of base plus object it is written with the base as a *prefix* and long-distance matching (BUG-290), with a window of at most 2^27, which every zstd decoder accepts by default: the same bytes to every reader, so no new version. Builds without the zstd C library (WASM, ARCHITECTURE.md §13) write kind 0 only and read 1 and 2 with a pure-Rust decoder (a delta's base given to it as a formatted dictionary: a fixed header, then the base); no new version either |
 | pack indexes `pack-<sum>.idx` | `VEILIDX1` ‖ count ‖ fanout ‖ ids ‖ offsets ‖ lengths ‖ pack sum ‖ BLAKE3 | magic digit | no | |
-| operations `.veil/ops/<id>` | JSON `Operation {parents, timestamp, user, description, view, manual_undo?, undo_of?, redo_of?}`, id = BLAKE3 of the bytes | repository format | no (device/repository-local) | `manual_undo` (absent unless set) marks an operation whose effect lies outside the view; `undo_of` / `redo_of` (absent unless set, hex operation ids) mark an undo and a redo, so repeated undos go further back (BUG-247). Older readers ignore all three (an older `vl undo` then treats an undo as a plain operation, as it always did); operations written before them have none, so no version bump or upgrade step. Format 5: a view's tags may carry `annotation` (hex id of a `veil:atag`) and the view `remote_release_tags` (`"<remote>/<name>"` → atag id); both omitted when absent or empty, so earlier views keep their bytes, and an operation using either is refused below format 5 (`OpStore::put`), so a format-4 vl never meets one (it refuses the repository and the remote by format before reading a view). |
-| `.veil/op_head` | hex id | fixed | no | |
+| operations `.veil/ops/<id>` | JSON `Operation {parents, timestamp, user, description, view, manual_undo?, undo_of?, redo_of?, workspace?, rewritten?}`, id = BLAKE3 of the bytes | repository format | no (device/repository-local) | `manual_undo` (absent unless set) marks an operation whose effect lies outside the view; `undo_of` / `redo_of` (absent unless set, hex operation ids) mark an undo and a redo, so repeated undos go further back (BUG-247). Older readers ignore all three (an older `vl undo` then treats an undo as a plain operation, as it always did); operations written before them have none, so no version bump or upgrade step. Format 5: a view's tags may carry `annotation` (hex id of a `veil:atag`) and the view `remote_release_tags` (`"<remote>/<name>"` → atag id); both omitted when absent or empty, so earlier views keep their bytes, and an operation using either is refused below format 5 (`OpStore::put`), so a format-4 vl never meets one (it refuses the repository and the remote by format before reading a view). Format 6: `workspace` (the workspace the command was run for; absent for repository-wide commands) and `rewritten` (hex snapshot id → its replacements, empty for abandoned; omitted when empty) come after `redo_of`, so every earlier operation keeps its bytes and id; an operation using either is refused below format 6 (`OpStore::put`). A merge of concurrent operations has several `parents` (sorted), `user` `"veil"`, `description` `merge N concurrent operations` and the largest of its parents' timestamps, so every process merging the same heads writes the same bytes. |
+| `.veil/op_head` | hex id | fixed | no | formats 1–5: the single head, moved under the repository lock. At format 6 it is not written; if present (a format-5 writer racing the upgrade) it is read as one more head, merged by the next command and removed |
+| `.veil/op_heads/<id>` (format 6) | empty files named by a 64-digit lowercase hex operation id | repository format | no | the heads of the op log. A transaction publishes its operation, creates its head file (`create_new`, durable) and then removes its parents' head files; readers drop a head that is an op-graph ancestor of another (a crash between those steps). Several heads are concurrent operations, which the next command merges. Any other entry is ignored (and noted by `fsck`). A remote has exactly one, written under its lock. Format-5 readers never look here (they refuse the repository by format) |
+| transaction staging `.veil/objects/incoming/tx-<owner>/ab/cdef…` (format 6) | loose objects, as in `.veil/objects/` | none | no | a transaction's new objects until it publishes them (a barrier, then renames into place). `<owner>` = `<host hash>-<boot hash>-<pid>-<pid start>-<ms>-<random>`: removed by `Repo::open` only once its owner is provably gone (`lock::owner_gone`). Never read by anyone but its transaction; gc marks from the live ones. Older clients never list `incoming/` |
+| pull spool `.veil/objects/incoming/pull-<owner>/` | a pull's downloaded packs (`PackWriter` streams) | none | no | one per pull (the transaction's owner), removed when the pull ends, or by `Repo::open` once its owner is gone. Format 5 used the fixed `incoming/pull`, emptied under the lock; `vl upgrade` to 6 removes it |
+| working-copy locks `.veil/local/wc/ws-<name>.lock` (format 6) | empty, `flock`ed | none | no (device-local) | one recorder of a workspace's directory at a time (the project directory, `ws exec`, `ws write`, mounts); released by the kernel when the process ends. An older vl ignores the directory |
 | pruned-ops list `.veil/ops_pruned` | one hex id per line | fixed | no | append-only |
 | key rings `.veil/meta/keyrings/<scope>.json` | pretty JSON `KeyRing` | `format` (0/1 legacy, 2 signed log, 3 signed log that may hold HPKE-wrapped keys) | yes | readers reject `format > 3` (no keys, a warning on sync); a ring with an HPKE wrap must say 3, and a format-1/2 repository refuses to store it |
 | — wrapped key (in a ring change) | JSON: legacy `{ephemeral, sealed}` or HPKE `{hpke, enc, ct}` | shape + `hpke` suite string | yes | legacy written by format 1–2, HPKE by format 3 (CRYPTO.md C3/C3L); unknown fields or suites refused |
@@ -392,6 +397,29 @@ still waiting for its admin.
 * **Downgrades** are not supported: an older vl refuses a format-2
   repository with a message naming the release it needs.
 
+### Format 6 (the lock-free op log)
+
+* **Steps.** `5 → 6` runs `5->6:op-heads` before the commit point: the
+  operation `op_head` names gets its head file in `op_heads/` (harmless to
+  format-5 readers, which never look there). After `set-format`,
+  `6:remove-op-head` makes sure that head file exists (`op_head` may have
+  moved if the upgrade was interrupted between the two steps), removes
+  `op_head`, and removes format 5's fixed pull spool `incoming/pull`.
+  Nothing else is rewritten: every object, operation, id and signature
+  stays.
+* **The upgrade race.** A process that opened the repository at format 5
+  (an older vl, or this vl started before the upgrade) may commit after
+  the commit point, by writing an operation and `op_head`. At format 6 a
+  present `op_head` is read as one more head: the next command merges its
+  operation in and removes the file. This vl's own format-5 transactions
+  re-read `repo.json` under the lock before moving the head, and fail
+  ("the repository was upgraded while this command ran") instead.
+* **Remotes and clones.** `vl upgrade --remote NAME` does the same on a
+  remote. A remote keeps one head, written under its lock, at every
+  format. An older vl refuses a format-6 repository or remote outright: it
+  would read only `op_head` and silently fork the log. Lock-free pushes and
+  pulls work against format-5 remotes (the remote's side is unchanged).
+
 ### Format 5 (symlinks, annotated tags)
 
 * **Nothing is rewritten** (`4 → 5` has no step): a format-4 snapshot never
@@ -465,7 +493,9 @@ and new constructions; from format 4 also a merge with conflict entries at
 the tag `conflicted`, one resolved with `vl resolve`; from format 5 also
 symlinks, public and sealed, a link/file conflict and annotated tags,
 written through the engine by `write_format_5_extras` in
-`format_compat.rs`): three identities (`home-alice`, `home-bob`, `home-carol`), the
+`format_compat.rs`; from format 6 also concurrent operations, written last
+by `write_format_6_extras`: a merge whose side carries `rewritten` and
+`workspace`, and two heads left unmerged): three identities (`home-alice`, `home-bob`, `home-carol`), the
 project `alice/` (packed and loose objects, a cloaked directory, a ring with
 a grant, a revocation and a rotation (key generation 2), a released and an
 unreleased embargo, a cloaked tag, a vault, gc pending list, pruned ops,
