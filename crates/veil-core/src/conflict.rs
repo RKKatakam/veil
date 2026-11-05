@@ -942,8 +942,8 @@ impl Pick {
 }
 
 /// `tree` with the entry at `path` replaced by `entry` (removed for
-/// `None`; directories left empty disappear). Plain trees only: a tree
-/// under an embargo wrapper is refused.
+/// `None`; directories left empty disappear, missing ones are created).
+/// Plain trees only: a tree under an embargo wrapper is refused.
 pub fn set_entry(store: &ObjectStore, tree: &ObjectId, path: &VPath, entry: Option<TreeEntry>) -> Result<ObjectId> {
     let comps: Vec<&str> = path.components().collect();
     let Some((last, dirs)) = comps.split_last() else {
@@ -957,7 +957,12 @@ pub fn set_entry(store: &ObjectStore, tree: &ObjectId, path: &VPath, entry: Opti
     for d in dirs {
         let next = match chain.last().expect("non-empty").get(d) {
             Some(e) if e.kind == EntryKind::Dir => (*store.tree_object(&e.id)?).clone(),
-            _ => return Err(VeilError::NotFound(path.to_string())),
+            // A directory the tree no longer has (deleted with everything
+            // in it, BUG-757): created for an entry put back, and nothing
+            // to remove.
+            None if entry.is_some() => crate::object::Tree::default(),
+            None => return Ok(*tree),
+            Some(_) => return Err(VeilError::NotFound(path.to_string())),
         };
         chain.push(next);
     }

@@ -120,14 +120,16 @@ impl Repo {
                 accept: None,
             });
         }
-        let colocated = self.is_colocated();
+        if self.is_colocated() {
+            let mut wp = policy::working_copy_policy_colocated(&*self.backend, fs)?;
+            wp.policy.edits_unattributed = true;
+            return Ok(wp);
+        }
         let parent = match checked_out_from {
-            Some(tree) if !colocated => self.policy_text_in(tree)?,
-            _ => None,
+            Some(tree) => self.policy_text_in(tree)?,
+            None => None,
         };
-        let mut wp = policy::working_copy_policy(&*self.backend, fs, parent.as_ref().map(|t| t.as_deref()))?;
-        wp.policy.edits_unattributed = colocated;
-        Ok(wp)
+        policy::working_copy_policy(&*self.backend, fs, parent.as_ref().map(|t| t.as_deref()))
     }
 
     /// [`Repo::snapshot_policy`] after a `vl` command changed `.veilpolicy`

@@ -3042,8 +3042,12 @@ fn cmd_gc(
     }
     if let Some(name) = &r.pack {
         let s = &r.pack_stats;
+        let more = match r.packs.len() {
+            0 | 1 => String::new(),
+            n => format!(" and {} more pack(s)", n - 1),
+        };
         println!(
-            "Packed {} object(s) into pack-{} ({} delta, {} compressed, {} stored)",
+            "Packed {} object(s) into pack-{}{more} ({} delta, {} compressed, {} stored)",
             s.objects,
             &name[..12],
             s.deltas,

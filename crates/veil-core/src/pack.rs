@@ -117,7 +117,21 @@ pub const DEFAULT_LEVEL: i32 = 3;
 /// diff, push, checkout) stop paying several syscalls per object, while
 /// short commands still only read the entries they need.
 const SLURP_AFTER: usize = 64;
-const SLURP_LIMIT: u64 = 256 << 20;
+/// The largest pack held whole in memory: a quarter of [`SLURP_BUDGET`],
+/// so that several hot packs fit at once instead of evicting each other on
+/// every read. Larger packs are always read by range.
+const SLURP_LIMIT: u64 = (SLURP_BUDGET / 4) as u64;
+/// What all the packs held whole take together, in this process (BUG-800:
+/// the limit used to be per pack, so a history walk ended up holding the
+/// whole store). The least recently used goes first.
+pub const SLURP_BUDGET: usize = 64 << 20;
+
+/// The packs held whole, by checksum (shared by every store of the process:
+/// a pack's checksum names its content).
+fn slurped() -> &'static LruCache<Arc<Vec<u8>>> {
+    static CACHE: OnceLock<LruCache<Arc<Vec<u8>>>> = OnceLock::new();
+    CACHE.get_or_init(|| LruCache::new(SLURP_BUDGET))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -320,8 +334,8 @@ pub struct Pack {
     index_path: VPath,
     index: PackIndex,
     size: u64,
+    /// Ranged reads since the pack was last loaded whole.
     reads: AtomicUsize,
-    data: OnceLock<Vec<u8>>,
     /// Largest object an entry may declare ([`max_object_size`]).
     max_object: u64,
 }
@@ -371,7 +385,6 @@ impl Pack {
             index,
             size,
             reads: AtomicUsize::new(0),
-            data: OnceLock::new(),
             max_object: max_object_size(),
         })
     }
@@ -412,26 +425,35 @@ impl Pack {
         format!("pack {}", &self.name[..12])
     }
 
-    /// The whole pack, once it has been read often enough to be worth it.
-    fn whole(&self, backend: &dyn StorageBackend) -> Result<Option<&[u8]>> {
-        if let Some(d) = self.data.get() {
+    /// The whole pack, once it has been read often enough to be worth it
+    /// and while it is among the packs held whole ([`SLURP_BUDGET`]).
+    fn whole(&self, backend: &dyn StorageBackend) -> Result<Option<Arc<Vec<u8>>>> {
+        if self.size > SLURP_LIMIT {
+            return Ok(None);
+        }
+        let key = ObjectId(self.index.pack_sum);
+        if let Some(d) = slurped().get(&key).filter(|d| d.len() as u64 == self.size) {
             return Ok(Some(d));
         }
-        if self.size > SLURP_LIMIT || self.reads.fetch_add(1, Ordering::Relaxed) < SLURP_AFTER {
+        if self.reads.fetch_add(1, Ordering::Relaxed) < SLURP_AFTER {
             return Ok(None);
         }
         let all = backend.read(&self.path)?;
         if all.len() as u64 != self.size || all[all.len() - SUM_LEN..] != self.index.pack_sum[..] {
             return Err(corrupt(self.what(), "pack changed on disk"));
         }
-        Ok(Some(self.data.get_or_init(|| all)))
+        self.reads.store(0, Ordering::Relaxed);
+        let all = Arc::new(all);
+        slurped().insert(key, all.clone(), all.len());
+        Ok(Some(all))
     }
 
     fn read_entry(&self, backend: &dyn StorageBackend, i: usize) -> Result<Entry> {
         let len = usize::try_from(self.index.lens[i]).map_err(|_| corrupt(self.what(), "entry too large"))?;
         let offset = self.index.offsets[i];
         let ranged;
-        let raw: &[u8] = match self.whole(backend)? {
+        let whole = self.whole(backend)?;
+        let raw: &[u8] = match &whole {
             Some(all) => &all[offset as usize..offset as usize + len],
             None => {
                 ranged = backend.read_range(&self.path, offset, len)?;

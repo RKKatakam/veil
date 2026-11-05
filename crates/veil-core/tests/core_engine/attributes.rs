@@ -472,7 +472,7 @@ fn a_megabyte_of_patterns_slows_a_snapshot_little() {
         start.elapsed()
     };
     time(&mut repo, &mut cache);
-    let plain = (0..3).map(|_| time(&mut repo, &mut cache)).min().unwrap();
+    let plain = (0..5).map(|_| time(&mut repo, &mut cache)).min().unwrap();
     let mut ga = String::new();
     let mut i = 0;
     while ga.len() < attributes::MAX_FILE - 64 {
@@ -482,9 +482,12 @@ fn a_megabyte_of_patterns_slows_a_snapshot_little() {
     ga.push_str("*.e3 text\n");
     fs.write(&p(".gitattributes"), ga.as_bytes()).unwrap();
     time(&mut repo, &mut cache);
-    let with = (0..3).map(|_| time(&mut repo, &mut cache)).min().unwrap();
+    let with = (0..5).map(|_| time(&mut repo, &mut cache)).min().unwrap();
     eprintln!("20 000 files: {plain:?} without, {with:?} with a 1 MiB .gitattributes ({i} patterns)");
-    assert!(with.as_secs_f64() <= plain.as_secs_f64() * 1.2 + 0.05, "{plain:?} -> {with:?}");
+    // A loose bound (BUG-758: 1.2× failed under a loaded full suite). What
+    // it guards against is matching every file against every pattern:
+    // 20 000 files × tens of thousands of patterns, far slower than 2×.
+    assert!(with.as_secs_f64() <= plain.as_secs_f64() * 2.0 + 0.1, "{plain:?} -> {with:?}");
 }
 
 // ---- 11. an unreadable .gitattributes ---------------------------------------------------

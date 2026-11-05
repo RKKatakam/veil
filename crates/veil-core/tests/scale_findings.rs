@@ -38,7 +38,6 @@ fn noise(seed: u64, len: usize) -> Vec<u8> {
 /// 950 MB.
 #[test]
 #[cfg(target_os = "linux")]
-#[ignore = "BUG-800: pack slurping is bounded per pack, not per store: memory grows with the store"]
 fn reading_every_pack_does_not_hold_the_whole_store_in_memory() {
     const PACKS: usize = 4;
     const BLOBS: usize = 150;
