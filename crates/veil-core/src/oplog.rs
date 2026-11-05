@@ -637,6 +637,17 @@ pub struct MergedView {
 /// * A key removed on one side and changed on another keeps the change.
 /// * `remote_tags`: per key, as above.
 pub fn merge_views(base: &View, sides: &[&View], descends: &mut dyn FnMut(&ObjectId, &ObjectId) -> bool) -> MergedView {
+    merge_views_with(base, sides, false, descends)
+}
+
+/// [`merge_views`] where the first side wins every conflict, a removal
+/// included: an undo (a 3-way revert, the reverting side first) of a
+/// command that created a workspace or tag removes it again.
+pub fn revert_views(base: &View, revert: &View, current: &View, descends: &mut dyn FnMut(&ObjectId, &ObjectId) -> bool) -> MergedView {
+    merge_views_with(base, &[revert, current], true, descends)
+}
+
+fn merge_views_with(base: &View, sides: &[&View], first_wins: bool, descends: &mut dyn FnMut(&ObjectId, &ObjectId) -> bool) -> MergedView {
     let mut out = MergedView::default();
     let mut losers: Vec<ObjectId> = Vec::new();
     // Heads.
@@ -658,8 +669,8 @@ pub fn merge_views(base: &View, sides: &[&View], descends: &mut dyn FnMut(&Objec
     for name in names {
         let b = base.workspaces.get(name);
         let vals: Vec<Option<&WorkspaceState>> = sides.iter().map(|s| s.workspaces.get(name)).collect();
-        let Some((wc, lost)) = pick(b.map(|w| w.wc), vals.iter().map(|v| v.map(|w| w.wc)).collect()) else { continue };
-        let cloak = pick_cloak(b.map(|w| w.cloak.clone()), vals.iter().map(|v| v.map(|w| w.cloak.clone())).collect());
+        let Some((wc, lost)) = pick(b.map(|w| w.wc), vals.iter().map(|v| v.map(|w| w.wc)).collect(), first_wins) else { continue };
+        let cloak = pick_cloak(b.map(|w| w.cloak.clone()), vals.iter().map(|v| v.map(|w| w.cloak.clone())).collect(), first_wins);
         if !lost.is_empty() {
             out.warnings.push(format!(
                 "workspace '{name}' was moved by concurrent commands; kept {}, and the other working cop{} as visible change{}",
@@ -683,7 +694,7 @@ pub fn merge_views(base: &View, sides: &[&View], descends: &mut dyn FnMut(&Objec
         let b = base.tags.get(name);
         let vals: Vec<Option<&Tag>> = sides.iter().map(|s| s.tags.get(name)).collect();
         let unit = |t: &Tag| (t.target, t.annotation);
-        let Some((mut winner, lost)) = pick(b.map(unit), vals.iter().map(|v| v.map(unit)).collect()) else { continue };
+        let Some((mut winner, lost)) = pick(b.map(unit), vals.iter().map(|v| v.map(unit)).collect(), first_wins) else { continue };
         // Two moves of an ordinary tag: a target descending from the
         // other wins. A release tag (annotated) is immutable: the first.
         if winner.1.is_none() {
@@ -698,7 +709,7 @@ pub fn merge_views(base: &View, sides: &[&View], descends: &mut dyn FnMut(&Objec
             lost.push(first);
         }
         lost.retain(|t| *t != winner.0);
-        let cloak = pick_cloak(b.map(|t| t.cloak.clone()), vals.iter().map(|v| v.map(|t| t.cloak.clone())).collect()).unwrap_or_default();
+        let cloak = pick_cloak(b.map(|t| t.cloak.clone()), vals.iter().map(|v| v.map(|t| t.cloak.clone())).collect(), first_wins).unwrap_or_default();
         if !lost.is_empty() {
             let shown = match &cloak {
                 Some(_) => "a cloaked tag".to_string(),
@@ -723,7 +734,7 @@ pub fn merge_views(base: &View, sides: &[&View], descends: &mut dyn FnMut(&Objec
     let names: BTreeSet<&String> = base.remote_tags.keys().chain(sides.iter().flat_map(|s| s.remote_tags.keys())).collect();
     for name in names {
         let b = base.remote_tags.get(name).copied();
-        if let Some((t, _)) = pick(b, sides.iter().map(|s| s.remote_tags.get(name).copied()).collect()) {
+        if let Some((t, _)) = pick(b, sides.iter().map(|s| s.remote_tags.get(name).copied()).collect(), first_wins) {
             out.view.remote_tags.insert(name.clone(), t);
         }
     }
@@ -736,10 +747,13 @@ pub fn merge_views(base: &View, sides: &[&View], descends: &mut dyn FnMut(&Objec
 /// 3-way value of a key: the value of the first side that changed it (a
 /// removal loses to a change), with the other sides' changed values; `None`
 /// when the key is gone.
-fn pick<T: Copy + PartialEq>(base: Option<T>, sides: Vec<Option<T>>) -> Option<(T, Vec<T>)> {
+fn pick<T: Copy + PartialEq>(base: Option<T>, sides: Vec<Option<T>>, first_wins: bool) -> Option<(T, Vec<T>)> {
     let changed: Vec<Option<T>> = sides.iter().filter(|s| **s != base).copied().collect();
     if changed.is_empty() {
         return base.map(|b| (b, Vec::new()));
+    }
+    if first_wins && changed[0].is_none() {
+        return None;
     }
     let values: Vec<T> = changed.iter().flatten().copied().collect();
     let first = values.first().copied()?;
@@ -754,7 +768,12 @@ fn pick<T: Copy + PartialEq>(base: Option<T>, sides: Vec<Option<T>>) -> Option<(
 
 /// 3-way cloak: the first changed side's, except that a cloaked value wins
 /// over an uncloaked one (`None` when every side removed the key).
-fn pick_cloak(base: Option<Option<String>>, sides: Vec<Option<Option<String>>>) -> Option<Option<String>> {
+fn pick_cloak(base: Option<Option<String>>, sides: Vec<Option<Option<String>>>, first_wins: bool) -> Option<Option<String>> {
+    if first_wins {
+        if let Some(first) = sides.iter().find(|s| **s != base) {
+            return first.clone();
+        }
+    }
     let changed: Vec<Option<String>> = sides.iter().filter(|s| **s != base).flatten().cloned().collect();
     if changed.is_empty() {
         return base.or_else(|| sides.into_iter().flatten().next());

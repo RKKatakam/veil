@@ -162,8 +162,10 @@ fn run_case(c: &Case) {
             let backend: Arc<dyn veil_core::StorageBackend> = Arc::new(DiskBackend::new(&proj));
             let lock = RepoLock::acquire(backend).expect("lock");
             let o = child.wait().unwrap();
-            assert!(!o.success(), "{tag}: recording should have timed out");
-            assert!(survives(&env, &proj, out_path, &content), "{tag}: the output is gone after the lock timeout");
+            // Format 6: recording takes no repository lock (BUG-551 is
+            // gone): a held lock (`vl gc`, a key-ring change) delays nothing.
+            assert!(o.success(), "{tag}: recording waited for the repository lock ({o:?})");
+            assert_eq!(cat(&env, &proj, out_path).as_deref(), Some(content.as_str()), "{tag}: not recorded");
             drop(lock);
         }
         Failure::UnreadablePolicy | Failure::DeletedPolicy => {

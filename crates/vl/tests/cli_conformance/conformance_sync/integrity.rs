@@ -149,10 +149,9 @@ fn fsck_writes_nothing_even_with_unrecorded_edits() {
     let proj = repo_with_history(&env);
     write(&proj, "a.txt", "unrecorded\n");
     let before = listing(&proj.join(".veil"));
-    let head = std::fs::read(proj.join(".veil/op_head")).unwrap();
     env.ok("alice", &proj, &["fsck"]);
+    // The listing includes the operation heads (`op_heads/`).
     assert_eq!(listing(&proj.join(".veil")), before);
-    assert_eq!(std::fs::read(proj.join(".veil/op_head")).unwrap(), head);
 }
 
 // Scenario from git t1450-fsck.sh: "fsck reports dangling objects" (not an error).

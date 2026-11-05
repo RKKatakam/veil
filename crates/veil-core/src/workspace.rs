@@ -1159,7 +1159,7 @@ impl Repo {
             Restore::Revert { base, revert } => {
                 // The reverting side first: it wins what both changed.
                 let mut descends = |a: &ObjectId, b: &ObjectId| tx.repo().is_ancestor(b, a).unwrap_or(false);
-                let merged = crate::oplog::merge_views(&base, &[&revert, &current], &mut descends);
+                let merged = crate::oplog::revert_views(&base, &revert, &current, &mut descends);
                 (merged.view, Some(revert.heads))
             }
         };

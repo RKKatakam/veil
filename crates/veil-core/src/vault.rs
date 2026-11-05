@@ -186,7 +186,8 @@ impl Repo {
         // A backup whose file is still there (no longer local-only, say) is
         // not the last copy; one whose file is gone is kept for a while.
         let mut gone = std::collections::HashSet::new();
-        if let Stored::Open(v) = self.vault_read(&self.local_key()?)? {
+        let read = self.vault_read(&self.local_key()?)?;
+        if let Stored::Open(v) = &read {
             for p in v.files.keys().filter(|p| !keep.contains(p.as_str())) {
                 let vanished = match VPath::new(p) {
                     Ok(vp) => !fs.exists(&vp)?,
@@ -198,7 +199,7 @@ impl Repo {
             }
         }
         let now = crate::now_millis();
-        let res = self.vault_update(|vault| {
+        let apply = |vault: &mut VaultData| {
             let before = vault.clone();
             let dropped: Vec<(String, String)> = std::mem::take(&mut vault.files)
                 .into_iter()
@@ -217,9 +218,22 @@ impl Repo {
                 }
             }
             vault.removed.retain(|p, r| !keep.contains(p.as_str()) && now - r.removed_at < REMOVED_RETENTION_MS);
-            vault.files.extend(contents);
-            Ok(*vault != before)
-        });
+            vault.files.extend(contents.clone());
+            *vault != before
+        };
+        // Every command snapshots, so this runs every time: the lock (a
+        // read-modify-write of the vault) is only taken when the backup
+        // changes. The vault is replaced atomically, so reading it without
+        // the lock sees one version or the other.
+        let unchanged = match &read {
+            Stored::Open(v) => !apply(&mut v.clone()),
+            Stored::Absent => !apply(&mut VaultData::default()),
+            Stored::Unreadable => return Ok(false),
+        };
+        if unchanged {
+            return Ok(false);
+        }
+        let res = self.vault_update(|vault| Ok(apply(vault)));
         match res {
             Err(_) if self.vault_unreadable()? => Ok(false),
             r => r,

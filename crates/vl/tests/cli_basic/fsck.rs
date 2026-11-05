@@ -65,11 +65,16 @@ fn fsck_passes_on_a_healthy_repository_and_writes_nothing() {
     let (_tmp, home, repo) = setup();
     std::fs::write(repo.join("a.txt"), "unsnapshotted edit\n").unwrap();
     let before = objects(&repo);
-    let head = std::fs::read(repo.join(".veil/op_head")).unwrap();
+    let heads = || {
+        let mut v: Vec<String> = std::fs::read_dir(repo.join(".veil/op_heads")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    };
+    let head = heads();
     let out = ok(&home, &repo, &["fsck"]);
     assert!(out.contains("No corruption found"), "{out}");
     assert_eq!(objects(&repo), before, "fsck does not snapshot");
-    assert_eq!(std::fs::read(repo.join(".veil/op_head")).unwrap(), head);
+    assert_eq!(heads(), head);
 }
 
 #[test]

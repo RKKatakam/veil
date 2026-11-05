@@ -667,7 +667,8 @@ fn upgrade_dry_run_writes_nothing() {
     assert!(r.corrupt.is_empty(), "{:?}", r.corrupt);
     assert!(r.trees_json > 0);
     assert!(r.steps.contains(&"set-format".to_string()), "{:?}", r.steps);
-    assert_eq!(r.steps.last().map(String::as_str), Some("3:hpke-ring-keys"));
+    assert!(r.steps.contains(&"3:hpke-ring-keys".to_string()), "{:?}", r.steps);
+    assert_eq!(r.steps.last().map(String::as_str), Some("6:remove-op-head"));
     assert_eq!(veil_files(&root), before, "a dry run changed .veil/");
 }
 
@@ -690,7 +691,7 @@ fn upgrade_keeps_ids_and_switches_new_trees_to_binary() {
     assert!(!fx.root.join("alice").join(JOURNAL_PATH).exists());
     let cfg = read_config(&*fx.backend("alice")).unwrap();
     assert_eq!(cfg.format, REPO_FORMAT);
-    assert_eq!(cfg.min_vl.as_deref(), Some("1.0.0"));
+    assert_eq!(cfg.min_vl.as_deref(), Some(veil_core::repo::min_vl_for_format(REPO_FORMAT)));
 
     let mut repo = fx.open("alice", Some("alice"));
     assert_eq!(repo.view(), &old_view, "upgrade changed the view");
@@ -1735,7 +1736,7 @@ fn upgrade_4_to_5_rewrites_nothing() {
     let before_objects: Vec<ObjectId> = fx.open("alice", Some("alice")).store().list_objects().unwrap();
     let before_view = fx.open("alice", Some("alice")).view().clone();
     let ops_before: Vec<(PathBuf, Vec<u8>)> = veil_files(&alice_dir).into_iter().filter(|(p, _)| p.to_string_lossy().contains("/.veil/ops/")).collect();
-    let r = upgrade(fx.backend("alice"), Some(fx.identity("alice")), &UpgradeOptions::default()).unwrap();
+    let r = upgrade(fx.backend("alice"), Some(fx.identity("alice")), &UpgradeOptions { to: 5, ..Default::default() }).unwrap();
     assert_eq!((r.from, r.to), (4, 5));
     assert!(r.notes.iter().any(|n| n.contains("symlinks")), "{:#?}", r.notes);
     let repo = fx.open("alice", Some("alice"));
