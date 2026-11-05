@@ -16,6 +16,7 @@ mod sftp_support;
 mod adversarial3_sftp;
 mod leak_helper;
 mod push_plan;
+mod push_two_phase;
 mod remote_init_race;
 mod remote_lock;
 mod sftp_backend;

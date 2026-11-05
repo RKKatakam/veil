@@ -147,21 +147,28 @@ pub fn backend_contains(backend: &dyn StorageBackend, needle: &[u8]) -> Vec<Stri
     hits
 }
 
-/// `(label, decoded bytes)` of every object in every pack on `backend`.
+/// `(label, decoded bytes)` of every object in every pack on `backend`:
+/// published ones (`objects/pack/`) and staged ones (the push staging
+/// directories `objects/incoming/*/`), which a raw reader of the remote can
+/// read too.
 pub fn packed_objects(backend: &dyn StorageBackend) -> Vec<(String, Vec<u8>)> {
     use veil_core::{cache::LruCache, pack};
-    let dir = VPath::new(".veil/objects/pack").unwrap();
-    let Ok(entries) = backend.list_dir(&dir) else {
-        return Vec::new();
-    };
+    let mut dirs = vec![VPath::new(".veil/objects/pack").unwrap()];
+    let incoming = VPath::new(".veil/objects/incoming").unwrap();
+    if let Ok(staged) = backend.list_dir(&incoming) {
+        dirs.extend(staged.into_iter().filter(|e| e.kind == veil_core::vfs::NodeKind::Dir).map(|e| incoming.join(&e.name)));
+    }
     let bases = LruCache::new(64 << 20);
     let mut out = Vec::new();
-    for e in entries {
-        let Some(name) = pack::name_from_index_file(&e.name) else { continue };
-        let p = pack::Pack::open(backend, &dir, name).unwrap();
-        for id in p.index().ids() {
-            let raw = p.get(backend, id, &bases).unwrap().expect("indexed object is in its pack");
-            out.push((format!("{}#{}", dir.join(&e.name), id.short()), raw));
+    for dir in dirs {
+        let Ok(entries) = backend.list_dir(&dir) else { continue };
+        for e in entries {
+            let Some(name) = pack::name_from_index_file(&e.name) else { continue };
+            let p = pack::Pack::open(backend, &dir, name).unwrap();
+            for id in p.index().ids() {
+                let raw = p.get(backend, id, &bases).unwrap().expect("indexed object is in its pack");
+                out.push((format!("{}#{}", dir.join(&e.name), id.short()), raw));
+            }
         }
     }
     out
