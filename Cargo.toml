@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/veil-core", "crates/vl"]
+members = ["crates/veil-core", "crates/vl", "crates/veil-bench"]
+# The scale benchmark (crates/veil-bench) builds only when asked for
+# (`-p veil-bench` or `--workspace`): `cargo test --all-targets` skips it.
+default-members = ["crates/veil-core", "crates/vl"]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,0 +1,21 @@
+[package]
+name = "veil-bench"
+description = "Scale benchmark harness for Veil (not published; not a default workspace member)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[[bin]]
+name = "veil-bench"
+path = "src/main.rs"
+
+[dependencies]
+veil-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+libc.workspace = true
+serde_json.workspace = true

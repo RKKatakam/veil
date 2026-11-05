@@ -19,8 +19,9 @@ fixed**. Severity: high / medium / low.
 - **Copy-on-write file clones for project-directory checkouts** (`vl ws
   switch`, `vl edit`): `ws exec` sandboxes clone already
   (`StorageBackend::clone_known`); the project directory does not.
-- **Scale benchmark** at 1 GB and ~5 GB (init, status, commit, gc, push,
-  clone, peak RAM), then fix what it exposes:
+- **Fix what the scale benchmark exposes** (the harness is built:
+  `scripts/bench-scale.sh`; the 1 GB baseline and its ranked offenders are
+  in `docs/design/scale/BASELINE.md`; the ~5 GB run is still to do):
   - streaming / incremental `gc` (no whole-store pack in memory);
   - streaming pull (packs written to disk, not held in RAM);
   - streaming large-file read/hash/seal (no whole file in memory);
