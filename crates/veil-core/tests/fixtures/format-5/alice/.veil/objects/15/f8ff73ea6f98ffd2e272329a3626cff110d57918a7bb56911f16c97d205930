@@ -1,0 +1,2 @@
+veil:atag
+{"name":"v5.0","target":"6734f8b6bfef5782072d1926cc99739d35fb2689af957c023cb38984753e8d1f","kind":"annotated","message":{"plain":"Release 5.0: links\n"},"tagger":"alice","timestamp":1793851012102,"signature":{"signer":"veil16b8028cb129a2e28bdc3667481aa2db6c434b1f3aaa4cdc91c90c5592eaa0070","key":"5243ae09e7ce1d9c0c79c0896f8b34ac50a386cad6f3c968666bd06beb57f090","sig":"be7828fec317770d467f841e26529498de1bc713776e35259b44e26e3a1ef3c0b2c41b9ddc126902d9403cd2c9bda65d7adc540519fa58ccd511e3ae19102b03"}}

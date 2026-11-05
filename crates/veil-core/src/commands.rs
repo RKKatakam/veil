@@ -327,8 +327,8 @@ impl Repo {
     ///
     /// * on a **cloaked line** (the workspace, or the change itself, is
     ///   cloaked under scope `S`), only tags cloaked under `S` move. An
-    ///   uncloaked tag such as `main` stays: it is what public remotes and
-    ///   Git receive, and cloaked work reaches it only through an explicit
+    ///   uncloaked tag such as `main` stays: it is what public remotes
+    ///   receive, and cloaked work reaches it only through an explicit
     ///   `vl merge` (which publishes it after a secret scan, or embargoes
     ///   it) or `vl tag set`;
     /// * with `advance == false` (`vl commit --no-advance`), no tag moves.
@@ -1011,14 +1011,14 @@ impl Repo {
                     }
                     if !spec.force {
                         return Err(VeilError::repo(format!(
-                            "tag '{name}' is an annotated release tag, and release tags are immutable; replace it with                              `vl tag set {name} --force` (a Git remote that has it keeps its copy unless you push with                              `--force-tags`), or delete it first with `vl tag delete {name}`"
+                            "tag '{name}' is an annotated release tag, and release tags are immutable; replace it with                              `vl tag set {name} --force`, or delete it first with `vl tag delete {name}`"
                         )));
                     }
                     old_annotation = Some(a);
                 }
                 None if spec.annotate.is_some() && !spec.force => {
                     return Err(VeilError::repo(format!(
-                        "tag '{name}' already exists as a plain tag (a branch in Git); make it an annotated release tag                          with --force, or pick another name"
+                        "tag '{name}' already exists as a plain tag; make it an annotated release tag                          with --force, or pick another name"
                     )));
                 }
                 None => {}
@@ -1079,8 +1079,7 @@ impl Repo {
     /// The annotation of tag `name` and what its signature proves, or
     /// `None` for a plain tag (`vl tag verify`, `vl tag list`). `verified`
     /// is true only for a valid Veil signature by a key some ring of this
-    /// repository registers for the member it names; a Git signature kept
-    /// from an import never counts.
+    /// repository registers for the member it names.
     pub fn tag_annotation(&self, name: &str) -> Result<Option<TagCheck>> {
         let t = self
             .view
@@ -1135,7 +1134,7 @@ impl Repo {
     /// Release embargo `id`, recorded as the operation `release embargo
     /// <id>`. The release is **staged** ([`Keychain::stage_release`]): this
     /// repository treats the embargo as released at once, and the key
-    /// reaches the synced record with the next push or Git export. Until
+    /// reaches the synced record with the next push. Until
     /// then `vl undo` takes the release back completely; afterwards it
     /// cannot be undone (BUG-109).
     ///
@@ -1169,7 +1168,7 @@ impl Repo {
         };
         match self.keys().release_state(id) {
             ReleaseState::Released => Err(VeilError::Policy(format!(
-                "cannot undo `{description}`: the embargo key has been published (pushed, exported to Git, or received from a remote), and a published key cannot be taken back. Nothing was changed. Treat the fix as public"
+                "cannot undo `{description}`: the embargo key has been published (pushed, or received from a remote), and a published key cannot be taken back. Nothing was changed. Treat the fix as public"
             ))),
             ReleaseState::Staged => Ok(Some(id.to_string())),
             ReleaseState::Unreleased | ReleaseState::Rejected(_) => Ok(None),

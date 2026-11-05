@@ -247,7 +247,7 @@ fn policy_check_names_the_matching_rule() {
 
 // Scenario from git t0008-ignores.sh "sub-directory local ignore": Veil
 // reads one policy, at the root; a `.veilpolicy` deeper down is an
-// ordinary file (a deliberate difference from per-directory .gitignore).
+// ordinary file (a deliberate difference from Git's per-directory ignores).
 #[test]
 fn a_policy_file_in_a_subdirectory_is_an_ordinary_file() {
     let env = Env::new();

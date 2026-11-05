@@ -30,22 +30,21 @@ release still opens, reads, verifies, `fsck`s, upgrades and syncs it.
   line of `vl identity show` (the identity binding made it longer than the
   128 digits the earlier script expected).
 
-* `format-5/`: the release that introduced the Git-parity format
-  (symlinks, gitlinks, annotated tags, the colocated marker), generated
-  with `VEIL_FIXTURE_EXTRAS=<core_format test binary> generate.sh
-  target/debug/vl …/format-5 …/format-4` (a debug build of the same
-  sources; `cargo test -p veil-core --test core_format --no-run` prints
-  the binary). No CLI writes links or annotated tags yet, so
-  `generate.sh` has the `write_format_5_extras` test of `format_compat.rs`
-  add them through the engine before the embargo, the cloaked tag and the
-  pushes: the tag `links` (`links/readme` → `../README.md`, `links/words`
-  → an absolute target, `secrets/current` → a target sealed for `team`,
-  the gitlinks `vendor/sdk` and `secrets/private-sdk`, the latter sealed),
-  `link-conflict` (a link/file conflict at `links/both`), and annotated
-  tags on `links`: `v5.0` (signed by alice), `team-release` (cloaked, its
-  message sealed, signed), `imported` (a lightweight Git tag, also the
-  remote release tag `github/imported`). `upgraded/` is format-4's
-  `alice/` after `vl upgrade` (4 → 5).
+* `format-5/`: the release that introduced format 5 (symlinks and
+  annotated tags), generated with `VEIL_FIXTURE_EXTRAS=<core_format test
+  binary> generate.sh target/debug/vl …/format-5 …/format-4` (a debug
+  build of the same sources; `cargo test -p veil-core --test core_format
+  --no-run` prints the binary). No CLI writes links or annotated tags yet,
+  so `generate.sh` has the `write_format_5_extras` test of
+  `format_compat.rs` add them through the engine before the embargo, the
+  cloaked tag and the pushes: the tag `links` (`links/readme` →
+  `../README.md`, `links/words` → an absolute target, `secrets/current` →
+  a target sealed for `team`), `link-conflict` (a link/file conflict at
+  `links/both`), and annotated tags on `links`: `v5.0` (signed by alice)
+  and `team-release` (cloaked, its message sealed, signed). `upgraded/` is
+  format-4's `alice/` after `vl upgrade` (4 → 5). Regenerated once, before
+  release, when Git interop was removed (2026-11-05): the first set also
+  held Git-only data that format 5 no longer has.
 
 `encodings.txt` pins the bytes of every object encoding. Append to it (with
 `VEIL_BLESS_ENCODINGS=1`) only together with a new format; see

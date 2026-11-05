@@ -24,11 +24,10 @@
 # From format 4 on, alice/ also holds a merge with conflict entries (tag
 # `conflicted`): a cloaked file's conflict left unresolved, a public one
 # resolved with `vl resolve`.
-# From format 5 on, alice/ also holds symlinks and gitlinks (public and
-# sealed), a link/file conflict and annotated tags (signed, cloaked with a
-# sealed message, an imported lightweight Git tag): tags `links`,
-# `link-conflict`, `v5.0`, `team-release`, `imported`. They are written
-# through the engine by the `write_format_5_extras` test of
+# From format 5 on, alice/ also holds symlinks (public and sealed), a
+# link/file conflict and annotated tags (signed, and cloaked with a sealed
+# message): tags `links`, `link-conflict`, `v5.0`, `team-release`. They are
+# written through the engine by the `write_format_5_extras` test of
 # tests/core_format/format_compat.rs: set VEIL_FIXTURE_EXTRAS to that test
 # binary (`cargo test -p veil-core --test core_format --no-run` prints it).
 #
@@ -134,7 +133,7 @@ if "$VL" resolve --help >/dev/null 2>&1; then
     as alice new main >/dev/null
 fi
 
-# Format 5 on: links, gitlinks and annotated tags (see the header).
+# Format 5 on: links and annotated tags (see the header).
 if [ "$("$VL" --version | sed -n 's/^repository format: //p')" -ge 5 ]; then
     : "${VEIL_FIXTURE_EXTRAS:?set VEIL_FIXTURE_EXTRAS to the core_format test binary}"
     VEIL_FIXTURE_DIR="$OUT" "$VEIL_FIXTURE_EXTRAS" --ignored --exact format_compat::write_format_5_extras >/dev/null

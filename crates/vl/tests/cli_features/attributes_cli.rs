@@ -1,9 +1,9 @@
 //! Feature 7 through the real `vl` binary: `vl attr check`, `vl
 //! renormalize` (explicit, undoable), device-local diff and merge drivers
-//! (a teammate's content never defines a command), textconv in `vl diff`
-//! but never in `vl format-patch`, and the Git export with `eol=crlf`
-//! (threat review of `docs/design/git-parity/7-attributes-line-endings.md`,
-//! points 5, 7 and 8; the engine side is in
+//! (a teammate's content never defines a command) and textconv in `vl
+//! diff` (threat review of
+//! `docs/design/git-parity/7-attributes-line-endings.md`, points 5 and 7;
+//! the engine side is in
 //! `crates/veil-core/tests/core_engine/attributes.rs`).
 
 use crate::adversarial_support;
@@ -11,30 +11,12 @@ use crate::adversarial_support;
 use std::{
     io::Write,
     path::Path,
-    process::{Command, Stdio},
+    process::Stdio,
 };
 
 use adversarial_support::*;
 
 const U: &str = "alice";
-
-fn git(dir: &Path, args: &[&str]) -> Vec<u8> {
-    let out = Command::new("git")
-        .current_dir(dir)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("HOME", dir)
-        .env("GIT_AUTHOR_NAME", "Gita Hub")
-        .env("GIT_AUTHOR_EMAIL", "gita@example.com")
-        .env("GIT_COMMITTER_NAME", "Gita Hub")
-        .env("GIT_COMMITTER_EMAIL", "gita@example.com")
-        .args(["-c", "init.defaultBranch=main", "-c", "commit.gpgsign=false", "-c", "core.autocrlf=false"])
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-    out.stdout
-}
 
 fn write_bytes(dir: &Path, rel: &str, data: &[u8]) {
     let p = dir.join(rel);
@@ -70,8 +52,8 @@ fn attr_check_shows_attributes_effects_and_what_is_not_supported() {
         U,
         "proj",
         &[
-            (".gitattributes", "* text=auto\n*.bat eol=crlf\n*.png binary\n*.bin filter=lfs diff=lfs merge=lfs -text\n"),
-            ("docs/.gitattributes", "*.md linguist-documentation export-ignore\n"),
+            (".veilattributes", "* text=auto\n*.bat eol=crlf\n*.png binary\n*.bin filter=lfs diff=lfs merge=lfs -text\n"),
+            ("docs/.veilattributes", "*.md linguist-documentation export-ignore\n"),
             ("README", "hi\n"),
         ],
     );
@@ -109,13 +91,13 @@ fn renormalize_is_explicit_and_undone_by_undo() {
     write_bytes(&proj, "mixed.txt", b"x\r\ny\n");
     env.ok(U, &proj, &["commit", "-m", "crlf"]);
     // The attributes change: nothing is re-recorded, status says so.
-    write(&proj, ".gitattributes", "*.txt text\n");
+    write(&proj, ".veilattributes", "*.txt text\n");
     let st = env.stdout(U, &proj, &["status"]);
     assert!(st.contains("2 file(s) would change line endings") && st.contains("vl renormalize"), "{st}");
     let js: serde_json::Value = serde_json::from_str(&env.stdout(U, &proj, &["status", "--json"])).unwrap();
     assert_eq!(js["renormalizable"], serde_json::json!(["a.txt", "b.txt"]));
     let changes: Vec<&str> = js["changes"].as_array().unwrap().iter().map(|c| c["path"].as_str().unwrap()).collect();
-    assert_eq!(changes, vec![".gitattributes"], "only the attributes file changed");
+    assert_eq!(changes, vec![".veilattributes"], "only the attributes file changed");
     // Renormalize one path, then the rest.
     let out = env.ok(U, &proj, &["renormalize", "a.txt"]);
     assert!(out.contains("Renormalized a.txt") && !out.contains("b.txt"), "{out}");
@@ -139,7 +121,7 @@ fn renormalize_is_explicit_and_undone_by_undo() {
 #[test]
 fn a_lossy_conversion_warns_and_records_the_bytes() {
     let env = Env::new();
-    let proj = env.project(U, "proj", &[(".gitattributes", "* text\n")]);
+    let proj = env.project(U, "proj", &[(".veilattributes", "* text\n")]);
     write_bytes(&proj, "m.txt", b"a\r\nb\nc\r\n");
     let out = env.ok(U, &proj, &["status"]);
     assert!(out.contains("m.txt: its line endings are mixed (CRLF and LF); recorded unchanged"), "{out}");
@@ -161,7 +143,7 @@ fn a_teammates_attributes_and_config_never_run_a_command() {
         U,
         "proj",
         &[
-            (".gitattributes", "* merge=pwn diff=pwn\n"),
+            (".veilattributes", "* merge=pwn diff=pwn\n"),
             ("config.toml", &cfg),
             (".veil.toml", &cfg),
             ("veil/local/config.toml", &cfg),
@@ -179,7 +161,7 @@ fn a_teammates_attributes_and_config_never_run_a_command() {
 #[test]
 fn a_device_local_merge_driver_runs_confined() {
     let env = Env::new();
-    let proj = env.project(U, "proj", &[(".gitattributes", "a.txt merge=both\n"), ("a.txt", "one\ntwo\nthree\n")]);
+    let proj = env.project(U, "proj", &[(".veilattributes", "a.txt merge=both\n"), ("a.txt", "one\ntwo\nthree\n")]);
     write(
         &proj,
         ".veil/local/config.toml",
@@ -200,7 +182,7 @@ fn a_device_local_merge_driver_runs_confined() {
 fn a_driver_program_inside_the_project_never_runs() {
     let env = Env::new();
     let marker = env.root.join("RAN");
-    let proj = env.project(U, "proj", &[(".gitattributes", "a.txt merge=mine\n"), ("a.txt", "one\ntwo\nthree\n")]);
+    let proj = env.project(U, "proj", &[(".veilattributes", "a.txt merge=mine\n"), ("a.txt", "one\ntwo\nthree\n")]);
     let script = proj.join("tools/merge.sh");
     write(&proj, "tools/merge.sh", &format!("#!/bin/sh\ntouch {}\n", marker.display()));
     #[cfg(unix)]
@@ -214,12 +196,12 @@ fn a_driver_program_inside_the_project_never_runs() {
     assert!(!marker.exists());
 }
 
-// ---- textconv: in `vl diff`, never in `vl format-patch` -----------------------------------
+// ---- textconv: in `vl diff` -----------------------------------------------------------------
 
 #[test]
-fn textconv_shapes_vl_diff_but_never_a_patch() {
+fn textconv_shapes_vl_diff() {
     let env = Env::new();
-    let proj = env.project(U, "proj", &[(".gitattributes", "*.txt diff=up\nblob.dat -diff\n"), ("a.txt", "hello\n"), ("blob.dat", "v1\n")]);
+    let proj = env.project(U, "proj", &[(".veilattributes", "*.txt diff=up\nblob.dat -diff\n"), ("a.txt", "hello\n"), ("blob.dat", "v1\n")]);
     write(&proj, ".veil/local/config.toml", "[diff.up]\ntextconv = [\"tr\", \"a-z\", \"A-Z\"]\n");
     write(&proj, "a.txt", "hello\nworld\n");
     write(&proj, "blob.dat", "v2\n");
@@ -231,82 +213,14 @@ fn textconv_shapes_vl_diff_but_never_a_patch() {
     let json: serde_json::Value = serde_json::from_str(&env.stdout(U, &proj, &["diff", "-r", "@-", "--json"])).unwrap();
     let blob = json["files"].as_array().unwrap().iter().find(|f| f["path"] == "blob.dat").unwrap();
     assert_eq!(blob["content"]["binary"], true);
-    let patch = env.stdout(U, &proj, &["format-patch", "@-", "--stdout"]);
-    assert!(patch.contains("+world") && !patch.contains("WORLD"), "never a textconv: {patch}");
-    assert!(patch.contains("Binary files a/blob.dat and b/blob.dat differ"), "{patch}");
-    // The same as `git format-patch` of the Git export.
-    let bare = env.root.join("github.git");
-    git(&env.root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
-    env.ok(U, &proj, &["git", "remote", "add", "origin", bare.to_str().unwrap()]);
-    env.ok(U, &proj, &["git", "push"]);
-    let clone = env.root.join("clone");
-    git(&env.root, &["clone", "-q", bare.to_str().unwrap(), clone.to_str().unwrap()]);
-    let gp = String::from_utf8(git(&clone, &["format-patch", "-1", "--stdout", "--full-index", "--no-renames", "--no-binary", "main"])).unwrap();
-    let body = |s: &str| -> Vec<String> {
-        s.lines()
-            .skip_while(|l| !l.starts_with("diff --git"))
-            .take_while(|l| *l != "-- ")
-            .map(str::to_string)
-            .collect()
-    };
-    assert_eq!(body(&patch), body(&gp), "\n--- vl:\n{patch}\n--- git:\n{gp}");
-}
-
-// ---- the Git export -----------------------------------------------------------------------
-
-#[test]
-fn an_eol_crlf_export_is_clean_in_a_git_clone() {
-    let env = Env::new();
-    let proj = env.dir("proj");
-    env.ok(U, &proj, &["init"]);
-    write(&proj, ".gitattributes", "*.txt text eol=crlf\n");
-    write_bytes(&proj, "a.txt", b"one\r\ntwo\r\n");
-    write_bytes(&proj, "old.dat", b"kept\r\nas is\r\n");
-    env.ok(U, &proj, &["commit", "-m", "first"]);
-    env.ok(U, &proj, &["tag", "set", "main", "-r", "@-"]);
-    assert_eq!(env.stdout(U, &proj, &["cat", "a.txt"]), "one\ntwo\n");
-    let bare = env.root.join("github.git");
-    git(&env.root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
-    env.ok(U, &proj, &["git", "remote", "add", "origin", bare.to_str().unwrap()]);
-    env.ok(U, &proj, &["git", "push"]);
-    let clone = env.root.join("clone");
-    git(&env.root, &["clone", "-q", bare.to_str().unwrap(), clone.to_str().unwrap()]);
-    // The blobs are the recorded bytes (export never converts) …
-    assert_eq!(git(&clone, &["cat-file", "blob", "HEAD:a.txt"]), b"one\ntwo\n");
-    assert_eq!(git(&clone, &["cat-file", "blob", "HEAD:old.dat"]), b"kept\r\nas is\r\n");
-    // … Git converts them as Veil does, and sees no change.
-    assert_eq!(std::fs::read(clone.join("a.txt")).unwrap(), b"one\r\ntwo\r\n");
-    assert!(git(&clone, &["status", "--porcelain"]).is_empty());
 }
 
 // ---- confidentiality ----------------------------------------------------------------------
 
 #[test]
-fn a_sealed_gitattributes_never_shapes_or_reaches_a_public_patch() {
-    let env = Env::new();
-    let proj = env.project(U, "proj", &[("a.txt", "hello\n")]);
-    env.ok(U, &proj, &["cloak", ".gitattributes"]);
-    write(&proj, ".gitattributes", "a.txt -diff merge=SEALED-DRIVER-7781\n");
-    env.ok(U, &proj, &["commit", "-m", "attrs"]);
-    write(&proj, "a.txt", "hello\nworld\n");
-    env.ok(U, &proj, &["commit", "-m", "edit"]);
-    // Alice (a member) sees her attributes.
-    assert!(env.stdout(U, &proj, &["diff", "-r", "@-"]).contains("binary content differs"));
-    // The public patch is the projection's: no sealed attribute decides
-    // how it looks, and none of its text is in it.
-    let patch = env.stdout(U, &proj, &["format-patch", "@-", "--stdout"]);
-    assert!(patch.contains("+world"), "{patch}");
-    assert!(!patch.contains("SEALED-DRIVER-7781") && !patch.contains("-diff"), "{patch}");
-    // Nor any JSON a public reader gets: `vl attr check --json` reads the
-    // member's own working copy only.
-    let out = env.ok(U, &proj, &["format-patch", "::@-", "--stdout"]);
-    assert!(!out.contains("SEALED-DRIVER-7781"), "{out}");
-}
-
-#[test]
 fn hostile_driver_configuration_is_reported_and_ignored() {
     let env = Env::new();
-    let proj = env.project(U, "proj", &[(".gitattributes", "*.txt diff=x merge=y\n"), ("a.txt", "hi\n")]);
+    let proj = env.project(U, "proj", &[(".veilattributes", "*.txt diff=x merge=y\n"), ("a.txt", "hi\n")]);
     for cfg in [
         "[merge.y]\ncommand = \"not an array\"\n",
         "[merge.y]\ncommand = []\n[diff.x]\ntextconv = [1, 2]\n",
@@ -328,22 +242,4 @@ fn hostile_driver_configuration_is_reported_and_ignored() {
     std::os::unix::fs::symlink("/etc/passwd", proj.join(".veil/local/config.toml")).unwrap();
     let out = env.ok(U, &proj, &["attr", "check", "a.txt"]);
     assert!(out.contains("not a regular file"), "{out}");
-}
-
-#[test]
-fn a_renamed_no_diff_file_is_binary_in_a_patch_and_a_link_never_is() {
-    let env = Env::new();
-    let body: String = (0..12).map(|i| format!("row {i} of the data file\n")).collect();
-    let proj = env.project(U, "proj", &[(".gitattributes", "*.dat -diff\n* -diff\n"), ("a.dat", &body)]);
-    std::fs::rename(proj.join("a.dat"), proj.join("b.dat")).unwrap();
-    std::fs::write(proj.join("b.dat"), format!("{body}one more\n")).unwrap();
-    #[cfg(unix)]
-    std::os::unix::fs::symlink("b.dat", proj.join("link")).unwrap();
-    env.ok(U, &proj, &["commit", "-m", "move"]);
-    let patch = env.stdout(U, &proj, &["format-patch", "@-", "-M", "--stdout"]);
-    assert!(patch.contains("rename from a.dat") && patch.contains("rename to b.dat"), "{patch}");
-    assert!(patch.contains("Binary files a/a.dat and b/b.dat differ"), "{patch}");
-    // `* -diff` covers the symlink too, but only regular files are binary.
-    #[cfg(unix)]
-    assert!(!patch.contains("Binary files /dev/null and b/link differ") && patch.contains("+b.dat"), "{patch}");
 }

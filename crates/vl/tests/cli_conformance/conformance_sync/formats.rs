@@ -116,33 +116,6 @@ fn old_format_public_mirrors_hold_no_cloaked_plaintext() {
     }
 }
 
-// Veil: the Git bridge on a format-1 repository exports only the public view.
-#[test]
-fn git_push_from_a_format_1_repository_exports_the_public_view() {
-    let env = Env::new();
-    let root = fx(&env, 1);
-    let alice = root.join("alice");
-    let home = root.join("home-alice");
-    let bare = env.path("gh.git");
-    git(&env.root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
-    let out = vl_home(
-        &env,
-        &home,
-        &alice,
-        &["git", "remote", "add", "gh", bare.to_str().unwrap()],
-    );
-    assert!(out.status.success(), "{}", text(&out));
-    let out = vl_home(&env, &home, &alice, &["git", "push", "gh"]);
-    assert!(exited_cleanly(&out), "{}", text(&out));
-    assert!(
-        git_ok(&bare, &["rev-parse", "--verify", "-q", "refs/heads/main"]),
-        "{}",
-        text(&out)
-    );
-    assert_absent_in_git(&bare, "team-only notes", "format-1 export");
-    assert_eq!(repo_format(&alice), 1, "exporting does not upgrade");
-}
-
 // Veil: a remote written by a newer vl (unknown format) is refused by clone, pull and push,
 // and nothing is written to it.
 #[test]

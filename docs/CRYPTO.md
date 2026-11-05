@@ -251,7 +251,7 @@ against the ring log (ARCHITECTURE §3).
   32-byte *unsigned id* of the atag: the BLAKE3 id of its canonical
   encoding (`veil:atag\n` ‖ JSON) with `signature` omitted, as for
   snapshots. It therefore covers the tag's name, target, kind, message (as
-  stored: the ciphertext of a sealed one), tagger, time and Git payload.
+  stored: the ciphertext of a sealed one), tagger and time.
   Goals: a signature cannot be moved to another tag name or target (the
   atag changes, the signature fails), and a view entry that names a
   genuine atag under another name or target is reported as "unverified
@@ -262,8 +262,7 @@ against the ring log (ARCHITECTURE §3).
   needs the key to be a member's in the ring, which the caller checks. An
   older atag of the same name and target, signed then, stays valid: a
   release tag is immutable, so replaying it restores what the signer
-  signed. A Git tag's own GPG or SSH signature, kept verbatim in
-  `git.raw`, is never verified by Veil and never reported as verified.
+  signed.
 
 ### C6. Ring log hash chain and genesis proof (all) — custom, kept
 
@@ -323,7 +322,7 @@ against the ring log (ARCHITECTURE §3).
   release`) does not write the record. It stores the signed release fields
   in device-local state (`.veil/local/releases/<id>.json`), which no sync
   or remote reads, and which only the identity that signed it honours. The
-  next push or Git export copies them into the record before the record is
+  next push copies them into the record before the record is
   synced (`Keychain::publish_staged_releases`). So until then the key has
   not left the repository through vl, and `vl undo` deletes the staged
   release outright. After it, undo refuses: a published key cannot be
@@ -354,12 +353,6 @@ Object ids are unkeyed `BLAKE3(encoding)` (content addressing). Pack and
 index trailers, the stat cache and the gc pending list end in an unkeyed
 BLAKE3 checksum against accidental damage. These are not security
 boundaries beyond collision resistance of BLAKE3-256.
-
-### C11. Git change ids (all)
-
-`BLAKE3-derive_key(GIT_CHANGE_ID, git_oid)[..16]`: a deterministic mapping
-of Git commit ids to Veil change ids. Not secret, and not a security
-boundary.
 
 ### C12. Team-vault records (all)
 
@@ -450,7 +443,6 @@ are distinct and pins their exact bytes.
 | `KEY_FINGERPRINT` | `veil 2026 key-fingerprint v1` | BLAKE3 `derive_key` | C9 |
 | `RING_CHANGE_HASH` | `veil 2026 ring-change v1` | BLAKE3 `derive_key` mode as a hash | C6 |
 | `RING_PROOF` | `veil 2026 ring-proof v1` | BLAKE3 `derive_key` → keyed BLAKE3 | C6 |
-| `GIT_CHANGE_ID` | `veil 2026 git change-id v1` | BLAKE3 `derive_key` | C11 |
 | `SIG_PREFIX` | `veil 2026 sig v1\0` | Ed25519 message prefix | C5 |
 | `SIG_CONTEXT_SNAPSHOT` | `snapshot` | Ed25519 context | C5 |
 | `SIG_CONTEXT_RING_CHANGE` | `ring-change` | Ed25519 context | C5, C6 |
@@ -497,8 +489,8 @@ Signature contexts never contain NUL and are followed by `0x00`, so
 | 1, 2 | C1L `veil:seal` | C3L | 0/1 (legacy), 2 | (older vl) derived signing key |
 | 3, 4, 5 | C1 `veil:sea2` | C3 HPKE | 3 once it holds an HPKE wrap | independent signing key |
 
-Format 5 adds no construction: a sealed symlink target or gitlink pointer
-is a sealed blob (C1), a cloaked tag message a C2 envelope, and an
+Format 5 adds no construction: a sealed symlink target is a sealed blob
+(C1), a cloaked tag message a C2 envelope, and an
 annotated tag's signature a C5 signature in the new context `tag`.
 
 * **Readers** read every construction forever: `veil:seal` and `veil:sea2`
@@ -530,8 +522,8 @@ annotated tag's signature a C5 signature in the new context `tag`.
   non-admin upgraded). A scope it cannot rotate becomes a note; it never
   blocks the upgrade after its commit point.
 * **Nothing is re-sealed.** Re-sealing history would change object ids, so
-  every tree and snapshot above them, every snapshot signature, change id
-  and Git-bridge mapping would change. Unchanged cloaked files also keep
+  every tree and snapshot above them, every snapshot signature and change
+  id would change. Unchanged cloaked files also keep
   their existing sealing when re-snapshotted (`matches_encoding` compares
   plaintext), so they keep their ids.
 

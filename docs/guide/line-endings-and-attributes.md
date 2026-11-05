@@ -1,17 +1,16 @@
 # Line endings and per-path attributes
 
-Veil reads `.gitattributes`, the file Git, GitHub and your editor already
-read, to decide three things per path: which line endings a file is
-recorded and checked out with, whether it is shown and merged as text or
-as binary, and which diff or merge *driver* applies. There is no second
-file to keep in sync, and no device setting like Git's `core.autocrlf`:
-what is recorded never depends on whose machine recorded it.
+Veil reads `.veilattributes` to decide three things per path: which line
+endings a file is recorded and checked out with, whether it is shown and
+merged as text or as binary, and which diff or merge *driver* applies.
+There is no device setting like Git's `core.autocrlf`: what is recorded
+never depends on whose machine recorded it.
 
 ## The file
 
-`.gitattributes` works exactly as in Git:
+`.veilattributes` has the syntax of Git's attributes files:
 
-```gitattributes
+```text
 # Normalise every text file to LF in history (Git's recommended setting).
 * text=auto
 # Windows scripts are checked out with CRLF.
@@ -25,17 +24,16 @@ Cargo.lock merge=union
 ```
 
 * A pattern without a `/` matches a file name at any depth below the
-  directory of the `.gitattributes` it is in; one with a `/` is matched
+  directory of the `.veilattributes` it is in; one with a `/` is matched
   against the path relative to that directory (`*` never crosses a `/`,
   `**/` matches any number of directories). A pattern ending in `/` never
   matches a file, as in Git.
 * Files in subdirectories add to the root's, and win over it; within one
   file a later line wins over an earlier one.
 * Macros (`[attr]mytext text eol=lf`) may only be defined in the
-  top-level `.gitattributes`; `binary` is built in (`-diff -merge -text`).
-* `.veil/local/attributes` holds this device's own overrides (as Git's
-  `.git/info/attributes`): it wins over every `.gitattributes` and is never
-  synced.
+  top-level `.veilattributes`; `binary` is built in (`-diff -merge -text`).
+* `.veil/local/attributes` holds this device's own overrides: it wins over
+  every `.veilattributes` and is never synced.
 
 `vl attr check` shows what applies to a path, and what Veil does with it:
 
@@ -67,10 +65,8 @@ Cargo.lock: text: auto
 | `eol=crlf` (with or without `text`) | CRLF normalised to LF | CRLF |
 | `text=auto eol=crlf` | as `text`, if the file looks like text | CRLF, if it looks like text |
 
-These are Git's rules (with `core.autocrlf=false`), so a Git clone of what
-Veil exports converts the same way and shows nothing modified. A file
-"looks like text" when it holds no NUL byte, no lone CR and few control
-characters, as Git decides it.
+These are Git's rules (with `core.autocrlf=false`). A file "looks like
+text" when it holds no NUL byte, no lone CR and few control characters.
 
 Three rules keep your bytes safe:
 
@@ -79,11 +75,11 @@ Three rules keep your bytes safe:
   recorded exactly as it is, and Veil says so:
 
   ```text
-  warning: notes.txt: its line endings are mixed (CRLF and LF); recorded unchanged (`.gitattributes` asks for LF line endings, and converting would change more than the line endings)
+  warning: notes.txt: its line endings are mixed (CRLF and LF); recorded unchanged (`.veilattributes` asks for LF line endings, and converting would change more than the line endings)
   ```
 
   (Git converts such a file anyway, with a warning.)
-* **No silent re-recording.** Adding or changing `.gitattributes` never
+* **No silent re-recording.** Adding or changing `.veilattributes` never
   re-records a file that still holds its recorded version: a file
   committed with CRLF stays so in history, and a file checked out with
   CRLF is not taken for an edit when the attributes change. The first
@@ -92,7 +88,7 @@ Three rules keep your bytes safe:
   change:
 
   ```text
-  2 file(s) would change line endings (`.gitattributes` asks for other line endings than they were recorded with); run `vl renormalize` to re-record them
+  2 file(s) would change line endings (`.veilattributes` asks for other line endings than they were recorded with); run `vl renormalize` to re-record them
   ```
 * **Edits are never overwritten.** Switching to another change replaces a
   file only if it holds exactly what was checked out (as written, with CRLF
@@ -106,7 +102,7 @@ operation of its own: `vl undo` reverts it. It does not rewrite the
 working copy. Like recording, it never makes a lossy conversion.
 
 ```text
-$ echo '* text=auto' > .gitattributes
+$ echo '* text=auto' > .veilattributes
 $ vl renormalize
 Renormalized docs/old-notes.txt
 Renormalized src/legacy.c
@@ -120,8 +116,7 @@ way to normalise it.
 ## Diff and merge
 
 * `binary` or `-diff`: `vl diff` and `vl show` say "binary
-  content differs"; `vl format-patch` writes `Binary files … differ`, as
-  `git format-patch --no-binary` does.
+  content differs".
 * `binary`, `-merge` or `merge=binary`: two different versions of the file
   are a conflict as a whole, never merged line by line.
 * `merge=union`: a conflicting hunk takes both sides' lines, ours first
@@ -134,7 +129,7 @@ way to normalise it.
 `diff=NAME` and `merge=NAME` only *name* a driver. A name means something
 only if **your device** defines it, in `$VEIL_HOME/config.toml` or the
 repository's `.veil/local/config.toml` (which wins by name). Nothing in a
-repository, not `.gitattributes`, not a tracked `config.toml`, can define a
+repository, not `.veilattributes`, not a tracked `config.toml`, can define a
 command: a teammate's `* merge=pwn` does nothing but print a warning, and
 the built-in merge is used.
 
@@ -154,8 +149,7 @@ textconv = ["sqlite3", "-batch", "/dev/stdin", ".dump"]
   `.veil/local/tmp/` and are removed afterwards.
 * A **textconv** gets the file's content on its standard input and prints
   the text to diff. `vl diff` and `vl show` use it; its output
-  is never written to disk or cached, and `vl format-patch` never uses one
-  (a patch is always a diff of the real bytes).
+  is never written to disk or cached.
 * The program is an absolute path or a name on `PATH`, and is never a file
   inside the project (a teammate could change it). It runs in the
   repository's directory with a cleaned environment (as hooks do, see
@@ -174,12 +168,10 @@ remember that whatever it does with it is up to it.
 
 `vl attr check` lists these as "not supported by Veil":
 
-* `filter` (Git LFS and other clean/smudge filters): Veil records the file
-  as it is on disk. With Git LFS that is the full content after `git lfs
-  smudge`, not the pointer. `vl attr check` warns about it.
+* `filter` (clean/smudge filters): Veil records the file as it is on disk.
+  `vl attr check` warns about it.
 * `ident`, `working-tree-encoding`: the bytes are recorded as they are.
-* `export-ignore`, `export-subst` (only `git archive` reads them),
-  `linguist-*` (GitHub's language statistics), `whitespace`,
+* `export-ignore`, `export-subst`, `linguist-*`, `whitespace`,
   `conflict-marker-size`.
 
 Also different from Git:
@@ -190,14 +182,14 @@ Also different from Git:
   and the native line ending is LF.
 * `vl ws mount` shows files with their recorded line endings (LF for an
   `eol=crlf` file); writing either form back records no change.
-* A `.gitattributes` larger than 1 MiB is ignored as a whole, and a line of
-  2 048 bytes or more is ignored (as Git does), each with a warning. A
-  symlinked `.gitattributes` is never followed. One you cannot read (sealed
+* A `.veilattributes` larger than 1 MiB is ignored as a whole, and a line
+  of 2 048 bytes or more is ignored (as Git does), each with a warning. A
+  symlinked `.veilattributes` is never followed. One you cannot read (sealed
   for a scope you are not in) counts as absent: you get the bytes as
   recorded, members get them converted, and neither is an edit.
-* A merge reads `.gitattributes` as the merged file's readers can: a
+* A merge reads `.veilattributes` as the merged file's readers can: a
   **public** file merges only under public attributes (a sealed
-  `.gitattributes` counts as its last public version, or as absent), so
+  `.veilattributes` counts as its last public version, or as absent), so
   a sealed `merge=union` never decides public content, and you and
   someone without the key merge the same files alike. A file cloaked for
-  `team` also follows `team`'s own sealed `.gitattributes`.
+  `team` also follows `team`'s own sealed `.veilattributes`.

@@ -1,8 +1,8 @@
 {
   "format": 2,
   "name": "bob",
-  "public": "veil1afd1f54ce3e1df10db5ba0115e243d40dddd9daf366446184abd61182ad3af5d",
-  "signing": "6b6d532cf0e1d97af26d7319984090928ca337fb6e72b90b3f8762793ae61584",
-  "encryption_secret": "2fb8f5f47aeb7f7d2a8ae25e77e35a59efe25ca78631bf58f693f9409ff7edc9",
-  "signing_secret": "fc038569bcec6bede5de3b0a8f0afb7819510767fc14144ed1e8a88fc9a2dbdc"
+  "public": "veil1c0939895de3967ec5bde771e22468bd032e47aff5dc3f91fe2633d28300c116d",
+  "signing": "14a00e01bbbd4bd472fbc67c30d0a88f434baff5bd64658f24c73bd616a8372f",
+  "encryption_secret": "d15a6ad51c5660b5a17bd76f8a4a5994a36c31a9e6d6f6e4877458e0c3c1398e",
+  "signing_secret": "25d275e3ba40a0ebd8578d5a45567e44bce6515960b351d71001f50d1229bb25"
 }

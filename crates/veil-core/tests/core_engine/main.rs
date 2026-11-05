@@ -1,4 +1,4 @@
-//! The engine: commits, history tools, merges, conflicts, rewriting, patches,
+//! The engine: commits, history tools, merges, conflicts, rewriting,
 //! embargo releases, attributes and `ws exec` sandboxes.
 //!
 //! One test binary for several suites, to save linking time and disk: each
@@ -19,8 +19,6 @@ mod engine;
 mod history_rename;
 mod history_tools;
 mod mount_recording;
-mod patch;
-mod patch_phase2;
 mod rename_merge;
 mod sandbox;
 mod split_squash;

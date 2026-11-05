@@ -113,17 +113,6 @@ fn new_flags_on_existing_commands_refuse_only_when_given() {
 }
 
 #[test]
-fn init_colocate_without_experimental_refuses_before_creating_anything() {
-    let env = Env::new();
-    let dir = env.root.join("colocated");
-    let out = env.vl(&env.root, &["init", "--colocate", dir.to_str().unwrap()]);
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(1), "{err}");
-    assert!(err.contains("experimental"), "{err}");
-    assert!(!dir.exists(), "init --colocate created {}", dir.display());
-}
-
-#[test]
 fn malformed_invocations_are_usage_errors() {
     let env = Env::new();
     for args in [
@@ -135,22 +124,12 @@ fn malformed_invocations_are_usage_errors() {
         &["duplicate"],
         &["duplicate", "@", "--keep-description", "-m", "x"],
         &["cherry-pick"],
-        &["format-patch"],
-        &["format-patch", "@", "-o", "out", "--stdout"],
-        &["format-patch", "@", "--audience", "everyone"],
-        &["format-patch", "@", "--aud", "me"],
-        &["am"],
-        &["am", "-", "--keep-author", "--author-as-me"],
         &["hooks"],
-        &["submodule"],
-        &["submodule", "set", "vendor/a"],
         &["attr"],
         &["attr", "check"],
-        &["git", "colocate", "--status", "--prune"],
         &["log", "-S", "a", "-G", "b"],
         &["diff", "--no-renames", "-M"],
         &["diff", "-M=101"],
-        &["git", "fetch", "--no-tags", "--prune-tags"],
         &["tag", "verify"],
     ] {
         env.usage_error(args);

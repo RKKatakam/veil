@@ -3,11 +3,13 @@
 Veil is built as a stack of small layers. Each layer only depends on the ones
 below it, and nothing above the VFS layer knows a disk exists.
 
+Veil does not interoperate with Git (no import, export, sync, colocation, submodules, Git file formats or Git-format patches). Owner decision, 2026-11-05: permanent.
+
 ```text
 ┌──────────────────────────────────────────────────────────────────────┐
 │ vl CLI   (clap grammar, auto-snapshot, checkout pointer, rendering)  │
 ├──────────────────────────────────────────────────────────────────────┤
-│ Features  workspace · commands · embargo · remote · git · vaults     │
+│ Features  workspace · commands · embargo · remote · vaults           │
 ├──────────────────────────────────────────────────────────────────────┤
 │ Graph     repo · transaction (auto-rebase) · oplog (views) · revset  │
 ├──────────────────────────────────────────────────────────────────────┤
@@ -510,10 +512,8 @@ CAS, and it applies these rules in order:
 
 1. Ignored paths are skipped. That includes, built in and at any depth,
    the metadata of other version control systems: a `.git` directory or
-   `.git` file (worktrees, submodules), `.jj/`, `.hg/`, `.svn/`, in any
-   ASCII case and with HFS+-ignorable code points
-   (`policy::vcs_metadata`; the Git bridge's refusal of `.git` entries uses
-   the same test). No `.veilpolicy` rule records them (not `** public`,
+   `.git` file (worktrees), `.jj/`, `.hg/`, `.svn/`, in any ASCII case and
+   with HFS+-ignorable code points (`policy::vcs_metadata`). No `.veilpolicy` rule records them (not `** public`,
    not `vendor/ public!`, not a cloak), except a `public!` rule whose
    pattern names the directory itself (`fixtures/repo/.git/ public!`).
    Lifting that ignore counts as weakening for the accepted policy below.
@@ -570,7 +570,7 @@ CAS, and it applies these rules in order:
      silently** (`policy::working_copy_policy`, `wc_policy.rs`). Isolated
      files never enter history, so nothing but the policy protects them,
      and `.veilpolicy` is shared: it arrives by merge, pull, checkout of
-     another change, rebase, Git import or undo. Each working copy keeps,
+     another change, rebase or undo. Each working copy keeps,
      device-locally, the policy its member last *accepted*
      (`.veil/local/accepted-policy`). Snapshots of the repository's own
      directory classify every path under both; where `.veilpolicy`
@@ -628,25 +628,9 @@ CAS, and it applies these rules in order:
      (`vl restore [--from REV]`, BUG-101) snapshots with
      `SnapshotOptions::policy_incoming`, so what it brought in is guarded
      like a pulled policy. Every other route (`vl new`, `edit`, `ws switch`,
-     `undo`, `op restore`, `merge`, `rebase`, `git pull`) moves the working
+     `undo`, `op restore`, `merge`, `rebase`) moves the working
      copy to a tree that holds the incoming policy, so there is no
      difference to mistake for an edit (`policy_routes_cli.rs` covers each).
-   * **Colocated Git mode** (BUG-759): Git may write `.veilpolicy` between
-     two commands without moving `HEAD` (`git reset --soft` after a pull,
-     `git stash pop`, `git checkout REV -- .veilpolicy`), so a difference
-     from the recorded version proves nothing. `Repo::snapshot_policy`
-     takes none as the member's edit there
-     (`policy::working_copy_policy_colocated`); only an explicit
-     `SnapshotOptions::policy_edit` is: `vl cloak|isolate|expose|ignore`
-     and `vl policy import-gitignore` pass the text they read and wrote,
-     and `Ctx` passes a hand edit only when Git cannot have written it
-     (`colocate_cmd::git_may_have_written_policy`: no Git operation in
-     progress, no unmerged entry or conflict-marker line, and the content,
-     cleaned as `git add` would, is no blob Git has). The edit counts only
-     while the file holds that exact text. A policy that is never weaker
-     than the accepted one for any path (the exhaustive check above) is
-     accepted in colocated mode whoever wrote it, so a protection added by
-     hand stays pinned; anything weaker waits for `vl policy accept`.
    * What is at `.veilpolicy` never makes a snapshot less protected than
      the accepted policy (`policy::read_policy_file`, BUG-106/107). A
      **missing** file is not taken as the member's edit (deleting every rule
@@ -656,7 +640,7 @@ CAS, and it applies these rules in order:
      manager, `stow`, a monorepo's shared policy) is followed, inside or
      outside the repository, to a regular file of at most 1 MiB whose name
      says it is a policy (`*veilpolicy*`: `.veilpolicy`, `dot_veilpolicy`,
-     `shared.veilpolicy`), so a hostile Git checkout's
+     `shared.veilpolicy`), so a hostile checkout's
      `.veilpolicy -> /proc/self/environ` is never parsed and echoed in
      warnings (FIFOs and devices are refused, the open is non-blocking), but a change in its
      target is never the member's edit, since it changes by routes Veil
@@ -724,8 +708,8 @@ CAS, and it applies these rules in order:
      the checkout as public except FILE's `public!` paths (BUG-115).
    * Considered and rejected: refusing the incoming `.veilpolicy` at merge
      time (as for sealed content). Merge cannot see the working copy's
-     isolated files, and pull + `vl new`, checkout, rebase, Git import and
-     undo bypass merge entirely; the working-copy snapshot is the one place
+     isolated files, and pull + `vl new`, checkout, rebase and undo bypass
+     merge entirely; the working-copy snapshot is the one place
      every route meets.
 4. Public files are scanned for credentials (AWS, GitHub, GitLab, Slack,
    Stripe, Anthropic, OpenAI, Google, JWT, private keys, passwords in URLs
@@ -899,7 +883,7 @@ CAS, and it applies these rules in order:
    description is too.
    * **Labels are claims; objects are authority** (BUG-103). The parent
      entry's visibility label comes from history, which anyone who can push
-     to a team remote (or a Git import) writes. Before new content is
+     to a team remote writes. Before new content is
      sealed, the builder checks the label against the object it points to
      (`builder::verify_sealing`: plaintext blob → public, envelope label
      `s` or `s#<key-id>` → cloaked under `s`, `embargo/<id>` → embargoed;
@@ -918,8 +902,7 @@ CAS, and it applies these rules in order:
      declassification (`embargo::normalize_tree`: only a *verified*
      `cloaked:s` of a merged-in line of `s` is published), embargo
      wrapping (`seal_dir`), squash into a cloaked change
-     (`seal_introduced`), and the Git bridge's import (which goes through
-     the builder and the merge). A snapshot's `cloak` field is used only if
+     (`seal_introduced`). A snapshot's `cloak` field is used only if
      it names a scope (`builder::trusted_cloak`): never an embargo label,
      `local` or a key generation, for files and for descriptions
      (`embargo::description_scope`). As a backstop, the builder never seals
@@ -1025,8 +1008,8 @@ CAS, and it applies these rules in order:
      with a base sealed for `team` and two sides that both exposed the file,
      or a base sealed for `ops` and two `team` sides, the markers show the
      two sides only (Git's `merge` conflict style). Before the fix, the
-     public result carried the `team` text into the snapshot, public
-     remotes and the Git export. The alternative, sealing the conflicted
+     public result carried the `team` text into the snapshot and public
+     remotes. The alternative, sealing the conflicted
      result for the narrowest audience involved, is rejected: scopes are
      not ordered (see the previous rule), so there is often no narrowest,
      and it would hide both sides' public edits from public readers
@@ -1047,7 +1030,7 @@ CAS, and it applies these rules in order:
      **last public version** as the entry's `fallback`, as an embargoed
      file does: the parent's public entry, or the fallback the parent's
      sealed entry already carried. Readers without the key (public remotes,
-     the Git projection, members of other scopes) see and check out that
+     members of other scopes) see and check out that
      version; key holders see the edit. Squash into a cloaked change
      (`seal_introduced`), merges into a cloaked line (`normalize_tree`) and
      diff3 merges (`merged_visibility`: the other side's public version
@@ -1069,8 +1052,7 @@ CAS, and it applies these rules in order:
      and the recorded entry is kept, as is any tracked file this reader
      cannot seal. Deleting the copy shown is not a deletion of the sealed
      content (it is carried, rule 7). Before this rule (BUG-074), such an
-     edit made the public side see the file deleted, on GitHub as a commit
-     deleting it.
+     edit made the public side see the file deleted.
 6. Embargoed entries stay embargoed until their embargo is released, and a
    tree under an unreleased embargo stays under it (§7). A key holder's
    edit of an embargoed file is secret-scanned like a public one, because
@@ -1099,13 +1081,11 @@ snapshot (and with it every command), and nothing is dropped silently:
   (BUG-200, `vfs::holds_repository`). It is reported once, in `vl status`
   (`N inner/`, `BuildReport::nested`); anything tracked there before is
   recorded as deleted (the files stay on disk). The same walk serves
-  every route (snapshots, `vl watch`, `vl ws exec` sandboxes, the Git
-  import, where a Git tree's subdirectory holding `.veil/` is left out
-  too); `vl scan` and `vl policy check` skip it and say so. Checkout
+  every route (snapshots, `vl watch`, `vl ws exec` sandboxes); `vl scan` and `vl policy check` skip it and say so. Checkout
   (and `vl restore`) never write or remove anything inside one
   (`CheckoutReport::nested`). A plain *file* named `.veil` is only
   skipped itself. The CI gate `vl scan --policy-from` does scan nested
-  repositories: Git publishes their files.
+  repositories: a CI checkout publishes their files.
 * A directory the policy ignores is never descended into (Git's rule), so
   no later rule re-includes a file below it (`build/ ignore` then
   `build/keep.txt public` records nothing under `build/`); `vl policy
@@ -1136,20 +1116,15 @@ snapshot (and with it every command), and nothing is dropped silently:
   (`T` in `vl status`), its old version kept in history. `.veilpolicy` is
   never recorded as a link (it is read through, BUG-058), and a link named
   `.veil` makes its directory a nested repository. The stat cache is not
-  used for links (one `readlinkat` costs less). A **gitlink** entry is
-  carried: a directory at its path is never descended into (whatever it
-  holds, its own repository decides), and only `vl submodule set` or a Git
-  import moves the pinned commit; an absent directory that was
-  materialised is a deletion.
+  used for links (one `readlinkat` costs less).
 * **Checkout of links** writes them with `write_link` (the target as it
   is) through the no-follow walk. A link at a path is replaced or removed
   only when it is the version `from` materialised (same `readlink`
   bytes); any other link is the user's and is kept (`kept_local`, or
-  `blocked` where a file of the tree would replace it). A gitlink becomes
-  an empty directory, never removed while it holds anything. A hostile
+  `blocked` where a file of the tree would replace it). A hostile
   target (NUL, over `PATH_MAX`, empty) fails that path only. A link is
-  never written from an embargo fallback. A conflict with a symlink or
-  gitlink side is materialised as its **shown side, as it is**
+  never written from an embargo fallback. A conflict with a symlink side
+  is materialised as its **shown side, as it is**
   (`conflict::shown_side`: ours, unless ours deleted it), never as a file
   of markers, which would turn a link target into file content a later
   edit could publish (threat 12); the builder keeps the conflict while
@@ -1176,9 +1151,7 @@ snapshot (and with it every command), and nothing is dropped silently:
   one) never blocks a checkout or a merge: the policy this member last
   accepted applies there, with a warning (BUG-121,
   `Policy::load_or_accepted`). A snapshot of a working copy holding such a
-  `.veilpolicy` already falls back to the accepted policy. A Git commit
-  whose `.veilpolicy` is not a regular file is refused with the branch
-  named (BUG-058), and the pull goes on.
+  `.veilpolicy` already falls back to the accepted policy.
 
 Local-only files (isolated and quarantined) are backed up into the vault, so
 `vl ws exec --with-isolated` can inject `.env` into a sandbox without it ever
@@ -1267,7 +1240,7 @@ struct Snapshot {
   pointed at the working copy's first parent to the committed change, so
   `main` follows commits made on it. On a **cloaked line** (the workspace
   or the change is cloaked under `S`) only tags cloaked under `S` move: an
-  uncloaked tag is what public remotes and Git receive, and cloaked work
+  uncloaked tag is what public remotes receive, and cloaked work
   reaches it only through an explicit `vl merge` (published after a scan,
   or embargoed) or `vl tag set`. `vl commit --no-advance` moves no tag. The
   CLI names the tags that stayed and how to move them (BUG-075).
@@ -1323,7 +1296,7 @@ struct Snapshot {
     forged label is not carried into a conflict.
   * **Materialisation** (`conflict::materialize`) happens only when a file
     is written or shown: checkout, `vl cat`, `vl restore`, a tree view, a
-    diff, the Git export, a snapshot comparing an edited copy. What only
+    diff, a snapshot comparing an edited copy. What only
     describes a conflict (`vl status`, `vl ls`, `vl resolve --list`, the
     JSON output, a checkout's executable bit) uses `conflict::inspect`,
     which reads every version but never merges their text (BUG-484);
@@ -1668,11 +1641,6 @@ A workspace is only a named pointer in the view. It owns no directory.
   through overlays (`vl ws write`), materialised into a throwaway directory
   for one command (`vl ws exec`), or attached to the project directory
   (`vl ws switch`). Two tasks can never fight over a directory.
-* **Restricted snapshots** (`SnapshotOptions::only`, a `SparseSet`)
-  record only some paths of a working copy: everything else keeps the
-  working copy's recorded entries, through the same `SparseView` that
-  records a sparse sandbox (colocated Git mode records only the paths Git
-  does not manage).
 * **Links in sandboxes** (symlinks design, threat 7; BUG-708, BUG-709).
   `SandboxFs` materialises a tree's symlink only when it provably resolves
   beneath the sandbox root whatever other links the tree holds
@@ -2040,7 +2008,7 @@ attached.
   the stat would be recorded under the checked-out content. Written files are
   re-read once by the next snapshot instead.
 * **Line endings** (§16). A record of content holding a CR also keeps an
-  `EolFact`: a fingerprint of the `.gitattributes` files the path is under
+  `EolFact`: a fingerprint of the `.veilattributes` files the path is under
   (a hash of their bytes, so checking it parses nothing), whether `vl
   renormalize` would change the file, and the blob recorded for it when
   that is not the content itself (a CRLF copy of an LF version). `content`
@@ -2124,10 +2092,9 @@ remains is mostly the one `lstat` per file and the per-directory
    snapshot that deleted every file of the fix keeps the wrapper
    (`embargo::wrap_line`, where `wrap` would return the bare fallback), and
    a working-copy tree that is not wrapped although an ancestor is an
-   unreleased embargoed merge (a Git commit the colocated follow imported
-   on top of it) gets wrapped at its next change, with its parent's public
-   view as the fallback (`Repo::keep_line_embargo`). Otherwise the line
-   would leave the embargo, and the fix put back (`git stash pop`, an
+   unreleased embargoed merge gets wrapped at its next change, with its
+   parent's public view as the fallback (`Repo::keep_line_embargo`).
+   Otherwise the line would leave the embargo, and the fix put back (an
    editor's undo) would be recorded, committed and pushed as public.
    Descriptions written on such a line by a key holder (`commit`, `describe`,
    `new -m`, squash, a plain merge into it) are sealed under the embargo key
@@ -2144,7 +2111,7 @@ remains is mostly the one `lstat` per file and the per-directory
      fields go to device-local state (`.veil/local/releases/<id>.json`),
      honoured only by the identity that signed them, and never read by a
      sync. This repository treats the embargo as released at once. The
-     next push (to any remote) or Git export writes them into the synced
+     next push (to any remote) writes them into the synced
      record, just before the record is sent (`publish_staged_releases`).
      Until then the key has not left the repository through vl, so
      `vl undo` right after the release deletes the staged release: the
@@ -2193,9 +2160,8 @@ the embargoed merge do not count), or has a tree under its wrapper. Content
 of a confined snapshot goes only into a change confined to the same
 embargo: `vl restore --from` checks the source against `@`, `squash_into`
 the source against the destination, `duplicate` the source against the new
-parents (which must be on the fix line, not the embargoed one), and
-`format-patch` refuses confined sources outright (its `--include-embargoed`
-escape aside). `Transaction::commit` checks every rewrite that changed a
+parents (which must be on the fix line, not the embargoed one).
+`Transaction::commit` checks every rewrite that changed a
 snapshot's parents: a confined change must still be confined to its
 embargo in the view the transaction ends with, so `vl rebase` of work on
 the fix onto a public line, or `vl abandon` of the fix under such work, is
@@ -2426,10 +2392,15 @@ it (`SyncReport::release_tags_kept`, "origin moved release tag v1.0 from X
 to Y; your release tag v1.0 stays at X"), at every pull until the user
 decides; only `vl tag set <name> -r <remote>/<name> --force` takes it
 (BUG-703).
+Commits, merges and rewrites never move a release tag
+(`commands::tag_kept`, the merge loop and the re-pointing in
+`Transaction::rebase_descendants` skip it), so its signed annotation always
+matches it. `vl tag set` over one is refused without `--force`, which
+writes a new atag keeping the old message unless `-m` gives one; the
+annotation is never dropped silently.
 
 **Deleting tags (BUG-280).** A plain push never deletes anything remotely;
-`remote::delete_remote_tags` (`vl push --delete`) and
-`git::push_with_deletions` (`vl git push --delete`) do, for tags already
+`remote::delete_remote_tags` (`vl push --delete`) does, for tags already
 deleted locally, leased: refused when the remote's tag moved to work the
 deleting repository has not seen (Git: a `--force-with-lease` delete). On a
 Veil remote the deleted tag's target also leaves `heads`, so `vl -R
@@ -2438,22 +2409,21 @@ the remote and keeps a local tag of that name (a teammate's deletion never
 deletes yours). A local deletion sticks, the way jj tracks a deleted
 bookmark against its remote bookmark: `vl tag delete` records the tag and
 its target in `.veil/local/deleted_tags.json` (`remote::deleted_tags`;
-repository-local, outside the view, so no format change), and pull and
-`vl git pull` do not recreate the tag while the remote's tag is that
+repository-local, outside the view, so no format change), and pull does
+not recreate the tag while the remote's tag is that
 target or behind it. When the remote moved past it, the tag comes back
 with a warning and the record goes. Records are dropped once the tag
 exists locally again.
 
-**Removing remotes.** `vl remote rm` and `vl git remote rm` drop the
-remote tags `<name>/*` (and the bridge's tracking refs) in one operation,
+**Removing remotes.** `vl remote rm` drops the remote tags `<name>/*` in
+one operation,
 then remove the remote from its configuration, so an interruption leaves
 a configured remote to remove again, never remote tags of a remote that is
-gone. Remote names are validated (`remote::validate_remote_name`), and a
-Veil remote and a Git remote never share a name.
+gone. Remote names are validated (`remote::validate_remote_name`).
 
 **Names a remote cannot hijack.** Revsets resolve tags before change ids,
-and change ids are visible to every reader of a remote. So `pull` (like
-`vl git pull`) never creates a local tag whose name is a change-id or
+and change ids are visible to every reader of a remote. So `pull` never
+creates a local tag whose name is a change-id or
 snapshot-id prefix of local history or of what the pull brings in; it
 warns, and `<remote>/<name>` still names the snapshot. A change id
 matching several visible snapshots resolves to the one in local history
@@ -2854,624 +2824,6 @@ agents, and counts snapshot decodes and lock waits from an `strace` of the
 command. Its design is `docs/design/scale/9-scale-benchmark.md`; the
 numbers at 1 GB, and what they rank, are in `docs/design/scale/BASELINE.md`.
 
-## 11. Git interop (`git/`)
-
-Teams keep GitHub or GitLab, their CI and their code review: Veil tags
-become Git branches and Git commits become snapshots. The module is behind
-the `git` cargo feature (on by default); it needs a disk-backed repository
-because Git does.
-
-```text
-.veil/git/repo.git      bare Git repository (gix), the bridge
-  refs/heads/<tag>          what Veil last exported for a plain tag
-  refs/tags/<tag>           what Veil last exported for a release tag (format 5)
-  refs/remotes/<r>/<b>      branch <b> of Git remote <r>, as last fetched or pushed
-  refs/veil/tags/<r>/<t>    Git tag <t> of remote <r>, as last fetched or pushed
-.veil/git/map           c <commit> <snapshot> <veiled embargoes>      every pair
-                        s <snapshot> <commit> <import|export|publish> <pending embargoes>
-                        t <tag object or commit> <atag>                release tags
-.veil/git/cache         projection and conversion memo (safe to delete)
-.veil/git/remotes.json  Git remote name → URL
-.veil/local/submodules/<hash of name>/  Git directories of `vl submodule` clones
-```
-
-### Export: what Git may see
-
-Git sees exactly what a clone of a `--public` Veil remote sees, decided by
-how each object is *sealed*, never by which keys this replica holds:
-
-* **Which snapshots.** The public push's own functions select them
-  (`remote::embargo_withheld`, `remote::push_closure`). Cloaked tags are
-  never exported. The merged-in history of an unreleased embargoed merge is
-  withheld: the merge's extra parents are dropped from its Git commit. A tag
-  that would publish withheld history (a tag on the fix, a commit building
-  on it) is skipped with the same reason `vl push` gives.
-* **Which tree** (`git/project.rs`, the *public projection*). Plaintext
-  objects are visible. Objects sealed under a scope or `local` are not:
-  their entries are left out and a directory left empty disappears. An
-  embargo wrapper resolves to its sealed side once released, otherwise to
-  its fallback; a file whose content is hidden shows its fallback if it has
-  one: an embargoed file its pre-merge version, a public file edited on a
-  cloaked line its last public version (§4 rule 5). So a cloaked edit is
-  exported as a commit that leaves the file as it was, never one that
-  deletes it, and a Git commit made on that view imports as an edit of it
-  (the import's `base` is the same projection). A `.git` entry, which
-  Git cannot hold, is left out with a warning, in every spelling that
-  names it on macOS (any case, HFS+-ignorable code points such as
-  `.g\u{200C}it`, as Git's `is_hfs_dotgit`); import refuses them too. Isolated files were never in
-  the graph. A **conflict entry** becomes the file of markers a public
-  reader is shown (`conflict::materialize` with `Audience::Public`): only
-  plaintext versions appear (content under an embargo, even a released
-  one, does not, so a pinned pre-release commit cannot depend on a
-  release), every other version is a `(not shown: this version is not
-  public)` line, and a conflict with no public side shows the newest public
-  version a side carries as its fallback, else nothing. Exporting conflicts
-  was chosen over refusing conflicted snapshots: a conflict recorded on a
-  merge would otherwise block the export of all later history. On import,
-  a Git commit's edit of such a file applies to the conflict (the
-  projection's file stands for the conflict in the merge when every
-  version was shown), so a resolution made on GitHub resolves it; where a
-  version was hidden the edit becomes one more side instead, never a
-  silent loss of what Git could not see.
-* **Which message.** Plain descriptions as they are. A description sealed
-  for a scope becomes `(description withheld: cloaked)`, one sealed under
-  an unreleased embargo `(description withheld: under embargo)`. Only
-  released embargo keys are ever used to open anything.
-
-Tests check this by dumping every object of the produced Git repositories
-(`git cat-file --batch-all-objects --batch`) and grepping for the
-plaintext of cloaked files, isolated files, cloaked descriptions and
-embargoed fixes.
-
-**Commits are deterministic.** Tree, parents (the commits of the Git-visible
-parents, root dropped), author and committer both set to the snapshot's
-author (`Name <email>` is split; a bare name gets an empty email) at its
-timestamp in UTC, the message, and a `change-id` header holding the change
-id in reverse hex, as Jujutsu writes it. No signature, no other header. Two
-machines exporting the same snapshot produce the same commit.
-
-**Exported commits are pinned.** Once exported, a snapshot keeps its commit
-(the mapping), so Veil only ever appends to Git history. The one case where
-the public view of an existing snapshot changes is an embargo release. Each
-exported commit records the unreleased embargoes that shaped it; when one is
-released, export recomputes that snapshot and, if Git would now see
-something different, writes a **publication commit** on top of the pinned
-one: the released tree, parents `[pinned commit, newly visible parents…]`
-(that is, the fix's own history), the released description, no `change-id`
-header (it would make the change look divergent to Jujutsu). Descendants
-exported before the release (they were sealed by stickiness) get one too,
-linking to their parent's publication commit. `vl git push` is then a
-fast-forward.
-
-The same holds for commits that came from Git. The mapping records, for
-every commit, the embargoes that were unreleased in the view it shows
-(*veiled*): an exported commit pinned under an embargo, and a Git commit
-made on top of one (it shows the pre-fix files too). On release, such an
-imported commit also gets a publication commit, parents `[imported commit,
-newly visible parents…]`, whose tree is the imported commit's tree with
-*only the release's change* to the snapshot's public view applied
-(carry-over from the projection through the old veil to the current one).
-GitHub's edits, and paths Veil never recorded, are kept; the fix reaches
-GitHub past any number of GitHub commits.
-
-**Carry-over in the other direction.** Paths Git has but Veil never
-recorded, because Veil isolated or quarantined them at import, or because
-Veil cannot represent them (below format 5: symlinks and submodules; in
-any format: a symlink whose target is not UTF-8, holds a NUL or is over
-4 KiB, a symlinked `.gitmodules`), must not be deleted by
-the next Veil commit. The exported tree is a path-wise three-way merge of
-Git trees: `base` = the public projection of the first parent's snapshot,
-`ours` = the first parent's Git commit, `theirs` = the public projection of
-this snapshot. Paths Veil did not change keep Git's version; paths Veil
-changed (deleted included) take Veil's. For a parent Veil exported itself,
-`ours == base` and the result is the projection exactly.
-
-### Import: Git commits that never saw everything
-
-`git/import.rs` imports every commit reachable from the fetched branches
-that is not mapped yet, parents first (Kahn's algorithm, oldest first).
-Each commit becomes a snapshot:
-
-* **parents**: the parents' snapshots (the root for a root commit);
-* **author / timestamp**: `Name <email>` and the author time (UTC, ms);
-* **description**: the message, plaintext (it is public in Git already);
-* **change id**: the `change-id` header (Jujutsu), unless a visible change
-  already has that id (a forged header must not make the user's change
-  divergent), otherwise derived from the commit id;
-* **no signature**: the snapshot is a function of the commit and of what
-  Veil holds for its parents, never of who imported it or when. Every
-  member who imports the same commit (each from GitHub, before syncing
-  with the others) gets the same snapshot id, so the team remote sees one
-  change, not two divergent copies that a merge would then export to Git
-  twice (BUG-285). Re-importing after the mapping was lost gives the same
-  id too;
-* **tree**, as a three-way merge (`merge::merge_trees`):
-  * `ours` = the parents' Veil tree (`Repo::parents_tree`): everything,
-    cloaked and embargoed content included;
-  * `base` = its public projection *as the commit's author saw it*: through
-    the veil of the Git parents' commits. A Git commit made after a
-    release on the pre-release view (the merge as pinned, or a Git commit
-    on it) shows the pre-fix files; against the released tree that would
-    read as a revert of the fix;
-  * `theirs` = the Git commit built **through the policy gate**: a
-    read-only `StorageBackend` over the Git tree is snapshotted by the
-    builder on top of `base`, so isolation, secret scanning and cloaking
-    apply exactly as for a working copy. Reuse hints (unchanged
-    subdirectories and blobs, proven by content identity) keep this
-    O(changes).
-
-  Entries Git never saw are in `ours` only, so they are carried over
-  untouched, just as the builder carries entries a reader cannot see. Git's
-  edits apply. A file both sides changed is diff3-merged and keeps `ours`'
-  sealing, so nothing sealed is widened. Under an unreleased embargo the
-  result is re-wrapped (key holder) or the commit is **held back** with
-  its descendants (no key), as the builder does for edits on top of an
-  embargo.
-* A Git commit that edits `.veilpolicy` so that sealed files would change
-  audience (`secrets/ cloak team` → `public!`) is not taken: the Veil
-  policy is kept and the import warns, as `vl merge` does.
-* What Veil refused (isolated, quarantined, no key for the scope, not
-  representable) is reported per path. It stays in Git (see carry-over).
-
-### Symlinks, submodules and release tags (format 5)
-
-Format 5 gives the bridge Git's three remaining object kinds (Git-parity
-designs 5, 6 and 8; `git/tags.rs`, `submodule.rs`).
-
-* **Symlinks and gitlinks.** The public projection keeps a public
-  `symlink` entry (exported as mode `120000`, its target as the blob) and
-  a public `gitlink` (mode `160000`, the commit its `"<hex>\n"` blob
-  names). A sealed one is left out like a sealed file, and its fallback,
-  if any, keeps the entry's kind. A link Git cannot carry (an empty or
-  NUL-holding target, a gitlink that is not a SHA-1 commit, a symlink named
-  `.gitmodules`) is left out with a warning. A conflict with a link side
-  is never exported as a file of markers (that would turn a target into
-  content): Git gets the first side as its own kind when public. When the
-  `.gitmodules` of an exported tip names a path Git does not receive as a
-  gitlink (a sealed submodule), export warns: the URL is public, and Veil
-  never rewrites file content to hide it.
-
-  On import the builder never sees links (`GitTreeFs` lists them as
-  special). `GitBridge::import_links` then walks the Git tree (memoised
-  per Git tree, so consecutive commits cost what changed), drops the link
-  entries the builder carried from the parent, and records each Git link
-  through the same gate as a file of that path: ignored and isolated paths
-  (and anything below an ignored or isolated directory) stay in Git, a
-  cloaked path seals the target (or pin) under its scope, a public
-  symlink's target is secret-scanned (`https://u:token@…` is quarantined),
-  and a target that is not UTF-8, holds a NUL or is over 4 KiB is left in
-  Git. An unchanged entry keeps its sealing.
-
-* **Submodules.** `vl submodule update` is the only thing that runs `git`
-  for a submodule; pulls and checkouts never do. `.gitmodules` is parsed
-  with gix's config parser (no includes) and only `path` and `url` are
-  read, so `update = !command` is never run. URLs must be `https`,
-  `ssh`, `git` or scp-like, with no option-like host; `file://` and local
-  paths need `--allow-local`; every `<helper>::` form, `http`, control
-  characters and a leading `-` are refused (CVE-2017-1000117,
-  CVE-2018-17456). `git` also gets `GIT_ALLOW_PROTOCOL` with the same
-  list, `protocol.file.allow=never`, hooks off, `--` before the URL, and
-  never `--recurse-submodules`. The name is checked like Git's
-  `check_submodule_name` and only ever used hashed: the Git directory is
-  `.veil/local/submodules/<blake3(name)>`, never `.git/modules`
-  (CVE-2018-11235), and the work tree gets a `.git` file. The path must be
-  a gitlink of `@`, reached through no symlink. The checked-out commit is
-  read with gix (isolated), never by running `git` in a work tree whose
-  configuration Veil did not write. The builder never records anything
-  below a gitlink, whatever the policy says: the submodule's own
-  repository decides where its files go.
-
-* **Release tags.** A tag with an annotation (`veil:atag`) is a release
-  tag, exported as `refs/tags/<name>`; every other tag stays a branch.
-  Export applies the branch checks (not cloaked, history not withheld),
-  then refuses an annotation that names another tag or snapshot, has a bad
-  signature or a sealed message, and holds back a tag whose target commit
-  is still shaped by an unreleased embargo (the map's `pending`): a
-  security release tag would otherwise name the fallback view, without
-  the fix, permanently. After the release it names the publication
-  commit. An atag imported from Git is re-written byte for byte (its GPG
-  signature still verifies in Git) when its raw object still names the
-  same commit; any other gets a fresh tag object (tagger and time from
-  the atag, UTC, no signature: Veil never signs Git tags), and a
-  `lightweight-git` atag stays a lightweight tag. Export is deterministic,
-  so a lost map loses nothing.
-
-  Push sends `<oid>:refs/tags/<name>`, never with `+`. A tag the remote
-  holds with another value (as last fetched) is rejected before `git`
-  runs; `--force-tags` replaces it with `--force-with-lease`. `--delete-tag`
-  needs the local tag deleted first. Every exported release tag the remote
-  lacks is pushed (Git's `push.followTags`).
-
-  Fetch adds `+refs/tags/*:refs/veil/tags/<r>/*`, a namespace of its own
-  (a branch `tags/x` cannot collide with tag `x`). Each tag is peeled
-  through at most 8 tag objects to a commit that imports; a tag of a tree
-  or blob, a deeper chain, or a tag object over 1 MiB + 64 KiB (checked
-  from the object header before reading) is skipped and reported. Names
-  pass `validate_tag_name` for `<name>` and `<r>/<name>`. Each becomes an
-  atag (deterministic: two members fetching the same tag get the same id;
-  one equal to Veil's own export, found through the map or by exporting
-  the local release tag again, is recognised, not re-imported) recorded in
-  `View::remote_release_tags["<r>/<name>"]`, apart from `remote_tags`
-  (branches). A snapshot only a tag names becomes a head. A recorded tag
-  whose new value names another snapshot is reported as **moved** (a
-  supply-chain warning). `vl git pull` creates a local release tag only
-  where no tag of that name exists and the name shadows no change or
-  snapshot id; it **never moves** an existing one (reported instead). A
-  name taken by a branch-like tag stays the branch's; `tag:<r>/<name>`
-  names the Git tag in revsets (`<r>/<name>` alone does when no branch
-  has it). Tags the remote deleted are reported and kept as
-  `<r>/<name>` until `--prune-tags`; local tags are never deleted. Below
-  format 5 tags are fetched into the bridge only, with one notice naming
-  `vl upgrade`.
-
-  Commits, merges and rewrites never move a release tag
-  (`commands::tag_kept`, the merge loop and the re-pointing in
-  `Transaction::rebase_descendants` skip it),
-  so its signed annotation always matches it. `vl tag set` over one is
-  refused without `--force`, which writes a new atag keeping the old
-  message unless `-m` gives one; the annotation is never dropped silently.
-
-### Remotes, divergence and transport
-
-`vl git fetch` runs `git fetch --prune <url> +refs/heads/*:refs/remotes/<r>/*`
-(plus the tag refspec above)
-in the bridge, imports, and records `<r>/<branch>` remote tags. A branch
-whose new tip does not descend from the previous one was **force-pushed**
-on the Git side: it is reported, the snapshots it dropped stay in Veil, and
-local tags never move backwards. `vl git pull` also creates or
-fast-forwards local tags; a diverged tag is left alone with a hint (`vl
-merge <r>/<branch>`). A local release tag never follows a Git branch of its
-name (`git::update_tag` warns and leaves it, BUG-703). Like `vl pull`, it never moves the working copy (a
-change of the user's own; rewriting it under them would be surprising):
-`vl rebase -d <tag>` does. The usual working-copy handling still runs at
-the end of the command (§6: anything that became readable is filled in). `vl git push` exports, then pushes
-`<commit>:refs/heads/<tag>` for each tag. A branch that moved on the Git
-side is rejected (non-fast-forward). `--force` uses
-`--force-with-lease=<branch>:<last fetched>`, so it can only overwrite what
-this replica has seen.
-
-Network transport is the system **`git` binary** (`$VEIL_GIT` overrides the
-path), with gix for all object reading and writing:
-
-* gix (0.90) has fetch but no push;
-* `git2`/libgit2 would bring its own credential callbacks and SSH
-  implementation (libssh2), which ignore `~/.ssh/config`, `ProxyJump`,
-  FIDO keys and most credential helpers;
-* the `git` binary uses exactly what the user already configured:
-  credential helpers (osxkeychain, libsecret, `gh auth git-credential`),
-  SSH config and agent, `insteadOf`, proxies. Jujutsu moved to the same
-  approach. Veil passes `--git-dir` and explicit refspecs, removes
-  `GIT_DIR`-style variables, disables auto-gc in the bridge (exported
-  commits may be referenced only by the mapping), and refuses URLs that
-  `git` could read as options.
-
-**Commits Veil exported are never imported.** Before importing an
-unmapped commit, import checks whether it is Veil's own: one with a
-`change-id` header naming a visible change is exported again (through the
-veils of earlier release states, if a release shaped it) and recognised if
-the commit id is the same; one without, on top of a commit whose view a
-release changed, is checked against the publication commit export would
-write. A header alone proves nothing (anyone can write one). So a lost
-`.veil/git/map` is rebuilt by the next fetch as well as by the next export,
-and a second replica that holds the same Veil history (from a Veil remote)
-maps the first one's exports to the same snapshots. An earlier import of
-the same commit is found by its derived change id.
-
-**Untrusted branches.** A branch that cannot be imported (an unreadable or
-hostile tree, `.veilpolicy` as a symlink, held back by an embargo) is
-reported with its name and the reason; the other branches are imported and
-the command succeeds. Deleted branches are found from the remote tags Veil
-recorded, not from the bridge's tracking refs (which `git fetch --prune`
-has already moved, even if the import then failed). `vl git pull` does not
-create a local tag whose name is also a change id or snapshot id prefix of
-the repository (tags win in revsets); `<r>/<branch>` names it. Credentials
-in a remote URL (`https://user:token@host`) are replaced by `***` in every
-message and in `vl git remote list`. A relative local path given to `vl git
-remote add` is stored absolute, and `git` always runs in the bridge
-directory, so the remote is the same from any directory.
-
-Every mapped object is re-checked before use; one that has gone (Veil gc
-of an abandoned import, Git gc) is treated as unmapped and recomputed,
-which gives the same result. A crash between writing objects and the map
-therefore only costs recomputation. Export and import run under the
-repository lock.
-
-### Patches: `vl format-patch` and `vl am` (`patch.rs`)
-
-Git's mbox format both ways (design and threat review:
-`docs/design/git-parity/4-patches.md`). No format change: `am` writes
-ordinary snapshots.
-
-**Export** (`patch::format_patches`, behind the `git` feature). The default
-audience is **public**, and it uses the export's own functions, not a copy
-of them: trees through `GitBridge::project`, file content through
-`project::public_open` (no scope key is ever used), descriptions through
-`project::public_text`. So a patch shows exactly what a Git push shows, and
-`git format-patch` on the bridge's export of the same range gives the same
-headers, file sections and `index` lines (`patch_cli`'s differential test).
-`index` ids are Git blob ids of the projected content, never Veil object
-ids; the `From <id>` line is the bridge's commit when the snapshot is
-mapped. `remote::embargo_withheld(_, true)` is checked first: a range
-holding withheld history is refused before anything is computed. Merges
-and the root have no patch. Hunks come from diffy within `textmerge`'s work
-bound (one coarse hunk past it), so a hostile pair of files cannot stall an
-export. `--audience me` reads through the keychain instead (`TreeView`
-semantics: a conflict for its reader, a file without a key left out with a
-warning) and collects the label of every sealed object it opened: scopes go
-to `X-Veil-Audience`, an unreleased embargo needs `--include-embargoed`,
-and `local` is refused. A description line a reader would take
-for patch syntax (`diff --git`, `---`, `-- `, a `From ` postmark, an
-in-body `From:` first in the body) is indented by one space, with a
-warning: a teammate's text never becomes a file section, a forged author or
-a message of its own when someone runs `git am` on the export.
-
-`-M`/`-C` run `rename::detect` on the **audience's own sides**: for the
-public audience the two projected trees, read as `Reader::Public`, so a
-pair can only join paths and content a public reader sees (a cloaked file
-that became a public one is a new file, never `rename from secrets/…`).
-`rename.rs` pairs files only; `writer::special_renames` adds Git's exact
-renames of symlinks and gitlinks (same kind, same object). Sections follow
-Git's layout (`old mode`/`new mode`, `similarity index`, `rename|copy
-from/to`, `index`), the diffstat names a pair as Git's `pprint_rename`
-does (`dir/{a => b}`), and a type change is written as a deletion and a
-creation with one diffstat entry. Symlinks are mode `120000` with the
-target as content; gitlinks `160000` with `Subproject commit <id>` and the
-commit as their `index` id. `--binary` writes `GIT binary patch` blocks
-(forward and reverse; a Git delta when its deflated form is smaller than
-the literal's) from `patch/binary.rs`, never for a side read from a
-sealed object (`Side::sealed`, audience `me`). The CLI names
-changes by id only in its messages (a description may be sealed), writes `-o DIR` into a private temp
-directory inside `DIR` and renames into place at the end, and requires
-`--yes` for `me` on a non-terminal standard output.
-
-**Parse** (`patch::parse`). Hand-written, one pass over the input, no
-regexes, refusing anything it does not understand exactly (see the module
-documentation for the grammar). Hunks are stored as byte ranges of the
-input and re-read by `Series::hunk_lines`, so memory is the input plus a
-few dozen bytes per hunk; every count and size is capped by `Limits`
-(input 1 GiB, 16 MiB lines, 1 000 000 hunks per file, …). A
-`GIT binary patch` block is checked line by line (length character
-against digit count) and kept as a byte range; its declared size is
-checked against `VEIL_MAX_OBJECT`, and the declared sizes of the whole
-series against `Limits::max_inflated` (2 GiB), before anything is
-decoded. Decoding (`patch/binary.rs`, zlib by `zlib-rs`) happens in the
-applier: the inflater writes in 64 KiB steps and stops one byte past the
-declared size, so memory follows the output actually produced; a delta's
-header is checked (base size, result at most `VEIL_MAX_OBJECT`) before
-its output is allocated, and every copy against the base and the room
-left. A type change (deletion and creation of one path, of different
-kinds) is the only way one path appears in two sections. Paths go
-through `check_path` before they are `VPath`s; decoded headers holding
-control characters or direction overrides are refused.
-
-**Apply** (`patch::apply_series`). The input is parsed before the lock is
-taken; then one transaction, in which the destination revision is
-resolved (so a racing commit is never lost: the series lands on `@-` as it
-is now). For each patch:
-
-1. every section is checked against the *pre-image* tree (all sections of
-   a patch read the pre-image, as in Git; each path is claimed by at most
-   one section, a copy's source by any number): a source must be a file,
-   symlink or gitlink of the kind the section says, whose own object this
-   reader can open (never its fallback), a target must be free (or a leaf
-   the same patch deletes: a type change) with directories (or leaves the
-   same patch deletes) above it, no path the patch writes may lie below
-   another it writes (those are leaves: a link is never written through),
-   and no name may fold (`NameFolding::MACOS`) onto another of its
-   directory, readable or not;
-2. hunks apply exactly, up to `max_offset` lines away, inside a work
-   budget (a binary section checks the pre-image's and the result's Git
-   ids against its full `index` line); the results are written to an
-   `OverlayBackend` over a `TreeView` of the pre-image (never the working
-   copy, never an OS path): files as files, symlinks with `write_link`
-   (targets as `vfs::check_link_target` accepts them; never at
-   `.veilpolicy`, `.gitmodules`, `.gitattributes`, `.gitignore`,
-   `.mailmap`), and a gitlink as a file holding its pin, so that the
-   builder classifies, scans and seals it as any content;
-3. the **builder** records the overlay with the policy guarded by the one
-   this device accepted (the pre-image's if none was): a weakening
-   `.veilpolicy` is recorded but held back (`P`), nothing is ever
-   accepted, and cloaking, isolation and scanning apply as to any
-   snapshot; sealed files edited stay sealed under their scope;
-4. the result is checked: anything quarantined, isolated, ignored, not
-   cloakable, unrepresentable or held back by an embargo aborts the
-   series, and so does a written file recorded with less protection than
-   the pre-image's own `.veilpolicy` gives it (the accepted policy may
-   predate a stricter rule that arrived since), or recorded public when
-   it was made from a sealed version (a rename, a copy, a type change);
-   then the pins become gitlink entries (`conflict::set_entry`), and the
-   conflicts of `--3way` conflict entries;
-5. a new change is written (`Transaction::write_snapshot`: signed by this
-   identity; author and time are the patch's claims, description sealed as
-   `embargo::description_scope` says).
-
-The working copy is rebased onto the last new change when it was a child
-of the destination. Any error drops the transaction: nothing is recorded,
-and the objects already written are unreferenced (gc removes them; a
-quarantined file never reaches the store). `vl undo` takes back a whole
-series.
-
-**`--3way`** (`AmOptions::three_way`, `git` feature: it needs Git's blob
-ids). When a section does not apply, `Preimages` looks for the version
-its `index` line names (at least 7 hex digits) among the versions of the
-section's paths in the trees of the destination's history, nearest
-first, then of every other visible head's (at most 10 000 snapshots and
-1 GiB hashed per series): a version this reader can open, or the public
-fallback of one it cannot (what the patch's author saw). Snapshots
-confined to an unreleased embargo (`Confinement::of`: the withheld fix,
-work built on it, the embargoed line) are looked in only when the
-destination is confined to the same embargo: their version would become a
-conflict term of the new change, and a public line would publish it before
-the release (BUG-706). The section is
-applied to it exactly, and the result merged with ours by
-`textmerge::merge` (diff3). A clean merge is written as the file; a
-conflict writes the markers to the overlay (so the builder scans every
-side and decides the audience), and once recorded the entry becomes a
-conflict entry of base, ours and theirs: base and ours as they are
-recorded (their own sealing), theirs stored with the audience the
-builder gave the merged file (repository format 4 and later; before, the
-file keeps its markers). The path is listed in `Snapshot::conflicts`.
-Symlinks and gitlinks are never merged.
-
-### Colocated Git mode (`git/colocate.rs`, `git/index.rs`; experimental)
-
-`vl init --colocate` / `vl git colocate --experimental` put a real `.git`
-beside the working copy (design: `docs/design/git-parity/9-colocated-git.md`;
-guide: `docs/guide/colocated-git.md`). The bridge's two premises, *Git only
-sees the projection* and *everything from Git is public*, no longer hold by
-construction there, so the mode restores them:
-
-```text
-.git                     the bridge repository (`git::default_git_dir` reads repo.json)
-  info/exclude             # BEGIN veil … # END veil: policy rules, protected paths, `*` when frozen
-  info/attributes          # BEGIN veil … `* -ident` … # END veil (Git expands no $Id$ here)
-  index                    HEAD's tree, skip-worktree on hidden paths (all when frozen), the user's own bits kept
-  hooks/pre-push           vl git check-push        (a prior hook → pre-push.veil-chained, run first)
-  hooks/pre-commit         vl git check-push --pre-commit
-  veil/                    the whole Veil repository (what is `.veil/` elsewhere)
-    repo.json                colocated: {git_dir: ".git"}  (format 5; an older vl refuses the directory)
-    git/colocated.json       last HEAD and refs, owned refs, held commits, index key, skip set, frozen,
-                             local-only paths, the user's hidden paths, exposures, stash findings
-    git/colocate.lock        flock serialising follow and mirror between vl processes
-    local/displaced/         whatever was found at `.veil` instead of the marker (never read)
-.veil -> .git/veil       a marker symlink; nothing reads through it
-```
-
-**Where the repository lives.** Veil's repository sits *inside Git's own
-directory*. The work tree is Git's to write: `git checkout`, `git pull`,
-`git clean` and `git stash` may write, replace or delete anything there,
-and Git treats an ignored path as expendable. A repository at `.veil`
-could therefore be overwritten by a hostile commit (a forged
-`.veil/local/accepted-policy` pin, BUG-740), replaced by a pulled file
-named `.veil` (BUG-741), or deleted by `git clean -ffdx` (BUG-746), and no
-Git configuration prevents it: a nested-repository decoy stops
-`git clean -fdx` but not `-ffdx` or a checkout, and sparse checkout would
-make Git rewrite every skip-worktree bit Veil sets. Git never checks a
-path out into, cleans or stashes its own directory (`.git` is refused as a
-tree entry by Git itself). So:
-
-* `repo::colocated_state_dir` (`.git` a real directory holding
-  `veil/repo.json`) is checked first by every opener (`ctx::find_root`)
-  and by `DiskBackend::new`, which then maps the engine's own paths
-  (`.veil/…`) to `.git/veil/…` directly: nothing of the repository is ever
-  read or written through the work tree's `.veil`, even while Git is
-  replacing it. Code that builds paths itself uses `repo::state_dir`.
-* `.veil` is only a marker symlink to `.git/veil`, for people and tools.
-  `colocate::ensure_marker` repairs it at every command; anything else
-  there is moved unread into `local/displaced/` (and is skip-worktree in
-  the index if Git tracks it). A missing marker is not put back while the
-  newest stash holds it (`git stash -a` took it), so `git stash pop`
-  works. The exclude line is `/.veil` (no trailing slash: it matches the
-  symlink). `pre-commit` refuses any staged `.veil` path, and a Git
-  checkout that tracks `.veil` cannot be colocated.
-* The cost: `rm -rf .git` now deletes the Veil repository too (the guide
-  says so). `vl git colocate` moves `.veil` in (a user's `.veil` symlink to
-  another disk stays where its data is: `.git/veil` becomes a link to it),
-  `vl git uncolocate` moves it back once the command no longer uses it
-  (`colocate_cmd::finish_uncolocate`), and a project an earlier build left
-  with a real `.veil` is moved by the next command (`colocate::ensure_layout`).
-
-**Follow** (`colocate_cmd::open_session`, from `Ctx::open` before the
-snapshot; `GitBridge::follow_local`):
-
-1. Nothing while a Git operation is in progress (`rebase-merge`,
-   `rebase-apply`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`,
-   `BISECT_LOG`, `index.lock`).
-2. `refs/heads/*` and a detached `HEAD` are imported (`import_tips`,
-   `ImportOrigin::Local`). Each new commit not reachable from a
-   remote-tracking ref is **local**: it stands only if its tree equals what
-   `fresh_commit` would export for its snapshot on its first parent, and its
-   parents stand. Otherwise its snapshot's mapping is dropped and exported
-   afresh, the branch (and a detached `HEAD`) moves to the replacement by
-   compare-and-swap, and the original is *held*. A held commit's snapshot is
-   represented by the replacement (`map.current`), so export never carries
-   over from it and `check-push` refuses it; a commit superseded by an
-   interrupted run is recognised from the map alone (its snapshot's current
-   commit is a Veil export).
-3. Tags follow branches (a non-fast-forward move keeps the old target as a
-   visible head); a branch deleted in Git deletes its tag unless Veil moved
-   the tag since. A branch named like a cloaked tag never moves it.
-   The user's own `skip-worktree` (read at adoption) and `assume-unchanged`
-   bits (`State::user_hidden`, re-read when the index changes) make every
-   snapshot keep those files' recorded entries (`BuildOptions::keep_recorded`)
-   until the user clears the bit; the mirror keeps the bits.
-4. `HEAD` moved: the paths Git manages (stage-0 index entries without
-   skip-worktree that Veil did not hide, public plain in the target) keep
-   Git's disk content. The others are snapshotted into the old `@` first
-   (`SnapshotOptions::only`), then `colocate::plan_head_move` chooses per
-   path among base, old `@` and target (carry an edit Git could not see,
-   take the target's version, or keep the edit in the old change), never
-   across a cloak or embargo boundary; `apply_head_move` writes the new
-   change and abandons the old one only if nothing of it is lost;
-   `checkout::restore_paths` (the no-follow writer) moves the hidden files.
-   The snapshot that follows takes `.veilpolicy` as *incoming*: a pulled
-   weakening is held back by the accepted policy.
-
-**Mirror** (`colocate_cmd::finish_session`, from `Ctx::finish`;
-`GitBridge::mirror`): tags are exported without refs
-(`export_without_refs`), `@-` (or its nearest exportable ancestor) is
-exported, and `refs/heads/*`, `refs/tags/*` and `HEAD` are written by
-compare-and-swap against what Git last held (`state.refs`; a ref Git moved
-since is skipped and imported by the next command; gix transactions with
-`Fail::Immediately`, so Veil never waits for a Git lock). Only refs Veil
-owns (`state.owned`: written as a tag's export) are ever deleted: a Git
-branch Veil cannot follow (`issue#12`) or must not (a cloaked tag's name)
-stays, and so does `HEAD` on it. `HEAD` keeps its
-branch while that branch is the export of `@-`, else takes the one tag at
-`@-`, else detaches. **Frozen mode**, every index entry skip-worktree and
-`*` excluded, holds when the workspace or `@` is cloaked, `@` carries an
-unreleased embargo, or `@-` cannot be exported. Outside it, every Git path
-whose entry in `@` is not plain public content (sealed, fallback,
-embargo-wrapped, a conflict, absent, or a quarantined edit) is
-skip-worktree. The index (`git/index.rs`, encoded and decoded by
-`gix-index`) is written to an exclusively created `index.lock` and renamed;
-an existing `index.lock` means Git is busy and the write is skipped, never
-waited for or removed. It is rewritten only when `HEAD`, the skip set or
-frozen mode changed, or when Git cleared a skip-worktree bit (re-asserted
-every command); staged entries of paths Git may see survive while `HEAD`
-stays. The exclude block (`policy_gitignore::policy_lines`: every
-protective rule of the effective and accepted policies, no negation,
-case-folded where Veil matches case-insensitively, braces expanded,
-artefact variants of protected names) is written last, on every command,
-with `*` whenever the repository says the working copy is frozen, even if
-the mirror could not run. **Freeze first:** before the working copy is
-moved onto cloaked or embargoed work (`Ctx::finish_working_copy`, and the
-catch-up of a stale directory), `colocate_cmd::before_materialise` freezes
-the index and writes `*`; while Git is busy (an operation in progress,
-`index.lock` held) it cannot, and the move is refused before a file is
-written.
-
-**What precedence cannot do.** Git ranks every `.gitignore` above
-`info/exclude`, and nothing outranks a `.gitignore`, so a negation there
-(`!secrets/`, `!*.md`) un-hides protected paths whatever Veil writes.
-Every mirror looks for negations in the working copy's `.gitignore` files,
-derives a path each would re-include (`policy_gitignore::negation_probes`)
-and asks Git (`git check-ignore --no-index`) about those Veil protects and
-about the protected files on disk; any exposure is reported on every
-command and freezes Git commits (`State::exposed`) until the negation goes.
-Git can still hash such a file on `git add`, or stash it: the guards keep
-it out of commits (`pre-commit`), remotes (`pre-push`, superseding) and,
-after `--prune`, `.git`. Git runs no hook for `git stash`: what a stash
-holds that Veil hides (`GitBridge::stash_findings`) is reported whenever
-the stash changes.
-
-**Gates.** `GitBridge::check_push` walks each pushed ref back to commits
-that are Veil exports or the current commit of their snapshot; a held
-commit, a commit Veil has not imported, and `refs/stash` are refused.
-`GitBridge::check_staged` refuses, in what `$GIT_INDEX_FILE` stages, any
-`.veil` path, any change while frozen (decided from the repository as it is
-now, `colocate::freeze_reason`, or an exposure, never from
-`colocated.json` alone), a hidden or local-only path, a path the policy
-does not make public, and public content the scanner flags.
-`vl git colocate --prune` deletes only the reflog entries naming held
-commits (`git reflog delete --rewrite`), then runs `git gc --prune=now`
-with reflog expiry off: stashes and the rest of the reflog are kept.
-`vl git uncolocate` keeps the exclude block and the skip-worktree bits of
-hidden files, lists the protected files, removes the hooks and the
-attributes block, and is refused on frozen work. The hooks are fixed scripts
-written by `vl` (device-local, like the hooks of §15; no repository content
-defines them); `git push --no-verify` is the documented residual hole.
-
 ## 12. Read commands: one API, text or JSON (`crates/vl/src/api.rs`)
 
 The read commands (`status`, `log`, `diff`, `show`, `ls`, `workspace list`,
@@ -3594,7 +2946,7 @@ for the CLI, and `blame`/`grep` methods in `vl serve`.
   matching lines over 1 MiB are cut; worker threads (with the `os` feature)
   and results sorted by path.
 * **`revset::resolve_set`**: `X`, `::B`, `A..B`, `..B`, `A..` (DAG
-  differences, children first); `vl log -r`, `vl bisect`, `vl format-patch`.
+  differences, children first); `vl log -r`, `vl bisect`.
 * **`bisect.rs`** holds the pure graph functions: candidates are the
   ancestors of the bad snapshot that are not ancestors of a good one (the
   root never), the next candidate splits them most evenly (exact ancestor
@@ -3627,7 +2979,6 @@ and runs without them. The user's view is in
 |---|---|---|
 | `os` | on | `DiskBackend` (`std::fs`, fsync, `libc`), `SftpBackend` (spawns `ssh`, threads), the lock's host introspection (`/proc`, `sysctl`, `kill`, `gethostname`, `std::process::id`) and heartbeat thread, the worker threads of sync (`par_map`), `Instant` as the monotonic clock |
 | `zstd` | on | the zstd C library (`zstd-sys`): compressed and delta pack entries written and read |
-| `git` | on | `veil_core::git` (gix, the system `git`); implies `os` |
 | `ruzstd` | off | the pure-Rust zstd decoder (`pack::pure`) |
 | `wasm` | off | `ruzstd` + getrandom's `wasm_js` (WebCrypto) backend |
 
@@ -3704,8 +3055,8 @@ with `--cfg getrandom_backend="custom"` and `ruzstd` instead of `wasm`, and
 supplies a `__getrandom_v03_custom` function (getrandom 0.4.3 does not
 compile with both `wasm_js` and the custom backend).
 
-**What is not there without `os`**: `DiskBackend`, SFTP remotes, Git
-interop, process-based lock recovery, worker threads (sync runs its
+**What is not there without `os`**: `DiskBackend`, SFTP remotes,
+process-based lock recovery, worker threads (sync runs its
 requests one after another), and the CLI.
 
 **Testing.** `tests/portable.rs` runs in both configurations: the smoke
@@ -3794,8 +3145,7 @@ and the absence of secret values carry over unchanged (section 12). No
 parameter is a path except `scan`'s `policy_from`, which is canonicalised
 and must lie inside the repository, outside `.veil/`; nothing runs a
 program. No string in the params (member names included) may hold a NUL,
-which no command-line argument can (BUG-486: a NUL in a description made
-the change unpushable to a Git remote that checks objects); `api` refuses
+which no command-line argument can (BUG-486); `api` refuses
 one in a description too (`api::check_message`).
 
 **Limits.** A request line is read up to 1 MiB without buffering more
@@ -3852,7 +3202,7 @@ starts a process, and `veil-core` has no hook API.
 |---|---|---|---|
 | `pre-commit` | `cmd_commit`, `cmd_describe` of `@`, `serve` `commit` / `describe` | env `VEIL_SNAPSHOT`, `VEIL_WORKSPACE` | refuses |
 | `commit-msg` | after `pre-commit` | `$1`: the message, `0600` in `.veil/local/tmp/` | refuses; an edit is used |
-| `pre-push` | `cmd_push`, the `vl git push` arm | argv remote, `redact_url(url)`, `public`/`team`/`git`; stdin one line per tag | refuses |
+| `pre-push` | `cmd_push` | argv remote, `redact_url(url)`, `public`/`team`; stdin one line per tag | refuses |
 | `post-checkout` | `run()`, after `ctx.finish()`, for `new`, `edit`, `ws switch` | old and new snapshot ids | warning |
 
 **Sources.** Device-local hooks (`$VEIL_HOME/hooks/<name>`, then
@@ -3937,15 +3287,9 @@ refused: the edits are in `@`, nothing is lost. `before_push` compares the
 tags instead. `vl` started inside a hook runs no hooks (no recursion).
 
 **Input never carries sealed content.** No hook input carries file content.
-`pre-push` lines come from the push's own plan (`push_plan::plan_push`) or,
-for Git, from the export the push then sends (`hooks::git_push_lines`
-mirrors `git::push_with`): only tags created, updated or rejected; never a
-cloaked tag on a public remote, never a snapshot in `withheld_snapshots`;
-for Git, the snapshot is `-` when the exported commit is a projection, and
-the release tags the push sends follow in Git's own format
-(`refs/tags/<name> <object> refs/tags/<name> <remote-object-or-zeros>`,
-`(delete) …` for `--delete-tag`; only exported tags, so never a cloaked or
-embargo-held one, BUG-641). A trusted hook runs as the user in the project directory
+`pre-push` lines come from the push's own plan (`push_plan::plan_push`):
+only tags created, updated or rejected; never a cloaked tag on a public
+remote, never a snapshot in `withheld_snapshots`. A trusted hook runs as the user in the project directory
 and can read what the user can: that is the documented trust boundary.
 
 **Where hooks do not run.** `ws exec` sandboxes and FUSE mounts record
@@ -3957,10 +3301,10 @@ finds no repository (`find_root`). `push --dry-run` runs nothing.
 Feature 7 of the Git-parity round (design and threat review:
 `docs/design/git-parity/7-attributes-line-endings.md`; user guide:
 `docs/guide/line-endings-and-attributes.md`). No format change:
-`.gitattributes` is a tracked file, and conversion only decides which
+`.veilattributes` is a tracked file, and conversion only decides which
 bytes are recorded and written.
 
-**Reading.** `attributes::Attrs` reads `.gitattributes` itself, lazily:
+**Reading.** `attributes::Attrs` reads `.veilattributes` itself, lazily:
 only the directories of the paths asked about, each file once
 (`AttrSource`: a working copy's backend, never through a symlink, or a
 recorded tree, where a file the reader cannot open counts as absent with a
@@ -3969,8 +3313,7 @@ device-local `.veil/local/attributes` (`ObjectStore::local_attributes`) has
 the highest priority. Matching ports Git's `wildmatch.c` and `attr.c`
 exactly (basename versus pathname patterns, `**` rules, `[attr]` macros
 from the top level only, the built-in `binary`, `!name`, the precedence of
-deeper files and later lines), checked by a differential test against `git
-check-attr` on generated trees (`tests/core_git/attributes_git.rs`). Exact names
+deeper files and later lines). Exact names
 and `*suffix` patterns are indexed, so a megabyte of them costs a lookup
 little. Limits: 1 MiB per file (ignored as a whole), Git's 2 048 bytes per
 line.
@@ -3984,11 +3327,10 @@ mixed with lone LF), which Git performs with a warning.
   scanning and sealing, on the one buffer). A file holding no CR costs
   nothing. A file that still stands for its parent entry keeps it (its
   bytes, or the CRLF rendering checkout wrote for it, `Materialised::crlf`),
-  whatever the attributes now say: changing `.gitattributes` never
+  whatever the attributes now say: changing `.veilattributes` never
   re-records a file (`BuildReport::renormalizable` lists those a
   renormalisation would change). Otherwise the attributes of the working
-  copy decide. `LineEndings::Off` (Git imports, `vl am`) records bytes as
-  they are; `LineEndings::Renormalize` (`vl renormalize`, an operation of
+  copy decide. `LineEndings::Renormalize` (`vl renormalize`, an operation of
   its own) ignores the parent for the paths selected.
 * **Checkout** (`checkout::apply_changes`) converts what it writes with the
   attributes of the tree it checks out (files, conflict renderings,
@@ -4001,21 +3343,15 @@ mixed with lone LF), which Git performs with a warning.
 * **Conflicts.** Markers are rendered on LF content and converted for the
   working copy; the builder undoes the conversion before comparing or
   parsing a copy back.
-* **Export.** The Git bridge exports recorded blobs as they are (Git
-  applies its own `.gitattributes` at checkout), so blob ids are those of
-  the recorded bytes.
 
 **Diff and merge.** `-diff`/`binary` make `vl diff` and `show`
-show binary (`api::content`, attributes of the working copy, as Git) and
-`format-patch` write `Binary files … differ` (attributes of the patched
-side's projection for the public audience, without the local file: a
-sealed `.gitattributes` never shapes a public patch; only regular files
-are written as binary, and a rename's destination decides). In `merge.rs`
+show binary (`api::content`, attributes of the working copy, as Git). In
+`merge.rs`
 stream R's `content_merge` seam picks the content merge (`strategy`,
 `attribute_merge`) from the attributes of `ours` with the followed renames
 applied, so a renamed file merges under the attributes of its new path,
 read as the merged file's audience reads them (`MergeAttrs`,
-`attributes::AudienceTreeSource`, BUG-705): a `.gitattributes` sealed for
+`attributes::AudienceTreeSource`, BUG-705): a `.veilattributes` sealed for
 another audience gives its last public version or nothing, so a sealed
 `merge=union` never decides a public result, and a member and a
 non-member merge the same public files alike: `Binary` (whole-file conflict), `Union`
@@ -4024,7 +3360,7 @@ A driver or union gets the base only when `base_shown` (its audience is
 the result's), never runs across an `audience_clash`, and its output is
 sealed by `merged_visibility`. A virtual merge base never runs a driver.
 
-**Drivers are device-local.** `.gitattributes` only names a driver. The
+**Drivers are device-local.** `.veilattributes` only names a driver. The
 engine knows only what the device registered on the store
 (`DeviceDrivers`, `ObjectStore::set_device_drivers`); the CLI registers
 `attr_cmd::LocalDrivers` from `$VEIL_HOME/config.toml` and
@@ -4048,9 +3384,8 @@ afterwards; textconv input on stdin, output never stored.
 
 *Not trusted:*
 
-* remotes and their operators (an SFTP server, a Git host, the future Hub). They see everything they store, and may withhold, replay, reorder or fork it;
-* anything that arrives by pull, fetch, merge, patch, bundle or Git import: trees, labels, policies, hooks, names, descriptions and metadata;
-* in colocated mode, anything Git can write: the work tree, the index, `.gitignore` and `.gitattributes`, refs and Git config. A `git pull` puts other people's content there, so a change Git could have made is never taken as the member's own edit (BUG-740, BUG-759);
+* remotes and their operators (an SFTP server, the future Hub). They see everything they store, and may withhold, replay, reorder or fork it;
+* anything that arrives by pull, fetch or merge: trees, labels, policies, hooks, names, descriptions and metadata;
 * teammates beyond their own scopes, and revoked members after their revocation;
 * other OS users on the same machine.
 
@@ -4059,9 +3394,6 @@ afterwards; textconv input on stdin, output never stored.
 * accidental commits of secrets (engine rules plus the scanner, with no ignore
   file to forget);
 * leaking cloaked content or names of cloaked tags to public remotes;
-* leaking cloaked, isolated or embargoed content, cloaked descriptions or
-  cloaked tags to a Git remote (Git sees what a public remote sees, §11),
-  and losing cloaked files when a commit made in Git is imported;
 * readers of a team remote who are not in a scope (they get ciphertext only);
 * pre-release disclosure of embargoed changes to non-members: their
   content, their messages, their history, and their file names, sizes and
@@ -4093,7 +3425,7 @@ afterwards; textconv input on stdin, output never stored.
 * **forged visibility metadata from a remote or an import** (BUG-103).
   Visibility labels of tree entries and a snapshot's `cloak` field are
   written by whoever produced the snapshot (anyone who can push to a team
-  remote, a Git import), so they are *claims*, never authority. The
+  remote), so they are *claims*, never authority. The
   audience of **new** content (an edit, merged or rebased content, a
   description) is decided from trusted inputs only: the accepted policy
   pin, the line's cloak if it names a scope, and the *verified* sealing of
@@ -4105,7 +3437,7 @@ afterwards; textconv input on stdin, output never stored.
   key generation (`team#<old>`, which a revoked member holds), `local`, or
   a scope the label merely names (§4, rule 5).
 * **code execution from a teammate's content** (§15). Nothing that arrives
-  by pull, merge, patch or Git import runs: repository hooks run only from
+  by pull or merge runs: repository hooks run only from
   bytes this device pinned by digest (copy-then-exec), with a scrubbed
   environment and a timeout; `.veil/hooks` cannot be written from a tree.
 
@@ -4173,8 +3505,8 @@ afterwards; textconv input on stdin, output never stored.
   Their in-protocol release is refused by every replica that holds the
   scope's ring (§7); a clone of a public remote, which has no ring, cannot
   judge it.
-* *An embargo release is final once pushed.* Until the next push or Git
-  export it is staged locally and `vl undo` takes it back (§7).
+* *An embargo release is final once pushed.* Until the next push it is
+  staged locally and `vl undo` takes it back (§7).
 * *Embargo metadata that remains visible:* that an embargoed merge exists,
   its parents' ids (the merged-in ones are redacted, not hidden), its
   author, its timestamp, the embargo's scope and deadline, and the
@@ -4200,11 +3532,6 @@ afterwards; textconv input on stdin, output never stored.
   release by members of that scope who are not in the embargo's. The
   embargoed merge itself refuses such changes (§7); for follow-ups, use the
   same scope for the cloak and the embargo.
-* *Git sees what a public remote sees*, including the metadata a public
-  remote keeps: names of public files, that a cloaked snapshot or an
-  embargoed merge exists (an empty-looking commit with a placeholder
-  message), its author and time. History imported from Git is public by
-  definition; cloaking a path later does not hide its Git history.
 * Content committed in plaintext **before** a path was cloaked stays readable
   in those older snapshots. `vl cloak` warns when this applies.
 
@@ -4246,7 +3573,3 @@ afterwards; textconv input on stdin, output never stored.
   (`eol=crlf` on disk) is cached through its `EolFact` but checkout never
   reflinks it; mixed-ending files are recorded unchanged where Git would
   normalise them; patterns match case-sensitively on every device.
-* Git interop: Git tags (annotated or not) are not imported or exported,
-  only branches; Git authors' time zones are not kept (export writes UTC);
-  carry-over of Git-only paths follows the first parent only; `vl git`
-  does not check out after a pull (use `vl new <tag>` or `vl edit`).

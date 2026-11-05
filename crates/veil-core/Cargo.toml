@@ -17,7 +17,6 @@ getrandom.workspace = true
 globset.workspace = true
 hkdf.workspace = true
 hpke.workspace = true
-gix = { workspace = true, optional = true, features = ["index"] }
 hex.workspace = true
 memchr.workspace = true
 aho-corasick.workspace = true
@@ -29,7 +28,6 @@ thiserror.workspace = true
 unicode-normalization.workspace = true
 x25519-dalek.workspace = true
 zeroize.workspace = true
-zlib-rs.workspace = true
 zstd = { workspace = true, optional = true }
 ruzstd = { workspace = true, optional = true }
 
@@ -41,9 +39,7 @@ libc = { workspace = true, optional = true }
 # --features wasm` is the portable engine that builds for
 # wasm32-unknown-unknown (scripts/check-wasm.sh).
 [features]
-default = ["git", "os", "zstd"]
-# Two-way Git interop (`veil_core::git`): needs a disk-backed repository.
-git = ["os", "dep:gix"]
+default = ["os", "zstd"]
 # A real operating system: `DiskBackend`, `SftpBackend` (spawns `ssh`),
 # process checks in the repository lock and its heartbeat thread, worker
 # threads, and the system clock as the default clock.

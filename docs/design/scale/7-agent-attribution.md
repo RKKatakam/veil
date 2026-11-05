@@ -61,7 +61,6 @@ pub struct Attribution {
 - **Kept** on rebase, auto-rebase, describe and `restore` (as `author` is kept).
 - **Squash keeps the destination's attribution.** The sources stay in `predecessors`, so `vl evolog` shows each one's attribution.
 - **`vl describe --agent none`** clears it; `--agent A …` sets it.
-- **Git import never invents an attribution**, and the Git export does not write one (open decision 3).
 
 ### Reading it
 
@@ -72,12 +71,12 @@ pub struct Attribution {
 
 ## Threat review
 
-1. **The prompt or task reaches a public remote or Git in plaintext.**
-   - *Invariant:* a sealed attribution `Text` is never plaintext outside its scope. Remotes receive the snapshot with the envelope, as for descriptions, and the Git export never includes attribution.
-   - *Test:* a property test (extend `adversarial7` rewrites): random histories with agent-stamped changes on public, cloaked and embargoed lines are pushed to a public remote and exported to Git. Grep every decoded object and commit for each task and prompt string: none outside readers of the scope.
+1. **The prompt or task reaches a public remote in plaintext.**
+   - *Invariant:* a sealed attribution `Text` is never plaintext outside its scope. Remotes receive the snapshot with the envelope, as for descriptions.
+   - *Test:* a property test (extend `adversarial7` rewrites): random histories with agent-stamped changes on public, cloaked and embargoed lines are pushed to a public remote. Grep every decoded object for each task and prompt string: none outside readers of the scope.
 2. **Leaking through a task title on an embargoed line** (the BUG-016 class: "embargo messages published in plaintext before release").
    - *Invariant:* `task` and `prompt` are sealed exactly when and as the description is (`description_scope`).
-   - *Test:* an embargoed fix made by an agent with the task "fix CVE-2026-1234 in auth". The public remote and Git hold no "CVE-2026-1234" before release, and do after (for `task`).
+   - *Test:* an embargoed fix made by an agent with the task "fix CVE-2026-1234 in auth". The public remote holds no "CVE-2026-1234" before release, and do after (for `task`).
 3. **Spoofing or stripping from inside the sandbox.** The command sets `VEIL_AGENT`, writes a file that looks like attribution, or runs `vl describe`.
    - *Invariant:* attribution comes only from the recording `vl` process's own arguments and environment; a command inside `ws exec` cannot reach the repository (`find_root` refuses `.veil/` and the ceiling is set).
    - *Test:* a sandbox command that exports `VEIL_AGENT=evil`, writes `.veil-agent` and runs `vl describe` (which fails). The recorded snapshot's attribution is the harness's.
@@ -89,10 +88,10 @@ pub struct Attribution {
    - *Test:* flip one byte of `agent` in a signed snapshot: the id changes. A forged re-encoding with the original signature fails verification. `format_compat.rs`: a format-5 store's `put_raw` refuses an attributed snapshot with the upgrade hint.
 6. **Silent loss in rewrites or round trips.**
    - *Invariant:* every rewrite keeps the attribution unless the user changes it; squash keeps the destination's and the evolution log keeps the rest.
-   - *Test:* a property test of rebase, squash, split, duplicate, `am` and auto-rebase on attributed changes: the field equals the expected one after each.
+   - *Test:* a property test of rebase, squash, split, duplicate and auto-rebase on attributed changes: the field equals the expected one after each.
 7. **The device-local prompt record.**
-   - *Invariant:* `.veil/local/attribution/` is 0700, its files 0600 and sealed under `local`; it is never synced, never in a sandbox, never exported.
-   - *Test:* permissions and `vl push`/`vl git push` contents.
+   - *Invariant:* `.veil/local/attribution/` is 0700, its files 0600 and sealed under `local`; it is never synced and never in a sandbox.
+   - *Test:* permissions and `vl push` contents.
 8. **Size abuse.** A 4 GiB prompt reference.
    - *Invariant:* 4 KiB cap on the opened text, enforced when stamping and when decoding.
    - *Test:* `--prompt-ref` of 5 KiB is refused with a message, and a pulled snapshot with one is skipped.
@@ -100,12 +99,10 @@ pub struct Attribution {
    - *Invariant:* glob only (no regex), length capped, with the same error path as other revset functions.
    - *Test:* the `adversarial_fuzz.rs` revset fuzzer gains `agent(…)`.
 10. **Interactions:**
-    - **colocated Git:** not exported;
     - **the team vault:** none;
     - **the history index:** not indexed (`agent()` reads snapshots; it is a filtered walk, exempt from the gate like `log -S`);
     - **mounts and sandboxes:** the flags are stored in device-local state only.
 
-    - *Test:* a colocated repository with an attributed commit: `git log --format=%B` shows no attribution.
 
 ## Open decisions
 
@@ -113,7 +110,5 @@ pub struct Attribution {
    - *Recommendation:* defer to the Hub (Scion 4.5 needs per-agent credentials anyway). This round, the member's signature covers the claim.
 2. **A new signing context for attributed snapshots.**
    - *Recommendation:* no (the argument above); the crypto reviewer confirms it in `CRYPTO.md`.
-3. **Git trailers** (`Veil-Agent: …`).
-   - *Recommendation:* not this round. It is easy to add for public changes later; plaintext rules for sealed fields would need care.
 4. **The default for prompts without an attribution scope.**
    - *Recommendation:* the device-local side record (above), not a `local`-sealed envelope inside the snapshot: ciphertext nobody else can open would only leak its length.

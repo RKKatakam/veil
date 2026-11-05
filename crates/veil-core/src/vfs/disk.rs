@@ -44,11 +44,6 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct DiskBackend {
     root: PathBuf,
-    /// Where the engine's own paths (`.veil/…`) live when that is not
-    /// `<root>/.veil`: a colocated project keeps them in `<root>/.git/veil`
-    /// ([`crate::repo::colocated_state_dir`]), and `.veil` in the work tree
-    /// (Git's to write) is never read or written for them.
-    state: Option<PathBuf>,
     unsynced: Arc<Mutex<Unsynced>>,
     /// Serialises barriers (see [`StorageBackend::sync_barrier`]).
     barrier: Arc<Mutex<()>>,
@@ -127,10 +122,8 @@ fn escape_name(name: &std::ffi::OsStr) -> String {
 
 impl DiskBackend {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        let root = root.into();
         DiskBackend {
-            state: crate::repo::colocated_state_dir(&root),
-            root,
+            root: root.into(),
             unsynced: Arc::default(),
             barrier: Arc::default(),
             folding: Arc::default(),
@@ -142,24 +135,11 @@ impl DiskBackend {
     }
 
     pub fn full_path(&self, p: &VPath) -> PathBuf {
-        if let Some(state) = self.state.as_ref().filter(|_| Self::own_path(p)) {
-            let mut f = state.clone();
-            for c in p.components().skip(1) {
-                f.push(c);
-            }
-            return f;
-        }
         let mut f = self.root.clone();
         for c in p.components() {
             f.push(c);
         }
         f
-    }
-
-    /// Where the engine's own `.veil/` directory really is (see
-    /// [`crate::repo::state_dir`]).
-    pub fn state_dir(&self) -> PathBuf {
-        self.state.clone().unwrap_or_else(|| self.root.join(crate::repo::VEIL_DIR))
     }
 
     /// Paths the engine keeps for itself (`.veil/` at the root) are

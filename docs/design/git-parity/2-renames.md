@@ -36,7 +36,7 @@ Status: design and threat review. No format change: renames are computed, never 
 ## Threat review
 
 1. **The similarity score as an oracle on sealed content.** If inexact scoring read sealed objects for a reader who holds the key, and the result were stored or exported, it would leak. A score, the old-path pairing, is a few bits of information about cloaked plaintext.
-   - *Invariant:* renames are never stored in snapshots, trees, operations or the Git export (Git recomputes on public content). They appear only in this reader's output.
+   - *Invariant:* renames are never stored in snapshots, trees or operations. They appear only in this reader's output.
    - *Test:* grep the encodings and the op log after a `vl merge` that followed a rename: no rename record.
 2. **A merge result that depends on the merger's keys.** A member of `ops` pairs `secrets/a.yml` (sealed) with `config/a.yml` by content; a non-member cannot. The two merge differently, but that is not a leak. The risk is that a member's merge *moves sealed content to another path whose audience differs*.
    - *Invariant:* the content merge runs through `merge::merge_file` with the real entries, so its audience rules (`merged_visibility`, `audience_clash`, two scopes → conflict, BUG-123) decide the sealing. The pairing only changes which entries are combined.
@@ -57,7 +57,7 @@ Status: design and threat review. No format change: renames are computed, never 
 8. **A rename across embargo views.** For a non-holder, an embargoed merge's tree resolves to the fallback. Rename detection must run on the *reader's resolved trees* (`checkout::resolve_view`), never on the wrapper's listed ids, which would show the fix renamed a file (BUG-104/018 class).
    - *Test:* an embargoed fix renames `a.c` to `b.c`; an outsider's `vl show` of the merge lists no rename and no `b.c`.
 9. **Conflict entries as rename sources.** A conflict is matched only by an exact equal conflict id, never by inexact content (rendering it costs the materialise budget, and its sides have their own audiences).
-10. **Kinds** (feature 6). A symlink renames only to a symlink, and a gitlink only to a gitlink, both by exact id. A file ↔ symlink pair is never a rename.
+10. **Kinds** (feature 6). A symlink renames only to a symlink, by exact id. A file ↔ symlink pair is never a rename.
 11. **Case-only renames on macOS** (`README` → `readme`). The builder already keeps recorded spellings stable (`canonical_names`). `vl status` shows `R README -> readme` only after an explicit `mv` that changed the recorded spelling.
     - *Test (`macos_fs.rs` harness):* a case-only rename is shown as a rename, not as D + A.
 12. **Auto-rebase churn.** Rename-aware merging in `Repo::rebase_tree` changes results for existing histories. That is a behaviour change, not a format change, but rebasing an old conflicted change could now resolve differently.

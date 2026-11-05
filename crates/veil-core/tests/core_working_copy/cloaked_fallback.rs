@@ -1,6 +1,6 @@
 //! A public file edited on a cloaked line is sealed with its **last public
 //! version** as `fallback` (BUG-074). Readers without the key (public
-//! remotes, Git export, members of other scopes) see that version, never a
+//! remotes, members of other scopes) see that version, never a
 //! deletion; the edit itself stays sealed. A file the policy cloaks
 //! deliberately (`vl cloak`) carries no fallback.
 

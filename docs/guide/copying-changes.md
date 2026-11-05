@@ -138,4 +138,4 @@ content into a wider audience, and never publish anything.
   ```
 
 Renames are computed when merging and reported to you; they are never
-stored in a snapshot, the operation log, a remote or the Git export.
+stored in a snapshot, the operation log or a remote.

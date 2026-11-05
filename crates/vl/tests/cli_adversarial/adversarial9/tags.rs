@@ -96,51 +96,9 @@ fn a_moved_release_tag_is_reported_recorded_and_taken_only_with_force() {
     assert_eq!(env.stdout(U, &alice, &["cat", "-r", "v1.0", "f.txt"]), "backdoor\n");
 }
 
-/// BUG-703 through the Git bridge: a Git **branch** named like a local
-/// release tag (`refs/heads/v1.0`) never fast-forwards the release tag on
-/// `vl git pull` (it used to, dropping its signed annotation).
-#[test]
-fn a_git_branch_named_like_a_release_tag_never_moves_it() {
-    use std::process::Command;
-    let git = |dir: &std::path::Path, args: &[&str]| {
-        let out = Command::new("git")
-            .current_dir(dir)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("HOME", dir)
-            .args(["-c", "user.name=Gita", "-c", "user.email=gita@example.com", "-c", "init.defaultBranch=main"])
-            .args(["-c", "commit.gpgsign=false", "-c", "protocol.file.allow=always", "-c", "advice.detachedHead=false"])
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-    };
-    let env = Env::new();
-    let alice = env.project(U, "alice", &[("f.txt", "release\n")]);
-    env.ok(U, &alice, &["tag", "set", "v1.0", "-r", "main", "-a", "-m", "Release 1.0"]);
-    let bare = env.root.join("hub.git");
-    git(&env.root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
-    env.ok(U, &alice, &["git", "remote", "add", "origin", bare.to_str().unwrap()]);
-    env.ok(U, &alice, &["git", "push"]);
-    let work = env.root.join("work");
-    git(&env.root, &["clone", "-q", bare.to_str().unwrap(), work.to_str().unwrap()]);
-    git(&work, &["checkout", "-q", "-b", "topic-1", "main"]);
-    write(&work, "f.txt", "backdoor\n");
-    git(&work, &["commit", "-q", "-am", "harmless"]);
-    git(&work, &["push", "-q", "origin", "topic-1:refs/heads/v1.0"]);
-
-    let ours = tag_target(&env, &alice, "tags", "v1.0");
-    let pull = super::adversarial_support::text(&env.vl(U, &alice, &["git", "pull"]));
-    assert_eq!(tag_target(&env, &alice, "tags", "v1.0"), ours, "{pull}");
-    assert!(pull.contains("has the name of release tag v1.0"), "{pull}");
-    let verify = env.stdout(U, &alice, &["tag", "verify", "v1.0"]);
-    assert!(verify.contains("good signature by alice"), "{verify}");
-    assert_eq!(env.stdout(U, &alice, &["cat", "-r", "v1.0", "f.txt"]), "release\n");
-}
-
 /// BUG-710: `vl push` of a release tag moved here with `vl tag set --force`
-/// (even forward) never moves it on a Veil remote without `--force-tags`,
-/// as `vl git push` needs `--force-tags` for the Git tag. Plain tags still
-/// fast-forward; the dry run says the same.
+/// (even forward) never moves it on a Veil remote without `--force-tags`.
+/// Plain tags still fast-forward; the dry run says the same.
 #[test]
 fn a_veil_push_never_moves_a_release_tag_without_force_tags() {
     let env = Env::new();

@@ -11,8 +11,8 @@ push, after the working copy moves. Veil has Git's two kinds:
   them, they stop running until you trust them again.
 
 Veil treats a teammate's push as untrusted input, so hooks follow one rule:
-nothing that arrives by a pull, a merge, a patch or a Git import runs
-until you trust it on this device.
+nothing that arrives by a pull or a merge runs until you trust it on this
+device.
 
 ## Hook points
 
@@ -20,11 +20,11 @@ until you trust it on this device.
 |---|---|---|---|
 | `pre-commit` | before `vl commit`, `vl describe` of `@`, and `commit` / `describe` over `vl serve` | `VEIL_SNAPSHOT` (the `@` about to be committed), `VEIL_WORKSPACE` | refuses the commit |
 | `commit-msg` | after `pre-commit` | `$1`: a file holding the message (mode `0600`, in `.veil/local/tmp/`) | refuses the commit; an edited message is used |
-| `pre-push` | before `vl push` and `vl git push` | argv: remote name, URL (credentials replaced by `***`), `public`, `team` or `git`; stdin: one line per tag (below) | refuses the push |
+| `pre-push` | before `vl push` | argv: remote name, URL (credentials replaced by `***`), `public` or `team`; stdin: one line per tag (below) | refuses the push |
 | `post-checkout` | after `vl new`, `vl edit` and `vl ws switch` moved the working copy | argv: the old and the new snapshot id | a warning only |
 
 A hook runs in the project directory, with `VEIL_HOOK` set to its name.
-`--no-verify` on `commit`, `describe`, `push` and `git push` (or
+`--no-verify` on `commit`, `describe` and `push` (or
 `"no_verify": true` over `vl serve`) skips every hook for that command.
 
 ## Your own hooks
@@ -32,7 +32,7 @@ A hook runs in the project directory, with `VEIL_HOOK` set to its name.
 Put an executable at `.veil/hooks/<name>` (this repository) or
 `$VEIL_HOME/hooks/<name>` (every repository; `~/.config/veil/hooks/` by
 default). Both run, global first. `.veil` is never recorded, and nothing a
-pull, a patch or a Git import brings can write there.
+pull brings can write there.
 
 ```console
 $ cat .veil/hooks/pre-commit
@@ -214,25 +214,12 @@ remote will reject it):
 
 ```text
 <tag> <snapshot> <remote-snapshot-or-0>            # vl push
-<tag> <snapshot-or--> <remote-snapshot-or-0> <git-commit>   # vl git push
 <tag> 0 <remote-snapshot-or-0>                     # vl push --delete
-refs/tags/<name> <git-object> refs/tags/<name> <remote-object-or-zeros>  # vl git push, a release tag
-(delete) <zeros> refs/tags/<name> <remote-object-or-zeros>             # vl git push --delete-tag
 ```
 
-The Git tag lines are in Git's own `pre-push` format, so a check written for
-Git reads them as it is: `<git-object>` is what `refs/tags/<name>` holds (the
-tag object of an annotated tag), the remote side is what the bridge last
-fetched from or pushed to that remote, and `<zeros>` is 40 zeros. A tag-only
-push (`--tag v1.0`, `--delete-tag v1.0`) lists just the tag; a tag the push
-refuses before sending (another target there, without `--force-tags`) is
-not listed.
-
-On a public remote, and on Git, the lines never name a cloaked tag, and
-never a snapshot that an unreleased embargo holds back: exactly what the
-remote receives. A release tag waiting for an embargo's release is not
-exported, so it is not listed either. For `vl git push`, the snapshot is
-`-` when the Git commit is a projection (an embargo's pre-merge tree).
+On a public remote the lines never name a cloaked tag, and never a
+snapshot that an unreleased embargo holds back: exactly what the remote
+receives.
 
 ## A hook cannot change what you commit
 
@@ -270,6 +257,3 @@ process group is stopped when it exits.
 * `vl push --dry-run` sends nothing, so it runs no `pre-push`.
 * `vl serve` runs the same hooks for `commit` and `describe` of `@`, with
   their output on the server's stderr; it has no method to trust hooks.
-* In [colocated Git mode](colocated-git.md) (experimental), Veil installs
-  its own `pre-commit` and `pre-push` guards into `.git/hooks` (a hook
-  already there is kept and runs first); Git runs those, not `.veilhooks`.

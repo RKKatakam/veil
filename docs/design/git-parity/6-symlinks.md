@@ -36,12 +36,11 @@ That stays exactly the behaviour of repositories below format 5.
 - **FUSE mount** (`mount/fs.rs`): `readlink` and `symlink` are served from the overlay, path resolution inside `MountFs` never follows links (the kernel follows them for callers, inside the mount's namespace), and the `EPERM` for `symlink()` is lifted in format 5.
 - **Sandboxes** (`sandbox.rs`, `vfs/sandbox.rs`): links are checked out as links. Reflink cloning (`clone_known`) applies to files only.
 - **Diff and display:** `vl diff` shows `symlink a -> old` / `-> new`; `vl ls` shows `l` and the target, escaped. JSON `kind: "symlink"`, `target`.
-- **Git bridge:** import maps mode `120000` to `Symlink` in format 5 (below, today's carry-over), and export maps the reverse.
 
 ## Threat review
 
 1. **Write-through on checkout** (BUG-025 class, CVE-2014-9390 / CVE-2021-21300 style). A tree has `a -> /home/u/.ssh`, and a later tree replaces `a` with a directory holding `authorized_keys`. Or one tree holds `A -> /tmp/x` and `a/file` on a case-insensitive filesystem.
-   - *Invariant:* no checkout, restore, sandbox sync, `am` or mount write ever resolves through a symlink: every component is opened `O_NOFOLLOW` (beneath the root fd). `checkout::name_collisions` counts links as names, so `A` and `a/` collide on macOS and the checkout is refused.
+   - *Invariant:* no checkout, restore, sandbox sync or mount write ever resolves through a symlink: every component is opened `O_NOFOLLOW` (beneath the root fd). `checkout::name_collisions` counts links as names, so `A` and `a/` collide on macOS and the checkout is refused.
    - *Tests:* the CVE-2021-21300 shape (a case-folding collision of a link and a directory), run in `macos_support`; a link-then-directory sequence across two checkouts; a race thread swapping a directory for a link during checkout (`checkout_obstacles.rs` style). Nothing appears outside the root.
 2. **Reading through links in the builder.** Today `read` refuses links. *Invariant:* the builder reads link *targets* only (`readlinkat`), never content through a link, apart from the existing `.veilpolicy` rule. *Test:* `notes.txt -> /etc/shadow`; the snapshot records the target string only, and no object holds the file's bytes.
 3. **Links into isolated files.** `public/env -> ../.env`. The link records only the string `../.env`, so the `.env` *content* is not recorded. The *name* of an isolated file becomes visible in history. This is accepted; `vl status` warns "`public/env` points to an isolated file".
@@ -69,7 +68,7 @@ That stays exactly the behaviour of repositories below format 5.
     - *Test:* a merge with link/link and link/file conflicts; `vl resolve --theirs` gives the right kind.
 13. **Hostile trees.** A symlink entry with `executable` set, a non-UTF-8 target object, a target over 4 KiB (`PATH_MAX`), a NUL in the target, or a sealed target with a fallback that is a file blob.
     - *Invariant:* the binary tree decoder refuses invalid flag combinations (canonical-by-construction). At checkout, a target with NUL or over 4 KiB is refused per path (`failed`), never panicking. *Test:* the fuzzer `adversarial_fuzz.rs` gains a symlink-kind generator.
-14. **Git import: a symlink to `.veilpolicy`, or a link named `.veilpolicy`.** That is refused today (BUG-058). *Invariant:* kept. Format 5 does not make `.veilpolicy` a recordable link.
+14. **An incoming symlink to `.veilpolicy`, or a link named `.veilpolicy`.** That is refused today (BUG-058). *Invariant:* kept. Format 5 does not make `.veilpolicy` a recordable link.
 15. **`vl serve`, `--json`, escapes.** Targets are raw data, escaped by `render::safe` and `to_json`. *Test:* a target holding an OSC 8 hyperlink escape.
 16. **macOS.** `symlinkat`/`renameat` semantics and `openat` with `O_NOFOLLOW` exist; `openat2` does not. *Invariant:* the per-component `O_NOFOLLOW` walk is the macOS path, and the CI macOS job runs the traversal tests.
 

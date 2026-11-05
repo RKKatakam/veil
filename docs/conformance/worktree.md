@@ -81,7 +81,7 @@ cargo test -p vl --test cli_conformance -- --ignored conformance_worktree::    #
   shows `R old -> new`, also for a case-only rename on macOS.
 * **History search / grep** (t3201, t78xx): `vl log` by path, author,
   `-S`/`-G`; grep over a snapshot.
-* **Git tags** (t7004 annotated/signed, t3800): belong to the Git bridge.
+* **Git tags** (t7004 annotated/signed, t3800): Veil's annotated tags cover what applies; Veil does not interoperate with Git.
 
 ## Git scripts
 
@@ -117,7 +117,7 @@ reason share a line.
 | t0100-previous | not applicable | `@{-N}` previous-branch syntax: no checkout history in Veil |
 | t0101-at-syntax | not applicable | `@{…}` reflog syntax: the op log replaces it (see `undo::*`) |
 | t0200-gettext-basic … t0213-trace2-ancestry (9 scripts) | not applicable | gettext / trace2: Git's own i18n and tracing |
-| t0300-credentials … t0303-credential-external (4 scripts) | not applicable | credential helpers (Veil runs `git` for the Git bridge; other agent) |
+| t0300-credentials … t0303-credential-external (4 scripts) | not applicable | credential helpers (Veil does not run `git`) |
 | t0410-partial-clone … t0411-clone-from-partial (2 scripts) | not applicable | partial clone (deferred to 1.1) |
 | t0450-txt-doc-vs-help … t0500-progress-display (2 scripts) | not applicable | doc-vs-help consistency, progress display (Veil generates its reference from clap) |
 | t0600-reffiles-backend … t0614-reftable-fsck (8 scripts) | not applicable | ref storage backends (files, reftable) |
@@ -243,7 +243,7 @@ reason share a line.
 | t7001-mv | ported | `add_rm_mv::moving_a_file_is_a_delete_and_an_add`, `moving_a_directory_moves_its_files`, `moving_over_an_existing_file`, `moving_a_file_into_a_cloaked_directory_cloaks_it`, `renaming_a_file_to_a_secret_name_stops_recording_it` (rename detection pending) |
 | t7002-mv-sparse-checkout | not applicable | sparse checkout / skip-worktree |
 | t7003-filter-branch | not applicable | filter-branch |
-| t7004-tag | ported | `tags::*` (Veil tags are local names; annotated/signed Git tags: pending "Git tags" and "signed tags"; Git-bridge tags belong to the interop agent), `visibility::a_cloaked_tag_stays_off_a_public_remote` |
+| t7004-tag | ported | `tags::*` (Veil tags are local names; annotated and signed tags: `vl tag set -a`, `vl tag verify`), `visibility::a_cloaked_tag_stays_off_a_public_remote` |
 | t7005-editor … t7006-pager (2 scripts) | not applicable | editor and pager (no editor prompt: `-m` is required) |
 | t7007-show | not applicable | other conformance agent (diff/history): `git show` |
 | t7008-filter-branch-null-sha1 | not applicable | filter-branch |
@@ -319,7 +319,7 @@ reason share a line.
 | cli `test_file_track_untrack_commands.rs` | ported | untrack = `vl ignore`: `ignores::ignoring_a_tracked_file_untracks_it_and_keeps_it_on_disk`, `removing_an_ignore_rule_tracks_the_file_again`, `undo_takes_back_an_ignore_rule` (auto-track only) |
 | cli `test_file_delete_command.rs` | ported (via the disk) | `add_rm_mv::deleting_*` |
 | cli `test_file_edit_command.rs`, `test_file_annotate_command.rs`, `test_file_search_command.rs` | pending feature | editor-driven edit (not planned), annotate/blame, grep |
-| cli `test_tag_command.rs` | ported | `tags::*` (Veil tags are local names; Git-bridge tags belong to the interop agent) — BUG-210 |
+| cli `test_tag_command.rs` | ported | `tags::*` (Veil tags are local names) — BUG-210 |
 | cli `test_bookmark_command.rs` | ported (local behaviour) | `tags::*`: create, move, backwards guard, delete, rewrites, abandon. Not applicable: remote tracking, `track/untrack`, conflicted bookmarks |
 | cli `test_advance_bookmarks.rs` | ported | `commit::commit_advances_every_tag_at_the_parent`, `commit_does_not_move_tags_elsewhere`, `commit_in_a_cloaked_workspace_does_not_move_main` |
 | cli `test_undo_redo_commands.rs` | ported | `undo::*` — BUG-206. Not applicable: `jj redo` (no command; a second undo redoes) |

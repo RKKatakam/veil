@@ -22,7 +22,6 @@ macro_rules! eprintln {
 mod api;
 mod attr_cmd;
 mod cli;
-mod colocate_cmd;
 mod ctx;
 mod doctor;
 #[cfg(test)]
@@ -30,14 +29,12 @@ mod docgen;
 mod history;
 mod hooks;
 mod mount;
-mod patch_cmd;
 mod picker;
 mod render;
 mod rewrite_cmd;
 mod sandbox;
 mod serve;
 mod shape;
-mod submodule_cmd;
 mod team_secret;
 
 use std::{
@@ -136,8 +133,7 @@ fn open(cli: &Cli) -> Result<Ctx> {
 
 fn run(cli: Cli) -> Result<ExitCode> {
     match &cli.cmd {
-        Cmd::Init { path, colocate } if colocate.colocate => colocate_cmd::init_colocate(path.as_deref(), colocate),
-        Cmd::Init { path, .. } => cmd_init(path.as_deref()),
+        Cmd::Init { path } => cmd_init(path.as_deref()),
         Cmd::Clone { source, dest } => cmd_clone(source, dest.as_deref()),
         Cmd::Identity(c) => cmd_identity(c),
         Cmd::Fsck { verbose } => cmd_fsck(cli.repository.as_deref(), *verbose),
@@ -176,12 +172,6 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let code = dispatch(&mut ctx, &cli)?;
             ctx.finish()?;
             hooks::post_checkout(&ctx, &cli.cmd, before);
-            if ctx.uncolocated {
-                // Nothing of this command writes the repository any more.
-                let root = ctx.root.clone();
-                drop(ctx);
-                colocate_cmd::finish_uncolocate(&root)?;
-            }
             Ok(code)
         }
     }
@@ -223,10 +213,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         // as one JSON document.
         Cmd::Status { out } => match out.json {
             true => api::emit_json(&api::status(ctx)?)?,
-            false => {
-                api::text::status(&api::status(ctx)?);
-                colocate_cmd::status_notes(ctx);
-            }
+            false => api::text::status(&api::status(ctx)?),
         },
         Cmd::Log { limit, filter, out } => history::log(ctx, *limit, filter, out.json)?,
         Cmd::Show { rev, stat, renames, out } => history::show(ctx, rev, *stat, renames, out.json)?,
@@ -252,8 +239,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
                 false => lookup(ctx.repo.store(), &ctx.repo.snapshot(&id)?.tree, &p)?,
             };
             match &e {
-                // A symlink prints its target, a gitlink its commit id, as
-                // `git cat-file` does.
+                // A symlink prints its target.
                 Some(e) if e.kind.is_file_like() || e.kind.is_special() => {}
                 Some(_) => bail!("{} is a directory in {}, not a file (`vl files -r {}` lists its files)", safe(p.as_str()), id.short(), id.short()),
                 None if p.is_root() => bail!("'{}' is the repository's root directory, not a file", safe(path)),
@@ -507,11 +493,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             return cmd_push(ctx, remote.as_deref().unwrap_or("origin"), tag, *force, &opts, delete, hooks);
         }
         Cmd::Pull { remote, full } => cmd_pull(ctx, remote, *full)?,
-        Cmd::Git(c) => return cmd_git(ctx, c),
-        Cmd::FormatPatch(a) => return patch_cmd::format_patch(ctx, a),
-        Cmd::Am(a) => return patch_cmd::am(ctx, a),
         Cmd::Hooks(c) => return hooks::run(ctx, c),
-        Cmd::Submodule(c) => return submodule_cmd::run(ctx, c),
         Cmd::Gc {
             keep_ops_days,
             grace_minutes,
@@ -526,13 +508,6 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
 // ---- setup ---------------------------------------------------------------
 
 fn cmd_init(path: Option<&Path>) -> Result<ExitCode> {
-    init_repository(path, true)
-}
-
-/// `vl init`; without `record`, nothing of the directory is recorded yet
-/// (`vl init --colocate` adopting a Git checkout records it once it knows
-/// which local edits Git was told to hide, BUG-745).
-pub(crate) fn init_repository(path: Option<&Path>, record: bool) -> Result<ExitCode> {
     let root = match path {
         Some(p) => p.to_path_buf(),
         None => std::env::current_dir()?,
@@ -546,12 +521,6 @@ pub(crate) fn init_repository(path: Option<&Path>, record: bool) -> Result<ExitC
     // Anything there (a symlinked or unreadable policy too) is kept.
     if std::fs::symlink_metadata(root.join(POLICY_FILE)).is_err() {
         fs.write(&policy, DEFAULT_POLICY.as_bytes())?;
-    }
-    if !record {
-        let wc = repo.workspace_wc(DEFAULT_WORKSPACE)?;
-        save_checkout(&fs, &CheckoutState::new(DEFAULT_WORKSPACE, wc, Materialised::default()))?;
-        println!("Initialized Veil repository in {}", root.join(".veil").display());
-        return Ok(ExitCode::SUCCESS);
     }
     let out = repo.snapshot_workspace(DEFAULT_WORKSPACE, &*fs)?;
     repo.capture_local_files(&*fs, &out.report)?;
@@ -975,7 +944,7 @@ fn print_tags_kept(repo: &Repo, r: &CommitResult) {
     if let Some((_, TagKept::CloakedLine(scope))) = cloaked.first() {
         let first = safe(&cloaked[0].0).into_owned();
         eprintln!(
-            "{} {} not moved: this is a line cloaked for '{}', and a commit there never moves an uncloaked tag (public remotes and Git would receive it)",
+            "{} {} not moved: this is a line cloaked for '{}', and a commit there never moves an uncloaked tag (public remotes would receive it)",
             yellow("note:"),
             names(&cloaked),
             safe(scope)
@@ -1162,8 +1131,8 @@ fn restored_as_recorded(repo: &veil_core::repo::Repo, e: &veil_core::TreeEntry) 
     use veil_core::builder::{verify_sealing, Sealing};
     Ok(match e.kind {
         veil_core::EntryKind::Conflict => true,
-        // A symlink's target and a gitlink's commit id are content too.
-        veil_core::EntryKind::File | veil_core::EntryKind::Symlink | veil_core::EntryKind::Gitlink => match verify_sealing(repo.store(), e)? {
+        // A symlink's target is content too.
+        veil_core::EntryKind::File | veil_core::EntryKind::Symlink => match verify_sealing(repo.store(), e)? {
             Sealing::Relabelled(actual) => !actual.is_public(),
             _ => !e.visibility.is_public(),
         },
@@ -1361,8 +1330,7 @@ fn cmd_embargo(ctx: &mut Ctx, c: &EmbargoCmd) -> Result<()> {
 }
 
 /// `vl embargo release`: a previewed, confirmed release (BUG-109). The
-/// release is staged in this repository; the next push or Git export
-/// publishes the key, and until then `vl undo` takes it back.
+/// release is staged in this repository; the next push publishes the key, and until then `vl undo` takes it back.
 fn cmd_embargo_release(ctx: &mut Ctx, id: &str, yes: bool) -> Result<()> {
     let keys = ctx.repo.keys();
     let Some(rec) = keys.load_embargo(id)? else {
@@ -1424,11 +1392,11 @@ fn cmd_embargo_release(ctx: &mut Ctx, id: &str, yes: bool) -> Result<()> {
         .map(|(n, r)| if r.public { format!("{} (public)", safe(n)) } else { safe(n).into_owned() })
         .collect();
     if remotes.is_empty() {
-        println!("  No remote is configured yet; the first push or Git export publishes it.");
+        println!("  No remote is configured yet; the first push publishes it.");
     } else {
         println!("  Your next push to any remote publishes it (remotes: {}).", remotes.join(", "));
     }
-    println!("  Until you push (or export to Git), `vl undo` takes the release back. After that it cannot be undone.");
+    println!("  Until you push, `vl undo` takes the release back. After that it cannot be undone.");
     if !yes {
         if !std::io::stdin().is_terminal() {
             bail!("not released: confirm with `vl embargo release {} --yes`", safe(id));
@@ -1444,7 +1412,7 @@ fn cmd_embargo_release(ctx: &mut Ctx, id: &str, yes: bool) -> Result<()> {
     }
     ctx.repo.release_embargo(id)?;
     println!(
-        "Released embargo {} in this repository. Your next push (or Git export) publishes the key; until then `vl undo` takes it back.",
+        "Released embargo {} in this repository. Your next push publishes the key; until then `vl undo` takes it back.",
         safe(id)
     );
     Ok(())
@@ -1484,10 +1452,7 @@ fn cmd_tag(ctx: &mut Ctx, c: &TagCmd) -> Result<()> {
                 None => println!("Tag {} → {}", cyan(name), one_line(&ctx.repo, &id)),
             }
             if out.replaced.is_some() {
-                eprintln!(
-                    "{} replaced release tag {name}; a Git remote that has it keeps its copy until `vl git push --force-tags`",
-                    dim("note:")
-                );
+                eprintln!("{} replaced release tag {name}", dim("note:"));
             }
         }
         TagCmd::Verify { name } => {
@@ -1498,7 +1463,6 @@ fn cmd_tag(ctx: &mut Ctx, c: &TagCmd) -> Result<()> {
             println!("{} {} → {}", bold("tag"), cyan(&safe(name)), one_line(&ctx.repo, &target));
             let kind = match c.atag.kind {
                 veil_core::tag_object::AtagKind::Annotated => "annotated",
-                veil_core::tag_object::AtagKind::LightweightGit => "lightweight Git tag",
             };
             println!("{}   {kind}", dim("kind:"));
             if !c.atag.tagger.is_empty() {
@@ -1628,7 +1592,6 @@ fn cmd_policy_rules(ctx: &mut Ctx, patterns: &[String], tier: Tier, force: bool)
             }
         }
     };
-    let before = text.clone();
     if !text.ends_with('\n') {
         text.push('\n');
     }
@@ -1672,7 +1635,7 @@ fn cmd_policy_rules(ctx: &mut Ctx, patterns: &[String], tier: Tier, force: bool)
         Tier::Isolated => "isolate",
         Tier::Ignored => "ignore",
     };
-    ctx.snapshot_policy_edit(format!("{verb} {}", patterns.join(" ")), before.as_bytes(), text.as_bytes())?;
+    ctx.snapshot_as(format!("{verb} {}", patterns.join(" ")))?;
     Ok(())
 }
 
@@ -1756,7 +1719,6 @@ fn cmd_policy(ctx: &mut Ctx, c: &PolicyCmd) -> Result<()> {
                 println!("Run `vl policy accept` to apply .veilpolicy in full.");
             }
         }
-        PolicyCmd::ImportGitignore(a) => colocate_cmd::import_gitignore(ctx, a)?,
         PolicyCmd::Accept { workspace: Some(ws) } => {
             if *ws == ctx.ws {
                 bail!("workspace '{}' is attached to the project directory: run `vl policy accept` there", safe(ws));
@@ -1800,38 +1762,13 @@ fn cmd_policy(ctx: &mut Ctx, c: &PolicyCmd) -> Result<()> {
             ctx.snapshot()?;
         }
         PolicyCmd::Check { paths } => {
-            let wc_tree = ctx.wc().and_then(|w| Ok(ctx.repo.snapshot(&w)?.tree)).ok();
-            let gitlink_at = |a: &VPath| -> bool {
-                !a.is_root()
-                    && wc_tree.is_some_and(|t| {
-                        lookup(ctx.repo.store(), &t, a).ok().flatten().is_some_and(|e| e.kind == veil_core::EntryKind::Gitlink)
-                    })
-            };
             for p in paths {
                 let vp = ctx.repo_path(p)?;
                 // As a snapshot walks: it never looks inside an ignored
                 // directory (Git's rule), so no later rule re-includes a
-                // file below one, nor inside a nested repository (BUG-203),
-                // nor inside a submodule (a gitlink: its own repository
-                // decides where its files are published).
+                // file below one, nor inside a nested repository (BUG-203).
                 let mut skipped = None;
-                if gitlink_at(&vp) {
-                    println!(
-                        "{}: {}: a submodule (a gitlink entry, recorded as its pinned commit); Veil never records what is inside it",
-                        safe(vp.as_str()),
-                        bold("submodule")
-                    );
-                    continue;
-                }
                 for a in vp.ancestors() {
-                    if gitlink_at(&a) {
-                        skipped = Some(format!(
-                            "{}: inside submodule {}: not recorded by Veil; its own repository decides where it is published",
-                            bold("not recorded"),
-                            safe(a.as_str())
-                        ));
-                        break;
-                    }
                     let c = policy.classify(&a, true);
                     if c.tier == Tier::Ignored {
                         let via = c.rule.map(|r| format!("rule '{r}'")).unwrap_or_else(|| "default".into());
@@ -1901,8 +1838,8 @@ fn scan_status(scan: &api::Scan) -> ExitCode {
 /// `vl scan --policy-from FILE`: the CI gate. It bypasses `Ctx::open` (no
 /// identity, no snapshot, no repository needed) and takes nothing from the
 /// scanned directory but its files: the rules come from FILE, a policy the
-/// pull request cannot edit. In a Git checkout every file is published by
-/// Git whatever a `.veilpolicy` says, so only FILE's `public!` paths are
+/// pull request cannot edit. A CI checkout publishes every file whatever a
+/// `.veilpolicy` says, so only FILE's `public!` paths are
 /// exempt; isolated, cloaked and ignored paths are scanned too, and only
 /// VCS metadata (`.git`, …) and `.veil/` are skipped.
 fn cmd_scan_gate(repo_arg: Option<&Path>, file: &Path, json: bool) -> Result<ExitCode> {
@@ -2472,7 +2409,7 @@ fn cmd_push(
         let kind = if cfg.public { "public" } else { "team" };
         hooks::before_push(ctx, verify, name, &cfg.url, kind, |ctx| {
             if tags.is_empty() && !delete.is_empty() {
-                return Ok(hooks::delete_lines(&ctx.repo, name, delete, cfg.public, false));
+                return Ok(hooks::delete_lines(&ctx.repo, name, delete, cfg.public));
             }
             let (backend, cfg) = remote_backend(ctx, name)?;
             let plan = veil_core::push_plan::plan_push_with(&ctx.repo, backend, cfg.public, tags, force, opts.force_tags)?;
@@ -2550,7 +2487,7 @@ fn cmd_push(
     // A release tag the remote moved is never merged or pulled into ours
     // (BUG-703): someone has to decide which one is the release.
     // A release is never replaced on the remote without --force-tags
-    // (BUG-710), as `vl git push` does for Git tags.
+    // (BUG-710).
     let release = rejected.iter().find(|t| {
         r.tags_skipped.iter().any(|(n, why)| n == *t && why.starts_with("release tag"))
             || ctx.repo.view().tags.get(*t).is_some_and(|t| t.annotation.is_some())
@@ -2647,242 +2584,6 @@ fn cmd_pull(ctx: &mut Ctx, name: &str, full: bool) -> Result<()> {
     }
     println!("Pulled {} object(s) from {name}", r.objects_copied);
     Ok(())
-}
-
-// ---- git -----------------------------------------------------------------
-
-fn cmd_git(ctx: &mut Ctx, c: &GitCmd) -> Result<ExitCode> {
-    use veil_core::git;
-    let git_dir = git::default_git_dir(&ctx.root);
-    match c {
-        GitCmd::Import { source, remote } => {
-            // A local path is stored absolute, so later fetches work from anywhere.
-            let src = git::absolute_git_url(source, &std::env::current_dir()?);
-            let r = git::import(&mut ctx.repo, &git_dir, &src, remote)?;
-            print_git_fetch(&r, remote);
-            // A working copy that still sits on the root (a fresh `vl init`)
-            // moves on top of the imported default branch, keeping its files.
-            let wc = ctx.wc()?;
-            let s = ctx.repo.snapshot(&wc)?;
-            let on_root = s.parents == [ctx.repo.root_id()] && ctx.repo.description(&s).trim().is_empty();
-            let default = ["main", "master", "trunk"]
-                .into_iter()
-                .find_map(|t| ctx.repo.view().tags.get(t).map(|tag| (t, tag.target)));
-            if let (true, Some((name, target))) = (on_root, default) {
-                let new = ctx.repo.rebase(wc, vec![target])?;
-                println!("Working copy is now a change on {}", cyan(name));
-                let conflicts = &ctx.repo.snapshot(&new)?.conflicts;
-                if !conflicts.is_empty() {
-                    warn_untrusted(&format!("conflicts in: {}", conflicts.join(", ")));
-                }
-            }
-        }
-        GitCmd::Remote(GitRemoteCmd::Add { name, url }) => {
-            // A relative path means what it means here, not wherever `vl`
-            // runs later: store it absolute.
-            let url = git::absolute_git_url(url, &std::env::current_dir()?);
-            git::remote_add(&mut ctx.repo, name, &url)?;
-            println!("Added Git remote {name} → {}", safe(&git::redact_url(&url)));
-        }
-        GitCmd::Remote(GitRemoteCmd::List) => {
-            for (name, url) in git::remotes(&ctx.repo)? {
-                println!("{}  {}", bold(&safe(&name)), safe(&git::redact_url(&url)));
-            }
-        }
-        GitCmd::Remote(GitRemoteCmd::Rm { name }) => {
-            git::remote_remove(&mut ctx.repo, &git_dir, name)?;
-            println!("Removed Git remote {name}");
-        }
-        GitCmd::Fetch { remote, no_tags, prune_tags } | GitCmd::Pull { remote, no_tags, prune_tags } => {
-            let opts = git::FetchOptions {
-                pull: matches!(c, GitCmd::Pull { .. }),
-                no_tags: *no_tags,
-                prune_tags: *prune_tags,
-            };
-            let r = git::fetch_with(&mut ctx.repo, &git_dir, remote, &opts)?;
-            print_git_fetch(&r, remote);
-        }
-        GitCmd::Push {
-            remote,
-            tag,
-            force,
-            delete,
-            force_tags,
-            delete_tag,
-            hooks,
-        } => {
-            let url = git::remotes(&ctx.repo)?.get(remote).cloned().unwrap_or_default();
-            let opts = git::PushOptions {
-                only_tags: tag.clone(),
-                force: *force,
-                delete: delete.clone(),
-                force_tags: *force_tags,
-                delete_tags: delete_tag.clone(),
-            };
-            hooks::before_push(ctx, hooks, remote, &url, "git", |ctx| hooks::git_push_lines(ctx, &git_dir, remote, &opts))?;
-            let r = git::push_with(&mut ctx.repo, &git_dir, remote, &opts)?;
-            print_git_export(&r.export);
-            let withheld: Vec<String> = r
-                .export
-                .skipped
-                .iter()
-                .filter(|(t, _)| tag.contains(t))
-                .map(|(t, _)| t.clone())
-                .collect();
-            let mut rejected = Vec::new();
-            for (branch, status) in &r.outcome.refs {
-                let commit = r
-                    .export
-                    .branches
-                    .iter()
-                    .find(|(b, _)| b == branch)
-                    .map(|(_, c)| c.to_hex_with_len(10).to_string())
-                    .unwrap_or_default();
-                let b = cyan(&safe(branch));
-                match status {
-                    git::RefStatus::Created => println!("  {} {b} → {commit} (new branch)", green("pushed")),
-                    git::RefStatus::FastForward => println!("  {} {b} → {commit}", green("pushed")),
-                    git::RefStatus::Forced => println!("  {} {b} → {commit} (forced)", yellow("pushed")),
-                    git::RefStatus::UpToDate => println!("  {} {b}", dim("up to date")),
-                    git::RefStatus::Deleted => println!("  {} {b}", red("deleted")),
-                    git::RefStatus::Rejected(why) => {
-                        rejected.push(branch.clone());
-                        println!("  {} {b} ({})", red("rejected"), safe(why));
-                    }
-                }
-            }
-            let mut tags_rejected = Vec::new();
-            for (name, status) in &r.outcome.tags {
-                let t = cyan(&format!("tag {}", safe(name)));
-                let commit = r
-                    .export
-                    .tags
-                    .iter()
-                    .find(|x| &x.name == name)
-                    .map(|x| x.commit.to_hex_with_len(10).to_string())
-                    .unwrap_or_default();
-                match status {
-                    git::RefStatus::Created => println!("  {} {t} → {commit} (new tag)", green("pushed")),
-                    git::RefStatus::FastForward | git::RefStatus::Forced => println!("  {} {t} → {commit} (replaced)", yellow("pushed")),
-                    git::RefStatus::UpToDate => println!("  {} {t}", dim("up to date")),
-                    git::RefStatus::Deleted => println!("  {} {t}", red("deleted")),
-                    git::RefStatus::Rejected(why) => {
-                        tags_rejected.push(name.clone());
-                        println!("  {} {t} ({})", red("rejected"), safe(why));
-                    }
-                }
-            }
-            if !tags_rejected.is_empty() && rejected.is_empty() {
-                eprintln!(
-                    "{} Git tags are immutable: {remote} keeps its {}. Check why it differs (`vl git fetch {remote}`), then replace it with `vl git push {remote} --force-tags` only if yours is right",
-                    yellow("note:"),
-                    tags_rejected.iter().map(|t| safe(t).into_owned()).collect::<Vec<_>>().join(", ")
-                );
-                rejected.extend(tags_rejected);
-            }
-            let first = rejected.first().map(|t| safe(t).into_owned()).unwrap_or_default();
-            return Ok(push_status(
-                &rejected,
-                &format!(
-                    "{remote} has commits you don't have. Run `vl git pull {remote}`, `vl merge {remote}/{first}`, and push again (or `vl git push --force` to overwrite them)"
-                ),
-                &withheld,
-            ));
-        }
-        GitCmd::Colocate(a) => return colocate_cmd::colocate(ctx, a),
-        GitCmd::Uncolocate(a) => return colocate_cmd::uncolocate(ctx, a),
-        GitCmd::CheckPush(a) => return colocate_cmd::check_push(ctx, a),
-        GitCmd::Export { tag } => {
-            let mut bridge = git::GitBridge::open(&ctx.repo, &git_dir)?;
-            let r = bridge.export(&mut ctx.repo, tag)?;
-            print_git_export(&r);
-            for (b, c) in &r.branches {
-                println!("{}  {c}", cyan(&safe(b)));
-            }
-            for t in &r.tags {
-                println!("{}  {}", cyan(&format!("tag {}", safe(&t.name))), t.git);
-            }
-        }
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-fn print_git_export(r: &veil_core::git::ExportReport) {
-    for (t, why) in &r.skipped {
-        println!("  {} {} ({})", yellow("skipped"), safe(t), safe(why));
-    }
-    for w in &r.warnings {
-        warn_untrusted(w);
-    }
-    if r.written > 0 {
-        eprintln!(
-            "Exported {} commit(s){}",
-            r.written,
-            if r.published > 0 {
-                format!(", {} publishing released embargoes", r.published)
-            } else {
-                String::new()
-            }
-        );
-    }
-}
-
-fn print_git_fetch(r: &veil_core::git::FetchReport, remote: &str) {
-    for (b, old, new) in &r.forced {
-        warn_untrusted(&format!(
-            "{remote}/{b} was force-pushed on the Git side ({} → {}); the Veil history it dropped is kept",
-            old.to_hex_with_len(10),
-            new.to_hex_with_len(10)
-        ));
-    }
-    for b in &r.deleted {
-        warn_untrusted(&format!("branch {b} was deleted on {remote}; local tag {b}, if any, is kept"));
-    }
-    for (path, why) in &r.import.left_in_git {
-        println!("  {} {} ({why}; it stays in Git)", yellow("not recorded"), safe(path));
-    }
-    for (c, why) in &r.import.failed {
-        println!("  {} {} ({})", red("not imported"), c.to_hex_with_len(10), safe(why));
-    }
-    for (c, paths) in &r.import.conflicts {
-        println!("  {} {} in {}", yellow("conflicts"), c.to_hex_with_len(10), safe(&paths.join(", ")));
-    }
-    for (t, id) in &r.tags_updated {
-        println!("  {} {} → {}", green("updated"), cyan(&safe(t)), id.short());
-    }
-    for (t, from, to) in &r.tags_moved {
-        warn_untrusted(&format!(
-            "{remote} moved Git tag {t} from {} to {}: Git tags should never move (was it rewritten, or is the remote compromised?). Your release tag {t}, if any, stays where it is; inspect it with `vl show tag:{remote}/{t}`",
-            from.short(),
-            to.short()
-        ));
-    }
-    for (t, id) in &r.release_tags_created {
-        println!("  {} {} → {}", green("new release tag"), cyan(&safe(t)), id.short());
-    }
-    for (t, local, theirs) in &r.release_tags_kept {
-        warn_untrusted(&format!(
-            "release tag {t} stays at {}; {remote} has it at {} (release tags never move; compare with `vl diff --from {t} --to tag:{remote}/{t}`)",
-            local.short(),
-            theirs.short()
-        ));
-    }
-    for (t, why) in &r.tags_skipped {
-        println!("  {} Git tag {} ({})", yellow("skipped"), safe(t), safe(why));
-    }
-    for t in &r.tags_deleted {
-        println!("  {} Git tag {} was deleted on {remote} (kept as {remote}/{t}; `--prune-tags` forgets it)", dim("note:"), safe(t));
-    }
-    for t in &r.tags_pruned {
-        println!("  {} {remote}/{}", dim("forgot Git tag"), safe(t));
-    }
-    if !r.release_tags.is_empty() {
-        println!("Recorded {} Git tag(s) from {remote}", r.release_tags.len());
-    }
-    for w in r.import.warnings.iter().chain(&r.warnings) {
-        warn_untrusted(w);
-    }
-    println!("Imported {} commit(s) from {remote}", r.import.imported);
 }
 
 // ---- integrity -----------------------------------------------------------

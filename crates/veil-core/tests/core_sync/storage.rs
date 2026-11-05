@@ -90,7 +90,7 @@ fn assert_history_intact(repo: &Repo) {
         for e in &t.entries {
             match e.kind {
                 EntryKind::Dir => trees.push(e.id),
-                EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink => {
+                EntryKind::File | EntryKind::Symlink => {
                     for id in std::iter::once(e.id).chain(e.fallback) {
                         let raw = store
                             .get_raw(&id)

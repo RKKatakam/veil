@@ -19,7 +19,7 @@
 //! between versions of the same (verified) audience, so the result never
 //! depends on the merger's keys and never moves content between audiences.
 //!
-//! How a file's content merges follows `.gitattributes` (feature 7), read
+//! How a file's content merges follows `.veilattributes` (feature 7), read
 //! from `ours`: `-merge` / `binary` make it a whole-file conflict,
 //! `merge=union` keeps both sides' lines, and `merge=<name>` runs a driver
 //! only if this device defines one ([`crate::attributes::DeviceDrivers`]).
@@ -299,9 +299,9 @@ fn merge_dir(
         let mut oe = f.o.as_ref().and_then(|x| x.0.get(&name)).cloned();
         let mut te = f.t.as_ref().and_then(|x| x.0.get(&name)).cloned();
         if !markers {
-            // A copy of a conflict as a public reader sees it (the Git
-            // export's marker file, which a Git commit then edits) stands
-            // for that conflict, so the edit applies to the conflict.
+            // A copy of a conflict as a public reader sees it (its marker
+            // file, which a later change then edits) stands for that
+            // conflict, so the edit applies to the conflict.
             for side in [&oe, &te] {
                 if let (Some(b), Some(c)) = (&be, side) {
                     if b.kind == EntryKind::File && c.kind == EntryKind::Conflict && crate::conflict::publicly_renders_as(store, c, b)? {
@@ -355,7 +355,7 @@ fn merge_dir(
                 // Modify/delete or file/directory: the base's version.
                 be.cloned()
             } else if oe.is_some_and(|e| e.kind != EntryKind::Dir) && te.is_some_and(|e| e.kind != EntryKind::Dir) {
-                // Two different versions where one is a symlink or gitlink
+                // Two different versions where one is a symlink
                 // (format 5) and no conflict entry can be recorded here:
                 // our side as it is, flagged. A link target never becomes
                 // a file of markers.
@@ -457,7 +457,7 @@ fn resolve_by_content(store: &ObjectStore, path: &VPath, name: &str, m: &Merge, 
     if m.adds.iter().any(Option::is_none) || (m.adds.len() > 2 && m.removes.iter().any(Option::is_none)) {
         return Ok(None);
     }
-    // Link targets and gitlink pointers are never merged line by line: two
+    // Link targets are never merged line by line: two
     // different ones are a conflict (format 5).
     if m.adds.iter().chain(&m.removes).flatten().any(|t| t.kind != crate::object::TermKind::File) {
         return Ok(None);
@@ -483,7 +483,7 @@ const MARKER_LEN: usize = 7;
 
 /// The attributes a merge reads (from ours), one set per audience of the
 /// merged files (BUG-705): a file merged for audience `V` is shaped only by
-/// `.gitattributes` content `V` can read ([`Attrs::for_audience`]), so a
+/// `.veilattributes` content `V` can read ([`Attrs::for_audience`]), so a
 /// sealed `merge=union` never decides a public result, and a member and a
 /// non-member merging the same public files get the same tree.
 struct MergeAttrs<'a> {
@@ -514,7 +514,7 @@ impl<'a> MergeAttrs<'a> {
 }
 
 /// How the content at `path`, merged for `audience`, merges, as
-/// `.gitattributes` (read from ours, as `audience` reads it) says, with
+/// `.veilattributes` (read from ours, as `audience` reads it) says, with
 /// named drivers resolved against this device's definitions (see
 /// [`crate::attributes::merge_strategy`]). A virtual merge base only
 /// tells whole-file merges from line merges: no driver runs for it.
@@ -763,7 +763,7 @@ fn merge_file(
 }
 
 /// The content merge of one file's three readable versions at `path`, by
-/// `how` (what `.gitattributes` asks for, see [`strategy`]): `Ok` when
+/// `how` (what `.veilattributes` asks for, see [`strategy`]): `Ok` when
 /// clean, `Err(Some(markers))` for a line conflict (see
 /// [`crate::textmerge::merge`]), `Err(None)` for a whole-file conflict
 /// (`binary` / `-merge`, binary-looking content, a driver's conflict).

@@ -68,7 +68,7 @@ notes
 **Committing in a workspace moves tags** as in `default`: a `vl commit`
 whose parent is `main` moves `main`. In a **cloaked** workspace it moves
 only tags cloaked under the same scope, never `main`. See
-[the pitfalls](coming-from-git.md#vl-commit-moves-the-tags-at-the-parent).
+[Tags](getting-started.md#tags).
 When an ordinary workspace's work should land later, `vl describe` it (or
 `vl commit --no-advance`) and `vl merge NAME@` when ready.
 

@@ -165,18 +165,6 @@ impl<'r> Transaction<'r> {
         Ok(id)
     }
 
-    /// Write `snap` as it is, without a signature: for snapshots whose
-    /// content is a function of something outside Veil (a Git commit), so
-    /// that every replica writing it gets the same id.
-    #[cfg(feature = "git")]
-    pub(crate) fn write_unsigned_snapshot(&mut self, snap: &Snapshot) -> Result<ObjectId> {
-        let mut s = self.indexed(snap.clone())?;
-        s.signature = None;
-        let id = self.repo.store.put_snapshot(&s)?;
-        self.add_head(id)?;
-        Ok(id)
-    }
-
     /// Create a new change on top of `parents` (merging them if several).
     ///
     /// The change takes the workspace's `cloak`, not its parents'. Sealed

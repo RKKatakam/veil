@@ -7,7 +7,7 @@ From `integration` @ 4a62259. This round is Scion phase 0 (`docs/design/scion-fo
 | 1 | lock-free, resumable pushes (SFTP and path remotes) | `1-lock-free-push.md` | no |
 | 2 | lock-free op log | `2-lock-free-oplog.md` | **yes** (op-heads layout, operation fields) |
 | 3 | history index (commit-graph, Bloom filters) | `3-history-index.md` | no (a device-local cache) |
-| 4 | background cleanup; streaming pull and Git import | `4-background-cleanup-streaming.md` | no |
+| 4 | background cleanup; streaming pull | `4-background-cleanup-streaming.md` | no |
 | 5 | copy-on-write checkouts of the project directory | `5-reflink-checkouts.md` | no |
 | 6 | partial clone, fetch on demand, bounded cache | `6-partial-clone.md` | **yes** (`repo.json` `partial`) |
 | 7 | agent attribution | `7-agent-attribution.md` | **yes** (`Snapshot.agent`) |
@@ -36,7 +36,6 @@ One bump: `REPO_FORMAT = 6`, `min_vl_for_format(6)` = this round's release. It f
    - Remotes use the same layout, always with one head, written under the lock.
 4. **`repo.json`** gains `partial: {remote, since?, recent?, only?, cache_limit}` (`deny_unknown_fields`, device-local).
    - It is refused as corrupt below format 6, or when `remote` is not a configured remote, a path in `only` is not a valid `VPath`, or `cache_limit` is 0.
-   - `colocated` together with `partial` is refused.
 5. **Not format changes** (device-local or ignored by older readers; each is listed in `FORMAT.md`'s inventory):
 
    | path | what | versioned by |
@@ -107,7 +106,7 @@ Process rules: never run `cargo fmt`; scratch work goes in `.scratch/`; builds u
 **B: benchmark and instrumentation** (size M; first agent)
 - Owns `crates/veil-bench/**`, `crates/veil-core/src/trace.rs` and `docs/design/scale/BENCH.md`.
 - **Milestone B1** (about 1 day): `trace.rs`, plus the `small` and `1g` profiles and the single-process cases. The **baseline** on 4a62259 goes into BENCH.md.
-- **B2:** the N-agents, `cloaked-1g`, `git-100k` and `5g` profiles, plus the gate checker (`veil-bench report --gate`).
+- **B2:** the N-agents, `cloaked-1g` and `5g` profiles, plus the gate checker (`veil-bench report --gate`).
 
 **F: format-6 foundation** (size M; t0, beside B)
 - **Owns:**
@@ -128,7 +127,7 @@ Process rules: never run `cargo fmt`; scratch work goes in `.scratch/`; builds u
   - `maintenance.rs` (consolidation, geometric merging, bitmap prune, auto spawn, gc lease use);
   - `store.rs`'s read path (`read_raw`'s miss: reload and re-probe; `contains`; listing functions);
   - `cmd_gc` in `main.rs`.
-- Item 4, except streaming pull (P) and Git import (S).
+- Item 4, except streaming pull (P).
 
 **I: history index** (size L; t0)
 - **Owns:**
@@ -138,12 +137,12 @@ Process rules: never run `cargo fmt`; scratch work goes in `.scratch/`; builds u
   - in `commands.rs`, only `check_current`, `carried_embargo` and `merged_in_signed_by`;
   - in `crates/vl/src/api.rs`, the log functions (`log_entries_with` and its helpers);
   - `crates/vl/src/history.rs`;
-  - the `visible_snapshots` caller in `main.rs`, and `patch_cmd.rs`'s `topo_children_first` call.
+  - the `visible_snapshots` caller in `main.rs`.
 - **Milestones:**
   - **I1** (merged early): `GraphIndex` with generations, `is_ancestor`, `range`, `topo_iter`, `merge_bases`, `descendants_among`, `embargo_merges` and `by_change_id`, with `repo.rs` delegating;
   - **I2:** Bloom filters, `log -- PATH`, `blame`;
   - **I3:** the remaining callers it owns.
-- **Other streams switch their own call sites after I1:** O (`rebase_descendants`), P (`embargo_withheld`, `committed_closure`, `push_closure`, `ancestors_in`), S (`ChangeIndex`, export and colocate order).
+- **Other streams switch their own call sites after I1:** O (`rebase_descendants`), P (`embargo_withheld`, `committed_closure`, `push_closure`, `ancestors_in`).
 
 **O: lock-free op log** (size XL; after F)
 - **Owns:**
@@ -157,17 +156,12 @@ Process rules: never run `cargo fmt`; scratch work goes in `.scratch/`; builds u
   - `crates/vl/src/ctx.rs`;
   - `crates/vl/src/mount.rs`'s recording and locking;
   - `crates/vl/src/sandbox.rs` `finish` (the recording step only);
-  - `git/colocate.rs` `follow`'s locking only.
 - **New tests:** `tests/oplog_concurrency.rs` (a multi-process scheduler with crash and power-loss injection), and `undo_redo_props.rs` with the second actor.
 
 **P: push and pull** (size L; the phase split starts after B1, the spooling after G1)
 - **Owns:** `remote.rs` (all of it), `push_plan.rs`, `cmd_push` and `cmd_pull` in `main.rs`, and the remote-staging report in `crates/vl/src/doctor.rs`.
 - **Covers:** item 1 (including the path-aligned `known`) and item 4's streaming pull.
 - **Tests:** `tests/push_two_phase.rs`, plus extensions of `sftp_sync.rs`, `push_plan.rs`, `remote_lock.rs` and `crash.rs` (push and pull sweeps).
-
-**S: streaming Git import** (size M; after I1)
-- Owns `git/import.rs`, `git/map.rs`, `git/mod.rs`, `git/export.rs`, and `git/colocate.rs` except `follow`'s locking.
-- Item 4's import section, and the `ChangeIndex` and export-order switches.
 
 **L: sandbox limits** (size M; t0, independent)
 - **Owns:**
@@ -211,8 +205,7 @@ t0 ── 0 ──┬── B1 (trace + baseline) ── B2 (agents, cloaked, 5g
           │               └── A (revset part after I) │
           ├── G1 ──┬── P ─────────────────────────────┤
           │        └── G2 ────────────────────────────┤
-          ├── I1 ──┬── I2/I3                          │
-          │        └── S                              │
+          ├── I1 ──── I2/I3                          │
           └── L                                       │
                             adversarial pass A ◄──── O, P, I, G merged (concurrency, durability, index)
                                                       C (after P, G2, O, I, R) ── C2 audit ── adversarial pass B (C, A, R)
@@ -226,7 +219,6 @@ t0 ── 0 ──┬── B1 (trace + baseline) ── B2 (agents, cloaked, 5g
   - C needs P (push from partial clones), G2 (the read-miss path), O (staging and promotion) and I (anchors use `range`);
   - A's `revset.rs` part needs I's edits there;
   - R needs O's `Ctx` to call the stub hook;
-  - S needs I1.
 
 ## 4. Size estimates
 
@@ -239,7 +231,6 @@ t0 ── 0 ──┬── B1 (trace + baseline) ── B2 (agents, cloaked, 5g
 | I | L | 2,500 | 2,000 (property tests against naive walks) | 2 days |
 | O | XL | 3,000 | 3,000 (multi-process scheduler, crash and EIO sweeps) | 3 days |
 | P | L | 1,800 | 1,600 | 1.5–2 days |
-| S | M | 900 | 800 (crash and resume equivalence) | 1 day |
 | L | M | 1,100 | 700 | 1 day |
 | A | M | 900 | 900 | 1 day |
 | R | S–M | 600 | 500 | 0.5–1 day |

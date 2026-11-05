@@ -1,85 +1,10 @@
 //! Embargo confinement (`veil_core::confinement`, BUG-681) and sealed
 //! content on public lines.
 
-use std::process::Command;
-
 use super::{
-    adversarial_support::{text, write, Env},
+    adversarial_support::{write, Env},
     change_id, repo_contains, ws_write, U,
 };
-
-/// A patch made with Git from `before` to `after` of `vuln.c` (its `index`
-/// line names the Git blob of `before`).
-fn git_patch(env: &Env, before: &str, after: &str) -> std::path::PathBuf {
-    let g = env.dir("git-src");
-    let git = |args: &[&str]| {
-        let out = Command::new("git")
-            .args(["-c", "user.name=Bob", "-c", "user.email=bob@example.com"])
-            .args(args)
-            .current_dir(&g)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("HOME", &g)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-        out.stdout
-    };
-    git(&["init", "-q"]);
-    write(&g, "vuln.c", before);
-    git(&["add", "vuln.c"]);
-    git(&["commit", "-qm", "base"]);
-    write(&g, "vuln.c", after);
-    git(&["commit", "-qam", "follow-up"]);
-    let patch = git(&["format-patch", "-1", "--stdout"]);
-    let p = env.root.join("follow.patch");
-    std::fs::write(&p, patch).unwrap();
-    p
-}
-
-/// BUG-706: `vl am --3way` looks for the pre-image a patch's `index` line
-/// names in the history of *every* visible head (`patch::Preimages`),
-/// the withheld fix of an unreleased embargo included, and records a
-/// conflict whose base term is the fix's version, onto any destination:
-/// `confinement` (BUG-681) is not consulted. A follow-up patch made on
-/// top of the fix (by a co-holder, in Git) and applied with `--3way` to a
-/// line outside the embargo therefore copies the fix's `vuln.c` into a
-/// public change; the next public push publishes it (sealed under the
-/// embargo key: the mirror learns that the embargo changed `vuln.c` and
-/// receives the fix's ciphertext before the release, readable by everyone
-/// the moment it is released, whatever the destination line says).
-#[test]
-fn am_three_way_never_copies_the_withheld_fix_onto_a_public_line() {
-    let env = Env::new();
-    let proj = env.project(U, "proj", &[("vuln.c", "int a;\nint b;\n")]);
-    let init = change_id(&env, U, &proj, "main");
-    env.ok(U, &proj, &["ws", "new", "fix", "-r", "main"]);
-    ws_write(&env, &proj, "fix", "vuln.c", "int a;\nint FIXED_LINE;\n");
-    env.ok(U, &proj, &["describe", "-r", "fix@", "-m", "fix"]);
-    env.ok(U, &proj, &["merge", "fix@", "--into", "main", "--embargo", "-m", "embargoed"]);
-    // A public line that is not under the embargo.
-    env.ok(U, &proj, &["ws", "new", "other", "-r", &init]);
-    let patch = git_patch(&env, "int a;\nint FIXED_LINE;\n", "int a;\nint FOLLOW_UP;\n");
-    let am = env.vl(U, &proj, &["am", "--3way", "-d", "other@-", patch.to_str().unwrap()]);
-    if !am.status.success() {
-        return; // refused: fine
-    }
-    // "Applied 1 patch(es):\n  <change> <snapshot> follow-up"
-    let new = text(&am).lines().find_map(|l| {
-        l.split_whitespace().next().filter(|w| w.len() == 8 && w.chars().all(|c| c.is_ascii_lowercase())).map(str::to_string)
-    });
-    let new = new.unwrap_or_else(|| panic!("no new change in: {}", text(&am)));
-    env.ok(U, &proj, &["tag", "set", "followup", "-r", &new]);
-    let mirror = env.root.join("mirror");
-    env.ok(U, &proj, &["remote", "add", "mirror", mirror.to_str().unwrap(), "--public"]);
-    env.ok(U, &proj, &["push", "mirror"]);
-    env.ok("carol", &env.root, &["clone", "mirror", "carol"]);
-    let carol = env.root.join("carol");
-    let list = text(&env.vl("carol", &carol, &["resolve", "--list", "-r", "followup"]));
-    assert!(
-        !list.contains("embargo"),
-        "the public change made by `vl am --3way` carries the embargoed fix's version of vuln.c:\n{list}"
-    );
-}
 
 /// BUG-682 (pinned; found by `adversarial7::rewrites` in fix wave 1): a
 /// draft in `@` that no public remote has seen, squashed into the cloaked
@@ -153,40 +78,4 @@ fn a_draft_duplicated_onto_a_cloaked_line_stays_off_the_mirror() {
     env.ok(U, &proj, &["push", "pub"]);
     let hits = repo_contains(&mirror, b"DRAFT-0001");
     assert!(hits.is_empty(), "the draft the cloaked line took in is on the public mirror: {hits:?}");
-}
-
-/// BUG-706, the other side of the rule: inside the embargo the fix's
-/// history is still a place to look. A follow-up made on a newer version
-/// of the fix (another head, built on the fix: confined to the embargo),
-/// applied with `--3way` to the fix itself (confined to the same embargo),
-/// finds the pre-image in that head's history and records a conflict;
-/// applied to a public line, the same patch finds nothing and is refused.
-#[test]
-fn am_three_way_still_finds_the_fix_inside_its_embargo() {
-    let env = Env::new();
-    let proj = env.project(U, "proj", &[("vuln.c", "int a;\nint b;\n")]);
-    let init = change_id(&env, U, &proj, "main");
-    env.ok(U, &proj, &["ws", "new", "fix", "-r", "main"]);
-    ws_write(&env, &proj, "fix", "vuln.c", "int a;\nint FIXED_LINE;\n");
-    env.ok(U, &proj, &["describe", "-r", "fix@", "-m", "fix"]);
-    env.ok(U, &proj, &["merge", "fix@", "--into", "main", "--embargo", "-m", "embargoed"]);
-    // Work built on the fix (withheld history, confined to the embargo).
-    env.ok(U, &proj, &["ws", "new", "fix-2", "-r", "fix@"]);
-    ws_write(&env, &proj, "fix-2", "vuln.c", "int a;\nint FIXED_TWO;\n");
-    env.ok(U, &proj, &["ws", "new", "other", "-r", &init]);
-    let patch = git_patch(&env, "int a;\nint FIXED_TWO;\n", "int a;\nint FOLLOW_UP;\n");
-    let p = patch.to_str().unwrap();
-
-    let public = env.vl(U, &proj, &["am", "--3way", "-d", "other@-", p]);
-    assert!(!public.status.success(), "applied to a public line: {}", text(&public));
-    let inside = env.vl(U, &proj, &["am", "--3way", "-d", "fix@", p]);
-    let shown = text(&inside);
-    assert!(inside.status.success(), "{shown}");
-    let new = shown.lines().find_map(|l| {
-        l.split_whitespace().next().filter(|w| w.len() == 8 && w.chars().all(|c| c.is_ascii_lowercase())).map(str::to_string)
-    });
-    let new = new.unwrap_or_else(|| panic!("no new change in: {shown}"));
-    let list = text(&env.vl(U, &proj, &["resolve", "--list", "-r", &new]));
-    let content = text(&env.vl(U, &proj, &["cat", "-r", &new, "vuln.c"]));
-    assert!(list.contains("vuln.c"), "the pre-image from the fix line was not used:\n{shown}\n{list}\n{content}");
 }

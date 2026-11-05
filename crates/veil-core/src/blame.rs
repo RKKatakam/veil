@@ -61,7 +61,7 @@ use crate::{
     conflict::{self, Audience},
     error::{Result, VeilError},
     id::ObjectId,
-    object::{EntryKind, Object, TreeEntry, Visibility},
+    object::{EntryKind, Object, Text, TreeEntry, Visibility},
     rename::{self, RenameOptions},
     repo::Repo,
     store::ObjectStore,
@@ -79,7 +79,7 @@ pub enum Reader {
     #[default]
     Me,
     /// A public mirror: plaintext objects and released embargoes only (the
-    /// `--public` view, and what the Git export shows).
+    /// `--public` view).
     Public,
 }
 
@@ -183,6 +183,23 @@ impl ReadStats {
         self.sealed_opened += o.sealed_opened;
         self.sealed_skipped += o.sealed_skipped;
         self.open_failed += o.open_failed;
+    }
+}
+
+/// A description as a public mirror reads it: `None` if it is sealed for a
+/// cloak scope, `local` or an unreleased embargo (keys this replica holds
+/// for them are never used). For `--public` views.
+pub fn public_description(store: &ObjectStore, t: &Text) -> Option<String> {
+    match t {
+        Text::Plain(s) => Some(s.clone()),
+        Text::Sealed(env) => {
+            let embargo = env.scope.strip_prefix("embargo/")?;
+            if !store.keys.embargo_released(embargo) {
+                return None;
+            }
+            let key = store.keys.key(&env.scope)?;
+            String::from_utf8(env.open(&key).ok()?).ok()
+        }
     }
 }
 

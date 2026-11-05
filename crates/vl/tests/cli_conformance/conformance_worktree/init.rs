@@ -146,8 +146,7 @@ fn nested_repository_is_independent_of_the_outer_one() {
     assert!(!inner.out(&["log"]).contains("outer one"));
 }
 
-// Scenario from git t0001-init.sh "plain nested" (Git records an embedded
-// repository as a gitlink, never its files), with Veil's invariant: a file
+// Scenario from git t0001-init.sh "plain nested", with Veil's invariant: a file
 // the inner repository cloaks is plaintext on disk, and the outer
 // repository must not record it in public.
 #[test]
@@ -169,26 +168,9 @@ fn outer_repository_does_not_record_a_nested_repositorys_cloaked_files() {
     );
 }
 
-/// `git` with a fixed identity and no system configuration.
-fn git(dir: &std::path::Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
-        .current_dir(dir)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_AUTHOR_NAME", "Gita Hub")
-        .env("GIT_AUTHOR_EMAIL", "gita@example.com")
-        .env("GIT_COMMITTER_NAME", "Gita Hub")
-        .env("GIT_COMMITTER_EMAIL", "gita@example.com")
-        .args(["-c", "init.defaultBranch=main", "-c", "commit.gpgsign=false"])
-        .args(args)
-        .output()
-        .expect("git runs");
-    assert!(out.status.success(), "git {args:?}: {}", text(&out));
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
-
 // BUG-200, end to end: nothing of a nested repository (its cloaked files,
-// plaintext on disk, above all) reaches the outer repository's objects,
-// a push of it, or its Git export; `vl status` names the nested
+// plaintext on disk, above all) reaches the outer repository's objects or
+// a push of it; `vl status` names the nested
 // repository once, and `vl scan` leaves it to its own repository.
 #[test]
 fn a_nested_repositorys_plaintext_never_leaves_the_outer_one() {
@@ -219,14 +201,6 @@ fn a_nested_repositorys_plaintext_never_leaves_the_outer_one() {
     let c = env.as_user("alice", &clone);
     assert!(!c.exists("inner"), "{:?}", c.disk());
     assert!(!c.paths("main").iter().any(|p| p.starts_with("inner")));
-    // Exported to Git: no path, no content.
-    let bare = env.root.join("github.git");
-    git(&env.root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
-    outer.ok(&["git", "remote", "add", "github", bare.to_str().unwrap()]);
-    outer.ok(&["git", "push", "github"]);
-    let files = git(&bare, &["ls-tree", "-r", "--name-only", "main"]);
-    assert!(files.contains("o.txt") && !files.contains("inner"), "{files}");
-    assert!(!git(&bare, &["log", "-p", "--all"]).contains(SECRET_PLAN));
     // The outer repository's own objects (loose, uncompressed) never held it.
     assert!(!contains_bytes(&all_bytes(&outer.path(".veil/objects")), SECRET_PLAN));
     assert!(!contains_bytes(&all_bytes(&outer.path(".veil/objects")), "inner notes"));

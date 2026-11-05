@@ -25,7 +25,6 @@
 //! |---------|---------|--------------|
 //! | `os` | yes | `DiskBackend`, `SftpBackend`, process checks and a heartbeat thread in the [`lock`], worker threads, the system clock |
 //! | `zstd` | yes | the zstd C library: compressed and delta pack entries |
-//! | `git` | yes | two-way Git interop (`git`, needs `os`) |
 //! | `ruzstd` | no | a pure-Rust zstd decoder that reads every pack without the C library |
 //! | `wasm` | no | `ruzstd` plus WebCrypto randomness: with `--no-default-features`, the engine for `wasm32-unknown-unknown` |
 //!
@@ -67,8 +66,6 @@ pub mod error;
 pub mod fsck;
 pub mod gc;
 pub mod hunks;
-#[cfg(feature = "git")]
-pub mod git;
 pub mod grep;
 pub mod id;
 pub mod identity;
@@ -78,10 +75,7 @@ pub mod merge;
 pub mod object;
 pub mod oplog;
 pub mod pack;
-pub mod patch;
 pub mod policy;
-#[cfg(feature = "git")]
-pub mod policy_gitignore;
 pub mod push_plan;
 pub mod remote;
 pub mod rename;
@@ -94,8 +88,6 @@ pub mod secrets;
 pub mod selection;
 pub mod statcache;
 pub mod store;
-#[cfg(feature = "git")]
-pub mod submodule;
 pub mod tag_object;
 pub mod team_vault;
 pub mod transaction;

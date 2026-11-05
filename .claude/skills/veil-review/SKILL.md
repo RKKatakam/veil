@@ -5,7 +5,7 @@ description: Review a Veil branch before it merges into `integration` (a fix wav
 
 # Reviewing Veil changes
 
-Veil (`vl`) is a version control system with per-path confidentiality (public / cloaked per scope / isolated), embargoes, a Git bridge and SFTP remotes. Agents write nearly all of its code, and one agent works at a time.
+Veil (`vl`) is a version control system with per-path confidentiality (public / cloaked per scope / isolated), embargoes and SFTP remotes. Agents write nearly all of its code, and one agent works at a time.
 
 The question every review answers is not "did someone read every line?" It is **"what could go wrong with this change, and which check, automated or human, is the right one to catch it?"** Anthropic's Claude Code team frames it the same way.
 
@@ -27,7 +27,7 @@ Each layer catches some bugs and misses others; few get through all of them.
 | 3 | **Security review** (adversarial pass, tier A) | Opus at high effort, never Fable, as the one agent | yes, while a finding is open |
 | 4 | **Automated checks on the merge applied to `integration`.** This is the merge queue: checks run on the merged result, not just on the branch. | `verify-fast.sh` | yes |
 | 5 | **Owner approval scaled by risk** (below) | the owner | only where required |
-| 6 | **Experimental flags and staged use.** New risky modes ship behind `--experimental` (colocated mode does); the owner uses them before the team does. | — | — |
+| 6 | **Experimental flags and staged use.** New risky modes ship behind `--experimental`; the owner uses them before the team does. | — | — |
 | 7 | **Fast feedback and rollback.** Deep randomized runs each round, sweeps of existing code, one-step merge reverts, and an escape review that asks which layer should have caught the bug. | orchestrator | — |
 
 ## Step 0: pick the tier from the change, not the author
@@ -36,7 +36,7 @@ Agent approvals never stand in for the owner's where the owner is required. The 
 
 | Tier | What the change touches | Review |
 |---|---|---|
-| **A** | sealing, policy and the accepted-policy pin, confinement or embargo, crypto or rings, sync/push/pull/export, the Git bridge, colocated mode, hooks, symlinks or the sandbox, formats | every lens below **plus** the security review (layer 3), with a **Deep** effort: several passes, each finding verified twice |
+| **A** | sealing, policy and the accepted-policy pin, confinement or embargo, crypto or rings, sync/push/pull, hooks, symlinks or the sandbox, formats | every lens below **plus** the security review (layer 3), with a **Deep** effort: several passes, each finding verified twice |
 | **B** | other engine or CLI behaviour, performance, error handling | lenses 1–4 and 6, plus a full read of the diff (**Standard**) |
 | **C** | docs, tests, benchmarks, scripts, tooling | the merge check, plus lens 4 on the diff (**Quick**) |
 
@@ -70,19 +70,18 @@ For each lens, read the diff **against the whole codebase and the brief's intent
 **For a bug fix, find the root cause.** Then check that the fix closes the bug's whole class, not just the one reproduction.
 
 1. **Confidentiality.** Can cloaked, isolated or embargoed content (or a cloaked tag name or description) reach:
-   - a public snapshot, a remote, the Git export, a log, JSON output, an error message or a bundle?
+   - a public snapshot, a remote, a log, JSON output, an error message or a bundle?
    - Is a label used as authority where the object should be (`verify_sealing`)?
    - Is a fallback version one the base doesn't already show publicly?
    - Does confined content move into an unconfined change?
 2. **Correctness.**
-   - Edge cases: empty repos, the root change, conflicts, renames, symlinks and gitlinks.
+   - Edge cases: empty repos, the root change, conflicts, renames and symlinks.
    - **Every new enum kind handled in every match.**
    - Error paths, and `Missing` treated as "redacted".
 3. **Concurrency and durability.**
    - The lock: is it taken, held across a slow scan, or released early?
    - Crash between steps: is the publish order `.pack`, then `.idx`, then the op head?
    - fsync on the file and on its directory.
-   - Races with Git in colocated mode.
 4. **Scope and over-engineering.** Anthropic's Scion team found that often "the role of the engineers was to tell Claude 'no'". Flag:
    - new flags, options, commands or abstractions that the bug or design does not need;
    - a framework with one user;
@@ -113,12 +112,12 @@ Anthropic confirms a finding only when enough independent agents vote for it. He
 
 - **It is real in the code.** It is shown by a failing test (preferred), a command transcript or an exact trace with **`file:line`**. Never guess file names. "Might" and "could in theory" don't count.
 - **Security findings: it crosses the trust boundary** (`docs/ARCHITECTURE.md` "Threat model"). Name all three:
-  - **the attacker**, who must be outside the boundary: a remote operator, a teammate without the scope, a hostile pull/import/patch/bundle, Git writing the work tree in colocated mode, another OS user;
+  - **the attacker**, who must be outside the boundary: a remote operator, a teammate without the scope, a hostile pull or bundle, another OS user;
   - **what they control:** the exact input;
   - **the harm:** what leaks, is lost or runs, and to whom.
 
   A candidate that needs a trusted party to be hostile goes under "Out of scope (trusted)" and is not filed. Trusted parties are the member's own device, keys, `vl` binary and deliberate commands. Don't build defences nobody needs; Scion's own adversarial review was once "overly defensive".
-- **It is introduced by this change.** Otherwise it is marked **Pre-existing**: recorded as BUG-NNN, but it doesn't block the merge or count against the author. **Check it on the base before calling it a regression.** BUG-759 was pre-existing.
+- **It is introduced by this change.** Otherwise it is marked **Pre-existing**: recorded as BUG-NNN, but it doesn't block the merge or count against the author. **Check it on the base before calling it a regression.**
 - **It is not a duplicate,** and **not already reported in an earlier cycle.**
 
 ## Step 4: rank and report
@@ -186,7 +185,7 @@ Anthropic once saw an agent author and an agent reviewer cycle more than fifty t
   - the layer that should have caught it.
 
   When this skill, a brief or `verify-fast.sh` changes, re-check the change against every row: would the new process catch it?
-  Seed it with: the dropped `verified_visibility` in `change()`, the format-5 kinds missing from `patch.rs`, the WASM break from git-only date helpers, and BUG-759, which escaped the colocated fix wave.
+  Seed it with: the dropped `verified_visibility` in `change()`, a format-5 kind missing from a branch's matches, the WASM break from feature-gated date helpers, and the policy pin that a fix wave closed for only one route of its class.
 - **Fix recurring findings at the source.** If the same class keeps being found, turn it into:
   - a test or clippy lint;
   - a line in `CLAUDE.md` or a brief;
@@ -195,7 +194,7 @@ Anthropic once saw an agent author and an agent reviewer cycle more than fifty t
 
   Whenever a review misses something, ask *what wasn't in the reviewer's context* and add it.
 - **Measure noise.** For each finding, note what happened to it: fixed, rejected, intentional, or didn't matter. Mostly "rejected" or "didn't matter" means the lens is too loud: tighten it.
-- **Sweep existing code.** Once per round, run `bash ~/.cache/veil-orch/deep-props.sh` (fresh seeds; pin every failure as an ignored BUG test with its minimal input, as for BUG-759). Run one adversarial pass over code that *wasn't* changed this round, to find old bugs before they spread.
+- **Sweep existing code.** Once per round, run `bash ~/.cache/veil-orch/deep-props.sh` (fresh seeds; pin every failure as an ignored BUG test with its minimal input). Run one adversarial pass over code that *wasn't* changed this round, to find old bugs before they spread.
 
 ## What only the owner does
 
@@ -209,7 +208,7 @@ When the owner wants to understand an area, generate an explainer of that exact 
 ## Always-check rules (any tier)
 
 - **Never `cargo fmt`.** A stray format run rewrites about 100 files. Reject reformat-heavy diffs.
-- **Git-only code is behind `#[cfg(feature = "git")]`.** Run check-wasm on every merge that touches `veil-core`.
+- **OS-only code is behind `#[cfg(feature = "os")]`.** Run check-wasm on every merge that touches `veil-core`.
 - **Every bug has:**
   - a `docs/BUGS.md` row;
   - an ignored reproduction until fixed;
@@ -217,7 +216,7 @@ When the owner wants to understand an area, generate an explainer of that exact 
 - **A changed CLI has regenerated `docs/reference/`:** `VEIL_BLESS_DOCS=1 cargo test -p vl --bin vl reference_is_up_to_date`.
 - **No new dependency without a stated reason. Everything still works offline.**
 - **Scratch work stays in the worktree's `.scratch/`.** Never `rm -rf` outside the worktree; it stalls agents on an approval.
-- **Tests join an existing binary** per crate (`cli_security`, `core_engine`, …). The exceptions are the colocated files.
+- **Tests join an existing binary** per crate (`cli_security`, `core_engine`, …).
 
 **Skip:**
 - `Cargo.lock`;

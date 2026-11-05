@@ -11,10 +11,8 @@
 mod adversarial_support;
 
 mod adversarial2_cli;
-mod adversarial3_git_cli;
 mod adversarial3_release;
 mod adversarial4_cli;
-mod adversarial5_cli;
 mod adversarial6_cli;
 mod adversarial6_docs;
 mod adversarial7;

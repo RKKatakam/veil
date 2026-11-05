@@ -437,8 +437,8 @@ fn random_tokens_under_v6_keys_are_found() {
 /// the rate. Round 5 on `~/.cargo/registry/src` (329 crates, 12,941 files,
 /// 155 MiB): 22 files flagged (0.17 %); 13 of them hold real test or doc
 /// private keys, leaving 9 files (0.07 %) of genuine false positives
-/// (`windows-sys` constant types such as `D3DVSD_TOKENTYPE`, `gix-url`
-/// test URLs).
+/// (`windows-sys` constant types such as `D3DVSD_TOKENTYPE`, a URL
+/// crate's test URLs).
 #[test]
 #[ignore = "measurement: VEIL_FP_DIR=<dir>"]
 fn scanner_false_positive_rate() {

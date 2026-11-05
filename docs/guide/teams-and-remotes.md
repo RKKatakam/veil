@@ -3,7 +3,6 @@
 A Veil **remote** is another Veil repository: a directory (local disk, a
 mounted share) or a directory on any machine you can `ssh` to. The server
 needs SSH with its SFTP subsystem and nothing else: no `vl`, no daemon.
-For GitHub, see [Using Veil with GitHub](github.md).
 
 1. [Adding remotes](#adding-remotes)
 2. [Team remotes and public remotes](#team-remotes-and-public-remotes)
@@ -39,9 +38,7 @@ origin  team  ../hub
   and is not a Veil repository (a typo, `../proj` for `../proj.veil`) is
   refused.
 * A remote name is letters, digits, `-`, `_` and `.` (not first), as in
-  `origin`: it becomes the `NAME/` of the remote tags. A Veil remote and a
-  [Git remote](github.md) can't share a name, since both record
-  `NAME/TAG` remote tags.
+  `origin`: it becomes the `NAME/` of the remote tags.
 * `~` and `~/` mean your home directory on the server, as with Git and
   `scp`. `~user` (another account's home) is refused: write the absolute
   path.
@@ -69,8 +66,7 @@ A teammate outside a scope who pulls from a team remote gets ciphertext
 they can't open: the files appear as redacted (`R`) until someone grants
 them access.
 
-Use a public remote for a published mirror. For GitHub use `vl git`, which
-exports the same public view.
+Use a public remote for a published mirror.
 
 ## Push and pull
 
@@ -187,8 +183,7 @@ $ vl push --delete experiment
 * **A push never moves a release tag on the remote** without
   `--force-tags`, not even forward: after `vl tag set v1.0 --force` here,
   `vl push` rejects `v1.0` (`release tag: the remote's is at 3f2a91c0;
-  replacing a release takes --force-tags`) and pushes the rest, as
-  `vl git push` does for Git tags.
+  replacing a release takes --force-tags`) and pushes the rest.
 * **A tag you deleted stays deleted.** The next `vl pull` doesn't bring it
   back while the remote's tag is still where it was (`kept deleted
   experiment`), and `origin/experiment` keeps showing what the remote holds
@@ -204,9 +199,6 @@ $ vl push --delete experiment
 * History is not deleted. The remote's snapshots stay until nothing
   references them and `vl -R <remote> gc` prunes them (see
   [Maintenance](maintenance.md)); every clone keeps what it pulled.
-
-The same holds for GitHub: `vl git push --delete BRANCH` (see
-[Using Veil with GitHub](github.md)).
 
 Concurrent pushes to one remote are serialised by a lock on the remote. A
 client that crashes mid-push leaves a lease that the next push takes over

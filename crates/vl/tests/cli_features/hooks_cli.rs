@@ -1,6 +1,6 @@
 //! Hooks (feature 5a of the Git-parity round) through the real binary: one
 //! test per point of the threat review in
-//! `docs/design/git-parity/5-hooks-submodules-signed-tags.md`, plus the
+//! `docs/design/git-parity/5-hooks-signed-tags.md`, plus the
 //! hostile inputs of every new surface (`.veilhooks`, the trust record,
 //! `VEIL_HOOK_TIMEOUT`, the environment, `PATH`, signals).
 
@@ -10,7 +10,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -166,41 +166,6 @@ fn a_teammates_push_never_runs_code_on_this_device() {
     assert_eq!(marked(&m), "");
 }
 
-#[test]
-fn a_git_import_brings_no_hooks_and_cannot_write_the_veil_directory() {
-    if Command::new("git").arg("--version").output().is_err() {
-        return;
-    }
-    let env = Env::new();
-    std::fs::create_dir_all(env.root.join("markers")).unwrap();
-    let evil = marker(&env, "evil");
-    let g = env.dir("gitrepo");
-    let git = |args: &[&str]| {
-        let o = Command::new("git")
-            .args(["-c", "user.name=t", "-c", "user.email=t@e", "-c", "init.defaultBranch=main"])
-            .args(args)
-            .current_dir(&g)
-            .output()
-            .unwrap();
-        assert!(o.status.success(), "git {args:?}: {}", text(&o));
-    };
-    git(&["init", "-q"]);
-    script(&g, "scripts/lint.sh", &format!("echo pwned >> '{}'", evil.display()));
-    write(&g, ".veilhooks", "[pre-commit]\nrun = [\"sh\", \"scripts/lint.sh\"]\n");
-    script(&g, ".veil/hooks/pre-commit", &format!("echo local-pwned >> '{}'", evil.display()));
-    git(&["add", "-A", "-f"]);
-    git(&["commit", "-q", "-m", "hooks"]);
-    let proj = env.dir("proj");
-    env.ok(U, &proj, &["init"]);
-    let _ = env.vl(U, &proj, &["git", "import", g.to_str().unwrap()]);
-    assert!(proj.join(".veilhooks").is_file() && proj.join("scripts/lint.sh").is_file(), "the import brought nothing");
-    assert!(!proj.join(".veil/hooks/pre-commit").exists(), "a Git import wrote a device-local hook");
-    write(&proj, "x.txt", "x\n");
-    let out = env.vl(U, &proj, &["commit", "-m", "x"]);
-    assert!(out.status.success(), "{}", text(&out));
-    assert_eq!(marked(&evil), "", "imported content ran code");
-}
-
 // ---- 2. time of check to time of use -------------------------------------------------------
 
 #[test]
@@ -350,104 +315,6 @@ fn pre_push_input_never_names_cloaked_tags_or_withheld_history_on_a_public_remot
     env.ok(U, &proj, &["push", "origin"]);
     assert!(marked(&argv).ends_with("team\n"));
     assert!(marked(&input).contains("cloakedtagname "), "{}", marked(&input));
-}
-
-#[test]
-fn git_push_pre_push_input_names_exported_commits_only_and_redacts_the_url() {
-    if Command::new("git").arg("--version").output().is_err() {
-        return;
-    }
-    let env = Env::new();
-    std::fs::create_dir_all(env.root.join("markers")).unwrap();
-    let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
-    env.ok(U, &proj, &["tag", "set", "cloakedtagname", "-r", "@-", "--cloak", "team"]);
-    let bare = env.dir("bare.git");
-    assert!(Command::new("git").args(["init", "-q", "--bare"]).arg(&bare).status().unwrap().success());
-    env.ok(U, &proj, &["git", "remote", "add", "gh", bare.to_str().unwrap()]);
-    let (argv, input) = capture_push(&env, &proj);
-    env.ok(U, &proj, &["git", "push", "gh"]);
-    assert_eq!(marked(&argv), format!("gh\n{}\ngit\n", bare.display()));
-    let stdin = marked(&input);
-    assert!(!stdin.contains("cloakedtagname"), "{stdin}");
-    let line = stdin.lines().find(|l| l.starts_with("main ")).unwrap_or_else(|| panic!("{stdin}"));
-    let f: Vec<&str> = line.split(' ').collect();
-    assert_eq!(f.len(), 4, "{line}");
-    let head = Command::new("git").args(["--git-dir", bare.to_str().unwrap(), "rev-parse", "main"]).output().unwrap();
-    assert_eq!(f[3], String::from_utf8_lossy(&head.stdout).trim(), "{line}");
-
-    // Credentials in a Git URL never reach the hook; a failing hook stops
-    // the push before anything is sent.
-    env.ok(U, &proj, &["git", "remote", "add", "creds", "https://bob:s3cr3t-token@127.0.0.1:9/x.git"]);
-    script(&proj, ".veil/hooks/pre-push", &format!("printf '%s\\n' \"$@\" > '{}'\nexit 3", argv.display()));
-    let out = env.vl(U, &proj, &["git", "push", "creds"]);
-    let t = text(&out);
-    assert!(!out.status.success(), "{t}");
-    assert!(t.contains("pre-push hook") && t.contains("exit status 3") && t.contains("nothing was pushed"), "{t}");
-    let a = marked(&argv);
-    assert!(a.contains("***") && !a.contains("s3cr3t-token"), "{a}");
-}
-
-/// BUG-641: `vl git push` tells `pre-push` about the Git tags it pushes, in
-/// Git's own format (`refs/tags/<name> <local> refs/tags/<name> <remote>`),
-/// including a tag-only push and a tag deletion, and never about a cloaked
-/// release tag or one an unreleased embargo holds back.
-#[test]
-fn git_push_pre_push_input_lists_git_tags_in_gits_format() {
-    if Command::new("git").arg("--version").output().is_err() {
-        return;
-    }
-    let env = Env::new();
-    std::fs::create_dir_all(env.root.join("markers")).unwrap();
-    let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
-    let bare = env.dir("bare.git");
-    assert!(Command::new("git").args(["init", "-q", "--bare"]).arg(&bare).status().unwrap().success());
-    env.ok(U, &proj, &["git", "remote", "add", "gh", bare.to_str().unwrap()]);
-    let git_ref = |r: &str| {
-        let o = Command::new("git").args(["--git-dir", bare.to_str().unwrap(), "rev-parse", r]).output().unwrap();
-        String::from_utf8_lossy(&o.stdout).trim().to_string()
-    };
-    let zeros = "0".repeat(40);
-    env.ok(U, &proj, &["tag", "set", "v1.0", "-r", "@-", "-a", "-m", "Release 1.0"]);
-    env.ok(U, &proj, &["tag", "set", "v-cloaked-rel", "-r", "@-", "-a", "-m", "team notes", "--cloak"]);
-    let (_, input) = capture_push(&env, &proj);
-    env.ok(U, &proj, &["git", "push", "gh"]);
-    let stdin = marked(&input);
-    let line = format!("refs/tags/v1.0 {} refs/tags/v1.0 {zeros}", git_ref("refs/tags/v1.0"));
-    assert!(stdin.lines().any(|l| l == line), "{line} missing from:\n{stdin}");
-    assert!(stdin.lines().any(|l| l.starts_with("main ")), "{stdin}");
-    assert!(!stdin.contains("v-cloaked-rel"), "a cloaked release tag reached the hook:\n{stdin}");
-
-    // A tag-only push: the hook sees the tag, and no branch.
-    env.ok(U, &proj, &["tag", "set", "v1.1", "-r", "@-", "-a", "-m", "Release 1.1"]);
-    env.ok(U, &proj, &["git", "push", "gh", "--tag", "v1.1"]);
-    let stdin = marked(&input);
-    assert_eq!(stdin, format!("refs/tags/v1.1 {} refs/tags/v1.1 {zeros}\n", git_ref("refs/tags/v1.1")), "{stdin}");
-
-    // Pushed again, a tag the remote already holds names what it holds.
-    env.ok(U, &proj, &["git", "push", "gh", "--tag", "v1.1"]);
-    let held = git_ref("refs/tags/v1.1");
-    assert_eq!(marked(&input), format!("refs/tags/v1.1 {held} refs/tags/v1.1 {held}\n"));
-
-    // A release tag an unreleased embargo holds back is never named.
-    env.ok(U, &proj, &["new", "main"]);
-    write(&proj, "fix.txt", "the fix\n");
-    env.ok(U, &proj, &["commit", "--no-advance", "-m", "fix"]);
-    env.ok(U, &proj, &["tag", "set", "fix-line", "-r", "@-", "--cloak", "team"]);
-    env.ok(U, &proj, &["merge", "fix-line", "--into", "main", "--embargo", "-m", "Fix CVE"]);
-    env.ok(U, &proj, &["tag", "set", "v2.0-held", "-r", "main", "-a", "-m", "Release 2.0"]);
-    let out = env.ok(U, &proj, &["git", "push", "gh"]);
-    assert!(out.contains("skipped v2.0-held"), "{out}");
-    let stdin = marked(&input);
-    assert!(!stdin.contains("v2.0-held") && !stdin.contains("fix-line"), "{stdin}");
-    let out = env.vl(U, &proj, &["git", "push", "gh", "--tag", "v2.0-held"]);
-    assert!(!out.status.success() && text(&out).contains("skipped v2.0-held"), "{}", text(&out));
-    assert_eq!(marked(&input), "", "a held-back tag reached the hook");
-
-    // A tag deletion, alone: Git's `(delete)` line, naming what the remote held.
-    let old = git_ref("refs/tags/v1.0");
-    env.ok(U, &proj, &["tag", "delete", "v1.0"]);
-    env.ok(U, &proj, &["git", "push", "gh", "--delete-tag", "v1.0"]);
-    assert_eq!(marked(&input), format!("(delete) {zeros} refs/tags/v1.0 {old}\n"));
 }
 
 #[test]

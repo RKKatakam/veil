@@ -21,7 +21,6 @@ or a web front-end that talks to `veil-core` directly. For the design, see
 | Randomness | the OS | WebCrypto (`crypto.getRandomValues`), through getrandom's `wasm_js` backend |
 | Packs (`gc`, sync) | read and written with zstd: compressed and delta entries | read with a pure-Rust decoder (every pack `vl` writes); written with *stored* entries only |
 | Repository lock | waits up to 15 s, a heartbeat renews it, dead holders are detected by pid | fails at once if held; never renewed; never taken from another instance |
-| Git interop | `veil_core::git` (feature `git`) | not available |
 
 Both builds read and write the same repository format. A repository built
 in memory by the portable engine and copied to disk opens in `vl`, and a
@@ -81,7 +80,7 @@ Everything in the engine that is not about the host:
   as it does in `vl`;
 * sync between backends (push, pull, clone), `fsck` and `gc`.
 
-Not available: `DiskBackend`, SSH remotes, Git interop, and `vl` itself.
+Not available: `DiskBackend`, SSH remotes, and `vl` itself.
 
 ## Things to know
 

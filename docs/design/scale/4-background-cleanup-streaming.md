@@ -1,6 +1,6 @@
-# 4. Background cleanup instead of whole-store `gc`; streaming pull and Git import
+# 4. Background cleanup instead of whole-store `gc`; streaming pull
 
-Status: design and threat review (Scion 2.2 and 2.6; the backlog's "streaming / incremental gc" and "streaming pull" items). **No repository format change.** Pack and index bytes are unchanged; the gc lease and the maintenance log are new device-local files.
+Status: design and threat review (Scion 2.2; the backlog's "streaming / incremental gc" and "streaming pull" items). **No repository format change.** Pack and index bytes are unchanged; the gc lease and the maintenance log are new device-local files.
 
 ## The problem
 
@@ -10,12 +10,6 @@ Status: design and threat review (Scion 2.2 and 2.6; the backlog's "streaming / 
   - `PullSource::prefetch` downloads up to `PREFETCH_LIMIT` (2 GiB) of remote packs **into memory** (`MemoryBackend` per pack);
   - `pull_incremental` builds `local_ids` from `ObjectStore::list_objects()`, a set of every local object id;
   - the received objects go through `PackSink`, so through an in-memory `PackBuilder` again.
-- **Git import** (`git/import.rs`, `GitBridge::import_tips`):
-  - keeps every new commit decoded (`todo: HashMap<GitOid, gix::objs::Commit>`, messages included);
-  - caches every Git directory it ever reads (`GitTreeFs::dirs`, unbounded);
-  - builds `ChangeIndex` from `visible_snapshots()`;
-  - imports everything inside **one** transaction, so a crash after hours keeps nothing.
-
 ## Design sketch
 
 ### G1 (first milestone): streaming pack writing
@@ -81,19 +75,6 @@ Three tasks. The first two never need reachability.
 - **Received objects** go through `PackSink` backed by a `PackWriter` into staging, published at commit (item 2). Downloaded remote packs are deleted after the pull.
 - **Whole-pack adoption** (moving a downloaded remote pack into `pack/` as it is) is **not** done this round (open decision 3).
 
-### Streaming Git import (`git/import.rs`, `git/mod.rs`)
-
-- **Commit walk.** `todo` holds `CommitMeta { oid, parents: SmallVec<[GitOid; 2]>, time }` (about 64 bytes) instead of decoded commits. `import_one` re-reads the commit through gix's object cache.
-- **`GitTreeFs::dirs`** becomes a weight-bounded `cache::LruCache` (64 MiB of entries).
-- **`ChangeIndex`** uses `GraphIndex::by_change_id` (item 3).
-- **Checkpoints.** The import runs in batches of 5,000 commits in the same parents-first order. Each batch is one transaction (lock-free under item 2):
-  - its snapshots are added as heads;
-  - `GitMap::save` runs after each batch;
-  - and the operation is described as `import from git (batch k of n)`.
-
-  Tags, branches and remote tags move only in the final operation. After a crash, the next `vl git fetch`/`pull` resumes from the map: `mapped` finds the imported commits.
-- **`.veil/git/map`** stays an in-memory `GitMap` (about 100 bytes per commit, so 100 MB at a million commits). Moving it to an on-disk sorted table is open decision 4.
-
 ### Not in this item
 
 - Streaming large-file read, hash and seal in the builder (backlog item): taken only if item 9's 5 GB numbers show the builder's peak RSS over the gate (see `PLAN.md`, conditional stream).
@@ -122,12 +103,6 @@ Three tasks. The first two never need reachability.
 7. **Unverified objects entering the store** (via adoption, or the disk path skipping checks).
    - *Invariant:* every object entering the store from a remote passes `Transfer`'s checks (hash, decode, `check_storable`, depth, `allowed`), exactly as before.
    - *Test:* a remote pack holding a format-6-only object for a format-5 clone, and a tree deeper than `MAX_TREE_DEPTH`. The pull refuses both, as today.
-8. **A crash between Git-import batches.**
-   - *Invariant:* resuming after a crash at any point yields the same snapshot ids, tags and map as an uninterrupted import, including veils, carried paths and policy guards (`guard_policy`, `released_veils`).
-   - *Test:* a crash sweep at each batch boundary and in the middle of a batch over a 12,000-commit generated Git repository with embargo veils. Compare ids and the map with a clean import.
-9. **gc during an import.**
-   - *Invariant:* every checkpoint's snapshots are heads, so they are reachable.
-   - *Test:* run `vl gc --prune-now` between batches. The final import equals a clean one.
 10. **Maintenance during `vl upgrade`, `ws rm`, or a fix-up.**
     - *Invariant:* `vl upgrade` takes the gc lease as well as `.veil/lock`, and maintenance re-reads `repo.json`'s format under its lease, stopping if it changed.
     - *Test:* start an upgrade with maintenance paused mid-run. The upgrade waits for the lease, or maintenance stops; `fsck` passes.
@@ -137,10 +112,9 @@ Three tasks. The first two never need reachability.
 12. **Partial clones.** The cache area of item 6 (`objects/cache/`) is evicted by its own policy.
     - *Invariant:* maintenance never consolidates `objects/cache/` into the main store, and never evicts the main store.
     - *Test:* item 6, threat 6.
-13. **Interaction with sandboxes, mounts and the Git bridge:**
+13. **Interaction with sandboxes and mounts:**
     - a sandbox's `manifest.json` tree is not a root (documented: rebuilt);
-    - a mount's `base` is the workspace's working copy, hence in the view;
-    - `.veil/git/` is not an object store.
+    - a mount's `base` is the workspace's working copy, hence in the view.
 
     - *Invariant:* the same roots as today, plus all op heads.
     - *Test:* `gc` with a running mount and a persistent sandbox; both keep working, the sandbox rebuilds at most.
@@ -156,5 +130,3 @@ Three tasks. The first two never need reachability.
    - *Recommendation:* on the rewrite estimate or 7 days, whichever comes first.
 3. **Adopting whole downloaded packs on pull** (saves writing every received object again).
    - *Recommendation:* not this round. It needs every object checked anyway, and it would let one remote's delta layout persist locally. Revisit with item 9's pull numbers.
-4. **An on-disk Git map.**
-   - *Recommendation:* not this round; measure the 100,000-commit import first.

@@ -141,7 +141,7 @@ pub struct SyncOptions {
     pub full: bool,
     /// Push: move release tags (annotated, format 5) that the remote holds
     /// with another target (BUG-710: a release is immutable; replacing one
-    /// takes this, as `vl git push --force-tags` does for Git tags).
+    /// takes this).
     pub force_tags: bool,
 }
 
@@ -1142,8 +1142,8 @@ pub fn refresh_ring(local: &Repo, remote_backend: Arc<dyn StorageBackend>, scope
 
 // ---- remotes -----------------------------------------------------------------
 
-/// Check a remote name (Veil or Git): it becomes the first component of
-/// the remote tags `<remote>/<tag>`, and of Git ref names. ASCII letters,
+/// Check a remote name: it becomes the first component of the remote tags
+/// `<remote>/<tag>`. ASCII letters,
 /// digits, `-`, `_` and `.`; not empty, no leading `-` or `.`, no `..`, not
 /// ending in `.lock` (BUG-286). A `/` would make `origin/main/<tag>`
 /// collide with remote `origin`'s tag `main/<tag>`.
@@ -1162,35 +1162,40 @@ pub fn validate_remote_name(name: &str) -> Result<()> {
     }
 }
 
-/// Names of the configured Git remotes (`.veil/git/remotes.json`), read
-/// directly so that this works without the `git` feature.
-pub(crate) fn git_remote_names(backend: &dyn StorageBackend) -> Result<Vec<String>> {
-    let path = VPath::new(".veil/git/remotes.json").expect("valid path");
-    match backend.read_opt(&path)? {
-        Some(raw) => {
-            let map: std::collections::BTreeMap<String, String> = serde_json::from_slice(&raw)?;
-            Ok(map.into_keys().collect())
-        }
-        None => Ok(Vec::new()),
+/// `url` with any credentials it embeds (`https://user:token@host/…`)
+/// replaced by `***`, for messages and hooks.
+pub fn redact_url(url: &str) -> String {
+    match secret_of(url) {
+        Some(secret) => url.replace(secret, "***"),
+        None => url.to_string(),
     }
 }
 
+/// The credentials part of `url` that must never be printed: the whole
+/// `user[:password]` of an `http(s)://` URL (a token is often passed as
+/// the user name), the password of any other `scheme://user:password@`.
+fn secret_of(url: &str) -> Option<&str> {
+    let (scheme, rest) = url.split_once("://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let userinfo = &rest[..rest[..end].rfind('@')?];
+    let web = matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https");
+    match userinfo.split_once(':') {
+        _ if web => Some(userinfo),
+        Some((_, password)) => Some(password),
+        None => None,
+    }
+    .filter(|s| !s.is_empty())
+}
+
 /// Add Veil remote `name` for `url` (`vl remote add`). Refuses an invalid
-/// name, an existing Veil remote and the name of a Git remote: both kinds
-/// record their tags as `<name>/<tag>` (BUG-287).
+/// name and an existing remote.
 pub fn add_remote(repo: &mut Repo, name: &str, url: &str, public: bool) -> Result<()> {
     validate_remote_name(name)?;
-    let backend = repo.backend().clone();
     // Under the repository lock (`update_config`): a concurrent `vl remote
     // add` must not be lost to this read-modify-write of repo.json.
     repo.update_config(|config| {
         if config.remotes.contains_key(name) {
             return Err(VeilError::repo(format!("remote '{name}' already exists")));
-        }
-        if git_remote_names(&*backend)?.iter().any(|g| g == name) {
-            return Err(VeilError::repo(format!(
-                "'{name}' is already the name of a Git remote; Veil remotes share its `{name}/<tag>` names, pick another"
-            )));
         }
         config.remotes.insert(
             name.to_string(),
@@ -1688,7 +1693,7 @@ pub(crate) fn accepted_tags(
         if let Some(existing) = remote_tags.get(&name) {
             // A release tag (annotated, on either side) is never moved on
             // the remote without `--force-tags` (BUG-710), even forward.
-            // With it, the release is replaced, as a Git tag is.
+            // With it, the release is replaced.
             let release = existing.annotation.is_some() || tag.annotation.is_some();
             if existing.target != tag.target && release {
                 if !force_tags {

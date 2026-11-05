@@ -20,7 +20,6 @@ working tree *is* the host filesystem. Veil drops all three assumptions:
 ## Documentation
 
 * **[User guide](docs/guide/README.md)**: [getting started](docs/guide/getting-started.md),
-  [coming from Git](docs/guide/coming-from-git.md), [GitHub](docs/guide/github.md),
   [secrets and visibility](docs/guide/secrets-and-visibility.md),
   [embargoes](docs/guide/embargoes.md), [workspaces and agents](docs/guide/workspaces-and-agents.md),
   [teams and remotes](docs/guide/teams-and-remotes.md), [maintenance](docs/guide/maintenance.md),
@@ -116,7 +115,7 @@ The integration tests are a few binaries per crate, one per area
 suite is a module of one of them, so a module path filter selects it. The
 benchmarks are `#[ignore]`d tests in `core_bench` and `cli_bench`.
 `portable` stays a binary of its own (`scripts/check-wasm.sh` builds it
-without default features), and so do the colocated-Git suites.
+without default features).
 
 ### Shell completions and man pages
 
@@ -236,9 +235,6 @@ Workspaces   ws list|new <name> [-r rev] [--cloak [S]]|switch <name>|rm <name>
 Op log       op log [-n N] · op restore <id> · undo · watch [--interval-ms N]
 Sync         remote add <name> <path|ssh-url> [--public]|list|rm
              push [remote] [-t tag…] [--force] [--full] [--dry-run [--json]] · pull [remote] [--full]
-Git          git import <path|url> [--remote R] · git remote add <name> <url>|list|rm
-             git fetch [remote] · git pull [remote] · git push [remote] [-t tag…] [--force]
-             git export [-t tag…]
 Maintenance  gc [--keep-ops-days N] [--grace-minutes M | --prune-now] [--level L] [--no-deltas]
              fsck [-v] · upgrade [--dry-run] [--remote NAME] [--force]
 ```
@@ -271,59 +267,14 @@ and `cloak`/`isolate` rules ignore case (`.ENV`, `Secrets/`). `public`,
 
 `.veilpolicy` is shared, but **a change to it that you did not make never
 weakens the protection of your local files silently.** Your device keeps
-the policy you last accepted. When a merge, pull, checkout, rebase, Git
-import or undo brings a `.veilpolicy` that would publish, uncloak, re-scope
+the policy you last accepted. When a merge, pull, checkout, rebase or undo
+brings a `.veilpolicy` that would publish, uncloak, re-scope
 or stop scanning a file in your working copy (say a PR adds `.env public!`),
 that file keeps the protection you accepted, every command warns about it,
 and `vl status` lists it as `P`. Review the change with `vl policy show`.
 Apply it with `vl policy accept`. Your own edits of `.veilpolicy`, by hand
 or with `vl cloak|isolate|expose|ignore`, apply at once, and so do new
 `isolate`/`ignore` rules from others.
-
-## Git interop: keep GitHub, CI and code review
-
-```sh
-vl init my-project && cd my-project
-vl git import git@github.com:me/my-project.git   # history, authors and dates; every branch becomes a tag
-                                                 # (`origin` is added as a Git remote)
-vl cloak secrets/                                # Veil-only from here on
-… edit, vl commit -m "…" …
-vl tag set main -r @-
-vl git push                                      # tags → branches; GitHub sees what a public remote would
-vl git pull                                      # commits made on GitHub become snapshots; tags fast-forward
-vl rebase -d main                                # like after `vl pull`: move your working copy onto the new main
-```
-
-Like `vl pull`, `vl git pull` moves tags, never your working copy: that is
-a change of your own, and moving it would rewrite it under you. Rebase it
-(`vl rebase -d main`) or start a new one (`vl new main`) when you want the
-pulled commits on disk. Anything that became readable meanwhile (a scope
-grant, a released embargo) is filled into the working copy by every
-command, pull included.
-
-Git sees exactly what a `--public` Veil remote sees: no cloaked or isolated
-files, no cloaked descriptions (a placeholder instead), no cloaked tags, and
-an unreleased embargo's pre-merge tree with the fix's history withheld.
-After `vl embargo release`, the next `vl git push` fast-forwards the branch
-with one commit that publishes the fix and links its history.
-
-* **Round trips are safe.** A commit made on GitHub never saw your cloaked
-  files, so importing it does not delete them: Veil applies the commit on
-  top of the full Veil tree. A Git commit that would widen a cloaked path's
-  audience by editing `.veilpolicy` is not taken. Paths Git has but Veil
-  refuses (a committed `.env`, a file the scanner quarantines, symlinks,
-  submodules) are reported, stay in Git, and are never deleted there by a
-  later Veil push.
-* **Deterministic.** The same snapshot always exports to the same commit;
-  the change id travels in a `change-id` commit header (Jujutsu's), and
-  `.veil/git/map` records commit ↔ snapshot.
-* **Divergence is reported, never resolved by losing data.** A branch
-  force-pushed on GitHub is reported by `vl git fetch` and leaves your tags
-  alone; `vl git push` refuses to overwrite a branch that moved
-  (`vl git pull`, `vl merge <remote>/<branch>`, push again, or `--force`,
-  which only overwrites what you last fetched).
-* Fetch and push run your `git` binary (`$VEIL_GIT`), so credential
-  helpers, SSH config and agents work as they do for Git.
 
 ## Platform notes
 
@@ -434,7 +385,6 @@ crates/
     src/workspace.rs  workspaces, ephemeral overlays
     src/embargo.rs    delayed-visibility merges
     src/remote.rs     visibility-filtered, incremental push / pull (packs on the wire)
-    src/git/          Git import/export (gix) and the `git` transport
     src/vault.rs      device-local encrypted vault
     src/upgrade.rs    `vl upgrade`: journaled repository format migrations
     tests/fixtures/   golden repositories written by every format's release

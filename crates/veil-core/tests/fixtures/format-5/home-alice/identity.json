@@ -1,8 +1,8 @@
 {
   "format": 2,
   "name": "alice",
-  "public": "veil1f54537fd489b28d008405324a434c67dbfe10ff23242016f2353954c84a39758",
-  "signing": "8008cedbce394e9f1c17d9573320b7b607b9cb031b8d9fc7e2d9cc0969fa77d3",
-  "encryption_secret": "4aaa4f0621d3ef98a99e891be195a9d3fec9eb2c01734c888821500cec02bde1",
-  "signing_secret": "2a31c14a2ea8a3490ddca4f1dcf469f309be94370dd6ef7461123ab52b8f91ea"
+  "public": "veil16b8028cb129a2e28bdc3667481aa2db6c434b1f3aaa4cdc91c90c5592eaa0070",
+  "signing": "5243ae09e7ce1d9c0c79c0896f8b34ac50a386cad6f3c968666bd06beb57f090",
+  "encryption_secret": "281a240543e3396f05152c5ade839e9978b8e7b2960e240a524f7a07f02946bb",
+  "signing_secret": "05deb2b21776f83ce444b606522ff563e0e02f016ff9a7f5264994b9cfc960e4"
 }

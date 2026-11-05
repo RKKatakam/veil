@@ -16,7 +16,6 @@ Status: design and threat review (Scion 4.1, 4.2 and 4.4). **Requires format 6:*
   - push and pull from a partial clone.
 - **Out:**
   - true shallow history (dropping snapshot objects past a depth). **Every snapshot object is always fetched**, as Git's blobless/treeless clones keep every commit: snapshots are small, and keeping the graph complete keeps embargo, confinement, `embargo_withheld`, the history index and push closures exact (threats 4 and 9);
-  - colocated Git mode together with a partial clone (refused this round: the export needs every exported commit's blobs).
 
 ## Design sketch
 
@@ -34,7 +33,7 @@ vl partial status | widen PATH… | narrow PATH… | full
 
 ### State
 
-- **`repo.json`** gains `partial: { remote, since?, recent?, only?: [paths], cache_limit }` (`deny_unknown_fields`, format 6, device-local like `colocated`).
+- **`repo.json`** gains `partial: { remote, since?, recent?, only?: [paths], cache_limit }` (`deny_unknown_fields`, format 6, device-local).
 - **`.veil/objects/cache/`** holds objects fetched on demand, as loose files and packs. It is **the only area ever evicted** (threat 6). The main store (`objects/??/`, `objects/pack/`) holds what this repository created, plus the horizon fetched at clone and pull.
 - **`.veil/local/promisor/`** holds the remote's inventory: copies of its `.idx` files and the loose listing, refreshed by each pull. It also holds `anchors.json` (below) and `atime` (an append-only access log for LRU, compacted by maintenance).
 
@@ -102,7 +101,7 @@ A full clone reveals nothing about what a member *reads*. Fetching per file woul
 
 ### Sparse working copy (`--only`)
 
-- **Recording.** The project directory is recorded with `SnapshotOptions::only` (the `SparseView` path that sparse sandboxes and colocated mode use), and checked out with `restrict(tree, set)`, which always includes `.veilpolicy`.
+- **Recording.** The project directory is recorded through a `SparseView` (the path sparse sandboxes use), and checked out with `restrict(tree, set)`, which always includes `.veilpolicy`.
 - **Paths outside the set** keep the working copy's recorded entries by id and are never fetched.
 - **A policy edit or a scanner upgrade** turns the hints off, so the builder reads the outside files to reclassify them (exact, as for sandboxes). In a partial clone that fetches them: `vl` prints the number and size and asks for `--fetch` when more than 1,000 files or 1 GiB would be fetched.
 
@@ -169,7 +168,6 @@ A full clone reveals nothing about what a member *reads*. Fetching per file woul
 15. **Interactions:**
     - **sandboxes:** `ws exec` sync fetches through `vl`, never from inside the command;
     - **mount:** fetching happens in the FUSE request thread, with `VEIL_SFTP_TIMEOUT`, and a failure is `EIO`, never wrong content;
-    - **colocated Git:** refused together;
     - **the team vault:** unchanged (metadata is not objects);
     - **the history index:** `BLOOM_UNKNOWN`.
     - **SSH from inside agents:** a `vl blame` started by an agent harness may need the user's ssh agent; `Unavailable` names the remote and the SSH error.
@@ -187,5 +185,3 @@ A full clone reveals nothing about what a member *reads*. Fetching per file woul
    - *Recommendation:* defer. It breaks the complete-graph assumption that embargo, confinement and push safety rely on.
 4. **Default horizon.**
    - *Recommendation:* `--recent 1` (the checked-out snapshot's content), with `--since` for agents that run `blame`.
-5. **Colocated + partial.**
-   - *Recommendation:* refuse this round.

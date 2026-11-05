@@ -169,8 +169,8 @@ fn ws_write_of_an_isolated_path_does_not_claim_it_was_recorded() {
 
 // ---- hostile team remote ----------------------------------------------------------
 
-/// `vl git pull` refuses to create a local tag whose name is a change id
-/// prefix (BUG-059). `vl pull` from a Veil remote does not (`remote.rs`,
+/// A pull must refuse to create a local tag whose name is a change id
+/// prefix (BUG-059). `vl pull` from a Veil remote did not (`remote.rs`,
 /// `pull_with`: any name `validate_tag_name` accepts), and tags win over
 /// change ids in revsets. Alice's change ids are visible on the team
 /// remote, so Mallory, who can push there, tags her own snapshot with the

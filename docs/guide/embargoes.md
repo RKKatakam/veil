@@ -2,7 +2,7 @@
 
 An **embargoed merge** lands a fix on `main` now and publishes it later.
 Until the release, everyone outside the embargo's scope (public remotes,
-GitHub, teammates not in the scope) keeps seeing `main`'s **pre-merge
+teammates not in the scope) keeps seeing `main`'s **pre-merge
 tree**: no new file names, sizes or message, and none of the fix's history.
 After the release, the same snapshot ids become readable, with nothing
 rewritten.
@@ -97,7 +97,7 @@ $ vl log -n 4
   merges into.
 
 **4. Push as usual.** Team members in the scope see the fix; the public
-mirror and GitHub see the pre-merge tree:
+mirror sees the pre-merge tree:
 
 ```text
 $ vl push mirror
@@ -116,9 +116,9 @@ Releasing embargo 77932133a2 (scope team) publishes its key: everyone who receiv
     2be318b2 Fix CVE-2026-1234: empty buffer crash
   on: main
   Your next push to any remote publishes it (remotes: mirror (public), origin).
-  Until you push (or export to Git), `vl undo` takes the release back. After that it cannot be undone.
+  Until you push, `vl undo` takes the release back. After that it cannot be undone.
 Release embargo 77932133a2? [y/N] y
-Released embargo 77932133a2 in this repository. Your next push (or Git export) publishes the key; until then `vl undo` takes it back.
+Released embargo 77932133a2 in this repository. Your next push publishes the key; until then `vl undo` takes it back.
 $ vl push mirror
   published embargo 77932133a2 (its key is in the pushed record now; the release can no longer be undone)
 Pushed 6 object(s) to public remote mirror; 1 cloaked/embargoed object(s) withheld
@@ -127,7 +127,7 @@ Pushed 6 object(s) to public remote mirror; 1 cloaked/embargoed object(s) withhe
 In a script, pass `--yes` (without it, a release from a non-terminal is
 refused).
 
-**Released by mistake?** Until your next push or Git export, the release
+**Released by mistake?** Until your next push, the release
 exists only in your repository: the key is kept in device-local state that
 no sync reads. `vl undo` right after it takes it back completely:
 
@@ -138,14 +138,11 @@ Embargo 77932133a2 is unreleased again: its key had not left this repository.
 ```
 
 (`vl embargo list` shows such a release as `released (not pushed yet)`.)
-Once a push or Git export has published the key, `vl undo` of the release
+Once a push has published the key, `vl undo` of the release
 refuses and changes nothing: a published key cannot be taken back, so
 treat the fix as public. (Right after `vl push`, the first `vl undo` takes
 back only what the push recorded about the remote, `mirror/main` and the
 like; the next one reaches the release and refuses.)
-
-For GitHub, `vl git push` after the release adds one commit on top of the
-branch that publishes the fix and links its history (a fast-forward).
 
 **6. Clean up:** `vl ws rm fix-cve`.
 
@@ -278,8 +275,8 @@ Nothing is recorded when this happens. Your options:
   naming the change and the embargo (never a file): `vl restore --from`
   (with or without paths), `vl squash` (`--into` another line, or into the
   fix's own public parent), `vl duplicate` and `vl cherry-pick`, `vl rebase`
-  of work built on the fix onto another line, `vl abandon` of the fix while
-  work is built on it, and `vl format-patch` (so `vl am` never gets it).
+  of work built on the fix onto another line, and `vl abandon` of the fix
+  while work is built on it.
   Inside the embargo they all work: restore from the fix into a change on
   the fix line, squash work on the fix into it, rebase or split the fix
   itself (the embargoed merge follows). `vl cat -r` reads it and changes

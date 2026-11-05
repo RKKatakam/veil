@@ -1,4 +1,4 @@
-//! Attributes (design 7): a sealed `.gitattributes` and public results.
+//! Attributes (design 7): a sealed `.veilattributes` and public results.
 
 use std::path::Path;
 
@@ -8,15 +8,15 @@ use super::{
 };
 
 /// Merge two public edits of `log.txt` (one line each, the same line)
-/// under a `.gitattributes` holding `attributes`, cloaked for `team` when
+/// under a `.veilattributes` holding `attributes`, cloaked for `team` when
 /// `cloaked`. Returns the merged working-copy file.
 fn merge_under(env: &Env, name: &str, attributes: &str, cloaked: bool) -> String {
     let proj = env.dir(name);
     env.ok(U, &proj, &["init"]);
     write(&proj, "log.txt", "a\nb\nc\n");
-    write(&proj, ".gitattributes", attributes);
+    write(&proj, ".veilattributes", attributes);
     if cloaked {
-        env.ok(U, &proj, &["cloak", ".gitattributes"]);
+        env.ok(U, &proj, &["cloak", ".veilattributes"]);
     }
     env.ok(U, &proj, &["commit", "-m", "base"]);
     let base = change_id(env, U, &proj, "@-");
@@ -34,7 +34,7 @@ fn merge_under(env: &Env, name: &str, attributes: &str, cloaked: bool) -> String
 }
 
 /// BUG-705 (the W2 agent's suspicion, proven): the merge of a *public*
-/// file depends on a *sealed* `.gitattributes`. A member merges with the
+/// file depends on a *sealed* `.veilattributes`. A member merges with the
 /// cloaked file's `merge=union` (a clean union of both sides, recorded
 /// and published as public content); without it the same merge is a
 /// conflict. The public result therefore tells every mirror reader
@@ -48,10 +48,10 @@ fn a_sealed_gitattributes_does_not_decide_a_public_merge() {
     // Same length, so only the rule differs.
     let with = merge_under(&env, "with", "log.txt merge=union\n", true);
     let without = merge_under(&env, "without", "lag.txt merge=union\n", true);
-    assert_eq!(with, without, "the sealed .gitattributes changed the public merge result");
+    assert_eq!(with, without, "the sealed .veilattributes changed the public merge result");
 }
 
-/// Control: a public `.gitattributes` is meant to decide it.
+/// Control: a public `.veilattributes` is meant to decide it.
 #[test]
 fn control_a_public_union_attribute_merges_by_union() {
     let env = Env::new();
@@ -60,7 +60,7 @@ fn control_a_public_union_attribute_merges_by_union() {
 }
 
 /// BUG-705, the other audience: a result sealed for `team` is shaped by
-/// what `team` reads, so a cloaked `.gitattributes` still decides how a
+/// what `team` reads, so a cloaked `.veilattributes` still decides how a
 /// cloaked file merges.
 #[test]
 fn a_sealed_gitattributes_still_decides_a_merge_sealed_for_its_scope() {
@@ -68,8 +68,8 @@ fn a_sealed_gitattributes_still_decides_a_merge_sealed_for_its_scope() {
     let proj = env.dir("cloaked");
     env.ok(U, &proj, &["init"]);
     write(&proj, "log.txt", "a\nb\nc\n");
-    write(&proj, ".gitattributes", "log.txt merge=union\n");
-    env.ok(U, &proj, &["cloak", ".gitattributes", "log.txt"]);
+    write(&proj, ".veilattributes", "log.txt merge=union\n");
+    env.ok(U, &proj, &["cloak", ".veilattributes", "log.txt"]);
     env.ok(U, &proj, &["commit", "-m", "base"]);
     let base = change_id(&env, U, &proj, "@-");
     write(&proj, "log.txt", "a\nOURS\nc\n");

@@ -20,7 +20,7 @@ vl log [-r REVSET] [-n N] [--author PAT] [--signed-by MEMBER] [-S STRING | -G RE
 - **`-G REGEX`:** a line matching the regex is added or removed in the diff (`textmerge::create_patch`).
   - Regexes use the `regex` crate (linear time) with `size_limit(1 MiB)` and `dfa_size_limit(8 MiB)`, case-sensitive by default with `-i`.
 - **`--author`:** a regex over the free-form `author` claim. `--signed-by` matches the *verified* signer through `Keychain`, the same check `vl log` uses for its signature column.
-- **Revsets:** the conformance doc lists the revset language as a pending feature. This round adds only `-r` with `A..B` and `::B` (needed by bisect and format-patch) in `revset.rs` (`resolve_set`).
+- **Revsets:** the conformance doc lists the revset language as a pending feature. This round adds only `-r` with `A..B` and `::B` (needed by bisect) in `revset.rs` (`resolve_set`).
 
 ### `vl grep`
 

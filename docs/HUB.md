@@ -1,10 +1,10 @@
 # Veil Hub: design
 
 Status: **design draft, post-1.0.** Nothing here is implemented. Veil 1.0
-ships without a server: public code reaches GitHub through the Git bridge
-([ARCHITECTURE.md §11](ARCHITECTURE.md#11-git-interop-git)), and closed code
-goes to a path or SSH remote that needs nothing but SFTP
-([ARCHITECTURE.md §1, §8](ARCHITECTURE.md#8-synchronisation)). This document
+ships without a server: code goes to a path or SSH remote (team or public)
+that needs nothing but SFTP
+([ARCHITECTURE.md §1, §8](ARCHITECTURE.md#8-synchronisation)). Veil does not
+interoperate with Git, so the Hub has no Git mirror or Git import. This document
 designs the hosted service that comes after: a GitHub-like product for
 repositories that are partly open and partly closed, in which **the server
 never holds a key that opens closed content**.
@@ -74,8 +74,6 @@ Contents:
 * **Retroactive revocation.** Revocation stays forward-only
   ([ARCHITECTURE.md, threat model](ARCHITECTURE.md#threat-model)). The Hub
   makes offboarding fast and lists what to rotate. It cannot un-share.
-* **Replacing Git hosting for the public.** Public code can stay mirrored on
-  GitHub (§5.8). The Hub is where mixed work is reviewed.
 * **Reusing Git's wire protocol.** The protocol is Veil's own (§4), built on
   Veil packs and Veil's sync rules.
 
@@ -83,10 +81,10 @@ Contents:
 
 | Persona | Today (1.0) | What they want from the Hub |
 |---|---|---|
-| **Solo developer** (the owner, first user) | One repository: public code exported to GitHub with `vl git push`, closed code pushed to an SSH remote | One place to see all of it from any machine, a phone included; backups; CI for both halves; no server to run |
-| **Small team with mixed open and closed code** (the owner's team) | A team SSH remote, scopes granted by hand with pasted `veil1…` keys, review on GitHub for the public part only | Review of *whole* changes, closed parts included; invitations without pasting keys; offboarding that lists what to rotate; per-scope approvals |
-| **Open-source maintainer with outside contributors** | GitHub PRs for public code; the closed parts (deploy configs, release keys, internal docs) are invisible to contributors | Contributors open PRs against the public projection; maintainers review and merge them without exposing closed files; mixed PRs from insiders in the same queue |
-| **Security team using embargoes** | `vl merge --embargo --until`, release by hand or by the next key holder's `vl` | Reports from outside researchers, private advisories, a release that happens on time, coordinated disclosure with downstreams, a fix that lands on GitHub the moment it is public |
+| **Solo developer** (the owner, first user) | One repository: public code pushed to a public remote, closed code pushed to an SSH remote | One place to see all of it from any machine, a phone included; backups; CI for both halves; no server to run |
+| **Small team with mixed open and closed code** (the owner's team) | A team SSH remote, scopes granted by hand with pasted `veil1…` keys, no shared review | Review of *whole* changes, closed parts included; invitations without pasting keys; offboarding that lists what to rotate; per-scope approvals |
+| **Open-source maintainer with outside contributors** | A public remote for public code, contributions by hand; the closed parts (deploy configs, release keys, internal docs) are invisible to contributors | Contributors open PRs against the public projection; maintainers review and merge them without exposing closed files; mixed PRs from insiders in the same queue |
+| **Security team using embargoes** | `vl merge --embargo --until`, release by hand or by the next key holder's `vl` | Reports from outside researchers, private advisories, a release that happens on time, coordinated disclosure with downstreams, a fix that lands on the public remote the moment it is public |
 
 ---
 
@@ -167,7 +165,7 @@ Veil's model calls for it.
    makes local actions undoable (`vl undo`, `vl op restore`). Some Hub
    actions cannot be taken back: revocation is forward-only, a release
    publishes a key, and a declassification reaches the public projection
-   and GitHub (§1.2). The UI sorts every action into *undoable*,
+   (§1.2). The UI sorts every action into *undoable*,
    *compensable* or *permanent*. Permanent actions get a preview of what
    becomes visible, and a passkey confirmation (§D.4.6).
 7. **The command is the documentation.** `vl` is the complete client
@@ -182,8 +180,7 @@ Veil's model calls for it.
 9. **No social layer.** There are no stars, followers, contribution
    heatmaps or trending pages. The Hub is a workplace for mixed open and
    closed code, and a social layer would mostly leak who works on what (one
-   of the metadata items in §3.3). Public projects can link to their GitHub
-   mirror for that (§5.8).
+   of the metadata items in §3.3).
 
 ### D.2 Information architecture
 
@@ -196,7 +193,7 @@ word is chosen not to be mistaken for it.
 |---|---|---|---|
 | **change** | a change id and its versions (ARCHITECTURE.md §5) | commit | A commit is one version; a change has many |
 | **version** | a snapshot (`53414202`) | commit | Shown only where one exact version matters |
-| **line** | a tag and the first-parent history behind it | branch | Veil has no branches. A tag follows rewrites and moves only on commit, merge and pull ([coming-from-git](guide/coming-from-git.md#concept-map)). The guide already says "line of work" and "one embargo per line" |
+| **line** | a tag and the first-parent history behind it | branch | Veil has no branches. A tag follows rewrites and moves only on commit, merge and pull ([tags](guide/getting-started.md#tags)). The guide already says "line of work" and "one embargo per line" |
 | **proposal** | `PullRequest` (§5.1) | pull request | Nothing is pulled. A proposal asks to move a tag so that it includes a stack of changes |
 | **stack** | `PullRequest.stack`, bottom first (§5.1) | — | — |
 | **round** | `Revision` (§5.1), one per push to a proposal | "force-pushed" | In `vl`, "revision" already means a `REV` expression such as `main--` ([getting-started](guide/getting-started.md#revisions)) |
@@ -318,7 +315,7 @@ by default your own: `Seeing as you · public + team + ops`. Opening it gives
 
 * **Public** renders the page as the public renderer serves it. It is not
   simulated: the client fetches the public projection itself, which is
-  exactly what a `--public` remote or the GitHub mirror holds (§2.2, §5.8).
+  exactly what a `--public` remote holds (§2.2).
   This is the view to check before landing a declassification.
 * **A member of scopes…** renders with a subset of your own scopes, for
   example "what a `team` member outside `ops` sees". The subset is computed
@@ -623,8 +620,8 @@ embargo's life:
   ("released by the release service at the deadline"), C ("anyone can
   release once the drand round is out; cannot be postponed") (§8.1).
 * **Preview release** shows the public projection as it would be after
-  release: the files that become public, the history that fills in, and
-  what the Git mirror will receive (§8.2). **Release** is a permanent
+  release: the files that become public and the history that fills in
+  (§8.2). **Release** is a permanent
   action (§D.4.6).
 * **Scope match** is checked when preparing: a fix workspace cloaked for a
   different scope than the planned embargo gets the guide's warning ("Use
@@ -649,14 +646,14 @@ noted per row)*:
 |---|---|---|---|
 | **Undoable** | ↺ | a tag move by push or land; closing a proposal; Hub settings, ACL and team changes; dismissing a sign-off | Restores the earlier state. For a tag, see *retraction* below |
 | **Compensable** | ⇄ | a grant (→ revoke, which rotates); a revoke (→ re-grant at the current generation, which opens history again); a team mapping | Proposes the counter-action, and says what it cannot take back |
-| **Permanent** | ■ | an embargo release; a land that declassifies cloaked files; a push that published public content mirrored to GitHub; a rotation | Nothing. The entry explains what to do instead (rotate the underlying secrets) |
+| **Permanent** | ■ | an embargo release; a land that declassifies cloaked files; a push that published public content; a rotation | Nothing. The entry explains what to do instead (rotate the underlying secrets) |
 
 ```text
  HUB LOG · acme/app                                                  vl hub log
  ↺  op 7a1c  alice   land proposal 42 → main  e7645a71 → af765f31          [Undo…]
  ⇄  op 7a0f  alice   ops: grant carol (laptop)   ring #9                    [Revoke…]
        carol's devices have not fetched since the grant: the key has not reached them yet
- ■  op 79d2  erin    release embargo 51c0aa9e3f   (public + GitHub mirror)   permanent
+ ■  op 79d2  erin    release embargo 51c0aa9e3f   (public)                   permanent
  ↺  op 7911  dan     push main  5f50d8ae → e7645a71                         [Undo…]
 ```
 
@@ -677,7 +674,7 @@ noted per row)*:
   [teams](guide/teams-and-remotes.md#removing-a-teammate)).
 * **Permanent actions get a ceremony, not a typing test.** The ceremony is
   a publication preview: the public projection before and after, the
-  files, the history that fills in, and the Git mirror effect. The user
+  files and the history that fills in. The user
   confirms with a passkey user-verification, which is needed anyway to
   sign. There is no "type the repository name" dialog.
 * In the browser, actions are a local transaction followed by a push (land,
@@ -692,7 +689,7 @@ In 1.0, workspaces are entries in a device's view. Only tags travel on push
 anyone's workspaces today. The proposal *(UX addition; needs a server-side
 ref namespace like `pr/<n>/…` in §5.1)*: a member may **share** a workspace
 to the Hub as `ws/<account>/<name>`, a server-side ref that is not a tag,
-never reaches public remotes or Git, and keeps the workspace's cloak.
+never reaches public remotes, and keeps the workspace's cloak.
 Shared workspaces do three jobs: hand-off between devices, "look at this"
 without opening a proposal, and a target for agent runs.
 
@@ -794,7 +791,6 @@ enforces it: the Hub, clients, or cryptography.
  Governance      minimum admins per scope [2]; hold admin changes for a 2nd admin [off]   Hub (not proof
                  break-glass identity [not set]                                  against a compromised Hub)
  Publishing      pre-publish gate: [reject] / quarantine for review (§4.5 check 12)        Hub
-                 Git mirror: github.com/acme/app [on]
  Embargoes       modes allowed: A [on] B [off] C [off]                           §8
  Scope names     opaque by default [on] (§6.1)                                   Hub
  Runners         groups, identities, the scopes they are members of              cryptography
@@ -895,10 +891,6 @@ credit in the evolution log.
   proposal's audience is a scope. It asks for the deadline and the release
   mode, and checks scope match and one-embargo-per-line before anything is
   signed (§5.7, §8).
-* **Proposals imported from GitHub** (§5.8) carry a provenance stamp:
-  "imported from github.com/acme/app#123, signed by the Hub bridge
-  identity (not a member)". Snapshots signed by the bridge identity show `?`
-  where a member's would show `✓`, so the signature column stays honest.
 
 #### D.5.7 What is deliberately not GitHub's
 
@@ -1198,7 +1190,7 @@ verification. The org settings page lists these as web-only.
 | **2. Web client, read and administer** | Unlock this device; the lens with "preview as public / as a subset of my scopes"; member timeline and "Needs you"; change page with versions and interdiffs; files decrypted in the worker with "opened on this device"; scopes, members, ring log, requests; the invite flow with fingerprint words; grant, revoke, rotate; offboarding checklist; checkpoint chips; embargo board (mode A: notify, release, preview release); device chip with the unverified state |
 | **3. Proposals** | Proposal page (stack, rounds, audience-grouped diff, sign-off matrix, threads, suggested changes), land and land under embargo, the Policy tab, held-at-gate review, Hub log undo with retraction (needs the server rule), reversibility classes; phone reading and sign-off |
 | **4. CI** | Runs (CI first), sealed logs, statuses in the sign-off matrix |
-| **5. Embargo service, Git mirror** | Release modes B and C on the board; GitHub import provenance stamps; mirror status |
+| **5. Embargo service** | Release modes B and C on the board |
 | **6. Hardening** | Extension-verified client state and the full-page stop; native-only scope UX; governance holds and second-admin confirmation; desktop app |
 | **Later** | Shared workspaces and agent runs (needs the `ws/` ref namespace; phase 4's runner work is the base); preview as a specific person; partial stack landing |
 
@@ -1245,10 +1237,10 @@ outside contributors (§1.3):
 10. **Tier glyphs and patterns.** Are the nine states distinguishable in
     greyscale, under simulated colour-vision deficiencies, at compact
     density, and with a screen reader?
-11. **Preview as.** Does "preview as public" before landing a
+10. **Preview as.** Does "preview as public" before landing a
     declassification catch mistakes in practice, and should it be
     mandatory for declassifying lands?
-12. **Phone scope.** Is read + comment + sign-off the right phone feature
+11. **Phone scope.** Is read + comment + sign-off the right phone feature
     set for the solo persona, or do they expect to release embargoes from a
     phone?
 
@@ -1270,7 +1262,6 @@ outside contributors (§1.3):
    keys in a        │   repo workers ────► object storage (packs, partitioned by audience; immutable)       │
    worker)          │     │                                                                               │
                     │     ├──► public renderer (server-side pages of the public projection)              │
-                    │     ├──► Git mirror worker (public projection → GitHub)                             │
                     │     └──► CI coordinator ──► hub-hosted runners (public projection only)              │
                     └───────────────────────────────────────────────────────────────────────────────────────┘
  static assets:     web client build ── signed manifest + transparency log (§9.5)
@@ -1286,16 +1277,15 @@ outside contributors (§1.3):
 | **Metadata DB** | Accounts, identities, orgs, teams, repository ACLs, a mirror of each repository's view (tags, heads) for compare-and-swap, PRs, review threads (ciphertext bodies), signed approvals, invitations, CI jobs, audit log | PostgreSQL |
 | **Web client** | All browsing and review of closed content; also signs approvals, ring changes and comments | TypeScript UI + `veil-core` compiled to WASM in a Web Worker (§9) |
 | **Public renderer** | Pages for anonymous readers and search engines: the public projection only | Server-side, plaintext public content only |
-| **Git mirror worker** | Exports the public projection to GitHub/GitLab | `veil-core` `git` feature; export is key-independent (§5.8) |
 | **CI coordinator** | Queues jobs, dispatches to runners, stores signed statuses and sealed logs | §7 |
 | **Release service** | Releases embargoes on time without the Hub holding their keys before the deadline | Separate deployment and operator; §8 |
 
 ### 2.2 The key property this design rests on
 
 **The public projection, and every per-viewer projection, is computable
-without keys.** Veil already decides what a public remote or Git receives
-"by how each object is *sealed*, never by which keys this replica holds"
-([ARCHITECTURE.md §11](ARCHITECTURE.md#export-what-git-may-see)). The
+without keys.** Veil already decides what a public remote receives by how
+each object is *sealed*, never by which keys this replica holds
+([ARCHITECTURE.md §8](ARCHITECTURE.md#8-synchronisation)). The
 transfer filter reads only the envelope label of each object
 (`Transfer::allowed` in `remote.rs` calls `Object::sealed_scope(raw)`), and
 the withheld history of an unreleased embargo is computed from snapshot
@@ -1312,8 +1302,7 @@ So the Hub, holding no keys, can still:
 * compute which scopes a PR touches, by diffing trees by object id;
 * carry review approvals across a rebase when the sealed objects of a scope
   did not change (deterministic sealing gives unchanged content the same
-  id, [CRYPTO.md C1](CRYPTO.md#c1-sealed-objects-aes-siv-f3));
-* mirror the public projection to GitHub.
+  id, [CRYPTO.md C1](CRYPTO.md#c1-sealed-objects-aes-siv-f3)).
 
 This property must be kept as an engine invariant (§10.1).
 
@@ -1322,7 +1311,7 @@ This property must be kept as an engine invariant (§10.1).
 | Component | Can see | Cannot see |
 |---|---|---|
 | API server, repo workers, DB, object storage | Everything in §3.3: public content in plaintext; ciphertext, labels, sizes and tree shape of closed content; rings (member ids, names, roles, generations, wrapped keys as ciphertext); embargo records; snapshot metadata; who did what when | Closed file contents, sealed descriptions, sealed review comments and CI logs, scope keys, embargo keys before release, identity secrets |
-| Public renderer, Git mirror worker | The public projection, as a `--public` remote holds it | Anything sealed; rings (public remotes receive none, BUG-077, `remote.rs` module table) |
+| Public renderer | The public projection, as a `--public` remote holds it | Anything sealed; rings (public remotes receive none, BUG-077, `remote.rs` module table) |
 | Hub-hosted CI runners | The public projection | Anything sealed |
 | Release service | Embargo records; in escrow mode, embargo keys escrowed to it (§8.3) | Scope keys, closed content outside embargoes |
 | Self-hosted runners | What their scopes open, the CI secrets granted to them | Other scopes |
@@ -1608,8 +1597,7 @@ is this push log. Members' own op logs stay device-local, as now (FORMAT.md
 §2: operations are not synced).
 
 Check 12 implements the "pre-publish gate" requirement: it is enforceable
-only because the Hub is then the one path to the public projection and to
-the Git mirror (§5.8). A client-side hook alone can be bypassed.
+only because the Hub is then the one path to the public projection. A client-side hook alone can be bypassed.
 
 ### 4.6 Signed tag updates (freshness of refs)
 
@@ -1899,29 +1887,6 @@ merger's client                                    Hub
   §5) is labelled in the PR as "publishes N files from scope S" and requires
   an approval for `S` as well as for `public`; the pre-publish gate (check
   12) scans the published blobs on the server too.
-
-### 5.8 The Git bridge
-
-* **The Hub mirrors the public projection to GitHub.** Export is
-  deterministic and key-independent: tree, message and parents come from
-  the public projection, cloaked descriptions become placeholders, and only
-  *released* embargo keys are ever used (ARCHITECTURE.md §11, "Export").
-  The Git mirror worker can run `git::export` and `vl git push` server-side
-  with no Veil keys, only GitHub credentials. Being the one path to GitHub
-  is what makes the pre-publish gate (check 12) enforceable.
-* **GitHub PRs from outside contributors** can be imported as Hub PRs:
-  import goes through the policy gate on the full Veil tree
-  (`git/import.rs`), so a GitHub commit never deletes cloaked files. Two
-  limits: the Hub cannot seal, so a GitHub commit that adds a file at a
-  cloaked path is held back (as for any reader without the key, ARCHITECTURE.md
-  §4 rule 4) until a member imports it; and imported snapshots are signed by
-  the Hub's bridge identity, which is a known non-member key, not a member.
-* **Hub PRs to GitHub**: only PRs whose touched set is public-only can be
-  mirrored as GitHub PRs (a branch per PR). A mixed PR is not mirrored: its
-  public half alone would be reviewed out of context. The Hub is the system
-  of record for review; GitHub is a mirror plus an inbox for outside PRs.
-* A Hub-side `vl git pull` of GitHub-made commits onto `main` is a push
-  like any other and passes the same protection rules.
 
 ---
 
@@ -2246,8 +2211,7 @@ Three modes, chosen per embargo:
   signature). The Hub verifies the fingerprint (check 9), moves the
   embargo's packs to the public partition, rebuilds the public projection,
   fills in the withheld history ("same snapshot ids, now readable",
-  ARCHITECTURE.md §7 step 6), and triggers the Git mirror: the publication
-  commit fast-forwards GitHub (ARCHITECTURE.md §11).
+  ARCHITECTURE.md §7 step 6).
 * After release the content is public, so the pre-publish gate scans it then.
 
 ### 8.3 Mode B: escrow to a release service
@@ -2298,7 +2262,7 @@ security team   → cloaked workspace in s-adv-<n>; PR with audience s-adv-<n>  
 downstreams     → invited to s-adv-<n> as members for the pre-disclosure period
 merge           → client-side `vl merge --embargo --scope s-adv-<n> --until T` (mode A, B or C)
 advisory draft  → sealed under s-adv-<n> (text, CVE id, affected versions)
-release (T)     → embargo released; advisory published; Git mirror pushed;
+release (T)     → embargo released; advisory published;
                    reporter credited; s-adv-<n> members kept or revoked
 ```
 
@@ -2327,7 +2291,6 @@ agents" (`vfs/mod.rs`), and a WASM build is on the roadmap. A survey of
 | lock heartbeat thread, `std::process`, `libc` | `lock.rs` | none of these exist | a no-op lock for single-writer in-memory repositories |
 | `std::fs`, `libc` | `vfs/disk.rs`, `lock.rs` | none | `DiskBackend` behind `cfg(not(target_family = "wasm"))` |
 | SFTP backend (spawns `ssh`, threads) | `vfs/sftp*.rs` | none | behind a feature |
-| `gix` | `git/` (feature `git`) | not needed in the browser | `--no-default-features` |
 | `zstd` (C library via `zstd-sys`) | packs (`pack.rs`) | builds for WASM only with a C toolchain for that target; large | try `zstd-sys` for WASM first; fall back to a pure-Rust decoder (dictionary support needed for delta entries) and have the browser write `stored` entries (pack kind 0) when it pushes |
 | `getrandom` | `crypto.rs`, `identity.rs` | needs its WebCrypto (`wasm_js`) backend enabled for this target | build configuration |
 | AES (AES-SIV) without AES-NI | `aes-siv`, `aes` | software AES: slower, constant-time bitsliced in RustCrypto | measure; WebCrypto has no AES-SIV, and composing one from WebCrypto's AES-CBC and AES-CTR would be a homemade construction, which Veil does not do (CRYPTO.md §1) |
@@ -2463,8 +2426,7 @@ script running in the app's origin can use the user's keys (§9.5), so:
   (`VeilError::Missing`, ARCHITECTURE.md §2: "Callers treat both as 'exists,
   but not for you'"). Partial clones need a third state, "not fetched yet",
   so that a lazily missing object is never mistaken for a redaction (§10.1).
-* **Budgets to measure in phase 0**: WASM size (target ≤ 3 MiB compressed
-  without `gix`), AES-SIV and zstd throughput in WASM, time to first file
+* **Budgets to measure in phase 0**: WASM size (target ≤ 3 MiB compressed), AES-SIV and zstd throughput in WASM, time to first file
   view on a 20,000-file repository (the size of the `bench_status` layout,
   ARCHITECTURE.md §6).
 
@@ -2510,7 +2472,7 @@ team production secrets.
 | **2. Web client, read and administer** | WASM worker, OPFS backend, passkey-wrapped browser identity; history, trees, files, diffs, scopes and ring logs, embargo state; invitations with out-of-band codes (§6.3); grant, revoke, rotate from the browser; offboarding (§6.5); team-to-scope requests; ring checkpoints (§6.6) | 12–16 |
 | **3. Pull requests** | PR model on change ids, revisions, touched scopes, sealed comments and anchors, per-scope signed approvals and carry-over, protection rules, client-side merge (CLI and browser), embargoed PRs, pre-publish gate (check 12) | 12–16 |
 | **4. CI** | Runner agent, dispatch, runner policy, sealed logs, signed statuses, secrets via a CI scope, hub-hosted runners for the public projection | 8–12 |
-| **5. Embargo service and Git mirror** | Deadline worker (mode A), escrow release service (mode B, needs C8), advisories and coordinated disclosure, server-side Git mirror, GitHub PR import | 8–11 |
+| **5. Embargo service** | Deadline worker (mode A), escrow release service (mode B, needs C8), advisories and coordinated disclosure | 8–11 |
 | **6. Hardening for others** | Reproducible web builds, signed manifests, transparency log, pinning extension, desktop app, native-only scopes, optional governance (§6.7), key transparency for the identity directory, sealed trees (C5) and padding (C6) in production | 14–20 |
 | **7. Scale** | Partial clone, sparse fetch, streaming pack building on the server, server-side incremental repacking, time-lock mode C | 8–12 |
 
@@ -2536,8 +2498,7 @@ something a team SSH remote plus GitHub cannot.
   embargoed ones, run in the client and are pushed.
 
 Not in the MVP: CI, the release service (embargoes release as today, by
-key holders, with Hub notifications), server-side Git mirroring (`vl git
-push` from a client, as today), the pinning extension and the desktop app.
+key holders, with Hub notifications), the pinning extension and the desktop app.
 Until phase 6, the MVP is for the owner and their team only, with the web
 client treated as "as trustworthy as the Hub" and sensitive scopes kept to
 `vl`. The UI each phase ships is in [§D.9](#d9-the-mvp-ui-and-what-to-validate).
@@ -2560,7 +2521,7 @@ client treated as "as trustworthy as the Hub" and sensitive scopes kept to
    linked devices sharing one identity (fewer grants, revocation means
    replacement)? The design defaults to per-device.
 4. **Readable or opaque scope names.** Opaque by default costs readability
-   on public remotes and in Git exports' absent paths; readable names leak
+   on public remotes; readable names leak
    project structure.
 5. **Confidential-computing runners** (attested VMs) as hub-hosted runners for
    closed code: do they satisfy "zero knowledge" for this owner, given the
@@ -2577,10 +2538,7 @@ client treated as "as trustworthy as the Hub" and sensitive scopes kept to
    enforced by the Hub and re-verified by merging clients. Should `vl`
    refuse to *pull* a tag move that the repository's signed policy forbids,
    which would make the rules hold against a compromised Hub too?
-9. **GitHub as a second review venue.** Is a one-way flow (GitHub PRs
-   imported into the Hub, mixed PRs never mirrored) acceptable to
-   outside contributors who live on GitHub?
-10. **Pricing of storage.** Ciphertext does not deduplicate across scopes or
+9. **Pricing of storage.** Ciphertext does not deduplicate across scopes or
     compress, and partitioned packs trade deltas away; storage per user is
     higher than a Git host's.
 
@@ -2605,10 +2563,9 @@ The constructions and their limits are in [CRYPTO.md](CRYPTO.md); the
 open questions there (§7) still apply. Specific to the Hub:
 
 1. **The keyless-projection invariant** (§2.2, C1). Is there any path,
-   today or planned, where what a public remote, Git or a per-viewer
-   audience receives depends on keys the sender holds? `Transfer::allowed`,
-   `embargo_withheld`, `push_closure` and `git/project.rs` are the places to
-   read.
+   today or planned, where what a public remote or a per-viewer audience
+   receives depends on keys the sender holds? `Transfer::allowed`,
+   `embargo_withheld` and `push_closure` are the places to read.
 2. **Sealed-object authorship** (§4.5 check 6): accepting new ciphertext
    labelled `S#k` only from members of `S`. Is "member by ring replay at
    generation `k`" the right test, given that the server cannot check that

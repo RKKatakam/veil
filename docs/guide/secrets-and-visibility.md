@@ -18,7 +18,7 @@ when it records a snapshot, so no command, merge or push can get around it.
 
 ## Tiers and `.veilpolicy`
 
-| Tier | Recorded? | Team remote gets | Public remote / GitHub gets |
+| Tier | Recorded? | Team remote gets | Public remote gets |
 |---|---|---|---|
 | `public` (default) | plaintext, **secret-scanned** | it | it |
 | `public!` | plaintext, **not** scanned | it | it |
@@ -191,8 +191,8 @@ built-in      .env.dist                public
 ```
 
 The first four keep the metadata of version control systems out of every
-snapshot: `.git` (a directory, or the `.git` file of a Git worktree or
-submodule), `.jj/`, `.hg/` and `.svn/`, at any depth and in any case. No
+snapshot: `.git` (a directory, or the `.git` file of a Git worktree),
+`.jj/`, `.hg/` and `.svn/`, at any depth and in any case. No
 rule of yours records them, not even `** public` or `vendor/ public!`; only
 a `public!` rule that names the directory itself does
 (`fixtures/repo/.git/ public!`), for a test fixture that really is a
@@ -382,18 +382,14 @@ request cannot edit (the base branch's), and disregards the checkout's
 own `.veilpolicy`. It needs no Veil repository (no `vl init`, no identity)
 and changes nothing on disk.
 
-A Git checkout publishes every file in it, whatever a policy says, so in
+A CI checkout publishes every file in it, whatever a policy says, so in
 this mode every file counts as public: only FILE's `public!` paths (your
 reviewed test fixtures) are exempt. `isolate`, `cloak` and `ignore` paths
 are scanned too; only `.git/` (and other VCS metadata) is skipped. A file
 that cannot be read fails the gate.
 
 ```sh
-# Pull requests: the base branch's policy (empty when it has none, which
-# means the built-in rules only).
-git fetch --depth=1 origin "$GITHUB_BASE_REF"
-git show FETCH_HEAD:.veilpolicy > "$RUNNER_TEMP/base.veilpolicy" 2>/dev/null \
-  || : > "$RUNNER_TEMP/base.veilpolicy"
+# The base's policy (an empty file means the built-in rules only).
 vl scan --policy-from "$RUNNER_TEMP/base.veilpolicy"
 ```
 
@@ -402,8 +398,8 @@ PUBLIC    leak.js:1  aws-access-key-id AKIA…(20 chars)
 found: 1 file(s) contain secrets (or could not be scanned); only the `public!` paths of base.veilpolicy may
 ```
 
-In a GitHub Actions step this fails the job on a hit (exit 1; a missing
-FILE is an error and fails it too). For pushes to a protected branch, whose
+In a CI step this fails the job on a hit (exit 1; a missing FILE is an
+error and fails it too). For pushes to a protected branch, whose
 `.veilpolicy` was reviewed when it merged, `--policy-from .veilpolicy`
 works the same way.
 
@@ -450,8 +446,7 @@ Replacing your identity makes the vault unreadable until you re-key it
 Secrets the whole team needs (a staging database URL, a shared API key) go
 into a scope's **team vault**: sealed for the members of the scope and
 synced through team remotes, so a new teammate who is granted the scope gets
-them on their next `vl pull`. Public remotes and the Git export never
-receive it.
+them on their next `vl pull`. Public remotes never receive it.
 
 ```text
 alice$ vl secret set --scope team STRIPE_TEST_KEY        # value from stdin
@@ -577,8 +572,8 @@ teammates have the value.
 
 A **scope** is a named group of identities that share a key. `vl init`
 creates `team`, with you as its admin. A cloaked file is encrypted for its
-scope's current key; only members can read it, and public remotes and Git
-never receive it.
+scope's current key; only members can read it, and public remotes never
+receive it.
 
 ```text
 $ vl scope list
@@ -662,16 +657,16 @@ for an audience the file with markers does not have is never shown in it:
 the base (the `||||||| original` section) is left out when it was sealed
 for an audience the merged file does not have (say it was cloaked for
 `team` and both sides made the file public), and a side you cannot read is
-a `(not shown: …)` line. GitHub (the Git export) gets the same file as a
-public reader would see it: public versions, and a `(not shown: this
-version is not public)` line for every other one. The file with markers is
+a `(not shown: …)` line. A public reader sees public versions, and a
+`(not shown: this version is not public)` line for every other one. The
+file with markers is
 sealed like a merged file (never wider than a side it shows), so a
 resolution is sealed the same way.
 
 > **Public files edited in a cloaked workspace.** A public file you *edit*
 > in a cloaked workspace is recorded cloaked, together with its last public
-> version. Anyone who cannot read the scope (a public remote, GitHub,
-> teammates outside it) keeps seeing that last public version, never a
+> version. Anyone who cannot read the scope (a public remote, teammates
+> outside it) keeps seeing that last public version, never a
 > deleted file, until you publish the work with `vl merge`. A file you
 > cloak with `vl cloak` is different: hiding it is the point, so public
 > readers stop seeing it.
@@ -716,13 +711,10 @@ another scope; `public` → `public!`; un-ignoring a built-in secret. New
 `isolate` and `ignore` rules from others, and anything that strengthens
 protection, apply at once. The check covers every route a policy arrives
 by: merge, pull, checkout (`vl new`, `vl edit`, `vl ws switch`), rebase,
-Git import, `vl restore [--from REV]`, undo and `vl op restore`. Only your
+`vl restore [--from REV]`, undo and `vl op restore`. Only your
 own edit of the file (by hand, or with `vl cloak|isolate|expose|ignore`)
 applies at once; putting back another revision's policy with `vl restore`
-is not your edit. In colocated Git mode, where Git may write the file at
-any time, a hand edit counts as yours only if Git cannot have written it
-(see [Colocated Git mode](colocated-git.md#your-edits-of-veilpolicy));
-`vl cloak` and friends always do.
+is not your edit.
 
 **The policy file itself never lowers protection** below the policy you
 accepted:
@@ -760,7 +752,7 @@ are in [`docs/BACKLOG.md`](../BACKLOG.md). In short:
 * Accidental commits of secrets: the built-in rules, the scanner and
   quarantine, with no ignore file to forget.
 * Cloaked content, cloaked descriptions and cloaked tags never reach public
-  remotes or Git. Readers of a team remote who are not in the scope get
+  remotes. Readers of a team remote who are not in the scope get
   ciphertext only.
 * Revoked members can't read **new** content: revocation rotates the key.
 * Tampering: ciphertext is authenticated; key-ring changes and embargo
@@ -777,7 +769,7 @@ are in [`docs/BACKLOG.md`](../BACKLOG.md). In short:
 | **Scope membership is visible on team remotes** | Key rings go to team remotes, so anyone who can read one can list each scope's member names and ids (`vl scope list`). Public remotes get no rings; a public mirror shows only the member ids and signing keys in the signatures of what it holds (snapshots, embargo records) |
 | **Equality leakage** | Sealing is deterministic: two cloaked files (or versions) with identical content produce identical ciphertext, so an observer can tell they are equal |
 | **Revocation is forward-only** | A revoked member keeps every key up to the revocation, so they can still read all history sealed before it, including unchanged files still sealed under an old generation, and anything they already decrypted. Rotate the underlying secrets |
-| **Plaintext history stays** | Cloaking a path doesn't encrypt earlier snapshots. Git history imported from GitHub is public by definition |
+| **Plaintext history stays** | Cloaking a path doesn't encrypt earlier snapshots |
 | **Trust on first use** | A fresh clone accepts the first valid key ring it sees. A malicious remote could serve an outdated ring. Members who already hold the newer ring reject it |
 | **Signatures are advisory** | Unsigned or unknown-key snapshots are shown (`unsigned`, `?signer`) but not rejected. `author` is a free-form claim; only the signer is authenticated |
 | **Embargoes** | See [Embargoes: limitations](embargoes.md#limitations-in-10): metadata stays visible, release time isn't cryptographically enforced, one embargo per line |

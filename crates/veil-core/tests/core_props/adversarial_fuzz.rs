@@ -201,7 +201,7 @@ proptest! {
 }
 
 /// Format-5 leaves from a hostile tree (symlinks design, threat 13): link
-/// and gitlink entries whose object is a hostile target (NUL, over
+/// entries whose object is a hostile target (NUL, over
 /// `PATH_MAX`, not UTF-8, empty), a tree, a missing object, with the
 /// executable bit set or not. Storing may refuse (canonical by
 /// construction); checking out and snapshotting what was stored never
@@ -216,7 +216,6 @@ fn exercise_link_tree(entries: Vec<(String, u8, Vec<u8>)>) {
             name,
             kind: match k % 3 {
                 0 => EntryKind::Symlink,
-                1 => EntryKind::Gitlink,
                 _ => EntryKind::File,
             },
             id: match k % 4 {
@@ -252,7 +251,6 @@ fn exercise_link_tree(entries: Vec<(String, u8, Vec<u8>)>) {
             materialised: None,
             line_base: None,
             line_endings: Default::default(),
-            keep_recorded: None,
         },
     );
     let _ = veil_core::tree::TreeView::new(store.clone(), root).list_dir(&VPath::root());

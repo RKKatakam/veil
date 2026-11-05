@@ -116,7 +116,7 @@ pub struct ObjectStore {
     needs_recovery: AtomicBool,
     /// Repository format: decides the tree encoding written and accepted.
     format: AtomicU32,
-    /// This device's diff and merge drivers (`.gitattributes` only names
+    /// This device's diff and merge drivers (`.veilattributes` only names
     /// them; see [`crate::attributes::DeviceDrivers`]).
     drivers: RwLock<Option<Arc<dyn crate::attributes::DeviceDrivers>>>,
 }
@@ -297,7 +297,7 @@ impl ObjectStore {
     fn format_5_refusal(&self) -> VeilError {
         let need = crate::object::GIT_PARITY_REPO_FORMAT;
         VeilError::Unsupported(format!(
-            "this repository is at format {} and cannot store format-{need} symlinks, gitlinks or annotated tags; \
+            "this repository is at format {} and cannot store format-{need} symlinks or annotated tags; \
              upgrade it with `vl upgrade` (a remote: `vl upgrade --remote <name>`) once everyone who uses it runs vl {} or later",
             self.format(),
             crate::repo::min_vl_for_format(need)
@@ -731,7 +731,7 @@ impl ObjectStore {
     }
 
     /// Store `obj` in this repository's encoding (see [`ObjectStore::encode`]).
-    /// Format-5 objects (trees holding a symlink or gitlink, conflicts with
+    /// Format-5 objects (trees holding a symlink, conflicts with
     /// such a term, annotated tags) are refused below format 5, as by
     /// [`ObjectStore::put_raw`] (checked on the value, without decoding).
     pub fn put(&self, obj: &Object) -> Result<ObjectId> {
@@ -1063,7 +1063,7 @@ impl ObjectStore {
         match e.kind {
             // A conflict is always materialised (unreadable sides redacted).
             EntryKind::Dir | EntryKind::Conflict => self.has(&e.id),
-            EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink => {
+            EntryKind::File | EntryKind::Symlink => {
                 self.id_readable(&e.id) || e.fallback.is_some_and(|f| self.id_readable(&f))
             }
         }

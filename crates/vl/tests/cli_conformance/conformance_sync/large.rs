@@ -1,5 +1,5 @@
 //! Large files and many files (git t1050-large.sh) through commit, push,
-//! clone, pull, gc, fsck and the Git bridge.
+//! clone, pull, gc and fsck.
 
 use std::path::Path;
 
@@ -156,37 +156,6 @@ fn two_thousand_small_files_push_and_clone() {
         out.contains("Pulled 5 object(s)"),
         "snapshot, three trees and a blob: {out}"
     );
-}
-
-// Scenario from git t1050-large.sh via the Git bridge: a large binary imported from Git and
-// exported back is byte-identical (same blob id in Git).
-#[test]
-fn a_large_file_round_trips_through_the_git_bridge() {
-    let env = Env::new();
-    let (bare, wc) = git_upstream(&env, "gh.git", &[("README", "r\n")]);
-    write_bytes(&wc, "big.bin", &noise(3 * MIB, 21));
-    git_commit_push(&wc, "big");
-    let blob = git(&bare, &["rev-parse", "main:big.bin"]);
-    let proj = env.dir("proj");
-    env.ok("alice", &proj, &["init"]);
-    env.ok("alice", &proj, &["git", "import", bare.to_str().unwrap()]);
-    assert_eq!(
-        std::fs::read(proj.join("big.bin")).unwrap(),
-        noise(3 * MIB, 21)
-    );
-    // Export to a second, empty Git remote: same blob.
-    let other = env.path("other.git");
-    git(
-        &env.root,
-        &["init", "-q", "--bare", other.to_str().unwrap()],
-    );
-    env.ok(
-        "alice",
-        &proj,
-        &["git", "remote", "add", "other", other.to_str().unwrap()],
-    );
-    env.ok("alice", &proj, &["git", "push", "other"]);
-    assert_eq!(git(&other, &["rev-parse", "main:big.bin"]), blob);
 }
 
 // Scenario from git t1050-large.sh: an empty file, then a large one at the same path, then empty again.

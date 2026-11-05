@@ -3,7 +3,7 @@
 
 # `vl attr`
 
-Per-path attributes from `.gitattributes`: line endings, binary files, diff and merge drivers
+Per-path attributes from `.veilattributes`: line endings, binary files, diff and merge drivers
 
 Subcommands:
 
@@ -13,7 +13,7 @@ Subcommands:
 
 Show the attributes that apply to each path (like `git check-attr -a`), what Veil does with them (line endings, diff, merge), and those Veil does not support.
 
-Read from the working copy's `.gitattributes` files and the device-local `.veil/local/attributes`.
+Read from the working copy's `.veilattributes` files and the device-local `.veil/local/attributes`.
 
 ```text
 vl attr check [OPTIONS] <PATHS>...

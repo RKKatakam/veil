@@ -46,7 +46,7 @@ fn a_small_conflict_of_rewritten_files_materialises() {
 /// `merge_bytes` at `conflict.rs:493`) by every command that looks at it,
 /// for every reader: the checkout, and `vl status`, `vl ls` (three times
 /// per entry: `entry_tier`, `conflict_view`, `conflict_info`), `vl diff`,
-/// `vl show`, `vl resolve --list`, the Git export, and the builder on each
+/// `vl show`, `vl resolve --list`, and the builder on each
 /// snapshot that sees the file changed. diffy's three-way merge is
 /// quadratic in the number of differing lines: two rewritten versions of a
 /// 10,000-line file take 25 s per `vl status` and 38 s per `vl ls` (debug

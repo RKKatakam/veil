@@ -184,7 +184,7 @@ pub fn status(s: &Status) {
     }
     if !s.renormalizable.is_empty() {
         println!(
-            "{} file(s) would change line endings (`.gitattributes` asks for other line endings than they were recorded with); run `vl renormalize` to re-record them",
+            "{} file(s) would change line endings (`.veilattributes` asks for other line endings than they were recorded with); run `vl renormalize` to re-record them",
             s.renormalizable.len()
         );
     }
@@ -574,7 +574,6 @@ pub fn tag_list(t: &TagList) {
     let release = |a: &Option<crate::api::AnnotationItem>| match a {
         None => String::new(),
         Some(a) if a.verified => green(" [release, signed]"),
-        Some(a) if a.kind == "lightweight-git" => yellow(" [release, from Git]"),
         Some(_) => yellow(" [release]"),
     };
     for tag in &t.tags {
@@ -583,10 +582,6 @@ pub fn tag_list(t: &TagList) {
     }
     for tag in &t.remote_tags {
         println!("{}: {}", dim(&safe(&tag.name)), one_line(&tag.target));
-    }
-    for tag in &t.remote_release_tags {
-        let target = tag.target.as_ref().map(one_line).unwrap_or_else(|| dim("(unreadable)"));
-        println!("{}{}: {}", dim(&format!("tag:{}", safe(&tag.name))), release(&tag.annotation), target);
     }
 }
 
@@ -725,11 +720,10 @@ pub fn ls(l: &Ls) {
         }
         let note = if note.is_empty() { String::new() } else { dim(&format!("  ({})", note.join("; "))) };
         // A symlink with its target (escaped; a redacted link's target is
-        // sealed content and never shown), a gitlink as a submodule.
+        // sealed content and never shown).
         let leaf = match (e.kind, &e.target) {
             ("symlink", Some(t)) => format!("{}{}", dim(" -> "), safe(t)),
             ("symlink", None) => dim(" -> (target not shown)"),
-            ("gitlink", _) => dim(" (submodule)"),
             _ => String::new(),
         };
         println!(

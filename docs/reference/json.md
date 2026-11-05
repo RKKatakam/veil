@@ -191,7 +191,7 @@ A changed path, as `vl status` lists it.
 | `redacted` | bool | The new version is unreadable here |
 | `tier` | string | Its [tier](#tier) for this reader: `public`, `cloaked`, `embargoed` or `redacted` (`[redacted]` in the text, followed by the label of whom it is sealed for) |
 | `conflict` | [conflict](#conflict) or null | The new version is an unresolved conflict (`[conflict]` in the text); `visibility` and `tier` are then those of the file with markers you are shown |
-| `kind` | string | What the new version is (the old one for a deletion): `file`, `symlink`, `gitlink` (repository format 5) or `conflict` |
+| `kind` | string | What the new version is (the old one for a deletion): `file`, `symlink` (repository format 5) or `conflict` |
 | `old_kind` | string or null | The old version's kind when a modification changed it, e.g. a file replaced by a symlink (`T path (file → symlink)` in the text); null otherwise |
 
 ### Conflict
@@ -243,10 +243,10 @@ An entry (`old`, `new`):
 |---|---|---|
 | `visibility` | [visibility](#visibility) | Who can read this version |
 | `executable` | bool | The executable bit |
-| `mode` | string | `100644` or `100755`, as Git writes it; `120000` for a symlink and `160000` for a gitlink (repository format 5) |
+| `mode` | string | `100644` or `100755`, as Git writes it; `120000` for a symlink (repository format 5) |
 | `readable` | bool | This reader can materialise this version (for an embargoed file: its pre-merge fallback counts) |
 | `conflict` | [conflict](#conflict) or null | This version is an unresolved conflict; its content (and `visibility`, `executable`, `readable`) is that of the file with markers you are shown (`unresolved conflict` in the text) |
-| `kind` | string | `file`, `symlink`, `gitlink` (repository format 5) or `conflict` |
+| `kind` | string | `file`, `symlink` (repository format 5) or `conflict` |
 | `target` | string or null | A symlink's target (`symlink PATH -> TARGET` in the text, escaped), when you can read it; null for a link sealed for someone else (its target is content) and for anything but a symlink. A symlink's `content` is the diff of its target |
 
 `content`:
@@ -301,7 +301,7 @@ this command found.
 | `nested` | array of strings | Directories that are repositories of their own; nothing in them is recorded here |
 | `redacted` | array | Files of `@` that are absent on disk because you cannot read them: `path`, `redaction` (a [redaction](#redaction)) and `tier` (`redacted`, or for `unwritable` the file's own [tier](#tier)) |
 | `conflicts` | array | Unresolved conflicts: `path`, `recorded_on` (string or null: the short change id of the parent, a merge, that recorded it with the same version; null if recorded on `@` itself) and `conflict` (a [conflict](#conflict), or null for markers in the file) |
-| `renormalizable` | array of strings | Omitted when empty. Files that still hold their recorded version, but whose line endings `.gitattributes` would now convert: `vl renormalize` re-records them (changing `.gitattributes` alone never does) |
+| `renormalizable` | array of strings | Omitted when empty. Files that still hold their recorded version, but whose line endings `.veilattributes` would now convert: `vl renormalize` re-records them (changing `.veilattributes` alone never does) |
 
 ## `veil.log/1`
 
@@ -394,11 +394,10 @@ what they change is sealed for you; listed in `entries` only with
 | Field | Type | Meaning |
 |---|---|---|
 | `schema` | string | `veil.tag.list/1` |
-| `tags` | array | Local tags, by name: `name`; `cloak` (string or null: never pushed to public remotes); `target` (a [snapshot reference](#snapshot-reference)); `kind` (`release` for an annotated tag, else `branch`); `git_ref` (what the Git bridge exports it as: `refs/tags/<name>` or `refs/heads/<name>`); `annotation` (null for a plain tag, see below) |
+| `tags` | array | Local tags, by name: `name`; `cloak` (string or null: never pushed to public remotes); `target` (a [snapshot reference](#snapshot-reference)); `kind` (`release` for an annotated tag, else `branch`); `annotation` (null for a plain tag, see below) |
 | `remote_tags` | array | Tags as last seen on remotes: `name` (`remote/tag`) and `target` |
-| `remote_release_tags` | array | Git tags as last fetched from Git remotes: `name` (`remote/tag`), `target` (null if its annotation is unreadable) and `annotation` |
 
-An `annotation` holds `id` (the hex id of the annotated tag object), `kind`, `tagger` (as recorded; a claim, like a snapshot's author), `timestamp` (when it was tagged), `message`, `signer`, `verified` and `status`: `kind` is `annotated` or `lightweight-git` (a lightweight Git tag); `message` is null when sealed for a scope you are not in; `verified` is true only for a valid Veil signature by a key a ring of this repository knows (`signer` names its owner), never for a Git signature; `status` says what the check found (`good signature by …`, `unsigned`, `Git signature, not verified by Veil`, `unverified (name mismatch)`, …).
+An `annotation` holds `id` (the hex id of the annotated tag object), `kind`, `tagger` (as recorded; a claim, like a snapshot's author), `timestamp` (when it was tagged), `message`, `signer`, `verified` and `status`: `kind` is `annotated`; `message` is null when sealed for a scope you are not in; `verified` is true only for a valid Veil signature by a key a ring of this repository knows (`signer` names its owner); `status` says what the check found (`good signature by …`, `unsigned`, `unverified (name mismatch)`, …).
 
 ## `veil.op.log/1`
 
@@ -482,7 +481,7 @@ the working copy its local-only files.
 | `redaction` | [redaction](#redaction) or null | Why a `redacted` file cannot be read. Never content |
 | `quarantine` | object or null | A `quarantined` file: `rule` (string), `line` (number) and `state` (`never_recorded`, or `held_back`: history keeps the previous, recorded version) |
 | `conflict` | [conflict](#conflict) or null | An unresolved conflict (`conflict: 2 sides` in the text); `tier`, `scope`, `visibility`, `size` and `executable` are those of the file with markers you are shown, `readable` says whether you can read every side |
-| `kind` | string | `file`, `symlink`, `gitlink` (repository format 5) or `conflict` |
+| `kind` | string | `file`, `symlink` (repository format 5) or `conflict` |
 | `target` | string or null | A symlink's target (`PATH -> TARGET` in the text, escaped), when you can read it; null for a redacted link (its target is sealed content), a local-only link, and anything but a symlink. `size` is the target's length |
 
 ## `veil.resolve.list/1`
@@ -672,7 +671,7 @@ A copy:
 ## `veil.attr-check/1`
 
 `vl attr check PATH… --json`: the attributes that apply to each path, read
-from the working copy's `.gitattributes` files and the device-local
+from the working copy's `.veilattributes` files and the device-local
 `.veil/local/attributes` (as `git check-attr -a`), and what Veil does with
 them. The paths need not exist.
 

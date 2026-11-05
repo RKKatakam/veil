@@ -357,8 +357,8 @@ impl Mark<'_> {
                 };
                 match e.kind {
                     EntryKind::Dir => stack.push((e.id, p)),
-                    // Symlink targets and gitlink pointers are blobs too.
-                    EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink => {
+                    // Symlink targets are blobs too.
+                    EntryKind::File | EntryKind::Symlink => {
                         if self.reach.insert(e.id) {
                             self.hint(HINT_FILE, &p, e.id);
                         }

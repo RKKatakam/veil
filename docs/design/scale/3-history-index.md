@@ -8,9 +8,9 @@ Every snapshot is a plaintext object, so all of these are correct, but each read
 
 | walk | callers that run it on everyday commands |
 |---|---|
-| `Repo::topo_children_first(roots)` (full Kahn sort) | `Transaction::rebase_descendants` (**every** commit that rewrites anything, over `start_view.refs() ∪ view.refs()`), `revset::resolve_set` (`A..B`, `A..`), `revset::local_history` (the BUG-105 shadow check), `blame::blame` (orders all ancestors first), `bisect`, `git/export.rs` (export order), `git/colocate.rs`, `patch_cmd.rs` |
-| `Repo::visible_snapshots()` | `api::log_entries_with` (`vl log` with no revset builds the whole list before applying `-n`), `confinement::active_embargoes`, `remote::embargo_withheld`, `git/import.rs` `ChangeIndex`, `commands::check_current`, `revset.rs` change-id resolution, `history.rs`, `main.rs` |
-| `Repo::ancestors(id)` / `is_ancestor` / `common_ancestor` / `merge_bases` (full ancestor sets) | `remote::embargo_withheld` (twice per unreleased embargo), `commands::carried_embargo`, `commands::merged_in_signed_by`, `git/tags.rs`, `bisect`, `patch_cmd.rs` |
+| `Repo::topo_children_first(roots)` (full Kahn sort) | `Transaction::rebase_descendants` (**every** commit that rewrites anything, over `start_view.refs() ∪ view.refs()`), `revset::resolve_set` (`A..B`, `A..`), `revset::local_history` (the BUG-105 shadow check), `blame::blame` (orders all ancestors first), `bisect` |
+| `Repo::visible_snapshots()` | `api::log_entries_with` (`vl log` with no revset builds the whole list before applying `-n`), `confinement::active_embargoes`, `remote::embargo_withheld`, `commands::check_current`, `revset.rs` change-id resolution, `history.rs`, `main.rs` |
+| `Repo::ancestors(id)` / `is_ancestor` / `common_ancestor` / `merge_bases` (full ancestor sets) | `remote::embargo_withheld` (twice per unreleased embargo), `commands::carried_embargo`, `commands::merged_in_signed_by`, `bisect` |
 | `remote::committed_closure`, `push_closure`, `ancestors_in` | every push and pull |
 
 `Confinement::new` calls `embargo_withheld`, so since BUG-681 every rewrite that moves parents walks the history once per unreleased embargo.
@@ -78,7 +78,7 @@ impl GraphIndex {
 ### Writing
 
 - **After every commit,** `Transaction::commit` calls `graph().append(new snapshot ids)`: one small layer, best-effort. An error is a warning, and the index stays incomplete.
-- **Pull and Git import** append their snapshots after the operation.
+- **Pull** appends its snapshots after the operation.
 - **Compaction** (item 4's maintenance) merges layers geometrically, each at least twice the size of the next, and drops entries of snapshots gc collected. Old layer files are removed 10 minutes after the chain stopped naming them, so a reader that opened the old chain can finish.
 - **Lost updates are harmless.** The `chain` file is replaced with `write` (temp, rename). Two concurrent appenders can lose one layer from the chain, which only leaves those snapshots unindexed until the next append re-indexes them.
 - **Building from scratch** (`vl index rebuild`, or automatically when `chain` is missing and the repository has more than 1,000 snapshots): stream the snapshots parents-first through an id → position map (about 40 bytes per snapshot), writing one layer.
@@ -96,7 +96,6 @@ impl GraphIndex {
 - `commands::merged_in_signed_by`: `range(others, into)`. `commands::check_current`: `is_ancestor_of_any`.
 - `api::log_entries_with`: `topo_iter(view.refs())` with `-n`. `log -- PATH`: skip entries where `maybe_touches` is false (and still diff the ones where it is true). `blame::blame`: `topo_iter([rev])` lazily, with `maybe_touches` skipping commits that cannot touch the path.
 - `revset.rs`: change-id prefixes through `by_change_id`. `local_history` (the BUG-105 check) becomes `is_ancestor_of_any`.
-- `git/import.rs` `ChangeIndex`: `by_change_id`.
 - **`log -S` / `-G` (`search.rs`)** without a path stays a per-snapshot content scan: a whole-history query by definition, exempt from the gate (item 9). With `-- PATH`, the Bloom filter skips snapshots. With `-n`, it stops early.
 
 ## Threat review
@@ -109,7 +108,7 @@ impl GraphIndex {
    - *Test:* two embargoed merges that differ only in which file the fix touched give byte-identical layers.
 3. **A false negative in the Bloom filter.** `vl log -- p` and `blame` miss a change, or a security check that someday uses the filter misses something.
    - *Invariant:* `maybe_touches(id, p) == false` implies that the full diff of `id` against its first parent, for **any** reader, changes nothing at or below `p`.
-   - *Test:* a property test against the full diff for every reader (no keys, member of S, embargo key holder) over trees with sealed boundaries, renames, conflicts, symlinks, gitlinks, `BLOOM_FULL` edits (600 files) and wrappers.
+   - *Test:* a property test against the full diff for every reader (no keys, member of S, embargo key holder) over trees with sealed boundaries, renames, conflicts, symlinks, `BLOOM_FULL` edits (600 files) and wrappers.
 4. **A stale generation after a missing parent arrives.** A public clone sees an embargoed merge with its extra parents redacted. After the release, the next pull brings them. Had the merge been given a finite generation, a parent arriving with a higher one would break `gen(a) < gen(b)`, and `is_ancestor` would answer false. `embargo_withheld` and confinement would then miss the fix line, and something withheld would be pushed.
    - *Invariant:* no entry with a missing parent, or a parent with `GEN_UNKNOWN`, has a finite generation; `GEN_UNKNOWN` never prunes a walk. When a snapshot listed in any layer's `missing_parents` arrives, the layers from the lowest one holding that entry are rebuilt.
    - *Test:* public clone, embargoed merge, release, pull. `is_ancestor`, `range` and `embargo_withheld` equal the naive walks, and a public push afterwards sends exactly what the naive push sends.
@@ -138,14 +137,12 @@ impl GraphIndex {
     - *Invariant:* `topo_iter` yields exactly `topo_children_first`'s sequence.
     - *Test:* a property test comparing the full sequences on random DAGs with equal timestamps, criss-cross merges and redacted parents.
 13. **Interactions with other features:**
-    - **colocated Git:** `.veil/index` is inside `.veil`, which the exclude block covers;
     - **sandboxes and the mount:** they never see `.veil`;
     - **the team vault:** nothing indexed;
     - **partial clone:** item 6 keeps the snapshot graph complete, so generations are exact, and only Bloom filters of unfetched trees are `UNKNOWN`;
     - **`vl serve`:** queries go through the same API, so they return only what the reader may see.
 
     - *Invariant:* the index is never copied out of `.veil/` by any Veil command.
-    - *Test:* a colocated repository runs `git status` and `git add -A`; `.veil/index` is never listed.
 
 ## Open decisions
 
