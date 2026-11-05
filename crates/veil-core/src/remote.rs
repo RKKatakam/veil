@@ -139,6 +139,10 @@ pub struct SyncOptions {
     /// Walk and re-verify everything object by object instead of skipping
     /// what the receiver provably has (see the module documentation).
     pub full: bool,
+    /// Push: move release tags (annotated, format 5) that the remote holds
+    /// with another target (BUG-710: a release is immutable; replacing one
+    /// takes this, as `vl git push --force-tags` does for Git tags).
+    pub force_tags: bool,
 }
 
 /// Raw objects for a transfer: `New` must be written to the receiver,
@@ -1440,7 +1444,7 @@ pub fn push_with(
     // merges are read-modify-writes, and objects must land before the
     // operation that references them.
     let mut tx = remote.transaction(format!("push from {}", local.repo_id()))?;
-    let selected = accepted_tags(local, sendable, &tx.view.tags, force, &mut report)?;
+    let selected = accepted_tags(local, sendable, &tx.view.tags, force, opts.force_tags, &mut report)?;
     let tips: Vec<ObjectId> = selected.iter().map(|(_, t)| t.target).collect();
     let ids = push_closure(local.store(), local.keys(), &tips, &withheld)?
         .map_err(|why| VeilError::repo(format!("push: {why}")))?;
@@ -1676,11 +1680,31 @@ pub(crate) fn accepted_tags(
     sendable: Vec<(String, Tag)>,
     remote_tags: &std::collections::BTreeMap<String, Tag>,
     force: bool,
+    force_tags: bool,
     report: &mut SyncReport,
 ) -> Result<Vec<(String, Tag)>> {
     let mut accepted = Vec::new();
     for (name, tag) in sendable {
         if let Some(existing) = remote_tags.get(&name) {
+            // A release tag (annotated, on either side) is never moved on
+            // the remote without `--force-tags` (BUG-710), even forward.
+            // With it, the release is replaced, as a Git tag is.
+            let release = existing.annotation.is_some() || tag.annotation.is_some();
+            if existing.target != tag.target && release {
+                if !force_tags {
+                    report.tags_rejected.push(name.clone());
+                    report.tags_skipped.push((
+                        name,
+                        format!(
+                            "release tag: the remote's is at {}; replacing a release takes --force-tags",
+                            existing.target.short()
+                        ),
+                    ));
+                    continue;
+                }
+                accepted.push((name, tag));
+                continue;
+            }
             if existing.target != tag.target && !force && !local.is_ancestor(&existing.target, &tag.target)? {
                 report.tags_rejected.push(name.clone());
                 report

@@ -34,7 +34,8 @@ fn pull_never_moves_a_local_release_tag() {
     write(&mallory, "f.txt", "backdoor\n");
     env.ok("mallory", &mallory, &["commit", "-m", "harmless"]);
     env.ok("mallory", &mallory, &["tag", "set", "v1.0", "-r", "@-", "--force"]);
-    env.ok("mallory", &mallory, &["push", "origin"]);
+    // (Replacing a release on the remote takes --force-tags, BUG-710.)
+    env.ok("mallory", &mallory, &["push", "origin", "--force-tags"]);
 
     let pull = env.ok(U, &alice, &["pull", "origin"]);
     let after = env.vl(U, &alice, &["tag", "verify", "v1.0"]);
@@ -74,7 +75,7 @@ fn a_moved_release_tag_is_reported_recorded_and_taken_only_with_force() {
     env.ok("mallory", &mallory, &["commit", "-m", "harmless"]);
     env.ok("mallory", &mallory, &["tag", "set", "main", "-r", "@-"]);
     env.ok("mallory", &mallory, &["tag", "set", "v1.0", "-r", "@-", "--force"]);
-    env.ok("mallory", &mallory, &["push", "origin"]);
+    env.ok("mallory", &mallory, &["push", "origin", "--force-tags"]);
 
     let ours = tag_target(&env, &alice, "tags", "v1.0");
     for _ in 0..2 {
@@ -134,4 +135,37 @@ fn a_git_branch_named_like_a_release_tag_never_moves_it() {
     let verify = env.stdout(U, &alice, &["tag", "verify", "v1.0"]);
     assert!(verify.contains("good signature by alice"), "{verify}");
     assert_eq!(env.stdout(U, &alice, &["cat", "-r", "v1.0", "f.txt"]), "release\n");
+}
+
+/// BUG-710: `vl push` of a release tag moved here with `vl tag set --force`
+/// (even forward) never moves it on a Veil remote without `--force-tags`,
+/// as `vl git push` needs `--force-tags` for the Git tag. Plain tags still
+/// fast-forward; the dry run says the same.
+#[test]
+fn a_veil_push_never_moves_a_release_tag_without_force_tags() {
+    let env = Env::new();
+    let alice = env.project(U, "alice", &[("f.txt", "release\n")]);
+    env.ok(U, &alice, &["tag", "set", "v1.0", "-r", "main", "-a", "-m", "Release 1.0"]);
+    let remote = env.root.join("team");
+    env.ok(U, &alice, &["remote", "add", "origin", remote.to_str().unwrap()]);
+    env.ok(U, &alice, &["push", "origin"]);
+    let released = tag_target(&env, &alice, "remote_tags", "origin/v1.0");
+    write(&alice, "f.txt", "later\n");
+    env.ok(U, &alice, &["commit", "-m", "later"]);
+    env.ok(U, &alice, &["tag", "set", "main", "-r", "@-"]);
+    env.ok(U, &alice, &["tag", "set", "v1.0", "-r", "@-", "--force"]);
+    let dry = env.vl(U, &alice, &["push", "origin", "--dry-run"]);
+    assert!(!dry.status.success(), "{}", super::adversarial_support::text(&dry));
+    let push = env.vl(U, &alice, &["push", "origin"]);
+    let shown = super::adversarial_support::text(&push);
+    assert!(!push.status.success() && shown.contains("--force-tags"), "{shown}");
+    // `main` (a plain tag) went; the release stayed.
+    assert!(shown.contains("pushed main"), "{shown}");
+    assert_eq!(tag_target(&env, &alice, "remote_tags", "origin/v1.0"), released);
+    env.ok("bob", &env.root, &["clone", "team", "bob"]);
+    assert_eq!(env.stdout("bob", &env.root.join("bob"), &["cat", "-r", "v1.0", "f.txt"]), "release\n");
+    // On purpose, it moves.
+    env.ok(U, &alice, &["push", "origin", "--dry-run", "--force-tags"]);
+    env.ok(U, &alice, &["push", "origin", "--force-tags"]);
+    assert_ne!(tag_target(&env, &alice, "remote_tags", "origin/v1.0"), released);
 }

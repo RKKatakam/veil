@@ -158,7 +158,7 @@ fn sftp_sync_benchmark() {
     println!("| operation                          |     RTT |       time | requests |        sent |    received | objects |");
     println!("|------------------------------------|---------|------------|----------|-------------|-------------|---------|");
 
-    let full = SyncOptions { full: true };
+    let full = SyncOptions { full: true, ..Default::default() };
     let inc = SyncOptions::default();
     let mut n = 0;
     for &rtt in &rtts {

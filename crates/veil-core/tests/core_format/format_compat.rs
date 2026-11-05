@@ -1267,7 +1267,7 @@ fn interrupted_upgrade_to_3_resumes_the_ring_step() {
 #[test]
 fn aes_siv_objects_and_hpke_rings_never_reach_a_format2_repository() {
     for full in [false, true] {
-        let opts = remote::SyncOptions { full };
+        let opts = remote::SyncOptions { full, ..Default::default() };
         let fx = Fixture::new(2);
         upgrade(fx.backend("alice"), Some(fx.identity("alice")), &UpgradeOptions::default()).unwrap();
         let mut alice = fx.open("alice", Some("alice"));

@@ -285,6 +285,19 @@ pub fn plan_push(
     only_tags: &[String],
     force: bool,
 ) -> Result<PushPlan> {
+    plan_push_with(local, remote_backend, public, only_tags, force, false)
+}
+
+/// [`plan_push`] for a push with `--force-tags` (`force_tags`, see
+/// [`remote::SyncOptions::force_tags`]).
+pub fn plan_push_with(
+    local: &Repo,
+    remote_backend: Arc<dyn StorageBackend>,
+    public: bool,
+    only_tags: &[String],
+    force: bool,
+    force_tags: bool,
+) -> Result<PushPlan> {
     let ro: Arc<dyn StorageBackend> = Arc::new(ReadOnly(remote_backend));
     let creates_remote = !ro.exists(&crate::repo::config_path())?;
     let remote = if creates_remote {
@@ -297,7 +310,7 @@ pub fn plan_push(
     let mut report = SyncReport::default();
     let (sendable, withheld) = remote::sendable_tags(local, public, only_tags, &mut report)?;
     let view = remote.view();
-    let accepted = remote::accepted_tags(local, sendable, &view.tags, force, &mut report)?;
+    let accepted = remote::accepted_tags(local, sendable, &view.tags, force, force_tags, &mut report)?;
     let tips: Vec<ObjectId> = accepted.iter().map(|(_, t)| t.target).collect();
     let ids = remote::push_closure(local.store(), local.keys(), &tips, &withheld)?
         .map_err(|why| VeilError::repo(format!("push: {why}")))?;

@@ -116,7 +116,7 @@ fn push_pull_and_clone_over_sftp() {
     assert_eq!(remote::pull(&mut alice, "origin", conn.clone()).unwrap().objects_copied, 0);
     let incremental = conn.stats().requests - before;
     let before = conn.stats().requests;
-    let full = remote::SyncOptions { full: true };
+    let full = remote::SyncOptions { full: true, ..Default::default() };
     remote::pull_with(&mut alice, "origin", conn.clone(), &full).unwrap();
     let walked = conn.stats().requests - before;
     assert!(incremental * 4 < walked, "{incremental} requests vs {walked} for the full walk");

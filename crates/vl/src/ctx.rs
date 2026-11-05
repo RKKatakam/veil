@@ -202,6 +202,10 @@ pub struct Ctx {
     /// repository, it moves from `.git/veil` back to `.veil` (see
     /// `colocate_cmd::uncolocate`).
     pub(crate) uncolocated: bool,
+    /// Paths whose recorded entry the next snapshots keep whatever the
+    /// directory holds, besides the session's (colocated Git mode: hidden
+    /// files a Git checkout overwrote, BUG-754).
+    pub(crate) keep_extra: std::collections::BTreeSet<VPath>,
 }
 
 pub fn find_root(start: &Path) -> Option<PathBuf> {
@@ -332,6 +336,7 @@ impl Ctx {
                 bare: true,
                 git: None,
                 uncolocated: false,
+                keep_extra: Default::default(),
             });
         }
         for id in repo.auto_release_embargoes()? {
@@ -351,6 +356,7 @@ impl Ctx {
             bare: false,
             git: None,
             uncolocated: false,
+            keep_extra: Default::default(),
         };
         // Colocated Git mode: follow what Git did since the last command
         // (new commits, a checkout) before the working copy is recorded.
@@ -548,6 +554,7 @@ impl Ctx {
         let policy_edit = policy_edit.or(attributed
             .as_ref()
             .map(|(before, after)| veil_core::policy::PolicyEdit { before, after }));
+        let keep = self.keep_recorded();
         let out = self.repo.snapshot_workspace_with(
             &self.ws,
             fs,
@@ -559,7 +566,7 @@ impl Ctx {
                 policy_edit,
                 expected_wc: Some(view_wc),
                 carried,
-                keep_recorded: self.git.as_ref().map(|g| &g.keep).filter(|k| !k.is_empty()),
+                keep_recorded: keep.as_ref().filter(|k| !k.is_empty()),
                 ..Default::default()
             },
         )?;
@@ -576,6 +583,15 @@ impl Ctx {
             save_checkout(&self.fs, &self.checkout)?;
         }
         Ok(true)
+    }
+
+    /// The tracked paths snapshots keep at their recorded entry: the
+    /// session's (the user's own hidden files, BUG-745) and
+    /// [`Ctx::keep_extra`].
+    fn keep_recorded(&self) -> Option<std::collections::BTreeSet<VPath>> {
+        let mut keep = self.git.as_ref().map(|g| g.keep.clone()).unwrap_or_default();
+        keep.extend(self.keep_extra.iter().cloned());
+        (!keep.is_empty()).then_some(keep)
     }
 
     /// Colocated Git mode: the edit of `.veilpolicy` the directory holds
@@ -862,6 +878,7 @@ impl Ctx {
             return self.record(None, true, None, &[]);
         }
         let disk = self.fs.clone();
+        let keep = self.keep_recorded();
         let out = self.repo.snapshot_workspace_with(
             &self.ws,
             &*disk,
@@ -871,7 +888,7 @@ impl Ctx {
                 expected_wc: Some(view_wc),
                 only: Some(only),
                 policy_incoming: true,
-                keep_recorded: self.git.as_ref().map(|g| &g.keep).filter(|k| !k.is_empty()),
+                keep_recorded: keep.as_ref().filter(|k| !k.is_empty()),
                 ..Default::default()
             },
         )?;

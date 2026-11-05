@@ -561,6 +561,14 @@ fn follow_head(ctx: &mut Ctx, bridge: &GitBridge, state: &State, target: ObjectI
         return Ok(());
     }
     let managed = managed_paths(ctx, bridge, state, &target)?;
+    // Hidden files Git's checkout overwrote (it treats ignored files as
+    // expendable, BUG-754): the old change keeps its recorded version,
+    // never Git's, and the member is told how to get it back.
+    let overwritten = overwritten_hidden(ctx, bridge, state, &old_snap.tree, commit).unwrap_or_else(|e| {
+        warn(&format!("could not check which hidden files Git's checkout overwrote: {e}"));
+        Vec::new()
+    });
+    ctx.keep_extra.extend(overwritten.iter().cloned());
     // 1. What the hidden files hold now goes into the old change first.
     // `.veilpolicy` is incoming here as in step 4: Git's checkout may have
     // written it, and an own edit would be accepted even if it weakens the
@@ -583,10 +591,20 @@ fn follow_head(ctx: &mut Ctx, bridge: &GitBridge, state: &State, target: ObjectI
             ctx.snapshot_only(&set)?;
         }
     }
+    for p in &overwritten {
+        ctx.keep_extra.remove(p);
+    }
     let old = ctx.wc()?;
     // 2–3. A new change on the target, with the hidden part moved by Veil.
     let ws = ctx.ws.clone();
-    let plan = colocate::plan_head_move(&ctx.repo, &ws, old, target, &managed)?;
+    let mut plan = colocate::plan_head_move(&ctx.repo, &ws, old, target, &managed)?;
+    // What Git overwrote is a conflict: the previous change, which holds
+    // the recorded version, stays visible (BUG-754).
+    for p in &overwritten {
+        if !plan.conflicts.contains(p) {
+            plan.conflicts.push(p.clone());
+        }
+    }
     let old_tree = ctx.repo.snapshot(&old)?.tree;
     let (new, kept) = colocate::apply_head_move(&mut ctx.repo, &ws, old, target, &plan)?;
     if !plan.write.is_empty() {
@@ -609,14 +627,78 @@ fn follow_head(ctx: &mut Ctx, bridge: &GitBridge, state: &State, target: ObjectI
         let c = ctx.repo.snapshot(&old)?.change_id;
         eprintln!("  {} the previous working-copy change {} stays as it was", dim("kept"), c.short());
     }
-    for p in &plan.conflicts {
+    for p in plan.conflicts.iter().filter(|p| !overwritten.contains(p)) {
         eprintln!(
             "  {} {} (changed here and in the checked-out commit; your version stays in the previous change)",
             yellow("kept"),
             safe(p.as_str())
         );
     }
+    if !overwritten.is_empty() {
+        // An empty change is not kept: its parent has the same version.
+        let old_s = ctx.repo.snapshot(&old)?;
+        let from = match old_s.parents.as_slice() {
+            [p] if ctx.repo.is_empty_change(&old)? => ctx.repo.snapshot(p)?.change_id.short(),
+            _ => old_s.change_id.short(),
+        };
+        for p in &overwritten {
+            warn(&format!(
+                "Git's checkout overwrote {} (a file Veil hides from Git, which Git treats as expendable). Your version \
+                 as of the last vl command is kept in change {from}: `vl restore --from {from} {}`. An edit made since \
+                 then is lost",
+                safe(p.as_str()),
+                safe(p.as_str())
+            ));
+        }
+    }
     Ok(())
+}
+
+/// The files Veil hid from Git that Git's checkout of `commit` wrote over
+/// (BUG-754: Git treats ignored files as expendable): hidden before the
+/// move (not plain public in `old_tree`, or a sealed edit under
+/// skip-worktree), recorded by Veil with other content, and on disk
+/// exactly as `commit` has them.
+fn overwritten_hidden(
+    ctx: &Ctx,
+    bridge: &GitBridge,
+    state: &State,
+    old_tree: &ObjectId,
+    commit: &veil_core::git::GitOid,
+) -> Result<Vec<VPath>> {
+    let store = ctx.repo.store().clone();
+    let public = colocate::public_plain(&ctx.repo, old_tree);
+    let mut recorded: Vec<(VPath, veil_core::TreeEntry)> = Vec::new();
+    for (p, e) in veil_core::tree::walk_files(&store, old_tree)? {
+        let hidden = !public.contains(p.as_str().as_bytes()) || state.skip.iter().any(|s| s == p.as_str());
+        if hidden && e.kind.is_file_like() {
+            recorded.push((p, e));
+        }
+    }
+    if recorded.is_empty() {
+        return Ok(Vec::new());
+    }
+    let c = bridge.read_commit(commit)?;
+    let theirs = bridge.flatten_tree(&c.tree)?;
+    let mut out = Vec::new();
+    for (p, e) in recorded {
+        let Some(leaf) = theirs.get(p.as_str().as_bytes()) else { continue };
+        if leaf.mode & 0o170000 != 0o100000 {
+            continue;
+        }
+        let Some(disk) = veil_core::StorageBackend::read_opt(&*ctx.fs, &p)? else { continue };
+        if bridge.read_blob(&leaf.oid)? != disk {
+            continue;
+        }
+        let ours = match veil_core::conflict::read_file_like(&store, &e) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if ours != disk {
+            out.push(p);
+        }
+    }
+    Ok(out)
 }
 
 // ---- who wrote .veilpolicy ---------------------------------------------------------------
