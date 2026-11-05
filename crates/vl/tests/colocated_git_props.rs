@@ -225,10 +225,15 @@ impl World<'_> {
     fn check_git(&mut self, when: &str) {
         let git = self.dir.join(".git");
         assert!(git.join("veil/repo.json").is_file(), "I0 {when}: the Veil repository is gone\n{}", self.log.join("\n"));
-        // (`vl cloak` strengthens it: the member's own edit.)
+        // (`vl cloak` strengthens it: the member's own edit, folded in
+        // with the rules normalised: `secrets/   cloak team`.)
         let pin = std::fs::read_to_string(git.join("veil/local/accepted-policy")).unwrap_or_default();
+        fn rule(l: &str) -> Vec<&str> {
+            l.split_whitespace().collect()
+        }
         assert!(
-            pin.lines().any(|l| l == "secrets/ cloak") && !pin.lines().any(|l| l.starts_with("secrets/ public")),
+            pin.lines().any(|l| matches!(rule(l)[..], ["secrets/", "cloak"] | ["secrets/", "cloak", "team"]))
+                && !pin.lines().any(|l| rule(l).first() == Some(&"secrets/") && rule(l).get(1).is_some_and(|t| t.starts_with("public"))),
             "I0 {when}: the accepted-policy pin is not the member's:\n{pin}\n{}",
             self.log.join("\n")
         );
@@ -434,6 +439,15 @@ fn hostile_pulls_negations_clean_and_stash_stay_clean() {
     // the member's own edit by the follow's first snapshot, and replaced
     // the accepted-policy pin.
     run_case(&[15, 10, 23, 21, 27, 5, 25, 28, 25, 0, 17]);
+}
+
+/// Found by this test in the final fix wave (BUG-761): the embargoed fix
+/// taken away by `git stash -a`, recorded as deleted (which unwrapped the
+/// embargoed line), then put back by `git stash pop`, was recorded public
+/// in `default@`.
+#[test]
+fn a_fix_stashed_and_popped_stays_embargoed() {
+    run_case(&[21, 16, 28, 26, 23, 11, 24, 4, 3, 19, 23, 7, 23, 22]);
 }
 
 /// The minimal case proptest found: a hostile pull that weakens the policy,

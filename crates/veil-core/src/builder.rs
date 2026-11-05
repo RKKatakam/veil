@@ -978,7 +978,7 @@ impl<'a> Builder<'a> {
             return Ok(id);
         };
         if self.store.keys.has(&w.key_label()) {
-            return crate::embargo::wrap(self.store, &w.embargo, &id, &w.fallback);
+            return crate::embargo::wrap_line(self.store, &w.embargo, &id, &w.fallback);
         }
         for c in crate::tree::diff_trees(self.store, Some(&parent), Some(&id))? {
             self.report.held_back.push((c.path, w.embargo.clone()));

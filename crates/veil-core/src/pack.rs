@@ -126,8 +126,8 @@ const SLURP_LIMIT: u64 = (SLURP_BUDGET / 4) as u64;
 /// whole store). The least recently used goes first.
 pub const SLURP_BUDGET: usize = 64 << 20;
 
-/// The packs held whole, by checksum (shared by every store of the process:
-/// a pack's checksum names its content).
+/// The packs held whole, by backend, path and checksum (one budget for
+/// every store of the process).
 fn slurped() -> &'static LruCache<Arc<Vec<u8>>> {
     static CACHE: OnceLock<LruCache<Arc<Vec<u8>>>> = OnceLock::new();
     CACHE.get_or_init(|| LruCache::new(SLURP_BUDGET))
@@ -431,7 +431,15 @@ impl Pack {
         if self.size > SLURP_LIMIT {
             return Ok(None);
         }
-        let key = ObjectId(self.index.pack_sum);
+        // Per backend and path, not by checksum alone: a store reads its
+        // own copy (`--full` walks must read the remote's bytes, never a
+        // local copy of the same pack).
+        let backend_at = backend as *const dyn StorageBackend as *const () as usize;
+        let mut k = Vec::with_capacity(64 + self.path.as_str().len());
+        k.extend_from_slice(&backend_at.to_le_bytes());
+        k.extend_from_slice(self.path.as_str().as_bytes());
+        k.extend_from_slice(&self.index.pack_sum);
+        let key = ObjectId::hash(&k);
         if let Some(d) = slurped().get(&key).filter(|d| d.len() as u64 == self.size) {
             return Ok(Some(d));
         }

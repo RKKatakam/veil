@@ -266,6 +266,7 @@ struct ChangedProbe {
 /// Build the tree recording `fs` as an amendment of working copy `wc`.
 fn build_wc_tree(
     repo: &Repo,
+    wc_id: &ObjectId,
     wc: &crate::object::Snapshot,
     fs: &dyn StorageBackend,
     p: &BuildParams<'_>,
@@ -309,6 +310,7 @@ fn build_wc_tree(
         cache,
     )?;
     let tree = hold_command_edit(&store, tree, &parent_tree, command_edit, &mut report)?;
+    let tree = repo.keep_line_embargo(wc_id, &parent_tree, tree, &mut report)?;
     Ok(Built { tree, report, wp })
 }
 
@@ -451,7 +453,7 @@ impl Repo {
                 }
                 p.built
             }
-            None => build_wc_tree(tx.repo(), &wc, fs, &params, rescan, cache)?,
+            None => build_wc_tree(tx.repo(), &wc_id, &wc, fs, &params, rescan, cache)?,
         };
         let Built { tree, report, wp } = built;
         tx.repo().record_accepted(&wp)?;
@@ -527,7 +529,7 @@ impl Repo {
         let mut scanned = cache.cloned();
         let store = self.store.clone();
         let scope = store.begin_staging();
-        let built = build_wc_tree(self, &wc, fs, params, false, scanned.as_mut());
+        let built = build_wc_tree(self, &wc_id, &wc, fs, params, false, scanned.as_mut());
         let staged = scope.finish();
         let built = match built {
             Ok(b) if !staged.overflowed() => b,
@@ -579,7 +581,7 @@ impl Repo {
         let policy = self.snapshot_policy(fs, None)?.policy;
         let line_base = || Ok(self.parents_tree(&snap.parents)?.tree);
         let parent_tree = with_carried(&self.store, snap.tree, carried)?;
-        build_tree_cached(
+        let (tree, mut report) = build_tree_cached(
             &self.store,
             fs,
             &BuildOptions {
@@ -594,7 +596,43 @@ impl Repo {
                 keep_recorded: None,
             },
             cache,
-        )
+        )?;
+        let tree = self.keep_line_embargo(snapshot, &parent_tree, tree, &mut report)?;
+        Ok((tree, report))
+    }
+
+    /// A line under an unreleased embargo stays under it (BUG-761). The
+    /// builder keeps a tree under its parent's wrapper; this covers a line
+    /// whose tree is not wrapped although an ancestor of `line` (the
+    /// snapshot being amended, or the base of a new one) is an unreleased
+    /// embargoed merge: a Git commit the colocated follow imported on top
+    /// of it, a tree the follow built for a new change there. A new
+    /// `tree` there is wrapped under that embargo, with `parent_tree`'s
+    /// public view as what everyone else sees, so what it adds (the fix put
+    /// back, `git stash pop`) is sealed until the release; without the
+    /// embargo's key, its edits are held back as the builder holds them.
+    pub(crate) fn keep_line_embargo(&self, line: &ObjectId, parent_tree: &ObjectId, tree: ObjectId, report: &mut BuildReport) -> Result<ObjectId> {
+        let store = &self.store;
+        if tree == *parent_tree
+            || crate::embargo::unreleased_wrapper(store, &tree)?.is_some()
+            || crate::embargo::unreleased_wrapper(store, parent_tree)?.is_some()
+        {
+            return Ok(tree);
+        }
+        // Cheap first: no unreleased embargo is known here (an embargo with
+        // no record here cannot have been read, so nothing of it put back).
+        if !self.keys().embargoes()?.iter().any(|r| !self.keys().embargo_released(&r.id)) {
+            return Ok(tree);
+        }
+        let Some(e) = self.carried_embargo(line)? else { return Ok(tree) };
+        if self.keys().has(&format!("embargo/{e}")) {
+            let fallback = crate::embargo::public_view(store, parent_tree)?;
+            return crate::embargo::wrap_line(store, &e, &tree, &fallback);
+        }
+        for c in crate::tree::diff_trees(store, Some(parent_tree), Some(&tree))? {
+            report.held_back.push((c.path, e.clone()));
+        }
+        Ok(*parent_tree)
     }
 
     /// Build a tree from `fs` relative to `parent_tree` without recording
@@ -770,6 +808,7 @@ impl Repo {
             None,
         )?;
         let tree = hold_command_edit(&store, tree, &parent_tree, command_edit, &mut report)?;
+        let tree = tx.repo().keep_line_embargo(&base, &parent_tree, tree, &mut report)?;
         tx.repo().record_accepted(&wp)?;
         let snap = Snapshot {
             parents: vec![base],

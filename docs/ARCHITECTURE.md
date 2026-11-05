@@ -2120,6 +2120,15 @@ remains is mostly the one `lstat` per file and the per-directory
    that reader sees only the pre-merge tree and recording on top of it would
    silently revert the fix for everyone. After the release they are
    recorded. Merging such history without the key is refused.
+   Stickiness holds even when nothing is left to hide (BUG-761): a
+   snapshot that deleted every file of the fix keeps the wrapper
+   (`embargo::wrap_line`, where `wrap` would return the bare fallback), and
+   a working-copy tree that is not wrapped although an ancestor is an
+   unreleased embargoed merge (a Git commit the colocated follow imported
+   on top of it) gets wrapped at its next change, with its parent's public
+   view as the fallback (`Repo::keep_line_embargo`). Otherwise the line
+   would leave the embargo, and the fix put back (`git stash pop`, an
+   editor's undo) would be recorded, committed and pushed as public.
    Descriptions written on such a line by a key holder (`commit`, `describe`,
    `new -m`, squash, a plain merge into it) are sealed under the embargo key
    too, and its snapshots record no conflict list: snapshot metadata is
@@ -2739,7 +2748,7 @@ pack-<sum>.idx    "VEILIDX1" | count u32 | fanout[256] u32 | ids[count] (sorted)
   read (`StorageBackend::read_range`) of one entry. A process that reads a
   pack often (more than 64 entries) loads it into memory once instead, for
   packs up to 16 MiB, within one budget of 64 MiB for the whole process
-  (least recently used first out, keyed by the pack's checksum), so a
+  (least recently used first out; each backend reads its own copy), so a
   history walk never holds the whole store (BUG-800). Larger packs are
   always read by range.
 * **Deltas.** A zstd frame "compressed against" the base object as a
