@@ -179,7 +179,12 @@ fn a_cloaked_change_copied_to_a_public_line_stays_sealed() {
     r.set_tag("main", done[0].duplicate, None, false).unwrap();
     let mirror = Arc::new(MemoryBackend::new());
     remote::push(&mut r, mirror.clone(), true, &[], false).unwrap();
-    assert!(backend_contains(mirror.as_ref(), b"7Q").is_empty(), "nothing of the cloaked change on the public mirror");
+    // Whole markers, never a 2-byte fragment: `7Q` alone turns up by chance in
+    // compressed pack bytes (about 1 run in 400 at format 6).
+    for marker in [&b"CLOAKED-EDIT-7Q"[..], b"CLOAKED-NEW-FILE-7Q", b"CLOAKED-DESCRIPTION-7Q"] {
+        let hits = backend_contains(mirror.as_ref(), marker);
+        assert!(hits.is_empty(), "nothing of the cloaked change on the public mirror: {hits:?}");
+    }
     let m = Repo::open(mirror, None, "carol").unwrap();
     assert!(m.snapshot_opt(&done[0].duplicate).unwrap().is_some(), "the copy itself was pushed");
 }
