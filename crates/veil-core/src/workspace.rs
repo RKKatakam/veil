@@ -84,6 +84,9 @@ pub struct SnapshotOptions<'a> {
     /// How `.gitattributes` line endings apply (`vl renormalize` sets
     /// [`LineEndings::Renormalize`]).
     pub line_endings: LineEndings<'a>,
+    /// Tracked paths whose recorded entry is kept whatever `fs` holds (see
+    /// [`crate::builder::BuildOptions::keep_recorded`]).
+    pub keep_recorded: Option<&'a std::collections::BTreeSet<VPath>>,
 }
 
 #[derive(Debug, Clone)]
@@ -276,6 +279,7 @@ impl Repo {
             carried,
             only,
             line_endings,
+            keep_recorded,
         } = opts;
         let mut tx = self.transaction(description.unwrap_or_else(|| snapshot_op_description(ws)))?;
         let wc_id = tx.view.workspace(ws)?.wc;
@@ -321,6 +325,7 @@ impl Repo {
                 materialised,
                 line_base: Some(&line_base),
                 line_endings,
+                keep_recorded,
             },
             cache,
         )?;
@@ -416,6 +421,7 @@ impl Repo {
                 materialised,
                 line_base: Some(&line_base),
                 line_endings: LineEndings::Convert,
+                keep_recorded: None,
             },
             cache,
         )
@@ -463,6 +469,7 @@ impl Repo {
                 materialised,
                 line_base: None,
                 line_endings: LineEndings::Convert,
+                keep_recorded: None,
             },
             cache,
         )
@@ -588,6 +595,7 @@ impl Repo {
                 materialised,
                 line_base: Some(&line_base),
                 line_endings: LineEndings::Convert,
+                keep_recorded: None,
             },
             None,
         )?;

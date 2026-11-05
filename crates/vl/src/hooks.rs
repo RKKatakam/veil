@@ -865,7 +865,7 @@ struct TrustedCommand {
 }
 
 fn local_dir(root: &Path) -> PathBuf {
-    root.join(VEIL_DIR).join("local")
+    veil_core::repo::state_dir(root).join("local")
 }
 
 fn trust_path(root: &Path) -> PathBuf {
@@ -1026,7 +1026,7 @@ impl Runnable {
 }
 
 fn local_hooks(root: &Path, hook: Hook) -> Vec<PathBuf> {
-    [crate::ctx::veil_home().join("hooks"), root.join(VEIL_DIR).join("hooks")]
+    [crate::ctx::veil_home().join("hooks"), veil_core::repo::state_dir(root).join("hooks")]
         .into_iter()
         .map(|d| d.join(hook.name()))
         .filter(|p| p.is_file())

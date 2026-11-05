@@ -5,7 +5,6 @@
 use crate::*;
 
 #[test]
-#[ignore = "BUG-753: with core.hooksPath set after colocation, the pre-commit and pre-push guards stop running and `vl status` gives no warning"]
 fn bug753_ordinary_commands_warn_when_the_guards_are_inactive() {
     need_git!();
     let env = Env::new();

@@ -4,7 +4,6 @@
 use crate::*;
 
 #[test]
-#[ignore = "BUG-740: a pulled Git commit with a path under .veil/ overwrites .veil/local/accepted-policy, so a weakened .veilpolicy is no longer held back and `vl git push` exports cloaked content"]
 fn bug740_a_pulled_commit_never_writes_veils_accepted_policy() {
     need_git!();
     let env = Env::new();

@@ -16,6 +16,7 @@
 
 use std::{
     collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque},
+    path::Path,
     sync::Arc,
 };
 
@@ -40,6 +41,33 @@ use crate::{
 };
 
 pub const VEIL_DIR: &str = ".veil";
+
+/// Where a colocated project keeps its Veil repository, relative to the
+/// project root: inside Git's own directory, which no Git command ever
+/// checks out into, cleans, stashes or deletes (BUG-740, BUG-741,
+/// BUG-746). `.veil` at the root is then only a symlink to it (see
+/// [`colocated_state_dir`]).
+pub const COLOCATED_STATE_DIR: &str = ".git/veil";
+
+/// The Veil repository of the colocated project at `root`, if there is
+/// one: `<root>/.git/veil`, when `.git` is a real directory (never a
+/// gitfile or a symlink) holding `veil/repo.json`. It takes precedence
+/// over whatever `<root>/.veil` is: that name is in Git's work tree, so a
+/// Git checkout may have put anything there.
+pub fn colocated_state_dir(root: &Path) -> Option<std::path::PathBuf> {
+    let git = root.join(".git");
+    if !std::fs::symlink_metadata(&git).is_ok_and(|m| m.is_dir()) {
+        return None;
+    }
+    let dir = git.join("veil");
+    dir.join("repo.json").is_file().then_some(dir)
+}
+
+/// The directory holding the Veil repository of the project at `root`:
+/// [`colocated_state_dir`] when colocated, else `<root>/.veil`.
+pub fn state_dir(root: &Path) -> std::path::PathBuf {
+    colocated_state_dir(root).unwrap_or_else(|| root.join(VEIL_DIR))
+}
 
 /// Repository format written by `vl init` and by [`crate::upgrade`].
 ///

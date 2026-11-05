@@ -51,7 +51,7 @@
 //! command cannot launder an injected secret into history under another name.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -123,6 +123,11 @@ pub struct BuildOptions<'a> {
     pub line_base: Option<&'a dyn Fn() -> Result<ObjectId>>,
     /// How `.gitattributes` decides the line endings recorded.
     pub line_endings: LineEndings<'a>,
+    /// Paths whose recorded entry is kept whatever the file holds now: a
+    /// local edit the member asked to keep unrecorded (colocated Git mode:
+    /// a file the user marked `skip-worktree` or `assume-unchanged` in
+    /// Git, BUG-745). Reported in [`BuildReport::kept_recorded`].
+    pub keep_recorded: Option<&'a BTreeSet<VPath>>,
 }
 
 /// How a build applies the line-ending attributes of `.gitattributes`.
@@ -722,6 +727,9 @@ pub struct BuildReport {
     /// `vl renormalize` would change (the attributes changed since they
     /// were recorded).
     pub renormalizable: Vec<VPath>,
+    /// Tracked files whose local edit was left unrecorded on purpose
+    /// ([`BuildOptions::keep_recorded`]): they keep their recorded entry.
+    pub kept_recorded: Vec<VPath>,
 }
 
 impl BuildReport {
@@ -1407,6 +1415,12 @@ impl<'a> Builder<'a> {
     /// The entry for the leaf at `path` of the working copy, a file or (in
     /// format 5) a symlink (`kind`).
     fn file_entry(&mut self, path: &VPath, name: &str, parent_entry: Option<&TreeEntry>, kind: EntryKind) -> Result<Option<TreeEntry>> {
+        if let (Some(keep), Some(pe)) = (self.opts.keep_recorded, parent_entry) {
+            if keep.contains(path) {
+                self.report.kept_recorded.push(path.clone());
+                return Ok(Some(pe.clone()));
+            }
+        }
         match parent_entry {
             Some(ce) if ce.kind == EntryKind::Conflict => self.conflict_entry(path, name, ce, kind),
             _ => self.plain_file_entry(path, name, parent_entry, kind),

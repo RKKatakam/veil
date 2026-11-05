@@ -4,7 +4,6 @@
 use crate::*;
 
 #[test]
-#[ignore = "BUG-744: after `vl git uncolocate`, `git add -A` stages isolated and cloaked files and the whole .veil directory; no warning names them"]
 fn bug744_uncolocate_keeps_protected_files_out_of_git_add() {
     need_git!();
     let env = Env::new();

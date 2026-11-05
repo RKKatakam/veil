@@ -1,10 +1,11 @@
 //! BUG-755: what Git does to a file on checkout (here the `ident`
 //! attribute expanding `$Id$`) is recorded by Veil as the member's edit.
+//! Fixed: `info/attributes` (which outranks every `.gitattributes`) turns
+//! `ident` off in the colocated work tree.
 
 use crate::*;
 
 #[test]
-#[ignore = "BUG-755: after `git pull` of a file with the `ident` attribute, Veil records Git's `$Id: <blob> $` expansion as a working-copy change"]
 fn bug755_a_git_checkout_transform_is_not_recorded_as_an_edit() {
     need_git!();
     let env = Env::new();

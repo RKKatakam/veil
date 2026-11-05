@@ -44,6 +44,8 @@ pub struct IndexEntry {
     /// Merge stage (0 = normal; 1–3 during a conflicted merge).
     pub stage: u8,
     pub skip_worktree: bool,
+    /// `git update-index --assume-unchanged` (Git's `CE_VALID`).
+    pub assume_unchanged: bool,
     /// `git add --intent-to-add`.
     pub intent_to_add: bool,
 }
@@ -55,6 +57,8 @@ pub struct NewEntry {
     pub mode: u32,
     pub oid: GitOid,
     pub skip_worktree: bool,
+    /// Kept as the user set it (`git update-index --assume-unchanged`).
+    pub assume_unchanged: bool,
 }
 
 fn io(path: &Path) -> impl FnOnce(std::io::Error) -> VeilError + '_ {
@@ -100,6 +104,7 @@ fn read_with(path: &Path, skip_hash: bool) -> Result<Option<Vec<IndexEntry>>> {
             oid: e.id,
             stage: e.stage_raw() as u8,
             skip_worktree: e.flags.contains(gi::entry::Flags::SKIP_WORKTREE),
+            assume_unchanged: e.flags.contains(gi::entry::Flags::ASSUME_VALID),
             intent_to_add: e.flags.contains(gi::entry::Flags::INTENT_TO_ADD),
         })
         .collect();
@@ -164,6 +169,9 @@ pub fn write(git_dir: &Path, entries: &[NewEntry]) -> Result<bool> {
             let mut flags = gi::entry::Flags::empty();
             if e.skip_worktree {
                 flags |= gi::entry::Flags::SKIP_WORKTREE | gi::entry::Flags::EXTENDED;
+            }
+            if e.assume_unchanged {
+                flags |= gi::entry::Flags::ASSUME_VALID;
             }
             let stat = old.get(&(e.path.clone(), e.mode, e.oid)).copied().unwrap_or_default();
             state.dangerously_push_entry(stat, e.oid, flags, mode, e.path.as_slice().into());
@@ -237,9 +245,9 @@ mod tests {
     fn round_trip_keeps_skip_worktree_and_sorts() {
         let dir = tempfile::tempdir().unwrap();
         let entries = vec![
-            NewEntry { path: b"b/x".to_vec(), mode: 0o100644, oid: oid(1), skip_worktree: true },
-            NewEntry { path: b"a".to_vec(), mode: 0o100755, oid: oid(2), skip_worktree: false },
-            NewEntry { path: b"b-c".to_vec(), mode: 0o120000, oid: oid(3), skip_worktree: false },
+            NewEntry { path: b"b/x".to_vec(), mode: 0o100644, oid: oid(1), skip_worktree: true, assume_unchanged: false },
+            NewEntry { path: b"a".to_vec(), mode: 0o100755, oid: oid(2), skip_worktree: false, assume_unchanged: false },
+            NewEntry { path: b"b-c".to_vec(), mode: 0o120000, oid: oid(3), skip_worktree: false, assume_unchanged: false },
         ];
         assert!(write(dir.path(), &entries).unwrap());
         let back = read(&index_path(dir.path())).unwrap().unwrap();
@@ -255,7 +263,7 @@ mod tests {
     fn an_existing_lock_is_never_waited_for_nor_removed() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("index.lock"), b"git's").unwrap();
-        let e = vec![NewEntry { path: b"a".to_vec(), mode: 0o100644, oid: oid(1), skip_worktree: true }];
+        let e = vec![NewEntry { path: b"a".to_vec(), mode: 0o100644, oid: oid(1), skip_worktree: true, assume_unchanged: false }];
         assert!(!write(dir.path(), &e).unwrap());
         assert_eq!(std::fs::read(dir.path().join("index.lock")).unwrap(), b"git's");
         assert!(!dir.path().join("index").exists());

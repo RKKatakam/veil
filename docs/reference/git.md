@@ -181,7 +181,7 @@ Options:
 |---|---|
 | `--experimental` | Required while colocated mode is experimental |
 | `--status` | Report the guards instead: exclude block, skip-worktree count, held local commits, Git version, `pre-push` hook |
-| `--prune` | Expire the reflogs of superseded local commits and run `git gc --prune=now` (every unreachable reflog entry of `.git` is expired) |
+| `--prune` | Remove held (superseded) local commits from `.git`: delete the reflog entries that name them, then run `git gc --prune=now`. Every other reflog entry and every stash is kept |
 
 ## `vl git uncolocate`
 

@@ -4,15 +4,26 @@
 //!
 //! Git side: `add -A`, `commit`, `commit -a`, branch `checkout`, `stash`,
 //! `stash -u`, `stash pop`, `reset --hard`, `reset --soft HEAD~1`,
-//! `rebase`. Veil side: edits of public, cloaked and isolated files, edits
-//! on a cloaked line (workspace `p`), `vl new`, `vl commit`, `vl restore`,
-//! `vl cloak`, an embargoed merge, `vl ws switch`, `vl status`.
+//! `rebase`, and the hostile and destructive ones of the round-9 fix wave:
+//! `git pull` of a contributor's commit writing `.veil/…` (a forged
+//! accepted-policy pin with a weakened `.veilpolicy`) or a file named
+//! `.veil`, a `.gitignore` negating Veil's excludes (`!secrets/`, `!.env`,
+//! `!*.md`), `git clean -ffdx`, `git stash -a`. Veil side: edits of public,
+//! cloaked and isolated files, edits on a cloaked line (workspace `p`),
+//! `vl new`, `vl commit`, `vl restore`, `vl cloak`, an embargoed merge,
+//! `vl ws switch`, `vl status`.
 //!
 //! Every sealed write carries a unique marker. After **every** step:
 //!
+//! * **I0** the Veil repository (`.git/veil`) is there and its
+//!   accepted-policy pin is the one it started with: nothing Git wrote
+//!   decides policy;
 //! * **I1** no object of `.git` (loose or packed, `git cat-file
-//!   --batch-all-objects`) holds a marker, and the `pre-push` gate refuses
-//!   nothing that is on a branch: whatever `git push` could send is clean;
+//!   --batch-all-objects`) holds a marker. Once Git was told to take
+//!   protected files anyway (a `.gitignore` negation, `git stash -a`: the
+//!   guide's documented limitations), the weaker form: every branch whose
+//!   history holds a marker is refused by the `pre-push` gate, so whatever
+//!   `git push` could send is clean;
 //!
 //! at the end of every case:
 //!
@@ -21,7 +32,9 @@
 //!   by another member);
 //! * **I2** no snapshot a workspace or tag names records a public file
 //!   holding a marker;
-//! * **I3** the operation log and `vl fsck` are intact.
+//! * **I3** the operation log and `vl fsck` are intact;
+//! * **I4** after `git stash clear`, `git reset` and
+//!   `vl git colocate --prune`, `.git` holds no marker at all.
 //!
 //! `VEIL_COLOCATED_CASES` sets the number of cases (default 10).
 
@@ -32,7 +45,7 @@ use std::path::Path;
 use colocated_support::*;
 use proptest::prelude::*;
 
-const OPS: u8 = 24;
+const OPS: u8 = 30;
 
 struct World<'a> {
     env: &'a Env,
@@ -42,6 +55,11 @@ struct World<'a> {
     in_p: bool,
     embargoed: bool,
     log: Vec<String>,
+    /// Git was told to take protected files (a negation, `stash -a`).
+    leaky: bool,
+    /// The contributor's clone of the Git remote.
+    contributor: std::path::PathBuf,
+    hostile: usize,
 }
 
 impl World<'_> {
@@ -140,7 +158,50 @@ impl World<'_> {
             }
             21 => self.embargo(),
             22 => self.vl(&["tag", "set", "main", "-r", "@-", "--allow-backwards"]),
+            24 => {
+                // A `.gitignore` that outranks Veil's excludes.
+                self.leaky = true;
+                self.write(".gitignore", "!secrets/\n!.env\n!*.md\n");
+            }
+            25 => self.hostile_pull(i, true),
+            26 => self.hostile_pull(i, false),
+            27 => self.git(&["clean", "-q", "-ffdx"]),
+            28 => {
+                self.leaky = true;
+                self.git(&["stash", "-q", "-a"]);
+            }
             _ => self.vl(&["status"]),
+        }
+    }
+
+    /// A contributor pushes a hostile commit to the Git remote, and it is
+    /// pulled here with plain Git: a forged `.veil/local/accepted-policy`
+    /// with a `.veilpolicy` making `secrets/` public, or a file `.veil`.
+    fn hostile_pull(&mut self, i: usize, pin: bool) {
+        self.hostile += 1;
+        let c = self.contributor.clone();
+        let _ = self.env.git(&c, &["pull", "-q", "--no-rebase", "--no-edit", "origin", "main"]);
+        if pin {
+            if c.join(".veil").is_file() {
+                let _ = self.env.git(&c, &["rm", "-q", "--cached", ".veil"]);
+                let _ = std::fs::remove_file(c.join(".veil"));
+            }
+            let policy = std::fs::read_to_string(c.join(".veilpolicy")).unwrap_or_default().replace("secrets/ cloak", "secrets/ public!");
+            self.env.write(&c, ".veilpolicy", &policy);
+            self.env.write(&c, ".veil/local/accepted-policy", "secrets/ public!\n");
+            let _ = self.env.git(&c, &["add", "-f", ".veilpolicy", ".veil"]);
+        } else {
+            let _ = self.env.git(&c, &["rm", "-rq", "--cached", ".veil"]);
+            let _ = std::fs::remove_dir_all(c.join(".veil"));
+            self.env.write(&c, ".veil", &format!("hostile {i}\n"));
+            let _ = self.env.git(&c, &["add", "-f", ".veil"]);
+        }
+        let _ = self.env.git(&c, &["commit", "-q", "-m", &format!("hostile {i}")]);
+        let _ = self.env.git(&c, &["push", "-q", "origin", "HEAD:main"]);
+        let ok = self.env.git(&self.dir, &["pull", "-q", "--no-rebase", "--no-edit", "origin", "main"]).status.success();
+        self.log.push(format!("git pull (hostile {}, {ok})", if pin { "pin" } else { ".veil file" }));
+        if !ok {
+            let _ = self.env.git(&self.dir, &["merge", "--abort"]);
         }
     }
 
@@ -160,12 +221,79 @@ impl World<'_> {
         self.vl(&["merge", "fix@-", "--into", "main", "--embargo", "-m", "Fix"]);
     }
 
-    /// I1 after a step.
+    /// I0 and I1 after a step.
     fn check_git(&mut self, when: &str) {
         let git = self.dir.join(".git");
+        assert!(git.join("veil/repo.json").is_file(), "I0 {when}: the Veil repository is gone\n{}", self.log.join("\n"));
+        // (`vl cloak` strengthens it: the member's own edit.)
+        let pin = std::fs::read_to_string(git.join("veil/local/accepted-policy")).unwrap_or_default();
+        assert!(
+            pin.lines().any(|l| l == "secrets/ cloak") && !pin.lines().any(|l| l.starts_with("secrets/ public")),
+            "I0 {when}: the accepted-policy pin is not the member's:\n{pin}\n{}",
+            self.log.join("\n")
+        );
+        if self.leaky {
+            return self.check_pushable(when);
+        }
         let dump = objects(self.env, &git);
         for m in &self.markers {
             assert!(!contains(&dump, m), "I1 {when}: .git holds {m}\n{}", self.log.join("\n"));
+        }
+    }
+
+    /// I1, weak form: a branch whose history holds a marker is refused by
+    /// the `pre-push` gate.
+    fn check_pushable(&mut self, when: &str) {
+        let refs = self.env.git_ok(&self.dir, &["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"]);
+        for line in refs.lines() {
+            let Some((name, oid)) = line.split_once(' ') else { continue };
+            let list = self.env.git(&self.dir, &["rev-list", "--objects", oid]);
+            let mut input = String::new();
+            for l in String::from_utf8_lossy(&list.stdout).lines() {
+                input.push_str(l.split(' ').next().unwrap_or(""));
+                input.push('\n');
+            }
+            let out = {
+                use std::io::Write;
+                let mut child = self
+                    .env
+                    .git_cmd(&self.dir, &["cat-file", "--batch"])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let mut stdin = child.stdin.take().unwrap();
+                let w = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+                let out = child.wait_with_output().unwrap();
+                let _ = w.join();
+                out.stdout
+            };
+            if !self.markers.iter().any(|m| contains(&out, m)) {
+                continue;
+            }
+            let zero = "0".repeat(40);
+            let gate = {
+                use std::io::Write;
+                let mut child = self
+                    .env
+                    .vl_cmd(&self.dir, &["git", "check-push", "origin"])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let mut stdin = child.stdin.take().unwrap();
+                let line = format!("{name} {oid} {name} {zero}\n");
+                let w = std::thread::spawn(move || stdin.write_all(line.as_bytes()));
+                let out = child.wait_with_output().unwrap();
+                let _ = w.join();
+                out
+            };
+            assert!(
+                !gate.status.success(),
+                "I1 {when}: {name} holds sealed content and the pre-push gate lets it through\n{}",
+                self.log.join("\n")
+            );
         }
     }
 
@@ -219,6 +347,16 @@ impl World<'_> {
         self.env.ok(&self.dir, &["op", "log", "-n", "5"]);
         let fsck = self.env.vl(&self.dir, &["fsck"]);
         assert!(fsck.status.success(), "I3: {}", text(&fsck));
+        // I4: what Git was made to take leaves with the stashes, the index
+        // and `--prune`.
+        self.git(&["stash", "clear"]);
+        self.git(&["reset", "-q"]);
+        self.vl(&["status"]);
+        self.vl(&["git", "colocate", "--prune"]);
+        let dump = objects(self.env, &self.dir.join(".git"));
+        for m in &self.markers {
+            assert!(!contains(&dump, m), "I4: .git holds {m} after --prune\n{}", self.log.join("\n"));
+        }
     }
 }
 
@@ -230,6 +368,13 @@ fn run_case(ops: &[u8]) {
     env.ok(&dir, &["git", "remote", "add", "gh", remote.to_str().unwrap()]);
     env.ok(&dir, &["remote", "add", "mirror", mirror.to_str().unwrap(), "--public"]);
     env.ok(&dir, &["ws", "new", "p", "-r", "main", "--cloak", "team"]);
+    // Git's own view of the same remote, and a contributor's clone of it.
+    env.ok(&dir, &["git", "push", "gh"]);
+    env.git_ok(&dir, &["remote", "add", "origin", remote.to_str().unwrap()]);
+    env.git_ok(&dir, &["fetch", "-q", "origin"]);
+    env.git_ok(&dir, &["branch", "-q", "-u", "origin/main", "main"]);
+    let contributor = env.root.join("contributor");
+    env.git_ok(&env.root, &["clone", "-q", remote.to_str().unwrap(), contributor.to_str().unwrap()]);
     let mut w = World {
         env: &env,
         dir,
@@ -238,6 +383,9 @@ fn run_case(ops: &[u8]) {
         in_p: false,
         embargoed: false,
         log: Vec::new(),
+        leaky: false,
+        contributor,
+        hostile: 0,
     };
     for (i, op) in ops.iter().enumerate() {
         w.step(*op, i);
@@ -269,4 +417,21 @@ fn known_interleavings_stay_clean() {
     run_case(&[12, 14, 11, 0, 1, 3, 12, 17, 4, 2, 10, 23]);
     // An embargoed merge, then Git and Veil work on top.
     run_case(&[21, 16, 11, 0, 1, 22, 2, 8, 23]);
+}
+
+/// The round-9 routes (BUG-740…748), in fixed sequences.
+#[test]
+fn hostile_pulls_negations_clean_and_stash_stay_clean() {
+    // A forged pin and a weakened policy pulled, then secrets written and
+    // committed both ways.
+    run_case(&[25, 23, 12, 0, 1, 17, 26, 23, 12, 2, 17, 23]);
+    // A negating .gitignore, then Git takes what it un-hides.
+    run_case(&[24, 17, 12, 14, 0, 1, 6, 23, 7, 2, 17, 23]);
+    // `git clean -ffdx` and `git stash -a` on a cloaked line and off it.
+    run_case(&[20, 15, 23, 27, 23, 28, 23, 7, 20, 12, 14, 23, 28, 27, 23]);
+    // Found by this test (150 cases): under an embargo (frozen, so Git
+    // manages no path) a pulled weakening of `.veilpolicy` was recorded as
+    // the member's own edit by the follow's first snapshot, and replaced
+    // the accepted-policy pin.
+    run_case(&[15, 10, 23, 21, 27, 5, 25, 28, 25, 0, 17]);
 }

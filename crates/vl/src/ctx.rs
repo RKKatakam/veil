@@ -198,12 +198,34 @@ pub struct Ctx {
     /// Colocated Git mode: what the follow at the start of this command saw
     /// (`None` when the directory is not colocated).
     pub(crate) git: Option<crate::colocate_cmd::Session>,
+    /// `vl git uncolocate` ran: once this command is done with the
+    /// repository, it moves from `.git/veil` back to `.veil` (see
+    /// `colocate_cmd::uncolocate`).
+    pub(crate) uncolocated: bool,
 }
 
 pub fn find_root(start: &Path) -> Option<PathBuf> {
     let mut cur = Some(start);
     while let Some(d) = cur {
+        // A colocated project's repository is in `.git/veil`, whatever
+        // `.veil` (in Git's work tree) holds; the marker is repaired here,
+        // before anything reads `.veil` (BUG-740, BUG-741).
+        if veil_core::repo::colocated_state_dir(d).is_some() {
+            match veil_core::git::colocate::ensure_marker(d) {
+                Ok(Some(w)) => warn_untrusted(&w),
+                Ok(None) => {}
+                Err(e) => warn(&format!("could not restore the .veil marker: {e}")),
+            }
+            return Some(d.to_path_buf());
+        }
         if d.join(VEIL_DIR).join("repo.json").is_file() {
+            // Colocated by an earlier build, with the repository still in
+            // `.veil`: moved into `.git/veil` now.
+            match veil_core::git::colocate::ensure_layout(d) {
+                Ok(Some(w)) => eprintln!("{} {w}", render::yellow("note:")),
+                Ok(None) => {}
+                Err(e) => warn(&format!("could not move the Veil repository into .git/veil: {e}")),
+            }
             return Some(d.to_path_buf());
         }
         // Never from inside a `vl ws exec` sandbox
@@ -273,8 +295,19 @@ impl Ctx {
             Some(p) => p.to_path_buf(),
             None => std::env::current_dir()?,
         };
-        let root = find_root(&start)
-            .ok_or_else(|| anyhow!("no Veil repository found in {} or its parents (run `vl init`)", start.display()))?;
+        let root = find_root(&start).ok_or_else(|| {
+            // A colocated project whose `.git` became a gitfile or a
+            // symlink to a moved directory: the repository was in it.
+            let marker = start.ancestors().find(|d| veil_core::git::colocate::is_marker(d));
+            match marker {
+                Some(d) => anyhow!(
+                    "{} is not a directory (a gitfile or a symlink), and this colocated project's Veil repository lives in \
+                     .git/veil; colocated mode refuses it. Put the Git directory back",
+                    d.join(".git").display()
+                ),
+                None => anyhow!("no Veil repository found in {} or its parents (run `vl init`)", start.display()),
+            }
+        })?;
         if snapshot {
             // What was written in mounted workspaces is recorded first, as
             // the project directory is below.
@@ -298,6 +331,7 @@ impl Ctx {
                 report: BuildReport::default(),
                 bare: true,
                 git: None,
+                uncolocated: false,
             });
         }
         for id in repo.auto_release_embargoes()? {
@@ -316,6 +350,7 @@ impl Ctx {
             cache,
             bare: false,
             git: None,
+            uncolocated: false,
         };
         // Colocated Git mode: follow what Git did since the last command
         // (new commits, a checkout) before the working copy is recorded.
@@ -352,6 +387,13 @@ impl Ctx {
     /// that edit the working copy themselves (`vl expose`, `vl restore`, …),
     /// so that `vl undo` reverts them instead of skipping them as the
     /// user's uncommitted edits.
+    /// The automatic snapshot, with `.veilpolicy` taken as incoming (a
+    /// change there is guarded by the accepted policy, never accepted as the
+    /// member's own edit): colocated Git mode, where Git may have written it.
+    pub(crate) fn snapshot_incoming(&mut self) -> Result<()> {
+        self.record(None, true, &[])
+    }
+
     pub fn snapshot_as(&mut self, description: String) -> Result<()> {
         self.record(Some(description), false, &[])
     }
@@ -420,6 +462,9 @@ impl Ctx {
             stale = false;
         }
         if stale {
+            // Colocated Git mode: Git is frozen before cloaked work is
+            // written (nothing is recorded or moved if it cannot be).
+            crate::colocate_cmd::before_materialise(self, view_wc)?;
             // The directory reflects `checkout.snapshot`, but the repository
             // moved on (undo, another process, removed workspace). Preserve
             // any local edits as their own change, then catch up.
@@ -487,6 +532,7 @@ impl Ctx {
                 policy_incoming,
                 expected_wc: Some(view_wc),
                 carried,
+                keep_recorded: self.git.as_ref().map(|g| &g.keep).filter(|k| !k.is_empty()),
                 ..Default::default()
             },
         )?;
@@ -669,6 +715,10 @@ impl Ctx {
         let to_snap = self.repo.snapshot(&target)?;
         let previous = self.checkout.snapshot;
         let needs_checkout = from != to_snap.tree || !self.checkout.materialised.is_empty();
+        // Colocated Git mode: Git is frozen before cloaked work is written.
+        if needs_checkout {
+            crate::colocate_cmd::before_materialise(self, target)?;
+        }
         // Journalled: a crash half way is finished by the next command.
         let ws = self.ws.clone();
         let r = self
@@ -743,12 +793,16 @@ impl Ctx {
     /// Record the directory into the attached workspace, but only the
     /// paths of `only` (colocated Git mode, before following a Git
     /// checkout: the paths Git manages hold Git's new content already).
+    ///
+    /// `.veilpolicy` (always recorded) is taken as *incoming*: Git may have
+    /// written it, so it is guarded by the accepted policy, never accepted
+    /// as the member's own edit.
     pub(crate) fn snapshot_only(&mut self, only: &veil_core::vfs::SparseSet) -> Result<()> {
         self.resume()?;
         let view_wc = self.wc()?;
         if self.checkout.workspace != self.ws || self.checkout.snapshot != view_wc {
             // Behind: the ordinary snapshot recovers first.
-            return self.snapshot();
+            return self.record(None, true, &[]);
         }
         let disk = self.fs.clone();
         let out = self.repo.snapshot_workspace_with(
@@ -759,6 +813,8 @@ impl Ctx {
                 materialised: Some(&self.checkout.materialised),
                 expected_wc: Some(view_wc),
                 only: Some(only),
+                policy_incoming: true,
+                keep_recorded: self.git.as_ref().map(|g| &g.keep).filter(|k| !k.is_empty()),
                 ..Default::default()
             },
         )?;

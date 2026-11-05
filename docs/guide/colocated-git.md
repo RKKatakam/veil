@@ -2,14 +2,22 @@
 
 > **Experimental.** Colocated mode puts a real `.git` next to files Veil
 > keeps private. Every route by which Git could pick them up is guarded and
-> tested (see [What is guarded](#what-is-guarded)), but the mode has not yet
-> been through its own dedicated adversarial review. It needs
-> `--experimental`, and the guards have one documented hole you must know
-> about: **`git push --no-verify` skips the push guard.** Use `vl git push`
-> to publish.
+> tested (see [What is guarded](#what-is-guarded)); a dedicated adversarial
+> pass (round 9) found fifteen holes, and the fix wave closed the critical
+> and high ones. It still needs `--experimental` until the Git-version
+> matrix and macOS have been run. Know these before you start:
+>
+> * **`git push --no-verify` skips the push guard.** Use `vl git push` to
+>   publish.
+> * **Veil's repository lives in `.git/veil`.** `rm -rf .git` deletes it
+>   too. Run `vl git uncolocate` first if you mean to throw `.git` away.
+> * A tracked **`.gitignore` negation** (`!secrets/`, `!*.md`) outranks
+>   everything Veil tells Git; Veil detects it and freezes Git commits, but
+>   `git add -A` and `git stash -u` can still take what it un-hides into
+>   your local `.git` (see [What Git can still do](#what-git-can-still-do)).
 
-Colocated mode keeps a real Git repository, `.git`, beside `.veil` in your
-project directory, in step with Veil. IDEs, Git GUIs, `git blame`,
+Colocated mode keeps a real Git repository, `.git`, in your project
+directory, in step with Veil. IDEs, Git GUIs, `git blame`,
 `git log`, pre-commit frameworks and every other tool that reads `.git`
 keep working, and you can mix `git` and `vl` commands in the same
 directory.
@@ -61,8 +69,43 @@ vl git colocate --experimental
 
 Adoption is refused when `.git` is a file (a linked worktree or a
 submodule) or a symlink, when the repository is bare, sets `core.worktree`
-or uses SHA-256, when `GIT_DIR` or `GIT_WORK_TREE` is set, and while a Git
-operation (rebase, merge, cherry-pick, revert, bisect) is in progress.
+or uses SHA-256, when `GIT_DIR` or `GIT_WORK_TREE` is set, while a Git
+operation (rebase, merge, cherry-pick, revert, bisect) is in progress, and
+when Git tracks a `.veil` (`git rm -r --cached .veil` first).
+
+Files you told Git to ignore your local edits of
+(`git update-index --skip-worktree` or `--assume-unchanged`, the usual way
+to keep a local `config/database.yml`) stay that way: Veil records the
+committed version, never your edit, and keeps the bit. Clear the bit
+(`git update-index --no-skip-worktree <file>`) when you want Veil to
+record the edit.
+
+```text
+  kept config/database.yml (Git was told to hide its local edit; Veil keeps the committed version until you clear the bit)
+```
+
+### Where Veil's repository lives
+
+Colocating moves Veil's repository into **`.git/veil`** and leaves `.veil`
+as a symlink to it. The work tree is Git's to write: `git checkout`,
+`git pull`, `git clean` and `git stash` may replace or delete anything
+there (a commit adding a `.veil` file, `git clean -ffdx`), and Git treats
+ignored files as expendable. Git never writes inside `.git` itself, so the
+repository, its accepted policy and your device keys are out of reach of
+anything a Git commit or command does. Veil finds the repository there
+directly and never reads `.veil` in a colocated project; if something else
+appears at `.veil` (a pulled commit put it there), the next `vl` command
+moves it aside, unread, into `.git/veil/local/displaced/` and puts the
+symlink back:
+
+```text
+warning: something else was at .veil (a Git checkout or pull wrote it?); it was never read and is kept in .git/veil/local/displaced/dot-veil-…
+```
+
+`git stash -a` takes the symlink with it; Veil does not put it back until
+you pop or drop that stash, so `git stash pop` works. The other side of
+this: **`rm -rf .git` now deletes Veil's repository too.**
+`vl git uncolocate` moves it back to `.veil`.
 
 ## Day to day
 
@@ -91,7 +134,19 @@ git log --oneline              # both commits, with Veil's description
 Veil writes nothing while a Git operation is in progress (a rebase, a
 merge, or a Git command holding `index.lock`, such as a pre-commit hook
 calling `vl status`): commands work as usual, say
-`Git operation in progress`, and Veil catches up when it ends.
+`Git operation in progress`, and Veil catches up when it ends. The one
+exception: a command that would put cloaked or embargoed work on disk
+(`vl ws switch` onto a cloaked line, `vl edit` of a sealed change) is
+refused meanwhile, because Veil must freeze Git's index first and cannot
+while Git holds it:
+
+```text
+error: Git is busy (rebase): Veil cannot freeze .git before writing work Git must not see (the working copy is on a line cloaked for 'team'). Finish or abort the Git operation (or wait for the Git command to end), then run this again
+```
+
+Branches Veil cannot follow (a name that is not a valid Veil tag, such as
+`issue#12`, or the name of a cloaked Veil tag) are left alone: Veil never
+deletes a Git ref it did not write, nor moves `HEAD` off such a branch.
 
 ## Commits made in Git
 
@@ -107,15 +162,17 @@ Imported 1 commit(s) from the colocated .git
 note: the held commit(s) stay in .git until `vl git colocate --prune`; `git push` refuses them
 ```
 
-`vl status` lists held commits until `vl git colocate --prune` expires
-Git's reflogs (every unreachable reflog entry of `.git`) and runs
-`git gc --prune=now`.
+`vl status` lists held commits until `vl git colocate --prune` deletes the
+reflog entries that name them and runs `git gc --prune=now`. Your stashes
+and the rest of every reflog (a commit you can still reach with
+`git reflog` after `git reset --hard`) are kept.
 
 The `pre-commit` guard Veil installs refuses such a commit in the first
-place: anything staged on a cloaked line or under an embargo, a file Veil
-hides from Git, a path the policy does not make public, or public content
-holding a secret. `git commit --no-verify` skips it; the commit is then
-superseded as above.
+place: anything staged on a cloaked line or under an embargo (decided from
+the repository as it is now, not from what the last command saw), a file
+Veil hides from Git or keeps local, anything under `.veil`, a path the
+policy does not make public, or public content holding a secret.
+`git commit --no-verify` skips it; the commit is then superseded as above.
 
 ## Pushing
 
@@ -133,9 +190,17 @@ hint: `vl git push origin` pushes Veil's public view. `git push --no-verify` ski
 **`git push --no-verify` skips the guard** (Git does not run the hook).
 Nothing else can stop a deliberate bypass; `vl git colocate --status` shows
 whether the hooks are installed and intact. A hook you had before is kept
-as `<name>.veil-chained` and runs first. If you set `core.hooksPath`, Git
-runs hooks from there and the guards do not run (Veil never changes it;
-`--status` says so): call `vl git check-push "$@"` from your own `pre-push`.
+as `<name>.veil-chained` and runs first. If you (or a hook manager such as
+husky or lefthook) set `core.hooksPath`, Git runs hooks from there and the
+guards do not run. Veil never changes it, and every `vl status` warns:
+
+```text
+warning: core.hooksPath is set (.husky): Git runs hooks from there, so Veil's pre-commit and pre-push guards do not run. Call `vl git check-push "$@"` from your pre-push hook and `vl --no-snapshot git check-push --pre-commit` from your pre-commit hook, or unset it.
+```
+
+`vl status` warns in the same way when a guard hook is missing, and when
+Git's sparse checkout is on (`core.sparseCheckout`): Git then rewrites the
+skip-worktree bits Veil relies on at every checkout.
 
 ## Cloaked work and embargoes: frozen mode
 
@@ -146,38 +211,82 @@ entry is skip-worktree and `info/exclude` ends with `*`. `git status` and
 `git stash` stores nothing. `HEAD` stays at the last exportable change.
 Git refuses checkouts that would change files there ("would be
 overwritten"); use `vl new`, `vl edit` or `vl ws switch`. Commit with
-`vl commit`.
+`vl commit`. Veil freezes Git *before* it writes cloaked work to disk, so
+no Git command running meanwhile (an IDE's background `git add`) ever sees
+it.
 
 ## What is guarded
 
 | Route | Guard |
 |---|---|
+| A Git commit writing `.veil/…` (a forged accepted-policy pin) or a file named `.veil`, pulled with `git pull` | the repository is in `.git/veil`, where Git never writes; `.veil` is only a symlink, repaired by the next command (what Git put there is set aside unread); a local commit holding `.veil` is superseded; `pre-commit` refuses `.veil` paths |
+| `git clean -fdx`, `git clean -ffdx`, `git stash -a` deleting the repository | the repository is in `.git/veil`, which they never touch |
 | `git add -A`, `git add .`, IDE "stage all" | `info/exclude` holds every protective policy rule, the protected files on disk, and `*` in frozen mode, written before every `vl` command returns |
-| `git commit -a`, `git diff`, `git stash` of a hidden edit | skip-worktree on every file whose content here may differ from Git's (all of them in frozen mode), set again by every command |
+| A tracked `.gitignore` negation (`!secrets/`) that outranks `info/exclude` | detected at every command (Git itself is asked which protected paths it would not ignore): reported, and Git commits freeze until it goes; `pre-commit`, superseding, `pre-push` and `--prune` keep what Git hashed out of commits, remotes and `.git` |
+| `git commit -a`, `git diff`, `git stash` of a hidden edit | skip-worktree on every file whose content here may differ from Git's (all of them in frozen mode), set again by every command, and set *before* cloaked work is written; a move onto cloaked work while Git is busy is refused |
 | Git clearing skip-worktree (`git sparse-checkout disable`, `git update-index --no-skip-worktree`) | the next `vl` command sets it again; `pre-commit` refuses; superseding; `pre-push` |
 | `git add -f`, `--no-verify` commits | superseded, held, never pushed by Veil |
 | A Git checkout recording sealed content as public | the working copy follows `HEAD` itself: hidden files are moved by Veil, never taken from Git as public edits |
 | A pulled `.veilpolicy` that weakens protection | taken as incoming, held back by the policy you accepted |
 | `git push` | `pre-push` guard (except `--no-verify`) |
-| `git stash -a` | `refs/stash` is never imported nor pushed |
-| `git clean -fdx`, `git stash -a` deleting `.veil` | `.veil/.git` marks `.veil` as a nested repository, which Git leaves alone (except `git clean -ffdx`) |
+| `git stash -a`, or a stash made after Git cleared skip-worktree | `refs/stash` is never imported nor pushed; what a stash holds that Veil hides is reported at the next command |
+| Your own skip-worktree / assume-unchanged bits | the edits stay unrecorded and the bits are kept |
+| `git checkout` expanding `$Id$` (`ident`) | `info/attributes` turns `ident` off in the colocated work tree |
+| `core.hooksPath` turning the guards off | every `vl status` warns |
 | A tree with `.git`, `.GIT`, … | refused on import and on checkout, as everywhere in Veil |
 | A Git commit racing a `vl` command | every ref and `HEAD` write is a compare-and-swap; Veil never waits for or removes a Git lock |
 
 ## What Git can still do
 
+These are leaks or losses by explicit Git action, all local to your
+machine. Veil cannot stop them, because Git runs no hook for them; it
+reports them at the next command.
+
+* **A `.gitignore` negation** (`!secrets/`, `!.env`, `!*.md`, or an
+  allow-list `.gitignore` that starts with `*` and re-includes what it
+  keeps) outranks Veil's `info/exclude`: Git ranks every `.gitignore`
+  above it, and nothing ranks above a `.gitignore`. Veil asks Git which
+  protected paths it would no longer ignore, at every command that
+  changed something:
+
+  ```text
+  warning: a .gitignore negation un-hides 2 protected path(s) from Git, and Git ranks .gitignore above Veil's excludes:
+    exposed secrets/veil-probe (.gitignore:1: !secrets/)
+    exposed .env (.gitignore:2: !.env)
+  hint: `git add -A` and `git stash -u` would take such files. Git commits are frozen until the negation goes (commit its removal with `vl commit`); `vl git push` still sends only the public view.
+  ```
+
+  Until you remove the negation, `git add -A` hashes such a file into
+  `.git` (a loose object, never committed by the guards, never pushed;
+  `vl git colocate --prune` removes it once it is no longer staged) and
+  `git stash -u` stores it in a stash and deletes it from disk
+  (`git stash pop` brings it back).
 * **`git stash -a`** stores ignored files, including cloaked and isolated
-  plaintext, in `.git/objects` (local, never pushed) and deletes them from
-  disk; **`git clean -fdx`** deletes them. Veil recorded cloaked files into
-  `@` at your last `vl` command and keeps isolated files in the vault:
-  `vl undo`, `vl restore` and `vl secret recover` bring them back. Only edits
-  made since the last `vl` command are at risk (`vl watch` narrows that).
+  plaintext, in a stash in `.git` and deletes them from disk; a stash made
+  after Git **cleared skip-worktree** (`git sparse-checkout`,
+  `git update-index --no-skip-worktree`) stores the hidden edit. A stash is
+  never pushed by `git push` (the guard refuses `refs/stash`), but
+  **`git bundle create --all`** and `git fast-export --all` include it.
+  `vl status` names such a stash until it is dropped:
+
+  ```text
+  warning: Git's stash@{0} holds .env (isolated): content Veil keeps from Git is in a local stash (never pushed by `git push`, but `git bundle --all` carries it). Recover what you need (`git stash show -p`), then `git stash drop` it and `vl git colocate --prune`
+  ```
+* **`git clean -fdx`** (and `-ffdx`) deletes ignored files, cloaked and
+  isolated ones included. Veil recorded cloaked files into `@` at your last
+  `vl` command and keeps isolated files in the vault: `vl undo`,
+  `vl restore` and `vl secret recover` bring them back. Only edits made
+  since the last `vl` command are lost (`vl watch` narrows that).
 * A **`git checkout`** of an old commit that has a file you have since
   cloaked or isolated overwrites your copy without asking (Git treats
-  ignored files as expendable). The same recovery applies.
+  ignored files as expendable). The same recovery applies; edits since the
+  last `vl` command are lost. (Putting such files in Git's index, so that
+  Git refused, would show them as staged new files in `git status`.)
 * After Git **clears skip-worktree**, `git add` hashes the hidden file into
   a loose object in `.git` (local, never committed by the guards, never
   pushed). `vl git colocate --prune` removes it.
+* Checkout **filters** (Git LFS's `filter=lfs`) still run: Veil records
+  the file as it is on disk (the full content, not the pointer).
 * `info/exclude` holds the **names** of protected files in plaintext, as
   `vl status` shows them; it is local and never pushed.
 * A commit you pull with `git pull <url>` (not through a configured
@@ -188,27 +297,45 @@ overwritten"); use `vl new`, `vl edit` or `vl ws switch`. Commit with
 ## Status, pruning, stopping
 
 ```sh
-vl git colocate --status     # excludes, skip-worktree count, frozen?, hooks, held commits, Git version
-vl git colocate --prune      # expire reflogs, gc: held commits leave .git
+vl git colocate --status     # excludes, skip-worktree count, frozen?, hooks, held commits, exposures, stashes, Git version
+vl git colocate --prune      # held commits leave .git (stashes and the rest of the reflog stay)
 vl git uncolocate            # stop: .git stays, a plain Git repository
 ```
 
-`vl git uncolocate` removes the exclude block, the hooks (restoring chained
-ones), the skip-worktree bits and the `.veil/.git` marker, and moves the
-bridge back to `.veil/git/repo.git`. Files Veil hid from Git then show in
-`git status`; some hold content Veil keeps private: do not `git add` them.
-The repository stays at format 5, so an older `vl` never works in a
-directory whose guards it would not keep.
+`vl git uncolocate` keeps the guards that keep protected files out of Git:
+the exclude block stays in `.git/info/exclude` (so `git add -A` still
+leaves `.env`, cloaked files and `.veil` alone), and so do the
+skip-worktree bits of files whose content here is not Git's. It removes
+the hooks (restoring chained ones; they need colocation) and the
+`info/attributes` block, moves Veil's repository back from `.git/veil` to
+`.veil`, and lists every file that holds content Veil keeps private:
+
+```text
+Stopped colocation: /home/alice/p/.git is a plain Git repository again
+kept: the exclude block stays in /home/alice/p/.git/info/exclude (edit it away only if you mean Git to see these files)
+warning: 2 file(s) here hold content Veil keeps private; never `git add -f` them:
+  protected .env
+  protected secrets/db.yml
+warning: Git's pre-commit and pre-push guards are removed: nothing stops `git add -f` or a push of a commit made with it
+```
+
+It is refused on a cloaked line or under an embargo (a plain Git would see
+that work): `vl ws switch` to a public line first. The repository stays at
+format 5, so an older `vl` never works in a directory whose guards it
+would not keep.
 
 ## Where colocation does not apply
 
 `vl ws exec` sandboxes, `--only` sparse sandboxes and mounted workspaces
-have no `.git`. The team vault is untouched.
+have no `.git` of their own (in a colocated project they live in
+`.git/veil/local/`, where Git commands find no work tree). The team vault
+is untouched.
 
 ## Tested Git versions
 
 The test suite (`crates/vl/tests/colocated_git_cli.rs`, the interleaving
-property test `colocated_git_props.rs`) runs with whatever `git` is
-installed and prints its version; this release was tested with Git 2.53 on
-Linux. Git-version-specific behaviour of skip-worktree is the main reason
-the mode is experimental.
+property test `colocated_git_props.rs`, and the round-9 adversarial tests
+`adversarial9_colocated/`) runs with whatever `git` is installed and prints
+its version; this release was tested with Git 2.53 on Linux. The
+Git-version matrix and macOS (where `.VEIL` and `.veil` are one name) are
+not run yet, which is why the mode is experimental.

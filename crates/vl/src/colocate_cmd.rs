@@ -17,7 +17,7 @@
 //! already there is kept and called first (`<name>.veil-chained`).
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     io::Read,
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
@@ -66,9 +66,9 @@ pub struct ColocateArgs {
     /// local commits, Git version, `pre-push` hook.
     #[arg(long, conflicts_with = "prune")]
     pub status: bool,
-    /// Expire the reflogs of superseded local commits and run
-    /// `git gc --prune=now` (every unreachable reflog entry of `.git` is
-    /// expired).
+    /// Remove held (superseded) local commits from `.git`: delete the
+    /// reflog entries that name them, then run `git gc --prune=now`. Every
+    /// other reflog entry and every stash is kept.
     #[arg(long)]
     pub prune: bool,
 }
@@ -108,6 +108,10 @@ pub struct Session {
     pub in_progress: Option<&'static str>,
     /// Mirror at all (`vl git check-push` does not: it runs inside Git).
     pub mirror: bool,
+    /// Files whose local edit the user hid from Git (their own
+    /// skip-worktree or assume-unchanged bit): every snapshot keeps their
+    /// recorded version (BUG-745).
+    pub keep: BTreeSet<VPath>,
 }
 
 // ---- session -------------------------------------------------------------------------------
@@ -149,7 +153,15 @@ pub fn open_session(ctx: &mut Ctx, snapshot: bool) -> Result<()> {
         followed: false,
         in_progress: None,
         mirror: true,
+        keep: BTreeSet::new(),
     };
+    {
+        let mut state = State::load(&**ctx.repo.backend())?;
+        if refresh_user_hidden(&session.git_dir, &mut state, false) {
+            state.save(&**ctx.repo.backend())?;
+        }
+        session.keep = keep_set(&state);
+    }
     if let Some(op) = colocate::operation_in_progress(&session.git_dir) {
         // Inside a Git hook (`git commit` holds index.lock), or a rebase:
         // the command works as usual; nothing is followed or mirrored.
@@ -204,7 +216,11 @@ pub fn finish_session(ctx: &mut Ctx) -> Result<()> {
     }
     let policy = ctx.repo.effective_policy(&*ctx.fs)?;
     let literal = colocate::literal_paths(&policy, state.local_only.iter().cloned());
-    let mut frozen = state.frozen;
+    // Frozen as the repository says now, not as `colocated.json` last
+    // said: a command that could not mirror still writes `*` (BUG-748).
+    let wc = ctx.wc()?;
+    let live = colocate::freeze_reason(&ctx.repo, &ctx.ws, wc)?;
+    let mut frozen = state.frozen || live.is_some();
     let unchanged = || -> Result<bool> {
         let (head, refs) = colocate::git_view(&session.git_dir)?;
         let key = colocate::mirror_key_of(&ctx.repo.op_id(), &ctx.ws, &head, &refs, &state.local_only);
@@ -214,21 +230,215 @@ pub fn finish_session(ctx: &mut Ctx) -> Result<()> {
             && colocate::index_intact(&session.git_dir, &state))
     };
     if session.in_progress.is_none() && session.followed && !unchanged()? {
+        // A `.gitignore` negation that un-hides a protected path outranks
+        // `info/exclude`: found here, it freezes Git commits (BUG-742).
+        let exposed = exposures(ctx, &session.git_dir, &policy, &state, live.is_some()).unwrap_or_else(|e| {
+            warn(&format!("could not check the .gitignore files against Veil's excludes: {e}"));
+            Vec::new()
+        });
+        let newly = exposed.iter().any(|x| !state.exposed.contains(x));
+        state.exposed = exposed;
+        let extra = state.exposed.first().map(|x| format!("a .gitignore negation un-hides {x} from Git"));
         let mut bridge = GitBridge::open(&ctx.repo, &session.git_dir)?;
         let local_only = state.local_only.clone();
         let ws = ctx.ws.clone();
-        let r = bridge.mirror(&mut ctx.repo, &mut state, &ws, session.expected_head.as_ref(), &local_only)?;
-        frozen = r.frozen;
-            for w in &r.warnings {
+        let r = bridge.mirror(&mut ctx.repo, &mut state, &ws, session.expected_head.as_ref(), &local_only, extra)?;
+        frozen = r.frozen || live.is_some();
+        for w in &r.warnings {
             warn_untrusted(w);
         }
         for n in &r.notes {
             eprintln!("{} {}", dim("note:"), safe(n));
         }
+        if newly {
+            print_exposed(&state.exposed);
+        }
+    }
+    // What Git's stashes hold that Veil keeps from Git (Git runs no hook
+    // for `git stash`): looked at again whenever the stash changed.
+    if session.in_progress.is_none() {
+        let tip = stash_tip(&session.git_dir);
+        if tip != state.stash_seen {
+            let found = match tip {
+                Some(_) => GitBridge::open(&ctx.repo, &session.git_dir)
+                    .and_then(|b| b.stash_findings(&state, &policy))
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            for f in found.iter().filter(|f| !state.stash_findings.contains(f)) {
+                print_stash_finding(f);
+            }
+            state.stash_findings = found;
+            state.stash_seen = tip;
+        }
     }
     colocate::write_exclude(&session.git_dir, &colocate::exclude_block(&policy, &literal, frozen))?;
+    colocate::write_attributes(&session.git_dir)?;
     state.save(&**ctx.repo.backend())?;
     Ok(())
+}
+
+/// What the stash is now (a hash of its reflog, or of `refs/stash`), to
+/// know whether [`State::stash_findings`] still describe it.
+fn stash_tip(git_dir: &Path) -> Option<String> {
+    std::fs::read(git_dir.join("logs/refs/stash"))
+        .or_else(|_| std::fs::read(git_dir.join("refs/stash")))
+        .ok()
+        .map(|t| blake3::hash(&t).to_hex().to_string())
+}
+
+fn print_stash_finding(f: &str) {
+    warn_untrusted(&format!(
+        "Git's {f}: content Veil keeps from Git is in a local stash (never pushed by `git push`, but `git bundle --all` \
+         carries it). Recover what you need (`git stash show -p`), then `git stash drop` it and `vl git colocate --prune`"
+    ));
+}
+
+fn print_exposed(exposed: &[String]) {
+    warn_untrusted(&format!(
+        "a .gitignore negation un-hides {} protected path(s) from Git, and Git ranks .gitignore above Veil's excludes:",
+        exposed.len()
+    ));
+    for x in exposed.iter().take(10) {
+        eprintln!("  {} {}", red("exposed"), safe(x));
+    }
+    eprintln!(
+        "{} `git add -A` and `git stash -u` would take such files. Git commits are frozen until the negation goes \
+         (commit its removal with `vl commit`); `vl git push` still sends only the public view. See {GUIDE}",
+        yellow("hint:")
+    );
+}
+
+/// Protected paths Git would not ignore because a `.gitignore` negation
+/// re-includes them, each with the line responsible: for every negation of
+/// every `.gitignore` of the working copy, a path it re-includes (see
+/// `policy_gitignore::negation_probes`), when Veil protects that path (in
+/// frozen mode, every path), plus the protected files on disk. Git itself
+/// decides (`git check-ignore`). Nothing to ask when no `.gitignore` has a
+/// negation.
+fn exposures(ctx: &Ctx, git_dir: &Path, policy: &veil_core::policy::Policy, state: &State, frozen: bool) -> Result<Vec<String>> {
+    let tree = ctx.repo.snapshot(&ctx.wc()?)?.tree;
+    let mut probes: Vec<(String, String)> = Vec::new();
+    let mut cloaked_on_disk: Vec<String> = Vec::new();
+    for (p, e) in veil_core::tree::walk_files(ctx.repo.store(), &tree)? {
+        if !e.visibility.is_public() {
+            cloaked_on_disk.push(p.as_str().to_string());
+        }
+        if p.file_name() != ".gitignore" {
+            continue;
+        }
+        let Ok(text) = veil_core::StorageBackend::read(&*ctx.fs, &p) else { continue };
+        let text = String::from_utf8_lossy(&text);
+        if text.lines().any(|l| l.starts_with('!')) {
+            probes.extend(policy_gitignore::negation_probes(p.as_str(), &text));
+        }
+    }
+    if probes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let protected = |path: &str| -> bool {
+        frozen
+            || state.local_only.contains(path)
+            || VPath::new(path).map_or(true, |vp| !matches!(policy.classify(&vp, false).tier, veil_core::policy::Tier::Public))
+    };
+    let mut ask: BTreeMap<String, String> = BTreeMap::new();
+    for (probe, line) in probes {
+        if protected(&probe) {
+            ask.entry(probe).or_insert(line);
+        }
+    }
+    for p in state.local_only.iter().chain(cloaked_on_disk.iter()) {
+        ask.entry(p.clone()).or_insert_with(|| "a .gitignore negation".into());
+    }
+    let paths: Vec<String> = ask.keys().cloned().collect();
+    let open = policy_gitignore::not_ignored(&ctx.root, git_dir, &paths)?;
+    Ok(open
+        .into_iter()
+        .map(|p| {
+            let line = ask.get(&p).cloned().unwrap_or_default();
+            format!("{p} ({line})")
+        })
+        .collect())
+}
+
+/// The working copy is about to move to `target` (`Ctx::finish`, or the
+/// catch-up of a stale directory): when `target` is cloaked or embargoed
+/// work and Git's index is not frozen yet, freeze it **before** a file of
+/// it is written, so that no Git command (an IDE's `git add -A` in a loop)
+/// ever sees it unfrozen (BUG-748). While Git is busy (a rebase, a merge,
+/// `index.lock` held) the index cannot be frozen: the move is refused.
+pub fn before_materialise(ctx: &mut Ctx, target: ObjectId) -> Result<()> {
+    let Some(git_dir) = ctx.git.as_ref().map(|s| s.git_dir.clone()) else { return Ok(()) };
+    let Some(why) = colocate::freeze_reason(&ctx.repo, &ctx.ws, target)? else { return Ok(()) };
+    let _lock = FollowLock::acquire(&ctx.root)?;
+    let mut state = State::load(&**ctx.repo.backend())?;
+    let busy = colocate::operation_in_progress(&git_dir);
+    if state.frozen && busy.is_none() && colocate::index_intact(&git_dir, &state) && colocate::current_exclude_block(&git_dir).is_some_and(|b| b.contains("\n*\n")) {
+        return Ok(());
+    }
+    if let Some(op) = busy {
+        bail!(
+            "Git is busy ({op}): Veil cannot freeze .git before writing work Git must not see ({why}). \
+             Finish or abort the Git operation (or wait for the Git command to end), then run this again"
+        );
+    }
+    if !colocate::freeze_index(&git_dir)? {
+        bail!(
+            "the Git index could not be frozen (it is locked, or holds a conflicted merge or a sparse index), so Veil \
+             will not write work Git must not see ({why}). Resolve that in Git, then run this again"
+        );
+    }
+    let policy = ctx.repo.effective_policy(&*ctx.fs)?;
+    let literal = colocate::literal_paths(&policy, state.local_only.iter().cloned());
+    colocate::write_exclude(&git_dir, &colocate::exclude_block(&policy, &literal, true))?;
+    state.frozen = true;
+    state.frozen_reason = Some(why);
+    state.index_frozen = true;
+    state.index_key = None;
+    state.mirrored = None;
+    state.save(&**ctx.repo.backend())?;
+    Ok(())
+}
+
+/// Read the user's own skip-worktree and assume-unchanged bits from the
+/// index into [`State::user_hidden`] (BUG-745): an assume-unchanged bit is
+/// always the user's (Veil never sets one); a skip-worktree bit is taken as
+/// the user's only at adoption (`adopting`), when Veil has set none, and
+/// kept while it stays set. A bit the user cleared lets the edit be
+/// recorded. Read again only when the index changed. Returns whether
+/// `state` changed.
+fn refresh_user_hidden(git_dir: &Path, state: &mut State, adopting: bool) -> bool {
+    let path = index::index_path(git_dir);
+    let stamp = std::fs::symlink_metadata(&path).ok().map(|m| {
+        use std::os::unix::fs::MetadataExt;
+        (m.len(), m.mtime() as i128 * 1_000_000_000 + m.mtime_nsec() as i128)
+    });
+    if !adopting && stamp == state.index_stamp {
+        return false;
+    }
+    let Some(entries) = index::read_unverified(&path).ok().flatten() else {
+        let changed = !state.user_hidden.is_empty() || state.index_stamp != stamp;
+        state.user_hidden.clear();
+        state.index_stamp = stamp;
+        return changed;
+    };
+    let mut hidden = BTreeMap::new();
+    for e in entries.iter().filter(|e| e.stage == 0) {
+        let p = colocate::escape_git_path(&e.path);
+        if e.assume_unchanged {
+            hidden.insert(p, colocate::USER_ASSUME.to_string());
+        } else if e.skip_worktree && (adopting || state.user_hidden.get(&p).is_some_and(|b| b == colocate::USER_SKIP)) {
+            hidden.insert(p, colocate::USER_SKIP.to_string());
+        }
+    }
+    let changed = hidden != state.user_hidden || stamp != state.index_stamp;
+    state.user_hidden = hidden;
+    state.index_stamp = stamp;
+    changed
+}
+
+fn keep_set(state: &State) -> BTreeSet<VPath> {
+    state.user_hidden.keys().filter_map(|p| VPath::new(p).ok()).collect()
 }
 
 /// The follow (see `veil_core::git::colocate`): local commits, then
@@ -324,6 +534,7 @@ fn managed_paths(ctx: &Ctx, bridge: &GitBridge, state: &State, target: &ObjectId
         return Ok(HashSet::new());
     };
     let mut ours: HashSet<String> = state.skip.iter().cloned().collect();
+    ours.extend(state.user_hidden.keys().cloned());
     if state.frozen {
         if let Some(h) = state.index_head.as_deref().and_then(|h| veil_core::git::GitOid::from_hex(h.as_bytes()).ok()) {
             if let Ok(c) = bridge.read_commit(&h) {
@@ -351,8 +562,13 @@ fn follow_head(ctx: &mut Ctx, bridge: &GitBridge, state: &State, target: ObjectI
     }
     let managed = managed_paths(ctx, bridge, state, &target)?;
     // 1. What the hidden files hold now goes into the old change first.
+    // `.veilpolicy` is incoming here as in step 4: Git's checkout may have
+    // written it, and an own edit would be accepted even if it weakens the
+    // policy (found by the round-9 property test: a pulled weakening
+    // replaced the accepted-policy pin in frozen mode, where Git manages
+    // no path).
     if managed.is_empty() {
-        ctx.snapshot()?;
+        ctx.snapshot_incoming()?;
     } else {
         let store = ctx.repo.store().clone();
         let mut hidden: BTreeSet<VPath> = BTreeSet::new();
@@ -581,7 +797,7 @@ pub fn init_colocate(path: Option<&Path>, args: &InitColocateArgs) -> Result<Exi
     };
     std::fs::create_dir_all(&root)?;
     let root = root.canonicalize()?;
-    if root.join(".veil").exists() {
+    if std::fs::symlink_metadata(root.join(".veil")).is_ok() || veil_core::repo::colocated_state_dir(&root).is_some() {
         bail!(
             "{} is already a Veil repository; colocate it with `vl git colocate --experimental`",
             root.display()
@@ -607,8 +823,10 @@ pub fn init_colocate(path: Option<&Path>, args: &InitColocateArgs) -> Result<Exi
     } else {
         colocate::init_git(&root)?;
     }
-    crate::cmd_init(Some(&root))?;
-    let mut ctx = Ctx::open(Some(&root), true)?;
+    crate::init_repository(Some(&root), !adopt)?;
+    // No snapshot yet: the first one is taken once the guards (and the
+    // user's own skip-worktree bits, BUG-745) are known.
+    let mut ctx = Ctx::open(Some(&root), false)?;
     colocate_now(&mut ctx, adopt)?;
     ctx.finish()?;
     Ok(ExitCode::SUCCESS)
@@ -666,6 +884,20 @@ fn colocate_now(ctx: &mut Ctx, adopt: bool) -> Result<()> {
     } else {
         refuse_adoption(&root)?;
     }
+    // Git must not track `.veil` (a Veil repository planted by a Git
+    // commit would otherwise be the one colocated).
+    if let Some(entries) = index::read(&index::index_path(&git_dir))? {
+        if let Some(e) = entries
+            .iter()
+            .find(|e| std::str::from_utf8(e.path.split(|b| *b == b'/').next().unwrap_or_default()).is_ok_and(veil_core::object::is_reserved_name))
+        {
+            bail!(
+                "Git tracks {} (a Veil repository in a Git commit?); colocated mode refuses it. Remove it from Git first \
+                 (`git rm -r --cached .veil` and commit)",
+                String::from_utf8_lossy(&e.path)
+            );
+        }
+    }
     // The old bridge's remote-tracking refs (and their objects) come along:
     // a local fetch, no network.
     let bridge_dir = root.join(".veil").join("git").join("repo.git");
@@ -681,12 +913,19 @@ fn colocate_now(ctx: &mut Ctx, adopt: bool) -> Result<()> {
         c.args(["config", k, v]);
         run_git(c, "config")?;
     }
-    colocate::guard_veil_dir(&root)?;
     ctx.repo.update_config(|c| {
         c.colocated = Some(Colocated { git_dir: ".git".into() });
         Ok(())
     })?;
+    // The Veil repository moves out of Git's work tree, into .git/veil,
+    // which no Git command writes (BUG-740, BUG-741, BUG-746); `.veil`
+    // becomes a symlink to it. This command goes on through the symlink.
+    colocate::move_state_into_git(&root)?;
     let mut state = State::load(&**ctx.repo.backend())?;
+    // The user's own skip-worktree and assume-unchanged bits: those files'
+    // local edits stay unrecorded (BUG-745).
+    refresh_user_hidden(&git_dir, &mut state, true);
+    let keep = keep_set(&state);
     let warnings = install_hooks(&git_dir)?;
     state.hooks_installed = true;
     for w in warnings {
@@ -702,7 +941,7 @@ fn colocate_now(ctx: &mut Ctx, adopt: bool) -> Result<()> {
             match bridge.snapshot_of(&h) {
                 Some(sid) => {
                     let ws = ctx.ws.clone();
-                    let new = colocate::reparent_working_copy(&mut ctx.repo, &ws, sid)?;
+                    let new = colocate::reparent_working_copy(&mut ctx.repo, &ws, sid, !keep.is_empty())?;
                     ctx.set_materialised_snapshot(new)?;
                     eprintln!(
                         "{} the working copy is a change on Git's HEAD ({}); uncommitted Git edits are its changes",
@@ -718,14 +957,22 @@ fn colocate_now(ctx: &mut Ctx, adopt: bool) -> Result<()> {
     state.last_head = head.commit.map(|c| c.to_string());
     state.last_head_ref = head.symbolic.clone();
     state.save(&**ctx.repo.backend())?;
-    ctx.snapshot()?;
+    for p in &keep {
+        eprintln!(
+            "  {} {} (Git was told to hide its local edit; Veil keeps the committed version until you clear the bit)",
+            yellow("kept"),
+            safe(p.as_str())
+        );
+    }
     ctx.git = Some(Session {
         git_dir: git_dir.clone(),
         expected_head: Some(head),
         followed: true,
         in_progress: None,
         mirror: true,
+        keep,
     });
+    ctx.snapshot()?;
     eprintln!(
         "{} {} with Veil ({}). Git sees the public view only; see {GUIDE}",
         green("Colocated"),
@@ -803,6 +1050,25 @@ fn status(ctx: &mut Ctx) -> Result<ExitCode> {
     if let Some(p) = hooks_path_config(&git_dir) {
         println!("{}  {} core.hooksPath={p}: the guards do not run", bold("hook"), red("inactive"));
     }
+    match veil_core::repo::colocated_state_dir(&ctx.root) {
+        Some(d) => println!(
+            "{}  {} ({}; .veil {})",
+            bold("veil dir"),
+            d.display(),
+            green("out of Git's work tree"),
+            if colocate::is_marker(&ctx.root) { "links to it" } else { "is restored by the next command" }
+        ),
+        None => println!("{}  {} ({})", bold("veil dir"), ctx.root.join(".veil").display(), red("inside Git's work tree")),
+    }
+    for x in &state.exposed {
+        println!("{}  {} {}", bold("exposed"), red("un-hidden by .gitignore:"), safe(x));
+    }
+    for f in &state.stash_findings {
+        println!("{}  {} {}", bold("stash"), red("holds hidden content:"), safe(f));
+    }
+    for (p, bit) in &state.user_hidden {
+        println!("{}  {} ({bit}: its local edit stays unrecorded)", bold("yours"), safe(p));
+    }
     if state.held.is_empty() {
         println!("{}  none", bold("held"));
     }
@@ -825,21 +1091,68 @@ fn status(ctx: &mut Ctx) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `vl git colocate --prune`: held commits leave `.git`. Only the reflog
+/// entries that name a held commit are deleted (old or new value; the
+/// entries around them are rewritten to stay a chain), never any other
+/// entry and never a stash; then `git gc --prune=now`, with reflog expiry
+/// turned off for it (BUG-743).
 fn prune(ctx: &mut Ctx) -> Result<ExitCode> {
     let git_dir = colocated_dir(ctx)?;
     let mut state = State::load(&**ctx.repo.backend())?;
+    let held: HashSet<String> = state.held.iter().map(|h| h.commit.clone()).collect();
+    let mut deleted = 0usize;
+    if !held.is_empty() {
+        for (name, file) in reflogs(&git_dir.join("logs")) {
+            if name == "refs/stash" {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&file) else { continue };
+            let lines: Vec<&str> = text.lines().collect();
+            let n = lines.len();
+            // `<ref>@{i}` counts from the newest entry (the last line).
+            let mut doomed: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| {
+                    let mut f = l.split_whitespace();
+                    let (old, new) = (f.next().unwrap_or(""), f.next().unwrap_or(""));
+                    held.contains(old) || held.contains(new)
+                })
+                .map(|(k, _)| n - 1 - k)
+                .collect();
+            // Oldest first: deleting it leaves the newer indexes as they are.
+            doomed.sort_unstable_by(|a, b| b.cmp(a));
+            for i in doomed {
+                let mut c = git_cmd(&git_dir);
+                c.args(["reflog", "delete", "--rewrite", &format!("{name}@{{{i}}}")]);
+                run_git(c, "reflog delete")?;
+                deleted += 1;
+            }
+        }
+    }
     let mut c = git_cmd(&git_dir);
-    c.args(["reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all"]);
-    run_git(c, "reflog expire")?;
-    let mut c = git_cmd(&git_dir);
-    c.args(["-c", "core.hooksPath=/dev/null", "gc", "--prune=now", "--quiet"]);
+    c.args([
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "gc.reflogExpire=never",
+        "-c",
+        "gc.reflogExpireUnreachable=never",
+        "gc",
+        "--prune=now",
+        "--quiet",
+    ]);
     run_git(c, "gc")?;
     let before = state.held.len();
     state
         .held
         .retain(|h| git_cmd(&git_dir).args(["cat-file", "-e", &h.commit]).status().is_ok_and(|s| s.success()));
     state.save(&**ctx.repo.backend())?;
-    println!("Pruned {} held commit(s) from .git", before - state.held.len());
+    println!(
+        "Pruned {} held commit(s) from .git ({deleted} reflog entr{} naming them deleted; every other reflog entry and stash kept)",
+        before - state.held.len(),
+        if deleted == 1 { "y" } else { "ies" }
+    );
     for h in &state.held {
         println!(
             "  {} {} is still referenced (a branch, tag or stash names it); delete that, then prune again",
@@ -850,9 +1163,41 @@ fn prune(ctx: &mut Ctx) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `vl git uncolocate`.
+/// Every reflog under `logs` (`.git/logs`): its ref name (`HEAD`,
+/// `refs/heads/main`) and file.
+fn reflogs(logs: &Path) -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    let mut stack = vec![(String::new(), logs.to_path_buf())];
+    while let Some((prefix, dir)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            let Some(name) = e.file_name().to_str().map(str::to_string) else { continue };
+            let full = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+            match e.file_type() {
+                Ok(t) if t.is_dir() => stack.push((full, e.path())),
+                Ok(t) if t.is_file() && !name.ends_with(".lock") => out.push((full, e.path())),
+                _ => {}
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// `vl git uncolocate`. The guards that keep protected files out of Git
+/// stay (BUG-744): the exclude block, and the skip-worktree bits of files
+/// whose content here is not Git's; only the hooks go (they need
+/// colocation). Refused on a cloaked line or under an embargo, where Git
+/// would see sealed work. Every protected file on disk is listed.
 pub fn uncolocate(ctx: &mut Ctx, _args: &UncolocateArgs) -> Result<ExitCode> {
     let git_dir = colocated_dir(ctx)?;
+    let wc = ctx.wc()?;
+    if let Some(why) = colocate::freeze_reason(&ctx.repo, &ctx.ws, wc)? {
+        bail!(
+            "{why}: a plain Git repository here would see that work. Move to a public line first \
+             (`vl ws switch default`), then uncolocate"
+        );
+    }
     ctx.git = None;
     let state = State::load(&**ctx.repo.backend())?;
     // The bridge goes back to .veil/git/repo.git, with what was fetched.
@@ -873,45 +1218,87 @@ pub fn uncolocate(ctx: &mut Ctx, _args: &UncolocateArgs) -> Result<ExitCode> {
         .arg(&git_dir)
         .args(["+refs/remotes/*:refs/remotes/*", "+refs/veil/*:refs/veil/*"]);
     run_git(c, "fetch into the bridge")?;
+    // The excludes as they protect now (never `*`: not frozen here).
+    let policy = ctx.repo.effective_policy(&*ctx.fs)?;
+    let literal = colocate::literal_paths(&policy, state.local_only.iter().cloned());
+    colocate::write_exclude(&git_dir, &colocate::exclude_block(&policy, &literal, false))?;
     ctx.repo.update_config(|c| {
         c.colocated = None;
         Ok(())
     })?;
-    colocate::remove_exclude(&git_dir)?;
     uninstall_hooks(&git_dir)?;
-    let mut revealed = 0;
+    colocate::remove_attributes(&git_dir)?;
+    // Skip-worktree stays on what Veil hid (and on the user's own bits);
+    // the rest is cleared.
+    let mut kept_hidden = 0;
     if let Some(entries) = index::read(&index::index_path(&git_dir))? {
-        revealed = entries.iter().filter(|e| e.skip_worktree).count();
-        let list: Vec<index::NewEntry> = entries
-            .iter()
-            .filter(|e| e.stage == 0)
-            .map(|e| index::NewEntry {
-                path: e.path.clone(),
-                mode: e.mode,
-                oid: e.oid,
-                skip_worktree: false,
-            })
-            .collect();
-        if !index::write(&git_dir, &list)? {
-            warn("the Git index is locked; its skip-worktree bits were left as they are");
+        let keep_bit = |p: &[u8]| {
+            let k = colocate::escape_git_path(p);
+            state.skip.contains(&k) || state.local_only.contains(&k) || state.user_hidden.get(&k).is_some_and(|b| b == colocate::USER_SKIP)
+        };
+        kept_hidden = entries.iter().filter(|e| e.skip_worktree && keep_bit(&e.path)).count();
+        if entries.iter().all(|e| e.stage == 0 && e.mode != 0o040000) {
+            let list: Vec<index::NewEntry> = entries
+                .iter()
+                .map(|e| index::NewEntry {
+                    path: e.path.clone(),
+                    mode: e.mode,
+                    oid: e.oid,
+                    skip_worktree: e.skip_worktree && keep_bit(&e.path),
+                    assume_unchanged: e.assume_unchanged,
+                })
+                .collect();
+            if !index::write(&git_dir, &list)? {
+                warn("the Git index is locked; its skip-worktree bits were left as they are");
+            }
         }
     }
-    colocate::unguard_veil_dir(&ctx.root)?;
-    State::remove(&**ctx.repo.backend())?;
-    println!("Stopped colocation: {} is a plain Git repository again", git_dir.display());
-    if revealed > 0 {
-        warn(&format!(
-            "{revealed} file(s) Veil hid from Git now show in `git status`; some hold content Veil keeps private \
-             (cloaked, embargoed): do not `git add` them"
-        ));
+    // Every protected file on disk, by name: Git must not get them.
+    let tree = ctx.repo.snapshot(&wc)?.tree;
+    let mut protected: BTreeSet<String> = state.local_only.clone();
+    for (p, e) in veil_core::tree::walk_files(ctx.repo.store(), &tree)? {
+        if !e.visibility.is_public() || e.fallback.is_some() {
+            protected.insert(p.as_str().to_string());
+        }
     }
+    State::remove(&**ctx.repo.backend())?;
+    // `.veil` goes back to a real directory once this command is done with
+    // the repository (`run` calls `finish_uncolocate`).
+    ctx.uncolocated = true;
+    println!("Stopped colocation: {} is a plain Git repository again", git_dir.display());
+    println!(
+        "{} the exclude block stays in {} (edit it away only if you mean Git to see these files){}",
+        dim("kept:"),
+        git_dir.join("info/exclude").display(),
+        if kept_hidden > 0 { format!("; {kept_hidden} file(s) stay skip-worktree") } else { String::new() }
+    );
+    if !protected.is_empty() {
+        warn(&format!(
+            "{} file(s) here hold content Veil keeps private; never `git add -f` them:",
+            protected.len()
+        ));
+        for p in protected.iter().take(50) {
+            eprintln!("  {} {}", yellow("protected"), safe(p));
+        }
+        if protected.len() > 50 {
+            eprintln!("  … and {} more", protected.len() - 50);
+        }
+    }
+    warn("Git's pre-commit and pre-push guards are removed: nothing stops `git add -f` or a push of a commit made with it");
     if !state.held.is_empty() {
         warn(&format!(
-            "{} held commit(s) are still in .git; `git gc --prune=now` after expiring reflogs removes them",
+            "{} held commit(s) are still in .git; `vl git colocate --prune` before uncolocating removes them",
             state.held.len()
         ));
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// After `vl git uncolocate` (and once nothing of the command uses the
+/// repository): move it from `.git/veil` back to `.veil`.
+pub fn finish_uncolocate(root: &Path) -> Result<()> {
+    colocate::move_state_out_of_git(root)?;
+    Ok(())
 }
 
 // ---- gates ---------------------------------------------------------------------------------
@@ -928,7 +1315,9 @@ pub fn check_push(ctx: &mut Ctx, args: &CheckPushArgs) -> Result<ExitCode> {
     let refused = if args.pre_commit {
         let staged = index::read_staged(&git_dir)?.unwrap_or_default();
         let policy = ctx.repo.effective_policy(&*ctx.fs)?;
-        bridge.check_staged(&state, &policy, &staged)?
+        // From the repository as it is now, not from colocated.json alone.
+        let live = colocate::freeze_reason(&ctx.repo, &ctx.ws, ctx.wc()?)?;
+        bridge.check_staged(&state, &policy, &staged, live.as_deref())?
     } else {
         let mut input = String::new();
         std::io::stdin().read_to_string(&mut input)?;
@@ -1031,6 +1420,50 @@ pub fn status_notes(ctx: &Ctx) {
             safe(state.frozen_reason.as_deref().unwrap_or("cloaked or embargoed work"))
         );
     }
+    // (A stash changed since is looked at by this command's end.)
+    let git_dir = colocate::colocated_git_dir(&ctx.root);
+    if git_dir.as_deref().is_some_and(|g| stash_tip(g) == state.stash_seen) {
+        for f in &state.stash_findings {
+            print_stash_finding(f);
+        }
+    }
+    for x in state.exposed.iter().take(5) {
+        warn_untrusted(&format!("a .gitignore negation un-hides {x} from Git; Git commits are frozen until it goes"));
+    }
+    if let Some(git_dir) = colocate::colocated_git_dir(&ctx.root) {
+        for w in inactive_guards(&git_dir) {
+            warn(&w);
+        }
+    }
+}
+
+/// Why the Git-side guards may not be running (BUG-753): `core.hooksPath`
+/// (a hook manager's) makes Git ignore `.git/hooks`; a missing or edited
+/// guard hook; Git's sparse checkout, which rewrites skip-worktree bits on
+/// every checkout.
+fn inactive_guards(git_dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(p) = hooks_path_config(git_dir) {
+        out.push(format!(
+            "core.hooksPath is set ({p}): Git runs hooks from there, so Veil's pre-commit and pre-push guards do not run. \
+             Call `vl git check-push \"$@\"` from your pre-push hook and `vl --no-snapshot git check-push --pre-commit` \
+             from your pre-commit hook, or unset it. See {GUIDE}"
+        ));
+    }
+    for (name, installed, _) in hooks_intact(git_dir) {
+        if !installed {
+            out.push(format!("Veil's {name} guard is not installed in .git/hooks; `vl git colocate --status` says more"));
+        }
+    }
+    let sparse = git_cmd(git_dir).args(["config", "--bool", "--get", "core.sparseCheckout"]).output();
+    if sparse.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "true") {
+        out.push(
+            "Git's sparse checkout is on (core.sparseCheckout): Git then rewrites the skip-worktree bits Veil relies on at every \
+             checkout. Turn it off (`git sparse-checkout disable`); Veil sets the bits again at the next command"
+                .into(),
+        );
+    }
+    out
 }
 
 #[cfg(test)]

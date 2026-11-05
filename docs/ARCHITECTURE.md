@@ -3276,16 +3276,54 @@ sees the projection* and *everything from Git is public*, no longer hold by
 construction there, so the mode restores them:
 
 ```text
-.veil/repo.json          colocated: {git_dir: ".git"}  (format 5; an older vl refuses the directory)
 .git                     the bridge repository (`git::default_git_dir` reads repo.json)
   info/exclude             # BEGIN veil … # END veil: policy rules, protected paths, `*` when frozen
-  index                    HEAD's tree, skip-worktree on hidden paths (all when frozen)
+  info/attributes          # BEGIN veil … `* -ident` … # END veil (Git expands no $Id$ here)
+  index                    HEAD's tree, skip-worktree on hidden paths (all when frozen), the user's own bits kept
   hooks/pre-push           vl git check-push        (a prior hook → pre-push.veil-chained, run first)
   hooks/pre-commit         vl git check-push --pre-commit
-.veil/.git               empty bare repository: Git treats .veil as nested (git clean -fdx, stash -a skip it)
-.veil/git/colocated.json last HEAD and refs, held commits, index key, skip set, frozen, local-only paths
-.veil/git/colocate.lock  flock serialising follow and mirror between vl processes
+  veil/                    the whole Veil repository (what is `.veil/` elsewhere)
+    repo.json                colocated: {git_dir: ".git"}  (format 5; an older vl refuses the directory)
+    git/colocated.json       last HEAD and refs, owned refs, held commits, index key, skip set, frozen,
+                             local-only paths, the user's hidden paths, exposures, stash findings
+    git/colocate.lock        flock serialising follow and mirror between vl processes
+    local/displaced/         whatever was found at `.veil` instead of the marker (never read)
+.veil -> .git/veil       a marker symlink; nothing reads through it
 ```
+
+**Where the repository lives.** Veil's repository sits *inside Git's own
+directory*. The work tree is Git's to write: `git checkout`, `git pull`,
+`git clean` and `git stash` may write, replace or delete anything there,
+and Git treats an ignored path as expendable. A repository at `.veil`
+could therefore be overwritten by a hostile commit (a forged
+`.veil/local/accepted-policy` pin, BUG-740), replaced by a pulled file
+named `.veil` (BUG-741), or deleted by `git clean -ffdx` (BUG-746), and no
+Git configuration prevents it: a nested-repository decoy stops
+`git clean -fdx` but not `-ffdx` or a checkout, and sparse checkout would
+make Git rewrite every skip-worktree bit Veil sets. Git never checks a
+path out into, cleans or stashes its own directory (`.git` is refused as a
+tree entry by Git itself). So:
+
+* `repo::colocated_state_dir` (`.git` a real directory holding
+  `veil/repo.json`) is checked first by every opener (`ctx::find_root`)
+  and by `DiskBackend::new`, which then maps the engine's own paths
+  (`.veil/…`) to `.git/veil/…` directly: nothing of the repository is ever
+  read or written through the work tree's `.veil`, even while Git is
+  replacing it. Code that builds paths itself uses `repo::state_dir`.
+* `.veil` is only a marker symlink to `.git/veil`, for people and tools.
+  `colocate::ensure_marker` repairs it at every command; anything else
+  there is moved unread into `local/displaced/` (and is skip-worktree in
+  the index if Git tracks it). A missing marker is not put back while the
+  newest stash holds it (`git stash -a` took it), so `git stash pop`
+  works. The exclude line is `/.veil` (no trailing slash: it matches the
+  symlink). `pre-commit` refuses any staged `.veil` path, and a Git
+  checkout that tracks `.veil` cannot be colocated.
+* The cost: `rm -rf .git` now deletes the Veil repository too (the guide
+  says so). `vl git colocate` moves `.veil` in (a user's `.veil` symlink to
+  another disk stays where its data is: `.git/veil` becomes a link to it),
+  `vl git uncolocate` moves it back once the command no longer uses it
+  (`colocate_cmd::finish_uncolocate`), and a project an earlier build left
+  with a real `.veil` is moved by the next command (`colocate::ensure_layout`).
 
 **Follow** (`colocate_cmd::open_session`, from `Ctx::open` before the
 snapshot; `GitBridge::follow_local`):
@@ -3306,7 +3344,11 @@ snapshot; `GitBridge::follow_local`):
    commit is a Veil export).
 3. Tags follow branches (a non-fast-forward move keeps the old target as a
    visible head); a branch deleted in Git deletes its tag unless Veil moved
-   the tag since.
+   the tag since. A branch named like a cloaked tag never moves it.
+   The user's own `skip-worktree` (read at adoption) and `assume-unchanged`
+   bits (`State::user_hidden`, re-read when the index changes) make every
+   snapshot keep those files' recorded entries (`BuildOptions::keep_recorded`)
+   until the user clears the bit; the mirror keeps the bits.
 4. `HEAD` moved: the paths Git manages (stage-0 index entries without
    skip-worktree that Veil did not hide, public plain in the target) keep
    Git's disk content. The others are snapshotted into the old `@` first
@@ -3325,7 +3367,10 @@ snapshot; `GitBridge::follow_local`):
 exported, and `refs/heads/*`, `refs/tags/*` and `HEAD` are written by
 compare-and-swap against what Git last held (`state.refs`; a ref Git moved
 since is skipped and imported by the next command; gix transactions with
-`Fail::Immediately`, so Veil never waits for a Git lock). `HEAD` keeps its
+`Fail::Immediately`, so Veil never waits for a Git lock). Only refs Veil
+owns (`state.owned`: written as a tag's export) are ever deleted: a Git
+branch Veil cannot follow (`issue#12`) or must not (a cloaked tag's name)
+stays, and so does `HEAD` on it. `HEAD` keeps its
 branch while that branch is the export of `@-`, else takes the one tag at
 `@-`, else detaches. **Frozen mode**, every index entry skip-worktree and
 `*` excluded, holds when the workspace or `@` is cloaked, `@` carries an
@@ -3341,14 +3386,43 @@ every command); staged entries of paths Git may see survive while `HEAD`
 stays. The exclude block (`policy_gitignore::policy_lines`: every
 protective rule of the effective and accepted policies, no negation,
 case-folded where Veil matches case-insensitively, braces expanded,
-artefact variants of protected names) is written last, on every command.
+artefact variants of protected names) is written last, on every command,
+with `*` whenever the repository says the working copy is frozen, even if
+the mirror could not run. **Freeze first:** before the working copy is
+moved onto cloaked or embargoed work (`Ctx::finish_working_copy`, and the
+catch-up of a stale directory), `colocate_cmd::before_materialise` freezes
+the index and writes `*`; while Git is busy (an operation in progress,
+`index.lock` held) it cannot, and the move is refused before a file is
+written.
+
+**What precedence cannot do.** Git ranks every `.gitignore` above
+`info/exclude`, and nothing outranks a `.gitignore`, so a negation there
+(`!secrets/`, `!*.md`) un-hides protected paths whatever Veil writes.
+Every mirror looks for negations in the working copy's `.gitignore` files,
+derives a path each would re-include (`policy_gitignore::negation_probes`)
+and asks Git (`git check-ignore --no-index`) about those Veil protects and
+about the protected files on disk; any exposure is reported on every
+command and freezes Git commits (`State::exposed`) until the negation goes.
+Git can still hash such a file on `git add`, or stash it: the guards keep
+it out of commits (`pre-commit`), remotes (`pre-push`, superseding) and,
+after `--prune`, `.git`. Git runs no hook for `git stash`: what a stash
+holds that Veil hides (`GitBridge::stash_findings`) is reported whenever
+the stash changes.
 
 **Gates.** `GitBridge::check_push` walks each pushed ref back to commits
 that are Veil exports or the current commit of their snapshot; a held
 commit, a commit Veil has not imported, and `refs/stash` are refused.
 `GitBridge::check_staged` refuses, in what `$GIT_INDEX_FILE` stages, any
-change while frozen, a hidden path, a path the policy does not make
-public, and public content the scanner flags. The hooks are fixed scripts
+`.veil` path, any change while frozen (decided from the repository as it is
+now, `colocate::freeze_reason`, or an exposure, never from
+`colocated.json` alone), a hidden or local-only path, a path the policy
+does not make public, and public content the scanner flags.
+`vl git colocate --prune` deletes only the reflog entries naming held
+commits (`git reflog delete --rewrite`), then runs `git gc --prune=now`
+with reflog expiry off: stashes and the rest of the reflog are kept.
+`vl git uncolocate` keeps the exclude block and the skip-worktree bits of
+hidden files, lists the protected files, removes the hooks and the
+attributes block, and is refused on frozen work. The hooks are fixed scripts
 written by `vl` (device-local, like the hooks of §15; no repository content
 defines them); `git push --no-verify` is the documented residual hole.
 

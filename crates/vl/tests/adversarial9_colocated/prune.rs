@@ -4,7 +4,6 @@
 use crate::*;
 
 #[test]
-#[ignore = "BUG-743: `vl git colocate --prune` runs `git reflog expire --expire=now --all`: the user's older stashes and reflog-only commits are destroyed"]
 fn bug743_prune_keeps_the_users_stashes_and_reflog() {
     need_git!();
     let env = Env::new();

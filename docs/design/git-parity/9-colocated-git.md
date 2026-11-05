@@ -129,6 +129,57 @@ This runs at the start of every `vl` command, in `Ctx::open` (before the working
     - A 100 000-file index write takes about 100 ms. A hostile `.git` with 1 million refs is the user's own and is not a threat.
     - *Bench:* `vl status` with colocation on a 20 000-file repository stays within 15 % of without.
 
+## Round 9 fix wave: what changed
+
+The round-9 adversarial pass (`docs/BUGS.md`, BUG-740…755) showed that the
+sketch above put Veil's own repository inside Git's work tree, where Git's
+checkout, pull, clean and stash may write, replace or delete it, and that
+Git's ignore precedence lets a tracked `.gitignore` override every line
+Veil writes. The design now says:
+
+* **The repository lives in `.git/veil`** (threats 13, 14, 16; BUG-740,
+  741, 746). Git never checks a path out into its own directory, and
+  never cleans or stashes it. `.veil` is a symlink marker to it, which
+  nothing reads through: every opener and `DiskBackend` find the
+  repository in `.git/veil` first, whatever `.veil` is, and the marker is
+  repaired at every command (anything else there is set aside, unread).
+  Alternatives rejected: Git's sparse checkout (it would rewrite every
+  skip-worktree bit Veil sets, at every checkout, differently across Git
+  versions) and refusing `.veil` paths on import alone (Git writes the work
+  tree before Veil runs). `pre-commit` refuses `.veil` paths, local commits
+  holding one are superseded, and a checkout that tracks `.veil` is not
+  adopted. Cost: `rm -rf .git` deletes the Veil repository (the guide
+  says so).
+* **No protection rests on ignore precedence** (threat 1; BUG-742). A
+  negation in any `.gitignore` is checked at every mirror against what Veil
+  protects (Git is asked, `git check-ignore`); an exposure is reported and
+  freezes Git commits. Git cannot be stopped from hashing or stashing what a
+  negation un-hides; `pre-commit`, superseding, `pre-push` and `--prune`
+  keep it out of commits, remotes and, eventually, `.git`. This residue is
+  documented as a limitation.
+* **Freeze first** (threats 2, 9; BUG-748). Before cloaked or embargoed
+  work is written to disk, the index is frozen and `*` excluded; while Git
+  is busy that cannot happen and the move is refused. The exclude block's
+  `*` and the `pre-commit` decision come from the repository as it is now,
+  not from `colocated.json`.
+* **Veil deletes only what it wrote** (BUG-743, 750, 751). The mirror
+  deletes only refs it owns (exported as a tag); a branch named like a
+  cloaked tag never moves the tag. `--prune` deletes only the reflog
+  entries naming held commits, never a stash.
+* **Leaving and entering are safe** (threat 18; BUG-744, 745).
+  `uncolocate` keeps the exclude block and the skip-worktree bits of hidden
+  files, lists the protected files, and is refused on frozen work. Adoption
+  keeps the user's own skip-worktree and assume-unchanged edits unrecorded
+  until the bit is cleared.
+* **Checkout transforms** (BUG-755): `info/attributes` turns `ident` off
+  in the colocated work tree. Filters (LFS) are not modelled.
+* **After the fact** (BUG-747, 752; threat 8, BUG-754): Git runs no hook
+  for `git stash`, `git bundle` or a checkout overwriting an ignored file.
+  A stash holding hidden content is reported at the next command; the
+  bundle and the overwrite are documented leaks. The skip-worktree entry
+  of threat 8's mitigation is not implemented: it would show the file as a
+  staged new file in `git status`.
+
 ## Open decisions
 
 - **How a cloaked file appears in `.git`.** *Recommendation:* exactly the bridge projection.
