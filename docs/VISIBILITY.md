@@ -9,7 +9,7 @@
 A company keeps its whole codebase in **one repository** on the Veil Hub.
 - **Each folder or file** is public, company-only, or secret, set in `.veilpolicy`.
 - **Public** paths are visible to anyone on the internet, like a public GitHub repository.
-- **Company** paths are visible only to company members. The Hub checks membership before it serves them.
+- **Company** paths are visible only to company members, **or to the groups or people named for that path**. The Hub checks before it serves them.
 - **Secret** paths (`.env` and the like) are the only things that are encrypted. They are synced like any file, and decrypted only on the devices of people and agents who have access. By default that is everyone in the company.
 
 ## The four tiers
@@ -17,7 +17,7 @@ A company keeps its whole codebase in **one repository** on the Veil Hub.
 | Tier | Who can see it | How it's protected | Encrypted? | Example |
 |---|---|---|---|---|
 | **public** | Anyone on the internet | Nothing to protect; served openly | No | `src/`, `README.md`, docs |
-| **company** | Company members only, people and their agents | **The Hub's permission check.** Non-members are never sent these files. | **No.** Plaintext on the Hub, so it can merge, search and blame them. | `internal/`, `billing/`, unreleased features |
+| **company** | Company members only, people and their agents, **optionally narrowed per path to named groups or people** | **The Hub's permission check, per path.** Anyone without access to a path is never sent its files. | **No.** Plaintext on the Hub, so it can merge, search and blame them. | `internal/`, `billing/`, unreleased features |
 | **secret** | Whoever has access to the secret. **By default, the whole company.** | **Encryption.** The Hub stores ciphertext only and never holds the key. | **Yes.** This is the only encrypted tier. | `.env`, `.env.*`, shared API keys, `deploy/keys/` |
 | **isolated** | Only you, on this machine | Never committed, pushed or shared, with anyone or any agent | n/a (it never leaves the machine) | your own `id_rsa`, personal tokens, local overrides, notes |
 
@@ -31,19 +31,29 @@ And, as before, **ignored** paths (`target/`, `node_modules/`) are simply not tr
 ### `.veilpolicy` example
 ```
 # everything not listed is public
-internal/          company
-billing/           company
-.env               secret
-deploy/keys/       secret
-notes/             isolated
+internal/              company                  # everyone in the company
+billing/               company finance          # only the finance group
+research/pricing/      company alice bob        # only these two people
+infra/                 company ops @carol       # the ops group, plus carol
+.env                   secret                   # every company member (the default)
+deploy/keys/           secret ops               # only the ops group
+notes/                 isolated
 ```
+
+### Per-path permissions
+- **`company` with no names** means every company member.
+- **Groups and people.** After `company`, list groups (`finance`, `ops`) and/or people (`alice`, or `@carol`). Groups are defined on the Hub as company teams.
+- **The most specific rule wins,** as for every `.veilpolicy` rule: the last matching rule applies. So `internal/` can be company-wide while `internal/hr/` is limited to `hr`.
+- **Agents inherit their person's access.** An agent running for alice sees what alice sees, unless it's given less.
+- **The same names work for secrets** (`deploy/keys/ secret ops`).
+- **Who can change the policy.** Editing `.veilpolicy` to widen access to a path needs someone who already has access to it **and** the right to manage permissions. The Hub checks this on push, and the accepted-policy pin protects it locally. Otherwise anyone could add their own name.
 
 ## Who gets what
 
 | Reader | public | company | secret | isolated |
 |---|---|---|---|---|
 | Anyone on the internet (no account, or not in the company) | ✅ | ❌ not sent | ❌ not sent | ❌ |
-| A company member, or an agent running for one | ✅ | ✅ plaintext | ✅ decrypted on their device | ❌ (only the owner's) |
+| A company member, or an agent running for one | ✅ | ✅ plaintext, **for paths they have access to**. Other company paths are not sent. | ✅ decrypted on their device, for secrets they have access to | ❌ (only the owner's) |
 | The Hub itself (and anyone who breaches it) | ✅ | ✅ (it serves them) | ❌ ciphertext only | ❌ never has them |
 | A public mirror or remote | ✅ | ❌ withheld on push | ❌ withheld on push | ❌ |
 | An SFTP remote (company-only by nature: only people with SSH access reach it) | ✅ | ✅ | ✅ encrypted | ❌ |
@@ -75,6 +85,11 @@ notes/             isolated
 
 ## Questions to settle in stream V's design (not decided here)
 
-- Is "company" one group, or can there be several (teams, departments) for company-tier paths? Proposed: one `company` group by default, with named groups allowed.
+- **Decided (owner, 2026-11-05):** company paths take per-path groups and individuals (above).
+- **Still open:** how per-path access shows up in history for people without access to a path:
+  - Their copy of a change shows that path as redacted: the name hidden or shown, and the content withheld.
+  - Snapshot signatures must still verify for them (the Hub's per-viewer projection, `HUB.md`).
+  - Proposed: names of paths you can't access are hidden too.
+- **Still open:** what an agent or person without access to `billing/` sees when a change touches both `billing/` and code they can see. Proposed: they see their part, and the change is marked as having parts they can't see.
 - The exact behaviour of an SFTP remote, which has no permission checks. Proposed: treat it as company-only, and refuse to push company paths to a remote marked public.
 - How existing cloaked repositories migrate. Proposed: cloaked paths become secret. A repository can convert code paths from cloaked to company with an explicit command, never silently, because that removes the encryption.
