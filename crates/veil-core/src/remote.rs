@@ -46,7 +46,7 @@
 //!   walks the local graph by generation down to the remote's view (as
 //!   read then), and sends only the snapshots outside its closure; of
 //!   their trees, a subtree with the same id at the same path in a known
-//!   snapshot they build on is skipped ([`Aligned`]). What is sent goes
+//!   snapshot they build on is skipped (the path-aligned diff). What is sent goes
 //!   into packs of at most [`PUSH_CHUNK`] staged in the push's own
 //!   directory on the remote, `incoming/push-<id>/`, which no reader looks
 //!   in, and recorded in the push journal for a retry. Under the lock it
@@ -1451,6 +1451,35 @@ pub(crate) fn select_snapshots(
     Ok(Ok(sel))
 }
 
+/// The snapshots of the committed closure of `refs` (the rule of
+/// [`committed_closure`]: never through a merged-in parent the receiver may
+/// lack) that are on a line building on an embargoed merge
+/// ([`crate::graph_index::FLAG_EMBARGO_LINE`]): those whose tree may be an
+/// embargo wrapper. Reads only those lines.
+fn known_embargo_lines(local: &Repo, refs: &[ObjectId], parent_ok: &mut dyn FnMut(&ObjectId) -> Result<bool>) -> Result<Vec<ObjectId>> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = refs.to_vec();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let Some(e) = local.graph().entry(local, &id)? else { continue };
+        if e.flags & crate::graph_index::FLAG_EMBARGO_LINE == 0 {
+            continue;
+        }
+        let Some(s) = local.snapshot_opt(&id)? else { continue };
+        for (i, p) in s.parents.iter().enumerate() {
+            if i == 0 || s.embargo.is_none() || parent_ok(p)? {
+                stack.push(*p);
+            }
+        }
+        out.push(id);
+    }
+    out.sort();
+    Ok(out)
+}
+
 /// Are all of `candidates` in the committed closure of `refs` (the rule of
 /// [`committed_closure`])? One walk down from `refs`, highest generation
 /// first, which stops below the lowest candidate.
@@ -1948,8 +1977,8 @@ fn publish_lock_options(backend: &dyn StorageBackend) -> crate::lock::LockOption
 ///   every embargo the plan treated as released still is (BUG-807); then
 ///   rename the packs into `objects/pack/` (each `.pack` before its
 ///   `.idx`), merge the metadata and write the operation. If any check
-///   fails, the lock is released and phase A runs again (at most
-///   [`PUBLISH_ATTEMPTS`] times).
+///   fails, the lock is released and phase A runs again (at most three
+///   times).
 ///
 /// [`SyncOptions::full`] keeps the walk of everything, under the lock.
 pub fn push_with(
@@ -2016,7 +2045,21 @@ pub fn push_with(
             }),
         };
         let refs = remote.view().refs();
-        let (report, boundary) = push_incremental(local, &refs, remote.store(), &tips, &withheld, public, report, dest, &inv, opts.chunk)?;
+        let staged_res = push_incremental(local, &refs, remote.store(), &tips, &withheld, public, report, dest, &inv, opts.chunk);
+        let (report, boundary) = match staged_res {
+            Ok(r) => r,
+            Err(e) => {
+                // Refused before anything was staged (a remote too old for
+                // these objects, say): leave the remote as it was.
+                if journal.staged.is_empty() && journal.existing {
+                    let _ = remote_backend.remove_dir_all(&staging_dir(&journal.push_id));
+                    if let Some(p) = &path {
+                        let _ = local_fs.remove_file(p);
+                    }
+                }
+                return Err(e);
+            }
+        };
         if let Some(hook) = &opts.pause_before_lock {
             (hook.0)();
         }
@@ -2577,10 +2620,7 @@ pub(crate) fn push_incremental(
     // embargoed merge can hold one.
     let mut rewalk = Vec::new();
     if public && local.keys().embargoes()?.iter().any(|r| local.keys().embargo_released(&r.id)) {
-        let sent: HashSet<&ObjectId> = sel.send.iter().collect();
-        let mut lines: Vec<ObjectId> = local.graph().embargo_lines_among(local, remote_refs.iter().copied())?.into_iter().collect();
-        lines.sort();
-        for s in lines.iter().filter(|s| !sent.contains(s)) {
+        for s in &known_embargo_lines(local, remote_refs, &mut |p| inv.packed(p))? {
             let tree = store.snapshot(s)?.tree;
             if let Ok(t) = store.tree_object(&tree) {
                 if wrapper_parts(&t).is_some() {
@@ -2939,7 +2979,8 @@ pub fn expire_push_staging(backend: &dyn StorageBackend, now: i64) -> Result<usi
     for (name, t) in names.iter().zip(ages) {
         let dir = incoming_dir().join(name);
         match t? {
-            Some(t) if now - t > PUSH_STAGING_EXPIRY_MS => {
+            // Remote content: any value, never an overflow.
+            Some(t) if now.saturating_sub(t) > PUSH_STAGING_EXPIRY_MS => {
                 backend.remove_dir_all(&dir)?;
                 removed += 1;
             }

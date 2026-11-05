@@ -554,7 +554,7 @@ fn check_push_staging(r: &mut Report, name: &str, backend: &dyn StorageBackend) 
         Err(e) => return r.note(format!("{name}: cannot list its push staging"), &[e.to_string()]),
     };
     let now = now_millis();
-    let old: Vec<_> = staged.iter().filter(|s| s.touched.is_none_or(|t| now - t > DAY_MS)).collect();
+    let old: Vec<_> = staged.iter().filter(|s| s.touched.is_none_or(|t| now.saturating_sub(t) > DAY_MS)).collect();
     if old.is_empty() {
         return;
     }
@@ -562,7 +562,7 @@ fn check_push_staging(r: &mut Report, name: &str, backend: &dyn StorageBackend) 
     let mut lines: Vec<String> = old
         .iter()
         .map(|s| {
-            let age = s.touched.map_or("unknown age".to_string(), |t| format!("{} days old", (now - t) / DAY_MS));
+            let age = s.touched.map_or("unknown age".to_string(), |t| format!("{} days old", now.saturating_sub(t) / DAY_MS));
             format!(".veil/objects/incoming/{}: {} bytes, {age}", s.name, s.bytes)
         })
         .collect();

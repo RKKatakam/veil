@@ -656,9 +656,12 @@ fn only_week_old_staging_is_removed() {
     plant("1h0000000000000000000000000000ab", Some(3600 * 1000));
     plant("000000000000000000000000000000ab", Some(0));
     plant("unknown0000000000000000000000ab", None);
+    // Hostile values from the remote are just old or unreadable.
+    let hostile = p(".veil/objects/incoming/push-ffff0000000000000000000000000000");
+    hub.write(&hostile.join("touched"), i64::MIN.to_string().as_bytes()).unwrap();
     let mut r = Repo::open_remote(hub.clone()).unwrap();
     let g = gc(&mut r, &GcOptions::default()).unwrap();
-    assert_eq!(g.push_staging_removed, 1);
+    assert_eq!(g.push_staging_removed, 2, "the week-old one and the hostile one");
     let mut left = staging(&hub);
     left.sort();
     assert_eq!(left, ["push-000000000000000000000000000000ab", "push-1h0000000000000000000000000000ab", "push-unknown0000000000000000000000ab"]);
