@@ -43,7 +43,7 @@ What Anthropic tried and dropped:
 Caveats from the post:
 - Scion is "by no means a suitable replacement for git for general use". It is built for one very large monorepo. Veil must stay good at the ordinary, Git-sized case and not take on Scion's always-online assumptions by default.
 - "What we learned building Scion": agents "will sometimes violate core system constraints", and engineers had to "steer Claude away from over-engineering parts of the system". Often "the role of the engineers was to tell Claude 'no.'" Anthropic "makes extensive use of adversarial review", but one such review "was overly defensive about trusting another internal service". For Veil: adversarial passes stay, but a finding that asks for defence against a component Veil already trusts by design needs a stated threat before it is built.
-- The post does not cover agent attribution, sandboxes, resource limits, offline work, latency, cache sizes or Git migration. Veil's items for those (4.6, 4.7) are Veil's own designs, not taken from Scion.
+- The post does not cover agent attribution, sandboxes, resource limits, offline work, latency or cache sizes. Veil's items for those (4.6, 4.7) are Veil's own designs, not taken from Scion.
 
 ## What Veil already has
 Veil already has about half of Scion's foundations. The missing half is the server.
@@ -84,7 +84,6 @@ Goal: a repository never needs repacking or a stop-the-world `gc`, and any cache
 | 2.3 | Layered caches | A daemon on each machine, a regional cache, the server. Objects are addressed by hash, so the caches never need to coordinate. | Caches hold only encrypted data, so they're safe to share |
 | 2.4 | Daemon on each machine | One cache shared by every agent on the machine, so 30 agents fetch each object once | Same; keys stay inside each agent's process |
 | 2.5 | Large files | Files are split into chunks by content, so editing a 2 GB file uploads only the changed chunks | Each chunk is encrypted separately |
-| 2.6 | Importing large Git repos | Import a big Git repo into the object store as a stream, without loading it into memory (today's import is `vl git import` via `gix`) | Not applicable |
 
 ## 3. Server queries and precomputed indexes
 Goal: history questions are answered in milliseconds without a checkout. Encryption hurts most here, because the server can't index what it can't read.
@@ -141,7 +140,7 @@ Goal: people review what a change is for rather than every line, and the team ca
 ## Roadmap
 Phase 0 fits alongside the current 1.0 work and makes today's remote handle concurrent pushes. Each later phase depends on the one before it.
 
-1. **Phase 0: Veil 1.0 client and SFTP remote (now).** Lock-free writes on SFTP (1.7), lock-free op log (1.3), history index (3.2), scale benchmark (6.6), background cleanup instead of whole-store `gc` (2.2), streaming Git import (2.6).
+1. **Phase 0: Veil 1.0 client and SFTP remote (now).** Lock-free writes on SFTP (1.7), lock-free op log (1.3), history index (3.2), scale benchmark (6.6), background cleanup instead of whole-store `gc` (2.2).
    - *Gate:* the benchmark shows no waiting on the lock and no commands that walk the whole history.
 2. **Phase 1: Hub core.** Object store on S3 (2.1), compare-and-swap branch moves (1.2), lock-free uploads (1.1), resumable pushes (1.5), few branches (1.6), layered caches (2.3), query API (3.5), large-file chunking (2.5).
    - *Gate:* 50 simultaneous pushes land in about the time of the slowest upload.

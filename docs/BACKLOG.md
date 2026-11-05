@@ -11,9 +11,8 @@ fixed**. Severity: high / medium / low.
 > Its **phase 0** belongs here, in the scale round after Git parity:
 > lock-free SFTP writes (pack first, lock only for the branch update),
 > a lock-free op log, a history (commit-graph) index, the scale
-> benchmark (including a mostly-cloaked profile), background cleanup
-> instead of whole-store `gc`, and streaming Git import. Phases 1–4 are
-> Hub work.
+> benchmark (including a mostly-cloaked profile) and background cleanup
+> instead of whole-store `gc`. Phases 1–4 are Hub work.
 
 ### Agent workspaces and scale
 - **Copy-on-write file clones for project-directory checkouts** (`vl ws
@@ -31,22 +30,12 @@ fixed**. Severity: high / medium / low.
     history;
   - concurrent op-log merging instead of one repository lock.
 
-### Gaps compared with Git and GitHub (core, before the Hub)
-- **Colocated Git mode: experimental.** Shipped behind `--experimental`
-  (`vl init --colocate`, `vl git colocate`; `docs/guide/colocated-git.md`).
-  Left before it loses the flag: a dedicated adversarial pass, the
-  Git-version matrix on 2.25 / 2.39 / latest and on macOS (tested with Git
-  2.53 on Linux only), `vl serve`'s watch loop following Git, local Git tags
-  imported as release tags (Git-side tags are not followed yet), and the
-  skip-worktree entry for excluded paths present in other exported commits
-  (design threat 8).
+### Gaps compared with Git (core, before the Hub)
 - **Missing everyday commands:** `archive` (tarball of a snapshot).
 - **Directory-rename detection in merges** (Git's `ort`: a file added on one
   side inside a directory the other side renamed goes to the new
   directory). Merges follow file renames, not directory renames.
 - **Non-UTF-8 names** are not recorded.
-- **Git bridge gaps:** author time zones become UTC; Veil does not sign Git
-  tags (GitHub shows release tags unverified).
 - **Windows** support.
 - **Maturity:** days of history versus Git's two decades; unaudited; no
   community, tutorials or Stack Overflow answers yet.
@@ -126,9 +115,6 @@ fixed**. Severity: high / medium / low.
   upgrade stays under the pre-standard construction (`docs/CRYPTO.md` §5).
 - **The policy pin does not forget an accepted weakening** when a teammate
   later reverts it (only dropped `public!` rules are forgotten).
-- **Author time zones** are exported to Git as UTC.
-- **Git maps from before the BUG-063 fix** carry no embargo "veil" for
-  imported commits; delete `.veil/git/map` once to rebuild it.
 - **SFTP lease renewals can stall on slow uplinks** (below roughly 4 Mbit/s,
   behind large pack writes), fencing the push; a per-operation in-flight cap
   would fix it.

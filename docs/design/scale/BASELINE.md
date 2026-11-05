@@ -208,8 +208,7 @@ Each entry gives the operation, its cost at 1 GB, the cause (located in the code
 - **Profiles:**
   - `5g` (the script is ready: `scripts/bench-scale.sh 5g`, only when nothing else builds; it refuses while `cargo` or `rustc` runs, unless `FORCE=1`);
   - `cloaked-1g` (`scripts/bench-scale.sh 1g --cloaked`);
-  - the 4×-history twin `1g-h4`;
-  - `git-100k` with `vl git import`.
+  - the 4×-history twin `1g-h4`.
 - **Cases:**
   - a 200 MB binary push;
   - `rebase`;

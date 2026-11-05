@@ -41,7 +41,7 @@ rename to src/billing/price.rs
 | `--no-renames` | Show a deletion and an addition instead |
 
 Renames are computed when you look, never stored: nothing in a snapshot,
-the operation log, a remote or the Git export records them. In `--json`,
+the operation log or a remote records them. In `--json`,
 a renamed file has `"status": "renamed"`, `from` and `score`
 ([JSON reference](../reference/json.md#change)).
 

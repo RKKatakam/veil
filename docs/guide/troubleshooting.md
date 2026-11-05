@@ -8,7 +8,7 @@ machine and the repository and explains what it finds.
 * [Secrets and policy](#secrets-and-policy)
 * [Cloaking and keys](#cloaking-and-keys)
 * [History, tags and revisions](#history-tags-and-revisions)
-* [Remotes and Git](#remotes-and-git)
+* [Remotes](#remotes)
 * [The working copy and the filesystem](#the-working-copy-and-the-filesystem)
 * [Locks, crashes and integrity](#locks-crashes-and-integrity)
 * [FAQ](#faq)
@@ -67,7 +67,7 @@ until then.
 ### `warning: N matching file(s) already exist in plaintext in earlier snapshots (e.g. X). New snapshots are protected; rotate any secrets they contain.`
 
 You cloaked or isolated a path that was already recorded in plaintext.
-Older snapshots (and any remote or Git repository they were pushed to)
+Older snapshots (and any remote they were pushed to)
 still contain it. Rotate the secrets.
 
 ### A rule in `.veilpolicy` behaves like `isolate`
@@ -164,7 +164,7 @@ before using `--force`.
 `vl commit` moves tags that pointed at the parent; `vl merge` moves tags at
 the change merged into. Put it back with
 `vl tag set main -r REV --allow-backwards`, or `vl undo`. See
-[the pitfalls](coming-from-git.md#pitfalls).
+[Tags](getting-started.md#tags).
 
 ### `error: moving tag 'main' would go backwards or sideways (use --allow-backwards)`
 
@@ -218,7 +218,7 @@ embargo the second fix on a separate line. See
 `--until` takes a future time: `+7d`, `+12h`, `2026-12-01`,
 `2026-12-01T09:00:00Z`. To publish now, `vl embargo release ID`.
 
-## Remotes and Git
+## Remotes
 
 ### `rejected main (remote has diverged: not a fast-forward)` / `error: 1 tag was rejected (main): origin has changes you don't have. …`
 
@@ -238,35 +238,7 @@ tag (`vl push -t T`), the push fails with
 The pull updated `origin/main` but left your `main` alone. Merge, then
 push.
 
-### `rejected main ([rejected] (fetch first))` / `error: 1 tag was rejected (main): origin has commits you don't have. …`
-
-The Git branch moved on GitHub. `vl git pull`, `vl merge origin/main`,
-`vl git push`. The other branches were pushed; the push exits 1.
-`vl git push --force` overwrites only what you last fetched.
-
-### `warning: origin/B was force-pushed on the Git side (…); the Veil history it dropped is kept`
-
-Someone rewrote the branch on GitHub. Your tags didn't move. Decide what you
-want, then `vl tag set B -r … --allow-backwards` and push, or merge.
-
-### `not recorded X (…; it stays in Git)`
-
-A file in a Git commit was refused at import (a committed `.env`, a file
-with a secret, a symlink, a submodule). Veil doesn't record it, and it is
-not deleted from Git by later pushes. Remove it from Git yourself if it is
-a leaked secret, and rotate the secret.
-
-### `could not run git for fetch: … (is git installed? set VEIL_GIT to its path)`
-
-`vl git` runs the `git` binary. Install Git or point `VEIL_GIT` at it.
-
-### Commits on GitHub show `alice <>`
-
-Veil exports the author it recorded. Set
-`VEIL_USER="Name <email>"` before creating changes. See
-[Credentials and authorship](github.md#credentials-and-authorship).
-
-### A file disappeared on GitHub or the public mirror
+### A file disappeared on the public mirror
 
 It was cloaked by policy (`vl cloak`, or a `cloak` rule in `.veilpolicy`)
 and that change reached a pushed tag: to the public, a cloaked file is
@@ -506,9 +478,9 @@ Reword it with `vl describe -r @- -m …`.
 Everything else is in the operation log: `vl op log`, `vl op restore ID`.
 
 **Can I use Veil and Git in the same directory?** Veil never records
-`.git/` (see above), but both tools would track the same files. Prefer
-`vl git import` in a separate directory and push to GitHub with
-`vl git push`.
+`.git/` (see above), but both tools would track the same files, and Veil
+does not interoperate with Git: it imports, exports and syncs nothing with
+it.
 
 **Is my `.env` safe?** It's never recorded or pushed, by any command,
 unless a policy you accepted says `cloak` (encrypted for a scope) or

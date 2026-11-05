@@ -116,8 +116,8 @@ Phase B costs about `6 + 2 × packs` round trips. For a 1 GiB push in 32 MiB chu
 14. **Memory.** The in-memory `PackBuilder` buffer and `Vec` of pending objects go away.
     - *Invariant:* push peak RSS is bounded by the chunk size plus the delta window, not by the push size.
     - *Test:* item 9's gate (peak RSS ≤ 512 MiB pushing the 5 GB profile).
-15. **Interaction with hooks, the Git bridge and colocated mode.**
-    - *Invariant:* `pre-push` hooks (`hooks.rs`) run before phase A, as now. `vl git push` (Git transport) is untouched. `vl git check-push` in colocated mode is unaffected.
+15. **Interaction with hooks.**
+    - *Invariant:* `pre-push` hooks (`hooks.rs`) run before phase A, as now.
     - *Test:* the existing hook test: a hook that refuses stops the push before anything is staged (`incoming/` stays empty).
 
 ## Open decisions

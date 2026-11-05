@@ -53,8 +53,8 @@ stored at   /home/alice/.config/veil/identity.json
   identity is created: `vl identity new --name "Alice Doe"`.
 
 **The author recorded on snapshots** is `$VEIL_USER` if set, else the
-identity's name. Git only gets an email address if that author has one, so
-if you push to GitHub, set it in your shell profile before you start:
+identity's name. To record an email address with it, set it in your shell
+profile before you start:
 
 ```sh
 export VEIL_USER="Alice Doe <alice@example.com>"
@@ -89,7 +89,6 @@ It also records whatever is already in the directory, except secrets: a
 
 To work on an existing Veil repository, `vl clone` it rather than running
 `vl init` (see [Teams and remotes](teams-and-remotes.md#onboarding-a-teammate)).
-To start from a Git repository, see [Using Veil with GitHub](github.md).
 
 ## No staging: every command snapshots
 
@@ -196,8 +195,8 @@ main: yltznuyx 53414202 Greet the world
   that pointed at the change merged into. Pulls fast-forward tags.
 * Nothing else moves a tag. `vl tag set` refuses to move one backwards or
   sideways unless you pass `--allow-backwards`.
-* `vl tag set NAME --cloak [SCOPE]` makes a tag that public remotes and Git
-  never see.
+* `vl tag set NAME --cloak [SCOPE]` makes a tag that public remotes never
+  see.
 
 ## Change ids and snapshot ids
 
@@ -321,7 +320,7 @@ take the access back with `vl scope revoke team 7f3a…` (until you push, nobody
   operation too, because it records `origin/main` and the other remote
   tags; undoing it only takes back what this repository remembers about the
   remote, never the push itself. An **embargo
-  release** can be undone only until your next push or Git export; after
+  release** can be undone only until your next push; after
   that `vl undo` refuses it ([Embargoes](embargoes.md#the-workflow)).
 
 Other ways to reshape history:
@@ -508,11 +507,10 @@ other way round), then delete the moved-aside copy.
 | `-R, --repository PATH` | Use the repository at `PATH` instead of searching upward from the current directory |
 | `--no-snapshot` | Don't record the working copy before the command |
 | `VEIL_HOME` | Where your identity lives (default `$XDG_CONFIG_HOME/veil` or `~/.config/veil`) |
-| `VEIL_USER` | Your name on new changes (`Name <email>` gives Git an email) |
-| `VEIL_GIT` | The `git` binary used by `vl git` |
+| `VEIL_USER` | Your name on new changes (`Name <email>` records an email too) |
 | `VEIL_SSH` | The `ssh` command used for SSH remotes |
 | `VEIL_FS_FOLDING` | Override the detected filename case/Unicode folding (see the README's platform notes) |
 | `VEIL_MAX_OBJECT` | Largest object a pack may hold when read (default `4G`; a larger declared size is refused as damaged or hostile) |
 | `NO_COLOR` | Disable colours (they are off anyway when output is not a terminal) |
 
-Next: [Coming from Git](coming-from-git.md).
+Next: [Secrets and visibility](secrets-and-visibility.md).

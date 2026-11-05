@@ -10,7 +10,7 @@ Status: harness built (`crates/veil-bench`, `scripts/bench-scale.sh`); the 1 GB 
 - **One binary**, `veil-bench`:
 
 ```text
-veil-bench gen     --profile small|1g|5g|cloaked-1g|git-100k --seed N --out DIR
+veil-bench gen     --profile small|1g|5g|cloaked-1g --seed N --out DIR
 veil-bench run     --profile … --vl target/release/vl [--rtt 2,50] [--bandwidth 4M] [--agents 1,4,16,32] [--only CASE…]
 veil-bench report  RESULTS.json… > docs/design/scale/BENCH.md (appends a dated section)
 ```
@@ -26,7 +26,6 @@ veil-bench report  RESULTS.json… > docs/design/scale/BENCH.md (appends a dated
 | `1g` | 1 GB | 35,000 | 10,000 snapshots, a merge every 50, 20 tags | 70 % synthetic source (zstd ratio about 4), 20 % JSON/YAML, 10 % incompressible binaries of 100 KB–20 MB |
 | `5g` | 5 GB | 150,000 | 20,000 snapshots | as `1g`, plus 4 binaries of 200–400 MB (the large-file paths) |
 | `cloaked-1g` | 1 GB | 35,000 | 10,000 snapshots | 85 % of files under `cloak` rules for scopes `a` and `b`; one cloaked line; one unreleased embargo whose fix line has 50 snapshots; isolated `.env` files |
-| `git-100k` | 300 MB | 10,000 | a Git repository of 100,000 commits written with `git fast-import` | for `vl git import` |
 
 - **Directory shape:** fan-out of about 20 and depth up to 8, with file sizes log-normal around 30 KB.
 - **Edits per snapshot:** 1–20 files, with renames and deletions at about 2 %.
@@ -47,7 +46,6 @@ veil-bench report  RESULTS.json… > docs/design/scale/BENCH.md (appends a dated
 - **`pull`** of 1 snapshot.
 - **`ws exec`**: sparse (`--only`) create and record, and a full sandbox create.
 - **`ws switch`** between two workspaces whose trees differ by 200 MB.
-- **`git import`** of `git-100k`.
 
 **The remote** is the local OpenSSH `sftp-server` behind the RTT shim of `crates/veil-core/tests/sftp_support`, copied into the bench crate. It adds a bandwidth cap (`--bandwidth`, token bucket) for the slow-uplink lease case. RTTs are 2 ms and 50 ms.
 
@@ -81,7 +79,7 @@ veil-bench report  RESULTS.json… > docs/design/scale/BENCH.md (appends a dated
    - snapshot decodes on `1g-h4` are at most `1.2 × (decodes on 1g) + 50`;
    - and the trace has no `walk` event visiting more than 10 % of the history.
    - **Exempt:** `log` with no limit; `log -S`/`-G` without a path or limit; `::X` revsets; `fsck`; gc's prune task; `push`/`pull --full`; `agent()` filters; `blame` of a file as old as the history (bounded by the file's own history).
-3. **Memory.** Peak RSS is at most 512 MiB for every case on `5g`, except `git import` (1 GiB) and `clone --full` (512 MiB plus the in-flight window).
+3. **Memory.** Peak RSS is at most 512 MiB for every case on `5g`, except `clone --full` (512 MiB plus the in-flight window).
 4. **No regression.** Every case on `small` stays within 10 % of the baseline's time; a known trade-off has to be written into BENCH.md.
 
 ### Disk (the hard constraint)

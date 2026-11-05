@@ -11,7 +11,7 @@ Status: design and threat review (Scion 1.3). **Requires format 6** (`PLAN.md` Â
 - sealing;
 - then the auto-rebase (`Transaction::rebase_descendants`) and the confinement check.
 
-So N agents recording N sandboxes queue on one file. `ws exec` recordings fail after the 15 s local wait (BUG-551), `vl watch` and a mount's timer contend with every command, and a long `vl git import` blocks the repository for its whole run.
+So N agents recording N sandboxes queue on one file. `ws exec` recordings fail after the 15 s local wait (BUG-551), `vl watch` and a mount's timer contend with every command, and a long pull blocks the repository for its whole run.
 
 The lock does real work today, and each of these jobs needs a replacement:
 1. **Serialising `op_head`.** It is the only mutable pointer of the log. A transaction's view is "the head's view plus my changes".
@@ -148,7 +148,7 @@ Format 6 adds `Operation::workspace: Option<String>`: the workspace the command 
 13. **Ancestry after pruning.** `gc --keep-ops-days` removes the operations that link two heads.
     - *Invariant:* an unknown op ancestry counts as "not an ancestor", which costs a harmless extra merge and never drops a head.
     - *Test:* prune, then commit concurrently. Both commits are in the merged view.
-14. **A transaction outlives gc's grace period.** A long `git import` or a slow sandbox recording references an object that became unreachable meanwhile, and gc deletes it after the grace period.
+14. **A transaction outlives gc's grace period.** A long pull or a slow sandbox recording references an object that became unreachable meanwhile, and gc deletes it after the grace period.
     - *Invariant:* a transaction older than half the grace period freshens (`ObjectStore::has`) every pre-existing object its new trees reference before it publishes.
     - *Test:* `SimClock`: start a transaction, run gc twice across 61 minutes with the object unreachable, then commit. The object is present, and `fsck` passes.
 15. **Concurrent writes to a key ring or the vault** now race transactions instead of being serialised with them.
@@ -157,11 +157,10 @@ Format 6 adds `Operation::workspace: Option<String>`: the workspace the command 
 16. **Features that relied on the lock:**
     - **sandboxes:** step 7's recording no longer waits for the lock (the BUG-551 failure goes away);
     - **mounts:** they record through `snapshot_workspace_with` and follow the workspace, both unchanged;
-    - **colocated Git:** `colocate::follow` used to run under the repository lock. It now runs under `colocate.lock` plus the attached workspace's working-copy lock, and the mirror's ref writes are compare-and-swap, as already designed;
     - **`vl serve` / `vl watch`:** `Repo::reload` merges heads.
 
     - *Invariant:* each keeps its existing guarantee with the lock removed.
-    - *Test:* the existing mount, sandbox, colocate and serve suites, plus one interleaving test each: a mount timer racing `vl commit`; `ws exec` recording racing `vl rebase` of its base; `colocate::follow` racing `vl tag set`.
+    - *Test:* the existing mount, sandbox and serve suites, plus one interleaving test each: a mount timer racing `vl commit`; `ws exec` recording racing `vl rebase` of its base.
 17. **The embargo release staged in `.veil/local/releases/`** is outside the view.
     - *Invariant:* unchanged: undo and redo never release, and a 3-way undo of a release operation is refused as today.
     - *Test:* `embargo_release.rs`: run the release-undo cases with a concurrent commit.
@@ -181,5 +180,5 @@ Format 6 adds `Operation::workspace: Option<String>`: the workspace the command 
    - jj undoes the last operation globally, which under agents is almost never what the human meant.
 4. **When to merge.**
    - *Recommendation:* writers merge right after they publish (`settle`); readers merge in memory. Nothing merges in the background.
-5. **Whether pull and git import should stage packs, not loose objects.**
+5. **Whether pull should stage packs, not loose objects.**
    - *Recommendation:* yes for more than 256 objects (pull already packs), as item 4 specifies.

@@ -1,7 +1,7 @@
 # Veil 1.0.0 release checklist
 
 1.0.0 means **stable for the owner and their team on Linux and macOS**, with
-GitHub as the public mirror and SSH/SFTP or path remotes for closed content,
+SSH/SFTP or path remotes (team and public),
 and a repository format that later versions will always read. It does
 **not** mean audited or ready for the general public; that follows
 dogfooding and a human security review.
@@ -34,7 +34,6 @@ gates below hold.
 - [ ] Rename detection in `diff` and `log`.
 - [ ] Cherry-pick / duplicate.
 - [ ] Symlinks; line endings and per-path attributes (binary, CRLF).
-- [ ] Git tags synced by the Git bridge (GitHub releases).
 
 ## Release mechanics
 
@@ -48,12 +47,12 @@ gates below hold.
       first real macOS run; fix what it finds).
 - [ ] Tag `v1.0.0`: release binaries, installer, Homebrew formula
       (`docs/RELEASING.md`).
-- [ ] Veil hosts itself: this repository moved onto Veil, mirrored to GitHub.
+- [ ] Veil hosts itself: this repository moved onto Veil.
 
 ## Deferred to 1.1 and later
 
-Colocated Git mode (a real `.git` beside `.veil`, so IDEs and Git tools keep
-working) as 1.1's headline; Windows; partial and sparse clones; content-defined
-chunking for large files; first-class conflicts; `bisect`, hooks, submodules,
-signed tags, `grep`, `archive`, patch export/import; the Veil Hub
-(`docs/HUB.md`).
+Windows; partial and sparse clones; content-defined chunking for large files;
+first-class conflicts; `bisect`, hooks, signed tags, `grep`, `archive`; the
+Veil Hub (`docs/HUB.md`). Never: Git interop (no import, export, sync,
+colocation, submodules, Git file formats or Git-format patches; owner
+decision, 2026-11-05).

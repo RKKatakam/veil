@@ -301,7 +301,7 @@ this command found.
 | `nested` | array of strings | Directories that are repositories of their own; nothing in them is recorded here |
 | `redacted` | array | Files of `@` that are absent on disk because you cannot read them: `path`, `redaction` (a [redaction](#redaction)) and `tier` (`redacted`, or for `unwritable` the file's own [tier](#tier)) |
 | `conflicts` | array | Unresolved conflicts: `path`, `recorded_on` (string or null: the short change id of the parent, a merge, that recorded it with the same version; null if recorded on `@` itself) and `conflict` (a [conflict](#conflict), or null for markers in the file) |
-| `renormalizable` | array of strings | Omitted when empty. Files that still hold their recorded version, but whose line endings `.gitattributes` would now convert: `vl renormalize` re-records them (changing `.gitattributes` alone never does) |
+| `renormalizable` | array of strings | Omitted when empty. Files that still hold their recorded version, but whose line endings `.veilattributes` would now convert: `vl renormalize` re-records them (changing `.veilattributes` alone never does) |
 
 ## `veil.log/1`
 
@@ -671,7 +671,7 @@ A copy:
 ## `veil.attr-check/1`
 
 `vl attr check PATH… --json`: the attributes that apply to each path, read
-from the working copy's `.gitattributes` files and the device-local
+from the working copy's `.veilattributes` files and the device-local
 `.veil/local/attributes` (as `git check-attr -a`), and what Veil does with
 them. The paths need not exist.
 
