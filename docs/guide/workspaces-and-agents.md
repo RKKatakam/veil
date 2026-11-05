@@ -55,6 +55,33 @@ there. Each workspace keeps its own unrecorded edits whatever you undo or
 redo; an undo that would delete a workspace holding recorded edits (undoing
 its `vl ws new`) is refused.
 
+**Undo with agents at work.** In a repository at format 6 (`vl upgrade`),
+commands never wait for each other: each records its operation without
+taking the repository lock, and operations that ran at the same time are
+merged by the next command. Undo then belongs to the workspace you run it
+in: `vl undo` in the project directory undoes your last command there (or
+a repository-wide one: tags, push, pull, remotes), never an agent's
+`vl ws exec agent` or `vl ws write agent`, and keeps whatever the agents
+did since. It reverts only what that command changed (a 3-way revert).
+`vl undo --op ID` undoes one operation from `vl op log` (an agent's, say),
+again keeping everything since. `vl op restore ID` puts the whole
+repository back to an earlier operation; if other workspaces recorded work
+after it, it lists their operations and refuses unless you pass `--force`
+(their work stays in the op log either way).
+
+When two commands change the same thing at the same time (both move one
+tag, or one workspace), one change wins, the other target stays a visible
+change, and the next command says so once: `warning: tag 'main' was moved
+by concurrent commands; kept 1a2b3c4d, and the other target stays a
+visible change`. A rewrite made at the same time as a new change on top of
+the rewritten one (an amend while an agent commits on it) moves the new
+change onto the rewritten one, as a single command would. A rewrite that
+would move a change out of an unreleased embargo the other command had put
+it in is not applied (`warning: a concurrent rewrite of change … was not
+applied`), so nothing leaves an embargo through concurrency. `vl op heads`
+lists the heads of the operation log: one, or several just before a
+command merges them.
+
 In revisions, `NAME@` is a workspace's working copy: `vl diff -r agent@`,
 `vl merge agent@`, `vl show fix-cve@`. In `vl log`, `agent@` marks it.
 
@@ -505,8 +532,9 @@ repo.set_tag("agent-result", snapshot, None, false)?;
   they are carried over unchanged in what it records.
 * `report` (a `BuildReport`) lists what was quarantined, isolated or
   held back, as `vl status` would.
-* Writes go through the repository lock, so the agent and your `vl`
-  commands can run at the same time.
+* The agent and your `vl` commands can run at the same time: at format 6
+  nothing waits for a lock, and concurrent operations are merged; below
+  format 6 writes go through the repository lock.
 * Both examples are compiled and run by
   `crates/vl/tests/cli_workspaces/guide_library.rs`.
 

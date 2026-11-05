@@ -18,4 +18,5 @@ mod graph_index_props;
 mod hostile_labels_props;
 mod policy_fold_props;
 mod team_vault_props;
+mod oplog_merge;
 mod undo_redo_props;

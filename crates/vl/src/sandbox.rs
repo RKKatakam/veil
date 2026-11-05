@@ -452,6 +452,28 @@ fn finish(
     kept: Option<&[VPath]>,
 ) -> Result<()> {
     let p = m.pending.clone().expect("a pending run");
+    // One recorder of the workspace at a time, and its operations are the
+    // workspace's (`vl undo` there undoes them).
+    let _wc = veil_core::lock::WcLock::acquire(&veil_core::repo::state_dir(&ctx.root), name)?;
+    let attached = ctx.repo.command_workspace().map(str::to_string);
+    ctx.repo.set_command_workspace(Some(name.to_string()));
+    let res = finish_recording(ctx, name, paths, m, cache, fs, injection, kept, p);
+    ctx.repo.set_command_workspace(attached);
+    res
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_recording(
+    ctx: &mut Ctx,
+    name: &str,
+    paths: &SandboxPaths,
+    m: &mut Manifest,
+    cache: &mut StatCache,
+    fs: &SandboxFs,
+    injection: Option<&core::Injection>,
+    kept: Option<&[VPath]>,
+    p: Pending,
+) -> Result<()> {
     let store = ctx.repo.store().clone();
     let synced = m.tree.ok_or_else(|| anyhow!("the sandbox's manifest names no tree"))?;
     let set = m.only_set()?;

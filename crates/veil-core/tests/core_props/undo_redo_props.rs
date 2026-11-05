@@ -175,3 +175,76 @@ proptest! {
         }
     }
 }
+
+/// What actor 1 (the `default` workspace) sees: its working copy and the
+/// tags (only actor 1 sets tags).
+fn actor1_state(repo: &Repo) -> (ObjectId, std::collections::BTreeMap<String, ObjectId>) {
+    (wc(repo), repo.view().tags.iter().map(|(n, t)| (n.clone(), t.target)).collect())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 64, failure_persistence: None, ..ProptestConfig::default() })]
+
+    /// The lock-free op log (format 6, threat 11): a second actor commits in
+    /// its own workspace between actor 1's commands. Undo and redo in
+    /// `default` follow the jj model for actor 1 (its working copy and the
+    /// tags), and never take back one of actor 2's commits.
+    #[test]
+    fn two_actor_undo_keeps_other_work(steps in prop::collection::vec((step(false), any::<bool>()), 1..20)) {
+        let mut repo = Repo::init(Arc::new(MemoryBackend::new()), Some(Identity::generate("alice")), "alice").unwrap();
+        let root = repo.root_id();
+        // Actor 2's workspace is its own (`vl ws new agent`, run there).
+        repo.set_command_workspace(Some("agent".into()));
+        repo.create_workspace("agent", vec![root], None).unwrap();
+        repo.set_command_workspace(Some(WS.into()));
+        let mut history = vec![actor1_state(&repo)];
+        let mut redo = Vec::new();
+        let mut agent_files: Vec<String> = Vec::new();
+        for (i, (s, agent_works)) in steps.iter().enumerate() {
+            if *agent_works {
+                // Actor 2, in its own workspace (its own `vl ws exec`).
+                repo.set_command_workspace(Some("agent".into()));
+                let ov = repo.workspace_overlay("agent").unwrap();
+                let name = format!("agent-{i}.txt");
+                ov.write(&VPath::new(&name).unwrap(), b"agent\n").unwrap();
+                // Recorded, not committed: a commit would advance a tag of
+                // actor 1's on the same parent, which is not this property.
+                repo.snapshot_workspace("agent", &ov).unwrap();
+                agent_files.push(name);
+                repo.set_command_workspace(Some(WS.into()));
+            }
+            match s {
+                Step::Undo => {
+                    let r = repo.undo_keeping_edits(WS);
+                    if history.len() > 1 {
+                        prop_assert!(r.is_ok(), "step {i} {s:?}: {:?}", r.err());
+                        redo.push(history.pop().unwrap());
+                    } else {
+                        prop_assert!(r.is_err(), "step {i}: undid past the start ({:?})", r.ok());
+                    }
+                }
+                Step::Redo => {
+                    let r = repo.redo_keeping_edits(WS);
+                    match redo.pop() {
+                        Some(v) => {
+                            prop_assert!(r.is_ok(), "step {i} {s:?}: {:?}", r.err());
+                            history.push(v);
+                        }
+                        None => prop_assert!(r.is_err(), "step {i}: redid with nothing to redo"),
+                    }
+                }
+                _ => {
+                    if command(&mut repo, s, i) {
+                        history.push(actor1_state(&repo));
+                        redo.clear();
+                    }
+                }
+            }
+            prop_assert_eq!(&actor1_state(&repo), history.last().unwrap(), "actor 1 after step {} ({:?}) of {:?}", i, s, steps);
+            let agent_tree = repo.snapshot(&repo.workspace_wc("agent").unwrap()).unwrap().tree;
+            for f in &agent_files {
+                prop_assert!(lookup(repo.store(), &agent_tree, &VPath::new(f).unwrap()).unwrap().is_some(), "actor 2's {} was undone at step {} of {:?}", f, i, steps);
+            }
+        }
+    }
+}

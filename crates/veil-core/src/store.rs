@@ -116,6 +116,9 @@ pub struct ObjectStore {
     needs_recovery: AtomicBool,
     /// Repository format: decides the tree encoding written and accepted.
     format: AtomicU32,
+    /// The transaction staging directory new loose objects go to (format 6,
+    /// see [`ObjectStore::begin_tx_staging`]).
+    tx: Mutex<Option<TxStaging>>,
     /// This device's diff and merge drivers (`.veilattributes` only names
     /// them; see [`crate::attributes::DeviceDrivers`]).
     drivers: RwLock<Option<Arc<dyn crate::attributes::DeviceDrivers>>>,
@@ -145,6 +148,28 @@ fn is_hex(s: &str) -> bool {
 /// ([`Staged::overflowed`]): a snapshot with more new content than this is
 /// built under the repository lock, as before.
 pub const STAGING_BUDGET: usize = 32 << 20;
+
+/// A transaction's staging directory (format 6): `<root>/incoming/tx-<owner>`.
+#[derive(Debug)]
+struct TxStaging {
+    dir: VPath,
+    /// The owner tag (`lock::Owner`), also naming a pull's spool.
+    owner: String,
+    /// Objects written there.
+    staged: HashSet<ObjectId>,
+    /// Fan-out directories (`ab`) holding an object this transaction found
+    /// already published instead of writing it: synced at publication.
+    present: std::collections::BTreeSet<String>,
+    /// The backend's failed barriers when the staging began: one failing
+    /// since (another transaction's, on a shared backend value) may have
+    /// covered these writes, which are then void.
+    failures_at: u64,
+}
+
+/// The prefix of transaction staging directories under `<root>/incoming/`.
+pub const TX_STAGING_PREFIX: &str = "tx-";
+/// The prefix of pull spools under `<root>/incoming/`.
+pub const PULL_SPOOL_PREFIX: &str = "pull-";
 
 /// New objects of one thread's [`ObjectStore::begin_staging`] scope.
 struct Staging {
@@ -238,6 +263,7 @@ impl ObjectStore {
             not_durable: Mutex::new(Vec::new()),
             needs_recovery: AtomicBool::new(false),
             format: AtomicU32::new(crate::repo::REPO_FORMAT),
+            tx: Mutex::new(None),
             drivers: RwLock::new(None),
         }
     }
@@ -408,6 +434,156 @@ impl ObjectStore {
         self.needs_recovery.swap(false, Ordering::SeqCst)
     }
 
+    fn tx_list(&self) -> std::sync::MutexGuard<'_, Option<TxStaging>> {
+        self.tx.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// From now until [`ObjectStore::publish_tx_staging`] or
+    /// [`ObjectStore::abort_tx_staging`], new loose objects are written
+    /// (unsynced) to `<root>/incoming/tx-<owner>/ab/cdef…` and read from
+    /// there first; nobody else ever looks in it (format 6). A staged
+    /// object is published only after a successful barrier, so another
+    /// process never adopts one that may not reach the disk (BUG-044's
+    /// class across processes).
+    pub(crate) fn begin_tx_staging(&self, owner: &str) -> Result<()> {
+        let mut t = self.tx_list();
+        if t.is_some() {
+            return Err(VeilError::repo("a transaction is already staging objects in this store"));
+        }
+        *t = Some(TxStaging {
+            dir: self.root.join("incoming").join(&format!("{TX_STAGING_PREFIX}{owner}")),
+            owner: owner.to_string(),
+            staged: HashSet::new(),
+            present: Default::default(),
+            failures_at: self.backend.barrier_failures(),
+        });
+        Ok(())
+    }
+
+    /// The owner tag of the transaction staging in this store, if any.
+    pub(crate) fn tx_owner(&self) -> Option<String> {
+        self.tx_list().as_ref().map(|t| t.owner.clone())
+    }
+
+    /// Objects staged so far by the current transaction.
+    pub(crate) fn tx_staged(&self) -> Vec<ObjectId> {
+        let mut v: Vec<ObjectId> = self.tx_list().as_ref().map(|t| t.staged.iter().copied().collect()).unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    fn staged_path(&self, id: &ObjectId) -> Option<VPath> {
+        let t = self.tx_list();
+        let t = t.as_ref()?;
+        t.staged.contains(id).then(|| {
+            let h = id.hex();
+            t.dir.join(&h[..2]).join(&h[2..])
+        })
+    }
+
+    /// Publish the transaction's staged objects: one barrier makes them
+    /// durable where they are (if it fails, the staging directory is
+    /// removed and nothing is published); each is renamed over its final
+    /// name (content-addressed, so replacing a concurrent identical copy is
+    /// harmless); a second barrier makes the renames durable, and the
+    /// directories of objects this transaction found already published
+    /// (another process's rename may not be durable yet). Ends the staging.
+    pub(crate) fn publish_tx_staging(&self) -> Result<()> {
+        let Some(t) = self.tx_list().take() else { return Ok(()) };
+        if let Err(e) = self.backend.sync_barrier() {
+            self.drop_staging_dir(&t.dir);
+            return Err(e);
+        }
+        if self.backend.barrier_failures() != t.failures_at {
+            // A barrier failed meanwhile, possibly over our writes.
+            self.drop_staging_dir(&t.dir);
+            return Err(VeilError::Io {
+                path: t.dir.to_string(),
+                source: std::io::Error::other("a write barrier failed while this command ran; its writes may not be on disk: run it again"),
+            });
+        }
+        let res = (|| -> Result<()> {
+            let mut staged: Vec<&ObjectId> = t.staged.iter().collect();
+            staged.sort();
+            for id in staged {
+                let h = id.hex();
+                self.backend.rename_unsynced(&t.dir.join(&h[..2]).join(&h[2..]), &self.loose_path(id))?;
+            }
+            for d in &t.present {
+                self.backend.sync_dir_later(&self.root.join(d))?;
+            }
+            self.backend.sync_barrier()
+        })();
+        self.drop_staging_dir(&t.dir);
+        res
+    }
+
+    fn drop_staging_dir(&self, dir: &VPath) {
+        let _ = self.backend.remove_dir_all(dir);
+    }
+
+    /// Remove the staging directories and pull spools under
+    /// `<root>/incoming/` whose owner is provably gone
+    /// ([`crate::lock::owner_gone`]): nothing in them was ever published,
+    /// so no recovery is needed. Others are kept. Returns how many were
+    /// removed.
+    pub fn sweep_staging(&self, ctx: &crate::lock::LockContext) -> Result<usize> {
+        let mut n = 0;
+        for (name, tag) in self.staging_dirs()? {
+            if crate::lock::owner_gone(&tag, ctx) {
+                self.backend.remove_dir_all(&self.root.join("incoming").join(&name))?;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Every transaction staging directory and pull spool under
+    /// `<root>/incoming/`: `(directory name, owner tag)`.
+    pub fn staging_dirs(&self) -> Result<Vec<(String, String)>> {
+        let entries = match self.backend.list_dir(&self.root.join("incoming")) {
+            Ok(e) => e,
+            Err(e) if e.is_not_found() => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        Ok(entries
+            .into_iter()
+            .filter(|e| e.kind == NodeKind::Dir)
+            .filter_map(|e| {
+                let tag = e.name.strip_prefix(TX_STAGING_PREFIX).or_else(|| e.name.strip_prefix(PULL_SPOOL_PREFIX))?.to_string();
+                Some((e.name, tag))
+            })
+            .collect())
+    }
+
+    /// The objects in the transaction staging directory `name` (a
+    /// [`ObjectStore::staging_dirs`] entry): gc marks from those of live
+    /// transactions, which may reference objects nothing else does yet.
+    pub fn staged_objects_in(&self, name: &str) -> Result<Vec<(ObjectId, Vec<u8>)>> {
+        let dir = self.root.join("incoming").join(name);
+        let mut out = Vec::new();
+        let fans = match self.backend.list_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.is_not_found() => return Ok(out),
+            Err(e) => return Err(e),
+        };
+        for d in fans.into_iter().filter(|d| d.kind == NodeKind::Dir && d.name.len() == 2 && is_hex(&d.name)) {
+            let files = match self.backend.list_dir(&dir.join(&d.name)) {
+                Ok(f) => f,
+                Err(e) if e.is_not_found() => continue,
+                Err(e) => return Err(e),
+            };
+            for f in files.into_iter().filter(|f| f.kind == NodeKind::File && f.name.len() == 62 && is_hex(&f.name)) {
+                let id = ObjectId::from_hex(&format!("{}{}", d.name, f.name))?;
+                match self.backend.read_opt(&dir.join(&d.name).join(&f.name))? {
+                    Some(raw) if ObjectId::hash(&raw) == id => out.push((id, raw)),
+                    _ => {}
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// From now until the scope returned ends, objects this thread
     /// puts into this store are kept in memory instead of written, and
     /// reads see them (BUG-801: a snapshot is built outside the repository
@@ -472,6 +648,15 @@ impl ObjectStore {
     fn write_loose(&self, id: &ObjectId, raw: &[u8]) -> Result<()> {
         if let Some(r) = self.stage(id, raw) {
             return r.map(|_| ());
+        }
+        let staging = self.tx_list().as_ref().map(|t| t.dir.clone());
+        if let Some(dir) = staging {
+            let h = id.hex();
+            self.backend.write_unsynced(&dir.join(&h[..2]).join(&h[2..]), raw)?;
+            if let Some(t) = self.tx_list().as_mut() {
+                t.staged.insert(*id);
+            }
+            return Ok(());
         }
         if self.unsynced.load(Ordering::SeqCst) > 0 {
             self.backend.write_unsynced(&self.loose_path(id), raw)?;
@@ -617,6 +802,9 @@ impl ObjectStore {
     // ---- raw access ------------------------------------------------------
 
     fn loose_exists(&self, id: &ObjectId) -> bool {
+        if self.staged_path(id).is_some() {
+            return true;
+        }
         self.backend.exists(&self.loose_path(id)).unwrap_or(false)
     }
 
@@ -632,6 +820,13 @@ impl ObjectStore {
             return false;
         }
         self.in_loaded_packs(id) || (self.reload_packs().unwrap_or(false) && self.in_loaded_packs(id))
+    }
+
+    /// [`ObjectStore::has`], freshening `id` for gc even if this process
+    /// already did (a long transaction re-marks what it references).
+    pub(crate) fn has_fresh(&self, id: &ObjectId) -> bool {
+        self.gc.freshened.write().unwrap().remove(id);
+        self.has(id)
     }
 
     /// Like `has`, without rescanning packs: used to skip redundant writes,
@@ -673,6 +868,13 @@ impl ObjectStore {
     }
 
     fn read_loose_verified(&self, id: &ObjectId) -> Result<Loose> {
+        if let Some(p) = self.staged_path(id) {
+            if let Some(b) = self.backend.read_opt(&p)? {
+                if ObjectId::hash(&b) == *id {
+                    return Ok(Loose::Good(b));
+                }
+            }
+        }
         match self.backend.read(&self.loose_path(id)) {
             Ok(b) if ObjectId::hash(&b) == *id => Ok(Loose::Good(b)),
             Ok(_) => Ok(Loose::Corrupt),
@@ -708,16 +910,30 @@ impl ObjectStore {
             // make sure we have our own good loose copy (in that order).
             self.write_keep_marker(id);
             if matches!(self.read_loose_verified(id)?, Loose::Good(_)) {
+                self.note_present(id);
                 return Ok(false);
             }
             self.write_loose(id, raw)?;
             return Ok(true);
         }
         if self.has_cached(id) && self.has_verified(id)? {
+            self.note_present(id);
             return Ok(false);
         }
         self.write_loose(id, raw)?;
         Ok(true)
+    }
+
+    /// A transaction found `id` already present instead of writing it: if
+    /// it is a published loose object, its directory is synced at
+    /// publication (another process may have just renamed it there).
+    fn note_present(&self, id: &ObjectId) {
+        let mut t = self.tx_list();
+        let Some(t) = t.as_mut() else { return };
+        if t.staged.contains(id) {
+            return;
+        }
+        t.present.insert(id.hex()[..2].to_string());
     }
 
     /// Insert an already-encoded object, verifying its address. Returns

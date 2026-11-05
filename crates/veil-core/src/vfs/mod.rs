@@ -315,6 +315,38 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
+    /// Rename the file `from` to `to`, replacing a file there and creating
+    /// `to`'s parent directories, atomically: a reader sees the whole file
+    /// under one name or the other. The new name is only durable once a
+    /// later [`StorageBackend::sync_barrier`] returns (which syncs both
+    /// directories). Transactions publish their staged objects this way
+    /// (`ObjectStore`, format 6). The default copies (unsynced) and removes,
+    /// for backends that are memory anyway, and for wrappers.
+    fn rename_unsynced(&self, from: &VPath, to: &VPath) -> Result<()> {
+        let data = self.read(from)?;
+        self.write_unsynced(to, &data)?;
+        self.remove_file(from)
+    }
+
+    /// How many [`StorageBackend::sync_barrier`] calls on this value failed
+    /// so far. A barrier syncs every unsynced write made through this value,
+    /// whoever made it: a transaction whose writes overlapped a failed
+    /// barrier (another transaction's, on a shared value) treats them as
+    /// lost, as the failed caller does. Backends whose barriers never fail
+    /// keep the default.
+    fn barrier_failures(&self) -> u64 {
+        0
+    }
+
+    /// Make directory `dir`'s entries part of the next
+    /// [`StorageBackend::sync_barrier`]: a name another process created
+    /// there (a rename not yet synced) becomes durable before anything
+    /// that relies on it is written. The default does nothing (backends
+    /// whose names are always durable, or never).
+    fn sync_dir_later(&self, _dir: &VPath) -> Result<()> {
+        Ok(())
+    }
+
     /// Atomically create a file only if it does not exist. Returns `false`
     /// when the path already exists. Used for repository locks.
     fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool>;

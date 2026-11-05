@@ -168,3 +168,84 @@ fn concurrent_vault_updates_never_lose_a_secret() {
     let repo = Repo::open(fs, Some(alice), "alice").unwrap();
     assert_eq!(repo.vault_load().unwrap().secrets.len(), 30);
 }
+
+/// The lock-free op log (format 6, threat 15): transactions no longer hold
+/// `.veil/lock`, so metadata writers race them instead of queueing behind
+/// them. Grants (key-ring read-modify-writes, under the lock), commits in
+/// several workspaces and a pull run at once: no grant and no commit is
+/// lost.
+#[test]
+fn grant_racing_lock_free_commits() {
+    for (fs, disk) in backends() {
+        let alice = Identity::generate("alice");
+        let mut init = Repo::init(fs.clone(), Some(alice.clone()), "alice").unwrap();
+        let root = init.root_id();
+        for w in 0..3 {
+            init.create_workspace(&format!("w{w}"), vec![root], None).unwrap();
+        }
+        // A remote with something to pull.
+        let remote: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        let mut other = Repo::init(Arc::new(MemoryBackend::new()), Some(alice.clone()), "alice").unwrap();
+        let ov = other.workspace_overlay("default").unwrap();
+        ov.write(&VPath::new("pulled.txt").unwrap(), b"pulled\n").unwrap();
+        other.snapshot_workspace("default", &ov).unwrap();
+        let (c, _) = other.commit_working_copy("default", "to pull").unwrap();
+        other.set_tag("main", c, None, false).unwrap();
+        remote::push(&mut other, remote.clone(), false, &[], false).unwrap();
+        drop(init);
+        let disk = Arc::new(disk);
+        let mut threads = Vec::new();
+        for t in 0..3 {
+            let (fs, disk, alice) = (fs.clone(), disk.clone(), alice.clone());
+            threads.push(thread::spawn(move || {
+                let mut granted = Vec::new();
+                for i in 0..2 {
+                    let member = Identity::generate(&format!("m{t}-{i}"));
+                    let repo = handle(&fs, &disk, &alice);
+                    repo.keys().grant("team", &member.public_id(), &member.name).unwrap();
+                    granted.push(member.public_hex());
+                }
+                granted
+            }));
+        }
+        for w in 0..3 {
+            let (fs, disk, alice) = (fs.clone(), disk.clone(), alice.clone());
+            threads.push(thread::spawn(move || {
+                let mut repo = handle(&fs, &disk, &alice);
+                let ws = format!("w{w}");
+                for n in 0..3 {
+                    let ov = repo.workspace_overlay(&ws).unwrap();
+                    ov.write(&VPath::new(&format!("f{w}-{n}")).unwrap(), b"x\n").unwrap();
+                    repo.snapshot_workspace(&ws, &ov).unwrap();
+                    let (c, _) = repo.commit_working_copy(&ws, &format!("{ws} {n}")).unwrap();
+                    repo.set_tag(&format!("c{w}-{n}"), c, None, true).unwrap();
+                }
+                Vec::new()
+            }));
+        }
+        {
+            let (fs, disk, alice, remote) = (fs.clone(), disk.clone(), alice.clone(), remote.clone());
+            threads.push(thread::spawn(move || {
+                let mut repo = handle(&fs, &disk, &alice);
+                remote::pull(&mut repo, "origin", remote).unwrap();
+                Vec::new()
+            }));
+        }
+        let granted: Vec<String> = threads.into_iter().flat_map(|t| t.join().unwrap()).collect();
+        let repo = handle(&fs, &disk, &alice);
+        let state = repo.keys().ring_state("team").unwrap().unwrap().expect("ring verifies");
+        for m in &granted {
+            assert!(state.members.contains_key(m), "{}: grant of {m} was lost", fs.kind());
+        }
+        for w in 0..3 {
+            for n in 0..3 {
+                let t = repo.view().tags.get(&format!("c{w}-{n}")).unwrap_or_else(|| panic!("{}: commit c{w}-{n} was lost", fs.kind()));
+                let files: Vec<String> = walk_files(repo.store(), &repo.snapshot(&t.target).unwrap().tree).unwrap().into_iter().map(|(p, _)| p.to_string()).collect();
+                assert!(files.contains(&format!("f{w}-{n}")), "{}: {files:?}", fs.kind());
+            }
+        }
+        assert_eq!(repo.view().remote_tags.get("origin/main"), Some(&c), "{}: the pull was lost", fs.kind());
+        assert_eq!(repo.heads().len(), 1);
+        let _ = Tag::new(c, None);
+    }
+}

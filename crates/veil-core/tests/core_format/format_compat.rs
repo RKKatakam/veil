@@ -326,7 +326,200 @@ fn golden_encodings() -> Vec<(String, Vec<u8>)> {
             })
             .encode(),
         ),
+        // Format 6: an operation (not an object: `.veil/ops/<id>`, its id
+        // the BLAKE3 of these bytes) with a workspace and rewrites, and a
+        // merge of two concurrent operations.
+        ("operation-format-6".into(), serde_json::to_vec(&golden_operation()).unwrap()),
+        (
+            "operation-merge".into(),
+            serde_json::to_vec(&veil_core::oplog::Operation {
+                parents: vec![ObjectId([0x61; 32]), ObjectId([0x62; 32])],
+                user: "veil".into(),
+                description: "merge 2 concurrent operations".into(),
+                workspace: None,
+                ..golden_operation()
+            })
+            .unwrap(),
+        ),
     ]
+}
+
+/// A format-6 operation: every field set.
+fn golden_operation() -> veil_core::oplog::Operation {
+    let mut view = veil_core::oplog::View::default();
+    view.heads.insert(ObjectId([0x51; 32]));
+    view.workspaces.insert("agent-1".into(), veil_core::oplog::WorkspaceState { wc: ObjectId([0x52; 32]), cloak: Some("team".into()) });
+    view.tags.insert("main".into(), veil_core::oplog::Tag::new(ObjectId([0x53; 32]), None));
+    view.remote_tags.insert("origin/main".into(), ObjectId([0x53; 32]));
+    let mut rewritten = std::collections::BTreeMap::new();
+    rewritten.insert(ObjectId([0x54; 32]), vec![ObjectId([0x55; 32])]);
+    rewritten.insert(ObjectId([0x56; 32]), vec![]);
+    veil_core::oplog::Operation {
+        parents: vec![ObjectId([0x60; 32])],
+        timestamp: 1_790_000_000_000,
+        user: "golden".into(),
+        description: "commit".into(),
+        view,
+        manual_undo: None,
+        undo_of: Some(ObjectId([0x57; 32])),
+        redo_of: None,
+        workspace: Some("agent-1".into()),
+        rewritten,
+    }
+}
+
+// ---- format 6: the lock-free op log ---------------------------------------------
+
+/// `vl upgrade` 5 → 6 rewrites nothing: every object, operation and id
+/// stays; the head moves from `op_head` to `op_heads/` (before the commit
+/// point its head file is created, after it `op_head` is removed).
+#[test]
+fn upgrade_5_to_6_keeps_every_id() {
+    let fx = Fixture::new(5);
+    let dir = fx.root.join("alice");
+    let before_view = fx.open("alice", Some("alice")).view().clone();
+    let head = String::from_utf8(std::fs::read(dir.join(".veil/op_head")).unwrap()).unwrap();
+    let before: Vec<(PathBuf, Vec<u8>)> = veil_files(&dir)
+        .into_iter()
+        .filter(|(p, _)| {
+            let p = p.to_string_lossy();
+            p.contains("/.veil/ops/") || p.contains("/.veil/objects/") && !p.contains("/gc/")
+        })
+        .collect();
+    let r = upgrade(fx.backend("alice"), Some(fx.identity("alice")), &UpgradeOptions::default()).unwrap();
+    assert_eq!((r.from, r.to), (5, 6));
+    assert!(r.steps.contains(&"5->6:op-heads".to_string()) && r.steps.contains(&"6:remove-op-head".to_string()), "{:?}", r.steps);
+    assert!(r.notes.iter().any(|n| n.contains("no longer wait")), "{:#?}", r.notes);
+    assert!(!dir.join(".veil/op_head").exists());
+    assert!(dir.join(".veil/op_heads").join(head.trim()).exists());
+    let after = veil_files(&dir);
+    for (p, bytes) in &before {
+        let now = after.iter().find(|(q, _)| q == p).map(|(_, b)| b);
+        assert_eq!(now, Some(bytes), "{} changed or vanished", p.display());
+    }
+    let repo = fx.open("alice", Some("alice"));
+    assert_eq!(repo.format(), 6);
+    assert_eq!(repo.view(), &before_view);
+    assert_fsck_clean(fx.backend("alice"), Some(fx.identity("alice")));
+}
+
+/// Threat 9 of the lock-free op log: a format-5 writer racing the upgrade
+/// (an older vl, or this vl opened before it) writes an operation and
+/// `op_head` after the commit point. At format 6 a present `op_head` is one
+/// more head: the next command merges it in and removes the file.
+#[test]
+fn op_head_written_after_upgrade_is_merged() {
+    let fx = Fixture::new(5);
+    let dir = fx.root.join("alice");
+    let backend = fx.backend("alice");
+    // The late writer read the view before the upgrade.
+    let mut late = fx.open("alice", Some("alice")).ops().get(&fx.open("alice", Some("alice")).op_id()).unwrap();
+    let parent = fx.open("alice", Some("alice")).op_id();
+    upgrade(backend.clone(), Some(fx.identity("alice")), &UpgradeOptions::default()).unwrap();
+    let mut repo = fx.open("alice", Some("alice"));
+    let main = repo.view().tags["main"].target;
+    repo.set_tag("after-upgrade", main, None, false).unwrap();
+    drop(repo);
+    // ...and writes its operation the way format 5 does.
+    late.parents = vec![parent];
+    late.description = "set tag late".into();
+    late.timestamp += 1;
+    late.view.tags.insert("late".into(), veil_core::oplog::Tag::new(main, None));
+    let raw = serde_json::to_vec(&late).unwrap();
+    let id = ObjectId::hash(&raw);
+    std::fs::write(dir.join(format!(".veil/ops/{}", id.hex())), &raw).unwrap();
+    std::fs::write(dir.join(".veil/op_head"), id.hex()).unwrap();
+    let repo = fx.open("alice", Some("alice"));
+    assert!(repo.view().tags.contains_key("late"), "the late writer's operation was ignored");
+    assert!(repo.view().tags.contains_key("after-upgrade"));
+    assert_eq!(repo.heads().len(), 1);
+    assert!(!dir.join(".veil/op_head").exists(), "op_head was not removed once merged");
+    assert_fsck_clean(backend, Some(fx.identity("alice")));
+}
+
+/// Fixture generator (format 6, `generate.sh` runs it last on `alice/`):
+/// concurrent operations, made with two handles whose transactions
+/// interleave. First an amend of `main`'s change racing a new workspace on
+/// it (merged by the next open: the merge's side carries `rewritten` and
+/// `workspace`); then two tag sets left as two heads, not merged.
+#[test]
+#[ignore = "fixture generator: run by tests/fixtures/generate.sh"]
+fn write_format_6_extras() {
+    // Only as the generator (a run of every ignored test passes it by).
+    let Ok(out) = std::env::var("VEIL_FIXTURE_DIR") else { return };
+    let out = PathBuf::from(out);
+    let identity = Identity::from_json(&std::fs::read_to_string(out.join("home-alice/identity.json")).unwrap()).unwrap();
+    let open = || {
+        let mut r = Repo::open(Arc::new(DiskBackend::new(out.join("alice"))), Some(identity.clone()), "alice").unwrap();
+        r.set_command_workspace(Some("default".into()));
+        r
+    };
+    let (mut a, mut b) = (open(), open());
+    assert_eq!(a.format(), 6, "the format-6 extras go into a format-6 set");
+    // A public change (`links`, from the format-5 extras), not `main`,
+    // whose line is under an unreleased embargo.
+    let x = tag(&a, "links");
+    let mut tx_a = a.transaction("describe").unwrap();
+    let mut amended = (*tx_a.repo().snapshot(&x).unwrap()).clone();
+    amended.description = Text::Plain("format 6: amended while a workspace was created on it".into());
+    amended.predecessors = vec![x];
+    tx_a.rewrite(x, amended).unwrap();
+    let mut tx_b = b.transaction("create workspace 'concurrent'").unwrap();
+    tx_b.for_workspace("concurrent");
+    let wc = tx_b.new_change(vec![x], "", None).unwrap();
+    tx_b.view.workspaces.insert("concurrent".into(), veil_core::oplog::WorkspaceState { wc, cloak: None });
+    tx_a.commit().unwrap();
+    tx_b.commit().unwrap();
+    drop((a, b));
+    // The next open merges them.
+    let main = tag(&open(), "main");
+    let (mut c, mut d) = (open(), open());
+    let mut tx_c = c.transaction("set tag head-c").unwrap();
+    tx_c.repository_wide();
+    tx_c.view.tags.insert("head-c".into(), veil_core::oplog::Tag::new(main, None));
+    let mut tx_d = d.transaction("set tag head-d").unwrap();
+    tx_d.repository_wide();
+    tx_d.view.tags.insert("head-d".into(), veil_core::oplog::Tag::new(main, None));
+    tx_c.commit().unwrap();
+    tx_d.commit().unwrap();
+}
+
+/// Format-6 operation fields are refused below format 6, as format-5
+/// fields are below 5: an older vl must never read an operation it would
+/// rewrite without them.
+#[test]
+fn format_6_operation_fields_are_refused_below_6() {
+    let ops = veil_core::oplog::OpStore::new(Arc::new(MemoryBackend::new()));
+    ops.set_format(5);
+    let err = ops.put(&golden_operation()).unwrap_err();
+    assert!(matches!(err, VeilError::Unsupported(_)), "{err}");
+    let mut plain = golden_operation();
+    plain.workspace = None;
+    plain.rewritten.clear();
+    ops.put(&plain).unwrap();
+}
+
+/// The format-6 set records concurrent operations: a merge whose side
+/// carries `rewritten` and `workspace`, and two heads not merged yet. The
+/// next open merges them; nothing recorded is lost.
+#[test]
+fn format_6_fixture_heads_merge() {
+    let fx = Fixture::new(6);
+    let dir = fx.root.join("alice");
+    let heads: Vec<String> = std::fs::read_dir(dir.join(".veil/op_heads")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(heads.len(), 2, "the set keeps two heads: {heads:?}");
+    let ops = veil_core::oplog::OpStore::new(fx.backend("alice"));
+    let all: Vec<veil_core::oplog::Operation> = std::fs::read_dir(dir.join(".veil/ops")).unwrap().flatten().map(|e| ops.get(&ObjectId::from_hex(&e.file_name().to_string_lossy()).unwrap()).unwrap()).collect();
+    assert!(all.iter().any(|o| o.is_merge()), "no merge operation");
+    assert!(all.iter().any(|o| !o.rewritten.is_empty()), "no operation with rewrites");
+    assert!(all.iter().any(|o| o.workspace.is_some()), "no operation with a workspace");
+    let tags: Vec<String> = heads.iter().flat_map(|h| ops.get(&ObjectId::from_hex(h).unwrap()).unwrap().view.tags.into_keys()).collect();
+    let repo = fx.open("alice", Some("alice"));
+    assert_eq!(repo.heads().len(), 1);
+    for t in tags {
+        assert!(repo.view().tags.contains_key(&t), "tag {t} of a head was lost");
+    }
+    assert_fsck_clean(fx.backend("alice"), Some(fx.identity("alice")));
 }
 
 /// A tree holding `kind` entries (format 5): public with a size, and
@@ -456,6 +649,12 @@ fn encodings_match_the_golden_file() {
     );
     // Every golden encoding still decodes, and decodes back to itself.
     for (name, raw) in golden_encodings() {
+        if name.starts_with("operation") {
+            // An operation (format 6 fields): JSON, re-encodes to itself.
+            let op: veil_core::oplog::Operation = serde_json::from_slice(&raw).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(serde_json::to_vec(&op).unwrap(), raw, "{name} does not re-encode to itself");
+            continue;
+        }
         let obj = Object::decode(&raw).unwrap_or_else(|e| panic!("{name}: {e}"));
         let enc = Object::tree_encoding(&raw).unwrap_or(TreeEncoding::Json);
         assert_eq!(obj.encode_with(enc), raw, "{name} does not re-encode to itself");
@@ -667,7 +866,8 @@ fn upgrade_dry_run_writes_nothing() {
     assert!(r.corrupt.is_empty(), "{:?}", r.corrupt);
     assert!(r.trees_json > 0);
     assert!(r.steps.contains(&"set-format".to_string()), "{:?}", r.steps);
-    assert_eq!(r.steps.last().map(String::as_str), Some("3:hpke-ring-keys"));
+    assert!(r.steps.contains(&"3:hpke-ring-keys".to_string()), "{:?}", r.steps);
+    assert_eq!(r.steps.last().map(String::as_str), Some("6:remove-op-head"));
     assert_eq!(veil_files(&root), before, "a dry run changed .veil/");
 }
 
@@ -690,7 +890,7 @@ fn upgrade_keeps_ids_and_switches_new_trees_to_binary() {
     assert!(!fx.root.join("alice").join(JOURNAL_PATH).exists());
     let cfg = read_config(&*fx.backend("alice")).unwrap();
     assert_eq!(cfg.format, REPO_FORMAT);
-    assert_eq!(cfg.min_vl.as_deref(), Some("1.0.0"));
+    assert_eq!(cfg.min_vl.as_deref(), Some(veil_core::repo::min_vl_for_format(REPO_FORMAT)));
 
     let mut repo = fx.open("alice", Some("alice"));
     assert_eq!(repo.view(), &old_view, "upgrade changed the view");
@@ -1477,7 +1677,7 @@ fn write_format_5_extras() {
     let out = PathBuf::from(std::env::var("VEIL_FIXTURE_DIR").expect("VEIL_FIXTURE_DIR"));
     let identity = Identity::from_json(&std::fs::read_to_string(out.join("home-alice/identity.json")).unwrap()).unwrap();
     let mut repo = Repo::open(Arc::new(DiskBackend::new(out.join("alice"))), Some(identity.clone()), "alice").unwrap();
-    assert_eq!(repo.format(), 5, "the format-5 extras go into a format-5 set");
+    assert!(repo.format() >= 5, "the format-5 extras go into a format-5 (or later) set");
     let main = tag(&repo, "main");
     let store = repo.store().clone();
     let base_tree = repo.snapshot(&main).unwrap().tree;
@@ -1735,7 +1935,7 @@ fn upgrade_4_to_5_rewrites_nothing() {
     let before_objects: Vec<ObjectId> = fx.open("alice", Some("alice")).store().list_objects().unwrap();
     let before_view = fx.open("alice", Some("alice")).view().clone();
     let ops_before: Vec<(PathBuf, Vec<u8>)> = veil_files(&alice_dir).into_iter().filter(|(p, _)| p.to_string_lossy().contains("/.veil/ops/")).collect();
-    let r = upgrade(fx.backend("alice"), Some(fx.identity("alice")), &UpgradeOptions::default()).unwrap();
+    let r = upgrade(fx.backend("alice"), Some(fx.identity("alice")), &UpgradeOptions { to: 5, ..Default::default() }).unwrap();
     assert_eq!((r.from, r.to), (4, 5));
     assert!(r.notes.iter().any(|n| n.contains("symlinks")), "{:#?}", r.notes);
     let repo = fx.open("alice", Some("alice"));

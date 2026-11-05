@@ -1108,29 +1108,7 @@ impl Checker {
         }
         self.report.operations = ops.len() + damaged.len();
 
-        let head = match self.backend.read_opt(&vpath(".veil/op_head"))? {
-            None => {
-                self.push(Severity::Corrupt, ".veil/op_head is missing");
-                None
-            }
-            Some(raw) => match ObjectId::from_hex(String::from_utf8_lossy(&raw).trim()) {
-                Err(_) => {
-                    self.push(Severity::Corrupt, ".veil/op_head does not contain an operation id");
-                    None
-                }
-                Ok(h) if ops.contains_key(&h) => Some(h),
-                Ok(h) => {
-                    if !damaged.contains(&h) {
-                        self.push(
-                            Severity::Corrupt,
-                            format!(".veil/op_head points to missing operation {}", h.short()),
-                        );
-                    }
-                    None
-                }
-            },
-        };
-
+        let heads = self.op_heads(&ops, &damaged)?;
         let pruned = crate::oplog::pruned_ops(&*self.backend).unwrap_or_default();
         for (id, op) in &ops {
             for p in &op.parents {
@@ -1154,7 +1132,7 @@ impl Checker {
         // Operations the head cannot reach never took effect (a crash between
         // writing an operation and moving the head) or were superseded.
         let mut reachable = BTreeSet::new();
-        let mut queue: VecDeque<ObjectId> = head.into_iter().collect();
+        let mut queue: VecDeque<ObjectId> = heads.iter().copied().collect();
         while let Some(id) = queue.pop_front() {
             if reachable.insert(id) {
                 if let Some(op) = ops.get(&id) {
@@ -1162,7 +1140,7 @@ impl Checker {
                 }
             }
         }
-        if head.is_some() {
+        if !heads.is_empty() {
             let dangling: Vec<String> = ops
                 .keys()
                 .filter(|id| !reachable.contains(*id))
@@ -1181,9 +1159,9 @@ impl Checker {
         }
 
         let mut roots = Vec::new();
-        if let Some(h) = head {
+        for h in &heads {
             roots.extend(
-                ops[&h]
+                ops[h]
                     .view
                     .refs()
                     .into_iter()
@@ -1191,7 +1169,7 @@ impl Checker {
             );
         }
         for (id, op) in &ops {
-            if Some(*id) != head {
+            if !heads.contains(id) {
                 roots.extend(
                     op.view
                         .refs()
@@ -1211,17 +1189,98 @@ impl Checker {
             }
         }
         let mut seen = HashSet::new();
-        if let Some(h) = head {
-            let view = ops[&h].view.clone();
+        for h in &heads {
+            let view = ops[h].view.clone();
             self.check_annotations(&view, true, &mut roots, &mut seen);
         }
-        let others: Vec<crate::oplog::View> = ops.iter().filter(|(id, _)| Some(**id) != head).map(|(_, op)| op.view.clone()).collect();
+        let others: Vec<crate::oplog::View> = ops.iter().filter(|(id, _)| !heads.contains(id)).map(|(_, op)| op.view.clone()).collect();
         for view in others {
             if view.uses_format_5() {
                 self.check_annotations(&view, false, &mut roots, &mut seen);
             }
         }
         Ok(roots)
+    }
+
+    /// The heads of the op log that name a readable operation, each other
+    /// head reported: `op_head` up to format 5, `op_heads/` from format 6
+    /// (each head file, entries that are not head files, a stray
+    /// `op_head`, several heads), and the staging directories of
+    /// transactions and pulls.
+    fn op_heads(&mut self, ops: &BTreeMap<ObjectId, Operation>, damaged: &BTreeSet<ObjectId>) -> Result<Vec<ObjectId>> {
+        let format = self.store.format();
+        let mut heads = Vec::new();
+        let mut check = |me: &mut Self, h: ObjectId, file: &str| {
+            if ops.contains_key(&h) {
+                heads.push(h);
+            } else if !damaged.contains(&h) {
+                me.push(Severity::Corrupt, format!("{file} names missing operation {}", h.short()));
+            }
+        };
+        let legacy = self.backend.read_opt(&vpath(crate::oplog::OP_HEAD_FILE))?;
+        let legacy = match legacy {
+            None => None,
+            Some(raw) => match ObjectId::from_hex(String::from_utf8_lossy(&raw).trim()) {
+                Ok(h) => Some(h),
+                Err(_) => {
+                    self.push(Severity::Corrupt, ".veil/op_head does not contain an operation id");
+                    None
+                }
+            },
+        };
+        if format < crate::oplog::OP_HEADS_REPO_FORMAT {
+            match legacy {
+                Some(h) => check(self, h, ".veil/op_head"),
+                None if self.backend.exists(&vpath(crate::oplog::OP_HEAD_FILE))? => {}
+                None => self.push(Severity::Corrupt, ".veil/op_head is missing"),
+            }
+        } else {
+            let entries = match self.backend.list_dir(&vpath(crate::oplog::OP_HEADS_DIR)) {
+                Ok(e) => e,
+                Err(e) if e.is_not_found() => Vec::new(),
+                Err(e) => return Err(e),
+            };
+            for e in entries {
+                let name = e.name.clone();
+                let id = (e.kind == crate::vfs::NodeKind::File && name.len() == 64 && name.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+                    .then(|| ObjectId::from_hex(&name).ok())
+                    .flatten();
+                match id {
+                    Some(h) => check(self, h, &format!(".veil/op_heads/{name}")),
+                    None if crate::vfs::is_temp_name(&name) => {}
+                    None => self.push(Severity::Note, format!(".veil/op_heads/{name:?}: not a head file; ignored")),
+                }
+            }
+            if let Some(h) = legacy {
+                self.push(
+                    Severity::Note,
+                    ".veil/op_head is present in a format-6 repository (an older vl wrote it): it is read as one more head, and the next command merges it",
+                );
+                check(self, h, ".veil/op_head");
+            }
+            heads.sort();
+            heads.dedup();
+            if heads.is_empty() && ops.is_empty() {
+                self.push(Severity::Corrupt, ".veil/op_heads holds no head");
+            } else if heads.len() > 1 {
+                self.push(
+                    Severity::Note,
+                    format!("{} operation heads (concurrent operations, or a head left by an interrupted one): the next command merges them", heads.len()),
+                );
+            }
+        }
+        if heads.is_empty() && !ops.is_empty() && format >= crate::oplog::OP_HEADS_REPO_FORMAT {
+            self.push(Severity::Corrupt, ".veil/op_heads holds no head naming a readable operation");
+        }
+        let ctx = crate::lock::LockContext::default();
+        for (name, tag) in self.store.staging_dirs()? {
+            let state = match crate::lock::owner_gone(&tag, &ctx) {
+                true => "left by a process that is gone; the next command removes it",
+                false => "in use by a running command, or by another host",
+            };
+            self.push(Severity::Note, format!(".veil/objects/incoming/{name}: staged objects, {state}"));
+        }
+        Ok(heads)
     }
 
     fn finish(&mut self) -> Result<()> {

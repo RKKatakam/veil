@@ -24,6 +24,9 @@
 # From format 4 on, alice/ also holds a merge with conflict entries (tag
 # `conflicted`): a cloaked file's conflict left unresolved, a public one
 # resolved with `vl resolve`.
+# From format 6 on, the last thing written to alice/ is concurrent
+# operations (the `write_format_6_extras` test): a merge whose sides carry
+# `rewritten` and `workspace`, and two heads left unmerged.
 # From format 5 on, alice/ also holds symlinks (public and sealed), a
 # link/file conflict and annotated tags (signed, and cloaked with a sealed
 # message): tags `links`, `link-conflict`, `v5.0`, `team-release`. They are
@@ -159,6 +162,13 @@ sed -i.bak -e "s#$OUT/#../#g" "$OUT/alice/.veil/repo.json" && rm "$OUT/alice/.ve
 # A lock file must not be left behind; the pointer and caches are kept.
 test ! -e "$OUT/alice/.veil/lock"
 as alice log > "$OUT/alice-log.txt"
+
+# Format 6 on: concurrent operations, last (any later command would merge
+# the two heads they leave).
+if [ "$("$VL" --version | sed -n 's/^repository format: //p')" -ge 6 ]; then
+    VEIL_FIXTURE_DIR="$OUT" "$VEIL_FIXTURE_EXTRAS" --ignored --exact format_compat::write_format_6_extras >/dev/null
+    test "$(ls "$OUT/alice/.veil/op_heads" | wc -l)" -eq 2
+fi
 
 if [ -n "$PREV" ]; then
     U="$OUT/upgraded"

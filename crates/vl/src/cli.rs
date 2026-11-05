@@ -12,7 +12,7 @@ pub const VERSION: &str = concat!(
     env!("VL_GIT_COMMIT"),
     ", repository format ",
     // Kept in step with `veil_core::repo::REPO_FORMAT_VERSION` by a test.
-    "5",
+    "6",
     ")"
 );
 
@@ -21,7 +21,7 @@ pub const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\ncommit: ",
     env!("VL_GIT_COMMIT"),
-    "\nrepository format: 5",
+    "\nrepository format: 6",
     "\ntarget: ",
     env!("VL_TARGET"),
 );
@@ -514,9 +514,16 @@ pub enum Cmd {
     /// Undo the last operation; run again to go further back.
     ///
     /// Automatic snapshots (your unrecorded edits) and earlier undos are
-    /// skipped, and the edits on disk are kept. `vl redo` re-applies what
-    /// the latest undos took back.
-    Undo,
+    /// skipped, and the edits on disk are kept. Only commands run in this
+    /// workspace (and repository-wide ones: tags, push, pull, remotes) are
+    /// undone: what other workspaces did since stays. `vl redo` re-applies
+    /// what the latest undos took back.
+    Undo {
+        /// Undo this operation (id or prefix, from `vl op log`) instead of
+        /// the last command; what other operations changed since stays.
+        #[arg(long, value_name = "ID")]
+        op: Option<String>,
+    },
     /// Re-apply what the latest `vl undo` took back.
     ///
     /// Successive redos take back successive undos, newest first. Any other
@@ -1088,6 +1095,16 @@ pub enum OpCmd {
     Restore {
         /// Operation id (or prefix), from `vl op log`.
         id: String,
+        /// Restore even though other workspaces recorded work after ID
+        /// (it leaves the view, and stays in the op log).
+        #[arg(long)]
+        force: bool,
+    },
+    /// List the heads of the operation log (several while concurrent
+    /// operations are not merged yet; the next command merges them).
+    Heads {
+        #[command(flatten)]
+        out: JsonOut,
     },
 }
 

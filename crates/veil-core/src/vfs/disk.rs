@@ -45,6 +45,8 @@ use crate::{
 pub struct DiskBackend {
     root: PathBuf,
     unsynced: Arc<Mutex<Unsynced>>,
+    /// Barriers that failed so far ([`StorageBackend::barrier_failures`]).
+    failures: Arc<std::sync::atomic::AtomicU64>,
     /// Serialises barriers (see [`StorageBackend::sync_barrier`]).
     barrier: Arc<Mutex<()>>,
     /// Probed lazily; only a definite answer is cached.
@@ -125,6 +127,7 @@ impl DiskBackend {
         DiskBackend {
             root: root.into(),
             unsynced: Arc::default(),
+            failures: Arc::default(),
             barrier: Arc::default(),
             folding: Arc::default(),
         }
@@ -853,6 +856,42 @@ impl StorageBackend for DiskBackend {
         Ok(())
     }
 
+    fn rename_unsynced(&self, from: &VPath, to: &VPath) -> Result<()> {
+        if !Self::own_path(from) || !Self::own_path(to) {
+            let data = self.read(from)?;
+            self.write_unsynced(to, &data)?;
+            return self.remove_file(from);
+        }
+        let (src, dst) = (self.full_path(from), self.full_path(to));
+        let parent = dst.parent().expect("non-root path has a parent");
+        let mut created = Vec::new();
+        create_dir_all_tracked(parent, &mut created).map_err(|e| io_err(parent, e))?;
+        {
+            let mut u = self.unsynced.lock().unwrap_or_else(|e| e.into_inner());
+            u.dirs.extend(created.iter().filter_map(|d| d.parent().map(Path::to_path_buf)));
+        }
+        fs::rename(&src, &dst).map_err(|e| io_err(&dst, e))?;
+        let mut u = self.unsynced.lock().unwrap_or_else(|e| e.into_inner());
+        u.dirs.insert(parent.to_path_buf());
+        if let Some(d) = src.parent() {
+            u.dirs.insert(d.to_path_buf());
+        }
+        Ok(())
+    }
+
+    fn barrier_failures(&self) -> u64 {
+        self.failures.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn sync_dir_later(&self, dir: &VPath) -> Result<()> {
+        if !Self::own_path(dir) {
+            return Ok(());
+        }
+        let full = self.full_path(dir);
+        self.unsynced.lock().unwrap_or_else(|e| e.into_inner()).dirs.insert(full);
+        Ok(())
+    }
+
     fn sync_barrier(&self) -> Result<()> {
         // Held until our batch is durable: a concurrent barrier waits for
         // it rather than returning early with nothing left to sync.
@@ -882,6 +921,7 @@ impl StorageBackend for DiskBackend {
             // must rewrite or remove those files; the object store does
             // (`ObjectStore::sync_barrier`). Nothing that depends on them may
             // be written by the caller, which gets the error.
+            self.failures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut u = self.unsynced.lock().unwrap_or_else(|e| e.into_inner());
             u.files.extend(batch.files);
             u.dirs.extend(batch.dirs);

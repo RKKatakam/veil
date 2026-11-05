@@ -300,6 +300,9 @@ impl Ctx {
         }
         let checkout = load_state(&fs, &repo)?;
         let ws = attached_workspace(&repo, &checkout)?;
+        // The operations of this command are for the attached workspace
+        // (`vl undo` there undoes them; format 6).
+        repo.set_command_workspace(Some(ws.clone()));
         let cache = StatCache::load(&*fs, &cache_path(&ws));
         let mut ctx = Ctx {
             root,
@@ -359,6 +362,9 @@ impl Ctx {
     }
 
     fn record(&mut self, description: Option<String>, policy_incoming: bool, carried: &[(VPath, veil_core::TreeEntry)]) -> Result<()> {
+        // One recorder of this directory at a time (the lock-free op log
+        // has no repository lock to serialise them).
+        let _wc = self.lock_wc()?;
         // A move of the directory that a previous command started and did
         // not finish (killed, disk full): finish it before recording
         // anything, or the half-moved directory would be recorded as the
@@ -595,6 +601,7 @@ impl Ctx {
         let ws = attached_workspace(&self.repo, &self.checkout)?;
         if ws != self.ws {
             self.cache = StatCache::load(&*self.fs, &cache_path(&ws));
+            self.repo.set_command_workspace(Some(ws.clone()));
             self.ws = ws;
         }
         Ok(())
@@ -632,11 +639,30 @@ impl Ctx {
         Ok(())
     }
 
+    /// Lock the attached workspace's directory for recording or checkout
+    /// ([`veil_core::lock::WcLock`]).
+    fn lock_wc(&self) -> Result<Option<veil_core::lock::WcLock>> {
+        if self.bare {
+            return Ok(None);
+        }
+        Ok(Some(veil_core::lock::WcLock::acquire(&veil_core::repo::state_dir(&self.root), &self.ws)?))
+    }
+
+    /// Print what merges of concurrent operations decided (once: only the
+    /// process that wrote the merge prints it).
+    pub fn print_merge_warnings(&mut self) {
+        for w in self.repo.take_warnings() {
+            warn(&w);
+        }
+    }
+
     /// Bring the project directory in line with the attached workspace.
     pub fn finish(&mut self) -> Result<()> {
+        self.print_merge_warnings();
         if self.bare {
             return Ok(());
         }
+        let _wc = self.lock_wc()?;
         if self.checkout.pending.is_some() {
             self.resume()?;
         }
@@ -738,6 +764,7 @@ impl Ctx {
             bail!("no workspace named '{ws}'");
         }
         self.ws = ws.to_string();
+        self.repo.set_command_workspace(Some(self.ws.clone()));
         Ok(())
     }
 

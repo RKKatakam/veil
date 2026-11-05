@@ -96,7 +96,7 @@ fn annotate(repo: &Repo, name: &str, target: ObjectId, message: Text) -> ObjectI
 /// with a public symlink and a sealed symlink.
 fn links_repo(sealed_target: &str) -> (Repo, Arc<MemoryBackend>, ObjectId, ObjectId) {
     let (mut alice, fs, _) = new_repo("alice");
-    assert_eq!(alice.format(), 5);
+    assert!(alice.format() >= 5);
     let main = commit_files(&mut alice, &*fs, &[("README", "hi\n")], "v1");
     alice.set_tag("main", main, None, false).unwrap();
     let mut tree = alice.snapshot(&main).unwrap().tree;

@@ -182,3 +182,66 @@ Format 6 adds `Operation::workspace: Option<String>`: the workspace the command 
    - *Recommendation:* writers merge right after they publish (`settle`); readers merge in memory. Nothing merges in the background.
 5. **Whether pull should stage packs, not loose objects.**
    - *Recommendation:* yes for more than 256 objects (pull already packs), as item 4 specifies.
+
+## As built / threat review (stream O)
+
+Written before the build, from the design above and a read of the code at `integration` 1799b89; kept up to date as built. Every numbered item has a test, named in brackets.
+
+### Decisions taken while building
+
+- **Which transactions are lock-free.** A repository at format ≥ 6 on a non-network backend, opened as a project (`Repo::open`). Format ≤ 5 repositories keep `op_head`, the lock and the unsynced-object protocol unchanged. Remotes are opened with `Repo::open_remote`: their transactions keep `.veil/lock` (push phase B, remote gc), with one head in `op_heads/`. On a network backend (SFTP) objects keep the unsynced protocol and lock recovery; on a disk remote they are staged like local ones, so no writer ever leaves an unsynced object under its final name at format 6.
+- **Staging.** `.veil/objects/incoming/tx-<owner>/ab/cdef…`, `<owner>` = `<host hash>-<boot hash>-<pid>-<pid start>-<ms>-<random>`. A pull's spool is `incoming/pull-<owner>` of its transaction. `owner_gone` (lock.rs) applies the lock's takeover rules to that name: same host, boot and pid namespace with the pid provably dead or reused (start time differs), or this process's own name not registered any more (a dropped transaction), or the same host with `ms` before this boot. Everything else is kept. `Repo::open` sweeps dead owners' directories; `vl fsck` notes live ones.
+- **An aborted transaction publishes too.** A transaction dropped without committing still syncs and publishes what it staged, as today's drop barrier keeps unsynced objects: the stat cache may already name them (a superseded snapshot keeps its cache). Only a failed barrier voids a staging directory.
+- **Publication order** (`Transaction::commit`): rebase and confinement; barrier over the staging directory (a failure removes it); rename every staged object over its final name (content-addressed, so replacing a concurrent identical copy is harmless and keeps a gc-freshened copy); a second barrier over every fan-out directory touched and every fan-out directory of an object found already present; the threat-14 freshening; the compare-and-swap re-checks; `OpStore::publish`. **No `settle` right after publishing** (a deviation): with every committer merging at once, eight writers raced each other into a storm of merges, 13× slower in `many_threads_no_lost_operation`. Concurrent heads are merged by the next open or transaction start instead, which every command does first.
+- **Merging at open, not only in memory (a deviation).** The design lets read-only commands merge in memory. A merge that drops an escaping rewrite (threat 3) must have run before any command uses the view: push computes what to send from the view it opened. So `Repo::open` and every transaction start settle several heads on disk (the merge is deterministic, so concurrent settlers write one operation). `Repo::open_remote` merges in memory without rewrites (remotes have one head; only a lock-free writer inside a bare directory makes two), and push settles it under the lock before writing.
+- **Per-field merge of workspaces and tags.** `WorkspaceState::wc` and `cloak` merge separately, as do a tag's `(target, annotation)` and its `cloak`. A cloak conflict keeps the cloaked side: a concurrent `ws cloak`/`tag cloak` never loses to a move. A release tag's target and annotation are one unit (never torn apart). A key changed on one side and removed on the other keeps the change (no lost update); its old value stays reachable from the log.
+- **`Operation::workspace`** is the repository's command workspace (`Repo::set_command_workspace`, set by `Ctx` to the attached workspace, by `ws exec`, `ws write` and mounts to theirs, by `snapshot_workspace_with` to the recorded one). Repository-wide commands (tag set/delete/move, push, pull, remote add/remove) clear it with `Transaction::repository_wide`. Written only at format ≥ 6.
+- **Undo and redo** compute their 3-way revert inside their transaction, from its base view, never from a view read before it (that would revert work committed in between). The revert side wins a conflict; a workspace whose working copy the revert restores carries its edits as before, and the snapshot that held them leaves the heads.
+- **Working-copy lock.** `lock::WcLock` (`flock` on `.veil/local/wc/<ws>.lock`, re-entrant within a process), taken by `Ctx` for recording and checkout, by `vl watch` per recording, by `ws exec`'s recording, `ws write` and mount recordings.
+
+### Threats, mechanisms and tests
+
+| # | threat | mechanism | test |
+|---|---|---|---|
+| 1 | lost view update in a merge | `oplog::merge_views` 3-way per key; property test against a sequential per-key model | `oplog_merge::merge_views_matches_sequential_model` and `oplog_merge::concurrent_commands_merge_per_key` (core_props), `oplog_concurrency::concurrent_tag_sets_all_land` |
+| 2 | child left on a rewritten parent | `Operation::rewritten`, `Transaction::for_merge` re-runs `rebase_descendants` | `oplog_concurrency::amend_racing_child_rebases_child` |
+| 3 | embargo escape through concurrency | merge re-runs confinement against every side's view; an escaping rewrite is reversed (the moved change back on its old parents) and named in a warning | `oplog_concurrency::concurrent_rebase_cannot_escape_embargo` (pushes to a public remote and greps decoded objects) |
+| 4 | two recorders of one workspace | `WcLock`, plus `expected_wc` re-checked against the current heads at commit | `oplog_processes::concurrent_status_loops_lose_nothing` (cli), `oplog_concurrency::expected_wc_cas_supersedes` |
+| 5 | adopting a non-durable object | staging per transaction; nobody reads another's staging; publish after a barrier; directory syncs for adopted objects | `oplog_concurrency::eio_barrier_never_adopted` |
+| 6 | torn publication | renames and head creation are mutations in the crash sweeps (all three modes) | `crash::crash_during_*` (snapshot, commit, rebase, merge, push, pull) and `crash::crash_during_settle` |
+| 7 | removing live staging | `lock::owner_gone` with the lock's rules | `oplog_concurrency::staging_sweep_keeps_live_owners` (zombie, reused pid, unknown namespace, other host, previous boot) |
+| 8 | a head pointing at nothing | `Repo::open` fails; `fsck` names the head file | `oplog_concurrency::planted_head_fails_open_and_fsck_names_it`, cli `oplog_cli::planted_head_status_fails_with_fsck_hint` |
+| 9 | the upgrade race | a stray `op_head` at format 6 is one more head, merged and removed | `format_compat::op_head_written_after_upgrade_is_merged` |
+| 10 | merge storms | deterministic merge operation (timestamp, user, description, sorted parents, derived change ids) | `oplog_concurrency::two_settlers_write_one_merge` |
+| 11 | undo removes someone else's work | `undo_target(ws)` per workspace; 3-way revert | `undo_redo_props::two_actor_undo_keeps_other_work` |
+| 12 | `op restore` drops concurrent work | refusal without `--force`, listing the operations | cli `oplog_cli::op_restore_refuses_over_other_workspace` |
+| 13 | ancestry after pruning | unknown ancestry is "not an ancestor" | `oplog_concurrency::pruned_ancestry_keeps_both_heads` |
+| 14 | a transaction outlives gc's grace | a transaction older than half the grace period freshens every pre-existing object its new objects and its view reference | `oplog_concurrency::long_transaction_survives_gc` (`SimClock`-style injected clock) |
+| 15 | metadata read-modify-writes race transactions | key rings, vault, embargo records and `repo.json` keep `.veil/lock` | `metadata_lock::grant_racing_lock_free_commits` |
+| 16 | features that relied on the lock | sandbox, mount and serve suites; interleavings below | `oplog_concurrency::mount_recording_racing_commit`, `oplog_concurrency::exec_recording_racing_rebase_of_base` |
+| 17 | embargo release outside the view | unchanged: undo/redo never release; release undo refused as today | `oplog_concurrency::release_undo_with_concurrent_commit` |
+| 18 | a merge that always fails | merges degrade instead of failing for policy reasons; a warning is printed once, by the process that writes the merge | `oplog_concurrency::concurrent_rebase_cannot_escape_embargo` (its second half: later commands succeed, no second warning) |
+| 19 | lost update through a whole-view replacement (undo, redo, `op restore` computed before their transaction) | computed inside the transaction from its base | `oplog_concurrency::undo_racing_commit_keeps_commit` |
+| 20 | a concurrent move dropping a cloak setting (wider audience) | per-field merge, the cloaked side wins | `oplog_merge::cloak_survives_concurrent_move` |
+| 21 | a release tag's target torn from its annotation | `(target, annotation)` merged as one unit | `oplog_merge::release_tag_never_torn` |
+| 22 | the stat cache naming objects an aborted transaction discarded | aborted transactions publish what they staged | `oplog_concurrency::expected_wc_cas_supersedes` (the loser's object is published), `oplog_concurrency::superseded_snapshot_keeps_objects` |
+| 23 | two pulls deleting each other's spool (BUG-800 follow-up) | `incoming/pull-<owner>` per transaction; cleanup by `owner_gone` | `oplog_concurrency::two_pulls_at_once` |
+| 24 | a hostile `op_heads/` (non-hex names, a directory, a symlink) | only 64-hex regular files are heads; others are ignored and noted by fsck | `oplog_concurrency::hostile_op_heads_entries_ignored` |
+| 25 | many writers on the disk backend lose an operation, or views differ | stress with threads and processes; every committed tag lands, `fsck` clean, one head after settle | `oplog_concurrency::many_threads_no_lost_operation`, cli `oplog_processes::many_processes_no_lost_operation` |
+| 26 | a failed barrier of one transaction voiding another's staged writes, on a backend value they share (one write batch) | backends count failed barriers (`StorageBackend::barrier_failures`); a transaction whose staging overlapped one voids itself and fails | `oplog_concurrency::eio_barrier_never_adopted` (found by it) |
+| 27 | `.veil/lock` taken by every command anyway: the snapshot refreshed the local vault's backup of isolated files under the lock, changed or not | `capture_local_files` reads the vault first and locks only to write a change | `ws_sandbox_failures_cli::no_failure_deletes_the_commands_output` (a held `.veil/lock` delays no recording), the N-agents benchmark |
+
+### What the build found and changed
+
+- **Threat 26** (above) was found by its own test: the design's barrier was per transaction, but a backend value's write batch is shared by every handle using it (threads, tests, a server).
+- **Threat 27**: with transactions off the lock, the next thing every command did under `.veil/lock` was the vault backup; without the fix the N-agents gate would still see lock waits.
+- **The compare-and-swap compares the merged view of the current heads**, not each new head's view: a head built on an older base (that never touched the workspace) showed the old working copy and superseded snapshots for nothing (`adversarial_lock::concurrent_snapshots_of_different_workspaces_are_all_recorded` caught it).
+- **A snapshot without `expected_wc` builds again** when its commit is superseded (up to 16 times), as formats ≤ 5 built again under the lock; with `expected_wc` (the CLI) the caller decides, as before.
+- **Undo's revert lets the reverting side win removals too** (`oplog::revert_views`): undoing `ws new` removes the workspace (and is refused when it holds edits, as before); the concurrent-merge rule "a removal loses to a change" would have kept it.
+- **A release tag wins over an ordinary tag** created concurrently under its name.
+- **Merging after commit was tried and removed** (see the publication order above).
+- **Merge rebases reverse a whole rewrite chain**: dropping an escaping rewrite X → X′ also rewrites back what X′ became on that side (`chained_rewrite_cannot_escape_embargo`), and a merge that cannot reach a clean state within its rounds fails rather than record an unchecked one.
+- **A transaction refuses to start from several heads** (if 16 rounds of merging could not keep up), rather than record a view merged without its rewrites.
+- **Lock-protocol tests now run on format-5 repositories** (`new_repo_v5`), where that protocol stays; the crash harness's backends model a rename as atomic and losable.
+- **Changed semantics, by design**: `vl undo` in the project directory no longer undoes `vl ws write NAME` or `vl ws exec NAME` (they are `NAME`'s operations; `vl undo --op` does); a held `.veil/lock` no longer fails a `ws exec` recording (BUG-551's premise is gone).
+

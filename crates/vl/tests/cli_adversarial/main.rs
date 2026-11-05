@@ -21,3 +21,4 @@ mod adversarial9;
 mod adversarial_cli_abuse;
 mod adversarial_cli_crash;
 mod adversarial_cli_remote;
+mod oplog_cli;

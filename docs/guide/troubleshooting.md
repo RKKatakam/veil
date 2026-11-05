@@ -427,6 +427,31 @@ exits 1.
 
 ## Locks, crashes and integrity
 
+From format 6 commands record their operations without the repository
+lock: only key-ring, vault and `repo.json` changes, `vl gc` and `vl
+upgrade` take it, for milliseconds to seconds, and pushes take a remote's.
+A `vl` killed while it records leaves its new objects in
+`.veil/objects/incoming/tx-…`, which the next command removes once that
+process is provably gone (`vl fsck` notes the ones it keeps). Two
+commands recording the same workspace's directory take turns on
+`.veil/local/wc/ws-NAME.lock`, which the system releases when a process
+ends.
+
+### `error: the working copy keeps moving under this command (another vl is running here?)`
+
+Other commands kept recording or moving this workspace while this one
+tried to record it, ten times in a row. Run it again.
+
+### `error: the repository was upgraded while this command ran; run the command again`
+
+`vl upgrade` ran while this command was working; nothing was recorded.
+
+### `error: operation … named by .veil/op_heads/… (run vl fsck)`
+
+A head of the operation log names an operation that is not there (a
+damaged disk, or a file planted by hand). `vl fsck` names the file;
+remove it if the operation is gone for good.
+
 ### `error: repository is locked: held by …, which cannot be proven gone from this machine; if it is, remove .veil/lock`
 
 Another `vl` holds the lock, or held it on another machine (common on

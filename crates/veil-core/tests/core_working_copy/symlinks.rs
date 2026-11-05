@@ -1135,7 +1135,7 @@ fn after_an_upgrade_a_file_replaced_by_a_link_is_recorded_and_its_history_kept()
     drop(repo);
     veil_core::upgrade::upgrade(backend.clone(), Some(id.clone()), &veil_core::upgrade::UpgradeOptions::default()).unwrap();
     let mut repo = Repo::open(backend, Some(id), "alice").unwrap();
-    assert_eq!(repo.format(), 5);
+    assert!(repo.format() >= 5);
     let s = repo.snapshot_workspace(WS, &d.fs).unwrap();
     assert!(s.changed && s.report.shadowed.is_empty());
     let e = file_entry(&repo, &s.snapshot, "config.yml").unwrap();

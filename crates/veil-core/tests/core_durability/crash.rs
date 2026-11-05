@@ -88,6 +88,9 @@ struct FaultyBackend {
     mutations: AtomicUsize,
     /// Unsynced writes since the last barrier.
     volatile: Mutex<Vec<VPath>>,
+    /// Unsynced renames since the last barrier (`from`, `to`): the content
+    /// is durable, the new name is not. A power loss undoes them.
+    renamed: Mutex<Vec<(VPath, VPath)>>,
     tore: AtomicBool,
 }
 
@@ -100,6 +103,7 @@ impl FaultyBackend {
             crashed: AtomicBool::new(false),
             mutations: AtomicUsize::new(0),
             volatile: Mutex::new(Vec::new()),
+            renamed: Mutex::new(Vec::new()),
             tore: AtomicBool::new(false),
         }
     }
@@ -110,6 +114,13 @@ impl FaultyBackend {
 
     /// Power loss: what never reached stable storage is torn.
     fn tear_volatile(&self) {
+        // A rename whose directory was never synced did not happen.
+        for (from, to) in self.renamed.lock().unwrap().drain(..).rev() {
+            if let Some(data) = self.inner.read_opt(&to).unwrap() {
+                self.inner.write(&from, &data).unwrap();
+                self.inner.remove_file(&to).unwrap();
+            }
+        }
         let mut volatile = self.volatile.lock().unwrap();
         self.tore.fetch_or(!volatile.is_empty(), Ordering::SeqCst);
         for (i, path) in volatile.drain(..).enumerate() {
@@ -177,6 +188,21 @@ impl StorageBackend for FaultyBackend {
     fn sync_barrier(&self) -> Result<()> {
         self.mutate(|| {
             self.volatile.lock().unwrap().clear();
+            self.renamed.lock().unwrap().clear();
+            Ok(())
+        })
+    }
+    fn rename_unsynced(&self, from: &VPath, to: &VPath) -> Result<()> {
+        self.mutate(|| {
+            let data = self.inner.read(from)?;
+            self.inner.write(to, &data)?;
+            self.inner.remove_file(from)?;
+            let mut volatile = self.volatile.lock().unwrap();
+            match volatile.iter().position(|p| p == from) {
+                // Never synced: torn under its new name instead.
+                Some(i) => volatile[i] = to.clone(),
+                None => self.renamed.lock().unwrap().push((from.clone(), to.clone())),
+            }
             Ok(())
         })
     }
@@ -223,6 +249,9 @@ struct EioBackend {
     volatile: Mutex<HashSet<VPath>>,
     /// Covered by the failed barrier: never durable unless rewritten.
     lost: Mutex<HashSet<VPath>>,
+    /// Renamed since the last successful barrier: the content is durable,
+    /// the name is not (a power loss removes it).
+    renamed: Mutex<HashSet<VPath>>,
 }
 
 impl EioBackend {
@@ -235,6 +264,7 @@ impl EioBackend {
             refuse_removes: AtomicBool::new(refuse_removes),
             volatile: Mutex::default(),
             lost: Mutex::default(),
+            renamed: Mutex::default(),
         }
     }
 
@@ -252,6 +282,9 @@ impl EioBackend {
 
     /// Tear every file that is not durable, as `FaultyBackend` does.
     fn power_loss(&self) {
+        for p in self.renamed.lock().unwrap().drain() {
+            self.inner.remove_file(&p).unwrap();
+        }
         let mut gone: Vec<VPath> = self.volatile.lock().unwrap().drain().collect();
         gone.extend(self.lost.lock().unwrap().drain());
         gone.sort();
@@ -292,6 +325,22 @@ impl StorageBackend for EioBackend {
             return Err(Self::eio());
         }
         volatile.clear();
+        self.renamed.lock().unwrap().clear();
+        Ok(())
+    }
+    fn rename_unsynced(&self, from: &VPath, to: &VPath) -> Result<()> {
+        let data = self.inner.read(from)?;
+        self.inner.write(to, &data)?;
+        self.inner.remove_file(from)?;
+        let was_volatile = self.volatile.lock().unwrap().remove(from);
+        let was_lost = self.lost.lock().unwrap().remove(from);
+        if was_volatile {
+            self.volatile.lock().unwrap().insert(to.clone());
+        } else if was_lost {
+            self.lost.lock().unwrap().insert(to.clone());
+        } else {
+            self.renamed.lock().unwrap().insert(to.clone());
+        }
         Ok(())
     }
     fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool> {
@@ -1092,4 +1141,65 @@ fn crash_during_upgrade_from_format_1() {
 #[test]
 fn crash_during_upgrade_from_format_2() {
     upgrade_sweep(2);
+}
+
+/// The lock-free op log (format 6, threat 6): two heads left by concurrent
+/// operations (an amend on one side, a child of the amended change on the
+/// other), merged by the next `Repo::open`, which writes rebased snapshots
+/// (staged, renamed into place), the merge operation and its head file. A
+/// crash at any mutation, in every mode, leaves a repository that opens
+/// and passes `fsck`, with both sides' work and both heads or the merge,
+/// never half of it; the next open completes the merge.
+#[test]
+fn crash_during_settle() {
+    use crate::oplog_concurrency::{head_files, land};
+    let id = Identity::generate("alice");
+    let disk = Arc::new(MemoryBackend::new());
+    let mut repo = Repo::init(disk.clone(), Some(id.clone()), "alice").unwrap();
+    let wc = MemoryBackend::new();
+    wc.write(&p("f"), b"1\n").unwrap();
+    repo.snapshot_workspace(WS, &wc).unwrap();
+    let (x, _) = repo.commit_working_copy(WS, "x").unwrap();
+    drop(repo);
+    let heads = head_files(&*disk);
+    let (fa, fb) = (Arc::new(disk.fork()), Arc::new(disk.fork()));
+    Repo::open(fa.clone(), Some(id.clone()), "alice").unwrap().describe(x, "x, amended").unwrap();
+    let mut b = Repo::open(fb.clone(), Some(id.clone()), "alice").unwrap();
+    b.create_workspace("side", vec![x], None).unwrap();
+    b.set_tag("from-b", x, None, false).unwrap();
+    drop(b);
+    land(&disk, &fa, &heads);
+    land(&disk, &fb, &heads);
+    let two = head_files(&*disk);
+    assert_eq!(two.len(), 2);
+    let check = |fs: Arc<dyn StorageBackend>, ctx: &str| {
+        let r = Repo::open(fs.clone(), Some(id.clone()), "alice").unwrap_or_else(|e| panic!("{ctx}: does not open: {e}"));
+        assert_healthy(fs.clone(), &id, ctx);
+        assert!(r.view().tags.contains_key("from-b"), "{ctx}: B's tag was lost");
+        let side = r.snapshot(&r.workspace_wc("side").unwrap()).unwrap();
+        let parent = r.snapshot(&side.parents[0]).unwrap();
+        assert_eq!(r.description(&parent), "x, amended", "{ctx}: the child is not on the amended change");
+        assert_eq!(r.heads().len(), 1, "{ctx}");
+    };
+    let mut crashes = 0;
+    for mode in [Crash::BeforeWrite, Crash::AfterWrite, Crash::PowerLoss] {
+        for budget in 0..10_000 {
+            let fork = Arc::new(disk.fork());
+            let faulty = Arc::new(FaultyBackend::new(fork.clone(), budget, mode));
+            let ctx = format!("settle: {mode:?} after {budget} writes");
+            let res = Repo::open(faulty.clone(), Some(id.clone()), "alice");
+            if res.is_ok() && !faulty.crashed() {
+                check(fork.clone(), &ctx);
+                break;
+            }
+            crashes += 1;
+            // Reboot: the heads are both originals, or the merge (with
+            // the head file of a parent it had not removed yet, which is
+            // its ancestor and dropped by readers).
+            let now = head_files(&*fork);
+            assert!(now.len() <= 3 && now.iter().filter(|h| !two.contains(*h)).count() <= 1, "{ctx}: heads {now:?}");
+            check(fork.clone(), &ctx);
+        }
+    }
+    assert!(crashes >= 3, "too few crash points ({crashes})");
 }

@@ -221,6 +221,9 @@ impl Repo {
 
     fn record_switch(&mut self, from: &str, to: &str, link: impl FnOnce(&mut crate::transaction::Transaction<'_>)) -> Result<Option<ObjectId>> {
         let mut tx = self.transaction(switch_description(from, to))?;
+        // `vl undo` in the workspace the directory is now attached to
+        // undoes the switch.
+        tx.for_workspace(to);
         link(&mut tx);
         tx.view.workspace(to)?;
         tx.manual_undo(format!(
@@ -237,6 +240,7 @@ impl Repo {
     /// instead of undoing an unrelated, earlier operation (BUG-116).
     pub fn record_outside_view(&mut self, description: impl Into<String>, how: impl Into<String>) -> Result<Option<ObjectId>> {
         let mut tx = self.transaction(description)?;
+        tx.repository_wide();
         tx.manual_undo(how);
         tx.commit()
     }
