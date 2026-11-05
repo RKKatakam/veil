@@ -509,9 +509,22 @@ impl Repo {
                             }
                         }
                     }
+                    // Undone on that side since: it shows `old` again, as
+                    // a ref or as an ancestor of one (an undone abandon or
+                    // amend of a parent of `@`). One walk from the refs, down
+                    // to the oldest rewritten snapshot.
+                    let mut floor = crate::graph_index::Gen::MAX;
+                    for old in side_map.keys() {
+                        if let Some(g) = self.graph.generation(self, old)? {
+                            floor = floor.min(g);
+                        }
+                    }
+                    let visible: std::collections::HashSet<ObjectId> = match floor {
+                        crate::graph_index::Gen::MAX => Default::default(),
+                        f => self.graph.down_to(self, refs.iter().copied(), f)?.into_keys().collect(),
+                    };
                     for (old, new) in side_map {
-                        // Undone on that side since (it shows `old` again).
-                        if refs.contains(&old) {
+                        if refs.contains(&old) || visible.contains(&old) {
                             continue;
                         }
                         match rewritten.get(&old) {

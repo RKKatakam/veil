@@ -2628,7 +2628,11 @@ take no lock:
   files). Readers drop a head that is an op-graph ancestor of another (a
   crash between the last two steps); the walk stops an hour below the oldest
   head and at pruned operations, where unknown ancestry counts as "not an
-  ancestor" (a harmless extra merge). A head naming a missing operation
+  ancestor" (an extra merge: the merge base walk, `OpStore::split`, has no
+  such floor and finds the operation a side forked from however long ago,
+  BUG-803). A transaction whose base operation was pruned while it ran
+  (`gc --keep-ops-days`) fails at commit rather than publish an operation
+  with no common history (BUG-804). A head naming a missing operation
   fails `Repo::open`, with `fsck` naming the file; non-head entries are
   ignored.
 * **Staging.** New loose objects go to the transaction's own directory,
@@ -2653,8 +2657,10 @@ take no lock:
   formats ≤ 5 and network remotes.
 * **Compare-and-swap.** A snapshot that recorded a workspace
   (`Transaction::expect_wc`) re-reads the heads at commit and fails
-  ("superseded") if their merged view moved that workspace; every commit
-  re-reads `repo.json` and fails if the repository was upgraded meanwhile.
+  ("superseded") if their merged view moved that workspace; the check and
+  the publication are one step for the threads of a process (a static
+  mutex, BUG-806). Every commit re-reads `repo.json` and fails if the
+  repository was upgraded meanwhile.
   `lock::WcLock` (`flock` on `.veil/local/wc/ws-<name>.lock`, re-entrant
   within a process) keeps one recorder per workspace directory: the
   project directory's `Ctx` for its recording and its checkout, `ws exec`,
@@ -2671,12 +2677,17 @@ take no lock:
   unit and win over an ordinary tag). Each side's `rewritten` is applied to
   the other's new snapshots (`Transaction::for_merge` runs the auto-rebase:
   a child committed on a snapshot amended meanwhile moves onto the amended
-  one); both sides rewriting one snapshot differently is a divergent change.
+  one); both sides rewriting one snapshot differently is a divergent change,
+  and a rewrite whose old snapshot is still visible on its side (an undo
+  since: as a ref or an ancestor of one) is not applied (BUG-802).
   The confinement check runs against **every side's view**: a rewrite that
   would move a change out of an unreleased embargo either side had it in
   is dropped and its replacement rewritten back, so the change stays
   inside, and a warning names the change and the embargo, never a file.
-  The merge never fails for a policy reason. Its timestamp is its
+  The merge never fails for a policy reason: a snapshot whose rebase is
+  refused (two unreleased embargoes combined, say) stays on its old
+  parents, with what is built on it, and the warning names it (BUG-805).
+  Its timestamp is its
   parents' latest, its user `veil`, and what it creates derives its change
   ids from its parents: two processes merging the same heads write the same
   operation, and `create_new` of its head file loses to itself. Merging at

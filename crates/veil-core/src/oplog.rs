@@ -486,32 +486,37 @@ impl OpStore {
 
     /// Split the history of `a` and `b` (each a set of operations): the
     /// operations only `a` reaches, those only `b` reaches (newest first),
-    /// and their nearest common operation (the newest one both reach,
-    /// within an hour below the oldest start; `None` if there is none
-    /// there, or it was pruned).
+    /// and their nearest common operation (the newest one both reach;
+    /// `None` if there is none, or it was pruned). The walk is exact (no
+    /// time floor): a side whose history spans more than an hour still
+    /// finds the operation it forked from, and lists every operation since
+    /// (their rewrites are applied by the merge).
     pub fn split(&self, a: &[ObjectId], b: &[ObjectId]) -> Result<Split> {
         let mut ops: HashMap<ObjectId, Operation> = HashMap::new();
         let mut marks: HashMap<ObjectId, u8> = HashMap::new();
-        let mut done: HashMap<ObjectId, u8> = HashMap::new();
+        let mut done: HashMap<ObjectId, (u8, bool)> = HashMap::new();
         let mut queue = BinaryHeap::new();
-        let mut floor = i64::MAX;
         for (set, m) in [(a, 1u8), (b, 2u8)] {
             for id in set {
                 let Some(op) = self.cached(&mut ops, id)? else { continue };
-                floor = floor.min(op.timestamp);
                 queue.push((op.timestamp, *id));
                 *marks.entry(*id).or_default() |= m;
             }
         }
-        let floor = floor.saturating_sub(ANCESTRY_SLACK_MS);
-        while let Some((ts, id)) = queue.pop() {
-            let m = marks[&id];
-            if done.get(&id) == Some(&m) {
+        // Ancestors of a common operation (never the nearest one).
+        let mut stale: std::collections::HashSet<ObjectId> = Default::default();
+        while let Some((_, id)) = queue.pop() {
+            let (m, st) = (marks[&id], stale.contains(&id));
+            if done.get(&id) == Some(&(m, st)) {
                 continue;
             }
-            done.insert(id, m);
-            if m == 3 || ts < floor {
-                continue;
+            done.insert(id, (m, st));
+            // Common operations are walked too (the classic merge-base walk): a
+            // timestamp out of order (a merge has its newest parent's) may
+            // have sent one side below them first. The walk ends once
+            // everything still queued is common.
+            if m == 3 && queue.iter().all(|(_, q)| marks[q] == 3) {
+                break;
             }
             let parents = match self.cached(&mut ops, &id)? {
                 Some(op) => op.parents.clone(),
@@ -519,8 +524,9 @@ impl OpStore {
             };
             for p in parents {
                 let Some(pts) = self.cached(&mut ops, &p)?.map(|o| o.timestamp) else { continue };
+                let newly_stale = m == 3 && stale.insert(p);
                 let pm = marks.entry(p).or_default();
-                if *pm | m != *pm {
+                if *pm | m != *pm || newly_stale {
                     *pm |= m;
                     queue.push((pts, p));
                 }
@@ -534,6 +540,7 @@ impl OpStore {
             match marks[&id] {
                 1 => out.only_a.push(id),
                 2 => out.only_b.push(id),
+                _ if stale.contains(&id) => {}
                 _ => {
                     if base.is_none_or(|b| (ts, id) > b) {
                         base = Some((ts, id));

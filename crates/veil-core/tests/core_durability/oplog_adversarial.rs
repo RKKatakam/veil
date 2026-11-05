@@ -41,7 +41,6 @@ fn head_file(id: &ObjectId) -> veil_core::VPath {
 /// set) lands concurrently: the merge re-applies the undone abandon, and the
 /// working copy loses X again.
 #[test]
-#[ignore = "BUG-802: a merge re-applies a rewrite that its side undid"]
 fn undone_abandon_is_not_redone_by_a_concurrent_merge() {
     let (mut repo, fs, id) = new_repo("alice");
     repo.set_command_workspace(Some(WS.into()));
@@ -72,7 +71,6 @@ fn undone_abandon_is_not_redone_by_a_concurrent_merge() {
 /// The same with an amend (`vl describe`): the undone rewrite comes back,
 /// and the working copy moves onto the amended change the user undid.
 #[test]
-#[ignore = "BUG-802: a merge re-applies a rewrite that its side undid"]
 fn undone_amend_is_not_redone_by_a_concurrent_merge() {
     let (mut repo, fs, id) = new_repo("alice");
     repo.set_command_workspace(Some(WS.into()));
@@ -104,7 +102,6 @@ fn undone_amend_is_not_redone_by_a_concurrent_merge() {
 /// no common operation and merges against an empty view: a tag deleted on
 /// one side comes back (and is pushed by the next `vl push`).
 #[test]
-#[ignore = "BUG-803: the merge base is not found below the one-hour ancestry floor"]
 fn merge_base_is_found_below_the_ancestry_slack() {
     let (mut repo, fs, id) = new_repo("alice");
     let base = commit_files(&mut repo, &*fs, &[("f", "1\n")], "base");
@@ -155,7 +152,6 @@ fn commit_in(r: &mut veil_core::Repo, ws: &str, files: &[(&str, &str)], msg: &st
 /// which `merge_trees` refuses: the merge fails, and since every command
 /// merges the heads first (at open), every command fails from then on.
 #[test]
-#[ignore = "BUG-805: a merge whose rebase is refused fails every later command"]
 fn merge_combining_two_embargoes_degrades_instead_of_failing_forever() {
     let (mut repo, fs, id) = new_repo("alice");
     let v1 = commit_files(&mut repo, &*fs, &[("a.c", "v\n")], "v1");
@@ -201,7 +197,6 @@ fn merge_combining_two_embargoes_degrades_instead_of_failing_forever() {
 /// parents only). The long command then publishes an operation whose parent
 /// is gone, and the merge has no common operation: the deleted tag returns.
 #[test]
-#[ignore = "BUG-804: an operation whose base was pruned meanwhile is merged against an empty view"]
 fn transaction_whose_base_was_pruned_does_not_merge_against_nothing() {
     let (mut repo, fs, id) = new_repo("alice");
     let base = commit_files(&mut repo, &*fs, &[("f", "1\n")], "base");
@@ -232,4 +227,126 @@ fn transaction_whose_base_was_pruned_does_not_merge_against_nothing() {
     let tags = &r.view().tags;
     assert!(!tags.contains_key("withdrawn"), "a deleted tag came back (commit: {committed:?})");
     assert!(tags.contains_key("a"));
+}
+
+// ---- the compare-and-swap of a recording is not atomic -----------------------------
+
+/// A disk that stops one thread (named `recorder-a`) right before it creates
+/// an op head file, until released: the gap between a transaction's
+/// compare-and-swap check (`recheck`) and its publication.
+#[derive(Debug)]
+struct PublishGate {
+    inner: std::sync::Arc<veil_core::MemoryBackend>,
+    armed: std::sync::atomic::AtomicBool,
+    at: (std::sync::Mutex<bool>, std::sync::Condvar),
+    go: (std::sync::Mutex<bool>, std::sync::Condvar),
+}
+
+impl PublishGate {
+    fn wait(flag: &(std::sync::Mutex<bool>, std::sync::Condvar)) {
+        let mut g = flag.0.lock().unwrap();
+        while !*g {
+            g = flag.1.wait(g).unwrap();
+        }
+    }
+    fn set(flag: &(std::sync::Mutex<bool>, std::sync::Condvar)) {
+        *flag.0.lock().unwrap() = true;
+        flag.1.notify_all();
+    }
+}
+
+impl StorageBackend for PublishGate {
+    fn kind(&self) -> &'static str {
+        "gate"
+    }
+    fn read(&self, path: &veil_core::VPath) -> veil_core::Result<Vec<u8>> {
+        self.inner.read(path)
+    }
+    fn write(&self, path: &veil_core::VPath, data: &[u8]) -> veil_core::Result<()> {
+        self.inner.write(path, data)
+    }
+    fn create_new(&self, path: &veil_core::VPath, data: &[u8]) -> veil_core::Result<bool> {
+        let me = std::thread::current().name() == Some("recorder-a");
+        if me && path.as_str().starts_with(OP_HEADS_DIR) && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            Self::set(&self.at);
+            Self::wait(&self.go);
+        }
+        self.inner.create_new(path, data)
+    }
+    fn remove_file(&self, path: &veil_core::VPath) -> veil_core::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &veil_core::VPath) -> veil_core::Result<()> {
+        self.inner.remove_dir_all(path)
+    }
+    fn create_dir_all(&self, path: &veil_core::VPath) -> veil_core::Result<()> {
+        self.inner.create_dir_all(path)
+    }
+    fn list_dir(&self, path: &veil_core::VPath) -> veil_core::Result<Vec<veil_core::vfs::DirEntry>> {
+        self.inner.list_dir(path)
+    }
+    fn metadata(&self, path: &veil_core::VPath) -> veil_core::Result<Option<veil_core::vfs::Metadata>> {
+        self.inner.metadata(path)
+    }
+    fn set_executable(&self, path: &veil_core::VPath, x: bool) -> veil_core::Result<()> {
+        self.inner.set_executable(path, x)
+    }
+}
+
+/// Two recorders of one directory in one process (threads of `vl serve`,
+/// an embedder): A scans and passes its compare-and-swap check, then B
+/// scans (seeing A's edit and its own), checks and publishes, then A
+/// publishes over the workspace B already moved. The merge keeps one
+/// working copy and warns: B's edit is out of the workspace (BUG-801's
+/// `racing_snapshots_of_one_directory_lose_nothing` fails this way about
+/// once in 50 runs under load).
+#[test]
+fn two_recorders_of_one_workspace_never_both_publish() {
+    use std::sync::{atomic::AtomicBool, Arc, Condvar, Mutex};
+    let id = veil_core::Identity::generate("alice");
+    let gate = Arc::new(PublishGate {
+        inner: Arc::new(veil_core::MemoryBackend::new()),
+        armed: AtomicBool::new(false),
+        at: (Mutex::new(false), Condvar::new()),
+        go: (Mutex::new(false), Condvar::new()),
+    });
+    let fs: Arc<dyn StorageBackend> = gate.clone();
+    let mut init = veil_core::Repo::init(fs.clone(), Some(id.clone()), "alice").unwrap();
+    init.snapshot_workspace(WS, &*fs).unwrap();
+    drop(init);
+    gate.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    fs.write(&p("file-a"), b"from A\n").unwrap();
+    let a = {
+        let (fs, id) = (fs.clone(), id.clone());
+        std::thread::Builder::new()
+            .name("recorder-a".into())
+            .spawn(move || {
+                let mut r = veil_core::Repo::open(fs.clone(), Some(id.clone()), "alice").unwrap();
+                r.snapshot_workspace(WS, &*fs).unwrap()
+            })
+            .unwrap()
+    };
+    PublishGate::wait(&gate.at);
+    fs.write(&p("file-b"), b"from B\n").unwrap();
+    let b = {
+        let (fs, id) = (fs.clone(), id.clone());
+        std::thread::spawn(move || {
+            let mut r = veil_core::Repo::open(fs.clone(), Some(id.clone()), "alice").unwrap();
+            r.snapshot_workspace(WS, &*fs).unwrap()
+        })
+    };
+    // B either finishes (it was not held back) or waits for A.
+    let t = std::time::Instant::now();
+    while !b.is_finished() && t.elapsed() < std::time::Duration::from_secs(2) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    PublishGate::set(&gate.go);
+    a.join().unwrap();
+    b.join().unwrap();
+    let mut r = veil_core::Repo::open(fs.clone(), Some(id.clone()), "alice").unwrap();
+    let w = r.take_warnings();
+    assert!(!w.iter().any(|w| w.contains("moved by concurrent commands")), "both recordings published: {w:?}");
+    let wc = r.workspace_wc(WS).unwrap();
+    assert_eq!(read_at(&r, &wc, "file-a"), b"from A\n");
+    assert_eq!(read_at(&r, &wc, "file-b"), b"from B\n", "B's edit is not in the working copy");
 }

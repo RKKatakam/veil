@@ -55,6 +55,9 @@ struct MergeCtx {
     seed: ObjectId,
     timestamp: i64,
     warnings: Vec<String>,
+    /// Snapshots the current round left on their old parents, because
+    /// rebasing them was refused (with why).
+    held: Vec<(ObjectId, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -182,6 +185,7 @@ impl<'r> Transaction<'r> {
             seed: ObjectId::hash(&seed),
             timestamp,
             warnings,
+            held: Vec::new(),
         });
         Ok(tx)
     }
@@ -555,7 +559,17 @@ impl<'r> Transaction<'r> {
             // relative to the merge of its old ones. A merge one of whose
             // parents moved is re-merged, never rebased by one parent's diff
             // (that dropped what the other parents hold, BUG-251).
-            let out = self.repo.rebase_tree(&s.parents, &new_parents, s.tree, s.cloak.as_deref())?;
+            let out = match self.repo.rebase_tree(&s.parents, &new_parents, s.tree, s.cloak.as_deref()) {
+                // A merge of concurrent operations never fails for a policy
+                // reason (threat 18; two embargoes combined, say): this
+                // snapshot, and what is built on it, stay where their side
+                // put them, and the warning names it.
+                Err(VeilError::Policy(why)) if self.merge.is_some() => {
+                    self.merge.as_mut().expect("a merge").held.push((id, why));
+                    continue;
+                }
+                r => r?,
+            };
             let tree = out.tree;
             let mut conflicts: BTreeSet<String> = s.conflicts.iter().cloned().collect();
             conflicts.extend(out.conflicts.iter().map(|c| c.to_string()));
@@ -731,6 +745,7 @@ impl<'r> Transaction<'r> {
         for _ in 0..rounds {
             self.view = base_view.clone();
             self.rewritten = union.clone();
+            self.merge.as_mut().expect("a merge").held.clear();
             for (k, v) in &reversals {
                 self.rewritten.insert(*k, v.clone());
             }
@@ -797,6 +812,14 @@ impl<'r> Transaction<'r> {
             let change = self.repo.snapshot(&c)?.change_id;
             warn.push(format!(
                 "a concurrent rewrite of change {} was not applied: it would have moved it out of unreleased embargo {e}; the change stays inside the embargo",
+                change.short()
+            ));
+        }
+        let held = std::mem::take(&mut self.merge.as_mut().expect("a merge").held);
+        for (id, why) in held {
+            let change = self.repo.snapshot(&id)?.change_id;
+            warn.push(format!(
+                "change {} was left on its old parents: moving it onto a concurrent rewrite was refused ({why})",
                 change.short()
             ));
         }
@@ -881,6 +904,17 @@ impl<'r> Transaction<'r> {
                 "the repository was upgraded while this command ran; run the command again",
             ));
         }
+        // An operation whose parent is gone has no common operation with
+        // the heads that landed meanwhile, and would be merged against an
+        // empty view (deleted tags and workspaces coming back).
+        for b in &self.base {
+            if self.repo.ops.try_get(b)?.is_none() {
+                return Err(VeilError::repo(format!(
+                    "operation {} this command started from was pruned by `vl gc --keep-ops-days` while it ran; run the command again",
+                    b.short()
+                )));
+            }
+        }
         if self.expected.is_empty() {
             return Ok(());
         }
@@ -931,6 +965,13 @@ impl<'r> Transaction<'r> {
             return Ok(None);
         }
         let lock_free = self.lock.is_none() && self.merge.is_none();
+        // A recording's compare-and-swap (`recheck`) and its publication are
+        // one step for the threads of this process: otherwise two recorders
+        // of one workspace both pass the check and both publish (BUG-806).
+        // Other processes recording a workspace hold its `WcLock` for the
+        // whole recording.
+        static PUBLISH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let publishing = (lock_free && !self.expected.is_empty()).then(|| PUBLISH.lock().unwrap_or_else(|e| e.into_inner()));
         if lock_free || self.repo.format() >= crate::oplog::OP_HEADS_REPO_FORMAT {
             self.recheck()?;
         } else {
@@ -977,6 +1018,7 @@ impl<'r> Transaction<'r> {
             lock.ensure_held()?;
         }
         let id = self.repo.ops.publish(&op, &self.stale)?;
+        drop(publishing);
         self.repo.op_id = id;
         self.repo.base = vec![id];
         self.repo.raw = RawHeads {
