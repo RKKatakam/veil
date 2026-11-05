@@ -20,16 +20,30 @@ Scion took Anthropic from about 2,500 merges a day in May 2026 to more than 30,0
 
 | Idea | How Scion does it |
 |---|---|
-| Commits without locks | A commit is an entry in a write-ahead log: the files changed plus pointers to their contents by hash. No locking, no coordination between servers. |
+| Commits without locks | A commit (a "changeset") is an entry in a write-ahead log, created on the server: the files changed relative to its first parent, each with a pointer to its compressed contents by hash. It is not a pointer to a whole tree, as a Git commit is. No locking, no coordination between servers. |
 | One tiny step done one at a time | Moving `main` is a single atomic compare-and-swap on one database row (Spanner), separate from writing the commit. |
 | No merge-queue lock | Concurrent changes may conflict. Testing happens after the merge and before deploy, and Claude fixes the conflicts. |
 | Few branches | Only `main` and release branches. Others are discouraged because every server has to agree on them. |
 | No packfiles, no gc | Each blob is stored on its own in cloud storage. "No repository maintenance is needed." |
-| The server does the work | The server creates commits, does merges and rebases, and answers blame and history queries. |
-| Precomputed indexes | Blame, file history and commit-graph indexes are built step by step as each commit lands. |
+| The server does the work | The server creates commits, does merges and rebases, and answers blame and history queries, so there is nothing to push. The client "can compute very little on its own" and assumes the server is always reachable. |
+| Derived data | One generic mechanism: each index's value for a changeset is computed from its parents' values, either eagerly as the changeset lands or deferred until asked. Examples: blame, path history, skip lists over the commit graph, copy detection, path search. |
 | Thin client | `scn` keeps a cache of limited size, fetches only the files it needs, and gives a partial checkout where files appear when read. |
-| Layered caches | Client, then a daemon on each machine, then a regional cache, then the server. Over 99% of requests are answered by a cache at each layer. |
+| Layered caches | Client, then a daemon on each machine (which starts from a periodically refreshed snapshot), then a regional cache, then the server. All layers answer the same requests; each talks only to the next, so a failing cache can't overwhelm the servers. No layer keeps long-lived state, and over 99% of requests are answered by a cache at each layer. |
 | API-first jobs | CI and agents ask for diffs, history or bisects through the API, often without checking anything out. |
+| Fetch protocol | The client never sends a list of what it has: it starts from the root tree, asks for the trees it is missing, then the blobs. Every request names an object that never changes, so any cache can serve it, and a dropped download resumes. |
+| Testing and operations | Hermetic simulations of the infrastructure, fuzzing, rate limiting, and Claude agents that watch each component's telemetry and logs, alongside ordinary alerts. |
+
+Scale, from the post: almost 100 GB of history on `main`, a compressed working copy over 25 GB, and about 25 million checkouts a day from CI. Scion uses about 200 times less CPU and memory than the Git mirror fleet it replaced, and checkouts take seconds instead of minutes.
+
+What Anthropic tried and dropped:
+- several hundred Git mirrors and seeds, which were hard to run and fell behind `main`;
+- shallow clones, sparse checkouts and promisor remotes, which "bought time" but did not solve the scaling problem;
+- a global merge-queue lock.
+
+Caveats from the post:
+- Scion is "by no means a suitable replacement for git for general use". It is built for one very large monorepo. Veil must stay good at the ordinary, Git-sized case and not take on Scion's always-online assumptions by default.
+- Code Claude wrote sometimes broke system constraints, or grew over-engineered after adversarial review, and engineers had to say no. Veil's threat reviews and adversarial passes should reject additions no threat calls for.
+- The post does not cover agent attribution, sandboxes, resource limits, offline work, latency, cache sizes or Git migration. Veil's items for those (4.6, 4.7) are Veil's own designs, not taken from Scion.
 
 ## What Veil already has
 Veil already has about half of Scion's foundations. The missing half is the server.
@@ -77,7 +91,7 @@ Goal: history questions are answered in milliseconds without a checkout. Encrypt
 
 | # | Feature | What it does | Cloaked content |
 |---|---|---|---|
-| 3.1 | Index framework | Each index entry is computed from a commit and its parents' entries, either when the commit lands or the first time someone asks | A runner holding the keys computes it and stores it encrypted for the scope |
+| 3.1 | Index framework | Each index entry is computed from a commit and its parents' entries, either when the commit lands or the first time someone asks. Phase 0's local commit-graph index (`docs/design/scale/3-history-index.md`, generation numbers and Bloom filters computed from parents) is the first such index; the framework generalises it rather than replacing it | A runner holding the keys computes it and stores it encrypted for the scope |
 | 3.2 | Commit-graph index | `log`, ancestry and merge-base queries no longer walk the whole history | The graph's shape needs no keys, so the server can do it |
 | 3.3 | Blame and file history | Precomputed per file, so `vl blame` on a 10-year-old file is instant | An encrypted index, read by members' clients |
 | 3.4 | Search by code and file path | Search file names and contents across history | Public: the server. Cloaked: an encrypted index that members search on their own machine, or search hosted on a runner |
@@ -92,7 +106,7 @@ Goal: an agent's sandbox is ready in seconds on a repo of any size, and many job
 | 4.1 | Fetch on demand | The client asks for the folders and files it wants, starting from the top folder. It doesn't have to send a list of everything it already has. | Fetches encrypted data and decrypts it locally |
 | 4.2 | Cache of limited size | Old objects are evicted, so a laptop never holds the full history | Same |
 | 4.3 | Checkouts that fetch from the server | Extend `vl ws mount` so a file is fetched from the server the first time it's read | Decrypted inside the mount, never on the server |
-| 4.4 | Partial clone | Clone one directory and only recent history | Same |
+| 4.4 | Partial clone | Clone one directory and only recent history. Phase 0's SFTP version (`docs/design/scale/6-partial-clone.md`) already fetches each object by hash with no list of what the client has, as Scion's protocol does. But it still copies the remote's pack indexes, and Anthropic found Git-style partial clones only bought time, so it is a stop-gap: the Hub's version uses 4.1 through the caches of 2.3 | Same |
 | 4.5 | Agent sandboxes on the Hub | `vl ws exec` against a remote repo: create a workspace, run, push the change, all without a full clone | The agent gets keys only for the scopes its task needs |
 | 4.6 | Agent identity and attribution | Each change records the agent, its task and a reference to its prompt, so a bad landing can be traced | Same |
 | 4.7 | Resource limits | CPU and memory caps for each sandbox, plus a shared build cache | Not applicable |
@@ -120,7 +134,9 @@ Goal: people review what a change is for rather than every line, and the team ca
 | 6.3 | Path permissions for agents | An agent may write only the paths its task names; the server refuses the rest | Scopes already control who can read; this adds control over who can write |
 | 6.4 | Health metrics | Per repo: merges per hour, time to land, conflict rate, reverts, cache hit rate | Metrics contain no file content |
 | 6.5 | Failure isolation | Caches and servers run as separate layers, so a cache outage slows reads but never blocks landing | Same |
-| 6.6 | Scale benchmark | A repeatable load test (N agents creating changes, landing them and running queries) run before each release | Includes a test profile with mostly cloaked files |
+| 6.6 | Scale benchmark | A repeatable load test (N agents creating changes, landing them and running queries) run before each release. Phase 0's version is `crates/veil-bench` (`docs/design/scale/BASELINE.md`) | Includes a test profile with mostly cloaked files |
+| 6.7 | Rate limiting | Per-account and per-agent limits on requests and landings, so one runaway agent can't starve the rest | Same |
+| 6.8 | Simulation testing | Hermetic simulations of the Hub, its caches and many clients, with faults injected (dropped connections, cache outages, racing landings) | Includes cloaked and embargoed changes, checked for leaks |
 
 ## Roadmap
 Phase 0 fits alongside the current 1.0 work and makes today's remote handle concurrent pushes. Each later phase depends on the one before it.
@@ -133,7 +149,9 @@ Phase 0 fits alongside the current 1.0 work and makes today's remote handle conc
    - *Gate:* an agent sandbox on a large repo is ready in seconds.
 4. **Phase 3: History answered by the server.** Index framework (3.1), blame and file history (3.3), search (3.4), rename and copy detection (3.6), encrypted indexes for cloaked scopes computed by runners that hold the keys.
    - *Gate:* blame, log and diff are answered through the API with no checkout.
-5. **Phase 4: Landing at agent scale.** Landing on the server (5.1), landing runners (5.2), fast path for non-overlapping changes (5.3), protected `main` (5.7), land first and test after (5.4), conflict-fixing agents (5.5), automatic bisect and revert (5.6), review by intent, CI through the API, path permissions, metrics and isolation (6.1–6.5).
+5. **Phase 4: Landing at agent scale.** Landing on the server (5.1), landing runners (5.2), fast path for non-overlapping changes (5.3), protected `main` (5.7), land first and test after (5.4), conflict-fixing agents (5.5), automatic bisect and revert (5.6), review by intent, CI through the API, path permissions, metrics and isolation (6.1–6.5), rate limiting (6.7).
+
+Simulation testing (6.8) starts in phase 1 and grows with each phase.
 
 The roadmap has no dates. Each gate is a benchmark result, and the target scale is still an open question.
 
@@ -149,4 +167,5 @@ The roadmap has no dates. Each gate is a benchmark result, and the target scale 
 - [Anthropic: Redesigning source control at Anthropic](https://www.anthropic.com/research/redesigning-source-control) (13 Oct 2026)
 - [The Register on Scion](https://www.theregister.com/a/5302943)
 - [Arize: Why Anthropic replaced Git, and whether you'll need to](https://arize.com/?p=33172)
+- Checked against the Anthropic post on 2026-11-05.
 - Veil repo: `docs/ARCHITECTURE.md` §8–9, `docs/HUB.md` §2, §4, §5.7, §7, `docs/BACKLOG.md`
