@@ -1,5 +1,7 @@
 # Veil Hub: design
 
+> **Visibility model:** `docs/VISIBILITY.md` is the source of truth (decided 2026-11-05). The Hub serves **company** code in plaintext behind its permission checks, so it can merge, search and blame it. It is **zero-knowledge only for the secret tier** (`.env` and the like). Sections below that assume all non-public code is encrypted, and so unreadable by the Hub, describe the earlier model and are to be revised with stream V.
+
 Status: **design draft, post-1.0.** Nothing here is implemented. Veil 1.0
 ships without a server: code goes to a path or SSH remote (team or public)
 that needs nothing but SFTP

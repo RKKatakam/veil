@@ -9,9 +9,12 @@ Crates:
 
 Read `docs/ARCHITECTURE.md` (its "Threat model" section has the trust boundary), `docs/FORMAT.md` and `docs/BUGS.md`.
 
+## Who can see what
+**`docs/VISIBILITY.md` is the source of truth** for access, encryption, sharing, agents and the Hub. In short: one repository; paths are **public** (the internet), **company** (plaintext, enforced by the Hub's permission check), **secret** (`.env` and the like: the only encrypted tier, shared with the company by default) or **isolated** (never leaves the machine). Read it before designing anything about access.
+
 ## Invariants (never break these)
 - Veil does not interoperate with Git (no import, export, sync, colocation, submodules, Git file formats or Git-format patches). Owner decision, 2026-11-05: permanent.
-- Cloaked, isolated and embargoed content never reaches public snapshots, remotes, logs, JSON or error messages.
+- Company, secret (cloaked), isolated and embargoed content never reaches public snapshots, public remotes, logs, JSON or error messages. Secret content is only ever stored encrypted. Isolated content never leaves the machine.
 - Visibility labels are claims; objects are authority (`verify_sealing`).
 - Old repository formats stay readable. A format change bumps the version and adds a `vl upgrade` path.
 - Everything works offline. `veil-core` builds for WASM: OS-only code goes behind `#[cfg(feature = "os")]`.

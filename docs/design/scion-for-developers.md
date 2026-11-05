@@ -11,7 +11,7 @@ A "Scion for developers" is a source-control service where most of the work happ
 
 Veil could offer this to any team, not just one company's huge repo, by building it on the Veil Hub.
 
-The catch is encryption. Scion is fast because its server can read everything: it merges, computes blame and indexes all content. The Veil Hub can't read cloaked files, so every server-side feature below splits in two:
+**Update, 2026-11-05 (`docs/VISIBILITY.md`):** company code is no longer encrypted. The Hub reads and serves it behind permission checks, so the split below applies only to the **secret** tier (`.env` and the like). Company code gets Scion's full server-side treatment. Original text: The catch is encryption. Scion is fast because its server can read everything: it merges, computes blame and indexes all content. The Veil Hub can't read cloaked files, so every server-side feature below splits in two:
 - **Public content:** the Hub does it on the server, as Scion does.
 - **Cloaked content:** it runs where the keys are, on the developer's machine or the team's own trusted runners. Any results that are stored go back as encrypted data.
 
