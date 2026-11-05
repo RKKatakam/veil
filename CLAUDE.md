@@ -18,11 +18,11 @@ Read `docs/ARCHITECTURE.md` (its "Threat model" section has the trust boundary),
 ## Checks to run, and show the output of
 ```sh
 export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=line-tables-only
-cargo test --all-targets --no-fail-fast
-cargo clippy --all-targets -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
-bash scripts/check-wasm.sh                 # needs target/debug/vl, so run it after the tests
-cargo test --all-targets -- --ignored      # open BUG reproductions; only known bugs may fail
+# The whole check (~5 min): nextest + clippy + rustdoc in parallel, then WASM and ignored BUG tests.
+# Prefer this to plain `cargo test --all-targets` (~25 min). It deletes target/ at the end.
+bash ~/.cache/veil-orch/verify-fast.sh <name>
+# While iterating, one test binary at a time:
+cargo test -p vl --test cli_security -- <test name>
 VEIL_BLESS_DOCS=1 cargo test -p vl --bin vl reference_is_up_to_date   # after any CLI change
 ```
 
