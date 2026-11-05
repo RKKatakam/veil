@@ -2972,29 +2972,44 @@ only make a walk longer. The index is a device-local cache in
   child. Each layer lists the parents that were missing; when one is
   present, the index is voided (a new epoch) and rebuilt.
 
-### Garbage collection (`vl gc`)
+### Garbage collection and maintenance (`vl gc`, `gc.rs`, `maintenance.rs`)
 
-`gc` holds the repository lock (`RepoLock`) for its whole run and works in
-this order:
+`vl gc` runs three tasks: **prune**, then **consolidation** of loose
+objects, then **geometric merging** of packs
+(`docs/design/scale/4-background-cleanup-streaming.md`). On a lock-free
+repository (format ≥ 6, local) it holds the **gc lease** (`.veil/gc.lock`,
+an `flock`: one gc at a time, never stale) and not `.veil/lock`, so writers
+and metadata updates never wait for it; elsewhere (format ≤ 5, remotes) it
+holds `.veil/lock` for its whole run, as their transactions do. Under its
+hold it re-reads `repo.json` and stops if the format changed (`vl upgrade`
+takes the lease too).
 
-1. **Inventory.** List every loose and packed object *before* looking at
-   reachability. Objects written after this point, for example by a `vl`
-   process that is building a snapshot and waiting for the lock, are not in
-   the inventory, so gc never touches them.
-2. **Op-log pruning** (`--keep-ops-days N`, off by default). Delete
-   operations older than the window. The current operations (every head,
-   format 6) and their parents are always kept, so `vl undo` works and can
-   be redone. `op log`
-   and op-id prefixes end where the log was pruned.
-3. **Mark.** The roots are the views of every retained operation (heads,
-   workspaces, tags, remote tags), the universal root, the project
-   directory's checkout pointer (`.veil/local/checkout.json`; the CLI diffs
-   the working copy against it), and keep markers. From there gc walks
-   snapshot → parents and tree, tree → entries, and file entry → object and
-   embargo `fallback`. An embargoed entry's pre-merge content is therefore
-   kept even after the fallback becomes its only reference. Snapshot
+Pruning:
+
+1. **Inventory.** Every pack index and the loose listing, *before*
+   reachability. Each copy of an object has a position (pack by pack, then
+   the sorted loose ids), found by a binary search of each pack's ids and of
+   the loose list: no set of all ids is built. Objects written after this
+   point are not in the inventory, so gc never touches them.
+2. **Op-log pruning** (`--keep-ops-days N`, off by default). Operations
+   older than the window go. Every head file's operation and its parents
+   are always kept, so `vl undo` works and can be redone. `op log` and
+   op-id prefixes end where the log was pruned.
+3. **Mark into a bitmap**, one bit per position (objects outside the
+   inventory, written since, in a small set). The roots are the views of
+   every retained operation (heads, workspaces, tags, remote tags), the
+   universal root, the project directory's checkout pointer
+   (`.veil/local/checkout.json`; the CLI diffs the working copy against it,
+   and `vl gc` adds the one it read itself), and keep markers. From there
+   gc walks snapshot → parents and tree, tree → entries (a subtree already
+   marked is not entered again), and file entry → object and embargo
+   `fallback`. An embargoed entry's pre-merge content is therefore kept
+   even after the fallback becomes its only reference. Snapshot
    `predecessors` (the evolution log) are weak references, as they already
-   are for sync: `vl evolog` stops where history was collected.
+   are for sync: `vl evolog` stops where history was collected. Memory is
+   the bitmap, the walk stack, the packs' index tables and the caches'
+   limits, never object content (measured: about 15 bytes per object
+   beyond the index tables, `maintenance::pruning_memory_is_the_inventory_bits_not_the_objects`).
 4. **Grace period, two phases.** An unreachable object is first recorded in
    `objects/gc/pending` with the time gc first saw it unreachable. A later
    gc deletes it only if it is still unreachable after `--grace-minutes`
@@ -3005,28 +3020,59 @@ this order:
    order. Markers are roots for the next gc, and a kept object's grace period
    restarts. Each loose object gc deletes goes through three steps: read it,
    delete it, then check for a marker; if a marker appeared, gc restores it.
-   Packed garbage needs no such step: the freshening process has its own
-   loose copy. So a process that starts using an object in the middle of a
-   gc keeps it, unless that process runs longer than the grace period.
-6. **Repack.** Write one new pack with everything kept: reachable objects
-   plus pending ones. Then delete the pruned ops, the now-packed loose files
-   and the old packs, and finally write the new pending list.
-   **The deletion fence (lock-free repositories, BUG-811).** gc holds the gc
-   lease (`.veil/gc.lock`, an `flock`), not `.veil/lock`. Every deletion
-   happens under `objects/gc/fence`, raised only once no transaction is
+6. **Packed garbage** goes by rewriting a pack only when its deletable
+   garbage is more than a quarter of its bytes, or the pack is at most
+   16 MiB, or the grace period is zero: its other entries are copied as
+   stored into a new pack (a delta whose base goes is stored whole). The
+   big old pack keeps its garbage (pending) until that share is reached.
+7. **The deletion fence (lock-free repositories, BUG-811).** Every deletion
+   (loose garbage, a rewritten pack's old copy, pruned operations) happens
+   under `.veil/local/gc/fence`, raised only once no transaction is
    registered (`objects/incoming/live-<owner>`, from before it reads the
-   heads until it has published): gc waits up to 5 s for a quiet moment,
+   heads until it has published; `Repo::open` and reload register too while
+   they read the op log): gc waits up to 5 s for a quiet moment,
    then raises it and waits up to 60 s for the rest (new transactions wait
-   for it), and otherwise deletes nothing that run. Under the fence it reads
-   its roots again and marks what they reach (what was published or reused
-   meanwhile), prunes only operations of its first listing, and gives a
-   loose copy to anything that became reachable whose pack goes. When it
-   deleted something it writes a new prune epoch (`objects/gc/epoch`); a
-   transaction whose process read its view under an older epoch checks at
-   commit that what its view gained and its new objects name is present.
-7. **Refuse to guess.** If any operation, snapshot or tree on the way cannot
-   be read (missing, corrupt, or sealed without a key), gc still packs but
-   deletes nothing, and reports why.
+   for it), and otherwise deletes nothing that run and says so. Under the
+   fence it reads its roots again and marks what they reach (what was
+   published or reused meanwhile), prunes only operations of its first
+   listing, and gives a loose copy to anything that became reachable whose
+   pack goes. When it deleted something it writes a new prune epoch
+   (`.veil/local/gc/epoch`); a transaction whose process read its view
+   under an older epoch checks at commit that what its view gained and its
+   new objects name is present ("… run the command again" otherwise).
+8. **Refuse to guess.** If any operation, snapshot or tree on the way cannot
+   be read (missing, corrupt, or sealed without a key), gc deletes nothing,
+   and reports why.
+
+**Consolidation** packs every loose object (all of them for `vl gc`; those
+older than 10 minutes for `--auto`) into one new pack, reachable or not:
+what the prune just found unreachable goes into a pack of its own, which a
+later prune drops whole. Successive versions of a path, found by walking
+the new snapshots' new trees, are delta candidates. The order is the
+durability argument: the `.pack` (fsynced, renamed, its directory
+fsynced), then the `.idx` written durably, and only then each loose file
+is removed. **Geometric merging** then merges the smallest packs so that
+each remaining one is at least twice the next smaller one (Git's
+`repack --geometric=2`), copying entries as stored; the big old pack is
+not rewritten. Readers never take an object for missing meanwhile: a miss
+is `Missing` only after a loose probe, a reload of the pack list and a
+second loose probe, and a pack whose index vanished while it was being
+opened counts as removed, not broken. **Crash debris** is removed by every
+run: stream temp files (`.stream-<owner>.vltmp…`, which name their
+process) whose owner is provably gone, owner-less temp files a day old,
+and dead transactions' staging, spools and registrations.
+
+**Background maintenance.** After a command (`Ctx::finish`), `vl` starts
+`vl gc --auto` detached (its own process group, `nice 10`, idle I/O
+priority on Linux, output to `.veil/local/maintenance.log`, 0600, kept to
+1 MiB) when `maintenance::auto_due` says so: about 6,700 loose objects
+(estimated from 16 of the 256 fan-out directories), more than 50 packs, or
+a week since the last prune. Not for a bare repository, not with
+`VEIL_GC_AUTO=0`, and by default not when `CI` is set; not again within
+10 minutes. `--auto` consolidates and merges every time, and prunes (with
+the default grace, keeping the op log) only a week after the last prune or
+once the operations since rewrote 10,000 snapshots. It exits at once if
+the lease is held.
 
 Benchmark (`cargo test --release -p veil-core --test core_bench --
 --ignored --nocapture storage_bench::`): 3,000 source files, 300 commits and 30 abandoned

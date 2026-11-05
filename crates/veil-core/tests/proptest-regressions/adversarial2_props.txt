@@ -1,8 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc c8e751107769173b4e49efafbd60f01445379fae74fbb373d20743dfbffd2835 # shrinks to ops = [Embargo { cloaked_line: false, file: 0 }]
-cc 738b007a78433c6ca52d71636a24e99638f5722e559923c538fdcc68dd2c8412 # shrinks to ops = [Embargo { cloaked_line: false, file: 0 }]

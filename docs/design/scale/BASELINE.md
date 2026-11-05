@@ -29,6 +29,21 @@ Times are unchanged (clone 59 s, gc 17 s, initial push 12.9 s).
 
 What still grows with the store: the per-object tables (gc's inventory, reachability set and path hints; a sync's `seen` set and the remote's inventory), a few tens of bytes per object, and the bounded caches (delta bases 64 MiB, packs held whole 64 MiB, a sync's last versions 64 MiB). Most of `gc, again` is its mark phase: the caches fill, and the tables are built (instrumented run: +207 MiB during marking, +92 MiB while packing). At 5 GB, gc's tables are the first thing to watch (the prune bitmap of item 4 replaces them).
 
+## Incremental maintenance (scale stream G2)
+
+`scripts/bench-scale.sh 1g`, 2026-11-05, on the G2 branch (bitmap prune, consolidation, geometric merging, the deletion fence of BUG-811). Same machine; no other build ran. The run took 21 minutes. Raw results (not committed): `.scratch/bench-results/1g-seed1-20261105T203731Z.md`. The benchmark now sets `VEIL_GC_AUTO=0` for every `vl` it runs and times `vl gc --auto` as a case of its own; "gc, after one commit" and "gc --auto" are new cases, run after the packed-store cases (one small commit, then `gc`).
+
+| case | baseline (b549e1e) | G1 (BUG-800) | **G2** | gate (512 MiB, big pack kept) |
+|---|---:|---:|---:|---|
+| gc, first (packs 3.38 GB loose) | 18.7 s, 867 MiB | 17 s, 297 MiB | **19.6 s, 246 MiB** | passes |
+| gc, again (nothing new) | 18.7 s, 998 MiB | 17 s, 467 MiB | **3.2 s, 202 MiB** | passes |
+| gc, after one commit | – | – | **3.6 s, 203 MiB**; both packs kept as they were | passes |
+| gc --auto (background maintenance) | – | – | **0.28 s, 79 MiB** | passes |
+
+- `gc, again` no longer rewrites the store (it was a full repack): it marks into a bitmap and finds nothing to pack. Its 202 MiB is mostly the pack index tables (48 bytes per object), the bounded caches and the op log's views; the mark itself adds about 15 bytes per object (`core_durability::maintenance::pruning_memory_is_the_inventory_bits_not_the_objects`).
+- After the first gc the store is two packs: the live objects, and the objects the prune found unreachable (packed apart, so a later prune drops that pack whole). After one commit, both were kept and two small packs were added (the new objects, and their garbage); geometric merging leaves them until they add up.
+- Remote cases are unchanged from `integration` @ `2a337ee`, measured the same evening with only the remote phases (`--skip-phase local,gc,packed,agents`): push, initial 192 MiB over SFTP (base 192), push nothing new 96 MiB (base 96), pull of one snapshot 168 MiB (base 168), clone 565 MiB over SFTP and 449 MiB by path (base 573 and 452). **The SFTP clone is over the gate on the base already** (G1 measured 424 MiB, before streams O and P): BUG-813.
+
 ## The harness
 
 - **The crate:** `crates/veil-bench` is a workspace member, but not one of the `default-members`, so `cargo test --all-targets` never builds it. It is driven by `scripts/bench-scale.sh [tiny|small|1g|5g] [--cloaked] [-- flags]`.

@@ -202,10 +202,10 @@ Process rules: never run `cargo fmt`; scratch work goes in `.scratch/`; builds u
 These were found in the BUG-800 review. They belong to the streams named; none of them blocks today's code.
 
 - **Stream O (lock-free op log):** pull spools remote packs to the fixed directory `.veil/objects/incoming/pull` and clears it when it starts. That is safe only while a pull holds the repository lock for its whole transaction, as it does today. Without the lock, two pulls would delete each other's spool. **O must give each pull its own spool directory** (`incoming/pull-<transaction id>`), and its cleanup must remove only spools whose transaction is dead.
-- **G2 (maintenance):** a crash mid-stream leaves a `*.stream.vltmp*` temp file, as an interrupted write did before. Maintenance should remove stale temp files and stale spools.
-- **G2:** loose objects on a remote are still downloaded into memory. The benchmark's remotes are fully packed, so it didn't show up.
-- **G2:** `gc`'s second run peaks at 467 MiB at 1 GB, mostly in marking. The reachability bitmap replaces this before 5 GB.
-- **G2:** `PREFETCH_LIMIT` (2 GiB, now a disk bound) makes packs beyond it fetch one object at a time on a 5 GB store.
+- **G2 (maintenance), done:** a crash mid-stream leaves a `*.stream.vltmp*` temp file, as an interrupted write did before. Maintenance should remove stale temp files and stale spools. *Done:* stream temp files name their process (`.stream-<owner>.vltmp…`); every gc removes those whose owner is provably gone, owner-less ones a day old, and dead staging, spools and registrations (`maintenance::sweep_debris`); push journals are streams too (BUG-812).
+- **G2, done:** loose objects on a remote are still downloaded into memory. The benchmark's remotes are fully packed, so it didn't show up. *Done:* they are spooled in pieces to the pull's spool (`loose/<id>`), checked against their id as they stream; memory holds their ids.
+- **G2, done:** `gc`'s second run peaks at 467 MiB at 1 GB, mostly in marking. The reachability bitmap replaces this before 5 GB. *Done:* the bitmap prune (`gc.rs`); numbers in `BASELINE.md`.
+- **G2, done:** `PREFETCH_LIMIT` (2 GiB, now a disk bound) makes packs beyond it fetch one object at a time on a 5 GB store. *Done:* the fixed limit is gone; every needed pack is spooled, bounded by the free-space check before the download (which names the space needed).
 
 ## 3. Order and dependencies
 

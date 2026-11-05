@@ -1418,6 +1418,13 @@ impl Drop for Owner {
     }
 }
 
+/// This process's own [`Owner`] tag, registered for as long as it runs
+/// (it names the stream temp files it writes).
+pub fn process_owner() -> &'static str {
+    static OWNER: std::sync::OnceLock<Owner> = std::sync::OnceLock::new();
+    OWNER.get_or_init(Owner::new).tag()
+}
+
 /// The tag an [`Owner`] of process `pid` (started at `start`, 0 if
 /// unknown) on `host` would have at `ms`: for tests that simulate other
 /// processes and machines.

@@ -20,6 +20,7 @@ Options:
 | `--prune-now` | Delete unreachable objects now (grace period 0). Safe beside running `vl` commands: gc deletes only while none of them is recording, and one that reuses a deleted object asks to be run again |
 | `--level <LEVEL>` | zstd compression level for packed objects (default: `3`) |
 | `--no-deltas` | Do not delta-compress successive versions of a file |
+| `--auto` | Run as background maintenance does (`vl` starts it after a command when the store needs it; `VEIL_GC_AUTO=0` turns that off, and so does `CI` unless `VEIL_GC_AUTO=1`): pack loose objects older than 10 minutes, merge small packs, and prune only after a week or 10,000 rewritten snapshots. Exits at once if another gc is running |
 
 ---
 

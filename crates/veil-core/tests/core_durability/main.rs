@@ -18,6 +18,7 @@ mod crash;
 mod durability;
 mod gc_concurrency;
 mod lock;
+mod maintenance;
 mod metadata_lock;
 mod oplog_concurrency;
 mod oplog_adversarial;

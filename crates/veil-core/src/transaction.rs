@@ -123,10 +123,10 @@ impl<'r> Transaction<'r> {
                     Some(r) => r,
                     None => crate::maintenance::Registration::enter(&repo.store)?,
                 };
-                repo.store.begin_tx_staging(reg.tag())?;
                 // Packs gc removed before we registered may still be in
                 // this process's list: a presence check must not trust it.
-                repo.store.reload_packs()?;
+                repo.store.refresh_packs()?;
+                repo.store.begin_tx_staging(reg.tag())?;
                 Some(reg)
             }
             // Objects are written unsynced and made durable by one barrier

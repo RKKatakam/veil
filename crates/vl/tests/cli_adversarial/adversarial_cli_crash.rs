@@ -100,6 +100,40 @@ fn kill_9_mid_command_never_corrupts_the_repository() {
     assert!(cat.starts_with("round5 7"), "{cat}");
 }
 
+/// `kill -9` at different moments of `vl gc` (scale stream G2: its prune,
+/// consolidation, pack rewrites and merging): the repository stays usable
+/// and `fsck` clean, history is intact, and the next gc completes.
+#[test]
+fn kill_9_mid_gc_never_loses_anything() {
+    let env = Env::new();
+    let proj = env.project("alice", "proj", &[("keep.txt", "keep\n")]);
+    for round in 0..6 {
+        many_files(&proj, 300, &format!("round{round}"));
+        env.ok("alice", &proj, &["commit", "-m", &format!("round {round}")]);
+        if round % 2 == 1 {
+            env.ok("alice", &proj, &["abandon", "@-"]);
+        }
+        let args: &[&str] = match round % 3 {
+            0 => &["gc"],
+            1 => &["gc", "--prune-now"],
+            _ => &["gc", "--keep-ops-days", "0", "--prune-now"],
+        };
+        let mut child = env.spawn("alice", &proj, args);
+        std::thread::sleep(Duration::from_millis(15 + 41 * round as u64));
+        let _ = child.kill(); // SIGKILL
+        let _ = child.wait();
+        let (fsck, out) = (env.vl("alice", &proj, &["fsck"]), "");
+        assert!(fsck.status.success(), "round {round}: fsck after kill -9 of gc:\n{}{out}", text(&fsck));
+        env.ok("alice", &proj, &["log"]);
+        assert_eq!(read(&proj, "keep.txt"), "keep\n");
+        env.ok("alice", &proj, &["gc"]);
+    }
+    let cat = env.stdout("alice", &proj, &["cat", "d7/f7.txt", "-r", "@-"]);
+    assert!(cat.starts_with("round4 7"), "{cat}");
+    let fsck = env.vl("alice", &proj, &["fsck"]);
+    assert!(fsck.status.success(), "{}", text(&fsck));
+}
+
 /// A process killed while holding the repository lock blocked every later
 /// command for two minutes. From format 6 a recording takes no repository
 /// lock: it stages its objects in its own directory. A process killed

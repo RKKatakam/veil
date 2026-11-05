@@ -209,14 +209,17 @@ fn mixed_loose_and_packed_store() {
     let ids = repo.store().list_objects().unwrap();
     assert_eq!(ids.iter().filter(|i| **i == packed_wc).count(), 1);
 
-    // The next gc folds everything back into a single pack.
+    // The next gc packs the loose objects into a pack of their own: the
+    // old pack is far bigger, so geometric merging leaves it as it is
+    // (scale stream G2: the big old pack is never rewritten).
     let before = all_raw(&repo);
+    let old_packs = fs.list_dir(&p(".veil/objects/pack")).unwrap();
     let r = gc(&mut repo, &now_gc()).unwrap();
     assert_eq!(r.packs_before, 1);
     let stats = repo.store().stats().unwrap();
-    assert_eq!((stats.loose_objects, stats.packs), (0, 1));
+    assert_eq!((stats.loose_objects, stats.packs), (0, 2));
     let pack_files = fs.list_dir(&p(".veil/objects/pack")).unwrap();
-    assert_eq!(pack_files.len(), 2, "old pack removed: {pack_files:?}");
+    assert!(old_packs.iter().all(|f| pack_files.contains(f)), "old pack kept: {pack_files:?}");
     for (id, raw) in &before {
         assert_eq!(&repo.store().get_raw(id).unwrap(), raw);
     }

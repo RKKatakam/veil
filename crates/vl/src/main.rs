@@ -21,6 +21,7 @@ macro_rules! eprintln {
 
 mod api;
 mod attr_cmd;
+mod auto_gc;
 mod cli;
 mod ctx;
 mod doctor;
@@ -172,6 +173,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let code = dispatch(&mut ctx, &cli)?;
             ctx.finish()?;
             hooks::post_checkout(&ctx, &cli.cmd, before);
+            if !matches!(cli.cmd, Cmd::Gc { .. }) {
+                auto_gc::maybe_spawn(&ctx);
+            }
             Ok(code)
         }
     }
@@ -541,7 +545,9 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             prune_now,
             level,
             no_deltas,
-        } => cmd_gc(ctx, *keep_ops_days, *grace_minutes, *prune_now, *level, *no_deltas)?,
+            auto,
+        } if !*auto => cmd_gc(ctx, *keep_ops_days, *grace_minutes, *prune_now, *level, *no_deltas)?,
+        Cmd::Gc { .. } => auto_gc::run(ctx)?,
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -2801,6 +2807,7 @@ fn cmd_gc(
         },
         level,
         deltas: !no_deltas,
+        extra_roots: ctx.checkout_roots(),
         ..GcOptions::default()
     };
     let r = gc(&mut ctx.repo, &opts)?;
@@ -2842,6 +2849,12 @@ fn cmd_gc(
     }
     if let Some(why) = &r.deferred {
         println!("{} {why}", yellow("note:"));
+    }
+    if r.merged > 0 {
+        println!("Merged {} small pack(s) into one", r.merged);
+    }
+    if r.debris_removed > 0 {
+        println!("Removed {} leftover(s) of interrupted commands", r.debris_removed);
     }
     Ok(())
 }

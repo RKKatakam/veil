@@ -728,6 +728,9 @@ impl ObjectStore {
                 Ok(p) => packs.push(Arc::new(p)),
                 // Removed by a concurrent gc between listing and opening.
                 Err(e) if e.is_not_found() => {}
+                // Its data file went after its index was read: removed
+                // meanwhile too (index first), if the index is gone now.
+                Err(_) if !self.backend.exists(&crate::pack::index_file(&dir, &name)).unwrap_or(true) => {}
                 Err(e) => broken.push((name, e.to_string())),
             }
         }
@@ -737,6 +740,15 @@ impl ObjectStore {
             broken,
         };
         Ok(true)
+    }
+
+    /// Re-scan the pack directory if this store has listed it already (a
+    /// list that has not been loaded yet will be fresh when it is).
+    pub(crate) fn refresh_packs(&self) -> Result<()> {
+        if self.packs.read().unwrap().loaded {
+            self.reload_packs()?;
+        }
+        Ok(())
     }
 
     /// Currently known packs (loading them if needed).
@@ -806,7 +818,7 @@ impl ObjectStore {
         if self.ensure_packs().is_err() {
             return false;
         }
-        self.in_loaded_packs(id) || (self.reload_packs().unwrap_or(false) && self.in_loaded_packs(id))
+        self.in_loaded_packs(id) || (self.reload_packs().unwrap_or(false) && self.in_loaded_packs(id)) || self.loose_exists(id)
     }
 
     /// [`ObjectStore::has`], freshening `id` for gc even if this process
@@ -848,7 +860,15 @@ impl ObjectStore {
         match self.read_packed(id) {
             Ok(Some(raw)) => Ok(raw),
             Ok(None) if loose_corrupt => Err(loose_mismatch(id)),
-            Ok(None) => Err(VeilError::Missing(*id)),
+            // `Missing` means redacted to the engine: only after a loose
+            // probe, a reload of the pack list (in `read_packed`) and a
+            // second loose probe, so that a reader racing maintenance
+            // (a pack replaced, a copy moved) never takes an object for
+            // redacted (threat 2 of the maintenance design).
+            Ok(None) => match self.read_loose_verified(id)? {
+                Loose::Good(b) => Ok(b),
+                _ => Err(VeilError::Missing(*id)),
+            },
             Err(e) if loose_corrupt && e.is_not_found() => Err(loose_mismatch(id)),
             Err(e) => Err(e),
         }

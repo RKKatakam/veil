@@ -314,6 +314,7 @@ fn main() -> Result<()> {
                         if phase("packed") {
                             run::local(&mut b, "packed store", false)?;
                         }
+                        run::gc_incremental(&mut b)?;
                     }
                     if phase("sftp") {
                         if b.opts.sftp_server.is_none() {

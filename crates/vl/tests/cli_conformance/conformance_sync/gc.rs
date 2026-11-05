@@ -330,6 +330,58 @@ fn gc_concurrent_with_commits_loses_nothing() {
     }
 }
 
+// Veil (BUG-811's class, scale stream G2): `gc --keep-ops-days 0
+// --prune-now` on both sides beside every kind of writer at once: a commit,
+// two `ws exec` recordings, a push, and a pull with its own gc. Each command
+// succeeds or asks to be run again; nothing recorded is lost, and `fsck` is
+// clean on both sides. Run it under load (many copies at once).
+#[test]
+fn gc_beside_commits_pushes_pulls_and_ws_exec_loses_nothing() {
+    let env = Env::new();
+    let (alice, hub) = env.project_with_hub("alice", "alice", "hub", &[("a.txt", "a\n")]);
+    let bob = env.clone("bob", &hub, "bob");
+    for w in ["agent0", "agent1"] {
+        env.ok("alice", &alice, &["ws", "new", w, "-r", "main"]);
+    }
+    write(&alice, "mine.txt", "alice's work\n");
+    let gc = ["gc", "--keep-ops-days", "0", "--prune-now"];
+    let mut children = vec![
+        env.spawn("alice", &alice, &["ws", "exec", "agent0", "-m", "agent 0", "--", "sh", "-c", "echo zero > zero.txt"]),
+        env.spawn("alice", &alice, &gc),
+        env.spawn("alice", &alice, &["commit", "-m", "mine"]),
+        env.spawn("alice", &alice, &["ws", "exec", "agent1", "-m", "agent 1", "--", "sh", "-c", "echo one > one.txt"]),
+        env.spawn("alice", &alice, &["push"]),
+        env.spawn("bob", &bob, &["pull"]),
+        env.spawn("bob", &bob, &gc),
+        env.spawn("alice", &alice, &gc),
+    ];
+    for c in children.drain(..) {
+        let out = c.wait_with_output().unwrap();
+        assert!(exited_cleanly(&out), "{}", text(&out));
+        assert!(
+            out.status.success() || text(&out).contains("locked") || text(&out).contains("run the command again"),
+            "{}",
+            text(&out)
+        );
+    }
+    for w in ["agent0", "agent1"] {
+        env.ok("alice", &alice, &["ws", "exec", w, "--record-only"]);
+    }
+    let _ = env.vl("alice", &alice, &["commit", "-m", "mine"]);
+    env.ok("alice", &alice, &["push"]);
+    env.ok("bob", &bob, &["pull"]);
+    for (dir, who) in [(&alice, "alice"), (&bob, "bob")] {
+        let (code, out) = env.code(who, dir, &["fsck"]);
+        assert_eq!(code, 0, "{who}: {out}");
+    }
+    assert_eq!(read(&alice, "mine.txt"), "alice's work\n");
+    assert!(env.ok("alice", &alice, &["log"]).contains("mine"));
+    for (w, f, c) in [("agent0", "zero.txt", "zero\n"), ("agent1", "one.txt", "one\n")] {
+        assert_eq!(env.stdout("alice", &alice, &["ws", "cat", w, f]), c, "work of {w} lost");
+    }
+    assert_eq!(env.stdout("bob", &bob, &["cat", "a.txt", "-r", "main"]), "a\n");
+}
+
 // Veil: gc on a clone, then push and pull keep working (packed objects travel).
 #[test]
 fn push_and_pull_work_after_gc_on_both_sides() {

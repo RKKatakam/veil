@@ -380,15 +380,23 @@ impl Repo {
             warnings: Vec::new(),
             prune_epoch: None,
         };
+        // Reading the heads walks the op log (and may merge): registered for
+        // gc's deletion fence meanwhile, so no operation it reads is pruned
+        // under it (BUG-811's class).
+        let reg = match repo.lock_free() {
+            true => Some(crate::maintenance::Registration::enter(&repo.store)?),
+            false => None,
+        };
         repo.read_heads()?;
         repo.graph = GraphIndex::new(repo.backend.clone(), persists_index(&*repo.backend, &repo.view));
-        if repo.lock_free() {
+        if reg.is_some() {
             // Best effort: what dead transactions staged is garbage.
             let ctx = crate::lock::LockContext::default();
             let _ = repo.store.sweep_staging(&ctx);
             let _ = crate::maintenance::sweep_registrations(&repo.store, &ctx);
             repo.settle()?;
         }
+        drop(reg);
         Ok(repo)
     }
 
@@ -432,6 +440,11 @@ impl Repo {
     /// Re-read the operation heads (another process or task may have
     /// published since); from format 6, merge several.
     pub fn reload(&mut self) -> Result<()> {
+        // As in `open`: registered while the op log is read.
+        let _reg = match self.lock_free() {
+            true => Some(crate::maintenance::Registration::enter(&self.store)?),
+            false => None,
+        };
         if self.read_heads()? {
             // Another process may have pulled a parent the index took as
             // missing.

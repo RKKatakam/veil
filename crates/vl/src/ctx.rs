@@ -656,6 +656,14 @@ impl Ctx {
         }
     }
 
+    /// The snapshots this command's view of the project directory names
+    /// (the checkout pointer as it read it): `vl gc` keeps them, as this
+    /// command reads them when it finishes, even if another command moved
+    /// the directory meanwhile.
+    pub fn checkout_roots(&self) -> Vec<veil_core::ObjectId> {
+        std::iter::once(self.checkout.snapshot).chain(self.checkout.pending.as_ref().map(|p| p.snapshot)).collect()
+    }
+
     /// Bring the project directory in line with the attached workspace.
     pub fn finish(&mut self) -> Result<()> {
         self.print_merge_warnings();

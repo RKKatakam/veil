@@ -960,7 +960,8 @@ fn upgrade_refuses_a_corrupt_repository_and_changes_nothing() {
     .unwrap_err();
     assert!(err.to_string().contains("upgrade refused"), "{err}");
     let mut after = veil_files(&root);
-    after.retain(|(p, _)| !p.ends_with("upgrade.json"));
+    // The journal, and the gc lease's (empty) lock file the upgrade took.
+    after.retain(|(p, _)| !p.ends_with("upgrade.json") && !p.ends_with(".veil/gc.lock"));
     assert_eq!(after, before);
     assert_eq!(read_config(&*fx.backend("alice")).unwrap().format, 1);
 }
