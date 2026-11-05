@@ -101,6 +101,7 @@ For each lens, read the diff **against the whole codebase and the brief's intent
      - substring checks on random change ids;
      - tag names made only of the letters k–z;
      - wall-clock ratios;
+     - leak checks that grep for a short needle (under ~8 bytes): it turns up by chance in ciphertext and compressed packs. Always grep for the whole marker;
      - asserting that something happened (liveness) before checking nothing leaked (safety).
    - Do `CLAUDE.md`, the guide, `ARCHITECTURE.md` and `FORMAT.md` still tell the truth? **Docs that lie are a bug.**
 
