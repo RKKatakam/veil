@@ -61,8 +61,8 @@ Global options (accepted by every command):
 | [`vl ignore`](ignore.md) | Do not track matching paths at all |
 | [`vl policy`](policy.md) | Inspect the visibility policy |
 | [`vl scan`](scan.md) | Scan the working copy for secrets that would become public |
-| [`vl attr`](attr.md) | Per-path attributes from `.gitattributes`: line endings, binary files, diff and merge drivers |
-| [`vl renormalize`](renormalize.md) | Re-record files with the line endings `.gitattributes` asks for now (changing `.gitattributes` alone never re-records a file). `vl undo` reverts it |
+| [`vl attr`](attr.md) | Per-path attributes from `.veilattributes`: line endings, binary files, diff and merge drivers |
+| [`vl renormalize`](renormalize.md) | Re-record files with the line endings `.veilattributes` asks for now (changing `.veilattributes` alone never re-records a file). `vl undo` reverts it |
 | [`vl secret`](secret.md) | Encrypted secrets: the device-local vault, or a scope's team vault (`--scope`), shared with the scope's members through team remotes |
 | [`vl run`](run.md) | Run a command with vault secrets injected as environment variables |
 | [`vl identity`](identity.md) | Your public-key identity |
@@ -76,11 +76,7 @@ Global options (accepted by every command):
 | [`vl remote`](remote.md) | Manage remotes |
 | [`vl push`](push.md) | Send tags and their history to a remote (visibility-filtered) |
 | [`vl pull`](pull.md) | Fetch tags and history from a remote |
-| [`vl git`](git.md) | Two-way Git interop: import Git history, push and fetch Git remotes |
-| [`vl format-patch`](format-patch.md) | Export snapshots as patch emails in Git's format |
-| [`vl am`](am.md) | Apply patch emails (Git's `format-patch` output, or a plain diff) as new changes on top of a snapshot |
 | [`vl hooks`](hooks.md) | Hooks run before commits and pushes; repository-suggested ones only once this device trusts them (not implemented yet) |
-| [`vl submodule`](submodule.md) | Git submodules: pinned commits of other Git repositories, fetched with `git` only when you run `vl submodule update` |
 | [`vl gc`](gc.md) | Pack objects and delete those no retained operation can reach |
 | [`vl doctor`](doctor.md) | Check this machine's setup and explain every problem found: identity, VEIL_HOME, the repository and its lock, the stat cache, the filesystem (case sensitivity, fsync, network mounts), the clock, the vault and leftover sandboxes. Exits 1 if anything is broken |
 | [`vl completions`](completions.md) | Print a shell completion script, e.g. `vl completions zsh > ~/.zfunc/_vl` |

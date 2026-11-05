@@ -83,7 +83,6 @@ const FOLLOW_EVERY: Duration = Duration::from_secs(1);
 
 /// `.veil/local/mounts` of project directory `root`.
 pub fn mounts_dir(root: &Path) -> PathBuf {
-    // In a colocated project, `.git/veil/local/mounts`.
     let mut p = veil_core::repo::state_dir(root);
     p.extend(MOUNTS_DIR.split('/').skip(1));
     p

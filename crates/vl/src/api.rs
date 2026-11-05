@@ -244,7 +244,7 @@ pub fn snapshot_ref_as(repo: &Repo, id: &ObjectId, public: bool) -> SnapshotRef 
     match repo.snapshot(id) {
         Ok(s) => {
             let (description, description_hidden) = match (&s.description, public) {
-                (Text::Sealed(e), true) => match veil_core::git::public_description(repo.store(), &s.description) {
+                (Text::Sealed(e), true) => match veil_core::blame::public_description(repo.store(), &s.description) {
                     Some(t) => (Some(t), None),
                     None => (None, Some(HiddenText { scope: split_label(&e.scope).0.to_string(), reason: "not_public" })),
                 },
@@ -448,15 +448,15 @@ pub struct Change {
     /// The new version is an unresolved conflict (null otherwise).
     pub conflict: Option<ConflictInfo>,
     /// What the new version is (the old one for a deletion): `file`,
-    /// `symlink`, `gitlink` (format 5) or `conflict`.
+    /// `symlink` (format 5) or `conflict`.
     pub kind: &'static str,
     /// The old version's kind when a modification changed it (a file
     /// replaced by a symlink: `T` in the text); null otherwise.
     pub old_kind: Option<&'static str>,
 }
 
-/// What entry `e` is, as JSON spells it: `file`, `symlink`, `gitlink`,
-/// `conflict` (or `dir`).
+/// What entry `e` is, as JSON spells it: `file`, `symlink`, `conflict`
+/// (or `dir`).
 pub fn entry_kind(e: &TreeEntry) -> &'static str {
     e.kind.name()
 }
@@ -476,12 +476,10 @@ pub fn link_target(repo: &Repo, e: &TreeEntry) -> Option<String> {
     repo.store().read_entry(&own).ok().map(|t| String::from_utf8_lossy(&t).into_owned())
 }
 
-/// The Git mode of entry `e`: `100644`, `100755`, `120000` (symlink) or
-/// `160000` (gitlink).
+/// The mode of entry `e`: `100644`, `100755` or `120000` (symlink).
 fn git_mode(e: &TreeEntry, executable: bool) -> &'static str {
     match e.kind {
         EntryKind::Symlink => "120000",
-        EntryKind::Gitlink => "160000",
         _ if executable => "100755",
         _ => "100644",
     }
@@ -646,7 +644,7 @@ pub struct Status {
     /// Files in the working-copy snapshot that are absent on disk.
     pub redacted: Vec<RedactedPath>,
     pub conflicts: Vec<Conflict>,
-    /// Files still recorded with line endings `.gitattributes` would now
+    /// Files still recorded with line endings `.veilattributes` would now
     /// convert (`vl renormalize` re-records them). Omitted when none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub renormalizable: Vec<String>,
@@ -1130,7 +1128,7 @@ pub struct EntryInfo {
     /// An unresolved conflict (null otherwise); its content is the file
     /// with markers this reader is shown.
     pub conflict: Option<ConflictInfo>,
-    /// `file`, `symlink`, `gitlink` (format 5) or `conflict`.
+    /// `file`, `symlink` (format 5) or `conflict`.
     pub kind: &'static str,
     /// A symlink's target, when this reader can read it (null otherwise,
     /// and for anything but a symlink).
@@ -1222,7 +1220,7 @@ pub(crate) fn item_diff_for_text(repo: &Repo, item: &Item, attrs: &Attrs<'_>) ->
 }
 
 /// The attributes diffs are shown under: the working copy's
-/// `.gitattributes` (as Git does), with the device-local file.
+/// `.veilattributes` (as Git does), with the device-local file.
 pub fn diff_attrs(repo: &Repo) -> Attrs<'_> {
     Attrs::for_backend(repo.store(), &**repo.backend())
 }
@@ -1256,7 +1254,7 @@ fn content(repo: &Repo, c: &TreeChange, attrs: &Attrs<'_>) -> Content {
         (Ok(a), Ok(b)) => (a, b),
         (Err(v), _) | (_, Err(v)) => return none(false, Some(v)),
     };
-    // `.gitattributes`: `-diff` / `binary` show "binary"; `diff=<name>`
+    // `.veilattributes`: `-diff` / `binary` show "binary"; `diff=<name>`
     // diffs the output of this device's textconv of that name, if it
     // defines one (never anything a tree defines; nothing is cached).
     let (old, new) = match veil_core::attributes::diff_strategy(repo.store(), attrs, &c.path) {
@@ -1494,8 +1492,6 @@ pub struct TagList {
     pub schema: &'static str,
     pub tags: Vec<TagItem>,
     pub remote_tags: Vec<RemoteTagItem>,
-    /// Git tags fetched from Git remotes (`<remote>/<name>`), format 5.
-    pub remote_release_tags: Vec<RemoteReleaseTagItem>,
 }
 
 #[derive(Serialize, Debug)]
@@ -1504,11 +1500,8 @@ pub struct TagItem {
     /// Cloaked tags are never pushed to public remotes.
     pub cloak: Option<String>,
     pub target: SnapshotRef,
-    /// `release` (annotated: immutable, a Git tag) or `branch`.
+    /// `release` (annotated: immutable) or `branch`.
     pub kind: &'static str,
-    /// What the Git bridge exports it as: `refs/tags/<name>` or
-    /// `refs/heads/<name>`.
-    pub git_ref: String,
     /// The annotation of a release tag (`null` for a plain tag).
     pub annotation: Option<AnnotationItem>,
 }
@@ -1517,7 +1510,7 @@ pub struct TagItem {
 #[derive(Serialize, Debug)]
 pub struct AnnotationItem {
     pub id: String,
-    /// `annotated` or `lightweight-git`.
+    /// `annotated`.
     pub kind: &'static str,
     pub tagger: String,
     pub timestamp: Option<String>,
@@ -1532,13 +1525,6 @@ pub struct AnnotationItem {
     pub status: String,
 }
 
-#[derive(Serialize, Debug)]
-pub struct RemoteReleaseTagItem {
-    /// `remote/tag`.
-    pub name: String,
-    pub target: Option<SnapshotRef>,
-    pub annotation: Option<AnnotationItem>,
-}
 
 /// The annotation `id` shown as `name → target`.
 pub fn annotation_item(repo: &Repo, name: &str, target: &ObjectId, id: &ObjectId) -> Option<AnnotationItem> {
@@ -1547,7 +1533,6 @@ pub fn annotation_item(repo: &Repo, name: &str, target: &ObjectId, id: &ObjectId
         id: id.hex(),
         kind: match c.atag.kind {
             veil_core::tag_object::AtagKind::Annotated => "annotated",
-            veil_core::tag_object::AtagKind::LightweightGit => "lightweight-git",
         },
         tagger: c.atag.tagger.clone(),
         timestamp: rfc3339(c.atag.timestamp),
@@ -1581,7 +1566,6 @@ pub fn tag_list(repo: &Repo) -> TagList {
                 cloak: t.cloak.clone(),
                 target: snapshot_ref(repo, &t.target),
                 kind: if t.annotation.is_some() { "release" } else { "branch" },
-                git_ref: format!("refs/{}/{name}", if t.annotation.is_some() { "tags" } else { "heads" }),
                 annotation: t.annotation.and_then(|a| annotation_item(repo, name, &t.target, &a)),
             })
             .collect(),
@@ -1590,20 +1574,6 @@ pub fn tag_list(repo: &Repo) -> TagList {
             .remote_tags
             .iter()
             .map(|(name, t)| RemoteTagItem { name: name.clone(), target: snapshot_ref(repo, t) })
-            .collect(),
-        remote_release_tags: repo
-            .view()
-            .remote_release_tags
-            .iter()
-            .map(|(key, a)| {
-                let atag = repo.store().atag(a).ok();
-                let short = key.split_once('/').map_or(key.as_str(), |(_, n)| n);
-                RemoteReleaseTagItem {
-                    name: key.clone(),
-                    target: atag.as_ref().map(|t| snapshot_ref(repo, &t.target)),
-                    annotation: atag.as_ref().and_then(|t| annotation_item(repo, short, &t.target, a)),
-                }
-            })
             .collect(),
     }
 }
@@ -1956,7 +1926,7 @@ pub struct LsEntry {
     /// `size` and `executable` are those of the file with markers this
     /// reader is shown.
     pub conflict: Option<ConflictInfo>,
-    /// `file`, `symlink`, `gitlink` (format 5) or `conflict`.
+    /// `file`, `symlink` (format 5) or `conflict`.
     pub kind: &'static str,
     /// A symlink's target, when this reader can read it (null for a
     /// redacted link, whose target is sealed content, and for anything but

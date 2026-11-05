@@ -15,13 +15,6 @@ Arguments:
 |---|---|
 | `<PATH>` | Directory to create the repository in (created if missing) |
 
-Options:
-
-| | |
-|---|---|
-| `--colocate` | Create (or adopt) a real `.git` beside the working copy, kept in step with Veil (experimental: needs `--experimental`) |
-| `--experimental` | Accept that colocated Git mode is experimental |
-
 ---
 
 [All commands](README.md) · [User guide](../guide/README.md)

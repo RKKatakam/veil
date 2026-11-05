@@ -1,11 +1,11 @@
-//! Per-path attributes (`.gitattributes`) and line endings: `vl attr
+//! Per-path attributes (`.veilattributes`) and line endings: `vl attr
 //! check`, `vl renormalize`, and this device's diff and merge drivers.
 //!
 //! Feature 7 of the Git-parity round
 //! (`docs/design/git-parity/7-attributes-line-endings.md`); the engine side
 //! is `veil_core::attributes`.
 //!
-//! **Drivers are device-local.** `.gitattributes` only *names* a driver
+//! **Drivers are device-local.** `.veilattributes` only *names* a driver
 //! (`diff=<name>`, `merge=<name>`). The definitions live in this device's
 //! own configuration, never in a repository:
 //!
@@ -29,8 +29,7 @@
 //!   writes the result there), `%B` theirs; `%P` is the path, `%L` the
 //!   marker size. Exit 0 is a clean merge; anything else a conflict.
 //! * A textconv gets the content on its standard input and prints the text
-//!   to diff; nothing is written to disk and nothing is cached. `vl
-//!   format-patch` never runs one.
+//!   to diff; nothing is written to disk and nothing is cached.
 //!
 //! A name this device does not define falls back to the built-in diff or
 //! merge, with one warning per name.
@@ -75,7 +74,7 @@ pub enum AttrCmd {
     /// -a`), what Veil does with them (line endings, diff, merge), and
     /// those Veil does not support.
     ///
-    /// Read from the working copy's `.gitattributes` files and the
+    /// Read from the working copy's `.veilattributes` files and the
     /// device-local `.veil/local/attributes`.
     Check {
         /// Paths to check (they need not exist).
@@ -244,7 +243,7 @@ pub fn attr(ctx: &mut Ctx, args: &AttrArgs) -> Result<ExitCode> {
                 );
                 if f.unsupported.iter().any(|u| u.name == "filter") {
                     warn(&format!(
-                        "{p}: `filter` is not supported by Veil: the file is recorded as it is on disk, unfiltered (with Git LFS, the full content after `git lfs smudge`)"
+                        "{p}: `filter` is not supported by Veil: the file is recorded as it is on disk, unfiltered"
                     ));
                 }
             }
@@ -256,7 +255,7 @@ pub fn attr(ctx: &mut Ctx, args: &AttrArgs) -> Result<ExitCode> {
 // ---- vl renormalize -------------------------------------------------------------------------
 
 /// `vl renormalize`: re-record the selected files with the line endings
-/// `.gitattributes` asks for now (an operation of its own, which `vl undo`
+/// `.veilattributes` asks for now (an operation of its own, which `vl undo`
 /// reverts). The working copy is not rewritten.
 pub fn renormalize(ctx: &mut Ctx, args: &RenormalizeArgs) -> Result<ExitCode> {
     let ps: Vec<VPath> = args.paths.iter().map(|p| ctx.repo_path(p)).collect::<Result<_>>()?;
@@ -274,7 +273,7 @@ pub fn renormalize(ctx: &mut Ctx, args: &RenormalizeArgs) -> Result<ExitCode> {
         warn_untrusted(&format!("{p}: {why}"));
     }
     if changed.is_empty() {
-        println!("Nothing to renormalize: every file is recorded as `.gitattributes` says.");
+        println!("Nothing to renormalize: every file is recorded as `.veilattributes` says.");
     } else {
         for c in &changed {
             println!("Renormalized {}", safe(c.path.as_str()));
@@ -524,7 +523,7 @@ impl DeviceDrivers for LocalDrivers {
         match kind {
             "textconv-failed" => warn_untrusted(&format!("the textconv of diff driver '{name}' failed on {path}; showing the plain diff")),
             _ => warn_untrusted(&format!(
-                "{path}: .gitattributes names {kind} driver '{name}', which this device does not define; the built-in {kind} is used \
+                "{path}: .veilattributes names {kind} driver '{name}', which this device does not define; the built-in {kind} is used \
                  (drivers are defined only in $VEIL_HOME/config.toml or .veil/local/config.toml)"
             )),
         }

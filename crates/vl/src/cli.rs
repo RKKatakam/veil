@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::{attr_cmd, colocate_cmd, history, hooks, patch_cmd, rewrite_cmd, submodule_cmd};
+use crate::{attr_cmd, history, hooks, rewrite_cmd};
 
 /// `vl -V`: version, the commit it was built from and the repository format
 /// it reads and writes.
@@ -54,8 +54,6 @@ pub enum Cmd {
     Init {
         /// Directory to create the repository in (created if missing).
         path: Option<PathBuf>,
-        #[command(flatten)]
-        colocate: colocate_cmd::InitColocateArgs,
     },
     /// Copy a repository (and every tag you can see) into a new directory.
     ///
@@ -446,11 +444,11 @@ pub enum Cmd {
     /// Scan the working copy for secrets that would become public.
     ///
     /// With `--policy-from`, scan as a CI gate on a checkout (no Veil
-    /// repository needed): every file counts as public, because a Git
+    /// repository needed): every file counts as public, because a CI
     /// checkout publishes all of them, except what FILE marks `public!`.
     Scan {
         /// CI gate: take the rules from FILE (the base branch's
-        /// `.veilpolicy`, e.g. from `git show`; an empty file for the
+        /// `.veilpolicy`; an empty file for the
         /// built-in rules only) and disregard the scanned directory's own
         /// `.veilpolicy`, so a pull request cannot switch the scan off.
         #[arg(long, value_name = "FILE")]
@@ -458,11 +456,11 @@ pub enum Cmd {
         #[command(flatten)]
         out: JsonOut,
     },
-    /// Per-path attributes from `.gitattributes`: line endings, binary
+    /// Per-path attributes from `.veilattributes`: line endings, binary
     /// files, diff and merge drivers.
     Attr(attr_cmd::AttrArgs),
-    /// Re-record files with the line endings `.gitattributes` asks for now
-    /// (changing `.gitattributes` alone never re-records a file). `vl undo`
+    /// Re-record files with the line endings `.veilattributes` asks for now
+    /// (changing `.veilattributes` alone never re-records a file). `vl undo`
     /// reverts it.
     Renormalize(attr_cmd::RenormalizeArgs),
 
@@ -616,35 +614,10 @@ pub enum Cmd {
         full: bool,
     },
 
-    /// Two-way Git interop: import Git history, push and fetch Git remotes.
-    ///
-    /// Git sees exactly what a public Veil remote sees: no cloaked or
-    /// isolated files, no cloaked descriptions, and the pre-merge tree of an
-    /// unreleased embargo. Tags map to branches.
-    #[command(subcommand)]
-    Git(GitCmd),
-    /// Export snapshots as patch emails in Git's format.
-    ///
-    /// The default view is the public one: exactly what `vl git push`
-    /// shows (no cloaked files or descriptions, nothing of an unreleased
-    /// embargo). `--audience me` includes what you can read, and says so.
-    FormatPatch(patch_cmd::FormatPatchArgs),
-    /// Apply patch emails (Git's `format-patch` output, or a plain diff) as
-    /// new changes on top of a snapshot.
-    ///
-    /// One change per patch, keeping its author, date and message; all or
-    /// nothing. Each patch is recorded like an incoming change: secrets are
-    /// quarantined (which aborts the series), a weakening `.veilpolicy` is
-    /// held back, and hostile paths are refused.
-    Am(patch_cmd::AmArgs),
     /// Hooks run before commits and pushes; repository-suggested ones only
     /// once this device trusts them (not implemented yet).
     #[command(subcommand)]
     Hooks(hooks::HooksCmd),
-    /// Git submodules: pinned commits of other Git repositories, fetched
-    /// with `git` only when you run `vl submodule update`.
-    #[command(subcommand)]
-    Submodule(submodule_cmd::SubmoduleCmd),
 
     // ---- maintenance ------------------------------------------------------
     /// Pack objects and delete those no retained operation can reach.
@@ -778,7 +751,7 @@ pub enum TagCmd {
         #[arg(long)]
         allow_backwards: bool,
         /// Make an annotated release tag: immutable, signed when you have
-        /// an identity, exported to Git as `refs/tags/NAME`.
+        /// an identity.
         #[arg(short, long)]
         annotate: bool,
         /// The annotated tag's message (implies `-a`; sealed for a cloaked
@@ -796,8 +769,7 @@ pub enum TagCmd {
         name: String,
     },
     /// Verify an annotated tag's signature: exits 1 unless it is a valid
-    /// Veil signature by a key a ring of this repository knows (a Git
-    /// signature is never verified by Veil).
+    /// Veil signature by a key a ring of this repository knows.
     Verify {
         /// Tag name.
         name: String,
@@ -809,7 +781,7 @@ pub enum EmbargoCmd {
     /// List embargoes.
     List,
     /// Release an embargo: show what becomes public, ask, and release it in
-    /// this repository. The next push (or Git export) publishes the key;
+    /// this repository. The next push publishes the key;
     /// until then `vl undo` takes the release back.
     Release {
         /// Embargo id, from `vl embargo list`.
@@ -840,9 +812,6 @@ pub enum PolicyCmd {
         #[arg(long, value_name = "NAME")]
         workspace: Option<String>,
     },
-    /// Add an `ignore` rule for each `.gitignore` pattern that matches a
-    /// file here, so files Git ignores are not recorded.
-    ImportGitignore(colocate_cmd::ImportGitignoreArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -1147,111 +1116,3 @@ pub enum RemoteCmd {
     },
 }
 
-#[derive(Subcommand, Debug)]
-pub enum GitCmd {
-    /// Import a Git repository's history (path or URL): adds it as a Git
-    /// remote and creates a tag for every branch.
-    Import {
-        /// Git repository: a path or any URL `git` understands.
-        source: String,
-        /// Name of the Git remote to create.
-        #[arg(long, default_value = "origin")]
-        remote: String,
-    },
-    /// Manage Git remotes.
-    #[command(subcommand)]
-    Remote(GitRemoteCmd),
-    /// Fetch a Git remote's branches as `<remote>/<branch>` and its Git tags
-    /// as `tag:<remote>/<tag>` (local tags stay).
-    Fetch {
-        /// Git remote.
-        #[arg(default_value = "origin")]
-        remote: String,
-        /// Do not fetch the remote's Git tags.
-        #[arg(long)]
-        no_tags: bool,
-        /// Forget remote Git tags (`<remote>/<tag>`) that the remote
-        /// deleted. Local release tags are never deleted.
-        #[arg(long, conflicts_with = "no_tags")]
-        prune_tags: bool,
-    },
-    /// Fetch, then create or fast-forward local tags from the branches, and
-    /// create a local release tag for each new Git tag (an existing one
-    /// never moves).
-    Pull {
-        /// Git remote.
-        #[arg(default_value = "origin")]
-        remote: String,
-        /// Do not fetch the remote's Git tags.
-        #[arg(long)]
-        no_tags: bool,
-        /// Forget remote Git tags (`<remote>/<tag>`) that the remote
-        /// deleted. Local release tags are never deleted.
-        #[arg(long, conflicts_with = "no_tags")]
-        prune_tags: bool,
-    },
-    /// Export tags (all by default) and push them: plain tags as branches,
-    /// annotated release tags as Git tags (never forced).
-    Push {
-        /// Git remote.
-        #[arg(default_value = "origin")]
-        remote: String,
-        /// Only push these tags.
-        #[arg(short, long)]
-        tag: Vec<String>,
-        /// Overwrite branches that moved on the Git side (only if they still
-        /// hold what was last fetched).
-        #[arg(long)]
-        force: bool,
-        /// Delete this branch on the Git remote (repeatable). Delete its tag
-        /// here first with `vl tag delete`. Refused if the branch moved since
-        /// the last fetch (unless --force). With no --tag, nothing else is
-        /// pushed.
-        #[arg(short, long, value_name = "BRANCH")]
-        delete: Vec<String>,
-        /// Replace Git tags that exist on the remote with another target
-        /// (only if they still hold what was last fetched).
-        #[arg(long)]
-        force_tags: bool,
-        /// Delete this Git tag (`refs/tags/TAG`) on the remote (repeatable).
-        /// Delete the release tag here first with `vl tag delete`. With no
-        /// --tag, nothing else is pushed.
-        #[arg(long, value_name = "TAG")]
-        delete_tag: Vec<String>,
-        #[command(flatten)]
-        hooks: hooks::NoVerifyArgs,
-    },
-    /// Export tags into the local bridge repository without pushing, and
-    /// print the commit of each.
-    Export {
-        /// Only export these tags.
-        #[arg(short, long)]
-        tag: Vec<String>,
-    },
-    /// Keep a real `.git` beside this working copy, in step with Veil
-    /// (experimental: needs `--experimental`).
-    Colocate(colocate_cmd::ColocateArgs),
-    /// Stop mirroring into `.git`, leaving it a plain Git repository.
-    Uncolocate(colocate_cmd::UncolocateArgs),
-    /// The `pre-push` guard of colocated mode: refuse a direct `git push`
-    /// of commits holding private content.
-    CheckPush(colocate_cmd::CheckPushArgs),
-}
-
-#[derive(Subcommand, Debug)]
-pub enum GitRemoteCmd {
-    /// Add a Git remote (any URL `git` understands, or a path).
-    Add {
-        /// Git remote name.
-        name: String,
-        /// Any URL `git` understands, or a path.
-        url: String,
-    },
-    /// List Git remotes.
-    List,
-    /// Remove a Git remote.
-    Rm {
-        /// Git remote name.
-        name: String,
-    },
-}

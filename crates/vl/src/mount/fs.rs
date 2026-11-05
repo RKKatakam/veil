@@ -363,8 +363,8 @@ impl ReaderView {
 
     /// Is leaf entry `e` shown to this reader, as checkout would write it?
     /// A symlink only with its own target (never an embargo fallback,
-    /// which may not be a link), a gitlink as its submodule's directory, a
-    /// conflict with a symlink or gitlink side as that shown side.
+    /// which may not be a link), a conflict with a symlink side as that
+    /// shown side.
     fn visible_leaf(&self, e: &TreeEntry) -> bool {
         let shown = match e.kind {
             EntryKind::Conflict => match self.store.conflict(&e.id) {
@@ -377,7 +377,7 @@ impl ReaderView {
             _ => e.clone(),
         };
         match shown.kind {
-            EntryKind::Symlink | EntryKind::Gitlink => self.store.entry_readable(&TreeEntry { fallback: None, ..shown }),
+            EntryKind::Symlink => self.store.entry_readable(&TreeEntry { fallback: None, ..shown }),
             EntryKind::Dir => false,
             _ => self.store.entry_readable(&shown),
         }

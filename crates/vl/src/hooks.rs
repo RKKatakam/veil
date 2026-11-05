@@ -1,5 +1,5 @@
-//! Hooks: commands `vl` runs at fixed points of `commit`, `describe`,
-//! `push` and `git push` (and after the working copy moves), the
+//! Hooks: commands `vl` runs at fixed points of `commit`, `describe` and
+//! `push` (and after the working copy moves), the
 //! repository's `.veilhooks` file and its per-device trust record, and
 //! `vl hooks show|trust`.
 //!
@@ -8,8 +8,8 @@
 //!
 //! * **Device-local hooks** (`$VEIL_HOME/hooks/<name>`, then
 //!   `.veil/hooks/<name>`) run without asking, as `.git/hooks` do: the user
-//!   put them there, and nothing from a tree, a pull, a patch or a Git
-//!   import can (`.veil` is never a tree entry, BUG-002).
+//!   put them there, and nothing from a tree or a pull can (`.veil` is
+//!   never a tree entry, BUG-002).
 //! * **Repository-suggested hooks** (`.veilhooks`, a tracked TOML file)
 //!   run only once this device trusts them: `vl hooks trust` pins the
 //!   BLAKE3 digest of `.veilhooks` and of every repository file its
@@ -118,7 +118,7 @@ pub enum Hook {
     /// After `pre-commit`, with the message in a file (`$1`); an edited
     /// message is used. A non-zero exit aborts.
     CommitMsg,
-    /// Before `vl push` and `vl git push`. A non-zero exit aborts.
+    /// Before `vl push`. A non-zero exit aborts.
     PrePush,
     /// After `vl new`, `vl edit` and `vl ws switch` moved the working copy
     /// (old and new snapshot ids). Its exit status is only reported.
@@ -1572,7 +1572,7 @@ fn commit_msg(root: &Path, rs: &[Runnable], message: &str, env: Vec<(&'static st
     r
 }
 
-/// `pre-push`, for `vl push` and `vl git push`. `lines` builds the hook's
+/// `pre-push`, for `vl push`. `lines` builds the hook's
 /// stdin (only if a hook will run): one line per tag the push sends. If
 /// the hook moved a tag, the push is refused (it would send something else
 /// than the hook was shown).
@@ -1598,7 +1598,7 @@ pub fn before_push(
     }
     let tags = ctx.repo.view().tags.clone();
     let inv = Invocation {
-        args: vec![remote.into(), veil_core::git::redact_url(url).into(), kind.into()],
+        args: vec![remote.into(), veil_core::remote::redact_url(url).into(), kind.into()],
         stdin: Some(stdin.into_bytes()),
         env: vec![("VEIL_WORKSPACE", ctx.ws.clone())],
     };
@@ -1618,7 +1618,7 @@ pub fn before_push(
 /// embargo holds back.
 pub fn veil_push_lines(repo: &Repo, plan: &veil_core::push_plan::PushPlan, remote: &str, delete: &[String]) -> Vec<String> {
     let mut out = plan_lines(plan);
-    out.extend(delete_lines(repo, remote, delete, plan.public, false));
+    out.extend(delete_lines(repo, remote, delete, plan.public));
     out
 }
 
@@ -1640,78 +1640,18 @@ fn plan_lines(plan: &veil_core::push_plan::PushPlan) -> Vec<String> {
     out
 }
 
-/// `<tag> 0 <remote-snapshot-or-0>` (and ` 0` for a Git remote's commit)
-/// for each tag `--delete` removes on `remote`.
-pub fn delete_lines(repo: &Repo, remote: &str, delete: &[String], public: bool, git: bool) -> Vec<String> {
+/// `<tag> 0 <remote-snapshot-or-0>` for each tag `--delete` removes on
+/// `remote`.
+pub fn delete_lines(repo: &Repo, remote: &str, delete: &[String], public: bool) -> Vec<String> {
     let view = repo.view();
     delete
         .iter()
         .filter(|d| !(public && view.tags.get(*d).is_some_and(|t| t.cloak.is_some())))
         .map(|d| {
             let there = view.remote_tags.get(&format!("{remote}/{d}")).map(|r| r.hex()).unwrap_or_else(|| "0".into());
-            format!("{d} 0 {there}{}", if git { " 0" } else { "" })
+            format!("{d} 0 {there}")
         })
         .collect()
-}
-
-/// The pre-push lines of `vl git push`: `<tag> <snapshot> <remote-or-0>
-/// <git-commit>` per branch, from an export (exactly what the push then
-/// sends). The snapshot is `-` when the commit is a projection (an
-/// unreleased embargo's pre-merge tree), so a withheld snapshot id is never
-/// shown. Then the Git tags the push sends (BUG-641), in Git's own format:
-/// `refs/tags/<name> <local-object> refs/tags/<name> <remote-object-or-zeros>`,
-/// and `(delete) <zeros> refs/tags/<name> <remote-object-or-zeros>` for
-/// `--delete-tag`. Only exported release tags appear (never a cloaked one,
-/// nor one an unreleased embargo holds back), and not one the push refuses
-/// before sending (it exists there with another target, without
-/// `--force-tags`). Mirrors `git::push_with`.
-pub fn git_push_lines(ctx: &mut Ctx, git_dir: &Path, remote: &str, push: &veil_core::git::PushOptions) -> Result<Vec<String>> {
-    use veil_core::git::GitBridge;
-    let (tags, delete) = (&push.only_tags[..], &push.delete[..]);
-    let mut out = Vec::new();
-    let mut tag_lines = Vec::new();
-    let zeros = |len: usize| "0".repeat(len);
-    if (delete.is_empty() && push.delete_tags.is_empty()) || !tags.is_empty() {
-        let mut bridge = GitBridge::open(&ctx.repo, git_dir)?;
-        let export = bridge.export(&mut ctx.repo, tags)?;
-        let view = ctx.repo.view();
-        for (branch, commit) in &export.branches {
-            let Some(t) = view.tags.get(branch) else { continue };
-            if t.cloak.is_some() {
-                continue;
-            }
-            let snap = match bridge.snapshot_of(commit) {
-                Some(s) if s == t.target => s.hex(),
-                _ => "-".into(),
-            };
-            let there = view.remote_tags.get(&format!("{remote}/{branch}")).map(|r| r.hex()).unwrap_or_else(|| "0".into());
-            out.push(format!("{branch} {snap} {there} {commit}"));
-        }
-        for t in &export.tags {
-            if view.tags.get(&t.name).is_some_and(|x| x.cloak.is_some()) {
-                continue;
-            }
-            let fetched = bridge.remote_tag(remote, &t.name)?;
-            if fetched.is_some_and(|f| f != t.git) && !push.force_tags {
-                continue; // refused before anything is sent
-            }
-            let local = t.git.to_string();
-            let there = fetched.map(|f| f.to_string()).unwrap_or_else(|| zeros(local.len()));
-            tag_lines.push(format!("refs/tags/{0} {local} refs/tags/{0} {there}", t.name));
-        }
-    }
-    out.extend(delete_lines(&ctx.repo, remote, delete, true, true));
-    out.extend(tag_lines);
-    if !push.delete_tags.is_empty() {
-        let bridge = GitBridge::open(&ctx.repo, git_dir)?;
-        for d in &push.delete_tags {
-            let there = bridge.remote_tag(remote, d)?;
-            let len = there.map(|f| f.to_string().len()).unwrap_or(40);
-            let there = there.map(|f| f.to_string()).unwrap_or_else(|| zeros(len));
-            out.push(format!("(delete) {} refs/tags/{d} {there}", zeros(len)));
-        }
-    }
-    Ok(out)
 }
 
 /// Where the working copy is before a command, for `post-checkout`.

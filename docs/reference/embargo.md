@@ -8,7 +8,7 @@ Manage embargoes created by delayed-visibility merges
 Subcommands:
 
 * [`vl embargo list`](#vl-embargo-list): List embargoes
-* [`vl embargo release`](#vl-embargo-release): Release an embargo: show what becomes public, ask, and release it in this repository. The next push (or Git export) publishes the key; until then `vl undo` takes the release back
+* [`vl embargo release`](#vl-embargo-release): Release an embargo: show what becomes public, ask, and release it in this repository. The next push publishes the key; until then `vl undo` takes the release back
 
 ## `vl embargo list`
 
@@ -20,7 +20,7 @@ vl embargo list [OPTIONS]
 
 ## `vl embargo release`
 
-Release an embargo: show what becomes public, ask, and release it in this repository. The next push (or Git export) publishes the key; until then `vl undo` takes the release back
+Release an embargo: show what becomes public, ask, and release it in this repository. The next push publishes the key; until then `vl undo` takes the release back
 
 ```text
 vl embargo release [OPTIONS] <ID>

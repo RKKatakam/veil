@@ -1411,7 +1411,6 @@ impl Server {
         // As `Ctx::open(…, true)` does: a bare repository has nothing to
         // snapshot.
         if snapshot && !ctx.bare {
-            crate::colocate_cmd::follow_now(&mut ctx)?;
             ctx.snapshot()?;
         }
         Ok(ctx)

@@ -3,7 +3,7 @@
 
 # `vl renormalize`
 
-Re-record files with the line endings `.gitattributes` asks for now (changing `.gitattributes` alone never re-records a file). `vl undo` reverts it
+Re-record files with the line endings `.veilattributes` asks for now (changing `.veilattributes` alone never re-records a file). `vl undo` reverts it
 
 ```text
 vl renormalize [OPTIONS] [PATHS]...

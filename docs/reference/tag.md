@@ -10,7 +10,7 @@ Subcommands:
 * [`vl tag list`](#vl-tag-list): List tags
 * [`vl tag set`](#vl-tag-set): Create or move a tag
 * [`vl tag delete`](#vl-tag-delete): Delete a tag
-* [`vl tag verify`](#vl-tag-verify): Verify an annotated tag's signature: exits 1 unless it is a valid Veil signature by a key a ring of this repository knows (a Git signature is never verified by Veil)
+* [`vl tag verify`](#vl-tag-verify): Verify an annotated tag's signature: exits 1 unless it is a valid Veil signature by a key a ring of this repository knows
 
 ## `vl tag list`
 
@@ -47,7 +47,7 @@ Options:
 | `-r, --rev <REV>` | Snapshot the tag points at (default: `@`) |
 | `--cloak [<SCOPE>]` | Cloak the tag (default scope: team): never pushed to public remotes |
 | `--allow-backwards` | Allow moving the tag to a snapshot that is not a descendant |
-| `-a, --annotate` | Make an annotated release tag: immutable, signed when you have an identity, exported to Git as `refs/tags/NAME` |
+| `-a, --annotate` | Make an annotated release tag: immutable, signed when you have an identity |
 | `-m, --message <MESSAGE>` | The annotated tag's message (implies `-a`; sealed for a cloaked tag) |
 | `--force` | Replace an existing annotated tag (or annotate a plain one). A release tag moved without `-m` keeps its message |
 
@@ -67,7 +67,7 @@ Arguments:
 
 ## `vl tag verify`
 
-Verify an annotated tag's signature: exits 1 unless it is a valid Veil signature by a key a ring of this repository knows (a Git signature is never verified by Veil)
+Verify an annotated tag's signature: exits 1 unless it is a valid Veil signature by a key a ring of this repository knows
 
 ```text
 vl tag verify [OPTIONS] <NAME>
