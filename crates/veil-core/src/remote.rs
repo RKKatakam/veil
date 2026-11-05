@@ -131,6 +131,9 @@ pub struct SyncReport {
     /// target, as (tag, local target, remote target). Release tags never
     /// move on a pull; the remote's target is `<remote>/<tag>`.
     pub release_tags_kept: Vec<(String, ObjectId, ObjectId)>,
+    /// Push: how long the remote's lock was held (phase B), in
+    /// milliseconds.
+    pub lock_held_ms: u64,
 }
 
 /// How to synchronise.
@@ -143,6 +146,30 @@ pub struct SyncOptions {
     /// with another target (BUG-710: a release is immutable; replacing one
     /// takes this).
     pub force_tags: bool,
+    /// Push: the remote's URL, to keep a push journal for it
+    /// (`.veil/local/push/`), so that a push interrupted after staging some
+    /// of its packs sends none of them again when retried. `None`: no
+    /// journal (each push starts afresh).
+    pub journal: Option<String>,
+    /// Push: discard the journal instead of resuming (`vl push --no-resume`).
+    pub no_resume: bool,
+    /// Push: the largest pack a push stages, in bytes of objects
+    /// (`VEIL_PUSH_CHUNK`); 0: [`PUSH_CHUNK`].
+    pub chunk: u64,
+    /// Tests: runs between a push's two phases, before the remote's lock is
+    /// taken.
+    #[doc(hidden)]
+    pub pause_before_lock: Option<PushHook>,
+}
+
+/// A test hook of [`SyncOptions::pause_before_lock`].
+#[derive(Clone)]
+pub struct PushHook(pub Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for PushHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PushHook")
+    }
 }
 
 /// Raw objects for a transfer: `New` must be written to the receiver,
@@ -164,6 +191,25 @@ struct StoreSource<'a>(&'a ObjectStore);
 impl Source for StoreSource<'_> {
     fn fetch(&self, id: &ObjectId) -> Result<Fetched> {
         self.0.get_raw(id).map(Fetched::New)
+    }
+}
+
+/// A push's objects: those in the packs an earlier attempt of the same
+/// push staged (or published) are not sent again, but are still looked
+/// inside, since that attempt may have stopped before staging what they
+/// reference.
+struct ResumeSource<'a> {
+    store: &'a ObjectStore,
+    staged: &'a HashSet<ObjectId>,
+}
+
+impl Source for ResumeSource<'_> {
+    fn fetch(&self, id: &ObjectId) -> Result<Fetched> {
+        let raw = self.store.get_raw(id)?;
+        Ok(match self.staged.contains(id) {
+            true => Fetched::Have(raw),
+            false => Fetched::New(raw),
+        })
     }
 }
 
@@ -297,6 +343,13 @@ struct PackSink<'a> {
     last: LruCache<(ObjectId, Arc<Vec<u8>>)>,
     packs: usize,
     bytes: u64,
+    /// A pack is closed once it holds this much (uncompressed).
+    limit: u64,
+    /// Runs before the first pack is started (a push creates its staging
+    /// directory only when it has something to stage).
+    prepare: Option<Box<dyn FnOnce() -> Result<()> + 'a>>,
+    /// Runs after each pack is complete (pack and index written).
+    on_pack: Option<Box<dyn FnMut(StagedPack) -> Result<()> + 'a>>,
 }
 
 impl<'a> PackSink<'a> {
@@ -313,6 +366,9 @@ impl<'a> PackSink<'a> {
             last: LruCache::new(LAST_VERSIONS),
             packs: 0,
             bytes: 0,
+            limit: PACK_LIMIT,
+            prepare: None,
+            on_pack: None,
         }
     }
 
@@ -331,6 +387,11 @@ impl<'a> PackSink<'a> {
     }
 
     fn pack(&mut self, id: ObjectId, raw: Vec<u8>, path: String) -> Result<()> {
+        if self.builder.is_none() {
+            if let Some(prepare) = self.prepare.take() {
+                prepare()?;
+            }
+        }
         let builder = match &mut self.builder {
             Some(b) => b,
             None => self.builder.insert(PackWriter::new(self.backend.create_stream(&self.dir, true)?, DEFAULT_LEVEL)?),
@@ -344,7 +405,7 @@ impl<'a> PackSink<'a> {
         self.builder_bytes += raw.len() as u64;
         let weight = raw.len();
         self.last.insert(key, (id, Arc::new(raw)), weight);
-        if self.builder_bytes >= PACK_LIMIT {
+        if self.builder_bytes >= self.limit {
             self.flush()?;
         }
         Ok(())
@@ -352,12 +413,21 @@ impl<'a> PackSink<'a> {
 
     fn flush(&mut self) -> Result<()> {
         if let Some(b) = self.builder.take() {
+            let objects = b.len();
             // `finish` publishes the pack (durably), then its index, after
             // a barrier, durably. A crash before the index leaves a pack
             // nobody finds; the index is never torn.
-            if let Some((_, stats)) = b.finish(&PackWrites(self.backend, self.dest), &self.dir)? {
+            if let Some((name, stats)) = b.finish(&PackWrites(self.backend, self.dest), &self.dir)? {
                 self.packs += 1;
                 self.bytes += stats.pack_bytes;
+                if let Some(f) = &mut self.on_pack {
+                    f(StagedPack {
+                        name,
+                        objects,
+                        raw_bytes: self.builder_bytes,
+                        pack_len: stats.pack_bytes,
+                    })?;
+                }
             }
         }
         self.builder_bytes = 0;
@@ -436,7 +506,8 @@ struct Transfer<'a> {
     src_keys: &'a Keychain,
     public: bool,
     /// Objects the receiver provably has: not visited at all.
-    known: Box<dyn Fn(&ObjectId) -> bool + 'a>,
+    /// Its arguments: the object, and the path where the walk met it.
+    known: Box<dyn Fn(&ObjectId, &str) -> bool + 'a>,
     seen: HashSet<ObjectId>,
     /// Tree height of every object copied so far (0 for non-trees).
     heights: HashMap<ObjectId, usize>,
@@ -530,7 +601,7 @@ impl Transfer<'_> {
     /// references, with their paths.
     #[allow(clippy::type_complexity)]
     fn enter(&mut self, id: ObjectId, path: &str) -> Result<Option<(bool, Vec<(ObjectId, String)>)>> {
-        if !self.seen.insert(id) || (self.known)(&id) {
+        if !self.seen.insert(id) || (self.known)(&id, path) {
             return Ok(None);
         }
         // Every source verifies the content against `id`.
@@ -566,8 +637,13 @@ impl Transfer<'_> {
             }
             Object::Tree(t) => {
                 let mut children = Vec::with_capacity(t.entries.len());
+                // An embargo wrapper's merged and pre-merge trees stand for
+                // the wrapper's own directory (see [`Aligned`]).
+                let wrapper = wrapper_parts(&t).is_some();
                 for e in &t.entries {
-                    let p = if path.is_empty() {
+                    let p = if wrapper && e.name == crate::embargo::WRAPPER_ENTRY {
+                        path.to_string()
+                    } else if path.is_empty() {
                         e.name.clone()
                     } else {
                         format!("{path}/{}", e.name)
@@ -957,34 +1033,116 @@ fn local_trees(store: &ObjectStore, roots: impl IntoIterator<Item = ObjectId>, m
     Ok(())
 }
 
-/// Every object reachable from the trees of `snaps`, as far as a receiver
-/// holding those snapshots provably has it. On a public receiver embargo
-/// wrappers (and their entries) are left out: what they hold may have
-/// been withheld when they were sent and be releasable now.
-fn known_objects(store: &ObjectStore, snaps: &HashSet<ObjectId>, public: bool) -> Result<HashSet<ObjectId>> {
-    let mut roots = Vec::new();
-    for s in snaps {
-        match store.snapshot(s) {
-            Ok(s) => roots.push(s.tree),
-            Err(VeilError::Missing(_)) => {}
-            Err(e) => return Err(e),
-        }
-    }
-    let mut known = HashSet::new();
-    local_trees(store, roots, |id, t| {
-        if public && wrapper_parts(t).is_some() {
-            return true; // descend (into the fallback), but know nothing here
-        }
-        known.insert(*id);
-        for e in &t.entries {
-            known.insert(e.id);
-            if let Some(fb) = e.fallback {
-                known.insert(fb);
+/// What a receiver holding the `boundary` snapshots provably has, found by
+/// path: an object met at path `p` is known if a boundary snapshot's tree
+/// has the same id at `p` (as a tree there, an entry, or an entry's
+/// fallback). Equal ids mean equal closures, and a boundary snapshot's
+/// closure is on the receiver, so only the directories that differ from the
+/// boundary are ever read (the path-aligned diff of
+/// `docs/design/scale/1-lock-free-push.md`). An object that moved to another
+/// path is sent again, which is harmless.
+///
+/// An embargo wrapper's marker entry (its merged tree and pre-merge tree)
+/// sits at the wrapper's own path, for the transfer ([`Transfer::enter`])
+/// as here. On a public receiver a wrapper (and its entries) is never
+/// known: what it holds may have been withheld when it was sent and be
+/// releasable now. Its pre-merge tree still is.
+struct Aligned<'a> {
+    store: &'a ObjectStore,
+    public: bool,
+    roots: Vec<ObjectId>,
+    /// The boundary's plaintext trees at each directory path read so far.
+    dirs: RefCell<HashMap<String, Arc<Vec<(ObjectId, Arc<crate::object::Tree>)>>>>,
+}
+
+impl<'a> Aligned<'a> {
+    fn new(store: &'a ObjectStore, boundary: &[ObjectId], public: bool) -> Result<Aligned<'a>> {
+        let mut roots = Vec::new();
+        for s in boundary {
+            match store.snapshot(s) {
+                Ok(s) => roots.push(s.tree),
+                Err(VeilError::Missing(_)) => {}
+                Err(e) => return Err(e),
             }
         }
-        true
-    })?;
-    Ok(known)
+        Ok(Aligned {
+            store,
+            public,
+            roots,
+            dirs: RefCell::new(HashMap::new()),
+        })
+    }
+
+    fn tree(&self, id: &ObjectId) -> Result<Option<Arc<crate::object::Tree>>> {
+        match self.store.tree_object(id) {
+            Ok(t) => Ok(Some(t)),
+            Err(e) if e.is_unreadable() || matches!(e, VeilError::Corrupt(..) | VeilError::Json(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The boundary's trees at directory `path` (`""`: the root trees),
+    /// with the pre-merge trees of the wrappers among them.
+    fn dir(&self, path: &str) -> Result<Arc<Vec<(ObjectId, Arc<crate::object::Tree>)>>> {
+        if let Some(d) = self.dirs.borrow().get(path) {
+            return Ok(d.clone());
+        }
+        let mut ids = Vec::new();
+        if path.is_empty() {
+            ids.extend(self.roots.iter().copied());
+        } else {
+            let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+            for (_, t) in self.dir(parent)?.iter() {
+                let Some(e) = t.get(name).filter(|e| e.kind == EntryKind::Dir) else { continue };
+                if e.visibility.is_public() {
+                    ids.push(e.id);
+                }
+                ids.extend(e.fallback);
+            }
+        }
+        let mut out: Vec<(ObjectId, Arc<crate::object::Tree>)> = Vec::new();
+        while let Some(id) = ids.pop() {
+            if out.iter().any(|(o, _)| *o == id) {
+                continue;
+            }
+            let Some(t) = self.tree(&id)? else { continue };
+            if let Some(w) = wrapper_parts(&t) {
+                ids.push(w.fallback);
+            }
+            out.push((id, t));
+        }
+        let out = Arc::new(out);
+        self.dirs.borrow_mut().insert(path.to_string(), out.clone());
+        Ok(out)
+    }
+
+    /// Does a boundary tree have `id` at `path`?
+    fn known(&self, id: &ObjectId, path: &str) -> Result<bool> {
+        for (tid, t) in self.dir(path)?.iter() {
+            match wrapper_parts(t) {
+                Some(_) if self.public => {}
+                Some(w) if w.inner == *id || *tid == *id => return Ok(true),
+                Some(_) => {}
+                None if *tid == *id => return Ok(true),
+                None => {}
+            }
+        }
+        if path.is_empty() {
+            return Ok(false);
+        }
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+        for (_, t) in self.dir(parent)?.iter() {
+            if self.public && wrapper_parts(t).is_some() {
+                continue;
+            }
+            if let Some(e) = t.get(name) {
+                if e.id == *id || e.fallback == Some(*id) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
 }
 
 fn too_deep(root: ObjectId) -> VeilError {
@@ -1133,6 +1291,248 @@ pub(crate) fn push_closure(
         out.push(id);
     }
     Ok(Ok(out))
+}
+
+// ---- what a push sends ----------------------------------------------------------
+
+/// The snapshots a push sends, decided on the local graph (see
+/// [`select_snapshots`]).
+#[derive(Debug, Default)]
+pub(crate) struct Selection {
+    /// Snapshots to send, highest generation first.
+    pub send: Vec<ObjectId>,
+    /// Known snapshots the sent ones build on, and pushed targets the
+    /// remote's view reaches already. Phase B checks that they are still in
+    /// the committed closure of the view it publishes on.
+    pub boundary: Vec<ObjectId>,
+}
+
+const SEND: u8 = 1;
+const KNOWN: u8 = 2;
+
+/// The snapshots reachable from `tips` that are not in the committed
+/// closure of `remote_refs`, with the boundary between the two.
+///
+/// One walk of the local graph, highest generation first (as
+/// [`crate::graph_index::GraphIndex::range`]), which stops as soon as no
+/// snapshot left to visit could still be sent: it reads the history above
+/// the remote's view, not all of it. A snapshot the remote's view reaches
+/// can still lead to one to send only through an embargoed merge whose
+/// merged-in parent it lacks (withheld when the merge was sent, and
+/// released since), so the walk goes on below a known snapshot only on a
+/// line that builds on an embargoed merge
+/// ([`crate::graph_index::FLAG_EMBARGO_LINE`]). Its edges follow the two
+/// rules of the full walks it replaces:
+/// * the committed closure ([`committed_closure`]): a non-first parent of an
+///   embargoed merge is known only if `parent_ok` says so (it reached the
+///   remote in a pack; it may have been redacted);
+/// * the push closure ([`push_closure`]): the withheld parent of an
+///   unreleased embargoed merge is not sent (it reaches the remote
+///   redacted). A sent snapshot that is withheld, or that builds on
+///   withheld history any other way, fails the push with the reason.
+
+pub(crate) fn select_snapshots(
+    local: &Repo,
+    tips: &[ObjectId],
+    remote_refs: &[ObjectId],
+    withheld: &HashMap<ObjectId, String>,
+    parent_ok: &mut dyn FnMut(&ObjectId) -> Result<bool>,
+) -> Result<Result<Selection, String>> {
+    struct Walk<'r> {
+        local: &'r Repo,
+        /// Flags, and whether the snapshot is on an embargo line.
+        flags: HashMap<ObjectId, (u8, bool)>,
+        heap: std::collections::BinaryHeap<(crate::graph_index::Gen, ObjectId)>,
+        queued: HashSet<ObjectId>,
+        /// Queued snapshots that may still lead to one to send.
+        live: usize,
+    }
+    fn live((f, line): (u8, bool)) -> bool {
+        f & SEND != 0 && (f & KNOWN == 0 || line)
+    }
+    impl Walk<'_> {
+        fn mark(&mut self, id: ObjectId, f: u8) -> Result<()> {
+            let Some(e) = self.local.graph().entry(self.local, &id)? else { return Ok(()) };
+            let line = e.flags & crate::graph_index::FLAG_EMBARGO_LINE != 0;
+            let old = self.flags.get(&id).copied();
+            let new = (old.map_or(0, |o| o.0) | f, line);
+            if old == Some(new) {
+                return Ok(());
+            }
+            self.flags.insert(id, new);
+            match old {
+                None => {
+                    self.heap.push((e.generation, id));
+                    self.queued.insert(id);
+                    self.live += usize::from(live(new));
+                }
+                Some(o) if self.queued.contains(&id) => {
+                    self.live = self.live + usize::from(live(new)) - usize::from(live(o));
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+    }
+    let mut w = Walk {
+        local,
+        flags: HashMap::new(),
+        heap: Default::default(),
+        queued: HashSet::new(),
+        live: 0,
+    };
+    for r in remote_refs {
+        w.mark(*r, KNOWN)?;
+    }
+    for t in tips {
+        w.mark(*t, SEND)?;
+    }
+    let mut sel = Selection::default();
+    let mut parents_of_sent = Vec::new();
+    while w.live > 0 {
+        let Some((_, id)) = w.heap.pop() else { break };
+        if !w.queued.remove(&id) {
+            continue;
+        }
+        let (f, line) = w.flags[&id];
+        w.live -= usize::from(live((f, line)));
+        let Some(s) = local.snapshot_opt(&id)? else { continue };
+        let sending = f & SEND != 0 && f & KNOWN == 0;
+        if sending {
+            if let Some(e) = withheld.get(&id) {
+                return Ok(Err(format!(
+                    "{} is part of the history merged under unreleased embargo {e}; it is pushed when the embargo is released",
+                    id.short()
+                )));
+            }
+            sel.send.push(id);
+            parents_of_sent.extend(s.parents.iter().copied());
+        }
+        let embargoed_merge = s.embargo.as_deref().is_some_and(|e| !local.keys().embargo_released(e));
+        for (i, p) in s.parents.iter().enumerate() {
+            let mut pf = 0;
+            if f & KNOWN != 0 && (i == 0 || s.embargo.is_none() || parent_ok(p)?) {
+                pf |= KNOWN;
+            }
+            if f & SEND != 0 {
+                match withheld.get(p) {
+                    None => pf |= SEND,
+                    Some(_) if embargoed_merge && i > 0 => {} // redacted parent
+                    // Known already: the remote holds it.
+                    Some(_) if !sending => {}
+                    Some(e) => {
+                        return Ok(Err(format!(
+                            "snapshot {} builds on {}, which is withheld by unreleased embargo {e}; release the embargo first",
+                            id.short(),
+                            p.short()
+                        )))
+                    }
+                }
+            }
+            if pf != 0 {
+                w.mark(*p, pf)?;
+            }
+        }
+    }
+    let known = |id: &ObjectId| w.flags.get(id).is_some_and(|f| f.0 & KNOWN != 0);
+    let mut boundary: Vec<ObjectId> = parents_of_sent.into_iter().chain(tips.iter().copied()).filter(known).collect();
+    boundary.sort();
+    boundary.dedup();
+    sel.boundary = boundary;
+    Ok(Ok(sel))
+}
+
+/// Are all of `candidates` in the committed closure of `refs` (the rule of
+/// [`committed_closure`])? One walk down from `refs`, highest generation
+/// first, which stops below the lowest candidate.
+fn all_known(
+    local: &Repo,
+    refs: &[ObjectId],
+    candidates: &[ObjectId],
+    parent_ok: &mut dyn FnMut(&ObjectId) -> Result<bool>,
+) -> Result<bool> {
+    let mut want: HashSet<ObjectId> = HashSet::new();
+    let mut floor = crate::graph_index::Gen::MAX;
+    for c in candidates {
+        match local.graph().generation(local, c)? {
+            Some(g) => floor = floor.min(g),
+            // Not here: nothing proves the remote has it.
+            None => return Ok(false),
+        }
+        want.insert(*c);
+    }
+    let mut heap = std::collections::BinaryHeap::new();
+    let mut seen = HashSet::new();
+    for r in refs {
+        if let Some(g) = local.graph().generation(local, r)? {
+            heap.push((g, *r));
+        }
+    }
+    while let Some((g, id)) = heap.pop() {
+        if want.is_empty() || g < floor {
+            break;
+        }
+        if !seen.insert(id) {
+            continue;
+        }
+        want.remove(&id);
+        let Some(s) = local.snapshot_opt(&id)? else { continue };
+        for (i, p) in s.parents.iter().enumerate() {
+            if seen.contains(p) || !(i == 0 || s.embargo.is_none() || parent_ok(p)?) {
+                continue;
+            }
+            if let Some(pg) = local.graph().generation(local, p)? {
+                heap.push((pg, *p));
+            }
+        }
+    }
+    Ok(want.is_empty())
+}
+
+/// Why pushing `tip` would publish history withheld by an unreleased
+/// embargo, if it would: [`push_closure`]'s check, reading only the history
+/// above the oldest withheld snapshot (none of whose ancestors can be
+/// withheld).
+fn builds_on_withheld(local: &Repo, tip: &ObjectId, withheld: &HashMap<ObjectId, String>) -> Result<Option<String>> {
+    if withheld.is_empty() {
+        return Ok(None);
+    }
+    let mut floor = crate::graph_index::Gen::MAX;
+    for id in withheld.keys() {
+        if let Some(g) = local.graph().generation(local, id)? {
+            floor = floor.min(g);
+        }
+    }
+    let above = |id: &ObjectId| -> Result<bool> { Ok(local.graph().generation(local, id)?.is_some_and(|g| g >= floor)) };
+    let mut seen = HashSet::new();
+    let mut stack = vec![*tip];
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) || !above(&id)? {
+            continue;
+        }
+        if let Some(e) = withheld.get(&id) {
+            return Ok(Some(format!(
+                "{} is part of the history merged under unreleased embargo {e}; it is pushed when the embargo is released",
+                id.short()
+            )));
+        }
+        let Some(s) = local.snapshot_opt(&id)? else { continue };
+        let embargoed_merge = s.embargo.as_deref().is_some_and(|e| !local.keys().embargo_released(e));
+        for (i, p) in s.parents.iter().enumerate() {
+            match withheld.get(p) {
+                None => stack.push(*p),
+                Some(_) if embargoed_merge && i > 0 => {}
+                Some(e) => {
+                    return Ok(Some(format!(
+                        "snapshot {} builds on {}, which is withheld by unreleased embargo {e}; release the embargo first",
+                        id.short(),
+                        p.short()
+                    )))
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Merge key rings and embargo records from `src` into `dst`.
@@ -1507,7 +1907,42 @@ pub fn push(
     push_with(local, remote_backend, public, only_tags, force, &SyncOptions::default())
 }
 
+/// How many times phase B may find that the remote changed under the push
+/// (a tag moved, the boundary went, staged packs went, a release was taken
+/// back) and start again before the push gives up.
+const PUBLISH_ATTEMPTS: usize = 3;
+
+/// The lock options of phase B: holders now keep the remote's lock for a
+/// few round trips, never for an upload, so waiting longer than for other
+/// locks is cheap and rarely needed.
+fn publish_lock_options(backend: &dyn StorageBackend) -> crate::lock::LockOptions {
+    let mut o = crate::lock::LockOptions::for_backend(backend);
+    if cfg!(feature = "os") {
+        o.wait = std::time::Duration::from_secs(300);
+    }
+    o
+}
+
 /// [`push`] with options.
+///
+/// A push has two phases (`docs/design/scale/1-lock-free-push.md`):
+/// * **A, without the remote's lock:** plan against the remote's committed
+///   view as read now (advisory), and upload what it lacks as packs of at
+///   most [`SyncOptions::chunk`] bytes into the push's own staging
+///   directory, `.veil/objects/incoming/push-<id>/`, which no reader of
+///   the remote ever looks in. Each staged pack is recorded in the push
+///   journal ([`SyncOptions::journal`]), so a retry after a dropped
+///   connection or a crash sends none of them again.
+/// * **B, under the lock:** re-read the view and decide the tags again
+///   against it; check that the snapshots the upload built on are still in
+///   its committed closure, that every staged pack is there, and that
+///   every embargo the plan treated as released still is (BUG-807); then
+///   rename the packs into `objects/pack/` (each `.pack` before its
+///   `.idx`), merge the metadata and write the operation. If any check
+///   fails, the lock is released and phase A runs again (at most
+///   [`PUBLISH_ATTEMPTS`] times).
+///
+/// [`SyncOptions::full`] keeps the walk of everything, under the lock.
 pub fn push_with(
     local: &mut Repo,
     remote_backend: Arc<dyn StorageBackend>,
@@ -1517,47 +1952,220 @@ pub fn push_with(
     opts: &SyncOptions,
 ) -> Result<SyncReport> {
     let mut remote = open_or_init_remote(&remote_backend)?;
-    let mut report = SyncReport::default();
-    let (sendable, withheld) = sendable_tags(local, public, only_tags, &mut report)?;
-    // Objects and metadata are copied under the remote's lock: metadata
-    // merges are read-modify-writes, and objects must land before the
-    // operation that references them.
-    let mut tx = remote.transaction(format!("push from {}", local.repo_id()))?;
-    let selected = accepted_tags(local, sendable, &tx.view.tags, force, opts.force_tags, &mut report)?;
-    let tips: Vec<ObjectId> = selected.iter().map(|(_, t)| t.target).collect();
-    let ids = push_closure(local.store(), local.keys(), &tips, &withheld)?
-        .map_err(|why| VeilError::repo(format!("push: {why}")))?;
-    {
-        let dst = tx.repo().store().clone();
-        let src = StoreSource(local.store());
-        if opts.full {
-            let mut xfer = Transfer {
-                src: &src,
-                sink: Sink::Store(&dst),
-                src_keys: local.keys(),
-                public,
-                known: Box::new(|_| false),
-                seen: HashSet::new(),
-                heights: HashMap::new(),
-                report,
-            };
-            for id in ids {
-                xfer.copy(id, "")?;
+    if opts.full {
+        return push_full(local, &mut remote, public, only_tags, force, opts);
+    }
+    let local_fs = local.backend().clone();
+    let path = opts.journal.as_deref().map(|url| journal_path(url, only_tags));
+    let mut journal = match (&path, opts.journal.as_deref()) {
+        (Some(p), Some(url)) if !opts.no_resume => Journal::load(&*local_fs, p, url)?,
+        _ => None,
+    }
+    .unwrap_or_else(|| Journal::new(opts.journal.clone().unwrap_or_default(), public));
+    // Staging abandoned for more than a week (best effort).
+    let _ = expire_push_staging(&*remote_backend, crate::now_millis());
+    let mut releases_published = Vec::new();
+    for _ in 0..PUBLISH_ATTEMPTS {
+        // ---- phase A: plan and stage, without the remote's lock.
+        remote.reload()?;
+        let mut base = SyncReport::default();
+        let (sendable, withheld) = sendable_tags(local, public, only_tags, &mut base)?;
+        let released = released_embargoes(local)?;
+        if journal.public != public || !journal.released.iter().all(|e| released.contains(e)) {
+            // Staged under other rules: none of it may be published now.
+            let _ = remote_backend.remove_dir_all(&staging_dir(&journal.push_id));
+            journal = Journal::new(journal.url.clone(), public);
+        }
+        journal.released = released;
+        let mut report = base.clone();
+        let selected = accepted_tags(local, sendable.clone(), &remote.view().tags, force, opts.force_tags, &mut report)?;
+        let tips: Vec<ObjectId> = selected.iter().map(|(_, t)| t.target).collect();
+        let staged = journal.reusable(&*remote_backend)?;
+        let inv = LazyInventory::new(remote_backend.clone());
+        let dir = staging_dir(&journal.push_id);
+        let journal_cell = RefCell::new(&mut journal);
+        let save = |j: &Journal| -> Result<()> {
+            match &path {
+                Some(p) => j.save(&*local_fs, p),
+                None => Ok(()),
             }
-            report = xfer.report;
-        } else {
-            report = push_incremental(local, &tx.view.refs(), &dst, ids, public, report, None)?;
+        };
+        let dest = Dest::Stage {
+            dir: dir.clone(),
+            staged: &staged,
+            prepare: Box::new(|| {
+                let mut j = journal_cell.borrow_mut();
+                prepare_staging(&*remote_backend, &dir, j.existing)?;
+                j.existing = true;
+                save(&j)
+            }),
+            on_pack: Box::new(|p| {
+                let mut j = journal_cell.borrow_mut();
+                j.staged.push(p);
+                touch_staging(&*remote_backend, &dir)?;
+                save(&j)
+            }),
+        };
+        let refs = remote.view().refs();
+        let (report, boundary) = push_incremental(local, &refs, remote.store(), &tips, &withheld, public, report, dest, &inv, opts.chunk)?;
+        drop(journal_cell);
+        if let Some(hook) = &opts.pause_before_lock {
+            (hook.0)();
+        }
+        // ---- phase B: publish, under the lock.
+        let attempt = Attempt {
+            sendable,
+            base,
+            selected,
+            boundary,
+            transfer: report,
+        };
+        match publish(local, &mut remote, &remote_backend, public, force, opts, attempt, &inv, &mut journal, &mut releases_published)? {
+            Publish::Done(mut report) => {
+                if journal.existing {
+                    let _ = remote_backend.remove_dir_all(&staging_dir(&journal.push_id));
+                }
+                if let Some(p) = &path {
+                    let _ = local_fs.remove_file(p);
+                }
+                report.releases_published = releases_published;
+                return Ok(report);
+            }
+            // Every tag rejected on a team remote: the upload stays staged
+            // (and journalled) for the push after the pull and merge.
+            Publish::Kept(mut report) => {
+                report.releases_published = releases_published;
+                return Ok(report);
+            }
+            Publish::Again { wiped } => {
+                if wiped {
+                    journal = Journal::new(journal.url.clone(), public);
+                }
+                if let Some(p) = &path {
+                    journal.save(&*local_fs, p)?;
+                }
+            }
         }
     }
+    Err(VeilError::repo(
+        "push: the remote changed while pushing; run `vl push` again (what was uploaded is kept for it)",
+    ))
+}
+
+/// The embargoes this repository treats as released now (staged releases
+/// included): what a plan's withheld history and visibility filter assume.
+fn released_embargoes(local: &Repo) -> Result<Vec<String>> {
+    let mut out: Vec<String> = local
+        .keys()
+        .embargoes()?
+        .into_iter()
+        .filter(|r| local.keys().embargo_released(&r.id))
+        .map(|r| r.id)
+        .collect();
+    out.sort();
+    Ok(out)
+}
+
+/// What phase A decided, for phase B.
+struct Attempt {
+    sendable: Vec<(String, Tag)>,
+    /// The report of [`sendable_tags`] (tags held back by design).
+    base: SyncReport,
+    /// The tags phase A found accepted, and staged the history of.
+    selected: Vec<(String, Tag)>,
+    boundary: Vec<ObjectId>,
+    /// The transfer's counts.
+    transfer: SyncReport,
+}
+
+enum Publish {
+    Done(SyncReport),
+    /// Nothing published, the staging kept (see [`push_with`]).
+    Kept(SyncReport),
+    /// Run phase A again; `wiped`: the staging was removed.
+    Again { wiped: bool },
+}
+
+/// Phase B of [`push_with`].
+#[allow(clippy::too_many_arguments)]
+fn publish(
+    local: &Repo,
+    remote: &mut Repo,
+    backend: &Arc<dyn StorageBackend>,
+    public: bool,
+    force: bool,
+    opts: &SyncOptions,
+    a: Attempt,
+    inv: &LazyInventory,
+    journal: &mut Journal,
+    releases_published: &mut Vec<String>,
+) -> Result<Publish> {
+    let lock = crate::lock::RepoLock::acquire_with(backend.clone(), &publish_lock_options(&**backend))?;
+    let held_from = crate::now_millis();
+    let mut tx = remote.transaction_with_lock(format!("push from {}", local.repo_id()), lock)?;
+    let dir = staging_dir(&journal.push_id);
+    // Removes what this push staged, under the lock. (Packs an earlier
+    // attempt published before it was interrupted are left: another push
+    // sharing the journal may have referenced them since. Unreferenced,
+    // they are pruned by the remote's gc.)
+    let wipe = || -> Result<Publish> {
+        backend.remove_dir_all(&dir)?;
+        Ok(Publish::Again { wiped: true })
+    };
+
+    // The tags, decided again against the view read under the lock.
+    let mut tags = a.base.clone();
+    let selected = accepted_tags(local, a.sendable, &tx.view.tags, force, opts.force_tags, &mut tags)?;
+    let then: HashSet<(String, ObjectId)> = a.selected.iter().map(|(n, t)| (n.clone(), t.target)).collect();
+    let now: HashSet<(String, ObjectId)> = selected.iter().map(|(n, t)| (n.clone(), t.target)).collect();
+    if !now.is_subset(&then) {
+        // A tag phase A rejected is accepted now: its history was not staged.
+        return Ok(Publish::Again { wiped: false });
+    }
+    if now != then && public {
+        // Rejected meanwhile: on a public remote, what was staged for it
+        // must not stay where every reader can list it (threat 4).
+        return wipe();
+    }
+    // The boundary: everything the upload took as known is still in the
+    // committed closure of this view (threat 2).
+    let refs = tx.view.refs();
+    if !all_known(local, &refs, &a.boundary, &mut |p| inv.packed(p))? {
+        return Ok(Publish::Again { wiped: false });
+    }
+    // The staged packs (threat 7): each complete, in the staging directory
+    // or already published by an earlier attempt.
+    let Some(renames) = journal.check_staged(&**backend, &dir, &tx.repo().store().pack_dir())? else {
+        return Ok(Publish::Again { wiped: false });
+    };
+    // Releases become permanent here, and only then is it checked that every
+    // embargo the plan treated as released still is: an undo of a staged
+    // release in between withholds the fix again (BUG-807).
+    releases_published.extend(local.keys().publish_staged_releases()?);
+    if !journal.released.iter().all(|e| local.keys().embargo_released(e)) {
+        return wipe();
+    }
+
+    let mut report = a.transfer;
+    report.tags_skipped = tags.tags_skipped;
+    report.tags_rejected = tags.tags_rejected;
+    // Every tag rejected meanwhile (a team remote: a public one wiped its
+    // staging above): nothing is published, the upload stays staged.
+    let keep = selected.is_empty() && !journal.staged.is_empty();
+    let renames = if keep { Vec::new() } else { renames };
+    // Fencing (threat 8): not after the lease lapsed. Packs before their
+    // index, as everywhere: readers find packs by their index.
+    tx.ensure_held()?;
+    let pack_dir = tx.repo().store().pack_dir();
+    for name in &renames {
+        backend.rename_unsynced(&pack_file(&dir, name), &pack_file(&pack_dir, name))?;
+        backend.rename_unsynced(&index_file(&dir, name), &index_file(&pack_dir, name))?;
+    }
+    backend.sync_barrier()?;
     // Annotated tag objects of the tags sent (format 5): after the history
     // they point at, before the operation that names them.
     let annotations: Vec<ObjectId> = selected.iter().filter_map(|(_, t)| t.annotation).collect();
     copy_annotations(local.store(), tx.repo().store(), &annotations, public)?;
-    // Releases staged by `vl embargo release` reach the record only now,
-    // as it leaves: before this, `vl undo` could still take them back
-    // (BUG-109). Objects sealed under their keys may already have been
-    // sent above; without the key they are unreadable.
-    report.releases_published = local.keys().publish_staged_releases()?;
     sync_meta(local.keys(), tx.repo().keys(), public, false, &mut report.warnings)?;
     for (name, tag) in selected {
         // A push never strips the annotation the remote's tag has for the
@@ -1587,6 +2195,78 @@ pub fn push_with(
         report.tags_updated.push((name, tag.target));
     }
     tx.commit()?;
+    report.lock_held_ms = u64::try_from(crate::now_millis() - held_from).unwrap_or(0);
+    Ok(match keep {
+        true => Publish::Kept(report),
+        false => Publish::Done(report),
+    })
+}
+
+/// [`push_with`] with [`SyncOptions::full`]: every object of the pushed
+/// history walked, re-verified on the remote and written loose, under the
+/// remote's lock (a repair, not the everyday push).
+fn push_full(
+    local: &mut Repo,
+    remote: &mut Repo,
+    public: bool,
+    only_tags: &[String],
+    force: bool,
+    opts: &SyncOptions,
+) -> Result<SyncReport> {
+    let held_from = crate::now_millis();
+    let mut tx = remote.transaction(format!("push from {}", local.repo_id()))?;
+    // Releases staged by `vl embargo release` become permanent before the
+    // withheld history is decided: an undo cannot take one back between
+    // that decision and the upload (BUG-807).
+    let releases_published = local.keys().publish_staged_releases()?;
+    let mut report = SyncReport::default();
+    let (sendable, withheld) = sendable_tags(local, public, only_tags, &mut report)?;
+    let selected = accepted_tags(local, sendable, &tx.view.tags, force, opts.force_tags, &mut report)?;
+    let tips: Vec<ObjectId> = selected.iter().map(|(_, t)| t.target).collect();
+    let ids = push_closure(local.store(), local.keys(), &tips, &withheld)?
+        .map_err(|why| VeilError::repo(format!("push: {why}")))?;
+    {
+        let dst = tx.repo().store().clone();
+        let src = StoreSource(local.store());
+        let mut xfer = Transfer {
+            src: &src,
+            sink: Sink::Store(&dst),
+            src_keys: local.keys(),
+            public,
+            known: Box::new(|_, _| false),
+            seen: HashSet::new(),
+            heights: HashMap::new(),
+            report,
+        };
+        for id in ids {
+            xfer.copy(id, "")?;
+        }
+        report = xfer.report;
+    }
+    report.releases_published = releases_published;
+    let annotations: Vec<ObjectId> = selected.iter().filter_map(|(_, t)| t.annotation).collect();
+    copy_annotations(local.store(), tx.repo().store(), &annotations, public)?;
+    sync_meta(local.keys(), tx.repo().keys(), public, false, &mut report.warnings)?;
+    for (name, tag) in selected {
+        let existing = tx.view.tags.get(&name).cloned();
+        let annotation = tag
+            .annotation
+            .or(existing.as_ref().filter(|e| e.target == tag.target).and_then(|e| e.annotation));
+        if existing.as_ref().is_some_and(|e| e.target == tag.target && e.annotation == annotation) {
+            report.remote_tags.push((name, tag.target));
+            continue;
+        }
+        for p in &local.snapshot(&tag.target)?.parents {
+            tx.view.heads.remove(p);
+        }
+        tx.view.heads.insert(tag.target);
+        let cloak = if public { None } else { tag.cloak };
+        tx.view.tags.insert(name.clone(), Tag { target: tag.target, cloak, annotation });
+        report.remote_tags.push((name.clone(), tag.target));
+        report.tags_updated.push((name, tag.target));
+    }
+    tx.commit()?;
+    report.lock_held_ms = u64::try_from(crate::now_millis() - held_from).unwrap_or(0);
     Ok(report)
 }
 
@@ -1629,9 +2309,9 @@ pub(crate) fn sendable_tags(
     let withheld = embargo_withheld(local, public)?;
     let mut sendable = Vec::new();
     for (name, tag) in selected {
-        match push_closure(local.store(), local.keys(), &[tag.target], &withheld)? {
-            Ok(_) => sendable.push((name, tag)),
-            Err(why) => report.tags_skipped.push((name, why)),
+        match builds_on_withheld(local, &tag.target, &withheld)? {
+            None => sendable.push((name, tag)),
+            Some(why) => report.tags_skipped.push((name, why)),
         }
     }
     Ok((sendable, withheld))
@@ -1815,64 +2495,84 @@ pub fn record_pushed_tags(local: &mut Repo, remote_name: &str, report: &SyncRepo
     Ok(())
 }
 
-/// Send `ids` (snapshots) and what they reference, except what the
-/// remote's committed view (`remote_refs`) provably holds, as packs.
-///
-/// With `plan` (a dry run), nothing is written: the same objects are
-/// recorded there and packed into [`Discard`], and `dst` is only read.
+/// Where a push's objects go ([`push_incremental`]).
+pub(crate) enum Dest<'a> {
+    /// A dry run ([`crate::push_plan`]): every object is recorded, and
+    /// packed exactly as a push packs it into a backend that keeps nothing.
+    Plan(&'a mut PlanRecord),
+    /// Packs staged in `dir` on the remote. `staged`: objects in the packs
+    /// an earlier attempt staged, not sent again. `prepare` runs before
+    /// the first pack, `on_pack` after each.
+    Stage {
+        dir: VPath,
+        staged: &'a HashSet<ObjectId>,
+        prepare: Box<dyn FnOnce() -> Result<()> + 'a>,
+        on_pack: Box<dyn FnMut(StagedPack) -> Result<()> + 'a>,
+    },
+}
+
+/// Default size of a push's packs ([`SyncOptions::chunk`]): the most one
+/// dropped connection makes a retry send again.
+pub const PUSH_CHUNK: u64 = 32 << 20;
+
+/// The remote's object inventory, read only if a walk needs it (an
+/// embargoed merge's extra parent, a public remote's released wrappers).
+pub(crate) struct LazyInventory {
+    backend: Arc<dyn StorageBackend>,
+    inv: RefCell<Option<Inventory>>,
+}
+
+impl LazyInventory {
+    pub(crate) fn new(backend: Arc<dyn StorageBackend>) -> LazyInventory {
+        LazyInventory {
+            backend,
+            inv: RefCell::new(None),
+        }
+    }
+
+    fn get(&self) -> Result<std::cell::Ref<'_, Inventory>> {
+        if self.inv.borrow().is_none() {
+            *self.inv.borrow_mut() = Some(Inventory::load(self.backend.clone(), &mut Vec::new())?);
+        }
+        Ok(std::cell::Ref::map(self.inv.borrow(), |i| i.as_ref().expect("loaded")))
+    }
+
+    /// Is `id` in one of the remote's packs (complete by construction)?
+    pub(crate) fn packed(&self, id: &ObjectId) -> Result<bool> {
+        Ok(self.get()?.packed.contains_key(id))
+    }
+}
+
+/// Send what `tips` reach and the remote's committed view (`remote_refs`)
+/// provably lacks, to `dest`. Returns the report and the boundary (see
+/// [`Selection`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn push_incremental(
     local: &Repo,
     remote_refs: &[ObjectId],
     dst: &ObjectStore,
-    ids: Vec<ObjectId>,
+    tips: &[ObjectId],
+    withheld: &HashMap<ObjectId, String>,
     public: bool,
     report: SyncReport,
-    mut plan: Option<&mut PlanRecord>,
-) -> Result<SyncReport> {
+    dest: Dest<'_>,
+    inv: &LazyInventory,
+    chunk: u64,
+) -> Result<(SyncReport, Vec<ObjectId>)> {
     let store = local.store();
-    let mut warnings = Vec::new();
-    let inventory: RefCell<Option<Inventory>> = RefCell::new(None);
-    let load_inventory = || -> Result<()> {
-        if inventory.borrow().is_none() {
-            *inventory.borrow_mut() = Some(Inventory::load(dst.backend().clone(), &mut Vec::new())?);
-        }
-        Ok(())
-    };
-    // An embargoed merge's extra parents count only if they reached the
-    // remote in a pack (complete by construction): they may have been
-    // redacted when the merge was pushed.
-    let mut inv_err = None;
-    let known_snaps = committed_closure(store, remote_refs, |p| match load_inventory() {
-        Ok(()) => inventory.borrow().as_ref().is_some_and(|i| i.packed.contains_key(p)),
-        Err(e) => {
-            inv_err.get_or_insert(e);
-            false
-        }
-    })?;
-    if let Some(e) = inv_err {
-        return Err(e);
-    }
-    let to_send: Vec<ObjectId> = ids.into_iter().filter(|i| !known_snaps.contains(i)).collect();
-    if let Some(p) = plan.as_deref_mut() {
-        p.known_snapshots = known_snaps.clone();
-        p.sent_snapshots = to_send.clone();
-    }
-    // Trees of the known snapshots the new ones build on.
-    let mut boundary = HashSet::new();
-    for id in &to_send {
-        for p in &store.snapshot(id)?.parents {
-            if known_snaps.contains(p) {
-                boundary.insert(*p);
-            }
-        }
-    }
-    let known = known_objects(store, &boundary, public)?;
+    let sel = select_snapshots(local, tips, remote_refs, withheld, &mut |p| inv.packed(p))?
+        .map_err(|why| VeilError::repo(format!("push: {why}")))?;
+    let aligned = Aligned::new(store, &sel.boundary, public)?;
     // On a public remote, released embargoes may have made content under
     // already-pushed snapshots sendable: revisit their wrappers (sending
-    // only what the remote does not hold yet).
+    // only what the remote does not hold yet). Only lines that build on an
+    // embargoed merge can hold one.
     let mut rewalk = Vec::new();
     if public && local.keys().embargoes()?.iter().any(|r| local.keys().embargo_released(&r.id)) {
-        for s in &known_snaps {
+        let sent: HashSet<&ObjectId> = sel.send.iter().collect();
+        let mut lines: Vec<ObjectId> = local.graph().embargo_lines_among(local, remote_refs.iter().copied())?.into_iter().collect();
+        lines.sort();
+        for s in lines.iter().filter(|s| !sent.contains(s)) {
             let tree = store.snapshot(s)?.tree;
             if let Ok(t) = store.tree_object(&tree) {
                 if wrapper_parts(&t).is_some() {
@@ -1881,35 +2581,64 @@ pub(crate) fn push_incremental(
             }
         }
     }
-    if !rewalk.is_empty() {
-        load_inventory()?;
-    }
-    let inventory = inventory.into_inner();
-    let src = StoreSource(store);
-    let pack_dir = dst.pack_dir();
-    let sink = match plan {
-        None => Sink::Pack(Box::new(PackSink::new(dst, pack_dir, None, 0))),
-        Some(p) => {
-            let mut pack = PackSink::new(dst, pack_dir, None, 0);
+    let chunk = if chunk == 0 { PUSH_CHUNK } else { chunk };
+    let none = HashSet::new();
+    let (staged, sink) = match dest {
+        Dest::Plan(p) => {
+            if public {
+                // What the remote shows already (`push_plan::public_files`):
+                // the dry run's walk of the remote's history.
+                let mut err = None;
+                p.known_snapshots = committed_closure(store, remote_refs, |x| match inv.packed(x) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        err.get_or_insert(e);
+                        false
+                    }
+                })?;
+                if let Some(e) = err {
+                    return Err(e);
+                }
+            }
+            p.sent_snapshots = sel.send.clone();
+            let p: &PlanRecord = p;
+            let mut pack = PackSink::new(dst, dst.pack_dir(), None, 0);
             pack.backend = &DISCARD;
-            Sink::Plan(Box::new(pack), &p.objects)
+            pack.limit = chunk;
+            (&none, Sink::Plan(Box::new(pack), &p.objects))
+        }
+        Dest::Stage {
+            dir,
+            staged,
+            prepare,
+            on_pack,
+        } => {
+            let mut pack = PackSink::new(dst, dir, None, 0);
+            pack.limit = chunk;
+            pack.prepare = Some(prepare);
+            pack.on_pack = Some(on_pack);
+            (staged, Sink::Pack(Box::new(pack)))
         }
     };
+    let src = ResumeSource { store, staged };
     let mut xfer = Transfer {
         src: &src,
         sink,
         src_keys: local.keys(),
         public,
-        known: Box::new(|id| known.contains(id)),
+        // A read error here only means "send it": the walk reads it again.
+        known: Box::new(|id, path| aligned.known(id, path).unwrap_or(false)),
         seen: HashSet::new(),
         heights: HashMap::new(),
         report,
     };
-    for id in &to_send {
+    for id in &sel.send {
         xfer.copy(*id, "")?;
     }
-    if let Some(inv) = inventory.as_ref().filter(|_| !rewalk.is_empty()) {
-        xfer.known = Box::new(|id| known.contains(id) || inv.contains(id));
+    if !rewalk.is_empty() {
+        let inv = inv.get()?;
+        let aligned = &aligned;
+        xfer.known = Box::new(move |id, path| aligned.known(id, path).unwrap_or(false) || inv.contains(id));
         let mut wrappers = Vec::new();
         local_trees(store, rewalk, |_, t| {
             if wrapper_parts(t).is_some() {
@@ -1928,11 +2657,289 @@ pub(crate) fn push_incremental(
     }
     let Transfer { sink, mut report, .. } = xfer;
     sink.finish(&mut report)?;
-    report.warnings.append(&mut warnings);
     // Nothing reads the remote store after this (the tag checks run on the
     // local graph), so its pack list is not reloaded: that would download
     // every remote index.
-    Ok(report)
+    Ok((report, sel.boundary))
+}
+
+// ---- push staging and the push journal ---------------------------------------------
+
+/// The prefix of a push's staging directory under `.veil/objects/incoming/`
+/// (beside transactions' `tx-` and pulls' `pull-`).
+pub const PUSH_STAGING_PREFIX: &str = "push-";
+
+/// In a push's staging directory: when the push last wrote there (ms since
+/// the epoch, on its clock), for [`expire_push_staging`].
+const TOUCHED: &str = "touched";
+
+/// Staging untouched for this long is abandoned ([`expire_push_staging`]).
+pub const PUSH_STAGING_EXPIRY_MS: i64 = 7 * 24 * 3600 * 1000;
+
+fn incoming_dir() -> VPath {
+    VPath::new(".veil/objects/incoming").expect("valid path")
+}
+
+fn staging_dir(push_id: &str) -> VPath {
+    incoming_dir().join(&format!("{PUSH_STAGING_PREFIX}{push_id}"))
+}
+
+/// One pack a push staged.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StagedPack {
+    /// The pack's name (`pack-<name>.pack`, `.idx`).
+    pub name: String,
+    pub objects: usize,
+    /// Its objects' canonical encodings, together.
+    pub raw_bytes: u64,
+    /// The size of its `.pack` file.
+    pub pack_len: u64,
+}
+
+/// The push journal, `.veil/local/push/<hash>.json` (device-local): what a
+/// push staged on the remote so far, so that a retry sends none of it
+/// again. Every entry is checked on the remote before it counts.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct Journal {
+    version: u32,
+    /// The staging directory is `incoming/push-<push_id>`.
+    push_id: String,
+    url: String,
+    /// The visibility filter the packs passed: a public remote's, or a
+    /// team remote's.
+    public: bool,
+    /// The embargoes treated as released when the packs were staged: what
+    /// the packs may hold of their fixes.
+    released: Vec<String>,
+    staged: Vec<StagedPack>,
+    /// The staging directory may exist already (not a new push).
+    #[serde(skip)]
+    existing: bool,
+}
+
+/// The journal of pushes of `tags` (all if empty) to `url`.
+fn journal_path(url: &str, tags: &[String]) -> VPath {
+    let mut tags = tags.to_vec();
+    tags.sort();
+    let key = format!("{url}\0{}", tags.join("\0"));
+    let hash = ObjectId::hash(key.as_bytes()).hex();
+    VPath::new(&format!(".veil/local/push/{}.json", &hash[..32])).expect("valid path")
+}
+
+impl Journal {
+    fn new(url: String, public: bool) -> Journal {
+        Journal {
+            version: 1,
+            push_id: hex::encode(crate::crypto::random_bytes::<16>()),
+            url,
+            public,
+            released: Vec::new(),
+            staged: Vec::new(),
+            existing: false,
+        }
+    }
+
+    /// The journal at `path` for `url`; `None` if there is none, or one this
+    /// build cannot use (it is then replaced).
+    fn load(fs: &dyn StorageBackend, path: &VPath, url: &str) -> Result<Option<Journal>> {
+        let Some(raw) = fs.read_opt(path)? else { return Ok(None) };
+        let Ok(mut j) = serde_json::from_slice::<Journal>(&raw) else { return Ok(None) };
+        let named = |s: &str, len: usize| s.len() == len && is_hex(s);
+        if j.version != 1 || j.url != url || !named(&j.push_id, 32) || !j.staged.iter().all(|p| named(&p.name, 64)) {
+            return Ok(None);
+        }
+        j.existing = true;
+        Ok(Some(j))
+    }
+
+    fn save(&self, fs: &dyn StorageBackend, path: &VPath) -> Result<()> {
+        fs.write(path, &serde_json::to_vec_pretty(self)?)
+    }
+
+    /// The objects of the journal's packs that are complete on the remote
+    /// (in the staging directory, or published by an earlier attempt);
+    /// packs that are not are dropped from the journal (threat 7).
+    fn reusable(&mut self, backend: &dyn StorageBackend) -> Result<HashSet<ObjectId>> {
+        let mut ids = HashSet::new();
+        if self.staged.is_empty() {
+            return Ok(ids);
+        }
+        let dirs = [staging_dir(&self.push_id), VPath::new(".veil/objects/pack")?];
+        let threads = threads_for(backend);
+        let found = par_map(&self.staged, threads, |p| -> Result<Option<PackIndex>> {
+            for dir in &dirs {
+                let Some(raw) = backend.read_opt(&index_file(dir, &p.name))? else { continue };
+                let Ok(idx) = PackIndex::decode(&raw) else { continue };
+                let len = backend.metadata(&pack_file(dir, &p.name))?.map(|m| m.len);
+                if idx.name() == p.name && len == Some(idx.pack_len()) && idx.pack_len() == p.pack_len {
+                    return Ok(Some(idx));
+                }
+            }
+            Ok(None)
+        });
+        let mut keep = Vec::new();
+        for (p, idx) in std::mem::take(&mut self.staged).into_iter().zip(found) {
+            if let Some(idx) = idx? {
+                ids.extend(idx.ids().iter().copied());
+                keep.push(p);
+            }
+        }
+        self.staged = keep;
+        Ok(ids)
+    }
+
+    /// Phase B's check of the journal's packs: the names to publish (those
+    /// in the staging directory `dir`, whole), or `None` if one is neither
+    /// there nor in `pack_dir` (it is dropped from the journal, and the
+    /// push stages its objects again).
+    fn check_staged(&mut self, backend: &dyn StorageBackend, dir: &VPath, pack_dir: &VPath) -> Result<Option<Vec<String>>> {
+        if self.staged.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let listed: HashSet<String> = match backend.list_dir(dir) {
+            Ok(l) => l.into_iter().filter(|e| e.kind == NodeKind::File).map(|e| e.name).collect(),
+            Err(e) if e.is_not_found() => HashSet::new(),
+            Err(e) => return Err(e),
+        };
+        let threads = threads_for(backend);
+        let checks = par_map(&self.staged, threads, |p| -> Result<Option<bool>> {
+            let (pack, idx) = (pack_file(dir, &p.name), index_file(dir, &p.name));
+            if listed.contains(idx.file_name()) && listed.contains(pack.file_name()) {
+                if backend.metadata(&pack)?.map(|m| m.len) == Some(p.pack_len) {
+                    return Ok(Some(true));
+                }
+                return Ok(None);
+            }
+            let published = backend.exists(&index_file(pack_dir, &p.name))?
+                && backend.metadata(&pack_file(pack_dir, &p.name))?.map(|m| m.len) == Some(p.pack_len);
+            Ok(published.then_some(false))
+        });
+        let mut renames = Vec::new();
+        let mut keep = Vec::new();
+        let mut complete = true;
+        for (p, c) in std::mem::take(&mut self.staged).into_iter().zip(checks) {
+            match c? {
+                Some(true) => {
+                    renames.push(p.name.clone());
+                    keep.push(p);
+                }
+                Some(false) => keep.push(p),
+                None => complete = false,
+            }
+        }
+        self.staged = keep;
+        Ok(complete.then_some(renames))
+    }
+}
+
+/// What occupies `path` that a push must never write through: a symlink,
+/// a file where a directory belongs, a special file.
+fn not_a_dir(backend: &dyn StorageBackend, path: &VPath) -> Result<Option<String>> {
+    if let Some(what) = backend.special_at(path)? {
+        return Ok(Some(format!("{path} is {what}")));
+    }
+    Ok(match backend.metadata(path)? {
+        Some(m) if m.kind != NodeKind::Dir => Some(format!("{path} is not a directory")),
+        _ => None,
+    })
+}
+
+/// Create the staging directory `dir` of a new push (it must not exist:
+/// a push writes only below its own), or, `existing`, check that the one an
+/// earlier attempt created is still a directory; then mark it touched.
+/// Nothing is ever written through a symlink there (threat 6).
+fn prepare_staging(backend: &dyn StorageBackend, dir: &VPath, existing: bool) -> Result<()> {
+    let refuse = |why: String| {
+        VeilError::repo(format!(
+            "push: {why} on the remote; it should be a directory that only vl writes. Remove it there and push again"
+        ))
+    };
+    if let Some(why) = not_a_dir(backend, &incoming_dir())? {
+        return Err(refuse(why));
+    }
+    let there = backend.metadata(dir)?.is_some() || backend.special_at(dir)?.is_some();
+    if there && !existing {
+        return Err(refuse(format!("{dir} exists already")));
+    }
+    backend.create_dir_all(dir)?;
+    if let Some(why) = not_a_dir(backend, dir)? {
+        return Err(refuse(why));
+    }
+    touch_staging(backend, dir)
+}
+
+fn touch_staging(backend: &dyn StorageBackend, dir: &VPath) -> Result<()> {
+    backend.write(&dir.join(TOUCHED), crate::now_millis().to_string().as_bytes())
+}
+
+/// A push's staging directory on a remote ([`push_staging`]).
+#[derive(Clone, Debug)]
+pub struct PushStaging {
+    /// `push-<id>`, under `.veil/objects/incoming/`.
+    pub name: String,
+    /// When its push last wrote there (ms since the epoch); `None` if it
+    /// does not say.
+    pub touched: Option<i64>,
+    /// Its files' sizes, together.
+    pub bytes: u64,
+}
+
+/// The names of the push staging directories on `backend`.
+fn staging_names(backend: &dyn StorageBackend) -> Result<Vec<String>> {
+    match backend.list_dir(&incoming_dir()) {
+        Ok(e) => Ok(e
+            .into_iter()
+            .filter(|e| e.kind == NodeKind::Dir && e.name.starts_with(PUSH_STAGING_PREFIX))
+            .map(|e| e.name)
+            .collect()),
+        Err(e) if e.is_not_found() => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+fn touched(backend: &dyn StorageBackend, name: &str) -> Result<Option<i64>> {
+    let raw = backend.read_opt(&incoming_dir().join(name).join(TOUCHED))?;
+    Ok(raw.and_then(|r| std::str::from_utf8(&r).ok()?.trim().parse().ok()))
+}
+
+/// Every push staging directory on `backend` (a remote): unpublished
+/// uploads, of live or interrupted pushes. Nothing in them is part of the
+/// repository.
+pub fn push_staging(backend: &dyn StorageBackend) -> Result<Vec<PushStaging>> {
+    let mut out = Vec::new();
+    for name in staging_names(backend)? {
+        let dir = incoming_dir().join(&name);
+        let mut bytes = 0;
+        for f in backend.list_dir(&dir)?.into_iter().filter(|f| f.kind == NodeKind::File) {
+            bytes += backend.metadata(&dir.join(&f.name))?.map_or(0, |m| m.len);
+        }
+        let touched = touched(backend, &name)?;
+        out.push(PushStaging { name, touched, bytes });
+    }
+    Ok(out)
+}
+
+/// Remove the push staging directories on `backend` that their push has
+/// not written to for [`PUSH_STAGING_EXPIRY_MS`] (by `now`): abandoned
+/// uploads. One touched within that time is never removed. One that does
+/// not say when is marked touched now, and so expires a week later.
+/// Returns how many were removed.
+pub fn expire_push_staging(backend: &dyn StorageBackend, now: i64) -> Result<usize> {
+    let names = staging_names(backend)?;
+    let ages = par_map(&names, threads_for(backend), |n| touched(backend, n));
+    let mut removed = 0;
+    for (name, t) in names.iter().zip(ages) {
+        let dir = incoming_dir().join(name);
+        match t? {
+            Some(t) if now - t > PUSH_STAGING_EXPIRY_MS => {
+                backend.remove_dir_all(&dir)?;
+                removed += 1;
+            }
+            Some(_) => {}
+            None => backend.write(&dir.join(TOUCHED), now.to_string().as_bytes())?,
+        }
+    }
+    Ok(removed)
 }
 
 /// Why `target` cannot be the target of a tag, if it cannot.
@@ -2047,7 +3054,7 @@ pub fn pull_with(
             sink: Sink::Store(tx.repo().store()),
             src_keys: remote.keys(),
             public: false,
-            known: Box::new(|_| false),
+            known: Box::new(|_, _| false),
             seen: HashSet::new(),
             heights: HashMap::new(),
             report,
@@ -2259,7 +3266,7 @@ fn pull_incremental(
         sink: Sink::Pack(Box::new(PackSink::new(local, local.pack_dir(), Some(&**local), 256))),
         src_keys: remote.keys(),
         public: false,
-        known: Box::new(|_| false),
+        known: Box::new(|_, _| false),
         seen: HashSet::new(),
         heights: HashMap::new(),
         report,

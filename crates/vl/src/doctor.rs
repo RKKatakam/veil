@@ -527,10 +527,12 @@ fn check_remotes(r: &mut Report, root: &Path, config: &RepoConfig) {
         let path = PathBuf::from(&remote.url);
         let path = if path.is_absolute() { path } else { root.join(path) };
         let started = Instant::now();
-        let reachable = path.is_dir() && is_repo(&DiskBackend::new(&path));
+        let backend = DiskBackend::new(&path);
+        let reachable = path.is_dir() && is_repo(&backend);
         let took = started.elapsed();
         if reachable {
             r.ok(format!("{name} ({}) reachable in {}", remote.url, fmt_duration(took)));
+            check_push_staging(r, name, &backend);
         } else if path.exists() {
             r.fail(format!("{name} ({}) is not a Veil repository", remote.url), &[]);
         } else {
@@ -540,6 +542,32 @@ fn check_remotes(r: &mut Report, root: &Path, config: &RepoConfig) {
             );
         }
     }
+}
+
+/// Push uploads on remote `name` left unpublished for more than a day
+/// (an interrupted push that was not retried): a later push or
+/// `vl -R <remote> gc` removes them once a week old.
+fn check_push_staging(r: &mut Report, name: &str, backend: &dyn StorageBackend) {
+    const DAY_MS: i64 = 24 * 3600 * 1000;
+    let staged = match veil_core::remote::push_staging(backend) {
+        Ok(s) => s,
+        Err(e) => return r.note(format!("{name}: cannot list its push staging"), &[e.to_string()]),
+    };
+    let now = now_millis();
+    let old: Vec<_> = staged.iter().filter(|s| s.touched.is_none_or(|t| now - t > DAY_MS)).collect();
+    if old.is_empty() {
+        return;
+    }
+    let bytes: u64 = old.iter().map(|s| s.bytes).sum();
+    let mut lines: Vec<String> = old
+        .iter()
+        .map(|s| {
+            let age = s.touched.map_or("unknown age".to_string(), |t| format!("{} days old", (now - t) / DAY_MS));
+            format!(".veil/objects/incoming/{}: {} bytes, {age}", s.name, s.bytes)
+        })
+        .collect();
+    lines.push("uploads of interrupted pushes: `vl push` again resumes yours; anything a week old is removed by the next push or `vl -R <remote> gc`".into());
+    r.note(format!("{name}: {} unpublished push upload(s), {bytes} bytes, untouched for over a day", old.len()), &lines);
 }
 
 /// Connect to an SSH remote, check that it holds a repository, and compare
@@ -571,6 +599,7 @@ fn check_ssh_remote(r: &mut Report, name: &str, shown: &str, url: veil_core::Res
         return;
     }
     r.ok(format!("{name} ({shown}) reachable in {}", fmt_duration(took)));
+    check_push_staging(r, name, &backend);
     let allowance = LockContext::default().skew;
     match backend.clock_offset(&VPath::new(VEIL_DIR).expect("valid path")) {
         Ok(offset) => {

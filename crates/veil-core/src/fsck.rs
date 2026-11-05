@@ -1280,6 +1280,16 @@ impl Checker {
             };
             self.push(Severity::Note, format!(".veil/objects/incoming/{name}: staged objects, {state}"));
         }
+        // Uploads of pushes not published (yet): never part of the store.
+        for s in crate::remote::push_staging(&**self.store.backend())? {
+            self.push(
+                Severity::Note,
+                format!(
+                    ".veil/objects/incoming/{}: a push's staged upload ({} bytes), not part of the repository; removed when the push completes, or after a week unused",
+                    s.name, s.bytes
+                ),
+            );
+        }
         Ok(heads)
     }
 

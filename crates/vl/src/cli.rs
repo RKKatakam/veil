@@ -599,6 +599,10 @@ pub enum Cmd {
         /// (unless --force). With no --tag, nothing else is pushed.
         #[arg(short, long, value_name = "TAG")]
         delete: Vec<String>,
+        /// Start the upload afresh instead of resuming an interrupted push
+        /// of the same tags to this remote (what it uploaded is not reused).
+        #[arg(long)]
+        no_resume: bool,
         /// Show what would be sent, and send nothing.
         #[arg(long, conflicts_with_all = ["full", "delete"])]
         dry_run: bool,

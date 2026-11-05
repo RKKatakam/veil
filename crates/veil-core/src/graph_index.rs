@@ -553,7 +553,12 @@ impl GraphIndex {
 
     /// The generation of snapshot `id`; `None` if the store does not hold it.
     pub fn generation(&self, repo: &Repo, id: &ObjectId) -> Result<Option<Gen>> {
-        self.with(repo, |w| Ok(w.entry(id)?.map(|e| e.generation)))
+        Ok(self.entry(repo, id)?.map(|e| e.generation))
+    }
+
+    /// The entry of snapshot `id`; `None` if the store does not hold it.
+    pub fn entry(&self, repo: &Repo, id: &ObjectId) -> Result<Option<Entry>> {
+        self.with(repo, |w| w.entry(id))
     }
 
     /// Is `a` an ancestor of (or equal to) `b`?
@@ -616,6 +621,19 @@ impl GraphIndex {
     /// reads only lines that build on one ([`FLAG_EMBARGO_LINE`]): with no
     /// embargo in the history, nothing past the roots.
     pub fn embargoed_among(&self, repo: &Repo, roots: impl IntoIterator<Item = ObjectId>) -> Result<HashSet<ObjectId>> {
+        self.on_embargo_lines(repo, roots, FLAG_EMBARGO)
+    }
+
+    /// Every snapshot reachable from `roots` on a line that builds on an
+    /// embargoed merge ([`FLAG_EMBARGO_LINE`]), the merges included: those
+    /// whose tree may be an embargo wrapper. Reads only those lines.
+    pub fn embargo_lines_among(&self, repo: &Repo, roots: impl IntoIterator<Item = ObjectId>) -> Result<HashSet<ObjectId>> {
+        self.on_embargo_lines(repo, roots, FLAG_EMBARGO_LINE)
+    }
+
+    /// The snapshots with flag `want` reachable from `roots` through
+    /// snapshots on embargo lines.
+    fn on_embargo_lines(&self, repo: &Repo, roots: impl IntoIterator<Item = ObjectId>, want: u8) -> Result<HashSet<ObjectId>> {
         self.with(repo, |w| {
             let mut found = HashSet::new();
             let mut seen = HashSet::new();
@@ -628,7 +646,7 @@ impl GraphIndex {
                 if e.flags & FLAG_EMBARGO_LINE == 0 {
                     continue;
                 }
-                if e.flags & FLAG_EMBARGO != 0 {
+                if e.flags & want != 0 {
                     found.insert(id);
                 }
                 let Some(s) = w.snapshot(&id)? else { continue };

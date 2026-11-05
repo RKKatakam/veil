@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 94cf83f822a5c6d564269cf5ad803ba42e835400561d9cc1df1a273de1221d6b # shrinks to ops = [Commit(0, false), Embargo(0, 0), Push { public: true, tag: None, force: false }]

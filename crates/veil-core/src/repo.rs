@@ -445,6 +445,12 @@ impl Repo {
             return Transaction::new(self, description.into(), None);
         }
         let lock = RepoLock::acquire(self.backend.clone())?;
+        self.transaction_with_lock(description, lock)
+    }
+
+    /// A transaction under `lock`, the repository lock taken by the caller
+    /// (a push's phase B waits for it longer than other commands).
+    pub(crate) fn transaction_with_lock(&mut self, description: impl Into<String>, lock: RepoLock) -> Result<Transaction<'_>> {
         self.reload()?;
         if self.base.len() > 1 {
             self.settle()?;
