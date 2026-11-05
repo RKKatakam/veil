@@ -193,8 +193,8 @@ impl Drop for StagingScope<'_> {
     }
 }
 
-/// What a [`ObjectStore::begin_staging`] scope staged: objects written
-/// nowhere yet. [`ObjectStore::publish_staged`] writes them (under the
+/// What a `ObjectStore::begin_staging` scope staged: objects written
+/// nowhere yet. `ObjectStore::publish_staged` writes them (under the
 /// repository lock, in a transaction); dropping it discards them.
 #[derive(Debug, Default)]
 pub struct Staged {

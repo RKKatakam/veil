@@ -240,7 +240,9 @@ struct Built {
 }
 
 /// What the scan before the lock found (see
-/// [`Repo::snapshot_workspace_with`]).
+/// [`Repo::snapshot_workspace_with`]). One per snapshot, moved once: the
+/// variants' sizes do not matter.
+#[allow(clippy::large_enum_variant)]
 enum Probe {
     /// Nothing to record: `wc` holds the directory as it is.
     Unchanged {

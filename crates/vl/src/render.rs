@@ -375,9 +375,9 @@ pub fn print_policy_held_back(held: &[HeldBack], own_edit_pending: bool, unattri
         list.push(format!("and {} more", held.len() - SHOWN));
     }
     let origin = match own_edit_pending {
-        _ if unattributed => "and in colocated Git mode an edit of it found in the working copy is never taken as yours, \
-                              because Git may have written it (a pull, checkout, `git stash pop` or `git reset --soft`); \
-                              `vl cloak`, `vl isolate`, `vl expose` and `vl ignore` record your own edits",
+        _ if unattributed => "and in colocated Git mode Git may have written it (a pull, checkout, `git stash pop`, \
+                              `git reset --soft`), so a change found there is never taken as your edit (make yours with \
+                              `vl cloak`, `vl isolate`, `vl expose` or `vl ignore`)",
         false => "and that change came from a merge, pull, checkout, restore or undo (or a symlinked policy file) rather than your own edit",
         true => "through a change from a merge, pull, checkout, restore or undo that you have not accepted, or through your \
                  own edit, which waits for `vl policy accept` because it could not be applied without that change",

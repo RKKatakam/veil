@@ -719,7 +719,10 @@ by: merge, pull, checkout (`vl new`, `vl edit`, `vl ws switch`), rebase,
 Git import, `vl restore [--from REV]`, undo and `vl op restore`. Only your
 own edit of the file (by hand, or with `vl cloak|isolate|expose|ignore`)
 applies at once; putting back another revision's policy with `vl restore`
-is not your edit.
+is not your edit. In colocated Git mode, where Git may write the file at
+any time, a hand edit counts as yours only if Git cannot have written it
+(see [Colocated Git mode](colocated-git.md#your-edits-of-veilpolicy));
+`vl cloak` and friends always do.
 
 **The policy file itself never lowers protection** below the policy you
 accepted:
