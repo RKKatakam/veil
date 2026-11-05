@@ -78,20 +78,9 @@ pub struct SnapshotOptions<'a> {
     /// sealed version stays sealed, a conflict stays the same conflict,
     /// BUG-481); an edit made on top of it is sealed as an edit of it.
     pub carried: &'a [(VPath, crate::object::TreeEntry)],
-    /// Record only these paths of `fs` (and `.veilpolicy`, which classifies
-    /// them); everything else keeps the working copy's recorded entries,
-    /// whatever `fs` holds there (colocated Git mode snapshots only the
-    /// paths Git does not manage). `fs` is seen through a
-    /// [`crate::vfs::SparseView`] of the working copy's tree, exactly as a
-    /// sparse sandbox is recorded: a file outside the set is never read,
-    /// recorded or deleted.
-    pub only: Option<&'a crate::vfs::SparseSet>,
-    /// How `.gitattributes` line endings apply (`vl renormalize` sets
+    /// How `.veilattributes` line endings apply (`vl renormalize` sets
     /// [`LineEndings::Renormalize`]).
     pub line_endings: LineEndings<'a>,
-    /// Tracked paths whose recorded entry is kept whatever `fs` holds (see
-    /// [`crate::builder::BuildOptions::keep_recorded`]).
-    pub keep_recorded: Option<&'a std::collections::BTreeSet<VPath>>,
 }
 
 #[derive(Debug, Clone)]
@@ -393,9 +382,7 @@ impl Repo {
             policy_from_command,
             expected_wc,
             carried,
-            only,
             line_endings,
-            keep_recorded,
         } = opts;
         let mut cache = cache;
         let params = BuildParams {
@@ -593,7 +580,6 @@ impl Repo {
                 materialised,
                 line_base: Some(&line_base),
                 line_endings: LineEndings::Convert,
-                keep_recorded: None,
             },
             cache,
         )?;
@@ -677,7 +663,6 @@ impl Repo {
                 materialised,
                 line_base: None,
                 line_endings: LineEndings::Convert,
-                keep_recorded: None,
             },
             cache,
         )
@@ -803,7 +788,6 @@ impl Repo {
                 materialised,
                 line_base: Some(&line_base),
                 line_endings: LineEndings::Convert,
-                keep_recorded: None,
             },
             None,
         )?;

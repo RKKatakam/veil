@@ -1,10 +1,10 @@
-//! Per-path attributes from `.gitattributes` (line endings, binary, diff
+//! Per-path attributes from `.veilattributes` (line endings, binary, diff
 //! and merge drivers) and the conversions they imply.
 //!
 //! Feature 7 of the Git-parity round
 //! (`docs/design/git-parity/7-attributes-line-endings.md`).
 //!
-//! **Source.** Veil reads `.gitattributes` itself, at the root and in every
+//! **Source.** Veil reads `.veilattributes` itself, at the root and in every
 //! directory, with Git's rules: a pattern without a `/` matches a file name
 //! at any depth below its file's directory, one with a `/` is matched
 //! against the path relative to that directory (Git's `wildmatch`, with
@@ -17,9 +17,9 @@
 //! exists: what is recorded never depends on device configuration, and the
 //! native line ending is LF (Linux and macOS).
 //!
-//! **Limits.** A `.gitattributes` larger than [`MAX_FILE`] is ignored as a
+//! **Limits.** A `.veilattributes` larger than [`MAX_FILE`] is ignored as a
 //! whole (with a warning), and so is a line of [`MAX_LINE`] bytes or more
-//! (as Git does). A symlinked `.gitattributes` is never followed, and one
+//! (as Git does). A symlinked `.veilattributes` is never followed, and one
 //! this reader cannot open (sealed for a scope it is not in) counts as
 //! absent, with a warning: attributes never block a command.
 //!
@@ -36,7 +36,7 @@
 //! **Drivers.** `diff=<name>` and `merge=<name>` only *name* a driver. A
 //! name means something only if this device defines it ([`DeviceDrivers`],
 //! registered on the [`ObjectStore`] by the CLI from its own configuration
-//! files); nothing in a tree, `.gitattributes` included, can ever define a
+//! files); nothing in a tree, `.veilattributes` included, can ever define a
 //! command. An unknown name falls back to the built-in behaviour.
 
 use std::{
@@ -53,7 +53,7 @@ use crate::{
 };
 
 /// The name of an attributes file (read in every directory).
-pub const ATTRIBUTES_FILE: &str = ".gitattributes";
+pub const ATTRIBUTES_FILE: &str = ".veilattributes";
 /// The device-local attributes file (as `.git/info/attributes`): highest
 /// priority, never synced.
 pub const LOCAL_ATTRIBUTES: &str = ".veil/local/attributes";
@@ -66,16 +66,15 @@ pub const MAX_LINE: usize = 2048;
 /// Attributes Veil acts on.
 pub const SUPPORTED: &[&str] = &["text", "eol", "binary", "diff", "merge", "crlf"];
 
-/// Attributes Veil knows Git gives a meaning to, but does not implement:
-/// `vl attr check` lists them as "not supported by Veil".
+/// Attributes Veil knows of but does not implement: `vl attr check` lists
+/// them as "not supported by Veil".
 pub fn unsupported_note(name: &str) -> Option<&'static str> {
     Some(match name {
-        "filter" => "not supported by Veil: Veil records the file's bytes as they are on disk, unfiltered (for Git LFS, the full content after `git lfs smudge`)",
+        "filter" => "not supported by Veil: Veil records the file's bytes as they are on disk, unfiltered",
         "ident" => "not supported by Veil: `$Id$` is never expanded",
         "working-tree-encoding" => "not supported by Veil: the file is recorded in its working-tree encoding",
-        "export-ignore" | "export-subst" => "not supported by Veil (it only affects `git archive`)",
-        "whitespace" | "conflict-marker-size" | "delta" | "encoding" => "not supported by Veil",
-        n if n.starts_with("linguist-") => "not supported by Veil (it only affects GitHub's language statistics)",
+        "export-ignore" | "export-subst" | "whitespace" | "conflict-marker-size" | "delta" | "encoding" => "not supported by Veil",
+        n if n.starts_with("linguist-") => "not supported by Veil",
         _ => return None,
     })
 }
@@ -672,7 +671,7 @@ impl AttrFile {
 
 /// Where the attributes files of a working copy or tree are read from.
 pub trait AttrSource {
-    /// The content of `dir/.gitattributes` if it is a regular file (never
+    /// The content of `dir/.veilattributes` if it is a regular file (never
     /// through or at a symlink); `Err` with the reason when it exists but
     /// cannot be read (sealed for a scope this reader is not in).
     fn read_attributes(&self, dir: &VPath) -> std::result::Result<Option<Vec<u8>>, String>;
@@ -687,7 +686,7 @@ impl AttrSource for NoSource {
     }
 }
 
-/// The `.gitattributes` files of a working copy (or any backend).
+/// The `.veilattributes` files of a working copy (or any backend).
 pub struct BackendSource<'a>(pub &'a dyn StorageBackend);
 
 impl AttrSource for BackendSource<'_> {
@@ -712,7 +711,7 @@ fn too_large() -> String {
     format!("it is larger than {} KiB", MAX_FILE >> 10)
 }
 
-/// The `.gitattributes` files of a recorded tree.
+/// The `.veilattributes` files of a recorded tree.
 pub struct TreeSource<'a> {
     pub store: &'a ObjectStore,
     pub tree: ObjectId,
@@ -741,7 +740,7 @@ impl AttrSource for TreeSource<'_> {
     }
 }
 
-/// The `.gitattributes` files of a recorded tree as one **audience** reads
+/// The `.veilattributes` files of a recorded tree as one **audience** reads
 /// them (BUG-705): a file whose content is public (or under a released
 /// embargo), or sealed exactly for `audience`, is read as it is; a file
 /// sealed for anyone else gives its last public version (its fallback), or

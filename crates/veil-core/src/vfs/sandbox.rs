@@ -222,7 +222,7 @@ impl SandboxFs {
                 continue;
             }
             // The file on disk is a line-ending conversion of the recorded
-            // version (`.gitattributes`), not its bytes.
+            // version (`.veilattributes`), not its bytes.
             if rec.eol.as_ref().is_some_and(|f| f.recorded.is_some()) {
                 continue;
             }

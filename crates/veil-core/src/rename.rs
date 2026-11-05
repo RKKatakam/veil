@@ -1,9 +1,8 @@
 //! Rename and copy detection (computed, never stored): exact and inexact
 //! passes within limits, on what this reader can read.
 //!
-//! Renames are never recorded in snapshots, trees, operations or the Git
-//! export (Git recomputes them on public content); they exist only in this
-//! reader's output. Detection runs on the changes between two trees as
+//! Renames are never recorded in snapshots, trees or operations; they exist
+//! only in this reader's output. Detection runs on the changes between two trees as
 //! [`crate::tree::diff_trees`] lists them, which reads trees through
 //! [`ObjectStore::tree`]: embargo wrappers are already resolved for this
 //! reader, so a non-holder never sees a rename an embargoed fix made

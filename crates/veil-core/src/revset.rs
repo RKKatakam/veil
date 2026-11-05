@@ -11,8 +11,8 @@
 //! X-  X--      first parent, grandparent, …
 //! ```
 //!
-//! Sets of snapshots ([`resolve_set`], `vl log -r`, `vl bisect`,
-//! `vl format-patch`), children before parents:
+//! Sets of snapshots ([`resolve_set`], `vl log -r`, `vl bisect`),
+//! children before parents:
 //!
 //! ```text
 //! X            just X
@@ -26,7 +26,7 @@
 //! the operators are unambiguous.
 //!
 //! Tags are resolved before change ids, so a tag must never be named after
-//! a change: `vl pull` and `vl git pull` do not create a local tag whose
+//! a change: `vl pull` does not create a local tag whose
 //! name is a change-id or snapshot-id prefix of the repository
 //! (`RevisionNames`, BUG-059 and BUG-105).
 //!
@@ -115,20 +115,12 @@ fn resolve_base(repo: &Repo, base: &str, ws: &str) -> Result<ObjectId> {
     if let Some(t) = view.remote_tags.get(base) {
         return Ok(*t);
     }
-    // Release tags (format 5): `tag:<name>` names a release tag, local or
-    // `<remote>/<name>` fetched from Git, when a branch has the same name;
-    // `<remote>/<name>` alone names the Git tag when no branch does.
+    // Release tags (format 5): `tag:<name>` names a release tag.
     if let Some(rest) = base.strip_prefix("tag:") {
-        if let Some(t) = view.tags.get(rest).filter(|t| t.annotation.is_some()) {
-            return Ok(t.target);
-        }
-        return match view.remote_release_tags.get(rest) {
-            Some(a) => Ok(repo.store().atag(a)?.target),
+        return match view.tags.get(rest).filter(|t| t.annotation.is_some()) {
+            Some(t) => Ok(t.target),
             None => Err(VeilError::Revset(format!("no release tag '{rest}'"))),
         };
-    }
-    if let Some(a) = view.remote_release_tags.get(base) {
-        return Ok(repo.store().atag(a)?.target);
     }
     if base.len() == 64 {
         if let Ok(id) = ObjectId::from_hex(base) {
@@ -260,9 +252,8 @@ fn local_history(repo: &Repo) -> Result<std::collections::HashSet<ObjectId>> {
 }
 
 /// Change ids and snapshot ids of the snapshots reachable from a set of
-/// refs, to keep tags created from a remote's names (`vl pull`,
-/// `vl git pull`) from shadowing them in revsets: anyone who can push a
-/// tag or branch named after a published change id could otherwise
+/// refs, to keep tags created from a remote's names (`vl pull`) from
+/// shadowing them in revsets: anyone who can push a tag named after a published change id could otherwise
 /// redirect `vl edit <change>` to their snapshot. Built on first use.
 #[derive(Default)]
 pub(crate) struct RevisionNames(Option<Vec<(String, String)>>);

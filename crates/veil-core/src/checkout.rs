@@ -18,16 +18,14 @@
 //!
 //! In repository format 5 symlink entries are materialised as symlinks
 //! ([`StorageBackend::write_link`]; the target is written as it is, never
-//! resolved), and gitlink entries as the empty directory of a submodule.
-//! A symlink at a path is replaced or removed only when it is the version
+//! resolved). A symlink at a path is replaced or removed only when it is the version
 //! `from` materialised there (same target); a link checkout did not write
 //! is never replaced or removed (`kept_local`, or `blocked` where a file of
-//! the tree would replace it). A submodule's directory is never removed
-//! unless empty. A conflict with a symlink or gitlink side is materialised
+//! the tree would replace it). A conflict with a symlink side is materialised
 //! as its shown side, as it is ([`crate::conflict::shown_side`]): never a
 //! file of markers, which would turn a link target into file content.
 //!
-//! Line endings follow `.gitattributes` (see [`crate::attributes`]): a
+//! Line endings follow `.veilattributes` (see [`crate::attributes`]): a
 //! file whose attributes say `eol=crlf` is written with CRLF line endings
 //! (the attributes of the tree checked out decide), and recorded in
 //! [`Materialised`] as written so. A file is taken for the version
@@ -624,19 +622,18 @@ impl<'a> SpecialGuard<'a> {
 }
 
 /// What checkout materialises for an entry: a file (or a conflict's file
-/// of markers), a symlink, a submodule's directory, or nothing (a hostile
+/// of markers), a symlink, or nothing (a hostile
 /// conflict with no side).
 #[derive(Clone, Debug)]
 enum Form {
     /// A file entry, or a conflict rendered as a file.
     File(TreeEntry),
     Symlink(TreeEntry),
-    Gitlink(TreeEntry),
     Nothing,
 }
 
 impl Form {
-    /// The form of `e`: a conflict with a symlink or gitlink side is its
+    /// The form of `e`: a conflict with a symlink side is its
     /// shown side, as it is ([`crate::conflict::shown_side`]).
     fn of(store: &ObjectStore, e: &TreeEntry) -> Form {
         let e = match e.kind {
@@ -651,14 +648,13 @@ impl Form {
         };
         match e.kind {
             EntryKind::Symlink => Form::Symlink(e),
-            EntryKind::Gitlink => Form::Gitlink(e),
             _ => Form::File(e),
         }
     }
 
     fn entry(&self) -> Option<&TreeEntry> {
         match self {
-            Form::File(e) | Form::Symlink(e) | Form::Gitlink(e) => Some(e),
+            Form::File(e) | Form::Symlink(e) => Some(e),
             Form::Nothing => None,
         }
     }
@@ -791,36 +787,18 @@ fn apply_changes(
             report.nested.push((c.path.clone(), repo));
             continue;
         }
-        let old = c.old.as_ref().map(|o| Form::of(store, o));
-        match fs.metadata(&c.path)?.map(|m| m.kind) {
-            Some(NodeKind::File | NodeKind::Symlink) => {
-                if !holds(store, fs, &c.path, c.old.as_ref(), cache.as_deref(), &eol)? {
-                    // A link checkout did not write is never removed.
-                    report.kept_local.push(c.path.clone());
-                    continue;
-                }
-                if let Err(e) = fs.remove_file(&c.path) {
-                    per_file(&mut report, &c.path, e)?;
-                    continue;
-                }
-                forget(&mut cache, &c.path);
-                report.removed += 1;
+        if let Some(NodeKind::File | NodeKind::Symlink) = fs.metadata(&c.path)?.map(|m| m.kind) {
+            if !holds(store, fs, &c.path, c.old.as_ref(), cache.as_deref(), &eol)? {
+                // A link checkout did not write is never removed.
+                report.kept_local.push(c.path.clone());
+                continue;
             }
-            // A submodule's directory: removed only if empty (never what
-            // `vl submodule update` put there).
-            Some(NodeKind::Dir) if matches!(old, Some(Form::Gitlink(_))) => {
-                if !is_empty_dir(fs, &c.path)? {
-                    report.kept_local.push(c.path.clone());
-                    continue;
-                }
-                if let Err(e) = fs.remove_dir_all(&c.path) {
-                    per_file(&mut report, &c.path, e)?;
-                    continue;
-                }
-                guard.forget(&c.path);
-                report.removed += 1;
+            if let Err(e) = fs.remove_file(&c.path) {
+                per_file(&mut report, &c.path, e)?;
+                continue;
             }
-            _ => {}
+            forget(&mut cache, &c.path);
+            report.removed += 1;
         }
         prune_empty_parents(fs, &c.path)?;
     }
@@ -847,7 +825,7 @@ fn apply_changes(
         if matches!(form, Form::Nothing) {
             continue;
         }
-        if let Form::Symlink(_) | Form::Gitlink(_) = &form {
+        if let Form::Symlink(_) = &form {
             apply_special(store, fs, c, &form, &policy, &mut guard, &mut report, cache.as_deref_mut(), &eol)?;
             continue;
         }
@@ -974,8 +952,8 @@ fn apply_changes(
     Ok(report)
 }
 
-/// Materialise change `c` whose new version is a symlink or a gitlink
-/// (`form`, format 5): see the module documentation. `None` when nothing
+/// Materialise change `c` whose new version is a symlink (`form`,
+/// format 5): see the module documentation. `None` when nothing
 /// was done (reported).
 #[allow(clippy::too_many_arguments)]
 fn apply_special(
@@ -1090,38 +1068,6 @@ fn apply_special(
             }
             forget(&mut cache, path);
             guard.forget(path);
-            report.written += 1;
-            Ok(Some(()))
-        }
-        Form::Gitlink(_) => {
-            if policy.classify(path, true).builtin_vcs {
-                return Ok(None);
-            }
-            if let Some(obstacle) = guard.file_in_the_way(path)? {
-                report.obstructed.push((path.clone(), obstacle));
-                return Ok(None);
-            }
-            match current.as_ref().map(|m| m.kind) {
-                // Whatever the user (or `vl submodule update`) put there
-                // stays.
-                Some(NodeKind::Dir) => return Ok(Some(())),
-                Some(NodeKind::File | NodeKind::Symlink) => {
-                    if !ours(fs)? {
-                        report.kept_local.push(path.clone());
-                        return Ok(None);
-                    }
-                    if let Err(err) = fs.remove_file(path) {
-                        per_file(report, path, err)?;
-                        return Ok(None);
-                    }
-                    forget(&mut cache, path);
-                }
-                None => {}
-            }
-            if let Err(err) = fs.create_dir_all(path) {
-                per_file(report, path, err)?;
-                return Ok(None);
-            }
             report.written += 1;
             Ok(Some(()))
         }

@@ -22,7 +22,6 @@ clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.6"
 clap_mangen = "0.3"
 diffy = "0.4"
-gix = { version = "0.90", default-features = false, features = ["sha1", "parallel"] }
 globset = "0.4"
 hex = "0.4"
 libc = "0.2"
@@ -36,8 +35,6 @@ thiserror = "2"
 unicode-normalization = "0.1"
 zeroize = { version = "1", features = ["derive"] }
 zstd = { version = "0.14", default-features = false }
-# zlib for `GIT binary patch` data (pure Rust; already what gix uses).
-zlib-rs = { version = "0.6", default-features = false, features = ["rust-allocator"] }
 # Pure-Rust zstd *decoder*, for builds without the C library (WASM).
 ruzstd = { version = "0.9", default-features = false, features = ["std"] }
 

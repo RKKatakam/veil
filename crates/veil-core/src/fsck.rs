@@ -643,7 +643,7 @@ impl Checker {
                 EntryKind::Dir => next.push((e.id, child, !e.visibility.is_public())),
                 EntryKind::File => self.check_file(e, &child),
                 EntryKind::Conflict => self.check_conflict(e, &child),
-                EntryKind::Symlink | EntryKind::Gitlink => self.check_special(e, &child),
+                EntryKind::Symlink => self.check_special(e, &child),
             }
         }
         next
@@ -686,18 +686,13 @@ impl Checker {
         }
     }
 
-    /// A symlink or gitlink (format 5): its object is checked as a file's,
-    /// then, when this reader can read it, its content: a link target is
-    /// UTF-8 without NUL and at most [`MAX_LINK_TARGET`] bytes; a gitlink
-    /// holds `"<40 or 64 lowercase hex digits>\n"`.
+    /// A symlink (format 5): its object is checked as a file's, then, when
+    /// this reader can read it, its content: a link target is UTF-8
+    /// without NUL and at most [`MAX_LINK_TARGET`] bytes.
     fn check_special(&mut self, e: &TreeEntry, path: &str) {
         self.check_file(e, path);
         let Ok(data) = self.store.read_blob(&e.id) else { return };
-        let why = match e.kind {
-            EntryKind::Symlink => special_content_problem_symlink(&data),
-            _ => special_content_problem_gitlink(&data),
-        };
-        if let Some(why) = why {
+        if let Some(why) = special_content_problem_symlink(&data) {
             self.push(Severity::Warning, format!("{} {path}: {why}", e.kind.name()));
         }
     }
@@ -707,12 +702,11 @@ impl Checker {
     /// tag whose atag names another tag or target, or whose signature does
     /// not verify, is reported.
     fn check_annotations(&mut self, view: &crate::oplog::View, check_names: bool, roots: &mut Vec<(ObjectId, String)>, seen: &mut HashSet<ObjectId>) {
-        let mut named: Vec<(Option<(&str, ObjectId)>, ObjectId)> = view
+        let named: Vec<(Option<(&str, ObjectId)>, ObjectId)> = view
             .tags
             .iter()
             .filter_map(|(n, t)| t.annotation.map(|a| (Some((n.as_str(), t.target)), a)))
             .collect();
-        named.extend(view.remote_release_tags.values().map(|a| (None, *a)));
         for (tag, id) in named {
             let first = seen.insert(id);
             if !first && !check_names {
@@ -743,7 +737,6 @@ impl Checker {
                     v,
                     crate::tag_object::AtagVerification::Signed { .. }
                         | crate::tag_object::AtagVerification::Unsigned
-                        | crate::tag_object::AtagVerification::GitSignatureNotVerified
                 ) {
                     self.push(
                         Severity::Warning,
@@ -1314,14 +1307,6 @@ pub fn special_content_problem_symlink(data: &[u8]) -> Option<String> {
     } else {
         None
     }
-}
-
-/// Why `data` is not a valid gitlink pointer, if it is not.
-pub fn special_content_problem_gitlink(data: &[u8]) -> Option<String> {
-    let ok = data.last() == Some(&b'\n')
-        && matches!(data.len(), 41 | 65)
-        && data[..data.len() - 1].iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-    (!ok).then(|| "not a Git commit id (40 or 64 lowercase hex digits and a newline)".into())
 }
 
 /// `s` with control characters escaped, for findings that quote names.

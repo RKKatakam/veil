@@ -1,4 +1,0 @@
-veil:blob
-fn main() {
-    println!("v3");
-}

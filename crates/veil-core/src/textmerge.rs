@@ -376,7 +376,7 @@ fn create_patch_within<'a>(old: &'a str, new: &'a str, scratch: &'a mut String, 
     diffy::Patch::from_str(scratch).unwrap_or_else(|_| diffy::create_patch(old, new))
 }
 
-/// The union merge of `ours` and `theirs` from `base` (`.gitattributes`
+/// The union merge of `ours` and `theirs` from `base` (`.veilattributes`
 /// `merge=union`): the line merge, where each conflicting hunk takes ours'
 /// lines followed by theirs'. Never fails, and never holds a line only the
 /// base has (the base's section of a conflict is dropped).

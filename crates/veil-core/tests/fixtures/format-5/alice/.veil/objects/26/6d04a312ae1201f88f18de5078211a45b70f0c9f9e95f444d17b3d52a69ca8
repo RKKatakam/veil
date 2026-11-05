@@ -1,4 +1,0 @@
-veil:blob
-pub fn shout(s: &str) -> String {
-    s.to_ascii_uppercase()
-}

@@ -1,10 +1,9 @@
 //! Annotated tag objects (`veil:atag`, repository format 5).
 //!
-//! An annotated tag is what Git calls a tag object: a name, the snapshot it
-//! points at, a message, who made it and when, and optionally a signature.
-//! The view's [`crate::oplog::Tag::annotation`] names one; a tag with an
-//! annotation is a **release tag** (immutable, exported to Git as
-//! `refs/tags/<name>`), one without stays a branch-like tag.
+//! An annotated tag is a tag object: a name, the snapshot it points at, a
+//! message, who made it and when, and optionally a signature. The view's
+//! [`crate::oplog::Tag::annotation`] names one; a tag with an annotation is
+//! a **release tag** (immutable), one without stays a branch-like tag.
 //!
 //! # Encoding
 //!
@@ -15,9 +14,9 @@
 //! signature. Unknown fields are refused too (FORMAT.md rule 1).
 //!
 //! ```text
-//! {"name":…,"target":…,"kind":"annotated"|"lightweight-git",
+//! {"name":…,"target":…,"kind":"annotated",
 //!  "message":{"plain":…}|{"sealed":…},"tagger":…,"timestamp":…,
-//!  "signature"?:{signer,key,sig},"git"?:{"oid":…,"raw":…}}
+//!  "signature"?:{signer,key,sig}}
 //! ```
 //!
 //! # Signatures
@@ -26,15 +25,11 @@
 //! with [`SIG_CONTEXT_TAG`], where
 //! the unsigned id is the id of the encoding without `signature`. The
 //! signature therefore covers the name, the target, the kind, the
-//! (possibly sealed) message, the tagger, the time and the Git payload: an
+//! (possibly sealed) message, the tagger and the time: an
 //! atag cannot be moved to another target or name without breaking it, and
 //! [`Atag::verify`] also checks that the view entry naming it agrees with
 //! its `name` and `target` (a valid atag of `v1.0` shown under `v2.0`, or
 //! under `v1.0` pointing elsewhere, is "unverified (name mismatch)").
-//!
-//! An imported Git tag's own GPG or SSH signature is kept verbatim in
-//! `git.raw` (for byte-exact re-export) and is **never** reported as
-//! verified: only a Veil Ed25519 signature counts.
 //!
 //! # Confidentiality
 //!
@@ -55,12 +50,9 @@ use crate::{
     object::{Object, Text},
 };
 
-/// Largest message (plain or sealed, in bytes) an atag may carry. Git tag
-/// messages larger than this are skipped on import (bridge-tags design,
-/// threat 9); a hostile object carrying more is corrupt.
+/// Largest message (plain or sealed, in bytes) an atag may carry: a
+/// hostile object carrying more is corrupt.
 pub const MAX_TAG_MESSAGE: usize = 1 << 20;
-/// Largest raw Git tag object (`git.raw`, before hex) an atag may carry.
-pub const MAX_GIT_TAG_RAW: usize = MAX_TAG_MESSAGE + 64 * 1024;
 /// Largest tagger string.
 pub const MAX_TAGGER: usize = 1024;
 
@@ -68,22 +60,8 @@ pub const MAX_TAGGER: usize = 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AtagKind {
-    /// `vl tag set -a`, or an annotated Git tag.
+    /// `vl tag set -a`.
     Annotated,
-    /// A lightweight Git tag imported as a release tag (no message of its
-    /// own, no Git tag object).
-    LightweightGit,
-}
-
-/// The Git tag object an imported atag came from, for byte-exact
-/// re-export (its signature, if any, stays valid in Git).
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GitTagOrigin {
-    /// Lowercase hex Git object id (40 or 64 digits).
-    pub oid: String,
-    /// Lowercase hex of the raw Git tag object (without the Git header).
-    pub raw: String,
 }
 
 /// An annotated tag object; see the module documentation.
@@ -103,16 +81,10 @@ pub struct Atag {
     /// Ed25519 over [`Atag::unsigned_id`] (context `tag`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<Signature>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub git: Option<GitTagOrigin>,
 }
 
 fn atag_corrupt(m: impl Into<String>) -> VeilError {
     VeilError::Corrupt("atag".into(), m.into())
-}
-
-fn is_lower_hex(s: &str) -> bool {
-    s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// What [`Atag::verify`] found.
@@ -122,9 +94,6 @@ pub enum AtagVerification {
     /// signing key `key` (hex Ed25519). Whether that key belongs to a
     /// trusted member is for the caller (the ring) to decide.
     Signed { signer: String, key: String },
-    /// No Veil signature, but a Git signature kept in `git.raw`: never
-    /// verified by Veil.
-    GitSignatureNotVerified,
     /// No signature at all.
     Unsigned,
     /// A signature that does not verify (forged, or the atag was edited).
@@ -146,7 +115,6 @@ impl AtagVerification {
     pub fn describe(&self) -> String {
         match self {
             AtagVerification::Signed { signer, .. } => format!("signed by {}", &signer[..signer.len().min(16)]),
-            AtagVerification::GitSignatureNotVerified => "Git signature, not verified by Veil".into(),
             AtagVerification::Unsigned => "unsigned".into(),
             AtagVerification::BadSignature => "unverified (bad signature)".into(),
             AtagVerification::NameMismatch { .. } => "unverified (name mismatch)".into(),
@@ -166,7 +134,6 @@ impl Atag {
             tagger: tagger.to_string(),
             timestamp,
             signature: None,
-            git: None,
         }
     }
 
@@ -199,24 +166,7 @@ impl Atag {
         if self.tagger.len() > MAX_TAGGER || self.tagger.chars().any(char::is_control) {
             return Err(atag_corrupt("invalid tagger"));
         }
-        if self.kind == AtagKind::LightweightGit && self.git.is_some() {
-            return Err(atag_corrupt("a lightweight Git tag has no Git tag object"));
-        }
-        if let Some(g) = &self.git {
-            if !matches!(g.oid.len(), 40 | 64) || !is_lower_hex(&g.oid) {
-                return Err(atag_corrupt("invalid Git object id"));
-            }
-            if g.raw.len() % 2 != 0 || g.raw.len() / 2 > MAX_GIT_TAG_RAW || !is_lower_hex(&g.raw) {
-                return Err(atag_corrupt("invalid raw Git tag object"));
-            }
-        }
         Ok(())
-    }
-
-    /// The raw Git tag object bytes, if this atag came from Git.
-    pub fn git_raw(&self) -> Option<Vec<u8>> {
-        let g = self.git.as_ref()?;
-        hex::decode(&g.raw).ok()
     }
 
     /// Id of this atag's encoding without `signature`: the signed value.
@@ -259,9 +209,6 @@ impl Atag {
                 key: sig.key.clone(),
             },
             (Some(_), _) => AtagVerification::BadSignature,
-            (None, _) if self.git.is_some() && self.git_raw().is_some_and(|r| git_tag_is_signed(&r)) => {
-                AtagVerification::GitSignatureNotVerified
-            }
             (None, _) => AtagVerification::Unsigned,
         }
     }
@@ -270,16 +217,6 @@ impl Atag {
     pub fn is_sealed(&self) -> bool {
         matches!(self.message, Text::Sealed(_))
     }
-}
-
-/// Does a raw Git tag object carry a GPG or SSH signature?
-fn git_tag_is_signed(raw: &[u8]) -> bool {
-    const MARKERS: [&[u8]; 3] = [
-        b"-----BEGIN PGP SIGNATURE-----",
-        b"-----BEGIN SSH SIGNATURE-----",
-        b"-----BEGIN SIGNED MESSAGE-----",
-    ];
-    MARKERS.iter().any(|m| raw.windows(m.len()).any(|w| w == *m))
 }
 
 #[cfg(test)]
@@ -352,18 +289,6 @@ mod tests {
     }
 
     #[test]
-    fn git_signatures_are_never_verified() {
-        let mut a = sample();
-        let raw = b"object 0123\ntype commit\ntag v1.0\n\nmsg\n-----BEGIN PGP SIGNATURE-----\njunk\n-----END PGP SIGNATURE-----\n";
-        a.git = Some(GitTagOrigin {
-            oid: "ab".repeat(20),
-            raw: hex::encode(raw),
-        });
-        assert_eq!(a.verify("v1.0", &ObjectId([7; 32])), AtagVerification::GitSignatureNotVerified);
-        assert!(!a.verify("v1.0", &ObjectId([7; 32])).is_signed());
-    }
-
-    #[test]
     fn hostile_atags_are_refused() {
         let enc = |a: &Atag| Object::Atag(a.clone()).encode();
         let bad = |a: Atag| matches!(Object::decode(&enc(&a)), Err(VeilError::Corrupt(..)));
@@ -380,24 +305,6 @@ mod tests {
         assert!(bad(a));
         let mut a = sample();
         a.tagger = "t".repeat(MAX_TAGGER + 1);
-        assert!(bad(a));
-        for oid in ["AB".repeat(20), "ab".repeat(19), "zz".repeat(20)] {
-            let mut a = sample();
-            a.git = Some(GitTagOrigin { oid, raw: String::new() });
-            assert!(bad(a));
-        }
-        let mut a = sample();
-        a.git = Some(GitTagOrigin {
-            oid: "ab".repeat(20),
-            raw: "abc".into(),
-        });
-        assert!(bad(a));
-        let mut a = sample();
-        a.kind = AtagKind::LightweightGit;
-        a.git = Some(GitTagOrigin {
-            oid: "ab".repeat(20),
-            raw: String::new(),
-        });
         assert!(bad(a));
         // A reserved encoding byte is "needs a newer vl".
         let mut r = b"veil:atag\n".to_vec();

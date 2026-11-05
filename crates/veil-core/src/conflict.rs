@@ -78,7 +78,7 @@ impl Merge {
     /// file in a file merge) is resolved to nothing.
     pub fn of_entry(store: &ObjectStore, e: Option<&TreeEntry>) -> Result<Merge> {
         Ok(match e {
-            // A symlink or gitlink (format 5) is a version like a file.
+            // A symlink (format 5) is a version like a file.
             Some(e) if e.kind.holds_blob() => Merge::resolved(Some(ConflictTerm::of(e))),
             Some(e) if e.kind == EntryKind::Conflict => Merge::of_conflict(store.conflict(&e.id)?),
             _ => Merge::resolved(None),
@@ -187,7 +187,7 @@ pub fn merged_executable(m: &Merge) -> bool {
 pub enum Audience {
     /// This reader: whatever its keys open.
     Reader,
-    /// Everyone: only plaintext is shown. What the Git export shows.
+    /// Everyone: only plaintext is shown. What a public remote shows.
     Public,
 }
 
@@ -260,7 +260,7 @@ fn see(store: &ObjectStore, t: &ConflictTerm, audience: Audience) -> Result<Seen
         Sealing::Unverifiable => None,
     };
     // Plaintext only: content under an embargo, even a released one, is
-    // not shown to the public audience (see `git::project`).
+    // not shown to the public audience.
     let shown_to_public = matches!(verified, Some(Visibility::Public));
     // A sealed term's fallback is an older version, never its content.
     let content = match audience {
@@ -346,7 +346,7 @@ fn marker_len<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> usize {
 ///   whole in one block, unreadable ones as a redaction line.
 ///
 /// Only what writes or shows the file calls this (checkout, `vl cat`,
-/// `vl diff`, `vl show`, the Git export, a snapshot comparing an edited
+/// `vl diff`, `vl show`, a snapshot comparing an edited
 /// copy); what only describes the conflict uses [`inspect`], which never
 /// compares the sides' text (BUG-484).
 pub fn materialize(store: &ObjectStore, c: &Conflict, audience: Audience) -> Result<Materialized> {
@@ -390,13 +390,13 @@ pub fn inspect_entry(store: &ObjectStore, e: &TreeEntry, audience: Audience) -> 
 /// text sides, whose content is then left empty.
 fn render(store: &ObjectStore, c: &Conflict, audience: Audience, text: bool) -> Result<Materialized> {
     // A link target is never turned into file content (a file of markers a
-    // later edit could publish): a conflict with a symlink or gitlink term
+    // later edit could publish): a conflict with a symlink term
     // is materialised as its shown side, as it is ([`shown_side`]; symlinks
     // design, threat 12). It can be described, never rendered as a file.
     if c.has_special_terms() {
         if text {
             return Err(VeilError::Unsupported(
-                "a conflict between a symlink or gitlink and another version is never written as a file of markers; \
+                "a conflict between a symlink and another version is never written as a file of markers; \
                  the working copy holds one side as it is (`vl resolve --ours|--theirs` picks one)"
                     .into(),
             ));
@@ -621,7 +621,7 @@ fn render(store: &ObjectStore, c: &Conflict, audience: Audience, text: bool) -> 
     Ok(out)
 }
 
-/// The side of a conflict with a symlink or gitlink term (format 5) that
+/// The side of a conflict with a symlink term (format 5) that
 /// the working copy holds, as it is: the first side present (ours, unless
 /// our side deleted it), with its index in `adds`. `None` only for a
 /// hostile conflict whose every side is "no file".
@@ -629,7 +629,7 @@ pub fn shown_side(c: &Conflict) -> Option<(usize, &crate::object::ConflictTerm)>
     c.adds.iter().enumerate().find_map(|(i, t)| t.as_ref().map(|t| (i, t)))
 }
 
-/// [`inspect`] of a conflict with a symlink or gitlink term: the shown side
+/// [`inspect`] of a conflict with a symlink term: the shown side
 /// decides the mode and audience; every other version is not shown.
 fn describe_special(store: &ObjectStore, c: &Conflict, audience: Audience) -> Result<Materialized> {
     let mut unreadable_side = false;
@@ -667,8 +667,8 @@ pub fn materialize_entry(store: &ObjectStore, e: &TreeEntry, audience: Audience)
 }
 
 /// Is file entry `file` exactly what a public reader is shown for conflict
-/// entry `c`, with every version shown (the Git export of the conflict)?
-/// Then a Git commit's edit of that file is an edit of the conflict.
+/// entry `c`, with every version shown? Then an edit of that file is an
+/// edit of the conflict.
 pub fn publicly_renders_as(store: &ObjectStore, c: &TreeEntry, file: &TreeEntry) -> Result<bool> {
     if !file.visibility.is_public() || file.fallback.is_some() {
         return Ok(false);
@@ -686,7 +686,7 @@ pub fn publicly_renders_as(store: &ObjectStore, c: &TreeEntry, file: &TreeEntry)
 /// conflict entry (under an unreleased embargo). Refused when a version
 /// cannot be read here, which writing markers would lose.
 pub fn as_marker_file(store: &ObjectStore, c: &TreeEntry, path: &VPath) -> Result<TreeEntry> {
-    // A conflict with a symlink or gitlink side: its shown side, as it is
+    // A conflict with a symlink side: its shown side, as it is
     // (a link target never becomes a file of markers).
     let conflict = store.conflict(&c.id)?;
     if conflict.has_special_terms() {
@@ -716,7 +716,7 @@ pub fn as_marker_file(store: &ObjectStore, c: &TreeEntry, path: &VPath) -> Resul
 /// fallback when this reader cannot read it, as [`ObjectStore::read_entry`])
 /// or a conflict's materialisation for this reader.
 ///
-/// A symlink's bytes are its target, a gitlink's its commit id line; a
+/// A symlink's bytes are its target; a
 /// conflict with such a side reads as its shown side ([`shown_side`]).
 pub fn read_file_like(store: &ObjectStore, e: &TreeEntry) -> Result<Vec<u8>> {
     match e.kind {

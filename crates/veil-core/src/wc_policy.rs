@@ -1,7 +1,7 @@
 //! The accepted policy of the repository's own working copy.
 //!
 //! A `.veilpolicy` that arrives from someone else (merge, pull, checkout of
-//! another change, rebase, Git import, undo) must never weaken, silently,
+//! another change, rebase, undo) must never weaken, silently,
 //! the protection of files that exist only in this working copy: isolated
 //! files (`.env`, keys) never enter history, so nothing but the policy
 //! protects them. Every route ends in a snapshot of the working copy, so

@@ -42,31 +42,10 @@ use crate::{
 
 pub const VEIL_DIR: &str = ".veil";
 
-/// Where a colocated project keeps its Veil repository, relative to the
-/// project root: inside Git's own directory, which no Git command ever
-/// checks out into, cleans, stashes or deletes (BUG-740, BUG-741,
-/// BUG-746). `.veil` at the root is then only a symlink to it (see
-/// [`colocated_state_dir`]).
-pub const COLOCATED_STATE_DIR: &str = ".git/veil";
-
-/// The Veil repository of the colocated project at `root`, if there is
-/// one: `<root>/.git/veil`, when `.git` is a real directory (never a
-/// gitfile or a symlink) holding `veil/repo.json`. It takes precedence
-/// over whatever `<root>/.veil` is: that name is in Git's work tree, so a
-/// Git checkout may have put anything there.
-pub fn colocated_state_dir(root: &Path) -> Option<std::path::PathBuf> {
-    let git = root.join(".git");
-    if !std::fs::symlink_metadata(&git).is_ok_and(|m| m.is_dir()) {
-        return None;
-    }
-    let dir = git.join("veil");
-    dir.join("repo.json").is_file().then_some(dir)
-}
-
 /// The directory holding the Veil repository of the project at `root`:
-/// [`colocated_state_dir`] when colocated, else `<root>/.veil`.
+/// `<root>/.veil`.
 pub fn state_dir(root: &Path) -> std::path::PathBuf {
-    colocated_state_dir(root).unwrap_or_else(|| root.join(VEIL_DIR))
+    root.join(VEIL_DIR)
 }
 
 /// Repository format written by `vl init` and by [`crate::upgrade`].
@@ -77,7 +56,7 @@ pub fn state_dir(root: &Path) -> std::path::PathBuf {
 /// | 2 | vl 1.0.0 | binary trees (`TreeEncoding::Binary`) |
 /// | 3 | vl 1.0.0 | standard crypto: AES-SIV sealed objects (`veil:sea2`), HPKE-wrapped ring keys (ring format 3) |
 /// | 4 | vl 1.0.0 | first-class conflicts: conflict objects (`veil:conf`) and conflict tree entries |
-/// | 5 | vl 1.0.0 | Git parity: symlink and gitlink tree entries and conflict terms, annotated tags (`veil:atag`, `Tag::annotation`, `View::remote_release_tags`), the `colocated` marker |
+/// | 5 | vl 1.0.0 | symlink tree entries and conflict terms, annotated tags (`veil:atag`, `Tag::annotation`, `View::remote_release_tags`) |
 ///
 /// Every format up to this one is read; see `docs/FORMAT.md` and
 /// `docs/CRYPTO.md`.
@@ -136,43 +115,6 @@ pub struct RepoConfig {
     /// of releases that do not know the format yet ("needs vl ≥ X").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_vl: Option<String>,
-    /// Set while the project directory is colocated with a Git repository
-    /// (`vl git colocate`, format 5): `vl` keeps the Git side's guards
-    /// (excludes, skip-worktree bits, the pre-push check). Only a format-5
-    /// repository may carry it, so an older vl, which would not keep the
-    /// guards, refuses the directory by its format. Device-local, like the
-    /// whole file.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub colocated: Option<Colocated>,
-}
-
-/// The `colocated` marker of `repo.json` (see [`RepoConfig::colocated`]).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Colocated {
-    /// The Git directory, relative to the project root (normally `.git`).
-    pub git_dir: String,
-}
-
-impl Colocated {
-    /// The Git directory must be a plain relative path inside the project
-    /// (no `..`, not absolute, not inside `.veil`).
-    pub fn validate(&self) -> Result<()> {
-        let ok = !self.git_dir.is_empty()
-            && !self.git_dir.starts_with('/')
-            && !self.git_dir.contains('\0')
-            && !self.git_dir.contains('\\')
-            && self.git_dir.split('/').all(|c| !c.is_empty() && c != "." && c != "..")
-            && !crate::object::is_reserved_name(self.git_dir.split('/').next().unwrap_or(""));
-        if ok {
-            Ok(())
-        } else {
-            Err(VeilError::Corrupt(
-                "repo.json".into(),
-                format!("invalid colocated Git directory {:?}", self.git_dir),
-            ))
-        }
-    }
 }
 
 impl RepoConfig {
@@ -187,19 +129,6 @@ impl RepoConfig {
             )),
             _ => e,
         })?;
-        if let Some(c) = &self.colocated {
-            if self.format < crate::object::GIT_PARITY_REPO_FORMAT {
-                return Err(VeilError::Corrupt(
-                    "repo.json".into(),
-                    format!(
-                        "a colocated repository must be at format {} or later (this one says {})",
-                        crate::object::GIT_PARITY_REPO_FORMAT,
-                        self.format
-                    ),
-                ));
-            }
-            c.validate()?;
-        }
         Ok(())
     }
 }
@@ -295,7 +224,6 @@ impl Repo {
             repo_id: hex::encode(random_bytes::<16>()),
             remotes: BTreeMap::new(),
             min_vl: (format > 1).then(|| min_vl_for_format(format).to_string()),
-            colocated: None,
         };
         let has_identity = identity.is_some();
         let keys = Arc::new(Keychain::new(backend.clone(), identity, config.repo_id.clone()));

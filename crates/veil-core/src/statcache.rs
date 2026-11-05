@@ -12,7 +12,7 @@
 //! * `sealed`: under scope `s` (with the current key), the content seals to
 //!   object `id`;
 //! * `eol`: for content holding a CR, the line-ending facts
-//!   (`.gitattributes`, see [`EolFact`]): a fingerprint of the attributes
+//!   (`.veilattributes`, see [`EolFact`]): a fingerprint of the attributes
 //!   files in force when it was read, whether `vl renormalize` would record it otherwise, and the
 //!   blob recorded for it when that is not the content itself (a file
 //!   checkout wrote with CRLF for an LF version).
@@ -125,7 +125,7 @@ pub struct Record {
     pub eol: Option<EolFact>,
 }
 
-/// What `.gitattributes` made of a file's content when it was read (see
+/// What `.veilattributes` made of a file's content when it was read (see
 /// [`crate::attributes`]). Only valid for the parent entry it was learned
 /// against: the builder trusts such a record only where the parent entry
 /// is still the recorded version.

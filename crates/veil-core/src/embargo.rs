@@ -349,7 +349,7 @@ fn seal_dir(
             }
             // Converted to its file of markers above.
             EntryKind::Conflict => unreachable!("conflict entries are converted first"),
-            EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink => {
+            EntryKind::File | EntryKind::Symlink => {
                 // A public label is a claim: content that is really sealed
                 // (a forged label) keeps its sealing, under its real label.
                 let e = match e.visibility.is_public() {
@@ -531,7 +531,7 @@ fn normalize_dir(
                 let child = normalize_frame(store, &e.id, sub_dest, path)?;
                 stack.push(child);
             }
-            EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink => {
+            EntryKind::File | EntryKind::Symlink => {
                 let ne = normalize_file(store, &e, de.as_ref(), &path, opts, report)?;
                 settle(f, &e, ne);
             }
@@ -802,7 +802,7 @@ fn seal_paths(store: &ObjectStore, tree: &ObjectId, dest: Option<&ObjectId>, pat
         let Some(e) = t.get(name).cloned() else { continue };
         let de = d.as_deref().and_then(|d| d.get(name)).cloned();
         let ne = match e.kind {
-            EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink if rest.iter().any(|r| r.is_empty()) => {
+            EntryKind::File | EntryKind::Symlink if rest.iter().any(|r| r.is_empty()) => {
                 let data = store.read_blob(&e.id)?;
                 TreeEntry {
                     id: store.store_file(&data, vis)?,
@@ -819,7 +819,7 @@ fn seal_paths(store: &ObjectStore, tree: &ObjectId, dest: Option<&ObjectId>, pat
                     ..e
                 }
             }
-            EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink | EntryKind::Conflict => continue,
+            EntryKind::File | EntryKind::Symlink | EntryKind::Conflict => continue,
         };
         t.insert(ne);
     }
@@ -855,7 +855,7 @@ pub fn policy_rekeys(
 /// previous entry `prev`: `prev` itself if public, or the fallback `prev`
 /// already carries if it is such a sealed edit under the same scope.
 /// Readers without the key see this version instead of losing the file
-/// (BUG-074): public remotes, Git export and members of other scopes.
+/// (BUG-074): public remotes and members of other scopes.
 pub(crate) fn public_fallback(prev: Option<&TreeEntry>, vis: &Visibility) -> Option<ObjectId> {
     let prev = prev.filter(|p| p.kind == EntryKind::File)?;
     if prev.visibility.is_public() && prev.fallback.is_none() {
@@ -904,7 +904,7 @@ pub fn seal_moved(store: &ObjectStore, src: ObjectId, pre: ObjectId, post: Objec
             Some(now.clone())
         } else {
             match cur.kind {
-                EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink if cur.visibility.is_public() && c.path.as_str() != POLICY_FILE && now.visibility == vis => {
+                EntryKind::File | EntryKind::Symlink if cur.visibility.is_public() && c.path.as_str() != POLICY_FILE && now.visibility == vis => {
                     match verified_entry(store, &cur)? {
                         Some(real) => Some(real),
                         None => match store.read_entry(&cur) {
@@ -996,7 +996,7 @@ fn seal_introduced_dir(store: &ObjectStore, tree: &ObjectId, base: Option<Object
                 }
                 // A public label is a claim: content that is really sealed
                 // keeps its own sealing (under its real label).
-                EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink if e.visibility.is_public() && path.as_str() != POLICY_FILE => {
+                EntryKind::File | EntryKind::Symlink if e.visibility.is_public() && path.as_str() != POLICY_FILE => {
                     match verified_entry(store, &e)? {
                         Some(real) => ne = real,
                         None => {
@@ -1025,7 +1025,7 @@ fn seal_introduced_dir(store: &ObjectStore, tree: &ObjectId, base: Option<Object
                 // side's public version, which a squash brings from a
                 // change never published) would publish what the line
                 // introduces (BUG-682).
-                EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink => {
+                EntryKind::File | EntryKind::Symlink => {
                     if e.visibility == vis {
                         if let Some(fb) = e.fallback {
                             if !publicly_seen(store, be.as_ref())?.contains(&fb) {
@@ -1049,7 +1049,7 @@ fn publicly_seen(store: &ObjectStore, e: Option<&TreeEntry>) -> Result<BTreeSet<
     let Some(e) = e else { return Ok(out) };
     let mut terms = Vec::new();
     match e.kind {
-        EntryKind::File | EntryKind::Symlink | EntryKind::Gitlink => terms.push(ConflictTerm::of(e)),
+        EntryKind::File | EntryKind::Symlink => terms.push(ConflictTerm::of(e)),
         EntryKind::Conflict => match store.conflict(&e.id) {
             Ok(c) => terms.extend(c.interleaved().flatten().cloned()),
             Err(err) if err.is_unreadable() || err.is_not_found() || matches!(err, VeilError::Corrupt(..)) => {}

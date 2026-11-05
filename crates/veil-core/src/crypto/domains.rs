@@ -78,7 +78,7 @@ pub const SIG_CONTEXT_MEMBER_BINDING: &str = "member-binding";
 pub const SIG_CONTEXT_VAULT_ENTRY: &str = "vault-entry";
 /// Signature context: an annotated tag (`veil:atag`, repository format 5),
 /// over the id of its encoding without `signature` (`Atag::unsigned_id`):
-/// name, target, kind, message, tagger, time and Git payload.
+/// name, target, kind, message, tagger and time.
 pub const SIG_CONTEXT_TAG: &str = "tag";
 
 /// Every signature context, for the uniqueness test.
@@ -133,12 +133,6 @@ pub const LOCAL_LABEL: &str = "local";
 /// Separator of `<scope>#<key-id>` generation labels.
 pub const GENERATION_SEPARATOR: char = '#';
 
-// ---- not secret, but derived ----------------------------------------------
-
-/// BLAKE3 `derive_key` context mapping a Git commit id to a Veil change id
-/// (Git bridge). Not a security boundary; listed for completeness.
-pub const GIT_CHANGE_ID: &str = "veil 2026 git change-id v1";
-
 /// Every BLAKE3 `derive_key` context, for the uniqueness test.
 pub const BLAKE3_CONTEXTS: &[&str] = &[
     LEGACY_SIV_NONCE,
@@ -148,7 +142,6 @@ pub const BLAKE3_CONTEXTS: &[&str] = &[
     KEY_FINGERPRINT,
     RING_CHANGE_HASH,
     RING_PROOF,
-    GIT_CHANGE_ID,
     TEAM_VAULT_HISTORY,
 ];
 
@@ -162,15 +155,15 @@ mod tests {
         all.extend([AES_SIV_SUBKEY, HPKE_KEY_WRAP_INFO]);
         let unique: std::collections::BTreeSet<&str> = all.iter().copied().collect();
         assert_eq!(unique.len(), all.len(), "duplicate domain-separation string");
-        // Contexts added after the first eight are pinned on their own.
-        assert_eq!(BLAKE3_CONTEXTS[8..], ["veil 2026 team-vault history v1"], "a context changed or was reordered");
-        let mut all: Vec<&str> = BLAKE3_CONTEXTS[..8].to_vec();
+        // Contexts added after the first seven are pinned on their own.
+        assert_eq!(BLAKE3_CONTEXTS[7..], ["veil 2026 team-vault history v1"], "a context changed or was reordered");
+        let mut all: Vec<&str> = BLAKE3_CONTEXTS[..7].to_vec();
         all.extend([AES_SIV_SUBKEY, HPKE_KEY_WRAP_INFO]);
         // Pinned: these strings are part of data already on disk.
         let pinned = blake3::hash(all.join("\n").as_bytes()).to_hex().to_string();
         assert_eq!(
             &pinned[..16],
-            "bdd6da15d799062f",
+            "33c7c64265e3b514",
             "a domain-separation string changed; that breaks existing data. Add a new constant instead."
         );
         let contexts: std::collections::BTreeSet<&str> = SIG_CONTEXTS.iter().copied().collect();

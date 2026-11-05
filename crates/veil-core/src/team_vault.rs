@@ -66,7 +66,7 @@
 //! (merged first), except that records of *former* members are kept (they
 //! count again if the member is granted again) with a warning on pull.
 //! Push and pull both report the records they refuse (BUG-522).
-//! Public remotes and the Git bridge never receive the vault.
+//! Public remotes never receive the vault.
 //!
 //! # Stale rings, clocks and exposure (round 8)
 //!

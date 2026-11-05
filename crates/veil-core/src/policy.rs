@@ -39,7 +39,7 @@
 //! a cloaked file is cloaked under the same scope.
 //!
 //! **Accepted policy.** `.veilpolicy` is shared: it arrives by merge, pull,
-//! checkout, rebase, Git import or undo like any other file. Isolated files
+//! checkout, rebase or undo like any other file. Isolated files
 //! never enter history, so their protection lives *only* in the policy, and
 //! a policy that arrives from someone else must not publish them. Each
 //! working copy therefore keeps, device-locally, the policy its member last
@@ -89,11 +89,10 @@ const BUILTIN_SECRETS: &[&str] = &[
 const BUILTIN_PUBLIC_EXCEPTIONS: &[&str] = &[".env.example", ".env.sample", ".env.template", ".env.dist"];
 
 /// Metadata of other version control systems, ignored at every depth by
-/// the engine: a `.git` directory, or a `.git` *file* (Git worktrees and
-/// submodules use one), and `.jj/`, `.hg/`, `.svn/` directories. Names
-/// match in any ASCII case and with HFS+-ignorable code points
-/// (`.g\u{200C}it`), as the Git bridge's refusal of `.git` entries does: on
-/// macOS those all name the same directory. Only a `public!` rule that
+/// the engine: a `.git` directory, or a `.git` *file* (Git worktrees use
+/// one), and `.jj/`, `.hg/`, `.svn/` directories. Names match in any ASCII
+/// case and with HFS+-ignorable code points (`.g\u{200C}it`): on macOS
+/// those all name the same directory. Only a `public!` rule that
 /// names such a directory itself (`fixtures/repo/.git/ public!`) records
 /// it; no other rule does (a broad `tests/ public!` or `** cloak` does not).
 pub const BUILTIN_VCS_DIRS: &[&str] = &[".git", ".jj", ".hg", ".svn"];
@@ -702,7 +701,7 @@ impl Policy {
     }
 
     /// [`Policy::load`] for a tree that came from someone else (a checkout
-    /// target, a merge, a Git commit): a `.veilpolicy` that cannot be read
+    /// target, a merge): a `.veilpolicy` that cannot be read
     /// there (a directory, a symlink, sealed for a scope this reader lacks:
     /// only a hostile or corrupt tree records one) never blocks the
     /// command. The policy the member last accepted (`accepted`, the text
@@ -1414,7 +1413,7 @@ pub enum PolicyFile {
 pub fn read_policy_file(fs: &dyn StorageBackend) -> Result<PolicyFile> {
     let path = VPath::new(POLICY_FILE)?;
     match fs.read_through_link(&path, MAX_LINKED_POLICY) {
-        // Only to a file whose name says it is a policy: a hostile Git
+        // Only to a file whose name says it is a policy: a hostile
         // checkout's `.veilpolicy -> /proc/self/environ` (or
         // `~/.aws/credentials`) must not be parsed, and its lines echoed
         // in warnings, by `vl init` in CI.
@@ -1434,7 +1433,7 @@ pub fn read_policy_file(fs: &dyn StorageBackend) -> Result<PolicyFile> {
     }
     Ok(match fs.metadata(&path) {
         // Nothing, or something the backend cannot show (a symlink in a
-        // Git tree): its `read` says which.
+        // tree): its `read` says which.
         Ok(None) => match fs.read_opt(&path) {
             Ok(None) => PolicyFile::Absent,
             Ok(Some(b)) => PolicyFile::File(b),
@@ -1869,7 +1868,7 @@ mod tests {
         for name in [".git", ".GIT", ".gIt", ".g\u{200C}it", "\u{FEFF}.git", ".git\u{200D}"] {
             assert_eq!(vcs_metadata_name(name), Some(".git"), "{name:?}");
         }
-        for name in ["git", ".gitx", ".gi", "..git", ".gitignore", ".github"] {
+        for name in ["git", ".gitx", ".gi", "..git", ".gitkeep", ".github"] {
             assert_eq!(vcs_metadata_name(name), None, "{name:?}");
         }
         assert_eq!(vcs_metadata_name(".JJ"), Some(".jj"));

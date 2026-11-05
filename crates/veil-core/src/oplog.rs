@@ -67,13 +67,6 @@ pub struct View {
     /// `remote/tag` → target as last seen on the remote.
     #[serde(default)]
     pub remote_tags: BTreeMap<String, ObjectId>,
-    /// `remote/tag` → the annotated tag object (`veil:atag`) of a Git
-    /// release tag as last fetched from a Git remote (repository format 5;
-    /// bridge tags). Kept apart from `remote_tags`, which holds branches,
-    /// so a branch `v1` and a tag `v1` never collide. Omitted when empty,
-    /// so views without it keep their bytes.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub remote_release_tags: BTreeMap<String, ObjectId>,
 }
 
 impl View {
@@ -95,20 +88,19 @@ impl View {
     }
 
     /// Every annotated tag object the view names (format 5): tag
-    /// annotations and remote release tags. Not snapshots: gc keeps them
-    /// and their targets, fsck checks them, sync sends them with their tag.
+    /// annotations. Not snapshots: gc keeps them and their targets, fsck
+    /// checks them, sync sends them with their tag.
     pub fn annotations(&self) -> Vec<ObjectId> {
         let mut v: Vec<ObjectId> = self.tags.values().filter_map(|t| t.annotation).collect();
-        v.extend(self.remote_release_tags.values().copied());
         v.sort();
         v.dedup();
         v
     }
 
-    /// Does the view use a format-5 field (an annotation or a remote
-    /// release tag)? Only a format-5 repository may record one.
+    /// Does the view use a format-5 field (an annotation)? Only a format-5
+    /// repository may record one.
     pub fn uses_format_5(&self) -> bool {
-        !self.remote_release_tags.is_empty() || self.tags.values().any(|t| t.annotation.is_some())
+        self.tags.values().any(|t| t.annotation.is_some())
     }
 }
 

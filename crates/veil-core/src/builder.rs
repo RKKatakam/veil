@@ -38,7 +38,7 @@
 //! ([`BuildReport::name_collisions`]), so a Linux user learns before a macOS
 //! teammate's checkout refuses the snapshot.
 //!
-//! Line endings follow the working copy's `.gitattributes` (see
+//! Line endings follow the working copy's `.veilattributes` (see
 //! [`crate::attributes`] and [`LineEndings`]): a file is normalised (CRLF →
 //! LF) before it is hashed, scanned and sealed, all on the one buffer, and
 //! only when that is lossless; a file that still holds its recorded version
@@ -51,7 +51,7 @@
 //! command cannot launder an injected secret into history under another name.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     sync::Arc,
 };
 
@@ -121,25 +121,17 @@ pub struct BuildOptions<'a> {
     /// introduces, so it is sealed (BUG-128). `None`: not known, so such an
     /// edit is always sealed.
     pub line_base: Option<&'a dyn Fn() -> Result<ObjectId>>,
-    /// How `.gitattributes` decides the line endings recorded.
+    /// How `.veilattributes` decides the line endings recorded.
     pub line_endings: LineEndings<'a>,
-    /// Paths whose recorded entry is kept whatever the file holds now: a
-    /// local edit the member asked to keep unrecorded (colocated Git mode:
-    /// a file the user marked `skip-worktree` or `assume-unchanged` in
-    /// Git, BUG-745). Reported in [`BuildReport::kept_recorded`].
-    pub keep_recorded: Option<&'a BTreeSet<VPath>>,
 }
 
-/// How a build applies the line-ending attributes of `.gitattributes`.
+/// How a build applies the line-ending attributes of `.veilattributes`.
 #[derive(Clone, Copy, Default)]
 pub enum LineEndings<'a> {
     /// Normalise new content as the working copy's attributes say (when
     /// lossless); a file that still holds its recorded version keeps it.
     #[default]
     Convert,
-    /// Record the bytes as they are (a Git import, a patch applied to
-    /// recorded bytes).
-    Off,
     /// `vl renormalize`: the paths selected are recorded as the attributes
     /// say now, even unchanged ones; the others as with `Convert`.
     Renormalize(&'a (dyn Fn(&VPath) -> bool + 'a)),
@@ -590,7 +582,7 @@ pub fn object_visibility(raw: &[u8]) -> Option<Visibility> {
 ///
 /// Visibility labels in trees, like every other field of history, are
 /// written by whoever produced the snapshot: a teammate, a remote anyone
-/// with write access can push to, a Git import. They are a *claim*. The
+/// with write access can push to. They are a *claim*. The
 /// envelope label of a sealed object is bound to its ciphertext (it is the
 /// AEAD's associated data), so it is what the content really is sealed
 /// for. A tree entry whose label disagrees with its object is hostile (or
@@ -707,12 +699,6 @@ pub struct BuildReport {
     /// name becomes visible in history, its content never). With what to
     /// say.
     pub link_warnings: Vec<(VPath, String)>,
-    /// Directories new in this snapshot that hold a `.git` of their own
-    /// but are not submodules (a vendored clone): their files are recorded
-    /// as this repository's, as Git does for an untracked nested
-    /// repository; reported once, when first recorded (submodules design,
-    /// threat 13).
-    pub git_repositories: Vec<VPath>,
     /// Pairs of recorded paths that differ only in case or Unicode
     /// normalisation, at least one of them new in this snapshot. Valid
     /// here, but a checkout on a case-insensitive filesystem (macOS by
@@ -723,7 +709,7 @@ pub struct BuildReport {
     /// (see [`crate::vfs::holds_repository`]). Something tracked there
     /// before is recorded as deleted (the files stay on disk).
     pub nested: Vec<VPath>,
-    /// New content `.gitattributes` asks to normalise (CRLF → LF) that was
+    /// New content `.veilattributes` asks to normalise (CRLF → LF) that was
     /// recorded exactly as it is because the conversion would lose
     /// information (mixed line endings, a lone CR), with why.
     pub line_endings: Vec<(VPath, String)>,
@@ -731,9 +717,6 @@ pub struct BuildReport {
     /// `vl renormalize` would change (the attributes changed since they
     /// were recorded).
     pub renormalizable: Vec<VPath>,
-    /// Tracked files whose local edit was left unrecorded on purpose
-    /// ([`BuildOptions::keep_recorded`]): they keep their recorded entry.
-    pub kept_recorded: Vec<VPath>,
 }
 
 impl BuildReport {
@@ -1030,13 +1013,6 @@ impl<'a> Builder<'a> {
             let path = f.dir.join(&child.name);
             let parent_entry = f.parent.as_ref().and_then(|(t, _)| t.get(&child.name)).cloned();
             match child.kind {
-                // A submodule (format 5): nothing below a gitlink is ever
-                // recorded, whatever is checked out there (its own
-                // repository decides where that is published); the pin
-                // changes only with `vl submodule set` or a Git import.
-                NodeKind::Dir if parent_entry.as_ref().is_some_and(|e| e.kind == EntryKind::Gitlink) => {
-                    f.out.insert(parent_entry.expect("checked"));
-                }
                 NodeKind::Dir => {
                     let class = self.opts.policy.classify(&path, true);
                     let pdir = parent_entry.clone().filter(|e| e.kind == EntryKind::Dir);
@@ -1056,16 +1032,6 @@ impl<'a> Builder<'a> {
                                 f.out.insert(pe.clone());
                             }
                         }
-                        continue;
-                    }
-                    // A submodule's directory (format 5): never descended
-                    // into, whatever it holds (its own repository decides
-                    // where that is published). Its gitlink entry is
-                    // carried as recorded: only `vl submodule set` or a Git
-                    // import moves the pinned commit, never the inner
-                    // `.git`.
-                    if let Some(pe) = parent_entry.as_ref().filter(|e| e.kind == EntryKind::Gitlink || self.shows_as(e, EntryKind::Gitlink)) {
-                        f.out.insert(pe.clone());
                         continue;
                     }
                     if let Some(pe) = &pdir {
@@ -1143,14 +1109,6 @@ impl<'a> Builder<'a> {
         if !dir.is_root() && crate::vfs::holds_repository(&listing) {
             self.report.nested.push(dir);
             return Ok(Opened::Done(None));
-        }
-        // A Git repository that is not a submodule (a gitlink's directory
-        // is never opened): recorded, and said once, when it is new.
-        if !dir.is_root()
-            && parent.is_none()
-            && listing.entries.iter().any(|e| crate::policy::vcs_metadata_name(&e.name) == Some(".git"))
-        {
-            self.report.git_repositories.push(dir.clone());
         }
         for name in &listing.unrepresentable {
             self.report.unrepresentable.push(match dir.is_root() {
@@ -1335,9 +1293,8 @@ impl<'a> Builder<'a> {
                 // Format 5. Below it, symlinks are special files the builder
                 // never records, so their absence is never a deletion.
                 // Otherwise as a file: readable, materialised and absent is
-                // a deletion (a removed link, a removed submodule
-                // directory).
-                EntryKind::Symlink | EntryKind::Gitlink => {
+                // a deletion (a removed link).
+                EntryKind::Symlink => {
                     let never_materialised = b.opts.materialised.is_some_and(|m| m.hidden(path));
                     let readable = match &e.visibility {
                         Visibility::Cloaked { .. } => b.store.entry_readable(&TreeEntry {
@@ -1420,30 +1377,14 @@ impl<'a> Builder<'a> {
     /// The entry for the leaf at `path` of the working copy, a file or (in
     /// format 5) a symlink (`kind`).
     fn file_entry(&mut self, path: &VPath, name: &str, parent_entry: Option<&TreeEntry>, kind: EntryKind) -> Result<Option<TreeEntry>> {
-        if let (Some(keep), Some(pe)) = (self.opts.keep_recorded, parent_entry) {
-            if keep.contains(path) {
-                self.report.kept_recorded.push(path.clone());
-                return Ok(Some(pe.clone()));
-            }
-        }
         match parent_entry {
             Some(ce) if ce.kind == EntryKind::Conflict => self.conflict_entry(path, name, ce, kind),
             _ => self.plain_file_entry(path, name, parent_entry, kind),
         }
     }
 
-    /// Is `e` a conflict (format 5) that is materialised as a `kind` (its
-    /// shown side, see [`crate::conflict::shown_side`])?
-    fn shows_as(&self, e: &TreeEntry, kind: EntryKind) -> bool {
-        e.kind == EntryKind::Conflict
-            && self
-                .store
-                .conflict(&e.id)
-                .is_ok_and(|c| crate::conflict::shown_side(&c).is_some_and(|(_, t)| t.kind.entry_kind() == kind && c.has_special_terms()))
-    }
-
     /// The working-copy leaf at `path` (a file or a symlink, `kind`) whose
-    /// parent entry is conflict `ce` with a symlink or gitlink side
+    /// parent entry is conflict `ce` with a symlink side
     /// (format 5). Checkout wrote its shown side as it is, never a file of
     /// markers (a link target must never become file content, symlinks
     /// design, threat 12). That side, unchanged, keeps the conflict;
@@ -1577,15 +1518,15 @@ impl<'a> Builder<'a> {
             Err(e) => return self.unreadable(path, e, Some(ce)),
         };
         self.report.hashed += 1;
-        // Line endings (`.gitattributes`): the copy as recorded, markers
+        // Line endings (`.veilattributes`): the copy as recorded, markers
         // and all (checkout wrote it converted for `eol=crlf`, and an
         // editor that keeps CRLF keeps it so).
         let data = if raw != m.content && self.disk_stands_for(path, &raw, &m.content) {
             m.content.clone()
         } else {
-            match (self.opts.line_endings, memchr::memchr(b'\r', &raw)) {
-                (LineEndings::Off, _) | (_, None) => raw.clone(),
-                _ => {
+            match memchr::memchr(b'\r', &raw) {
+                None => raw.clone(),
+                Some(_) => {
                     let conv = self.attrs().for_path(path).conversion;
                     match to_odb(&raw, conv, || true) {
                         ToOdb::Converted(v) => v,
@@ -1793,7 +1734,7 @@ impl<'a> Builder<'a> {
             }
         }
         self.report.hashed += 1;
-        // Line endings (`.gitattributes`): from here on `data` is what is
+        // Line endings (`.veilattributes`): from here on `data` is what is
         // recorded, and exactly what is scanned, hashed and sealed.
         let data = match kind {
             EntryKind::File => self.line_endings(path, parent_file, data)?,
@@ -2183,7 +2124,7 @@ impl<'a> Builder<'a> {
         // A public file sealed only because of the line it is edited on (a
         // cloaked workspace, or sealed content keeping its audience; the
         // policy itself says public) keeps its last public version as
-        // `fallback`: readers without the key (public remotes, Git, members
+        // `fallback`: readers without the key (public remotes, members
         // of other scopes) go on seeing that version instead of losing the
         // file. A file the policy cloaks has none: hiding it is the point.
         let cloak_fallback = match (&desired, parent_file) {
@@ -2256,7 +2197,7 @@ impl<'a> Builder<'a> {
     /// for it and that is lossless. Sets `eol_now` for the stat cache.
     fn line_endings(&mut self, path: &VPath, parent_file: Option<&TreeEntry>, raw: Vec<u8>) -> Result<Vec<u8>> {
         self.eol_now = None;
-        if matches!(self.opts.line_endings, LineEndings::Off) || memchr::memchr(b'\r', &raw).is_none() {
+        if memchr::memchr(b'\r', &raw).is_none() {
             return Ok(raw);
         }
         let renorm = self.renormalizing(path);
@@ -2325,7 +2266,7 @@ impl<'a> Builder<'a> {
             ToOdb::Lossy(why) => {
                 self.report.line_endings.push((
                     path.clone(),
-                    format!("{why}; recorded unchanged (`.gitattributes` asks for LF line endings, and converting would change more than the line endings)"),
+                    format!("{why}; recorded unchanged (`.veilattributes` asks for LF line endings, and converting would change more than the line endings)"),
                 ));
                 (raw, None)
             }
@@ -2363,7 +2304,7 @@ impl<'a> Builder<'a> {
         if raw == want {
             return true;
         }
-        if matches!(self.opts.line_endings, LineEndings::Off) || memchr::memchr(b'\r', raw).is_none() {
+        if memchr::memchr(b'\r', raw).is_none() {
             return false;
         }
         if self.opts.materialised.is_some_and(|m| m.wrote_crlf(path)) && lf_to_crlf(want) == raw {

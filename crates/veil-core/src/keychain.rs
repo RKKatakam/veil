@@ -1961,8 +1961,7 @@ impl Keychain {
     /// repository treats it as released (checkouts, snapshots, `vl log`),
     /// but the key is kept in device-local state (`.veil/local/releases/`,
     /// which no sync reads) and reaches the synced record only when this
-    /// repository next pushes, or exports to Git
-    /// ([`Keychain::publish_staged_releases`]). Until then
+    /// repository next pushes ([`Keychain::publish_staged_releases`]). Until then
     /// [`Keychain::take_back_release`] undoes it completely: the key never
     /// left this repository through vl (BUG-109).
     pub fn stage_release(&self, id: &str) -> Result<StageOutcome> {
@@ -2012,7 +2011,7 @@ impl Keychain {
     }
 
     /// Write every staged release into its (synced) record. Called before
-    /// anything leaves the repository: a push, a Git export. From then on
+    /// anything leaves the repository: a push. From then on
     /// the release cannot be taken back. Returns the published ids.
     pub fn publish_staged_releases(&self) -> Result<Vec<String>> {
         let dir = VPath::new(STAGED_RELEASES)?;
