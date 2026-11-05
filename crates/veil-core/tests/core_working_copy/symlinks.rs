@@ -750,8 +750,6 @@ fn editing_a_link_conflict_resolves_it_and_resolve_ours_gives_a_file() {
     assert_eq!(c.adds.iter().flatten().map(|t| t.kind).collect::<Vec<_>>(), [TermKind::Symlink, TermKind::File]);
 }
 
-// ---- gitlinks ----------------------------------------------------------------------
-
 // ---- sandboxes (threat 7) ----------------------------------------------------------
 
 #[test]

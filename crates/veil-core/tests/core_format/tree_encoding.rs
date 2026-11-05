@@ -165,7 +165,7 @@ fn binary_trees_are_smaller() {
     assert!(bin * 2 < json, "binary {bin} vs JSON {json}");
 }
 
-// ---- format 5: symlinks, gitlinks, link terms --------------------------------
+// ---- format 5: symlinks, link terms ------------------------------------------
 
 fn special(kind: EntryKind) -> Vec<u8> {
     let mut t = Tree::default();
@@ -248,7 +248,7 @@ fn link_term_strategy() -> impl Strategy<Value = Option<veil_core::ConflictTerm>
 }
 
 proptest! {
-    /// Conflicts with link and gitlink terms round-trip exactly; a term
+    /// Conflicts with link terms round-trip exactly; a term
     /// kind other than file makes them format 5.
     #[test]
     fn conflicts_with_link_terms_round_trip(n in 1usize..4, terms in proptest::collection::vec(link_term_strategy(), 7)) {

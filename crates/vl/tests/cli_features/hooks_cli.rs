@@ -1,6 +1,6 @@
 //! Hooks (feature 5a of the Git-parity round) through the real binary: one
 //! test per point of the threat review in
-//! `docs/design/git-parity/5-hooks-submodules-signed-tags.md`, plus the
+//! `docs/design/git-parity/5-hooks-signed-tags.md`, plus the
 //! hostile inputs of every new surface (`.veilhooks`, the trust record,
 //! `VEIL_HOOK_TIMEOUT`, the environment, `PATH`, signals).
 

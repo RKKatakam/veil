@@ -1020,7 +1020,7 @@ impl Server {
 /// Every string in the params (and every member name) must be one a
 /// command-line argument could hold (BUG-486): a request does nothing the
 /// CLI could not. JSON already guarantees UTF-8; what remains is NUL, which
-/// no argument can carry and no Git commit may hold (`nulInCommit`).
+/// no argument can carry.
 fn check_strings(v: &Value, at: &str) -> Result<(), RpcError> {
     let bad = |what: &str| {
         let what = if what.is_empty() { "params".to_string() } else { format!("`{what}`") };

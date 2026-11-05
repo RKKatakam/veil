@@ -1,6 +1,6 @@
-//! Helpers for the remotes, storage and Git-interop conformance suite: run
-//! the real `vl` binary with an isolated `VEIL_HOME` per user, drive plain
-//! `git`, stand in for `ssh` with a local `sftp-server`, and look inside
+//! Helpers for the remotes and storage conformance suite: run the real `vl`
+//! binary with an isolated `VEIL_HOME` per user, stand in for `ssh` with a
+//! local `sftp-server`, and look inside
 //! repositories (every object's bytes, metadata files) for leaks.
 
 #![allow(dead_code)]

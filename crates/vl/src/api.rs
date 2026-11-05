@@ -1518,10 +1518,9 @@ pub struct AnnotationItem {
     pub message: Option<String>,
     /// The signer's name, when signed by a key a ring knows.
     pub signer: Option<String>,
-    /// A valid Veil signature by a known key (a Git signature never is).
+    /// A valid Veil signature by a known key.
     pub verified: bool,
-    /// What the check found (`signed by …`, `unsigned`, `Git signature,
-    /// not verified by Veil`, `unverified (…)`).
+    /// What the check found (`signed by …`, `unsigned`, `unverified (…)`).
     pub status: String,
 }
 
@@ -1746,7 +1745,7 @@ pub struct ScanFile {
     pub tier: &'static str,
     pub scope: Option<String>,
     /// Its tier keeps the secret out of public history (always false in a
-    /// gate: a Git checkout publishes every file).
+    /// gate: a CI checkout publishes every file).
     pub protected: bool,
     pub findings: Vec<ScanFinding>,
     /// Why the file could not be read (`gate` only); it then has no
@@ -2393,8 +2392,7 @@ pub struct Described {
 }
 
 /// A description must be one the command line could give (BUG-486): no
-/// NUL, which no argument can carry and no Git commit may hold
-/// (`nulInCommit`).
+/// NUL, which no argument can carry.
 pub fn check_message(message: &str) -> Result<()> {
     if message.contains('\0') {
         anyhow::bail!("a description cannot contain a NUL character");

@@ -4,7 +4,7 @@
 //! `vl hooks show|trust`.
 //!
 //! Feature 5a of the Git-parity round
-//! (`docs/design/git-parity/5-hooks-submodules-signed-tags.md`). The rules:
+//! (`docs/design/git-parity/5-hooks-signed-tags.md`). The rules:
 //!
 //! * **Device-local hooks** (`$VEIL_HOME/hooks/<name>`, then
 //!   `.veil/hooks/<name>`) run without asking, as `.git/hooks` do: the user

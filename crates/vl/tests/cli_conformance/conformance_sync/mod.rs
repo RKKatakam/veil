@@ -1,10 +1,10 @@
-//! Conformance tests for remotes, storage and Git interop: Veil's
+//! Conformance tests for remotes and storage: Veil's
 //! equivalents of Git's t5xxx (clone, fetch, push, pull, remote), t1050
-//! (large files), t1450 (fsck), t5304/t6500 (prune, gc) and the fast-import
-//! / fast-export round trips of t9300/t9350, and of Jujutsu's `test_git_*`,
-//! `test_bookmark_command`, `test_concurrent_operations` and `test_gc`.
+//! (large files), t1450 (fsck) and t5304/t6500 (prune, gc), and of
+//! Jujutsu's `test_bookmark_command`, `test_concurrent_operations` and
+//! `test_gc`.
 //! Coverage: `docs/conformance/sync.md`. Bugs: `docs/BUGS.md`,
-//! "Conformance findings: remotes, storage and Git interop".
+//! "Conformance findings: remotes and storage".
 
 mod support;
 
