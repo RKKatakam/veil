@@ -65,6 +65,7 @@ pub mod embargo;
 pub mod error;
 pub mod fsck;
 pub mod gc;
+pub mod graph_index;
 pub mod hunks;
 pub mod grep;
 pub mod id;

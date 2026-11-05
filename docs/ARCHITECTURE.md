@@ -2783,6 +2783,34 @@ snapshot 1, a base its size in bytes. The defaults are 200k tree entries,
 20k snapshots and 64 MiB of bases, adjustable with
 `ObjectStore::set_cache_limits`.
 
+### The history index (`graph_index.rs`)
+
+Graph queries that used to read every reachable snapshot (the auto-rebase
+after each commit, `log -n`, change-id lookup, `tag set`'s ancestry check,
+the embargo walks behind push filtering and confinement, blame's ranks)
+stop early using each snapshot's **generation**, a corrected commit date:
+the larger of its timestamp and 1 plus the largest generation of its
+parents in the store. Generations strictly decrease along every parent
+edge whatever timestamps authors chose, so a walk for `a` below `b` stops
+soundly at every snapshot below `a`'s generation; a false timestamp can
+only make a walk longer. The index is a device-local cache in
+`.veil/index/graph/` (`docs/design/scale/3-history-index.md`):
+- **What it holds:** per snapshot, its generation, change id, whether
+  `embargo` is set, and whether any ancestor has it set (so embargo checks
+  skip every line that does not build on an embargoed merge). Only
+  plaintext snapshot fields, so it is the same with and without keys.
+  Walks take parents from the objects, never from the index.
+- **Never required:** an entry not on disk is computed from the store on
+  first use and persisted at the next commit (or once 256 have
+  accumulated). A damaged or unreadable index is dropped and computed again.
+- **Concurrency:** layers are created with `create_new`, one slot each, and
+  merged geometrically; concurrent appenders never overwrite one another.
+  Remotes (bare repositories, SFTP) compute it in memory only.
+- **A parent that arrives later** (the fix of a released embargo, pulled
+  into a public clone) could carry a larger generation than its indexed
+  child. Each layer lists the parents that were missing; when one is
+  present, the index is voided (a new epoch) and rebuilt.
+
 ### Garbage collection (`vl gc`)
 
 `gc` holds the repository lock (`RepoLock`) for its whole run and works in

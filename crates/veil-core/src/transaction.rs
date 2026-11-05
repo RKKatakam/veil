@@ -325,9 +325,29 @@ impl<'r> Transaction<'r> {
     fn rebase_descendants(&mut self) -> Result<()> {
         let mut roots = self.start_view.refs();
         roots.extend(self.view.refs());
-        let order = self.repo.topo_children_first(roots)?;
+        // Only descendants of a rewritten snapshot can move, and each has a
+        // larger generation than the oldest one: the walk stops there
+        // instead of reading all history.
+        let mut floor = crate::graph_index::Gen::MAX;
+        for old in self.rewritten.keys() {
+            if let Some(g) = self.repo.graph.generation(self.repo, old)? {
+                floor = floor.min(g);
+            }
+        }
+        let mut order: Vec<(crate::graph_index::Gen, i64, ObjectId)> = match floor {
+            crate::graph_index::Gen::MAX => Vec::new(),
+            f => self
+                .repo
+                .graph
+                .down_to(self.repo, roots, f + 1)?
+                .into_iter()
+                .map(|(id, (g, s))| (g, s.timestamp, id))
+                .collect(),
+        };
+        // Parents first: a parent has a smaller generation than its child.
+        order.sort();
         let store = self.repo.store.clone();
-        for id in order.into_iter().rev() {
+        for id in order.into_iter().map(|(_, _, id)| id) {
             if self.rewritten.contains_key(&id) {
                 continue;
             }
@@ -501,6 +521,8 @@ impl<'r> Transaction<'r> {
         self.repo.ops.set_head(&id)?;
         self.repo.op_id = id;
         self.repo.view = std::mem::take(&mut self.view);
+        // Best effort: the index is a cache.
+        self.repo.graph.persist(self.repo);
         Ok(Some(id))
     }
 }

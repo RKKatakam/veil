@@ -1029,7 +1029,7 @@ pub fn withheld_by_embargo(local: &Repo, embargo: &str) -> Result<Vec<ObjectId>>
 ///   blocks the push.
 pub(crate) fn embargo_withheld(local: &Repo, public: bool) -> Result<HashMap<ObjectId, String>> {
     let mut out = HashMap::new();
-    for id in local.visible_snapshots()? {
+    for id in local.visible_embargoed()? {
         let s = local.snapshot(&id)?;
         let Some(e) = &s.embargo else { continue };
         if s.parents.len() < 2 || local.keys().embargo_released(e) {
@@ -1037,15 +1037,12 @@ pub(crate) fn embargo_withheld(local: &Repo, public: bool) -> Result<HashMap<Obj
         }
         // An unknown record (no scope to compare with) withholds everything.
         let scope = local.keys().load_embargo(e).ok().flatten().map(|r| r.scope);
-        let mainline = local.ancestors(&s.parents[0])?;
+        // What the extra parents reach and the mainline does not. A
+        // snapshot this replica lacks is withheld from it already.
         let mut merged_in: HashMap<ObjectId, Option<Arc<crate::object::Snapshot>>> = HashMap::new();
-        for p in &s.parents[1..] {
-            for a in local.ancestors(p)? {
-                if !mainline.contains(&a) {
-                    let snap = local.snapshot_opt(&a)?;
-                    merged_in.insert(a, snap);
-                }
-            }
+        for a in local.graph().range(local, &s.parents[1..], &s.parents[..1])? {
+            let snap = local.snapshot_opt(&a)?;
+            merged_in.insert(a, snap);
         }
         // Withheld: everything on a public remote; on a team remote, what
         // is not cloaked under the embargo's scope, and whatever has a

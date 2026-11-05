@@ -884,7 +884,7 @@ pub struct ParentRef {
 /// (`vl log | head`).
 pub struct LogEntries<'a> {
     repo: &'a Repo,
-    ids: std::vec::IntoIter<ObjectId>,
+    ids: std::iter::Peekable<Box<dyn Iterator<Item = veil_core::error::Result<ObjectId>> + 'a>>,
     signers: std::collections::BTreeMap<String, (String, String)>,
     tags: HashMap<ObjectId, Vec<TagLabel>>,
     remote_tags: HashMap<ObjectId, Vec<String>>,
@@ -917,16 +917,27 @@ pub struct LogQuery {
 }
 
 pub fn log_entries_with<'a>(repo: &'a Repo, ws: &str, q: LogQuery) -> Result<LogEntries<'a>> {
-    let mut ids = match q.ids {
-        Some(ids) => ids,
-        None => repo.visible_snapshots()?,
+    // All visible snapshots are produced lazily (the history index), so
+    // `-n` reads only the history it shows.
+    let mut ids: Box<dyn Iterator<Item = veil_core::error::Result<ObjectId>> + 'a> = match q.ids {
+        Some(ids) => Box::new(ids.into_iter().map(Ok)),
+        None => Box::new(repo.visible_iter()),
     };
     let searcher = q.filter.filter(|f| !f.is_empty()).map(|f| Searcher::new(repo, f));
     // Without a filter `-n` is known at once; with one, only once enough
     // snapshots matched.
-    let truncated = searcher.is_none() && q.limit.is_some_and(|l| ids.len() > l);
+    let mut truncated = false;
     if let (None, Some(l)) = (&searcher, q.limit) {
-        ids.truncate(l);
+        let mut first = Vec::new();
+        for id in ids.by_ref() {
+            first.push(id?);
+            if first.len() > l {
+                break;
+            }
+        }
+        truncated = first.len() > l;
+        first.truncate(l);
+        ids = Box::new(first.into_iter().map(Ok));
     }
     let mut tags: HashMap<ObjectId, Vec<TagLabel>> = HashMap::new();
     for (name, t) in &repo.view().tags {
@@ -942,7 +953,7 @@ pub fn log_entries_with<'a>(repo: &'a Repo, ws: &str, q: LogQuery) -> Result<Log
     }
     Ok(LogEntries {
         repo,
-        ids: ids.into_iter(),
+        ids: ids.peekable(),
         signers: repo.keys().known_signers(),
         tags,
         remote_tags,
@@ -966,20 +977,22 @@ impl Iterator for LogEntries<'_> {
 
     fn next(&mut self) -> Option<Result<LogEntry>> {
         if self.searcher.is_none() {
-            let id = self.ids.next()?;
-            return Some(self.entry(id));
+            return Some(self.ids.next()?.map_err(Into::into).and_then(|id| self.entry(id)));
         }
         loop {
             if self.limit.is_some_and(|l| self.yielded >= l) {
-                self.truncated = self.ids.len() > 0;
+                self.truncated = self.ids.peek().is_some();
                 return None;
             }
             let searcher = self.searcher.as_mut().expect("a filter");
             if self.max_changes.is_some_and(|m| searcher.searched >= m) {
-                self.stopped = self.ids.len() > 0;
+                self.stopped = self.ids.peek().is_some();
                 return None;
             }
-            let id = self.ids.next()?;
+            let id = match self.ids.next()? {
+                Ok(id) => id,
+                Err(e) => return Some(Err(e.into())),
+            };
             let pickaxe = searcher.filter().pickaxe.is_some();
             match searcher.check(&id) {
                 Err(e) => return Some(Err(e.into())),

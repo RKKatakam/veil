@@ -16,6 +16,7 @@ mod conflicts;
 mod duplicate;
 mod embargo_release;
 mod engine;
+mod graph_index;
 mod history_rename;
 mod history_tools;
 mod mount_recording;
