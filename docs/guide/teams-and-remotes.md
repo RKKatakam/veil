@@ -175,6 +175,15 @@ $ vl push --delete experiment
   deleted experiment on origin
 ```
 
+* **Release tags never move on a pull.** If a teammate (or the remote
+  itself) moved an annotated release tag such as `v1.0`, `vl pull` keeps
+  yours, with its signed annotation, records theirs as `origin/v1.0`, and
+  warns at every pull: `origin moved release tag v1.0 from 3f2a91c0 to
+  9d81e0b2; your release tag v1.0 stays at 3f2a91c0`. Compare with
+  `vl diff --from v1.0 --to origin/v1.0`; take theirs only on purpose, with
+  `vl tag set v1.0 -r origin/v1.0 --force`. Until you decide, `vl push`
+  rejects `v1.0` (the other tags are pushed); `vl push origin -t v1.0
+  --force` puts yours back on the remote.
 * **A tag you deleted stays deleted.** The next `vl pull` doesn't bring it
   back while the remote's tag is still where it was (`kept deleted
   experiment`), and `origin/experiment` keeps showing what the remote holds

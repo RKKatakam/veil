@@ -48,7 +48,6 @@ fn git_patch(env: &Env, before: &str, after: &str) -> std::path::PathBuf {
 /// receives the fix's ciphertext before the release, readable by everyone
 /// the moment it is released, whatever the destination line says).
 #[test]
-#[ignore = "BUG-706: vl am --3way takes the embargoed fix's version as a base on a public line (confinement bypass)"]
 fn am_three_way_never_copies_the_withheld_fix_onto_a_public_line() {
     let env = Env::new();
     let proj = env.project(U, "proj", &[("vuln.c", "int a;\nint b;\n")]);
@@ -154,4 +153,40 @@ fn a_draft_duplicated_onto_a_cloaked_line_stays_off_the_mirror() {
     env.ok(U, &proj, &["push", "pub"]);
     let hits = repo_contains(&mirror, b"DRAFT-0001");
     assert!(hits.is_empty(), "the draft the cloaked line took in is on the public mirror: {hits:?}");
+}
+
+/// BUG-706, the other side of the rule: inside the embargo the fix's
+/// history is still a place to look. A follow-up made on a newer version
+/// of the fix (another head, built on the fix: confined to the embargo),
+/// applied with `--3way` to the fix itself (confined to the same embargo),
+/// finds the pre-image in that head's history and records a conflict;
+/// applied to a public line, the same patch finds nothing and is refused.
+#[test]
+fn am_three_way_still_finds_the_fix_inside_its_embargo() {
+    let env = Env::new();
+    let proj = env.project(U, "proj", &[("vuln.c", "int a;\nint b;\n")]);
+    let init = change_id(&env, U, &proj, "main");
+    env.ok(U, &proj, &["ws", "new", "fix", "-r", "main"]);
+    ws_write(&env, &proj, "fix", "vuln.c", "int a;\nint FIXED_LINE;\n");
+    env.ok(U, &proj, &["describe", "-r", "fix@", "-m", "fix"]);
+    env.ok(U, &proj, &["merge", "fix@", "--into", "main", "--embargo", "-m", "embargoed"]);
+    // Work built on the fix (withheld history, confined to the embargo).
+    env.ok(U, &proj, &["ws", "new", "fix-2", "-r", "fix@"]);
+    ws_write(&env, &proj, "fix-2", "vuln.c", "int a;\nint FIXED_TWO;\n");
+    env.ok(U, &proj, &["ws", "new", "other", "-r", &init]);
+    let patch = git_patch(&env, "int a;\nint FIXED_TWO;\n", "int a;\nint FOLLOW_UP;\n");
+    let p = patch.to_str().unwrap();
+
+    let public = env.vl(U, &proj, &["am", "--3way", "-d", "other@-", p]);
+    assert!(!public.status.success(), "applied to a public line: {}", text(&public));
+    let inside = env.vl(U, &proj, &["am", "--3way", "-d", "fix@", p]);
+    let shown = text(&inside);
+    assert!(inside.status.success(), "{shown}");
+    let new = shown.lines().find_map(|l| {
+        l.split_whitespace().next().filter(|w| w.len() == 8 && w.chars().all(|c| c.is_ascii_lowercase())).map(str::to_string)
+    });
+    let new = new.unwrap_or_else(|| panic!("no new change in: {shown}"));
+    let list = text(&env.vl(U, &proj, &["resolve", "--list", "-r", &new]));
+    let content = text(&env.vl(U, &proj, &["cat", "-r", &new, "vuln.c"]));
+    assert!(list.contains("vuln.c"), "the pre-image from the fix line was not used:\n{shown}\n{list}\n{content}");
 }

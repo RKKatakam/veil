@@ -2372,7 +2372,14 @@ limit, because a tampered local `.veil/` is not depth-checked on arrival), measu
 that shared subtrees cannot hide depth. Remote tags with an invalid name, or
 whose target is missing or not a snapshot, are skipped with a warning. Tags
 fast-forward. A diverged tag is reported and left alone
-(`--force` overrides on push).
+(`--force` overrides on push). A local **release tag** (annotated, format 5)
+never moves on a pull, and keeps its annotation: when the remote holds it
+at another target (a teammate's `vl tag set --force`, or a hostile remote),
+`remote::pull_with` records that target as `<remote>/<name>` and reports
+it (`SyncReport::release_tags_kept`, "origin moved release tag v1.0 from X
+to Y; your release tag v1.0 stays at X"), at every pull until the user
+decides; only `vl tag set <name> -r <remote>/<name> --force` takes it
+(BUG-703).
 
 **Deleting tags (BUG-280).** A plain push never deletes anything remotely;
 `remote::delete_remote_tags` (`vl push --delete`) and
@@ -3055,7 +3062,8 @@ whose new tip does not descend from the previous one was **force-pushed**
 on the Git side: it is reported, the snapshots it dropped stay in Veil, and
 local tags never move backwards. `vl git pull` also creates or
 fast-forwards local tags; a diverged tag is left alone with a hint (`vl
-merge <r>/<branch>`). Like `vl pull`, it never moves the working copy (a
+merge <r>/<branch>`). A local release tag never follows a Git branch of its
+name (`git::update_tag` warns and leaves it, BUG-703). Like `vl pull`, it never moves the working copy (a
 change of the user's own; rewriting it under them would be surprising):
 `vl rebase -d <tag>` does. The usual working-copy handling still runs at
 the end of the command (§6: anything that became readable is filled in). `vl git push` exports, then pushes
@@ -3231,7 +3239,12 @@ its `index` line names (at least 7 hex digits) among the versions of the
 section's paths in the trees of the destination's history, nearest
 first, then of every other visible head's (at most 10 000 snapshots and
 1 GiB hashed per series): a version this reader can open, or the public
-fallback of one it cannot (what the patch's author saw). The section is
+fallback of one it cannot (what the patch's author saw). Snapshots
+confined to an unreleased embargo (`Confinement::of`: the withheld fix,
+work built on it, the embargoed line) are looked in only when the
+destination is confined to the same embargo: their version would become a
+conflict term of the new change, and a public line would publish it before
+the release (BUG-706). The section is
 applied to it exactly, and the result merged with ours by
 `textmerge::merge` (diff3). A clean merge is written as the file; a
 conflict writes the markers to the overlay (so the builder scans every
@@ -3845,7 +3858,12 @@ sealed `.gitattributes` never shapes a public patch; only regular files
 are written as binary, and a rename's destination decides). In `merge.rs`
 stream R's `content_merge` seam picks the content merge (`strategy`,
 `attribute_merge`) from the attributes of `ours` with the followed renames
-applied, so a renamed file merges under the attributes of its new path: `Binary` (whole-file conflict), `Union`
+applied, so a renamed file merges under the attributes of its new path,
+read as the merged file's audience reads them (`MergeAttrs`,
+`attributes::AudienceTreeSource`, BUG-705): a `.gitattributes` sealed for
+another audience gives its last public version or nothing, so a sealed
+`merge=union` never decides a public result, and a member and a
+non-member merge the same public files alike: `Binary` (whole-file conflict), `Union`
 (`textmerge::merge_union`), a device driver, or the built-in line merge.
 A driver or union gets the base only when `base_shown` (its audience is
 the result's), never runs across an `audience_clash`, and its output is

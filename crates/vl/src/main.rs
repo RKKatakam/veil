@@ -2521,13 +2521,21 @@ fn cmd_push(
         }
     );
     let first = rejected.first().map(|t| safe(t).into_owned()).unwrap_or_default();
-    Ok(push_status(
-        &rejected,
-        &format!(
+    // A release tag the remote moved is never merged or pulled into ours
+    // (BUG-703): someone has to decide which one is the release.
+    let release = rejected.iter().find(|t| ctx.repo.view().tags.get(*t).is_some_and(|t| t.annotation.is_some()));
+    let fix = match release {
+        Some(t) => {
+            let t = safe(t);
+            format!(
+                "{name} holds release tag {t} at another target. Keep yours there with `vl push {name} -t {t} --force`, or take theirs with `vl tag set {t} -r {name}/{t} --force`"
+            )
+        }
+        None => format!(
             "{name} has changes you don't have. Run `vl pull {name}`, `vl merge {name}/{first}`, and push again (or `vl push --force` to overwrite them)"
         ),
-        &withheld,
-    ))
+    };
+    Ok(push_status(&rejected, &fix, &withheld))
 }
 
 /// `vl push --dry-run`: the plan, per remote. Exits 1 where the push would
@@ -2586,6 +2594,14 @@ fn cmd_pull(ctx: &mut Ctx, name: &str, full: bool) -> Result<()> {
     }
     for t in &r.remote_tags_removed {
         println!("  {} {} (gone from {name})", yellow("pruned"), safe(t));
+    }
+    for (t, local, theirs) in &r.release_tags_kept {
+        warn_untrusted(&format!(
+            "{name} moved release tag {t} from {} to {}; your release tag {t} stays at {} (release tags never move; compare with `vl diff --from {t} --to {name}/{t}`, take theirs with `vl tag set {t} -r {name}/{t} --force`)",
+            local.short(),
+            theirs.short(),
+            local.short()
+        ));
     }
     for t in &r.tags_kept_deleted {
         println!(

@@ -366,7 +366,9 @@ If both sides changed the same lines, the change is still recorded, with
 a **conflict** in that file, as `vl merge` would record it; the working
 copy shows the markers, and `vl resolve` or an edit resolves it. A sealed
 file stays sealed (every version in the conflict keeps its audience), and
-a version you hold no key for is never used. Without the original
+a version you hold no key for is never used, nor a version from an
+unreleased embargo's fix unless the patch lands inside that embargo too.
+Without the original
 version in your history (a patch made on something you never had),
 `--3way` changes nothing: the patch does not apply.
 

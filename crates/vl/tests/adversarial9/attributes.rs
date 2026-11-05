@@ -43,7 +43,6 @@ fn merge_under(env: &Env, name: &str, attributes: &str, cloaked: bool) -> String
 /// that decide public content should come only from what that audience
 /// can read.
 #[test]
-#[ignore = "BUG-705: a cloaked .gitattributes (merge=union) decides the content of a public merge result"]
 fn a_sealed_gitattributes_does_not_decide_a_public_merge() {
     let env = Env::new();
     // Same length, so only the rule differs.
@@ -58,4 +57,30 @@ fn control_a_public_union_attribute_merges_by_union() {
     let env = Env::new();
     let merged = merge_under(&env, "public", "log.txt merge=union\n", false);
     assert_eq!(merged, "a\nOURS\nTHEIRS\nc\n");
+}
+
+/// BUG-705, the other audience: a result sealed for `team` is shaped by
+/// what `team` reads, so a cloaked `.gitattributes` still decides how a
+/// cloaked file merges.
+#[test]
+fn a_sealed_gitattributes_still_decides_a_merge_sealed_for_its_scope() {
+    let env = Env::new();
+    let proj = env.dir("cloaked");
+    env.ok(U, &proj, &["init"]);
+    write(&proj, "log.txt", "a\nb\nc\n");
+    write(&proj, ".gitattributes", "log.txt merge=union\n");
+    env.ok(U, &proj, &["cloak", ".gitattributes", "log.txt"]);
+    env.ok(U, &proj, &["commit", "-m", "base"]);
+    let base = change_id(&env, U, &proj, "@-");
+    write(&proj, "log.txt", "a\nOURS\nc\n");
+    env.ok(U, &proj, &["commit", "-m", "ours"]);
+    let ours = change_id(&env, U, &proj, "@-");
+    env.ok(U, &proj, &["new", &base]);
+    write(&proj, "log.txt", "a\nTHEIRS\nc\n");
+    env.ok(U, &proj, &["commit", "-m", "theirs"]);
+    let theirs = change_id(&env, U, &proj, "@-");
+    env.ok(U, &proj, &["new", &ours, &theirs]);
+    let tier = env.stdout(U, &proj, &["files"]);
+    assert!(tier.lines().any(|l| !l.starts_with("public") && l.contains(" log.txt")), "{tier}");
+    assert_eq!(read(Path::new(&proj), "log.txt"), "a\nOURS\nTHEIRS\nc\n");
 }

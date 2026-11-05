@@ -197,7 +197,8 @@ pub struct Redaction {
 pub struct HiddenText {
     /// The scope the description is sealed for.
     pub scope: String,
-    /// Always `no_key`.
+    /// `no_key`, or `not_public` (a `--public` view: a public mirror
+    /// cannot read it, whatever keys this reader holds).
     pub reason: &'static str,
 }
 
@@ -233,9 +234,22 @@ pub struct SnapshotRef {
 }
 
 pub fn snapshot_ref(repo: &Repo, id: &ObjectId) -> SnapshotRef {
+    snapshot_ref_as(repo, id, false)
+}
+
+/// [`snapshot_ref`], with `public`: the description as a public mirror
+/// reads it (`--public` views). A description sealed for a cloak scope or
+/// an unreleased embargo is hidden (`not_public`), keys held or not.
+pub fn snapshot_ref_as(repo: &Repo, id: &ObjectId, public: bool) -> SnapshotRef {
     match repo.snapshot(id) {
         Ok(s) => {
-            let (description, description_hidden) = description(repo, &s);
+            let (description, description_hidden) = match (&s.description, public) {
+                (Text::Sealed(e), true) => match veil_core::git::public_description(repo.store(), &s.description) {
+                    Some(t) => (Some(t), None),
+                    None => (None, Some(HiddenText { scope: split_label(&e.scope).0.to_string(), reason: "not_public" })),
+                },
+                _ => description(repo, &s),
+            };
             SnapshotRef {
                 snapshot_id: id.hex(),
                 snapshot_short: id.short(),
@@ -2720,7 +2734,7 @@ pub fn blame(ctx: &Ctx, req: &BlameRequest<'_>) -> Result<BlameDoc> {
     Ok(BlameDoc {
         schema: BLAME_SCHEMA,
         path: path(&p),
-        rev: snapshot_ref(repo, &id),
+        rev: snapshot_ref_as(repo, &id, req.public),
         version: if b.fallback { "fallback" } else { "plain" },
         public: req.public,
         coarse: b.coarse,
@@ -2731,7 +2745,7 @@ pub fn blame(ctx: &Ctx, req: &BlameRequest<'_>) -> Result<BlameDoc> {
         visited: b.visited,
         unattributed: b.unattributed(),
         lines,
-        changes: stamped.iter().map(|(_, c)| snapshot_ref(repo, c)).collect(),
+        changes: stamped.iter().map(|(_, c)| snapshot_ref_as(repo, c, req.public)).collect(),
     })
 }
 
