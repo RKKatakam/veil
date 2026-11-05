@@ -83,19 +83,14 @@ vl merge fix --into main --embargo-for security distro-partners --until 2026-12-
 - **An embargoed PR doesn't exist** for anyone outside its groups: no title, no count, no placeholder.
 - **The same check applies everywhere:** search, notifications, counts, the API, agents and CI.
 
-## Without a server (SFTP, a shared drive, no Hub)
+## Veil always works through its server
 
-**Restricted folders are always plain text,** never encrypted (owner, 2026-11-05). A plain storage server can't check permissions: anyone who can log into it can read every file on it. So **restricted folders only go where access can be enforced:**
-
-| Where the files go | Folder for everyone with access | Folder for one group (`billing/ finance`) | Secrets (`.env`, keys) | Public |
-|---|---|---|---|---|
-| **The Hub** | plain; the Hub checks | **plain; the Hub only gives it to finance** | encrypted | plain |
-| **SFTP or a shared drive** | plain | **not uploaded**, unless you allow that server for finance (`vl remote allow NAME finance`) | encrypted | plain |
-| **A public mirror** | not sent | not sent | not sent | plain |
-
-- **Allowing a server for a group** (e.g. finance's own SFTP server) means: everyone who can log into that server is trusted to see that folder.
-- **Groups and admins without the Hub** are kept in a file in the project that only admins can change. Every change is signed, so nobody can add themselves.
-- **The only encrypted things are secrets and embargoed changes.**
+**Veil is server-centric, not Git and not offline-first** (owner, 2026-11-05).
+- The `vl` client is always connected to the Veil server (the Hub).
+- **The server stores the code and checks every permission.**
+- **Restricted folders like `billing/` are plain text on the server,** and the server only gives them to the people and groups with access.
+- **There are no plain-file remotes** (SFTP, shared drives) and no offline mode, so no other way of enforcing access is needed.
+- **Encryption is used only for secrets** (`.env`, keys) and embargoed changes.
 
 ## What the server sees
 
@@ -106,13 +101,13 @@ vl merge fix --into main --embargo-for security distro-partners --until 2026-12-
 | The server (and anyone who breaks in) | ✅ | ✅ | ❌ ciphertext only | ❌ never uploaded |
 | A public mirror | ✅ | ❌ never sent | ❌ never sent | ❌ |
 
-## For stream V's design: open technical questions (not product questions)
+## For the design: open technical questions (not product questions)
 
-- **What history shows** someone without access to a folder: proposed, they don't see its files or even their names. Snapshot signatures must still verify (the per-viewer projection in `HUB.md`).
-- **The authority on push.** Private files aren't encrypted, so the server and the push filter decide from the **accepted `.veilpolicy`, by path**, never from labels inside a snapshot. This is the main threat-review item.
-- **Projects without the Hub:** decided (above). Restricted folders stay plain text and are not uploaded to a plain server unless it is allowed for their group. Open technical details: what a clone from such a server shows for the folders it lacks, and moving a project from SFTP to the Hub.
+- **What history shows** someone without access to a folder: proposed, they don't see its files or even their names. Snapshot signatures must still verify (a per-viewer projection served by the server).
+- **The authority:** the server enforces access from the accepted `.veilpolicy` and its own group and admin records, by path, never from labels inside a snapshot.
+- **What the client keeps locally:** a cache of what the user may see. Fetch on demand from the server comes from the scale plan.
 - **Existing repositories:**
-  - cloaked paths become private folders whose secrets stay encrypted;
-  - `.env` files start syncing (encrypted) only after an explicit `vl upgrade` step that lists them;
+  - cloaked paths become restricted folders, with their secrets still encrypted;
+  - `.env` files start syncing (encrypted) only after an explicit upgrade step that lists them;
   - nothing is ever made public or decrypted silently.
-- **Old commands:** `vl cloak`, `vl isolate` and `vl expose` keep working as aliases of `vl access`.
+- **Old commands:** `vl cloak`, `vl isolate` and `vl expose` become aliases of `vl access` or are removed in the simplification pass.

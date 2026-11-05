@@ -1,6 +1,6 @@
 # Veil
 
-Veil (`vl`) is a version control system in Rust with per-path confidentiality: public, cloaked per scope (encrypted), and isolated (local only). It also has embargoes, secret scanning, change ids, an undoable op log, workspaces, a BLAKE3 content-addressed store and SFTP remotes.
+Veil (`vl`) is a **server-centric** version control system in Rust. **It is not Git and not offline-first:** the `vl` client is always connected to the Veil server (the Hub), which stores the code and enforces permissions. Veil has per-path confidentiality: public, cloaked per scope (encrypted), and isolated (local only). It also has embargoes, secret scanning, change ids, an undoable op log, workspaces, a BLAKE3 content-addressed store and SFTP remotes.
 
 Crates:
 - `crates/veil-core`: the engine;
@@ -23,7 +23,7 @@ Veil automatically **encrypts secrets** (`.env`, keys), which follow the same pe
 - Private, secret and embargoed content never reaches public snapshots, public remotes, logs, JSON or error messages, and nobody receives a file they have no access to. Secrets are only ever stored encrypted. Personal private keys never leave the machine.
 - Visibility labels are claims; objects are authority (`verify_sealing`).
 - Old repository formats stay readable. A format change bumps the version and adds a `vl upgrade` path.
-- Everything works offline. `veil-core` builds for WASM: OS-only code goes behind `#[cfg(feature = "os")]`.
+- **Veil is server-centric** (owner, 2026-11-05): the client is always connected to the Veil server, and the server enforces every permission. There is no offline mode and no plain-file remotes (SFTP); don't design for them. `veil-core` builds for WASM (the server's web client uses it): OS-only code goes behind `#[cfg(feature = "os")]`.
 
 ## Checks to run, and show the output of
 ```sh
