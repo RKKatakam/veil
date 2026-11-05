@@ -2787,16 +2787,19 @@ snapshot 1, a base its size in bytes. The defaults are 200k tree entries,
 
 Graph queries that used to read every reachable snapshot (the auto-rebase
 after each commit, `log -n`, change-id lookup, `tag set`'s ancestry check,
-the embargo walks behind push filtering and confinement) stop early using
-each snapshot's **generation**: 1 plus the largest generation of its
+the embargo walks behind push filtering and confinement, blame's ranks)
+stop early using each snapshot's **generation**, a corrected commit date:
+the larger of its timestamp and 1 plus the largest generation of its
 parents in the store. Generations strictly decrease along every parent
-edge, so a walk for `a` below `b` stops at every snapshot below `a`'s
-generation. The index is a device-local cache in `.veil/index/graph/`
-(`docs/design/scale/3-history-index.md`):
-- **What it holds:** per snapshot, its generation, change id and whether
-  `embargo` is set. Only plaintext snapshot fields, so it is the same with
-  and without keys. Walks take parents from the objects, never from the
-  index.
+edge whatever timestamps authors chose, so a walk for `a` below `b` stops
+soundly at every snapshot below `a`'s generation; a false timestamp can
+only make a walk longer. The index is a device-local cache in
+`.veil/index/graph/` (`docs/design/scale/3-history-index.md`):
+- **What it holds:** per snapshot, its generation, change id, whether
+  `embargo` is set, and whether any ancestor has it set (so embargo checks
+  skip every line that does not build on an embargoed merge). Only
+  plaintext snapshot fields, so it is the same with and without keys.
+  Walks take parents from the objects, never from the index.
 - **Never required:** an entry not on disk is computed from the store on
   first use and persisted at the next commit (or once 256 have
   accumulated). A damaged or unreadable index is dropped and computed again.

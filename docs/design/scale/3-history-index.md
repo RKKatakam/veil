@@ -1,6 +1,18 @@
 # 3. A history index (commit-graph)
 
-Status: design and threat review (Scion 3.2). **No repository format change.** The index is a device-local cache with its own magic and version, and it is rebuilt whenever it cannot be read.
+Status: **built** (stream I), except the Bloom filters (I2, see "As built"). **No repository format change.** The index is a device-local cache with its own magic and version, and it is rebuilt whenever it cannot be read.
+
+## As built (2026-11-05)
+
+The design below was simplified where a simpler rule closes the same threat:
+- **Generations are corrected commit dates** (Git's v2), not topological levels: `max(timestamp, 1 + max(parents))`. Open decision 1 rejected them because authors choose timestamps, but pruning needs only that generations strictly decrease along every edge, which holds for any timestamps. A false timestamp only makes some walk longer. Plain levels made every walk read all of `main` to rule out an old branch or an old tag (measured: `status` with a change and `log -n 20` read 100 % of `small`).
+- **The index holds no parents.** Walks read every snapshot they visit and take parents from the object, so a damaged index can only cost time; threat 6's parent checks are unnecessary. Entries hold the generation, the change id and two flags: `embargo` set, and an embargoed snapshot among the ancestors (`FLAG_EMBARGO_LINE`, derived from the parents). The embargo checks (`embargo_withheld`, `active_embargoes`, `carried_embargo`) walk only lines with that flag: with no embargo in the history, nothing.
+- **No `GEN_UNKNOWN`.** A missing parent is ignored in the child's generation, and listed in its layer. When one arrives the index is voided and recomputed (threat 4): checked on open, after each commit and on `Repo::reload`.
+- **Layers are named `L-<epoch>-<lo>-<hi>.vcg`**, created with `create_new` one slot at a time, so appenders never lose one another's layers and no `chain` file is rewritten. Voiding writes the next epoch's marker `E-<n>` first, so a layer appended concurrently from the old epoch is never mixed in.
+- **No `vl index rebuild`.** Entries missing from disk are computed from the store on first use and persisted at the next commit (or once 256 accumulate). A damaged layer voids the index.
+- **`topo_iter`** is Kahn's algorithm made lazy: exploration only as deep as the next node to emit, and a root is examined only once its timestamp could be the next one emitted. Its output is exactly `topo_children_first`'s (property-tested, threat 12).
+- **Not built yet:** the Bloom filters (`log -- PATH`, `blame`) and the push and pull walks (`committed_closure`, `push_closure`, `ancestors_in`, stream P). `log -n 20 -- <hot file>` reads 24 % of `small`'s history without them; whether `1g` needs them is for the gate run.
+- **Measured** on `small` (1,073 snapshots), snapshots read before → after: `status` with 1 or 100 modified files 1,073 → 3; `commit` 1,073 → 1; `log -n 20` 1,073 → 92; `log -n 20 -- <hot file>` 1,073 → 255; `tag set` and `ws exec` 1 → 1; push still 1,073 (stream P). N = 64 agents: 1,757 landings per minute (baseline 397, partly from BUG-801's fix).
 
 ## The problem: the walks that read all history
 
