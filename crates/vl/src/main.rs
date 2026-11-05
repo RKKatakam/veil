@@ -398,9 +398,40 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         },
         // Both keep uncommitted working-copy edits: the automatic snapshot
         // taken before the command is not what the user wants to undo.
-        Cmd::Op(OpCmd::Restore { id }) => {
+        Cmd::Op(OpCmd::Heads { out }) => {
+            let heads = api::op_heads(&ctx.repo)?;
+            match out.json {
+                true => api::emit_json(&heads)?,
+                false => api::text::op_log(&heads),
+            }
+        }
+        Cmd::Op(OpCmd::Restore { id, force }) => {
             let op = ctx.repo.ops().resolve_prefix(id)?;
             let ws = ctx.ws.clone();
+            // Work other workspaces (agents) recorded after the target would
+            // leave the view: refuse unless asked (it stays in the op log).
+            let others = ctx.repo.other_workspaces_since(op, &ws)?;
+            if !others.is_empty() && !*force {
+                let mut list = String::new();
+                for (id, o) in others.iter().take(10) {
+                    list.push_str(&format!(
+                        "\n  {} {} (workspace '{}')",
+                        id.short(),
+                        safe(&o.description),
+                        safe(o.workspace.as_deref().unwrap_or_default())
+                    ));
+                }
+                if others.len() > 10 {
+                    list.push_str(&format!("\n  … and {} more", others.len() - 10));
+                }
+                bail!(
+                    "other workspaces recorded {} operation(s) after {}, whose work would leave the view:{list}\n\
+                     Nothing was changed. Undo a single operation with `vl undo --op <id>`, or restore anyway with `vl op restore {} --force` (their work stays in the op log)",
+                    others.len(),
+                    op.short(),
+                    safe(id)
+                );
+            }
             let outside = ctx.repo.manual_undo_since(op)?;
             // Releases are not in the view: take back the staged ones made
             // since, and say which published ones stay (BUG-109).
@@ -427,10 +458,13 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
                 ));
             }
         }
-        Cmd::Undo => {
+        Cmd::Undo { op } => {
             let ws = ctx.ws.clone();
             ctx.repo.reload()?;
-            let target = ctx.repo.undo_target(&ws)?;
+            let target = match op {
+                Some(id) => ctx.repo.ops().resolve_prefix(id)?,
+                None => ctx.repo.undo_target(&ws)?,
+            };
             // The attachment is not in the view: undoing `vl ws switch` is
             // switching back (each workspace keeps its own edits).
             if let Some(from) = ctx.repo.undo_switch(&ws, &target)? {
@@ -439,7 +473,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
                 println!("Undid: switch the project directory from workspace '{}' to '{}'", safe(&from), safe(&ws));
                 return Ok(ExitCode::SUCCESS);
             }
-            let (_, undone) = ctx.repo.undo_keeping_edits(&ws)?;
+            let (_, undone) = ctx.repo.undo_operation_keeping_edits(&ws, target)?;
             println!("Undid: {}", safe(&undone));
             if let Some(remote) = undone.strip_prefix("push to ") {
                 println!(
@@ -2241,6 +2275,7 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
             }
             let mut data = Vec::new();
             std::io::stdin().read_to_end(&mut data)?;
+            let _wc = veil_core::lock::WcLock::acquire(&veil_core::repo::state_dir(&ctx.root), name)?;
             let overlay = ctx.repo.workspace_overlay(name)?;
             let vp = VPath::new(path)?;
             overlay.write(&vp, &data)?;

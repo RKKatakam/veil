@@ -353,7 +353,40 @@ impl Repo {
     /// always was. Stream O (`docs/design/scale/2-lock-free-oplog.md`)
     /// takes the same shape further: staging on disk, and a
     /// compare-and-swap of the op heads instead of the lock.
-    pub fn snapshot_workspace_with(&mut self, ws: &str, fs: &dyn StorageBackend, opts: SnapshotOptions<'_>) -> Result<WcSnapshot> {
+    pub fn snapshot_workspace_with(&mut self, ws: &str, fs: &dyn StorageBackend, mut opts: SnapshotOptions<'_>) -> Result<WcSnapshot> {
+        // A caller that did not name the working copy `fs` came from
+        // records into whatever the workspace is now: a lock-free commit
+        // that lost to another recorder of the workspace builds again
+        // (formats ≤ 5 did so under the lock).
+        if opts.expected_wc.is_none() && self.lock_free() {
+            for attempt in 0..16u32 {
+                if attempt > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(u64::from(attempt.min(8)) * 3));
+                }
+                let again = SnapshotOptions {
+                    cache: opts.cache.as_deref_mut(),
+                    injected: opts.injected,
+                    materialised: opts.materialised,
+                    description: opts.description.clone(),
+                    policy_incoming: opts.policy_incoming,
+                    policy_from_command: opts.policy_from_command,
+                    expected_wc: None,
+                    carried: opts.carried,
+                    line_endings: opts.line_endings,
+                };
+                let out = self.snapshot_once(ws, fs, again)?;
+                if !out.superseded {
+                    return Ok(out);
+                }
+            }
+            return Err(VeilError::repo(format!(
+                "workspace '{ws}' keeps moving while it is recorded (other commands are recording it); try again"
+            )));
+        }
+        self.snapshot_once(ws, fs, opts)
+    }
+
+    fn snapshot_once(&mut self, ws: &str, fs: &dyn StorageBackend, opts: SnapshotOptions<'_>) -> Result<WcSnapshot> {
         let SnapshotOptions {
             cache,
             injected,
@@ -374,8 +407,10 @@ impl Repo {
             carried,
             line_endings,
         };
-        // 1. Scan without the lock.
-        let probe = match self.backend.is_network() {
+        // 1. Scan without the lock. Lock-free repositories (format 6) take
+        // no lock: they build inside the transaction, with the objects
+        // staged on disk, and compare-and-swap at commit.
+        let probe = match self.backend.is_network() || self.lock_free() {
             true => None,
             false => self.probe_snapshot(ws, fs, &params, expected_wc, cache.as_deref())?,
         };
@@ -394,8 +429,11 @@ impl Repo {
             Some(Probe::Changed(p)) => Some(p),
             None => None,
         };
-        // 2. Record under the lock.
+        // 2. Record under the lock (formats ≤ 5), or in a lock-free
+        // transaction that fails at commit if the workspace moved since it
+        // started (format 6).
         let mut tx = self.transaction(description.unwrap_or_else(|| snapshot_op_description(ws)))?;
+        tx.for_workspace(ws);
         let wc_id = tx.view.workspace(ws)?.wc;
         if expected_wc.is_some_and(|e| e != wc_id) {
             return Ok(WcSnapshot {
@@ -405,6 +443,7 @@ impl Repo {
                 superseded: true,
             });
         }
+        tx.expect_wc(ws, wc_id);
         let wc = tx.repo().snapshot(&wc_id)?;
         let store = tx.repo().store.clone();
         let rescan = scanner_outdated(&*tx.repo().backend, ws)?;
@@ -456,7 +495,18 @@ impl Repo {
         }
         let id = tx.rewrite(wc_id, new)?;
         let backend = tx.repo().backend.clone();
-        tx.commit()?;
+        match tx.commit() {
+            Err(e) if crate::transaction::Transaction::is_superseded(&e) => {
+                self.reload()?;
+                return Ok(WcSnapshot {
+                    snapshot: self.view.workspace(ws)?.wc,
+                    changed: false,
+                    report,
+                    superseded: true,
+                });
+            }
+            r => r?,
+        };
         // Only after the re-scanned tree is durable: a crash before this
         // point simply re-scans again next time.
         if rescan {
@@ -849,7 +899,20 @@ impl Repo {
     pub fn undo_keeping_edits(&mut self, ws: &str) -> Result<(ObjectId, String)> {
         self.reload()?;
         let command = self.undo_target(ws)?;
+        self.undo_operation_keeping_edits(ws, command)
+    }
+
+    /// Undo operation `command` (`vl undo --op`), as [`Repo::undo_keeping_edits`]
+    /// undoes the last command: a 3-way revert of what it changed, which
+    /// keeps every change made since by other operations.
+    pub fn undo_operation_keeping_edits(&mut self, ws: &str, command: ObjectId) -> Result<(ObjectId, String)> {
         let op = self.ops.get(&command)?;
+        if op.is_merge() {
+            return Err(VeilError::repo(format!(
+                "operation {} merges concurrent operations; undo one of them instead (`vl op log`)",
+                command.short()
+            )));
+        }
         if let Some(how) = &op.manual_undo {
             return Err(VeilError::repo(format!(
                 "cannot undo '{}': {how}. \
@@ -858,15 +921,15 @@ impl Repo {
                 op.description
             )));
         }
-        let parent = *op
-            .parents
-            .first()
-            .ok_or_else(|| VeilError::repo("nothing to undo"))?;
+        if op.parents.is_empty() {
+            return Err(VeilError::repo("nothing to undo"));
+        }
         // An embargo release is not in the view (see `check_undo_release`).
         let release = self.check_undo_release(&op.description)?;
-        let view = self.ops.get(&parent)?.view;
+        let revert = self.parent_view(&op)?;
         let link = OpLink::UndoOf(command);
-        let id = self.restore_view_keeping_edits(ws, view, &op.view, format!("undo: {}", op.description), link)?;
+        let target = Restore::Revert { base: op.view.clone(), revert };
+        let id = self.restore_view_keeping_edits(ws, target, &op.view, format!("undo: {}", op.description), link)?;
         self.finish_undo_release(release)?;
         Ok((id, op.description))
     }
@@ -876,7 +939,9 @@ impl Repo {
     /// Successive redos take back successive undos, newest first; any
     /// command recorded after an undo (other than an undo or redo, and
     /// automatic snapshots of `ws`) leaves nothing to redo. Returns the
-    /// new operation and the description of the redone command.
+    /// new operation and the description of the redone command. Like an
+    /// undo, a redo is a 3-way revert (of the undo), which keeps what other
+    /// operations changed since.
     pub fn redo_keeping_edits(&mut self, ws: &str) -> Result<(ObjectId, String)> {
         self.reload()?;
         let (undo, command) = self.redo_target(ws)?;
@@ -890,17 +955,46 @@ impl Repo {
                  run `vl embargo release {id}` to release it again (nothing was changed)"
             )));
         }
-        let parent = *op
-            .parents
-            .first()
-            .ok_or_else(|| VeilError::repo("nothing to redo"))?;
-        let before_edits = self.ops.get(&parent)?.view;
-        let id = self.restore_view_keeping_edits(ws, op.view, &before_edits, format!("redo: {}", op.description), OpLink::RedoOf(undo))?;
+        if op.parents.is_empty() {
+            return Err(VeilError::repo("nothing to redo"));
+        }
+        let undo_op = self.ops.get(&undo)?;
+        let revert = self.parent_view(&undo_op)?;
+        let target = Restore::Revert {
+            base: undo_op.view.clone(),
+            revert,
+        };
+        let id = self.restore_view_keeping_edits(ws, target, &undo_op.view, format!("redo: {}", op.description), OpLink::RedoOf(undo))?;
         Ok((id, op.description))
     }
 
+    /// The view `op` was recorded on: its parent's, or the merge of its
+    /// parents' views (several heads it did not merge first).
+    fn parent_view(&self, op: &crate::oplog::Operation) -> Result<View> {
+        match op.parents.as_slice() {
+            [] => Err(VeilError::repo("nothing to undo")),
+            [p] => Ok(self.op_or_pruned(p, "undo")?.view),
+            ps => {
+                let mut sorted = ps.to_vec();
+                sorted.sort();
+                let split = self.ops.split(&sorted[..1], &sorted[1..])?;
+                let base = match split.base {
+                    Some(b) => self.ops.try_get(&b)?.map(|o| o.view).unwrap_or_default(),
+                    None => View::default(),
+                };
+                let views: Vec<View> = sorted.iter().map(|p| self.op_or_pruned(p, "undo").map(|o| o.view)).collect::<Result<_>>()?;
+                let refs: Vec<&View> = views.iter().collect();
+                let mut descends = |a: &ObjectId, b: &ObjectId| self.is_ancestor(b, a).unwrap_or(false);
+                Ok(crate::oplog::merge_views(&base, &refs, &mut descends).view)
+            }
+        }
+    }
+
     /// The operation `vl undo` in workspace `ws` undoes: the newest command
-    /// that is neither an automatic snapshot of `ws` nor already undone.
+    /// of `ws` (or of no workspace: tags, push, pull, remotes) that is
+    /// neither an automatic recording, a merge of concurrent operations,
+    /// nor already undone. Other workspaces' commands are never its target:
+    /// agents working in their own workspaces do not move a human's undo.
     /// An undo is skipped together with what it undid (and everything
     /// between them, which that undo already reverted); a redo stands for
     /// the command it re-applied. So `undo, undo` walks back over two
@@ -928,7 +1022,7 @@ impl Repo {
     /// What `vl redo` in workspace `ws` re-applies: `(undo, command)`, the
     /// newest undo not taken back by a redo yet and the command it undid.
     /// Redos are skipped together with the undo they took back; any other
-    /// command (automatic snapshots of `ws` aside) ends the search: a new
+    /// command of `ws` (automatic recordings aside) ends the search: a new
     /// command clears what could be redone, as in jj.
     pub fn redo_target(&self, ws: &str) -> Result<(ObjectId, ObjectId)> {
         let mut cur = self.command_at(self.op_id, ws)?;
@@ -956,30 +1050,46 @@ impl Repo {
     }
 
     /// [`Repo::restore_operation`] that keeps the uncommitted edits of `ws`
-    /// (see [`Repo::undo_keeping_edits`]).
+    /// (see [`Repo::undo_keeping_edits`]). The whole view goes back to
+    /// operation `op`'s: work of other workspaces recorded since leaves it
+    /// (it stays in the op log; the CLI asks for `--force` first, see
+    /// [`Repo::other_workspaces_since`]).
     pub fn restore_operation_keeping_edits(&mut self, ws: &str, op: ObjectId) -> Result<ObjectId> {
         self.reload()?;
         let command = self.last_command_op(ws)?;
         let before_edits = self.ops.get(&command)?.view;
         let view = self.ops.get(&op)?.view;
-        self.restore_view_keeping_edits(ws, view, &before_edits, format!("restore to operation {}", op.short()), OpLink::None)
+        self.restore_view_keeping_edits(ws, Restore::Exact(view), &before_edits, format!("restore to operation {}", op.short()), OpLink::None)
+    }
+
+    /// The operations recorded after `op` (that it does not reach) for a
+    /// workspace other than `ws`, newest first: restoring the view of `op`
+    /// takes their work out of the view (`vl op restore` refuses without
+    /// `--force`).
+    pub fn other_workspaces_since(&self, op: ObjectId, ws: &str) -> Result<Vec<(ObjectId, crate::oplog::Operation)>> {
+        let split = self.ops.split(&self.base, &[op])?;
+        let mut out = Vec::new();
+        for id in split.only_a {
+            if let Some(o) = self.ops.try_get(&id)? {
+                if o.workspace.as_deref().is_some_and(|w| w != ws) && !o.is_merge() {
+                    out.push((id, o));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// The operations after `op`, newest first, whose effect lies outside
     /// the view (see [`crate::oplog::Operation::manual_undo`]): restoring
     /// the view of `op` leaves what they did in place.
     pub fn manual_undo_since(&self, op: ObjectId) -> Result<Vec<crate::oplog::Operation>> {
+        let split = self.ops.split(&self.base, &[op])?;
         let mut out = Vec::new();
-        let mut cur = self.op_id;
-        while cur != op {
-            let Some(o) = self.ops.try_get(&cur)? else { break };
-            let next = o.parents.first().copied();
-            if o.manual_undo.is_some() {
-                out.push(o);
-            }
-            match next {
-                Some(p) => cur = p,
-                None => break,
+        for id in split.only_a {
+            if let Some(o) = self.ops.try_get(&id)? {
+                if o.manual_undo.is_some() {
+                    out.push(o);
+                }
             }
         }
         Ok(out)
@@ -990,39 +1100,78 @@ impl Repo {
         self.command_at(self.op_id, ws)
     }
 
-    /// `start`, or the newest operation before it that is not an automatic
-    /// recording: a snapshot of `ws`, or a mount's recording of any
-    /// workspace (see [`mount_record_op_description`]).
+    /// `start`, or the newest operation before it (newest first across
+    /// merged branches) that `vl undo` in `ws` considers: not an automatic
+    /// recording (a snapshot of `ws`, or a mount's recording of any
+    /// workspace, see [`mount_record_op_description`]), not a merge of
+    /// concurrent operations, and of `ws` or of no workspace.
     fn command_at(&self, start: ObjectId, ws: &str) -> Result<ObjectId> {
-        let mut cur = start;
-        loop {
-            let op = self.op_or_pruned(&cur, "undo")?;
-            match op.parents.first() {
-                Some(p) if is_automatic_recording(&op.description, ws) => cur = *p,
-                _ => return Ok(cur),
+        let mut queue = std::collections::BinaryHeap::new();
+        let mut seen = std::collections::HashSet::new();
+        let first = self.op_or_pruned(&start, "undo")?;
+        queue.push((first.timestamp, start));
+        seen.insert(start);
+        let mut pruned = None;
+        while let Some((_, id)) = queue.pop() {
+            let Some(op) = self.ops.try_get(&id)? else {
+                pruned = Some(id);
+                continue;
+            };
+            let other_ws = op.workspace.as_deref().is_some_and(|w| w != ws);
+            let skip = op.is_merge() || other_ws || (is_automatic_recording(&op.description, ws) && !op.parents.is_empty());
+            if !skip {
+                return Ok(id);
             }
+            for p in &op.parents {
+                if seen.insert(*p) {
+                    match self.ops.try_get(p)? {
+                        Some(po) => queue.push((po.timestamp, *p)),
+                        None => pruned = Some(*p),
+                    }
+                }
+            }
+        }
+        match pruned {
+            Some(p) => Err(VeilError::repo(format!(
+                "nothing further to undo: operation {} was pruned by `vl gc --keep-ops-days`",
+                p.short()
+            ))),
+            None => Err(VeilError::repo("nothing to undo")),
         }
     }
 
-    /// Install `view`, then carry the edits of each workspace recorded
-    /// since `before_edits` (its working copy there vs. now) over to the
-    /// working copy `view` restores for it. `ws`, the attached workspace,
-    /// comes first; the others matter once undo walks back past a switch,
-    /// whose new workspace may have recorded edits in the range it skips.
+    /// Install `target` (inside the transaction, from its base view, so an
+    /// operation that landed meanwhile is never reverted by accident), then
+    /// carry the edits of each workspace recorded since `before_edits` (its
+    /// working copy there vs. now) over to the working copy the result
+    /// gives it. `ws`, the attached workspace, comes first; the others
+    /// matter once undo walks back past a switch, whose new workspace may
+    /// have recorded edits in the range it skips.
     ///
     /// An undo or redo that would remove a workspace holding such edits is
     /// refused (nothing changes): they could not be carried anywhere.
     /// `vl op restore` goes to the exact state the user picked.
-    fn restore_view_keeping_edits(&mut self, ws: &str, view: View, before_edits: &View, description: String, link: OpLink) -> Result<ObjectId> {
+    fn restore_view_keeping_edits(&mut self, ws: &str, target: Restore, before_edits: &View, description: String, link: OpLink) -> Result<ObjectId> {
+        let mut tx = self.transaction(description.clone())?;
+        let current = tx.view.clone();
+        let (mut view, revert_heads) = match target {
+            Restore::Exact(v) => (v, None),
+            Restore::Revert { base, revert } => {
+                // The reverting side first: it wins what both changed.
+                let mut descends = |a: &ObjectId, b: &ObjectId| tx.repo().is_ancestor(b, a).unwrap_or(false);
+                let merged = crate::oplog::merge_views(&base, &[&revert, &current], &mut descends);
+                (merged.view, Some(revert.heads))
+            }
+        };
         let wc_of = |v: &View, name: &str| v.workspaces.get(name).map(|w| w.wc);
-        let mut names: Vec<&String> = self.view.workspaces.keys().collect();
+        let mut names: Vec<&String> = current.workspaces.keys().collect();
         names.sort_by_key(|n| n.as_str() != ws);
         let mut edits = Vec::new();
         for name in names {
-            let (Some(base), Some(now)) = (wc_of(before_edits, name), wc_of(&self.view, name)) else {
+            let (Some(base), Some(now)) = (wc_of(before_edits, name), wc_of(&current, name)) else {
                 continue;
             };
-            if base == now || self.snapshot(&base)?.tree == self.snapshot(&now)?.tree {
+            if base == now || tx.repo().snapshot(&base)?.tree == tx.repo().snapshot(&now)?.tree {
                 continue;
             }
             match wc_of(&view, name) {
@@ -1042,7 +1191,16 @@ impl Repo {
                 None => {}
             }
         }
-        let mut tx = self.transaction(description)?;
+        // A working copy whose edits are carried over leaves the heads
+        // (the restored one holds them now), unless the result itself
+        // shows it.
+        if let Some(rh) = &revert_heads {
+            for (_, now, restored) in &edits {
+                if now != restored && !rh.contains(now) {
+                    view.heads.remove(now);
+                }
+            }
+        }
         tx.view = view;
         tx.record_always();
         match link {
@@ -1087,6 +1245,16 @@ enum OpLink {
     None,
     UndoOf(ObjectId),
     RedoOf(ObjectId),
+}
+
+/// The view [`Repo::restore_view_keeping_edits`] installs.
+enum Restore {
+    /// Exactly this view (`vl op restore`).
+    Exact(View),
+    /// A 3-way revert: what `base` → `revert` changed, applied to the
+    /// current view (undo: `base` is the undone operation's view, `revert`
+    /// its parent's; redo: the undo's, and its parent's).
+    Revert { base: View, revert: View },
 }
 
 fn scanned_marker(ws: &str) -> Result<VPath> {

@@ -1068,6 +1068,7 @@ impl Repo {
             }
         };
         let mut tx = self.transaction(format!("set tag {name}"))?;
+        tx.repository_wide();
         tx.view.tags.insert(
             name.to_string(),
             Tag {
@@ -1129,6 +1130,7 @@ impl Repo {
 
     pub fn delete_tag(&mut self, name: &str) -> Result<()> {
         let mut tx = self.transaction(format!("delete tag {name}"))?;
+        tx.repository_wide();
         let old = tx
             .view
             .tags
@@ -1153,6 +1155,7 @@ impl Repo {
             return Ok(());
         }
         let mut tx = self.transaction(format!("{RELEASE_OP_PREFIX}{id}"))?;
+        tx.repository_wide();
         tx.record_always();
         tx.commit()?;
         Ok(())
@@ -1236,15 +1239,19 @@ impl Repo {
     pub fn undo(&mut self) -> Result<ObjectId> {
         self.reload()?;
         let op = self.ops.get(&self.op_id)?;
+        let undone = op.description.clone();
+        let release = self.check_undo_release(&undone)?;
+        let mut tx = self.transaction(format!("undo: {undone}"))?;
+        // From the transaction's base: what it reads is what it replaces.
+        let op = tx.repo().ops.get(&tx.repo().op_id)?;
+        if op.description != undone {
+            return Err(VeilError::repo("another command ran meanwhile; run `vl undo` again"));
+        }
         let parent = *op
             .parents
             .first()
             .ok_or_else(|| VeilError::repo("nothing to undo"))?;
-        let undone = op.description.clone();
-        let release = self.check_undo_release(&undone)?;
-        let view = self.ops.get(&parent)?.view;
-        let mut tx = self.transaction(format!("undo: {undone}"))?;
-        tx.view = view;
+        tx.view = tx.repo().ops.get(&parent)?.view;
         tx.record_always();
         let id = tx.commit()?.expect("recorded");
         self.finish_undo_release(release)?;

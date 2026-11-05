@@ -1506,7 +1506,10 @@ impl Server {
             drop(self.open(false, false)?);
         }
         self.check_identity()?;
-        let ops = OpStore::new(Arc::new(DiskBackend::new(&self.root)));
+        let backend: Arc<dyn veil_core::StorageBackend> = Arc::new(DiskBackend::new(&self.root));
+        let ops = OpStore::new(backend.clone());
+        // The layout of the heads depends on the format (`op_heads/` from 6).
+        ops.set_format(veil_core::repo::read_config(&*backend).map_err(|e| RpcError::failed(e.into()))?.format);
         let head = ops.head().map_err(|e| RpcError::failed(e.into()))?;
         let stop = Arc::new(AtomicBool::new(false));
         let thread = std::thread::Builder::new()
@@ -1588,14 +1591,7 @@ fn watch_loop(
         }
         head = now;
         let Ok(op) = ops.get(&now) else { continue };
-        let entry = api::OpEntry {
-            op_id: now.hex(),
-            op_short: now.short(),
-            timestamp: api::rfc3339(op.timestamp),
-            user: op.user,
-            description: op.description,
-            timestamp_ms: op.timestamp,
-        };
+        let entry = api::op_entry(now, op);
         let note = format!(
             "{{\"jsonrpc\":\"2.0\",\"method\":\"changed\",\"params\":{}}}",
             json(&Changed { schema: CHANGED_SCHEMA, operation: entry })

@@ -237,6 +237,9 @@ pub struct LockContext {
     /// How holders' processes are looked up ([`SystemProbe`]; tests
     /// simulate restricted `/proc` setups).
     pub probe: Arc<dyn ProcessProbe>,
+    /// When this machine booted (ms since the epoch); `None`: ask the
+    /// operating system. Tests simulate a reboot with it.
+    pub boot_ms: Option<i64>,
 }
 
 impl Default for LockContext {
@@ -248,6 +251,7 @@ impl Default for LockContext {
             clock: Arc::new(SystemClock),
             host: None,
             probe: Arc::new(SystemProbe),
+            boot_ms: None,
         }
     }
 }
@@ -1350,6 +1354,186 @@ impl Drop for Registered {
     fn drop(&mut self) {
         if let Some(t) = &self.0 {
             unregister(t);
+        }
+    }
+}
+
+// ---- owners of private directories ---------------------------------------------
+
+static LIVE_OWNERS: Mutex<BTreeMap<String, ()>> = Mutex::new(BTreeMap::new());
+
+fn live_owners() -> std::sync::MutexGuard<'static, BTreeMap<String, ()>> {
+    LIVE_OWNERS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn short_hash(s: &str) -> String {
+    hex::encode(&blake3::hash(s.as_bytes()).as_bytes()[..4])
+}
+
+/// The owner of a private directory (a transaction's object staging, a
+/// pull's spool): a name that says which process made it, so that others
+/// remove it only when that process is provably gone ([`owner_gone`]),
+/// by the lock's rules. Registered in this process while the value lives.
+///
+/// The tag is `<host>-<boot>-<pid>-<pid start>-<ms>-<random>`: short hashes
+/// of the host name and of the boot identity (which includes the pid
+/// namespace), the pid, its start time (0 if unknown), the creation time
+/// and a random part.
+#[derive(Debug)]
+pub struct Owner {
+    tag: String,
+}
+
+impl Owner {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Owner {
+        Owner::with_context(&LockContext::default())
+    }
+
+    /// An owner tag for this process as `ctx` sees it (tests simulate other
+    /// hosts with it).
+    pub fn with_context(ctx: &LockContext) -> Owner {
+        let me = ctx.me();
+        let tag = format!(
+            "{}-{}-{}-{}-{}-{}",
+            short_hash(&me.host),
+            short_hash(&me.boot),
+            my_pid(),
+            my_start().unwrap_or(0),
+            now_millis().max(0),
+            hex::encode(random_bytes::<4>())
+        );
+        live_owners().insert(tag.clone(), ());
+        Owner { tag }
+    }
+
+    pub fn tag(&self) -> &str {
+        &self.tag
+    }
+}
+
+impl Drop for Owner {
+    fn drop(&mut self) {
+        live_owners().remove(&self.tag);
+    }
+}
+
+/// Whether the owner named by `tag` ([`Owner`]) is provably gone, by the
+/// lock's takeover rules:
+/// * this process (same host, boot, namespace, pid and start time): gone
+///   once its [`Owner`] was dropped;
+/// * same host, boot and pid namespace: its pid is provably not running
+///   (a zombie, `ESRCH`), or runs with another start time (a reused pid);
+/// * same host, another boot identity: made before this machine booted.
+///
+/// Everything else is kept: another host (a `.veil` shared over NFS),
+/// another pid namespace of this boot, a pid whose state cannot be told,
+/// or a tag that does not parse.
+pub fn owner_gone(tag: &str, ctx: &LockContext) -> bool {
+    let parts: Vec<&str> = tag.split('-').collect();
+    let [host, boot, pid, start, ms, _rand] = parts.as_slice() else { return false };
+    let (Ok(pid), Ok(start), Ok(ms)) = (pid.parse::<u32>(), start.parse::<u64>(), ms.parse::<i64>()) else {
+        return false;
+    };
+    let me = ctx.me();
+    if *host != short_hash(&me.host) || me.host.is_empty() {
+        return false;
+    }
+    if *boot != short_hash(&me.boot) {
+        let booted = ctx.boot_ms.or_else(boot_time_ms);
+        return booted.is_some_and(|b| ms < b);
+    }
+    if pid == my_pid() && (start == 0 || my_start().is_none_or(|s| s == start)) {
+        return !live_owners().contains_key(tag);
+    }
+    match process_alive_with(&*ctx.probe, pid) {
+        Some(false) => true,
+        Some(true) => start != 0 && process_start_with(&*ctx.probe, pid).is_some_and(|s| s.id != start),
+        None => false,
+    }
+}
+
+// ---- the working-copy lock -------------------------------------------------------
+
+/// One recorder per workspace (stream O, threat 4): an exclusive `flock` on
+/// `.veil/local/wc/ws-<name>.lock`, held while a command records a
+/// workspace's directory and while it checks it out, so that two processes
+/// never snapshot or materialise one workspace at once (the BUG-361/362
+/// and BUG-117 class); the compare-and-swap at commit catches the rest.
+/// Device-local, released by the kernel when the process dies, and
+/// re-entrant within a process (a command that records its own workspace
+/// through another route does not wait for itself).
+#[cfg(all(feature = "os", unix))]
+#[derive(Debug)]
+pub struct WcLock {
+    key: std::path::PathBuf,
+}
+
+#[cfg(all(feature = "os", unix))]
+type WcHeld = BTreeMap<std::path::PathBuf, (usize, std::fs::File)>;
+
+#[cfg(all(feature = "os", unix))]
+fn wc_held() -> std::sync::MutexGuard<'static, WcHeld> {
+    static HELD: Mutex<WcHeld> = Mutex::new(BTreeMap::new());
+    HELD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(all(feature = "os", unix))]
+impl WcLock {
+    /// Lock workspace `ws` of the repository whose `.veil` directory is
+    /// `veil_dir`, waiting for another process that holds it.
+    pub fn acquire(veil_dir: &std::path::Path, ws: &str) -> Result<WcLock> {
+        use std::os::unix::io::AsRawFd;
+        crate::workspace::validate_workspace_name(ws)?;
+        let dir = veil_dir.join("local").join("wc");
+        // `ws-` keeps `.` and `..` from naming a directory.
+        let key = dir.join(format!("ws-{ws}.lock"));
+        {
+            let mut held = wc_held();
+            if let Some((n, _)) = held.get_mut(&key) {
+                *n += 1;
+                return Ok(WcLock { key });
+            }
+        }
+        let io = |e: std::io::Error| VeilError::Io {
+            path: key.display().to_string(),
+            source: e,
+        };
+        std::fs::create_dir_all(&dir).map_err(io)?;
+        let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&key).map_err(io)?;
+        loop {
+            // SAFETY: a valid descriptor we own; `flock` only takes a lock.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                break;
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return Err(io(e));
+            }
+        }
+        let mut held = wc_held();
+        match held.get_mut(&key) {
+            // Another thread of this process took it meanwhile (it waited
+            // for nobody: the lock is per process).
+            Some((n, _)) => *n += 1,
+            None => {
+                held.insert(key.clone(), (1, file));
+            }
+        }
+        Ok(WcLock { key })
+    }
+}
+
+#[cfg(all(feature = "os", unix))]
+impl Drop for WcLock {
+    fn drop(&mut self) {
+        let mut held = wc_held();
+        if let Some((n, _)) = held.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                // Closing the descriptor releases the lock.
+                held.remove(&self.key);
+            }
         }
     }
 }

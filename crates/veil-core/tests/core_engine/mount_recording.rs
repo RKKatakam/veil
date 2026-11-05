@@ -77,8 +77,10 @@ fn undo_redo_and_op_restore_skip_mount_recordings_and_keep_them() {
 }
 
 /// A recording of any workspace's mount is skipped, whichever workspace
-/// is attached; the automatic snapshot of *another* workspace is not (it
-/// is a command there: `vl ws write`).
+/// is attached. From format 6 the automatic snapshot of *another*
+/// workspace (`vl ws write`) is that workspace's operation: `vl undo` in
+/// this one skips it too (stream O: undo never takes back another
+/// workspace's work), and `vl undo --op` undoes it.
 #[test]
 fn only_mount_recordings_and_the_own_snapshot_are_skipped() {
     let (mut repo, fs, _) = new_repo("alice");
@@ -87,20 +89,19 @@ fn only_mount_recordings_and_the_own_snapshot_are_skipped() {
     let o = repo.workspace_overlay("agent").unwrap();
     o.write(&p("w.txt"), b"w\n").unwrap();
     repo.snapshot_workspace("agent", &o).unwrap();
-    let (_, undone) = repo.undo_keeping_edits(WS).unwrap();
+    let agent_op = repo.op_id();
+    assert_eq!(repo.ops().get(&agent_op).unwrap().workspace.as_deref(), Some("agent"));
+    assert_ne!(repo.undo_target(WS).unwrap(), agent_op, "undo in {WS} took back the agent's snapshot");
+    let (_, undone) = repo.undo_operation_keeping_edits(WS, agent_op).unwrap();
     assert_eq!(undone, "snapshot working copy of 'agent'");
     // A look-alike with an invalid workspace name is not a mount's.
     let o = repo.workspace_overlay("agent").unwrap();
     o.write(&p("x.txt"), b"x\n").unwrap();
-    repo.snapshot_workspace_with(
-        "agent",
-        &o,
-        SnapshotOptions {
-            description: Some("record the mount of workspace 'a b'".into()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    repo.set_command_workspace(Some(WS.into()));
+    let mut tx = repo.transaction("record the mount of workspace 'a b'").unwrap();
+    tx.for_workspace(WS);
+    tx.record_always();
+    tx.commit().unwrap();
     let (_, undone) = repo.undo_keeping_edits(WS).unwrap();
     assert_eq!(undone, "record the mount of workspace 'a b'");
 }

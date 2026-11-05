@@ -88,6 +88,9 @@ struct FaultyBackend {
     mutations: AtomicUsize,
     /// Unsynced writes since the last barrier.
     volatile: Mutex<Vec<VPath>>,
+    /// Unsynced renames since the last barrier (`from`, `to`): the content
+    /// is durable, the new name is not. A power loss undoes them.
+    renamed: Mutex<Vec<(VPath, VPath)>>,
     tore: AtomicBool,
 }
 
@@ -100,6 +103,7 @@ impl FaultyBackend {
             crashed: AtomicBool::new(false),
             mutations: AtomicUsize::new(0),
             volatile: Mutex::new(Vec::new()),
+            renamed: Mutex::new(Vec::new()),
             tore: AtomicBool::new(false),
         }
     }
@@ -110,6 +114,13 @@ impl FaultyBackend {
 
     /// Power loss: what never reached stable storage is torn.
     fn tear_volatile(&self) {
+        // A rename whose directory was never synced did not happen.
+        for (from, to) in self.renamed.lock().unwrap().drain(..).rev() {
+            if let Some(data) = self.inner.read_opt(&to).unwrap() {
+                self.inner.write(&from, &data).unwrap();
+                self.inner.remove_file(&to).unwrap();
+            }
+        }
         let mut volatile = self.volatile.lock().unwrap();
         self.tore.fetch_or(!volatile.is_empty(), Ordering::SeqCst);
         for (i, path) in volatile.drain(..).enumerate() {
@@ -177,6 +188,21 @@ impl StorageBackend for FaultyBackend {
     fn sync_barrier(&self) -> Result<()> {
         self.mutate(|| {
             self.volatile.lock().unwrap().clear();
+            self.renamed.lock().unwrap().clear();
+            Ok(())
+        })
+    }
+    fn rename_unsynced(&self, from: &VPath, to: &VPath) -> Result<()> {
+        self.mutate(|| {
+            let data = self.inner.read(from)?;
+            self.inner.write(to, &data)?;
+            self.inner.remove_file(from)?;
+            let mut volatile = self.volatile.lock().unwrap();
+            match volatile.iter().position(|p| p == from) {
+                // Never synced: torn under its new name instead.
+                Some(i) => volatile[i] = to.clone(),
+                None => self.renamed.lock().unwrap().push((from.clone(), to.clone())),
+            }
             Ok(())
         })
     }
@@ -223,6 +249,9 @@ struct EioBackend {
     volatile: Mutex<HashSet<VPath>>,
     /// Covered by the failed barrier: never durable unless rewritten.
     lost: Mutex<HashSet<VPath>>,
+    /// Renamed since the last successful barrier: the content is durable,
+    /// the name is not (a power loss removes it).
+    renamed: Mutex<HashSet<VPath>>,
 }
 
 impl EioBackend {
@@ -235,6 +264,7 @@ impl EioBackend {
             refuse_removes: AtomicBool::new(refuse_removes),
             volatile: Mutex::default(),
             lost: Mutex::default(),
+            renamed: Mutex::default(),
         }
     }
 
@@ -252,6 +282,9 @@ impl EioBackend {
 
     /// Tear every file that is not durable, as `FaultyBackend` does.
     fn power_loss(&self) {
+        for p in self.renamed.lock().unwrap().drain() {
+            self.inner.remove_file(&p).unwrap();
+        }
         let mut gone: Vec<VPath> = self.volatile.lock().unwrap().drain().collect();
         gone.extend(self.lost.lock().unwrap().drain());
         gone.sort();
@@ -292,6 +325,22 @@ impl StorageBackend for EioBackend {
             return Err(Self::eio());
         }
         volatile.clear();
+        self.renamed.lock().unwrap().clear();
+        Ok(())
+    }
+    fn rename_unsynced(&self, from: &VPath, to: &VPath) -> Result<()> {
+        let data = self.inner.read(from)?;
+        self.inner.write(to, &data)?;
+        self.inner.remove_file(from)?;
+        let was_volatile = self.volatile.lock().unwrap().remove(from);
+        let was_lost = self.lost.lock().unwrap().remove(from);
+        if was_volatile {
+            self.volatile.lock().unwrap().insert(to.clone());
+        } else if was_lost {
+            self.lost.lock().unwrap().insert(to.clone());
+        } else {
+            self.renamed.lock().unwrap().insert(to.clone());
+        }
         Ok(())
     }
     fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool> {

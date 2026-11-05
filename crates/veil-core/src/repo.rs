@@ -7,7 +7,8 @@
 //! .veil/objects/ab/cdef…        content-addressed objects (shared)
 //! .veil/objects/pack/           packfiles written by `vl gc`
 //! .veil/objects/gc/             gc pending list and keep markers
-//! .veil/ops/<id>, op_head       operation log (local)
+//! .veil/ops/<id>                operation log (local)
+//! .veil/op_heads/<id>           its heads (format 6; `op_head` before)
 //! .veil/meta/keyrings/*.json    wrapped scope keys (shared, safe to publish)
 //! .veil/meta/embargoes/*.json   embargo records (shared)
 //! .veil/meta/vault/<scope>/     team-vault records (shared with team remotes)
@@ -32,7 +33,7 @@ use crate::{
     merge::{merge_trees, virtual_merge_base, MergeOutcome},
     now_millis,
     object::{Snapshot, Text},
-    oplog::{OpStore, Operation, View, WorkspaceState},
+    oplog::{OpStore, Operation, RawHeads, View, WorkspaceState},
     policy::DEFAULT_SCOPE,
     graph_index::GraphIndex,
     store::ObjectStore,
@@ -58,10 +59,11 @@ pub fn state_dir(root: &Path) -> std::path::PathBuf {
 /// | 3 | vl 1.0.0 | standard crypto: AES-SIV sealed objects (`veil:sea2`), HPKE-wrapped ring keys (ring format 3) |
 /// | 4 | vl 1.0.0 | first-class conflicts: conflict objects (`veil:conf`) and conflict tree entries |
 /// | 5 | vl 1.0.0 | symlink tree entries and conflict terms, annotated tags (`veil:atag`, `Tag::annotation`, `View::remote_release_tags`) |
+/// | 6 | vl 1.1.0 | the lock-free op log: `op_heads/`, `Operation::{workspace, rewritten}` |
 ///
 /// Every format up to this one is read; see `docs/FORMAT.md` and
 /// `docs/CRYPTO.md`.
-pub const REPO_FORMAT: u32 = 5;
+pub const REPO_FORMAT: u32 = 6;
 
 /// Oldest repository format this build reads (and keeps writing, unchanged,
 /// until `vl upgrade`).
@@ -72,6 +74,7 @@ pub fn min_vl_for_format(format: u32) -> &'static str {
     match format {
         0 | 1 => "0.1.0",
         2..=5 => "1.0.0",
+        6 => "1.1.0",
         _ => "a newer release",
     }
 }
@@ -158,6 +161,18 @@ pub struct Repo {
     pub(crate) root_id: ObjectId,
     /// The history index (`graph_index`): generations, to stop walks early.
     pub(crate) graph: GraphIndex,
+    /// The heads the view was read from (ancestors dropped, sorted): the
+    /// parents of the next operation.
+    pub(crate) base: Vec<ObjectId>,
+    /// The head files as read.
+    pub(crate) raw: RawHeads,
+    /// Opened as a remote ([`Repo::open_remote`]): transactions take the
+    /// repository lock, and several heads are merged in memory only.
+    pub(crate) remote: bool,
+    /// [`Repo::set_command_workspace`].
+    pub(crate) command_ws: Option<String>,
+    /// What merges of concurrent operations decided ([`Repo::take_warnings`]).
+    pub(crate) warnings: Vec<String>,
 }
 
 impl std::fmt::Debug for Repo {
@@ -174,6 +189,15 @@ pub(crate) fn config_path() -> VPath {
 /// a working copy. Remotes (bare, or over the network) compute it in memory.
 fn persists_index(backend: &dyn StorageBackend, view: &View) -> bool {
     !backend.is_network() && !view.workspaces.is_empty()
+}
+
+/// See `Repo::merge_plan`.
+pub(crate) struct MergePlan {
+    pub(crate) view: View,
+    rewritten: BTreeMap<ObjectId, Vec<ObjectId>>,
+    before: Vec<View>,
+    timestamp: i64,
+    warnings: Vec<String>,
 }
 
 pub fn is_repo(backend: &dyn StorageBackend) -> bool {
@@ -266,7 +290,7 @@ impl Repo {
         }
         let ops = OpStore::new(backend.clone());
         ops.set_format(format);
-        let op_id = ops.put(&Operation {
+        let op = Operation {
             parents: vec![],
             timestamp: now_millis(),
             user: user.to_string(),
@@ -275,8 +299,10 @@ impl Repo {
             manual_undo: None,
             undo_of: None,
             redo_of: None,
-        })?;
-        ops.set_head(&op_id)?;
+            workspace: None,
+            rewritten: Default::default(),
+        };
+        let op_id = ops.publish(&op, &RawHeads::default())?;
         // `repo.json` is what makes this a repository, so it is written last:
         // a crash before this point leaves no half-initialised repository.
         write_config(&*backend, &config)?;
@@ -291,10 +317,36 @@ impl Repo {
             view,
             user: user.to_string(),
             root_id,
+            base: vec![op_id],
+            raw: RawHeads {
+                all: vec![op_id],
+                legacy: None,
+            },
+            remote: bare,
+            command_ws: None,
+            warnings: Vec::new(),
         })
     }
 
+    /// Open the repository on `backend` as a project (or a bare repository
+    /// worked on directly). From format 6 its transactions take no lock;
+    /// staging left by dead processes is removed, and several heads (from
+    /// concurrent operations) are merged now, on disk, so that every command
+    /// sees one settled view.
     pub fn open(backend: Arc<dyn StorageBackend>, identity: Option<Identity>, user: &str) -> Result<Repo> {
+        Self::open_as(backend, identity, user, false)
+    }
+
+    /// Open the repository on `backend` as a remote: its transactions take
+    /// the repository lock (push, remote gc), as at every format, and its
+    /// single head is never merged on disk by a reader (several heads, which
+    /// only a lock-free writer working in the bare repository itself
+    /// leaves, are merged in memory, and by the next push under the lock).
+    pub fn open_remote(backend: Arc<dyn StorageBackend>) -> Result<Repo> {
+        Self::open_as(backend, None, "remote", true)
+    }
+
+    fn open_as(backend: Arc<dyn StorageBackend>, identity: Option<Identity>, user: &str, remote: bool) -> Result<Repo> {
         let config = read_config(&*backend)?;
         // Before reading anything else: a newer format is never
         // half-understood, and never rewritten by this build.
@@ -305,39 +357,213 @@ impl Repo {
         let root_id = store.put_snapshot(&Snapshot::root(store.empty_tree()?))?;
         let ops = OpStore::new(backend.clone());
         ops.set_format(config.format);
-        let op_id = ops.head()?;
-        let view = ops.get(&op_id)?.view;
-        let graph = GraphIndex::new(backend.clone(), persists_index(&*backend, &view));
-        Ok(Repo {
+        let graph = GraphIndex::new(backend.clone(), false);
+        let mut repo = Repo {
             graph,
             backend,
             store,
             ops,
             config,
-            op_id,
-            view,
+            op_id: root_id,
+            view: View::default(),
             user: user.to_string(),
             root_id,
-        })
+            base: Vec::new(),
+            raw: RawHeads::default(),
+            remote,
+            command_ws: None,
+            warnings: Vec::new(),
+        };
+        repo.read_heads()?;
+        repo.graph = GraphIndex::new(repo.backend.clone(), persists_index(&*repo.backend, &repo.view));
+        if repo.lock_free() {
+            // Best effort: what dead transactions staged is garbage.
+            let _ = repo.store.sweep_staging(&crate::lock::LockContext::default());
+            repo.settle()?;
+        }
+        Ok(repo)
     }
 
-    /// Re-read the operation head (another process or task may have moved it).
+    /// Transactions take no lock: format ≥ 6, opened as a project, not over
+    /// a network.
+    pub fn lock_free(&self) -> bool {
+        self.config.format >= crate::oplog::OP_HEADS_REPO_FORMAT && !self.remote && !self.backend.is_network()
+    }
+
+    /// New objects are staged per transaction (format ≥ 6, not over a
+    /// network, where the unsynced-object protocol and lock recovery stay).
+    pub(crate) fn stages_objects(&self) -> bool {
+        self.config.format >= crate::oplog::OP_HEADS_REPO_FORMAT && !self.backend.is_network()
+    }
+
+    /// Read the heads; with several, merge their views in memory (without
+    /// applying rewrites: [`Repo::settle`] does that on disk).
+    fn read_heads(&mut self) -> Result<bool> {
+        let raw = self.ops.raw_heads()?;
+        if raw == self.raw && !self.base.is_empty() {
+            return Ok(false);
+        }
+        let heads = self.ops.drop_ancestors(&raw.all)?;
+        let (op_id, view) = match heads.as_slice() {
+            [one] => (*one, self.ops.get(one)?.view),
+            _ => {
+                let plan = self.merge_plan(&heads, false)?;
+                (self.ops.head()?, plan.view)
+            }
+        };
+        self.raw = raw;
+        self.base = heads;
+        self.op_id = op_id;
+        self.view = view;
+        Ok(true)
+    }
+
+    /// Re-read the operation heads (another process or task may have
+    /// published since); from format 6, merge several.
     pub fn reload(&mut self) -> Result<()> {
-        let head = self.ops.head()?;
-        if head != self.op_id {
-            self.view = self.ops.get(&head)?.view;
-            self.op_id = head;
+        if self.read_heads()? {
             // Another process may have pulled a parent the index took as
             // missing.
             self.graph.revalidate(self);
+        }
+        if self.base.len() > 1 && self.lock_free() {
+            self.settle()?;
         }
         Ok(())
     }
 
     pub fn transaction(&mut self, description: impl Into<String>) -> Result<Transaction<'_>> {
+        if self.lock_free() {
+            self.reload()?;
+            return Transaction::new(self, description.into(), None);
+        }
         let lock = RepoLock::acquire(self.backend.clone())?;
         self.reload()?;
-        Ok(Transaction::new(self, description.into(), lock))
+        if self.base.len() > 1 {
+            self.settle()?;
+        }
+        Transaction::new(self, description.into(), Some(lock))
+    }
+
+    /// Merge the heads of the op log into one operation, as long as there
+    /// are several: a deterministic 3-way merge of their views against
+    /// their nearest common operation, applying each side's rewrites to
+    /// the other side's new snapshots, and never moving a change out of an
+    /// unreleased embargo (`Transaction::for_merge`). Two processes merging
+    /// the same heads write the same operation. Lock-free repositories do
+    /// this at open and before every transaction; what the merges decided
+    /// is in [`Repo::take_warnings`].
+    pub fn settle(&mut self) -> Result<()> {
+        for _ in 0..16 {
+            self.read_heads()?;
+            if self.base.len() < 2 {
+                return Ok(());
+            }
+            let heads = self.base.clone();
+            let stale = self.raw.clone();
+            let plan = self.merge_plan(&heads, true)?;
+            let tx = Transaction::for_merge(self, heads, stale, plan.view, plan.rewritten, plan.before, plan.timestamp, plan.warnings)?;
+            tx.commit()?;
+            self.graph.revalidate(self);
+        }
+        Ok(())
+    }
+
+    /// What merging `heads` (sorted) gives: folded in order, each against
+    /// the nearest common operation of those merged so far and the next.
+    /// With `rewrites`, also the sides' rewrites to apply, and the views a
+    /// change's embargo is judged in.
+    pub(crate) fn merge_plan(&self, heads: &[ObjectId], rewrites: bool) -> Result<MergePlan> {
+        let mut acc_heads = vec![heads[0]];
+        let first = self.ops.get(&heads[0])?;
+        let mut timestamp = first.timestamp;
+        let mut acc = first.view;
+        let mut before = vec![acc.clone()];
+        let mut warnings = Vec::new();
+        let mut rewritten: BTreeMap<ObjectId, Vec<ObjectId>> = BTreeMap::new();
+        let mut divergent: std::collections::BTreeSet<ObjectId> = Default::default();
+        for h in &heads[1..] {
+            let op = self.ops.get(h)?;
+            timestamp = timestamp.max(op.timestamp);
+            let split = self.ops.split(&acc_heads, &[*h])?;
+            let base = match split.base {
+                Some(b) => self.ops.try_get(&b)?.map(|o| o.view).unwrap_or_default(),
+                None => View::default(),
+            };
+            if rewrites {
+                for (ids, side) in [(&split.only_a, &acc), (&split.only_b, &op.view)] {
+                    let refs: std::collections::HashSet<ObjectId> = side.refs().into_iter().collect();
+                    // Oldest first: a later rewrite of a snapshot wins.
+                    let mut side_map: BTreeMap<ObjectId, Vec<ObjectId>> = BTreeMap::new();
+                    for id in ids.iter().rev() {
+                        if let Some(o) = self.ops.try_get(id)? {
+                            for (old, new) in o.rewritten {
+                                side_map.insert(old, new);
+                            }
+                        }
+                    }
+                    for (old, new) in side_map {
+                        // Undone on that side since (it shows `old` again).
+                        if refs.contains(&old) {
+                            continue;
+                        }
+                        match rewritten.get(&old) {
+                            Some(prev) if *prev != new => {
+                                divergent.insert(old);
+                            }
+                            _ => {
+                                rewritten.insert(old, new);
+                            }
+                        }
+                    }
+                }
+                before.push(base.clone());
+                before.push(op.view.clone());
+            }
+            let mut descends = |a: &ObjectId, b: &ObjectId| self.is_ancestor(b, a).unwrap_or(false);
+            let merged = crate::oplog::merge_views(&base, &[&acc, &op.view], &mut descends);
+            warnings.extend(merged.warnings);
+            acc = merged.view;
+            acc_heads.push(*h);
+        }
+        // Both sides rewrote it differently: a divergent change, both
+        // replacements stay visible and nothing follows either.
+        for d in divergent {
+            rewritten.remove(&d);
+        }
+        Ok(MergePlan {
+            view: acc,
+            rewritten,
+            before,
+            timestamp,
+            warnings,
+        })
+    }
+
+    /// Set the workspace the operations of this command are for
+    /// ([`crate::oplog::Operation::workspace`]): the attached one, or the
+    /// workspace a `ws exec`, `ws write` or mount works on. `None`: the
+    /// command is repository-wide.
+    pub fn set_command_workspace(&mut self, ws: Option<String>) {
+        self.command_ws = ws;
+    }
+
+    /// The workspace set by [`Repo::set_command_workspace`].
+    pub fn command_workspace(&self) -> Option<&str> {
+        self.command_ws.as_deref()
+    }
+
+    /// What merges of concurrent operations written by this handle decided
+    /// (a workspace or tag moved on two sides, a rewrite not applied), for
+    /// the user. Each merge's warnings are returned once.
+    pub fn take_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.warnings)
+    }
+
+    /// The current heads of the op log (one, unless concurrent operations
+    /// landed since this handle last settled).
+    pub fn heads(&self) -> &[ObjectId] {
+        &self.base
     }
 
     // ---- accessors -------------------------------------------------------
@@ -740,23 +966,14 @@ impl Repo {
         Ok(self.parents_tree(&s.parents)?.tree == s.tree)
     }
 
+    /// The newest `limit` operations the heads reach, newest first (by
+    /// timestamp, then id). A merge of concurrent operations is followed
+    /// by both sides; pruned operations end their branch.
     pub fn op_log(&self, limit: usize) -> Result<Vec<(ObjectId, Operation)>> {
-        let mut out = Vec::new();
-        let mut cur = Some(self.op_id);
-        while let Some(id) = cur {
-            if out.len() >= limit {
-                break;
-            }
-            // The current operation must exist; older ones may have been
-            // pruned by gc, which simply ends the log.
-            let op = match self.ops.try_get(&id)? {
-                Some(op) => op,
-                None if !out.is_empty() => break,
-                None => return Err(VeilError::NotFound(format!("operation {}", id.short()))),
-            };
-            cur = op.parents.first().copied();
-            out.push((id, op));
+        // The current operations must exist.
+        for h in &self.base {
+            self.ops.get(h)?;
         }
-        Ok(out)
+        self.ops.walk(&self.base).take(limit).collect()
     }
 }

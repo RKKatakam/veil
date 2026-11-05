@@ -729,21 +729,35 @@ struct Prefetched {
     loose: HashMap<ObjectId, Vec<u8>>,
 }
 
-/// Where a pull downloads the remote's packs: `objects/incoming/pull` of
-/// the local store, emptied before the download and when the pull ends
-/// (the pull holds the repository lock, so nothing else uses it). Never
+/// Where a pull downloads the remote's packs: `objects/incoming/pull-<owner>`
+/// of the local store, named after the pull's transaction (its staging
+/// owner, or an owner of its own), so that concurrent pulls never touch
+/// each other's spool (the transactions of format 6 take no lock). It is
+/// removed when the pull ends; one a dead pull left is removed by
+/// [`ObjectStore::sweep_staging`] once its owner is provably gone. Never
 /// scanned for objects: everything in it reaches the store only through
 /// [`Transfer`]'s checks.
 struct Spool {
     backend: Arc<dyn StorageBackend>,
     dir: VPath,
+    /// Registered while the spool is used, when the store has no
+    /// transaction staging to name it after.
+    _owner: Option<crate::lock::Owner>,
 }
 
 impl Spool {
     fn new(store: &ObjectStore) -> Spool {
+        let (tag, owner) = match store.tx_owner() {
+            Some(tag) => (tag, None),
+            None => {
+                let o = crate::lock::Owner::new();
+                (o.tag().to_string(), Some(o))
+            }
+        };
         Spool {
             backend: store.backend().clone(),
-            dir: store.root().join("incoming").join("pull"),
+            dir: store.root().join("incoming").join(&format!("{}{tag}", crate::store::PULL_SPOOL_PREFIX)),
+            _owner: owner,
         }
     }
 }
@@ -791,7 +805,6 @@ impl PullSource<'_> {
             })
             .collect();
         let (local, dir) = (&*self.spool.backend, &self.spool.dir);
-        local.remove_dir_all(dir)?; // an interrupted pull's
         let need: u64 = packs.iter().map(|&i| inv.packs[i].2.pack_len()).sum();
         if let Some(free) = local.available_space(self.local.root()).filter(|free| need > *free) {
             return Err(VeilError::repo(format!(
@@ -1283,6 +1296,7 @@ pub fn remove_remote(repo: &mut Repo, name: &str) -> Result<crate::repo::RemoteC
         .cloned()
         .ok_or_else(|| VeilError::repo(format!("no remote named '{name}'")))?;
     let mut tx = repo.transaction(format!("remove remote {name}"))?;
+    tx.repository_wide();
     let prefix = format!("{name}/");
     tx.view.remote_tags.retain(|k, _| !k.starts_with(&prefix));
     tx.manual_undo(format!(
@@ -1436,7 +1450,7 @@ pub fn delete_remote_tags(
         return Err(VeilError::NotFound(format!("Veil repository at remote '{remote_name}'")));
     }
     let deleted = deleted_tags(&**local.backend())?;
-    let mut remote = Repo::open(remote_backend, None, "remote")?;
+    let mut remote = Repo::open_remote(remote_backend)?;
     let mut report = SyncReport::default();
     let mut tx = remote.transaction(format!("delete tags from {}", local.repo_id()))?;
     for n in names {
@@ -1470,6 +1484,7 @@ pub fn delete_remote_tags(
     tx.commit()?;
     if !report.tags_deleted.is_empty() {
         let mut ltx = local.transaction(format!("delete tags on {remote_name}"))?;
+        ltx.repository_wide();
         for n in &report.tags_deleted {
             let key = format!("{remote_name}/{n}");
             if ltx.view.remote_tags.remove(&key).is_some() {
@@ -1792,6 +1807,7 @@ pub fn record_pushed_tags(local: &mut Repo, remote_name: &str, report: &SyncRepo
         return Ok(());
     }
     let mut tx = local.transaction(format!("push to {remote_name}"))?;
+    tx.repository_wide();
     for (name, target) in &report.remote_tags {
         tx.view.remote_tags.insert(format!("{remote_name}/{name}"), *target);
     }
@@ -1944,12 +1960,12 @@ fn unusable_target(store: &ObjectStore, target: &ObjectId) -> Result<Option<&'st
 fn open_or_init_remote(backend: &Arc<dyn StorageBackend>) -> Result<Repo> {
     let config = crate::repo::config_path();
     if backend.exists(&config)? {
-        return Repo::open(backend.clone(), None, "remote");
+        return Repo::open_remote(backend.clone());
     }
     refuse_foreign_directory(&**backend)?;
     let lock = crate::lock::RepoLock::acquire(backend.clone())?;
     let repo = if backend.exists(&config)? {
-        Repo::open(backend.clone(), None, "remote")
+        Repo::open_remote(backend.clone())
     } else {
         Repo::init_bare(backend.clone())
     };
@@ -1957,7 +1973,7 @@ fn open_or_init_remote(backend: &Arc<dyn StorageBackend>) -> Result<Repo> {
     match repo {
         // Initialised meanwhile by a client that did not take the lock
         // (an older version): push to it like to any other repository.
-        Err(VeilError::AlreadyExists(_)) => Repo::open(backend.clone(), None, "remote"),
+        Err(VeilError::AlreadyExists(_)) => Repo::open_remote(backend.clone()),
         r => r,
     }
 }
@@ -2008,10 +2024,11 @@ pub fn pull_with(
     if !is_repo(&*remote_backend) {
         return Err(VeilError::NotFound(format!("Veil repository at remote '{remote_name}'")));
     }
-    let remote = Repo::open(remote_backend.clone(), None, "remote")?;
+    let remote = Repo::open_remote(remote_backend.clone())?;
     let tags: Vec<(String, Tag)> = remote.view().tags.clone().into_iter().collect();
     // Under the local lock, like push (see there).
     let mut tx = local.transaction(format!("pull from {remote_name}"))?;
+    tx.repository_wide();
     let mut report = SyncReport::default();
     if opts.full {
         // Only snapshot targets are fetched; tags on anything else (missing,

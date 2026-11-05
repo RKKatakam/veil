@@ -587,7 +587,11 @@ pub fn tag_list(t: &TagList) {
 
 pub fn op_log(o: &OpLog) {
     for op in &o.operations {
-        println!("{} {} {} {}", blue(&op.op_short), dim(&fmt_time(op.timestamp_ms)), yellow(&safe(&op.user)), safe(&op.description));
+        let merges = match op.merges.is_empty() {
+            true => String::new(),
+            false => format!(" ({})", op.merges.join(", ")),
+        };
+        println!("{} {} {} {}{}", blue(&op.op_short), dim(&fmt_time(op.timestamp_ms)), yellow(&safe(&op.user)), safe(&op.description), dim(&merges));
     }
 }
 

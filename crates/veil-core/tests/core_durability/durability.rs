@@ -1,7 +1,10 @@
 //! The durability barrier (ARCHITECTURE §9): transactions write objects
 //! unsynced, sync them with one barrier, and only then write the operation
-//! and the operation head. A lock taken over from a dead holder first
-//! repairs what that holder may have left unsynced or torn.
+//! and the operation head. From format 6 the objects are staged in the
+//! transaction's own directory and renamed into place after the barrier,
+//! and a second barrier makes the renames durable before the operation.
+//! Formats ≤ 5: a lock taken over from a dead holder first repairs what
+//! that holder may have left unsynced or torn.
 
 use std::sync::{Arc, Mutex};
 
@@ -21,6 +24,8 @@ enum Call {
     Unsynced(String),
     Write(String),
     Barrier,
+    Rename(String),
+    CreateNew(String),
 }
 
 /// Records every mutation, in order.
@@ -56,7 +61,12 @@ impl StorageBackend for Recorder {
         self.inner.sync_barrier()
     }
     fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool> {
+        self.calls.lock().unwrap().push(Call::CreateNew(path.to_string()));
         self.inner.create_new(path, data)
+    }
+    fn rename_unsynced(&self, from: &VPath, to: &VPath) -> Result<()> {
+        self.calls.lock().unwrap().push(Call::Rename(to.to_string()));
+        self.inner.rename_unsynced(from, to)
     }
     fn remove_file(&self, path: &VPath) -> Result<()> {
         self.inner.remove_file(path)
@@ -84,21 +94,42 @@ impl StorageBackend for Recorder {
     }
 }
 
-/// Objects are written unsynced, then one barrier, then the operation, then
-/// the head; no unsynced write follows the barrier.
-fn assert_ordered(calls: &[Call], what: &str) {
+/// Formats ≤ 5: objects are written unsynced, then one barrier, then the
+/// operation, then the head; no unsynced write follows the barrier.
+/// Format 6: objects are written unsynced into the transaction's staging
+/// directory, one barrier, renamed into place, a second barrier, then the
+/// operation and its head file.
+fn assert_ordered(calls: &[Call], what: &str, format: u32) {
     let pos = |pred: &dyn Fn(&Call) -> bool| calls.iter().position(pred);
     let op = pos(&|c| matches!(c, Call::Write(p) if p.starts_with(".veil/ops/")))
         .unwrap_or_else(|| panic!("{what}: no op written: {calls:?}"));
-    let head = pos(&|c| matches!(c, Call::Write(p) if p == ".veil/op_head")).expect("head written");
+    let head = match format {
+        6 => pos(&|c| matches!(c, Call::CreateNew(p) if p.starts_with(".veil/op_heads/"))).expect("head file created"),
+        _ => pos(&|c| matches!(c, Call::Write(p) if p == ".veil/op_head")).expect("head written"),
+    };
     let barrier = calls[..op]
         .iter()
         .rposition(|c| *c == Call::Barrier)
         .unwrap_or_else(|| panic!("{what}: no barrier before the op: {calls:?}"));
     let unsynced: Vec<usize> = (0..calls.len()).filter(|i| matches!(calls[*i], Call::Unsynced(_))).collect();
     assert!(!unsynced.is_empty(), "{what}: objects were written durably one by one");
-    assert!(unsynced.iter().all(|i| *i < barrier), "{what}: unsynced write after the barrier: {calls:?}");
     assert!(barrier < op && op < head, "{what}: order is objects, barrier, op, head: {calls:?}");
+    if format == 6 {
+        let renames: Vec<usize> = (0..calls.len()).filter(|i| matches!(calls[*i], Call::Rename(_))).collect();
+        let first_barrier = calls.iter().position(|c| *c == Call::Barrier).unwrap();
+        assert!(!renames.is_empty(), "{what}: nothing published: {calls:?}");
+        assert!(unsynced.iter().all(|i| *i < first_barrier), "{what}: unsynced write after the staging barrier: {calls:?}");
+        assert!(renames.iter().all(|i| *i > first_barrier && *i < barrier), "{what}: renames between the barriers: {calls:?}");
+        for c in calls {
+            match c {
+                Call::Unsynced(p) => assert!(p.starts_with(".veil/objects/incoming/tx-"), "{what}: staged outside the transaction's directory ({p})"),
+                Call::Rename(p) => assert!(p.starts_with(".veil/objects/") && !p.contains("incoming"), "{what}: renamed to {p}"),
+                _ => {}
+            }
+        }
+        return;
+    }
+    assert!(unsynced.iter().all(|i| *i < barrier), "{what}: unsynced write after the barrier: {calls:?}");
     for c in calls {
         if let Call::Unsynced(p) = c {
             assert!(p.starts_with(".veil/objects/"), "{what}: only objects are written unsynced ({p})");
@@ -109,22 +140,28 @@ fn assert_ordered(calls: &[Call], what: &str) {
 #[test]
 fn transactions_sync_objects_once_before_the_operation() {
     let tmp = tempfile::tempdir().unwrap();
-    for inner in [
-        Arc::new(MemoryBackend::new()) as Arc<dyn StorageBackend>,
-        Arc::new(DiskBackend::new(tmp.path())),
-    ] {
+    for (n, (format, inner)) in [
+        (5, Arc::new(MemoryBackend::new()) as Arc<dyn StorageBackend>),
+        (5, Arc::new(DiskBackend::new(tmp.path().join("5"))) as Arc<dyn StorageBackend>),
+        (6, Arc::new(MemoryBackend::new()) as Arc<dyn StorageBackend>),
+        (6, Arc::new(DiskBackend::new(tmp.path().join("6"))) as Arc<dyn StorageBackend>),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let _ = n;
         let rec = Arc::new(Recorder {
             inner: inner.clone(),
             calls: Mutex::default(),
         });
         let id = Identity::generate("alice");
-        let mut repo = Repo::init(rec.clone(), Some(id.clone()), "alice").unwrap();
+        let mut repo = Repo::init_for_clone_at(rec.clone(), Some(id.clone()), "alice", format).unwrap();
         for i in 0..50 {
             inner.write(&p(&format!("src/d{}/f{i}.txt", i % 5)), format!("{i}\n").as_bytes()).unwrap();
         }
         rec.take();
         repo.snapshot_workspace("default", &*inner).unwrap();
-        assert_ordered(&rec.take(), "snapshot");
+        assert_ordered(&rec.take(), "snapshot", format);
         let (c, _) = repo.commit_working_copy("default", "c").unwrap();
         repo.set_tag("main", c, None, false).unwrap();
 
@@ -133,10 +170,10 @@ fn transactions_sync_objects_once_before_the_operation() {
             inner: Arc::new(MemoryBackend::new()),
             calls: Mutex::default(),
         });
-        let mut clone = Repo::init_for_clone(clone_fs.clone(), Some(id.clone()), "alice").unwrap();
+        let mut clone = Repo::init_for_clone_at(clone_fs.clone(), Some(id.clone()), "alice", format).unwrap();
         clone_fs.take();
         remote::pull(&mut clone, "origin", rec.clone()).unwrap();
-        assert_ordered(&clone_fs.take(), "pull");
+        assert_ordered(&clone_fs.take(), "pull", format);
         assert_eq!(clone.view().tags["main"].target, c);
     }
 }
@@ -203,7 +240,9 @@ fn taking_over_a_crashed_lock_discards_torn_objects() {
     let tmp = tempfile::tempdir().unwrap();
     let fs: Arc<dyn StorageBackend> = Arc::new(DiskBackend::new(tmp.path()));
     let id = Identity::generate("alice");
-    let mut repo = Repo::init(fs.clone(), Some(id.clone()), "alice").unwrap();
+    // The unsynced-object protocol and its recovery: formats ≤ 5 (and
+    // network remotes); format 6 stages objects instead.
+    let mut repo = Repo::init_for_clone_at(fs.clone(), Some(id.clone()), "alice", 5).unwrap();
     let good = repo.store().put(&veil_core::object::Object::Blob(b"kept".to_vec())).unwrap();
     let torn = ObjectId::hash(b"some object the dead holder was writing");
     let torn_path = p(&format!(".veil/objects/{}/{}", &torn.hex()[..2], &torn.hex()[2..]));
@@ -375,7 +414,8 @@ fn pulled_packs_are_published_before_their_index_and_the_operation() {
     let op = pos(&|c| matches!(c, Call::Write(p) if p.starts_with(".veil/ops/")));
     assert!(barrier < idx && idx < op, "{calls:?}");
     assert!(!calls.iter().any(|c| matches!(c, Call::Write(p) | Call::Unsynced(p) if p.ends_with(".pack"))), "the pack is streamed: {calls:?}");
-    assert!(!tmp.path().join("b/.veil/objects/incoming/pull").exists(), "the spool is removed");
+    let incoming: Vec<String> = std::fs::read_dir(tmp.path().join("b/.veil/objects/incoming")).map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+    assert!(incoming.is_empty(), "the spool and the staging are removed: {incoming:?}");
     let packs: Vec<String> = std::fs::read_dir(tmp.path().join("b/.veil/objects/pack")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
     assert_eq!(packs.len(), 2, "{packs:?}");
     assert_eq!(clone.view().tags["main"].target, c);
