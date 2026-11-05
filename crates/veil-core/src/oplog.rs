@@ -695,8 +695,15 @@ fn merge_views_with(base: &View, sides: &[&View], first_wins: bool, descends: &m
         let vals: Vec<Option<&Tag>> = sides.iter().map(|s| s.tags.get(name)).collect();
         let unit = |t: &Tag| (t.target, t.annotation);
         let Some((mut winner, lost)) = pick(b.map(unit), vals.iter().map(|v| v.map(unit)).collect(), first_wins) else { continue };
+        // A release tag (annotated) is immutable: it wins over an ordinary
+        // tag made concurrently under its name, and the first of two wins.
+        if winner.1.is_none() {
+            if let Some(a) = lost.iter().find(|u| u.1.is_some()) {
+                winner = *a;
+            }
+        }
         // Two moves of an ordinary tag: a target descending from the
-        // other wins. A release tag (annotated) is immutable: the first.
+        // other wins.
         if winner.1.is_none() {
             for u in &lost {
                 if u.1.is_none() && descends(&u.0, &winner.0) {

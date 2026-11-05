@@ -160,6 +160,10 @@ struct TxStaging {
     /// Fan-out directories (`ab`) holding an object this transaction found
     /// already published instead of writing it: synced at publication.
     present: std::collections::BTreeSet<String>,
+    /// The backend's failed barriers when the staging began: one failing
+    /// since (another transaction's, on a shared backend value) may have
+    /// covered these writes, which are then void.
+    failures_at: u64,
 }
 
 /// The prefix of transaction staging directories under `<root>/incoming/`.
@@ -451,6 +455,7 @@ impl ObjectStore {
             owner: owner.to_string(),
             staged: HashSet::new(),
             present: Default::default(),
+            failures_at: self.backend.barrier_failures(),
         });
         Ok(())
     }
@@ -488,6 +493,14 @@ impl ObjectStore {
         if let Err(e) = self.backend.sync_barrier() {
             self.drop_staging_dir(&t.dir);
             return Err(e);
+        }
+        if self.backend.barrier_failures() != t.failures_at {
+            // A barrier failed meanwhile, possibly over our writes.
+            self.drop_staging_dir(&t.dir);
+            return Err(VeilError::Io {
+                path: t.dir.to_string(),
+                source: std::io::Error::other("a write barrier failed while this command ran; its writes may not be on disk: run it again"),
+            });
         }
         let res = (|| -> Result<()> {
             let mut staged: Vec<&ObjectId> = t.staged.iter().collect();

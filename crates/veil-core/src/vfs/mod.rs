@@ -328,6 +328,16 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
         self.remove_file(from)
     }
 
+    /// How many [`StorageBackend::sync_barrier`] calls on this value failed
+    /// so far. A barrier syncs every unsynced write made through this value,
+    /// whoever made it: a transaction whose writes overlapped a failed
+    /// barrier (another transaction's, on a shared value) treats them as
+    /// lost, as the failed caller does. Backends whose barriers never fail
+    /// keep the default.
+    fn barrier_failures(&self) -> u64 {
+        0
+    }
+
     /// Make directory `dir`'s entries part of the next
     /// [`StorageBackend::sync_barrier`]: a name another process created
     /// there (a rename not yet synced) becomes durable before anything

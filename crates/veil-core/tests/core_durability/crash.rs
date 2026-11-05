@@ -1142,3 +1142,64 @@ fn crash_during_upgrade_from_format_1() {
 fn crash_during_upgrade_from_format_2() {
     upgrade_sweep(2);
 }
+
+/// The lock-free op log (format 6, threat 6): two heads left by concurrent
+/// operations (an amend on one side, a child of the amended change on the
+/// other), merged by the next `Repo::open`, which writes rebased snapshots
+/// (staged, renamed into place), the merge operation and its head file. A
+/// crash at any mutation, in every mode, leaves a repository that opens
+/// and passes `fsck`, with both sides' work and both heads or the merge,
+/// never half of it; the next open completes the merge.
+#[test]
+fn crash_during_settle() {
+    use crate::oplog_concurrency::{head_files, land};
+    let id = Identity::generate("alice");
+    let disk = Arc::new(MemoryBackend::new());
+    let mut repo = Repo::init(disk.clone(), Some(id.clone()), "alice").unwrap();
+    let wc = MemoryBackend::new();
+    wc.write(&p("f"), b"1\n").unwrap();
+    repo.snapshot_workspace(WS, &wc).unwrap();
+    let (x, _) = repo.commit_working_copy(WS, "x").unwrap();
+    drop(repo);
+    let heads = head_files(&*disk);
+    let (fa, fb) = (Arc::new(disk.fork()), Arc::new(disk.fork()));
+    Repo::open(fa.clone(), Some(id.clone()), "alice").unwrap().describe(x, "x, amended").unwrap();
+    let mut b = Repo::open(fb.clone(), Some(id.clone()), "alice").unwrap();
+    b.create_workspace("side", vec![x], None).unwrap();
+    b.set_tag("from-b", x, None, false).unwrap();
+    drop(b);
+    land(&disk, &fa, &heads);
+    land(&disk, &fb, &heads);
+    let two = head_files(&*disk);
+    assert_eq!(two.len(), 2);
+    let check = |fs: Arc<dyn StorageBackend>, ctx: &str| {
+        let r = Repo::open(fs.clone(), Some(id.clone()), "alice").unwrap_or_else(|e| panic!("{ctx}: does not open: {e}"));
+        assert_healthy(fs.clone(), &id, ctx);
+        assert!(r.view().tags.contains_key("from-b"), "{ctx}: B's tag was lost");
+        let side = r.snapshot(&r.workspace_wc("side").unwrap()).unwrap();
+        let parent = r.snapshot(&side.parents[0]).unwrap();
+        assert_eq!(r.description(&parent), "x, amended", "{ctx}: the child is not on the amended change");
+        assert_eq!(r.heads().len(), 1, "{ctx}");
+    };
+    let mut crashes = 0;
+    for mode in [Crash::BeforeWrite, Crash::AfterWrite, Crash::PowerLoss] {
+        for budget in 0..10_000 {
+            let fork = Arc::new(disk.fork());
+            let faulty = Arc::new(FaultyBackend::new(fork.clone(), budget, mode));
+            let ctx = format!("settle: {mode:?} after {budget} writes");
+            let res = Repo::open(faulty.clone(), Some(id.clone()), "alice");
+            if res.is_ok() && !faulty.crashed() {
+                check(fork.clone(), &ctx);
+                break;
+            }
+            crashes += 1;
+            // Reboot: the heads are both originals, or the merge (with
+            // the head file of a parent it had not removed yet, which is
+            // its ancestor and dropped by readers).
+            let now = head_files(&*fork);
+            assert!(now.len() <= 3 && now.iter().filter(|h| !two.contains(*h)).count() <= 1, "{ctx}: heads {now:?}");
+            check(fork.clone(), &ctx);
+        }
+    }
+    assert!(crashes >= 3, "too few crash points ({crashes})");
+}

@@ -1418,6 +1418,14 @@ impl Drop for Owner {
     }
 }
 
+/// The tag an [`Owner`] of process `pid` (started at `start`, 0 if
+/// unknown) on `host` would have at `ms`: for tests that simulate other
+/// processes and machines.
+#[doc(hidden)]
+pub fn owner_tag(host: &HostIdentity, pid: u32, start: u64, ms: i64) -> String {
+    format!("{}-{}-{pid}-{start}-{ms}-00000000", short_hash(&host.host), short_hash(&host.boot))
+}
+
 /// Whether the owner named by `tag` ([`Owner`]) is provably gone, by the
 /// lock's takeover rules:
 /// * this process (same host, boot, namespace, pid and start time): gone

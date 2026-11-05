@@ -45,6 +45,8 @@ use crate::{
 pub struct DiskBackend {
     root: PathBuf,
     unsynced: Arc<Mutex<Unsynced>>,
+    /// Barriers that failed so far ([`StorageBackend::barrier_failures`]).
+    failures: Arc<std::sync::atomic::AtomicU64>,
     /// Serialises barriers (see [`StorageBackend::sync_barrier`]).
     barrier: Arc<Mutex<()>>,
     /// Probed lazily; only a definite answer is cached.
@@ -125,6 +127,7 @@ impl DiskBackend {
         DiskBackend {
             root: root.into(),
             unsynced: Arc::default(),
+            failures: Arc::default(),
             barrier: Arc::default(),
             folding: Arc::default(),
         }
@@ -876,6 +879,10 @@ impl StorageBackend for DiskBackend {
         Ok(())
     }
 
+    fn barrier_failures(&self) -> u64 {
+        self.failures.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn sync_dir_later(&self, dir: &VPath) -> Result<()> {
         if !Self::own_path(dir) {
             return Ok(());
@@ -914,6 +921,7 @@ impl StorageBackend for DiskBackend {
             // must rewrite or remove those files; the object store does
             // (`ObjectStore::sync_barrier`). Nothing that depends on them may
             // be written by the caller, which gets the error.
+            self.failures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut u = self.unsynced.lock().unwrap_or_else(|e| e.into_inner());
             u.files.extend(batch.files);
             u.dirs.extend(batch.dirs);
