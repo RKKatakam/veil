@@ -289,3 +289,26 @@ Rows under "local, packed store" come after `gc`. RSS floor: 16 MiB.
 | 64 | 397 | 1 | 1.82 / 11.30 s |
 
 **Spread.** Runs whose spread is above 15 % (⚠) are sub-0.1 s commands, timed beside other agents' builds. Gate 4 should compare medians of 5 runs, on a quiet machine.
+
+## After stream O (lock-free op log), `small`
+
+`scripts/bench-scale.sh small`, seed 1, branch `scale-o-oplog` @ 1f43144 (format 6), same machine (32 CPUs, ext4, warm cache), 2026-11-05. Full table: `.scratch/bench-results/small-seed1-20261105T083320Z.md` of that worktree (not kept).
+
+**Gate 1 (no `.veil/lock` waits in the N-agents profile): passes.** Every command of every agent, at N = 4, 16 and 64, waited 0 ms for `.veil/lock` and held it 0 ms (traced runs); no iteration failed and none was retried.
+
+| N agents (`small`, 10 iterations) | landings / min | failures | retries | exec p50 / p95 | push p50 / p95 | iteration p50 / p95 | before (5 iterations) |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 4 | **959** | 0 | 0 | 0.09 / 0.14 s | 0.07 / 0.13 s | 0.23 / 0.32 s | 336 / min, 0 failures |
+| 16 | **1,058** | 0 | 0 | 0.29 / 0.48 s | 0.28 / 0.37 s | 0.88 / 1.14 s | 416 / min, 0 failures |
+| 64 | **647** | 0 | 0 | 2.93 / 4.41 s | 1.07 / 2.71 s | 5.68 / 8.22 s | 397 / min, 1 failure |
+
+Lock time in the traced repetition (2 iterations each, sums over all commands):
+
+| N | command | `.veil/lock` wait / hold | remote lock wait | remote lock hold (max) |
+|---:|---|---:|---:|---:|
+| 4 | exec / tag / push | 0 / 0 ms | 0 | 78 ms (11 ms) |
+| 16 | exec / tag / push | 0 / 0 ms | 0 | 601 ms (31 ms) |
+| 64 | exec / tag / push | 0 / 0 ms | 511 ms | 7,038 ms (98 ms) |
+
+- **Throughput is no longer flat**: 2.5–2.9× the baseline at N = 4–16. At N = 64 (twice the CPU count) it drops to 647 a minute: CPU-bound agents plus the remote's lock, now the only shared lock (its waits appear at N = 64, 511 ms in all; each hold is at most 98 ms traced). Stream P (lock-free pushes) owns that.
+- **Single-command cases** are unchanged within noise (`status, clean` 0.089 s loose / 0.021 s packed; `tag set` 0.024 s; `commit, 100 modified files` 0.081 s), and the "local lock held" column is empty: no local command took `.veil/lock`.
