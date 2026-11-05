@@ -2796,6 +2796,15 @@ pruned. Reading every object costs about 2.3 µs each loose and 6.5 µs each
 packed, with a warm page cache. The packed cost is zstd decompression, the
 BLAKE3 verification that loose reads skip, and the loose-first probe.
 
+**The scale benchmark** (`crates/veil-bench`, run by `scripts/bench-scale.sh`;
+not a default workspace member, so the normal build and tests skip it)
+generates a seeded repository of 100 MB to 5 GB with a realistic history
+(merges, renames, cloaked scopes, an embargo), times every everyday command
+as a separate release `vl` process with its peak RSS, runs N concurrent
+agents, and counts snapshot decodes and lock waits from an `strace` of the
+command. Its design is `docs/design/scale/9-scale-benchmark.md`; the
+numbers at 1 GB, and what they rank, are in `docs/design/scale/BASELINE.md`.
+
 ## 11. Git interop (`git/`)
 
 Teams keep GitHub or GitLab, their CI and their code review: Veil tags

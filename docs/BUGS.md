@@ -1112,3 +1112,12 @@ flag only when all of the following hold, each with its test passing:
 
 The medium findings (BUG-747, 752, 753, 754) should be fixed or plainly
 documented as leaks in the guide, not as recoverable limitations.
+
+## Findings from the scale round (benchmark baseline)
+
+Baseline: `integration` @ `b549e1e`, measured by `crates/veil-bench` (`scripts/bench-scale.sh 1g`). Numbers and causes: `docs/design/scale/BASELINE.md`.
+
+| ID | Sev. | Area | Finding | Root cause | Reproducing tests |
+|---|---|---|---|---|---|
+| BUG-800 | medium | store / memory | **Memory grows with the store.** At 1 GB, `vl clone` peaks at 1.98 GB RSS, `vl gc` at 1.0 GB, `vl pull` of one snapshot at 950 MB, and `vl pull` with nothing new at 560 MB. Each is over the scale gate's 512 MiB, and they grow linearly with the store. Reading every object of a 117 MiB store in 4 packs grows RSS by 117 MiB. | `crates/veil-core/src/pack.rs:415` (`Pack::whole`) keeps a whole pack in memory once it has served 64 reads (`SLURP_AFTER`), for any pack of at most 256 MiB (`SLURP_LIMIT`). The limit is per pack, and nothing bounds the total, so any history walk (pull, clone, gc, log) ends up holding every pack. Suggested fix: one store-wide budget for slurped packs (LRU), or ranged reads only. | `crates/veil-core/tests/scale_findings.rs::reading_every_pack_does_not_hold_the_whole_store_in_memory` |
+| BUG-801 | medium | locking / concurrency | **Concurrent commands fail instead of queueing.** Every `vl` command holds `.veil/lock` while it records the project directory. With enough commands at once, contenders give up after 15 s with `repository is locked: another process holds the lock`. The 64-agent profile at 1 GB failed 194 of 640 iterations (`ws exec`, `tag set` and `push` alike), and 64 concurrent `vl status` on 20,000 files fail 15 times. Nothing is lost, but agents and editors see random failures. | `crates/veil-core/src/workspace.rs:280` (`Repo::snapshot_workspace_with` opens its transaction, which takes the lock, before `build_tree_cached` scans the working copy at `:312`), together with `crates/veil-core/src/lock.rs:197` (`LockOptions::default().wait` = 15 s; polling with back-off, no fairness). The scale round's stream O (lock-free op log, compare-and-swap snapshot) removes the cause; a longer or fair wait would only hide it. | `crates/vl/tests/scale_findings_cli.rs::many_concurrent_commands_all_succeed` |

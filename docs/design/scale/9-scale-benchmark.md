@@ -1,6 +1,6 @@
 # 9. The scale benchmark
 
-Status: design (Scion 6.6, and the backlog's "Scale benchmark at 1 GB and ~5 GB"). **It is built first:** its baseline on `integration` @ 4a62259 ranks the other streams, and its gates decide when phase 0 is done.
+Status: harness built (`crates/veil-bench`, `scripts/bench-scale.sh`); the 1 GB baseline on b549e1e is in [`BASELINE.md`](BASELINE.md). The trace hooks below are not built: the harness counts snapshot decodes and lock waits from an `strace` of each command instead (Scion 6.6, and the backlog's "Scale benchmark at 1 GB and ~5 GB"). **It is built first:** its baseline on `integration` @ 4a62259 ranks the other streams, and its gates decide when phase 0 is done.
 
 ## Design sketch
 
