@@ -184,6 +184,39 @@ fn a_repository_around_a_mount_never_records_it() {
     assert!(!files(&env, "alice", &secret, "view@").is_empty(), "{out}");
 }
 
+/// Maintenance threat 13 (scale stream G2): `gc --keep-ops-days 0
+/// --prune-now` while a workspace is mounted and another keeps its sandbox
+/// between runs. The mount keeps serving and recording, the sandbox keeps
+/// working (rebuilt at most), and nothing either recorded is lost.
+#[test]
+fn gc_beside_a_mount_and_a_kept_sandbox_breaks_neither() {
+    if !fuse_available() {
+        return;
+    }
+    let env = Env::new();
+    let proj = env.dir("proj");
+    write(&proj, "a.txt", "a\n");
+    env.ok("alice", &proj, &["init"]);
+    env.ok("alice", &proj, &["commit", "-m", "initial"]);
+    env.ok("alice", &proj, &["ws", "new", "view", "-r", "@-"]);
+    env.ok("alice", &proj, &["ws", "new", "agent", "-r", "@-"]);
+    env.ok("alice", &proj, &["ws", "exec", "agent", "-m", "one", "--", "sh", "-c", "echo one > one.txt"]);
+    let mnt = env.dir("mnt");
+    let _g = mount_at(&env, "alice", &proj, "view", &mnt);
+    write(&mnt, "mounted.txt", "from the mount\n");
+    env.ok("alice", &proj, &["gc", "--keep-ops-days", "0", "--prune-now"]);
+    write(&mnt, "after.txt", "after gc\n");
+    assert_eq!(read(&mnt, "a.txt"), "a\n");
+    assert_eq!(read(&mnt, "mounted.txt"), "from the mount\n");
+    env.ok("alice", &proj, &["ws", "exec", "agent", "-m", "two", "--", "sh", "-c", "cat one.txt > two.txt"]);
+    env.ok("alice", &proj, &["gc", "--keep-ops-days", "0", "--prune-now"]);
+    env.ok("alice", &proj, &["ws", "unmount", "view"]);
+    let view = files(&env, "alice", &proj, "view@");
+    assert!(view.contains(&"mounted.txt".to_string()) && view.contains(&"after.txt".to_string()), "{view:?}");
+    assert_eq!(env.ok("alice", &proj, &["ws", "cat", "agent", "two.txt"]), "one\n");
+    env.ok("alice", &proj, &["fsck"]);
+}
+
 /// The mountpoint is refused inside any repository: this one, another
 /// one, a nested one, at any depth.
 #[test]

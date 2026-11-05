@@ -644,8 +644,10 @@ pub enum Cmd {
         /// Minutes an object must have been unreachable before deletion.
         #[arg(long, value_name = "MINUTES", default_value_t = 60.0)]
         grace_minutes: f64,
-        /// Delete unreachable objects now (grace period 0). Unsafe while
-        /// another `vl` process is running.
+        /// Delete unreachable objects now (grace period 0). Safe beside
+        /// running `vl` commands: gc deletes only while none of them is
+        /// recording, and one that reuses a deleted object asks to be run
+        /// again.
         #[arg(long)]
         prune_now: bool,
         /// zstd compression level for packed objects.
@@ -654,6 +656,14 @@ pub enum Cmd {
         /// Do not delta-compress successive versions of a file.
         #[arg(long)]
         no_deltas: bool,
+        /// Run as background maintenance does (`vl` starts it after a
+        /// command when the store needs it; `VEIL_GC_AUTO=0` turns that
+        /// off, and so does `CI` unless `VEIL_GC_AUTO=1`): pack loose
+        /// objects older than 10 minutes, merge small packs, and prune
+        /// only after a week or 10,000 rewritten snapshots. Exits at once
+        /// if another gc is running.
+        #[arg(long, conflicts_with_all = ["keep_ops_days", "prune_now"])]
+        auto: bool,
     },
     /// Check this machine's setup and explain every problem found: identity,
     /// VEIL_HOME, the repository and its lock, the stat cache, the

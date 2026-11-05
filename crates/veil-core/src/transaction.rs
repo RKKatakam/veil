@@ -92,20 +92,42 @@ pub struct Transaction<'r> {
     started: i64,
     /// New objects go to a staging directory (format 6, not over a network).
     staging: bool,
-    /// Registered for as long as the staging directory is in use.
-    owner: Option<crate::lock::Owner>,
+    /// Registered for gc's deletion fence (and naming the staging
+    /// directory) until the transaction ends (BUG-811,
+    /// [`crate::maintenance`]).
+    reg: Option<crate::maintenance::Registration>,
+    /// gc deleted objects since the command last read its view: check at
+    /// commit that what this transaction brought in is still there.
+    pub(crate) check_carried: bool,
     merge: Option<MergeCtx>,
     done: bool,
 }
 
 impl<'r> Transaction<'r> {
     pub(crate) fn new(repo: &'r mut Repo, description: String, lock: Option<RepoLock>) -> Result<Self> {
+        Self::registered(repo, description, lock, None)
+    }
+
+    /// [`Transaction::new`], registered (if it stages objects) by `reg`,
+    /// taken before the caller read the heads it starts from.
+    pub(crate) fn registered(
+        repo: &'r mut Repo,
+        description: String,
+        lock: Option<RepoLock>,
+        reg: Option<crate::maintenance::Registration>,
+    ) -> Result<Self> {
         let staging = repo.stages_objects();
-        let owner = match staging {
+        let reg = match staging {
             true => {
-                let owner = crate::lock::Owner::new();
-                repo.store.begin_tx_staging(owner.tag())?;
-                Some(owner)
+                let reg = match reg {
+                    Some(r) => r,
+                    None => crate::maintenance::Registration::enter(&repo.store)?,
+                };
+                // Packs gc removed before we registered may still be in
+                // this process's list: a presence check must not trust it.
+                repo.store.refresh_packs()?;
+                repo.store.begin_tx_staging(reg.tag())?;
+                Some(reg)
             }
             // Objects are written unsynced and made durable by one barrier
             // in `commit` (or `drop`), before the operation that references
@@ -134,7 +156,8 @@ impl<'r> Transaction<'r> {
             workspace,
             expected: Vec::new(),
             staging,
-            owner,
+            reg,
+            check_carried: false,
             merge: None,
             done: false,
         })
@@ -860,14 +883,23 @@ impl<'r> Transaction<'r> {
 
     /// Every pre-existing object this transaction's new objects and view
     /// reference, freshened for gc (threat 14). An object that is gone
-    /// fails the commit: the operation would reference nothing.
-    fn freshen_references(&self) -> Result<()> {
+    /// fails the commit: the operation would reference nothing. With
+    /// `all` false, only what the view gained and what the new objects
+    /// name: everything else is the base view's, which gc's deletion
+    /// fence keeps (BUG-811), but an id this command carried from an
+    /// older view may be gone.
+    fn freshen_references(&self, all: bool) -> Result<()> {
         let store = &self.repo.store;
         let staged: std::collections::HashSet<ObjectId> = store.tx_staged().into_iter().collect();
         let mut refs: Vec<ObjectId> = self.view.refs();
         refs.extend(self.view.annotations());
-        for id in &staged {
-            match store.get(id)? {
+        if !all {
+            let mut before: std::collections::HashSet<ObjectId> = self.start_view.refs().into_iter().collect();
+            before.extend(self.start_view.annotations());
+            refs.retain(|r| !before.contains(r));
+        }
+        for id in store.tx_staged_naming() {
+            match store.get(&id)? {
                 crate::object::Object::Snapshot(s) => {
                     refs.push(s.tree);
                     refs.extend(s.parents.iter().copied());
@@ -878,6 +910,8 @@ impl<'r> Transaction<'r> {
                         refs.extend(e.fallback);
                     }
                 }
+                crate::object::Object::Conflict(c) => refs.extend(c.referenced_ids()),
+                crate::object::Object::Atag(a) => refs.push(a.target),
                 _ => {}
             }
         }
@@ -958,8 +992,12 @@ impl<'r> Transaction<'r> {
             self.check_confinement()?;
         }
         if self.staging {
-            if now_millis() - self.started > FRESHEN_AFTER_MS {
-                self.freshen_references()?;
+            // A long transaction freshens everything it references (gc's
+            // grace period); one that gc deleted objects under checks what
+            // it brought in (an id from an older view).
+            let long = now_millis() - self.started > FRESHEN_AFTER_MS;
+            if long || self.check_carried {
+                self.freshen_references(long)?;
             }
             // Durability barrier, then publication: every object this
             // transaction wrote is on stable storage, under its final name,
@@ -1079,7 +1117,7 @@ impl Drop for Transaction<'_> {
             if !self.done {
                 let _ = self.repo.store.publish_tx_staging();
             }
-            self.owner.take();
+            self.reg.take();
             return;
         }
         self.repo.store.end_unsynced();

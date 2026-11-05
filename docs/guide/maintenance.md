@@ -10,8 +10,9 @@
 
 ## `vl gc`
 
-Packs loose objects into one compressed pack (with deltas between versions
-of a file) and deletes objects nothing references any more.
+Deletes objects nothing references any more, packs the loose objects into
+a compressed pack (with deltas between versions of a file), and merges
+small packs.
 
 ```text
 $ vl gc
@@ -38,13 +39,19 @@ Storage: 0.02 MiB -> 0.01 MiB
   unreachable for the grace period (`--grace-minutes`, default 60), so a
   `vl` command running at the same time is never affected. `pending
   deletion` counts them.
-* `--prune-now` deletes them at once. Only use it when no other `vl`
-  process is running on the repository.
+* `--prune-now` deletes them at once. It is safe beside running `vl`
+  commands: gc deletes only at a moment when none of them is recording
+  (it waits for those that are, and commands that start meanwhile wait
+  for it), and a command that reuses an object gc just deleted asks to be
+  run again instead of recording it. If commands keep running for more
+  than about a minute, gc deletes nothing that run and says so.
 * `--level L` sets the zstd level (default 3); `--no-deltas` disables delta
   compression. A small edit of a large file is stored as a small delta up
   to about 64 MiB per version (the base and the new version must fit in
   zstd's 128 MiB window); above that only the parts within the window are
   shared.
+* `--auto` runs what background maintenance runs (see below), and exits
+  at once if another `gc` is running.
 * **A remote on a path is collected the same way**: `vl -R ../hub gc`.
   History un-tagged there (`vl push --delete`, `vl push --force`) is pruned
   after the grace period. In a bare repository such as a remote, `vl -R`
@@ -53,11 +60,32 @@ Storage: 0.02 MiB -> 0.01 MiB
 * If part of the history can't be read, `gc` deletes nothing and says so.
   Run `vl fsck`.
 
-In 1.0, `gc` rewrites everything it keeps into new packs (a new one every
-128 MiB, so its memory stays bounded). On a large repository, run it
-occasionally, not after every command. After `gc` with
-`--keep-ops-days`, `vl evolog` may end with
+`gc` never rewrites what is already well packed: new loose objects go into
+a new pack, and the smallest packs are merged so that each pack is at least
+twice the size of the next smaller one. The big old pack stays as it is;
+garbage in it is removed only once it is more than a quarter of the pack
+(at once with `--prune-now`). Its memory is a bit per object plus the pack
+indexes, not the objects. Commands keep working while it runs: they never
+wait for it, except for the moment it deletes, and only one `gc` runs at a
+time (a second waits up to 15 seconds, then says another is running).
+After `gc` with `--keep-ops-days`, `vl evolog` may end with
 `(older versions were removed by `vl gc`)`.
+
+### Background maintenance
+
+You rarely need to run `vl gc` yourself. After a command, `vl` starts
+`vl gc --auto` in the background when the store needs it: about 6,700
+loose objects, more than 50 packs, or a week since the last pruning. It
+runs at low priority, packs loose objects older than ten minutes, merges
+small packs, prunes (with the grace period, keeping the whole operation
+log) once a week or after 10,000 rewritten snapshots, and writes what it
+did to `.veil/local/maintenance.log`.
+
+* `VEIL_GC_AUTO=0` turns it off. It is off when `CI` is set, unless
+  `VEIL_GC_AUTO=1`.
+* Remotes are never maintained in the background: run `vl -R <remote> gc`.
+* It also removes what interrupted commands left behind: temp files whose
+  writer is gone, and abandoned staging.
 
 ## `vl fsck`
 

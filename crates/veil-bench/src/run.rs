@@ -452,6 +452,31 @@ pub fn gc(b: &mut Bench) -> Result<()> {
     Ok(())
 }
 
+/// Incremental maintenance (scale stream G2), after the packed-store cases:
+/// one small commit, then `gc` packs the new objects and never rewrites
+/// the big pack; then `gc --auto`.
+pub fn gc_incremental(b: &mut Bench) -> Result<()> {
+    let repo = b.repo.clone();
+    let packs = |r: &Path| -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(r.join(".veil/objects/pack"))
+            .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".pack")).collect())
+            .unwrap_or_default();
+        v.sort();
+        v
+    };
+    let before = packs(&repo);
+    std::fs::write(repo.join("bench-g2.txt"), b"one small change\n")?;
+    let _ = b.env.run(&repo, &["commit", "-m", "one small change"], false)?;
+    b.case(Case::new("gc, after one commit (incremental)", "local", &repo, &["gc"]).runs(1), |_, _| Ok(()))?;
+    let after = packs(&repo);
+    let kept = before.iter().filter(|p| after.contains(p)).count();
+    b.note(format!("gc after one commit: {kept} of {} packs kept as they were, {} packs now", before.len(), after.len()));
+    b.manifest["gc_incremental_packs_kept"] = json!(kept);
+    b.manifest["gc_incremental_packs_before"] = json!(before.len());
+    b.case(Case::new("gc --auto (background maintenance)", "local", &repo, &["gc", "--auto"]).runs(1), |_, _| Ok(()))?;
+    Ok(())
+}
+
 /// Write the stand-in `ssh`: it ignores its arguments and runs a local
 /// `sftp-server` (under strace when `VEIL_BENCH_STRACE` is set, behind the
 /// RTT shim when `VEIL_BENCH_RTT_MS` is set).

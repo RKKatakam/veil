@@ -319,11 +319,13 @@ impl PackIndex {
 
 // ---- reading ----------------------------------------------------------------
 
-struct Entry {
-    kind: EntryKind,
-    raw_len: u64,
-    base: Option<ObjectId>,
-    data: Vec<u8>,
+/// One pack entry as stored: copied into another pack without decoding
+/// by maintenance (`maintenance.rs`: merging, pruning).
+pub(crate) struct Entry {
+    pub(crate) kind: EntryKind,
+    pub(crate) raw_len: u64,
+    pub(crate) base: Option<ObjectId>,
+    pub(crate) data: Vec<u8>,
 }
 
 /// An opened pack: its parsed index plus the location of its data file.
@@ -423,6 +425,32 @@ impl Pack {
 
     fn what(&self) -> String {
         format!("pack {}", &self.name[..12])
+    }
+
+    /// The entry of `id` as stored, if this pack has it.
+    pub(crate) fn entry(&self, backend: &dyn StorageBackend, id: &ObjectId) -> Result<Option<Entry>> {
+        match self.index.find(id) {
+            Some(i) => self.read_entry(backend, i).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The ids of this pack's entries in the order they are stored (a
+    /// delta's base comes before it in packs vl writes).
+    pub(crate) fn ids_in_pack_order(&self) -> Vec<ObjectId> {
+        let mut order: Vec<usize> = (0..self.index.len()).collect();
+        order.sort_by_key(|&i| self.index.offsets[i]);
+        order.into_iter().map(|i| self.index.ids[i]).collect()
+    }
+
+    /// The stored length of the entry of `id` (0 if absent).
+    pub(crate) fn entry_len(&self, id: &ObjectId) -> u64 {
+        self.index.find(id).map_or(0, |i| self.index.lens[i])
+    }
+
+    /// Bytes of all entries (the pack less its header and trailer).
+    pub(crate) fn entries_len(&self) -> u64 {
+        self.index.lens.iter().sum()
     }
 
     /// The whole pack, once it has been read often enough to be worth it
@@ -932,6 +960,41 @@ impl PackBuilder {
         Ok(())
     }
 
+    /// Add an entry as another pack stored it (no decoding, no new
+    /// delta). A delta is added only if its base is already in this pack
+    /// and the chain stays within the depth limit: `Ok(false)` otherwise,
+    /// and the caller adds the object decoded instead.
+    pub(crate) fn add_entry(&mut self, id: ObjectId, e: &Entry) -> Result<bool> {
+        if self.contains(&id) {
+            return Ok(true);
+        }
+        let depth = match (e.kind, &e.base) {
+            (EntryKind::Delta, Some(b)) => match self.depth.get(b) {
+                Some(d) if *d < self.max_depth => d + 1,
+                _ => return Ok(false),
+            },
+            (EntryKind::Delta, None) => return Ok(false),
+            _ => 0,
+        };
+        let offset = self.flushed + self.buf.len() as u64;
+        self.buf.push(e.kind as u8);
+        self.buf.extend_from_slice(&e.raw_len.to_le_bytes());
+        if let (EntryKind::Delta, Some(b)) = (e.kind, &e.base) {
+            self.buf.extend_from_slice(&b.0);
+        }
+        self.buf.extend_from_slice(&e.data);
+        self.entries.push((id, offset, self.flushed + self.buf.len() as u64 - offset));
+        self.depth.insert(id, depth);
+        self.stats.objects += 1;
+        self.stats.raw_bytes += e.raw_len;
+        match e.kind {
+            EntryKind::Stored => self.stats.stored += 1,
+            EntryKind::Zstd => self.stats.compressed += 1,
+            EntryKind::Delta => self.stats.deltas += 1,
+        }
+        Ok(true)
+    }
+
     /// The entry for `raw`: (kind, data, delta base, delta depth).
     #[cfg(feature = "zstd")]
     fn encode(&mut self, raw: &[u8], base: Option<(&ObjectId, &[u8])>) -> Result<(EntryKind, Vec<u8>, Option<ObjectId>, u32)> {
@@ -1038,6 +1101,15 @@ impl<'a> PackWriter<'a> {
             self.flush()?;
         }
         Ok(())
+    }
+
+    /// As [`PackBuilder::add_entry`].
+    pub(crate) fn add_entry(&mut self, id: ObjectId, e: &Entry) -> Result<bool> {
+        let added = self.b.add_entry(id, e)?;
+        if self.b.buf.len() >= WRITE_CHUNK {
+            self.flush()?;
+        }
+        Ok(added)
     }
 
     fn flush(&mut self) -> Result<()> {

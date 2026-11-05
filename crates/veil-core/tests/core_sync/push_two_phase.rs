@@ -635,7 +635,9 @@ fn a_push_whose_lock_is_taken_over_before_the_operation_records_nothing() {
 }
 
 /// Threat 9: staging untouched for over a week is removed (by a push and by
-/// the remote's gc); staging touched within the day never is.
+/// the remote's gc); staging touched within the day never is. "A week" is
+/// of the cleaning host's own clock, from when it first saw the directory
+/// as it is (BUG-810).
 #[test]
 fn only_week_old_staging_is_removed() {
     let hub = Arc::new(MemoryBackend::new());
@@ -659,20 +661,26 @@ fn only_week_old_staging_is_removed() {
     // Hostile values from the remote are just old or unreadable.
     let hostile = p(".veil/objects/incoming/push-ffff0000000000000000000000000000");
     hub.write(&hostile.join("touched"), i64::MIN.to_string().as_bytes()).unwrap();
+    // Expiry counts only this host's own clock (BUG-810): what the stamps
+    // say (another machine's clock, or hostile) never removes anything; a
+    // directory goes once this host has seen it unchanged for a week.
     let mut r = Repo::open_remote(hub.clone()).unwrap();
-    let g = gc(&mut r, &GcOptions::default()).unwrap();
-    assert_eq!(g.push_staging_removed, 2, "the week-old one and the hostile one");
-    let mut left = staging(&hub);
-    left.sort();
-    assert_eq!(left, ["push-000000000000000000000000000000ab", "push-1h0000000000000000000000000000ab", "push-unknown0000000000000000000000ab"]);
-    // A week later (by the clock of whoever looks), the rest goes too; the
-    // one that did not say when was marked then.
-    assert_eq!(remote::expire_push_staging(&*hub, now + 8 * DAY).unwrap(), 3);
-    // And a push removes week-old staging too.
+    let g = gc(&mut r, &GcOptions { now: Some(now), ..GcOptions::default() }).unwrap();
+    assert_eq!(g.push_staging_removed, 0, "first sight: nothing is old yet");
+    assert_eq!(staging(&hub).len(), 5);
+    // One of them is written to meanwhile: its week starts again.
+    hub.write(&p(".veil/objects/incoming/push-000000000000000000000000000000ab/touched"), (now + DAY).to_string().as_bytes()).unwrap();
+    assert_eq!(remote::expire_push_staging(&*hub, now + 8 * DAY).unwrap(), 4);
+    assert_eq!(staging(&hub), ["push-000000000000000000000000000000ab"]);
+    assert_eq!(remote::expire_push_staging(&*hub, now + 16 * DAY).unwrap(), 1);
+    // And a push expires staging too, by the same rule.
     plant("8d0000000000000000000000000000ab", Some(8 * DAY));
+    assert_eq!(remote::expire_push_staging(&*hub, now).unwrap(), 0);
     let v2 = commit_files(&mut alice, &*fs, &[("a.txt", "two\n")], "v2");
     alice.set_tag("main", v2, None, true).unwrap();
     remote::push(&mut alice, hub.clone(), false, &[], false).unwrap();
+    assert_eq!(staging(&hub).len(), 1, "seen for less than a week by this host's clock");
+    assert_eq!(remote::expire_push_staging(&*hub, crate_now() + 8 * DAY).unwrap(), 1);
     assert!(staging(&hub).is_empty(), "{:?}", staging(&hub));
 }
 
@@ -1116,7 +1124,6 @@ fn a_release_and_its_undo_during_phase_a_never_publish_the_fix() {
 /// here they start one during each of Alice's phase A, and Alice's push
 /// fails after three uploads although nothing about the remote changed.
 #[test]
-#[ignore = "BUG-810: a pusher whose clock is a week fast removes live pushes' staging"]
 fn a_teammate_with_a_fast_clock_never_removes_a_live_push_staging() {
     const DAY: i64 = 24 * 3600 * 1000;
     let (mut alice, _fs, _) = alice_with_files(20);

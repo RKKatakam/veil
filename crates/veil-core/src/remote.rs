@@ -796,24 +796,23 @@ impl Inventory {
     }
 }
 
-/// Most pack data one pull downloads in bulk (BUG-490), into a spool on
-/// local disk ([`Spool`]; BUG-800: it used to be memory): packs past it
-/// are read one object at a time instead (ranged reads), so a remote
-/// listing many or huge packs cannot make a pull store them all. Each pack
-/// is read to the size its index implies, never further, and the pull
-/// fails up front if the disk lacks the room.
-const PREFETCH_LIMIT: u64 = 2 << 30;
-
-/// How much of a remote pack one download holds at a time.
+/// How much of a remote file one download holds at a time.
 const PREFETCH_PIECE: u64 = 4 << 20;
 
-/// Remote objects downloaded in bulk.
+/// Remote objects downloaded in bulk, into a spool on local disk
+/// ([`Spool`]; BUG-800: they used to be held in memory). Every remote pack
+/// holding an object we lack is downloaded: the bound is the local disk,
+/// checked before anything is downloaded (the pull fails up front, naming
+/// the space it needs), not a fixed size past which objects came one by
+/// one. Each pack is read to the size its index implies, never further.
 #[derive(Default)]
 struct Prefetched {
     loaded: bool,
     /// Opened from the spool, on the local backend.
     packs: HashMap<usize, Pack>,
-    loose: HashMap<ObjectId, Vec<u8>>,
+    /// Loose objects downloaded into the spool's `loose/` (only their ids
+    /// are kept in memory).
+    loose: HashSet<ObjectId>,
 }
 
 /// Where a pull downloads the remote's packs: `objects/incoming/pull-<owner>`
@@ -879,17 +878,8 @@ impl PullSource<'_> {
         got.loaded = true;
         let inv = self.inv;
         let threads = threads_for(&*inv.backend);
-        let mut held = 0u64;
         let packs: Vec<usize> = (0..inv.packs.len())
             .filter(|&i| inv.packs[i].2.ids().iter().any(|id| !self.local_ids.contains(id)))
-            .filter(|&i| {
-                let len = inv.packs[i].2.pack_len();
-                let fits = held.saturating_add(len) <= PREFETCH_LIMIT;
-                if fits {
-                    held += len;
-                }
-                fits
-            })
             .collect();
         let (local, dir) = (&*self.spool.backend, &self.spool.dir);
         let need: u64 = packs.iter().map(|&i| inv.packs[i].2.pack_len()).sum();
@@ -928,18 +918,40 @@ impl PullSource<'_> {
                 got.packs.insert(i, p);
             }
         }
+        // Loose objects too go to the spool, in pieces, each checked
+        // against its id as it streams (BUG-800 follow-up: they were held
+        // in memory). Unverified copies are simply not used.
         let loose: Vec<ObjectId> = inv.loose.iter().filter(|id| !self.local_ids.contains(id)).copied().collect();
-        let data = par_map(&loose, threads, |id| {
+        let ldir = dir.join("loose");
+        let fetched = par_map(&loose, threads, |id| -> Result<u64> {
             let h = id.hex();
-            inv.backend.read(&VPath::new(&format!(".veil/objects/{}/{}", &h[..2], &h[2..]))?)
-        });
-        for (id, d) in loose.into_iter().zip(data) {
-            if let Ok(d) = d {
-                bytes += d.len() as u64;
-                // Unverified copies are simply not used.
-                if ObjectId::hash(&d) == id {
-                    got.loose.insert(id, d);
+            let from = VPath::new(&format!(".veil/objects/{}/{}", &h[..2], &h[2..]))?;
+            let len = inv.backend.metadata(&from)?.map_or(0, |m| m.len);
+            if len > crate::pack::max_object_size() {
+                return Err(VeilError::repo(format!("remote object {} is larger than an object may be", id.short())));
+            }
+            let mut out = local.create_stream(&ldir, false)?;
+            let mut hasher = blake3::Hasher::new();
+            let mut at = 0;
+            while at < len {
+                let piece = inv.backend.read_range(&from, at, (len - at).min(PREFETCH_PIECE) as usize)?;
+                if piece.is_empty() {
+                    break;
                 }
+                hasher.update(&piece);
+                out.write_all(&piece)?;
+                at += piece.len() as u64;
+            }
+            if hasher.finalize().as_bytes() != &id.0 {
+                return Err(VeilError::Corrupt(id.hex(), "remote loose object does not match its id".into()));
+            }
+            out.finish(&h)?;
+            Ok(at)
+        });
+        for (id, r) in loose.into_iter().zip(fetched) {
+            if let Ok(n) = r {
+                bytes += n;
+                got.loose.insert(id);
             }
         }
         *self.bytes.borrow_mut() += bytes;
@@ -948,8 +960,13 @@ impl PullSource<'_> {
 
     fn prefetched(&self, id: &ObjectId) -> Result<Option<Vec<u8>>> {
         let got = self.got.borrow();
-        if let Some(d) = got.loose.get(id) {
-            return Ok(Some(d.clone()));
+        if got.loose.contains(id) {
+            let d = self.spool.backend.read(&self.spool.dir.join("loose").join(&id.hex()))?;
+            // Checked as it was spooled, and re-hashed here as every read
+            // from disk is.
+            if ObjectId::hash(&d) == *id {
+                return Ok(Some(d));
+            }
         }
         if let Some(p) = self.inv.packed.get(id).and_then(|i| got.packs.get(i)) {
             // `Pack::get` re-hashes what it returns.
@@ -2101,6 +2118,9 @@ pub fn push_with(
                 }
                 if let Some(p) = &path {
                     let _ = local_fs.remove_file(p);
+                    if let Some(dir) = p.parent() {
+                        let _ = crate::maintenance::remove_dead_temps(&*local_fs, &dir);
+                    }
                 }
                 report.releases_published = releases_published;
                 return Ok(report);
@@ -2827,8 +2847,14 @@ impl Journal {
         Ok(Some(j))
     }
 
+    /// Written as a stream, whose temp file names this process: a push
+    /// killed mid-write leaves one that a later push (or gc) removes
+    /// once its owner is provably gone (BUG-812), never a live push's.
     fn save(&self, fs: &dyn StorageBackend, path: &VPath) -> Result<()> {
-        fs.write(path, &serde_json::to_vec_pretty(self)?)
+        let dir = path.parent().expect("the journal is in a directory");
+        let mut out = fs.create_stream(&dir, true)?;
+        out.write_all(&serde_json::to_vec_pretty(self)?)?;
+        out.finish(path.file_name())
     }
 
     /// The objects of the journal's packs that are complete on the remote
@@ -2994,26 +3020,46 @@ pub fn push_staging(backend: &dyn StorageBackend) -> Result<Vec<PushStaging>> {
     Ok(out)
 }
 
-/// Remove the push staging directories on `backend` that their push has
-/// not written to for [`PUSH_STAGING_EXPIRY_MS`] (by `now`): abandoned
-/// uploads. One touched within that time is never removed. One that does
-/// not say when is marked touched now, and so expires a week later.
-/// Returns how many were removed.
+/// What this host has seen of the push staging directories on a remote,
+/// kept there per host (`.veil/local/push-expiry/<host>.json`): each
+/// directory's `touched` stamp as seen, and when this host first saw it so
+/// (ms, by this host's clock).
+type SeenStaging = std::collections::BTreeMap<String, (Option<i64>, i64)>;
+
+fn seen_staging_path() -> VPath {
+    let host = crate::lock::process_owner().split('-').next().unwrap_or("host");
+    VPath::new(&format!(".veil/local/push-expiry/{host}.json")).expect("valid path")
+}
+
+/// Remove the push staging directories on `backend` that this host has
+/// seen unchanged (the same `touched` stamp, which their push rewrites
+/// whenever it writes there) for [`PUSH_STAGING_EXPIRY_MS`] of its own
+/// clock (`now`): abandoned uploads. No other machine's clock is compared
+/// with ours (BUG-810: a pusher whose clock ran a week fast removed every
+/// live push's staging). A directory seen for the first time, or changed
+/// since, starts its week now. Returns how many were removed.
 pub fn expire_push_staging(backend: &dyn StorageBackend, now: i64) -> Result<usize> {
     let names = staging_names(backend)?;
-    let ages = par_map(&names, threads_for(backend), |n| touched(backend, n));
+    let stamps = par_map(&names, threads_for(backend), |n| touched(backend, n));
+    let path = seen_staging_path();
+    let seen: SeenStaging = backend.read_opt(&path)?.and_then(|raw| serde_json::from_slice(&raw).ok()).unwrap_or_default();
+    let mut next = SeenStaging::new();
     let mut removed = 0;
-    for (name, t) in names.iter().zip(ages) {
-        let dir = incoming_dir().join(name);
-        match t? {
-            // Remote content: any value, never an overflow.
-            Some(t) if now.saturating_sub(t) > PUSH_STAGING_EXPIRY_MS => {
-                backend.remove_dir_all(&dir)?;
-                removed += 1;
-            }
-            Some(_) => {}
-            None => backend.write(&dir.join(TOUCHED), now.to_string().as_bytes())?,
+    for (name, stamp) in names.iter().zip(stamps) {
+        let stamp = stamp?;
+        let first = match seen.get(name) {
+            Some((s, t)) if *s == stamp => *t,
+            _ => now,
+        };
+        if now.saturating_sub(first) > PUSH_STAGING_EXPIRY_MS {
+            backend.remove_dir_all(&incoming_dir().join(name))?;
+            removed += 1;
+        } else {
+            next.insert(name.clone(), (stamp, first));
         }
+    }
+    if next != seen {
+        backend.write(&path, &serde_json::to_vec(&next)?)?;
     }
     Ok(removed)
 }

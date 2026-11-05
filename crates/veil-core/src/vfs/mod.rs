@@ -518,6 +518,12 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
     fn available_space(&self, _dir: &VPath) -> Option<u64> {
         None
     }
+
+    /// The operating-system path of `path`, for a backend that is a local
+    /// directory: the gc lease is an `flock` on it ([`crate::maintenance::GcLease`]).
+    fn local_path(&self, _path: &VPath) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 /// A file being written by [`StorageBackend::create_stream`].
@@ -563,10 +569,25 @@ impl<B: StorageBackend + ?Sized> StreamWriter for Buffered<'_, B> {
     }
 }
 
-/// The temp file name a [`StreamWriter`] writes under until `finish`.
+/// The temp file name a [`StreamWriter`] writes under until `finish`:
+/// `.stream-<owner>.vltmp<8 hex digits>`, naming this process
+/// ([`crate::lock::Owner`]), so that maintenance removes it only once its
+/// writer is provably gone ([`temp_owner`]).
 #[cfg(feature = "os")]
 pub(crate) fn stream_temp_name() -> String {
-    format!(".stream{TEMP_MARKER}{}", hex::encode(crate::crypto::random_bytes::<4>()))
+    format!(
+        ".stream-{}{TEMP_MARKER}{}",
+        crate::lock::process_owner(),
+        hex::encode(crate::crypto::random_bytes::<4>())
+    )
+}
+
+/// The owner tag in a stream temp file's name (`.stream-<owner>.vltmp…`), if
+/// it has one (older vl wrote `.stream.vltmp…`).
+pub fn temp_owner(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix(".stream-")?;
+    let end = rest.rfind(TEMP_MARKER)?;
+    is_temp_name(name).then(|| &rest[..end])
 }
 
 /// Bounds-checked `data[offset..offset + len]` for [`StorageBackend::read_range`].

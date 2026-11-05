@@ -500,6 +500,12 @@ fn assert_healthy(fs: Arc<dyn StorageBackend>, id: &Identity, ctx: &str) {
 
 /// Sweep `op` across every crash point, in both crash modes.
 fn sweep(name: &str, target: Target, op: Op) {
+    sweep_with(name, target, op, target != Target::RemoteOld)
+}
+
+/// [`sweep`]; `unsynced` says whether the operation writes anything not
+/// yet covered by a barrier (gc writes everything durably).
+fn sweep_with(name: &str, target: Target, op: Op, unsynced: bool) {
     let w = world();
     let mut crashes = 0;
     let mut torn = 0;
@@ -589,7 +595,7 @@ fn sweep(name: &str, target: Target, op: Op) {
     assert!(crashes >= 2, "{name}: too few crash points ({crashes})");
     // A push writes nothing unsynced on the remote: each pack is a durable
     // stream (BUG-800), then its index, then the tags.
-    if target != Target::RemoteOld {
+    if unsynced {
         assert!(torn > 0, "{name}: no power loss ever tore an unsynced write");
     }
 }
@@ -772,6 +778,54 @@ fn crash_during_pull() {
         assert_eq!(repo.view().tags["main"].target, env.v3);
         Ok(())
     });
+}
+
+/// Maintenance (scale stream G2, threat 1): consolidation of the loose
+/// objects, then a garbage pack and geometric merging. A loose copy goes
+/// only after the pack and index holding it are durable.
+#[test]
+fn crash_during_gc() {
+    sweep_with(
+        "gc",
+        Target::Local,
+        |env| {
+            let mut repo = env.open(&env.local)?;
+            veil_core::gc::gc(&mut repo, &Default::default())?;
+            for i in 0..30 {
+                repo.store().put(&veil_core::object::Object::Blob(format!("unreferenced {i}\n").repeat(40).into_bytes()))?;
+            }
+            veil_core::gc::gc(&mut repo, &Default::default())?;
+            Ok(())
+        },
+        false,
+    );
+}
+
+/// Pruning with grace 0 and the op log cut: loose garbage deleted, a pack
+/// rewritten without its garbage, operations pruned.
+#[test]
+fn crash_during_gc_prune_now() {
+    sweep_with(
+        "gc --prune-now",
+        Target::Local,
+        |env| {
+            let mut repo = env.open(&env.local)?;
+            for i in 0..10 {
+                repo.store().put(&veil_core::object::Object::Blob(format!("garbage {i}\n").into_bytes()))?;
+            }
+            veil_core::gc::gc(&mut repo, &Default::default())?;
+            let now = veil_core::now_millis() + 60_000;
+            let opts = veil_core::gc::GcOptions {
+                grace: std::time::Duration::ZERO,
+                keep_ops: Some(std::time::Duration::ZERO),
+                now: Some(now),
+                ..Default::default()
+            };
+            veil_core::gc::gc(&mut repo, &opts)?;
+            Ok(())
+        },
+        false,
+    );
 }
 
 #[test]

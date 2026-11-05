@@ -327,6 +327,14 @@ pub fn upgrade(
     opts: &UpgradeOptions,
 ) -> Result<UpgradeReport> {
     check_format_supported(opts.to)?;
+    // The gc lease first (threat 10 of the maintenance design): no gc or
+    // background maintenance runs while the format changes under it.
+    let _lease = match opts.dry_run {
+        true => None,
+        false => Some(crate::maintenance::GcLease::acquire(&backend, true)?.ok_or_else(|| {
+            VeilError::Locked("`vl gc` is running on this repository; run the upgrade again once it is done".into())
+        })?),
+    };
     let _lock = if opts.dry_run {
         None
     } else {

@@ -64,7 +64,7 @@ Phase B costs about `6 + 2 × packs` round trips. For a 1 GiB push in 32 MiB chu
 - **Rejected in phase B.**
   - Public remote: the staging directory is removed under the lock, so content that was not published stays unpublished.
   - Team remote: it is kept for reuse (the user pulls, merges and pushes again; most blobs are the same).
-- **Abandoned.** Any phase B, and `vl -R <remote> gc`, removes staging directories whose newest file is more than 7 days old. A directory touched in the last 24 hours is never removed. `vl doctor --remotes` lists staging directories older than 24 hours with their size.
+- **Abandoned.** Any phase B, and `vl -R <remote> gc`, removes staging directories whose newest file is more than 7 days old. A directory touched in the last 24 hours is never removed. `vl doctor --remotes` lists staging directories older than 24 hours with their size. *As built (BUG-810):* "7 days" is of the cleaning host's own clock, from when it first saw the directory with its current `touched` stamp (`.veil/local/push-expiry/<host>.json` on the remote): no other machine's clock is compared with ours.
 
 ### Compatibility
 

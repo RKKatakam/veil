@@ -1242,6 +1242,11 @@ impl Object {
         raw.starts_with(BLOB_TAG)
     }
 
+    /// Whether `raw` is a snapshot's encoding (by its first bytes).
+    pub fn is_snapshot_raw(raw: &[u8]) -> bool {
+        raw.starts_with(SNAP_TAG)
+    }
+
     pub fn kind_name(&self) -> &'static str {
         match self {
             Object::Blob(_) => "blob",

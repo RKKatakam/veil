@@ -173,6 +173,10 @@ pub struct Repo {
     pub(crate) command_ws: Option<String>,
     /// What merges of concurrent operations decided ([`Repo::take_warnings`]).
     pub(crate) warnings: Vec<String>,
+    /// gc's prune epoch when the view was last read (lock-free
+    /// repositories, [`crate::maintenance::prune_epoch`]): a transaction
+    /// that finds it changed checks the ids it carried in (BUG-811).
+    pub(crate) prune_epoch: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for Repo {
@@ -325,6 +329,7 @@ impl Repo {
             remote: bare,
             command_ws: None,
             warnings: Vec::new(),
+            prune_epoch: None,
         })
     }
 
@@ -373,14 +378,25 @@ impl Repo {
             remote,
             command_ws: None,
             warnings: Vec::new(),
+            prune_epoch: None,
+        };
+        // Reading the heads walks the op log (and may merge): registered for
+        // gc's deletion fence meanwhile, so no operation it reads is pruned
+        // under it (BUG-811's class).
+        let reg = match repo.lock_free() {
+            true => Some(crate::maintenance::Registration::enter(&repo.store)?),
+            false => None,
         };
         repo.read_heads()?;
         repo.graph = GraphIndex::new(repo.backend.clone(), persists_index(&*repo.backend, &repo.view));
-        if repo.lock_free() {
+        if reg.is_some() {
             // Best effort: what dead transactions staged is garbage.
-            let _ = repo.store.sweep_staging(&crate::lock::LockContext::default());
+            let ctx = crate::lock::LockContext::default();
+            let _ = repo.store.sweep_staging(&ctx);
+            let _ = crate::maintenance::sweep_registrations(&repo.store, &ctx);
             repo.settle()?;
         }
+        drop(reg);
         Ok(repo)
     }
 
@@ -399,6 +415,9 @@ impl Repo {
     /// Read the heads; with several, merge their views in memory (without
     /// applying rewrites: [`Repo::settle`] does that on disk).
     fn read_heads(&mut self) -> Result<bool> {
+        if self.lock_free() {
+            self.prune_epoch = crate::maintenance::prune_epoch(&self.store)?;
+        }
         let raw = self.ops.raw_heads()?;
         if raw == self.raw && !self.base.is_empty() {
             return Ok(false);
@@ -421,6 +440,11 @@ impl Repo {
     /// Re-read the operation heads (another process or task may have
     /// published since); from format 6, merge several.
     pub fn reload(&mut self) -> Result<()> {
+        // As in `open`: registered while the op log is read.
+        let _reg = match self.lock_free() {
+            true => Some(crate::maintenance::Registration::enter(&self.store)?),
+            false => None,
+        };
         if self.read_heads()? {
             // Another process may have pulled a parent the index took as
             // missing.
@@ -434,7 +458,14 @@ impl Repo {
 
     pub fn transaction(&mut self, description: impl Into<String>) -> Result<Transaction<'_>> {
         if self.lock_free() {
+            // Registered for gc's deletion fence before the heads are read:
+            // nothing the base view names is deleted while this runs (BUG-811).
+            let reg = crate::maintenance::Registration::enter(&self.store)?;
+            // gc deleted objects since this process last read its view: an
+            // id it carried from there may be gone (checked at commit).
+            let before = self.prune_epoch.clone();
             self.reload()?;
+            let carried_check = before != self.prune_epoch;
             // A transaction starts from one merged head: from several, its
             // view would lack the merge's rewrites and confinement check.
             if self.base.len() > 1 {
@@ -442,7 +473,9 @@ impl Repo {
                     "other commands keep recording operations faster than they can be merged; try again",
                 ));
             }
-            return Transaction::new(self, description.into(), None);
+            let mut tx = Transaction::registered(self, description.into(), None, Some(reg))?;
+            tx.check_carried = carried_check;
+            return Ok(tx);
         }
         let lock = RepoLock::acquire(self.backend.clone())?;
         self.transaction_with_lock(description, lock)

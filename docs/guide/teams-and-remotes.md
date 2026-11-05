@@ -227,7 +227,8 @@ Pushed 412 object(s) to origin
 * `VEIL_PUSH_CHUNK` (for example `8M`) sets the largest upload piece: the
   most a dropped connection makes the next push send again.
 * An upload that is never resumed is removed by any push or
-  `vl -R <remote> gc` once it has been untouched for a week;
+  `vl -R <remote> gc` once that machine has seen it untouched for a week
+  (by its own clock: a teammate's clock running fast removes nothing early);
   `vl doctor --remotes` lists those untouched for over a day.
 * On a **public** remote, the upload of a push whose tags were rejected
   meanwhile is removed at once: what was not published stays unpublished.

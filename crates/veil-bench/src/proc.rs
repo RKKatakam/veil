@@ -86,6 +86,9 @@ impl VlEnv {
             .env("VEIL_USER", "bench")
             .env("TMPDIR", &self.tmp)
             .env("NO_COLOR", "1")
+            // No background maintenance inside the benchmark: it measures
+            // `vl gc` and `vl gc --auto` as cases of their own.
+            .env("VEIL_GC_AUTO", "0")
             .env_remove("VEIL_BENCH_STRACE")
             .stdin(Stdio::null());
         if let Some(ssh) = &self.ssh {

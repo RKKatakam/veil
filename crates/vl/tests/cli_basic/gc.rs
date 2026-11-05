@@ -83,3 +83,58 @@ fn gc_packs_prunes_and_keeps_the_repository_usable() {
     let out = vl(&home, &proj, &["fsck"]);
     assert!(out.contains("No corruption found"), "{out}");
 }
+
+/// Background maintenance (scale stream G2, threat 11): never with
+/// `CI` set (or `VEIL_GC_AUTO=0`); otherwise one `vl gc --auto` once the
+/// store needs it, detached, logging to `.veil/local/maintenance.log`, and
+/// not again right after.
+#[test]
+fn background_maintenance_starts_only_where_allowed_and_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home: PathBuf = tmp.path().join("home");
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let run = |args: &[&str], ci: bool, auto: Option<&str>| {
+        let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_vl"));
+        c.args(args).current_dir(&proj).env("VEIL_HOME", &home).env("VEIL_USER", "alice").env("NO_COLOR", "1").env_remove("CI").env_remove("VEIL_GC_AUTO");
+        if ci {
+            c.env("CI", "1");
+        }
+        if let Some(v) = auto {
+            c.env("VEIL_GC_AUTO", v);
+        }
+        let out = c.output().unwrap();
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    run(&["init"], true, None);
+    // More loose objects than the threshold.
+    for i in 0..9000 {
+        std::fs::write(proj.join(format!("f{i}.txt")), format!("file {i}\n")).unwrap();
+    }
+    let log = proj.join(".veil/local/maintenance.log");
+    run(&["commit", "-m", "many"], true, None);
+    assert!(!log.exists(), "maintenance started with CI set");
+    run(&["status"], false, Some("0"));
+    assert!(!log.exists(), "maintenance started with VEIL_GC_AUTO=0");
+    run(&["status"], false, None);
+    assert!(wait_until(|| std::fs::read_to_string(&log).is_ok_and(|l| l.contains("packed"))), "no background run");
+    run(&["status"], false, None);
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(text.matches("vl gc --auto").count(), 1, "{text}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&log).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+}
+
+fn wait_until(mut f: impl FnMut() -> bool) -> bool {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < until {
+        if f() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}

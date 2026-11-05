@@ -157,6 +157,9 @@ struct TxStaging {
     owner: String,
     /// Objects written there.
     staged: HashSet<ObjectId>,
+    /// Those that may name other objects (neither blobs nor sealed): the
+    /// commit checks what they name is present (BUG-811).
+    naming: HashSet<ObjectId>,
     /// Fan-out directories (`ab`) holding an object this transaction found
     /// already published instead of writing it: synced at publication.
     present: std::collections::BTreeSet<String>,
@@ -454,6 +457,7 @@ impl ObjectStore {
             dir: self.root.join("incoming").join(&format!("{TX_STAGING_PREFIX}{owner}")),
             owner: owner.to_string(),
             staged: HashSet::new(),
+            naming: HashSet::new(),
             present: Default::default(),
             failures_at: self.backend.barrier_failures(),
         });
@@ -468,6 +472,14 @@ impl ObjectStore {
     /// Objects staged so far by the current transaction.
     pub(crate) fn tx_staged(&self) -> Vec<ObjectId> {
         let mut v: Vec<ObjectId> = self.tx_list().as_ref().map(|t| t.staged.iter().copied().collect()).unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    /// The staged objects that may name others (trees, snapshots,
+    /// conflicts, annotated tags; not blobs, not sealed objects).
+    pub(crate) fn tx_staged_naming(&self) -> Vec<ObjectId> {
+        let mut v: Vec<ObjectId> = self.tx_list().as_ref().map(|t| t.naming.iter().copied().collect()).unwrap_or_default();
         v.sort();
         v
     }
@@ -556,34 +568,6 @@ impl ObjectStore {
             .collect())
     }
 
-    /// The objects in the transaction staging directory `name` (a
-    /// [`ObjectStore::staging_dirs`] entry): gc marks from those of live
-    /// transactions, which may reference objects nothing else does yet.
-    pub fn staged_objects_in(&self, name: &str) -> Result<Vec<(ObjectId, Vec<u8>)>> {
-        let dir = self.root.join("incoming").join(name);
-        let mut out = Vec::new();
-        let fans = match self.backend.list_dir(&dir) {
-            Ok(e) => e,
-            Err(e) if e.is_not_found() => return Ok(out),
-            Err(e) => return Err(e),
-        };
-        for d in fans.into_iter().filter(|d| d.kind == NodeKind::Dir && d.name.len() == 2 && is_hex(&d.name)) {
-            let files = match self.backend.list_dir(&dir.join(&d.name)) {
-                Ok(f) => f,
-                Err(e) if e.is_not_found() => continue,
-                Err(e) => return Err(e),
-            };
-            for f in files.into_iter().filter(|f| f.kind == NodeKind::File && f.name.len() == 62 && is_hex(&f.name)) {
-                let id = ObjectId::from_hex(&format!("{}{}", d.name, f.name))?;
-                match self.backend.read_opt(&dir.join(&d.name).join(&f.name))? {
-                    Some(raw) if ObjectId::hash(&raw) == id => out.push((id, raw)),
-                    _ => {}
-                }
-            }
-        }
-        Ok(out)
-    }
-
     /// From now until the scope returned ends, objects this thread
     /// puts into this store are kept in memory instead of written, and
     /// reads see them (BUG-801: a snapshot is built outside the repository
@@ -655,6 +639,9 @@ impl ObjectStore {
             self.backend.write_unsynced(&dir.join(&h[..2]).join(&h[2..]), raw)?;
             if let Some(t) = self.tx_list().as_mut() {
                 t.staged.insert(*id);
+                if !Object::is_blob_raw(raw) && Object::sealed_scope(raw).is_none() {
+                    t.naming.insert(*id);
+                }
             }
             return Ok(());
         }
@@ -741,6 +728,9 @@ impl ObjectStore {
                 Ok(p) => packs.push(Arc::new(p)),
                 // Removed by a concurrent gc between listing and opening.
                 Err(e) if e.is_not_found() => {}
+                // Its data file went after its index was read: removed
+                // meanwhile too (index first), if the index is gone now.
+                Err(_) if !self.backend.exists(&crate::pack::index_file(&dir, &name)).unwrap_or(true) => {}
                 Err(e) => broken.push((name, e.to_string())),
             }
         }
@@ -750,6 +740,15 @@ impl ObjectStore {
             broken,
         };
         Ok(true)
+    }
+
+    /// Re-scan the pack directory if this store has listed it already (a
+    /// list that has not been loaded yet will be fresh when it is).
+    pub(crate) fn refresh_packs(&self) -> Result<()> {
+        if self.packs.read().unwrap().loaded {
+            self.reload_packs()?;
+        }
+        Ok(())
     }
 
     /// Currently known packs (loading them if needed).
@@ -819,7 +818,7 @@ impl ObjectStore {
         if self.ensure_packs().is_err() {
             return false;
         }
-        self.in_loaded_packs(id) || (self.reload_packs().unwrap_or(false) && self.in_loaded_packs(id))
+        self.in_loaded_packs(id) || (self.reload_packs().unwrap_or(false) && self.in_loaded_packs(id)) || self.loose_exists(id)
     }
 
     /// [`ObjectStore::has`], freshening `id` for gc even if this process
@@ -861,7 +860,15 @@ impl ObjectStore {
         match self.read_packed(id) {
             Ok(Some(raw)) => Ok(raw),
             Ok(None) if loose_corrupt => Err(loose_mismatch(id)),
-            Ok(None) => Err(VeilError::Missing(*id)),
+            // `Missing` means redacted to the engine: only after a loose
+            // probe, a reload of the pack list (in `read_packed`) and a
+            // second loose probe, so that a reader racing maintenance
+            // (a pack replaced, a copy moved) never takes an object for
+            // redacted (threat 2 of the maintenance design).
+            Ok(None) => match self.read_loose_verified(id)? {
+                Loose::Good(b) => Ok(b),
+                _ => Err(VeilError::Missing(*id)),
+            },
             Err(e) if loose_corrupt && e.is_not_found() => Err(loose_mismatch(id)),
             Err(e) => Err(e),
         }
