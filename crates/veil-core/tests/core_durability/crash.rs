@@ -730,6 +730,39 @@ fn crash_during_public_push() {
     });
 }
 
+/// A two-phase push in packs of one object each, journalled: a crash at
+/// any write (each staged pack and index, the journal's `touched` marks,
+/// each rename into `objects/pack/`, the metadata, the operation) leaves no
+/// visible partial push, and the retry resumes from the journal.
+#[test]
+fn crash_during_resumable_push() {
+    sweep("resumable push", Target::RemoteOld, |env| {
+        let mut repo = env.open(&env.local)?;
+        let opts = remote::SyncOptions {
+            journal: Some("ssh://hub/remote_old".into()),
+            chunk: 1,
+            ..Default::default()
+        };
+        let report = remote::push_with(&mut repo, env.remote_old.clone(), false, &[], false, &opts)?;
+        assert!(report.tags_skipped.is_empty(), "{report:?}");
+        Ok(())
+    });
+}
+
+#[test]
+fn eio_during_resumable_push() {
+    eio_sweep("resumable push", Target::RemoteOld, |env| {
+        let mut repo = env.open(&env.local)?;
+        let opts = remote::SyncOptions {
+            journal: Some("ssh://hub/remote_old".into()),
+            chunk: 1,
+            ..Default::default()
+        };
+        remote::push_with(&mut repo, env.remote_old.clone(), false, &[], false, &opts)?;
+        Ok(())
+    });
+}
+
 #[test]
 fn crash_during_pull() {
     sweep("pull", Target::Stale, |env| {

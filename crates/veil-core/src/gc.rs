@@ -513,9 +513,12 @@ pub fn gc(repo: &mut Repo, opts: &GcOptions) -> Result<GcReport> {
     let _restore = FresheningOff(&store);
     store.invalidate()?;
     let now = opts.now.unwrap_or_else(now_millis);
-    let mut report = GcReport::default();
-    // Never inventoried (below): only abandoned ones are removed.
-    report.push_staging_removed = crate::remote::expire_push_staging(&*backend, now)?;
+    // Push staging is never inventoried (below): only abandoned staging is
+    // removed.
+    let mut report = GcReport {
+        push_staging_removed: crate::remote::expire_push_staging(&*backend, now)?,
+        ..GcReport::default()
+    };
 
     // 1. Inventory, strictly before the reachability scan.
     if let Some((name, why)) = store.broken_packs()?.first() {

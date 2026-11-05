@@ -185,11 +185,13 @@ use veil_core::{
     VeilError,
 };
 
+type OnMutation = Box<dyn Fn(&str, &VPath, &VPath) -> Result<()> + Send + Sync>;
+
 /// A remote that runs `on(op, path)` before each mutation; an error from it
 /// fails the mutation (a dropped connection, a stalled holder).
 struct Hooked {
     inner: Arc<MemoryBackend>,
-    on: Box<dyn Fn(&str, &VPath, &VPath) -> Result<()> + Send + Sync>,
+    on: OnMutation,
 }
 
 impl std::fmt::Debug for Hooked {
@@ -790,7 +792,7 @@ proptest! {
                 Op::Commit(n) => {
                     let main = alice.view().tags["main"].target;
                     let ws = alice.ephemeral_workspace(main).unwrap();
-                    ws.write(&format!("f{}.txt", n % 5), &format!("edit {n}\n")).unwrap();
+                    ws.write(&format!("f{}.txt", n % 5), format!("edit {n}\n")).unwrap();
                     if let Ok((c, _)) = alice.commit_ephemeral(&ws, "edit") {
                         alice.set_tag("main", c, None, true).unwrap();
                     }

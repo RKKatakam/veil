@@ -339,6 +339,16 @@ fn a_failing_or_tag_moving_pre_push_hook_stops_the_push() {
     // `--no-verify` skips it.
     env.ok(U, &proj, &["push", "--no-verify"]);
     assert!(team.join(".veil").exists());
+    // A refusing hook runs before anything is uploaded: an existing remote
+    // gets no staged upload either (two-phase pushes, threat 15).
+    script(&proj, ".veil/hooks/pre-push", "exit 1");
+    write(&proj, "b.txt", "new work\n");
+    env.ok(U, &proj, &["commit", "-m", "more"]);
+    env.ok(U, &proj, &["tag", "set", "main", "-r", "@-"]);
+    let out = env.vl(U, &proj, &["push"]);
+    assert!(!out.status.success(), "{}", text(&out));
+    let staged: Vec<_> = std::fs::read_dir(team.join(".veil/objects/incoming")).map(|d| d.flatten().map(|e| e.file_name()).collect()).unwrap_or_default();
+    assert!(staged.iter().all(|n| !n.to_string_lossy().starts_with("push-")), "{staged:?}");
 }
 
 // ---- 5. environment ------------------------------------------------------------------------

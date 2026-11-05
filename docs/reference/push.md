@@ -26,6 +26,7 @@ Options:
 | `--force-tags` | Move release tags (annotated: `vl tag set -a`) that the remote holds at another target. A release is otherwise never replaced, even by a fast-forward |
 | `--full` | Walk and verify every object instead of skipping what the remote provably has (repairs damaged or missing objects on the remote) |
 | `-d, --delete <TAG>` | Delete this tag on the remote (repeatable). Delete it here first with `vl tag delete`. Refused if someone moved it there since (unless --force). With no --tag, nothing else is pushed |
+| `--no-resume` | Start the upload afresh instead of resuming an interrupted push of the same tags to this remote (what it uploaded is not reused) |
 | `--dry-run` | Show what would be sent, and send nothing |
 | `--json` | With --dry-run: print one JSON document (`veil.push.plan/1`; see docs/reference/json.md) instead of text. Errors then also print a `veil.error/1` document |
 | `--no-verify` | Do not run hooks for this command (device-local or `.veilhooks`) |

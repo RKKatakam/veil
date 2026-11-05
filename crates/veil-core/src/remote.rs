@@ -42,14 +42,18 @@
 //!   was sent, so they count only if the receiver holds them in a pack; and
 //!   on a public receiver an embargo wrapper may hold content that was
 //!   withheld then and is releasable now, so wrappers are always revisited.
-//! * **Push** walks, on the local graph, the snapshots the remote's view
-//!   reaches; those are not sent. Of the trees of the remaining snapshots,
-//!   every subtree reachable from a known parent snapshot is skipped.
-//!   Everything left goes into **one pack** (plus index), written to the
-//!   remote's pack directory pack first, index second, each made durable
-//!   before the next, inside the remote transaction. A crash leaves at
-//!   worst a pack nobody can see (no index) or a complete pack whose
-//!   operation never landed; both are harmless.
+//! * **Push** has two phases ([`push_with`]). Without the remote's lock, it
+//!   walks the local graph by generation down to the remote's view (as
+//!   read then), and sends only the snapshots outside its closure; of
+//!   their trees, a subtree with the same id at the same path in a known
+//!   snapshot they build on is skipped ([`Aligned`]). What is sent goes
+//!   into packs of at most [`PUSH_CHUNK`] staged in the push's own
+//!   directory on the remote, `incoming/push-<id>/`, which no reader looks
+//!   in, and recorded in the push journal for a retry. Under the lock it
+//!   checks the tags, the boundary, the staged packs and the releases
+//!   again, renames each pack and then its index into `objects/pack/`, and
+//!   writes the operation. A crash leaves at worst unpublished staging, or
+//!   complete packs nothing references; both are harmless.
 //! * **Pull** lists the remote's objects (pack indexes and loose fan-out
 //!   directories, many requests in flight at once), skips every snapshot
 //!   the local committed view reaches, and at the first object it lacks
@@ -500,6 +504,12 @@ impl StorageBackend for PackWrites<'_> {
     }
 }
 
+/// [`Transfer::known`].
+type Known<'a> = Box<dyn Fn(&ObjectId, &str) -> bool + 'a>;
+
+/// Trees at one directory path, with their ids ([`Aligned`]).
+type DirTrees = Arc<Vec<(ObjectId, Arc<crate::object::Tree>)>>;
+
 struct Transfer<'a> {
     src: &'a dyn Source,
     sink: Sink<'a>,
@@ -507,7 +517,7 @@ struct Transfer<'a> {
     public: bool,
     /// Objects the receiver provably has: not visited at all.
     /// Its arguments: the object, and the path where the walk met it.
-    known: Box<dyn Fn(&ObjectId, &str) -> bool + 'a>,
+    known: Known<'a>,
     seen: HashSet<ObjectId>,
     /// Tree height of every object copied so far (0 for non-trees).
     heights: HashMap<ObjectId, usize>,
@@ -1052,7 +1062,7 @@ struct Aligned<'a> {
     public: bool,
     roots: Vec<ObjectId>,
     /// The boundary's plaintext trees at each directory path read so far.
-    dirs: RefCell<HashMap<String, Arc<Vec<(ObjectId, Arc<crate::object::Tree>)>>>>,
+    dirs: RefCell<HashMap<String, DirTrees>>,
 }
 
 impl<'a> Aligned<'a> {
@@ -1083,7 +1093,7 @@ impl<'a> Aligned<'a> {
 
     /// The boundary's trees at directory `path` (`""`: the root trees),
     /// with the pre-merge trees of the wrappers among them.
-    fn dir(&self, path: &str) -> Result<Arc<Vec<(ObjectId, Arc<crate::object::Tree>)>>> {
+    fn dir(&self, path: &str) -> Result<DirTrees> {
         if let Some(d) = self.dirs.borrow().get(path) {
             return Ok(d.clone());
         }
@@ -1330,7 +1340,6 @@ const KNOWN: u8 = 2;
 ///   unreleased embargoed merge is not sent (it reaches the remote
 ///   redacted). A sent snapshot that is withheld, or that builds on
 ///   withheld history any other way, fails the push with the reason.
-
 pub(crate) fn select_snapshots(
     local: &Repo,
     tips: &[ObjectId],
@@ -2008,7 +2017,6 @@ pub fn push_with(
         };
         let refs = remote.view().refs();
         let (report, boundary) = push_incremental(local, &refs, remote.store(), &tips, &withheld, public, report, dest, &inv, opts.chunk)?;
-        drop(journal_cell);
         if let Some(hook) = &opts.pause_before_lock {
             (hook.0)();
         }

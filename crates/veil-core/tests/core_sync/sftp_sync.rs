@@ -305,3 +305,110 @@ fn a_public_remote_over_sftp_never_receives_cloaked_bytes() {
     assert!(carol.store().read_entry(&e).is_err());
     assert_eq!(carol.store().read_entry(&file_entry(&carol, &main, "README").unwrap()).unwrap(), b"public readme\n");
 }
+
+/// Two-phase pushes over SFTP: a connection dropped while packs are being
+/// staged, then a retry with the push journal, which publishes the packs
+/// already staged instead of sending them again.
+#[test]
+fn a_dropped_push_resumes_without_resending_staged_packs() {
+    let server = need_server!();
+    let base = tempfile::tempdir().unwrap();
+    let (mut alice, afs, _) = new_repo("alice");
+    history(&mut alice, &afs, 0, 2);
+    remote::push(&mut alice, Arc::new(connect(&server, base.path())), false, &[], false).unwrap();
+    let main = history(&mut alice, &afs, 2, 30);
+    let opts = remote::SyncOptions {
+        journal: Some("ssh://hub/repo".into()),
+        chunk: 8 << 10,
+        ..Default::default()
+    };
+    // What the whole push sends.
+    let probe = tempfile::tempdir().unwrap();
+    copy_dir(base.path(), probe.path());
+    let b = Arc::new(connect(&server, probe.path()));
+    let fresh = remote::SyncOptions { journal: None, ..opts.clone() };
+    remote::push_with(&mut alice, b.clone(), false, &[], false, &fresh).unwrap();
+    let total = b.stats().bytes_sent as i64;
+
+    let shim = Shim {
+        cut_after: Some(budget(total * 2 / 3)),
+        ..Shim::default()
+    };
+    let res = try_connect_with(&server, base.path(), shim).and_then(|(b, _child)| remote::push_with(&mut alice, Arc::new(b), false, &[], false, &opts));
+    assert!(res.is_err(), "control: the connection was cut");
+    let staged = std::fs::read_dir(base.path().join(".veil/objects/incoming")).unwrap().count();
+    assert!(staged >= 1, "control: something was staged");
+    let r = Repo::open(Arc::new(DiskBackend::new(base.path())), None, "x").unwrap();
+    assert_ne!(r.view().tags["main"].target, main, "nothing was published by the cut push");
+    drop(r);
+
+    let b = Arc::new(connect(&server, base.path()));
+    remote::push_with(&mut alice, b.clone(), false, &[], false, &opts).unwrap();
+    let resent = b.stats().bytes_sent as i64;
+    assert!(resent < total / 2, "the retry sent {resent} bytes of {total}: staged packs were sent again");
+    let r = assert_remote_healthy(base.path(), "after the resumed push");
+    assert_eq!(r.view().tags["main"].target, main);
+    let bob = clone_over_sftp(&server, base.path(), "bob");
+    assert_eq!(files(&bob, &main), files(&alice, &main));
+    assert!(
+        std::fs::read_dir(base.path().join(".veil/objects/incoming")).map_or(true, |mut d| d.all(|e| !e.unwrap().file_name().to_string_lossy().starts_with("push-"))),
+        "the staging is removed once published"
+    );
+}
+
+/// Many pushers, each with its own tag, over SFTP at once: every one lands
+/// (none times out waiting for another's upload), and the remote is
+/// complete.
+#[test]
+fn many_pushers_over_sftp_each_land_their_tags() {
+    let server = need_server!();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let mut repos: Vec<Repo> = (0..8)
+        .map(|i| {
+            let (mut r, fs, _) = new_repo(&format!("dev{i}"));
+            let c = commit_files(&mut r, &*fs, &[(&format!("dev{i}.txt"), &format!("{i} ").repeat(4000))], "work");
+            r.set_tag(&format!("agent-{i}"), c, None, true).unwrap();
+            r
+        })
+        .collect();
+    std::thread::scope(|s| {
+        let hs: Vec<_> = repos
+            .iter_mut()
+            .map(|r| {
+                let (server, root) = (server.clone(), root.clone());
+                s.spawn(move || {
+                    let rep = remote::push(r, Arc::new(connect(&server, &root)), false, &[], false).unwrap();
+                    assert_eq!(rep.tags_updated.len(), 1, "{rep:#?}");
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+    });
+    let r = assert_remote_healthy(&root, "after many pushers");
+    for (i, repo) in repos.iter().enumerate() {
+        assert_eq!(r.view().tags[&format!("agent-{i}")].target, repo.view().tags[&format!("agent-{i}")].target);
+    }
+}
+
+/// Threat 6 over SFTP: `.veil/objects/incoming` is a symlink on the
+/// server. The push fails with a message and writes nothing through it.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_staging_directory_on_the_server_is_refused() {
+    let server = need_server!();
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let (mut alice, afs, _) = new_repo("alice");
+    history(&mut alice, &afs, 0, 1);
+    remote::push(&mut alice, Arc::new(connect(&server, dir.path())), false, &[], false).unwrap();
+    let incoming = dir.path().join(".veil/objects/incoming");
+    let _ = std::fs::remove_dir_all(&incoming);
+    std::os::unix::fs::symlink(outside.path(), &incoming).unwrap();
+    history(&mut alice, &afs, 1, 1);
+    let err = remote::push(&mut alice, Arc::new(connect(&server, dir.path())), false, &[], false).unwrap_err().to_string();
+    assert!(err.contains("symlink") && err.contains("incoming"), "{err}");
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0, "the push wrote through the symlink");
+}
