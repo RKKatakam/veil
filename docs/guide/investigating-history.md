@@ -231,6 +231,8 @@ These tools never show you more than `vl cat` and a checkout would:
 * **Local-only files** (isolated, quarantined, ignored) are in no snapshot,
   so none of these tools can find them.
 * `vl blame --public` shows the history as a public mirror sees it, for a
-  screenshot or a bug report.
+  screenshot or a bug report. With `--json`, a description the mirror
+  cannot read (cloaked, or under an unreleased embargo) is hidden even if
+  you hold its key (`description_hidden`, reason `not_public`).
 * Search memos live in memory only: nothing derived from sealed content is
   written to disk.

@@ -140,12 +140,14 @@ README`): in `status`, `show` (`parents`), `workspace list`, `tag list`.
 ### Hidden description
 
 A description sealed for a scope you are not in (the text shows
-`[cloaked:team]`).
+`[cloaked:team]`), or, in a `--public` view (`blame --public`), any
+description a public mirror cannot read (cloaked, or under an unreleased
+embargo), whatever keys you hold.
 
 | Field | Type | Meaning |
 |---|---|---|
 | `scope` | string | The scope it is sealed for |
-| `reason` | string | `no_key` |
+| `reason` | string | `no_key`; `not_public`: a `--public` view, and the description is not public |
 
 ### Visibility
 

@@ -120,7 +120,8 @@ merge later. For those:
 
 * `vl new main` and editing do **not** move `main`. Only committing does.
 * `vl merge X` moves the tags that pointed at the change merged *into*.
-* `vl pull` and `vl git pull` fast-forward tags from the remote. They never
+* `vl pull` and `vl git pull` fast-forward tags from the remote (never a
+  release tag: those stay where you made them). They never
   move your working copy: run `vl rebase -d main` (or `vl new main`)
   afterwards.
 * `vl push` and `vl git push` send **tags**, not your working copy. A change

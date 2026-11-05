@@ -2182,6 +2182,13 @@ const PREIMAGE_BYTES: u64 = 1 << 30;
 /// later version than the destination), read as this reader reads them
 /// (its own versions it can open, and the public fallbacks of the
 /// others), with the Git ids already computed.
+///
+/// A snapshot confined to an unreleased embargo (its withheld fix, work
+/// built on it, or its embargoed line: [`crate::confinement`]) is never
+/// looked in unless the destination is confined to the same embargo
+/// (BUG-706): its version would become a conflict term of the new change,
+/// and a public line would publish the fix's file (sealed or not) before
+/// the release.
 #[cfg_attr(not(feature = "git"), allow(dead_code))]
 struct Preimages {
     trees: Vec<ObjectId>,
@@ -2194,6 +2201,8 @@ impl Preimages {
         let mut trees = Vec::new();
         let mut seen_trees = BTreeSet::new();
         let mut seen = BTreeSet::new();
+        let mut confinement = crate::confinement::Confinement::new(repo)?;
+        let inside = confinement.of(repo, dest)?;
         for start in std::iter::once(*dest).chain(heads) {
             if !seen.insert(start) {
                 continue;
@@ -2204,7 +2213,11 @@ impl Preimages {
                     break;
                 }
                 let Ok(s) = repo.snapshot(&id) else { continue };
-                if seen_trees.insert(s.tree) {
+                let usable = match confinement.of(repo, &id)? {
+                    None => true,
+                    Some(e) => inside.as_deref() == Some(e.as_str()),
+                };
+                if usable && seen_trees.insert(s.tree) {
                     trees.push(s.tree);
                 }
                 for p in &s.parents {

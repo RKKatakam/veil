@@ -173,8 +173,9 @@ fn merge_resolved(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, t
     let t = store.tree(&plan.theirs)?;
     let mut conflicts = Vec::new();
     // Attributes of the path the content merges at: `ours` with the
-    // followed renames applied (a renamed file merges at its new path).
-    let attrs = Attrs::for_tree(store, plan.ours);
+    // followed renames applied (a renamed file merges at its new path), as
+    // the merged file's audience reads them (BUG-705).
+    let attrs = MergeAttrs::new(store, plan.ours);
     let tree = match merge_dir(store, b, Some((o, plan.ours)), Some((t, plan.theirs)), mode, markers, &mut conflicts, &attrs)? {
         Some(id) => id,
         None => store.empty_tree()?,
@@ -271,7 +272,7 @@ fn merge_dir(
     mode: Mode,
     markers: bool,
     conflicts: &mut Vec<VPath>,
-    attrs: &Attrs<'_>,
+    attrs: &MergeAttrs<'_>,
 ) -> Result<Option<ObjectId>> {
     let mut stack = vec![MergeFrame::new(VPath::root(), b, o, t)];
     let mut result: Option<Option<ObjectId>> = None;
@@ -407,14 +408,14 @@ fn merge_terms(
     te: Option<&TreeEntry>,
     mode: Mode,
     conflicts: &mut Vec<VPath>,
-    attrs: &Attrs<'_>,
+    attrs: &MergeAttrs<'_>,
 ) -> Result<Option<TreeEntry>> {
     let be = be.filter(|e| e.kind != EntryKind::Dir);
     let m = Merge::three_way(Merge::of_entry(store, be)?, Merge::of_entry(store, oe)?, Merge::of_entry(store, te)?).simplify();
     if let Some(t) = m.trivial() {
         return Ok(t.map(|t| t.entry(name)));
     }
-    if let Some(e) = resolve_by_content(store, path, name, &m, strategy(store, attrs, path, mode))? {
+    if let Some(e) = resolve_by_content(store, path, name, &m, attrs, mode)? {
         return Ok(Some(e));
     }
     if mode == Mode::VirtualBase {
@@ -452,7 +453,7 @@ fn relabelled(store: &ObjectStore, t: &Term, name: &str) -> Result<Term> {
 /// the result so far against its base. Its audience is the merged
 /// audience of the sides, as for any merged file (never wider than either,
 /// never moved between scopes). `None`: a real conflict.
-fn resolve_by_content(store: &ObjectStore, path: &VPath, name: &str, m: &Merge, how: MergeAttr) -> Result<Option<TreeEntry>> {
+fn resolve_by_content(store: &ObjectStore, path: &VPath, name: &str, m: &Merge, attrs: &MergeAttrs<'_>, mode: Mode) -> Result<Option<TreeEntry>> {
     if m.adds.iter().any(Option::is_none) || (m.adds.len() > 2 && m.removes.iter().any(Option::is_none)) {
         return Ok(None);
     }
@@ -467,7 +468,7 @@ fn resolve_by_content(store: &ObjectStore, path: &VPath, name: &str, m: &Merge, 
         let base = entry(&m.removes[i - 1]);
         let side = entry(&m.adds[i]).expect("present");
         let mut found = Vec::new();
-        let merged = merge_file_content(store, path, base.as_ref(), &acc, &side, &mut found, &how)?;
+        let merged = merge_file_content(store, path, base.as_ref(), &acc, &side, &mut found, attrs, mode)?;
         match merged {
             Some(e) if found.is_empty() => acc = e,
             _ => return Ok(None),
@@ -480,12 +481,45 @@ fn resolve_by_content(store: &ObjectStore, path: &VPath, name: &str, m: &Merge, 
 /// Git's (and diffy's default) conflict marker length.
 const MARKER_LEN: usize = 7;
 
-/// How the content at `path` merges, as `.gitattributes` (read from ours)
-/// says, with named drivers resolved against this device's definitions
-/// (see [`crate::attributes::merge_strategy`]). A virtual merge base only
+/// The attributes a merge reads (from ours), one set per audience of the
+/// merged files (BUG-705): a file merged for audience `V` is shaped only by
+/// `.gitattributes` content `V` can read ([`Attrs::for_audience`]), so a
+/// sealed `merge=union` never decides a public result, and a member and a
+/// non-member merging the same public files get the same tree.
+struct MergeAttrs<'a> {
+    store: &'a ObjectStore,
+    tree: ObjectId,
+    by_audience: std::cell::RefCell<Vec<(Visibility, Arc<Attrs<'a>>)>>,
+}
+
+impl<'a> MergeAttrs<'a> {
+    fn new(store: &'a ObjectStore, tree: ObjectId) -> Self {
+        MergeAttrs { store, tree, by_audience: Default::default() }
+    }
+
+    /// The attributes for a result sealed as `audience`.
+    fn for_audience(&self, audience: &Visibility) -> Arc<Attrs<'a>> {
+        let audience = match audience {
+            Visibility::Embargoed { embargo } if self.store.keys.embargo_released(embargo) => Visibility::Public,
+            v => v.clone(),
+        };
+        let mut by = self.by_audience.borrow_mut();
+        if let Some((_, a)) = by.iter().find(|(v, _)| *v == audience) {
+            return a.clone();
+        }
+        let a = Arc::new(Attrs::for_audience(self.store, self.tree, audience.clone()));
+        by.push((audience, a.clone()));
+        a
+    }
+}
+
+/// How the content at `path`, merged for `audience`, merges, as
+/// `.gitattributes` (read from ours, as `audience` reads it) says, with
+/// named drivers resolved against this device's definitions (see
+/// [`crate::attributes::merge_strategy`]). A virtual merge base only
 /// tells whole-file merges from line merges: no driver runs for it.
-fn strategy(store: &ObjectStore, attrs: &Attrs<'_>, path: &VPath, mode: Mode) -> MergeAttr {
-    match crate::attributes::merge_strategy(store, attrs, path) {
+fn strategy(store: &ObjectStore, attrs: &MergeAttrs<'_>, audience: &Visibility, path: &VPath, mode: Mode) -> MergeAttr {
+    match crate::attributes::merge_strategy(store, &attrs.for_audience(audience), path) {
         MergeAttr::Union | MergeAttr::Driver(_) if mode == Mode::VirtualBase => MergeAttr::Text,
         m => m,
     }
@@ -580,6 +614,7 @@ fn aside_name(f: &MergeFrame, name: &str, side: &str) -> String {
 /// The clean content merge of two file versions (format 4): `Some` with
 /// the merged file, or `None` (and the path in `conflicts`) when the two
 /// do not merge. No markers are ever written.
+#[allow(clippy::too_many_arguments)]
 fn merge_file_content(
     store: &ObjectStore,
     path: &VPath,
@@ -587,7 +622,8 @@ fn merge_file_content(
     oe: &TreeEntry,
     te: &TreeEntry,
     conflicts: &mut Vec<VPath>,
-    how: &MergeAttr,
+    attrs: &MergeAttrs<'_>,
+    mode: Mode,
 ) -> Result<Option<TreeEntry>> {
     let base = match be.filter(|e| e.kind == EntryKind::File) {
         Some(e) => read_for_merge(store, e, path)?,
@@ -613,7 +649,8 @@ fn merge_file_content(
     let (oe, te) = (&checked(store, oe, path)?, &checked(store, te, path)?);
     let (visibility, fallback) = merged_visibility(store, oe, te);
     let base_ok = base_shown(store, be, &visibility)?;
-    let merged = match content_merge(store, path, how, &base, &ours, &theirs, base_ok, crate::textmerge::Style::Diff3) {
+    let how = strategy(store, attrs, &visibility, path, mode);
+    let merged = match content_merge(store, path, &how, &base, &ours, &theirs, base_ok, crate::textmerge::Style::Diff3) {
         Ok(m) => m,
         Err(_) => {
             conflicts.push(path.clone());
@@ -644,7 +681,7 @@ fn merge_file(
     te: &TreeEntry,
     mode: Mode,
     conflicts: &mut Vec<VPath>,
-    attrs: &Attrs<'_>,
+    attrs: &MergeAttrs<'_>,
 ) -> Result<TreeEntry> {
     let base = match be.filter(|e| e.kind == EntryKind::File) {
         Some(e) => read_for_merge(store, e, path)?,
@@ -684,7 +721,7 @@ fn merge_file(
         true => crate::textmerge::Style::Diff3,
         false => crate::textmerge::Style::Merge,
     };
-    let how = strategy(store, attrs, path, mode);
+    let how = strategy(store, attrs, &visibility, path, mode);
     let merged = if mode == Mode::VirtualBase {
         // A virtual base keeps the base's version where the two merge
         // bases disagree, and is sealed as they are: where the base's

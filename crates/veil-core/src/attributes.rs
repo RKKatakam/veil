@@ -741,6 +741,56 @@ impl AttrSource for TreeSource<'_> {
     }
 }
 
+/// The `.gitattributes` files of a recorded tree as one **audience** reads
+/// them (BUG-705): a file whose content is public (or under a released
+/// embargo), or sealed exactly for `audience`, is read as it is; a file
+/// sealed for anyone else gives its last public version (its fallback), or
+/// nothing. Attributes that shape a merged result therefore come only from
+/// what the result's readers can read: a sealed `merge=union` never decides
+/// a public merge (the rule public patches already follow).
+pub struct AudienceTreeSource<'a> {
+    pub store: &'a ObjectStore,
+    pub tree: ObjectId,
+    /// [`crate::object::Visibility::Public`] for a public result.
+    pub audience: crate::object::Visibility,
+}
+
+impl AttrSource for AudienceTreeSource<'_> {
+    fn read_attributes(&self, dir: &VPath) -> std::result::Result<Option<Vec<u8>>, String> {
+        use crate::blame::{readable_version, Readable, Reader};
+        let path = dir.join(ATTRIBUTES_FILE);
+        let e = match crate::tree::lookup(self.store, &self.tree, &path) {
+            Ok(Some(e)) => e,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(e.to_string()),
+        };
+        if e.kind != EntryKind::File {
+            return Ok(None);
+        }
+        if e.size > MAX_FILE as u64 {
+            return Err(too_large());
+        }
+        let shown = |v: &crate::object::Visibility| match v {
+            crate::object::Visibility::Public => true,
+            crate::object::Visibility::Embargoed { embargo } if self.store.keys.embargo_released(embargo) => true,
+            v => *v == self.audience,
+        };
+        // What it really is sealed for (the visibility the opened object
+        // proves, never the entry's label).
+        let data = match readable_version(self.store, &e, Reader::Me).map_err(|e| e.to_string())? {
+            Readable::Plain { data, visibility, .. } if shown(&visibility) => Some(data),
+            _ => match readable_version(self.store, &e, Reader::Public).map_err(|e| e.to_string())? {
+                Readable::Plain { data, .. } | Readable::Fallback { data, .. } => Some(data),
+                Readable::Redacted(_) => None,
+            },
+        };
+        match data {
+            Some(d) if d.len() > MAX_FILE => Err(too_large()),
+            d => Ok(d),
+        }
+    }
+}
+
 // ---- the attributes of a working copy or tree -----------------------------------------------
 
 /// One directory's attributes file, read once, parsed on first need.
@@ -816,6 +866,12 @@ impl<'a> Attrs<'a> {
     /// The attributes of recorded tree `tree`, with the device-local file.
     pub fn for_tree(store: &'a ObjectStore, tree: ObjectId) -> Attrs<'a> {
         Attrs::with_source(Box::new(TreeSource { store, tree }), store.local_attributes().as_deref())
+    }
+
+    /// The attributes of recorded tree `tree` as `audience` reads them
+    /// ([`AudienceTreeSource`]), with the device-local file.
+    pub fn for_audience(store: &'a ObjectStore, tree: ObjectId, audience: crate::object::Visibility) -> Attrs<'a> {
+        Attrs::with_source(Box::new(AudienceTreeSource { store, tree, audience }), store.local_attributes().as_deref())
     }
 
     /// Warnings so far (files unreadable or too large, ignored lines), each

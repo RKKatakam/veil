@@ -15,7 +15,6 @@ const EMBARGO_DESC: &str = "EMBARGO-DESC-7730";
 /// cloaked change, and that of an unreleased embargoed merge, in plain
 /// text. A mirror shows `(description withheld)` / `[cloaked:embargo/…]`.
 #[test]
-#[ignore = "BUG-704: vl blame --public --json prints sealed descriptions (cloaked change, embargoed merge)"]
 fn blame_public_never_prints_a_sealed_description() {
     let env = Env::new();
     let proj = env.project(U, "proj", &[("README.md", "hello\nworld\n"), ("vuln.c", "int a;\nint b;\n")]);
@@ -46,4 +45,32 @@ fn blame_public_never_prints_a_sealed_description() {
     for d in [CLOAKED_DESC, EMBARGO_DESC] {
         assert!(!out.contains(d), "`vl blame --public` printed the sealed description {d}:\n{out}");
     }
+}
+
+/// BUG-704, the shape of the fix: `blame --public --json` hides a sealed
+/// description as `not_public` (naming its scope, as the mirror's `[cloaked:…]`
+/// does), still shows public descriptions, and without `--public` the
+/// member reads their own descriptions as before.
+#[test]
+fn blame_public_hides_sealed_descriptions_and_keeps_public_ones() {
+    let env = Env::new();
+    let proj = env.project(U, "proj", &[("README.md", "hello\nworld\n")]);
+    env.ok(U, &proj, &["ws", "new", "plan", "-r", "main", "--cloak", "team"]);
+    ws_write(&env, &proj, "plan", "README.md", "hello\ncloaked line\nworld\n");
+    env.ok(U, &proj, &["describe", "-r", "plan@", "-m", CLOAKED_DESC]);
+    let doc = |public: bool| -> serde_json::Value {
+        let mut args = vec!["blame", "README.md", "-r", "plan@", "--json"];
+        if public {
+            args.push("--public");
+        }
+        serde_json::from_str(&env.stdout(U, &proj, &args)).unwrap()
+    };
+    let public = doc(true);
+    assert_eq!(public["rev"]["description"], serde_json::Value::Null, "{public}");
+    assert_eq!(public["rev"]["description_hidden"]["reason"], "not_public", "{public}");
+    assert_eq!(public["rev"]["description_hidden"]["scope"], "team", "{public}");
+    let descriptions: Vec<&str> = public["changes"].as_array().unwrap().iter().filter_map(|c| c["description"].as_str()).collect();
+    assert!(descriptions.iter().any(|d| d.contains("initial")), "{public}");
+    let own = doc(false);
+    assert_eq!(own["rev"]["description"].as_str().map(str::trim), Some(CLOAKED_DESC), "{own}");
 }

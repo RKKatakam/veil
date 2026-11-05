@@ -195,3 +195,9 @@ Also different from Git:
   symlinked `.gitattributes` is never followed. One you cannot read (sealed
   for a scope you are not in) counts as absent: you get the bytes as
   recorded, members get them converted, and neither is an edit.
+* A merge reads `.gitattributes` as the merged file's readers can: a
+  **public** file merges only under public attributes (a sealed
+  `.gitattributes` counts as its last public version, or as absent), so
+  a sealed `merge=union` never decides public content, and you and
+  someone without the key merge the same files alike. A file cloaked for
+  `team` also follows `team`'s own sealed `.gitattributes`.

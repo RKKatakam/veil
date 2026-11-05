@@ -81,6 +81,7 @@ pub use export::{ExportReport, ExportedTag};
 // one projection function for every export.
 pub(crate) use export::split_author;
 pub(crate) use project::{public_open, public_text, Public, Veil, CLOAKED_DESCRIPTION};
+pub use project::public_description;
 pub use import::{ImportOrigin, ImportReport};
 pub use map::{GitMap, GitOid, Origin};
 pub use transport::{redact_url, PushOutcome, RefStatus};
@@ -758,6 +759,12 @@ fn update_tag(
             report.tags_updated.push((branch.to_string(), sid));
         }
         Some(t) if t.target == sid => {}
+        // A release tag (annotated) never follows a Git branch of its
+        // name: release tags are immutable.
+        Some(t) if t.annotation.is_some() => report.warnings.push(format!(
+            "Git branch {remote}/{branch} has the name of release tag {branch}; the release tag stays at {} (release tags never move)",
+            t.target.short()
+        )),
         Some(t) => {
             if tx.repo().is_ancestor(&t.target, &sid)? {
                 tx.view.tags.insert(

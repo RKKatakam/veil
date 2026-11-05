@@ -24,7 +24,7 @@ vl blame PATH [-r REV] [-L START,END] [--follow] [--max-changes N] [--json]
   - `Fallback(bytes)`: an embargoed entry the reader cannot open, or a line-cloaked public file, shown as its last public version. This is the version `vl cat` shows them.
   - `Redacted(reason)`.
   - A conflict entry is rendered with `conflict::materialize(…, Audience::Reader)`, so marker lines are attributed to the snapshot that recorded the conflict.
-- **Descriptions:** blame prints change ids, never descriptions, so a sealed description cannot leak through it. `--json` gives `snapshot_ref`, which already uses `api::description` (`HiddenText`).
+- **Descriptions:** blame prints change ids, never descriptions, so a sealed description cannot leak through it. `--json` gives `snapshot_ref`, which already uses `api::description` (`HiddenText`). With `--public` it gives `snapshot_ref_as(…, public)`: the description as a public mirror reads it (`git::public_description`), so a cloaked or unreleased-embargo description is `HiddenText` with reason `not_public` even for a member who holds the key (BUG-704).
 - **CLI:** `crates/vl/src/history.rs` (new), `api::blame` in `crates/vl/src/api.rs`, and a `blame` method in `serve.rs`.
 
 ### `vl bisect`

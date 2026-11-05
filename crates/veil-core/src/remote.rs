@@ -127,6 +127,10 @@ pub struct SyncReport {
     /// Local tags that a pull did not recreate: deleted here, and not
     /// moved on the remote since ([`deleted_tags`]).
     pub tags_kept_deleted: Vec<String>,
+    /// Pull: local release tags (annotated) the remote holds at another
+    /// target, as (tag, local target, remote target). Release tags never
+    /// move on a pull; the remote's target is `<remote>/<tag>`.
+    pub release_tags_kept: Vec<(String, ObjectId, ObjectId)>,
 }
 
 /// How to synchronise.
@@ -2046,6 +2050,13 @@ pub fn pull_with(
                         },
                     );
                 }
+            }
+            // A release tag (annotated, format 5) is immutable: a remote
+            // that holds it elsewhere (a teammate's `--force`, or a hostile
+            // remote) never moves the local one, nor swaps its annotation.
+            // The remote's target is recorded as `<remote>/<name>` above.
+            Some(existing) if existing.annotation.is_some() => {
+                report.release_tags_kept.push((name, existing.target, tag.target));
             }
             Some(existing) => {
                 if tx.repo().is_ancestor(&existing.target, &tag.target)? {

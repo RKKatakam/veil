@@ -157,6 +157,21 @@ pub(crate) fn public_text(store: &ObjectStore, veil: &Veil, t: &Text) -> (String
     }
 }
 
+/// A description as a public mirror reads it: `None` if it is sealed for a
+/// cloak scope or an unreleased embargo (keys this replica holds for them
+/// are never used). For `--public` views outside the bridge (`vl blame
+/// --public`).
+pub fn public_description(store: &ObjectStore, t: &Text) -> Option<String> {
+    match t {
+        Text::Plain(s) => Some(s.clone()),
+        Text::Sealed(env) if label_is_public(&store.keys, &Veil::default(), &env.scope) => {
+            let key = store.keys.key(&env.scope)?;
+            String::from_utf8(env.open(&key).ok()?).ok()
+        }
+        Text::Sealed(_) => None,
+    }
+}
+
 /// The commit a gitlink's content `"<40 hex>\n"` names (lowercase hex,
 /// SHA-1 only: the bridge repository is SHA-1).
 pub(crate) fn gitlink_commit(data: &[u8]) -> Option<GitOid> {
