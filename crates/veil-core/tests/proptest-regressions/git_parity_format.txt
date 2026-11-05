@@ -1,7 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc d5daaabd9ed84f944e0bbc57df91c1e16001b556490f8d41d61da84615f52d8d # shrinks to target = "/srv/aaaaaa-secret", notes = "release notes aaaafffr"
