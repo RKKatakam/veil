@@ -331,19 +331,13 @@ impl OpStore {
     /// walk stops an hour below the oldest head and at pruned operations:
     /// an unknown ancestry counts as "not an ancestor" (a harmless merge).
     pub fn drop_ancestors(&self, heads: &[ObjectId]) -> Result<Vec<ObjectId>> {
+        if heads.len() < 2 {
+            // The caller reads it ([`OpStore::get_head`]).
+            return Ok(heads.to_vec());
+        }
         let mut ops = HashMap::new();
         for h in heads {
-            let op = self.try_get(h)?.ok_or_else(|| {
-                let file = match self.uses_heads_dir() {
-                    true => format!("{OP_HEADS_DIR}/{}", h.hex()),
-                    false => OP_HEAD_FILE.to_string(),
-                };
-                VeilError::NotFound(format!("operation {} named by {file} (run `vl fsck`)", h.short()))
-            })?;
-            ops.insert(*h, op);
-        }
-        if heads.len() < 2 {
-            return Ok(heads.to_vec());
+            ops.insert(*h, self.get_head(h)?);
         }
         let words = heads.len().div_ceil(64);
         let mut full = vec![u64::MAX; words];
@@ -391,6 +385,17 @@ impl OpStore {
             }
         }
         Ok(heads.iter().zip(reached_from_other).filter(|(_, r)| !r).map(|(h, _)| *h).collect())
+    }
+
+    /// The operation of head `id`; missing, an error naming the head file.
+    pub fn get_head(&self, id: &ObjectId) -> Result<Operation> {
+        self.try_get(id)?.ok_or_else(|| {
+            let file = match self.uses_heads_dir() {
+                true => format!("{OP_HEADS_DIR}/{}", id.hex()),
+                false => OP_HEAD_FILE.to_string(),
+            };
+            VeilError::NotFound(format!("operation {} named by {file} (run `vl fsck`)", id.short()))
+        })
     }
 
     fn cached<'a>(&self, ops: &'a mut HashMap<ObjectId, Operation>, id: &ObjectId) -> Result<Option<&'a Operation>> {

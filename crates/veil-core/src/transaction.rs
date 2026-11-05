@@ -975,6 +975,15 @@ impl<'r> Transaction<'r> {
         self.repo.graph.persist(self.repo);
         let warnings = self.take_merge_warnings();
         self.repo.warnings.extend(warnings);
+        if lock_free {
+            // Merge what landed concurrently now, so that this process
+            // reports what the merge decided. The operation is recorded
+            // either way: a failure here leaves the merge to the next
+            // command.
+            if let Err(e) = self.repo.settle() {
+                self.repo.warnings.push(format!("concurrent operations are not merged yet ({e}); the next command merges them"));
+            }
+        }
         Ok(Some(id))
     }
 }

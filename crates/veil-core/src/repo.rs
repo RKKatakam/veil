@@ -405,7 +405,7 @@ impl Repo {
         }
         let heads = self.ops.drop_ancestors(&raw.all)?;
         let (op_id, view) = match heads.as_slice() {
-            [one] => (*one, self.ops.get(one)?.view),
+            [one] => (*one, self.ops.get_head(one)?.view),
             _ => {
                 let plan = self.merge_plan(&heads, false)?;
                 (self.ops.head()?, plan.view)
@@ -435,6 +435,13 @@ impl Repo {
     pub fn transaction(&mut self, description: impl Into<String>) -> Result<Transaction<'_>> {
         if self.lock_free() {
             self.reload()?;
+            // A transaction starts from one merged head: from several, its
+            // view would lack the merge's rewrites and confinement check.
+            if self.base.len() > 1 {
+                return Err(VeilError::repo(
+                    "other commands keep recording operations faster than they can be merged; try again",
+                ));
+            }
             return Transaction::new(self, description.into(), None);
         }
         let lock = RepoLock::acquire(self.backend.clone())?;
