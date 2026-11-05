@@ -522,6 +522,28 @@ impl PartialOrd for Queued {
     }
 }
 
+/// Topological ranks (children first, as [`Repo::topo_children_first`]
+/// numbers them), produced only as far as they are asked for.
+struct LazyRank<'r> {
+    iter: crate::graph_index::TopoIter<'r>,
+    ranks: HashMap<ObjectId, usize>,
+}
+
+impl LazyRank<'_> {
+    fn of(&mut self, id: &ObjectId) -> Result<Option<usize>> {
+        while !self.ranks.contains_key(id) {
+            match self.iter.next() {
+                Some(next) => {
+                    let n = self.ranks.len();
+                    self.ranks.insert(next?, n);
+                }
+                None => break,
+            }
+        }
+        Ok(self.ranks.get(id).copied())
+    }
+}
+
 /// The version of the file at `path` in `tree` this reader reads, `None`
 /// when there is no file there; `Err(Hidden)` when it is redacted.
 fn version_at(store: &ObjectStore, tree: &ObjectId, path: &VPath, reader: Reader, stats: &mut ReadStats) -> Result<Option<std::result::Result<Arc<Version>, Hidden>>> {
@@ -567,11 +589,8 @@ pub fn blame(repo: &Repo, rev: &ObjectId, path: &VPath, o: &BlameOptions) -> Res
     let open: Vec<(u32, u32)> = (from..to.max(from)).map(|i| (i as u32, i as u32)).collect();
     // Children before parents: every line a snapshot will receive has
     // arrived by the time it is popped.
-    let rank: HashMap<ObjectId, usize> = if open.is_empty() {
-        HashMap::new()
-    } else {
-        repo.topo_children_first([*rev])?.into_iter().enumerate().map(|(i, id)| (id, i)).collect()
-    };
+    // Ranks come lazily, as far down as the walk goes (the history index).
+    let mut rank = LazyRank { iter: repo.topo_iter([*rev]), ranks: HashMap::new() };
     if !open.is_empty() {
         pending.insert((*rev, path.clone()), Pending { lines: open, version: version.clone() });
         heap.push(Queued { rank: 0, id: *rev, path: path.clone() });
@@ -596,8 +615,8 @@ pub fn blame(repo: &Repo, rev: &ObjectId, path: &VPath, o: &BlameOptions) -> Res
             }
             // A parent withheld here (an unreleased embargo on a public
             // clone) is not part of this replica's history.
-            let Some(&prank) = rank.get(parent) else { continue };
             let Some(ps) = repo.snapshot_opt(parent)? else { continue };
+            let Some(prank) = rank.of(parent)? else { continue };
             let mut ppath = q.path.clone();
             let mut pv = match pending.get(&(*parent, ppath.clone())) {
                 Some(p) => Some(Ok(p.version.clone())),

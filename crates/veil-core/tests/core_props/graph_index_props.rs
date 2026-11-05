@@ -44,7 +44,10 @@ fn dag() -> impl Strategy<Value = Dag> {
                 proptest::collection::vec(earlier, if i == 0 { 0..1 } else { 1..4 })
             })
             .collect::<Vec<_>>();
-        (parents, proptest::collection::vec(0i64..4, n), proptest::collection::vec(proptest::bool::weighted(0.15), n))
+        // Timestamps often tie, and often run against the history (a
+        // child older than its parent), which generations must survive.
+        let times = proptest::collection::vec(prop_oneof![0i64..4, 0i64..40], n);
+        (parents, times, proptest::collection::vec(proptest::bool::weighted(0.15), n))
     })
     .prop_map(|(parents, times, late)| {
         // Node 0 has no parents; `None` stands for an absent parent.
@@ -102,10 +105,11 @@ fn repo() -> (Arc<dyn StorageBackend>, Repo) {
 }
 
 /// Full-walk answers.
-fn naive_generation(repo: &Repo, id: &ObjectId, memo: &mut HashMap<ObjectId, Option<u32>>) -> Option<u32> {
+fn naive_generation(repo: &Repo, id: &ObjectId, memo: &mut HashMap<ObjectId, Option<u64>>) -> Option<u64> {
     if let Some(g) = memo.get(id) {
         return *g;
     }
+    // A corrected commit date: the timestamp, or one more than the parents.
     let g = repo.snapshot_opt(id).unwrap().map(|s| {
         let mut g = 0;
         for p in &s.parents {
@@ -113,7 +117,7 @@ fn naive_generation(repo: &Repo, id: &ObjectId, memo: &mut HashMap<ObjectId, Opt
                 g = g.max(pg);
             }
         }
-        g + 1
+        (g + 1).max(s.timestamp.max(0) as u64)
     });
     memo.insert(*id, g);
     g
@@ -131,6 +135,9 @@ fn check_all(repo: &Repo, nodes: &[ObjectId], pick: &[usize]) {
     // Order: exactly `topo_children_first`'s (threat 12).
     let lazy: Vec<ObjectId> = repo.topo_iter(roots.iter().copied()).map(Result::unwrap).collect();
     assert_eq!(lazy, repo.topo_children_first(roots.iter().copied()).unwrap(), "topo order");
+    // Every node a root (old tags and branches among the refs).
+    let all: Vec<ObjectId> = repo.topo_iter(nodes.iter().copied()).map(Result::unwrap).collect();
+    assert_eq!(all, repo.topo_children_first(nodes.iter().copied()).unwrap(), "topo order, all roots");
     let mut memo = HashMap::new();
     for id in nodes {
         // Generations strictly decrease along every edge.

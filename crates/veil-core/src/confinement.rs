@@ -38,7 +38,7 @@ pub struct Confinement {
     memo: HashMap<ObjectId, Option<String>>,
     /// The lowest generation of the withheld history: nothing below it
     /// builds on withheld history.
-    floor: u32,
+    floor: crate::graph_index::Gen,
 }
 
 /// The unreleased embargoes whose embargoed merge (or a rewrite of it) is
@@ -63,7 +63,7 @@ impl Confinement {
     /// The confinement of `repo`'s current view.
     pub fn new(repo: &Repo) -> Result<Confinement> {
         let withheld = crate::remote::embargo_withheld(repo, true)?;
-        let mut floor = u32::MAX;
+        let mut floor = crate::graph_index::Gen::MAX;
         for id in withheld.keys() {
             if let Some(g) = repo.graph().generation(repo, id)? {
                 floor = floor.min(g);

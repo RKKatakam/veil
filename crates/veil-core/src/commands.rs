@@ -268,7 +268,11 @@ impl Repo {
         if let Some(w) = unreleased_wrapper(&self.store, &s.tree)? {
             return Ok(Some(w.embargo));
         }
-        for a in self.ancestors(id)? {
+        // Embargoed snapshots come from the history index: with none in
+        // the history, nothing is walked.
+        let mut carried: Vec<ObjectId> = self.graph().embargoed_among(self, [*id])?.into_iter().collect();
+        carried.sort();
+        for a in carried {
             let Some(s) = self.snapshot_opt(&a)? else { continue };
             if let Some(e) = &s.embargo {
                 if !self.keys().embargo_released(e) {
@@ -923,18 +927,23 @@ impl Repo {
     /// ancestor of one of `others`, not of `into`) present and signed by a
     /// current member of `scope` ([`crate::keychain::Keychain::signed_by_member`])?
     fn merged_in_signed_by(&self, into: &ObjectId, others: &[ObjectId], scope: &str) -> Result<bool> {
-        let known = self.ancestors(into)?;
-        let mut seen = std::collections::HashSet::new();
-        let mut stack = others.to_vec();
-        while let Some(x) = stack.pop() {
-            if known.contains(&x) || !seen.insert(x) {
-                continue;
+        // What the merge brings in, without reading `into`'s history below
+        // the merge base (the history index).
+        let brought = self.graph().range(self, others, &[*into])?;
+        for x in others.iter().chain(&brought) {
+            if brought.contains(x) || !self.is_ancestor(x, into)? {
+                let Some(s) = self.snapshot_opt(x)? else { return Ok(false) };
+                if !self.keys().signed_by_member(scope, &s) {
+                    return Ok(false);
+                }
+                // A parent this replica lacks counts as unsigned unless
+                // `into` already has it.
+                for p in &s.parents {
+                    if !brought.contains(p) && self.snapshot_opt(p)?.is_none() && !self.is_ancestor(p, into)? {
+                        return Ok(false);
+                    }
+                }
             }
-            let Some(s) = self.snapshot_opt(&x)? else { return Ok(false) };
-            if !self.keys().signed_by_member(scope, &s) {
-                return Ok(false);
-            }
-            stack.extend(s.parents.iter().copied());
         }
         Ok(true)
     }

@@ -493,33 +493,19 @@ impl Repo {
         self.topo_iter(self.view.refs())
     }
 
-    /// The visible snapshots whose `embargo` is set, in the order of
-    /// [`Repo::visible_snapshots`]. Found through the history index: with
-    /// no embargo in the history, nothing is walked.
+    /// The visible snapshots whose `embargo` is set, newest first
+    /// (generation, then timestamp, then id). Found through the history
+    /// index, which walks only lines that build on one: with no embargo in
+    /// the history, nothing is walked.
     pub fn visible_embargoed(&self) -> Result<Vec<ObjectId>> {
-        let flagged: HashSet<ObjectId> = self
-            .graph
-            .entries_matching(self, self.view.refs(), |_, e| e.flags & crate::graph_index::FLAG_EMBARGO != 0)?
-            .into_iter()
-            .collect();
-        if flagged.is_empty() {
-            return Ok(Vec::new());
+        let found = self.graph.embargoed_among(self, self.view.refs())?;
+        let mut out = Vec::with_capacity(found.len());
+        for id in found {
+            let g = self.graph.generation(self, &id)?.unwrap_or(0);
+            out.push((std::cmp::Reverse(g), std::cmp::Reverse(self.snapshot(&id)?.timestamp), id));
         }
-        let visible = self.visible_among(&flagged)?;
-        let mut out = Vec::with_capacity(visible.len());
-        if visible.is_empty() {
-            return Ok(out);
-        }
-        for id in self.visible_iter() {
-            let id = id?;
-            if visible.contains(&id) {
-                out.push(id);
-                if out.len() == visible.len() {
-                    break;
-                }
-            }
-        }
-        Ok(out)
+        out.sort();
+        Ok(out.into_iter().map(|(_, _, id)| id).collect())
     }
 
     /// Which of `candidates` are visible (reachable from the view)? Reads

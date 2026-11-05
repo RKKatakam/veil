@@ -328,14 +328,14 @@ impl<'r> Transaction<'r> {
         // Only descendants of a rewritten snapshot can move, and each has a
         // larger generation than the oldest one: the walk stops there
         // instead of reading all history.
-        let mut floor = u32::MAX;
+        let mut floor = crate::graph_index::Gen::MAX;
         for old in self.rewritten.keys() {
             if let Some(g) = self.repo.graph.generation(self.repo, old)? {
                 floor = floor.min(g);
             }
         }
-        let mut order: Vec<(u32, i64, ObjectId)> = match floor {
-            u32::MAX => Vec::new(),
+        let mut order: Vec<(crate::graph_index::Gen, i64, ObjectId)> = match floor {
+            crate::graph_index::Gen::MAX => Vec::new(),
             f => self
                 .repo
                 .graph

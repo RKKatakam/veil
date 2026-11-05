@@ -1,14 +1,23 @@
-//! The history index: each snapshot's **generation** (its topological
-//! level), kept as a device-local cache so that graph queries stop at the
-//! part of the history they need instead of reading all of it
+//! The history index: each snapshot's **generation**, kept as a
+//! device-local cache so that graph queries stop at the part of the
+//! history they need instead of reading all of it
 //! (`docs/design/scale/3-history-index.md`).
 //!
-//! The generation of a snapshot is 1 plus the largest generation of its
-//! parents present in the store, and 1 for a snapshot without any. Along
+//! The generation is a *corrected commit date* (Git's generation v2): the
+//! larger of the snapshot's own timestamp (milliseconds, at least 0) and 1
+//! plus the largest generation of its parents present in the store. Along
 //! every parent edge it strictly decreases, so a walk looking for `a` below
 //! `b` can stop at every snapshot whose generation is below `a`'s: none of
 //! that snapshot's ancestors can be `a`. That is the only property the walks
-//! rely on.
+//! rely on, and it holds whatever timestamps authors chose: a timestamp in
+//! the future or the past only makes some walk read more, never answer
+//! wrongly. Following timestamps, walks stop at what is older than what
+//! they look for, which a plain topological level cannot do for an old
+//! branch or an old tag.
+//!
+//! A second derived fact rides along: whether a snapshot or any ancestor
+//! has `embargo` set ([`FLAG_EMBARGO_LINE`]), so that the embargo checks
+//! skip every line that does not build on an embargoed merge.
 //!
 //! **What the index trusts.** Walks read every snapshot they visit from the
 //! store, and take its parents from the object, never from the index. The
@@ -54,7 +63,7 @@
 //! ```text
 //! "VEILCG01" | count u32 | missing u32
 //! | ids [count × 32], ascending
-//! | records [count × (generation u32 | change id [16] | flags u8)]
+//! | records [count × (generation u64 | change id [16] | flags u8)]
 //! | missing parents [missing × 32]
 //! | BLAKE3 of everything before
 //! ```
@@ -76,9 +85,14 @@ use crate::{
 const MAGIC: &[u8; 8] = b"VEILCG01";
 const DIR: &str = ".veil/index/graph";
 const HEADER: usize = 8 + 4 + 4;
-const REC: usize = 4 + 16 + 1;
+const REC: usize = 8 + 16 + 1;
 /// Flag: the snapshot's `embargo` field is set.
 pub const FLAG_EMBARGO: u8 = 1;
+/// Flag: the snapshot or one of its ancestors in the store has [`FLAG_EMBARGO`].
+pub const FLAG_EMBARGO_LINE: u8 = 2;
+
+/// A generation (see the module docs).
+pub type Gen = u64;
 /// Fresh entries a read-only command persists without waiting for a commit.
 const PERSIST_BATCH: usize = 256;
 /// Layers above this count on the chain are merged even when not geometric.
@@ -87,7 +101,7 @@ const MAX_LAYERS: usize = 24;
 /// One index entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Entry {
-    pub generation: u32,
+    pub generation: Gen,
     pub change_id: ChangeId,
     pub flags: u8,
 }
@@ -134,9 +148,9 @@ impl Layer {
         let at = HEADER + self.count * 32 + i * REC;
         let r = &self.data[at..at + REC];
         Entry {
-            generation: u32::from_le_bytes(r[..4].try_into().unwrap()),
-            change_id: ChangeId(r[4..20].try_into().unwrap()),
-            flags: r[20],
+            generation: u64::from_le_bytes(r[..8].try_into().unwrap()),
+            change_id: ChangeId(r[8..24].try_into().unwrap()),
+            flags: r[24],
         }
     }
 
@@ -538,7 +552,7 @@ impl GraphIndex {
     // ---- queries --------------------------------------------------------
 
     /// The generation of snapshot `id`; `None` if the store does not hold it.
-    pub fn generation(&self, repo: &Repo, id: &ObjectId) -> Result<Option<u32>> {
+    pub fn generation(&self, repo: &Repo, id: &ObjectId) -> Result<Option<Gen>> {
         self.with(repo, |w| Ok(w.entry(id)?.map(|e| e.generation)))
     }
 
@@ -560,7 +574,7 @@ impl GraphIndex {
         candidates: &HashSet<ObjectId>,
     ) -> Result<HashSet<ObjectId>> {
         self.with(repo, |w| {
-            let mut floor = u32::MAX;
+            let mut floor = Gen::MAX;
             let mut wanted = HashSet::new();
             for c in candidates {
                 if let Some(e) = w.entry(c)? {
@@ -598,16 +612,42 @@ impl GraphIndex {
         })
     }
 
+    /// The snapshots with [`FLAG_EMBARGO`] reachable from `roots`. The walk
+    /// reads only lines that build on one ([`FLAG_EMBARGO_LINE`]): with no
+    /// embargo in the history, nothing past the roots.
+    pub fn embargoed_among(&self, repo: &Repo, roots: impl IntoIterator<Item = ObjectId>) -> Result<HashSet<ObjectId>> {
+        self.with(repo, |w| {
+            let mut found = HashSet::new();
+            let mut seen = HashSet::new();
+            let mut stack: Vec<ObjectId> = roots.into_iter().collect();
+            while let Some(id) = stack.pop() {
+                if !seen.insert(id) {
+                    continue;
+                }
+                let Some(e) = w.entry(&id)? else { continue };
+                if e.flags & FLAG_EMBARGO_LINE == 0 {
+                    continue;
+                }
+                if e.flags & FLAG_EMBARGO != 0 {
+                    found.insert(id);
+                }
+                let Some(s) = w.snapshot(&id)? else { continue };
+                stack.extend(s.parents.iter().filter(|p| !seen.contains(*p)).copied());
+            }
+            Ok(found)
+        })
+    }
+
     /// Every snapshot reachable from `roots` whose generation is at least
     /// `floor`, with its snapshot. The walk stops below `floor`.
     pub fn down_to(
         &self,
         repo: &Repo,
         roots: impl IntoIterator<Item = ObjectId>,
-        floor: u32,
-    ) -> Result<HashMap<ObjectId, (u32, Arc<Snapshot>)>> {
+        floor: Gen,
+    ) -> Result<HashMap<ObjectId, (Gen, Arc<Snapshot>)>> {
         self.with(repo, |w| {
-            let mut out: HashMap<ObjectId, (u32, Arc<Snapshot>)> = HashMap::new();
+            let mut out: HashMap<ObjectId, (Gen, Arc<Snapshot>)> = HashMap::new();
             let mut seen = HashSet::new();
             let mut stack: Vec<ObjectId> = roots.into_iter().collect();
             while let Some(id) = stack.pop() {
@@ -634,11 +674,11 @@ impl GraphIndex {
         const EXC: u8 = 2;
         self.with(repo, |w| {
             let mut flags: HashMap<ObjectId, u8> = HashMap::new();
-            let mut heap: BinaryHeap<(u32, ObjectId)> = BinaryHeap::new();
+            let mut heap: BinaryHeap<(Gen, ObjectId)> = BinaryHeap::new();
             // Queued nodes not (yet) known to be reachable from `exclude`.
             let mut live = 0usize;
             let mut queued: HashSet<ObjectId> = HashSet::new();
-            let mark = |w: &mut Walker<'_>, flags: &mut HashMap<ObjectId, u8>, heap: &mut BinaryHeap<(u32, ObjectId)>, queued: &mut HashSet<ObjectId>, live: &mut usize, id: ObjectId, f: u8| -> Result<()> {
+            let mark = |w: &mut Walker<'_>, flags: &mut HashMap<ObjectId, u8>, heap: &mut BinaryHeap<(Gen, ObjectId)>, queued: &mut HashSet<ObjectId>, live: &mut usize, id: ObjectId, f: u8| -> Result<()> {
                 let Some(e) = w.entry(&id)? else { return Ok(()) };
                 let old = flags.get(&id).copied();
                 let new = old.unwrap_or(0) | f;
@@ -693,9 +733,9 @@ impl GraphIndex {
         const STALE: u8 = 4;
         self.with(repo, |w| {
             let mut flags: HashMap<ObjectId, u8> = HashMap::new();
-            let mut heap: BinaryHeap<(u32, ObjectId)> = BinaryHeap::new();
+            let mut heap: BinaryHeap<(Gen, ObjectId)> = BinaryHeap::new();
             let mut done: HashSet<ObjectId> = HashSet::new();
-            let push = |w: &mut Walker<'_>, flags: &mut HashMap<ObjectId, u8>, heap: &mut BinaryHeap<(u32, ObjectId)>, id: ObjectId, f: u8| -> Result<()> {
+            let push = |w: &mut Walker<'_>, flags: &mut HashMap<ObjectId, u8>, heap: &mut BinaryHeap<(Gen, ObjectId)>, id: ObjectId, f: u8| -> Result<()> {
                 let Some(e) = w.entry(&id)? else { return Ok(()) };
                 let old = flags.get(&id).copied();
                 let new = old.unwrap_or(0) | f;
@@ -782,9 +822,11 @@ impl GraphIndex {
             index: self,
             repo,
             roots: Some(roots.into_iter().collect()),
+            unexamined: Vec::new(),
             explore: BinaryHeap::new(),
             indegree: HashMap::new(),
             ready: BinaryHeap::new(),
+            queued: HashSet::new(),
             nodes: HashMap::new(),
             failed: false,
         }
@@ -830,23 +872,27 @@ impl Walker<'_> {
                 continue;
             }
             let s = pending.remove(&x).expect("expanded snapshots are pending");
-            let mut generation: u32 = 0;
+            let mut above: Gen = 0;
+            let mut flags = if s.embargo.is_some() { FLAG_EMBARGO | FLAG_EMBARGO_LINE } else { 0 };
             for p in &s.parents {
                 match self.st.get(p) {
-                    Some(e) => generation = generation.max(e.generation),
+                    Some(e) => {
+                        above = above.max(e.generation);
+                        flags |= e.flags & FLAG_EMBARGO_LINE;
+                    }
                     None => {
                         self.st.missing.insert(*p);
                         self.st.fresh_missing.insert(*p);
                     }
                 }
             }
-            let generation = generation.checked_add(1).filter(|g| *g < u32::MAX).ok_or_else(|| {
-                VeilError::Unsupported("the history is deeper than the index supports (4 billion snapshots)".into())
+            let above = above.checked_add(1).filter(|g| *g < Gen::MAX).ok_or_else(|| {
+                VeilError::Unsupported("the history is deeper than the index supports".into())
             })?;
             let e = Entry {
-                generation,
+                generation: above.max(s.timestamp.max(0) as Gen),
                 change_id: s.change_id,
-                flags: if s.embargo.is_some() { FLAG_EMBARGO } else { 0 },
+                flags,
             };
             self.st.mem.insert(x, e);
             self.st.fresh.push(x);
@@ -856,18 +902,29 @@ impl Walker<'_> {
 }
 
 /// See [`GraphIndex::topo_iter`].
+///
+/// Kahn's algorithm, newest first among the snapshots whose children are
+/// all emitted, made lazy two ways. A node's count of children is complete
+/// once every node of a larger generation is explored, so exploration goes
+/// only as deep as the next node to emit. And a root (which no emitted node
+/// will free) is examined only once its timestamp could be the next one
+/// emitted: an old tag costs nothing until the walk reaches its time.
 pub struct TopoIter<'r> {
     index: &'r GraphIndex,
     repo: &'r Repo,
     roots: Option<Vec<ObjectId>>,
+    /// Roots not examined yet, oldest first (the newest is popped).
+    unexamined: Vec<(i64, ObjectId)>,
     /// Nodes to explore (count their parents' children), highest generation first.
-    explore: BinaryHeap<(u32, ObjectId)>,
+    explore: BinaryHeap<(Gen, ObjectId)>,
     /// Children counted so far, per discovered node.
     indegree: HashMap<ObjectId, usize>,
     /// Nodes whose children are all emitted, newest first.
     ready: BinaryHeap<(i64, ObjectId)>,
+    /// Nodes ever put in `ready`.
+    queued: HashSet<ObjectId>,
     /// Discovered nodes: generation and snapshot.
-    nodes: HashMap<ObjectId, (u32, Arc<Snapshot>)>,
+    nodes: HashMap<ObjectId, (Gen, Arc<Snapshot>)>,
     failed: bool,
 }
 
@@ -884,10 +941,12 @@ impl TopoIter<'_> {
         Ok(true)
     }
 
-    /// Explore every node of generation `>= floor`: afterwards the child
-    /// count of every node of generation `< floor`... and of every node
-    /// whose children all have generation `>= floor` is complete.
-    fn explore_to(&mut self, w: &mut Walker<'_>, floor: u32) -> Result<()> {
+    /// Explore every discovered node of generation `>= floor` (count it
+    /// as a child of each of its parents, discovering them). Afterwards the
+    /// count of every node of generation `< floor` whose children all have
+    /// generation `>= floor` is complete: in particular, of every node of
+    /// generation `floor - 1`.
+    fn explore_to(&mut self, w: &mut Walker<'_>, floor: Gen) -> Result<()> {
         while let Some(&(g, id)) = self.explore.peek() {
             if g < floor {
                 break;
@@ -903,39 +962,54 @@ impl TopoIter<'_> {
         Ok(())
     }
 
+    /// Queue `id` if its count is complete and zero.
+    fn settle(&mut self, w: &mut Walker<'_>, id: ObjectId) -> Result<()> {
+        if self.queued.contains(&id) {
+            return Ok(());
+        }
+        let g = self.nodes[&id].0;
+        self.explore_to(w, g + 1)?;
+        if self.indegree[&id] == 0 {
+            self.queued.insert(id);
+            self.ready.push((self.nodes[&id].1.timestamp, id));
+        }
+        Ok(())
+    }
+
     fn step(&mut self) -> Result<Option<ObjectId>> {
         let (index, repo) = (self.index, self.repo);
         index.with(repo, |w| {
             if let Some(roots) = self.roots.take() {
-                let mut present = Vec::new();
                 for r in roots {
                     if self.discover(w, r)? {
-                        present.push(r);
+                        self.unexamined.push((self.nodes[&r].1.timestamp, r));
                     }
                 }
-                let floor = present.iter().map(|r| self.nodes[r].0).min().unwrap_or(u32::MAX);
-                self.explore_to(w, floor.saturating_add(1))?;
-                present.sort();
-                present.dedup();
-                for r in present {
-                    if self.indegree[&r] == 0 {
-                        self.ready.push((self.nodes[&r].1.timestamp, r));
-                    }
+                self.unexamined.sort();
+                self.unexamined.dedup();
+            }
+            // A root newer than the best ready node might be ready itself.
+            while let Some(&key) = self.unexamined.last() {
+                if self.ready.peek().is_some_and(|top| *top > key) {
+                    break;
                 }
+                self.unexamined.pop();
+                self.settle(w, key.1)?;
             }
             let Some((_, id)) = self.ready.pop() else { return Ok(None) };
             // Explored itself, so its parents are discovered and counted.
             self.explore_to(w, self.nodes[&id].0)?;
             let parents = self.nodes[&id].1.parents.clone();
             for p in parents {
-                let Some(&(g, _)) = self.nodes.get(&p) else { continue };
-                // Every child of `p` has a larger generation: once those
-                // are explored, `p`'s count is final.
-                self.explore_to(w, g + 1)?;
+                if !self.nodes.contains_key(&p) {
+                    continue;
+                }
                 let c = self.indegree.get_mut(&p).unwrap();
                 *c -= 1;
                 if *c == 0 {
-                    self.ready.push((self.nodes[&p].1.timestamp, p));
+                    // Every child of `p` has a larger generation: once
+                    // those are explored, its count is final.
+                    self.settle(w, p)?;
                 }
             }
             Ok(Some(id))
