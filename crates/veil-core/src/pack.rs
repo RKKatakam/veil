@@ -40,7 +40,7 @@ use crate::{
     cache::LruCache,
     error::{Result, VeilError},
     id::ObjectId,
-    vfs::StorageBackend,
+    vfs::{StorageBackend, StreamWriter},
     vpath::VPath,
 };
 
@@ -844,7 +844,8 @@ pub struct PackStats {
     pub pack_bytes: u64,
 }
 
-/// Accumulates objects into a pack in memory, then writes it out.
+/// Accumulates objects into a pack in memory, then writes it out (small
+/// packs; [`PackWriter`] streams large ones).
 ///
 /// Objects are written in insertion order; a delta base must have been added
 /// before the objects that use it.
@@ -856,6 +857,8 @@ pub struct PackBuilder {
     level: i32,
     max_depth: u32,
     buf: Vec<u8>,
+    /// Bytes before `buf` already handed to a [`PackWriter`]'s stream.
+    flushed: u64,
     entries: Vec<(ObjectId, u64, u64)>,
     depth: HashMap<ObjectId, u32>,
     #[cfg(feature = "zstd")]
@@ -872,6 +875,7 @@ impl PackBuilder {
             level,
             max_depth: MAX_DELTA_DEPTH,
             buf,
+            flushed: 0,
             entries: Vec::new(),
             depth: HashMap::new(),
             #[cfg(feature = "zstd")]
@@ -909,14 +913,14 @@ impl PackBuilder {
             return Err(corrupt(id.hex(), "hash mismatch while packing"));
         }
         let (kind, data, base_id, depth) = self.encode(raw, base)?;
-        let offset = self.buf.len() as u64;
+        let offset = self.flushed + self.buf.len() as u64;
         self.buf.push(kind as u8);
         self.buf.extend_from_slice(&(raw.len() as u64).to_le_bytes());
         if let Some(b) = base_id {
             self.buf.extend_from_slice(&b.0);
         }
         self.buf.extend_from_slice(&data);
-        self.entries.push((id, offset, self.buf.len() as u64 - offset));
+        self.entries.push((id, offset, self.flushed + self.buf.len() as u64 - offset));
         self.depth.insert(id, depth);
         self.stats.objects += 1;
         self.stats.raw_bytes += raw.len() as u64;
@@ -982,6 +986,164 @@ impl PackBuilder {
     }
 }
 
+/// What a [`PackWriter`] hands its stream at a time.
+const WRITE_CHUNK: usize = 1 << 20;
+
+/// Writes a pack as objects are added (BUG-800): the same bytes as
+/// [`PackBuilder`], streamed through [`StorageBackend::create_stream`], so
+/// memory holds the `(id, offset, length)` table, the delta depths and at
+/// most about 1 MiB of pack data (plus the object being added),
+/// whatever the pack's size.
+///
+/// The header's object count is patched in by `finish`, and the trailer's
+/// BLAKE3 is computed while streaming (`StreamHash`): nothing is read
+/// back. Publishing is as [`PackBuilder::finish`]'s: the `.pack` under its
+/// name, then the `.idx` through `backend.write`, so a reader (who finds
+/// packs by their index) never sees part of one. A writer dropped before
+/// `finish` publishes nothing.
+pub struct PackWriter<'a> {
+    b: PackBuilder,
+    out: Box<dyn StreamWriter + 'a>,
+    hash: StreamHash,
+}
+
+impl<'a> PackWriter<'a> {
+    /// Start a pack written to `out`: a durable stream
+    /// ([`StorageBackend::create_stream`]) in the directory `finish` is
+    /// given.
+    pub fn new(out: Box<dyn StreamWriter + 'a>, level: i32) -> Result<PackWriter<'a>> {
+        Ok(PackWriter {
+            b: PackBuilder::new(level)?,
+            out,
+            hash: StreamHash::default(),
+        })
+    }
+
+    pub fn contains(&self, id: &ObjectId) -> bool {
+        self.b.contains(id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.b.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.b.is_empty()
+    }
+
+    /// As [`PackBuilder::add`].
+    pub fn add(&mut self, id: ObjectId, raw: &[u8], base: Option<(&ObjectId, &[u8])>) -> Result<()> {
+        self.b.add(id, raw, base)?;
+        if self.b.buf.len() >= WRITE_CHUNK {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.hash.update(&self.b.buf);
+        self.out.write_all(&self.b.buf)?;
+        self.b.flushed += self.b.buf.len() as u64;
+        self.b.buf.clear();
+        // A large object grew the buffer: give that back.
+        self.b.buf.shrink_to(2 * WRITE_CHUNK);
+        Ok(())
+    }
+
+    /// Write the rest, the count and the checksum, publish the `.pack`,
+    /// then write the `.idx` into `dir` (the stream's directory) of
+    /// `backend`. Returns the pack name, or `None` (and publishes nothing)
+    /// if no objects were added.
+    pub fn finish(mut self, backend: &dyn StorageBackend, dir: &VPath) -> Result<Option<(String, PackStats)>> {
+        if self.b.entries.is_empty() {
+            return Ok(None);
+        }
+        let count = u32::try_from(self.b.entries.len()).map_err(|_| VeilError::repo("too many objects for one pack"))?;
+        self.flush()?;
+        self.hash.patch(8, &count.to_le_bytes());
+        self.out.write_at(8, &count.to_le_bytes())?;
+        let sum = self.hash.finalize();
+        self.out.write_all(&sum)?;
+        let index = PackIndex::build(std::mem::take(&mut self.b.entries), sum);
+        let name = index.name();
+        self.out.finish(pack_file(dir, &name).file_name())?;
+        backend.write(&index_file(dir, &name), &index.encode())?;
+        self.b.stats.pack_bytes = self.b.flushed + SUM_LEN as u64;
+        Ok(Some((name, self.b.stats)))
+    }
+}
+
+/// BLAKE3 of a stream whose first [`blake3::CHUNK_LEN`] bytes may still
+/// change (a pack's header, whose count is known last). Those are kept;
+/// everything after them is hashed as it comes, into the subtrees
+/// BLAKE3's tree has at any final length: `[C, 2C)`, `[2C, 4C)`, `[4C,
+/// 8C)`, … (`C` = one chunk). At the end, with the head known, the left
+/// spine is merged and joined with the last, partial, subtree (the right
+/// child of the root: `left_subtree_len` of the length is always where the
+/// last subtree starts).
+#[derive(Default)]
+struct StreamHash {
+    head: Vec<u8>,
+    /// Chaining values of the complete subtrees, in order.
+    done: Vec<blake3::hazmat::ChainingValue>,
+    /// The subtree being filled, and how much of it is.
+    cur: Option<blake3::Hasher>,
+    cur_len: u64,
+}
+
+impl StreamHash {
+    fn update(&mut self, mut data: &[u8]) {
+        use blake3::hazmat::HasherExt;
+        let c = blake3::CHUNK_LEN;
+        if self.head.len() < c {
+            let n = (c - self.head.len()).min(data.len());
+            self.head.extend_from_slice(&data[..n]);
+            data = &data[n..];
+        }
+        while !data.is_empty() {
+            // Subtree k starts at C·2^k and is as long as its offset.
+            let start = (c as u64) << self.done.len();
+            let h = self.cur.get_or_insert_with(|| {
+                let mut h = blake3::Hasher::new();
+                h.set_input_offset(start);
+                h
+            });
+            let n = (start - self.cur_len).min(data.len() as u64) as usize;
+            h.update(&data[..n]);
+            self.cur_len += n as u64;
+            data = &data[n..];
+            if self.cur_len == start {
+                self.done.push(self.cur.take().expect("being filled").finalize_non_root());
+                self.cur_len = 0;
+            }
+        }
+    }
+
+    /// Change bytes of the head (`at + bytes.len()` within what was hashed
+    /// and within the first chunk).
+    fn patch(&mut self, at: usize, bytes: &[u8]) {
+        self.head[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+
+    fn finalize(&self) -> [u8; 32] {
+        use blake3::hazmat::{merge_subtrees_non_root, merge_subtrees_root, HasherExt, Mode};
+        // The root's right child: the partial subtree, or else the last
+        // complete one (the length ends on a power-of-two boundary).
+        let (spine, right) = match (&self.cur, self.done.split_last()) {
+            (Some(h), _) => (&self.done[..], h.finalize_non_root()),
+            (None, Some((last, rest))) => (rest, *last),
+            (None, None) => return *blake3::hash(&self.head).as_bytes(),
+        };
+        let mut h = blake3::Hasher::new();
+        h.update(&self.head);
+        let mut left = h.finalize_non_root();
+        for cv in spine {
+            left = merge_subtrees_non_root(&left, cv, Mode::Hash);
+        }
+        *merge_subtrees_root(&left, &right, Mode::Hash).as_bytes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1010,6 +1172,86 @@ mod tests {
             assert!(PackIndex::decode(&bad).is_err(), "flip at {at} detected");
         }
         assert!(PackIndex::decode(&enc[..enc.len() - 1]).is_err());
+    }
+
+    /// The checksum computed while streaming is BLAKE3's, at every length
+    /// around the tree's boundaries and however the input is split, with
+    /// the head patched late.
+    #[test]
+    fn stream_hash_is_blake3() {
+        let c = blake3::CHUNK_LEN;
+        let data: Vec<u8> = (0..(70 * c + 77) as u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        let mut lens: Vec<usize> = vec![0, 1, 12, 13];
+        for k in 0..7 {
+            let b = c << k;
+            lens.extend([b - 1, b, b + 1, b + c, 3 * b, 3 * b + 5]);
+        }
+        lens.push(data.len());
+        for len in lens.into_iter().filter(|&n| n <= data.len()) {
+            for piece in [1, 7, 1000, c, 3 * c + 1, usize::MAX] {
+                let mut want = data[..len].to_vec();
+                let mut h = StreamHash::default();
+                let mut at = 0;
+                while at < len {
+                    let n = piece.min(len - at);
+                    h.update(&want[at..at + n]);
+                    at += n;
+                }
+                if len >= 12 {
+                    want[8..12].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+                    h.patch(8, &0xdead_beefu32.to_le_bytes());
+                }
+                assert_eq!(h.finalize(), *blake3::hash(&want).as_bytes(), "{len} bytes in pieces of {piece}");
+            }
+        }
+    }
+
+    /// A streamed pack is byte for byte the pack `PackBuilder` writes, and
+    /// one dropped before `finish` publishes nothing.
+    #[test]
+    fn pack_writer_matches_pack_builder() {
+        // Noise, in groups of three near-identical versions (deltas).
+        let objects: Vec<(ObjectId, Vec<u8>)> = (0..600u32)
+            .map(|i| {
+                let mut x = 0x9e37_79b9_7f4a_7c15u64 ^ u64::from(i / 3);
+                let mut b: Vec<u8> = (0..16_000)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        (x >> 24) as u8
+                    })
+                    .collect();
+                b[i as usize % 3] ^= 1;
+                blob(&b)
+            })
+            .collect();
+        let (fa, fb) = (MemoryBackend::new(), MemoryBackend::new());
+        let dir = VPath::new("p").unwrap();
+        let mut pb = PackBuilder::new(DEFAULT_LEVEL).unwrap();
+        let mut pw = PackWriter::new(fb.create_stream(&dir, true).unwrap(), DEFAULT_LEVEL).unwrap();
+        for (i, (id, raw)) in objects.iter().enumerate() {
+            let base = i.checked_sub(1).map(|j| (&objects[j].0, &objects[j].1[..]));
+            pb.add(*id, raw, base).unwrap();
+            pw.add(*id, raw, base).unwrap();
+        }
+        let (na, sa) = pb.finish(&fa, &dir).unwrap().unwrap();
+        let (nb, sb) = pw.finish(&fb, &dir).unwrap().unwrap();
+        assert_eq!((&na, &sa), (&nb, &sb));
+        assert!(sa.deltas > 300, "{sa:?}");
+        assert!(fa.read(&pack_file(&dir, &na)).unwrap().len() > 2 * WRITE_CHUNK, "the writer flushed several times");
+        for f in [pack_file(&dir, &na), index_file(&dir, &na)] {
+            assert_eq!(fa.read(&f).unwrap(), fb.read(&f).unwrap(), "{f}");
+        }
+        Pack::open(&fb, &dir, &na).unwrap().verify(&fb).unwrap();
+
+        let fc = MemoryBackend::new();
+        let mut pw = PackWriter::new(fc.create_stream(&dir, true).unwrap(), DEFAULT_LEVEL).unwrap();
+        pw.add(objects[1].0, &objects[1].1, None).unwrap();
+        drop(pw);
+        assert!(fc.list_dir(&dir).map_or(true, |l| l.is_empty()));
+        let pw = PackWriter::new(fc.create_stream(&dir, true).unwrap(), DEFAULT_LEVEL).unwrap();
+        assert!(pw.finish(&fc, &dir).unwrap().is_none());
     }
 
     /// BUG-290: a small edit of a large file is stored as a small delta,

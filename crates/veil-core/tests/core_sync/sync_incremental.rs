@@ -215,3 +215,69 @@ fn remote_url_credentials_are_redacted() {
     assert_eq!(redact_url("alice@host:o/r"), "alice@host:o/r");
     assert_eq!(redact_url("https://host/a@b"), "https://host/a@b");
 }
+
+/// A local disk reporting `free` bytes available.
+#[derive(Debug)]
+struct LowDisk {
+    inner: MemoryBackend,
+    free: u64,
+}
+
+impl StorageBackend for LowDisk {
+    fn kind(&self) -> &'static str {
+        "low-disk"
+    }
+    fn read(&self, path: &veil_core::VPath) -> veil_core::Result<Vec<u8>> {
+        self.inner.read(path)
+    }
+    fn write(&self, path: &veil_core::VPath, data: &[u8]) -> veil_core::Result<()> {
+        self.inner.write(path, data)
+    }
+    fn create_new(&self, path: &veil_core::VPath, data: &[u8]) -> veil_core::Result<bool> {
+        self.inner.create_new(path, data)
+    }
+    fn remove_file(&self, path: &veil_core::VPath) -> veil_core::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &veil_core::VPath) -> veil_core::Result<()> {
+        self.inner.remove_dir_all(path)
+    }
+    fn create_dir_all(&self, path: &veil_core::VPath) -> veil_core::Result<()> {
+        self.inner.create_dir_all(path)
+    }
+    fn list_dir(&self, path: &veil_core::VPath) -> veil_core::Result<Vec<veil_core::vfs::DirEntry>> {
+        self.inner.list_dir(path)
+    }
+    fn metadata(&self, path: &veil_core::VPath) -> veil_core::Result<Option<veil_core::vfs::Metadata>> {
+        self.inner.metadata(path)
+    }
+    fn set_executable(&self, path: &veil_core::VPath, executable: bool) -> veil_core::Result<()> {
+        self.inner.set_executable(path, executable)
+    }
+    fn available_space(&self, _dir: &veil_core::VPath) -> Option<u64> {
+        Some(self.free)
+    }
+}
+
+/// BUG-800: a pull downloads the remote's packs to local disk, so it first
+/// checks that they fit, and says how much room they need.
+#[test]
+fn a_pull_that_would_fill_the_disk_says_how_much_it_needs() {
+    let (mut alice, fs, id) = new_repo("alice");
+    history(&mut alice, &fs, 30);
+    let remote = Arc::new(MemoryBackend::new());
+    let r = remote::push(&mut alice, remote.clone(), false, &[], false).unwrap();
+    assert!(r.packs_written > 0);
+    for (free, fits) in [(1000, false), (u64::MAX, true)] {
+        let disk = Arc::new(LowDisk { inner: MemoryBackend::new(), free });
+        let mut bob = Repo::init_for_clone(disk.clone(), Some(id.clone()), "bob").unwrap();
+        match remote::pull(&mut bob, "origin", remote.clone()) {
+            Ok(_) => assert!(fits),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(!fits && msg.contains("not enough disk space") && msg.contains("MiB"), "{msg}");
+            }
+        }
+        assert!(!disk.inner.exists(&veil_core::VPath::new(".veil/objects/incoming/pull").unwrap()).unwrap());
+    }
+}

@@ -457,6 +457,84 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
             Err(e) => Err(e),
         }
     }
+
+    /// Start a new file in `dir`, written piece by piece and named only
+    /// when it is complete ([`StreamWriter::finish`]), so a file larger
+    /// than memory can be written (packs, downloads; BUG-800). Nothing is
+    /// visible under the final name before `finish`, and a writer dropped
+    /// without it leaves nothing behind but, after a crash, a temp file
+    /// (`.stream.vltmp…`, see [`is_temp_name`]).
+    ///
+    /// `durable`: `finish` returns only once the content and its name are
+    /// on stable storage. Otherwise the file may be lost or torn at a
+    /// power cut (a download spool, deleted after use).
+    ///
+    /// The default buffers in memory and publishes with
+    /// [`StorageBackend::write`] (or [`StorageBackend::write_unsynced`]):
+    /// backends that are memory anyway, and wrappers, keep it.
+    fn create_stream<'a>(&'a self, dir: &VPath, durable: bool) -> Result<Box<dyn StreamWriter + 'a>> {
+        Ok(Box::new(Buffered {
+            backend: self,
+            dir: dir.clone(),
+            durable,
+            buf: Vec::new(),
+        }))
+    }
+
+    /// Bytes free for new files at `dir` (`statvfs`), if this backend can
+    /// tell. A pull checks it before downloading.
+    fn available_space(&self, _dir: &VPath) -> Option<u64> {
+        None
+    }
+}
+
+/// A file being written by [`StorageBackend::create_stream`].
+pub trait StreamWriter {
+    /// Append `data`.
+    fn write_all(&mut self, data: &[u8]) -> Result<()>;
+    /// Overwrite bytes already written, at `offset`.
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<()>;
+    /// Publish the file as `name` in its directory, atomically (replacing
+    /// a file of that name), and durably if it was created so.
+    fn finish(self: Box<Self>, name: &str) -> Result<()>;
+}
+
+/// The default [`StreamWriter`]: everything in memory until `finish`.
+struct Buffered<'a, B: ?Sized> {
+    backend: &'a B,
+    dir: VPath,
+    durable: bool,
+    buf: Vec<u8>,
+}
+
+impl<B: StorageBackend + ?Sized> StreamWriter for Buffered<'_, B> {
+    fn write_all(&mut self, data: &[u8]) -> Result<()> {
+        self.buf.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<()> {
+        let at = usize::try_from(offset).ok().filter(|at| at.checked_add(data.len()).is_some_and(|end| end <= self.buf.len()));
+        let Some(at) = at else {
+            return Err(crate::error::VeilError::repo("stream: write past the end"));
+        };
+        self.buf[at..at + data.len()].copy_from_slice(data);
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>, name: &str) -> Result<()> {
+        let path = self.dir.join(name);
+        match self.durable {
+            true => self.backend.write(&path, &self.buf),
+            false => self.backend.write_unsynced(&path, &self.buf),
+        }
+    }
+}
+
+/// The temp file name a [`StreamWriter`] writes under until `finish`.
+#[cfg(feature = "os")]
+pub(crate) fn stream_temp_name() -> String {
+    format!(".stream{TEMP_MARKER}{}", hex::encode(crate::crypto::random_bytes::<4>()))
 }
 
 /// Bounds-checked `data[offset..offset + len]` for [`StorageBackend::read_range`].

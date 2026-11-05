@@ -992,6 +992,28 @@ impl StorageBackend for SftpBackend {
         Ok(Some(Metadata::unstamped(kind, a.size.unwrap_or(0), exec)))
     }
 
+    /// A temp file created with `O_EXCL`, written with up to `WINDOW`
+    /// `WRITE`s in flight, then (when `durable`) `fsync@openssh.com`, and
+    /// renamed into place (`posix-rename@openssh.com` where offered), as
+    /// [`StorageBackend::write`] does.
+    fn create_stream<'a>(&'a self, dir: &VPath, durable: bool) -> Result<Box<dyn super::StreamWriter + 'a>> {
+        let dir = self.rp(dir);
+        let tmp = format!("{dir}/{}", super::stream_temp_name());
+        let handle = match self.open_creating(&tmp, FXF_WRITE | FXF_CREAT | FXF_EXCL | FXF_TRUNC)? {
+            Ok(h) => h,
+            Err(r) => return Err(r.ok(&tmp).err().unwrap_or_else(|| io_error(&tmp, io::Error::other("open failed")))),
+        };
+        Ok(Box::new(SftpStream {
+            b: self,
+            dir,
+            tmp,
+            handle: Some(handle),
+            len: 0,
+            inflight: VecDeque::new(),
+            durable,
+        }))
+    }
+
     fn set_executable(&self, p: &VPath, executable: bool) -> Result<()> {
         let path = self.rp(p);
         let a = self.lstat(&path)?.ok_or_else(|| VeilError::NotFound(path.clone()))?;
@@ -1008,6 +1030,92 @@ impl StorageBackend for SftpBackend {
             .ok(&path)?;
         }
         Ok(())
+    }
+}
+
+/// [`SftpBackend::create_stream`]'s writer.
+struct SftpStream<'a> {
+    b: &'a SftpBackend,
+    dir: String,
+    tmp: String,
+    /// `None` once closed.
+    handle: Option<Vec<u8>>,
+    len: u64,
+    inflight: VecDeque<Pending>,
+    durable: bool,
+}
+
+impl SftpStream<'_> {
+    /// Send `data` at `offset` in `max_write` pieces, waiting for the
+    /// oldest reply whenever [`WINDOW`] are in flight.
+    fn send_at(&mut self, offset: u64, data: &[u8]) -> Result<()> {
+        let handle = self.handle.as_deref().ok_or_else(|| VeilError::repo("stream: already closed"))?;
+        let chunk = self.b.client.max_write as usize;
+        for (i, part) in data.chunks(chunk).enumerate() {
+            if self.inflight.len() >= WINDOW {
+                let p = self.inflight.pop_front().unwrap();
+                self.b.wait(&self.tmp, p)?.ok(&self.tmp)?;
+            }
+            let at = offset + (i * chunk) as u64;
+            self.inflight.push_back(self.b.send(&self.tmp, FXP_WRITE, |b| {
+                b.bytes(handle).u64(at).bytes(part);
+            })?);
+        }
+        Ok(())
+    }
+
+    fn drain(&mut self) -> Result<()> {
+        let mut first_err = None;
+        for p in std::mem::take(&mut self.inflight) {
+            if let Err(e) = self.b.wait(&self.tmp, p).and_then(|r| r.ok(&self.tmp)) {
+                first_err.get_or_insert(e);
+            }
+        }
+        first_err.map_or(Ok(()), Err)
+    }
+}
+
+impl super::StreamWriter for SftpStream<'_> {
+    fn write_all(&mut self, data: &[u8]) -> Result<()> {
+        self.send_at(self.len, data)?;
+        self.len += data.len() as u64;
+        Ok(())
+    }
+
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<()> {
+        if offset.checked_add(data.len() as u64).is_none_or(|end| end > self.len) {
+            return Err(VeilError::repo("stream: write past the end"));
+        }
+        // Never in flight beside an earlier write of the same bytes.
+        self.drain()?;
+        self.send_at(offset, data)
+    }
+
+    fn finish(mut self: Box<Self>, name: &str) -> Result<()> {
+        let to = format!("{}/{name}", self.dir);
+        let handle = self.handle.take().ok_or_else(|| VeilError::repo("stream: already closed"))?;
+        let res = self
+            .drain()
+            .and_then(|()| if self.durable { self.b.fsync_handle(&self.tmp, &handle) } else { Ok(()) });
+        let closed = self.b.close(&self.tmp, &handle);
+        res.and(closed)?;
+        self.b.rename_over(&self.tmp, &to)?;
+        // Published: nothing for `drop` to remove.
+        self.tmp.clear();
+        Ok(())
+    }
+}
+
+impl Drop for SftpStream<'_> {
+    fn drop(&mut self) {
+        if self.tmp.is_empty() {
+            return;
+        }
+        let _ = self.drain();
+        if let Some(h) = self.handle.take() {
+            let _ = self.b.close(&self.tmp, &h);
+        }
+        let _ = self.b.remove(&self.tmp);
     }
 }
 

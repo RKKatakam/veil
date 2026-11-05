@@ -16,7 +16,7 @@ homepage = "https://github.com/veil-vcs/veil"
 [workspace.dependencies]
 veil-core = { path = "crates/veil-core" }
 anyhow = "1"
-blake3 = "1.5"
+blake3 = "1.8" # `hazmat`: pack checksums computed while streaming (BUG-800)
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.6"

@@ -44,7 +44,7 @@ use crate::{
     now_millis,
     object::{EntryKind, Object},
     oplog::Operation,
-    pack::{index_file, pack_file, PackBuilder, PackStats, DEFAULT_LEVEL},
+    pack::{index_file, pack_file, PackStats, PackWriter, DEFAULT_LEVEL},
     repo::Repo,
     store::ObjectStore,
     vfs::{NodeKind, StorageBackend},
@@ -112,9 +112,9 @@ pub struct GcReport {
     pub incomplete: Vec<String>,
 }
 
-/// The raw bytes gc puts into one pack before it starts the next (BUG-800):
-/// a pack is built in memory, so this bounds gc's memory, whatever the
-/// size of the store.
+/// The raw bytes gc puts into one pack before it starts the next. Packs
+/// are streamed ([`PackWriter`], BUG-800), so this no longer bounds
+/// memory; it keeps packs of the size pull and push write.
 pub const GC_PACK_LIMIT: u64 = 128 << 20;
 
 /// The packs one gc writes (see [`GC_PACK_LIMIT`]).
@@ -122,7 +122,7 @@ struct GcPacks<'a> {
     level: i32,
     backend: &'a dyn StorageBackend,
     dir: VPath,
-    current: Option<PackBuilder>,
+    current: Option<PackWriter<'a>>,
     current_bytes: u64,
     /// Every object in a pack written (or being written) by this gc.
     packed: HashSet<ObjectId>,
@@ -155,7 +155,7 @@ impl<'a> GcPacks<'a> {
 
     fn add(&mut self, id: ObjectId, raw: &[u8], base: Option<(&ObjectId, &[u8])>) -> Result<()> {
         if self.current.is_none() {
-            self.current = Some(PackBuilder::new(self.level)?);
+            self.current = Some(PackWriter::new(self.backend.create_stream(&self.dir, true)?, self.level)?);
         }
         let b = self.current.as_mut().expect("just created");
         b.add(id, raw, base)?;
