@@ -14,6 +14,7 @@ mod adversarial2_props;
 mod adversarial6_props;
 mod adversarial_fuzz;
 mod adversarial_props;
+mod graph_index_props;
 mod hostile_labels_props;
 mod policy_fold_props;
 mod team_vault_props;

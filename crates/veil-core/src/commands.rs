@@ -1,6 +1,6 @@
 //! High-level history operations. Each is one transaction → one op-log entry.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 
 use crate::{
     builder::trusted_cloak,
@@ -213,7 +213,7 @@ pub struct SquashResult {
 /// choice can take minutes, and `vl watch` or another command may have
 /// rewritten the change meanwhile).
 fn check_current(repo: &Repo, ids: &[ObjectId], parts: &ChangeParts, s: &Snapshot) -> Result<()> {
-    let visible: HashSet<ObjectId> = repo.visible_snapshots()?.into_iter().collect();
+    let visible = repo.visible_among(&ids.iter().copied().collect())?;
     for i in ids {
         if !visible.contains(i) {
             return Err(VeilError::repo(format!(

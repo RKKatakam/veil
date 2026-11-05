@@ -36,6 +36,9 @@ pub struct Confinement {
     withheld: HashMap<ObjectId, String>,
     /// Snapshots already judged by their history (not their tree).
     memo: HashMap<ObjectId, Option<String>>,
+    /// The lowest generation of the withheld history: nothing below it
+    /// builds on withheld history.
+    floor: u32,
 }
 
 /// The unreleased embargoes whose embargoed merge (or a rewrite of it) is
@@ -43,7 +46,7 @@ pub struct Confinement {
 /// nothing any more: its fix is back to the state before the merge.
 pub fn active_embargoes(repo: &Repo) -> Result<std::collections::HashSet<String>> {
     let mut out = std::collections::HashSet::new();
-    for id in repo.visible_snapshots()? {
+    for id in repo.visible_embargoed()? {
         let s = repo.snapshot(&id)?;
         if let Some(e) = &s.embargo {
             // A merge rewritten down to one parent (its fix abandoned)
@@ -59,9 +62,17 @@ pub fn active_embargoes(repo: &Repo) -> Result<std::collections::HashSet<String>
 impl Confinement {
     /// The confinement of `repo`'s current view.
     pub fn new(repo: &Repo) -> Result<Confinement> {
+        let withheld = crate::remote::embargo_withheld(repo, true)?;
+        let mut floor = u32::MAX;
+        for id in withheld.keys() {
+            if let Some(g) = repo.graph().generation(repo, id)? {
+                floor = floor.min(g);
+            }
+        }
         Ok(Confinement {
-            withheld: crate::remote::embargo_withheld(repo, true)?,
+            withheld,
             memo: HashMap::new(),
+            floor,
         })
     }
 
@@ -97,6 +108,11 @@ impl Confinement {
             }
             if let Some(e) = self.withheld.get(&x) {
                 self.memo.insert(x, Some(e.clone()));
+                continue;
+            }
+            // Below every withheld snapshot: its ancestors are all below too.
+            if repo.graph().generation(repo, &x)?.is_none_or(|g| g < self.floor) {
+                self.memo.insert(x, None);
                 continue;
             }
             let Some(s) = repo.snapshot_opt(&x)? else {

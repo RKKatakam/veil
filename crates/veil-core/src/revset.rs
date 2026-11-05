@@ -130,14 +130,19 @@ fn resolve_base(repo: &Repo, base: &str, ws: &str) -> Result<ObjectId> {
             }
         }
     }
-    let visible = repo.visible_snapshots()?;
+    // Candidates come from the history index; only their visibility is
+    // walked for, never all history.
+    let visible_matching = |keep: &dyn Fn(&ObjectId, &ChangeId) -> bool| -> Result<Vec<ObjectId>> {
+        let found: HashSet<ObjectId> =
+            repo.graph().entries_matching(repo, view.refs(), |id, e| keep(id, &e.change_id))?.into_iter().collect();
+        let mut v: Vec<ObjectId> = repo.visible_among(&found)?.into_iter().collect();
+        v.sort();
+        Ok(v)
+    };
     if let Some(hex) = ChangeId::reverse_hex_to_hex(base) {
         let mut matches: Vec<(ObjectId, ChangeId)> = Vec::new();
-        for id in &visible {
-            let s = repo.snapshot(id)?;
-            if hex::encode(s.change_id.0).starts_with(&hex) {
-                matches.push((*id, s.change_id));
-            }
+        for id in visible_matching(&|_, c| hex_starts_with(&c.0, &hex))? {
+            matches.push((id, repo.snapshot(&id)?.change_id));
         }
         let mut changes: Vec<ChangeId> = matches.iter().map(|m| m.1).collect();
         changes.sort();
@@ -163,7 +168,7 @@ fn resolve_base(repo: &Repo, base: &str, ws: &str) -> Result<ObjectId> {
     }
     if base.len() >= 4 && base.bytes().all(|b| b.is_ascii_hexdigit()) {
         let lower = base.to_ascii_lowercase();
-        let found: Vec<ObjectId> = visible.into_iter().filter(|id| id.hex().starts_with(&lower)).collect();
+        let found = visible_matching(&|id, _| hex_starts_with(&id.0, &lower))?;
         match found.as_slice() {
             [one] => return Ok(*one),
             [] => {}
@@ -178,6 +183,17 @@ fn resolve_base(repo: &Repo, base: &str, ws: &str) -> Result<ObjectId> {
         }
     }
     Err(VeilError::Revset(format!("revision '{base}' not found")))
+}
+
+/// Does the lowercase hex spelling of `bytes` start with `prefix`?
+fn hex_starts_with(bytes: &[u8], prefix: &str) -> bool {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    prefix.len() <= bytes.len() * 2
+        && prefix.bytes().enumerate().all(|(i, c)| {
+            let b = bytes[i / 2];
+            let nibble = if i % 2 == 0 { b >> 4 } else { b & 15 };
+            DIGITS[nibble as usize] == c
+        })
 }
 
 /// The snapshots in the store whose id starts with `prefix` (lowercase hex)

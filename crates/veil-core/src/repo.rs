@@ -34,6 +34,7 @@ use crate::{
     object::{Snapshot, Text},
     oplog::{OpStore, Operation, View, WorkspaceState},
     policy::DEFAULT_SCOPE,
+    graph_index::GraphIndex,
     store::ObjectStore,
     transaction::Transaction,
     vfs::StorageBackend,
@@ -155,6 +156,8 @@ pub struct Repo {
     pub(crate) view: View,
     pub(crate) user: String,
     pub(crate) root_id: ObjectId,
+    /// The history index (`graph_index`): generations, to stop walks early.
+    pub(crate) graph: GraphIndex,
 }
 
 impl std::fmt::Debug for Repo {
@@ -165,6 +168,12 @@ impl std::fmt::Debug for Repo {
 
 pub(crate) fn config_path() -> VPath {
     VPath::new(".veil/repo.json").unwrap()
+}
+
+/// Whether a repository keeps its history index on disk: a local one with
+/// a working copy. Remotes (bare, or over the network) compute it in memory.
+fn persists_index(backend: &dyn StorageBackend, view: &View) -> bool {
+    !backend.is_network() && !view.workspaces.is_empty()
 }
 
 pub fn is_repo(backend: &dyn StorageBackend) -> bool {
@@ -271,7 +280,9 @@ impl Repo {
         // `repo.json` is what makes this a repository, so it is written last:
         // a crash before this point leaves no half-initialised repository.
         write_config(&*backend, &config)?;
+        let graph = GraphIndex::new(backend.clone(), persists_index(&*backend, &view));
         Ok(Repo {
+            graph,
             backend,
             store,
             ops,
@@ -296,7 +307,9 @@ impl Repo {
         ops.set_format(config.format);
         let op_id = ops.head()?;
         let view = ops.get(&op_id)?.view;
+        let graph = GraphIndex::new(backend.clone(), persists_index(&*backend, &view));
         Ok(Repo {
+            graph,
             backend,
             store,
             ops,
@@ -314,6 +327,9 @@ impl Repo {
         if head != self.op_id {
             self.view = self.ops.get(&head)?.view;
             self.op_id = head;
+            // Another process may have pulled a parent the index took as
+            // missing.
+            self.graph.revalidate(self);
         }
         Ok(())
     }
@@ -349,6 +365,10 @@ impl Repo {
     }
     pub fn root_id(&self) -> ObjectId {
         self.root_id
+    }
+    /// The history index.
+    pub fn graph(&self) -> &GraphIndex {
+        &self.graph
     }
     pub fn user(&self) -> &str {
         &self.user
@@ -462,6 +482,52 @@ impl Repo {
         self.topo_children_first(self.view.refs())
     }
 
+    /// [`Repo::topo_children_first`] of `roots`, lazily: callers that need
+    /// only the first few snapshots read only the history above them.
+    pub fn topo_iter(&self, roots: impl IntoIterator<Item = ObjectId>) -> crate::graph_index::TopoIter<'_> {
+        self.graph.topo_iter(self, roots)
+    }
+
+    /// The visible snapshots ([`Repo::visible_snapshots`]), lazily.
+    pub fn visible_iter(&self) -> crate::graph_index::TopoIter<'_> {
+        self.topo_iter(self.view.refs())
+    }
+
+    /// The visible snapshots whose `embargo` is set, in the order of
+    /// [`Repo::visible_snapshots`]. Found through the history index: with
+    /// no embargo in the history, nothing is walked.
+    pub fn visible_embargoed(&self) -> Result<Vec<ObjectId>> {
+        let flagged: HashSet<ObjectId> = self
+            .graph
+            .entries_matching(self, self.view.refs(), |_, e| e.flags & crate::graph_index::FLAG_EMBARGO != 0)?
+            .into_iter()
+            .collect();
+        if flagged.is_empty() {
+            return Ok(Vec::new());
+        }
+        let visible = self.visible_among(&flagged)?;
+        let mut out = Vec::with_capacity(visible.len());
+        if visible.is_empty() {
+            return Ok(out);
+        }
+        for id in self.visible_iter() {
+            let id = id?;
+            if visible.contains(&id) {
+                out.push(id);
+                if out.len() == visible.len() {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Which of `candidates` are visible (reachable from the view)? Reads
+    /// only the history above the oldest candidate.
+    pub fn visible_among(&self, candidates: &HashSet<ObjectId>) -> Result<HashSet<ObjectId>> {
+        self.graph.reachable_among(self, self.view.refs(), candidates)
+    }
+
     pub fn ancestors(&self, id: &ObjectId) -> Result<HashSet<ObjectId>> {
         let mut seen = HashSet::new();
         let mut stack = vec![*id];
@@ -475,9 +541,15 @@ impl Repo {
         Ok(seen)
     }
 
-    /// Is `a` an ancestor of (or equal to) `b`?
+    /// Is `a` an ancestor of (or equal to) `b`? Reads only the history
+    /// between them (the history index stops the walk below `a`).
     pub fn is_ancestor(&self, a: &ObjectId, b: &ObjectId) -> Result<bool> {
-        Ok(a == b || self.ancestors(b)?.contains(a))
+        // A snapshot this replica lacks (a redacted parent) has no
+        // generation; it is an ancestor if some ancestor names it.
+        if a != b && self.snapshot_opt(a)?.is_none() {
+            return Ok(self.ancestors(b)?.contains(a));
+        }
+        self.graph.is_ancestor(self, a, b)
     }
 
     pub fn common_ancestor(&self, a: &ObjectId, b: &ObjectId) -> Result<ObjectId> {
@@ -558,6 +630,20 @@ impl Repo {
     /// (by timestamp, then id), so the order does not depend on the order
     /// of `a` and `b`. Redacted snapshots are left out.
     pub fn merge_bases(&self, a: &[ObjectId], b: &[ObjectId]) -> Result<Vec<ObjectId>> {
+        let mut best = Vec::new();
+        for c in self.graph.merge_bases(self, a, b)? {
+            if let Some(s) = self.snapshot_opt(&c)? {
+                best.push((s.timestamp, c));
+            }
+        }
+        best.sort();
+        Ok(best.into_iter().map(|(_, id)| id).collect())
+    }
+
+    /// [`Repo::merge_bases`] by full ancestor sets, without the history
+    /// index: the reference the index is tested against.
+    #[doc(hidden)]
+    pub fn merge_bases_naive(&self, a: &[ObjectId], b: &[ObjectId]) -> Result<Vec<ObjectId>> {
         let from_a = self.ancestors_of(a)?;
         let common: HashSet<ObjectId> = self.ancestors_of(b)?.into_iter().filter(|x| from_a.contains(x)).collect();
         // Everything below a common ancestor is a common ancestor too, and
