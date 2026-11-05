@@ -45,18 +45,21 @@ jobs:
           rustup default stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # adversarial_props, plus every adversarial2_* suite that uses proptest.
+      # Each is a module of a test binary (crates/<crate>/tests/<binary>/<module>.rs),
+      # so run that binary filtered to the module.
       - name: Property tests (PROPTEST_CASES=${{ env.PROPTEST_CASES }})
         shell: bash
         run: |
           set -euo pipefail
           status=0
-          for file in crates/veil-core/tests/adversarial_props.rs crates/*/tests/adversarial2_*.rs; do
+          for file in crates/veil-core/tests/*/adversarial_props.rs crates/*/tests/*/adversarial2_*.rs; do
             [ -f "$file" ] || continue
             grep -q 'proptest' "$file" || continue
-            crate=$(basename "$(dirname "$(dirname "$file")")")
-            test=$(basename "$file" .rs)
-            echo "::group::$crate --test $test"
-            cargo test --release --locked -p "$crate" --test "$test" || status=1
+            crate=$(basename "$(dirname "$(dirname "$(dirname "$file")")")")
+            test=$(basename "$(dirname "$file")")
+            module=$(basename "$file" .rs)
+            echo "::group::$crate --test $test $module::"
+            cargo test --release --locked -p "$crate" --test "$test" -- "$module::" || status=1
             echo "::endgroup::"
           done
           exit "$status"
@@ -88,9 +91,10 @@ jobs:
           rustup default stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build benchmarks
-        run: cargo test --release --locked --no-run -p veil-core --test storage_bench --test scanner -p vl --test bench_status
-      # `--ignored` runs only the #[ignore]d tests of these binaries: the
-      # benchmarks. One thread, so they do not compete with each other.
+        run: cargo test --release --locked --no-run -p veil-core --test core_bench --test core_security -p vl --test cli_bench
+      # `--ignored --exact` with these names runs only the benchmarks (the
+      # binaries also hold bug reproductions and other measurements). One
+      # thread, so they do not compete with each other.
       - name: Run benchmarks
         shell: bash
         env:
@@ -98,8 +102,10 @@ jobs:
           VEIL_SCAN_DIR: ${{ github.workspace }}/crates
         run: |
           set -euo pipefail
-          cargo test --release --locked -p veil-core --test storage_bench --test scanner -p vl --test bench_status \
-            -- --ignored --nocapture --test-threads=1 2>&1 | tee bench.txt
+          cargo test --release --locked -p veil-core --test core_bench --test core_security -p vl --test cli_bench \
+            -- --ignored --nocapture --test-threads=1 --exact \
+            storage_bench::storage_benchmark scanner::scanner_throughput scanner::scanner_real_world \
+            bench_status::status_on_20k_files 2>&1 | tee bench.txt
       - name: Summary
         if: always()
         shell: bash

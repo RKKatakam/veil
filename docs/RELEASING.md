@@ -104,7 +104,7 @@ The version lives in one place, `[workspace.package] version` in the root
 ```sh
 $EDITOR Cargo.toml              # version = "1.2.3"
 cargo update --workspace        # records it in Cargo.lock
-cargo test -p vl --test version # `vl --version` reports it
+cargo test -p vl --test cli_basic version:: # `vl --version` reports it
 ```
 
 Use SemVer. A pre-release suffix (`1.2.3-rc.1`) makes the GitHub Release a
@@ -130,7 +130,7 @@ For every release:
    object kind, encoding or file), the format changed:
    * bump `REPO_FORMAT_VERSION`;
    * update the two literals in `crates/vl/src/cli.rs` (`VERSION` and
-     `LONG_VERSION`). `crates/vl/tests/version.rs` fails until they match;
+     `LONG_VERSION`). `crates/vl/tests/cli_basic/version.rs` fails until they match;
    * make sure `vl upgrade` migrates every older format to the new one, and
      that it is tested;
    * update **`docs/FORMAT.md`**: the version number, the change, and how
@@ -257,7 +257,7 @@ sha256sum -c vl-x86_64-unknown-linux-musl.tar.xz.sha256
     version comment in `dist-workspace.toml`, run `dist generate`. Stay on
     the major version dist chose (`checkout` v6, `upload-artifact` v7,
     `download-artifact` v8) until a dist release moves it.
-  * `crates/vl/tests/adversarial3_release.rs` fails if any `uses:` in the
+  * `crates/vl/tests/cli_adversarial/adversarial3_release.rs` fails if any `uses:` in the
     four workflows is not a 40-character SHA, or if `ci.yml` pipes a
     download into `sh`.
 * **Downloaded tools** in CI (`dist`, `actionlint`) are fetched as release

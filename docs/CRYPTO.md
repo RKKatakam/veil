@@ -572,7 +572,7 @@ every file would get new content off them, never old content.
   construction swap, wrong key), HPKE (enc/ct bit flips, truncation,
   all-zero enc, wrong scope, wrong recipient, unknown suite, unknown
   fields), legacy wraps, identity files (damaged, mixed, newer).
-* **Cross-version and migration** (`tests/format_compat.rs`).
+* **Cross-version and migration** (`tests/core_format/format_compat.rs`).
   * Every fixture set (formats 1, 2, 3) reads, verifies and `fsck`s.
   * The format-3 set has only C1/C3, plus a member with a legacy identity.
   * Its `upgraded/` repository, a format-2 set after `vl upgrade`, mixes

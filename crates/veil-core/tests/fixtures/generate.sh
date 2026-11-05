@@ -29,8 +29,8 @@
 # sealed message, an imported lightweight Git tag): tags `links`,
 # `link-conflict`, `v5.0`, `team-release`, `imported`. They are written
 # through the engine by the `write_format_5_extras` test of
-# tests/format_compat.rs: set VEIL_FIXTURE_EXTRAS to that test binary
-# (`cargo test -p veil-core --test format_compat --no-run` prints it).
+# tests/core_format/format_compat.rs: set VEIL_FIXTURE_EXTRAS to that test
+# binary (`cargo test -p veil-core --test core_format --no-run` prints it).
 #
 #   upgraded/       the previous set's alice/ and team-remote/ (and their
 #                   identities) after `vl upgrade --remote origin`,
@@ -136,8 +136,8 @@ fi
 
 # Format 5 on: links, gitlinks and annotated tags (see the header).
 if [ "$("$VL" --version | sed -n 's/^repository format: //p')" -ge 5 ]; then
-    : "${VEIL_FIXTURE_EXTRAS:?set VEIL_FIXTURE_EXTRAS to the format_compat test binary}"
-    VEIL_FIXTURE_DIR="$OUT" "$VEIL_FIXTURE_EXTRAS" --ignored --exact write_format_5_extras >/dev/null
+    : "${VEIL_FIXTURE_EXTRAS:?set VEIL_FIXTURE_EXTRAS to the core_format test binary}"
+    VEIL_FIXTURE_DIR="$OUT" "$VEIL_FIXTURE_EXTRAS" --ignored --exact format_compat::write_format_5_extras >/dev/null
 fi
 
 # Unreleased embargo with a deadline far in the future.

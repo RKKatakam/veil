@@ -65,7 +65,7 @@ Rule: a stream edits only the files it owns. Appends to shared files (`lib.rs`, 
 - Handlers return "not yet implemented".
 
 **F — format 5 foundation** (size M; first, blocking W, G, C and the format parts of P)
-- Owns: `object.rs`, `tree.rs`, `conflict.rs` (term encoding only), `store.rs`, `repo.rs`, `upgrade.rs`, `fsck.rs`, `gc.rs`, `oplog.rs`, `remote.rs` (atag transfer and withholding), `crypto/domains.rs`, new `tag_object.rs` (atag type, canonical encoding, sign and verify), `docs/FORMAT.md`, `docs/CRYPTO.md` (tag context), `tests/fixtures/**`, `tests/format_compat.rs`, `tests/tree_encoding.rs`.
+- Owns: `object.rs`, `tree.rs`, `conflict.rs` (term encoding only), `store.rs`, `repo.rs`, `upgrade.rs`, `fsck.rs`, `gc.rs`, `oplog.rs`, `remote.rs` (atag transfer and withholding), `crypto/domains.rs`, new `tag_object.rs` (atag type, canonical encoding, sign and verify), `docs/FORMAT.md`, `docs/CRYPTO.md` (tag context), `tests/fixtures/**`, `tests/core_format/format_compat.rs`, `tests/core_format/tree_encoding.rs`.
 - Adds the minimal `match` arms elsewhere so the tree compiles: new kinds are carried unchanged, and refused where content is read.
 - Done when: fixtures exist, golden encodings are appended, and the round-trip and `Unsupported` tests pass.
 

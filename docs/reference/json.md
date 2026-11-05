@@ -1,4 +1,4 @@
-<!-- Written by hand (not generated). crates/vl/tests/json_cli.rs checks that
+<!-- Written by hand (not generated). crates/vl/tests/cli_basic/json_cli.rs checks that
      every field of every schema is documented here. -->
 
 # JSON output

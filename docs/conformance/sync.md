@@ -2,8 +2,8 @@
 
 Veil checked against Git's and Jujutsu's tests for clone, fetch, push,
 pull and remotes, large files, `fsck`, `gc`/prune, and the Git bridge.
-Tests: `crates/vl/tests/conformance_sync/` (one binary,
-`cargo test -p vl --test conformance_sync`; about 5 s). Bugs:
+Tests: `crates/vl/tests/cli_conformance/conformance_sync/` (a module of the `cli_conformance` binary,
+`cargo test -p vl --test cli_conformance conformance_sync::`; about 5 s). Bugs:
 [`docs/BUGS.md`](../BUGS.md), "Conformance findings: remotes, storage and
 Git interop".
 

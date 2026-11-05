@@ -7,10 +7,10 @@ op log do, compared with `git diff/log/rev-list/merge/rebase` and jj's
 equivalents, plus Veil-only variants of the same scenarios with cloaked,
 isolated and embargoed content.
 
-Tests: `crates/vl/tests/conformance_history/` (one binary; modules `diff`,
+Tests: `crates/vl/tests/cli_conformance/conformance_history/` (a module of the `cli_conformance` binary; modules `diff`,
 `log`, `revisions`, `merge`, `rewrite`, `veil_angles`). Run them with
-`cargo test -p vl --test conformance_history`, and the bug reproductions
-with `-- --ignored`. Baseline: `integration` @ `8dbdb61`.
+`cargo test -p vl --test cli_conformance conformance_history::`, and the bug
+reproductions with `-- --ignored conformance_history::`. Baseline: `integration` @ `8dbdb61`.
 
 ## Summary
 
@@ -88,8 +88,8 @@ The Git-parity round built rename and copy detection (in `diff`, `show`,
 `status` and `log --follow`, and since stream R in merges and rebases),
 `vl duplicate` and `vl cherry-pick`, path-limited `log`, the
 `-r` ranges `A..B`, `::B`, `..B` and `A..`, blame, `log -S`/`-G`, `grep` and
-bisect (`crates/vl/tests/history_cli.rs`,
-`crates/veil-core/tests/history_tools.rs`, `history_rename.rs`). Their
+bisect (`crates/vl/tests/cli_features/history_cli.rs`,
+`crates/veil-core/tests/core_engine/history_tools.rs`, `history_rename.rs`). Their
 scenarios below are still to port; until then their rows keep the status
 `pending feature`.
 
