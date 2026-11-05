@@ -14,7 +14,8 @@
 //! 4. a link named like a secret is isolated by its name;
 //! 5. a token in a target is quarantined;
 //! 6. a target outside the repository round-trips unchanged (and warns);
-//! 7. a sandbox never materialises a link that leads out of it;
+//! 7. a sandbox never materialises a link that leads out of it, alone,
+//!    through a chain of links (BUG-708) or by absolute path (BUG-709);
 //! 9. a tracked file replaced by a link keeps its history;
 //! 10. a link Veil did not write is never replaced or removed;
 //! 11. a link loop is a leaf;
@@ -806,12 +807,18 @@ fn a_sandbox_never_materialises_a_link_leading_out_of_it() {
             ("abs", symlink(&repo, "abs", project.join(".env").to_str().unwrap())),
             ("dotdot", symlink(&repo, "dotdot", &format!("{}/../home/./identity.json", project.display()))),
             ("fine", symlink(&repo, "fine", "deep")),
+            ("up/fine", symlink(&repo, "fine", "../deep/y")),
+            // BUG-709: any absolute target, `/proc/self/cwd` above all.
             ("usr", symlink(&repo, "usr", "/usr/share/dict/words")),
+            ("proc", symlink(&repo, "proc", "/proc/self/cwd/../../../../../.env")),
+            // BUG-708: two links, each inside on its own, chained.
+            ("s1/s2/s3/s4/u", symlink(&repo, "u", "../../../..")),
+            ("s1/s2/s3/s4/x", symlink(&repo, "x", "u/../../../../../.env")),
         ],
     );
     let mut record = veil_core::checkout::Materialised::default();
     let r = veil_core::checkout::checkout_recorded(repo.store(), &fs, None, &t, &mut record, None).unwrap();
-    for path in ["x", "deep/y", "abs", "dotdot"] {
+    for path in ["x", "deep/y", "abs", "dotdot", "usr", "proc", "s1/s2/s3/s4/x"] {
         assert!(r.failed.iter().any(|(p, why)| p.as_str() == path && why.contains("not materialised in this sandbox")), "{path}: {r:?}");
         assert!(std::fs::symlink_metadata(sandbox.join(path)).is_err(), "{path} was materialised");
         // Never materialised: recording the sandbox carries the link.
@@ -819,7 +826,100 @@ fn a_sandbox_never_materialises_a_link_leading_out_of_it() {
     }
     assert!(r.failed.iter().any(|(_, w)| w.contains("x -> ../../../../../.env")), "{:?}", r.failed);
     assert_eq!(std::fs::read_link(sandbox.join("fine")).unwrap(), PathBuf::from("deep"));
-    assert!(std::fs::symlink_metadata(sandbox.join("usr")).unwrap().file_type().is_symlink());
+    assert_eq!(std::fs::read_link(sandbox.join("up/fine")).unwrap(), PathBuf::from("../deep/y"));
+    assert_eq!(std::fs::read_link(sandbox.join("s1/s2/s3/s4/u")).unwrap(), PathBuf::from("../../../.."));
+    assert!(r.failed.iter().any(|(_, w)| w.contains("project")), "{:?}", r.failed);
+}
+
+/// Targets for the sandbox property: chains of `..` and names (some of
+/// which are links of the same tree), and absolute ones through `/proc`.
+fn sandbox_target_strategy() -> BoxedStrategy<String> {
+    let part = prop::sample::select(vec!["..", "..", "a", "b", "u", ".", "", "s"]);
+    let free = prop::collection::vec(part, 1..9).prop_map(|v| v.join("/")).prop_filter("not empty", |t| !t.is_empty());
+    // A chain's shape: climb, a name (maybe a link), climb again, a tail.
+    let chain = (0..6usize, prop::sample::select(vec!["a", "u", "s", "a/u"]), 0..8usize, prop::sample::select(vec![".env", "", "a"]))
+        .prop_map(|(up, name, up2, tail)| {
+            let mut v: Vec<&str> = vec![".."; up];
+            v.push(name);
+            v.extend(std::iter::repeat_n("..", up2));
+            if !tail.is_empty() {
+                v.push(tail);
+            }
+            v.join("/")
+        });
+    let relative = prop_oneof![free, chain];
+    let absolute = prop::sample::select(vec![
+        "/proc/self/cwd/../../../../../.env",
+        "/proc/self/cwd/.env",
+        "/proc/self/root/PROJECT/.env",
+        "/proc/thread-self/cwd/../.env",
+        "/dev/fd/3/.env",
+        "PROJECT/.env",
+        "/usr/share/dict/words",
+    ])
+    .prop_map(str::to_string);
+    prop_oneof![8 => relative, 1 => absolute].boxed()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 1000, ..ProptestConfig::default() })]
+
+    /// Threat 7, BUG-708, BUG-709: whatever links a tree holds (chains of
+    /// links that are each inside on their own, `/proc` magic links,
+    /// absolute targets), every link a sandbox materialises is relative and
+    /// resolves beneath the sandbox root, and nothing read through the
+    /// sandbox is the project's isolated `.env`.
+    #[test]
+    fn a_sandbox_never_resolves_outside_itself_through_any_links(
+        leaves in prop::collection::vec((
+            prop::collection::vec(prop::sample::select(vec!["a", "b", "u", "s"]), 1..7).prop_map(|v| v.join("/")),
+            prop_oneof![1 => any::<u8>().prop_map(Node::File), 4 => sandbox_target_strategy().prop_map(Node::Link)],
+        ), 1..10),
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let sandbox = project.join(".veil/local/sandboxes/ws/files");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::fs::write(project.join(".env"), b"SECRET=isolated\n").unwrap();
+        let (repo, _, _) = new_repo("alice");
+        let fs = SandboxFs::new(&sandbox, None, false).with_forbidden_targets([project.clone()]);
+        let leaves: Vec<(String, Node)> = leaves
+            .into_iter()
+            .map(|(p, n)| match n {
+                Node::Link(t) => (p, Node::Link(t.replace("PROJECT", project.to_str().unwrap()))),
+                n => (p, n),
+            })
+            .collect();
+        let t = random_tree(&repo, &leaves);
+        let mut record = veil_core::checkout::Materialised::default();
+        let r = veil_core::checkout::checkout_recorded(repo.store(), &fs, None, &t, &mut record, None);
+        prop_assert!(r.is_ok(), "{:?}", r.err());
+        let root = sandbox.canonicalize().unwrap();
+        let mut stack = vec![sandbox.clone()];
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).unwrap() {
+                let path = e.unwrap().path();
+                let m = std::fs::symlink_metadata(&path).unwrap();
+                if m.is_dir() {
+                    stack.push(path.clone());
+                }
+                if m.file_type().is_symlink() {
+                    let target = std::fs::read_link(&path).unwrap();
+                    prop_assert!(target.is_relative(), "{} -> {} (absolute) was materialised", path.display(), target.display());
+                    if let Ok(real) = path.canonicalize() {
+                        prop_assert!(real.starts_with(&root), "{} resolves to {}", path.display(), real.display());
+                    }
+                }
+                // Read through every name the tree gives (a command's own
+                // `..` climbs out of any directory, links or not).
+                for probe in [path.clone(), path.join(".env")] {
+                    if let Ok(data) = std::fs::read(&probe) {
+                        prop_assert!(data != b"SECRET=isolated\n", "{} reads the isolated .env", probe.display());
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ---- confidentiality --------------------------------------------------------------

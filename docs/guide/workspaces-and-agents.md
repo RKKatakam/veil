@@ -337,15 +337,26 @@ Use the vault for secrets an agent needs (`vl run`), not files it writes.
   exits, including after `kill -9`.
 * `vl doctor` reports leftover throwaway sandboxes, sandboxes of removed
   workspaces, interrupted and unrecorded runs, and files a rebuild kept.
-* A sandbox never hands its command a **symlink that leads out of it**: a
-  tree's link whose target climbs out of the sandbox
-  (`x -> ../../../../../.env`, which would reach the project's isolated
-  `.env` without `--with-isolated`), or points by absolute path into the
-  project directory or `$VEIL_HOME`, is not materialised (`failed: x ->
-  …: it leads outside the sandbox`), and recording the run keeps the
-  link as it is. Other links (`bin/tool -> ../lib/tool.sh`,
-  `/usr/share/dict/words`) are written as links. This holds for full,
-  `--only` and `--ephemeral` sandboxes alike.
+* A sandbox never hands its command a **symlink that could lead out of
+  it**. A tree's link is materialised only when its target is relative,
+  climbs with `..` first and then names only, and stays inside the
+  sandbox: `bin/tool -> ../lib/tool.sh` and `current -> releases/v2` are
+  written as links. Any other link is not materialised (`failed: x -> …:
+  … ; the link is not materialised in this sandbox`), and recording the
+  run keeps it as it is:
+  * a target that climbs out (`x -> ../../../../../.env`, which would reach
+    the project's isolated `.env` without `--with-isolated`);
+  * a `..` after a name (`x -> u/../../.env`): if `u` is itself a link, the
+    kernel climbs from where `u` points, so two links that each look
+    inside can together reach outside;
+  * any absolute target (`/usr/share/dict/words` too): what it names
+    depends on who reads it (`/proc/self/cwd/../../.env` is the sandbox
+    itself, then the project above it).
+
+  This holds for full, `--only` and `--ephemeral` sandboxes and for `vl
+  bisect run` alike. A command that needs such a link can create it
+  itself. A mounted workspace (`vl ws mount`) shows links as they are, as
+  your project directory does.
 * A sandbox is an isolation of **files**, not a security boundary: the
   command runs as you, with your network and your home directory. Run
   untrusted agents inside your own container or VM.

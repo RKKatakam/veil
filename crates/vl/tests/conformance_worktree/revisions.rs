@@ -108,6 +108,9 @@ fn ambiguous_change_id_prefix_is_refused() {
         ids.push(r.commit(&format!("c{i}")));
     }
     ids.push(r.change("@"));
+    // The root change (`zzzzzzzz…`) is a change id too: a random id
+    // starting with "zz" shares a prefix with it.
+    ids.push(r.change("root()"));
     let (a, b) = ids
         .iter()
         .enumerate()

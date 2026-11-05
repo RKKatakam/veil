@@ -97,18 +97,17 @@ pub struct SandboxFs {
     log: Mutex<Option<HashMap<VPath, WrittenFile>>>,
     cloned: AtomicU64,
     cloned_bytes: AtomicU64,
-    /// Absolute symlink targets inside these directories are never
-    /// materialised (see [`SandboxFs::with_forbidden_targets`]).
+    /// Named when an absolute symlink target lies inside one of them (see
+    /// [`SandboxFs::with_forbidden_targets`]).
     forbidden: Vec<PathBuf>,
 }
 
 impl SandboxFs {
-    /// Never materialise a symlink whose absolute target lies inside one of
-    /// `roots` (the project directory, `$VEIL_HOME`): a command run in the
-    /// sandbox would reach through it what the sandbox promised not to
-    /// give it (the project's isolated `.env`, without `--with-isolated`;
-    /// the identity). Relative targets that climb out of the sandbox are
-    /// refused whatever this says. Symlinks design, threat 7.
+    /// Name `roots` (the project directory, `$VEIL_HOME`) in the message
+    /// that refuses a link whose absolute target lies inside one of them.
+    /// Every absolute target is refused whatever this says (BUG-709), as is
+    /// every relative one that could resolve outside the sandbox
+    /// ([`super::sandbox_link_check`]). Symlinks design, threat 7.
     pub fn with_forbidden_targets(mut self, roots: impl IntoIterator<Item = PathBuf>) -> SandboxFs {
         for r in roots {
             if let Ok(c) = fs::canonicalize(&r) {
@@ -122,34 +121,27 @@ impl SandboxFs {
     }
 
     /// May a tree's symlink `path -> target` be materialised here? Refused
-    /// (`Policy`, which checkout reports as blocked) when the target,
-    /// resolved lexically against the link's directory, leaves the sandbox
-    /// (`../../.env`), or is absolute and inside a forbidden root.
+    /// (`Policy`, which checkout reports as blocked) unless it provably
+    /// resolves beneath the sandbox root, whatever other links the tree
+    /// holds: see [`super::sandbox_link_check`]. That rules out absolute
+    /// targets (BUG-709: `/proc/self/cwd/../../.env`) and chains of links
+    /// that are each inside on their own (BUG-708).
     fn guard_link(&self, path: &VPath, target: &[u8]) -> Result<()> {
         let t = super::check_link_target(target)?;
         let refuse = |why: String| {
             crate::error::VeilError::Policy(format!("{path} -> {t}: {why}; the link is not materialised in this sandbox"))
         };
-        if !t.starts_with('/') {
-            if super::link_escapes(path, t) {
-                return Err(refuse("it leads outside the sandbox".into()));
-            }
-            return Ok(());
-        }
-        let mut abs = PathBuf::from("/");
-        for c in Path::new(t).components() {
-            match c {
-                std::path::Component::ParentDir => {
-                    abs.pop();
+        match super::sandbox_link_check(path, t) {
+            Ok(()) => Ok(()),
+            Err(why) if t.starts_with('/') => {
+                let abs = Path::new(t);
+                match self.forbidden.iter().find(|r| abs.starts_with(r)) {
+                    Some(root) => Err(refuse(format!("it points into {}, which the sandbox does not give its commands", root.display()))),
+                    None => Err(refuse(why.to_string())),
                 }
-                std::path::Component::Normal(n) => abs.push(n),
-                _ => {}
             }
+            Err(why) => Err(refuse(why.to_string())),
         }
-        if let Some(root) = self.forbidden.iter().find(|r| abs.starts_with(r)) {
-            return Err(refuse(format!("it points into {}, which the sandbox does not give its commands", root.display())));
-        }
-        Ok(())
     }
     /// A sandbox rooted at `root`. With `sources`, checkout clones files
     /// from them where it can; with `log_writes`, every write is remembered

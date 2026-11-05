@@ -59,7 +59,7 @@ run = ["sh", "scripts/check-push.sh"]
 
 A command that reads further repository files can list them in
 `files = ["scripts/common.sh"]`, so that they are pinned with it (see
-below).
+below). A directory in `files` is pinned with every file below it.
 
 Until you trust it, nothing in `.veilhooks` runs, and every command that
 would run it says so:
@@ -158,7 +158,35 @@ file when you trusted the command and names one now counts as a change too
   (`Makefile`, `package.json`, `.pre-commit-config.yaml`, …), so a change
   to them untrusts the hook. What those files pull in further
   (`node_modules`, an included makefile) is not pinned: trusting a build
-  tool trusts the project's build.
+  tool trusts the project's build. A build tool behind a launcher (`nice
+  make`, `timeout 60 make`, `env A=b make`, `sudo -u ci make`, `vl run --
+  npm test`) counts the same.
+* **Every spelling is the same path.** `./scripts/lint.sh`,
+  `scripts//lint.sh`, `--rcfile=scripts/lint.sh` and
+  `LD_PRELOAD=./lib/x.so` name repository files: they are pinned, and the
+  command gets the trusted copy in their place. A path `vl` cannot pin is
+  refused instead: one through `..` (`x/../scripts/lint.sh`,
+  `../proj/scripts/lint.sh`), an absolute one into the project or through
+  `/proc`, one under `.veil` or `.git`, one glued to a short option
+  (`-Iscripts/lib`: write `-I scripts/lib`), a `PATH`-like list
+  (`PYTHONPATH=lib:tools`).
+* **Directories.** A directory the program may run (`["python3", "tools"]`
+  runs `tools/__main__.py`; `node dir` runs `dir/index.js`) is pinned with
+  every file below it (at most 1024 entries and 64 MiB, no symbolic
+  links), and the command gets a private copy of it. Any other directory
+  (`["ruff", "check", "src"]`) is the command's input, like the project
+  directory it runs in: only that it is a directory is pinned, so editing
+  `src` does not untrust the hook. `.` (the project directory) is never
+  pinned, and an interpreter is never given it (`["python3", "."]` is
+  refused).
+* **Code as text is refused.** `sh -c "make lint"`, `bash -ec …`,
+  `python3 -c …`, `node -e …`, `perl -e …`, `ruby -e …`, `php -r …`, an
+  `awk` program without `-f`, `env -S`, and commands that run their
+  arguments through a shell or read them from their input (`xargs`,
+  `watch`, `parallel`) can run repository files in a syntax `vl` does not
+  read, so `vl hooks trust` refuses them, with or without
+  `--i-understand-indirect`. Put the command line in a script and name the
+  script.
 
 ## The environment
 

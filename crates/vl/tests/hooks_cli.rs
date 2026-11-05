@@ -898,12 +898,14 @@ fn hostile_veilhooks_files_run_nothing() {
     std::os::unix::fs::symlink("/bin/true", proj.join("scripts/linked.sh")).unwrap();
     let out = env.vl(U, &proj, &["hooks", "trust", "--yes"]);
     assert!(!out.status.success() && text(&out).contains("not a regular file"), "{}", text(&out));
-    // An absolute argument inside the project is refused at run time.
+    // An absolute argument inside the project is refused, by trust
+    // (BUG-701: it would never be pinned) and so never runs.
     std::fs::remove_file(proj.join("scripts/linked.sh")).unwrap();
     write(&proj, ".veilhooks", &format!("[pre-commit]\nrun = [\"sh\", \"{}\"]\n", proj.join("scripts/lint.sh").display()));
-    trust(&env, &proj);
-    let out = env.vl(U, &proj, &["commit", "-m", "abs"]);
+    let out = env.vl(U, &proj, &["hooks", "trust", "--yes"]);
     assert!(!out.status.success() && text(&out).contains("relative path"), "{}", text(&out));
+    let out = env.vl(U, &proj, &["commit", "-m", "abs"]);
+    assert!(out.status.success() && text(&out).contains("warning:"), "{}", text(&out));
     assert_eq!(marked(&m), "");
 }
 

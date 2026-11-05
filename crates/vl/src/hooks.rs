@@ -13,10 +13,15 @@
 //! * **Repository-suggested hooks** (`.veilhooks`, a tracked TOML file)
 //!   run only once this device trusts them: `vl hooks trust` pins the
 //!   BLAKE3 digest of `.veilhooks` and of every repository file its
-//!   commands name in `.veil/local/hooks-trust.json`. Any change makes them
-//!   untrusted again: they do not run, and every command that would have
-//!   run them warns. The record is never synced, and only `vl hooks trust`
-//!   writes it (not a hook, not `vl serve`).
+//!   commands name, in any spelling (BUG-701), in
+//!   `.veil/local/hooks-trust.json` (a directory the program may run, with
+//!   every file below it: BUG-700). Any change makes them untrusted again:
+//!   they do not run, and every command that would have run them warns.
+//!   The record is never synced, and only `vl hooks trust` writes it (not a
+//!   hook, not `vl serve`). What trust cannot pin is refused (`refusal`):
+//!   code given as text (`sh -c`), arguments taken from input (`xargs`),
+//!   paths through `..`, `/proc` or into `.veil`. Build tools are found
+//!   behind launchers too (BUG-702).
 //! * **Copy, then exec.** A repository file a trusted command runs or reads
 //!   as an argument is read once, hashed, compared with the trusted digest,
 //!   and written to `.veil/local/hooks-run/` (`0700`); the command is given
@@ -145,8 +150,12 @@ const TRUST_FILE: &str = "hooks-trust.json";
 const RUN_DIR: &str = "hooks-run";
 const MAX_VEILHOOKS: u64 = 64 << 10;
 const MAX_TRUST_FILE: u64 = 1 << 20;
-/// A pinned repository file (a script, a Makefile).
+/// A pinned repository file (a script, a Makefile), or all the files of a
+/// pinned directory together.
 const MAX_PINNED: u64 = 64 << 20;
+/// Entries (files and directories) below a pinned directory.
+const MAX_TREE_ENTRIES: usize = 1024;
+const MAX_TREE_DEPTH: usize = 32;
 const MAX_COMMANDS: usize = 16;
 const MAX_ARGS: usize = 64;
 const MAX_ARG: usize = 4096;
@@ -288,8 +297,12 @@ enum PathState {
     File(String),
     /// Nothing there.
     Absent,
-    /// A directory (its content is not pinned).
+    /// A directory given to a command as data: only that it is one is
+    /// pinned (see [`Pin::Plain`]).
     Dir,
+    /// A directory pinned with everything below it ([`Pin::Tree`]): the
+    /// BLAKE3 digest (hex) of [`tree_digest`]'s manifest.
+    Tree(String),
     /// A symbolic link, a socket, unreadable, too large…
     Other,
 }
@@ -300,18 +313,33 @@ impl PathState {
             PathState::File(d) => d.clone(),
             PathState::Absent => "absent".into(),
             PathState::Dir => "directory".into(),
+            PathState::Tree(d) => format!("tree:{d}"),
             PathState::Other => "other".into(),
         }
     }
 
     fn from_word(s: &str) -> PathState {
+        let hex = |d: &str| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit());
         match s {
             "absent" => PathState::Absent,
             "directory" => PathState::Dir,
-            d if d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()) => PathState::File(d.to_string()),
+            d if hex(d) => PathState::File(d.to_string()),
+            t if t.strip_prefix("tree:").is_some_and(hex) => PathState::Tree(t["tree:".len()..].to_string()),
             _ => PathState::Other,
         }
     }
+}
+
+/// How a repository path a command names is pinned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Pin {
+    /// A file by its content; a directory only as being one (it is data
+    /// the command reads, as the project directory it runs in is).
+    Plain,
+    /// A file by its content; a directory by the content of every file
+    /// below it (BUG-700): the command may run it (`python3 tools`), or
+    /// `files` names it.
+    Tree,
 }
 
 /// Read a regular repository file without following a final symbolic link,
@@ -341,12 +369,86 @@ fn read_regular(path: &Path, max: u64) -> std::io::Result<Option<Vec<u8>>> {
     Ok(Some(data))
 }
 
-fn path_state(root: &Path, p: &str) -> PathState {
+/// A pinned directory, read whole: each entry below it (a path relative
+/// to it, in order) with its content, `None` for a directory.
+type TreeContent = Vec<(PathBuf, Option<Vec<u8>>)>;
+
+/// Read every file below directory `dir`, never through a symbolic link:
+/// a link, a special file, more than [`MAX_TREE_ENTRIES`] entries, more
+/// than [`MAX_PINNED`] bytes in all or more than [`MAX_TREE_DEPTH`]
+/// levels is an error (such a directory cannot be pinned).
+fn read_tree(dir: &Path) -> std::io::Result<TreeContent> {
+    fn walk(base: &Path, rel: &Path, depth: usize, out: &mut TreeContent, bytes: &mut u64) -> std::io::Result<()> {
+        if depth > MAX_TREE_DEPTH {
+            return Err(std::io::Error::other(format!("deeper than {MAX_TREE_DEPTH} levels")));
+        }
+        let mut names: Vec<std::ffi::OsString> =
+            std::fs::read_dir(base.join(rel))?.map(|e| e.map(|e| e.file_name())).collect::<std::io::Result<_>>()?;
+        names.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        for name in names {
+            if out.len() >= MAX_TREE_ENTRIES {
+                return Err(std::io::Error::other(format!("more than {MAX_TREE_ENTRIES} entries")));
+            }
+            let r = rel.join(&name);
+            let full = base.join(&r);
+            let m = std::fs::symlink_metadata(&full)?;
+            if m.is_dir() {
+                out.push((r.clone(), None));
+                walk(base, &r, depth + 1, out, bytes)?;
+            } else if m.is_file() {
+                let data = read_regular(&full, MAX_PINNED.saturating_sub(*bytes))?
+                    .ok_or_else(|| std::io::Error::other(format!("{} disappeared", r.display())))?;
+                *bytes += data.len() as u64;
+                out.push((r, Some(data)));
+            } else {
+                return Err(std::io::Error::other(format!("{} is a symbolic link or a special file", r.display())));
+            }
+        }
+        Ok(())
+    }
+    if !std::fs::symlink_metadata(dir)?.is_dir() {
+        return Err(std::io::Error::other("not a directory"));
+    }
+    let mut out = Vec::new();
+    walk(dir, Path::new(""), 0, &mut out, &mut 0)?;
+    Ok(out)
+}
+
+/// The digest a [`Pin::Tree`] directory is pinned by: of every entry
+/// below it, its kind, its relative path and (for a file) its content's
+/// digest, NUL-separated, in path order.
+fn tree_digest(tree: &TreeContent) -> String {
+    let mut h = blake3::Hasher::new();
+    for (p, data) in tree {
+        match data {
+            None => {
+                h.update(b"d\0");
+                h.update(p.as_os_str().as_bytes());
+                h.update(b"\0");
+            }
+            Some(d) => {
+                h.update(b"f\0");
+                h.update(p.as_os_str().as_bytes());
+                h.update(b"\0");
+                h.update(blake3::hash(d).as_bytes());
+            }
+        }
+    }
+    h.finalize().to_hex().to_string()
+}
+
+fn path_state(root: &Path, p: &str, pin: Pin) -> PathState {
     let full = root.join(p);
     match std::fs::symlink_metadata(&full) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => PathState::Absent,
         Err(_) => PathState::Other,
-        Ok(m) if m.is_dir() => PathState::Dir,
+        Ok(m) if m.is_dir() => match pin {
+            Pin::Plain => PathState::Dir,
+            Pin::Tree => match read_tree(&full) {
+                Ok(t) => PathState::Tree(tree_digest(&t)),
+                Err(_) => PathState::Other,
+            },
+        },
         Ok(m) if m.is_file() => match read_regular(&full, MAX_PINNED) {
             Ok(Some(d)) => PathState::File(digest(&d)),
             Ok(None) => PathState::Absent,
@@ -422,36 +524,124 @@ fn base_name(program: &str) -> &str {
     program.rsplit('/').next().unwrap_or(program)
 }
 
-/// The program a command really runs: through `env [-opts] [VAR=x]… prog`.
-fn effective_program(run: &[String]) -> Option<(usize, &str)> {
-    let mut i = 0;
-    while i < run.len() {
-        let b = base_name(&run[i]);
-        if b == "env" && i == 0 {
-            i += 1;
-            while i < run.len() && (run[i].starts_with('-') || run[i].contains('=')) {
-                i += 1;
-            }
-            continue;
-        }
-        return Some((i, b));
+/// Programs that run another command given in their arguments (BUG-702):
+/// a command behind one of them is looked at as if it were the program,
+/// and since their own options differ, every argument after a launcher
+/// counts as a program that may run (see [`programs`]).
+const LAUNCHERS: &[&str] = &[
+    "env", "nice", "nohup", "timeout", "exec", "command", "builtin", "sudo", "doas", "su", "runuser", "setpriv",
+    "stdbuf", "ionice", "chrt", "taskset", "setsid", "time", "caffeinate", "flock", "unbuffer", "chronic",
+    "eatmydata", "faketime", "firejail", "bwrap", "unshare", "nsenter", "systemd-run", "script", "busybox", "vl",
+    "uvx", "pipx", "dotenv", "direnv", "strace", "ltrace", "valgrind", "catchsegv", "rlwrap", "torsocks",
+    "proxychains", "proxychains4", "dbus-run-session", "xvfb-run", "tini", "dumb-init", "gosu", "su-exec", "chpst",
+    "setlock", "softlimit", "envdir", "nocache", "cpulimit", "prlimit", "numactl", "sg", "doppler", "op", "aws-vault",
+];
+
+/// Programs that run their arguments through a shell, or take them from
+/// their input: what they run cannot be pinned, so they are refused.
+const SHELL_RUNNERS: &[&str] = &["xargs", "watch", "parallel", "hyperfine", "entr", "eval", "source"];
+
+const SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "ksh", "mksh", "ash", "yash", "fish", "csh", "tcsh", "rc", "es"];
+
+/// Interpreters that run a directory given as their program
+/// (`__main__.py`, `index.js`, `package.json`'s `main`).
+fn runs_directories(b: &str) -> bool {
+    b.starts_with("python") || b.starts_with("pypy") || matches!(b, "node" | "nodejs" | "bun")
+}
+
+/// The positions of `run` that may be a program it runs: the first, and,
+/// once a launcher is among them, every later argument (BUG-702: `nice
+/// make`, `timeout 60 make`, `env A=b sudo -u x make`).
+fn programs(run: &[String]) -> Vec<usize> {
+    match run.first() {
+        None => Vec::new(),
+        Some(p) if LAUNCHERS.contains(&base_name(p)) => (0..run.len()).collect(),
+        Some(_) => vec![0],
     }
-    None
+}
+
+/// A short-option cluster (`-ec`, `-Im`): its letters. `None` for
+/// anything else (`--long`, `-`, a non-option).
+fn cluster(a: &str) -> Option<&str> {
+    a.strip_prefix('-').filter(|r| !r.is_empty() && !r.starts_with('-'))
+}
+
+/// The letters of a cluster up to the first that takes the rest as its
+/// value (`stop`).
+fn letters<'a>(c: &'a str, stop: &str) -> &'a str {
+    c.find(|ch| stop.contains(ch)).map_or(c, |i| &c[..=i])
+}
+
+/// Does the program at `run[j]` run code given as text in its arguments
+/// (`sh -c "make lint"`, `python3 -c`, `node -e`, `perl -e`, …)? That
+/// text can name any repository file, in a syntax `vl` does not parse,
+/// so such a command is never trusted (BUG-702). Also: the programs of
+/// [`SHELL_RUNNERS`], and `env -S`.
+fn code_string(run: &[String], j: usize) -> Option<String> {
+    let b = base_name(&run[j]);
+    let after = &run[j + 1..];
+    // Options before the first operand (the script, for interpreters), or
+    // (`all`) every later argument.
+    let flagged = |short: &str, stop: &str, long: &[&str], all: bool| -> Option<String> {
+        let opts = after.iter().take_while(|a| all || (a.starts_with('-') && a.as_str() != "--"));
+        let mut it = opts;
+        it.find(|a| {
+            cluster(a).is_some_and(|c| letters(c, stop).contains(|ch| short.contains(ch)))
+                || long.iter().any(|l| a.as_str() == *l || a.strip_prefix(l).is_some_and(|r| r.starts_with('=')))
+        })
+        .map(|a| format!("`{b} {a}` runs code given as text, which can run repository files no trust pins"))
+    };
+    if SHELL_RUNNERS.contains(&b) {
+        return Some(format!("`{b}` runs a command line, or arguments from its input, which no trust can pin"));
+    }
+    if SHELLS.contains(&b) {
+        // Anywhere after the shell: `bash -o pipefail -c …`.
+        return flagged("c", "", &["--command"], true);
+    }
+    match b {
+        "su" | "runuser" | "flock" | "script" => flagged("c", "", &["--command"], true),
+        "env" => flagged("S", "uC", &["--split-string"], false),
+        b if b.starts_with("python") || b.starts_with("pypy") => flagged("c", "WX", &[], false),
+        "node" | "nodejs" | "bun" => flagged("ep", "rC", &["--eval", "--print"], false),
+        "deno" => after
+            .iter()
+            .find(|a| !a.starts_with('-'))
+            .filter(|a| *a == "eval" || *a == "repl")
+            .map(|_| "`deno eval` runs code given as text, which can run repository files no trust pins".to_string()),
+        "perl" => flagged("eE", "IMmxiCDd", &[], false),
+        "ruby" => flagged("e", "IrCExF0KTW", &[], false),
+        "php" => flagged("rBRE", "cdzF", &[], false),
+        "lua" | "luajit" | "Rscript" | "julia" | "osascript" | "tclsh" => flagged("eE", "l", &["--eval"], false),
+        "awk" | "gawk" | "mawk" | "nawk" => {
+            (!after.iter().any(|a| a == "-f" || a.starts_with("--file") || cluster(a).is_some_and(|c| c.ends_with('f'))))
+                .then(|| format!("`{b}` runs a program given as text, which can run repository files no trust pins; put it in a file and use `-f`"))
+        }
+        _ => None,
+    }
 }
 
 /// Does the command run something that reads repository files beyond its
 /// argv? The files to pin with it, if so.
 fn indirect(run: &[String]) -> Option<Vec<&'static str>> {
-    let (i, prog) = effective_program(run)?;
-    // `python -m mod` imports from the current directory.
-    let python = prog.starts_with("python") && run[i + 1..].iter().any(|a| a == "-m");
-    if python {
-        return Some(vec!["pyproject.toml", "setup.cfg"]);
+    let mut out: Vec<&'static str> = Vec::new();
+    let mut any = false;
+    for j in programs(run) {
+        let b = base_name(&run[j]);
+        // `python -m mod` imports from the current directory.
+        if (b.starts_with("python") || b.starts_with("pypy"))
+            && run[j + 1..].iter().any(|a| a == "-m" || cluster(a).is_some_and(|c| letters(c, "WX").contains('m')))
+        {
+            any = true;
+            out.extend(["pyproject.toml", "setup.cfg"]);
+        }
+        if let Some((_, files)) = INDIRECT.iter().find(|(names, _)| names.contains(&b)) {
+            any = true;
+            out.extend(files.iter());
+        }
     }
-    INDIRECT
-        .iter()
-        .find(|(names, _)| names.contains(&prog))
-        .map(|(_, files)| files.to_vec())
+    let mut seen = HashSet::new();
+    out.retain(|f| seen.insert(*f));
+    any.then_some(out)
 }
 
 /// How each argument of a command is treated.
@@ -459,45 +649,196 @@ fn indirect(run: &[String]) -> Option<Vec<&'static str>> {
 enum Arg {
     /// A program found on `PATH` (a bare name) or by absolute path.
     Program(String),
-    /// A repository path (it may name nothing yet): pinned; a file there is
-    /// given to the command as its trusted copy.
-    Repo(String),
+    /// `prefix` (`--opt=`, `VAR=` or nothing) and a repository path in any
+    /// spelling (`./a`, `a//b` and `a/./b` are `a/b`; BUG-701), normalised,
+    /// which may name nothing yet: pinned, and a file there (or a pinned
+    /// directory) is given to the command as its trusted copy. The empty
+    /// path is the project root, the command's working directory: never
+    /// pinned, given as `.`. `whole`: for `VAR=value`, the whole argument
+    /// as a path, which must name nothing (pinned absent). `spelled`: the
+    /// path as written, given as is when no copy replaces it (a path with
+    /// `..` is refused, so it names what `path` names).
+    Repo { prefix: String, path: String, whole: Option<String>, spelled: String },
     /// Anything else, given as is.
     Literal(String),
+    /// An argument trust refuses (why).
+    Refused(String),
 }
 
-fn classify(run: &[String]) -> Vec<Arg> {
+/// What a path written in an argument names.
+enum Spelled {
+    /// A repository path, normalised (`""`: the root).
+    Repo(String),
+    /// Not a repository path (outside the project, not a path at all).
+    Outside,
+    Refused(String),
+}
+
+fn under_proc(abs: &Path) -> bool {
+    ["/proc", "/dev/fd", "/dev/stdin", "/dev/stdout", "/dev/stderr"].iter().any(|p| abs.starts_with(p))
+}
+
+/// Normalise `s`, a path as an argument spells it, against the project
+/// `root` (BUG-701). In doubt, refused: a path through `..` that ends in
+/// the project, an absolute path into the project (or through `/proc`,
+/// which can name it), a path into `.veil` or `.git`.
+fn spelled(root: &Path, s: &str) -> Spelled {
+    if s.is_empty() {
+        return Spelled::Outside;
+    }
+    let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if s.starts_with('/') {
+        let p = Path::new(s);
+        if under_proc(p) {
+            return Spelled::Refused(format!("`{}` goes through /proc or /dev/fd, which can name the project", safe(s)));
+        }
+        if inside(root, p) || lexically(Path::new("/"), s).starts_with(&canon_root) {
+            return Spelled::Refused(format!("`{}` is inside the project: name repository files by relative path", safe(s)));
+        }
+        return Spelled::Outside;
+    }
+    let parts: Vec<&str> = s.split('/').filter(|c| !c.is_empty() && *c != ".").collect();
+    if parts.contains(&"..") {
+        let full = lexically(&canon_root, s);
+        let real = canon_root.join(s).canonicalize().ok();
+        if full.starts_with(&canon_root) || real.is_some_and(|r| r.starts_with(&canon_root)) {
+            return Spelled::Refused(format!(
+                "`{}` names a project path through `..`: write it as its path in the repository",
+                safe(s)
+            ));
+        }
+        return Spelled::Outside;
+    }
+    if let Some(first) = parts.first() {
+        let first = first.to_ascii_lowercase();
+        if first == VEIL_DIR || first == ".git" {
+            return Spelled::Refused(format!("`{}` is in {first}, which a hook's trust cannot pin", safe(s)));
+        }
+    }
+    Spelled::Repo(parts.join("/"))
+}
+
+/// `base` joined with `s`, `..` and `.` resolved lexically.
+fn lexically(base: &Path, s: &str) -> PathBuf {
+    let mut out = base.to_path_buf();
+    for c in s.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `NAME=value`, as `env` and `make` read it: the value.
+fn assignment(a: &str) -> Option<(&str, &str)> {
+    let (name, value) = a.split_once('=')?;
+    let mut ch = name.chars();
+    let ok = ch.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && ch.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    ok.then_some((name, value))
+}
+
+fn classify(root: &Path, run: &[String]) -> Vec<Arg> {
+    let as_path = |prefix: &str, value: &str, whole: Option<String>, original: &str| match spelled(root, value) {
+        Spelled::Repo(path) => Arg::Repo { prefix: prefix.to_string(), path, whole, spelled: value.to_string() },
+        Spelled::Outside => Arg::Literal(original.to_string()),
+        Spelled::Refused(why) => Arg::Refused(why),
+    };
     run.iter()
         .enumerate()
         .map(|(i, a)| {
             if i == 0 {
-                if a.contains('/') && !a.starts_with('/') {
-                    Arg::Repo(a.clone())
+                return if a.contains('/') && !a.starts_with('/') {
+                    as_path("", a, None, a)
                 } else {
                     Arg::Program(a.clone())
-                }
-            } else if a.starts_with('-') || a.starts_with('/') || repo_path(a).is_none() {
-                Arg::Literal(a.clone())
-            } else {
-                Arg::Repo(a.clone())
+                };
             }
+            if a.starts_with('-') {
+                // `--opt=path`: the value is a path like any other.
+                if let Some((opt, value)) = a.split_once('=') {
+                    return as_path(&format!("{opt}="), value, None, a);
+                }
+                // `-Iscripts/x`, `--rcfile/x`: a path glued to an option.
+                if a.contains('/') {
+                    return Arg::Refused(format!(
+                        "`{}` attaches a path to an option: write it as two arguments, or as `--opt=path`",
+                        safe(a)
+                    ));
+                }
+                return Arg::Literal(a.clone());
+            }
+            if let Some((name, value)) = assignment(a) {
+                // `PYTHONPATH=lib:tools`: a list of paths.
+                if value.contains(':') && value.split(':').any(|v| !matches!(spelled(root, v), Spelled::Outside)) {
+                    return Arg::Refused(format!("`{}` names repository paths in a list: trust cannot pin them", safe(a)));
+                }
+                let whole = match spelled(root, a) {
+                    Spelled::Repo(p) => Some(p),
+                    _ => None,
+                };
+                return as_path(&format!("{name}="), value, whole, a);
+            }
+            as_path("", a, None, a)
         })
         .collect()
 }
 
-/// Every repository path a command's trust pins: its argv's, its `files`,
-/// and a build tool's own files.
-fn pinned_paths(c: &Suggested) -> BTreeSet<String> {
-    let mut out: BTreeSet<String> = classify(&c.run)
-        .into_iter()
-        .filter_map(|a| match a {
-            Arg::Repo(p) => Some(p),
-            _ => None,
-        })
-        .collect();
-    out.extend(c.files.iter().cloned());
+/// Why trust must refuse `c` whatever the files hold, if it must: an
+/// argument it cannot pin, code given as text, the project root given to
+/// an interpreter that would run it.
+fn refusal(root: &Path, c: &Suggested) -> Option<String> {
+    let progs = programs(&c.run);
+    for &j in &progs {
+        if let Some(why) = code_string(&c.run, j) {
+            return Some(why);
+        }
+    }
+    let interp = progs.iter().any(|&j| runs_directories(base_name(&c.run[j])));
+    for a in classify(root, &c.run) {
+        match a {
+            Arg::Refused(why) => return Some(why),
+            Arg::Repo { path, .. } if path.is_empty() && interp => {
+                return Some("it gives the project directory to an interpreter that would run it (`__main__.py`, `index.js`), which trust cannot pin: name the script".into())
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Every repository path a command's trust pins, and how: its argv's, its
+/// `files`, and a build tool's own files. A directory in `files`, or an
+/// argument of a command whose program may run it (`python3 tools`), is
+/// pinned with everything below it.
+fn pinned_paths(root: &Path, c: &Suggested) -> BTreeMap<String, Pin> {
+    let interp = programs(&c.run).into_iter().any(|j| runs_directories(base_name(&c.run[j])));
+    let arg_pin = if interp { Pin::Tree } else { Pin::Plain };
+    let mut out: BTreeMap<String, Pin> = BTreeMap::new();
+    let mut add = |p: String, pin: Pin| {
+        let e = out.entry(p).or_insert(pin);
+        *e = (*e).max(pin);
+    };
+    for a in classify(root, &c.run) {
+        if let Arg::Repo { path, whole, .. } = a {
+            if !path.is_empty() {
+                add(path, arg_pin);
+            }
+            if let Some(w) = whole {
+                add(w, Pin::Plain);
+            }
+        }
+    }
+    for f in &c.files {
+        add(f.clone(), Pin::Tree);
+    }
     if let Some(files) = indirect(&c.run) {
-        out.extend(files.into_iter().map(String::from));
+        for f in files {
+            add(f.to_string(), Pin::Plain);
+        }
     }
     out
 }
@@ -622,14 +963,16 @@ fn check_trust(root: &Path, hooks: &Veilhooks) -> Result<Trust> {
         };
         // The paths the trust pinned must be the ones this command reads
         // (a record for another vl's notion of them does not do).
-        let want = pinned_paths(c);
-        if want.iter().any(|p| !t.digests.contains_key(p)) {
+        // A command this vl refuses is never trusted, whatever an older
+        // record says.
+        let want = pinned_paths(root, c);
+        if refusal(root, c).is_some() || want.keys().any(|p| !t.digests.contains_key(p)) {
             changed.insert(VEILHOOKS.to_string());
             continue;
         }
         let mut states = BTreeMap::new();
         for (p, d) in &t.digests {
-            let now = path_state(root, p);
+            let now = path_state(root, p, want.get(p).copied().unwrap_or(Pin::Plain));
             if now != PathState::from_word(d) || matches!(now, PathState::Other) {
                 changed.insert(p.clone());
             }
@@ -837,6 +1180,53 @@ fn trusted_copy(root: &Path, rel: &str, want: &str, copies: &mut Vec<PathBuf>) -
     Ok(copy)
 }
 
+/// [`trusted_copy`] for a directory pinned with everything below it
+/// (BUG-700): read whole, checked against its trusted digest, and that
+/// very content written to a private directory the command gets.
+fn trusted_tree_copy(root: &Path, rel: &str, want: &str, copies: &mut Vec<PathBuf>) -> Result<PathBuf> {
+    let changed = || anyhow!("`{}` changed since you trusted it", safe(rel));
+    let tree = read_tree(&root.join(rel)).map_err(|_| changed())?;
+    if tree_digest(&tree) != want {
+        return Err(changed());
+    }
+    let dir = local_dir(root).join(RUN_DIR);
+    private_dir(&local_dir(root))?;
+    private_dir(&dir)?;
+    let name = Path::new(rel).file_name().and_then(|n| n.to_str()).unwrap_or("dir");
+    let name: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')).take(32).collect();
+    let copy = dir.join(format!("{}{}-{name}", &want[..16], unique("-")));
+    std::fs::DirBuilder::new().mode(0o700).create(&copy).with_context(|| format!("creating {}", copy.display()))?;
+    copies.push(copy.clone());
+    for (p, data) in &tree {
+        let to = copy.join(p);
+        match data {
+            None => std::fs::DirBuilder::new().mode(0o700).create(&to),
+            Some(d) => std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o700)
+                .open(&to)
+                .and_then(|mut f| f.write_all(d)),
+        }
+        .with_context(|| format!("writing {}", to.display()))?;
+    }
+    Ok(copy)
+}
+
+/// Remove a private copy (a file, or a directory [`trusted_tree_copy`]
+/// made).
+fn remove_copy(c: &Path) {
+    match std::fs::symlink_metadata(c) {
+        Ok(m) if m.is_dir() => {
+            let _ = std::fs::remove_dir_all(c);
+        }
+        Ok(_) => {
+            let _ = std::fs::remove_file(c);
+        }
+        Err(_) => {}
+    }
+}
+
 /// The process group of the hook running now (0: none), for the signal
 /// handler.
 static HOOK_GROUP: AtomicI32 = AtomicI32::new(0);
@@ -1003,6 +1393,69 @@ fn execute(program: &Path, args: &[OsString], root: &Path, hook: Hook, inv: &Inv
     Ok(outcome)
 }
 
+/// The program and arguments of trusted command `c`, given the states its
+/// paths were trusted at: every repository file or pinned directory it
+/// names is replaced by a private copy of the trusted bytes (written to
+/// `copies`), whatever spelling named it (`./a`, `--opt=a`, `VAR=a`), and
+/// every other pinned path is checked again. `Err` if anything changed
+/// since the trust, or the command is one trust refuses.
+fn suggested_argv(
+    root: &Path,
+    c: &Suggested,
+    states: &BTreeMap<String, PathState>,
+    copies: &mut Vec<PathBuf>,
+    resolve: &dyn Fn(&str) -> Result<PathBuf>,
+) -> Result<(PathBuf, Vec<OsString>)> {
+    if let Some(why) = refusal(root, c) {
+        bail!("{why}");
+    }
+    let pins = pinned_paths(root, c);
+    let changed = |p: &str| anyhow!("`{}` changed since you trusted it", safe(p));
+    let mut argv: Vec<OsString> = Vec::new();
+    let mut program = None;
+    let mut copied = BTreeSet::new();
+    for a in classify(root, &c.run) {
+        let v: OsString = match a {
+            Arg::Program(name) => resolve(&name)?.into_os_string(),
+            Arg::Repo { prefix, path, spelled, .. } if path.is_empty() => format!("{prefix}{spelled}").into(),
+            Arg::Repo { prefix, path, spelled, .. } => {
+                let pin = pins.get(&path).copied().unwrap_or(Pin::Plain);
+                let target: OsString = match states.get(&path) {
+                    Some(PathState::File(d)) => trusted_copy(root, &path, d, copies)?.into_os_string(),
+                    Some(PathState::Tree(d)) => trusted_tree_copy(root, &path, d, copies)?.into_os_string(),
+                    // The program itself is always a trusted copy.
+                    Some(s) if program.is_some() && path_state(root, &path, pin) == *s => spelled.into(),
+                    _ => return Err(changed(&path)),
+                };
+                copied.insert(path);
+                let mut v = OsString::from(prefix);
+                v.push(target);
+                v
+            }
+            Arg::Literal(s) => {
+                if s.starts_with('/') && (inside(root, Path::new(&s)) || under_proc(Path::new(&s))) {
+                    bail!("`{}` is inside the project: name repository files by relative path", safe(&s));
+                }
+                s.into()
+            }
+            Arg::Refused(why) => bail!("{why}"),
+        };
+        if program.is_none() {
+            program = Some(PathBuf::from(v));
+        } else {
+            argv.push(v);
+        }
+    }
+    // Files the command reads but is not given (`files`, a build tool's):
+    // checked now.
+    for (p, pin) in &pins {
+        if !copied.contains(p) && states.get(p).is_none_or(|s| path_state(root, p, *pin) != *s) {
+            return Err(changed(p));
+        }
+    }
+    Ok((program.expect("a command has a program"), argv))
+}
+
 /// Run one hook; `Err` if it failed (a non-zero exit, a signal, the
 /// timeout, or it could not start).
 fn run_one(root: &Path, hook: Hook, r: &Runnable, inv: &Invocation, limit: Duration) -> Result<()> {
@@ -1012,51 +1465,14 @@ fn run_one(root: &Path, hook: Hook, r: &Runnable, inv: &Invocation, limit: Durat
         match r {
             Runnable::Local(p) => execute(p, &inv.args, root, hook, inv, limit),
             Runnable::Suggested(c, states) => {
-                let path = clean_path(root);
-                let mut argv: Vec<OsString> = Vec::new();
-                let mut program = None;
-                for a in classify(&c.run) {
-                    let v: OsString = match a {
-                        Arg::Program(name) => resolve_program(root, &name, &path)?.into_os_string(),
-                        Arg::Repo(p) => match states.get(&p) {
-                            Some(PathState::File(d)) => trusted_copy(root, &p, d, &mut copies)?.into_os_string(),
-                            // The program itself is always a trusted copy.
-                            Some(s) if program.is_some() && path_state(root, &p) == *s => p.into(),
-                            _ => bail!("`{}` changed since you trusted it", safe(&p)),
-                        },
-                        Arg::Literal(s) => {
-                            if s.starts_with('/') && inside(root, Path::new(&s)) {
-                                bail!("`{}` is inside the project: name repository files by relative path", safe(&s));
-                            }
-                            s.into()
-                        }
-                    };
-                    if program.is_none() {
-                        program = Some(PathBuf::from(v));
-                    } else {
-                        argv.push(v);
-                    }
-                }
-                // Files the command reads but does not run: checked now.
-                for p in &c.files {
-                    if states.get(p).is_none_or(|s| path_state(root, p) != *s) {
-                        bail!("`{}` changed since you trusted it", safe(p));
-                    }
-                }
-                if let Some(files) = indirect(&c.run) {
-                    for p in files {
-                        if states.get(p).is_none_or(|s| path_state(root, p) != *s) {
-                            bail!("`{}` changed since you trusted it", safe(p));
-                        }
-                    }
-                }
+                let (program, mut argv) = suggested_argv(root, c, states, &mut copies, &|name| resolve_program(root, name, &clean_path(root)))?;
                 argv.extend(inv.args.iter().cloned());
-                execute(&program.unwrap(), &argv, root, hook, inv, limit)
+                execute(&program, &argv, root, hook, inv, limit)
             }
         }
     })();
     for c in copies {
-        let _ = std::fs::remove_file(c);
+        remove_copy(&c);
     }
     let fail = |why: String| anyhow!("the {} hook `{label}` {why}", hook.name());
     match result {
@@ -1354,8 +1770,11 @@ fn print_commands(root: &Path, hooks: &Veilhooks, trusted: &BTreeMap<String, Str
     for c in &hooks.commands {
         let ind = if indirect(&c.run).is_some() { format!("  {}", yellow("(runs a build tool: reads files it is not given)")) } else { String::new() };
         println!("  {:<14} {}{ind}", c.hook.name(), safe(&c.run.join(" ")));
-        for p in pinned_paths(c) {
-            let now = path_state(root, &p);
+        if let Some(why) = refusal(root, c) {
+            println!("      {}", red(&format!("cannot be trusted: {}", safe(&why))));
+        }
+        for (p, pin) in pinned_paths(root, c) {
+            let now = path_state(root, &p, pin);
             let mark = match trusted.get(&p) {
                 Some(w) if PathState::from_word(w) == now => green("trusted"),
                 Some(_) => red("changed since trusted"),
@@ -1403,6 +1822,45 @@ fn show(ctx: &mut Ctx) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// What `vl hooks trust` records for command `c`: the state of every
+/// path it pins. `Err` if trust must refuse it.
+fn trust_command(root: &Path, c: &Suggested) -> Result<TrustedCommand> {
+    if let Some(why) = refusal(root, c) {
+        bail!("the {} command `{}` cannot be trusted: {why}", c.hook.name(), safe(&c.run.join(" ")));
+    }
+    let args = classify(root, &c.run);
+    if let Arg::Repo { path, .. } = &args[0] {
+        if !matches!(path_state(root, path, Pin::Plain), PathState::File(_)) {
+            bail!("the {} command runs `{}`, which is not a regular file here", c.hook.name(), safe(path));
+        }
+    }
+    for a in &args {
+        if let Arg::Repo { whole: Some(w), .. } = a {
+            if path_state(root, w, Pin::Plain) != PathState::Absent {
+                bail!(
+                    "the {} command's argument `{}` is both a file of the project and an assignment: rename the file or the variable",
+                    c.hook.name(),
+                    safe(w)
+                );
+            }
+        }
+    }
+    let mut digests = BTreeMap::new();
+    for (p, pin) in pinned_paths(root, c) {
+        let s = path_state(root, &p, pin);
+        if s == PathState::Other {
+            bail!(
+                "`{}` (named by the {} command) is not a regular file, or a directory of at most {MAX_TREE_ENTRIES} entries and {} MiB without symbolic links",
+                safe(&p),
+                c.hook.name(),
+                MAX_PINNED >> 20
+            );
+        }
+        digests.insert(p, s.word());
+    }
+    Ok(TrustedCommand { hook: c.hook.name().into(), command: c.run.clone(), digests, indirect: indirect(&c.run).is_some() })
+}
+
 fn trust(ctx: &mut Ctx, yes: bool, i_understand_indirect: bool) -> Result<ExitCode> {
     if inside_hook() {
         bail!("a hook cannot trust hooks: run `vl hooks trust` yourself");
@@ -1412,24 +1870,11 @@ fn trust(ctx: &mut Ctx, yes: bool, i_understand_indirect: bool) -> Result<ExitCo
     let mut trusted = Vec::new();
     let mut indirect_cmds = Vec::new();
     for c in &hooks.commands {
-        if let Arg::Repo(p) = &classify(&c.run)[0] {
-            if !matches!(path_state(&root, p), PathState::File(_)) {
-                bail!("the {} command runs `{}`, which is not a regular file here", c.hook.name(), safe(p));
-            }
+        let t = trust_command(&root, c)?;
+        if t.indirect {
+            indirect_cmds.push((c, indirect(&c.run).unwrap_or_default()));
         }
-        let ind = indirect(&c.run);
-        if let Some(files) = &ind {
-            indirect_cmds.push((c, files.clone()));
-        }
-        let mut digests = BTreeMap::new();
-        for p in pinned_paths(c) {
-            let s = path_state(&root, &p);
-            if s == PathState::Other {
-                bail!("`{}` (named by the {} command) is not a regular file or directory", safe(&p), c.hook.name());
-            }
-            digests.insert(p, s.word());
-        }
-        trusted.push(TrustedCommand { hook: c.hook.name().into(), command: c.run.clone(), digests, indirect: ind.is_some() });
+        trusted.push(t);
     }
     if !indirect_cmds.is_empty() && !i_understand_indirect {
         let mut msg = String::from("these commands run a tool that reads repository files it is not given:");
@@ -1469,9 +1914,10 @@ fn trust(ctx: &mut Ctx, yes: bool, i_understand_indirect: bool) -> Result<ExitCo
     if again.digest != hooks.digest {
         bail!("{VEILHOOKS} changed while you were reviewing it; run `vl hooks trust` again");
     }
-    for t in &trusted {
+    for (t, c) in trusted.iter().zip(&hooks.commands) {
+        let pins = pinned_paths(&root, c);
         for (p, d) in &t.digests {
-            if path_state(&root, p).word() != *d {
+            if path_state(&root, p, pins.get(p).copied().unwrap_or(Pin::Plain)).word() != *d {
                 bail!("`{}` changed while you were reviewing it; run `vl hooks trust` again", safe(p));
             }
         }
@@ -1553,26 +1999,113 @@ mod tests {
         }
     }
 
+    fn repo(prefix: &str, path: &str) -> Arg {
+        Arg::Repo { prefix: prefix.into(), path: path.into(), whole: None, spelled: path.into() }
+    }
+
+    /// Only what pins and copies a path matters, not how it was written.
+    fn norm(a: Arg) -> Arg {
+        match a {
+            Arg::Repo { prefix, path, whole, .. } => Arg::Repo { prefix, spelled: path.clone(), path, whole },
+            a => a,
+        }
+    }
+
+    fn v(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
     #[test]
     fn classifies_arguments() {
-        let run: Vec<String> = ["sh", "scripts/lint.sh", "-x", "/abs", "lint", "../up"].map(String::from).to_vec();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir(&root).unwrap();
+        let run = v(&["sh", "scripts/lint.sh", "-x", "/abs", "lint", "../up"]);
         assert_eq!(
-            classify(&run),
+            classify(&root, &run),
             vec![
                 Arg::Program("sh".into()),
-                Arg::Repo("scripts/lint.sh".into()),
+                repo("", "scripts/lint.sh"),
                 Arg::Literal("-x".into()),
                 Arg::Literal("/abs".into()),
-                Arg::Repo("lint".into()),
+                repo("", "lint"),
                 Arg::Literal("../up".into()),
             ]
         );
-        assert_eq!(classify(&["bin/check".to_string()])[0], Arg::Repo("bin/check".into()));
+        assert_eq!(classify(&root, &v(&["bin/check"]))[0], repo("", "bin/check"));
+        // BUG-701: every spelling of a repository path is that path.
+        for a in ["./s/lint.sh", "s//lint.sh", "s/./lint.sh", ".//s/lint.sh/"] {
+            assert_eq!(norm(classify(&root, &v(&["sh", a])).remove(1)), repo("", "s/lint.sh"), "{a}");
+        }
+        assert_eq!(norm(classify(&root, &v(&["sh", "--rcfile=./s/x"])).remove(1)), repo("--rcfile=", "s/x"));
+        assert_eq!(
+            norm(classify(&root, &v(&["env", "LD_PRELOAD=./lib/x.so", "true"])).remove(1)),
+            Arg::Repo { prefix: "LD_PRELOAD=".into(), path: "lib/x.so".into(), whole: Some("LD_PRELOAD=./lib/x.so".into()), spelled: "lib/x.so".into() }
+        );
+        assert_eq!(norm(classify(&root, &v(&["ruff", "."])).remove(1)), repo("", ""));
+        assert_eq!(norm(classify(&root, &v(&["ruff", "./"])).remove(1)), repo("", ""));
+        // A path that names nothing is given as written.
+        let states = BTreeMap::new();
+        let c = Suggested { hook: Hook::PreCommit, run: v(&["curl", "https://example.com//x", "--url=a//b", "./"]), files: Vec::new() };
+        assert!(suggested_argv(&root, &c, &states, &mut Vec::new(), &|n| Ok(PathBuf::from(n))).is_err(), "untrusted paths");
+        let t = trust_command(&root, &c).unwrap();
+        let states = t.digests.iter().map(|(p, d)| (p.clone(), PathState::from_word(d))).collect();
+        let (_, argv) = suggested_argv(&root, &c, &states, &mut Vec::new(), &|n| Ok(PathBuf::from(n))).unwrap();
+        assert_eq!(argv, vec![OsString::from("https://example.com//x"), "--url=a//b".into(), "./".into()]);
+        // In doubt, refused.
+        let abs = format!("{}/s/lint.sh", root.display());
+        for a in ["s/../s/lint.sh", "../proj/s/lint.sh", abs.as_str(), "/proc/self/cwd/s/lint.sh", "-Is/lib", ".veil/local/x", ".git/hooks/x", "PYTHONPATH=lib:tools"] {
+            assert!(matches!(classify(&root, &v(&["sh", a]))[1], Arg::Refused(_)), "{a}: {:?}", classify(&root, &v(&["sh", a])));
+        }
+    }
+
+    #[test]
+    fn launchers_and_code_strings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = |run: &[&str]| Suggested { hook: Hook::PreCommit, run: v(run), files: Vec::new() };
+        // BUG-702: a build tool behind a launcher is still a build tool.
+        for run in [
+            &["nice", "make", "-s"][..],
+            &["timeout", "60", "make"],
+            &["nohup", "make"],
+            &["env", "-i", "A=b", "sudo", "-u", "x", "make"],
+            &["vl", "run", "--", "npm", "test"],
+            &["stdbuf", "-oL", "cargo", "test"],
+        ] {
+            assert!(indirect(&v(run)).is_some(), "{run:?}");
+        }
+        // Code given as text is refused.
+        for run in [
+            &["sh", "-c", "make lint"][..],
+            &["bash", "-o", "pipefail", "-ec", "x"],
+            &["nice", "sh", "-c", "x"],
+            &["env", "bash", "-lc", "x"],
+            &["python3", "-c", "import x"],
+            &["python3", "-Ic", "import x"],
+            &["node", "-e", "x"],
+            &["node", "--eval=x"],
+            &["perl", "-lne", "x"],
+            &["ruby", "-e", "x"],
+            &["xargs", "make"],
+            &["env", "-S", "make lint"],
+            &["awk", "{print}", "f"],
+            &["su", "-c", "x"],
+        ] {
+            assert!(refusal(tmp.path(), &c(run)).is_some(), "{run:?}");
+        }
+        for run in [&["sh", "scripts/lint.sh"][..], &["python3", "-W", "error", "x.py"], &["perl", "-Ilib", "x.pl"], &["ruff", "check", "."], &["awk", "-f", "x.awk", "y"]] {
+            assert!(refusal(tmp.path(), &c(run)).is_none(), "{run:?}: {:?}", refusal(tmp.path(), &c(run)));
+        }
+        // An interpreter given the project directory would run its
+        // `__main__.py`; a directory it is given is pinned whole.
+        assert!(refusal(tmp.path(), &c(&["python3", "."])).is_some());
+        assert!(refusal(tmp.path(), &c(&["nice", "node", "./"])).is_some());
+        assert_eq!(pinned_paths(tmp.path(), &c(&["python3", "tools"])).get("tools"), Some(&Pin::Tree));
+        assert_eq!(pinned_paths(tmp.path(), &c(&["ruff", "src"])).get("src"), Some(&Pin::Plain));
     }
 
     #[test]
     fn build_tools_are_indirect() {
-        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         assert!(indirect(&v(&["make", "lint"])).unwrap().contains(&"Makefile"));
         assert!(indirect(&v(&["/usr/bin/make"])).is_some());
         assert!(indirect(&v(&["env", "-i", "A=b", "npm", "run", "lint"])).unwrap().contains(&"package.json"));
@@ -1580,9 +2113,9 @@ mod tests {
         assert!(indirect(&v(&["sh", "scripts/lint.sh"])).is_none());
         assert!(indirect(&v(&["python3", "scripts/x.py"])).is_none());
         let c = Suggested { hook: Hook::PreCommit, run: v(&["make", "lint"]), files: v(&["extra"]) };
-        let p = pinned_paths(&c);
+        let p = pinned_paths(Path::new("/nonexistent"), &c);
         for want in ["Makefile", "lint", "extra"] {
-            assert!(p.contains(want), "{p:?}");
+            assert!(p.contains_key(want), "{p:?}");
         }
     }
 
@@ -1639,9 +2172,182 @@ mod tests {
         }
     }
 
+    /// A project for the argv property: a script, a directory an
+    /// interpreter runs, a Makefile, `Cargo.toml`, `package.json`.
+    fn argv_project() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        for (p, c) in [
+            ("s/lint.sh", "echo lint\n"),
+            ("tools/__main__.py", "print(1)\n"),
+            ("tools/lib/helper.py", "X = 1\n"),
+            ("Makefile", "all:\n\ttrue\n"),
+            ("Cargo.toml", "[package]\n"),
+            ("package.json", "{}\n"),
+            ("pyproject.toml", "\n"),
+        ] {
+            std::fs::create_dir_all(root.join(p).parent().unwrap()).unwrap();
+            std::fs::write(root.join(p), c).unwrap();
+        }
+        std::fs::create_dir(root.join(VEIL_DIR)).unwrap();
+        (tmp, root)
+    }
+
+    /// How the argv property's generated arguments name repository files.
+    const SPELLINGS: &[(&str, Option<&str>)] = &[
+        ("s/lint.sh", Some("s/lint.sh")),
+        ("./s/lint.sh", Some("s/lint.sh")),
+        ("s//lint.sh", Some("s/lint.sh")),
+        ("s/./lint.sh", Some("s/lint.sh")),
+        ("s/lint.sh/", Some("s/lint.sh")),
+        ("x/../s/lint.sh", Some("s/lint.sh")),
+        ("../proj/s/lint.sh", Some("s/lint.sh")),
+        ("--rcfile=./s/lint.sh", Some("s/lint.sh")),
+        ("--rcfile=s/lint.sh", Some("s/lint.sh")),
+        ("VAR=./s/lint.sh", Some("s/lint.sh")),
+        ("LD_PRELOAD=s//lint.sh", Some("s/lint.sh")),
+        ("-Is/lint.sh", Some("s/lint.sh")),
+        ("PYTHONPATH=x:./s", Some("s")),
+        ("/proc/self/cwd/s/lint.sh", Some("s/lint.sh")),
+        ("ABS/s/lint.sh", Some("s/lint.sh")),
+        ("Makefile", Some("Makefile")),
+        ("./Makefile", Some("Makefile")),
+        ("--file=Makefile", Some("Makefile")),
+        ("tools", Some("tools")),
+        ("./tools/", Some("tools")),
+        ("tools/__main__.py", Some("tools/__main__.py")),
+        (".", None),
+        ("./", None),
+        ("lint", None),
+        ("-x", None),
+        ("--check", None),
+        ("make lint", None),
+        ("import x", None),
+    ];
+
+    const PREFIXES: &[&[&str]] = &[
+        &[],
+        &["nice"],
+        &["nice", "-n", "5"],
+        &["timeout", "60"],
+        &["env", "A=b"],
+        &["env", "-i"],
+        &["nohup"],
+        &["sudo", "-u", "x"],
+        &["xargs"],
+        &["vl", "run", "--"],
+        &["stdbuf", "-oL"],
+        &["flock", "/tmp/l"],
+    ];
+
+    const PROGRAMS: &[&str] = &["sh", "bash", "python3", "node", "perl", "make", "cargo", "npm", "ruff", "true", "s/lint.sh", "/usr/bin/env"];
+    const FLAGS: &[&str] = &["-c", "-e", "-x", "-m", "-Ic", "-ec", "-s"];
+
+    fn is_interpreter(a: &str) -> bool {
+        runs_directories(base_name(a))
+    }
+
+    /// Does `flag` right after `program` make it run code given as text?
+    fn code_flag(program: &str, flag: &str) -> bool {
+        let b = base_name(program);
+        match b {
+            "sh" | "bash" => flag.starts_with('-') && !flag.starts_with("--") && flag.contains('c'),
+            "python3" => matches!(flag, "-c" | "-Ic"),
+            "node" | "perl" => matches!(flag, "-e" | "-ec"),
+            _ => false,
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(512))]
+
+        /// BUG-700/701/702: over generated argv shapes (launchers, programs,
+        /// options, every spelling of a repository path), any repository
+        /// file a trusted hook could execute or read as code is pinned, or
+        /// trust refuses the command; and the argv a trusted command runs
+        /// with never names a live repository file (only private copies of
+        /// the trusted bytes), nor a directory an interpreter would run.
+        #[test]
+        fn every_repository_file_a_hook_runs_is_pinned_or_refused(
+            prefix in 0..PREFIXES.len(),
+            program in 0..PROGRAMS.len(),
+            flag in proptest::option::of(0..FLAGS.len()),
+            args in proptest::collection::vec(0..SPELLINGS.len(), 0..4),
+        ) {
+            let (_tmp, root) = argv_project();
+            let canon_root = root.canonicalize().unwrap();
+            let mut run: Vec<String> = PREFIXES[prefix].iter().map(|s| s.to_string()).collect();
+            let prog = PROGRAMS[program];
+            let launched = !run.is_empty();
+            run.push(prog.to_string());
+            if let Some(f) = flag {
+                run.push(FLAGS[f].to_string());
+            }
+            for &a in &args {
+                run.push(SPELLINGS[a].0.replace("ABS", &root.display().to_string()));
+            }
+            let c = Suggested { hook: Hook::PreCommit, run: run.clone(), files: Vec::new() };
+            let interp = run.iter().any(|a| is_interpreter(a));
+            let must_refuse = flag.is_some_and(|f| code_flag(prog, FLAGS[f]))
+                || PREFIXES[prefix].contains(&"xargs")
+                || (interp && args.iter().any(|&a| SPELLINGS[a].1.is_none() && SPELLINGS[a].0.starts_with('.')));
+            let Ok(t) = trust_command(&root, &c) else { return Ok(()) };
+            proptest::prop_assert!(!must_refuse, "trusted {run:?}");
+            // Every repository file named, in any spelling, is pinned.
+            let mut want: Vec<(&str, bool)> = args.iter().filter_map(|&a| SPELLINGS[a].1).map(|p| (p, interp)).collect();
+            if prog.contains('/') && !prog.starts_with('/') && !launched {
+                want.push((prog, false));
+            }
+            for (p, tree) in &want {
+                let d = t.digests.get(*p);
+                proptest::prop_assert!(d.is_some(), "{run:?}: `{p}` not pinned: {:?}", t.digests);
+                let s = PathState::from_word(d.unwrap());
+                if *tree || root.join(p).is_file() {
+                    proptest::prop_assert!(matches!(s, PathState::File(_) | PathState::Tree(_)), "{run:?}: `{p}` pinned as {s:?}");
+                }
+            }
+            // A build tool behind any launcher pins its files.
+            for (tool, file) in [("make", "Makefile"), ("cargo", "Cargo.toml"), ("npm", "package.json")] {
+                if prog == tool || (launched && run.iter().any(|a| a == tool)) {
+                    proptest::prop_assert!(t.indirect && t.digests.contains_key(file), "{run:?}: {file} not pinned");
+                }
+            }
+            if base_name(prog).starts_with("python") && flag.is_some_and(|f| FLAGS[f] == "-m") {
+                proptest::prop_assert!(t.indirect && t.digests.contains_key("pyproject.toml"), "{run:?}");
+            }
+            // What would run: copies only.
+            let states: BTreeMap<String, PathState> = t.digests.iter().map(|(p, d)| (p.clone(), PathState::from_word(d))).collect();
+            let mut copies = Vec::new();
+            let built = suggested_argv(&root, &c, &states, &mut copies, &|n| Ok(PathBuf::from("/usr/bin").join(base_name(n))));
+            let (program_path, argv) = built.map_err(|e| proptest::test_runner::TestCaseError::fail(format!("{run:?}: {e:#}")))?;
+            let run_dir = canon_root.join(VEIL_DIR);
+            for o in std::iter::once(program_path.into_os_string()).chain(argv) {
+                let o = o.into_string().unwrap();
+                let mut cands = vec![o.clone()];
+                if let Some((_, v)) = o.split_once('=') {
+                    cands.push(v.to_string());
+                }
+                for cand in cands {
+                    let full = if cand.starts_with('/') { PathBuf::from(&cand) } else { root.join(&cand) };
+                    let Ok(real) = full.canonicalize() else { continue };
+                    if !real.starts_with(&canon_root) || real.starts_with(&run_dir) {
+                        continue;
+                    }
+                    proptest::prop_assert!(
+                        !real.is_file() && !(interp && real != canon_root),
+                        "{run:?} runs with the live `{}`", real.display()
+                    );
+                }
+            }
+            for c in copies {
+                remove_copy(&c);
+            }
+        }
+    }
+
     #[test]
     fn path_states_round_trip() {
-        for s in [PathState::File("ab".repeat(32)), PathState::Absent, PathState::Dir] {
+        for s in [PathState::File("ab".repeat(32)), PathState::Absent, PathState::Dir, PathState::Tree("cd".repeat(32))] {
             assert_eq!(PathState::from_word(&s.word()), s);
         }
         assert_eq!(PathState::from_word("zz"), PathState::Other);
