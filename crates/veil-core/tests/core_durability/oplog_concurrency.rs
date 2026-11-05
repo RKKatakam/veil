@@ -59,7 +59,7 @@ pub(crate) fn land(disk: &MemoryBackend, side: &MemoryBackend, heads_at_fork: &B
 /// Two "processes" on forks of `disk`: run `a` and `b` on their own forks
 /// (each opens the repository as it is now), then land both. Returns what
 /// each returned.
-fn concurrently<A, B>(disk: &Arc<MemoryBackend>, id: &Identity, a: impl FnOnce(&mut Repo) -> A, b: impl FnOnce(&mut Repo) -> B) -> (A, B) {
+pub(crate) fn concurrently<A, B>(disk: &Arc<MemoryBackend>, id: &Identity, a: impl FnOnce(&mut Repo) -> A, b: impl FnOnce(&mut Repo) -> B) -> (A, B) {
     let heads = head_files(&**disk);
     let (fa, fb) = (Arc::new(disk.fork()), Arc::new(disk.fork()));
     let ra = a(&mut Repo::open(fa.clone(), Some(id.clone()), &id.name).unwrap());
@@ -69,7 +69,7 @@ fn concurrently<A, B>(disk: &Arc<MemoryBackend>, id: &Identity, a: impl FnOnce(&
     (ra, rb)
 }
 
-fn assert_fsck_clean(fs: Arc<dyn StorageBackend>, id: &Identity, what: &str) {
+pub(crate) fn assert_fsck_clean(fs: Arc<dyn StorageBackend>, id: &Identity, what: &str) {
     let r = fsck(fs, Some(id.clone())).unwrap();
     let bad: Vec<String> = r
         .findings
@@ -80,7 +80,7 @@ fn assert_fsck_clean(fs: Arc<dyn StorageBackend>, id: &Identity, what: &str) {
     assert!(bad.is_empty(), "{what}: {bad:#?}");
 }
 
-fn open(fs: &Arc<MemoryBackend>, id: &Identity) -> Repo {
+pub(crate) fn open(fs: &Arc<MemoryBackend>, id: &Identity) -> Repo {
     Repo::open(fs.clone(), Some(id.clone()), &id.name).unwrap()
 }
 
