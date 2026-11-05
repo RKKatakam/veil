@@ -23,14 +23,32 @@ Also:
 - **PRs** are visible only to people who can see every file they touch. Hidden PRs don't exist for anyone else.
 - **Agents** see what their person sees, using the same secrets. Nobody makes new API keys for agents.
 
-## How it scales
+## How it scales: the Scion design
 
-- **YugabyteDB** for the server's metadata: open source, with Spanner-style scaling. Plain **PostgreSQL** for development and CI.
-- **S3-style object storage** for file contents, served through caches.
-- **Commits never wait on a lock.** Moving `main` is one tiny atomic step on the server.
-- **Clients fetch only what they need** from the server, instead of cloning everything.
-- **The server does the heavy work:** merges, history, blame and search.
-- **Landings are batched,** so huge numbers of agents don't contend on one branch.
+The Hub follows **the design of Anthropic's Scion**, which handles tens of thousands of merges a day, mostly from agents. It is built for **thousands of agents at once pulling, opening PRs and merging**.
+
+- **Changes are written without locks.** Uploading a change is just storing its files. **Moving `main` is one tiny atomic step**: a compare-and-swap on one database row.
+- **The server does the work:** merges, rebases, history, blame and search all run on the server. Agents ask through the API, often without a checkout.
+- **Precomputed history:** blame, file history and the commit graph are computed once per change as it lands, so queries are instant.
+- **Fetch on demand:** a client asks only for the folders and files it needs, starting from the top folder. An agent working in `src/api/` never downloads the rest.
+- **Layered caches:** the client, then a cache daemon on each machine, then regional caches, then the server. Files are addressed by their hash, so any cache can serve them with no coordination; Scion serves over 99% of reads from caches. Caches only ever hold what the asker is allowed to see.
+- **No locked merge queue:** ready changes that don't overlap are **merged in batches** (500 ready PRs become one move of `main`). Conflicts go back to an agent to fix. Tests run after merging and before deploy.
+- **Few branches:** work lives as changes and PRs, not thousands of long-lived branches.
+- **No maintenance:** each file is stored once in S3-style object storage; there is no repacking.
+- **Horizontal scaling:** stateless API servers, **YugabyteDB** for metadata (Spanner-style; PostgreSQL for development and CI), and object storage. Capacity grows by adding machines.
+- **Permissions on every request,** cached per person and folder, so access control never becomes the bottleneck.
+
+### Design targets (the server's benchmark must prove them)
+
+| What | Target |
+|---|---|
+| Agents working at once | **Thousands** (benchmark at 1,000 and 10,000) |
+| Pull of a small change | **Under 100 ms** of server time; mostly served from cache |
+| Opening or updating a PR | **Under 100 ms** |
+| Merges | **Thousands per hour per project**, with no agent waiting on a global lock. Landing batches change by change. |
+| A fresh agent workspace on a large project | **Seconds**, fetching on demand |
+| History, blame or search through the API | **Milliseconds to low hundreds of ms**, with no checkout |
+| Permission checks | A negligible share of request time |
 
 ## What exists today, and what's next
 
