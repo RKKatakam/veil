@@ -200,3 +200,36 @@ fn a_dead_connection_fails_cleanly() {
     assert!(b.read(&p("x")).is_err());
     assert!(b.is_disconnected());
 }
+
+/// BUG-800: `create_stream` writes a file in pieces (more than a window of
+/// `WRITE`s in flight), patches bytes already written, and publishes it
+/// only at `finish`, replacing a file of that name; a stream dropped
+/// before `finish` leaves nothing.
+#[test]
+fn streams_are_published_whole_and_only_on_finish() {
+    let server = need_server!();
+    let dir = tempfile::tempdir().unwrap();
+    let b = connect(&server, dir.path());
+    let want: Vec<u8> = (0..3u32 << 20).map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8).collect();
+    for durable in [true, false] {
+        b.write(&p("s/out.bin"), b"an older file").unwrap();
+        let mut w = b.create_stream(&p("s"), durable).unwrap();
+        for piece in want.chunks(100_000) {
+            w.write_all(piece).unwrap();
+        }
+        w.write_at(8, b"PATCHED!").unwrap();
+        assert!(w.write_at(want.len() as u64 - 2, b"past the end").is_err());
+        assert_eq!(std::fs::read(dir.path().join("s/out.bin")).unwrap(), b"an older file", "not visible before finish");
+        w.finish("out.bin").unwrap();
+        let mut patched = want.clone();
+        patched[8..16].copy_from_slice(b"PATCHED!");
+        assert!(b.read(&p("s/out.bin")).unwrap() == patched, "durable {durable}: the content is complete");
+        let names: Vec<String> = b.list_dir(&p("s")).unwrap().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, ["out.bin"]);
+    }
+    let mut w = b.create_stream(&p("s"), true).unwrap();
+    w.write_all(&want).unwrap();
+    drop(w);
+    let names: Vec<String> = b.list_dir(&p("s")).unwrap().into_iter().map(|e| e.name).collect();
+    assert_eq!(names, ["out.bin"], "a dropped stream leaves nothing");
+}

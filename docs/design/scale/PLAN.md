@@ -197,6 +197,16 @@ Process rules: never run `cargo fmt`; scratch work goes in `.scratch/`; builds u
 
 **X: conditional, streaming large-file builder** (backlog). Taken only if B's `5g` numbers show the builder over the 512 MiB gate. It would own `builder.rs`'s read, hash and seal path.
 
+### Follow-ups from the BUG-800 fix (G1 streaming, merged 2026-11-05)
+
+These were found in the BUG-800 review. They belong to the streams named; none of them blocks today's code.
+
+- **Stream O (lock-free op log):** pull spools remote packs to the fixed directory `.veil/objects/incoming/pull` and clears it when it starts. That is safe only while a pull holds the repository lock for its whole transaction, as it does today. Without the lock, two pulls would delete each other's spool. **O must give each pull its own spool directory** (`incoming/pull-<transaction id>`), and its cleanup must remove only spools whose transaction is dead.
+- **G2 (maintenance):** a crash mid-stream leaves a `*.stream.vltmp*` temp file, as an interrupted write did before. Maintenance should remove stale temp files and stale spools.
+- **G2:** loose objects on a remote are still downloaded into memory. The benchmark's remotes are fully packed, so it didn't show up.
+- **G2:** `gc`'s second run peaks at 467 MiB at 1 GB, mostly in marking. The reachability bitmap replaces this before 5 GB.
+- **G2:** `PREFETCH_LIMIT` (2 GiB, now a disk bound) makes packs beyond it fetch one object at a time on a 5 GB store.
+
 ## 3. Order and dependencies
 
 ```text

@@ -262,6 +262,62 @@ pub(super) fn temp_name(path: &VPath) -> String {
     format!(".{}.vltmp{}", &name[..cut], hex::encode(crate::crypto::random_bytes::<4>()))
 }
 
+/// [`DiskBackend::create_stream`]'s writer.
+struct DiskStream {
+    file: fs::File,
+    tmp: PathBuf,
+    dir: PathBuf,
+    len: u64,
+    durable: bool,
+    done: bool,
+}
+
+impl super::StreamWriter for DiskStream {
+    fn write_all(&mut self, data: &[u8]) -> Result<()> {
+        self.file.write_all(data).map_err(|e| io_err(&self.tmp, e))?;
+        self.len += data.len() as u64;
+        Ok(())
+    }
+
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<()> {
+        use std::io::{Seek, SeekFrom};
+        if offset.checked_add(data.len() as u64).is_none_or(|end| end > self.len) {
+            return Err(VeilError::repo("stream: write past the end"));
+        }
+        (|| {
+            self.file.seek(SeekFrom::Start(offset))?;
+            self.file.write_all(data)?;
+            self.file.seek(SeekFrom::End(0)).map(drop)
+        })()
+        .map_err(|e| io_err(&self.tmp, e))
+    }
+
+    fn finish(mut self: Box<Self>, name: &str) -> Result<()> {
+        let to = self.dir.join(name);
+        let res = (|| {
+            if self.durable {
+                full_sync(&self.file)?;
+            }
+            fs::rename(&self.tmp, &to)?;
+            if self.durable {
+                sync_dir(&self.dir)?;
+            }
+            Ok(())
+        })();
+        // Renamed (or about to be removed by `drop`).
+        self.done = res.is_ok();
+        res.map_err(|e| io_err(&to, e))
+    }
+}
+
+impl Drop for DiskStream {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = fs::remove_file(&self.tmp);
+        }
+    }
+}
+
 /// Create `path` with `data`, flushed to stable storage.
 fn write_synced(path: &Path, data: &[u8]) -> io::Result<()> {
     let mut f = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
@@ -832,6 +888,56 @@ impl StorageBackend for DiskBackend {
             return Err(io_err(&self.root, e));
         }
         Ok(())
+    }
+
+    /// Below `.veil/`: a temp file created with `O_EXCL`, written in place,
+    /// then (when `durable`) fsynced, renamed, and the directory fsynced.
+    /// Elsewhere (never needed there) the default, in memory.
+    fn create_stream<'a>(&'a self, dir: &VPath, durable: bool) -> Result<Box<dyn super::StreamWriter + 'a>> {
+        if dir.is_root() || !Self::own_path(dir) {
+            return Ok(Box::new(super::Buffered {
+                backend: self,
+                dir: dir.clone(),
+                durable,
+                buf: Vec::new(),
+            }));
+        }
+        let full = self.full_path(dir);
+        match durable {
+            true => create_dir_all_durable(&full),
+            false => fs::create_dir_all(&full),
+        }
+        .map_err(|e| io_err(&full, e))?;
+        let tmp = full.join(super::stream_temp_name());
+        let file = fs::OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(|e| io_err(&tmp, e))?;
+        Ok(Box::new(DiskStream {
+            file,
+            tmp,
+            dir: full,
+            len: 0,
+            durable,
+            done: false,
+        }))
+    }
+
+    #[cfg(unix)]
+    fn available_space(&self, dir: &VPath) -> Option<u64> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut p = self.full_path(dir);
+        while !p.exists() {
+            if !p.pop() {
+                return None;
+            }
+        }
+        let c = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
+        // SAFETY: `statvfs` fills the zeroed struct we own, from a valid C string.
+        let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
+            return None;
+        }
+        // The field types differ between Linux and macOS.
+        #[allow(clippy::useless_conversion)]
+        Some(u64::from(s.f_bavail).saturating_mul(u64::from(s.f_frsize)))
     }
 
     /// Exclusive create that never exposes a partially written file: the

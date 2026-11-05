@@ -10,6 +10,25 @@ These are the first numbers from the scale benchmark (`9-scale-benchmark.md`), m
 - **Run:** `scripts/bench-scale.sh 1g -- --rtt 0,2`, 2026-11-05. It took 21.5 minutes end to end, including 4 minutes of generation, then deleted everything it generated.
 - **Raw results** (not committed): `.scratch/bench-results/1g-seed1-*.json` and `.md`.
 
+## Memory after streaming pack writes (BUG-800, G1)
+
+`scripts/bench-scale.sh 1g`, 2026-11-05, on the BUG-800 branch (streaming `PackWriter`, prefetch spooled to disk; see `4-background-cleanup-streaming.md`, G1). Same machine. The run took 13 minutes, every phase included. Raw results (not committed): `.scratch/bench-results/1g-seed1-20261105T052050Z.md`.
+
+"Before" is the base `integration` @ b4ec8db (the read-side wave: `SLURP_BUDGET`, 128 MiB gc packs), measured the same day with `/usr/bin/time` on the same generated repository and a path remote. Pull of one snapshot was not measured on the base.
+
+| case | baseline (b549e1e) | before (b4ec8db) | after, path | after, SFTP | gate (512 MiB) |
+|---|---:|---:|---:|---:|---|
+| clone, full | 1,975 MiB | 1,230 MiB | **367 MiB** | **424 MiB** | passes |
+| pull, 1 new snapshot | 950 MiB | – | **171 MiB** | **172 MiB** | passes |
+| pull, nothing new | 559 MiB | 151 MiB | **139 MiB** | **139 MiB** | passes |
+| gc, first (packs 3.38 GB loose) | 867 MiB | 366 MiB | **297 MiB** | | passes |
+| gc, again (nothing new) | 998 MiB | 540 MiB | **467 MiB** | | passes |
+| push, initial (all tags) | 310 MiB | 283 MiB | **220 MiB** | **341 MiB** | passes |
+
+Times are unchanged (clone 59 s, gc 17 s, initial push 12.9 s).
+
+What still grows with the store: the per-object tables (gc's inventory, reachability set and path hints; a sync's `seen` set and the remote's inventory), a few tens of bytes per object, and the bounded caches (delta bases 64 MiB, packs held whole 64 MiB, a sync's last versions 64 MiB). Most of `gc, again` is its mark phase: the caches fill, and the tables are built (instrumented run: +207 MiB during marking, +92 MiB while packing). At 5 GB, gc's tables are the first thing to watch (the prune bitmap of item 4 replaces them).
+
 ## The harness
 
 - **The crate:** `crates/veil-bench` is a workspace member, but not one of the `default-members`, so `cargo test --all-targets` never builds it. It is driven by `scripts/bench-scale.sh [tiny|small|1g|5g] [--cloaked] [-- flags]`.

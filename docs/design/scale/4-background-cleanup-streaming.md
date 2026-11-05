@@ -25,6 +25,12 @@ Status: design and threat review (Scion 2.2; the backlog's "streaming / incremen
   - **The trailer hash** covers the patched header. When `count` was given up front (gc knows it after marking) the hash is computed while streaming. Otherwise `finish` re-reads the file once to hash it: the file is a local spool or a staged file, read sequentially.
 - **`PackBuilder` stays** for small packs and for WASM. `PackSink` (pull and push) and gc move to `PackWriter`.
 
+**Implemented (BUG-800), with these differences from the sketch:**
+- `create_stream(dir, durable)` names the file at `finish(name)`: a pack's name is its checksum, known last.
+- The trailer hash is always computed while streaming, so nothing is read back (no second read over SFTP). The first BLAKE3 chunk (1 KiB, holding the count) is kept; the rest is hashed into the subtrees `[C, 2C)`, `[2C, 4C)`, … that BLAKE3's tree has at any final length (`blake3::hazmat`), merged at `finish`.
+- Prefetch spools to `.veil/objects/incoming/pull` (item 2's staging does not exist yet), in 4 MiB pieces, removed when the pull ends. `PREFETCH_LIMIT` keeps its 2 GiB, now of disk; the pull fails first, naming the space needed, when `statvfs` shows less free. The download is checked as before (`Pack::open`, then every object re-hashed); `local_ids` and whole-pack adoption are unchanged.
+- `PackSink` keeps the last version per path in a 64 MiB LRU (it was every path's, for the whole pack). Each pack is a durable stream of its own (fsync, rename, directory fsync), then the store's barrier, then the `.idx`.
+
 ### Incremental maintenance (`crates/veil-core/src/maintenance.rs`, `gc.rs`)
 
 Three tasks. The first two never need reachability.

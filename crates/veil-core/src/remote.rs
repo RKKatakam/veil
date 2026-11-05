@@ -87,11 +87,11 @@ use crate::{
     keychain::{Keychain, RingMerge, LOCAL_SCOPE},
     object::{EntryKind, Object},
     oplog::Tag,
-    pack::{index_file, name_from_index_file, pack_file, Pack, PackBuilder, PackIndex, DEFAULT_LEVEL},
+    pack::{index_file, name_from_index_file, pack_file, Pack, PackIndex, PackWriter, DEFAULT_LEVEL},
     repo::{is_repo, Repo},
     store::ObjectStore,
     tree::MAX_TREE_DEPTH,
-    vfs::{MemoryBackend, NodeKind, StorageBackend},
+    vfs::{NodeKind, StorageBackend},
     vpath::VPath,
 };
 
@@ -272,6 +272,10 @@ static DISCARD: Discard = Discard;
 /// before the next one is started.
 const PACK_LIMIT: u64 = 128 << 20;
 
+/// What the last versions kept as delta bases may hold together (BUG-800:
+/// one per path, for the whole pack, used to be kept).
+const LAST_VERSIONS: usize = 64 << 20;
+
 /// Collects objects into packs on `backend`. Below `threshold` objects
 /// (and with a `loose` store) they are written as loose objects instead,
 /// so a small pull does not leave a tiny pack behind.
@@ -284,11 +288,13 @@ struct PackSink<'a> {
     loose: Option<&'a ObjectStore>,
     threshold: usize,
     pending: Vec<(ObjectId, Vec<u8>, String)>,
-    builder: Option<PackBuilder>,
+    /// The pack being streamed (BUG-800: it used to be built in memory).
+    builder: Option<PackWriter<'a>>,
     builder_bytes: u64,
-    /// The last object packed at each path: the delta base for the next
-    /// version found there.
-    last: HashMap<String, (ObjectId, Vec<u8>)>,
+    /// The last object packed at each path (by the path's hash), the
+    /// delta base for the next version found there; least recently used
+    /// out past [`LAST_VERSIONS`].
+    last: LruCache<(ObjectId, Arc<Vec<u8>>)>,
     packs: usize,
     bytes: u64,
 }
@@ -304,7 +310,7 @@ impl<'a> PackSink<'a> {
             pending: Vec::new(),
             builder: None,
             builder_bytes: 0,
-            last: HashMap::new(),
+            last: LruCache::new(LAST_VERSIONS),
             packs: 0,
             bytes: 0,
         }
@@ -327,15 +333,17 @@ impl<'a> PackSink<'a> {
     fn pack(&mut self, id: ObjectId, raw: Vec<u8>, path: String) -> Result<()> {
         let builder = match &mut self.builder {
             Some(b) => b,
-            None => self.builder.insert(PackBuilder::new(DEFAULT_LEVEL)?),
+            None => self.builder.insert(PackWriter::new(self.backend.create_stream(&self.dir, true)?, DEFAULT_LEVEL)?),
         };
+        let key = ObjectId::hash(path.as_bytes());
         let base = self
             .last
-            .get(&path)
+            .get(&key)
             .filter(|(bid, braw)| builder.contains(bid) && Object::is_blob_raw(braw) == Object::is_blob_raw(&raw));
-        builder.add(id, &raw, base.map(|(bid, braw)| (bid, &braw[..])))?;
+        builder.add(id, &raw, base.as_ref().map(|(bid, braw)| (bid, &braw[..])))?;
         self.builder_bytes += raw.len() as u64;
-        self.last.insert(path, (id, raw));
+        let weight = raw.len();
+        self.last.insert(key, (id, Arc::new(raw)), weight);
         if self.builder_bytes >= PACK_LIMIT {
             self.flush()?;
         }
@@ -344,9 +352,9 @@ impl<'a> PackSink<'a> {
 
     fn flush(&mut self) -> Result<()> {
         if let Some(b) = self.builder.take() {
-            // `finish` writes the pack, then its index: the pack unsynced,
-            // then a barrier, then the index durably. A crash before the
-            // index leaves a pack nobody finds; the index is never torn.
+            // `finish` publishes the pack (durably), then its index, after
+            // a barrier, durably. A crash before the index leaves a pack
+            // nobody finds; the index is never torn.
             if let Some((_, stats)) = b.finish(&PackWrites(self.backend, self.dest), &self.dir)? {
                 self.packs += 1;
                 self.bytes += stats.pack_bytes;
@@ -377,9 +385,10 @@ impl<'a> PackSink<'a> {
     }
 }
 
-/// The backend as `PackBuilder::finish` sees it: data files are written
-/// unsynced, and an index only after a barrier, durably. The barrier is the
-/// destination store's, which voids its own unsynced objects if it fails.
+/// The backend as `PackWriter::finish` sees it: an index is written only
+/// after a barrier, durably. The barrier is the destination store's, which
+/// voids its own unsynced objects if it fails. (The pack itself is a
+/// durable stream of the backend.)
 #[derive(Debug)]
 struct PackWrites<'a>(&'a dyn StorageBackend, &'a ObjectStore);
 
@@ -700,18 +709,49 @@ impl Inventory {
     }
 }
 
-/// Most pack data one pull downloads into memory in bulk (BUG-490): packs
-/// past it are read one object at a time instead (ranged reads), so a
-/// remote listing many or huge packs cannot make a pull hold them all.
-/// Each pack is read to the size its index implies, never further.
+/// Most pack data one pull downloads in bulk (BUG-490), into a spool on
+/// local disk ([`Spool`]; BUG-800: it used to be memory): packs past it
+/// are read one object at a time instead (ranged reads), so a remote
+/// listing many or huge packs cannot make a pull store them all. Each pack
+/// is read to the size its index implies, never further, and the pull
+/// fails up front if the disk lacks the room.
 const PREFETCH_LIMIT: u64 = 2 << 30;
+
+/// How much of a remote pack one download holds at a time.
+const PREFETCH_PIECE: u64 = 4 << 20;
 
 /// Remote objects downloaded in bulk.
 #[derive(Default)]
 struct Prefetched {
     loaded: bool,
-    packs: HashMap<usize, (MemoryBackend, Pack)>,
+    /// Opened from the spool, on the local backend.
+    packs: HashMap<usize, Pack>,
     loose: HashMap<ObjectId, Vec<u8>>,
+}
+
+/// Where a pull downloads the remote's packs: `objects/incoming/pull` of
+/// the local store, emptied before the download and when the pull ends
+/// (the pull holds the repository lock, so nothing else uses it). Never
+/// scanned for objects: everything in it reaches the store only through
+/// [`Transfer`]'s checks.
+struct Spool {
+    backend: Arc<dyn StorageBackend>,
+    dir: VPath,
+}
+
+impl Spool {
+    fn new(store: &ObjectStore) -> Spool {
+        Spool {
+            backend: store.backend().clone(),
+            dir: store.root().join("incoming").join("pull"),
+        }
+    }
+}
+
+impl Drop for Spool {
+    fn drop(&mut self) {
+        let _ = self.backend.remove_dir_all(&self.dir);
+    }
 }
 
 /// Pull's view of the objects: local copies first, then the bulk download
@@ -722,6 +762,7 @@ struct PullSource<'a> {
     remote: &'a ObjectStore,
     inv: &'a Inventory,
     got: RefCell<Prefetched>,
+    spool: Spool,
     bases: LruCache<Arc<Vec<u8>>>,
     bytes: RefCell<u64>,
 }
@@ -749,21 +790,42 @@ impl PullSource<'_> {
                 fits
             })
             .collect();
-        let data = par_map(&packs, threads, |&i| {
-            let len = usize::try_from(inv.packs[i].2.pack_len()).map_err(|_| VeilError::Corrupt("pack".into(), "too large".into()))?;
-            inv.backend.read_range(&pack_file(&inv.pack_dir, &inv.packs[i].0), 0, len)
+        let (local, dir) = (&*self.spool.backend, &self.spool.dir);
+        local.remove_dir_all(dir)?; // an interrupted pull's
+        let need: u64 = packs.iter().map(|&i| inv.packs[i].2.pack_len()).sum();
+        if let Some(free) = local.available_space(self.local.root()).filter(|free| need > *free) {
+            return Err(VeilError::repo(format!(
+                "not enough disk space to pull: the remote's packs need {} MiB under {}, and {} MiB are free",
+                need.div_ceil(1 << 20),
+                self.local.root(),
+                free >> 20
+            )));
+        }
+        // Each pack is streamed to the spool in pieces, its index after it.
+        let spooled = par_map(&packs, threads, |&i| -> Result<()> {
+            let (name, idx, index) = &inv.packs[i];
+            let (len, from) = (index.pack_len(), pack_file(&inv.pack_dir, name));
+            let mut out = local.create_stream(dir, false)?;
+            let mut at = 0;
+            while at < len {
+                let n = (len - at).min(PREFETCH_PIECE);
+                out.write_all(&inv.backend.read_range(&from, at, n as usize)?)?;
+                at += n;
+            }
+            out.finish(pack_file(dir, name).file_name())?;
+            let mut out = local.create_stream(dir, false)?;
+            out.write_all(idx)?;
+            out.finish(index_file(dir, name).file_name())
         });
-        let dir = VPath::new("p")?;
         let mut bytes = 0u64;
-        for (i, data) in packs.into_iter().zip(data) {
-            let (name, idx, _) = &inv.packs[i];
-            let Ok(data) = data else { continue }; // fetched one by one instead
-            bytes += (data.len() + idx.len()) as u64;
-            let mem = MemoryBackend::new();
-            mem.write(&pack_file(&dir, name), &data)?;
-            mem.write(&index_file(&dir, name), idx)?;
-            if let Ok(p) = Pack::open(&mem, &dir, name) {
-                got.packs.insert(i, (mem, p));
+        for (i, r) in packs.into_iter().zip(spooled) {
+            let (name, idx, index) = &inv.packs[i];
+            if r.is_err() {
+                continue; // fetched one by one instead
+            }
+            bytes += index.pack_len() + idx.len() as u64;
+            if let Ok(p) = Pack::open(local, dir, name) {
+                got.packs.insert(i, p);
             }
         }
         let loose: Vec<ObjectId> = inv.loose.iter().filter(|id| !self.local_ids.contains(id)).copied().collect();
@@ -789,9 +851,9 @@ impl PullSource<'_> {
         if let Some(d) = got.loose.get(id) {
             return Ok(Some(d.clone()));
         }
-        if let Some((mem, p)) = self.inv.packed.get(id).and_then(|i| got.packs.get(i)) {
+        if let Some(p) = self.inv.packed.get(id).and_then(|i| got.packs.get(i)) {
             // `Pack::get` re-hashes what it returns.
-            return p.get(mem, id, &self.bases);
+            return p.get(&*self.spool.backend, id, &self.bases);
         }
         Ok(None)
     }
@@ -2128,6 +2190,7 @@ fn pull_incremental(
         remote: remote.store(),
         inv: &inv,
         got: RefCell::default(),
+        spool: Spool::new(local),
         bases: LruCache::new(64 << 20),
         bytes: RefCell::new(0),
     };

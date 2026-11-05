@@ -538,7 +538,11 @@ fn sweep(name: &str, target: Target, op: Op) {
         }
     }
     assert!(crashes >= 2, "{name}: too few crash points ({crashes})");
-    assert!(torn > 0, "{name}: no power loss ever tore an unsynced write");
+    // A push writes nothing unsynced on the remote: each pack is a durable
+    // stream (BUG-800), then its index, then the tags.
+    if target != Target::RemoteOld {
+        assert!(torn > 0, "{name}: no power loss ever tore an unsynced write");
+    }
 }
 
 /// Sweep `op` across every barrier failing in turn (see `EioBackend`): the

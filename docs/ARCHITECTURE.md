@@ -2280,10 +2280,11 @@ what the other provably has (`remote.rs` has the details):
   and be releasable now).
 * **Push** walks the remote view's closure on the *local* graph, sends only
   the snapshots outside it, and skips every subtree reachable from the
-  known snapshots they build on. Everything sent goes into one pack with
-  deltas between versions of the same path (`PackBuilder`), written to the
-  remote's pack directory inside its transaction: the pack unsynced, a
-  barrier, then the index durably. A crash leaves at worst an invisible
+  known snapshots they build on. Everything sent goes into packs of about
+  128 MiB with deltas between versions of the same path (`PackWriter`),
+  streamed to the remote's pack directory inside its transaction: each
+  pack durably under its name (a temp file until then), a barrier, then
+  the index durably. A crash leaves at worst a temp file, an invisible
   pack (no index) or a complete one whose operation never landed. Tag
   fast-forward checks run on the local graph too, under the remote's lock
   and **before anything is sent**: the history of a rejected tag is not
@@ -2292,8 +2293,12 @@ what the other provably has (`remote.rs` has the details):
 * **Pull** lists the remote's objects (pack indexes and loose fan-out
   directories, many requests in flight), skips every snapshot the local
   committed view reaches, and at the first object it lacks downloads, in
-  parallel, every remote pack and loose object it lacks. The walk then
-  runs locally; objects already present are read locally, never fetched.
+  parallel, every remote pack and loose object it lacks. Packs are
+  streamed in 4 MiB pieces to a spool on local disk
+  (`.veil/objects/incoming/pull`, removed when the pull ends; never read
+  as part of the store), after checking that the disk has room for them.
+  The walk then runs locally; objects already present are read locally,
+  never fetched.
   When the remote holds objects the walk did not need, a local walk of the
   committed view finds references to them: that fills gaps such as a clone
   of a public mirror now pulling from a team remote, or embargoed content
@@ -2746,15 +2751,28 @@ pack-<sum>.idx    "VEILIDX1" | count u32 | fanout[256] u32 | ids[count] (sorted)
   above, it is streamed into its hash first (1 MiB at a time, the window
   at most 128 MiB) and decoded into memory only once that matched its id,
   so content that is not the object costs decoding time, never memory. A
-  pull downloads at most 2 GiB of packs into memory for its bulk read,
-  each to the size its index implies; objects in further packs are read
-  one at a time. If a pack cannot be opened, lookups
+  pull downloads at most 2 GiB of packs to its spool on disk for its bulk
+  read (BUG-800: it used to be memory), each to the size its index
+  implies, and fails first, naming the space needed, if the disk lacks
+  it; objects in further packs are read one at a time. If a pack cannot be opened, lookups
   that miss report `Corrupt` rather than `Missing`, because "missing" means
   "redacted" to the rest of the engine. `ObjectStore::verify_packs` does a
   full check, and `gc` refuses to run on a store with a broken pack.
 * **Atomic publication.** The `.pack` is written before its `.idx`, and
   readers find packs only through `.idx` files. Old packs are removed index
-  first. A reader whose pack disappears (a concurrent gc replaced it)
+  first.
+* **Streaming writes** (BUG-800). gc, push and pull write packs with
+  `PackWriter`: the same bytes as `PackBuilder` (which stays for small
+  packs), streamed through `StorageBackend::create_stream` (on disk a temp
+  file created with `O_EXCL`, fsynced, renamed, then the directory fsynced;
+  on SFTP pipelined writes, `fsync@openssh.com`, `posix-rename`; elsewhere
+  buffered). Memory holds the `(id, offset, length)` table, the delta
+  depths and 1 MiB of pack data. The header's count is patched at the end,
+  and the trailer's BLAKE3 is computed while streaming (the first 1 KiB
+  chunk, holding the count, is kept, the rest is hashed as the subtrees
+  BLAKE3's tree has at any length, and the two are merged at the end), so
+  nothing is read back. Sync keeps the last version seen at each path as
+  the next one's delta base, 64 MiB of them at most. A reader whose pack disappears (a concurrent gc replaced it)
   rescans the pack directory and retries.
 
 ### Caches
@@ -3045,7 +3063,7 @@ uncompressed canonical encoding, so only packs involve zstd:
   the pure decoder against libzstd's output (plain frames at levels 1–19,
   dictionary and prefix deltas, property tests on random edits) and that
   damaged frames and random bytes are errors, never a panic.
-* *Writing* (`PackBuilder`, so gc and sync) stores every entry as kind 0.
+* *Writing* (`PackBuilder` and `PackWriter`, so gc and sync) stores every entry as kind 0.
   Packs are larger but the format is unchanged; every vl reads them, and
   the next native `vl gc` recompresses them.
 
@@ -3548,10 +3566,11 @@ afterwards; textconv input on stdin, output never stored.
 * Performance: recording checked-out files
   in the stat cache (needs a backend write that returns the stat of the
   file it wrote). `gc` always rewrites everything it keeps, into packs of
-  at most about 128 MiB each, each built in memory (so gc's memory is
-  bounded, BUG-800); incremental packing (small packs merged
-  geometrically), streaming pack writes and cross-pack deltas are next.
-  Sync builds its packs in memory too, 128 MiB at a time.
+  at most about 128 MiB each, streamed (BUG-800); incremental packing
+  (small packs merged geometrically) and cross-pack deltas are next. gc
+  and pull still hold a few table entries per object of the store (the
+  inventory, the reachability set), so their memory still grows with the
+  number of objects, though no longer with their size.
 * Sealed directory nodes for cloaked paths, to hide their names (embargoes
   already seal their trees, §7); a "require signed snapshots" policy;
   pinning a ring head out of band; automatic re-application of concurrent
