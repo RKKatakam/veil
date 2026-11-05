@@ -370,6 +370,6 @@ pub fn am(ctx: &mut Ctx, args: &AmArgs) -> Result<ExitCode> {
             ctx.repo.snapshot(last)?.change_id.short()
         );
     }
-    render::print_policy_held_back(&report.policy_held_back, false);
+    render::print_policy_held_back(&report.policy_held_back, false, false);
     Ok(ExitCode::SUCCESS)
 }

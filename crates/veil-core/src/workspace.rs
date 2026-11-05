@@ -48,6 +48,11 @@ pub struct SnapshotOptions<'a> {
     /// guarded by the accepted policy like any incoming change (see
     /// [`crate::policy::working_copy_policy`]).
     pub policy_incoming: bool,
+    /// The command changed `.veilpolicy` itself (`vl cloak`, `vl expose`):
+    /// in colocated Git mode, where nothing else found in the working copy
+    /// is taken as the member's own edit, this edit is (see
+    /// [`Repo::snapshot_policy`](crate::repo::Repo)).
+    pub policy_edit: Option<crate::policy::PolicyEdit<'a>>,
     /// The files of `fs` were written by a command, not edited by the
     /// member (a `vl ws exec` sandbox, a mount): an edit of `.veilpolicy`
     /// is the command's, so the recorded policy pins it, as the accepted
@@ -213,6 +218,98 @@ fn hold_command_edit(
     crate::conflict::set_entry(store, &tree, &path, recorded)
 }
 
+/// What [`Repo::snapshot_workspace_with`] builds a tree with, besides the
+/// working copy it amends.
+struct BuildParams<'a> {
+    injected: Option<&'a InjectedSecrets>,
+    materialised: Option<&'a Materialised>,
+    policy_incoming: bool,
+    policy_edit: Option<crate::policy::PolicyEdit<'a>>,
+    policy_from_command: bool,
+    carried: &'a [(VPath, crate::object::TreeEntry)],
+    only: Option<&'a crate::vfs::SparseSet>,
+    line_endings: LineEndings<'a>,
+    keep_recorded: Option<&'a std::collections::BTreeSet<VPath>>,
+}
+
+/// A tree built from a working copy, with the policy that classified it.
+struct Built {
+    tree: ObjectId,
+    report: BuildReport,
+    wp: WorkingCopyPolicy,
+}
+
+/// What the scan before the lock found (see
+/// [`Repo::snapshot_workspace_with`]).
+enum Probe {
+    /// Nothing to record: `wc` holds the directory as it is.
+    Unchanged {
+        wc: ObjectId,
+        report: BuildReport,
+        cache: Option<StatCache>,
+    },
+    Changed(ChangedProbe),
+}
+
+struct ChangedProbe {
+    /// The working copy it was built against.
+    wc: ObjectId,
+    /// The accepted policy it applied.
+    accepted: Option<Vec<u8>>,
+    built: Built,
+    staged: crate::store::Staged,
+    cache: Option<StatCache>,
+}
+
+/// Build the tree recording `fs` as an amendment of working copy `wc`.
+fn build_wc_tree(
+    repo: &Repo,
+    wc: &crate::object::Snapshot,
+    fs: &dyn StorageBackend,
+    p: &BuildParams<'_>,
+    rescan: bool,
+    cache: Option<&mut StatCache>,
+) -> Result<Built> {
+    let store = repo.store.clone();
+    // What `fs` was materialised from: the working copy, with the
+    // entries a command put back in place of its own.
+    let parent_tree = with_carried(&store, wc.tree, p.carried)?;
+    let restricted;
+    let fs: &dyn StorageBackend = match p.only {
+        Some(set) => {
+            restricted = crate::vfs::SparseView::new(fs, store.clone(), parent_tree, set);
+            &restricted
+        }
+        None => fs,
+    };
+    // `fs` was checked out from `wc.tree`: a `.veilpolicy` edit is the
+    // member's, unless a command wrote it from elsewhere (or wrote the
+    // files at all).
+    let (wp, command_edit) = recording_policy(repo, fs, &parent_tree, p.policy_from_command, || match p.policy_edit {
+        Some(edit) if !p.policy_incoming => repo.snapshot_policy_edit(fs, &wc.tree, edit),
+        _ => repo.snapshot_policy(fs, (!p.policy_incoming).then_some(&wc.tree)),
+    })?;
+    let line_base = || Ok(repo.parents_tree(&wc.parents)?.tree);
+    let (tree, mut report) = build_tree_cached(
+        &store,
+        fs,
+        &BuildOptions {
+            policy: &wp.policy,
+            parent_tree: Some(parent_tree),
+            cloak: wc.cloak.as_deref(),
+            injected: p.injected,
+            rescan,
+            materialised: p.materialised,
+            line_base: Some(&line_base),
+            line_endings: p.line_endings,
+            keep_recorded: p.keep_recorded,
+        },
+        cache,
+    )?;
+    let tree = hold_command_edit(&store, tree, &parent_tree, command_edit, &mut report)?;
+    Ok(Built { tree, report, wp })
+}
+
 pub fn validate_workspace_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 64
@@ -267,6 +364,20 @@ impl Repo {
     }
 
     /// Record `fs` as the working copy of `ws`, with every option.
+    ///
+    /// The working copy is scanned **before** the repository lock is taken
+    /// (BUG-801): the tree is built with every new object staged in memory
+    /// (`ObjectStore::begin_staging`), against the view as it is now. If
+    /// nothing changed, nothing is written and the lock is never taken, so
+    /// any number of `vl status` run at once. Otherwise the transaction
+    /// takes the lock, and if the workspace, the accepted policy and the
+    /// scanner's rules are still what the scan saw, publishes the staged
+    /// objects and records that tree; if anything moved (another command
+    /// recorded or moved the workspace meanwhile), or the new content was
+    /// too large to stage, the tree is built again under the lock, as it
+    /// always was. Stream O (`docs/design/scale/2-lock-free-oplog.md`)
+    /// takes the same shape further: staging on disk, and a
+    /// compare-and-swap of the op heads instead of the lock.
     pub fn snapshot_workspace_with(&mut self, ws: &str, fs: &dyn StorageBackend, opts: SnapshotOptions<'_>) -> Result<WcSnapshot> {
         let SnapshotOptions {
             cache,
@@ -274,6 +385,7 @@ impl Repo {
             materialised,
             description,
             policy_incoming,
+            policy_edit,
             policy_from_command,
             expected_wc,
             carried,
@@ -281,6 +393,39 @@ impl Repo {
             line_endings,
             keep_recorded,
         } = opts;
+        let mut cache = cache;
+        let params = BuildParams {
+            injected,
+            materialised,
+            policy_incoming,
+            policy_edit,
+            policy_from_command,
+            carried,
+            only,
+            line_endings,
+            keep_recorded,
+        };
+        // 1. Scan without the lock.
+        let probe = match self.backend.is_network() {
+            true => None,
+            false => self.probe_snapshot(ws, fs, &params, expected_wc, cache.as_deref())?,
+        };
+        let probe = match probe {
+            Some(Probe::Unchanged { wc, report, cache: scanned }) => {
+                if let (Some(c), Some(s)) = (cache.as_deref_mut(), scanned) {
+                    *c = s;
+                }
+                return Ok(WcSnapshot {
+                    snapshot: wc,
+                    changed: false,
+                    report,
+                    superseded: false,
+                });
+            }
+            Some(Probe::Changed(p)) => Some(p),
+            None => None,
+        };
+        // 2. Record under the lock.
         let mut tx = self.transaction(description.unwrap_or_else(|| snapshot_op_description(ws)))?;
         let wc_id = tx.view.workspace(ws)?.wc;
         if expected_wc.is_some_and(|e| e != wc_id) {
@@ -294,42 +439,19 @@ impl Repo {
         let wc = tx.repo().snapshot(&wc_id)?;
         let store = tx.repo().store.clone();
         let rescan = scanner_outdated(&*tx.repo().backend, ws)?;
-        // What `fs` was materialised from: the working copy, with the
-        // entries a command put back in place of its own.
-        let parent_tree = with_carried(&store, wc.tree, carried)?;
-        let restricted;
-        let fs: &dyn StorageBackend = match only {
-            Some(set) => {
-                restricted = crate::vfs::SparseView::new(fs, store.clone(), parent_tree, set);
-                &restricted
+        let accepted = crate::policy::load_accepted(&*tx.repo().backend)?;
+        let reuse = probe.filter(|p| p.wc == wc_id && !rescan && p.accepted == accepted);
+        let built = match reuse {
+            Some(p) => {
+                store.publish_staged(p.staged)?;
+                if let (Some(c), Some(s)) = (cache.as_deref_mut(), p.cache) {
+                    *c = s;
+                }
+                p.built
             }
-            None => fs,
+            None => build_wc_tree(tx.repo(), &wc, fs, &params, rescan, cache)?,
         };
-        // `fs` was checked out from `wc.tree`: a `.veilpolicy` edit is the
-        // member's, unless a command wrote it from elsewhere (or wrote the
-        // files at all).
-        let (wp, command_edit) = recording_policy(tx.repo(), fs, &parent_tree, policy_from_command, || {
-            tx.repo().snapshot_policy(fs, (!policy_incoming).then_some(&wc.tree))
-        })?;
-        let repo = tx.repo();
-        let line_base = || Ok(repo.parents_tree(&wc.parents)?.tree);
-        let (tree, mut report) = build_tree_cached(
-            &store,
-            fs,
-            &BuildOptions {
-                policy: &wp.policy,
-                parent_tree: Some(parent_tree),
-                cloak: wc.cloak.as_deref(),
-                injected,
-                rescan,
-                materialised,
-                line_base: Some(&line_base),
-                line_endings,
-                keep_recorded,
-            },
-            cache,
-        )?;
-        let tree = hold_command_edit(&store, tree, &parent_tree, command_edit, &mut report)?;
+        let Built { tree, report, wp } = built;
         tx.repo().record_accepted(&wp)?;
         if tree == wc.tree {
             // Nothing to record; the re-scan (if any) found nothing new.
@@ -377,6 +499,52 @@ impl Repo {
             report,
             superseded: false,
         })
+    }
+
+    /// Step 1 of [`Repo::snapshot_workspace_with`]: build the tree before
+    /// taking the lock, with its new objects staged. `None` when the scan
+    /// cannot be used (the workspace already moved, the scanner's rules
+    /// changed, the new content is too large to stage, or the scan failed:
+    /// the build under the lock then runs, and reports any error).
+    fn probe_snapshot(
+        &mut self,
+        ws: &str,
+        fs: &dyn StorageBackend,
+        params: &BuildParams<'_>,
+        expected_wc: Option<ObjectId>,
+        cache: Option<&StatCache>,
+    ) -> Result<Option<Probe>> {
+        self.reload()?;
+        let Ok(w) = self.view.workspace(ws) else { return Ok(None) };
+        let wc_id = w.wc;
+        if expected_wc.is_some_and(|e| e != wc_id) || scanner_outdated(&*self.backend, ws)? {
+            return Ok(None);
+        }
+        let wc = self.snapshot(&wc_id)?;
+        let accepted = crate::policy::load_accepted(&*self.backend)?;
+        let mut scanned = cache.cloned();
+        let store = self.store.clone();
+        let scope = store.begin_staging();
+        let built = build_wc_tree(self, &wc, fs, params, false, scanned.as_mut());
+        let staged = scope.finish();
+        let built = match built {
+            Ok(b) if !staged.overflowed() => b,
+            _ => return Ok(None),
+        };
+        if built.tree == wc.tree && built.wp.accept.is_none() {
+            return Ok(Some(Probe::Unchanged {
+                wc: wc_id,
+                report: built.report,
+                cache: scanned,
+            }));
+        }
+        Ok(Some(Probe::Changed(ChangedProbe {
+            wc: wc_id,
+            accepted,
+            built,
+            staged,
+            cache: scanned,
+        })))
     }
 
     /// Build a tree from `fs` as an amendment of `snapshot` (what recording

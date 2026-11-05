@@ -292,3 +292,91 @@ fn slow_snapshot_serialises_with_a_concurrent_writer() {
     assert_eq!(r.workspace_wc(WS).unwrap(), out.snapshot, "snapshot lost");
     assert_eq!(read_at(&r, &out.snapshot, "dir3/f10"), b"10\n");
 }
+
+/// BUG-801: a snapshot scans the working copy before it takes the lock, so
+/// any number of clean `vl status` run at once without contending. The
+/// scan may race other recorders of the same directory: it is used only if
+/// the workspace did not move meanwhile; otherwise the tree is built again
+/// under the lock. Eight handles on one directory, each editing its own
+/// file and snapshotting in a loop: every snapshot follows the last one
+/// (no fork, no lost edit), and the last records what the directory holds.
+#[test]
+fn racing_snapshots_of_one_directory_lose_nothing() {
+    let fs = Arc::new(MemoryBackend::new());
+    let mut init = Repo::init(fs.clone(), Some(veil_core::Identity::generate("a")), "a").unwrap();
+    init.snapshot_workspace("default", &*fs).unwrap();
+    const THREADS: usize = 8;
+    const ROUNDS: usize = 12;
+    let handles: Vec<_> = (0..THREADS)
+        .map(|i| {
+            let fs = fs.clone();
+            std::thread::spawn(move || {
+                let mut r = Repo::open(fs.clone(), Some(veil_core::Identity::generate("x")), "x").unwrap();
+                for n in 0..ROUNDS {
+                    fs.write(&p(&format!("file-{i}")), format!("{n}\n").as_bytes()).unwrap();
+                    let out = r.snapshot_workspace("default", &*fs).unwrap();
+                    assert!(!out.superseded);
+                    // What this handle wrote is recorded by now (by it, or
+                    // by a racer that scanned after the write).
+                    let r2 = Repo::open(fs.clone(), None, "check").unwrap();
+                    let wc = r2.workspace_wc("default").unwrap();
+                    let got = String::from_utf8(read_at(&r2, &wc, &format!("file-{i}"))).unwrap();
+                    assert_eq!(got, format!("{n}\n"), "file-{i} lost round {n}");
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    let mut r = Repo::open(fs.clone(), None, "check").unwrap();
+    let before = r.workspace_wc("default").unwrap();
+    let out = r.snapshot_workspace("default", &*fs).unwrap();
+    assert!(!out.changed, "the last snapshot missed an edit");
+    assert_eq!(out.snapshot, before);
+    for i in 0..THREADS {
+        assert_eq!(read_at(&r, &before, &format!("file-{i}")), format!("{}\n", ROUNDS - 1).as_bytes());
+    }
+    // One line of working-copy snapshots: each the successor of the last.
+    let mut chain = 0;
+    let mut at = before;
+    loop {
+        let s = r.snapshot(&at).unwrap();
+        match s.predecessors.as_slice() {
+            [prev] => {
+                at = *prev;
+                chain += 1;
+            }
+            [] => break,
+            more => panic!("forked working copy: {more:?}"),
+        }
+    }
+    assert!(chain >= ROUNDS, "{chain}");
+    assert!(!fs.exists(&p(LOCK)).unwrap(), "lock leaked");
+}
+
+/// BUG-801: a clean snapshot never takes the lock (another holder does not
+/// make it wait or fail), and content too large to stage in memory is
+/// still recorded (under the lock).
+#[test]
+fn a_clean_snapshot_needs_no_lock_and_large_content_still_records() {
+    let (mut a, fs, _) = new_repo("alice");
+    commit_files(&mut a, &*fs, &[("f", "1\n")], "base");
+    a.snapshot_workspace("default", &*fs).unwrap();
+    // Someone holds the lock for longer than any wait.
+    let held = RepoLock::acquire(fs.clone()).unwrap();
+    let mut b = Repo::open(fs.clone(), None, "b").unwrap();
+    let t = Instant::now();
+    let out = b.snapshot_workspace("default", &*fs).unwrap();
+    assert!(!out.changed);
+    assert!(t.elapsed() < Duration::from_secs(5), "a clean snapshot waited for the lock");
+    drop(held);
+    // More new content than the staging budget: built under the lock.
+    let big: Vec<u8> = (0..veil_core::store::STAGING_BUDGET + 4096).map(|i| (i * 7 % 251) as u8).collect();
+    fs.write(&p("big.bin"), &big).unwrap();
+    let out = b.snapshot_workspace("default", &*fs).unwrap();
+    assert!(out.changed);
+    assert_eq!(read_at(&b, &out.snapshot, "big.bin"), big);
+    let mut c = Repo::open(fs.clone(), None, "c").unwrap();
+    assert!(!c.snapshot_workspace("default", &*fs).unwrap().changed);
+}

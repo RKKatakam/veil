@@ -655,6 +655,10 @@ pub struct BuildReport {
     /// The member's own edit of `.veilpolicy` waits for `vl policy accept`
     /// (see [`Policy::own_edit_pending`]).
     pub policy_edit_pending: bool,
+    /// Colocated Git mode: no edit of `.veilpolicy` found in the working
+    /// copy was taken as the member's own (see
+    /// [`Policy::edits_unattributed`]).
+    pub policy_edits_unattributed: bool,
     /// An edit of `.veilpolicy` made by a command (a `vl ws exec` sandbox,
     /// a mount; see `SnapshotOptions::policy_from_command`) that weakens
     /// the recorded policy, or could, was not recorded: the tree keeps the
@@ -847,6 +851,7 @@ pub fn build_tree_cached(
         report: BuildReport {
             policy_warnings: opts.policy.warnings.clone(),
             policy_edit_pending: opts.policy.own_edit_pending,
+            policy_edits_unattributed: opts.policy.edits_unattributed,
             ..Default::default()
         },
         folding: fs.name_folding(),

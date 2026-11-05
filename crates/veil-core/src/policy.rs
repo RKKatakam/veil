@@ -609,6 +609,11 @@ pub struct Policy {
     /// [`working_copy_policy`]): some of what is held back may be the
     /// member's own change.
     pub own_edit_pending: bool,
+    /// Colocated Git mode: Git may have written the working copy's
+    /// `.veilpolicy` (a pull, checkout, `stash pop`, `reset --soft`), so no
+    /// edit found there was taken as the member's own (BUG-759); only a
+    /// `vl` command's own edit is ([`PolicyEdit`]).
+    pub edits_unattributed: bool,
     /// The policy the member accepted, if this one is guarded by it (see
     /// [`Policy::guarded_by`]).
     accepted: Option<Box<Policy>>,
@@ -627,6 +632,7 @@ impl Policy {
             set: GlobSet::empty(),
             warnings: vec![],
             own_edit_pending: false,
+            edits_unattributed: false,
             accepted: None,
         }
     }
@@ -1520,9 +1526,46 @@ pub fn working_copy_policy(
     fs: &dyn StorageBackend,
     parent_policy: Option<Option<&[u8]>>,
 ) -> Result<WorkingCopyPolicy> {
+    working_copy_policy_written(local, fs, parent_policy, None)
+}
+
+/// An edit of `.veilpolicy` a `vl` command made itself (`vl cloak`,
+/// `vl expose`, `vl policy import-gitignore`): it read `before` and wrote
+/// `after`. In colocated Git mode it is the only edit taken as the
+/// member's own (see [`working_copy_policy_after_edit`]).
+#[derive(Clone, Copy, Debug)]
+pub struct PolicyEdit<'a> {
+    pub before: &'a [u8],
+    pub after: &'a [u8],
+}
+
+/// [`working_copy_policy`] where the member's own edit is exactly `edit`
+/// (colocated Git mode, BUG-759: Git may write `.veilpolicy` between two
+/// `vl` commands by any route, so a difference from the recorded version
+/// proves nothing about who made it). `edit.before` → `edit.after` is
+/// folded in as theirs, and only while the file still holds `edit.after`;
+/// anything else found there is incoming.
+pub fn working_copy_policy_after_edit(local: &dyn StorageBackend, fs: &dyn StorageBackend, edit: PolicyEdit<'_>) -> Result<WorkingCopyPolicy> {
+    working_copy_policy_written(local, fs, Some(Some(edit.before)), Some(edit.after))
+}
+
+/// [`working_copy_policy`]; with `written`, the edit `parent_policy` →
+/// file counts as the member's only while the file holds `written`.
+fn working_copy_policy_written(
+    local: &dyn StorageBackend,
+    fs: &dyn StorageBackend,
+    parent_policy: Option<Option<&[u8]>>,
+    written: Option<&[u8]>,
+) -> Result<WorkingCopyPolicy> {
     let acc = load_accepted(local)?;
     let (text, own_edit) = match read_policy_file(fs)? {
-        PolicyFile::File(t) => (t, parent_policy),
+        PolicyFile::File(t) => {
+            let own = match written {
+                Some(w) if w != t.as_slice() => None,
+                _ => parent_policy,
+            };
+            (t, own)
+        }
         PolicyFile::Linked(t) => {
             let mut wp = guarded_policy(acc, t, None);
             wp.policy.warnings.push(format!(
@@ -1576,7 +1619,14 @@ fn guarded_policy(acc: Option<Vec<u8>>, text: Vec<u8>, parent_policy: Option<Opt
         policy: current.clone(),
         accept: (acc != text).then(|| text.clone()),
     };
-    if current.same_rules(&accepted) || current.only_adds_protection_to(&accepted) {
+    // Never weaker than the accepted policy for any path (the exhaustive
+    // check of `verify_fold`): accepted whoever wrote it, so a protection
+    // the member added by hand stays pinned even where the edit cannot be
+    // told apart from an incoming one (colocated Git mode, BUG-759).
+    if current.same_rules(&accepted)
+        || current.only_adds_protection_to(&accepted)
+        || verify_fold(&accepted, &accepted, &current).is_ok()
+    {
         return take_all();
     }
     let parent = parent_policy.map(|p| Policy::parse(&String::from_utf8_lossy(p.unwrap_or_default())));

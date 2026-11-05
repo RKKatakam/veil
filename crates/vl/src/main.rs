@@ -1625,6 +1625,7 @@ fn cmd_policy_rules(ctx: &mut Ctx, patterns: &[String], tier: Tier, force: bool)
             }
         }
     };
+    let before = text.clone();
     if !text.ends_with('\n') {
         text.push('\n');
     }
@@ -1668,7 +1669,7 @@ fn cmd_policy_rules(ctx: &mut Ctx, patterns: &[String], tier: Tier, force: bool)
         Tier::Isolated => "isolate",
         Tier::Ignored => "ignore",
     };
-    ctx.snapshot_as(format!("{verb} {}", patterns.join(" ")))?;
+    ctx.snapshot_policy_edit(format!("{verb} {}", patterns.join(" ")), before.as_bytes(), text.as_bytes())?;
     Ok(())
 }
 
