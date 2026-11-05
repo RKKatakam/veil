@@ -1482,7 +1482,7 @@ fn known_embargo_lines(local: &Repo, refs: &[ObjectId], parent_ok: &mut dyn FnMu
 
 /// Are all of `candidates` in the committed closure of `refs` (the rule of
 /// [`committed_closure`])? One walk down from `refs`, highest generation
-/// first, which stops below the lowest candidate.
+/// first, which stops below the lowest candidate that is not a ref itself.
 fn all_known(
     local: &Repo,
     refs: &[ObjectId],
@@ -1491,7 +1491,10 @@ fn all_known(
 ) -> Result<bool> {
     let mut want: HashSet<ObjectId> = HashSet::new();
     let mut floor = crate::graph_index::Gen::MAX;
-    for c in candidates {
+    let direct: HashSet<&ObjectId> = refs.iter().collect();
+    // A ref itself needs no walk (a pushed tag the remote holds already,
+    // the old tip a new snapshot builds on).
+    for c in candidates.iter().filter(|c| !direct.contains(c)) {
         match local.graph().generation(local, c)? {
             Some(g) => floor = floor.min(g),
             // Not here: nothing proves the remote has it.
