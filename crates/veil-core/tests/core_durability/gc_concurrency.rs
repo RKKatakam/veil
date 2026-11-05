@@ -410,3 +410,172 @@ fn prune_now_beside_many_writers_loses_nothing() {
     drop(r);
     assert_fsck_clean(fs, &id, "after the stress run");
 }
+
+// ---- scale round, adversarial pass on stream G2 --------------------------------------
+
+/// A backend that forwards to `inner` and, the first time a path under
+/// `.veil/ops/` is written once armed, runs `hook`; optionally it says it
+/// is a network backend (an SFTP remote, as a pusher over SSH sees it) or
+/// fails writes to one path (EIO, or `kill -9` right before that write).
+struct Wire {
+    inner: Arc<MemoryBackend>,
+    network: bool,
+    armed: AtomicBool,
+    hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    fail: Option<&'static str>,
+}
+
+impl std::fmt::Debug for Wire {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("wire")
+    }
+}
+
+impl Wire {
+    fn new(inner: Arc<MemoryBackend>, network: bool, fail: Option<&'static str>) -> Arc<Wire> {
+        Arc::new(Wire {
+            inner,
+            network,
+            armed: AtomicBool::new(false),
+            hook: Mutex::new(None),
+            fail,
+        })
+    }
+
+    fn arm(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.hook.lock().unwrap() = Some(Box::new(hook));
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    fn check(&self, path: &VPath) -> Result<()> {
+        if self.fail == Some(path.as_str()) {
+            return Err(veil_core::VeilError::Io {
+                path: path.to_string(),
+                source: std::io::Error::other("injected EIO"),
+            });
+        }
+        if path.as_str().starts_with(".veil/ops/") && self.armed.swap(false, Ordering::SeqCst) {
+            if let Some(h) = self.hook.lock().unwrap().take() {
+                h();
+            }
+        }
+        Ok(())
+    }
+}
+
+impl StorageBackend for Wire {
+    fn kind(&self) -> &'static str {
+        "wire"
+    }
+    fn is_network(&self) -> bool {
+        self.network
+    }
+    fn read(&self, path: &VPath) -> Result<Vec<u8>> {
+        self.inner.read(path)
+    }
+    fn write(&self, path: &VPath, data: &[u8]) -> Result<()> {
+        self.check(path)?;
+        self.inner.write(path, data)
+    }
+    fn write_unsynced(&self, path: &VPath, data: &[u8]) -> Result<()> {
+        self.check(path)?;
+        self.inner.write_unsynced(path, data)
+    }
+    fn rename_unsynced(&self, from: &VPath, to: &VPath) -> Result<()> {
+        self.inner.rename_unsynced(from, to)
+    }
+    fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool> {
+        self.check(path)?;
+        self.inner.create_new(path, data)
+    }
+    fn remove_file(&self, path: &VPath) -> Result<()> {
+        self.check(path)?;
+        self.inner.remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &VPath) -> Result<()> {
+        self.inner.remove_dir_all(path)
+    }
+    fn create_dir_all(&self, path: &VPath) -> Result<()> {
+        self.inner.create_dir_all(path)
+    }
+    fn list_dir(&self, path: &VPath) -> Result<Vec<DirEntry>> {
+        self.inner.list_dir(path)
+    }
+    fn metadata(&self, path: &VPath) -> Result<Option<Metadata>> {
+        self.inner.metadata(path)
+    }
+    fn set_executable(&self, path: &VPath, x: bool) -> Result<()> {
+        self.inner.set_executable(path, x)
+    }
+}
+
+/// BUG-814: `vl -R ../hub gc --prune-now` (the documented way to collect a
+/// remote) opens the bare hub as a lock-free repository, so it takes the gc
+/// lease and the deletion fence, not `.veil/lock`. A push over SSH (a
+/// network backend: no staging, no registration, only `.veil/lock`) that
+/// has published its packs and not yet written its operation is invisible
+/// to the fence: gc deletes the pushed history and the push then records a
+/// tag that names nothing.
+#[test]
+fn hub_gc_never_deletes_what_a_push_over_ssh_is_publishing() {
+    let (mut alice, fs, id) = new_repo("alice");
+    let c1 = commit_files(&mut alice, &*fs, &[("a.txt", "first 814\n")], "first");
+    alice.set_tag("main", c1, None, false).unwrap();
+    let hub = Arc::new(MemoryBackend::new());
+    let wire = Wire::new(hub.clone(), true, None);
+    let ssh: Arc<dyn StorageBackend> = wire.clone();
+    veil_core::remote::push(&mut alice, ssh.clone(), false, &[], false).unwrap();
+    let c2 = commit_files(&mut alice, &*fs, &[("b.txt", "pushed over ssh 814\n")], "second");
+    alice.set_tag("main", c2, None, true).unwrap();
+    let gc_thread: Arc<Mutex<Option<std::thread::JoinHandle<Result<GcReport>>>>> = Default::default();
+    {
+        let (hub, id, slot) = (hub.clone(), id.clone(), gc_thread.clone());
+        wire.arm(move || {
+            // Meanwhile, on the server: `vl -R hub gc --prune-now`.
+            let g = std::thread::spawn(move || {
+                let mut r = Repo::open(hub, Some(id.clone()), &id.name)?;
+                gc(&mut r, &prune_now())
+            });
+            let until = std::time::Instant::now() + Duration::from_secs(2);
+            while !g.is_finished() && std::time::Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            *slot.lock().unwrap() = Some(g);
+        });
+    }
+    veil_core::remote::push(&mut alice, ssh, false, &[], false).unwrap();
+    let g = gc_thread.lock().unwrap().take().expect("the push wrote an operation");
+    g.join().unwrap().unwrap();
+    let r = Repo::open(hub.clone(), Some(id.clone()), "alice").unwrap();
+    let main = r.view().tags["main"].target;
+    assert_eq!(main, c2);
+    assert_eq!(read_at(&r, &main, "b.txt"), b"pushed over ssh 814\n");
+    drop(r);
+    assert_fsck_clean(hub, &id, "the hub after gc raced a push over ssh");
+}
+
+/// BUG-815: gc bumps the prune epoch only after it has deleted. A gc that
+/// dies in between (`kill -9`, EIO, a full disk) leaves objects deleted and
+/// the epoch as it was, so a command holding an id from its older view
+/// (`vl tag set` with a revision resolved before gc ran) does not check it
+/// and records a tag that names nothing.
+#[test]
+fn a_gc_that_dies_after_deleting_still_makes_carried_ids_checked() {
+    let (mut repo, fs, id) = new_repo("alice");
+    let old = commit_files(&mut repo, &*fs, &[("f", "old 815\n")], "old");
+    repo.abandon(old).unwrap();
+    commit_files(&mut repo, &*fs, &[("f", "new 815\n")], "new");
+    // gc dies at its first write after deleting (the pending list, which
+    // it removes when nothing stays pending).
+    let dying = Wire::new(fs.clone(), false, Some(".veil/objects/gc/pending"));
+    let mut g = Repo::open(dying, Some(id.clone()), "alice").unwrap();
+    assert!(gc(&mut g, &prune_now()).is_err(), "gc dies after deleting");
+    drop(g);
+    let probe = open(&fs, &id);
+    assert!(probe.store().snapshot(&old).is_err(), "the test needs the snapshot gone");
+    drop(probe);
+    let mut tx = repo.transaction("tag set").unwrap();
+    tx.view.tags.insert("stale".into(), Tag::new(old, None));
+    let e = tx.commit().expect_err("a tag naming a deleted snapshot was recorded");
+    assert!(e.to_string().contains("run the command again"), "{e}");
+}

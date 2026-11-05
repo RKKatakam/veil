@@ -931,7 +931,13 @@ fn prune_store(
     }
 
     // 7. Delete: pruned operations (recorded first, so fsck can tell the
-    // pruning apart from loss), loose garbage, then the dropped packs.
+    // pruning apart from loss), loose garbage, then the dropped packs. The
+    // prune epoch moves first: a gc that dies part-way (`kill -9`, EIO)
+    // has still told every command carrying an older view to check what
+    // it brought in (BUG-815).
+    if matches!(fence, Some(Ok(_))) && (!delete.is_empty() || !pruned_ops.is_empty()) {
+        crate::maintenance::bump_prune_epoch(store)?;
+    }
     crate::oplog::record_pruned_ops(&*backend, &pruned_ops)?;
     for id in &pruned_ops {
         backend.remove_file(&op_path(id))?;
@@ -972,9 +978,6 @@ fn prune_store(
     }
     report.pending = pending.len();
     write_pending(&*backend, &store.gc_dir(), &pending)?;
-    if matches!(fence, Some(Ok(_))) && (report.deleted > 0 || report.ops_pruned > 0) {
-        crate::maintenance::bump_prune_epoch(store)?;
-    }
     drop(fence);
     if report.deferred.is_none() && report.incomplete.is_empty() {
         crate::maintenance::record_prune(store, now)?;

@@ -22,6 +22,13 @@
 //!   they reach before it deletes anything; a transaction that meets a
 //!   raised fence waits for it to be lowered before it registers.
 //!
+//! * with the fence raised and no transaction registered, gc also takes
+//!   `.veil/lock`: writers that take it instead of registering (a push
+//!   over SSH into a bare repository collected with `vl -R <hub> gc`, any
+//!   transaction over a network backend) are then finished or not
+//!   started either (BUG-814). If it is held for long, nothing is
+//!   deleted that run.
+//!
 //! The two sides write first and read second (registration, then fence;
 //! fence, then registrations), so whichever order they run in, one sees
 //! the other. A transaction is therefore either finished before the
@@ -216,6 +223,8 @@ pub(crate) struct Fence {
     backend: Arc<dyn StorageBackend>,
     path: VPath,
     _owner: Owner,
+    /// `.veil/lock`, for the writers that take it instead of registering.
+    lock: Option<crate::lock::RepoLock>,
 }
 
 impl Drop for Fence {
@@ -228,11 +237,32 @@ impl Drop for Fence {
 pub(crate) const FENCE_REFUSED_SELF: &str =
     "this thread holds a transaction, so gc cannot wait for it to finish";
 
+/// Raise the fence once no lock-free transaction is running ([`drain`]),
+/// then take `.veil/lock` (BUG-814: writers that do not register take it
+/// for their whole transaction). `Err(why)` if either did not happen in
+/// time (the fence is lowered again).
+pub(crate) fn raise_fence(store: &ObjectStore) -> Result<std::result::Result<Fence, String>> {
+    let mut fence = match drain(store)? {
+        Ok(f) => f,
+        Err(why) => return Ok(Err(why)),
+    };
+    match crate::lock::RepoLock::acquire(store.backend().clone()) {
+        Ok(l) => fence.lock = Some(l),
+        Err(VeilError::Locked(_)) => {
+            return Ok(Err(
+                "another command held the repository lock (`.veil/lock`), so nothing was deleted; run `vl gc` again".into(),
+            ))
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(Ok(fence))
+}
+
 /// Raise the fence once no lock-free transaction is running: wait up to
 /// [`QUIET_WAIT`] for a moment with none, then raise it anyway and wait up
 /// to [`DRAIN_WAIT`] for those still running. `Err(why)` if they did not
 /// finish (the fence is lowered again).
-pub(crate) fn raise_fence(store: &ObjectStore) -> Result<std::result::Result<Fence, String>> {
+fn drain(store: &ObjectStore) -> Result<std::result::Result<Fence, String>> {
     if HELD.with(|h| h.get()) > 0 {
         return Ok(Err(FENCE_REFUSED_SELF.into()));
     }
@@ -282,6 +312,7 @@ fn raise(store: &ObjectStore) -> Result<Fence> {
         backend: store.backend().clone(),
         path,
         _owner: owner,
+        lock: None,
     })
 }
 

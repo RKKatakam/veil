@@ -3032,12 +3032,17 @@ Pruning:
    heads until it has published; `Repo::open` and reload register too while
    they read the op log): gc waits up to 5 s for a quiet moment,
    then raises it and waits up to 60 s for the rest (new transactions wait
-   for it), and otherwise deletes nothing that run and says so. Under the
+   for it), and otherwise deletes nothing that run and says so. With the
+   fence raised it also takes `.veil/lock` (BUG-814): writers that hold it
+   instead of registering (a push over SSH into a bare hub collected with
+   `vl -R`, any transaction over a network backend) are then finished or
+   not started; if it stays held, nothing is deleted that run. Under the
    fence it reads its roots again and marks what they reach (what was
    published or reused meanwhile), prunes only operations of its first
    listing, and gives a loose copy to anything that became reachable whose
-   pack goes. When it deleted something it writes a new prune epoch
-   (`.veil/local/gc/epoch`); a transaction whose process read its view
+   pack goes. Before it deletes anything it writes a new prune epoch
+   (`.veil/local/gc/epoch`, first, so that a gc killed part-way still
+   moved it: BUG-815); a transaction whose process read its view
    under an older epoch checks at commit that what its view gained and its
    new objects name is present ("… run the command again" otherwise).
 8. **Refuse to guess.** If any operation, snapshot or tree on the way cannot
