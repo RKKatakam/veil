@@ -10,7 +10,7 @@
 
 use crate::adversarial_support;
 
-use std::{path::Path, process::Command};
+use std::path::Path;
 
 use adversarial_support::{read, text, write, Env};
 
@@ -153,47 +153,6 @@ fn merging_a_pulled_policy_holds_it_back() {
     env.ok(U, &proj, &["commit", "-m", "c"]);
     env.ok(U, &proj, &["merge", "main", "-m", "merge main"]);
     assert_env_off_the_record(&env, &proj, "merge");
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .current_dir(dir)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_AUTHOR_NAME", "Mal")
-        .env("GIT_AUTHOR_EMAIL", "mal@example.com")
-        .env("GIT_COMMITTER_NAME", "Mal")
-        .env("GIT_COMMITTER_EMAIL", "mal@example.com")
-        .args(["-c", "init.defaultBranch=main", "-c", "commit.gpgsign=false"])
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-}
-
-/// `vl git pull` of a GitHub commit that adds `.env public!`, then the
-/// guide's post-pull `vl new main`.
-#[test]
-fn a_policy_from_git_pull_is_held_back() {
-    let env = Env::new();
-    let bare = env.root.join("github.git");
-    git(&env.root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
-    let proj = env.dir("proj");
-    env.ok(U, &proj, &["init"]);
-    write(&proj, ".env", SECRET);
-    write(&proj, "a.txt", "a\n");
-    env.ok(U, &proj, &["commit", "-m", "initial"]);
-    env.ok(U, &proj, &["tag", "set", "main", "-r", "@-"]);
-    env.ok(U, &proj, &["git", "remote", "add", "origin", bare.to_str().unwrap()]);
-    env.ok(U, &proj, &["git", "push"]);
-    let work = env.root.join("work");
-    git(&env.root, &["clone", "-q", bare.to_str().unwrap(), work.to_str().unwrap()]);
-    let policy = read(&work, ".veilpolicy") + ".env public!\n";
-    write(&work, ".veilpolicy", &policy);
-    git(&work, &["commit", "-q", "-am", "expose .env"]);
-    git(&work, &["push", "-q", "origin", "main"]);
-    env.ok(U, &proj, &["git", "pull"]);
-    env.ok(U, &proj, &["new", "main"]);
-    assert_env_off_the_record(&env, &proj, "git pull + new main");
 }
 
 // ---- what is at .veilpolicy ---------------------------------------------------------

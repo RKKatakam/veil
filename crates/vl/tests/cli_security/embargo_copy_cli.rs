@@ -5,7 +5,7 @@
 //! release. Every route, through the binary: `vl restore --from` (with and
 //! without paths), `vl squash` (`--into`, partial and whole), `vl rebase`
 //! and `vl abandon` that move work off the fix, `vl duplicate` of work built
-//! on it, `vl format-patch` (so `vl am` never receives it), and `vl resolve`
+//! on it, and `vl resolve`
 //! (which only ever picks among versions already in the change). Refusals
 //! name the change and the embargo, never a file or a description, and
 //! record nothing. Inside the embargo every route still works.
@@ -186,21 +186,6 @@ fn resolving_a_conflict_with_the_fix_inside_its_embargo_works() {
     r.ok(&["commit", "-m", "resolved"]);
     r.tag("resolved", "@-");
     publishes_nothing(&env, &r);
-}
-
-#[test]
-fn a_patch_of_work_built_on_the_fix_is_refused_so_am_never_gets_it() {
-    let env = Env::new();
-    let (r, v1) = embargoed(&env);
-    with_child(&r, &v1);
-    for rev in ["fix", "fixchild"] {
-        let out = r.run(&["format-patch", rev, "--stdout"]);
-        let t = text(&out);
-        assert_eq!(out.status.code(), Some(1), "{rev}: {t}");
-        assert!(t.contains("withheld history of unreleased embargo"), "{t}");
-        assert!(!t.contains(MARK), "{t}");
-        assert!(out.stdout.is_empty());
-    }
 }
 
 #[test]

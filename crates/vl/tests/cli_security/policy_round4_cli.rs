@@ -5,26 +5,9 @@
 
 use crate::adversarial_support;
 
-use std::{path::Path, process::Command};
+use std::path::Path;
 
 use adversarial_support::*;
-
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .current_dir(dir)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_AUTHOR_NAME", "Gita Hub")
-        .env("GIT_AUTHOR_EMAIL", "gita@example.com")
-        .env("GIT_COMMITTER_NAME", "Gita Hub")
-        .env("GIT_COMMITTER_EMAIL", "gita@example.com")
-        .args(["-c", "init.defaultBranch=main", "-c", "commit.gpgsign=false", "-c", "protocol.file.allow=always"])
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
 
 /// Paths recorded in `rev` (`vl files -r <rev>`).
 fn files(env: &Env, proj: &Path, rev: &str) -> Vec<String> {
@@ -42,48 +25,21 @@ fn vcs_paths(paths: &[String]) -> Vec<&String> {
         .collect()
 }
 
-/// A Git checkout with one commit (and so a populated `.git/`).
-fn git_checkout(env: &Env, name: &str) -> std::path::PathBuf {
-    let dir = env.dir(name);
-    git(&dir, &["init", "-q"]);
-    write(&dir, "app.txt", "v1\n");
-    git(&dir, &["add", "-A"]);
-    git(&dir, &["commit", "-q", "-m", "initial"]);
-    dir
-}
-
 // ---- BUG-076: VCS metadata ---------------------------------------------------
-
-#[test]
-fn init_inside_a_git_checkout_does_not_record_git_metadata() {
-    let env = Env::new();
-    let proj = git_checkout(&env, "proj");
-    env.ok("alice", &proj, &["init"]);
-    let recorded = files(&env, &proj, "@");
-    assert!(recorded.iter().any(|p| p == "app.txt"), "{recorded:?}");
-    assert!(vcs_paths(&recorded).is_empty(), "VCS metadata recorded: {:?}", vcs_paths(&recorded));
-    env.ok("alice", &proj, &["commit", "-m", "adopt veil"]);
-    assert!(vcs_paths(&files(&env, &proj, "@-")).is_empty());
-    // Git still works in the same directory.
-    write(&proj, "app.txt", "v2\n");
-    git(&proj, &["commit", "-q", "-am", "v2"]);
-    let out = env.ok("alice", &proj, &["status"]);
-    assert!(!out.contains(".git"), "{out}");
-}
 
 #[test]
 fn nested_vcs_metadata_and_git_files_are_ignored_at_any_depth() {
     let env = Env::new();
     let proj = env.dir("proj");
     env.ok("alice", &proj, &["init"]);
-    // A nested repository, a `.git` *file* (worktree / submodule), and
-    // the metadata of other VCSs.
+    // A nested repository, a `.git` *file* (a worktree), and the metadata
+    // of other VCSs.
     let nested = proj.join("vendor/lib");
-    std::fs::create_dir_all(&nested).unwrap();
-    git(&nested, &["init", "-q"]);
+    write(&nested, ".git/HEAD", "ref: refs/heads/main\n");
+    write(&nested, ".git/config", "[core]\n");
     write(&nested, "lib.rs", "pub fn f() {}\n");
     write(&proj, "sub/.git", "gitdir: ../.git/modules/sub\n");
-    write(&proj, "sub/readme.md", "submodule\n");
+    write(&proj, "sub/readme.md", "worktree\n");
     write(&proj, ".hg/store/data", "hg\n");
     write(&proj, "deep/er/.jj/repo/op_heads", "jj\n");
     write(&proj, "old/.svn/entries", "svn\n");
@@ -107,32 +63,6 @@ fn nested_vcs_metadata_and_git_files_are_ignored_at_any_depth() {
     let recorded = files(&env, &proj, "@-");
     assert!(recorded.iter().any(|p| p == "vendor/lib/.git/HEAD"), "{recorded:?}");
     assert!(!recorded.iter().any(|p| p.starts_with("sub/.git") || p.starts_with(".hg")), "{recorded:?}");
-}
-
-#[test]
-fn snapshots_after_git_import_never_record_git_metadata() {
-    let env = Env::new();
-    let root = env.root.clone();
-    let bare = root.join("github.git");
-    git(&root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
-    let proj = git_checkout(&env, "proj");
-    git(&proj, &["push", "-q", bare.to_str().unwrap(), "HEAD:refs/heads/main"]);
-    // Adopt Veil in the existing checkout: init, then import its history.
-    env.ok("alice", &proj, &["init"]);
-    let out = env.ok("alice", &proj, &["git", "import", bare.to_str().unwrap()]);
-    assert!(out.contains("Imported 1 commit(s)"), "{out}");
-    write(&proj, "app.txt", "v2 from veil\n");
-    env.ok("alice", &proj, &["commit", "-m", "v2"]);
-    env.ok("alice", &proj, &["tag", "set", "main", "-r", "@-"]);
-    for rev in ["@", "@-", "main"] {
-        let recorded = files(&env, &proj, rev);
-        assert!(vcs_paths(&recorded).is_empty(), "{rev}: {:?}", vcs_paths(&recorded));
-    }
-    env.ok("alice", &proj, &["git", "push"]);
-    assert_eq!(git(&bare, &["ls-tree", "-r", "--name-only", "main"]).lines().collect::<Vec<_>>(), [".veilpolicy", "app.txt"]);
-    // The checkout's own Git repository is untouched and still usable.
-    assert_eq!(git(&proj, &["log", "-1", "--format=%s"]), "initial");
-    git(&proj, &["status", "--short"]);
 }
 
 // ---- BUG-083: a `public` rule settled by a later `public!` -------------------

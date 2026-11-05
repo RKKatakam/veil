@@ -1,4 +1,4 @@
-//! Symlinks and gitlinks in the working copy (repository format 5; the
+//! Symlinks in the working copy (repository format 5; the
 //! Git-parity round's stream W1, `docs/design/git-parity/6-symlinks.md`).
 //!
 //! Each numbered threat of the design's review is tested here (the mount's
@@ -26,7 +26,7 @@
 //! 14. `.veilpolicy` is never recorded as a link.
 //!
 //! Plus confidentiality (a cloaked link's target never reaches a public
-//! remote), gitlink carry, `SnapshotOptions::only`, the rename-protection
+//! remote), the rename-protection
 //! hardening, and a property test of random trees with links checked out
 //! over random hostile states.
 
@@ -48,7 +48,7 @@ use veil_core::{
     object::{Conflict, ConflictTerm, EntryKind, Snapshot, TermKind, Text, Tree, TreeEntry, Visibility},
     remote,
     tree::lookup,
-    vfs::{NodeKind, SandboxFs, SparseSet},
+    vfs::{NodeKind, SandboxFs},
     workspace::SnapshotOptions,
     ChangeId, DiskBackend, MemoryBackend, ObjectId, Repo, StorageBackend, VPath,
 };
@@ -466,7 +466,6 @@ fn below_format_5_links_stay_special_files() {
             materialised: None,
             line_base: None,
             line_endings: Default::default(),
-            keep_recorded: None,
         },
     )
     .unwrap();
@@ -753,39 +752,6 @@ fn editing_a_link_conflict_resolves_it_and_resolve_ours_gives_a_file() {
 
 // ---- gitlinks ----------------------------------------------------------------------
 
-#[test]
-fn a_gitlink_is_an_empty_directory_the_builder_never_enters() {
-    let d = disk();
-    let (mut repo, _, _) = new_repo("alice");
-    const PIN: &str = "0123456789abcdef0123456789abcdef01234567\n";
-    let t = tree_of(&repo, vec![("vendor/sdk", leaf(&repo, "sdk", EntryKind::Gitlink, PIN, Visibility::Public)), ("README", file(&repo, "README", "hi\n"))]);
-    move_to(&mut repo, &d.fs, t, vec![]);
-    assert!(d.root.join("vendor/sdk").is_dir());
-    // `vl submodule update` populates it (with a `.git` of its own): the
-    // builder carries the gitlink, never records what is inside, and never
-    // follows the inner `.git`.
-    d.write("vendor/sdk/.git", "gitdir: ../../.git/modules/sdk\n");
-    d.write("vendor/sdk/src/secret.rs", "inner\n");
-    let s = repo.snapshot_workspace(WS, &d.fs).unwrap();
-    assert!(!s.changed, "{:?}", s.report);
-    let tree = wc_tree(&repo);
-    assert_eq!(entry_at(&repo, &tree, "vendor/sdk").unwrap().kind, EntryKind::Gitlink);
-    // A tree without the gitlink leaves the populated directory alone.
-    let t2 = set_entry(repo.store(), &tree, &p("vendor/sdk"), None).unwrap();
-    let r = repo.checkout_tree(&d.fs, Some(&tree), &t2).unwrap();
-    assert!(r.kept_local.iter().any(|p| p.as_str() == "vendor/sdk"), "{r:?}");
-    assert!(d.root.join("vendor/sdk/src/secret.rs").exists());
-    // An empty one goes, and removing the directory records the deletion.
-    move_to(&mut repo, &d.fs, t, vec![]);
-    std::fs::remove_dir_all(d.root.join("vendor/sdk")).unwrap();
-    let r = repo.checkout_tree(&d.fs, None, &t).unwrap();
-    assert!(r.failed.is_empty(), "{r:?}");
-    assert!(d.root.join("vendor/sdk").is_dir());
-    std::fs::remove_dir_all(d.root.join("vendor")).unwrap();
-    repo.snapshot_workspace(WS, &d.fs).unwrap();
-    assert!(entry_at(&repo, &wc_tree(&repo), "vendor/sdk").is_none());
-}
-
 // ---- sandboxes (threat 7) ----------------------------------------------------------
 
 #[test]
@@ -1008,30 +974,6 @@ fn a_sealed_file_moved_to_a_public_path_stays_sealed() {
     assert!(file_entry(&repo2, &s.snapshot, "docs/db.yml").unwrap().visibility.is_public());
 }
 
-// ---- SnapshotOptions::only ----------------------------------------------------------
-
-#[test]
-fn a_restricted_snapshot_records_only_its_paths() {
-    let d = disk();
-    let (mut repo, _, _) = new_repo("alice");
-    d.write("hidden/a", "1\n");
-    d.write("shown/b", "1\n");
-    repo.snapshot_workspace(WS, &d.fs).unwrap();
-    d.write("hidden/a", "2\n");
-    d.write("shown/b", "2\n");
-    d.write("shown/new", "x\n");
-    d.link("hidden/l", "a");
-    std::fs::remove_file(d.root.join("shown/b")).unwrap();
-    let only = SparseSet::new([p("hidden")]).unwrap();
-    let s = repo.snapshot_workspace_with(WS, &d.fs, SnapshotOptions { only: Some(&only), ..Default::default() }).unwrap();
-    let tree = repo.snapshot(&s.snapshot).unwrap().tree;
-    assert_eq!(repo.store().read_entry(&entry_at(&repo, &tree, "hidden/a").unwrap()).unwrap(), b"2\n");
-    assert_eq!(entry_at(&repo, &tree, "hidden/l").unwrap().kind, EntryKind::Symlink);
-    // Outside the set: as recorded, whatever is on disk.
-    assert_eq!(repo.store().read_entry(&entry_at(&repo, &tree, "shown/b").unwrap()).unwrap(), b"1\n");
-    assert!(entry_at(&repo, &tree, "shown/new").is_none());
-}
-
 // ---- the property: random trees over random hostile states ---------------------------
 
 #[derive(Clone, Debug)]
@@ -1217,24 +1159,4 @@ fn a_veilpolicy_symlink_entry_is_never_written_or_taken_for_no_policy() {
     assert!(!d.is_link(".veilpolicy") && !d.root.join(".veilpolicy").exists());
     let view = veil_core::tree::TreeView::new(repo.store().clone(), t);
     assert!(matches!(veil_core::policy::read_policy_file(&view).unwrap(), veil_core::policy::PolicyFile::Unavailable(_)));
-}
-
-/// Submodules design, threat 13: a vendored Git clone that is not a
-/// submodule is recorded as before (its `.git` never is), with a warning
-/// the first time only. A gitlink's directory is never reported (never
-/// opened).
-#[test]
-fn a_nested_git_repository_is_recorded_and_reported_once() {
-    let d = disk();
-    let (mut repo, _, _) = new_repo("alice");
-    d.write("vendor/x/.git/HEAD", "ref: refs/heads/main\n");
-    d.write("vendor/x/lib.rs", "pub fn f() {}\n");
-    let s = repo.snapshot_workspace(WS, &d.fs).unwrap();
-    assert_eq!(s.report.git_repositories, vec![p("vendor/x")]);
-    let tree = wc_tree(&repo);
-    assert!(entry_at(&repo, &tree, "vendor/x/lib.rs").is_some());
-    assert!(entry_at(&repo, &tree, "vendor/x/.git").is_none());
-    d.write("vendor/x/lib.rs", "pub fn g() {}\n");
-    let s = repo.snapshot_workspace(WS, &d.fs).unwrap();
-    assert!(s.report.git_repositories.is_empty(), "reported again");
 }

@@ -1,4 +1,4 @@
-//! Feature 7 (`.gitattributes`, line endings, diff and merge drivers): the
+//! Feature 7 (`.veilattributes`, line endings, diff and merge drivers): the
 //! threat review of `docs/design/git-parity/7-attributes-line-endings.md`,
 //! point by point, plus hostile attributes files and property tests.
 //! The differential tests against Git are in `attributes_git.rs`; the CLI
@@ -58,7 +58,7 @@ fn wc_tree(repo: &Repo) -> ObjectId {
 fn binary_attributes_never_switch_the_scanner_off() {
     for ga in ["* binary\n", "config.yml -text -diff -merge\n", "* text eol=crlf\n", "*.yml text=auto\n"] {
         let (mut repo, fs, _) = new_repo("alice");
-        fs.write(&p(".gitattributes"), ga.as_bytes()).unwrap();
+        fs.write(&p(".veilattributes"), ga.as_bytes()).unwrap();
         fs.write(&p("config.yml"), format!("db: x\r\n{AWS}\r\n").as_bytes()).unwrap();
         let out = repo.snapshot_workspace(WS, &*fs).unwrap();
         assert!(
@@ -93,7 +93,7 @@ proptest! {
             content.extend_from_slice(l.as_bytes());
             content.extend_from_slice(match endings[i] { 0 => b"\n" as &[u8], 1 => b"\r\n", _ => b"\r\n" });
         }
-        fs.write(&p(".gitattributes"), ga.as_bytes()).unwrap();
+        fs.write(&p(".veilattributes"), ga.as_bytes()).unwrap();
         fs.write(&p("f.txt"), &content).unwrap();
         let out = repo.snapshot_workspace(WS, &*fs).unwrap();
         prop_assert!(out.report.quarantined.iter().any(|(q, _)| q.as_str() == "f.txt"));
@@ -112,7 +112,7 @@ proptest! {
         ]),
     ) {
         let (mut repo, fs, _) = new_repo("alice");
-        fs.write(&p(".gitattributes"), ga.as_bytes()).unwrap();
+        fs.write(&p(".veilattributes"), ga.as_bytes()).unwrap();
         fs.write(&p("f.bin"), &data).unwrap();
         let out = repo.snapshot_workspace(WS, &*fs).unwrap();
         prop_assume!(out.report.quarantined.is_empty());
@@ -137,7 +137,7 @@ proptest! {
         }
     }
 
-    /// Byte-exactness: adding or changing `.gitattributes` never re-records
+    /// Byte-exactness: adding or changing `.veilattributes` never re-records
     /// a file by itself; only `vl renormalize` does, and only to the
     /// lossless form.
     #[test]
@@ -151,7 +151,7 @@ proptest! {
         }
         snap(&mut repo, &*fs);
         let before = wc_tree(&repo);
-        fs.write(&p(".gitattributes"), ga.as_bytes()).unwrap();
+        fs.write(&p(".veilattributes"), ga.as_bytes()).unwrap();
         snap(&mut repo, &*fs);
         let after = wc_tree(&repo);
         for i in 0..files.len() {
@@ -177,11 +177,11 @@ proptest! {
 
 // ---- 4. checkout never overwrites an edit after an attribute change ---------------------
 
-/// A working copy checked out (recorded) from a tree whose `.gitattributes`
+/// A working copy checked out (recorded) from a tree whose `.veilattributes`
 /// says `eol=crlf`, then recorded with `-text`.
 fn crlf_then_text_off() -> (Repo, Arc<MemoryBackend>, Materialised, ObjectId) {
     let (mut repo, fs, _) = new_repo("alice");
-    let t1 = tree_of(&repo, &[(".gitattributes", b"*.txt eol=crlf\n"), ("a.txt", b"x\ny\n")]);
+    let t1 = tree_of(&repo, &[(".veilattributes", b"*.txt eol=crlf\n"), ("a.txt", b"x\ny\n")]);
     let mut rec = Materialised::default();
     let empty = wc_tree(&repo);
     repo.checkout_tree_recorded(&*fs, Some(&empty), &t1, &mut rec, None).unwrap();
@@ -191,7 +191,7 @@ fn crlf_then_text_off() -> (Repo, Arc<MemoryBackend>, Materialised, ObjectId) {
     assert_eq!(bytes_at(&repo, &s1, "a.txt"), b"x\ny\n", "the CRLF copy stands for the LF version");
     // The attributes change: the file is not re-recorded (it is still
     // exactly what checkout wrote).
-    fs.write(&p(".gitattributes"), b"*.txt -text\n").unwrap();
+    fs.write(&p(".veilattributes"), b"*.txt -text\n").unwrap();
     let s2 = snap_rec(&mut repo, &*fs, &rec);
     assert_eq!(entry_at(&repo, &s1, "a.txt"), entry_at(&repo, &s2, "a.txt"), "no silent re-recording");
     (repo, fs, rec, s2)
@@ -200,7 +200,7 @@ fn crlf_then_text_off() -> (Repo, Arc<MemoryBackend>, Materialised, ObjectId) {
 #[test]
 fn an_unedited_file_is_updated_after_an_attribute_change() {
     let (repo, fs, mut rec, s2) = crlf_then_text_off();
-    let t3 = tree_of(&repo, &[(".gitattributes", b"*.txt -text\n"), ("a.txt", b"x\ny\nz\n")]);
+    let t3 = tree_of(&repo, &[(".veilattributes", b"*.txt -text\n"), ("a.txt", b"x\ny\nz\n")]);
     let r = repo.checkout_tree_recorded(&*fs, Some(&s2), &t3, &mut rec, None).unwrap();
     assert!(r.kept_local.is_empty(), "{:?}", r.kept_local);
     assert_eq!(fs.read(&p("a.txt")).unwrap(), b"x\ny\nz\n");
@@ -211,7 +211,7 @@ fn an_unedited_file_is_updated_after_an_attribute_change() {
 fn an_edit_is_kept_after_an_attribute_change() {
     let (repo, fs, mut rec, s2) = crlf_then_text_off();
     fs.write(&p("a.txt"), b"x\r\ny\r\nmine\r\n").unwrap();
-    let t3 = tree_of(&repo, &[(".gitattributes", b"*.txt -text\n"), ("a.txt", b"x\ny\nz\n")]);
+    let t3 = tree_of(&repo, &[(".veilattributes", b"*.txt -text\n"), ("a.txt", b"x\ny\nz\n")]);
     let r = repo.checkout_tree_recorded(&*fs, Some(&s2), &t3, &mut rec, None).unwrap();
     assert_eq!(r.kept_local, vec![p("a.txt")]);
     assert_eq!(fs.read(&p("a.txt")).unwrap(), b"x\r\ny\r\nmine\r\n");
@@ -222,12 +222,12 @@ fn a_file_the_user_wrote_with_crlf_is_not_wedged() {
     // Recorded LF by normalisation (never checked out), then switched away
     // under the same attributes: the file is ours to replace.
     let (mut repo, fs, _) = new_repo("alice");
-    fs.write(&p(".gitattributes"), b"* text\n").unwrap();
+    fs.write(&p(".veilattributes"), b"* text\n").unwrap();
     fs.write(&p("a.txt"), b"one\r\ntwo\r\n").unwrap();
     snap(&mut repo, &*fs);
     let t1 = wc_tree(&repo);
     assert_eq!(bytes_at(&repo, &t1, "a.txt"), b"one\ntwo\n");
-    let t2 = tree_of(&repo, &[(".gitattributes", b"* text\n"), ("a.txt", b"three\n")]);
+    let t2 = tree_of(&repo, &[(".veilattributes", b"* text\n"), ("a.txt", b"three\n")]);
     let r = repo.checkout_tree(&*fs, Some(&t1), &t2).unwrap();
     assert!(r.kept_local.is_empty(), "{:?}", r.kept_local);
     assert_eq!(fs.read(&p("a.txt")).unwrap(), b"three\n");
@@ -237,16 +237,16 @@ fn a_file_the_user_wrote_with_crlf_is_not_wedged() {
 
 #[test]
 fn without_device_drivers_named_drivers_are_built_ins() {
-    // A teammate's `.gitattributes` names a driver, and a tracked
+    // A teammate's `.veilattributes` names a driver, and a tracked
     // `config.toml` / `.veil.toml` "defines" it: the core knows only what
     // the device registered (nothing here), so the merge is the built-in
     // text merge.
     let (repo, _fs, _) = new_repo("alice");
     let cfg: &[u8] = b"[merge.pwn]\ncommand = [\"/bin/sh\", \"-c\", \"touch PWNED\"]\n";
     let ga: &[u8] = b"* merge=pwn diff=pwn\n";
-    let base = tree_of(&repo, &[(".gitattributes", ga), ("config.toml", cfg), (".veil.toml", cfg), ("a.txt", b"1\n2\n3\n")]);
-    let ours = tree_of(&repo, &[(".gitattributes", ga), ("config.toml", cfg), (".veil.toml", cfg), ("a.txt", b"one\n2\n3\n")]);
-    let theirs = tree_of(&repo, &[(".gitattributes", ga), ("config.toml", cfg), (".veil.toml", cfg), ("a.txt", b"1\n2\nthree\n")]);
+    let base = tree_of(&repo, &[(".veilattributes", ga), ("config.toml", cfg), (".veil.toml", cfg), ("a.txt", b"1\n2\n3\n")]);
+    let ours = tree_of(&repo, &[(".veilattributes", ga), ("config.toml", cfg), (".veil.toml", cfg), ("a.txt", b"one\n2\n3\n")]);
+    let theirs = tree_of(&repo, &[(".veilattributes", ga), ("config.toml", cfg), (".veil.toml", cfg), ("a.txt", b"1\n2\nthree\n")]);
     let out = veil_core::merge::merge_trees(repo.store(), Some(base), ours, theirs).unwrap();
     assert!(out.conflicts.is_empty());
     assert_eq!(bytes_at(&repo, &out.tree, "a.txt"), b"one\n2\nthree\n");
@@ -290,9 +290,9 @@ fn an_undefined_driver_name_is_reported_and_never_run() {
     let spy = Arc::new(Spy::default());
     repo.store().set_device_drivers(spy.clone());
     let ga: &[u8] = b"* merge=$(touch${IFS}x) diff=../../bin/sh\n";
-    let base = tree_of(&repo, &[(".gitattributes", ga), ("a.txt", b"1\n2\n3\n")]);
-    let ours = tree_of(&repo, &[(".gitattributes", ga), ("a.txt", b"one\n2\n3\n")]);
-    let theirs = tree_of(&repo, &[(".gitattributes", ga), ("a.txt", b"1\n2\nthree\n")]);
+    let base = tree_of(&repo, &[(".veilattributes", ga), ("a.txt", b"1\n2\n3\n")]);
+    let ours = tree_of(&repo, &[(".veilattributes", ga), ("a.txt", b"one\n2\n3\n")]);
+    let theirs = tree_of(&repo, &[(".veilattributes", ga), ("a.txt", b"1\n2\nthree\n")]);
     let out = veil_core::merge::merge_trees(repo.store(), Some(base), ours, theirs).unwrap();
     assert_eq!(bytes_at(&repo, &out.tree, "a.txt"), b"one\n2\nthree\n");
     assert!(spy.calls.lock().unwrap().is_empty());
@@ -310,7 +310,7 @@ fn sealed_tree(repo: &Repo, ga: &str, text: &str, v: &Visibility) -> ObjectId {
     e.size = text.len() as u64;
     e.visibility = v.clone();
     let gid = store.store_file(ga.as_bytes(), &Visibility::Public).unwrap();
-    let mut g = file(".gitattributes", gid);
+    let mut g = file(".veilattributes", gid);
     g.size = ga.len() as u64;
     raw_tree(repo, vec![g, e])
 }
@@ -399,7 +399,7 @@ fn a_huge_attributes_file_is_ignored_with_a_warning() {
     let (repo, fs, _) = new_repo("alice");
     let mut big = "* text eol=crlf\n".repeat((attributes::MAX_FILE / 16) + 1).into_bytes();
     big.truncate(attributes::MAX_FILE + 10);
-    fs.write(&p(".gitattributes"), &big).unwrap();
+    fs.write(&p(".veilattributes"), &big).unwrap();
     let a = Attrs::for_backend(repo.store(), &*fs);
     assert_eq!(a.for_path(&p("x.txt")).conversion, attributes::Conversion::None);
     assert!(a.warnings().iter().any(|w| w.contains("larger than")), "{:?}", a.warnings());
@@ -418,7 +418,7 @@ fn hostile_attributes_lines_are_bounded() {
     ga.extend_from_slice(format!("{star} text\n").as_bytes());
     ga.extend_from_slice(b"*.txt text\0* binary\n");
     let (repo, fs, _) = new_repo("alice");
-    fs.write(&p(".gitattributes"), &ga).unwrap();
+    fs.write(&p(".veilattributes"), &ga).unwrap();
     let a = Attrs::for_backend(repo.store(), &*fs);
     let start = std::time::Instant::now();
     let deep = format!("{}{}.m", "d/".repeat(200), "a".repeat(200));
@@ -458,7 +458,7 @@ fn many_nested_attributes_files_are_read_lazily() {
 #[test]
 fn a_megabyte_of_patterns_slows_a_snapshot_little() {
     // 20 000 files (some with CRLF), recorded once; then each snapshot
-    // with and without a 1 MiB `.gitattributes`.
+    // with and without a 1 MiB `.veilattributes`.
     let (mut repo, fs, _) = new_repo("alice");
     for i in 0..20_000 {
         let crlf = i % 50 == 0;
@@ -480,17 +480,17 @@ fn a_megabyte_of_patterns_slows_a_snapshot_little() {
         i += 1;
     }
     ga.push_str("*.e3 text\n");
-    fs.write(&p(".gitattributes"), ga.as_bytes()).unwrap();
+    fs.write(&p(".veilattributes"), ga.as_bytes()).unwrap();
     time(&mut repo, &mut cache);
     let with = (0..5).map(|_| time(&mut repo, &mut cache)).min().unwrap();
-    eprintln!("20 000 files: {plain:?} without, {with:?} with a 1 MiB .gitattributes ({i} patterns)");
+    eprintln!("20 000 files: {plain:?} without, {with:?} with a 1 MiB .veilattributes ({i} patterns)");
     // A loose bound (BUG-758: 1.2× failed under a loaded full suite). What
     // it guards against is matching every file against every pattern:
     // 20 000 files × tens of thousands of patterns, far slower than 2×.
     assert!(with.as_secs_f64() <= plain.as_secs_f64() * 2.0 + 0.1, "{plain:?} -> {with:?}");
 }
 
-// ---- 11. an unreadable .gitattributes ---------------------------------------------------
+// ---- 11. an unreadable .veilattributes ---------------------------------------------------
 
 #[test]
 fn an_outsider_with_a_sealed_gitattributes_checks_out_clean() {
@@ -498,7 +498,7 @@ fn an_outsider_with_a_sealed_gitattributes_checks_out_clean() {
     let main = commit_files(
         &mut alice,
         &*fs,
-        &[(".veilpolicy", ".gitattributes cloak team\n"), (".gitattributes", "*.txt eol=crlf\n"), ("a.txt", "one\ntwo\n")],
+        &[(".veilpolicy", ".veilattributes cloak team\n"), (".veilattributes", "*.txt eol=crlf\n"), ("a.txt", "one\ntwo\n")],
         "v1",
     );
     alice.set_tag("main", main, None, false).unwrap();
@@ -513,7 +513,7 @@ fn an_outsider_with_a_sealed_gitattributes_checks_out_clean() {
     let wc = MemoryBackend::new();
     let mut rec = Materialised::default();
     let r = bob.checkout_tree_recorded(&wc, None, &tree, &mut rec, None).unwrap();
-    assert!(r.redacted.contains(&p(".gitattributes")));
+    assert!(r.redacted.contains(&p(".veilattributes")));
     assert_eq!(wc.read(&p("a.txt")).unwrap(), b"one\ntwo\n", "defaults apply: no conversion");
     let (now, report) = bob.build_from_recorded(&wc, Some(tree), None, None, Some(&rec)).unwrap();
     assert_eq!(now, tree, "nothing to record: {report:?}");
@@ -531,9 +531,9 @@ fn an_outsider_with_a_sealed_gitattributes_checks_out_clean() {
 fn an_eol_crlf_conflict_resolves_in_an_editor_that_keeps_crlf() {
     let (mut repo, fs, _) = new_repo("alice");
     let ga: &[u8] = b"*.txt eol=crlf\n";
-    let base = tree_of(&repo, &[(".gitattributes", ga), ("a.txt", b"1\n2\n3\n")]);
-    let ours = tree_of(&repo, &[(".gitattributes", ga), ("a.txt", b"1\nOURS\n3\n")]);
-    let theirs = tree_of(&repo, &[(".gitattributes", ga), ("a.txt", b"1\nTHEIRS\n3\n")]);
+    let base = tree_of(&repo, &[(".veilattributes", ga), ("a.txt", b"1\n2\n3\n")]);
+    let ours = tree_of(&repo, &[(".veilattributes", ga), ("a.txt", b"1\nOURS\n3\n")]);
+    let theirs = tree_of(&repo, &[(".veilattributes", ga), ("a.txt", b"1\nTHEIRS\n3\n")]);
     let m = veil_core::merge::merge_trees(repo.store(), Some(base), ours, theirs).unwrap();
     assert_eq!(entry_at(&repo, &m.tree, "a.txt").unwrap().kind, EntryKind::Conflict);
     let mut rec = Materialised::default();
@@ -558,7 +558,7 @@ fn an_eol_crlf_conflict_resolves_in_an_editor_that_keeps_crlf() {
 #[test]
 fn an_overlay_writing_the_recorded_bytes_back_records_nothing() {
     let (mut repo, fs, _) = new_repo("alice");
-    let base = commit_files(&mut repo, &*fs, &[(".gitattributes", "*.txt eol=crlf\n"), ("a.txt", "x\ny\n")], "v1");
+    let base = commit_files(&mut repo, &*fs, &[(".veilattributes", "*.txt eol=crlf\n"), ("a.txt", "x\ny\n")], "v1");
     let mut eph = repo.ephemeral_workspace(base).unwrap();
     // A mount shows the recorded (LF) bytes; writing them back is no edit,
     // and neither is writing the CRLF form.
@@ -577,7 +577,7 @@ fn an_overlay_writing_the_recorded_bytes_back_records_nothing() {
 fn files_recorded_with_crlf_before_attributes_stay_until_edited() {
     let (mut repo, fs, _) = new_repo("alice");
     commit_files(&mut repo, &*fs, &[("a.txt", "x\r\ny\r\n"), ("b.txt", "p\r\nq\r\n")], "old");
-    fs.write(&p(".gitattributes"), b"*.txt text\n").unwrap();
+    fs.write(&p(".veilattributes"), b"*.txt text\n").unwrap();
     let out = repo.snapshot_workspace(WS, &*fs).unwrap();
     let t = wc_tree(&repo);
     assert_eq!(bytes_at(&repo, &t, "a.txt"), b"x\r\ny\r\n", "never re-recorded by itself");
@@ -592,7 +592,7 @@ fn files_recorded_with_crlf_before_attributes_stay_until_edited() {
     assert_eq!(bytes_at(&repo, &t, "b.txt"), b"p\r\nq\r\n");
     // `text=auto` keeps CRLF on an edit of a file recorded with CR (Git's
     // safer autocrlf), until renormalised.
-    fs.write(&p(".gitattributes"), b"*.txt text=auto\n").unwrap();
+    fs.write(&p(".veilattributes"), b"*.txt text=auto\n").unwrap();
     fs.write(&p("b.txt"), b"p\r\nq\r\nr\r\n").unwrap();
     snap(&mut repo, &*fs);
     assert_eq!(bytes_at(&repo, &wc_tree(&repo), "b.txt"), b"p\r\nq\r\nr\r\n");
@@ -601,7 +601,7 @@ fn files_recorded_with_crlf_before_attributes_stay_until_edited() {
 #[test]
 fn mixed_line_endings_are_recorded_unchanged_with_a_warning() {
     let (mut repo, fs, _) = new_repo("alice");
-    fs.write(&p(".gitattributes"), b"* text\n").unwrap();
+    fs.write(&p(".veilattributes"), b"* text\n").unwrap();
     fs.write(&p("mixed.txt"), b"a\r\nb\nc\r\n").unwrap();
     fs.write(&p("cr.txt"), b"a\rb\r\n").unwrap();
     let out = repo.snapshot_workspace(WS, &*fs).unwrap();
@@ -621,7 +621,7 @@ fn the_stat_cache_agrees_with_a_fresh_read() {
     // A converted file is recorded through the cache exactly as without
     // it, also after the attributes change.
     let (mut repo, fs, _) = new_repo("alice");
-    fs.write(&p(".gitattributes"), b"*.txt text\n").unwrap();
+    fs.write(&p(".veilattributes"), b"*.txt text\n").unwrap();
     fs.write(&p("a.txt"), b"x\r\ny\r\n").unwrap();
     fs.write(&p("i.png"), b"\x89PNG\r\n\x1a\n").unwrap();
     let mut cache = veil_core::statcache::StatCache::new();
@@ -633,7 +633,7 @@ fn the_stat_cache_agrees_with_a_fresh_read() {
     let t2 = run(&mut repo, &mut cache);
     assert_eq!(t1, t2);
     assert_eq!(bytes_at(&repo, &t1, "a.txt"), b"x\ny\n");
-    fs.write(&p(".gitattributes"), b"*.txt -text\n* text=auto\n").unwrap();
+    fs.write(&p(".veilattributes"), b"*.txt -text\n* text=auto\n").unwrap();
     let t3 = run(&mut repo, &mut cache);
     let fresh = repo.build_from(&*fs, Some(t1), None).unwrap().0;
     assert_eq!(entry_at(&repo, &t3, "a.txt"), entry_at(&repo, &fresh, "a.txt"));
@@ -651,10 +651,10 @@ fn a_followed_rename_merges_under_the_attributes_of_its_new_path() {
     for (ga, clean) in [("new/*.txt merge=union\n", true), ("old/*.txt merge=union\n", false)] {
         let (repo, _fs, _) = new_repo("alice");
         let g = ga.as_bytes();
-        let base = tree_of(&repo, &[(".gitattributes", g), ("old/a.txt", &lines_with(12, 5, "middle"))]);
+        let base = tree_of(&repo, &[(".veilattributes", g), ("old/a.txt", &lines_with(12, 5, "middle"))]);
         // Ours moves the file and edits a line; theirs edits the same line.
-        let ours = tree_of(&repo, &[(".gitattributes", g), ("new/a.txt", &lines_with(12, 5, "OURS"))]);
-        let theirs = tree_of(&repo, &[(".gitattributes", g), ("old/a.txt", &lines_with(12, 5, "THEIRS"))]);
+        let ours = tree_of(&repo, &[(".veilattributes", g), ("new/a.txt", &lines_with(12, 5, "OURS"))]);
+        let theirs = tree_of(&repo, &[(".veilattributes", g), ("old/a.txt", &lines_with(12, 5, "THEIRS"))]);
         let out = veil_core::merge::merge_trees(repo.store(), Some(base), ours, theirs).unwrap();
         assert!(entry_at(&repo, &out.tree, "old/a.txt").is_none(), "{ga}: the rename was followed");
         if clean {

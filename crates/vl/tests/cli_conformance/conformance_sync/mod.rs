@@ -12,8 +12,6 @@ mod clone;
 mod concurrency;
 mod formats;
 mod gc;
-mod git_bridge;
-mod git_roundtrip;
 mod integrity;
 mod large;
 mod push_pull;

@@ -3,10 +3,7 @@
 
 use crate::adversarial_support;
 
-use std::{
-    path::Path,
-    process::{Command, Stdio},
-};
+use std::process::Stdio;
 
 use adversarial_support::*;
 
@@ -143,53 +140,6 @@ fn a_requested_tag_that_is_held_back_fails_the_push() {
     let out = env.vl("alice", &proj, &["push", "mirror", "-t", "secret-line"]);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
     assert!(stderr(&out).contains("requested tag was not pushed: secret-line"), "{}", text(&out));
-}
-
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .current_dir(dir)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_AUTHOR_NAME", "Gita Hub")
-        .env("GIT_AUTHOR_EMAIL", "gita@example.com")
-        .env("GIT_COMMITTER_NAME", "Gita Hub")
-        .env("GIT_COMMITTER_EMAIL", "gita@example.com")
-        .args(["-c", "init.defaultBranch=main", "-c", "commit.gpgsign=false"])
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
-#[test]
-fn a_git_push_with_a_rejected_branch_fails_but_pushes_the_others() {
-    let env = Env::new();
-    let bare = env.root.join("github.git");
-    git(&env.root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
-    let proj = env.project("alice", "proj", &[("a.txt", "a\n")]);
-    env.ok("alice", &proj, &["git", "remote", "add", "github", bare.to_str().unwrap()]);
-    env.ok("alice", &proj, &["git", "push", "github"]);
-    let out = env.vl("alice", &proj, &["git", "push", "github"]);
-    assert!(out.status.success(), "nothing to do must succeed: {}", text(&out));
-
-    let work = env.root.join("work");
-    git(&env.root, &["clone", "-q", bare.to_str().unwrap(), work.to_str().unwrap()]);
-    write(&work, "b.txt", "b\n");
-    git(&work, &["add", "-A"]);
-    git(&work, &["commit", "-q", "-m", "b on GitHub"]);
-    git(&work, &["push", "-q", "origin", "main"]);
-
-    write(&proj, "c.txt", "c\n");
-    env.ok("alice", &proj, &["commit", "-m", "c"]);
-    env.ok("alice", &proj, &["tag", "set", "main", "-r", "@-"]);
-    env.ok("alice", &proj, &["tag", "set", "dev", "-r", "@-"]);
-    let out = env.vl("alice", &proj, &["git", "push", "github"]);
-    let all = text(&out);
-    assert_eq!(out.status.code(), Some(1), "{all}");
-    assert!(all.contains("rejected main") && all.contains("pushed dev"), "{all}");
-    assert!(stderr(&out).contains("error: 1 tag was rejected (main)"), "{all}");
-    assert!(all.contains("vl git pull github"), "{all}");
-    assert!(!git(&bare, &["rev-parse", "--verify", "refs/heads/dev"]).is_empty());
 }
 
 // ---- BUG-082: lock times ----------------------------------------------------

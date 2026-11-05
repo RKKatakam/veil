@@ -530,41 +530,6 @@ fn the_vault_never_reaches_a_public_remote() {
     assert_eq!(record_files(&*public, "team").len(), 1);
 }
 
-#[cfg(feature = "git")]
-#[test]
-fn the_vault_never_reaches_the_git_export() {
-    use std::process::Command;
-    let tmp = tempfile::tempdir().unwrap();
-    let bare = tmp.path().join("remote.git");
-    let st = Command::new("git")
-        .args(["init", "--bare", "-q", bare.to_str().unwrap()])
-        .status()
-        .unwrap();
-    assert!(st.success());
-    let bridge = tmp.path().join("bridge.git");
-    let mut alice = peer("alice");
-    set(&alice, SECRET_NAME, SECRET_VALUE);
-    let commit = adversarial_support::commit_files(&mut alice.repo, &*alice.fs, &[("README", "hello\n")], "c");
-    alice.repo.set_tag("main", commit, None, false).unwrap();
-    veil_core::git::remote_add(&mut alice.repo, "github", bare.to_str().unwrap()).unwrap();
-    veil_core::git::push(&mut alice.repo, &bridge, "github", &[], false).unwrap();
-    // Every byte of both Git repositories, loose and packed, decompressed.
-    for dir in [&bare, &bridge] {
-        let out = Command::new("git")
-            .current_dir(dir)
-            .args(["cat-file", "--batch-all-objects", "--batch"])
-            .output()
-            .unwrap();
-        assert!(out.status.success());
-        assert!(!out.stdout.is_empty());
-        let disk = veil_core::DiskBackend::new(dir);
-        for needle in [SECRET_NAME, SECRET_VALUE] {
-            assert!(!out.stdout.windows(needle.len()).any(|w| w == needle.as_bytes()), "{needle} in a Git object");
-            assert!(backend_contains(&disk, needle.as_bytes()).is_empty(), "{needle} in a Git file");
-        }
-    }
-}
-
 #[test]
 fn entries_sync_over_sftp_and_the_remote_holds_ciphertext_only() {
     let Some(server) = sftp_support::server() else { return };

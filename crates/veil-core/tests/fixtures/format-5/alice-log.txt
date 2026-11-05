@@ -1,0 +1,28 @@
+@  snzymwqr alice ✓ 2026-11-05 03:56:52 default@ bd774402 (empty)
+│  (no description set)
+○  wqltylnt alice ✓ 2026-11-05 03:56:52 main mirror/main origin/main 3232e09c [embargo:6675b55c4c]
+│ │  Fix B (embargoed)  ⇠ merges ookwqxyw, ylxuyros
+│ ○  ylxuyros alice ✓ 2026-11-05 03:56:52 fix-b@ 4059fb40 [cloaked:team]
+│ │  (no description set)
+│ │ ×  uoyvzlxk alice ✓ 2026-11-05 03:56:52 link-conflict mirror/link-conflict origin/link-conflict 683c1949 (conflict)
+│ │ │  a link/file conflict
+│ │ ○  suzlzuns alice ✓ 2026-11-05 03:56:52 links team-release[cloaked:team] v5.0 mirror/links mirror/v5.0 origin/links origin/team-release origin/v5.0 6734f8b6
+│ │ │  format 5: symlinks
+│ │ │ ×  kvwkyvrz alice ✓ 2026-11-05 03:56:51 conflicted mirror/conflicted origin/conflicted a6b9558b (conflict)
+│ │ │ │ │  keep side b's strings.rs  ⇠ merges twsntztm, rouzksor
+│ │ │ │ ○  rouzksor alice ✓ 2026-11-05 03:56:51 side-b@ 649f4ddc
+│ │ │ │ │  (no description set)
+│ │ │ ○ │  twsntztm alice ✓ 2026-11-05 03:56:51 side-a@ f176ac08
+│ │ │ │ │  (no description set)
+○          ookwqxyw alice ✓ 2026-11-05 03:56:51 4388f87b
+│  third: loose objects
+○  uvvutvxl alice ✓ 2026-11-05 03:56:50 e3009b32 [embargo:77821f6102 released]
+│ │  Fix A (released)  ⇠ merges xsxrpquu, roxzvxrx
+│ ○  roxzvxrx alice ✓ 2026-11-05 03:56:50 fix-a@ team-only[cloaked:team] origin/team-only 36477a9e [cloaked:team]
+│ │  (no description set)
+○    xsxrpquu alice ✓ 2026-11-05 03:56:50 ff2c3d9b
+│  second: edit docs and notes
+○  sprwskuw alice ✓ 2026-11-05 03:56:48 3e14c078
+│  initial import
+◆  zzzzzzzz 72edc798
+   root()

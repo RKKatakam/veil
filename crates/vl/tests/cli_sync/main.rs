@@ -1,4 +1,4 @@
-//! Remotes through the real `vl` binary: Git, SFTP and `vl serve`.
+//! Remotes through the real `vl` binary: SFTP and `vl serve`, and annotated tags.
 //!
 //! One test binary for several suites, to save linking time and disk: each
 //! module was its own binary before (`tests/<module>.rs`, or a directory
@@ -10,7 +10,6 @@
 #[path = "../adversarial_support/mod.rs"]
 mod adversarial_support;
 
-mod git_cli;
-mod git_parity_g_cli;
+mod annotated_tags_cli;
 mod serve_cli;
 mod sftp_cli;

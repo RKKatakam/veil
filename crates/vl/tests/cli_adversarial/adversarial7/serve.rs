@@ -96,11 +96,8 @@ fn a_served_commit_lands_in_the_served_repository() {
 
 /// The command line cannot pass a NUL in `-m` (an argument is a C string),
 /// but `describe`, `commit` and `new` over JSON-RPC take any JSON string
-/// (`serve.rs:786-812`, `message: String`) and record it. The description
-/// then reaches the Git export, where a NUL in a commit object is refused
-/// by any Git remote that checks objects (`receive.fsckObjects`,
-/// `nulInCommit`), and `vl git push` reports that as "has commits you don't
-/// have". A message the CLI could not have given should be refused.
+/// (`serve.rs:786-812`, `message: String`) and record it. A message the
+/// CLI could not have given should be refused.
 #[test]
 fn serve_refuses_a_nul_in_a_message() {
     let env = Env::new();

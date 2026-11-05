@@ -202,3 +202,16 @@ fn full_sync_still_walks_and_verifies_everything() {
     assert_eq!(again.objects_copied, 1, "exactly the damaged object is rewritten");
     fsck_ok(remote);
 }
+
+/// A remote URL's credentials never reach a hook or a message
+/// (`remote::redact_url`, moved from the removed Git transport).
+#[test]
+fn remote_url_credentials_are_redacted() {
+    use veil_core::remote::redact_url;
+    assert_eq!(redact_url("https://bob:tok_x@h:9/x"), "https://***@h:9/x");
+    assert_eq!(redact_url("https://tok_x@example.com/o/r"), "https://***@example.com/o/r");
+    assert_eq!(redact_url("ssh://alice:pw@host/r"), "ssh://alice:***@host/r");
+    assert_eq!(redact_url("ssh://alice@host/r"), "ssh://alice@host/r");
+    assert_eq!(redact_url("alice@host:o/r"), "alice@host:o/r");
+    assert_eq!(redact_url("https://host/a@b"), "https://host/a@b");
+}

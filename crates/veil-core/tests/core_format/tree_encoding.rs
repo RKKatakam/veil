@@ -1,8 +1,8 @@
 //! The binary tree encoding (repository format 2) is canonical: every valid
 //! tree has exactly one encoding, decoding accepts only that encoding, and
 //! the two encodings describe the same trees (see `docs/FORMAT.md`). Since
-//! format 5 that includes symlink and gitlink entries (flag bit 7 and a
-//! kind byte) and conflict terms of those kinds.
+//! format 5 that includes symlink entries (flag bit 7 and a kind byte) and
+//! conflict terms of that kind.
 
 use proptest::prelude::*;
 use veil_core::{
@@ -13,7 +13,7 @@ use veil_core::{
 fn entry_strategy() -> impl Strategy<Value = TreeEntry> {
     (
         "[a-zA-Z0-9._ é-]{1,12}",
-        prop_oneof![Just(EntryKind::File), Just(EntryKind::Dir), Just(EntryKind::Symlink), Just(EntryKind::Gitlink)],
+        prop_oneof![Just(EntryKind::File), Just(EntryKind::Dir), Just(EntryKind::Symlink)],
         any::<[u8; 32]>(),
         prop_oneof![Just(0u64), 1u64..200, any::<u64>()],
         any::<bool>(),
@@ -29,7 +29,7 @@ fn entry_strategy() -> impl Strategy<Value = TreeEntry> {
             kind,
             id: ObjectId(id),
             size,
-            // A symlink or gitlink is never executable (refused below).
+            // A symlink is never executable (refused below).
             executable: executable && !kind.is_special(),
             visibility,
             fallback: fallback.map(ObjectId),
@@ -182,8 +182,8 @@ fn special(kind: EntryKind) -> Vec<u8> {
 }
 
 #[test]
-fn symlink_and_gitlink_entries_round_trip_and_need_format_5() {
-    for (kind, byte) in [(EntryKind::Symlink, 1u8), (EntryKind::Gitlink, 2)] {
+fn symlink_entries_round_trip_and_need_format_5() {
+    for (kind, byte) in [(EntryKind::Symlink, 1u8)] {
         let raw = special(kind);
         // tag(10) | 02 | count | name_len | 'a' | flags (KIND|SIZE) | kind
         assert_eq!(&raw[10..16], &[0x02, 0x01, 0x01, b'a', 0x84, byte]);
@@ -211,8 +211,8 @@ fn hostile_special_entries_are_refused() {
         raw[flags_at] |= extra;
         assert!(corrupt(&raw), "flags {:#04x} accepted", raw[flags_at]);
     }
-    // Unknown kind bytes: "needs a newer vl".
-    for k in [0u8, 3, 4, 0x80, 0xff] {
+    // Unknown kind bytes: "needs a newer vl" (2 is reserved, never reused).
+    for k in [0u8, 2, 3, 4, 0x80, 0xff] {
         let mut raw = good.clone();
         raw[flags_at + 1] = k;
         assert!(matches!(Object::decode(&raw), Err(VeilError::Unsupported(_))), "kind {k}");
@@ -229,7 +229,7 @@ fn link_term_strategy() -> impl Strategy<Value = Option<veil_core::ConflictTerm>
     use veil_core::object::TermKind;
     proptest::option::of(
         (
-            prop_oneof![Just(TermKind::File), Just(TermKind::Symlink), Just(TermKind::Gitlink)],
+            prop_oneof![Just(TermKind::File), Just(TermKind::Symlink)],
             any::<[u8; 32]>(),
             prop_oneof![Just(0u64), 1u64..5000],
             any::<bool>(),

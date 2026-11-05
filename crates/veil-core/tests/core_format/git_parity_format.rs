@@ -1,11 +1,10 @@
-//! Repository format 5 (the Git-parity round): symlink and gitlink tree
-//! entries and conflict terms, annotated tags (`veil:atag`), and how every
-//! algorithm carries them before the working-copy and Git-bridge streams
-//! implement them (see `docs/FORMAT.md` §3.7–3.8).
+//! Repository format 5 (the Git-parity round): symlink tree entries and
+//! conflict terms, annotated tags (`veil:atag`), and how every algorithm
+//! carries them (see `docs/FORMAT.md` §3.7–3.8).
 //!
 //! Security properties tested here:
 //!
-//! * a sealed symlink target, a sealed gitlink pointer and a cloaked tag's
+//! * a sealed symlink target and a cloaked tag's
 //!   annotation (its sealed message) never reach a public remote, by any
 //!   route (property test over the secret strings);
 //! * an atag is pushed only with its tag, so an atag whose target is
@@ -94,8 +93,8 @@ fn annotate(repo: &Repo, name: &str, target: ObjectId, message: Text) -> ObjectI
 }
 
 /// Alice's format-5 repository: `main` (a public file), and `links` on it
-/// with a public symlink, a sealed symlink, a public and a sealed gitlink.
-fn links_repo(sealed_target: &str, sealed_pointer: &str) -> (Repo, Arc<MemoryBackend>, ObjectId, ObjectId) {
+/// with a public symlink and a sealed symlink.
+fn links_repo(sealed_target: &str) -> (Repo, Arc<MemoryBackend>, ObjectId, ObjectId) {
     let (mut alice, fs, _) = new_repo("alice");
     assert_eq!(alice.format(), 5);
     let main = commit_files(&mut alice, &*fs, &[("README", "hi\n")], "v1");
@@ -104,8 +103,6 @@ fn links_repo(sealed_target: &str, sealed_pointer: &str) -> (Repo, Arc<MemoryBac
     for (path, kind, content, vis) in [
         ("links/readme", EntryKind::Symlink, "../README", Visibility::Public),
         ("links/private", EntryKind::Symlink, sealed_target, team()),
-        ("vendor/sdk", EntryKind::Gitlink, "0123456789abcdef0123456789abcdef01234567\n", Visibility::Public),
-        ("vendor/private", EntryKind::Gitlink, sealed_pointer, team()),
     ] {
         let name = path.rsplit('/').next().unwrap();
         tree = put_at(&alice, tree, path, link(&alice, name, kind, content, vis));
@@ -121,18 +118,16 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: 12, ..ProptestConfig::default() })]
 
     /// Whatever the secret strings, a public push carries none of them: not
-    /// the sealed symlink target, not the sealed gitlink pointer, not the
+    /// the sealed symlink target, not the
     /// cloaked tag's sealed message (nor its atag), not a sealed message
     /// smuggled into a non-cloaked tag's atag. A team push carries them all
     /// (as ciphertext).
     #[test]
     fn a_public_push_never_carries_sealed_link_targets_or_cloaked_annotations(
         target in "/srv/[a-z]{6,12}-secret",
-        pointer in "[0-9a-f]{40}",
         notes in "release notes [a-z]{8,16}",
     ) {
-        let pointer = format!("{pointer}\n");
-        let (mut alice, _fs, _, links) = links_repo(&target, &pointer);
+        let (mut alice, _fs, _, links) = links_repo(&target);
         let sealed = alice.store().make_text(&notes, Some("team")).unwrap();
         let cloaked_atag = annotate(&alice, "team-release", links, sealed.clone());
         set_view_tag(&mut alice, "team-release", Tag { target: links, cloak: Some("team".into()), annotation: Some(cloaked_atag) });
@@ -147,7 +142,7 @@ proptest! {
         let report = remote::push(&mut alice, mirror.clone(), true, &[], false).unwrap();
         let skipped: Vec<&str> = report.tags_skipped.iter().map(|(n, _)| n.as_str()).collect();
         prop_assert!(skipped.contains(&"team-release") && skipped.contains(&"smuggled"), "{:?}", report.tags_skipped);
-        for secret in [target.as_bytes(), pointer.trim().as_bytes(), notes.as_bytes()] {
+        for secret in [target.as_bytes(), notes.as_bytes()] {
             prop_assert!(backend_contains(&*mirror, secret).is_empty(), "{:?} reached the public mirror", String::from_utf8_lossy(secret));
         }
         let m = Repo::open(mirror.clone(), None, "remote").unwrap();
@@ -206,7 +201,7 @@ fn an_annotation_of_embargo_withheld_history_stays_with_it() {
 
 #[test]
 fn forged_retargeted_and_transplanted_annotations_are_never_pushed() {
-    let (mut alice, _fs, main, links) = links_repo("/x", "fedcba9876543210fedcba9876543210fedcba98\n");
+    let (mut alice, _fs, main, links) = links_repo("/x");
     // Transplanted: v2's view entry names v1's genuine atag.
     let v1 = annotate(&alice, "v1", links, Text::Plain("one".into()));
     set_view_tag(&mut alice, "v2", Tag { target: links, cloak: None, annotation: Some(v1) });
@@ -239,7 +234,7 @@ fn forged_retargeted_and_transplanted_annotations_are_never_pushed() {
 /// warning), and a forged signature is never reported as signed.
 #[test]
 fn a_hostile_remotes_annotations_are_checked_on_pull() {
-    let (mut mallory, _fs, main, links) = links_repo("/x", "fedcba9876543210fedcba9876543210fedcba98\n");
+    let (mut mallory, _fs, main, links) = links_repo("/x");
     let genuine = annotate(&mallory, "v1", links, Text::Plain("one".into()));
     let retargeted = annotate(&mallory, "v3", links, Text::Plain("three".into()));
     // A forged signature: alice's key claimed, mallory's signature.
@@ -295,15 +290,10 @@ fn hostile_atag_names_never_decode() {
 
 #[test]
 fn gc_keeps_annotations_their_targets_and_link_objects() {
-    let (mut alice, _fs, main, links) = links_repo("/srv/x", "fedcba9876543210fedcba9876543210fedcba98\n");
-    // A target reachable only through a remote release tag's atag.
-    let only_tree = put_at(&alice, alice.snapshot(&main).unwrap().tree, "only/link", link(&alice, "link", EntryKind::Symlink, "../x", Visibility::Public));
-    let only = snapshot(&alice, main, only_tree, vec![]);
-    let release = annotate(&alice, "v0.9", only, Text::Plain("imported".into()));
+    let (mut alice, _fs, _main, links) = links_repo("/srv/x");
     let v1 = annotate(&alice, "v1.0", links, Text::Plain("one".into()));
     let mut tx = alice.transaction("tags").unwrap();
     tx.view.tags.insert("v1.0".into(), Tag { target: links, cloak: None, annotation: Some(v1) });
-    tx.view.remote_release_tags.insert("github/v0.9".into(), release);
     tx.commit().unwrap();
     let opts = GcOptions {
         grace: std::time::Duration::ZERO,
@@ -312,28 +302,24 @@ fn gc_keeps_annotations_their_targets_and_link_objects() {
     };
     let report = gc(&mut alice, &opts).unwrap();
     assert!(report.incomplete.is_empty(), "{:?}", report.incomplete);
-    for id in [v1, release, only, links] {
+    for id in [v1, links] {
         assert!(alice.store().has(&id), "gc deleted {}", id.short());
     }
     let tree = alice.snapshot(&links).unwrap().tree;
-    for path in ["links/readme", "links/private", "vendor/sdk", "vendor/private"] {
+    for path in ["links/readme", "links/private"] {
         let e = lookup(alice.store(), &tree, &p(path)).unwrap().unwrap();
         assert!(alice.store().has(&e.id), "gc deleted {path}");
     }
-    let e = lookup(alice.store(), &only_tree, &p("only/link")).unwrap().unwrap();
-    assert!(alice.store().has(&e.id));
     let f = fsck(alice.backend().clone(), alice.identity().cloned()).unwrap();
     assert!(f.findings.iter().all(|f| !matches!(f.severity, Severity::Corrupt | Severity::Warning)), "{:#?}", f.findings);
 }
 
 #[test]
-fn fsck_checks_link_and_gitlink_content() {
-    let (mut alice, _fs, main, _) = links_repo("/x", "fedcba9876543210fedcba9876543210fedcba98\n");
+fn fsck_checks_link_content() {
+    let (mut alice, _fs, main, _) = links_repo("/x");
     let mut tree = alice.snapshot(&main).unwrap().tree;
     for (path, kind, content) in [
         ("bad/nul", EntryKind::Symlink, "a\0b"),
-        ("bad/pointer", EntryKind::Gitlink, "not a commit\n"),
-        ("bad/upper", EntryKind::Gitlink, "0123456789ABCDEF0123456789abcdef01234567\n"),
     ] {
         let name = path.rsplit('/').next().unwrap();
         tree = put_at(&alice, tree, path, link(&alice, name, kind, content, Visibility::Public));
@@ -343,7 +329,7 @@ fn fsck_checks_link_and_gitlink_content() {
     let s = snapshot(&alice, main, tree, vec![]);
     set_view_tag(&mut alice, "bad", Tag::new(s, None));
     let f = fsck(alice.backend().clone(), alice.identity().cloned()).unwrap();
-    for (path, why) in [("bad/nul", "NUL"), ("bad/pointer", "Git commit id"), ("bad/upper", "Git commit id"), ("bad/long", "over")] {
+    for (path, why) in [("bad/nul", "NUL"), ("bad/long", "over")] {
         assert!(
             f.findings.iter().any(|x| x.severity == Severity::Warning && x.message.contains(path) && x.message.contains(why)),
             "{path}: {:#?}",
@@ -355,11 +341,10 @@ fn fsck_checks_link_and_gitlink_content() {
 // ---- carried, never misread -----------------------------------------------------
 
 /// Checkout writes a link as a link (replacing the file version it wrote
-/// before) and a gitlink as its submodule's empty directory, and the next
-/// snapshot keeps both entries unchanged (stream W1).
+/// before), and the next snapshot keeps the entry unchanged (stream W1).
 #[test]
 fn checkout_writes_links_and_the_builder_keeps_them() {
-    let (mut alice, fs, main, _) = links_repo("/x", "fedcba9876543210fedcba9876543210fedcba98\n");
+    let (mut alice, fs, main, _) = links_repo("/x");
     // `links/readme` is a file in `main`'s child, then a symlink.
     let file_tree = put_at(&alice, alice.snapshot(&main).unwrap().tree, "links/readme", TreeEntry {
         name: "readme".into(),
@@ -371,15 +356,13 @@ fn checkout_writes_links_and_the_builder_keeps_them() {
         fallback: None,
     });
     let link_tree = put_at(&alice, file_tree, "links/readme", link(&alice, "readme", EntryKind::Symlink, "../README", Visibility::Public));
-    let link_tree = put_at(&alice, link_tree, "vendor/sdk", link(&alice, "sdk", EntryKind::Gitlink, "0123456789abcdef0123456789abcdef01234567\n", Visibility::Public));
     let main_tree = alice.snapshot(&main).unwrap().tree;
     alice.checkout_tree(&*fs, Some(&main_tree), &file_tree).unwrap();
     assert_eq!(fs.read(&p("links/readme")).unwrap(), b"a file\n");
     let r = alice.checkout_tree(&*fs, Some(&file_tree), &link_tree).unwrap();
     assert!(r.failed.is_empty() && r.kept_local.is_empty(), "{r:?}");
     assert_eq!(fs.read_link(&p("links/readme")).unwrap(), b"../README");
-    assert_eq!(fs.metadata(&p("vendor/sdk")).unwrap().unwrap().kind, veil_core::vfs::NodeKind::Dir);
-    // The working copy's snapshot keeps both entries, unchanged.
+    // The working copy's snapshot keeps the entry, unchanged.
     let wc = snapshot(&alice, main, link_tree, vec![]);
     let mut tx = alice.transaction("wc").unwrap();
     tx.view.workspaces.get_mut(WS).unwrap().wc = wc;
@@ -387,7 +370,7 @@ fn checkout_writes_links_and_the_builder_keeps_them() {
     tx.commit().unwrap();
     let s = alice.snapshot_workspace(WS, &*fs).unwrap();
     let tree = alice.snapshot(&s.snapshot).unwrap().tree;
-    for path in ["links/readme", "vendor/sdk"] {
+    for path in ["links/readme"] {
         let want = lookup(alice.store(), &link_tree, &p(path)).unwrap().unwrap();
         assert_eq!(lookup(alice.store(), &tree, &p(path)).unwrap(), Some(want), "{path} lost by the snapshot");
     }
@@ -399,7 +382,7 @@ fn checkout_writes_links_and_the_builder_keeps_them() {
 /// of markers holding link targets).
 #[test]
 fn merges_never_merge_link_targets_by_line() {
-    let (mut alice, fs, main, _) = links_repo("/x", "fedcba9876543210fedcba9876543210fedcba98\n");
+    let (mut alice, fs, main, _) = links_repo("/x");
     let base_tree = put_at(&alice, alice.snapshot(&main).unwrap().tree, "l", link(&alice, "l", EntryKind::Symlink, "a\nb\nc\n", Visibility::Public));
     let base = snapshot(&alice, main, base_tree, vec![]);
     let side = |t: &str| {
@@ -435,7 +418,7 @@ fn merges_never_merge_link_targets_by_line() {
 #[test]
 fn format_4_repositories_refuse_links_annotations_and_link_terms() {
     let fs = Arc::new(MemoryBackend::new());
-    let mut r = Repo::init_for_clone_at(fs, Some(veil_core::Identity::generate("a")), "a", 4).unwrap();
+    let r = Repo::init_for_clone_at(fs, Some(veil_core::Identity::generate("a")), "a", 4).unwrap();
     let e = TreeEntry {
         name: "l".into(),
         kind: EntryKind::Symlink,
@@ -451,11 +434,6 @@ fn format_4_repositories_refuse_links_annotations_and_link_terms() {
     let t = |kind| Some(veil_core::ConflictTerm { kind, id: ObjectId([2; 32]), size: 0, executable: false, visibility: Visibility::Public, fallback: None });
     let c = veil_core::Conflict { adds: vec![t(TermKind::Symlink), t(TermKind::File)], removes: vec![None] };
     assert!(matches!(r.store().put_conflict(&c), Err(VeilError::Unsupported(_))));
-    let root = r.root_id();
-    let mut tx = r.transaction("t").unwrap();
-    tx.view.remote_release_tags.insert("github/v1".into(), ObjectId([3; 32]));
-    tx.view.heads.insert(root);
-    assert!(matches!(tx.commit(), Err(VeilError::Unsupported(_))));
 }
 
 /// The view fields are additive: a view without them serialises exactly as
@@ -465,22 +443,20 @@ fn view_fields_are_omitted_when_empty() {
     let mut v = veil_core::oplog::View::default();
     v.tags.insert("main".into(), Tag::new(ObjectId([1; 32]), None));
     let json = serde_json::to_string(&v).unwrap();
-    assert!(!json.contains("annotation") && !json.contains("remote_release_tags"), "{json}");
+    assert!(!json.contains("annotation"), "{json}");
     assert_eq!(json, format!(r#"{{"heads":[],"workspaces":{{}},"tags":{{"main":{{"target":"{}"}}}},"remote_tags":{{}}}}"#, "01".repeat(32)));
     v.tags.get_mut("main").unwrap().annotation = Some(ObjectId([2; 32]));
-    v.remote_release_tags.insert("github/v1".into(), ObjectId([3; 32]));
     let json = serde_json::to_string(&v).unwrap();
     assert!(json.contains(&format!(r#""annotation":"{}""#, "02".repeat(32))), "{json}");
-    assert!(json.contains(&format!(r#""remote_release_tags":{{"github/v1":"{}"}}"#, "03".repeat(32))), "{json}");
     assert_eq!(serde_json::from_str::<veil_core::oplog::View>(&json).unwrap(), v);
 }
 
 /// `walk_files`, the tree view and the reader-facing VFS: links are leaves,
 /// never directories, never read as file content (only their target, by
-/// `read_link`); a gitlink is its submodule's empty directory.
+/// `read_link`).
 #[test]
 fn tree_views_do_not_serve_links_as_files() {
-    let (alice, _fs, _, links) = links_repo("/x", "fedcba9876543210fedcba9876543210fedcba98\n");
+    let (alice, _fs, _, links) = links_repo("/x");
     let tree = alice.snapshot(&links).unwrap().tree;
     let view = veil_core::tree::TreeView::new(alice.store().clone(), tree);
     let listed: Vec<(String, veil_core::vfs::NodeKind)> = view.list_dir(&p("links")).unwrap().into_iter().map(|e| (e.name, e.kind)).collect();
@@ -488,8 +464,6 @@ fn tree_views_do_not_serve_links_as_files() {
     assert_eq!(view.metadata(&p("links/readme")).unwrap().unwrap().kind, veil_core::vfs::NodeKind::Symlink);
     assert!(view.read(&p("links/readme")).unwrap_err().is_not_found());
     assert_eq!(view.read_link(&p("links/readme")).unwrap(), b"../README");
-    assert_eq!(view.metadata(&p("vendor/sdk")).unwrap().unwrap().kind, veil_core::vfs::NodeKind::Dir);
-    assert!(view.list_dir(&p("vendor/sdk")).unwrap().is_empty());
     // `lookup` never descends into a link.
     assert!(lookup(alice.store(), &tree, &p("links/readme/x")).unwrap().is_none());
 }

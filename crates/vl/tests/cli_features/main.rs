@@ -17,7 +17,5 @@ mod duplicate_cli;
 mod git_parity_stubs;
 mod history_cli;
 mod hooks_cli;
-mod patch_cli;
-mod patch_phase2_cli;
 mod split_cli;
 mod symlinks_cli;

@@ -107,39 +107,6 @@ fn remote_add_refuses_invalid_names() {
     }
 }
 
-// Veil: a Veil remote and a Git remote share the `NAME/branch` remote-tag
-// namespace; `vl git remote add` refuses a Veil remote's name, the reverse
-// must hold too.
-#[test]
-fn remote_add_refuses_the_name_of_a_git_remote() {
-    let env = Env::new();
-    let proj = env.project("alice", "proj", &[("a", "a\n")]);
-    let bare = env.path("gh.git");
-    git(&env.root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
-    env.ok(
-        "alice",
-        &proj,
-        &["git", "remote", "add", "origin", bare.to_str().unwrap()],
-    );
-    env.fails("alice", &proj, &["remote", "add", "origin", "../hub"]);
-}
-
-// Control for the above: the Git side refuses a Veil remote's name.
-#[test]
-fn git_remote_add_refuses_the_name_of_a_veil_remote() {
-    let env = Env::new();
-    let proj = env.project("alice", "proj", &[("a", "a\n")]);
-    env.ok("alice", &proj, &["remote", "add", "origin", "../hub"]);
-    let bare = env.path("gh.git");
-    git(&env.root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
-    let out = env.fails(
-        "alice",
-        &proj,
-        &["git", "remote", "add", "origin", bare.to_str().unwrap()],
-    );
-    assert!(out.contains("already the name of a Veil remote"), "{out}");
-}
-
 // Scenario from git t5505-remote.sh / t5528: pushing or pulling a remote that is not configured.
 #[test]
 fn push_and_pull_to_an_unknown_remote_fail_with_a_hint() {

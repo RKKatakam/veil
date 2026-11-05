@@ -201,13 +201,10 @@ fn specs() -> Vec<(&'static str, Value)> {
                 "?": true, "id": "string", "kind": "string", "tagger": "string", "timestamp": "string|null",
                 "message": "string|null", "signer": "string|null", "verified": "bool", "status": "string",
             });
-            let mut maybe_target = snapshot_ref();
-            maybe_target["?"] = json!(true);
             json!({
                 "schema": "string",
-                "tags": [{"name": "string", "cloak": "string|null", "target": snapshot_ref(), "kind": "string", "git_ref": "string", "annotation": annotation}],
+                "tags": [{"name": "string", "cloak": "string|null", "target": snapshot_ref(), "kind": "string", "annotation": annotation}],
                 "remote_tags": [{"name": "string", "target": snapshot_ref()}],
-                "remote_release_tags": [{"name": "string", "target": maybe_target, "annotation": annotation}],
             })
         }),
         ("veil.op.log/1", json!({
