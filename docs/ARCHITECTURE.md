@@ -1,6 +1,6 @@
 # Veil architecture
 
-> **Visibility model:** `docs/VISIBILITY.md` is the source of truth for who can see what (per path: `public`, named groups or people, `secret` plus names, `local`; decided 2026-11-05). This document still describes the earlier model, where cloaking was the way to keep code private, until stream V lands. Where they disagree, VISIBILITY.md wins.
+> **Visibility model:** `docs/VISIBILITY.md` is the source of truth for who can see what (private by default, groups and admins, per-folder access, `public` for everyone; secrets encrypted automatically; decided 2026-11-05). This document still describes the earlier model, where cloaking was the way to keep code private, until stream V lands. Where they disagree, VISIBILITY.md wins.
 
 Veil is built as a stack of small layers. Each layer only depends on the ones
 below it, and nothing above the VFS layer knows a disk exists.

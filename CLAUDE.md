@@ -10,11 +10,17 @@ Crates:
 Read `docs/ARCHITECTURE.md` (its "Threat model" section has the trust boundary), `docs/FORMAT.md` and `docs/BUGS.md`.
 
 ## Who can see what
-**`docs/VISIBILITY.md` is the source of truth** for access, encryption, sharing, agents and the Hub. In short: one repository, and for each path `.veilpolicy` says **who** can see it. That is `public` (the internet, the default), names (groups or people; `members` = everyone with access), `secret` plus names (the only encrypted case: `.env`, keys), `local` (never leaves the machine) or `ignore`. One command: `vl access PATH WHO…`. There is no separate company or team system.
+**`docs/VISIBILITY.md` is the source of truth. Keep it simple; it's the ordinary permission model:**
+- the creator is the admin;
+- everything is **private** by default (admins only);
+- admins create **groups**, add people, choose **group managers**, and give groups or people access to folders (`vl access billing/ finance`);
+- **`public`** folders are visible to everyone on Earth.
+
+Veil automatically **encrypts secrets** (`.env`, keys), which follow the same permissions, and keeps **personal private keys** on the machine. There is no separate company or team tier.
 
 ## Invariants (never break these)
 - Veil does not interoperate with Git (no import, export, sync, colocation, submodules, Git file formats or Git-format patches). Owner decision, 2026-11-05: permanent.
-- Restricted (named), secret, local and embargoed content never reaches public snapshots, public remotes, logs, JSON or error messages. Secret content is only ever stored encrypted. Local content never leaves the machine.
+- Private, secret and embargoed content never reaches public snapshots, public remotes, logs, JSON or error messages, and nobody receives a file they have no access to. Secrets are only ever stored encrypted. Personal private keys never leave the machine.
 - Visibility labels are claims; objects are authority (`verify_sealing`).
 - Old repository formats stay readable. A format change bumps the version and adds a `vl upgrade` path.
 - Everything works offline. `veil-core` builds for WASM: OS-only code goes behind `#[cfg(feature = "os")]`.
