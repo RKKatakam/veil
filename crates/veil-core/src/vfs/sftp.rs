@@ -852,6 +852,17 @@ impl StorageBackend for SftpBackend {
         self.put(p, data, false)
     }
 
+    /// One `posix-rename@openssh.com` (after creating `to`'s directory):
+    /// a push publishes its staged packs this way, without copying them.
+    /// SFTP cannot sync a directory; the content was synced when written.
+    fn rename_unsynced(&self, from: &VPath, to: &VPath) -> Result<()> {
+        let (from, to) = (self.rp(from), self.rp(to));
+        if let Some(parent) = Self::parent_of(&to) {
+            self.mkdir_all(parent)?;
+        }
+        self.rename_over(&from, &to)
+    }
+
     fn sync_barrier(&self) -> Result<()> {
         let _serial = self.barrier.lock().unwrap_or_else(|e| e.into_inner());
         let batch = std::mem::take(&mut *self.unsynced.lock().unwrap());

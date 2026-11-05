@@ -521,9 +521,16 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             full,
             delete,
             hooks,
+            no_resume,
             ..
         } => {
-            let opts = remote::SyncOptions { full: *full, force_tags: *force_tags };
+            let opts = remote::SyncOptions {
+                full: *full,
+                force_tags: *force_tags,
+                no_resume: *no_resume,
+                chunk: push_chunk()?,
+                ..Default::default()
+            };
             return cmd_push(ctx, remote.as_deref().unwrap_or("origin"), tag, *force, &opts, delete, hooks);
         }
         Cmd::Pull { remote, full } => cmd_pull(ctx, remote, *full)?,
@@ -2476,7 +2483,13 @@ fn cmd_push(
         }
     }
     let (backend, cfg) = remote_backend(ctx, name)?;
-    let r = remote::push_with(&mut ctx.repo, backend, cfg.public, tags, force, opts)?;
+    // The journal of an interrupted push to this remote (its URL) is
+    // resumed: what it staged there is not sent again.
+    let opts = remote::SyncOptions {
+        journal: Some(cfg.url.clone()),
+        ..opts.clone()
+    };
+    let r = remote::push_with(&mut ctx.repo, backend, cfg.public, tags, force, &opts)?;
     remote::record_pushed_tags(&mut ctx.repo, name, &r)?;
     for (t, id) in &r.tags_updated {
         println!("  {} {} → {}", green("pushed"), cyan(&safe(t)), id.short());
@@ -2539,6 +2552,18 @@ fn cmd_push(
         ),
     };
     Ok(push_status(&rejected, &fix, &withheld))
+}
+
+/// The largest pack a push stages (`VEIL_PUSH_CHUNK`, e.g. `8M`; default
+/// 32 MiB): what one dropped connection makes a retry send again.
+fn push_chunk() -> Result<u64> {
+    match std::env::var("VEIL_PUSH_CHUNK") {
+        Ok(v) => match veil_core::vfs::parse_size(&v) {
+            Some(n) if n > 0 => Ok(n),
+            _ => bail!("VEIL_PUSH_CHUNK={v:?} is not a size (like 32M)"),
+        },
+        Err(_) => Ok(0),
+    }
 }
 
 /// `vl push --dry-run`: the plan, per remote. Exits 1 where the push would

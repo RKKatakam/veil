@@ -110,6 +110,9 @@ pub struct GcReport {
     pub pack_stats: PackStats,
     /// Why nothing was deleted, if the graph could not be fully read.
     pub incomplete: Vec<String>,
+    /// Push staging directories removed: uploads abandoned for more than a
+    /// week (on a remote, [`crate::remote::expire_push_staging`]).
+    pub push_staging_removed: usize,
 }
 
 /// The raw bytes gc puts into one pack before it starts the next. Packs
@@ -510,7 +513,12 @@ pub fn gc(repo: &mut Repo, opts: &GcOptions) -> Result<GcReport> {
     let _restore = FresheningOff(&store);
     store.invalidate()?;
     let now = opts.now.unwrap_or_else(now_millis);
-    let mut report = GcReport::default();
+    // Push staging is never inventoried (below): only abandoned staging is
+    // removed.
+    let mut report = GcReport {
+        push_staging_removed: crate::remote::expire_push_staging(&*backend, now)?,
+        ..GcReport::default()
+    };
 
     // 1. Inventory, strictly before the reachability scan.
     if let Some((name, why)) = store.broken_packs()?.first() {

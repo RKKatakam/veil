@@ -115,9 +115,6 @@ fixed**. Severity: high / medium / low.
   upgrade stays under the pre-standard construction (`docs/CRYPTO.md` §5).
 - **The policy pin does not forget an accepted weakening** when a teammate
   later reverts it (only dropped `public!` rules are forgotten).
-- **SFTP lease renewals can stall on slow uplinks** (below roughly 4 Mbit/s,
-  behind large pack writes), fencing the push; a per-operation in-flight cap
-  would fix it.
 - **A hostile SFTP server can still force up to the 4 GiB read ceiling**
   (`VEIL_SFTP_MAX_FILE`), since sizes come from the server.
 

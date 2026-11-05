@@ -308,14 +308,14 @@ pub fn plan_push_with(
         Repo::open_remote(ro)?
     };
     let mut report = SyncReport::default();
-    let (sendable, withheld) = remote::sendable_tags(local, public, only_tags, &mut report)?;
+    let (sendable, withheld, _) = remote::sendable_tags(local, public, only_tags, &mut report)?;
     let view = remote.view();
     let accepted = remote::accepted_tags(local, sendable, &view.tags, force, force_tags, &mut report)?;
     let tips: Vec<ObjectId> = accepted.iter().map(|(_, t)| t.target).collect();
-    let ids = remote::push_closure(local.store(), local.keys(), &tips, &withheld)?
-        .map_err(|why| VeilError::repo(format!("push: {why}")))?;
     let mut rec = PlanRecord::default();
-    let report = remote::push_incremental(local, &view.refs(), remote.store(), ids, public, report, Some(&mut rec))?;
+    let inv = remote::LazyInventory::new(remote.backend().clone());
+    let dest = remote::Dest::Plan(&mut rec);
+    let (report, _) = remote::push_incremental(local, &view.refs(), remote.store(), &tips, &withheld, public, report, dest, &inv, 0)?;
 
     let mut tags = Vec::new();
     for (name, tag) in &accepted {

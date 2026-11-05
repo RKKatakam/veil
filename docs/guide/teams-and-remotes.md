@@ -200,9 +200,45 @@ $ vl push --delete experiment
   references them and `vl -R <remote> gc` prunes them (see
   [Maintenance](maintenance.md)); every clone keeps what it pulled.
 
-Concurrent pushes to one remote are serialised by a lock on the remote. A
-client that crashes mid-push leaves a lease that the next push takes over
-after at most about 45 seconds.
+### Many pushers, and interrupted pushes
+
+A push uploads first and publishes second. The upload goes into a
+directory of its own on the remote (`.veil/objects/incoming/push-…`),
+which nobody else reads, in packs of at most 32 MiB, and takes no lock:
+any number of teammates, agents or CI jobs can upload to one remote at
+once. Only the publication takes the remote's lock, for a few round trips
+whatever the size of the push: it checks that the tags may still move
+(someone may have pushed meanwhile; a tag that diverged is rejected as
+usual), renames the uploaded packs into place and records the push.
+
+If the connection drops, or you press Ctrl-C, nothing of the push is
+visible on the remote. Run `vl push` again: it finds what it already
+uploaded (it keeps a note in `.veil/local/push/`) and sends only the rest.
+
+```text
+$ vl push origin
+error: … connection reset
+$ vl push origin
+  pushed main → 9d81e0b2
+Pushed 412 object(s) to origin
+```
+
+* `vl push --no-resume` starts the upload afresh instead.
+* `VEIL_PUSH_CHUNK` (for example `8M`) sets the largest upload piece: the
+  most a dropped connection makes the next push send again.
+* An upload that is never resumed is removed by any push or
+  `vl -R <remote> gc` once it has been untouched for a week;
+  `vl doctor --remotes` lists those untouched for over a day.
+* On a **public** remote, the upload of a push whose tags were rejected
+  meanwhile is removed at once: what was not published stays unpublished.
+  Whatever is uploaded has passed the same filter as a publication (nothing
+  cloaked, isolated or embargoed).
+* An embargo release staged with `vl embargo release` is published by the
+  push. If it is taken back (`vl undo`) while the push runs, the push
+  notices before it publishes, and withholds the fix again.
+
+A client that crashes while publishing leaves a lease that the next push
+takes over after at most about 45 seconds.
 
 ## Onboarding a teammate
 

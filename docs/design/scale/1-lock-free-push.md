@@ -53,7 +53,8 @@ Phase B costs about `6 + 2 × packs` round trips. For a 1 GiB push in 32 MiB chu
 
 - **Crash or dropped connection in phase A.** The next `vl push` to the same remote finds the journal.
   - If `local_op`'s view still reaches the same tips, the push resumes: staged packs whose `.idx` exists are reused (their objects count as known), and `.vltmp` files in its own staging directory are removed.
-  - Otherwise the journal is discarded and phase A starts afresh. The staged packs are still reused as known objects if they are present.
+  - Otherwise the journal is discarded and phase A starts afresh.
+  - *As built (stream P adversarial fixes, BUG-808):* there is no tips check. A staged pack is reused, and published, only if the new attempt's own walk meets every object in it; otherwise its staging is removed and phase A starts afresh. Reusing staged packs as known objects whatever the plan (the sketch above) would publish what the plan no longer sends: a change embargoed, cloaked or withdrawn after the interrupted attempt.
 - **Crash in phase B before the operation.** Published packs are invisible garbage until something references them. The retry counts the objects in packs named by its journal as known, after checking that those packs exist under `pack/` (step 4 covers both places).
 - **Crash after the operation.** The retry finds the tags already at their targets, which is a no-op. The journal is then cleared.
 - **`vl push --no-resume`** discards the journal. `vl push --dry-run` never reads or writes it.

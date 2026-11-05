@@ -553,7 +553,12 @@ impl GraphIndex {
 
     /// The generation of snapshot `id`; `None` if the store does not hold it.
     pub fn generation(&self, repo: &Repo, id: &ObjectId) -> Result<Option<Gen>> {
-        self.with(repo, |w| Ok(w.entry(id)?.map(|e| e.generation)))
+        Ok(self.entry(repo, id)?.map(|e| e.generation))
+    }
+
+    /// The entry of snapshot `id`; `None` if the store does not hold it.
+    pub fn entry(&self, repo: &Repo, id: &ObjectId) -> Result<Option<Entry>> {
+        self.with(repo, |w| w.entry(id))
     }
 
     /// Is `a` an ancestor of (or equal to) `b`?
