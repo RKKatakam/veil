@@ -106,13 +106,6 @@ impl Repo {
     /// member's own edits (then an edit of `.veilpolicy` is theirs, and is
     /// accepted). `None` when anything else may have written `.veilpolicy`
     /// since: a difference is then guarded like any incoming change.
-    ///
-    /// In colocated Git mode `checked_out_from` is ignored: Git may write
-    /// `.veilpolicy` between two `vl` commands by any route (a pull, a
-    /// checkout, `stash pop`, a `reset --soft` that takes a pulled commit
-    /// out of `HEAD` but leaves its files), so a difference from the
-    /// recorded version is never taken as the member's own edit (BUG-759).
-    /// Only a `vl` command's own edit is ([`Repo::snapshot_policy_edit`]).
     pub(crate) fn snapshot_policy(&self, fs: &dyn StorageBackend, checked_out_from: Option<&ObjectId>) -> Result<WorkingCopyPolicy> {
         if !self.is_own_working_copy(fs) {
             return Ok(WorkingCopyPolicy {
@@ -120,36 +113,11 @@ impl Repo {
                 accept: None,
             });
         }
-        if self.is_colocated() {
-            let mut wp = policy::working_copy_policy_colocated(&*self.backend, fs)?;
-            wp.policy.edits_unattributed = true;
-            return Ok(wp);
-        }
         let parent = match checked_out_from {
             Some(tree) => self.policy_text_in(tree)?,
             None => None,
         };
         policy::working_copy_policy(&*self.backend, fs, parent.as_ref().map(|t| t.as_deref()))
-    }
-
-    /// [`Repo::snapshot_policy`] after a `vl` command changed `.veilpolicy`
-    /// itself (`edit`), in the working copy checked out from `tree`. In
-    /// colocated Git mode exactly that edit is the member's (while the file
-    /// holds what the command wrote); otherwise, as for any snapshot, every
-    /// difference from `tree`'s version.
-    pub(crate) fn snapshot_policy_edit(&self, fs: &dyn StorageBackend, tree: &ObjectId, edit: policy::PolicyEdit<'_>) -> Result<WorkingCopyPolicy> {
-        if !self.is_own_working_copy(fs) || !self.is_colocated() {
-            return self.snapshot_policy(fs, Some(tree));
-        }
-        let mut wp = policy::working_copy_policy_after_edit(&*self.backend, fs, edit)?;
-        wp.policy.edits_unattributed = true;
-        Ok(wp)
-    }
-
-    /// Is the project directory colocated with a Git repository (Git may
-    /// write any file of it between two `vl` commands)?
-    pub fn is_colocated(&self) -> bool {
-        self.config().colocated.is_some()
     }
 
     /// Record what [`Repo::snapshot_policy`] decided to accept.

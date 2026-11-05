@@ -183,8 +183,7 @@ $ vl push --delete experiment
 * **A push never moves a release tag on the remote** without
   `--force-tags`, not even forward: after `vl tag set v1.0 --force` here,
   `vl push` rejects `v1.0` (`release tag: the remote's is at 3f2a91c0;
-  replacing a release takes --force-tags`) and pushes the rest, as
-  `vl git push` does for Git tags.
+  replacing a release takes --force-tags`) and pushes the rest.
 * **A tag you deleted stays deleted.** The next `vl pull` doesn't bring it
   back while the remote's tag is still where it was (`kept deleted
   experiment`), and `origin/experiment` keeps showing what the remote holds

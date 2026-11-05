@@ -336,7 +336,7 @@ impl Ctx {
 
     /// Record the project directory into the attached workspace.
     pub fn snapshot(&mut self) -> Result<()> {
-        self.record(None, false, None, &[])
+        self.record(None, false, &[])
     }
 
     /// Record the project directory as operation `description`: for commands
@@ -355,16 +355,10 @@ impl Ctx {
     /// `.veilpolicy` from another revision: it is guarded by the accepted
     /// policy like any incoming change, never taken as the member's edit.
     pub fn snapshot_restored(&mut self, description: String, policy_incoming: bool, carried: &[(VPath, veil_core::TreeEntry)]) -> Result<()> {
-        self.record(Some(description), policy_incoming, None, carried)
+        self.record(Some(description), policy_incoming, carried)
     }
 
-    fn record(
-        &mut self,
-        description: Option<String>,
-        policy_incoming: bool,
-        policy_edit: Option<veil_core::policy::PolicyEdit<'_>>,
-        carried: &[(VPath, veil_core::TreeEntry)],
-    ) -> Result<()> {
+    fn record(&mut self, description: Option<String>, policy_incoming: bool, carried: &[(VPath, veil_core::TreeEntry)]) -> Result<()> {
         // A move of the directory that a previous command started and did
         // not finish (killed, disk full): finish it before recording
         // anything, or the half-moved directory would be recorded as the
@@ -381,7 +375,7 @@ impl Ctx {
             if attempt > 0 {
                 std::thread::sleep(record_backoff(attempt));
             }
-            if self.record_once(description.clone(), policy_incoming, policy_edit, carried)? {
+            if self.record_once(description.clone(), policy_incoming, carried)? {
                 return Ok(());
             }
             // The process that moved it also recorded what the directory
@@ -396,13 +390,7 @@ impl Ctx {
 
     /// One attempt of [`Ctx::record`]; `false` if the workspace moved
     /// before the snapshot could be recorded.
-    fn record_once(
-        &mut self,
-        description: Option<String>,
-        policy_incoming: bool,
-        policy_edit: Option<veil_core::policy::PolicyEdit<'_>>,
-        carried: &[(VPath, veil_core::TreeEntry)],
-    ) -> Result<bool> {
+    fn record_once(&mut self, description: Option<String>, policy_incoming: bool, carried: &[(VPath, veil_core::TreeEntry)]) -> Result<bool> {
         let view_wc = self.wc()?;
         let disk = self.fs.clone();
         let fs: &dyn StorageBackend = &*disk;
@@ -481,16 +469,6 @@ impl Ctx {
             self.save_cache();
             return Ok(true);
         }
-        // Colocated Git mode: an edit of `.veilpolicy` is the member's own
-        // only if Git cannot have written it (BUG-759).
-        let attributed = match (policy_incoming, policy_edit) {
-            (false, None) => self.colocated_own_policy_edit(&view_wc)?,
-            _ => None,
-        };
-        let policy_edit = policy_edit.or(attributed
-            .as_ref()
-            .map(|(before, after)| veil_core::policy::PolicyEdit { before, after }));
-        let keep = self.keep_recorded();
         let out = self.repo.snapshot_workspace_with(
             &self.ws,
             fs,
@@ -499,7 +477,6 @@ impl Ctx {
                 materialised: Some(&self.checkout.materialised),
                 description,
                 policy_incoming,
-                policy_edit,
                 expected_wc: Some(view_wc),
                 carried,
                 ..Default::default()
@@ -518,45 +495,6 @@ impl Ctx {
             save_checkout(&self.fs, &self.checkout)?;
         }
         Ok(true)
-    }
-
-    /// The tracked paths snapshots keep at their recorded entry: the
-    /// session's (the user's own hidden files, BUG-745) and
-    /// [`Ctx::keep_extra`].
-    fn keep_recorded(&self) -> Option<std::collections::BTreeSet<VPath>> {
-        let mut keep = self.git.as_ref().map(|g| g.keep.clone()).unwrap_or_default();
-        keep.extend(self.keep_extra.iter().cloned());
-        (!keep.is_empty()).then_some(keep)
-    }
-
-    /// Colocated Git mode: the edit of `.veilpolicy` the directory holds
-    /// since `wc` was recorded (`before`, `after`), if Git cannot have
-    /// written it (`colocate_cmd::git_may_have_written_policy`), so it is
-    /// the member's own. `None` in any other mode, or when it may be Git's:
-    /// the snapshot then takes it as incoming (BUG-759).
-    fn colocated_own_policy_edit(&self, wc: &ObjectId) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        if !self.repo.is_colocated() {
-            return Ok(None);
-        }
-        let Some(git_dir) = veil_core::git::colocate::colocated_git_dir(&self.root) else {
-            return Ok(None);
-        };
-        let veil_core::policy::PolicyFile::File(after) = veil_core::policy::read_policy_file(&*self.fs)? else {
-            return Ok(None);
-        };
-        let tree = self.repo.snapshot(wc)?.tree;
-        let before = match lookup(self.repo.store(), &tree, &VPath::new(POLICY_FILE)?)? {
-            None => Vec::new(),
-            Some(e) if e.kind.is_file_like() => match veil_core::conflict::read_file_like(self.repo.store(), &e) {
-                Ok(b) => b,
-                Err(_) => return Ok(None),
-            },
-            Some(_) => return Ok(None),
-        };
-        if before == after || crate::colocate_cmd::git_may_have_written_policy(&self.root, &git_dir, &after) {
-            return Ok(None);
-        }
-        Ok(Some((before, after)))
     }
 
     /// Record the project directory as operation `description`, with line
@@ -754,7 +692,7 @@ impl Ctx {
         // the next snapshot) which local files keep their protection.
         let policy_of = |t: &ObjectId| lookup(self.repo.store(), t, &VPath::new(POLICY_FILE).expect("valid"));
         if policy_of(&from)? != policy_of(&to_snap.tree)? {
-            render::print_policy_held_back(&self.repo.policy_held_back(&*self.fs)?, false, false);
+            render::print_policy_held_back(&self.repo.policy_held_back(&*self.fs)?, false);
         }
         if previous != target {
             eprintln!("Working copy now at: {}", render::one_line(&self.repo, &target));

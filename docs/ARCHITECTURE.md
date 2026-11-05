@@ -631,22 +631,6 @@ CAS, and it applies these rules in order:
      `undo`, `op restore`, `merge`, `rebase`) moves the working
      copy to a tree that holds the incoming policy, so there is no
      difference to mistake for an edit (`policy_routes_cli.rs` covers each).
-   * **Colocated Git mode** (BUG-759): Git may write `.veilpolicy` between
-     two commands without moving `HEAD` (`git reset --soft` after a pull,
-     `git stash pop`, `git checkout REV -- .veilpolicy`), so a difference
-     from the recorded version proves nothing. `Repo::snapshot_policy`
-     takes none as the member's edit there
-     (`policy::working_copy_policy_colocated`); only an explicit
-     `SnapshotOptions::policy_edit` is: `vl cloak|isolate|expose|ignore`
-     and `vl policy import-gitignore` pass the text they read and wrote,
-     and `Ctx` passes a hand edit only when Git cannot have written it
-     (`colocate_cmd::git_may_have_written_policy`: no Git operation in
-     progress, no unmerged entry or conflict-marker line, and the content,
-     cleaned as `git add` would, is no blob Git has). The edit counts only
-     while the file holds that exact text. A policy that is never weaker
-     than the accepted one for any path (the exhaustive check above) is
-     accepted in colocated mode whoever wrote it, so a protection added by
-     hand stays pinned; anything weaker waits for `vl policy accept`.
    * What is at `.veilpolicy` never makes a snapshot less protected than
      the accepted policy (`policy::read_policy_file`, BUG-106/107). A
      **missing** file is not taken as the member's edit (deleting every rule
@@ -2108,10 +2092,9 @@ remains is mostly the one `lstat` per file and the per-directory
    snapshot that deleted every file of the fix keeps the wrapper
    (`embargo::wrap_line`, where `wrap` would return the bare fallback), and
    a working-copy tree that is not wrapped although an ancestor is an
-   unreleased embargoed merge (a Git commit the colocated follow imported
-   on top of it) gets wrapped at its next change, with its parent's public
-   view as the fallback (`Repo::keep_line_embargo`). Otherwise the line
-   would leave the embargo, and the fix put back (`git stash pop`, an
+   unreleased embargoed merge gets wrapped at its next change, with its
+   parent's public view as the fallback (`Repo::keep_line_embargo`).
+   Otherwise the line would leave the embargo, and the fix put back (an
    editor's undo) would be recorded, committed and pushed as public.
    Descriptions written on such a line by a key holder (`commit`, `describe`,
    `new -m`, squash, a plain merge into it) are sealed under the embargo key

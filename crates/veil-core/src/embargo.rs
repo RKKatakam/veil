@@ -211,8 +211,8 @@ pub fn wrap(store: &ObjectStore, embargo: &str, tree: &ObjectId, fallback: &Obje
 /// (BUG-761): a line under an unreleased embargo stays under it. A
 /// snapshot that deleted every file of the fix has the fallback's tree;
 /// unwrapped, it would take the line out of the embargo, and the next
-/// snapshot would record a file put back (the fix itself: `git stash
-/// pop`, an editor's undo) as a public edit, which a commit and a push
+/// snapshot would record a file put back (the fix itself, by an
+/// editor's undo) as a public edit, which a commit and a push
 /// publish before the release.
 pub fn wrap_line(store: &ObjectStore, embargo: &str, tree: &ObjectId, fallback: &ObjectId) -> Result<ObjectId> {
     for id in [tree, fallback] {

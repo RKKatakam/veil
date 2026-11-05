@@ -48,11 +48,6 @@ pub struct SnapshotOptions<'a> {
     /// guarded by the accepted policy like any incoming change (see
     /// [`crate::policy::working_copy_policy`]).
     pub policy_incoming: bool,
-    /// The command changed `.veilpolicy` itself (`vl cloak`, `vl expose`):
-    /// in colocated Git mode, where nothing else found in the working copy
-    /// is taken as the member's own edit, this edit is (see
-    /// [`Repo::snapshot_policy`](crate::repo::Repo)).
-    pub policy_edit: Option<crate::policy::PolicyEdit<'a>>,
     /// The files of `fs` were written by a command, not edited by the
     /// member (a `vl ws exec` sandbox, a mount): an edit of `.veilpolicy`
     /// is the command's, so the recorded policy pins it, as the accepted
@@ -213,12 +208,9 @@ struct BuildParams<'a> {
     injected: Option<&'a InjectedSecrets>,
     materialised: Option<&'a Materialised>,
     policy_incoming: bool,
-    policy_edit: Option<crate::policy::PolicyEdit<'a>>,
     policy_from_command: bool,
     carried: &'a [(VPath, crate::object::TreeEntry)],
-    only: Option<&'a crate::vfs::SparseSet>,
     line_endings: LineEndings<'a>,
-    keep_recorded: Option<&'a std::collections::BTreeSet<VPath>>,
 }
 
 /// A tree built from a working copy, with the policy that classified it.
@@ -266,20 +258,11 @@ fn build_wc_tree(
     // What `fs` was materialised from: the working copy, with the
     // entries a command put back in place of its own.
     let parent_tree = with_carried(&store, wc.tree, p.carried)?;
-    let restricted;
-    let fs: &dyn StorageBackend = match p.only {
-        Some(set) => {
-            restricted = crate::vfs::SparseView::new(fs, store.clone(), parent_tree, set);
-            &restricted
-        }
-        None => fs,
-    };
     // `fs` was checked out from `wc.tree`: a `.veilpolicy` edit is the
     // member's, unless a command wrote it from elsewhere (or wrote the
     // files at all).
-    let (wp, command_edit) = recording_policy(repo, fs, &parent_tree, p.policy_from_command, || match p.policy_edit {
-        Some(edit) if !p.policy_incoming => repo.snapshot_policy_edit(fs, &wc.tree, edit),
-        _ => repo.snapshot_policy(fs, (!p.policy_incoming).then_some(&wc.tree)),
+    let (wp, command_edit) = recording_policy(repo, fs, &parent_tree, p.policy_from_command, || {
+        repo.snapshot_policy(fs, (!p.policy_incoming).then_some(&wc.tree))
     })?;
     let line_base = || Ok(repo.parents_tree(&wc.parents)?.tree);
     let (tree, mut report) = build_tree_cached(
@@ -294,7 +277,6 @@ fn build_wc_tree(
             materialised: p.materialised,
             line_base: Some(&line_base),
             line_endings: p.line_endings,
-            keep_recorded: p.keep_recorded,
         },
         cache,
     )?;
@@ -378,7 +360,6 @@ impl Repo {
             materialised,
             description,
             policy_incoming,
-            policy_edit,
             policy_from_command,
             expected_wc,
             carried,
@@ -389,12 +370,9 @@ impl Repo {
             injected,
             materialised,
             policy_incoming,
-            policy_edit,
             policy_from_command,
             carried,
-            only,
             line_endings,
-            keep_recorded,
         };
         // 1. Scan without the lock.
         let probe = match self.backend.is_network() {
@@ -591,11 +569,10 @@ impl Repo {
     /// builder keeps a tree under its parent's wrapper; this covers a line
     /// whose tree is not wrapped although an ancestor of `line` (the
     /// snapshot being amended, or the base of a new one) is an unreleased
-    /// embargoed merge: a Git commit the colocated follow imported on top
-    /// of it, a tree the follow built for a new change there. A new
-    /// `tree` there is wrapped under that embargo, with `parent_tree`'s
-    /// public view as what everyone else sees, so what it adds (the fix put
-    /// back, `git stash pop`) is sealed until the release; without the
+    /// embargoed merge (a snapshot that deleted the fix's files took the
+    /// line off the wrapper). A new `tree` there is wrapped under that
+    /// embargo, with `parent_tree`'s public view as what everyone else
+    /// sees, so what it adds (the fix put back) is sealed until the release; without the
     /// embargo's key, its edits are held back as the builder holds them.
     pub(crate) fn keep_line_embargo(&self, line: &ObjectId, parent_tree: &ObjectId, tree: ObjectId, report: &mut BuildReport) -> Result<ObjectId> {
         let store = &self.store;

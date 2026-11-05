@@ -141,7 +141,7 @@ pub struct SyncOptions {
     pub full: bool,
     /// Push: move release tags (annotated, format 5) that the remote holds
     /// with another target (BUG-710: a release is immutable; replacing one
-    /// takes this, as `vl git push --force-tags` does for Git tags).
+    /// takes this).
     pub force_tags: bool,
 }
 
@@ -1693,7 +1693,7 @@ pub(crate) fn accepted_tags(
         if let Some(existing) = remote_tags.get(&name) {
             // A release tag (annotated, on either side) is never moved on
             // the remote without `--force-tags` (BUG-710), even forward.
-            // With it, the release is replaced, as a Git tag is.
+            // With it, the release is replaced.
             let release = existing.annotation.is_some() || tag.annotation.is_some();
             if existing.target != tag.target && release {
                 if !force_tags {

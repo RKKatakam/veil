@@ -1592,7 +1592,6 @@ fn cmd_policy_rules(ctx: &mut Ctx, patterns: &[String], tier: Tier, force: bool)
             }
         }
     };
-    let before = text.clone();
     if !text.ends_with('\n') {
         text.push('\n');
     }
@@ -1636,7 +1635,7 @@ fn cmd_policy_rules(ctx: &mut Ctx, patterns: &[String], tier: Tier, force: bool)
         Tier::Isolated => "isolate",
         Tier::Ignored => "ignore",
     };
-    ctx.snapshot_policy_edit(format!("{verb} {}", patterns.join(" ")), before.as_bytes(), text.as_bytes())?;
+    ctx.snapshot_as(format!("{verb} {}", patterns.join(" ")))?;
     Ok(())
 }
 
@@ -2488,7 +2487,7 @@ fn cmd_push(
     // A release tag the remote moved is never merged or pulled into ours
     // (BUG-703): someone has to decide which one is the release.
     // A release is never replaced on the remote without --force-tags
-    // (BUG-710), as `vl git push` does for Git tags.
+    // (BUG-710).
     let release = rejected.iter().find(|t| {
         r.tags_skipped.iter().any(|(n, why)| n == *t && why.starts_with("release tag"))
             || ctx.repo.view().tags.get(*t).is_some_and(|t| t.annotation.is_some())
