@@ -59,7 +59,6 @@ fn control_a_changed_script_named_by_its_path_does_not_run() {
 /// device that trusted the hook once. `vl hooks trust` prints `tools
 /// directory` as a pinned file, which reads as if it were pinned.
 #[test]
-#[ignore = "BUG-700: a directory named by a trusted .veilhooks command is not pinned; changed code in it runs"]
 fn a_changed_file_inside_a_trusted_directory_argument_does_not_run() {
     let env = Env::new();
     let m = markers(&env);
@@ -86,7 +85,6 @@ fn a_changed_file_inside_a_trusted_directory_argument_does_not_run() {
 /// and empty components) and is neither pinned nor replaced by its trusted
 /// copy: `sh` reads whatever the file holds at commit time.
 #[test]
-#[ignore = "BUG-701: ./path arguments of a trusted .veilhooks command are never pinned; a changed script runs"]
 fn a_changed_script_named_with_a_dot_slash_does_not_run() {
     let env = Env::new();
     let m = markers(&env);
@@ -109,7 +107,6 @@ fn a_changed_script_named_with_a_dot_slash_does_not_run() {
 /// `--i-understand-indirect` and does not pin the `Makefile`, so a
 /// teammate's later `Makefile` change runs.
 #[test]
-#[ignore = "BUG-702: `nice make` (any launcher but env) escapes the build-tool rule; a changed Makefile runs"]
 fn a_build_tool_behind_a_launcher_still_pins_its_files() {
     let env = Env::new();
     let m = markers(&env);

@@ -1637,15 +1637,27 @@ A workspace is only a named pointer in the view. It owns no directory.
   working copy's recorded entries, through the same `SparseView` that
   records a sparse sandbox (colocated Git mode records only the paths Git
   does not manage).
-* **Links in sandboxes** (symlinks design, threat 7). `SandboxFs` never
-  materialises a tree's symlink whose target, resolved lexically against
-  the link's directory, leaves the sandbox (`x -> ../../../../../.env`
-  reaches the project's isolated `.env` from
-  `.veil/local/sandboxes/<ws>/files/`), or whose absolute target lies in a
-  forbidden root (the project directory and `$VEIL_HOME`, given by the
-  CLI). Checkout reports it `failed`, so the materialisation record keeps
+* **Links in sandboxes** (symlinks design, threat 7; BUG-708, BUG-709).
+  `SandboxFs` materialises a tree's symlink only when it provably resolves
+  beneath the sandbox root whatever other links the tree holds
+  (`vfs::sandbox_link_check`): its target is relative, made of `..`
+  components first and names after them only (`../../lib/tool.sh`, never
+  `lib/../tool.sh`), and the `..` components do not climb above the root.
+  Every link sits in a real directory at its own depth (writes never go
+  through a link), so the leading `..` climb real directories, and each
+  later name is a real entry or a link obeying the same rule; a `..` after
+  a name is what a chain needs (`u -> ../../../..` and `x ->
+  u/../../../../../.env` are each lexically inside, together they reach
+  the project's isolated `.env`). Absolute targets are never materialised:
+  what they name depends on the reader (`/proc/self/cwd/../../.env` is
+  the sandbox itself, then the project), so a lexical check of them proves
+  nothing; the project directory and `$VEIL_HOME` (given by the CLI) are
+  only named in the message. Checkout reports it `failed`, so the materialisation record keeps
   it hidden and recording the run carries the link; full, `--only` and
-  `--ephemeral` sandboxes alike. Reflink clones are made in the
+  `--ephemeral` sandboxes and `vl bisect run`'s alike. A mounted workspace
+  (`vl ws mount`) serves links as they are, as the project directory holds
+  them: it is the user's own view of the workspace, with no promise to
+  keep the project's isolated files from what runs in it. Reflink clones are made in the
   destination's directory opened without following links.
 * **`ws exec` sandboxes** (`veil_core::sandbox`, `vfs::SandboxFs`, the
   CLI's `sandbox.rs`). Each virtual workspace has one persistent sandbox,
@@ -3712,12 +3724,33 @@ nothing and warns.
 **Trust.** `vl hooks trust` records in `.veil/local/hooks-trust.json`
 (`{version: 1, veilhooks: <blake3>, trusted: [{hook, command, digests,
 indirect}]}`, `0600`, written by rename) the BLAKE3 of `.veilhooks` and the
-state of every repository path a command names: each argv element that is
-a canonical relative path (whether or not a file is there: `absent` and
-`directory` are states too), its `files`, and, for a known build tool
-(`make`, `npm`, `cargo`, `pytest`, `python -m`, … in `INDIRECT`), the tool's
-own files (`Makefile`, `package.json`, …). Build tools need
-`--i-understand-indirect`. A repository hook runs only when the whole
+state of every repository path a command names: each argv element that
+names a repository path in any spelling (`hooks::classify` normalises
+`./a`, `a//b`, `a/./b` to `a/b`, and reads the value of `--opt=a` and
+`VAR=a`; BUG-701), whether or not a file is there (`absent` and `directory`
+are states too), its `files`, and, for a known build tool (`make`, `npm`,
+`cargo`, `pytest`, `python -m`, … in `INDIRECT`), the tool's own files
+(`Makefile`, `package.json`, …). A directory is pinned as `tree:<blake3>`
+of a manifest of every file below it (kind, path, content digest; at most
+1024 entries and 64 MiB, no links) when `files` names it or the command's
+program may run it (`python*`, `pypy*`, `node`, `bun`: `python3 tools` runs
+`tools/__main__.py`; BUG-700); otherwise it is the command's data, as the
+project directory it runs in is, and only `directory` is pinned. The
+project root (`.`) is never pinned: it is the hook's working directory.
+Build tools need `--i-understand-indirect`; they are recognised as the
+program or anywhere after a known launcher (`hooks::LAUNCHERS`: `env`,
+`nice`, `timeout`, `nohup`, `sudo`, `stdbuf`, `vl`, …; BUG-702).
+`hooks::refusal` makes trust refuse, whatever the files hold, a command
+that runs code given as text (`sh -c`, `bash -ec`, `python3 -c`, `node
+-e`, `perl -e`, `ruby -e`, `php -r`, an `awk` program without `-f`, `env
+-S`), runs its arguments through a shell or takes them from its input
+(`xargs`, `watch`, `parallel`, …), gives the project root to an interpreter
+that would run it (`python3 .`), or has an argument that names the project
+in a way that cannot be pinned (through `..`, by absolute path, through
+`/proc` or `/dev/fd`, under `.veil` or `.git`, glued to a short option as
+in `-Iscripts/x`, in a `PATH`-like list). A record made by an older `vl`
+for such a command, or one missing a path this `vl` pins, does not count
+as trust. A repository hook runs only when the whole
 record matches: any change to any pinned path untrusts every command of the
 file (all or nothing, so a security check is never silently dropped while
 the rest still runs), and each command that would have run it warns,
@@ -3732,7 +3765,9 @@ trusted is what was shown.
 runs or is given is read once (`O_NOFOLLOW`, a regular file, at most 64
 MiB), hashed, compared with its trusted digest, and written to
 `.veil/local/hooks-run/<digest prefix>-<unique>` (`0700`, directory `0700`);
-the argv gets that copy, which is removed afterwards. A script swapped
+the argv gets that copy (after its `--opt=` or `VAR=` prefix), which is
+removed afterwards. A `tree:` directory is read whole, checked against its
+manifest digest, and copied the same way (a private directory). A script swapped
 between the check and `exec` cannot run (copy-then-exec). Programs named
 bare are resolved on a cleaned `PATH` (absolute entries outside the
 project only) and must resolve outside the project; an absolute argument

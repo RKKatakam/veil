@@ -123,6 +123,46 @@ pub fn link_escapes(link: &VPath, target: &str) -> bool {
     false
 }
 
+/// May a sandbox materialise the link at `link` (relative to the sandbox
+/// root) with `target`, whatever other links the tree holds? `Err` says
+/// why not. The rule (symlinks design, threat 7; BUG-708, BUG-709):
+///
+/// * **Never an absolute target.** Its meaning depends on the reader, not
+///   on the string: `/proc/self/cwd/…`, `/proc/self/root/…`, `/dev/fd/N/…`
+///   name the sandbox itself, and from there `..` climbs to the project.
+/// * **A relative target is some `..` components, then names only**
+///   (`.` and empty components aside), and its `..` components do not climb
+///   above the root: `../../lib/tool.sh`, never `lib/../tool.sh`.
+///
+/// Why that is enough, with no knowledge of the other links: every link
+/// the sandbox writes sits in a real directory at its own depth (writes
+/// never go through a link), so its leading `..` components climb real
+/// directories, staying beneath the root. From there, each name is a real
+/// entry beneath the root or another link obeying the same rule, which (by
+/// induction on the kernel's link expansions) resolves beneath the root.
+/// A `..` after a name is what a chain needs (`x -> u/../../..`, where `u`
+/// is itself a link: the kernel climbs from `u`'s target, not from `x`'s
+/// directory), so it is refused.
+pub fn sandbox_link_check(link: &VPath, target: &str) -> std::result::Result<(), &'static str> {
+    if target.starts_with('/') {
+        return Err("its target is absolute (what it names depends on who reads it, `/proc/self/cwd` names the sandbox)");
+    }
+    let mut up = 0usize;
+    let mut named = false;
+    for part in target.split('/') {
+        match part {
+            "" | "." => {}
+            ".." if named => return Err("its target climbs with `..` after a name, which may itself be a link"),
+            ".." => up += 1,
+            _ => named = true,
+        }
+    }
+    if up > link.components().count().saturating_sub(1) {
+        return Err("it leads outside the sandbox");
+    }
+    Ok(())
+}
+
 /// The path (relative to the working copy's root) that relative `target`
 /// of the link at `link` names, resolved lexically (see [`link_escapes`]);
 /// `None` when it is absolute or leaves the root.
