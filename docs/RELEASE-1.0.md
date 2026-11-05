@@ -27,13 +27,13 @@ gates below hold.
 
 ## Features in 1.0.0
 
-- [ ] Persistent, copy-on-write `vl ws exec` sandboxes (reflinks where the
+- [x] Persistent, copy-on-write `vl ws exec` sandboxes (reflinks where the
       filesystem supports them) and sparse sandboxes.
-- [ ] `vl blame` / annotate and history search (`log` by path, author,
+- [x] `vl blame` / annotate and history search (`log` by path, author,
       `-S`/`-G`).
-- [ ] Rename detection in `diff` and `log`.
-- [ ] Cherry-pick / duplicate.
-- [ ] Symlinks; line endings and per-path attributes (binary, CRLF).
+- [x] Rename detection in `diff` and `log`.
+- [x] Cherry-pick / duplicate.
+- [x] Symlinks; line endings and per-path attributes (binary, CRLF).
 
 ## Release mechanics
 
