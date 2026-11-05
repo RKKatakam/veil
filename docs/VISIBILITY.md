@@ -61,6 +61,18 @@ The tiers above are **per path**. An **embargo** is **per change**. It is for wo
 
 **On the Hub: hidden PRs.** A proposal under an embargo is visible only to the embargo's group. It can be reviewed, approved and landed invisibly, then released.
 
+## Who can see a PR
+
+A PR (proposal) carries more than code: a title, a description, comments, reviews and a diff. These usually *describe* the code. So a PR is never shown in part.
+
+- **An embargoed PR is visible only to the embargo's audience.** For everyone else it **does not exist**: no title, no count, no "hidden PR" placeholder. Even its existence would signal that a security fix is coming.
+- **Any other PR is visible only to people who can see every path it touches.** A PR touching `billing/` (finance only) and `src/` (public) is shown only to finance members.
+  - Nobody gets a partial view: the text would leak what the hidden part is about.
+  - To share the public part with a wider audience, split the change into two PRs.
+- **After an embargo's release,** its PR follows the rule above for the paths it touched (public paths only: public; and so on).
+- **Agents and CI follow the same rule:** an agent sees the PRs its person can see. A CI job sees only the PRs whose paths its runner has access to.
+- **Search, notifications, activity feeds, counts and the API** all apply the same check. A PR you can't see never shows up anywhere, including in "N open PRs".
+
 **Embargoes stay encrypted** (like the secret tier), not just permission-checked:
 - an unreleased security fix is a prime target;
 - it often has to reach people outside the company, over remotes the Hub doesn't control.
