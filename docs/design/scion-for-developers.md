@@ -9,6 +9,8 @@ A "Scion for developers" is a source-control service where most of the work happ
 - Clients fetch only the files they read.
 - Agents land work without a global merge-queue lock.
 
+**The Veil Hub is built on this design,** for thousands of agents at once pulling, opening PRs and merging. Its design targets (`docs/OVERVIEW.md`, "Design targets") are the server's benchmark gates, listed in `docs/HUB.md` §9.2: thousands of agents (benchmarked at 1,000 and 10,000); a small pull and a PR open or update in under 100 ms of server time; thousands of merges per hour per project with no global lock; a fresh agent workspace in seconds; history, blame and search through the API in milliseconds to low hundreds of ms; permission checks a negligible share of request time.
+
 Veil offers this to any team, not just one company's huge repo, on the Veil server. The server reads code, so it can merge, index and search it as Scion does. Only secrets and embargoed changes are encrypted; those few cases run where the keys are, on a device or machine with access (`docs/HUB.md` §7.5, §8.3).
 
 ## What Scion does
@@ -139,20 +141,21 @@ The server is built now, with the permission model. Each later phase depends on 
 - **Done: client groundwork.** Lock-free op log (1.3), two-phase resumable pushes (1.5), commit-graph index (3.2, first part of 3.1), background maintenance (2.2, client side), scale benchmark (6.6).
 
 1. **Phase 1: the server and the permission model, together.** Object store on S3 (2.1), compare-and-swap branch moves (1.2), lock-free uploads (1.1), few branches (1.6), sign-in, admins, groups, managers, folder access and `public`, encrypted secrets, `vl` pushing and pulling through the server.
-   - *Gate:* 50 simultaneous pushes land in about the time of the slowest upload, and each person receives only what they may see.
+   - *Gate:* 50 simultaneous pushes land in about the time of the slowest upload; a small pull is under 100 ms of server time; permission checks are a negligible share; each person receives only what they may see.
 2. **Then: a simplification pass** (`docs/OVERVIEW.md`). Remove SFTP and path remotes, offline assumptions, old formats and old jargon.
 3. **Phase 2: fetch on demand and agent sandboxes.** Fetch on demand (4.1), limited cache (4.2), checkouts that fetch from the server and partial checkouts (4.3, 4.4), layered caches (2.3, 2.4), server sandboxes (4.5), commits through the API (1.4), agent attribution (4.6), resource limits (4.7), large-file chunking (2.5).
-   - *Gate:* an agent sandbox on a large project is ready in seconds.
+   - *Gate:* a fresh agent workspace on a large project is ready in seconds.
 4. **Phase 3: history answered by the server.** Index framework (3.1), blame and file history (3.3), search (3.4), query API (3.5), rename and copy detection (3.6).
-   - *Gate:* blame, log and diff are answered through the API with no checkout.
+   - *Gate:* history, blame and search are answered through the API, with no checkout, in milliseconds to low hundreds of ms.
 5. **Phase 4: landing at agent scale.** Landing on the server (5.1), batched landings (5.2), fast path (5.3), protected `main` (5.7), land first and test after (5.4), conflict-fixing agents (5.5), automatic bisect and revert (5.6), landings that need keys (5.8), review by intent, CI through the API, path permissions, metrics and isolation (6.1–6.5), rate limiting (6.7). PR review and hidden PRs (`docs/HUB.md` §7) land here too.
+   - *Gate:* thousands of merges per hour per project with no agent waiting on a global lock; a PR open or update under 100 ms; benchmarked at 1,000 and 10,000 agents.
 
 Simulation testing (6.8) starts in phase 1 and grows with each phase.
 
-The roadmap has no dates. Each gate is a benchmark result, and the target scale is still an open question.
+The roadmap has no dates. Each gate is a benchmark result against the design targets in `docs/HUB.md` §9.2.
 
 ## Open questions
-- What's the target scale? How many merges a day per project should the server sustain (1,000? 30,000?), and on what hardware?
+- What hardware do the 1,000- and 10,000-agent benchmarks run on?
 - Land first and test after (5.4) clashes with embargoes: reverting an embargoed merge must not reveal the fix.
 - Can a per-viewer projection (people who can't see a folder don't see its names) keep the fast path (5.3) and the shared caches (2.3) simple?
 

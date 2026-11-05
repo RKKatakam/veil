@@ -46,9 +46,10 @@ Contents:
   never uploaded.
 * **Pull requests on change ids**, visible only to people who can see every
   file they touch.
-* **Agents at scale**, following Scion: lock-free commits, an atomic
-  one-row branch move, fetch on demand, server-side merges, history and
-  search, batched landings (§9).
+* **Built on the Scion design,** for thousands of agents at once pulling,
+  opening PRs and merging: lock-free commits, an atomic one-row branch
+  move, fetch on demand, layered caches, server-side merges, history and
+  search, batched landings, with benchmark gates for each (§9).
 
 ### 1.2 Non-goals
 
@@ -234,7 +235,7 @@ push      C→S {expected: {"main": "<old>"}, updates: [{branch: "main", new: "<
                upload: "<id>", records: [...]}
           S→C {results: [{branch: "main", status: "ok"} | {status: "rejected", code, message}]}
 
-land      C→S {change: "<change id>", onto: "main"}                // server-side landing (§9.4)
+land      C→S {change: "<change id>", onto: "main"}                // server-side landing (§9.1)
           S→C {status: "queued" | "landed" | "conflict", ...}
 ```
 
@@ -291,7 +292,7 @@ today; **they must be the same code** on client and server.
 | 12 | Branch moves are fast-forward unless forced by someone allowed to | `push_with` |
 | 13 | Quotas and limits (§4.7) | (new) |
 
-Then the branch moves with one compare-and-swap in the DB (§9.2), and the
+Then the branch moves with one compare-and-swap in the DB (§9.1), and the
 push is recorded in the project's audit log.
 
 **What exists today and carries over:** `vl push` is already two-phase. It
@@ -580,7 +581,7 @@ allow_force = false
 ### 7.5 Landing
 
 The server lands PRs: it merges or rebases the stack onto the latest
-target and moves the branch atomically (§9.4). Two cases need keys, and so
+target and moves the branch atomically (§9.1). Two cases need keys, and so
 run on a device or machine that holds them:
 
 * **a conflict inside a secret file** (`.env` changed on both sides);
@@ -655,72 +656,82 @@ One unreleased embargo per line still applies (ARCHITECTURE.md §7).
 
 ---
 
-## 9. Scale
+## 9. Scale: the Scion design
 
-Following Scion (`docs/design/scion-for-developers.md`, Anthropic's post
-cited there): most of the work happens on the server, and the only step
-done one at a time is moving a branch.
+**The Hub is built on the design of Anthropic's Scion** (OVERVIEW.md, "How
+it scales"; `docs/design/scion-for-developers.md` cites the source), for
+**thousands of agents at once pulling, opening PRs and merging**. Most of
+the work happens on the server, and the only step done one at a time is
+moving a branch.
 
-### 9.1 Storage
+### 9.1 The pieces
 
-* **Metadata in YugabyteDB** (PostgreSQL for development and CI): people,
-  groups, access, branch tips, PRs, indexes' small values.
-* **File contents in S3-style object storage,** one object per BLAKE3 id,
-  immutable. Packs are used only to transfer data.
-* **Caches:** per machine (one cache shared by every agent on it), then
-  regional, then the server. Every request names an immutable object, so
-  caches never need to coordinate, and a failing cache slows reads but
-  never blocks landing.
-* **No stop-the-world `gc`:** unreferenced objects are removed in the
-  background by a retention rule. Today's client already does incremental,
-  background maintenance with a safe prune (built as stream G2,
-  ARCHITECTURE.md §10).
+* **Lock-free change writes.** Uploading a change is just storing its
+  objects in a holding area (§4.5); an object nothing points to is
+  invisible and harmless. **Moving `main` is one atomic compare-and-swap
+  on one DB row:** "move `main` from X to Y" succeeds or is rejected.
+  Today's client already has the groundwork: a lock-free op log (stream O,
+  format 6) and two-phase pushes that lock only for the branch move
+  (stream P).
+* **The server does the work:** merges, rebases, history, blame and search
+  run on the server, through the API, often with no checkout.
+* **Precomputed history:** blame, file history and the commit graph are
+  computed once per change as it lands (each index value from its parents'
+  values), so queries are instant. Today's local commit-graph index
+  (`graph_index.rs`, stream I) is the first such index.
+* **Fetch on demand,** from the top folder down (§4.4). An agent working in
+  `src/api/` never downloads the rest. The client's cache is bounded, and
+  files appear when read (extending today's `vl ws mount`).
+* **Layered caches:** the client, a cache daemon on each machine (shared by
+  every agent on it), regional caches, then the server. Objects are
+  addressed by hash, so any cache serves them with no coordination, and a
+  failing cache slows reads but never blocks landing. **Caches hold only
+  what the asker may see:** a cache serves an object only after the
+  server's access check for that person (§4.6).
+* **No locked merge queue.** Ready changes that don't overlap land **in
+  batches**: 500 ready PRs become one move of `main`, by rewriting folder
+  listings without merging contents. A change that conflicts goes back to
+  an agent with both versions and the test result. Tests run after merging
+  and before deploy; a broken `main` is fixed forward or reverted (with
+  automatic bisect through the API). Changes that need keys land as in
+  §7.5.
+* **Few branches:** work lives as changes and PRs, not thousands of
+  long-lived branches.
+* **No repacking:** each object is stored once in S3-style object storage;
+  unreferenced objects are removed in the background by a retention rule.
+  Packs are used only to transfer data.
+* **Horizontal scaling:** stateless API servers, **YugabyteDB** for metadata
+  (PostgreSQL for development and CI), and object storage. Capacity grows
+  by adding machines.
+* **Permission checks on every request, cached per person and folder,** so
+  access control never becomes the bottleneck. A change to a group or to
+  `.veilpolicy` invalidates the affected cache entries before it takes
+  effect.
 
-### 9.2 Lock-free commits and the atomic branch move
+### 9.2 Benchmark gates
 
-* Uploading objects takes no lock; an object nothing points to is invisible
-  and harmless (§4.5).
-* **Moving a branch is one atomic compare-and-swap on one DB row:** "move
-  `main` from X to Y" succeeds or is rejected.
-* Today's client already has the pieces: a lock-free op log (stream O,
-  format 6) and two-phase pushes that lock only for the branch move (stream
-  P).
+The design targets from OVERVIEW.md. **The server's benchmark must prove
+each one** before the feature that serves it is called done; today's
+`crates/veil-bench` is extended to drive the server.
 
-### 9.3 Fetch on demand
+| What | Gate |
+|---|---|
+| Agents working at once | **Thousands**: benchmark at 1,000 and 10,000 |
+| Pull of a small change | **Under 100 ms** of server time; mostly served from cache |
+| Opening or updating a PR | **Under 100 ms** of server time |
+| Merges | **Thousands per hour per project**, with no agent waiting on a global lock; landing batches change by change |
+| A fresh agent workspace on a large project | **Seconds**, fetching on demand |
+| History, blame or search through the API | **Milliseconds to low hundreds of ms**, with no checkout |
+| Permission checks | **A negligible share** of request time |
 
-* The client fetches only what it needs (§4.4): a checkout of one folder
-  fetches that folder; a file appears when it is read (extending today's
-  `vl ws mount`).
-* The client's cache is bounded, so a laptop never holds the full history.
-* An agent sandbox on a large project is ready in seconds.
-
-### 9.4 Server-side merges, history and search
-
-* **Landing:** the server merges or rebases a change onto the latest
-  branch and moves it atomically. Changes to different files land by
-  rewriting folder listings without merging contents.
-* **Batched landings:** ready changes are landed in batches, so thousands
-  of agents don't contend on one branch. There is no merge-queue lock:
-  land first, test after; a broken `main` is fixed forward or reverted
-  (automatic bisect and revert through the query API).
-* **Conflicts** go back to an agent with both versions and the test
-  result.
-* **History and search on the server:** log, blame, file history, rename
-  detection, grep and path search, answered through the API without a
-  checkout. Indexes are computed per commit from its parents' values, when
-  the commit lands or when first asked. Today's history index
-  (`graph_index.rs`, stream I) is the first one.
-* Answers go through the same access check (§4.6): a search never returns a
-  hit in a folder the asker can't see, nor its count.
-
-### 9.5 Operations
+### 9.3 Operations
 
 * Health metrics per project: merges per hour, time to land, conflict
   rate, reverts, cache hit rate.
 * Rate limits per person and per agent (§4.7).
-* A repeatable scale benchmark before each release (today's
-  `crates/veil-bench`, extended to the server), and simulation testing of
-  the server, its caches and many clients with faults injected.
+* Simulation testing of the server, its caches and many clients, with
+  faults injected (dropped connections, cache outages, racing landings),
+  checked for leaks of private folders, secrets and embargoed changes.
 
 ---
 
@@ -758,9 +769,9 @@ From OVERVIEW.md:
    storage formats (still readable for `vl upgrade`) and old jargon (cloak,
    scope, isolate).
 3. **Then: the server's features, in stages.**
-   * fetch on demand (§9.3);
-   * server-side history and search (§9.4);
-   * landing changes at agent scale (§9.2, §9.4);
+   * fetch on demand (§9.1);
+   * server-side history and search (§9.1);
+   * landing changes at agent scale (§9.1), proved by the gates of §9.2;
    * PR review and hidden PRs (§7);
    * the deadline worker and escrow (§8.2), CI on machines (§5.5), the web
      client (§10).
@@ -784,8 +795,8 @@ inside a snapshot are claims, never authority.
 3. **Write access separate from read access:** VISIBILITY.md gives one kind
    of access. Branch rules (§7.4) and agent path limits may need a
    narrower "may write".
-4. **Target scale:** merges a day per project (1,000? 30,000?), and on what
-   hardware.
+4. **Hardware for the gates** (§9.2): what machines the 1,000- and
+   10,000-agent benchmarks run on.
 5. **Land first, test after, with embargoes:** reverting an embargoed merge
    must not reveal the fix.
 
