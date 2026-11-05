@@ -1477,7 +1477,7 @@ struct Snapshot {
     minutes), so the transaction re-checks that the change and destination
     are still in the history and unchanged, and refuses otherwise. Trees
     under an embargo wrapper are only squashed whole into their parent.
-    A property test (`veil-core/tests/split_squash.rs`) checks, over random
+    A property test (`veil-core/tests/core_engine/split_squash.rs`) checks, over random
     edits (text, binary, adds, deletes, executable bits, cloaked paths) and
     random selections, that the halves are the selection and its complement,
     that every entry keeps one of its versions' audiences, that squashing
@@ -2039,7 +2039,7 @@ Binary trees (format 2) then cut decoding the parent's ~1,200 trees from
 and a one-file edit from 77–99 ms to about 63 ms (FORMAT.md §7). What
 remains is mostly the one `lstat` per file and the per-directory
 `readdir`. Run the benchmark with
-`cargo test --release -p vl --test bench_status -- --ignored --nocapture`.
+`cargo test --release -p vl --test cli_bench -- --ignored --nocapture bench_status::`.
 
 ## 7. Delayed-visibility (embargoed) merges
 
@@ -2316,7 +2316,7 @@ transfer (`remote::push_incremental`) with its visibility filter. Only the
 sink differs: `Sink::Plan` records every object and packs it exactly as
 the real sink would, into a backend that drops the bytes, so the plan's
 object ids, counts and pack size are the push's own. A property test
-(`veil-core/tests/push_plan.rs`) runs random histories of public, cloaked
+(`veil-core/tests/core_sync/push_plan.rs`) runs random histories of public, cloaked
 and exposed files, cloaked tags, rewound tags, embargoed merges and
 releases against a team and a public remote, and checks after every push
 that its new packs hold exactly the planned objects, its report the
@@ -2352,8 +2352,8 @@ files` and the tier marks use the same verified visibility. A public
 label is taken as it is: if its object is in fact sealed, the push
 withholds it, so the plan can only overstate what becomes public.
 
-Benchmark (`cargo test --release -p veil-core --test sftp_bench --
---ignored --nocapture`): 3,000 files, 300 snapshots, about 7,850 objects,
+Benchmark (`cargo test --release -p veil-core --test core_bench --
+--ignored --nocapture sftp_bench::`): 3,000 files, 300 snapshots, about 7,850 objects,
 through a local OpenSSH `sftp-server` with an artificial delay in both
 directions (release build):
 
@@ -2675,7 +2675,7 @@ entry that references it:
 | redacted (expected) | cloaked or embargoed content absent, e.g. in a clone of a public remote | 0 |
 | note | leftovers of interrupted commands: dangling operations, unreachable objects, temp files, a lock | 0 |
 
-**Crash-injection tests** (`crates/veil-core/tests/crash.rs`). A
+**Crash-injection tests** (`crates/veil-core/tests/core_durability/crash.rs`). A
 `FaultyBackend` wraps `MemoryBackend` and fails the N+1-th mutation and every
 later one, with the fatal write either lost or applied. The barrier is a
 mutation too. In a third mode, *power loss*, the fatal write is lost and
@@ -2800,8 +2800,8 @@ this order:
    be read (missing, corrupt, or sealed without a key), gc still packs but
    deletes nothing, and reports why.
 
-Benchmark (`cargo test --release -p veil-core --test storage_bench --
---ignored --nocapture`): 3,000 source files, 300 commits and 30 abandoned
+Benchmark (`cargo test --release -p veil-core --test core_bench --
+--ignored --nocapture storage_bench::`): 3,000 source files, 300 commits and 30 abandoned
 experiments, about 8,000 objects. They take 36.5 MiB loose and 3.2 MiB after
 `vl gc` (8.5 MiB without deltas), or 2.6 MiB once the experiments are
 pruned. Reading every object costs about 2.3 µs each loose and 6.5 µs each
@@ -3382,7 +3382,7 @@ reader cannot decrypt becomes a `Redaction` (a reason and the text's
 message, never bytes); a description sealed for a scope the reader is not in
 becomes `null` plus a `HiddenText` naming the scope; `secret list` reads the
 vault's key set only, so a value never enters a result; scan findings carry
-the scanner's already-redacted excerpt. `crates/vl/tests/json_cli.rs` runs
+the scanner's already-redacted excerpt. `crates/vl/tests/cli_basic/json_cli.rs` runs
 every read command on every revision as a non-member, a public-mirror
 reader and the owner, and checks no cloaked, embargoed or isolated
 plaintext, sealed description or vault value appears.
@@ -3850,7 +3850,7 @@ the highest priority. Matching ports Git's `wildmatch.c` and `attr.c`
 exactly (basename versus pathname patterns, `**` rules, `[attr]` macros
 from the top level only, the built-in `binary`, `!name`, the precedence of
 deeper files and later lines), checked by a differential test against `git
-check-attr` on generated trees (`tests/attributes_git.rs`). Exact names
+check-attr` on generated trees (`tests/core_git/attributes_git.rs`). Exact names
 and `*suffix` patterns are indexed, so a megabyte of them costs a lookup
 little. Limits: 1 MiB per file (ignored as a whole), Git's 2 048 bytes per
 line.

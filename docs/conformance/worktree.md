@@ -2,12 +2,12 @@
 
 Veil checked against the working-copy parts of Git's and Jujutsu's test
 suites. Every scenario that makes sense in Veil's model is an original Rust
-test in one binary, `crates/vl/tests/conformance_worktree/` (one module per
+test in one module of the `cli_conformance` binary, `crates/vl/tests/cli_conformance/conformance_worktree/` (one module per
 topic), driving the real `vl` binary with an isolated `VEIL_HOME`:
 
 ```sh
-cargo test -p vl --test conformance_worktree                 # 267 pass, 15 ignored
-cargo test -p vl --test conformance_worktree -- --ignored    # the 15 bug reproductions (all fail)
+cargo test -p vl --test cli_conformance conformance_worktree::                 # 267 pass, 15 ignored
+cargo test -p vl --test cli_conformance -- --ignored conformance_worktree::    # the 15 bug reproductions (all fail)
 ```
 
 ## Summary

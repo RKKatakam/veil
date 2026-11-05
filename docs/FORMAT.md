@@ -367,7 +367,7 @@ vl upgrade [--dry-run] [--remote NAME] [--force]
 
 Each finished step is journaled before the next starts, so `vl upgrade`
 after a crash resumes (it skips verification if it already passed, and
-notices a commit point already reached; `tests/crash.rs` crashes 1→3 and
+notices a commit point already reached; `tests/core_durability/crash.rs` crashes 1→3 and
 2→3 at every write). Old data is never removed. A remote is upgraded with
 `--remote NAME` (checked structurally, without opening sealed content);
 an SSH remote is reached over SFTP, as push and pull reach it.
@@ -481,7 +481,7 @@ unreleased embargo, a cloaked tag, a vault, gc pending list, pruned ops,
 stat cache and checkout state), and its `team-remote/` and
 `public-mirror/`. The identity files are test-only keys.
 
-`tests/format_compat.rs` and `crates/vl/tests/upgrade_cli.rs` check that
+`tests/core_format/format_compat.rs` and `crates/vl/tests/cli_basic/upgrade_cli.rs` check that
 this build:
 
 * opens, reads (as the admin, a member, a revoked member and an outsider),
@@ -539,6 +539,6 @@ The status runs alternate the vl 0.1.0 binary (format 1) and this build
 repository opened by this build decodes its JSON trees as before.
 
 ```sh
-cargo test --release -p veil-core --test tree_bench -- --ignored --nocapture
-VL_BENCH_BIN=/path/to/old/vl cargo test --release -p vl --test bench_status -- --ignored --nocapture
+cargo test --release -p veil-core --test core_bench -- --ignored --nocapture tree_bench::
+VL_BENCH_BIN=/path/to/old/vl cargo test --release -p vl --test cli_bench -- --ignored --nocapture bench_status::
 ```

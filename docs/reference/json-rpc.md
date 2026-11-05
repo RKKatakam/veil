@@ -1,4 +1,4 @@
-<!-- Written by hand (not generated). crates/vl/tests/serve_cli.rs checks that
+<!-- Written by hand (not generated). crates/vl/tests/cli_sync/serve_cli.rs checks that
      every method and every field of every schema below is documented here. -->
 
 # `vl serve --local` protocol (JSON-RPC 2.0)

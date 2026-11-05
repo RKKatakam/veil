@@ -508,6 +508,6 @@ repo.set_tag("agent-result", snapshot, None, false)?;
 * Writes go through the repository lock, so the agent and your `vl`
   commands can run at the same time.
 * Both examples are compiled and run by
-  `crates/vl/tests/guide_library.rs`.
+  `crates/vl/tests/cli_workspaces/guide_library.rs`.
 
 Next: [Teams and remotes](teams-and-remotes.md).

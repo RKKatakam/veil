@@ -1,0 +1,152 @@
+//! Replacing the identity (`vl identity new --force`) and the local vault,
+//! whose key is derived from the identity (BUG-027).
+
+use crate::adversarial_support;
+
+use adversarial_support::*;
+
+fn project_with_vault(env: &Env, name: &str) -> std::path::PathBuf {
+    let proj = env.project("alice", name, &[("a.txt", "a\n")]);
+    write(&proj, ".env", "X=1\n");
+    env.ok("alice", &proj, &["status"]);
+    env.ok("alice", &proj, &["secret", "set", "TOKEN", &format!("t-{name}")]);
+    proj
+}
+
+#[test]
+fn replacing_the_identity_keeps_vaults_recoverable() {
+    let env = Env::new();
+    let here = project_with_vault(&env, "here");
+    let other = project_with_vault(&env, "other");
+
+    // Run inside `here`: its vault is re-keyed on the spot.
+    let out = env.ok("alice", &here, &["identity", "new", "--force"]);
+    assert!(out.contains("Re-keyed the local vault"), "{out}");
+    assert_eq!(env.stdout("alice", &here, &["secret", "get", "TOKEN"]).trim(), "t-here");
+
+    // The replaced identity is kept, owner-only.
+    let retired: Vec<_> = std::fs::read_dir(env.root.join("home-alice/retired"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(retired.len(), 1);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&retired[0]).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "retired identity is private ({mode:o})");
+    }
+
+    // `other` keeps working; only the vault's content is out of reach, with
+    // a message saying what to do.
+    env.ok("alice", &other, &["status"]);
+    env.ok("alice", &other, &["log"]);
+    let out = env.vl("alice", &other, &["secret", "get", "TOKEN"]);
+    assert!(!out.status.success() && text(&out).contains("recover-vault"), "{}", text(&out));
+    // Nothing overwrites the old vault meanwhile.
+    write(&other, ".env", "X=2\n");
+    env.ok("alice", &other, &["status"]);
+    assert!(!env.vl("alice", &other, &["secret", "set", "NEW", "v"]).status.success());
+
+    let out = env.ok("alice", &other, &["identity", "recover-vault"]);
+    assert!(out.contains("Re-keyed"), "{out}");
+    assert_eq!(env.stdout("alice", &other, &["secret", "get", "TOKEN"]).trim(), "t-other");
+    env.ok("alice", &other, &["status"]);
+    let out = env.ok("alice", &other, &["identity", "recover-vault"]);
+    assert!(out.contains("nothing to do"), "{out}");
+}
+
+#[test]
+fn a_vault_without_its_identity_never_bricks_the_repository() {
+    let env = Env::new();
+    let proj = project_with_vault(&env, "proj");
+    env.ok("alice", &proj, &["identity", "new", "--force"]);
+    // Re-keyed already; simulate a vault sealed by an identity that is gone
+    // for good: replace the identity again from outside the repository and
+    // delete everything it retired.
+    env.ok("alice", &env.root, &["identity", "new", "--force"]);
+    std::fs::remove_dir_all(env.root.join("home-alice/retired")).unwrap();
+
+    for args in [&["status"][..], &["log"], &["commit", "-m", "still works"], &["files"]] {
+        env.ok("alice", &proj, args);
+    }
+    let out = env.vl("alice", &proj, &["identity", "recover-vault"]);
+    assert!(!out.status.success() && text(&out).contains("none of 0"), "{}", text(&out));
+    let out = env.vl("alice", &proj, &["secret", "list"]);
+    assert!(!out.status.success() && text(&out).contains("sealed by"), "{}", text(&out));
+    // The documented way out: delete the vault and start over.
+    std::fs::remove_file(proj.join(".veil/local/vault.sealed")).unwrap();
+    env.ok("alice", &proj, &["secret", "set", "K", "v"]);
+    assert_eq!(env.stdout("alice", &proj, &["secret", "get", "K"]).trim(), "v");
+}
+
+/// BUG-089: replacing the identity of a scope's only admin warns first, and
+/// `vl identity recover-admin` lets the replaced identity hand the admin
+/// rights over (then, with `--revoke-old`, revokes it).
+#[test]
+fn a_sole_admin_can_hand_over_after_replacing_the_identity() {
+    let env = Env::new();
+    let proj = env.project("alice", "proj", &[("a.txt", "a\n")]);
+    env.ok("alice", &proj, &["scope", "create", "ops"]);
+    let old_member = env.stdout("alice", &proj, &["identity", "show"]);
+    let old_member = old_member
+        .lines()
+        .find(|l| l.starts_with("member id"))
+        .unwrap()
+        .split_whitespace()
+        .last()
+        .unwrap()
+        .to_string();
+
+    let out = env.ok("alice", &proj, &["identity", "new", "--force"]);
+    assert!(out.contains("only admin of scope(s)") && out.contains("ops") && out.contains("recover-admin"), "{out}");
+    env.ok("bob", &env.root, &["identity", "new"]);
+    let bob = env.stdout("bob", &env.root, &["identity", "show"]);
+    let bob = bob.lines().find(|l| l.starts_with("public key")).unwrap().split_whitespace().last().unwrap().to_string();
+    let frozen = env.vl("alice", &proj, &["scope", "grant", "ops", &bob, "--name", "bob"]);
+    assert!(!frozen.status.success() && text(&frozen).contains("only an admin"), "{}", text(&frozen));
+
+    let out = env.ok("alice", &proj, &["identity", "recover-admin"]);
+    assert!(out.contains("Scope ops:") && out.contains("granted you admin rights"), "{out}");
+    assert!(out.contains("--revoke-old"), "{out}");
+    env.ok("alice", &proj, &["scope", "grant", "ops", &bob, "--name", "bob"]);
+    let list = env.ok("alice", &proj, &["scope", "list"]);
+    assert!(list.contains(&old_member), "the replaced identity is still listed:\n{list}");
+
+    let out = env.ok("alice", &proj, &["identity", "recover-admin", "--revoke-old"]);
+    assert!(out.contains("it was then revoked"), "{out}");
+    let list = env.ok("alice", &proj, &["scope", "list"]);
+    assert!(!list.contains(&old_member), "{list}");
+    let out = env.ok("alice", &proj, &["identity", "recover-admin"]);
+    assert!(out.contains("you are already an admin"), "{out}");
+}
+
+/// BUG-360: several `vl` processes starting at once on a fresh `VEIL_HOME`
+/// agree on one identity. Each used to generate and store its own; only
+/// the last write survived, so every other process had worked (signed,
+/// been granted) under an identity that no longer existed.
+#[test]
+fn concurrent_first_runs_create_one_identity() {
+    for round in 0..3 {
+        let env = Env::new();
+        let user = format!("fresh{round}");
+        let children: Vec<_> = (0..12).map(|_| env.spawn(&user, &env.root, &["identity", "show"])).collect();
+        let mut keys = std::collections::BTreeSet::new();
+        let mut created = 0;
+        for child in children {
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success(), "{}", text(&out));
+            created += String::from_utf8_lossy(&out.stderr).matches("new identity").count();
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            let key = stdout.lines().find(|l| l.starts_with("public key")).unwrap().to_string();
+            keys.insert(key);
+        }
+        let stored = env.stdout(&user, &env.root, &["identity", "show"]);
+        assert_eq!(keys.len(), 1, "round {round}: {} identities from 12 concurrent first runs: {keys:#?}", keys.len());
+        assert!(stored.contains(keys.first().unwrap()), "round {round}: the stored identity is not the one used");
+        assert_eq!(created, 1, "round {round}: {created} processes announced a new identity");
+        let home = env.root.join(format!("home-{user}"));
+        let leftovers: Vec<_> = std::fs::read_dir(&home).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(leftovers.len(), 1, "round {round}: temp files left behind: {leftovers:?}");
+    }
+}

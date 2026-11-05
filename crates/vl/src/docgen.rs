@@ -25,9 +25,9 @@ const BLESS_VAR: &str = "VEIL_BLESS_DOCS";
 
 /// Pages of `docs/reference/` written by hand, not generated (and not
 /// removed by a regeneration). `json.md` documents the `--json` schemas;
-/// `crates/vl/tests/json_cli.rs` checks that it covers every field.
+/// `crates/vl/tests/cli_basic/json_cli.rs` checks that it covers every field.
 /// `json-rpc.md` documents the `vl serve --local` protocol;
-/// `crates/vl/tests/serve_cli.rs` checks it.
+/// `crates/vl/tests/cli_sync/serve_cli.rs` checks it.
 const HAND_WRITTEN: &[&str] = &["json.md", "json-rpc.md"];
 
 fn docs_dir() -> PathBuf {

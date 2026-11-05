@@ -9,7 +9,7 @@ crates/veil-core/tests/fixtures/generate.sh target/release/vl crates/veil-core/t
 ```
 
 Never regenerate or edit an existing set: it is the record of what that
-release wrote, and `tests/format_compat.rs` checks that every later
+release wrote, and `tests/core_format/format_compat.rs` checks that every later
 release still opens, reads, verifies, `fsck`s, upgrades and syncs it.
 
 * `format-1/`: vl 0.1.0 (integration at 8aa7a22), JSON trees.
@@ -32,9 +32,9 @@ release still opens, reads, verifies, `fsck`s, upgrades and syncs it.
 
 * `format-5/`: the release that introduced the Git-parity format
   (symlinks, gitlinks, annotated tags, the colocated marker), generated
-  with `VEIL_FIXTURE_EXTRAS=<format_compat test binary> generate.sh
+  with `VEIL_FIXTURE_EXTRAS=<core_format test binary> generate.sh
   target/debug/vl …/format-5 …/format-4` (a debug build of the same
-  sources; `cargo test -p veil-core --test format_compat --no-run` prints
+  sources; `cargo test -p veil-core --test core_format --no-run` prints
   the binary). No CLI writes links or annotated tags yet, so
   `generate.sh` has the `write_format_5_extras` test of `format_compat.rs`
   add them through the engine before the embargo, the cloaked tag and the

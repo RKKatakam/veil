@@ -5,7 +5,7 @@
 //! result from the repository context and prints nothing, and a renderer
 //! turns it into text ([`text`], today's output, byte for byte) or into one
 //! JSON document ([`emit_json`]). The schemas are documented, field by
-//! field, in `docs/reference/json.md`; `crates/vl/tests/json_cli.rs` pins
+//! field, in `docs/reference/json.md`; `crates/vl/tests/cli_basic/json_cli.rs` pins
 //! their shape.
 //!
 //! **Confidentiality.** The results hold exactly what the text output

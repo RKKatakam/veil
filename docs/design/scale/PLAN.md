@@ -118,7 +118,7 @@ Process rules: never run `cargo fmt`; scratch work goes in `.scratch/`; builds u
   - `upgrade.rs` (`6:op-heads`);
   - `fsck.rs` (all heads, staging and `op_head` notes);
   - `crypto/domains.rs` (the Bloom context);
-  - `docs/FORMAT.md`, `docs/CRYPTO.md`, `tests/fixtures/**`, `tests/format_compat.rs`.
+  - `docs/FORMAT.md`, `docs/CRYPTO.md`, `tests/fixtures/**`, `tests/core_format/format_compat.rs`.
 - **Done when** the fixtures exist, the encodings are appended, and the compatibility tests pass. Until O lands, the repository behaves as format 5 with the new layout (a single writer).
 
 **G: storage** (size L; G1 at t0, the rest after the baseline)

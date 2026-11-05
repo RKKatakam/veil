@@ -19,7 +19,7 @@ gates below hold.
 - [ ] `cargo test --all-targets --no-fail-fast`, `cargo clippy --all-targets
       -- -D warnings` and `RUSTDOCFLAGS=-D warnings cargo doc --no-deps
       --workspace` clean.
-- [ ] Test files consolidated into a few test binaries (build time and cache
+- [x] Test files consolidated into a few test binaries (build time and cache
       size).
 - [ ] Scale benchmark at ~1 GB and ~5 GB (init, status, commit, gc, push,
       clone, peak RAM) passes, with streaming `gc` and pull so large

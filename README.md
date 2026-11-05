@@ -98,6 +98,26 @@ cargo build --release --locked -p vl --target x86_64-unknown-linux-musl
 building outside a Git checkout), the repository format it reads and writes,
 and the target.
 
+### Running the tests
+
+```sh
+cargo test --all-targets --no-fail-fast
+# or with cargo-nextest (one process per test); its own `cargo metadata
+# --all-features` fails here (the fuse features), so hand it the metadata:
+mkdir -p target && cargo metadata --format-version=1 > target/metadata.json
+cargo nextest run --cargo-metadata target/metadata.json --workspace --all-targets
+
+cargo test -p vl --test cli_conformance conformance_history::   # one suite
+cargo test -p vl --test cli_adversarial -- --ignored adversarial9::   # its bug reproductions
+```
+
+The integration tests are a few binaries per crate, one per area
+(`crates/veil-core/tests/core_*/`, `crates/vl/tests/cli_*/`); each former
+suite is a module of one of them, so a module path filter selects it. The
+benchmarks are `#[ignore]`d tests in `core_bench` and `cli_bench`.
+`portable` stays a binary of its own (`scripts/check-wasm.sh` builds it
+without default features), and so do the colocated-Git suites.
+
 ### Shell completions and man pages
 
 Release archives have them in `completions/` and `man/`; `vl` also prints
@@ -418,8 +438,9 @@ crates/
     src/vault.rs      device-local encrypted vault
     src/upgrade.rs    `vl upgrade`: journaled repository format migrations
     tests/fixtures/   golden repositories written by every format's release
-    tests/engine.rs   end-to-end tests, entirely in memory
-  vl/          the CLI (clap)
+    tests/core_*/     integration tests, one binary per area (core_engine/engine.rs:
+                      end-to-end, entirely in memory)
+  vl/          the CLI (clap); tests/cli_*/ drive the real binary
 docs/ARCHITECTURE.md  design, data model, threat model, roadmap
 docs/FORMAT.md        on-disk formats, compatibility rules, migrations
 ```
