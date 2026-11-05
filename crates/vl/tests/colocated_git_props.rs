@@ -435,3 +435,12 @@ fn hostile_pulls_negations_clean_and_stash_stay_clean() {
     // the accepted-policy pin.
     run_case(&[15, 10, 23, 21, 27, 5, 25, 28, 25, 0, 17]);
 }
+
+/// The minimal case proptest found: a hostile pull that weakens the policy,
+/// then `git reset --soft HEAD~1`, leaves the pulled policy as an uncommitted
+/// edit that Veil accepts as the member's own.
+#[test]
+#[ignore = "BUG-759: a soft reset after a hostile pull makes the pulled policy look like the member's edit"]
+fn bug759_a_soft_reset_after_a_hostile_pull_never_unseals_a_cloaked_file() {
+    run_case(&[0, 25, 9, 0, 0, 0]);
+}
