@@ -10,14 +10,14 @@
 //! **From format 6, locally,** it takes no lock (`docs/design/scale/
 //! 2-lock-free-oplog.md`): it records the heads it started from (its
 //! *base*), stages its new objects in its own directory
-//! ([`crate::store::ObjectStore::begin_tx_staging`]), and at commit
+//! (`ObjectStore::begin_tx_staging`), and at commit
 //! publishes them, re-checks what it was promised (the working copies it
 //! recorded still where they were; the repository not upgraded), and
 //! publishes its operation with the base as parents. Concurrent operations
 //! leave several heads, which [`Repo::settle`] merges at once: a
 //! deterministic 3-way merge of the views ([`crate::oplog::merge_views`])
 //! that applies each side's rewrites to the other's new snapshots
-//! ([`Transaction::for_merge`]) and never lets that move a change out of an
+//! (`Transaction::for_merge`) and never lets that move a change out of an
 //! unreleased embargo.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -142,16 +142,14 @@ impl<'r> Transaction<'r> {
     /// at commit, and keeps every change any of `before` had inside an
     /// unreleased embargo inside it. Takes no lock: the caller holds it if
     /// the repository needs one.
-    pub(crate) fn for_merge(
-        repo: &'r mut Repo,
-        parents: Vec<ObjectId>,
-        stale: RawHeads,
-        view: View,
-        rewritten: BTreeMap<ObjectId, Vec<ObjectId>>,
-        before: Vec<View>,
-        timestamp: i64,
-        warnings: Vec<String>,
-    ) -> Result<Self> {
+    pub(crate) fn for_merge(repo: &'r mut Repo, parents: Vec<ObjectId>, stale: RawHeads, plan: crate::repo::MergePlan) -> Result<Self> {
+        let crate::repo::MergePlan {
+            view,
+            rewritten,
+            before,
+            timestamp,
+            warnings,
+        } = plan;
         let n = parents.len();
         let mut tx = Transaction::new(repo, format!("merge {n} concurrent operations"), None)?;
         tx.base = parents;
@@ -729,6 +727,7 @@ impl<'r> Transaction<'r> {
         let mut kept: BTreeSet<ObjectId> = BTreeSet::new();
         let mut dropped: Vec<(ObjectId, String)> = Vec::new();
         let rounds = union.len() * 2 + 4;
+        let mut clean = false;
         for _ in 0..rounds {
             self.view = base_view.clone();
             self.rewritten = union.clone();
@@ -740,6 +739,7 @@ impl<'r> Transaction<'r> {
             }
             let bad = self.confinement_violations(&before)?;
             if bad.is_empty() {
+                clean = true;
                 break;
             }
             let mut progress = false;
@@ -763,19 +763,32 @@ impl<'r> Transaction<'r> {
                     progress = true;
                     dropped.push((c, e.clone()));
                     if let Rewrite::Replaced(n) = r {
-                        // The side already shows the replacement: rewrite
-                        // it back, so its descendants return as well.
-                        if n != c && !kept.contains(&n) {
-                            reversals.insert(n, Rewrite::Replaced(c));
+                        // The side already shows the replacement (or what
+                        // that was rewritten into in turn): rewrite each
+                        // back, so their descendants return as well.
+                        let mut chain = vec![n];
+                        while let Some(Rewrite::Replaced(next)) = union.get(chain.last().expect("non-empty")) {
+                            if chain.contains(next) || *next == c {
+                                break;
+                            }
+                            chain.push(*next);
+                        }
+                        for x in chain {
+                            if x != c && !kept.contains(&x) {
+                                reversals.insert(x, Rewrite::Replaced(c));
+                            }
                         }
                     }
                 }
             }
             if !progress {
-                return Err(VeilError::repo(
-                    "cannot merge concurrent operations without moving a change out of an unreleased embargo (run `vl fsck`)",
-                ));
+                break;
             }
+        }
+        if !clean {
+            return Err(VeilError::repo(
+                "cannot merge concurrent operations without moving a change out of an unreleased embargo (run `vl fsck`)",
+            ));
         }
         dropped.sort();
         dropped.dedup();
@@ -975,15 +988,10 @@ impl<'r> Transaction<'r> {
         self.repo.graph.persist(self.repo);
         let warnings = self.take_merge_warnings();
         self.repo.warnings.extend(warnings);
-        if lock_free {
-            // Merge what landed concurrently now, so that this process
-            // reports what the merge decided. The operation is recorded
-            // either way: a failure here leaves the merge to the next
-            // command.
-            if let Err(e) = self.repo.settle() {
-                self.repo.warnings.push(format!("concurrent operations are not merged yet ({e}); the next command merges them"));
-            }
-        }
+        // Concurrent operations are merged by the next open or
+        // transaction, not here: every committer merging right after it
+        // publishes races the others into a storm of merges (measured: 13×
+        // slower with eight writers).
         Ok(Some(id))
     }
 }

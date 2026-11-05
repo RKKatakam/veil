@@ -194,10 +194,10 @@ fn persists_index(backend: &dyn StorageBackend, view: &View) -> bool {
 /// See `Repo::merge_plan`.
 pub(crate) struct MergePlan {
     pub(crate) view: View,
-    rewritten: BTreeMap<ObjectId, Vec<ObjectId>>,
-    before: Vec<View>,
-    timestamp: i64,
-    warnings: Vec<String>,
+    pub(crate) rewritten: BTreeMap<ObjectId, Vec<ObjectId>>,
+    pub(crate) before: Vec<View>,
+    pub(crate) timestamp: i64,
+    pub(crate) warnings: Vec<String>,
 }
 
 pub fn is_repo(backend: &dyn StorageBackend) -> bool {
@@ -469,7 +469,7 @@ impl Repo {
             let heads = self.base.clone();
             let stale = self.raw.clone();
             let plan = self.merge_plan(&heads, true)?;
-            let tx = Transaction::for_merge(self, heads, stale, plan.view, plan.rewritten, plan.before, plan.timestamp, plan.warnings)?;
+            let tx = Transaction::for_merge(self, heads, stale, plan)?;
             tx.commit()?;
             self.graph.revalidate(self);
         }

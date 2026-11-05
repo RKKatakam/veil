@@ -445,7 +445,9 @@ fn op_head_written_after_upgrade_is_merged() {
 #[test]
 #[ignore = "fixture generator: run by tests/fixtures/generate.sh"]
 fn write_format_6_extras() {
-    let out = PathBuf::from(std::env::var("VEIL_FIXTURE_DIR").expect("VEIL_FIXTURE_DIR"));
+    // Only as the generator (a run of every ignored test passes it by).
+    let Ok(out) = std::env::var("VEIL_FIXTURE_DIR") else { return };
+    let out = PathBuf::from(out);
     let identity = Identity::from_json(&std::fs::read_to_string(out.join("home-alice/identity.json")).unwrap()).unwrap();
     let open = || {
         let mut r = Repo::open(Arc::new(DiskBackend::new(out.join("alice"))), Some(identity.clone()), "alice").unwrap();

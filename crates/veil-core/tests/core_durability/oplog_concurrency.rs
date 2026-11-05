@@ -212,6 +212,41 @@ fn concurrent_rebase_cannot_escape_embargo() {
     assert_fsck_clean(fs.clone(), &id, "after the merge");
 }
 
+/// Threat 3 with a chain: the side that moved the child out also amended
+/// it afterwards (two rewrites, child → moved → amended). Dropping the
+/// first rewrite must take the last replacement back too.
+#[test]
+fn chained_rewrite_cannot_escape_embargo() {
+    let (mut repo, fs, id) = new_repo("alice");
+    let (v1, fix, child) = fix_line(&mut repo, &fs);
+    let change = repo.snapshot(&child).unwrap().change_id;
+    drop(repo);
+    concurrently(
+        &fs,
+        &id,
+        |r| {
+            let moved = r.rebase(child, vec![v1]).unwrap();
+            r.describe(moved, "moved, then amended").unwrap();
+        },
+        |r| {
+            r.merge(WS, v1, vec![fix], "embargoed", Some(EmbargoSpec { scope: "team".into(), until: None })).unwrap();
+        },
+    );
+    let mut r = open(&fs, &id);
+    assert!(r.take_warnings().iter().any(|w| w.contains("was not applied")));
+    for s in r.visible_snapshots().unwrap() {
+        if r.snapshot(&s).unwrap().change_id == change {
+            assert!(r.is_ancestor(&fix, &s).unwrap(), "a copy of the child sits outside the embargo: {}", s.short());
+        }
+    }
+    let mirror = Arc::new(MemoryBackend::new());
+    remote::push(&mut r, mirror.clone(), true, &[], false).unwrap();
+    for n in FIX_NAMES {
+        assert!(backend_contains(&*mirror, n.as_bytes()).is_empty(), "{n} reached the public remote");
+    }
+    assert_fsck_clean(fs.clone(), &id, "after the merge");
+}
+
 // ---- threats 4 and 22: compare-and-swap; a superseded snapshot keeps its objects -----
 
 #[test]

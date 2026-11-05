@@ -341,7 +341,7 @@ impl OpStore {
         }
         let words = heads.len().div_ceil(64);
         let mut full = vec![u64::MAX; words];
-        if heads.len() % 64 != 0 {
+        if !heads.len().is_multiple_of(64) {
             full[words - 1] = (1u64 << (heads.len() % 64)) - 1;
         }
         let bit = |i: usize| -> Vec<u64> {
