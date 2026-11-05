@@ -1605,25 +1605,50 @@ pub struct OpEntry {
     pub timestamp: Option<String>,
     pub user: String,
     pub description: String,
+    /// The workspace the command was run for (format 6; absent for
+    /// repository-wide commands and older operations).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// A merge of concurrent operations: the operations it merges.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub merges: Vec<String>,
     #[serde(skip)]
     pub(crate) timestamp_ms: i64,
+}
+
+pub(crate) fn op_entry(id: veil_core::ObjectId, op: veil_core::oplog::Operation) -> OpEntry {
+    OpEntry {
+        op_id: id.hex(),
+        op_short: id.short(),
+        timestamp: rfc3339(op.timestamp),
+        user: op.user,
+        description: op.description,
+        workspace: op.workspace,
+        merges: match op.parents.len() {
+            0 | 1 => Vec::new(),
+            _ => op.parents.iter().map(|p| p.short()).collect(),
+        },
+        timestamp_ms: op.timestamp,
+    }
 }
 
 pub fn op_log(repo: &Repo, limit: usize) -> Result<OpLog> {
     Ok(OpLog {
         schema: OP_LOG_SCHEMA,
-        operations: repo
-            .op_log(limit)?
-            .into_iter()
-            .map(|(id, op)| OpEntry {
-                op_id: id.hex(),
-                op_short: id.short(),
-                timestamp: rfc3339(op.timestamp),
-                user: op.user,
-                description: op.description,
-                timestamp_ms: op.timestamp,
-            })
-            .collect(),
+        operations: repo.op_log(limit)?.into_iter().map(|(id, op)| op_entry(id, op)).collect(),
+    })
+}
+
+/// `vl op heads --json` (`veil.op.log/1`, one entry per head): the heads
+/// of the operation log as stored, ancestors dropped.
+pub fn op_heads(repo: &Repo) -> Result<OpLog> {
+    let mut operations = Vec::new();
+    for h in repo.ops().heads()? {
+        operations.push(op_entry(h, repo.ops().get(&h)?));
+    }
+    Ok(OpLog {
+        schema: OP_LOG_SCHEMA,
+        operations,
     })
 }
 

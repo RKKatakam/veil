@@ -306,11 +306,19 @@ fn gc_concurrent_with_commits_loses_nothing() {
     for c in children {
         let out = c.wait_with_output().unwrap();
         assert!(exited_cleanly(&out), "{}", text(&out));
+        // With the lock-free op log, `gc --keep-ops-days 0 --prune-now` can
+        // prune the operation a running `ws exec` started from (BUG-804):
+        // that command refuses to record and keeps its output in the
+        // sandbox, which is never a loss. Anything else must succeed.
         assert!(
-            out.status.success() || text(&out).contains("locked"),
+            out.status.success() || text(&out).contains("locked") || text(&out).contains("run the command again"),
             "{}",
             text(&out)
         );
+    }
+    // Record what a refused `ws exec` kept in its sandbox.
+    for w in &ws {
+        env.ok("alice", &proj, &["ws", "exec", w, "--record-only"]);
     }
     let (code, out) = env.code("alice", &proj, &["fsck"]);
     assert_eq!(code, 0, "{out}");

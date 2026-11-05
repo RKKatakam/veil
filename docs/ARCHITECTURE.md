@@ -1208,11 +1208,18 @@ struct Snapshot {
   workspace, the accepted policy and the scanner's rules are what the scan
   saw, then writes the staged objects and records the tree; if anything
   moved meanwhile, or the new content was too large to stage, the tree is
-  built again under the lock. (Stream O of the scale round takes this
-  further: staging on disk and a compare-and-swap of op heads.)
+  built again under the lock. That is formats ≤ 5. From format 6 (the
+  lock-free op log, §9) there is no lock to avoid: the snapshot builds
+  inside its transaction, with its objects staged on disk, and its commit
+  fails ("superseded") if an operation that landed meanwhile moved the
+  workspace; a caller that did not name the working copy it materialised
+  builds again.
 * **Views and the operation log.** A `View` holds the visible heads,
   workspaces (`name → working copy`), tags and remote tags. Every transaction
-  writes one `Operation { parents, user, time, description, view }`. Undo and
+  writes one `Operation { parents, user, time, description, view }` (format
+  6 adds `workspace`, the workspace the command was for, and `rewritten`,
+  its rewrites; concurrent operations are merged, §9 "The lock-free op
+  log"). Undo and
   `op restore` reinstate an older view, and then the CLI checks out the
   difference. Uncommitted edits survive both: the automatic snapshots of the
   attached workspace at the top of the op log are not commands, so undo
@@ -1236,6 +1243,27 @@ struct Snapshot {
   property test checks random command/undo/redo/edit sequences against
   jj's model (a history stack and a redo stack). Undos written before
   `undo_of` existed are plain operations: undoing one redoes it, once.
+* **Undo per workspace (format 6).** `Repo::undo_target(ws)` walks the op
+  graph newest first (by timestamp, then id, across merged branches) and
+  skips merges of concurrent operations and other workspaces' commands: it
+  takes the newest command whose `workspace` is `ws` or none (tags, push,
+  pull, remotes: repository-wide). An agent working in its own workspace
+  never moves a human's undo. The undo is a **3-way revert**,
+  `oplog::revert_views(base = the undone operation's view, revert = its
+  parent's, current)`: what the undone command changed goes back, what
+  every other operation changed since stays; the reverting side wins what
+  both changed, a removal included (undoing `ws new` removes the
+  workspace again, and is refused, as before, if it holds edits recorded
+  since). It is computed inside the undo's own transaction, from its base
+  view, so a command that lands meanwhile is never reverted by accident.
+  Redo reverts the undo the same way. With no other workspace's operation
+  since the target, the result is exactly the old "restore the parent's
+  view", and the jj-model property keeps passing; a second property adds an
+  actor committing in another workspace between the first actor's commands
+  (`two_actor_undo_keeps_other_work`). `vl undo --op ID` undoes one
+  operation; `vl op restore ID` restores a whole view, and refuses without
+  `--force` when other workspaces recorded operations after `ID` (their
+  work would leave the view; it stays in the op log).
 * **Commit and tags.** `vl commit` (`Repo::commit`) moves the tags that
   pointed at the working copy's first parent to the committed change, so
   `main` follows commits made on it. On a **cloaked line** (the workspace
@@ -2582,11 +2610,106 @@ embargo records, team-vault records and the vault holds the repository lock (`Ke
 `Repo::vault_update` take it reentrantly). Push and pull copy objects and
 merge metadata *inside* their transaction, under the destination's lock.
 Two concurrent `grant`s, or a `grant` racing a `pull`, cannot lose an
-update.
+update. From format 6 local transactions no longer hold the lock, so these
+writers race transactions instead of queueing behind them; they still
+serialise among themselves (`metadata_lock::grant_racing_lock_free_commits`).
+The local vault's backup of isolated files, which every command's snapshot
+refreshes, reads the vault first and takes the lock only when the backup
+changes.
+
+**The lock-free op log (format 6, `docs/design/scale/2-lock-free-oplog.md`).**
+Local transactions (`Repo::open`, a format-6 repository not over a network)
+take no lock:
+
+* **Heads.** The log's heads are empty files `.veil/op_heads/<id>`. A
+  transaction records the heads it started from (its *base*) and publishes
+  its operation with them as parents (`OpStore::publish`: write the
+  operation durably, `create_new` its head file, remove the parents' head
+  files). Readers drop a head that is an op-graph ancestor of another (a
+  crash between the last two steps); the walk stops an hour below the oldest
+  head and at pruned operations, where unknown ancestry counts as "not an
+  ancestor" (an extra merge: the merge base walk, `OpStore::split`, has no
+  such floor and finds the operation a side forked from however long ago,
+  BUG-803). A transaction whose base operation was pruned while it ran
+  (`gc --keep-ops-days`) fails at commit rather than publish an operation
+  with no common history (BUG-804). A head naming a missing operation
+  fails `Repo::open`, with `fsck` naming the file; non-head entries are
+  ignored.
+* **Staging.** New loose objects go to the transaction's own directory,
+  `objects/incoming/tx-<owner>/` (`ObjectStore::begin_tx_staging`), which
+  only it reads. At commit: one barrier (a failure removes the directory,
+  and nobody can have adopted those objects), each object renamed over its
+  final name (`rename_unsynced`; content-addressed, so replacing a
+  concurrent identical copy is harmless), then a second barrier over every
+  fan-out directory touched and every fan-out directory of an object the
+  transaction found already present instead of writing it (another
+  process's rename may not be durable yet). Only then the operation. So an
+  operation references only objects that were published after their
+  writer's successful barrier (BUG-044's class, across processes). A
+  transaction whose staging overlapped a failed barrier of another one on
+  the same backend value (they share its write batch) voids itself
+  (`StorageBackend::barrier_failures`). A dropped transaction publishes what
+  it staged too (a stat cache may already name it). `<owner>` encodes the
+  host, boot, pid, pid start time and creation time: `Repo::open` removes
+  the staging and pull spools of owners that are provably gone by the
+  lock's rules (`lock::owner_gone`), and `fsck` notes the others.
+  `recover_interrupted_writes` and the lock's `"recover"` flag remain for
+  formats ≤ 5 and network remotes.
+* **Compare-and-swap.** A snapshot that recorded a workspace
+  (`Transaction::expect_wc`) re-reads the heads at commit and fails
+  ("superseded") if their merged view moved that workspace; the check and
+  the publication are one step for the threads of a process (a static
+  mutex, BUG-806). Every commit re-reads `repo.json` and fails if the
+  repository was upgraded meanwhile.
+  `lock::WcLock` (`flock` on `.veil/local/wc/ws-<name>.lock`, re-entrant
+  within a process) keeps one recorder per workspace directory: the
+  project directory's `Ctx` for its recording and its checkout, `ws exec`,
+  `ws write` and mount recordings.
+* **Merging (`Repo::settle`).** Several heads are merged into one operation
+  at open and before every transaction: folded in id order, each against
+  the nearest common operation, by `oplog::merge_views`, a 3-way merge per
+  key (heads: kept if every side kept it or some side added it;
+  workspaces, tags, remote tags: one side's change wins, two different
+  changes go to the first side and the other target stays a visible head,
+  with a warning printed once by the process that writes the merge; a
+  removal loses to a change; a workspace's or tag's cloak merges separately
+  and a cloaked side wins; a release tag's target and annotation are one
+  unit and win over an ordinary tag). Each side's `rewritten` is applied to
+  the other's new snapshots (`Transaction::for_merge` runs the auto-rebase:
+  a child committed on a snapshot amended meanwhile moves onto the amended
+  one); both sides rewriting one snapshot differently is a divergent change,
+  and a rewrite whose old snapshot is still visible on its side (an undo
+  since: as a ref or an ancestor of one) is not applied (BUG-802).
+  The confinement check runs against **every side's view**: a rewrite that
+  would move a change out of an unreleased embargo either side had it in
+  is dropped and its replacement rewritten back, so the change stays
+  inside, and a warning names the change and the embargo, never a file.
+  The merge never fails for a policy reason: a snapshot whose rebase is
+  refused (two unreleased embargoes combined, say) stays on its old
+  parents, with what is built on it, and the warning names it (BUG-805).
+  Its timestamp is its
+  parents' latest, its user `veil`, and what it creates derives its change
+  ids from its parents: two processes merging the same heads write the same
+  operation, and `create_new` of its head file loses to itself. Merging at
+  open, rather than in memory for read-only commands as the design
+  allowed, is deliberate: a command such as push computes what to send from
+  the view it opened, and an escaping rewrite must already be dropped
+  there.
+* **Remotes** (`Repo::open_remote`) keep `.veil/lock` for their
+  transactions (push phase B, remote gc), with one head in `op_heads/`;
+  on a disk remote objects are staged like local ones, on SFTP the
+  unsynced protocol and lock recovery stay.
+* **Pull spools** are `incoming/pull-<owner>` of their transaction, so
+  concurrent pulls never touch each other's.
+* **gc** marks from every head and from what live transactions staged
+  (their trees may be all that references an older object), and a transaction older than half the grace period freshens
+  every pre-existing object it references before it publishes.
 
 **Crash ordering.** Every transaction writes in this order: objects (the
 snapshot, trees and blobs it references), then a durability barrier, then
-the operation, then `op_head`. Pull and push copy objects and shared metadata
+the operation, then `op_head` (format 6: staged objects, a barrier, their
+renames, a second barrier, the operation, its head file, the removal of its
+parents' head files). Pull and push copy objects and shared metadata
 (key rings, embargo records) before the operation that references them.
 `init` writes `repo.json` last, because it is what makes a directory a
 repository.
@@ -2821,8 +2944,9 @@ this order:
    process that is building a snapshot and waiting for the lock, are not in
    the inventory, so gc never touches them.
 2. **Op-log pruning** (`--keep-ops-days N`, off by default). Delete
-   operations older than the window. The current operation and its parents
-   are always kept, so `vl undo` works and can be redone. `op log`
+   operations older than the window. The current operations (every head,
+   format 6) and their parents are always kept, so `vl undo` works and can
+   be redone. `op log`
    and op-id prefixes end where the log was pruned.
 3. **Mark.** The roots are the views of every retained operation (heads,
    workspaces, tags, remote tags), the universal root, the project

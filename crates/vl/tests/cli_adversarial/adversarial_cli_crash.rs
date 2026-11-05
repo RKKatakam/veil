@@ -100,28 +100,37 @@ fn kill_9_mid_command_never_corrupts_the_repository() {
     assert!(cat.starts_with("round5 7"), "{cat}");
 }
 
-/// A process killed while holding the repository lock blocks every later
-/// command for two minutes.
+/// A process killed while holding the repository lock blocked every later
+/// command for two minutes. From format 6 a recording takes no repository
+/// lock: it stages its objects in its own directory. A process killed
+/// while staging blocks nothing, its staging directory is removed by the
+/// next command (its pid is provably gone), and the repository stays
+/// consistent.
 #[test]
 fn repository_is_usable_right_after_a_crash_while_locked() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a", "a\n")]);
     many_files(&proj, 3000, "v1");
     env.ok("alice", &proj, &["status"]);
+    let incoming = proj.join(".veil/objects/incoming");
+    let staging = || -> Vec<String> {
+        std::fs::read_dir(&incoming).map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with("tx-")).collect()).unwrap_or_default()
+    };
     let mut caught = false;
     for attempt in 0..30 {
         many_files(&proj, 3000, &format!("v{}", attempt + 2));
         let mut child = env.spawn("alice", &proj, &["status"]);
-        // the lock is held while the tree is being built
-        let held = wait_for(Duration::from_secs(5), || proj.join(".veil/lock").exists());
+        // objects are staged while the tree is being built
+        let held = wait_for(Duration::from_secs(5), || !staging().is_empty() && proj.join(".veil/objects/incoming").read_dir().is_ok_and(|d| d.flatten().any(|e| e.path().read_dir().is_ok_and(|mut f| f.next().is_some()))));
         let _ = child.kill();
         let _ = child.wait();
-        if held && proj.join(".veil/lock").exists() {
+        if held && !staging().is_empty() {
             caught = true;
             break;
         }
     }
-    assert!(caught, "could not kill vl while it held the lock");
+    assert!(caught, "could not kill vl while it staged objects");
+    assert!(!proj.join(".veil/lock").exists(), "a recording took the repository lock");
     let start = Instant::now();
     let out = env.vl("alice", &proj, &["status"]);
     assert!(
@@ -130,6 +139,8 @@ fn repository_is_usable_right_after_a_crash_while_locked() {
         start.elapsed(),
         text(&out)
     );
+    assert!(staging().is_empty(), "the dead process's staging was not removed: {:?}", staging());
+    env.ok("alice", &proj, &["fsck"]);
 }
 
 #[test]

@@ -254,7 +254,8 @@ fn world() -> (Arc<MemoryBackend>, Arc<Disk>, Identity) {
 
 fn world_of(id: &Identity) -> (Arc<MemoryBackend>, Arc<Disk>) {
     let mem = Arc::new(MemoryBackend::new());
-    let mut repo = Repo::init(mem.clone(), Some(id.clone()), "alice").unwrap();
+    // The unsynced-object protocol and lock recovery: formats ≤ 5.
+    let mut repo = Repo::init_for_clone_at(mem.clone(), Some(id.clone()), "alice", 5).unwrap();
     mem.write(&p("README"), b"hello\n").unwrap();
     repo.snapshot_workspace(WS, &*mem).unwrap();
     repo.commit_working_copy(WS, "base").unwrap();

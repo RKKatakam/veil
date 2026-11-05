@@ -46,6 +46,19 @@ release still opens, reads, verifies, `fsck`s, upgrades and syncs it.
   release, when Git interop was removed (2026-11-05): the first set also
   held Git-only data that format 5 no longer has.
 
+* `format-6/`: the lock-free op log (`op_heads/`, `Operation::workspace`
+  and `rewritten`), generated with `VEIL_FIXTURE_EXTRAS=<core_format test
+  binary> generate.sh target/debug/vl …/format-6 …/format-5` (a debug build
+  of the same sources). After the usual history, the `write_format_6_extras`
+  test of `format_compat.rs` writes concurrent operations last: an amend of
+  `links`' change racing a new workspace `concurrent` on it (merged by the
+  next open, so the log holds a merge whose side carries `rewritten` and
+  `workspace`), then two tag sets (`head-c`, `head-d`) left as two heads.
+  `upgraded/` is format-5's `alice/` and `team-remote/` after `vl upgrade
+  --remote origin` and `vl upgrade` (5 → 6). Format 6 is unreleased: streams
+  A (attribution) and C (partial clone) extend it, and regenerate this set
+  with their additions before the release.
+
 `encodings.txt` pins the bytes of every object encoding. Append to it (with
 `VEIL_BLESS_ENCODINGS=1`) only together with a new format; see
 `docs/FORMAT.md` §4 and §6.

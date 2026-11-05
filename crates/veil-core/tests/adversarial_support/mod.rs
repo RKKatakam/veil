@@ -30,6 +30,15 @@ pub fn new_repo(name: &str) -> (Repo, Arc<MemoryBackend>, Identity) {
     (repo, fs, id)
 }
 
+/// [`new_repo`] at format 5: one op head moved under the repository lock
+/// (the lock-free op log is format 6).
+pub fn new_repo_v5(name: &str) -> (Repo, Arc<MemoryBackend>, Identity) {
+    let fs = Arc::new(MemoryBackend::new());
+    let id = Identity::generate(name);
+    let repo = Repo::init_for_clone_at(fs.clone(), Some(id.clone()), name, 5).unwrap();
+    (repo, fs, id)
+}
+
 pub fn repo_for(name: &str, id: &Identity) -> (Repo, Arc<MemoryBackend>) {
     let fs = Arc::new(MemoryBackend::new());
     let repo = Repo::init(fs.clone(), Some(id.clone()), name).unwrap();

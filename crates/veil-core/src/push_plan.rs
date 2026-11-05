@@ -305,7 +305,7 @@ pub fn plan_push_with(
         // What the push would create: an empty bare repository.
         Repo::init_bare(Arc::new(MemoryBackend::new()))?
     } else {
-        Repo::open(ro, None, "remote")?
+        Repo::open_remote(ro)?
     };
     let mut report = SyncReport::default();
     let (sendable, withheld) = remote::sendable_tags(local, public, only_tags, &mut report)?;

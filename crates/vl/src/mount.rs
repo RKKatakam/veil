@@ -489,9 +489,11 @@ impl Recorder {
     /// moved). Returns what to tell the user.
     fn record(&mut self) -> Result<Vec<String>> {
         let mut notes = Vec::new();
+        let _wc = veil_core::lock::WcLock::acquire(&veil_core::repo::state_dir(&self.root), &self.ws)?;
         for _ in 0..8 {
             let generation = self.fs.generation();
             let mut repo = open_repo(&self.root)?;
+            repo.set_command_workspace(Some(self.ws.clone()));
             let Some(wc) = repo.view().workspaces.get(&self.ws).map(|w| w.wc) else {
                 self.orphan(&mut repo, &mut notes)?;
                 return Ok(notes);

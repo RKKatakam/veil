@@ -282,6 +282,35 @@ const HINT_DIR: u8 = 0;
 const HINT_FILE: u8 = 1;
 
 /// Mark phase state.
+/// The objects a staged object references (a sealed one is opened with
+/// this device's keys; one it cannot open references nothing it can see).
+fn staged_children(store: &ObjectStore, raw: &[u8]) -> Vec<ObjectId> {
+    let mut obj = match Object::decode(raw) {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    for _ in 0..4 {
+        let Object::Sealed(env) = &obj else { break };
+        let Ok(key) = store.keys.require(&env.scope) else { return Vec::new() };
+        let Ok(plain) = env.open(&key) else { return Vec::new() };
+        obj = match Object::decode(&plain) {
+            Ok(o) => o,
+            Err(_) => return Vec::new(),
+        };
+    }
+    match obj {
+        Object::Snapshot(s) => {
+            let mut v = s.parents.clone();
+            v.push(s.tree);
+            v
+        }
+        Object::Tree(t) => t.entries.iter().flat_map(|e| std::iter::once(e.id).chain(e.fallback)).collect(),
+        Object::Conflict(c) => c.referenced_ids(),
+        Object::Atag(a) => vec![a.target],
+        _ => Vec::new(),
+    }
+}
+
 struct Mark<'a> {
     store: &'a ObjectStore,
     reach: HashSet<ObjectId>,
@@ -509,6 +538,8 @@ pub fn gc(repo: &mut Repo, opts: &GcOptions) -> Result<GcReport> {
     // 2. Operations to retain.
     let op_ids = list_hex_files(&*backend, &VPath::new(".veil/ops")?)?;
     report.ops_before = op_ids.len();
+    // Every head of the op log (format 6 may have several) is a root.
+    let heads = repo.ops.heads()?;
     let head = repo.ops.head()?;
     let mut ops: HashMap<ObjectId, Operation> = HashMap::new();
     let mut retained: HashSet<ObjectId> = HashSet::new();
@@ -528,8 +559,14 @@ pub fn gc(repo: &mut Repo, opts: &GcOptions) -> Result<GcReport> {
         Some(op) => op.clone(),
         None => repo.ops.get(&head)?,
     };
-    retained.insert(head);
-    retained.extend(head_op.parents.iter().copied());
+    for h in &heads {
+        retained.insert(*h);
+        let op = match ops.get(h) {
+            Some(op) => op.clone(),
+            None => repo.ops.get(h)?,
+        };
+        retained.extend(op.parents.iter().copied());
+    }
     match opts.keep_ops {
         None => retained.extend(ops.keys().copied()),
         Some(keep) => {
@@ -574,6 +611,24 @@ pub fn gc(repo: &mut Repo, opts: &GcOptions) -> Result<GcReport> {
     mark.trees_of_snapshots();
     for m in &markers {
         mark.any(*m);
+    }
+    // What live transactions staged (format 6) is not in the store yet,
+    // but may be all that references an older object: mark what it
+    // references (threat 14 of the lock-free op log).
+    let ctx = crate::lock::LockContext::default();
+    for (name, tag) in store.staging_dirs()? {
+        if !name.starts_with(crate::store::TX_STAGING_PREFIX) || crate::lock::owner_gone(&tag, &ctx) {
+            continue;
+        }
+        let staged = store.staged_objects_in(&name)?;
+        let ids: HashSet<ObjectId> = staged.iter().map(|(id, _)| *id).collect();
+        for (_, raw) in staged {
+            for c in staged_children(&store, &raw) {
+                if !ids.contains(&c) {
+                    mark.any(c);
+                }
+            }
+        }
     }
     report.reachable = inventory.iter().filter(|id| mark.reach.contains(id)).count();
     report.incomplete = std::mem::take(&mut mark.incomplete);

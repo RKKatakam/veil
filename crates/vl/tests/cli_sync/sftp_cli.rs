@@ -269,8 +269,8 @@ fn upgrade_remote_over_a_stand_in_ssh() {
     assert!(dry.contains("Would upgrade remote 'ssh'"), "{dry}");
     assert_eq!(format_of(&remote), 2, "a dry run writes nothing");
     let out = env.ok("alice", &alice, &["upgrade", "--remote", "ssh"]);
-    assert!(out.contains("from format 2 to format 5"), "{out}");
-    assert_eq!(format_of(&remote), 5, "the SFTP remote was upgraded");
+    assert!(out.contains("from format 2 to format 6"), "{out}");
+    assert_eq!(format_of(&remote), 6, "the SFTP remote was upgraded");
     assert_eq!(format_of(&decoy), 2, "the look-alike local path was not touched");
     assert!(!remote.join(".veil/upgrade.json").exists());
 

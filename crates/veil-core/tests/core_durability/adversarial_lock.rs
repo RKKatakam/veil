@@ -35,7 +35,8 @@ const LOCK: &str = ".veil/lock";
 #[test]
 #[cfg(unix)]
 fn a_live_lock_holder_is_never_robbed() {
-    let (mut a, fs, _) = new_repo("alice");
+    // Transactions hold the lock up to format 5 (and on remotes).
+    let (mut a, fs, _) = new_repo_v5("alice");
     let base = commit_files(&mut a, &*fs, &[("f", "1\n")], "base");
     let mut alive = std::process::Command::new("sleep").arg("60").spawn().expect("spawn `sleep`");
 
@@ -89,7 +90,8 @@ fn a_live_lock_holder_is_never_robbed() {
 #[test]
 #[cfg(unix)]
 fn a_tampered_lock_is_reclaimed_and_its_holder_cannot_commit() {
-    let (mut a, fs, _) = new_repo("alice");
+    // Transactions hold the lock up to format 5 (and on remotes).
+    let (mut a, fs, _) = new_repo_v5("alice");
     let base = commit_files(&mut a, &*fs, &[("f", "1\n")], "base");
     let mut b = Repo::open(fs.clone(), None, "bob").unwrap();
 
@@ -185,7 +187,10 @@ fn concurrent_writers_never_lose_operations() {
     }
     let r = Repo::open(fs.clone(), None, "check").unwrap();
     assert_eq!(r.view().tags.len(), threads * per, "tags: {}", r.view().tags.len());
-    assert_eq!(r.op_log(usize::MAX).unwrap().len(), before + threads * per);
+    // Format 6: concurrent operations are merged (the merges are extra).
+    let log = r.op_log(usize::MAX).unwrap();
+    assert_eq!(log.iter().filter(|(_, op)| !op.is_merge()).count(), before + threads * per);
+    assert_eq!(r.heads().len(), 1, "settled");
     assert!(!fs.exists(&p(LOCK)).unwrap(), "lock leaked");
 }
 
@@ -222,9 +227,10 @@ fn concurrent_snapshots_of_different_workspaces_are_all_recorded() {
     }
 }
 
-/// A working copy that is slow to read (huge tree, network FS): the snapshot
-/// holds the lock for its whole duration; a concurrent writer must wait, not
-/// fail or interleave, and both operations must be recorded.
+/// A working copy that is slow to read (huge tree, network FS). Up to format
+/// 5 the snapshot held the lock for its whole duration and a concurrent
+/// writer waited. From format 6 nothing holds a lock: the writer goes
+/// through at once, and both operations are recorded (merged).
 #[test]
 fn slow_snapshot_serialises_with_a_concurrent_writer() {
     #[derive(Debug)]
@@ -286,7 +292,7 @@ fn slow_snapshot_serialises_with_a_concurrent_writer() {
     let snap_time = start.elapsed();
     let waited = other.join().unwrap();
     assert!(out.changed && snap_time > Duration::from_secs(1));
-    assert!(waited > Duration::from_millis(500), "writer did not wait for the snapshot ({waited:?})");
+    assert!(waited < Duration::from_millis(500), "the writer waited for the snapshot ({waited:?})");
     let r = Repo::open(repo_fs, None, "c").unwrap();
     assert!(r.view().tags.contains_key("b"));
     assert_eq!(r.workspace_wc(WS).unwrap(), out.snapshot, "snapshot lost");

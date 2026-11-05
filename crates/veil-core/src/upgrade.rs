@@ -52,6 +52,7 @@ use crate::{
     lock::RepoLock,
     now_millis,
     object::{Object, TreeEncoding},
+    oplog::{OP_HEADS_DIR, OP_HEADS_REPO_FORMAT, OP_HEAD_FILE},
     repo::{check_format_supported, min_vl_for_format, read_config, write_config, REPO_FORMAT},
     store::ObjectStore,
     vfs::StorageBackend,
@@ -150,6 +151,9 @@ fn transition_steps(from: u32) -> Vec<&'static str> {
         // stayed unrecorded (a format-4 snapshot never holds one), so no
         // object, id or signature changes.
         4 => vec![],
+        // The lock-free op log: a head file for the current `op_head`,
+        // before the commit point (format-5 readers ignore `op_heads/`).
+        5 => vec!["op-heads"],
         _ => vec![],
     }
 }
@@ -161,7 +165,31 @@ fn post_commit_steps(from: u32, to: u32) -> Vec<String> {
     if from < HPKE_REPO_FORMAT && to >= HPKE_REPO_FORMAT {
         out.push(format!("{HPKE_REPO_FORMAT}:hpke-ring-keys"));
     }
+    if from < OP_HEADS_REPO_FORMAT && to >= OP_HEADS_REPO_FORMAT {
+        out.push(format!("{OP_HEADS_REPO_FORMAT}:remove-op-head"));
+    }
     out
+}
+
+/// The head file of `op_head`'s operation (idempotent).
+fn op_heads_step(backend: &Arc<dyn StorageBackend>) -> Result<()> {
+    let Some(raw) = backend.read_opt(&VPath::new(OP_HEAD_FILE)?)? else {
+        return Ok(()); // already moved (a resumed upgrade)
+    };
+    let head = crate::id::ObjectId::from_hex(String::from_utf8_lossy(&raw).trim())
+        .map_err(|_| VeilError::Corrupt(OP_HEAD_FILE.into(), "does not contain an operation id".into()))?;
+    backend.create_new(&VPath::new(&format!("{OP_HEADS_DIR}/{}", head.hex()))?, b"")?;
+    Ok(())
+}
+
+/// `6:remove-op-head`: after the commit point, `op_head` is not written any
+/// more. Its operation gets a head file first (it may have moved since the
+/// first step, if the upgrade was interrupted in between), then it is
+/// removed, with the fixed pull spool of format 5 (now one per pull).
+fn remove_op_head_step(backend: &Arc<dyn StorageBackend>) -> Result<()> {
+    op_heads_step(backend)?;
+    backend.remove_file(&VPath::new(OP_HEAD_FILE)?)?;
+    backend.remove_dir_all(&VPath::new(".veil/objects/incoming/pull")?)
 }
 
 /// `3:hpke-ring-keys`: rotate every ring this identity may change whose
@@ -258,6 +286,19 @@ fn notes_for(from: u32, to: u32, report: &UpgradeReport) -> Vec<String> {
              repository"
                 .into(),
         );
+    }
+    if from < OP_HEADS_REPO_FORMAT && to >= OP_HEADS_REPO_FORMAT {
+        notes.push(
+            "commands no longer wait for each other: each records its operation without the repository lock, \
+             and concurrent operations are merged; `vl undo` undoes the last command of the workspace it runs in; \
+             nothing recorded before the upgrade changes"
+                .into(),
+        );
+        notes.push(format!(
+            "vl releases that only know format 5 refuse this repository; a remote at format 5 keeps working \
+             (upgrade it with `vl upgrade --remote <name>` once everyone who uses it runs vl {} or later)",
+            min_vl_for_format(OP_HEADS_REPO_FORMAT)
+        ));
     }
     if from < 2 && to >= 2 {
         notes.push(format!(
@@ -404,6 +445,12 @@ pub fn upgrade(
         if step.ends_with(":hpke-ring-keys") {
             let notes = hpke_ring_keys(&backend, identity.as_ref(), &config.repo_id)?;
             report.step_notes.extend(notes);
+        }
+        if step.ends_with(":op-heads") {
+            op_heads_step(&backend)?;
+        }
+        if step.ends_with(":remove-op-head") {
+            remove_op_head_step(&backend)?;
         }
         j.done.push(step);
         write_journal(&*backend, &j)?;

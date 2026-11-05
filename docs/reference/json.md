@@ -401,13 +401,14 @@ An `annotation` holds `id` (the hex id of the annotated tag object), `kind`, `ta
 
 ## `veil.op.log/1`
 
-`vl op log --json`: the operation log, newest first; `-n` (default 20)
-limits it.
+`vl op log --json`: the operation log, newest first (merged branches
+interleaved by time); `-n` (default 20) limits it. `vl op heads --json`
+lists the heads of the log in the same shape.
 
 | Field | Type | Meaning |
 |---|---|---|
 | `schema` | string | `veil.op.log/1` |
-| `operations` | array | `op_id` and `op_short` (string: pass either to `vl op restore`); `timestamp`; `user`; `description` (what the operation did) |
+| `operations` | array | `op_id` and `op_short` (string: pass either to `vl op restore` or `vl undo --op`); `timestamp`; `user`; `description` (what the operation did); `workspace` (string, absent for repository-wide commands and operations written before format 6: the workspace the command was run for); `merges` (array of short operation ids, absent unless the operation merges concurrent ones) |
 
 ## `veil.scan/1`
 
