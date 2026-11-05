@@ -48,6 +48,25 @@ notes/                 isolated
 - **The same names work for secrets** (`deploy/keys/ secret ops`).
 - **Who can change the policy.** Editing `.veilpolicy` to widen access to a path needs someone who already has access to it **and** the right to manage permissions. The Hub checks this on push, and the accepted-policy pin protects it locally. Otherwise anyone could add their own name.
 
+## Embargoes: hidden changes, released later
+
+The tiers above are **per path**. An **embargo** is **per change**. It is for work like a security fix that must reach some people now, and the public only later.
+
+1. **Fix privately** on an embargoed line (e.g. `vl ws new fix --cloak security`).
+2. **Merge it everywhere, hidden:** `vl merge fix --into main --embargo --until 2026-12-01`.
+   - **Who has access** (the company, a group such as `security`, named people, or **outside partners** such as distro maintainers) gets the fix in `main`: its code, its message and its history. They can build, ship and install it.
+   - **Everyone else**, including the public repository, sees `main` without it. They see no content, no message, no file names, and not even which files changed.
+3. **Everything built on top stays embargoed** until release ("confinement"), so a later commit can't leak it by accident.
+4. **Release:** `vl embargo release`, or automatically at the deadline. The fix, its history and its message then appear publicly. On the Hub, a separate release service publishes it on time, without the Hub holding the key before the deadline (`HUB.md` §8).
+
+**On the Hub: hidden PRs.** A proposal under an embargo is visible only to the embargo's group. It can be reviewed, approved and landed invisibly, then released.
+
+**Embargoes stay encrypted** (like the secret tier), not just permission-checked:
+- an unreleased security fix is a prime target;
+- it often has to reach people outside the company, over remotes the Hub doesn't control.
+
+A patch is small, so decrypting it costs nothing noticeable.
+
 ## Who gets what
 
 | Reader | public | company | secret | isolated |
@@ -81,7 +100,10 @@ notes/                 isolated
 - **`.env` changes from isolated** (never shared) **to secret** (encrypted and shared with the company).
 - **A new company tier** (plaintext, enforced by the Hub). On push, public remotes withhold company paths exactly as they withhold secret content.
 - **The Hub is zero-knowledge for the secret tier only,** not for all code. The Hub, and anyone who breaches it, can read company code. This is the trade the owner chose for simplicity and server-side features.
-- **Unchanged:** public remotes and mirrors never receive anything but public paths, and isolated files never leave the machine.
+- **Unchanged:**
+  - public remotes and mirrors never receive anything but public paths;
+  - isolated files never leave the machine;
+  - embargoes work as before (encrypted, per change, with confinement and timed release), with groups, people and outside partners as their audience.
 
 ## Questions to settle in stream V's design (not decided here)
 
