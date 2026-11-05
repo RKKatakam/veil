@@ -312,3 +312,28 @@ Lock time in the traced repetition (2 iterations each, sums over all commands):
 
 - **Throughput is no longer flat**: 2.5–2.9× the baseline at N = 4–16. At N = 64 (twice the CPU count) it drops to 647 a minute: CPU-bound agents plus the remote's lock, now the only shared lock (its waits appear at N = 64, 511 ms in all; each hold is at most 98 ms traced). Stream P (lock-free pushes) owns that.
 - **Single-command cases** are unchanged within noise (`status, clean` 0.089 s loose / 0.021 s packed; `tag set` 0.024 s; `commit, 100 modified files` 0.081 s), and the "local lock held" column is empty: no local command took `.veil/lock`.
+
+## After stream P (two-phase pushes), `small`
+
+`scripts/bench-scale.sh small`, seed 1, branch `t3/a6c6d6aa` (stream P, on `integration` @ 12f35fa), same machine (32 CPUs, ext4, warm cache), 2026-11-05. Full table: `.scratch/bench-results/small-seed1-20261105T183356Z.md` of that worktree (not kept).
+
+**Gates:**
+- **No `.veil/lock` waits at N = 64: passes.** Every command of every agent, at N = 4, 16 and 64, waited 0 ms for `.veil/lock` and held it 0 ms (traced runs).
+- **The remote lock is held for at most a few hundred ms per push: passes.** The longest single hold in the traced N-agents runs is 8 ms, and remote waits are 0. `push, 1 new snapshot` holds it 5 ms (traced).
+- **No failures: passes.** 0 failures and 0 retries at every N.
+- **Push of 1 snapshot or of nothing new no longer reads all snapshots: passes.** It reads 71 of 1,073 (6.6 %), down from 1,073 (100 %). The 71 are the `release` line and the embargoed fix line: `embargo_withheld`'s range over the fix, and the walk down a known line that builds on an embargoed merge. A first run of this branch still read 1,023: phase B's boundary check walked from the view down to the oldest pushed tag, since unchanged tags are in the boundary. Fixed: a boundary snapshot that is itself a ref of the view needs no walk.
+
+| case | baseline (b549e1e) | after stream O | after stream P |
+|---|---:|---:|---:|
+| push, nothing new (path): median / snapshots read / remote lock (traced) | – | – | 0.029 s / 71 (6.6 %) / 2 ms |
+| push, 1 new snapshot (path) | 0.051 s / 1,073 (100 %) / 12 ms | – | 0.043 s / 71 (6.6 %) / 5 ms |
+| push, 1 new snapshot (SFTP) | 0.080 s | – | 0.067 s |
+| push, initial (path / SFTP) | 1.320 s, 193 MiB / – | – | 1.260 s, 85 MiB / 1.555 s, 125 MiB |
+
+| N agents (`small`, 10 iterations) | landings / min | failures | push p50 / p95 | remote lock hold, sum (max) | after stream O |
+|---:|---:|---:|---:|---:|---|
+| 4 | 991 | 0 | 0.08 / 0.13 s | 42 ms (7 ms) | 959 / min; 78 ms (11 ms) |
+| 16 | 1,075 | 0 | 0.28 / 0.42 s | 165 ms (7 ms) | 1,058 / min; 601 ms (31 ms) |
+| 64 | 882 | 0 | 1.16 / 1.73 s | 648 ms (8 ms) | 647 / min; 7,038 ms (98 ms), 511 ms of waits |
+
+At N = 64 the remote's lock no longer queues anyone (0 ms waits, 8 ms longest hold, against 98 ms before). Throughput rose from 647 to 882 landings a minute; the rest is CPU, at twice the CPU count. Not measured here: the 200 MB push (whether phase B's hold is independent of pack size), and push RSS at `5g` (threat 14).

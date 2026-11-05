@@ -2306,18 +2306,51 @@ what the other provably has (`remote.rs` has the details):
   the receiver holds them in a pack, and on a public receiver embargo
   wrappers are always revisited (what they hold may have been withheld then
   and be releasable now).
-* **Push** walks the remote view's closure on the *local* graph, sends only
-  the snapshots outside it, and skips every subtree reachable from the
-  known snapshots they build on. Everything sent goes into packs of about
-  128 MiB with deltas between versions of the same path (`PackWriter`),
-  streamed to the remote's pack directory inside its transaction: each
-  pack durably under its name (a temp file until then), a barrier, then
-  the index durably. A crash leaves at worst a temp file, an invisible
-  pack (no index) or a complete one whose operation never landed. Tag
-  fast-forward checks run on the local graph too, under the remote's lock
-  and **before anything is sent**: the history of a rejected tag is not
-  uploaded, since the remote's committed view would never reach it and
-  every retry would send it again as a new pack (BUG-288).
+* **Push** has two phases (`docs/design/scale/1-lock-free-push.md`).
+  * **Phase A, without the remote's lock**, plans against the remote's
+    committed view as read then (advisory). One walk of the *local* graph
+    by generation (the history index) finds the snapshots the tags reach
+    outside that view's closure, and stops as soon as none left could be
+    sent: it reads the history above the remote's view, not all of it.
+    Below a known snapshot it goes on only along lines that build on an
+    embargoed merge (a merged-in parent withheld then may be releasable
+    now). Of their trees, a subtree whose id equals the one **at the same
+    path** in a known snapshot they build on is not sent and not read
+    (the path-aligned diff; an object that moved is sent again, which is
+    harmless). Tag fast-forward checks run on the local graph against
+    that view, **before anything is sent** (BUG-288).
+  * Everything sent goes into packs of at most 32 MiB of objects
+    (`VEIL_PUSH_CHUNK`; deltas between versions of a path), streamed into
+    the push's own staging directory `.veil/objects/incoming/push-<id>/`
+    (created exclusively, never through a symlink), each `.pack` durably,
+    then its `.idx`. No reader, inventory, fsck or gc counts what is
+    there. Each staged pack is recorded in the push journal
+    (`.veil/local/push/<hash of URL and tags>.json`), with the visibility
+    rules it passed (public or team, the embargoes released then).
+  * **Phase B, under the remote's lock** (waiting up to 300 s), re-reads
+    the view and decides the tags again against it; checks that every
+    known snapshot the upload built on is still in the view's committed
+    closure (a rewind and a prune in between: start again); checks every
+    journalled pack (in staging, or published by an interrupted attempt,
+    with the size its index implies); publishes the staged embargo
+    releases and only then checks that every embargo the plan treated as
+    released still is (BUG-807); then `ensure_held`, renames each pack and
+    then its index into `objects/pack/`, a barrier, the metadata merges
+    and the operation (`ensure_held` again). A failed check releases the
+    lock and runs phase A again, at most three times. `SyncReport::
+    lock_held_ms` says how long the lock was held.
+  * **Resume:** a retry finds the journal and reuses the packs it names
+    that are complete on the remote: their objects are not sent again,
+    but are still looked inside (the interrupted attempt may not have
+    staged what they reference). A journal whose rules no longer hold (a
+    release taken back, the remote turned public) is discarded with its
+    staging. A crash leaves at worst unpublished staging, or complete
+    packs no operation references; never a partial push.
+  * **Staging lifetime:** removed after publication; on a public remote,
+    removed under the lock when a tag was rejected meanwhile (what was not
+    published stays unpublished); kept for reuse on a team remote. Any
+    push and `vl -R <remote> gc` remove staging untouched for a week (its
+    `touched` file); `vl doctor --remotes` lists staging older than a day.
 * **Pull** lists the remote's objects (pack indexes and loose fan-out
   directories, many requests in flight), skips every snapshot the local
   committed view reaches, and at the first object it lacks downloads, in
