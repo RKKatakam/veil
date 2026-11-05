@@ -271,8 +271,9 @@ fn gc_keeps_cloaked_content_and_content_it_cannot_read() {
 }
 
 // Scenario from git t6500-gc.sh: "background auto gc respects lock" — gc next to running commands.
+// BUG-811: under load (12 copies at once) this lost a recorded tree about
+// one run in three, before gc deleted only under its fence.
 #[test]
-#[ignore = "BUG-811: gc --keep-ops-days 0 --prune-now racing ws exec can lose a recorded tree under load (fails ~1 in 3 with 12 copies at once)"]
 fn gc_concurrent_with_commits_loses_nothing() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a", "a\n")]);

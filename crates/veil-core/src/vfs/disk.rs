@@ -960,6 +960,10 @@ impl StorageBackend for DiskBackend {
         }))
     }
 
+    fn local_path(&self, path: &VPath) -> Option<PathBuf> {
+        Self::own_path(path).then(|| self.full_path(path))
+    }
+
     #[cfg(unix)]
     fn available_space(&self, dir: &VPath) -> Option<u64> {
         use std::os::unix::ffi::OsStrExt;

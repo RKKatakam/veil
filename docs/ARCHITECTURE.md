@@ -3011,6 +3011,19 @@ this order:
 6. **Repack.** Write one new pack with everything kept: reachable objects
    plus pending ones. Then delete the pruned ops, the now-packed loose files
    and the old packs, and finally write the new pending list.
+   **The deletion fence (lock-free repositories, BUG-811).** gc holds the gc
+   lease (`.veil/gc.lock`, an `flock`), not `.veil/lock`. Every deletion
+   happens under `objects/gc/fence`, raised only once no transaction is
+   registered (`objects/incoming/live-<owner>`, from before it reads the
+   heads until it has published): gc waits up to 5 s for a quiet moment,
+   then raises it and waits up to 60 s for the rest (new transactions wait
+   for it), and otherwise deletes nothing that run. Under the fence it reads
+   its roots again and marks what they reach (what was published or reused
+   meanwhile), prunes only operations of its first listing, and gives a
+   loose copy to anything that became reachable whose pack goes. When it
+   deleted something it writes a new prune epoch (`objects/gc/epoch`); a
+   transaction whose process read its view under an older epoch checks at
+   commit that what its view gained and its new objects name is present.
 7. **Refuse to guess.** If any operation, snapshot or tree on the way cannot
    be read (missing, corrupt, or sealed without a key), gc still packs but
    deletes nothing, and reports why.

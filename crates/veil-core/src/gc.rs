@@ -40,7 +40,6 @@ use std::{
 use crate::{
     error::{Result, VeilError},
     id::ObjectId,
-    lock::RepoLock,
     now_millis,
     object::{EntryKind, Object},
     oplog::Operation,
@@ -61,7 +60,9 @@ pub struct GcOptions {
     /// Prune operations older than this. `None` keeps the whole op log.
     pub keep_ops: Option<Duration>,
     /// How long an object must have been unreachable before it is deleted.
-    /// `Duration::ZERO` deletes immediately (unsafe with concurrent writers).
+    /// `Duration::ZERO` deletes immediately; on a lock-free repository
+    /// still only under the deletion fence ([`crate::maintenance`]), so
+    /// never under a running transaction.
     pub grace: Duration,
     /// zstd level for packed objects.
     pub level: i32,
@@ -113,6 +114,9 @@ pub struct GcReport {
     /// Push staging directories removed: uploads abandoned for more than a
     /// week (on a remote, [`crate::remote::expire_push_staging`]).
     pub push_staging_removed: usize,
+    /// Why nothing was deleted although the graph was read: other commands
+    /// kept running past gc's wait for its deletion fence (BUG-811).
+    pub deferred: Option<String>,
 }
 
 /// The raw bytes gc puts into one pack before it starts the next. Packs
@@ -285,35 +289,6 @@ const HINT_DIR: u8 = 0;
 const HINT_FILE: u8 = 1;
 
 /// Mark phase state.
-/// The objects a staged object references (a sealed one is opened with
-/// this device's keys; one it cannot open references nothing it can see).
-fn staged_children(store: &ObjectStore, raw: &[u8]) -> Vec<ObjectId> {
-    let mut obj = match Object::decode(raw) {
-        Ok(o) => o,
-        Err(_) => return Vec::new(),
-    };
-    for _ in 0..4 {
-        let Object::Sealed(env) = &obj else { break };
-        let Ok(key) = store.keys.require(&env.scope) else { return Vec::new() };
-        let Ok(plain) = env.open(&key) else { return Vec::new() };
-        obj = match Object::decode(&plain) {
-            Ok(o) => o,
-            Err(_) => return Vec::new(),
-        };
-    }
-    match obj {
-        Object::Snapshot(s) => {
-            let mut v = s.parents.clone();
-            v.push(s.tree);
-            v
-        }
-        Object::Tree(t) => t.entries.iter().flat_map(|e| std::iter::once(e.id).chain(e.fallback)).collect(),
-        Object::Conflict(c) => c.referenced_ids(),
-        Object::Atag(a) => vec![a.target],
-        _ => Vec::new(),
-    }
-}
-
 struct Mark<'a> {
     store: &'a ObjectStore,
     reach: HashSet<ObjectId>,
@@ -506,7 +481,8 @@ impl Drop for FresheningOff<'_> {
 /// Collect garbage in `repo`. See the module docs for the algorithm.
 pub fn gc(repo: &mut Repo, opts: &GcOptions) -> Result<GcReport> {
     let backend = repo.backend.clone();
-    let _lock = RepoLock::acquire(backend.clone())?;
+    let _hold = crate::maintenance::GcHold::take(repo, true)?
+        .ok_or_else(|| VeilError::Locked("another `vl gc` is running".into()))?;
     repo.reload()?;
     let store = repo.store.clone();
     store.set_freshening(false);
@@ -620,24 +596,6 @@ pub fn gc(repo: &mut Repo, opts: &GcOptions) -> Result<GcReport> {
     for m in &markers {
         mark.any(*m);
     }
-    // What live transactions staged (format 6) is not in the store yet,
-    // but may be all that references an older object: mark what it
-    // references (threat 14 of the lock-free op log).
-    let ctx = crate::lock::LockContext::default();
-    for (name, tag) in store.staging_dirs()? {
-        if !name.starts_with(crate::store::TX_STAGING_PREFIX) || crate::lock::owner_gone(&tag, &ctx) {
-            continue;
-        }
-        let staged = store.staged_objects_in(&name)?;
-        let ids: HashSet<ObjectId> = staged.iter().map(|(id, _)| *id).collect();
-        for (_, raw) in staged {
-            for c in staged_children(&store, &raw) {
-                if !ids.contains(&c) {
-                    mark.any(c);
-                }
-            }
-        }
-    }
     report.reachable = inventory.iter().filter(|id| mark.reach.contains(id)).count();
     report.incomplete = std::mem::take(&mut mark.incomplete);
 
@@ -695,7 +653,101 @@ pub fn gc(repo: &mut Repo, opts: &GcOptions) -> Result<GcReport> {
     report.packs = names;
     report.pack_stats = stats;
 
-    // 6. The new pack is in place: delete pruned ops, then old objects.
+    // 6. Lock-free repositories delete only under the fence (BUG-811):
+    //    no transaction runs then, so the roots are read again and what
+    //    they reach now (published or reused since the first marking)
+    //    survives. Objects to delete that must survive are `kept_back`.
+    let mut pruned_ops = pruned_ops;
+    let mut kept_back: HashSet<ObjectId> = HashSet::new();
+    let fence = match repo.lock_free() && (!delete.is_empty() || !pruned_ops.is_empty()) {
+        true => Some(crate::maintenance::raise_fence(&store)?),
+        false => None,
+    };
+    match &fence {
+        Some(Err(why)) => {
+            report.deferred = Some(why.clone());
+            kept_back = std::mem::take(&mut delete);
+            pruned_ops.clear();
+        }
+        Some(Ok(_)) => {
+            let heads2: Vec<ObjectId> = repo.ops.raw_heads()?.all.into_iter().chain(repo.ops.heads()?).collect();
+            let op_ids2 = list_hex_files(&*backend, &VPath::new(".veil/ops")?)?;
+            let mut load = |id: &ObjectId, mark: &mut Mark| -> Option<Operation> {
+                if let Some(op) = ops.get(id) {
+                    return Some(op.clone());
+                }
+                match repo.ops.get(id) {
+                    Ok(op) => {
+                        ops.insert(*id, op.clone());
+                        Some(op)
+                    }
+                    Err(e) => {
+                        mark.incomplete.push(format!("operation {}: {e}", id.short()));
+                        None
+                    }
+                }
+            };
+            let mut retained2: HashSet<ObjectId> = HashSet::new();
+            for h in &heads2 {
+                retained2.insert(*h);
+                if let Some(op) = load(h, &mut mark) {
+                    retained2.extend(op.parents.iter().copied());
+                }
+            }
+            let cutoff = opts.keep_ops.map(|keep| now.saturating_sub(keep.as_millis() as i64));
+            for id in &op_ids2 {
+                if let Some(op) = load(id, &mut mark) {
+                    if cutoff.is_none_or(|c| op.timestamp >= c) {
+                        retained2.insert(*id);
+                    }
+                }
+            }
+            // Only what the first listing saw is pruned; every operation
+            // that stays has its view marked.
+            pruned_ops.retain(|id| !retained2.contains(id));
+            let mut roots2: Vec<ObjectId> = Vec::new();
+            let mut annotations2 = Vec::new();
+            for id in op_ids2.iter().chain(&heads2) {
+                if retained.contains(id) || pruned_ops.contains(id) {
+                    continue;
+                }
+                if let Some(op) = load(id, &mut mark) {
+                    roots2.extend(op.view.refs());
+                    annotations2.extend(op.view.annotations());
+                }
+            }
+            roots2.extend(checkout_snapshots(&*backend));
+            for a in annotations2 {
+                roots2.extend(mark.atag(a));
+            }
+            mark.snapshots(roots2);
+            mark.trees_of_snapshots();
+            for m in list_hex_files(&*backend, &store.gc_dir().join("keep"))? {
+                mark.any(m);
+            }
+            if mark.incomplete.is_empty() {
+                kept_back = delete.iter().filter(|id| mark.reach.contains(id)).copied().collect();
+                delete.retain(|id| !kept_back.contains(id));
+            } else {
+                report.incomplete.append(&mut mark.incomplete);
+                kept_back = std::mem::take(&mut delete);
+                pruned_ops.clear();
+            }
+        }
+        None => {}
+    }
+    // What survives this way is in none of the new packs: an old pack
+    // holding it goes, so it gets a loose copy (of the old pack's bytes).
+    for id in &kept_back {
+        if !loose_set.contains(id) {
+            backend.write(&store.loose_path(id), &store.read_raw(id)?)?;
+        }
+        if !mark.reach.contains(id) {
+            pending.insert(*id, old_pending.get(id).copied().unwrap_or(now).min(now));
+        }
+    }
+
+    // 7. The new packs are in place: delete pruned ops, then old objects.
     // Record the pruning first so fsck can tell it apart from loss.
     crate::oplog::record_pruned_ops(&*backend, &pruned_ops)?;
     for id in &pruned_ops {
@@ -704,6 +756,9 @@ pub fn gc(repo: &mut Repo, opts: &GcOptions) -> Result<GcReport> {
     report.ops_pruned = pruned_ops.len();
     for id in &loose {
         let path = store.loose_path(id);
+        if kept_back.contains(id) {
+            continue; // not packed, still needed
+        }
         if !delete.contains(id) {
             backend.remove_file(&path)?; // now packed
             continue;
@@ -734,6 +789,10 @@ pub fn gc(repo: &mut Repo, opts: &GcOptions) -> Result<GcReport> {
     }
     report.pending = pending.len();
     write_pending(&*backend, &store.gc_dir(), &pending)?;
+    if matches!(fence, Some(Ok(_))) && (report.deleted > 0 || report.ops_pruned > 0) {
+        crate::maintenance::bump_prune_epoch(&store)?;
+    }
+    drop(fence);
 
     store.invalidate()?;
     let stats = store.stats()?;

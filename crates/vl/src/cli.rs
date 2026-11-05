@@ -644,8 +644,10 @@ pub enum Cmd {
         /// Minutes an object must have been unreachable before deletion.
         #[arg(long, value_name = "MINUTES", default_value_t = 60.0)]
         grace_minutes: f64,
-        /// Delete unreachable objects now (grace period 0). Unsafe while
-        /// another `vl` process is running.
+        /// Delete unreachable objects now (grace period 0). Safe beside
+        /// running `vl` commands: gc deletes only while none of them is
+        /// recording, and one that reuses a deleted object asks to be run
+        /// again.
         #[arg(long)]
         prune_now: bool,
         /// zstd compression level for packed objects.

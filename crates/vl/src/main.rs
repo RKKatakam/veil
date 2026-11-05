@@ -2840,6 +2840,9 @@ fn cmd_gc(
             yellow("warning:")
         );
     }
+    if let Some(why) = &r.deferred {
+        println!("{} {why}", yellow("note:"));
+    }
     Ok(())
 }
 

@@ -16,6 +16,7 @@ mod adversarial6_lock;
 mod adversarial_lock;
 mod crash;
 mod durability;
+mod gc_concurrency;
 mod lock;
 mod metadata_lock;
 mod oplog_concurrency;

@@ -38,8 +38,12 @@ Storage: 0.02 MiB -> 0.01 MiB
   unreachable for the grace period (`--grace-minutes`, default 60), so a
   `vl` command running at the same time is never affected. `pending
   deletion` counts them.
-* `--prune-now` deletes them at once. Only use it when no other `vl`
-  process is running on the repository.
+* `--prune-now` deletes them at once. It is safe beside running `vl`
+  commands: gc deletes only at a moment when none of them is recording
+  (it waits for those that are, and commands that start meanwhile wait
+  for it), and a command that reuses an object gc just deleted asks to be
+  run again instead of recording it. If commands keep running for more
+  than about a minute, gc deletes nothing that run and says so.
 * `--level L` sets the zstd level (default 3); `--no-deltas` disables delta
   compression. A small edit of a large file is stored as a small delta up
   to about 64 MiB per version (the base and the new version must fit in

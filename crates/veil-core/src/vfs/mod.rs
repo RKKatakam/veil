@@ -518,6 +518,12 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
     fn available_space(&self, _dir: &VPath) -> Option<u64> {
         None
     }
+
+    /// The operating-system path of `path`, for a backend that is a local
+    /// directory: the gc lease is an `flock` on it ([`crate::maintenance::GcLease`]).
+    fn local_path(&self, _path: &VPath) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 /// A file being written by [`StorageBackend::create_stream`].

@@ -72,6 +72,7 @@ pub mod id;
 pub mod identity;
 pub mod keychain;
 pub mod lock;
+pub mod maintenance;
 pub mod merge;
 pub mod object;
 pub mod oplog;

@@ -17,7 +17,7 @@ Options:
 |---|---|
 | `--keep-ops-days <DAYS>` | Prune operations older than this many days (the current operation and its parents are always kept). Default: keep the whole op log |
 | `--grace-minutes <MINUTES>` | Minutes an object must have been unreachable before deletion (default: `60`) |
-| `--prune-now` | Delete unreachable objects now (grace period 0). Unsafe while another `vl` process is running |
+| `--prune-now` | Delete unreachable objects now (grace period 0). Safe beside running `vl` commands: gc deletes only while none of them is recording, and one that reuses a deleted object asks to be run again |
 | `--level <LEVEL>` | zstd compression level for packed objects (default: `3`) |
 | `--no-deltas` | Do not delta-compress successive versions of a file |
 
