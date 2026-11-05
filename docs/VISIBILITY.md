@@ -85,17 +85,17 @@ vl merge fix --into main --embargo-for security distro-partners --until 2026-12-
 
 ## Without a server (SFTP, a shared drive, no Hub)
 
-A plain storage server can't check permissions: anyone who can reach it can download every file on it. So without the Hub, Veil enforces the same rules with **encryption, automatically**. Your `vl access` rules never change; Veil picks the protection for wherever the files go.
+**Restricted folders are always plain text,** never encrypted (owner, 2026-11-05). A plain storage server can't check permissions: anyone who can log into it can read every file on it. So **restricted folders only go where access can be enforced:**
 
-| Where the files go | Folder for everyone with access | Folder for one group (`billing/ finance`) | Secrets | Public |
+| Where the files go | Folder for everyone with access | Folder for one group (`billing/ finance`) | Secrets (`.env`, keys) | Public |
 |---|---|---|---|---|
-| **The Hub** | plain; the Hub checks | **plain; the Hub checks** | encrypted | plain |
-| **SFTP, or no server** | plain | **encrypted for that group, automatically** | encrypted | plain |
+| **The Hub** | plain; the Hub checks | **plain; the Hub only gives it to finance** | encrypted | plain |
+| **SFTP or a shared drive** | plain | **not uploaded**, unless you allow that server for finance (`vl remote allow NAME finance`) | encrypted | plain |
 | **A public mirror** | not sent | not sent | not sent | plain |
 
-- **Without the Hub,** the server (or anyone who copies its disk) sees only ciphertext for restricted folders. Only the group's devices can open them.
+- **Allowing a server for a group** (e.g. finance's own SFTP server) means: everyone who can log into that server is trusted to see that folder.
 - **Groups and admins without the Hub** are kept in a file in the project that only admins can change. Every change is signed, so nobody can add themselves.
-- **"Everyone with access" on an SFTP server** means everyone who can reach that server. Folders open to all of them stay plain.
+- **The only encrypted things are secrets and embargoed changes.**
 
 ## What the server sees
 
@@ -110,7 +110,7 @@ A plain storage server can't check permissions: anyone who can reach it can down
 
 - **What history shows** someone without access to a folder: proposed, they don't see its files or even their names. Snapshot signatures must still verify (the per-viewer projection in `HUB.md`).
 - **The authority on push.** Private files aren't encrypted, so the server and the push filter decide from the **accepted `.veilpolicy`, by path**, never from labels inside a snapshot. This is the main threat-review item.
-- **Projects without the Hub:** decided (above). Restricted folders are encrypted for their group on dumb remotes. Open technical details: the key per group, re-encryption when a group changes, and moving a project from SFTP to the Hub.
+- **Projects without the Hub:** decided (above). Restricted folders stay plain text and are not uploaded to a plain server unless it is allowed for their group. Open technical details: what a clone from such a server shows for the folders it lacks, and moving a project from SFTP to the Hub.
 - **Existing repositories:**
   - cloaked paths become private folders whose secrets stay encrypted;
   - `.env` files start syncing (encrypted) only after an explicit `vl upgrade` step that lists them;
