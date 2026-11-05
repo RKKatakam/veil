@@ -101,11 +101,92 @@ pub struct GcReport {
     pub rescued: usize,
     pub bytes_before: u64,
     pub bytes_after: u64,
-    /// Name of the pack written, if any.
+    /// Name of the (first) pack written, if any.
     pub pack: Option<String>,
+    /// Every pack written: the kept objects go into packs of at most about
+    /// [`GC_PACK_LIMIT`] bytes each (BUG-800).
+    pub packs: Vec<String>,
+    /// Totals over [`GcReport::packs`].
     pub pack_stats: PackStats,
     /// Why nothing was deleted, if the graph could not be fully read.
     pub incomplete: Vec<String>,
+}
+
+/// The raw bytes gc puts into one pack before it starts the next (BUG-800):
+/// a pack is built in memory, so this bounds gc's memory, whatever the
+/// size of the store.
+pub const GC_PACK_LIMIT: u64 = 128 << 20;
+
+/// The packs one gc writes (see [`GC_PACK_LIMIT`]).
+struct GcPacks<'a> {
+    level: i32,
+    backend: &'a dyn StorageBackend,
+    dir: VPath,
+    current: Option<PackBuilder>,
+    current_bytes: u64,
+    /// Every object in a pack written (or being written) by this gc.
+    packed: HashSet<ObjectId>,
+    names: Vec<String>,
+    stats: PackStats,
+}
+
+impl<'a> GcPacks<'a> {
+    fn new(level: i32, backend: &'a dyn StorageBackend, dir: VPath) -> Self {
+        GcPacks {
+            level,
+            backend,
+            dir,
+            current: None,
+            current_bytes: 0,
+            packed: HashSet::new(),
+            names: Vec::new(),
+            stats: PackStats::default(),
+        }
+    }
+
+    fn contains(&self, id: &ObjectId) -> bool {
+        self.packed.contains(id)
+    }
+
+    /// Is `id` in the pack being built (so it can be a delta base)?
+    fn current_has(&self, id: &ObjectId) -> bool {
+        self.current.as_ref().is_some_and(|b| b.contains(id))
+    }
+
+    fn add(&mut self, id: ObjectId, raw: &[u8], base: Option<(&ObjectId, &[u8])>) -> Result<()> {
+        if self.current.is_none() {
+            self.current = Some(PackBuilder::new(self.level)?);
+        }
+        let b = self.current.as_mut().expect("just created");
+        b.add(id, raw, base)?;
+        self.packed.insert(id);
+        self.current_bytes += raw.len() as u64;
+        if self.current_bytes >= GC_PACK_LIMIT {
+            self.close()?;
+        }
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.current_bytes = 0;
+        if let Some(b) = self.current.take() {
+            if let Some((name, s)) = b.finish(self.backend, &self.dir)? {
+                self.names.push(name);
+                self.stats.objects += s.objects;
+                self.stats.stored += s.stored;
+                self.stats.compressed += s.compressed;
+                self.stats.deltas += s.deltas;
+                self.stats.raw_bytes += s.raw_bytes;
+                self.stats.pack_bytes += s.pack_bytes;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(Vec<String>, PackStats)> {
+        self.close()?;
+        Ok((self.names, self.stats))
+    }
 }
 
 // ---- pending list -------------------------------------------------------------
@@ -515,39 +596,41 @@ pub fn gc(repo: &mut Repo, opts: &GcOptions) -> Result<GcReport> {
         }
     }
 
-    // 5. Write one pack with everything kept: by path first (delta chains,
+    // 5. Write packs with everything kept: by path first (delta chains,
     //    newest version as the base of older ones), then everything else.
-    let mut pb = PackBuilder::new(opts.level)?;
+    //    A pack is closed once it holds GC_PACK_LIMIT bytes, so that a
+    //    builder never holds the whole store in memory (BUG-800); a delta
+    //    base is always in its own pack.
+    let mut packs = GcPacks::new(opts.level, &*backend, store.pack_dir());
     let keep = |id: &ObjectId| inventory.contains(id) && !delete.contains(id);
     for ids in mark.hints.values() {
         let mut prev: Option<(ObjectId, Vec<u8>)> = None;
         for id in ids {
-            if !keep(id) || pb.contains(id) {
+            if !keep(id) || packs.contains(id) {
                 continue;
             }
             let raw = store.read_raw(id)?;
-            let base = if opts.deltas {
-                prev.as_ref().map(|(b, r)| (b, r.as_slice()))
-            } else {
-                None
+            let base = match (opts.deltas, &prev) {
+                (true, Some((b, r))) if packs.current_has(b) => Some((b, r.as_slice())),
+                _ => None,
             };
-            pb.add(*id, &raw, base)?;
+            packs.add(*id, &raw, base)?;
             prev = Some((*id, raw));
         }
     }
     let mut rest: Vec<ObjectId> = inventory
         .iter()
-        .filter(|id| keep(id) && !pb.contains(id))
+        .filter(|id| keep(id) && !packs.contains(id))
         .copied()
         .collect();
     rest.sort();
     for id in rest {
-        pb.add(id, &store.read_raw(&id)?, None)?;
+        packs.add(id, &store.read_raw(&id)?, None)?;
     }
-    if let Some((name, stats)) = pb.finish(&*backend, &store.pack_dir())? {
-        report.pack = Some(name);
-        report.pack_stats = stats;
-    }
+    let (names, stats) = packs.finish()?;
+    report.pack = names.first().cloned();
+    report.packs = names;
+    report.pack_stats = stats;
 
     // 6. The new pack is in place: delete pruned ops, then old objects.
     // Record the pruning first so fsck can tell it apart from loss.
@@ -577,7 +660,7 @@ pub fn gc(repo: &mut Repo, opts: &GcOptions) -> Result<GcReport> {
     }
     report.deleted += delete.iter().filter(|id| !loose_set.contains(id)).count();
     for p in &old_packs {
-        if Some(p.name()) == report.pack.as_deref() {
+        if report.packs.iter().any(|n| n == p.name()) {
             continue; // identical repack
         }
         backend.remove_file(&index_file(&store.pack_dir(), p.name()))?;

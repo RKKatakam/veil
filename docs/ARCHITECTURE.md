@@ -631,6 +631,22 @@ CAS, and it applies these rules in order:
      `undo`, `op restore`, `merge`, `rebase`, `git pull`) moves the working
      copy to a tree that holds the incoming policy, so there is no
      difference to mistake for an edit (`policy_routes_cli.rs` covers each).
+   * **Colocated Git mode** (BUG-759): Git may write `.veilpolicy` between
+     two commands without moving `HEAD` (`git reset --soft` after a pull,
+     `git stash pop`, `git checkout REV -- .veilpolicy`), so a difference
+     from the recorded version proves nothing. `Repo::snapshot_policy`
+     takes none as the member's edit there
+     (`policy::working_copy_policy_colocated`); only an explicit
+     `SnapshotOptions::policy_edit` is: `vl cloak|isolate|expose|ignore`
+     and `vl policy import-gitignore` pass the text they read and wrote,
+     and `Ctx` passes a hand edit only when Git cannot have written it
+     (`colocate_cmd::git_may_have_written_policy`: no Git operation in
+     progress, no unmerged entry or conflict-marker line, and the content,
+     cleaned as `git add` would, is no blob Git has). The edit counts only
+     while the file holds that exact text. A policy that is never weaker
+     than the accepted one for any path (the exhaustive check above) is
+     accepted in colocated mode whoever wrote it, so a protection added by
+     hand stays pinned; anything weaker waits for `vl policy accept`.
    * What is at `.veilpolicy` never makes a snapshot less protected than
      the accepted policy (`policy::read_policy_file`, BUG-106/107). A
      **missing** file is not taken as the member's edit (deleting every rule
@@ -1212,6 +1228,15 @@ struct Snapshot {
   `snapshot_workspace`, which builds a tree from the working copy. If the
   tree changed, it *rewrites* the working-copy snapshot: same change id, new
   tree, predecessor recorded. No index, no `add`.
+  The scan runs **before** the repository lock is taken (BUG-801): new
+  objects are staged in memory (`ObjectStore::begin_staging`, up to
+  32 MiB), never written or adopted, so a clean working copy is recorded
+  without the lock at all. A changed one takes the lock, checks that the
+  workspace, the accepted policy and the scanner's rules are what the scan
+  saw, then writes the staged objects and records the tree; if anything
+  moved meanwhile, or the new content was too large to stage, the tree is
+  built again under the lock. (Stream O of the scale round takes this
+  further: staging on disk and a compare-and-swap of op heads.)
 * **Views and the operation log.** A `View` holds the visible heads,
   workspaces (`name → working copy`), tags and remote tags. Every transaction
   writes one `Operation { parents, user, time, description, view }`. Undo and
@@ -2095,6 +2120,15 @@ remains is mostly the one `lstat` per file and the per-directory
    that reader sees only the pre-merge tree and recording on top of it would
    silently revert the fix for everyone. After the release they are
    recorded. Merging such history without the key is refused.
+   Stickiness holds even when nothing is left to hide (BUG-761): a
+   snapshot that deleted every file of the fix keeps the wrapper
+   (`embargo::wrap_line`, where `wrap` would return the bare fallback), and
+   a working-copy tree that is not wrapped although an ancestor is an
+   unreleased embargoed merge (a Git commit the colocated follow imported
+   on top of it) gets wrapped at its next change, with its parent's public
+   view as the fallback (`Repo::keep_line_embargo`). Otherwise the line
+   would leave the embargo, and the fix put back (`git stash pop`, an
+   editor's undo) would be recorded, committed and pushed as public.
    Descriptions written on such a line by a key holder (`commit`, `describe`,
    `new -m`, squash, a plain merge into it) are sealed under the embargo key
    too, and its snapshots record no conflict list: snapshot metadata is
@@ -2712,8 +2746,11 @@ pack-<sum>.idx    "VEILIDX1" | count u32 | fanout[256] u32 | ids[count] (sorted)
 * **Lookup.** `fanout[b]` counts ids whose first byte is `<= b`. A lookup
   is one fan-out step, then a binary search over one bucket, then a ranged
   read (`StorageBackend::read_range`) of one entry. A process that reads a
-  pack often (more than 64 entries; packs up to 256 MiB) loads it into memory
-  once instead.
+  pack often (more than 64 entries) loads it into memory once instead, for
+  packs up to 16 MiB, within one budget of 64 MiB for the whole process
+  (least recently used first out; each backend reads its own copy), so a
+  history walk never holds the whole store (BUG-800). Larger packs are
+  always read by range.
 * **Deltas.** A zstd frame "compressed against" the base object as a
   dictionary is a compact delta with no extra code. GC groups objects by the
   path where it found them (files and directories separately), newest version
@@ -4183,10 +4220,11 @@ afterwards; textconv input on stdin, output never stored.
   (`vl push --full` fills it).
 * Performance: recording checked-out files
   in the stat cache (needs a backend write that returns the stat of the
-  file it wrote). `gc` always rewrites everything into one pack, built in
-  memory; incremental packing (small packs merged geometrically), streaming
-  pack writes and cross-pack deltas are next. Sync builds its packs in
-  memory too, and a pull holds the remote packs it downloads in memory.
+  file it wrote). `gc` always rewrites everything it keeps, into packs of
+  at most about 128 MiB each, each built in memory (so gc's memory is
+  bounded, BUG-800); incremental packing (small packs merged
+  geometrically), streaming pack writes and cross-pack deltas are next.
+  Sync builds its packs in memory too, 128 MiB at a time.
 * Sealed directory nodes for cloaked paths, to hide their names (embargoes
   already seal their trees, §7); a "require signed snapshots" policy;
   pinning a ring head out of band; automatic re-application of concurrent

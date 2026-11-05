@@ -485,23 +485,26 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             remote,
             tag,
             force,
+            force_tags,
             dry_run: true,
             json,
             ..
         } => {
             // A dry run sends nothing: no `pre-push` (`--no-verify` is moot).
-            return cmd_push_dry_run(ctx, remote.as_deref(), tag, *force, *json);
+            return cmd_push_dry_run(ctx, remote.as_deref(), tag, (*force, *force_tags), *json);
         }
         Cmd::Push {
             remote,
             tag,
             force,
+            force_tags,
             full,
             delete,
             hooks,
             ..
         } => {
-            return cmd_push(ctx, remote.as_deref().unwrap_or("origin"), tag, *force, *full, delete, hooks);
+            let opts = remote::SyncOptions { full: *full, force_tags: *force_tags };
+            return cmd_push(ctx, remote.as_deref().unwrap_or("origin"), tag, *force, &opts, delete, hooks);
         }
         Cmd::Pull { remote, full } => cmd_pull(ctx, remote, *full)?,
         Cmd::Git(c) => return cmd_git(ctx, c),
@@ -1625,6 +1628,7 @@ fn cmd_policy_rules(ctx: &mut Ctx, patterns: &[String], tier: Tier, force: bool)
             }
         }
     };
+    let before = text.clone();
     if !text.ends_with('\n') {
         text.push('\n');
     }
@@ -1668,7 +1672,7 @@ fn cmd_policy_rules(ctx: &mut Ctx, patterns: &[String], tier: Tier, force: bool)
         Tier::Isolated => "isolate",
         Tier::Ignored => "ignore",
     };
-    ctx.snapshot_as(format!("{verb} {}", patterns.join(" ")))?;
+    ctx.snapshot_policy_edit(format!("{verb} {}", patterns.join(" ")), before.as_bytes(), text.as_bytes())?;
     Ok(())
 }
 
@@ -2458,7 +2462,7 @@ fn cmd_push(
     name: &str,
     tags: &[String],
     force: bool,
-    full: bool,
+    opts: &remote::SyncOptions,
     delete: &[String],
     verify: &hooks::NoVerifyArgs,
 ) -> Result<ExitCode> {
@@ -2471,7 +2475,7 @@ fn cmd_push(
                 return Ok(hooks::delete_lines(&ctx.repo, name, delete, cfg.public, false));
             }
             let (backend, cfg) = remote_backend(ctx, name)?;
-            let plan = veil_core::push_plan::plan_push(&ctx.repo, backend, cfg.public, tags, force)?;
+            let plan = veil_core::push_plan::plan_push_with(&ctx.repo, backend, cfg.public, tags, force, opts.force_tags)?;
             Ok(hooks::veil_push_lines(&ctx.repo, &plan, name, delete))
         })?;
     }
@@ -2500,8 +2504,7 @@ fn cmd_push(
         }
     }
     let (backend, cfg) = remote_backend(ctx, name)?;
-    let opts = remote::SyncOptions { full };
-    let r = remote::push_with(&mut ctx.repo, backend, cfg.public, tags, force, &opts)?;
+    let r = remote::push_with(&mut ctx.repo, backend, cfg.public, tags, force, opts)?;
     remote::record_pushed_tags(&mut ctx.repo, name, &r)?;
     for (t, id) in &r.tags_updated {
         println!("  {} {} → {}", green("pushed"), cyan(&safe(t)), id.short());
@@ -2510,7 +2513,11 @@ fn cmd_push(
     let mut withheld = Vec::new();
     for (t, why) in &r.tags_skipped {
         if r.tags_rejected.contains(t) {
-            println!("  {} {} (remote has diverged: not a fast-forward)", red("rejected"), safe(t));
+            let why = match why.starts_with("release tag") {
+                true => safe(why).into_owned(),
+                false => "remote has diverged: not a fast-forward".to_string(),
+            };
+            println!("  {} {} ({why})", red("rejected"), safe(t));
             rejected.push(t.clone());
         } else {
             println!("  {} {} ({})", yellow("skipped"), safe(t), safe(why));
@@ -2542,12 +2549,17 @@ fn cmd_push(
     let first = rejected.first().map(|t| safe(t).into_owned()).unwrap_or_default();
     // A release tag the remote moved is never merged or pulled into ours
     // (BUG-703): someone has to decide which one is the release.
-    let release = rejected.iter().find(|t| ctx.repo.view().tags.get(*t).is_some_and(|t| t.annotation.is_some()));
+    // A release is never replaced on the remote without --force-tags
+    // (BUG-710), as `vl git push` does for Git tags.
+    let release = rejected.iter().find(|t| {
+        r.tags_skipped.iter().any(|(n, why)| n == *t && why.starts_with("release tag"))
+            || ctx.repo.view().tags.get(*t).is_some_and(|t| t.annotation.is_some())
+    });
     let fix = match release {
         Some(t) => {
             let t = safe(t);
             format!(
-                "{name} holds release tag {t} at another target. Keep yours there with `vl push {name} -t {t} --force`, or take theirs with `vl tag set {t} -r {name}/{t} --force`"
+                "{name} holds release tag {t} at another target. Replace it there with yours with `vl push {name} -t {t} --force-tags`, or take theirs with `vl tag set {t} -r {name}/{t} --force`"
             )
         }
         None => format!(
@@ -2560,8 +2572,8 @@ fn cmd_push(
 /// `vl push --dry-run`: the plan, per remote. Exits 1 where the push would
 /// fail: a remote that cannot be planned, a tag the remote would reject, or
 /// a tag named with `-t` that would be held back.
-fn cmd_push_dry_run(ctx: &mut Ctx, remote: Option<&str>, tags: &[String], force: bool, json: bool) -> Result<ExitCode> {
-    let doc = api::push_plan(ctx, remote, tags, force)?;
+fn cmd_push_dry_run(ctx: &mut Ctx, remote: Option<&str>, tags: &[String], (force, force_tags): (bool, bool), json: bool) -> Result<ExitCode> {
+    let doc = api::push_plan(ctx, remote, tags, force, force_tags)?;
     match json {
         true => api::emit_json(&doc)?,
         false => api::text::push_plan(&doc),
@@ -2607,7 +2619,7 @@ fn push_status(rejected: &[String], fix: &str, withheld: &[String]) -> ExitCode 
 
 fn cmd_pull(ctx: &mut Ctx, name: &str, full: bool) -> Result<()> {
     let (backend, _) = remote_backend(ctx, name)?;
-    let r = remote::pull_with(&mut ctx.repo, name, backend, &remote::SyncOptions { full })?;
+    let r = remote::pull_with(&mut ctx.repo, name, backend, &remote::SyncOptions { full, ..Default::default() })?;
     for (t, id) in &r.tags_updated {
         println!("  {} {} → {}", green("updated"), cyan(&safe(t)), id.short());
     }
@@ -3041,8 +3053,12 @@ fn cmd_gc(
     }
     if let Some(name) = &r.pack {
         let s = &r.pack_stats;
+        let more = match r.packs.len() {
+            0 | 1 => String::new(),
+            n => format!(" and {} more pack(s)", n - 1),
+        };
         println!(
-            "Packed {} object(s) into pack-{} ({} delta, {} compressed, {} stored)",
+            "Packed {} object(s) into pack-{}{more} ({} delta, {} compressed, {} stored)",
             s.objects,
             &name[..12],
             s.deltas,

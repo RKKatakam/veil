@@ -53,8 +53,9 @@ Storage: 0.02 MiB -> 0.01 MiB
 * If part of the history can't be read, `gc` deletes nothing and says so.
   Run `vl fsck`.
 
-In 1.0, `gc` rewrites everything into one pack, in memory. On a large
-repository, run it occasionally, not after every command. After `gc` with
+In 1.0, `gc` rewrites everything it keeps into new packs (a new one every
+128 MiB, so its memory stays bounded). On a large repository, run it
+occasionally, not after every command. After `gc` with
 `--keep-ops-days`, `vl evolog` may end with
 `(older versions were removed by `vl gc`)`.
 

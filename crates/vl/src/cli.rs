@@ -580,6 +580,11 @@ pub enum Cmd {
         /// Overwrite tags that diverged on the remote.
         #[arg(long)]
         force: bool,
+        /// Move release tags (annotated: `vl tag set -a`) that the
+        /// remote holds at another target. A release is otherwise never
+        /// replaced, even by a fast-forward.
+        #[arg(long)]
+        force_tags: bool,
         /// Walk and verify every object instead of skipping what the remote
         /// provably has (repairs damaged or missing objects on the remote).
         #[arg(long)]

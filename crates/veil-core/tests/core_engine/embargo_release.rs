@@ -165,3 +165,47 @@ fn a_revoked_member_who_knows_of_the_revocation_cannot_release() {
     assert!(err.contains("not a current member"), "{err}");
     assert!(!bobs.keys().embargo_released(&e));
 }
+
+/// BUG-761: a line under an unreleased embargo stays under it when a
+/// snapshot deletes every file of the fix. `embargo::wrap` returned the bare
+/// fallback for a tree equal to it, so the line left the embargo, and the
+/// fix put back (`git stash pop`, an editor's undo, a restore by hand) was
+/// recorded as a public edit: a commit and a push to a public remote
+/// published it before the release.
+#[test]
+fn deleting_and_putting_back_the_fix_never_publishes_it() {
+    let (mut alice, fs, _) = new_repo("alice");
+    let main = commit_files(&mut alice, &*fs, &[("README.md", "hello\n")], "v1");
+    alice.set_tag("main", main, None, false).unwrap();
+    alice.create_workspace("fix", vec![main], Some("team".into())).unwrap();
+    let ov = alice.workspace_overlay("fix").unwrap();
+    ov.write(&p("auth.rs"), b"fn check() -> bool { verify_signature() }\n").unwrap();
+    let fix = alice.snapshot_workspace("fix", &ov).unwrap().snapshot;
+    let r = alice
+        .merge(WS, main, vec![fix], "merge", Some(EmbargoSpec { scope: "team".into(), until: None }))
+        .unwrap();
+    let e = r.embargo.unwrap();
+    alice.new_change(WS, vec![r.snapshot], "").unwrap();
+    // The directory does not have the fix (deleted): recorded as such …
+    let _ = fs.remove_file(&p("auth.rs"));
+    alice.snapshot_workspace(WS, &*fs).unwrap();
+    // … then it is put back, with a new file beside it.
+    fs.write(&p("auth.rs"), b"fn check() -> bool { verify_signature() }\n").unwrap();
+    fs.write(&p("other.rs"), b"fn other() {}\n").unwrap();
+    let wc = alice.snapshot_workspace(WS, &*fs).unwrap().snapshot;
+    let tree = alice.snapshot(&wc).unwrap().tree;
+    assert!(veil_core::embargo::unreleased_wrapper(alice.store(), &tree).unwrap().is_some(), "the line left the embargo");
+    for f in ["auth.rs", "other.rs"] {
+        let e = veil_core::tree::lookup(alice.store(), &veil_core::embargo::public_view(alice.store(), &tree).unwrap(), &p(f)).unwrap();
+        assert!(e.is_none(), "{f} is in the public view before the release");
+    }
+    let c = alice.commit(WS, "on the fix", false).unwrap();
+    alice.set_tag("main", c.committed, None, true).unwrap();
+    let mirror = Arc::new(MemoryBackend::new());
+    remote::push(&mut alice, mirror.clone(), true, &[], false).unwrap();
+    assert!(!mirror_has_fix(&mirror), "the fix reached a public remote before its release");
+    // The release still publishes all of it.
+    alice.release_embargo(&e).unwrap();
+    remote::push(&mut alice, mirror.clone(), true, &[], false).unwrap();
+    assert!(mirror_has_fix(&mirror));
+}

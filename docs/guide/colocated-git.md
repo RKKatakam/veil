@@ -228,6 +228,7 @@ it.
 | `git add -f`, `--no-verify` commits | superseded, held, never pushed by Veil |
 | A Git checkout recording sealed content as public | the working copy follows `HEAD` itself: hidden files are moved by Veil, never taken from Git as public edits |
 | A pulled `.veilpolicy` that weakens protection | taken as incoming, held back by the policy you accepted |
+| A `.veilpolicy` Git wrote with `HEAD` back where Veil saw it (`git reset --soft` after a pull, `git stash pop`, `git checkout REV -- .veilpolicy`) | an edit of `.veilpolicy` is your own only if Git cannot have written it (see below); anything else is held back like a pull |
 | `git push` | `pre-push` guard (except `--no-verify`) |
 | `git stash -a`, or a stash made after Git cleared skip-worktree | `refs/stash` is never imported nor pushed; what a stash holds that Veil hides is reported at the next command |
 | Your own skip-worktree / assume-unchanged bits | the edits stay unrecorded and the bits are kept |
@@ -235,6 +236,27 @@ it.
 | `core.hooksPath` turning the guards off | every `vl status` warns |
 | A tree with `.git`, `.GIT`, … | refused on import and on checkout, as everywhere in Veil |
 | A Git commit racing a `vl` command | every ref and `HEAD` write is a compare-and-swap; Veil never waits for or removes a Git lock |
+
+## Your edits of `.veilpolicy`
+
+Git may write `.veilpolicy` between two `vl` commands by many routes, and
+not all of them move `HEAD`: `git reset --soft HEAD~1` after a pull leaves
+the pulled policy in the work tree as if you had typed it. So in colocated
+mode an edit of `.veilpolicy` counts as yours (and is accepted at once,
+even where it weakens the policy) only when Git cannot have written it:
+
+* no Git operation is in progress, and the file has no conflict (no
+  unmerged entries in Git's index, no conflict-marker lines);
+* its content, cleaned as `git add` would clean it, is not a blob Git
+  already has (pulled, stashed, or staged).
+
+Anything else is guarded like a pull: rules that only add protection, and
+a policy never weaker than the one you accepted, apply and are accepted;
+what weakens protection waits for `vl policy accept`, and every command
+says so. `vl cloak`, `vl isolate`, `vl expose` and `vl ignore` always
+record exactly the rule they add as yours. If you `git add .veilpolicy`
+before any `vl` command sees your edit, Git has the blob, so a weakening
+edit then waits for `vl policy accept`.
 
 ## What Git can still do
 
@@ -279,9 +301,18 @@ reports them at the next command.
   since the last `vl` command are lost (`vl watch` narrows that).
 * A **`git checkout`** of an old commit that has a file you have since
   cloaked or isolated overwrites your copy without asking (Git treats
-  ignored files as expendable). The same recovery applies; edits since the
-  last `vl` command are lost. (Putting such files in Git's index, so that
-  Git refused, would show them as staged new files in `git status`.)
+  ignored files as expendable, and no Git hook can stop a checkout from
+  writing). The next command says so and keeps the version Veil recorded
+  in the previous change:
+
+  ```text
+  warning: Git's checkout overwrote secrets/db.yml (a file Veil hides from Git, which Git treats as expendable). Your version as of the last vl command is kept in change uyxntzkt: `vl restore --from uyxntzkt secrets/db.yml`. An edit made since then is lost
+  ```
+
+  An edit made since the last `vl` command is lost (`vl watch` narrows
+  that). Putting such files in Git's index so that Git refused would show
+  them as staged new files in `git status` and make `pre-commit` refuse
+  every commit.
 * After Git **clears skip-worktree**, `git add` hashes the hidden file into
   a loose object in `.git` (local, never committed by the guards, never
   pushed). `vl git colocate --prune` removes it.

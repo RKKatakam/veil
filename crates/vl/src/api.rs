@@ -2347,7 +2347,7 @@ fn remote_plan(name: &str, url: &str, plan: veil_core::push_plan::PushPlan) -> R
 /// `remote`, or to every configured remote. Nothing is written to any
 /// remote. With one remote named, a failure is the command's; for all
 /// remotes, each failure is recorded in its plan and the others go on.
-pub fn push_plan(ctx: &Ctx, remote: Option<&str>, tags: &[String], force: bool) -> Result<PushPlanDoc> {
+pub fn push_plan(ctx: &Ctx, remote: Option<&str>, tags: &[String], force: bool, force_tags: bool) -> Result<PushPlanDoc> {
     let names: Vec<String> = match remote {
         Some(n) => vec![n.to_string()],
         None => ctx.repo.config().remotes.keys().cloned().collect(),
@@ -2358,7 +2358,7 @@ pub fn push_plan(ctx: &Ctx, remote: Option<&str>, tags: &[String], force: bool) 
     let mut remotes = Vec::new();
     for name in &names {
         let planned = crate::remote_backend(ctx, name).and_then(|(backend, cfg)| {
-            let plan = veil_core::push_plan::plan_push(&ctx.repo, backend, cfg.public, tags, force)?;
+            let plan = veil_core::push_plan::plan_push_with(&ctx.repo, backend, cfg.public, tags, force, force_tags)?;
             Ok(remote_plan(name, &cfg.url, plan))
         });
         match planned {

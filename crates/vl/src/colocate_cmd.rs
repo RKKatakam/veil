@@ -561,6 +561,14 @@ fn follow_head(ctx: &mut Ctx, bridge: &GitBridge, state: &State, target: ObjectI
         return Ok(());
     }
     let managed = managed_paths(ctx, bridge, state, &target)?;
+    // Hidden files Git's checkout overwrote (it treats ignored files as
+    // expendable, BUG-754): the old change keeps its recorded version,
+    // never Git's, and the member is told how to get it back.
+    let overwritten = overwritten_hidden(ctx, bridge, state, &old_snap.tree, commit).unwrap_or_else(|e| {
+        warn(&format!("could not check which hidden files Git's checkout overwrote: {e}"));
+        Vec::new()
+    });
+    ctx.keep_extra.extend(overwritten.iter().cloned());
     // 1. What the hidden files hold now goes into the old change first.
     // `.veilpolicy` is incoming here as in step 4: Git's checkout may have
     // written it, and an own edit would be accepted even if it weakens the
@@ -583,10 +591,20 @@ fn follow_head(ctx: &mut Ctx, bridge: &GitBridge, state: &State, target: ObjectI
             ctx.snapshot_only(&set)?;
         }
     }
+    for p in &overwritten {
+        ctx.keep_extra.remove(p);
+    }
     let old = ctx.wc()?;
     // 2–3. A new change on the target, with the hidden part moved by Veil.
     let ws = ctx.ws.clone();
-    let plan = colocate::plan_head_move(&ctx.repo, &ws, old, target, &managed)?;
+    let mut plan = colocate::plan_head_move(&ctx.repo, &ws, old, target, &managed)?;
+    // What Git overwrote is a conflict: the previous change, which holds
+    // the recorded version, stays visible (BUG-754).
+    for p in &overwritten {
+        if !plan.conflicts.contains(p) {
+            plan.conflicts.push(p.clone());
+        }
+    }
     let old_tree = ctx.repo.snapshot(&old)?.tree;
     let (new, kept) = colocate::apply_head_move(&mut ctx.repo, &ws, old, target, &plan)?;
     if !plan.write.is_empty() {
@@ -609,14 +627,169 @@ fn follow_head(ctx: &mut Ctx, bridge: &GitBridge, state: &State, target: ObjectI
         let c = ctx.repo.snapshot(&old)?.change_id;
         eprintln!("  {} the previous working-copy change {} stays as it was", dim("kept"), c.short());
     }
-    for p in &plan.conflicts {
+    for p in plan.conflicts.iter().filter(|p| !overwritten.contains(p)) {
         eprintln!(
             "  {} {} (changed here and in the checked-out commit; your version stays in the previous change)",
             yellow("kept"),
             safe(p.as_str())
         );
     }
+    if !overwritten.is_empty() {
+        // An empty change is not kept: its parent has the same version.
+        let old_s = ctx.repo.snapshot(&old)?;
+        let from = match old_s.parents.as_slice() {
+            [p] if ctx.repo.is_empty_change(&old)? => ctx.repo.snapshot(p)?.change_id.short(),
+            _ => old_s.change_id.short(),
+        };
+        for p in &overwritten {
+            warn(&format!(
+                "Git's checkout overwrote {} (a file Veil hides from Git, which Git treats as expendable). Your version \
+                 as of the last vl command is kept in change {from}: `vl restore --from {from} {}`. An edit made since \
+                 then is lost",
+                safe(p.as_str()),
+                safe(p.as_str())
+            ));
+        }
+    }
     Ok(())
+}
+
+/// The files Veil hid from Git that Git's checkout of `commit` wrote over
+/// (BUG-754: Git treats ignored files as expendable): hidden before the
+/// move (not plain public in `old_tree`, or a sealed edit under
+/// skip-worktree), recorded by Veil with other content, and on disk
+/// exactly as `commit` has them.
+fn overwritten_hidden(
+    ctx: &Ctx,
+    bridge: &GitBridge,
+    state: &State,
+    old_tree: &ObjectId,
+    commit: &veil_core::git::GitOid,
+) -> Result<Vec<VPath>> {
+    let store = ctx.repo.store().clone();
+    let public = colocate::public_plain(&ctx.repo, old_tree);
+    let mut recorded: Vec<(VPath, veil_core::TreeEntry)> = Vec::new();
+    for (p, e) in veil_core::tree::walk_files(&store, old_tree)? {
+        let hidden = !public.contains(p.as_str().as_bytes()) || state.skip.iter().any(|s| s == p.as_str());
+        if hidden && e.kind.is_file_like() {
+            recorded.push((p, e));
+        }
+    }
+    if recorded.is_empty() {
+        return Ok(Vec::new());
+    }
+    let c = bridge.read_commit(commit)?;
+    let theirs = bridge.flatten_tree(&c.tree)?;
+    let mut out = Vec::new();
+    for (p, e) in recorded {
+        let Some(leaf) = theirs.get(p.as_str().as_bytes()) else { continue };
+        if leaf.mode & 0o170000 != 0o100000 {
+            continue;
+        }
+        let Some(disk) = veil_core::StorageBackend::read_opt(&*ctx.fs, &p)? else { continue };
+        if bridge.read_blob(&leaf.oid)? != disk {
+            continue;
+        }
+        let ours = match veil_core::conflict::read_file_like(&store, &e) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if ours != disk {
+            out.push(p);
+        }
+    }
+    Ok(out)
+}
+
+// ---- who wrote .veilpolicy ---------------------------------------------------------------
+
+/// Could Git have written `text`, the working copy's `.veilpolicy`, since
+/// the last `vl` command (BUG-759)? Only an edit Git could not have
+/// written is taken as the member's own (and accepted even where it
+/// weakens the policy): Git writes a file only as a blob of its object
+/// database (through its attributes' conversions) or as a conflicted
+/// merge of blobs. So it may have been Git's when
+/// * a Git operation is in progress (a merge, rebase, cherry-pick, or a
+///   command holding `index.lock`);
+/// * Git's index has unmerged entries for `.veilpolicy`, or a line of
+///   `text` looks like a conflict marker (of any `conflict-marker-size`:
+///   `git stash pop` leaves markers, and a `git reset` the unmerged
+///   entries away);
+/// * `text`, cleaned as `git add` would, or as it is, is a blob Git has (a
+///   pulled, stashed or staged version: `git reset --soft` after a pull
+///   leaves the pulled policy in the work tree with `HEAD` back where
+///   Veil saw it).
+///
+/// Anything Git cannot answer counts as Git's. A member who staged their
+/// own edit (`git add`) before the next `vl` command makes it look like
+/// Git's too: it then waits for `vl policy accept`.
+pub fn git_may_have_written_policy(root: &Path, git_dir: &Path, text: &[u8]) -> bool {
+    if colocate::operation_in_progress(git_dir).is_some() {
+        return true;
+    }
+    match index::read(&index::index_path(git_dir)) {
+        Ok(Some(entries)) => {
+            if entries.iter().any(|e| e.stage != 0 && e.path == POLICY_FILE.as_bytes()) {
+                return true;
+            }
+        }
+        Ok(None) => {}
+        Err(_) => return true,
+    }
+    if looks_like_conflict(text) {
+        return true;
+    }
+    let mut oids = Vec::new();
+    for filters in [true, false] {
+        let mut c = git_cmd(git_dir);
+        c.arg("--work-tree").arg(root).current_dir(root).args(["hash-object", "--stdin"]);
+        match filters {
+            true => c.arg(format!("--path={POLICY_FILE}")),
+            false => c.arg("--no-filters"),
+        };
+        match pipe_git(c, text) {
+            Some(out) => oids.push(out.trim().to_string()),
+            None => return true,
+        }
+    }
+    let mut query = String::new();
+    for o in &oids {
+        if o.is_empty() || !o.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return true;
+        }
+        query.push_str(o);
+        query.push('\n');
+    }
+    let mut c = git_cmd(git_dir);
+    c.args(["cat-file", "--batch-check=%(objectname) %(objecttype)"]);
+    match pipe_git(c, query.as_bytes()) {
+        // `<oid> missing` for a blob Git does not have.
+        Some(out) => out.lines().count() != oids.len() || !out.lines().all(|l| l.ends_with(" missing")),
+        None => true,
+    }
+}
+
+/// A line of a conflicted merge: `<<<<<<< ours`, `|||||||`, `=======`,
+/// `>>>>>>> theirs`, of any marker length.
+fn looks_like_conflict(text: &[u8]) -> bool {
+    String::from_utf8_lossy(text).lines().any(|l| {
+        let l = l.trim_end_matches('\r');
+        let Some(c) = l.chars().next().filter(|c| matches!(c, '<' | '>' | '|' | '=')) else { return false };
+        let rest = l.trim_start_matches(c);
+        rest.is_empty() || rest.starts_with(' ')
+    })
+}
+
+/// Run `c` with `input` on its standard input; its output, if it succeeded.
+fn pipe_git(mut c: Command, input: &[u8]) -> Option<String> {
+    use std::io::Write;
+    let mut child = c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let mut stdin = child.stdin.take()?;
+    let data = input.to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&data));
+    let out = child.wait_with_output().ok()?;
+    let _ = writer.join();
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 // ---- hooks ---------------------------------------------------------------------------------
@@ -1363,7 +1536,7 @@ fn add_policy_rules(ctx: &mut Ctx, found: &[policy_gitignore::ImportedPattern]) 
     if text != before {
         veil_core::StorageBackend::write(&*ctx.fs, &p, text.as_bytes())?;
         print_imported(found);
-        ctx.snapshot_as("import .gitignore patterns into .veilpolicy".into())?;
+        ctx.snapshot_policy_edit("import .gitignore patterns into .veilpolicy".into(), before.as_bytes(), text.as_bytes())?;
         let recorded: Vec<String> = found
             .iter()
             .filter(|f| {

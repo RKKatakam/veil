@@ -204,6 +204,17 @@ pub fn wrap(store: &ObjectStore, embargo: &str, tree: &ObjectId, fallback: &Obje
     if tree == fallback {
         return Ok(*fallback);
     }
+    wrap_line(store, embargo, tree, fallback)
+}
+
+/// [`wrap`], keeping the wrapper even when `tree` holds nothing to hide
+/// (BUG-761): a line under an unreleased embargo stays under it. A
+/// snapshot that deleted every file of the fix has the fallback's tree;
+/// unwrapped, it would take the line out of the embargo, and the next
+/// snapshot would record a file put back (the fix itself: `git stash
+/// pop`, an editor's undo) as a public edit, which a commit and a push
+/// publish before the release.
+pub fn wrap_line(store: &ObjectStore, embargo: &str, tree: &ObjectId, fallback: &ObjectId) -> Result<ObjectId> {
     for id in [tree, fallback] {
         if let Some(w) = unreleased_wrapper(store, id)? {
             if w.embargo != embargo {

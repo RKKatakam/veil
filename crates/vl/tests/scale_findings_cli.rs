@@ -29,7 +29,6 @@ fn vl(home: &Path, cwd: &Path, args: &[&str]) -> Command {
 /// "repository is locked". The baseline's 64-agent profile on the 1 GB
 /// repository failed 194 of 640 iterations this way.
 #[test]
-#[ignore = "BUG-801: concurrent commands fail with `repository is locked` after 15 s instead of queueing"]
 fn many_concurrent_commands_all_succeed() {
     const FILES: usize = 20_000;
     const PROCS: usize = 64;

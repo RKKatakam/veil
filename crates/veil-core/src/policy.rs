@@ -609,6 +609,11 @@ pub struct Policy {
     /// [`working_copy_policy`]): some of what is held back may be the
     /// member's own change.
     pub own_edit_pending: bool,
+    /// Colocated Git mode: Git may have written the working copy's
+    /// `.veilpolicy` (a pull, checkout, `stash pop`, `reset --soft`), so no
+    /// edit found there was taken as the member's own (BUG-759); only a
+    /// `vl` command's own edit is ([`PolicyEdit`]).
+    pub edits_unattributed: bool,
     /// The policy the member accepted, if this one is guarded by it (see
     /// [`Policy::guarded_by`]).
     accepted: Option<Box<Policy>>,
@@ -627,6 +632,7 @@ impl Policy {
             set: GlobSet::empty(),
             warnings: vec![],
             own_edit_pending: false,
+            edits_unattributed: false,
             accepted: None,
         }
     }
@@ -1520,11 +1526,60 @@ pub fn working_copy_policy(
     fs: &dyn StorageBackend,
     parent_policy: Option<Option<&[u8]>>,
 ) -> Result<WorkingCopyPolicy> {
+    working_copy_policy_written(local, fs, parent_policy, None, false)
+}
+
+/// [`working_copy_policy`] in colocated Git mode, where no edit found in
+/// the working copy is taken as the member's own (BUG-759): a
+/// `.veilpolicy` that differs from the accepted one is guarded like an
+/// incoming change, except that one never weaker than the accepted policy
+/// for any path is accepted (a protection the member added by hand stays
+/// pinned, though Git might have written it).
+pub fn working_copy_policy_colocated(local: &dyn StorageBackend, fs: &dyn StorageBackend) -> Result<WorkingCopyPolicy> {
+    working_copy_policy_written(local, fs, None, None, true)
+}
+
+/// An edit of `.veilpolicy` a `vl` command made itself (`vl cloak`,
+/// `vl expose`, `vl policy import-gitignore`): it read `before` and wrote
+/// `after`. In colocated Git mode it is the only edit taken as the
+/// member's own (see [`working_copy_policy_after_edit`]).
+#[derive(Clone, Copy, Debug)]
+pub struct PolicyEdit<'a> {
+    pub before: &'a [u8],
+    pub after: &'a [u8],
+}
+
+/// [`working_copy_policy`] where the member's own edit is exactly `edit`
+/// (colocated Git mode, BUG-759: Git may write `.veilpolicy` between two
+/// `vl` commands by any route, so a difference from the recorded version
+/// proves nothing about who made it). `edit.before` → `edit.after` is
+/// folded in as theirs, and only while the file still holds `edit.after`;
+/// anything else found there is incoming.
+pub fn working_copy_policy_after_edit(local: &dyn StorageBackend, fs: &dyn StorageBackend, edit: PolicyEdit<'_>) -> Result<WorkingCopyPolicy> {
+    working_copy_policy_written(local, fs, Some(Some(edit.before)), Some(edit.after), true)
+}
+
+/// [`working_copy_policy`]; with `written`, the edit `parent_policy` →
+/// file counts as the member's only while the file holds `written`; with
+/// `pin_stronger`, see [`working_copy_policy_colocated`].
+fn working_copy_policy_written(
+    local: &dyn StorageBackend,
+    fs: &dyn StorageBackend,
+    parent_policy: Option<Option<&[u8]>>,
+    written: Option<&[u8]>,
+    pin_stronger: bool,
+) -> Result<WorkingCopyPolicy> {
     let acc = load_accepted(local)?;
     let (text, own_edit) = match read_policy_file(fs)? {
-        PolicyFile::File(t) => (t, parent_policy),
+        PolicyFile::File(t) => {
+            let own = match written {
+                Some(w) if w != t.as_slice() => None,
+                _ => parent_policy,
+            };
+            (t, own)
+        }
         PolicyFile::Linked(t) => {
-            let mut wp = guarded_policy(acc, t, None);
+            let mut wp = guarded_policy(acc, t, None, pin_stronger);
             wp.policy.warnings.push(format!(
                 "{POLICY_FILE} is a symlink: Veil applies the rules of the file it leads to, but records no change \
                  to it (history keeps the recorded version, so teammates do not get your edits), and a change there \
@@ -1534,7 +1589,7 @@ pub fn working_copy_policy(
             return Ok(wp);
         }
         PolicyFile::Absent => {
-            let mut wp = guarded_policy(acc, Vec::new(), None);
+            let mut wp = guarded_policy(acc, Vec::new(), None, pin_stronger);
             if wp.policy.accepted().is_some_and(|a| !a.rule_lines().is_empty()) {
                 wp.policy.warnings.push(format!(
                     "{POLICY_FILE} is missing: the policy you accepted on this device still applies (a deleted \
@@ -1557,13 +1612,15 @@ pub fn working_copy_policy(
             return Ok(WorkingCopyPolicy { policy, accept: None });
         }
     };
-    Ok(guarded_policy(acc, text, own_edit))
+    Ok(guarded_policy(acc, text, own_edit, pin_stronger))
 }
 
 /// [`working_copy_policy`] for a readable `.veilpolicy` (`text`; empty for
 /// none), the accepted policy `acc` and, when the member may have edited
-/// the file, the policy of the tree it was checked out from.
-fn guarded_policy(acc: Option<Vec<u8>>, text: Vec<u8>, parent_policy: Option<Option<&[u8]>>) -> WorkingCopyPolicy {
+/// the file, the policy of the tree it was checked out from; with
+/// `pin_stronger`, a policy never weaker than the accepted one is accepted
+/// whoever wrote it (colocated Git mode).
+fn guarded_policy(acc: Option<Vec<u8>>, text: Vec<u8>, parent_policy: Option<Option<&[u8]>>, pin_stronger: bool) -> WorkingCopyPolicy {
     let current = Policy::parse(&String::from_utf8_lossy(&text));
     let Some(acc) = acc else {
         return WorkingCopyPolicy {
@@ -1611,6 +1668,15 @@ fn guarded_policy(acc: Option<Vec<u8>>, text: Vec<u8>, parent_policy: Option<Opt
             policy,
             accept: pin.map(String::into_bytes),
         };
+    }
+    // Colocated Git mode: not known to be the member's edit, but never
+    // weaker than the accepted policy for any path (the exhaustive check of
+    // `verify_fold`): accepted whoever wrote it, so a protection the member
+    // added by hand stays pinned where their edit cannot be told apart from
+    // an incoming one (BUG-759). Elsewhere only the member's own edit moves
+    // the pin (folded above), never what a pending change did.
+    if pin_stronger && verify_fold(&accepted, &accepted, &current).is_ok() {
+        return take_all();
     }
     WorkingCopyPolicy {
         policy: current.guarded_by(accepted),

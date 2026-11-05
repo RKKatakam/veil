@@ -128,7 +128,7 @@ fn damaged_object_is_repaired_by_pulling_it_again() {
     // A plain pull trusts what the local committed view reaches; repair is
     // the explicit full pull, which re-verifies every local copy.
     let mut bob = bob;
-    remote::pull_with(&mut bob, "origin", remote_fs, &remote::SyncOptions { full: true }).unwrap();
+    remote::pull_with(&mut bob, "origin", remote_fs, &remote::SyncOptions { full: true, ..Default::default() }).unwrap();
     assert_eq!(bob.store().read_blob(&e.id).unwrap(), b"trusted\n");
 }
 

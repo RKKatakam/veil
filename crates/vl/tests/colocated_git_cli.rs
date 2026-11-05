@@ -818,3 +818,66 @@ fn quarantined_edits_are_hidden_from_git() {
     assert!(!out.status.success() || !contains(&objects(&env, &dir.join(".git")), "wJalrXUtnFEMI"), "{}", text(&out));
     assert_clean(&env, &dir.join(".git"), &["wJalrXUtnFEMI"], "after a quarantined edit");
 }
+
+// ---- BUG-759: who wrote .veilpolicy ----------------------------------------------------------
+
+fn pin(dir: &Path) -> String {
+    std::fs::read_to_string(dir.join(".git/veil/local/accepted-policy")).unwrap_or_default()
+}
+
+/// Does the pin have a rule making something `public!`?
+fn pins_public(dir: &Path) -> bool {
+    pin(dir).lines().any(|l| !l.starts_with('#') && l.contains("public!"))
+}
+
+fn recorded_public(env: &Env, dir: &Path, path: &str) -> bool {
+    env.ok(dir, &["ls", "-r", "@"]).lines().any(|l| l.starts_with("public") && l.ends_with(path))
+}
+
+/// Git may write `.veilpolicy` between two `vl` commands by any route, so
+/// an edit found there is the member's own only when Git cannot have
+/// written it: not a blob Git has (a pulled, stashed or staged version),
+/// no conflict markers, no Git operation in progress. Anything else is
+/// guarded like a pull until `vl policy accept`; `vl cloak`, `vl expose`
+/// and friends record the member's edits whatever the file held.
+#[test]
+fn bug759_a_policy_edit_is_the_members_only_if_git_cannot_have_written_it() {
+    let env = Env::new();
+    let dir = env.project("p");
+    let policy = std::fs::read_to_string(dir.join(".veilpolicy")).unwrap();
+    assert!(pin(&dir).lines().any(|l| l == "secrets/ cloak"), "{}", pin(&dir));
+    // 1. A hand edit Git never saw is the member's (here it may weaken
+    // `notes/.env`, so only the attribution accepts it).
+    env.write(&dir, ".veilpolicy", &format!("{policy}notes/ cloak\n"));
+    env.ok(&dir, &["status"]);
+    assert!(pin(&dir).lines().any(|l| l == "notes/ cloak"), "{}", pin(&dir));
+    // 2. The same kind of edit, staged with `git add` before `vl` looks
+    // (as `git reset --soft` leaves a pulled one): a weakening waits.
+    env.write(&dir, ".veilpolicy", &format!("{policy}notes/ cloak\nsecrets/db.yml public!\n"));
+    env.git_ok(&dir, &["add", ".veilpolicy"]);
+    let out = env.ok(&dir, &["status"]);
+    assert!(out.contains("colocated Git mode"), "{out}");
+    assert!(!pins_public(&dir), "{}", pin(&dir));
+    assert!(!recorded_public(&env, &dir, "secrets/db.yml"), "{}", env.ok(&dir, &["ls", "-r", "@"]));
+    // 3. Conflict markers (a `git stash pop` conflict, then `git reset`):
+    // never the member's, whatever the marker size.
+    for marker in ["<<<<<<<", "<<<"] {
+        env.write(&dir, ".veilpolicy", &format!("{policy}{marker} Updated upstream\nsecrets/ public!\n===\nnotes/ cloak\n>>> Stashed changes\n"));
+        env.ok(&dir, &["status"]);
+        assert!(!pins_public(&dir), "{marker}: {}", pin(&dir));
+        assert!(!recorded_public(&env, &dir, "secrets/db.yml"), "{marker}");
+    }
+    // 4. `vl expose` is the member's edit even on top of one that waits:
+    // exactly its rule is accepted.
+    env.write(&dir, ".veilpolicy", &format!("{policy}notes/ cloak\nsecrets/db.yml public!\n"));
+    env.write(&dir, "notes/open.md", "open\n");
+    env.ok(&dir, &["expose", "notes/open.md"]);
+    let p = pin(&dir);
+    assert!(p.lines().any(|l| l.starts_with("notes/open.md") && l.contains("public")), "{p}");
+    assert!(!p.contains("secrets/db.yml"), "{p}");
+    assert!(recorded_public(&env, &dir, "notes/open.md"));
+    assert!(!recorded_public(&env, &dir, "secrets/db.yml"));
+    // 5. `vl policy accept` takes the rest, on purpose.
+    env.ok(&dir, &["policy", "accept"]);
+    assert!(pin(&dir).contains("secrets/db.yml public!"), "{}", pin(&dir));
+}

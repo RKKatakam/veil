@@ -312,7 +312,7 @@ pub fn print_build_warnings(r: &BuildReport) {
     // A command's held-back edit of `.veilpolicy`: the caller says where
     // it stays and how to accept it (`policy_edit_held_message`).
     if r.policy_edit_held.is_none() {
-        print_policy_held_back(&r.policy_held_back, r.policy_edit_pending);
+        print_policy_held_back(&r.policy_held_back, r.policy_edit_pending, r.policy_edits_unattributed);
     }
 }
 
@@ -357,7 +357,11 @@ pub fn policy_edit_held_message(r: &BuildReport, kept: Option<(&str, &str)>) -> 
 /// changed by a merge, pull, checkout, …) would weaken their protection.
 /// `own_edit_pending`: the member's own edit of `.veilpolicy` could not be
 /// applied on its own and waits too, so some of `held` may be theirs.
-pub fn print_policy_held_back(held: &[HeldBack], own_edit_pending: bool) {
+///
+/// `unattributed`: colocated Git mode, where Git may have written
+/// `.veilpolicy`, so no edit found there was taken as the member's own
+/// (BUG-759).
+pub fn print_policy_held_back(held: &[HeldBack], own_edit_pending: bool, unattributed: bool) {
     const SHOWN: usize = 5;
     if held.is_empty() {
         return;
@@ -371,6 +375,9 @@ pub fn print_policy_held_back(held: &[HeldBack], own_edit_pending: bool) {
         list.push(format!("and {} more", held.len() - SHOWN));
     }
     let origin = match own_edit_pending {
+        _ if unattributed => "and in colocated Git mode Git may have written it (a pull, checkout, `git stash pop`, \
+                              `git reset --soft`), so a change found there is never taken as your edit (make yours with \
+                              `vl cloak`, `vl isolate`, `vl expose` or `vl ignore`)",
         false => "and that change came from a merge, pull, checkout, restore or undo (or a symlinked policy file) rather than your own edit",
         true => "through a change from a merge, pull, checkout, restore or undo that you have not accepted, or through your \
                  own edit, which waits for `vl policy accept` because it could not be applied without that change",

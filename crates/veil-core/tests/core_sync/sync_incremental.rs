@@ -181,7 +181,7 @@ fn full_sync_still_walks_and_verifies_everything() {
     let (mut alice, fs, _) = new_repo("alice");
     history(&mut alice, &fs, 5);
     let remote = Arc::new(MemoryBackend::new());
-    let full = SyncOptions { full: true };
+    let full = SyncOptions { full: true, ..Default::default() };
     let first = remote::push_with(&mut alice, remote.clone(), false, &[], false, &full).unwrap();
     assert!(first.objects_copied > 20);
     assert_eq!(first.packs_written, 0, "the full walk writes loose objects");

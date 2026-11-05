@@ -141,6 +141,83 @@ fn is_hex(s: &str) -> bool {
     s.bytes().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
 }
 
+/// The most a [`Staged`] scope holds in memory before it gives up
+/// ([`Staged::overflowed`]): a snapshot with more new content than this is
+/// built under the repository lock, as before.
+pub const STAGING_BUDGET: usize = 32 << 20;
+
+/// New objects of one thread's [`ObjectStore::begin_staging`] scope.
+struct Staging {
+    /// The store they are for (`ObjectStore` address).
+    store: usize,
+    objects: std::collections::HashMap<ObjectId, Vec<u8>>,
+    bytes: usize,
+    overflowed: bool,
+}
+
+thread_local! {
+    static STAGING: std::cell::RefCell<Option<Staging>> = const { std::cell::RefCell::new(None) };
+}
+
+/// An open [`ObjectStore::begin_staging`] scope: [`StagingScope::finish`]
+/// ends it; dropping it (a panic in the build) ends it too, discarding
+/// what was staged, so the thread never stays in staging.
+pub(crate) struct StagingScope<'a> {
+    store: &'a ObjectStore,
+    done: bool,
+}
+
+impl StagingScope<'_> {
+    /// End the scope; what it staged.
+    pub(crate) fn finish(mut self) -> Staged {
+        self.done = true;
+        let me = self.store as *const ObjectStore as usize;
+        STAGING.with(|s| match s.borrow_mut().take() {
+            Some(st) if st.store == me => Staged {
+                objects: st.objects.into_iter().collect(),
+                overflowed: st.overflowed,
+            },
+            _ => Staged {
+                objects: Vec::new(),
+                overflowed: true,
+            },
+        })
+    }
+}
+
+impl Drop for StagingScope<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            STAGING.with(|s| s.borrow_mut().take());
+        }
+    }
+}
+
+/// What a `ObjectStore::begin_staging` scope staged: objects written
+/// nowhere yet. `ObjectStore::publish_staged` writes them (under the
+/// repository lock, in a transaction); dropping it discards them.
+#[derive(Debug, Default)]
+pub struct Staged {
+    objects: Vec<(ObjectId, Vec<u8>)>,
+    overflowed: bool,
+}
+
+impl Staged {
+    /// More than [`STAGING_BUDGET`] was put: the objects were not all
+    /// kept, so what was built must be built again.
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+
+    pub fn len(&self) -> usize {
+        self.objects.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.objects.is_empty()
+    }
+}
+
 impl ObjectStore {
     pub fn new(backend: Arc<dyn StorageBackend>, root: VPath, keys: Arc<Keychain>) -> Self {
         let limits = CacheLimits::default();
@@ -331,7 +408,71 @@ impl ObjectStore {
         self.needs_recovery.swap(false, Ordering::SeqCst)
     }
 
+    /// From now until the scope returned ends, objects this thread
+    /// puts into this store are kept in memory instead of written, and
+    /// reads see them (BUG-801: a snapshot is built outside the repository
+    /// lock, and published under it only if nothing moved meanwhile) and
+    /// [`StagingScope::finish`] says what was staged. An
+    /// object already present is not adopted either: another process's
+    /// transaction may have written it and not made it durable yet (the
+    /// stream-O threat 5), so only [`ObjectStore::publish_staged`], under
+    /// the lock, decides. Beyond [`STAGING_BUDGET`] bytes, puts fail
+    /// ([`Staged::overflowed`]).
+    pub(crate) fn begin_staging(&self) -> StagingScope<'_> {
+        let me = self as *const ObjectStore as usize;
+        STAGING.with(|s| {
+            *s.borrow_mut() = Some(Staging {
+                store: me,
+                objects: Default::default(),
+                bytes: 0,
+                overflowed: false,
+            })
+        });
+        StagingScope { store: self, done: false }
+    }
+
+    /// Write what a staging scope kept, as any put would (inside a
+    /// transaction: unsynced, made durable by its barrier).
+    pub(crate) fn publish_staged(&self, staged: Staged) -> Result<()> {
+        for (id, raw) in staged.objects {
+            if ObjectId::hash(&raw) != id {
+                return Err(VeilError::Corrupt(id.hex(), "hash mismatch".into()));
+            }
+            self.write_if_absent(&id, &raw)?;
+        }
+        Ok(())
+    }
+
+    /// Stage `raw` if this thread has a staging scope for this store:
+    /// `Some(result)` then, `None` otherwise.
+    fn stage(&self, id: &ObjectId, raw: &[u8]) -> Option<Result<bool>> {
+        let me = self as *const ObjectStore as usize;
+        STAGING.with(|s| {
+            let mut s = s.borrow_mut();
+            let st = s.as_mut().filter(|st| st.store == me)?;
+            if st.objects.contains_key(id) {
+                return Some(Ok(false));
+            }
+            if st.overflowed || st.bytes + raw.len() > STAGING_BUDGET {
+                st.overflowed = true;
+                return Some(Err(VeilError::repo("too much new content to stage; recording under the lock")));
+            }
+            st.bytes += raw.len();
+            st.objects.insert(*id, raw.to_vec());
+            Some(Ok(true))
+        })
+    }
+
+    /// The bytes of `id` if this thread staged it.
+    fn staged(&self, id: &ObjectId) -> Option<Vec<u8>> {
+        let me = self as *const ObjectStore as usize;
+        STAGING.with(|s| s.borrow().as_ref().filter(|st| st.store == me).and_then(|st| st.objects.get(id).cloned()))
+    }
+
     fn write_loose(&self, id: &ObjectId, raw: &[u8]) -> Result<()> {
+        if let Some(r) = self.stage(id, raw) {
+            return r.map(|_| ());
+        }
         if self.unsynced.load(Ordering::SeqCst) > 0 {
             self.backend.write_unsynced(&self.loose_path(id), raw)?;
             self.not_durable_list().push(*id);
@@ -480,6 +621,9 @@ impl ObjectStore {
     }
 
     pub fn has(&self, id: &ObjectId) -> bool {
+        if self.staged(id).is_some() {
+            return true;
+        }
         self.freshen(id);
         if self.loose_exists(id) {
             return true;
@@ -493,7 +637,7 @@ impl ObjectStore {
     /// Like `has`, without rescanning packs: used to skip redundant writes,
     /// where a false negative only costs a duplicate loose copy.
     fn has_cached(&self, id: &ObjectId) -> bool {
-        self.loose_exists(id) || (self.ensure_packs().is_ok() && self.in_loaded_packs(id))
+        self.staged(id).is_some() || self.loose_exists(id) || (self.ensure_packs().is_ok() && self.in_loaded_packs(id))
     }
 
     pub fn get_raw(&self, id: &ObjectId) -> Result<Vec<u8>> {
@@ -511,6 +655,9 @@ impl ObjectStore {
     /// process for those; blobs are hashed on every read (BLAKE3, typically
     /// well above 1 GiB/s, so small next to the I/O and decryption).
     pub(crate) fn read_raw(&self, id: &ObjectId) -> Result<Vec<u8>> {
+        if let Some(b) = self.staged(id) {
+            return Ok(b);
+        }
         let loose_corrupt = match self.read_loose_verified(id)? {
             Loose::Good(b) => return Ok(b),
             Loose::Absent => false,
@@ -553,6 +700,9 @@ impl ObjectStore {
     /// loose one and shadows a corrupt packed one. That costs one read of
     /// the existing copy whenever an object is put twice.
     fn write_if_absent(&self, id: &ObjectId, raw: &[u8]) -> Result<bool> {
+        if let Some(r) = self.stage(id, raw) {
+            return r;
+        }
         if self.is_gc_candidate(id) {
             // A gc may be about to delete the existing copy: mark it, then
             // make sure we have our own good loose copy (in that order).

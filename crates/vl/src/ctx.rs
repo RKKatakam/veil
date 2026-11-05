@@ -202,6 +202,10 @@ pub struct Ctx {
     /// repository, it moves from `.git/veil` back to `.veil` (see
     /// `colocate_cmd::uncolocate`).
     pub(crate) uncolocated: bool,
+    /// Paths whose recorded entry the next snapshots keep whatever the
+    /// directory holds, besides the session's (colocated Git mode: hidden
+    /// files a Git checkout overwrote, BUG-754).
+    pub(crate) keep_extra: std::collections::BTreeSet<VPath>,
 }
 
 pub fn find_root(start: &Path) -> Option<PathBuf> {
@@ -332,6 +336,7 @@ impl Ctx {
                 bare: true,
                 git: None,
                 uncolocated: false,
+                keep_extra: Default::default(),
             });
         }
         for id in repo.auto_release_embargoes()? {
@@ -351,6 +356,7 @@ impl Ctx {
             bare: false,
             git: None,
             uncolocated: false,
+            keep_extra: Default::default(),
         };
         // Colocated Git mode: follow what Git did since the last command
         // (new commits, a checkout) before the working copy is recorded.
@@ -380,35 +386,46 @@ impl Ctx {
 
     /// Record the project directory into the attached workspace.
     pub fn snapshot(&mut self) -> Result<()> {
-        self.record(None, false, &[])
+        self.record(None, false, None, &[])
     }
 
-    /// Record the project directory as operation `description`: for commands
-    /// that edit the working copy themselves (`vl expose`, `vl restore`, …),
-    /// so that `vl undo` reverts them instead of skipping them as the
-    /// user's uncommitted edits.
     /// The automatic snapshot, with `.veilpolicy` taken as incoming (a
     /// change there is guarded by the accepted policy, never accepted as the
     /// member's own edit): colocated Git mode, where Git may have written it.
     pub(crate) fn snapshot_incoming(&mut self) -> Result<()> {
-        self.record(None, true, &[])
+        self.record(None, true, None, &[])
     }
 
-    pub fn snapshot_as(&mut self, description: String) -> Result<()> {
-        self.record(Some(description), false, &[])
+    /// Record the project directory as operation `description`, after the
+    /// command changed `.veilpolicy` itself from `before` to `after` (`vl
+    /// cloak`, `vl expose`, …): a command of its own, so that `vl undo`
+    /// reverts it instead of skipping it as the user's uncommitted edits.
+    /// In colocated Git mode, where Git may write `.veilpolicy` and so
+    /// nothing found in the directory is taken as the member's own edit
+    /// (BUG-759), this edit is.
+    pub fn snapshot_policy_edit(&mut self, description: String, before: &[u8], after: &[u8]) -> Result<()> {
+        let edit = veil_core::policy::PolicyEdit { before, after };
+        self.record(Some(description), false, Some(edit), &[])
     }
 
-    /// [`Ctx::snapshot_as`] after `vl restore` wrote the versions `carried`
+    /// Record the project directory as operation `description` after `vl
+    /// restore` wrote the versions `carried`
     /// into the directory: those files are recorded as the entries they
     /// were written from (their sealing, or the conflict as it was), not as
     /// edits of `@`'s (BUG-481). With `policy_incoming`, the command wrote
     /// `.veilpolicy` from another revision: it is guarded by the accepted
     /// policy like any incoming change, never taken as the member's edit.
     pub fn snapshot_restored(&mut self, description: String, policy_incoming: bool, carried: &[(VPath, veil_core::TreeEntry)]) -> Result<()> {
-        self.record(Some(description), policy_incoming, carried)
+        self.record(Some(description), policy_incoming, None, carried)
     }
 
-    fn record(&mut self, description: Option<String>, policy_incoming: bool, carried: &[(VPath, veil_core::TreeEntry)]) -> Result<()> {
+    fn record(
+        &mut self,
+        description: Option<String>,
+        policy_incoming: bool,
+        policy_edit: Option<veil_core::policy::PolicyEdit<'_>>,
+        carried: &[(VPath, veil_core::TreeEntry)],
+    ) -> Result<()> {
         // A move of the directory that a previous command started and did
         // not finish (killed, disk full): finish it before recording
         // anything, or the half-moved directory would be recorded as the
@@ -425,7 +442,7 @@ impl Ctx {
             if attempt > 0 {
                 std::thread::sleep(record_backoff(attempt));
             }
-            if self.record_once(description.clone(), policy_incoming, carried)? {
+            if self.record_once(description.clone(), policy_incoming, policy_edit, carried)? {
                 return Ok(());
             }
             // The process that moved it also recorded what the directory
@@ -440,7 +457,13 @@ impl Ctx {
 
     /// One attempt of [`Ctx::record`]; `false` if the workspace moved
     /// before the snapshot could be recorded.
-    fn record_once(&mut self, description: Option<String>, policy_incoming: bool, carried: &[(VPath, veil_core::TreeEntry)]) -> Result<bool> {
+    fn record_once(
+        &mut self,
+        description: Option<String>,
+        policy_incoming: bool,
+        policy_edit: Option<veil_core::policy::PolicyEdit<'_>>,
+        carried: &[(VPath, veil_core::TreeEntry)],
+    ) -> Result<bool> {
         let view_wc = self.wc()?;
         let disk = self.fs.clone();
         let fs: &dyn StorageBackend = &*disk;
@@ -522,6 +545,16 @@ impl Ctx {
             self.save_cache();
             return Ok(true);
         }
+        // Colocated Git mode: an edit of `.veilpolicy` is the member's own
+        // only if Git cannot have written it (BUG-759).
+        let attributed = match (policy_incoming, policy_edit) {
+            (false, None) => self.colocated_own_policy_edit(&view_wc)?,
+            _ => None,
+        };
+        let policy_edit = policy_edit.or(attributed
+            .as_ref()
+            .map(|(before, after)| veil_core::policy::PolicyEdit { before, after }));
+        let keep = self.keep_recorded();
         let out = self.repo.snapshot_workspace_with(
             &self.ws,
             fs,
@@ -530,9 +563,10 @@ impl Ctx {
                 materialised: Some(&self.checkout.materialised),
                 description,
                 policy_incoming,
+                policy_edit,
                 expected_wc: Some(view_wc),
                 carried,
-                keep_recorded: self.git.as_ref().map(|g| &g.keep).filter(|k| !k.is_empty()),
+                keep_recorded: keep.as_ref().filter(|k| !k.is_empty()),
                 ..Default::default()
             },
         )?;
@@ -549,6 +583,45 @@ impl Ctx {
             save_checkout(&self.fs, &self.checkout)?;
         }
         Ok(true)
+    }
+
+    /// The tracked paths snapshots keep at their recorded entry: the
+    /// session's (the user's own hidden files, BUG-745) and
+    /// [`Ctx::keep_extra`].
+    fn keep_recorded(&self) -> Option<std::collections::BTreeSet<VPath>> {
+        let mut keep = self.git.as_ref().map(|g| g.keep.clone()).unwrap_or_default();
+        keep.extend(self.keep_extra.iter().cloned());
+        (!keep.is_empty()).then_some(keep)
+    }
+
+    /// Colocated Git mode: the edit of `.veilpolicy` the directory holds
+    /// since `wc` was recorded (`before`, `after`), if Git cannot have
+    /// written it (`colocate_cmd::git_may_have_written_policy`), so it is
+    /// the member's own. `None` in any other mode, or when it may be Git's:
+    /// the snapshot then takes it as incoming (BUG-759).
+    fn colocated_own_policy_edit(&self, wc: &ObjectId) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        if !self.repo.is_colocated() {
+            return Ok(None);
+        }
+        let Some(git_dir) = veil_core::git::colocate::colocated_git_dir(&self.root) else {
+            return Ok(None);
+        };
+        let veil_core::policy::PolicyFile::File(after) = veil_core::policy::read_policy_file(&*self.fs)? else {
+            return Ok(None);
+        };
+        let tree = self.repo.snapshot(wc)?.tree;
+        let before = match lookup(self.repo.store(), &tree, &VPath::new(POLICY_FILE)?)? {
+            None => Vec::new(),
+            Some(e) if e.kind.is_file_like() => match veil_core::conflict::read_file_like(self.repo.store(), &e) {
+                Ok(b) => b,
+                Err(_) => return Ok(None),
+            },
+            Some(_) => return Ok(None),
+        };
+        if before == after || crate::colocate_cmd::git_may_have_written_policy(&self.root, &git_dir, &after) {
+            return Ok(None);
+        }
+        Ok(Some((before, after)))
     }
 
     /// Record the project directory as operation `description`, with line
@@ -757,7 +830,7 @@ impl Ctx {
         // the next snapshot) which local files keep their protection.
         let policy_of = |t: &ObjectId| lookup(self.repo.store(), t, &VPath::new(POLICY_FILE).expect("valid"));
         if policy_of(&from)? != policy_of(&to_snap.tree)? {
-            render::print_policy_held_back(&self.repo.policy_held_back(&*self.fs)?, false);
+            render::print_policy_held_back(&self.repo.policy_held_back(&*self.fs)?, false, false);
         }
         if previous != target {
             eprintln!("Working copy now at: {}", render::one_line(&self.repo, &target));
@@ -802,9 +875,10 @@ impl Ctx {
         let view_wc = self.wc()?;
         if self.checkout.workspace != self.ws || self.checkout.snapshot != view_wc {
             // Behind: the ordinary snapshot recovers first.
-            return self.record(None, true, &[]);
+            return self.record(None, true, None, &[]);
         }
         let disk = self.fs.clone();
+        let keep = self.keep_recorded();
         let out = self.repo.snapshot_workspace_with(
             &self.ws,
             &*disk,
@@ -814,7 +888,7 @@ impl Ctx {
                 expected_wc: Some(view_wc),
                 only: Some(only),
                 policy_incoming: true,
-                keep_recorded: self.git.as_ref().map(|g| &g.keep).filter(|k| !k.is_empty()),
+                keep_recorded: keep.as_ref().filter(|k| !k.is_empty()),
                 ..Default::default()
             },
         )?;
