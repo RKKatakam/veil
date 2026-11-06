@@ -65,6 +65,14 @@ fn p(s: &str) -> VPath {
     VPath::new(s).unwrap()
 }
 
+/// Where `DiskBackend::write_staged` would put the staged copy of `path`:
+/// a temp file beside it, a name snapshots ignore.
+fn staged_name(path: &VPath) -> VPath {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let tmp = format!(".{}.vltmp{:08x}", path.file_name(), NEXT.fetch_add(1, Ordering::Relaxed));
+    path.parent().unwrap().join(&tmp)
+}
+
 // ---- the faulty backend --------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,6 +192,13 @@ impl StorageBackend for FaultyBackend {
             self.volatile.lock().unwrap().push(path.clone());
             Ok(())
         })
+    }
+    /// As `DiskBackend` stages a working-copy file (BUG-818): unsynced, at
+    /// a temp name, so a power loss tears the temp file, never `path`.
+    fn write_staged(&self, path: &VPath, data: &[u8]) -> Result<VPath> {
+        let tmp = staged_name(path);
+        self.write_unsynced(&tmp, data)?;
+        Ok(tmp)
     }
     fn sync_barrier(&self) -> Result<()> {
         self.mutate(|| {
@@ -316,6 +331,11 @@ impl StorageBackend for EioBackend {
         self.lost.lock().unwrap().remove(path);
         self.volatile.lock().unwrap().insert(path.clone());
         Ok(())
+    }
+    fn write_staged(&self, path: &VPath, data: &[u8]) -> Result<VPath> {
+        let tmp = staged_name(path);
+        self.write_unsynced(&tmp, data)?;
+        Ok(tmp)
     }
     fn sync_barrier(&self) -> Result<()> {
         let mut volatile = self.volatile.lock().unwrap();
@@ -966,13 +986,18 @@ fn wc_files(repo: &Repo, ws: &str) -> BTreeMap<String, Vec<u8>> {
         .collect()
 }
 
-/// BUG-113: `vl ws switch` killed at any point (before, during or after the
-/// checkout that replaces the directory's files) never records a mix of
-/// both workspaces into either of them, never loses the edits of the
-/// workspace it leaves or a local-only file, and the next command leaves
-/// the directory holding exactly the workspace it is attached to.
-#[test]
-fn crash_during_workspace_switch() {
+/// The project directory of `default`, with unrecorded edits and a
+/// local-only file, and a workspace `agent` that edits, adds, removes and
+/// swaps a file for a directory: the "disk", with what each workspace
+/// records (`default`, `agent`).
+struct SwitchWorld {
+    id: Identity,
+    disk: Arc<MemoryBackend>,
+    default_files: BTreeMap<String, Vec<u8>>,
+    agent_files: BTreeMap<String, Vec<u8>>,
+}
+
+fn switch_world() -> SwitchWorld {
     let id = Identity::generate("alice");
     let base_disk = Arc::new(MemoryBackend::new());
     let mut repo = Repo::init(base_disk.clone(), Some(id.clone()), "alice").unwrap();
@@ -998,49 +1023,127 @@ fn crash_during_workspace_switch() {
     drop(repo);
     let mut default_files = disk_files(&*base_disk);
     default_files.remove(".env");
+    SwitchWorld {
+        id,
+        disk: base_disk,
+        default_files,
+        agent_files,
+    }
+}
 
+/// After a crash and the commands that follow it: the move is finished,
+/// neither workspace recorded anything of the other (nor a torn file),
+/// and the directory holds exactly the workspace it is attached to, with
+/// the local-only file and no staged debris.
+fn assert_switch_recovered(w: &SwitchWorld, disk: &Arc<dyn StorageBackend>, ctx: &str) -> CheckoutState {
+    assert_healthy(disk.clone(), &w.id, ctx);
+    let repo = Repo::open(disk.clone(), Some(w.id.clone()), "alice").unwrap();
+    let st = CheckoutState::load(&**disk).unwrap().unwrap();
+    assert!(st.pending.is_none(), "{ctx}: the move was not finished");
+    assert_eq!(wc_files(&repo, WS), w.default_files, "{ctx}: default's working copy");
+    assert_eq!(wc_files(&repo, "agent"), w.agent_files, "{ctx}: agent's working copy");
+    let mut expect = if st.workspace == "agent" { w.agent_files.clone() } else { w.default_files.clone() };
+    expect.insert(".env".into(), b"TOKEN=local\n".to_vec());
+    assert_eq!(disk_files(&**disk), expect, "{ctx}: the directory, attached to '{}'", st.workspace);
+    st
+}
+
+/// Is any file of the working copy a staged copy checkout left behind?
+fn has_debris(fs: &dyn StorageBackend) -> bool {
+    disk_files(fs).keys().any(|p| veil_core::vfs::is_temp_name(p.rsplit('/').next().unwrap()))
+}
+
+/// BUG-113: `vl ws switch` killed at any point (before, during or after the
+/// checkout that replaces the directory's files) never records a mix of
+/// both workspaces into either of them, never loses the edits of the
+/// workspace it leaves or a local-only file, and the next command leaves
+/// the directory holding exactly the workspace it is attached to.
+///
+/// BUG-818: checkout stages every file and makes them durable with one
+/// barrier. A power loss before it tears staged copies, never a file under
+/// its own name, so nothing torn is recorded as an edit; the next command
+/// removes the staged debris.
+#[test]
+fn crash_during_workspace_switch() {
+    let w = switch_world();
+    let (id, base_disk, agent_files, default_files) = (&w.id, &w.disk, &w.agent_files, &w.default_files);
     let mut crashes = 0;
+    let mut debris = 0;
     for mode in [Crash::BeforeWrite, Crash::AfterWrite, Crash::PowerLoss] {
         for budget in 0..10_000 {
             let disk = Arc::new(base_disk.fork());
             let faulty = Arc::new(FaultyBackend::new(disk.clone(), budget, mode));
             let ctx = format!("ws switch: {mode:?} after {budget} writes");
-            let result = wc_session(faulty.clone(), &id, Some("agent"));
+            let result = wc_session(faulty.clone(), id, Some("agent"));
             let completed = result.is_ok() && !faulty.crashed();
             if let Err(e) = &result {
                 assert!(faulty.crashed(), "{ctx}: failed without a crash: {e}");
             }
             crashes += usize::from(!completed);
             let disk: Arc<dyn StorageBackend> = disk;
+            debris += usize::from(has_debris(&*disk));
             // Reboot, then the next command; twice, so a recovery that is
             // itself interrupted later is covered by the second.
             for _ in 0..2 {
-                wc_session(disk.clone(), &id, None).unwrap_or_else(|e| panic!("{ctx}: the next command fails: {e}"));
+                wc_session(disk.clone(), id, None).unwrap_or_else(|e| panic!("{ctx}: the next command fails: {e}"));
             }
-            assert_healthy(disk.clone(), &id, &ctx);
+            let st = assert_switch_recovered(&w, &disk, &ctx);
             let repo = Repo::open(disk.clone(), Some(id.clone()), "alice").unwrap();
-            let st = CheckoutState::load(&*disk).unwrap().unwrap();
-            assert!(st.pending.is_none(), "{ctx}: the move was not finished");
-            assert_eq!(wc_files(&repo, WS), default_files, "{ctx}: default's working copy");
-            assert_eq!(wc_files(&repo, "agent"), agent_files, "{ctx}: agent's working copy");
-            let mut expect = if st.workspace == "agent" { agent_files.clone() } else { default_files.clone() };
-            expect.insert(".env".into(), b"TOKEN=local\n".to_vec());
-            assert_eq!(disk_files(&*disk), expect, "{ctx}: the directory, attached to '{}'", st.workspace);
             if completed {
                 assert_eq!(st.workspace, "agent", "{ctx}");
                 break;
             }
             // The user runs the switch again: it completes.
             drop(repo);
-            wc_session(disk.clone(), &id, Some("agent")).unwrap_or_else(|e| panic!("{ctx}: switching again: {e}"));
+            wc_session(disk.clone(), id, Some("agent")).unwrap_or_else(|e| panic!("{ctx}: switching again: {e}"));
             let repo = Repo::open(disk.clone(), Some(id.clone()), "alice").unwrap();
-            assert_eq!(wc_files(&repo, WS), default_files, "{ctx}: default after switching again");
+            assert_eq!(&wc_files(&repo, WS), default_files, "{ctx}: default after switching again");
             let mut expect = agent_files.clone();
             expect.insert(".env".into(), b"TOKEN=local\n".to_vec());
             assert_eq!(disk_files(&*disk), expect, "{ctx}: the directory after switching again");
         }
     }
     assert!(crashes > 10, "the sweep crashed only {crashes} times");
+    assert!(debris > 0, "no crash ever found a file staged by checkout");
+}
+
+/// BUG-818: a barrier of `vl ws switch` fails with EIO, at each barrier in
+/// turn (the snapshot's, then the checkout's: after staging, after the
+/// renames). What a failed barrier covered reads back fine but never
+/// reaches the disk. The command fails; the next command finishes the
+/// move, rewriting every file whose write may not be durable; then the
+/// power fails. Nothing torn or missing is recorded into either
+/// workspace, and the directory holds exactly the workspace it is
+/// attached to.
+#[test]
+fn eio_during_workspace_switch() {
+    let w = switch_world();
+    let mut failures = 0;
+    for fail_at in 0..1000 {
+        let disk = Arc::new(w.disk.fork());
+        let eio = Arc::new(EioBackend::new(disk.clone(), fail_at, false));
+        let ctx = format!("ws switch: barrier {fail_at} fails");
+        let first = wc_session(eio.clone(), &w.id, Some("agent"));
+        if !eio.failed.load(Ordering::SeqCst) {
+            first.unwrap_or_else(|e| panic!("{ctx}: failed without a fault: {e}"));
+            // No barrier failed, and the power fails as soon as the switch
+            // returns: everything it recorded is already on disk.
+            eio.power_loss();
+            let disk: Arc<dyn StorageBackend> = disk;
+            wc_session(disk.clone(), &w.id, None).unwrap_or_else(|e| panic!("{ctx}: the command after the power loss fails: {e}"));
+            let st = assert_switch_recovered(&w, &disk, "power loss right after the switch");
+            assert_eq!(st.workspace, "agent");
+            break;
+        }
+        failures += 1;
+        wc_session(eio.clone(), &w.id, None).unwrap_or_else(|e| panic!("{ctx}: the next command fails: {e}"));
+        eio.power_loss();
+        let disk: Arc<dyn StorageBackend> = disk;
+        wc_session(disk.clone(), &w.id, None).unwrap_or_else(|e| panic!("{ctx}: the command after the power loss fails: {e}"));
+        assert_switch_recovered(&w, &disk, &ctx);
+    }
+    // The snapshot's barrier, and the checkout's two.
+    assert!(failures >= 3, "only {failures} barriers failed");
 }
 
 /// First-class conflicts: `vl ws switch` onto a workspace whose change holds

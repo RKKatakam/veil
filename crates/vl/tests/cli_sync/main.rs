@@ -11,5 +11,6 @@
 mod adversarial_support;
 
 mod annotated_tags_cli;
+mod clone_crash_cli;
 mod serve_cli;
 mod sftp_cli;

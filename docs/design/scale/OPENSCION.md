@@ -35,7 +35,7 @@ by `veil-bench openscion` (`crates/veil-bench/src/openscion.rs`) on
   the server used 0.3–0.9 s of CPU and the client 1.8 s; the rest is
   waiting on the disk.
 - **The cost is the checkout's durability, not the transfer** (BUG-818,
-  pre-existing): checkout writes every file to a temporary file, `fsync`s
+  pre-existing, fixed since: see "After BUG-818" below): checkout writes every file to a temporary file, `fsync`s
   it, renames it and `fsync`s its directory: 20,154 `fsync`s for 10,001
   files, 7.3 s of the 9.4 s clone under `strace -w`. Git does not `fsync`
   working-tree files. The figures in `OVERVIEW.md` (50 / 483 ms) do not
@@ -49,11 +49,58 @@ by `veil-bench openscion` (`crates/veil-bench/src/openscion.rs`) on
 - **Commit one changed file** and **import** are client costs measured for
   the record; S1 did not change them.
 
+## After BUG-818: one barrier per checkout (2026-11-06)
+
+Checkout now stages every file beside its path (unsynced), makes them all
+durable with one barrier (the object store's parallel `fsync`s), renames
+them into place and syncs their directories once
+(`docs/ARCHITECTURE.md`, BUG-818). Same machine, same method: release
+builds, median of 5, the bench directory in the worktree on the ext4 NVMe
+disk (never `/tmp`, which is tmpfs here). "Before" is the S1 branch
+(`ab4304a`), measured again the same hour, so both columns share the
+machine's state; the server and the bench binary are the same build in
+both.
+
+| Files | Workload | Before (ms) | After (ms) | Git (ms) | Target (ms) | Meets target | Beats Git |
+|---:|---|---:|---:|---:|---:|---|---|
+| 1000 | import a directory | 115.3 | 117.6 | 116.9 | 22.0 | no | no |
+| 1000 | clone everything (server) | 1059.3 | **124.4** | 171.1 | 51.0 | no | **yes** |
+| 1000 | clone everything (path remote) | 1037.6 | **133.0** | – | – | – | – |
+| 1000 | commit one changed file | 32.2 | 30.2 | 4.4 | 2.5 | no | no |
+| 1000 | clone one directory (server) | 170.9 | **62.0** | 47.2 | 6.1 | no | no |
+| 10000 | import a directory | 694.7 | 788.2 | 814.4 | 245.0 | no | yes |
+| 10000 | clone everything (server) | 10043.8 | **1014.2** | 582.6 | 544.0 | no | no |
+| 10000 | clone everything (path remote) | 10363.1 | **1178.1** | – | – | – | – |
+| 10000 | commit one changed file | 54.9 | 44.7 | 9.0 | 22.0 | no | no |
+| 10000 | clone one directory (server) | 188.3 | **74.0** | 81.7 | 25.0 | no | **yes** |
+
+- **Clone is 8.5× (1k) to 9.9× (10k) faster**, and clone one directory
+  2.5×. A 10k clone makes 10,155 `fsync`s instead of 20,154 (one per file,
+  32 at a time, plus one per directory), so ext4 commits them in a few
+  journal transactions instead of one each.
+- **Import and commit one file** do not check anything out; their changes
+  are run-to-run noise.
+- **Barriers compared** (10k path-remote clone, median of 5, the same
+  disk): the parallel `fsync`s 1,108 ms; `syncfs` 906 ms; starting each
+  file's writeback when it is staged (`sync_file_range`) and then the
+  `fsync`s, 1,710 ms. `syncfs` is not used: before Linux 5.8 it does not
+  report writeback errors (a failed write would go unnoticed), after it
+  reports other files' errors as ours, it waits for every other process's
+  dirty data on the file system, and macOS has no equivalent. Under a
+  sustained writer on the same disk both varied between 1.3 and 2.5 s.
+- **What is left of a 10k clone** (about 1.0 s): roughly 16 `openat` per
+  file for the no-follow walks of checkout's steps (`vfs::beneath`), the
+  file `fsync`s, and the transfer. Times cluster in steps of about 100 ms
+  (1,106 / 1,208 ms) from run to run, which is not checkout's.
+
 ## Next
 
-1. BUG-818: batch the checkout's durability (write every file, then one
-   barrier: `StorageBackend::write_unsynced` and the existing batch
-   barrier already do this for objects).
-2. Then re-measure; the transfer itself (about 1 s of the 10k clone today)
-   is the server's share to bring under the 544 ms gate (one request per
-   level, streamed responses, the pack format on the wire).
+1. The transfer and the per-file walks are what separate the 10k clone
+   (1,014 ms) from the 544 ms gate and from Git (583 ms): one request per
+   level, streamed responses and the pack format on the wire on the
+   server's side; on the client, one directory descriptor per directory
+   for checkout's steps instead of a walk from the root for each.
+2. Clone one directory (74 ms at 10k, 62 ms at 1k) is now mostly the fixed
+   cost of `vl` starting, creating a repository and signing in.
+3. Commit one changed file: the fixed per-command overhead (opening the
+   repository, keys, the op log, the working-copy scan).

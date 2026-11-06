@@ -300,6 +300,25 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
         self.write(path, data)
     }
 
+    /// Write `data` for `path` so that no crash can ever leave `path`
+    /// torn, without making anything durable yet: the bytes go to a new
+    /// temp file beside `path` (a name snapshots ignore, see
+    /// [`is_temp_name`]), whose path is returned, with the permissions of
+    /// the file at `path`. A [`StorageBackend::sync_barrier`] makes it
+    /// durable, then [`StorageBackend::rename_unsynced`] moves it over
+    /// `path`, and a second barrier makes the name durable. Checkout
+    /// writes the working copy this way: one barrier for every file
+    /// instead of an `fsync` each (BUG-818).
+    ///
+    /// The default writes `path` itself ([`StorageBackend::write_unsynced`])
+    /// and returns it: right for backends that a power loss cannot tear
+    /// (memory) or that are never durable (sandboxes). A backend whose
+    /// unsynced writes can be torn under their final name must override it.
+    fn write_staged(&self, path: &VPath, data: &[u8]) -> Result<VPath> {
+        self.write_unsynced(path, data)?;
+        Ok(path.clone())
+    }
+
     /// Make every [`StorageBackend::write_unsynced`] that returned before
     /// this call durable: file contents, their names, and any directories
     /// created for them. Barriers on one backend value are serialised, so a

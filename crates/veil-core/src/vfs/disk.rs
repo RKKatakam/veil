@@ -856,7 +856,49 @@ impl StorageBackend for DiskBackend {
         Ok(())
     }
 
+    /// Working-copy paths: the temp file is written beneath the root (no
+    /// symlink followed), with the mode of the file it will replace, and
+    /// left for the next barrier; [`DiskBackend::rename_unsynced`] then
+    /// moves it into place. `.veil/` keeps the default.
+    #[cfg(unix)]
+    fn write_staged(&self, path: &VPath, data: &[u8]) -> Result<VPath> {
+        if path.is_root() || Self::own_path(path) {
+            self.write_unsynced(path, data)?;
+            return Ok(path.clone());
+        }
+        let full = self.full_path(path);
+        let mut created = Vec::new();
+        let dir = super::beneath::open_parent(&self.root, path, true, false, &mut created).map_err(|e| self.write_walk_err(path, e))?;
+        let parent = full.parent().expect("non-root path has a parent").to_path_buf();
+        {
+            let mut u = self.unsynced.lock().unwrap_or_else(|e| e.into_inner());
+            u.dirs.extend(created.iter().filter_map(|d| d.parent().map(Path::to_path_buf)));
+        }
+        let tmp = temp_name(path);
+        if let Err(e) = super::beneath::write_temp(&dir, &tmp, path.file_name(), data, false) {
+            let _ = dir.unlink(&tmp, false);
+            return Err(io_err(&full, e));
+        }
+        // Only the content: the temp's name never has to be durable (the
+        // rename's directory is synced by the barrier after it).
+        self.unsynced.lock().unwrap_or_else(|e| e.into_inner()).files.push(parent.join(&tmp));
+        Ok(path.parent().expect("non-root path has a parent").join(&tmp))
+    }
+
     fn rename_unsynced(&self, from: &VPath, to: &VPath) -> Result<()> {
+        // A staged working-copy file (`write_staged`): renamed within its
+        // directory, beneath the root.
+        #[cfg(unix)]
+        if !Self::own_path(from) && !Self::own_path(to) && !to.is_root() && from.parent() == to.parent() {
+            let full = self.full_path(to);
+            let Some(dir) = self.read_parent(to)? else {
+                return Err(VeilError::NotFound(full.display().to_string()));
+            };
+            dir.rename(from.file_name(), to.file_name()).map_err(|e| io_err(&full, e))?;
+            let parent = full.parent().expect("non-root path has a parent").to_path_buf();
+            self.unsynced.lock().unwrap_or_else(|e| e.into_inner()).dirs.insert(parent);
+            return Ok(());
+        }
         if !Self::own_path(from) || !Self::own_path(to) {
             let data = self.read(from)?;
             self.write_unsynced(to, &data)?;
@@ -883,10 +925,10 @@ impl StorageBackend for DiskBackend {
         self.failures.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Working-copy directories too (checkout's removals): the barrier
+    /// only `fsync`s them, so a directory swapped for a link costs a
+    /// harmless `fsync` of what it points to, never a write through it.
     fn sync_dir_later(&self, dir: &VPath) -> Result<()> {
-        if !Self::own_path(dir) {
-            return Ok(());
-        }
         let full = self.full_path(dir);
         self.unsynced.lock().unwrap_or_else(|e| e.into_inner()).dirs.insert(full);
         Ok(())
