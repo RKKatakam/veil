@@ -123,7 +123,10 @@ impl Person {
     }
 
     pub fn run(&self, dir: &Path, args: &[&str]) -> Output {
-        Command::new(vl_bin())
+        // `timeout` ends a `vl` that never returns: the test then fails.
+        Command::new("timeout")
+            .arg("300")
+            .arg(vl_bin())
             .args(args)
             .current_dir(dir)
             .env("VEIL_HOME", self.home.path().join("veil"))
@@ -218,6 +221,8 @@ impl Api {
         let agent = ureq::Agent::config_builder()
             .tls_config(tls)
             .http_status_as_error(false)
+            // A request that never answers fails the test instead of hanging it.
+            .timeout_global(Some(std::time::Duration::from_secs(120)))
             .build()
             .new_agent();
         Api {

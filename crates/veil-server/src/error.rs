@@ -38,6 +38,14 @@ impl Error {
     pub fn bad_request(m: impl Into<String>) -> Error {
         Error::new(StatusCode::BAD_REQUEST, "bad_request", m)
     }
+    /// A transaction could not finish within its deadline (contention).
+    pub fn busy() -> Error {
+        Error::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            "the database is busy (a transaction kept losing races or waiting); try again",
+        )
+    }
     pub fn conflict(m: impl Into<String>) -> Error {
         Error::new(StatusCode::CONFLICT, "conflict", m)
     }
@@ -48,7 +56,8 @@ impl Error {
         let Error::Db(e) = self else { return false };
         match e.as_database_error() {
             Some(d) => {
-                matches!(d.code().as_deref(), Some("40001" | "40P01"))
+                // Serialisation failure, deadlock, lock or statement timeout.
+                matches!(d.code().as_deref(), Some("40001" | "40P01" | "55P03" | "57014"))
                     || d.message().contains("Restart read required")
                     || d.message().contains("Try again")
             }

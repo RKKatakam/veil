@@ -734,11 +734,13 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
         }
         plans.push((u.branch.clone(), cur, new_real, accept));
     }
-    let new_reals: Vec<String> = completed.iter().map(|c| c.real.hex()).chain(known.values().flatten().map(|r| r.hex())).collect();
+    // Only the snapshots this push made: known ones are recorded already
+    // (rewriting their rows made every racing pusher write the same row).
+    let new_reals: Vec<String> = completed.iter().map(|c| c.real.hex()).collect();
     let origins: Vec<(String, String)> = completed.iter().filter_map(|c| c.origin.map(|o| (c.real.hex(), o.hex()))).collect();
     let pid = project.id;
     let plans2 = plans.clone();
-    let moved = crate::db::serializable(&hub.db, move |c| {
+    let moved = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
         let plans = plans2.clone();
         let new_reals = new_reals.clone();
         let origins = origins.clone();

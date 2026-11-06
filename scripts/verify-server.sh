@@ -55,14 +55,17 @@ PG_URL=postgres://veil:veil@127.0.0.1:$PG_PORT/veil
 YB_URL=postgres://yugabyte@127.0.0.1:$YB_PORT/yugabyte
 
 status=0
+# Every step is bounded: a hang fails the run instead of blocking it.
+STEP_LIMIT=${STEP_LIMIT:-600}
 step() { # name, command...
   local name=$1; shift
-  if "$@" > "$LOGS/$name.log" 2>&1; then echo "   ok    $name"; else echo "   FAIL  $name  ($LOGS/$name.log)"; status=1; fi
+  if timeout --kill-after=30 "$STEP_LIMIT" "$@" > "$LOGS/$name.log" 2>&1; then echo "   ok    $name"
+  else echo "   FAIL  $name (exit $?: 124 is the ${STEP_LIMIT}s limit)  ($LOGS/$name.log)"; status=1; fi
   grep -E '^test result|tests run' "$LOGS/$name.log" | tail -1 | sed 's/^/         /'
 }
 
 echo "== unit tests and lints"
-step unit cargo test -q -p veil-server
+step unit cargo test -p veil-server
 step clippy cargo clippy -q -p veil-server --all-targets --features containers -- -D warnings
 
 echo "== container suite"
@@ -70,18 +73,23 @@ step postgres env VEIL_TEST_DATABASE_URL="$PG_URL" VEIL_TEST_S3_BUCKET=veil-pg "
 step yugabyte env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-yb "$BIN"
 
 echo "== concurrency under load (several copies at once)"
-load() { # url, bucket, copies
+load() { # url, bucket, copies (each copy bounded like a step)
   local pids=() rc=0
   for i in $(seq "$3"); do
-    env VEIL_TEST_DATABASE_URL="$1" VEIL_TEST_S3_BUCKET="$2" "$BIN" concurrency > "$LOGS/load-$2-$i.log" 2>&1 &
+    timeout --kill-after=30 "$STEP_LIMIT" env VEIL_TEST_DATABASE_URL="$1" VEIL_TEST_S3_BUCKET="$2" "$BIN" concurrency > "$LOGS/load-$2-$i.log" 2>&1 &
     pids+=($!)
   done
   for p in "${pids[@]}"; do wait "$p" || rc=1; done
   grep -h 'pushes landed' "$LOGS"/load-"$2"-*.log | head -3
   return $rc
 }
-step load-postgres load "$PG_URL" veil-load-pg 8
-step load-yugabyte load "$YB_URL" veil-load-yb 3
+load_step() { # name, url, bucket, copies: the copies are bounded, not the function
+  local name=$1; shift
+  if load "$@" > "$LOGS/$name.log" 2>&1; then echo "   ok    $name"; else echo "   FAIL  $name  ($LOGS/$name.log)"; status=1; fi
+  cat "$LOGS/$name.log" | sed 's/^/         /'
+}
+load_step load-postgres "$PG_URL" veil-load-pg 8
+load_step load-yugabyte "$YB_URL" veil-load-yb 3
 
 echo "== result"
 if [ $status = 0 ]; then echo "verify-server: all green"; else echo "verify-server: FAILED (logs in $LOGS)"; fi

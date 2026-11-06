@@ -399,18 +399,20 @@ async fn post_ring(
     merge_ring(&hub, &project, ring).await
 }
 
+/// Merge `ring` into the stored ring: read, merge in memory with the
+/// engine's own replay (it verifies every change), then write with a
+/// one-row compare-and-swap on the old body, again if someone else wrote
+/// first. No serialisable transaction: YugabyteDB reports range conflicts
+/// between unrelated projects' rings as deadlocks.
 async fn merge_ring(hub: &HubState, project: &Project, ring: KeyRing) -> Result<Json<serde_json::Value>> {
     let pid = project.id;
-    let hub2: Arc<crate::Hub> = hub.clone();
-    let result = crate::db::serializable(&hub.db, move |c| {
-        let ring = ring.clone();
-        let _ = &hub2;
-        Box::pin(async move {
-            let current: Option<String> = sqlx::query_scalar("SELECT body FROM rings WHERE project_id = $1 AND scope = $2")
-                .bind(pid)
-                .bind(&ring.scope)
-                .fetch_optional(&mut *c)
-                .await?;
+    for _ in 0..50 {
+        let current: Option<String> = sqlx::query_scalar("SELECT body FROM rings WHERE project_id = $1 AND scope = $2")
+            .bind(pid)
+            .bind(&ring.scope)
+            .fetch_optional(&hub.db)
+            .await?;
+        let merged = {
             let mem = Arc::new(MemoryBackend::new());
             let path = VPath::new(&format!(".veil/meta/keyrings/{}.json", ring.scope)).map_err(Error::from)?;
             if let Some(b) = &current {
@@ -420,28 +422,33 @@ async fn merge_ring(hub: &HubState, project: &Project, ring: KeyRing) -> Result<
             keys.set_format(veil_core::repo::REPO_FORMAT);
             match keys.merge_ring(&ring).map_err(Error::from)? {
                 RingMerge::Rejected(why) => return Err(Error::conflict(why)),
-                RingMerge::Unchanged => {}
-                RingMerge::Updated => {
-                    let body = String::from_utf8(mem.read(&path).map_err(Error::from)?).map_err(|e| Error::Other(e.into()))?;
-                    sqlx::query(
-                        "INSERT INTO rings (project_id, scope, body) VALUES ($1, $2, $3) \
-                         ON CONFLICT (project_id, scope) DO UPDATE SET body = EXCLUDED.body",
-                    )
-                    .bind(pid)
-                    .bind(&ring.scope)
-                    .bind(&body)
-                    .execute(&mut *c)
-                    .await?;
-                }
+                RingMerge::Unchanged => None,
+                RingMerge::Updated => Some(String::from_utf8(mem.read(&path).map_err(Error::from)?).map_err(|e| Error::Other(e.into()))?),
             }
-            let body: Option<String> = sqlx::query_scalar("SELECT body FROM rings WHERE project_id = $1 AND scope = $2")
+        };
+        let Some(body) = merged else {
+            return Ok(Json(current.and_then(|b| serde_json::from_str(&b).ok()).unwrap_or(serde_json::Value::Null)));
+        };
+        let rows = match &current {
+            None => sqlx::query("INSERT INTO rings (project_id, scope, body) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
                 .bind(pid)
                 .bind(&ring.scope)
-                .fetch_optional(&mut *c)
-                .await?;
-            Ok(body.and_then(|b| serde_json::from_str(&b).ok()).unwrap_or(serde_json::Value::Null))
-        })
-    })
-    .await?;
-    Ok(Json(result))
+                .bind(&body)
+                .execute(&hub.db)
+                .await?
+                .rows_affected(),
+            Some(old) => sqlx::query("UPDATE rings SET body = $1 WHERE project_id = $2 AND scope = $3 AND body = $4")
+                .bind(&body)
+                .bind(pid)
+                .bind(&ring.scope)
+                .bind(old)
+                .execute(&hub.db)
+                .await?
+                .rows_affected(),
+        };
+        if rows == 1 {
+            return Ok(Json(serde_json::from_str(&body).unwrap_or(serde_json::Value::Null)));
+        }
+    }
+    Err(Error::conflict("the key ring kept changing; try again"))
 }

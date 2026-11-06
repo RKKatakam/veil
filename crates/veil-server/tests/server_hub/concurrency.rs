@@ -57,11 +57,10 @@ fn concurrent_pushers_lose_no_update() {
             let rejected = rejected.clone();
             let project = p.name.clone();
             s.spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
                 for k in 0..PUSHES {
-                    let mut tries = 0;
                     loop {
-                        tries += 1;
-                        assert!(tries < 400, "worker {i} starved");
+                        assert!(std::time::Instant::now() < deadline, "worker {i} made no progress for 4 minutes (push {k})");
                         let mut c = Craft::with(&api, w.token.clone(), w.identity.clone(), &project, "main");
                         c.file(&format!("w/{i}/{k}"), &format!("worker {i} push {k}"));
                         let r = c.push("main", &format!("w{i}-{k}"));
@@ -69,7 +68,8 @@ fn concurrent_pushers_lose_no_update() {
                         if ok {
                             break;
                         }
-                        assert!(r.status == 200 || r.status == 409, "{}: {}", r.status, String::from_utf8_lossy(&r.body));
+                        // 409: the branch moved; 503: the database was busy. Both: again.
+                        assert!(matches!(r.status, 200 | 409 | 503), "{}: {}", r.status, String::from_utf8_lossy(&r.body));
                         rejected.fetch_add(1, Ordering::Relaxed);
                     }
                 }
