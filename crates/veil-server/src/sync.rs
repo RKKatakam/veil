@@ -61,6 +61,17 @@ pub fn root_snapshot_id() -> ObjectId {
     ObjectId::hash(&Object::Snapshot(Snapshot::root(empty)).encode())
 }
 
+/// Every history starts at the universal root and its empty tree, which no
+/// project stores.
+fn builtin(id: &ObjectId) -> Option<Bytes> {
+    let empty = Object::Tree(Tree::default()).encode();
+    if *id == ObjectId::hash(&empty) {
+        return Some(Bytes::from(empty));
+    }
+    let root = Object::Snapshot(Snapshot::root(ObjectId::hash(&empty))).encode();
+    (*id == ObjectId::hash(&root)).then(|| Bytes::from(root))
+}
+
 /// Objects of one project, read synchronously (for the projection code,
 /// which runs on a blocking thread).
 pub struct Source {
@@ -71,14 +82,8 @@ pub struct Source {
 
 impl Source {
     pub fn raw(&self, id: &ObjectId) -> veil_core::Result<Bytes> {
-        // Every history starts at the universal root and its empty tree.
-        let empty = Object::Tree(Tree::default()).encode();
-        if *id == ObjectId::hash(&empty) {
-            return Ok(Bytes::from(empty));
-        }
-        let root = Object::Snapshot(Snapshot::root(ObjectId::hash(&empty))).encode();
-        if *id == ObjectId::hash(&root) {
-            return Ok(Bytes::from(root));
+        if let Some(b) = builtin(id) {
+            return Ok(b);
         }
         self.hub
             .objects
@@ -108,12 +113,23 @@ impl TreeSource for Source {
         match Object::decode(&raw)? {
             Object::Tree(t) => {
                 let t = Arc::new(t);
-                self.hub.trees.insert(ck, (t.clone(), enc), raw.len() * 2);
+                self.hub.trees.insert(ck, (t.clone(), enc), tree_weight(&t));
                 Ok(Node::Tree(t, enc))
             }
             _ => Ok(Node::Leaf),
         }
     }
+}
+
+/// About the memory decoded tree `t` holds in [`Hub::trees`], its slot
+/// included (BUG-860: twice its encoding was well below it).
+fn tree_weight(t: &Tree) -> usize {
+    let heap: usize = t
+        .entries
+        .iter()
+        .map(|e| e.name.capacity() + if e.visibility.is_public() { 0 } else { 64 })
+        .sum();
+    128 + std::mem::size_of::<Tree>() + t.entries.capacity() * std::mem::size_of::<veil_core::TreeEntry>() + heap
 }
 
 /// Run `f` with a [`Source`] on a blocking thread.
@@ -358,10 +374,15 @@ pub async fn history(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &
 }
 
 /// Objects `wants` under snapshot `snapshot`, each checked against what
-/// `viewer` may read at its path, as object frames. Anything not found at
-/// its path in the viewer's projection is refused as not found, without
-/// saying whether it exists.
-pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot: ObjectId, wants: Vec<Want>) -> Result<Vec<u8>> {
+/// `viewer` may read at its path, as a stream of object frames. Anything
+/// not found at its path in the viewer's projection is refused as not
+/// found, without saying whether it exists.
+///
+/// Memory is bounded (BUG-860): every want is checked first, a snapshot at
+/// a time (its projected trees dropped before the next), then the answer
+/// is read and sent a window at a time ([`FETCH_WINDOW`]); a failure while
+/// sending ends the stream with an error, so it is never taken as whole.
+pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot: ObjectId, wants: Vec<Want>) -> Result<FrameStream> {
     // Each want is checked in its own snapshot (revision 1), as the viewer
     // sees it.
     let mut reals: HashMap<ObjectId, ObjectId> = HashMap::new();
@@ -374,9 +395,10 @@ pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot:
         };
         reals.insert(snap, real);
     }
-    hub.objects.prefetch(project.id, wants.iter().map(|w| w.id).collect()).await;
     let (policy_text, bindings, viewer) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone());
-    blocking(hub, project.id, move |src| {
+    let wants = Arc::new(wants);
+    let w2 = wants.clone();
+    let (sizes, created) = blocking(hub, project.id, move |src| {
         let p = Project {
             id: src.project,
             name: String::new(),
@@ -386,29 +408,102 @@ pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot:
             bindings,
         };
         let view = p.view(&viewer);
-        let mut pr = Projector::new(src, &view);
-        // Per snapshot: its projected root, and its projected directory
-        // trees by path, filled as the wants need them.
-        let mut roots: HashMap<ObjectId, (ObjectId, Dirs)> = HashMap::new();
+        check_wants(src, &view, snapshot, &reals, &w2)
+    })
+    .await?;
+    // The answer, a window at a time: read concurrently (a remote store's
+    // latency would otherwise add up one object at a time), framed in
+    // order, sent about a MiB at a time as the caller takes it.
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let (hub, pid) = (hub.clone(), project.id);
+    tokio::spawn(async move {
         let mut out = Vec::new();
-        let gone = || Error::not_found("no such object at that path that you can see");
-        for w in wants {
-            let snap = w.snapshot.unwrap_or(snapshot);
-            let (root, dirs) = match roots.entry(snap) {
-                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    let root = pr.root(src.snapshot(&reals[&snap])?.tree)?;
-                    let mut dirs = HashMap::new();
-                    dirs.insert(String::new(), pr.tree(&root)?);
-                    e.insert((root, dirs))
+        let mut start = 0;
+        while start < wants.len() {
+            let (mut end, mut bytes) = (start, 0u64);
+            while end < wants.len() && end - start < FETCH_WINDOW && (end == start || bytes + sizes[end] <= FETCH_WINDOW_BYTES) {
+                bytes += sizes[end];
+                end += 1;
+            }
+            let window = match read_window(&hub, pid, &wants[start..end], &created).await {
+                Ok(w) => w,
+                Err(e) => {
+                    // Details go to the server's log; the caller's answer
+                    // ends in an error, never taken as whole.
+                    eprintln!("veil-server: a fetch answer stopped: {e:?}");
+                    let _ = tx.send(Err(std::io::Error::other("the answer stopped"))).await;
+                    return;
                 }
             };
+            for (w, raw) in wants[start..end].iter().zip(window) {
+                put_frame(&mut out, &w.id, &raw);
+                if out.len() >= 1 << 20 && tx.send(Ok(Bytes::from(std::mem::take(&mut out)))).await.is_err() {
+                    return;
+                }
+            }
+            start = end;
+        }
+        if !out.is_empty() {
+            let _ = tx.send(Ok(Bytes::from(out))).await;
+        }
+    });
+    Ok(FrameStream(rx))
+}
+
+/// Most objects, and about the most bytes (by the sizes tree entries
+/// carry), [`fetch`] reads at once.
+const FETCH_WINDOW: usize = 64;
+const FETCH_WINDOW_BYTES: u64 = 8 << 20;
+
+/// An answer of object frames, sent as [`fetch`] reads them.
+pub struct FrameStream(tokio::sync::mpsc::Receiver<std::result::Result<Bytes, std::io::Error>>);
+
+impl hyper::body::Body for FrameStream {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<std::result::Result<hyper::body::Frame<Bytes>, std::io::Error>>> {
+        self.0.poll_recv(cx).map(|o| o.map(|r| r.map(hyper::body::Frame::data)))
+    }
+}
+
+/// Check every want of a fetch (see [`fetch`]), a snapshot at a time.
+/// Returns each want's size where its tree entry says (0 otherwise), and
+/// the projected trees the server made that the wants name.
+fn check_wants(
+    src: &Source,
+    view: &View,
+    snapshot: ObjectId,
+    reals: &HashMap<ObjectId, ObjectId>,
+    wants: &[Want],
+) -> Result<(Vec<u64>, HashMap<ObjectId, Bytes>)> {
+    let gone = || Error::not_found("no such object at that path that you can see");
+    let mut sizes = vec![0u64; wants.len()];
+    let mut created = HashMap::new();
+    let mut order: Vec<usize> = (0..wants.len()).collect();
+    order.sort_by_key(|&i| wants[i].snapshot.unwrap_or(snapshot));
+    for group in order.chunk_by(|&a, &b| wants[a].snapshot.unwrap_or(snapshot) == wants[b].snapshot.unwrap_or(snapshot)) {
+        let snap = wants[group[0]].snapshot.unwrap_or(snapshot);
+        // This snapshot's projected root and directory trees by path,
+        // filled as its wants need them, and dropped after them.
+        let mut pr = Projector::new(src, view);
+        let root = pr.root(src.snapshot(&reals[&snap])?.tree)?;
+        let mut dirs: Dirs = HashMap::new();
+        dirs.insert(String::new(), pr.tree(&root)?);
+        for &i in group {
+            let w = &wants[i];
             let ok = if w.path.is_empty() {
-                w.id == *root
+                w.id == root
             } else {
                 let (dir, name) = w.path.rsplit_once('/').unwrap_or(("", w.path.as_str()));
-                let tree = dir_tree(&mut pr, dirs, dir)?.ok_or_else(gone)?;
+                let tree = dir_tree(&mut pr, &mut dirs, dir)?.ok_or_else(gone)?;
                 let e = tree.get(name).ok_or_else(gone)?;
+                if e.id == w.id && e.kind != EntryKind::Dir {
+                    sizes[i] = e.size;
+                }
                 e.id == w.id
                     || e.fallback == Some(w.id)
                     || (e.kind == EntryKind::Conflict
@@ -417,14 +512,32 @@ pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot:
             if !ok {
                 return Err(gone());
             }
-            match pr.created_raw(&w.id) {
-                Some(raw) => put_frame(&mut out, &w.id, raw),
-                None => put_frame(&mut out, &w.id, &src.raw(&w.id)?),
+            if let Some(raw) = pr.created_raw(&w.id) {
+                created.insert(w.id, Bytes::copy_from_slice(raw));
             }
         }
-        Ok(out)
-    })
-    .await
+    }
+    Ok((sizes, created))
+}
+
+/// The objects of `wants`, in order, read concurrently.
+async fn read_window(hub: &Arc<Hub>, project: i64, wants: &[Want], created: &HashMap<ObjectId, Bytes>) -> Result<Vec<Bytes>> {
+    let mut out: Vec<Option<Bytes>> = vec![None; wants.len()];
+    let mut set = tokio::task::JoinSet::new();
+    for (i, w) in wants.iter().enumerate() {
+        match created.get(&w.id).cloned().or_else(|| builtin(&w.id)) {
+            Some(raw) => out[i] = Some(raw),
+            None => {
+                let (hub, id) = (hub.clone(), w.id);
+                set.spawn(async move { (i, hub.objects.get(project, &id).await) });
+            }
+        }
+    }
+    while let Some(r) = set.join_next().await {
+        let (i, r) = r.map_err(|e| Error::Other(e.into()))?;
+        out[i] = Some(r?.ok_or_else(|| Error::Other(anyhow::anyhow!("object {} is not stored", wants[i].id.short())))?);
+    }
+    Ok(out.into_iter().map(|o| o.expect("every want read")).collect())
 }
 
 /// Projected directory trees of one snapshot, by path.

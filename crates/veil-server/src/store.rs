@@ -105,6 +105,41 @@ pub struct S3Store {
 
 /// How long a signed request stays valid.
 const S3_SIGN_FOR: Duration = Duration::from_secs(300);
+/// How often an S3 request is tried, and the wait before the second try
+/// (doubling, jittered): about 1.5 s in all, well inside a request's
+/// deadline (`db::TRANSACTION_DEADLINE`).
+const S3_TRIES: u32 = 6;
+const S3_FIRST_WAIT: Duration = Duration::from_millis(25);
+
+/// Send an S3 request (`make` builds it afresh for each try) and read its
+/// answer, until the answer is not a server error (5xx), at most
+/// [`S3_TRIES`] times (BUG-861). A connection the store closed, reset or
+/// timed out, before or during the answer, and the store's own transient
+/// errors (500, 503 "slow down"), are tried again: every request the store
+/// sends is idempotent (GET, HEAD, and PUT of a key that names its
+/// content).
+async fn s3_send(make: impl Fn() -> reqwest::RequestBuilder) -> Result<(u16, Bytes)> {
+    let mut wait = S3_FIRST_WAIT;
+    for attempt in 1.. {
+        let last = attempt == S3_TRIES;
+        let answer = match make().send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                resp.bytes().await.map(|body| (status, body))
+            }
+            Err(e) => Err(e),
+        };
+        match answer {
+            Ok((status, body)) if !status.is_server_error() || last => return Ok((status.as_u16(), body)),
+            Err(e) if last || e.is_builder() => return Err(e.into()),
+            _ => {}
+        }
+        let jitter = u64::from(u16::from_le_bytes(veil_core::crypto::random_bytes::<2>())) % (wait.as_millis() as u64 + 1);
+        tokio::time::sleep(wait + Duration::from_millis(jitter)).await;
+        wait *= 2;
+    }
+    unreachable!()
+}
 
 impl S3Store {
     /// `endpoint` e.g. `http://127.0.0.1:9000`.
@@ -115,7 +150,9 @@ impl S3Store {
         Ok(S3Store {
             bucket,
             credentials: rusty_s3::Credentials::new(key, secret),
-            http: reqwest::Client::builder().pool_max_idle_per_host(64).build()?,
+            // Idle connections are dropped before the store drops them (AWS
+            // after about 20 s), so few requests meet a closed one.
+            http: reqwest::Client::builder().pool_max_idle_per_host(64).pool_idle_timeout(Duration::from_secs(15)).build()?,
         })
     }
 
@@ -123,9 +160,8 @@ impl S3Store {
     pub async fn ensure_bucket(&self) -> Result<()> {
         use rusty_s3::S3Action;
         let url = self.bucket.create_bucket(&self.credentials).sign(S3_SIGN_FOR);
-        let resp = self.http.put(url).send().await?;
-        let status = resp.status();
-        if status.is_success() || status.as_u16() == 409 {
+        let (status, _) = s3_send(|| self.http.put(url.clone())).await?;
+        if (200..300).contains(&status) || status == 409 {
             return Ok(());
         }
         bail!("creating the S3 bucket: HTTP {status}")
@@ -137,20 +173,19 @@ impl BlobStore for S3Store {
     async fn get(&self, key: &str) -> Result<Option<Bytes>> {
         use rusty_s3::S3Action;
         let url = self.bucket.get_object(Some(&self.credentials), key).sign(S3_SIGN_FOR);
-        let resp = self.http.get(url).send().await?;
-        match resp.status().as_u16() {
-            200 => Ok(Some(resp.bytes().await?)),
-            404 => Ok(None),
-            s => bail!("S3 GET: HTTP {s}"),
+        match s3_send(|| self.http.get(url.clone())).await? {
+            (200, body) => Ok(Some(body)),
+            (404, _) => Ok(None),
+            (s, _) => bail!("S3 GET: HTTP {s}"),
         }
     }
 
     async fn put(&self, key: &str, data: Bytes) -> Result<()> {
         use rusty_s3::S3Action;
         let url = self.bucket.put_object(Some(&self.credentials), key).sign(S3_SIGN_FOR);
-        let resp = self.http.put(url).body(data).send().await?;
-        if !resp.status().is_success() {
-            bail!("S3 PUT: HTTP {}", resp.status());
+        let (status, _) = s3_send(|| self.http.put(url.clone()).body(data.clone())).await?;
+        if !(200..300).contains(&status) {
+            bail!("S3 PUT: HTTP {status}");
         }
         Ok(())
     }
@@ -158,8 +193,7 @@ impl BlobStore for S3Store {
     async fn exists(&self, key: &str) -> Result<bool> {
         use rusty_s3::S3Action;
         let url = self.bucket.head_object(Some(&self.credentials), key).sign(S3_SIGN_FOR);
-        let resp = self.http.head(url).send().await?;
-        match resp.status().as_u16() {
+        match s3_send(|| self.http.head(url.clone())).await?.0 {
             200 => Ok(true),
             404 => Ok(false),
             s => bail!("S3 HEAD: HTTP {s}"),
