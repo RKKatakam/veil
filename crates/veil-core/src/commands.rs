@@ -93,6 +93,47 @@ pub struct MergeResult {
     pub renames: Vec<crate::merge::FollowedRename>,
 }
 
+/// [`Repo::commit`] inside transaction `tx`. With `recorded`, the working
+/// copy's content is that (the automatic snapshot of `vl commit`, recorded
+/// in the same transaction as the commit: one operation, so `vl undo`
+/// takes back both); without, the working copy as it is.
+pub(crate) fn commit_in(tx: &mut Transaction, ws: &str, message: &str, advance: bool, recorded: Option<Snapshot>) -> Result<CommitResult> {
+    let wc_id = tx.view.workspace(ws)?.wc;
+    let cloak = tx.view.workspace(ws)?.cloak.clone();
+    let s = tx.repo().snapshot(&wc_id)?;
+    let mut ns = recorded.unwrap_or_else(|| (*s).clone());
+    // On a line under an unreleased embargo a key holder's message
+    // describes the hidden fix: it is sealed under the embargo key.
+    let store = &tx.repo().store;
+    ns.description = store.make_text(message, description_scope(store, &ns.tree, ns.cloak.as_deref())?.as_deref())?;
+    ns.predecessors = vec![wc_id];
+    ns.timestamp = now_millis();
+    let committed = tx.rewrite(wc_id, ns)?;
+    let line_cloak = cloak.clone().or_else(|| s.cloak.clone());
+    let (mut advanced, mut kept) = (Vec::new(), Vec::new());
+    for (name, tag) in tx.view.tags.iter_mut() {
+        if s.parents.first() != Some(&tag.target) {
+            continue;
+        }
+        match tag_kept(tag, line_cloak.as_deref(), advance) {
+            None => {
+                tag.target = committed;
+                advanced.push(name.clone());
+            }
+            Some(why) => kept.push((name.clone(), why)),
+        }
+    }
+    let wc = tx.new_change(vec![committed], "", cloak)?;
+    tx.set_workspace_wc(ws, wc)?;
+    tx.set_description(format!("commit change {}", s.change_id.short()));
+    Ok(CommitResult {
+        committed,
+        wc,
+        advanced,
+        kept,
+    })
+}
+
 /// What [`Repo::commit`] did.
 #[derive(Debug, Clone)]
 pub struct CommitResult {
@@ -340,41 +381,9 @@ impl Repo {
     /// Tags that stayed are reported in [`CommitResult::kept`].
     pub fn commit(&mut self, ws: &str, message: &str, advance: bool) -> Result<CommitResult> {
         let mut tx = self.transaction("commit")?;
-        let wc_id = tx.view.workspace(ws)?.wc;
-        let cloak = tx.view.workspace(ws)?.cloak.clone();
-        let s = tx.repo().snapshot(&wc_id)?;
-        let mut ns = (*s).clone();
-        // On a line under an unreleased embargo a key holder's message
-        // describes the hidden fix: it is sealed under the embargo key.
-        let store = &tx.repo().store;
-        ns.description = store.make_text(message, description_scope(store, &s.tree, s.cloak.as_deref())?.as_deref())?;
-        ns.predecessors = vec![wc_id];
-        ns.timestamp = now_millis();
-        let committed = tx.rewrite(wc_id, ns)?;
-        let line_cloak = cloak.clone().or_else(|| s.cloak.clone());
-        let (mut advanced, mut kept) = (Vec::new(), Vec::new());
-        for (name, tag) in tx.view.tags.iter_mut() {
-            if s.parents.first() != Some(&tag.target) {
-                continue;
-            }
-            match tag_kept(tag, line_cloak.as_deref(), advance) {
-                None => {
-                    tag.target = committed;
-                    advanced.push(name.clone());
-                }
-                Some(why) => kept.push((name.clone(), why)),
-            }
-        }
-        let wc = tx.new_change(vec![committed], "", cloak)?;
-        tx.set_workspace_wc(ws, wc)?;
-        tx.set_description(format!("commit change {}", s.change_id.short()));
+        let r = commit_in(&mut tx, ws, message, advance, None)?;
         tx.commit()?;
-        Ok(CommitResult {
-            committed,
-            wc,
-            advanced,
-            kept,
-        })
+        Ok(r)
     }
 
     pub fn edit(&mut self, ws: &str, id: ObjectId) -> Result<()> {

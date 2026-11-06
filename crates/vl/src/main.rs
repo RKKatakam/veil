@@ -138,7 +138,9 @@ fn error_hint(e: &anyhow::Error) -> Option<&'static str> {
 }
 
 fn open(cli: &Cli) -> Result<Ctx> {
-    Ctx::open(cli.repository.as_deref(), !cli.no_snapshot)
+    // `vl commit` records the directory in its own transaction (one
+    // operation with the commit, `Ctx::commit`).
+    Ctx::open(cli.repository.as_deref(), !cli.no_snapshot && !matches!(cli.cmd, Cmd::Commit { .. }))
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
@@ -306,7 +308,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         }
         Cmd::Commit { message, no_advance, hooks } => {
             let message = hooks::before_commit(ctx, hooks, message, !cli.no_snapshot, "commit")?;
-            let c = api::commit(ctx, &message, !*no_advance)?;
+            let c = api::commit(ctx, &message, !*no_advance, !cli.no_snapshot)?;
             println!("Committed {}", one_line(&ctx.repo, &c.result.committed));
             print_tags_kept(&ctx.repo, &c.result);
         }

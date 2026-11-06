@@ -15,17 +15,25 @@ fn two_commits(env: &Env) -> (R<'_>, String, String) {
     (r, one, two)
 }
 
-// Scenario from jj test_undo_redo_commands.rs "undo a commit".
+// Scenario from jj test_undo_redo_commands.rs "undo a commit". `vl
+// commit` records the directory and commits in one operation (owner,
+// 2026-11-06): undo takes back both, so the edits the commit recorded leave
+// the working copy too, and `vl redo` brings them back.
 #[test]
 fn undo_of_a_commit_reopens_the_change() {
     let env = Env::new();
     let (r, one, two) = two_commits(&env);
+    let ops = r.out(&["op", "log", "-n", "2"]);
+    assert!(ops.contains("commit change") && !ops.contains("snapshot working copy"), "one operation per commit:\n{ops}");
     let out = r.ok(&["undo"]);
     assert!(out.contains(&format!("Undid: commit change {}", &two[..8])), "{out}");
     assert_eq!(r.change("@"), two);
     assert_eq!(r.change("@-"), one);
-    assert_eq!(r.read("a.txt"), "2\n");
+    assert_eq!(r.read("a.txt"), "1\n");
     assert_eq!(r.description("@"), "(no description set)");
+    r.ok(&["redo"]);
+    assert_eq!(r.read("a.txt"), "2\n");
+    assert_eq!(r.description("@-"), "two");
 }
 
 // Scenario from the guide ("Both keep the files on disk that you had not
@@ -35,10 +43,10 @@ fn undo_keeps_unrecorded_edits() {
     let env = Env::new();
     let (r, _, _) = two_commits(&env);
     r.write("new-work.txt", "do not lose me\n");
-    r.write("a.txt", "3\n");
+    r.write("b.txt", "3\n");
     r.ok(&["undo"]);
     assert_eq!(r.read("new-work.txt"), "do not lose me\n");
-    assert_eq!(r.read("a.txt"), "3\n");
+    assert_eq!(r.read("b.txt"), "3\n");
 }
 
 // Scenario from jj test_undo_redo_commands.rs "undo twice": the guide

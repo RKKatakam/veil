@@ -4,16 +4,19 @@
 //! veil-server --database-url postgres://… --data ./hub [--listen 127.0.0.1:8443]
 //!             [--storage DIR | --s3-endpoint URL --s3-bucket B]
 //!             [--tls-cert cert.pem --tls-key key.pem]   (default: self-signed)
+//! veil-server migrate --database-url postgres://…   (apply migrations, then exit)
 //! ```
 
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use veil_server::{tls::TlsSource, Config, Storage};
 
 #[derive(Parser)]
-#[command(name = "veil-server", about = "The Veil server (the Hub)")]
+#[command(name = "veil-server", about = "The Veil server (the Hub)", args_conflicts_with_subcommands = true)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
     /// Address to listen on (HTTPS).
     #[arg(long, default_value = "127.0.0.1:8443")]
     listen: SocketAddr,
@@ -21,8 +24,8 @@ struct Args {
     #[arg(long)]
     database_url: Option<String>,
     /// Directory for the server's identity and its self-signed certificate.
-    #[arg(long)]
-    data: PathBuf,
+    #[arg(long, required = true)]
+    data: Option<PathBuf>,
     /// Keep objects in this directory (default: DATA/objects).
     #[arg(long, conflicts_with = "s3_endpoint")]
     storage: Option<PathBuf>,
@@ -47,9 +50,35 @@ struct Args {
     db_connections: u32,
 }
 
+#[derive(Subcommand)]
+enum Command {
+    /// Apply the database migrations once, then exit: run it before
+    /// starting (or restarting) servers. A server that finds the schema
+    /// current changes nothing in it.
+    Migrate {
+        /// PostgreSQL or YugabyteDB connection URL (default: VEIL_DATABASE_URL).
+        #[arg(long)]
+        database_url: Option<String>,
+    },
+}
+
+fn database_url(given: Option<String>) -> anyhow::Result<String> {
+    match given {
+        Some(u) => Ok(u),
+        None => std::env::var("VEIL_DATABASE_URL").map_err(|_| anyhow::anyhow!("give --database-url or VEIL_DATABASE_URL")),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let a = Args::parse();
+    if let Some(Command::Migrate { database_url: url }) = a.command {
+        let db = veil_server::db::connect(&database_url(url)?, 2).await?;
+        veil_server::db::migrate(&db).await?;
+        println!("veil-server: the database schema is current");
+        return Ok(());
+    }
+    let data = a.data.expect("clap requires --data");
     let storage = match a.s3_endpoint {
         Some(endpoint) => Storage::S3 {
             endpoint,
@@ -58,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
             key: std::env::var("VEIL_S3_ACCESS_KEY").unwrap_or_default(),
             secret: std::env::var("VEIL_S3_SECRET_KEY").unwrap_or_default(),
         },
-        None => Storage::Dir(a.storage.unwrap_or_else(|| a.data.join("objects"))),
+        None => Storage::Dir(a.storage.unwrap_or_else(|| data.join("objects"))),
     };
     let tls = match (a.tls_cert, a.tls_key) {
         (Some(cert), Some(key)) => TlsSource::Files { cert, key },
@@ -66,20 +95,17 @@ async fn main() -> anyhow::Result<()> {
     };
     let running = veil_server::start(Config {
         listen: a.listen,
-        database_url: match a.database_url {
-            Some(u) => u,
-            None => std::env::var("VEIL_DATABASE_URL").map_err(|_| anyhow::anyhow!("give --database-url or VEIL_DATABASE_URL"))?,
-        },
+        database_url: database_url(a.database_url)?,
         storage,
         tls,
-        data_dir: a.data.clone(),
+        data_dir: data.clone(),
         session_ttl: Duration::from_secs(a.session_seconds),
         db_connections: a.db_connections,
     })
     .await?;
     println!("veil-server listening on https://{}", running.addr);
     if matches!(running.cert_pem.as_str(), s if !s.is_empty()) {
-        println!("certificate: {}", a.data.join("self-signed-cert.pem").display());
+        println!("certificate: {}", data.join("self-signed-cert.pem").display());
     }
     tokio::signal::ctrl_c().await?;
     running.stop().await;

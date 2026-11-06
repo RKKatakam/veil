@@ -56,10 +56,16 @@ impl Error {
         let Error::Db(e) = self else { return false };
         match e.as_database_error() {
             Some(d) => {
-                // Serialisation failure, deadlock, lock or statement timeout.
+                // Serialisation failure, deadlock, lock or statement
+                // timeout; on YugabyteDB, a read to restart or a catalog
+                // changed by DDL (BUG-838).
+                let m = d.message();
                 matches!(d.code().as_deref(), Some("40001" | "40P01" | "55P03" | "57014"))
-                    || d.message().contains("Restart read required")
-                    || d.message().contains("Try again")
+                    || m.contains("Restart read required")
+                    || m.contains("Try again")
+                    || m.contains("catalog snapshot")
+                    || m.contains("catalog version")
+                    || m.contains("schema version mismatch")
             }
             None => false,
         }
@@ -97,6 +103,13 @@ impl IntoResponse for Error {
             Error::Db(sqlx::Error::PoolTimedOut) => {
                 eprintln!("veil-server: no database connection free");
                 return Error::busy().into_response();
+            }
+            // Lost a race, outside a transaction: `db::retry_requests` runs
+            // the request again, or answers "busy" at its deadline.
+            e @ Error::Db(_) if e.is_retryable() => {
+                let mut r = Error::busy().into_response();
+                r.extensions_mut().insert(crate::db::Retryable);
+                return r;
             }
             // Internal details go to the server's log, not to the caller.
             Error::Db(e) => {

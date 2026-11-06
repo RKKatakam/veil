@@ -973,7 +973,7 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
 |---|---|
 | `GET /v1/projects/{p}/tips` | branches → tips as the caller sees them (projections) |
 | `POST …/history {tips, stop}` | the caller's projected snapshots from `tips` down to `stop`, as object frames (`id ‖ len u32be ‖ object`) |
-| `POST …/fetch {snapshot, objects: [{path, id}]}` | objects by id, each with the path where the client met it under that snapshot; the server walks the viewer's projection to that path and serves the object only if it is there. No list of what the client has; each request names an immutable object, so a per-viewer cache can serve it |
+| `POST …/fetch {snapshot, objects: [{path, id, snapshot?}]}` | objects by id, each with the path where the client met it under that snapshot (its own `snapshot`, or the request's); the server walks the viewer's projection of that snapshot to that path and serves the object only if it is there. No list of what the client has; each request names an immutable object, so a per-viewer cache can serve it |
 | `POST …/objects` | upload object frames: re-hashed, canonically decoded, format-checked, stored; invisible until a push reaches them. Answers a **receipt** per object (a server MAC over project ‖ person ‖ id) |
 | `POST …/push {updates: [{branch, expected, new}], force, receipts}` | complete and check every new snapshot, then move the branches in **one serialisable transaction of compare-and-swaps** (`UPDATE branches SET target = new WHERE … AND target = expected`); one lost race rejects the whole push with 409 and `vl` retries |
 | `GET …/access?path=` | the deciding line and who it names; only for a path the caller may read |
@@ -982,7 +982,14 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
 
 * **Fetch on demand (Scion):** `vl` asks for the tips, the snapshots it
   lacks, then trees from the root down and the files it needs, one request
-  per tree level, skipping what it already has. `vl clone URL --only DIR`
+  per tree level for every new snapshot at once, skipping what it already
+  has. **Revision 1** (`Tips::revision`, performance round 2): a want may
+  name its own snapshot, so a pull behind by many landings asks once per
+  level instead of once per snapshot and level; `vl` asks a server of
+  revision 0 the old way. A level of more than 2,000 objects is fetched as
+  up to 8 requests at once (`Client::fetch_all`). From 16 objects a pull
+  stores what it received as one pack, compressed on several threads (one
+  fsync instead of one, a rename and a directory sync per object). `vl clone URL --only DIR`
   fetches the root, the trees on the way to `DIR`, and `DIR`'s subtree
   only; it checks out `DIR` and records the rest as never materialised, so
   every snapshot keeps it unchanged. **S1 limit:** moving such a clone to
@@ -1086,6 +1093,16 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
   (`scripts/verify-server.sh` runs 8 copies at once on PostgreSQL, 3 on
   YugabyteDB).
 
+* **Migrations and retries** (BUG-838): `veil-server migrate` applies
+  the schema migrations once; a server starting on a schema that is not
+  current applies them itself while holding a database advisory lock,
+  other servers waiting for it, and a server that finds the schema current
+  runs no DDL at all (it can run as a role without DDL rights). Every
+  request that fails on a retryable database error (`40001`, a restarted
+  read, a catalog changed by DDL on YugabyteDB) before anything it did was
+  committed runs again, with capped and jittered backoff, until a 45 s
+  deadline, then answers `busy` (`db::retry_requests`).
+
 ### 13.8 Known limits of S1 (deliberate)
 
 * **Branch names** are visible to everyone who may read anything in the
@@ -1152,7 +1169,10 @@ through the server takes what cloning from a path remote takes on the same
 machine (the server adds nothing measurable). Both were dominated by the
 checkout's per-file `fsync` (BUG-818, pre-existing); with one barrier per
 checkout the 10k clone takes 1,014 ms instead of 10,044 ms. Clone one
-directory stays flat from 1k to 10k files (62 and 74 ms).
+directory stays flat from 1k to 10k files (62 and 74 ms). Performance
+round 2 (parallel staging and barriers, packed and parallel fetches):
+437–449 ms at 10k, faster than Git. The server under load:
+`docs/design/scale/LOAD.md` (`veil-bench load`).
 
 ### 13.11 Confirmed devices: who a secret key is wrapped for (BUG-827)
 

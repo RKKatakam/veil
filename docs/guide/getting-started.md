@@ -263,13 +263,16 @@ vl new main
 ## Undo anything
 
 Every command that changes the repository is an **operation** in the
-operation log. That includes the automatic snapshots.
+operation log. That includes the automatic snapshots. `vl commit` records
+your edits and commits them as **one** operation, so `vl undo` takes back
+both: the change is open again, without the edits the commit recorded
+(`vl redo` brings them back).
 
 ```text
 $ vl op log -n 3
 c924f35b 2026-11-04 04:07:59 alice commit change yyntkszx
-a39343fc 2026-11-04 04:07:59 alice snapshot working copy of 'default'
-f1df66f3 2026-11-04 04:07:59 alice set tag main
+a39343fc 2026-11-04 04:07:58 alice snapshot working copy of 'default'
+f1df66f3 2026-11-04 04:07:58 alice set tag main
 
 $ vl undo
 Undid: commit change yyntkszx
@@ -296,7 +299,10 @@ Redid: set tag main
 * `vl op restore <id>` returns the whole repository (changes, tags,
   workspaces) to the state after operation `<id>`.
 * Both **keep the files on disk that you had not recorded yet**: the
-  automatic snapshot taken before `undo` is not what gets undone. After
+  automatic snapshot taken before `undo` is not what gets undone. What a
+  command recorded as part of itself goes back with it: `vl commit`'s
+  edits (with pre-commit or commit-msg hooks, which read the recorded
+  snapshot, the edits are recorded first, as their own operation, and stay). After
   `vl ws switch`, `vl undo` switches back (and `vl redo` switches again);
   the edits of each workspace stay in that workspace. An undo that would
   delete a workspace holding recorded edits (undoing its `vl ws new`) is

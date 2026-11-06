@@ -76,6 +76,11 @@ pub struct SnapshotOptions<'a> {
     /// How `.veilattributes` line endings apply (`vl renormalize` sets
     /// [`LineEndings::Renormalize`]).
     pub line_endings: LineEndings<'a>,
+    /// Commit what is recorded, in the same transaction (`vl commit`: the
+    /// automatic snapshot and the commit are one operation, which `vl undo`
+    /// takes back as one): `(message, advance)` as [`Repo::commit`] takes
+    /// them. The result is [`WcSnapshot::committed`].
+    pub commit: Option<(&'a str, bool)>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +91,9 @@ pub struct WcSnapshot {
     /// Nothing was recorded: the workspace no longer points at
     /// [`SnapshotOptions::expected_wc`] (`snapshot` is where it points now).
     pub superseded: bool,
+    /// What [`SnapshotOptions::commit`] committed (`snapshot` is then the
+    /// new working copy on top of it).
+    pub committed: Option<crate::commands::CommitResult>,
 }
 
 /// An in-memory copy-on-write workspace over a base snapshot. Creating one is
@@ -373,6 +381,7 @@ impl Repo {
                     expected_wc: None,
                     carried: opts.carried,
                     line_endings: opts.line_endings,
+                    commit: opts.commit,
                 };
                 let out = self.snapshot_once(ws, fs, again)?;
                 if !out.superseded {
@@ -397,6 +406,7 @@ impl Repo {
             expected_wc,
             carried,
             line_endings,
+            commit,
         } = opts;
         let mut cache = cache;
         let params = BuildParams {
@@ -410,7 +420,8 @@ impl Repo {
         // 1. Scan without the lock. Lock-free repositories (format 6) take
         // no lock: they build inside the transaction, with the objects
         // staged on disk, and compare-and-swap at commit.
-        let probe = match self.backend.is_network() || self.lock_free() {
+        // A commit records under the lock in any case.
+        let probe = match self.backend.is_network() || self.lock_free() || commit.is_some() {
             true => None,
             false => self.probe_snapshot(ws, fs, &params, expected_wc, cache.as_deref())?,
         };
@@ -424,6 +435,7 @@ impl Repo {
                     changed: false,
                     report,
                     superseded: false,
+                    committed: None,
                 });
             }
             Some(Probe::Changed(p)) => Some(p),
@@ -441,6 +453,7 @@ impl Repo {
                 changed: false,
                 report: BuildReport::default(),
                 superseded: true,
+                committed: None,
             });
         }
         tx.expect_wc(ws, wc_id);
@@ -461,7 +474,7 @@ impl Repo {
         };
         let Built { tree, report, wp } = built;
         tx.repo().record_accepted(&wp)?;
-        if tree == wc.tree {
+        if tree == wc.tree && commit.is_none() {
             // Nothing to record; the re-scan (if any) found nothing new.
             if rescan {
                 mark_scanned(&*tx.repo().backend, ws)?;
@@ -471,8 +484,10 @@ impl Repo {
                 changed: false,
                 report,
                 superseded: false,
+                committed: None,
             });
         }
+        let changed = tree != wc.tree;
         let mut new = (*wc).clone();
         new.tree = tree;
         new.predecessors = vec![wc_id];
@@ -493,7 +508,13 @@ impl Repo {
                 new.conflicts.push(p.to_string());
             }
         }
-        let id = tx.rewrite(wc_id, new)?;
+        let (id, committed) = match commit {
+            None => (tx.rewrite(wc_id, new)?, None),
+            Some((message, advance)) => {
+                let r = crate::commands::commit_in(&mut tx, ws, message, advance, Some(new))?;
+                (r.wc, Some(r))
+            }
+        };
         let backend = tx.repo().backend.clone();
         match tx.commit() {
             Err(e) if crate::transaction::Transaction::is_superseded(&e) => {
@@ -503,6 +524,7 @@ impl Repo {
                     changed: false,
                     report,
                     superseded: true,
+                    committed: None,
                 });
             }
             r => r?,
@@ -514,9 +536,10 @@ impl Repo {
         }
         Ok(WcSnapshot {
             snapshot: id,
-            changed: true,
+            changed,
             report,
             superseded: false,
+            committed,
         })
     }
 

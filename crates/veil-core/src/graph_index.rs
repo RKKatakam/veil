@@ -45,8 +45,9 @@
 //! E-<epoch>                 an empty marker: layers of older epochs are void
 //! ```
 //!
-//! A layer is created with `create_new`, so appenders never overwrite one
-//! another: an appender that loses a slot reads the winner's layer and
+//! A layer is created with `create_new_unsynced` (exclusive, never
+//! synced: a power loss can leave it missing, empty or torn, which its
+//! checksum catches), so appenders never overwrite one another: an appender that loses a slot reads the winner's layer and
 //! tries the next slot. Readers use the newest epoch, and take its longest
 //! layer starting at slot 0, then the longest starting right after it, and
 //! so on. Small layers are merged geometrically into larger ones, which are
@@ -470,7 +471,7 @@ impl GraphIndex {
             let (lo, hi) = (st.end, st.end);
             let name = layer_name(st.epoch, lo, hi);
             let path = dir().join(&name);
-            match self.backend.create_new(&path, &data) {
+            match self.backend.create_new_unsynced(&path, &data) {
                 Ok(true) => {
                     let Some(layer) = Layer::parse(name, lo, hi, data) else { return };
                     st.layers.push(layer);
@@ -536,7 +537,7 @@ impl GraphIndex {
             missing.dedup();
             let data = Layer::encode(&mut entries, &missing);
             let name = layer_name(st.epoch, lo, hi);
-            if self.backend.create_new(&dir().join(&name), &data).is_err() {
+            if self.backend.create_new_unsynced(&dir().join(&name), &data).is_err() {
                 return;
             }
             let Some(merged) = Layer::parse(name.clone(), lo, hi, data) else { return };

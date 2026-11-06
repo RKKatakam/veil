@@ -261,6 +261,9 @@ impl Repo {
         if is_repo(&*backend) {
             return Err(VeilError::AlreadyExists("a Veil repository".into()));
         }
+        // An `init` that never wrote `repo.json` wrote its objects
+        // unsynced ([`InitWrites`]): a power loss may have torn them.
+        crate::fsck::recover_interrupted_writes(&*backend, crate::fsck::RecoveryWindow::All)?;
         let config = RepoConfig {
             format,
             repo_id: hex::encode(random_bytes::<16>()),
@@ -269,10 +272,13 @@ impl Repo {
         };
         let has_identity = identity.is_some();
         let keys = Arc::new(Keychain::new(backend.clone(), identity, config.repo_id.clone()));
-        let store = Arc::new(ObjectStore::new(backend.clone(), VPath::new(".veil/objects")?, keys.clone()));
-        store.set_format(format);
-        let empty = store.empty_tree()?;
-        let root_id = store.put_snapshot(&Snapshot::root(empty))?;
+        // The first objects are written unsynced and made durable by one
+        // barrier ([`InitWrites`]).
+        let deferred: Arc<dyn StorageBackend> = Arc::new(InitWrites(backend.clone()));
+        let init_store = ObjectStore::new(deferred.clone(), VPath::new(".veil/objects")?, keys.clone());
+        init_store.set_format(format);
+        let empty = init_store.empty_tree()?;
+        let root_id = init_store.put_snapshot(&Snapshot::root(empty))?;
         // A crashed earlier `init` may have left the ring behind.
         if has_identity && default_scope && keys.load_ring(DEFAULT_SCOPE)?.is_none() {
             keys.create_scope(DEFAULT_SCOPE)?;
@@ -290,13 +296,17 @@ impl Repo {
                 timestamp: now_millis(),
                 ..Snapshot::root(empty)
             };
-            let wc_id = store.put_snapshot(&wc)?;
+            let wc_id = init_store.put_snapshot(&wc)?;
             view.heads.insert(wc_id);
             view.workspaces.insert(
                 DEFAULT_WORKSPACE.to_string(),
                 WorkspaceState { wc: wc_id, cloak: None },
             );
         }
+        drop(init_store);
+        drop(deferred);
+        // The objects are durable before the operation that names them.
+        backend.sync_barrier()?;
         let ops = OpStore::new(backend.clone());
         ops.set_format(format);
         let op = Operation {
@@ -315,6 +325,8 @@ impl Repo {
         // `repo.json` is what makes this a repository, so it is written last:
         // a crash before this point leaves no half-initialised repository.
         write_config(&*backend, &config)?;
+        let store = Arc::new(ObjectStore::new(backend.clone(), VPath::new(".veil/objects")?, keys.clone()));
+        store.set_format(format);
         let graph = GraphIndex::new(backend.clone(), persists_index(&*backend, &view));
         Ok(Repo {
             graph,
@@ -1039,5 +1051,59 @@ impl Repo {
             self.ops.get(h)?;
         }
         self.ops.walk(&self.base).take(limit).collect()
+    }
+}
+
+/// The first objects [`Repo::init_with`] writes (the empty tree, the root
+/// snapshot, the first working copy): unsynced, all made durable by one
+/// barrier before the operation that names them, instead of three fsyncs
+/// each in turn. An `init` that crashed before `repo.json` may leave them
+/// torn; the next `init` removes those first.
+#[derive(Debug)]
+struct InitWrites(Arc<dyn StorageBackend>);
+
+impl StorageBackend for InitWrites {
+    fn kind(&self) -> &'static str {
+        self.0.kind()
+    }
+    fn is_network(&self) -> bool {
+        self.0.is_network()
+    }
+    fn read(&self, path: &VPath) -> Result<Vec<u8>> {
+        self.0.read(path)
+    }
+    fn write(&self, path: &VPath, data: &[u8]) -> Result<()> {
+        self.0.write_unsynced(path, data)
+    }
+    fn write_unsynced(&self, path: &VPath, data: &[u8]) -> Result<()> {
+        self.0.write_unsynced(path, data)
+    }
+    fn sync_barrier(&self) -> Result<()> {
+        self.0.sync_barrier()
+    }
+    fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool> {
+        // Whatever is there was left by an `init` that never finished
+        // (nothing is a repository before `repo.json`), maybe torn by a
+        // power loss: written again.
+        self.0.write_unsynced(path, data)?;
+        Ok(true)
+    }
+    fn remove_file(&self, path: &VPath) -> Result<()> {
+        self.0.remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &VPath) -> Result<()> {
+        self.0.remove_dir_all(path)
+    }
+    fn create_dir_all(&self, path: &VPath) -> Result<()> {
+        self.0.create_dir_all(path)
+    }
+    fn list_dir(&self, path: &VPath) -> Result<Vec<crate::vfs::DirEntry>> {
+        self.0.list_dir(path)
+    }
+    fn metadata(&self, path: &VPath) -> Result<Option<crate::vfs::Metadata>> {
+        self.0.metadata(path)
+    }
+    fn set_executable(&self, path: &VPath, executable: bool) -> Result<()> {
+        self.0.set_executable(path, executable)
     }
 }

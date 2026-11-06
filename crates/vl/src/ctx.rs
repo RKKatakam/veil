@@ -195,6 +195,10 @@ pub struct Ctx {
     /// working copy. Only commands that read history, and `gc`, run here
     /// (BUG-284); nothing is snapshotted or checked out.
     pub bare: bool,
+    /// The working copy before [`Ctx::commit`] recorded the directory and
+    /// moved `@` in one operation: what [`Ctx::finish`] reports the move
+    /// from (the directory already holds the new `@`).
+    committed_from: Option<ObjectId>,
 }
 
 /// Written by `vl clone` before it fetches anything, removed once its
@@ -334,6 +338,7 @@ impl Ctx {
                 checkout,
                 report: BuildReport::default(),
                 bare: true,
+                committed_from: None,
             });
         }
         for id in repo.auto_release_embargoes()? {
@@ -354,6 +359,7 @@ impl Ctx {
             report: BuildReport::default(),
             cache,
             bare: false,
+            committed_from: None,
         };
         if snapshot {
             ctx.snapshot()?;
@@ -402,7 +408,40 @@ impl Ctx {
         self.record(Some(description), policy_incoming, carried)
     }
 
+    /// `vl commit`: record the project directory and commit it as one
+    /// operation (one transaction; `vl undo` takes back both). If the
+    /// directory was stale, its recovery is recorded first and the commit
+    /// is its own operation.
+    pub fn commit(&mut self, message: &str, advance: bool) -> Result<veil_core::commands::CommitResult> {
+        if !self.bare {
+            veil_core::secrets::prepare();
+            crate::mount::record_live(&self.root);
+            let mut committed = None;
+            let before = self.wc()?;
+            self.record_into(None, false, &[], Some((message, advance)), &mut committed)?;
+            if let Some(r) = committed {
+                self.committed_from = Some(before);
+                return Ok(r);
+            }
+        }
+        let ws = self.ws.clone();
+        Ok(self.repo.commit(&ws, message, advance)?)
+    }
+
     fn record(&mut self, description: Option<String>, policy_incoming: bool, carried: &[(VPath, veil_core::TreeEntry)]) -> Result<()> {
+        self.record_into(description, policy_incoming, carried, None, &mut None)
+    }
+
+    /// [`Ctx::record`], committing what it records when `commit` is given
+    /// (the result in `committed`, unless the directory was stale).
+    fn record_into(
+        &mut self,
+        description: Option<String>,
+        policy_incoming: bool,
+        carried: &[(VPath, veil_core::TreeEntry)],
+        commit: Option<(&str, bool)>,
+        committed: &mut Option<veil_core::commands::CommitResult>,
+    ) -> Result<()> {
         // One recorder of this directory at a time (the lock-free op log
         // has no repository lock to serialise them).
         let _wc = self.lock_wc()?;
@@ -422,7 +461,7 @@ impl Ctx {
             if attempt > 0 {
                 std::thread::sleep(record_backoff(attempt));
             }
-            if self.record_once(description.clone(), policy_incoming, carried)? {
+            if self.record_once(description.clone(), policy_incoming, carried, commit, committed)? {
                 return Ok(());
             }
             // The process that moved it also recorded what the directory
@@ -437,7 +476,14 @@ impl Ctx {
 
     /// One attempt of [`Ctx::record`]; `false` if the workspace moved
     /// before the snapshot could be recorded.
-    fn record_once(&mut self, description: Option<String>, policy_incoming: bool, carried: &[(VPath, veil_core::TreeEntry)]) -> Result<bool> {
+    fn record_once(
+        &mut self,
+        description: Option<String>,
+        policy_incoming: bool,
+        carried: &[(VPath, veil_core::TreeEntry)],
+        commit: Option<(&str, bool)>,
+        committed: &mut Option<veil_core::commands::CommitResult>,
+    ) -> Result<bool> {
         let view_wc = self.wc()?;
         let disk = self.fs.clone();
         let fs: &dyn StorageBackend = &*disk;
@@ -526,12 +572,14 @@ impl Ctx {
                 policy_incoming,
                 expected_wc: Some(view_wc),
                 carried,
+                commit,
                 ..Default::default()
             },
         )?;
         if out.superseded {
             return Ok(false);
         }
+        *committed = out.committed;
         self.save_cache();
         self.repo.capture_local_files(fs, &out.report)?;
         render::print_build_warnings(&out.report);
@@ -716,6 +764,9 @@ impl Ctx {
             self.resume()?;
         }
         let target = self.wc()?;
+        if self.committed_from.take().is_some_and(|f| f != target) {
+            eprintln!("Working copy now at: {}", render::one_line(&self.repo, &target));
+        }
         let moved = target != self.checkout.snapshot || self.checkout.workspace != self.ws;
         if !moved && self.checkout.materialised.is_empty() {
             return Ok(());

@@ -30,6 +30,10 @@ use crate::{
 
 /// Protocol version, in the `/v1/` of every path.
 pub const PROTOCOL: u32 = 1;
+/// What this side of `/v1/` supports beyond its first release, as
+/// [`Tips::revision`] tells clients: 1, a fetch names objects of several
+/// snapshots ([`Want::snapshot`]).
+pub const REVISION: u32 = 1;
 /// Largest object a frame may carry.
 pub const MAX_FRAME_OBJECT: usize = 1 << 30;
 /// Most objects one fetch request may name.
@@ -93,6 +97,9 @@ pub struct Tips {
     /// Who the server takes the caller to be (`None`: anyone on Earth).
     pub you: Option<String>,
     pub admin: bool,
+    /// The server's [`REVISION`] (0: a server from before revisions).
+    #[serde(default)]
+    pub revision: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -110,6 +117,11 @@ pub struct HistoryRequest {
 pub struct Want {
     pub path: String,
     pub id: ObjectId,
+    /// The snapshot `path` is in (default: the request's): one fetch
+    /// brings the new objects of every snapshot a pull receives (revision
+    /// 1; an older server answers for the request's snapshot only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<ObjectId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

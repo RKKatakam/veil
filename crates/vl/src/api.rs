@@ -2487,11 +2487,18 @@ pub struct KeptTag {
     pub scope: Option<String>,
 }
 
-pub fn commit(ctx: &mut Ctx, message: &str, advance: bool) -> Result<Committed> {
+/// `vl commit`: with `record`, the project directory is recorded and
+/// committed as one operation ([`Ctx::commit`]).
+pub fn commit(ctx: &mut Ctx, message: &str, advance: bool, record: bool) -> Result<Committed> {
     use veil_core::commands::TagKept;
     check_message(message)?;
-    let ws = ctx.ws.clone();
-    let r = ctx.repo.commit(&ws, message, advance)?;
+    let r = match record {
+        true => ctx.commit(message, advance)?,
+        false => {
+            let ws = ctx.ws.clone();
+            ctx.repo.commit(&ws, message, advance)?
+        }
+    };
     let repo = &ctx.repo;
     Ok(Committed {
         schema: COMMIT_SCHEMA,

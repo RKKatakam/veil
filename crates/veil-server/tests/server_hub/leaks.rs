@@ -218,3 +218,42 @@ fn removing_someone_from_a_group_stops_serving_at_once() {
     assert_eq!(r.status, 404, "the next request is refused");
     assert_no_marker(&[("after removal".into(), r.body)], &[BILL_MARK], &p.fin.name);
 }
+
+/// Revision 1: one fetch names objects of several snapshots
+/// (`Want::snapshot`). Each want is checked in its own snapshot, as its
+/// viewer sees it: what another snapshot holds is not served through it,
+/// and nothing restricted is served through any.
+#[test]
+fn fetch_across_snapshots_checks_each_want_in_its_own_snapshot() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let token = p.dev.token();
+    let tips = api.tips(Some(&token), &p.name).unwrap();
+    assert_eq!(tips.revision, veil_core::hub::wire::REVISION);
+    let before = tips.branches["main"];
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.file("src/across.txt", "across snapshots");
+    let r = c.push("main", "a new file");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let after = veil_core::ObjectId::from_hex(r.json()["results"][0]["tip"].as_str().unwrap()).unwrap();
+    let id = veil_core::ObjectId::hash(&veil_core::object::Object::Blob(b"across snapshots".to_vec()).encode());
+    let fetch = |wants: serde_json::Value| api.post_json(Some(&token), &format!("/v1/projects/{}/fetch", p.name), &json!({"snapshot": before.hex(), "objects": wants}));
+    // In the snapshot it names: served.
+    let got = fetch(json!([{"path": "src/across.txt", "id": id.hex(), "snapshot": after.hex()}]));
+    assert_eq!(got.status, 200, "{}", String::from_utf8_lossy(&got.body));
+    assert_eq!(got.frames()[0].0, id);
+    // In the request's snapshot, where it is not: refused.
+    assert_eq!(fetch(json!([{"path": "src/across.txt", "id": id.hex()}])).status, 404);
+    // Restricted objects, named in any snapshot the viewer was shown, or
+    // in a real one: never.
+    let real = real_paths(&p.dir);
+    let admin_tip = api.tips(Some(&p.admin.token()), &p.name).unwrap().branches["main"];
+    for (path, oid) in real.iter().filter(|(q, _)| q.starts_with(BILL_DIR) || q.starts_with(ROOT_FILE)) {
+        for snap in [before, after, admin_tip] {
+            let r = fetch(json!([{"path": "src/across.txt", "id": id.hex(), "snapshot": after.hex()}, {"path": path, "id": oid.hex(), "snapshot": snap.hex()}]));
+            assert_eq!(r.status, 404, "{path} in {}", snap.short());
+            assert_no_marker(&[("fetch".into(), r.body)], &restricted_markers(), &p.dev.name);
+        }
+    }
+}
