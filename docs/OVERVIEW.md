@@ -50,6 +50,21 @@ The Hub follows **the design of Anthropic's Scion**, which handles tens of thous
 | History, blame or search through the API | **Milliseconds to low hundreds of ms**, with no checkout |
 | Permission checks | A negligible share of request time |
 
+### Speed gates: the OpenScion workloads (owner, 2026-11-06)
+
+The owner adopted the four synthetic workloads published by OpenScion, an independent open implementation of the Scion design, as Veil's speed gates. The repositories are made of 4 KiB files; times are medians.
+
+| Workload | 1,000 files: target | 10,000 files: target | Veil on 2026-11-06 (1k / 10k) |
+|---|---:|---:|---|
+| Import a directory (first snapshot) | **22 ms** | **245 ms** | 51 / 316 ms |
+| Clone everything | **51 ms** | **544 ms** | 50 / 483 ms ✅ |
+| Commit one changed file | **2.5 ms** | **22 ms** | 12.8 / 27 ms (Git: 4.6 / 8.9 ms) |
+| Clone one directory | **6.1 ms** | **25 ms** | not built (fetch on demand) |
+
+- The Veil numbers were measured on the development machine with a release build, the median of 5 runs, and Git as a same-machine reference. Absolute numbers depend on the machine, so each gate also requires **beating Git on the same machine**.
+- **The biggest gap is committing one file:** fixed per-command overhead (opening the repository, keys, the op log, the working-copy scan).
+- **These run in `crates/veil-bench` as a permanent profile,** re-run on every stream that touches the client or the server. Once the server exists, clone is also measured over the network.
+
 ## What exists today, and what's next
 
 - **Built: the client engine.**
