@@ -50,6 +50,14 @@ Agent approvals never stand in for the owner's where the owner is required. The 
 
 **An approval covers one commit.** If the branch changes after review, the new commits get re-reviewed: only the new diff, unless they touch tier A. That includes an agent pushing more work, and **anyone resolving a merge conflict by hand**.
 
+## Step 0.5: design conformance (every tier)
+The diff must match `docs/OVERVIEW.md` and `docs/VISIBILITY.md`. Reject anything that:
+- reintroduces encrypting code;
+- adds an offline or plain-file remote path;
+- uses rings for anything but secrets and embargoes;
+- invents access tiers or names beyond admins, groups, managers, access and public;
+- touches Git interop.
+
 ## Step 1: check the proofs, not the claims
 
 Read the brief and the agent's report. The report must have:
