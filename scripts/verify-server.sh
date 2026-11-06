@@ -5,7 +5,8 @@
 #
 # Steps: the migrations, once per database; the server's unit tests and
 # clippy; the container test suite
-# (`--features containers`) on PostgreSQL + MinIO and on YugabyteDB + MinIO;
+# (`--features containers`) on PostgreSQL + MinIO and on YugabyteDB + MinIO,
+# and its hostile-size reproductions in steps of their own;
 # then the concurrency tests under load (several copies of the test binary
 # at once, as the veil-review skill's lens 3 asks).
 #
@@ -79,8 +80,14 @@ step unit cargo test -p veil-server
 step clippy cargo clippy -q -p veil-server --all-targets --features containers -- -D warnings
 
 echo "== container suite"
-step postgres env VEIL_TEST_DATABASE_URL="$PG_URL" VEIL_TEST_S3_BUCKET=veil-pg "$BIN"
-step yugabyte env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-yb "$BIN"
+# The hostile-size reproductions (S12's adversarial pass: millions of
+# rows) run in steps of their own, so that their load never starves the
+# suite's contention-sensitive tests (sign-up under SERIALIZABLE).
+HOSTILE=derived::s12_adversarial
+step postgres env VEIL_TEST_DATABASE_URL="$PG_URL" VEIL_TEST_S3_BUCKET=veil-pg "$BIN" --skip "$HOSTILE"
+step yugabyte env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-yb "$BIN" --skip "$HOSTILE"
+STEP_LIMIT=1500 step hostile-postgres env VEIL_TEST_DATABASE_URL="$PG_URL" VEIL_TEST_S3_BUCKET=veil-hpg "$BIN" "$HOSTILE" --test-threads=3
+STEP_LIMIT=1500 step hostile-yugabyte env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-hyb "$BIN" "$HOSTILE" --test-threads=3
 
 echo "== concurrency under load (several copies at once)"
 load() { # url, bucket, copies (each copy bounded like a step)

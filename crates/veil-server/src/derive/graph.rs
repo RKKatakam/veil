@@ -7,7 +7,8 @@
 //!   (`veil_core::graph_index`): the larger of the snapshot's timestamp (at
 //!   least 0) and 1 plus its parents' largest generation. It strictly
 //!   decreases along every parent edge, which is all the walks rely on; a
-//!   hostile timestamp only lengthens a walk. **It is never shown to a
+//!   hostile timestamp only lengthens a walk (timestamps are clamped to
+//!   [`MAX_STAMP`], so the sum never overflows: BUG-866). **It is never shown to a
 //!   viewer:** hidden snapshots take part in it, so it is not the same in a
 //!   viewer's projected history (S13 orders answers by something else).
 //! * **Depth** counts first parents down to the universal root (depth 0).
@@ -33,6 +34,11 @@ pub const FLAG_EMBARGO: i32 = 1;
 /// The snapshot or one of its ancestors carries an embargo: its changes are
 /// not indexed or listed until release (design §6, row 8).
 pub const FLAG_EMBARGO_LINE: i32 = 2;
+
+/// The largest timestamp a generation takes from a snapshot (about 73
+/// million years in milliseconds): far above any real clock, and far
+/// enough below `i64::MAX` that no history can count up to it.
+pub const MAX_STAMP: i64 = i64::MAX / 4;
 
 /// The jump-table levels after the first parent.
 const LEVELS: [i64; 3] = [16, 256, 4096];
@@ -67,7 +73,11 @@ impl GraphRow {
 
     /// The row of `s`, whose parents' rows are `parents` (in order).
     pub fn compute(s: &Snapshot, parents: &[(ObjectId, Arc<GraphRow>)]) -> GraphRow {
-        let generation = parents.iter().map(|(_, p)| p.generation + 1).max().unwrap_or(0).max(s.timestamp.max(0));
+        // The timestamp is the author's choice (BUG-866): clamped, so that
+        // 1 plus a parent's generation never overflows, and generations
+        // strictly decrease along every edge whatever was pushed.
+        let stamp = s.timestamp.clamp(0, MAX_STAMP);
+        let generation = parents.iter().map(|(_, p)| p.generation.saturating_add(1)).max().unwrap_or(0).max(stamp);
         let mut flags = if s.embargo.is_some() { FLAG_EMBARGO | FLAG_EMBARGO_LINE } else { 0 };
         for (_, p) in parents {
             flags |= p.flags & FLAG_EMBARGO_LINE;
@@ -83,7 +93,7 @@ impl GraphRow {
                     let at = if p.depth % level == 0 { *p0 } else { p.skip.get(i + 1).copied().unwrap_or(*p0) };
                     skip.push(at);
                 }
-                (skip, p.depth + 1)
+                (skip, p.depth.saturating_add(1))
             }
         };
         GraphRow {

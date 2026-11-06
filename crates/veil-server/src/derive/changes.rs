@@ -54,8 +54,6 @@ pub const MANY: &str = "many";
 /// `graph.changed` for a snapshot on an embargo line: nothing is indexed
 /// until release (design §6, row 8).
 pub const WITHHELD: &str = "withheld";
-/// The `file_history` key of `many` snapshots.
-pub const MANY_KEY: &str = "*";
 
 /// Most paths one changed-paths object lists.
 pub const MAX_PATHS: usize = 100_000;
@@ -78,6 +76,11 @@ pub struct Changed {
     pub paths: Vec<PathChange>,
     /// Similarity was computed for the whole change (false above the caps).
     pub similar: bool,
+    /// Folders that changed with no leaf changing below them (an empty
+    /// folder added or removed, a folder entry's metadata), deepest only:
+    /// listed under the lines deciding them (BUG-871).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dirs: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,9 +144,11 @@ fn tree_of(src: &dyn TreeSource, e: &TreeEntry) -> Result<Option<std::sync::Arc<
 }
 
 /// Every leaf that differs between real trees `old` and `new`, sorted by
-/// path.
-pub fn diff(src: &dyn TreeSource, old: ObjectId, new: ObjectId) -> Result<Vec<Change>> {
+/// path; and the folders that differ with no leaf differing below them,
+/// deepest only (`""` when only the root's own encoding differs).
+pub fn diff(src: &dyn TreeSource, old: ObjectId, new: ObjectId) -> Result<(Vec<Change>, Vec<String>)> {
     let mut out = Vec::new();
+    let mut dirs = Vec::new();
     if old != new {
         let root = |id: &ObjectId| -> Result<Option<std::sync::Arc<veil_core::object::Tree>>> {
             Ok(match src.node(id)? {
@@ -151,10 +156,14 @@ pub fn diff(src: &dyn TreeSource, old: ObjectId, new: ObjectId) -> Result<Vec<Ch
                 Node::Leaf => None,
             })
         };
-        walk(src, "", root(&old)?.as_deref(), root(&new)?.as_deref(), &mut out, 0)?;
+        walk(src, "", root(&old)?.as_deref(), root(&new)?.as_deref(), &mut out, &mut dirs, 0)?;
+        if out.is_empty() && dirs.is_empty() {
+            dirs.push(String::new());
+        }
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(out)
+    dirs.sort();
+    Ok((out, dirs))
 }
 
 fn walk(
@@ -163,6 +172,7 @@ fn walk(
     old: Option<&veil_core::object::Tree>,
     new: Option<&veil_core::object::Tree>,
     out: &mut Vec<Change>,
+    dirs: &mut Vec<String>,
     depth: usize,
 ) -> Result<()> {
     if depth > MAX_TREE_DEPTH {
@@ -180,6 +190,7 @@ fn walk(
             continue;
         }
         let path = join(dir, name);
+        let (leaves, folders) = (out.len(), dirs.len());
         let ot = match o {
             Some(e) => tree_of(src, e)?,
             None => None,
@@ -192,10 +203,13 @@ fn walk(
         let ol = if ot.is_some() { None } else { o.cloned() };
         let nl = if nt.is_some() { None } else { n.cloned() };
         if (ot.is_some() || nt.is_some()) && ot.as_ref().map(|t| t.as_ref()) != nt.as_ref().map(|t| t.as_ref()) {
-            walk(src, &path, ot.as_deref(), nt.as_deref(), out, depth + 1)?;
+            walk(src, &path, ot.as_deref(), nt.as_deref(), out, dirs, depth + 1)?;
         }
         if ol.is_some() || nl.is_some() {
             out.push(Change { path, old: ol, new: nl });
+        } else if out.len() == leaves && dirs.len() == folders {
+            // A folder that differs with nothing differing below it.
+            dirs.push(path);
         }
     }
     Ok(())

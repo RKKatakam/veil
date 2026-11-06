@@ -90,6 +90,18 @@ impl Lines {
         }
     }
 
+    /// The list of a folder that changed with no leaf below it changing:
+    /// as for a directory side ([`Lines::key_of`]); the root's is `none`.
+    pub fn dir_key(&self, path: &str) -> &str {
+        if path.is_empty() || self.policy.rule_below(path) {
+            return &self.none;
+        }
+        match self.policy.deciding(path) {
+            Some(i) => self.keys[i].as_deref().unwrap_or(&self.none),
+            None => &self.none,
+        }
+    }
+
     /// The lists `view` may read (`view` must be of this policy).
     pub fn readable(&self, view: &View) -> Vec<String> {
         if view.admin {

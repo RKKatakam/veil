@@ -95,11 +95,16 @@ pub struct Hist {
     pub stored: HashSet<ObjectId>,
 }
 
-/// Encode `files` as trees; every object goes to `out`.
+/// Encode `files` as trees; every object goes to `out`. A path ending in
+/// `/` is an empty folder.
 fn build_tree(files: &Files, out: &mut Vec<(ObjectId, Vec<u8>)>) -> ObjectId {
     let mut here: BTreeMap<String, TreeEntry> = BTreeMap::new();
     let mut sub: BTreeMap<String, Files> = BTreeMap::new();
     for (p, c) in files {
+        if p.is_empty() {
+            // The folder itself (it was named `…/`).
+            continue;
+        }
         match p.split_once('/') {
             Some((d, rest)) => {
                 sub.entry(d.to_string()).or_default().insert(rest.to_string(), c.clone());
@@ -246,7 +251,7 @@ impl Hist {
     }
 
     pub fn derive(&self, th: &TestHub) -> derive::Stats {
-        th.rt.block_on(derive::catch_up(&self.hub, self.id, None)).unwrap()
+        th.rt.block_on(derive::catch_up(&self.hub, self.id, derive::Scope::All)).unwrap()
     }
 
     /// Every derived row of the project, and every changed-paths object.
@@ -406,9 +411,11 @@ pub fn random_history(th: &TestHub, h: &mut Hist, rng: &mut Rng, n: usize) {
             for _ in 0..ops {
                 let paths: Vec<String> = files.keys().cloned().collect();
                 let pick = |rng: &mut Rng| paths.get(rng.below(paths.len())).cloned();
-                match rng.below(9) {
+                // A file, not an empty folder (whose bytes are not content).
+                let pick_file = |rng: &mut Rng| pick(rng).filter(|p| !p.ends_with('/'));
+                match rng.below(10) {
                     0 | 1 => {
-                        if let Some(p) = pick(rng) {
+                        if let Some(p) = pick_file(rng) {
                             let mut c = files[&p].clone();
                             c.extend(format!("edit {}\n", rng.next() % 1000).bytes());
                             files.insert(p, c);
@@ -435,7 +442,7 @@ pub fn random_history(th: &TestHub, h: &mut Hist, rng: &mut Rng, n: usize) {
                     }
                     6 => {
                         // A rename with an edit (similar, not the same object).
-                        if let Some(p) = pick(rng) {
+                        if let Some(p) = pick_file(rng) {
                             let mut c = files.remove(&p).unwrap();
                             c.extend(b"one more line\n");
                             let d = DIRS[rng.below(DIRS.len())];
@@ -444,7 +451,7 @@ pub fn random_history(th: &TestHub, h: &mut Hist, rng: &mut Rng, n: usize) {
                     }
                     7 => {
                         // A copy whose source is edited too.
-                        if let Some(p) = pick(rng) {
+                        if let Some(p) = pick_file(rng) {
                             let c = files[&p].clone();
                             let d = DIRS[rng.below(DIRS.len())];
                             files.insert(fresh(rng, d), c.clone());
@@ -452,6 +459,13 @@ pub fn random_history(th: &TestHub, h: &mut Hist, rng: &mut Rng, n: usize) {
                             e.extend(b"source edited\n");
                             files.insert(p, e);
                         }
+                    }
+                    8 => {
+                        // An empty folder (BUG-871): a tree change with no
+                        // leaf change.
+                        let d = DIRS[rng.below(DIRS.len())];
+                        let p = fresh(rng, d);
+                        files.insert(format!("{p}/"), Vec::new());
                     }
                     _ => {
                         // A change of a hidden-to-most folder only.
@@ -662,6 +676,14 @@ fn projection_equivalence() {
         h.derive(&th);
         let project = h.project(&th);
         let (mut hidden_somewhere, mut sourced) = (0, 0);
+        let folders_only = h
+            .order
+            .iter()
+            .filter(|s| {
+                let (now, before) = (&h.files[*s], &h.files[&h.parents[*s][0]]);
+                now != before && now.keys().chain(before.keys()).filter(|k| now.get(*k) != before.get(*k)).all(|k| k.ends_with('/'))
+            })
+            .count();
         for (who, viewer) in viewers(carol) {
             let p = projections(&th, &h, &project, &viewer);
             let copy = copy_for(&th, &h, &project, &viewer, &p);
@@ -741,6 +763,7 @@ fn projection_equivalence() {
         }
         // The history exercised what the test is about.
         assert!(hidden_somewhere > 0 && merges(&h) > 0 && sourced > 0, "seed {seed}: {hidden_somewhere} {} {sourced}", merges(&h));
+        println!("seed {seed}: {} changes, {} merges, {folders_only} changing empty folders only", h.order.len(), merges(&h));
         // The boundary cases happened: a readable file's exact sources were
         // a hidden one (ranked first) and a readable one.
         let c4 = h.order[4];
@@ -805,7 +828,7 @@ fn derived_graph_matches_direct_walks() {
             for p in &h.parents[s] {
                 paths.extend(h.files[p].keys());
             }
-            for path in paths {
+            for path in paths.into_iter().filter(|p| !p.ends_with('/')) {
                 if rng.chance(30) {
                     wants.push((*s, path.clone()));
                 }
@@ -899,7 +922,7 @@ fn derived_data_resumes_after_a_crash() {
             let mut set = tokio::task::JoinSet::new();
             for _ in 0..4 {
                 let hub = hub.clone();
-                set.spawn(async move { derive::catch_up(&hub, id, None).await.unwrap() });
+                set.spawn(async move { derive::catch_up(&hub, id, derive::Scope::All).await.unwrap() });
             }
             let mut out = Vec::new();
             while let Some(r) = set.join_next().await {
@@ -1531,7 +1554,6 @@ mod s12_adversarial {
     /// release builds wrap, so generations no longer decrease along parent
     /// edges and ancestry and merge-base walks answer wrongly.
     #[test]
-    #[ignore = "BUG-866: a far-future snapshot timestamp overflows the derived generation"]
     fn bug_866_a_far_future_timestamp_breaks_the_commit_graph() {
         let th = TestHub::start();
         let p = setup_project(&th);
@@ -1550,7 +1572,7 @@ mod s12_adversarial {
         assert_eq!(r.json()["results"][0]["ok"], true, "{}", r.json());
         let hub = th.hub();
         let pid = project_id(&th, &p.name);
-        let run = th.rt.block_on(derive::catch_up(&hub, pid, None));
+        let run = th.rt.block_on(derive::catch_up(&hub, pid, derive::Scope::All));
         assert!(run.is_ok(), "deriving the project fails on every run: {run:?}");
         // Generations strictly decrease along every parent edge.
         let rows: Vec<(String, i64, String)> = th.rt.block_on(async {
@@ -1572,8 +1594,22 @@ mod s12_adversarial {
     /// drives the server's memory to gigabytes (512 x 100,000 paths: tens of
     /// GB).
     #[test]
-    #[ignore = "BUG-867: a derive batch's memory grows with the paths its snapshots change, unbounded by the 512-snapshot flush"]
     fn bug_867_a_derive_batch_holds_unbounded_memory() {
+        // Memory is the whole process's: measured in a process of its own,
+        // so other tests running beside it count for nothing.
+        const CHILD: &str = "VEIL_BUG867_CHILD";
+        if std::env::var(CHILD).is_err() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "derived::s12_adversarial::bug_867_a_derive_batch_holds_unbounded_memory", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let line = stdout.lines().find(|l| l.contains("BUG-867:")).unwrap_or_default();
+            println!("{line}");
+            assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+            return;
+        }
         let th = TestHub::start();
         let (text, bindings) = devs_policy();
         let mut h = Hist::new(&th, &text, &bindings);
@@ -1608,7 +1644,6 @@ mod s12_adversarial {
     /// snapshot), so after a push of them, everyone's later landings cost a
     /// multiple of what they did.
     #[test]
-    #[ignore = "BUG-868: each many snapshot in history adds tree lookups to every path of every later landing"]
     fn bug_868_many_snapshots_slow_every_later_landing() {
         let th = TestHub::start();
         let n_many: usize = std::env::var("VEIL_BUG868_MANY").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
@@ -1657,17 +1692,18 @@ mod s12_adversarial {
     /// the thread's stack, which aborts the whole server process. Run in a
     /// child process, which the overflow kills.
     #[test]
-    #[ignore = "BUG-869: Reader::visible recurses once per merge and overflows the stack"]
     fn bug_869_a_chain_of_merges_overflows_the_readers_stack() {
         const CHILD: &str = "VEIL_BUG869_CHILD";
         if std::env::var(CHILD).is_err() {
             let out = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "derived::s12_adversarial::bug_869_a_chain_of_merges_overflows_the_readers_stack", "--ignored", "--nocapture"])
+                .args(["--exact", "derived::s12_adversarial::bug_869_a_chain_of_merges_overflows_the_readers_stack", "--nocapture"])
                 .env(CHILD, "1")
                 .output()
                 .unwrap();
             let err = String::from_utf8_lossy(&out.stderr);
             assert!(out.status.success(), "the reader's process died ({:?}): {}", out.status, err.lines().filter(|l| l.contains("overflow") || l.contains("BUG-869")).collect::<Vec<_>>().join(" | "));
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(stdout.contains("1 passed"), "the child ran the test: {stdout}");
             return;
         }
         let th = TestHub::start();
@@ -1706,7 +1742,6 @@ mod s12_adversarial {
     /// thousands, all naming one snapshot), so one landing then costs
     /// thousands of statements per view key.
     #[test]
-    #[ignore = "BUG-870: each landing does work proportional to the project's branch count, not to what moved"]
     fn bug_870_branches_multiply_the_work_of_every_landing() {
         let th = TestHub::start();
         let n_branches: usize = std::env::var("VEIL_BUG870_BRANCHES").ok().and_then(|s| s.parse().ok()).unwrap_or(3_000);
@@ -1728,14 +1763,13 @@ mod s12_adversarial {
                 .await;
             });
             h.derive(&th);
-            th.rt.block_on(derive::memo_tips(&hub, id)).unwrap();
+            th.rt.block_on(derive::memo_tips(&hub, id, &["main".to_string()])).unwrap();
             // One landing on main: what derive::landed runs for it.
             let (t1, o1) = tree_of(&Files::from([("pub/a.txt".to_string(), b"b\n".to_vec())]));
             let b = commit_tree(&th, &mut h, &[a], t1, o1, 2, 2);
             h.set_branch(&th, "main", b);
             let t = Instant::now();
-            assert_eq!(h.derive(&th).snapshots, 1);
-            th.rt.block_on(derive::memo_tips(&hub, id)).unwrap();
+            assert_eq!(th.rt.block_on(derive::landing(&hub, id, vec!["main".to_string()])).unwrap().snapshots, 1);
             t.elapsed()
         };
         let one = land(0);
@@ -1752,7 +1786,6 @@ mod s12_adversarial {
     /// reader disagrees with `sync::projected` and would show the change,
     /// its description and author to people without access.
     #[test]
-    #[ignore = "BUG-871: a tree change with no leaf change is derived as none and shown to every viewer"]
     fn bug_871_a_change_of_an_empty_hidden_folder_is_visible_to_all() {
         let th = TestHub::start();
         let (text, bindings) = devs_policy();

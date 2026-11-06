@@ -37,6 +37,16 @@ pub struct Reader<'a> {
     /// The lists the viewer may read.
     pub keys: Vec<String>,
     visible: RefCell<HashMap<ObjectId, bool>>,
+    /// The representative of snapshots already walked ([`Reader::rep`]).
+    reps: RefCell<HashMap<ObjectId, ObjectId>>,
+    listed: RefCell<HashMap<ObjectId, bool>>,
+}
+
+/// What deciding one snapshot's visibility needs: nothing more, or another
+/// snapshot's visibility first.
+enum Step {
+    Done(bool),
+    Need(ObjectId),
 }
 
 impl<'a> Reader<'a> {
@@ -47,6 +57,8 @@ impl<'a> Reader<'a> {
             view,
             keys: lines.readable(view),
             visible: RefCell::new(HashMap::new()),
+            reps: RefCell::new(HashMap::new()),
+            listed: RefCell::new(HashMap::new()),
         }
     }
 
@@ -89,43 +101,114 @@ impl<'a> Reader<'a> {
 
     /// Is `id` in the viewer's history, or does it collapse into its first
     /// parent (`docs/HUB.md` §13.4)? A change with one parent is in it when
-    /// it changed something the viewer may read, or nothing at all; a merge
-    /// also when its parents are different snapshots for the viewer.
+    /// it changed something the viewer may read, or nothing at all (its
+    /// tree is its parent's); a merge also when its parents are different
+    /// snapshots for the viewer.
+    ///
+    /// Iterative (BUG-869): a merge needs its parents' representatives,
+    /// which need older merges' visibility; those wait on an explicit
+    /// stack, never on the thread's, whatever the history holds.
     pub fn visible(&self, id: &ObjectId) -> Result<bool> {
-        if *id == root_snapshot_id() {
-            return Ok(true);
-        }
-        if let Some(v) = self.visible.borrow().get(id) {
-            return Ok(*v);
-        }
-        let row = self.g.get(id)?;
-        let v = match row.changed.as_deref() {
-            // An embargo line is withheld until its release (S22).
-            Some(WITHHELD) => false,
-            _ if self.listed(id)? => true,
-            Some(NONE) if row.parents.len() == 1 => true,
-            _ if row.parents.len() > 1 => {
-                let first = self.rep(&row.parents[0])?;
-                let mut other = false;
-                for p in &row.parents[1..] {
-                    other |= self.rep(p)? != first;
-                }
-                other
+        let mut stack = vec![*id];
+        while let Some(&x) = stack.last() {
+            if self.decided(&x).is_some() {
+                stack.pop();
+                continue;
             }
-            _ => false,
+            match self.step(&x)? {
+                Step::Done(v) => {
+                    self.visible.borrow_mut().insert(x, v);
+                    stack.pop();
+                }
+                Step::Need(y) => stack.push(y),
+            }
+        }
+        Ok(self.decided(id).unwrap())
+    }
+
+    fn decided(&self, id: &ObjectId) -> Option<bool> {
+        if *id == root_snapshot_id() {
+            return Some(true);
+        }
+        self.visible.borrow().get(id).copied()
+    }
+
+    /// Decide `x` from what is decided already, or name what it needs.
+    fn step(&self, x: &ObjectId) -> Result<Step> {
+        let row = self.g.get(x)?;
+        if row.changed.as_deref() == Some(WITHHELD) {
+            // An embargo line is withheld until its release (S22).
+            return Ok(Step::Done(false));
+        }
+        let cached = self.listed.borrow().get(x).copied();
+        let listed = match cached {
+            Some(l) => l,
+            None => {
+                let l = self.listed(x)?;
+                self.listed.borrow_mut().insert(*x, l);
+                l
+            }
         };
-        self.visible.borrow_mut().insert(*id, v);
-        Ok(v)
+        if listed {
+            return Ok(Step::Done(true));
+        }
+        if row.parents.len() == 1 {
+            return Ok(Step::Done(row.changed.as_deref() == Some(NONE)));
+        }
+        if row.parents.len() < 2 {
+            return Ok(Step::Done(false));
+        }
+        let first = match self.known_rep(&row.parents[0])? {
+            Ok(r) => r,
+            Err(need) => return Ok(Step::Need(need)),
+        };
+        let mut other = false;
+        for p in &row.parents[1..] {
+            match self.known_rep(p)? {
+                Ok(r) => other |= r != first,
+                Err(need) => return Ok(Step::Need(need)),
+            }
+        }
+        Ok(Step::Done(other))
+    }
+
+    /// The representative of `id` from what is decided already (each step
+    /// remembered), or the first snapshot on the way whose visibility is
+    /// not decided yet.
+    fn known_rep(&self, id: &ObjectId) -> Result<std::result::Result<ObjectId, ObjectId>> {
+        let mut walked = Vec::new();
+        let mut x = *id;
+        let r = loop {
+            if let Some(r) = self.reps.borrow().get(&x) {
+                break *r;
+            }
+            match self.decided(&x) {
+                Some(true) => break x,
+                Some(false) => {
+                    walked.push(x);
+                    x = self.g.get(&x)?.parents[0];
+                }
+                None => return Ok(Err(x)),
+            }
+        };
+        let mut reps = self.reps.borrow_mut();
+        for w in walked {
+            reps.insert(w, r);
+        }
+        Ok(Ok(r))
     }
 
     /// The snapshot of the viewer's history that `id` stands for: `id`, or
     /// the nearest first-parent ancestor in their history.
     pub fn rep(&self, id: &ObjectId) -> Result<ObjectId> {
-        let mut x = *id;
-        while !self.visible(&x)? {
-            x = self.g.get(&x)?.parents[0];
+        loop {
+            match self.known_rep(id)? {
+                Ok(r) => return Ok(r),
+                Err(need) => {
+                    self.visible(&need)?;
+                }
+            }
         }
-        Ok(x)
     }
 
     /// The best common ancestors of `a` and `b` in the viewer's history.
