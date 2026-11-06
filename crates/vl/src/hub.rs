@@ -1,0 +1,762 @@
+//! `vl`'s client for the Veil server (`docs/HUB.md`; milestone S1).
+//!
+//! * **URLs:** `veil://host[:port]/project` or `https://host[:port]/project`
+//!   (HTTPS; the default port is 443).
+//! * **Sign-in:** challenge-response with this device's identity key
+//!   (`vl login`), then a session token kept in `$VEIL_HOME/hub.json`
+//!   (mode 0600), with the server's certificate when it is self-signed
+//!   (`--ca`). An expired session is renewed with the key, silently. Without
+//!   a session the client is anyone on Earth: it sees `public` folders only.
+//! * **Fetch on demand** (Scion): the client asks for the branch tips, the
+//!   snapshots it lacks, then trees from the root down and the files it
+//!   needs, each by id with the path where it met it. It never sends a list
+//!   of what it has; it skips what it already holds.
+//! * **Push:** the snapshots the server lacks and, of their trees, what
+//!   differs from their parents at the same path; then one request that
+//!   moves each branch by compare-and-swap. Key rings (secret scopes only)
+//!   go up first and come down with every pull.
+
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
+
+use anyhow::{anyhow, bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use veil_core::{
+    crypto::domains::SIG_CONTEXT_HUB_LOGIN,
+    hub::wire::{
+        put_frame, read_frames, AccessInfo, BranchUpdate, Challenge, ChallengeRequest, Devices, ErrorBody, FetchRequest, GroupChange, GroupInfo,
+        HistoryRequest, LoginRequest, PushRequest, PushResult, Session, Tips, Want,
+    },
+    keychain::KeyRing,
+    object::{EntryKind, Object},
+    oplog::Tag,
+    remote::{apply_remote_tags, Incoming, SyncReport},
+    store::ObjectStore,
+    Identity, ObjectId, Repo,
+};
+
+use crate::ctx::veil_home;
+
+/// A Veil server project URL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HubUrl {
+    /// `host[:port]` as given.
+    pub authority: String,
+    /// Empty for a bare server URL (`vl login veil://host`).
+    pub project: String,
+}
+
+impl HubUrl {
+    /// `Some` if `s` is a Veil server URL (then `Err` if it is malformed).
+    pub fn parse(s: &str) -> Option<Result<HubUrl>> {
+        let rest = s.strip_prefix("veil://").or_else(|| s.strip_prefix("https://"))?;
+        Some((|| {
+            let rest = rest.trim_end_matches('/');
+            let (authority, project) = rest.split_once('/').unwrap_or((rest, ""));
+            if authority.is_empty() || authority.contains(['@', '?', '#', ' ']) {
+                bail!("invalid server URL {s:?}: expected veil://host[:port]/project");
+            }
+            if project.contains('/') {
+                bail!("invalid server URL {s:?}: a project name has no '/'");
+            }
+            Ok(HubUrl {
+                authority: authority.to_ascii_lowercase(),
+                project: project.to_string(),
+            })
+        })())
+    }
+
+    fn base(&self) -> String {
+        format!("https://{}", self.authority)
+    }
+
+    fn project_path(&self, rest: &str) -> String {
+        format!("/v1/projects/{}{rest}", self.project)
+    }
+}
+
+pub fn is_hub_url(s: &str) -> bool {
+    HubUrl::parse(s).is_some()
+}
+
+// ---- $VEIL_HOME/hub.json ------------------------------------------------------------
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ServerEntry {
+    /// The server's certificate (PEM), when it is not signed by a public CA.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ca: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+    #[serde(default)]
+    expires_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    person: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hub_key: Option<String>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct HubFile {
+    #[serde(default)]
+    servers: BTreeMap<String, ServerEntry>,
+}
+
+fn hub_file() -> std::path::PathBuf {
+    veil_home().join("hub.json")
+}
+
+fn load_file() -> Result<HubFile> {
+    match std::fs::read(hub_file()) {
+        Ok(b) => Ok(serde_json::from_slice(&b).context("reading $VEIL_HOME/hub.json")?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HubFile::default()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Write `hub.json` (it holds session tokens): owner-only, atomically.
+fn save_file(f: &HubFile) -> Result<()> {
+    use std::io::Write;
+    let path = hub_file();
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    let mut file = o.open(&tmp)?;
+    file.write_all(&serde_json::to_vec_pretty(f)?)?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+fn update_entry(authority: &str, f: impl FnOnce(&mut ServerEntry)) -> Result<()> {
+    let mut file = load_file()?;
+    f(file.servers.entry(authority.to_string()).or_default());
+    save_file(&file)
+}
+
+// ---- the client -------------------------------------------------------------------------
+
+pub struct Client {
+    agent: ureq::Agent,
+    pub url: HubUrl,
+    identity: Identity,
+    token: std::cell::RefCell<Option<String>>,
+    /// Signed in before (an entry in hub.json): renew the session silently.
+    known: bool,
+}
+
+/// Body of a response: JSON or object frames.
+fn read_body(resp: ureq::http::Response<ureq::Body>) -> Result<Vec<u8>> {
+    let mut body = resp.into_body();
+    Ok(body.with_config().limit(4 << 30).read_to_vec()?)
+}
+
+impl Client {
+    pub fn new(url: &HubUrl, identity: Identity) -> Result<Client> {
+        let file = load_file()?;
+        let entry = file.servers.get(&url.authority).cloned();
+        let ca = match std::env::var_os("VEIL_HUB_CA") {
+            Some(p) => Some(std::fs::read_to_string(&p).with_context(|| format!("reading VEIL_HUB_CA {}", Path::new(&p).display()))?),
+            None => entry.as_ref().and_then(|e| e.ca.clone()),
+        };
+        let mut tls = ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::Rustls);
+        if let Some(pem) = &ca {
+            let certs: Vec<ureq::tls::Certificate<'static>> = ureq::tls::parse_pem(pem.as_bytes())
+                .filter_map(|i| match i {
+                    Ok(ureq::tls::PemItem::Certificate(c)) => Some(c),
+                    _ => None,
+                })
+                .collect();
+            if certs.is_empty() {
+                bail!("no certificate in the server's CA file");
+            }
+            tls = tls.root_certs(ureq::tls::RootCerts::Specific(Arc::new(certs)));
+        }
+        let agent = ureq::Agent::config_builder()
+            .tls_config(tls.build())
+            .http_status_as_error(false)
+            .timeout_global(Some(Duration::from_secs(600)))
+            .build()
+            .new_agent();
+        let token = entry
+            .as_ref()
+            .filter(|e| e.expires_at > veil_core::now_millis() + 30_000)
+            .and_then(|e| e.token.clone());
+        Ok(Client {
+            agent,
+            url: url.clone(),
+            identity,
+            token: std::cell::RefCell::new(token),
+            known: entry.is_some_and(|e| e.person.is_some()),
+        })
+    }
+
+    /// Remember the server's certificate (a self-signed one, for development).
+    pub fn trust_ca(authority: &str, pem: &str) -> Result<()> {
+        update_entry(authority, |e| e.ca = Some(pem.to_string()))
+    }
+
+    fn error(status: u16, body: &[u8]) -> anyhow::Error {
+        match serde_json::from_slice::<ErrorBody>(body) {
+            Ok(e) => anyhow!("{} (server: {})", e.message, e.code),
+            Err(_) => anyhow!("the server answered HTTP {status}"),
+        }
+    }
+
+    fn send(&self, method: &str, path: &str, body: Option<(&str, Vec<u8>)>, auth: bool) -> Result<(u16, Vec<u8>)> {
+        let url = format!("{}{path}", self.url.base());
+        let token = if auth { self.token.borrow().clone() } else { None };
+        let resp = match (method, body) {
+            ("GET", _) => {
+                let mut r = self.agent.get(&url);
+                if let Some(t) = &token {
+                    r = r.header("authorization", &format!("Bearer {t}"));
+                }
+                r.call()
+            }
+            (m, body) => {
+                let mut r = if m == "DELETE" {
+                    self.agent.delete(&url).force_send_body()
+                } else {
+                    self.agent.post(&url)
+                };
+                if let Some(t) = &token {
+                    r = r.header("authorization", &format!("Bearer {t}"));
+                }
+                match body {
+                    Some((ct, b)) => r.header("content-type", ct).send(&b[..]),
+                    None => r.send_empty(),
+                }
+            }
+        }
+        .with_context(|| format!("connecting to the Veil server at {}", self.url.authority))?;
+        let status = resp.status().as_u16();
+        Ok((status, read_body(resp)?))
+    }
+
+    /// Send a request, signing in again once if the session expired.
+    fn call(&self, method: &str, path: &str, body: Option<(&str, Vec<u8>)>) -> Result<(u16, Vec<u8>)> {
+        if self.token.borrow().is_none() && self.known {
+            self.login(None)?;
+        }
+        let (status, out) = self.send(method, path, body.clone(), true)?;
+        if status == 401 && self.known {
+            self.login(None)?;
+            return self.send(method, path, body, true);
+        }
+        Ok((status, out))
+    }
+
+    fn ok(&self, method: &str, path: &str, body: Option<(&str, Vec<u8>)>) -> Result<Vec<u8>> {
+        let (status, out) = self.call(method, path, body)?;
+        if !(200..300).contains(&status) {
+            return Err(Self::error(status, &out));
+        }
+        Ok(out)
+    }
+
+    fn json<T: for<'de> Deserialize<'de>>(&self, method: &str, path: &str, req: Option<&impl Serialize>) -> Result<T> {
+        let body = req.map(|r| ("application/json", serde_json::to_vec(r).unwrap()));
+        let out = self.ok(method, path, body)?;
+        serde_json::from_slice(&out).context("the server's answer")
+    }
+
+    /// Sign in with this device's key; `name` registers it as a new person.
+    pub fn login(&self, name: Option<&str>) -> Result<Session> {
+        let key = self.identity.verifying_hex();
+        let (status, out) = self.send(
+            "POST",
+            "/v1/auth/challenge",
+            Some(("application/json", serde_json::to_vec(&ChallengeRequest { key: key.clone() })?)),
+            false,
+        )?;
+        if status != 200 {
+            return Err(Self::error(status, &out));
+        }
+        let ch: Challenge = serde_json::from_slice(&out)?;
+        let hub = self.url.authority.clone();
+        let req = LoginRequest {
+            signature: self
+                .identity
+                .sign(SIG_CONTEXT_HUB_LOGIN, &veil_core::hub::wire::login_message(&hub, &ch.challenge)),
+            key,
+            challenge: ch.challenge,
+            hub,
+            identity: self.identity.public_id(),
+            name: name.map(str::to_string),
+        };
+        let (status, out) = self.send("POST", "/v1/auth/login", Some(("application/json", serde_json::to_vec(&req)?)), false)?;
+        if status != 200 {
+            return Err(Self::error(status, &out));
+        }
+        let s: Session = serde_json::from_slice(&out)?;
+        *self.token.borrow_mut() = Some(s.token.clone());
+        update_entry(&self.url.authority, |e| {
+            e.token = Some(s.token.clone());
+            e.expires_at = s.expires_at;
+            e.person = Some(s.person.clone());
+            e.hub_key = Some(s.hub_key.clone());
+        })?;
+        Ok(s)
+    }
+
+    /// The branch tips this caller may see; `None` if there is no project
+    /// they can see.
+    pub fn tips(&self) -> Result<Option<Tips>> {
+        let (status, out) = self.call("GET", &self.url.project_path("/tips"), None)?;
+        match status {
+            200 => Ok(Some(serde_json::from_slice(&out)?)),
+            404 => Ok(None),
+            s => Err(Self::error(s, &out)),
+        }
+    }
+
+    pub fn create_project(&self) -> Result<Tips> {
+        self.json("POST", &self.url.project_path(""), None::<&()>)
+    }
+
+    pub fn history(&self, tips: Vec<ObjectId>, stop: Vec<ObjectId>) -> Result<Vec<(ObjectId, Vec<u8>)>> {
+        let out = self.ok(
+            "POST",
+            &self.url.project_path("/history"),
+            Some(("application/json", serde_json::to_vec(&HistoryRequest { tips, stop })?)),
+        )?;
+        Ok(read_frames(&out)?.into_iter().map(|(id, raw)| (id, raw.to_vec())).collect())
+    }
+
+    pub fn fetch(&self, snapshot: ObjectId, objects: Vec<Want>) -> Result<Vec<(ObjectId, Vec<u8>)>> {
+        let out = self.ok(
+            "POST",
+            &self.url.project_path("/fetch"),
+            Some(("application/json", serde_json::to_vec(&FetchRequest { snapshot, objects })?)),
+        )?;
+        Ok(read_frames(&out)?.into_iter().map(|(id, raw)| (id, raw.to_vec())).collect())
+    }
+
+    pub fn upload(&self, frames: Vec<u8>) -> Result<()> {
+        self.ok("POST", &self.url.project_path("/objects"), Some(("application/octet-stream", frames)))?;
+        Ok(())
+    }
+
+    /// Push; `Ok(None)` when a branch moved during the push (retry).
+    pub fn push(&self, req: &PushRequest) -> Result<Option<PushResult>> {
+        let (status, out) = self.call(
+            "POST",
+            &self.url.project_path("/push"),
+            Some(("application/json", serde_json::to_vec(req)?)),
+        )?;
+        match status {
+            200 => Ok(Some(serde_json::from_slice(&out)?)),
+            409 => Ok(None),
+            s => Err(Self::error(s, &out)),
+        }
+    }
+
+    pub fn access(&self, path: &str) -> Result<AccessInfo> {
+        let mut q = String::new();
+        for b in path.bytes() {
+            if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) {
+                q.push(b as char);
+            } else {
+                q.push_str(&format!("%{b:02X}"));
+            }
+        }
+        self.json("GET", &self.url.project_path(&format!("/access?path={q}")), None::<&()>)
+    }
+
+    pub fn groups(&self) -> Result<Vec<GroupInfo>> {
+        self.json("GET", &self.url.project_path("/groups"), None::<&()>)
+    }
+
+    pub fn group(&self, method: &str, group: &str, what: &str, people: &[String]) -> Result<GroupInfo> {
+        self.json(
+            method,
+            &self.url.project_path(&format!("/groups/{group}{what}")),
+            Some(&GroupChange { people: people.to_vec() }),
+        )
+    }
+
+    pub fn devices(&self, person: &str) -> Result<Devices> {
+        self.json("GET", &format!("/v1/people/{person}/devices"), None::<&()>)
+    }
+
+    pub fn rings(&self) -> Result<Vec<KeyRing>> {
+        let v: Vec<serde_json::Value> = self.json("GET", &self.url.project_path("/rings"), None::<&()>)?;
+        Ok(v.into_iter().filter_map(|r| serde_json::from_value(r).ok()).collect())
+    }
+
+    pub fn post_ring(&self, ring: &KeyRing) -> Result<()> {
+        let _: serde_json::Value = self.json("POST", &self.url.project_path(&format!("/rings/{}", ring.scope)), Some(ring))?;
+        Ok(())
+    }
+}
+
+// ---- pull ---------------------------------------------------------------------------------
+
+/// Is `path` inside the `only` directory, or a directory on the way to it?
+fn in_scope(only: Option<&str>, path: &str) -> bool {
+    let Some(o) = only else { return true };
+    path.is_empty()
+        || path == o
+        || (path.len() > o.len() && path.starts_with(o) && path.as_bytes()[o.len()] == b'/')
+        || (o.len() > path.len() && o.starts_with(path) && o.as_bytes()[path.len()] == b'/')
+}
+
+/// Pull from the server into `repo` as remote `remote`: new snapshots, the
+/// trees and files they reach (within `only`), the key rings, then the
+/// remote tags (with the checks of every pull).
+pub fn pull(repo: &mut Repo, remote: &str, client: &Client, only: Option<&str>) -> Result<SyncReport> {
+    let tips = client
+        .tips()?
+        .ok_or_else(|| anyhow!("no project '{}' that you can see on {}", client.url.project, client.url.authority))?;
+    let mut tx = repo.transaction(format!("pull from {remote}"))?;
+    tx.repository_wide();
+    let store: Arc<ObjectStore> = tx.repo().store().clone();
+    let prefix = format!("{remote}/");
+    let stop: Vec<ObjectId> = tx
+        .view
+        .remote_tags
+        .iter()
+        .filter(|(k, _)| k.starts_with(&prefix))
+        .map(|(_, v)| *v)
+        .filter(|id| store.has(id))
+        .collect();
+    let mut want_tips: Vec<ObjectId> = tips.branches.values().copied().filter(|t| !store.has(t)).collect();
+    want_tips.sort();
+    want_tips.dedup();
+    let mut report = SyncReport::default();
+    let mut incoming = Incoming::new(&store);
+    let mut new_snaps = Vec::new();
+    if !want_tips.is_empty() {
+        for (id, raw) in client.history(want_tips, stop)? {
+            if store.has(&id) {
+                continue;
+            }
+            let Object::Snapshot(s) = Object::decode(&raw)? else {
+                bail!("the server sent a non-snapshot in history");
+            };
+            if s.signature_valid() != Some(true) {
+                report.warnings.push(format!("snapshot {} carries no valid signature", id.short()));
+            }
+            new_snaps.push((id, s.tree));
+            if incoming.put(id, raw, "")? {
+                report.objects_copied += 1;
+            }
+        }
+    }
+    // Trees from the root down, then the files: one request per level.
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    let mut frontier: Vec<(ObjectId, String, ObjectId)> = Vec::new();
+    for (snap, tree) in &new_snaps {
+        if !store.has(tree) && seen.insert(*tree) {
+            frontier.push((*snap, String::new(), *tree));
+        }
+    }
+    while !frontier.is_empty() {
+        let mut by_snap: HashMap<ObjectId, Vec<Want>> = HashMap::new();
+        for (snap, path, id) in frontier.drain(..) {
+            by_snap.entry(snap).or_default().push(Want { path, id });
+        }
+        let mut next = Vec::new();
+        for (snap, wants) in by_snap {
+            for chunk in wants.chunks(20_000) {
+                let got = client.fetch(snap, chunk.to_vec())?;
+                if got.len() != chunk.len() {
+                    bail!("the server sent {} objects for {} asked", got.len(), chunk.len());
+                }
+                for (w, (id, raw)) in chunk.iter().zip(got) {
+                    if id != w.id {
+                        bail!("the server sent another object than asked");
+                    }
+                    let obj = Object::decode(&raw)?;
+                    let mut children = Vec::new();
+                    match &obj {
+                        Object::Tree(t) => {
+                            for e in &t.entries {
+                                let p = if w.path.is_empty() { e.name.clone() } else { format!("{}/{}", w.path, e.name) };
+                                if !in_scope(only, &p) {
+                                    continue;
+                                }
+                                if e.kind == EntryKind::Dir && only.is_some_and(|o| o.len() > p.len()) {
+                                    // A directory on the way to `only`: its tree only.
+                                    children.push((e.id, p));
+                                    continue;
+                                }
+                                children.extend(e.fallback.map(|f| (f, p.clone())));
+                                children.push((e.id, p));
+                            }
+                        }
+                        Object::Conflict(c) => children.extend(c.referenced_ids().into_iter().map(|i| (i, w.path.clone()))),
+                        _ => {}
+                    }
+                    for (cid, p) in children {
+                        if !store.has(&cid) && seen.insert(cid) {
+                            next.push((snap, p, cid));
+                        }
+                    }
+                    if incoming.put(w.id, raw, &w.path)? {
+                        report.objects_copied += 1;
+                    }
+                }
+            }
+        }
+        frontier = next;
+    }
+    report.packs_written = incoming.finish()?;
+    // Key rings of secret scopes: verified and fast-forwarded locally.
+    if client.token.borrow().is_some() {
+        if let Ok(rings) = client.rings() {
+            for ring in rings {
+                if let veil_core::keychain::RingMerge::Rejected(w) = tx.repo().keys().merge_ring(&ring)? {
+                    report.warnings.push(w);
+                }
+            }
+            tx.repo().keys().invalidate();
+        }
+    }
+    let tags: Vec<(String, Tag)> = tips
+        .branches
+        .iter()
+        .map(|(n, id)| {
+            (
+                n.clone(),
+                Tag {
+                    target: *id,
+                    cloak: None,
+                    annotation: None,
+                },
+            )
+        })
+        .collect();
+    apply_remote_tags(&mut tx, remote, tags, None, &mut report)?;
+    tx.commit()?;
+    Ok(report)
+}
+
+// ---- push ---------------------------------------------------------------------------------
+
+/// Append the objects of tree `tree` at `path` that differ from `parents`
+/// (the trees at the same path in the snapshot's parents).
+fn collect_tree(
+    store: &ObjectStore,
+    tree: ObjectId,
+    parents: &[ObjectId],
+    path: &str,
+    seen: &mut HashSet<ObjectId>,
+    out: &mut Vec<(ObjectId, Vec<u8>)>,
+) -> Result<()> {
+    if parents.contains(&tree) || !seen.insert(tree) {
+        return Ok(());
+    }
+    let raw = store.get_raw(&tree)?;
+    let Object::Tree(t) = Object::decode(&raw)? else {
+        out.push((tree, raw));
+        return Ok(());
+    };
+    out.push((tree, raw));
+    let ptrees: Vec<Arc<veil_core::Tree>> = parents.iter().filter_map(|p| store.tree(p).ok()).collect();
+    for e in &t.entries {
+        if ptrees.iter().any(|pt| pt.get(&e.name).is_some_and(|pe| pe.id == e.id)) {
+            continue;
+        }
+        let p = if path.is_empty() { e.name.clone() } else { format!("{path}/{}", e.name) };
+        if e.kind == EntryKind::Dir && matches!(store.get(&e.id), Ok(Object::Tree(_))) {
+            let sub: Vec<ObjectId> = ptrees
+                .iter()
+                .filter_map(|pt| pt.get(&e.name).filter(|pe| pe.kind == EntryKind::Dir).map(|pe| pe.id))
+                .collect();
+            collect_tree(store, e.id, &sub, &p, seen, out)?;
+        } else if seen.insert(e.id) {
+            let raw = store.get_raw(&e.id).with_context(|| format!("reading {p}"))?;
+            if let Ok(Object::Conflict(c)) = Object::decode(&raw) {
+                for r in c.referenced_ids() {
+                    if seen.insert(r) {
+                        out.push((r, store.get_raw(&r)?));
+                    }
+                }
+            }
+            out.push((e.id, raw));
+        }
+        if let Some(fb) = e.fallback {
+            if seen.insert(fb) {
+                out.push((fb, store.get_raw(&fb)?));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub struct PushOutcome {
+    pub moved: Vec<(String, ObjectId)>,
+    pub rejected: Vec<(String, String)>,
+    pub uploaded: usize,
+    pub created: bool,
+}
+
+/// Push local tags (all, or `only_tags`) to the server.
+pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String], force: bool) -> Result<PushOutcome> {
+    let mut created = false;
+    if client.tips()?.is_none() {
+        client.create_project()?;
+        created = true;
+    }
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let view = repo.view().clone();
+        let prefix = format!("{remote}/");
+        let mut updates = Vec::new();
+        for (name, tag) in &view.tags {
+            if !only_tags.is_empty() && !only_tags.contains(name) {
+                continue;
+            }
+            let expected = view.remote_tags.get(&format!("{prefix}{name}")).copied();
+            if expected == Some(tag.target) {
+                continue;
+            }
+            updates.push(BranchUpdate {
+                branch: name.clone(),
+                expected,
+                new: Some(tag.target),
+            });
+        }
+        for t in only_tags {
+            if !view.tags.contains_key(t) {
+                bail!("no tag '{t}' here");
+            }
+        }
+        if updates.is_empty() {
+            return Ok(PushOutcome {
+                moved: vec![],
+                rejected: vec![],
+                uploaded: 0,
+                created,
+            });
+        }
+        // What the server has: everything the remote tags reach.
+        let store = repo.store().clone();
+        let mut known: HashSet<ObjectId> = HashSet::new();
+        let mut stack: Vec<ObjectId> = view
+            .remote_tags
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(_, v)| *v)
+            .collect();
+        stack.push(repo.root_id());
+        while let Some(id) = stack.pop() {
+            if !known.insert(id) {
+                continue;
+            }
+            if let Ok(s) = store.snapshot(&id) {
+                stack.extend(s.parents.iter().copied());
+            }
+        }
+        let mut new = Vec::new();
+        let mut stack: Vec<ObjectId> = updates.iter().filter_map(|u| u.new).collect();
+        let mut seen_snaps = HashSet::new();
+        while let Some(id) = stack.pop() {
+            if known.contains(&id) || !seen_snaps.insert(id) {
+                continue;
+            }
+            let s = store.snapshot(&id)?;
+            stack.extend(s.parents.iter().copied());
+            new.push((id, s));
+        }
+        let mut objects: Vec<(ObjectId, Vec<u8>)> = Vec::new();
+        let mut seen = HashSet::new();
+        for (id, s) in &new {
+            objects.push((*id, store.get_raw(id)?));
+            let parents: Vec<ObjectId> = s.parents.iter().filter_map(|p| store.snapshot(p).ok().map(|ps| ps.tree)).collect();
+            collect_tree(&store, s.tree, &parents, "", &mut seen, &mut objects)?;
+        }
+        let uploaded = objects.len();
+        let mut frames = Vec::new();
+        for (id, raw) in objects {
+            put_frame(&mut frames, &id, &raw);
+            if frames.len() > 8 << 20 {
+                client.upload(std::mem::take(&mut frames))?;
+            }
+        }
+        if !frames.is_empty() {
+            client.upload(frames)?;
+        }
+        // Key rings (secret scopes) first, so new members can open what lands.
+        for ring in repo.keys().rings()? {
+            if let Err(e) = client.post_ring(&ring) {
+                crate::render::warn(&format!("key ring '{}' not sent: {e:#}", ring.scope));
+            }
+        }
+        let Some(result) = client.push(&PushRequest { updates, force })? else {
+            if attempt < 5 {
+                std::thread::sleep(Duration::from_millis(50 * attempt));
+                continue;
+            }
+            bail!("a branch kept moving during the push; pull, then push again");
+        };
+        let mut out = PushOutcome {
+            moved: vec![],
+            rejected: vec![],
+            uploaded,
+            created,
+        };
+        let mut tx = repo.transaction(format!("push to {remote}"))?;
+        tx.repository_wide();
+        let mut missing = false;
+        for r in result.results {
+            match (r.ok, r.tip) {
+                (true, Some(tip)) => {
+                    if tx.repo().store().has(&tip) {
+                        tx.view.remote_tags.insert(format!("{prefix}{}", r.branch), tip);
+                    } else {
+                        missing = true;
+                    }
+                    out.moved.push((r.branch, tip));
+                }
+                (true, None) => {
+                    tx.view.remote_tags.remove(&format!("{prefix}{}", r.branch));
+                }
+                (false, _) => out.rejected.push((r.branch, r.message.unwrap_or_default())),
+            }
+        }
+        tx.commit()?;
+        if missing {
+            pull(repo, remote, client, None)?;
+        }
+        return Ok(out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn urls() {
+        let u = HubUrl::parse("veil://Hub.example:8443/acme").unwrap().unwrap();
+        assert_eq!(u, HubUrl { authority: "hub.example:8443".into(), project: "acme".into() });
+        assert_eq!(HubUrl::parse("https://h/p/").unwrap().unwrap().project, "p");
+        assert!(HubUrl::parse("veil://h/a/b").unwrap().is_err());
+        assert!(HubUrl::parse("veil://user@h/a").unwrap().is_err());
+        assert!(HubUrl::parse("/some/path").is_none());
+        assert!(HubUrl::parse("host:path").is_none());
+    }
+
+    #[test]
+    fn only_scope() {
+        assert!(in_scope(Some("src/api"), ""));
+        assert!(in_scope(Some("src/api"), "src"));
+        assert!(in_scope(Some("src/api"), "src/api/x.rs"));
+        assert!(!in_scope(Some("src/api"), "src/apix"));
+        assert!(!in_scope(Some("src/api"), "docs"));
+    }
+}

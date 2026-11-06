@@ -28,6 +28,8 @@ mod doctor;
 #[cfg(test)]
 mod docgen;
 mod history;
+mod hub;
+mod hub_cmd;
 mod hooks;
 mod mount;
 mod picker;
@@ -135,7 +137,12 @@ fn open(cli: &Cli) -> Result<Ctx> {
 fn run(cli: Cli) -> Result<ExitCode> {
     match &cli.cmd {
         Cmd::Init { path } => cmd_init(path.as_deref()),
-        Cmd::Clone { source, dest } => cmd_clone(source, dest.as_deref()),
+        Cmd::Clone { source, dest, only } => match hub::HubUrl::parse(source) {
+            Some(url) => hub_cmd::clone(&url?, dest.as_deref(), only.as_deref()),
+            None if only.is_some() => bail!("--only works with a Veil server project (veil://host/project)"),
+            None => cmd_clone(source, dest.as_deref()),
+        },
+        Cmd::Login { url, name, ca } => hub_cmd::login(url, name.as_deref(), ca.as_deref()),
         Cmd::Identity(c) => cmd_identity(c),
         Cmd::Fsck { verbose } => cmd_fsck(cli.repository.as_deref(), *verbose),
         Cmd::Doctor { remotes } => doctor::run(cli.repository.as_deref(), *remotes),
@@ -206,6 +213,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
     match &cli.cmd {
         Cmd::Init { .. }
         | Cmd::Clone { .. }
+        | Cmd::Login { .. }
         | Cmd::Identity(_)
         | Cmd::Fsck { .. }
         | Cmd::Doctor { .. }
@@ -505,6 +513,14 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         }
         Cmd::Watch { interval_ms } => cmd_watch(ctx, *interval_ms)?,
         Cmd::Remote(c) => cmd_remote(ctx, c)?,
+        Cmd::Group(c) => hub_cmd::group(ctx, c)?,
+        Cmd::Access { path, who } => hub_cmd::access(ctx, path, who)?,
+        Cmd::Push { remote, tag, force, dry_run: false, delete, .. }
+            if delete.is_empty() && hub_cmd::is_hub_remote(ctx, remote.as_deref().unwrap_or("origin")) =>
+        {
+            return hub_cmd::push(ctx, remote.as_deref().unwrap_or("origin"), tag, *force);
+        }
+        Cmd::Pull { remote, .. } if hub_cmd::is_hub_remote(ctx, remote) => hub_cmd::pull(ctx, remote)?,
         Cmd::Push {
             remote,
             tag,
@@ -670,7 +686,7 @@ fn clone_populate(backend: Arc<dyn StorageBackend>, url: String, shown: String, 
     source_config.check_supported()?;
     let mut repo = Repo::init_for_clone_at(fs.clone(), Some(identity.clone()), &user_for(&identity), source_config.format)?;
     let mut config = repo.config().clone();
-    config.remotes.insert("origin".into(), RemoteConfig { url, public: false });
+    config.remotes.insert("origin".into(), RemoteConfig { url, public: false, only: None });
     repo.save_config(config)?;
     let report = remote::pull(&mut repo, "origin", backend)?;
     for w in &report.warnings {
@@ -2417,7 +2433,14 @@ fn remote_backend(ctx: &Ctx, name: &str) -> Result<(Arc<dyn StorageBackend>, Rem
 fn cmd_remote(ctx: &mut Ctx, c: &RemoteCmd) -> Result<()> {
     match c {
         RemoteCmd::Add { name, url, public } => {
-            if let Some(parsed) = SshUrl::parse(url) {
+            if let Some(parsed) = hub::HubUrl::parse(url) {
+                if parsed?.project.is_empty() {
+                    bail!("a Veil server remote names a project: veil://host[:port]/project");
+                }
+                if *public {
+                    bail!("--public is for path and SSH remotes; on a Veil server, `vl access PATH public` makes folders public");
+                }
+            } else if let Some(parsed) = SshUrl::parse(url) {
                 parsed?;
             }
             remote::add_remote(&mut ctx.repo, name, url, *public)?;

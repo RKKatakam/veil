@@ -57,14 +57,53 @@ pub enum Cmd {
     },
     /// Copy a repository (and every tag you can see) into a new directory.
     ///
-    /// SOURCE is a path, `ssh://[user@]host[:port]/path` or scp-style
-    /// `[user@]host:path` (through your own `ssh`; the server needs only
-    /// SSH with SFTP).
+    /// SOURCE is a Veil server project (`veil://host[:port]/project` or
+    /// `https://host[:port]/project`): you receive only what you may see.
+    /// Today's client also clones a path, `ssh://[user@]host[:port]/path` or
+    /// scp-style `[user@]host:path` (through your own `ssh`).
     Clone {
-        /// Repository to clone: a path or an SSH URL.
+        /// Project or repository to clone: a server URL, a path or an SSH URL.
         source: String,
         /// Directory to clone into (default: the source's last path component).
         dest: Option<PathBuf>,
+        /// From a Veil server: fetch only this directory's files (the server
+        /// sends only that subtree's objects).
+        #[arg(long, value_name = "DIR")]
+        only: Option<String>,
+    },
+    /// Sign in to a Veil server with this device's identity key.
+    ///
+    /// URL is `veil://host[:port]` (a project URL works too). The first
+    /// time, give `--name` to register this device as a new person. A
+    /// session lasts hours and is renewed with the key without asking.
+    Login {
+        /// The server: `veil://host[:port]` or `https://host[:port]`.
+        url: String,
+        /// Register as a new person with this name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Trust this certificate (PEM) for the server: a self-signed one,
+        /// for development.
+        #[arg(long, value_name = "FILE")]
+        ca: Option<PathBuf>,
+    },
+    /// Groups of people on the Veil server (the origin remote's project).
+    #[command(subcommand)]
+    Group(GroupCmd),
+    /// Who may see a path; with WHO, give a group, a person or `public`
+    /// access to it.
+    ///
+    /// `vl access PATH` asks the server who can see PATH and which line of
+    /// the accepted `.veilpolicy` decides. `vl access PATH WHO…` writes that
+    /// line into `.veilpolicy` (replacing the line for the same path); push
+    /// it to apply. Only admins may change access, and the last matching
+    /// line wins. Folder access means read and write; `public` means
+    /// everyone on Earth may read.
+    Access {
+        /// A folder (`billing/`) or file, from the project root.
+        path: String,
+        /// Groups, people, or `public`.
+        who: Vec<String>,
     },
 
     // ---- inspecting -------------------------------------------------------
@@ -927,6 +966,35 @@ pub enum IdentityCmd {
         /// their keys). Leave it out while another device still uses it.
         #[arg(long)]
         revoke_old: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GroupCmd {
+    /// List the groups you are in or manage (admins: every group).
+    List,
+    /// Create a group (admins only).
+    Create {
+        name: String,
+    },
+    /// Add people to a group (admins and the group's managers). An admin
+    /// device also grants them the keys of the project's secrets.
+    Add {
+        group: String,
+        #[arg(required = true)]
+        people: Vec<String>,
+    },
+    /// Remove people from a group (admins and the group's managers).
+    Remove {
+        group: String,
+        #[arg(required = true)]
+        people: Vec<String>,
+    },
+    /// Let people manage a group: add and remove its people (admins only).
+    Manager {
+        group: String,
+        #[arg(required = true)]
+        people: Vec<String>,
     },
 }
 
