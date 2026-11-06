@@ -607,21 +607,24 @@ fn for_each_parallel<T: Sync>(
         return items.iter().try_for_each(f);
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
+    let work = || loop {
+        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match items.get(i) {
+            Some(item) => f(item)?,
+            None => return Ok(()),
+        }
+    };
     std::thread::scope(|scope| {
-        let handles = (0..workers)
-            .map(|_| {
-                std::thread::Builder::new().stack_size(64 << 10).spawn_scoped(scope, || loop {
-                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    match items.get(i) {
-                        Some(item) => f(item)?,
-                        None => return Ok(()),
-                    }
-                })
-            })
-            .collect::<io::Result<Vec<_>>>()?;
+        // As many workers as the system gives (a container may cap
+        // threads); this thread works too.
+        let handles: Vec<_> = (1..workers)
+            .map_while(|_| std::thread::Builder::new().stack_size(64 << 10).spawn_scoped(scope, work).ok())
+            .collect();
+        let mine = work();
         handles
             .into_iter()
-            .try_for_each(|h| h.join().unwrap_or_else(|_| Err(io::Error::other("sync worker panicked"))))
+            .map(|h| h.join().unwrap_or_else(|_| Err(io::Error::other("sync worker panicked"))))
+            .fold(mine, |acc, r| acc.and(r))
     })
 }
 

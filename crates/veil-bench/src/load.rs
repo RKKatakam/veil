@@ -206,7 +206,7 @@ fn root_snapshot_id() -> ObjectId {
 
 /// What one agent holds of one project.
 #[derive(Default)]
-struct Clone {
+struct Held {
     /// `main` as this agent last saw it, and its root tree.
     tip: Option<(ObjectId, ObjectId)>,
     have: HashSet<ObjectId>,
@@ -256,7 +256,7 @@ struct Agent<'a> {
     project: String,
     /// This agent's directory, `w/gNN/aNNNN`.
     dir: Vec<String>,
-    clone: Clone,
+    clone: Held,
     files: u64,
     c: &'a Counters,
 }
@@ -726,7 +726,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
                         identity: cx.agent,
                         project: name.clone(),
                         dir: vec!["w".into(), format!("g{:02}", (i / projects) / 32), format!("a{:04}", i / projects)],
-                        clone: Clone::default(),
+                        clone: Held::default(),
                         files: 0,
                         c,
                     },
@@ -784,7 +784,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
                         identity: cx.agent,
                         project: name.clone(),
                         dir: vec!["w".into(), "bg".into(), format!("p{p}")],
-                        clone: Clone::default(),
+                        clone: Held::default(),
                         files: 0,
                         c: bg,
                     },

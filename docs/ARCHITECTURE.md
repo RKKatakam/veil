@@ -79,7 +79,10 @@ must not be trusted (which disables stat caching):
   fsync of the directory; see §9) and never follows a symlink. Checkout
   instead stages each file (`write_staged`: a temp file beside it,
   unsynced), makes them all durable with one barrier, renames them into
-  place, and makes the names durable with a second (BUG-818). A link is a
+  place, and makes the names durable with a second (BUG-818). Files are
+  read and staged on up to 16 threads, and renamed into place on as many;
+  a barrier fsyncs on up to 256 threads, so that ext4 commits them in a
+  few journal transactions (performance round 2). A link is a
   leaf of its own: `NodeKind::Symlink` in `metadata` and listings, its
   target from `read_link`, created atomically by `write_link` (`symlinkat`
   to a temp name, `renameat`); `read` never reads through one. A path below
@@ -3058,9 +3061,12 @@ only make a walk longer. The index is a device-local cache in
 - **Never required:** an entry not on disk is computed from the store on
   first use and persisted at the next commit (or once 256 have
   accumulated). A damaged or unreadable index is dropped and computed again.
-- **Concurrency:** layers are created with `create_new`, one slot each, and
+- **Concurrency:** layers are created with `create_new_unsynced` (as
+  exclusive as `create_new`, and never synced: a cache), one slot each, and
   merged geometrically (what the rule merges in several steps is written
-  as one layer); concurrent appenders never overwrite one another.
+  as one layer); concurrent appenders never overwrite one another. A layer
+  a power loss tore (missing, empty, half written) fails its checksum and
+  the index is rebuilt (`crash::a_power_loss_tears_history_index_layers_and_they_are_rebuilt`).
   Remotes (bare repositories, SFTP) compute it in memory only.
 - **A parent that arrives later** (the fix of a released embargo, pulled
   into a public clone) could carry a larger generation than its indexed
