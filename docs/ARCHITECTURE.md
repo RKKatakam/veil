@@ -1,6 +1,31 @@
 # Veil architecture
 
-> **Visibility model:** `docs/VISIBILITY.md` is the source of truth for who can see what (private by default, groups and admins, per-folder access, `public` for everyone; secrets encrypted automatically; decided 2026-11-05). This document still describes the earlier model, where cloaking was the way to keep code private, until stream V lands. Where they disagree, VISIBILITY.md wins.
+> **Sources of truth:** `docs/OVERVIEW.md` (what Veil is) and `docs/VISIBILITY.md` (who can see what). The server's design is `docs/HUB.md`. Where this document disagrees with them, they win.
+
+**What Veil is.** Veil is a server-centric version control system. The `vl`
+client is always connected to the Veil server (the Hub), which stores every
+project and enforces every permission. It is not Git and not offline-first.
+
+**Goals:**
+* **The ordinary permission model:** the creator is the admin; everything
+  is private by default; admins create groups, choose group managers and
+  give groups or people access to folders; `public` folders are visible to
+  everyone on Earth. The server enforces it on every request.
+* **Code is plain text on the server.** Only secrets (`.env`, keys) and
+  embargoed changes are encrypted, and personal private keys never leave
+  the machine.
+* **Agents at scale**, on the Scion design (`docs/HUB.md` §9).
+* **History you can rewrite and undo:** change ids, auto-snapshots, an
+  undoable op log, workspaces and sandboxes.
+
+**What this document describes.** The built **client engine**: the layers
+below, the op log, packs, the history index, gc, embargoes, the secret
+scanner, workspaces. The server is built next (`docs/HUB.md`). Until then,
+today's client restricts paths by encrypting them for a *scope* (cloaking,
+§3–§4) and syncs with path and SFTP remotes (§1, §8). Those parts are
+described as built facts; the server replaces them (folder access instead
+of cloaking, the server instead of plain-file remotes), and the
+simplification pass removes them.
 
 Veil is built as a stack of small layers. Each layer only depends on the ones
 below it, and nothing above the VFS layer knows a disk exists.
@@ -85,7 +110,8 @@ must not be trusted (which disables stat caching):
   layer. Ancestor whiteouts hide whole subtrees. A file in the way of a
   directory is an error, exactly as on the other backends; it is never
   whited out implicitly.
-* **SftpBackend** (`vfs/sftp*.rs`) is a repository on another machine,
+* **SftpBackend** (`vfs/sftp*.rs`; today's client, removed in the
+  simplification pass) is a repository on another machine,
   reached through the user's own `ssh` (`ssh … -s -- host sftp`, as
   `sftp(1)` runs it; `VEIL_SSH` replaces the command), so `~/.ssh/config`,
   the agent, `known_hosts` and ProxyJump just work and the server needs only
@@ -218,6 +244,11 @@ trade-off convergent-encryption backups make. Descriptions, sealed keys and
 the vault use XChaCha20-Poly1305 with random nonces.
 
 ## 3. Identities, scopes and the keychain
+
+> Today's client, before the server. With the server, access to folders is
+> the server's permission model (`docs/VISIBILITY.md`); scopes, key rings and
+> HPKE wraps remain the mechanism for **secrets and embargoes** only
+> (`docs/HUB.md` §6, §8). Device identities stay.
 
 ### Identities
 
@@ -500,6 +531,12 @@ one **immutable record per write**.
   operations whose message says how to reverse them by hand.
 
 ## 4. Visibility policy, and where it is enforced
+
+> Today's client, before the server. The secret rules, the scanner,
+> quarantine and the accepted-policy pin carry over. Cloaking a path for a
+> scope is replaced by folder access on the server, and secrets (today
+> `isolate`d, kept on the device) are encrypted and synced by folder access
+> (`docs/VISIBILITY.md`, `docs/HUB.md` §5–§6).
 
 | Tier | In the snapshot graph? | Synced to team remote | Synced to public remote |
 |---|---|---|---|
@@ -2201,7 +2238,7 @@ rebased with it and the result is still withheld. The refusals name the
 change and the embargo only. `vl resolve` picks among versions already in
 the change, so it needs no check of its own.
 
-**Embargoes never overlap (1.0).** At most one unreleased embargo per line:
+**Embargoes never overlap.** At most one unreleased embargo per line:
 
 * `vl merge --embargo` is refused if the line it merges into, or any line it
   merges in, already carries an unreleased embargo: its tree is a wrapper of
@@ -2253,6 +2290,14 @@ readable by anyone else must not be part of it:
   release (see step 5).
 
 ## 8. Synchronisation
+
+> **With the server**, `vl` pushes and pulls only through the Veil server,
+> which checks permissions and sends each person only what they may see
+> (`docs/HUB.md` §4). What follows is **today's** sync between two
+> repositories (a path or SFTP remote, public or team). Its object walk,
+> embargo withholding, two-phase push and validation are what the server
+> reuses; plain-file remotes themselves are removed in the simplification
+> pass.
 
 `remote::push` and `remote::pull` work between any two backends. Filtering
 happens *during the object walk*: a public remote never receives sealed
@@ -2906,7 +2951,7 @@ pack-<sum>.idx    "VEILIDX1" | count u32 | fanout[256] u32 | ids[count] (sorted)
 * **Decompression limits** (BUG-490). A pack may come from a hostile
   remote, and a few KiB of zstd RLE blocks decode to gigabytes. An entry
   declaring more than 4 GiB (`VEIL_MAX_OBJECT`, e.g. `8G`; the SFTP
-  read ceiling and the Hub's object limit) is refused before anything is
+  read ceiling and the server's planned object limit) is refused before anything is
   decoded, and an index of more than 2^25 entries is refused. A frame must
   declare exactly the entry's size, and decoding stops (in both decoders,
   libzstd and `ruzstd`) as soon as it would produce more, or a second
@@ -3036,7 +3081,7 @@ Pruning:
    then raises it and waits up to 60 s for the rest (new transactions wait
    for it), and otherwise deletes nothing that run and says so. With the
    fence raised it also takes `.veil/lock` (BUG-814): writers that hold it
-   instead of registering (a push over SSH into a bare hub collected with
+   instead of registering (a push over SSH into a bare remote collected with
    `vl -R`, any transaction over a network backend) are then finished or
    not started; if it stays held, nothing is deleted that run. Under the
    fence it reads its roots again and marks what they reach (what was
@@ -3296,8 +3341,8 @@ and so does any lock file this instance did not write: an unreadable one
 process copied along with the repository (native vl checks its pid). Each
 fails with `Locked` naming the holder; removing `.veil/lock` by hand is the
 remedy.
-Single-writer use, and in-memory repositories, never meet it. A Hub web
-client that shares storage between tabs needs a lock built on the
+Single-writer use, and in-memory repositories, never meet it. The server's web
+client, if it shares storage between tabs needs a lock built on the
 platform's own (Web Locks API) behind `StorageBackend::create_new`.
 
 **Packs without zstd.** The loose object format always was the
@@ -3649,19 +3694,28 @@ afterwards; textconv input on stdin, output never stored.
 
 **Trust boundary.** Every security finding must name an attacker outside this boundary, what that attacker controls, and the concrete harm. A finding that needs something inside the boundary to be hostile is out of scope: it is recorded as such, not fixed.
 
+**With the server** (the design, `docs/HUB.md` §3; the boundary the server is built to):
+
 *Trusted:*
 
-* the member's device and OS account. Anyone who can run commands as the member, read their process memory or replace the `vl` binary already holds their keys;
-* the member's identity and key files on that device. Protecting them at rest (a passphrase or the keychain) is a backlog item, not a bug;
-* the member's own deliberate commands, including `vl expose`, `public!`, `--force`, `--no-verify` and their own edits to `.veilpolicy`. Veil warns but obeys;
+* **the Veil server, with plain-text code,** branch tips, group and admin records, folder access and metadata. It enforces every permission. Someone who breaks into it reads the code; that is accepted (`docs/OVERVIEW.md`, non-goals);
+* each person's device and OS account, and the identity and key files on it. Anyone who can run commands as the person, read their process memory or replace the `vl` binary already holds their keys. Protecting key files at rest is a backlog item, not a bug;
+* each person's own deliberate commands, including `public!`, `--force`, `--no-verify` and their own edits to `.veilpolicy` (the server still checks who may change access). Veil warns but obeys;
 * the OS, the file system, and the toolchain and dependencies `vl` was built with.
 
 *Not trusted:*
 
-* remotes and their operators (an SFTP server, the future Hub). They see everything they store, and may withhold, replay, reorder or fork it;
-* anything that arrives by pull, fetch or merge: trees, labels, policies, hooks, names, descriptions and metadata;
-* teammates beyond their own scopes, and revoked members after their revocation;
-* other OS users on the same machine.
+* **the server, with secrets and embargoed changes before release.** It stores only their ciphertext and never holds a key that opens them. Personal private keys never reach it;
+* people outside a folder's access, including others in the same project, and members after they are removed;
+* anything that arrives by push, pull, fetch or merge: trees, names, descriptions, policies, hooks and metadata;
+* the network, and other OS users on the same machine.
+
+**Today's client** (before the server) syncs with plain-file remotes, so for now:
+
+* remotes and their operators (a path remote, an SFTP server) are **not** trusted. They see everything they store, and may withhold, replay, reorder or fork it;
+* teammates beyond their own scopes, and revoked members after their revocation, are not trusted.
+
+The lists below describe what today's client protects, and what not.
 
 **Protected against:**
 
@@ -3717,8 +3771,9 @@ afterwards; textconv input on stdin, output never stored.
 
 **Not protected against (yet), and documented honestly:**
 
-* *File names, sizes and tree shape* of cloaked files are visible. The object
-  format can already seal trees; the policy hook for that is still to come.
+* *File names, sizes and tree shape* of cloaked files are visible to anyone
+  who can read the repository. With the server, people without access to a
+  folder don't receive its names at all (HUB.md §5.4).
 * *Equality leakage* from deterministic sealing (see §2).
 * *Revocation is forward-only.* A revoked member keeps every key up to the
   revocation, and with it all history sealed before it (including unchanged
@@ -3789,7 +3844,7 @@ afterwards; textconv input on stdin, output never stored.
   embargo record and the wrapper do not name files, and the wrapper lists
   no id an outsider can map to a path (BUG-104), and the record carries no description (the field is
   always empty). (Overlapping embargoes, which used to reveal one
-  another's files, are refused in 1.0, §7.)
+  another's files, are refused, §7.)
 * *History withheld by an embargo* is computed from the local graph. If the
   embargoed merge is undone or abandoned before a push, nothing protects
   the fix branch any more; it is then an ordinary change.
@@ -3811,14 +3866,12 @@ afterwards; textconv input on stdin, output never stored.
 
 ## Limitations and roadmap
 
-* Network transport: remotes are paths or SSH remotes (`SftpBackend`, §1,
-  §8); no smart server protocol (have/want negotiation, server-side
-  packing) is planned for 1.0; the post-1.0 protocol is designed in
-  [HUB.md §4](HUB.md#4-the-smart-sync-protocol). Remote packs accumulate, one per push, and a
-  pull reads every index, so consolidating small remote packs (by the
-  pushing client, which holds their objects) is next. A plain push does not
-  notice content a remote lacks below snapshots it already has
-  (`vl push --full` fills it).
+* **The server is next** ([HUB.md](HUB.md)): its sync protocol (§4) replaces
+  today's path and SSH remotes (`SftpBackend`, §1, §8), which the
+  simplification pass then removes. Until then: remote packs accumulate,
+  one per push, and a pull reads every index; a plain push does not notice
+  content a remote lacks below snapshots it already has (`vl push --full`
+  fills it).
 * Performance: recording checked-out files
   in the stat cache (needs a backend write that returns the stat of the
   file it wrote). `gc` always rewrites everything it keeps, into packs of
@@ -3827,10 +3880,9 @@ afterwards; textconv input on stdin, output never stored.
   and pull still hold a few table entries per object of the store (the
   inventory, the reachability set), so their memory still grows with the
   number of objects, though no longer with their size.
-* Sealed directory nodes for cloaked paths, to hide their names (embargoes
-  already seal their trees, §7); a "require signed snapshots" policy;
-  pinning a ring head out of band; automatic re-application of concurrent
-  ring changes.
+* With the server, people without access to a folder receive neither its
+  files nor their names (a per-viewer projection, [HUB.md](HUB.md) §5.4).
+  A "require signed snapshots" policy.
 * Conflicts (format 4): parsing back partly edited copies of conflicts of
   more than two sides (today any edit of such a copy resolves it as the
   file is), hunk-level rendering of many-sided conflicts, directory

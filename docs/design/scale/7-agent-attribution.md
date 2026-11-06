@@ -1,6 +1,6 @@
 # 7. Agent attribution
 
-Status: design and threat review (Scion 4.6). **Requires format 6:** a new snapshot field. `Snapshot` is decoded without `deny_unknown_fields`, so an older vl would silently drop the field when it rewrites a snapshot (`FORMAT.md` §4 rule 1), and its signature would no longer verify.
+Status: design and threat review, **not built** (Scion 4.6). It is built with the server's agent work (`docs/design/scion-for-developers.md`, phase 2). Where this document seals text "for a scope" or "for a cloaked line", it describes today's client; on the server, see "Sealing" below. **Requires format 6:** a new snapshot field. `Snapshot` is decoded without `deny_unknown_fields`, so an older vl would silently drop the field when it rewrites a snapshot (`FORMAT.md` §4 rule 1), and its signature would no longer verify.
 
 ## Design sketch
 
@@ -22,7 +22,7 @@ pub struct Attribution {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<Text>,       // a task id or title; Plain or Sealed (as `description`)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt: Option<Text>,     // a prompt reference (URL, transcript id, digest); sealed by default
+    pub prompt: Option<Text>,     // a prompt reference (URL, transcript id, digest); Plain or Sealed (as `description`)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<String>,      // harness run or session id; [A-Za-z0-9._:-], ≤ 64
 }
@@ -45,11 +45,9 @@ pub struct Attribution {
 
 ### Sealing
 
-- **`task` and `prompt` use exactly the description's scope:** `embargo::description_scope(store, tree, cloak)`, as `Transaction::new_change` does. On a cloaked line they are sealed for the cloak's scope; under an unreleased embargo, for the embargo key.
-- **`prompt` on a public change** is sealed for the **attribution scope**, set per device with `vl agent config --prompt-scope S` (`.veil/local/attribution.json`) or `VEIL_AGENT_PROMPT_SCOPE`.
-  - With none configured, the prompt reference is **not put in the snapshot**. It goes to a device-local side record, `.veil/local/attribution/<snapshot id>` (sealed under `local`, 0600), and the first time `vl` prints "prompt references stay on this device; set `vl agent config --prompt-scope <scope>` to share them with a scope".
-  - `--prompt-public` stores it plaintext, for open-source projects whose prompts are public.
-- **`task` on a public change** is plaintext by default, like a public description; `--task-sealed` seals it for the attribution scope.
+- **`task` and `prompt` follow the description:** `embargo::description_scope(store, tree, cloak)`, as `Transaction::new_change` does. On the server, that means plain text, visible to exactly the people who can see the change (`docs/VISIBILITY.md`); under an unreleased embargo, sealed with the embargo key.
+- **Prompt references can stay on the device.** With `--prompt-local` (or by device setting, `.veil/local/attribution.json`), the prompt reference is **not put in the snapshot**. It goes to a device-local side record, `.veil/local/attribution/<snapshot id>` (0600).
+- In today's client, which still restricts paths by cloaking, `task` and `prompt` on a cloaked line are sealed for the cloak's scope, exactly as the description is.
 
 ### Signatures
 
@@ -71,16 +69,16 @@ pub struct Attribution {
 
 ## Threat review
 
-1. **The prompt or task reaches a public remote in plaintext.**
-   - *Invariant:* a sealed attribution `Text` is never plaintext outside its scope. Remotes receive the snapshot with the envelope, as for descriptions.
-   - *Test:* a property test (extend `adversarial7` rewrites): random histories with agent-stamped changes on public, cloaked and embargoed lines are pushed to a public remote. Grep every decoded object for each task and prompt string: none outside readers of the scope.
+1. **The prompt or task reaches people who can't see the change.**
+   - *Invariant:* `task` and `prompt` reach exactly the people who can see the change, as its description does.
+   - *Test:* a property test (extend `adversarial7` rewrites): random histories with agent-stamped changes on public, private and embargoed lines. Grep everything a person without access receives for each task and prompt string: none.
 2. **Leaking through a task title on an embargoed line** (the BUG-016 class: "embargo messages published in plaintext before release").
    - *Invariant:* `task` and `prompt` are sealed exactly when and as the description is (`description_scope`).
-   - *Test:* an embargoed fix made by an agent with the task "fix CVE-2026-1234 in auth". The public remote holds no "CVE-2026-1234" before release, and do after (for `task`).
+   - *Test:* an embargoed fix made by an agent with the task "fix CVE-2026-1234 in auth". Nobody outside the embargo's groups receives "CVE-2026-1234" before release; everyone with access does after (for `task`).
 3. **Spoofing or stripping from inside the sandbox.** The command sets `VEIL_AGENT`, writes a file that looks like attribution, or runs `vl describe`.
    - *Invariant:* attribution comes only from the recording `vl` process's own arguments and environment; a command inside `ws exec` cannot reach the repository (`find_root` refuses `.veil/` and the ceiling is set).
    - *Test:* a sandbox command that exports `VEIL_AGENT=evil`, writes `.veil-agent` and runs `vl describe` (which fails). The recorded snapshot's attribution is the harness's.
-4. **Hostile attribution from a remote.** ANSI escapes (`\x1b]8;;…`, `\x1b[2J`), overlong fields, or invalid UTF-8 in `agent` or `run` corrupt the terminal and logs.
+4. **Hostile attribution in a pulled snapshot.** ANSI escapes (`\x1b]8;;…`, `\x1b[2J`), overlong fields, or invalid UTF-8 in `agent` or `run` corrupt the terminal and logs.
    - *Invariant:* `Attribution::validate` refuses them at decode (the snapshot is `Corrupt`, as for hostile tree names); rendering escapes anything unprintable in opened `Text` too.
    - *Test:* `hostile_objects.rs`: a pulled snapshot with each hostile value. The pull skips it with a warning, and `vl log` output contains no escape byte.
 5. **Signatures and format.**
@@ -90,7 +88,7 @@ pub struct Attribution {
    - *Invariant:* every rewrite keeps the attribution unless the user changes it; squash keeps the destination's and the evolution log keeps the rest.
    - *Test:* a property test of rebase, squash, split, duplicate and auto-rebase on attributed changes: the field equals the expected one after each.
 7. **The device-local prompt record.**
-   - *Invariant:* `.veil/local/attribution/` is 0700, its files 0600 and sealed under `local`; it is never synced and never in a sandbox.
+   - *Invariant:* `.veil/local/attribution/` is 0700, its files 0600; it is never synced and never in a sandbox.
    - *Test:* permissions and `vl push` contents.
 8. **Size abuse.** A 4 GiB prompt reference.
    - *Invariant:* 4 KiB cap on the opened text, enforced when stamping and when decoding.
@@ -99,7 +97,7 @@ pub struct Attribution {
    - *Invariant:* glob only (no regex), length capped, with the same error path as other revset functions.
    - *Test:* the `adversarial_fuzz.rs` revset fuzzer gains `agent(…)`.
 10. **Interactions:**
-    - **the team vault:** none;
+    - **secrets:** none;
     - **the history index:** not indexed (`agent()` reads snapshots; it is a filtered walk, exempt from the gate like `log -S`);
     - **mounts and sandboxes:** the flags are stored in device-local state only.
 
@@ -107,8 +105,8 @@ pub struct Attribution {
 ## Open decisions
 
 1. **Agent sub-keys:** an identity-signed delegation for an agent's own Ed25519 key, so that snapshots are signed by the agent and the member's grant can be revoked.
-   - *Recommendation:* defer to the Hub (Scion 4.5 needs per-agent credentials anyway). This round, the member's signature covers the claim.
+   - *Recommendation:* no. An agent acts with its person's device identity, and nobody makes new keys for agents (`docs/VISIBILITY.md`). The person's signature covers the claim.
 2. **A new signing context for attributed snapshots.**
    - *Recommendation:* no (the argument above); the crypto reviewer confirms it in `CRYPTO.md`.
-4. **The default for prompts without an attribution scope.**
-   - *Recommendation:* the device-local side record (above), not a `local`-sealed envelope inside the snapshot: ciphertext nobody else can open would only leak its length.
+4. **The default for prompt references.**
+   - *Recommendation:* in the snapshot, visible to whoever can see the change; `--prompt-local` for the device-local side record (above), not an envelope inside the snapshot that nobody else can open (it would only leak its length).

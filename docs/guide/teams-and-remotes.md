@@ -1,8 +1,10 @@
 # Teams and remotes
 
-A Veil **remote** is another Veil repository: a directory (local disk, a
-mounted share) or a directory on any machine you can `ssh` to. The server
-needs SSH with its SFTP subsystem and nothing else: no `vl`, no daemon.
+> Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)). With the server, `vl` pushes and pulls only through the Veil server, which sends each person only what they may see; path and SSH remotes are removed in the simplification pass.
+
+In today's client, a Veil **remote** is another Veil repository: a directory
+(local disk, a mounted share) or a directory on a machine you can `ssh` to,
+reached over SFTP.
 
 1. [Adding remotes](#adding-remotes)
 2. [Team remotes and public remotes](#team-remotes-and-public-remotes)

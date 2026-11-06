@@ -4,6 +4,13 @@ This guide is for people who **use** Veil (`vl`) day to day. Design notes for
 developers and reviewers are in [`docs/ARCHITECTURE.md`](../ARCHITECTURE.md),
 [`docs/FORMAT.md`](../FORMAT.md) and [`docs/CRYPTO.md`](../CRYPTO.md).
 
+**Veil is server-centric** ([OVERVIEW.md](../OVERVIEW.md)): the `vl` client
+is always connected to the Veil server, which stores the code and enforces
+who can see what ([VISIBILITY.md](../VISIBILITY.md)). The server is built
+next. **These pages document today's client, before the server.** Where a
+page shows cloaking, scopes or SSH and path remotes, that changes when the
+server lands.
+
 Every example here was run with the `vl` it documents. Output is real,
 trimmed where marked (`…`); some paths and host names were shortened
 (`/home/alice`, `build.example.com`). Your ids, keys and times will differ.
@@ -14,7 +21,7 @@ trimmed where marked (`…`); some paths and host names were shortened
 | 2. [Secrets and visibility](secrets-and-visibility.md) | You want to know what is protected, how, and what is not |
 | 3. [Embargoes](embargoes.md) | You are fixing a security issue that must stay private until release |
 | 4. [Workspaces and agents](workspaces-and-agents.md) | You want several lines of work at once, or run tools and AI agents in sandboxes |
-| 5. [Teams and remotes](teams-and-remotes.md) | You share a repository with teammates, over a path or SSH |
+| 5. [Teams and remotes](teams-and-remotes.md) | You share a repository with teammates today, before the server |
 | 6. [Maintenance](maintenance.md) | Housekeeping: `gc`, `fsck`, `doctor`, `upgrade`, backups, recovery |
 | 7. [Troubleshooting and FAQ](troubleshooting.md) | A command printed a warning or an error you want explained |
 | 8. [Scripting with `--json`](scripting.md) | An editor, CI job, agent or script needs `vl`'s output as data |
@@ -41,10 +48,15 @@ vl undo                          # step back through the operation log (`vl redo
 * There is **no staging area**. Every `vl` command first records the files on
   disk as a snapshot of the current change, `@`.
 * **Secrets are handled by the engine.** `.env`, keys and similar files are
-  never recorded, and a public file that contains a credential is
-  quarantined (kept out of history) with a warning.
-* **Cloaked paths** are encrypted for a *scope* (a group of people), inside
-  the same repository. Public remotes never receive them.
+  never recorded as plain files, and a public file that contains a
+  credential is quarantined (kept out of history) with a warning.
+* **Who can see what** is the ordinary model ([VISIBILITY.md](../VISIBILITY.md)):
+  the creator is the admin, everything is private by default, admins give
+  groups or people access to folders, and `public` folders are visible to
+  everyone. Veil is server-centric ([OVERVIEW.md](../OVERVIEW.md)): the
+  server enforces this. Today's client, before the server, restricts paths
+  by encrypting them for a *scope* (`vl cloak`); this changes when the
+  server lands.
 * **Tags** are Veil's branches. They follow rewrites of the change they
   point at, and move forward on `vl commit`, `vl merge` and pulls; nothing
   else moves them.

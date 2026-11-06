@@ -19,7 +19,7 @@ There is one **repository format**, a number in `.veil/repo.json`:
 | 3 | 1.0.0 | standard cryptography: AES-SIV sealed objects (`veil:sea2`), HPKE-wrapped ring keys (ring format 3); see [CRYPTO.md](CRYPTO.md) |
 | 4 | 1.0.0 | first-class conflicts: conflict objects (`veil:conf`, §3.6) and conflict entries in binary trees (flag bit 6) |
 | 5 | 1.0.0 | symlink tree entries (flag bit 7 and a kind byte, §3.7) and conflict terms (§3.6), annotated tags (`veil:atag`, §3.8; `Tag.annotation`) |
-| 6 | 1.1.0 | the lock-free op log: heads in `.veil/op_heads/` instead of `.veil/op_head`, operations gain `workspace` and `rewritten` (§2, §5 "Format 6"). Unreleased: streams A (snapshot attribution) and C (partial clones) extend it before the release |
+| 6 | 1.1.0 | the lock-free op log: heads in `.veil/op_heads/` instead of `.veil/op_head`, operations gain `workspace` and `rewritten` (§2, §5 "Format 6"). Not yet built: snapshot attribution (`Snapshot.agent`) and the `partial` marker for fetch on demand (`docs/design/scale/PLAN.md` §1) |
 
 * `vl init` writes the newest format (`repo::REPO_FORMAT`). `vl clone` takes
   the format of its source, so that what the clone writes can be pushed

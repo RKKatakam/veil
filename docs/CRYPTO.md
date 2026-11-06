@@ -7,6 +7,17 @@ it does not. It is written for a security reviewer. The architecture is in
 embargoes, threat model), and the on-disk encodings are in
 [FORMAT.md](FORMAT.md).
 
+**What encryption is for.** Veil is server-centric
+([OVERVIEW.md](OVERVIEW.md)): code is plain text on the Veil server, which
+enforces who can see what ([VISIBILITY.md](VISIBILITY.md)). **Encryption is
+for secrets (`.env`, keys) and embargoed changes only;** personal private
+keys never leave the machine. Code is not encrypted, and there is no plan to
+encrypt it. Today's client, before the server, also seals *cloaked* paths
+with these constructions (C1 under a scope key); that is built and is
+described here as a fact. With the server, cloaked paths become private
+folders, and the same constructions protect secrets and embargoes
+([HUB.md](HUB.md) §6, §8).
+
 Code map:
 
 | file | what |

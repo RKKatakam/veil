@@ -2,20 +2,26 @@
 
 # Veil (`vl`)
 
-**Snapshot-first version control with per-file cloaking, engine-level secret
-protection, virtual workspaces, and a storage engine that never needs a disk.**
+**Server-centric version control for teams and AI agents at scale.** The
+`vl` client is always connected to the Veil server (the Hub), which stores
+every project and decides who can see what. Veil is not Git and not
+offline-first. Start with [what Veil is](docs/OVERVIEW.md) and
+[who can see what](docs/VISIBILITY.md).
 
-Git assumes every byte is public, every branch is a mutable pointer, and the
-working tree *is* the host filesystem. Veil drops all three assumptions:
-
-| Git pain | Veil |
+| | Veil |
 |---|---|
-| `.env` leaks when `.gitignore` is wrong | `.env`, `*.pem`, SSH keys… are **isolated by the engine**; every public file is secret-scanned and **quarantined** on a hit |
-| Private files need separate repos or submodules | **Cloaked** paths are encrypted per scope inside one repo; public remotes never receive them |
-| Security fixes leak the moment they're merged | **Embargoed merges**: outsiders see the pre-merge tree, and none of the fix's history, until release |
-| `git add` / index / detached HEAD | Every command **auto-snapshots** the working copy; stable **change ids**; undoable **op log** |
-| Worktrees lock directories hostage | **Virtual workspaces** live in the DAG; agents get **in-memory overlays** in microseconds |
-| Tied to the OS filesystem | Engine runs on any `StorageBackend`: disk, memory, overlay, SFTP |
+| Access | The creator is the **admin**; everything is **private** by default; admins create **groups**, choose group **managers** and give groups or people access to folders (`vl access billing/ finance`); **`public`** folders are visible to everyone on Earth |
+| Secrets | `.env`, keys and the like are **encrypted automatically** and follow the same folder access; every other file is secret-scanned and **quarantined** on a hit; **personal private keys** never leave the machine |
+| Security fixes | **Embargoes**: a fix goes to chosen groups now and becomes public later; outsiders see none of it until release |
+| Everyday work | Every command **auto-snapshots** the working copy; stable **change ids**; an undoable **op log** |
+| Agents | **Virtual workspaces** and in-memory sandboxes; an agent sees what its person sees, with the same secrets |
+| Scale | The Scion design: lock-free commits, an atomic branch move, fetch on demand, server-side merges, history and search, batched landings |
+
+**Today:** the client engine is built; the server and the permission model
+are built next, together ([OVERVIEW.md](docs/OVERVIEW.md), "What exists
+today, and what's next"). Until then, `vl` restricts paths by encrypting
+them (`vl cloak`) and syncs through path or SSH remotes; that changes when
+the server lands.
 
 ## Documentation
 
@@ -26,13 +32,14 @@ working tree *is* the host filesystem. Veil drops all three assumptions:
   [troubleshooting](docs/guide/troubleshooting.md).
 * **[Command reference](docs/reference/README.md)**, generated from the CLI
   (also `vl <command> --help` and `vl man`).
-* Design, for developers and reviewers: [architecture and threat model](docs/ARCHITECTURE.md),
-  [formats](docs/FORMAT.md), [cryptography](docs/CRYPTO.md), [releasing](docs/RELEASING.md),
-  and the post-1.0 [Veil Hub design](docs/HUB.md).
+* Design, for developers and reviewers: [what Veil is](docs/OVERVIEW.md),
+  [who can see what](docs/VISIBILITY.md), the [Veil server (Hub) design](docs/HUB.md),
+  [architecture and threat model](docs/ARCHITECTURE.md), [formats](docs/FORMAT.md),
+  [cryptography](docs/CRYPTO.md), [releasing](docs/RELEASING.md).
 
 ## Install
 
-Veil 1.0 supports **Linux and macOS**, on x86_64 and aarch64 (Apple
+Veil supports **Linux and macOS**, on x86_64 and aarch64 (Apple
 silicon). Windows is not supported.
 
 ### From a release
@@ -135,6 +142,8 @@ Maintainers: [docs/RELEASING.md](docs/RELEASING.md) explains how releases are cu
 
 ## Quick start
 
+> Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](docs/OVERVIEW.md) and [VISIBILITY.md](docs/VISIBILITY.md)).
+
 ```sh
 cd my-project
 vl init                        # creates .veil/, a default .veilpolicy, your identity and a `team` scope
@@ -157,6 +166,8 @@ Change ids (`syplqsok`, letters k–z) are stable across rewrites; snapshot ids
 (`814bccc1`, hex) are BLAKE3 content addresses. `✓` marks a good signature.
 
 ## A tour
+
+> Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](docs/OVERVIEW.md) and [VISIBILITY.md](docs/VISIBILITY.md)). Cloaking, scopes and SSH remotes are replaced by folder access and the server.
 
 ```sh
 # Secrets: nothing to configure.
@@ -186,7 +197,7 @@ vl push mirror        # same snapshot ids, now readable, and the fix's history f
 # Until release, outsiders keep seeing the pre-merge tree, even for commits made on
 # top of the merge (their messages are sealed too), and cannot commit on top of it;
 # a tag that would publish the fix by another route is skipped by `vl push`.
-# Veil 1.0 keeps one unreleased embargo per line: a second `--embargo` merge into
+# Veil keeps one unreleased embargo per line: a second `--embargo` merge into
 # (or of) a line that still carries one is refused, and so is merging or rebasing
 # two embargoed lines together. Release the earlier embargo first, then merge.
 # Use `--scope S` matching the fix line's cloak (`--cloak S`): the team remote only
@@ -210,6 +221,8 @@ vl undo
 ```
 
 ## CLI grammar
+
+> Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](docs/OVERVIEW.md) and [VISIBILITY.md](docs/VISIBILITY.md)).
 
 ```text
 vl <command> [args]     global: -R <repo>  --no-snapshot
@@ -243,6 +256,8 @@ Revisions: `@` (working copy), `name@` (another workspace), `root`, tags,
 `origin/main`, change-id or snapshot-id prefixes, and `X-` / `X--` for parents.
 
 ### `.veilpolicy`
+
+> Today's client, before the server; this changes when the server lands. With the server, `.veilpolicy` holds folder access (`billing/ finance`, `src/ public`), and only admins can change it ([VISIBILITY.md](docs/VISIBILITY.md)).
 
 ```text
 # <pattern>        <tier> [scope]     — last matching rule wins
@@ -421,14 +436,16 @@ drop(ws);                                       // vanishes; the snapshot remain
 
 ## Status
 
-This is an MVP of the architecture: the full engine and CLI work end-to-end
-and are covered by tests (`cargo test`). See
+The client engine and CLI work end-to-end and are covered by tests
+(`cargo test`). Next comes the Veil server with the permission model, then a
+simplification pass ([OVERVIEW.md](docs/OVERVIEW.md)). See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#limitations-and-roadmap) for
-known limitations and what comes next (sealed tree names, a FUSE
-front-end). The engine also builds for WebAssembly
+known limitations. The engine also builds for WebAssembly
 ([docs/guide/embedding.md](docs/guide/embedding.md)).
 
 ### SSH remotes
+
+> Today's client, before the server; SSH (SFTP) and path remotes are removed once the server lands ([OVERVIEW.md](docs/OVERVIEW.md)).
 
 A remote can live on any machine you can `ssh` to; the server needs SSH
 with its SFTP subsystem and nothing else. `vl` runs your own `ssh`, so

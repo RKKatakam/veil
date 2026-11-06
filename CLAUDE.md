@@ -1,13 +1,13 @@
 # Veil
 
-Veil (`vl`) is a **server-centric** version control system in Rust. **It is not Git and not offline-first:** the `vl` client is always connected to the Veil server (the Hub), which stores the code and enforces permissions. Veil has per-path confidentiality: public, cloaked per scope (encrypted), and isolated (local only). It also has embargoes, secret scanning, change ids, an undoable op log, workspaces, a BLAKE3 content-addressed store and SFTP remotes.
+Veil (`vl`) is a **server-centric** version control system in Rust. **It is not Git and not offline-first:** the `vl` client is always connected to the Veil server (the Hub), which stores the code and enforces permissions. Access is the ordinary model in `docs/VISIBILITY.md`; code is plain text on the server, and only secrets and embargoed changes are encrypted. Read `docs/OVERVIEW.md` first. The built client engine has embargoes, secret scanning, change ids, an undoable op log, workspaces and a BLAKE3 content-addressed store. Until the server lands, today's client still restricts paths by cloaking them and syncs through path and SFTP remotes; the simplification pass removes those.
 
 Crates:
 - `crates/veil-core`: the engine;
 - `crates/vl`: the CLI;
 - `crates/veil-bench`: the scale benchmark, not a default workspace member.
 
-Read `docs/ARCHITECTURE.md` (its "Threat model" section has the trust boundary), `docs/FORMAT.md` and `docs/BUGS.md`.
+Read `docs/OVERVIEW.md`, `docs/VISIBILITY.md`, `docs/HUB.md` (the server design), `docs/ARCHITECTURE.md` (its "Threat model" section has the trust boundary), `docs/FORMAT.md` and `docs/BUGS.md`.
 
 ## Who can see what
 **`docs/VISIBILITY.md` is the source of truth. Keep it simple; it's the ordinary permission model:**

@@ -1,6 +1,6 @@
 # 2. A lock-free operation log
 
-Status: design and threat review (Scion 1.3). **Requires format 6** (`PLAN.md` §2): an older vl reads only `.veil/op_head`, and would silently fork the log.
+Status: **built** (stream O, Scion 1.3). This is the design and threat review, with notes on what the build found. **Requires format 6** (`PLAN.md` §2): an older vl reads only `.veil/op_head`, and would silently fork the log.
 
 ## The problem
 

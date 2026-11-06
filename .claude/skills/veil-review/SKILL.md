@@ -5,7 +5,7 @@ description: Review a Veil branch before it merges into `integration` (a fix wav
 
 # Reviewing Veil changes
 
-Veil (`vl`) is a version control system with per-path confidentiality (public / cloaked per scope / isolated), embargoes and SFTP remotes. Agents write nearly all of its code, and one agent works at a time.
+Veil (`vl`) is a server-centric version control system (`docs/OVERVIEW.md`): the client is always connected to the Veil server, which stores the code and enforces who can see what (`docs/VISIBILITY.md`: admins, private by default, groups and managers, folder access, `public`; secrets encrypted automatically). Today's client, before the server, still restricts paths by cloaking them for a scope and syncs through path and SFTP remotes. Agents write nearly all of its code, and one agent works at a time.
 
 The question every review answers is not "did someone read every line?" It is **"what could go wrong with this change, and which check, automated or human, is the right one to catch it?"** Anthropic's Claude Code team frames it the same way.
 
@@ -69,7 +69,7 @@ For each lens, read the diff **against the whole codebase and the brief's intent
 
 **For a bug fix, find the root cause.** Then check that the fix closes the bug's whole class, not just the one reproduction.
 
-1. **Confidentiality.** Can cloaked, isolated or embargoed content (or a cloaked tag name or description) reach:
+1. **Confidentiality.** Can private, secret, cloaked, isolated or embargoed content (or a cloaked tag name or description) reach someone without access, or:
    - a public snapshot, a remote, a log, JSON output, an error message or a bundle?
    - Is a label used as authority where the object should be (`verify_sealing`)?
    - Is a fallback version one the base doesn't already show publicly?
@@ -115,7 +115,7 @@ Anthropic confirms a finding only when enough independent agents vote for it. He
 
 - **It is real in the code.** It is shown by a failing test (preferred), a command transcript or an exact trace with **`file:line`**. Never guess file names. "Might" and "could in theory" don't count.
 - **Security findings: it crosses the trust boundary** (`docs/ARCHITECTURE.md` "Threat model"). Name all three:
-  - **the attacker**, who must be outside the boundary: a remote operator, a teammate without the scope, a hostile pull or bundle, another OS user;
+  - **the attacker**, who must be outside the boundary: a person without access to the folder, a remote operator (today's plain-file remotes; for the server, only for secrets and embargoes), a hostile pull or bundle, another OS user;
   - **what they control:** the exact input;
   - **the harm:** what leaks, is lost or runs, and to whom.
 
@@ -217,7 +217,7 @@ When the owner wants to understand an area, generate an explainer of that exact 
   - an ignored reproduction until fixed;
   - `(**fixed**, <wave>)` plus a "**Fixed:** …" note once fixed.
 - **A changed CLI has regenerated `docs/reference/`:** `VEIL_BLESS_DOCS=1 cargo test -p vl --bin vl reference_is_up_to_date`.
-- **No new dependency without a stated reason. Everything still works offline.**
+- **No new dependency without a stated reason.**
 - **Scratch work stays in the worktree's `.scratch/`.** Never `rm -rf` outside the worktree; it stalls agents on an approval.
 - **Tests join an existing binary** per crate (`cli_security`, `core_engine`, …).
 
@@ -243,7 +243,6 @@ When the owner wants to understand an area, generate an explainer of that exact 
 
 **Not adopted from Anthropic:**
 - landing first and testing after (a leak can't be reverted);
-- always-online clients (Veil stays offline-first);
 - parallel finders and voting (one agent at a time, so candidates are re-derived in sequence).
 
 ## Sources

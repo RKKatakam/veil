@@ -1,5 +1,7 @@
 # Git-parity round: build plan
 
+> **Access model:** written for today's client, which restricts paths by cloaking them for a *scope*. With the server, access is the ordinary model in `docs/VISIBILITY.md` (admins, private by default, groups and managers, folder access, `public`): cloaked paths become private folders, and only secrets and embargoed changes are encrypted.
+
 From `integration` @ aa78e6d. The feature designs and threat reviews are in `1-…md` to `7-…md` in this directory (features 4, 5b, 8 and 9, Git interop, were removed on 2026-11-05: Veil does not interoperate with Git). Every builder brief must append its feature's "Threat review" list. Each numbered point is a required test (property or hostile-input), and the adversarial pass starts from the same lists.
 
 ## 1. Which features need a format bump

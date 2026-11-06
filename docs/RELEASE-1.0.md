@@ -1,10 +1,21 @@
 # Veil 1.0.0 release checklist
 
-1.0.0 means **stable for the owner and their team on Linux and macOS**, with
-SSH/SFTP or path remotes (team and public),
-and a repository format that later versions will always read. It does
-**not** mean audited or ready for the general public; that follows
-dogfooding and a human security review.
+1.0.0 means **the `vl` client and the Veil server, with the permission
+model, stable for the owner and their team on Linux and macOS**, and a
+repository format that later versions will always read. Veil is
+server-centric ([OVERVIEW.md](OVERVIEW.md)): the client is always connected
+to the server, which stores the code and enforces who can see what
+([VISIBILITY.md](VISIBILITY.md)). 1.0.0 does **not** mean audited or ready
+for the general public; that follows dogfooding and a human security
+review.
+
+The order (OVERVIEW.md):
+1. **The server and the permission model, built together** ([HUB.md](HUB.md) §11).
+2. **A simplification pass:** remove SFTP and path remotes, offline
+   assumptions, old formats (kept readable for `vl upgrade`) and old jargon.
+3. **Then the server's later features,** in stages (fetch on demand,
+   server-side history and search, landing at agent scale, PR review and
+   hidden PRs). These come after 1.0.0.
 
 Process: build, then an adversarial pass, then a fix wave, repeated until the
 gates below hold.
@@ -21,11 +32,16 @@ gates below hold.
       --workspace` clean.
 - [x] Test files consolidated into a few test binaries (build time and cache
       size).
-- [ ] Scale benchmark at ~1 GB and ~5 GB (init, status, commit, gc, push,
-      clone, peak RAM) passes, with streaming `gc` and pull so large
+- [ ] Client scale benchmark at ~1 GB and ~5 GB (init, status, commit, gc,
+      push, clone, peak RAM) passes, with streaming `gc` and pull so large
       repositories do not run out of memory.
+- [ ] The server's benchmark gates for what 1.0.0 ships ([HUB.md](HUB.md)
+      §9.2): a small pull under 100 ms of server time, permission checks a
+      negligible share, pushes landing with no global lock.
 
 ## Features in 1.0.0
+
+Built (the client engine):
 
 - [x] Persistent, copy-on-write `vl ws exec` sandboxes (reflinks where the
       filesystem supports them) and sparse sandboxes.
@@ -34,6 +50,22 @@ gates below hold.
 - [x] Rename detection in `diff` and `log`.
 - [x] Cherry-pick / duplicate.
 - [x] Symlinks; line endings and per-path attributes (binary, CRLF).
+- [x] Lock-free op log, two-phase resumable pushes, history index,
+      background maintenance.
+
+To build:
+
+- [ ] The Veil server: sign-in, devices, the sync protocol and push
+      validation, YugabyteDB (PostgreSQL in dev and CI), object storage.
+- [ ] The permission model: admins, groups, managers, folder access
+      (`vl access`), `public`; every read and push checked by the server.
+- [ ] Secrets encrypted automatically and synced by folder access, with
+      member devices wrapping keys for new members; personal keys never
+      uploaded.
+- [ ] Embargoes through the server (`--embargo-for GROUPS`).
+- [ ] Moving existing repositories onto the server (`vl upgrade`; nothing
+      made public or decrypted silently).
+- [ ] The simplification pass.
 
 ## Release mechanics
 
@@ -49,10 +81,16 @@ gates below hold.
       (`docs/RELEASING.md`).
 - [ ] Veil hosts itself: this repository moved onto Veil.
 
-## Deferred to 1.1 and later
+## After 1.0.0
 
-Windows; partial and sparse clones; content-defined chunking for large files;
-first-class conflicts; `bisect`, hooks, signed tags, `grep`, `archive`; the
-Veil Hub (`docs/HUB.md`). Never: Git interop (no import, export, sync,
-colocation, submodules, Git file formats or Git-format patches; owner
-decision, 2026-11-05).
+The server's later features: fetch on demand, server-side history and
+search, landing changes at agent scale, PR review and hidden PRs, the
+embargo deadline worker, CI machines, the web client. Also Windows and
+content-defined chunking for large files.
+
+## Never
+
+- **Git interop:** no import, export, sync, colocation, submodules, Git file
+  formats or Git-format patches (owner decision, 2026-11-05).
+- **Offline use, or plain-file remotes** (SFTP, shared drives).
+- **Encrypting code.** Only secrets and embargoed changes are encrypted.

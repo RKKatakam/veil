@@ -1,5 +1,7 @@
 # Copying changes, and merges that follow renames
 
+> Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)). Where this page mentions cloaking, scopes, isolated files or path and SSH remotes, the server replaces them with folder access, encrypted secrets and pushes to the server.
+
 `vl duplicate` copies changes onto other parents, as new changes;
 `vl cherry-pick` is its Git-style shortcut. Merges, rebases and copies
 **follow renames**: when one side moved a file and the other edited it, the

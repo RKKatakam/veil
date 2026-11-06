@@ -1,6 +1,6 @@
 # 8. Resource limits for `vl ws exec`
 
-Status: design and threat review (Scion 4.7). **No repository format change.** Limits are device-local configuration and command-line flags.
+Status: design and threat review, **not built** (Scion 4.7). A client-side item, independent of the server. ("Scope" here means a systemd scope.) **No repository format change.** Limits are device-local configuration and command-line flags.
 
 **What this is:** a guard against runaway agents and builds (memory leaks, fork loops, hung test suites) on a shared developer machine. **What it is not:** a security boundary. The command runs as the same user, and a deliberately hostile one can leave any user-level limit (threat 1). That stays documented in the guide.
 

@@ -7,12 +7,14 @@ tree**: no new file names, sizes or message, and none of the fix's history.
 After the release, the same snapshot ids become readable, with nothing
 rewritten.
 
+> **With the server**, an embargo goes to chosen groups now and becomes public later (`vl merge fix --into main --embargo-for security distro-partners --until 2026-12-01`), and an embargoed PR doesn't exist for anyone else ([VISIBILITY.md](../VISIBILITY.md), "Hidden changes"). The commands below are today's client, before the server, where the audience is a *scope* (`--embargo --scope S`); this changes when the server lands (see [OVERVIEW.md](../OVERVIEW.md)).
+
 1. [The workflow](#the-workflow)
 2. [What the public sees](#what-the-public-sees)
 3. [Deadlines and release](#deadlines-and-release)
 4. [One embargo per line](#one-embargo-per-line)
 5. [Working on an embargoed line](#working-on-an-embargoed-line)
-6. [Limitations in 1.0](#limitations-in-10)
+6. [Limitations today](#limitations-today)
 
 ## The workflow
 
@@ -241,7 +243,7 @@ them with the identity `vl identity show` prints.
 
 ## One embargo per line
 
-Veil 1.0 keeps **at most one unreleased embargo per line**. A second
+Veil keeps **at most one unreleased embargo per line**. A second
 `--embargo` merge into (or of) a line that still carries one is refused,
 and so is merging or rebasing two embargoed lines together:
 
@@ -288,7 +290,7 @@ Nothing is recorded when this happens. Your options:
   outside the embargo); an unresolved conflict the embargoed merge takes in
   goes under the embargo as its file of markers.
 
-## Limitations in 1.0
+## Limitations today
 
 * **Metadata stays visible**: that an embargoed merge exists, its author,
   time, scope and deadline, its parents' ids, and ciphertext sizes on team

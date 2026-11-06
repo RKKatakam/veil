@@ -1,15 +1,23 @@
 # Scale round: build plan
 
-From `integration` @ 4a62259. This round is Scion phase 0 (`docs/design/scion-for-developers.md`) plus the owner's three serverless items. Designs and threat reviews:
+From `integration` @ 4a62259. This round built the client groundwork for Veil's Scion-style server (`docs/design/scion-for-developers.md`).
+
+**Status (2026-11-05).** Veil is server-centric (`docs/OVERVIEW.md`); the server is built next, with the permission model, and its benchmark gates are the design targets in `docs/HUB.md` §9.2 (thousands of agents, benchmarked at 1,000 and 10,000; a small pull and a PR open or update under 100 ms of server time; thousands of merges per hour per project with no global lock; a fresh agent workspace in seconds; history, blame and search in milliseconds to low hundreds of ms; permission checks a negligible share).
+- **Built, kept as history below:** B (benchmark), F (format 6), O (lock-free op log), I (history index, without the Bloom filters), G1 and G2 (streaming and background maintenance), P (two-phase pushes).
+- **P and G are the server's mechanisms** in client form: the server keeps the holding area and replaces the remote's lock with a compare-and-swap on one row (`docs/HUB.md` §4.5, §9.1), and replaces repacking with retention on object storage.
+- **Re-aimed at the server:** C becomes **fetch on demand from the server** (`6-partial-clone.md`); A (attribution) is built with the server's agent work. R and L are client-side and independent.
+- Where the text below mentions SFTP or path remotes, cloaked profiles or scope batches, it describes today's client as the round planned it.
+
+Designs and threat reviews:
 
 | # | item | file | format 6? |
 |---|---|---|---|
-| 1 | lock-free, resumable pushes (SFTP and path remotes) | `1-lock-free-push.md` | no |
+| 1 | lock-free, resumable two-phase pushes (built) | `1-lock-free-push.md` | no |
 | 2 | lock-free op log | `2-lock-free-oplog.md` | **yes** (op-heads layout, operation fields) |
 | 3 | history index (commit-graph, Bloom filters) | `3-history-index.md` | no (a device-local cache) |
 | 4 | background cleanup; streaming pull | `4-background-cleanup-streaming.md` | no |
 | 5 | copy-on-write checkouts of the project directory | `5-reflink-checkouts.md` | no |
-| 6 | partial clone, fetch on demand, bounded cache | `6-partial-clone.md` | **yes** (`repo.json` `partial`) |
+| 6 | fetch on demand from the server, bounded cache | `6-partial-clone.md` | **yes** (`repo.json` `partial`) |
 | 7 | agent attribution | `7-agent-attribution.md` | **yes** (`Snapshot.agent`) |
 | 8 | sandbox resource limits | `8-sandbox-limits.md` | no |
 | 9 | scale benchmark and gates | `9-scale-benchmark.md` | no |
@@ -184,7 +192,7 @@ Process rules: never run `cargo fmt`; scratch work goes in `.scratch/`; builds u
 - Owns `vfs/clone_source.rs`, `checkout.rs` (`apply_changes` ordering and the clone path), `vfs/disk.rs` `clone_known`, and in core `sandbox.rs` the trusted-source helper.
 - Item 5.
 
-**C: partial clone** (size XL; last)
+**C: fetch on demand from the server** (size XL; after the server's `get`, `docs/HUB.md` §4.2)
 - **Owns:**
   - `promisor.rs`;
   - the `read_raw` miss hook in `store.rs` (after G2);
@@ -244,7 +252,7 @@ t0 ── 0 ──┬── B1 (trace + baseline) ── B2 (agents, cloaked, 5g
 | L | M | 1,100 | 700 | 1 day |
 | A | M | 900 | 900 | 1 day |
 | R | S–M | 600 | 500 | 0.5–1 day |
-| C | XL | 3,000 | 2,500 (server-logging SFTP harness, offline matrix, audit table) | 3 days |
+| C | XL | 3,000 | 2,500 (request-logging test server, server-stopped matrix, audit table) | 3 days |
 | X | M (conditional) | 1,000 | 600 | 1 day |
 
 That is about 19 agent-days without X: roughly 5 working days with four streams at a time, and 9–10 with two.
@@ -291,7 +299,7 @@ That is about 19 agent-days without X: roughly 5 working days with four streams 
    - *Harness:* extend `adversarial7`'s public-mirror grep. After every step, push to a public mirror and grep decoded objects for the fix's names. Run it with the index on, off, corrupted, and rebuilt mid-run.
 4. **Confidentiality of new local and remote artefacts.**
    - The index's Bloom filters (item 3, threats 1–2): byte-identical with and without keys.
-   - The fetch pattern (item 6, threats 2–3): a server-side request log compared with the scope batches.
+   - What fetch on demand sends (item 6, threat 2): a server-side request log shows nothing outside the person's access.
    - Attribution task and prompt on cloaked and embargoed lines (item 7, threats 1–2).
    - Public staging after a rejected push (item 1, threat 4).
 5. **The two-phase push.** The boundary disappearing between the phases (item 1, threat 2); the dry run drifting from the push (threat 12); the format-5 compatibility of staging (threat 13).
