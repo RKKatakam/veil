@@ -555,10 +555,19 @@ pub fn pull(repo: &mut Repo, remote: &str, client: &Client, only: Option<&str>) 
             frontier.push((*snap, String::new(), *tree));
         }
     }
+    // A server of revision 1 takes the wants of every snapshot in one
+    // request per level; an older one, one request per snapshot.
+    let across = tips.revision >= 1;
     while !frontier.is_empty() {
         let mut by_snap: HashMap<ObjectId, Vec<Want>> = HashMap::new();
         for (snap, path, id) in frontier.drain(..) {
-            by_snap.entry(snap).or_default().push(Want { path, id });
+            match across {
+                true => {
+                    let first = *by_snap.keys().next().unwrap_or(&snap);
+                    by_snap.entry(first).or_default().push(Want { path, id, snapshot: (first != snap).then_some(snap) });
+                }
+                false => by_snap.entry(snap).or_default().push(Want { path, id, snapshot: None }),
+            }
         }
         let mut next = Vec::new();
         for (snap, wants) in by_snap {
@@ -594,7 +603,7 @@ pub fn pull(repo: &mut Repo, remote: &str, client: &Client, only: Option<&str>) 
                     }
                     for (cid, p) in children {
                         if !have(&cid) && seen.insert(cid) {
-                            next.push((snap, p, cid));
+                            next.push((w.snapshot.unwrap_or(snap), p, cid));
                         }
                     }
                     if incoming.put(w.id, raw, &w.path)? {

@@ -179,6 +179,7 @@ async fn tips(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>
         default_branch: project.default_branch,
         you: caller.person.map(|p| p.name),
         admin: viewer.admin,
+        revision: veil_core::hub::wire::REVISION,
     }))
 }
 

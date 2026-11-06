@@ -1524,3 +1524,4 @@ fn a_power_loss_tears_history_index_layers_and_they_are_rebuilt() {
     assert_eq!(reopened.visible_snapshots().unwrap(), visible);
     assert!(reopened.is_ancestor(&line[0], &tip).unwrap());
 }
+

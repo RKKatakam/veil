@@ -7,6 +7,8 @@
 //! veil-bench report RESULTS.json
 //! veil-bench openscion --vl PATH --server PATH --database-url URL --dir DIR --out RESULTS.json
 //! veil-bench openscion-memory --out RESULTS.json
+//! veil-bench load --mode pull|land (--server PATH --database-url URL | --url URL [--ca PEM])
+//!                 --projects 1,10 --clients 10,100 [--rates 0.35,3.5,max] --out RESULTS.json
 //! ```
 //!
 //! Every measured command is a separate process of the release `vl`
@@ -17,6 +19,7 @@
 mod agents;
 mod content;
 mod gen;
+mod load;
 mod openscion;
 mod proc;
 mod report;
@@ -103,6 +106,60 @@ enum Cmd {
         /// Repetitions per case (the median is reported).
         #[arg(long, default_value_t = 5)]
         runs: usize,
+        /// Results JSON (a Markdown table is written beside it).
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// The server under load: simulated agents pulling and landing
+    /// changes, ramped over clients, projects and rates; one row per
+    /// point of each curve (docs/design/scale/LOAD.md).
+    Load {
+        /// `pull` (agents pull in a closed loop) or `land` (agents land
+        /// changes on `main`).
+        #[arg(long)]
+        mode: String,
+        /// A running server (`https://host:port`); else `--server` starts one here.
+        #[arg(long)]
+        url: Option<String>,
+        /// The running server's certificate (PEM), when self-signed.
+        #[arg(long)]
+        ca: Option<PathBuf>,
+        /// The `veil-server` binary to start here (a release build).
+        #[arg(long)]
+        server: Option<PathBuf>,
+        /// The database of the server started here, and of the statement counts.
+        #[arg(long)]
+        database_url: Option<String>,
+        /// Database connections of the server started here.
+        #[arg(long, default_value_t = 64)]
+        db_connections: u32,
+        /// The server's process id, for its CPU (default: the one started here).
+        #[arg(long)]
+        server_pid: Option<u32>,
+        /// Projects, one curve point each.
+        #[arg(long, value_delimiter = ',', default_value = "1")]
+        projects: Vec<usize>,
+        /// Concurrent agents (spread over the projects), one curve point each.
+        #[arg(long, value_delimiter = ',', default_value = "10,100")]
+        clients: Vec<usize>,
+        /// `land`: target landings per second in all (a number), or `max`.
+        #[arg(long, value_delimiter = ',', default_value = "max")]
+        rates: Vec<String>,
+        /// Seconds measured per point.
+        #[arg(long, default_value_t = 20.0)]
+        duration: f64,
+        /// Seconds of warm-up before each point.
+        #[arg(long, default_value_t = 3.0)]
+        warmup: f64,
+        /// `pull`: landings per second per project moving `main` meanwhile.
+        #[arg(long, default_value_t = 2.0)]
+        background: f64,
+        /// Count only this container's database processes (a container id prefix).
+        #[arg(long)]
+        db_container: Option<String>,
+        /// Bench directory (the server started here keeps its data there).
+        #[arg(long)]
+        dir: PathBuf,
         /// Results JSON (a Markdown table is written beside it).
         #[arg(long)]
         out: PathBuf,
@@ -241,6 +298,53 @@ fn main() -> Result<()> {
             })?;
             std::fs::write(&out, serde_json::to_vec_pretty(&v)?)?;
             let md = openscion::markdown(&v)?;
+            std::fs::write(out.with_extension("md"), &md)?;
+            print!("{md}");
+            Ok(())
+        }
+        Cmd::Load {
+            mode,
+            url,
+            ca,
+            server,
+            database_url,
+            db_connections,
+            server_pid,
+            projects,
+            clients,
+            rates,
+            duration,
+            warmup,
+            background,
+            db_container,
+            dir,
+            out,
+        } => {
+            let mode = match mode.as_str() {
+                "pull" => load::Mode::Pull,
+                "land" => load::Mode::Land,
+                m => return Err(anyhow!("--mode {m}: pull or land")),
+            };
+            let rates = rates.iter().map(|r| r.parse::<load::Rate>().map_err(|e| anyhow!(e))).collect::<Result<_>>()?;
+            let v = load::run_all(&load::Args {
+                url,
+                ca,
+                server: server.as_deref().map(absolute).transpose()?,
+                database_url,
+                db_connections,
+                server_pid,
+                dir: absolute(&dir)?,
+                mode,
+                projects,
+                clients,
+                rates,
+                duration: Duration::from_secs_f64(duration),
+                warmup: Duration::from_secs_f64(warmup),
+                background,
+                db_container,
+            })?;
+            std::fs::write(&out, serde_json::to_vec_pretty(&v)?)?;
+            let md = load::markdown(&v)?;
             std::fs::write(out.with_extension("md"), &md)?;
             print!("{md}");
             Ok(())

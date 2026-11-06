@@ -3004,8 +3004,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "hex",
  "libc",
+ "serde",
  "serde_json",
+ "sqlx",
+ "tokio",
+ "ureq",
  "veil-core",
 ]
 
