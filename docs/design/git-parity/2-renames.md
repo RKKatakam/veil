@@ -1,5 +1,7 @@
 # 2. Rename and copy detection (`diff`, `log`, `status`, merge)
 
+> **Access model:** written for today's client, which restricts paths by cloaking them for a *scope*. With the server, access is the ordinary model in `docs/VISIBILITY.md` (admins, private by default, groups and managers, folder access, `public`): cloaked paths become private folders, and only secrets and embargoed changes are encrypted.
+
 Status: design and threat review. No format change: renames are computed, never stored, as in Git.
 
 ## Design sketch

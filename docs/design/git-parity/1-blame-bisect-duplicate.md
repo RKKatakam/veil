@@ -1,5 +1,7 @@
 # 1. `vl blame`, `vl bisect`, `vl duplicate` (cherry-pick)
 
+> **Access model:** written for today's client, which restricts paths by cloaking them for a *scope*. With the server, access is the ordinary model in `docs/VISIBILITY.md` (admins, private by default, groups and managers, folder access, `public`): cloaked paths become private folders, and only secrets and embargoed changes are encrypted.
+
 Status: design and threat review for the Git-parity round, from `integration` @ aa78e6d.
 No format change.
 

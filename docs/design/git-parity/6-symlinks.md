@@ -1,5 +1,7 @@
 # 6. Symlinks
 
+> **Access model:** written for today's client, which restricts paths by cloaking them for a *scope*. With the server, access is the ordinary model in `docs/VISIBILITY.md` (admins, private by default, groups and managers, folder access, `public`): cloaked paths become private folders, and only secrets and embargoed changes are encrypted.
+
 Status: design and threat review. **Format 5** (a new tree entry kind; see `PLAN.md`). Today symlinks are invisible.
 - `DirListing::special`: never recorded or followed.
 - A tracked path that became a link keeps its entry and is reported.
@@ -76,4 +78,4 @@ That stays exactly the behaviour of repositories below format 5.
 
 - **Record links that point outside the repository?** *Recommendation:* yes, as Git does. Veil never follows them, and refusing would break real repositories (`node_modules/.bin`, `/usr/share/…` fixtures). The sandbox and mount mitigations in points 7 and 8 cover the cases where Veil itself hands the link to untrusted code.
 - **Should the target be scanned and sealed?** *Recommendation:* yes. The target is content: it is classified by the link's path, scanned, and sealed under its scope.
-- **Windows.** Out of scope (1.0 targets Linux and macOS).
+- **Windows.** Out of scope (Veil targets Linux and macOS).
