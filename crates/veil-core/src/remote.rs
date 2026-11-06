@@ -330,6 +330,9 @@ const LAST_VERSIONS: usize = 64 << 20;
 /// Collects objects into packs on `backend`. Below `threshold` objects
 /// (and with a `loose` store) they are written as loose objects instead,
 /// so a small pull does not leave a tiny pack behind.
+/// Bytes of objects [`PackSink`] encodes at a time.
+const BATCH_BYTES: usize = 4 << 20;
+
 struct PackSink<'a> {
     /// The destination store: decides what its repository format may hold
     /// (packs bypass `put_raw`, so the check happens here).
@@ -342,6 +345,11 @@ struct PackSink<'a> {
     /// The pack being streamed (BUG-800: it used to be built in memory).
     builder: Option<PackWriter<'a>>,
     builder_bytes: u64,
+    /// Objects waiting to be encoded into `builder`, a few MiB at a time:
+    /// those with no earlier version at their path are compressed on
+    /// several threads ([`PackSink::encode_batch`]).
+    batch: Vec<(ObjectId, Vec<u8>, String)>,
+    batch_bytes: usize,
     /// The last object packed at each path (by the path's hash), the
     /// delta base for the next version found there; least recently used
     /// out past [`LAST_VERSIONS`].
@@ -368,6 +376,8 @@ impl<'a> PackSink<'a> {
             pending: Vec::new(),
             builder: None,
             builder_bytes: 0,
+            batch: Vec::new(),
+            batch_bytes: 0,
             last: LruCache::new(LAST_VERSIONS),
             packs: 0,
             bytes: 0,
@@ -396,20 +406,60 @@ impl<'a> PackSink<'a> {
             if let Some(prepare) = self.prepare.take() {
                 prepare()?;
             }
+            self.builder = Some(PackWriter::new(self.backend.create_stream(&self.dir, true)?, DEFAULT_LEVEL)?);
         }
-        let builder = match &mut self.builder {
-            Some(b) => b,
-            None => self.builder.insert(PackWriter::new(self.backend.create_stream(&self.dir, true)?, DEFAULT_LEVEL)?),
+        self.batch_bytes += raw.len();
+        self.batch.push((id, raw, path));
+        // Encoded by the time the pack reaches its limit, so packs close
+        // where they did object by object.
+        if self.batch_bytes >= BATCH_BYTES || self.builder_bytes + self.batch_bytes as u64 >= self.limit {
+            self.encode_batch()?;
+        }
+        Ok(())
+    }
+
+    /// Encode the waiting objects into the pack, in order. An object with
+    /// an earlier version at its path (packed already, or earlier in the
+    /// batch) is a delta candidate, encoded here; the others are
+    /// compressed on several threads first.
+    fn encode_batch(&mut self) -> Result<()> {
+        let batch = std::mem::take(&mut self.batch);
+        self.batch_bytes = 0;
+        let Some(builder) = self.builder.as_mut() else { return Ok(()) };
+        let mut keys = HashSet::new();
+        let (mut plain, mut plain_keys, mut later) = (Vec::new(), Vec::new(), Vec::new());
+        for (id, raw, path) in batch {
+            let key = ObjectId::hash(path.as_bytes());
+            if self.last.get(&key).is_some() || !keys.insert(key) {
+                later.push((id, raw, key));
+            } else {
+                plain.push((id, raw));
+                plain_keys.push(key);
+            }
+        }
+        let threads = match cfg!(feature = "os") {
+            true => std::thread::available_parallelism().map_or(1, |n| n.get()).min(8),
+            false => 1,
         };
-        let key = ObjectId::hash(path.as_bytes());
-        let base = self
-            .last
-            .get(&key)
-            .filter(|(bid, braw)| builder.contains(bid) && Object::is_blob_raw(braw) == Object::is_blob_raw(&raw));
-        builder.add(id, &raw, base.as_ref().map(|(bid, braw)| (bid, &braw[..])))?;
-        self.builder_bytes += raw.len() as u64;
-        let weight = raw.len();
-        self.last.insert(key, (id, Arc::new(raw)), weight);
+        let entries = crate::pack::encode_entries(&plain, DEFAULT_LEVEL, threads)?;
+        for (((id, raw), e), key) in plain.into_iter().zip(&entries).zip(plain_keys) {
+            if !builder.add_entry(id, e)? {
+                builder.add(id, &raw, None)?;
+            }
+            self.builder_bytes += raw.len() as u64;
+            let weight = raw.len();
+            self.last.insert(key, (id, Arc::new(raw)), weight);
+        }
+        for (id, raw, key) in later {
+            let base = self
+                .last
+                .get(&key)
+                .filter(|(bid, braw)| builder.contains(bid) && Object::is_blob_raw(braw) == Object::is_blob_raw(&raw));
+            builder.add(id, &raw, base.as_ref().map(|(bid, braw)| (bid, &braw[..])))?;
+            self.builder_bytes += raw.len() as u64;
+            let weight = raw.len();
+            self.last.insert(key, (id, Arc::new(raw)), weight);
+        }
         if self.builder_bytes >= self.limit {
             self.flush()?;
         }
@@ -417,6 +467,10 @@ impl<'a> PackSink<'a> {
     }
 
     fn flush(&mut self) -> Result<()> {
+        if !self.batch.is_empty() {
+            // Encoding the batch may close the pack itself (at the limit).
+            return self.encode_batch().and_then(|()| self.flush());
+        }
         if let Some(b) = self.builder.take() {
             let objects = b.len();
             // `finish` publishes the pack (durably), then its index, after
@@ -3211,7 +3265,10 @@ impl<'a> Incoming<'a> {
     pub fn new(store: &'a Arc<ObjectStore>) -> Incoming<'a> {
         Incoming {
             store,
-            sink: PackSink::new(store, store.pack_dir(), Some(&**store), 256),
+            // A pack from 16 objects: one fsync instead of one, and a
+            // rename and a directory, per object (a clone of one directory
+            // brings a hundred).
+            sink: PackSink::new(store, store.pack_dir(), Some(&**store), 16),
             report: SyncReport::default(),
         }
     }

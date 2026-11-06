@@ -169,6 +169,11 @@ pub struct Client {
 }
 
 /// Body of a response: JSON or object frames.
+/// Wants per fetch request when [`Client::fetch_all`] splits them, and
+/// how many requests it sends at once.
+const FETCH_PART: usize = 1_000;
+const FETCH_REQUESTS: usize = 8;
+
 fn read_body(resp: ureq::http::Response<ureq::Body>) -> Result<Vec<u8>> {
     let mut body = resp.into_body();
     Ok(body.with_config().limit(4 << 30).read_to_vec()?)
@@ -365,6 +370,48 @@ impl Client {
         Ok(read_frames(&out)?.into_iter().map(|(id, raw)| (id, raw.to_vec())).collect())
     }
 
+    /// [`Client::fetch`] of many objects: up to [`FETCH_REQUESTS`]
+    /// requests at once, each for a part of `wants` (the server reads,
+    /// frames and encrypts them on several threads), answers in order.
+    pub fn fetch_all(&self, snapshot: ObjectId, wants: Vec<Want>) -> Result<Vec<(ObjectId, Vec<u8>)>> {
+        if wants.len() < 2 * FETCH_PART {
+            return self.fetch(snapshot, wants);
+        }
+        let token = self.token.borrow().clone();
+        let url = format!("{}{}", self.url.base(), self.url.project_path("/fetch"));
+        let part = wants.len().div_ceil(FETCH_REQUESTS).max(FETCH_PART);
+        let parts: Vec<&[Want]> = wants.chunks(part).collect();
+        let agent = &self.agent;
+        let answers: Vec<Option<Vec<u8>>> = std::thread::scope(|s| {
+            let handles: Vec<_> = parts
+                .iter()
+                .map(|p| {
+                    let (url, token) = (&url, &token);
+                    s.spawn(move || -> Option<Vec<u8>> {
+                        let body = serde_json::to_vec(&FetchRequest { snapshot, objects: p.to_vec() }).ok()?;
+                        let mut r = agent.post(url).header("content-type", "application/json");
+                        if let Some(t) = token {
+                            r = r.header("authorization", &format!("Bearer {t}"));
+                        }
+                        let resp = r.send(&body[..]).ok()?;
+                        (resp.status().as_u16() == 200).then(|| read_body(resp).ok()).flatten()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().ok().flatten()).collect()
+        });
+        let mut out = Vec::with_capacity(wants.len());
+        for (p, answer) in parts.into_iter().zip(answers) {
+            match answer {
+                Some(body) => out.extend(read_frames(&body)?.into_iter().map(|(id, raw)| (id, raw.to_vec()))),
+                // Anything else (a session to renew, an error to report):
+                // this part again, the ordinary way.
+                None => out.extend(self.fetch(snapshot, p.to_vec())?),
+            }
+        }
+        Ok(out)
+    }
+
     /// Upload object frames; the server's receipt for each, in order.
     pub fn upload(&self, frames: Vec<u8>) -> Result<Vec<String>> {
         let out = self.ok("POST", &self.url.project_path("/objects"), Some(("application/octet-stream", frames)))?;
@@ -471,12 +518,21 @@ pub fn pull(repo: &mut Repo, remote: &str, client: &Client, only: Option<&str>) 
     let mut want_tips: Vec<ObjectId> = tips.branches.values().copied().filter(|t| !store.has(t)).collect();
     want_tips.sort();
     want_tips.dedup();
+    // A repository made for this clone holds only the root snapshot and
+    // its empty tree: nothing to probe the disk for, object by object.
+    let root = tx.repo().root_id();
+    let fresh = stop.is_empty() && tx.view.heads.iter().all(|h| *h == root);
+    let empty_tree = tx.repo().snapshot(&root)?.tree;
+    let have = |id: &ObjectId| match fresh {
+        true => *id == root || *id == empty_tree,
+        false => store.has(id),
+    };
     let mut report = SyncReport::default();
     let mut incoming = Incoming::new(&store);
     let mut new_snaps = Vec::new();
     if !want_tips.is_empty() {
         for (id, raw) in client.history(want_tips, stop)? {
-            if store.has(&id) {
+            if have(&id) {
                 continue;
             }
             let Object::Snapshot(s) = Object::decode(&raw)? else {
@@ -495,7 +551,7 @@ pub fn pull(repo: &mut Repo, remote: &str, client: &Client, only: Option<&str>) 
     let mut seen: HashSet<ObjectId> = HashSet::new();
     let mut frontier: Vec<(ObjectId, String, ObjectId)> = Vec::new();
     for (snap, tree) in &new_snaps {
-        if !store.has(tree) && seen.insert(*tree) {
+        if !have(tree) && seen.insert(*tree) {
             frontier.push((*snap, String::new(), *tree));
         }
     }
@@ -507,7 +563,7 @@ pub fn pull(repo: &mut Repo, remote: &str, client: &Client, only: Option<&str>) 
         let mut next = Vec::new();
         for (snap, wants) in by_snap {
             for chunk in wants.chunks(20_000) {
-                let got = client.fetch(snap, chunk.to_vec())?;
+                let got = client.fetch_all(snap, chunk.to_vec())?;
                 if got.len() != chunk.len() {
                     bail!("the server sent {} objects for {} asked", got.len(), chunk.len());
                 }
@@ -537,7 +593,7 @@ pub fn pull(repo: &mut Repo, remote: &str, client: &Client, only: Option<&str>) 
                         _ => {}
                     }
                     for (cid, p) in children {
-                        if !store.has(&cid) && seen.insert(cid) {
+                        if !have(&cid) && seen.insert(cid) {
                             next.push((snap, p, cid));
                         }
                     }

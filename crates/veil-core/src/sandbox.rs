@@ -1332,6 +1332,10 @@ impl StorageBackend for PolicyPin<'_> {
         self.inner.clone_known(path, id)
     }
 
+    fn clones(&self) -> bool {
+        self.inner.clones()
+    }
+
     fn stat_clock(&self) -> Option<crate::vfs::StatClock> {
         self.inner.stat_clock()
     }

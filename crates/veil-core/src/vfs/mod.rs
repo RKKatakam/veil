@@ -458,6 +458,12 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
         Ok(false)
     }
 
+    /// Can [`StorageBackend::clone_known`] ever succeed here? Checkout
+    /// reads nothing for a clone where it cannot.
+    fn clones(&self) -> bool {
+        false
+    }
+
     /// Current reading of the clock `Metadata::mtime` stamps come from, or
     /// `None` if this backend's stamps cannot be trusted for change detection
     /// (which disables stat caching).

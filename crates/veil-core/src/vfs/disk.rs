@@ -608,9 +608,9 @@ fn for_each_parallel<T: Sync>(
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..workers)
+        let handles = (0..workers)
             .map(|_| {
-                scope.spawn(|| loop {
+                std::thread::Builder::new().stack_size(64 << 10).spawn_scoped(scope, || loop {
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     match items.get(i) {
                         Some(item) => f(item)?,
@@ -618,14 +618,18 @@ fn for_each_parallel<T: Sync>(
                     }
                 })
             })
-            .collect();
+            .collect::<io::Result<Vec<_>>>()?;
         handles
             .into_iter()
             .try_for_each(|h| h.join().unwrap_or_else(|_| Err(io::Error::other("sync worker panicked"))))
     })
 }
 
-const SYNC_WORKERS: usize = 32;
+/// Most threads a barrier fsyncs on. ext4 commits concurrent fsyncs in one
+/// journal transaction: measured on NVMe, a 10,000-file checkout's
+/// barrier took 310 ms at 32, 125 at 128, 60–65 at 256, and no less at
+/// 512 or 1,024. The threads only wait (small stacks).
+const SYNC_WORKERS: usize = 256;
 
 /// `(mtime, ctime, inode)` change-detection stamps, nanoseconds since the epoch.
 #[cfg(unix)]

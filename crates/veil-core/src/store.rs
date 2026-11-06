@@ -966,6 +966,18 @@ impl ObjectStore {
         if let Some(b) = self.staged(id).or_else(|| self.tx_buffered(id)) {
             return Ok(b);
         }
+        // In a pack already open, on a local disk: no probe for a loose
+        // copy first (a clone's checkout reads ten thousand packed files;
+        // over a network a loose copy is the cheaper read). Anything but a
+        // good copy takes the full path below.
+        if !self.backend.is_network() {
+            self.ensure_packs()?;
+            if self.packs.read().unwrap().packs.iter().any(|p| p.contains(id)) {
+                if let Ok(Some(raw)) = self.read_packed(id) {
+                    return Ok(raw);
+                }
+            }
+        }
         let loose_corrupt = match self.read_loose_verified(id)? {
             Loose::Good(b) => return Ok(b),
             Loose::Absent => false,
