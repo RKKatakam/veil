@@ -139,6 +139,7 @@ fn clone_populate(url: &HubUrl, dest: &Path, only: Option<&str>) -> Result<ExitC
     let identity = load_identity()?;
     let client = Client::new(url, identity.clone())?;
     let fs = Arc::new(DiskBackend::new(dest));
+    crate::ctx::mark_clone_incomplete(&fs)?;
     let mut repo = Repo::init_for_clone_at(fs.clone(), Some(identity.clone()), &user_for(&identity), veil_core::repo::REPO_FORMAT)?;
     let mut config = repo.config().clone();
     config.remotes.insert(
@@ -174,6 +175,7 @@ fn clone_populate(url: &HubUrl, dest: &Path, only: Option<&str>) -> Result<ExitC
     // Journalled, so a clone killed here is finished by the next command
     // (BUG-830).
     let (_, co) = repo.check_out_new(&*fs, DEFAULT_WORKSPACE, wc, partial).context("checking out")?;
+    crate::ctx::mark_clone_complete(&fs)?;
     println!(
         "Cloned {} into {} ({} objects, {} files{})",
         safe(&format!("veil://{}/{}", url.authority, url.project)),
@@ -437,6 +439,12 @@ pub fn group(ctx: &mut Ctx, c: &GroupCmd) -> Result<()> {
         }
         GroupCmd::Create { name } => show(&client.group("POST", name, "", &[])?),
         GroupCmd::Add { group, people, confirm } => {
+            // A fingerprint vouches for one person's device: with several
+            // people, the server could list it under another, and the key
+            // ring would record it under the wrong name (BUG-835).
+            if !confirm.is_empty() && people.len() > 1 {
+                bail!("--confirm confirms one person's devices: add {} one at a time", people.join(", "));
+            }
             show(&client.group("POST", group, "/members", people)?);
             sync_secret_keys(ctx, &client, group, people, true, confirm)?;
         }
@@ -449,6 +457,17 @@ pub fn group(ctx: &mut Ctx, c: &GroupCmd) -> Result<()> {
                 .filter(|p| !groups.iter().any(|g| g.members.contains(p)))
                 .cloned()
                 .collect();
+            // The server's group list decides this: never silently
+            // (BUG-836).
+            for person in people.iter().filter(|p| !gone.contains(p)) {
+                let other: Vec<&str> = groups.iter().filter(|g| g.members.contains(person)).map(|g| g.name.as_str()).collect();
+                println!(
+                    "  {} {} is still in {}: the secret key was not rotated away from them",
+                    yellow("keys:"),
+                    safe(person),
+                    safe(&other.join(", "))
+                );
+            }
             if !gone.is_empty() {
                 sync_secret_keys(ctx, &client, group, &gone, false, &[])?;
             }

@@ -701,6 +701,7 @@ fn clone_populate(backend: Arc<dyn StorageBackend>, url: String, shown: String, 
     // pushed back and read by everyone who reads the source.
     let source_config = veil_core::repo::read_config(&*backend)?;
     source_config.check_supported()?;
+    ctx::mark_clone_incomplete(&fs)?;
     let mut repo = Repo::init_for_clone_at(fs.clone(), Some(identity.clone()), &user_for(&identity), source_config.format)?;
     let mut config = repo.config().clone();
     config.remotes.insert("origin".into(), RemoteConfig { url, public: false, only: None });
@@ -720,6 +721,7 @@ fn clone_populate(backend: Arc<dyn StorageBackend>, url: String, shown: String, 
     // materialised (no key yet, an unreleased embargo), so it is filled in
     // once it becomes readable instead of being recorded as deleted.
     let (state, co) = repo.check_out_new(&*fs, DEFAULT_WORKSPACE, wc, None)?;
+    ctx::mark_clone_complete(&fs)?;
     let hidden_by_embargo = state.materialised.view().is_some();
     println!(
         "Cloned {} into {} ({} objects, {} files)",

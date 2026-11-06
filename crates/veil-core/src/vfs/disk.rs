@@ -545,16 +545,33 @@ fn barrier_sync_file(path: &Path) -> io::Result<()> {
     }
 }
 
-/// [`barrier_sync_file`] for directories.
+/// [`barrier_sync_file`] for directories. A directory replaced since it
+/// was recorded (checkout removed it and wrote a link or a file there,
+/// BUG-833) is not opened through what replaced it: the replacement's own
+/// directory is synced instead (it is in the batch, or was synced when
+/// the link was written), and a link there is never followed.
 fn barrier_sync_dir(dir: &Path) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     {
-        match fs::File::open(dir).and_then(|d| plain_fsync(&d)) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let d = match fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(dir) {
+            // Replaced since by a link or a file: nothing of ours to sync.
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) || e.kind() == io::ErrorKind::NotADirectory => return Ok(()),
+            r => r?,
+        };
+        #[cfg(target_os = "macos")]
+        return match plain_fsync(&d) {
             Err(e) if fullfsync_unsupported(&e) => Ok(()),
+            r => r,
+        };
+        #[cfg(not(target_os = "macos"))]
+        match full_sync(&d) {
+            // Some filesystems cannot fsync directories; nothing more can be done.
+            Err(e) if matches!(e.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported) => Ok(()),
             r => r,
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(unix))]
     {
         sync_dir(dir)
     }

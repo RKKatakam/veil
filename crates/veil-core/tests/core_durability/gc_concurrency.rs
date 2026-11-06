@@ -411,6 +411,85 @@ fn prune_now_beside_many_writers_loses_nothing() {
     assert_fsck_clean(fs, &id, "after the stress run");
 }
 
+/// Performance round 1, adversarial pass: on a disk (where a transaction
+/// writes its new file contents as a pack, `TX_PACK_MIN`, and spills one
+/// mid-transaction past `TX_BUFFER`), writers whose snapshots publish packs
+/// beside `gc --prune-now` in a loop lose nothing, and `fsck` is clean.
+#[test]
+fn prune_now_beside_writers_that_publish_packs_loses_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fs: Arc<dyn StorageBackend> = Arc::new(veil_core::DiskBackend::new(tmp.path().join("r")));
+    let id = Identity::generate("alice");
+    {
+        let mut r = Repo::init(fs.clone(), Some(id.clone()), "alice").unwrap();
+        r.snapshot_workspace(WS, &*fs).unwrap();
+        let wc = r.workspace_wc(WS).unwrap();
+        for i in 0..3 {
+            r.create_workspace(&format!("agent{i}"), vec![wc], None).unwrap();
+        }
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut threads = Vec::new();
+    for i in 0..3 {
+        let (fs, id) = (fs.clone(), id.clone());
+        threads.push(std::thread::spawn(move || {
+            let n = format!("agent{i}");
+            let mut done = Vec::new();
+            for k in 0..3 {
+                let mut r = Repo::open(fs.clone(), Some(id.clone()), "alice").unwrap();
+                let ov = r.workspace_overlay(&n).unwrap();
+                // 300 small new files: one pack at publication. Agent 0's
+                // last round adds 40 MiB more: a pack spilled before it.
+                for f in 0..300 {
+                    ov.write(&p(&format!("{n}/{k}/f{f}.txt")), format!("{n} {k} {f}\n").as_bytes()).unwrap();
+                }
+                if i == 0 && k == 2 {
+                    for f in 0..40 {
+                        let mut big = vec![b'x'; 1 << 20];
+                        big[..16].copy_from_slice(format!("{f:016}").as_bytes());
+                        ov.write(&p(&format!("{n}/big/b{f}.bin")), &big).unwrap();
+                    }
+                }
+                match r.snapshot_workspace_with(&n, &ov, Default::default()) {
+                    Ok(_) => done.push(k),
+                    Err(e) => assert!(e.to_string().contains("run the command again"), "{e}"),
+                }
+            }
+            (n, done)
+        }));
+    }
+    let gcs = {
+        let (fs, id, stop) = (fs.clone(), id.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut runs = 0;
+            while !stop.load(Ordering::SeqCst) {
+                let mut g = Repo::open(fs.clone(), Some(id.clone()), "alice").unwrap();
+                gc(&mut g, &prune_now()).unwrap();
+                runs += 1;
+            }
+            runs
+        })
+    };
+    let results: Vec<(String, Vec<usize>)> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    stop.store(true, Ordering::SeqCst);
+    let runs = gcs.join().unwrap();
+    assert!(runs > 0);
+    let r = Repo::open(fs.clone(), Some(id.clone()), "alice").unwrap();
+    for (n, rounds) in results {
+        let wc = r.workspace_wc(&n).unwrap();
+        for k in rounds {
+            for f in [0, 150, 299] {
+                assert_eq!(read_at(&r, &wc, &format!("{n}/{k}/f{f}.txt")), format!("{n} {k} {f}\n").as_bytes());
+            }
+            if n == "agent0" && k == 2 {
+                assert_eq!(&read_at(&r, &wc, &format!("{n}/big/b39.bin"))[..16], format!("{:016}", 39).as_bytes());
+            }
+        }
+    }
+    drop(r);
+    assert_fsck_clean(fs, &id, "after packing writers raced gc");
+}
+
 // ---- scale round, adversarial pass on stream G2 --------------------------------------
 
 /// A backend that forwards to `inner` and, the first time a path under

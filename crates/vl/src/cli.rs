@@ -1011,7 +1011,8 @@ pub enum GroupCmd {
         group: String,
         #[arg(required = true)]
         people: Vec<String>,
-        /// A device fingerprint you have checked with its owner.
+        /// A device fingerprint you have checked with its owner (one
+        /// person at a time).
         #[arg(long, value_name = "FINGERPRINT")]
         confirm: Vec<String>,
     },

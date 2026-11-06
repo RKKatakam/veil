@@ -152,14 +152,16 @@ vl push
   them.
 - **Keys come from an admin's signature, for confirmed devices only.** When
   an admin adds you to a group, their `vl` grants you the key, but only for
-  devices nothing but the server vouches for. The first time, it shows
+  devices vouched for outside the server. The first time, it shows
   `confirm alice's device: 4F2A-…`; the admin checks it with you and runs
-  `vl group add finance alice --confirm 4F2A-9C1E-77B0-D3E5-A1C2`. Devices
+  `vl group add finance alice --confirm 4F2A-9C1E-77B0-D3E5-A1C2` (one
+  person at a time). Devices
   you confirm yourself (`vl identity confirm`) get the key the next time an
   admin adds you. A server that lists a device of its own under your name
   gets nothing. A manager's addition gives you the folder but not the key,
   until an admin's device signs. Leaving your last group rotates the key
-  away from all your devices.
+  away from all your devices; a removal that leaves you in another group
+  says so.
 - **An existing repository** starts syncing its secrets only when you ask,
   after seeing the list:
 

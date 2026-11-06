@@ -994,7 +994,9 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
   first parent replaced: BUG-820),
   3 (access lines), 4–6 (hash, canonical decoding, format), 7 (closure:
   every object a push introduces carries the pusher's upload receipt,
-  unless it is the entry at the same path in one of the snapshot's parents;
+  unless the entry at the same path in one of the snapshot's parents names
+  it; that is every object an entry names: its own, its `fallback`, and a
+  conflict's terms, which `fetch` also serves at that path (BUG-834);
   anything else, stored or not, gets the answer a missing object gets, so a
   push never confirms a guess of a hidden file or folder: BUG-824),
   8 (§13.6), 10 (every
@@ -1096,8 +1098,7 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
 * **One secret key** per project (§13.6).
 * **Open findings** (`docs/BUGS.md`): HTTP/2 connections idle between
   requests are not timed out (BUG-825 bounds handshakes and HTTP/1 request
-  heads); a `--only` clone records the folder's secrets as deleted
-  (BUG-832).
+  heads).
 * **Upload timing:** an upload answers the same whether the project held
   an object or not, but a store may take another time to write over an
   existing key.
@@ -1108,6 +1109,11 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
 * **Embargoes and cloaked lines** cannot be pushed to the server yet.
 * **`--only` clones** cannot move to revisions that changed folders outside
   their directory (§13.5).
+* **A working copy without the project's `.veilpolicy`** (someone who cannot
+  read it, the project root being private by default; an `--only` clone)
+  classifies files by the built-in rules: a shared secret it holds sealed is
+  kept as recorded, never deleted, and an edit of it stays local (`vl status`
+  says so) until someone who reads the policy records it (BUG-832).
 * **Moving a repository with history onto the server** works by pushing it;
   its first accepted policy is listed back to the admin (§13.3). Every
   pushed snapshot must be signed by a device registered on the server, so
@@ -1170,7 +1176,9 @@ for by someone outside the server.
   4F2A-9C1E-…` for each of alice's devices nothing vouches for yet, and
   grants no key to it. The admin compares it with what alice reads from
   her screen (in person, on a call), then runs `vl group add finance alice
-  --confirm 4F2A-9C1E-77B0-D3E5-A1C2`. A `--confirm` that matches none of
+  --confirm 4F2A-9C1E-77B0-D3E5-A1C2` (one person at a time: with several,
+  the server could list the device under another of them, BUG-835). A
+  `--confirm` that matches none of
   alice's listed devices fails loudly: the server is listing a device that
   is not the one alice has.
 * **A person's later devices are confirmed by the person (cross-signing).**
@@ -1200,6 +1208,9 @@ for by someone outside the server.
 * **Removal rotates by the ring, not the list:** `vl group remove` revokes
   every ring member recorded under the person's name as well as their
   listed devices, so a server that hides a device does not keep it the key.
+  Whether the person left their last group is the server's word: a removal
+  that leaves them in another group says so (`keys: fin is still in
+  security: the secret key was not rotated away from them`, BUG-836).
 
 **Threat review** (attackers outside the boundary for secrets, §3.1):
 

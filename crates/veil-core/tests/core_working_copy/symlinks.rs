@@ -1060,6 +1060,28 @@ fn random_tree(repo: &Repo, leaves: &[(String, Node)]) -> ObjectId {
     t
 }
 
+/// BUG-833 (the proptest's pinned seed): a directory `a` holding `a/a`
+/// replaced by a link `a → a`. Checkout failed as a whole with ELOOP
+/// (`Too many levels of symbolic links`); it must replace the directory
+/// with the link, writing nothing outside and nothing through a link.
+#[test]
+fn a_directory_replaced_by_a_link_to_its_own_name_is_checked_out() {
+    let d = disk();
+    let (repo, _, _) = new_repo("alice");
+    let first = random_tree(&repo, &[("a/a".into(), Node::File(0))]);
+    let second = random_tree(&repo, &[("a".into(), Node::Link("a".into()))]);
+    repo.checkout_tree(&d.fs, None, &first).unwrap();
+    let r = repo.checkout_tree(&d.fs, Some(&first), &second);
+    assert!(r.is_ok(), "{:?}", r.err());
+    assert_eq!(std::fs::read_link(d.root.join("a")).unwrap(), std::path::Path::new("a"));
+    d.assert_outside_untouched();
+    // And back again.
+    let r = repo.checkout_tree(&d.fs, Some(&second), &first);
+    assert!(r.is_ok(), "{:?}", r.err());
+    assert!(d.root.join("a/a").is_file());
+    d.assert_outside_untouched();
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
 

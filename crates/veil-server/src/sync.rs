@@ -469,6 +469,20 @@ fn entry_at(src: &Source, tree: &ObjectId, path: &str) -> Result<Option<veil_cor
     Ok(None)
 }
 
+/// Every object entry `e` names: its object, its fallback and, for a
+/// conflict, its terms' objects and fallbacks (what `fetch` serves at its
+/// path).
+fn named_ids(src: &Source, e: &veil_core::TreeEntry) -> Result<Vec<ObjectId>> {
+    let mut out = vec![e.id];
+    out.extend(e.fallback);
+    if e.kind == EntryKind::Conflict {
+        if let Object::Conflict(c) = Object::decode(&src.raw(&e.id)?)? {
+            out.extend(c.referenced_ids());
+        }
+    }
+    Ok(out)
+}
+
 /// A common ancestor of real snapshots `a` and `b` (the universal root at
 /// worst): both histories are walked a generation at a time until one
 /// reaches a snapshot the other has seen.
@@ -721,20 +735,24 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             for (id, raw) in &trees {
                 src.rt.block_on(src.hub.objects.put(src.project, id, Bytes::from(raw.clone())))?;
             }
-            // Every object a changed path names was uploaded by the pusher,
-            // or is the entry at that path in a parent: anything else gets
-            // the answer a missing object gets, stored or not (BUG-824).
+            // Every object a changed path names (its object, fallback and
+            // conflict terms) was uploaded by the pusher, or is named by the
+            // entry at that path in a parent: anything else gets the answer
+            // a missing object gets, stored or not (BUG-824, BUG-834).
             for c in &g.changes {
                 let Some(e) = &c.new else { continue };
-                if uploaded.contains(&e.id) {
-                    continue;
-                }
-                let mut in_parent = false;
+                let mut before = HashSet::new();
                 for t in &ptrees {
-                    in_parent |= entry_at(src, t, &c.path)?.is_some_and(|p| p.id == e.id);
+                    if let Some(pe) = entry_at(src, t, &c.path)? {
+                        before.extend(named_ids(src, &pe)?);
+                    }
                 }
-                if !in_parent {
+                let known = |id: &ObjectId| uploaded.contains(id) || before.contains(id);
+                if !known(&e.id) {
                     return Err(VeilError::Missing(e.id).into());
+                }
+                if let Some(id) = named_ids(src, e)?.into_iter().find(|id| !known(id)) {
+                    return Err(VeilError::Missing(id).into());
                 }
             }
             check_changes(src, &view, &g.changes, &real_tree, &rp)?;

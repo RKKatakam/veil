@@ -56,7 +56,7 @@ Options:
 
 | | |
 |---|---|
-| `--confirm <FINGERPRINT>` | A device fingerprint you have checked with its owner |
+| `--confirm <FINGERPRINT>` | A device fingerprint you have checked with its owner (one person at a time) |
 
 ## `vl group remove`
 

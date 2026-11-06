@@ -697,6 +697,18 @@ impl Craft<'_> {
         self.refer(path, id, size);
     }
 
+    /// Upload `o` with the push and return its id.
+    pub fn put_object(&mut self, o: O) -> ObjectId {
+        self.put(o)
+    }
+
+    /// Set `path` to `entry` as given (its object is not uploaded).
+    pub fn set_entry(&mut self, path: &str, mut entry: TreeEntry) {
+        let parts: Vec<&str> = path.split('/').collect();
+        entry.name = parts.last().unwrap().to_string();
+        self.root = self.set_at("", Some(self.root), &parts, entry);
+    }
+
     /// Point `path` at directory tree `id` without uploading it.
     pub fn refer_dir(&mut self, path: &str, id: ObjectId) {
         let parts: Vec<&str> = path.split('/').collect();

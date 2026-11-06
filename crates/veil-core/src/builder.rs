@@ -798,7 +798,9 @@ pub fn build_tree_cached(
     let policy_changed = match (crate::policy::read_policy_file(fs)?, parent_policy) {
         (PolicyFile::File(now) | PolicyFile::Linked(now), Some(p)) => !store.matches_encoding(&p, &now)?,
         (PolicyFile::File(_) | PolicyFile::Linked(_), None) => true,
-        (PolicyFile::Absent, p) => p.is_some(),
+        // A policy file this working copy never showed (a `vl clone
+        // --only`) is not deleted: nothing is reclassified (BUG-832).
+        (PolicyFile::Absent, p) => p.is_some() && !opts.materialised.is_some_and(|m| m.hidden(&policy_path)),
         // Unreadable: the accepted policy applies, nothing to reclassify.
         (PolicyFile::Unavailable(_), _) => false,
     };
@@ -1646,6 +1648,26 @@ impl<'a> Builder<'a> {
             }
         }
         match &class.tier {
+            // A secret this working copy holds sealed keeps its recorded
+            // entry, unless this snapshot's own edit of `.veilpolicy`
+            // isolates it: a view without the project's policy (one that
+            // cannot read it, a `vl clone --only`) applies the built-in
+            // rules, which keep `.env` local, and would otherwise record
+            // the shared secret as deleted for everyone (BUG-832). Nothing
+            // of the local file is recorded: under a rule that keeps it
+            // local, it may be the member's own (a `.netrc` where a
+            // teammate committed a sealed one), so its edit stays local.
+            Tier::Ignored | Tier::Isolated if self.keeps_sealing(path, &class, parent_file) => {
+                let pe = parent_file.expect("keeps_sealing checks it");
+                if !self.holds_leaf(path, pe)? {
+                    self.report.policy_warnings.push(format!(
+                        "{path}: kept as recorded ({}): the policy this working copy applies keeps the file local, so \
+                         its edit is not recorded",
+                        pe.visibility.label()
+                    ));
+                }
+                return Ok(Some(pe.clone()));
+            }
             Tier::Ignored => {
                 self.report.ignored += 1;
                 self.report.ignored_paths.push((path.clone(), false));
@@ -2082,6 +2104,15 @@ impl<'a> Builder<'a> {
             name: name.to_string(),
             ..pe.clone()
         }))
+    }
+
+    /// Does sealed content at `path` (its parent entry `parent_file`) keep
+    /// its entry against `class`? Yes unless an edit of `.veilpolicy` in
+    /// this very snapshot reclassifies the path (as in
+    /// [`Builder::audience`]).
+    fn keeps_sealing(&self, path: &VPath, class: &Classification, parent_file: Option<&TreeEntry>) -> bool {
+        parent_file.is_some_and(|pe| matches!(pe.visibility, Visibility::Cloaked { .. }))
+            && !self.parent_policy.as_ref().is_some_and(|old| old.classify(path, false) != *class)
     }
 
     /// The audience of new content at `path` (classified `class`, not

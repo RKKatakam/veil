@@ -89,3 +89,51 @@ fn a_clone_killed_during_its_checkout_never_records_deletions() {
     }
     assert!(interrupted > 0, "no clone was interrupted during its checkout (each finished first)");
 }
+
+/// BUG-837: a clone killed before its checkout started (during its fetch:
+/// `kill -9` as soon as its repository exists) held part of the history and
+/// none of the files, and the next command showed a clean, empty project.
+/// It must say the clone did not finish instead.
+#[test]
+fn a_clone_killed_during_its_fetch_is_refused_not_shown_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, src) = (tmp.path().join("home"), tmp.path().join("src"));
+    for d in 0..40 {
+        std::fs::create_dir_all(src.join(format!("d{d:02}"))).unwrap();
+        for i in 0..100 {
+            std::fs::write(src.join(format!("d{d:02}/f{i:03}.txt")), format!("{d} {i}\n")).unwrap();
+        }
+    }
+    ok(&home, &src, &["init"]);
+    ok(&home, &src, &["commit", "-m", "import"]);
+    ok(&home, &src, &["tag", "set", "main", "-r", "@-"]);
+    let mut interrupted = 0;
+    for attempt in 0..8 {
+        let dst = tmp.path().join(format!("dst{attempt}"));
+        let mut child = Command::new(env!("CARGO_BIN_EXE_vl"))
+            .args(["clone", src.to_str().unwrap(), dst.to_str().unwrap()])
+            .current_dir(tmp.path())
+            .env("VEIL_HOME", &home)
+            .env("VEIL_USER", "alice")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while child.try_wait().unwrap().is_none() && !dst.join(".veil/repo.json").exists() {
+            assert!(std::time::Instant::now() < deadline, "the clone neither created its repository nor ended");
+        }
+        let _ = child.kill();
+        if child.wait().unwrap().success() || checkout_started(&dst) {
+            continue;
+        }
+        interrupted += 1;
+        let out = vl(&home, &dst, &["status"]);
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(!out.status.success() && text.contains("interrupted"), "attempt {attempt}: an interrupted clone was taken for a whole one:\n{text}");
+        if interrupted >= 2 {
+            break;
+        }
+    }
+    assert!(interrupted > 0, "no clone was interrupted during its fetch");
+}
