@@ -1,6 +1,6 @@
 # Maintenance
 
-> Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)). Where this page mentions cloaking, scopes, isolated files or path and SSH remotes, the server replaces them with folder access, encrypted secrets and pushes to the server.
+> Where this page mentions cloaking, scopes or isolated files, the server replaces them with folder access and encrypted secrets (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)).
 
 1. [`vl gc`](#vl-gc)
 2. [`vl fsck`](#vl-fsck)
@@ -54,11 +54,10 @@ Storage: 0.02 MiB -> 0.01 MiB
   shared.
 * `--auto` runs what background maintenance runs (see below), and exits
   at once if another `gc` is running.
-* **A remote on a path is collected the same way**: `vl -R ../hub gc`.
-  History un-tagged there (`vl push --delete`, `vl push --force`) is pruned
-  after the grace period. In a bare repository such as a remote, `vl -R`
-  runs `log`, `show`, `tag list`, `op log`, `gc` and `fsck`; other commands
-  need a working copy and are refused.
+* **A bare repository** (an old path remote, from before the Veil server)
+  is collected the same way: `vl -R ../hub gc`. In a bare repository,
+  `vl -R` runs `log`, `show`, `tag list`, `op log`, `gc` and `fsck`; other
+  commands need a working copy and are refused.
 * If part of the history can't be read, `gc` deletes nothing and says so.
   Run `vl fsck`.
 
@@ -85,7 +84,7 @@ did to `.veil/local/maintenance.log`.
 
 * `VEIL_GC_AUTO=0` turns it off. It is off when `CI` is set, unless
   `VEIL_GC_AUTO=1`.
-* Remotes are never maintained in the background: run `vl -R <remote> gc`.
+* The Veil server needs no maintenance: each object is stored once, with no repacking.
 * It also removes what interrupted commands left behind: temp files whose
   writer is gone, and abandoned staging.
 
@@ -105,16 +104,16 @@ note: 2 predecessor snapshot(s) of the evolution log are not present (normal aft
 …
 ```
 
-* `redacted` objects are content you hold no key for, or that a public
-  remote withheld: expected.
+* `redacted` objects are content you hold no key for, or that never reached
+  this repository: expected.
 * `unreachable` counts objects nothing references, loose or packed (`gc`
   keeps them, packed, through their grace period); they are verified too.
   A pack that can't be opened is a warning (`gc` refuses to run until it is
   removed); any reachable object it held is reported as missing.
-* `-R PATH` checks another repository, including a bare remote on a path:
+* `-R PATH` checks another repository, including a bare one:
   `vl fsck -R ../hub`.
-* To repair missing or damaged objects, fetch them from a remote that has
-  them: `vl pull --full`. To repair a remote, `vl push --full`.
+* Missing or damaged objects are not repaired in place: clone the project
+  from the Veil server again and move your unpushed work across.
 * Notes about a leftover lock, `.veil/lock.steal` or a sub-guard
   `.veil/lock.steal.<hash>` mean a `vl` was interrupted. They are
   harmless: the next command takes a dead holder's lock over (and first
@@ -158,14 +157,7 @@ too), `VEIL_HOME`, leftover sandboxes, the repository's format and lock
 it removes those whose holder has provably exited, which is the one thing
 it changes, and names the rest), the stat cache, the vault, the filesystem (network mounts, `fsync`, case and
 Unicode folding, see the README's [platform notes](../../README.md#platform-notes))
-and the clock. `vl doctor --remotes` also checks every remote: a path
-remote must be a Veil repository; an SSH remote is contacted (through your
-`ssh`, like `vl push`), must be a Veil repository, and its clock is compared
-with this machine's by the modification time of a probe file it creates and
-removes in the remote's `.veil/`. Beyond 60 s it warns: locks on a shared
-remote allow 2 minutes of clock difference between clients, and two clients
-can be off in opposite directions. Use it when a push or pull to an SSH
-remote reports a lock you do not expect.
+and the clock.
 
 Run it after installing, after moving a repository to another disk, and
 whenever something behaves strangely.
@@ -188,16 +180,12 @@ Would upgrade this repository from format 1 to format 3
   objects    76 (27 JSON tree(s), 0 binary tree(s))
   steps      verify, set-format, 3:hpke-ring-keys
   note: new content is sealed with AES-SIV and scope keys are wrapped with HPKE; existing sealed objects keep the legacy construction, their bytes and their ids (nothing is re-sealed), so snapshot ids and signatures do not change
-  note: a remote still at format 1 or 2 refuses AES-SIV objects and HPKE key rings: upgrade it with `vl upgrade --remote <name>`; a member's clone at format 2 cannot pull them until it is upgraded
+  note: a member's clone at format 1 or 2 refuses AES-SIV objects and HPKE key rings: it cannot pull them until it is upgraded (`vl upgrade` there)
   …
 $ vl upgrade
 Upgraded this repository from format 1 to format 3
   …
   note: scope 'team': new key generation 3, wrapped to every member with HPKE; earlier generations stay reachable (and stay under the legacy key wrapping already published)
-$ vl upgrade --remote origin
-Upgraded remote 'origin' (../team) from format 1 to format 3
-  …
-  note: key rings were not re-keyed here (no identity: a remote is upgraded structurally); they move to HPKE when an admin who has upgraded their clone pushes (in a clone that is already at format 3, `vl upgrade` still moves the admin's rings)
 ```
 
 * **Nothing is rewritten.** Old objects keep their bytes and ids, so
@@ -205,18 +193,15 @@ Upgraded remote 'origin' (../team) from format 1 to format 3
 * It runs `fsck` first and refuses if there is corruption (`--force`
   overrides). It is journaled and resumes after a crash.
 * **Older `vl` releases can no longer read an upgraded repository.**
-* **Order matters for a team.** Everyone upgrades `vl` first. Then upgrade
-  the shared remote (`vl upgrade --remote origin`), and each member upgrades
-  their clone. A format-1 or format-2 remote refuses format-3 objects, and a
-  clone at an older format can't pull them.
-* `vl upgrade --remote` works for path and SSH remotes (over SFTP, as push
-  and pull reach them).
+* **Order matters for a team.** Everyone upgrades `vl` first, then each
+  member upgrades their clone: a clone at an older format can't pull
+  objects of a newer one.
 * **Admins: run `vl upgrade` even in a clone that is already at format 3**
-  (a fresh clone of the upgraded remote, or one a non-admin upgraded). It
+  (one a non-admin upgraded). It
   moves the key rings you administer to HPKE ("Moved the key rings of this
   repository (format 3) to HPKE key wrapping"), then push. Members who are
   not admins get a note naming the scopes still waiting.
-* `vl clone` creates a clone at the source's format.
+* `vl clone` creates a clone at the newest format.
 
 Details: [`docs/FORMAT.md`](../FORMAT.md).
 
@@ -233,9 +218,8 @@ What only exists on your machine:
 
 * Back up `$VEIL_HOME` securely (it holds private keys): an encrypted
   backup or a password manager.
-* A team remote is a backup of the history you pushed, cloaked content
-  included (as ciphertext). Push to a second remote on another disk if you
-  want two.
+* The Veil server holds the history you pushed, secrets included (as
+  ciphertext): back the server up (its database and object storage).
 * To back up a whole repository, copy the directory (including `.veil/`)
   **while no `vl` command is running** on it, with your usual backup tool.
   After restoring, run `vl fsck`. If the repository and your files are out

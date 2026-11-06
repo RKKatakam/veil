@@ -2,7 +2,7 @@
 
 > **With the server** ([VISIBILITY.md](../VISIBILITY.md)): the creator is the admin, everything is private by default, admins give groups or people access to folders (`vl access billing/ finance`), and `public` folders are visible to everyone. Secrets (`.env`, keys) are encrypted automatically and follow the same access; personal private keys never leave the machine. The built-in secret rules, the scanner and quarantine below carry over unchanged.
 >
-Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)). Tiers, cloaking, scopes and team remotes below are how today's client works.
+Tiers, cloaking and scopes below are how today's client works; folder access on the server replaces cloaking in the next part of the simplification pass (see [OVERVIEW.md](../OVERVIEW.md)). Where this page shows team and public remotes, those were path remotes, removed in its first part: `vl` syncs only through the Veil server, which takes shared secrets (`.env` and the like) but refuses other cloaked lines and embargoes until a later milestone ([HUB.md](../HUB.md) §13.8), so those stay on your device for now. The engine still applies every filter described here to any transfer between repositories.
 
 Every path in a Veil repository has a **visibility tier**, decided by
 `.veilpolicy` and by rules built into the engine. The engine enforces it

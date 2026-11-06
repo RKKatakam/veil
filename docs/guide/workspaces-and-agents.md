@@ -1,6 +1,6 @@
 # Workspaces and agents
 
-> Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)). Where this page mentions cloaking, scopes, isolated files or path and SSH remotes, the server replaces them with folder access, encrypted secrets and pushes to the server.
+> Where this page mentions cloaking, scopes or isolated files, the server replaces them with folder access and encrypted secrets (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)). `vl` syncs only through the Veil server.
 
 A **workspace** is a line of work with its own working-copy change. Unlike a
 Git worktree it needs no directory: it lives in the repository, and you

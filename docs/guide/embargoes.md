@@ -1,5 +1,7 @@
 # Embargoes: fixing a security issue in private
 
+> The Veil server cannot take embargoed changes yet ([HUB.md](../HUB.md) §13.8, §13.9), and the path remotes that carried them (the "mirror" and "team remote" below) were removed in the simplification pass, part 1. Until the server's embargo milestone, an embargoed merge stays on the device where it was made; the rules below are what the engine enforces on any transfer.
+
 An **embargoed merge** lands a fix on `main` now and publishes it later.
 Until the release, everyone outside the embargo's scope (public remotes,
 teammates not in the scope) keeps seeing `main`'s **pre-merge

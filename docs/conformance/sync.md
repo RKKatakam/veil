@@ -13,9 +13,14 @@ storage".
 
 * **152 tests**, all passing (200 when first written, 16 of them
   `#[ignore = "BUG-NNN: …"]` reproductions, all fixed since; 48 Git-bridge
-  tests left with Git interop). SFTP tests run through a stand-in `ssh`
-  serving the local OpenSSH `sftp-server` (skipped, with a message, where
-  there is none).
+  tests left with Git interop). **Since the simplification pass, part 1**
+  (path and SFTP remotes removed), the SFTP tests and the tests of removed
+  flags (`--delete`, `--full`, `--dry-run`, remote kinds, `upgrade
+  --remote`) are gone; the rest run through the path remotes of `vl`'s
+  test fixture (`crates/vl/src/test_remotes.rs`, debug builds only), which
+  exercise the engine's transfer and the pull rules
+  (`remote::apply_remote_tags`) the server client shares. Counts below are
+  from before that.
 * **Git scripts in this series:** 318: 177 t5xxx (t5304 included), t1050,
   t1450, t6500 and 138 t9xxx. Not applicable: smart/HTTP/wire protocols,
   Git's pack and index formats, submodules, svn/p4/cvs and other bridges,

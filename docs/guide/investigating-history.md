@@ -1,6 +1,6 @@
 # Investigating history
 
-> Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)). Where this page mentions cloaking, scopes, isolated files or path and SSH remotes, the server replaces them with folder access, encrypted secrets and pushes to the server.
+> Where this page mentions cloaking, scopes or isolated files, the server replaces them with folder access and encrypted secrets (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)). `vl` syncs only through the Veil server.
 
 Who wrote this line, when did this string appear, which change broke the
 build? Veil answers with `vl blame`, `vl grep`, the `vl log` filters and

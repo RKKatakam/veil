@@ -16,7 +16,7 @@ or a web front-end that talks to `veil-core` directly. For the design, see
 | | Native (`vl`, the default) | Portable (`--no-default-features --features wasm`) |
 |---|---|---|
 | Targets | Linux, macOS | `wasm32-unknown-unknown`; any host, for tests |
-| Storage | `DiskBackend`, `SftpBackend` (via `ssh`), `MemoryBackend`, overlays | `MemoryBackend`, overlays, or a `StorageBackend` you write (IndexedDB, OPFS, a server API) |
+| Storage | `DiskBackend`, `MemoryBackend`, overlays | `MemoryBackend`, overlays, or a `StorageBackend` you write (IndexedDB, OPFS, a server API) |
 | Clock | system clock | the one you install with `veil_core::clock::set_clock` |
 | Randomness | the OS | WebCrypto (`crypto.getRandomValues`), through getrandom's `wasm_js` backend |
 | Packs (`gc`, sync) | read and written with zstd: compressed and delta entries | read with a pure-Rust decoder (every pack `vl` writes); written with *stored* entries only |
@@ -80,7 +80,7 @@ Everything in the engine that is not about the host:
   as it does in `vl`;
 * sync between backends (push, pull, clone), `fsck` and `gc`.
 
-Not available: `DiskBackend`, SSH remotes, and `vl` itself.
+Not available: `DiskBackend` and `vl` itself.
 
 ## Things to know
 

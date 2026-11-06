@@ -257,3 +257,25 @@ fn fetch_across_snapshots_checks_each_want_in_its_own_snapshot() {
         }
     }
 }
+
+/// BUG-839: `vl tag set NAME --cloak` makes a tag whose name is sealed for
+/// its scope, and before the Veil server no public remote ever received
+/// it. `vl push` to the server sends every local tag as a branch, cloaked
+/// ones too, and the server shows branch names to everyone who may read
+/// anything in the project: anyone on Earth, once a folder is public.
+#[test]
+#[ignore = "BUG-839: a cloaked tag's name is pushed to the server as a branch everyone sees"]
+fn bug_839_a_cloaked_tag_name_never_reaches_anyone_on_earth() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    const TAG: &str = "plan-acquire-initech-6d1f";
+    p.admin.ok(&p.dir, &["tag", "set", TAG, "-r", "main", "--cloak"]);
+    let _ = p.admin.run(&p.dir, &["push"]);
+    let api = hub.api();
+    let tips = api.tips(None, &p.name);
+    assert!(
+        tips.as_ref().is_none_or(|t| !t.branches.contains_key(TAG)),
+        "anyone on Earth sees the cloaked tag's name: {tips:?}"
+    );
+    assert!(api.tips(None, &p.name).is_some(), "control: the project has public folders");
+}

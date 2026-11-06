@@ -345,8 +345,8 @@ have their own, lower limits.
 
 * `vl clone`, `vl push` and `vl pull` talk to the server; `hub:` URLs
   (`hub:acme/app`, `https://hub.example/acme/app`) name a project.
-* Path and SFTP remotes, which today's client supports, are removed in the
-  simplification pass after the server lands (OVERVIEW.md).
+* Path and SFTP remotes were removed in the simplification pass, part 1
+  (OVERVIEW.md).
 * **Moving an existing repository** onto the server is a push, with the
   upgrade steps of §5.7.
 
@@ -769,9 +769,9 @@ From OVERVIEW.md:
      what they may see (§4.6);
    * moving existing repositories onto the server (§5.7).
 2. **Then: a simplification pass.** Remove what the server makes
-   unnecessary: plain-file (SFTP and path) remotes, offline assumptions, old
-   storage formats (still readable for `vl upgrade`) and old jargon (cloak,
-   scope, isolate).
+   unnecessary: plain-file (SFTP and path) remotes and offline assumptions
+   (**part 1, done**), old storage formats (still readable for
+   `vl upgrade`) and old jargon (cloak, scope, isolate).
 3. **Then: the server's features, in stages.**
    * fetch on demand (§9.1);
    * server-side history and search (§9.1);
@@ -1137,8 +1137,9 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
   history signed by teammates who have not signed in yet is refused until
   they do.
 * The team vault (`vl secret --scope`) does not sync through the server.
-* `vl push --dry-run` and `--delete`, and `pre-push` hooks, are not
-  available for server remotes yet.
+* `vl push --dry-run` and `--delete` were removed with path remotes (the
+  simplification pass, part 1); `pre-push` hooks run before a push to the
+  server.
 
 ### 13.9 Later milestones (not in S1)
 
@@ -1156,8 +1157,8 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
 6. **The embargo release service** (deadline worker, escrow, §8.2) and
    embargoes through the server.
 7. **The web client** (§10).
-8. **The simplification pass:** remove SFTP and path remotes, offline
-   assumptions, cloak/scope jargon (OVERVIEW.md).
+8. **The simplification pass:** remove SFTP and path remotes (part 1,
+   done), offline assumptions, cloak/scope jargon (OVERVIEW.md).
 
 ### 13.10 Speed (the OpenScion gates, first measurement)
 

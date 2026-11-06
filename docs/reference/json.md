@@ -19,7 +19,6 @@ text:
 | [`vl secret list`](secret.md#vl-secret-list) | [`veil.secret.list/1`](#veilsecretlist1) |
 | [`vl ls`](ls.md) | [`veil.ls/1`](#veills1) |
 | [`vl resolve --list`](resolve.md) | [`veil.resolve.list/1`](#veilresolvelist1) |
-| [`vl push --dry-run`](push.md) | [`veil.push.plan/1`](#veilpushplan1) |
 | [`vl split`](split.md) (a write command) | [`veil.split/1`](#veilsplit1) |
 | [`vl squash`](squash.md) (a write command) | [`veil.squash/1`](#veilsquash1) |
 | [`vl blame`](blame.md) | [`veil.blame/1`](#veilblame1) |
@@ -500,45 +499,6 @@ conflicts of a snapshot (`-r`, default `@`).
 | `schema` | string | `veil.resolve.list/1` |
 | `snapshot` | [snapshot reference](#snapshot-reference) | The snapshot listed |
 | `conflicts` | array | In path order: `path`, and `conflict` (a [conflict](#conflict); null for a conflict recorded as markers in the file, or a file moved aside by a file/directory conflict) |
-
-## `veil.push.plan/1`
-
-`vl push --dry-run [REMOTE] --json`: what a push would send, per remote
-(every configured remote when none is named). Nothing is written to any
-remote. The objects and tags listed are exactly what the push then sends,
-unless someone else pushes in between.
-
-| Field | Type | Meaning |
-|---|---|---|
-| `schema` | string | `veil.push.plan/1` |
-| `remotes` | array | One plan per remote, by name: |
-| `name` | string | The remote |
-| `url` | string | Its URL, as configured |
-| `public` | bool | A public remote: no cloaked content, cloaked tags or key rings |
-| `error` | string or null | This remote could not be planned (unreachable, not a repository, a tag that builds on withheld history): the push would fail the same way. The other fields are then empty |
-| `creates_remote` | bool | Nothing is there yet: the push would create the repository |
-| `tags` | array | Each tag the push considers, by name: `name`; `action` (`create`, `update`, `unchanged`, `rejected`: the remote diverged and `--force` was not given, or `skipped`: held back by design, such as a cloaked tag on a public remote or a tag that would publish an unreleased embargo's history); `target` and `target_short` (the local target); `remote_target` (string or null: where the remote's tag is now); `message` (string or null: why it is rejected or skipped); `cloak` (string or null: the scope of a cloaked tag) |
-| `snapshots` | number | Snapshots that would be sent |
-| `objects` | number | Objects that would be sent, snapshots included |
-| `trees` | number | Of which directory trees |
-| `blobs` | number | Of which plaintext file contents |
-| `sealed` | number | Of which ciphertext (cloaked or embargoed content, sealed trees) |
-| `object_bytes` | number | Size of those objects before packing |
-| `pack_bytes` | number | Size of the pack(s) the push would write: compressed, with deltas (what crosses the wire) |
-| `snapshot_ids` | array of strings | The snapshots, in hex |
-| `object_ids` | array of strings | Every object, in hex, in the order it would be sent |
-| `withheld_objects` | number | Objects the visibility filter holds back (cloaked or embargoed content, on a public remote) |
-| `withheld_snapshots` | array | History that stays here: snapshots reachable from the pushed tags only through an unreleased embargo (`snapshot_id`, `snapshot_short`, and `embargo`). Sent once the embargo is released |
-| `releases` | array of strings | Embargoes whose staged release this push would publish (`vl embargo release`): afterwards it cannot be taken back |
-| `files` | object or null | Public remotes only (null for a team remote): `published`, `withheld`, `embargoed_trees`, below |
-| `published` | array | Each file whose content becomes public on this remote, by path: `path`; `exposure` (`new`: the path was never public there; `exposed`: it was there but withheld, cloaked or embargoed, until now; `modified`: already public there, new content); `size` (number or null: unknown for the last public version of a file edited on a cloaked line); `released_embargo` (string or null: public because this embargo was released) |
-| `withheld` | array | Each file of the pushed history whose new content stays withheld: `path`; `reason` (`cloaked`: public remotes never receive it; `cloaked_edit`: edited on a cloaked line, the remote keeps its last public version; `embargoed`: under an unreleased embargo, the remote shows the pre-merge version); `scope` and `embargo` (strings or null); `message` (what the text prints) |
-| `embargoed_trees` | array | Snapshots whose tree is under an unreleased embargo you hold no key for (`snapshot_id`, `snapshot_short`, `embargo`): the remote sees their pre-merge tree, and the files the embargo changes cannot be listed |
-| `warnings` | array of strings | What the push would warn about |
-
-The exit status is 1 where the push would fail: a remote that cannot be
-planned, a tag the remote would reject, or a tag named with `-t` that
-would be held back.
 
 ## `veil.split/1`
 

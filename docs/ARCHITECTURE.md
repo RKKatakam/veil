@@ -20,12 +20,12 @@ project and enforces every permission. It is not Git and not offline-first.
 
 **What this document describes.** The built **client engine**: the layers
 below, the op log, packs, the history index, gc, embargoes, the secret
-scanner, workspaces. The server is built next (`docs/HUB.md`). Until then,
-today's client restricts paths by encrypting them for a *scope* (cloaking,
-§3–§4) and syncs with path and SFTP remotes (§1, §8). Those parts are
-described as built facts; the server replaces them (folder access instead
-of cloaking, the server instead of plain-file remotes), and the
-simplification pass removes them.
+scanner, workspaces. The server's milestone S1 is built (`docs/HUB.md`
+§13), and `vl` syncs only through it (§8). Today's client still restricts
+paths by encrypting them for a *scope* (cloaking, §3–§4), described as
+built facts; folder access on the server replaces it, and the next part of
+the simplification pass removes it. Path and SFTP remotes were removed in
+its first part.
 
 Veil is built as a stack of small layers. Each layer only depends on the ones
 below it, and nothing above the VFS layer knows a disk exists.
@@ -73,7 +73,6 @@ must not be trusted (which disables stat caching):
 | `DiskBackend` | ns since the epoch / ns / inode number (Unix; mtime only elsewhere) | wall clock, ns, `exact: false` |
 | `MemoryBackend` | per-backend write-generation counter / – / – | current generation, `exact: true` |
 | `OverlayBackend`, `TreeView` | – (mixed or immutable sources) | `None` (they use `known_id`) |
-| `SftpBackend` | – (another machine's clock) | `None` |
 
 * **DiskBackend** does atomic, durable writes (temp file, fsync, rename,
   fsync of the directory; see §9) and never follows a symlink. Checkout
@@ -104,8 +103,7 @@ must not be trusted (which disables stat caching):
   disk, and nothing from a tree is written there. `metadata` and listings
   stay plain `lstat`s (they only ever lead to such a read or write).
   `MemoryBackend`, `OverlayBackend`, `TreeView`, `SparseView` and
-  `SandboxFs` hold links the same way; `SftpBackend` holds none (remotes
-  hold objects only), and a backend without them says so
+  `SandboxFs` hold links the same way, and a backend without them says so
   (`supports_links`), which checkout reports per link.
 * **MemoryBackend** is a flat `BTreeMap<VPath, Node>`. Because the
   descendants of `a/` are contiguous in string order, directory listings are
@@ -117,54 +115,6 @@ must not be trusted (which disables stat caching):
   layer. Ancestor whiteouts hide whole subtrees. A file in the way of a
   directory is an error, exactly as on the other backends; it is never
   whited out implicitly.
-* **SftpBackend** (`vfs/sftp*.rs`; today's client, removed in the
-  simplification pass) is a repository on another machine,
-  reached through the user's own `ssh` (`ssh … -s -- host sftp`, as
-  `sftp(1)` runs it; `VEIL_SSH` replaces the command), so `~/.ssh/config`,
-  the agent, `known_hosts` and ProxyJump just work and the server needs only
-  SSH. It speaks SFTP version 3 itself: a small pipelined client in which
-  any number of threads keep any number of requests in flight, a reader
-  thread routing replies by request id. `write` is a temp file opened with
-  `O_EXCL`, written with every chunk in flight, `fsync@openssh.com`, then
-  `posix-rename@openssh.com`; `write_unsynced` skips the fsync and queues
-  the file, and `sync_barrier` opens, fsyncs and closes every queued file in
-  one pipelined batch. `create_new` writes a synced temp file and
-  `hardlink@openssh.com`s it into place (fails if the target exists), or
-  falls back to `OPEN` with `CREAT|EXCL`. `read` stats and opens in one
-  round trip and reads everything in the next (255 KiB requests, short
-  reads re-requested, a probe past the expected end). "No such file" maps
-  to `NotFound`, other statuses to `Io` with a matching `ErrorKind`, a lost
-  connection to `ConnectionAborted`. SFTP cannot fsync a directory, so a rename is as durable
-  as the server's file system makes it after the file itself was synced.
-  `is_network()` is true: its lock is a fencing lease (§9) and sync batches
-  requests (§8). Remote URLs are `ssh://[user@]host[:port]/path` (`/~/` for
-  the home directory) and scp-style `[user@]host:path`; as in Git, a `:`
-  after a `/` makes a local path.
-  *A hostile or broken server* can neither hang the client nor exhaust its
-  memory (BUG-065, BUG-066). A writer thread sends requests, so a server
-  that stops reading never blocks a caller. Every request has its own
-  timeout: 300 s (`VEIL_SFTP_TIMEOUT`, in seconds), counted from when it
-  was sent or from the latest reply to an *earlier* request (servers answer
-  in order, so a deep pipeline on a slow link is progress); the handshake
-  has the same timeout. Replies to later requests, or to none at all, never
-  extend it, and more than 16 replies to requests never made close the
-  connection as a protocol error. Packets over 1 MiB are refused. One
-  `read` accepts the size the server stated plus 16 MiB (the file may have
-  been replaced between the stat and the open; Veil's mutable files are
-  small, packs and objects never change), and never more than 4 GiB
-  (`VEIL_SFTP_MAX_FILE`, e.g. `8G`); `read_range` reads exactly what was
-  asked, within the same ceiling. A directory listing accepts 1,000,000
-  entries (`VEIL_SFTP_MAX_LISTING`) and 256 MiB of names, and
-  `remove_dir_all` descends 256 levels. Each limit fails the operation with
-  a message that names it. Status messages from the server are stripped of
-  control characters before they reach the terminal.
-  *Why not a library:* `openssh-sftp-client` (with `openssh`) also drives
-  the system `ssh`, but is async-only: a tokio runtime under a synchronous,
-  `&self`, multi-threaded `StorageBackend`, for a protocol that takes a few
-  hundred lines. `russh` and `ssh2` (libssh2) bring their own SSH
-  implementation, so the user's config, agent forwarding, ProxyJump,
-  ControlMaster, FIDO keys and known_hosts handling would all have to be
-  re-created (or would silently differ), and `ssh2` adds a C dependency.
 * **TreeView** (in `tree.rs`) is a lazy, read-only backend over a snapshot
   tree. It only loads and decrypts the nodes that are actually read.
 
@@ -2327,15 +2277,36 @@ readable by anyone else must not be part of it:
 
 ## 8. Synchronisation
 
-> **With the server**, `vl` pushes and pulls only through the Veil server,
-> which checks permissions and sends each person only what they may see
-> (`docs/HUB.md` §4). What follows is **today's** sync between two
-> repositories (a path or SFTP remote, public or team). Its object walk,
-> embargo withholding, two-phase push and validation are what the server
-> reuses; plain-file remotes themselves are removed in the simplification
-> pass.
+**`vl` pushes and pulls only through the Veil server**, which checks every
+permission and sends each person only what they may see (`docs/HUB.md`
+§13.5; the client is `crates/vl/src/hub.rs`). Path and SFTP remotes were
+removed in the simplification pass, part 1.
 
-`remote::push` and `remote::pull` work between any two backends. Filtering
+* **Pull** asks for the branch tips, the snapshots it lacks, then trees from
+  the root down and the files it needs, one request per tree level, never
+  sending a list of what it has. What arrives is written through
+  `remote::Incoming`: loose below 16 objects, otherwise streamed into packs
+  (each `.pack`, a barrier, then its `.idx`, durably), all before the
+  pull's operation; every frame is checked against its id on arrival
+  (`hub::wire::read_frames`). The branches are then recorded with
+  `remote::apply_remote_tags`, with every rule below.
+* **Push** uploads the snapshots the server lacks and, of their trees, what
+  differs from their parents at the same path, collecting the server's
+  upload receipts; then one request moves each branch by compare-and-swap.
+  Objects go first: an interrupted push leaves only unreferenced objects
+  on the server. `pre-push` hooks run before it (§13).
+
+**The in-process transfer.** `remote::push` and `remote::pull` move history
+between two repositories in one process (any two backends). Nothing on the
+command line reaches them: the engine's tests use them, with in-memory or
+local stores, to check the visibility filters below, and `vl`'s debug
+builds use them as a test fixture (`crates/vl/src/test_remotes.rs`, active
+only with `VEIL_TEST_PATH_REMOTES`). A push runs under the receiver's lock:
+it decides the tags against the receiver's view (a rejected tag's history
+is not copied, BUG-288), walks the pushed history object by object, writes
+what the receiver lacks with `put_raw` (which re-verifies a copy it already
+has), then the operation. A pull walks the sender's tagged history the same
+way under the local lock. Filtering
 happens *during the object walk*: a public remote never receives sealed
 objects except those of released embargoes, never receives cloaked tags, and
 nothing is ever transferred under the `local` scope. Metadata follows
@@ -2348,8 +2319,7 @@ and records it as shown from a fallback (§6), never as deleted. A conflict
 object (format 4) is plaintext and travels with its entry; the walk then
 visits every version it names as any object, so a public remote receives
 the conflict and its public versions, never a sealed one (a public clone
-renders it with that version redacted), and `vl push --dry-run` lists each
-version as published or withheld. `gc` keeps, and `fsck` checks, every
+renders it with that version redacted). `gc` keeps, and `fsck` checks, every
 version a reachable conflict names.
 
 **Embargoed history.** Before walking, `push` computes, for every
@@ -2375,156 +2345,6 @@ merged-in (non-first) parents reach: the fix, and how it was made.
 * After the release, the next push fills the parents in, with unchanged
   snapshot ids.
 
-### Incremental transfer and packs on the wire
-
-Over a WAN, sync costs round trips, so neither side re-walks or re-checks
-what the other provably has (`remote.rs` has the details):
-
-* **The receiver's committed view is a complete closure**: transactions
-  write objects, a barrier, then the operation, so everything reachable
-  from the receiver's committed view is present. Presence alone proves
-  nothing (a crashed transfer leaves snapshots without trees), so only
-  reachability counts. Two refinements keep it exact: the non-first parents
-  of an embargoed merge (possibly redacted when it was sent) count only if
-  the receiver holds them in a pack, and on a public receiver embargo
-  wrappers are always revisited (what they hold may have been withheld then
-  and be releasable now).
-* **Push** has two phases (`docs/design/scale/1-lock-free-push.md`).
-  * **Phase A, without the remote's lock**, plans against the remote's
-    committed view as read then (advisory). One walk of the *local* graph
-    by generation (the history index) finds the snapshots the tags reach
-    outside that view's closure, and stops as soon as none left could be
-    sent: it reads the history above the remote's view, not all of it.
-    Below a known snapshot it goes on only along lines that build on an
-    embargoed merge (a merged-in parent withheld then may be releasable
-    now). Of their trees, a subtree whose id equals the one **at the same
-    path** in a known snapshot they build on is not sent and not read
-    (the path-aligned diff; an object that moved is sent again, which is
-    harmless). Tag fast-forward checks run on the local graph against
-    that view, **before anything is sent** (BUG-288).
-  * Everything sent goes into packs of at most 32 MiB of objects
-    (`VEIL_PUSH_CHUNK`; deltas between versions of a path), streamed into
-    the push's own staging directory `.veil/objects/incoming/push-<id>/`
-    (created exclusively, never through a symlink), each `.pack` durably,
-    then its `.idx`. No reader, inventory, fsck or gc counts what is
-    there. Each staged pack is recorded in the push journal
-    (`.veil/local/push/<hash of URL and tags>.json`), with the visibility
-    rules it passed (public or team, the embargoes released then).
-  * **Phase B, under the remote's lock** (waiting up to 300 s), re-reads
-    the view and decides the tags again against it; checks that every
-    known snapshot the upload built on is still in the view's committed
-    closure (a rewind and a prune in between: start again); checks every
-    journalled pack (in staging, or published by an interrupted attempt,
-    with the size its index implies); publishes the staged embargo
-    releases and only then checks that every embargo the plan treated as
-    released still is (BUG-807); then `ensure_held`, renames each pack and
-    then its index into `objects/pack/`, a barrier, the metadata merges
-    and the operation (`ensure_held` again). A failed check releases the
-    lock and runs phase A again, at most three times. `SyncReport::
-    lock_held_ms` says how long the lock was held.
-  * **Resume:** a retry finds the journal and reuses the packs it names
-    that are complete on the remote: their objects are not sent again,
-    but are still looked inside (the interrupted attempt may not have
-    staged what they reference). A staged pack is published only if this
-    attempt's own walk met every object in it: if the plan changed since
-    (a change withdrawn, embargoed or cloaked), the staging is removed and
-    the push plans again (BUG-808). A journal whose rules no longer hold (a
-    release taken back, the remote turned public) is discarded with its
-    staging. The withheld history is decided from the same one reading of
-    the release state that phase B checks (BUG-809). A crash leaves at
-    worst unpublished staging, or complete packs no operation references;
-    never a partial push.
-  * **Staging lifetime:** removed after publication; on a public remote,
-    removed under the lock when a tag was rejected meanwhile (what was not
-    published stays unpublished); kept for reuse on a team remote. Any
-    push and `vl -R <remote> gc` remove staging untouched for a week (its
-    `touched` file); `vl doctor --remotes` lists staging older than a day.
-* **Pull** lists the remote's objects (pack indexes and loose fan-out
-  directories, many requests in flight), skips every snapshot the local
-  committed view reaches, and at the first object it lacks downloads, in
-  parallel, every remote pack and loose object it lacks. Packs are
-  streamed in 4 MiB pieces to a spool on local disk
-  (`.veil/objects/incoming/pull`, removed when the pull ends; never read
-  as part of the store), after checking that the disk has room for them.
-  The walk then runs locally; objects already present are read locally,
-  never fetched.
-  When the remote holds objects the walk did not need, a local walk of the
-  committed view finds references to them: that fills gaps such as a clone
-  of a public mirror now pulling from a team remote, or embargoed content
-  released since. More than 256 new objects are stored locally as a pack.
-* Filtering is unchanged: whatever crosses passes the same `allowed`,
-  decoding and depth checks as before.
-* `vl push --full` / `vl pull --full` is the object-by-object walk of
-  everything, which re-verifies the receiver's copies: it repairs a
-  damaged object, and fills content a push receiver lacks below snapshots
-  it already has (a gap a plain push does not detect).
-
-### Dry runs (`push_plan.rs`)
-
-`vl push --dry-run` (`push_plan::plan_push`) is the push stopped before it
-writes, not a second implementation of it. It runs the same steps as
-`remote::push_with`: tag selection and the embargo-withheld history
-(`remote::sendable_tags`), the fast-forward check against the remote's
-tags (`remote::accepted_tags`), the push closure, and the incremental
-transfer (`remote::push_incremental`) with its visibility filter. Only the
-sink differs: `Sink::Plan` records every object and packs it exactly as
-the real sink would, into a backend that drops the bytes, so the plan's
-object ids, counts and pack size are the push's own. A property test
-(`veil-core/tests/core_sync/push_plan.rs`) runs random histories of public, cloaked
-and exposed files, cloaked tags, rewound tags, embargoed merges and
-releases against a team and a public remote, and checks after every push
-that its new packs hold exactly the planned objects, its report the
-planned byte count, and its tags the planned actions; `vl/tests/
-tiers_cli.rs` does the same through the binary and a path remote.
-
-The remote is only read. It is opened through `push_plan::ReadOnly`, which
-turns every write into an error, and no lock is taken: the real push takes
-the lock and re-reads the same view under it (a push by someone else in
-between changes the push, and the plan with it). An empty or missing remote
-is planned as the empty repository the push would create; a foreign
-directory fails as the push would (BUG-283).
-
-For a public remote the plan also lists the files whose content becomes
-public there and those withheld, computed as the remote's readers see the
-trees: cloaked entries redacted (or shown as their last public version),
-unreleased wrappers replaced by their fallback. "Already there" is the
-public view of every snapshot the remote's committed view reaches, under
-the releases the remote's records carry; "after the push" uses this
-repository's releases, and revisits already-pushed wrappers whose embargo
-was released since (as the transfer does). A file is listed when its
-content object is in the plan, or its path was never public there:
-`new`, `exposed` (it was there withheld, or cloaked earlier in the same
-push), `modified`. Paths changed under an unreleased embargo are listed as
-withheld only for a reader holding its key; others get the snapshot id and
-the embargo, nothing about which files it changes.
-The push sends an object by what it is (a plaintext blob goes to a
-public remote whatever its entry's label says), so the plan decides the
-same way: a sealed label is checked against its object
-(`builder::verify_sealing`), and a file labelled `cloaked:team` whose
-object is plaintext is listed as published (BUG-482). `vl ls`, `vl
-files` and the tier marks use the same verified visibility. A public
-label is taken as it is: if its object is in fact sealed, the push
-withholds it, so the plan can only overstate what becomes public.
-
-Benchmark (`cargo test --release -p veil-core --test core_bench --
---ignored --nocapture sftp_bench::`): 3,000 files, 300 snapshots, about 7,850 objects,
-through a local OpenSSH `sftp-server` with an artificial delay in both
-directions (release build):
-
-| operation | full walk, 2 ms RTT | incremental, 2 ms RTT | incremental, 50 ms RTT |
-|---|---|---|---|
-| first push | 87.5 s, 63,720 requests, 41 MiB sent | 0.51 s, 122 requests, 2.6 MiB | 5.3 s |
-| clone | 52.7 s, 40,904 requests, 37 MiB | 0.41 s, 80 requests, 2.6 MiB | 2.4 s |
-| push, up to date | 68.3 s, 47,400 requests | 0.08 s, 58 requests | 1.9 s |
-| push of 1 new snapshot | 68.4 s | 0.14 s, 85 requests | 3.1 s |
-| pull of 1 new snapshot | 52.9 s | 0.11 s, 75 requests | 2.2 s |
-
-The full walk's requests are almost all one round trip each, so at 50 ms
-it would take about 25 times its 2 ms time (not run). The incremental
-costs at 50 ms are a fixed number of round trips: opening the remote,
-the lock, metadata, the operation; a pull also reads every remote pack
-index (0.4 MiB here).
-
 Key rings are signed
 logs that only fast-forward (§3). Stale, tampered or forged rings are
 ignored or rejected with a warning, and membership is never merged as a
@@ -2541,7 +2361,7 @@ fast-forward. A diverged tag is reported and left alone
 (`--force` overrides on push). A local **release tag** (annotated, format 5)
 never moves on a pull, and keeps its annotation: when the remote holds it
 at another target (a teammate's `vl tag set --force`, or a hostile remote),
-`remote::pull_with` records that target as `<remote>/<name>` and reports
+`remote::apply_remote_tags` records that target as `<remote>/<name>` and reports
 it (`SyncReport::release_tags_kept`, "origin moved release tag v1.0 from X
 to Y; your release tag v1.0 stays at X"), at every pull until the user
 decides; only `vl tag set <name> -r <remote>/<name> --force` takes it
@@ -2553,12 +2373,8 @@ matches it. `vl tag set` over one is refused without `--force`, which
 writes a new atag keeping the old message unless `-m` gives one; the
 annotation is never dropped silently.
 
-**Deleting tags (BUG-280).** A plain push never deletes anything remotely;
-`remote::delete_remote_tags` (`vl push --delete`) does, for tags already
-deleted locally, leased: refused when the remote's tag moved to work the
-deleting repository has not seen (Git: a `--force-with-lease` delete). On a
-Veil remote the deleted tag's target also leaves `heads`, so `vl -R
-<remote> gc` can prune it. Pull prunes `<remote>/<tag>` for tags gone from
+**Deleting tags (BUG-280).** A push never deletes anything on the server.
+Pull prunes `<remote>/<tag>` for tags gone from
 the remote and keeps a local tag of that name (a teammate's deletion never
 deletes yours). A local deletion sticks, the way jj tracks a deleted
 bookmark against its remote bookmark: `vl tag delete` records the tag and
@@ -2585,11 +2401,14 @@ matching several visible snapshots resolves to the one in local history
 others are only reachable through tags: a snapshot someone pushed with
 another person's change id cannot make that change divergent (BUG-105).
 
-**Creating a remote.** The first push to an empty remote initialises it
-under the remote's lock and re-checks once the lock is held, so when
-several pushes reach an empty remote at once one creates it and the others
-push to it normally (BUG-120). An error while checking is an error, never
-a reason to initialise over what may be a repository.
+**Creating a repository** (the in-process transfer). The first push to an
+empty store initialises it under its lock and re-checks once the lock is
+held, so when several pushes reach an empty store at once one creates it
+and the others push to it normally (BUG-120). An error while checking is an
+error, never a reason to initialise over what may be a repository; a
+directory that holds other files is refused (BUG-283). On the server, the
+first push to a project that does not exist creates it, with the pusher as
+its admin.
 
 ## 9. Locking, crash safety and `fsck`
 
@@ -2664,7 +2483,10 @@ and, once renewed, when it was acquired on the backend's own stamp clock.
   clear the provably stale ones (`lock::clear_stale_guards`), each by
   *claiming* it under the protocol above and then releasing it, so a live
   contender's guard is never touched.
-* **Network remotes: fencing leases.** On an `is_network()` backend
+* **Network remotes: fencing leases.** *Unused since SFTP remotes were
+  removed (simplification pass, part 1): no backend is `is_network()` any
+  more. The code and its tests (`core_sync/remote_lock.rs`) stay until a
+  follow-up removes them.* On an `is_network()` backend
   (SFTP), other hosts can never prove a holder gone, so a client that
   crashed mid-push would lock the remote forever. Its lock is a *fencing*
   lock (`"fencing": true`; lease 30 s, renewed every 5 s):
@@ -2699,10 +2521,7 @@ and, once renewed, when it was acquired on the backend's own stamp clock.
     races no longer need a stall then: a takeover landing between a
     renewal's check and its write is overwritten (the contender fails), and
     one landing between the holder's final check and its `op_head` write
-    lets both publish. `vl doctor --remotes` measures each SSH remote's
-    clock against this machine's (the modification time of a probe file it
-    creates and removes in the remote's `.veil/`) and warns beyond 60 s,
-    half the allowance, since two clients can be off in opposite directions;
+    lets both publish;
   * locks without the flag (local holders, older versions) keep the rule
     above and are never taken over from another host. The takeover guard
     is a fencing lock too, so a contender that crashed mid-takeover on
@@ -2723,7 +2542,7 @@ and, once renewed, when it was acquired on the backend's own stamp clock.
   path that is a symlink (or a socket, a device) defeats `create_new` yet
   reads as absent, since backends never follow symlinks; it is reported at
   once (`.veil/lock is a symlink, not a lock file; … remove .veil/lock`),
-  locally and on an SSH remote, and never removed on the user's behalf
+  and never removed on the user's behalf
   (BUG-119).
 
 **Shared metadata under the lock.** Every read-modify-write of key rings,
@@ -2829,10 +2648,10 @@ take no lock:
   allowed, is deliberate: a command such as push computes what to send from
   the view it opened, and an escaping rewrite must already be dropped
   there.
-* **Remotes** (`Repo::open_remote`) keep `.veil/lock` for their
-  transactions (push phase B, remote gc), with one head in `op_heads/`;
-  on a disk remote objects are staged like local ones, on SFTP the
-  unsynced protocol and lock recovery stay.
+* **Bare repositories** (`Repo::open_remote`: the receiver of the
+  in-process transfer, and old path remotes) keep `.veil/lock` for their
+  transactions (a push, gc), with one head in `op_heads/`; objects are
+  staged like local ones.
 * **Pull spools** are `incoming/pull-<owner>` of their transaction, so
   concurrent pulls never touch each other's.
 * **gc** marks from every head and from what live transactions staged
@@ -2898,7 +2717,7 @@ repository.
   starts five minutes earlier on wall-clock filesystems (clock steps) and
   exactly there on generation-stamped ones. Fanout directories not modified
   since are skipped without listing them. Older locks, and backends without
-  usable stamps (SFTP), fall back to the holder's wall-clock `acquired`
+  usable stamps, fall back to the holder's wall-clock `acquired`
   time minus an hour, or to every loose object. If recovery fails, the
   lock is left flagged for the next contender rather than released.
 * A recovery that fails or dies must not narrow the next one (BUG-096).
@@ -3001,8 +2820,8 @@ pack-<sum>.idx    "VEILIDX1" | count u32 | fanout[256] u32 | ids[count] (sorted)
   `Corrupt`, never as wrong content.
 * **Decompression limits** (BUG-490). A pack may come from a hostile
   remote, and a few KiB of zstd RLE blocks decode to gigabytes. An entry
-  declaring more than 4 GiB (`VEIL_MAX_OBJECT`, e.g. `8G`; the SFTP
-  read ceiling and the server's planned object limit) is refused before anything is
+  declaring more than 4 GiB (`VEIL_MAX_OBJECT`, e.g. `8G`; the server's
+  planned object limit) is refused before anything is
   decoded, and an index of more than 2^25 entries is refused. A frame must
   declare exactly the entry's size, and decoding stops (in both decoders,
   libzstd and `ruzstd`) as soon as it would produce more, or a second
@@ -3024,8 +2843,7 @@ pack-<sum>.idx    "VEILIDX1" | count u32 | fanout[256] u32 | ids[count] (sorted)
   `PackWriter`: the same bytes as `PackBuilder` (which stays for small
   packs), streamed through `StorageBackend::create_stream` (on disk a temp
   file created with `O_EXCL`, fsynced, renamed, then the directory fsynced;
-  on SFTP pipelined writes, `fsync@openssh.com`, `posix-rename`; elsewhere
-  buffered). Memory holds the `(id, offset, length)` table, the delta
+  elsewhere buffered). Memory holds the `(id, offset, length)` table, the delta
   depths and 1 MiB of pack data. The header's count is patched at the end,
   and the trailer's BLAKE3 is computed while streaming (the first 1 KiB
   chunk, holding the count, is kept, the rest is hashed as the subtrees
@@ -3068,7 +2886,7 @@ only make a walk longer. The index is a device-local cache in
   as one layer); concurrent appenders never overwrite one another. A layer
   a power loss tore (missing, empty, half written) fails its checksum and
   the index is rebuilt (`crash::a_power_loss_tears_history_index_layers_and_they_are_rebuilt`).
-  Remotes (bare repositories, SFTP) compute it in memory only.
+  Bare repositories compute it in memory only.
 - **A parent that arrives later** (the fix of a released embargo, pulled
   into a public clone) could carry a larger generation than its indexed
   child. Each layer lists the parents that were missing; when one is
@@ -3136,8 +2954,8 @@ Pruning:
    then raises it and waits up to 60 s for the rest (new transactions wait
    for it), and otherwise deletes nothing that run and says so. With the
    fence raised it also takes `.veil/lock` (BUG-814): writers that hold it
-   instead of registering (a push over SSH into a bare remote collected with
-   `vl -R`, any transaction over a network backend) are then finished or
+   instead of registering (a push into a bare repository collected with
+   `vl -R`) are then finished or
    not started; if it stays held, nothing is deleted that run. Under the
    fence it reads its roots again and marks what they reach (what was
    published or reused meanwhile), prunes only operations of its first
@@ -3201,7 +3019,7 @@ numbers at 1 GB, and what they rank, are in `docs/design/scale/BASELINE.md`.
 ## 12. Read commands: one API, text or JSON (`crates/vl/src/api.rs`)
 
 The read commands (`status`, `log`, `diff`, `show`, `ls`, `workspace list`,
-`tag list`, `op log`, `scan`, `secret list`, and `push --dry-run`) are split
+`tag list`, `op log`, `scan`, `secret list`) are split
 in two:
 
 * **A function in `api`** takes the repository context (`&Ctx`, or `&Repo`
@@ -3351,7 +3169,7 @@ and runs without them. The user's view is in
 
 | Feature | Default | Gates |
 |---|---|---|
-| `os` | on | `DiskBackend` (`std::fs`, fsync, `libc`), `SftpBackend` (spawns `ssh`, threads), the lock's host introspection (`/proc`, `sysctl`, `kill`, `gethostname`, `std::process::id`) and heartbeat thread, the worker threads of sync (`par_map`), `Instant` as the monotonic clock |
+| `os` | on | `DiskBackend` (`std::fs`, fsync, `libc`), the lock's host introspection (`/proc`, `sysctl`, `kill`, `gethostname`, `std::process::id`) and heartbeat thread, the worker threads that compress packs, `Instant` as the monotonic clock |
 | `zstd` | on | the zstd C library (`zstd-sys`): compressed and delta pack entries written and read |
 | `ruzstd` | off | the pure-Rust zstd decoder (`pack::pure`) |
 | `wasm` | off | `ruzstd` + getrandom's `wasm_js` (WebCrypto) backend |
@@ -3429,9 +3247,9 @@ with `--cfg getrandom_backend="custom"` and `ruzstd` instead of `wasm`, and
 supplies a `__getrandom_v03_custom` function (getrandom 0.4.3 does not
 compile with both `wasm_js` and the custom backend).
 
-**What is not there without `os`**: `DiskBackend`, SFTP remotes,
-process-based lock recovery, worker threads (sync runs its
-requests one after another), and the CLI.
+**What is not there without `os`**: `DiskBackend`,
+process-based lock recovery, worker threads (packs are compressed on the
+calling thread), and the CLI.
 
 **Testing.** `tests/portable.rs` runs in both configurations: the smoke
 scenario (`examples/wasm_smoke.rs`: init, write, snapshot, read back, log,
@@ -3661,14 +3479,14 @@ refused: the edits are in `@`, nothing is lost. `before_push` compares the
 tags instead. `vl` started inside a hook runs no hooks (no recursion).
 
 **Input never carries sealed content.** No hook input carries file content.
-`pre-push` lines come from the push's own plan (`push_plan::plan_push`):
-only tags created, updated or rejected; never a cloaked tag on a public
-remote, never a snapshot in `withheld_snapshots`. A trusted hook runs as the user in the project directory
+`pre-push` lines name each tag whose target differs from the server's
+(`<tag> <snapshot> <remote-snapshot-or-0>`, `hooks::push_lines`), as the
+push sends it. A trusted hook runs as the user in the project directory
 and can read what the user can: that is the documented trust boundary.
 
 **Where hooks do not run.** `ws exec` sandboxes and FUSE mounts record
 through the engine, not through `cmd_commit`, and `vl` inside a sandbox
-finds no repository (`find_root`). `push --dry-run` runs nothing.
+finds no repository (`find_root`).
 
 ## 16. Attributes and line endings (`attributes.rs`)
 
@@ -3765,10 +3583,7 @@ afterwards; textconv input on stdin, output never stored.
 * anything that arrives by push, pull, fetch or merge: trees, names, descriptions, policies, hooks and metadata;
 * the network, and other OS users on the same machine.
 
-**Today's client** (before the server) syncs with plain-file remotes, so for now:
-
-* remotes and their operators (a path remote, an SFTP server) are **not** trusted. They see everything they store, and may withhold, replay, reorder or fork it;
-* teammates beyond their own scopes, and revoked members after their revocation, are not trusted.
+**Today's client** still cloaks paths for scopes (§3–§4), so for now teammates beyond their own scopes, and revoked members after their revocation, are not trusted. `vl` syncs only through the Veil server; path and SFTP remotes, whose operators were not trusted, were removed in the simplification pass, part 1. The engine still enforces its filters on any repository-to-repository transfer (`remote::push`/`pull`, in process), so they are kept and tested.
 
 The lists below describe what today's client protects, and what not.
 
@@ -3921,12 +3736,11 @@ The lists below describe what today's client protects, and what not.
 
 ## Limitations and roadmap
 
-* **The server is next** ([HUB.md](HUB.md)): its sync protocol (§4) replaces
-  today's path and SSH remotes (`SftpBackend`, §1, §8), which the
-  simplification pass then removes. Until then: remote packs accumulate,
-  one per push, and a pull reads every index; a plain push does not notice
-  content a remote lacks below snapshots it already has (`vl push --full`
-  fills it).
+* **The server's later milestones** ([HUB.md](HUB.md) §13.9): embargoes
+  and cloaked lines cannot be pushed to the server yet, so with path
+  remotes gone (the simplification pass, part 1) they stay on the device
+  until the server takes them. The lock's fencing leases for network
+  backends (§9) are unused since SFTP went, and are still to be removed.
 * Performance: recording checked-out files
   in the stat cache (needs a backend write that returns the stat of the
   file it wrote). `gc` always rewrites everything it keeps, into packs of

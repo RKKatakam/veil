@@ -65,7 +65,7 @@ To build:
 - [ ] Embargoes through the server (`--embargo-for GROUPS`).
 - [ ] Moving existing repositories onto the server (`vl upgrade`; nothing
       made public or decrypted silently).
-- [ ] The simplification pass.
+- [ ] The simplification pass (part 1 done: SFTP and path remotes, offline-era text).
 
 ## Release mechanics
 

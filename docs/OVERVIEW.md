@@ -78,7 +78,7 @@ The owner adopted the four synthetic workloads published by OpenScion, an indepe
   - a history index;
   - streaming storage, safe gc, secret scanning, embargoes.
 - **Built (milestone S1, 2026-11-06): the server and the permission model, together** (`docs/HUB.md` §13). The server, the database (PostgreSQL, YugabyteDB), object storage (S3), sign-in, groups, admins, folder access, public, secrets encrypted on the device, and `vl` pushing, pulling and cloning (one directory too) through the server, with each person receiving only what they may see.
-- **Then: a simplification pass.** Remove what the server makes unnecessary: plain-file (SFTP and path) remotes, offline assumptions, old storage formats and old jargon.
+- **Now: a simplification pass.** Remove what the server makes unnecessary. **Part 1 is done** (2026-11-06): SFTP and path remotes and the offline-era text are gone, and `vl` syncs only through the server. Next: old storage formats and old jargon.
 - **Then: the server's features, in stages.**
   - fetch on demand;
   - server-side history and search;

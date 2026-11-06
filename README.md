@@ -17,11 +17,13 @@ offline-first. Start with [what Veil is](docs/OVERVIEW.md) and
 | Agents | **Virtual workspaces** and in-memory sandboxes; an agent sees what its person sees, with the same secrets |
 | Scale | The Scion design: lock-free commits, an atomic branch move, fetch on demand, server-side merges, history and search, batched landings |
 
-**Today:** the client engine is built; the server and the permission model
-are built next, together ([OVERVIEW.md](docs/OVERVIEW.md), "What exists
-today, and what's next"). Until then, `vl` restricts paths by encrypting
-them (`vl cloak`) and syncs through path or SSH remotes; that changes when
-the server lands.
+**Today:** the client engine and the server's first milestone (S1: sign-in,
+groups, folder access, `public`, encrypted secrets, push, pull and clone
+through the server) are built ([OVERVIEW.md](docs/OVERVIEW.md), "What exists
+today, and what's next"). `vl` syncs only through the Veil server. The
+client still also restricts paths by encrypting them for a scope
+(`vl cloak`); the next part of the simplification pass replaces that with
+folder access.
 
 ## Documentation
 
@@ -167,7 +169,7 @@ Change ids (`syplqsok`, letters k–z) are stable across rewrites; snapshot ids
 
 ## A tour
 
-> Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](docs/OVERVIEW.md) and [VISIBILITY.md](docs/VISIBILITY.md)). Cloaking, scopes and SSH remotes are replaced by folder access and the server.
+> Cloaking and scopes are today's client; folder access on the server replaces them (see [OVERVIEW.md](docs/OVERVIEW.md) and [VISIBILITY.md](docs/VISIBILITY.md)). Cloaked lines and embargoes cannot be pushed to the server yet ([HUB.md](docs/HUB.md) §13.8), so they stay on the device for now.
 
 ```sh
 # Secrets: nothing to configure.
@@ -180,28 +182,23 @@ vl secret import .env && vl run -- ./server      # encrypted device-local vault 
 vl cloak secrets/ --scope team
 vl scope grant team veil1<bob's public key> --name bob   # from bob's `vl identity show`
 vl scope revoke team veil1<…>   # rotates the key: new content is unreadable to them
-vl remote add origin alice@build.example.com:repos/proj   # any SSH server: no vl needed there
-vl remote add mirror ../public-mirror --public
-vl push origin        # team members receive ciphertext + key rings
 vl ls                 # every file's tier: public, cloaked:team, isolated, quarantined…
-vl push --dry-run     # per remote: tags, objects, bytes, what becomes public, what is withheld
-vl push mirror        # cloaked blobs and cloaked tags are withheld
+
+# Sync: through the Veil server, which sends each person only what they may see.
+vl login veil://hub.example.com --name alice
+vl remote add origin veil://hub.example.com/acme
+vl push               # a new project: you are its admin, everything is private
+vl access src/ public # who may see what (push it to apply)
 
 # Delayed-visibility merge (e.g. a security fix), developed out of sight.
 vl ws new fix-cve -r main --cloak team            # or any change not on `main`
 vl merge fix-cve@ --into main --embargo --until +7d -m "Fix CVE-…"
-vl push mirror        # the mirror shows main's pre-merge tree: no new names, sizes or message,
-                      # and the fix's own history is withheld (the merge's extra parent is redacted)
 vl embargo release <id>   # (or automatically after 7 days)
-vl push mirror        # same snapshot ids, now readable, and the fix's history follows
-# Until release, outsiders keep seeing the pre-merge tree, even for commits made on
-# top of the merge (their messages are sealed too), and cannot commit on top of it;
-# a tag that would publish the fix by another route is skipped by `vl push`.
+# Until release, outsiders see main's pre-merge tree, even for commits made on
+# top of the merge (their messages are sealed too), and cannot commit on top of it.
 # Veil keeps one unreleased embargo per line: a second `--embargo` merge into
 # (or of) a line that still carries one is refused, and so is merging or rebasing
 # two embargoed lines together. Release the earlier embargo first, then merge.
-# Use `--scope S` matching the fix line's cloak (`--cloak S`): the team remote only
-# receives the fix's history if it is sealed for the embargo's own scope.
 
 # Visibility never widens by accident: rebase, `vl new`, squash and policy edits that
 # arrive by merge keep sealed files sealed. Publishing is explicit: `vl merge` of a
@@ -222,13 +219,11 @@ vl undo
 
 ## CLI grammar
 
-> Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](docs/OVERVIEW.md) and [VISIBILITY.md](docs/VISIBILITY.md)).
-
 ```text
 vl <command> [args]     global: -R <repo>  --no-snapshot
 
-Setup        init [path] · clone <src> [dest] · identity show|new
-             (<src>, remotes: a path, ssh://[user@]host[:port]/path or [user@]host:path)
+Setup        init [path] · clone <veil://host/project> [dest] [--only DIR] · identity show|new
+             login <veil://host> [--name] [--ca FILE]
 Inspect      status|st · log [-n N] · show [rev] · diff [-r rev | --from a --to b] [--stat]
              ls [-r rev] [paths…] [--all] · files [-r rev] · cat <path> [-r rev] · evolog [-r rev]
 History      new [revs…] [-m] · commit -m · describe [-r rev] -m · edit <rev>
@@ -246,10 +241,11 @@ Workspaces   ws list|new <name> [-r rev] [--cloak [S]]|switch <name>|rm <name>
              ws cat <name> <path> · ws write <name> <path> < stdin
              ws mount <name> <dir> [--foreground] [--record-every SECS] · ws unmount <name>
 Op log       op log [-n N] · op restore <id> · undo · watch [--interval-ms N]
-Sync         remote add <name> <path|ssh-url> [--public]|list|rm
-             push [remote] [-t tag…] [--force] [--full] [--dry-run [--json]] · pull [remote] [--full]
+Sync         remote add <name> <veil://host/project>|list|rm
+             push [remote] [-t tag…] [--force] · pull [remote]
+Server       group list|create|add|remove|manager · access <path> [who…]
 Maintenance  gc [--keep-ops-days N] [--grace-minutes M | --prune-now] [--level L] [--no-deltas]
-             fsck [-v] · upgrade [--dry-run] [--remote NAME] [--force]
+             fsck [-v] · upgrade [--dry-run] [--force] [--sync-secrets]
 ```
 
 Revisions: `@` (working copy), `name@` (another workspace), `root`, tags,
@@ -376,17 +372,13 @@ something is broken:
   they differ).
 * **Clock:** set, not behind the last recorded operation, and in step with
   the filesystem's clock (a network share's server).
-* **Remotes**, with `vl doctor --remotes`: each remote can be reached and is
-  a Veil repository; for SSH remotes, also that the server's clock is within
-  60 s of this machine's (remote locks allow 2 minutes of clock difference
-  between clients).
 
 ## Repository layout
 
 ```text
 crates/
   veil-core/   the engine library (no direct std::fs use outside DiskBackend)
-    src/vfs/          StorageBackend + Disk / Memory / Overlay / SFTP backends
+    src/vfs/          StorageBackend + Disk / Memory / Overlay backends
     src/crypto.rs     VeilEnvelope (XChaCha20-Poly1305, SIV-style nonces)
     src/identity.rs   X25519 + Ed25519 identities, key wrapping, signatures
     src/keychain.rs   signed key-ring logs, key generations, embargo records, `local`
@@ -399,13 +391,15 @@ crates/
     src/oplog.rs      views + operation log  src/transaction.rs  auto-rebase
     src/workspace.rs  workspaces, ephemeral overlays
     src/embargo.rs    delayed-visibility merges
-    src/remote.rs     visibility-filtered, incremental push / pull (packs on the wire)
+    src/remote.rs     what a pull from the server writes; the in-process, visibility-filtered transfer
+    src/hub/          the permission model and wire protocol shared with the server
     src/vault.rs      device-local encrypted vault
     src/upgrade.rs    `vl upgrade`: journaled repository format migrations
     tests/fixtures/   golden repositories written by every format's release
     tests/core_*/     integration tests, one binary per area (core_engine/engine.rs:
                       end-to-end, entirely in memory)
   vl/          the CLI (clap); tests/cli_*/ drive the real binary
+  veil-server/ the Veil server (axum, PostgreSQL/YugabyteDB, S3); tests/server_hub/
 docs/ARCHITECTURE.md  design, data model, threat model, roadmap
 docs/FORMAT.md        on-disk formats, compatibility rules, migrations
 ```
@@ -436,25 +430,10 @@ drop(ws);                                       // vanishes; the snapshot remain
 
 ## Status
 
-The client engine and CLI work end-to-end and are covered by tests
-(`cargo test`). Next comes the Veil server with the permission model, then a
-simplification pass ([OVERVIEW.md](docs/OVERVIEW.md)). See
+The client engine, the CLI and the server's milestone S1 work end-to-end
+and are covered by tests (`cargo test`; `scripts/verify-server.sh` for the
+server). The simplification pass is under way: plain-file remotes are gone,
+cloaking and old formats are next ([OVERVIEW.md](docs/OVERVIEW.md)). See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#limitations-and-roadmap) for
 known limitations. The engine also builds for WebAssembly
 ([docs/guide/embedding.md](docs/guide/embedding.md)).
-
-### SSH remotes
-
-> Today's client, before the server; SSH (SFTP) and path remotes are removed once the server lands ([OVERVIEW.md](docs/OVERVIEW.md)).
-
-A remote can live on any machine you can `ssh` to; the server needs SSH
-with its SFTP subsystem and nothing else. `vl` runs your own `ssh`, so
-`~/.ssh/config` host aliases, the agent, `known_hosts` and ProxyJump work as
-they do for Git (`VEIL_SSH` replaces the command). Cloaked content is
-encrypted before it leaves your machine. Pushes send one pack of what the
-remote lacks; pulls download what they lack in a few round trips. A client
-that crashes mid-push leaves a lease-based lock that the next push takes
-over after at most about 45 seconds. A server that stops answering fails the
-command after 5 minutes (`VEIL_SFTP_TIMEOUT`, in seconds); a single file over
-4 GiB (`VEIL_SFTP_MAX_FILE`, e.g. `8G`) or a directory of more than a million
-entries (`VEIL_SFTP_MAX_LISTING`) is refused rather than buffered.

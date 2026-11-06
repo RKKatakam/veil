@@ -96,26 +96,17 @@ for access, then the next command records it.
 
 Cloaked files you can't read are kept in history and left out of your
 working copy. The reason in brackets says why: `no key` (you are not a
-member of `S`), `withheld by a public remote` (see the next entry) or
+member of `S`), `not received` (see the next entry) or
 `embargo …; not released`. They appear automatically (`Filled in N file(s) that became
 readable`) after an admin grants you the scope and pushes, and you pull.
-From a **public** remote they never appear: public remotes don't carry
-cloaked content at all.
 
-### `note: N cloaked file(s) (scope 'S') withheld: this is a public remote, and public remotes never deliver cloaked content. …`
+### `error: X is cloaked under scope 'S' and its content never reached this repository …`
 
-You cloned a public mirror. The cloaked files' names are in history, but
-not their content, and no pull from the mirror will bring it, even after
-a grant. Ask a member of `S` to grant you (`vl scope grant S <key>`; your
-key is in `vl identity show`), then clone the **team** remote, or add it
-(`vl remote add origin …`) and `vl pull origin`.
-
-### `error: X is cloaked under scope 'S' and was withheld: this repository's content came from a public remote, …`
-
-`vl cat` (or `vl restore`) of a cloaked file in a clone of a public
-mirror. As above: once granted, clone or pull from a team remote.
-`vl files` shows such files as `(redacted)`, and `vl diff` / `vl show` as
-`(content hidden: cloaked:S; withheld by a public remote)`.
+`vl cat` (or `vl restore`) of a cloaked file in a repository that came from
+a public mirror (before the Veil server), which never delivers cloaked
+content. Once a member grants you `S`, clone the project from the Veil
+server. `vl files` shows such files as `(redacted)`, and `vl diff` /
+`vl show` as `(content hidden: cloaked:S; not received)`.
 
 ### `error: X is cloaked under scope 'S' and you hold no key for it. …`
 
@@ -222,43 +213,23 @@ embargo the second fix on a separate line. See
 
 ## Remotes
 
-> Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)).
-
-### `rejected main (remote has diverged: not a fast-forward)` / `error: 1 tag was rejected (main): origin has changes you don't have. …`
+### `rejected main: …`
 
 Someone pushed to `main` since you last pulled. `vl pull`,
 `vl merge origin/main`, `vl push`. The other tags were pushed; the push
-exits 1 so that scripts notice. `vl push --force` overwrites the remote's
-`main` instead.
+exits 1 so that scripts notice. An admin's `vl push --force` moves the
+server's `main` back instead.
 
-### `skipped T (cloaked tag is never pushed to a public remote)`, `skipped T (… embargo …)`
+### `remote 'origin' (…) is not a Veil server; vl syncs only through a Veil server now. …`
 
-Held back by design; a push of all tags still exits 0. If you named the
-tag (`vl push -t T`), the push fails with
-`error: requested tag was not pushed: T`.
+The remote is a path or an SSH URL, from before the Veil server. Those
+remotes were removed: `vl remote rm origin`, then
+`vl remote add origin veil://host/project`.
 
 ### `warning: tag 'main' has diverged from origin/main; merge with `vl merge origin/main``
 
 The pull updated `origin/main` but left your `main` alone. Merge, then
 push.
-
-### A file disappeared on the public mirror
-
-It was cloaked by policy (`vl cloak`, or a `cloak` rule in `.veilpolicy`)
-and that change reached a pushed tag: to the public, a cloaked file is
-absent. A public file merely *edited* in a cloaked workspace does not
-disappear: public readers keep its last public version (see
-[Cloaking for a team](secrets-and-visibility.md#cloaking-for-a-team)).
-(Cloaked edits recorded by Veil builds older than this rule carry no public
-version and still show as deleted.)
-
-### `vl upgrade --remote` on an SSH remote
-
-`vl upgrade --remote NAME` reaches an SSH remote over SFTP, like `vl push`
-and `vl pull`. Releases before this fix treated the URL as a local path:
-they failed with `not found: Veil repository (run `vl init`)` and left an
-empty directory named after the URL (`ssh:/…` or `user@host:…`) in your
-working copy. Delete such a directory if you find one.
 
 ## The working copy and the filesystem
 
@@ -433,7 +404,7 @@ exits 1.
 
 From format 6 commands record their operations without the repository
 lock: only key-ring, vault and `repo.json` changes, `vl gc` and `vl
-upgrade` take it, for milliseconds to seconds, and pushes take a remote's.
+upgrade` take it, for milliseconds to seconds.
 A `vl` killed while it records leaves its new objects in
 `.veil/objects/incoming/tx-…`, which the next command removes once that
 process is provably gone (`vl fsck` notes the ones it keeps). Two
@@ -486,8 +457,8 @@ command again.
 
 ### `vl fsck` reports `Corrupt:`
 
-Restore the damaged objects from a remote that has them: `vl pull --full`.
-`vl gc` refuses to delete anything while the store is damaged.
+Clone the project from the Veil server again and move your unpushed work
+across. `vl gc` refuses to delete anything while the store is damaged.
 
 ### `error: unsupported format: this repository uses format N and needs vl X or later`
 

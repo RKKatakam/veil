@@ -5,7 +5,7 @@ description: Review a Veil branch before it merges into `integration` (a fix wav
 
 # Reviewing Veil changes
 
-Veil (`vl`) is a server-centric version control system (`docs/OVERVIEW.md`): the client is always connected to the Veil server, which stores the code and enforces who can see what (`docs/VISIBILITY.md`: admins, private by default, groups and managers, folder access, `public`; secrets encrypted automatically). Today's client, before the server, still restricts paths by cloaking them for a scope and syncs through path and SFTP remotes. Agents write nearly all of its code, and one agent works at a time.
+Veil (`vl`) is a server-centric version control system (`docs/OVERVIEW.md`): the client is always connected to the Veil server, which stores the code and enforces who can see what (`docs/VISIBILITY.md`: admins, private by default, groups and managers, folder access, `public`; secrets encrypted automatically). Today's client still restricts paths by cloaking them for a scope; it syncs only through the server (path and SFTP remotes were removed in the simplification pass, part 1; debug builds keep path remotes as a test fixture, `crates/vl/src/test_remotes.rs`). Agents write nearly all of its code, and one agent works at a time.
 
 The question every review answers is not "did someone read every line?" It is **"what could go wrong with this change, and which check, automated or human, is the right one to catch it?"** Anthropic's Claude Code team frames it the same way.
 
@@ -123,7 +123,7 @@ Anthropic confirms a finding only when enough independent agents vote for it. He
 
 - **It is real in the code.** It is shown by a failing test (preferred), a command transcript or an exact trace with **`file:line`**. Never guess file names. "Might" and "could in theory" don't count.
 - **Security findings: it crosses the trust boundary** (`docs/ARCHITECTURE.md` "Threat model"). Name all three:
-  - **the attacker**, who must be outside the boundary: a person without access to the folder, a remote operator (today's plain-file remotes; for the server, only for secrets and embargoes), a hostile pull or bundle, another OS user;
+  - **the attacker**, who must be outside the boundary: a person without access to the folder, a remote operator (the server, only for secrets and embargoes), a hostile pull or bundle, another OS user;
   - **what they control:** the exact input;
   - **the harm:** what leaks, is lost or runs, and to whom.
 

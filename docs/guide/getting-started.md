@@ -1,6 +1,6 @@
 # Getting started
 
-> Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)). Where this page mentions cloaking, scopes, isolated files or path and SSH remotes, the server replaces them with folder access, encrypted secrets and pushes to the server.
+> Where this page mentions cloaking, scopes or isolated files, the server replaces them with folder access and encrypted secrets (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)). `vl` syncs only through the Veil server.
 
 1. [Install](#install)
 2. [Your identity](#your-identity)
@@ -197,8 +197,9 @@ main: yltznuyx 53414202 Greet the world
   that pointed at the change merged into. Pulls fast-forward tags.
 * Nothing else moves a tag. `vl tag set` refuses to move one backwards or
   sideways unless you pass `--allow-backwards`.
-* `vl tag set NAME --cloak [SCOPE]` makes a tag that public remotes never
-  see.
+* `vl tag set NAME --cloak [SCOPE]` makes a tag whose name is sealed for
+  the scope. **The Veil server does not hide it yet:** `vl push` sends it
+  as a branch everyone in the project sees (BUG-839).
 
 ## Change ids and snapshot ids
 
@@ -516,7 +517,6 @@ other way round), then delete the moved-aside copy.
 | `--no-snapshot` | Don't record the working copy before the command |
 | `VEIL_HOME` | Where your identity lives (default `$XDG_CONFIG_HOME/veil` or `~/.config/veil`) |
 | `VEIL_USER` | Your name on new changes (`Name <email>` records an email too) |
-| `VEIL_SSH` | The `ssh` command used for SSH remotes |
 | `VEIL_FS_FOLDING` | Override the detected filename case/Unicode folding (see the README's platform notes) |
 | `VEIL_MAX_OBJECT` | Largest object a pack may hold when read (default `4G`; a larger declared size is refused as damaged or hostile) |
 | `NO_COLOR` | Disable colours (they are off anyway when output is not a terminal) |
