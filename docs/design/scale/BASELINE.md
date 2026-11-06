@@ -1,6 +1,6 @@
 # Scale baseline: 1 GB, `integration` @ b549e1e
 
-These are the scale benchmark's numbers for today's client (`9-scale-benchmark.md`), first measured on `integration` @ **b549e1e** before any scale stream landed, then after each. The remote cases use today's path and SFTP remotes; the server's own targets are in `docs/HUB.md` §9.2. They rank the streams: see [the ranked list](#ranked-offenders) and [what it means for the plan](#what-this-means-for-the-plan).
+These are the scale benchmark's numbers for today's client (`9-scale-benchmark.md`), first measured on `integration` @ **b549e1e** before any scale stream landed, then after each. **Push, clone and pull now go through the Veil server** ([the first section](#through-the-veil-server-2026-11-06-bfa691a)); the older remote cases below used path and SFTP remotes, which the simplification pass removes, and are kept as history. The server's own targets are in `docs/HUB.md` §9.2. They rank the streams: see [the ranked list](#ranked-offenders) and [what it means for the plan](#what-this-means-for-the-plan).
 
 - **Machine:**
   - 32 CPUs (i9-13900KF), 30 GB RAM;
@@ -9,6 +9,60 @@ These are the scale benchmark's numbers for today's client (`9-scale-benchmark.m
 - **Neighbours:** other agents were building at the same time, so the absolute times carry some noise.
 - **Run:** `scripts/bench-scale.sh 1g -- --rtt 0,2`, 2026-11-05. It took 21.5 minutes end to end, including 4 minutes of generation, then deleted everything it generated.
 - **Raw results** (not committed): `.scratch/bench-results/1g-seed1-*.json` and `.md`.
+
+## Through the Veil server (2026-11-06, `bfa691a`)
+
+`scripts/bench-server.sh 1g`, 2026-11-06, on `integration` @ **`bfa691a`** (the product code measured; the bench changes of this stream only). Same machine, release builds, everything under the worktree's `.scratch/` on the ext4 disk. The run took 12 minutes end to end (4 of generation), then removed its containers and everything it generated. Raw results (not committed): `.scratch/bench-results/server-1g-bfa691a-20261106T194539Z.{json,md}`.
+
+- **Server:** a release `veil-server` on `127.0.0.1` over TLS, **PostgreSQL 17 and MinIO in Docker** (objects in S3), 32 database connections, started fresh for the phase. `vl` signs in as the project's admin (the identity that signed the history), so no projection work.
+- **Repository:** the `1g` profile generated **`--plain`**: what the server accepts. No cloak rules, no `isolate` rule, no scopes, and no cloaked fix line or embargoed merge (the server refuses cloaked lines and embargoes, `HUB.md` §13.8, and the simplification pass removes cloaking). 10,022 snapshots, 35,001 files, 1.15 GB of working tree, 2.91 GB loose store (0.73 GB after `gc`).
+- **Cases** (`run::server`): push of everything (all tags: `main`, `release`, 20 `rel-*`), push of nothing new and of one new snapshot (a commit, then `main` moved to it), a full clone, pull of one new snapshot and of nothing new into the clone, `status` in the clone, a clone of one top-level directory (`--only docs`, about a tenth of the tree, fetched on demand), then the client's `gc` cases.
+- **Client peak RSS** is the `vl` child's `ru_maxrss`; **server RSS** is the server's `VmRSS` before the case and its `VmHWM` during it (reset by `clear_refs` before each run). The kernel restarts a peak at the current RSS, never below, and the server keeps what it has allocated, so a case's server peak is at least the RSS before it.
+
+**Gate (every case ≤ 512 MiB on the client): fails** for the initial push and the full clone.
+
+| case | median | client peak RSS | server RSS before → peak | gate (512 MiB) |
+|---|---:|---:|---:|---|
+| push, initial (all tags) | 120.9 s, then **refused** (BUG-848) | **2,410 MiB** | 11 → **1,498 MiB** | **fails** (BUG-849) |
+| push, initial in 54 fast-forward steps along `main` (the workaround; 14 steps refused and retried smaller) | 172.6 s in all | **867 MiB** (the first step: the import) | → 2,311 MiB | **fails** (BUG-849) |
+| push, all tags after the steps | 0.30 s | 54 MiB | 2,358 → 2,358 MiB | passes |
+| push, nothing new | 0.16 s | 54 MiB | 2,358 → 2,358 MiB | passes |
+| push, 1 new snapshot | 0.24 s | 54 MiB | 2,358 → 2,358 MiB | passes |
+| clone, full (1.88 GB on disk) | 61.4 s | **979 MiB** | 2,358 → **3,070 MiB** | **fails** (BUG-850) |
+| pull, 1 new snapshot | 0.25 s (the first of 3 runs: 8.0 s) | 106 MiB | 2,934 → 2,934 MiB | passes |
+| pull, nothing new | 0.18 s | 68 MiB | 2,934 → 2,934 MiB | passes |
+| `status` in the clone, clean | 0.24 s | 68 MiB | | passes |
+| clone, one directory (`--only docs`) | 7.8 s | 93 MiB | 2,934 → 2,942 MiB | passes |
+| gc, first (packs 2.91 GB loose) | 49.9 s | 238 MiB | | passes |
+| gc, again (nothing new) | 4.0 s | 198 MiB | | passes |
+| gc, after one commit | 6.1 s | 199 MiB | | passes |
+| gc --auto | 1.5 s | 68 MiB | | passes |
+
+(The "before → peak" column is from a second run of the same profile and code an hour later, which recorded the RSS before each case; its client numbers were within 5 % of the first run's: 2,410 / 865 / 931 MiB.)
+
+**The server's memory.** It reached **3.1 GB** during the run and kept it. A **fresh server serving one full clone** peaked at **2.5 GB** (`VmHWM`), growing steadily through the whole clone, not in one burst; with `MALLOC_ARENA_MAX=2` it peaked at 1.95 GB, so about 0.5 GB is the allocator's per-thread arenas and the rest is live data (BUG-851). Its bounded caches are 512 MiB by their weights (256 MiB of objects, 256 MiB of decoded trees weighed at twice their encoded size).
+
+### Where the memory goes
+
+No heap profiler is installed on this machine; the holders below come from sampling `VmRSS` every 0.2 s against the code paths, and from the allocator experiment.
+
+- **`vl push` to the server holds every new object in memory** (BUG-849, `crates/vl/src/hub.rs` `push`): it collects the raw bytes of every object the push introduces (`objects: Vec<(ObjectId, Vec<u8>)>`, from `collect_tree`) and only then uploads them in 8 MiB frames. The initial push of 1 GB of history held 2.4 GB; one step holding the import (11 snapshots, 20,883 files) held 867 MiB. Uploading each 8 MiB batch as the walk fills it would bound it.
+- **`vl clone`/`pull` holds a whole tree level of history at once** (BUG-850, `Client::fetch_all` and `pull`): a fresh clone asks for every snapshot's trees and files level by level, so a deep level holds many versions of many files; each level is up to 20,000 objects, fetched as 8 parts whose response bodies are all kept until the last arrives, and copied object by object (`raw.to_vec()`) before any is written. The client's RSS climbs in steps level by level to about 600 MiB during the fetch (27 s of a 54 s clone), then checkout's staging threads add theirs (to 974 MiB). With `MALLOC_ARENA_MAX=2` the clone still peaked at 792 MiB. Writing each part's objects as it arrives, and sizing a level's requests by bytes (tree entries carry sizes) rather than by count, would bound it.
+- **The server holds each fetch's whole answer, and every wanted snapshot's projected trees, per request** (BUG-851, `crates/veil-server/src/sync.rs` `fetch`): a clone's level is 8 concurrent requests of up to 2,500 objects; each builds its whole response body in memory, and keeps the projected root and directory trees (`roots`, `Dirs`: decoded `Arc<Tree>`s) of every snapshot its wants name, which with revision 1's cross-snapshot wants is most of the 10,022 snapshots, outside the bounded tree cache. The push of the whole history peaked at 1.5 GB on a fresh server; that path was not profiled further. Streaming the frames of a response, and dropping a snapshot's directory trees once its wants are served, would bound it; a weight for decoded trees nearer their real size would keep the tree cache within its 256 MiB.
+- **What passes, and why:** an incremental push, a pull of one snapshot, a clone of one directory and every `gc` stay at 54–238 MiB: they touch a few snapshots' worth of objects.
+
+### BUG-848: a push of more than a few snapshots is refused
+
+The initial push uploads 2.4 GB and is then refused: `missing object 7a8b7c15 (server: bad_request)`. `vl push` (`hub.rs` `collect_tree`) skips an entry that equals the same path's entry in one of the snapshot's parents, and stops at any tree it has already walked (`seen`), whichever parents that walk was against. A tree first walked under a later snapshot, against a parent that already had a file, never walks again under the snapshot that introduced the file, so that file is never sent; the server requires every object a snapshot introduces at a path to carry the pusher's upload receipt (check 7, BUG-824) and answers as for a missing object. Pushes of a few snapshots at a time succeed, so the benchmark loads the server in fast-forward steps along `main`'s first-parent line (`mainline.txt`, up to 512 snapshots a step, fewer after a refusal) to measure the other cases. Reproduced in 30 s by `scripts/bench-server.sh tiny`. This blocks moving a repository with history onto the server (`HUB.md` §5.7, §13.8).
+
+### How to run
+
+```sh
+scripts/bench-server.sh 1g        # ~12 min; tiny (30 s) and small for smoke tests
+OBJECTS=local scripts/bench-server.sh 1g   # objects in a local directory instead of MinIO
+```
+
+It starts PostgreSQL 17 and MinIO in Docker (through `sg docker` when the session lacks the group), builds the release `vl`, `veil-server` and `veil-bench`, runs `veil-bench run --server … --skip-phase import,local,remote-path,packed,sftp,agents` under `timeout` (`STEP_LIMIT`, default 3600 s), prints the table, and removes the containers and everything it generated. `scripts/bench-scale.sh` keeps the local cases and the N-agents profile, and now skips the path and SFTP phases.
 
 ## Memory after streaming pack writes (BUG-800, G1)
 

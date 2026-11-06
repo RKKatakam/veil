@@ -42,11 +42,11 @@ pub fn markdown(r: &Value) -> String {
         man["generate_seconds"].as_f64().unwrap_or(0.0),
     ));
     o.push_str(&format!(
-        "Peak RSS is the child's `ru_maxrss`; it cannot read below the harness's own peak ({} MiB): values at that floor mean \"at most this\".\n\n",
+        "Peak RSS is the child's `ru_maxrss`; it cannot read below the harness's own peak ({} MiB): values at that floor mean \"at most this\". ⛔ marks a case over the 512 MiB gate. The server's RSS is its `VmRSS` before the case's first run and its `VmHWM` during the case's runs (reset before each run; it cannot restart below the RSS the server keeps).\n\n",
         f(&r["rss_floor_mib"], 0)
     ));
-    o.push_str("| case | group | median | spread | runs | peak RSS | snapshots read | local lock held | remote lock held | ok |\n");
-    o.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---|\n");
+    o.push_str("| case | group | median | spread | runs | peak RSS | server RSS before → peak | snapshots read | local lock held | remote lock held | ok |\n");
+    o.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
     for c in r["cases"].as_array().into_iter().flatten() {
         if c.is_null() {
             continue;
@@ -73,7 +73,7 @@ pub fn markdown(r: &Value) -> String {
             }
         };
         o.push_str(&format!(
-            "| {} | {} | {} s | {}{} | {} | {} MiB | {} | {} | {} | {} |\n",
+            "| {} | {} | {} s | {}{} | {} | {} MiB{} | {} | {} | {} | {} | {} |\n",
             c["name"].as_str().unwrap_or(""),
             c["group"].as_str().unwrap_or(""),
             f(&c["median_secs"], 3),
@@ -81,13 +81,15 @@ pub fn markdown(r: &Value) -> String {
             if spread > 0.15 { " ⚠" } else { "" },
             c["runs"].as_array().map(|a| a.len()).unwrap_or(0),
             f(&c["maxrss_mib"], 0),
+            if c["maxrss_mib"].as_f64().is_some_and(|m| m > 512.0) { " ⛔" } else { "" },
+            c["server_maxrss_mib"].as_f64().map(|m| format!("{} → {m:.0} MiB", f(&c["server_rss_before_mib"], 0))).unwrap_or_default(),
             snaps,
             lock("local_lock"),
             lock("remote_lock"),
             if c["ok"].as_bool() == Some(true) { "yes".to_string() } else { format!("**no** ({})", c["error"].as_str().unwrap_or("")) },
         ));
     }
-    if let Some(a) = r["agents"].as_array() {
+    if let Some(a) = r["agents"].as_array().filter(|a| !a.is_empty()) {
         o.push_str("\n### N agents\n\n");
         o.push_str("| N | traced | iterations | wall | landings/min | failures | retries | exec p50 / p95 | tag p50 / p95 | push p50 / p95 | iteration p50 / p95 | peak RSS |\n");
         o.push_str("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");

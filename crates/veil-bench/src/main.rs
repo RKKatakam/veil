@@ -4,12 +4,16 @@
 //! ```text
 //! veil-bench gen    --profile tiny|small|1g|5g [--cloaked] --seed N --dir DIR --vl PATH
 //! veil-bench run    --profile … --seed N --dir DIR --vl PATH --out RESULTS.json [--agents 4,16,64] …
+//!                   [--server PATH --database-url URL [--s3-endpoint URL --s3-bucket B]]
 //! veil-bench report RESULTS.json
-//! veil-bench openscion --vl PATH --server PATH --database-url URL --dir DIR --out RESULTS.json
+//! veil-bench openscion --vl PATH --server PATH --database-url URL [--s3-…] --dir DIR --out RESULTS.json
 //! veil-bench openscion-memory --out RESULTS.json
 //! veil-bench load --mode pull|land (--server PATH --database-url URL | --url URL [--ca PEM])
 //!                 --projects 1,10 --clients 10,100 [--rates 0.35,3.5,max] --out RESULTS.json
 //! ```
+//!
+//! `scripts/bench-server.sh [1g|openscion|load]` starts the server's
+//! containers and runs these against it.
 //!
 //! Every measured command is a separate process of the release `vl`
 //! binary; histories are built in-process through `veil_core`. Everything
@@ -24,6 +28,7 @@ mod openscion;
 mod proc;
 mod report;
 mod run;
+mod server;
 mod shim;
 mod trace;
 
@@ -51,6 +56,10 @@ struct GenArgs {
     /// 85 % of the files under cloak rules (the `cloaked-*` profiles).
     #[arg(long)]
     cloaked: bool,
+    /// What the server accepts: no cloak rules, no `isolate` rule, no
+    /// cloaked fix line, no scopes (set by `run --server`).
+    #[arg(long)]
+    plain: bool,
     #[arg(long, default_value_t = 1)]
     seed: u64,
     /// Bench directory: the run creates everything below it.
@@ -78,12 +87,8 @@ enum Cmd {
         /// The `vl` binary (a release build).
         #[arg(long)]
         vl: PathBuf,
-        /// The `veil-server` binary (a release build).
-        #[arg(long)]
-        server: PathBuf,
-        /// PostgreSQL for the server.
-        #[arg(long)]
-        database_url: String,
+        #[command(flatten)]
+        server: server::ServerArgs,
         /// Bench directory (created; everything is written below it).
         #[arg(long)]
         dir: PathBuf,
@@ -124,12 +129,10 @@ enum Cmd {
         /// The running server's certificate (PEM), when self-signed.
         #[arg(long)]
         ca: Option<PathBuf>,
-        /// The `veil-server` binary to start here (a release build).
-        #[arg(long)]
-        server: Option<PathBuf>,
-        /// The database of the server started here, and of the statement counts.
-        #[arg(long)]
-        database_url: Option<String>,
+        /// The server to start here (`--database-url` also serves the
+        /// statement counts).
+        #[command(flatten)]
+        server: server::ServerArgs,
         /// Database connections of the server started here.
         #[arg(long, default_value_t = 64)]
         db_connections: u32,
@@ -197,7 +200,7 @@ enum Cmd {
         /// Skip cases whose name starts with this (repeatable).
         #[arg(long)]
         skip: Vec<String>,
-        /// Skip whole phases: import, local, remote-path, gc, packed, sftp, agents.
+        /// Skip whole phases: import, local, remote-path, server, gc, packed, sftp, agents.
         #[arg(long, value_delimiter = ',')]
         skip_phase: Vec<String>,
         /// Source checkout, for the commit recorded with the results.
@@ -206,6 +209,10 @@ enum Cmd {
         /// Keep the generated repository.
         #[arg(long)]
         keep: bool,
+        /// Start this server and run the `server` phase against it (the
+        /// repository is generated `--plain`).
+        #[command(flatten)]
+        server: server::ServerArgs,
     },
     /// (internal) Generate into an existing bench directory (`run` does
     /// this in a child process, so the harness stays small: see
@@ -244,13 +251,15 @@ fn absolute(p: &Path) -> Result<PathBuf> {
 
 /// `vl init` and the scopes, then the in-process history.
 fn generate(g: &GenArgs, dir: &Path, env: &proc::VlEnv) -> Result<serde_json::Value> {
-    let profile = gen::Profile::named(&g.profile, g.cloaked)?;
+    let profile = gen::Profile::named(&g.profile, g.cloaked, g.plain)?;
     let repo = dir.join("repo");
     std::fs::create_dir_all(&repo)?;
     std::fs::create_dir_all(&env.home)?;
     env.ok(&repo, &["init"])?;
-    env.ok(&repo, &["scope", "create", "a"])?;
-    env.ok(&repo, &["scope", "create", "b"])?;
+    if !g.plain {
+        env.ok(&repo, &["scope", "create", "a"])?;
+        env.ok(&repo, &["scope", "create", "b"])?;
+    }
     log_line(&format!(
         "generating {}: {} files, {:.1} GB, {} snapshots (seed {})",
         profile.name,
@@ -265,7 +274,7 @@ fn generate(g: &GenArgs, dir: &Path, env: &proc::VlEnv) -> Result<serde_json::Va
 
 fn setup_dirs(g: &GenArgs) -> Result<(PathBuf, proc::VlEnv)> {
     let base = absolute(&g.dir)?;
-    let dir = base.join(format!("{}{}-seed{}", if g.cloaked { "cloaked-" } else { "" }, g.profile, g.seed));
+    let dir = base.join(format!("{}{}-seed{}", if g.cloaked { "cloaked-" } else if g.plain { "plain-" } else { "" }, g.profile, g.seed));
     if dir.exists() {
         return Err(anyhow!("{} exists: remove it first (or pick another seed)", dir.display()));
     }
@@ -287,11 +296,10 @@ fn setup_dirs(g: &GenArgs) -> Result<(PathBuf, proc::VlEnv)> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Openscion { vl, server, database_url, dir, files, runs, out } => {
+        Cmd::Openscion { vl, server, dir, files, runs, out } => {
             let v = openscion::run_all(&openscion::Args {
                 vl,
                 server,
-                database_url,
                 dir,
                 sizes: files,
                 runs,
@@ -306,8 +314,7 @@ fn main() -> Result<()> {
             mode,
             url,
             ca,
-            server,
-            database_url,
+            mut server,
             db_connections,
             server_pid,
             projects,
@@ -329,8 +336,10 @@ fn main() -> Result<()> {
             let v = load::run_all(&load::Args {
                 url,
                 ca,
-                server: server.as_deref().map(absolute).transpose()?,
-                database_url,
+                server: {
+                    server.server = server.server.as_deref().map(absolute).transpose()?;
+                    server
+                },
                 db_connections,
                 server_pid,
                 dir: absolute(&dir)?,
@@ -383,7 +392,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Run {
-            gen: g,
+            gen: mut g,
             out,
             runs,
             agents: ns,
@@ -396,8 +405,15 @@ fn main() -> Result<()> {
             skip_phase,
             src,
             keep,
+            server,
         } => {
             proc::install_signal_handlers();
+            if server.server.is_some() {
+                if g.cloaked {
+                    return Err(anyhow!("--cloaked cannot go through the server (it refuses cloaked content)"));
+                }
+                g.plain = true;
+            }
             let out = absolute(&out)?;
             let min_free = (g.min_free_gb * 1e9) as u64;
             let base = absolute(&g.dir)?;
@@ -436,6 +452,7 @@ fn main() -> Result<()> {
                     .arg("--vl")
                     .arg(&env.vl)
                     .args(if g.cloaked { &["--cloaked"][..] } else { &[][..] })
+                    .args(if g.plain { &["--plain"][..] } else { &[][..] })
                     .args(["--pack-every", &g.pack_every.to_string()])
                     .arg("--exact-dir")
                     .arg(&dir)
@@ -464,6 +481,7 @@ fn main() -> Result<()> {
                     },
                     edit_seq: 0,
                     log: Box::new(log_line),
+                    server_pid: None,
                 };
                 let phase = |p: &str| !skip_phase.iter().any(|s| s == p);
                 let r = (|| -> Result<()> {
@@ -477,6 +495,10 @@ fn main() -> Result<()> {
                     }
                     if phase("remote-path") {
                         run::remote(&mut b, "path", 0, true)?;
+                    }
+                    if phase("server") && server.server.is_some() {
+                        let srv = server::Server::start(&server, &b.dir.join("server"), 32)?;
+                        run::server(&mut b, &srv)?;
                     }
                     if phase("gc") {
                         run::gc(&mut b)?;
