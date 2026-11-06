@@ -80,8 +80,9 @@ impl Source {
         if *id == ObjectId::hash(&root) {
             return Ok(Bytes::from(root));
         }
-        self.rt
-            .block_on(self.hub.objects.get(self.project, id))
+        self.hub
+            .objects
+            .get_blocking(&self.rt, self.project, id)
             .map_err(|e| VeilError::Repo(format!("object store: {e}")))?
             .ok_or(VeilError::Missing(*id))
     }
@@ -329,6 +330,7 @@ pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot:
     let Some(real) = resolve(hub, project.id, &snapshot).await?.into_iter().next() else {
         return Err(Error::not_found(format!("no snapshot {} that you can see", snapshot.short())));
     };
+    hub.objects.prefetch(project.id, wants.iter().map(|w| w.id).collect()).await;
     let (policy_text, bindings, viewer) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone());
     blocking(hub, project.id, move |src| {
         let p = Project {

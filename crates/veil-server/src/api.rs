@@ -157,13 +157,15 @@ async fn names_of(c: &mut PgConnection, table: &str, id: i64) -> Result<Vec<Stri
     Ok(sqlx::query_scalar(q).bind(id).fetch_all(&mut *c).await?)
 }
 
-/// Who may see `path`, and which rule decides. Only someone who may read
-/// the path gets an answer.
+/// Who may see `path`, and which rule decides. Only a participant who may
+/// read the path gets an answer.
 async fn access(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Query(q): Query<PathQuery>) -> Result<Json<AccessInfo>> {
     let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
     let path = q.path.trim_matches('/').to_string();
     let view = project.view(&viewer);
-    if !view.read(&path) {
+    // Who has access names groups and people: for the project's own
+    // participants only, and only for a path they may read.
+    if !project.participant(&viewer) || !view.read(&path) {
         return Err(Error::not_found("no such path that you can see"));
     }
     let mut c = hub.db.acquire().await?;

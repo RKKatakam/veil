@@ -22,6 +22,11 @@ pub trait BlobStore: Send + Sync {
     /// same key twice writes the same bytes.
     async fn put(&self, key: &str, data: Bytes) -> Result<()>;
     async fn exists(&self, key: &str) -> Result<bool>;
+    /// A read that needs no async runtime (a local file), for code already
+    /// on a blocking thread; `None`: use [`BlobStore::get`].
+    fn get_blocking(&self, _key: &str) -> Option<Result<Option<Bytes>>> {
+        None
+    }
 }
 
 /// Object key of `id` in `project`.
@@ -80,6 +85,14 @@ impl BlobStore for FsStore {
 
     async fn exists(&self, key: &str) -> Result<bool> {
         Ok(tokio::fs::try_exists(self.path(key)?).await?)
+    }
+
+    fn get_blocking(&self, key: &str) -> Option<Result<Option<Bytes>>> {
+        Some((|| match std::fs::read(self.path(key)?) {
+            Ok(b) => Ok(Some(Bytes::from(b))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        })())
     }
 }
 
@@ -199,6 +212,44 @@ impl Objects {
         }
         self.cache.insert(ck, b.clone(), b.len());
         Ok(Some(b))
+    }
+
+    /// [`Objects::get`] from a blocking thread: a local store is read
+    /// directly; any other through `rt`.
+    pub fn get_blocking(&self, rt: &tokio::runtime::Handle, project: i64, id: &ObjectId) -> Result<Option<Bytes>> {
+        let ck = Self::cache_key(project, id);
+        if let Some(b) = self.cache.get(&ck) {
+            return Ok(Some(b));
+        }
+        let Some(r) = self.store.get_blocking(&object_key(project, id)) else {
+            return rt.block_on(self.get(project, id));
+        };
+        let Some(b) = r? else { return Ok(None) };
+        if ObjectId::hash(&b) != *id {
+            bail!("stored object {} does not match its id", id.short());
+        }
+        self.cache.insert(ck, b.clone(), b.len());
+        Ok(Some(b))
+    }
+
+    /// Read `ids` into the cache, many at once (a remote store's latency
+    /// would otherwise add up one object at a time). Only warms the cache:
+    /// what is served is decided afterwards.
+    pub async fn prefetch(self: &std::sync::Arc<Self>, project: i64, ids: Vec<ObjectId>) {
+        let mut set = tokio::task::JoinSet::new();
+        let mut it = ids.into_iter();
+        loop {
+            while set.len() < 64 {
+                let Some(id) = it.next() else { break };
+                let me = self.clone();
+                set.spawn(async move {
+                    let _ = me.get(project, &id).await;
+                });
+            }
+            if set.join_next().await.is_none() {
+                break;
+            }
+        }
     }
 
     pub async fn put(&self, project: i64, id: &ObjectId, raw: Bytes) -> Result<()> {

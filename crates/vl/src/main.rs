@@ -534,6 +534,9 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             return hub_cmd::push(ctx, remote.as_deref().unwrap_or("origin"), tag, *force);
         }
         Cmd::Pull { remote, .. } if hub_cmd::is_hub_remote(ctx, remote) => hub_cmd::pull(ctx, remote)?,
+        Cmd::Push { remote, .. } if hub_cmd::is_hub_remote(ctx, remote.as_deref().unwrap_or("origin")) => {
+            bail!("--dry-run and --delete are not available for a Veil server remote yet (docs/HUB.md §13.8)")
+        }
         Cmd::Push {
             remote,
             tag,

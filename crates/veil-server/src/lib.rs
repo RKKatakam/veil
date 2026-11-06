@@ -28,7 +28,7 @@ use veil_core::{cache::LruCache, object::Tree, object::TreeEncoding, Identity};
 /// Shared server state.
 pub struct Hub {
     pub db: sqlx::PgPool,
-    pub objects: store::Objects,
+    pub objects: Arc<store::Objects>,
     /// Decoded trees, by [`store::Objects::tree_key`].
     pub trees: LruCache<(Arc<Tree>, TreeEncoding)>,
     /// The server's own signing identity: projected snapshots are signed
@@ -116,7 +116,7 @@ pub async fn start(config: Config) -> Result<Running> {
     };
     let hub = Arc::new(Hub {
         db,
-        objects: store::Objects::new(blob, 256 << 20),
+        objects: Arc::new(store::Objects::new(blob, 256 << 20)),
         trees: LruCache::new(256 << 20),
         identity,
         session_ttl_ms: config.session_ttl.as_millis() as i64,

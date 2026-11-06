@@ -1074,6 +1074,8 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
   history signed by teammates who have not signed in yet is refused until
   they do.
 * The team vault (`vl secret --scope`) does not sync through the server.
+* `vl push --dry-run` and `--delete`, and `pre-push` hooks, are not
+  available for server remotes yet.
 
 ### 13.9 Later milestones (not in S1)
 
@@ -1099,4 +1101,8 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
 `veil-bench openscion` (`crates/veil-bench/src/openscion.rs`) measures the
 four OpenScion workloads with release builds, the server on `127.0.0.1`
 over TLS with PostgreSQL in Docker, and Git on the same machine as the
-reference. Results are in `docs/design/scale/OPENSCION.md`.
+reference. Results are in `docs/design/scale/OPENSCION.md`: cloning
+through the server takes what cloning from a path remote takes on the same
+machine (the server adds nothing measurable); both are dominated by the
+checkout's per-file `fsync` (BUG-818, pre-existing). Clone one directory
+stays flat from 1k to 10k files.
