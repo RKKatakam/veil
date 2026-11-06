@@ -153,27 +153,50 @@ pub async fn login(State(hub): State<HubState>, headers: HeaderMap, Json(req): J
     // The session is written in the same transaction as the device: a
     // request that committed is never run again (`db::retry_requests`),
     // and its challenge is spent.
-    let outcome = crate::db::serializable(&hub.db, move |c| {
-        let key = key.clone();
-        let name = name.clone();
-        let public_identity = public_identity.clone();
-        let fingerprint = fingerprint.clone();
-        let session = session.clone();
-        Box::pin(async move {
-            let found = signed_in(&mut *c, &key, name, &public_identity, &fingerprint).await?;
-            if let Ok((device, person, _)) = &found {
-                sqlx::query("INSERT INTO sessions (token_hash, device_id, person_id, expires_at) VALUES ($1, $2, $3, $4)")
-                    .bind(&session)
-                    .bind(device)
-                    .bind(person)
-                    .bind(expires_at)
-                    .execute(&mut *c)
-                    .await?;
-            }
-            Ok(found)
+    //
+    // READ COMMITTED, not SERIALIZABLE (BUG-847): a new sign-up looks up a
+    // device by `signing_key` and a person by `name` and finds neither, and
+    // on YugabyteDB a SERIALIZABLE read that finds no row through a unique
+    // secondary index locks its whole table; every concurrent sign-up then
+    // inserted into a table another one held, and they deadlocked. The only
+    // races sign-in has are decided by those unique keys anyway: two
+    // sign-ups of one name, or one key signing in twice. The loser's insert
+    // fails on the key (`23505`), and the transaction runs again: it then
+    // finds the person (a pending device) or the device.
+    let mut attempt = 0;
+    let outcome = loop {
+        attempt += 1;
+        let (key, name, public_identity, fingerprint, session) =
+            (key.clone(), name.clone(), public_identity.clone(), fingerprint.clone(), session.clone());
+        let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
+            let key = key.clone();
+            let name = name.clone();
+            let public_identity = public_identity.clone();
+            let fingerprint = fingerprint.clone();
+            let session = session.clone();
+            Box::pin(async move {
+                let found = signed_in(&mut *c, &key, name, &public_identity, &fingerprint).await?;
+                if let Ok((device, person, _)) = &found {
+                    sqlx::query("INSERT INTO sessions (token_hash, device_id, person_id, expires_at) VALUES ($1, $2, $3, $4)")
+                        .bind(&session)
+                        .bind(device)
+                        .bind(person)
+                        .bind(expires_at)
+                        .execute(&mut *c)
+                        .await?;
+                }
+                Ok(found)
+            })
         })
-    })
-    .await?;
+        .await;
+        match r {
+            Err(Error::Db(sqlx::Error::Database(d))) if d.code().as_deref() == Some("23505") && attempt < 5 => continue,
+            r => break r?,
+        }
+    };
+    if let Err(name) = &outcome {
+        prune_pending(&hub.db, name).await;
+    }
     let (device, person, person_name) = outcome.map_err(|name| pending(&name))?;
     crate::audit(&hub.db, None, Some(person), "login", &format!("device {device}")).await;
     Ok(Json(Session {
@@ -221,33 +244,8 @@ async fn signed_in(
     let taken: Option<i64> = sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(&name).fetch_optional(&mut *c).await?;
     if let Some(person) = taken {
         // One of their devices may vouch for it; until then it is nothing
-        // (no session, its signatures not accepted). Expired pending
-        // devices go; then at most PENDING_PER_PERSON stay, the oldest
-        // pushed out, never one the person is waiting for (§13.12).
-        sqlx::query(
-            "DELETE FROM devices d WHERE d.person_id = $1 AND d.pending AND d.created_at < $2 \
-             AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.device_id = d.id) \
-             AND NOT EXISTS (SELECT 1 FROM device_vouches v WHERE v.device_id = d.id) \
-             AND NOT EXISTS (SELECT 1 FROM invites i WHERE i.device_id = d.id)",
-        )
-        .bind(person)
-        .bind(now - PENDING_TTL_MS)
-        .execute(&mut *c)
-        .await?;
-        sqlx::query(
-            "DELETE FROM devices WHERE id IN (SELECT d.id FROM devices d WHERE d.person_id = $1 AND d.pending \
-             AND NOT EXISTS (SELECT 1 FROM device_expected e WHERE e.person_id = d.person_id AND e.fingerprint = d.fingerprint \
-             AND e.expires_at > $2) \
-             AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.device_id = d.id) \
-             AND NOT EXISTS (SELECT 1 FROM device_vouches v WHERE v.device_id = d.id) \
-             AND NOT EXISTS (SELECT 1 FROM invites i WHERE i.device_id = d.id) \
-             ORDER BY d.created_at DESC, d.id DESC OFFSET $3)",
-        )
-        .bind(person)
-        .bind(now)
-        .bind(PENDING_PER_PERSON - 1)
-        .execute(&mut *c)
-        .await?;
+        // (no session, its signatures not accepted). The bound on pending
+        // devices is kept after the transaction ([`prune_pending`]).
         sqlx::query(
             "INSERT INTO devices (person_id, signing_key, public_identity, created_at, pending, fingerprint) \
              VALUES ($1, $2, $3, $4, TRUE, $5)",
@@ -276,6 +274,42 @@ async fn signed_in(
     .fetch_one(&mut *c)
     .await?;
     Ok(Ok((device, person, name)))
+}
+
+/// Keep `name`'s pending devices bounded (§13.12): the expired ones go, then
+/// all but the newest [`PENDING_PER_PERSON`], never one the person is
+/// waiting for (`device_expected`). Best effort and idempotent, outside the
+/// sign-in's transaction: its scans of other tables would make every
+/// concurrent sign-in conflict with it on YugabyteDB.
+async fn prune_pending(db: &sqlx::PgPool, name: &str) {
+    let now = veil_core::now_millis();
+    let unreferenced = "NOT EXISTS (SELECT 1 FROM sessions s WHERE s.device_id = d.id) \
+         AND NOT EXISTS (SELECT 1 FROM device_vouches v WHERE v.device_id = d.id) \
+         AND NOT EXISTS (SELECT 1 FROM invites i WHERE i.device_id = d.id)";
+    let expired = sqlx::query(&format!(
+        "DELETE FROM devices d WHERE d.person_id = (SELECT id FROM people WHERE name = $1) AND d.pending \
+         AND d.created_at < $2 AND {unreferenced}"
+    ))
+    .bind(name)
+    .bind(now - PENDING_TTL_MS)
+    .execute(db)
+    .await;
+    let over = sqlx::query(&format!(
+        "DELETE FROM devices WHERE id IN (SELECT d.id FROM devices d WHERE d.person_id = (SELECT id FROM people WHERE name = $1) \
+         AND d.pending AND NOT EXISTS (SELECT 1 FROM device_expected e WHERE e.person_id = d.person_id \
+         AND e.fingerprint = d.fingerprint AND e.expires_at > $2) AND {unreferenced} \
+         ORDER BY d.created_at DESC, d.id DESC OFFSET $3)"
+    ))
+    .bind(name)
+    .bind(now)
+    .bind(PENDING_PER_PERSON)
+    .execute(db)
+    .await;
+    for r in [expired, over] {
+        if let Err(e) = r {
+            eprintln!("veil-server: pruning pending devices: {e}");
+        }
+    }
 }
 
 impl FromRequestParts<HubState> for Caller {

@@ -2,7 +2,11 @@
 //! with portable SQL only (`docs/HUB.md` §2.1).
 //!
 //! * Read-check-write transactions are SERIALIZABLE ([`serializable`]);
-//!   branch moves, which are one-row compare-and-swaps, READ COMMITTED.
+//!   branch moves, which are one-row compare-and-swaps, READ COMMITTED, and
+//!   so are the hot ones whose races unique keys and row locks decide:
+//!   sign-in, project and group creation, group changes (BUG-847: on
+//!   YugabyteDB a SERIALIZABLE read blocks every insert into the table it
+//!   read until it commits).
 //!   Both go through [`transaction`], which runs them again when they lose
 //!   a race, within a deadline.
 //! * Every connection sets `statement_timeout` and `lock_timeout`: no
@@ -166,11 +170,13 @@ pub const TRANSACTION_DEADLINE: Duration = Duration::from_secs(45);
 /// Isolation of a [`transaction`].
 #[derive(Clone, Copy, Debug)]
 pub enum Isolation {
-    /// For read-check-write sequences (group changes, sign-up, project
-    /// creation).
+    /// For read-check-write sequences whose race no unique key or row lock
+    /// decides.
     Serializable,
     /// For compare-and-swaps that are atomic on their own (a branch move is
-    /// one conditional `UPDATE` of one row). SERIALIZABLE would add read
+    /// one conditional `UPDATE` of one row), and for transactions whose
+    /// races unique keys and row locks decide (sign-in, project and group
+    /// creation, group changes: BUG-847). SERIALIZABLE would add read
     /// locks that make racing pushers block one another; on YugabyteDB they
     /// queued for minutes. (YugabyteDB runs it as REPEATABLE READ unless
     /// read committed is enabled; both fail fast on a conflict.)

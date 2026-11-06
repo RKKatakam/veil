@@ -243,3 +243,45 @@ fn shares_racing_a_removal_never_keep_a_removed_device() {
     }
     assert!(raced > 0, "no share raced the removal: the test proved nothing");
 }
+
+/// BUG-847. New people signing up at once: on YugabyteDB, sign-in's
+/// SERIALIZABLE transaction found no device by its key and no person by the
+/// name, and each such read locked its whole table (`devices`, `people`), so
+/// concurrent sign-ups deadlocked and, under load, some ran past the 45 s
+/// deadline ("the database is busy"). Every sign-up must succeed, whatever
+/// else signs up meanwhile, and a name raced for goes to one person: the
+/// other sign-ups under it wait as pending devices.
+#[test]
+fn bug_847_concurrent_sign_ups_all_succeed() {
+    let hub = TestHub::start();
+    let failed = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..48 {
+            s.spawn(|| {
+                let api = hub.api();
+                for _ in 0..4 {
+                    if api.login(&Identity::generate("x"), Some(&unique("signup"))).is_err() {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    assert_eq!(failed.load(Ordering::Relaxed), 0, "sign-ups failed");
+    // One name raced for by several new devices: one signs up, the others
+    // are its pending devices.
+    let name = unique("raced");
+    let (signed, pending) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    std::thread::scope(|s| {
+        for _ in 0..8 {
+            s.spawn(|| match hub.api().login(&Identity::generate("x"), Some(&name)) {
+                Ok(_) => signed.fetch_add(1, Ordering::Relaxed),
+                Err(r) => {
+                    assert!(String::from_utf8_lossy(&r.body).contains("device_pending"), "{r:?}");
+                    pending.fetch_add(1, Ordering::Relaxed)
+                }
+            });
+        }
+    });
+    assert_eq!((signed.load(Ordering::Relaxed), pending.load(Ordering::Relaxed)), (1, 7));
+}

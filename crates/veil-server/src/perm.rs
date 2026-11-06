@@ -178,8 +178,10 @@ pub async fn bind_names(c: &mut PgConnection, project: i64, policy: &AccessPolic
     Ok(out)
 }
 
+/// Is `person` a manager of `group`? The row is locked (`FOR SHARE`) for
+/// the rest of the transaction: a concurrent removal of the manager waits.
 pub async fn is_manager(c: &mut PgConnection, group: i64, person: i64) -> Result<bool> {
-    let r: Option<i64> = sqlx::query_scalar("SELECT person_id FROM group_managers WHERE group_id = $1 AND person_id = $2")
+    let r: Option<i64> = sqlx::query_scalar("SELECT person_id FROM group_managers WHERE group_id = $1 AND person_id = $2 FOR SHARE")
         .bind(group)
         .bind(person)
         .fetch_optional(&mut *c)

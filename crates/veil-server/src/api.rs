@@ -184,33 +184,39 @@ async fn pending_device(
     )))
 }
 
-/// Queue "share keys for `person`" in `project`, or in every project they
-/// take part in (an admin, or in a group): a hint for the devices that
-/// share keys in the background (`GET …/keys/pending`), never a grant.
-async fn queue_key_request(c: &mut PgConnection, person: i64, project: Option<i64>) -> Result<()> {
-    let now = veil_core::now_millis();
-    sqlx::query("DELETE FROM key_requests WHERE created_at < $1").bind(now - KEY_REQUEST_TTL_MS).execute(&mut *c).await?;
-    let projects: Vec<i64> = match project {
-        Some(p) => vec![p],
-        None => sqlx::query_scalar(
-            "SELECT project_id FROM project_admins WHERE person_id = $1 UNION \
-             SELECT g.project_id FROM groups g JOIN group_members m ON m.group_id = g.id WHERE m.person_id = $1",
-        )
-        .bind(person)
-        .fetch_all(&mut *c)
-        .await?,
-    };
-    for p in projects {
-        sqlx::query(
-            "INSERT INTO key_requests (project_id, person_id, created_at) VALUES ($1, $2, $3) \
-             ON CONFLICT (project_id, person_id) DO UPDATE SET created_at = EXCLUDED.created_at",
-        )
-        .bind(p)
-        .bind(person)
-        .bind(now)
-        .execute(&mut *c)
-        .await?;
-    }
+/// Queue "share keys for `person`" in `project`: a hint for the devices
+/// that share keys in the background (`GET …/keys/pending`), never a grant.
+/// One row's upsert, so it may run inside a transaction. Expired requests
+/// are ignored when listed, and removed there (`pending_keys`).
+async fn queue_key_request(c: &mut PgConnection, person: i64, project: i64) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO key_requests (project_id, person_id, created_at) VALUES ($1, $2, $3) \
+         ON CONFLICT (project_id, person_id) DO UPDATE SET created_at = EXCLUDED.created_at",
+    )
+    .bind(project)
+    .bind(person)
+    .bind(veil_core::now_millis())
+    .execute(&mut *c)
+    .await?;
+    Ok(())
+}
+
+/// The same hint in every project `person` takes part in (an admin, or in
+/// a group), after a transaction committed: one autocommit statement. Inside
+/// a SERIALIZABLE transaction its read of `groups` and `group_members` locked
+/// both tables on YugabyteDB, so every group change of every project waited
+/// for it. Idempotent, so a request run again repeats it harmlessly.
+async fn queue_key_requests_everywhere(db: &sqlx::PgPool, person: i64) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO key_requests (project_id, person_id, created_at) \
+         SELECT DISTINCT p, $1, $2 FROM (SELECT project_id AS p FROM project_admins WHERE person_id = $1 UNION \
+         SELECT g.project_id FROM groups g JOIN group_members m ON m.group_id = g.id WHERE m.person_id = $1) t \
+         ON CONFLICT (project_id, person_id) DO UPDATE SET created_at = EXCLUDED.created_at",
+    )
+    .bind(person)
+    .bind(veil_core::now_millis())
+    .execute(db)
+    .await?;
     Ok(())
 }
 
@@ -228,6 +234,11 @@ async fn pending_keys(State(hub): State<HubState>, caller: Caller, Path(p): Path
     if !project.participant(&viewer) {
         return Err(Error::forbidden("you are not in this project"));
     }
+    sqlx::query("DELETE FROM key_requests WHERE project_id = $1 AND created_at < $2")
+        .bind(project.id)
+        .bind(veil_core::now_millis() - KEY_REQUEST_TTL_MS)
+        .execute(&hub.db)
+        .await?;
     let names: Vec<String> = sqlx::query_scalar(
         "SELECT p.name FROM key_requests k JOIN people p ON p.id = k.person_id WHERE k.project_id = $1 AND k.created_at > $2 ORDER BY p.name",
     )
@@ -296,7 +307,6 @@ async fn remove_device(State(hub): State<HubState>, caller: Caller, Json(req): J
             if person == me.id {
                 sqlx::query("UPDATE devices SET removed_at = $1 WHERE id = $2").bind(veil_core::now_millis()).bind(id).execute(&mut *c).await?;
                 sqlx::query("DELETE FROM sessions WHERE device_id = $1").bind(id).execute(&mut *c).await?;
-                queue_key_request(c, person, None).await?;
             } else {
                 let project = admin_of.expect("allowed only as an admin of the project");
                 sqlx::query("INSERT INTO device_bars (project_id, device_id, created_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
@@ -305,13 +315,16 @@ async fn remove_device(State(hub): State<HubState>, caller: Caller, Json(req): J
                     .bind(veil_core::now_millis())
                     .execute(&mut *c)
                     .await?;
-                queue_key_request(c, person, Some(project)).await?;
+                queue_key_request(c, person, project).await?;
             }
             Ok((person, name))
         })
     })
     .await?;
     let own = person == caller.signed_in()?.id;
+    if own {
+        queue_key_requests_everywhere(&hub.db, person).await?;
+    }
     let what = if own { "remove device" } else { "remove device from project" };
     crate::audit(&hub.db, admin_of, Some(caller.signed_in()?.id), what, &format!("{name} ({person}): {}", &req.device[..req.device.len().min(69)])).await;
     device_list(&hub, &name, if own { None } else { admin_of }).await
@@ -430,7 +443,7 @@ async fn join(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>
                 .bind(me.id)
                 .execute(&mut *c)
                 .await?;
-            queue_key_request(c, me.id, Some(pid)).await?;
+            queue_key_request(c, me.id, pid).await?;
             let group: String = sqlx::query_scalar("SELECT name FROM groups WHERE id = $1").bind(gid).fetch_one(&mut *c).await?;
             Ok((group, person))
         })
@@ -477,11 +490,11 @@ async fn vouch(State(hub): State<HubState>, caller: Caller, Json(req): Json<Vouc
             .execute(&mut *c)
             .await?;
             sqlx::query("UPDATE devices SET pending = FALSE WHERE id = $1").bind(device).execute(&mut *c).await?;
-            queue_key_request(c, person, None).await?;
             Ok(device)
         })
     })
     .await?;
+    queue_key_requests_everywhere(&hub.db, person).await?;
     crate::audit(&hub.db, None, Some(me.id), "vouch for device", &format!("device {n}")).await;
     device_list(&hub, &me.name, None).await
 }
@@ -492,15 +505,15 @@ async fn create_project(State(hub): State<HubState>, caller: Caller, Path(name):
         return Err(Error::bad_request("a project name is 1 to 64 lowercase letters, digits, '-', '_' or '.'"));
     }
     let n = name.clone();
-    crate::db::serializable(&hub.db, move |c| {
+    // READ COMMITTED (BUG-847): the unique name decides a race, and on
+    // YugabyteDB a SERIALIZABLE read blocks every insert into the table it
+    // read until it commits, so project creations queued behind each other.
+    crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
         let n = n.clone();
         Box::pin(async move {
-            let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&n).fetch_optional(&mut *c).await?;
-            if exists.is_some() {
-                return Err(Error::conflict(format!("a project named '{n}' exists")));
-            }
+            let exists = || Error::conflict(format!("a project named '{n}' exists"));
             // The creator is the admin; everything is private (no rules).
-            let id: i64 = sqlx::query_scalar(
+            let id: i64 = match sqlx::query_scalar(
                 "INSERT INTO projects (name, created_by, created_at, default_branch, policy_text, policy_bindings, policy_version) \
                  VALUES ($1, $2, $3, 'main', '', '{}', 0) RETURNING id",
             )
@@ -508,7 +521,11 @@ async fn create_project(State(hub): State<HubState>, caller: Caller, Path(name):
             .bind(me.id)
             .bind(veil_core::now_millis())
             .fetch_one(&mut *c)
-            .await?;
+            .await
+            {
+                Err(sqlx::Error::Database(d)) if d.code().as_deref() == Some("23505") => return Err(exists()),
+                r => r?,
+            };
             sqlx::query("INSERT INTO project_admins (project_id, person_id) VALUES ($1, $2)")
                 .bind(id)
                 .bind(me.id)
@@ -672,22 +689,27 @@ async fn create_group(State(hub): State<HubState>, caller: Caller, Path((p, g)):
     }
     let pid = project.id;
     let g2 = g.clone();
-    let info = crate::db::serializable(&hub.db, move |c| {
+    // READ COMMITTED (BUG-847): the unique key decides a race, the project's
+    // row lock orders the bindings' read-modify-write, and on YugabyteDB a
+    // SERIALIZABLE read blocks every insert into the table it read until it
+    // commits, so every project's group creations waited for one another.
+    let info = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
         let g = g2.clone();
         Box::pin(async move {
-            let r = sqlx::query("INSERT INTO groups (project_id, name) VALUES ($1, $2) ON CONFLICT DO NOTHING")
-                .bind(pid)
-                .bind(&g)
-                .execute(&mut *c)
-                .await?;
-            if r.rows_affected() == 0 {
-                return Err(Error::conflict(format!("group '{g}' exists")));
+            // A plain insert, the unique key refusing a second group.
+            let r = sqlx::query("INSERT INTO groups (project_id, name) VALUES ($1, $2)").bind(pid).bind(&g).execute(&mut *c).await;
+            if let Err(sqlx::Error::Database(d)) = &r {
+                if d.code().as_deref() == Some("23505") {
+                    return Err(Error::conflict(format!("group '{g}' exists")));
+                }
             }
+            r?;
             // A group always wins: an accepted access line naming it now
             // names this group, never the person who signed up under its
             // name, nor a deleted group of that name.
             let gid = group_id(c, pid, &g).await?;
-            let text: String = sqlx::query_scalar("SELECT policy_bindings FROM projects WHERE id = $1").bind(pid).fetch_one(&mut *c).await?;
+            let text: String =
+                sqlx::query_scalar("SELECT policy_bindings FROM projects WHERE id = $1 FOR UPDATE").bind(pid).fetch_one(&mut *c).await?;
             let mut bindings: std::collections::BTreeMap<String, Binding> = serde_json::from_str(&text).unwrap_or_default();
             if let Some(b) = bindings.get_mut(&g) {
                 *b = Binding::Group(gid);
@@ -757,7 +779,12 @@ async fn change_group(hub: HubState, caller: Caller, p: String, g: String, op: O
     let pid = project.id;
     let admin = viewer.admin;
     let (g2, people) = (g.clone(), req.people.clone());
-    let info = crate::db::serializable(&hub.db, move |c| {
+    // READ COMMITTED (BUG-847): on YugabyteDB a SERIALIZABLE read blocks
+    // every insert into the table it read until it commits, so every
+    // group change waited for every other. The changes are idempotent row
+    // inserts and deletes; the manager's right is held by a row lock
+    // (`is_manager`), so a manager removed meanwhile changes nothing.
+    let info = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
         let (g, people) = (g2.clone(), people.clone());
         Box::pin(async move {
             let gid = group_id(c, pid, &g).await?;
@@ -801,7 +828,7 @@ async fn change_group(hub: HubState, caller: Caller, p: String, g: String, op: O
                 };
                 sqlx::query(q).bind(gid).bind(id).execute(&mut *c).await?;
                 if op == Op::AddMember {
-                    queue_key_request(c, *id, Some(pid)).await?;
+                    queue_key_request(c, *id, pid).await?;
                 }
             }
             group_info(c, pid, &g).await
