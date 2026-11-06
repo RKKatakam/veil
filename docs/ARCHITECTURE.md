@@ -1826,7 +1826,19 @@ A workspace is only a named pointer in the view. It owns no directory.
      `GIT_CEILING_DIRECTORIES` set to the sandbox (and `find_root` never
      resolves a repository from inside `.veil/`), with SIGINT/SIGQUIT
      ignored by `vl` and SIGTERM/SIGHUP forwarded to the command (BUG-550),
-     so they stop the command, not the recording;
+     so they stop the command, not the recording. **On Linux the command
+     is confined** (`confine.rs`, `docs/design/scale/9-confinement.md`):
+     `bwrap` binds the sandbox at the project's canonical path, the
+     system read-only, an empty tmpfs `HOME` and `/tmp`, a read-only
+     allow-list, and a tmpfs over the Veil home, in new user, pid, IPC
+     and UTS namespaces (`--disable-userns`, `--die-with-parent`,
+     `--new-session`). `vl` checks it with a run of `true` before step 1
+     touches anything. Limits go through a systemd user scope
+     (`systemd-run --scope` execs `bwrap` in place) or `RLIMIT_CPU` and
+     polling; `vl` and the reaper are outside them. `bwrap` has its own
+     process group and the command no terminal, so `vl` forwards
+     SIGINT/SIGQUIT to the command's process group and SIGTERM/SIGHUP to
+     the command, through a pidfd;
   7. records with `expected_wc` = the snapshot it synced to, through
      `PolicyPin` (the recorded `.veilpolicy` when the sandbox's is not a
      regular, readable file), as the command's output

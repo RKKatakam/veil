@@ -79,6 +79,7 @@ The owner adopted the four synthetic workloads published by OpenScion, an indepe
   - streaming storage, safe gc, secret scanning, embargoes.
 - **Built (milestone S1, 2026-11-06): the server and the permission model, together** (`docs/HUB.md` §13). The server, the database (PostgreSQL, YugabyteDB), object storage (S3), sign-in, groups, admins, folder access, public, secrets encrypted on the device, and `vl` pushing, pulling and cloning (one directory too) through the server, with each person receiving only what they may see.
 - **Required for phase 1: isolated agent sandboxes** (owner, 2026-11-06). Every `vl ws exec` runs the agent in an isolated view of the machine, not just a separate folder.
+  - **Built on Linux (2026-11-06)** with bubblewrap, default on, with the limits (`docs/design/scale/9-confinement.md`, the guide's "Confinement and limits"). A confined run starts about 5 ms slower than an unconfined one; a limit that needs a systemd scope adds about 40 ms. **Not built yet:** macOS and `--container`.
   - **Linux:**
     - kernel namespaces, with no Docker image and no copying, starting in milliseconds and needing no root;
     - the computer's own tools (`/usr`, `/bin`, `/lib`, toolchains) are visible **read-only and live**;

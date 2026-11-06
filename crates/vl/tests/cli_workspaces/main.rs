@@ -11,6 +11,8 @@
 #[path = "../adversarial_support/mod.rs"]
 mod adversarial_support;
 
+#[cfg(target_os = "linux")]
+mod confine_cli;
 mod guide_library;
 mod mount_cli;
 mod mount_props;

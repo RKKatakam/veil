@@ -98,12 +98,14 @@ fn a_secret_that_lands_after_an_injected_run_is_never_recorded() {
     let env = Env::new();
     let proj = project(&env);
     // A dev server started in the background keeps the environment and
-    // writes it to its log a moment later.
+    // writes it to its log a moment later. Only an unconfined run leaves a
+    // background process running (a confined one stops with its command).
     exec(
         &env,
         &proj,
         &[
             "--with-isolated",
+            "--unconfined",
             "--",
             "sh",
             "-c",
@@ -205,10 +207,11 @@ fn sigterm_to_vl_keeps_the_commands_work() {
     let env = Env::new();
     let proj = project(&env);
     exec(&env, &proj, &["--", "true"]);
-    let started = env.root.join("started");
-    let script = format!("echo 'an hour of agent work' > work.txt; touch {}; sleep 3; echo more >> work.txt", started.display());
-    let child = env.spawn(U, &proj, &["ws", "exec", "agent", "--", "sh", "-c", &script]);
+    let started = files_dir(&proj).join(".started");
+    let script = "echo 'an hour of agent work' > work.txt; touch .started; sleep 3; echo more >> work.txt";
+    let child = env.spawn(U, &proj, &["ws", "exec", "agent", "--", "sh", "-c", script]);
     assert!(wait_for(Duration::from_secs(20), || started.exists()));
+    let _ = std::fs::remove_file(&started);
     // SAFETY: signals our own child.
     unsafe {
         libc::kill(child.id() as i32, libc::SIGTERM);
@@ -238,10 +241,12 @@ fn a_busy_repository_lock_at_record_time_keeps_the_run() {
     let env = Env::new();
     let proj = project(&env);
     exec(&env, &proj, &["--", "true"]);
-    let started = env.root.join("started");
-    let script = format!("touch {}; sleep 1; echo 'agent output' > out.txt", started.display());
-    let child = env.spawn(U, &proj, &["ws", "exec", "agent", "--", "sh", "-c", &script]);
+    // In the sandbox: the confined command sees nothing else.
+    let started = files_dir(&proj).join(".started");
+    let script = "touch .started; sleep 1; echo 'agent output' > out.txt";
+    let child = env.spawn(U, &proj, &["ws", "exec", "agent", "--", "sh", "-c", script]);
     assert!(wait_for(Duration::from_secs(20), || started.exists()));
+    let _ = std::fs::remove_file(&started);
     // Another process takes the repository lock while the command runs and
     // holds it for 20 s.
     let backend: Arc<dyn veil_core::StorageBackend> = Arc::new(DiskBackend::new(&proj));

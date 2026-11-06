@@ -241,10 +241,11 @@ fn a_workspace_moved_during_a_sparse_run_keeps_both_results_and_everything_else(
     let env = Env::new();
     let proj = project(&env);
     exec(&env, &proj, &["--only", "src", "--", "true"]);
-    let started = env.root.join("started");
-    let script = format!("touch {}; sleep 2; echo run > src/run.rs", started.display());
-    let child = env.spawn("alice", &proj, &["ws", "exec", "agent", "--only", "src", "-m", "agent run", "--", "sh", "-c", &script]);
+    let started = files_dir(&proj).join(".started");
+    let script = "touch .started; sleep 2; echo run > src/run.rs";
+    let child = env.spawn("alice", &proj, &["ws", "exec", "agent", "--only", "src", "-m", "agent run", "--", "sh", "-c", script]);
     assert!(wait_for(Duration::from_secs(20), || started.exists()));
+    let _ = std::fs::remove_file(&started);
     let mut w = env
         .cmd("alice", &proj, &["ws", "write", "agent", "docs/meanwhile.md"])
         .stdin(Stdio::piped())

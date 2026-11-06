@@ -1124,6 +1124,19 @@ pub enum WsCmd {
     /// it stays in the sandbox, and the next run (or --record-only)
     /// records it first. SIGTERM and SIGHUP are forwarded to the command,
     /// as Ctrl-C is, and vl records what it left.
+    ///
+    /// On Linux the command runs confined (bubblewrap): the sandbox appears
+    /// at the project's real path, starting in the sub-folder you ran vl
+    /// from; the computer's tools are read-only; HOME and /tmp are empty
+    /// and private (~/.ssh, ~/.gnupg, the Veil identity and other projects
+    /// are not there); only the sandbox's own processes are visible. A
+    /// read-only allow-list shows toolchains and agent configuration
+    /// (~/.cargo, ~/.rustup, ~/.claude, ...; more with --allow or
+    /// [exec.confine] allow in .veil/local/config.toml or
+    /// $VEIL_HOME/config.toml). When the command exits, everything it
+    /// started stops. --memory, --cpus, --cpu-time, --pids and --timeout
+    /// limit it ([exec.limits] gives defaults); vl itself stays outside
+    /// the limits, so the run is always recorded.
     Exec {
         /// Workspace to run in (or use --ephemeral).
         name: Option<String>,
@@ -1145,6 +1158,8 @@ pub enum WsCmd {
         /// Run nothing: record what an earlier run left unrecorded (vl was killed, or recording failed).
         #[arg(long, conflicts_with_all = ["ephemeral", "with_isolated", "only", "command"])]
         record_only: bool,
+        #[command(flatten)]
+        confine: Box<crate::confine::ConfineArgs>,
         /// Command and arguments.
         #[arg(last = true, required_unless_present = "record_only")]
         command: Vec<String>,

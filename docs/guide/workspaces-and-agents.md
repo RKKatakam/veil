@@ -10,11 +10,12 @@ it), or read and write its files directly. You never set up a worktree.
 
 1. [Virtual workspaces](#virtual-workspaces)
 2. [`vl ws exec`: run a command in a sandbox](#vl-ws-exec-run-a-command-in-a-sandbox)
-3. [One-shot runs: `--ephemeral`](#one-shot-runs---ephemeral)
-4. [Isolated files in sandboxes: `--with-isolated`](#with-isolated)
-5. [Sandboxes](#sandboxes)
-6. [`vl ws mount`: a workspace as a directory](#vl-ws-mount-a-workspace-as-a-directory)
-7. [Agents in the library: in-memory workspaces](#agents-in-the-library-in-memory-workspaces)
+3. [Confinement and limits (Linux)](#confinement-and-limits-linux)
+4. [One-shot runs: `--ephemeral`](#one-shot-runs---ephemeral)
+5. [Isolated files in sandboxes: `--with-isolated`](#with-isolated)
+6. [Sandboxes](#sandboxes)
+7. [`vl ws mount`: a workspace as a directory](#vl-ws-mount-a-workspace-as-a-directory)
+8. [Agents in the library: in-memory workspaces](#agents-in-the-library-in-memory-workspaces)
 
 ## Virtual workspaces
 
@@ -106,7 +107,7 @@ When an ordinary workspace's work should land later, `vl describe` it (or
 ```text
 $ vl ws exec agent -m "agent: add notes" -- sh -c 'echo "notes" > NOTES.md; ls -a'
 synced sandbox: 3 files written, 0 removed
-running sh -c echo "notes" > NOTES.md; ls -a in /home/me/app/.veil/local/sandboxes/agent/files
+running sh -c echo "notes" > NOTES.md; ls -a in /home/me/app/.veil/local/sandboxes/agent/files (confined at /home/me/app)
 .
 ..
 .veilpolicy
@@ -115,7 +116,7 @@ app.py
 cfg.js
 Recorded lqosxltm 79607804 agent: add notes
 $ vl ws exec agent -- cargo build      # the second run rewrites nothing
-running cargo build in /home/me/app/.veil/local/sandboxes/agent/files
+running cargo build in /home/me/app/.veil/local/sandboxes/agent/files (confined at /home/me/app)
 ```
 
 * Each workspace has **one sandbox**, `.veil/local/sandboxes/NAME/files`,
@@ -173,6 +174,90 @@ running cargo build in /home/me/app/.veil/local/sandboxes/agent/files
 * You can't `ws exec` the workspace your directory is attached to (`vl`
   says: just run the command).
 
+## Confinement and limits (Linux)
+
+On Linux every `vl ws exec` runs its command **confined**, through
+[bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`, the tool
+Flatpak uses): an agent or a test suite can change only its own sandbox,
+and cannot read your private files. It needs no root, copies nothing, and
+adds a few milliseconds to a run.
+
+```text
+$ cd ~/app/src
+$ vl ws exec agent -- sh -c 'pwd; ls -A ~; cat ~/.ssh/id_ed25519'
+running sh -c … in /home/me/app/.veil/local/sandboxes/agent/files (confined at /home/me/app/src)
+/home/me/app/src
+.cargo  .claude  .rustup
+cat: /home/me/.ssh/id_ed25519: No such file or directory
+No changes in lqosxltm 79607804 agent: add notes
+```
+
+What the command sees:
+
+| | |
+|---|---|
+| **The project** | the workspace's sandbox, read-write, **at the project's real path** (`/home/me/app`), starting in the sub-folder you ran `vl` from. Absolute paths and tools that look in parent directories behave as in the project; every write goes to the sandbox. Your project directory and its `.veil` are not there. |
+| **The computer's tools** | `/usr`, `/bin`, `/lib`, `/etc`, `/opt`: read-only, live. |
+| **`HOME`, `/tmp`, `/var/tmp`** | empty and private, gone after the run. `~/.ssh`, `~/.gnupg`, cloud credentials, other projects and the Veil identity are not there. |
+| **The allow-list** | toolchains and agents' own configuration, **read-only**: `~/.cargo` (without its `credentials.toml`), `~/.rustup`, `~/.local/bin`, `~/.local/share/claude`, `~/.nvm`, `~/.pyenv`, `~/.volta`, `~/.bun`, `~/.deno`, `~/.claude`, `~/.claude.json`, `~/.codex`, `~/.gemini`, those that exist. |
+| **Processes** | only its own: it cannot see or signal your other programs, or another workspace's run. |
+| **Network** | on (agents call their model's API); `--no-network` leaves only a private loopback. |
+
+* **More of the machine, read-only:** `--allow PATH` (repeatable), or for
+  every run, in `.veil/local/config.toml` (this repository) or
+  `$VEIL_HOME/config.toml` (all of them):
+
+  ```toml
+  [exec.confine]
+  allow = ["~/.config/gh", "/srv/datasets"]
+  ```
+
+  Only these two device-local files count: nothing in the repository (a
+  teammate's tracked `config.toml`) can widen what an agent sees. The Veil
+  home stays hidden even inside an allowed folder. An agent that must
+  write its configuration (a token refresh) cannot, here; a read-only
+  folder still lets the command reach sockets and FIFOs in it.
+* **When the command exits, everything it started stops** (a dev server
+  too), and `kill -9` of `vl` stops it all as well; the reaper then takes
+  injected files out as before.
+* **Ctrl-C, SIGTERM and SIGHUP** reach the command as before: the command
+  has no terminal of its own (no keystrokes can be pushed into yours), so
+  `vl` passes them on.
+* **If bubblewrap is missing or does not work** (`vl doctor` says), the run
+  fails before anything is touched: `install bubblewrap (apt install
+  bubblewrap, …)`. `--unconfined` runs the command as before, with
+  everything your user can reach, and says so.
+* **Limits** (none by default):
+
+  ```text
+  vl ws exec agent --memory 4G --pids 1024 --cpu-time 30m --timeout 60m -- my-agent "…"
+  ```
+
+  | flag | stops |
+  |---|---|
+  | `--memory 4G` | memory over 4 GiB |
+  | `--cpus 2` | caps the CPU rate at 2 CPUs |
+  | `--cpu-time 30m` | CPU time over 30 minutes, all processes together |
+  | `--pids 1024` | more than 1024 processes and threads (forks fail) |
+  | `--timeout 60m` | the run after 60 minutes, background processes included |
+
+  A limit that fires stops everything in the sandbox (SIGTERM, then SIGKILL
+  after 10 s; a memory kill at once) and says so (`stopped: memory limit (4
+  GiB) reached`). **`vl` is never inside the limits**: the run is
+  recorded, scanned and cleaned up as always. Defaults go in
+  `[exec.limits]` (`memory`, `cpus`, `cpu-time`, `pids`, `timeout`, `mode`)
+  in the same two files; flags win. With a systemd user manager (any
+  desktop Linux, or a server with lingering), the kernel enforces them
+  (a systemd scope); without one, memory, process count and CPU time are
+  polled every 100 ms (soft) and `--cpus` is not available, and `vl` says
+  so. `--limits strict` refuses to run instead.
+* **What confinement does not cover:** your environment variables are
+  passed on (agents need their API keys); with the network on, the
+  command can send anything it can read (the sandbox, injected secrets,
+  the allow-list) anywhere, and reach abstract Unix sockets (X11's);
+  kernel bugs. Give risky agents test keys and `--no-network`.
+* **macOS** runs unconfined for now (`vl doctor` says so).
+
 ## One-shot runs: `--ephemeral`
 
 `--ephemeral` keeps no sandbox: each run gets a fresh throwaway copy.
@@ -201,7 +286,7 @@ $ vl ws new agent
 $ vl ws exec agent --only src/ tests/ -m "agent: fix parser" -- my-agent "fix the parser bug"
 sparse: sandbox holds src, tests
 synced sandbox: 412 files written, 0 removed
-running my-agent fix the parser bug in /home/me/app/.veil/local/sandboxes/agent/files
+running my-agent fix the parser bug in /home/me/app/.veil/local/sandboxes/agent/files (confined at /home/me/app)
 warning: not recorded: 1 file(s) written outside --only src, tests (removed from the sandbox): NOTES.md
 Recorded lqosxltm 5b0e44a1 agent: fix parser
 $ vl ws exec agent --only src/ tests/ -- cargo test    # the next run rewrites nothing
@@ -278,7 +363,7 @@ a copy under another name can't be recorded:
 
 ```text
 $ vl ws exec agent --with-isolated -- sh -c 'cat .env; cp .env leaked.txt'
-running sh -c cat .env; cp .env leaked.txt in /home/me/app/.veil/local/sandboxes/agent/files
+running sh -c cat .env; cp .env leaked.txt in /home/me/app/.veil/local/sandboxes/agent/files (confined at /home/me/app)
 DB_URL=postgres://app:Xk29vLq8sPz@db/prod
 warning: leaked.txt quarantined: looks like a secret (injected-isolated-secret at line 1: content of .env injected into the sandbox); not snapshotted. Fix it, or `vl cloak|isolate|expose --force leaked.txt`
   cleaned leaked.txt (they held an injected secret; quarantined and taken out of the sandbox)
@@ -306,9 +391,10 @@ them (sealed, in `.veil/local/sandboxes/NAME/guard.sealed`), and every
 later run in it guards against them, with or without `--with-isolated`:
 a copy that turns up after the run (a dev server the command started in
 the background, which writes its environment to a log a minute later) is
-quarantined and taken out by the next run, never recorded. `vl` does not
-kill background processes a command leaves running; `vl ws rm` forgets
-the guard with the sandbox.
+quarantined and taken out by the next run, never recorded. Unconfined,
+`vl` does not kill background processes a command leaves running (a
+confined run stops them with its command); `vl ws rm` forgets the guard
+with the sandbox.
 
 Other quarantined files (the scanner found what looks like a secret in
 something the command wrote) stay in the sandbox, as they would in your
@@ -357,9 +443,11 @@ Use the vault for secrets an agent needs (`vl run`), not files it writes.
   output (`target/`) does not survive a rebuild.
 * Files you edit in the sandbox yourself, between runs, are recorded by
   the next run, as if the command had written them.
-* Tools that look in parent directories (Node's `node_modules` lookup,
-  editor and linter configuration) can see your project directory above
-  the sandbox. Install dependencies inside the sandbox if that matters.
+* Unconfined (`--unconfined`, macOS), tools that look in parent
+  directories (Node's `node_modules` lookup, editor and linter
+  configuration) can see your project directory above the sandbox.
+  Confined, the sandbox is at the project's own path, with nothing above
+  it.
 * `--ephemeral` runs use a throwaway directory in `$TMPDIR` (`/tmp` on
   Linux, a per-user directory under `/var/folders` on macOS), named
   `veil-ws-ephemeral-<pid>-<random>`, private to you and removed when `vl`
@@ -386,9 +474,11 @@ Use the vault for secrets an agent needs (`vl run`), not files it writes.
   bisect run` alike. A command that needs such a link can create it
   itself. A mounted workspace (`vl ws mount`) shows links as they are, as
   your project directory does.
-* A sandbox is an isolation of **files**, not a security boundary: the
-  command runs as you, with your network and your home directory. Run
-  untrusted agents inside your own container or VM.
+* Confined (Linux), the command runs as you but sees only the sandbox,
+  the computer's tools and the allow-list ([above](#confinement-and-limits-linux)).
+  Unconfined, a sandbox is an isolation of **files**, not a security
+  boundary: the command runs as you, with your network and your home
+  directory. Either way, run hostile code inside your own VM.
 
 ## `vl ws mount`: a workspace as a directory
 

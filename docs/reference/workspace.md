@@ -98,6 +98,8 @@ With --only, the sandbox holds just the given files and directories (and .veilpo
 
 The command's output is never deleted when something fails: if vl is killed or the result cannot be recorded (the repository is busy), it stays in the sandbox, and the next run (or --record-only) records it first. SIGTERM and SIGHUP are forwarded to the command, as Ctrl-C is, and vl records what it left.
 
+On Linux the command runs confined (bubblewrap): the sandbox appears at the project's real path, starting in the sub-folder you ran vl from; the computer's tools are read-only; HOME and /tmp are empty and private (~/.ssh, ~/.gnupg, the Veil identity and other projects are not there); only the sandbox's own processes are visible. A read-only allow-list shows toolchains and agent configuration (~/.cargo, ~/.rustup, ~/.claude, ...; more with --allow or [exec.confine] allow in .veil/local/config.toml or $VEIL_HOME/config.toml). When the command exits, everything it started stops. --memory, --cpus, --cpu-time, --pids and --timeout limit it ([exec.limits] gives defaults); vl itself stays outside the limits, so the run is always recorded.
+
 ```text
 vl workspace exec [OPTIONS] [NAME] [-- <COMMAND>...]
 ```
@@ -119,6 +121,15 @@ Options:
 | `--with-isolated` | Copy local-only (isolated) files such as .env into the sandbox for this run (they are taken out again afterwards) |
 | `--only <PATH>` | Sparse sandbox: hold only these paths (files or directories of the workspace, relative to the current directory) |
 | `--record-only` | Run nothing: record what an earlier run left unrecorded (vl was killed, or recording failed) |
+| `--unconfined` | Run without confinement: the command can read and change everything your user can |
+| `--allow <PATH>` | Also show PATH (a folder or file of this machine) to the command, read-only. Repeatable |
+| `--no-network` | No network: the command gets only a private loopback |
+| `--memory <SIZE>` | Memory limit, e.g. 4G or 512M |
+| `--cpus <N>` | CPU rate limit, in CPUs, e.g. 2 or 0.5 |
+| `--cpu-time <DURATION>` | Total CPU-time limit, e.g. 30m or 90s |
+| `--pids <N>` | Limit on the number of processes and threads |
+| `--timeout <DURATION>` | Wall-clock limit, e.g. 45m: at the deadline everything in the sandbox is stopped |
+| `--limits <MODE>` | best-effort (the default): run, saying which limits are soft here; strict: refuse unless the kernel enforces every limit (one of `best-effort`, `strict`) |
 
 ## `vl workspace cat`
 
