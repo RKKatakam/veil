@@ -1,5 +1,7 @@
 # Maintenance
 
+> Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)). Where this page mentions cloaking, scopes, isolated files or path and SSH remotes, the server replaces them with folder access, encrypted secrets and pushes to the server.
+
 1. [`vl gc`](#vl-gc)
 2. [`vl fsck`](#vl-fsck)
 3. [`vl doctor`](#vl-doctor)

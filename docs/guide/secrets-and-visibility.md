@@ -1,5 +1,9 @@
 # Secrets and visibility
 
+> **With the server** ([VISIBILITY.md](../VISIBILITY.md)): the creator is the admin, everything is private by default, admins give groups or people access to folders (`vl access billing/ finance`), and `public` folders are visible to everyone. Secrets (`.env`, keys) are encrypted automatically and follow the same access; personal private keys never leave the machine. The built-in secret rules, the scanner and quarantine below carry over unchanged.
+>
+Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)). Tiers, cloaking, scopes and team remotes below are how today's client works.
+
 Every path in a Veil repository has a **visibility tier**, decided by
 `.veilpolicy` and by rules built into the engine. The engine enforces it
 when it records a snapshot, so no command, merge or push can get around it.
@@ -443,6 +447,8 @@ Replacing your identity makes the vault unreadable until you re-key it
 
 ### The team vault
 
+> Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)).
+
 Secrets the whole team needs (a staging database URL, a shared API key) go
 into a scope's **team vault**: sealed for the members of the scope and
 synced through team remotes, so a new teammate who is granted the scope gets
@@ -569,6 +575,8 @@ rings). `vl undo` refuses them and tells you how to reverse the write by hand
 teammates have the value.
 
 ## Cloaking for a team
+
+> Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)). With the server, cloaking is replaced by folder access with groups (`vl access`), and code is plain text on the server.
 
 A **scope** is a named group of identities that share a key. `vl init`
 creates `team`, with you as its admin. A cloaked file is encrypted for its
@@ -761,7 +769,7 @@ are in [`docs/BACKLOG.md`](../BACKLOG.md). In short:
 * Hostile remotes: path traversal, writes into `.veil/`, deep nesting and
   terminal escape sequences in names are refused.
 
-**Not protected (known limits in 1.0):**
+**Not protected (known limits of today's client):**
 
 | Limit | What it means for you |
 |---|---|
@@ -772,7 +780,7 @@ are in [`docs/BACKLOG.md`](../BACKLOG.md). In short:
 | **Plaintext history stays** | Cloaking a path doesn't encrypt earlier snapshots |
 | **Trust on first use** | A fresh clone accepts the first valid key ring it sees. A malicious remote could serve an outdated ring. Members who already hold the newer ring reject it |
 | **Signatures are advisory** | Unsigned or unknown-key snapshots are shown (`unsigned`, `?signer`) but not rejected. `author` is a free-form claim; only the signer is authenticated |
-| **Embargoes** | See [Embargoes: limitations](embargoes.md#limitations-in-10): metadata stays visible, release time isn't cryptographically enforced, one embargo per line |
+| **Embargoes** | See [Embargoes: limitations](embargoes.md#limitations-today): metadata stays visible, release time isn't cryptographically enforced, one embargo per line |
 | **Team vault metadata** | A team remote's operator can't read names or values, but sees how many entries a scope has (roughly), their sizes in 128-byte steps, when they were written and by whom. They can also withhold records: a fresh clone then sees an older value, or a deleted secret (members who already pulled the newer record keep it) |
 | **Concurrent admin edits** | Two admins changing a scope at the same time: the local ring is kept, `vl` warns, and an admin re-applies the missing change |
 

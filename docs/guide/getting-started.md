@@ -1,5 +1,7 @@
 # Getting started
 
+> Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)). Where this page mentions cloaking, scopes, isolated files or path and SSH remotes, the server replaces them with folder access, encrypted secrets and pushes to the server.
+
 1. [Install](#install)
 2. [Your identity](#your-identity)
 3. [Create a repository](#create-a-repository)

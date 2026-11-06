@@ -78,6 +78,8 @@ with `vl policy check PATH`.
 
 ## Cloaking and keys
 
+> Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)).
+
 ### `error: you hold no current key for scope 'S' (create it with `vl scope create S`)`
 
 You ran `vl cloak … --scope S` (default `team`) for a scope you are not a
@@ -209,7 +211,7 @@ recorded after the release. Work on the merge's first parent instead
 
 ### `error: policy violation: cannot merge under a new embargo: … already carries unreleased embargo E, and embargoes cannot overlap; …`
 
-Veil 1.0 allows one unreleased embargo per line. Release `E` first, or
+Veil allows one unreleased embargo per line. Release `E` first, or
 embargo the second fix on a separate line. See
 [One embargo per line](embargoes.md#one-embargo-per-line).
 
@@ -219,6 +221,8 @@ embargo the second fix on a separate line. See
 `2026-12-01T09:00:00Z`. To publish now, `vl embargo release ID`.
 
 ## Remotes
+
+> Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)).
 
 ### `rejected main (remote has diverged: not a fast-forward)` / `error: 1 tag was rejected (main): origin has changes you don't have. …`
 
@@ -519,7 +523,7 @@ machine.
 their names, sizes and who the scope members are. See
 [what isn't protected](secrets-and-visibility.md#what-is-protected-and-what-isnt).
 
-**Does Veil work on Windows?** Not in 1.0: Linux and macOS only.
+**Does Veil work on Windows?** Not yet: Linux and macOS only.
 
 **Where do I report a bug?** Include `vl --version` and the output of
 `vl doctor`.
