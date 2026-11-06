@@ -155,8 +155,13 @@ struct TxStaging {
     dir: VPath,
     /// The owner tag (`lock::Owner`), also naming a pull's spool.
     owner: String,
-    /// Objects written there.
+    /// Objects this transaction staged: written there, buffered, or packed.
     staged: HashSet<ObjectId>,
+    /// Small new objects not written anywhere yet (see [`TX_BUFFER`]).
+    buffered: std::collections::HashMap<ObjectId, Vec<u8>>,
+    buffered_bytes: usize,
+    /// Staged objects already in a published pack (the buffer spilled).
+    packed: HashSet<ObjectId>,
     /// Those that may name other objects (neither blobs nor sealed): the
     /// commit checks what they name is present (BUG-811).
     naming: HashSet<ObjectId>,
@@ -168,6 +173,19 @@ struct TxStaging {
     /// covered these writes, which are then void.
     failures_at: u64,
 }
+
+/// A transaction keeps its new file contents (blobs, sealed or not) of at
+/// most [`TX_BUFFER_OBJECT`] bytes in memory, up to this many bytes in all; past that they are
+/// written as a pack (not in memory, see
+/// `ObjectStore::packs_new_objects`); its trees and snapshots are staged
+/// loose as before. At publication, [`TX_PACK_MIN`] contents or more
+/// become one pack (compressed on several threads), fewer are written as
+/// loose objects: an import of 10,000 files makes one pack and its index
+/// durable instead of 10,000 files and their renames (a fsync and a
+/// rename each).
+const TX_BUFFER: usize = 32 << 20;
+const TX_BUFFER_OBJECT: usize = 1 << 20;
+const TX_PACK_MIN: usize = 256;
 
 /// The prefix of transaction staging directories under `<root>/incoming/`.
 pub const TX_STAGING_PREFIX: &str = "tx-";
@@ -457,6 +475,9 @@ impl ObjectStore {
             dir: self.root.join("incoming").join(&format!("{TX_STAGING_PREFIX}{owner}")),
             owner: owner.to_string(),
             staged: HashSet::new(),
+            buffered: Default::default(),
+            buffered_bytes: 0,
+            packed: HashSet::new(),
             naming: HashSet::new(),
             present: Default::default(),
             failures_at: self.backend.barrier_failures(),
@@ -484,24 +505,49 @@ impl ObjectStore {
         v
     }
 
+    /// The bytes of `id` if the current transaction holds it in memory.
+    fn tx_buffered(&self, id: &ObjectId) -> Option<Vec<u8>> {
+        self.tx_list().as_ref()?.buffered.get(id).cloned()
+    }
+
     fn staged_path(&self, id: &ObjectId) -> Option<VPath> {
         let t = self.tx_list();
         let t = t.as_ref()?;
-        t.staged.contains(id).then(|| {
+        (t.staged.contains(id) && !t.buffered.contains_key(id) && !t.packed.contains(id)).then(|| {
             let h = id.hex();
             t.dir.join(&h[..2]).join(&h[2..])
         })
     }
 
-    /// Publish the transaction's staged objects: one barrier makes them
-    /// durable where they are (if it fails, the staging directory is
+    /// Publish the transaction's staged objects. Those still in memory
+    /// become one pack, made durable before its index (enough of them,
+    /// see [`TX_PACK_MIN`]), or loose objects staged like the rest. One
+    /// barrier makes the staged ones durable where they are (if it fails, the staging directory is
     /// removed and nothing is published); each is renamed over its final
     /// name (content-addressed, so replacing a concurrent identical copy is
     /// harmless); a second barrier makes the renames durable, and the
     /// directories of objects this transaction found already published
     /// (another process's rename may not be durable yet). Ends the staging.
     pub(crate) fn publish_tx_staging(&self) -> Result<()> {
-        let Some(t) = self.tx_list().take() else { return Ok(()) };
+        let Some(mut t) = self.tx_list().take() else { return Ok(()) };
+        // What is still buffered: one pack (durable, then its index,
+        // durably: readers find packs by their index), or, if few, loose
+        // objects staged as any other.
+        let buffered: Vec<(ObjectId, Vec<u8>)> = std::mem::take(&mut t.buffered).into_iter().collect();
+        let written = match buffered.len() >= TX_PACK_MIN {
+            true => {
+                t.packed.extend(buffered.iter().map(|(id, _)| *id));
+                self.write_pack(buffered)
+            }
+            false => buffered.into_iter().try_for_each(|(id, raw)| {
+                let h = id.hex();
+                self.backend.write_unsynced(&t.dir.join(&h[..2]).join(&h[2..]), &raw)
+            }),
+        };
+        if let Err(e) = written {
+            self.drop_staging_dir(&t.dir);
+            return Err(e);
+        }
         if let Err(e) = self.backend.sync_barrier() {
             self.drop_staging_dir(&t.dir);
             return Err(e);
@@ -515,7 +561,7 @@ impl ObjectStore {
             });
         }
         let res = (|| -> Result<()> {
-            let mut staged: Vec<&ObjectId> = t.staged.iter().collect();
+            let mut staged: Vec<&ObjectId> = t.staged.iter().filter(|id| !t.packed.contains(id)).collect();
             staged.sort();
             for id in staged {
                 let h = id.hex();
@@ -528,6 +574,46 @@ impl ObjectStore {
         })();
         self.drop_staging_dir(&t.dir);
         res
+    }
+
+    /// New objects of a transaction may become a pack ([`TX_BUFFER`]),
+    /// except in memory, where a loose object costs nothing (on a disk, a
+    /// fsync and a rename) and compressing a pack would.
+    fn packs_new_objects(&self) -> bool {
+        self.backend.kind() != "memory"
+    }
+
+    /// Write `objects` (canonical encodings) as one pack in the pack
+    /// directory: compressed on several threads, then the pack made
+    /// durable and only then its index (as a pull writes its packs).
+    fn write_pack(&self, mut objects: Vec<(ObjectId, Vec<u8>)>) -> Result<()> {
+        // A few MiB at a time: compressed, added to the streamed pack and
+        // freed, so a pack costs little more memory than what it holds.
+        const CHUNK: usize = 4 << 20;
+        objects.sort_by_key(|o| o.0);
+        let threads = match cfg!(feature = "os") {
+            true => std::thread::available_parallelism().map_or(1, |n| n.get()).min(8),
+            false => 1,
+        };
+        let dir = self.pack_dir();
+        let mut w = crate::pack::PackWriter::new(self.backend.create_stream(&dir, true)?, crate::pack::DEFAULT_LEVEL)?;
+        let mut objects = std::collections::VecDeque::from(objects);
+        while !objects.is_empty() {
+            let mut bytes = 0;
+            let n = objects.iter().take_while(|(_, raw)| {
+                bytes += raw.len();
+                bytes <= CHUNK
+            });
+            let n = n.count().max(1);
+            let chunk: Vec<(ObjectId, Vec<u8>)> = objects.drain(..n).collect();
+            let entries = crate::pack::encode_entries(&chunk, crate::pack::DEFAULT_LEVEL, threads)?;
+            for ((id, _), e) in chunk.iter().zip(&entries) {
+                w.add_entry(*id, e)?;
+            }
+        }
+        w.finish(&*self.backend, &dir)?;
+        self.reload_packs()?;
+        Ok(())
     }
 
     fn drop_staging_dir(&self, dir: &VPath) {
@@ -635,6 +721,34 @@ impl ObjectStore {
         }
         let staging = self.tx_list().as_ref().map(|t| t.dir.clone());
         if let Some(dir) = staging {
+            // File contents only (blobs, sealed or not): trees and
+            // snapshots stay loose until gc, as before, so status, log and
+            // other history reads find them uncompressed (and the scale
+            // benchmark still counts snapshot reads by their opens).
+            let content = Object::is_blob_raw(raw) || Object::sealed_scope(raw).is_some();
+            if content && raw.len() <= TX_BUFFER_OBJECT && self.packs_new_objects() {
+                let spill = {
+                    let mut t = self.tx_list();
+                    let Some(t) = t.as_mut() else { return Err(VeilError::repo("the transaction ended while it wrote")) };
+                    if t.staged.insert(*id) {
+                        t.buffered.insert(*id, raw.to_vec());
+                        t.buffered_bytes += raw.len();
+                    }
+                    match t.buffered_bytes > TX_BUFFER {
+                        true => {
+                            t.buffered_bytes = 0;
+                            let b: Vec<(ObjectId, Vec<u8>)> = std::mem::take(&mut t.buffered).into_iter().collect();
+                            t.packed.extend(b.iter().map(|(id, _)| *id));
+                            b
+                        }
+                        false => Vec::new(),
+                    }
+                };
+                if !spill.is_empty() {
+                    self.write_pack(spill)?;
+                }
+                return Ok(());
+            }
             let h = id.hex();
             self.backend.write_unsynced(&dir.join(&h[..2]).join(&h[2..]), raw)?;
             if let Some(t) = self.tx_list().as_mut() {
@@ -801,7 +915,7 @@ impl ObjectStore {
     // ---- raw access ------------------------------------------------------
 
     fn loose_exists(&self, id: &ObjectId) -> bool {
-        if self.staged_path(id).is_some() {
+        if self.staged_path(id).is_some() || self.tx_list().as_ref().is_some_and(|t| t.buffered.contains_key(id)) {
             return true;
         }
         self.backend.exists(&self.loose_path(id)).unwrap_or(false)
@@ -849,7 +963,7 @@ impl ObjectStore {
     /// process for those; blobs are hashed on every read (BLAKE3, typically
     /// well above 1 GiB/s, so small next to the I/O and decryption).
     pub(crate) fn read_raw(&self, id: &ObjectId) -> Result<Vec<u8>> {
-        if let Some(b) = self.staged(id) {
+        if let Some(b) = self.staged(id).or_else(|| self.tx_buffered(id)) {
             return Ok(b);
         }
         let loose_corrupt = match self.read_loose_verified(id)? {

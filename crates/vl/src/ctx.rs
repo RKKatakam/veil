@@ -272,6 +272,9 @@ impl Ctx {
         };
         let root = find_root(&start).ok_or_else(|| anyhow!("no Veil repository found in {} or its parents (run `vl init`)", start.display()))?;
         if snapshot {
+            // The snapshot may scan changed files: the scanner's rules
+            // compile on another thread meanwhile.
+            veil_core::secrets::prepare();
             // What was written in mounted workspaces is recorded first, as
             // the project directory is below.
             crate::mount::record_live(&root);

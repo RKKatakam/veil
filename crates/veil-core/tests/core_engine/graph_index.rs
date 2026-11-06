@@ -50,6 +50,73 @@ fn commits_append_layers_that_stay_few() {
     assert_eq!(visible, reopened.visible_snapshots().unwrap());
 }
 
+/// Counts the layer files created (`create_new` under the index).
+#[derive(Debug, Default)]
+struct Counting {
+    inner: MemoryBackend,
+    created: std::sync::atomic::AtomicUsize,
+}
+
+impl StorageBackend for Counting {
+    fn kind(&self) -> &'static str {
+        "memory"
+    }
+    fn read(&self, path: &VPath) -> veil_core::Result<Vec<u8>> {
+        self.inner.read(path)
+    }
+    fn write(&self, path: &VPath, data: &[u8]) -> veil_core::Result<()> {
+        self.inner.write(path, data)
+    }
+    fn create_new(&self, path: &VPath, data: &[u8]) -> veil_core::Result<bool> {
+        if path.as_str().starts_with(".veil/index/graph/L-") {
+            self.created.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.inner.create_new(path, data)
+    }
+    fn remove_file(&self, path: &VPath) -> veil_core::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &VPath) -> veil_core::Result<()> {
+        self.inner.remove_dir_all(path)
+    }
+    fn create_dir_all(&self, path: &VPath) -> veil_core::Result<()> {
+        self.inner.create_dir_all(path)
+    }
+    fn list_dir(&self, path: &VPath) -> veil_core::Result<Vec<veil_core::vfs::DirEntry>> {
+        self.inner.list_dir(path)
+    }
+    fn metadata(&self, path: &VPath) -> veil_core::Result<Option<veil_core::vfs::Metadata>> {
+        self.inner.metadata(path)
+    }
+    fn set_executable(&self, path: &VPath, executable: bool) -> veil_core::Result<()> {
+        self.inner.set_executable(path, executable)
+    }
+}
+
+/// A merge that the geometric rule takes several steps for is written as
+/// one layer: an append creates at most its own layer and one merged one
+/// (each layer file costs two fsyncs on a disk), never one per step, and
+/// the chain is what the steps would have left.
+#[test]
+fn a_compaction_writes_one_merged_layer() {
+    let backend = Arc::new(Counting::default());
+    let mut repo = Repo::init(backend.clone(), None, "t").unwrap();
+    let mut most = 0;
+    for i in 0..64 {
+        let before = backend.created.load(std::sync::atomic::Ordering::SeqCst);
+        repo.describe(repo.workspace_wc(WS).unwrap(), &format!("change {i}")).unwrap();
+        let created = backend.created.load(std::sync::atomic::Ordering::SeqCst) - before;
+        most = most.max(created);
+        assert!(created <= 2, "append {i} created {created} layers: {:?}", layers(&*backend));
+    }
+    assert_eq!(most, 2, "some append merged");
+    let names = layers(&*backend);
+    assert!(!names.is_empty() && names.len() <= 8, "layers: {names:?}");
+    let reopened = Repo::open(backend.clone(), None, "t").unwrap();
+    let wc = reopened.workspace_wc(WS).unwrap();
+    assert!(reopened.graph().generation(&reopened, &wc).unwrap().is_some());
+}
+
 /// Another process took the next slot first: the appender reads its layer
 /// and takes the slot after it; nothing is overwritten.
 #[test]

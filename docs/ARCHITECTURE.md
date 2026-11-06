@@ -803,7 +803,10 @@ CAS, and it applies these rules in order:
    * Pre-filter (scanner v6): an Aho-Corasick pass over the lowercased chunk
      finds the eight keyword words (`password`, `passwd`, `secret`,
      `token`, `key`, `salt`, `pwd`, `identified`). A chunk without one is
-     not searched by the assignment rule, and the search is limited to
+     not searched by the assignment rule (whose regexes are compiled only
+     for the first chunk with one: they take more time to compile than
+     the rest of a one-file commit; the token rules compile on another
+     thread while the command starts, `secrets::prepare`), and the search is limited to
      from the first to 16 KiB past the line of the last. On each line with
      a keyword, the `:`/`=` that ends a configuration key is replaced by a
      stand-in (`C`/`E`, upper-case letters never occur in the lowercased
@@ -2079,7 +2082,11 @@ attached.
   released/readable state changes.
 * **Racy mtime.** Each record stores `verified_at`, the clock reading taken
   before the build stat'ed and read the file. A record is trusted only if
-  `max(mtime, ctime) + window ≤ verified_at`. The window is 2 s for
+  `max(mtime, ctime) + window ≤ verified_at`. A record learnt inside that
+  window (a file edited just before the command: every `vl commit` right
+  after an edit) can therefore never vouch for anything, and does not by
+  itself make the cache rewrite itself (at 10,000 files a 1 MB fsynced
+  write). The window is 2 s for
   whole-second stamps (ext3, HFS+, FAT, many network filesystems) and 100 ms
   for sub-second stamps (the kernel's coarse clock, exFAT's 10 ms). On a
   generation clock it is 0. A file written in the same tick it was verified
@@ -2736,9 +2743,22 @@ take no lock:
   with no common history (BUG-804). A head naming a missing operation
   fails `Repo::open`, with `fsck` naming the file; non-head entries are
   ignored.
-* **Staging.** New loose objects go to the transaction's own directory,
-  `objects/incoming/tx-<owner>/` (`ObjectStore::begin_tx_staging`), which
-  only it reads. At commit: one barrier (a failure removes the directory,
+* **Staging.** A transaction keeps its new file contents (blobs, sealed
+  or not) of up to 1 MiB in memory (32 MiB in all; past that they are
+  written out as a pack). Its trees and snapshots stay loose until gc, as
+  before: status, log and the other history reads find them uncompressed,
+  and never read a pack for them. At
+  commit, 256 or more contents become **one pack** in `objects/pack/`
+  (compressed a few MiB at a time on up to 8 threads; the `.pack` made durable, then its
+  `.idx`, durably, as a pull writes its packs): an import of 10,000 files
+  makes two files durable instead of 10,000 objects with a fsync and a
+  rename each. A registered transaction's pack is as safe from gc as its
+  renamed loose objects (the deletion fence, `maintenance.rs`). Fewer
+  objects, larger ones, and every object in memory (`MemoryBackend`,
+  where a loose object costs nothing) are loose objects in the
+  transaction's own directory, `objects/incoming/tx-<owner>/`
+  (`ObjectStore::begin_tx_staging`), which only it reads. At commit: one
+  barrier (a failure removes the directory,
   and nobody can have adopted those objects), each object renamed over its
   final name (`rename_unsynced`; content-addressed, so replacing a
   concurrent identical copy is harmless), then a second barrier over every
@@ -2821,8 +2841,10 @@ repository.
 * Inside a transaction, objects are written with
   `StorageBackend::write_unsynced` instead: temp file, rename, no fsync. The
   backend remembers each file. `StorageBackend::sync_barrier` then fsyncs
-  all of them, several at a time so that ext4 or XFS share journal commits,
-  and every touched directory once. `Transaction::commit` runs the barrier
+  all of them at once, a thread each (up to 32), so that ext4 or XFS
+  share journal commits (two new files: 0.42 ms instead of 0.70; four:
+  0.73 instead of 1.36 on ext4 NVMe), and then every touched directory
+  once (one thread per 16: after the files' fsyncs they are mostly clean). `Transaction::commit` runs the barrier
   before writing the operation, and `Transaction`'s `Drop` runs it again,
   before the lock is released, so an aborted transaction leaves nothing
   unsynced either. Barriers on one backend are serialised, so a barrier
@@ -3028,7 +3050,8 @@ only make a walk longer. The index is a device-local cache in
   first use and persisted at the next commit (or once 256 have
   accumulated). A damaged or unreadable index is dropped and computed again.
 - **Concurrency:** layers are created with `create_new`, one slot each, and
-  merged geometrically; concurrent appenders never overwrite one another.
+  merged geometrically (what the rule merges in several steps is written
+  as one layer); concurrent appenders never overwrite one another.
   Remotes (bare repositories, SFTP) compute it in memory only.
 - **A parent that arrives later** (the fix of a released embargo, pulled
   into a public clone) could carry a larger generation than its indexed

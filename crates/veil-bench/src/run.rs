@@ -174,8 +174,8 @@ impl Bench {
                 traced = trace_json(&s, self.total_snapshots());
                 traced["traced_secs"] = json!(o.secs);
                 // Packed objects are read without an open each: the counts
-                // only mean something for a loose store.
-                traced["store_packed"] = json!(has_packs(&c.cwd));
+                // only mean something while the snapshots are loose.
+                traced["store_packed"] = json!(snapshots_packed(&c.cwd, &self.snapshots));
             }
         }
         let runs_secs = secs.clone();
@@ -271,10 +271,13 @@ pub fn enough_disk(phase: &str, free: u64, need: u64, floor: u64) -> Result<()> 
     Ok(())
 }
 
-fn has_packs(repo: &Path) -> bool {
-    std::fs::read_dir(repo.join(".veil/objects/pack"))
-        .map(|rd| rd.flatten().any(|e| e.file_name().to_string_lossy().ends_with(".pack")))
-        .unwrap_or(false)
+/// Snapshot reads are counted by the opens of loose snapshot objects:
+/// the counts mean something only while every snapshot is loose
+/// (transactions write snapshots loose, also when the rest of their new
+/// objects is a pack; `gc` packs them).
+fn snapshots_packed(repo: &Path, snapshots: &HashSet<String>) -> bool {
+    let objects = repo.join(".veil/objects");
+    snapshots.iter().any(|h| h.len() > 2 && !objects.join(&h[..2]).join(&h[2..]).exists())
 }
 
 fn traced_if(c: Case<'_>, trace: bool) -> Case<'_> {

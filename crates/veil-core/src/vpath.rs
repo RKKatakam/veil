@@ -20,6 +20,11 @@ impl VPath {
     }
 
     pub fn new(s: &str) -> Result<Self> {
+        // Already normal (the common case: every path of a scan, of a
+        // stat cache): one copy, no split and join.
+        if !s.is_empty() && s.split('/').all(|c| !matches!(c, "" | "." | "..") && !c.contains('\0')) {
+            return Ok(VPath(s.to_string()));
+        }
         let mut parts = Vec::new();
         for c in s.split('/') {
             match c {
@@ -246,6 +251,21 @@ impl fmt::Debug for VPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fast path for a path that is already normal gives what the
+    /// general one does, and leaves everything else to it.
+    #[test]
+    fn already_normal_paths_are_taken_as_they_are() {
+        for s in ["a", "a/b", "d001/f001.txt", ".env", "..a/b..", "a.b/.c", "x/y/z/w"] {
+            assert_eq!(VPath::new(s).unwrap().as_str(), s);
+        }
+        for (s, want) in [("a/", "a"), ("/a", "a"), ("a//b", "a/b"), ("./a", "a"), ("a/.", "a"), (".", "")] {
+            assert_eq!(VPath::new(s).unwrap().as_str(), want, "{s:?}");
+        }
+        for s in ["..", "a/..", "../a", "a/../b", "a\0b", "\0"] {
+            assert!(VPath::new(s).is_err(), "{s:?}");
+        }
+    }
 
     #[test]
     fn normalises() {

@@ -244,6 +244,46 @@ fn racy_files_on_disk_are_reread_until_they_age() {
     assert_eq!(repo.store().read_entry(&e).unwrap(), b"AGED\n");
 }
 
+/// A file edited just before a snapshot (every `vl commit` right after an
+/// edit) is recorded, but its record falls in the racy window and can
+/// never vouch for it: it is no reason to rewrite the cache (a 1 MB fsynced
+/// write at 10,000 files). Once the file stats older, the record learnt
+/// for it can vouch, and the cache is written again.
+#[test]
+fn a_record_that_can_never_vouch_does_not_rewrite_the_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut repo, fs) = repo_with(veil_core::DiskBackend::new(dir.path()));
+    let age = |name: &str| {
+        let f = std::fs::File::options().write(true).open(dir.path().join(name)).unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600)).unwrap();
+    };
+    let mut cache = StatCache::new();
+    for name in ["a.txt", "b.txt"] {
+        fs.write(&p(name), name.as_bytes()).unwrap();
+        age(name);
+    }
+    // The ctimes are recent too: let them age past the window.
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    snap(&mut repo, &*fs, &mut cache);
+    assert!(cache.is_dirty(), "new records are written");
+    cache.save(&*fs, &veil_core::statcache::cache_path(WS)).unwrap();
+
+    fs.write(&p("a.txt"), b"edited").unwrap();
+    let r = snap(&mut repo, &*fs, &mut cache);
+    assert_eq!((r.hashed, r.cache_hits), (1, 1));
+    let e = entry(&repo, &wc_tree(&repo), "a.txt").unwrap();
+    assert_eq!(repo.store().read_entry(&e).unwrap(), b"edited", "the edit is recorded");
+    assert!(!cache.is_dirty(), "a racy record alone does not rewrite the cache");
+
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    let r = snap(&mut repo, &*fs, &mut cache);
+    assert_eq!((r.hashed, r.cache_hits), (1, 1), "the racy record never vouched: read again");
+    assert!(cache.is_dirty(), "the record learnt now can vouch: written");
+    cache.save(&*fs, &veil_core::statcache::cache_path(WS)).unwrap();
+    let r = snap(&mut repo, &*fs, &mut cache);
+    assert_eq!((r.hashed, r.cache_hits), (0, 2));
+}
+
 #[test]
 fn policy_change_invalidates_the_cache_and_reclassifies() {
     let (mut repo, fs) = repo_with(MemoryBackend::new());

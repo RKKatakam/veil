@@ -107,12 +107,16 @@ fn background_maintenance_starts_only_where_allowed_and_once() {
         assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
     };
     run(&["init"], true, None);
-    // More loose objects than the threshold.
-    for i in 0..9000 {
-        std::fs::write(proj.join(format!("f{i}.txt")), format!("file {i}\n")).unwrap();
+    // More loose objects than the threshold, in commits small enough to
+    // write loose objects (a transaction with many new objects writes a
+    // pack instead).
+    for batch in 0..40 {
+        for i in 0..225 {
+            std::fs::write(proj.join(format!("f{batch}-{i}.txt")), format!("file {batch} {i}\n")).unwrap();
+        }
+        run(&["commit", "-m", "many"], true, None);
     }
     let log = proj.join(".veil/local/maintenance.log");
-    run(&["commit", "-m", "many"], true, None);
     assert!(!log.exists(), "maintenance started with CI set");
     run(&["status"], false, Some("0"));
     assert!(!log.exists(), "maintenance started with VEIL_GC_AUTO=0");
