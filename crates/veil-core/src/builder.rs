@@ -781,6 +781,8 @@ pub fn build_tree_cached(
     opts: &BuildOptions,
     cache: Option<&mut StatCache>,
 ) -> Result<(ObjectId, BuildReport)> {
+    #[cfg(feature = "os")]
+    secrets::prepare();
     let parent = opts.parent_tree.map(|t| store.tree(&t)).transpose()?;
     // Hints (reuse of unchanged subtrees by id) are only valid if the policy
     // is unchanged, otherwise reclassification could be skipped.

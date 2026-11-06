@@ -507,25 +507,28 @@ impl GraphIndex {
 
     /// Merge the newest layers while the one below is less than twice as
     /// large as the one above (or the chain is too long), so the chain stays
-    /// logarithmic. The merged layer is created first, then the parts are
-    /// removed; readers prefer the merged one either way.
+    /// logarithmic. The rule is followed on the counts first, so that what
+    /// it merges is written as one layer, not once per step. The merged
+    /// layer is created first, then the parts are removed; readers prefer
+    /// the merged one either way.
     fn compact(&self, st: &mut State) {
-        loop {
-            let n = st.layers.len();
-            if n < 2 {
-                // Leftovers of voided epochs.
-                let (files, _) = self.list();
-                self.remove_older(&files, st.epoch);
-                return;
+        let n = st.layers.len();
+        // How many of the newest layers end up merged into one.
+        let (mut k, mut top) = (1, st.layers.last().map_or(0, |l| l.count));
+        while k < n {
+            let below = st.layers[n - 1 - k].count;
+            if below >= 2 * top && n - k < MAX_LAYERS {
+                break;
             }
-            let (below, top) = (&st.layers[n - 2], &st.layers[n - 1]);
-            if below.count >= 2 * top.count && n <= MAX_LAYERS {
-                return;
-            }
-            let (lo, hi) = (below.lo, top.hi);
-            let mut entries: Vec<(ObjectId, Entry)> = Vec::with_capacity(below.count + top.count);
+            top += below;
+            k += 1;
+        }
+        if k > 1 {
+            let parts = &st.layers[n - k..];
+            let (lo, hi) = (parts[0].lo, parts[k - 1].hi);
+            let mut entries: Vec<(ObjectId, Entry)> = Vec::with_capacity(top);
             let mut missing: Vec<ObjectId> = Vec::new();
-            for l in [below, top] {
+            for l in parts {
                 entries.extend((0..l.count).map(|i| (l.id(i), l.entry(i))));
                 missing.extend((0..l.missing).map(|i| l.missing_parent(i)));
             }
@@ -533,19 +536,23 @@ impl GraphIndex {
             missing.dedup();
             let data = Layer::encode(&mut entries, &missing);
             let name = layer_name(st.epoch, lo, hi);
-            let path = dir().join(&name);
-            if self.backend.create_new(&path, &data).is_err() {
+            if self.backend.create_new(&dir().join(&name), &data).is_err() {
                 return;
             }
             let Some(merged) = Layer::parse(name.clone(), lo, hi, data) else { return };
-            let parts = [st.layers[n - 2].name.clone(), st.layers[n - 1].name.clone()];
-            st.layers.truncate(n - 2);
+            let parts: Vec<String> = parts.iter().map(|l| l.name.clone()).collect();
+            st.layers.truncate(n - k);
             st.layers.push(merged);
             for part in parts {
                 if part != name {
                     let _ = self.backend.remove_file(&dir().join(&part));
                 }
             }
+        }
+        if st.layers.len() < 2 {
+            // Leftovers of voided epochs.
+            let (files, _) = self.list();
+            self.remove_older(&files, st.epoch);
         }
     }
 

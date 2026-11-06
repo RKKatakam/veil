@@ -60,7 +60,7 @@
 //! accepted policy moves forward (the member's own edit of `.veilpolicy`, or
 //! an explicit `vl policy accept`).
 
-use globset::{GlobBuilder, GlobMatcher, GlobSet, GlobSetBuilder};
+use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 
 use crate::{
     error::{Result, VeilError},
@@ -364,8 +364,11 @@ pub struct Rule {
     /// `.*.swp`): as `public!`, it records them (see [`editor_artefact`]).
     names_scratch: bool,
     dir_only: bool,
-    exact: GlobMatcher,
-    under: GlobMatcher,
+    /// The globs, not compiled one by one: classification matches the
+    /// policy's [`GlobSet`] (compiling every rule's matchers too cost a
+    /// millisecond per command); [`Rule::matches`] compiles them on use.
+    exact: Glob,
+    under: Glob,
 }
 
 /// The built-in rules, and their glob set, compiled once.
@@ -392,8 +395,8 @@ fn builtin_rules() -> &'static (Vec<Rule>, GlobSet) {
 fn compile_set(rules: &[Rule]) -> GlobSet {
     let mut b = GlobSetBuilder::new();
     for r in rules {
-        b.add(r.exact.glob().clone());
-        b.add(r.under.glob().clone());
+        b.add(r.exact.clone());
+        b.add(r.under.clone());
     }
     b.build().expect("globs were already validated individually")
 }
@@ -532,7 +535,6 @@ impl Rule {
                 .backslash_escape(true)
                 .case_insensitive(case_insensitive)
                 .build()
-                .map(|g| g.compile_matcher())
                 .map_err(|e| format!("bad pattern '{pattern}': {e}"))
         };
         Ok(Rule {
@@ -557,7 +559,7 @@ impl Rule {
 
     pub fn matches(&self, path: &VPath, is_dir: bool) -> bool {
         let s = &*crate::vpath::nfc(path.as_str());
-        (self.exact.is_match(s) && (!self.dir_only || is_dir)) || self.under.is_match(s)
+        (self.exact.compile_matcher().is_match(s) && (!self.dir_only || is_dir)) || self.under.compile_matcher().is_match(s)
     }
 
     pub fn to_line(&self) -> String {
@@ -1644,7 +1646,11 @@ fn guarded_policy(acc: Option<Vec<u8>>, text: Vec<u8>, parent_policy: Option<Opt
             accept: Some(text),
         };
     };
-    let accepted = Policy::parse(&String::from_utf8_lossy(&acc));
+    // Usually the same text: parsed once (parsing compiles the globs).
+    let accepted = match acc == text {
+        true => current.clone(),
+        false => Policy::parse(&String::from_utf8_lossy(&acc)),
+    };
     let take_all = || WorkingCopyPolicy {
         policy: current.clone(),
         accept: (acc != text).then(|| text.clone()),

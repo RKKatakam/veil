@@ -62,24 +62,32 @@ fn median(mut v: Vec<f64>) -> f64 {
     v[v.len() / 2]
 }
 
+/// The files of a repository of `files` 4 KiB files in directories of
+/// 100: `(d000/f000.txt, content)`.
+fn files_of(files: usize, seed: u64) -> Vec<(String, String)> {
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..files)
+        .map(|i| {
+            let mut body = String::with_capacity(4096);
+            while body.len() < 4096 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                body.push_str(&format!("{:016x} ", x));
+            }
+            body.truncate(4095);
+            body.push('\n');
+            (format!("d{:03}/f{:03}.txt", i / 100, i % 100), body)
+        })
+        .collect()
+}
+
 /// A repository of `files` 4 KiB files in directories of 100.
 fn generate(dir: &Path, files: usize, seed: u64) -> Result<()> {
-    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-    for i in 0..files {
-        let d = dir.join(format!("d{:03}", i / 100));
-        if i % 100 == 0 {
-            std::fs::create_dir_all(&d)?;
-        }
-        let mut body = String::with_capacity(4096);
-        while body.len() < 4096 {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            body.push_str(&format!("{:016x} ", x));
-        }
-        body.truncate(4095);
-        body.push('\n');
-        std::fs::write(d.join(format!("f{:03}.txt", i % 100)), body)?;
+    for (path, body) in files_of(files, seed) {
+        let p = dir.join(path);
+        std::fs::create_dir_all(p.parent().expect("in a directory"))?;
+        std::fs::write(p, body)?;
     }
     Ok(())
 }
@@ -218,6 +226,100 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
         }
     }
     Ok(json!({ "profile": "openscion", "cases": cases }))
+}
+
+/// The workloads measured as OpenScion measures its own numbers
+/// (`benchmarks/README.md` of tinyhumansai/openscion): in one process, in
+/// memory (a `MemoryBackend`), so no process start, no disk and no fsync,
+/// for a like-for-like comparison of the design with its targets. The
+/// engine work is the same as `vl`'s (secret scanning, sealing, the stat
+/// cache, the op log); packing and compression are not skipped either.
+///
+/// | case | in process |
+/// |---|---|
+/// | import a directory | `Repo::init`, then the first snapshot |
+/// | commit one changed file | one file written, the snapshot, the commit |
+/// | clone everything | `init_for_clone`, a pull of every object, the checkout |
+///
+/// "Clone one directory" fetches on demand from the server; it has no
+/// in-memory equivalent here.
+pub fn run_in_memory(sizes: &[usize], runs: usize) -> Result<serde_json::Value> {
+    use std::sync::Arc;
+    use veil_core::{remote, statcache::StatCache, Identity, MemoryBackend, Repo, StorageBackend, VPath};
+    let id = Identity::generate("bench");
+    let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
+    let mut cases = Vec::new();
+    for &files in sizes {
+        let tree = files_of(files, files as u64);
+        let fill = |fs: &MemoryBackend| -> Result<()> {
+            for (path, body) in &tree {
+                fs.write(&VPath::new(path)?, body.as_bytes())?;
+            }
+            Ok(())
+        };
+        let (mut import, mut commit, mut clone) = (vec![], vec![], vec![]);
+        let mut kept = None;
+        for _ in 0..runs {
+            let fs = Arc::new(MemoryBackend::new());
+            fill(&fs)?;
+            let mut cache = StatCache::new();
+            let t = Instant::now();
+            let mut repo = Repo::init(fs.clone(), Some(id.clone()), "bench")?;
+            repo.snapshot_workspace_cached("default", &*fs, Some(&mut cache))?;
+            import.push(ms(t));
+            kept.get_or_insert((fs, repo, cache));
+        }
+        let (fs, mut repo, mut cache) = kept.ok_or_else(|| anyhow!("no runs"))?;
+        let (c, _) = repo.commit_working_copy("default", "import")?;
+        repo.set_tag("main", c, None, false)?;
+        for r in 0..runs {
+            let t = Instant::now();
+            fs.write(&VPath::new("d001/f001.txt")?, format!("change {r}\n").as_bytes())?;
+            repo.snapshot_workspace_cached("default", &*fs, Some(&mut cache))?;
+            repo.commit_working_copy("default", &format!("one file {r}"))?;
+            commit.push(ms(t));
+        }
+        let main = repo.view().tags["main"].target;
+        let source: Arc<dyn StorageBackend> = fs.clone();
+        for _ in 0..runs {
+            let to = Arc::new(MemoryBackend::new());
+            let t = Instant::now();
+            let mut c = Repo::init_for_clone(to.clone(), Some(id.clone()), "bench")?;
+            remote::pull(&mut c, "origin", source.clone())?;
+            let target = c.snapshot(&main)?.tree;
+            veil_core::checkout::checkout(c.store(), &*to, None, &target)?;
+            clone.push(ms(t));
+            if !to.exists(&VPath::new("d001/f002.txt")?)? {
+                bail!("the in-memory clone wrote no files");
+            }
+        }
+        let t = targets(files);
+        for (case, v, target) in [
+            ("import a directory", import, t[0]),
+            ("clone everything", clone, t[1]),
+            ("commit one changed file", commit, t[2]),
+        ] {
+            let v = median(v);
+            cases.push(json!({ "files": files, "case": case, "veil_memory_ms": v, "target_ms": target, "meets_target": v <= target, "runs": runs }));
+        }
+    }
+    Ok(json!({ "profile": "openscion-memory", "cases": cases }))
+}
+
+/// [`run_in_memory`]'s results as a Markdown table.
+pub fn markdown_in_memory(v: &serde_json::Value) -> Result<String> {
+    let mut out = String::from("| Files | Workload | Veil in memory, in process (ms) | Target (ms) | Meets target |\n|---:|---|---:|---:|---|\n");
+    for c in v["cases"].as_array().ok_or_else(|| anyhow!("no cases"))? {
+        out.push_str(&format!(
+            "| {} | {} | {:.2} | {} | {} |\n",
+            c["files"],
+            c["case"].as_str().unwrap_or(""),
+            c["veil_memory_ms"].as_f64().unwrap_or(f64::NAN),
+            c["target_ms"],
+            if c["meets_target"] == json!(true) { "yes" } else { "no" },
+        ));
+    }
+    Ok(out)
 }
 
 fn count_files(dir: &Path) -> Result<usize> {

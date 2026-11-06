@@ -139,12 +139,18 @@ fn kill_9_mid_gc_never_loses_anything() {
 /// lock: it stages its objects in its own directory. A process killed
 /// while staging blocks nothing, its staging directory is removed by the
 /// next command (its pid is provably gone), and the repository stays
-/// consistent.
+/// consistent. (Files over 1 MiB: smaller new objects wait in memory and
+/// are published as one pack, so nothing of theirs is staged on disk.)
 #[test]
 fn repository_is_usable_right_after_a_crash_while_locked() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a", "a\n")]);
-    many_files(&proj, 3000, "v1");
+    let large_files = |tag: &str| {
+        for i in 0..40 {
+            write(&proj, &format!("big/f{i}.txt"), &format!("{tag} {i}\n{}\n", "x".repeat(1_100_000)));
+        }
+    };
+    large_files("v1");
     env.ok("alice", &proj, &["status"]);
     let incoming = proj.join(".veil/objects/incoming");
     let staging = || -> Vec<String> {
@@ -152,7 +158,7 @@ fn repository_is_usable_right_after_a_crash_while_locked() {
     };
     let mut caught = false;
     for attempt in 0..30 {
-        many_files(&proj, 3000, &format!("v{}", attempt + 2));
+        large_files(&format!("v{}", attempt + 2));
         let mut child = env.spawn("alice", &proj, &["status"]);
         // objects are staged while the tree is being built
         let held = wait_for(Duration::from_secs(5), || !staging().is_empty() && proj.join(".veil/objects/incoming").read_dir().is_ok_and(|d| d.flatten().any(|e| e.path().read_dir().is_ok_and(|mut f| f.next().is_some()))));

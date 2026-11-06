@@ -231,8 +231,11 @@ struct Rules {
     /// Capture group `token_groups[i]` is `tokens[i]`.
     tokens: Vec<Rule>,
     token_re: Regex,
-    /// `token_re` unbounded, for capture groups (see `assignment_caps`).
-    token_caps: Regex,
+    /// The alternation `token_re` was compiled from.
+    token_pattern: String,
+    /// `token_re` unbounded, for capture groups (see [`Assignments::caps`]),
+    /// compiled for the first match.
+    token_caps: OnceLock<Regex>,
     token_groups: Vec<usize>,
     /// Finds [`KEYWORD_PARTS`] (see `lowercase_into`).
     keyword_parts: aho_corasick::AhoCorasick,
@@ -241,13 +244,46 @@ struct Rules {
     /// `key = value` assignments, run on ASCII-lowercased text: `(?i)`
     /// keywords have too many case variants for the literal prefilter.
     assignment: Rule,
-    assignment_re: Regex,
+    /// Compiled for the first text holding a keyword: only such text is
+    /// searched for assignments ([`search_assignments`]), and compiling
+    /// them costs more than all the rest of a one-file commit.
+    assignments: OnceLock<Assignments>,
+}
+
+/// The assignment rule's regexes.
+struct Assignments {
+    re: Regex,
     /// The same pattern with its repetitions unbounded, for the capture
     /// groups of a match already found: its smaller automaton computes them
     /// several times faster on the match alone (where no bound is needed).
     /// The groups are numbered the same.
-    assignment_caps: Regex,
-    assign: AssignGroups,
+    caps: Regex,
+    groups: AssignGroups,
+}
+
+impl Rules {
+    fn token_caps(&self) -> &Regex {
+        self.token_caps.get_or_init(|| compile(&unbounded(&self.token_pattern)))
+    }
+
+    fn assignments(&self) -> &Assignments {
+        self.assignments.get_or_init(|| {
+            let re = compile(&self.assignment.pattern);
+            Assignments {
+                caps: compile(&unbounded(&self.assignment.pattern)),
+                groups: AssignGroups::new(&re),
+                re,
+            }
+        })
+    }
+}
+
+fn compile(p: &str) -> Regex {
+    regex::bytes::RegexBuilder::new(&format!("(?-u){p}"))
+        .size_limit(64 << 20)
+        .dfa_size_limit(16 << 20)
+        .build()
+        .expect("valid secret pattern")
 }
 
 /// Capture groups of an assignment pattern, by index. (Looking a group up
@@ -419,8 +455,25 @@ fn unbounded(pattern: &str) -> String {
     out
 }
 
+static RULES: OnceLock<Rules> = OnceLock::new();
+
+/// Compile the rules on another thread, for a command that may scan soon:
+/// the token rules take 2 to 3 ms to compile (the assignment rule's are
+/// compiled when a keyword is first found), about what the rest of a
+/// one-file commit's scan of the working copy takes, which it overlaps. A scan that comes
+/// first waits for that compilation instead of starting its own
+/// (`OnceLock`); a thread that cannot be started changes nothing.
+#[cfg(feature = "os")]
+pub fn prepare() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if RULES.get().is_none() && !STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let _ = std::thread::Builder::new().name("veil-scanner".into()).spawn(|| {
+            rules();
+        });
+    }
+}
+
 fn rules() -> &'static Rules {
-    static RULES: OnceLock<Rules> = OnceLock::new();
     RULES.get_or_init(|| {
         let r = |name, pattern: &str, before, after, check| Rule {
             name,
@@ -460,18 +513,8 @@ fn rules() -> &'static Rules {
         ];
         let assignment = r("generic-secret-assignment", &assignment_pattern(), E::None, E::None, C::Assignment);
         let alternation: Vec<String> = tokens.iter().enumerate().map(|(i, t)| format!("(?P<t{i}>{})", t.pattern)).collect();
-        let compile = |p: &str| {
-            regex::bytes::RegexBuilder::new(&format!("(?-u){p}"))
-                .size_limit(64 << 20)
-                .dfa_size_limit(16 << 20)
-                .build()
-                .expect("valid secret pattern")
-        };
-        let token_re = compile(&alternation.join("|"));
-        let token_caps = compile(&unbounded(&alternation.join("|")));
-        let assignment_re = compile(&assignment.pattern);
-        let assignment_caps = compile(&unbounded(&assignment.pattern));
-        let assign = AssignGroups::new(&assignment_re);
+        let token_pattern = alternation.join("|");
+        let token_re = compile(&token_pattern);
         Rules {
             keyword_parts: aho_corasick::AhoCorasick::builder()
                 .match_kind(aho_corasick::MatchKind::LeftmostFirst)
@@ -479,11 +522,10 @@ fn rules() -> &'static Rules {
                 .expect("keyword parts"),
             token_groups: (0..tokens.len()).map(|i| group(&token_re, &format!("t{i}"))).collect(),
             token_values: vec![group(&token_re, "pw")],
-            assignment_re,
-            assignment_caps,
-            assign,
+            assignments: OnceLock::new(),
             token_re,
-            token_caps,
+            token_pattern,
+            token_caps: OnceLock::new(),
             tokens,
             assignment,
         }
@@ -1703,7 +1745,7 @@ struct Hit {
 /// NUL-padded data with the NULs removed.
 fn search_tokens(hay: &[u8], from: usize, limit: usize, stripped: bool, out: &mut Vec<Hit>) {
     let rules = rules();
-    search_with(&rules.token_re, &rules.token_caps, &rules.token_values, None, stripped, hay, hay, from..limit, out, |caps| {
+    search_with(&rules.token_re, &|| rules.token_caps(), &rules.token_values, None, stripped, hay, hay, from..limit, out, |caps| {
         let i = rules.token_groups.iter().position(|&g| caps.get(g).is_some()).expect("one alternative matched");
         &rules.tokens[i]
     });
@@ -1720,7 +1762,8 @@ fn search_assignments(text: &[u8], lower: &[u8], keywords: Option<(usize, usize)
     let Some((first, last)) = keywords else { return };
     let hay = &lower[..(last + OVERLAP).min(lower.len())];
     let rules = rules();
-    search_with(&rules.assignment_re, &rules.assignment_caps, &rules.assign.values, Some(&rules.assign), false, hay, text, from.max(first)..limit.min(hay.len()), out, |_| {
+    let a = rules.assignments();
+    search_with(&a.re, &|| &a.caps, &a.groups.values, Some(&a.groups), false, hay, text, from.max(first)..limit.min(hay.len()), out, |_| {
         &rules.assignment
     });
 }
@@ -1752,7 +1795,7 @@ const CAPTURE_COST: usize = 160;
 #[allow(clippy::too_many_arguments)]
 fn search_with<'r>(
     re: &Regex,
-    caps_re: &Regex,
+    caps_re: &dyn Fn() -> &'r Regex,
     values: &[usize],
     assign: Option<&AssignGroups>,
     stripped: bool,
@@ -1845,7 +1888,7 @@ fn search_with<'r>(
             at = restart;
             continue;
         }
-        let caps = caps_re.captures_at(&hay[..whole.end()], whole.start()).expect("the same match");
+        let caps = caps_re().captures_at(&hay[..whole.end()], whole.start()).expect("the same match");
         let rule = rule_of(&caps);
         if !rule.before.allows(prev) {
             // A real token may start inside this rejected match.
@@ -2572,10 +2615,10 @@ QyNTUxOQAAACBGqZt3YkVvQ2mR8sXlN0pWcF4hTj7uK9eAoD1bLyS6xQAAAJgVb1oKFW9a
             let line = format!("{ident} = \"Xk9mQ2vL7pR4wZt8uY3n\"\n");
             let text = line.as_bytes();
             lowercase_into(&mut lower, text);
-            for m in rules.assignment_re.find_iter(&lower) {
+            for m in rules.assignments().re.find_iter(&lower) {
                 if rejected_by_context(&lower, text, m.start()) {
-                    let caps = rules.assignment_caps.captures_at(&lower[..m.end()], m.start()).expect("same match");
-                    assert!(credential_key(&caps, &rules.assign, &lower, text) == Key::No, "{line:?} at {}", m.start());
+                    let caps = rules.assignments().caps.captures_at(&lower[..m.end()], m.start()).expect("same match");
+                    assert!(credential_key(&caps, &rules.assignments().groups, &lower, text) == Key::No, "{line:?} at {}", m.start());
                     checked += 1;
                 }
             }
@@ -2683,15 +2726,15 @@ QyNTUxOQAAACBGqZt3YkVvQ2mR8sXlN0pWcF4hTj7uK9eAoD1bLyS6xQAAAJgVb1oKFW9a
                     let line = format!("{}\n", l.replace("{k}", k).replace("{v}", v));
                     let text = line.as_bytes();
                     lowercase_into(&mut lower, text);
-                    for m in rules.assignment_re.find_iter(&lower) {
+                    for m in rules.assignments().re.find_iter(&lower) {
                         let Some(vs) = value_start(&lower[m.range()]).filter(|_| lower[m.end() - 1] == b'\n') else { continue };
                         let rest = &text[m.start() + vs..m.end() - 1];
                         if !line_value_rejected(text, m.start(), rest, config_line(text, m.start())) {
                             continue;
                         }
                         fired += 1;
-                        let caps = rules.assignment_caps.captures_at(&lower[..m.end()], m.start()).expect("same match");
-                        if let Some(span) = assignment_value(&caps, &rules.assign, text) {
+                        let caps = rules.assignments().caps.captures_at(&lower[..m.end()], m.start()).expect("same match");
+                        if let Some(span) = assignment_value(&caps, &rules.assignments().groups, text) {
                             assert!(!plausible_value(&text[span]), "{line:?}");
                         }
                     }

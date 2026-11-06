@@ -576,16 +576,16 @@ fn flush_drive_cache(files: &[PathBuf], dirs: &[PathBuf]) -> io::Result<()> {
     Ok(())
 }
 
-/// Run `f` on every item, on up to `max_workers` threads. Concurrent
-/// fsyncs let filesystems such as ext4 and XFS commit many files in one
-/// journal transaction instead of one each.
+/// Run `f` on every item, on up to `max_workers` threads, one per
+/// `per_worker` items. Concurrent fsyncs let filesystems such as ext4 and
+/// XFS commit many files in one journal transaction instead of one each.
 fn for_each_parallel<T: Sync>(
     items: &[T],
     max_workers: usize,
+    per_worker: usize,
     f: impl Fn(&T) -> io::Result<()> + Sync,
 ) -> io::Result<()> {
-    const PER_WORKER: usize = 16;
-    let workers = items.len().div_ceil(PER_WORKER).clamp(1, max_workers);
+    let workers = items.len().div_ceil(per_worker).clamp(1, max_workers);
     if workers == 1 {
         return items.iter().try_for_each(f);
     }
@@ -943,14 +943,20 @@ impl StorageBackend for DiskBackend {
             return Ok(());
         }
         let dirs: Vec<PathBuf> = batch.dirs.iter().cloned().collect();
-        let res = for_each_parallel(&batch.files, SYNC_WORKERS, |f| match barrier_sync_file(f) {
+        // Files: a worker each from two on (measured on ext4 NVMe: two
+        // new files 0.42 ms instead of 0.70, four 0.73 instead of 1.36; a
+        // thread costs tens of microseconds, a journal commit hundreds).
+        // Directories: once the files' fsyncs have committed the journal
+        // they are mostly clean, and a thread for each costs more than
+        // their fsyncs; one worker per 16.
+        let res = for_each_parallel(&batch.files, SYNC_WORKERS, 1, |f| match barrier_sync_file(f) {
             // Removed since (by gc, or by crash recovery as torn): the
             // directory sync below makes the removal durable instead.
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             r => r,
         })
         .and_then(|()| {
-            for_each_parallel(&dirs, SYNC_WORKERS, |d| match barrier_sync_dir(d) {
+            for_each_parallel(&dirs, SYNC_WORKERS, 16, |d| match barrier_sync_dir(d) {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
                 r => r,
             })
