@@ -1,6 +1,6 @@
 # 5. Copy-on-write checkouts of the project directory
 
-Status: design and threat review (backlog: "Copy-on-write file clones for project-directory checkouts"). **No repository format change.**
+Status: design and threat review, **not built** (backlog: "Copy-on-write file clones for project-directory checkouts"). A client-side item, independent of the server. Threats about cloaked files describe today's client; with the server they apply to secrets and embargoed files. **No repository format change.**
 
 > **This machine cannot exercise real reflinks:** `/` is ext4 (no `FICLONE`) and `/tmp` is tmpfs. Real clone tests run on macOS (APFS `clonefileat`, the `macos_fs.rs` precedent) and on any btrfs or XFS developer machine. Here, a `CloneCounting` test backend covers the logic.
 

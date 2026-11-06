@@ -1,6 +1,6 @@
 # 4. Background cleanup instead of whole-store `gc`; streaming pull
 
-Status: design and threat review (Scion 2.2; the backlog's "streaming / incremental gc" and "streaming pull" items). **No repository format change.** Pack and index bytes are unchanged; the gc lease and the maintenance log are new device-local files.
+Status: **built** (streams G1 and G2, Scion 2.2; this is the design and threat review, with as-built notes; the backlog's "streaming / incremental gc" and "streaming pull" items). **No repository format change.** Pack and index bytes are unchanged; the gc lease and the maintenance log are new device-local files.
 
 ## The problem
 
@@ -66,7 +66,7 @@ Three tasks. The first two never need reachability.
   - the prune estimate is reached: the operations since the last prune rewrote more than 10,000 snapshots (from `Operation::rewritten`, item 2), or 7 days have passed.
 - `--auto` does consolidation and merging every time, and prune only on the estimate.
 - Output goes to `.veil/local/maintenance.log` (0600, kept to 1 MiB).
-- **Never:** inside `vl serve`'s request path, when `VEIL_GC_AUTO=0`, or (by default) when `CI` is set. Remotes have no server, so they are never maintained automatically; push phase B does not run gc.
+- **Never:** inside `vl serve`'s request path, when `VEIL_GC_AUTO=0`, or (by default) when `CI` is set. Today's remotes are never maintained automatically; push phase B does not run gc. On the server, cleanup is a background retention rule on object storage (`docs/HUB.md` §9.1).
 - `vl gc` (explicit) keeps today's flags and output, and runs all three tasks in the foreground.
 
 ### Streaming pull (`remote.rs`)

@@ -1,6 +1,6 @@
 # 9. The scale benchmark
 
-Status: harness built (`crates/veil-bench`, `scripts/bench-scale.sh`); the 1 GB baseline on b549e1e is in [`BASELINE.md`](BASELINE.md). The trace hooks below are not built: the harness counts snapshot decodes and lock waits from an `strace` of each command instead (Scion 6.6, and the backlog's "Scale benchmark at 1 GB and ~5 GB"). **It is built first:** its baseline on `integration` @ 4a62259 ranks the other streams, and its gates decide when phase 0 is done.
+Status: harness built (`crates/veil-bench`, `scripts/bench-scale.sh`); the 1 GB baseline on b549e1e is in [`BASELINE.md`](BASELINE.md). The trace hooks below are not built: the harness counts snapshot decodes and lock waits from an `strace` of each command instead (Scion 6.6, and the backlog's "Scale benchmark at 1 GB and ~5 GB"). **It was built first:** its baseline on `integration` @ 4a62259 ranked the other streams, and its gates decide when the client groundwork is done. The `cloaked-1g` profile measures today's client, which encrypts restricted paths; on the server only secrets and embargoed changes are encrypted.
 
 ## Design sketch
 
@@ -70,7 +70,9 @@ veil-bench report  RESULTS.json… > docs/design/scale/BENCH.md (appends a dated
 - **Never** a path inside the repository, a file name, a description or any content (threat 3).
 - **The harness** also takes each child's `ru_maxrss` from `wait4`.
 
-### Gates (phase 0 is done when all hold on `1g`, `cloaked-1g` and `5g`)
+### Gates for the client groundwork (all on `1g`, `cloaked-1g` and `5g`)
+
+These gates measure today's client. The server's own gates are the design targets in `docs/HUB.md` §9.2 (thousands of agents, benchmarked at 1,000 and 10,000; sub-100 ms pulls and PR updates; thousands of merges per hour per project); this harness is extended to drive the server.
 
 1. **Locks.**
    - In the N-agents profile, no local command waits on `.veil/lock` except metadata commands (`scope`, `secret`, `embargo`), which the profile does not run. So the wait total is 0.

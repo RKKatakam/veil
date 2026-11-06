@@ -1,6 +1,6 @@
 # Scale baseline: 1 GB, `integration` @ b549e1e
 
-These are the first numbers from the scale benchmark (`9-scale-benchmark.md`), measured on `integration` @ **b549e1e** before any scale stream lands. They rank the streams: see [the ranked list](#ranked-offenders) and [what it means for the plan](#what-this-means-for-the-plan).
+These are the scale benchmark's numbers for today's client (`9-scale-benchmark.md`), first measured on `integration` @ **b549e1e** before any scale stream landed, then after each. The remote cases use today's path and SFTP remotes; the server's own targets are in `docs/HUB.md` §9.2. They rank the streams: see [the ranked list](#ranked-offenders) and [what it means for the plan](#what-this-means-for-the-plan).
 
 - **Machine:**
   - 32 CPUs (i9-13900KF), 30 GB RAM;
@@ -221,7 +221,7 @@ Each entry gives the operation, its cost at 1 GB, the cause (located in the code
 
 ## What this means for the plan
 
-- **O goes first.** It removes the lock waits that make 64 agents fail, and gives the largest gain for the agent scenario (Scion phase 0's reason to exist).
+- **O goes first.** It removes the lock waits that make 64 agents fail, and gives the largest gain for the agent scenario (the reason for the client groundwork).
 - **G2 second.** Memory is over gate 3 at 1 GB already, and grows with the store. Bounding the pack cache is small and contained; geometric repacking also fixes item 5.
 - **P third.** At 1 GB the remote's lock is not contended: waits are about 0, holds are at most 23 ms traced, and that already fits gate 1's `20 × RTT + 250 ms`. P's value here is removing the push's history walks (item 3) and resumability, which matter more over a slow link than on this machine.
 - **I** (in parallel, as planned) removes the walks in `log` and, with O, in `status`/`commit`. At 1 GB they cost less than a quarter of a second; they will matter on the 4× history twin.
