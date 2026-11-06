@@ -1,11 +1,12 @@
 # Veil
 
-Veil (`vl`) is a **server-centric** version control system in Rust. **It is not Git and not offline-first:** the `vl` client is always connected to the Veil server (the Hub), which stores the code and enforces permissions. Access is the ordinary model in `docs/VISIBILITY.md`; code is plain text on the server, and only secrets and embargoed changes are encrypted. Read `docs/OVERVIEW.md` first. The built client engine has embargoes, secret scanning, change ids, an undoable op log, workspaces and a BLAKE3 content-addressed store. Until the server lands, today's client still restricts paths by cloaking them and syncs through path and SFTP remotes; the simplification pass removes those.
+Veil (`vl`) is a **server-centric** version control system in Rust. **It is not Git and not offline-first:** the `vl` client is always connected to the Veil server (the Hub), which stores the code and enforces permissions. Access is the ordinary model in `docs/VISIBILITY.md`; code is plain text on the server, and only secrets and embargoed changes are encrypted. Read `docs/OVERVIEW.md` first. The built client engine has embargoes, secret scanning, change ids, an undoable op log, workspaces and a BLAKE3 content-addressed store. The server's milestone S1 is built (`docs/HUB.md` §13). Today's client still also restricts paths by cloaking them and syncs through path and SFTP remotes; the simplification pass removes those.
 
 Crates:
 - `crates/veil-core`: the engine;
 - `crates/vl`: the CLI;
-- `crates/veil-bench`: the scale benchmark, not a default workspace member.
+- `crates/veil-server`: the Veil server (axum, sqlx for PostgreSQL/YugabyteDB, S3), not a default workspace member;
+- `crates/veil-bench`: the scale benchmark and the OpenScion speed gates, not a default workspace member.
 
 Read `docs/OVERVIEW.md`, `docs/VISIBILITY.md`, `docs/HUB.md` (the server design), `docs/ARCHITECTURE.md` (its "Threat model" section has the trust boundary), `docs/FORMAT.md` and `docs/BUGS.md`.
 
@@ -34,6 +35,8 @@ bash ~/.cache/veil-orch/verify-fast.sh <name>
 # While iterating, one test binary at a time:
 cargo test -p vl --test cli_security -- <test name>
 VEIL_BLESS_DOCS=1 cargo test -p vl --bin vl reference_is_up_to_date   # after any CLI change
+# The server against PostgreSQL, YugabyteDB and MinIO in Docker (~5 min; not in verify-fast):
+bash scripts/verify-server.sh
 ```
 
 ## Conventions

@@ -1,6 +1,6 @@
 # Who can see what: Veil's permission model
 
-> **Status:** decided by the owner on 2026-11-05. It is built by scale stream V.
+> **Status:** decided by the owner on 2026-11-05. Milestone S1 of the server builds it (2026-11-06): see "As built" below.
 >
 > **This document is the source of truth.** Where `ARCHITECTURE.md`, `HUB.md`, a guide or an older design doc disagrees with it, this document wins, and the other one needs updating. **Keep it this simple:** it is the ordinary permission model everyone already knows.
 
@@ -100,6 +100,29 @@ vl merge fix --into main --embargo-for security distro-partners --until 2026-12-
 | People and agents with access | ✅ | ✅ | ✅ decrypted on their device | ❌ |
 | The server (and anyone who breaks in) | ✅ | ✅ | ❌ ciphertext only | ❌ never uploaded |
 | A public mirror | ✅ | ❌ never sent | ❌ never sent | ❌ |
+
+## As built (milestone S1, 2026-11-06)
+
+What the server and `vl` do today; `docs/HUB.md` §13 has the details.
+
+- **`.veilpolicy` access lines** are `PATH  public` and `PATH  group-or-person…`, with **the last matching line winning**. Paths are folders or files from the project root (a line with `*` or `?` grants nothing on the server). Anything no line matches is private to admins.
+  ```
+  vl access billing/ finance      # writes the line; push it (admins only)
+  vl access billing/              # asks the server who can see billing/, and which line decides
+  vl group create finance; vl group add finance alice; vl group manager finance carol
+  ```
+- **Folder access means read and write; `public` means read for everyone on Earth.** Writing a public folder needs a named group or person (`src/  public devs`).
+- **Folders under access lines are plain text** in snapshots and on the server. The server's check is what protects them, on every request: clone, pull, the fetch API and every listing. Nobody receives a file, or a name, from a folder they cannot see.
+- **History without access:** you do not see the folder's files or names in any snapshot, and a change that touched only such folders is not in your history at all. A change that touched both shows only your part (and its description). Every snapshot you receive carries a signature that verifies: its author's, or the server's on the part it left out.
+- **Only admins change access.** The server refuses a push that changes access lines, on any branch, unless an admin made it; the authority is the policy accepted on the default branch, never a label inside a snapshot. Names bind to the project's group first, also when the group is created after the line, so nobody gains access by signing up under a group's name.
+- **Managers** add and remove other people in their groups, never themselves.
+- **Secrets:**
+  - new repositories encrypt `.env`, `.env.*`, `.envrc` and Terraform state on the device and sync them; only devices holding the key open them;
+  - personal private keys and credentials (`id_rsa`, `id_ed25519`, `*.pem`, `*.key`, `.netrc`, …) never leave the device, and the server refuses them;
+  - existing repositories switch only with `vl upgrade --sync-secrets`, which lists the files first;
+  - **keys are granted by an admin's signature, never by the server:** an admin's `vl group add` signs the key grant for the people added; a manager's addition, or anything the server does on its own, gives folder access but no key. Removing someone from their last group rotates the key when an admin does it; a manager's removal says it did not and asks an admin to remove them too.
+  - In S1 one key opens every secret of the project; keys per access rule come in S2 (`HUB.md` §13.6).
+- **Anyone on Earth** (not signed in) receives `public` folders only, and does not see a project with nothing public.
 
 ## For the design: open technical questions (not product questions)
 

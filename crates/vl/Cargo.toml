@@ -27,6 +27,9 @@ serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 # `.veilhooks` (parsing only; already in the tree through proc-macro-crate).
 toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
+# HTTPS to the Veil server (`vl login`, clone, push, pull): a blocking
+# client fits vl's synchronous code; rustls with ring, no OpenSSL.
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

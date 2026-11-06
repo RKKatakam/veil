@@ -77,10 +77,10 @@ fn ignored_and_isolated_files_stay_on_disk() {
     let env = Env::new();
     let (r, _) = dirty(&env);
     r.write("target/build.o", "o\n");
-    r.write(".env", DOTENV);
+    r.write(".netrc", DOTENV);
     r.ok(&["new", "@-"]);
     assert_eq!(r.read("target/build.o"), "o\n");
-    assert_eq!(r.read(".env"), DOTENV);
+    assert_eq!(r.read(".netrc"), DOTENV);
 }
 
 // Scenario from git t3903-stash.sh with a quarantined edit: it is never

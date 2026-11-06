@@ -28,7 +28,7 @@ fn sandbox(proj: &Path) -> PathBuf {
 
 fn project(env: &Env) -> PathBuf {
     let proj = env.project("alice", "proj", &[("a.txt", "a\n"), ("src/lib.rs", "pub fn f() {}\n"), ("docs/d.md", "d\n")]);
-    write(&proj, ".env", &format!("API_TOKEN={SECRET}\n"));
+    write(&proj, ".netrc", &format!("API_TOKEN={SECRET}\n"));
     env.ok("alice", &proj, &["commit", "-m", "env"]);
     env.ok("alice", &proj, &["ws", "new", "agent", "-r", "@-"]);
     proj
@@ -118,7 +118,7 @@ fn run_case(c: &Case) {
     };
     let script = format!(
         "printf '%s' '{content}' > {out_path}; {extra} {copy} touch {started}; sleep 2",
-        copy = if c.injected { "cp .env src/leak.txt; mkdir -p target; cp .env target/app.env;" } else { "" },
+        copy = if c.injected { "cp .netrc src/leak.txt; mkdir -p target; cp .netrc target/app.env;" } else { "" },
         started = started.display()
     );
     args.extend(["--".into(), "sh".into(), "-c".into(), script]);

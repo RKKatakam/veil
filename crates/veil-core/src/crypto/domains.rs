@@ -80,6 +80,10 @@ pub const SIG_CONTEXT_VAULT_ENTRY: &str = "vault-entry";
 /// over the id of its encoding without `signature` (`Atag::unsigned_id`):
 /// name, target, kind, message, tagger and time.
 pub const SIG_CONTEXT_TAG: &str = "tag";
+/// Signature context: signing in to a Veil server (`docs/HUB.md` §4.3),
+/// over `hub ‖ 0x00 ‖ challenge` (the server's name as the client dialled
+/// it, and the single-use random challenge it issued).
+pub const SIG_CONTEXT_HUB_LOGIN: &str = "hub-login";
 
 /// Every signature context, for the uniqueness test.
 pub const SIG_CONTEXTS: &[&str] = &[
@@ -90,6 +94,7 @@ pub const SIG_CONTEXTS: &[&str] = &[
     SIG_CONTEXT_MEMBER_BINDING,
     SIG_CONTEXT_VAULT_ENTRY,
     SIG_CONTEXT_TAG,
+    SIG_CONTEXT_HUB_LOGIN,
 ];
 
 // ---- key rings and embargoes (keychain.rs) --------------------------------
@@ -133,6 +138,12 @@ pub const LOCAL_LABEL: &str = "local";
 /// Separator of `<scope>#<key-id>` generation labels.
 pub const GENERATION_SEPARATOR: char = '#';
 
+/// BLAKE3 `derive_key` context of a Veil server's view key: the hash of the
+/// paths one viewer may read under the accepted policy, under which the
+/// server caches that viewer's projections (`hub::access::View::key`). Not
+/// secret; equal for two viewers who read the same paths.
+pub const HUB_VIEW_KEY: &str = "veil 2026 hub view-key v1";
+
 /// Every BLAKE3 `derive_key` context, for the uniqueness test.
 pub const BLAKE3_CONTEXTS: &[&str] = &[
     LEGACY_SIV_NONCE,
@@ -143,6 +154,7 @@ pub const BLAKE3_CONTEXTS: &[&str] = &[
     RING_CHANGE_HASH,
     RING_PROOF,
     TEAM_VAULT_HISTORY,
+    HUB_VIEW_KEY,
 ];
 
 #[cfg(test)]
@@ -156,7 +168,11 @@ mod tests {
         let unique: std::collections::BTreeSet<&str> = all.iter().copied().collect();
         assert_eq!(unique.len(), all.len(), "duplicate domain-separation string");
         // Contexts added after the first seven are pinned on their own.
-        assert_eq!(BLAKE3_CONTEXTS[7..], ["veil 2026 team-vault history v1"], "a context changed or was reordered");
+        assert_eq!(
+            BLAKE3_CONTEXTS[7..],
+            ["veil 2026 team-vault history v1", "veil 2026 hub view-key v1"],
+            "a context changed or was reordered"
+        );
         let mut all: Vec<&str> = BLAKE3_CONTEXTS[..7].to_vec();
         all.extend([AES_SIV_SUBKEY, HPKE_KEY_WRAP_INFO]);
         // Pinned: these strings are part of data already on disk.
@@ -176,7 +192,7 @@ mod tests {
             "028e842fb2475981",
             "a signature context changed; that breaks existing signatures. Add a new constant instead."
         );
-        assert_eq!(SIG_CONTEXTS[5..], ["vault-entry", "tag"], "a signature context changed or was reordered");
+        assert_eq!(SIG_CONTEXTS[5..], ["vault-entry", "tag", "hub-login"], "a signature context changed or was reordered");
         let labels = [
             WRAP_LABEL_PREFIX,
             PREV_KEY_LABEL_PREFIX,

@@ -3694,7 +3694,7 @@ afterwards; textconv input on stdin, output never stored.
 
 **Trust boundary.** Every security finding must name an attacker outside this boundary, what that attacker controls, and the concrete harm. A finding that needs something inside the boundary to be hostile is out of scope: it is recorded as such, not fixed.
 
-**With the server** (the design, `docs/HUB.md` §3; the boundary the server is built to):
+**With the server** (`docs/HUB.md` §3; milestone S1 is built to it, §13):
 
 *Trusted:*
 
@@ -3705,7 +3705,7 @@ afterwards; textconv input on stdin, output never stored.
 
 *Not trusted:*
 
-* **the server, with secrets and embargoed changes before release.** It stores only their ciphertext and never holds a key that opens them. Personal private keys never reach it;
+* **the server, with secrets and embargoed changes before release.** It stores only their ciphertext and never holds a key that opens them. Personal private keys never reach it. **Nor can it hand a secret out:** a key is granted only by a ring admin's signed change, never by the server's group records, which a compromised server could rewrite (`docs/HUB.md` §13.6);
 * people outside a folder's access, including others in the same project, and members after they are removed;
 * anything that arrives by push, pull, fetch or merge: trees, names, descriptions, policies, hooks and metadata;
 * the network, and other OS users on the same machine.

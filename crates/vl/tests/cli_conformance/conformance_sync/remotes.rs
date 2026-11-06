@@ -152,7 +152,7 @@ fn unsupported_url_schemes_are_refused() {
     for url in [
         "file:///tmp/x",
         "http://example.com/r",
-        "https://example.com/r",
+        "ftp://example.com/r",
         "git://example.com/r",
     ] {
         let out = env.fails("alice", &proj, &["remote", "add", "r", url]);

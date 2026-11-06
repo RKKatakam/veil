@@ -33,7 +33,7 @@ fn project(env: &Env) -> PathBuf {
     );
     let policy = std::fs::read_to_string(proj.join(".veilpolicy")).unwrap();
     write(&proj, ".veilpolicy", &format!("{policy}secret/ cloak team\n"));
-    write(&proj, ".env", "API_TOKEN=super-secret-isolated-value\n");
+    write(&proj, ".netrc", "API_TOKEN=super-secret-isolated-value\n");
     env.ok("alice", &proj, &["commit", "-m", "base"]);
     env.ok("alice", &proj, &["ws", "new", "agent", "-r", "@-"]);
     proj
@@ -216,12 +216,12 @@ fn isolated_files_are_injected_everywhere_and_copies_outside_are_not_recorded() 
     let out = exec(
         &env,
         &proj,
-        &["--only", "src", "--with-isolated", "--", "sh", "-c", "cat .env; cp .env leak.txt; cp .env src/leak.rs; echo ok > src/ok.rs"],
+        &["--only", "src", "--with-isolated", "--", "sh", "-c", "cat .netrc; cp .netrc leak.txt; cp .netrc src/leak.rs; echo ok > src/ok.rs"],
     );
-    assert!(out.contains("super-secret-isolated-value"), "the root .env was injected: {out}");
+    assert!(out.contains("super-secret-isolated-value"), "the root .netrc was injected: {out}");
     assert!(out.contains("leak.txt") && out.contains("not recorded"), "{out}");
     let p = paths(&env, &proj, "agent@");
-    assert!(p.contains(&"src/ok.rs".to_string()) && !p.iter().any(|p| p.contains("leak") || p == ".env"), "{p:?}");
+    assert!(p.contains(&"src/ok.rs".to_string()) && !p.iter().any(|p| p.contains("leak") || p == ".netrc"), "{p:?}");
     let all = String::from_utf8_lossy(
         &std::process::Command::new("grep")
             .arg("-r")
