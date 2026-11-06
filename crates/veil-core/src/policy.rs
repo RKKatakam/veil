@@ -422,7 +422,7 @@ pub fn is_access_line(fields: &[String]) -> bool {
 }
 
 /// Split a policy line into fields: whitespace separates fields unless
-/// escaped, and an unescaped `#` starts a comment (see [`fields`]).
+/// escaped, and an unescaped `#` starts a comment.
 pub fn split_fields(line: &str) -> Vec<String> {
     fields(line)
 }

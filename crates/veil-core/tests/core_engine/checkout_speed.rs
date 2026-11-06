@@ -61,7 +61,7 @@ fn checkout_of_many_files_is_one_barrier_not_one_fsync_per_file() {
     let mut repo = Repo::init(Arc::new(MemoryBackend::new()), Some(Identity::generate("a")), "a").unwrap();
     let ws = repo.ephemeral_workspace(repo.root_id()).unwrap();
     for i in 0..200 {
-        ws.write(&format!("d{}/f{i}.txt", i / 50), &format!("file {i}")).unwrap();
+        ws.write(&format!("d{}/f{i}.txt", i / 50), format!("file {i}")).unwrap();
     }
     let (snap, _) = repo.commit_ephemeral(&ws, "many").unwrap();
     let tree = repo.snapshot(&snap).unwrap().tree;
