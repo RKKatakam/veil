@@ -352,6 +352,69 @@ short, on this one machine with PostgreSQL: about 2,500 pulls/s while
 saturating at 20–30 landings/s with many agents (collisions; phase 4's
 batched landing).
 
+## Through the server, re-measured on `bfa691a` (2026-11-06)
+
+The four workloads on the current code (`integration` @ **`bfa691a`**),
+by `scripts/bench-server.sh openscion`: PostgreSQL 17 (and MinIO) in
+Docker, a release `veil-server` started fresh, release `vl`, the bench
+directory in the worktree's `.scratch/` on the ext4 NVMe disk, median of
+5, Git 2.53 beside it. **Both clones always go through the server**; the
+path-remote column of earlier rounds is gone with path remotes. Two
+sessions, one with the server's objects in **MinIO (S3)** and one in a
+**local directory** (as rounds 1 and 2). The machine was **heavily
+loaded** by other agents' builds (load average 35–41 against 32 threads;
+Git's own 10k import took 1,122–1,132 ms here, against 764–806 in rounds
+1 and 2), so compare within a session.
+
+| Files | Workload | Veil, MinIO (ms) | Veil, local objects (ms) | Git (ms) | Target (ms) | Meets target | Beats Git |
+|---:|---|---:|---:|---:|---:|---|---|
+| 1000 | import a directory | 53.8 | 53.0 | 153.7 / 102.8 | 22.0 | no | **yes** |
+| 1000 | clone everything (server) | 124.7 | 99.8 | 178.4 / 180.4 | 51.0 | no | **yes** (1.4–1.8×) |
+| 1000 | commit one changed file | 10.9 | 13.8 | 4.8 / 4.8 | 2.5 | no | no |
+| 1000 | clone one directory (server) | 60.9 | **39.1** | 50.8 / 47.3 | 6.1 | no | no / **yes** |
+| 10000 | import a directory | 382.0 | 386.0 | 1,131.9 / 1,122.0 | 245.0 | no | **yes** (2.9×) |
+| 10000 | clone everything (server) | **532.9** | 719.0 | 696.2 / 787.9 | 544.0 | **yes** / no | **yes** |
+| 10000 | commit one changed file | 35.9 | 37.3 | 8.6 / 9.7 | 22.0 | no | no |
+| 10000 | clone one directory (server) | 57.3 | 74.5 | 52.9 / 60.6 | 25.0 | no | no |
+
+(Git: MinIO session / local session. "Meets target" and "Beats Git":
+MinIO / local when they differ.)
+
+In one process, in memory (`veil-bench openscion-memory`, as OpenScion
+measures), the same sessions: import 10.4–16.8 / 97–191 ms, clone
+everything 15.5–26.3 / 153–200 ms, commit one file 1.3–1.8 / 9.4–18.5 ms
+(1k / 10k): **every in-memory target is met** in both.
+
+- **Clone everything beats Git at both sizes**, and meets its 10k target
+  in the MinIO session (533 against 544 ms); under the local session's
+  heavier load it took 719 ms. Objects in MinIO cost nothing measurable here
+  for a clone: the server prefetches each level's objects 64 at a time.
+- **Clone one directory** beats Git at 1k in the local session (39 against
+  47 ms) and stays within 5–14 ms of Git otherwise; it is flat from 1k to
+  10k, as designed.
+- **Commit one changed file** is faster than in round 2 (11–14 ms at 1k,
+  against 17–21) but still not Git's (5 ms; Git makes no fsync here).
+- **Import** beats Git 1.9–2.9×.
+- **Gates met:** clone everything at 10k (one session). **Not met:**
+  import, commit one file and clone one directory at both sizes, and clone
+  everything at 1k: the durable, multi-process CLI is above OpenScion's
+  in-memory targets, which Veil meets in memory.
+
+**Memory of the same operations at scale** (1 GB, `BASELINE.md`, "Through
+the Veil server"): a full clone through the server peaks at 979 MiB on
+the client (BUG-859) and 2.5 GB on the server (BUG-860); the initial push
+is refused (BUG-857) and holds 2.4 GB (BUG-858).
+
+**Run:**
+
+```sh
+scripts/bench-server.sh openscion             # objects in MinIO; ~3 minutes
+OBJECTS=local scripts/bench-server.sh openscion
+scripts/bench-server.sh openscion -- --files 10000 --runs 9
+```
+
+Raw results (not committed): `.scratch/bench-results/server-openscion-bfa691a-20261106T202008Z*` and `…T202658Z*`.
+
 ## Next
 
 1. **Clone one directory** (Git's level, not below): the ~60 sequential

@@ -57,6 +57,10 @@ the server behave at Anthropic's rate (30,000 merges a day, 0.35/s), its
   by up to 2× (the quiet-pull curve below is not monotonic for that
   reason). Read the curves for their shape and the order of magnitude.
 
+`scripts/bench-server.sh load` starts PostgreSQL and MinIO in Docker, a
+server per curve, and runs a reduced set of the points below
+(`OBJECTS=local` for objects in a local directory); by hand:
+
 ```sh
 veil-bench load --mode pull --server target/release/veil-server \
   --database-url postgres://… --db-container ID --projects 1 \
@@ -229,6 +233,47 @@ statement pays the distributed transaction path with none of the scale-out.
   the `--database-url` of its database (statement counts); the CPU
   columns need the processes on the tool's machine (`--server-pid`,
   `--db-container`), so on separate machines read CPU there.
+
+## Re-measured on `bfa691a`, with MinIO (2026-11-06)
+
+`scripts/bench-server.sh load` on `integration` @ **`bfa691a`**: the same
+tool and method, a reduced set of points (15 s each), each curve with its
+own fresh server; PostgreSQL 17 in Docker with `pg_stat_statements`; the
+server's objects in **MinIO** (S3, in Docker on the same machine) and, in
+a second session, in a local directory as above. The machine was heavily
+loaded by other agents' builds (load average 35–62 on 32 threads), so
+read the shape, not the last digit.
+
+| Run | Projects | Agents | Target (/s) | MinIO: done (/s) | p50 / p99 (ms) | Local: done (/s) | p50 / p99 (ms) | DB statements per op (MinIO / local) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| pulls, `main` moving 20/s | 1 | 10 | max | 8,704 | 0.9 / 8.0 | 9,314 | 0.9 / 7.2 | 7.0 / 6.9 |
+| pulls, `main` moving 20/s | 1 | 100 | max | 4,821 | 6.0 / 46.4 | 5,200 | 5.7 / 45.7 | 22.4 / 21.2 |
+| pulls, `main` moving 20/s | 1 | 1,000 | max | **2,267** | 414 / 568 | **2,066** | 409 / 832 | 46.1 / 47.0 |
+| landings | 1 | 1 | max | 86 | 9.9 / 39.4 | 42 | 23.7 / 61.8 | 34.0 / 34.0 |
+| landings | 10 | 10 | max | 459 | 18.4 / 74.7 | 481 | 14.8 / 76.1 | 34.0 / 34.0 |
+| landings | 100 | 100 | max | **376** | 259 / 523 | **1,051** | 91 / 183 | 34.1 / 34.0 |
+| landings, one `main` | 1 | 50 | 5 | 5.0 | 54 / 67 | 5.0 | 57 / 66 | 311 / 306 |
+| landings, one `main` | 1 | 50 | 20 | 20.0 | 45 / 86 | 19.9 | 67 / 212 | 376 / 400 |
+| landings, one `main` | 1 | 50 | 40 | 18.7 | 3,032 / 11,040 | 21.9 | 5,781 / 7,221 | 2,238 / 2,082 |
+
+- **Pulls:** about 2,100–2,300 pulls/s at 1,000 agents with `main`
+  moving, as before (target 1,000: **met**), with MinIO or without; a pull
+  costs 46–47 statements, unchanged.
+- **Landings across projects: 1,051/s with local objects, 376/s with
+  MinIO** (target 1,000: met with local objects, **not with MinIO** on
+  this machine). A landing writes its objects to the store; with MinIO each
+  is an HTTP PUT to a single MinIO container sharing the loaded machine,
+  and the server and database were mostly idle (1.0 and 1.2 cores): the
+  object store bounds it. Statements per landing are 34 (37 in round 2).
+- **One project's `main`** still saturates at about 20 landings/s with 50
+  agents (collisions, 28–31 per landing at a target of 40/s), as in round
+  2: phase 4's batched landing is the fix.
+- **BUG-861:** in a first MinIO run, 1,239 uploads at 100 projects failed
+  with HTTP 500; the server's log of the second run shows why: S3 requests
+  on connections MinIO had reset, which the server does not retry. The
+  run above had no errors.
+
+Raw results (not committed): `.scratch/bench-results/server-load-bfa691a-20261106T202331Z-*` (MinIO, with the server logs) and `…T202730Z-*` (local objects).
 
 ## What would raise each ceiling (not built)
 
