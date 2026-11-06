@@ -353,7 +353,7 @@ pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot:
                 w.id == root
             } else {
                 let (dir, name) = w.path.rsplit_once('/').unwrap_or(("", w.path.as_str()));
-                let tree = dir_tree(&mut pr, &mut dirs, root, dir)?.ok_or_else(gone)?;
+                let tree = dir_tree(&mut pr, &mut dirs, dir)?.ok_or_else(gone)?;
                 let e = tree.get(name).ok_or_else(gone)?;
                 e.id == w.id
                     || e.fallback == Some(w.id)
@@ -374,12 +374,12 @@ pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot:
 }
 
 /// The projected tree of directory `dir`, walking down from the root.
-fn dir_tree(pr: &mut Projector, dirs: &mut HashMap<String, Option<Arc<Tree>>>, root: ObjectId, dir: &str) -> Result<Option<Arc<Tree>>> {
+fn dir_tree(pr: &mut Projector, dirs: &mut HashMap<String, Option<Arc<Tree>>>, dir: &str) -> Result<Option<Arc<Tree>>> {
     if let Some(t) = dirs.get(dir) {
         return Ok(t.clone());
     }
     let (parent, name) = dir.rsplit_once('/').unwrap_or(("", dir));
-    let t = match dir_tree(pr, dirs, root, parent)? {
+    let t = match dir_tree(pr, dirs, parent)? {
         Some(pt) => match pt.get(name) {
             Some(e) if e.kind == EntryKind::Dir => pr.tree(&e.id)?,
             _ => None,
@@ -561,9 +561,13 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             .await?;
         rows.into_iter().filter_map(|(n, t)| ObjectId::from_hex(&t).ok().map(|t| (n, t))).collect()
     };
+    // Only the branches this push moves, and the default branch, are
+    // candidates.
     let mut tip_projection: HashMap<ObjectId, ObjectId> = HashMap::new();
-    for t in current.values() {
-        tip_projection.insert(projected(hub, project, viewer, *t).await?, *t);
+    for (name, t) in &current {
+        if *name == project.default_branch || req.updates.iter().any(|u| u.branch == *name) {
+            tip_projection.insert(projected(hub, project, viewer, *t).await?, *t);
+        }
     }
     let signers: HashSet<String> = sqlx::query_scalar::<_, String>("SELECT signing_key FROM devices WHERE removed_at IS NULL")
         .fetch_all(&hub.db)

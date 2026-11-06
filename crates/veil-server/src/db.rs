@@ -74,10 +74,15 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
             .await;
             match r {
                 Ok(()) => break,
-                // Another server applied it at the same time: look again.
-                Err(e) if attempt < 10 => {
-                    eprintln!("veil-server: migration {version} retrying: {e:?}");
-                    tokio::time::sleep(Duration::from_millis(100 * attempt)).await;
+                // Another server applied it at the same time (YugabyteDB
+                // reports the conflict, and cannot retry a multi-statement
+                // script itself): back off and look again.
+                Err(e) if attempt < 60 => {
+                    if attempt % 10 == 1 {
+                        eprintln!("veil-server: migration {version} retrying: {e:?}");
+                    }
+                    let jitter = u64::from(veil_core::crypto::random_bytes::<1>()[0]);
+                    tokio::time::sleep(Duration::from_millis((50 * attempt).min(1000) + jitter * 4)).await;
                 }
                 Err(Error::Db(e)) => return Err(e.into()),
                 Err(Error::Other(e)) => return Err(e),
@@ -121,7 +126,7 @@ where
             // (YugabyteDB reports conflicts as deadlocks or serialisation
             // failures) the losers spread out instead of colliding again.
             Err(e) if e.is_retryable() && attempt < MAX_ATTEMPTS => {
-                let cap = 5u64 << attempt.min(8);
+                let cap = 5u64 << attempt.min(6);
                 let jitter = u64::from(u16::from_le_bytes(veil_core::crypto::random_bytes::<2>()));
                 tokio::time::sleep(Duration::from_millis(cap / 2 + jitter % cap)).await;
             }

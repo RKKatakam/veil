@@ -1,0 +1,268 @@
+//! The OpenScion workloads, Veil's speed gates (`docs/OVERVIEW.md`, "Speed
+//! gates"): repositories of 4 KiB files (1,000 and 10,000), and four
+//! operations, each the median of `runs` separate processes, with Git on the
+//! same machine as the reference.
+//!
+//! | case | Veil | Git |
+//! |---|---|---|
+//! | import a directory (first snapshot) | `vl init` | `git init && git add -A && git commit` |
+//! | clone everything | `vl clone veil://…` (the server, PostgreSQL) | `git clone --no-local file://…` |
+//! | commit one changed file | `vl commit -m` | `git commit -qam` |
+//! | clone one directory | `vl clone veil://… --only DIR` | `git clone --filter=blob:none --sparse` + `sparse-checkout set DIR` |
+//!
+//! Files sit in directories of 100 (`d000/f000.txt` …), so "one directory"
+//! is 100 files at both sizes. The server is a release `veil-server`
+//! started here, on `127.0.0.1` over TLS, with a PostgreSQL the caller
+//! names and objects in a local directory.
+
+use std::{
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    time::{Duration, Instant},
+};
+
+use anyhow::{anyhow, bail, Context, Result};
+use serde_json::json;
+
+pub struct Args {
+    pub vl: PathBuf,
+    pub server: PathBuf,
+    pub database_url: String,
+    pub dir: PathBuf,
+    pub sizes: Vec<usize>,
+    pub runs: usize,
+}
+
+/// The targets (ms) by size: import, clone everything, commit one file,
+/// clone one directory.
+fn targets(files: usize) -> [f64; 4] {
+    match files {
+        1_000 => [22.0, 51.0, 2.5, 6.1],
+        10_000 => [245.0, 544.0, 22.0, 25.0],
+        _ => [f64::NAN; 4],
+    }
+}
+
+fn time(cmd: &mut Command) -> Result<f64> {
+    let t = Instant::now();
+    let out = cmd.stdout(Stdio::null()).stderr(Stdio::piped()).output()?;
+    let ms = t.elapsed().as_secs_f64() * 1000.0;
+    if !out.status.success() {
+        bail!("{cmd:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(ms)
+}
+
+fn run(cmd: &mut Command) -> Result<()> {
+    time(cmd).map(|_| ())
+}
+
+fn median(mut v: Vec<f64>) -> f64 {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v[v.len() / 2]
+}
+
+/// A repository of `files` 4 KiB files in directories of 100.
+fn generate(dir: &Path, files: usize, seed: u64) -> Result<()> {
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    for i in 0..files {
+        let d = dir.join(format!("d{:03}", i / 100));
+        if i % 100 == 0 {
+            std::fs::create_dir_all(&d)?;
+        }
+        let mut body = String::with_capacity(4096);
+        while body.len() < 4096 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            body.push_str(&format!("{:016x} ", x));
+        }
+        body.truncate(4095);
+        body.push('\n');
+        std::fs::write(d.join(format!("f{:03}.txt", i % 100)), body)?;
+    }
+    Ok(())
+}
+
+struct Server {
+    child: Child,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn start_server(a: &Args, data: &Path, port: u16) -> Result<Server> {
+    let child = Command::new(&a.server)
+        .args(["--listen", &format!("127.0.0.1:{port}"), "--data"])
+        .arg(data)
+        .args(["--database-url", &a.database_url])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("starting veil-server")?;
+    let s = Server { child };
+    let cert = data.join("self-signed-cert.pem");
+    for _ in 0..200 {
+        if cert.exists() && std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return Ok(s);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    bail!("veil-server did not start")
+}
+
+fn free_port() -> Result<u16> {
+    Ok(std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
+}
+
+pub fn run_all(a: &Args) -> Result<serde_json::Value> {
+    std::fs::create_dir_all(&a.dir)?;
+    let home = a.dir.join("home");
+    let vl = |cwd: &Path| {
+        let mut c = Command::new(&a.vl);
+        c.current_dir(cwd).env("VEIL_HOME", &home).env("NO_COLOR", "1");
+        c
+    };
+    let git = |cwd: &Path| {
+        let mut c = Command::new("git");
+        c.current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "bench")
+            .env("GIT_AUTHOR_EMAIL", "bench@example.com")
+            .env("GIT_COMMITTER_NAME", "bench")
+            .env("GIT_COMMITTER_EMAIL", "bench@example.com")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &a.dir);
+        c
+    };
+    let port = free_port()?;
+    let data = a.dir.join("server");
+    let _server = start_server(a, &data, port)?;
+    let hub = format!("veil://127.0.0.1:{port}");
+    run(vl(&a.dir).args(["login", &hub, "--name", &format!("bench{port}"), "--ca"]).arg(data.join("self-signed-cert.pem")))?;
+    let mut cases = Vec::new();
+    for &files in &a.sizes {
+        let name = format!("os{files}-{port}");
+        let src = a.dir.join(format!("src-{files}"));
+        generate(&src, files, files as u64)?;
+        let mut veil = [vec![], vec![], vec![], vec![]];
+        let mut gits = [vec![], vec![], vec![], vec![]];
+        // Import: a fresh copy each run.
+        for r in 0..a.runs {
+            let d = a.dir.join(format!("imp-{files}-{r}"));
+            copy_dir(&src, &d)?;
+            veil[0].push(time(vl(&d).arg("init"))?);
+            let g = a.dir.join(format!("gimp-{files}-{r}"));
+            copy_dir(&src, &g)?;
+            let t = Instant::now();
+            run(git(&g).args(["init", "-q"]))?;
+            run(git(&g).args(["add", "-A"]))?;
+            run(git(&g).args(["commit", "-qm", "import"]))?;
+            gits[0].push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        // The project on the server, and the Git origin.
+        let proj = a.dir.join(format!("imp-{files}-0"));
+        run(vl(&proj).args(["remote", "add", "origin", &format!("{hub}/{name}")]))?;
+        run(vl(&proj).args(["commit", "-m", "import"]))?;
+        run(vl(&proj).args(["tag", "set", "main", "-r", "@-"]))?;
+        run(vl(&proj).args(["push"]))?;
+        let gorigin = a.dir.join(format!("gimp-{files}-0"));
+        run(git(&gorigin).args(["config", "uploadpack.allowFilter", "true"]))?;
+        // Commit one changed file.
+        for r in 0..a.runs {
+            std::fs::write(proj.join("d001/f001.txt"), format!("change {r}\n"))?;
+            veil[2].push(time(vl(&proj).args(["commit", "-m", &format!("one file {r}")]))?);
+            std::fs::write(gorigin.join("d001/f001.txt"), format!("change {r}\n"))?;
+            gits[2].push(time(git(&gorigin).args(["commit", "-qam", &format!("one file {r}")]))?);
+        }
+        // Clone everything, and one directory.
+        for r in 0..a.runs {
+            let d = a.dir.join(format!("clone-{files}-{r}"));
+            veil[1].push(time(vl(&a.dir).args(["clone", &format!("{hub}/{name}")]).arg(&d))?);
+            let d = a.dir.join(format!("only-{files}-{r}"));
+            veil[3].push(time(vl(&a.dir).args(["clone", &format!("{hub}/{name}")]).arg(&d).args(["--only", "d005"]))?);
+            let g = a.dir.join(format!("gclone-{files}-{r}"));
+            gits[1].push(time(git(&a.dir).args(["clone", "-q", "--no-local", &format!("file://{}", gorigin.display())]).arg(&g))?);
+            let g = a.dir.join(format!("gonly-{files}-{r}"));
+            let t = Instant::now();
+            run(git(&a.dir)
+                .args(["clone", "-q", "--filter=blob:none", "--sparse", "--no-local", &format!("file://{}", gorigin.display())])
+                .arg(&g))?;
+            run(git(&g).args(["sparse-checkout", "set", "d005"]))?;
+            gits[3].push(t.elapsed().as_secs_f64() * 1000.0);
+            let files_out = count_files(&a.dir.join(format!("only-{files}-{r}")))?;
+            if files_out != 100 {
+                bail!("vl clone --only wrote {files_out} files, not 100");
+            }
+        }
+        let t = targets(files);
+        for (i, case) in ["import a directory", "clone everything (server)", "commit one changed file", "clone one directory (server)"]
+            .iter()
+            .enumerate()
+        {
+            let v = median(veil[i].clone());
+            let g = median(gits[i].clone());
+            cases.push(json!({
+                "files": files, "case": case, "veil_ms": v, "git_ms": g, "target_ms": t[i],
+                "meets_target": v <= t[i], "beats_git": v <= g, "runs": a.runs,
+            }));
+        }
+    }
+    Ok(json!({ "profile": "openscion", "cases": cases }))
+}
+
+fn count_files(dir: &Path) -> Result<usize> {
+    let mut n = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d)? {
+            let e = e?;
+            if e.file_name() == ".veil" || e.file_name() == ".veilpolicy" {
+                continue;
+            }
+            if e.file_type()?.is_dir() {
+                stack.push(e.path());
+            } else {
+                n += 1;
+            }
+        }
+    }
+    Ok(n)
+}
+
+fn copy_dir(from: &Path, to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to)?;
+    for e in std::fs::read_dir(from)? {
+        let e = e?;
+        let t = to.join(e.file_name());
+        if e.file_type()?.is_dir() {
+            copy_dir(&e.path(), &t)?;
+        } else {
+            std::fs::copy(e.path(), &t)?;
+        }
+    }
+    Ok(())
+}
+
+/// The results as a Markdown table.
+pub fn markdown(v: &serde_json::Value) -> Result<String> {
+    let mut out = String::from(
+        "| Files | Workload | Veil (ms) | Git (ms) | Target (ms) | Meets target | Beats Git |\n|---:|---|---:|---:|---:|---|---|\n",
+    );
+    for c in v["cases"].as_array().ok_or_else(|| anyhow!("no cases"))? {
+        out.push_str(&format!(
+            "| {} | {} | {:.1} | {:.1} | {} | {} | {} |\n",
+            c["files"],
+            c["case"].as_str().unwrap_or(""),
+            c["veil_ms"].as_f64().unwrap_or(f64::NAN),
+            c["git_ms"].as_f64().unwrap_or(f64::NAN),
+            c["target_ms"],
+            if c["meets_target"] == json!(true) { "yes" } else { "no" },
+            if c["beats_git"] == json!(true) { "yes" } else { "no" },
+        ));
+    }
+    Ok(out)
+}

@@ -2,11 +2,14 @@
 
 > **Sources of truth:** `docs/OVERVIEW.md` (what Veil is) and `docs/VISIBILITY.md` (who can see what). This document is how the server implements them. Where it disagrees with either, they win.
 
-Status: **design. Nothing here is built yet.** The Hub is built **next**,
-together with the permission model (OVERVIEW.md, "What exists today, and
-what's next"). Statements about what Veil does today cite the document or
-source file they come from; everything else is a proposal and is worded as
-one.
+Status: **milestone S1 is built** (`crates/veil-server`, the `vl` client
+commands, 2026-11-06): the server core, sign-in, the permission model,
+sync with fetch on demand, enforcement and secrets sealed on the device.
+**§13 records what was built and every decision S1 made**; where §1–§12
+propose something §13 decided otherwise, §13 is what runs. Later
+milestones are in §13.9. Statements about what Veil does today cite the
+document or source file they come from; everything else is a proposal and
+is worded as one.
 
 Contents:
 
@@ -22,6 +25,7 @@ Contents:
 10. [The web client](#10-the-web-client)
 11. [Build order](#11-build-order)
 12. [Open questions and risks](#12-open-questions-and-risks)
+13. [As built: milestone S1](#13-as-built-milestone-s1)
 
 ---
 
@@ -809,3 +813,290 @@ inside a snapshot are claims, never authority.
 | **One access check, missed somewhere:** a search count, a notification or an agent API that leaks a name | One function for every read (§4.6); tests that compare every endpoint's answer for people with and without access |
 | **Validation divergence:** server and client disagree on what is valid | One validation library used by both (§4.5) |
 | **Rotation not done:** a removed person keeps working secret values | The rotation list on removal (§5.6); reminders until each is marked changed |
+
+---
+
+## 13. As built: milestone S1
+
+Built on `integration` @ `cbfe9ee` (2026-11-06). Code: `crates/veil-server`
+(the server), `crates/veil-core/src/hub/` (the permission model and wire
+protocol as pure functions, shared with `vl`; they build for WASM),
+`crates/vl/src/hub.rs` and `hub_cmd.rs` (the client).
+
+### 13.1 Components
+
+| Part | Built with | Notes |
+|---|---|---|
+| HTTPS API | tokio, axum, hyper, rustls (ring) | TLS on every connection; `--tls-cert/--tls-key`, or a self-signed certificate (rcgen) for `localhost`/`127.0.0.1` created in the data directory, which `vl login --ca FILE` pins for that server |
+| Metadata | sqlx, PostgreSQL 17 (development, CI) and YugabyteDB 2025.2 | portable SQL only; every read-write transaction is SERIALIZABLE through `db::serializable`, retried with capped exponential backoff on `40001`/`40P01` (YugabyteDB reports conflicts as both) |
+| Migrations | `db::migrate`, `migrations/0001_initial.sql` | each in its own transaction, recorded in `schema_migrations`; servers starting together race on its primary key and the loser re-checks. On PostgreSQL DDL is transactional; on YugabyteDB DDL inside a transaction block is applied statement by statement unless transactional DDL is enabled, so **migration files are idempotent** (`IF NOT EXISTS`) and a half-applied one is completed by the next start |
+| Object storage | `store::BlobStore`: `FsStore` (a directory; unit tests, development) and `S3Store` (rusty-s3 request signing + reqwest; tested against MinIO) | key `p/<project id>/ab/cdef…`: projects never share an object; every read is re-hashed against its id; an in-memory cache of objects and decoded trees |
+| Server identity | an Ed25519 `Identity` in `<data>/hub-identity.json` (0600) | signs projected snapshots (§13.4); its key is shown by `vl login` |
+
+**YugabyteDB's licence (checked 2026-11-06).** The `LICENSE.md` shipped in
+the official image `yugabytedb/yugabyte:2025.2.8.1-b8` (`/licenses/`) and
+the repository say: the **database core** (`src/yb`, `src/postgres`, the
+client libraries and tools) is **Apache-2.0**; **YugabyteDB Anywhere**
+(`managed/`, the management platform, and `troubleshoot/`) is under the
+**Polyform Free Trial License 1.0.0** (32 days' evaluation). The
+`yugabytedb/yugabyte` image and the download at download.yugabyte.com are
+the Apache-2.0 core; Veil uses only that, never YugabyteDB Anywhere or a
+`-managed` build.
+
+**MinIO** no longer publishes images on Docker Hub or anonymously on
+quay.io; the tests use the MinIO server binary packaged as
+`bitnamilegacy/minio`. Any S3-compatible store works.
+
+### 13.2 Sign-in (§4.3, decided)
+
+* `POST /v1/auth/challenge {key}` returns 32 random bytes, valid 60 s,
+  stored with the key.
+* `POST /v1/auth/login` carries the key, the challenge, the server's name
+  as dialled (`host:port`), an Ed25519 signature under the new context
+  `hub-login` (`crypto/domains.rs`) over `hub ‖ 0 ‖ challenge`, and the
+  device's full public identity (`veil1<x25519><ed25519><binding>`).
+  * The challenge is deleted in the statement that checks it: **a replayed
+    login finds nothing.**
+  * `hub` must equal the request's `Host`: a signature a client made for
+    another server (one relaying our challenges) is refused.
+  * The identity's Ed25519 part must be the key, with a valid binding: a
+    device cannot register someone else's X25519 key.
+* An unknown key with `name` registers a new person (names are unique,
+  lowercase, never a tier word); without `name` it is refused.
+* The **session token** is 32 random bytes; the database keeps only its
+  BLAKE3 hash, the device and an expiry (`--session-seconds`, 12 h). A
+  bad or expired token is **401, never downgraded to anyone-on-Earth**;
+  `vl` then signs in again with the device key, without asking.
+* Per-request signatures (§4.3) are not built: TLS plus short sessions
+  bound to a device cover S1.
+
+### 13.3 The permission model on the server (§5, decided)
+
+* **Records:** people, devices, projects, project admins, groups, members,
+  managers, branches, committed snapshots, projections, origins, key
+  rings, an audit log (`migrations/0001_initial.sql`).
+* **Access lines** (`veil_core::hub::access`): a line of `.veilpolicy` whose
+  fields after the path are `public` and/or group or person names
+  (`billing/  finance`, `src/  public devs`). Decided for S1:
+  * paths are **literal folders or files, from the project root**; a line
+    with glob syntax grants nothing on the server (the push says so);
+  * **the last matching line decides**; a path no line matches is private
+    (admins only), and so is the project root;
+  * **folder access is read and write**; `public` is read-only for everyone
+    (writing a public folder needs a named group or person);
+  * on the device an access line is a plain-text rule like `public`: it
+    never seals and never weakens a secret's protection.
+* **The authority is the accepted policy**: the `.veilpolicy` of the
+  project's default branch (`main`), as last accepted from an **admin's**
+  push, plus the server's own records. Labels inside snapshots are never
+  consulted, and a permissive `.veilpolicy` on another branch grants
+  nothing.
+* **Names are bound when a policy is accepted**, and stored with it: a
+  name binds to the project's group of that name if one exists (**a group
+  always wins**), else to the person of that name, else the push is
+  refused. A person who signs up under a group's name takes over nothing;
+  a group deleted later grants nothing. The admin's push lists every
+  binding and every public line ("access accepted: billing/ → group
+  finance"), so nothing becomes public or shared silently.
+* **Who may do what** (`api.rs`, `sync.rs`):
+
+  | Action | Who |
+  |---|---|
+  | create a project | anyone signed in (`vl push` to a new project creates it; they are its admin) |
+  | read a path | admins; groups and people its deciding line names; anyone if `public` |
+  | write a path | admins; groups and people its deciding line names |
+  | change access lines (on any branch), make public | admins |
+  | create or delete groups, choose managers | admins |
+  | add or remove a group's people | admins and that group's managers; **a manager never adds themselves** |
+  | upload objects, push, read key rings | participants: admins, group members, people named on a rule |
+  | force a branch move, delete a branch | admins |
+
+* **Every check is on the server, on every request**; removing someone
+  takes effect on their next request.
+
+### 13.4 History for someone without access: projected history (§5.4, §12.1 Q1, decided)
+
+For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
+
+* `P(S).tree`: `S.tree` with every entry `v` may not read left out, names
+  included (`hub::project::Projector`). Because access lines name literal
+  paths, a subtree with no rule below it is kept by id (no walk) or
+  dropped whole; only directories holding a rule are rewritten. Empty
+  directories are dropped.
+* `P(S).parents`: the projections of `S.parents`, duplicates removed;
+  `conflicts` keeps only paths `v` may read.
+* **A change that touched only what `v` cannot see is not in `v`'s history
+  at all**: `P(S) = P(parent)`, and its description never reaches `v`. A
+  change that touched both appears with only `v`'s part, **with its
+  description** (as one commit, its message describes the whole change;
+  write descriptions accordingly).
+* **Signatures still verify.** If `P(S)` equals `S` field for field, `v`
+  gets `S` with its author's signature. If `S` was completed by the server
+  from a pusher's own snapshot `N` (below) and `P(S)` equals `N`, `v` gets
+  `N`, again with its author's signature. Otherwise `P(S)` is a new
+  snapshot **signed by the server's key** (`vl log` shows it as
+  `?signer`). The server is trusted with code (§3.1), so its signature on
+  a projection is within the trust boundary. Projections are deterministic
+  (Ed25519 signatures are), memoised per view key (a hash of what the
+  viewer may read), and identical for viewers who read the same paths.
+* **Pushing from a projection (the graft).** A pusher's snapshot `N` has
+  their projected tree. The server rebuilds the full tree
+  (`hub::project::Graft`): unchanged subtrees keep the real ones, hidden
+  entries come from the real first parent, and every changed path is
+  checked. It stores the full snapshot (its own signature) and records `N`
+  as its origin, so the pusher (and anyone who sees the same) gets `N` back
+  with their own signature. A merge whose parents differ in what the
+  pusher cannot see is refused ("ask someone with access to merge it");
+  server-side merges are a later milestone.
+* **Old history follows today's policy**: making a folder public shows its
+  history; removing someone's access hides it from their next request.
+  Their projected history may then change ids where it touched folders
+  whose access changed (like a rewrite); their own unchanged work keeps
+  its ids.
+
+### 13.5 Sync (§4, as built)
+
+| Route | |
+|---|---|
+| `GET /v1/projects/{p}/tips` | branches → tips as the caller sees them (projections) |
+| `POST …/history {tips, stop}` | the caller's projected snapshots from `tips` down to `stop`, as object frames (`id ‖ len u32be ‖ object`) |
+| `POST …/fetch {snapshot, objects: [{path, id}]}` | objects by id, each with the path where the client met it under that snapshot; the server walks the viewer's projection to that path and serves the object only if it is there. No list of what the client has; each request names an immutable object, so a per-viewer cache can serve it |
+| `POST …/objects` | upload object frames: re-hashed, canonically decoded, format-checked, stored; invisible until a push reaches them |
+| `POST …/push {updates: [{branch, expected, new}], force}` | complete and check every new snapshot, then move the branches in **one serialisable transaction of compare-and-swaps** (`UPDATE branches SET target = new WHERE … AND target = expected`); one lost race rejects the whole push with 409 and `vl` retries |
+| `GET …/access?path=` | the deciding line and who it names; only for a path the caller may read |
+| `…/groups`, `…/rings/{scope}`, `GET /v1/people/{name}/devices` | groups; key rings of secret scopes; a person's device identities (for an admin's device to wrap keys to) |
+
+* **Fetch on demand (Scion):** `vl` asks for the tips, the snapshots it
+  lacks, then trees from the root down and the files it needs, one request
+  per tree level, skipping what it already has. `vl clone URL --only DIR`
+  fetches the root, the trees on the way to `DIR`, and `DIR`'s subtree
+  only; it checks out `DIR` and records the rest as never materialised, so
+  every snapshot keeps it unchanged. **S1 limit:** moving such a clone to
+  a revision that changed folders outside `DIR` needs the full fetch on
+  demand of milestone S3.
+* **Push validation** (§4.5): checks 1 (participant), 2 (write access per
+  changed path; a merge may take a path unchanged from another parent),
+  3 (access lines), 4–6 (hash, canonical decoding, format), 7 (closure:
+  every changed object must be uploaded or stored), 8 (§13.6), 10 (every
+  new snapshot signed by a registered device key) and 12 (fast-forward
+  unless an admin forces) are built. Cloaked lines and embargoed content
+  are refused in S1. Not built: 9 (the server-side secret scan), 11, 13.
+* **The default branch's move accepts its policy** in the same
+  transaction, admins only.
+* **Objects first, then the branch move:** a crash leaves only
+  unreferenced objects.
+
+### 13.6 Secrets (§6): the server is trusted with code, never with secrets
+
+* **New repositories seal shared secrets and sync them:** `vl init` writes
+  `.veilpolicy` lines that cloak `.env`, `.env.*`, `.envrc` and Terraform
+  state under the `team` scope (`policy::SYNCED_SECRETS_POLICY`). They are
+  encrypted on the device with the existing sealing (AES-SIV envelopes,
+  CRYPTO.md) and decrypted only on devices holding the key.
+* **Personal keys and credentials stay on the device** (`id_rsa`,
+  `id_ed25519`, `*.pem`, `*.key`, `.netrc`, …: the other built-in secret
+  rules). The server refuses `id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519`
+  even sealed, refuses a path its policy keeps on the device, and refuses
+  a secret that arrives in plain text.
+* **Existing repositories switch only through `vl upgrade
+  --sync-secrets`**, which lists the files that would start syncing
+  (`--dry-run` lists only).
+* **Key rings are for secrets (and embargoes) only.** Group membership and
+  folder access for code are plain server records: no rings, no keys.
+  Secret keys stay in the existing signed rings **because the server must
+  not be able to hand out secrets**: a compromised server could add an
+  attacker's device to a group, and a member's device would then wrap the
+  key for it. So:
+  * **granting secret access is an admin-signed ring change**: when an
+    admin runs `vl group add`, their `vl` grants the secret scopes (those
+    the project's `cloak` lines name) to every registered device of the
+    people added, signed by the admin's device, and sends the ring;
+  * a manager's (or a compromised server's) group change gives folder
+    access but **no key**: the secret stays closed until a ring admin
+    signs (`vl group add` says so);
+  * removing someone from their last group **rotates** the key away from
+    their devices (as `vl scope revoke` does).
+  * The server stores rings, verifies each change with the engine's own
+    replay (`Keychain::merge_ring`) and keeps the longest log that
+    verifies; it cannot open them and is not their authority.
+* **S1 limit: one key for every secret.** All sealed secrets use the
+  `team` key, so someone granted it for one folder could open another
+  folder's secret *if* they received its ciphertext, which the server
+  never sends them without folder access (a compromised server could).
+  Per-rule keys (below) close this.
+
+**S2 plan: keys per access rule, wrapped in the background.**
+1. Each access line that covers a secret gets its own scope
+   (`rule-<hash of the path>`), and the builder seals a shared secret under
+   the scope of the line that decides its path (this needs a new
+   classification input, the accepted access lines; FORMAT.md entry for the
+   scope name).
+2. When an admin adds someone to a group, the server queues "wrap the
+   scopes of the rules naming this group for these devices". **The next
+   online device of a ring admin** (or of a member holding the key) checks
+   the request against an **admin-signed membership statement**, never
+   against the server's group list alone: the admin's `vl group add` signs
+   `(project, group, person, device keys, time)` with the admin's device
+   key, the server stores it, and the wrapping device verifies the
+   signature, that the signer is a current ring admin, and that the device
+   keys are bound to the person (§6.3, §12.2).
+3. A new device of an existing member is wrapped the same way, on a
+   statement signed by one of the person's existing devices.
+4. Removal rotates every scope the person could open and lists the
+   secrets to change (§6.4).
+
+### 13.7 Concurrency
+
+* Branch moves are one conditional `UPDATE` per branch inside one
+  serialisable transaction; `server_hub` checks no update is lost with 12
+  concurrent pushers × 6 pushes (with server-side grafts), that exactly
+  one of 12 racing branch creations wins, and that separate branches never
+  wait on each other, on PostgreSQL and on YugabyteDB, and under load
+  (`scripts/verify-server.sh` runs 8 copies at once on PostgreSQL, 3 on
+  YugabyteDB).
+
+### 13.8 Known limits of S1 (deliberate)
+
+* **Branch names** are visible to everyone who may read anything in the
+  project (branch rules, §7.4, decide later who sees which branch).
+* **Existence by probing:** a writer refused at a path learns that a rule
+  restricts it (they must guess the name). Errors never name anything the
+  caller did not send.
+* **Descriptions** of changes that touched both visible and hidden paths
+  are shown with the visible part (§13.4).
+* **One secret key** per project (§13.6).
+* **Embargoes and cloaked lines** cannot be pushed to the server yet.
+* **`--only` clones** cannot move to revisions that changed folders outside
+  their directory (§13.5).
+* **Moving a repository with history onto the server** works by pushing it;
+  its first accepted policy is listed back to the admin (§13.3). Every
+  pushed snapshot must be signed by a device registered on the server, so
+  history signed by teammates who have not signed in yet is refused until
+  they do.
+* The team vault (`vl secret --scope`) does not sync through the server.
+
+### 13.9 Later milestones (not in S1)
+
+1. **S2: secrets at scale** — keys per access rule and background wrapping
+   for new members and devices (§13.6), device removal.
+2. **S3: fetch on demand in the client** — the partial-clone design
+   (`docs/design/scale/6-partial-clone.md`): bounded cache, objects fetched
+   when read, `vl ws mount` over the server; layered caches (per-machine
+   daemon, regional caches) serving objects only after the server's check.
+3. **The PR and review service** (§7), hidden PRs.
+4. **Server-side merges and batched landings** (§9.1), with the gates of
+   §9.2.
+5. **Precomputed history and search APIs** (blame, file history, graph,
+   search through the API).
+6. **The embargo release service** (deadline worker, escrow, §8.2) and
+   embargoes through the server.
+7. **The web client** (§10).
+8. **The simplification pass:** remove SFTP and path remotes, offline
+   assumptions, cloak/scope jargon (OVERVIEW.md).
+
+### 13.10 Speed (the OpenScion gates, first measurement)
+
+`veil-bench openscion` (`crates/veil-bench/src/openscion.rs`) measures the
+four OpenScion workloads with release builds, the server on `127.0.0.1`
+over TLS with PostgreSQL in Docker, and Git on the same machine as the
+reference. Results are in `docs/design/scale/OPENSCION.md`.

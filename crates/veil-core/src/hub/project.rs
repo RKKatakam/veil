@@ -536,7 +536,9 @@ mod tests {
         assert_eq!(pr.tree(&r).unwrap().unwrap().entries.len(), 0);
     }
 
-    fn graft_of(m: &Mem, view: &View, real: ObjectId, pushed_files: &[(&str, &str)]) -> Result<(ObjectId, Vec<Change>, HashMap<ObjectId, Vec<u8>>)> {
+    type Grafted = (ObjectId, Vec<Change>, HashMap<ObjectId, Vec<u8>>);
+
+    fn graft_of(m: &Mem, view: &View, real: ObjectId, pushed_files: &[(&str, &str)]) -> Result<Grafted> {
         let pushed = m.build(pushed_files);
         let mut g = Graft::new(m, view);
         let id = g.root(pushed, Some(real))?;
@@ -684,7 +686,7 @@ mod tests {
                 prop_assert_eq!(g.root(proj, Some(real)).unwrap(), real);
                 // Edit every file they may write; the graft keeps the rest.
                 let mut mine: Vec<(String, String)> = Vec::new();
-                for (k, _) in &seen {
+                for k in seen.keys() {
                     if view.write(k) {
                         mine.push((k.clone(), edit.clone()));
                     } else {

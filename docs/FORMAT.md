@@ -45,7 +45,7 @@ not be understood.
 
 | Path / structure | Encoding | Version | Synced? | Notes |
 |---|---|---|---|---|
-| `.veil/repo.json` | pretty JSON `{format, repo_id, remotes, min_vl?}` | `format` | no | written last by `init`, rewritten atomically by `upgrade` (commit point) |
+| `.veil/repo.json` | pretty JSON `{format, repo_id, remotes, min_vl?}` | `format` | no | written last by `init`, rewritten atomically by `upgrade` (commit point). A remote may be a Veil server (`veil://host[:port]/project` or `https://…`); a server remote cloned with `--only DIR` has `"only": "DIR"` (absent otherwise, so earlier files keep their bytes; an older vl ignores the field and cannot use a server remote) |
 | objects (§3) | `tag ‖ payload`, id = BLAKE3 | tag + encoding byte | yes | loose: `.veil/objects/ab/cdef…` (the canonical bytes) |
 | — blob | `veil:blob\n` ‖ bytes | none needed: any bytes are valid | yes | a new blob encoding would be a new tag |
 | — tree | `veil:tree\n` ‖ `{` JSON (v1) or `0x02` binary (v2) | encoding byte | yes | §3 |
@@ -94,8 +94,10 @@ not be understood.
 | gc keep markers `.veil/objects/gc/keep/<id>` | empty files | none | no | |
 | upgrade journal `.veil/upgrade.json` | pretty JSON `{from, to, started, done[]}` | — | no | present only during `vl upgrade` |
 | public identity (what `vl identity show` prints and `vl scope grant` takes) | `veil1` ‖ hex(X25519 32) ‖ hex(Ed25519 32) ‖ hex(binding 64); the short `veil1` ‖ hex(X25519) is a member id; the earlier `veil1` ‖ hex(X25519) ‖ hex(Ed25519) still parses, but a grant refuses it | length | no (pasted between people) | the binding is deterministic, so the string never changes |
+| server sessions `$VEIL_HOME/hub.json` | JSON `{servers: {"host:port": {ca?, token?, expires_at, person?, hub_key?}}}`, mode 0600 | none | no (device-local) | written by `vl login` and when a session is renewed; `ca` is a self-signed server's certificate (PEM) given to `vl login --ca` |
+| server metadata (`veil-server`) | PostgreSQL/YugabyteDB schema, `crates/veil-server/migrations/` | `schema_migrations.version` (1) | no | migrations are applied in order, never edited once shipped; the object store holds plain Veil objects under `p/<project>/ab/cdef…` |
 | identity `$VEIL_HOME/identity.json`, `retired/` | legacy JSON `{name, public, secret, signing?}` (signing key derived); format 2 `{format: 2, name, public, signing, encryption_secret, signing_secret}` (independent keys) | `format` (absent = legacy) | no | outside the repository; new identities are format 2 whatever the repository format; format 2 has no `secret` so older vl refuse it; readers reject `format > 2` |
-| `.veilpolicy` | text, one rule per line | grammar is fail-safe: unknown tiers isolate | yes (it is a tracked file) | |
+| `.veilpolicy` | text, one rule per line | grammar is fail-safe: unknown tiers isolate | yes (it is a tracked file) | **access lines** (the Veil server, S1): a line whose fields after the pattern are all `public` or group/person names (lowercase letters, digits, `-`, `_`, `.`; never a tier word) is an access line, a plain `public` rule on the device. Older vl read such a line as an unknown tier and isolate its pattern: fail-safe, never a leak. New repositories get `cloak team` lines for shared secrets (`vl init`; `vl upgrade --sync-secrets` adds them) |
 
 Signed bodies have their own fixed encodings and must never change: the ring
 change body (`RingChange::signing_body`), the embargo body

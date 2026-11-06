@@ -341,11 +341,10 @@ pub fn access(ctx: &mut Ctx, path: &str, who: &[String]) -> Result<()> {
     let mut replaced = false;
     for l in lines.iter_mut() {
         let f = split_fields(l);
-        if veil_core::policy::is_access_line(&f) || (f.len() == 2 && (f[1] == "public" || f[1] == "public!")) {
-            if veil_core::hub::access::normalize_access_path(&f[0]).ok().as_deref() == Some(norm.as_str()) && !replaced {
-                *l = new_line.clone();
-                replaced = true;
-            }
+        let access = veil_core::policy::is_access_line(&f) || (f.len() == 2 && (f[1] == "public" || f[1] == "public!"));
+        if access && !replaced && veil_core::hub::access::normalize_access_path(&f[0]).ok().as_deref() == Some(norm.as_str()) {
+            *l = new_line.clone();
+            replaced = true;
         }
     }
     if !replaced {

@@ -3280,7 +3280,7 @@ pub fn apply_remote_tags(
         .filter(|(_, t)| incoming.contains(&t.target))
         .map(|(n, t)| (n.clone(), t.target))
         .collect();
-    let (stay_deleted, recreated) = tags_staying_deleted(&tx, &usable)?;
+    let (stay_deleted, recreated) = tags_staying_deleted(tx, &usable)?;
     for name in recreated {
         report.warnings.push(format!(
             "tag '{name}', deleted here, has moved on {remote_name} to work you had not seen: it is back. \
