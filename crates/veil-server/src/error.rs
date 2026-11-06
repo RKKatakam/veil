@@ -93,6 +93,11 @@ impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let (status, code, message) = match self {
             Error::Api { status, code, message } => (status, code, message),
+            // Every connection busy: the caller may try again.
+            Error::Db(sqlx::Error::PoolTimedOut) => {
+                eprintln!("veil-server: no database connection free");
+                return Error::busy().into_response();
+            }
             // Internal details go to the server's log, not to the caller.
             Error::Db(e) => {
                 let code = e.as_database_error().and_then(|d| d.code().map(|c| c.into_owned())).unwrap_or_default();

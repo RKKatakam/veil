@@ -34,7 +34,9 @@ trap cleanup EXIT
 port() { D port "$1" "$2" | head -1 | sed 's/.*://'; }
 
 echo "== starting containers"
-D run -d --name "$PG" -e POSTGRES_PASSWORD=veil -e POSTGRES_USER=veil -e POSTGRES_DB=veil -p 127.0.0.1::5432 "$PG_IMAGE" >/dev/null || exit 1
+# The load step runs 8 copies of the concurrency tests, each with its own
+# servers and connection pools: more than PostgreSQL's default 100 clients.
+D run -d --name "$PG" -e POSTGRES_PASSWORD=veil -e POSTGRES_USER=veil -e POSTGRES_DB=veil -p 127.0.0.1::5432 "$PG_IMAGE" -c max_connections=500 >/dev/null || exit 1
 D run -d --name "$S3" -e MINIO_ROOT_USER=veilminio -e MINIO_ROOT_PASSWORD=veilminio-secret -p 127.0.0.1::9000 "$S3_IMAGE" >/dev/null || exit 1
 D run -d --name "$YB" -p 127.0.0.1::5433 "$YB_IMAGE" bin/yugabyted start --background=false >/dev/null || exit 1
 PG_PORT=$(port "$PG" 5432) S3_PORT=$(port "$S3" 9000) YB_PORT=$(port "$YB" 5433)
