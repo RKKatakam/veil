@@ -168,7 +168,11 @@ mod tests {
         let unique: std::collections::BTreeSet<&str> = all.iter().copied().collect();
         assert_eq!(unique.len(), all.len(), "duplicate domain-separation string");
         // Contexts added after the first seven are pinned on their own.
-        assert_eq!(BLAKE3_CONTEXTS[7..], ["veil 2026 team-vault history v1"], "a context changed or was reordered");
+        assert_eq!(
+            BLAKE3_CONTEXTS[7..],
+            ["veil 2026 team-vault history v1", "veil 2026 hub view-key v1"],
+            "a context changed or was reordered"
+        );
         let mut all: Vec<&str> = BLAKE3_CONTEXTS[..7].to_vec();
         all.extend([AES_SIV_SUBKEY, HPKE_KEY_WRAP_INFO]);
         // Pinned: these strings are part of data already on disk.
@@ -188,7 +192,7 @@ mod tests {
             "028e842fb2475981",
             "a signature context changed; that breaks existing signatures. Add a new constant instead."
         );
-        assert_eq!(SIG_CONTEXTS[5..], ["vault-entry", "tag"], "a signature context changed or was reordered");
+        assert_eq!(SIG_CONTEXTS[5..], ["vault-entry", "tag", "hub-login"], "a signature context changed or was reordered");
         let labels = [
             WRAP_LABEL_PREFIX,
             PREV_KEY_LABEL_PREFIX,

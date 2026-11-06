@@ -204,7 +204,7 @@ fn an_old_stale_lock_is_recovered_automatically() {
 
 fn sandbox_project(env: &Env) -> std::path::PathBuf {
     let proj = env.project("alice", "proj", &[("app.py", "print('hi')\n")]);
-    write(&proj, ".env", "API_TOKEN=super-secret-isolated-value\n");
+    write(&proj, ".netrc", "API_TOKEN=super-secret-isolated-value\n");
     write(&proj, "secrets/db.txt", "cloaked-db-password\n");
     env.ok("alice", &proj, &["cloak", "secrets/"]);
     env.ok("alice", &proj, &["commit", "-m", "with secrets"]);
@@ -219,7 +219,7 @@ fn ws_exec_sandbox_is_private_to_the_user() {
     let out = env.stdout(
         "alice",
         &proj,
-        &["ws", "exec", "agent", "--with-isolated", "--", "sh", "-c", "stat -c '%a %n' . .env secrets secrets/db.txt"],
+        &["ws", "exec", "agent", "--with-isolated", "--", "sh", "-c", "stat -c '%a %n' . .netrc secrets secrets/db.txt"],
     );
     for line in out.lines() {
         let mode = u32::from_str_radix(line.split_whitespace().next().unwrap(), 8).unwrap();
@@ -242,7 +242,7 @@ fn killed_ws_exec_leaves_no_plaintext_behind() {
     }
     let leftovers: Vec<String> = tree_listing(&env.root.join("tmp"))
         .into_iter()
-        .filter(|p| p.ends_with(".env") || p.ends_with("db.txt"))
+        .filter(|p| p.ends_with(".netrc") || p.ends_with("db.txt"))
         .collect();
     assert!(leftovers.is_empty(), "secrets left on disk after crash: {leftovers:?}");
 }
@@ -260,7 +260,7 @@ fn ws_exec_cleans_up_and_never_records_isolated_files() {
     assert!(tree_listing(&env.root.join("tmp")).is_empty(), "sandbox not removed");
     let files = env.stdout("alice", &proj, &["files", "-r", "agent@"]);
     assert!(files.contains("out.txt"));
-    assert!(!files.lines().any(|l| l.ends_with(" .env")), "isolated file recorded:\n{files}");
+    assert!(!files.lines().any(|l| l.ends_with(" .netrc")), "isolated file recorded:\n{files}");
     let cat = env.vl("alice", &proj, &["ws", "cat", "agent", "out.txt"]);
     assert_eq!(String::from_utf8_lossy(&cat.stdout), "new\n");
 }
@@ -284,7 +284,7 @@ fn ws_write_from_stdin_records_into_the_virtual_workspace_only() {
     assert_eq!(env.stdout("alice", &proj, &["ws", "cat", "agent", "notes/n.txt"]), "from stdin\n");
 }
 
-/// `--with-isolated` hands `.env` to the sandboxed command; anything the
+/// `--with-isolated` hands `.netrc` to the sandboxed command; anything the
 /// command writes is recorded. A tool (or a prompt-injected agent) that copies
 /// the secret into a tracked file publishes it: nothing compares recorded
 /// content with the isolated values the engine itself injected.
@@ -295,7 +295,7 @@ fn ws_exec_cannot_launder_isolated_secrets_into_history() {
     let o = env.vl(
         "alice",
         &proj,
-        &["ws", "exec", "agent", "--with-isolated", "-m", "agent run", "--", "sh", "-c", "cp .env config.txt"],
+        &["ws", "exec", "agent", "--with-isolated", "-m", "agent run", "--", "sh", "-c", "cp .netrc config.txt"],
     );
     assert!(o.status.success(), "{}", text(&o));
     let cat = env.vl("alice", &proj, &["ws", "cat", "agent", "config.txt"]);

@@ -95,6 +95,30 @@ const BUILTIN_SECRETS: &[&str] = &[
     "*.tfstate.*",
 ];
 
+/// The built-in secrets that are **shared** (a team's `.env`, Terraform
+/// state): new repositories seal and sync them ([`SYNCED_SECRETS_POLICY`]).
+/// Every other built-in secret is a personal credential or private key
+/// (`id_rsa`, `id_ed25519`, `*.pem`, `*.key`, `.netrc`, …) and stays on the
+/// device.
+pub const SHARED_SECRETS: &[&str] = &[".env", ".env.*", ".envrc", "*.tfstate", "*.tfstate.*"];
+
+/// The `.veilpolicy` lines that seal the shared secrets ([`SHARED_SECRETS`])
+/// under the `team` scope, so they are encrypted on the device and synced
+/// (`docs/VISIBILITY.md`, "Secrets are encrypted"). `vl init` writes them;
+/// `vl upgrade --sync-secrets` adds them to an existing repository after
+/// listing the files that would start syncing.
+pub const SYNCED_SECRETS_POLICY: &str = "\
+# Shared secrets are encrypted on this device and synced; only devices
+# holding the 'team' key open them (an admin's `vl group add` grants it).
+# Personal private keys (id_rsa, id_ed25519, *.pem, *.key, .netrc, ...)
+# never leave this device.
+.env                     cloak team
+.env.*                   cloak team
+.envrc                   cloak team
+*.tfstate                cloak team
+*.tfstate.*              cloak team
+";
+
 const BUILTIN_PUBLIC_EXCEPTIONS: &[&str] = &[".env.example", ".env.sample", ".env.template", ".env.dist"];
 
 /// Metadata of other version control systems, ignored at every depth by
@@ -2039,7 +2063,7 @@ mod tests {
 
     #[test]
     fn invalid_rules_fail_safe() {
-        let p = Policy::parse("a/ cloak local\nb/ cloak embargo/x\nc/ clok\nd/\ne[ cloak\nf[ public!\n");
+        let p = Policy::parse("a/ cloak local\nb/ cloak embargo/x\nc/ Clok\nd/\ne[ cloak\nf[ public!\n");
         for path in ["a/x", "b/x", "c/x", "d/x"] {
             assert_eq!(class(&p, path), Tier::Isolated, "{path}: {:?}", p.warnings);
         }

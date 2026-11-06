@@ -170,7 +170,7 @@ fn world() -> (Env, PathBuf, PathBuf) {
     let alice = env.dir("alice");
     write(&alice, "README.md", "hello\n");
     write(&alice, "internal/plan.md", &format!("{CLOAKED_TEXT}\n"));
-    write(&alice, ".env", &format!("API={ISOLATED_TEXT}\n"));
+    write(&alice, ".netrc", &format!("API={ISOLATED_TEXT}\n"));
     write(&alice, "policy.txt", "");
     env.ok("alice", &alice, &["init"]);
     env.ok("alice", &alice, &["cloak", "internal/"]);

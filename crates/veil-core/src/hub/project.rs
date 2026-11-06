@@ -57,6 +57,11 @@ fn too_deep() -> VeilError {
     VeilError::Corrupt("tree".into(), format!("nested deeper than {MAX_TREE_DEPTH} directories"))
 }
 
+/// The id of the empty tree (always the format-1 encoding).
+pub fn empty_tree_id() -> ObjectId {
+    ObjectId::hash(&Object::Tree(Tree::default()).encode())
+}
+
 /// Encode `entries` (sorted) as a tree in `enc`; the empty tree is always
 /// the format-1 encoding.
 fn encode_tree(entries: Vec<TreeEntry>, enc: TreeEncoding) -> (ObjectId, Arc<Tree>, Vec<u8>) {
@@ -282,16 +287,22 @@ impl<'a> Graft<'a> {
             let child = join(dir, &name);
             let pe = pt.as_ref().and_then(|t| t.get(&name)).cloned();
             let re = rt.as_ref().and_then(|t| t.get(&name)).cloned();
-            if !view.read(&child) && !view.rule_below(&child) {
-                // Hidden from the pusher: theirs cannot name it.
+            let p_dir = self.is_tree(pe.as_ref())?.is_some();
+            let r_dir = self.is_tree(re.as_ref())?.is_some();
+            // Hidden from the pusher (a file they may not read, or a
+            // directory with nothing they may read below it): theirs cannot
+            // name it, and the real one is kept.
+            let hidden = match r_dir {
+                false if re.is_some() => !view.read(&child),
+                _ => !view.read(&child) && !view.rule_below(&child),
+            };
+            if hidden {
                 if pe.is_some() {
                     return Err(refused(&child));
                 }
                 out.extend(re);
                 continue;
             }
-            let p_dir = self.is_tree(pe.as_ref())?.is_some();
-            let r_dir = self.is_tree(re.as_ref())?.is_some();
             if (p_dir || pe.is_none()) && (r_dir || re.is_none()) {
                 let id = self.dir(&child, pe.as_ref().map(|e| e.id), re.as_ref().map(|e| e.id), depth + 1)?;
                 if let Some(id) = id {
@@ -325,11 +336,14 @@ impl<'a> Graft<'a> {
     }
 
     fn is_empty_tree(&self, id: &ObjectId) -> bool {
-        matches!(self.src.node(id), Ok(Node::Tree(t, _)) if t.entries.is_empty())
+        *id == empty_tree_id() || matches!(self.src.node(id), Ok(Node::Tree(t, _)) if t.entries.is_empty())
     }
 
     /// The tree `id` at `dir`: a pushed or real tree, or a projection.
     fn tree_at(&self, dir: &str, id: &ObjectId) -> Result<Arc<Tree>> {
+        if *id == empty_tree_id() {
+            return Ok(Arc::new(Tree::default()));
+        }
         if let Some(t) = self.proj.created.get(id) {
             return Ok(t.0.clone());
         }
@@ -565,6 +579,128 @@ mod tests {
         ] {
             let err = graft_of(&m, &dev, real, files).unwrap_err();
             assert!(matches!(err, VeilError::Policy(_)), "{files:?}: {err}");
+        }
+    }
+
+    mod props {
+        use std::collections::BTreeMap;
+
+        use proptest::prelude::*;
+
+        use super::*;
+
+        const PARTS: &[&str] = &["a", "b", "c"];
+
+        fn path_strategy() -> impl Strategy<Value = String> {
+            prop::collection::vec(0..PARTS.len(), 1..4).prop_map(|v| v.iter().map(|i| PARTS[*i]).collect::<Vec<_>>().join("/"))
+        }
+
+        /// Files whose paths never make one a directory of another.
+        fn files_strategy() -> impl Strategy<Value = BTreeMap<String, String>> {
+            prop::collection::btree_map(path_strategy(), "[a-z]{1,4}", 1..10).prop_map(|m| {
+                let keys: Vec<String> = m.keys().cloned().collect();
+                m.into_iter()
+                    .filter(|(k, _)| !keys.iter().any(|o| o.len() > k.len() && o.starts_with(&format!("{k}/"))))
+                    .collect()
+            })
+        }
+
+        fn policy_strategy() -> impl Strategy<Value = String> {
+            prop::collection::vec((path_strategy(), any::<bool>(), prop::sample::subsequence(vec!["g", "h", "me"], 0..3)), 0..5).prop_map(|rules| {
+                rules
+                    .into_iter()
+                    .filter(|(_, public, names)| *public || !names.is_empty())
+                    .map(|(p, public, names)| {
+                        let mut who: Vec<&str> = names;
+                        if public {
+                            who.insert(0, "public");
+                        }
+                        format!("{p}/ {}\n", who.join(" "))
+                    })
+                    .collect()
+            })
+        }
+
+        fn files_of(m: &Mem, root: ObjectId, created: &HashMap<ObjectId, Vec<u8>>) -> BTreeMap<String, Vec<u8>> {
+            let mut out = BTreeMap::new();
+            let mut stack = vec![(String::new(), root)];
+            while let Some((dir, id)) = stack.pop() {
+                let raw = created.get(&id).cloned().or_else(|| m.0.borrow().get(&id).cloned()).unwrap();
+                if let Object::Tree(t) = Object::decode(&raw).unwrap() {
+                    for e in t.entries {
+                        let p = join(&dir, &e.name);
+                        if e.kind == EntryKind::Dir {
+                            stack.push((p, e.id));
+                        } else {
+                            let b = m.0.borrow().get(&e.id).cloned().unwrap();
+                            out.insert(p, b);
+                        }
+                    }
+                }
+            }
+            out
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// A viewer's projection holds exactly the files they may read (so
+            /// no other name), and grafting it back unchanged gives the real
+            /// tree; an edit of what they may write changes only that.
+            #[test]
+            fn projection_hides_exactly_and_graft_restores(
+                files in files_strategy(),
+                policy in policy_strategy(),
+                groups in prop::sample::subsequence(vec!["g", "h"], 0..3),
+                edit in "[a-z]{1,4}",
+            ) {
+                let m = Mem::default();
+                let list: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+                let real = m.build(&list);
+                let p = AccessPolicy::parse(&policy);
+                let view = View::new(&p, false, |_, n| n == "me" || groups.contains(&n));
+                let mut pr = Projector::new(&m, &view);
+                let proj = pr.root(real).unwrap();
+                let created: HashMap<ObjectId, Vec<u8>> = pr.created.iter().map(|(k, v)| (*k, v.1.clone())).collect();
+                let seen = files_of(&m, proj, &created);
+                let readable: BTreeMap<String, Vec<u8>> = files_of(&m, real, &HashMap::new())
+                    .into_iter()
+                    .filter(|(k, _)| view.read(k))
+                    .collect();
+                prop_assert_eq!(&seen, &readable);
+                // Every name in a projected tree leads to something readable.
+                for raw in created.values() {
+                    if let Ok(Object::Tree(t)) = Object::decode(raw) {
+                        for e in &t.entries {
+                            prop_assert!(seen.keys().any(|k| k.split('/').any(|c| c == e.name)), "{} named", e.name);
+                        }
+                    }
+                }
+                // Unchanged: the real tree itself.
+                let mut g = Graft::new(&m, &view);
+                prop_assert_eq!(g.root(proj, Some(real)).unwrap(), real);
+                // Edit every file they may write; the graft keeps the rest.
+                let mut mine: Vec<(String, String)> = Vec::new();
+                for (k, _) in &seen {
+                    if view.write(k) {
+                        mine.push((k.clone(), edit.clone()));
+                    } else {
+                        mine.push((k.clone(), String::from_utf8_lossy(&seen[k][10..]).into_owned()));
+                    }
+                }
+                let pushed = m.build(&mine.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect::<Vec<_>>());
+                let mut g = Graft::new(&m, &view);
+                let full = g.root(pushed, Some(real)).unwrap();
+                let after = files_of(&m, full, &g.created);
+                for (k, v) in files_of(&m, real, &HashMap::new()) {
+                    let want = if view.read(&k) && view.write(&k) { format!("veil:blob\n{edit}").into_bytes() } else { v };
+                    prop_assert_eq!(after.get(&k), Some(&want), "{}", k);
+                }
+                prop_assert_eq!(after.len(), files.len());
+                for c in &g.changes {
+                    prop_assert!(view.write(&c.path), "{} changed without write access", c.path);
+                }
+            }
         }
     }
 }

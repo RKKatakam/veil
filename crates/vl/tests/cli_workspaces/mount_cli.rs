@@ -111,7 +111,7 @@ fn reads_writes_and_unmount_records_through_the_policy() {
     f.set_len(2).unwrap();
     drop(f);
     // Isolated and quarantined files stay local.
-    std::fs::write(mnt.join(".env"), "API_TOKEN=isolated-value-9f8e7d6c\n").unwrap();
+    std::fs::write(mnt.join(".netrc"), "API_TOKEN=isolated-value-9f8e7d6c\n").unwrap();
     std::fs::write(mnt.join("leak.txt"), "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n").unwrap();
     // Private to the owner.
     assert_eq!(std::fs::metadata(&mnt).unwrap().permissions().mode() & 0o077, 0);
@@ -125,7 +125,7 @@ fn reads_writes_and_unmount_records_through_the_policy() {
     // Another command records the mount first.
     let diff = env.ok("alice", &proj, &["diff", "-r", "agent@", "--stat"]);
     assert!(diff.contains("a.txt") && diff.contains("lib/lib.rs") && diff.contains("gone.txt"), "{diff}");
-    assert!(diff.contains(".env is isolated") && diff.contains("leak.txt quarantined"), "{diff}");
+    assert!(diff.contains(".netrc is isolated") && diff.contains("leak.txt quarantined"), "{diff}");
 
     let out = env.ok("alice", &proj, &["ws", "unmount", "agent"]);
     assert!(out.contains("Unmounted workspace agent"), "{out}");
@@ -134,7 +134,7 @@ fn reads_writes_and_unmount_records_through_the_policy() {
     for p in ["a.txt", "new.txt", "lib/lib.rs", "deep/er/x.txt", "run.sh"] {
         assert!(recorded.contains(&p.to_string()), "{p} missing from {recorded:?}");
     }
-    for p in ["gone.txt", "src/lib.rs", ".env", "leak.txt"] {
+    for p in ["gone.txt", "src/lib.rs", ".netrc", "leak.txt"] {
         assert!(!recorded.contains(&p.to_string()), "{p} in {recorded:?}");
     }
     assert_eq!(env.stdout("alice", &proj, &["ws", "cat", "agent", "a.txt"]), "edited\n");
@@ -143,9 +143,9 @@ fn reads_writes_and_unmount_records_through_the_policy() {
     // What was not recorded is kept for the next mount, and only there.
     assert!(out.contains("kept 2 file(s)"), "{out}");
     let (mnt, _guard2) = mount(&env, "alice", &proj, "agent");
-    assert_eq!(read(&mnt, ".env"), "API_TOKEN=isolated-value-9f8e7d6c\n");
+    assert_eq!(read(&mnt, ".netrc"), "API_TOKEN=isolated-value-9f8e7d6c\n");
     assert!(mnt.join("leak.txt").exists());
-    assert!(!proj.join(".env").exists() && !proj.join("leak.txt").exists());
+    assert!(!proj.join(".netrc").exists() && !proj.join("leak.txt").exists());
     env.ok("alice", &proj, &["ws", "unmount", "agent"]);
     // `vl ws rm` wants --force for them.
     let o = env.vl("alice", &proj, &["ws", "rm", "agent"]);
@@ -202,7 +202,7 @@ fn a_killed_mount_loses_nothing() {
     let (mnt, _guard) = mount(&env, "alice", &proj, "agent");
     std::fs::write(mnt.join("crash.txt"), "survives\n").unwrap();
     std::fs::remove_file(mnt.join("gone.txt")).unwrap();
-    std::fs::write(mnt.join(".env"), "TOKEN=local-only-abcdef123456\n").unwrap();
+    std::fs::write(mnt.join(".netrc"), "TOKEN=local-only-abcdef123456\n").unwrap();
     // SAFETY: plain kill(2).
     unsafe { libc::kill(state_pid(&proj, "agent"), libc::SIGKILL) };
     assert!(wait_for(Duration::from_secs(5), || std::fs::read_dir(&mnt).is_err()), "the dead mount still answers");
@@ -217,13 +217,13 @@ fn a_killed_mount_loses_nothing() {
     assert!(!is_mounted(&mnt));
     let recorded = files(&env, "alice", &proj, "agent@");
     assert!(recorded.contains(&"crash.txt".into()) && !recorded.contains(&"gone.txt".into()), "{recorded:?}");
-    assert!(!recorded.contains(&".env".into()));
+    assert!(!recorded.contains(&".netrc".into()));
     assert_eq!(env.stdout("alice", &proj, &["ws", "cat", "agent", "crash.txt"]), "survives\n");
 
     // Killed again, and mounted again without an unmount in between: the
     // new mount picks the overlay up.
     let (mnt, _g2) = mount(&env, "alice", &proj, "agent");
-    assert_eq!(read(&mnt, ".env"), "TOKEN=local-only-abcdef123456\n");
+    assert_eq!(read(&mnt, ".netrc"), "TOKEN=local-only-abcdef123456\n");
     std::fs::write(mnt.join("second.txt"), "2\n").unwrap();
     unsafe { libc::kill(state_pid(&proj, "agent"), libc::SIGKILL) };
     assert!(wait_for(Duration::from_secs(5), || std::fs::read_dir(&mnt).is_err()));

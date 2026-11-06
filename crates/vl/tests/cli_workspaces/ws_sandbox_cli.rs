@@ -20,7 +20,7 @@ fn files_dir(proj: &Path, ws: &str) -> PathBuf {
 
 fn project(env: &Env) -> PathBuf {
     let proj = env.project("alice", "proj", &[("a.txt", "a\n"), ("src/lib.rs", "pub fn f() {}\n"), ("gone.txt", "g\n")]);
-    write(&proj, ".env", "API_TOKEN=super-secret-isolated-value\n");
+    write(&proj, ".netrc", "API_TOKEN=super-secret-isolated-value\n");
     env.ok("alice", &proj, &["commit", "-m", "env"]);
     env.ok("alice", &proj, &["ws", "new", "agent", "-r", "@-"]);
     proj
@@ -136,16 +136,16 @@ fn injected_secrets_are_taken_out_after_the_run() {
     let env = Env::new();
     let proj = project(&env);
     let dir = files_dir(&proj, "agent");
-    // The sandbox's own .env (written by an earlier run) is put back after
+    // The sandbox's own .netrc (written by an earlier run) is put back after
     // an injected run.
-    exec(&env, &proj, &["--", "sh", "-c", "echo LOCAL=1 > .env"]);
+    exec(&env, &proj, &["--", "sh", "-c", "echo LOCAL=1 > .netrc"]);
     let out = exec(
         &env,
         &proj,
-        &["--with-isolated", "--", "sh", "-c", "cat .env; cp .env leak.txt; cat .env >> a.txt; mkdir -p deep && cp .env deep/copy; echo fine > fine.txt"],
+        &["--with-isolated", "--", "sh", "-c", "cat .netrc; cp .netrc leak.txt; cat .netrc >> a.txt; mkdir -p deep && cp .netrc deep/copy; echo fine > fine.txt"],
     );
     assert!(out.contains("super-secret-isolated-value"), "the command saw the secret: {out}");
-    assert_eq!(read(&dir, ".env"), "LOCAL=1\n");
+    assert_eq!(read(&dir, ".netrc"), "LOCAL=1\n");
     assert!(!dir.join("leak.txt").exists(), "copy of the secret left in the sandbox");
     assert!(!dir.join("deep").exists(), "copy of the secret left in the sandbox");
     assert_eq!(read(&dir, "a.txt"), "a\n", "the tracked file is put back");
@@ -177,7 +177,7 @@ fn the_reaper_takes_injected_files_out_of_a_run_that_was_killed() {
         let _ = std::process::Command::new("kill").args(["-9", pid.trim()]).status();
     }
     let dir = files_dir(&proj, "agent");
-    assert!(wait_for(Duration::from_secs(10), || !dir.join(".env").exists()), "injected secret left after kill -9");
+    assert!(wait_for(Duration::from_secs(10), || !dir.join(".netrc").exists()), "injected secret left after kill -9");
     // The next run records what the killed one left (nothing new here),
     // keeps the build output and works.
     let out = exec(&env, &proj, &["--", "sh", "-c", "test -e target/o && cat a.txt"]);

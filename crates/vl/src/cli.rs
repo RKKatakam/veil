@@ -222,6 +222,13 @@ pub enum Cmd {
         /// Upgrade even if fsck reports corruption.
         #[arg(long)]
         force: bool,
+        /// Start encrypting and syncing shared secrets (`.env`, `.env.*`,
+        /// `.envrc`, Terraform state) under the `team` key, as new
+        /// repositories do: lists the files that would start syncing, then
+        /// adds the rules to `.veilpolicy` (with --dry-run: only lists).
+        /// Personal private keys stay on this device.
+        #[arg(long, conflicts_with_all = ["remote", "force"])]
+        sync_secrets: bool,
     },
     /// Show how a change evolved (amends, rewrites, rebases).
     Evolog {

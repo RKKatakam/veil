@@ -225,9 +225,9 @@ fn ws_exec_sandbox_has_no_repository_metadata() {
 fn ws_exec_applies_the_policy_to_what_the_command_writes() {
     let env = Env::new();
     let (r, _) = based(&env);
-    r.write(".env", DOTENV);
+    r.write(".netrc", DOTENV);
     r.ok(&["ws", "new", "agent"]);
-    let out = r.run(&["ws", "exec", "agent", "--", "sh", "-c", &format!("test ! -e .env && printf '%s' '{}' > .env && echo built > out.txt", DOTENV.trim())]);
+    let out = r.run(&["ws", "exec", "agent", "--", "sh", "-c", &format!("test ! -e .netrc && printf '%s' '{}' > .netrc && echo built > out.txt", DOTENV.trim())]);
     assert!(out.status.success(), "{}", text(&out));
     assert_eq!(r.paths("agent@"), vec!["a.txt", "out.txt"]);
     assert!(!contains_bytes(&all_bytes(&r.path(".veil/objects")), "Xk29vLq8sPz"));

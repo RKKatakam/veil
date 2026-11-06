@@ -129,7 +129,7 @@ struct World {
 
 /// Alice's project: a public file later edited on a cloaked line (sealed,
 /// with its last public version as fallback), a policy-cloaked file edited
-/// twice, an isolated `.env`, a quarantined file, a vault secret, and an
+/// twice, an isolated `.netrc`, a quarantined file, a vault secret, and an
 /// unreleased embargoed fix that edits `src/vuln.c` and renames a file.
 fn world() -> World {
     let env = Env::new();
@@ -138,7 +138,7 @@ fn world() -> World {
     write(&alice, "internal/plan.md", &format!("{CLOAKED_TEXT}\n"));
     write(&alice, "src/vuln.c", "int check(int x) {\n  return 1;\n}\n");
     write(&alice, "src/old.c", "int old(void) {\n  return 0;\n}\n/* padding so the rename is inexact */\n");
-    write(&alice, ".env", &format!("KEY={ISOLATED_TEXT}\n"));
+    write(&alice, ".netrc", &format!("KEY={ISOLATED_TEXT}\n"));
     env.ok("alice", &alice, &["init"]);
     env.ok("alice", &alice, &["cloak", "internal/"]);
     env.ok("alice", &alice, &["commit", "-m", "initial"]);
@@ -190,7 +190,7 @@ fn all_output(env: &Env, user: &str, dir: &Path) -> String {
     let ids: Vec<String> = log["entries"].as_array().unwrap().iter().map(|e| e["snapshot_id"].as_str().unwrap().to_string()).collect();
     let secrets = [CLOAKED_TEXT, CLOAKED_LINE, EMBARGO_TEXT, ISOLATED_TEXT, VAULT_VALUE, TOKEN, EMBARGO_NAME, "KEY", "."];
     // (Never the fix's new file name: an error would echo the argument.)
-    let files = ["README.md", "internal/plan.md", "src/vuln.c", "src/old.c", ".env", "leak.txt"];
+    let files = ["README.md", "internal/plan.md", "src/vuln.c", "src/old.c", ".netrc", "leak.txt"];
     for id in &ids {
         for f in files {
             for extra in [&[][..], &["--json"], &["--public"], &["--follow", "--json"]] {
@@ -273,7 +273,7 @@ fn grep_never_searches_or_counts_local_only_files() {
     let w = world();
     let (v, _) = json(&w.env, "alice", &w.alice, &["grep", "KEY|token", "-r", "@", "--json"]);
     let s = v.to_string();
-    assert!(!s.contains(".env") && !s.contains("leak.txt") && !s.contains(ISOLATED_TEXT) && !s.contains(TOKEN), "{s}");
+    assert!(!s.contains(".netrc") && !s.contains("leak.txt") && !s.contains(ISOLATED_TEXT) && !s.contains(TOKEN), "{s}");
     assert_eq!(v["skipped"]["sealed"], 0);
     // Exactly the snapshot's files were looked at.
     let ls = json_ok(&w.env, "alice", &w.alice, &["ls", "--json"]);
@@ -704,20 +704,20 @@ fn bisect_run_finds_it_without_touching_the_working_copy() {
     env.ok("alice", &dir, &["bisect", "reset"]);
 }
 
-/// Design 1, threat 7: `bisect run` gets neither the isolated `.env` nor
+/// Design 1, threat 7: `bisect run` gets neither the isolated `.netrc` nor
 /// vault values, unless `--with-isolated` (which copies the local-only
 /// files, never vault values into the environment).
 #[test]
 fn bisect_run_injects_no_secrets() {
     let env = Env::new();
     let (dir, changes) = bisect_project(&env);
-    write(&dir, ".env", &format!("KEY={ISOLATED_TEXT}\n"));
+    write(&dir, ".netrc", &format!("KEY={ISOLATED_TEXT}\n"));
     env.ok("alice", &dir, &["secret", "set", "API_TOKEN", VAULT_VALUE]);
     env.ok("alice", &dir, &["bisect", "start", "--bad", &changes[11], "--good", &changes[0]]);
-    let test = script(&env.root, "env.sh", "env; ls -a; cat .env 2>/dev/null; grep -q fine bug.txt");
+    let test = script(&env.root, "env.sh", "env; ls -a; cat .netrc 2>/dev/null; grep -q fine bug.txt");
     let out = env.ok("alice", &dir, &["bisect", "run", "--", &test]);
     assert!(!out.contains(ISOLATED_TEXT) && !out.contains(VAULT_VALUE), "{out}");
-    assert!(!out.contains(".env"), "{out}");
+    assert!(!out.contains(".netrc"), "{out}");
     env.ok("alice", &dir, &["bisect", "reset"]);
 }
 

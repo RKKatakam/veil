@@ -99,7 +99,7 @@ fn project(env: &Env) -> std::path::PathBuf {
     let dir = env.dir("alice");
     write(&dir, "src/main.rs", "fn main() {}\n");
     write(&dir, "secrets/db.yml", &format!("{CLOAKED}\n"));
-    write(&dir, ".env", &format!("KEY={ISOLATED}\n"));
+    write(&dir, ".netrc", &format!("KEY={ISOLATED}\n"));
     env.ok("alice", &dir, &["init"]);
     env.ok("alice", &dir, &["cloak", "secrets/"]);
     env.ok("alice", &dir, &["commit", "-m", "one"]);
@@ -122,7 +122,7 @@ fn ls_shows_every_tier_and_status_marks_every_file() {
     let files = ls(&env, "alice", &dir, &["--all"]);
     assert_eq!(files["src/main.rs"], "public");
     assert_eq!(files["secrets/db.yml"], "cloaked:team");
-    assert_eq!(files[".env"], "isolated");
+    assert_eq!(files[".netrc"], "isolated");
     assert_eq!(files["cfg.js"], "quarantined");
     assert_eq!(files["target/"], "ignored", "{files:?}");
     assert!(!ls(&env, "alice", &dir, &[]).contains_key("target/"), "ignored files need --all");
@@ -133,14 +133,14 @@ fn ls_shows_every_tier_and_status_marks_every_file() {
     assert!(!out.status.success() && text(&out).contains("matches no file"), "{}", text(&out));
     // An older snapshot has no local-only files.
     let old = ls(&env, "alice", &dir, &["-r", "main"]);
-    assert!(!old.contains_key(".env") && !old.contains_key("cfg.js"), "{old:?}");
+    assert!(!old.contains_key(".netrc") && !old.contains_key("cfg.js"), "{old:?}");
     // `vl files` keeps its format.
     let f = env.stdout("alice", &dir, &["files"]);
     assert!(f.lines().any(|l| l.starts_with("cloaked:team") && l.ends_with("secrets/db.yml")), "{f}");
 
     let st = env.stdout("alice", &dir, &["status"]);
     assert!(st.contains("M secrets/db.yml [cloaked:team]"), "{st}");
-    assert!(st.contains("L .env [isolated]"), "{st}");
+    assert!(st.contains("L .netrc [isolated]"), "{st}");
     assert!(st.contains("Q cfg.js [quarantined]  (aws-access-key-id; never recorded)"), "{st}");
     let (v, _) = json(&env, "alice", &dir, &["status", "--json"]);
     let change = v["changes"].as_array().unwrap().iter().find(|c| c["path"] == "secrets/db.yml").unwrap();

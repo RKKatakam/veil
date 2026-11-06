@@ -18,10 +18,10 @@ fn secretive(env: &Env) -> PathBuf {
     env.ok("alice", &proj, &["cloak", "secrets/"]);
     write(&proj, "secrets/plan.md", &format!("{CLOAKED}\n"));
     write(&proj, "app.txt", "public app\n");
-    write(&proj, ".env", &format!("{ISOLATED}\n"));
+    write(&proj, ".netrc", &format!("{ISOLATED}\n"));
     write(
         &proj,
-        "config/.env.production",
+        "config/prod.pem",
         &format!("{ISOLATED}-prod\n"),
     );
     write(&proj, "keys/id_rsa", KEYFILE);
@@ -76,7 +76,7 @@ fn a_public_remote_receives_none_of_the_protected_content() {
     for (needle, what) in [
         (CLOAKED, "cloaked file"),
         (CLOAKED_MSG, "cloaked description"),
-        (ISOLATED, "isolated .env"),
+        (ISOLATED, "isolated .netrc"),
         ("BEGIN OPENSSH PRIVATE KEY", "isolated key"),
         ("hidden-work", "cloaked workspace file"),
     ] {
@@ -107,7 +107,7 @@ fn a_team_remote_holds_ciphertext_and_key_rings_but_no_plaintext() {
     let hub = push_to(&env, &proj, "origin", false);
     assert_absent(&hub, CLOAKED, "cloaked file on a team remote");
     assert_absent(&hub, CLOAKED_MSG, "cloaked description on a team remote");
-    assert_absent(&hub, ISOLATED, "isolated .env on a team remote");
+    assert_absent(&hub, ISOLATED, "isolated .netrc on a team remote");
     assert_absent(
         &hub,
         "BEGIN OPENSSH PRIVATE KEY",
@@ -128,7 +128,7 @@ fn a_team_remote_holds_ciphertext_and_key_rings_but_no_plaintext() {
     env.ok("alice", &proj, &["push"]);
     let bob = env.clone("bob", &hub, "bob");
     assert_eq!(read(&bob, "secrets/plan.md"), format!("{CLOAKED}\n"));
-    assert!(!bob.join(".env").exists() && !bob.join("keys/id_rsa").exists());
+    assert!(!bob.join(".netrc").exists() && !bob.join("keys/id_rsa").exists());
     let log = env.stdout("bob", &bob, &["show", "roadmap"]);
     assert!(log.contains(CLOAKED_MSG), "{log}");
 }
