@@ -543,6 +543,40 @@ pub fn pull(repo: &mut Repo, remote: &str, client: &Client, only: Option<&str>) 
     Ok(report)
 }
 
+/// For a clone of one directory: `tree` with only the path to `only` and
+/// `only` itself, and the paths left out (never materialised, so every
+/// snapshot keeps them as they are; `Materialised::hiding`).
+pub fn restrict_to(store: &ObjectStore, tree: ObjectId, only: &str) -> Result<(ObjectId, Vec<veil_core::VPath>)> {
+    let parts: Vec<&str> = only.split('/').collect();
+    let mut hidden = Vec::new();
+    fn go(
+        store: &ObjectStore,
+        tree: ObjectId,
+        parts: &[&str],
+        dir: &str,
+        hidden: &mut Vec<veil_core::VPath>,
+    ) -> Result<ObjectId> {
+        let t = store.tree(&tree)?;
+        let mut out = veil_core::Tree::default();
+        for e in &t.entries {
+            let p = if dir.is_empty() { e.name.clone() } else { format!("{dir}/{}", e.name) };
+            if e.name != parts[0] {
+                hidden.push(veil_core::VPath::new(&p)?);
+                continue;
+            }
+            if parts.len() == 1 || e.kind != EntryKind::Dir {
+                out.insert(e.clone());
+            } else {
+                let id = go(store, e.id, &parts[1..], &p, hidden)?;
+                out.insert(veil_core::TreeEntry { id, ..e.clone() });
+            }
+        }
+        Ok(store.put_tree(&out)?)
+    }
+    let id = go(store, tree, &parts, "", &mut hidden)?;
+    Ok((id, hidden))
+}
+
 // ---- push ---------------------------------------------------------------------------------
 
 /// Append the objects of tree `tree` at `path` that differ from `parents`
@@ -597,6 +631,7 @@ fn collect_tree(
 }
 
 pub struct PushOutcome {
+    pub warnings: Vec<String>,
     pub moved: Vec<(String, ObjectId)>,
     pub rejected: Vec<(String, String)>,
     pub uploaded: usize,
@@ -637,6 +672,7 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
         }
         if updates.is_empty() {
             return Ok(PushOutcome {
+                warnings: vec![],
                 moved: vec![],
                 rejected: vec![],
                 uploaded: 0,
@@ -704,6 +740,7 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
             bail!("a branch kept moving during the push; pull, then push again");
         };
         let mut out = PushOutcome {
+            warnings: result.warnings.clone(),
             moved: vec![],
             rejected: vec![],
             uploaded,

@@ -133,8 +133,10 @@ pub async fn open(db: &sqlx::PgPool, name: &str, caller: &Caller) -> Result<(Pro
     Ok((project, viewer))
 }
 
-/// Bind every name of `policy` to a group of `project` or a person, or say
-/// which name is unknown or ambiguous.
+/// Bind every name of `policy`: to the project's group of that name if
+/// there is one (a group always wins, so a person who signs up under a
+/// group's name takes over nothing), else to the person of that name, else
+/// refuse. The admin's push lists every binding (`sync::push`).
 pub async fn bind_names(c: &mut PgConnection, project: i64, policy: &AccessPolicy) -> Result<BTreeMap<String, Binding>> {
     let mut out = BTreeMap::new();
     for name in policy.names() {
@@ -143,22 +145,21 @@ pub async fn bind_names(c: &mut PgConnection, project: i64, policy: &AccessPolic
             .bind(&name)
             .fetch_optional(&mut *c)
             .await?;
-        let person: Option<i64> = sqlx::query_scalar("SELECT id FROM people WHERE name = $1")
-            .bind(&name)
-            .fetch_optional(&mut *c)
-            .await?;
-        let b = match (group, person) {
-            (Some(g), None) => Binding::Group(g),
-            (None, Some(p)) => Binding::Person(p),
-            (Some(_), Some(_)) => {
-                return Err(Error::bad_request(format!(
-                    "'{name}' in .veilpolicy is both a group and a person; rename the group"
-                )))
-            }
-            (None, None) => {
-                return Err(Error::bad_request(format!(
-                    "'{name}' in .veilpolicy is neither a group of this project nor a person; create the group first (`vl group create {name}`)"
-                )))
+        let b = match group {
+            Some(g) => Binding::Group(g),
+            None => {
+                let person: Option<i64> = sqlx::query_scalar("SELECT id FROM people WHERE name = $1")
+                    .bind(&name)
+                    .fetch_optional(&mut *c)
+                    .await?;
+                match person {
+                    Some(p) => Binding::Person(p),
+                    None => {
+                        return Err(Error::bad_request(format!(
+                            "'{name}' in .veilpolicy is neither a group of this project nor a person; create the group first (`vl group create {name}`)"
+                        )))
+                    }
+                }
             }
         };
         out.insert(name, b);

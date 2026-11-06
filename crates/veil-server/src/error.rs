@@ -86,7 +86,8 @@ impl IntoResponse for Error {
             Error::Api { status, code, message } => (status, code, message),
             // Internal details go to the server's log, not to the caller.
             Error::Db(e) => {
-                eprintln!("veil-server: database error: {e}");
+                let code = e.as_database_error().and_then(|d| d.code().map(|c| c.into_owned())).unwrap_or_default();
+                eprintln!("veil-server: database error [{code}]: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal", "internal error".to_string())
             }
             Error::Other(e) => {

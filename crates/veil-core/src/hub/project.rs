@@ -216,6 +216,9 @@ impl<'a> Graft<'a> {
 
     fn is_tree(&self, e: Option<&TreeEntry>) -> Result<Option<Arc<Tree>>> {
         match e {
+            // A projected directory the pusher left unchanged: the server
+            // computed it, nobody stored it.
+            Some(e) if e.kind == EntryKind::Dir && self.proj.created.contains_key(&e.id) => Ok(Some(self.proj.created[&e.id].0.clone())),
             Some(e) if e.kind == EntryKind::Dir => match self.src.node(&e.id)? {
                 Node::Tree(t, _) => Ok(Some(t)),
                 Node::Leaf => Ok(None),

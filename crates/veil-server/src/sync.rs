@@ -802,9 +802,30 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
     crate::audit(&hub.db, Some(project.id), Some(person), "push", &format!("moved {moved:?}")).await;
     // The tips as the pusher sees them now (their own snapshots, where the
     // server's projection gives them back).
+    let accepted = plans.iter().any(|p| p.3.is_some());
     let project = crate::perm::load_project(&mut *hub.db.acquire().await?, &project.name)
         .await?
         .ok_or_else(|| Error::not_found("project"))?;
+    let mut warnings = Vec::new();
+    if accepted {
+        // Never silently: say who can now see what.
+        for r in &project.policy.rules {
+            let mut who: Vec<String> = Vec::new();
+            if r.public {
+                who.push("everyone on Earth (public, read)".into());
+            }
+            for n in &r.names {
+                who.push(match project.bindings.get(n) {
+                    Some(crate::perm::Binding::Group(_)) => format!("group {n}"),
+                    _ => format!("person {n}"),
+                });
+            }
+            warnings.push(format!("access accepted: {}/ → {}", r.path, who.join(", ")));
+        }
+        for w in &project.policy.warnings {
+            warnings.push(w.clone());
+        }
+    }
     for (branch, _, new, _) in plans {
         let tip = match new {
             Some(n) => Some(projected(hub, &project, viewer, n).await?),
@@ -812,7 +833,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
         };
         results.push(BranchResult { branch, ok: true, message: None, tip });
     }
-    Ok(PushResult { results, warnings: Vec::new() })
+    Ok(PushResult { results, warnings })
 }
 
 /// Is `a` an ancestor of (or equal to) `b` in the real history?

@@ -29,11 +29,25 @@ pub async fn connect(url: &str, max: u32) -> anyhow::Result<PgPool> {
 
 /// Apply every migration not applied yet.
 pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
-    sqlx::raw_sql(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)",
-    )
-    .execute(pool)
-    .await?;
+    // Servers starting together race on creating the table itself
+    // (IF NOT EXISTS is not atomic on either database): try again.
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let r = sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)",
+        )
+        .execute(pool)
+        .await;
+        match r {
+            Ok(_) => break,
+            Err(e) if attempt < 20 => {
+                eprintln!("veil-server: creating schema_migrations, retrying: {e}");
+                tokio::time::sleep(Duration::from_millis(100 * attempt)).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
     for &(version, name, sql) in MIGRATIONS {
         let mut attempt = 0;
         loop {
@@ -74,6 +88,9 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Attempts of one transaction before its error is returned.
+const MAX_ATTEMPTS: u32 = 40;
+
 pub type TxFuture<'t, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 't>>;
 
 /// Run `f` in a SERIALIZABLE transaction, again (with backoff) while it
@@ -100,9 +117,13 @@ where
             }
         };
         match r {
-            Err(e) if e.is_retryable() && attempt < 30 => {
-                let jitter = u64::from(veil_core::crypto::random_bytes::<1>()[0]);
-                tokio::time::sleep(Duration::from_millis(u64::from(attempt.min(10)) * 5 + jitter % 20)).await;
+            // Exponential backoff with jitter, capped: under contention
+            // (YugabyteDB reports conflicts as deadlocks or serialisation
+            // failures) the losers spread out instead of colliding again.
+            Err(e) if e.is_retryable() && attempt < MAX_ATTEMPTS => {
+                let cap = 5u64 << attempt.min(8);
+                let jitter = u64::from(u16::from_le_bytes(veil_core::crypto::random_bytes::<2>()));
+                tokio::time::sleep(Duration::from_millis(cap / 2 + jitter % cap)).await;
             }
             r => return r,
         }

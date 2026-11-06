@@ -250,10 +250,6 @@ async fn create_group(State(hub): State<HubState>, caller: Caller, Path((p, g)):
     let info = crate::db::serializable(&hub.db, move |c| {
         let g = g2.clone();
         Box::pin(async move {
-            let person: Option<i64> = sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(&g).fetch_optional(&mut *c).await?;
-            if person.is_some() {
-                return Err(Error::conflict(format!("a person is named '{g}': a group needs another name")));
-            }
             let r = sqlx::query("INSERT INTO groups (project_id, name) VALUES ($1, $2) ON CONFLICT DO NOTHING")
                 .bind(pid)
                 .bind(&g)

@@ -110,7 +110,7 @@ fn clone_populate(url: &HubUrl, dest: &Path, only: Option<&str>) -> Result<ExitC
         },
     );
     repo.save_config(config)?;
-    let report = hub::pull(&mut repo, "origin", &client, only)?;
+    let report = hub::pull(&mut repo, "origin", &client, only).context("fetching from the server")?;
     for w in &report.warnings {
         warn_untrusted(w);
     }
@@ -119,10 +119,20 @@ fn clone_populate(url: &HubUrl, dest: &Path, only: Option<&str>) -> Result<ExitC
         .find_map(|t| repo.view().tags.get(*t).map(|t| t.target))
         .or_else(|| repo.view().tags.values().next().map(|t| t.target))
         .unwrap_or(repo.root_id());
-    let wc = repo.new_change(DEFAULT_WORKSPACE, vec![target], "")?;
-    let to = repo.snapshot(&wc)?.tree;
+    let wc = repo.new_change(DEFAULT_WORKSPACE, vec![target], "").context("starting a change")?;
+    let mut to = repo.snapshot(&wc)?.tree;
     let mut record = Materialised::default();
-    let co = repo.checkout_tree_recorded(&*fs, None, &to, &mut record, None)?;
+    if let Some(o) = only {
+        if veil_core::tree::lookup(repo.store(), &to, &VPath::new(o)?)?.is_none_or(|e| e.kind != veil_core::EntryKind::Dir) {
+            bail!("no directory '{o}' that you can see in this project");
+        }
+        // Only `o` is written; the rest was never fetched, never shown, and
+        // every snapshot keeps it unchanged.
+        let (restricted, hidden) = hub::restrict_to(repo.store(), to, o)?;
+        to = restricted;
+        record = Materialised::hiding(hidden);
+    }
+    let co = repo.checkout_tree_recorded(&*fs, None, &to, &mut record, None).context("checking out")?;
     save_checkout(&fs, &CheckoutState::new(DEFAULT_WORKSPACE, wc, record))?;
     println!(
         "Cloned {} into {} ({} objects, {} files{})",
@@ -164,6 +174,9 @@ pub fn push(ctx: &mut Ctx, remote: &str, tags: &[String], force: bool) -> Result
     for (b, tip) in &out.moved {
         println!("  {} {} → {}", green("pushed"), cyan(&safe(b)), tip.short());
     }
+    for w in &out.warnings {
+        println!("  {} {}", dim("note:"), safe(w));
+    }
     for (b, why) in &out.rejected {
         println!("  {} {}: {}", yellow("rejected"), cyan(&safe(b)), safe(why));
     }
@@ -197,6 +210,7 @@ fn secret_scopes(ctx: &Ctx) -> Vec<String> {
 fn sync_secret_keys(ctx: &mut Ctx, client: &Client, people: &[String], grant: bool) -> Result<()> {
     let keys = ctx.repo.keys();
     let mut changed = Vec::new();
+    let mut admin_somewhere = false;
     for scope in secret_scopes(ctx) {
         let Some(Ok(state)) = keys.ring_state(&scope)? else { continue };
         let me = load_identity()?;
@@ -205,13 +219,9 @@ fn sync_secret_keys(ctx: &mut Ctx, client: &Client, people: &[String], grant: bo
             .get(&me.public_hex())
             .is_some_and(|m| m.role == Role::Admin);
         if !admin {
-            if grant {
-                warn(&format!(
-                    "you are not an admin of the '{scope}' key ring: the new people cannot open its secrets until a ring admin adds them"
-                ));
-            }
             continue;
         }
+        admin_somewhere = true;
         for person in people {
             let devices = client.devices(person)?;
             for id in &devices.identities {
@@ -226,6 +236,12 @@ fn sync_secret_keys(ctx: &mut Ctx, client: &Client, people: &[String], grant: bo
                 }
             }
         }
+    }
+    if grant && !admin_somewhere {
+        warn(
+            "they get the project's secret keys (.env and the like) only when a key-ring admin's device signs them in: \
+             ask a project admin to run this `vl group add` too",
+        );
     }
     changed.dedup();
     let rings: Vec<_> = changed.iter().filter_map(|s| keys.load_ring(s).ok().flatten()).collect();
