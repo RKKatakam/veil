@@ -1103,6 +1103,7 @@ four OpenScion workloads with release builds, the server on `127.0.0.1`
 over TLS with PostgreSQL in Docker, and Git on the same machine as the
 reference. Results are in `docs/design/scale/OPENSCION.md`: cloning
 through the server takes what cloning from a path remote takes on the same
-machine (the server adds nothing measurable); both are dominated by the
-checkout's per-file `fsync` (BUG-818, pre-existing). Clone one directory
-stays flat from 1k to 10k files.
+machine (the server adds nothing measurable). Both were dominated by the
+checkout's per-file `fsync` (BUG-818, pre-existing); with one barrier per
+checkout the 10k clone takes 1,014 ms instead of 10,044 ms. Clone one
+directory stays flat from 1k to 10k files (62 and 74 ms).

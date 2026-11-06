@@ -76,7 +76,10 @@ must not be trusted (which disables stat caching):
 | `SftpBackend` | – (another machine's clock) | `None` |
 
 * **DiskBackend** does atomic, durable writes (temp file, fsync, rename,
-  fsync of the directory; see §9) and never follows a symlink. A link is a
+  fsync of the directory; see §9) and never follows a symlink. Checkout
+  instead stages each file (`write_staged`: a temp file beside it,
+  unsynced), makes them all durable with one barrier, renames them into
+  place, and makes the names durable with a second (BUG-818). A link is a
   leaf of its own: `NodeKind::Symlink` in `metadata` and listings, its
   target from `read_link`, created atomically by `write_link` (`symlinkat`
   to a temp name, `renameat`); `read` never reads through one. A path below
@@ -1648,6 +1651,19 @@ A workspace is only a named pointer in the view. It owns no directory.
   it was leaving (BUG-113). The crash harness sweeps `ws switch` across
   every write (`crash_during_workspace_switch`). gc keeps the pending
   snapshot as well as the materialised one.
+  **Checkout's files are durable before the record says so** (BUG-818):
+  each file is staged beside its path, one barrier makes every staged file
+  durable, they are renamed into place, a second barrier makes the names
+  and the checkout's removals durable, and only then does checkout return
+  and the caller save `checkout.json`. Whenever the power fails, each path
+  holds its old version or its complete new one, never a torn file that a
+  snapshot would record as an edit. A failed barrier (EIO) fails the
+  checkout with the move still pending; finishing it rewrites every file
+  that already holds the target, since an earlier write may never reach
+  the disk. Staged copies a crash leaves are temp names snapshots ignore,
+  and finishing the move removes them. Swept by
+  `crash_during_workspace_switch` (power loss tears staged copies) and
+  `eio_during_workspace_switch` (each barrier fails in turn).
 * **Checkout never deletes what it did not write.** A file is overwritten
   or removed only if it holds what `from` put there. A directory where the
   target has a file is removed only once checkout has emptied it (a

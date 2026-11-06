@@ -773,6 +773,13 @@ fn apply_changes(
     let (policy, warning) = Policy::load_or_accepted(&TreeView::new(store.clone(), *to), accepted.as_deref())?;
     report.warnings.extend(warning);
     let mut guard = SpecialGuard::new(fs);
+    // Files are staged (written beside their path, unsynced) and moved into
+    // place only after one barrier; dropped on an early return, the guard
+    // removes what was staged (BUG-818).
+    let mut staging = Staging {
+        fs,
+        files: Vec::new(),
+    };
 
     // Removals first so file<->directory swaps work.
     for c in changes.iter().filter(|c| c.new.is_none()) {
@@ -797,6 +804,7 @@ fn apply_changes(
                 per_file(&mut report, &c.path, e)?;
                 continue;
             }
+            sync_parent_later(fs, &c.path)?;
             forget(&mut cache, &c.path);
             report.removed += 1;
         }
@@ -906,23 +914,31 @@ fn apply_changes(
                     EntryKind::Conflict => crate::conflict::inspect_entry(store, new, crate::conflict::Audience::Reader)?.executable,
                     _ => new.executable,
                 };
-                if let Err(e) = fs.write(&c.path, &data).and_then(|_| fs.set_executable(&c.path, executable)) {
-                    forget(&mut cache, &c.path);
-                    // Never leave the previous version where the new one
-                    // belongs, or the next snapshot would revert it.
-                    if c.old.is_some() && !local_edit && fs.metadata(&c.path)?.is_some_and(|m| m.kind == NodeKind::File) {
-                        let _ = fs.remove_file(&c.path);
+                // The mode is set on the staged copy, so the barrier makes
+                // it durable with the content.
+                let staged = fs.write_staged(&c.path, &data).and_then(|at| match fs.set_executable(&at, executable) {
+                    Ok(()) => Ok(at),
+                    Err(e) => {
+                        if at != c.path {
+                            let _ = fs.remove_file(&at);
+                        }
+                        Err(e)
                     }
-                    per_file(&mut report, &c.path, e)?;
-                    continue;
-                }
+                });
                 forget(&mut cache, &c.path);
-                report.written += 1;
-                if crlf {
-                    report.crlf.push(c.path.clone());
-                }
-                if let Some(fb) = via_fallback {
-                    report.from_fallback.push((c.path.clone(), fb));
+                let replaces = c.old.is_some() && !local_edit;
+                match staged {
+                    Ok(at) => staging.files.push(Staged {
+                        at,
+                        path: c.path.clone(),
+                        replaces,
+                        crlf,
+                        fallback: via_fallback,
+                    }),
+                    Err(e) => {
+                        drop_previous_version(fs, &c.path, replaces)?;
+                        per_file(&mut report, &c.path, e)?;
+                    }
                 }
             }
             Err(e) if e.is_unreadable() => {
@@ -934,6 +950,7 @@ fn apply_changes(
                         report.kept_local.push(c.path.clone());
                     } else {
                         fs.remove_file(&c.path)?;
+                        sync_parent_later(fs, &c.path)?;
                         forget(&mut cache, &c.path);
                         report.removed += 1;
                         prune_empty_parents(fs, &c.path)?;
@@ -944,12 +961,128 @@ fn apply_changes(
             Err(e) => return Err(e),
         }
     }
+    if !changes.is_empty() {
+        staging.publish(&mut report)?;
+    }
     for w in attrs.warnings().into_iter().chain(eol.from.iter().flat_map(|a| a.warnings())) {
         if !report.warnings.contains(&w) {
             report.warnings.push(w);
         }
     }
     Ok(report)
+}
+
+/// A file checkout staged ([`StorageBackend::write_staged`]) and moves
+/// into place at [`Staging::publish`].
+struct Staged {
+    /// Where its content is now: a temp file beside `path`, or `path`
+    /// itself on a backend that writes in place.
+    at: VPath,
+    path: VPath,
+    /// It replaces the version `from` put at `path` (not a local edit).
+    replaces: bool,
+    crlf: bool,
+    fallback: Option<ObjectId>,
+}
+
+/// The files of one checkout waiting for the barrier (BUG-818). Writing a
+/// file and making it durable one at a time took two `fsync`s per file;
+/// instead every file is staged beside its path, one barrier makes them
+/// all durable, they are renamed into place, and a second barrier makes
+/// the names (and the checkout's removals) durable. Only then does
+/// checkout return, so the caller records the new state (`checkout.json`)
+/// after its files are on disk. Whenever power is lost, each path holds
+/// its old version or its complete new one, never a torn file that the
+/// next snapshot would record as an edit; what a crash leaves staged is
+/// debris that snapshots ignore ([`crate::vfs::is_temp_name`]) and that
+/// resuming the move removes ([`remove_staging_debris`]).
+struct Staging<'a> {
+    fs: &'a dyn StorageBackend,
+    files: Vec<Staged>,
+}
+
+impl Staging<'_> {
+    /// Make the staged files durable, move them into place and make that
+    /// durable, reporting each in `report`. A failed barrier fails the
+    /// checkout: what it covered may never reach the disk, and is never
+    /// renamed into place (a temp file is removed; a file written in
+    /// place is rewritten by the next checkout, which takes a file
+    /// holding the target for one to replace).
+    fn publish(&mut self, report: &mut CheckoutReport) -> Result<()> {
+        let fs = self.fs;
+        fs.sync_barrier()?;
+        let mut renamed = false;
+        self.files.reverse();
+        while let Some(s) = self.files.pop() {
+            if s.at != s.path {
+                if let Err(e) = fs.rename_unsynced(&s.at, &s.path) {
+                    let _ = fs.remove_file(&s.at);
+                    drop_previous_version(fs, &s.path, s.replaces)?;
+                    per_file(report, &s.path, e)?;
+                    continue;
+                }
+                renamed = true;
+            }
+            report.written += 1;
+            if s.crlf {
+                report.crlf.push(s.path.clone());
+            }
+            if let Some(fb) = s.fallback {
+                report.from_fallback.push((s.path, fb));
+            }
+        }
+        if renamed {
+            fs.sync_barrier()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Staging<'_> {
+    fn drop(&mut self) {
+        for s in self.files.drain(..).filter(|s| s.at != s.path) {
+            let _ = self.fs.remove_file(&s.at);
+        }
+    }
+}
+
+/// A new version of `path` could not be put in place. Never leave the
+/// previous version there when it `replaces` it, or the next snapshot
+/// would revert the file.
+fn drop_previous_version(fs: &dyn StorageBackend, path: &VPath, replaces: bool) -> Result<()> {
+    if replaces && fs.metadata(path)?.is_some_and(|m| m.kind == NodeKind::File) {
+        let _ = fs.remove_file(path);
+    }
+    Ok(())
+}
+
+/// Make the removal of `path` durable at the checkout's barrier.
+fn sync_parent_later(fs: &dyn StorageBackend, path: &VPath) -> Result<()> {
+    fs.sync_dir_later(&path.parent().unwrap_or_else(VPath::root))
+}
+
+/// After a move of the working copy from tree `from` to tree `to` was
+/// interrupted and has been finished: remove the temp files the
+/// interrupted checkout staged ([`StorageBackend::write_staged`]) and never
+/// renamed into place, in the directories of the paths it wrote. Snapshots
+/// ignore them anyway; this only tidies the directory.
+pub fn remove_staging_debris(store: &ObjectStore, fs: &dyn StorageBackend, from: &ObjectId, to: &ObjectId) -> Result<()> {
+    let dirs: BTreeSet<VPath> = diff_trees(store, Some(from), Some(to))?
+        .into_iter()
+        .filter(|c| c.new.is_some())
+        .map(|c| c.path.parent().unwrap_or_else(VPath::root))
+        .collect();
+    for dir in dirs {
+        let entries = match fs.list_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.is_not_found() || matches!(e, VeilError::Io { .. } | VeilError::InvalidPath(_)) => continue,
+            Err(e) => return Err(e),
+        };
+        for e in entries.into_iter().filter(|e| e.kind == NodeKind::File && crate::vfs::is_temp_name(&e.name)) {
+            fs.remove_file(&dir.join(&e.name))?;
+        }
+    }
+    Ok(())
 }
 
 /// Materialise change `c` whose new version is a symlink (`form`,
@@ -1241,6 +1374,7 @@ fn prune_empty_parents(fs: &dyn StorageBackend, path: &VPath) -> Result<()> {
             break;
         }
         fs.remove_dir_all(&dir)?;
+        sync_parent_later(fs, &dir)?;
         cur = dir.parent();
     }
     Ok(())

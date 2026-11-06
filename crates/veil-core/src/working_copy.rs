@@ -20,6 +20,15 @@
 //! `snapshot` is deterministic. Without the journal the half-moved
 //! directory would be recorded as an edit of the workspace it was leaving
 //! (BUG-113).
+//!
+//! Checkout makes its files durable with one barrier, before step 3
+//! (BUG-818): until then a file is staged beside its path and renamed into
+//! place only once its content is durable, so whenever the power fails each
+//! path holds its old version or its new one, never a torn file the next
+//! snapshot could record as an edit. Finishing the move rewrites every
+//! file of the diff that holds the target already (an earlier write may
+//! never have reached the disk if its barrier failed), and removes the
+//! staged copies the interrupted checkout left.
 
 use serde::{Deserialize, Serialize};
 
@@ -160,7 +169,11 @@ impl Repo {
             return Ok(None);
         };
         if self.store().has(&p.snapshot) && self.store().has(&state.snapshot) {
-            return self.move_working_copy(fs, state, &p.workspace, p.snapshot, cache).map(Some);
+            let from = state.materialised.view().map_or_else(|| self.snapshot(&state.snapshot).map(|s| s.tree), Ok)?;
+            let to = self.snapshot(&p.snapshot)?.tree;
+            let report = self.move_working_copy(fs, state, &p.workspace, p.snapshot, cache)?;
+            crate::checkout::remove_staging_debris(self.store(), fs, &from, &to)?;
+            return Ok(Some(report));
         }
         state.workspace = p.workspace;
         state.pending = None;
