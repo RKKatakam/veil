@@ -60,10 +60,11 @@ pub fn state_dir(root: &Path) -> std::path::PathBuf {
 /// | 4 | vl 1.0.0 | first-class conflicts: conflict objects (`veil:conf`) and conflict tree entries |
 /// | 5 | vl 1.0.0 | symlink tree entries and conflict terms, annotated tags (`veil:atag`, `Tag::annotation`, `View::remote_release_tags`) |
 /// | 6 | vl 1.1.0 | the lock-free op log: `op_heads/`, `Operation::{workspace, rewritten}` |
+/// | 7 | vl 1.1.0 | key rings of ring format 4: invites, shares by members, a member's removal of their own device (`docs/HUB.md` §13.12) |
 ///
 /// Every format up to this one is read; see `docs/FORMAT.md` and
 /// `docs/CRYPTO.md`.
-pub const REPO_FORMAT: u32 = 6;
+pub const REPO_FORMAT: u32 = 7;
 
 /// Oldest repository format this build reads (and keeps writing, unchanged,
 /// until `vl upgrade`).
@@ -74,7 +75,7 @@ pub fn min_vl_for_format(format: u32) -> &'static str {
     match format {
         0 | 1 => "0.1.0",
         2..=5 => "1.0.0",
-        6 => "1.1.0",
+        6 | 7 => "1.1.0",
         _ => "a newer release",
     }
 }

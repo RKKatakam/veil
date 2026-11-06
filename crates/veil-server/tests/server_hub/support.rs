@@ -95,6 +95,12 @@ impl TestHub {
         Person::new(self, "anyone")
     }
 
+    /// Someone new, not signed in yet, under a unique name starting with
+    /// `prefix` (an invite's recipient).
+    pub fn newcomer(&self, prefix: &str) -> Person {
+        Person::new(self, &unique(prefix))
+    }
+
     pub fn api(&self) -> Api {
         Api::new(self)
     }

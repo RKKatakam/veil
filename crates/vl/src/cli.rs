@@ -12,7 +12,7 @@ pub const VERSION: &str = concat!(
     env!("VL_GIT_COMMIT"),
     ", repository format ",
     // Kept in step with `veil_core::repo::REPO_FORMAT_VERSION` by a test.
-    "6",
+    "7",
     ")"
 );
 
@@ -21,7 +21,7 @@ pub const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\ncommit: ",
     env!("VL_GIT_COMMIT"),
-    "\nrepository format: 6",
+    "\nrepository format: 7",
     "\ntarget: ",
     env!("VL_TARGET"),
 );
@@ -90,6 +90,32 @@ pub enum Cmd {
     /// Groups of people on the Veil server (the origin remote's project).
     #[command(subcommand)]
     Group(GroupCmd),
+    /// Invite a person to a group (admins): prints a one-time link to send
+    /// them (Slack, email).
+    ///
+    /// The link holds a secret the server never sees. With it, `vl join`
+    /// confirms the person's device and joins them to the group, and their
+    /// device receives the keys of the group's folders' secrets from the
+    /// next teammate's device that is online. It works once, for 7 days.
+    /// `vl group add … --confirm FINGERPRINT` is the other way to confirm a
+    /// person's first device.
+    Invite {
+        /// The person's name on the server (a new name registers them).
+        person: String,
+        /// The group to join.
+        #[arg(long, value_name = "GROUP")]
+        to: String,
+    },
+    /// Join a project with the link `vl invite` printed: signs this device
+    /// in (registering the invited name if it is new), confirms it and
+    /// joins the group.
+    Join {
+        /// The invite link (`veil://host/project#invite=NAME:SECRET`).
+        link: String,
+    },
+    /// One pass of the background key sharing (run by vl itself).
+    #[command(hide = true)]
+    ShareKeys,
     /// Who may see a path; with WHO, give a group, a person or `public`
     /// access to it.
     ///
@@ -229,6 +255,13 @@ pub enum Cmd {
         /// Personal private keys stay on this device.
         #[arg(long, conflicts_with_all = ["remote", "force"])]
         sync_secrets: bool,
+        /// Give each folder's secrets their own key, instead of one key for
+        /// every secret of the project (milestone S1's): lists every secret
+        /// with its new key and who will hold it, then rewrites the lines
+        /// and sets up the keys (with --dry-run: only lists). Admins of a
+        /// Veil server project; commit and push afterwards.
+        #[arg(long, conflicts_with_all = ["remote", "force", "sync_secrets"])]
+        rule_keys: bool,
     },
     /// Show how a change evolved (amends, rewrites, rebases).
     Evolog {
@@ -985,6 +1018,23 @@ pub enum IdentityCmd {
         fingerprint: String,
         /// The server (`veil://host[:port]`); default: the one this device
         /// is signed in to.
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Remove a device on a Veil server: a lost laptop, say. Run it on
+    /// another of your devices; an admin may remove anyone's device in their
+    /// project (run it in a clone of the project).
+    ///
+    /// The device can no longer sign in, and in a clone of a project the
+    /// keys of every secret it could open rotate away from it at once (your
+    /// other devices, and admins', do the same in your other projects in the
+    /// background). It keeps what it already had.
+    Remove {
+        /// The device's fingerprint (`vl identity show` on it, or the one
+        /// `vl group add` showed).
+        fingerprint: String,
+        /// The server (`veil://host[:port]`); default: this clone's, or the
+        /// one this device is signed in to.
         #[arg(long)]
         server: Option<String>,
     },

@@ -46,14 +46,28 @@ without asking. The session token is kept in `$VEIL_HOME/hub.json`, readable
 only by you. Your private keys never leave the device.
 
 **This device** is your device's fingerprint (`vl identity show` prints it
-too). An admin compares it with you once, before your device receives the
-project's secret keys.
+too). Your first device is confirmed once, with an invite link (below) or by
+an admin comparing this fingerprint with you, before it receives secret keys.
 
 **Another device of yours** signs in with the same command and name. It
-waits until you confirm it from a device you already use, then signs in:
+waits until you confirm it from a device you already use, then signs in.
+Run the confirmation in a clone of a project, and that device shares the
+project's secret keys with the new one at once:
 
 ```sh
 vl identity confirm 7C1B-0E44-93AD-2F18-B6C0    # on your laptop: the new device's fingerprint
+```
+
+Nobody else can stop this by making up devices under your name: the new
+device is looked up by its fingerprint, and it waits for a day.
+
+**A lost laptop:** remove it from another of your devices, in a clone of the
+project. It can no longer sign in, and the keys of every secret it could open
+rotate away from it (it keeps what it already had). An admin can do the same
+for anyone's device in their project.
+
+```sh
+vl identity remove 7C1B-0E44-93AD-2F18-B6C0
 ```
 
 ## A project: you are its admin
@@ -73,15 +87,41 @@ Sent 8 object(s) to origin
 
 ## Groups and folder access
 
-Admins create groups, add people (who signed in once), and choose managers;
-a group's managers add and remove other people in it, never themselves:
+Admins create groups, add people, and choose managers; a group's managers
+add and remove other people in it, never themselves:
 
 ```sh
 vl group create finance
-vl group add finance alice bob
+vl invite alice --to finance       # someone new, or a remote teammate
+vl group add finance bob           # someone whose device is confirmed already
 vl group manager finance carol
 vl group list
 ```
+
+**An invite** is the easy way to bring someone in:
+
+```text
+$ vl invite alice --to finance
+Invited alice to finance in acme. Send them this link (Slack, email):
+
+  veil://127.0.0.1:8443/acme#invite=alice:5f2c…
+
+  They run: vl join 'veil://127.0.0.1:8443/acme#invite=alice:5f2c…'
+  It works once, for 7 days. The server never sees the secret in it: their device's keys for billing/ come from it.
+```
+
+Alice runs `vl join` with the link. It signs her device in (registering the
+name `alice` if it is new), joins her to `finance`, and confirms her device:
+the next teammate's device that runs `vl` gives it the keys of `finance`'s
+folders. The link holds a secret that never reaches the server, so a
+hacked server cannot use it to slip in a device of its own. If someone else
+uses a leaked link first, alice's `vl join` says it was used: remove that
+device (`vl identity remove`) and invite her again.
+
+Without an invite, an admin's `vl group add` shows `confirm alice's device:
+4F2A-…` for a device nothing confirms yet; compare it with what `vl identity
+show` prints on alice's device, then run `vl group add finance alice --confirm
+4F2A-9C1E-77B0-D3E5-A1C2` (one person at a time).
 
 Access is written in `.veilpolicy`, one line per folder, **the last matching
 line winning**:
@@ -146,28 +186,42 @@ vl push
 
 - **New repositories encrypt shared secrets** (`.env`, `.env.*`, `.envrc`,
   Terraform state) on your device and sync them; the policy `vl init` writes
-  says so. Only devices holding the project's key open them.
+  says so (`cloak rule`).
+- **Each folder's secrets have their own key**, held by whoever may see the
+  folder, and by the admins: `finance` opens `billing/.env`, and nothing that
+  opens `infra/.env`. A secret no access line gives anyone is the admins'.
+  `vl access` sets up the folder's key.
 - **Personal private keys and credentials** (`id_rsa`, `id_ed25519`,
   `*.pem`, `*.key`, `.netrc`, …) never leave your device; the server refuses
   them.
-- **Keys come from an admin's signature, for confirmed devices only.** When
-  an admin adds you to a group, their `vl` grants you the key, but only for
-  devices vouched for outside the server. The first time, it shows
-  `confirm alice's device: 4F2A-…`; the admin checks it with you and runs
-  `vl group add finance alice --confirm 4F2A-9C1E-77B0-D3E5-A1C2` (one
-  person at a time). Devices
-  you confirm yourself (`vl identity confirm`) get the key the next time an
-  admin adds you. A server that lists a device of its own under your name
-  gets nothing. A manager's addition gives you the folder but not the key,
-  until an admin's device signs. Leaving your last group rotates the key
-  away from all your devices; a removal that leaves you in another group
-  says so.
+- **Keys reach confirmed devices only, on their own.** A device is confirmed
+  by an invite, by an admin's `--confirm`, or by its person from another of
+  their devices. Teammates' devices that hold a key share it with confirmed
+  devices in the background, within seconds of running any `vl` command (set
+  `VEIL_KEY_SHARE=0` to turn that off on a device). The key ring checks every
+  share: a server that lists a device of its own under your name gets
+  nothing, whatever it claims.
+- **Removing someone rotates only the keys they lose**: leaving `finance`
+  rotates `billing/`'s key away from all their devices, even ones the server
+  hides; if another group still gives them the folder, the removal says so.
+  A manager's addition gives the folder but not the key, and a manager's
+  removal asks an admin to rotate it.
 - **An existing repository** starts syncing its secrets only when you ask,
   after seeing the list:
 
 ```sh
 vl upgrade --sync-secrets --dry-run
 vl upgrade --sync-secrets
+```
+
+- **A project from before keys per folder** (one key for every secret) moves
+  only when an admin asks: it lists every secret with its new key and who
+  will hold it, and the old key becomes the admins' only. Then commit and
+  push; everyone else runs `vl pull`, then `vl policy accept`.
+
+```sh
+vl upgrade --rule-keys --dry-run
+vl upgrade --rule-keys
 ```
 
 ## What someone without access sees

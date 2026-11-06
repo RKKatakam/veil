@@ -380,8 +380,11 @@ fn granting_a_low_order_public_key_does_not_publish_the_scope_key() {
     for c in &ring.log {
         match &c.op {
             RingOp::Genesis { members, .. } => all.extend(members.iter().map(|m| &m.wrapped)),
-            RingOp::Grant { member } => all.push(&member.wrapped),
-            RingOp::Revoke { rotation, .. } | RingOp::Rotate { rotation } => all.extend(rotation.wrapped.values()),
+            RingOp::Grant { member } | RingOp::Share { member, .. } => all.push(&member.wrapped),
+            RingOp::Revoke { rotation, .. } | RingOp::Rotate { rotation } | RingOp::RevokeOwn { rotation, .. } => {
+                all.extend(rotation.wrapped.values())
+            }
+            RingOp::Invite { .. } | RingOp::Uninvite { .. } => {}
         }
     }
     assert!(!all.is_empty());

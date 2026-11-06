@@ -1,0 +1,8 @@
+{
+  "format": 2,
+  "name": "alice",
+  "public": "veil1dda427094a9391c0e1332c4b1da097e71a65921f039b983d34f621ad87d40a1b",
+  "signing": "16bc3bf0845cf61ed2f4e2c6f02a97d545400aeb79587365d04944c1ac5bae66",
+  "encryption_secret": "afb72c531e07fbbe713d9826111f06c7adaee2bf554d2c5058e297fa9c1a1114",
+  "signing_secret": "fa95cf7f0827ec0b0c4e8a9393c4f77d46a2fcc442b6464a68b09934a201b149"
+}

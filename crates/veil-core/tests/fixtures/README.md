@@ -59,9 +59,23 @@ release still opens, reads, verifies, `fsck`s, upgrades and syncs it.
   A (attribution) and C (partial clone) extend it, and regenerate this set
   with their additions before the release.
 
+* `format-7/`: the release that introduced format 7 (key rings of ring
+  format 4: invites, shares by members, a member's removal of their own
+  device; `docs/HUB.md` §13.12), generated with `VEIL_FIXTURE_EXTRAS=<core_format
+  test binary> generate.sh target/debug/vl …/format-7 …/format-6`. Before the
+  pushes, the `write_format_7_extras` test adds the scope `rule-fixture`:
+  alice invites bob (a fixed test invite secret) and shares the key under his
+  join; bob shares it with a laptop he vouched for and removes it again. It
+  reaches `team-remote/` with the push. `upgraded/` is format-6's `alice/` and
+  `team-remote/` after `vl upgrade` (6 → 7); its one more commit pushes `main`
+  only (`generate.sh` now pushes `--tag main` there: the format-6 extras amend
+  `links` after that set's push). No object encoding changed.
+
 `encodings.txt` pins the bytes of every object encoding. Append to it (with
 `VEIL_BLESS_ENCODINGS=1`) only together with a new format; see
 `docs/FORMAT.md` §4 and §6.
 
 The identity files (`home-*/identity.json`) hold test-only keys, and
-`alice/.env` is a deliberately harmless isolated file.
+`alice/.env` is a deliberately harmless file: isolated up to the format-6
+set, sealed for `team` from the format-7 set on (`vl init` syncs shared
+secrets).

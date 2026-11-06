@@ -22,7 +22,7 @@ use veil_core::{
     pack::{IDX_MAGIC, PACK_MAGIC},
     remote,
     identity::WrappedKey,
-    keychain::{current_key_has_legacy_wraps, HpkeMigration, KeyRing, RingOp, RING_FORMAT},
+    keychain::{current_key_has_legacy_wraps, HpkeMigration, KeyRing, RingOp, RING_FORMAT, RING_FORMAT_HPKE},
     repo::{read_config, MIN_REPO_FORMAT, REPO_FORMAT},
     tree::{lookup, walk_files},
     upgrade::{upgrade, UpgradeOptions, JOURNAL_PATH},
@@ -387,7 +387,7 @@ fn upgrade_5_to_6_keeps_every_id() {
         })
         .collect();
     let r = upgrade(fx.backend("alice"), Some(fx.identity("alice")), &UpgradeOptions::default()).unwrap();
-    assert_eq!((r.from, r.to), (5, 6));
+    assert_eq!((r.from, r.to), (5, REPO_FORMAT));
     assert!(r.steps.contains(&"5->6:op-heads".to_string()) && r.steps.contains(&"6:remove-op-head".to_string()), "{:?}", r.steps);
     assert!(r.notes.iter().any(|n| n.contains("no longer wait")), "{:#?}", r.notes);
     assert!(!dir.join(".veil/op_head").exists());
@@ -398,7 +398,7 @@ fn upgrade_5_to_6_keeps_every_id() {
         assert_eq!(now, Some(bytes), "{} changed or vanished", p.display());
     }
     let repo = fx.open("alice", Some("alice"));
-    assert_eq!(repo.format(), 6);
+    assert_eq!(repo.format(), REPO_FORMAT);
     assert_eq!(repo.view(), &before_view);
     assert_fsck_clean(fx.backend("alice"), Some(fx.identity("alice")));
 }
@@ -455,7 +455,7 @@ fn write_format_6_extras() {
         r
     };
     let (mut a, mut b) = (open(), open());
-    assert_eq!(a.format(), 6, "the format-6 extras go into a format-6 set");
+    assert!(a.format() >= 6, "the format-6 extras go into a format-6 set or later");
     // A public change (`links`, from the format-5 extras), not `main`,
     // whose line is under an unreleased embargo.
     let x = tag(&a, "links");
@@ -482,6 +482,69 @@ fn write_format_6_extras() {
     tx_d.view.tags.insert("head-d".into(), veil_core::oplog::Tag::new(main, None));
     tx_c.commit().unwrap();
     tx_d.commit().unwrap();
+}
+
+/// The fixed secret of the format-7 set's invite (a test value).
+const FORMAT_7_INVITE: &str = "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f";
+/// The scope of the format-7 set's ring of format 4.
+const FORMAT_7_SCOPE: &str = "rule-fixture";
+
+/// Fixture generator (format 7, `generate.sh` runs it on `alice/` before
+/// the pushes): a ring of format 4 (`docs/HUB.md` §13.12). alice starts
+/// `rule-fixture`, invites bob, and shares the key with bob's device under
+/// his join; bob (a member) shares it with a laptop of his he vouched for,
+/// then removes the laptop again (`revoke_own`), rotating the key.
+#[test]
+#[ignore = "fixture generator: run by tests/fixtures/generate.sh"]
+fn write_format_7_extras() {
+    use veil_core::{
+        hub::wire::{vouch_message, InviteKey},
+        keychain::ShareProof,
+    };
+    let Ok(out) = std::env::var("VEIL_FIXTURE_DIR") else { return };
+    let out = PathBuf::from(out);
+    let who = |h: &str| Identity::from_json(&std::fs::read_to_string(out.join(format!("home-{h}/identity.json"))).unwrap()).unwrap();
+    let (alice, bob) = (who("alice"), who("bob"));
+    let repo = |id: &Identity| Repo::open(Arc::new(DiskBackend::new(out.join("alice"))), Some(id.clone()), &id.name).unwrap();
+    let a = repo(&alice);
+    assert!(a.format() >= 7, "the format-7 extras go into a format-7 set or later");
+    let key = InviteKey::from_hex(FORMAT_7_INVITE).unwrap();
+    a.keys().create_scope(FORMAT_7_SCOPE).unwrap();
+    a.keys().invite(FORMAT_7_SCOPE, "bob", &key.public_hex(), 4_102_444_800_000).unwrap();
+    let pid = |i: &Identity| veil_core::identity::parse_public_identity(&i.public_id()).unwrap();
+    let join = ShareProof::Invite {
+        key: key.public_hex(),
+        signature: key.sign_join("bob", &pid(&bob)).unwrap(),
+    };
+    a.keys().share(FORMAT_7_SCOPE, &bob.public_id(), "bob", join).unwrap();
+    drop(a);
+    let b = repo(&bob);
+    let laptop = Identity::generate("bob");
+    let vouch = ShareProof::Vouch {
+        by: bob.verifying_hex(),
+        signature: bob.sign(veil_core::crypto::domains::SIG_CONTEXT_HUB_DEVICE, &vouch_message(&pid(&laptop)).unwrap()),
+    };
+    b.keys().share(FORMAT_7_SCOPE, &laptop.public_id(), "bob", vouch).unwrap();
+    assert!(b.keys().revoke_device(FORMAT_7_SCOPE, &laptop.public_hex()).unwrap());
+}
+
+/// The format-7 set's ring of format 4 verifies on this build: bob holds
+/// the key through his invite, the invite is used, and the laptop he
+/// removed holds no current key.
+#[test]
+fn format_7_fixture_ring_verifies() {
+    let fx = Fixture::new(7);
+    let ring = fx.open("alice", Some("alice")).keys().load_ring(FORMAT_7_SCOPE).unwrap().expect("the set has the format-4 ring");
+    assert_eq!(ring.format, veil_core::keychain::RING_FORMAT_SHARES);
+    let st = ring.verify().unwrap();
+    assert!(st.invites.values().all(|i| i.used));
+    assert!(matches!(ring.log.last().unwrap().op, RingOp::RevokeOwn { .. }));
+    assert_eq!(st.members.values().filter(|m| m.name == "bob").count(), 1);
+    let bob = fx.open("alice", Some("bob"));
+    assert!(bob.keys().sealing_key(FORMAT_7_SCOPE).is_ok(), "bob cannot open the key his invite gave him");
+    // The team remote holds it too.
+    let remote = Repo::open(fx.backend("team-remote"), None, "remote").unwrap();
+    assert_eq!(remote.keys().load_ring(FORMAT_7_SCOPE).unwrap().unwrap(), ring);
 }
 
 /// Format-6 operation fields are refused below format 6, as format-5
@@ -721,8 +784,16 @@ fn check_fixture_reads(format: u32) {
         wrapper_of(repo.store(), &tree).unwrap().is_some(),
         "main is under an embargo wrapper"
     );
-    // Isolated files never entered history.
-    assert!(read(&repo, &main, ".env").is_none());
+    // Isolated files never entered history. From the format-7 set on,
+    // `vl init` seals and syncs `.env` (`cloak rule`: with no access line,
+    // the admins' `team` key).
+    if format >= 7 {
+        let e = lookup(repo.store(), &tree, &p(".env")).unwrap().unwrap();
+        assert_eq!(e.visibility, Visibility::Cloaked { scope: "team".into() });
+        assert!(read_str(&repo, &main, ".env").unwrap().contains("fixture-not-a-secret"));
+    } else {
+        assert!(read(&repo, &main, ".env").is_none());
+    }
     // Signatures, ring, embargo records, vault.
     for id in repo.topo_children_first([main]).unwrap() {
         let s = repo.snapshot(&id).unwrap();
@@ -1248,6 +1319,9 @@ fn wraps(ring: &KeyRing) -> Vec<(&'static str, WrappedKey)> {
             RingOp::Grant { member } => out.push(("grant", member.wrapped.clone())),
             RingOp::Revoke { rotation, .. } => out.extend(rotation.wrapped.values().map(|w| ("revoke", w.clone()))),
             RingOp::Rotate { rotation } => out.extend(rotation.wrapped.values().map(|w| ("rotate", w.clone()))),
+            RingOp::Share { member, .. } => out.push(("share", member.wrapped.clone())),
+            RingOp::RevokeOwn { rotation, .. } => out.extend(rotation.wrapped.values().map(|w| ("revoke-own", w.clone()))),
+            RingOp::Invite { .. } | RingOp::Uninvite { .. } => {}
         }
     }
     out
@@ -1275,7 +1349,7 @@ fn format3_fixture_uses_only_the_standard_constructions() {
     assert_eq!(legacy, 0, "a format-3 repository wrote legacy sealed objects");
     assert!(siv > 0);
     let ring = ring_of(&alice, "team");
-    assert_eq!(ring.format, RING_FORMAT);
+    assert_eq!(ring.format, RING_FORMAT_HPKE);
     assert!(wraps(&ring).iter().all(|(_, w)| w.is_hpke()), "legacy key wrapping in a format-3 ring");
     for who in ["alice", "bob", "carol"] {
         assert!(!fx.identity(who).signing_key_is_derived(), "{who}: new identities have independent keys");
@@ -1391,7 +1465,7 @@ fn upgrade_to_3_rotates_rings_to_hpke_and_reseals_nothing() {
         assert!(old_ids.iter().all(|id| now.contains(id)), "an object disappeared");
         // The ring grew by exactly one signed rotation, wrapped with HPKE.
         let ring = ring_of(&repo, "team");
-        assert_eq!(ring.format, RING_FORMAT);
+        assert_eq!(ring.format, RING_FORMAT_HPKE);
         assert_eq!(ring.log[..old_ring.log.len()], old_ring.log[..]);
         assert_eq!(ring.log.len(), old_ring.log.len() + 1);
         let RingOp::Rotate { rotation } = &ring.log.last().unwrap().op else { panic!() };

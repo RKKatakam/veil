@@ -251,7 +251,7 @@ fn existing_repositories_switch_to_synced_secrets_only_through_the_upgrade_step(
     env.ok("alice", &proj, &["init"]);
     // An existing repository: its policy has no rules for shared secrets.
     let policy = read(&proj, ".veilpolicy");
-    let legacy: String = policy.lines().filter(|l| !l.contains("cloak team")).map(|l| format!("{l}\n")).collect();
+    let legacy: String = policy.lines().filter(|l| !l.contains("cloak rule")).map(|l| format!("{l}\n")).collect();
     write(&proj, ".veilpolicy", &legacy);
     write(&proj, ".env", "TOKEN=LEGACY-SECRET-VALUE-aa11\n");
     write(&proj, "svc/.env.local", "TOKEN=LEGACY-SECRET-VALUE-bb22\n");
@@ -295,8 +295,11 @@ fn access_lines_record_plain_text_and_never_weaken_secrets() {
     env.ok("alice", &proj, &["commit", "-m", "c"]);
     let files = recorded(&env, &proj);
     assert_eq!(tier_of(&files, "ledger/invoice.txt"), Some("public"), "folders under access lines are plain text: {files:?}");
-    assert_eq!(tier_of(&files, "ledger/.env"), Some("cloaked:team"), "{files:?}");
-    assert_eq!(tier_of(&files, "src/.env"), Some("cloaked:team"), "a public line never exposes a secret: {files:?}");
+    // Each line's secrets under that line's own key (docs/HUB.md §13.12).
+    let ledger = format!("cloaked:{}", veil_core::policy::rule_scope_of("ledger"));
+    let src = format!("cloaked:{}", veil_core::policy::rule_scope_of("src"));
+    assert_eq!(tier_of(&files, "ledger/.env"), Some(ledger.as_str()), "{files:?}");
+    assert_eq!(tier_of(&files, "src/.env"), Some(src.as_str()), "a public line never exposes a secret: {files:?}");
     assert_eq!(tier_of(&files, "src/id_ed25519"), None, "{files:?}");
     let bytes = store_bytes(&proj);
     assert!(!holds(&bytes, "BILLING-SECRET-VALUE-77ee") && !holds(&bytes, "SRC-SECRET-VALUE-88ff"));
@@ -323,4 +326,19 @@ fn access_edits_the_line_that_decides() {
     let rules = veil_core::hub::access::AccessPolicy::parse(&text);
     let deciding = &rules.rules[rules.deciding("ledger/x").unwrap()];
     assert!(!deciding.public && deciding.names == ["finance"], "ledger/ is still decided by {deciding:?}:\n{text}");
+}
+
+/// BUG-839 (pre-existing). An access line over a folder that holds a
+/// shared secret publishes nothing, yet every snapshot warns that the
+/// policy tries to make the secret public.
+#[test]
+#[ignore = "BUG-839: an access line over a shared secret warns that it makes it public"]
+fn bug_839_an_access_line_does_not_warn_that_it_publishes_a_secret() {
+    let env = Env::new();
+    let proj = env.dir("proj");
+    env.ok("alice", &proj, &["init"]);
+    env.ok("alice", &proj, &["access", "ledger/", "finance"]);
+    write(&proj, "ledger/.env", "TOKEN=LEDGER-SECRET-VALUE-39cc\n");
+    let out = env.ok("alice", &proj, &["commit", "-m", "c"]);
+    assert!(!out.contains("tries to make built-in secret"), "{out}");
 }

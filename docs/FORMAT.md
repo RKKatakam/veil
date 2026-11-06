@@ -20,6 +20,7 @@ There is one **repository format**, a number in `.veil/repo.json`:
 | 4 | 1.0.0 | first-class conflicts: conflict objects (`veil:conf`, §3.6) and conflict entries in binary trees (flag bit 6) |
 | 5 | 1.0.0 | symlink tree entries (flag bit 7 and a kind byte, §3.7) and conflict terms (§3.6), annotated tags (`veil:atag`, §3.8; `Tag.annotation`) |
 | 6 | 1.1.0 | the lock-free op log: heads in `.veil/op_heads/` instead of `.veil/op_head`, operations gain `workspace` and `rewritten` (§2, §5 "Format 6"). Not yet built: snapshot attribution (`Snapshot.agent`) and the `partial` marker for fetch on demand (`docs/design/scale/PLAN.md` §1) |
+| 7 | 1.1.0 | key rings of ring format 4: invites, shares by members, a member's removal of their own device (`docs/HUB.md` §13.12). No object encoding changes; the upgrade 6 → 7 rewrites nothing |
 
 * `vl init` writes the newest format (`repo::REPO_FORMAT`). `vl clone` takes
   the format of its source, so that what the clone writes can be pushed
@@ -72,7 +73,8 @@ not be understood.
 | pull spool `.veil/objects/incoming/pull-<owner>/` | a pull's downloaded packs (`PackWriter` streams), and its loose objects under `loose/<hex id>` | none | no | one per pull (the transaction's owner), removed when the pull ends, or by `Repo::open` once its owner is gone. Format 5 used the fixed `incoming/pull`, emptied under the lock; `vl upgrade` to 6 removes it |
 | working-copy locks `.veil/local/wc/ws-<name>.lock` (format 6) | empty, `flock`ed | none | no (device-local) | one recorder of a workspace's directory at a time (the project directory, `ws exec`, `ws write`, mounts); released by the kernel when the process ends. An older vl ignores the directory |
 | pruned-ops list `.veil/ops_pruned` | one hex id per line | fixed | no | append-only |
-| key rings `.veil/meta/keyrings/<scope>.json` | pretty JSON `KeyRing` | `format` (0/1 legacy, 2 signed log, 3 signed log that may hold HPKE-wrapped keys) | yes | readers reject `format > 3` (no keys, a warning on sync); a ring with an HPKE wrap must say 3, and a format-1/2 repository refuses to store it |
+| key rings `.veil/meta/keyrings/<scope>.json` | pretty JSON `KeyRing` | `format` (0/1 legacy, 2 signed log, 3 signed log that may hold HPKE-wrapped keys, 4 signed log that may hold `invite`, `uninvite`, `share` and `revoke_own` changes) | yes | readers reject `format > 4` (no keys, a warning on sync); a ring with an HPKE wrap must say 3 or more, a ring with a format-4 change must say 4; a format-1/2 repository refuses to store format 3, a format-3 to 6 one format 4 (`vl upgrade`) |
+| — ring format 4 changes | `{"kind": "invite", person, key, expires_at}`, `{"kind": "uninvite", key}`, `{"kind": "share", member, proof: {"kind": "invite", key, signature} \| {"kind": "vouch", by, signature}}`, `{"kind": "revoke_own", member, rotation}`, in the signed body like every change | ring format 4 | yes | the rules the replay applies are in `docs/HUB.md` §13.12; a share and a `revoke_own` are signed by a current member, the others by an admin |
 | — wrapped key (in a ring change) | JSON: legacy `{ephemeral, sealed}` or HPKE `{hpke, enc, ct}` | shape + `hpke` suite string | yes | legacy written by format 1–2, HPKE by format 3 (CRYPTO.md C3/C3L); unknown fields or suites refused |
 | — member binding (in a genesis member or grant) | `"binding": hex(Ed25519 signature)`, after `signing_key`; absent when not recorded | ring format 3 | yes | written from repository format 3 only (CRYPTO.md C4); a ring with one must say format 3, so format-1/2 repositories and older vl never receive it. Added to ring format 3 before any release wrote that format; the format-3 fixtures predate it and carry none |
 | embargo records `.veil/meta/embargoes/<id>.json` | pretty JSON `EmbargoRecord` | implicit 1; a later format adds `"format": N` | yes | readers reject `format > 1` |
@@ -406,6 +408,23 @@ still waiting for its admin.
   `put_raw` refuses the push as a whole.
 * **Downgrades** are not supported: an older vl refuses a format-2
   repository with a message naming the release it needs.
+
+### Format 7 (key rings of ring format 4)
+
+* **Nothing is rewritten** (`6 → 7` has no step): rings keep their format
+  until a change needs ring format 4 (an invite, a share by a member, a
+  member's removal of their own device, `docs/HUB.md` §13.12), which only
+  a format-7 repository stores. `repo.json` gets the new format.
+* **Clones of a Veil server project** are made at the newest format. A
+  format-6 clone that pulls a ring of format 4 keeps its own ring and warns
+  ("vl upgrade"): no keys are lost, it just receives none from shares until
+  it is upgraded.
+* **Keys per access rule** are not a format change: `cloak rule` is a
+  policy word (`policy::RULE_SCOPE`); an older vl reads it as a scope named
+  `rule`, holds no key for it, and keeps the file on the device. A project
+  sealed with S1's one `team` key moves only through `vl upgrade
+  --rule-keys` (admins), which lists every secret and who will hold its key
+  first (`docs/HUB.md` §13.12, "Migration").
 
 ### Format 6 (the lock-free op log)
 

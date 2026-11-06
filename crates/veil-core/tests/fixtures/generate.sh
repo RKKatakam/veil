@@ -24,6 +24,9 @@
 # From format 4 on, alice/ also holds a merge with conflict entries (tag
 # `conflicted`): a cloaked file's conflict left unresolved, a public one
 # resolved with `vl resolve`.
+# From format 7 on, alice/ also holds a key ring of ring format 4 (scope
+# `rule-fixture`: an invite, shares by members, a member's removal of their
+# own device), written by the `write_format_7_extras` test before the pushes.
 # From format 6 on, the last thing written to alice/ is concurrent
 # operations (the `write_format_6_extras` test): a merge whose sides carry
 # `rewritten` and `workspace`, and two heads left unmerged.
@@ -147,6 +150,12 @@ as alice ws new fix-b -r main --cloak team >/dev/null
 printf 'pub fn fix_b() {}\n' | as alice ws write fix-b src/fix_b.rs >/dev/null
 as alice merge fix-b@ --into main --embargo --until 2099-01-01 -m "Fix B (embargoed)" >/dev/null
 
+# Format 7 on: a ring of format 4 (an invite, shares by members, a member's
+# removal of their own device), pushed with the rest.
+if [ "$("$VL" --version | sed -n 's/^repository format: //p')" -ge 7 ]; then
+    VEIL_FIXTURE_DIR="$OUT" "$VEIL_FIXTURE_EXTRAS" --ignored --exact format_compat::write_format_7_extras >/dev/null
+fi
+
 # A cloaked tag and a vault secret.
 as alice tag set team-only -r fix-a@ --cloak team >/dev/null
 as alice secret set API_TOKEN fixture-value >/dev/null
@@ -187,7 +196,9 @@ if [ -n "$PREV" ]; then
     printf 'after the upgrade\n' > "$U/alice/UPGRADED.md"
     up alice commit -m "fourth: after the upgrade" >/dev/null
     up alice tag set main -r @- >/dev/null
-    up alice push origin >/dev/null 2>&1
+    # Only `main`: the format-6 set's extras amend `links` after its push,
+    # so its other tags differ from its remote.
+    up alice push origin --tag main >/dev/null 2>&1
     test ! -e "$U/alice/.veil/lock"
     test ! -e "$U/alice/.veil/upgrade.json"
 fi

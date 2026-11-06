@@ -99,6 +99,15 @@ struct ServerEntry {
     person: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hub_key: Option<String>,
+    /// Devices this device's person confirmed as an admin, by fingerprint
+    /// (person → signing keys): trusted later, when a rule's key ring is
+    /// created after the confirmation (`docs/HUB.md` §13.12).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    confirmed: BTreeMap<String, Vec<String>>,
+    /// Invites this device made (public key → person): a join under one
+    /// confirms the joining device for rings created after the invite.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    invites: BTreeMap<String, String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -140,15 +149,54 @@ fn save_file(f: &HubFile) -> Result<()> {
 }
 
 fn update_entry(authority: &str, f: impl FnOnce(&mut ServerEntry)) -> Result<()> {
+    // One writer at a time: the background key sharing renews sessions
+    // while a command records a confirmation.
+    let lock = hub_file().with_extension("lock");
+    std::fs::create_dir_all(lock.parent().unwrap())?;
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(lock)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: a valid descriptor; released when `lock` is closed.
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+    }
     let mut file = load_file()?;
     f(file.servers.entry(authority.to_string()).or_default());
-    save_file(&file)
+    let r = save_file(&file);
+    drop(lock);
+    r
 }
 
 /// The fingerprint of a full public identity (`4F2A-9C1E-…`): what
 /// people compare out of band (`docs/HUB.md` §13.11).
 pub fn fingerprint(public_identity: &str) -> Option<String> {
     parse_public_identity(public_identity).ok().and_then(|id| device_fingerprint(&id))
+}
+
+/// What this device confirmed on a server as an admin: devices (person →
+/// signing keys) and invites (key → person).
+pub type Remembered = (BTreeMap<String, Vec<String>>, BTreeMap<String, String>);
+
+/// What this device confirmed on `authority` as an admin. Device-local.
+pub fn remembered(authority: &str) -> Result<Remembered> {
+    Ok(load_file()?.servers.remove(authority).map(|e| (e.confirmed, e.invites)).unwrap_or_default())
+}
+
+/// Remember that this device confirmed `signing_key` as `person`'s device.
+pub fn remember_device(authority: &str, person: &str, signing_key: &str) -> Result<()> {
+    update_entry(authority, |e| {
+        let keys = e.confirmed.entry(person.to_string()).or_default();
+        if !keys.iter().any(|k| k == signing_key) {
+            keys.push(signing_key.to_string());
+        }
+    })
+}
+
+/// Remember an invite this device made.
+pub fn remember_invite(authority: &str, key: &str, person: &str) -> Result<()> {
+    update_entry(authority, |e| {
+        e.invites.insert(key.to_string(), person.to_string());
+    })
 }
 
 /// The servers this device has signed in to (`host:port`), with who it
@@ -435,6 +483,64 @@ impl Client {
     pub fn post_ring(&self, ring: &KeyRing) -> Result<()> {
         let _: serde_json::Value = self.json("POST", &self.url.project_path(&format!("/rings/{}", ring.scope)), Some(ring))?;
         Ok(())
+    }
+
+    /// The server's ring of `scope`, if it has one.
+    pub fn ring(&self, scope: &str) -> Result<Option<KeyRing>> {
+        let (status, out) = self.call("GET", &self.url.project_path(&format!("/rings/{scope}")), None)?;
+        match status {
+            200 => Ok(serde_json::from_slice(&out).ok()),
+            404 => Ok(None),
+            s => Err(Self::error(s, &out)),
+        }
+    }
+
+    /// Send a ring; `Err(Some(why))` if the server refused it as not
+    /// following its ring (it moved on meanwhile, or diverged): fetch it and
+    /// decide again.
+    pub fn try_post_ring(&self, ring: &KeyRing) -> Result<std::result::Result<(), String>> {
+        let (status, out) = self.call(
+            "POST",
+            &self.url.project_path(&format!("/rings/{}", ring.scope)),
+            Some(("application/json", serde_json::to_vec(ring)?)),
+        )?;
+        match status {
+            200 => Ok(Ok(())),
+            409 => Ok(Err(Self::error(status, &out).to_string())),
+            s => Err(Self::error(s, &out)),
+        }
+    }
+
+    /// One of this person's pending devices, by fingerprint.
+    pub fn pending_device(&self, person: &str, fingerprint: &str) -> Result<Option<String>> {
+        let (status, out) = self.call("GET", &format!("/v1/people/{person}/pending/{fingerprint}"), None)?;
+        match status {
+            200 => Ok(Some(serde_json::from_slice::<veil_core::hub::wire::PendingDevice>(&out)?.identity)),
+            404 => Ok(None),
+            s => Err(Self::error(s, &out)),
+        }
+    }
+
+    pub fn remove_device(&self, device: &str, project: Option<&str>) -> Result<Devices> {
+        let req = veil_core::hub::wire::RemoveDevice {
+            device: device.to_string(),
+            project: project.map(str::to_string),
+        };
+        self.json("POST", "/v1/devices/remove", Some(&req))
+    }
+
+    pub fn create_invite(&self, req: &veil_core::hub::wire::InviteRequest) -> Result<()> {
+        let _: veil_core::hub::wire::InviteRequest = self.json("POST", &self.url.project_path("/invites"), Some(req))?;
+        Ok(())
+    }
+
+    pub fn join(&self, req: &veil_core::hub::wire::JoinRequest) -> Result<veil_core::hub::wire::Joined> {
+        self.json("POST", &self.url.project_path("/invites/join"), Some(req))
+    }
+
+    /// People whose devices may wait for keys here (a hint).
+    pub fn pending_keys(&self) -> Result<Vec<Devices>> {
+        self.json("GET", &self.url.project_path("/keys/pending"), None::<&()>)
     }
 }
 

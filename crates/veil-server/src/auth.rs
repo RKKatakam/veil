@@ -16,7 +16,10 @@
 //! * An unknown key may register as a new person, under a name nobody has.
 //!   Under a name somebody has, it becomes one of their **pending**
 //!   devices: no session until one of their devices vouches for it
-//!   (`docs/HUB.md` §13.11). At most [`MAX_PENDING`] per person.
+//!   (`docs/HUB.md` §13.11). A pending device lasts [`PENDING_TTL_MS`]
+//!   (signing in again renews it) and is looked up by its fingerprint, so
+//!   pending devices someone else makes under the name never hide it
+//!   (§13.12): there is no cap per person.
 
 use axum::{
     extract::{FromRequestParts, State},
@@ -35,8 +38,11 @@ use crate::{
 };
 
 pub const CHALLENGE_TTL_MS: i64 = 60_000;
-/// Pending devices kept per person (the newest).
-pub const MAX_PENDING: i64 = 8;
+/// How long a pending device waits to be confirmed.
+pub const PENDING_TTL_MS: i64 = 24 * 3600 * 1000;
+/// Pending devices listed in `Devices::pending` (the newest; for display).
+/// Confirming one looks it up by fingerprint instead.
+pub const LISTED_PENDING: i64 = 8;
 
 /// The code of the answer to a pending device's login.
 pub const DEVICE_PENDING: &str = "device_pending";
@@ -142,7 +148,12 @@ pub async fn login(State(hub): State<HubState>, headers: HeaderMap, Json(req): J
             .fetch_optional(&mut *c)
             .await?;
             if let Some((device, person, name, pending)) = row {
-                return Ok(if pending { Err(name) } else { Ok((device, person, name)) });
+                if pending {
+                    // Signing in again renews the wait.
+                    sqlx::query("UPDATE devices SET created_at = $1 WHERE id = $2").bind(veil_core::now_millis()).bind(device).execute(&mut *c).await?;
+                    return Ok(Err(name));
+                }
+                return Ok(Ok((device, person, name)));
             }
             let Some(name) = name else {
                 return Err(Error::unauthorized("this device is not registered; sign up with a name (`vl login URL --name NAME`)"));
@@ -156,22 +167,29 @@ pub async fn login(State(hub): State<HubState>, headers: HeaderMap, Json(req): J
             let taken: Option<i64> = sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(&name).fetch_optional(&mut *c).await?;
             if let Some(person) = taken {
                 // One of their devices may vouch for it; until then it is
-                // nothing (no session, its signatures not accepted).
+                // nothing (no session, its signatures not accepted). Only
+                // expired pending devices are removed: one still waiting is
+                // kept however many others are made under the name (§13.12).
                 sqlx::query(
-                    "INSERT INTO devices (person_id, signing_key, public_identity, created_at, pending) VALUES ($1, $2, $3, $4, TRUE)",
+                    "DELETE FROM devices d WHERE d.person_id = $1 AND d.pending AND d.created_at < $2 \
+                     AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.device_id = d.id) \
+                     AND NOT EXISTS (SELECT 1 FROM device_vouches v WHERE v.device_id = d.id) \
+                     AND NOT EXISTS (SELECT 1 FROM invites i WHERE i.device_id = d.id)",
+                )
+                .bind(person)
+                .bind(now - PENDING_TTL_MS)
+                .execute(&mut *c)
+                .await?;
+                let fingerprint = veil_core::hub::wire::device_fingerprint(&ident).unwrap_or_default();
+                sqlx::query(
+                    "INSERT INTO devices (person_id, signing_key, public_identity, created_at, pending, fingerprint) \
+                     VALUES ($1, $2, $3, $4, TRUE, $5)",
                 )
                 .bind(person)
                 .bind(&key)
                 .bind(&public_identity)
                 .bind(now)
-                .execute(&mut *c)
-                .await?;
-                sqlx::query(
-                    "DELETE FROM devices WHERE person_id = $1 AND pending AND id NOT IN \
-                     (SELECT id FROM devices WHERE person_id = $1 AND pending ORDER BY id DESC LIMIT $2)",
-                )
-                .bind(person)
-                .bind(MAX_PENDING)
+                .bind(fingerprint)
                 .execute(&mut *c)
                 .await?;
                 return Ok(Err(name));

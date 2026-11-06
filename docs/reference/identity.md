@@ -12,6 +12,7 @@ Subcommands:
 * [`vl identity recover-vault`](#vl-identity-recover-vault): Re-key this repository's local vault, sealed by an identity that was replaced, to the current identity
 * [`vl identity recover-admin`](#vl-identity-recover-admin): Hand the scope admin rights of a replaced identity over to the current one, in this repository: the replaced identity signs a grant that makes the current identity an admin. Push to share it
 * [`vl identity confirm`](#vl-identity-confirm): Confirm that another device of yours is yours, on a Veil server
+* [`vl identity remove`](#vl-identity-remove): Remove a device on a Veil server: a lost laptop, say. Run it on another of your devices; an admin may remove anyone's device in their project (run it in a clone of the project)
 
 ## `vl identity show`
 
@@ -86,6 +87,28 @@ Options:
 | | |
 |---|---|
 | `--server <SERVER>` | The server (`veil://host[:port]`); default: the one this device is signed in to |
+
+## `vl identity remove`
+
+Remove a device on a Veil server: a lost laptop, say. Run it on another of your devices; an admin may remove anyone's device in their project (run it in a clone of the project).
+
+The device can no longer sign in, and in a clone of a project the keys of every secret it could open rotate away from it at once (your other devices, and admins', do the same in your other projects in the background). It keeps what it already had.
+
+```text
+vl identity remove [OPTIONS] <FINGERPRINT>
+```
+
+Arguments:
+
+| | |
+|---|---|
+| `<FINGERPRINT>` | The device's fingerprint (`vl identity show` on it, or the one `vl group add` showed) (required) |
+
+Options:
+
+| | |
+|---|---|
+| `--server <SERVER>` | The server (`veil://host[:port]`); default: this clone's, or the one this device is signed in to |
 
 ---
 

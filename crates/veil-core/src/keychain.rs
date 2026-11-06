@@ -77,15 +77,25 @@ pub const LOCAL_SCOPE: &str = domains::LOCAL_LABEL;
 /// Ring file format with a signed change log (legacy sealed-box wraps only).
 pub const RING_FORMAT_SIGNED: u32 = 2;
 /// Ring file format whose log may hold HPKE-wrapped keys (repository format
-/// 3); the newest this build reads.
-pub const RING_FORMAT: u32 = 3;
+/// 3).
+pub const RING_FORMAT_HPKE: u32 = 3;
+/// Ring file format whose log may hold invites, shares by members and a
+/// member's revocation of their own device (repository format 7,
+/// `docs/HUB.md` §13.12); the newest this build reads.
+pub const RING_FORMAT_SHARES: u32 = 4;
+/// The newest ring format this build reads.
+pub const RING_FORMAT: u32 = RING_FORMAT_SHARES;
 /// Repository format that may hold HPKE-wrapped keys and ring format 3.
 pub const HPKE_REPO_FORMAT: u32 = 3;
+/// Repository format that may hold ring format 4.
+pub const SHARES_REPO_FORMAT: u32 = 7;
 
 /// Newest ring format a repository of `repo_format` may store.
 pub fn max_ring_format(repo_format: u32) -> u32 {
-    if repo_format >= HPKE_REPO_FORMAT {
-        RING_FORMAT
+    if repo_format >= SHARES_REPO_FORMAT {
+        RING_FORMAT_SHARES
+    } else if repo_format >= HPKE_REPO_FORMAT {
+        RING_FORMAT_HPKE
     } else {
         RING_FORMAT_SIGNED
     }
@@ -200,6 +210,42 @@ pub enum RingOp {
     Revoke { member: String, rotation: Rotation },
     /// Start a new key generation for the same members.
     Rotate { rotation: Rotation },
+    /// Ring format 4, signed by an admin: whoever signs a join under `key`
+    /// (the public half of an invite's secret, `hub::wire::InviteKey`) may
+    /// have one device shared to them as `person`, until `expires_at`
+    /// (`docs/HUB.md` §13.12).
+    Invite { person: String, key: String, expires_at: i64 },
+    /// Ring format 4, signed by an admin: the invite under `key` can no
+    /// longer be used.
+    Uninvite { key: String },
+    /// Ring format 4, signed by **any current member**: add a device of a
+    /// person the ring already trusts, at the current generation, with a
+    /// proof the server cannot forge ([`ShareProof`]).
+    Share { member: MemberGrant, proof: ShareProof },
+    /// Ring format 4, signed by a current member: remove another device of
+    /// **their own** (same name) and start a new key generation.
+    RevokeOwn { member: String, rotation: Rotation },
+}
+
+/// Why a member may add a device to a ring ([`RingOp::Share`]). Both are
+/// signatures over the new device's keys that only someone outside the
+/// server can make.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ShareProof {
+    /// A join signed (context `hub-invite`) under the key of an unused,
+    /// unexpired invite for the person (`hub::wire::join_message`).
+    Invite { key: String, signature: String },
+    /// A vouch signed (context `hub-device`) by the signing key `by` of a
+    /// current member with the same name (`hub::wire::vouch_message`).
+    Vouch { by: String, signature: String },
+}
+
+impl RingOp {
+    /// Is this an operation only ring format 4 may hold?
+    fn needs_shares_format(&self) -> bool {
+        matches!(self, RingOp::Invite { .. } | RingOp::Uninvite { .. } | RingOp::Share { .. } | RingOp::RevokeOwn { .. })
+    }
 }
 
 impl RingOp {
@@ -218,6 +264,19 @@ impl RingOp {
                 format!("revoke {} → generation {}", &member[..member.len().min(17)], rotation.generation)
             }
             RingOp::Rotate { rotation } => format!("rotate → generation {}", rotation.generation),
+            RingOp::Invite { person, .. } => format!("invite {person}"),
+            RingOp::Uninvite { key } => format!("cancel invite {}", &key[..key.len().min(16)]),
+            RingOp::Share { member, proof } => format!(
+                "share with {} ({})",
+                member.name,
+                match proof {
+                    ShareProof::Invite { .. } => "invite",
+                    ShareProof::Vouch { .. } => "confirmed by their device",
+                }
+            ),
+            RingOp::RevokeOwn { member, rotation } => {
+                format!("remove own device {} → generation {}", &member[..member.len().min(17)], rotation.generation)
+            }
         }
     }
 }
@@ -330,6 +389,19 @@ pub struct RingState {
     /// Hash of the last change (empty for legacy rings).
     pub head: String,
     pub len: usize,
+    /// Every member id the ring ever held: a share never brings one back.
+    pub ever_members: BTreeSet<String>,
+    /// Invites by key (ring format 4).
+    pub invites: BTreeMap<String, InviteState>,
+}
+
+/// An invite as the ring's replay leaves it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InviteState {
+    pub person: String,
+    pub expires_at: i64,
+    /// A device was shared to under it: it cannot be used again.
+    pub used: bool,
 }
 
 impl RingState {
@@ -349,6 +421,19 @@ impl RingState {
 
     fn admins(&self) -> usize {
         self.members.values().filter(|m| m.role == Role::Admin).count()
+    }
+
+    /// Is `member` a current member whose registered signing key is
+    /// `signing_key` (any role)?
+    pub fn is_member_with_key(&self, member: &str, signing_key: &str) -> bool {
+        self.members.get(member).is_some_and(|m| m.signing_key.as_deref() == Some(signing_key))
+    }
+
+    /// Does the ring trust `person` (`docs/HUB.md` §13.12): one of their
+    /// devices is a current member, or a live invite names them?
+    pub fn trusts(&self, person: &str, now: i64) -> bool {
+        self.members.values().any(|m| m.name == person)
+            || self.invites.values().any(|i| i.person == person && !i.used && now <= i.expires_at)
     }
 
     /// Current members whose member id is a low-order X25519 point: no key
@@ -405,8 +490,11 @@ impl KeyRing {
         let logged = self.log.iter().flat_map(|c| -> Box<dyn Iterator<Item = &WrappedKey> + '_> {
             match &c.op {
                 RingOp::Genesis { members, .. } => Box::new(members.iter().map(|m| &m.wrapped)),
-                RingOp::Grant { member } => Box::new(std::iter::once(&member.wrapped)),
-                RingOp::Revoke { rotation, .. } | RingOp::Rotate { rotation } => Box::new(rotation.wrapped.values()),
+                RingOp::Grant { member } | RingOp::Share { member, .. } => Box::new(std::iter::once(&member.wrapped)),
+                RingOp::Revoke { rotation, .. } | RingOp::Rotate { rotation } | RingOp::RevokeOwn { rotation, .. } => {
+                    Box::new(rotation.wrapped.values())
+                }
+                RingOp::Invite { .. } | RingOp::Uninvite { .. } => Box::new(std::iter::empty()),
             }
         });
         legacy.chain(logged)
@@ -421,15 +509,22 @@ impl KeyRing {
     pub fn has_bindings(&self) -> bool {
         self.log.iter().any(|c| match &c.op {
             RingOp::Genesis { members, .. } => members.iter().any(|m| m.binding.is_some()),
-            RingOp::Grant { member } => member.binding.is_some(),
+            RingOp::Grant { member } | RingOp::Share { member, .. } => member.binding.is_some(),
             _ => false,
         })
     }
 
+    /// Does the log hold an operation of ring format 4?
+    pub fn has_shares(&self) -> bool {
+        self.log.iter().any(|c| c.op.needs_shares_format())
+    }
+
     /// The lowest ring format that can hold this ring's content.
     pub fn required_format(&self) -> u32 {
-        if self.has_hpke_keys() || self.has_bindings() {
-            RING_FORMAT
+        if self.has_shares() {
+            RING_FORMAT_SHARES
+        } else if self.has_hpke_keys() || self.has_bindings() {
+            RING_FORMAT_HPKE
         } else if self.is_legacy() {
             self.format
         } else {
@@ -451,16 +546,24 @@ impl KeyRing {
         // An HPKE-wrapped key in a ring labelled older than format 3 would
         // reach vl releases that cannot read it (and a repository that
         // must not hold it).
-        if self.format < RING_FORMAT && self.has_hpke_keys() {
+        if self.format < RING_FORMAT_HPKE && self.has_hpke_keys() {
             return Err(format!(
-                "ring format {} cannot hold HPKE-wrapped keys (needs ring format {RING_FORMAT})",
+                "ring format {} cannot hold HPKE-wrapped keys (needs ring format {RING_FORMAT_HPKE})",
                 self.format
             ));
         }
         // Older readers would drop a binding and then fail the signature.
-        if self.format < RING_FORMAT && self.has_bindings() {
+        if self.format < RING_FORMAT_HPKE && self.has_bindings() {
             return Err(format!(
-                "ring format {} cannot hold member bindings (needs ring format {RING_FORMAT})",
+                "ring format {} cannot hold member bindings (needs ring format {RING_FORMAT_HPKE})",
+                self.format
+            ));
+        }
+        // Older readers refuse these operations (a member's signature where
+        // they expect an admin's): the ring must say so first.
+        if self.format < RING_FORMAT_SHARES && self.has_shares() {
+            return Err(format!(
+                "ring format {} cannot hold invites or shares (needs ring format {RING_FORMAT_SHARES})",
                 self.format
             ));
         }
@@ -487,6 +590,8 @@ impl KeyRing {
                 bound_signers: BTreeSet::new(),
                 head: String::new(),
                 len: 0,
+                ever_members: self.members.keys().cloned().collect(),
+                invites: BTreeMap::new(),
             });
         }
         let scope = self.scope.as_str();
@@ -516,6 +621,8 @@ impl KeyRing {
                         bound_signers: BTreeSet::new(),
                         head: String::new(),
                         len: 0,
+                        ever_members: BTreeSet::new(),
+                        invites: BTreeMap::new(),
                     };
                     for m in members {
                         if m.generation != 0 || parse_public_key(&m.id).is_err() || st.members.contains_key(&m.id) {
@@ -531,7 +638,14 @@ impl KeyRing {
                 (None, _) => return Err(at("the first change must be a genesis")),
                 (Some(_), RingOp::Genesis { .. }) => return Err(at("a second genesis is not allowed")),
                 (Some(st), op) => {
-                    if !st.is_admin(&c.signer, &c.signing_key) {
+                    // A share or a member's revocation of their own device is
+                    // signed by any current member; everything else by an admin.
+                    let by_member = matches!(op, RingOp::Share { .. } | RingOp::RevokeOwn { .. });
+                    if by_member {
+                        if !st.is_member_with_key(&c.signer, &c.signing_key) {
+                            return Err(at("signer is not a member of the scope at this point (forged change)"));
+                        }
+                    } else if !st.is_admin(&c.signer, &c.signing_key) {
                         return Err(at("signer is not an admin of the scope at this point (forged change)"));
                     }
                     match op {
@@ -567,6 +681,52 @@ impl KeyRing {
                             check_rotation(st, rotation, &all).map_err(|e| at(&e))?;
                             st.generation = rotation.generation;
                             st.generations.push(rotation.key_id.clone());
+                        }
+                        RingOp::RevokeOwn { member, rotation } => {
+                            let signer_name = &st.members[&c.signer].name;
+                            let Some(info) = st.members.get(member) else {
+                                return Err(at("revokes a non-member"));
+                            };
+                            if info.name != *signer_name {
+                                return Err(at("a member may remove only their own devices"));
+                            }
+                            if info.role == Role::Admin && st.admins() == 1 {
+                                return Err(at("would leave the scope without an admin"));
+                            }
+                            let remaining: BTreeSet<&String> = st.members.keys().filter(|k| *k != member).collect();
+                            check_rotation(st, rotation, &remaining).map_err(|e| at(&e))?;
+                            st.members.remove(member);
+                            st.generation = rotation.generation;
+                            st.generations.push(rotation.key_id.clone());
+                        }
+                        RingOp::Invite { person, key, expires_at } => {
+                            if !crate::policy::valid_principal_name(person) {
+                                return Err(at("invites an invalid name"));
+                            }
+                            if !valid_verifying_key(key) {
+                                return Err(at("invite key is not an Ed25519 public key"));
+                            }
+                            if st.invites.contains_key(key) || st.ever_signers.contains_key(key) {
+                                return Err(at("invite key is already in use"));
+                            }
+                            st.invites.insert(
+                                key.clone(),
+                                InviteState {
+                                    person: person.clone(),
+                                    expires_at: *expires_at,
+                                    used: false,
+                                },
+                            );
+                        }
+                        RingOp::Uninvite { key } => {
+                            let Some(i) = st.invites.get_mut(key) else {
+                                return Err(at("cancels an unknown invite"));
+                            };
+                            i.used = true;
+                        }
+                        RingOp::Share { member, proof } => {
+                            check_share(st, member, proof, c.timestamp).map_err(|e| at(&e))?;
+                            add_member(st, member).map_err(|e| at(&e))?;
                         }
                     }
                 }
@@ -615,6 +775,7 @@ fn add_member(st: &mut RingState, m: &MemberGrant) -> std::result::Result<(), St
             }
         }
     }
+    st.ever_members.insert(m.id.clone());
     st.members.insert(
         m.id.clone(),
         MemberInfo {
@@ -624,6 +785,69 @@ fn add_member(st: &mut RingState, m: &MemberGrant) -> std::result::Result<(), St
             role: m.role,
         },
     );
+    Ok(())
+}
+
+/// Is `key` an Ed25519 verifying key in hex?
+pub fn valid_verifying_key(key: &str) -> bool {
+    hex::decode(key)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .is_some_and(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).is_ok())
+}
+
+/// The replay's rules for a member's share (`docs/HUB.md` §13.12): a new,
+/// bound device of a person the ring trusts, at the current generation,
+/// proved by an invite join or by a vouch of that person's own device.
+/// `at` is the share's signed time. Marks an invite used.
+fn check_share(st: &mut RingState, m: &MemberGrant, proof: &ShareProof, at: i64) -> std::result::Result<(), String> {
+    if m.role != Role::Member {
+        return Err("a share adds a member, never an admin".into());
+    }
+    if m.generation != st.generation {
+        return Err("share wraps a key from the wrong generation".into());
+    }
+    if st.ever_members.contains(&m.id) {
+        return Err("shares to a device the ring held before (a removed device is never shared to again)".into());
+    }
+    let (Some(k), Some(_)) = (&m.signing_key, &m.binding) else {
+        return Err("a shared device must carry its signing key and binding".into());
+    };
+    if st.ever_signers.contains_key(k) || st.invites.contains_key(k) {
+        return Err("the shared device's signing key already belongs to someone in the ring".into());
+    }
+    let device = parse_public_identity(&format!("{}{k}{}", m.id, m.binding.as_deref().unwrap_or_default()))
+        .map_err(|e| format!("malformed shared device: {e}"))?;
+    match proof {
+        ShareProof::Invite { key, signature } => {
+            let Some(inv) = st.invites.get_mut(key) else {
+                return Err("the invite is not in this ring".into());
+            };
+            if inv.used {
+                return Err("the invite was already used".into());
+            }
+            if inv.person != m.name {
+                return Err("the invite is for someone else".into());
+            }
+            if at > inv.expires_at {
+                return Err("the invite had expired".into());
+            }
+            let msg = crate::hub::wire::join_message(&m.name, &device).ok_or("the device has no signing key")?;
+            if !crate::identity::verify_signature(key, domains::SIG_CONTEXT_HUB_INVITE, &msg, signature) {
+                return Err("the join does not verify under the invite's key".into());
+            }
+            inv.used = true;
+        }
+        ShareProof::Vouch { by, signature } => {
+            if !st.members.values().any(|v| v.name == m.name && v.signing_key.as_deref() == Some(by.as_str())) {
+                return Err("the vouch is not by a current device of the same person".into());
+            }
+            let msg = crate::hub::wire::vouch_message(&device).ok_or("the device has no signing key")?;
+            if !crate::identity::verify_signature(by, domains::SIG_CONTEXT_HUB_DEVICE, &msg, signature) {
+                return Err("the vouch does not verify".into());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -748,13 +972,14 @@ pub fn validate_scope_name(s: &str) -> Result<()> {
     let ok = !s.is_empty()
         && s.len() <= 64
         && s != LOCAL_SCOPE
+        && s != crate::policy::RULE_SCOPE
         && !s.starts_with("embargo")
         && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
     if ok {
         Ok(())
     } else {
         Err(VeilError::Policy(format!(
-            "invalid scope name '{s}' (use lowercase letters, digits, '-' or '_'; 'local' and 'embargo*' are reserved)"
+            "invalid scope name '{s}' (use lowercase letters, digits, '-' or '_'; 'local', 'rule' and 'embargo*' are reserved)"
         )))
     }
 }
@@ -821,10 +1046,11 @@ pub fn current_key_has_legacy_wraps(ring: &KeyRing, state: &RingState) -> bool {
     let g = state.generation;
     ring.log.iter().any(|c| match &c.op {
         RingOp::Genesis { members, .. } => g == 0 && members.iter().any(|m| !m.wrapped.is_hpke()),
-        RingOp::Grant { member } => member.generation == g && !member.wrapped.is_hpke(),
-        RingOp::Revoke { rotation, .. } | RingOp::Rotate { rotation } => {
+        RingOp::Grant { member } | RingOp::Share { member, .. } => member.generation == g && !member.wrapped.is_hpke(),
+        RingOp::Revoke { rotation, .. } | RingOp::Rotate { rotation } | RingOp::RevokeOwn { rotation, .. } => {
             rotation.generation == g && rotation.wrapped.values().any(|w| !w.is_hpke())
         }
+        RingOp::Invite { .. } | RingOp::Uninvite { .. } => false,
     })
 }
 
@@ -1003,9 +1229,11 @@ impl Keychain {
         for c in &ring.log {
             match &c.op {
                 RingOp::Genesis { members, .. } => candidates.extend(members.iter().filter(|m| m.id == my_id).map(|m| (0, &m.wrapped))),
-                RingOp::Grant { member } if member.id == my_id => candidates.push((member.generation, &member.wrapped)),
-                RingOp::Grant { .. } => {}
-                RingOp::Revoke { rotation, .. } | RingOp::Rotate { rotation } => {
+                RingOp::Grant { member } | RingOp::Share { member, .. } if member.id == my_id => {
+                    candidates.push((member.generation, &member.wrapped))
+                }
+                RingOp::Grant { .. } | RingOp::Share { .. } | RingOp::Invite { .. } | RingOp::Uninvite { .. } => {}
+                RingOp::Revoke { rotation, .. } | RingOp::Rotate { rotation } | RingOp::RevokeOwn { rotation, .. } => {
                     rotations.insert(rotation.generation, rotation);
                     if let Some(w) = rotation.wrapped.get(&my_id) {
                         candidates.push((rotation.generation, w));
@@ -1091,13 +1319,18 @@ impl Keychain {
         let _lock = self.lock_meta()?;
         validate_scope_name(&ring.scope)?;
         let have = self.format();
-        if ring.format.max(ring.required_format()) > max_ring_format(have) {
+        let needs = ring.format.max(ring.required_format());
+        if needs > max_ring_format(have) {
+            let (what, repo) = match needs {
+                RING_FORMAT_HPKE => ("HPKE-wrapped keys", HPKE_REPO_FORMAT),
+                _ => ("invites and shares", SHARES_REPO_FORMAT),
+            };
             return Err(VeilError::Unsupported(format!(
                 "this repository is at format {have} and cannot store the key ring of scope '{}' \
-                 (ring format {RING_FORMAT}: HPKE-wrapped keys); upgrade it with `vl upgrade` \
+                 (ring format {needs}: {what}); upgrade it with `vl upgrade` \
                  (a remote: `vl upgrade --remote <name>`) once everyone who uses it runs vl {} or later",
                 ring.scope,
-                crate::repo::min_vl_for_format(HPKE_REPO_FORMAT)
+                crate::repo::min_vl_for_format(repo)
             )));
         }
         self.backend
@@ -1288,6 +1521,101 @@ impl Keychain {
         };
         self.append(ring, RingOp::Grant { member })?;
         Ok(())
+    }
+
+    /// Add an invite to `scope` (ring format 4; an admin): a device whose
+    /// join verifies under `key` may be shared to as `person` until
+    /// `expires_at` (`docs/HUB.md` §13.12).
+    pub fn invite(&self, scope: &str, person: &str, key: &str, expires_at: i64) -> Result<()> {
+        let _lock = self.lock_meta()?;
+        let (ring, _) = self.ring_for_admin(scope, "invite people")?;
+        self.append(
+            ring,
+            RingOp::Invite {
+                person: person.to_string(),
+                key: key.to_string(),
+                expires_at,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Cancel the invite under `key` (an admin); `false` if `scope` holds
+    /// no usable invite under it.
+    pub fn uninvite(&self, scope: &str, key: &str) -> Result<bool> {
+        let _lock = self.lock_meta()?;
+        let (ring, state) = self.ring_for_admin(scope, "cancel invites")?;
+        if !state.invites.get(key).is_some_and(|i| !i.used) {
+            return Ok(false);
+        }
+        self.append(ring, RingOp::Uninvite { key: key.to_string() })?;
+        Ok(true)
+    }
+
+    /// Share the current key of `scope` with the device `public_identity`
+    /// (full form) as `name` (any current member, ring format 4). The
+    /// replay refuses it unless `proof` holds (`docs/HUB.md` §13.12).
+    pub fn share(&self, scope: &str, public_identity: &str, name: &str, proof: ShareProof) -> Result<()> {
+        let _lock = self.lock_meta()?;
+        let pk = parse_public_identity(public_identity)?;
+        let (Some(signing_key), Some(binding)) = (pk.signing_hex(), pk.binding_hex()) else {
+            return Err(VeilError::Policy("a device is shared to only with its full public identity".into()));
+        };
+        let (ring, state) = self.ring_for_member(scope)?;
+        let key = Zeroizing::new(self.require(&generation_label(scope, state.key_id()))?);
+        let member = MemberGrant {
+            id: pk.member_id(),
+            name: name.to_string(),
+            signing_key: Some(signing_key),
+            binding: Some(binding),
+            role: Role::Member,
+            generation: state.generation,
+            wrapped: self.wrap_for(&pk.x25519, &key, scope)?,
+        };
+        self.append(ring, RingOp::Share { member, proof })?;
+        Ok(())
+    }
+
+    /// Remove the device `member` (a member id) from `scope` and rotate: as
+    /// an admin, any device; as a member, only one of their own (same
+    /// name). `false` if it is not a member.
+    pub fn revoke_device(&self, scope: &str, member: &str) -> Result<bool> {
+        let _lock = self.lock_meta()?;
+        let id = format_public_key(&parse_public_key(member)?);
+        let (ring, state) = self.ring_for_member(scope)?;
+        let Some(info) = state.members.get(&id) else { return Ok(false) };
+        let me = self.me()?;
+        let admin = state.is_admin(&me.public_hex(), &me.verifying_hex());
+        if !admin && state.members.get(&me.public_hex()).is_none_or(|m| m.name != info.name) {
+            return Err(VeilError::Policy(format!(
+                "only an admin of scope '{scope}' removes someone else's device"
+            )));
+        }
+        let remaining: Vec<&String> = state.members.keys().filter(|k| **k != id).collect();
+        let rotation = self.rotation(scope, &state, &remaining)?;
+        let op = if admin {
+            RingOp::Revoke { member: id, rotation }
+        } else {
+            RingOp::RevokeOwn { member: id, rotation }
+        };
+        self.append(ring, op)?;
+        Ok(true)
+    }
+
+    /// Load a ring for a change by this identity as a current member (any
+    /// role).
+    fn ring_for_member(&self, scope: &str) -> Result<(KeyRing, RingState)> {
+        let ring = self
+            .load_ring(scope)?
+            .ok_or_else(|| VeilError::NotFound(format!("scope '{scope}'")))?;
+        let state = ring
+            .verify()
+            .map_err(|e| VeilError::Policy(format!("key ring for '{scope}' does not verify: {e}")))?;
+        let me = self.me()?;
+        if !state.is_member_with_key(&me.public_hex(), &me.verifying_hex()) {
+            return Err(VeilError::Policy(format!("this device is not a member of scope '{scope}'")));
+        }
+        Ok((ring, state))
     }
 
     /// Current members of `scope` that no key can be wrapped to (low-order
