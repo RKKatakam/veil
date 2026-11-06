@@ -230,30 +230,6 @@ fn specs() -> Vec<(&'static str, Value)> {
             "schema": "string", "snapshot": snapshot_ref(),
             "conflicts": [{"path": "string", "conflict": conflict_info()}],
         })),
-        ("veil.push.plan/1", {
-            let snap = json!({"snapshot_id": "string", "snapshot_short": "string", "embargo": "string"});
-            json!({
-                "schema": "string",
-                "remotes": [{
-                    "name": "string", "url": "string", "public": "bool", "error": "string|null",
-                    "creates_remote": "bool",
-                    "tags": [{
-                        "name": "string", "action": "string", "target": "string", "target_short": "string",
-                        "remote_target": "string|null", "message": "string|null", "cloak": "string|null",
-                    }],
-                    "snapshots": "number", "objects": "number", "trees": "number", "blobs": "number",
-                    "sealed": "number", "object_bytes": "number", "pack_bytes": "number",
-                    "snapshot_ids": ["string"], "object_ids": ["string"], "withheld_objects": "number",
-                    "withheld_snapshots": [snap], "releases": ["string"],
-                    "files": nullable(json!({
-                        "published": [{"path": "string", "exposure": "string", "size": "number|null", "released_embargo": "string|null"}],
-                        "withheld": [{"path": "string", "reason": "string", "scope": "string|null", "embargo": "string|null", "message": "string"}],
-                        "embargoed_trees": [snap],
-                    })),
-                    "warnings": ["string"],
-                }],
-            })
-        }),
         ("veil.error/1", json!({"schema": "string", "error": {"message": "string", "hint": "string|null"}})),
         ("veil.split/1", {
             let taken = json!([{"path": "string", "whole": "bool", "hunks": ["string"]}]);

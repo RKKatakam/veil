@@ -266,9 +266,9 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
     fn kind(&self) -> &'static str;
 
     /// Storage reached over a network and shared with clients on other
-    /// hosts ([`SftpBackend`]). Its repository lock uses lease-based
-    /// takeover with fencing (see `lock.rs`), and sync batches requests
-    /// instead of probing object by object.
+    /// hosts. Its repository lock uses lease-based takeover with fencing
+    /// (see `lock.rs`). No backend is one since SFTP remotes were removed;
+    /// the fencing lock goes in a follow-up.
     fn is_network(&self) -> bool {
         false
     }

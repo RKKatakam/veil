@@ -1256,7 +1256,7 @@ impl<'a> Incoming<'a> {
 }
 
 /// Record a remote's tags after their objects are in the local store
-/// (the second half of [`pull_with`]): set `<remote>/<tag>`, prune remote
+/// (the second half of [`pull`], and of the server client's pull): set `<remote>/<tag>`, prune remote
 /// tags the remote no longer has, and create or fast-forward local tags,
 /// with every check a pull makes (names, targets, shadowing, release
 /// tags, divergence). `remote_store`: where annotated tag objects are
