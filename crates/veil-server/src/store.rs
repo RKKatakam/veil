@@ -105,23 +105,26 @@ pub struct S3Store {
 
 /// How long a signed request stays valid.
 const S3_SIGN_FOR: Duration = Duration::from_secs(300);
-/// How often an S3 request is tried, and the wait before the second try
-/// (doubling, jittered): about 1.5 s in all, well inside a request's
-/// deadline (`db::TRANSACTION_DEADLINE`).
-const S3_TRIES: u32 = 6;
+/// How long an S3 request is tried again for, the wait before the second
+/// try (doubling, jittered) and the longest wait: well inside a request's
+/// deadline (`db::TRANSACTION_DEADLINE`, 45 s). An S3 service or a local
+/// MinIO that resets connections under load stays unreachable for seconds
+/// at a time (BUG-861).
+const S3_RETRY_FOR: Duration = Duration::from_secs(10);
 const S3_FIRST_WAIT: Duration = Duration::from_millis(25);
+const S3_MOST_WAIT: Duration = Duration::from_secs(1);
 
 /// Send an S3 request (`make` builds it afresh for each try) and read its
-/// answer, until the answer is not a server error (5xx), at most
-/// [`S3_TRIES`] times (BUG-861). A connection the store closed, reset or
-/// timed out, before or during the answer, and the store's own transient
-/// errors (500, 503 "slow down"), are tried again: every request the store
-/// sends is idempotent (GET, HEAD, and PUT of a key that names its
-/// content).
+/// answer, again while the answer is a server error (5xx) or the request
+/// fails, for at most [`S3_RETRY_FOR`] (BUG-861). A connection the store
+/// closed, reset or timed out, before or during the answer, and the
+/// store's own transient errors (500, 503 "slow down"), are tried again:
+/// every request the store sends is idempotent (GET, HEAD, and PUT of a
+/// key that names its content).
 async fn s3_send(make: impl Fn() -> reqwest::RequestBuilder) -> Result<(u16, Bytes)> {
+    let deadline = tokio::time::Instant::now() + S3_RETRY_FOR;
     let mut wait = S3_FIRST_WAIT;
-    for attempt in 1.. {
-        let last = attempt == S3_TRIES;
+    for tries in 1.. {
         let answer = match make().send().await {
             Ok(resp) => {
                 let status = resp.status();
@@ -129,14 +132,15 @@ async fn s3_send(make: impl Fn() -> reqwest::RequestBuilder) -> Result<(u16, Byt
             }
             Err(e) => Err(e),
         };
+        let jitter = Duration::from_millis(u64::from(u16::from_le_bytes(veil_core::crypto::random_bytes::<2>())) % (wait.as_millis() as u64 + 1));
+        let last = tokio::time::Instant::now() + wait + jitter >= deadline;
         match answer {
             Ok((status, body)) if !status.is_server_error() || last => return Ok((status.as_u16(), body)),
-            Err(e) if last || e.is_builder() => return Err(e.into()),
+            Err(e) if last || e.is_builder() => return Err(anyhow::Error::new(e).context(format!("S3 request failed {tries} times"))),
             _ => {}
         }
-        let jitter = u64::from(u16::from_le_bytes(veil_core::crypto::random_bytes::<2>())) % (wait.as_millis() as u64 + 1);
-        tokio::time::sleep(wait + Duration::from_millis(jitter)).await;
-        wait *= 2;
+        tokio::time::sleep(wait + jitter).await;
+        wait = (wait * 2).min(S3_MOST_WAIT);
     }
     unreachable!()
 }

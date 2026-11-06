@@ -401,9 +401,10 @@ everything 15.5–26.3 / 153–200 ms, commit one file 1.3–1.8 / 9.4–18.5 ms
   in-memory targets, which Veil meets in memory.
 
 **Memory of the same operations at scale** (1 GB, `BASELINE.md`, "Through
-the Veil server"): a full clone through the server peaks at 979 MiB on
-the client (BUG-859) and 2.5 GB on the server (BUG-860); the initial push
-is refused (BUG-857) and holds 2.4 GB (BUG-858).
+the Veil server"): after the server bench fixes a full clone through the
+server peaks at 433 MiB on the client (was 979 MiB, BUG-859) and the
+initial push is accepted at 401 MiB (was refused at 2.4 GB, BUG-857 and
+BUG-858); the server's own memory is BUG-860 (fixed) and BUG-864 (open).
 
 **Run:**
 
