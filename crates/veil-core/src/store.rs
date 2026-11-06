@@ -39,7 +39,7 @@ use crate::{
     error::{Result, VeilError},
     id::ObjectId,
     keychain::Keychain,
-    object::{Conflict, EntryKind, Object, Snapshot, Text, Tree, TreeEncoding, TreeEntry, Visibility},
+    object::{Conflict, EntryKind, Object, Snapshot, Tree, TreeEncoding, TreeEntry, Visibility},
     pack::{name_from_index_file, Pack},
     vfs::{NodeKind, StorageBackend},
     vpath::VPath,
@@ -1440,25 +1440,4 @@ impl ObjectStore {
         }
     }
 
-    pub fn make_text(&self, text: &str, cloak: Option<&str>) -> Result<Text> {
-        match cloak {
-            None => Ok(Text::Plain(text.to_string())),
-            Some(scope) => {
-                let (label, key) = self.keys.sealing_key(scope)?;
-                let key = zeroize::Zeroizing::new(key);
-                Ok(Text::Sealed(Envelope::seal_random(&key, &label, text.as_bytes())?))
-            }
-        }
-    }
-
-    /// Plaintext of a description, or `None` if cloaked and unreadable.
-    pub fn read_text(&self, t: &Text) -> Option<String> {
-        match t {
-            Text::Plain(s) => Some(s.clone()),
-            Text::Sealed(env) => {
-                let key = self.keys.key(&env.scope)?;
-                String::from_utf8(env.open(&key).ok()?).ok()
-            }
-        }
-    }
 }

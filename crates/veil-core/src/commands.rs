@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use crate::{
     builder::trusted_cloak,
     embargo::{
-        apply_embargo, description_scope, normalize_tree, policy_rekeys, recordable_conflicts, seal_declassified, seal_introduced,
+        apply_embargo, normalize_tree, policy_rekeys, recordable_conflicts, seal_declassified, seal_introduced,
         unreleased_wrapper, wrap, NormalizeOptions, NormalizeReport,
     },
     error::{Result, VeilError},
@@ -102,10 +102,7 @@ pub(crate) fn commit_in(tx: &mut Transaction, ws: &str, message: &str, advance: 
     let cloak = tx.view.workspace(ws)?.cloak.clone();
     let s = tx.repo().snapshot(&wc_id)?;
     let mut ns = recorded.unwrap_or_else(|| (*s).clone());
-    // On a line under an unreleased embargo a key holder's message
-    // describes the hidden fix: it is sealed under the embargo key.
-    let store = &tx.repo().store;
-    ns.description = store.make_text(message, description_scope(store, &ns.tree, ns.cloak.as_deref())?.as_deref())?;
+    ns.description = Text::Plain(message.to_string());
     ns.predecessors = vec![wc_id];
     ns.timestamp = now_millis();
     let committed = tx.rewrite(wc_id, ns)?;
@@ -204,18 +201,6 @@ fn sealed_for_other_scopes(store: &ObjectStore, dest: &ObjectId, tree: &ObjectId
     Ok(out)
 }
 
-/// Is `text` the description `message`, sealed for `scope` (plain when
-/// `None`)?
-fn same_description(store: &ObjectStore, text: &Text, message: &str, scope: Option<&str>) -> bool {
-    match (text, scope) {
-        (Text::Plain(t), None) => t == message,
-        (Text::Sealed(env), Some(scope)) => {
-            store.keys.sealing_key(scope).is_ok_and(|(label, _)| label == env.scope)
-                && store.read_text(text).as_deref() == Some(message)
-        }
-        _ => false,
-    }
-}
 
 /// A change taken apart for [`Repo::split`] and [`Repo::squash_into`]
 /// ([`Repo::change_parts`]).
@@ -340,15 +325,11 @@ impl Repo {
         let mut tx = self.transaction("describe")?;
         let s = tx.repo().snapshot(&id)?;
         let mut ns = (*s).clone();
-        let store = &tx.repo().store;
-        let scope = description_scope(store, &s.tree, s.cloak.as_deref())?;
-        // The same message, sealed for the same audience: nothing to do
-        // (a sealed description never encrypts the same way twice, so the
-        // rewrite's own no-op check cannot see this, BUG-246).
-        if same_description(store, &s.description, message, scope.as_deref()) {
+        // The same message: nothing to do (BUG-246).
+        if s.description.as_str() == message {
             return Ok(id);
         }
-        ns.description = store.make_text(message, scope.as_deref())?;
+        ns.description = Text::Plain(message.to_string());
         ns.predecessors = vec![id];
         let new = tx.rewrite(id, ns)?;
         tx.set_description(format!("describe change {}", s.change_id.short()));
@@ -501,12 +482,11 @@ impl Repo {
                 "everything chosen: the second change would be empty (to change only the description, use `vl describe`)",
             ));
         }
-        let scope = description_scope(&store, &h.chosen, s.cloak.as_deref())?;
         let first = Snapshot {
             parents: s.parents.clone(),
             change_id: ChangeId::random(),
             tree: h.chosen,
-            description: store.make_text(message.unwrap_or(""), scope.as_deref())?,
+            description: Text::Plain(message.unwrap_or("").to_string()),
             author: s.author.clone(),
             timestamp: s.timestamp,
             predecessors: vec![id],
@@ -636,21 +616,14 @@ impl Repo {
                 let sd = tx.repo().description(&s);
                 if !sd.trim().is_empty() {
                     let joined = if pd.trim().is_empty() { sd } else { format!("{pd}\n\n{sd}") };
-                    // A cloaked change's description stays sealed for its
-                    // scope, even when folded into a public one (the
-                    // joined text is sealed).
-                    let scope = match (&now.cloak, &s.cloak) {
-                        (Some(a), Some(b)) if a != b => {
+                    if let (Some(a), Some(b)) = (&now.cloak, &s.cloak) {
+                        if a != b {
                             return Err(VeilError::Policy(format!(
                                 "cannot squash a change cloaked under '{b}' into one cloaked under '{a}'"
-                            )))
+                            )));
                         }
-                        (a, b) => a.as_deref().or(b.as_deref()),
-                    };
-                    // Folded into (or from) a line under an unreleased
-                    // embargo: the joined text stays sealed under its key.
-                    let scope = description_scope(&store, &nd.tree, scope)?;
-                    nd.description = store.make_text(&joined, scope.as_deref())?;
+                    }
+                    nd.description = Text::Plain(joined);
                 }
             }
             Ok(nd)
@@ -879,12 +852,7 @@ impl Repo {
                 reported_conflicts.len()
             ));
         }
-        let scope = match (&embargo_id, cloak) {
-            (Some(e), None) => Some(format!("embargo/{e}")),
-            // Also a plain merge into a line under an unreleased embargo.
-            _ => description_scope(&store, &tree, cloak)?,
-        };
-        let description = store.make_text(message, scope.as_deref())?;
+        let description = Text::Plain(message.to_string());
         warnings.extend(report.kept_sealed.iter().map(|(p, why)| format!("{p} {why}")));
         let snap = Snapshot {
             parents,
@@ -1052,21 +1020,14 @@ impl Repo {
         // one) the old message, never dropped.
         let message = match (&spec.annotate, old_annotation) {
             (Some(m), _) => Some(m.clone()),
-            (None, Some(a)) => {
-                let old = self.store().atag(&a)?;
-                Some(self.store().read_text(&old.message).ok_or_else(|| {
-                    VeilError::repo(format!(
-                        "the message of release tag '{name}' is sealed and you cannot read it; give a new one with -m"
-                    ))
-                })?)
-            }
+            (None, Some(a)) => Some(self.store().atag(&a)?.message.as_str().to_string()),
             (None, None) => None,
         };
         let mut signed = false;
         let annotation = match message {
             None => None,
             Some(m) => {
-                let text = self.store().make_text(&m, cloak.as_deref())?;
+                let text = Text::Plain(m);
                 let tagger: String = self.user.chars().filter(|c| !c.is_control()).take(crate::tag_object::MAX_TAGGER).collect();
                 let mut a = Atag::annotated(name, target, text, &tagger, now_millis());
                 if let Some(id) = self.identity() {
@@ -1126,7 +1087,7 @@ impl Repo {
             }
             _ => None,
         };
-        let message = self.store().read_text(&atag.message);
+        let message = Some(atag.message.as_str().to_string());
         Ok(TagCheck {
             id: *id,
             verified: signer.is_some(),

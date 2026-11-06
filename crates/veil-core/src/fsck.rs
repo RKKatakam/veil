@@ -40,7 +40,7 @@ use crate::{
     keychain::{EmbargoRecord, KeyRing, Keychain},
     lock::{RepoLock, STEAL_PATH},
     now_millis,
-    object::{EntryKind, Object, Text, TreeEntry, Visibility},
+    object::{EntryKind, Object, TreeEntry, Visibility},
     oplog::Operation,
     repo::{Repo, RepoConfig},
     store::ObjectStore,
@@ -530,14 +530,6 @@ impl Checker {
             }
             if let Some(e) = &s.embargo {
                 self.check_embargo_known(e);
-            }
-            if let Text::Sealed(env) = &s.description {
-                if self.keys.has(&env.scope) && self.store.read_text(&s.description).is_none() {
-                    self.push(
-                        Severity::Warning,
-                        format!("{me}: sealed description does not open with the '{}' key", env.scope),
-                    );
-                }
             }
             self.check_tree(s.tree, &format!("{me}:/"), false);
         }

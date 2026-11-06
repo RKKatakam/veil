@@ -17,7 +17,7 @@ pub fn one_line(r: &SnapshotRef) -> String {
     let (Some(change), true) = (&r.change_short, r.available) else {
         return r.snapshot_short.clone();
     };
-    let desc = description_shown(&r.description, &r.description_hidden);
+    let desc = description_shown(&r.description);
     let desc = if desc.trim().is_empty() {
         dim("(no description set)")
     } else {
@@ -27,14 +27,9 @@ pub fn one_line(r: &SnapshotRef) -> String {
     format!("{} {} {empty}{desc}", bold(&magenta(change)), blue(&r.snapshot_short))
 }
 
-/// A description as the text output shows it: sealed ones as
-/// `[cloaked:scope]` (what `Repo::description` returns).
-fn description_shown(d: &Option<String>, hidden: &Option<HiddenText>) -> String {
-    match (d, hidden) {
-        (Some(d), _) => d.clone(),
-        (None, Some(h)) => format!("[cloaked:{}]", h.scope),
-        (None, None) => String::new(),
-    }
+/// A description as the text output shows it.
+fn description_shown(d: &Option<String>) -> String {
+    d.clone().unwrap_or_default()
 }
 
 // ---- status ----------------------------------------------------------------------
@@ -339,7 +334,7 @@ fn log_entry(e: &LogEntry, lanes: &mut Vec<Option<ObjectId>>) {
     if e.root {
         println!("{line2_prefix} {}", dim("root()"));
     } else {
-        let desc = description_shown(&e.description, &e.description_hidden);
+        let desc = description_shown(&e.description);
         let desc = if desc.trim().is_empty() {
             dim("(no description set)")
         } else {
@@ -548,7 +543,7 @@ pub fn show(repo: &Repo, s: &Show, r: &Renames) -> Result<()> {
         println!("Conflicts : {}", red(&paths.join(", ")));
     }
     println!();
-    let desc = description_shown(&s.description, &s.description_hidden);
+    let desc = description_shown(&s.description);
     if desc.trim().is_empty() {
         println!("    {}", dim("(no description set)"));
     } else {

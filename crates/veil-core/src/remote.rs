@@ -324,11 +324,6 @@ struct Transfer<'a> {
 
 impl Transfer<'_> {
     fn allowed(&self, raw: &[u8]) -> bool {
-        // An annotated tag's message is sealed for a cloaked tag: such an
-        // atag never reaches a public remote, whichever route names it.
-        if self.public && raw.starts_with(crate::object::ATAG_TAG) {
-            return matches!(Object::decode(raw), Ok(Object::Atag(a)) if !a.is_sealed());
-        }
         match Object::sealed_scope(raw) {
             None => true,
             Some(scope) if scope == LOCAL_SCOPE => false,
@@ -890,7 +885,7 @@ pub fn push(
     }
     report.releases_published = releases_published;
     let annotations: Vec<ObjectId> = selected.iter().filter_map(|(_, t)| t.annotation).collect();
-    copy_annotations(local.store(), tx.repo().store(), &annotations, public)?;
+    copy_annotations(local.store(), tx.repo().store(), &annotations)?;
     sync_meta(local.keys(), tx.repo().keys(), public, false, &mut report.warnings)?;
     for (name, tag) in selected {
         // A push never strips the annotation the remote's tag has for the
@@ -936,7 +931,7 @@ fn sendable_tags(
                 .push((name.clone(), "cloaked tag is never pushed to a public remote".into()));
             continue;
         }
-        if let Some(why) = annotation_problem(local.store(), name, tag, public)? {
+        if let Some(why) = annotation_problem(local.store(), name, tag)? {
             report.tags_skipped.push((name.clone(), why));
             continue;
         }
@@ -963,9 +958,8 @@ fn sendable_tags(
 /// Why the tag `name` may not be pushed because of its annotation (format
 /// 5), if it may not: the atag is missing or not an atag, names another tag
 /// or target (a transplanted or re-targeted annotation, which would
-/// publish a release tag the signer never made), or (`public`) has a
-/// sealed message, which only a cloaked tag has.
-fn annotation_problem(store: &ObjectStore, name: &str, tag: &Tag, public: bool) -> Result<Option<String>> {
+/// publish a release tag the signer never made).
+fn annotation_problem(store: &ObjectStore, name: &str, tag: &Tag) -> Result<Option<String>> {
     let Some(a) = tag.annotation else { return Ok(None) };
     let atag = match store.get(&a) {
         Ok(Object::Atag(atag)) => atag,
@@ -983,18 +977,13 @@ fn annotation_problem(store: &ObjectStore, name: &str, tag: &Tag, public: bool) 
             atag.verify(name, &tag.target).describe()
         )));
     }
-    if public && atag.is_sealed() {
-        return Ok(Some("its annotation's message is sealed; it is never pushed to a public remote".into()));
-    }
     Ok(None)
 }
 
 /// Copy the annotated tag objects `ids` (format 5) from `src` to `dst`
 /// with `put_raw`, so a destination below format 5 refuses them with the
-/// upgrade hint. On a `public` destination an atag with a sealed message
-/// is never written (the tag checks already skip its tag; this is the
-/// second line).
-fn copy_annotations(src: &ObjectStore, dst: &ObjectStore, ids: &[ObjectId], public: bool) -> Result<usize> {
+/// upgrade hint.
+fn copy_annotations(src: &ObjectStore, dst: &ObjectStore, ids: &[ObjectId]) -> Result<usize> {
     let mut copied = 0;
     for id in ids {
         if dst.has(id) {
@@ -1002,7 +991,6 @@ fn copy_annotations(src: &ObjectStore, dst: &ObjectStore, ids: &[ObjectId], publ
         }
         let raw = src.get_raw(id)?;
         match Object::decode(&raw)? {
-            Object::Atag(a) if public && a.is_sealed() => continue,
             Object::Atag(_) => {}
             other => {
                 return Err(VeilError::Corrupt(

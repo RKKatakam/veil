@@ -10,9 +10,8 @@
 //!
 //! **Confidentiality.** The results hold exactly what the text output
 //! shows, so JSON can never reveal more: content the reader cannot decrypt
-//! is a [`Redaction`] (a reason, never the plaintext), descriptions sealed
-//! for a scope the reader is not in are a [`HiddenText`], and secret
-//! values never enter a result at all (`secret list` reads names only).
+//! is a [`Redaction`] (a reason, never the plaintext), and secret values
+//! never enter a result at all (`secret list` reads names only).
 //!
 //! **Versioning.** Each document starts with `"schema": "veil.<command>/<n>"`.
 //! Adding a field keeps the version; renaming, removing or retyping one, or
@@ -30,10 +29,10 @@ use anyhow::Result;
 use serde::Serialize;
 use veil_core::{
     blame::Reader,
-    keychain::{split_label, ReleaseState, SignatureStatus},
+    keychain::{ReleaseState, SignatureStatus},
     rename::{Item, Pair, RenameOptions},
     search::{LogFilter, Match, Searcher},
-    object::{EntryKind, Snapshot, Text, Visibility},
+    object::{EntryKind, Snapshot, Visibility},
     policy::{Policy, Tier},
     attributes::Attrs,
     secrets::{self, looks_binary},
@@ -191,25 +190,9 @@ pub struct Redaction {
     pub message: String,
 }
 
-/// A description sealed for a scope this reader is not in.
-#[derive(Serialize, Debug, Clone)]
-pub struct HiddenText {
-    /// The scope the description is sealed for.
-    pub scope: String,
-    /// `no_key`, or `not_public` (a `--public` view: a public mirror
-    /// cannot read it, whatever keys this reader holds).
-    pub reason: &'static str,
-}
-
-/// A snapshot's description: the text, or why it is hidden.
-fn description(repo: &Repo, s: &Snapshot) -> (Option<String>, Option<HiddenText>) {
-    match repo.store().read_text(&s.description) {
-        Some(t) => (Some(t), None),
-        None => match &s.description {
-            Text::Sealed(e) => (None, Some(HiddenText { scope: split_label(&e.scope).0.to_string(), reason: "no_key" })),
-            Text::Plain(t) => (Some(t.clone()), None),
-        },
-    }
+/// A snapshot's description (plain text).
+fn description(_repo: &Repo, s: &Snapshot) -> Option<String> {
+    Some(s.description.as_str().to_string())
 }
 
 /// A snapshot in one line, as `vl status`, `tag list` and `workspace list`
@@ -229,26 +212,12 @@ pub struct SnapshotRef {
     /// The change has no changes of its own.
     pub empty: bool,
     pub description: Option<String>,
-    pub description_hidden: Option<HiddenText>,
 }
 
 pub fn snapshot_ref(repo: &Repo, id: &ObjectId) -> SnapshotRef {
-    snapshot_ref_as(repo, id, false)
-}
-
-/// [`snapshot_ref`], with `public`: the description as a public mirror
-/// reads it (`--public` views). A description sealed for a cloak scope or
-/// an unreleased embargo is hidden (`not_public`), keys held or not.
-pub fn snapshot_ref_as(repo: &Repo, id: &ObjectId, public: bool) -> SnapshotRef {
     match repo.snapshot(id) {
         Ok(s) => {
-            let (description, description_hidden) = match (&s.description, public) {
-                (Text::Sealed(e), true) => match veil_core::blame::public_description(repo.store(), &s.description) {
-                    Some(t) => (Some(t), None),
-                    None => (None, Some(HiddenText { scope: split_label(&e.scope).0.to_string(), reason: "not_public" })),
-                },
-                _ => description(repo, &s),
-            };
+            let description = description(repo, &s);
             SnapshotRef {
                 snapshot_id: id.hex(),
                 snapshot_short: id.short(),
@@ -257,7 +226,6 @@ pub fn snapshot_ref_as(repo: &Repo, id: &ObjectId, public: bool) -> SnapshotRef 
                 available: true,
                 empty: repo.is_empty_change(id).unwrap_or(false) && !s.parents.is_empty(),
                 description,
-                description_hidden,
             }
         }
         Err(_) => SnapshotRef {
@@ -268,7 +236,6 @@ pub fn snapshot_ref_as(repo: &Repo, id: &ObjectId, public: bool) -> SnapshotRef 
             available: false,
             empty: false,
             description: None,
-            description_hidden: None,
         },
     }
 }
@@ -839,7 +806,6 @@ pub struct LogEntry {
     pub cloak: Option<String>,
     pub embargo: Option<LogEmbargo>,
     pub description: Option<String>,
-    pub description_hidden: Option<HiddenText>,
     pub parents: Vec<ParentRef>,
     /// With `-S` / `-G`: the files that matched (every changed file with
     /// `--pickaxe-all`). Absent otherwise.
@@ -1037,7 +1003,7 @@ impl LogEntries<'_> {
         let repo = self.repo;
         let s = repo.snapshot(&id)?;
         let root = id == self.root;
-        let (description, description_hidden) = description(repo, &s);
+        let description = description(repo, &s);
         let parents = s
             .parents
             .iter()
@@ -1069,7 +1035,6 @@ impl LogEntries<'_> {
             cloak: s.cloak.clone(),
             embargo: s.embargo.as_ref().map(|e| LogEmbargo { id: e.clone(), released: repo.keys().embargo_released(e) }),
             description,
-            description_hidden,
             parents,
             files: None,
             not_searched: None,
@@ -1375,7 +1340,6 @@ pub struct Show {
     pub embargo: Option<EmbargoInfo>,
     pub conflicts: Vec<String>,
     pub description: Option<String>,
-    pub description_hidden: Option<HiddenText>,
     /// The snapshot's changes against its parents.
     pub diff: DiffBody,
     /// The merged parents' tree and the snapshot's tree.
@@ -1435,7 +1399,7 @@ pub fn show_header(ctx: &Ctx, rev: &str, stat: bool) -> Result<Show> {
         None => None,
     };
     let status = (!root).then(|| repo.keys().snapshot_status(&s));
-    let (description, description_hidden) = description(repo, &s);
+    let description = description(repo, &s);
     let base = repo.parents_tree(&s.parents)?.tree;
     Ok(Show {
         schema: SHOW_SCHEMA,
@@ -1453,7 +1417,6 @@ pub fn show_header(ctx: &Ctx, rev: &str, stat: bool) -> Result<Show> {
         embargo,
         conflicts: s.conflicts.clone(),
         description,
-        description_hidden,
         diff: DiffBody { stat, files: Vec::new(), renames_skipped: false },
         base_tree: base,
         tree: s.tree,
@@ -2530,7 +2493,7 @@ pub fn blame(ctx: &Ctx, req: &BlameRequest<'_>) -> Result<BlameDoc> {
     Ok(BlameDoc {
         schema: BLAME_SCHEMA,
         path: path(&p),
-        rev: snapshot_ref_as(repo, &id, req.public),
+        rev: snapshot_ref(repo, &id),
         version: if b.fallback { "fallback" } else { "plain" },
         public: req.public,
         coarse: b.coarse,
@@ -2541,7 +2504,7 @@ pub fn blame(ctx: &Ctx, req: &BlameRequest<'_>) -> Result<BlameDoc> {
         visited: b.visited,
         unattributed: b.unattributed(),
         lines,
-        changes: stamped.iter().map(|(_, c)| snapshot_ref_as(repo, c, req.public)).collect(),
+        changes: stamped.iter().map(|(_, c)| snapshot_ref(repo, c)).collect(),
     })
 }
 

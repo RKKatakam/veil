@@ -49,9 +49,7 @@
 //! publish, or reveal the shape of, the other.
 //!
 //! Snapshot metadata stays public, so on a line under an unreleased embargo
-//! a key holder's descriptions are sealed under the embargo key
-//! ([`description_scope`]) and no conflict list is recorded
-//! ([`recordable_conflicts`]).
+//! no conflict list is recorded ([`recordable_conflicts`]).
 //!
 //! Time-based release is enforced by the engines of key holders: the first
 //! `vl` invocation by a key holder after the deadline publishes the key.
@@ -160,22 +158,6 @@ pub fn overlap_error(a: &str, b: &str) -> VeilError {
     VeilError::Policy(format!(
         "cannot combine history under two unreleased embargoes ({a} and {b}): embargoes cannot overlap; release one of them first (`vl embargo release <id>`), then merge or rebase"
     ))
-}
-
-/// The scope a description written on a snapshot with `tree` is sealed
-/// under: the line's cloak if it is a cloaked line of work, else the
-/// embargo key if `tree` is under an unreleased embargo whose key we hold
-/// (a key holder's follow-up messages describe the hidden fix), else none.
-/// `cloak` comes from a snapshot's `cloak` field, so only a
-/// [`trusted_cloak`] counts: a forged `embargo/<released id>` would seal
-/// the message under a public key.
-pub fn description_scope(store: &ObjectStore, tree: &ObjectId, cloak: Option<&str>) -> Result<Option<String>> {
-    if let Some(c) = trusted_cloak(cloak) {
-        return Ok(Some(c.to_string()));
-    }
-    Ok(unreleased_wrapper(store, tree)?
-        .map(|w| w.key_label())
-        .filter(|l| store.keys.has(l)))
 }
 
 /// The conflict list a snapshot with `tree` may carry. Snapshot metadata is

@@ -363,9 +363,8 @@ impl<'r> Transaction<'r> {
         let parents = dedup_parents(parents);
         let merged = self.repo.parents_tree(&parents)?;
         let store = &self.repo.store;
-        // On a line under an unreleased embargo, messages are sealed under
-        // the embargo key and conflicts are not recorded (see `embargo`).
-        let scope = crate::embargo::description_scope(store, &merged.tree, cloak.as_deref())?;
+        // On a line under an unreleased embargo, conflicts are not recorded
+        // (see `embargo`).
         let conflicts = merged.conflicts.iter().map(|p| p.to_string()).collect();
         // A merge of concurrent operations derives what is random elsewhere,
         // so that every process merging the same heads writes the same.
@@ -387,7 +386,7 @@ impl<'r> Transaction<'r> {
             parents,
             change_id,
             tree: merged.tree,
-            description: store.make_text(description, scope.as_deref())?,
+            description: crate::object::Text::Plain(description.to_string()),
             author: self.repo.user.clone(),
             timestamp,
             predecessors: vec![],
@@ -464,7 +463,7 @@ impl<'r> Transaction<'r> {
             return Ok(());
         }
         let s = self.repo.snapshot(&id)?;
-        let undescribed = self.repo.store.read_text(&s.description).is_some_and(|t| t.trim().is_empty());
+        let undescribed = s.description.as_str().trim().is_empty();
         // A change holding a conflict of its own (a merge that conflicted)
         // is kept; one that only inherits its parent's conflicts (format 4:
         // they are in its tree too) is as empty as any.

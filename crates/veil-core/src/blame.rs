@@ -186,21 +186,10 @@ impl ReadStats {
     }
 }
 
-/// A description as a public mirror reads it: `None` if it is sealed for a
-/// cloak scope, `local` or an unreleased embargo (keys this replica holds
-/// for them are never used). For `--public` views.
-pub fn public_description(store: &ObjectStore, t: &Text) -> Option<String> {
-    match t {
-        Text::Plain(s) => Some(s.clone()),
-        Text::Sealed(env) => {
-            let embargo = env.scope.strip_prefix("embargo/")?;
-            if !store.keys.embargo_released(embargo) {
-                return None;
-            }
-            let key = store.keys.key(&env.scope)?;
-            String::from_utf8(env.open(&key).ok()?).ok()
-        }
-    }
+/// A description as a public mirror reads it (descriptions are plain
+/// text). For `--public` views.
+pub fn public_description(_store: &ObjectStore, t: &Text) -> Option<String> {
+    Some(t.as_str().to_string())
 }
 
 /// File entry `e` as `reader` may read it (see the module docs).

@@ -728,15 +728,9 @@ impl Repo {
         Ok(self.view.workspace(ws)?.wc)
     }
 
-    /// Plaintext description, or a `[cloaked:scope]` marker.
+    /// The description (plain text).
     pub fn description(&self, s: &Snapshot) -> String {
-        match self.store.read_text(&s.description) {
-            Some(t) => t,
-            None => match &s.description {
-                Text::Sealed(e) => format!("[cloaked:{}]", crate::keychain::split_label(&e.scope).0),
-                Text::Plain(t) => t.clone(),
-            },
-        }
+        s.description.as_str().to_string()
     }
 
     // ---- graph queries ---------------------------------------------------

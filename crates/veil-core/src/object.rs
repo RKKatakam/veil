@@ -985,12 +985,22 @@ impl Tree {
     }
 }
 
-/// Descriptions may themselves be cloaked (snapshots on cloaked branches).
+/// A description or message: always plain text (only secret files are
+/// ever encrypted, `docs/VISIBILITY.md`). One variant, encoded as
+/// `{"plain": …}` as before, so existing snapshot ids are unchanged; the
+/// sealed variant of formats 7 and earlier is refused on decoding.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Text {
     Plain(String),
-    Sealed(Envelope),
+}
+
+impl Text {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Text::Plain(s) => s,
+        }
+    }
 }
 
 impl Default for Text {

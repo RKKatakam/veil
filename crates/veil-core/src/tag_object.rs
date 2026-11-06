@@ -156,10 +156,7 @@ impl Atag {
     /// remotes and from `.veil/`: hostile).
     pub fn validate(&self) -> Result<()> {
         validate_tag_name(&self.name).map_err(|_| atag_corrupt("invalid tag name"))?;
-        let message_len = match &self.message {
-            Text::Plain(s) => s.len(),
-            Text::Sealed(e) => e.ciphertext.len(),
-        };
+        let message_len = self.message.as_str().len();
         if message_len > MAX_TAG_MESSAGE {
             return Err(atag_corrupt(format!("message over {MAX_TAG_MESSAGE} bytes")));
         }
@@ -213,10 +210,6 @@ impl Atag {
         }
     }
 
-    /// Is this atag's message sealed (a cloaked tag)?
-    pub fn is_sealed(&self) -> bool {
-        matches!(self.message, Text::Sealed(_))
-    }
 }
 
 #[cfg(test)]

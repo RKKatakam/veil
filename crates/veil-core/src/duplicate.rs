@@ -36,7 +36,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     builder::trusted_cloak,
-    embargo::{description_scope, recordable_conflicts},
+    embargo::recordable_conflicts,
     error::{Result, VeilError},
     id::{ChangeId, ObjectId},
     merge::FollowedRename,
@@ -284,7 +284,7 @@ fn duplicate_in(tx: &mut Transaction, sources: &[ObjectId], placement: &Placemen
         }
         let out = tx.repo().rebase_tree(&s.parents, &parents, s.tree, cloak.as_deref())?;
         let description = match &o.message {
-            Some(m) => store.make_text(m, description_scope(&store, &out.tree, cloak.as_deref())?.as_deref())?,
+            Some(m) => Text::Plain(m.clone()),
             None => match &s.description {
                 Text::Plain(t) if o.record_origin => Text::Plain(with_origin(t, &s.change_id)),
                 d => d.clone(),
