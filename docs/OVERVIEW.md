@@ -101,4 +101,4 @@ The owner adopted the four synthetic workloads published by OpenScion, an indepe
 
 - **Git interop.** No import, export, sync, colocation, submodules or Git-format patches. This is permanent.
 - **Offline use, or plain-file remotes** (SFTP, shared drives).
-- **Encrypting code.** Only secrets and embargoed changes are encrypted.
+- **Encrypting code.** Only secrets (`.env`, keys) are encrypted. Embargoed changes are protected by the server's permissions and made public by the server at their deadline.

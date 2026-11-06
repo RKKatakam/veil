@@ -76,7 +76,7 @@ vl merge fix --into main --embargo-for security distro-partners --until 2026-12-
 - The groups named get the fix right away: code, message and history. Everyone else, the public included, sees nothing of it until it's released.
 - Anything built on top of it stays hidden too.
 - `vl embargo release`, or the deadline, makes it public.
-- **Embargoed changes are encrypted,** like secrets, because they often go to people outside the project.
+- **Embargoes are permissions, not encryption** (owner, 2026-11-06). An embargoed change is plain text on the server, visible only to the groups and people named. **The server makes it public at the deadline,** or when someone with the right runs `vl embargo release`. Outside partners (e.g. distro maintainers) get accounts and are named like anyone else.
 
 ## Who can see a PR
 
@@ -91,7 +91,7 @@ vl merge fix --into main --embargo-for security distro-partners --until 2026-12-
 - **The server stores the code and checks every permission.**
 - **Restricted folders like `billing/` are plain text on the server,** and the server only gives them to the people and groups with access.
 - **There are no plain-file remotes** (SFTP, shared drives) and no offline mode, so no other way of enforcing access is needed.
-- **Encryption is used only for secrets** (`.env`, keys) and embargoed changes.
+- **Encryption is used only for secrets** (`.env`, keys).
 
 ## What the server sees
 

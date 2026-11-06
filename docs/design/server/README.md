@@ -1,5 +1,7 @@
 # Server phases 2–4: designs and build order
 
+> **Owner, 2026-11-06:** all recommended product defaults are approved. Embargoes are permission-based; the server releases them at the deadline (no drand, no release machine).
+
 > **Status: design** (2026-11-06). Base: `integration` @ `3851159`. Sources of truth: `docs/OVERVIEW.md` and `docs/VISIBILITY.md`. The server as built: `docs/HUB.md` §13 (milestone S1). Roadmap: `docs/design/scion-for-developers.md`.
 
 | Document | Phase | Gate |
