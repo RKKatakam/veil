@@ -27,7 +27,7 @@ use veil_core::{
         wire::{self, Devices, GroupInfo, InviteKey},
     },
     identity::parse_public_identity,
-    keychain::{Keychain, RingMerge, RingState, Role, ShareProof},
+    keychain::{KeyRing, Keychain, RingMerge, RingState, Role, ShareProof},
     policy::{rule_scope_of, valid_principal_name, Policy, Tier, DEFAULT_SCOPE, POLICY_FILE, RULE_SCOPE},
     MemoryBackend, StorageBackend, VPath,
 };
@@ -213,6 +213,44 @@ fn confirmed_devices(
         .collect())
 }
 
+// ---- taking rings from the server -------------------------------------------------------
+
+/// Take `ring` from the server into this repository (`merge_ring`); a
+/// warning if it was not taken. A ring of a scope this repository does not
+/// hold yet is taken only if a current member of its `team` ring (the
+/// admins', on the server) started it: the server cannot make a ring of its
+/// own that confirms its devices or seals secrets under its key (BUG-840,
+/// BUG-841). `team` itself is taken when first seen (the first clone).
+pub fn merge_server_ring(keys: &Keychain, ring: &KeyRing) -> Result<Option<String>> {
+    if ring.scope != DEFAULT_SCOPE && !matches!(keys.load_ring(&ring.scope), Ok(Some(_))) {
+        let team = keys.ring_state(DEFAULT_SCOPE)?.and_then(|s| s.ok());
+        let started_by_team = ring.log.first().is_some_and(|c| {
+            team.as_ref().is_some_and(|st| st.members.values().any(|m| m.signing_key.as_deref() == Some(c.signing_key.as_str())))
+        });
+        if !started_by_team {
+            return Ok(Some(format!(
+                "key ring for scope '{}': refused, it was not started by a device of this project's admins",
+                ring.scope
+            )));
+        }
+    }
+    Ok(match keys.merge_ring(ring)? {
+        RingMerge::Rejected(w) => Some(w),
+        _ => None,
+    })
+}
+
+/// Take the server's rings ([`merge_server_ring`]), `team` first: it
+/// decides which others are taken. The warnings.
+pub fn merge_server_rings(keys: &Keychain, mut rings: Vec<KeyRing>) -> Result<Vec<String>> {
+    rings.sort_by_key(|r| r.scope != DEFAULT_SCOPE);
+    let mut out = Vec::new();
+    for r in &rings {
+        out.extend(merge_server_ring(keys, r)?);
+    }
+    Ok(out)
+}
+
 // ---- changing a ring --------------------------------------------------------------------
 
 /// Change the ring of `scope`: fast-forward this repository's ring to the
@@ -235,7 +273,7 @@ fn ring_update(ctx: &mut Ctx, client: &Client, scope: &str, mut f: impl FnMut(&K
             }
         }
         if let Some(r) = &server {
-            if let RingMerge::Rejected(w) = keys.merge_ring(r)? {
+            if let Some(w) = merge_server_ring(keys, r)? {
                 warn_untrusted(&w);
             }
         }
@@ -356,7 +394,10 @@ fn admin_sync(
     let touch = |p: &str| only.is_none_or(|o| o.iter().any(|x| x == p));
     ring_update(ctx, client, &ring.scope, |w| {
         out = Outcome::default();
-        if w.load_ring(&ring.scope)?.is_none() {
+        // A ring made here is sent even if nobody else gets it yet: the
+        // admins' own secrets need it (BUG-846).
+        let mut changed = w.load_ring(&ring.scope)?.is_none();
+        if changed {
             w.create_scope(&ring.scope)?;
         }
         let mut st = w.ring_state(&ring.scope)?.ok_or_else(|| anyhow!("no ring"))?.map_err(|e| anyhow!(e))?;
@@ -364,7 +405,6 @@ fn admin_sync(
             admin = false;
             return Ok(false);
         }
-        let mut changed = false;
         for pd in devices.iter().filter(|d| targets.contains(&d.person) && touch(&d.person)) {
             for (id, how) in &pd.confirmed {
                 let pk = parse_public_identity(id)?;
@@ -1034,9 +1074,7 @@ pub fn remove_device(fingerprint: &str, server: Option<&str>) -> Result<()> {
     // The rings as they are now (a device shared to since this clone's
     // last pull is found too).
     if let Some(c) = &ctx {
-        for r in client.rings().unwrap_or_default() {
-            let _ = c.repo.keys().merge_ring(&r);
-        }
+        let _ = merge_server_rings(c.repo.keys(), client.rings().unwrap_or_default());
     }
     // The device: one of mine the server lists, or a ring member's.
     let mine = client.devices(&me)?;
@@ -1101,35 +1139,44 @@ pub fn remove_device(fingerprint: &str, server: Option<&str>) -> Result<()> {
 /// non-admin from `team`. The next commit re-seals each secret.
 pub fn upgrade_rule_keys(ctx: &mut Ctx, dry_run: bool) -> Result<std::process::ExitCode> {
     let text = policy_text(ctx);
-    if per_rule(&text) {
+    // Already rewritten (also by a run that stopped before its keys were
+    // moved, BUG-844): the keys are still brought up to date below.
+    let already = per_rule(&text);
+    if already {
         println!("This project already seals each folder's secrets with that folder's key (`cloak rule` in {POLICY_FILE}).");
-        return Ok(std::process::ExitCode::SUCCESS);
     }
     let (client, _) = crate::hub_cmd::client_for(ctx, "origin")?;
     if !is_admin(&client) {
+        if already {
+            return Ok(std::process::ExitCode::SUCCESS);
+        }
         bail!("only an admin of the project moves its secrets to keys per folder");
     }
     // S1's lines, rewritten in place.
     let mut changed = 0;
-    let new_text: String = text
-        .lines()
-        .map(|l| {
-            let f = veil_core::policy::split_fields(l);
-            if f.len() == 3
-                && matches!(f[1].as_str(), "cloak" | "cloaked")
-                && f[2] == DEFAULT_SCOPE
-                && veil_core::policy::S1_SYNCED_SECRETS_LINES.contains(&f[0].as_str())
-            {
-                changed += 1;
-                format!("{:<25}cloak {RULE_SCOPE}", f[0])
-            } else {
-                l.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n";
-    if changed == 0 {
+    let new_text: String = if already {
+        text.clone()
+    } else {
+        text
+            .lines()
+            .map(|l| {
+                let f = veil_core::policy::split_fields(l);
+                if f.len() == 3
+                    && matches!(f[1].as_str(), "cloak" | "cloaked")
+                    && f[2] == DEFAULT_SCOPE
+                    && veil_core::policy::S1_SYNCED_SECRETS_LINES.contains(&f[0].as_str())
+                {
+                    changed += 1;
+                    format!("{:<25}cloak {RULE_SCOPE}", f[0])
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    };
+    if changed == 0 && !already {
         bail!("{POLICY_FILE} has none of the lines milestone S1 wrote for shared secrets (`.env  cloak team`, …): nothing to move");
     }
     let new_policy = Policy::parse(&new_text);
@@ -1157,7 +1204,9 @@ pub fn upgrade_rule_keys(ctx: &mut Ctx, dry_run: bool) -> Result<std::process::E
         println!("Dry run: nothing changed. Run without --dry-run to move them.");
         return Ok(std::process::ExitCode::SUCCESS);
     }
-    ctx.fs.write(&VPath::new(POLICY_FILE)?, new_text.as_bytes())?;
+    if !already {
+        ctx.fs.write(&VPath::new(POLICY_FILE)?, new_text.as_bytes())?;
+    }
     let people: Vec<String> = rings.iter().flat_map(|r| targets(r, &groups, &admins).0).collect::<BTreeSet<_>>().into_iter().collect();
     let devices = person_devices(ctx, &client, &people, &[])?;
     for ring in &rings {
@@ -1167,6 +1216,10 @@ pub fn upgrade_rule_keys(ctx: &mut Ctx, dry_run: bool) -> Result<std::process::E
         }
     }
     print_unconfirmed(None, &devices, None);
+    if already {
+        println!("The keys of every folder are up to date. Commit and push any secret not yet re-sealed under its folder's key.");
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
     println!("Rewrote {changed} line(s) of {POLICY_FILE} to `cloak rule`. Commit and push: the commit re-seals each secret under its folder's key.");
     println!("  Everyone else runs `vl pull`, then `vl policy accept` to take the new keys for their edits.");
     Ok(std::process::ExitCode::SUCCESS)

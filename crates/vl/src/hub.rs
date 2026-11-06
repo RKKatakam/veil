@@ -659,11 +659,7 @@ pub fn pull(repo: &mut Repo, remote: &str, client: &Client, only: Option<&str>) 
     // Key rings of secret scopes: verified and fast-forwarded locally.
     if client.token.borrow().is_some() {
         if let Ok(rings) = client.rings() {
-            for ring in rings {
-                if let veil_core::keychain::RingMerge::Rejected(w) = tx.repo().keys().merge_ring(&ring)? {
-                    report.warnings.push(w);
-                }
-            }
+            report.warnings.extend(crate::hub_keys::merge_server_rings(tx.repo().keys(), rings)?);
             tx.repo().keys().invalidate();
         }
     }

@@ -18,12 +18,12 @@ use veil_core::{
 
 use crate::support::*;
 
-fn pid(i: &Identity) -> PublicIdentity {
+pub(crate) fn pid(i: &Identity) -> PublicIdentity {
     parse_public_identity(&i.public_id()).unwrap()
 }
 
 /// Run `q` with text and integer binds on the server's database.
-fn sql(hub: &TestHub, q: &str, binds: &[&dyn Bind]) {
+pub(crate) fn sql(hub: &TestHub, q: &str, binds: &[&dyn Bind]) {
     let db = hub.hub().db.clone();
     let mut query = sqlx::query(q);
     for b in binds {
@@ -32,7 +32,7 @@ fn sql(hub: &TestHub, q: &str, binds: &[&dyn Bind]) {
     hub.rt.block_on(query.execute(&db)).unwrap();
 }
 
-trait Bind {
+pub(crate) trait Bind {
     fn bind<'q>(&'q self, q: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>)
         -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>;
 }
@@ -74,7 +74,7 @@ pub(crate) fn member_of(st: &RingState, who: &Identity) -> bool {
 }
 
 /// The invite link in `vl invite`'s output.
-fn link_in(out: &str) -> String {
+pub(crate) fn link_in(out: &str) -> String {
     out.lines().map(str::trim).find(|l| l.starts_with("veil://") && l.contains("#invite=")).unwrap_or_else(|| panic!("no link in:\n{out}")).to_string()
 }
 
@@ -86,7 +86,7 @@ pub(crate) fn clone(hub: &TestHub, p: &Project, who: &Person, name: &str) -> std
 }
 
 /// The raw sealed object at `path` on the admin's `main`.
-fn sealed_raw(p: &Project, path: &str) -> (ObjectId, Vec<u8>) {
+pub(crate) fn sealed_raw(p: &Project, path: &str) -> (ObjectId, Vec<u8>) {
     let repo = veil_core::Repo::open(Arc::new(veil_core::DiskBackend::new(&p.dir)), None, "test").unwrap();
     let tip = repo.view().tags["main"].target;
     let tree = repo.store().snapshot(&tip).unwrap().tree;
@@ -96,7 +96,7 @@ fn sealed_raw(p: &Project, path: &str) -> (ObjectId, Vec<u8>) {
 
 /// Can `who`, in their clone `dir`, open this sealed object if a
 /// (compromised) server hands it to them?
-fn opens(who: &Person, dir: &Path, (id, raw): &(ObjectId, Vec<u8>)) -> bool {
+pub(crate) fn opens(who: &Person, dir: &Path, (id, raw): &(ObjectId, Vec<u8>)) -> bool {
     let repo = veil_core::Repo::open(Arc::new(veil_core::DiskBackend::new(dir)), Some(who.identity()), "test").unwrap();
     repo.store().put_raw(id, raw).unwrap();
     repo.store().read_blob(id).is_ok()
@@ -104,7 +104,7 @@ fn opens(who: &Person, dir: &Path, (id, raw): &(ObjectId, Vec<u8>)) -> bool {
 
 /// A ring change signed by `signer` (a member's device), appended by hand:
 /// what a hostile writer could send, bypassing `vl`'s own checks.
-fn forged(ring: &KeyRing, signer: &Identity, op: RingOp) -> KeyRing {
+pub(crate) fn forged(ring: &KeyRing, signer: &Identity, op: RingOp) -> KeyRing {
     let mut r = ring.clone();
     let mut c = RingChange {
         seq: r.log.len() as u64,
@@ -121,7 +121,7 @@ fn forged(ring: &KeyRing, signer: &Identity, op: RingOp) -> KeyRing {
     r
 }
 
-fn grant_for(who: &Identity, name: &str, st: &RingState) -> MemberGrant {
+pub(crate) fn grant_for(who: &Identity, name: &str, st: &RingState) -> MemberGrant {
     let p = pid(who);
     MemberGrant {
         id: p.member_id(),
@@ -136,7 +136,7 @@ fn grant_for(who: &Identity, name: &str, st: &RingState) -> MemberGrant {
 }
 
 /// Post a ring as `who`; the status.
-fn post_ring(hub: &TestHub, p: &Project, who: &Person, ring: &KeyRing) -> u16 {
+pub(crate) fn post_ring(hub: &TestHub, p: &Project, who: &Person, ring: &KeyRing) -> u16 {
     hub.api().post_json(Some(&who.token()), &format!("/v1/projects/{}/rings/{}", p.name, ring.scope), &serde_json::to_value(ring).unwrap()).status
 }
 
@@ -151,7 +151,7 @@ pub(crate) fn invited(hub: &TestHub, p: &Project, prefix: &str) -> (Person, Stri
 }
 
 /// An invite's secret, from its link.
-fn invite_key(link: &str) -> InviteKey {
+pub(crate) fn invite_key(link: &str) -> InviteKey {
     InviteKey::from_hex(link.rsplit(':').next().unwrap()).unwrap()
 }
 
@@ -174,7 +174,7 @@ fn raw_invite(hub: &TestHub, p: &Project, person: &str, expires_at: i64) -> Invi
 }
 
 /// Run `f` until it holds, poking with `poke`, for at most a minute.
-fn eventually(mut poke: impl FnMut(), f: impl Fn() -> bool) -> bool {
+pub(crate) fn eventually(mut poke: impl FnMut(), f: impl Fn() -> bool) -> bool {
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(60) {
         poke();

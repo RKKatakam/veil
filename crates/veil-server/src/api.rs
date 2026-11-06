@@ -705,6 +705,26 @@ async fn change_group(hub: HubState, caller: Caller, p: String, g: String, op: O
         Box::pin(async move {
             let gid = group_id(c, pid, &g).await?;
             let manager = perm::is_manager(c, gid, me).await?;
+            // A removal takes back the invites to the group not used yet,
+            // also of a name nobody has signed up with (BUG-842).
+            let mut people = people;
+            if op == Op::RemoveMember && (admin || manager) {
+                let mut kept = Vec::new();
+                for n in people {
+                    let cancelled = sqlx::query("DELETE FROM invites WHERE project_id = $1 AND group_id = $2 AND person = $3 AND used_at IS NULL")
+                        .bind(pid)
+                        .bind(gid)
+                        .bind(&n)
+                        .execute(&mut *c)
+                        .await?
+                        .rows_affected();
+                    let known: Option<i64> = sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(&n).fetch_optional(&mut *c).await?;
+                    if cancelled == 0 || known.is_some() {
+                        kept.push(n);
+                    }
+                }
+                people = kept;
+            }
             let ids = people_ids(c, &people).await?;
             match op {
                 Op::AddManager if !admin => return Err(Error::forbidden("only an admin may choose a group's managers")),

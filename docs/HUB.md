@@ -1313,7 +1313,10 @@ ever need `vl invite`, `vl group add|remove`, `vl access` and, rarely,
   signs the join for this device with the invite key, and sends it. The
   server checks it, marks the invite used, adds alice to `finance` (folder
   access) and queues "share keys for alice". The fingerprint flow
-  (`--confirm`) stays as the fallback.
+  (`--confirm`) stays as the fallback. **Removing** alice from the group
+  (`vl group remove finance alice`, also before she has an account) takes
+  back her invites to it that were not used, on the server and in the
+  rings (BUG-842).
 * **Background sharing.** After a `vl` command in a clone of a server
   project (at most every 10 s; `VEIL_KEY_SHARE=0` turns it off), a detached
   `vl` asks the server whose devices are waiting (`GET …/keys/pending`: a
@@ -1322,6 +1325,12 @@ ever need `vl invite`, `vl group add|remove`, `vl access` and, rarely,
   ring. The ring's replay decides, never the list. `vl identity confirm`
   shares from the confirming device at once, and `vl group add` by an admin
   still grants directly.
+* **Which rings a device takes from the server.** A ring of a scope the
+  device does not hold yet is taken only if a current member of its `team`
+  ring (the admins', on the server) started it; `team` itself is taken when
+  first seen, on the first clone. So the server cannot put up a ring of its
+  own, for any scope, that confirms its devices to an admin or seals a
+  rule's secrets under its key (BUG-840, BUG-841).
 * **Every ring change is decided on the server's latest ring.** It is built
   in memory, sent, and stored locally only once the server accepted it as
   a fast-forward. On a race (409) the device fetches the ring and decides
@@ -1345,7 +1354,8 @@ ever need `vl invite`, `vl group add|remove`, `vl access` and, rarely,
   will hold it. It rewrites the S1 lines (`.env cloak team`, …) to
   `cloak rule`, creates the rule rings and grants them, and revokes every
   non-admin from `team`. The admin's next commit re-seals each secret under
-  its rule's key. Old versions stay readable with the old `team`
+  its rule's key. Running it again (after a run that stopped midway) brings
+  the rings up to date the same way (BUG-844). Old versions stay readable with the old `team`
   generations; nothing is decrypted or made public.
 
 #### Threat review
@@ -1393,3 +1403,11 @@ secrets, §3.1), unless a row says otherwise. Each row is tested in
   key back only with a new `--confirm` (row 10).
 * Invites name the invited person in the rings of their group's folders,
   which every participant of the project may read.
+* **Rings are not bound to their project** (BUG-845, open; owner decision,
+  crypto and format): rule scope names depend on the path only, and a
+  device's first clone takes `team` on the server's word. A server can hand
+  a new device another project's ring for the same path (started by the same
+  admin), and that device seals this project's secrets under it.
+* **Device removal by an admin is global** (BUG-843, open): an admin of any
+  project the person is in removes the device everywhere, so anyone can make
+  a project, add a person and remove their device (denial of service).
