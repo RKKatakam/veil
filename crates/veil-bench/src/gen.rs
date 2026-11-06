@@ -1,6 +1,5 @@
 //! The repository generator: a realistic, seeded history built through
-//! `veil_core`'s API in-process (ephemeral workspaces, as `sftp_bench.rs`
-//! does), so 10,000 snapshots take minutes rather than hours of CLI runs.
+//! `veil_core`'s API in-process (ephemeral workspaces), so 10,000 snapshots take minutes rather than hours of CLI runs.
 //!
 //! Shape (see `docs/design/scale/9-scale-benchmark.md`):
 //! * a directory tree of fan-out up to 20 and depth up to 8;

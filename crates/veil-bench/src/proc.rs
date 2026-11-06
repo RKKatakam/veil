@@ -48,7 +48,6 @@ pub struct VlEnv {
     pub vl: PathBuf,
     pub home: PathBuf,
     pub tmp: PathBuf,
-    pub ssh: Option<PathBuf>,
     /// Scratch directory for captured output and traces.
     pub logs: PathBuf,
 }
@@ -67,7 +66,7 @@ pub struct Outcome {
     /// Bytes written to stdout (it is kept on disk, not in memory, when
     /// large).
     pub stdout_bytes: u64,
-    /// The trace file, when run under strace (plus `.sftp.<pid>` siblings).
+    /// The trace file, when run under strace.
     pub trace: Option<PathBuf>,
 }
 
@@ -89,11 +88,7 @@ impl VlEnv {
             // No background maintenance inside the benchmark: it measures
             // `vl gc` and `vl gc --auto` as cases of their own.
             .env("VEIL_GC_AUTO", "0")
-            .env_remove("VEIL_BENCH_STRACE")
             .stdin(Stdio::null());
-        if let Some(ssh) = &self.ssh {
-            c.env("VEIL_SSH", ssh);
-        }
         c
     }
 
@@ -134,12 +129,7 @@ impl VlEnv {
                     .env("VEIL_USER", "bench")
                     .env("TMPDIR", &self.tmp)
                     .env("NO_COLOR", "1")
-                    // The stand-in ssh traces sftp-server too.
-                    .env("VEIL_BENCH_STRACE", t)
                     .stdin(Stdio::null());
-                if let Some(ssh) = &self.ssh {
-                    c.env("VEIL_SSH", ssh);
-                }
                 c
             }
             None => self.command(cwd, args),

@@ -157,8 +157,6 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
         let src = a.dir.join(format!("src-{files}"));
         generate(&src, files, files as u64)?;
         let mut veil = [vec![], vec![], vec![], vec![]];
-        // Clone everything from a path remote: the same checkout, no server.
-        let mut veil_path = Vec::new();
         let mut gits = [vec![], vec![], vec![], vec![]];
         // Import: a fresh copy each run.
         for r in 0..a.runs {
@@ -192,8 +190,6 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
         for r in 0..a.runs {
             let d = a.dir.join(format!("clone-{files}-{r}"));
             veil[1].push(time(vl(&a.dir).args(["clone", &format!("{hub}/{name}")]).arg(&d))?);
-            let d = a.dir.join(format!("pathclone-{files}-{r}"));
-            veil_path.push(time(vl(&a.dir).arg("clone").arg(&proj).arg(&d))?);
             let d = a.dir.join(format!("only-{files}-{r}"));
             veil[3].push(time(vl(&a.dir).args(["clone", &format!("{hub}/{name}")]).arg(&d).args(["--only", "d005"]))?);
             let g = a.dir.join(format!("gclone-{files}-{r}"));
@@ -217,11 +213,9 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
         {
             let v = median(veil[i].clone());
             let g = median(gits[i].clone());
-            let path = (i == 1).then(|| median(veil_path.clone()));
             cases.push(json!({
                 "files": files, "case": case, "veil_ms": v, "git_ms": g, "target_ms": t[i],
                 "meets_target": v <= t[i], "beats_git": v <= g, "runs": a.runs,
-                "veil_path_remote_ms": path,
             }));
         }
     }
@@ -358,11 +352,11 @@ fn copy_dir(from: &Path, to: &Path) -> Result<()> {
 /// The results as a Markdown table.
 pub fn markdown(v: &serde_json::Value) -> Result<String> {
     let mut out = String::from(
-        "| Files | Workload | Veil (ms) | Git (ms) | Target (ms) | Meets target | Beats Git | Veil, path remote (ms) |\n|---:|---|---:|---:|---:|---|---|---:|\n",
+        "| Files | Workload | Veil (ms) | Git (ms) | Target (ms) | Meets target | Beats Git |\n|---:|---|---:|---:|---:|---|---|\n",
     );
     for c in v["cases"].as_array().ok_or_else(|| anyhow!("no cases"))? {
         out.push_str(&format!(
-            "| {} | {} | {:.1} | {:.1} | {} | {} | {} | {} |\n",
+            "| {} | {} | {:.1} | {:.1} | {} | {} | {} |\n",
             c["files"],
             c["case"].as_str().unwrap_or(""),
             c["veil_ms"].as_f64().unwrap_or(f64::NAN),
@@ -370,7 +364,6 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
             c["target_ms"],
             if c["meets_target"] == json!(true) { "yes" } else { "no" },
             if c["beats_git"] == json!(true) { "yes" } else { "no" },
-            c["veil_path_remote_ms"].as_f64().map(|v| format!("{v:.1}")).unwrap_or_else(|| "–".into()),
         ));
     }
     Ok(out)
