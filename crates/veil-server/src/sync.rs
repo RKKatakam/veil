@@ -389,18 +389,20 @@ pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot:
         let mut pr = Projector::new(src, &view);
         // Per snapshot: its projected root, and its projected directory
         // trees by path, filled as the wants need them.
-        let mut roots: HashMap<ObjectId, (ObjectId, HashMap<String, Option<Arc<Tree>>>)> = HashMap::new();
+        let mut roots: HashMap<ObjectId, (ObjectId, Dirs)> = HashMap::new();
         let mut out = Vec::new();
         let gone = || Error::not_found("no such object at that path that you can see");
         for w in wants {
             let snap = w.snapshot.unwrap_or(snapshot);
-            if !roots.contains_key(&snap) {
-                let root = pr.root(src.snapshot(&reals[&snap])?.tree)?;
-                let mut dirs = HashMap::new();
-                dirs.insert(String::new(), pr.tree(&root)?);
-                roots.insert(snap, (root, dirs));
-            }
-            let (root, dirs) = roots.get_mut(&snap).expect("inserted above");
+            let (root, dirs) = match roots.entry(snap) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let root = pr.root(src.snapshot(&reals[&snap])?.tree)?;
+                    let mut dirs = HashMap::new();
+                    dirs.insert(String::new(), pr.tree(&root)?);
+                    e.insert((root, dirs))
+                }
+            };
             let ok = if w.path.is_empty() {
                 w.id == *root
             } else {
@@ -425,8 +427,11 @@ pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot:
     .await
 }
 
+/// Projected directory trees of one snapshot, by path.
+type Dirs = HashMap<String, Option<Arc<Tree>>>;
+
 /// The projected tree of directory `dir`, walking down from the root.
-fn dir_tree(pr: &mut Projector, dirs: &mut HashMap<String, Option<Arc<Tree>>>, dir: &str) -> Result<Option<Arc<Tree>>> {
+fn dir_tree(pr: &mut Projector, dirs: &mut Dirs, dir: &str) -> Result<Option<Arc<Tree>>> {
     if let Some(t) = dirs.get(dir) {
         return Ok(t.clone());
     }

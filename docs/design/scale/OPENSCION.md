@@ -212,24 +212,140 @@ content means decompressing it, as after any `vl gc`: 1.5 → 2.0 s.
   1. *One transaction per `vl commit`* (the automatic snapshot and the
      commit as one operation): halves the journal commits (about 4 ms),
      but changes what `vl op log` shows and what `vl undo` takes back.
+     **Done in round 2** (owner decision).
   2. *The history index as designed:* `graph_index.rs` documents its
      layers as "never synced" (a checksummed cache, rebuilt when damaged),
      but writes them with `create_new`, which fsyncs the file and its
      directory: 0.8–1.5 ms per transaction. This round kept every fsync.
+     **Done in round 2.**
   3. *No scan* (a file-system watcher daemon, Git's fsmonitor): the
      10,000-file scan is 14 ms of CPU.
 - **Import** beats Git 1.7–3.7×. What is left is reading each file
   through the no-follow walk (about 12 system calls per file), hashing,
   scanning and compressing, on one thread except the compression.
 
+## Performance round 2: clone, one-operation commit, BUG-838, load (2026-11-06)
+
+**Goal** (orchestrator): beat Git on the same machine, on a real disk,
+with full durability, for clone everything (10k: 1,014 ms against Git's
+583) and clone one directory (1k: 62 against 47); `vl commit` as one
+operation (owner decision); history-index layers not synced (as
+designed); a load test of the server (`docs/design/scale/LOAD.md`).
+
+**Method.** As in round 1: release builds, the bench directories in the
+worktree's `.scratch/` on the ext4 NVMe disk, base (`integration` @
+`a9f4fa8`), this round and Git **interleaved run by run** (each Veil
+build with its own server and PostgreSQL database), median of 5. Two
+sessions: the first before the last two changes (one barrier for `init`'s
+objects, fetch across snapshots), on a quieter machine; the second with
+the final code while another agent's containers were running. The
+machine's load moved every number (base's one-directory clone: 47.5 ms
+in the first session, 95.0 in the second); compare within a session.
+
+| Files | Workload | Base (ms) | This round (ms) | Git (ms) | Target (ms) | Meets target | Beats Git |
+|---:|---|---:|---:|---:|---:|---|---|
+| 1000 | import a directory | 56.9 / 75.5 | 53.0 / 61.4 | 96.0 / 101.0 | 22.0 | no | **yes** |
+| 1000 | clone everything (server) | 135.0 / 165.6 | **114.2** / 181.5 | 169.3 / 199.5 | 51.0 | no | **yes** |
+| 1000 | commit one changed file | 23.5 / 31.8 | **17.2 / 27.8** | 8.7 / 18.5 | 2.5 | no | no |
+| 1000 | clone one directory (server) | 47.5 / 95.0 | 55.2 / 91.4 | 49.6 / 64.4 | 6.1 | no | no |
+| 10000 | import a directory | 228.8 / 233.2 | 237.8 / 236.4 | 805.6 / 810.7 | 245.0 | **yes** | **yes** |
+| 10000 | clone everything (server) | 1003.3 / 950.8 | **436.8 / 370.8** | 562.9 / 575.4 | 544.0 | **yes** | **yes** (1.3–1.6×) |
+| 10000 | commit one changed file | 53.6 / 49.6 | **49.1 / 42.5** | 38.0 / 13.1 | 22.0 | no | no |
+| 10000 | clone one directory (server) | 84.7 / 57.6 | 92.2 / 66.7 | 51.5 / 53.4 | 25.0 | no | no |
+
+(first session / second session)
+
+- **Clone everything, 10k: 2.2–2.6× faster, and it beats Git (1.3–1.6×)
+  and meets its 544 ms target**, with every file still durable before the
+  checkout is recorded. Clone everything at 1k beats Git in both sessions.
+- **Clone one directory does not beat Git.** It is a fixed cost: about 60
+  `fsync`s in sequence (initialising the repository, the pull's and the
+  new change's transactions, `repo.json` twice, the `--only` view's two
+  trees, `checkout.json` twice), against Git's none, plus process start
+  and three requests. This round removed six (`init`'s objects under one
+  barrier) and 100 loose objects' worth (a pull of 16 or more objects is a
+  pack); measured alone on a quiet machine it took 36–40 ms (Git 47–50),
+  but interleaved sessions put it at Git's level, not below.
+- **Commit one changed file** is one transaction instead of two (owner
+  decision): 4–7 ms less. Git makes no fsync here.
+
+### Where a 10k clone's time went (phases, instrumented build)
+
+| Phase | Before | After |
+|---|---:|---:|
+| start, `init`, tips, history, the trees | 25–35 | 15–25 |
+| the files: request, transfer, frames | 120 | 75–95 (8 requests at once) |
+| decode, check and pack what arrived | 150 | 50–55 (compression on 8 threads) |
+| checkout: read and stage the files | 280 | 125–175 with the barrier (16 threads) |
+| checkout: the barrier (10,000 `fsync`s) | 235–310 | (included above: 256 threads) |
+| checkout: renames into place | 75 | 25 (16 threads) |
+| **total** | **about 985** | **about 320–420** |
+
+| `strace -c -f`, 10k clone | Before | After |
+|---|---:|---:|
+| `fsync` | 10,157 | 10,155 |
+| `openat` | 140,741 | 110,669 |
+| `statx` (failed) | 70,748 (60,574) | 60,565 (50,371) |
+
+### What changed
+
+1. **Barriers fsync on up to 256 threads** (was 32): ext4 commits
+   concurrent fsyncs in one journal transaction. A 10,000-file barrier
+   took 310 ms at 32 threads, 125 at 128, 60–65 at 256, no less at 512 or
+   1,024 (`vfs/disk.rs`). The threads have 64 KiB stacks; if the system
+   gives fewer threads, the barrier uses what it gets.
+2. **Checkout reads and stages files on up to 16 threads, and renames on
+   as many** (`checkout.rs`): the checks that decide what to write stay
+   in order on one thread; the outcomes are taken in order. Every no-follow
+   walk, hash check and durability step is the same.
+3. **One read per file:** checkout no longer reads each object twice (a
+   readability probe for backends that clone files ran for every
+   backend: `StorageBackend::clones`), and a local store reads an object
+   it holds in a pack without probing for a loose copy first (`store.rs`).
+4. **What a pull receives is packed on several threads** (`PackSink`
+   compresses objects without an earlier version at their path in
+   batches of 4 MiB, on 8 threads; deltas as before), **from 16 objects**
+   (was 256: a clone of one directory brings a hundred).
+5. **The fetch:** a level of more than 2,000 objects goes as up to 8
+   requests at once (`Client::fetch_all`); a fresh clone does not probe its
+   empty store object by object; **revision 1** of the protocol lets one
+   request name objects of several snapshots (a pull behind by many
+   landings: one request per level instead of one per snapshot and level;
+   `HUB.md` §13.5). Old servers are asked the old way.
+6. **`init`'s first objects under one barrier** (`repo.rs`, `InitWrites`):
+   the operation that names them stays durable and `repo.json` last; an
+   `init` that crashed before `repo.json` has its torn objects removed by
+   the next (`crash_during_init`).
+7. **`vl commit` is one operation** (owner decision): the automatic
+   snapshot and the commit are one transaction (`SnapshotOptions::commit`);
+   `vl undo` takes back both (`ARCHITECTURE.md`).
+8. **History-index layers are never synced** (`create_new_unsynced`), as
+   designed: a torn layer fails its checksum and the index is rebuilt
+   (`crash::a_power_loss_tears_history_index_layers_and_they_are_rebuilt`).
+
+Measured and not kept: 512 and 1,024 sync threads (no faster); fewer sync
+threads for small barriers (16–64 at 1k files: no difference beyond
+noise).
+
+### The server under load
+
+`veil-bench load` and its curves are in `docs/design/scale/LOAD.md`. In
+short, on this one machine with PostgreSQL: about 2,500 pulls/s while
+`main` moves (target 1,000), about 2,000 landings/s across 100 projects
+(aim 1,000; bounded by the database's WAL), and one project's `main`
+saturating at 20–30 landings/s with many agents (collisions; phase 4's
+batched landing).
+
 ## Next
 
-1. The transfer and the per-file walks are what separate the 10k clone
-   (1,014 ms) from the 544 ms gate and from Git (583 ms): one request per
-   level, streamed responses and the pack format on the wire on the
-   server's side; on the client, one directory descriptor per directory
-   for checkout's steps instead of a walk from the root for each.
-2. Clone one directory (74 ms at 10k, 62 ms at 1k) is now mostly the fixed
-   cost of `vl` starting, creating a repository and signing in.
-3. Commit one changed file: see "What remains" in performance round 1
-   above (two transactions' journal commits, the scan).
+1. **Clone one directory** (Git's level, not below): the ~60 sequential
+   `fsync`s of `init`, two transactions and the checkout record. Folding
+   the clone's pull, new change and checkout record into fewer durable
+   steps is the next lever.
+2. **Path walks:** about 11 `openat` per file remain in a checkout (each
+   step walks from the root without following links); one directory
+   descriptor per directory for all of checkout's steps would remove most.
+3. **Commit one changed file** (one transaction now): the scan and the
+   transaction's journal commits; Git makes no fsync.
+4. **Server:** permission lookups cached per person and folder, fewer
+   commits per landing, then batched landing (`LOAD.md`).

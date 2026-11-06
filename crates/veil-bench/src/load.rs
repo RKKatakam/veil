@@ -696,6 +696,9 @@ struct Ctx<'a> {
     stats: Option<(&'a tokio::runtime::Runtime, &'a str)>,
 }
 
+/// Scheduled landings of one project, shared by its agents.
+type Schedule = Arc<Mutex<mpsc::Receiver<Instant>>>;
+
 /// One point of a curve.
 fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) -> Result<serde_json::Value> {
     let setup = Api::new(cx.base, cx.ca)?;
@@ -707,7 +710,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
     let landers = if a.mode == Mode::Pull && a.background > 0.0 { projects } else { 0 };
     let ready = Barrier::new(clients + landers + 1);
     // Open loop: scheduled landings, one queue per project.
-    let queues: Vec<(mpsc::Sender<Instant>, Arc<Mutex<mpsc::Receiver<Instant>>>)> = (0..projects)
+    let queues: Vec<(mpsc::Sender<Instant>, Schedule)> = (0..projects)
         .map(|_| {
             let (tx, rx) = mpsc::channel();
             (tx, Arc::new(Mutex::new(rx)))
