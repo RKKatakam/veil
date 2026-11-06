@@ -1111,6 +1111,32 @@ impl StorageBackend for DiskBackend {
         }
     }
 
+    /// Inside `.veil/` only (the history index); elsewhere it is
+    /// [`StorageBackend::create_new`].
+    fn create_new_unsynced(&self, path: &VPath, data: &[u8]) -> Result<bool> {
+        if path.is_root() || !Self::own_path(path) {
+            return self.create_new(path, data);
+        }
+        self.refuse_symlinked_parent(path)?;
+        let full = self.full_path(path);
+        let parent = full.parent().expect("non-root path has a parent");
+        create_dir_all_durable(parent).map_err(|e| io_err(parent, e))?;
+        let tmp = temp_path(parent, path);
+        let written = fs::OpenOptions::new().write(true).create_new(true).open(&tmp).and_then(|mut f| f.write_all(data));
+        if let Err(e) = written {
+            let _ = fs::remove_file(&tmp);
+            return Err(io_err(&full, e));
+        }
+        let linked = fs::hard_link(&tmp, &full);
+        let _ = fs::remove_file(&tmp);
+        match linked {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+            // No hard links here: the durable `O_EXCL` route.
+            Err(_) => self.create_new(path, data),
+        }
+    }
+
     fn remove_file(&self, path: &VPath) -> Result<()> {
         let full = self.full_path(path);
         #[cfg(unix)]

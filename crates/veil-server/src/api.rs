@@ -36,7 +36,7 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/tips", get(tips))
         .route("/v1/projects/{p}/history", post(history))
         .route("/v1/projects/{p}/fetch", post(fetch))
-        .route("/v1/projects/{p}/objects", post(objects).layer(DefaultBodyLimit::max(2 << 30)))
+        .route("/v1/projects/{p}/objects", post(objects).layer(DefaultBodyLimit::max(crate::db::body_limit("/objects"))))
         .route("/v1/projects/{p}/push", post(push))
         .route("/v1/projects/{p}/access", get(access))
         .route("/v1/projects/{p}/groups", get(list_groups))
@@ -46,7 +46,8 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/groups/{g}/managers", post(add_managers))
         .route("/v1/projects/{p}/rings", get(get_rings))
         .route("/v1/projects/{p}/rings/{scope}", post(post_ring))
-        .layer(DefaultBodyLimit::max(64 << 20))
+        .layer(DefaultBodyLimit::max(crate::db::body_limit("")))
+        .layer(axum::middleware::from_fn(crate::db::retry_requests))
         .with_state(hub)
 }
 

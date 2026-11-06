@@ -99,6 +99,10 @@ struct FaultyBackend {
     /// Unsynced renames since the last barrier (`from`, `to`): the content
     /// is durable, the new name is not. A power loss undoes them.
     renamed: Mutex<Vec<(VPath, VPath)>>,
+    /// Files created never to be synced (`create_new_unsynced`: the
+    /// history index's layers): no barrier covers them, a power loss tears
+    /// them.
+    never_synced: Mutex<Vec<VPath>>,
     tore: AtomicBool,
 }
 
@@ -112,6 +116,7 @@ impl FaultyBackend {
             mutations: AtomicUsize::new(0),
             volatile: Mutex::new(Vec::new()),
             renamed: Mutex::new(Vec::new()),
+            never_synced: Mutex::new(Vec::new()),
             tore: AtomicBool::new(false),
         }
     }
@@ -130,15 +135,15 @@ impl FaultyBackend {
             }
         }
         let mut volatile = self.volatile.lock().unwrap();
+        volatile.extend(self.never_synced.lock().unwrap().drain(..));
         self.tore.fetch_or(!volatile.is_empty(), Ordering::SeqCst);
         for (i, path) in volatile.drain(..).enumerate() {
+            // Already removed (a merged-away index layer): nothing to tear.
+            let Some(data) = self.inner.read_opt(&path).unwrap() else { continue };
             match i % 3 {
                 0 => self.inner.remove_file(&path).unwrap(),
                 1 => self.inner.write(&path, b"").unwrap(),
-                _ => {
-                    let data = self.inner.read(&path).unwrap();
-                    self.inner.write(&path, &data[..data.len() / 2]).unwrap();
-                }
+                _ => self.inner.write(&path, &data[..data.len() / 2]).unwrap(),
             }
         }
     }
@@ -223,6 +228,15 @@ impl StorageBackend for FaultyBackend {
     }
     fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool> {
         self.mutate(|| self.inner.create_new(path, data))
+    }
+    fn create_new_unsynced(&self, path: &VPath, data: &[u8]) -> Result<bool> {
+        self.mutate(|| {
+            let created = self.inner.create_new(path, data)?;
+            if created {
+                self.never_synced.lock().unwrap().push(path.clone());
+            }
+            Ok(created)
+        })
     }
     fn remove_file(&self, path: &VPath) -> Result<()> {
         self.mutate(|| self.inner.remove_file(path))
@@ -1441,4 +1455,72 @@ fn crash_during_settle() {
         }
     }
     assert!(crashes >= 3, "too few crash points ({crashes})");
+}
+
+/// The history index's layers are never synced (a cache, `graph_index`):
+/// a power loss tears them (missing, empty, half written). The checksum
+/// catches each torn layer, the index is dropped (a new epoch) and computed
+/// again from the store, and every graph query answers as before.
+#[test]
+fn a_power_loss_tears_history_index_layers_and_they_are_rebuilt() {
+    let disk = Arc::new(MemoryBackend::new());
+    let faulty = Arc::new(FaultyBackend::new(disk.clone(), usize::MAX, Crash::PowerLoss));
+    let backend: Arc<dyn StorageBackend> = faulty.clone();
+    let mut repo = Repo::init(backend.clone(), None, "t").unwrap();
+    let mut line = Vec::new();
+    for i in 0..40 {
+        repo.describe(repo.workspace_wc(WS).unwrap(), &format!("change {i}")).unwrap();
+        let described = repo.workspace_wc(WS).unwrap();
+        repo.new_change(WS, vec![described], "").unwrap();
+        line.push(described);
+    }
+    line.push(repo.workspace_wc(WS).unwrap());
+    let tip = *line.last().unwrap();
+    let visible = repo.visible_snapshots().unwrap();
+    drop(repo);
+    let layers = |d: &MemoryBackend| -> Vec<(String, Vec<u8>)> {
+        let dir = VPath::new(".veil/index/graph").unwrap();
+        let mut v: Vec<(String, Vec<u8>)> = d
+            .list_dir(&dir)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| e.name.starts_with("L-"))
+            .map(|e| (e.name.clone(), d.read(&dir.join(&e.name)).unwrap()))
+            .collect();
+        v.sort();
+        v
+    };
+    let before = layers(&disk);
+    assert!(!before.is_empty(), "commits wrote index layers");
+    faulty.tear_volatile();
+    let after = layers(&disk);
+    assert_ne!(before, after, "the power loss tore some layer");
+    assert!(
+        after.iter().any(|(n, d)| before.iter().any(|(m, e)| m == n && e != d)),
+        "a layer is still there, torn under its name: {:?} → {:?}",
+        before.iter().map(|l| (&l.0, l.1.len())).collect::<Vec<_>>(),
+        after.iter().map(|l| (&l.0, l.1.len())).collect::<Vec<_>>()
+    );
+    // Reboot: every query answers as the full walk does.
+    let repo = Repo::open(disk.clone(), None, "t").unwrap();
+    assert_eq!(repo.visible_snapshots().unwrap(), visible);
+    for (i, a) in line.iter().enumerate() {
+        assert!(repo.is_ancestor(a, &tip).unwrap(), "{i} is below the tip");
+        if *a != tip {
+            assert!(!repo.is_ancestor(&tip, a).unwrap(), "the tip is not below {i}");
+        }
+        let (g, gt) = (repo.graph().generation(&repo, a).unwrap(), repo.graph().generation(&repo, &tip).unwrap());
+        assert!(*a == tip || g < gt, "{i}: generation {g:?} below the tip's {gt:?}");
+    }
+    repo.graph().persist(&repo);
+    drop(repo);
+    // The torn epoch is gone: what is left was written again, and parses.
+    let torn_epoch = |n: &str| n.split('-').nth(1).map(str::to_string);
+    let epochs: HashSet<Option<String>> = before.iter().map(|(n, _)| torn_epoch(n)).collect();
+    let rebuilt = layers(&disk);
+    assert!(!rebuilt.is_empty(), "the index was written again");
+    assert!(rebuilt.iter().all(|(n, _)| !epochs.contains(&torn_epoch(n))), "{rebuilt:?}");
+    let reopened = Repo::open(disk.clone(), None, "t").unwrap();
+    assert_eq!(reopened.visible_snapshots().unwrap(), visible);
+    assert!(reopened.is_ancestor(&line[0], &tip).unwrap());
 }

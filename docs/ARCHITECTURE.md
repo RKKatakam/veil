@@ -1700,6 +1700,15 @@ A workspace is only a named pointer in the view. It owns no directory.
   content. The builder also consults it (`BuildOptions::materialised`): a
   file that was never materialised is never recorded as deleted. The
   clone-then-grant onboarding flow depends on this.
+* **`vl commit` is one operation.** It records the project directory and
+  commits it in one transaction (`SnapshotOptions::commit`,
+  `commands::commit_in`, `Ctx::commit`): one op-log entry, half the
+  journal commits of a snapshot followed by a commit. `vl undo` takes back
+  both (the edits the commit recorded leave `@` and the directory; `vl
+  redo` brings them back). With pre-commit or commit-msg hooks the
+  directory is recorded first (the hooks read `VEIL_SNAPSHOT`), as its own
+  automatic snapshot; a stale directory's recovery is also its own
+  operation.
 * **Commands that edit the working copy are operations of their own.**
   `vl expose`, `cloak`, `isolate`, `ignore` and `restore` write files and
   record the result under their own operation description, not as the

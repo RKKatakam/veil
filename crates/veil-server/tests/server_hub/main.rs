@@ -18,3 +18,4 @@ mod escalation;
 mod leaks;
 mod sync;
 mod adversarial;
+mod startup;

@@ -3,7 +3,8 @@
 # Docker containers this script starts and removes:
 #   PostgreSQL 17, YugabyteDB 2025.2 (Apache-2.0 core image) and MinIO.
 #
-# Steps: the server's unit tests and clippy; the container test suite
+# Steps: the migrations, once per database; the server's unit tests and
+# clippy; the container test suite
 # (`--features containers`) on PostgreSQL + MinIO and on YugabyteDB + MinIO;
 # then the concurrency tests under load (several copies of the test binary
 # at once, as the veil-review skill's lens 3 asks).
@@ -55,6 +56,13 @@ export VEIL_TEST_VL=$PWD/target/debug/vl
 export VEIL_TEST_S3_ENDPOINT=http://127.0.0.1:$S3_PORT VEIL_TEST_S3_KEY=veilminio VEIL_TEST_S3_SECRET=veilminio-secret
 PG_URL=postgres://veil:veil@127.0.0.1:$PG_PORT/veil
 YB_URL=postgres://yugabyte@127.0.0.1:$YB_PORT/yugabyte
+
+# Migrate each database once, before any server starts (BUG-838): servers
+# that find the schema current run no DDL, so the suites' many servers
+# never change the catalog under one another.
+for url in "$PG_URL" "$YB_URL"; do
+  timeout 300 target/debug/veil-server migrate --database-url "$url" || { echo "migrating $url failed"; exit 1; }
+done
 
 status=0
 # Every step is bounded: a hang fails the run instead of blocking it.

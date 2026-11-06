@@ -1449,7 +1449,8 @@ impl Server {
 
     fn write(&self, w: WriteOp, snapshot: bool) -> Result<String, RpcError> {
         let _serial = self.serialise();
-        let mut ctx = self.open(snapshot, false)?;
+        // A commit records the directory in its own operation (`Ctx::commit`).
+        let mut ctx = self.open(snapshot && !matches!(w, WriteOp::Commit { .. }), false)?;
         let doc = match w {
             WriteOp::Snapshot => json(&api::recorded(&ctx)?),
             // The same hooks as the commands; their output goes to this
@@ -1466,7 +1467,7 @@ impl Server {
             WriteOp::Commit { message, advance, no_verify } => {
                 let verify = crate::hooks::NoVerifyArgs { no_verify };
                 let message = crate::hooks::before_commit(&mut ctx, &verify, &message, snapshot, "commit")?;
-                json(&api::commit(&mut ctx, &message, advance)?)
+                json(&api::commit(&mut ctx, &message, advance, snapshot)?)
             }
             // No picker: what to take is always given.
             WriteOp::Split { rev, message, files } => {
