@@ -1142,6 +1142,10 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
 
 ### 13.9 Later milestones (not in S1)
 
+The designs for phases 2–4, with milestones S3–S26 in build order, are in
+`docs/design/server/` (`README.md` lists them, their dependencies and what
+can run in parallel).
+
 1. **S2: secrets at scale** — keys per access rule and background wrapping
    for new members and devices (§13.6), device removal.
 2. **S3: fetch on demand in the client** — the partial-clone design

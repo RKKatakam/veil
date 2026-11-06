@@ -152,6 +152,8 @@ The server is built now, with the permission model. Each later phase depends on 
 
 Simulation testing (6.8) starts in phase 1 and grows with each phase.
 
+The designs of phases 2, 3 and 4, with their milestones (S3–S26), threat reviews and benchmarks, are in `docs/design/server/`.
+
 The roadmap has no dates. Each gate is a benchmark result against the design targets in `docs/HUB.md` §9.2.
 
 ## Open questions
