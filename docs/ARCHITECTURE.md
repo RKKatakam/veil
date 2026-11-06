@@ -1826,7 +1826,24 @@ A workspace is only a named pointer in the view. It owns no directory.
      `GIT_CEILING_DIRECTORIES` set to the sandbox (and `find_root` never
      resolves a repository from inside `.veil/`), with SIGINT/SIGQUIT
      ignored by `vl` and SIGTERM/SIGHUP forwarded to the command (BUG-550),
-     so they stop the command, not the recording;
+     so they stop the command, not the recording. **On Linux the command
+     is confined** (`confine.rs`, `docs/design/scale/9-confinement.md`):
+     `bwrap` binds the sandbox at the project's canonical path, the
+     system read-only, an empty tmpfs `HOME` and `/tmp`, a read-only
+     allow-list, and a tmpfs over the Veil home (and over the Veil home
+     and the project under every other name an allowed link gives them,
+     BUG-848), in new user, pid, IPC and UTS namespaces
+     (`--disable-userns`, `--die-with-parent`, `--new-session`; `vl` arms
+     the parent-death signal itself before the exec, BUG-851). `vl`
+     checks it with a run of `true` before step 1 touches anything.
+     Limits go through a systemd user scope (`systemd-run --scope`,
+     with `--expand-environment=no` where it knows it, execs `bwrap` in
+     place; every `systemd-run`
+     and `systemctl` call has a 5 s deadline, BUG-849/850) or
+     `RLIMIT_CPU` and polling; `vl` and the reaper are outside them. `bwrap` has its own
+     process group and the command no terminal, so `vl` forwards
+     SIGINT/SIGQUIT to the command's process group and SIGTERM/SIGHUP to
+     the command, through a pidfd;
   7. records with `expected_wc` = the snapshot it synced to, through
      `PolicyPin` (the recorded `.veilpolicy` when the sandbox's is not a
      regular, readable file), as the command's output
@@ -3763,7 +3780,8 @@ afterwards; textconv input on stdin, output never stored.
 * **the server, with secrets and embargoed changes before release.** It stores only their ciphertext and never holds a key that opens them. Personal private keys never reach it. **Nor can it hand a secret out:** a key is granted only by a ring admin's signed change, never by the server's group records, which a compromised server could rewrite (`docs/HUB.md` §13.6);
 * people outside a folder's access, including others in the same project, and members after they are removed;
 * anything that arrives by push, pull, fetch or merge: trees, names, descriptions, policies, hooks and metadata;
-* the network, and other OS users on the same machine.
+* the network, and other OS users on the same machine;
+* **a command confined by `vl ws exec`** (Linux, `docs/design/scale/9-confinement.md`; owner, 2026-11-06). It runs as the person, but for files it is outside the trust boundary: it cannot read the person's private files (keys, the rest of the home, the Veil identity, the real repository and other workspaces' sandboxes) or write outside its sandbox, and the files it leaves are untrusted input to `vl`. By the owner's choice it gets the environment variables, and the network unless `--no-network`; what it is given (the environment, injected secrets, the read-only allow-list) it can use and send anywhere. An unconfined run (`--unconfined`, or `vl bisect run`) is the person's own deliberate command.
 
 **Today's client** (before the server) syncs with plain-file remotes, so for now:
 

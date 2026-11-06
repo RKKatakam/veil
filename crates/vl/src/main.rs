@@ -23,6 +23,7 @@ mod api;
 mod attr_cmd;
 mod auto_gc;
 mod cli;
+mod confine;
 mod ctx;
 mod doctor;
 #[cfg(test)]
@@ -2370,6 +2371,7 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
             with_isolated,
             only,
             record_only,
+            confine,
             command,
         } => {
             return sandbox::exec(
@@ -2382,6 +2384,7 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
                     with_isolated: *with_isolated,
                     only,
                     record_only: *record_only,
+                    confine,
                     command,
                 },
             );
