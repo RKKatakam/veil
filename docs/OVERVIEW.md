@@ -57,13 +57,13 @@ The owner adopted the four synthetic workloads published by OpenScion, an indepe
 | Workload | 1,000 files: target | 10,000 files: target | Veil, real disk, through the server (1k / 10k) |
 |---|---:|---:|---|
 | Import a directory (first snapshot) | **22 ms** | **245 ms** | 101 / 708 ms (Git: 101 / 790 ms) |
-| Clone everything | **51 ms** | **544 ms** | 1,075 / 9,872 ms (Git: 271 / 579 ms) |
+| Clone everything | **51 ms** | **544 ms** | 124 / 1,014 ms after BUG-818 (Git: 171 / 583 ms) |
 | Commit one changed file | **2.5 ms** | **22 ms** | 34 / 45 ms (Git: 14 / 7 ms) |
-| Clone one directory | **6.1 ms** | **25 ms** | 189 / 193 ms (Git: 79 / 63 ms) |
+| Clone one directory | **6.1 ms** | **25 ms** | 62 / 74 ms after BUG-818 (Git: 47 / 82 ms) |
 
 - **Measured by the S1 server milestone** on an ext4 NVMe disk: release builds, the median of 5, PostgreSQL, with Git as the same-machine reference. Absolute numbers depend on the machine, so each gate also requires **beating Git on the same machine**. **No gate is met yet.**
 - **Correction:** an earlier table here (51 / 316, 50 / 483, 12.8 / 27 ms) was measured under `/tmp`, which is a tmpfs on the development machine, where `fsync` costs nothing. Those numbers were invalid. **Never benchmark under `/tmp` on that machine.**
-- **The biggest cost:** checkout makes every file durable on its own (BUG-818: 20,154 `fsync`s for 10,001 files, 7.3 s of a 9.4 s clone). Being fixed now.
+- **BUG-818 fixed** (one durability barrier per checkout): clones are 2.5–10× faster. The rest of a 10k clone is the transfer plus about 16 `openat` calls per file from checkout's no-follow path walks.
 - **Next costs:** per-command overhead (commit), server round trips (clone one directory), and hashing and compression work (import).
 - **Performance rounds continue until every gate is met.** The profile runs in `crates/veil-bench` (`docs/design/scale/OPENSCION.md`) and is re-run on every stream that touches the client or the server.
 
