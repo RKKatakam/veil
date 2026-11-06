@@ -80,10 +80,6 @@ impl HubUrl {
     }
 }
 
-pub fn is_hub_url(s: &str) -> bool {
-    HubUrl::parse(s).is_some()
-}
-
 // ---- $VEIL_HOME/hub.json ------------------------------------------------------------
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

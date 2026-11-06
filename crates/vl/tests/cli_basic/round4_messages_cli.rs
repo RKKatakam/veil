@@ -171,12 +171,12 @@ fn reading_a_cloaked_file_from_a_public_clone_explains_why_it_is_withheld() {
     let err = stderr(&out);
     assert!(!out.status.success());
     assert!(!err.contains("not present in this store"), "{err}");
-    assert!(err.contains("cloaked under scope 'team' and was withheld") && err.contains("team remote"), "{err}");
+    assert!(err.contains("cloaked under scope 'team' and its content never reached this repository") && err.contains("from the Veil server"), "{err}");
 
     let show = env.stdout("carol", &carol, &["show", "main"]);
-    assert!(show.contains("(content hidden: cloaked:team; withheld by a public remote)"), "{show}");
+    assert!(show.contains("(content hidden: cloaked:team; not received)"), "{show}");
     let diff = env.stdout("carol", &carol, &["diff", "-r", "main"]);
-    assert!(diff.contains("withheld by a public remote"), "{diff}");
+    assert!(diff.contains("cloaked:team; not received"), "{diff}");
 }
 
 #[test]

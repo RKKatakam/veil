@@ -1455,42 +1455,39 @@ fn interrupted_upgrade_to_3_resumes_the_ring_step() {
 
 #[test]
 fn aes_siv_objects_and_hpke_rings_never_reach_a_format2_repository() {
-    for full in [false, true] {
-        let opts = remote::SyncOptions { full, ..Default::default() };
-        let fx = Fixture::new(2);
-        upgrade(fx.backend("alice"), Some(fx.identity("alice")), &UpgradeOptions::default()).unwrap();
-        let mut alice = fx.open("alice", Some("alice"));
-        // Ring only (the upgrade's rotation), no new objects yet: refused.
-        let err = remote::push_with(&mut alice, fx.backend("team-remote"), false, &[], false, &opts).unwrap_err();
-        assert!(matches!(err, VeilError::Unsupported(_)) && err.to_string().contains("vl upgrade"), "{err}");
-        // With AES-SIV objects: refused too, by the store (pack sink or put_raw).
-        let c = commit_edit(&fx, &mut alice, &[("secrets/notes.txt", "sealed with AES-SIV\n")], "siv");
-        alice.set_tag("main", c, None, true).unwrap();
-        let err = remote::push_with(&mut alice, fx.backend("team-remote"), false, &[], false, &opts).unwrap_err();
-        assert!(matches!(err, VeilError::Unsupported(_)) && err.to_string().contains("vl upgrade"), "{err}");
-        let team = fx.open("team-remote", None);
-        assert_eq!(team.format(), 2);
-        assert_eq!(sealed_census(&team).1, 0, "an AES-SIV object reached the format-2 remote");
-        assert_eq!(ring_of(&team, "team").format, 2);
-        assert_fsck_clean(fx.backend("team-remote"), None);
+    let fx = Fixture::new(2);
+    upgrade(fx.backend("alice"), Some(fx.identity("alice")), &UpgradeOptions::default()).unwrap();
+    let mut alice = fx.open("alice", Some("alice"));
+    // Ring only (the upgrade's rotation), no new objects yet: refused.
+    let err = remote::push(&mut alice, fx.backend("team-remote"), false, &[], false).unwrap_err();
+    assert!(matches!(err, VeilError::Unsupported(_)) && err.to_string().contains("vl upgrade"), "{err}");
+    // With AES-SIV objects: refused too, by the store (pack sink or put_raw).
+    let c = commit_edit(&fx, &mut alice, &[("secrets/notes.txt", "sealed with AES-SIV\n")], "siv");
+    alice.set_tag("main", c, None, true).unwrap();
+    let err = remote::push(&mut alice, fx.backend("team-remote"), false, &[], false).unwrap_err();
+    assert!(matches!(err, VeilError::Unsupported(_)) && err.to_string().contains("vl upgrade"), "{err}");
+    let team = fx.open("team-remote", None);
+    assert_eq!(team.format(), 2);
+    assert_eq!(sealed_census(&team).1, 0, "an AES-SIV object reached the format-2 remote");
+    assert_eq!(ring_of(&team, "team").format, 2);
+    assert_fsck_clean(fx.backend("team-remote"), None);
 
-        // A format-2 clone cannot pull them either.
-        let mid = Arc::new(MemoryBackend::new());
-        drop(Repo::init_bare(mid.clone()).unwrap());
-        remote::push_with(&mut alice, mid.clone(), false, &[], false, &opts).unwrap();
-        let mut old = Repo::init_for_clone_at(Arc::new(MemoryBackend::new()), Some(fx.identity("bob")), "bob", 2).unwrap();
-        let err = remote::pull_with(&mut old, "origin", mid.clone(), &opts).unwrap_err();
-        assert!(matches!(err, VeilError::Unsupported(_)), "{err}");
+    // A format-2 clone cannot pull them either.
+    let mid = Arc::new(MemoryBackend::new());
+    drop(Repo::init_bare(mid.clone()).unwrap());
+    remote::push(&mut alice, mid.clone(), false, &[], false).unwrap();
+    let mut old = Repo::init_for_clone_at(Arc::new(MemoryBackend::new()), Some(fx.identity("bob")), "bob", 2).unwrap();
+    let err = remote::pull(&mut old, "origin", mid.clone()).unwrap_err();
+    assert!(matches!(err, VeilError::Unsupported(_)), "{err}");
 
-        // Once the remote is upgraded, the push goes through and Bob reads it.
-        upgrade(fx.backend("team-remote"), None, &UpgradeOptions::default()).unwrap();
-        remote::push_with(&mut alice, fx.backend("team-remote"), false, &[], false, &opts).unwrap();
-        let mut bob = Repo::init_for_clone(Arc::new(MemoryBackend::new()), Some(fx.identity("bob")), "bob").unwrap();
-        remote::pull(&mut bob, "origin", fx.backend("team-remote")).unwrap();
-        let main = tag(&bob, "main");
-        assert_eq!(read_str(&bob, &main, "secrets/notes.txt").as_deref(), Some("sealed with AES-SIV\n"));
-        assert_fsck_clean(fx.backend("team-remote"), None);
-    }
+    // Once the remote is upgraded, the push goes through and Bob reads it.
+    upgrade(fx.backend("team-remote"), None, &UpgradeOptions::default()).unwrap();
+    remote::push(&mut alice, fx.backend("team-remote"), false, &[], false).unwrap();
+    let mut bob = Repo::init_for_clone(Arc::new(MemoryBackend::new()), Some(fx.identity("bob")), "bob").unwrap();
+    remote::pull(&mut bob, "origin", fx.backend("team-remote")).unwrap();
+    let main = tag(&bob, "main");
+    assert_eq!(read_str(&bob, &main, "secrets/notes.txt").as_deref(), Some("sealed with AES-SIV\n"));
+    assert_fsck_clean(fx.backend("team-remote"), None);
 }
 
 #[test]
@@ -1575,7 +1572,7 @@ fn format_4_fixture_holds_conflicts_as_data_for_their_audiences() {
 }
 
 /// A format-3 remote or clone never receives a conflict entry: the push is
-/// refused (naming `vl upgrade --remote`) and nothing is recorded; after
+/// refused (naming `vl upgrade`) and nothing is recorded; after
 /// the upgrade it goes through.
 #[test]
 fn conflicts_never_reach_a_format_3_repository() {

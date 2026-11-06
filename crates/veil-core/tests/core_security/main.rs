@@ -14,8 +14,6 @@
 
 #[path = "../adversarial_support/mod.rs"]
 mod adversarial_support;
-#[path = "../sftp_support/mod.rs"]
-mod sftp_support;
 
 mod access;
 mod adversarial2_embargo;

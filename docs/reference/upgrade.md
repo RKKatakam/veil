@@ -3,7 +3,7 @@
 
 # `vl upgrade`
 
-Upgrade the repository (or a remote) to the newest format.
+Upgrade the repository to the newest format.
 
 Existing repositories keep working at their format without this; upgrading enables what the newer format adds (format 2: binary trees, which make `vl status` faster). Old objects keep their ids, nothing is rewritten, and older vl releases can no longer read the repository afterwards. Runs `fsck` first; resumable after a crash.
 
@@ -16,7 +16,6 @@ Options:
 | | |
 |---|---|
 | `--dry-run` | Show what would happen without changing anything |
-| `--remote <NAME>` | Upgrade this remote instead of the local repository |
 | `--force` | Upgrade even if fsck reports corruption |
 | `--sync-secrets` | Start encrypting and syncing shared secrets (`.env`, `.env.*`, `.envrc`, Terraform state) under the `team` key, as new repositories do: lists the files that would start syncing, then adds the rules to `.veilpolicy` (with --dry-run: only lists). Personal private keys stay on this device |
 

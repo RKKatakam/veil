@@ -26,33 +26,6 @@ fn vl_home(
         .unwrap()
 }
 
-// Veil (jj test_load_repo.rs: loading a repository written by an older version): a new
-// repository pushing to a format-1 remote is refused with the upgrade hint and writes nothing.
-#[test]
-fn a_new_repository_cannot_push_into_a_format_1_remote_and_leaves_it_untouched() {
-    let env = Env::new();
-    let root = fx(&env, 1);
-    let remote = root.join("team-remote");
-    let before = listing(&remote);
-    let proj = env.project("zoe", "zoe", &[("z.txt", "z\n")]);
-    env.ok(
-        "zoe",
-        &proj,
-        &["remote", "add", "old", remote.to_str().unwrap()],
-    );
-    // A new tag: the remote's `main` is unrelated history, and a diverged tag is refused before
-    // anything is sent (BUG-288), so it would never reach the format check.
-    env.ok("zoe", &proj, &["tag", "set", "zoe-work", "-r", "main"]);
-    let out = env.fails("zoe", &proj, &["push", "old", "-t", "zoe-work"]);
-    assert!(out.contains("vl upgrade --remote"), "{out}");
-    assert_eq!(
-        listing(&remote),
-        before,
-        "a refused push wrote to the remote"
-    );
-    assert_eq!(repo_format(&remote), 1);
-}
-
 // jj test_load_repo.rs: an older remote is still readable by a newer client.
 #[test]
 fn a_current_clone_of_a_format_2_remote_reads_and_pushes_back() {
@@ -135,24 +108,4 @@ fn a_remote_in_a_newer_format_is_refused_without_writing() {
     env.fails("bob", &env.root, &["clone", hub.to_str().unwrap(), "bob"]);
     assert!(!env.path("bob").exists());
     assert_eq!(listing(&hub), before);
-}
-
-// Veil: `vl upgrade --remote --dry-run` describes the upgrade and writes nothing.
-#[test]
-fn upgrade_remote_dry_run_writes_nothing() {
-    let env = Env::new();
-    let root = fx(&env, 1);
-    let alice = root.join("alice");
-    let home = root.join("home-alice");
-    let remote = root.join("team-remote");
-    let before = listing(&remote);
-    let out = vl_home(
-        &env,
-        &home,
-        &alice,
-        &["upgrade", "--remote", "origin", "--dry-run"],
-    );
-    assert!(out.status.success(), "{}", text(&out));
-    assert!(text(&out).contains("format 1"), "{}", text(&out));
-    assert_eq!(listing(&remote), before);
 }

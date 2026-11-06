@@ -59,15 +59,13 @@ pub enum Cmd {
     ///
     /// SOURCE is a Veil server project (`veil://host[:port]/project` or
     /// `https://host[:port]/project`): you receive only what you may see.
-    /// Today's client also clones a path, `ssh://[user@]host[:port]/path` or
-    /// scp-style `[user@]host:path` (through your own `ssh`).
     Clone {
-        /// Project or repository to clone: a server URL, a path or an SSH URL.
+        /// The project's server URL: `veil://host[:port]/project`.
         source: String,
-        /// Directory to clone into (default: the source's last path component).
+        /// Directory to clone into (default: the project's name).
         dest: Option<PathBuf>,
-        /// From a Veil server: fetch only this directory's files (the server
-        /// sends only that subtree's objects).
+        /// Fetch only this directory's files (the server sends only that
+        /// subtree's objects).
         #[arg(long, value_name = "DIR")]
         only: Option<String>,
     },
@@ -205,7 +203,7 @@ pub enum Cmd {
         #[arg(short, long)]
         verbose: bool,
     },
-    /// Upgrade the repository (or a remote) to the newest format.
+    /// Upgrade the repository to the newest format.
     ///
     /// Existing repositories keep working at their format without this;
     /// upgrading enables what the newer format adds (format 2: binary
@@ -216,9 +214,6 @@ pub enum Cmd {
         /// Show what would happen without changing anything.
         #[arg(long)]
         dry_run: bool,
-        /// Upgrade this remote instead of the local repository.
-        #[arg(long, value_name = "NAME")]
-        remote: Option<String>,
         /// Upgrade even if fsck reports corruption.
         #[arg(long)]
         force: bool,
@@ -227,7 +222,7 @@ pub enum Cmd {
         /// repositories do: lists the files that would start syncing, then
         /// adds the rules to `.veilpolicy` (with --dry-run: only lists).
         /// Personal private keys stay on this device.
-        #[arg(long, conflicts_with_all = ["remote", "force"])]
+        #[arg(long, conflicts_with = "force")]
         sync_secrets: bool,
     },
     /// Show how a change evolved (amends, rewrites, rebases).
@@ -512,7 +507,8 @@ pub enum Cmd {
 
     // ---- secrets & identities ---------------------------------------------
     /// Encrypted secrets: the device-local vault, or a scope's team vault
-    /// (`--scope`), shared with the scope's members through team remotes.
+    /// (`--scope`), sealed for the scope's members (it does not sync
+    /// through the Veil server yet).
     #[command(subcommand)]
     Secret(SecretCmd),
     /// Run a command with vault secrets injected as environment variables.
@@ -610,65 +606,28 @@ pub enum Cmd {
     },
 
     // ---- sync -------------------------------------------------------------
-    /// Manage remotes.
+    /// Manage remotes: the Veil server projects this repository syncs with.
     #[command(subcommand)]
     Remote(RemoteCmd),
-    /// Send tags and their history to a remote (visibility-filtered).
-    ///
-    /// `--dry-run` shows what the push would send, writing nothing to the
-    /// remote (it only reads the remote's tags): which tags it creates,
-    /// moves or would have rejected, how many snapshots and objects it
-    /// sends and their size, and what stays here (embargoed history). For a
-    /// public remote it also lists every file whose content would become
-    /// public there, and the files it withholds, with the reason.
+    /// Send tags and their history to the Veil server, which moves each
+    /// branch only if nobody moved it meanwhile (and checks your access).
     Push {
-        /// Remote to push to (default: origin; with --dry-run, every
-        /// configured remote).
+        /// Remote to push to (default: origin).
         remote: Option<String>,
         /// Only push these tags.
         #[arg(short, long)]
         tag: Vec<String>,
-        /// Overwrite tags that diverged on the remote.
+        /// Overwrite branches that diverged on the server (admins only).
         #[arg(long)]
         force: bool,
-        /// Move release tags (annotated: `vl tag set -a`) that the
-        /// remote holds at another target. A release is otherwise never
-        /// replaced, even by a fast-forward.
-        #[arg(long)]
-        force_tags: bool,
-        /// Walk and verify every object instead of skipping what the remote
-        /// provably has (repairs damaged or missing objects on the remote).
-        #[arg(long)]
-        full: bool,
-        /// Delete this tag on the remote (repeatable). Delete it here first
-        /// with `vl tag delete`. Refused if someone moved it there since
-        /// (unless --force). With no --tag, nothing else is pushed.
-        #[arg(short, long, value_name = "TAG")]
-        delete: Vec<String>,
-        /// Start the upload afresh instead of resuming an interrupted push
-        /// of the same tags to this remote (what it uploaded is not reused).
-        #[arg(long)]
-        no_resume: bool,
-        /// Show what would be sent, and send nothing.
-        #[arg(long, conflicts_with_all = ["full", "delete"])]
-        dry_run: bool,
-        /// With --dry-run: print one JSON document (`veil.push.plan/1`; see
-        /// docs/reference/json.md) instead of text. Errors then also print
-        /// a `veil.error/1` document.
-        #[arg(long, requires = "dry_run")]
-        json: bool,
         #[command(flatten)]
         hooks: hooks::NoVerifyArgs,
     },
-    /// Fetch tags and history from a remote.
+    /// Fetch tags and history from the Veil server: what you may see.
     Pull {
         /// Remote to pull from.
         #[arg(default_value = "origin")]
         remote: String,
-        /// Walk and verify every object instead of skipping what this
-        /// repository provably has (repairs damaged local objects).
-        #[arg(long)]
-        full: bool,
     },
 
     /// Hooks run before commits and pushes; repository-suggested ones only
@@ -715,11 +674,7 @@ pub enum Cmd {
     /// VEIL_HOME, the repository and its lock, the stat cache, the
     /// filesystem (case sensitivity, fsync, network mounts), the clock, the
     /// vault and leftover sandboxes. Exits 1 if anything is broken.
-    Doctor {
-        /// Also check that every remote can be reached.
-        #[arg(long)]
-        remotes: bool,
-    },
+    Doctor,
     /// Print a shell completion script, e.g. `vl completions zsh > ~/.zfunc/_vl`.
     Completions {
         /// Shell to generate the script for.
@@ -790,7 +745,6 @@ impl Cmd {
             | Cmd::Duplicate(rewrite_cmd::DuplicateArgs { out, .. })
             | Cmd::CherryPick(rewrite_cmd::CherryPickArgs { out, .. })
             | Cmd::Attr(attr_cmd::AttrArgs { cmd: attr_cmd::AttrCmd::Check { out, .. } }) => out,
-            Cmd::Push { json, .. } => return *json,
             _ => return false,
         };
         out.json
@@ -890,8 +844,8 @@ pub enum SecretCmd {
         /// Secret value (default: read from stdin, which keeps it out of
         /// your shell history).
         value: Option<String>,
-        /// Store it in this scope's team vault (sealed for its members,
-        /// pushed to team remotes) instead of the local vault.
+        /// Store it in this scope's team vault (sealed for its members)
+        /// instead of the local vault.
         #[arg(long, value_name = "SCOPE")]
         scope: Option<String>,
     },
@@ -1224,18 +1178,17 @@ pub enum OpCmd {
 
 #[derive(Subcommand, Debug)]
 pub enum RemoteCmd {
-    /// Add a remote: a path to another Veil repository, or an SSH remote
-    /// (`ssh://[user@]host[:port]/path` or `[user@]host:path`), reached
-    /// through your own `ssh` and its SFTP subsystem (`VEIL_SSH` overrides
-    /// the command). Nothing but SSH is needed on the server.
+    /// Add a remote: a project on a Veil server
+    /// (`veil://host[:port]/project`).
     Add {
         /// Remote name.
         name: String,
-        /// Path or SSH URL.
+        /// The project's server URL.
         url: String,
-        /// Public remote: cloaked content, cloaked tags and unreleased
-        /// embargoes are never sent.
-        #[arg(long)]
+        /// Test fixture only (debug builds, `VEIL_TEST_PATH_REMOTES`): a
+        /// public path remote (`test_remotes.rs`).
+        #[cfg(debug_assertions)]
+        #[arg(long, hide = true)]
         public: bool,
     },
     /// List remotes.

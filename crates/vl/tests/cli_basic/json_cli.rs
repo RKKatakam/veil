@@ -413,7 +413,6 @@ fn read_commands() -> Vec<(Vec<&'static str>, &'static str)> {
         (vec!["secret", "list", "--json"], "veil.secret.list/1"),
         (vec!["ls", "--json"], "veil.ls/1"),
         (vec!["ls", "--all", "--json"], "veil.ls/1"),
-        (vec!["push", "--dry-run", "--json"], "veil.push.plan/1"),
         (vec!["resolve", "--list", "--json"], "veil.resolve.list/1"),
         (vec!["resolve", "--json"], "veil.resolve.list/1"),
     ]
@@ -707,39 +706,6 @@ fn ls_shape() {
     let e = &nonempty(&v, "entries")[0];
     assert_eq!(e["tier"], "embargoed", "{v}");
     assert!(e["embargo"].is_string());
-}
-
-#[test]
-fn push_plan_shape() {
-    let w = world();
-    let (env, alice) = (&w.env, &w.alice);
-    write(alice, "new.txt", "new\n");
-    env.ok("alice", alice, &["commit", "-m", "next"]);
-    env.ok("alice", alice, &["tag", "set", "next", "-r", "@-"]);
-    let v = json_ok(env, "alice", alice, &["push", "--dry-run", "--json"]);
-    check_doc(&v, "veil.push.plan/1");
-    let remotes = nonempty(&v, "remotes");
-    assert_eq!(remotes.len(), 2, "every configured remote: {v}");
-    let mirror = remotes.iter().find(|r| r["name"] == "mirror").unwrap();
-    assert_eq!(mirror["public"], true);
-    let next = mirror["tags"].as_array().unwrap().iter().find(|t| t["name"] == "next").unwrap();
-    assert_eq!(next["action"], "create");
-    // `@` builds on the embargoed merge: new work there is sealed under the
-    // embargo, so the mirror does not get it yet.
-    let withheld = mirror["files"]["withheld"].as_array().unwrap();
-    assert!(withheld.iter().any(|f| f["path"] == "new.txt" && f["reason"] == "embargoed"), "{mirror}");
-    assert!(mirror["files"]["published"].as_array().unwrap().is_empty(), "{mirror}");
-    assert!(!nonempty(mirror, "withheld_snapshots").is_empty());
-    let skipped = mirror["tags"].as_array().unwrap().iter().find(|t| t["name"] == "plan-tag").unwrap();
-    assert_eq!(skipped["action"], "skipped");
-    let origin = remotes.iter().find(|r| r["name"] == "origin").unwrap();
-    assert!(origin["files"].is_null(), "file lists are for public remotes");
-    assert!(origin["objects"].as_u64().unwrap() >= 3);
-    assert_eq!(origin["object_ids"].as_array().unwrap().len() as u64, origin["objects"].as_u64().unwrap());
-    // One remote; --json needs --dry-run.
-    let v = json_ok(env, "alice", alice, &["push", "origin", "--dry-run", "--json"]);
-    assert_eq!(nonempty(&v, "remotes").len(), 1);
-    assert!(!env.vl("alice", alice, &["push", "--json"]).status.success());
 }
 
 #[test]

@@ -257,8 +257,8 @@ fn notes_for(from: u32, to: u32, report: &UpgradeReport) -> Vec<String> {
                 .into(),
         );
         notes.push(
-            "a remote still at format 1 or 2 refuses AES-SIV objects and HPKE key rings: upgrade it with \
-             `vl upgrade --remote <name>`; a member's clone at format 2 cannot pull them until it is upgraded"
+            "a member's clone at format 1 or 2 refuses AES-SIV objects and HPKE key rings: it cannot pull them \
+             until it is upgraded (`vl upgrade` there)"
                 .into(),
         );
     }
@@ -269,8 +269,8 @@ fn notes_for(from: u32, to: u32, report: &UpgradeReport) -> Vec<String> {
                 .into(),
         );
         notes.push(
-            "a remote or clone still at format 3 refuses conflict entries: upgrade it with `vl upgrade --remote <name>` \
-             before pushing a change that holds an unresolved conflict"
+            "a clone still at format 3 refuses conflict entries: it cannot pull a change that holds an \
+             unresolved conflict until it is upgraded (`vl upgrade` there)"
                 .into(),
         );
     }
@@ -281,9 +281,8 @@ fn notes_for(from: u32, to: u32, report: &UpgradeReport) -> Vec<String> {
                 .into(),
         );
         notes.push(
-            "a remote or clone still at format 4 refuses symlinks and annotated tags: upgrade it with \
-             `vl upgrade --remote <name>` before pushing them; vl releases that only know format 4 refuse this \
-             repository"
+            "a clone still at format 4 refuses symlinks and annotated tags until it is upgraded (`vl upgrade` \
+             there); vl releases that only know format 4 refuse this repository"
                 .into(),
         );
     }
@@ -295,8 +294,7 @@ fn notes_for(from: u32, to: u32, report: &UpgradeReport) -> Vec<String> {
                 .into(),
         );
         notes.push(format!(
-            "vl releases that only know format 5 refuse this repository; a remote at format 5 keeps working \
-             (upgrade it with `vl upgrade --remote <name>` once everyone who uses it runs vl {} or later)",
+            "vl releases that only know format 5 refuse this repository (vl {} or later reads it)",
             min_vl_for_format(OP_HEADS_REPO_FORMAT)
         ));
     }
@@ -311,8 +309,7 @@ fn notes_for(from: u32, to: u32, report: &UpgradeReport) -> Vec<String> {
             min_vl_for_format(2)
         ));
         notes.push(
-            "a remote still at format 1 refuses binary trees: upgrade it with `vl upgrade --remote <name>` \
-             once everyone who uses it has upgraded vl; pulling from format-1 remotes keeps working"
+            "a clone still at format 1 refuses binary trees until it is upgraded (`vl upgrade` there)"
                 .into(),
         );
     }

@@ -40,7 +40,7 @@ libc = { workspace = true, optional = true }
 # wasm32-unknown-unknown (scripts/check-wasm.sh).
 [features]
 default = ["os", "zstd"]
-# A real operating system: `DiskBackend`, `SftpBackend` (spawns `ssh`),
+# A real operating system: `DiskBackend`,
 # process checks in the repository lock and its heartbeat thread, worker
 # threads, and the system clock as the default clock.
 os = ["dep:libc"]

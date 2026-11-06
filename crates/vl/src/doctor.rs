@@ -16,10 +16,10 @@ use anyhow::Result;
 use veil_core::{
     lock::{assess, assess_raw, LockContext, RepoLock, Verdict, LOCK_PATH, STEAL_PATH},
     now_millis,
-    repo::{is_repo, RepoConfig, REPO_FORMAT_VERSION, VEIL_DIR},
+    repo::{RepoConfig, REPO_FORMAT_VERSION},
     statcache::{cache_path, StatCache},
     vfs::{NameFolding, FOLDING_ENV},
-    DiskBackend, Identity, Repo, SftpBackend, SshUrl, StorageBackend, VPath,
+    DiskBackend, Identity, Repo, StorageBackend, VPath,
 };
 
 use crate::{
@@ -81,7 +81,7 @@ impl Report {
     }
 }
 
-pub fn run(repo_arg: Option<&Path>, remotes: bool) -> Result<ExitCode> {
+pub fn run(repo_arg: Option<&Path>) -> Result<ExitCode> {
     let mut r = Report::default();
     println!("vl {VERSION} on {}", env!("VL_TARGET"));
 
@@ -119,13 +119,6 @@ pub fn run(repo_arg: Option<&Path>, remotes: bool) -> Result<ExitCode> {
             r.section("Filesystem");
             check_filesystem(&mut r, &veil_core::repo::state_dir(&root).join("local"), Some(&fs));
             check_clock(&mut r, repo.as_ref());
-            if remotes {
-                r.section("Remotes");
-                match &repo {
-                    Some(repo) => check_remotes(&mut r, &root, repo.config()),
-                    None => r.note("skipped: the repository does not open", &[]),
-                }
-            }
         }
     }
 
@@ -504,123 +497,6 @@ fn check_vault(r: &mut Report, repo: &Repo) {
             Err(e) => r.fail(format!("the vault does not open: {e}"), &[]),
         },
         Err(e) => r.fail(format!("the vault cannot be read: {e}"), &[]),
-    }
-}
-
-fn check_remotes(r: &mut Report, root: &Path, config: &RepoConfig) {
-    if config.remotes.is_empty() {
-        r.note("no remotes configured", &[]);
-        return;
-    }
-    for (name, remote) in &config.remotes {
-        if let Some(url) = SshUrl::parse(&remote.url) {
-            check_ssh_remote(r, name, &remote.url, url);
-            continue;
-        }
-        if remote.url.contains("://") {
-            r.note(
-                format!("{name} ({}): not a local path; `vl pull {name}` checks it", remote.url),
-                &[],
-            );
-            continue;
-        }
-        let path = PathBuf::from(&remote.url);
-        let path = if path.is_absolute() { path } else { root.join(path) };
-        let started = Instant::now();
-        let backend = DiskBackend::new(&path);
-        let reachable = path.is_dir() && is_repo(&backend);
-        let took = started.elapsed();
-        if reachable {
-            r.ok(format!("{name} ({}) reachable in {}", remote.url, fmt_duration(took)));
-            check_push_staging(r, name, &backend);
-        } else if path.exists() {
-            r.fail(format!("{name} ({}) is not a Veil repository", remote.url), &[]);
-        } else {
-            r.fail(
-                format!("{name} ({}) is not reachable", remote.url),
-                &[format!("{} does not exist (an unmounted drive or share?)", path.display())],
-            );
-        }
-    }
-}
-
-/// Push uploads on remote `name` left unpublished for more than a day
-/// (an interrupted push that was not retried): a later push or
-/// `vl -R <remote> gc` removes them once a week old.
-fn check_push_staging(r: &mut Report, name: &str, backend: &dyn StorageBackend) {
-    const DAY_MS: i64 = 24 * 3600 * 1000;
-    let staged = match veil_core::remote::push_staging(backend) {
-        Ok(s) => s,
-        Err(e) => return r.note(format!("{name}: cannot list its push staging"), &[e.to_string()]),
-    };
-    let now = now_millis();
-    let old: Vec<_> = staged.iter().filter(|s| s.touched.is_none_or(|t| now.saturating_sub(t) > DAY_MS)).collect();
-    if old.is_empty() {
-        return;
-    }
-    let bytes: u64 = old.iter().map(|s| s.bytes).sum();
-    let mut lines: Vec<String> = old
-        .iter()
-        .map(|s| {
-            let age = s.touched.map_or("unknown age".to_string(), |t| format!("{} days old", now.saturating_sub(t) / DAY_MS));
-            format!(".veil/objects/incoming/{}: {} bytes, {age}", s.name, s.bytes)
-        })
-        .collect();
-    lines.push("uploads of interrupted pushes: `vl push` again resumes yours; anything a week old is removed by the next push or `vl -R <remote> gc`".into());
-    r.note(format!("{name}: {} unpublished push upload(s), {bytes} bytes, untouched for over a day", old.len()), &lines);
-}
-
-/// Connect to an SSH remote, check that it holds a repository, and compare
-/// its clock with ours: fencing locks on network remotes judge abandoned
-/// locks partly by wall-clock age, assuming hosts agree within the skew
-/// allowance (see `lock.rs`).
-fn check_ssh_remote(r: &mut Report, name: &str, shown: &str, url: veil_core::Result<SshUrl>) {
-    let url = match url {
-        Ok(u) => u,
-        Err(e) => {
-            r.fail(format!("{name} ({shown}) is not a valid SSH URL"), &[e.to_string()]);
-            return;
-        }
-    };
-    let started = Instant::now();
-    let backend = match SftpBackend::connect(&url) {
-        Ok(b) => b,
-        Err(e) => {
-            r.fail(format!("{name} ({shown}) is not reachable"), &[e.to_string()]);
-            return;
-        }
-    };
-    let took = started.elapsed();
-    if !is_repo(&backend) {
-        r.fail(
-            format!("{name} ({shown}) is not a Veil repository"),
-            &["`vl push` creates one there".into()],
-        );
-        return;
-    }
-    r.ok(format!("{name} ({shown}) reachable in {}", fmt_duration(took)));
-    check_push_staging(r, name, &backend);
-    let allowance = LockContext::default().skew;
-    match backend.clock_offset(&VPath::new(VEIL_DIR).expect("valid path")) {
-        Ok(offset) => {
-            let ahead = if offset >= 0 { "ahead of" } else { "behind" };
-            let secs = offset.unsigned_abs() as f64 / 1000.0;
-            if offset.unsigned_abs() > (allowance / 2).as_millis() as u64 {
-                r.warn(
-                    format!("{name}'s clock is {secs:.0} s {ahead} this machine's"),
-                    &[
-                        format!(
-                            "locks on a shared remote are taken over by wall-clock age with a {} s allowance for clock differences between clients; a client whose clock runs ahead of another's by more than that can take over the other's live lock, and a push then fails (or, rarely, both publish)",
-                            allowance.as_secs()
-                        ),
-                        "keep every client's clock in sync (NTP: `timedatectl`, or System Settings → Date & Time on macOS)".into(),
-                    ],
-                );
-            } else {
-                r.ok(format!("{name}'s clock is within {:.0} s of this machine's", secs.max(1.0)));
-            }
-        }
-        Err(e) => r.note(format!("{name}: cannot compare clocks"), &[e.to_string()]),
     }
 }
 

@@ -57,7 +57,6 @@ pub const SCAN_SCHEMA: &str = "veil.scan/1";
 pub const SECRET_LIST_SCHEMA: &str = "veil.secret.list/1";
 pub const ERROR_SCHEMA: &str = "veil.error/1";
 pub const LS_SCHEMA: &str = "veil.ls/1";
-pub const PUSH_PLAN_SCHEMA: &str = "veil.push.plan/1";
 pub const RESOLVE_LIST_SCHEMA: &str = "veil.resolve.list/1";
 pub const SNAPSHOT_SCHEMA: &str = "veil.snapshot/1";
 pub const DESCRIBE_SCHEMA: &str = "veil.describe/1";
@@ -182,7 +181,7 @@ impl Vis {
 #[derive(Serialize, Debug, Clone)]
 pub struct Redaction {
     /// `no_key` (cloaked for a scope you hold no key for, or unreadable),
-    /// `withheld` (a public remote never delivered it), `not_released`
+    /// `withheld` (never received: a public mirror never delivers it), `not_released`
     /// (an unreleased embargo), `unwritable` (readable, but this
     /// filesystem could not hold the file), `missing` (a public object
     /// absent from the store: damage, not a redaction) or `error` (the
@@ -598,7 +597,7 @@ fn redaction_for_listing(repo: &Repo, e: &TreeEntry) -> Option<Redaction> {
         Visibility::Public => return None,
         Visibility::Cloaked { scope } if present => Redaction { reason: "no_key", message: format!("cloaked:{scope}; no key") },
         Visibility::Cloaked { scope } => {
-            Redaction { reason: "withheld", message: format!("cloaked:{scope}; withheld by a public remote") }
+            Redaction { reason: "withheld", message: format!("cloaked:{scope}; not received") }
         }
         Visibility::Embargoed { embargo } => {
             Redaction { reason: "not_released", message: format!("embargo {embargo}; not released") }
@@ -616,7 +615,7 @@ fn redaction_for_diff(repo: &Repo, e: &TreeEntry, err: &veil_core::VeilError) ->
             Redaction { reason: "no_key", message: format!("{}; you hold no key", e.visibility.label()) }
         }
         Visibility::Cloaked { .. } => {
-            Redaction { reason: "withheld", message: format!("{}; withheld by a public remote", e.visibility.label()) }
+            Redaction { reason: "withheld", message: format!("{}; not received", e.visibility.label()) }
         }
         Visibility::Embargoed { .. } => {
             Redaction { reason: "not_released", message: format!("{}; not released yet", e.visibility.label()) }
@@ -2174,218 +2173,6 @@ pub fn resolve_list(ctx: &Ctx, rev: &str, paths: &[String]) -> Result<ResolveLis
     Ok(ResolveList { schema: RESOLVE_LIST_SCHEMA, snapshot: snapshot_ref(repo, &id), conflicts })
 }
 
-// ---- push --dry-run ----------------------------------------------------------------
-
-/// `vl push --dry-run --json` (`veil.push.plan/1`): one plan per remote.
-#[derive(Serialize, Debug)]
-pub struct PushPlanDoc {
-    pub schema: &'static str,
-    pub remotes: Vec<RemotePlan>,
-}
-
-#[derive(Serialize, Debug, Default)]
-pub struct RemotePlan {
-    pub name: String,
-    pub url: String,
-    pub public: bool,
-    /// Planning failed for this remote (unreachable, not a repository, a
-    /// tag that would publish withheld history…): the push would fail the
-    /// same way. The other fields are then empty.
-    pub error: Option<String>,
-    /// No repository there yet: the push would create one.
-    pub creates_remote: bool,
-    pub tags: Vec<PlanTag>,
-    /// How many objects would be sent, by kind, and their bytes.
-    pub snapshots: usize,
-    pub objects: usize,
-    pub trees: usize,
-    /// Plaintext file contents.
-    pub blobs: usize,
-    /// Ciphertext: cloaked or embargoed content, sealed trees.
-    pub sealed: usize,
-    /// Sum of the objects' encodings, before packing.
-    pub object_bytes: u64,
-    /// Size of the pack(s) the push would write (compressed, with deltas).
-    pub pack_bytes: u64,
-    /// Every snapshot and every object that would be sent, in hex.
-    pub snapshot_ids: Vec<String>,
-    pub object_ids: Vec<String>,
-    /// Objects the visibility filter holds back (cloaked or embargoed
-    /// content, on a public remote).
-    pub withheld_objects: usize,
-    /// History reachable from the pushed tags only through an unreleased
-    /// embargo: it stays here until the release.
-    pub withheld_snapshots: Vec<PlanSnapshot>,
-    /// Embargo releases staged here that the push would publish.
-    pub releases: Vec<String>,
-    /// Public remotes only.
-    pub files: Option<PlanFiles>,
-    pub warnings: Vec<String>,
-}
-
-#[derive(Serialize, Debug)]
-pub struct PlanTag {
-    pub name: String,
-    /// `create`, `update`, `unchanged`, `rejected` (non-fast-forward) or
-    /// `skipped` (held back by design; see `reason`).
-    pub action: &'static str,
-    pub target: String,
-    pub target_short: String,
-    /// The remote's tag now, if it has one.
-    pub remote_target: Option<String>,
-    /// Why it is rejected or skipped.
-    pub message: Option<String>,
-    /// The scope of a cloaked tag.
-    pub cloak: Option<String>,
-}
-
-#[derive(Serialize, Debug)]
-pub struct PlanSnapshot {
-    pub snapshot_id: String,
-    pub snapshot_short: String,
-    pub embargo: String,
-}
-
-#[derive(Serialize, Debug)]
-pub struct PlanFiles {
-    /// Content that becomes public on this remote with this push.
-    pub published: Vec<PlanPublished>,
-    /// Files of the pushed history whose content stays withheld.
-    pub withheld: Vec<PlanWithheld>,
-    /// Snapshots under an unreleased embargo this reader holds no key for:
-    /// the remote sees their pre-merge tree (which files the embargo
-    /// changes cannot be listed here).
-    pub embargoed_trees: Vec<PlanSnapshot>,
-}
-
-#[derive(Serialize, Debug)]
-pub struct PlanPublished {
-    pub path: String,
-    /// `new` (never public there), `exposed` (there, but withheld until
-    /// now) or `modified` (public there; new content).
-    pub exposure: &'static str,
-    pub size: Option<u64>,
-    /// Published because this embargo was released.
-    pub released_embargo: Option<String>,
-}
-
-#[derive(Serialize, Debug)]
-pub struct PlanWithheld {
-    pub path: String,
-    /// `cloaked`, `cloaked_edit` (the remote keeps the last public version)
-    /// or `embargoed` (the remote shows the pre-merge version).
-    pub reason: &'static str,
-    pub scope: Option<String>,
-    pub embargo: Option<String>,
-    /// The explanation the text output prints.
-    pub message: String,
-}
-
-fn plan_snapshot((id, embargo): &(ObjectId, String)) -> PlanSnapshot {
-    PlanSnapshot { snapshot_id: id.hex(), snapshot_short: id.short(), embargo: embargo.clone() }
-}
-
-fn remote_plan(name: &str, url: &str, plan: veil_core::push_plan::PushPlan) -> RemotePlan {
-    use veil_core::push_plan::WithheldReason;
-    let sent: std::collections::HashSet<ObjectId> = plan.snapshots.iter().copied().collect();
-    let count = |f: &dyn Fn(&veil_core::remote::PlannedObject) -> bool| plan.objects.iter().filter(|o| f(o)).count();
-    let files = plan.files.as_ref().map(|f| PlanFiles {
-        published: f
-            .published
-            .iter()
-            .map(|p| PlanPublished {
-                path: path(&p.path),
-                exposure: p.exposure.word(),
-                size: p.size,
-                released_embargo: p.released_embargo.clone(),
-            })
-            .collect(),
-        withheld: f
-            .withheld
-            .iter()
-            .map(|w| {
-                let (reason, scope, embargo) = match &w.reason {
-                    WithheldReason::Cloaked { scope } => ("cloaked", Some(scope.clone()), None),
-                    WithheldReason::CloakedEdit { scope } => ("cloaked_edit", Some(scope.clone()), None),
-                    WithheldReason::Embargoed { embargo } => ("embargoed", None, Some(embargo.clone())),
-                };
-                PlanWithheld { path: path(&w.path), reason, scope, embargo, message: w.reason.text() }
-            })
-            .collect(),
-        embargoed_trees: f.embargoed_trees.iter().map(plan_snapshot).collect(),
-    });
-    RemotePlan {
-        name: name.to_string(),
-        url: url.to_string(),
-        public: plan.public,
-        error: None,
-        creates_remote: plan.creates_remote,
-        tags: plan
-            .tags
-            .iter()
-            .map(|t| PlanTag {
-                name: t.name.clone(),
-                action: t.action.word(),
-                target: t.target.hex(),
-                target_short: t.target.short(),
-                remote_target: t.remote.map(|r| r.hex()),
-                message: t.reason.clone(),
-                cloak: t.cloak.clone(),
-            })
-            .collect(),
-        snapshots: plan.snapshots.len(),
-        objects: plan.objects.len(),
-        trees: count(&|o| !o.blob && !o.sealed && !sent.contains(&o.id)),
-        blobs: count(&|o| o.blob),
-        sealed: count(&|o| o.sealed),
-        object_bytes: plan.object_bytes(),
-        pack_bytes: plan.pack_bytes,
-        snapshot_ids: plan.snapshots.iter().map(|i| i.hex()).collect(),
-        object_ids: plan.objects.iter().map(|o| o.id.hex()).collect(),
-        withheld_objects: plan.redacted,
-        withheld_snapshots: plan.withheld_snapshots.iter().map(plan_snapshot).collect(),
-        releases: plan.releases.clone(),
-        files,
-        warnings: plan.warnings.clone(),
-    }
-}
-
-/// `vl push --dry-run [REMOTE] [-t TAG…]`: what a push would send to
-/// `remote`, or to every configured remote. Nothing is written to any
-/// remote. With one remote named, a failure is the command's; for all
-/// remotes, each failure is recorded in its plan and the others go on.
-pub fn push_plan(ctx: &Ctx, remote: Option<&str>, tags: &[String], force: bool, force_tags: bool) -> Result<PushPlanDoc> {
-    let names: Vec<String> = match remote {
-        Some(n) => vec![n.to_string()],
-        None => ctx.repo.config().remotes.keys().cloned().collect(),
-    };
-    if names.is_empty() {
-        anyhow::bail!("no remotes are configured (add one with `vl remote add <name> <path>`)");
-    }
-    let mut remotes = Vec::new();
-    for name in &names {
-        let planned = crate::remote_backend(ctx, name).and_then(|(backend, cfg)| {
-            let plan = veil_core::push_plan::plan_push_with(&ctx.repo, backend, cfg.public, tags, force, force_tags)?;
-            Ok(remote_plan(name, &cfg.url, plan))
-        });
-        match planned {
-            Ok(p) => remotes.push(p),
-            Err(e) if remote.is_some() => return Err(e),
-            Err(e) => {
-                let cfg = ctx.repo.config().remotes.get(name).cloned();
-                remotes.push(RemotePlan {
-                    name: name.clone(),
-                    url: cfg.as_ref().map(|c| c.url.clone()).unwrap_or_default(),
-                    public: cfg.is_some_and(|c| c.public),
-                    error: Some(format!("{e:#}")),
-                    ..Default::default()
-                });
-            }
-        }
-    }
-    Ok(PushPlanDoc { schema: PUSH_PLAN_SCHEMA, remotes })
-}
-
 // ---- the write methods of `vl serve --local` ----------------------------------------
 //
 // `vl describe`, `vl new` and `vl commit` call these too, so the CLI and the
@@ -2566,8 +2353,6 @@ mod cli_tests {
             &["secret", "list"],
             &["ls"],
             &["ls", "-r", "@-", "src"],
-            &["push", "--dry-run"],
-            &["push", "origin", "--dry-run"],
         ];
         for args in read {
             let with = |json: bool| {
@@ -2585,9 +2370,7 @@ mod cli_tests {
             assert!(!Cli::try_parse_from(args).unwrap().cmd.wants_json());
         }
         assert!(Cli::try_parse_from(["vl", "commit", "-m", "x", "--json"]).is_err(), "write commands do not take --json");
-        assert!(Cli::try_parse_from(["vl", "push", "--json"]).is_err(), "a push takes --json only with --dry-run");
-        assert!(Cli::try_parse_from(["vl", "push", "--dry-run", "--full"]).is_err());
-        assert!(Cli::try_parse_from(["vl", "push", "--dry-run", "--delete", "x"]).is_err());
+        assert!(Cli::try_parse_from(["vl", "push", "--json"]).is_err(), "a push takes no --json");
     }
 }
 

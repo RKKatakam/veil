@@ -737,12 +737,6 @@ fn remove_temps(backend: &dyn StorageBackend, dir: &VPath, ctx: &LockContext, no
     Ok(n)
 }
 
-/// Remove the stream temp files in `dir` whose writer is provably gone
-/// (owner-less ones are left to [`sweep_debris`]).
-pub(crate) fn remove_dead_temps(backend: &dyn StorageBackend, dir: &VPath) -> Result<usize> {
-    remove_temps(backend, dir, &LockContext::default(), None)
-}
-
 // ---- background maintenance ---------------------------------------------------------
 
 /// `vl gc --auto` runs when more loose objects than this exist (Git's

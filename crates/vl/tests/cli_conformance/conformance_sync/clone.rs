@@ -24,7 +24,7 @@ fn clone_copies_history_tags_and_files_and_sets_origin() {
     assert_eq!(tags, vec!["main".to_string(), "origin/main".to_string()]);
     let remotes = env.stdout("bob", &copy, &["remote", "list"]);
     assert!(
-        remotes.starts_with("origin") && remotes.contains("team"),
+        remotes.starts_with("origin"),
         "{remotes}"
     );
     assert!(
@@ -99,6 +99,8 @@ fn a_failed_clone_into_an_existing_empty_directory_leaves_it_empty() {
         &[("big.txt", &"payload ".repeat(400))],
     );
     let _ = proj;
+    // Pushed objects arrive loose; gc packs them.
+    env.ok("alice", &hub, &["gc"]);
     let corrupt = env.path("corrupt");
     copy_dir(&hub, &corrupt);
     let pack = packs(&corrupt).pop().expect("a pack");

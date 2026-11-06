@@ -54,7 +54,7 @@ fn status_says_why_a_file_is_redacted() {
 
     env.ok("bob", &env.root, &["clone", mirror.to_str().unwrap(), "bob"]);
     let status = env.ok("bob", &env.root.join("bob"), &["status"]);
-    assert!(status.contains("R plans/q3.md [redacted]  (cloaked:team; withheld by a public remote)"), "{status}");
+    assert!(status.contains("R plans/q3.md [redacted]  (cloaked:team; not received)"), "{status}");
     env.ok("carol", &env.root, &["clone", team.to_str().unwrap(), "carol"]);
     let status = env.ok("carol", &env.root.join("carol"), &["status"]);
     assert!(status.contains("R plans/q3.md [redacted]  (cloaked:team; no key)"), "{status}");

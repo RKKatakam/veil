@@ -148,9 +148,8 @@ pub fn backend_contains(backend: &dyn StorageBackend, needle: &[u8]) -> Vec<Stri
 }
 
 /// `(label, decoded bytes)` of every object in every pack on `backend`:
-/// published ones (`objects/pack/`) and staged ones (the push staging
-/// directories `objects/incoming/*/`), which a raw reader of the remote can
-/// read too.
+/// published ones (`objects/pack/`) and staged ones (`objects/incoming/*/`),
+/// which a raw reader of the store can read too.
 pub fn packed_objects(backend: &dyn StorageBackend) -> Vec<(String, Vec<u8>)> {
     use veil_core::{cache::LruCache, pack};
     let mut dirs = vec![VPath::new(".veil/objects/pack").unwrap()];

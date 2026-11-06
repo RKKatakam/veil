@@ -3,7 +3,7 @@
 //! ([`veil_core::maintenance::auto_due`]), and print what such a run did.
 //!
 //! Never inside `vl serve` or a mount (they do not finish through here),
-//! never for a bare repository (a remote), never when `VEIL_GC_AUTO=0`,
+//! never for a bare repository (an old path remote), never when `VEIL_GC_AUTO=0`,
 //! and by default not when `CI` is set (`VEIL_GC_AUTO=1` turns it on
 //! there). The child runs in its own process group at `nice 10` (and, on
 //! Linux, idle I/O priority), and writes to `.veil/local/maintenance.log`

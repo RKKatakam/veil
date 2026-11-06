@@ -26,6 +26,7 @@ impl Env {
     /// Run `vl` as `user` (each user has their own VEIL_HOME / identity).
     fn vl(&self, user: &str, cwd: &Path, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_vl"))
+            .env("VEIL_TEST_PATH_REMOTES", "1")
             .args(args)
             .current_dir(cwd)
             .env("VEIL_HOME", self.root.join(format!("home-{user}")))

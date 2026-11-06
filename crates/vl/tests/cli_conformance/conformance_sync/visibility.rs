@@ -183,7 +183,7 @@ fn force_push_to_a_public_remote_is_still_filtered() {
     let env = Env::new();
     let proj = secretive(&env);
     let mirror = push_to(&env, &proj, "mirror", true);
-    env.ok("alice", &proj, &["push", "mirror", "--force", "--full"]);
+    env.ok("alice", &proj, &["push", "mirror", "--force"]);
     assert_absent(&mirror, CLOAKED, "forced full push");
     assert_absent(&mirror, CLOAKED_MSG, "forced full push");
     assert!(keyrings(&mirror).is_empty());

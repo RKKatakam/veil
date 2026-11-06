@@ -450,25 +450,29 @@ fn few_new_objects_stay_loose() {
     assert!(std::fs::read_dir(tmp.path().join("a/.veil/objects/pack")).map(|d| d.count()).unwrap_or(0) == 0);
 }
 
-/// BUG-800: a pull that writes packs streams each `.pack`, then issues the
-/// store's barrier, then writes the `.idx` durably, before the operation
-/// and its head; the download spool is gone afterwards.
+/// BUG-800: a pull from the Veil server writes what it receives as the
+/// server client does ([`remote::Incoming`], in the pull's transaction):
+/// it streams each `.pack`, then issues the store's barrier, then writes
+/// the `.idx` durably, before the operation and its head.
 #[test]
 fn pulled_packs_are_published_before_their_index_and_the_operation() {
     let tmp = tempfile::tempdir().unwrap();
     let id = Identity::generate("alice");
     let fs = Arc::new(DiskBackend::new(tmp.path().join("a")));
     let mut repo = Repo::init(fs.clone(), Some(id.clone()), "alice").unwrap();
-    // More objects than a pull writes loose (256).
+    // More objects than a pull writes loose (16).
     for i in 0..300 {
         fs.write(&p(&format!("src/d{}/f{i}.txt", i % 7)), &noise(i, 3000)).unwrap();
     }
     repo.snapshot_workspace("default", &*fs).unwrap();
     let (c, _) = repo.commit_working_copy("default", "c").unwrap();
-    repo.set_tag("main", c, None, false).unwrap();
-    // A pack on the remote, so that the pull downloads (spools) it.
-    let remote: Arc<dyn StorageBackend> = Arc::new(DiskBackend::new(tmp.path().join("r")));
-    remote::push(&mut repo, remote.clone(), false, &[], false).unwrap();
+    let sent: Vec<(ObjectId, Vec<u8>)> = repo
+        .store()
+        .list_objects()
+        .unwrap()
+        .into_iter()
+        .map(|o| (o, repo.store().get_raw(&o).unwrap()))
+        .collect();
 
     let rec = Arc::new(Recorder {
         inner: Arc::new(DiskBackend::new(tmp.path().join("b"))),
@@ -476,8 +480,16 @@ fn pulled_packs_are_published_before_their_index_and_the_operation() {
     });
     let mut clone = Repo::init_for_clone(rec.clone(), Some(id), "alice").unwrap();
     rec.take();
-    let report = remote::pull(&mut clone, "origin", remote).unwrap();
-    assert_eq!(report.packs_written, 1);
+    let mut tx = clone.transaction("pull from origin").unwrap();
+    tx.repository_wide();
+    let store = tx.repo().store().clone();
+    let mut incoming = remote::Incoming::new(&store);
+    for (o, raw) in sent {
+        incoming.put(o, raw, "").unwrap();
+    }
+    assert_eq!(incoming.finish().unwrap(), 1);
+    tx.view.remote_tags.insert("origin/main".into(), c);
+    tx.commit().unwrap();
     let calls = rec.take();
     let pos = |pred: &dyn Fn(&Call) -> bool| calls.iter().position(pred).unwrap_or_else(|| panic!("{calls:?}"));
     let idx = pos(&|c| matches!(c, Call::Write(p) if p.starts_with(".veil/objects/pack/") && p.ends_with(".idx")));
@@ -485,9 +497,8 @@ fn pulled_packs_are_published_before_their_index_and_the_operation() {
     let op = pos(&|c| matches!(c, Call::Write(p) if p.starts_with(".veil/ops/")));
     assert!(barrier < idx && idx < op, "{calls:?}");
     assert!(!calls.iter().any(|c| matches!(c, Call::Write(p) | Call::Unsynced(p) if p.ends_with(".pack"))), "the pack is streamed: {calls:?}");
-    let incoming: Vec<String> = std::fs::read_dir(tmp.path().join("b/.veil/objects/incoming")).map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
-    assert!(incoming.is_empty(), "the spool and the staging are removed: {incoming:?}");
     let packs: Vec<String> = std::fs::read_dir(tmp.path().join("b/.veil/objects/pack")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
     assert_eq!(packs.len(), 2, "{packs:?}");
-    assert_eq!(clone.view().tags["main"].target, c);
+    assert_eq!(clone.view().remote_tags["origin/main"], c);
+    assert!(clone.store().has(&c));
 }

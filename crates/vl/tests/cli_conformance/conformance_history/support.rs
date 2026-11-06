@@ -40,7 +40,7 @@ impl Env {
 
     pub fn cmd(&self, user: &str, cwd: &Path, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_vl"));
-        c.args(args)
+        c.env("VEIL_TEST_PATH_REMOTES", "1").args(args)
             .current_dir(cwd)
             .env("VEIL_HOME", self.home(user))
             .env("VEIL_USER", user)

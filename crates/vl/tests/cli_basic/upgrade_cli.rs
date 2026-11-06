@@ -25,6 +25,7 @@ fn copy_dir(from: &Path, to: &Path) {
 
 fn vl(home: &Path, cwd: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_vl"))
+        .env("VEIL_TEST_PATH_REMOTES", "1")
         .args(args)
         .current_dir(cwd)
         .env("VEIL_HOME", home)
@@ -47,6 +48,13 @@ fn ok(o: &Output) -> String {
 fn format_of(repo: &Path) -> u64 {
     let v: serde_json::Value = serde_json::from_slice(&std::fs::read(repo.join(".veil/repo.json")).unwrap()).unwrap();
     v["format"].as_u64().unwrap()
+}
+
+/// Upgrade the fixture's path remote at `dir` structurally (no identity),
+/// as `vl upgrade --remote` did before path remotes were removed.
+fn upgrade_remote(dir: &Path) {
+    let backend = std::sync::Arc::new(veil_core::DiskBackend::new(dir));
+    veil_core::upgrade::upgrade(backend, None, &veil_core::upgrade::UpgradeOptions::default()).unwrap();
 }
 
 #[test]
@@ -86,11 +94,10 @@ fn upgrade_from_the_cli() {
     let push = vl(&home, &alice, &["push", "origin"]);
     assert!(!push.status.success());
     assert!(
-        String::from_utf8_lossy(&push.stderr).contains("vl upgrade --remote"),
+        String::from_utf8_lossy(&push.stderr).contains("vl upgrade"),
         "{push:?}"
     );
-    let up = ok(&vl(&home, &alice, &["upgrade", "--remote", "origin"]));
-    assert!(up.contains("Upgraded remote 'origin'"), "{up}");
+    upgrade_remote(&root.join("team-remote"));
     ok(&vl(&home, &alice, &["push", "origin"]));
     assert_eq!(format_of(&root.join("team-remote")), 6);
 }
@@ -117,9 +124,9 @@ fn upgrade_from_format_2_moves_keys_to_hpke_from_the_cli() {
     // The format-2 remote refuses AES-SIV objects and the HPKE ring.
     let push = vl(&home, &alice, &["push", "origin"]);
     assert!(!push.status.success());
-    assert!(String::from_utf8_lossy(&push.stderr).contains("vl upgrade --remote"), "{push:?}");
+    assert!(String::from_utf8_lossy(&push.stderr).contains("vl upgrade"), "{push:?}");
     assert_eq!(format_of(&root.join("team-remote")), 2);
-    ok(&vl(&home, &alice, &["upgrade", "--remote", "origin"]));
+    upgrade_remote(&root.join("team-remote"));
     ok(&vl(&home, &alice, &["push", "origin"]));
 
     // Bob (a member, legacy identity) clones the upgraded remote and reads it.

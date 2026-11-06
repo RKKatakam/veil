@@ -191,7 +191,7 @@ pub struct Ctx {
     /// Stat cache of the project directory (it follows the directory when
     /// another workspace is attached).
     cache: StatCache,
-    /// A bare repository (a remote created by `vl push`): no workspace, no
+    /// A bare repository (a path remote an older `vl push` created): no workspace, no
     /// working copy. Only commands that read history, and `gc`, run here
     /// (BUG-284); nothing is snapshotted or checked out.
     pub bare: bool,
@@ -375,7 +375,7 @@ impl Ctx {
 
     pub fn wc(&self) -> Result<ObjectId> {
         if self.bare {
-            return Err(anyhow!("this is a bare repository (a remote): it has no working copy"));
+            return Err(anyhow!("this is a bare repository (an old path remote): it has no working copy"));
         }
         Ok(self.repo.workspace_wc(&self.ws)?)
     }

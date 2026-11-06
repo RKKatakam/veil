@@ -426,14 +426,14 @@ pub fn signature_detail(status: &SignatureStatus, s: &Snapshot) -> String {
 /// which this repository cannot show. `None`: no explanation beyond the
 /// engine's error (see `api::redaction_for_diff`).
 /// Why this reader cannot materialise `e`, in a few words (`cloaked:team;
-/// no key`, `cloaked:team; withheld by a public remote`, `embargo …; not
+/// no key`, `cloaked:team; not received`, `embargo …; not
 /// released`), for listings; [`hidden_explanation`] says what to do.
 pub fn hidden_reason(repo: &Repo, e: &TreeEntry) -> Option<String> {
     let present = repo.store().has(&e.id);
     Some(match &e.visibility {
         Visibility::Public => return None,
         Visibility::Cloaked { scope } if present => format!("cloaked:{}; no key", safe(scope)),
-        Visibility::Cloaked { scope } => format!("cloaked:{}; withheld by a public remote", safe(scope)),
+        Visibility::Cloaked { scope } => format!("cloaked:{}; not received", safe(scope)),
         Visibility::Embargoed { embargo } => format!("embargo {}; not released", safe(embargo)),
     })
 }
@@ -454,9 +454,9 @@ pub fn hidden_explanation(repo: &Repo, path: &VPath, e: &TreeEntry) -> Option<St
         Visibility::Cloaked { scope } => {
             let scope = safe(scope);
             format!(
-                "{path} is cloaked under scope '{scope}' and was withheld: this repository's content came from \
-                 a public remote, and public remotes never deliver cloaked content. Once a member grants you \
-                 '{scope}' (`vl scope grant {scope} <key>`), clone or pull from a team remote to read it"
+                "{path} is cloaked under scope '{scope}' and its content never reached this repository (it came \
+                 from a public mirror, which never delivers cloaked content). Once a member grants you '{scope}' \
+                 (`vl scope grant {scope} <key>`), clone the project from the Veil server to read it"
             )
         }
         Visibility::Embargoed { embargo } => format!(
@@ -477,8 +477,7 @@ pub fn read_file(repo: &Repo, path: &VPath, e: &TreeEntry) -> Result<Vec<u8>> {
         Err(err) if err.is_unreadable() => match hidden_explanation(repo, path, e) {
             Some(why) => Err(anyhow::anyhow!(why)),
             None => Err(anyhow::Error::new(err).context(format!(
-                "the content of {} is missing from this repository (`vl fsck` checks the store; \
-                 `vl pull --full` restores missing objects from a remote that has them)",
+                "the content of {} is missing from this repository (`vl fsck` checks the store)",
                 safe(path.as_str())
             ))),
         },

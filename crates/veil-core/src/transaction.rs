@@ -972,16 +972,6 @@ impl<'r> Transaction<'r> {
         Ok(())
     }
 
-    /// Fail unless this transaction still holds its repository lock (see
-    /// [`RepoLock::ensure_held`]); lock-free transactions always pass. A
-    /// push checks it before it publishes its packs.
-    pub(crate) fn ensure_held(&self) -> Result<()> {
-        match &self.lock {
-            Some(lock) => lock.ensure_held(),
-            None => Ok(()),
-        }
-    }
-
     /// Finish the transaction. Returns the new operation id, or `None` if
     /// nothing changed.
     pub fn commit(mut self) -> Result<Option<ObjectId>> {

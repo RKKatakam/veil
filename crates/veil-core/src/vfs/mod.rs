@@ -1,15 +1,13 @@
 //! The Virtual File System layer.
 //!
 //! The engine never talks to the host OS directly. Repositories, working
-//! copies, remotes and agent sandboxes are all [`StorageBackend`]s:
+//! copies and agent sandboxes are all [`StorageBackend`]s:
 //!
 //! * [`DiskBackend`]    — persistent storage rooted at a host directory.
 //! * [`MemoryBackend`]  — pure in-memory tree (tests, CI, WASM, agents).
 //! * [`OverlayBackend`] — copy-on-write layer over any read-only lower
 //!   backend (typically a [`crate::tree::TreeView`] of a snapshot), giving
 //!   O(1) workspace creation and O(changes) snapshots.
-//! * [`SftpBackend`]    — a repository on another machine, reached through
-//!   the user's `ssh` and its `sftp` subsystem (remotes).
 //! * [`SandboxFs`]      — a `vl ws exec` sandbox directory: unsynced writes,
 //!   copy-on-write clones of the project directory's files.
 //! * [`SparseView`]     — a sparse working copy (a sandbox holding a
@@ -24,11 +22,6 @@ mod overlay;
 #[cfg(feature = "os")]
 mod sandbox;
 mod sparse;
-#[cfg(feature = "os")]
-mod sftp;
-#[cfg(feature = "os")]
-mod sftp_client;
-mod sftp_url;
 
 #[cfg(feature = "os")]
 pub use disk::{parse_folding, probe_folding, DiskBackend, FOLDING_ENV};
@@ -36,9 +29,6 @@ pub use memory::MemoryBackend;
 pub use overlay::{OverlayBackend, OverlayChanges};
 #[cfg(feature = "os")]
 pub use sandbox::{clone_file, private_dir, reflink_supported, remove_tree, CloneSources, SandboxFs, SandboxLock, WrittenFile};
-#[cfg(feature = "os")]
-pub use sftp::{SftpBackend, SftpOptions, SftpStats};
-pub use sftp_url::SshUrl;
 pub use sparse::{restrict, SparseSet, SparseView};
 
 pub use crate::vpath::NameFolding;
@@ -272,7 +262,7 @@ pub fn is_temp_name(name: &str) -> bool {
 /// mutability so a backend can be shared (`Arc<dyn StorageBackend>`) between
 /// the repository, its working copies and concurrent tasks.
 pub trait StorageBackend: Send + Sync + std::fmt::Debug {
-    /// Human-readable backend kind (`disk`, `memory`, `overlay`, `tree`, `sftp`).
+    /// Human-readable backend kind (`disk`, `memory`, `overlay`, `tree`).
     fn kind(&self) -> &'static str;
 
     /// Storage reached over a network and shared with clients on other

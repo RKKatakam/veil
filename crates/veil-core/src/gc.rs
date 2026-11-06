@@ -124,9 +124,6 @@ pub struct GcReport {
     pub pack_stats: PackStats,
     /// Why nothing was deleted, if the graph could not be fully read.
     pub incomplete: Vec<String>,
-    /// Push staging directories removed: uploads abandoned for more than a
-    /// week (on a remote, [`crate::remote::expire_push_staging`]).
-    pub push_staging_removed: usize,
     /// Why nothing was deleted although the graph was read: other commands
     /// kept running past gc's wait for its deletion fence (BUG-811).
     pub deferred: Option<String>,
@@ -617,9 +614,6 @@ pub(crate) fn run(repo: &mut Repo, opts: &GcOptions, prune: bool, loose_age: Dur
     let now = opts.now.unwrap_or_else(now_millis);
     let before = store.stats()?;
     let mut report = GcReport {
-        // Push staging is never inventoried: only abandoned staging is
-        // removed.
-        push_staging_removed: crate::remote::expire_push_staging(&*backend, now)?,
         loose_before: before.loose_objects,
         packs_before: before.packs,
         bytes_before: before.loose_bytes + before.pack_bytes,

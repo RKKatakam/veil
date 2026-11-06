@@ -1,6 +1,5 @@
 //! Round-7 adversarial tests (Opus) through the real `vl` binary, against
-//! the local-tooling features: `--json` and the API layer, `vl ls` and
-//! `vl push --dry-run`, first-class conflicts (format 4), `vl serve --local`,
+//! the local-tooling features: `--json` and the API layer, `vl ls`, first-class conflicts (format 4), `vl serve --local`,
 //! and `vl split` / `vl squash`.
 //!
 //! Every `#[ignore = "BUG-NNN: …"]` test asserts the secure (or correct)
@@ -12,7 +11,6 @@
 use crate::adversarial_support;
 
 mod conflicts;
-mod plan;
 mod fallbacks;
 mod rewrites;
 mod serve;

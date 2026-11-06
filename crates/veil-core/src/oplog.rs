@@ -229,7 +229,7 @@ impl OpStore {
         if format < crate::object::GIT_PARITY_REPO_FORMAT && op.view.uses_format_5() {
             return Err(VeilError::Unsupported(format!(
                 "this repository is at format {format} and cannot record annotated or release tags; \
-                 upgrade it with `vl upgrade` (a remote: `vl upgrade --remote <name>`) once everyone who uses it runs vl {} or later",
+                 upgrade it with `vl upgrade` once everyone who uses it runs vl {} or later",
                 crate::repo::min_vl_for_format(crate::object::GIT_PARITY_REPO_FORMAT)
             )));
         }

@@ -153,8 +153,6 @@ pub const STAGING_BUDGET: usize = 32 << 20;
 #[derive(Debug)]
 struct TxStaging {
     dir: VPath,
-    /// The owner tag (`lock::Owner`), also naming a pull's spool.
-    owner: String,
     /// Objects this transaction staged: written there, buffered, or packed.
     staged: HashSet<ObjectId>,
     /// Small new objects not written anywhere yet (see [`TX_BUFFER`]).
@@ -345,7 +343,7 @@ impl ObjectStore {
         let need = crate::object::GIT_PARITY_REPO_FORMAT;
         VeilError::Unsupported(format!(
             "this repository is at format {} and cannot store format-{need} symlinks or annotated tags; \
-             upgrade it with `vl upgrade` (a remote: `vl upgrade --remote <name>`) once everyone who uses it runs vl {} or later",
+             upgrade it with `vl upgrade` once everyone who uses it runs vl {} or later",
             self.format(),
             crate::repo::min_vl_for_format(need)
         ))
@@ -367,7 +365,7 @@ impl ObjectStore {
             };
             return Err(VeilError::Unsupported(format!(
                 "this repository is at format {have} and cannot store format-{need} {what}; \
-                 upgrade it with `vl upgrade` (a remote: `vl upgrade --remote <name>`) once everyone who uses it runs vl {} or later",
+                 upgrade it with `vl upgrade` once everyone who uses it runs vl {} or later",
                 crate::repo::min_vl_for_format(need)
             )));
         }
@@ -473,7 +471,6 @@ impl ObjectStore {
         }
         *t = Some(TxStaging {
             dir: self.root.join("incoming").join(&format!("{TX_STAGING_PREFIX}{owner}")),
-            owner: owner.to_string(),
             staged: HashSet::new(),
             buffered: Default::default(),
             buffered_bytes: 0,
@@ -483,11 +480,6 @@ impl ObjectStore {
             failures_at: self.backend.barrier_failures(),
         });
         Ok(())
-    }
-
-    /// The owner tag of the transaction staging in this store, if any.
-    pub(crate) fn tx_owner(&self) -> Option<String> {
-        self.tx_list().as_ref().map(|t| t.owner.clone())
     }
 
     /// Objects staged so far by the current transaction.
