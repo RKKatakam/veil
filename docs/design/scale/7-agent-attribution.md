@@ -1,5 +1,7 @@
 # 7. Agent attribution
 
+> **Owner, 2026-11-06:** attribution (`agent`, `task`, `prompt`) is **never encrypted**. It's plain text behind the server's permissions, visible to exactly the people who can see the change. The `Sealed` variants below describe older plans and are dropped.
+
 Status: design and threat review, **not built** (Scion 4.6). It is built with the server's agent work (`docs/design/scion-for-developers.md`, phase 2). Where this document seals text "for a scope" or "for a cloaked line", it describes today's client; on the server, see "Sealing" below. **Requires format 6:** a new snapshot field. `Snapshot` is decoded without `deny_unknown_fields`, so an older vl would silently drop the field when it rewrites a snapshot (`FORMAT.md` §4 rule 1), and its signature would no longer verify.
 
 ## Design sketch
