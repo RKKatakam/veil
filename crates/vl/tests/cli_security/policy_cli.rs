@@ -306,3 +306,21 @@ fn access_lines_record_plain_text_and_never_weaken_secrets() {
     }
     assert_eq!(read(&proj, ".veilpolicy"), policy);
 }
+
+/// BUG-829. `vl access PATH WHO` must change the line that decides PATH:
+/// with two lines for one path (a hand edit, a merge), the last one wins
+/// on the server, so editing the first left the folder as it was (public
+/// here) while `vl` said it was updated.
+#[test]
+fn access_edits_the_line_that_decides() {
+    let env = Env::new();
+    let proj = env.dir("proj");
+    env.ok("alice", &proj, &["init"]);
+    let policy = read(&proj, ".veilpolicy");
+    write(&proj, ".veilpolicy", &format!("{policy}ledger/ finance\nsrc/ public\nledger/ public\n"));
+    env.ok("alice", &proj, &["access", "ledger/", "finance"]);
+    let text = read(&proj, ".veilpolicy");
+    let rules = veil_core::hub::access::AccessPolicy::parse(&text);
+    let deciding = &rules.rules[rules.deciding("ledger/x").unwrap()];
+    assert!(!deciding.public && deciding.names == ["finance"], "ledger/ is still decided by {deciding:?}:\n{text}");
+}

@@ -5,9 +5,11 @@
 //!   **single use**: login deletes it in the same statement that checks it,
 //!   so a replayed login finds nothing.
 //! * The device signs `hub ‖ 0 ‖ challenge` under the `hub-login` context.
-//!   `hub` is the server's name as the client dialled it, and must equal
-//!   the request's `Host`: a signature made for another server (one relaying
-//!   our challenges) is refused.
+//!   `hub` is the server's name as the client dialled it. It must be a name
+//!   this server's TLS certificate is valid for (the client checked that
+//!   before signing), and equal the request's `Host`: a signature made for
+//!   another server (one relaying our challenges) is refused. The `Host`
+//!   header alone proves nothing, as the relaying server writes it.
 //! * The token is 32 random bytes; the database keeps only its BLAKE3
 //!   hash, with an expiry and the device. A removed device's sessions stop
 //!   at once.
@@ -80,7 +82,7 @@ pub async fn login(State(hub): State<HubState>, headers: HeaderMap, Json(req): J
         return Err(Error::bad_request("key must be an Ed25519 public key in lowercase hex"));
     }
     let host = headers.get("host").and_then(|h| h.to_str().ok()).unwrap_or_default();
-    if normal_host(host) != normal_host(&req.hub) {
+    if normal_host(host) != normal_host(&req.hub) || !crate::tls::names(&hub.certificate, &req.hub) {
         return Err(Error::unauthorized("the signature names another server"));
     }
     let now = veil_core::now_millis();

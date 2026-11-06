@@ -114,13 +114,13 @@ What the server and `vl` do today; `docs/HUB.md` §13 has the details.
 - **Folder access means read and write; `public` means read for everyone on Earth.** Writing a public folder needs a named group or person (`src/  public devs`).
 - **Folders under access lines are plain text** in snapshots and on the server. The server's check is what protects them, on every request: clone, pull, the fetch API and every listing. Nobody receives a file, or a name, from a folder they cannot see.
 - **History without access:** you do not see the folder's files or names in any snapshot, and a change that touched only such folders is not in your history at all. A change that touched both shows only your part (and its description). Every snapshot you receive carries a signature that verifies: its author's, or the server's on the part it left out.
-- **Only admins change access.** The server refuses a push that changes access lines, on any branch, unless an admin made it; the authority is the policy accepted on the default branch, never a label inside a snapshot. Names bind to the project's group first, so nobody gains access by signing up under a group's name.
+- **Only admins change access.** The server refuses a push that changes access lines, on any branch, unless an admin made it; the authority is the policy accepted on the default branch, never a label inside a snapshot. Names bind to the project's group first, also when the group is created after the line, so nobody gains access by signing up under a group's name.
 - **Managers** add and remove other people in their groups, never themselves.
 - **Secrets:**
   - new repositories encrypt `.env`, `.env.*`, `.envrc` and Terraform state on the device and sync them; only devices holding the key open them;
   - personal private keys and credentials (`id_rsa`, `id_ed25519`, `*.pem`, `*.key`, `.netrc`, …) never leave the device, and the server refuses them;
   - existing repositories switch only with `vl upgrade --sync-secrets`, which lists the files first;
-  - **keys are granted by an admin's signature, never by the server:** an admin's `vl group add` signs the key grant for the people added; a manager's addition, or anything the server does on its own, gives folder access but no key. Removing someone from their last group rotates the key.
+  - **keys are granted by an admin's signature, never by the server:** an admin's `vl group add` signs the key grant for the people added; a manager's addition, or anything the server does on its own, gives folder access but no key. Removing someone from their last group rotates the key when an admin does it; a manager's removal says it did not and asks an admin to remove them too.
   - In S1 one key opens every secret of the project; keys per access rule come in S2 (`HUB.md` §13.6).
 - **Anyone on Earth** (not signed in) receives `public` folders only, and does not see a project with nothing public.
 

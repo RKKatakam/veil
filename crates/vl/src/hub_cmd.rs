@@ -243,6 +243,15 @@ fn sync_secret_keys(ctx: &mut Ctx, client: &Client, people: &[String], grant: bo
              ask a project admin to run this `vl group add` too",
         );
     }
+    // A manager's clone may not read `.veilpolicy`: the server's rings say
+    // whether the project has secret keys at all.
+    if !grant && !admin_somewhere && client.rings().is_ok_and(|r| !r.is_empty()) {
+        warn(&format!(
+            "the secret key was not rotated: only a key-ring admin's device rotates it. Until then {} can open new secrets \
+             if they get them; ask a project admin to run this `vl group remove` too",
+            people.join(", ")
+        ));
+    }
     changed.dedup();
     let rings: Vec<_> = changed.iter().filter_map(|s| keys.load_ring(s).ok().flatten()).collect();
     for ring in &rings {
@@ -339,7 +348,8 @@ pub fn access(ctx: &mut Ctx, path: &str, who: &[String]) -> Result<()> {
     let new_line = format!("{:<24}{}", line_path(&norm), who.join(" "));
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
     let mut replaced = false;
-    for l in lines.iter_mut() {
+    // The last matching line decides: edit that one.
+    for l in lines.iter_mut().rev() {
         let f = split_fields(l);
         let access = veil_core::policy::is_access_line(&f) || (f.len() == 2 && (f[1] == "public" || f[1] == "public!"));
         if access && !replaced && veil_core::hub::access::normalize_access_path(&f[0]).ok().as_deref() == Some(norm.as_str()) {

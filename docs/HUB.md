@@ -857,8 +857,12 @@ quay.io; the tests use the MinIO server binary packaged as
   device's full public identity (`veil1<x25519><ed25519><binding>`).
   * The challenge is deleted in the statement that checks it: **a replayed
     login finds nothing.**
-  * `hub` must equal the request's `Host`: a signature a client made for
-    another server (one relaying our challenges) is refused.
+  * `hub` must be a name the server's TLS certificate is valid for (the
+    check the client made before signing), and equal the request's `Host`:
+    a signature a client made for another server (one relaying our
+    challenges, which also writes the `Host` header) is refused (BUG-819).
+    Two servers on one machine that share a certificate's names (the
+    self-signed `localhost` one) are not told apart.
   * The identity's Ed25519 part must be the key, with a valid binding: a
     device cannot register someone else's X25519 key.
 * An unknown key with `name` registers a new person (names are unique,
@@ -894,8 +898,11 @@ quay.io; the tests use the MinIO server binary packaged as
 * **Names are bound when a policy is accepted**, and stored with it: a
   name binds to the project's group of that name if one exists (**a group
   always wins**), else to the person of that name, else the push is
-  refused. A person who signs up under a group's name takes over nothing;
-  a group deleted later grants nothing. The admin's push lists every
+  refused. A person who signs up under a group's name takes over nothing:
+  creating a group rebinds an accepted line that names it to the new group
+  (BUG-821), and a group deleted later grants nothing. Between an admin's
+  push of a line naming a person and the creation of a group of that name,
+  the person has the folder, as the push listed. The admin's push lists every
   binding and every public line ("access accepted: billing/ → group
   finance"), so nothing becomes public or shared silently.
 * **Who may do what** (`api.rs`, `sync.rs`):
@@ -975,7 +982,9 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
   a revision that changed folders outside `DIR` needs the full fetch on
   demand of milestone S3.
 * **Push validation** (§4.5): checks 1 (participant), 2 (write access per
-  changed path; a merge may take a path unchanged from another parent),
+  changed path; a merge may take a path unchanged from another parent
+  whose side changed it since a common ancestor, never the version the
+  first parent replaced: BUG-820),
   3 (access lines), 4–6 (hash, canonical decoding, format), 7 (closure:
   every changed object must be uploaded or stored), 8 (§13.6), 10 (every
   new snapshot signed by a registered device key) and 12 (fast-forward
@@ -1014,8 +1023,16 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
   * a manager's (or a compromised server's) group change gives folder
     access but **no key**: the secret stays closed until a ring admin
     signs (`vl group add` says so);
+  * **S1 limit (BUG-827, open):** the admin's device takes a person's
+    devices from the server (`GET /v1/people/{name}/devices`), so a
+    compromised server can list its own device under the person being
+    added and receive the key. Step 3 of the S2 plan below closes this;
   * removing someone from their last group **rotates** the key away from
-    their devices (as `vl scope revoke` does).
+    their devices (as `vl scope revoke` does) when a ring admin removes
+    them; a manager's removal says the key was not rotated and asks an
+    admin to remove them too (BUG-828);
+  * only an admin of the project starts a scope's ring on the server (its
+    first change); later changes verify against its signed log (BUG-822).
   * The server stores rings, verifies each change with the engine's own
     replay (`Keychain::merge_ring`) and keeps the longest log that
     verifies; it cannot open them and is not their authority.
@@ -1065,6 +1082,12 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
 * **Descriptions** of changes that touched both visible and hidden paths
   are shown with the visible part (§13.4).
 * **One secret key** per project (§13.6).
+* **Open findings of the S1 adversarial pass** (`docs/BUGS.md`): a push
+  may name an object it did not upload, which confirms a guess of a whole
+  hidden file (BUG-824); projections keep the real ids of `predecessors`
+  (BUG-826); a compromised server can obtain the secret key through the
+  device list (BUG-827, §13.6). HTTP/2 connections idle between requests
+  are not timed out (BUG-825 bounds handshakes and HTTP/1 request heads).
 * **Embargoes and cloaked lines** cannot be pushed to the server yet.
 * **`--only` clones** cannot move to revisions that changed folders outside
   their directory (§13.5).

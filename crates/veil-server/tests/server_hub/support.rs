@@ -260,6 +260,16 @@ impl Api {
         self.post(token, path, &serde_json::to_vec(v).unwrap(), true)
     }
 
+    /// POST JSON with the `Host` header a relaying server would send.
+    pub fn post_json_host(&self, path: &str, v: &serde_json::Value, host: &str) -> Reply {
+        let r = self
+            .agent
+            .post(format!("{}{path}", self.base))
+            .header("host", host)
+            .header("content-type", "application/json");
+        Self::finish(r.send(&serde_json::to_vec(v).unwrap()[..]))
+    }
+
     /// Sign in as `id` (registering `name` if given); the session token.
     pub fn login(&self, id: &Identity, name: Option<&str>) -> Result<String, Reply> {
         let ch = self.post_json(None, "/v1/auth/challenge", &serde_json::json!({"key": id.verifying_hex()}));
@@ -592,6 +602,80 @@ impl<'a> Craft<'a> {
 }
 
 impl Craft<'_> {
+    /// Commit a merge of the tip and `others` (as the crafter was given
+    /// them) and push it to `branch`.
+    pub fn push_merge(mut self, branch: &str, others: &[ObjectId]) -> Reply {
+        let mut parents = vec![self.tip];
+        parents.extend_from_slice(others);
+        let mut s = Snapshot {
+            parents,
+            change_id: veil_core::ChangeId::random(),
+            tree: self.root,
+            description: Text::Plain("merge".into()),
+            author: "crafter".into(),
+            timestamp: veil_core::now_millis(),
+            predecessors: vec![],
+            conflicts: vec![],
+            cloak: None,
+            embargo: None,
+            signature: None,
+        };
+        s.sign(&self.identity);
+        let id = self.put(O::Snapshot(s));
+        let up = self.api.upload(&self.token, &self.project, &self.objects);
+        assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+        self.api.post_json(
+            Some(&self.token),
+            &format!("/v1/projects/{}/push", self.project),
+            &serde_json::json!({"updates": [{"branch": branch, "expected": self.tip.hex(), "new": id.hex()}]}),
+        )
+    }
+
+    /// Commit and push to `branch` (expected at `expected`), letting `edit`
+    /// change the snapshot before it is signed; the snapshot's id and the
+    /// push's reply.
+    pub fn push_edited(mut self, branch: &str, expected: Option<ObjectId>, edit: impl FnOnce(&mut Snapshot)) -> (ObjectId, Reply) {
+        let mut s = Snapshot {
+            parents: vec![self.tip],
+            change_id: veil_core::ChangeId::random(),
+            tree: self.root,
+            description: Text::Plain(format!("to {branch}")),
+            author: "crafter".into(),
+            timestamp: veil_core::now_millis(),
+            predecessors: vec![],
+            conflicts: vec![],
+            cloak: None,
+            embargo: None,
+            signature: None,
+        };
+        edit(&mut s);
+        s.sign(&self.identity);
+        let id = self.put(O::Snapshot(s));
+        let up = self.api.upload(&self.token, &self.project, &self.objects);
+        assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+        let r = self.api.post_json(
+            Some(&self.token),
+            &format!("/v1/projects/{}/push", self.project),
+            &serde_json::json!({"updates": [{"branch": branch, "expected": expected.map(|e| e.hex()), "new": id.hex()}]}),
+        );
+        (id, r)
+    }
+
+    /// Point `path` at object `id` without uploading it.
+    pub fn refer(&mut self, path: &str, id: ObjectId, size: u64) {
+        let parts: Vec<&str> = path.split('/').collect();
+        let entry = TreeEntry {
+            name: parts.last().unwrap().to_string(),
+            kind: K::File,
+            id,
+            size,
+            executable: false,
+            visibility: Visibility::Public,
+            fallback: None,
+        };
+        self.root = self.set_at("", Some(self.root), &parts, entry);
+    }
+
     /// The root tree of snapshot `id` (one the crafter was given).
     pub fn tree_of(&self, id: ObjectId) -> ObjectId {
         let h = self.api.post_json(Some(&self.token), &format!("/v1/projects/{}/history", self.project), &serde_json::json!({"tips": [id.hex()]}));

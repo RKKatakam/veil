@@ -260,6 +260,20 @@ async fn create_group(State(hub): State<HubState>, caller: Caller, Path((p, g)):
             if r.rows_affected() == 0 {
                 return Err(Error::conflict(format!("group '{g}' exists")));
             }
+            // A group always wins: an accepted access line naming it now
+            // names this group, never the person who signed up under its
+            // name, nor a deleted group of that name.
+            let gid = group_id(c, pid, &g).await?;
+            let text: String = sqlx::query_scalar("SELECT policy_bindings FROM projects WHERE id = $1").bind(pid).fetch_one(&mut *c).await?;
+            let mut bindings: std::collections::BTreeMap<String, Binding> = serde_json::from_str(&text).unwrap_or_default();
+            if let Some(b) = bindings.get_mut(&g) {
+                *b = Binding::Group(gid);
+                sqlx::query("UPDATE projects SET policy_bindings = $1 WHERE id = $2")
+                    .bind(serde_json::to_string(&bindings).map_err(|e| Error::Other(e.into()))?)
+                    .bind(pid)
+                    .execute(&mut *c)
+                    .await?;
+            }
             group_info(c, pid, &g).await
         })
     })
@@ -395,6 +409,19 @@ async fn post_ring(
     validate_scope_name(&scope).map_err(|e| Error::bad_request(e.to_string()))?;
     if ring.scope != scope {
         return Err(Error::bad_request("the ring is for another scope"));
+    }
+    // Whoever starts a ring is its admin and holds its key: only an admin
+    // of the project starts one. Later changes verify against the ring's
+    // own signed log (`merge_ring`).
+    if !viewer.admin {
+        let exists: Option<i32> = sqlx::query_scalar("SELECT 1 FROM rings WHERE project_id = $1 AND scope = $2")
+            .bind(project.id)
+            .bind(&scope)
+            .fetch_optional(&hub.db)
+            .await?;
+        if exists.is_none() {
+            return Err(Error::forbidden(format!("only an admin of this project starts a key ring (scope '{scope}')")));
+        }
     }
     merge_ring(&hub, &project, ring).await
 }

@@ -17,3 +17,4 @@ mod concurrency;
 mod escalation;
 mod leaks;
 mod sync;
+mod adversarial;

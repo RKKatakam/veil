@@ -35,6 +35,9 @@ pub struct Hub {
     /// with it.
     pub identity: Identity,
     pub session_ttl_ms: i64,
+    /// The TLS certificate (leaf, DER): sign-in accepts only signatures
+    /// for a server name it is valid for.
+    pub certificate: rustls::pki_types::CertificateDer<'static>,
 }
 
 pub type HubState = Arc<Hub>;
@@ -97,7 +100,7 @@ fn server_identity(data_dir: &std::path::Path) -> Result<Identity> {
 pub async fn start(config: Config) -> Result<Running> {
     std::fs::create_dir_all(&config.data_dir)?;
     let identity = server_identity(&config.data_dir)?;
-    let (tls, cert_pem) = tls::server_config(&config.tls, &config.data_dir)?;
+    let (tls, cert_pem, certificate) = tls::server_config(&config.tls, &config.data_dir)?;
     let db = db::connect(&config.database_url, config.db_connections).await.context("connecting to the database")?;
     db::migrate(&db).await.context("migrating the database")?;
     let blob: Arc<dyn store::BlobStore> = match &config.storage {
@@ -120,6 +123,7 @@ pub async fn start(config: Config) -> Result<Running> {
         trees: LruCache::new(256 << 20),
         identity,
         session_ttl_ms: config.session_ttl.as_millis() as i64,
+        certificate,
     });
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;
@@ -135,6 +139,10 @@ pub async fn start(config: Config) -> Result<Running> {
     })
 }
 
+/// How long a connection may take to finish its TLS handshake, or to send
+/// a request's head.
+const IDLE_LIMIT: Duration = Duration::from_secs(20);
+
 async fn serve_tls(
     listener: tokio::net::TcpListener,
     tls: Arc<rustls::ServerConfig>,
@@ -146,7 +154,11 @@ async fn serve_tls(
         let (tcp, _) = tokio::select! {
             r = listener.accept() => match r {
                 Ok(c) => c,
-                Err(_) => continue,
+                // Out of file descriptors, say: back off instead of spinning.
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
             },
             _ = stop.changed() => return,
         };
@@ -154,11 +166,13 @@ async fn serve_tls(
         let acceptor = acceptor.clone();
         let app = app.clone();
         tokio::spawn(async move {
-            let Ok(stream) = acceptor.accept(tcp).await else { return };
+            // A connection that never finishes its handshake, or never sends
+            // a request's head, is closed: idle sockets cannot pile up.
+            let Ok(Ok(stream)) = tokio::time::timeout(IDLE_LIMIT, acceptor.accept(tcp)).await else { return };
             let service = hyper_util::service::TowerToHyperService::new(app);
-            let _ = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
-                .await;
+            let mut b = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+            b.http1().timer(hyper_util::rt::TokioTimer::new()).header_read_timeout(IDLE_LIMIT);
+            let _ = b.serve_connection(hyper_util::rt::TokioIo::new(stream), service).await;
         });
     }
 }

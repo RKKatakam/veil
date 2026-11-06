@@ -434,23 +434,65 @@ fn entry_at(src: &Source, tree: &ObjectId, path: &str) -> Result<Option<veil_cor
     Ok(None)
 }
 
+/// A common ancestor of real snapshots `a` and `b` (the universal root at
+/// worst): both histories are walked a generation at a time until one
+/// reaches a snapshot the other has seen.
+fn common_ancestor(src: &Source, a: ObjectId, b: ObjectId) -> Result<ObjectId> {
+    let root = root_snapshot_id();
+    let mut seen = [HashSet::new(), HashSet::new()];
+    let mut queue = [std::collections::VecDeque::from([a]), std::collections::VecDeque::from([b])];
+    loop {
+        let mut walked = false;
+        for side in 0..2 {
+            let Some(x) = queue[side].pop_front() else { continue };
+            walked = true;
+            if seen[1 - side].contains(&x) {
+                return Ok(x);
+            }
+            if seen[side].insert(x) && x != root {
+                queue[side].extend(src.snapshot(&x)?.parents.iter().copied());
+            }
+        }
+        if !walked {
+            return Ok(root);
+        }
+    }
+}
+
 /// Check the paths one snapshot changes: write access, personal keys,
 /// secrets sealed, nothing local-only (`docs/HUB.md` §4.5, checks 2 and 8).
-fn check_changes(src: &Source, view: &View, changes: &[Change], real_tree: &ObjectId, other_parents: &[ObjectId]) -> Result<()> {
+/// `parents` are the snapshot's real parents.
+fn check_changes(src: &Source, view: &View, changes: &[Change], real_tree: &ObjectId, parents: &[ObjectId]) -> Result<()> {
     let text = policy_text(src, real_tree)?;
     let policy = Policy::parse(&text);
+    // A merge's other parents: their trees, and the tree of a common
+    // ancestor with the first parent (found when first needed).
+    let mut others: Vec<(ObjectId, Option<ObjectId>)> = Vec::new();
+    for p in parents.iter().skip(1) {
+        others.push((src.snapshot(p)?.tree, None));
+    }
     for c in changes {
-        // Taken unchanged from another parent (a merge): written by someone
-        // who could, already.
-        let from_other = || -> Result<bool> {
-            for t in other_parents {
-                if entry_at(src, t, &c.path)? == c.new {
-                    return Ok(true);
+        // Taken from another parent of a merge, where that parent's side
+        // changed it since the common ancestor: the merge takes a change
+        // someone who could write it made. Taking the version the first
+        // parent replaced is a revert, a write like any other.
+        let mut from_other = false;
+        if !view.write(&c.path) {
+            for (i, (tree, base)) in others.iter_mut().enumerate() {
+                if entry_at(src, tree, &c.path)? != c.new {
+                    continue;
+                }
+                let base = match base {
+                    Some(b) => *b,
+                    None => *base.insert(src.snapshot(&common_ancestor(src, parents[0], parents[i + 1])?)?.tree),
+                };
+                if entry_at(src, &base, &c.path)? != c.new {
+                    from_other = true;
+                    break;
                 }
             }
-            Ok(false)
-        };
-        if !view.write(&c.path) && !from_other()? {
+        }
+        if !view.write(&c.path) && !from_other {
             return Err(Error::forbidden(format!("you may not write '{}'", c.path)));
         }
         let Some(e) = &c.new else { continue };
@@ -564,10 +606,12 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
         rows.into_iter().filter_map(|(n, t)| ObjectId::from_hex(&t).ok().map(|t| (n, t))).collect()
     };
     // Only the branches this push moves, and the default branch, are
-    // candidates.
+    // candidates; a branch this push moves wins over the default branch
+    // (both may look the same to the pusher).
     let mut tip_projection: HashMap<ObjectId, ObjectId> = HashMap::new();
-    for (name, t) in &current {
-        if *name == project.default_branch || req.updates.iter().any(|u| u.branch == *name) {
+    let candidates = std::iter::once(&project.default_branch).chain(req.updates.iter().map(|u| &u.branch));
+    for name in candidates {
+        if let Some(t) = current.get(name) {
             tip_projection.insert(projected(hub, project, viewer, *t).await?, *t);
         }
     }
@@ -638,7 +682,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             for (id, raw) in &trees {
                 src.rt.block_on(src.hub.objects.put(src.project, id, Bytes::from(raw.clone())))?;
             }
-            check_changes(src, &view, &g.changes, &real_tree, &ptrees[1..])?;
+            check_changes(src, &view, &g.changes, &real_tree, &rp)?;
             // Access lines: only admins change them.
             let mine = AccessPolicy::parse(&policy_text(src, &real_tree)?);
             let mut unchanged = false;
