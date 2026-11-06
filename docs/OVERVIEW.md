@@ -78,6 +78,18 @@ The owner adopted the four synthetic workloads published by OpenScion, an indepe
   - a history index;
   - streaming storage, safe gc, secret scanning, embargoes.
 - **Built (milestone S1, 2026-11-06): the server and the permission model, together** (`docs/HUB.md` §13). The server, the database (PostgreSQL, YugabyteDB), object storage (S3), sign-in, groups, admins, folder access, public, secrets encrypted on the device, and `vl` pushing, pulling and cloning (one directory too) through the server, with each person receiving only what they may see.
+- **Required for phase 1: isolated agent sandboxes** (owner, 2026-11-06). Every `vl ws exec` runs the agent in an isolated view of the machine, not just a separate folder.
+  - **Linux:**
+    - kernel namespaces, with no Docker image and no copying, starting in milliseconds and needing no root;
+    - the computer's own tools (`/usr`, `/bin`, `/lib`, toolchains) are visible **read-only and live**;
+    - the sandbox appears **at the project's real path**, starting in the same sub-folder, so directories and absolute paths behave as in the real project, while every write goes to the sandbox;
+    - `HOME` and `/tmp` are private; `~/.ssh`, personal keys and other projects are hidden;
+    - the agent sees only its own processes;
+    - **CPU, memory, process and time limits** apply.
+  - **Network:** on by default, because agents need their model's API; `--no-network` for runs that shouldn't call out.
+  - **macOS:** Apple's sandbox profiles; weaker, and documented as such.
+  - **Optional `--container IMAGE`** (Docker or Podman) for a fully separate environment, with the sandbox mounted at the same path.
+  - **Tests prove** an agent can't read `~/.ssh` or write outside its sandbox.
 - **Then: a simplification pass.** Remove what the server makes unnecessary: plain-file (SFTP and path) remotes, offline assumptions, old storage formats and old jargon.
 - **Then: the server's features, in stages.**
   - fetch on demand;
