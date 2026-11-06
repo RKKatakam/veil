@@ -11,23 +11,23 @@
 //! | clone one directory | `vl clone veil://… --only DIR` | `git clone --filter=blob:none --sparse` + `sparse-checkout set DIR` |
 //!
 //! Files sit in directories of 100 (`d000/f000.txt` …), so "one directory"
-//! is 100 files at both sizes. The server is a release `veil-server`
-//! started here, on `127.0.0.1` over TLS, with a PostgreSQL the caller
-//! names and objects in a local directory.
+//! is 100 files at both sizes. Both clones always go through the server:
+//! a release `veil-server` started here (`server.rs`), on `127.0.0.1` over
+//! TLS, with the PostgreSQL the caller names and objects in S3 (MinIO) or a
+//! local directory. The clones sign in as the project's admin.
 
 use std::{
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    time::{Duration, Instant},
+    process::{Command, Stdio},
+    time::Instant,
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
 pub struct Args {
     pub vl: PathBuf,
-    pub server: PathBuf,
-    pub database_url: String,
+    pub server: crate::server::ServerArgs,
     pub dir: PathBuf,
     pub sizes: Vec<usize>,
     pub runs: usize,
@@ -92,41 +92,6 @@ fn generate(dir: &Path, files: usize, seed: u64) -> Result<()> {
     Ok(())
 }
 
-struct Server {
-    child: Child,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn start_server(a: &Args, data: &Path, port: u16) -> Result<Server> {
-    let child = Command::new(&a.server)
-        .args(["--listen", &format!("127.0.0.1:{port}"), "--data"])
-        .arg(data)
-        .args(["--database-url", &a.database_url])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("starting veil-server")?;
-    let s = Server { child };
-    let cert = data.join("self-signed-cert.pem");
-    for _ in 0..200 {
-        if cert.exists() && std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return Ok(s);
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    bail!("veil-server did not start")
-}
-
-fn free_port() -> Result<u16> {
-    Ok(std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
-}
-
 pub fn run_all(a: &Args) -> Result<serde_json::Value> {
     std::fs::create_dir_all(&a.dir)?;
     let home = a.dir.join("home");
@@ -146,14 +111,13 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
             .env("HOME", &a.dir);
         c
     };
-    let port = free_port()?;
-    let data = a.dir.join("server");
-    let _server = start_server(a, &data, port)?;
-    let hub = format!("veil://127.0.0.1:{port}");
-    run(vl(&a.dir).args(["login", &hub, "--name", &format!("bench{port}"), "--ca"]).arg(data.join("self-signed-cert.pem")))?;
+    let server = crate::server::Server::start(&a.server, &a.dir.join("server"), 32)?;
+    let hub = format!("veil://{}", server.authority);
+    let tag = server.pid();
+    run(vl(&a.dir).args(["login", &hub, "--name", &format!("bench{tag}"), "--ca"]).arg(&server.cert))?;
     let mut cases = Vec::new();
     for &files in &a.sizes {
-        let name = format!("os{files}-{port}");
+        let name = format!("os{files}-{tag}");
         let src = a.dir.join(format!("src-{files}"));
         generate(&src, files, files as u64)?;
         let mut veil = [vec![], vec![], vec![], vec![]];
@@ -219,7 +183,7 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
             }));
         }
     }
-    Ok(json!({ "profile": "openscion", "cases": cases }))
+    Ok(json!({ "profile": "openscion", "objects": if a.server.s3_endpoint.is_some() { "s3" } else { "directory" }, "cases": cases }))
 }
 
 /// The workloads measured as OpenScion measures its own numbers

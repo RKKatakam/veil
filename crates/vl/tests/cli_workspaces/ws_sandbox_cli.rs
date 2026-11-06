@@ -167,15 +167,14 @@ fn the_reaper_takes_injected_files_out_of_a_run_that_was_killed() {
     let env = Env::new();
     let proj = project(&env);
     exec(&env, &proj, &["--", "sh", "-c", "mkdir -p target; echo o > target/o"]);
-    let pidfile = env.root.join("child.pid");
-    let script = format!("echo $$ > {}; exec sleep 30", pidfile.display());
-    let mut child = env.spawn("alice", &proj, &["ws", "exec", "agent", "--with-isolated", "--", "sh", "-c", &script]);
-    assert!(wait_for(Duration::from_secs(20), || pidfile.exists()), "never started");
+    // Confined, the command sees only the sandbox: it says it started
+    // there, and the confinement stops it when `vl` dies.
+    let started = files_dir(&proj, "agent").join(".started");
+    let mut child = env.spawn("alice", &proj, &["ws", "exec", "agent", "--with-isolated", "--", "sh", "-c", "touch .started; exec sleep 30"]);
+    assert!(wait_for(Duration::from_secs(20), || started.exists()), "never started");
+    let _ = std::fs::remove_file(&started);
     let _ = child.kill();
     let _ = child.wait();
-    if let Ok(pid) = std::fs::read_to_string(&pidfile) {
-        let _ = std::process::Command::new("kill").args(["-9", pid.trim()]).status();
-    }
     let dir = files_dir(&proj, "agent");
     assert!(wait_for(Duration::from_secs(10), || !dir.join(".netrc").exists()), "injected secret left after kill -9");
     // The next run records what the killed one left (nothing new here),
@@ -242,11 +241,11 @@ fn two_runs_in_one_workspace_take_turns() {
 fn ctrl_c_stops_the_command_and_vl_records_what_it_left() {
     let env = Env::new();
     let proj = project(&env);
-    let started = env.root.join("started");
-    let script = format!("echo partial > p.txt; touch {}; exec sleep 30", started.display());
+    let started = files_dir(&proj, "agent").join(".started");
+    let script = "echo partial > p.txt; touch .started; exec sleep 30";
     let child = {
         use std::os::unix::process::CommandExt;
-        env.cmd("alice", &proj, &["ws", "exec", "agent", "--", "sh", "-c", &script])
+        env.cmd("alice", &proj, &["ws", "exec", "agent", "--", "sh", "-c", script])
             .process_group(0)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -254,6 +253,7 @@ fn ctrl_c_stops_the_command_and_vl_records_what_it_left() {
             .unwrap()
     };
     assert!(wait_for(Duration::from_secs(20), || started.exists()));
+    let _ = std::fs::remove_file(&started);
     // The terminal's Ctrl-C goes to the whole foreground process group.
     // SAFETY: signals our own child's process group.
     unsafe {
@@ -272,11 +272,14 @@ fn the_command_cannot_reach_the_project_through_vl_or_git() {
     std::fs::create_dir_all(proj.join(".git")).unwrap();
     std::process::Command::new("git").arg("init").arg("-q").current_dir(&proj).status().ok();
     let vl = env!("CARGO_BIN_EXE_vl");
-    let o = env.vl(
-        "alice",
-        &proj,
-        &["ws", "exec", "agent", "--", "sh", "-c", &format!("'{vl}' status; echo vl=$?; git rev-parse --show-toplevel; echo git=$?")],
-    );
+    // Confined (Linux), `vl` must be allowed in to be run at all.
+    let script = format!("'{vl}' status; echo vl=$?; git rev-parse --show-toplevel; echo git=$?");
+    let mut args = vec!["ws", "exec", "agent"];
+    if cfg!(target_os = "linux") {
+        args.extend(["--allow", vl]);
+    }
+    args.extend(["--", "sh", "-c", &script]);
+    let o = env.vl("alice", &proj, &args);
     let t = text(&o);
     assert!(t.contains("no Veil repository found"), "{t}");
     assert!(!t.contains("vl=0"), "{t}");
@@ -290,10 +293,11 @@ fn a_workspace_moved_during_the_run_keeps_both_results() {
     let env = Env::new();
     let proj = project(&env);
     exec(&env, &proj, &["--", "true"]);
-    let started = env.root.join("started");
-    let script = format!("touch {}; sleep 2; echo run > run.txt", started.display());
-    let child = env.spawn("alice", &proj, &["ws", "exec", "agent", "-m", "agent run", "--", "sh", "-c", &script]);
+    let started = files_dir(&proj, "agent").join(".started");
+    let script = "touch .started; sleep 2; echo run > run.txt";
+    let child = env.spawn("alice", &proj, &["ws", "exec", "agent", "-m", "agent run", "--", "sh", "-c", script]);
     assert!(wait_for(Duration::from_secs(20), || started.exists()));
+    let _ = std::fs::remove_file(&started);
     ws_write(&env, &proj, "agent", "meanwhile.txt", "m\n");
     let out = child.wait_with_output().unwrap();
     let t = text(&out);
@@ -335,10 +339,10 @@ fn ws_rm_removes_the_sandbox_but_not_quarantined_work_without_force() {
 fn ws_rm_is_refused_while_a_run_is_in_progress() {
     let env = Env::new();
     let proj = project(&env);
-    let started = env.root.join("started");
-    let script = format!("touch {}; sleep 2", started.display());
-    let child = env.spawn("alice", &proj, &["ws", "exec", "agent", "--", "sh", "-c", &script]);
+    let started = files_dir(&proj, "agent").join(".started");
+    let child = env.spawn("alice", &proj, &["ws", "exec", "agent", "--", "sh", "-c", "touch .started; sleep 2"]);
     assert!(wait_for(Duration::from_secs(20), || started.exists()));
+    let _ = std::fs::remove_file(&started);
     let o = env.vl("alice", &proj, &["ws", "rm", "agent"]);
     assert!(!o.status.success() && text(&o).contains("is running"), "{}", text(&o));
     let out = child.wait_with_output().unwrap();

@@ -18,6 +18,7 @@ Options:
 | `--dry-run` | Show what would happen without changing anything |
 | `--force` | Upgrade even if fsck reports corruption |
 | `--sync-secrets` | Start encrypting and syncing shared secrets (`.env`, `.env.*`, `.envrc`, Terraform state) under the `team` key, as new repositories do: lists the files that would start syncing, then adds the rules to `.veilpolicy` (with --dry-run: only lists). Personal private keys stay on this device |
+| `--rule-keys` | Give each folder's secrets their own key, instead of one key for every secret of the project (milestone S1's): lists every secret with its new key and who will hold it, then rewrites the lines and sets up the keys (with --dry-run: only lists). Admins of a Veil server project; commit and push afterwards |
 
 ---
 

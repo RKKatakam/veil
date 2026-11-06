@@ -40,8 +40,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc, Barrier, Mutex,
@@ -49,7 +48,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 use veil_core::{
     hub::wire::{put_frame, read_frames, BranchUpdate, FetchRequest, HistoryRequest, PushRequest, PushResult, Tips, Want},
@@ -86,10 +85,9 @@ pub struct Args {
     pub url: Option<String>,
     /// Its certificate (PEM), for a self-signed one.
     pub ca: Option<PathBuf>,
-    /// The `veil-server` to start here when no `url` is given.
-    pub server: Option<PathBuf>,
-    /// The database of the server started here, and of the statistics.
-    pub database_url: Option<String>,
+    /// The server to start here when no `url` is given (its
+    /// `database_url` also serves the statement counts).
+    pub server: crate::server::ServerArgs,
     pub db_connections: u32,
     /// The server's process, for its CPU (the one started here if none).
     pub server_pid: Option<u32>,
@@ -564,42 +562,6 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 
 // ---- the run --------------------------------------------------------------------------------
 
-struct Server {
-    child: Child,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn start_server(bin: &Path, data: &Path, database_url: &str, connections: u32) -> Result<(Server, String, String)> {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
-    let status = Command::new(bin).args(["migrate", "--database-url", database_url]).stdout(Stdio::null()).status()?;
-    if !status.success() {
-        bail!("veil-server migrate failed");
-    }
-    let child = Command::new(bin)
-        .args(["--listen", &format!("127.0.0.1:{port}"), "--data"])
-        .arg(data)
-        .args(["--database-url", database_url, "--db-connections", &connections.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(std::fs::File::create(data.with_extension("log"))?))
-        .spawn()
-        .context("starting veil-server")?;
-    let s = Server { child };
-    let cert = data.join("self-signed-cert.pem");
-    for _ in 0..400 {
-        if cert.exists() && std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return Ok((s, format!("https://127.0.0.1:{port}"), std::fs::read_to_string(cert)?));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    bail!("veil-server did not start")
-}
-
 fn unique(prefix: &str) -> String {
     format!("{prefix}{}", hex::encode(veil_core::crypto::random_bytes::<4>()))
 }
@@ -893,12 +855,11 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
 pub fn run_all(a: &Args) -> Result<serde_json::Value> {
     std::fs::create_dir_all(&a.dir)?;
     let mut _server = None;
-    let (base, ca, mut server_pid) = match (&a.url, &a.server) {
+    let (base, ca, mut server_pid) = match (&a.url, &a.server.server) {
         (Some(u), _) => (u.clone(), a.ca.as_ref().map(std::fs::read_to_string).transpose()?, None),
-        (None, Some(bin)) => {
-            let url = a.database_url.as_deref().ok_or_else(|| anyhow!("--database-url for the server started here"))?;
-            let (s, base, ca) = start_server(bin, &a.dir.join("server"), url, a.db_connections)?;
-            let pid = s.child.id();
+        (None, Some(_)) => {
+            let s = crate::server::Server::start(&a.server, &a.dir.join("server"), a.db_connections)?;
+            let (base, ca, pid) = (s.https(), std::fs::read_to_string(&s.cert)?, s.pid());
             _server = Some(s);
             (base, Some(ca), Some(pid))
         }
@@ -923,7 +884,7 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
         agent_name: &agent_name,
         agent_token: &agent_token,
         server_pid,
-        stats: a.database_url.as_deref().map(|u| (&rt, u)),
+        stats: a.server.database_url.as_deref().map(|u| (&rt, u)),
     };
     let rates = match a.mode {
         Mode::Pull => vec![Rate::Max],

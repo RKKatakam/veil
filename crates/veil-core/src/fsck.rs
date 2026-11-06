@@ -958,7 +958,7 @@ impl Checker {
                         self.push(
                             Severity::Corrupt,
                             format!(
-                                "key ring {path} needs ring format {} (HPKE-wrapped keys) in a format-{} repository (older vl cannot read it)",
+                                "key ring {path} needs ring format {} in a format-{} repository (older vl cannot read it)",
                                 ring.format.max(ring.required_format()),
                                 self.store.format()
                             ),
@@ -969,7 +969,9 @@ impl Checker {
                     for c in &ring.log {
                         match &c.op {
                             crate::keychain::RingOp::Genesis { members, .. } => granted.extend(members.iter().map(|m| &m.id)),
-                            crate::keychain::RingOp::Grant { member } => granted.push(&member.id),
+                            crate::keychain::RingOp::Grant { member } | crate::keychain::RingOp::Share { member, .. } => {
+                                granted.push(&member.id)
+                            }
                             _ => {}
                         }
                     }

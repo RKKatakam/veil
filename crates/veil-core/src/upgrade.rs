@@ -154,6 +154,9 @@ fn transition_steps(from: u32) -> Vec<&'static str> {
         // The lock-free op log: a head file for the current `op_head`,
         // before the commit point (format-5 readers ignore `op_heads/`).
         5 => vec!["op-heads"],
+        // Ring format 4 (invites and shares): nothing to rewrite. Rings
+        // already stored keep their format until a change needs format 4.
+        6 => vec![],
         _ => vec![],
     }
 }

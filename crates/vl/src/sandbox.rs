@@ -72,6 +72,7 @@ use veil_core::{
 };
 
 use crate::{
+    confine::Confine,
     ctx::{print_checkout_problems, print_working_copy_warnings, Ctx},
     render::{dim, one_line, policy_edit_held_message, print_build_warnings, safe, warn, yellow},
 };
@@ -99,6 +100,8 @@ pub struct Exec<'a> {
     pub only: &'a [String],
     /// `--record-only`: record what an earlier run left unrecorded, run nothing.
     pub record_only: bool,
+    /// Confinement and limits ([`crate::confine`]).
+    pub confine: &'a crate::confine::ConfineArgs,
     pub command: &'a [String],
 }
 
@@ -151,15 +154,23 @@ fn warn_strays(set: &SparseSet, strays: &[VPath], removed: bool) {
 }
 
 pub fn exec(ctx: &mut Ctx, a: &Exec<'_>) -> Result<ExitCode> {
+    // Checked before anything is touched: a run that cannot be confined
+    // fails here, with the sandbox and its manifest as they were.
+    let confine = |ctx: &Ctx| match a.record_only {
+        true => Ok(None),
+        false => Confine::prepare(&ctx.root, a.confine),
+    };
     if a.ephemeral {
-        return exec_ephemeral(ctx, a);
+        let c = confine(ctx)?;
+        return exec_ephemeral(ctx, a, c.as_ref());
     }
     let name = a.name.ok_or_else(|| anyhow!("give a workspace name or --ephemeral"))?;
     if name == ctx.ws {
         bail!("workspace '{name}' is attached to the project directory; just run the command");
     }
     ctx.repo.workspace_wc(name)?;
-    exec_persistent(ctx, name, a)
+    let c = confine(ctx)?;
+    exec_persistent(ctx, name, a, c.as_ref())
 }
 
 // ---- persistent sandboxes --------------------------------------------------
@@ -229,7 +240,7 @@ fn vault_files(repo: &Repo) -> Result<Vec<(String, Vec<u8>)>> {
     Ok(files)
 }
 
-fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>) -> Result<ExitCode> {
+fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Confine>) -> Result<ExitCode> {
     // Throwaway sandboxes of dead `vl` processes may hold secrets.
     sweep_stale(&std::env::temp_dir());
     let started = core::now_ns();
@@ -411,8 +422,8 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>) -> Result<ExitCode> 
         }
     }
 
-    eprintln!("{} {} in {}", dim("running"), a.command.join(" "), paths.files.display());
-    let code = run_command(&paths.files, &paths.dir, a.command);
+    print_running(a.command, &paths.files, confine);
+    let code = run_command(&paths.files, &paths.dir, a.command, confine);
     // Nothing may have run (the command was not found): recording finds no
     // change and the injected files are taken out as after any run.
     finish(ctx, name, &paths, &mut m, &mut cache, &fs, injection.as_ref(), Some(&kept))?;
@@ -807,20 +818,29 @@ pub fn remove_workspace(ctx: &mut Ctx, name: &str, force: bool) -> Result<bool> 
 
 // ---- running the command ---------------------------------------------------
 
+fn print_running(command: &[String], dir: &Path, confine: Option<&Confine>) {
+    let how = confine.map(|c| format!(" ({})", c.describe(dir))).unwrap_or_default();
+    eprintln!("{} {} in {}{how}", dim("running"), command.join(" "), dir.display());
+}
+
 /// Run `command` in `dir` and return its exit status (128 + n for a
 /// signal). Git never looks above `ceiling` for a repository (the sandbox
 /// lives inside the project directory). Ctrl-C and Ctrl-\ go to the command
 /// only, and SIGTERM and SIGHUP sent to `vl` (an IDE stopping a task, a
 /// closed terminal) are forwarded to it: `vl` waits for it and records what
-/// it left (BUG-550).
-fn run_command(dir: &Path, ceiling: &Path, command: &[String]) -> Result<i32> {
-    let mut cmd = Command::new(&command[0]);
-    cmd.args(&command[1..]).current_dir(dir);
+/// it left (BUG-550). With `confine`, `dir` appears at the project's path
+/// inside the confinement ([`crate::confine`], which forwards the signals).
+fn run_command(dir: &Path, ceiling: &Path, command: &[String], confine: Option<&Confine>) -> Result<i32> {
     let mut ceilings = ceiling.as_os_str().to_owned();
     if let Some(old) = std::env::var_os("GIT_CEILING_DIRECTORIES").filter(|v| !v.is_empty()) {
         ceilings.push(":");
         ceilings.push(old);
     }
+    if let Some(c) = confine {
+        return crate::confine::run(c, dir, command, &[("GIT_CEILING_DIRECTORIES", ceilings)]);
+    }
+    let mut cmd = Command::new(&command[0]);
+    cmd.args(&command[1..]).current_dir(dir);
     cmd.env("GIT_CEILING_DIRECTORIES", ceilings);
     let interrupts = Interrupts::to_child(&mut cmd);
     let status = cmd
@@ -963,7 +983,7 @@ impl Drop for Interrupts {
 
 // ---- ephemeral sandboxes ---------------------------------------------------
 
-fn exec_ephemeral(ctx: &mut Ctx, a: &Exec<'_>) -> Result<ExitCode> {
+fn exec_ephemeral(ctx: &mut Ctx, a: &Exec<'_>, confine: Option<&Confine>) -> Result<ExitCode> {
     let base_snapshot = ctx.rev(a.rev)?;
     let tree = ctx.repo.snapshot(&base_snapshot)?.tree;
     let set = sparse_set(ctx, a.only, &tree, &safe(a.rev))?;
@@ -994,8 +1014,8 @@ fn exec_ephemeral(ctx: &mut Ctx, a: &Exec<'_>) -> Result<ExitCode> {
             ));
         }
         sb.make_private()?;
-        eprintln!("{} {} in {}", dim("running"), a.command.join(" "), dir.display());
-        let code = run_command(&dir, &dir, a.command)?;
+        print_running(a.command, &dir, confine);
+        let code = run_command(&dir, &dir, a.command, confine)?;
         // A deleted or unreadable `.veilpolicy` keeps the recorded one.
         let pin = core::PolicyPin::new(&sandbox, ctx.repo.store(), &tree)?;
         let view = set.as_ref().map(|s| SparseView::new(&pin, ctx.repo.store().clone(), tree, s));

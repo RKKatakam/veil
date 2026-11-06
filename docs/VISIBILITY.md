@@ -1,6 +1,6 @@
 # Who can see what: Veil's permission model
 
-> **Status:** decided by the owner on 2026-11-05. Milestone S1 of the server builds it (2026-11-06): see "As built" below.
+> **Status:** decided by the owner on 2026-11-05. Milestone S1 of the server builds it (2026-11-06), and S2 finishes its secrets (invites, a key per folder, keys shared in the background, device removal): see "As built" below.
 >
 > **This document is the source of truth.** Where `ARCHITECTURE.md`, `HUB.md`, a guide or an older design doc disagrees with it, this document wins, and the other one needs updating. **Keep it this simple:** it is the ordinary permission model everyone already knows.
 
@@ -62,6 +62,7 @@ The secret scanner also stops anything that looks like a password or token from 
 - **Agents on your computer** (`vl ws exec`) see what you see, including secrets you have access to. If an agent writes a secret into some other file, Veil refuses to commit it and removes it after the run.
 - **A cloud machine or CI server** is added like a person. Give it the groups it needs; every agent on it shares that access. Veil creates the machine's identity automatically.
 - **Over SSH** (planned): borrow your laptop's access for a session, like `ssh -A`, without storing secrets on the remote machine.
+- **Isolation (built on Linux; macOS to come):** each agent's `vl ws exec` runs in an isolated view of the machine. It sees the project at its real path and the computer's tools read-only; your `~/.ssh`, personal keys and other projects are hidden; CPU, memory and time are limited. See `docs/OVERVIEW.md`.
 - **The limit:** an agent that's given a secret can use it while it runs. Give risky agents test keys.
 
 ## Hidden changes (embargoes)
@@ -75,13 +76,28 @@ vl merge fix --into main --embargo-for security distro-partners --until 2026-12-
 - The groups named get the fix right away: code, message and history. Everyone else, the public included, sees nothing of it until it's released.
 - Anything built on top of it stays hidden too.
 - `vl embargo release`, or the deadline, makes it public.
-- **Embargoed changes are encrypted,** like secrets, because they often go to people outside the project.
+- **Embargoes are permissions, not encryption** (owner, 2026-11-06). An embargoed change is plain text on the server, visible only to the groups and people named. **The server makes it public at the deadline,** or when someone with the right runs `vl embargo release`. Outside partners (e.g. distro maintainers) get accounts and are named like anyone else.
 
 ## Who can see a PR
 
 - **A PR is visible only to people who can see every file it touches.** There is no partial view, because the title and comments describe the change.
 - **An embargoed PR doesn't exist** for anyone outside its groups: no title, no count, no placeholder.
 - **The same check applies everywhere:** search, notifications, counts, the API, agents and CI.
+
+## What is encrypted: secrets only
+
+**The only thing Veil encrypts is secret files:** `.env`, `.env.*`, keys and similar files (owner, 2026-11-06, firmly). **Nothing else is encrypted:**
+- code, in any folder;
+- embargoed changes and hidden PRs;
+- change descriptions, tag and branch names, release notes;
+- agent attribution;
+- PRs, reviews and comments.
+
+All of that is plain text, protected by the server's permissions.
+
+**Not exceptions:** HTTPS (TLS) between `vl` and the server protects the network connection, and a device's own private key may be protected at rest by a passphrase or the OS keychain. Neither encrypts project data.
+
+**Older client code still encrypts more** (cloaked lines' descriptions, sealed tag annotations, encrypted embargoes, cloaked folders). The simplification pass removes all of it, leaving only secret files sealed.
 
 ## Veil always works through its server
 
@@ -90,7 +106,7 @@ vl merge fix --into main --embargo-for security distro-partners --until 2026-12-
 - **The server stores the code and checks every permission.**
 - **Restricted folders like `billing/` are plain text on the server,** and the server only gives them to the people and groups with access.
 - **There are no plain-file remotes** (SFTP, shared drives) and no offline mode, so no other way of enforcing access is needed.
-- **Encryption is used only for secrets** (`.env`, keys) and embargoed changes.
+- **Encryption is used only for secrets** (`.env`, keys).
 
 ## What the server sees
 
@@ -116,12 +132,14 @@ What the server and `vl` do today; `docs/HUB.md` §13 has the details.
 - **History without access:** you do not see the folder's files or names in any snapshot, and a change that touched only such folders is not in your history at all. A change that touched both shows only your part (and its description). Every snapshot you receive carries a signature that verifies: its author's, or the server's on the part it left out.
 - **Only admins change access.** The server refuses a push that changes access lines, on any branch, unless an admin made it; the authority is the policy accepted on the default branch, never a label inside a snapshot. Names bind to the project's group first, also when the group is created after the line, so nobody gains access by signing up under a group's name.
 - **Managers** add and remove other people in their groups, never themselves.
-- **Secrets:**
+- **Secrets** (`HUB.md` §13.11, §13.12):
   - new repositories encrypt `.env`, `.env.*`, `.envrc` and Terraform state on the device and sync them; only devices holding the key open them;
+  - **each access line's secrets have their own key**, held by the people the line gives the folder to and by the admins: finance opens `billing/.env`, never `infra/.env`. A secret no line gives anyone is the admins';
   - personal private keys and credentials (`id_rsa`, `id_ed25519`, `*.pem`, `*.key`, `.netrc`, …) never leave the device, and the server refuses them;
-  - existing repositories switch only with `vl upgrade --sync-secrets`, which lists the files first;
-  - **keys are granted by an admin's signature, never by the server:** an admin's `vl group add` signs the key grant for the people added, **for their confirmed devices only**: a person's first device is confirmed by the admin, who compares its fingerprint with them (`confirm alice's device: 4F2A-…`, then `--confirm`), and later devices by the person from a device they already use (`vl identity confirm`). The server's list of someone's devices is never enough (`HUB.md` §13.11). A manager's addition, or anything the server does on its own, gives folder access but no key. Removing someone from their last group rotates the key when an admin does it; a manager's removal says it did not and asks an admin to remove them too.
-  - In S1 one key opens every secret of the project; keys per access rule come in S2 (`HUB.md` §13.6).
+  - existing repositories switch only with `vl upgrade --sync-secrets`, which lists the files first; a project from S1 (one key for every secret) moves to a key per folder only with an admin's `vl upgrade --rule-keys`, which lists every secret and who will hold its key first;
+  - **a hacked server can never hand out a key.** Keys go only to **confirmed devices**: a person's first device is confirmed by an **invite** (`vl invite alice --to finance` prints a one-time link, valid 7 days, whose secret the server never sees; alice runs `vl join -` and pastes it) or by the admin comparing its fingerprint with them (`vl group add … --confirm 4F2A-…`), and their later devices by the person from a device they already use (`vl identity confirm`). The key ring itself checks every device it receives, by signatures the server cannot make; the server's lists are never enough. **Every key ring belongs to one project,** and a device trusts a project's keys only once it knows the project's fingerprint from outside the server (the invite link carries it; otherwise the person compares it with an admin, or with another of their devices, and runs `vl identity confirm` in the clone), so a hacked server can hand out neither another project's keys nor keys of its own;
+  - **keys are shared in the background:** a teammate's device that holds a key gives it to a newly confirmed device within seconds of its next `vl` command; an admin's `vl group add` still grants it at once. A manager's addition, or anything the server does on its own, gives folder access but no key;
+  - **removing someone rotates only the keys they lose** (an admin's `vl group remove`; a manager's says it did not rotate and asks an admin). **A lost device** is removed with `vl identity remove FINGERPRINT`: by its person, everywhere (it can no longer sign in); by an admin, from their project only. Either way the project's keys it held rotate.
 - **Anyone on Earth** (not signed in) receives `public` folders only, and does not see a project with nothing public.
 
 ## For the design: open technical questions (not product questions)

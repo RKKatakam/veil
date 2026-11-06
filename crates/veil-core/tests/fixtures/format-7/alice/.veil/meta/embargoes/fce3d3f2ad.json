@@ -1,0 +1,26 @@
+{
+  "id": "fce3d3f2ad",
+  "scope": "team",
+  "wrapped": {
+    "scope": "embargo-wrap:fce3d3f2ad",
+    "nonce": "b402e44ec4a0f3b98d214385c55a2850b62a3f22addaebf1",
+    "ciphertext": "3db0c7a5cdfbf93021a4b552565bbb3b75964b2ac8d141e15ae14f23b03d9022ac4ef0d703659d0c73999017d7aefe86"
+  },
+  "until": null,
+  "released_key": "4cf235ef43bba9eb3665dedd9b20881819dc55600643dbaa56159c079639eb0d",
+  "released_at": 1793988491772,
+  "created": 1793988491549,
+  "description": "",
+  "scope_key": "team#480be80eb96e7e16",
+  "key_id": "56d2288e6c86ee37",
+  "signature": {
+    "signer": "veil12b795c44c136a01b3b0d5091e6dab555a3fafd0d660bb8a8e9b0da62abe6ca35",
+    "key": "ca37e3b4d681a3e848262fb53e80fb6a7926086fe26106fae753187f8bb09575",
+    "sig": "a1366d0345aeea45c74dd926f8f0424c3fb5c152e56b1d12d7c93f5897a964e61569c62adff2e0e103773bc7de1e401bdca669012b5d8a7d0fb6bba70c150d09"
+  },
+  "release_signature": {
+    "signer": "veil12b795c44c136a01b3b0d5091e6dab555a3fafd0d660bb8a8e9b0da62abe6ca35",
+    "key": "ca37e3b4d681a3e848262fb53e80fb6a7926086fe26106fae753187f8bb09575",
+    "sig": "f16acb73929a0d38fe5fbec3d9ba96cab671317384e22643ffb91df9a2096778ae924f4317512f315cac7951faefcf6851482e3e78d697c0caa9fa15894e2f07"
+  }
+}

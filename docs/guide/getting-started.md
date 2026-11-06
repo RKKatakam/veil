@@ -199,7 +199,7 @@ main: yltznuyx 53414202 Greet the world
   sideways unless you pass `--allow-backwards`.
 * `vl tag set NAME --cloak [SCOPE]` makes a tag whose name is sealed for
   the scope. **The Veil server does not hide it yet:** `vl push` sends it
-  as a branch everyone in the project sees (BUG-839).
+  as a branch everyone in the project sees (BUG-856).
 
 ## Change ids and snapshot ids
 

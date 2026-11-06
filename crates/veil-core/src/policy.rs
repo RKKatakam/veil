@@ -71,6 +71,27 @@ use crate::{
 
 pub const POLICY_FILE: &str = ".veilpolicy";
 pub const DEFAULT_SCOPE: &str = "team";
+/// `cloak rule`: seal under the scope of the access line that decides the
+/// path ([`rule_scope`]); a reserved word, never a scope of its own.
+pub const RULE_SCOPE: &str = "rule";
+
+/// The scope that seals a `cloak rule` secret at `path` (`docs/HUB.md`
+/// §13.12): that of the access line deciding it ([`rule_scope_of`]), or
+/// [`DEFAULT_SCOPE`] (the admins, on the server) when no line decides it
+/// or the deciding line names no group or person (`docs/  public`).
+pub fn rule_scope(access: &crate::hub::access::AccessPolicy, path: &str) -> String {
+    match access.deciding(path).map(|i| &access.rules[i]) {
+        Some(r) if !r.names.is_empty() => rule_scope_of(&r.path),
+        _ => DEFAULT_SCOPE.to_string(),
+    }
+}
+
+/// The scope of the secrets of the access line for `path` (normalised):
+/// `rule-` and 20 hex digits of a BLAKE3 `derive_key` over it.
+pub fn rule_scope_of(path: &str) -> String {
+    let h = blake3::derive_key(crate::crypto::domains::POLICY_RULE_SCOPE, path.as_bytes());
+    format!("rule-{}", hex::encode(&h[..10]))
+}
 
 const BUILTIN_SECRETS: &[&str] = &[
     ".env",
@@ -103,21 +124,27 @@ const BUILTIN_SECRETS: &[&str] = &[
 pub const SHARED_SECRETS: &[&str] = &[".env", ".env.*", ".envrc", "*.tfstate", "*.tfstate.*"];
 
 /// The `.veilpolicy` lines that seal the shared secrets ([`SHARED_SECRETS`])
-/// under the `team` scope, so they are encrypted on the device and synced
-/// (`docs/VISIBILITY.md`, "Secrets are encrypted"). `vl init` writes them;
-/// `vl upgrade --sync-secrets` adds them to an existing repository after
-/// listing the files that would start syncing.
+/// under the key of the access line that decides each one (`cloak rule`,
+/// [`rule_scope`]), so they are encrypted on the device and synced, and
+/// open for whoever may see their folder (`docs/VISIBILITY.md`, "Secrets
+/// are encrypted"). `vl init` writes them; `vl upgrade --sync-secrets` adds
+/// them to an existing repository after listing the files that would start
+/// syncing.
 pub const SYNCED_SECRETS_POLICY: &str = "\
-# Shared secrets are encrypted on this device and synced; only devices
-# holding the 'team' key open them (an admin's `vl group add` grants it).
+# Shared secrets are encrypted on this device and synced; only devices of
+# people who may see their folder hold the key (`vl access`, `vl group add`).
 # Personal private keys (id_rsa, id_ed25519, *.pem, *.key, .netrc, ...)
 # never leave this device.
-.env                     cloak team
-.env.*                   cloak team
-.envrc                   cloak team
-*.tfstate                cloak team
-*.tfstate.*              cloak team
+.env                     cloak rule
+.env.*                   cloak rule
+.envrc                   cloak rule
+*.tfstate                cloak rule
+*.tfstate.*              cloak rule
 ";
+
+/// The same lines as milestone S1 wrote them, under the one `team` key:
+/// what `vl upgrade --rule-keys` rewrites.
+pub const S1_SYNCED_SECRETS_LINES: &[&str] = &[".env", ".env.*", ".envrc", "*.tfstate", "*.tfstate.*"];
 
 const BUILTIN_PUBLIC_EXCEPTIONS: &[&str] = &[".env.example", ".env.sample", ".env.template", ".env.dist"];
 
@@ -678,6 +705,8 @@ pub struct Policy {
     /// The policy the member accepted, if this one is guarded by it (see
     /// [`Policy::guarded_by`]).
     accepted: Option<Box<Policy>>,
+    /// Its access lines: they decide the scope of `cloak rule` secrets.
+    access: crate::hub::access::AccessPolicy,
 }
 
 impl Default for Policy {
@@ -694,6 +723,7 @@ impl Policy {
             warnings: vec![],
             own_edit_pending: false,
             accepted: None,
+            access: Default::default(),
         }
     }
 
@@ -720,6 +750,9 @@ impl Policy {
                 }
                 Some("public") => (Tier::Public, false),
                 Some("public!") => (Tier::Public, true),
+                Some("cloak" | "cloaked") if parts.get(2).map(String::as_str) == Some(RULE_SCOPE) => {
+                    (Tier::Cloaked(RULE_SCOPE.to_string()), false)
+                }
                 Some("cloak" | "cloaked") => {
                     let scope = parts.get(2).map(String::as_str).unwrap_or(DEFAULT_SCOPE);
                     match validate_scope_name(scope) {
@@ -754,6 +787,7 @@ impl Policy {
             }
         }
         policy.set = compile_set(&policy.rules[builtin_rules().0.len()..]);
+        policy.access = crate::hub::access::AccessPolicy::parse(text);
         policy
     }
 
@@ -935,6 +969,9 @@ impl Policy {
         }
         for r in hit {
             c.apply(r);
+        }
+        if c.tier == Tier::Cloaked(RULE_SCOPE.to_string()) {
+            c.tier = Tier::Cloaked(rule_scope(&self.access, &name));
         }
         c
     }

@@ -66,6 +66,7 @@ The owner adopted the four synthetic workloads published by OpenScion, an indepe
 - **BUG-818 fixed** (one durability barrier per checkout): clones are 2.5–10× faster. The rest of a 10k clone is the transfer plus about 16 `openat` calls per file from checkout's no-follow path walks.
 - **Performance round 1** (`docs/design/scale/OPENSCION.md`): import beats Git (1.7× at 1k, 3.7× at 10k); commit one file does not yet (Git does no fsync; Veil's commit is two durable transactions). **Measured as OpenScion measures** (in one process, in memory, no disk or process start), Veil meets the import, clone-everything and commit targets: 8.8 / 86 ms, 32 / 303 ms, 0.9 / 7.4 ms.
 - **Performance round 2** (`docs/design/scale/OPENSCION.md`): clone everything is 2.3× faster at 10k (beats Git 1.3×, meets 544 ms); `vl commit` is one operation; the server's load curves are in `docs/design/scale/LOAD.md` (about 2,500 pulls/s and 2,000 landings/s across projects on one machine).
+- **Through the server** (`scripts/bench-server.sh`, 2026-11-06, `docs/design/scale/BASELINE.md`): the 512 MiB memory gate fails for the 1 GB profile's initial push (2,410 MiB, BUG-858) and full clone (979 MiB, BUG-859), and the server grows to several GB (BUG-860); an initial push of a long history is refused (BUG-857). Landings with MinIO stop at about 376/s, limited by the object store.
 - **Next costs:** clone one directory's ~60 sequential `fsync`s, checkout's path walks, the commit's scan.
 - **Performance rounds continue until every gate is met.** The profile runs in `crates/veil-bench` (`docs/design/scale/OPENSCION.md`) and is re-run on every stream that touches the client or the server.
 
@@ -78,6 +79,19 @@ The owner adopted the four synthetic workloads published by OpenScion, an indepe
   - a history index;
   - streaming storage, safe gc, secret scanning, embargoes.
 - **Built (milestone S1, 2026-11-06): the server and the permission model, together** (`docs/HUB.md` §13). The server, the database (PostgreSQL, YugabyteDB), object storage (S3), sign-in, groups, admins, folder access, public, secrets encrypted on the device, and `vl` pushing, pulling and cloning (one directory too) through the server, with each person receiving only what they may see.
+- **Required for phase 1: isolated agent sandboxes** (owner, 2026-11-06). Every `vl ws exec` runs the agent in an isolated view of the machine, not just a separate folder.
+  - **Built on Linux (2026-11-06)** with bubblewrap, default on, with the limits (`docs/design/scale/9-confinement.md`, the guide's "Confinement and limits"). A confined run starts about 5 ms slower than an unconfined one; a limit that needs a systemd scope adds about 40 ms. **Not built yet:** macOS and `--container`.
+  - **Linux:**
+    - kernel namespaces, with no Docker image and no copying, starting in milliseconds and needing no root;
+    - the computer's own tools (`/usr`, `/bin`, `/lib`, toolchains) are visible **read-only and live**;
+    - the sandbox appears **at the project's real path**, starting in the same sub-folder, so directories and absolute paths behave as in the real project, while every write goes to the sandbox;
+    - `HOME` and `/tmp` are private; `~/.ssh`, personal keys and other projects are hidden;
+    - the agent sees only its own processes;
+    - **CPU, memory, process and time limits** apply.
+  - **Network:** on by default, because agents need their model's API; `--no-network` for runs that shouldn't call out.
+  - **macOS:** Apple's sandbox profiles; weaker, and documented as such.
+  - **Optional `--container IMAGE`** (Docker or Podman) for a fully separate environment, with the sandbox mounted at the same path.
+  - **Tests prove** an agent can't read `~/.ssh` or write outside its sandbox.
 - **Now: a simplification pass.** Remove what the server makes unnecessary. **Part 1 is done** (2026-11-06): SFTP and path remotes and the offline-era text are gone, and `vl` syncs only through the server. Next: old storage formats and old jargon.
 - **Then: the server's features, in stages.**
   - fetch on demand;
@@ -89,4 +103,4 @@ The owner adopted the four synthetic workloads published by OpenScion, an indepe
 
 - **Git interop.** No import, export, sync, colocation, submodules or Git-format patches. This is permanent.
 - **Offline use, or plain-file remotes** (SFTP, shared drives).
-- **Encrypting code.** Only secrets and embargoed changes are encrypted.
+- **Encrypting code.** Only secrets (`.env`, keys) are encrypted. Embargoed changes are protected by the server's permissions and made public by the server at their deadline.

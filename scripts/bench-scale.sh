@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # The scale benchmark (docs/design/scale/9-scale-benchmark.md): builds the
-# release `vl` and `veil-bench`, generates a repository, times every case,
-# runs the N-agents profile, writes RESULTS.json and RESULTS.md, and
+# release `vl` and `veil-bench`, generates a repository, times every local
+# case, runs the N-agents profile, writes RESULTS.json and RESULTS.md, and
 # deletes what it generated.
+#
+# Push, clone and pull go through the Veil server: scripts/bench-server.sh
+# (path and SFTP remotes are being removed, so their phases are skipped
+# here).
 #
 #   scripts/bench-scale.sh                 # the 1 GB profile
 #   scripts/bench-scale.sh 5g              # ~5 GB: only when nothing else builds
@@ -80,6 +84,7 @@ fi
     --profile "$PROFILE" "${CLOAKED[@]}" --seed "$SEED" \
     --dir "$BENCH_DIR" --vl "$ROOT/target/release/vl" \
     --out "$OUT" --min-free-gb "$MIN_FREE_GB" --src "$ROOT" \
+    --skip-phase remote-path,sftp \
     "${AGENTS[@]}" "${PACK[@]}" "${EXTRA[@]}"
 
 echo "== disk after the run"

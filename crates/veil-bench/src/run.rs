@@ -42,6 +42,9 @@ pub struct Bench {
     pub opts: Options,
     pub edit_seq: usize,
     pub log: Box<dyn FnMut(&str)>,
+    /// The server under test, when there is one: its peak RSS is recorded
+    /// with every case (each run's window starts after `prep`).
+    pub server_pid: Option<u32>,
 }
 
 fn median(v: &mut [f64]) -> f64 {
@@ -141,10 +144,18 @@ impl Bench {
         let mut user = Vec::new();
         let mut sys = Vec::new();
         let mut rss = 0u64;
+        let mut server_rss: Option<u64> = None;
+        let mut server_before: Option<u64> = None;
         let mut last = Outcome::default();
         for i in 0..runs {
             prep(self, i)?;
+            if let Some(k) = self.server_pid.and_then(crate::server::reset_peak) {
+                server_before.get_or_insert(k);
+            }
             let o = self.env.run_full(&c.cwd, &args, false, &env, Some(self.opts.timeout))?;
+            if let Some(k) = self.server_pid.and_then(crate::server::peak_kib) {
+                server_rss = Some(server_rss.unwrap_or(0).max(k));
+            }
             if !o.ok() {
                 self.say(&format!("  {} FAILED ({}): {}", c.name, o.code, o.stderr.lines().last().unwrap_or("")));
             }
@@ -192,6 +203,8 @@ impl Bench {
             "user_secs": median(&mut user),
             "sys_secs": median(&mut sys),
             "maxrss_mib": rss as f64 / 1024.0,
+            "server_maxrss_mib": server_rss.map(|k| k as f64 / 1024.0),
+            "server_rss_before_mib": server_before.map(|k| k as f64 / 1024.0),
             "stdout_bytes": last.stdout_bytes,
             "trace": traced,
         });
@@ -203,7 +216,10 @@ impl Bench {
                 traced["snapshots_read"], traced["local_lock"]["hold_ms"].as_f64().unwrap_or(0.0)
             )
         };
-        self.say(&format!("  {:<34} {:>9.3} s  {:>7.1} MiB{}", c.name, med, rss as f64 / 1024.0, tr));
+        let srv = server_rss
+            .map(|k| format!(", server {:.0} → {:.0} MiB", server_before.unwrap_or(0) as f64 / 1024.0, k as f64 / 1024.0))
+            .unwrap_or_default();
+        self.say(&format!("  {:<34} {:>9.3} s  {:>7.1} MiB{srv}{}", c.name, med, rss as f64 / 1024.0, tr));
         self.cases.push(v.clone());
         Ok(v)
     }
@@ -238,6 +254,10 @@ impl Bench {
             writeln!(f, "// bench edit {} {}", self.edit_seq, i)?;
         }
         Ok(())
+    }
+
+    fn vl_ok(&self, cwd: &Path, args: &[&str]) -> Result<Outcome> {
+        self.env.ok(cwd, args)
     }
 
     pub fn note(&mut self, s: impl Into<String>) {
@@ -289,17 +309,20 @@ pub fn setup(b: &mut Bench) -> Result<()> {
     b.say("setup: checkout, embargo, isolated files");
     b.preflight("checkout", 2_000_000_000)?;
     b.case(Case::new("checkout main (full tree)", "setup", &repo, &["new", "main", "-m", "bench work"]).runs(1), |_, _| Ok(()))?;
-    let fix = b.manifest["fix_tip"].as_str().unwrap_or_default().to_string();
-    b.case(
-        Case::new("merge --embargo (fix line of 50)", "setup", &repo, &["merge", &fix, "--into", "release", "--embargo", "--until", "+30d", "-m", "Security fix (embargoed)"]).runs(1),
-        |_, _| Ok(()),
-    )?;
-    // The merge may move the working copy; go back to main.
-    b.case(Case::new("switch release → main", "setup", &repo, &["new", "main", "-m", "bench work"]).runs(1), |_, _| Ok(()))?;
-    for i in 0..5 {
-        let dir = repo.join(format!("config/env{i}"));
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join(".env"), format!("API_TOKEN=bench-isolated-{i}\n"))?;
+    // A `--plain` repository (for the server) has no fix line to embargo
+    // and no `isolate` rule.
+    if let Some(fix) = b.manifest["fix_tip"].as_str().map(str::to_string) {
+        b.case(
+            Case::new("merge --embargo (fix line of 50)", "setup", &repo, &["merge", &fix, "--into", "release", "--embargo", "--until", "+30d", "-m", "Security fix (embargoed)"]).runs(1),
+            |_, _| Ok(()),
+        )?;
+        // The merge may move the working copy; go back to main.
+        b.case(Case::new("switch release → main", "setup", &repo, &["new", "main", "-m", "bench work"]).runs(1), |_, _| Ok(()))?;
+        for i in 0..5 {
+            let dir = repo.join(format!("config/env{i}"));
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join(".env"), format!("API_TOKEN=bench-isolated-{i}\n"))?;
+        }
     }
     let (wbytes, wfiles) = du(&repo);
     let (sbytes, sfiles) = du(&repo.join(".veil"));
@@ -373,6 +396,119 @@ pub fn local(b: &mut Bench, label: &str, trace: bool) -> Result<()> {
     b.case(t(Case::new("tag set", g, &repo, &["tag", "set", "bench-tag", "-r", "@-", "--allow-backwards"])), |_, _| Ok(()))?;
     b.case(t(Case::new("ws exec --only (sparse sandbox)", g, &repo, &["ws", "exec", "--ephemeral", "-r", "main", "--only", "docs", "-m", "bench exec", "--", "true"])), |_, _| Ok(()))?;
     Ok(())
+}
+
+/// Push, clone and pull through the Veil server (`server`: started by the
+/// caller; the repository's identity signs in as the project's admin, so
+/// it may push the history it signed). Every case records the client's
+/// and the server's peak RSS.
+pub fn server(b: &mut Bench, server: &crate::server::Server) -> Result<()> {
+    let repo = b.repo.clone();
+    let project = format!("{}-{}", b.manifest["profile"].as_str().unwrap_or("bench"), std::process::id());
+    let url = server.url(&project);
+    let g = "server";
+    let clone_parent = b.dir.join("clone-server");
+    remove_tree(&clone_parent, &b.dir)?;
+    let store = b.manifest["store_disk_bytes_loose"].as_u64().unwrap_or(2_000_000_000);
+    let tree = b.manifest["tree_disk_bytes"].as_u64().unwrap_or(1_000_000_000);
+    b.preflight("push to the server", store)?;
+    let me = format!("bench-{}", std::process::id());
+    b.vl_ok(&repo, &["login", &format!("veil://{}", server.authority), "--name", &me, "--ca", &s(&server.cert)])?;
+    let _ = b.env.run(&repo, &["remote", "rm", "hub"], false);
+    b.vl_ok(&repo, &["remote", "add", "hub", &url])?;
+    b.server_pid = Some(server.pid());
+    // A pushed change moves `main` (the server takes tags as branches).
+    let commit_on_main = |b: &mut Bench, msg: &str| -> Result<()> {
+        b.dirty(1)?;
+        let repo = b.repo.clone();
+        b.vl_ok(&repo, &["commit", "-m", msg])?;
+        b.vl_ok(&repo, &["tag", "set", "main", "-r", "@-"]).map(|_| ())
+    };
+    let r = (|| -> Result<()> {
+        let r = b.case(Case::new("push, initial (all tags)", g, &repo, &["push", "hub"]).runs(1), |_, _| Ok(()))?;
+        if r.get("ok") != Some(&json!(true)) {
+            push_in_steps(b, g)?;
+            b.case(Case::new("push, all tags after the steps", g, &repo, &["push", "hub"]).runs(1), |_, _| Ok(()))?;
+        }
+        b.case(Case::new("push, nothing new", g, &repo, &["push", "hub"]), |_, _| Ok(()))?;
+        b.case(Case::new("push, 1 new snapshot", g, &repo, &["push", "hub"]), |b, _| commit_on_main(b, "one more"))?;
+        b.preflight("clone from the server", 2 * tree)?;
+        std::fs::create_dir_all(&clone_parent)?;
+        let clone = clone_parent.join("c");
+        b.case(Case::new("clone, full", g, &clone_parent, &["clone", &url, "c"]).runs(1), |_, _| Ok(()))?;
+        if clone.join(".veil").exists() {
+            let (cb, _) = du(&clone);
+            b.note(format!("server clone: {:.2} GB on disk", cb as f64 / 1e9));
+            b.case(Case::new("pull, 1 new snapshot", g, &clone, &["pull"]), |b, _| {
+                commit_on_main(b, "for pull")?;
+                b.env.ok(&b.repo, &["push", "hub"]).map(|_| ())
+            })?;
+            b.case(Case::new("pull, nothing new", g, &clone, &["pull"]), |_, _| Ok(()))?;
+            b.case(Case::new("status in clone, clean", g, &clone, &["status"]), |_, _| Ok(()))?;
+            remove_tree(&clone, &b.dir)?;
+        }
+        // A fresh agent workspace: one top-level directory (about a tenth
+        // of the tree), fetched on demand.
+        b.case(Case::new("clone, one directory (--only docs)", g, &clone_parent, &["clone", &url, "o", "--only", "docs"]).runs(1), |_, _| Ok(()))?;
+        Ok(())
+    })();
+    b.server_pid = None;
+    remove_tree(&clone_parent, &b.dir)?;
+    r
+}
+
+/// The server's copy of the history when the initial push fails
+/// (BUG-857): `main` pushed along its first-parent line in fast-forward
+/// steps (up to 512 snapshots each, fewer after a refused step), then put
+/// back. Recorded as one case: the steps' total time and their largest
+/// client and server peak RSS.
+fn push_in_steps(b: &mut Bench, g: &str) -> Result<()> {
+    let repo = b.repo.clone();
+    let line: Vec<String> = std::fs::read_to_string(b.dir.join("mainline.txt"))?.lines().map(str::to_string).collect();
+    let main = b.manifest["main"].as_str().unwrap_or_default().to_string();
+    b.note("the initial push was refused: pushing `main` in fast-forward steps instead (BUG-857)");
+    let (mut done, mut step, mut pushes, mut refused) = (0usize, 512usize, 0usize, 0usize);
+    let (mut secs, mut rss, mut srss, mut sbefore) = (0.0f64, 0u64, None::<u64>, None::<u64>);
+    let mut failure = None;
+    while done < line.len() {
+        check_stop()?;
+        let to = (done + step).min(line.len());
+        b.vl_ok(&repo, &["tag", "set", "main", "-r", &line[to - 1], "--allow-backwards"])?;
+        if let Some(k) = b.server_pid.and_then(crate::server::reset_peak) {
+            sbefore.get_or_insert(k);
+        }
+        let o = b.env.run_full(&repo, &["push", "hub", "-t", "main"], false, &[], Some(b.opts.timeout))?;
+        pushes += 1;
+        secs += o.secs;
+        rss = rss.max(o.maxrss_kib);
+        if let Some(k) = b.server_pid.and_then(crate::server::peak_kib) {
+            srss = Some(srss.unwrap_or(0).max(k));
+        }
+        if o.ok() {
+            done = to;
+            step = (step * 2).min(512);
+        } else if step > 1 {
+            refused += 1;
+            step = (step / 4).max(1);
+        } else {
+            failure = Some(o.stderr.lines().last().unwrap_or("").to_string());
+            break;
+        }
+    }
+    b.vl_ok(&repo, &["tag", "set", "main", "-r", &main, "--allow-backwards"])?;
+    let name = "push, initial in steps along main (BUG-857)";
+    b.say(&format!("  {name:<34} {secs:>9.3} s  {:>7.1} MiB, {pushes} pushes, {refused} refused", rss as f64 / 1024.0));
+    b.cases.push(json!({
+        "name": name, "group": g, "ok": failure.is_none(), "error": failure,
+        "runs": [secs], "median_secs": secs, "spread": 0.0,
+        "maxrss_mib": rss as f64 / 1024.0, "server_maxrss_mib": srss.map(|k| k as f64 / 1024.0),
+        "server_rss_before_mib": sbefore.map(|k| k as f64 / 1024.0),
+        "pushes": pushes, "refused": refused, "trace": null,
+    }));
+    match failure {
+        Some(e) => Err(anyhow!("pushing in steps failed: {e}")),
+        None => Ok(()),
+    }
 }
 
 pub fn gc(b: &mut Bench) -> Result<()> {

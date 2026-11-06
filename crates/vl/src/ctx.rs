@@ -325,6 +325,17 @@ impl Ctx {
         let user = user_for(&identity);
         let fs = Arc::new(DiskBackend::new(&root));
         let mut repo = Repo::open(fs.clone(), Some(identity), &user)?;
+        // A clone of a server project trusts only the key rings of the
+        // project fingerprint this device confirmed, before anything seals
+        // (BUG-845). (A repository that will create its project, at its first
+        // push, records none until then.)
+        if let Some(Ok(url)) = repo.config().remotes.get("origin").and_then(|r| crate::hub::HubUrl::parse(&r.url)) {
+            if repo.keys().anchor().is_none() {
+                if let Some(a) = crate::hub::anchor_for(&url.authority, &url.project)? {
+                    repo.keys().set_anchor(&a)?;
+                }
+            }
+        }
         // This device's diff and merge drivers (`.veilattributes` only names them).
         crate::attr_cmd::register(&repo, &root);
         if repo.view().workspaces.is_empty() {

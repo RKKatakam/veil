@@ -14,7 +14,7 @@ use veil_core::{
     fsck::{fsck, Severity},
     keychain::{
         current_key_has_legacy_wraps, AdminRecovery, KeyRing, Keychain, MemberGrant, RingChange, RingOp, Role,
-        RING_FORMAT,
+        RING_FORMAT_HPKE,
     },
     remote,
     upgrade::{upgrade, UpgradeOptions},
@@ -93,7 +93,7 @@ fn grants_record_a_verified_binding_for_new_and_legacy_identities() {
     repo.keys().grant_role("team", &dave.public_id(), "dave", Role::Admin).unwrap();
     repo.keys().grant("team", &bob.public_id(), "bob").unwrap();
     let r = ring(repo.keys(), "team");
-    assert_eq!(r.format, RING_FORMAT);
+    assert_eq!(r.format, RING_FORMAT_HPKE);
     let st = r.verify().unwrap();
     for id in [&alice, &dave, &bob] {
         let m = &st.members[&id.public_hex()];
@@ -400,9 +400,10 @@ fn a_retired_identity_hands_its_admin_rights_over() {
     let out = repo.keys().recover_admin(&old, false).unwrap();
     assert_eq!(
         out,
+        // `team` first: `Keychain::rings` lists it first (BUG-845).
         vec![
-            ("ops".to_string(), AdminRecovery::RetiredNotAdmin),
-            ("team".to_string(), AdminRecovery::HandedOver { revoked: false })
+            ("team".to_string(), AdminRecovery::HandedOver { revoked: false }),
+            ("ops".to_string(), AdminRecovery::RetiredNotAdmin)
         ]
     );
     let st = ring(repo.keys(), "team").verify().unwrap();

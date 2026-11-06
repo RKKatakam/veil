@@ -237,15 +237,12 @@ fn ws_exec_sandbox_is_private_to_the_user() {
 fn killed_ws_exec_leaves_no_plaintext_behind() {
     let env = Env::new();
     let proj = sandbox_project(&env);
-    let pidfile = env.root.join("child.pid");
-    let script = format!("echo $$ > {}; exec sleep 30", pidfile.display());
-    let mut child = env.spawn("alice", &proj, &["ws", "exec", "agent", "--with-isolated", "--", "sh", "-c", &script]);
-    assert!(wait_for(Duration::from_secs(20), || pidfile.exists()), "sandbox command never started");
+    // The confined command sees only the sandbox, and stops when `vl` dies.
+    let started = proj.join(".veil/local/sandboxes/agent/files/.started");
+    let mut child = env.spawn("alice", &proj, &["ws", "exec", "agent", "--with-isolated", "--", "sh", "-c", "touch .started; exec sleep 30"]);
+    assert!(wait_for(Duration::from_secs(20), || started.exists()), "sandbox command never started");
     let _ = child.kill();
     let _ = child.wait();
-    if let Ok(pid) = std::fs::read_to_string(&pidfile) {
-        let _ = std::process::Command::new("kill").args(["-9", pid.trim()]).status();
-    }
     let leftovers: Vec<String> = tree_listing(&env.root.join("tmp"))
         .into_iter()
         .filter(|p| p.ends_with(".netrc") || p.ends_with("db.txt"))

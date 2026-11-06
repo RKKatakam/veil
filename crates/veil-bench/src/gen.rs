@@ -47,10 +47,15 @@ pub struct Profile {
     pub big_binaries: Vec<u64>,
     /// Fraction of the files under `cloak` rules.
     pub cloaked: f64,
+    /// What the server accepts (`--plain`): no cloak rules, no `isolate`
+    /// rule and no cloaked fix line (the server refuses cloaked lines and
+    /// embargoes, `docs/HUB.md` §13.8; the simplification pass removes
+    /// cloaking).
+    pub plain: bool,
 }
 
 impl Profile {
-    pub fn named(name: &str, cloaked: bool) -> Result<Profile> {
+    pub fn named(name: &str, cloaked: bool, plain: bool) -> Result<Profile> {
         let mb = 1u64 << 20;
         let mut p = match name {
             // A smoke test: seconds to generate.
@@ -63,6 +68,7 @@ impl Profile {
                 tags: 4,
                 big_binaries: vec![],
                 cloaked: 0.03,
+                plain: false,
             },
             "small" => Profile {
                 name: name.into(),
@@ -73,6 +79,7 @@ impl Profile {
                 tags: 20,
                 big_binaries: vec![],
                 cloaked: 0.03,
+                plain: false,
             },
             "1g" => Profile {
                 name: name.into(),
@@ -83,6 +90,7 @@ impl Profile {
                 tags: 20,
                 big_binaries: vec![],
                 cloaked: 0.03,
+                plain: false,
             },
             "5g" => Profile {
                 name: name.into(),
@@ -93,12 +101,20 @@ impl Profile {
                 tags: 20,
                 big_binaries: vec![200 * mb, 260 * mb, 330 * mb, 400 * mb],
                 cloaked: 0.03,
+                plain: false,
             },
             other => return Err(anyhow!("unknown profile {other:?} (tiny, small, 1g, 5g)")),
         };
+        if cloaked && plain {
+            return Err(anyhow!("--cloaked and --plain exclude each other"));
+        }
         if cloaked {
             p.cloaked = 0.85;
             p.name = format!("cloaked-{}", p.name);
+        }
+        if plain {
+            p.cloaked = 0.0;
+            p.plain = true;
         }
         Ok(p)
     }
@@ -319,6 +335,9 @@ pub fn generate(p: &Profile, seed: u64, root: &Path, home: &Path, pack_every: us
 
     // ---- import --------------------------------------------------------
     let mut tip = repo.root_id();
+    // `main`'s first-parent line, oldest first (`mainline.txt`: the
+    // server phase can push the history along it in fast-forward steps).
+    let mut mainline: Vec<ObjectId> = Vec::new();
     let mut policy = String::new();
     {
         let ws = repo.ephemeral_workspace(tip)?;
@@ -326,7 +345,9 @@ pub fn generate(p: &Profile, seed: u64, root: &Path, home: &Path, pack_every: us
             policy = String::from_utf8_lossy(&existing).into_owned();
         }
     }
-    policy.push_str("\n# veil-bench\n*.env isolate\n");
+    if !p.plain {
+        policy.push_str("\n# veil-bench\n*.env isolate\n");
+    }
     for (d, s) in &layout.cloak_rules {
         policy.push_str(&format!("{d}/ cloak {s}\n"));
     }
@@ -343,6 +364,7 @@ pub fn generate(p: &Profile, seed: u64, root: &Path, home: &Path, pack_every: us
             live.by_path.insert(f.path.clone(), i);
         }
         tip = commit_ws(&mut repo, &ws, &format!("import part {}/{}", c + 1, chunks), &mut all)?;
+        mainline.push(tip);
     }
     log(&format!("import: {} files in {chunks} snapshots ({:.0} s)", import.len(), t0.elapsed().as_secs_f64()));
 
@@ -380,6 +402,7 @@ pub fn generate(p: &Profile, seed: u64, root: &Path, home: &Path, pack_every: us
                 tx.commit()?;
                 all.push(id);
                 tip = id;
+                mainline.push(tip);
                 merges += 1;
                 branch = None;
                 step += 1;
@@ -506,6 +529,7 @@ pub fn generate(p: &Profile, seed: u64, root: &Path, home: &Path, pack_every: us
             branch.as_mut().unwrap().0 = id;
         } else {
             tip = id;
+            mainline.push(tip);
             if step.is_multiple_of(tag_every) && tags.len() < p.tags {
                 let name = format!("rel-{:03}", tags.len() + 1);
                 repo.set_tag(&name, tip, None, false)?;
@@ -538,6 +562,7 @@ pub fn generate(p: &Profile, seed: u64, root: &Path, home: &Path, pack_every: us
             }
         }
         tip = commit_ws(&mut repo, &ws, "late files", &mut all)?;
+        mainline.push(tip);
     }
     repo.set_tag("main", tip, None, false)?;
 
@@ -555,26 +580,9 @@ pub fn generate(p: &Profile, seed: u64, root: &Path, home: &Path, pack_every: us
         rtip = commit_ws(&mut repo, &ws, &format!("release fix {k}"), &mut all)?;
     }
     repo.set_tag("release", rtip, None, false)?;
-    let fix_base = repo.create_workspace("fix-sec", vec![rtip], Some("team".into()))?;
-    all.push(fix_base);
-    let mut ftip = fix_base;
-    // The fix touches public files only: an embargo for `team` refuses a
-    // merge that changes files cloaked under another scope.
-    let public: Vec<String> = live
-        .text_paths()
-        .into_iter()
-        .filter(|p| !layout.cloak_rules.iter().any(|(d, _)| p.starts_with(&format!("{d}/"))))
-        .filter(|p| hot.contains(p))
-        .collect();
-    let public = if public.is_empty() { paths.clone() } else { public };
-    let fix_files: Vec<String> = (0..5).map(|_| rng.pick(&public).clone()).collect();
-    for k in 0..50u64 {
-        let ws = repo.ephemeral_workspace(ftip)?;
-        let path = &fix_files[k as usize % fix_files.len()];
-        let data = ws.read(path)?;
-        let ext = live.files[live.by_path[path]].ext;
-        ws.write(path, content::edit_text(&mut Rng::fork(seed, 950_000 + k), &data, ext, None))?;
-        ftip = commit_ws(&mut repo, &ws, &format!("embargoed fix step {k}"), &mut all)?;
+    let mut ftip = None;
+    if !p.plain {
+        ftip = Some(fix_line(&mut repo, &mut rng, seed, rtip, &hot, &live, &layout, &mut all)?);
     }
 
     // ---- manifest ------------------------------------------------------------
@@ -621,15 +629,46 @@ pub fn generate(p: &Profile, seed: u64, root: &Path, home: &Path, pack_every: us
         "cloak_rules": layout.cloak_rules.iter().map(|(d, s)| format!("{d}/ cloak {s}")).collect::<Vec<_>>(),
         "main": tip.hex(),
         "release": rtip.hex(),
-        "fix_tip": ftip.hex(),
+        "fix_tip": ftip.map(|f| f.hex()),
         "generate_seconds": t0.elapsed().as_secs_f64(),
         "pack_every": pack_every,
         "sample_paths": live.by_path.keys().step_by((live.by_path.len() / 200).max(1)).cloned().collect::<Vec<_>>(),
     });
     let dir = root.parent().unwrap_or(root);
     std::fs::write(dir.join("snapshots.txt"), snaps)?;
+    std::fs::write(dir.join("mainline.txt"), mainline.iter().map(|id| format!("{}\n", id.hex())).collect::<String>())?;
     std::fs::write(dir.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
     Ok(Generated { manifest })
+}
+
+/// The cloaked fix line: 50 snapshots in workspace `fix-sec` (scope
+/// `team`) on top of `release`, merged later under an embargo
+/// (`run::setup`). Its tip.
+#[allow(clippy::too_many_arguments)]
+fn fix_line(repo: &mut Repo, rng: &mut Rng, seed: u64, rtip: ObjectId, hot: &[String], live: &Live, layout: &Layout, all: &mut Vec<ObjectId>) -> Result<ObjectId> {
+    let paths = hot.to_vec();
+    let fix_base = repo.create_workspace("fix-sec", vec![rtip], Some("team".into()))?;
+    all.push(fix_base);
+    let mut ftip = fix_base;
+    // The fix touches public files only: an embargo for `team` refuses a
+    // merge that changes files cloaked under another scope.
+    let public: Vec<String> = live
+        .text_paths()
+        .into_iter()
+        .filter(|p| !layout.cloak_rules.iter().any(|(d, _)| p.starts_with(&format!("{d}/"))))
+        .filter(|p| hot.contains(p))
+        .collect();
+    let public = if public.is_empty() { paths.clone() } else { public };
+    let fix_files: Vec<String> = (0..5).map(|_| rng.pick(&public).clone()).collect();
+    for k in 0..50u64 {
+        let ws = repo.ephemeral_workspace(ftip)?;
+        let path = &fix_files[k as usize % fix_files.len()];
+        let data = ws.read(path)?;
+        let ext = live.files[live.by_path[path]].ext;
+        ws.write(path, content::edit_text(&mut Rng::fork(seed, 950_000 + k), &data, ext, None))?;
+        ftip = commit_ws(repo, &ws, &format!("embargoed fix step {k}"), all)?;
+    }
+    Ok(ftip)
 }
 
 #[cfg(test)]
@@ -638,7 +677,7 @@ mod tests {
 
     #[test]
     fn the_plan_is_deterministic_and_sized() {
-        let p = Profile::named("small", false).unwrap();
+        let p = Profile::named("small", false, false).unwrap();
         let a = plan(&p, 7);
         let b = plan(&p, 7);
         assert_eq!(a.files.len(), b.files.len());
@@ -653,9 +692,17 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_profile_has_nothing_the_server_refuses() {
+        let p = Profile::named("small", false, true).unwrap();
+        assert!(p.plain && p.cloaked == 0.0);
+        assert!(plan(&p, 3).cloak_rules.is_empty());
+        assert!(Profile::named("small", true, true).is_err(), "--cloaked and --plain exclude each other");
+    }
+
+    #[test]
     fn cloak_rules_cover_about_the_fraction() {
         for (cloaked, lo, hi) in [(false, 0.0, 0.08), (true, 0.70, 0.95)] {
-            let p = Profile::named("small", cloaked).unwrap();
+            let p = Profile::named("small", cloaked, false).unwrap();
             let l = plan(&p, 3);
             let n = l
                 .files
