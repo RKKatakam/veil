@@ -84,6 +84,21 @@ vl merge fix --into main --embargo-for security distro-partners --until 2026-12-
 - **An embargoed PR doesn't exist** for anyone outside its groups: no title, no count, no placeholder.
 - **The same check applies everywhere:** search, notifications, counts, the API, agents and CI.
 
+## What is encrypted: secrets only
+
+**The only thing Veil encrypts is secret files:** `.env`, `.env.*`, keys and similar files (owner, 2026-11-06, firmly). **Nothing else is encrypted:**
+- code, in any folder;
+- embargoed changes and hidden PRs;
+- change descriptions, tag and branch names, release notes;
+- agent attribution;
+- PRs, reviews and comments.
+
+All of that is plain text, protected by the server's permissions.
+
+**Not exceptions:** HTTPS (TLS) between `vl` and the server protects the network connection, and a device's own private key may be protected at rest by a passphrase or the OS keychain. Neither encrypts project data.
+
+**Older client code still encrypts more** (cloaked lines' descriptions, sealed tag annotations, encrypted embargoes, cloaked folders). The simplification pass removes all of it, leaving only secret files sealed.
+
 ## Veil always works through its server
 
 **Veil is server-centric, not Git and not offline-first** (owner, 2026-11-05).

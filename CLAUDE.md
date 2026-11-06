@@ -22,6 +22,7 @@ Veil automatically **encrypts secrets** (`.env`, keys), which follow the same pe
 ## Invariants (never break these)
 - Veil does not interoperate with Git (no import, export, sync, colocation, submodules, Git file formats or Git-format patches). Owner decision, 2026-11-05: permanent.
 - Private, secret and embargoed content never reaches public snapshots, public remotes, logs, JSON or error messages, and nobody receives a file they have no access to. Secrets are only ever stored encrypted. Personal private keys never leave the machine.
+- **Only secret files (`.env`, keys) are ever encrypted.** Never encrypt code, descriptions, tags, embargoes, PRs or attribution; they are plain text behind the server's permissions (`docs/VISIBILITY.md`, "What is encrypted").
 - Visibility labels are claims; objects are authority (`verify_sealing`).
 - Old repository formats stay readable. A format change bumps the version and adds a `vl upgrade` path.
 - **Veil is server-centric** (owner, 2026-11-05): the client is always connected to the Veil server, and the server enforces every permission. There is no offline mode and no plain-file remotes (SFTP); don't design for them. `veil-core` builds for WASM (the server's web client uses it): OS-only code goes behind `#[cfg(feature = "os")]`.
