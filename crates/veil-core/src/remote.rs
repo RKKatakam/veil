@@ -1740,6 +1740,7 @@ pub fn add_remote(repo: &mut Repo, name: &str, url: &str, public: bool) -> Resul
             crate::repo::RemoteConfig {
                 url: url.to_string(),
                 public,
+                only: None,
             },
         );
         Ok(())
@@ -3191,6 +3192,56 @@ pub fn pull_with(
     }
     sync_meta(remote.keys(), tx.repo().keys(), false, true, &mut report.warnings)?;
     tx.repo().keys().invalidate();
+    apply_remote_tags(&mut tx, remote_name, tags, Some(remote.store()), &mut report)?;
+    tx.commit()?;
+    Ok(report)
+}
+
+/// Objects received from the Veil server, written into a local store as a
+/// pull writes them: loose while few, then streamed into packs, each
+/// checked against what the store's repository format may hold. They are
+/// readable once [`Incoming::finish`] returns.
+pub struct Incoming<'a> {
+    store: &'a Arc<ObjectStore>,
+    sink: PackSink<'a>,
+    report: SyncReport,
+}
+
+impl<'a> Incoming<'a> {
+    pub fn new(store: &'a Arc<ObjectStore>) -> Incoming<'a> {
+        Incoming {
+            store,
+            sink: PackSink::new(store, store.pack_dir(), Some(&**store), 256),
+            report: SyncReport::default(),
+        }
+    }
+
+    /// Write object `id` (already checked against its id) found at `path`.
+    pub fn put(&mut self, id: ObjectId, raw: Vec<u8>, path: &str) -> Result<bool> {
+        self.sink.put(id, raw, path)
+    }
+
+    /// Publish what was written; returns the packs written.
+    pub fn finish(mut self) -> Result<usize> {
+        self.sink.finish(&mut self.report)?;
+        self.store.reload_packs()?;
+        Ok(self.report.packs_written)
+    }
+}
+
+/// Record a remote's tags after their objects are in the local store
+/// (the second half of [`pull_with`]): set `<remote>/<tag>`, prune remote
+/// tags the remote no longer has, and create or fast-forward local tags,
+/// with every check a pull makes (names, targets, shadowing, release
+/// tags, divergence). `remote_store`: where annotated tag objects are
+/// read from (`None`: the remote has none, as the Veil server in S1).
+pub fn apply_remote_tags(
+    tx: &mut crate::transaction::Transaction<'_>,
+    remote_name: &str,
+    tags: Vec<(String, Tag)>,
+    remote_store: Option<&ObjectStore>,
+    report: &mut SyncReport,
+) -> Result<()> {
     // Change and snapshot ids a new local tag must not shadow: those of
     // local history and of everything this pull brings in (a teammate's
     // change, tagged after its id by someone else, BUG-105).
@@ -3253,7 +3304,10 @@ pub fn pull_with(
             continue;
         }
         // Its annotation (format 5), checked against the tag.
-        tag.annotation = fetch_annotation(tx.repo().store(), remote.store(), &name, &tag, &mut report.warnings)?;
+        tag.annotation = match remote_store {
+            Some(remote) => fetch_annotation(tx.repo().store(), remote, &name, &tag, &mut report.warnings)?,
+            None => None,
+        };
         tx.view.remote_tags.insert(format!("{remote_name}/{name}"), tag.target);
         match tx.view.tags.get(&name).cloned() {
             None if stay_deleted.contains(&name) => report.tags_kept_deleted.push(name),
@@ -3311,8 +3365,7 @@ pub fn pull_with(
             }
         }
     }
-    tx.commit()?;
-    Ok(report)
+    Ok(())
 }
 
 /// Fetch what the remote's tags reach and the local committed view
