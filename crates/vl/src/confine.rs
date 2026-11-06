@@ -819,11 +819,45 @@ pub fn doctor(root: Option<&Path>) -> Vec<(bool, String, Vec<String>)> {
 // ---- running ---------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
-pub use run::run;
+pub use run::{run, stop_leftovers};
 
 #[cfg(not(target_os = "linux"))]
 pub fn run(_: &Confine, _: &Path, _: &[String], _: &[(&str, OsString)]) -> Result<i32> {
     bail!("confinement is only built for Linux")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn stop_leftovers(_: &Path) {}
+
+/// Stop and clear the `veil-exec-<pid>-*` scopes of `vl` processes that
+/// are gone (BUG-852): `systemd-run` killed while systemd starts its scope
+/// can leave it active, empty, or failed. Best effort, each call within
+/// [`SYSTEMD_WAIT`]; nothing without a systemd user manager.
+pub fn clear_dead_scopes() {
+    if !BUILT {
+        return;
+    }
+    let Some(ctl) = find_program("systemctl", None) else { return };
+    let mut c = std::process::Command::new(&ctl);
+    c.args(["--user", "list-units", "--all", "--plain", "--no-legend", "--full", "veil-exec-*"]);
+    let Some(out) = output_within(&mut c, SYSTEMD_WAIT) else { return };
+    let dead: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|u| {
+            let pid = u.strip_prefix("veil-exec-").and_then(|r| r.split('-').next()).and_then(|p| p.parse::<u32>().ok());
+            pid.is_some_and(|p| p != std::process::id() && veil_core::lock::process_alive(p) == Some(false))
+        })
+        .map(str::to_string)
+        .collect();
+    if dead.is_empty() {
+        return;
+    }
+    for verb in [&["kill", "--signal=SIGKILL"][..], &["stop"], &["reset-failed"]] {
+        let mut c = std::process::Command::new(&ctl);
+        c.arg("--user").args(verb).args(&dead);
+        let _ = output_within(&mut c, SYSTEMD_WAIT);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1024,6 +1058,52 @@ mod run {
             }
         }
         None
+    }
+
+    /// Does `cmdline` (`/proc/<pid>/cmdline`) start a confined run of
+    /// `sandbox` (`want`: its canonical path)? Our `bwrap` (or the
+    /// `systemd-run` that execs it) binds it read-write, and only it.
+    fn runs_sandbox(cmdline: &[u8], sandbox: &Path, want: Option<&Path>) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        let args: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
+        let ours = ["--die-with-parent", "--unshare-pid"].iter().all(|f| args.contains(&f.as_bytes()));
+        ours && args.windows(2).any(|w| {
+            let at = Path::new(std::ffi::OsStr::from_bytes(w[1]));
+            w[0] == b"--bind" && (at == sandbox || want.is_some_and(|c| at.canonicalize().is_ok_and(|a| a == c)))
+        })
+    }
+
+    /// Stop every process still running a confined run of `sandbox`, for a
+    /// `vl` that died (BUG-852). Its parent-death signal kills `bwrap`, and
+    /// `--die-with-parent` the sandbox's init, but only once that init has
+    /// armed it: `vl` killed in the moment between leaves the init, and so
+    /// the command, running. Killing the init ends its pid namespace,
+    /// everything in it included. Callers make sure no live run can be
+    /// starting the sandbox (its lock, or a dead owner's throwaway
+    /// directory). Until none is left, or five seconds.
+    pub fn stop_leftovers(sandbox: &Path) {
+        let want = sandbox.canonicalize().ok();
+        let me = std::process::id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut found = false;
+            let Ok(procs) = std::fs::read_dir("/proc") else { return };
+            for e in procs.flatten() {
+                let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) else { continue };
+                let cmdline = |pid: i32| std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+                if pid as u32 == me || !runs_sandbox(&cmdline(pid), sandbox, want.as_deref()) {
+                    continue;
+                }
+                // Pinned first, then checked again: never a reused pid.
+                if let Some(p) = Pinned::open(pid).filter(|_| runs_sandbox(&cmdline(pid), sandbox, want.as_deref())) {
+                    found |= p.signal(libc::SIGKILL);
+                }
+            }
+            if !found || Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// What the sandbox's processes use, from `/proc`.
