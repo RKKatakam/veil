@@ -415,6 +415,164 @@ scripts/bench-server.sh openscion -- --files 10000 --runs 9
 
 Raw results (not committed): `.scratch/bench-results/server-openscion-bfa691a-20261106T202008Z*` and `…T202658Z*`.
 
+## Performance round 3: commit one changed file (2026-11-07)
+
+**Goal** (orchestrator): `vl commit` of one changed file faster than Git
+on the same machine, at 1k and 10k files, with full durability (no
+lowering of any crash-safety guarantee). **Not met:** 1.4× (1k) and 1.8×
+(10k) faster than `integration` @ `1b39297`, but still 1.9× (1k) and 2.3× (10k)
+slower than Git, which makes no `fsync` here.
+
+**Method.** `scripts/bench-server.sh openscion` (release builds, the bench
+directory in the worktree's `.scratch/` on the ext4 NVMe disk, PostgreSQL
+and MinIO in Docker, median of 5, Git 2.53 beside each Veil run), once on
+this round's code and once on `integration` @ `1b39297` (exported with
+`git archive`), minutes apart. The machine was loaded by other agents
+(load average 17 to 60 on 32 threads), so each run's Git column is the
+reference for that run. While iterating, an interleaved harness
+(`.scratch/`, not committed) timed the base build, the new build and Git
+commit by commit, with each process's CPU time.
+
+| Files | Workload | Base (ms) | This round (ms) | Git (ms) | Target (ms) | Meets target | Beats Git |
+|---:|---|---:|---:|---:|---:|---|---|
+| 1000 | import a directory | 51.8 | 50.4 | 98.6 / 106.4 | 22.0 | no | yes |
+| 1000 | clone everything (server) | 158.1 | 140.8 | 228.9 / 180.9 | 51.0 | no | yes |
+| 1000 | **commit one changed file** | 21.8 | **15.3** | 12.0 / 8.2 | 2.5 | no | **no** |
+| 1000 | clone one directory (server) | 63.4 | 58.2 | 50.4 / 60.3 | 6.1 | no | no / yes |
+| 10000 | import a directory | 298.4 | 303.5 | 928.5 / 947.4 | 245.0 | no | yes |
+| 10000 | clone everything (server) | 483.1 | 442.5 | 778.3 / 595.3 | 544.0 | yes | yes |
+| 10000 | **commit one changed file** | 39.7 | **22.3** | 9.2 / 9.9 | 22.0 | no (0.3 over) | **no** |
+| 10000 | clone one directory (server) | 59.3 | 46.5 | 53.8 / 60.5 | 25.0 | no | no / yes |
+
+(Git: base run / this round's run.) In one process, in memory, commit one
+file: 1.11 → 1.03 ms (1k), 13.3 → 8.8 ms (10k). The interleaved harness,
+commit by commit at load 31: 1k 21.7 → 10.9 ms (Git 5.9), 10k 42.9 →
+22.0 ms (Git 9.6). Nothing else got slower beyond the runs' noise.
+
+### Where the time went (phase marks in an instrumented build, ms)
+
+| Commit one file, 1k / 10k | Before | After |
+|---|---:|---:|
+| arguments | 0.5 / 0.5 | 0.5 / 0.5 |
+| `Repo::open` | 0.5 / 1.1 | 0.55 / 1.1 |
+| stat cache load (10k: 940 KB, 10,000 records) | 0.4 / 1.7–2.9 | overlapped (another thread); waits 0 / 1.8 under load |
+| policy (the built-in rules' glob set compiled) | 0.85 / 0.9 | 0.35–0.4 (compiled on another thread) |
+| builder setup (`CacheKey`: the key rings verified, 0.45) | 0.5 / 0.5 | 0.4–0.75 / 0.5 |
+| walk of the working copy | 4.9 / 22–26 | 1.8–2.2 / 11–14 |
+| of which: the changed file's scan, waiting for the scanner's rules | 3.5 / 3.5 | 0.1 / 0.1 |
+| of which: stat of every file | 1.5 / 8.4 | in the listing, on other threads |
+| of which: classification | 0.7 / 2.8–4.6 | on other threads |
+| `commit_in` | 0.4 / 0.5 | 0.3–0.5 |
+| transaction: objects (barriers 1 and 2) | 1.7 / 2.4 | 1.5–2.2 |
+| transaction: operation and head | 1.6 / 1.5 | 0.9–1.0 (barriers 3 and 4) |
+| `checkout.json` (two fsyncs), finish | 0.9 / 0.9 | 0.9–1.3 |
+| `fsync` calls (`strace -c -f`, 10k) | 29 | 17 |
+| `fsync`s in sequence | about 25 | 6 (4 in the transaction, 2 for `checkout.json`) |
+
+### What changed
+
+1. **The scanner compiles its token rules only for text that could hold a
+   token** (`secrets.rs`): every match of a token rule contains one of its
+   literals (`TOKEN_LITERALS`: `AKIA`, `ghp_`, `sk-`, `://`, …), so text
+   holding none is not searched for tokens. A test parses every rule's
+   pattern (`regex-syntax`, a dev-dependency already in the tree through
+   `regex`) and checks that each prefix it allows holds a literal of that
+   rule; a mutated literal fails it. A second test compares the search
+   with and without the check on 20,000 random texts built from literals,
+   near misses and real tokens. The keyword finder (Aho-Corasick) no
+   longer forces the rules' compilation. The changed file's scan: 3.5 →
+   0.1 ms. Text with a literal (a URL in a comment) still compiles the
+   rules, on the thread `secrets::prepare` starts.
+2. **Every file is stat'ed beside its listing**, relative to the open
+   directory (`DirListing::stats`, `std::fs::DirEntry::metadata`: one
+   name to look up, not eleven path components): 12.8 → 9.6 ms for 10,000
+   files on this machine.
+3. **Directories are listed ahead of the walk** (`prefetch.rs`): on a disk,
+   one thread per 250 files the stat cache counted, up to 7, list the
+   directories breadth first, stat their files, classify them against the
+   policy (a pure function of the policy and the path) and load their
+   trees from the parent snapshot. The walk takes a ready listing, waits
+   for one being made, or lists the directory itself; the workers start
+   after the cache run's clock reading and never descend where the walk
+   does not. What the walk decides is unchanged.
+4. **One durability chain of four barriers** (`transaction.rs`,
+   `store.rs`, `oplog.rs`): the operation's bytes and its empty head file
+   are staged in the transaction's directory with its objects, so the
+   objects' barrier makes them durable too; then the objects' names, a
+   barrier, the operation's name, a barrier, the head's name, a barrier.
+   Staging directories are never synced (`stage_unsynced`,
+   `publish_unsynced`: nothing ever names a file in them), and a barrier
+   of names alone syncs its directories on a thread each (they are dirty,
+   so their journal commits are shared). About twenty fsyncs in sequence
+   became four.
+5. **Stat-cache hits move their record** into the next run instead of
+   copying it with its path; the walk keeps no set of the names it saw (a
+   directory's entries are sorted: a binary search answers).
+6. **`vl` compiles the policy's built-in rules, and reads the stat cache,
+   on other threads** while it opens the repository (`policy::prepare`,
+   `Ctx::open`).
+
+### Crash safety
+
+The order of durable names did not change, only how many barriers carry
+it: an object is named after its content is durable; an operation after
+every object it names; a head after its operation; `checkout.json` after
+the head (it is written as before). Proved by the crash harness
+(`core_durability`):
+
+- every sweep (`crash.rs`: every mutation of every operation, in three
+  crash modes) passes, including a new sweep of `vl commit`'s
+  one-operation transaction (`crash_during_one_operation_commit`; none
+  existed, BUG-906);
+- the harness now models the disk more harshly (BUG-905): at a power loss
+  it drops the names of staged files whether a barrier covered their
+  content or not, and keeps the unsynced renames into every other
+  directory (by first appearance) instead of undoing all of them together;
+  removing the barrier between naming the operation and naming the head
+  makes `crash_during_snapshot` and `crash_during_one_operation_commit`
+  fail;
+- `durability::transactions_sync_objects_once_before_the_operation` checks
+  the whole sequence (staged contents, barrier, object names, barrier,
+  operation name, barrier, head name, barrier) on memory and on a real
+  disk; the gc and op-log races (`gc_concurrency`, `oplog_adversarial`)
+  pause at the head's new rename.
+
+### The 1 GB profile's memory gate
+
+`scripts/bench-server.sh 1g` on this round's code and on the base, the
+same evening (512 MiB a case, the client's peak RSS, base → this round).
+**The gate's outcome did not move:** the same three cases are over it as
+before (BUG-857/858/859: push of everything 2,412 → 2,438, push in steps
+868 → 882, full clone 904 → 938 MiB, none on this round's paths), and
+every other case passes. Checkout 397 → 387, pulls 141 → 135 and 77 → 81,
+status 77 → 79, one-directory clone 89 → 95 MiB. **The gc cases rose by
+7–20 MiB** (238 → 257, 198 → 218, 199 → 215, 68 → 75): `vl gc` first
+records the working copy (35,000 files), whose listings, stats and trees
+the prefetch workers allocate in their own allocator arenas, which keep
+that memory after the snapshot. The base's timings are not comparable:
+its run overlapped this round's load tests.
+
+### What remains, and why
+
+- **The walk is about 1 µs a file on one thread** at 10,000 files (11–14
+  ms under load): the stat cache's lookups and moves (≈ 0.35 µs, bound by
+  memory and hashing), the walk's own bookkeeping, and each directory's
+  tree. Git's index makes the same comparison in place. Building
+  subtrees on several threads (one builder each, their reports and cache
+  runs merged in order) would take most of it off the critical path; it
+  is a restructuring of `builder.rs`, left for after the simplification
+  pass removes its sealing paths.
+- **Fixed costs of about 3 ms at either size:** arguments (clap) 0.5,
+  `Repo::open` 0.5–1.1, the key rings verified for the stat cache's key
+  (`statcache::key_state`, 0.45; key handling, an owner decision),
+  `commit_in` 0.3–0.5, the policy 0.35.
+- **The durability floor:** six barriers in sequence (four in the
+  transaction, then `checkout.json`'s file and directory), 0.4–0.6 ms
+  each under load, about 3 ms; Git makes none. The checkout record's
+  content could join the transaction's first barrier (one fewer); the
+  chain itself cannot shrink without a format change: each name must wait
+  for what it depends on.
+
 ## Next
 
 1. **Clone one directory** (Git's level, not below): the ~60 sequential
@@ -424,7 +582,8 @@ Raw results (not committed): `.scratch/bench-results/server-openscion-bfa691a-20
 2. **Path walks:** about 11 `openat` per file remain in a checkout (each
    step walks from the root without following links); one directory
    descriptor per directory for all of checkout's steps would remove most.
-3. **Commit one changed file** (one transaction now): the scan and the
-   transaction's journal commits; Git makes no fsync.
+3. **Commit one changed file** (round 3: 15 / 22 ms against Git's 8–10):
+   the walk on several threads, the fixed costs and the checkout record
+   (round 3, "What remains").
 4. **Server:** permission lookups cached per person and folder, fewer
    commits per landing, then batched landing (`LOAD.md`).
