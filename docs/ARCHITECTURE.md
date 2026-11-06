@@ -79,7 +79,11 @@ must not be trusted (which disables stat caching):
   fsync of the directory; see §9) and never follows a symlink. Checkout
   instead stages each file (`write_staged`: a temp file beside it,
   unsynced), makes them all durable with one barrier, renames them into
-  place, and makes the names durable with a second (BUG-818). A link is a
+  place, and makes the names durable with a second (BUG-818). Files up
+  to 256 KiB are read and staged on up to 8 threads (larger ones one at a
+  time: memory stays bounded), and renamed into place on as many; a
+  barrier fsyncs on up to 256 threads, so that ext4 commits them in a few
+  journal transactions (performance round 2). A link is a
   leaf of its own: `NodeKind::Symlink` in `metadata` and listings, its
   target from `read_link`, created atomically by `write_link` (`symlinkat`
   to a temp name, `renameat`); `read` never reads through one. A path below
@@ -1706,6 +1710,15 @@ A workspace is only a named pointer in the view. It owns no directory.
   content. The builder also consults it (`BuildOptions::materialised`): a
   file that was never materialised is never recorded as deleted. The
   clone-then-grant onboarding flow depends on this.
+* **`vl commit` is one operation.** It records the project directory and
+  commits it in one transaction (`SnapshotOptions::commit`,
+  `commands::commit_in`, `Ctx::commit`): one op-log entry, half the
+  journal commits of a snapshot followed by a commit. `vl undo` takes back
+  both (the edits the commit recorded leave `@` and the directory; `vl
+  redo` brings them back). With pre-commit or commit-msg hooks the
+  directory is recorded first (the hooks read `VEIL_SNAPSHOT`), as its own
+  automatic snapshot; a stale directory's recovery is also its own
+  operation.
 * **Commands that edit the working copy are operations of their own.**
   `vl expose`, `cloak`, `isolate`, `ignore` and `restore` write files and
   record the result under their own operation description, not as the
@@ -3055,9 +3068,12 @@ only make a walk longer. The index is a device-local cache in
 - **Never required:** an entry not on disk is computed from the store on
   first use and persisted at the next commit (or once 256 have
   accumulated). A damaged or unreadable index is dropped and computed again.
-- **Concurrency:** layers are created with `create_new`, one slot each, and
+- **Concurrency:** layers are created with `create_new_unsynced` (as
+  exclusive as `create_new`, and never synced: a cache), one slot each, and
   merged geometrically (what the rule merges in several steps is written
-  as one layer); concurrent appenders never overwrite one another.
+  as one layer); concurrent appenders never overwrite one another. A layer
+  a power loss tore (missing, empty, half written) fails its checksum and
+  the index is rebuilt (`crash::a_power_loss_tears_history_index_layers_and_they_are_rebuilt`).
   Remotes (bare repositories, SFTP) compute it in memory only.
 - **A parent that arrives later** (the fix of a released embargo, pulled
   into a public clone) could carry a larger generation than its indexed

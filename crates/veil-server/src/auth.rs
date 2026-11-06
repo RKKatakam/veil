@@ -144,111 +144,37 @@ pub async fn login(State(hub): State<HubState>, headers: HeaderMap, Json(req): J
         return Err(Error::bad_request("the public identity does not belong to this key, or has no binding"));
     }
     let public_identity = req.identity.clone();
+    let fingerprint = veil_core::hub::wire::device_fingerprint(&ident).unwrap_or_default();
     let key = req.key.clone();
     let name = req.name.clone();
+    let token = hex::encode(veil_core::crypto::random_bytes::<32>());
+    let expires_at = now + hub.session_ttl_ms;
+    let session = token_hash(&token);
+    // The session is written in the same transaction as the device: a
+    // request that committed is never run again (`db::retry_requests`),
+    // and its challenge is spent.
     let outcome = crate::db::serializable(&hub.db, move |c| {
         let key = key.clone();
         let name = name.clone();
         let public_identity = public_identity.clone();
+        let fingerprint = fingerprint.clone();
+        let session = session.clone();
         Box::pin(async move {
-            let row: Option<(i64, i64, String, bool)> = sqlx::query_as(
-                "SELECT d.id, p.id, p.name, d.pending FROM devices d JOIN people p ON p.id = d.person_id \
-                 WHERE d.signing_key = $1 AND d.removed_at IS NULL",
-            )
-            .bind(&key)
-            .fetch_optional(&mut *c)
-            .await?;
-            if let Some((device, person, name, pending)) = row {
-                if pending {
-                    // Signing in again renews the wait.
-                    sqlx::query("UPDATE devices SET created_at = $1 WHERE id = $2").bind(veil_core::now_millis()).bind(device).execute(&mut *c).await?;
-                    return Ok(Err(name));
-                }
-                return Ok(Ok((device, person, name)));
-            }
-            let Some(name) = name else {
-                return Err(Error::unauthorized("this device is not registered; sign up with a name (`vl login URL --name NAME`)"));
-            };
-            if !veil_core::policy::valid_principal_name(&name) {
-                return Err(Error::bad_request(
-                    "a name is 1 to 64 lowercase letters, digits, '-', '_' or '.', and not a tier word",
-                ));
-            }
-            let now = veil_core::now_millis();
-            let taken: Option<i64> = sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(&name).fetch_optional(&mut *c).await?;
-            if let Some(person) = taken {
-                // One of their devices may vouch for it; until then it is
-                // nothing (no session, its signatures not accepted). Only
-                // expired pending devices are removed: one still waiting is
-                // kept however many others are made under the name (§13.12).
-                sqlx::query(
-                    "DELETE FROM devices d WHERE d.person_id = $1 AND d.pending AND d.created_at < $2 \
-                     AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.device_id = d.id) \
-                     AND NOT EXISTS (SELECT 1 FROM device_vouches v WHERE v.device_id = d.id) \
-                     AND NOT EXISTS (SELECT 1 FROM invites i WHERE i.device_id = d.id)",
-                )
-                .bind(person)
-                .bind(now - PENDING_TTL_MS)
-                .execute(&mut *c)
-                .await?;
-                // At most PENDING_PER_PERSON: the oldest go, never one the
-                // person is waiting for.
-                sqlx::query(
-                    "DELETE FROM devices WHERE id IN (SELECT d.id FROM devices d WHERE d.person_id = $1 AND d.pending \
-                     AND NOT EXISTS (SELECT 1 FROM device_expected e WHERE e.person_id = d.person_id AND e.fingerprint = d.fingerprint \
-                     AND e.expires_at > $2) \
-                     AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.device_id = d.id) \
-                     AND NOT EXISTS (SELECT 1 FROM device_vouches v WHERE v.device_id = d.id) \
-                     AND NOT EXISTS (SELECT 1 FROM invites i WHERE i.device_id = d.id) \
-                     ORDER BY d.created_at DESC, d.id DESC OFFSET $3)",
-                )
-                .bind(person)
-                .bind(now)
-                .bind(PENDING_PER_PERSON - 1)
-                .execute(&mut *c)
-                .await?;
-                let fingerprint = veil_core::hub::wire::device_fingerprint(&ident).unwrap_or_default();
-                sqlx::query(
-                    "INSERT INTO devices (person_id, signing_key, public_identity, created_at, pending, fingerprint) \
-                     VALUES ($1, $2, $3, $4, TRUE, $5)",
-                )
-                .bind(person)
-                .bind(&key)
-                .bind(&public_identity)
-                .bind(now)
-                .bind(fingerprint)
-                .execute(&mut *c)
-                .await?;
-                return Ok(Err(name));
-            }
-            let person: i64 = sqlx::query_scalar("INSERT INTO people (name, created_at) VALUES ($1, $2) RETURNING id")
-                .bind(&name)
-                .bind(now)
-                .fetch_one(&mut *c)
-                .await?;
-            let device: i64 = sqlx::query_scalar(
-                "INSERT INTO devices (person_id, signing_key, public_identity, created_at) VALUES ($1, $2, $3, $4) RETURNING id",
-            )
+            let found = signed_in(&mut *c, &key, name, &public_identity, &fingerprint).await?;
+            if let Ok((device, person, _)) = &found {
+                sqlx::query("INSERT INTO sessions (token_hash, device_id, person_id, expires_at) VALUES ($1, $2, $3, $4)")
+                    .bind(&session)
+                    .bind(device)
                     .bind(person)
-                    .bind(&key)
-                    .bind(&public_identity)
-                    .bind(now)
-                    .fetch_one(&mut *c)
+                    .bind(expires_at)
+                    .execute(&mut *c)
                     .await?;
-            Ok(Ok((device, person, name)))
+            }
+            Ok(found)
         })
     })
     .await?;
     let (device, person, person_name) = outcome.map_err(|name| pending(&name))?;
-    let token = hex::encode(veil_core::crypto::random_bytes::<32>());
-    let expires_at = now + hub.session_ttl_ms;
-    sqlx::query("INSERT INTO sessions (token_hash, device_id, person_id, expires_at) VALUES ($1, $2, $3, $4)")
-        .bind(token_hash(&token))
-        .bind(device)
-        .bind(person)
-        .bind(expires_at)
-        .execute(&hub.db)
-        .await?;
     crate::audit(&hub.db, None, Some(person), "login", &format!("device {device}")).await;
     Ok(Json(Session {
         token,
@@ -256,6 +182,100 @@ pub async fn login(State(hub): State<HubState>, headers: HeaderMap, Json(req): J
         expires_at,
         hub_key: hub.identity.verifying_hex(),
     }))
+}
+
+/// The device signing in with `key` (registering `name` for a new person,
+/// or a pending device of an existing one): `Ok((device, person, name))`,
+/// or `Err(name)` for a device still waiting to be confirmed.
+async fn signed_in(
+    c: &mut sqlx::PgConnection,
+    key: &str,
+    name: Option<String>,
+    public_identity: &str,
+    fingerprint: &str,
+) -> Result<Result<(i64, i64, String), String>> {
+    let row: Option<(i64, i64, String, bool)> = sqlx::query_as(
+        "SELECT d.id, p.id, p.name, d.pending FROM devices d JOIN people p ON p.id = d.person_id \
+         WHERE d.signing_key = $1 AND d.removed_at IS NULL",
+    )
+    .bind(key)
+    .fetch_optional(&mut *c)
+    .await?;
+    if let Some((device, person, name, pending)) = row {
+        if pending {
+            // Signing in again renews the wait.
+            sqlx::query("UPDATE devices SET created_at = $1 WHERE id = $2").bind(veil_core::now_millis()).bind(device).execute(&mut *c).await?;
+            return Ok(Err(name));
+        }
+        return Ok(Ok((device, person, name)));
+    }
+    let Some(name) = name else {
+        return Err(Error::unauthorized("this device is not registered; sign up with a name (`vl login URL --name NAME`)"));
+    };
+    if !veil_core::policy::valid_principal_name(&name) {
+        return Err(Error::bad_request(
+            "a name is 1 to 64 lowercase letters, digits, '-', '_' or '.', and not a tier word",
+        ));
+    }
+    let now = veil_core::now_millis();
+    let taken: Option<i64> = sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(&name).fetch_optional(&mut *c).await?;
+    if let Some(person) = taken {
+        // One of their devices may vouch for it; until then it is nothing
+        // (no session, its signatures not accepted). Expired pending
+        // devices go; then at most PENDING_PER_PERSON stay, the oldest
+        // pushed out, never one the person is waiting for (§13.12).
+        sqlx::query(
+            "DELETE FROM devices d WHERE d.person_id = $1 AND d.pending AND d.created_at < $2 \
+             AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.device_id = d.id) \
+             AND NOT EXISTS (SELECT 1 FROM device_vouches v WHERE v.device_id = d.id) \
+             AND NOT EXISTS (SELECT 1 FROM invites i WHERE i.device_id = d.id)",
+        )
+        .bind(person)
+        .bind(now - PENDING_TTL_MS)
+        .execute(&mut *c)
+        .await?;
+        sqlx::query(
+            "DELETE FROM devices WHERE id IN (SELECT d.id FROM devices d WHERE d.person_id = $1 AND d.pending \
+             AND NOT EXISTS (SELECT 1 FROM device_expected e WHERE e.person_id = d.person_id AND e.fingerprint = d.fingerprint \
+             AND e.expires_at > $2) \
+             AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.device_id = d.id) \
+             AND NOT EXISTS (SELECT 1 FROM device_vouches v WHERE v.device_id = d.id) \
+             AND NOT EXISTS (SELECT 1 FROM invites i WHERE i.device_id = d.id) \
+             ORDER BY d.created_at DESC, d.id DESC OFFSET $3)",
+        )
+        .bind(person)
+        .bind(now)
+        .bind(PENDING_PER_PERSON - 1)
+        .execute(&mut *c)
+        .await?;
+        sqlx::query(
+            "INSERT INTO devices (person_id, signing_key, public_identity, created_at, pending, fingerprint) \
+             VALUES ($1, $2, $3, $4, TRUE, $5)",
+        )
+        .bind(person)
+        .bind(key)
+        .bind(public_identity)
+        .bind(now)
+        .bind(fingerprint)
+        .execute(&mut *c)
+        .await?;
+        return Ok(Err(name));
+    }
+    let person: i64 = sqlx::query_scalar("INSERT INTO people (name, created_at) VALUES ($1, $2) RETURNING id")
+        .bind(&name)
+        .bind(now)
+        .fetch_one(&mut *c)
+        .await?;
+    let device: i64 = sqlx::query_scalar(
+        "INSERT INTO devices (person_id, signing_key, public_identity, created_at) VALUES ($1, $2, $3, $4) RETURNING id",
+    )
+    .bind(person)
+    .bind(key)
+    .bind(public_identity)
+    .bind(now)
+    .fetch_one(&mut *c)
+    .await?;
+    Ok(Ok((device, person, name)))
 }
 
 impl FromRequestParts<HubState> for Caller {

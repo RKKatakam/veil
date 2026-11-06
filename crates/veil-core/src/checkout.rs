@@ -821,6 +821,7 @@ fn apply_changes(
         }
         prune_empty_parents(fs, &c.path)?;
     }
+    let mut jobs: Vec<Job<'_>> = Vec::new();
     for c in changes {
         let Some(new) = &c.new else { continue };
         // VCS metadata a snapshot made before it was ignored (`.git/`) is
@@ -893,6 +894,7 @@ fn apply_changes(
         if !local_edit
             && !conversion.writes_crlf()
             && new.fallback.is_none()
+            && fs.clones()
             && store.entry_readable(new)
             && fs.clone_known(&c.path, &new.id)?
         {
@@ -906,74 +908,74 @@ fn apply_changes(
             report.written += 1;
             continue;
         }
-        match read_materialised(store, new) {
-            Ok((data, via_fallback)) => {
-                // Line endings for the working copy (`eol=crlf`), on the
-                // bytes as read: a conflict's markers too, a fallback too.
-                let (data, crlf) = match to_worktree(&data, conversion) {
-                    Some(d) => (d, true),
-                    None => (data, false),
-                };
-                if local_edit {
-                    // Already what we want? Then there is nothing to protect.
-                    if fs.read(&c.path).map_or(true, |d| d != data) {
-                        report.kept_local.push(c.path.clone());
-                        continue;
-                    }
-                }
-                let executable = match new.kind {
-                    EntryKind::Conflict => crate::conflict::inspect_entry(store, new, crate::conflict::Audience::Reader)?.executable,
-                    _ => new.executable,
-                };
-                // The mode is set on the staged copy, so the barrier makes
-                // it durable with the content.
-                let staged = fs.write_staged(&c.path, &data).and_then(|at| match fs.set_executable(&at, executable) {
-                    Ok(()) => Ok(at),
-                    Err(e) => {
-                        if at != c.path {
-                            let _ = fs.remove_file(&at);
-                        }
-                        Err(e)
-                    }
-                });
-                forget(&mut cache, &c.path);
-                let replaces = c.old.is_some() && !local_edit;
-                match staged {
-                    Ok(at) => staging.files.push(Staged {
-                        at,
-                        path: c.path.clone(),
-                        replaces,
-                        crlf,
-                        fallback: via_fallback,
-                    }),
-                    Err(e) => {
-                        drop_previous_version(fs, &c.path, replaces)?;
-                        per_file(&mut report, &c.path, e)?;
-                    }
+        jobs.push(Job {
+            change: c,
+            entry: new.clone(),
+            conversion,
+            local_edit,
+            had_file: current.is_some_and(|m| m.kind == NodeKind::File),
+        });
+    }
+    // Read and stage the small files on several threads (BUG-818's
+    // barrier then makes them durable at once), the large ones here, one
+    // at a time as before: memory stays bounded (the 1 GB profile's
+    // checkout reached 593 MiB with every file on 16 threads). Then take
+    // the outcomes in order.
+    let small = |j: &Job<'_>| j.entry.size <= PARALLEL_FILE_MAX;
+    let small_jobs: Vec<&Job<'_>> = jobs.iter().filter(|j| small(j)).collect();
+    let mut parallel = parallel_map(&small_jobs, |j| stage_one(store, fs, j)).into_iter();
+    let outcomes: Vec<Staging1> = jobs
+        .iter()
+        .map(|j| match small(j) {
+            true => parallel.next().expect("one outcome per small file"),
+            false => stage_one(store, fs, j),
+        })
+        .collect();
+    let mut fatal = None;
+    for (j, outcome) in jobs.iter().zip(outcomes) {
+        let path = &j.change.path;
+        match outcome {
+            Staging1::Staged(s) => {
+                forget(&mut cache, path);
+                staging.files.push(s);
+            }
+            Staging1::KeptLocal => report.kept_local.push(path.clone()),
+            Staging1::Failed(e) => {
+                forget(&mut cache, path);
+                drop_previous_version(fs, path, j.change.old.is_some() && !j.local_edit)?;
+                if let Err(e) = per_file(&mut report, path, e) {
+                    fatal.get_or_insert(e);
                 }
             }
-            Err(e) if e.is_unreadable() => {
+            Staging1::Unreadable => {
                 // Never leave a stale readable version where hidden content
                 // now lives, or the next snapshot would "revert" it. A local
                 // edit there is kept (the builder carries the hidden entry).
-                if c.old.is_some() && current.is_some_and(|m| m.kind == NodeKind::File) {
-                    if local_edit {
-                        report.kept_local.push(c.path.clone());
+                if j.change.old.is_some() && j.had_file {
+                    if j.local_edit {
+                        report.kept_local.push(path.clone());
                     } else {
-                        fs.remove_file(&c.path)?;
-                        sync_parent_later(fs, &c.path)?;
-                        forget(&mut cache, &c.path);
+                        fs.remove_file(path)?;
+                        sync_parent_later(fs, path)?;
+                        forget(&mut cache, path);
                         report.removed += 1;
-                        prune_empty_parents(fs, &c.path)?;
+                        prune_empty_parents(fs, path)?;
                     }
                 }
-                report.redacted.push(c.path.clone());
+                report.redacted.push(path.clone());
             }
-            Err(e) => return Err(e),
+            Staging1::Fatal(e) => {
+                fatal.get_or_insert(e);
+            }
         }
+    }
+    // Dropped with `staging`, what was staged is removed.
+    if let Some(e) = fatal {
+        return Err(e);
     }
     if !changes.is_empty() {
         staging.publish(&mut report)?;
+
     }
     for w in attrs.warnings().into_iter().chain(eol.from.iter().flat_map(|a| a.warnings())) {
         if !report.warnings.contains(&w) {
@@ -981,6 +983,123 @@ fn apply_changes(
         }
     }
     Ok(report)
+}
+
+/// A file [`apply_changes`] writes: what it decided before reading it.
+struct Job<'c> {
+    change: &'c TreeChange,
+    entry: TreeEntry,
+    conversion: crate::attributes::Conversion,
+    /// The working copy holds an edit of the user's at the path.
+    local_edit: bool,
+    /// The path held a file before.
+    had_file: bool,
+}
+
+/// What became of one [`Job`].
+enum Staging1 {
+    Staged(Staged),
+    /// A local edit that differs from the new version: kept.
+    KeptLocal,
+    /// Writing it failed ([`per_file`] decides whether that is fatal).
+    Failed(VeilError),
+    /// This reader cannot read the new version.
+    Unreadable,
+    Fatal(VeilError),
+}
+
+/// Read job `j`'s content and stage it beside its path (on any thread).
+fn stage_one(store: &ObjectStore, fs: &dyn StorageBackend, j: &Job<'_>) -> Staging1 {
+    let c = j.change;
+    let new = &j.entry;
+    let (data, via_fallback) = match read_materialised(store, new) {
+        Ok(r) => r,
+        Err(e) if e.is_unreadable() => return Staging1::Unreadable,
+        Err(e) => return Staging1::Fatal(e),
+    };
+    // Line endings for the working copy (`eol=crlf`), on the bytes as
+    // read: a conflict's markers too, a fallback too.
+    let (data, crlf) = match to_worktree(&data, j.conversion) {
+        Some(d) => (d, true),
+        None => (data, false),
+    };
+    // Already what we want? Then there is nothing to protect.
+    if j.local_edit && fs.read(&c.path).map_or(true, |d| d != data) {
+        return Staging1::KeptLocal;
+    }
+    let executable = match new.kind {
+        EntryKind::Conflict => match crate::conflict::inspect_entry(store, new, crate::conflict::Audience::Reader) {
+            Ok(i) => i.executable,
+            Err(e) => return Staging1::Fatal(e),
+        },
+        _ => new.executable,
+    };
+    // The mode is set on the staged copy, so the barrier makes it durable
+    // with the content.
+    let staged = fs.write_staged(&c.path, &data).and_then(|at| match fs.set_executable(&at, executable) {
+        Ok(()) => Ok(at),
+        Err(e) => {
+            if at != c.path {
+                let _ = fs.remove_file(&at);
+            }
+            Err(e)
+        }
+    });
+    match staged {
+        Ok(at) => Staging1::Staged(Staged {
+            at,
+            path: c.path.clone(),
+            replaces: c.old.is_some() && !j.local_edit,
+            crlf,
+            fallback: via_fallback,
+        }),
+        Err(e) => Staging1::Failed(e),
+    }
+}
+
+/// Largest file [`apply_changes`] stages on another thread.
+const PARALLEL_FILE_MAX: u64 = 256 << 10;
+
+/// Threads [`parallel_map`] uses at most. Each one reading packed objects
+/// raises peak memory (about 6 MiB each on the scale benchmark's small
+/// profile, more on larger ones); 8 keep the 1 GB profile's checkout well
+/// under its 512 MiB gate. A 10,000-file clone: 365 ms at 16 threads, 445
+/// at 8, 525 at 4 (Git 575).
+const PARALLEL_THREADS: usize = 8;
+
+/// `f` over `items` on up to [`PARALLEL_THREADS`] threads (in order); on one thread for a
+/// few items, and always without the `os` feature (WASM).
+fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let threads = match cfg!(feature = "os") && items.len() >= 64 {
+        true => std::thread::available_parallelism().map_or(1, |n| n.get()).min(PARALLEL_THREADS),
+        false => 1,
+    };
+    if threads <= 1 {
+        return items.iter().map(f).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut out: Vec<(usize, R)> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut mine = Vec::new();
+                    loop {
+                        // A few at a time: little contention on the counter.
+                        let i = next.fetch_add(16, std::sync::atomic::Ordering::Relaxed);
+                        if i >= items.len() {
+                            return mine;
+                        }
+                        for (k, item) in items[i..(i + 16).min(items.len())].iter().enumerate() {
+                            mine.push((i + k, f(item)));
+                        }
+                    }
+                })
+            })
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().expect("a checkout thread panicked")).collect()
+    });
+    out.sort_unstable_by_key(|(i, _)| *i);
+    out.into_iter().map(|(_, r)| r).collect()
 }
 
 /// A file checkout staged ([`StorageBackend::write_staged`]) and moves
@@ -1022,17 +1141,24 @@ impl Staging<'_> {
     fn publish(&mut self, report: &mut CheckoutReport) -> Result<()> {
         let fs = self.fs;
         fs.sync_barrier()?;
+        let renames = parallel_map(&self.files, |s| match s.at != s.path {
+            true => Some(fs.rename_unsynced(&s.at, &s.path)),
+            false => None,
+        });
         let mut renamed = false;
-        self.files.reverse();
-        while let Some(s) = self.files.pop() {
-            if s.at != s.path {
-                if let Err(e) = fs.rename_unsynced(&s.at, &s.path) {
+        let mut fatal = None;
+        for (s, r) in std::mem::take(&mut self.files).into_iter().zip(renames) {
+            match r {
+                Some(Err(e)) => {
                     let _ = fs.remove_file(&s.at);
                     drop_previous_version(fs, &s.path, s.replaces)?;
-                    per_file(report, &s.path, e)?;
+                    if let Err(e) = per_file(report, &s.path, e) {
+                        fatal.get_or_insert(e);
+                    }
                     continue;
                 }
-                renamed = true;
+                Some(Ok(())) => renamed = true,
+                None => {}
             }
             report.written += 1;
             if s.crlf {
@@ -1041,6 +1167,9 @@ impl Staging<'_> {
             if let Some(fb) = s.fallback {
                 report.from_fallback.push((s.path, fb));
             }
+        }
+        if let Some(e) = fatal {
+            return Err(e);
         }
         if renamed {
             fs.sync_barrier()?;

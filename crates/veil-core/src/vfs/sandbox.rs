@@ -386,6 +386,10 @@ impl StorageBackend for SandboxFs {
         self.try_clone(path, id)
     }
 
+    fn clones(&self) -> bool {
+        true
+    }
+
     fn stat_clock(&self) -> Option<StatClock> {
         self.disk.stat_clock()
     }

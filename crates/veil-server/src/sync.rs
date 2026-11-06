@@ -362,9 +362,18 @@ pub async fn history(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &
 /// its path in the viewer's projection is refused as not found, without
 /// saying whether it exists.
 pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot: ObjectId, wants: Vec<Want>) -> Result<Vec<u8>> {
-    let Some(real) = resolve(hub, project.id, &snapshot).await?.into_iter().next() else {
-        return Err(Error::not_found(format!("no snapshot {} that you can see", snapshot.short())));
-    };
+    // Each want is checked in its own snapshot (revision 1), as the viewer
+    // sees it.
+    let mut reals: HashMap<ObjectId, ObjectId> = HashMap::new();
+    for snap in std::iter::once(snapshot).chain(wants.iter().filter_map(|w| w.snapshot)) {
+        if reals.contains_key(&snap) {
+            continue;
+        }
+        let Some(real) = resolve(hub, project.id, &snap).await?.into_iter().next() else {
+            return Err(Error::not_found(format!("no snapshot {} that you can see", snap.short())));
+        };
+        reals.insert(snap, real);
+    }
     hub.objects.prefetch(project.id, wants.iter().map(|w| w.id).collect()).await;
     let (policy_text, bindings, viewer) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone());
     blocking(hub, project.id, move |src| {
@@ -378,19 +387,27 @@ pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot:
         };
         let view = p.view(&viewer);
         let mut pr = Projector::new(src, &view);
-        let s = src.snapshot(&real)?;
-        let root = pr.root(s.tree)?;
-        // Projected directory trees by path, filled as the wants need them.
-        let mut dirs: HashMap<String, Option<Arc<Tree>>> = HashMap::new();
-        dirs.insert(String::new(), pr.tree(&root)?);
+        // Per snapshot: its projected root, and its projected directory
+        // trees by path, filled as the wants need them.
+        let mut roots: HashMap<ObjectId, (ObjectId, Dirs)> = HashMap::new();
         let mut out = Vec::new();
         let gone = || Error::not_found("no such object at that path that you can see");
         for w in wants {
+            let snap = w.snapshot.unwrap_or(snapshot);
+            let (root, dirs) = match roots.entry(snap) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let root = pr.root(src.snapshot(&reals[&snap])?.tree)?;
+                    let mut dirs = HashMap::new();
+                    dirs.insert(String::new(), pr.tree(&root)?);
+                    e.insert((root, dirs))
+                }
+            };
             let ok = if w.path.is_empty() {
-                w.id == root
+                w.id == *root
             } else {
                 let (dir, name) = w.path.rsplit_once('/').unwrap_or(("", w.path.as_str()));
-                let tree = dir_tree(&mut pr, &mut dirs, dir)?.ok_or_else(gone)?;
+                let tree = dir_tree(&mut pr, dirs, dir)?.ok_or_else(gone)?;
                 let e = tree.get(name).ok_or_else(gone)?;
                 e.id == w.id
                     || e.fallback == Some(w.id)
@@ -410,8 +427,11 @@ pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot:
     .await
 }
 
+/// Projected directory trees of one snapshot, by path.
+type Dirs = HashMap<String, Option<Arc<Tree>>>;
+
 /// The projected tree of directory `dir`, walking down from the root.
-fn dir_tree(pr: &mut Projector, dirs: &mut HashMap<String, Option<Arc<Tree>>>, dir: &str) -> Result<Option<Arc<Tree>>> {
+fn dir_tree(pr: &mut Projector, dirs: &mut Dirs, dir: &str) -> Result<Option<Arc<Tree>>> {
     if let Some(t) = dirs.get(dir) {
         return Ok(t.clone());
     }

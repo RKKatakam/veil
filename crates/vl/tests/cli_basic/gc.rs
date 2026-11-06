@@ -75,9 +75,14 @@ fn gc_packs_prunes_and_keeps_the_repository_usable() {
     vl(&home, &proj, &["evolog"]);
     std::fs::write(proj.join("after.txt"), "after gc\n").unwrap();
     vl(&home, &proj, &["commit", "-m", "after"]);
+    // A commit is one operation with what it recorded: undo takes the
+    // file back too, redo brings both back.
     vl(&home, &proj, &["undo"]);
-    let st = vl(&home, &proj, &["status"]);
-    assert!(st.contains("after.txt"), "{st}");
+    assert!(!proj.join("after.txt").exists());
+    vl(&home, &proj, &["redo"]);
+    assert_eq!(std::fs::read_to_string(proj.join("after.txt")).unwrap(), "after gc\n");
+    let log = vl(&home, &proj, &["log"]);
+    assert!(log.contains("after"), "{log}");
 
     // fsck (from the durability stream) understands packed and pruned repos.
     let out = vl(&home, &proj, &["fsck"]);

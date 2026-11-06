@@ -1523,6 +1523,12 @@ pub fn before_commit(ctx: &mut Ctx, verify: &NoVerifyArgs, message: &str, snapsh
     if pre.is_empty() && msg.is_empty() {
         return Ok(message.to_string());
     }
+    // The hooks read the recorded working copy: record it first (without
+    // hooks, `vl commit` records it in the commit's own operation).
+    if snapshot {
+        ctx.snapshot()?;
+    }
+    let wc = ctx.wc()?;
     let op = ctx.repo.op_id();
     let env = vec![("VEIL_SNAPSHOT", wc.hex()), ("VEIL_WORKSPACE", ctx.ws.clone())];
     let skip = format!("the {what} was refused; fix it, or skip hooks with `--no-verify`");

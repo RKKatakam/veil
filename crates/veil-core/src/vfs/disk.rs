@@ -607,25 +607,32 @@ fn for_each_parallel<T: Sync>(
         return items.iter().try_for_each(f);
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
+    let work = || loop {
+        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match items.get(i) {
+            Some(item) => f(item)?,
+            None => return Ok(()),
+        }
+    };
     std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..workers)
-            .map(|_| {
-                scope.spawn(|| loop {
-                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    match items.get(i) {
-                        Some(item) => f(item)?,
-                        None => return Ok(()),
-                    }
-                })
-            })
+        // As many workers as the system gives (a container may cap
+        // threads); this thread works too.
+        let handles: Vec<_> = (1..workers)
+            .map_while(|_| std::thread::Builder::new().stack_size(64 << 10).spawn_scoped(scope, work).ok())
             .collect();
+        let mine = work();
         handles
             .into_iter()
-            .try_for_each(|h| h.join().unwrap_or_else(|_| Err(io::Error::other("sync worker panicked"))))
+            .map(|h| h.join().unwrap_or_else(|_| Err(io::Error::other("sync worker panicked"))))
+            .fold(mine, |acc, r| acc.and(r))
     })
 }
 
-const SYNC_WORKERS: usize = 32;
+/// Most threads a barrier fsyncs on. ext4 commits concurrent fsyncs in one
+/// journal transaction: measured on NVMe, a 10,000-file checkout's
+/// barrier took 310 ms at 32, 125 at 128, 60–65 at 256, and no less at
+/// 512 or 1,024. The threads only wait (small stacks).
+const SYNC_WORKERS: usize = 256;
 
 /// `(mtime, ctime, inode)` change-detection stamps, nanoseconds since the epoch.
 #[cfg(unix)]
@@ -1108,6 +1115,32 @@ impl StorageBackend for DiskBackend {
             // Filesystems without hard links: fall back to O_EXCL. A crash
             // here can leave a short file, which the lock treats as garbage.
             Err(_) => create_exclusive(&full, data).map_err(|e| io_err(&full, e)),
+        }
+    }
+
+    /// Inside `.veil/` only (the history index); elsewhere it is
+    /// [`StorageBackend::create_new`].
+    fn create_new_unsynced(&self, path: &VPath, data: &[u8]) -> Result<bool> {
+        if path.is_root() || !Self::own_path(path) {
+            return self.create_new(path, data);
+        }
+        self.refuse_symlinked_parent(path)?;
+        let full = self.full_path(path);
+        let parent = full.parent().expect("non-root path has a parent");
+        create_dir_all_durable(parent).map_err(|e| io_err(parent, e))?;
+        let tmp = temp_path(parent, path);
+        let written = fs::OpenOptions::new().write(true).create_new(true).open(&tmp).and_then(|mut f| f.write_all(data));
+        if let Err(e) = written {
+            let _ = fs::remove_file(&tmp);
+            return Err(io_err(&full, e));
+        }
+        let linked = fs::hard_link(&tmp, &full);
+        let _ = fs::remove_file(&tmp);
+        match linked {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+            // No hard links here: the durable `O_EXCL` route.
+            Err(_) => self.create_new(path, data),
         }
     }
 

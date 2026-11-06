@@ -33,6 +33,11 @@ impl TestHub {
     }
 
     pub fn start_with_ttl(ttl: Duration) -> TestHub {
+        TestHub::start_on(&std::env::var("VEIL_TEST_DATABASE_URL").expect("VEIL_TEST_DATABASE_URL (run scripts/verify-server.sh)"), ttl)
+    }
+
+    /// A server on the database at `database_url`.
+    pub fn start_on(database_url: &str, ttl: Duration) -> TestHub {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(8).build().unwrap();
         let dir = tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap();
         let storage = match std::env::var("VEIL_TEST_S3_ENDPOINT") {
@@ -47,7 +52,7 @@ impl TestHub {
         };
         let config = Config {
             listen: "127.0.0.1:0".parse().unwrap(),
-            database_url: std::env::var("VEIL_TEST_DATABASE_URL").expect("VEIL_TEST_DATABASE_URL (run scripts/verify-server.sh)"),
+            database_url: database_url.to_string(),
             storage,
             tls: TlsSource::SelfSigned,
             data_dir: dir.path().join("data"),

@@ -370,6 +370,15 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
     /// when the path already exists. Used for repository locks.
     fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool>;
 
+    /// [`StorageBackend::create_new`], never made durable: a power loss
+    /// may leave the file missing, empty or torn under its name. Only for
+    /// caches that check what they read (a checksum) and are rebuilt when
+    /// it fails: the history index's layers (`graph_index`). The default
+    /// is [`StorageBackend::create_new`].
+    fn create_new_unsynced(&self, path: &VPath, data: &[u8]) -> Result<bool> {
+        self.create_new(path, data)
+    }
+
     /// Remove a file. Removing a missing file is not an error.
     fn remove_file(&self, path: &VPath) -> Result<()>;
 
@@ -447,6 +456,12 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
     /// over nothing it needs to protect.
     fn clone_known(&self, _path: &VPath, _id: &ObjectId) -> Result<bool> {
         Ok(false)
+    }
+
+    /// Can [`StorageBackend::clone_known`] ever succeed here? Checkout
+    /// reads nothing for a clone where it cannot.
+    fn clones(&self) -> bool {
+        false
     }
 
     /// Current reading of the clock `Metadata::mtime` stamps come from, or

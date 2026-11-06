@@ -19,3 +19,11 @@ anyhow.workspace = true
 clap.workspace = true
 libc.workspace = true
 serde_json.workspace = true
+hex.workspace = true
+serde.workspace = true
+# The load test (`veil-bench load`): agents speak the server's HTTPS API
+# (the client `vl` uses), and the database's statement counts are read
+# with the driver the server uses.
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres"] }
+tokio = { version = "1.47", features = ["rt"] }

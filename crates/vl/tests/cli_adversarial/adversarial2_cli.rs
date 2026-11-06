@@ -80,7 +80,9 @@ fn undo_reverts_a_restore() {
     );
 }
 
-/// Control: undo of an ordinary command keeps uncommitted edits.
+/// Control: undo of an ordinary command keeps uncommitted edits. A commit
+/// is one operation with the snapshot it recorded, so its own edit goes
+/// back with it.
 #[test]
 fn undo_of_a_commit_keeps_later_edits() {
     let env = Env::new();
@@ -91,7 +93,7 @@ fn undo_of_a_commit_keeps_later_edits() {
     env.ok("alice", &proj, &["status"]);
     env.ok("alice", &proj, &["undo"]);
     assert_eq!(read(&proj, "b.txt"), "uncommitted\n");
-    assert_eq!(read(&proj, "a.txt"), "2\n");
+    assert_eq!(read(&proj, "a.txt"), "1\n");
 }
 
 /// `vl isolate` is undone like any command, and edits made after it stay.

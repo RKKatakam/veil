@@ -57,15 +57,16 @@ The owner adopted the four synthetic workloads published by OpenScion, an indepe
 | Workload | 1,000 files: target | 10,000 files: target | Veil, real disk, through the server (1k / 10k) |
 |---|---:|---:|---|
 | Import a directory (first snapshot) | **22 ms** | **245 ms** | 48–58 / 202–208 ms after performance round 1 (Git: 87–94 / 763–764 ms) |
-| Clone everything | **51 ms** | **544 ms** | 124 / 1,014 ms after BUG-818 (Git: 171 / 583 ms) |
-| Commit one changed file | **2.5 ms** | **22 ms** | 20–27 / 43–44 ms after performance round 1 (Git: 6–16 / 9–10 ms) |
-| Clone one directory | **6.1 ms** | **25 ms** | 62 / 74 ms after BUG-818 (Git: 47 / 82 ms) |
+| Clone everything | **51 ms** | **544 ms** | 114–119 / **437–449 ms** after performance round 2: **10k meets its target** (Git: 169–192 / 563–589 ms) |
+| Commit one changed file | **2.5 ms** | **22 ms** | 17–21 / 43–49 ms after performance round 2, one transaction (Git: 9–16 / 27–38 ms) |
+| Clone one directory | **6.1 ms** | **25 ms** | 55–69 / 69–92 ms after performance round 2 (Git: 50–51 / 52–56 ms) |
 
 - **Measured by the S1 server milestone** on an ext4 NVMe disk: release builds, the median of 5, PostgreSQL, with Git as the same-machine reference. Absolute numbers depend on the machine, so each gate also requires **beating Git on the same machine**. **No gate is met yet.**
 - **Correction:** an earlier table here (51 / 316, 50 / 483, 12.8 / 27 ms) was measured under `/tmp`, which is a tmpfs on the development machine, where `fsync` costs nothing. Those numbers were invalid. **Never benchmark under `/tmp` on that machine.**
 - **BUG-818 fixed** (one durability barrier per checkout): clones are 2.5–10× faster. The rest of a 10k clone is the transfer plus about 16 `openat` calls per file from checkout's no-follow path walks.
 - **Performance round 1** (`docs/design/scale/OPENSCION.md`): import beats Git (1.7× at 1k, 3.7× at 10k); commit one file does not yet (Git does no fsync; Veil's commit is two durable transactions). **Measured as OpenScion measures** (in one process, in memory, no disk or process start), Veil meets the import, clone-everything and commit targets: 8.8 / 86 ms, 32 / 303 ms, 0.9 / 7.4 ms.
-- **Next costs:** the commit's two transactions and its scan (owner decisions, see OPENSCION.md), server round trips (clone one directory).
+- **Performance round 2** (`docs/design/scale/OPENSCION.md`): clone everything is 2.3× faster at 10k (beats Git 1.3×, meets 544 ms); `vl commit` is one operation; the server's load curves are in `docs/design/scale/LOAD.md` (about 2,500 pulls/s and 2,000 landings/s across projects on one machine).
+- **Next costs:** clone one directory's ~60 sequential `fsync`s, checkout's path walks, the commit's scan.
 - **Performance rounds continue until every gate is met.** The profile runs in `crates/veil-bench` (`docs/design/scale/OPENSCION.md`) and is re-run on every stream that touches the client or the server.
 
 ## What exists today, and what's next
@@ -77,6 +78,18 @@ The owner adopted the four synthetic workloads published by OpenScion, an indepe
   - a history index;
   - streaming storage, safe gc, secret scanning, embargoes.
 - **Built (milestone S1, 2026-11-06): the server and the permission model, together** (`docs/HUB.md` §13). The server, the database (PostgreSQL, YugabyteDB), object storage (S3), sign-in, groups, admins, folder access, public, secrets encrypted on the device, and `vl` pushing, pulling and cloning (one directory too) through the server, with each person receiving only what they may see.
+- **Required for phase 1: isolated agent sandboxes** (owner, 2026-11-06). Every `vl ws exec` runs the agent in an isolated view of the machine, not just a separate folder.
+  - **Linux:**
+    - kernel namespaces, with no Docker image and no copying, starting in milliseconds and needing no root;
+    - the computer's own tools (`/usr`, `/bin`, `/lib`, toolchains) are visible **read-only and live**;
+    - the sandbox appears **at the project's real path**, starting in the same sub-folder, so directories and absolute paths behave as in the real project, while every write goes to the sandbox;
+    - `HOME` and `/tmp` are private; `~/.ssh`, personal keys and other projects are hidden;
+    - the agent sees only its own processes;
+    - **CPU, memory, process and time limits** apply.
+  - **Network:** on by default, because agents need their model's API; `--no-network` for runs that shouldn't call out.
+  - **macOS:** Apple's sandbox profiles; weaker, and documented as such.
+  - **Optional `--container IMAGE`** (Docker or Podman) for a fully separate environment, with the sandbox mounted at the same path.
+  - **Tests prove** an agent can't read `~/.ssh` or write outside its sandbox.
 - **Then: a simplification pass.** Remove what the server makes unnecessary: plain-file (SFTP and path) remotes, offline assumptions, old storage formats and old jargon.
 - **Then: the server's features, in stages.**
   - fetch on demand;
