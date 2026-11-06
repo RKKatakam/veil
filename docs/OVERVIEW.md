@@ -57,15 +57,15 @@ The owner adopted the four synthetic workloads published by OpenScion, an indepe
 | Workload | 1,000 files: target | 10,000 files: target | Veil, real disk, through the server (1k / 10k) |
 |---|---:|---:|---|
 | Import a directory (first snapshot) | **22 ms** | **245 ms** | 48–58 / 202–208 ms after performance round 1 (Git: 87–94 / 763–764 ms) |
-| Clone everything | **51 ms** | **544 ms** | 114–182 / **371–437 ms** after performance round 2: **10k meets its target** (Git: 169–200 / 563–575 ms) |
-| Commit one changed file | **2.5 ms** | **22 ms** | 17–28 / 43–49 ms after performance round 2, one transaction (Git: 9–19 / 13–38 ms) |
-| Clone one directory | **6.1 ms** | **25 ms** | 55–91 / 67–92 ms after performance round 2, Git's level (Git: 50–64 / 52–53 ms) |
+| Clone everything | **51 ms** | **544 ms** | 114–119 / **437–449 ms** after performance round 2: **10k meets its target** (Git: 169–192 / 563–589 ms) |
+| Commit one changed file | **2.5 ms** | **22 ms** | 17–21 / 43–49 ms after performance round 2, one transaction (Git: 9–16 / 27–38 ms) |
+| Clone one directory | **6.1 ms** | **25 ms** | 55–69 / 69–92 ms after performance round 2 (Git: 50–51 / 52–56 ms) |
 
 - **Measured by the S1 server milestone** on an ext4 NVMe disk: release builds, the median of 5, PostgreSQL, with Git as the same-machine reference. Absolute numbers depend on the machine, so each gate also requires **beating Git on the same machine**. **No gate is met yet.**
 - **Correction:** an earlier table here (51 / 316, 50 / 483, 12.8 / 27 ms) was measured under `/tmp`, which is a tmpfs on the development machine, where `fsync` costs nothing. Those numbers were invalid. **Never benchmark under `/tmp` on that machine.**
 - **BUG-818 fixed** (one durability barrier per checkout): clones are 2.5–10× faster. The rest of a 10k clone is the transfer plus about 16 `openat` calls per file from checkout's no-follow path walks.
 - **Performance round 1** (`docs/design/scale/OPENSCION.md`): import beats Git (1.7× at 1k, 3.7× at 10k); commit one file does not yet (Git does no fsync; Veil's commit is two durable transactions). **Measured as OpenScion measures** (in one process, in memory, no disk or process start), Veil meets the import, clone-everything and commit targets: 8.8 / 86 ms, 32 / 303 ms, 0.9 / 7.4 ms.
-- **Performance round 2** (`docs/design/scale/OPENSCION.md`): clone everything is 2.2–2.6× faster at 10k (beats Git 1.3–1.6×, meets 544 ms); `vl commit` is one operation; the server's load curves are in `docs/design/scale/LOAD.md` (about 2,500 pulls/s and 2,000 landings/s across projects on one machine).
+- **Performance round 2** (`docs/design/scale/OPENSCION.md`): clone everything is 2.3× faster at 10k (beats Git 1.3×, meets 544 ms); `vl commit` is one operation; the server's load curves are in `docs/design/scale/LOAD.md` (about 2,500 pulls/s and 2,000 landings/s across projects on one machine).
 - **Next costs:** clone one directory's ~60 sequential `fsync`s, checkout's path walks, the commit's scan.
 - **Performance rounds continue until every gate is met.** The profile runs in `crates/veil-bench` (`docs/design/scale/OPENSCION.md`) and is re-run on every stream that touches the client or the server.
 

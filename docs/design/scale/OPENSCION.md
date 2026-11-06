@@ -235,39 +235,42 @@ designed); a load test of the server (`docs/design/scale/LOAD.md`).
 **Method.** As in round 1: release builds, the bench directories in the
 worktree's `.scratch/` on the ext4 NVMe disk, base (`integration` @
 `a9f4fa8`), this round and Git **interleaved run by run** (each Veil
-build with its own server and PostgreSQL database), median of 5. Two
-sessions: the first before the last two changes (one barrier for `init`'s
-objects, fetch across snapshots), on a quieter machine; the second with
-the final code while another agent's containers were running. The
-machine's load moved every number (base's one-directory clone: 47.5 ms
-in the first session, 95.0 in the second); compare within a session.
+build with its own server and PostgreSQL database), median of 5. Three
+sessions; the table shows the first (before the last changes, on a
+quieter machine) and the **final** one (the code as committed). A second
+session, taken while another agent's containers ran, moved every number
+(base's one-directory clone 47.5 → 95.0 ms) and is left out; compare
+within a session.
 
 | Files | Workload | Base (ms) | This round (ms) | Git (ms) | Target (ms) | Meets target | Beats Git |
 |---:|---|---:|---:|---:|---:|---|---|
-| 1000 | import a directory | 56.9 / 75.5 | 53.0 / 61.4 | 96.0 / 101.0 | 22.0 | no | **yes** |
-| 1000 | clone everything (server) | 135.0 / 165.6 | **114.2** / 181.5 | 169.3 / 199.5 | 51.0 | no | **yes** |
-| 1000 | commit one changed file | 23.5 / 31.8 | **17.2 / 27.8** | 8.7 / 18.5 | 2.5 | no | no |
-| 1000 | clone one directory (server) | 47.5 / 95.0 | 55.2 / 91.4 | 49.6 / 64.4 | 6.1 | no | no |
-| 10000 | import a directory | 228.8 / 233.2 | 237.8 / 236.4 | 805.6 / 810.7 | 245.0 | **yes** | **yes** |
-| 10000 | clone everything (server) | 1003.3 / 950.8 | **436.8 / 370.8** | 562.9 / 575.4 | 544.0 | **yes** | **yes** (1.3–1.6×) |
-| 10000 | commit one changed file | 53.6 / 49.6 | **49.1 / 42.5** | 38.0 / 13.1 | 22.0 | no | no |
-| 10000 | clone one directory (server) | 84.7 / 57.6 | 92.2 / 66.7 | 51.5 / 53.4 | 25.0 | no | no |
+| 1000 | import a directory | 56.9 / 56.1 | 53.0 / 57.2 | 96.0 / 97.0 | 22.0 | no | **yes** |
+| 1000 | clone everything (server) | 135.0 / 138.8 | **114.2 / 118.6** | 169.3 / 191.8 | 51.0 | no | **yes** (1.5–1.6×) |
+| 1000 | commit one changed file | 23.5 / 26.6 | **17.2 / 21.1** | 8.7 / 16.1 | 2.5 | no | no |
+| 1000 | clone one directory (server) | 47.5 / 58.5 | 55.2 / 69.1 | 49.6 / 50.9 | 6.1 | no | no |
+| 10000 | import a directory | 228.8 / 221.4 | 237.8 / 258.1 | 805.6 / 776.9 | 245.0 | yes / no | **yes** |
+| 10000 | clone everything (server) | 1003.3 / 1015.7 | **436.8 / 449.2** | 562.9 / 588.6 | 544.0 | **yes** | **yes** (1.3×) |
+| 10000 | commit one changed file | 53.6 / 50.5 | **49.1 / 43.3** | 38.0 / 26.6 | 22.0 | no | no |
+| 10000 | clone one directory (server) | 84.7 / 77.8 | 92.2 / 68.8 | 51.5 / 55.8 | 25.0 | no | no |
 
-(first session / second session)
+(first session / final session)
 
-- **Clone everything, 10k: 2.2–2.6× faster, and it beats Git (1.3–1.6×)
-  and meets its 544 ms target**, with every file still durable before the
-  checkout is recorded. Clone everything at 1k beats Git in both sessions.
-- **Clone one directory does not beat Git.** It is a fixed cost: about 60
-  `fsync`s in sequence (initialising the repository, the pull's and the
-  new change's transactions, `repo.json` twice, the `--only` view's two
-  trees, `checkout.json` twice), against Git's none, plus process start
-  and three requests. This round removed six (`init`'s objects under one
-  barrier) and 100 loose objects' worth (a pull of 16 or more objects is a
-  pack); measured alone on a quiet machine it took 36–40 ms (Git 47–50),
-  but interleaved sessions put it at Git's level, not below.
+- **Clone everything, 10k: 2.3× faster, beats Git (1.3×) and meets its
+  544 ms target**, with every file still durable before the checkout is
+  recorded. Clone everything at 1k beats Git in every session.
+- **Clone one directory does not beat Git** (69 against 51–56 ms in the
+  final session). It is a fixed cost: about 60 `fsync`s in sequence
+  (initialising the repository, the pull's and the new change's
+  transactions, `repo.json` twice, the `--only` view's two trees,
+  `checkout.json` twice), against Git's none, plus process start and three
+  requests. This round removed six (`init`'s objects under one barrier)
+  and 100 loose objects' worth (a pull of 16 or more objects is a pack);
+  measured alone on a quiet machine it took 36–40 ms (Git 47–50), but no
+  interleaved session put it below Git.
 - **Commit one changed file** is one transaction instead of two (owner
   decision): 4–7 ms less. Git makes no fsync here.
+- **Import** is unchanged by this round (the import at 10k varies with
+  the disk's load from run to run).
 
 ### Where a 10k clone's time went (phases, instrumented build)
 
@@ -276,9 +279,9 @@ in the first session, 95.0 in the second); compare within a session.
 | start, `init`, tips, history, the trees | 25–35 | 15–25 |
 | the files: request, transfer, frames | 120 | 75–95 (8 requests at once) |
 | decode, check and pack what arrived | 150 | 50–55 (compression on 8 threads) |
-| checkout: read and stage the files | 280 | 125–175 with the barrier (16 threads) |
+| checkout: read and stage the files | 280 | 125–175 with the barrier (16 threads; 8 as committed, about 80 ms more) |
 | checkout: the barrier (10,000 `fsync`s) | 235–310 | (included above: 256 threads) |
-| checkout: renames into place | 75 | 25 (16 threads) |
+| checkout: renames into place | 75 | 25 (on as many threads) |
 | **total** | **about 985** | **about 320–420** |
 
 | `strace -c -f`, 10k clone | Before | After |
@@ -294,10 +297,14 @@ in the first session, 95.0 in the second); compare within a session.
    took 310 ms at 32 threads, 125 at 128, 60–65 at 256, no less at 512 or
    1,024 (`vfs/disk.rs`). The threads have 64 KiB stacks; if the system
    gives fewer threads, the barrier uses what it gets.
-2. **Checkout reads and stages files on up to 16 threads, and renames on
-   as many** (`checkout.rs`): the checks that decide what to write stay
-   in order on one thread; the outcomes are taken in order. Every no-follow
-   walk, hash check and durability step is the same.
+2. **Checkout reads and stages files of up to 256 KiB on up to 8
+   threads, and renames on as many** (`checkout.rs`): the checks that
+   decide what to write stay in order on one thread; the outcomes are
+   taken in order. Every no-follow walk, hash check and durability step is
+   the same. Each thread reading packed objects raises peak memory: 16
+   threads took the 1 GB profile's checkout from 28 to 593 MiB (over its
+   512 MiB gate), 8 threads and large files on the calling thread keep it
+   under (below). A 10k clone: 365 ms at 16 threads, 445 at 8.
 3. **One read per file:** checkout no longer reads each object twice (a
    readability probe for backends that clone files ran for every
    backend: `StorageBackend::clones`), and a local store reads an object
@@ -325,7 +332,16 @@ in the first session, 95.0 in the second); compare within a session.
 
 Measured and not kept: 512 and 1,024 sync threads (no faster); fewer sync
 threads for small barriers (16–64 at 1k files: no difference beyond
-noise).
+noise); 16 staging threads (the 1 GB gate failed).
+
+**The 1 GB profile's memory gate** (512 MiB per case, `scripts/bench-scale.sh
+1g`, SFTP and agents phases skipped): passes, with less margin than
+before. Highest: `clone, full` (path remote) 502.9 MiB (about 452 before
+this round, BUG-813), `status, clean` 460.4, `init` 407.5, `checkout main
+(full tree)` 351.8 MiB (28–66 before: the parallel staging's reads of
+packed, deltified objects; 593.5 with 16 threads). Finding what each
+reading thread holds (about 40 MiB on this profile, 6 MiB on the small
+one) would let checkout use more threads within the gate.
 
 ### The server under load
 

@@ -1171,7 +1171,7 @@ checkout's per-file `fsync` (BUG-818, pre-existing); with one barrier per
 checkout the 10k clone takes 1,014 ms instead of 10,044 ms. Clone one
 directory stays flat from 1k to 10k files (62 and 74 ms). Performance
 round 2 (parallel staging and barriers, packed and parallel fetches):
-371–437 ms at 10k, faster than Git. The server under load:
+437–449 ms at 10k, faster than Git. The server under load:
 `docs/design/scale/LOAD.md` (`veil-bench load`).
 
 ### 13.11 Confirmed devices: who a secret key is wrapped for (BUG-827)

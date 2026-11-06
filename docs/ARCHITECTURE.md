@@ -79,10 +79,11 @@ must not be trusted (which disables stat caching):
   fsync of the directory; see §9) and never follows a symlink. Checkout
   instead stages each file (`write_staged`: a temp file beside it,
   unsynced), makes them all durable with one barrier, renames them into
-  place, and makes the names durable with a second (BUG-818). Files are
-  read and staged on up to 16 threads, and renamed into place on as many;
-  a barrier fsyncs on up to 256 threads, so that ext4 commits them in a
-  few journal transactions (performance round 2). A link is a
+  place, and makes the names durable with a second (BUG-818). Files up
+  to 256 KiB are read and staged on up to 8 threads (larger ones one at a
+  time: memory stays bounded), and renamed into place on as many; a
+  barrier fsyncs on up to 256 threads, so that ext4 commits them in a few
+  journal transactions (performance round 2). A link is a
   leaf of its own: `NodeKind::Symlink` in `metadata` and listings, its
   target from `read_link`, created atomically by `write_link` (`symlinkat`
   to a temp name, `renameat`); `read` never reads through one. A path below
