@@ -88,6 +88,10 @@ pub const SIG_CONTEXT_HUB_LOGIN: &str = "hub-login";
 /// person's too (`docs/HUB.md` §13.11), over the vouched device's X25519
 /// ‖ Ed25519 public keys (`hub::wire::vouch_message`).
 pub const SIG_CONTEXT_HUB_DEVICE: &str = "hub-device";
+/// Signature context: a join under an invite (`docs/HUB.md` §13.12), by
+/// the invite's key, over `person ‖ 0x00 ‖ X25519 ‖ Ed25519` of the
+/// joining device (`hub::wire::join_message`).
+pub const SIG_CONTEXT_HUB_INVITE: &str = "hub-invite";
 
 /// Every signature context, for the uniqueness test.
 pub const SIG_CONTEXTS: &[&str] = &[
@@ -100,6 +104,7 @@ pub const SIG_CONTEXTS: &[&str] = &[
     SIG_CONTEXT_TAG,
     SIG_CONTEXT_HUB_LOGIN,
     SIG_CONTEXT_HUB_DEVICE,
+    SIG_CONTEXT_HUB_INVITE,
 ];
 
 // ---- key rings and embargoes (keychain.rs) --------------------------------
@@ -161,6 +166,24 @@ pub const HUB_DEVICE_FINGERPRINT: &str = "veil 2026 hub device-fingerprint v1";
 /// this person uploaded that object, so a push may name it (BUG-824).
 pub const HUB_UPLOAD_RECEIPT: &str = "veil 2026 hub upload-receipt v1";
 
+/// BLAKE3 `derive_key` context of an invite's Ed25519 seed, from the 32
+/// random bytes only the invite link holds (`hub::wire::InviteKey`). The
+/// public half goes to the server and into the key rings; the secret never
+/// leaves the admin's device and the link.
+pub const HUB_INVITE_KEY: &str = "veil 2026 hub invite-key v1";
+
+/// BLAKE3 `derive_key` context of a project's fingerprint, over its id (the
+/// hash of its `team` key ring's genesis; first 10 bytes, shown as
+/// `4F2A-9C1E-…`): what an invite link carries and what a person compares
+/// before a device trusts the project's key rings (`docs/HUB.md` §13.12,
+/// BUG-845). Not secret.
+pub const HUB_PROJECT_FINGERPRINT: &str = "veil 2026 hub project-fingerprint v1";
+
+/// BLAKE3 `derive_key` context of the scope name of an access line's
+/// secrets (`policy::rule_scope`): `rule-` and the first 10 bytes (hex)
+/// over the line's path. Not secret.
+pub const POLICY_RULE_SCOPE: &str = "veil 2026 policy rule-scope v1";
+
 /// Every BLAKE3 `derive_key` context, for the uniqueness test.
 pub const BLAKE3_CONTEXTS: &[&str] = &[
     LEGACY_SIV_NONCE,
@@ -174,6 +197,9 @@ pub const BLAKE3_CONTEXTS: &[&str] = &[
     HUB_VIEW_KEY,
     HUB_DEVICE_FINGERPRINT,
     HUB_UPLOAD_RECEIPT,
+    HUB_INVITE_KEY,
+    POLICY_RULE_SCOPE,
+    HUB_PROJECT_FINGERPRINT,
 ];
 
 #[cfg(test)]
@@ -193,7 +219,10 @@ mod tests {
                 "veil 2026 team-vault history v1",
                 "veil 2026 hub view-key v1",
                 "veil 2026 hub device-fingerprint v1",
-                "veil 2026 hub upload-receipt v1"
+                "veil 2026 hub upload-receipt v1",
+                "veil 2026 hub invite-key v1",
+                "veil 2026 policy rule-scope v1",
+                "veil 2026 hub project-fingerprint v1"
             ],
             "a context changed or was reordered"
         );
@@ -216,7 +245,7 @@ mod tests {
             "028e842fb2475981",
             "a signature context changed; that breaks existing signatures. Add a new constant instead."
         );
-        assert_eq!(SIG_CONTEXTS[5..], ["vault-entry", "tag", "hub-login", "hub-device"], "a signature context changed or was reordered");
+        assert_eq!(SIG_CONTEXTS[5..], ["vault-entry", "tag", "hub-login", "hub-device", "hub-invite"], "a signature context changed or was reordered");
         let labels = [
             WRAP_LABEL_PREFIX,
             PREV_KEY_LABEL_PREFIX,

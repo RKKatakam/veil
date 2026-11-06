@@ -100,6 +100,12 @@ impl TestHub {
         Person::new(self, "anyone")
     }
 
+    /// Someone new, not signed in yet, under a unique name starting with
+    /// `prefix` (an invite's recipient).
+    pub fn newcomer(&self, prefix: &str) -> Person {
+        Person::new(self, &unique(prefix))
+    }
+
     pub fn api(&self) -> Api {
         Api::new(self)
     }
@@ -197,6 +203,30 @@ impl Person {
             serde_json::from_slice(&std::fs::read(self.home.path().join("veil/hub.json")).unwrap()).unwrap();
         let servers = v["servers"].as_object().unwrap();
         servers.values().next().unwrap()["token"].as_str().unwrap().to_string()
+    }
+
+    /// The project fingerprint this person's clone `dir` trusts, as `vl
+    /// identity show` prints it there (what an admin reads to a person).
+    pub fn project_fingerprint(&self, dir: &Path) -> String {
+        let out = self.ok(dir, &["identity", "show"]);
+        let line = out.lines().find(|l| l.starts_with("project ")).unwrap_or_else(|| panic!("no project line in:\n{out}"));
+        let fp = line.split_whitespace().nth(1).unwrap().to_string();
+        assert!(veil_core::hub::wire::normalize_fingerprint(&fp).is_some(), "the clone trusts no project fingerprint: {line}");
+        fp
+    }
+
+    /// Clone `url` into `dir` and confirm the project's fingerprint `fp`
+    /// (compared with an admin out of band): the clone trusts its keys.
+    pub fn clone_trusting(&self, url: &str, dir: &Path, fp: &str) {
+        self.ok(self.home.path(), &["clone", url, dir.to_str().unwrap()]);
+        self.ok(dir, &["identity", "confirm", fp]);
+    }
+
+    /// Confirm the fingerprint `fp` of `project` on this device (in a clone
+    /// made for it): every later clone of the project here trusts its keys.
+    pub fn trust_project(&self, hub: &TestHub, project: &str, fp: &str) {
+        let d = self.dir(&format!("trust-{}", unique("c")));
+        self.clone_trusting(&hub.url(project), &d, fp);
     }
 
     /// Commit everything in `dir` and move tag `main` to it.
@@ -392,6 +422,10 @@ pub struct Project {
     pub name: String,
     pub admin: Person,
     pub dir: PathBuf,
+    /// The project's fingerprint (its `team` key ring's), as the admin's
+    /// clone trusts it: what a person confirms before their device trusts
+    /// the project's keys (BUG-845).
+    pub fp: String,
     /// In `devs` (src/ is `public devs`: read for all, write for devs).
     pub dev: Person,
     /// In `finance` (billing).
@@ -461,8 +495,15 @@ pub fn setup_project(hub: &TestHub) -> Project {
     write_files(&dir, &[(&format!("{BILL_DIR}/acme/invoice.txt"), &format!("{BILL_MARK}\nsecond"))]);
     admin.commit_main(&dir, DESC_MARK);
     admin.ok(&dir, &["push"]);
+    // Each of them also compared the project's fingerprint with the admin
+    // (BUG-845): their devices trust its keys.
+    let fp = admin.project_fingerprint(&dir);
+    for who in [&dev, &fin, &carol, &sec] {
+        who.trust_project(hub, &name, &fp);
+    }
     Project {
         name,
+        fp,
         admin,
         dir,
         dev,

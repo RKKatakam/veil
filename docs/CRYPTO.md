@@ -254,7 +254,8 @@ Read forever; written only into format-1/2 repositories.
 
 `Ed25519(signing_key, SIG_PREFIX ‖ context ‖ 0x00 ‖ payload)`, contexts
 `snapshot`, `ring-change`, `embargo`, `embargo-release`, `member-binding`,
-`vault-entry`, `tag` (see the domains table). Payloads are fixed encodings (FORMAT.md §2, "signed bodies never
+`vault-entry`, `tag`, `hub-login`, `hub-device`, `hub-invite` (see the
+domains table). Payloads are fixed encodings (FORMAT.md §2, "signed bodies never
 change"). What a valid signature *means* (who may sign what) is decided
 against the ring log (ARCHITECTURE §3).
 
@@ -365,6 +366,62 @@ index trailers, the stat cache and the gc pending list end in an unkeyed
 BLAKE3 checksum against accidental damage. These are not security
 boundaries beyond collision resistance of BLAKE3-256.
 
+### C13. Invites and shares (ring format 4) — custom composition of standard parts
+
+What it is for (`docs/HUB.md` §13.12): a device receives a scope key
+only through a proof made outside the Veil server, which stores the rings
+and is trusted with code but never with secrets.
+
+* **Invite key.** `secret` = 32 bytes from the OS RNG on the admin's
+  device, only in the invite link (`#invite=NAME:<hex>`, a URL fragment `vl`
+  never sends). `seed = BLAKE3-derive_key(HUB_INVITE_KEY, secret)`, the
+  Ed25519 key from that seed. The admin's ring change `invite {person, key:
+  the verifying key, expires_at}` (signed, C5/C6) and the server's record
+  hold only the public key. A server that sees the join cannot sign another:
+  that needs the seed (2^256 secrets; Ed25519 security for the key).
+* **Join.** `Ed25519(invite key, "hub-invite" context, person ‖ 0x00 ‖
+  X25519 ‖ Ed25519)` of the joining device (fixed-length keys after a name
+  without NUL: unambiguous). Bound to the person and to both of the device's
+  keys, so it cannot be moved to another device or name.
+* **Vouch** (C5, `hub-device`, §13.11): the person's own device's signature
+  over the new device's X25519 ‖ Ed25519.
+* **Share.** A ring change (C6) signed by **any current member**, adding a
+  bound member (C4 binding checked) at the current generation, with the key
+  wrapped by HPKE (C3) as for an admin's grant. Every replay checks the proof:
+  a join under an unused, unexpired `invite` of the same person (then marked
+  used), or a vouch by a current member's signing key with the same name. A
+  member id or signing key the ring ever held is refused, so a removed
+  device never comes back.
+* **`revoke_own`.** A member removes another device with their own name and
+  rotates (the same rotation as a revocation, C6, C9). A key holder checks
+  that its new generation unlocks the previous one, as for every rotation
+  (`check_with_keys`).
+* **Project binding (BUG-845).** A project's id is `team`'s genesis change
+  hash (C6's chain hash, 128 bits: it commits to the genesis's random key id,
+  members and signature). Every other ring's genesis carries the id in its
+  signed body (`project`, ring format 4), so the binding is as strong as the
+  genesis signature (C5) and the chain (C6): a server can neither move a
+  ring to another project nor re-label one. A reader accepts a non-`team`
+  ring only if its `project` equals its own `team`'s id.
+* **Project fingerprint, the anchor.** `fp = BLAKE3-derive_key(
+  HUB_PROJECT_FINGERPRINT, id)[..10]` (80 bits), shown as 20 hex digits. A
+  clone of a server project trusts a `team` ring only if its fingerprint is
+  the one the device anchored outside the server: from the invite link
+  (inside the fragment the server never sees; `vl join` compares it with
+  the server's `team`), from creating the project, or typed by the person
+  after comparing it. Forging a `team` ring with a given fingerprint is a
+  second preimage of 80 bits (about 2^80 genesis signatures, each with a
+  fresh key or member list), as for device fingerprints. Until a device
+  has an anchor it takes no ring of the project.
+* **Not from a vouch.** A vouch (C5, `hub-device`) is checked by the
+  *voucher's* peers, not by the new device, which knows no key of its
+  person yet: anchors carried in a vouch would be the server's to choose.
+* **Not covered.** Whether a member wraps the right key cannot be checked by
+  a replay (true of admins' grants as well): a member could leak the key
+  anyway. Freshness of the ring a member reads is TOFU, as for every ring (a
+  server can withhold a rotation from one device: HUB.md §13.12, "Residual
+  risks").
+
 ### C12. Team-vault records (all)
 
 * **Construction.** C2 (XChaCha20-Poly1305, random nonce) under the
@@ -463,10 +520,14 @@ are distinct and pins their exact bytes.
 | `SIG_CONTEXT_VAULT_ENTRY` | `vault-entry` | Ed25519 context | C5, C12 |
 | `SIG_CONTEXT_TAG` | `tag` | Ed25519 context (format 5: annotated tags, over `Atag::unsigned_id`) | C5 |
 | `SIG_CONTEXT_HUB_LOGIN` | `hub-login` | Ed25519 context (signing in to a Veil server, HUB.md §13.2) | C5 |
-| `SIG_CONTEXT_HUB_DEVICE` | `hub-device` | Ed25519 context (a device vouching for another device of its person, over X25519 ‖ Ed25519 public keys, HUB.md §13.11) | C5 |
+| `SIG_CONTEXT_HUB_DEVICE` | `hub-device` | Ed25519 context (a device vouching for another device of its person, over X25519 ‖ Ed25519 public keys, HUB.md §13.11) | C5, C13 |
+| `SIG_CONTEXT_HUB_INVITE` | `hub-invite` | Ed25519 context (a join under an invite, by the invite's key, over `person ‖ 0 ‖ X25519 ‖ Ed25519` of the joining device, HUB.md §13.12) | C5, C13 |
 | `HUB_VIEW_KEY` | `veil 2026 hub view-key v1` | BLAKE3 `derive_key` mode as a hash | server: projection cache key (not secret) |
 | `HUB_DEVICE_FINGERPRINT` | `veil 2026 hub device-fingerprint v1` | BLAKE3 `derive_key` mode as a hash (first 80 bits) | device fingerprint compared out of band (HUB.md §13.11) |
 | `HUB_UPLOAD_RECEIPT` | `veil 2026 hub upload-receipt v1` | BLAKE3 `derive_key` → keyed BLAKE3 (first 128 bits) | server: upload receipts over project ‖ person ‖ object id (HUB.md §13.5) |
+| `HUB_INVITE_KEY` | `veil 2026 hub invite-key v1` | BLAKE3 `derive_key` → Ed25519 seed | C13: an invite's signing key, from the link's 32 random bytes |
+| `HUB_PROJECT_FINGERPRINT` | `veil 2026 hub project-fingerprint v1` | BLAKE3 `derive_key` mode as a hash (first 80 bits) | C13: a project's fingerprint, over its id; in invite links and compared out of band (not secret) |
+| `POLICY_RULE_SCOPE` | `veil 2026 policy rule-scope v1` | BLAKE3 `derive_key` mode as a hash (first 80 bits) | the scope name `rule-<hex>` of an access line's secrets (not secret) |
 | `WRAP_LABEL_PREFIX` | `wrap:` | AEAD associated data | C3, C3L |
 | `PREV_KEY_LABEL_PREFIX` | `prev-key:` | AEAD associated data | C2 |
 | `EMBARGO_WRAP_LABEL_PREFIX` | `embargo-wrap:` | AEAD associated data | C2, C7 |

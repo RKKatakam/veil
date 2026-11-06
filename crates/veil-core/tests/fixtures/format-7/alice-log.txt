@@ -1,0 +1,28 @@
+@  quswqlut alice ✓ 2026-11-06 18:08:13 default@ 2f0a8c4c (empty)
+│  (no description set)
+○  kzulqvwn alice ✓ 2026-11-06 18:08:13 main mirror/main origin/main 43badc98 [embargo:f39097766e]
+│ │  Fix B (embargoed)  ⇠ merges nzolsmvw, qtqypmlt
+│ ○  qtqypmlt alice ✓ 2026-11-06 18:08:12 fix-b@ 086d8b1c [cloaked:team]
+│ │  (no description set)
+│ │ ×  pkpzsqvk alice ✓ 2026-11-06 18:08:12 link-conflict mirror/link-conflict origin/link-conflict 55ec2245 (conflict)
+│ │ │  a link/file conflict
+│ │ ○  soxuyplq alice ✓ 2026-11-06 18:08:12 links team-release[cloaked:team] v5.0 mirror/links mirror/v5.0 origin/links origin/team-release origin/v5.0 97100729
+│ │ │  format 5: symlinks
+│ │ │ ×  pytlwnun alice ✓ 2026-11-06 18:08:12 conflicted mirror/conflicted origin/conflicted e7fbef0f (conflict)
+│ │ │ │ │  keep side b's strings.rs  ⇠ merges zyxslptn, rzrzvytv
+│ │ │ │ ○  rzrzvytv alice ✓ 2026-11-06 18:08:12 side-b@ 8a0b834c
+│ │ │ │ │  (no description set)
+│ │ │ ○ │  zyxslptn alice ✓ 2026-11-06 18:08:12 side-a@ 33976e06
+│ │ │ │ │  (no description set)
+○          nzolsmvw alice ✓ 2026-11-06 18:08:11 2bb9b94e
+│  third: loose objects
+○  vvtyqurz alice ✓ 2026-11-06 18:08:11 a5948412 [embargo:fce3d3f2ad released]
+│ │  Fix A (released)  ⇠ merges ksrnvutp, tnxtmyrv
+│ ○  tnxtmyrv alice ✓ 2026-11-06 18:08:11 fix-a@ team-only[cloaked:team] origin/team-only d5939c62 [cloaked:team]
+│ │  (no description set)
+○    ksrnvutp alice ✓ 2026-11-06 18:08:11 4313bc79
+│  second: edit docs and notes
+○  ovwpvkpq alice ✓ 2026-11-06 18:08:09 03392c20
+│  initial import
+◆  zzzzzzzz 72edc798
+   root()

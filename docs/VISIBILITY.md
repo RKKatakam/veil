@@ -1,6 +1,6 @@
 # Who can see what: Veil's permission model
 
-> **Status:** decided by the owner on 2026-11-05. Milestone S1 of the server builds it (2026-11-06): see "As built" below.
+> **Status:** decided by the owner on 2026-11-05. Milestone S1 of the server builds it (2026-11-06), and S2 finishes its secrets (invites, a key per folder, keys shared in the background, device removal): see "As built" below.
 >
 > **This document is the source of truth.** Where `ARCHITECTURE.md`, `HUB.md`, a guide or an older design doc disagrees with it, this document wins, and the other one needs updating. **Keep it this simple:** it is the ordinary permission model everyone already knows.
 
@@ -132,12 +132,14 @@ What the server and `vl` do today; `docs/HUB.md` §13 has the details.
 - **History without access:** you do not see the folder's files or names in any snapshot, and a change that touched only such folders is not in your history at all. A change that touched both shows only your part (and its description). Every snapshot you receive carries a signature that verifies: its author's, or the server's on the part it left out.
 - **Only admins change access.** The server refuses a push that changes access lines, on any branch, unless an admin made it; the authority is the policy accepted on the default branch, never a label inside a snapshot. Names bind to the project's group first, also when the group is created after the line, so nobody gains access by signing up under a group's name.
 - **Managers** add and remove other people in their groups, never themselves.
-- **Secrets:**
+- **Secrets** (`HUB.md` §13.11, §13.12):
   - new repositories encrypt `.env`, `.env.*`, `.envrc` and Terraform state on the device and sync them; only devices holding the key open them;
+  - **each access line's secrets have their own key**, held by the people the line gives the folder to and by the admins: finance opens `billing/.env`, never `infra/.env`. A secret no line gives anyone is the admins';
   - personal private keys and credentials (`id_rsa`, `id_ed25519`, `*.pem`, `*.key`, `.netrc`, …) never leave the device, and the server refuses them;
-  - existing repositories switch only with `vl upgrade --sync-secrets`, which lists the files first;
-  - **keys are granted by an admin's signature, never by the server:** an admin's `vl group add` signs the key grant for the people added, **for their confirmed devices only**: a person's first device is confirmed by the admin, who compares its fingerprint with them (`confirm alice's device: 4F2A-…`, then `--confirm`), and later devices by the person from a device they already use (`vl identity confirm`). The server's list of someone's devices is never enough (`HUB.md` §13.11). A manager's addition, or anything the server does on its own, gives folder access but no key. Removing someone from their last group rotates the key when an admin does it; a manager's removal says it did not and asks an admin to remove them too.
-  - In S1 one key opens every secret of the project; keys per access rule come in S2 (`HUB.md` §13.6).
+  - existing repositories switch only with `vl upgrade --sync-secrets`, which lists the files first; a project from S1 (one key for every secret) moves to a key per folder only with an admin's `vl upgrade --rule-keys`, which lists every secret and who will hold its key first;
+  - **a hacked server can never hand out a key.** Keys go only to **confirmed devices**: a person's first device is confirmed by an **invite** (`vl invite alice --to finance` prints a one-time link, valid 7 days, whose secret the server never sees; alice runs `vl join -` and pastes it) or by the admin comparing its fingerprint with them (`vl group add … --confirm 4F2A-…`), and their later devices by the person from a device they already use (`vl identity confirm`). The key ring itself checks every device it receives, by signatures the server cannot make; the server's lists are never enough. **Every key ring belongs to one project,** and a device trusts a project's keys only once it knows the project's fingerprint from outside the server (the invite link carries it; otherwise the person compares it with an admin, or with another of their devices, and runs `vl identity confirm` in the clone), so a hacked server can hand out neither another project's keys nor keys of its own;
+  - **keys are shared in the background:** a teammate's device that holds a key gives it to a newly confirmed device within seconds of its next `vl` command; an admin's `vl group add` still grants it at once. A manager's addition, or anything the server does on its own, gives folder access but no key;
+  - **removing someone rotates only the keys they lose** (an admin's `vl group remove`; a manager's says it did not rotate and asks an admin). **A lost device** is removed with `vl identity remove FINGERPRINT`: by its person, everywhere (it can no longer sign in); by an admin, from their project only. Either way the project's keys it held rotate.
 - **Anyone on Earth** (not signed in) receives `public` folders only, and does not see a project with nothing public.
 
 ## For the design: open technical questions (not product questions)

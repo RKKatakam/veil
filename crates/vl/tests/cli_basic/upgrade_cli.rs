@@ -60,19 +60,19 @@ fn upgrade_from_the_cli() {
     assert!(ok(&vl(&home, &alice, &["cat", "secrets/notes.txt", "-r", "main"])).contains("team-only notes v2"));
     let dry = ok(&vl(&home, &alice, &["upgrade", "--dry-run"]));
     assert!(
-        dry.contains("Would upgrade this repository from format 1 to format 6"),
+        dry.contains(&format!("Would upgrade this repository from format 1 to format {}", veil_core::repo::REPO_FORMAT)),
         "{dry}"
     );
     assert_eq!(format_of(&alice), 1);
 
     let out = ok(&vl(&home, &alice, &["upgrade"]));
     assert!(
-        out.contains("Upgraded this repository from format 1 to format 6"),
+        out.contains(&format!("Upgraded this repository from format 1 to format {}", veil_core::repo::REPO_FORMAT)),
         "{out}"
     );
     assert!(out.contains("scope 'team': new key generation 3"), "{out}");
-    assert_eq!(format_of(&alice), 6);
-    assert!(ok(&vl(&home, &alice, &["upgrade"])).contains("already at format 6"));
+    assert_eq!(format_of(&alice), u64::from(veil_core::repo::REPO_FORMAT));
+    assert!(ok(&vl(&home, &alice, &["upgrade"])).contains(&format!("already at format {}", veil_core::repo::REPO_FORMAT)));
     ok(&vl(&home, &alice, &["fsck"]));
 
     // New commits are binary; the format-1 remote refuses them until upgraded.
@@ -92,7 +92,7 @@ fn upgrade_from_the_cli() {
     let up = ok(&vl(&home, &alice, &["upgrade", "--remote", "origin"]));
     assert!(up.contains("Upgraded remote 'origin'"), "{up}");
     ok(&vl(&home, &alice, &["push", "origin"]));
-    assert_eq!(format_of(&root.join("team-remote")), 6);
+    assert_eq!(format_of(&root.join("team-remote")), u64::from(veil_core::repo::REPO_FORMAT));
 }
 
 #[test]
@@ -105,7 +105,7 @@ fn upgrade_from_format_2_moves_keys_to_hpke_from_the_cli() {
     assert!(show.contains("legacy: derived from the encryption key"), "{show}");
 
     let out = ok(&vl(&home, &alice, &["upgrade"]));
-    assert!(out.contains("from format 2 to format 6"), "{out}");
+    assert!(out.contains(&format!("from format 2 to format {}", veil_core::repo::REPO_FORMAT)), "{out}");
     assert!(out.contains("3:hpke-ring-keys"), "{out}");
     assert!(out.contains("nothing is re-sealed"), "{out}");
     assert!(ok(&vl(&home, &alice, &["cat", "secrets/notes.txt", "-r", "main"])).contains("team-only notes v2"));
@@ -126,7 +126,7 @@ fn upgrade_from_format_2_moves_keys_to_hpke_from_the_cli() {
     let bob_home = root.join("home-bob");
     let dest = tmp.path().join("bob-clone");
     ok(&vl(&bob_home, tmp.path(), &["clone", root.join("team-remote").to_str().unwrap(), dest.to_str().unwrap()]));
-    assert_eq!(format_of(&dest), 6);
+    assert_eq!(format_of(&dest), u64::from(veil_core::repo::REPO_FORMAT));
     assert!(ok(&vl(&bob_home, &dest, &["cat", "secrets/notes.txt", "-r", "main"])).contains("notes after the upgrade"));
 }
 

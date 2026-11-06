@@ -31,6 +31,7 @@ mod docgen;
 mod history;
 mod hub;
 mod hub_cmd;
+mod hub_keys;
 mod hooks;
 mod mount;
 mod picker;
@@ -161,6 +162,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Man { out_dir } => cmd_man(out_dir.as_deref()),
+        Cmd::Join { link } => hub_keys::join(link).map(|()| ExitCode::SUCCESS),
+        Cmd::Upgrade { dry_run, rule_keys: true, .. } => {
+            let mut ctx = open(&cli)?;
+            let code = hub_keys::upgrade_rule_keys(&mut ctx, *dry_run)?;
+            ctx.finish()?;
+            Ok(code)
+        }
         Cmd::Upgrade { dry_run, sync_secrets: true, .. } => {
             let mut ctx = open(&cli)?;
             let code = cmd_sync_secrets(&mut ctx, *dry_run)?;
@@ -199,6 +207,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
             if !matches!(cli.cmd, Cmd::Gc { .. }) {
                 auto_gc::maybe_spawn(&ctx);
             }
+            if !matches!(cli.cmd, Cmd::ShareKeys) {
+                hub_keys::maybe_spawn(&ctx);
+            }
             Ok(code)
         }
     }
@@ -230,6 +241,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Init { .. }
         | Cmd::Clone { .. }
         | Cmd::Login { .. }
+        | Cmd::Join { .. }
         | Cmd::Identity(_)
         | Cmd::Fsck { .. }
         | Cmd::Doctor { .. }
@@ -530,6 +542,8 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Watch { interval_ms } => cmd_watch(ctx, *interval_ms)?,
         Cmd::Remote(c) => cmd_remote(ctx, c)?,
         Cmd::Group(c) => hub_cmd::group(ctx, c)?,
+        Cmd::Invite { person, to } => hub_cmd::invite(ctx, person, to)?,
+        Cmd::ShareKeys => hub_cmd::share_keys(ctx)?,
         Cmd::Access { path, who } => hub_cmd::access(ctx, path, who)?,
         Cmd::Push { remote, tag, force, dry_run: false, delete, .. }
             if delete.is_empty() && hub_cmd::is_hub_remote(ctx, remote.as_deref().unwrap_or("origin")) =>
@@ -797,6 +811,9 @@ fn cmd_identity(c: &IdentityCmd) -> Result<ExitCode> {
                 println!("            (legacy: derived from the encryption key; `vl identity new` creates independent keys)");
             }
             println!("stored at   {}", ctx::identity_path().display());
+            if let Some(line) = hub_keys::clone_here().as_ref().and_then(hub_keys::project_line) {
+                println!("project     {line}");
+            }
         }
         IdentityCmd::New { name, force } => {
             let path = ctx::identity_path();
@@ -838,6 +855,7 @@ fn cmd_identity(c: &IdentityCmd) -> Result<ExitCode> {
             }
         }
         IdentityCmd::Confirm { fingerprint, server } => hub_cmd::confirm_device(fingerprint, server.as_deref())?,
+        IdentityCmd::Remove { fingerprint, server } => hub_keys::remove_device(fingerprint, server.as_deref())?,
         IdentityCmd::RecoverAdmin { from, revoke_old } => {
             use veil_core::keychain::AdminRecovery;
             let id = load_identity()?;
@@ -2216,7 +2234,7 @@ fn cmd_scope(ctx: &mut Ctx, c: &ScopeCmd) -> Result<()> {
                     veil_core::keychain::RingOp::Genesis { members, .. } => {
                         names.extend(members.iter().map(|m| (m.id.clone(), m.name.clone())))
                     }
-                    veil_core::keychain::RingOp::Grant { member } => {
+                    veil_core::keychain::RingOp::Grant { member } | veil_core::keychain::RingOp::Share { member, .. } => {
                         names.insert(member.id.clone(), member.name.clone());
                     }
                     _ => {}
@@ -2225,7 +2243,8 @@ fn cmd_scope(ctx: &mut Ctx, c: &ScopeCmd) -> Result<()> {
             for c in &ring.log {
                 let who = names.get(&c.signer).cloned().unwrap_or_else(|| c.signer[..17].to_string());
                 let what = match &c.op {
-                    veil_core::keychain::RingOp::Revoke { member, rotation } => format!(
+                    veil_core::keychain::RingOp::Revoke { member, rotation }
+                    | veil_core::keychain::RingOp::RevokeOwn { member, rotation } => format!(
                         "revoke {} → generation {}",
                         names.get(member).cloned().unwrap_or_else(|| member.clone()),
                         rotation.generation
@@ -2789,7 +2808,10 @@ fn cmd_sync_secrets(ctx: &mut Ctx, dry_run: bool) -> Result<ExitCode> {
         }
     }
     files.sort();
-    println!("These files would start syncing, encrypted under the 'team' key (only devices holding it open them):");
+    println!(
+        "These files would start syncing, encrypted under the key of the access line that gives their folder (the admins' \
+         'team' key where no line names anyone); only devices holding it open them:"
+    );
     for f in &files {
         println!("  {}", safe(f));
     }

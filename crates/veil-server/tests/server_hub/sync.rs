@@ -188,7 +188,7 @@ fn group_changes_grant_and_rotate_secret_keys() {
     // Someone in no group yet, so no admin's device ever granted them a key.
     let newbie = hub.person("newbie");
     let out = p.carol.ok(&c, &["group", "add", "finance", &newbie.name]);
-    assert!(out.contains("key-ring admin"), "{out}");
+    assert!(out.contains("ask a project admin"), "{out}");
     let d = newbie.dir("c");
     newbie.ok(newbie.home.path(), &["clone", &hub.url(&p.name), d.to_str().unwrap()]);
     assert!(d.join(BILL_DIR).join("acme/invoice.txt").exists(), "folder access is the server's record");

@@ -321,6 +321,25 @@ fn signed_message(context: &str, msg: &[u8]) -> Vec<u8> {
     m
 }
 
+/// An Ed25519 key from a 32-byte seed that is not a device identity (an
+/// invite's key, `hub::wire::InviteKey`): its verifying key (hex), and
+/// signatures under the same domain separation as [`Identity::sign`].
+pub struct SeedSigner(SigningKey);
+
+impl SeedSigner {
+    pub fn from_seed(seed: &[u8; 32]) -> SeedSigner {
+        SeedSigner(SigningKey::from_bytes(seed))
+    }
+
+    pub fn verifying_hex(&self) -> String {
+        hex::encode(self.0.verifying_key().to_bytes())
+    }
+
+    pub fn sign(&self, context: &str, msg: &[u8]) -> String {
+        hex::encode(self.0.sign(&signed_message(context, msg)).to_bytes())
+    }
+}
+
 /// Verify an Ed25519 signature (hex) by `verifying_key` (hex) over `msg`
 /// under `context`. Malformed input verifies as `false`.
 pub fn verify_signature(verifying_key: &str, context: &str, msg: &[u8], signature: &str) -> bool {

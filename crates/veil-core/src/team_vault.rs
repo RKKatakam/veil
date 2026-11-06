@@ -642,8 +642,8 @@ fn generation_starts(ring: &KeyRing) -> BTreeMap<u32, i64> {
     for c in &ring.log {
         let g = match &c.op {
             RingOp::Genesis { .. } => 0,
-            RingOp::Revoke { rotation, .. } | RingOp::Rotate { rotation } => rotation.generation,
-            RingOp::Grant { .. } => continue,
+            RingOp::Revoke { rotation, .. } | RingOp::Rotate { rotation } | RingOp::RevokeOwn { rotation, .. } => rotation.generation,
+            RingOp::Grant { .. } | RingOp::Share { .. } | RingOp::Invite { .. } | RingOp::Uninvite { .. } => continue,
         };
         out.entry(g).or_insert(c.timestamp);
     }
@@ -656,7 +656,7 @@ fn ever_members(ring: &KeyRing) -> BTreeSet<String> {
     for c in &ring.log {
         match &c.op {
             RingOp::Genesis { members, .. } => out.extend(members.iter().map(|m| m.id.clone())),
-            RingOp::Grant { member } => {
+            RingOp::Grant { member } | RingOp::Share { member, .. } => {
                 out.insert(member.id.clone());
             }
             _ => {}
@@ -842,10 +842,11 @@ pub fn last_generation_held(ring: &KeyRing, state: &RingState, member: &str) -> 
     for c in &ring.log {
         let g = match &c.op {
             RingOp::Genesis { members, .. } => members.iter().any(|m| m.id == member).then_some(0),
-            RingOp::Grant { member: m } => (m.id == member).then_some(m.generation),
-            RingOp::Revoke { rotation, .. } | RingOp::Rotate { rotation } => {
+            RingOp::Grant { member: m } | RingOp::Share { member: m, .. } => (m.id == member).then_some(m.generation),
+            RingOp::Revoke { rotation, .. } | RingOp::Rotate { rotation } | RingOp::RevokeOwn { rotation, .. } => {
                 rotation.wrapped.contains_key(member).then_some(rotation.generation)
             }
+            RingOp::Invite { .. } | RingOp::Uninvite { .. } => None,
         };
         if g.is_some() {
             last = last.max(g);
@@ -861,7 +862,7 @@ pub fn resolve_member(ring: &KeyRing, state: &RingState, who: &str) -> Result<(S
     for c in &ring.log {
         match &c.op {
             RingOp::Genesis { members, .. } => names.extend(members.iter().map(|m| (m.id.clone(), m.name.clone()))),
-            RingOp::Grant { member } => {
+            RingOp::Grant { member } | RingOp::Share { member, .. } => {
                 names.insert(member.id.clone(), member.name.clone());
             }
             _ => {}
