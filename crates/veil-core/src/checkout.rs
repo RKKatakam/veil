@@ -916,9 +916,21 @@ fn apply_changes(
             had_file: current.is_some_and(|m| m.kind == NodeKind::File),
         });
     }
-    // Read and stage the files on several threads (BUG-818's barrier then
-    // makes them durable at once), then take the outcomes in order.
-    let outcomes = parallel_map(&jobs, |j| stage_one(store, fs, j));
+    // Read and stage the small files on several threads (BUG-818's
+    // barrier then makes them durable at once), the large ones here, one
+    // at a time as before: memory stays bounded (the 1 GB profile's
+    // checkout reached 593 MiB with every file on 16 threads). Then take
+    // the outcomes in order.
+    let small = |j: &Job<'_>| j.entry.size <= PARALLEL_FILE_MAX;
+    let small_jobs: Vec<&Job<'_>> = jobs.iter().filter(|j| small(j)).collect();
+    let mut parallel = parallel_map(&small_jobs, |j| stage_one(store, fs, j)).into_iter();
+    let outcomes: Vec<Staging1> = jobs
+        .iter()
+        .map(|j| match small(j) {
+            true => parallel.next().expect("one outcome per small file"),
+            false => stage_one(store, fs, j),
+        })
+        .collect();
     let mut fatal = None;
     for (j, outcome) in jobs.iter().zip(outcomes) {
         let path = &j.change.path;
@@ -1045,11 +1057,21 @@ fn stage_one(store: &ObjectStore, fs: &dyn StorageBackend, j: &Job<'_>) -> Stagi
     }
 }
 
-/// `f` over `items` on up to 16 threads (in order); on one thread for a
+/// Largest file [`apply_changes`] stages on another thread.
+const PARALLEL_FILE_MAX: u64 = 256 << 10;
+
+/// Threads [`parallel_map`] uses at most. Each one reading packed objects
+/// raises peak memory (about 6 MiB each on the scale benchmark's small
+/// profile, more on larger ones); 8 keep the 1 GB profile's checkout well
+/// under its 512 MiB gate. A 10,000-file clone: 365 ms at 16 threads, 445
+/// at 8, 525 at 4 (Git 575).
+const PARALLEL_THREADS: usize = 8;
+
+/// `f` over `items` on up to [`PARALLEL_THREADS`] threads (in order); on one thread for a
 /// few items, and always without the `os` feature (WASM).
 fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     let threads = match cfg!(feature = "os") && items.len() >= 64 {
-        true => std::thread::available_parallelism().map_or(1, |n| n.get()).min(16),
+        true => std::thread::available_parallelism().map_or(1, |n| n.get()).min(PARALLEL_THREADS),
         false => 1,
     };
     if threads <= 1 {
