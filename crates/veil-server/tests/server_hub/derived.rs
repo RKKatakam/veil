@@ -1437,3 +1437,369 @@ fn derived_speed() {
         }))
         .unwrap();
 }
+
+// ---- adversarial pass: S12 derived data (BUG-866…) -------------------------------
+
+mod s12_adversarial {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use veil_core::hub::project::empty_tree_id;
+
+    use super::*;
+
+    /// A snapshot of tree `tree` (its objects in `objects`) written as
+    /// committed history, without keeping a copy of its files.
+    fn commit_tree(th: &TestHub, h: &mut Hist, parents: &[ObjectId], tree: ObjectId, mut objects: Vec<(ObjectId, Vec<u8>)>, n: u128, timestamp: i64) -> ObjectId {
+        let s = Snapshot {
+            parents: parents.to_vec(),
+            change_id: ChangeId(n.to_le_bytes()),
+            tree,
+            description: Text::Plain(format!("change {n}")),
+            author: "gen".into(),
+            timestamp,
+            predecessors: vec![],
+            conflicts: vec![],
+            cloak: None,
+            embargo: None,
+            signature: None,
+        };
+        let raw = Object::Snapshot(s).encode();
+        let id = ObjectId::hash(&raw);
+        objects.push((id, raw));
+        h.put(th, objects);
+        th.rt.block_on(async {
+            again(|| {
+                sqlx::query("INSERT INTO snapshots (project_id, id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+                    .bind(h.id)
+                    .bind(id.hex())
+                    .execute(&h.hub.db)
+            })
+            .await;
+        });
+        h.parents.insert(id, parents.to_vec());
+        h.order.push(id);
+        id
+    }
+
+    fn tree_of(files: &Files) -> (ObjectId, Vec<(ObjectId, Vec<u8>)>) {
+        let mut out = Vec::new();
+        let id = build_tree(files, &mut out);
+        (id, out)
+    }
+
+    fn devs_policy() -> (String, BTreeMap<String, Binding>) {
+        ("pub/ public devs\nfin/ finance\n".to_string(), BTreeMap::from([
+            ("devs".to_string(), Binding::Group(GROUP_DEVS)),
+            ("finance".to_string(), Binding::Group(GROUP_FIN)),
+        ]))
+    }
+
+    fn rss() -> u64 {
+        let s = std::fs::read_to_string("/proc/self/status").unwrap();
+        let kib: u64 = s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)).unwrap().parse().unwrap();
+        kib * 1024
+    }
+
+    /// `f`'s result, and how far the process's memory rose above where it
+    /// was when `f` started.
+    fn peak_growth<T>(f: impl FnOnce() -> T) -> (T, u64) {
+        let base = rss();
+        let stop = Arc::new(AtomicBool::new(false));
+        let s2 = stop.clone();
+        let sampler = std::thread::spawn(move || {
+            let mut m = 0;
+            while !s2.load(Ordering::Relaxed) {
+                m = m.max(rss());
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            m
+        });
+        let r = f();
+        stop.store(true, Ordering::Relaxed);
+        let peak = sampler.join().unwrap().max(rss());
+        (r, peak.saturating_sub(base))
+    }
+
+    fn project_id(th: &TestHub, name: &str) -> i64 {
+        let hub = th.hub();
+        th.rt.block_on(async { sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(name).fetch_one(&hub.db).await.unwrap() })
+    }
+
+    /// BUG-866: a member's push with a timestamp of `i64::MAX` overflows the
+    /// generation of every snapshot built on it. Debug builds panic in the
+    /// deriver on every run (the project's derived history stops for good);
+    /// release builds wrap, so generations no longer decrease along parent
+    /// edges and ancestry and merge-base walks answer wrongly.
+    #[test]
+    #[ignore = "BUG-866: a far-future snapshot timestamp overflows the derived generation"]
+    fn bug_866_a_far_future_timestamp_breaks_the_commit_graph() {
+        let th = TestHub::start();
+        let p = setup_project(&th);
+        let api = th.api();
+        // A dev (write access to src/ only) pushes a far-future snapshot,
+        // then an ordinary one on top of it.
+        let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+        let tip = c.tip;
+        c.file("src/far-future-5e1a.txt", "x");
+        let (_, r) = c.push_edited("main", Some(tip), |s| s.timestamp = i64::MAX);
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["results"][0]["ok"], true, "{}", r.json());
+        let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+        c.file("src/after-it-5e1a.txt", "y");
+        let r = c.push("main", "built on it");
+        assert_eq!(r.json()["results"][0]["ok"], true, "{}", r.json());
+        let hub = th.hub();
+        let pid = project_id(&th, &p.name);
+        let run = th.rt.block_on(derive::catch_up(&hub, pid, None));
+        assert!(run.is_ok(), "deriving the project fails on every run: {run:?}");
+        // Generations strictly decrease along every parent edge.
+        let rows: Vec<(String, i64, String)> = th.rt.block_on(async {
+            sqlx::query_as("SELECT snapshot, generation, parents FROM graph WHERE project_id = $1").bind(pid).fetch_all(&hub.db).await.unwrap()
+        });
+        let gen: HashMap<String, i64> = rows.iter().map(|(s, g, _)| (s.clone(), *g)).collect();
+        for (s, g, parents) in &rows {
+            for p in serde_json::from_str::<Vec<ObjectId>>(parents).unwrap() {
+                let pg = gen.get(&p.hex()).copied().unwrap_or(0);
+                assert!(*g > pg, "snapshot {s}: generation {g} not above its parent's {pg}");
+            }
+        }
+    }
+
+    /// BUG-867: one batch of the deriver holds every row and object of up
+    /// to 512 snapshots in memory before writing. A member alternating one
+    /// folder between two trees makes each snapshot change tens of thousands
+    /// of paths for an upload of a few hundred bytes, so a single push
+    /// drives the server's memory to gigabytes (512 x 100,000 paths: tens of
+    /// GB).
+    #[test]
+    #[ignore = "BUG-867: a derive batch's memory grows with the paths its snapshots change, unbounded by the 512-snapshot flush"]
+    fn bug_867_a_derive_batch_holds_unbounded_memory() {
+        let th = TestHub::start();
+        let (text, bindings) = devs_policy();
+        let mut h = Hist::new(&th, &text, &bindings);
+        let n_files: usize = std::env::var("VEIL_BUG867_FILES").ok().and_then(|s| s.parse().ok()).unwrap_or(50_000);
+        let n_snaps: usize = std::env::var("VEIL_BUG867_SNAPSHOTS").ok().and_then(|s| s.parse().ok()).unwrap_or(48);
+        let small = Files::from([("pub/keep.txt".to_string(), b"keep\n".to_vec())]);
+        let mut big = small.clone();
+        for i in 0..n_files {
+            big.insert(format!("pub/bulk/{i:06}"), b"x".to_vec());
+        }
+        let (ta, oa) = tree_of(&big);
+        let (tb, ob) = tree_of(&small);
+        let mut tip = commit_tree(&th, &mut h, &[root_snapshot_id()], tb, ob, 1, 1);
+        let mut objects = Some(oa);
+        for k in 0..n_snaps {
+            let t = if k % 2 == 0 { ta } else { tb };
+            tip = commit_tree(&th, &mut h, &[tip], t, objects.take().unwrap_or_default(), 2 + k as u128, 2 + k as i64);
+        }
+        h.set_branch(&th, "main", tip);
+        let (stats, grew) = peak_growth(|| h.derive(&th));
+        assert_eq!(stats.snapshots, n_snaps + 1);
+        println!("BUG-867: {n_snaps} snapshots of {n_files} changed paths each: memory rose {} MiB while deriving", grew >> 20);
+        // The caches are bounded at 512 MiB together (objects and trees);
+        // the batch itself should stay well under another 512 MiB.
+        assert!(grew < 1 << 30, "memory rose {} MiB deriving one batch", grew >> 20);
+    }
+
+    /// BUG-868: every snapshot that changed more than 100,000 paths (`many`)
+    /// is checked, against the trees, for every path of every later change
+    /// on the same line. `many` snapshots cost a member nothing to make (one
+    /// folder alternating between two trees, a few hundred bytes a
+    /// snapshot), so after a push of them, everyone's later landings cost a
+    /// multiple of what they did.
+    #[test]
+    #[ignore = "BUG-868: each many snapshot in history adds tree lookups to every path of every later landing"]
+    fn bug_868_many_snapshots_slow_every_later_landing() {
+        let th = TestHub::start();
+        let n_many: usize = std::env::var("VEIL_BUG868_MANY").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+        // The same history twice: the bulk folder just above the cap (many)
+        // and just below it (listed).
+        let land = |bulk: usize| -> Duration {
+            let (text, bindings) = devs_policy();
+            let mut h = Hist::new(&th, &text, &bindings);
+            let small = Files::from([("pub/keep.txt".to_string(), b"keep\n".to_vec())]);
+            let mut big = small.clone();
+            for i in 0..bulk {
+                big.insert(format!("pub/bulk/{i:06}"), b"x".to_vec());
+            }
+            let (ta, oa) = tree_of(&big);
+            let (tb, ob) = tree_of(&small);
+            let mut tip = commit_tree(&th, &mut h, &[root_snapshot_id()], tb, ob, 1, 1);
+            let mut objects = Some(oa);
+            for k in 0..n_many {
+                let t = if k % 2 == 0 { ta } else { tb };
+                tip = commit_tree(&th, &mut h, &[tip], t, objects.take().unwrap_or_default(), 2 + k as u128, 2 + k as i64);
+            }
+            h.set_branch(&th, "main", tip);
+            h.derive(&th);
+            // One ordinary landing of 5,000 new files elsewhere.
+            let mut later = if n_many % 2 == 1 { big } else { small };
+            for i in 0..5_000 {
+                later.insert(format!("pub/other/{i:05}.txt"), format!("{i}\n").into_bytes());
+            }
+            let (tl, ol) = tree_of(&later);
+            let tip = commit_tree(&th, &mut h, &[tip], tl, ol, 10_000, 10_000);
+            h.set_branch(&th, "main", tip);
+            let t = Instant::now();
+            assert_eq!(h.derive(&th).snapshots, 1);
+            t.elapsed()
+        };
+        let listed = land(derive::changes::MAX_PATHS - 10);
+        let many = land(derive::changes::MAX_PATHS + 1);
+        println!("BUG-868: a landing of 5,000 paths after {n_many} large changes: {listed:?} (listed) vs {many:?} (many)");
+        assert!(many < listed * 3 + Duration::from_millis(500), "{many:?} vs {listed:?}");
+    }
+
+    /// BUG-869: `Reader::visible` of a merge asks `rep` of its parents,
+    /// which asks `visible` of the next merge down: one stack frame pair per
+    /// merge. A member's push of a few thousand merges (100,000 are allowed
+    /// in one push) makes the first `visible` or `rep` of the tip overflow
+    /// the thread's stack, which aborts the whole server process. Run in a
+    /// child process, which the overflow kills.
+    #[test]
+    #[ignore = "BUG-869: Reader::visible recurses once per merge and overflows the stack"]
+    fn bug_869_a_chain_of_merges_overflows_the_readers_stack() {
+        const CHILD: &str = "VEIL_BUG869_CHILD";
+        if std::env::var(CHILD).is_err() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "derived::s12_adversarial::bug_869_a_chain_of_merges_overflows_the_readers_stack", "--ignored", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "the reader's process died ({:?}): {}", out.status, err.lines().filter(|l| l.contains("overflow") || l.contains("BUG-869")).collect::<Vec<_>>().join(" | "));
+            return;
+        }
+        let th = TestHub::start();
+        let (text, bindings) = devs_policy();
+        let mut h = Hist::new(&th, &text, &bindings);
+        let n: usize = std::env::var("VEIL_BUG869_MERGES").ok().and_then(|s| s.parse().ok()).unwrap_or(20_000);
+        let (t0, o0) = tree_of(&Files::from([("pub/a.txt".to_string(), b"a\n".to_vec())]));
+        let a = commit_tree(&th, &mut h, &[root_snapshot_id()], t0, o0, 1, 1);
+        let (t1, o1) = tree_of(&Files::from([("pub/a.txt".to_string(), b"b\n".to_vec())]));
+        let mut tip = commit_tree(&th, &mut h, &[a], t1, o1, 2, 2);
+        // Each merge takes `a` in again and changes nothing.
+        for k in 0..n {
+            tip = commit_tree(&th, &mut h, &[tip, a], t1, Vec::new(), 3 + k as u128, 3 + k as i64);
+        }
+        h.set_branch(&th, "main", tip);
+        h.derive(&th);
+        eprintln!("BUG-869: {n} merges derived; asking visible(tip)");
+        let project = h.project(&th);
+        let ok = th
+            .rt
+            .block_on(derive::read(&h.hub, h.id, move |g| {
+                let lines = g.cx.lines()?;
+                let anyone = Viewer::default();
+                let view = project.view(&anyone);
+                let r = Reader::new(g, &lines, &view);
+                r.visible(&tip)
+            }))
+            .unwrap();
+        assert!(ok);
+    }
+
+    /// BUG-870: every run of the deriver writes one `derive_progress` row
+    /// per branch, and every landing projects every branch tip for every
+    /// view key (`memo_tips`), whether or not the branch moved. Any
+    /// participant may create branches, with no limit (one push may create
+    /// thousands, all naming one snapshot), so one landing then costs
+    /// thousands of statements per view key.
+    #[test]
+    #[ignore = "BUG-870: each landing does work proportional to the project's branch count, not to what moved"]
+    fn bug_870_branches_multiply_the_work_of_every_landing() {
+        let th = TestHub::start();
+        let n_branches: usize = std::env::var("VEIL_BUG870_BRANCHES").ok().and_then(|s| s.parse().ok()).unwrap_or(3_000);
+        let land = |branches: usize| -> Duration {
+            let (text, bindings) = policy(1);
+            let mut h = Hist::new(&th, &text, &bindings);
+            let (t0, o0) = tree_of(&Files::from([("pub/a.txt".to_string(), b"a\n".to_vec())]));
+            let a = commit_tree(&th, &mut h, &[root_snapshot_id()], t0, o0, 1, 1);
+            h.set_branch(&th, "main", a);
+            let (hub, id) = (h.hub.clone(), h.id);
+            th.rt.block_on(async {
+                again(|| {
+                    sqlx::query("INSERT INTO branches (project_id, name, target) SELECT $1, 'b' || n, $2 FROM generate_series(1, $3) AS n ON CONFLICT DO NOTHING")
+                        .bind(id)
+                        .bind(a.hex())
+                        .bind(branches as i64)
+                        .execute(&hub.db)
+                })
+                .await;
+            });
+            h.derive(&th);
+            th.rt.block_on(derive::memo_tips(&hub, id)).unwrap();
+            // One landing on main: what derive::landed runs for it.
+            let (t1, o1) = tree_of(&Files::from([("pub/a.txt".to_string(), b"b\n".to_vec())]));
+            let b = commit_tree(&th, &mut h, &[a], t1, o1, 2, 2);
+            h.set_branch(&th, "main", b);
+            let t = Instant::now();
+            assert_eq!(h.derive(&th).snapshots, 1);
+            th.rt.block_on(derive::memo_tips(&hub, id)).unwrap();
+            t.elapsed()
+        };
+        let one = land(0);
+        let many = land(n_branches);
+        println!("BUG-870: one landing with 1 branch: {one:?}; with {} branches: {many:?}", n_branches + 1);
+        assert!(many < one * 5 + Duration::from_millis(500), "{many:?} vs {one:?}");
+    }
+
+    /// BUG-871: a change whose tree differs from its first parent's but
+    /// changes no leaf (an empty folder added in `fin/`, which a finance
+    /// member may write) is derived as `none`, and `Reader::visible` shows a
+    /// one-parent `none` change to everyone. The projection hides it from
+    /// whoever cannot read `fin/` (it collapses into its parent), so the
+    /// reader disagrees with `sync::projected` and would show the change,
+    /// its description and author to people without access.
+    #[test]
+    #[ignore = "BUG-871: a tree change with no leaf change is derived as none and shown to every viewer"]
+    fn bug_871_a_change_of_an_empty_hidden_folder_is_visible_to_all() {
+        let th = TestHub::start();
+        let (text, bindings) = devs_policy();
+        let mut h = Hist::new(&th, &text, &bindings);
+        let files = Files::from([("pub/a.txt".to_string(), b"a\n".to_vec()), ("fin/b.txt".to_string(), b"b\n".to_vec())]);
+        let (t0, mut o0) = tree_of(&files);
+        let a = commit_tree(&th, &mut h, &[root_snapshot_id()], t0, std::mem::take(&mut o0), 1, 1);
+        // The same files, and an empty folder fin/empty-4c1d.
+        let fin_tree = {
+            let mut out = Vec::new();
+            let id = build_tree(&Files::from([("b.txt".to_string(), b"b\n".to_vec())]), &mut out);
+            let Object::Tree(mut t) = Object::decode(&out.iter().find(|(i, _)| *i == id).unwrap().1).unwrap() else { panic!() };
+            t.insert(TreeEntry::dir("empty-4c1d", empty_tree_id()));
+            let raw = Object::Tree(t).encode();
+            let fid = ObjectId::hash(&raw);
+            out.push((fid, raw));
+            (fid, out)
+        };
+        let pub_tree = {
+            let mut out = Vec::new();
+            let id = build_tree(&Files::from([("a.txt".to_string(), b"a\n".to_vec())]), &mut out);
+            (id, out)
+        };
+        let root = Tree {
+            entries: vec![TreeEntry::dir("fin", fin_tree.0), TreeEntry::dir("pub", pub_tree.0)],
+        };
+        let raw = Object::Tree(root).encode();
+        let rid = ObjectId::hash(&raw);
+        let mut objects = fin_tree.1;
+        objects.extend(pub_tree.1);
+        objects.push((rid, raw));
+        let b = commit_tree(&th, &mut h, &[a], rid, objects, 2, 2);
+        h.set_branch(&th, "main", b);
+        h.derive(&th);
+        let project = h.project(&th);
+        let anyone = Viewer::default();
+        let p = projections(&th, &h, &project, &anyone);
+        let in_history = in_projected_history(&h, &p, &b);
+        let visible = th
+            .rt
+            .block_on(derive::read(&h.hub, h.id, move |g| {
+                let lines = g.cx.lines()?;
+                let view = project.view(&anyone);
+                Reader::new(g, &lines, &view).visible(&b)
+            }))
+            .unwrap();
+        assert!(!in_history, "the projection hides the change of fin/ only");
+        assert_eq!(visible, in_history, "the reader shows anyone on Earth a change of fin/ only");
+    }
+}
