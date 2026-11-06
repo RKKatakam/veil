@@ -54,16 +54,18 @@ The Hub follows **the design of Anthropic's Scion**, which handles tens of thous
 
 The owner adopted the four synthetic workloads published by OpenScion, an independent open implementation of the Scion design, as Veil's speed gates. The repositories are made of 4 KiB files; times are medians.
 
-| Workload | 1,000 files: target | 10,000 files: target | Veil on 2026-11-06 (1k / 10k) |
+| Workload | 1,000 files: target | 10,000 files: target | Veil, real disk, through the server (1k / 10k) |
 |---|---:|---:|---|
-| Import a directory (first snapshot) | **22 ms** | **245 ms** | 51 / 316 ms |
-| Clone everything | **51 ms** | **544 ms** | 50 / 483 ms ✅ |
-| Commit one changed file | **2.5 ms** | **22 ms** | 12.8 / 27 ms (Git: 4.6 / 8.9 ms) |
-| Clone one directory | **6.1 ms** | **25 ms** | not built (fetch on demand) |
+| Import a directory (first snapshot) | **22 ms** | **245 ms** | 101 / 708 ms (Git: 101 / 790 ms) |
+| Clone everything | **51 ms** | **544 ms** | 1,075 / 9,872 ms (Git: 271 / 579 ms) |
+| Commit one changed file | **2.5 ms** | **22 ms** | 34 / 45 ms (Git: 14 / 7 ms) |
+| Clone one directory | **6.1 ms** | **25 ms** | 189 / 193 ms (Git: 79 / 63 ms) |
 
-- The Veil numbers were measured on the development machine with a release build, the median of 5 runs, and Git as a same-machine reference. Absolute numbers depend on the machine, so each gate also requires **beating Git on the same machine**.
-- **The biggest gap is committing one file:** fixed per-command overhead (opening the repository, keys, the op log, the working-copy scan).
-- **These run in `crates/veil-bench` as a permanent profile,** re-run on every stream that touches the client or the server. Once the server exists, clone is also measured over the network.
+- **Measured by the S1 server milestone** on an ext4 NVMe disk: release builds, the median of 5, PostgreSQL, with Git as the same-machine reference. Absolute numbers depend on the machine, so each gate also requires **beating Git on the same machine**. **No gate is met yet.**
+- **Correction:** an earlier table here (51 / 316, 50 / 483, 12.8 / 27 ms) was measured under `/tmp`, which is a tmpfs on the development machine, where `fsync` costs nothing. Those numbers were invalid. **Never benchmark under `/tmp` on that machine.**
+- **The biggest cost:** checkout makes every file durable on its own (BUG-818: 20,154 `fsync`s for 10,001 files, 7.3 s of a 9.4 s clone). Being fixed now.
+- **Next costs:** per-command overhead (commit), server round trips (clone one directory), and hashing and compression work (import).
+- **Performance rounds continue until every gate is met.** The profile runs in `crates/veil-bench` (`docs/design/scale/OPENSCION.md`) and is re-run on every stream that touches the client or the server.
 
 ## What exists today, and what's next
 
