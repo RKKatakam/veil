@@ -82,9 +82,34 @@ pub fn resolve_server(server: Option<&str>) -> Result<(String, String)> {
 /// fingerprint, so pending devices others make under the name cannot hide
 /// it (§13.12). In a clone of a project, this device then shares its keys
 /// with the new one at once.
+///
+/// In a clone of a project, a fingerprint that is the project's (the
+/// server's `team` ring has it) confirms the project instead: this device
+/// then trusts its key rings (BUG-845).
 pub fn confirm_device(fingerprint: &str, server: Option<&str>) -> Result<()> {
     let fp = veil_core::hub::wire::normalize_fingerprint(fingerprint)
-        .ok_or_else(|| anyhow!("a device fingerprint is 20 hex digits, as `vl identity show` prints it (4F2A-9C1E-…)"))?;
+        .ok_or_else(|| anyhow!("a fingerprint is 20 hex digits, as `vl identity show` prints it (4F2A-9C1E-…)"))?;
+    let mut in_clone = false;
+    if server.is_none() {
+        if let Some(mut ctx) = crate::hub_keys::clone_here() {
+            in_clone = true;
+            let (client, _) = client_for(&ctx, "origin")?;
+            // A probe: if the server's `team` ring cannot be read here, the
+            // fingerprint may still be a device's.
+            if crate::hub_keys::confirm_project(Some(ctx.repo.keys()), &client, &fp).unwrap_or(false) {
+                println!(
+                    "Confirmed the fingerprint {} of project {}: this device trusts its secret keys",
+                    bold(&fp),
+                    safe(&client.url.project)
+                );
+                for w in crate::hub_keys::merge_server_rings(ctx.repo.keys(), &client.url, client.rings()?)? {
+                    warn_untrusted(&w);
+                }
+                ctx.finish()?;
+                return Ok(());
+            }
+        }
+    }
     let (authority, me) = resolve_server(server)?;
     let url = HubUrl::parse(&format!("veil://{authority}")).ok_or_else(|| anyhow!("bad server"))??;
     let client = Client::new(&url, load_identity()?)?;
@@ -95,7 +120,13 @@ pub fn confirm_device(fingerprint: &str, server: Option<&str>) -> Result<()> {
             .identities
             .into_iter()
             .find(|d| hub::fingerprint(d).as_deref() == Some(fp.as_str()))
-            .ok_or_else(|| anyhow!("none of {me}'s devices on {authority} has the fingerprint {fp}: check it on the new device (`vl identity show`)"))?,
+            .ok_or_else(|| {
+                anyhow!(
+                    "none of {me}'s devices on {authority} has the fingerprint {fp}{}: check it on the new device (`vl identity show`), \
+                     sign in there again (`vl login veil://{authority} --name {me}`), then run this again",
+                    if in_clone { ", and it is not the fingerprint of this project's keys on the server" } else { "" }
+                )
+            })?,
     };
     if hub::fingerprint(&device).as_deref() != Some(fp.as_str()) {
         bail!("the server answered with a device whose fingerprint is not {fp}");
@@ -163,6 +194,9 @@ fn clone_populate(url: &HubUrl, dest: &Path, only: Option<&str>) -> Result<ExitC
         },
     );
     repo.save_config(config)?;
+    // The project fingerprint this device confirmed, if any: the only `team`
+    // ring it takes (BUG-845).
+    repo.keys().set_anchor(&hub::anchor_for(&url.authority, &url.project)?.unwrap_or_default())?;
     let report = hub::pull(&mut repo, "origin", &client, only).context("fetching from the server")?;
     for w in &report.warnings {
         warn_untrusted(w);

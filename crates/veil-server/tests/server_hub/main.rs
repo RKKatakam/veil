@@ -20,3 +20,4 @@ mod sync;
 mod adversarial;
 mod secrets2;
 mod adversarial_s2;
+mod projects;

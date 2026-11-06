@@ -59,12 +59,33 @@ vl identity confirm 7C1B-0E44-93AD-2F18-B6C0    # on your laptop: the new device
 ```
 
 Nobody else can stop this by making up devices under your name: the new
-device is looked up by its fingerprint, and it waits for a day.
+device is looked up by its fingerprint, and it waits for a day. (If strangers
+flood your name with so many devices that yours was pushed out, `vl identity
+confirm` says so: sign in on the new device again and confirm it; from then
+on nobody can push it out.)
+
+**Each project's fingerprint.** A device trusts a project's secret keys only
+once it knows the project's fingerprint, so a hacked server can never hand it
+another project's keys, or keys of its own making. An invite link carries the
+fingerprint, so `vl join` needs nothing more. Otherwise (a new laptop of
+yours, or an admin who confirmed your device with `--confirm`), your first
+`vl clone` of the project shows the fingerprint the server claims and opens no
+secrets yet. Compare it with `vl identity show` in a clone on another of your
+devices (it prints `project  9D3E-…`), or with your admin, then confirm it in
+the clone:
+
+```sh
+vl identity confirm 9D3E-51A0-C7F2-0B64-E18D    # in the clone: the project's fingerprint
+```
+
+Every later clone of the project on this device trusts the same keys.
 
 **A lost laptop:** remove it from another of your devices, in a clone of the
-project. It can no longer sign in, and the keys of every secret it could open
-rotate away from it (it keeps what it already had). An admin can do the same
-for anyone's device in their project.
+project. It can no longer sign in anywhere, and the keys of every secret it
+could open rotate away from it (it keeps what it already had). An admin can
+remove anyone's device **from their own project**: it can no longer use that
+project, and the project's keys rotate away from it, but only its person can
+remove it everywhere.
 
 ```sh
 vl identity remove 7C1B-0E44-93AD-2F18-B6C0
@@ -104,24 +125,30 @@ vl group list
 $ vl invite alice --to finance
 Invited alice to finance in acme. Send them this link (Slack, email):
 
-  veil://127.0.0.1:8443/acme#invite=alice:5f2c…
+  veil://127.0.0.1:8443/acme#invite=alice:5f2c…:9D3E51A0…
 
-  They run: vl join 'veil://127.0.0.1:8443/acme#invite=alice:5f2c…'
+  They run `vl join -` and paste it (on a shared machine, never put it on the command line).
   It works once, for 7 days. The server never sees the secret in it: their device's keys for billing/ come from it.
 ```
 
-Alice runs `vl join` with the link. It signs her device in (registering the
-name `alice` if it is new), joins her to `finance`, and confirms her device:
-the next teammate's device that runs `vl` gives it the keys of `finance`'s
-folders. The link holds a secret that never reaches the server, so a
-hacked server cannot use it to slip in a device of its own. If someone else
-uses a leaked link first, alice's `vl join` says it was used: remove that
-device (`vl identity remove`) and invite her again.
+Alice runs `vl join -` and pastes the link (or `vl join LINK`; on a machine
+other people use, the link on the command line can be read by them while it
+runs). It signs her device in (registering the name `alice` if it is new),
+joins her to `finance`, and confirms her device: the next teammate's device
+that runs `vl` gives it the keys of `finance`'s folders. The link holds a
+secret that never reaches the server, so a hacked server cannot use it to
+slip in a device of its own, and the project's fingerprint, which `vl join`
+checks: if the server's keys for the project are not those, it says so and her
+device trusts none of them. If someone else uses a leaked link first, alice's
+`vl join` says it was used: remove that device (`vl identity remove`) and
+invite her again.
 
 Without an invite, an admin's `vl group add` shows `confirm alice's device:
 4F2A-…` for a device nothing confirms yet; compare it with what `vl identity
 show` prints on alice's device, then run `vl group add finance alice --confirm
-4F2A-9C1E-77B0-D3E5-A1C2` (one person at a time).
+4F2A-9C1E-77B0-D3E5-A1C2` (one person at a time). Give alice the project's
+fingerprint at the same time (`vl group add` prints it): she confirms it in
+her clone (`vl identity confirm 9D3E-…`), as above.
 
 Access is written in `.veilpolicy`, one line per folder, **the last matching
 line winning**:

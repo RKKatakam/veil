@@ -830,7 +830,7 @@ protocol as pure functions, shared with `vl`; they build for WASM),
 |---|---|---|
 | HTTPS API | tokio, axum, hyper, rustls (ring) | TLS on every connection; `--tls-cert/--tls-key`, or a self-signed certificate (rcgen) for `localhost`/`127.0.0.1` created in the data directory, which `vl login --ca FILE` pins for that server |
 | Metadata | sqlx, PostgreSQL 17 (development, CI) and YugabyteDB 2025.2 | portable SQL only; every read-write transaction is SERIALIZABLE through `db::serializable`, retried with capped exponential backoff on `40001`/`40P01` (YugabyteDB reports conflicts as both) |
-| Migrations | `db::migrate`, `migrations/0001_initial.sql`, `0002_device_vouches.sql` (pending devices, vouches: §13.11), `0003_invites_and_key_sharing.sql` (invites, key requests, pending devices by fingerprint: §13.12) | each in its own transaction, recorded in `schema_migrations`; servers starting together race on its primary key and the loser re-checks. On PostgreSQL DDL is transactional; on YugabyteDB DDL inside a transaction block is applied statement by statement unless transactional DDL is enabled, so **migration files are idempotent** (`IF NOT EXISTS`) and a half-applied one is completed by the next start |
+| Migrations | `db::migrate`, `migrations/0001_initial.sql`, `0002_device_vouches.sql` (pending devices, vouches: §13.11), `0003_invites_and_key_sharing.sql` (invites, key requests, pending devices by fingerprint and the fingerprints a person waits for, devices barred from one project: §13.12) | each in its own transaction, recorded in `schema_migrations`; servers starting together race on its primary key and the loser re-checks. On PostgreSQL DDL is transactional; on YugabyteDB DDL inside a transaction block is applied statement by statement unless transactional DDL is enabled, so **migration files are idempotent** (`IF NOT EXISTS`) and a half-applied one is completed by the next start |
 | Object storage | `store::BlobStore`: `FsStore` (a directory; unit tests, development) and `S3Store` (rusty-s3 request signing + reqwest; tested against MinIO) | key `p/<project id>/ab/cdef…`: projects never share an object; every read is re-hashed against its id; an in-memory cache of objects and decoded trees |
 | Server identity | an Ed25519 `Identity` in `<data>/hub-identity.json` (0600); a random secret in `<data>/hub-receipt-key` (0600) | signs projected snapshots (§13.4); its key is shown by `vl login`. The secret keys upload receipts (§13.5); servers sharing the data directory accept each other's |
 
@@ -980,8 +980,8 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
 | `GET …/access?path=` | the deciding line and who it names; only for a path the caller may read |
 | `…/groups`, `GET|POST …/rings/{scope}`, `GET /v1/people/{name}/devices` | groups; key rings of secret scopes; a person's devices (active, the newest pending, removed), the vouches and invite joins the server stores, which devices check before sharing a key (§13.11, §13.12) |
 | `POST /v1/devices/vouch {device, signature}` | the signed-in device vouches for another device of its person; a pending one becomes active |
-| `GET /v1/people/{me}/pending/{fingerprint}` | one of the caller's own pending devices, by fingerprint (§13.12) |
-| `POST /v1/devices/remove {device, project?}` | remove a device: its person, from another device, or an admin of `project` where the person takes part; its sessions end (§13.12) |
+| `GET /v1/people/{me}/pending/{fingerprint}` | one of the caller's own pending devices, by fingerprint; if none waits, the fingerprint is kept for the person for an hour, so the bound on pending devices never pushes that device out (§13.12) |
+| `POST /v1/devices/remove {device, project?}` | remove a device: its person, from another device, everywhere (its sessions end); or an admin of `project` where the person takes part, from that project only (§13.12, BUG-843) |
 | `POST …/invites {key, person, group, expires_at}`, `POST …/invites/join {key, device, signature}` | an admin records an invite's public key; the signed-in device joins under it, once, before it expires (§13.12) |
 | `GET …/keys/pending` | the people whose devices may wait for keys, with their devices, vouches, joins and removed devices: a hint for the devices that share keys (§13.12) |
 
@@ -1118,7 +1118,7 @@ invite join or the person's own vouch. Server lists are hints.
 * **Devices** (fixed in S2, §13.12): a confirmed device receives its keys
   from any member's device, in the background; devices are removed with
   `vl identity remove`; pending devices are found by fingerprint, so others
-  made under a name never hide the real one.
+  made under a name never hide the real one, and are bounded per person.
 * **Embargoes and cloaked lines** cannot be pushed to the server yet.
 * **`--only` clones** cannot move to revisions that changed folders outside
   their directory (§13.5).
@@ -1204,9 +1204,9 @@ for by someone outside the server.
   signature context `hub-device`, over the new device's X25519 and Ed25519
   keys) with her device key. The server checks the vouch, activates the
   device and stores the vouch; the new device's next `vl login` signs in.
-  A pending device waits 24 hours (signing in again renews it); since S2
-  there is no cap per person, and `vl identity confirm` looks it up by its
-  fingerprint (§13.12).
+  A pending device waits 24 hours (signing in again renews it), and `vl
+  identity confirm` looks it up by its fingerprint (§13.12); a person has at
+  most 32 pending devices, and one they looked for is never pushed out.
 * **What an admin's `vl` wraps for.** For each person being added it takes
   the server's list of their devices *and the vouches*, and grants the
   secret scopes only to devices in this chain, built entirely from things
@@ -1306,13 +1306,18 @@ ever need `vl invite`, `vl group add|remove`, `vl access` and, rarely,
   bytes on the admin's device. It derives the invite key from them, appends
   `invite` to the rings of the rules naming `finance`, tells the server
   (person, group, public key, expiry: 7 days) and prints
-  `veil://host/project#invite=alice:<64 hex>`. **The secret is only in the
+  `veil://host/project#invite=alice:<64 hex>:<20 hex>`: the secret, then
+  **the project's fingerprint** (below). **The secret is only in the
   link.** The fragment is never sent to the server by `vl`; the server sees
-  only the public key. `vl join <link>` signs in (a new name registers
-  alice; a name somebody has must sign in from one of its devices first),
-  signs the join for this device with the invite key, and sends it. The
-  server checks it, marks the invite used, adds alice to `finance` (folder
-  access) and queues "share keys for alice". The fingerprint flow
+  only the public key. `vl join <link>` (or `vl join -`, reading the link on
+  standard input, where other users of the machine cannot see it) signs in
+  (a new name registers alice; a name somebody has must sign in from one of
+  its devices first), signs the join for this device with the invite key,
+  and sends it. The server checks it, marks the invite used, adds alice to
+  `finance` (folder access) and queues "share keys for alice". `vl join`
+  then checks that the server's `team` ring has the link's project
+  fingerprint and records it: the anchor of every ring alice's device takes
+  from this project. The fingerprint flow
   (`--confirm`) stays as the fallback. **Removing** alice from the group
   (`vl group remove finance alice`, also before she has an account) takes
   back her invites to it that were not used, on the server and in the
@@ -1325,29 +1330,72 @@ ever need `vl invite`, `vl group add|remove`, `vl access` and, rarely,
   ring. The ring's replay decides, never the list. `vl identity confirm`
   shares from the confirming device at once, and `vl group add` by an admin
   still grants directly.
-* **Which rings a device takes from the server.** A ring of a scope the
-  device does not hold yet is taken only if a current member of its `team`
-  ring (the admins', on the server) started it; `team` itself is taken when
-  first seen, on the first clone. So the server cannot put up a ring of its
-  own, for any scope, that confirms its devices to an admin or seals a
-  rule's secrets under its key (BUG-840, BUG-841).
+* **Every ring is bound to its project** (BUG-845). A project's id is the
+  hash of its `team` ring's genesis change (32 hex digits); every other ring
+  carries it in its signed genesis (`project`). The **project fingerprint**
+  people compare is the first 80 bits of BLAKE3 `derive_key("veil 2026 hub
+  project-fingerprint v1", id)`, shown as `9D3E-51A0-C7F2-0B64-E18D`.
+  Every replay that decides about keys (`Keychain::bound`: sealing, opening,
+  taking a ring, an admin's or member's change, the server's merge) refuses
+  a ring that names another project, and in a clone of a server project one
+  that names none.
+* **Which rings a device takes from the server.** Only rings of a project
+  whose fingerprint this device **anchored**, from outside the server:
+  * the device that created the project (its own `team` ring);
+  * `vl join`, from the invite link;
+  * `vl identity confirm PROJECT-FINGERPRINT` in a clone, after the person
+    compared it with an admin, or with `vl identity show` in a clone on
+    another of their devices (it prints `project  9D3E-…`). This is how an
+    admin's new laptop, or a device an admin confirmed with `--confirm`,
+    anchors a project: `vl group add … --confirm` prints the project's
+    fingerprint to tell the person, and an unanchored clone prints the one
+    the server claims, to compare.
+
+  The anchor is kept per device and project (`$VEIL_HOME/hub.json`) and in
+  each clone (`.veil/local/project-anchor`). Until a clone has one, it takes
+  no ring at all (code still arrives: it is plain text, and the server's
+  access check protects it), so it seals and opens no secret. With one, it
+  takes only the `team` ring with that fingerprint, and then only rings
+  naming that project. A ring of a scope the device does not hold yet must
+  also be started by a current member of its `team` ring (the admins'),
+  so the server cannot put up a ring of its own, for any scope, that
+  confirms its devices to an admin or seals a rule's secrets under its key
+  (BUG-840, BUG-841). The server, for its part, stores a new ring only if
+  it names the project's `team` ring, sent first.
+* **Why not in the vouch.** A new device cannot check a vouch's signer by
+  itself: a hacked server can show it a made-up "device of yours" vouching
+  for anchors of the server's choosing. So a later device anchors through
+  the person's own comparison of the project fingerprint (or an invite), not
+  through the vouch.
 * **Every ring change is decided on the server's latest ring.** It is built
   in memory, sent, and stored locally only once the server accepted it as
   a fast-forward. On a race (409) the device fetches the ring and decides
   again from scratch: a removal racing a share can never resurrect a removed
   device, and no device ever keeps a key the server refused.
-* **Device removal.** `vl identity remove FINGERPRINT` (the person, from
-  another of their devices, or an admin) removes the device on the server
-  (its sessions stop) and revokes it in every ring of this project, found by
-  its fingerprint among the **ring's** members, not the server's list. The
-  person's other devices, or admins, do the same in other projects in the
-  background when the server reports a removed device. Revoking is
+* **Device removal** (BUG-843). `vl identity remove FINGERPRINT`:
+  * **by the person**, from another of their devices: the device is removed
+    on the server everywhere (it can no longer sign in, its sessions stop);
+  * **by an admin**, of someone else's device: the device is **barred from
+    that project only** (`device_bars`): every request of it to the project
+    is refused, and nothing reaches the person's other projects. Only the
+    person removes a device everywhere.
+
+  Either way `vl` revokes it in every ring of this project, found by its
+  fingerprint among the **ring's** members, not the server's list. The
+  server reports it as removed in the projects it no longer may use (a
+  global removal: all of them; a bar: that one), and the person's other
+  devices, or admins, revoke it there in the background. Revoking is
   conservative, so trusting that report gives a hacked server nothing.
-* **Pending devices** (§13.8's limit) are no longer capped per person. Each
-  expires after 24 h, and `vl identity confirm` looks a device up **by its
-  fingerprint** (`GET /v1/people/{me}/pending/{fp}`, for its person only),
-  so no number of made-up pending devices can push out or hide the real
-  one.
+* **Pending devices** (§13.8's limit). Each expires after 24 h, and `vl
+  identity confirm` looks a device up **by its fingerprint** (`GET
+  /v1/people/{me}/pending/{fp}`, for its person only). A person has at most
+  32 pending devices: a new one pushes out the oldest, **except one whose
+  fingerprint the person looked for** in the last hour (`device_expected`,
+  at most 8 per person, written only by the person's own lookup). So the
+  table stays bounded, and no number of made-up pending devices hides the
+  real one: if a flood pushed it out before the person looked, `vl identity
+  confirm` says so, the new device signs in again, and from then on nobody
+  can push it out.
 * **Migration from S1's one key** (explicit and listed): `vl upgrade` moves
   each clone to format 7. Then an admin runs `vl upgrade --rule-keys`
   (`--dry-run` lists only). It lists every secret with its new key and who
@@ -1362,7 +1410,8 @@ ever need `vl invite`, `vl group add|remove`, `vl access` and, rarely,
 
 The attacker is **whoever controls the server** (outside the boundary for
 secrets, §3.1), unless a row says otherwise. Each row is tested in
-`server_hub` (`adversarial`, `secrets2`).
+`server_hub` (`adversarial`, `secrets2`, `adversarial_s2`, `projects`) and
+`core_security` (`ring_shares`).
 
 | # | Tries | Result |
 |---|---|---|
@@ -1382,11 +1431,19 @@ secrets, §3.1), unless a row says otherwise. Each row is tested in
 | 14 | **Sends `infra/.env`'s ciphertext** to someone with `billing/` only | Sealed under `rule-<infra>`, which they never hold |
 | 15 | **Misreports a group's members** to an admin's `vl access` or `vl group add` | Only confirmed devices are granted, so the server's own devices never are. The command lists every person it granted. A lying list can make an admin grant a *real teammate* a rule's key, never the server |
 | 16 | **Misreports membership at a removal** (keeps someone listed in another group) | The removal says who kept a key and why (BUG-836) |
-| 17 | **Floods pending devices** under alice's name | No per-person cap; lookup is by fingerprint (80 bits, a second preimage); each pending device expires after 24 h. Alice's real device is always found |
+| 17 | **Floods pending devices** under alice's name (also in parallel) | Lookup is by fingerprint (80 bits, a second preimage); each pending device expires after 24 h; at most 32 per person, the oldest pushed out, never one alice looked for (`device_expected`, written only by her own lookup). A flood before she looks pushes hers out once: `vl identity confirm` says so, the device signs in again, and is kept from then on |
 | 18 | **Turns a leaked or replayed invite into an account** (a device signs in as an existing person) | A join never makes a device someone's: under a name somebody has, `vl join` needs a session of that person's |
 | 19 | *A member* (insider) shares to a device that is not the person's | They hold the key and could leak it anyway: trusted (§3.1). Still, the replay lets them add only devices with a proof |
 | 20 | *A compromised member device* revokes others or takes over the ring | `revoke_own` only reaches the same person's devices; anything else needs an admin's signature |
-| 21 | *Someone who reads the invite link* (a leaked Slack message) | Before alice uses it: they can join as alice (first use wins), and alice's own `vl join` then fails ("used"), so it is noticed. The admin removes the device (`vl identity remove`) and invites again. After use, or after 7 days: nothing |
+| 21 | *Someone who reads the invite link* (a leaked Slack message) | Before alice uses it: they can join as alice (first use wins), and alice's own `vl join` then fails ("used"), so it is noticed. The admin removes the device (`vl identity remove`) and invites again. After use, or after 7 days: nothing. `vl join -` reads the link on standard input, so other users of a shared machine cannot read it from the command line |
+| 22 | **Serves another project's ring** for the same rule path (`rule-<billing>` is the same name everywhere; the same admin started both) | The ring's signed genesis names its project; every replay that decides about keys refuses another project's ring (BUG-845) |
+| 23 | **Renames a ring** (another project's ring served under another scope name) | The scope is in every signed change: the replay fails |
+| 24 | **Replays a change** of one project's ring onto another's | Each change signs its scope and the previous change's hash: it does not link |
+| 25 | **Serves another project's `team`** (or one it made) to a device's first clone | The device takes no ring until it anchored the project's fingerprint (the invite link, its own creation of the project, or the person's comparison); then only the `team` with that fingerprint. `vl identity confirm` checks a typed fingerprint against the server's `team` ring, so a substituted one cannot be confirmed |
+| 26 | **Substitutes `team` before a join** (or the link's fingerprint was changed) | `vl join` fails loudly ("not the one your invite names") and records nothing: the device trusts none of the project's rings |
+| 27 | **Gives an admin's new laptop** (vouched, holding project A's keys) project A's ring as B's | The laptop anchors B separately (B's fingerprint, compared with the admin's first device); A's ring names A and is refused in B |
+| 28 | **Shows a made-up vouching device** with anchors of its choosing to a new device | Anchors never come from a vouch (the new device cannot check its signer): only from an invite link or the person's comparison |
+| 29 | *An admin of any project* (anyone can make one and add a person to a group) removes the person's device | It is barred from that admin's project only; the person's other projects never list it as removed; only the person removes a device everywhere (BUG-843) |
 
 **Residual risks** (not closed here; recorded):
 * **Freshness:** a server can withhold a rotation from a member's device,
@@ -1403,11 +1460,10 @@ secrets, §3.1), unless a row says otherwise. Each row is tested in
   key back only with a new `--confirm` (row 10).
 * Invites name the invited person in the rings of their group's folders,
   which every participant of the project may read.
-* **Rings are not bound to their project** (BUG-845, open; owner decision,
-  crypto and format): rule scope names depend on the path only, and a
-  device's first clone takes `team` on the server's word. A server can hand
-  a new device another project's ring for the same path (started by the same
-  admin), and that device seals this project's secrets under it.
-* **Device removal by an admin is global** (BUG-843, open): an admin of any
-  project the person is in removes the device everywhere, so anyone can make
-  a project, add a person and remove their device (denial of service).
+* **A person who confirms a project fingerprint without comparing it**
+  (like an admin who confirms a device fingerprint without comparing it)
+  trusts what the server shows: the human comparison is the boundary. An
+  invite link needs no comparison.
+* **A clone made before its device anchored the project** opens no secret
+  until the person confirms the fingerprint; this is the price of never
+  trusting a ring on the server's word.

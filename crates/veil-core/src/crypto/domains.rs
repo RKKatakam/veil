@@ -172,6 +172,13 @@ pub const HUB_UPLOAD_RECEIPT: &str = "veil 2026 hub upload-receipt v1";
 /// leaves the admin's device and the link.
 pub const HUB_INVITE_KEY: &str = "veil 2026 hub invite-key v1";
 
+/// BLAKE3 `derive_key` context of a project's fingerprint, over its id (the
+/// hash of its `team` key ring's genesis; first 10 bytes, shown as
+/// `4F2A-9C1E-…`): what an invite link carries and what a person compares
+/// before a device trusts the project's key rings (`docs/HUB.md` §13.12,
+/// BUG-845). Not secret.
+pub const HUB_PROJECT_FINGERPRINT: &str = "veil 2026 hub project-fingerprint v1";
+
 /// BLAKE3 `derive_key` context of the scope name of an access line's
 /// secrets (`policy::rule_scope`): `rule-` and the first 10 bytes (hex)
 /// over the line's path. Not secret.
@@ -192,6 +199,7 @@ pub const BLAKE3_CONTEXTS: &[&str] = &[
     HUB_UPLOAD_RECEIPT,
     HUB_INVITE_KEY,
     POLICY_RULE_SCOPE,
+    HUB_PROJECT_FINGERPRINT,
 ];
 
 #[cfg(test)]
@@ -213,7 +221,8 @@ mod tests {
                 "veil 2026 hub device-fingerprint v1",
                 "veil 2026 hub upload-receipt v1",
                 "veil 2026 hub invite-key v1",
-                "veil 2026 policy rule-scope v1"
+                "veil 2026 policy rule-scope v1",
+                "veil 2026 hub project-fingerprint v1"
             ],
             "a context changed or was reordered"
         );

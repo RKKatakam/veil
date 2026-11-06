@@ -27,7 +27,7 @@ use veil_core::{
         wire::{self, Devices, GroupInfo, InviteKey},
     },
     identity::parse_public_identity,
-    keychain::{KeyRing, Keychain, RingMerge, RingState, Role, ShareProof},
+    keychain::{project_fingerprint, KeyRing, Keychain, RingMerge, RingState, Role, ShareProof},
     policy::{rule_scope_of, valid_principal_name, Policy, Tier, DEFAULT_SCOPE, POLICY_FILE, RULE_SCOPE},
     MemoryBackend, StorageBackend, VPath,
 };
@@ -213,15 +213,80 @@ fn confirmed_devices(
         .collect())
 }
 
+// ---- the project's fingerprint (BUG-845) ------------------------------------------------
+
+/// Make this clone's record of the project fingerprint it trusts
+/// (`Keychain::anchor`) agree with what this device confirmed for the
+/// project (`hub.json`): a clone of a server project always records one,
+/// or that it trusts none of the project's key rings yet.
+pub fn sync_anchor(keys: &Keychain, url: &HubUrl) -> Result<()> {
+    let device = hub::anchor_for(&url.authority, &url.project)?;
+    match keys.anchor() {
+        Some(a) if !a.is_empty() => {
+            if device.is_none() {
+                hub::set_anchor_for(&url.authority, &url.project, &a)?;
+            }
+        }
+        _ => keys.set_anchor(&device.unwrap_or_default())?,
+    }
+    Ok(())
+}
+
+/// After this device created the project on the server: the `team` ring
+/// it made is the project's, and the one it trusts.
+pub fn anchor_created(keys: &Keychain, url: &HubUrl) -> Result<()> {
+    let Some(Ok(st)) = keys.load_ring(DEFAULT_SCOPE)?.map(|r| r.verify()) else { return Ok(()) };
+    if let Some(p) = st.project {
+        let fp = project_fingerprint(&p);
+        keys.set_anchor(&fp)?;
+        hub::set_anchor_for(&url.authority, &url.project, &fp)?;
+    }
+    Ok(())
+}
+
+/// The project fingerprint of a server's `team` ring (what it claims).
+pub fn fingerprint_of(ring: &KeyRing) -> Option<String> {
+    ring.verify().ok()?.project.map(|p| project_fingerprint(&p))
+}
+
+/// Confirm `fp` as the fingerprint of the project of `url`, against the
+/// server's `team` ring; `Ok(false)` if the server's ring has another one.
+pub fn confirm_project(keys: Option<&Keychain>, client: &Client, fp: &str) -> Result<bool> {
+    let Some(team) = client.ring(DEFAULT_SCOPE)? else { return Ok(false) };
+    if fingerprint_of(&team).as_deref() != Some(fp) {
+        return Ok(false);
+    }
+    hub::set_anchor_for(&client.url.authority, &client.url.project, fp)?;
+    if let Some(keys) = keys {
+        keys.set_anchor(fp)?;
+    }
+    Ok(true)
+}
+
 // ---- taking rings from the server -------------------------------------------------------
 
 /// Take `ring` from the server into this repository (`merge_ring`); a
-/// warning if it was not taken. A ring of a scope this repository does not
+/// warning if it was not taken. Only rings of this project are taken
+/// (`Keychain::bound`, BUG-845): `team` only if it is the ring whose
+/// fingerprint this device confirmed, every other one only if its signed
+/// genesis names that project. A ring of a scope this repository does not
 /// hold yet is taken only if a current member of its `team` ring (the
 /// admins', on the server) started it: the server cannot make a ring of its
 /// own that confirms its devices or seals secrets under its key (BUG-840,
-/// BUG-841). `team` itself is taken when first seen (the first clone).
+/// BUG-841).
 pub fn merge_server_ring(keys: &Keychain, ring: &KeyRing) -> Result<Option<String>> {
+    if ring.scope == DEFAULT_SCOPE && keys.anchor().is_some_and(|a| a.is_empty()) {
+        let fp = fingerprint_of(ring).unwrap_or_else(|| "(none: the server's ring names no project)".into());
+        return Ok(Some(format!(
+            "secret keys: this device does not trust this project's key rings yet. Compare the project's fingerprint {fp} \
+             with an admin (`vl identity show` in their clone prints it; an invite link carries it), then run \
+             `vl identity confirm {fp}` here"
+        )));
+    }
+    if ring.scope != DEFAULT_SCOPE && keys.ring_state(DEFAULT_SCOPE)?.is_none_or(|s| s.is_err()) && keys.anchor().is_some() {
+        // Nothing of this project is trusted yet: `team` said so.
+        return Ok(None);
+    }
     if ring.scope != DEFAULT_SCOPE && !matches!(keys.load_ring(&ring.scope), Ok(Some(_))) {
         let team = keys.ring_state(DEFAULT_SCOPE)?.and_then(|s| s.ok());
         let started_by_team = ring.log.first().is_some_and(|c| {
@@ -242,7 +307,8 @@ pub fn merge_server_ring(keys: &Keychain, ring: &KeyRing) -> Result<Option<Strin
 
 /// Take the server's rings ([`merge_server_ring`]), `team` first: it
 /// decides which others are taken. The warnings.
-pub fn merge_server_rings(keys: &Keychain, mut rings: Vec<KeyRing>) -> Result<Vec<String>> {
+pub fn merge_server_rings(keys: &Keychain, url: &HubUrl, mut rings: Vec<KeyRing>) -> Result<Vec<String>> {
+    sync_anchor(keys, url)?;
     rings.sort_by_key(|r| r.scope != DEFAULT_SCOPE);
     let mut out = Vec::new();
     for r in &rings {
@@ -260,8 +326,8 @@ pub fn merge_server_rings(keys: &Keychain, mut rings: Vec<KeyRing>) -> Result<Ve
 /// so a change is never made on an old ring and no device ever keeps a
 /// key the server refused. `f` may create the ring.
 fn ring_update(ctx: &mut Ctx, client: &Client, scope: &str, mut f: impl FnMut(&Keychain) -> Result<bool>) -> Result<bool> {
-    let path = VPath::new(&format!(".veil/meta/keyrings/{scope}.json"))?;
     let mut refused: Option<(Option<String>, String)> = None;
+    sync_anchor(ctx.repo.keys(), &client.url)?;
     for attempt in 0..12u64 {
         let keys = ctx.repo.keys();
         let server = client.ring(scope)?;
@@ -278,11 +344,18 @@ fn ring_update(ctx: &mut Ctx, client: &Client, scope: &str, mut f: impl FnMut(&K
             }
         }
         let mem = Arc::new(MemoryBackend::new());
-        if let Some(r) = keys.load_ring(scope)? {
-            mem.write(&path, &serde_json::to_vec_pretty(&r)?)?;
+        // The ring, and `team` with the fingerprint this device trusts: the
+        // copy decides as this repository does (`Keychain::bound`).
+        for s in [scope, DEFAULT_SCOPE] {
+            if let Some(r) = keys.load_ring(s)? {
+                mem.write(&VPath::new(&format!(".veil/meta/keyrings/{s}.json"))?, &serde_json::to_vec_pretty(&r)?)?;
+            }
         }
         let work = Keychain::new(mem.clone() as Arc<dyn StorageBackend>, keys.identity().cloned(), ctx.repo.repo_id().to_string());
         work.set_format(keys.format());
+        if let Some(a) = keys.anchor() {
+            work.set_anchor(&a)?;
+        }
         if !f(&work)? {
             return Ok(false);
         }
@@ -308,7 +381,8 @@ fn me_admin(st: &RingState, keys: &Keychain) -> bool {
 
 /// Every verified ring of this repository.
 fn local_states(ctx: &Ctx) -> Vec<RingState> {
-    ctx.repo.keys().rings().unwrap_or_default().iter().filter_map(|r| r.verify().ok()).collect()
+    let keys = ctx.repo.keys();
+    keys.rings().unwrap_or_default().iter().filter_map(|r| keys.trusted_state(r).ok()).collect()
 }
 
 /// A person's confirmed and unconfirmed listed devices.
@@ -544,6 +618,19 @@ pub fn group_added(ctx: &mut Ctx, client: &Client, group: &str, people: &[String
         }
     }
     any_admin |= legacy_grant(ctx, client, &text, &devices, true)?;
+    // Their device takes the project's key rings only once it knows the
+    // project's fingerprint (BUG-845): the same comparison, the other way.
+    if !confirm.is_empty() {
+        if let Some(p) = ctx.repo.keys().project_id() {
+            let pfp = project_fingerprint(&p);
+            println!(
+                "  {} tell {} this project's fingerprint too: {} (they run `vl identity confirm {pfp}` in their clone)",
+                dim("keys:"),
+                safe(&people.join(", ")),
+                bold(&pfp)
+            );
+        }
+    }
     if any_admin {
         print_unconfirmed(Some(group), &devices, None);
     } else if admin {
@@ -731,6 +818,13 @@ pub fn invite(ctx: &mut Ctx, client: &Client, person: &str, group: &str) -> Resu
     if !per_rule(&text) {
         bail!("this project still seals every secret with one key: an admin runs `vl upgrade --rule-keys` first");
     }
+    // The link names the project's `team` ring, so the invitee's device
+    // trusts no other (BUG-845).
+    sync_anchor(ctx.repo.keys(), &client.url)?;
+    let project = ctx.repo.keys().project_id().ok_or_else(|| {
+        anyhow!("this clone does not trust the project's key rings yet (`vl identity confirm` the project's fingerprint first)")
+    })?;
+    let pfp = project_fingerprint(&project);
     let key = InviteKey::generate();
     let public = key.public_hex();
     let expires_at = veil_core::now_millis() + INVITE_DAYS * 24 * 3600 * 1000;
@@ -760,12 +854,18 @@ pub fn invite(ctx: &mut Ctx, client: &Client, person: &str, group: &str) -> Resu
         })?;
         rules.push(ring.label());
     }
-    let link = format!("veil://{}/{}#invite={person}:{}", client.url.authority, client.url.project, key.secret_hex());
+    let link = format!(
+        "veil://{}/{}#invite={person}:{}:{}",
+        client.url.authority,
+        client.url.project,
+        key.secret_hex(),
+        pfp.replace('-', "")
+    );
     println!("Invited {} to {} in {}. Send them this link (Slack, email):", bold(&safe(person)), safe(group), safe(&client.url.project));
     println!();
     println!("  {link}");
     println!();
-    println!("  They run: vl join '{link}'");
+    println!("  They run `vl join -` and paste it (on a shared machine, never put it on the command line).");
     println!(
         "  It works once, for {} days. The server never sees the secret in it: their device's keys{} come from it.",
         INVITE_DAYS,
@@ -774,13 +874,28 @@ pub fn invite(ctx: &mut Ctx, client: &Client, person: &str, group: &str) -> Resu
     Ok(())
 }
 
-/// `vl join LINK`: sign in (registering the invited name if it is new),
-/// and join under the invite with this device.
+/// `vl join LINK` (`-`: read it from standard input, where other users of
+/// the machine cannot see it): sign in (registering the invited name if it
+/// is new), join under the invite with this device, and check that the
+/// project's `team` key ring is the one the link names (BUG-845): the only
+/// one this device then trusts.
 pub fn join(link: &str) -> Result<()> {
-    let bad = || anyhow!("expected the link `vl invite` printed: veil://host/project#invite=NAME:SECRET");
+    let link = if link == "-" {
+        use std::io::Read;
+        let mut s = String::new();
+        std::io::stdin().take(64 << 10).read_to_string(&mut s).context("reading the invite link from standard input")?;
+        s
+    } else {
+        link.to_string()
+    };
+    let bad = || anyhow!("expected the link `vl invite` printed: veil://host/project#invite=NAME:SECRET:FINGERPRINT");
     let (url, frag) = link.trim().split_once('#').ok_or_else(bad)?;
-    let (person, secret) = frag.strip_prefix("invite=").and_then(|f| f.split_once(':')).ok_or_else(bad)?;
+    let mut parts = frag.strip_prefix("invite=").ok_or_else(bad)?.split(':');
+    let (Some(person), Some(secret), Some(pfp), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
+        return Err(bad());
+    };
     let key = InviteKey::from_hex(secret).ok_or_else(bad)?;
+    let pfp = wire::normalize_fingerprint(pfp).ok_or_else(bad)?;
     if !valid_principal_name(person) {
         return Err(bad());
     }
@@ -811,6 +926,14 @@ pub fn join(link: &str) -> Result<()> {
             signature,
         })
         .context("joining")?;
+    if !confirm_project(None, &client, &pfp)? {
+        bail!(
+            "joined {} as {}, but the server's key ring for this project is not the one your invite names (fingerprint {pfp}): \
+             another project's, or one the server made. This device trusts none of its secret keys. Tell your admin",
+            joined.project,
+            joined.person
+        );
+    }
     println!(
         "Joined {} as {} (group {}). This device: {}",
         safe(&joined.project),
@@ -818,6 +941,7 @@ pub fn join(link: &str) -> Result<()> {
         safe(&joined.group),
         bold(&fp)
     );
+    println!("  The project's fingerprint matches your invite: {}", bold(&pfp));
     println!("  Its keys for the folder's secrets arrive as soon as a teammate's or an admin's device is online.");
     println!("  Clone the project: vl clone veil://{}/{}", url.authority, url.project);
     Ok(())
@@ -1019,6 +1143,24 @@ pub fn clone_of(authority: &str) -> Option<Ctx> {
     (url.authority == authority).then_some(ctx)
 }
 
+/// The repository here, if it is a clone of a project on a Veil server.
+pub fn clone_here() -> Option<Ctx> {
+    let root = crate::ctx::find_root(&std::env::current_dir().ok()?)?;
+    let ctx = Ctx::open(Some(&root), false).ok()?;
+    HubUrl::parse(&ctx.repo.config().remotes.get("origin")?.url)?.ok()?;
+    Some(ctx)
+}
+
+/// `vl identity show` in a clone of a server project: the project's
+/// fingerprint this device trusts, or that it trusts none yet.
+pub fn project_line(ctx: &Ctx) -> Option<String> {
+    HubUrl::parse(&ctx.repo.config().remotes.get("origin")?.url)?.ok()?;
+    Some(match ctx.repo.keys().project_id() {
+        Some(p) if ctx.repo.keys().anchor().is_some() => project_fingerprint(&p),
+        _ => "(not confirmed on this device: `vl pull` shows the fingerprint to compare)".to_string(),
+    })
+}
+
 /// After `vl identity confirm` in a clone: share this device's keys with
 /// the device just confirmed, now.
 pub fn confirmed_here(authority: &str) {
@@ -1042,9 +1184,9 @@ pub fn confirmed_here(authority: &str) {
 }
 
 /// `vl identity remove FINGERPRINT`: remove one of your devices (from
-/// another), or, as an admin of this clone's project, anyone's device in
-/// it. The server ends its sessions; every ring of this clone that holds it
-/// revokes it and rotates. The device is found among the **rings'**
+/// another) everywhere, or, as an admin of this clone's project, anyone's
+/// device from this project only (BUG-843). Every ring of this clone that
+/// holds it revokes it and rotates. The device is found among the **rings'**
 /// members when the server does not list it.
 pub fn remove_device(fingerprint: &str, server: Option<&str>) -> Result<()> {
     let fp = wire::normalize_fingerprint(fingerprint)
@@ -1074,7 +1216,7 @@ pub fn remove_device(fingerprint: &str, server: Option<&str>) -> Result<()> {
     // The rings as they are now (a device shared to since this clone's
     // last pull is found too).
     if let Some(c) = &ctx {
-        let _ = merge_server_rings(c.repo.keys(), client.rings().unwrap_or_default());
+        let _ = merge_server_rings(c.repo.keys(), &client.url, client.rings().unwrap_or_default());
     }
     // The device: one of mine the server lists, or a ring member's.
     let mine = client.devices(&me)?;
@@ -1093,11 +1235,20 @@ pub fn remove_device(fingerprint: &str, server: Option<&str>) -> Result<()> {
             if ctx.is_some() { ", nor in this project's key rings" } else { " (run this in a clone of the project to find someone else's)" }
         ),
     };
+    // An admin bars someone else's device from this project only; only its
+    // person removes it everywhere (BUG-843).
     let project = (person != me).then(|| url.project.clone());
-    match client.remove_device(&device, project.as_deref()) {
-        Ok(_) => println!("Removed {}'s device {} on {}: it can no longer sign in", safe(&person), bold(&fp), safe(&authority)),
+    match (client.remove_device(&device, project.as_deref()), &project) {
+        (Ok(_), None) => println!("Removed {}'s device {} on {}: it can no longer sign in", safe(&person), bold(&fp), safe(&authority)),
+        (Ok(_), Some(p)) => println!(
+            "Removed {}'s device {} from project {}: it can no longer use this project (only {} can remove it everywhere)",
+            safe(&person),
+            bold(&fp),
+            safe(p),
+            safe(&person)
+        ),
         // Already gone on the server (or hidden by it): the rings decide.
-        Err(e) => warn_untrusted(&format!("the server did not remove it: {e:#}")),
+        (Err(e), _) => warn_untrusted(&format!("the server did not remove it: {e:#}")),
     }
     let Some(c) = ctx.as_mut() else {
         println!("  run this again in a clone of each of your projects to rotate the keys it held now; your devices also do it in the background");

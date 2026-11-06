@@ -78,10 +78,11 @@ pub(crate) fn link_in(out: &str) -> String {
     out.lines().map(str::trim).find(|l| l.starts_with("veil://") && l.contains("#invite=")).unwrap_or_else(|| panic!("no link in:\n{out}")).to_string()
 }
 
-/// A person's clone of the project.
+/// A person's clone of the project, trusting its keys (they confirmed the
+/// project's fingerprint with the admin, or joined with an invite).
 pub(crate) fn clone(hub: &TestHub, p: &Project, who: &Person, name: &str) -> std::path::PathBuf {
     let d = who.dir(name);
-    who.ok(who.home.path(), &["clone", &hub.url(&p.name), d.to_str().unwrap()]);
+    who.clone_trusting(&hub.url(&p.name), &d, &p.fp);
     d
 }
 
@@ -152,7 +153,7 @@ pub(crate) fn invited(hub: &TestHub, p: &Project, prefix: &str) -> (Person, Stri
 
 /// An invite's secret, from its link.
 pub(crate) fn invite_key(link: &str) -> InviteKey {
-    InviteKey::from_hex(link.rsplit(':').next().unwrap()).unwrap()
+    InviteKey::from_hex(link.split("#invite=").nth(1).unwrap().split(':').nth(1).unwrap()).unwrap()
 }
 
 /// An invite made by the admin's device and recorded on the server, as
@@ -279,7 +280,7 @@ fn an_invite_is_used_once_and_expires() {
     let late = hub.newcomer("late");
     let key = raw_invite(&hub, &p, &late.name, veil_core::now_millis() + 1500);
     std::thread::sleep(Duration::from_millis(2500));
-    let link = format!("veil://{}/{}#invite={}:{}", hub.authority(), p.name, late.name, key.secret_hex());
+    let link = format!("veil://{}/{}#invite={}:{}:{}", hub.authority(), p.name, late.name, key.secret_hex(), p.fp.replace('-', ""));
     let out = late.fails(late.home.path(), &["join", &link]);
     assert!(out.contains("expired"), "{out}");
     let (r, st) = ring(&hub, &p, &bill_scope());
@@ -443,7 +444,10 @@ fn a_server_cannot_keep_hide_or_bring_back_a_device() {
 }
 
 /// A pending device cannot be hidden by others' pending devices under the
-/// same name, before or after it signs in (HUB.md §13.8's limit).
+/// same name, before or after it signs in (HUB.md §13.8's limit), and their
+/// number is bounded: a flood pushes out the oldest, but never a device the
+/// person looked for (`vl identity confirm` keeps its fingerprint for an
+/// hour), even while strangers flood in parallel.
 #[test]
 fn pending_devices_made_by_others_never_hide_the_real_one() {
     let hub = TestHub::start();
@@ -456,17 +460,46 @@ fn pending_devices_made_by_others_never_hide_the_real_one() {
             assert!(r.is_err(), "a stranger signed in under fin's name");
         }
     };
+    let pending_rows = || -> i64 {
+        let db = hub.hub().db.clone();
+        hub.rt
+            .block_on(
+                sqlx::query_scalar("SELECT COUNT(*) FROM devices d JOIN people p ON p.id = d.person_id WHERE p.name = $1 AND d.pending")
+                    .bind(&p.fin.name)
+                    .fetch_one(&db),
+            )
+            .unwrap()
+    };
     flood(30);
     let laptop = hub.new_device_of(&p.fin);
-    flood(30);
+    // Pushed out by a flood bigger than the bound...
+    flood(40);
+    assert!(pending_rows() <= veil_server::auth::PENDING_PER_PERSON, "{} pending devices", pending_rows());
     let devices = api.get(Some(&p.fin.token()), &format!("/v1/people/{}/devices", p.fin.name)).json();
     assert!(devices["pending"].as_array().unwrap().len() <= 8, "{devices}");
+    let out = p.fin.fails(p.fin.home.path(), &["identity", "confirm", &laptop.fingerprint()]);
+    assert!(out.contains("sign in there again"), "{out}");
+    // ...but once fin looked for it, strangers flooding in parallel never
+    // push it out again.
+    std::thread::scope(|s| {
+        let floods: Vec<_> = (0..4).map(|_| s.spawn(|| flood(25))).collect();
+        let out = laptop.fails(laptop.home.path(), &["login", &format!("veil://{}", hub.authority()), "--name", &p.fin.name, "--ca", hub.ca.to_str().unwrap()]);
+        assert!(out.contains("vl identity confirm"), "{out}");
+        for f in floods {
+            f.join().unwrap();
+        }
+    });
+    flood(40);
+    assert!(pending_rows() <= veil_server::auth::PENDING_PER_PERSON + 1, "{} pending devices", pending_rows());
     p.fin.ok(p.fin.home.path(), &["identity", "confirm", &laptop.fingerprint()]);
     laptop.ok(laptop.home.path(), &["login", &format!("veil://{}", hub.authority()), "--ca", hub.ca.to_str().unwrap()]);
-    // Someone else cannot look fin's pending devices up.
+    // Someone else cannot look fin's pending devices up, nor keep one.
     let other = hub.new_device_of(&p.fin);
     let r = api.get(Some(&p.dev.token()), &format!("/v1/people/{}/pending/{}", p.fin.name, other.fingerprint()));
     assert_eq!(r.status, 404);
+    flood(40);
+    let r = api.get(Some(&p.fin.token()), &format!("/v1/people/{}/pending/{}", p.fin.name, other.fingerprint()));
+    assert_eq!(r.status, 404, "a stranger's lookup kept the device");
 }
 
 // ---- keys per access rule ---------------------------------------------------------------
@@ -637,7 +670,7 @@ fn the_s1_key_moves_to_keys_per_rule_explicitly() {
         (e.id, r.store().get_raw(&e.id).unwrap())
     };
     let f = fin.dir("f");
-    fin.ok(fin.home.path(), &["clone", &hub.url(&name), f.to_str().unwrap()]);
+    fin.clone_trusting(&hub.url(&name), &f, &admin.project_fingerprint(&dir));
     assert!(std::fs::read_to_string(f.join(BILL_DIR).join(".env")).unwrap().contains(ENV_MARK));
     let d = dev.dir("d");
     dev.ok(dev.home.path(), &["clone", &hub.url(&name), d.to_str().unwrap()]);

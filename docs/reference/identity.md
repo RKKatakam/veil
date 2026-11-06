@@ -11,8 +11,8 @@ Subcommands:
 * [`vl identity new`](#vl-identity-new): Create a new identity (replaces the existing one with --force; the replaced one is kept so local vaults can be re-keyed)
 * [`vl identity recover-vault`](#vl-identity-recover-vault): Re-key this repository's local vault, sealed by an identity that was replaced, to the current identity
 * [`vl identity recover-admin`](#vl-identity-recover-admin): Hand the scope admin rights of a replaced identity over to the current one, in this repository: the replaced identity signs a grant that makes the current identity an admin. Push to share it
-* [`vl identity confirm`](#vl-identity-confirm): Confirm that another device of yours is yours, on a Veil server
-* [`vl identity remove`](#vl-identity-remove): Remove a device on a Veil server: a lost laptop, say. Run it on another of your devices; an admin may remove anyone's device in their project (run it in a clone of the project)
+* [`vl identity confirm`](#vl-identity-confirm): Confirm a fingerprint you checked out of band: another device of yours, or, in a clone, the project's
+* [`vl identity remove`](#vl-identity-remove): Remove a device on a Veil server: a lost laptop, say. Run it on another of your devices to remove it everywhere; an admin may remove anyone's device from their project only (run it in a clone of the project)
 
 ## `vl identity show`
 
@@ -68,9 +68,11 @@ Options:
 
 ## `vl identity confirm`
 
-Confirm that another device of yours is yours, on a Veil server.
+Confirm a fingerprint you checked out of band: another device of yours, or, in a clone, the project's.
 
-The new device signs in with `vl login URL --name YOU` and shows its fingerprint. Run this on a device you already use: it signs that device with this one, and the server lets it sign in. Admins then grant it the project's secret keys without asking you again.
+A device: the new device signs in with `vl login URL --name YOU` and shows its fingerprint. Run this on a device you already use: it signs that device with this one, and the server lets it sign in. Admins then grant it the project's secret keys without asking you again.
+
+A project: a device trusts a project's secret keys only once it knows the project's fingerprint (an invite link carries it). In a clone that does not trust them yet, `vl clone` and `vl pull` show the fingerprint the server claims; compare it with an admin's, or with `vl identity show` in a clone on another of your devices, then run this in the clone.
 
 ```text
 vl identity confirm [OPTIONS] <FINGERPRINT>
@@ -80,7 +82,7 @@ Arguments:
 
 | | |
 |---|---|
-| `<FINGERPRINT>` | The new device's fingerprint (`vl identity show` on it) (required) |
+| `<FINGERPRINT>` | The new device's fingerprint (`vl identity show` on it), or the project's (required) |
 
 Options:
 
@@ -90,9 +92,9 @@ Options:
 
 ## `vl identity remove`
 
-Remove a device on a Veil server: a lost laptop, say. Run it on another of your devices; an admin may remove anyone's device in their project (run it in a clone of the project).
+Remove a device on a Veil server: a lost laptop, say. Run it on another of your devices to remove it everywhere; an admin may remove anyone's device from their project only (run it in a clone of the project).
 
-The device can no longer sign in, and in a clone of a project the keys of every secret it could open rotate away from it at once (your other devices, and admins', do the same in your other projects in the background). It keeps what it already had.
+Your own device can no longer sign in, and in a clone of a project the keys of every secret it could open rotate away from it at once (your other devices, and admins', do the same in your other projects in the background). A device an admin removes can no longer use that project, and that project's keys rotate away from it; only its person removes it everywhere. It keeps what it already had.
 
 ```text
 vl identity remove [OPTIONS] <FINGERPRINT>

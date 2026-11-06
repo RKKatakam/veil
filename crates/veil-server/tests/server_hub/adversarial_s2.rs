@@ -122,11 +122,10 @@ fn bug_842_removing_an_invited_person_cancels_their_invite() {
 
 /// BUG-843. Anyone can make a project, add any person to one of its groups
 /// (no consent is asked) and, as its admin, `vl identity remove` that
-/// person's device: the server removes it everywhere. The person's laptop
-/// can no longer sign in to their own company's project, and that
-/// project's rings revoke it in the background.
+/// person's device: the server removed it everywhere. Fixed: an admin's
+/// removal bars the device from their project only; the person's own
+/// projects, and their rings, never hear of it.
 #[test]
-#[ignore = "BUG-843: an admin of any project removes a person's device in every project"]
 fn bug_843_an_admin_removes_a_device_only_for_their_own_project() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -149,9 +148,22 @@ fn bug_843_an_admin_removes_a_device_only_for_their_own_project() {
         "/v1/devices/remove",
         &serde_json::json!({"device": p.fin.identity().public_id(), "project": name}),
     );
-    println!("remove: {} {}", r.status, String::from_utf8_lossy(&r.body));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     let out = p.fin.run(&f, &["pull"]);
     assert!(out.status.success(), "an outsider's project removed fin's device from fin's own project: {}", String::from_utf8_lossy(&out.stderr));
+    // The outsider's project is closed to the device...
+    let r = hub.api().get(Some(&p.fin.token()), &format!("/v1/projects/{name}/tips"));
+    assert_eq!(r.status, 403, "{}", String::from_utf8_lossy(&r.body));
+    // ...and fin's own project neither lists it as removed (its rings would
+    // revoke it in the background) nor stops sharing with it.
+    let pending = hub.api().get(Some(&p.admin.token()), &format!("/v1/projects/{}/keys/pending", p.name)).json();
+    for d in pending.as_array().unwrap() {
+        assert!(d["removed"].as_array().unwrap().is_empty(), "fin's own project lists the device as removed: {pending}");
+    }
+    let devices = hub.api().get(Some(&p.admin.token()), &format!("/v1/people/{}/devices", p.fin.name)).json();
+    assert!(devices["removed"].as_array().unwrap().is_empty(), "{devices}");
+    p.admin.ok(&p.dir, &["share-keys"]);
+    assert!(member_of(&ring(&hub, &p, &bill_scope()).1, &p.fin.identity()), "fin's own project rotated fin's device away");
 }
 
 /// BUG-844. `vl upgrade --rule-keys` rewrites `.veilpolicy` first, then
@@ -196,21 +208,11 @@ fn bug_844_an_interrupted_rule_keys_move_is_finished_by_a_rerun() {
     assert!(!member_of(&team, &dev.identity()), "the move was reported done and team still holds a non-admin:\n{out}");
 }
 
-/// BUG-845. Rule scope names depend on the path only (`rule-<billing>` is
-/// the same in every project), and a ring does not say which project it
-/// belongs to. An admin runs two projects with a `billing/` line. Their
-/// new laptop clones project B; the compromised server hands it project A's
-/// `billing/` ring (started by the same admin, so it passes BUG-840's
-/// check), and the laptop seals B's `billing/.env` under A's key: A's
-/// finance, who have nothing in B, open it.
-#[test]
-#[ignore = "BUG-845: a ring of another project with the same rule path seals this project's secrets"]
-fn bug_845_a_ring_of_another_project_never_seals_a_secret() {
-    let hub = TestHub::start();
-    let p = setup_project(&hub);
-    // The admin's second project, with its own billing/ line and ring.
+/// The admin's second project B, with its own `billing/` line (finance:
+/// sec) and ring. `(name, the admin's clone)`.
+pub(crate) fn second_project(hub: &TestHub, p: &Project) -> (String, std::path::PathBuf) {
     let b = unique("bee");
-    let bdir = p.admin.dir("b");
+    let bdir = p.admin.dir(&unique("b"));
     std::fs::create_dir_all(&bdir).unwrap();
     p.admin.ok(&bdir, &["init"]);
     write_files(&bdir, &[("README.md", "b")]);
@@ -222,28 +224,62 @@ fn bug_845_a_ring_of_another_project_never_seals_a_secret() {
     p.admin.ok(&bdir, &["access", &format!("{BILL_DIR}/"), "finance"]);
     p.admin.commit_main(&bdir, "access");
     p.admin.ok(&bdir, &["push"]);
+    (b, bdir)
+}
+
+/// The server stores `ring` as project `project`'s ring of its scope.
+pub(crate) fn plant_in(hub: &TestHub, project: &str, ring: &KeyRing) {
+    let body = serde_json::to_string(ring).unwrap();
+    sql(
+        hub,
+        "INSERT INTO rings (project_id, scope, body) SELECT id, $1, $2 FROM projects WHERE name = $3 \
+         ON CONFLICT (project_id, scope) DO UPDATE SET body = EXCLUDED.body",
+        &[&ring.scope, &body, &project.to_string()],
+    );
+}
+
+/// Can A's finance member open what `who` committed at `path` in `dir`?
+pub(crate) fn a_finance_opens(hub: &TestHub, p: &Project, dir: &std::path::Path, path: &str) -> bool {
+    let repo = veil_core::Repo::open(Arc::new(veil_core::DiskBackend::new(dir)), None, "test").unwrap();
+    let tip = repo.view().tags["main"].target;
+    let tree = repo.store().snapshot(&tip).unwrap().tree;
+    let Some(e) = veil_core::tree::lookup(repo.store(), &tree, &veil_core::VPath::new(path).unwrap()).unwrap() else { return false };
+    let raw = (e.id, repo.store().get_raw(&e.id).unwrap());
+    let f = clone(hub, p, &p.fin, &unique("f"));
+    opens(&p.fin, &f, &raw)
+}
+
+/// BUG-845. Rule scope names depend on the path only (`rule-<billing>` is
+/// the same in every project), and a ring did not say which project it
+/// belongs to. An admin runs two projects with a `billing/` line. Their
+/// new laptop clones project B; the compromised server hands it project A's
+/// `billing/` ring (started by the same admin, so it passes BUG-840's
+/// check), and the laptop sealed B's `billing/.env` under A's key: A's
+/// finance, who have nothing in B, opened it. Fixed: every ring's signed
+/// genesis names its project, and a device trusts a project's rings only
+/// once it confirmed the project's fingerprint.
+#[test]
+fn bug_845_a_ring_of_another_project_never_seals_a_secret() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let (b, bdir) = second_project(&hub, &p);
     // The admin's new laptop, confirmed from their first device (and given
     // project A's keys by it).
     let laptop = hub.new_device_of(&p.admin);
     p.admin.ok(&p.dir, &["identity", "confirm", &laptop.fingerprint()]);
-    laptop.ok(laptop.home.path(), &["login", &format!("veil://{}", hub.authority()), "--name", &p.admin.name, "--ca", hub.ca.to_str().unwrap()]);
+    laptop.ok(laptop.home.path(), &["login", &format!("veil://{}", hub.authority()), "--ca", hub.ca.to_str().unwrap()]);
     assert!(member_of(&ring(&hub, &p, &bill_scope()).1, &laptop.identity()), "the laptop holds project A's billing/ key");
     // The server serves A's billing/ ring as B's.
     let (a_ring, _) = ring(&hub, &p, &bill_scope());
-    let body = serde_json::to_string(&a_ring).unwrap();
-    sql(&hub, "UPDATE rings SET body = $1 WHERE scope = $2 AND project_id = (SELECT id FROM projects WHERE name = $3)", &[&body, &bill_scope(), &b]);
+    plant_in(&hub, &b, &a_ring);
     let bl = laptop.dir("b");
-    laptop.ok(laptop.home.path(), &["clone", &hub.url(&b), bl.to_str().unwrap()]);
+    // The admin reads B's fingerprint off their first device.
+    laptop.clone_trusting(&hub.url(&b), &bl, &p.admin.project_fingerprint(&bdir));
+    let out = laptop.ok(&bl, &["pull"]);
+    assert!(out.contains("another project"), "{out}");
     write_files(&bl, &[(&format!("{BILL_DIR}/.env") as &str, "B=MARKER-PROJECT-B-SECRET-2b9c\n")]);
     laptop.commit_main(&bl, "b secrets");
-    // What A's finance member opens, if the server hands it to them.
-    let repo = veil_core::Repo::open(Arc::new(veil_core::DiskBackend::new(&bl)), None, "test").unwrap();
-    let tip = repo.view().tags["main"].target;
-    let tree = repo.store().snapshot(&tip).unwrap().tree;
-    let Some(e) = veil_core::tree::lookup(repo.store(), &tree, &veil_core::VPath::new(&format!("{BILL_DIR}/.env")).unwrap()).unwrap() else { panic!("not recorded") };
-    let raw = (e.id, repo.store().get_raw(&e.id).unwrap());
-    let f = clone(&hub, &p, &p.fin, "f");
-    assert!(!opens(&p.fin, &f, &raw), "project A's finance member opens project B's billing/.env");
+    assert!(!a_finance_opens(&hub, &p, &bl, &format!("{BILL_DIR}/.env")), "project A's finance member opens project B's billing/.env");
 }
 
 /// BUG-846. `vl access billing/ finance` while finance has nobody else in

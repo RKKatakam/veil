@@ -400,9 +400,10 @@ fn a_retired_identity_hands_its_admin_rights_over() {
     let out = repo.keys().recover_admin(&old, false).unwrap();
     assert_eq!(
         out,
+        // `team` first: `Keychain::rings` lists it first (BUG-845).
         vec![
-            ("ops".to_string(), AdminRecovery::RetiredNotAdmin),
-            ("team".to_string(), AdminRecovery::HandedOver { revoked: false })
+            ("team".to_string(), AdminRecovery::HandedOver { revoked: false }),
+            ("ops".to_string(), AdminRecovery::RetiredNotAdmin)
         ]
     );
     let st = ring(repo.keys(), "team").verify().unwrap();

@@ -375,3 +375,124 @@ fn step_index(t: &Try) -> usize {
         _ => 0,
     }
 }
+
+// ---- rings name their project (BUG-845) -----------------------------------------------
+
+/// A project's repository: its `team` ring and the rule ring `SCOPE`.
+fn project(admin: &Identity) -> Repo {
+    let a = device(admin, SHARES_REPO_FORMAT, None);
+    a.keys().create_scope(DEFAULT_SCOPE).unwrap();
+    a.keys().create_scope(SCOPE).unwrap();
+    a
+}
+
+/// `ring` with its genesis's project replaced and re-signed by `signer`.
+fn regenesis(ring: &KeyRing, signer: &Identity, project: Option<String>) -> KeyRing {
+    let mut r = ring.clone();
+    r.log.truncate(1);
+    let RingOp::Genesis { project: p, .. } = &mut r.log[0].op else { unreachable!() };
+    *p = project;
+    r.log[0].signature = signer.sign(SIG_CONTEXT_RING_CHANGE, &r.log[0].signing_body(&r.scope));
+    r.format = RING_FORMAT_SHARES;
+    r
+}
+
+#[test]
+fn every_ring_names_its_project_and_another_projects_ring_is_refused() {
+    let admin = Identity::generate("admin");
+    let (a, b) = (project(&admin), project(&admin));
+    let team_a = a.keys().load_ring(DEFAULT_SCOPE).unwrap().unwrap();
+    let pa = a.keys().project_id().unwrap();
+    assert_eq!(pa, team_a.log[0].hash(DEFAULT_SCOPE), "a project's id is its team ring's genesis");
+    assert_ne!(Some(pa.clone()), b.keys().project_id());
+    let rule_a = a.keys().load_ring(SCOPE).unwrap().unwrap();
+    assert!(matches!(&rule_a.log[0].op, RingOp::Genesis { project: Some(p), .. } if *p == pa));
+    assert_eq!(rule_a.format, RING_FORMAT_SHARES, "a ring that names its project is ring format 4");
+    // Project B's device holding A's ring of the same scope (a server's
+    // substitution): it seals and opens nothing, and decides nothing.
+    b.keys().save_ring(&rule_a).unwrap();
+    assert!(b.keys().sealing_key(SCOPE).is_err(), "another project's ring seals this project's secrets");
+    assert!(b.keys().ring_state(SCOPE).unwrap().unwrap().unwrap_err().contains("another project"));
+    assert!(b.keys().grant(SCOPE, &Identity::generate("x").public_id(), "x").is_err());
+    // A repository of B without that ring refuses to take it.
+    let c = device(&admin, SHARES_REPO_FORMAT, Some(&b.keys().load_ring(DEFAULT_SCOPE).unwrap().unwrap()));
+    let m = c.keys().merge_ring(&rule_a).unwrap();
+    assert!(matches!(&m, veil_core::keychain::RingMerge::Rejected(w) if w.contains("another project")), "{m:?}");
+    // The genesis is signed: rewriting its project breaks the signature, and
+    // re-signing needs an admin of the ring (here: the same admin, which is
+    // why the id must also be checked against the project's own team).
+    let mut forged = rule_a.clone();
+    let RingOp::Genesis { project, .. } = &mut forged.log[0].op else { unreachable!() };
+    *project = b.keys().project_id();
+    assert!(forged.verify().unwrap_err().contains("bad signature"));
+    // `team` names no project (its genesis is the id); a malformed id is
+    // refused.
+    assert!(regenesis(&team_a, &admin, Some(pa.clone())).verify().unwrap_err().contains("names no project"));
+    assert!(regenesis(&rule_a, &admin, Some("xyz".into())).verify().unwrap_err().contains("malformed project id"));
+    // A format-6 repository makes rings that name no project, as before.
+    let old = device(&admin, 6, None);
+    old.keys().create_scope(DEFAULT_SCOPE).unwrap();
+    old.keys().create_scope(SCOPE).unwrap();
+    assert!(matches!(&old.keys().load_ring(SCOPE).unwrap().unwrap().log[0].op, RingOp::Genesis { project: None, .. }));
+}
+
+#[test]
+fn a_clone_trusts_only_the_team_ring_whose_fingerprint_it_confirmed() {
+    use veil_core::keychain::{project_fingerprint, RingMerge};
+    let admin = Identity::generate("admin");
+    let (a, b) = (project(&admin), project(&admin));
+    let team_a = a.keys().load_ring(DEFAULT_SCOPE).unwrap().unwrap();
+    let rule_a = a.keys().load_ring(SCOPE).unwrap().unwrap();
+    let team_b = b.keys().load_ring(DEFAULT_SCOPE).unwrap().unwrap();
+    let fp_a = project_fingerprint(&a.keys().project_id().unwrap());
+    assert!(veil_core::hub::wire::normalize_fingerprint(&fp_a).as_deref() == Some(fp_a.as_str()));
+    // Nothing confirmed yet: no ring is taken, none seals.
+    let fresh = device(&admin, SHARES_REPO_FORMAT, None);
+    fresh.keys().set_anchor("").unwrap();
+    assert!(matches!(fresh.keys().merge_ring(&team_a).unwrap(), RingMerge::Rejected(w) if w.contains("not confirmed")));
+    fresh.keys().save_ring(&team_a).unwrap();
+    assert!(fresh.keys().sealing_key(DEFAULT_SCOPE).is_err());
+    // Confirmed A: B's team (another project's) is refused, A's taken, and
+    // A's rule ring with it; an unbound ring is not.
+    let d = device(&admin, SHARES_REPO_FORMAT, None);
+    d.keys().set_anchor(&fp_a).unwrap();
+    assert!(matches!(d.keys().merge_ring(&team_b).unwrap(), RingMerge::Rejected(w) if w.contains("this device confirmed")));
+    assert_eq!(d.keys().merge_ring(&team_a).unwrap(), RingMerge::Updated);
+    assert_eq!(d.keys().merge_ring(&rule_a).unwrap(), RingMerge::Updated);
+    assert!(d.keys().sealing_key(SCOPE).is_ok());
+    let (_, _, plain) = start();
+    let unbound = plain.keys().load_ring(SCOPE).unwrap().unwrap();
+    let e = device(&admin, SHARES_REPO_FORMAT, Some(&team_a));
+    e.keys().set_anchor(&fp_a).unwrap();
+    assert!(matches!(e.keys().merge_ring(&unbound).unwrap(), RingMerge::Rejected(w) if w.contains("bound to no project")));
+    // Another project's fingerprint: A's team is refused too.
+    fresh.keys().set_anchor(&project_fingerprint(&b.keys().project_id().unwrap())).unwrap();
+    assert!(fresh.keys().ring_state(DEFAULT_SCOPE).unwrap().unwrap().is_err());
+}
+
+/// A member's `revoke_own` rotation is checked like an admin's (the nit of
+/// the S2 adversarial pass): a new generation that does not unlock the
+/// previous one is refused by a device that holds it.
+#[test]
+fn a_revoke_own_rotation_must_unlock_the_previous_generation() {
+    let (_admin, alice, a) = start();
+    let laptop = Identity::generate("alice");
+    let al = device(&alice, SHARES_REPO_FORMAT, Some(&ring(a.keys())));
+    al.keys().share(SCOPE, &laptop.public_id(), "alice", vouch(&alice, &laptop)).unwrap();
+    let before = ring(al.keys());
+    assert!(al.keys().revoke_device(SCOPE, &laptop.public_hex()).unwrap());
+    let r = ring(al.keys());
+    let (label, new_key) = al.keys().sealing_key(SCOPE).unwrap();
+    let RingOp::RevokeOwn { member, mut rotation } = r.log.last().unwrap().op.clone() else { unreachable!() };
+    rotation.previous[0].sealed = veil_core::crypto::Envelope::seal_random(
+        &new_key,
+        &format!("{}{label}", veil_core::crypto::domains::PREV_KEY_LABEL_PREFIX),
+        &[9u8; 32],
+    )
+    .unwrap();
+    let bad = appended(&before, &alice, RingOp::RevokeOwn { member, rotation });
+    assert!(bad.verify().is_ok(), "only a key holder can tell");
+    let other = device(&alice, SHARES_REPO_FORMAT, Some(&before));
+    let m = other.keys().merge_ring(&bad).unwrap();
+    assert!(matches!(&m, veil_core::keychain::RingMerge::Rejected(w) if w.contains("does not unlock")), "{m:?}");
+}

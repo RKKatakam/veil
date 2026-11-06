@@ -477,7 +477,7 @@ fn a_later_device_is_confirmed_by_its_person() {
     assert!(!out.contains("confirm "), "{out}");
     assert!(out.contains("granted to"), "{out}");
     let c2 = laptop.dir("c2");
-    laptop.ok(laptop.home.path(), &["clone", &hub.url(&p.name), c2.to_str().unwrap()]);
+    laptop.clone_trusting(&hub.url(&p.name), &c2, &p.fp);
     assert!(std::fs::read_to_string(c2.join(BILL_DIR).join(".env")).unwrap().contains(ENV_MARK));
     // Another person cannot confirm a device under fin's name...
     let thief = hub.new_device_of(&p.fin);

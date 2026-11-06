@@ -529,8 +529,8 @@ fn write_format_7_extras() {
 }
 
 /// The format-7 set's ring of format 4 verifies on this build: bob holds
-/// the key through his invite, the invite is used, and the laptop he
-/// removed holds no current key.
+/// the key through his invite, the invite is used, the laptop he removed
+/// holds no current key, and the ring names its project.
 #[test]
 fn format_7_fixture_ring_verifies() {
     let fx = Fixture::new(7);
@@ -542,6 +542,11 @@ fn format_7_fixture_ring_verifies() {
     assert_eq!(st.members.values().filter(|m| m.name == "bob").count(), 1);
     let bob = fx.open("alice", Some("bob"));
     assert!(bob.keys().sealing_key(FORMAT_7_SCOPE).is_ok(), "bob cannot open the key his invite gave him");
+    // It names its project: the hash of the set's `team` ring's genesis
+    // (BUG-845); `team` names none.
+    let team = fx.open("alice", Some("alice")).keys().load_ring("team").unwrap().unwrap();
+    assert!(matches!(&ring.log[0].op, RingOp::Genesis { project: Some(p), .. } if *p == team.log[0].hash("team")));
+    assert!(matches!(&team.log[0].op, RingOp::Genesis { project: None, .. }));
     // The team remote holds it too.
     let remote = Repo::open(fx.backend("team-remote"), None, "remote").unwrap();
     assert_eq!(remote.keys().load_ring(FORMAT_7_SCOPE).unwrap().unwrap(), ring);

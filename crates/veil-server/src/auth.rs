@@ -19,7 +19,10 @@
 //!   (`docs/HUB.md` §13.11). A pending device lasts [`PENDING_TTL_MS`]
 //!   (signing in again renews it) and is looked up by its fingerprint, so
 //!   pending devices someone else makes under the name never hide it
-//!   (§13.12): there is no cap per person.
+//!   (§13.12). A person has at most [`PENDING_PER_PERSON`] pending devices:
+//!   a new one pushes out the oldest, except one whose fingerprint the
+//!   person's `vl identity confirm` looked for (`device_expected`, for
+//!   [`EXPECTED_TTL_MS`]), which nobody else can push out.
 
 use axum::{
     extract::{FromRequestParts, State},
@@ -40,6 +43,14 @@ use crate::{
 pub const CHALLENGE_TTL_MS: i64 = 60_000;
 /// How long a pending device waits to be confirmed.
 pub const PENDING_TTL_MS: i64 = 24 * 3600 * 1000;
+/// The most pending devices a person has: anyone can make them under the
+/// name, so the table stays bounded.
+pub const PENDING_PER_PERSON: i64 = 32;
+/// How long a fingerprint the person looked for is kept for them: its
+/// device, signing in again, is never pushed out by the bound.
+pub const EXPECTED_TTL_MS: i64 = 3600 * 1000;
+/// The most fingerprints a person waits for at once.
+pub const EXPECTED_PER_PERSON: i64 = 8;
 /// Pending devices listed in `Devices::pending` (the newest; for display).
 /// Confirming one looks it up by fingerprint instead.
 pub const LISTED_PENDING: i64 = 8;
@@ -178,6 +189,22 @@ pub async fn login(State(hub): State<HubState>, headers: HeaderMap, Json(req): J
                 )
                 .bind(person)
                 .bind(now - PENDING_TTL_MS)
+                .execute(&mut *c)
+                .await?;
+                // At most PENDING_PER_PERSON: the oldest go, never one the
+                // person is waiting for.
+                sqlx::query(
+                    "DELETE FROM devices WHERE id IN (SELECT d.id FROM devices d WHERE d.person_id = $1 AND d.pending \
+                     AND NOT EXISTS (SELECT 1 FROM device_expected e WHERE e.person_id = d.person_id AND e.fingerprint = d.fingerprint \
+                     AND e.expires_at > $2) \
+                     AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.device_id = d.id) \
+                     AND NOT EXISTS (SELECT 1 FROM device_vouches v WHERE v.device_id = d.id) \
+                     AND NOT EXISTS (SELECT 1 FROM invites i WHERE i.device_id = d.id) \
+                     ORDER BY d.created_at DESC, d.id DESC OFFSET $3)",
+                )
+                .bind(person)
+                .bind(now)
+                .bind(PENDING_PER_PERSON - 1)
                 .execute(&mut *c)
                 .await?;
                 let fingerprint = veil_core::hub::wire::device_fingerprint(&ident).unwrap_or_default();

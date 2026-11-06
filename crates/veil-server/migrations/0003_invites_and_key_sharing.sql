@@ -31,3 +31,21 @@ CREATE TABLE IF NOT EXISTS key_requests (
     created_at BIGINT NOT NULL,
     PRIMARY KEY (project_id, person_id)
 );
+-- A device an admin removed from one project (BUG-843): it may no longer
+-- use that project; only its person removes it everywhere
+-- (`devices.removed_at`).
+CREATE TABLE IF NOT EXISTS device_bars (
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    device_id BIGINT NOT NULL REFERENCES devices(id),
+    created_at BIGINT NOT NULL,
+    PRIMARY KEY (project_id, device_id)
+);
+-- A fingerprint a person's `vl identity confirm` looked for and did not
+-- find: a pending device with it is never pushed out by the bound on
+-- pending devices per person, whoever else signs in under the name.
+CREATE TABLE IF NOT EXISTS device_expected (
+    person_id BIGINT NOT NULL REFERENCES people(id),
+    fingerprint TEXT NOT NULL,
+    expires_at BIGINT NOT NULL,
+    PRIMARY KEY (person_id, fingerprint)
+);

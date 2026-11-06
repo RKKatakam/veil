@@ -108,6 +108,10 @@ struct ServerEntry {
     /// confirms the joining device for rings created after the invite.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     invites: BTreeMap<String, String>,
+    /// Project fingerprints this device confirmed (project → fingerprint):
+    /// the only `team` key ring of that project it trusts (BUG-845).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    anchors: BTreeMap<String, String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -196,6 +200,18 @@ pub fn remember_device(authority: &str, person: &str, signing_key: &str) -> Resu
 pub fn remember_invite(authority: &str, key: &str, person: &str) -> Result<()> {
     update_entry(authority, |e| {
         e.invites.insert(key.to_string(), person.to_string());
+    })
+}
+
+/// The fingerprint this device confirmed for `project` on `authority`.
+pub fn anchor_for(authority: &str, project: &str) -> Result<Option<String>> {
+    Ok(load_file()?.servers.remove(authority).and_then(|mut e| e.anchors.remove(project)))
+}
+
+/// Remember the fingerprint this device confirmed for `project`.
+pub fn set_anchor_for(authority: &str, project: &str, fingerprint: &str) -> Result<()> {
+    update_entry(authority, |e| {
+        e.anchors.insert(project.to_string(), fingerprint.to_string());
     })
 }
 
@@ -659,7 +675,7 @@ pub fn pull(repo: &mut Repo, remote: &str, client: &Client, only: Option<&str>) 
     // Key rings of secret scopes: verified and fast-forwarded locally.
     if client.token.borrow().is_some() {
         if let Ok(rings) = client.rings() {
-            report.warnings.extend(crate::hub_keys::merge_server_rings(tx.repo().keys(), rings)?);
+            report.warnings.extend(crate::hub_keys::merge_server_rings(tx.repo().keys(), &client.url, rings)?);
             tx.repo().keys().invalidate();
         }
     }
@@ -800,6 +816,8 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
     if client.tips()?.is_none() {
         client.create_project()?;
         created = true;
+        // This device made the project's `team` ring: the one it trusts.
+        crate::hub_keys::anchor_created(repo.keys(), &client.url)?;
     }
     let mut attempt = 0;
     loop {
@@ -894,7 +912,8 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
         if !frames.is_empty() {
             send(frames, ids)?;
         }
-        // Key rings (secret scopes) first, so new members can open what lands.
+        // Key rings (secret scopes) first, so new members can open what lands
+        // (`team` first of them: it names the project the others belong to).
         for ring in repo.keys().rings()? {
             if let Err(e) = client.post_ring(&ring) {
                 crate::render::warn(&format!("key ring '{}' not sent: {e:#}", ring.scope));

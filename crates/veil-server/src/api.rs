@@ -64,21 +64,25 @@ fn frames(body: Vec<u8>) -> Response {
 
 async fn devices(State(hub): State<HubState>, caller: Caller, Path(name): Path<String>) -> Result<Json<Devices>> {
     caller.signed_in()?;
-    device_list(&hub, &name).await
+    device_list(&hub, &name, None).await
 }
 
 /// A person's devices with the vouches the server stores. The server's
 /// list is not what wraps a key: admins' `vl` check the vouches
-/// (`docs/HUB.md` §13.11).
-async fn device_list(hub: &HubState, name: &str) -> Result<Json<Devices>> {
+/// (`docs/HUB.md` §13.11). In `project`, a device an admin removed from it
+/// is listed as removed (BUG-843), so its devices revoke it from its rings.
+async fn device_list(hub: &HubState, name: &str, project: Option<i64>) -> Result<Json<Devices>> {
     let person: Option<i64> = sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(name).fetch_optional(&hub.db).await?;
     let Some(person) = person else {
         return Err(Error::not_found(format!("no person named '{name}'")));
     };
-    let active: Vec<String> = sqlx::query_scalar(
-        "SELECT public_identity FROM devices WHERE person_id = $1 AND removed_at IS NULL AND NOT pending ORDER BY id",
-    )
+    let barred = "EXISTS (SELECT 1 FROM device_bars b WHERE b.device_id = d.id AND b.project_id = $2)";
+    let active: Vec<String> = sqlx::query_scalar(&format!(
+        "SELECT d.public_identity FROM devices d WHERE d.person_id = $1 AND d.removed_at IS NULL AND NOT d.pending \
+         AND NOT {barred} ORDER BY d.id"
+    ))
     .bind(person)
+    .bind(project.unwrap_or(-1))
     .fetch_all(&hub.db)
     .await?;
     // Only the newest few pending devices: anyone can make pending devices
@@ -106,11 +110,12 @@ async fn device_list(hub: &HubState, name: &str) -> Result<Json<Devices>> {
     .bind(name)
     .fetch_all(&hub.db)
     .await?;
-    let removed: Vec<String> = sqlx::query_scalar(
-        "SELECT d.public_identity FROM devices d JOIN people p ON p.id = d.person_id \
-         WHERE p.name = $1 AND d.removed_at IS NOT NULL AND NOT d.pending ORDER BY d.id",
-    )
-    .bind(name)
+    let removed: Vec<String> = sqlx::query_scalar(&format!(
+        "SELECT d.public_identity FROM devices d WHERE d.person_id = $1 AND NOT d.pending \
+         AND (d.removed_at IS NOT NULL OR {barred}) ORDER BY d.id"
+    ))
+    .bind(person)
+    .bind(project.unwrap_or(-1))
     .fetch_all(&hub.db)
     .await?;
     Ok(Json(Devices {
@@ -146,9 +151,36 @@ async fn pending_device(
     } else {
         None
     };
-    found
-        .map(|identity| Json(PendingDevice { identity }))
-        .ok_or_else(|| Error::not_found(format!("no device of yours waits with the fingerprint {fp}")))
+    if let Some(identity) = found {
+        return Ok(Json(PendingDevice { identity }));
+    }
+    if me.name == name {
+        // Kept for the person: their device, signing in again, is never
+        // pushed out by the bound on pending devices (auth.rs).
+        let now = veil_core::now_millis();
+        sqlx::query(
+            "INSERT INTO device_expected (person_id, fingerprint, expires_at) VALUES ($1, $2, $3) \
+             ON CONFLICT (person_id, fingerprint) DO UPDATE SET expires_at = EXCLUDED.expires_at",
+        )
+        .bind(me.id)
+        .bind(&fp)
+        .bind(now + crate::auth::EXPECTED_TTL_MS)
+        .execute(&hub.db)
+        .await?;
+        sqlx::query(
+            "DELETE FROM device_expected WHERE person_id = $1 AND (expires_at < $2 OR fingerprint NOT IN \
+             (SELECT fingerprint FROM device_expected WHERE person_id = $1 ORDER BY expires_at DESC LIMIT $3))",
+        )
+        .bind(me.id)
+        .bind(now)
+        .bind(crate::auth::EXPECTED_PER_PERSON)
+        .execute(&hub.db)
+        .await?;
+    }
+    Err(Error::not_found(format!(
+        "no device of yours waits with the fingerprint {fp}: sign in on it again (`vl login URL --name {name}`), then run \
+         this again (it is kept for you for an hour)"
+    )))
 }
 
 /// Queue "share keys for `person`" in `project`, or in every project they
@@ -204,15 +236,17 @@ async fn pending_keys(State(hub): State<HubState>, caller: Caller, Path(p): Path
     .await?;
     let mut out = Vec::new();
     for n in names {
-        out.push(device_list(&hub, &n).await?.0);
+        out.push(device_list(&hub, &n, Some(project.id)).await?.0);
     }
     Ok(Json(out))
 }
 
-/// Remove a device: its person may (from another of their devices), and
-/// so may an admin of `project` in which the person takes part. Its
-/// sessions end at once. Key rings revoke it on the devices that hold
-/// them (`vl identity remove`, and in the background).
+/// Remove a device. Its person may, from another of their devices: it is
+/// removed everywhere and its sessions end at once. An admin of `project`
+/// in which the person takes part may remove it **from that project only**
+/// (BUG-843): it can no longer use the project, and nothing a project's
+/// admin does reaches the person's other projects. Key rings revoke it on
+/// the devices that hold them (`vl identity remove`, and in the background).
 async fn remove_device(State(hub): State<HubState>, caller: Caller, Json(req): Json<RemoveDevice>) -> Result<Json<Devices>> {
     let me = caller.signed_in()?.clone();
     let admin_of = match &req.project {
@@ -258,15 +292,28 @@ async fn remove_device(State(hub): State<HubState>, caller: Caller, Json(req): J
             if key == me.device_key {
                 return Err(Error::bad_request("this is the device you are using: remove it from another of your devices"));
             }
-            sqlx::query("UPDATE devices SET removed_at = $1 WHERE id = $2").bind(veil_core::now_millis()).bind(id).execute(&mut *c).await?;
-            sqlx::query("DELETE FROM sessions WHERE device_id = $1").bind(id).execute(&mut *c).await?;
-            queue_key_request(c, person, None).await?;
+            if person == me.id {
+                sqlx::query("UPDATE devices SET removed_at = $1 WHERE id = $2").bind(veil_core::now_millis()).bind(id).execute(&mut *c).await?;
+                sqlx::query("DELETE FROM sessions WHERE device_id = $1").bind(id).execute(&mut *c).await?;
+                queue_key_request(c, person, None).await?;
+            } else {
+                let project = admin_of.expect("allowed only as an admin of the project");
+                sqlx::query("INSERT INTO device_bars (project_id, device_id, created_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+                    .bind(project)
+                    .bind(id)
+                    .bind(veil_core::now_millis())
+                    .execute(&mut *c)
+                    .await?;
+                queue_key_request(c, person, Some(project)).await?;
+            }
             Ok((person, name))
         })
     })
     .await?;
-    crate::audit(&hub.db, admin_of, Some(caller.signed_in()?.id), "remove device", &format!("{name} ({person}): {}", &req.device[..req.device.len().min(69)])).await;
-    device_list(&hub, &name).await
+    let own = person == caller.signed_in()?.id;
+    let what = if own { "remove device" } else { "remove device from project" };
+    crate::audit(&hub.db, admin_of, Some(caller.signed_in()?.id), what, &format!("{name} ({person}): {}", &req.device[..req.device.len().min(69)])).await;
+    device_list(&hub, &name, if own { None } else { admin_of }).await
 }
 
 /// An admin records an invite: its public key, for whom, into which group,
@@ -353,6 +400,14 @@ async fn join(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>
             let Some((device_id, identity)) = mine.filter(|(_, i)| *i == r.device) else {
                 return Err(Error::bad_request("a device joins for itself"));
             };
+            let barred: Option<i64> = sqlx::query_scalar("SELECT device_id FROM device_bars WHERE project_id = $1 AND device_id = $2")
+                .bind(pid)
+                .bind(device_id)
+                .fetch_optional(&mut *c)
+                .await?;
+            if barred.is_some() {
+                return Err(Error::forbidden("an admin removed this device from this project"));
+            }
             if !join_valid(&r.key, &person, &identity, &r.signature) {
                 return Err(Error::bad_request("the join does not verify under the invite's key"));
             }
@@ -427,7 +482,7 @@ async fn vouch(State(hub): State<HubState>, caller: Caller, Json(req): Json<Vouc
     })
     .await?;
     crate::audit(&hub.db, None, Some(me.id), "vouch for device", &format!("device {n}")).await;
-    device_list(&hub, &me.name).await
+    device_list(&hub, &me.name, None).await
 }
 
 async fn create_project(State(hub): State<HubState>, caller: Caller, Path(name): Path<String>) -> Result<Json<Tips>> {
@@ -821,14 +876,30 @@ async fn post_ring(
     // Whoever starts a ring is its admin and holds its key: only an admin
     // of the project starts one. Later changes verify against the ring's
     // own signed log (`merge_ring`).
-    if !viewer.admin {
-        let exists: Option<i32> = sqlx::query_scalar("SELECT 1 FROM rings WHERE project_id = $1 AND scope = $2")
-            .bind(project.id)
-            .bind(&scope)
-            .fetch_optional(&hub.db)
-            .await?;
-        if exists.is_none() {
+    let exists: Option<i32> = sqlx::query_scalar("SELECT 1 FROM rings WHERE project_id = $1 AND scope = $2")
+        .bind(project.id)
+        .bind(&scope)
+        .fetch_optional(&hub.db)
+        .await?;
+    if exists.is_none() {
+        if !viewer.admin {
             return Err(Error::forbidden(format!("only an admin of this project starts a key ring (scope '{scope}')")));
+        }
+        // A new ring must name this project, as its devices check (BUG-845):
+        // its signed genesis carries the id of the project's `team` ring.
+        if scope != veil_core::policy::DEFAULT_SCOPE {
+            let team: Option<String> = sqlx::query_scalar("SELECT body FROM rings WHERE project_id = $1 AND scope = $2")
+                .bind(project.id)
+                .bind(veil_core::policy::DEFAULT_SCOPE)
+                .fetch_optional(&hub.db)
+                .await?;
+            let id = |r: &KeyRing| r.verify().ok().and_then(|st| st.project);
+            let mine = team.and_then(|b| serde_json::from_str::<KeyRing>(&b).ok()).as_ref().and_then(id);
+            if mine.is_none() || id(&ring) != mine {
+                return Err(Error::bad_request(format!(
+                    "the key ring '{scope}' does not belong to this project (its genesis must name the project's 'team' key ring, sent first)"
+                )));
+            }
         }
     }
     merge_ring(&hub, &project, ring).await
@@ -841,6 +912,17 @@ async fn post_ring(
 /// between unrelated projects' rings as deadlocks.
 async fn merge_ring(hub: &HubState, project: &Project, ring: KeyRing) -> Result<Json<serde_json::Value>> {
     let pid = project.id;
+    // The project's `team` ring, which every other ring must name (the
+    // engine's `Keychain::bound`, BUG-845). Its genesis never changes.
+    let team: Option<String> = if ring.scope == veil_core::policy::DEFAULT_SCOPE {
+        None
+    } else {
+        sqlx::query_scalar("SELECT body FROM rings WHERE project_id = $1 AND scope = $2")
+            .bind(pid)
+            .bind(veil_core::policy::DEFAULT_SCOPE)
+            .fetch_optional(&hub.db)
+            .await?
+    };
     for _ in 0..50 {
         let current: Option<String> = sqlx::query_scalar("SELECT body FROM rings WHERE project_id = $1 AND scope = $2")
             .bind(pid)
@@ -852,6 +934,10 @@ async fn merge_ring(hub: &HubState, project: &Project, ring: KeyRing) -> Result<
             let path = VPath::new(&format!(".veil/meta/keyrings/{}.json", ring.scope)).map_err(Error::from)?;
             if let Some(b) = &current {
                 mem.write(&path, b.as_bytes()).map_err(Error::from)?;
+            }
+            if let Some(t) = &team {
+                let tp = VPath::new(&format!(".veil/meta/keyrings/{}.json", veil_core::policy::DEFAULT_SCOPE)).map_err(Error::from)?;
+                mem.write(&tp, t.as_bytes()).map_err(Error::from)?;
             }
             let keys = Keychain::new(mem.clone(), None, "hub".into());
             keys.set_format(veil_core::repo::REPO_FORMAT);

@@ -109,8 +109,15 @@ pub enum Cmd {
     /// Join a project with the link `vl invite` printed: signs this device
     /// in (registering the invited name if it is new), confirms it and
     /// joins the group.
+    ///
+    /// The link also carries the project's fingerprint: `vl join` checks
+    /// that the server's key ring for the project is that one, the only one
+    /// this device then trusts with secrets. Give `-` to paste the link on
+    /// standard input: a link on the command line can be read by other
+    /// users of the machine while `vl join` runs.
     Join {
-        /// The invite link (`veil://host/project#invite=NAME:SECRET`).
+        /// The invite link (`veil://host/project#invite=NAME:SECRET:FINGERPRINT`),
+        /// or `-` to read it from standard input (safer on a shared machine).
         link: String,
     },
     /// One pass of the background key sharing (run by vl itself).
@@ -1007,14 +1014,23 @@ pub enum IdentityCmd {
         #[arg(long)]
         revoke_old: bool,
     },
-    /// Confirm that another device of yours is yours, on a Veil server.
+    /// Confirm a fingerprint you checked out of band: another device of
+    /// yours, or, in a clone, the project's.
     ///
-    /// The new device signs in with `vl login URL --name YOU` and shows its
-    /// fingerprint. Run this on a device you already use: it signs that
-    /// device with this one, and the server lets it sign in. Admins then
-    /// grant it the project's secret keys without asking you again.
+    /// A device: the new device signs in with `vl login URL --name YOU` and
+    /// shows its fingerprint. Run this on a device you already use: it signs
+    /// that device with this one, and the server lets it sign in. Admins
+    /// then grant it the project's secret keys without asking you again.
+    ///
+    /// A project: a device trusts a project's secret keys only once it knows
+    /// the project's fingerprint (an invite link carries it). In a clone
+    /// that does not trust them yet, `vl clone` and `vl pull` show the
+    /// fingerprint the server claims; compare it with an admin's, or with
+    /// `vl identity show` in a clone on another of your devices, then run
+    /// this in the clone.
     Confirm {
-        /// The new device's fingerprint (`vl identity show` on it).
+        /// The new device's fingerprint (`vl identity show` on it), or the
+        /// project's.
         fingerprint: String,
         /// The server (`veil://host[:port]`); default: the one this device
         /// is signed in to.
@@ -1022,13 +1038,16 @@ pub enum IdentityCmd {
         server: Option<String>,
     },
     /// Remove a device on a Veil server: a lost laptop, say. Run it on
-    /// another of your devices; an admin may remove anyone's device in their
-    /// project (run it in a clone of the project).
+    /// another of your devices to remove it everywhere; an admin may remove
+    /// anyone's device from their project only (run it in a clone of the
+    /// project).
     ///
-    /// The device can no longer sign in, and in a clone of a project the
-    /// keys of every secret it could open rotate away from it at once (your
-    /// other devices, and admins', do the same in your other projects in the
-    /// background). It keeps what it already had.
+    /// Your own device can no longer sign in, and in a clone of a project
+    /// the keys of every secret it could open rotate away from it at once
+    /// (your other devices, and admins', do the same in your other projects
+    /// in the background). A device an admin removes can no longer use that
+    /// project, and that project's keys rotate away from it; only its person
+    /// removes it everywhere. It keeps what it already had.
     Remove {
         /// The device's fingerprint (`vl identity show` on it, or the one
         /// `vl group add` showed).

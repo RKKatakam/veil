@@ -203,6 +203,14 @@ pub enum RingOp {
         /// MAC under the generation-0 key binding this genesis to someone who
         /// knew the key. Checked by every reader who holds that key.
         proof: String,
+        /// Ring format 4: the id of the project the ring belongs to (the
+        /// hash of the project's `team` ring's genesis change, 32 hex
+        /// digits). Every ring but `team` carries it from repository format
+        /// 7 on; a ring for another project is refused (BUG-845,
+        /// [`Keychain::bound`]). `team` itself never carries one: its
+        /// genesis *is* the project's id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
     },
     /// Add a member, or change an existing member's name, role or signing key.
     Grant { member: MemberGrant },
@@ -245,6 +253,7 @@ impl RingOp {
     /// Is this an operation only ring format 4 may hold?
     fn needs_shares_format(&self) -> bool {
         matches!(self, RingOp::Invite { .. } | RingOp::Uninvite { .. } | RingOp::Share { .. } | RingOp::RevokeOwn { .. })
+            || matches!(self, RingOp::Genesis { project: Some(_), .. })
     }
 }
 
@@ -393,6 +402,10 @@ pub struct RingState {
     pub ever_members: BTreeSet<String>,
     /// Invites by key (ring format 4).
     pub invites: BTreeMap<String, InviteState>,
+    /// The project the ring belongs to (its genesis's `project`; for
+    /// `team`, which carries none, the hash of its own genesis). `None`:
+    /// a ring bound to no project (legacy, or made before ring format 4).
+    pub project: Option<String>,
 }
 
 /// An invite as the ring's replay leaves it.
@@ -592,6 +605,7 @@ impl KeyRing {
                 len: 0,
                 ever_members: self.members.keys().cloned().collect(),
                 invites: BTreeMap::new(),
+                project: None,
             });
         }
         let scope = self.scope.as_str();
@@ -610,7 +624,15 @@ impl KeyRing {
             }
             parse_public_key(&c.signer).map_err(|e| at(&e.to_string()))?;
             match (&mut state, &c.op) {
-                (None, RingOp::Genesis { key_id, members, .. }) => {
+                (None, RingOp::Genesis { key_id, members, project, .. }) => {
+                    let project = match project {
+                        None => (scope == crate::policy::DEFAULT_SCOPE).then(|| c.hash(scope)),
+                        Some(_) if scope == crate::policy::DEFAULT_SCOPE => {
+                            return Err(at("the 'team' ring is the project's own id and names no project"))
+                        }
+                        Some(p) if valid_project_id(p) => Some(p.clone()),
+                        Some(_) => return Err(at("malformed project id")),
+                    };
                     let mut st = RingState {
                         scope: scope.to_string(),
                         legacy: false,
@@ -623,6 +645,7 @@ impl KeyRing {
                         len: 0,
                         ever_members: BTreeSet::new(),
                         invites: BTreeMap::new(),
+                        project,
                     };
                     for m in members {
                         if m.generation != 0 || parse_public_key(&m.id).is_err() || st.members.contains_key(&m.id) {
@@ -795,6 +818,25 @@ pub fn valid_verifying_key(key: &str) -> bool {
         .and_then(|b| <[u8; 32]>::try_from(b).ok())
         .is_some_and(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).is_ok())
 }
+
+/// Is `p` a project id: 32 lowercase hex digits (a ring change hash)?
+pub fn valid_project_id(p: &str) -> bool {
+    p.len() == 32 && p.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A project's fingerprint (`4F2A-9C1E-77B0-D3E5-A1C2`): the first 80 bits
+/// of BLAKE3 `derive_key` ([`domains::HUB_PROJECT_FINGERPRINT`]) over its
+/// id. What an invite link carries and what people compare before a device
+/// trusts a project's key rings (`docs/HUB.md` §13.12, BUG-845).
+pub fn project_fingerprint(project: &str) -> String {
+    let h = blake3::derive_key(domains::HUB_PROJECT_FINGERPRINT, project.as_bytes());
+    let hex = hex::encode_upper(&h[..10]);
+    hex.as_bytes().chunks(4).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join("-")
+}
+
+/// Where a repository records the project fingerprint its device confirmed
+/// (device-local; [`Keychain::bound`]).
+pub const ANCHOR_FILE: &str = ".veil/local/project-anchor";
 
 /// The replay's rules for a member's share (`docs/HUB.md` §13.12): a new,
 /// bound device of a person the ring trusts, at the current generation,
@@ -1194,6 +1236,11 @@ impl Keychain {
         let Ok(state) = ring.verify() else {
             return ScopeAccess::default();
         };
+        // A ring of another project, or one this device has not anchored,
+        // neither seals nor opens anything here (BUG-845).
+        if self.bound(&state).is_err() {
+            return ScopeAccess::default();
+        }
         let mut access = ScopeAccess {
             genesis: state.genesis_key_id().to_string(),
             current: state.key_id().to_string(),
@@ -1339,7 +1386,9 @@ impl Keychain {
         Ok(())
     }
 
-    /// Every ring that parses (malformed files are skipped).
+    /// Every ring that parses (malformed files are skipped), `team` first:
+    /// it names the project the others must belong to ([`Keychain::bound`]),
+    /// so whoever merges them in this order takes it first.
     pub fn rings(&self) -> Result<Vec<KeyRing>> {
         let dir = VPath::new(".veil/meta/keyrings")?;
         if !self.backend.exists(&dir)? {
@@ -1353,12 +1402,80 @@ impl Keychain {
                 }
             }
         }
+        out.sort_by(|a, b| (a.scope != crate::policy::DEFAULT_SCOPE, &a.scope).cmp(&(b.scope != crate::policy::DEFAULT_SCOPE, &b.scope)));
         Ok(out)
     }
 
     /// Verified state of a scope's ring.
     pub fn ring_state(&self, scope: &str) -> Result<Option<std::result::Result<RingState, String>>> {
-        Ok(self.load_ring(scope)?.map(|r| r.verify()))
+        Ok(self.load_ring(scope)?.map(|r| self.trusted_state(&r)))
+    }
+
+    /// Replay `ring` and check that it is bound to this repository's
+    /// project ([`Keychain::bound`]): what every decision about keys uses.
+    pub fn trusted_state(&self, ring: &KeyRing) -> std::result::Result<RingState, String> {
+        let st = ring.verify()?;
+        self.bound(&st)?;
+        Ok(st)
+    }
+
+    /// The project fingerprint this device confirmed for this repository
+    /// ([`ANCHOR_FILE`]): `None` if the repository records none (it is not
+    /// a clone of a server project); `Some("")` if it records that nothing
+    /// is confirmed yet, so no key ring is trusted.
+    pub fn anchor(&self) -> Option<String> {
+        let raw = self.backend.read_opt(&VPath::new(ANCHOR_FILE).unwrap()).ok()??;
+        let text = String::from_utf8_lossy(&raw);
+        Some(crate::hub::wire::normalize_fingerprint(text.trim()).unwrap_or_default())
+    }
+
+    /// Record the project fingerprint this device confirmed (`""`: none
+    /// yet, trust no ring). Device-local, never synced.
+    pub fn set_anchor(&self, fingerprint: &str) -> Result<()> {
+        self.backend.write(&VPath::new(ANCHOR_FILE)?, fingerprint.as_bytes())?;
+        self.invalidate();
+        Ok(())
+    }
+
+    /// The id of this repository's project: its `team` ring's genesis
+    /// hash, if that ring verifies and is the one this device anchored.
+    pub fn project_id(&self) -> Option<String> {
+        let team = self.load_ring(crate::policy::DEFAULT_SCOPE).ok()??;
+        let st = team.verify().ok()?;
+        self.bound(&st).ok()?;
+        st.project
+    }
+
+    /// Is a verified ring this repository's (BUG-845)? `team` must be the
+    /// ring whose fingerprint this device anchored (when it records one,
+    /// [`Keychain::anchor`]); every other ring must name this repository's
+    /// project ([`Keychain::project_id`]) in its signed genesis. A ring
+    /// bound to no project is accepted only where nothing is anchored (a
+    /// repository that is not a clone of a server project).
+    pub fn bound(&self, st: &RingState) -> std::result::Result<(), String> {
+        let anchor = self.anchor();
+        if st.scope == crate::policy::DEFAULT_SCOPE {
+            return match (anchor, &st.project) {
+                (None, _) => Ok(()),
+                (Some(a), _) if a.is_empty() => Err(
+                    "this device has not confirmed the project's fingerprint yet, so it trusts none of its key rings".into(),
+                ),
+                (Some(a), Some(p)) if project_fingerprint(p) == a => Ok(()),
+                (Some(a), _) => Err(format!(
+                    "it is not the project's key ring this device confirmed (fingerprint {a}): another project's, or one the \
+                     server made"
+                )),
+            };
+        }
+        match (&st.project, anchor) {
+            (Some(p), _) => match self.project_id() {
+                Some(mine) if mine == *p => Ok(()),
+                Some(_) => Err("it belongs to another project".into()),
+                None => Err("it belongs to a project this repository holds no confirmed 'team' key ring of".into()),
+            },
+            (None, Some(_)) => Err("it is bound to no project (made before key rings named their project)".into()),
+            (None, None) => Ok(()),
+        }
     }
 
     fn me(&self) -> Result<&Identity> {
@@ -1400,7 +1517,11 @@ impl Keychain {
             format: RING_FORMAT_SIGNED,
             ..Default::default()
         };
-        self.append(ring, RingOp::Genesis { key_id, members, proof })
+        // Every ring but `team` names its project, from format 7 on (BUG-845).
+        let project = (scope != crate::policy::DEFAULT_SCOPE && self.format() >= SHARES_REPO_FORMAT)
+            .then(|| self.project_id())
+            .flatten();
+        self.append(ring, RingOp::Genesis { key_id, members, proof, project })
     }
 
     /// Create a new scope whose only member (and admin) is this identity.
@@ -1433,9 +1554,9 @@ impl Keychain {
             .load_ring(scope)?
             .ok_or_else(|| VeilError::NotFound(format!("scope '{scope}'")))?;
         let ring = if ring.is_legacy() { self.upgrade_legacy(ring)? } else { ring };
-        let state = ring
-            .verify()
-            .map_err(|e| VeilError::Policy(format!("key ring for '{scope}' does not verify: {e}")))?;
+        let state = self
+            .trusted_state(&ring)
+            .map_err(|e| VeilError::Policy(format!("key ring for '{scope}' is not trusted: {e}")))?;
         let me = self.me()?;
         if !state.is_admin(&me.public_hex(), &me.verifying_hex()) {
             return Err(VeilError::Policy(format!("only an admin of scope '{scope}' can {action}")));
@@ -1608,9 +1729,9 @@ impl Keychain {
         let ring = self
             .load_ring(scope)?
             .ok_or_else(|| VeilError::NotFound(format!("scope '{scope}'")))?;
-        let state = ring
-            .verify()
-            .map_err(|e| VeilError::Policy(format!("key ring for '{scope}' does not verify: {e}")))?;
+        let state = self
+            .trusted_state(&ring)
+            .map_err(|e| VeilError::Policy(format!("key ring for '{scope}' is not trusted: {e}")))?;
         let me = self.me()?;
         if !state.is_member_with_key(&me.public_hex(), &me.verifying_hex()) {
             return Err(VeilError::Policy(format!("this device is not a member of scope '{scope}'")));
@@ -1816,7 +1937,7 @@ impl Keychain {
             }
         }
         for c in &ring.log {
-            if let RingOp::Revoke { rotation, .. } | RingOp::Rotate { rotation } = &c.op {
+            if let RingOp::Revoke { rotation, .. } | RingOp::Rotate { rotation } | RingOp::RevokeOwn { rotation, .. } = &c.op {
                 if access.keys.contains_key(&rotation.key_id) {
                     let prev = &state.generations[rotation.generation as usize - 1];
                     if !access.keys.contains_key(prev) {
@@ -1847,6 +1968,9 @@ impl Keychain {
             Ok(s) => s,
             Err(e) => return reject(format!("rejected, it does not verify ({e})")),
         };
+        if let Err(e) = self.bound(&inc) {
+            return reject(format!("refused: {e}"));
+        }
         if let Err(e) = self.check_with_keys(incoming, &inc) {
             return reject(format!("rejected ({e})"));
         }
@@ -1921,7 +2045,7 @@ impl Keychain {
         // key → [(member, name, bound)]
         let mut claims: BTreeMap<String, Vec<(String, String, bool)>> = BTreeMap::new();
         for r in self.rings().unwrap_or_default() {
-            if let Ok(st) = r.verify() {
+            if let Ok(st) = self.trusted_state(&r) {
                 for (k, (member, name)) in st.ever_signers {
                     let bound = st.bound_signers.contains(&k);
                     claims.entry(k).or_default().push((member, name, bound));

@@ -808,6 +808,9 @@ fn cmd_identity(c: &IdentityCmd) -> Result<ExitCode> {
                 println!("            (legacy: derived from the encryption key; `vl identity new` creates independent keys)");
             }
             println!("stored at   {}", ctx::identity_path().display());
+            if let Some(line) = hub_keys::clone_here().as_ref().and_then(hub_keys::project_line) {
+                println!("project     {line}");
+            }
         }
         IdentityCmd::New { name, force } => {
             let path = ctx::identity_path();

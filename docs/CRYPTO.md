@@ -393,7 +393,29 @@ and is trusted with code but never with secrets.
   member id or signing key the ring ever held is refused, so a removed
   device never comes back.
 * **`revoke_own`.** A member removes another device with their own name and
-  rotates (the same rotation as a revocation, C6, C9).
+  rotates (the same rotation as a revocation, C6, C9). A key holder checks
+  that its new generation unlocks the previous one, as for every rotation
+  (`check_with_keys`).
+* **Project binding (BUG-845).** A project's id is `team`'s genesis change
+  hash (C6's chain hash, 128 bits: it commits to the genesis's random key id,
+  members and signature). Every other ring's genesis carries the id in its
+  signed body (`project`, ring format 4), so the binding is as strong as the
+  genesis signature (C5) and the chain (C6): a server can neither move a
+  ring to another project nor re-label one. A reader accepts a non-`team`
+  ring only if its `project` equals its own `team`'s id.
+* **Project fingerprint, the anchor.** `fp = BLAKE3-derive_key(
+  HUB_PROJECT_FINGERPRINT, id)[..10]` (80 bits), shown as 20 hex digits. A
+  clone of a server project trusts a `team` ring only if its fingerprint is
+  the one the device anchored outside the server: from the invite link
+  (inside the fragment the server never sees; `vl join` compares it with
+  the server's `team`), from creating the project, or typed by the person
+  after comparing it. Forging a `team` ring with a given fingerprint is a
+  second preimage of 80 bits (about 2^80 genesis signatures, each with a
+  fresh key or member list), as for device fingerprints. Until a device
+  has an anchor it takes no ring of the project.
+* **Not from a vouch.** A vouch (C5, `hub-device`) is checked by the
+  *voucher's* peers, not by the new device, which knows no key of its
+  person yet: anchors carried in a vouch would be the server's to choose.
 * **Not covered.** Whether a member wraps the right key cannot be checked by
   a replay (true of admins' grants as well): a member could leak the key
   anyway. Freshness of the ring a member reads is TOFU, as for every ring (a
@@ -504,6 +526,7 @@ are distinct and pins their exact bytes.
 | `HUB_DEVICE_FINGERPRINT` | `veil 2026 hub device-fingerprint v1` | BLAKE3 `derive_key` mode as a hash (first 80 bits) | device fingerprint compared out of band (HUB.md §13.11) |
 | `HUB_UPLOAD_RECEIPT` | `veil 2026 hub upload-receipt v1` | BLAKE3 `derive_key` → keyed BLAKE3 (first 128 bits) | server: upload receipts over project ‖ person ‖ object id (HUB.md §13.5) |
 | `HUB_INVITE_KEY` | `veil 2026 hub invite-key v1` | BLAKE3 `derive_key` → Ed25519 seed | C13: an invite's signing key, from the link's 32 random bytes |
+| `HUB_PROJECT_FINGERPRINT` | `veil 2026 hub project-fingerprint v1` | BLAKE3 `derive_key` mode as a hash (first 80 bits) | C13: a project's fingerprint, over its id; in invite links and compared out of band (not secret) |
 | `POLICY_RULE_SCOPE` | `veil 2026 policy rule-scope v1` | BLAKE3 `derive_key` mode as a hash (first 80 bits) | the scope name `rule-<hex>` of an access line's secrets (not secret) |
 | `WRAP_LABEL_PREFIX` | `wrap:` | AEAD associated data | C3, C3L |
 | `PREV_KEY_LABEL_PREFIX` | `prev-key:` | AEAD associated data | C2 |
