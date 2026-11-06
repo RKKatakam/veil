@@ -9,7 +9,7 @@ Subcommands:
 
 * [`vl group list`](#vl-group-list): List the groups you are in or manage (admins: every group)
 * [`vl group create`](#vl-group-create): Create a group (admins only)
-* [`vl group add`](#vl-group-add): Add people to a group (admins and the group's managers). An admin device also grants them the keys of the project's secrets
+* [`vl group add`](#vl-group-add): Add people to a group (admins and the group's managers). An admin device also grants them the keys of the project's secrets, on their confirmed devices only
 * [`vl group remove`](#vl-group-remove): Remove people from a group (admins and the group's managers)
 * [`vl group manager`](#vl-group-manager): Let people manage a group: add and remove its people (admins only)
 
@@ -37,7 +37,9 @@ Arguments:
 
 ## `vl group add`
 
-Add people to a group (admins and the group's managers). An admin device also grants them the keys of the project's secrets
+Add people to a group (admins and the group's managers). An admin device also grants them the keys of the project's secrets, on their confirmed devices only.
+
+A person's first device must be confirmed by you: `vl` shows `confirm alice's device: 4F2A-…`; compare it with what `vl identity show` prints on alice's device, then run the command again with `--confirm`. Their later devices are confirmed by themselves (`vl identity confirm`).
 
 ```text
 vl group add [OPTIONS] <GROUP> <PEOPLE>...
@@ -49,6 +51,12 @@ Arguments:
 |---|---|
 | `<GROUP>` | (required) |
 | `<PEOPLE>…` | (required) |
+
+Options:
+
+| | |
+|---|---|
+| `--confirm <FINGERPRINT>` | A device fingerprint you have checked with its owner |
 
 ## `vl group remove`
 

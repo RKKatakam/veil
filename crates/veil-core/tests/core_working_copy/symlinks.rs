@@ -282,12 +282,12 @@ fn a_directory_swapped_for_a_link_mid_write_never_redirects_it() {
 /// outside.
 #[test]
 fn a_directory_swapped_for_a_link_mid_checkout_receives_nothing_outside() {
-    // The safety property (nothing outside) is checked on every attempt.
-    // Liveness (some file written despite the race) depends on scheduling:
-    // a swapper that wins every race makes every write refused, which is
-    // safe, so a few attempts are allowed before it counts as a failure.
-    let mut wrote = false;
-    for _ in 0..5 {
+    // Safety (nothing outside, no abort half-way) is checked on every
+    // attempt, whoever wins the races. Liveness does not depend on the
+    // scheduler (BUG-831): a swapper that wins every race makes every
+    // write refused, which is safe; once it stops, the next checkout
+    // finishes the tree.
+    for _ in 0..3 {
         let d = disk();
         let (repo, _, _) = new_repo("alice");
         let leaves: Vec<(String, TreeEntry)> = (0..400).map(|i| (format!("a/sub/f{i}"), file(&repo, &format!("f{i}"), "payload\n"))).collect();
@@ -313,17 +313,19 @@ fn a_directory_swapped_for_a_link_mid_checkout_receives_nothing_outside() {
         stop.store(true, Ordering::Relaxed);
         swapper.join().unwrap();
         // Never an error that aborts it half-way (a refused write is per path).
-        let r = r.unwrap();
+        r.unwrap();
         if d.is_link("a/sub") {
             std::fs::remove_file(d.root.join("a/sub")).unwrap();
         }
         d.assert_outside_untouched();
-        if r.written > 0 {
-            wrote = true;
-            break;
+        // The race over, checking out again completes the tree.
+        let again = repo.checkout_tree(&d.fs, None, &tree).unwrap();
+        assert!(again.failed.is_empty() && again.blocked.is_empty(), "{:?} {:?}", again.failed, again.blocked);
+        for (p, _) in &leaves {
+            assert_eq!(std::fs::read_to_string(d.root.join(p)).ok().as_deref(), Some("payload\n"), "{p}");
         }
+        d.assert_outside_untouched();
     }
-    assert!(wrote, "no attempt wrote anything: the checkout never made progress against the swapper");
 }
 
 // ---- recording links (threats 2-6, 9, 11, 14) -------------------------------------

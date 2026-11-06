@@ -716,13 +716,11 @@ fn clone_populate(backend: Arc<dyn StorageBackend>, url: String, shown: String, 
         .unwrap_or(repo.root_id());
     let wc = repo.new_change(DEFAULT_WORKSPACE, vec![target], "")?;
     let to = repo.snapshot(&wc)?.tree;
-    // Remember what could not be materialised (no key yet, an unreleased
-    // embargo), so it is filled in once it becomes readable instead of
-    // being recorded as deleted.
-    let mut record = Materialised::default();
-    let co = repo.checkout_tree_recorded(&*fs, None, &to, &mut record, None)?;
-    let hidden_by_embargo = record.view().is_some();
-    save_checkout(&fs, &CheckoutState::new(DEFAULT_WORKSPACE, wc, record))?;
+    // Journalled (BUG-830). The record remembers what could not be
+    // materialised (no key yet, an unreleased embargo), so it is filled in
+    // once it becomes readable instead of being recorded as deleted.
+    let (state, co) = repo.check_out_new(&*fs, DEFAULT_WORKSPACE, wc, None)?;
+    let hidden_by_embargo = state.materialised.view().is_some();
     println!(
         "Cloned {} into {} ({} objects, {} files)",
         safe(&shown),
@@ -786,6 +784,7 @@ fn cmd_identity(c: &IdentityCmd) -> Result<ExitCode> {
         IdentityCmd::Show => {
             let id = load_identity()?;
             println!("name        {}", id.name);
+            println!("device      {}", hub::fingerprint(&id.public_id()).unwrap_or_default());
             println!("public key  {}", id.public_id());
             println!("member id   {}", id.public_hex());
             println!("signing key {}", id.verifying_hex());
@@ -833,6 +832,7 @@ fn cmd_identity(c: &IdentityCmd) -> Result<ExitCode> {
                 );
             }
         }
+        IdentityCmd::Confirm { fingerprint, server } => hub_cmd::confirm_device(fingerprint, server.as_deref())?,
         IdentityCmd::RecoverAdmin { from, revoke_old } => {
             use veil_core::keychain::AdminRecovery;
             let id = load_identity()?;

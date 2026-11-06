@@ -20,7 +20,10 @@
 //! secret checks. Writing to, replacing or removing anything the viewer
 //! cannot see is refused here.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use super::access::View;
 use crate::{
@@ -198,6 +201,9 @@ pub struct Graft<'a> {
     /// Full trees this graft built, by id.
     pub created: HashMap<ObjectId, Vec<u8>>,
     pub changes: Vec<Change>,
+    /// Set by [`Graft::proving`]: the objects the pusher uploaded, and the
+    /// real root trees of the snapshot's parents.
+    proof: Option<(&'a HashSet<ObjectId>, Vec<ObjectId>)>,
 }
 
 fn refused(path: &str) -> VeilError {
@@ -211,6 +217,51 @@ impl<'a> Graft<'a> {
             src,
             created: HashMap::new(),
             changes: Vec::new(),
+            proof: None,
+        }
+    }
+
+    /// Read a pushed directory tree only if the pusher uploaded it, or it is
+    /// what they see at the same path in one of the parents (`parents`:
+    /// their real root trees). Any other tree the push names gets
+    /// [`VeilError::Missing`], whether the project stores it or not: a push
+    /// never confirms a guess of a hidden folder (BUG-824).
+    pub fn proving(mut self, uploaded: &'a HashSet<ObjectId>, parents: Vec<ObjectId>) -> Graft<'a> {
+        self.proof = Some((uploaded, parents));
+        self
+    }
+
+    /// See [`Graft::proving`]: may the pushed tree `id` at `dir` be read?
+    fn check_pushed(&mut self, dir: &str, id: &ObjectId, depth: usize) -> Result<()> {
+        let Some((uploaded, parents)) = &self.proof else { return Ok(()) };
+        if *id == empty_tree_id() || uploaded.contains(id) || self.proj.created.contains_key(id) {
+            return Ok(());
+        }
+        for root in parents.clone() {
+            // The real tree at `dir` in that parent (on the pusher's path),
+            // then what the pusher sees of it.
+            let mut real = Some(root);
+            for part in dir.split('/').filter(|p| !p.is_empty()) {
+                real = match real.map(|r| self.src.node(&r)).transpose()? {
+                    Some(Node::Tree(t, _)) => t.get(part).filter(|e| e.kind == EntryKind::Dir).map(|e| e.id),
+                    _ => None,
+                };
+            }
+            if let Some(r) = real {
+                if self.proj.dir_at(dir, r, depth)? == Some(*id) {
+                    return Ok(());
+                }
+            }
+        }
+        Err(VeilError::Missing(*id))
+    }
+
+    /// [`Graft::check_pushed`] for a pushed entry at `path`, if it is a
+    /// directory other than the real one there (`real`).
+    fn check_pushed_entry(&mut self, path: &str, e: Option<&TreeEntry>, real: Option<&TreeEntry>, depth: usize) -> Result<()> {
+        match e {
+            Some(e) if e.kind == EntryKind::Dir && real.is_none_or(|r| r.id != e.id) => self.check_pushed(path, &e.id, depth),
+            _ => Ok(()),
         }
     }
 
@@ -263,7 +314,10 @@ impl<'a> Graft<'a> {
             return Ok(pushed);
         }
         let pt = match pushed {
-            Some(p) => Some(self.tree_at(dir, &p)?),
+            Some(p) => {
+                self.check_pushed(dir, &p, depth)?;
+                Some(self.tree_at(dir, &p)?)
+            }
             None => None,
         };
         let rt = match real {
@@ -290,6 +344,7 @@ impl<'a> Graft<'a> {
             let child = join(dir, &name);
             let pe = pt.as_ref().and_then(|t| t.get(&name)).cloned();
             let re = rt.as_ref().and_then(|t| t.get(&name)).cloned();
+            self.check_pushed_entry(&child, pe.as_ref(), re.as_ref(), depth + 1)?;
             let p_dir = self.is_tree(pe.as_ref())?.is_some();
             let r_dir = self.is_tree(re.as_ref())?.is_some();
             // Hidden from the pusher (a file they may not read, or a
@@ -384,7 +439,10 @@ impl<'a> Graft<'a> {
             None => None,
         };
         let nt = match new {
-            Some(n) => Some(self.tree_at(dir, &n)?),
+            Some(n) => {
+                self.check_pushed(dir, &n, depth)?;
+                Some(self.tree_at(dir, &n)?)
+            }
             None => None,
         };
         let mut names: Vec<String> = Vec::new();
@@ -401,6 +459,7 @@ impl<'a> Graft<'a> {
                 continue;
             }
             let o_dir = self.is_tree(oe.as_ref())?.is_some();
+            self.check_pushed_entry(&child, ne.as_ref(), oe.as_ref(), depth + 1)?;
             let n_dir = self.is_tree(ne.as_ref())?.is_some();
             match (o_dir, n_dir) {
                 (true, true) => self.diff(&child, oe.map(|e| e.id), ne.map(|e| e.id), depth + 1)?,

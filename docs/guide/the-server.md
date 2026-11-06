@@ -37,12 +37,24 @@ prints); nothing to type but your name, the first time:
 ```text
 $ vl login veil://127.0.0.1:8443 --name alice --ca hub/self-signed-cert.pem
 Signed in to 127.0.0.1:8443 as alice
-  server key d0fca5e69d6afaf0343dbc7728611ac7588abe1ca3d2e82e98969059caae08cf
+  this device 4F2A-9C1E-77B0-D3E5-A1C2
+  server key  d0fca5e69d6afaf0343dbc7728611ac7588abe1ca3d2e82e98969059caae08cf
 ```
 
 The session lasts hours; when it ends, `vl` signs in again with the key,
 without asking. The session token is kept in `$VEIL_HOME/hub.json`, readable
 only by you. Your private keys never leave the device.
+
+**This device** is your device's fingerprint (`vl identity show` prints it
+too). An admin compares it with you once, before your device receives the
+project's secret keys.
+
+**Another device of yours** signs in with the same command and name. It
+waits until you confirm it from a device you already use, then signs in:
+
+```sh
+vl identity confirm 7C1B-0E44-93AD-2F18-B6C0    # on your laptop: the new device's fingerprint
+```
 
 ## A project: you are its admin
 
@@ -138,10 +150,16 @@ vl push
 - **Personal private keys and credentials** (`id_rsa`, `id_ed25519`,
   `*.pem`, `*.key`, `.netrc`, …) never leave your device; the server refuses
   them.
-- **Keys come from an admin's signature.** When an admin adds you to a group,
-  their `vl` grants you the key. A manager's addition gives you the folder
-  but not the key, until an admin's device signs. Leaving your last group
-  rotates the key away from you.
+- **Keys come from an admin's signature, for confirmed devices only.** When
+  an admin adds you to a group, their `vl` grants you the key, but only for
+  devices nothing but the server vouches for. The first time, it shows
+  `confirm alice's device: 4F2A-…`; the admin checks it with you and runs
+  `vl group add finance alice --confirm 4F2A-9C1E-77B0-D3E5-A1C2`. Devices
+  you confirm yourself (`vl identity confirm`) get the key the next time an
+  admin adds you. A server that lists a device of its own under your name
+  gets nothing. A manager's addition gives you the folder but not the key,
+  until an admin's device signs. Leaving your last group rotates the key
+  away from all your devices.
 - **An existing repository** starts syncing its secrets only when you ask,
   after seeing the list:
 

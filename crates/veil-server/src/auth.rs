@@ -14,6 +14,9 @@
 //!   hash, with an expiry and the device. A removed device's sessions stop
 //!   at once.
 //! * An unknown key may register as a new person, under a name nobody has.
+//!   Under a name somebody has, it becomes one of their **pending**
+//!   devices: no session until one of their devices vouches for it
+//!   (`docs/HUB.md` §13.11). At most [`MAX_PENDING`] per person.
 
 use axum::{
     extract::{FromRequestParts, State},
@@ -32,6 +35,22 @@ use crate::{
 };
 
 pub const CHALLENGE_TTL_MS: i64 = 60_000;
+/// Pending devices kept per person (the newest).
+pub const MAX_PENDING: i64 = 8;
+
+/// The code of the answer to a pending device's login.
+pub const DEVICE_PENDING: &str = "device_pending";
+
+fn pending(name: &str) -> Error {
+    Error::new(
+        axum::http::StatusCode::CONFLICT,
+        DEVICE_PENDING,
+        format!(
+            "the name '{name}' is taken. If it is yours, this device waits for one of your devices to confirm it \
+             (`vl identity confirm`); otherwise choose another name"
+        ),
+    )
+}
 
 /// The signed-in person, if any.
 #[derive(Clone, Debug)]
@@ -43,6 +62,8 @@ pub struct Caller {
 pub struct Person {
     pub id: i64,
     pub name: String,
+    /// The signed-in device's Ed25519 key (hex).
+    pub device_key: String,
 }
 
 fn valid_key(key: &str) -> bool {
@@ -108,19 +129,20 @@ pub async fn login(State(hub): State<HubState>, headers: HeaderMap, Json(req): J
     let public_identity = req.identity.clone();
     let key = req.key.clone();
     let name = req.name.clone();
-    let (device, person, person_name) = crate::db::serializable(&hub.db, move |c| {
+    let outcome = crate::db::serializable(&hub.db, move |c| {
         let key = key.clone();
         let name = name.clone();
         let public_identity = public_identity.clone();
         Box::pin(async move {
-            let row: Option<(i64, i64, String)> = sqlx::query_as(
-                "SELECT d.id, p.id, p.name FROM devices d JOIN people p ON p.id = d.person_id WHERE d.signing_key = $1 AND d.removed_at IS NULL",
+            let row: Option<(i64, i64, String, bool)> = sqlx::query_as(
+                "SELECT d.id, p.id, p.name, d.pending FROM devices d JOIN people p ON p.id = d.person_id \
+                 WHERE d.signing_key = $1 AND d.removed_at IS NULL",
             )
             .bind(&key)
             .fetch_optional(&mut *c)
             .await?;
-            if let Some(r) = row {
-                return Ok(r);
+            if let Some((device, person, name, pending)) = row {
+                return Ok(if pending { Err(name) } else { Ok((device, person, name)) });
             }
             let Some(name) = name else {
                 return Err(Error::unauthorized("this device is not registered; sign up with a name (`vl login URL --name NAME`)"));
@@ -130,11 +152,30 @@ pub async fn login(State(hub): State<HubState>, headers: HeaderMap, Json(req): J
                     "a name is 1 to 64 lowercase letters, digits, '-', '_' or '.', and not a tier word",
                 ));
             }
-            let taken: Option<i64> = sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(&name).fetch_optional(&mut *c).await?;
-            if taken.is_some() {
-                return Err(Error::conflict(format!("the name '{name}' is taken")));
-            }
             let now = veil_core::now_millis();
+            let taken: Option<i64> = sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(&name).fetch_optional(&mut *c).await?;
+            if let Some(person) = taken {
+                // One of their devices may vouch for it; until then it is
+                // nothing (no session, its signatures not accepted).
+                sqlx::query(
+                    "INSERT INTO devices (person_id, signing_key, public_identity, created_at, pending) VALUES ($1, $2, $3, $4, TRUE)",
+                )
+                .bind(person)
+                .bind(&key)
+                .bind(&public_identity)
+                .bind(now)
+                .execute(&mut *c)
+                .await?;
+                sqlx::query(
+                    "DELETE FROM devices WHERE person_id = $1 AND pending AND id NOT IN \
+                     (SELECT id FROM devices WHERE person_id = $1 AND pending ORDER BY id DESC LIMIT $2)",
+                )
+                .bind(person)
+                .bind(MAX_PENDING)
+                .execute(&mut *c)
+                .await?;
+                return Ok(Err(name));
+            }
             let person: i64 = sqlx::query_scalar("INSERT INTO people (name, created_at) VALUES ($1, $2) RETURNING id")
                 .bind(&name)
                 .bind(now)
@@ -149,10 +190,11 @@ pub async fn login(State(hub): State<HubState>, headers: HeaderMap, Json(req): J
                     .bind(now)
                     .fetch_one(&mut *c)
                     .await?;
-            Ok((device, person, name))
+            Ok(Ok((device, person, name)))
         })
     })
     .await?;
+    let (device, person, person_name) = outcome.map_err(|name| pending(&name))?;
     let token = hex::encode(veil_core::crypto::random_bytes::<32>());
     let expires_at = now + hub.session_ttl_ms;
     sqlx::query("INSERT INTO sessions (token_hash, device_id, person_id, expires_at) VALUES ($1, $2, $3, $4)")
@@ -183,17 +225,17 @@ impl FromRequestParts<HubState> for Caller {
             .ok()
             .and_then(|a| a.strip_prefix("Bearer "))
             .ok_or_else(|| Error::unauthorized("expected a bearer token"))?;
-        let row: Option<(i64, String)> = sqlx::query_as(
-            "SELECT p.id, p.name FROM sessions s JOIN devices d ON d.id = s.device_id JOIN people p ON p.id = s.person_id \
-             WHERE s.token_hash = $1 AND s.expires_at > $2 AND d.removed_at IS NULL",
+        let row: Option<(i64, String, String)> = sqlx::query_as(
+            "SELECT p.id, p.name, d.signing_key FROM sessions s JOIN devices d ON d.id = s.device_id JOIN people p ON p.id = s.person_id \
+             WHERE s.token_hash = $1 AND s.expires_at > $2 AND d.removed_at IS NULL AND NOT d.pending",
         )
         .bind(token_hash(token))
         .bind(veil_core::now_millis())
         .fetch_optional(&hub.db)
         .await?;
         match row {
-            Some((id, name)) => Ok(Caller {
-                person: Some(Person { id, name }),
+            Some((id, name, device_key)) => Ok(Caller {
+                person: Some(Person { id, name, device_key }),
             }),
             // Never downgraded to anonymous: the client signs in again.
             None => Err(Error::unauthorized("session expired or unknown; sign in again")),

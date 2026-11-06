@@ -829,9 +829,9 @@ protocol as pure functions, shared with `vl`; they build for WASM),
 |---|---|---|
 | HTTPS API | tokio, axum, hyper, rustls (ring) | TLS on every connection; `--tls-cert/--tls-key`, or a self-signed certificate (rcgen) for `localhost`/`127.0.0.1` created in the data directory, which `vl login --ca FILE` pins for that server |
 | Metadata | sqlx, PostgreSQL 17 (development, CI) and YugabyteDB 2025.2 | portable SQL only; every read-write transaction is SERIALIZABLE through `db::serializable`, retried with capped exponential backoff on `40001`/`40P01` (YugabyteDB reports conflicts as both) |
-| Migrations | `db::migrate`, `migrations/0001_initial.sql` | each in its own transaction, recorded in `schema_migrations`; servers starting together race on its primary key and the loser re-checks. On PostgreSQL DDL is transactional; on YugabyteDB DDL inside a transaction block is applied statement by statement unless transactional DDL is enabled, so **migration files are idempotent** (`IF NOT EXISTS`) and a half-applied one is completed by the next start |
+| Migrations | `db::migrate`, `migrations/0001_initial.sql`, `0002_device_vouches.sql` (pending devices, vouches: §13.11) | each in its own transaction, recorded in `schema_migrations`; servers starting together race on its primary key and the loser re-checks. On PostgreSQL DDL is transactional; on YugabyteDB DDL inside a transaction block is applied statement by statement unless transactional DDL is enabled, so **migration files are idempotent** (`IF NOT EXISTS`) and a half-applied one is completed by the next start |
 | Object storage | `store::BlobStore`: `FsStore` (a directory; unit tests, development) and `S3Store` (rusty-s3 request signing + reqwest; tested against MinIO) | key `p/<project id>/ab/cdef…`: projects never share an object; every read is re-hashed against its id; an in-memory cache of objects and decoded trees |
-| Server identity | an Ed25519 `Identity` in `<data>/hub-identity.json` (0600) | signs projected snapshots (§13.4); its key is shown by `vl login` |
+| Server identity | an Ed25519 `Identity` in `<data>/hub-identity.json` (0600); a random secret in `<data>/hub-receipt-key` (0600) | signs projected snapshots (§13.4); its key is shown by `vl login`. The secret keys upload receipts (§13.5); servers sharing the data directory accept each other's |
 
 **YugabyteDB's licence (checked 2026-11-06).** The `LICENSE.md` shipped in
 the official image `yugabytedb/yugabyte:2025.2.8.1-b8` (`/licenses/`) and
@@ -866,7 +866,10 @@ quay.io; the tests use the MinIO server binary packaged as
   * The identity's Ed25519 part must be the key, with a valid binding: a
     device cannot register someone else's X25519 key.
 * An unknown key with `name` registers a new person (names are unique,
-  lowercase, never a tier word); without `name` it is refused.
+  lowercase, never a tier word); without `name` it is refused. Under a
+  name somebody has, the key becomes one of their **pending** devices: no
+  session, its signatures not accepted, until one of their devices vouches
+  for it (§13.11).
 * The **session token** is 32 random bytes; the database keeps only its
   BLAKE3 hash, the device and an expiry (`--session-seconds`, 12 h). A
   bad or expired token is **401, never downgraded to anyone-on-Earth**;
@@ -931,7 +934,10 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
   dropped whole; only directories holding a rule are rewritten. Empty
   directories are dropped.
 * `P(S).parents`: the projections of `S.parents`, duplicates removed;
-  `conflicts` keeps only paths `v` may read.
+  `conflicts` keeps only paths `v` may read; `predecessors` are projected
+  too: a stored predecessor becomes `v`'s version of that change, or is left
+  out if `v`'s history has no version of it (BUG-826); one the server never
+  stored is kept.
 * **A change that touched only what `v` cannot see is not in `v`'s history
   at all**: `P(S) = P(parent)`, and its description never reaches `v`. A
   change that touched both appears with only `v`'s part, **with its
@@ -968,10 +974,11 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
 | `GET /v1/projects/{p}/tips` | branches → tips as the caller sees them (projections) |
 | `POST …/history {tips, stop}` | the caller's projected snapshots from `tips` down to `stop`, as object frames (`id ‖ len u32be ‖ object`) |
 | `POST …/fetch {snapshot, objects: [{path, id}]}` | objects by id, each with the path where the client met it under that snapshot; the server walks the viewer's projection to that path and serves the object only if it is there. No list of what the client has; each request names an immutable object, so a per-viewer cache can serve it |
-| `POST …/objects` | upload object frames: re-hashed, canonically decoded, format-checked, stored; invisible until a push reaches them |
-| `POST …/push {updates: [{branch, expected, new}], force}` | complete and check every new snapshot, then move the branches in **one serialisable transaction of compare-and-swaps** (`UPDATE branches SET target = new WHERE … AND target = expected`); one lost race rejects the whole push with 409 and `vl` retries |
+| `POST …/objects` | upload object frames: re-hashed, canonically decoded, format-checked, stored; invisible until a push reaches them. Answers a **receipt** per object (a server MAC over project ‖ person ‖ id) |
+| `POST …/push {updates: [{branch, expected, new}], force, receipts}` | complete and check every new snapshot, then move the branches in **one serialisable transaction of compare-and-swaps** (`UPDATE branches SET target = new WHERE … AND target = expected`); one lost race rejects the whole push with 409 and `vl` retries |
 | `GET …/access?path=` | the deciding line and who it names; only for a path the caller may read |
-| `…/groups`, `…/rings/{scope}`, `GET /v1/people/{name}/devices` | groups; key rings of secret scopes; a person's device identities (for an admin's device to wrap keys to) |
+| `…/groups`, `…/rings/{scope}`, `GET /v1/people/{name}/devices` | groups; key rings of secret scopes; a person's devices (active and pending) and the vouches the server stores, which admins' devices check before wrapping a key (§13.11) |
+| `POST /v1/devices/vouch {device, signature}` | the signed-in device vouches for another device of its person; a pending one becomes active |
 
 * **Fetch on demand (Scion):** `vl` asks for the tips, the snapshots it
   lacks, then trees from the root down and the files it needs, one request
@@ -986,7 +993,11 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
   whose side changed it since a common ancestor, never the version the
   first parent replaced: BUG-820),
   3 (access lines), 4–6 (hash, canonical decoding, format), 7 (closure:
-  every changed object must be uploaded or stored), 8 (§13.6), 10 (every
+  every object a push introduces carries the pusher's upload receipt,
+  unless it is the entry at the same path in one of the snapshot's parents;
+  anything else, stored or not, gets the answer a missing object gets, so a
+  push never confirms a guess of a hidden file or folder: BUG-824),
+  8 (§13.6), 10 (every
   new snapshot signed by a registered device key) and 12 (fast-forward
   unless an admin forces) are built. Cloaked lines and embargoed content
   are refused in S1. Not built: 9 (the server-side secret scan), 11, 13.
@@ -1023,10 +1034,10 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
   * a manager's (or a compromised server's) group change gives folder
     access but **no key**: the secret stays closed until a ring admin
     signs (`vl group add` says so);
-  * **S1 limit (BUG-827, open):** the admin's device takes a person's
-    devices from the server (`GET /v1/people/{name}/devices`), so a
-    compromised server can list its own device under the person being
-    added and receive the key. Step 3 of the S2 plan below closes this;
+  * **the devices a key is wrapped for are vouched for outside the
+    server** (BUG-827, fixed; §13.11): a person's first device is
+    confirmed by the admin by its fingerprint, and their later devices by
+    one of their own. The server's device list alone never wraps a key;
   * removing someone from their last group **rotates** the key away from
     their devices (as `vl scope revoke` does) when a ring admin removes
     them; a manager's removal says the key was not rotated and asks an
@@ -1058,7 +1069,8 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
    signature, that the signer is a current ring admin, and that the device
    keys are bound to the person (§6.3, §12.2).
 3. A new device of an existing member is wrapped the same way, on a
-   statement signed by one of the person's existing devices.
+   statement signed by one of the person's existing devices (**built**,
+   §13.11; the wrapping still waits for a ring admin's `vl group add`).
 4. Removal rotates every scope the person could open and lists the
    secrets to change (§6.4).
 
@@ -1082,12 +1094,17 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
 * **Descriptions** of changes that touched both visible and hidden paths
   are shown with the visible part (§13.4).
 * **One secret key** per project (§13.6).
-* **Open findings of the S1 adversarial pass** (`docs/BUGS.md`): a push
-  may name an object it did not upload, which confirms a guess of a whole
-  hidden file (BUG-824); projections keep the real ids of `predecessors`
-  (BUG-826); a compromised server can obtain the secret key through the
-  device list (BUG-827, §13.6). HTTP/2 connections idle between requests
-  are not timed out (BUG-825 bounds handshakes and HTTP/1 request heads).
+* **Open findings** (`docs/BUGS.md`): HTTP/2 connections idle between
+  requests are not timed out (BUG-825 bounds handshakes and HTTP/1 request
+  heads); a `--only` clone records the folder's secrets as deleted
+  (BUG-832).
+* **Upload timing:** an upload answers the same whether the project held
+  an object or not, but a store may take another time to write over an
+  existing key.
+* **Devices:** confirming a device takes a second `vl group add` by an
+  admin for its keys (no background wrapping yet); devices are not removed
+  through the API yet; anyone can make up to 8 pending devices under a
+  name, which only delays its owner's next new device.
 * **Embargoes and cloaked lines** cannot be pushed to the server yet.
 * **`--only` clones** cannot move to revisions that changed folders outside
   their directory (§13.5).
@@ -1130,3 +1147,76 @@ machine (the server adds nothing measurable). Both were dominated by the
 checkout's per-file `fsync` (BUG-818, pre-existing); with one barrier per
 checkout the 10k clone takes 1,014 ms instead of 10,044 ms. Clone one
 directory stays flat from 1k to 10k files (62 and 74 ms).
+
+### 13.11 Confirmed devices: who a secret key is wrapped for (BUG-827)
+
+**The problem.** The server is trusted with code, never with secrets
+(§3.1). Before this fix an admin's `vl group add` wrapped the secret key
+for every device `GET /v1/people/{name}/devices` returned, so a
+compromised server listed its own device under the person being added and
+received the key (BUG-827). **The server's word about whose device a key
+is can never be enough:** every device a key is wrapped for must be vouched
+for by someone outside the server.
+
+**The design.**
+
+* **A device fingerprint** is what people compare: 20 hex digits in five
+  groups (`4F2A-9C1E-77B0-D3E5-A1C2`), the first 80 bits of a BLAKE3
+  `derive_key` (context `veil 2026 hub device-fingerprint v1`) over the
+  device's Ed25519 and X25519 public keys (`hub::wire::device_fingerprint`).
+  `vl login` and `vl identity show` print it.
+* **A person's first device is confirmed by the admin, out of band.**
+  `vl group add finance alice` shows `confirm alice's device:
+  4F2A-9C1E-…` for each of alice's devices nothing vouches for yet, and
+  grants no key to it. The admin compares it with what alice reads from
+  her screen (in person, on a call), then runs `vl group add finance alice
+  --confirm 4F2A-9C1E-77B0-D3E5-A1C2`. A `--confirm` that matches none of
+  alice's listed devices fails loudly: the server is listing a device that
+  is not the one alice has.
+* **A person's later devices are confirmed by the person (cross-signing).**
+  The new device signs in with `vl login URL --name alice`: the server
+  records it as **pending** (no session, its signatures are not accepted)
+  and `vl` prints its fingerprint. On a device alice already uses she runs
+  `vl identity confirm 7C1B-…`: her `vl` finds the pending device with that
+  fingerprint in her own device list and signs a **vouch** (Ed25519,
+  signature context `hub-device`, over the new device's X25519 and Ed25519
+  keys) with her device key. The server checks the vouch, activates the
+  device and stores the vouch; the new device's next `vl login` signs in.
+  The server keeps at most 8 pending devices per person (the newest).
+* **What an admin's `vl` wraps for.** For each person being added it takes
+  the server's list of their devices *and the vouches*, and grants the
+  secret scopes only to devices in this chain, built entirely from things
+  the server cannot forge:
+  1. devices already in a key ring this device verifies (signed by a ring
+     admin), under the person's name: confirmed before;
+  2. devices whose fingerprint the admin gave with `--confirm`;
+  3. devices with a vouch that verifies under the signing key of a device
+     in 1–3 (repeated until nothing changes).
+
+  Every other listed device gets `confirm alice's device: …` and no key.
+  Re-running `vl group add` after alice confirms a new device wraps the
+  key for it (an admin's device still does the wrapping in S2's first
+  step; the background wrapping of §13.6 step 2 is not built).
+* **Removal rotates by the ring, not the list:** `vl group remove` revokes
+  every ring member recorded under the person's name as well as their
+  listed devices, so a server that hides a device does not keep it the key.
+
+**Threat review** (attackers outside the boundary for secrets, §3.1):
+
+| Attacker | Tries | Result |
+|---|---|---|
+| Compromised server | lists its own device under alice when an admin adds her | not confirmed: shown as `confirm alice's device: <its fingerprint>`, no key. Alice reads a different fingerprint, so the admin's `--confirm` matches nothing and fails |
+| Compromised server | forges a vouch for its device | the vouch must verify under a key in the chain; the server holds none |
+| Compromised server | replays alice's real vouch for her device D2 onto its own device | the vouch signs D2's keys, not its device's: it does not verify |
+| Compromised server | makes a device whose fingerprint equals alice's | a second preimage of 80 bits: about 2^80 key generations |
+| Compromised server | renames people, so bob's confirmed device is listed under alice | bob's device already holds the key; nothing new is wrapped |
+| Compromised server | hides one of alice's devices at removal | rotation also revokes every ring member named alice |
+| Anyone on Earth | `vl login --name alice` with their own key | a pending device only: no session, no access, no key, until one of alice's devices vouches for it; at most 8 pending, so alice's own pending device may need a second `vl login` if someone floods it |
+| Alice herself | vouches for a device that is not hers | trusted: her own deliberate command (§3.1) |
+| Admin | confirms without comparing | the human check is the boundary; the fingerprint is shown once, with what to compare it against |
+
+**Remaining (not needed to close the class):** keys per access rule (§13.6,
+S2 plan step 1) — one project key still opens every secret for anyone
+granted it; background wrapping when a new device is vouched (step 2);
+removing a device (§5.6); an invite code as an alternative to reading a
+fingerprint.

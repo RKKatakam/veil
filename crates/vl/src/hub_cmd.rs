@@ -10,7 +10,6 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use veil_core::{
-    checkout::Materialised,
     identity::parse_public_identity,
     keychain::Role,
     policy::{split_fields, valid_principal_name, Policy, Tier, POLICY_FILE},
@@ -20,7 +19,7 @@ use veil_core::{
 
 use crate::{
     cli::GroupCmd,
-    ctx::{load_identity, save_checkout, user_for, CheckoutState, Ctx},
+    ctx::{load_identity, user_for, Ctx},
     hub::{self, Client, HubUrl},
     render::{bold, cyan, dim, green, safe, warn, warn_untrusted, yellow},
 };
@@ -48,11 +47,52 @@ pub fn login(url: &str, name: Option<&str>, ca: Option<&Path>) -> Result<ExitCod
         let pem = std::fs::read_to_string(ca).with_context(|| format!("reading {}", ca.display()))?;
         Client::trust_ca(&u.authority, &pem)?;
     }
-    let client = Client::new(&u, load_identity()?)?;
+    let identity = load_identity()?;
+    let fp = hub::fingerprint(&identity.public_id()).unwrap_or_default();
+    let client = Client::new(&u, identity)?;
     let s = client.login(name)?;
     println!("Signed in to {} as {}", safe(&u.authority), bold(&safe(&s.person)));
-    println!("  server key {}", dim(&s.hub_key));
+    println!("  this device {}", bold(&fp));
+    println!("  server key  {}", dim(&s.hub_key));
     Ok(ExitCode::SUCCESS)
+}
+
+/// `vl identity confirm FINGERPRINT`: vouch, with this device's key, for
+/// the device of this person's with that fingerprint (`docs/HUB.md`
+/// §13.11). The fingerprint is read off the new device by its owner, so
+/// the server cannot substitute another device.
+pub fn confirm_device(fingerprint: &str, server: Option<&str>) -> Result<()> {
+    let fp = veil_core::hub::wire::normalize_fingerprint(fingerprint)
+        .ok_or_else(|| anyhow!("a device fingerprint is 20 hex digits, as `vl identity show` prints it (4F2A-9C1E-…)"))?;
+    let servers = hub::signed_in_servers()?;
+    let (authority, me) = match server {
+        Some(s) => {
+            let a = HubUrl::parse(s).ok_or_else(|| anyhow!("expected veil://host[:port]"))??.authority;
+            servers
+                .into_iter()
+                .find(|(x, _)| *x == a)
+                .ok_or_else(|| anyhow!("this device is not signed in to {a} (`vl login veil://{a}`)"))?
+        }
+        None => match <[_; 1]>::try_from(servers) {
+            Ok([one]) => one,
+            Err(v) if v.is_empty() => bail!("this device is not signed in to a Veil server (`vl login`)"),
+            Err(_) => bail!("this device is signed in to several servers: give one with --server veil://host[:port]"),
+        },
+    };
+    let url = HubUrl::parse(&format!("veil://{authority}")).ok_or_else(|| anyhow!("bad server"))??;
+    let client = Client::new(&url, load_identity()?)?;
+    let devices = client.devices(&me)?;
+    let device = devices
+        .identities
+        .iter()
+        .chain(&devices.pending)
+        .find(|d| hub::fingerprint(d).as_deref() == Some(fp.as_str()))
+        .ok_or_else(|| anyhow!("none of {me}'s devices on {authority} has the fingerprint {fp}: check it on the new device (`vl identity show`)"))?
+        .clone();
+    client.vouch(&device)?;
+    println!("Confirmed device {} as {}'s on {}", bold(&fp), safe(&me), safe(&authority));
+    println!("  it may sign in now (`vl login`); admins grant it secret keys when they next add you to a group");
+    Ok(())
 }
 
 pub fn clone(url: &HubUrl, dest: Option<&Path>, only: Option<&str>) -> Result<ExitCode> {
@@ -120,20 +160,20 @@ fn clone_populate(url: &HubUrl, dest: &Path, only: Option<&str>) -> Result<ExitC
         .or_else(|| repo.view().tags.values().next().map(|t| t.target))
         .unwrap_or(repo.root_id());
     let wc = repo.new_change(DEFAULT_WORKSPACE, vec![target], "").context("starting a change")?;
-    let mut to = repo.snapshot(&wc)?.tree;
-    let mut record = Materialised::default();
+    let to = repo.snapshot(&wc)?.tree;
+    let mut partial = None;
     if let Some(o) = only {
         if veil_core::tree::lookup(repo.store(), &to, &VPath::new(o)?)?.is_none_or(|e| e.kind != veil_core::EntryKind::Dir) {
             bail!("no directory '{o}' that you can see in this project");
         }
         // Only `o` is written; the rest was never fetched, never shown, and
         // every snapshot keeps it unchanged.
-        let (restricted, hidden) = hub::restrict_to(repo.store(), to, o)?;
-        to = restricted;
-        record = Materialised::hiding(hidden);
+        let (_, hidden) = hub::restrict_to(repo.store(), to, o)?;
+        partial = Some((hub::without(repo.store(), to, o)?, hidden));
     }
-    let co = repo.checkout_tree_recorded(&*fs, None, &to, &mut record, None).context("checking out")?;
-    save_checkout(&fs, &CheckoutState::new(DEFAULT_WORKSPACE, wc, record))?;
+    // Journalled, so a clone killed here is finished by the next command
+    // (BUG-830).
+    let (_, co) = repo.check_out_new(&*fs, DEFAULT_WORKSPACE, wc, partial).context("checking out")?;
     println!(
         "Cloned {} into {} ({} objects, {} files{})",
         safe(&format!("veil://{}/{}", url.authority, url.project)),
@@ -203,39 +243,145 @@ fn secret_scopes(ctx: &Ctx) -> Vec<String> {
     out
 }
 
-/// Grant (or revoke) the secret scopes to every registered device of
-/// `people`, signed by this device as a ring admin, and send the rings.
-/// The server's group list is never what wraps a key: this admin's
-/// signature is (`docs/HUB.md` §6).
-fn sync_secret_keys(ctx: &mut Ctx, client: &Client, people: &[String], grant: bool) -> Result<()> {
-    let keys = ctx.repo.keys();
-    let mut changed = Vec::new();
-    let mut admin_somewhere = false;
-    for scope in secret_scopes(ctx) {
-        let Some(Ok(state)) = keys.ring_state(&scope)? else { continue };
-        let me = load_identity()?;
-        let admin = state
-            .members
-            .get(&me.public_hex())
-            .is_some_and(|m| m.role == Role::Admin);
-        if !admin {
-            continue;
+/// The devices of `person` that are vouched for outside the server
+/// (`docs/HUB.md` §13.11), as listed public identities: those whose
+/// signing key a verified key ring records under `person`, those whose
+/// fingerprint is in `confirm` (each match is removed from it), and,
+/// repeatedly, those with a vouch that verifies under one of these
+/// devices' keys. The server's list alone never makes a device trusted.
+fn confirmed_devices(
+    person: &str,
+    devices: &veil_core::hub::wire::Devices,
+    rings: &[veil_core::keychain::RingState],
+    confirm: &mut Vec<String>,
+) -> Vec<String> {
+    let mut keys: std::collections::HashSet<String> = rings
+        .iter()
+        .flat_map(|st| st.members.values())
+        .filter(|m| m.name == person)
+        .filter_map(|m| m.signing_key.clone())
+        .collect();
+    // Listed devices with a binding (the identity's keys belong together).
+    let listed: Vec<(&String, String, String)> = devices
+        .identities
+        .iter()
+        .filter_map(|i| {
+            let p = parse_public_identity(i).ok().filter(|p| p.binding.is_some())?;
+            Some((i, p.signing_hex()?, veil_core::hub::wire::device_fingerprint(&p)?))
+        })
+        .collect();
+    for (_, key, fp) in &listed {
+        if let Some(at) = confirm.iter().position(|c| c == fp) {
+            confirm.remove(at);
+            keys.insert(key.clone());
         }
-        admin_somewhere = true;
-        for person in people {
-            let devices = client.devices(person)?;
-            for id in &devices.identities {
-                let member = parse_public_identity(id)?.member_id();
-                let has = state.members.contains_key(&member);
-                if grant && !has {
-                    keys.grant_role(&scope, id, person, Role::Member)?;
-                    changed.push(scope.clone());
-                } else if !grant && has {
-                    keys.revoke_with_vault(&scope, id)?;
-                    changed.push(scope.clone());
-                }
+    }
+    loop {
+        let before = keys.len();
+        for v in &devices.vouches {
+            if !keys.contains(&v.by) || !veil_core::hub::wire::vouch_valid(v) {
+                continue;
+            }
+            let Some(fp) = hub::fingerprint(&v.device) else { continue };
+            if let Some((_, key, _)) = listed.iter().find(|(_, _, f)| *f == fp) {
+                keys.insert(key.clone());
             }
         }
+        if keys.len() == before {
+            break;
+        }
+    }
+    listed.into_iter().filter(|(_, k, _)| keys.contains(k)).map(|(i, _, _)| i.clone()).collect()
+}
+
+/// Grant (or revoke) the secret scopes to `people`, signed by this device
+/// as a ring admin, and send the rings. The server's group list is never
+/// what wraps a key: this admin's signature is (`docs/HUB.md` §6), and
+/// only for devices vouched for outside the server (§13.11). Revoking
+/// takes every ring member recorded under the person's name, not only the
+/// devices the server lists.
+fn sync_secret_keys(ctx: &mut Ctx, client: &Client, group: &str, people: &[String], grant: bool, confirm: &[String]) -> Result<()> {
+    let keys = ctx.repo.keys();
+    let me = load_identity()?;
+    let mut rings = Vec::new();
+    let mut admin_of = Vec::new();
+    for scope in secret_scopes(ctx) {
+        let Some(Ok(state)) = keys.ring_state(&scope)? else { continue };
+        if state.members.get(&me.public_hex()).is_some_and(|m| m.role == Role::Admin) {
+            admin_of.push(scope);
+        }
+        rings.push(state);
+    }
+    let admin_somewhere = !admin_of.is_empty();
+    let mut confirm: Vec<String> = confirm
+        .iter()
+        .map(|c| {
+            veil_core::hub::wire::normalize_fingerprint(c)
+                .ok_or_else(|| anyhow!("'{c}' is not a device fingerprint (20 hex digits, as `vl identity show` prints it)"))
+        })
+        .collect::<Result<_>>()?;
+    // Decide everything first: a fingerprint that matches nothing stops
+    // the command before any key is wrapped.
+    let mut plan: Vec<(String, String)> = Vec::new(); // (person, device or member id)
+    let mut unconfirmed: Vec<(String, String)> = Vec::new(); // (person, fingerprint)
+    if admin_somewhere {
+        for person in people {
+            let devices = client.devices(person)?;
+            if grant {
+                let ok = confirmed_devices(person, &devices, &rings, &mut confirm);
+                for id in &devices.identities {
+                    if ok.contains(id) {
+                        plan.push((person.clone(), id.clone()));
+                    } else {
+                        unconfirmed.push((person.clone(), hub::fingerprint(id).unwrap_or_else(|| "(no signing key)".into())));
+                    }
+                }
+            } else {
+                let mut gone: Vec<String> = devices
+                    .identities
+                    .iter()
+                    .filter_map(|i| parse_public_identity(i).ok().map(|p| p.member_id()))
+                    .collect();
+                for st in &rings {
+                    gone.extend(st.members.iter().filter(|(id, m)| m.name == *person && **id != me.public_hex()).map(|(id, _)| id.clone()));
+                }
+                gone.sort();
+                gone.dedup();
+                plan.extend(gone.into_iter().map(|g| (person.clone(), g)));
+            }
+        }
+    }
+    if admin_somewhere && !confirm.is_empty() {
+        bail!(
+            "no device of {} on the server has the fingerprint {}: the server lists a different device than the one you \
+             checked. No secret key was granted",
+            people.join(", "),
+            confirm.join(", ")
+        );
+    }
+    let mut changed = Vec::new();
+    for scope in &admin_of {
+        let Some(Ok(state)) = keys.ring_state(scope)? else { continue };
+        for (person, id) in &plan {
+            let member = parse_public_identity(id)?.member_id();
+            let has = state.members.contains_key(&member);
+            if grant && !has {
+                keys.grant_role(scope, id, person, Role::Member)?;
+                changed.push(scope.clone());
+            } else if !grant && has {
+                keys.revoke_with_vault(scope, id)?;
+                changed.push(scope.clone());
+            }
+        }
+    }
+    for (person, fp) in &unconfirmed {
+        println!("  {} confirm {}'s device: {}", yellow("keys:"), safe(person), bold(fp));
+        println!(
+            "        compare it with `vl identity show` on their device, then: vl group add {} {} --confirm {}",
+            safe(group),
+            safe(person),
+            fp
+        );
     }
     if grant && !admin_somewhere {
         warn(
@@ -262,11 +408,12 @@ fn sync_secret_keys(ctx: &mut Ctx, client: &Client, people: &[String], grant: bo
             format!("{} secret keys of scope {scope}", if grant { "grant" } else { "revoke" }),
             "key rings are append-only".to_string(),
         )?;
+        let whom: Vec<&str> = plan.iter().map(|(p, _)| p.as_str()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
         println!(
             "  {} the '{scope}' secret key {} {}",
             dim("keys:"),
             if grant { "granted to" } else { "rotated away from" },
-            people.join(", ")
+            whom.join(", ")
         );
     }
     Ok(())
@@ -289,9 +436,9 @@ pub fn group(ctx: &mut Ctx, c: &GroupCmd) -> Result<()> {
             }
         }
         GroupCmd::Create { name } => show(&client.group("POST", name, "", &[])?),
-        GroupCmd::Add { group, people } => {
+        GroupCmd::Add { group, people, confirm } => {
             show(&client.group("POST", group, "/members", people)?);
-            sync_secret_keys(ctx, &client, people, true)?;
+            sync_secret_keys(ctx, &client, group, people, true, confirm)?;
         }
         GroupCmd::Remove { group, people } => {
             show(&client.group("POST", group, "/members/remove", people)?);
@@ -303,7 +450,7 @@ pub fn group(ctx: &mut Ctx, c: &GroupCmd) -> Result<()> {
                 .cloned()
                 .collect();
             if !gone.is_empty() {
-                sync_secret_keys(ctx, &client, &gone, false)?;
+                sync_secret_keys(ctx, &client, group, &gone, false, &[])?;
             }
         }
         GroupCmd::Manager { group, people } => show(&client.group("POST", group, "/managers", people)?),

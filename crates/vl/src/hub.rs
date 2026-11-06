@@ -26,11 +26,12 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use veil_core::{
-    crypto::domains::SIG_CONTEXT_HUB_LOGIN,
+    crypto::domains::{SIG_CONTEXT_HUB_DEVICE, SIG_CONTEXT_HUB_LOGIN},
     hub::wire::{
-        put_frame, read_frames, AccessInfo, BranchUpdate, Challenge, ChallengeRequest, Devices, ErrorBody, FetchRequest, GroupChange, GroupInfo,
-        HistoryRequest, LoginRequest, PushRequest, PushResult, Session, Tips, Want,
+        device_fingerprint, put_frame, read_frames, vouch_message, AccessInfo, BranchUpdate, Challenge, ChallengeRequest, Devices, ErrorBody,
+        FetchRequest, GroupChange, GroupInfo, HistoryRequest, LoginRequest, PushRequest, PushResult, Session, Tips, VouchRequest, Want,
     },
+    identity::parse_public_identity,
     keychain::KeyRing,
     object::{EntryKind, Object},
     oplog::Tag,
@@ -142,6 +143,18 @@ fn update_entry(authority: &str, f: impl FnOnce(&mut ServerEntry)) -> Result<()>
     let mut file = load_file()?;
     f(file.servers.entry(authority.to_string()).or_default());
     save_file(&file)
+}
+
+/// The fingerprint of a full public identity (`4F2A-9C1E-…`): what
+/// people compare out of band (`docs/HUB.md` §13.11).
+pub fn fingerprint(public_identity: &str) -> Option<String> {
+    parse_public_identity(public_identity).ok().and_then(|id| device_fingerprint(&id))
+}
+
+/// The servers this device has signed in to (`host:port`), with who it
+/// signed in as.
+pub fn signed_in_servers() -> Result<Vec<(String, String)>> {
+    Ok(load_file()?.servers.into_iter().filter_map(|(a, e)| Some((a, e.person?))).collect())
 }
 
 // ---- the client -------------------------------------------------------------------------
@@ -297,6 +310,15 @@ impl Client {
         };
         let (status, out) = self.send("POST", "/v1/auth/login", Some(("application/json", serde_json::to_vec(&req)?)), false)?;
         if status != 200 {
+            if serde_json::from_slice::<ErrorBody>(&out).is_ok_and(|e| e.code == "device_pending") {
+                let fp = fingerprint(&self.identity.public_id()).unwrap_or_default();
+                bail!(
+                    "the name '{}' is taken. If it is yours, confirm this device ({fp}) on a device you already use:\n    \
+                     vl identity confirm {fp} --server veil://{}\n  then run `vl login` here again. Otherwise choose another name.",
+                    name.unwrap_or("?"),
+                    self.url.authority
+                );
+            }
             return Err(Self::error(status, &out));
         }
         let s: Session = serde_json::from_slice(&out)?;
@@ -343,9 +365,10 @@ impl Client {
         Ok(read_frames(&out)?.into_iter().map(|(id, raw)| (id, raw.to_vec())).collect())
     }
 
-    pub fn upload(&self, frames: Vec<u8>) -> Result<()> {
-        self.ok("POST", &self.url.project_path("/objects"), Some(("application/octet-stream", frames)))?;
-        Ok(())
+    /// Upload object frames; the server's receipt for each, in order.
+    pub fn upload(&self, frames: Vec<u8>) -> Result<Vec<String>> {
+        let out = self.ok("POST", &self.url.project_path("/objects"), Some(("application/octet-stream", frames)))?;
+        Ok(serde_json::from_slice::<veil_core::hub::wire::Uploaded>(&out)?.receipts)
     }
 
     /// Push; `Ok(None)` when a branch moved during the push (retry).
@@ -386,8 +409,22 @@ impl Client {
         )
     }
 
+    /// A person's devices and vouches, as the server lists them: never
+    /// enough on its own to wrap a key (`docs/HUB.md` §13.11).
     pub fn devices(&self, person: &str) -> Result<Devices> {
         self.json("GET", &format!("/v1/people/{person}/devices"), None::<&()>)
+    }
+
+    /// Vouch, with this device's key, that `device` (a full public
+    /// identity) is this person's too.
+    pub fn vouch(&self, device: &str) -> Result<Devices> {
+        let id = parse_public_identity(device)?;
+        let msg = vouch_message(&id).ok_or_else(|| anyhow!("that device has no signing key"))?;
+        let req = VouchRequest {
+            device: device.to_string(),
+            signature: self.identity.sign(SIG_CONTEXT_HUB_DEVICE, &msg),
+        };
+        self.json("POST", "/v1/devices/vouch", Some(&req))
     }
 
     pub fn rings(&self) -> Result<Vec<KeyRing>> {
@@ -577,6 +614,23 @@ pub fn restrict_to(store: &ObjectStore, tree: ObjectId, only: &str) -> Result<(O
     Ok((id, hidden))
 }
 
+/// `tree` without the entry at `only` (a directory path): what stands for
+/// everything a `--only` clone never writes. Only the trees on the way to
+/// `only` are read.
+pub fn without(store: &ObjectStore, tree: ObjectId, only: &str) -> Result<ObjectId> {
+    let (name, rest) = only.split_once('/').map_or((only, None), |(a, b)| (a, Some(b)));
+    let mut t = (*store.tree(&tree)?).clone();
+    match rest {
+        None => t.entries.retain(|e| e.name != name),
+        Some(rest) => {
+            for e in t.entries.iter_mut().filter(|e| e.name == name && e.kind == EntryKind::Dir) {
+                e.id = without(store, e.id, rest)?;
+            }
+        }
+    }
+    Ok(store.put_tree(&t)?)
+}
+
 // ---- push ---------------------------------------------------------------------------------
 
 /// Append the objects of tree `tree` at `path` that differ from `parents`
@@ -716,15 +770,27 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
             collect_tree(&store, s.tree, &parents, "", &mut seen, &mut objects)?;
         }
         let uploaded = objects.len();
-        let mut frames = Vec::new();
+        // The server's receipt for each object: the push shows them, so it
+        // names nothing it did not send (BUG-824).
+        let mut receipts = BTreeMap::new();
+        let mut send = |frames: Vec<u8>, ids: Vec<ObjectId>| -> Result<()> {
+            let r = client.upload(frames)?;
+            if r.len() != ids.len() {
+                bail!("the server sent {} upload receipts for {} objects", r.len(), ids.len());
+            }
+            receipts.extend(ids.into_iter().zip(r));
+            Ok(())
+        };
+        let (mut frames, mut ids) = (Vec::new(), Vec::new());
         for (id, raw) in objects {
             put_frame(&mut frames, &id, &raw);
+            ids.push(id);
             if frames.len() > 8 << 20 {
-                client.upload(std::mem::take(&mut frames))?;
+                send(std::mem::take(&mut frames), std::mem::take(&mut ids))?;
             }
         }
         if !frames.is_empty() {
-            client.upload(frames)?;
+            send(frames, ids)?;
         }
         // Key rings (secret scopes) first, so new members can open what lands.
         for ring in repo.keys().rings()? {
@@ -732,7 +798,7 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
                 crate::render::warn(&format!("key ring '{}' not sent: {e:#}", ring.scope));
             }
         }
-        let Some(result) = client.push(&PushRequest { updates, force })? else {
+        let Some(result) = client.push(&PushRequest { updates, force, receipts })? else {
             if attempt < 5 {
                 std::thread::sleep(Duration::from_millis(50 * attempt));
                 continue;
