@@ -21,7 +21,7 @@ pub const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\ncommit: ",
     env!("VL_GIT_COMMIT"),
-    "\nrepository format: 7",
+    "\nrepository format: 8",
     "\ntarget: ",
     env!("VL_TARGET"),
 );

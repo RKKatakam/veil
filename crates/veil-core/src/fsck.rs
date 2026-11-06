@@ -278,7 +278,7 @@ pub fn fsck(backend: Arc<dyn StorageBackend>, identity: Option<Identity>) -> Res
             (String::new(), crate::repo::REPO_FORMAT)
         }
     };
-    if let Err(e) = crate::repo::check_format_supported(format) {
+    if let Err(e) = crate::repo::check_format_upgradable(format) {
         report.findings.push(Finding {
             severity: Severity::Corrupt,
             message: e.to_string(),

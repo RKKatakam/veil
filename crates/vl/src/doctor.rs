@@ -335,9 +335,9 @@ fn check_repo(r: &mut Report, fs: &std::sync::Arc<DiskBackend>, identity: Option
             format!("repository format {} is newer than this vl supports ({REPO_FORMAT_VERSION})", config.format),
             &["upgrade vl before using this repository".into()],
         ),
-        std::cmp::Ordering::Less => r.warn(
-            format!("repository format {} is older than this vl's ({REPO_FORMAT_VERSION})", config.format),
-            &[],
+        std::cmp::Ordering::Less => r.fail(
+            format!("repository format {} is older than this vl reads ({REPO_FORMAT_VERSION})", config.format),
+            &["run `vl upgrade`".into()],
         ),
         std::cmp::Ordering::Equal => {}
     }

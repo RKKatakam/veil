@@ -61,35 +61,62 @@ pub fn state_dir(root: &Path) -> std::path::PathBuf {
 /// | 5 | vl 1.0.0 | symlink tree entries and conflict terms, annotated tags (`veil:atag`, `Tag::annotation`, `View::remote_release_tags`) |
 /// | 6 | vl 1.1.0 | the lock-free op log: `op_heads/`, `Operation::{workspace, rewritten}` |
 /// | 7 | vl 1.1.0 | key rings of ring format 4: invites, shares by members, a member's removal of their own device (`docs/HUB.md` §13.12) |
+/// | 8 | vl 1.1.0 | only secret files are encrypted: no encrypted descriptions, tag messages, tag names, embargoes, folders or lines of work; plain embargo records (embargo record format 2) |
 ///
-/// Every format up to this one is read; see `docs/FORMAT.md` and
-/// `docs/CRYPTO.md`.
-pub const REPO_FORMAT: u32 = 7;
+/// This build reads format 8 only. `vl upgrade` brings formats 6 and 7 to
+/// it, after checking that they hold nothing the removed encryption of
+/// non-secret content wrote; formats 1 to 5 are no longer supported. See
+/// `docs/FORMAT.md` and `docs/CRYPTO.md`.
+pub const REPO_FORMAT: u32 = 8;
 
-/// Oldest repository format this build reads (and keeps writing, unchanged,
-/// until `vl upgrade`).
-pub const MIN_REPO_FORMAT: u32 = 1;
+/// Oldest repository format this build opens.
+pub const MIN_REPO_FORMAT: u32 = REPO_FORMAT;
+
+/// Oldest repository format `vl upgrade` brings to [`REPO_FORMAT`].
+pub const MIN_UPGRADE_FORMAT: u32 = 6;
 
 /// The first vl release that reads repository format `format`.
 pub fn min_vl_for_format(format: u32) -> &'static str {
     match format {
         0 | 1 => "0.1.0",
         2..=5 => "1.0.0",
-        6 | 7 => "1.1.0",
+        6..=8 => "1.1.0",
         _ => "a newer release",
     }
 }
 
 /// `Ok` if this build can read and write a repository of `format`.
 pub fn check_format_supported(format: u32) -> Result<()> {
+    check_format_upgradable(format)?;
+    if format < MIN_REPO_FORMAT {
+        return Err(VeilError::Unsupported(format!(
+            "this repository uses format {format}, which may hold encrypted descriptions, tags, embargoes or folders; \
+             this vl encrypts secret files only and reads format {REPO_FORMAT}. Run `vl upgrade`: it checks the \
+             repository and moves it to format {REPO_FORMAT}"
+        )));
+    }
+    Ok(())
+}
+
+/// `Ok` if `vl upgrade` (and `vl fsck`) can read a repository of `format`:
+/// [`MIN_UPGRADE_FORMAT`] to [`REPO_FORMAT`].
+pub fn check_format_upgradable(format: u32) -> Result<()> {
     if format > REPO_FORMAT {
         return Err(VeilError::Unsupported(format!(
-            "this repository uses format {format}, which needs a newer vl (this is vl {}, which reads formats {MIN_REPO_FORMAT} to {REPO_FORMAT})",
+            "this repository uses format {format}, which needs a newer vl (this is vl {}, which reads format {REPO_FORMAT})",
             env!("CARGO_PKG_VERSION")
         )));
     }
-    if format < MIN_REPO_FORMAT {
-        return Err(VeilError::Corrupt("repo.json".into(), format!("invalid repository format {format}")));
+    if format == 0 {
+        return Err(VeilError::Corrupt("repo.json".into(), "invalid repository format 0".into()));
+    }
+    if format < MIN_UPGRADE_FORMAT {
+        return Err(VeilError::Unsupported(format!(
+            "this repository uses format {format}, which this vl no longer reads (formats 1 to {} were dropped). \
+             Nothing was changed. Upgrade it to format 7 with vl {} first (`vl upgrade` there), then run `vl upgrade` here",
+            MIN_UPGRADE_FORMAT - 1,
+            min_vl_for_format(7)
+        )));
     }
     Ok(())
 }
@@ -132,7 +159,7 @@ impl RepoConfig {
     /// it needs when the configuration says so.
     pub fn check_supported(&self) -> Result<()> {
         check_format_supported(self.format).map_err(|e| match (&e, &self.min_vl) {
-            (VeilError::Unsupported(_), Some(v)) => VeilError::Unsupported(format!(
+            (VeilError::Unsupported(_), Some(v)) if self.format > REPO_FORMAT => VeilError::Unsupported(format!(
                 "this repository uses format {} and needs vl {v} or later (this is vl {})",
                 self.format,
                 env!("CARGO_PKG_VERSION")

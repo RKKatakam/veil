@@ -2380,6 +2380,10 @@ fn cmd_upgrade(repo_arg: Option<&Path>, dry_run: bool, force: bool) -> Result<Ex
     for n in &r.notes {
         println!("  {} {n}", dim("note:"));
     }
+    if dry_run && !r.removed.is_empty() {
+        println!("{}", yellow("The upgrade would be refused: it would have to rewrite the whole history (see the note above)."));
+        return Ok(ExitCode::FAILURE);
+    }
     if dry_run && !r.corrupt.is_empty() && !force {
         println!("{}", yellow("The upgrade would be refused until `vl fsck` is clean (or --force)."));
         return Ok(ExitCode::FAILURE);
