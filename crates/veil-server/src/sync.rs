@@ -380,8 +380,9 @@ pub async fn history(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &
 ///
 /// Memory is bounded (BUG-860): every want is checked first, a snapshot at
 /// a time (its projected trees dropped before the next), then the answer
-/// is read and sent a window at a time ([`FETCH_WINDOW`]); a failure while
-/// sending ends the stream with an error, so it is never taken as whole.
+/// is read and sent a few objects ahead of the caller ([`FETCH_WINDOW`]);
+/// a failure while sending ends the stream with an error, so it is never
+/// taken as whole.
 pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot: ObjectId, wants: Vec<Want>) -> Result<FrameStream> {
     // Each want is checked in its own snapshot (revision 1), as the viewer
     // sees it.
@@ -411,37 +412,64 @@ pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot:
         check_wants(src, &view, snapshot, &reals, &w2)
     })
     .await?;
-    // The answer, a window at a time: read concurrently (a remote store's
-    // latency would otherwise add up one object at a time), framed in
-    // order, sent about a MiB at a time as the caller takes it.
+    // The answer: objects read concurrently (a remote store's latency would
+    // otherwise add up one object at a time), at most [`FETCH_WINDOW`] of
+    // them and about [`FETCH_WINDOW_BYTES`] (by the sizes tree entries
+    // carry) ahead of the one sent next, framed in order and sent about a
+    // MiB at a time as the caller takes it.
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     let (hub, pid) = (hub.clone(), project.id);
     tokio::spawn(async move {
+        let stop = |e: Error| {
+            // Details go to the server's log; the caller's answer ends in an
+            // error, never taken as whole.
+            eprintln!("veil-server: a fetch answer stopped: {e:?}");
+            std::io::Error::other("the answer stopped")
+        };
+        let mut set = tokio::task::JoinSet::new();
+        let mut ready: HashMap<usize, Bytes> = HashMap::new();
+        let (mut next, mut sent, mut ahead) = (0usize, 0usize, 0u64);
         let mut out = Vec::new();
-        let mut start = 0;
-        while start < wants.len() {
-            let (mut end, mut bytes) = (start, 0u64);
-            while end < wants.len() && end - start < FETCH_WINDOW && (end == start || bytes + sizes[end] <= FETCH_WINDOW_BYTES) {
-                bytes += sizes[end];
-                end += 1;
-            }
-            let window = match read_window(&hub, pid, &wants[start..end], &created).await {
-                Ok(w) => w,
-                Err(e) => {
-                    // Details go to the server's log; the caller's answer
-                    // ends in an error, never taken as whole.
-                    eprintln!("veil-server: a fetch answer stopped: {e:?}");
-                    let _ = tx.send(Err(std::io::Error::other("the answer stopped"))).await;
-                    return;
+        while sent < wants.len() {
+            while next < wants.len() && next - sent < FETCH_WINDOW && (next == sent || ahead + sizes[next] <= FETCH_WINDOW_BYTES) {
+                let id = wants[next].id;
+                match created.get(&id).cloned().or_else(|| builtin(&id)) {
+                    Some(raw) => {
+                        ready.insert(next, raw);
+                    }
+                    None => {
+                        let (hub, i) = (hub.clone(), next);
+                        set.spawn(async move { (i, hub.objects.get(pid, &id).await) });
+                    }
                 }
-            };
-            for (w, raw) in wants[start..end].iter().zip(window) {
-                put_frame(&mut out, &w.id, &raw);
-                if out.len() >= 1 << 20 && tx.send(Ok(Bytes::from(std::mem::take(&mut out)))).await.is_err() {
-                    return;
+                ahead += sizes[next];
+                next += 1;
+            }
+            while !ready.contains_key(&sent) {
+                let got = match set.join_next().await {
+                    Some(Ok((i, Ok(Some(raw))))) => Ok((i, raw)),
+                    Some(Ok((i, Ok(None)))) => Err(Error::Other(anyhow::anyhow!("object {} is not stored", wants[i].id.short()))),
+                    Some(Ok((_, Err(e)))) => Err(Error::Other(e)),
+                    Some(Err(e)) => Err(Error::Other(e.into())),
+                    None => Err(Error::Other(anyhow::anyhow!("a fetch read went missing"))),
+                };
+                match got {
+                    Ok((i, raw)) => {
+                        ready.insert(i, raw);
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(stop(e))).await;
+                        return;
+                    }
                 }
             }
-            start = end;
+            let raw = ready.remove(&sent).expect("ready");
+            put_frame(&mut out, &wants[sent].id, &raw);
+            ahead -= sizes[sent];
+            sent += 1;
+            if out.len() >= 1 << 20 && tx.send(Ok(Bytes::from(std::mem::take(&mut out)))).await.is_err() {
+                return;
+            }
         }
         if !out.is_empty() {
             let _ = tx.send(Ok(Bytes::from(out))).await;
@@ -451,7 +479,7 @@ pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot:
 }
 
 /// Most objects, and about the most bytes (by the sizes tree entries
-/// carry), [`fetch`] reads at once.
+/// carry), [`fetch`] reads ahead of what it has sent.
 const FETCH_WINDOW: usize = 64;
 const FETCH_WINDOW_BYTES: u64 = 8 << 20;
 
@@ -518,26 +546,6 @@ fn check_wants(
         }
     }
     Ok((sizes, created))
-}
-
-/// The objects of `wants`, in order, read concurrently.
-async fn read_window(hub: &Arc<Hub>, project: i64, wants: &[Want], created: &HashMap<ObjectId, Bytes>) -> Result<Vec<Bytes>> {
-    let mut out: Vec<Option<Bytes>> = vec![None; wants.len()];
-    let mut set = tokio::task::JoinSet::new();
-    for (i, w) in wants.iter().enumerate() {
-        match created.get(&w.id).cloned().or_else(|| builtin(&w.id)) {
-            Some(raw) => out[i] = Some(raw),
-            None => {
-                let (hub, id) = (hub.clone(), w.id);
-                set.spawn(async move { (i, hub.objects.get(project, &id).await) });
-            }
-        }
-    }
-    while let Some(r) = set.join_next().await {
-        let (i, r) = r.map_err(|e| Error::Other(e.into()))?;
-        out[i] = Some(r?.ok_or_else(|| Error::Other(anyhow::anyhow!("object {} is not stored", wants[i].id.short())))?);
-    }
-    Ok(out.into_iter().map(|o| o.expect("every want read")).collect())
 }
 
 /// Projected directory trees of one snapshot, by path.
@@ -1143,10 +1151,14 @@ fn receipted(hub: &Hub, project: i64, person: i64, receipts: &std::collections::
 /// (stored whether or not the project held it already, so the answer is
 /// the same either way).
 pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes) -> Result<Vec<String>> {
+    // Each object copied out of the request: a slice would keep the whole
+    // body alive in the object cache for as long as any one of its objects
+    // stays there (BUG-860).
     let frames: Vec<(ObjectId, Bytes)> = veil_core::hub::wire::read_frames(&body)?
         .into_iter()
-        .map(|(id, raw)| (id, body.slice_ref(raw)))
+        .map(|(id, raw)| (id, Bytes::copy_from_slice(raw)))
         .collect();
+    drop(body);
     for (_, raw) in &frames {
         if Object::min_repo_format(raw) > veil_core::repo::REPO_FORMAT {
             return Err(Error::bad_request("an object of a newer format than this server serves"));

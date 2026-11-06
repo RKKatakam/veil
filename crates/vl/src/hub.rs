@@ -233,9 +233,10 @@ pub struct Client {
     known: bool,
 }
 
-/// Most objects, and about the most bytes, per fetch request when
-/// [`Client::fetch_each`] splits them, and how many requests it sends at
-/// once.
+/// Fewest and most objects, and about the most bytes, per fetch request
+/// when [`Client::fetch_each`] splits them, and how many requests it sends
+/// at once.
+const FETCH_PART_MIN: usize = 1_000;
 const FETCH_PART: usize = 2_500;
 const FETCH_BYTES: u64 = 8 << 20;
 const FETCH_REQUESTS: usize = 8;
@@ -437,18 +438,25 @@ impl Client {
         )
     }
 
-    /// [`Client::fetch`] of many objects, each handed to `f` with its want
+    /// A fetch of many objects, each handed to `f` with its want
     /// as its part arrives (BUG-859): `wants` split into parts of about
     /// [`FETCH_BYTES`] by the sizes tree entries carry (`sizes`, one per
-    /// want; 0 where unknown) and at most [`FETCH_PART`] objects, up to
+    /// want; 0 where unknown) and at most [`FETCH_PART`] objects (at least
+    /// [`FETCH_REQUESTS`] parts of a large level), up to
     /// [`FETCH_REQUESTS`] of them in flight (the server reads and frames
     /// them on several threads). Each part's objects are checked against
     /// its wants, in order.
     pub fn fetch_each(&self, snapshot: ObjectId, wants: &[Want], sizes: &[u64], mut f: impl FnMut(&Want, &[u8]) -> Result<()>) -> Result<()> {
+        // Fewer than 2,000 objects in one request; more in at least
+        // FETCH_REQUESTS parts (the server serves each on its own threads).
+        let most = match wants.len() < 2 * FETCH_PART_MIN {
+            true => wants.len(),
+            false => wants.len().div_ceil(FETCH_REQUESTS).clamp(FETCH_PART_MIN, FETCH_PART),
+        };
         let mut parts: Vec<std::ops::Range<usize>> = Vec::new();
         let (mut start, mut bytes) = (0, 0u64);
         for (i, size) in sizes.iter().enumerate().take(wants.len()) {
-            if i > start && (i - start >= FETCH_PART || bytes + size > FETCH_BYTES) {
+            if i > start && (i - start >= most || bytes + size > FETCH_BYTES) {
                 parts.push(start..i);
                 (start, bytes) = (i, 0);
             }
