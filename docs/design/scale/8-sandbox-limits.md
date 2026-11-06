@@ -1,6 +1,6 @@
 # 8. Resource limits for `vl ws exec`
 
-Status: design and threat review, **not built** (Scion 4.7). A client-side item, independent of the server. ("Scope" here means a systemd scope.) **No repository format change.** Limits are device-local configuration and command-line flags.
+Status: **built on Linux** with confinement (2026-11-06; `9-confinement.md` says what was built and what was left: the delegated-cgroup mechanism, `--pids-mode`, `--memory-mode`, macOS). The limits need confinement, so they conflict with `--unconfined`, and a confined command's background processes stop with it (Scion 4.7). A client-side item, independent of the server. ("Scope" here means a systemd scope.) **No repository format change.** Limits are device-local configuration and command-line flags.
 
 **What this is:** a guard against runaway agents and builds (memory leaks, fork loops, hung test suites) on a shared developer machine. **What it is not:** a security boundary. The command runs as the same user, and a deliberately hostile one can leave any user-level limit (threat 1). That stays documented in the guide.
 

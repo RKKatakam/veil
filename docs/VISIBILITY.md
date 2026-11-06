@@ -62,7 +62,7 @@ The secret scanner also stops anything that looks like a password or token from 
 - **Agents on your computer** (`vl ws exec`) see what you see, including secrets you have access to. If an agent writes a secret into some other file, Veil refuses to commit it and removes it after the run.
 - **A cloud machine or CI server** is added like a person. Give it the groups it needs; every agent on it shares that access. Veil creates the machine's identity automatically.
 - **Over SSH** (planned): borrow your laptop's access for a session, like `ssh -A`, without storing secrets on the remote machine.
-- **Isolation (required, being built):** each agent's `vl ws exec` runs in an isolated view of the machine. It sees the project at its real path and the computer's tools read-only; your `~/.ssh`, personal keys and other projects are hidden; CPU, memory and time are limited. See `docs/OVERVIEW.md`.
+- **Isolation (built on Linux; macOS to come):** each agent's `vl ws exec` runs in an isolated view of the machine. It sees the project at its real path and the computer's tools read-only; your `~/.ssh`, personal keys and other projects are hidden; CPU, memory and time are limited. See `docs/OVERVIEW.md`.
 - **The limit:** an agent that's given a secret can use it while it runs. Give risky agents test keys.
 
 ## Hidden changes (embargoes)

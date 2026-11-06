@@ -89,6 +89,7 @@ pub fn run(repo_arg: Option<&Path>, remotes: bool) -> Result<ExitCode> {
     check_veil_home(&mut r);
     let identity = check_identity(&mut r);
     check_sandboxes(&mut r);
+    check_confinement(&mut r);
 
     let start = match repo_arg {
         Some(p) => p.to_path_buf(),
@@ -265,6 +266,16 @@ fn private_file_problem(path: &Path) -> Option<String> {
     #[cfg(not(unix))]
     let _ = path;
     None
+}
+
+/// Whether `vl ws exec` can confine its command here, and how limits apply.
+fn check_confinement(r: &mut Report) {
+    for (works, line, detail) in crate::confine::doctor() {
+        match works {
+            true => r.item(Level::Ok, &line, &detail),
+            false => r.warn(line, &detail),
+        }
+    }
 }
 
 fn check_sandboxes(r: &mut Report) {

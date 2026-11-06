@@ -57,11 +57,12 @@ jobs:
       # Tests spawn `sh`, `sleep` and `true` (always present) and, for SFTP
       # remotes, `ssh` and `sftp-server`. macOS ships OpenSSH, including
       # /usr/libexec/sftp-server; Ubuntu runners have the client only.
-      - name: Install OpenSSH (Linux)
+      # `vl ws exec` is confined by bubblewrap on Linux.
+      - name: Install OpenSSH and bubblewrap (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends openssh-client openssh-server openssh-sftp-server
+          sudo apt-get install -y --no-install-recommends openssh-client openssh-server openssh-sftp-server bubblewrap
       - name: Show test tools
         run: |
           command -v sh sleep true ssh

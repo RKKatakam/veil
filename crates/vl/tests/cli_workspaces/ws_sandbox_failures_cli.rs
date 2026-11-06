@@ -75,7 +75,7 @@ enum Failure {
     Term,
     /// SIGHUP to `vl` (a closed terminal).
     Hup,
-    /// `kill -9` of `vl`; the command finishes on its own.
+    /// `kill -9` of `vl` (the confinement stops the command with it).
     Kill,
     /// `kill -9`, then the machine "restarts" before the next run.
     KillThenReboot,
@@ -110,16 +110,17 @@ fn run_case(c: &Case) {
     if c.injected {
         args.push("--with-isolated".into());
     }
-    let started = env.root.join("started");
+    // In the sandbox: the confined command sees nothing else. The test
+    // removes it as soon as it sees it.
+    let started = sandbox(&proj).join("files/.started");
     let extra = match c.failure {
         Failure::UnreadablePolicy => "chmod 000 .veilpolicy;",
         Failure::DeletedPolicy => "rm .veilpolicy;",
         _ => "",
     };
     let script = format!(
-        "printf '%s' '{content}' > {out_path}; {extra} {copy} touch {started}; sleep 2",
+        "printf '%s' '{content}' > {out_path}; {extra} {copy} touch .started; sleep 2",
         copy = if c.injected { "cp .netrc src/leak.txt; mkdir -p target; cp .netrc target/app.env;" } else { "" },
-        started = started.display()
     );
     args.extend(["--".into(), "sh".into(), "-c".into(), script]);
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -131,6 +132,7 @@ fn run_case(c: &Case) {
         Failure::Term | Failure::Hup | Failure::Kill | Failure::KillThenReboot => {
             let mut child = env.spawn("alice", &proj, &argv);
             assert!(wait_for(Duration::from_secs(30), || started.exists()), "{tag}: never started");
+            let _ = std::fs::remove_file(&started);
             let sig = match c.failure {
                 Failure::Term => libc::SIGTERM,
                 Failure::Hup => libc::SIGHUP,
@@ -159,6 +161,7 @@ fn run_case(c: &Case) {
         Failure::BusyLock => {
             let mut child = env.spawn("alice", &proj, &argv);
             assert!(wait_for(Duration::from_secs(30), || started.exists()), "{tag}: never started");
+            let _ = std::fs::remove_file(&started);
             let backend: Arc<dyn veil_core::StorageBackend> = Arc::new(DiskBackend::new(&proj));
             let lock = RepoLock::acquire(backend).expect("lock");
             let o = child.wait().unwrap();
