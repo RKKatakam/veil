@@ -45,9 +45,6 @@ pub struct WorkspaceState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tag {
     pub target: ObjectId,
-    /// Cloaked tags are never pushed to public remotes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cloak: Option<String>,
     /// The annotated tag object (`veil:atag`, repository format 5) that
     /// makes this a release tag. Its `name` and `target` must equal this
     /// entry's (`Atag::verify`). Absent on every other tag, and on every
@@ -58,12 +55,8 @@ pub struct Tag {
 
 impl Tag {
     /// A tag without annotation.
-    pub fn new(target: ObjectId, cloak: Option<String>) -> Tag {
-        Tag {
-            target,
-            cloak,
-            annotation: None,
-        }
+    pub fn new(target: ObjectId) -> Tag {
+        Tag { target, annotation: None }
     }
 }
 
@@ -728,25 +721,16 @@ fn merge_views_with(base: &View, sides: &[&View], first_wins: bool, descends: &m
             lost.push(first);
         }
         lost.retain(|t| *t != winner.0);
-        let cloak = pick_cloak(b.map(|t| t.cloak.clone()), vals.iter().map(|v| v.map(|t| t.cloak.clone())).collect(), first_wins).unwrap_or_default();
         if !lost.is_empty() {
-            let shown = match &cloak {
-                Some(_) => "a cloaked tag".to_string(),
-                None => format!("tag '{name}'"),
-            };
             out.warnings.push(format!(
-                "{shown} was moved by concurrent commands; kept {}, and the other target stays a visible change",
+                "tag '{name}' was moved by concurrent commands; kept {}, and the other target stays a visible change",
                 winner.0.short()
             ));
             losers.extend(lost);
         }
         out.view.tags.insert(
             name.clone(),
-            Tag {
-                target: winner.0,
-                cloak,
-                annotation: winner.1,
-            },
+            Tag { target: winner.0, annotation: winner.1 },
         );
     }
     // Remote tags.

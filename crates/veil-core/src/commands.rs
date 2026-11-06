@@ -27,8 +27,6 @@ use crate::{
 /// How [`Repo::set_tag_with`] sets a tag (`vl tag set`).
 #[derive(Debug, Clone, Default)]
 pub struct TagSpec {
-    /// Cloak the tag under this scope (kept from the existing tag if unset).
-    pub cloak: Option<String>,
     /// Allow moving a plain tag to a snapshot that is not a descendant.
     pub allow_backwards: bool,
     /// Make an annotated release tag with this message (`-a`, `-m`).
@@ -166,10 +164,7 @@ fn tag_kept(tag: &Tag, line_cloak: Option<&str>, advance: bool) -> Option<TagKep
     if !advance {
         return Some(TagKept::NoAdvance);
     }
-    match line_cloak {
-        Some(scope) if tag.cloak.as_deref() != Some(scope) => Some(TagKept::CloakedLine(scope.to_string())),
-        _ => None,
-    }
+    line_cloak.map(|scope| TagKept::CloakedLine(scope.to_string()))
 }
 
 /// `tree` with its root entry `name` replaced by `entry` (or removed).
@@ -926,12 +921,11 @@ impl Repo {
     }
 
     /// Create or move a plain (branch-like) tag. See [`Repo::set_tag_with`].
-    pub fn set_tag(&mut self, name: &str, target: ObjectId, cloak: Option<String>, allow_backwards: bool) -> Result<()> {
+    pub fn set_tag(&mut self, name: &str, target: ObjectId, allow_backwards: bool) -> Result<()> {
         self.set_tag_with(
             name,
             target,
             &TagSpec {
-                cloak,
                 allow_backwards,
                 ..TagSpec::default()
             },
@@ -950,20 +944,9 @@ impl Repo {
     /// tag -f`). The annotation is never dropped silently: forcing without
     /// a message keeps the old one, and turning a release tag back into a
     /// plain tag takes `vl tag delete` first. Commits and merges never
-    /// advance a release tag. A cloaked tag's message is sealed under its
-    /// scope.
+    /// advance a release tag.
     pub fn set_tag_with(&mut self, name: &str, target: ObjectId, spec: &TagSpec) -> Result<SetTagOutcome> {
         validate_tag_name(name)?;
-        let cloak = spec.cloak.clone();
-        // A cloaked tag names a scope you can use, as `vl ws new --cloak`
-        // and `vl cloak --scope` require: a typo or a reserved name would
-        // leave a tag no cloaked line ever advances (BUG-210).
-        if let Some(scope) = &cloak {
-            crate::keychain::validate_scope_name(scope)?;
-            if !self.keys().is_member(scope) {
-                return Err(VeilError::Policy(format!("you hold no key for scope '{scope}'")));
-            }
-        }
         // A tag on anything but a snapshot (a blob, a tree) would break
         // every graph query that walks the view.
         match self.snapshot(&target) {
@@ -985,9 +968,7 @@ impl Repo {
         if let Some(t) = &existing {
             match t.annotation {
                 Some(a) => {
-                    let unchanged = t.target == target
-                        && spec.annotate.is_none()
-                        && spec.cloak.as_ref().is_none_or(|c| t.cloak.as_ref() == Some(c));
+                    let unchanged = t.target == target && spec.annotate.is_none();
                     if unchanged && !spec.force {
                         return Ok(SetTagOutcome {
                             annotation: Some(a),
@@ -1015,7 +996,6 @@ impl Repo {
                 )));
             }
         }
-        let cloak = cloak.or_else(|| existing.as_ref().and_then(|t| t.cloak.clone()));
         // The annotation: a new message, or (forcing a release tag without
         // one) the old message, never dropped.
         let message = match (&spec.annotate, old_annotation) {
@@ -1041,11 +1021,7 @@ impl Repo {
         tx.repository_wide();
         tx.view.tags.insert(
             name.to_string(),
-            Tag {
-                target,
-                cloak,
-                annotation,
-            },
+            Tag { target, annotation },
         );
         tx.commit()?;
         Ok(SetTagOutcome {

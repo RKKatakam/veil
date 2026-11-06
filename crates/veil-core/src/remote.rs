@@ -901,8 +901,7 @@ pub fn push(
             tx.view.heads.remove(p);
         }
         tx.view.heads.insert(tag.target);
-        let cloak = if public { None } else { tag.cloak };
-        tx.view.tags.insert(name.clone(), Tag { target: tag.target, cloak, annotation });
+        tx.view.tags.insert(name.clone(), Tag { target: tag.target, annotation });
         report.tags_updated.push((name, tag.target));
     }
     tx.commit()?;
@@ -910,9 +909,8 @@ pub fn push(
 }
 
 /// The tags a push of `only_tags` (all if empty) may send, before the
-/// remote is consulted, and the embargo-withheld history. Cloaked tags
-/// (on a public remote) and tags that would publish withheld history are
-/// recorded in `report.tags_skipped` with the reason.
+/// remote is consulted, and the embargo-withheld history. Tags that would
+/// publish withheld history are recorded in `report.tags_skipped` with the reason.
 #[allow(clippy::type_complexity)]
 fn sendable_tags(
     local: &Repo,
@@ -923,12 +921,6 @@ fn sendable_tags(
     let mut selected: Vec<(String, Tag)> = Vec::new();
     for (name, tag) in &local.view().tags {
         if !only_tags.is_empty() && !only_tags.contains(name) {
-            continue;
-        }
-        if public && tag.cloak.is_some() {
-            report
-                .tags_skipped
-                .push((name.clone(), "cloaked tag is never pushed to a public remote".into()));
             continue;
         }
         if let Some(why) = annotation_problem(local.store(), name, tag)? {
@@ -1364,11 +1356,7 @@ pub fn apply_remote_tags(
                 if tx.repo().is_ancestor(&existing.target, &tag.target)? {
                     tx.view.tags.insert(
                         name.clone(),
-                        Tag {
-                            target: tag.target,
-                            cloak: existing.cloak,
-                            annotation: tag.annotation,
-                        },
+                        Tag { target: tag.target, annotation: tag.annotation },
                     );
                     report.tags_updated.push((name, tag.target));
                 } else if !tx.repo().is_ancestor(&tag.target, &existing.target)? {

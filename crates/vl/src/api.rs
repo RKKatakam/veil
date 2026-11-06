@@ -824,7 +824,6 @@ pub struct LogEntry {
 #[derive(Serialize, Debug)]
 pub struct TagLabel {
     pub name: String,
-    pub cloak: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -906,7 +905,7 @@ pub fn log_entries_with<'a>(repo: &'a Repo, ws: &str, q: LogQuery) -> Result<Log
     }
     let mut tags: HashMap<ObjectId, Vec<TagLabel>> = HashMap::new();
     for (name, t) in &repo.view().tags {
-        tags.entry(t.target).or_default().push(TagLabel { name: name.clone(), cloak: t.cloak.clone() });
+        tags.entry(t.target).or_default().push(TagLabel { name: name.clone() });
     }
     let mut remote_tags: HashMap<ObjectId, Vec<String>> = HashMap::new();
     for (name, t) in &repo.view().remote_tags {
@@ -1472,8 +1471,6 @@ pub struct TagList {
 #[derive(Serialize, Debug)]
 pub struct TagItem {
     pub name: String,
-    /// Cloaked tags are never pushed to public remotes.
-    pub cloak: Option<String>,
     pub target: SnapshotRef,
     /// `release` (annotated: immutable) or `branch`.
     pub kind: &'static str,
@@ -1537,7 +1534,6 @@ pub fn tag_list(repo: &Repo) -> TagList {
             .iter()
             .map(|(name, t)| TagItem {
                 name: name.clone(),
-                cloak: t.cloak.clone(),
                 target: snapshot_ref(repo, &t.target),
                 kind: if t.annotation.is_some() { "release" } else { "branch" },
                 annotation: t.annotation.and_then(|a| annotation_item(repo, name, &t.target, &a)),

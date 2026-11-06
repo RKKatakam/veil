@@ -750,11 +750,7 @@ pub fn pull(repo: &mut Repo, remote: &str, client: &Client, only: Option<&str>) 
         .map(|(n, id)| {
             (
                 n.clone(),
-                Tag {
-                    target: *id,
-                    cloak: None,
-                    annotation: None,
-                },
+                Tag { target: *id, annotation: None },
             )
         })
         .collect();

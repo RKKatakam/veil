@@ -163,7 +163,7 @@ impl Repo {
                 continue;
             }
             match line.as_deref() {
-                Some(scope) if tag.cloak.as_deref() != Some(scope) => {
+                Some(scope) => {
                     kept.push((name.clone(), crate::commands::TagKept::CloakedLine(scope.to_string())));
                 }
                 _ => {

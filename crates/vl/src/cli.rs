@@ -805,9 +805,6 @@ pub enum TagCmd {
         /// Snapshot the tag points at.
         #[arg(short, long, default_value = "@")]
         rev: String,
-        /// Cloak the tag (default scope: team): never pushed to public remotes.
-        #[arg(long, value_name = "SCOPE", num_args = 0..=1, default_missing_value = "team")]
-        cloak: Option<String>,
         /// Allow moving the tag to a snapshot that is not a descendant.
         #[arg(long)]
         allow_backwards: bool,
@@ -815,8 +812,7 @@ pub enum TagCmd {
         /// an identity.
         #[arg(short, long)]
         annotate: bool,
-        /// The annotated tag's message (implies `-a`; sealed for a cloaked
-        /// tag).
+        /// The annotated tag's message (implies `-a`).
         #[arg(short, long)]
         message: Option<String>,
         /// Replace an existing annotated tag (or annotate a plain one). A

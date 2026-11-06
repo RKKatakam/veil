@@ -287,10 +287,7 @@ fn log_entry(e: &LogEntry, lanes: &mut Vec<Option<ObjectId>>) {
     let tags: Vec<String> = e
         .tags
         .iter()
-        .map(|t| match &t.cloak {
-            Some(s) => format!("{}[cloaked:{}]", safe(&t.name), safe(s)),
-            None => safe(&t.name).into_owned(),
-        })
+        .map(|t| safe(&t.name).into_owned())
         .chain(e.remote_tags.iter().map(|t| safe(t).into_owned()))
         .collect();
     if !tags.is_empty() {
@@ -572,8 +569,7 @@ pub fn tag_list(t: &TagList) {
         Some(_) => yellow(" [release]"),
     };
     for tag in &t.tags {
-        let cloak = tag.cloak.as_ref().map(|c| magenta(&format!(" [cloaked:{}]", safe(c)))).unwrap_or_default();
-        println!("{}{}{cloak}: {}", cyan(&safe(&tag.name)), release(&tag.annotation), one_line(&tag.target));
+        println!("{}{}: {}", cyan(&safe(&tag.name)), release(&tag.annotation), one_line(&tag.target));
     }
     for tag in &t.remote_tags {
         println!("{}: {}", dim(&safe(&tag.name)), one_line(&tag.target));

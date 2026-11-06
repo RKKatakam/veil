@@ -1341,7 +1341,6 @@ fn cmd_tag(ctx: &mut Ctx, c: &TagCmd) -> Result<()> {
         TagCmd::Set {
             name,
             rev,
-            cloak,
             allow_backwards,
             annotate,
             message,
@@ -1349,7 +1348,6 @@ fn cmd_tag(ctx: &mut Ctx, c: &TagCmd) -> Result<()> {
         } => {
             let id = ctx.rev(rev)?;
             let spec = veil_core::commands::TagSpec {
-                cloak: cloak.clone(),
                 allow_backwards: *allow_backwards,
                 annotate: (*annotate || message.is_some()).then(|| message.clone().unwrap_or_default()),
                 force: *force,
