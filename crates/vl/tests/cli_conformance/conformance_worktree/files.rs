@@ -72,7 +72,7 @@ fn files_lists_only_what_is_recorded() {
     let env = Env::new();
     let r = env.repo("p");
     r.write("ok.txt", "ok\n");
-    r.write(".env", DOTENV);
+    r.write(".netrc", DOTENV);
     r.write("leak.js", LEAKY);
     r.write("target/x.o", "o\n");
     assert_eq!(r.paths("@"), vec!["ok.txt"]);

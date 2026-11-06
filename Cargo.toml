@@ -1,8 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/veil-core", "crates/vl", "crates/veil-bench"]
-# The scale benchmark (crates/veil-bench) builds only when asked for
-# (`-p veil-bench` or `--workspace`): `cargo test --all-targets` skips it.
+members = ["crates/veil-core", "crates/vl", "crates/veil-bench", "crates/veil-server"]
+# The scale benchmark (crates/veil-bench) and the server (crates/veil-server)
+# build only when asked for (`-p …` or `--workspace`): `cargo test
+# --all-targets` skips them.
 default-members = ["crates/veil-core", "crates/vl"]
 
 [workspace.package]

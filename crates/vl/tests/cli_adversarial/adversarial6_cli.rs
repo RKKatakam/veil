@@ -69,13 +69,13 @@ fn undo_after_a_workspace_switch_does_not_discard_the_previous_workspaces_edits(
 
 // ---- policy pin ----------------------------------------------------------------
 
-/// Alice's project with an isolated `.env`, pushed to `hub`; Mallory's
-/// clone pushes a `.veilpolicy` that says `.env public!`.
+/// Alice's project with an isolated `.netrc`, pushed to `hub`; Mallory's
+/// clone pushes a `.veilpolicy` that says `.netrc public!`.
 fn hostile_policy_on_main(env: &Env) -> std::path::PathBuf {
     let hub = env.dir("hub");
     let proj = env.dir("proj");
     env.ok(U, &proj, &["init"]);
-    write(&proj, ".env", "DB_PASSWORD=hunter2hunter2\n");
+    write(&proj, ".netrc", "DB_PASSWORD=hunter2hunter2\n");
     write(&proj, "a.txt", "a\n");
     env.ok(U, &proj, &["commit", "-m", "initial"]);
     env.ok(U, &proj, &["tag", "set", "main", "-r", "@-"]);
@@ -83,7 +83,7 @@ fn hostile_policy_on_main(env: &Env) -> std::path::PathBuf {
     env.ok(U, &proj, &["push"]);
     let m = env.root.join("m");
     env.ok("mallory", &env.root, &["clone", hub.to_str().unwrap(), "m"]);
-    let policy = read(&m, ".veilpolicy") + ".env public!\n";
+    let policy = read(&m, ".veilpolicy") + ".netrc public!\n";
     write(&m, ".veilpolicy", &policy);
     write(&m, "b.txt", "b\n");
     env.ok("mallory", &m, &["commit", "-m", "add b"]);
@@ -92,7 +92,7 @@ fn hostile_policy_on_main(env: &Env) -> std::path::PathBuf {
 }
 
 /// Control: the documented routes are guarded. After `vl pull` and
-/// `vl rebase -d main`, `.env` keeps its protection until `vl policy accept`.
+/// `vl rebase -d main`, `.netrc` keeps its protection until `vl policy accept`.
 #[test]
 fn a_pulled_policy_is_held_back_after_a_rebase() {
     let env = Env::new();
@@ -101,7 +101,7 @@ fn a_pulled_policy_is_held_back_after_a_rebase() {
     let out = env.ok(U, &proj, &["rebase", "-d", "main"]);
     assert!(out.contains("policy accept"), "{out}");
     let files = env.stdout(U, &proj, &["files"]);
-    assert!(!files.contains(".env"), "{files}");
+    assert!(!files.contains(".netrc"), "{files}");
 }
 
 /// `vl restore --from REV` writes REV's files into the working copy,
@@ -110,8 +110,8 @@ fn a_pulled_policy_is_held_back_after_a_rebase() {
 /// tree the directory was checked out from (`snapshot_policy(fs,
 /// Some(&wc.tree))`), so a policy that arrived by `vl restore --from` counts
 /// as **the member's own edit** and is folded into the accepted policy at
-/// once (`policy::fold_edit`): the teammate's `.env public!` applies
-/// without `vl policy accept`, `.env` is recorded in plaintext, and the
+/// once (`policy::fold_edit`): the teammate's `.netrc public!` applies
+/// without `vl policy accept`, `.netrc` is recorded in plaintext, and the
 /// next commit and push publish it. The guide lists merge, pull, checkout,
 /// rebase, Git import and undo as the guarded routes; `restore --from` is
 /// a seventh route, and "put files back as they are in REV" does not read
@@ -125,8 +125,8 @@ fn restore_from_a_revision_does_not_accept_its_policy() {
     let status = env.ok(U, &proj, &["status"]);
     let files = env.stdout(U, &proj, &["files"]);
     assert!(
-        !files.contains(".env") && !status.contains("A .env"),
-        "the restored policy published .env without `vl policy accept`:\n{status}\n{files}"
+        !files.contains(".netrc") && !status.contains("A .netrc"),
+        "the restored policy published .netrc without `vl policy accept`:\n{status}\n{files}"
     );
     // And it never reaches the team remote (packs are zstd: read it back
     // through the engine, as any reader of the remote would).
@@ -134,13 +134,13 @@ fn restore_from_a_revision_does_not_accept_its_policy() {
     env.ok(U, &proj, &["tag", "set", "after", "-r", "@-"]);
     env.ok(U, &proj, &["push"]);
     let hub = env.root.join("hub");
-    assert!(remote_reads(&hub, "after", ".env").is_none(), ".env reached the team remote in plaintext");
+    assert!(remote_reads(&hub, "after", ".netrc").is_none(), ".netrc reached the team remote in plaintext");
 }
 
 // ---- messages that lead users into mistakes --------------------------------------
 
 /// `vl ws write NAME PATH` prints `Recorded PATH in …` whatever the builder
-/// did with it (`cmd_ws`, `main.rs`): a path the policy isolates (`.env`,
+/// did with it (`cmd_ws`, `main.rs`): a path the policy isolates (`.netrc`,
 /// `*.pem`, a user rule) is silently dropped, the overlay is discarded, and
 /// the message says it was recorded. The user (or the agent driving `vl`)
 /// believes the file is in the workspace; `vl ws cat` then says it does
@@ -150,7 +150,7 @@ fn ws_write_of_an_isolated_path_does_not_claim_it_was_recorded() {
     let env = Env::new();
     let proj = env.project(U, "proj", &[("app.py", "x\n")]);
     env.ok(U, &proj, &["ws", "new", "agent"]);
-    let mut c = env.cmd(U, &proj, &["ws", "write", "agent", ".env"]);
+    let mut c = env.cmd(U, &proj, &["ws", "write", "agent", ".netrc"]);
     c.stdin(std::process::Stdio::piped());
     c.stdout(std::process::Stdio::piped());
     c.stderr(std::process::Stdio::piped());
@@ -159,10 +159,10 @@ fn ws_write_of_an_isolated_path_does_not_claim_it_was_recorded() {
     child.stdin.take().unwrap().write_all(b"SECRET=abc\n").unwrap();
     let out = child.wait_with_output().unwrap();
     let t = text(&out);
-    let cat = env.vl(U, &proj, &["ws", "cat", "agent", ".env"]);
+    let cat = env.vl(U, &proj, &["ws", "cat", "agent", ".netrc"]);
     let recorded = cat.status.success();
     assert!(
-        recorded || !t.contains("Recorded .env") || t.contains("isolat") || t.contains("local-only"),
+        recorded || !t.contains("Recorded .netrc") || t.contains("isolat") || t.contains("local-only"),
         "the file was dropped but the command said:\n{t}"
     );
 }
@@ -213,10 +213,10 @@ fn a_pulled_tag_named_after_a_change_id_does_not_hijack_the_change() {
 fn a_copied_text_secret_is_quarantined_in_the_sandbox() {
     let env = Env::new();
     let proj = env.project(U, "proj", &[("app.py", "x\n")]);
-    write(&proj, ".env", "API_TOKEN=Xk9mQ2vL7pR4wZt8\n");
+    write(&proj, ".netrc", "API_TOKEN=Xk9mQ2vL7pR4wZt8\n");
     env.ok(U, &proj, &["status"]);
     env.ok(U, &proj, &["ws", "new", "agent"]);
-    let out = env.vl(U, &proj, &["ws", "exec", "agent", "--with-isolated", "--", "sh", "-c", "cp .env leaked.txt"]);
+    let out = env.vl(U, &proj, &["ws", "exec", "agent", "--with-isolated", "--", "sh", "-c", "cp .netrc leaked.txt"]);
     assert!(text(&out).contains("quarantined"), "{}", text(&out));
     assert!(!env.stdout(U, &proj, &["files", "-r", "agent@"]).contains("leaked.txt"));
 }
@@ -671,15 +671,15 @@ fn undo_after_remote_secret_or_policy_commands_names_them_and_undoes_nothing_els
 fn a_vanished_isolated_file_can_be_recovered_from_the_vault() {
     let env = Env::new();
     let proj = env.project(U, "proj", &[("a.txt", "a\n")]);
-    write(&proj, ".env", "TOKEN=abc\n");
+    write(&proj, ".netrc", "TOKEN=abc\n");
     env.ok(U, &proj, &["status"]);
-    std::fs::remove_file(proj.join(".env")).unwrap();
+    std::fs::remove_file(proj.join(".netrc")).unwrap();
     env.ok(U, &proj, &["status"]);
     env.ok(U, &proj, &["status"]);
-    assert!(env.stdout(U, &proj, &["secret", "files"]).contains(".env"));
-    env.ok(U, &proj, &["secret", "recover", ".env"]);
-    assert_eq!(read(&proj, ".env"), "TOKEN=abc\n");
-    assert!(!env.vl(U, &proj, &["secret", "recover", ".env"]).status.success(), "never overwrites");
+    assert!(env.stdout(U, &proj, &["secret", "files"]).contains(".netrc"));
+    env.ok(U, &proj, &["secret", "recover", ".netrc"]);
+    assert_eq!(read(&proj, ".netrc"), "TOKEN=abc\n");
+    assert!(!env.vl(U, &proj, &["secret", "recover", ".netrc"]).status.success(), "never overwrites");
 }
 
 // ---- `vl watch` next to other commands ----------------------------------------------

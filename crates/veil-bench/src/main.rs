@@ -5,6 +5,7 @@
 //! veil-bench gen    --profile tiny|small|1g|5g [--cloaked] --seed N --dir DIR --vl PATH
 //! veil-bench run    --profile … --seed N --dir DIR --vl PATH --out RESULTS.json [--agents 4,16,64] …
 //! veil-bench report RESULTS.json
+//! veil-bench openscion --vl PATH --server PATH --database-url URL --dir DIR --out RESULTS.json
 //! ```
 //!
 //! Every measured command is a separate process of the release `vl`
@@ -15,6 +16,7 @@
 mod agents;
 mod content;
 mod gen;
+mod openscion;
 mod proc;
 mod report;
 mod run;
@@ -65,6 +67,32 @@ struct GenArgs {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// The OpenScion speed gates (docs/OVERVIEW.md): 4 KiB-file repositories,
+    /// import, clone everything and one directory through the server,
+    /// commit one changed file; Git on the same machine as the reference.
+    Openscion {
+        /// The `vl` binary (a release build).
+        #[arg(long)]
+        vl: PathBuf,
+        /// The `veil-server` binary (a release build).
+        #[arg(long)]
+        server: PathBuf,
+        /// PostgreSQL for the server.
+        #[arg(long)]
+        database_url: String,
+        /// Bench directory (created; everything is written below it).
+        #[arg(long)]
+        dir: PathBuf,
+        /// Repository sizes, in 4 KiB files.
+        #[arg(long, value_delimiter = ',', default_value = "1000,10000")]
+        files: Vec<usize>,
+        /// Repetitions per case (the median is reported).
+        #[arg(long, default_value_t = 5)]
+        runs: usize,
+        /// Results JSON (a Markdown table is written beside it).
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Generate a repository (and keep it).
     Gen(GenArgs),
     /// Generate, run every case, write results, clean up.
@@ -188,6 +216,21 @@ fn setup_dirs(g: &GenArgs) -> Result<(PathBuf, proc::VlEnv)> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Openscion { vl, server, database_url, dir, files, runs, out } => {
+            let v = openscion::run_all(&openscion::Args {
+                vl,
+                server,
+                database_url,
+                dir,
+                sizes: files,
+                runs,
+            })?;
+            std::fs::write(&out, serde_json::to_vec_pretty(&v)?)?;
+            let md = openscion::markdown(&v)?;
+            std::fs::write(out.with_extension("md"), &md)?;
+            print!("{md}");
+            Ok(())
+        }
         Cmd::SftpShim { rtt_ms, cmd } => shim::run(Duration::from_millis(rtt_ms) / 2, &cmd),
         Cmd::Report { results } => {
             let r: serde_json::Value = serde_json::from_slice(&std::fs::read(&results)?)?;

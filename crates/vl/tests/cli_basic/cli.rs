@@ -64,13 +64,13 @@ fn init_isolates_secrets_and_commits_without_staging() {
     let env = Env::new();
     let proj = env.dir("proj");
     write(&proj, "src/lib.rs", "pub fn f() {}\n");
-    write(&proj, ".env", "SECRET=1\n");
+    write(&proj, ".netrc", "SECRET=1\n");
     write(&proj, "leak.txt", "aws = AKIAIOSFODNN7EXAMPLE\n");
     let out = env.ok("alice", &proj, &["init"]);
-    assert!(out.contains("local-only .env, leak.txt"), "{out}");
+    assert!(out.contains("local-only .netrc, leak.txt"), "{out}");
     let st = env.ok("alice", &proj, &["status"]);
     assert!(st.contains("A src/lib.rs"));
-    assert!(st.contains("L .env"));
+    assert!(st.contains("L .netrc"));
     assert!(st.contains("Q leak.txt"));
     env.ok("alice", &proj, &["commit", "-m", "first"]);
     let files = env.stdout("alice", &proj, &["files", "-r", "@-"]);

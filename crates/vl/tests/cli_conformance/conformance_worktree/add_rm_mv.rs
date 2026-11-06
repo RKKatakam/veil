@@ -146,10 +146,10 @@ fn renaming_a_file_to_a_secret_name_stops_recording_it() {
     let r = env.repo("p");
     r.write("settings", "PORT=8080\n");
     r.commit("one");
-    std::fs::rename(r.path("settings"), r.path(".env")).unwrap();
-    r.write(".env", DOTENV);
+    std::fs::rename(r.path("settings"), r.path(".netrc")).unwrap();
+    r.write(".netrc", DOTENV);
     let st = r.status();
-    assert!(st.contains("D settings") && st.contains("L .env"), "{st}");
+    assert!(st.contains("D settings") && st.contains("L .netrc"), "{st}");
     r.commit("rename");
     assert!(r.paths("@-").is_empty());
     assert!(!contains_bytes(&all_bytes(&r.path(".veil/objects")), "Xk29vLq8sPz"));

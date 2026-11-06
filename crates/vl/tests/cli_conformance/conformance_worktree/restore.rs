@@ -192,11 +192,11 @@ fn restore_leaves_ignored_and_isolated_files_alone() {
     let env = Env::new();
     let (r, _) = base(&env);
     r.write("target/build.o", "obj\n");
-    r.write(".env", DOTENV);
+    r.write(".netrc", DOTENV);
     r.write("a.txt", "a2\n");
     r.ok(&["restore"]);
     assert_eq!(r.read("target/build.o"), "obj\n");
-    assert_eq!(r.read(".env"), DOTENV);
+    assert_eq!(r.read(".netrc"), DOTENV);
     assert_eq!(r.read("a.txt"), "a1\n");
 }
 

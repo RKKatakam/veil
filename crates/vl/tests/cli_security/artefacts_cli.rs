@@ -17,13 +17,13 @@ fn status_lists_editor_artefacts_of_protected_files_as_local_only() {
     let proj = env.project("alice", "proj", &[("README.md", "hello\n")]);
     write(&proj, "deploy/id_ed25519", KEY);
     write(&proj, "deploy/.id_ed25519.swp", KEY);
-    write(&proj, ".env", "APP_KEY=base64:Zq8vXk9mQ2vL7pR4\n");
-    write(&proj, ".env~", "APP_KEY=base64:Zq8vXk9mQ2vL7pR4\n");
+    write(&proj, ".netrc", "APP_KEY=base64:Zq8vXk9mQ2vL7pR4\n");
+    write(&proj, ".netrc~", "APP_KEY=base64:Zq8vXk9mQ2vL7pR4\n");
     write(&proj, "deploy/server.pem.bak", KEY);
     write(&proj, "deploy/server.pem", KEY);
     write(&proj, "src/.main.rs.swp", "fn main() {}\n");
     let status = env.ok("alice", &proj, &["status"]);
-    for path in ["deploy/.id_ed25519.swp", ".env~", "deploy/server.pem.bak"] {
+    for path in ["deploy/.id_ed25519.swp", ".netrc~", "deploy/server.pem.bak"] {
         assert!(status.lines().any(|l| l.trim() == format!("L {path} [isolated]")), "{path} not local-only:\n{status}");
     }
     assert!(!status.contains("src/.main.rs.swp"), "a scratch file of a public file is ignored:\n{status}");
@@ -32,7 +32,7 @@ fn status_lists_editor_artefacts_of_protected_files_as_local_only() {
     assert!(check.contains("built-in editor scratch rule '.*.sw[a-p]'"), "{check}");
     env.ok("alice", &proj, &["commit", "-m", "c"]);
     let files = env.stdout("alice", &proj, &["files", "-r", "@-"]);
-    assert!(!files.contains("id_ed25519") && !files.contains(".env") && !files.contains(".swp"), "{files}");
+    assert!(!files.contains("id_ed25519") && !files.contains(".netrc") && !files.contains(".swp"), "{files}");
     let show = env.ok("alice", &proj, &["policy", "show"]);
     assert!(show.contains(".*.sw[a-p]") && show.contains("take its protection"), "{show}");
 }

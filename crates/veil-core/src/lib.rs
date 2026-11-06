@@ -66,6 +66,7 @@ pub mod error;
 pub mod fsck;
 pub mod gc;
 pub mod graph_index;
+pub mod hub;
 pub mod hunks;
 pub mod grep;
 pub mod id;

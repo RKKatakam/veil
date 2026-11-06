@@ -28,6 +28,8 @@ mod doctor;
 #[cfg(test)]
 mod docgen;
 mod history;
+mod hub;
+mod hub_cmd;
 mod hooks;
 mod mount;
 mod picker;
@@ -81,12 +83,19 @@ const DEFAULT_POLICY: &str = "\
 # Patterns are globs. Escape * ? [ ] { } # and spaces with \\ to match them
 # literally (`vl cloak <existing path>` does this for you).
 #
-# Engine-enforced: .env, .env.*, *.pem, *.key, id_rsa, … are isolated by
-# default and cannot be made public by a plain `public` rule. Public files are
-# scanned for credentials on every snapshot and quarantined on a hit.
+# Access lines name who may see a folder on the Veil server (the last
+# matching line wins; everything else is private to admins):
+#
+#   src/                 public          everyone on Earth may read
+#   billing/             finance         the group finance, or a person
+#
+# Engine-enforced: .env, .env.*, *.pem, *.key, id_rsa, … are secrets and
+# cannot be made public by a plain `public` rule. Public files are scanned
+# for credentials on every snapshot and quarantined on a hit.
 
 target/                  ignore
 node_modules/            ignore
+
 ";
 
 fn main() -> ExitCode {
@@ -135,7 +144,12 @@ fn open(cli: &Cli) -> Result<Ctx> {
 fn run(cli: Cli) -> Result<ExitCode> {
     match &cli.cmd {
         Cmd::Init { path } => cmd_init(path.as_deref()),
-        Cmd::Clone { source, dest } => cmd_clone(source, dest.as_deref()),
+        Cmd::Clone { source, dest, only } => match hub::HubUrl::parse(source) {
+            Some(url) => hub_cmd::clone(&url?, dest.as_deref(), only.as_deref()),
+            None if only.is_some() => bail!("--only works with a Veil server project (veil://host/project)"),
+            None => cmd_clone(source, dest.as_deref()),
+        },
+        Cmd::Login { url, name, ca } => hub_cmd::login(url, name.as_deref(), ca.as_deref()),
         Cmd::Identity(c) => cmd_identity(c),
         Cmd::Fsck { verbose } => cmd_fsck(cli.repository.as_deref(), *verbose),
         Cmd::Doctor { remotes } => doctor::run(cli.repository.as_deref(), *remotes),
@@ -144,7 +158,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Man { out_dir } => cmd_man(out_dir.as_deref()),
-        Cmd::Upgrade { dry_run, remote, force } => cmd_upgrade(cli.repository.as_deref(), *dry_run, remote.as_deref(), *force),
+        Cmd::Upgrade { dry_run, sync_secrets: true, .. } => {
+            let mut ctx = open(&cli)?;
+            let code = cmd_sync_secrets(&mut ctx, *dry_run)?;
+            ctx.finish()?;
+            Ok(code)
+        }
+        Cmd::Upgrade { dry_run, remote, force, .. } => cmd_upgrade(cli.repository.as_deref(), *dry_run, remote.as_deref(), *force),
         Cmd::Scan { policy_from: Some(file), out } => cmd_scan_gate(cli.repository.as_deref(), file, out.json),
         // Bypasses `Ctx::open` too: the server opens the repository afresh
         // for every request.
@@ -206,6 +226,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
     match &cli.cmd {
         Cmd::Init { .. }
         | Cmd::Clone { .. }
+        | Cmd::Login { .. }
         | Cmd::Identity(_)
         | Cmd::Fsck { .. }
         | Cmd::Doctor { .. }
@@ -505,6 +526,17 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         }
         Cmd::Watch { interval_ms } => cmd_watch(ctx, *interval_ms)?,
         Cmd::Remote(c) => cmd_remote(ctx, c)?,
+        Cmd::Group(c) => hub_cmd::group(ctx, c)?,
+        Cmd::Access { path, who } => hub_cmd::access(ctx, path, who)?,
+        Cmd::Push { remote, tag, force, dry_run: false, delete, .. }
+            if delete.is_empty() && hub_cmd::is_hub_remote(ctx, remote.as_deref().unwrap_or("origin")) =>
+        {
+            return hub_cmd::push(ctx, remote.as_deref().unwrap_or("origin"), tag, *force);
+        }
+        Cmd::Pull { remote, .. } if hub_cmd::is_hub_remote(ctx, remote) => hub_cmd::pull(ctx, remote)?,
+        Cmd::Push { remote, .. } if hub_cmd::is_hub_remote(ctx, remote.as_deref().unwrap_or("origin")) => {
+            bail!("--dry-run and --delete are not available for a Veil server remote yet (docs/HUB.md §13.8)")
+        }
         Cmd::Push {
             remote,
             tag,
@@ -567,7 +599,8 @@ fn cmd_init(path: Option<&Path>) -> Result<ExitCode> {
     let policy = VPath::new(POLICY_FILE)?;
     // Anything there (a symlinked or unreadable policy too) is kept.
     if std::fs::symlink_metadata(root.join(POLICY_FILE)).is_err() {
-        fs.write(&policy, DEFAULT_POLICY.as_bytes())?;
+        let text = format!("{DEFAULT_POLICY}{}", veil_core::policy::SYNCED_SECRETS_POLICY);
+        fs.write(&policy, text.as_bytes())?;
     }
     let out = repo.snapshot_workspace(DEFAULT_WORKSPACE, &*fs)?;
     repo.capture_local_files(&*fs, &out.report)?;
@@ -670,7 +703,7 @@ fn clone_populate(backend: Arc<dyn StorageBackend>, url: String, shown: String, 
     source_config.check_supported()?;
     let mut repo = Repo::init_for_clone_at(fs.clone(), Some(identity.clone()), &user_for(&identity), source_config.format)?;
     let mut config = repo.config().clone();
-    config.remotes.insert("origin".into(), RemoteConfig { url, public: false });
+    config.remotes.insert("origin".into(), RemoteConfig { url, public: false, only: None });
     repo.save_config(config)?;
     let report = remote::pull(&mut repo, "origin", backend)?;
     for w in &report.warnings {
@@ -2417,7 +2450,14 @@ fn remote_backend(ctx: &Ctx, name: &str) -> Result<(Arc<dyn StorageBackend>, Rem
 fn cmd_remote(ctx: &mut Ctx, c: &RemoteCmd) -> Result<()> {
     match c {
         RemoteCmd::Add { name, url, public } => {
-            if let Some(parsed) = SshUrl::parse(url) {
+            if let Some(parsed) = hub::HubUrl::parse(url) {
+                if parsed?.project.is_empty() {
+                    bail!("a Veil server remote names a project: veil://host[:port]/project");
+                }
+                if *public {
+                    bail!("--public is for path and SSH remotes; on a Veil server, `vl access PATH public` makes folders public");
+                }
+            } else if let Some(parsed) = SshUrl::parse(url) {
                 parsed?;
             }
             remote::add_remote(&mut ctx.repo, name, url, *public)?;
@@ -2704,6 +2744,70 @@ fn cmd_fsck(repo_arg: Option<&Path>, verbose: bool) -> Result<ExitCode> {
 
 /// `vl upgrade` bypasses `Ctx::open` too: it must not snapshot, and it
 /// works on bare remotes.
+/// `vl upgrade --sync-secrets`: an existing repository starts sealing and
+/// syncing its shared secrets only through this explicit step, which lists
+/// the files first (`docs/VISIBILITY.md`, "Existing repositories").
+fn cmd_sync_secrets(ctx: &mut Ctx, dry_run: bool) -> Result<ExitCode> {
+    use veil_core::policy::{Policy, Tier, SYNCED_SECRETS_POLICY};
+    let file = VPath::new(POLICY_FILE)?;
+    let text = String::from_utf8_lossy(&ctx.fs.read(&file).unwrap_or_default()).into_owned();
+    let current = Policy::parse(&text);
+    let wanted = Policy::parse(&format!("{text}\n{SYNCED_SECRETS_POLICY}"));
+    if matches!(current.classify(&VPath::new(".env")?, false).tier, Tier::Cloaked(_)) {
+        println!("Shared secrets already sync in this repository ({POLICY_FILE} seals .env).");
+        return Ok(ExitCode::SUCCESS);
+    }
+    // Every file kept on this device today that would start syncing.
+    let mut files = Vec::new();
+    let mut stack = vec![ctx.root.clone()];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir)?.flatten() {
+            let p = e.path();
+            let rel = p.strip_prefix(&ctx.root)?.to_string_lossy().replace('\\', "/");
+            if rel == ".veil" {
+                continue;
+            }
+            let Ok(vp) = VPath::new(&rel) else { continue };
+            let ft = e.file_type()?;
+            if ft.is_dir() {
+                if !matches!(current.classify(&vp, true).tier, Tier::Ignored) {
+                    stack.push(p);
+                }
+            } else if ft.is_file()
+                && current.classify(&vp, false).tier == Tier::Isolated
+                && matches!(wanted.classify(&vp, false).tier, Tier::Cloaked(_))
+            {
+                files.push(rel);
+            }
+        }
+    }
+    files.sort();
+    println!("These files would start syncing, encrypted under the 'team' key (only devices holding it open them):");
+    for f in &files {
+        println!("  {}", safe(f));
+    }
+    if files.is_empty() {
+        println!("  (none today; new .env files would)");
+    }
+    if dry_run {
+        println!("Dry run: nothing changed. Run without --dry-run to add the rules to {POLICY_FILE}.");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let keys = ctx.repo.keys();
+    if keys.ring_state(veil_core::policy::DEFAULT_SCOPE)?.is_none() {
+        keys.create_scope(veil_core::policy::DEFAULT_SCOPE)?;
+    }
+    let mut out = text;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(SYNCED_SECRETS_POLICY);
+    ctx.fs.write(&file, out.as_bytes())?;
+    println!("Added the rules to {POLICY_FILE}; the next snapshot seals these files. Push to share them.");
+    Ok(ExitCode::SUCCESS)
+}
+
 fn cmd_upgrade(repo_arg: Option<&Path>, dry_run: bool, remote_name: Option<&str>, force: bool) -> Result<ExitCode> {
     use veil_core::upgrade::{upgrade, UpgradeOptions};
     let start = match repo_arg {

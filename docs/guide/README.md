@@ -6,10 +6,10 @@ developers and reviewers are in [`docs/ARCHITECTURE.md`](../ARCHITECTURE.md),
 
 **Veil is server-centric** ([OVERVIEW.md](../OVERVIEW.md)): the `vl` client
 is always connected to the Veil server, which stores the code and enforces
-who can see what ([VISIBILITY.md](../VISIBILITY.md)). The server is built
-next. **These pages document today's client, before the server.** Where a
-page shows cloaking, scopes or SSH and path remotes, that changes when the
-server lands.
+who can see what ([VISIBILITY.md](../VISIBILITY.md)). Its first milestone
+is built: [The Veil server](the-server.md). **The other pages document
+today's client**; where a page shows cloaking, scopes or SSH and path
+remotes, that changes in the simplification pass.
 
 Every example here was run with the `vl` it documents. Output is real,
 trimmed where marked (`…`); some paths and host names were shortened
@@ -31,6 +31,7 @@ trimmed where marked (`…`); some paths and host names were shortened
 | 12. [Investigating history](investigating-history.md) | You want to know who wrote a line, when a string appeared, or which change broke something (`blame`, `grep`, `log -S`, `bisect`, renames) |
 | 13. [Copying changes, and merges that follow renames](copying-changes.md) | You want a change on another line too (`vl duplicate`, `vl cherry-pick`), or wonder what a merge does with a moved file |
 | 14. [Line endings and attributes](line-endings-and-attributes.md) | Your project has Windows line endings, binary files, or wants its own diff or merge driver (`.veilattributes`) |
+| 15. [The Veil server](the-server.md) | You sign in to a server, create a project, give groups access to folders, or push and pull through it |
 
 The [command reference](../reference/README.md) lists every command and
 flag. It is generated from `vl` itself and cannot drift from it.

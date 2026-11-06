@@ -125,8 +125,8 @@ fn an_unreadable_file_is_warned_about_and_keeps_its_recorded_version() {
 
 fn sandbox_project(env: &Env) -> std::path::PathBuf {
     let proj = env.project("alice", "proj", &[("app.py", "print('hi')\n")]);
-    write(&proj, ".env", "API_TOKEN=super-secret-isolated-value\nPORT=3000\n");
-    env.ok("alice", &proj, &["commit", "-m", "with .env"]);
+    write(&proj, ".netrc", "API_TOKEN=super-secret-isolated-value\nPORT=3000\n");
+    env.ok("alice", &proj, &["commit", "-m", "with .netrc"]);
     env.ok("alice", &proj, &["ws", "new", "agent", "-r", "@-"]);
     proj
 }
@@ -138,7 +138,7 @@ fn ephemeral_exec_cannot_launder_isolated_secrets_either() {
     let o = env.vl(
         "alice",
         &proj,
-        &["ws", "exec", "--ephemeral", "-r", "@-", "--with-isolated", "-m", "eph", "--", "sh", "-c", "grep TOKEN .env | cut -d= -f2 > leaked.txt; echo ok > fine.txt"],
+        &["ws", "exec", "--ephemeral", "-r", "@-", "--with-isolated", "-m", "eph", "--", "sh", "-c", "grep TOKEN .netrc | cut -d= -f2 > leaked.txt; echo ok > fine.txt"],
     );
     assert!(o.status.success(), "{}", text(&o));
     assert!(text(&o).contains("leaked.txt"), "a quarantine warning names the file: {}", text(&o));
@@ -176,7 +176,7 @@ fn stale_sandboxes_of_dead_processes_are_swept() {
     let live = tmp.join(format!("veil-ws-agent-{}-0badf00d", std::process::id()));
     let unrelated = tmp.join(format!("other-{dead}"));
     for d in [&stale, &live, &unrelated] {
-        write(d, ".env", "API_TOKEN=leftover\n");
+        write(d, ".netrc", "API_TOKEN=leftover\n");
     }
     env.ok("alice", &proj, &["ws", "exec", "agent", "--", "true"]);
     assert!(!stale.exists(), "stale sandbox with secrets left behind");
