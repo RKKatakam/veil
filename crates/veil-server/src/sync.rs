@@ -945,6 +945,8 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
     })
     .await?;
     crate::audit(&hub.db, Some(project.id), Some(person), "push", &format!("moved {moved:?}")).await;
+    // Derived history data, in the background: the push never waits.
+    crate::derive::landed(hub, project.id);
     // The tips as the pusher sees them now (their own snapshots, where the
     // server's projection gives them back).
     let accepted = plans.iter().any(|p| p.3.is_some());

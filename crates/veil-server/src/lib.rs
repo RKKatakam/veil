@@ -7,6 +7,7 @@
 //! | [`auth`] | challenge-response sign-in, session tokens |
 //! | [`perm`] | the permission model: admins, groups, the accepted policy |
 //! | [`sync`] | projected history, fetch by id, push validation, branch CAS |
+//! | [`mod@derive`] | derived history data: commit graph, changed paths, per-rule lists (S12) |
 //! | [`db`] | PostgreSQL / YugabyteDB, migrations, serialisable retries |
 //! | [`store`] | object storage: local directory or S3 |
 //! | [`tls`] | TLS configuration |
@@ -14,6 +15,7 @@
 pub mod api;
 pub mod auth;
 pub mod db;
+pub mod derive;
 pub mod error;
 pub mod perm;
 pub mod store;
@@ -41,6 +43,8 @@ pub struct Hub {
     /// The TLS certificate (leaf, DER): sign-in accepts only signatures
     /// for a server name it is valid for.
     pub certificate: rustls::pki_types::CertificateDer<'static>,
+    /// The derive workers (`derive::landed`).
+    pub derive: derive::Workers,
 }
 
 pub type HubState = Arc<Hub>;
@@ -142,6 +146,7 @@ pub async fn start(config: Config) -> Result<Running> {
         receipt_key,
         session_ttl_ms: config.session_ttl.as_millis() as i64,
         certificate,
+        derive: derive::Workers::default(),
     });
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;
