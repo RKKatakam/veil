@@ -101,11 +101,22 @@ pub async fn load_viewer(c: &mut PgConnection, project: i64, caller: &Caller) ->
     let Some(p) = &caller.person else {
         return Ok(Viewer::default());
     };
-    let admin: Option<i64> = sqlx::query_scalar("SELECT person_id FROM project_admins WHERE project_id = $1 AND person_id = $2")
-        .bind(project)
-        .bind(p.id)
-        .fetch_optional(&mut *c)
-        .await?;
+    // One round trip: an admin? and is this device barred from the project
+    // (an admin removed it from this project only, BUG-843)?
+    let (admin, barred): (bool, bool) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM project_admins WHERE project_id = $1 AND person_id = $2), \
+         EXISTS (SELECT 1 FROM device_bars b JOIN devices d ON d.id = b.device_id WHERE b.project_id = $1 AND d.signing_key = $3)",
+    )
+    .bind(project)
+    .bind(p.id)
+    .bind(&p.device_key)
+    .fetch_one(&mut *c)
+    .await?;
+    if barred {
+        return Err(Error::forbidden(
+            "an admin removed this device from this project: use another of your devices (`vl identity confirm` a new one)",
+        ));
+    }
     let groups: Vec<i64> = sqlx::query_scalar(
         "SELECT g.id FROM groups g JOIN group_members m ON m.group_id = g.id WHERE g.project_id = $1 AND m.person_id = $2",
     )
@@ -115,7 +126,7 @@ pub async fn load_viewer(c: &mut PgConnection, project: i64, caller: &Caller) ->
     .await?;
     Ok(Viewer {
         person: Some(p.id),
-        admin: admin.is_some(),
+        admin,
         groups: groups.into_iter().collect(),
     })
 }

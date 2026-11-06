@@ -1,0 +1,36 @@
+# Veil visibility policy — the last matching rule wins.
+#
+#   <pattern>          public | public! | cloak [scope] | isolate | ignore
+#
+#   public    plaintext, synced everywhere (default)
+#   public!   public with secret scanning disabled (deliberate exposure)
+#   cloak     encrypted for members of a scope (default scope: team)
+#   isolate   local-only: never snapshotted, never pushed
+#   ignore    not tracked at all
+#
+# Patterns are globs. Escape * ? [ ] { } # and spaces with \ to match them
+# literally (`vl cloak <existing path>` does this for you).
+#
+# Access lines name who may see a folder on the Veil server (the last
+# matching line wins; everything else is private to admins):
+#
+#   src/                 public          everyone on Earth may read
+#   billing/             finance         the group finance, or a person
+#
+# Engine-enforced: .env, .env.*, *.pem, *.key, id_rsa, … are secrets and
+# cannot be made public by a plain `public` rule. Public files are scanned
+# for credentials on every snapshot and quarantined on a hit.
+
+target/                  ignore
+node_modules/            ignore
+
+# Shared secrets are encrypted on this device and synced; only devices of
+# people who may see their folder hold the key (`vl access`, `vl group add`).
+# Personal private keys (id_rsa, id_ed25519, *.pem, *.key, .netrc, ...)
+# never leave this device.
+.env                     cloak rule
+.env.*                   cloak rule
+.envrc                   cloak rule
+*.tfstate                cloak rule
+*.tfstate.*              cloak rule
+secrets/                 cloak team

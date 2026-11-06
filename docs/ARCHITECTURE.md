@@ -367,6 +367,12 @@ rotation = { generation, key_id, previous: [{key_id, sealed}], wrapped: {id → 
   * the last admin can be neither revoked nor demoted.
 
   A ring that fails to verify gives no keys at all.
+* **Project binding** (format 7, BUG-845). Every ring but `team` names its
+  project in its signed genesis: the hash of the project's `team` ring's
+  genesis. A ring naming another project gives no keys and is never taken
+  (`Keychain::bound`). In a clone of a Veil server project, `team` itself is
+  trusted only if its fingerprint is the one the device confirmed outside
+  the server (`.veil/local/project-anchor`; `docs/HUB.md` §13.12).
 * **Genesis proof.** The genesis carries a MAC, made with the generation-0
   key, over `(scope, key_id, signer, signing_key)`. Every reader who can
   unwrap generation 0 checks it, along with each rotation's `previous` chain.
@@ -3777,7 +3783,7 @@ afterwards; textconv input on stdin, output never stored.
 
 *Not trusted:*
 
-* **the server, with secrets and embargoed changes before release.** It stores only their ciphertext and never holds a key that opens them. Personal private keys never reach it. **Nor can it hand a secret out:** a key is granted only by a ring admin's signed change, never by the server's group records, which a compromised server could rewrite (`docs/HUB.md` §13.6);
+* **the server, with secrets and embargoed changes before release.** It stores only their ciphertext and never holds a key that opens them. Personal private keys never reach it. **Nor can it hand a secret out:** a key is granted only by a signed change in the key ring, never by the server's group records, which a compromised server could rewrite: a ring admin's grant, or a member's share that carries a proof only someone outside the server can make (an invite join, or the person's own vouch), which every reader's replay checks (`docs/HUB.md` §13.6, §13.12);
 * people outside a folder's access, including others in the same project, and members after they are removed;
 * anything that arrives by push, pull, fetch or merge: trees, names, descriptions, policies, hooks and metadata;
 * the network, and other OS users on the same machine;

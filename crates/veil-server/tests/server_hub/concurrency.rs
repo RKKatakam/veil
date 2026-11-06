@@ -157,3 +157,89 @@ fn racing_branch_creations_and_separate_branches() {
     }
     let _ = Object::Blob(vec![]);
 }
+
+/// Members' devices share keys while an admin removes the person they share
+/// with (HUB.md §13.12, threat 13): every ring change is decided on the
+/// server's latest ring, so once the removal lands no device of the person
+/// is in the ring, and no later pass brings one back. The person keeps
+/// confirming new devices during the removal, so shares race it.
+#[test]
+fn shares_racing_a_removal_never_keep_a_removed_device() {
+    use crate::secrets2::{bill_scope, clone, invited, member_of, named, ring};
+    use std::sync::atomic::AtomicBool;
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let f = clone(&hub, &p, &p.fin, "f");
+    // More finance members whose devices hold the key.
+    let mut sharers = vec![(&p.fin, f.clone())];
+    let extra: Vec<Person> = (0..2).map(|i| invited(&hub, &p, &format!("m{i}-")).0).collect();
+    p.fin.ok(&f, &["share-keys"]);
+    for (i, m) in extra.iter().enumerate() {
+        assert!(member_of(&ring(&hub, &p, &bill_scope()).1, &m.identity()));
+        sharers.push((m, clone(&hub, &p, m, &format!("c{i}"))));
+    }
+    let mut raced = 0;
+    for round in 0..3 {
+        let (newbie, _) = invited(&hub, &p, &format!("newbie{round}-"));
+        p.fin.ok(&f, &["share-keys"]);
+        assert!(member_of(&ring(&hub, &p, &bill_scope()).1, &newbie.identity()));
+        let before = ring(&hub, &p, &bill_scope()).0.log.len();
+        let done = AtomicBool::new(false);
+        let removing = AtomicBool::new(false);
+        let confirm_one = || {
+            let d = hub.new_device_of(&newbie);
+            newbie.ok(newbie.home.path(), &["identity", "confirm", &d.fingerprint()]);
+            d
+        };
+        std::thread::scope(|s| {
+            for (who, dir) in &sharers {
+                let (dir, done) = (dir.clone(), &done);
+                s.spawn(move || {
+                    while !done.load(Ordering::SeqCst) {
+                        // A pass may lose every race and give up: that is
+                        // allowed; leaving a removed device in is not.
+                        let o = who.run(&dir, &["share-keys"]);
+                        if !o.status.success() {
+                            println!("a pass gave up: {}", String::from_utf8_lossy(&o.stderr).trim());
+                        }
+                    }
+                });
+            }
+            let first = confirm_one();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            while !member_of(&ring(&hub, &p, &bill_scope()).1, &first.identity()) {
+                assert!(std::time::Instant::now() < deadline, "round {round}: no pass shared the first device");
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let removal = s.spawn(|| {
+                removing.store(true, Ordering::SeqCst);
+                p.admin.ok(&p.dir, &["group", "remove", "finance", &newbie.name]);
+            });
+            // More devices while the removal runs.
+            while !removing.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            for _ in 0..2 {
+                confirm_one();
+            }
+            removal.join().unwrap();
+            // Sharers keep passing a little after the removal.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            done.store(true, Ordering::SeqCst);
+        });
+        let (r, st) = ring(&hub, &p, &bill_scope());
+        let shares = r.log[before..]
+            .iter()
+            .filter(|c| matches!(&c.op, veil_core::keychain::RingOp::Share { member, .. } if member.name == newbie.name))
+            .count();
+        raced += shares;
+        println!("round {round}: {shares} share(s) to newbie's devices around the removal; ring of {} changes, generation {}", st.len, st.generation);
+        assert_eq!(named(&st, &newbie.name), 0, "round {round}: a removed person's device kept the key");
+        for (who, dir) in &sharers {
+            who.ok(dir, &["share-keys"]);
+        }
+        let st = ring(&hub, &p, &bill_scope()).1;
+        assert_eq!(named(&st, &newbie.name), 0, "round {round}: a pass gave a removed person a key back");
+    }
+    assert!(raced > 0, "no share raced the removal: the test proved nothing");
+}

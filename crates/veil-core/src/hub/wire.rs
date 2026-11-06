@@ -5,7 +5,12 @@
 //! POST /v1/auth/challenge                 ChallengeRequest  → Challenge
 //! POST /v1/auth/login                     LoginRequest      → Session
 //! GET  /v1/people/{name}/devices                            → Devices
+//! GET  /v1/people/{name}/pending/{fp}                       → PendingDevice
 //! POST /v1/devices/vouch                  VouchRequest      → Devices
+//! POST /v1/devices/remove                 RemoveDevice      → Devices
+//! POST /v1/projects/{p}/invites           InviteRequest     → InviteRequest
+//! POST /v1/projects/{p}/invites/join      JoinRequest       → Joined
+//! GET  /v1/projects/{p}/keys/pending                        → [Devices]
 //! GET  /v1/projects/{p}/tips                                → Tips
 //! POST /v1/projects/{p}/history           HistoryRequest    → frames (snapshots)
 //! POST /v1/projects/{p}/fetch             FetchRequest      → frames (trees, blobs)
@@ -213,6 +218,69 @@ pub struct Devices {
     pub pending: Vec<String>,
     #[serde(default)]
     pub vouches: Vec<Vouch>,
+    /// Their devices' joins under invites (any project's): a device whose
+    /// join verifies under an invite a key ring holds may be shared to
+    /// (`docs/HUB.md` §13.12).
+    #[serde(default)]
+    pub joins: Vec<Join>,
+    /// Devices removed from the person (full public identities): devices
+    /// that may revoke them in a key ring do (a revocation is never a
+    /// grant, so the server's word is enough for it).
+    #[serde(default)]
+    pub removed: Vec<String>,
+}
+
+/// One device's join under an invite.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Join {
+    /// The invite's public key (hex).
+    pub key: String,
+    /// The joining device's full public identity.
+    pub device: String,
+    /// Signature (context `hub-invite`) under `key` over [`join_message`].
+    pub signature: String,
+}
+
+/// A pending device found by its fingerprint.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingDevice {
+    pub identity: String,
+}
+
+/// `POST /v1/devices/remove`: remove a device (its person, from another
+/// device; or an admin of `project` where the person takes part).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RemoveDevice {
+    pub device: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+}
+
+/// `POST …/invites` (an admin): the server's record of an invite, used to
+/// join the group. Key rings hold the admin-signed record that grants keys.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InviteRequest {
+    /// The invite's public key (hex).
+    pub key: String,
+    pub person: String,
+    pub group: String,
+    pub expires_at: i64,
+}
+
+/// `POST …/invites/join`: the signed-in device joins under an invite.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct JoinRequest {
+    pub key: String,
+    /// The joining device: the caller's own.
+    pub device: String,
+    pub signature: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Joined {
+    pub project: String,
+    pub group: String,
+    pub person: String,
 }
 
 /// One device's signature saying another device is its person's too.
@@ -241,6 +309,63 @@ pub fn vouch_message(id: &crate::identity::PublicIdentity) -> Option<Vec<u8>> {
     let mut m = id.x25519.to_vec();
     m.extend_from_slice(&ed);
     Some(m)
+}
+
+/// What a join under an invite signs (context `hub-invite`): the invited
+/// person's name, then the joining device's X25519 ‖ Ed25519 public keys.
+/// `None` for an identity without a signing key.
+pub fn join_message(person: &str, device: &crate::identity::PublicIdentity) -> Option<Vec<u8>> {
+    let mut m = person.as_bytes().to_vec();
+    m.push(0);
+    m.extend(vouch_message(device)?);
+    Some(m)
+}
+
+/// The secret of an invite (`vl invite`, `docs/HUB.md` §13.12): 32 random
+/// bytes that only the admin's device and the invite link hold. The
+/// server and the key rings get only the public half of the Ed25519 key
+/// derived from it, so whoever has not seen the link cannot sign a join.
+pub struct InviteKey {
+    secret: zeroize::Zeroizing<[u8; 32]>,
+}
+
+impl InviteKey {
+    pub fn generate() -> InviteKey {
+        InviteKey { secret: zeroize::Zeroizing::new(crate::crypto::random_bytes::<32>()) }
+    }
+
+    /// From the 64 hex digits of a link.
+    pub fn from_hex(s: &str) -> Option<InviteKey> {
+        let b: [u8; 32] = hex::decode(s.trim()).ok()?.try_into().ok()?;
+        Some(InviteKey { secret: zeroize::Zeroizing::new(b) })
+    }
+
+    /// The secret, for the link.
+    pub fn secret_hex(&self) -> String {
+        hex::encode(*self.secret)
+    }
+
+    fn signer(&self) -> crate::identity::SeedSigner {
+        let seed = zeroize::Zeroizing::new(blake3::derive_key(crate::crypto::domains::HUB_INVITE_KEY, &*self.secret));
+        crate::identity::SeedSigner::from_seed(&seed)
+    }
+
+    /// The public key (hex): what the server and the rings hold.
+    pub fn public_hex(&self) -> String {
+        self.signer().verifying_hex()
+    }
+
+    /// Sign the join of `device` as `person`.
+    pub fn sign_join(&self, person: &str, device: &crate::identity::PublicIdentity) -> Option<String> {
+        Some(self.signer().sign(crate::crypto::domains::SIG_CONTEXT_HUB_INVITE, &join_message(person, device)?))
+    }
+}
+
+/// Does a join verify under the invite key `key`?
+pub fn join_valid(key: &str, person: &str, device: &str, signature: &str) -> bool {
+    let Ok(id) = crate::identity::parse_public_identity(device) else { return false };
+    join_message(person, &id)
+        .is_some_and(|m| crate::identity::verify_signature(key, crate::crypto::domains::SIG_CONTEXT_HUB_INVITE, &m, signature))
 }
 
 /// Does `v` verify for the device it names?

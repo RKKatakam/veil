@@ -477,7 +477,7 @@ fn a_later_device_is_confirmed_by_its_person() {
     assert!(!out.contains("confirm "), "{out}");
     assert!(out.contains("granted to"), "{out}");
     let c2 = laptop.dir("c2");
-    laptop.ok(laptop.home.path(), &["clone", &hub.url(&p.name), c2.to_str().unwrap()]);
+    laptop.clone_trusting(&hub.url(&p.name), &c2, &p.fp);
     assert!(std::fs::read_to_string(c2.join(BILL_DIR).join(".env")).unwrap().contains(ENV_MARK));
     // Another person cannot confirm a device under fin's name...
     let thief = hub.new_device_of(&p.fin);
@@ -719,13 +719,15 @@ fn bug_835_a_confirmed_device_is_recorded_under_its_persons_name() {
 
 /// BUG-836. Attacker: a compromised server keeping a removed person the
 /// key. Controls: the group list an admin's `vl group remove` reads to
-/// decide whether the person left their last group. It says fin is still
-/// in another group: the key was not rotated, and nothing said so. Fixed:
-/// the removal says who keeps the key, and why.
+/// decide whether the person still has the folder. It says fin is still
+/// in another group the folder's line names: the key was not rotated, and
+/// nothing said so. Fixed: the removal says who keeps the key, and why.
 #[test]
 fn bug_836_a_removal_that_does_not_rotate_says_so() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
+    // billing/ is finance's and security's.
+    p.admin.ok(&p.dir, &["access", &format!("{BILL_DIR}/"), "finance", "security"]);
     // The server's records gain fin in `security` (no admin did that).
     hub.rt
         .block_on(

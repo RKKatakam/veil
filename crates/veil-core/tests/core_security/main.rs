@@ -33,6 +33,7 @@ mod audiences;
 mod hostile_objects;
 mod hostile_policy_dir;
 mod injected_binary;
+mod ring_shares;
 mod round4_keys;
 mod scanner;
 mod scanner_upgrade;
