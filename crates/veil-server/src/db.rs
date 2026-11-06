@@ -69,8 +69,8 @@ pub async fn schema_current(pool: &PgPool) -> anyhow::Result<bool> {
 /// * A schema that is current is only read: no DDL, so servers starting
 ///   together (a rolling restart) never change the catalog under the
 ///   servers already running.
-/// * Otherwise one process applies them, holding [`MIGRATION_LOCK`]; the
-///   others wait for the lock (until [`MIGRATION_DEADLINE`]) and then find
+/// * Otherwise one process applies them, holding an advisory lock; the
+///   others wait for the lock (up to ten minutes) and then find
 ///   the schema current.
 ///
 /// `veil-server migrate` runs it on its own, before servers start.
