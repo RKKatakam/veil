@@ -210,6 +210,17 @@ impl Materialised {
         }
     }
 
+    /// The record of a working copy that shows tree `view` (by id: its
+    /// entries are never walked) and never showed the paths `hidden`: the
+    /// start of a partial clone's journalled checkout
+    /// ([`Repo::check_out_new`](crate::repo::Repo::check_out_new)).
+    pub(crate) fn shown_as(view: ObjectId, hidden: impl IntoIterator<Item = VPath>) -> Materialised {
+        Materialised {
+            view: Some(view),
+            ..Materialised::hiding(hidden)
+        }
+    }
+
     /// Nothing hidden, nothing from a fallback, nothing converted.
     pub fn is_empty(&self) -> bool {
         self.view.is_none() && self.hidden.is_empty() && self.fallback.is_empty() && self.crlf.is_empty()

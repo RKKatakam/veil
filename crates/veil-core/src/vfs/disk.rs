@@ -545,16 +545,33 @@ fn barrier_sync_file(path: &Path) -> io::Result<()> {
     }
 }
 
-/// [`barrier_sync_file`] for directories.
+/// [`barrier_sync_file`] for directories. A directory replaced since it
+/// was recorded (checkout removed it and wrote a link or a file there,
+/// BUG-833) is not opened through what replaced it: the replacement's own
+/// directory is synced instead (it is in the batch, or was synced when
+/// the link was written), and a link there is never followed.
 fn barrier_sync_dir(dir: &Path) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     {
-        match fs::File::open(dir).and_then(|d| plain_fsync(&d)) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let d = match fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(dir) {
+            // Replaced since by a link or a file: nothing of ours to sync.
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) || e.kind() == io::ErrorKind::NotADirectory => return Ok(()),
+            r => r?,
+        };
+        #[cfg(target_os = "macos")]
+        return match plain_fsync(&d) {
             Err(e) if fullfsync_unsupported(&e) => Ok(()),
+            r => r,
+        };
+        #[cfg(not(target_os = "macos"))]
+        match full_sync(&d) {
+            // Some filesystems cannot fsync directories; nothing more can be done.
+            Err(e) if matches!(e.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported) => Ok(()),
             r => r,
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(unix))]
     {
         sync_dir(dir)
     }
@@ -576,16 +593,16 @@ fn flush_drive_cache(files: &[PathBuf], dirs: &[PathBuf]) -> io::Result<()> {
     Ok(())
 }
 
-/// Run `f` on every item, on up to `max_workers` threads. Concurrent
-/// fsyncs let filesystems such as ext4 and XFS commit many files in one
-/// journal transaction instead of one each.
+/// Run `f` on every item, on up to `max_workers` threads, one per
+/// `per_worker` items. Concurrent fsyncs let filesystems such as ext4 and
+/// XFS commit many files in one journal transaction instead of one each.
 fn for_each_parallel<T: Sync>(
     items: &[T],
     max_workers: usize,
+    per_worker: usize,
     f: impl Fn(&T) -> io::Result<()> + Sync,
 ) -> io::Result<()> {
-    const PER_WORKER: usize = 16;
-    let workers = items.len().div_ceil(PER_WORKER).clamp(1, max_workers);
+    let workers = items.len().div_ceil(per_worker).clamp(1, max_workers);
     if workers == 1 {
         return items.iter().try_for_each(f);
     }
@@ -943,14 +960,20 @@ impl StorageBackend for DiskBackend {
             return Ok(());
         }
         let dirs: Vec<PathBuf> = batch.dirs.iter().cloned().collect();
-        let res = for_each_parallel(&batch.files, SYNC_WORKERS, |f| match barrier_sync_file(f) {
+        // Files: a worker each from two on (measured on ext4 NVMe: two
+        // new files 0.42 ms instead of 0.70, four 0.73 instead of 1.36; a
+        // thread costs tens of microseconds, a journal commit hundreds).
+        // Directories: once the files' fsyncs have committed the journal
+        // they are mostly clean, and a thread for each costs more than
+        // their fsyncs; one worker per 16.
+        let res = for_each_parallel(&batch.files, SYNC_WORKERS, 1, |f| match barrier_sync_file(f) {
             // Removed since (by gc, or by crash recovery as torn): the
             // directory sync below makes the removal durable instead.
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             r => r,
         })
         .and_then(|()| {
-            for_each_parallel(&dirs, SYNC_WORKERS, |d| match barrier_sync_dir(d) {
+            for_each_parallel(&dirs, SYNC_WORKERS, 16, |d| match barrier_sync_dir(d) {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
                 r => r,
             })

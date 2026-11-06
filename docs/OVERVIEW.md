@@ -56,15 +56,16 @@ The owner adopted the four synthetic workloads published by OpenScion, an indepe
 
 | Workload | 1,000 files: target | 10,000 files: target | Veil, real disk, through the server (1k / 10k) |
 |---|---:|---:|---|
-| Import a directory (first snapshot) | **22 ms** | **245 ms** | 101 / 708 ms (Git: 101 / 790 ms) |
+| Import a directory (first snapshot) | **22 ms** | **245 ms** | 48–58 / 202–208 ms after performance round 1 (Git: 87–94 / 763–764 ms) |
 | Clone everything | **51 ms** | **544 ms** | 124 / 1,014 ms after BUG-818 (Git: 171 / 583 ms) |
-| Commit one changed file | **2.5 ms** | **22 ms** | 34 / 45 ms (Git: 14 / 7 ms) |
+| Commit one changed file | **2.5 ms** | **22 ms** | 20–27 / 43–44 ms after performance round 1 (Git: 6–16 / 9–10 ms) |
 | Clone one directory | **6.1 ms** | **25 ms** | 62 / 74 ms after BUG-818 (Git: 47 / 82 ms) |
 
 - **Measured by the S1 server milestone** on an ext4 NVMe disk: release builds, the median of 5, PostgreSQL, with Git as the same-machine reference. Absolute numbers depend on the machine, so each gate also requires **beating Git on the same machine**. **No gate is met yet.**
 - **Correction:** an earlier table here (51 / 316, 50 / 483, 12.8 / 27 ms) was measured under `/tmp`, which is a tmpfs on the development machine, where `fsync` costs nothing. Those numbers were invalid. **Never benchmark under `/tmp` on that machine.**
 - **BUG-818 fixed** (one durability barrier per checkout): clones are 2.5–10× faster. The rest of a 10k clone is the transfer plus about 16 `openat` calls per file from checkout's no-follow path walks.
-- **Next costs:** per-command overhead (commit), server round trips (clone one directory), and hashing and compression work (import).
+- **Performance round 1** (`docs/design/scale/OPENSCION.md`): import beats Git (1.7× at 1k, 3.7× at 10k); commit one file does not yet (Git does no fsync; Veil's commit is two durable transactions). **Measured as OpenScion measures** (in one process, in memory, no disk or process start), Veil meets the import, clone-everything and commit targets: 8.8 / 86 ms, 32 / 303 ms, 0.9 / 7.4 ms.
+- **Next costs:** the commit's two transactions and its scan (owner decisions, see OPENSCION.md), server round trips (clone one directory).
 - **Performance rounds continue until every gate is met.** The profile runs in `crates/veil-bench` (`docs/design/scale/OPENSCION.md`) and is re-run on every stream that touches the client or the server.
 
 ## What exists today, and what's next

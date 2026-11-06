@@ -13,7 +13,7 @@ use axum::{
 use serde::Deserialize;
 use sqlx::PgConnection;
 use veil_core::{
-    hub::wire::{AccessInfo, Devices, FetchRequest, GroupChange, GroupInfo, HistoryRequest, PushRequest, PushResult, Tips, MAX_WANTS},
+    hub::wire::{vouch_valid, AccessInfo, Devices, FetchRequest, GroupChange, GroupInfo, HistoryRequest, PushRequest, PushResult, Tips, Vouch, VouchRequest, MAX_WANTS},
     keychain::{validate_scope_name, KeyRing, Keychain, RingMerge},
     policy::valid_principal_name,
     MemoryBackend, StorageBackend, VPath,
@@ -31,6 +31,7 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/auth/challenge", post(auth::challenge))
         .route("/v1/auth/login", post(auth::login))
         .route("/v1/people/{name}/devices", get(devices))
+        .route("/v1/devices/vouch", post(vouch))
         .route("/v1/projects/{p}", post(create_project))
         .route("/v1/projects/{p}/tips", get(tips))
         .route("/v1/projects/{p}/history", post(history))
@@ -55,16 +56,82 @@ fn frames(body: Vec<u8>) -> Response {
 
 async fn devices(State(hub): State<HubState>, caller: Caller, Path(name): Path<String>) -> Result<Json<Devices>> {
     caller.signed_in()?;
-    let ids: Vec<String> = sqlx::query_scalar(
-        "SELECT d.public_identity FROM devices d JOIN people p ON p.id = d.person_id WHERE p.name = $1 AND d.removed_at IS NULL ORDER BY d.id",
+    device_list(&hub, &name).await
+}
+
+/// A person's devices with the vouches the server stores. The server's
+/// list is not what wraps a key: admins' `vl` check the vouches
+/// (`docs/HUB.md` §13.11).
+async fn device_list(hub: &HubState, name: &str) -> Result<Json<Devices>> {
+    let rows: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT d.public_identity, d.pending FROM devices d JOIN people p ON p.id = d.person_id \
+         WHERE p.name = $1 AND d.removed_at IS NULL ORDER BY d.id",
     )
-    .bind(&name)
+    .bind(name)
     .fetch_all(&hub.db)
     .await?;
-    if ids.is_empty() {
+    if rows.is_empty() {
         return Err(Error::not_found(format!("no person named '{name}'")));
     }
-    Ok(Json(Devices { person: name, identities: ids }))
+    let vouches: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT d.public_identity, v.voucher_key, v.signature FROM device_vouches v JOIN devices d ON d.id = v.device_id \
+         JOIN people p ON p.id = d.person_id WHERE p.name = $1 AND d.removed_at IS NULL ORDER BY d.id, v.voucher_key",
+    )
+    .bind(name)
+    .fetch_all(&hub.db)
+    .await?;
+    let (pending, active): (Vec<_>, Vec<_>) = rows.into_iter().partition(|(_, p)| *p);
+    Ok(Json(Devices {
+        person: name.to_string(),
+        identities: active.into_iter().map(|(i, _)| i).collect(),
+        pending: pending.into_iter().map(|(i, _)| i).collect(),
+        vouches: vouches.into_iter().map(|(device, by, signature)| Vouch { device, by, signature }).collect(),
+    }))
+}
+
+/// The signed-in device vouches for another device of its person: the
+/// device becomes active (a pending one may then sign in).
+async fn vouch(State(hub): State<HubState>, caller: Caller, Json(req): Json<VouchRequest>) -> Result<Json<Devices>> {
+    let me = caller.signed_in()?.clone();
+    let v = Vouch {
+        device: req.device.clone(),
+        by: me.device_key.clone(),
+        signature: req.signature,
+    };
+    if !vouch_valid(&v) {
+        return Err(Error::bad_request("the vouch does not verify under this device's key"));
+    }
+    let person = me.id;
+    let n = crate::db::serializable(&hub.db, move |c| {
+        let v = v.clone();
+        Box::pin(async move {
+            let device: Option<i64> = sqlx::query_scalar(
+                "SELECT id FROM devices WHERE person_id = $1 AND public_identity = $2 AND removed_at IS NULL",
+            )
+            .bind(person)
+            .bind(&v.device)
+            .fetch_optional(&mut *c)
+            .await?;
+            let Some(device) = device else {
+                return Err(Error::not_found("no device of yours with that identity"));
+            };
+            sqlx::query(
+                "INSERT INTO device_vouches (device_id, voucher_key, signature, created_at) VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (device_id, voucher_key) DO NOTHING",
+            )
+            .bind(device)
+            .bind(&v.by)
+            .bind(&v.signature)
+            .bind(veil_core::now_millis())
+            .execute(&mut *c)
+            .await?;
+            sqlx::query("UPDATE devices SET pending = FALSE WHERE id = $1").bind(device).execute(&mut *c).await?;
+            Ok(device)
+        })
+    })
+    .await?;
+    crate::audit(&hub.db, None, Some(me.id), "vouch for device", &format!("device {n}")).await;
+    device_list(&hub, &me.name).await
 }
 
 async fn create_project(State(hub): State<HubState>, caller: Caller, Path(name): Path<String>) -> Result<Json<Tips>> {
@@ -128,13 +195,16 @@ async fn fetch(State(hub): State<HubState>, caller: Caller, Path(p): Path<String
 }
 
 async fn objects(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, body: Bytes) -> Result<Json<veil_core::hub::wire::Uploaded>> {
-    caller.signed_in()?;
+    let me = caller.signed_in()?.id;
     let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
     if !project.participant(&viewer) {
         return Err(Error::forbidden("you are not in this project"));
     }
-    let stored = sync::upload(&hub, project.id, body).await?;
-    Ok(Json(veil_core::hub::wire::Uploaded { stored }))
+    let receipts = sync::upload(&hub, project.id, me, body).await?;
+    Ok(Json(veil_core::hub::wire::Uploaded {
+        stored: receipts.len(),
+        receipts,
+    }))
 }
 
 async fn push(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Json(req): Json<PushRequest>) -> Result<Json<PushResult>> {

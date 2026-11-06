@@ -4,6 +4,8 @@
 //! ```text
 //! POST /v1/auth/challenge                 ChallengeRequest  → Challenge
 //! POST /v1/auth/login                     LoginRequest      → Session
+//! GET  /v1/people/{name}/devices                            → Devices
+//! POST /v1/devices/vouch                  VouchRequest      → Devices
 //! GET  /v1/projects/{p}/tips                                → Tips
 //! POST /v1/projects/{p}/history           HistoryRequest    → frames (snapshots)
 //! POST /v1/projects/{p}/fetch             FetchRequest      → frames (trees, blobs)
@@ -119,6 +121,10 @@ pub struct FetchRequest {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Uploaded {
     pub stored: usize,
+    /// One receipt per object, in the order sent: what a push shows for
+    /// the objects it names (BUG-824).
+    #[serde(default)]
+    pub receipts: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -135,6 +141,11 @@ pub struct PushRequest {
     pub updates: Vec<BranchUpdate>,
     #[serde(default)]
     pub force: bool,
+    /// The upload receipts of the objects this push names, by id. Every
+    /// object the push introduces needs one, unless it is the entry at the
+    /// same path in one of the snapshot's parents (BUG-824).
+    #[serde(default)]
+    pub receipts: BTreeMap<ObjectId, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -175,12 +186,78 @@ pub struct GroupChange {
     pub people: Vec<String>,
 }
 
-/// A person's registered devices, as full public identities: what an
-/// admin's device wraps secret keys to (`docs/HUB.md` §6).
+/// A person's devices, as the server lists them, with the vouches it
+/// stores. **Never enough on its own to wrap a key:** a device receives a
+/// secret key only through a chain the server cannot forge (`docs/HUB.md`
+/// §13.11).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Devices {
     pub person: String,
+    /// Active devices, as full public identities.
     pub identities: Vec<String>,
+    /// Devices that signed in under this person's name and wait for one of
+    /// their devices to vouch for them.
+    #[serde(default)]
+    pub pending: Vec<String>,
+    #[serde(default)]
+    pub vouches: Vec<Vouch>,
+}
+
+/// One device's signature saying another device is its person's too.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Vouch {
+    /// The full public identity vouched for.
+    pub device: String,
+    /// The Ed25519 key (hex) that signed.
+    pub by: String,
+    /// Signature (context `hub-device`) over [`vouch_message`] of `device`.
+    pub signature: String,
+}
+
+/// `POST /v1/devices/vouch`: the signed-in device vouches for another
+/// device of its person (pending or not).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VouchRequest {
+    pub device: String,
+    pub signature: String,
+}
+
+/// What a vouch signs: the vouched device's X25519 ‖ Ed25519 public keys.
+/// `None` for an identity without a signing key.
+pub fn vouch_message(id: &crate::identity::PublicIdentity) -> Option<Vec<u8>> {
+    let ed = id.ed25519?;
+    let mut m = id.x25519.to_vec();
+    m.extend_from_slice(&ed);
+    Some(m)
+}
+
+/// Does `v` verify for the device it names?
+pub fn vouch_valid(v: &Vouch) -> bool {
+    let Ok(id) = crate::identity::parse_public_identity(&v.device) else { return false };
+    vouch_message(&id).is_some_and(|m| {
+        crate::identity::verify_signature(&v.by, crate::crypto::domains::SIG_CONTEXT_HUB_DEVICE, &m, &v.signature)
+    })
+}
+
+/// A device's fingerprint, `4F2A-9C1E-77B0-D3E5-A1C2`: the first 80 bits
+/// of a BLAKE3 `derive_key` over its Ed25519 ‖ X25519 public keys. What
+/// people compare out of band (`docs/HUB.md` §13.11). `None` for an
+/// identity without a signing key.
+pub fn device_fingerprint(id: &crate::identity::PublicIdentity) -> Option<String> {
+    let ed = id.ed25519?;
+    let mut h = blake3::Hasher::new_derive_key(crate::crypto::domains::HUB_DEVICE_FINGERPRINT);
+    h.update(&ed);
+    h.update(&id.x25519);
+    let hex = hex::encode_upper(&h.finalize().as_bytes()[..10]);
+    Some(hex.as_bytes().chunks(4).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join("-"))
+}
+
+/// A fingerprint as typed (any case, with or without dashes or spaces),
+/// in the form [`device_fingerprint`] prints; `None` if it is not one.
+pub fn normalize_fingerprint(s: &str) -> Option<String> {
+    let hex: String = s.chars().filter(|c| !matches!(c, '-' | ' ')).collect::<String>().to_ascii_uppercase();
+    (hex.len() == 20 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| hex.as_bytes().chunks(4).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join("-"))
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -243,5 +320,24 @@ mod tests {
         bad[40] ^= 1;
         assert!(read_frames(&bad).is_err());
         assert!(read_frames(&body[..body.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn vouches_and_fingerprints() {
+        let alice = crate::Identity::generate("alice");
+        let laptop = crate::Identity::generate("alice");
+        let other = crate::Identity::generate("mal");
+        let pid = |i: &crate::Identity| crate::identity::parse_public_identity(&i.public_id()).unwrap();
+        let fp = device_fingerprint(&pid(&laptop)).unwrap();
+        assert_eq!(fp.len(), 24);
+        assert_eq!(normalize_fingerprint(&fp.to_lowercase().replace('-', " ")).as_deref(), Some(fp.as_str()));
+        assert_ne!(fp, device_fingerprint(&pid(&other)).unwrap());
+        assert!(normalize_fingerprint("4F2A-9C1E").is_none());
+        let sig = alice.sign(crate::crypto::domains::SIG_CONTEXT_HUB_DEVICE, &vouch_message(&pid(&laptop)).unwrap());
+        let v = Vouch { device: laptop.public_id(), by: alice.verifying_hex(), signature: sig };
+        assert!(vouch_valid(&v));
+        // Moved to another device, or claimed by another key: refused.
+        assert!(!vouch_valid(&Vouch { device: other.public_id(), ..v.clone() }));
+        assert!(!vouch_valid(&Vouch { by: other.verifying_hex(), ..v }));
     }
 }

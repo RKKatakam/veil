@@ -81,6 +81,15 @@ impl TestHub {
         p
     }
 
+    /// A new device of `of`'s: it signs in under their name and waits for
+    /// one of their devices to confirm it (pending; `vl login` fails).
+    pub fn new_device_of(&self, of: &Person) -> Person {
+        let p = Person::new(self, &of.name);
+        let out = p.fails(p.home.path(), &["login", &format!("veil://{}", self.authority()), "--name", &p.name, "--ca", self.ca.to_str().unwrap()]);
+        assert!(out.contains("vl identity confirm"), "{out}");
+        p
+    }
+
     /// Anyone on Earth: never signed in.
     pub fn anyone(&self) -> Person {
         Person::new(self, "anyone")
@@ -122,17 +131,27 @@ impl Person {
         }
     }
 
-    pub fn run(&self, dir: &Path, args: &[&str]) -> Output {
-        // `timeout` ends a `vl` that never returns: the test then fails.
-        Command::new("timeout")
-            .arg("300")
-            .arg(vl_bin())
-            .args(args)
+    /// `vl args` in `dir` as this person.
+    pub fn command(&self, dir: &Path, args: &[&str]) -> Command {
+        let mut c = Command::new(vl_bin());
+        c.args(args)
             .current_dir(dir)
             .env("VEIL_HOME", self.home.path().join("veil"))
             .env("VEIL_USER", &self.name)
             .env("VEIL_HUB_CA", &self.ca)
-            .env("NO_COLOR", "1")
+            .env("NO_COLOR", "1");
+        c
+    }
+
+    pub fn run(&self, dir: &Path, args: &[&str]) -> Output {
+        // `timeout` ends a `vl` that never returns: the test then fails.
+        let c = self.command(dir, args);
+        Command::new("timeout")
+            .arg("300")
+            .arg(c.get_program())
+            .args(c.get_args())
+            .envs(c.get_envs().filter_map(|(k, v)| Some((k, v?))))
+            .current_dir(dir)
             .output()
             .unwrap()
     }
@@ -158,6 +177,14 @@ impl Person {
 
     pub fn identity(&self) -> Identity {
         Identity::from_json(&std::fs::read_to_string(self.home.path().join("veil/identity.json")).unwrap()).unwrap()
+    }
+
+    /// This device's fingerprint, as `vl identity show` prints it: what
+    /// the person reads to an admin.
+    pub fn fingerprint(&self) -> String {
+        let out = self.ok(self.home.path(), &["identity", "show"]);
+        let line = out.lines().find(|l| l.starts_with("device ")).expect("vl identity show prints the device fingerprint");
+        line.split_whitespace().nth(1).unwrap().to_string()
     }
 
     pub fn token(&self) -> String {
@@ -415,9 +442,10 @@ pub fn setup_project(hub: &TestHub) -> Project {
     for g in ["devs", "finance", "security"] {
         admin.ok(&dir, &["group", "create", g]);
     }
-    admin.ok(&dir, &["group", "add", "devs", &dev.name]);
-    admin.ok(&dir, &["group", "add", "finance", &fin.name]);
-    admin.ok(&dir, &["group", "add", "security", &sec.name]);
+    // The admin confirms each person's first device (docs/HUB.md §13.11).
+    admin.ok(&dir, &["group", "add", "devs", &dev.name, "--confirm", &dev.fingerprint()]);
+    admin.ok(&dir, &["group", "add", "finance", &fin.name, "--confirm", &fin.fingerprint()]);
+    admin.ok(&dir, &["group", "add", "security", &sec.name, "--confirm", &sec.fingerprint()]);
     admin.ok(&dir, &["access", "src/", "public", "devs"]);
     admin.ok(&dir, &["access", &format!("src/{NESTED_DIR}/"), "security"]);
     admin.ok(&dir, &["access", &format!("{BILL_DIR}/"), "finance"]);
@@ -591,13 +619,7 @@ impl<'a> Craft<'a> {
         };
         s.sign(&self.identity);
         let id = self.put(O::Snapshot(s));
-        let up = self.api.upload(&self.token, &self.project, &self.objects);
-        assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
-        self.api.post_json(
-            Some(&self.token),
-            &format!("/v1/projects/{}/push", self.project),
-            &serde_json::json!({"updates": [{"branch": branch, "expected": self.tip.hex(), "new": id.hex()}]}),
-        )
+        self.send(serde_json::json!({"updates": [{"branch": branch, "expected": self.tip.hex(), "new": id.hex()}]}))
     }
 }
 
@@ -622,13 +644,7 @@ impl Craft<'_> {
         };
         s.sign(&self.identity);
         let id = self.put(O::Snapshot(s));
-        let up = self.api.upload(&self.token, &self.project, &self.objects);
-        assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
-        self.api.post_json(
-            Some(&self.token),
-            &format!("/v1/projects/{}/push", self.project),
-            &serde_json::json!({"updates": [{"branch": branch, "expected": self.tip.hex(), "new": id.hex()}]}),
-        )
+        self.send(serde_json::json!({"updates": [{"branch": branch, "expected": self.tip.hex(), "new": id.hex()}]}))
     }
 
     /// Commit and push to `branch` (expected at `expected`), letting `edit`
@@ -651,14 +667,53 @@ impl Craft<'_> {
         edit(&mut s);
         s.sign(&self.identity);
         let id = self.put(O::Snapshot(s));
+        let r = self.send(serde_json::json!({"updates": [{"branch": branch, "expected": expected.map(|e| e.hex()), "new": id.hex()}]}));
+        (id, r)
+    }
+
+    /// Upload what the crafter made, then push `body` with the receipts
+    /// the server gave for it, as `vl` does.
+    fn send(&self, mut body: serde_json::Value) -> Reply {
         let up = self.api.upload(&self.token, &self.project, &self.objects);
         assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+        let receipts = up.json()["receipts"].as_array().unwrap().clone();
+        let map: serde_json::Map<String, serde_json::Value> =
+            self.objects.iter().zip(receipts).map(|((id, _), r)| (id.hex(), r)).collect();
+        body["receipts"] = serde_json::Value::Object(map);
+        self.api.post_json(Some(&self.token), &format!("/v1/projects/{}/push", self.project), &body)
+    }
+
+    /// Point `path` at a copy of object `id` (fetched where the crafter
+    /// can read it, at `from` in snapshot `snap`), uploaded like any write.
+    pub fn copy(&mut self, path: &str, snap: ObjectId, from: &str, id: ObjectId, size: u64) {
         let r = self.api.post_json(
             Some(&self.token),
-            &format!("/v1/projects/{}/push", self.project),
-            &serde_json::json!({"updates": [{"branch": branch, "expected": expected.map(|e| e.hex()), "new": id.hex()}]}),
+            &format!("/v1/projects/{}/fetch", self.project),
+            &serde_json::json!({"snapshot": snap.hex(), "objects": [{"path": from, "id": id.hex()}]}),
         );
-        (id, r)
+        let (got, raw) = r.frames().into_iter().next().unwrap();
+        assert_eq!(got, id);
+        self.objects.push((id, raw));
+        self.refer(path, id, size);
+    }
+
+    /// Upload `o` with the push and return its id.
+    pub fn put_object(&mut self, o: O) -> ObjectId {
+        self.put(o)
+    }
+
+    /// Set `path` to `entry` as given (its object is not uploaded).
+    pub fn set_entry(&mut self, path: &str, mut entry: TreeEntry) {
+        let parts: Vec<&str> = path.split('/').collect();
+        entry.name = parts.last().unwrap().to_string();
+        self.root = self.set_at("", Some(self.root), &parts, entry);
+    }
+
+    /// Point `path` at directory tree `id` without uploading it.
+    pub fn refer_dir(&mut self, path: &str, id: ObjectId) {
+        let parts: Vec<&str> = path.split('/').collect();
+        let entry = TreeEntry::dir(parts.last().unwrap(), id);
+        self.root = self.set_at("", Some(self.root), &parts, entry);
     }
 
     /// Point `path` at object `id` without uploading it.
@@ -704,12 +759,6 @@ impl Craft<'_> {
         };
         s.sign(&self.identity);
         let id = self.put(O::Snapshot(s));
-        let up = self.api.upload(&self.token, &self.project, &self.objects);
-        assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
-        self.api.post_json(
-            Some(&self.token),
-            &format!("/v1/projects/{}/push", self.project),
-            &serde_json::json!({"updates": [{"branch": branch, "expected": expected.map(|e| e.hex()), "new": id.hex()}]}),
-        )
+        self.send(serde_json::json!({"updates": [{"branch": branch, "expected": expected.map(|e| e.hex()), "new": id.hex()}]}))
     }
 }

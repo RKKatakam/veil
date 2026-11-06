@@ -379,6 +379,77 @@ fn an_interrupted_pack_write_leaves_no_visible_pack() {
     assert!(report.is_ok() && report.count(Severity::Warning) == 0, "{report:?}");
 }
 
+/// A snapshot with many new files writes them as one pack, not as loose
+/// objects (a fsync and a rename each): the pack is made durable, then its
+/// index, durably, and only then the operation and its head. Trees and
+/// the snapshot stay loose (staged, renamed between the barriers), no file
+/// content does, nothing is left staged, and every file reads back.
+#[test]
+fn many_new_objects_are_one_pack_published_before_the_operation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let id = Identity::generate("alice");
+    let disk = Arc::new(DiskBackend::new(tmp.path().join("a")));
+    let rec = Arc::new(Recorder {
+        inner: disk.clone(),
+        calls: Mutex::default(),
+    });
+    let mut repo = Repo::init(rec.clone(), Some(id.clone()), "alice").unwrap();
+    for i in 0..300 {
+        disk.write(&p(&format!("src/d{}/f{i}.txt", i % 7)), &noise(i, 3000)).unwrap();
+    }
+    let dir = |d: &str| -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(tmp.path().join("a/.veil/objects").join(d)).map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+        v.sort();
+        v
+    };
+    // `init`'s own few objects (the root, the first change) are loose.
+    let loose_before: Vec<String> = dir("").into_iter().filter(|n| n.len() == 2).flat_map(|d| dir(&d)).collect();
+    rec.take();
+    repo.snapshot_workspace("default", &*rec).unwrap();
+    let calls = rec.take();
+    let pos = |pred: &dyn Fn(&Call) -> bool| calls.iter().position(pred).unwrap_or_else(|| panic!("{calls:?}"));
+    let idx = pos(&|c| matches!(c, Call::Write(p) if p.starts_with(".veil/objects/pack/") && p.ends_with(".idx")));
+    let op = pos(&|c| matches!(c, Call::Write(p) if p.starts_with(".veil/ops/")));
+    let head = pos(&|c| matches!(c, Call::CreateNew(p) if p.starts_with(".veil/op_heads/")));
+    assert!(idx < op && op < head, "{calls:?}");
+    let loose_writes = calls.iter().filter(|c| matches!(c, Call::Unsynced(p) if p.starts_with(".veil/objects/"))).count();
+    // The root, `src`, its 7 directories and the snapshot.
+    assert_eq!(loose_writes, 10, "only trees and the snapshot are loose: {calls:?}");
+    let packs = dir("pack");
+    assert_eq!(packs.len(), 2, "{packs:?}");
+    assert!(packs[0].ends_with(".idx") && packs[1].ends_with(".pack"), "{packs:?}");
+    assert!(dir("incoming").iter().all(|n| !n.starts_with("tx-")), "the staging is removed");
+    let loose: Vec<String> = dir("").into_iter().filter(|n| n.len() == 2).flat_map(|d| dir(&d).into_iter().map(move |f| format!("{d}/{f}"))).collect();
+    assert_eq!(loose.len(), loose_before.len() + 10, "{loose:?}");
+    for f in &loose {
+        let raw = std::fs::read(tmp.path().join("a/.veil/objects").join(f)).unwrap();
+        assert!(!veil_core::object::Object::is_blob_raw(&raw), "file content written loose: {f}");
+    }
+    // Every file reads back, from a fresh process.
+    drop(repo);
+    let repo = Repo::open(disk.clone(), Some(id.clone()), "alice").unwrap();
+    let tree = repo.snapshot(&repo.workspace_wc("default").unwrap()).unwrap().tree;
+    for i in 0..300 {
+        let e = veil_core::tree::lookup(repo.store(), &tree, &p(&format!("src/d{}/f{i}.txt", i % 7))).unwrap().unwrap();
+        assert_eq!(repo.store().read_entry(&e).unwrap(), noise(i, 3000));
+    }
+    let report = veil_core::fsck::fsck(disk, Some(id)).unwrap();
+    assert!(report.findings.iter().all(|f| !matches!(f.severity, veil_core::fsck::Severity::Corrupt | veil_core::fsck::Severity::Warning)), "{:?}", report.findings);
+}
+
+/// A few new objects stay loose (staged, one barrier, renamed, a second
+/// barrier): a one-file commit writes no pack.
+#[test]
+fn few_new_objects_stay_loose() {
+    let tmp = tempfile::tempdir().unwrap();
+    let disk = Arc::new(DiskBackend::new(tmp.path().join("a")));
+    let mut repo = Repo::init(disk.clone(), Some(Identity::generate("alice")), "alice").unwrap();
+    disk.write(&p("a.txt"), b"one\n").unwrap();
+    repo.snapshot_workspace("default", &*disk).unwrap();
+    repo.commit_working_copy("default", "c").unwrap();
+    assert!(std::fs::read_dir(tmp.path().join("a/.veil/objects/pack")).map(|d| d.count()).unwrap_or(0) == 0);
+}
+
 /// BUG-800: a pull that writes packs streams each `.pack`, then issues the
 /// store's barrier, then writes the `.idx` durably, before the operation
 /// and its head; the download spool is gone afterwards.

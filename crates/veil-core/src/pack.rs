@@ -1049,6 +1049,64 @@ impl PackBuilder {
     }
 }
 
+/// The pack entries of `objects` (canonical encodings, each checked
+/// against its id), each compressed as [`PackBuilder::add`] would without
+/// a delta base (sealed objects stored), on up to `threads` threads: for a
+/// transaction that writes many new objects at once (an import), whose
+/// pack is then assembled from them with [`PackWriter::add_entry`].
+pub(crate) fn encode_entries(objects: &[(ObjectId, Vec<u8>)], level: i32, threads: usize) -> Result<Vec<Entry>> {
+    #[cfg(not(feature = "zstd"))]
+    let _ = level;
+    let encode = |chunk: &[(ObjectId, Vec<u8>)]| -> Result<Vec<Entry>> {
+        #[cfg(feature = "zstd")]
+        let mut z = zstd::bulk::Compressor::new(level).map_err(|e| VeilError::repo(format!("zstd: {e}")))?;
+        chunk
+            .iter()
+            .map(|(id, raw)| {
+                if ObjectId::hash(raw) != *id {
+                    return Err(corrupt(id.hex(), "hash mismatch while packing"));
+                }
+                let stored = || Entry {
+                    kind: EntryKind::Stored,
+                    raw_len: raw.len() as u64,
+                    base: None,
+                    data: raw.clone(),
+                };
+                #[cfg(feature = "zstd")]
+                if Object::sealed_scope(raw).is_none() {
+                    let plain = z.compress(raw).map_err(|e| VeilError::repo(format!("zstd: {e}")))?;
+                    if plain.len() < raw.len() {
+                        return Ok(Entry {
+                            kind: EntryKind::Zstd,
+                            raw_len: raw.len() as u64,
+                            base: None,
+                            data: plain,
+                        });
+                    }
+                }
+                Ok(stored())
+            })
+            .collect()
+    };
+    let threads = threads.clamp(1, objects.len().max(1));
+    if threads == 1 || cfg!(not(feature = "os")) {
+        return encode(objects);
+    }
+    let size = objects.len().div_ceil(threads);
+    let parts: Vec<Result<Vec<Entry>>> = std::thread::scope(|s| {
+        let handles: Vec<_> = objects.chunks(size).map(|c| s.spawn(move || encode(c))).collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| Err(VeilError::repo("a packing thread panicked"))))
+            .collect()
+    });
+    let mut out = Vec::with_capacity(objects.len());
+    for p in parts {
+        out.extend(p?);
+    }
+    Ok(out)
+}
+
 /// What a [`PackWriter`] hands its stream at a time.
 const WRITE_CHUNK: usize = 1 << 20;
 

@@ -93,6 +93,135 @@ both.
   file `fsync`s, and the transfer. Times cluster in steps of about 100 ms
   (1,106 / 1,208 ms) from run to run, which is not checkout's.
 
+## Performance round 1: commit one changed file and import (2026-11-06)
+
+**Goal** (orchestrator, revised the same day): beat Git on the same
+machine, on a real disk, with full durability. OpenScion's own numbers
+come from an in-memory build (no disk, no fsync, no compression, client
+and server in one process, no process start; its `benchmarks/README.md`),
+so its 2.5 ms and 22 ms are not like-for-like targets for a durable CLI:
+the in-memory column below measures Veil that way.
+
+**Method.** Release builds, the bench directory in the worktree's
+`.scratch/` on the ext4 NVMe disk (never `/tmp`), the bench's own
+commands (`vl init` in a copy of the generated tree; `vl commit -m` after
+rewriting `d001/f001.txt`; Git: `git init && git add -A && git commit`,
+`git commit -qam`), 2 s between import and the commits (the bench pushes
+in between, so nothing is racy for either tool). Base (`integration` @
+`b78e52d`), this round and Git run **interleaved**, run by run: other
+processes' writes share the ext4 journal and move every fsync's latency,
+so only measurements taken in the same minutes compare. Median of 5 runs,
+three sessions each (the range is over the sessions). The server is not
+involved in these two workloads.
+
+| Files | Workload | Before (ms) | After (ms) | Git (ms) | Veil in memory, in process (ms) | Target (ms) | Beats Git |
+|---:|---|---:|---:|---:|---:|---:|---|
+| 1000 | import a directory | 99–105 | **48–58** | 87–94 | 8.8 | 22.0 | **yes** (1.7×) |
+| 1000 | commit one changed file | 24–40 | **20–27** | 6–16 | 0.9 | 2.5 | no |
+| 10000 | import a directory | 597–616 | **202–208** | 763–764 | 86 | 245.0 | **yes** (3.7×) |
+| 10000 | commit one changed file | 52–53 | **43–44** | 9–10 | 7.4 | 22.0 | no |
+
+- **In memory** (`veil-bench openscion-memory`: `MemoryBackend`, one
+  process, the same engine work: scanning, sealing, the stat cache, the op
+  log), Veil meets all three of these OpenScion targets, before and after
+  this round: clone everything 32 / 303 ms (targets 51 / 544). "Clone one
+  directory" fetches on demand from the server and has no in-memory form.
+- Git makes **no fsync** in either workload here (`strace`: none for
+  `git commit -qam`). Veil's commit makes every object, operation and
+  head durable before it returns.
+
+### Where the time went (spans, instrumented build, 1k / 10k)
+
+| Commit one file | Before | After |
+|---|---:|---:|
+| process start, arguments | 0.5–1.7 | 0.3–0.6 |
+| identity, `Repo::open` (op heads, history index) | 1.5 / 0.4 | 0.5 / 0.3 |
+| stat cache load | 1.1 / 3.1 | 0.4 / 1.7 |
+| policy (parsing, glob compilation) | 2.5 / 3.0 | 1.3 / 0.8 |
+| scan of the working copy (stat, classify, stat-cache lookups, the changed file) | 7.8 / 27 | 6.4 / 20 |
+| of which: the scanner's rules compiled for the changed file | 4.6 / 5–6 | 0–2 (the token rules on another thread; the assignment rule not at all) |
+| snapshot transaction (objects, op, head, index) | 4.6 / 4.5 | 4.0 / 3.7 |
+| stat cache save (fsynced, 940 KB at 10k) | 1.2 / 2.4 | 0 |
+| commit transaction | 9.2 / 4.0 (index compaction) | 4.4 / 3.8 |
+| `checkout.json` (twice), finish | 1.9 / 1.5 | 1.6 / 1.5 |
+| **total in the process** | **33 / 47** | **20 / 33** |
+
+The commit's floor is its durability: two transactions (the automatic
+snapshot, then the commit), each with about eight sequential journal
+commits (objects, their renames, the operation file and its directory,
+the head file and its directory, the history-index layer and its
+directory), plus `checkout.json` twice: about 20 journal commits of
+0.35–0.45 ms on this disk, 7–8 ms, against Git's none.
+
+| Import (`vl init`, 10k) | Before | After |
+|---|---:|---:|
+| scan: read, hash, scan each file, write each object (spans) | 251 ms | |
+| publish the objects (spans) | 410 ms | |
+| whole command (above) | 597–616 ms | 202–208 ms |
+| `fsync` calls (`strace -c -f`) | 10,915 | 407 |
+| `rename` calls | 20,216 | 218 |
+| new objects on disk | about 10,100 loose files | the 10,000 file contents in 2 packs (the 32 MiB buffer spilled once); 109 trees and snapshots loose |
+
+### What changed
+
+1. **Barriers fsync a transaction's files on a thread each** (from two
+   files on; directories stay one worker per 16). A one-file commit's
+   barriers used to fsync their 2–5 files one after another, a journal
+   commit each (`vfs/disk.rs`).
+2. **A transaction's many new file contents are one pack** (256 or more,
+   not in memory): buffered (32 MiB, spilled as a pack beyond), compressed
+   a few MiB at a time on up to 8 threads, the `.pack` durable before its
+   `.idx`, as a pull writes them. Trees and snapshots stay loose until gc,
+   as before, so history reads never decompress them (and the scale
+   benchmark still counts snapshot reads). An import of 10,000 files makes
+   407 fsyncs instead of 10,915 (`store.rs`, `pack.rs`).
+3. **The history index merges once:** what the geometric rule merges in
+   several steps is written as one layer (a commit used to write up to
+   five layer files, two fsyncs each) (`graph_index.rs`).
+4. **The scanner compiles what it uses:** the token rules on a thread
+   started with the command (`secrets::prepare`); the assignment rule's
+   regexes (the costliest, 3.5–6 ms) only for the first text with a
+   keyword, the only text it searches; each rule's capture regex for its
+   first match. What is found is unchanged (`secrets.rs`).
+5. **The stat cache is not rewritten for a record that can never vouch**
+   (learnt inside the racy window, as every commit right after an edit
+   is): at 10,000 files that was a 940 KB fsynced write per commit
+   (`statcache.rs`).
+6. **Policy:** glob matchers are no longer compiled one by one (the
+   `GlobSet` does the matching), and the accepted policy is not parsed a
+   second time when it is the working copy's text (`policy.rs`).
+7. `VPath::new` takes an already normal path without splitting and
+   joining it (`vpath.rs`).
+
+Measured and **not** kept: a parallel stat prefetch for the scan (as Git's
+preload-index): 1.2 ms (5%) at 10,000 files, not worth its threads.
+
+**The 1 GB profile's memory gate** (512 MiB per case), on one generated
+tree, base and this round with `/usr/bin/time`: `vl init` 392 → 405 MiB
+(4.3 → 3.6 s), `vl status` right after it 459 → 462 MiB. A first version
+packed trees and snapshots too and kept a compressed copy of the whole
+buffer: 497 and 525 MiB, over the gate; both were changed. The one
+regression left: that status lists all 35,000 files just imported and
+verifies each one's sealing against its object, which for a packed file
+content means decompressing it, as after any `vl gc`: 1.5 → 2.0 s.
+
+### What remains, and why
+
+- **Commit one file vs Git** needs one of three changes that are owner
+  decisions, not overhead:
+  1. *One transaction per `vl commit`* (the automatic snapshot and the
+     commit as one operation): halves the journal commits (about 4 ms),
+     but changes what `vl op log` shows and what `vl undo` takes back.
+  2. *The history index as designed:* `graph_index.rs` documents its
+     layers as "never synced" (a checksummed cache, rebuilt when damaged),
+     but writes them with `create_new`, which fsyncs the file and its
+     directory: 0.8–1.5 ms per transaction. This round kept every fsync.
+  3. *No scan* (a file-system watcher daemon, Git's fsmonitor): the
+     10,000-file scan is 14 ms of CPU.
+- **Import** beats Git 1.7–3.7×. What is left is reading each file
+  through the no-follow walk (about 12 system calls per file), hashing,
+  scanning and compressing, on one thread except the compression.
+
 ## Next
 
 1. The transfer and the per-file walks are what separate the 10k clone
@@ -102,5 +231,5 @@ both.
    for checkout's steps instead of a walk from the root for each.
 2. Clone one directory (74 ms at 10k, 62 ms at 1k) is now mostly the fixed
    cost of `vl` starting, creating a repository and signing in.
-3. Commit one changed file: the fixed per-command overhead (opening the
-   repository, keys, the op log, the working-copy scan).
+3. Commit one changed file: see "What remains" in performance round 1
+   above (two transactions' journal commits, the scan).

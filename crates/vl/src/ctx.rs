@@ -197,6 +197,43 @@ pub struct Ctx {
     pub bare: bool,
 }
 
+/// Written by `vl clone` before it fetches anything, removed once its
+/// checkout is done (BUG-837). A clone killed before its checkout started
+/// holds part of the project's history and none of its files: commands
+/// refuse it instead of showing an empty project. Once the checkout's
+/// journal exists everything was fetched, and the journal finishes the
+/// checkout (BUG-830).
+pub const CLONE_INCOMPLETE: &str = ".veil/local/clone-incomplete";
+
+/// Mark `fs` as a clone that has not finished ([`CLONE_INCOMPLETE`]).
+pub fn mark_clone_incomplete(fs: &DiskBackend) -> Result<()> {
+    fs.write(&VPath::new(CLONE_INCOMPLETE)?, b"vl clone did not finish\n")?;
+    Ok(())
+}
+
+/// The clone in `fs` finished ([`CLONE_INCOMPLETE`]).
+pub fn mark_clone_complete(fs: &DiskBackend) -> Result<()> {
+    fs.remove_file(&VPath::new(CLONE_INCOMPLETE)?)?;
+    Ok(())
+}
+
+/// Refuse a clone killed before it fetched everything (see
+/// [`CLONE_INCOMPLETE`]).
+fn check_clone_finished(root: &Path) -> Result<()> {
+    if !root.join(CLONE_INCOMPLETE).exists() {
+        return Ok(());
+    }
+    if root.join(veil_core::working_copy::CHECKOUT_STATE_PATH).exists() {
+        // Everything was fetched; the checkout's journal finishes it.
+        let _ = std::fs::remove_file(root.join(CLONE_INCOMPLETE));
+        return Ok(());
+    }
+    bail!(
+        "{} is a clone that was interrupted before it fetched the project: remove it and clone again",
+        root.display()
+    )
+}
+
 pub fn find_root(start: &Path) -> Option<PathBuf> {
     let mut cur = Some(start);
     while let Some(d) = cur {
@@ -271,7 +308,11 @@ impl Ctx {
             None => std::env::current_dir()?,
         };
         let root = find_root(&start).ok_or_else(|| anyhow!("no Veil repository found in {} or its parents (run `vl init`)", start.display()))?;
+        check_clone_finished(&root)?;
         if snapshot {
+            // The snapshot may scan changed files: the scanner's rules
+            // compile on another thread meanwhile.
+            veil_core::secrets::prepare();
             // What was written in mounted workspaces is recorded first, as
             // the project directory is below.
             crate::mount::record_live(&root);

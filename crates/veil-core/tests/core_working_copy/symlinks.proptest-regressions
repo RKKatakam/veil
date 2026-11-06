@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc f0f1812058354d8ea0e6d820d61a296b70ac861f4dc1a7636973617c8d53541e # shrinks to existing = [("c", Link("OUTSIDE")), ("c/a/a", File(0))], trees = [[("a", File(0))]]
 cc e484ba9d80013c8b1cf3f2f774145c531e2558daf2ffbeea3586fb62dce48978 # shrinks to existing = [("c", Link(".."))], trees = [[("c", Link("."))], [("c", Link("."))]]
+cc e8e6e4df9667b320c13434a5b70eba5748ed35be03874ffef97f26dc63a370d1 # shrinks to existing = [], trees = [[("a/a", File(0))], [("a", Link("a"))]]

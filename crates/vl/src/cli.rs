@@ -974,6 +974,20 @@ pub enum IdentityCmd {
         #[arg(long)]
         revoke_old: bool,
     },
+    /// Confirm that another device of yours is yours, on a Veil server.
+    ///
+    /// The new device signs in with `vl login URL --name YOU` and shows its
+    /// fingerprint. Run this on a device you already use: it signs that
+    /// device with this one, and the server lets it sign in. Admins then
+    /// grant it the project's secret keys without asking you again.
+    Confirm {
+        /// The new device's fingerprint (`vl identity show` on it).
+        fingerprint: String,
+        /// The server (`veil://host[:port]`); default: the one this device
+        /// is signed in to.
+        #[arg(long)]
+        server: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -985,11 +999,22 @@ pub enum GroupCmd {
         name: String,
     },
     /// Add people to a group (admins and the group's managers). An admin
-    /// device also grants them the keys of the project's secrets.
+    /// device also grants them the keys of the project's secrets, on their
+    /// confirmed devices only.
+    ///
+    /// A person's first device must be confirmed by you: `vl` shows
+    /// `confirm alice's device: 4F2A-…`; compare it with what `vl identity
+    /// show` prints on alice's device, then run the command again with
+    /// `--confirm`. Their later devices are confirmed by themselves
+    /// (`vl identity confirm`).
     Add {
         group: String,
         #[arg(required = true)]
         people: Vec<String>,
+        /// A device fingerprint you have checked with its owner (one
+        /// person at a time).
+        #[arg(long, value_name = "FINGERPRINT")]
+        confirm: Vec<String>,
     },
     /// Remove people from a group (admins and the group's managers).
     Remove {

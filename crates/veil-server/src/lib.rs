@@ -34,6 +34,9 @@ pub struct Hub {
     /// The server's own signing identity: projected snapshots are signed
     /// with it.
     pub identity: Identity,
+    /// The MAC key of upload receipts (`sync::receipt`), derived from the
+    /// random secret in `<data>/hub-receipt-key`.
+    pub receipt_key: [u8; 32],
     pub session_ttl_ms: i64,
     /// The TLS certificate (leaf, DER): sign-in accepts only signatures
     /// for a server name it is valid for.
@@ -96,10 +99,24 @@ fn server_identity(data_dir: &std::path::Path) -> Result<Identity> {
     Ok(id)
 }
 
+/// Load or create the server's upload-receipt secret in `data_dir`, and
+/// derive the receipt MAC key from it. Servers sharing the data directory
+/// accept each other's receipts.
+fn receipt_key(data_dir: &std::path::Path) -> Result<[u8; 32]> {
+    let path = data_dir.join("hub-receipt-key");
+    if !path.exists() {
+        let _ = tls::write_private(&path, hex::encode(veil_core::crypto::random_bytes::<32>()).as_bytes());
+    }
+    let secret = hex::decode(std::fs::read_to_string(&path)?.trim()).context("reading hub-receipt-key")?;
+    anyhow::ensure!(secret.len() == 32, "hub-receipt-key must hold 32 bytes in hex");
+    Ok(blake3::derive_key(veil_core::crypto::domains::HUB_UPLOAD_RECEIPT, &secret))
+}
+
 /// Connect, migrate and start serving.
 pub async fn start(config: Config) -> Result<Running> {
     std::fs::create_dir_all(&config.data_dir)?;
     let identity = server_identity(&config.data_dir)?;
+    let receipt_key = receipt_key(&config.data_dir)?;
     let (tls, cert_pem, certificate) = tls::server_config(&config.tls, &config.data_dir)?;
     let db = db::connect(&config.database_url, config.db_connections).await.context("connecting to the database")?;
     db::migrate(&db).await.context("migrating the database")?;
@@ -122,6 +139,7 @@ pub async fn start(config: Config) -> Result<Running> {
         objects: Arc::new(store::Objects::new(blob, 256 << 20)),
         trees: LruCache::new(256 << 20),
         identity,
+        receipt_key,
         session_ttl_ms: config.session_ttl.as_millis() as i64,
         certificate,
     });

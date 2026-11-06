@@ -6,6 +6,7 @@
 //! veil-bench run    --profile … --seed N --dir DIR --vl PATH --out RESULTS.json [--agents 4,16,64] …
 //! veil-bench report RESULTS.json
 //! veil-bench openscion --vl PATH --server PATH --database-url URL --dir DIR --out RESULTS.json
+//! veil-bench openscion-memory --out RESULTS.json
 //! ```
 //!
 //! Every measured command is a separate process of the release `vl`
@@ -83,6 +84,19 @@ enum Cmd {
         /// Bench directory (created; everything is written below it).
         #[arg(long)]
         dir: PathBuf,
+        /// Repository sizes, in 4 KiB files.
+        #[arg(long, value_delimiter = ',', default_value = "1000,10000")]
+        files: Vec<usize>,
+        /// Repetitions per case (the median is reported).
+        #[arg(long, default_value_t = 5)]
+        runs: usize,
+        /// Results JSON (a Markdown table is written beside it).
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// The OpenScion workloads as OpenScion measures them: in one process,
+    /// in memory (no process start, no disk, no fsync).
+    OpenscionMemory {
         /// Repository sizes, in 4 KiB files.
         #[arg(long, value_delimiter = ',', default_value = "1000,10000")]
         files: Vec<usize>,
@@ -227,6 +241,14 @@ fn main() -> Result<()> {
             })?;
             std::fs::write(&out, serde_json::to_vec_pretty(&v)?)?;
             let md = openscion::markdown(&v)?;
+            std::fs::write(out.with_extension("md"), &md)?;
+            print!("{md}");
+            Ok(())
+        }
+        Cmd::OpenscionMemory { files, runs, out } => {
+            let v = openscion::run_in_memory(&files, runs)?;
+            std::fs::write(&out, serde_json::to_vec_pretty(&v)?)?;
+            let md = openscion::markdown_in_memory(&v)?;
             std::fs::write(out.with_extension("md"), &md)?;
             print!("{md}");
             Ok(())

@@ -526,7 +526,24 @@ fn sweep(name: &str, target: Target, op: Op) {
 /// [`sweep`]; `unsynced` says whether the operation writes anything not
 /// yet covered by a barrier (gc writes everything durably).
 fn sweep_with(name: &str, target: Target, op: Op, unsynced: bool) {
+    sweep_in(world(), name, target, op, unsynced)
+}
+
+/// [`world`] with [`LARGE`] more new files in Alice's working copy: a
+/// snapshot of it writes its new objects as one pack.
+fn large_world() -> World {
     let w = world();
+    for i in 0..LARGE {
+        w.local.write(&p(&format!("bulk/d{}/f{i}.txt", i % 7)), format!("bulk file {i}\n").as_bytes()).unwrap();
+    }
+    w
+}
+
+/// More new objects than a transaction writes loose (`TX_PACK_MIN`).
+const LARGE: usize = 300;
+
+/// [`sweep_with`] in world `w`.
+fn sweep_in(w: World, name: &str, target: Target, op: Op, unsynced: bool) {
     let mut crashes = 0;
     let mut torn = 0;
     for mode in [Crash::BeforeWrite, Crash::AfterWrite, Crash::PowerLoss] {
@@ -626,7 +643,11 @@ fn sweep_with(name: &str, target: Target, op: Op, unsynced: bool) {
 /// intact, and everything the retry recorded must still be readable (a
 /// reachable torn object is corruption for `fsck`).
 fn eio_sweep(name: &str, target: Target, op: Op) {
-    let w = world();
+    eio_sweep_in(world(), name, target, op)
+}
+
+/// [`eio_sweep`] in world `w`.
+fn eio_sweep_in(w: World, name: &str, target: Target, op: Op) {
     for refuse_removes in [false, true] {
         let mut failures = 0;
         for fail_at in 0..1000 {
@@ -695,6 +716,34 @@ fn crash_during_snapshot() {
         assert!(out.changed || out.report.files > 0);
         Ok(())
     });
+}
+
+/// A snapshot with many new files publishes them as one pack (made
+/// durable, then its index) instead of loose objects: a crash at any point
+/// leaves the snapshot recorded completely or not at all, with every new
+/// file readable.
+#[test]
+fn crash_during_large_snapshot() {
+    // Nothing is written unsynced: the pack and its index are durable
+    // writes, then the operation's.
+    sweep_in(large_world(), "large snapshot", Target::Local, large_snapshot, false);
+}
+
+#[test]
+fn eio_during_large_snapshot() {
+    eio_sweep_in(large_world(), "large snapshot", Target::Local, large_snapshot);
+}
+
+fn large_snapshot(env: &Env) -> Result<()> {
+    let mut repo = env.open(&env.local)?;
+    repo.snapshot_workspace(WS, &*env.local)?;
+    let tree = repo.snapshot(&repo.workspace_wc(WS)?)?.tree;
+    for i in [0, LARGE / 2, LARGE - 1] {
+        let path = p(&format!("bulk/d{}/f{i}.txt", i % 7));
+        let e = lookup(repo.store(), &tree, &path)?.expect("recorded");
+        assert_eq!(repo.store().read_entry(&e)?, format!("bulk file {i}\n").into_bytes());
+    }
+    Ok(())
 }
 
 #[test]

@@ -344,9 +344,10 @@ impl StatCache {
             self.key = Some(key);
             self.dirty = true;
         }
+        let old = std::mem::take(&mut self.records);
         CacheRun {
-            old: std::mem::take(&mut self.records),
-            new: HashMap::new(),
+            new: HashMap::with_capacity(old.len()),
+            old,
             verified_at: clock.now,
             exact: clock.exact,
             changed: false,
@@ -410,7 +411,14 @@ impl CacheRun {
         if let Some(old) = self.old.get(path) {
             rec.absorb(old);
         }
-        self.changed |= self.old.get(path) != Some(&rec);
+        // A record verified within the racy window of the file's last
+        // change (a file edited just before the command, as in every `vl
+        // commit` right after an edit) can never vouch for it: both
+        // stamps are fixed. It is kept for this run, but is no reason to
+        // rewrite the whole cache (a 1 MB fsynced write at 10,000 files);
+        // the next run reads the file again either way.
+        let useful = rec.vouches_for(&rec.stamp, self.exact);
+        self.changed |= useful && self.old.get(path) != Some(&rec);
         self.new.insert(path.clone(), rec);
     }
 }

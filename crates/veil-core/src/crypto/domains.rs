@@ -84,6 +84,10 @@ pub const SIG_CONTEXT_TAG: &str = "tag";
 /// over `hub ‖ 0x00 ‖ challenge` (the server's name as the client dialled
 /// it, and the single-use random challenge it issued).
 pub const SIG_CONTEXT_HUB_LOGIN: &str = "hub-login";
+/// Signature context: one device's vouch that another device is its
+/// person's too (`docs/HUB.md` §13.11), over the vouched device's X25519
+/// ‖ Ed25519 public keys (`hub::wire::vouch_message`).
+pub const SIG_CONTEXT_HUB_DEVICE: &str = "hub-device";
 
 /// Every signature context, for the uniqueness test.
 pub const SIG_CONTEXTS: &[&str] = &[
@@ -95,6 +99,7 @@ pub const SIG_CONTEXTS: &[&str] = &[
     SIG_CONTEXT_VAULT_ENTRY,
     SIG_CONTEXT_TAG,
     SIG_CONTEXT_HUB_LOGIN,
+    SIG_CONTEXT_HUB_DEVICE,
 ];
 
 // ---- key rings and embargoes (keychain.rs) --------------------------------
@@ -144,6 +149,18 @@ pub const GENERATION_SEPARATOR: char = '#';
 /// secret; equal for two viewers who read the same paths.
 pub const HUB_VIEW_KEY: &str = "veil 2026 hub view-key v1";
 
+/// BLAKE3 `derive_key` context of a device's fingerprint, over its Ed25519
+/// ‖ X25519 public keys (first 10 bytes, shown as `4F2A-9C1E-…`): what an
+/// admin compares with a person out of band before their device receives
+/// a secret key (`docs/HUB.md` §13.11). Not secret.
+pub const HUB_DEVICE_FINGERPRINT: &str = "veil 2026 hub device-fingerprint v1";
+
+/// BLAKE3 `derive_key` context of a Veil server's upload-receipt MAC key,
+/// from the server's random receipt secret: a receipt (keyed BLAKE3 over
+/// project ‖ person ‖ object id, first 16 bytes) proves to the server that
+/// this person uploaded that object, so a push may name it (BUG-824).
+pub const HUB_UPLOAD_RECEIPT: &str = "veil 2026 hub upload-receipt v1";
+
 /// Every BLAKE3 `derive_key` context, for the uniqueness test.
 pub const BLAKE3_CONTEXTS: &[&str] = &[
     LEGACY_SIV_NONCE,
@@ -155,6 +172,8 @@ pub const BLAKE3_CONTEXTS: &[&str] = &[
     RING_PROOF,
     TEAM_VAULT_HISTORY,
     HUB_VIEW_KEY,
+    HUB_DEVICE_FINGERPRINT,
+    HUB_UPLOAD_RECEIPT,
 ];
 
 #[cfg(test)]
@@ -170,7 +189,12 @@ mod tests {
         // Contexts added after the first seven are pinned on their own.
         assert_eq!(
             BLAKE3_CONTEXTS[7..],
-            ["veil 2026 team-vault history v1", "veil 2026 hub view-key v1"],
+            [
+                "veil 2026 team-vault history v1",
+                "veil 2026 hub view-key v1",
+                "veil 2026 hub device-fingerprint v1",
+                "veil 2026 hub upload-receipt v1"
+            ],
             "a context changed or was reordered"
         );
         let mut all: Vec<&str> = BLAKE3_CONTEXTS[..7].to_vec();
@@ -192,7 +216,7 @@ mod tests {
             "028e842fb2475981",
             "a signature context changed; that breaks existing signatures. Add a new constant instead."
         );
-        assert_eq!(SIG_CONTEXTS[5..], ["vault-entry", "tag", "hub-login"], "a signature context changed or was reordered");
+        assert_eq!(SIG_CONTEXTS[5..], ["vault-entry", "tag", "hub-login", "hub-device"], "a signature context changed or was reordered");
         let labels = [
             WRAP_LABEL_PREFIX,
             PREV_KEY_LABEL_PREFIX,

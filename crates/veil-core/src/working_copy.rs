@@ -106,6 +106,34 @@ impl CheckoutState {
 }
 
 impl Repo {
+    /// Check snapshot `target` of workspace `ws` out into `fs`, a new,
+    /// empty working copy (a clone), journalled like every move: the
+    /// record says "moving from the root snapshot to `target`" before the
+    /// first file is written, so a clone killed during its checkout is
+    /// finished by the next command instead of having the files it had
+    /// not written recorded as deleted (BUG-830). Returns the saved record.
+    ///
+    /// `partial`: a clone that writes only part of `target` (`vl clone
+    /// --only`) gives the tree that stands for what it never writes
+    /// (`target`'s tree without the directory it writes, its entries kept
+    /// by id and never walked) and the paths it never shows. Checkout then
+    /// writes only what differs from that tree, now and when resumed.
+    pub fn check_out_new(
+        &self,
+        fs: &dyn StorageBackend,
+        ws: &str,
+        target: ObjectId,
+        partial: Option<(ObjectId, Vec<VPath>)>,
+    ) -> Result<(CheckoutState, CheckoutReport)> {
+        let record = match partial {
+            Some((shown, hidden)) => Materialised::shown_as(shown, hidden),
+            None => Materialised::default(),
+        };
+        let mut state = CheckoutState::new(ws, self.root_id(), record);
+        let report = self.move_working_copy(fs, &mut state, ws, target, None)?;
+        Ok((state, report))
+    }
+
     /// Move the working copy `fs`, described by `state`, to snapshot
     /// `target` of workspace `ws`, journalled (see the module
     /// documentation). On return `state` describes `fs` as holding `target`

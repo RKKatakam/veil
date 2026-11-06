@@ -133,7 +133,40 @@ fn without_signature(s: &Snapshot) -> Snapshot {
 }
 
 /// The projection of real snapshot `real` for `viewer` (the module docs).
+/// Its predecessors are projected too (BUG-826).
 pub async fn projected(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, real: ObjectId) -> Result<ObjectId> {
+    Box::pin(projected_inner(hub, project, viewer, real)).await
+}
+
+/// The predecessors of `s` as `viewer` is shown them (BUG-826): a stored
+/// predecessor becomes its projection, kept only if that is still a version
+/// of the same change (not one that touched only what the viewer cannot
+/// see); one the server never stored names nothing on it and is kept.
+/// Terminates: ids are hashes of what they name, so no snapshot is its own
+/// predecessor or ancestor.
+async fn projected_predecessors(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, s: &Snapshot) -> Result<Vec<ObjectId>> {
+    let mut out = Vec::new();
+    for p in &s.predecessors {
+        let stored: Option<String> = sqlx::query_scalar("SELECT id FROM snapshots WHERE project_id = $1 AND id = $2")
+            .bind(project.id)
+            .bind(p.hex())
+            .fetch_optional(&hub.db)
+            .await?;
+        if stored.is_none() {
+            out.push(*p);
+            continue;
+        }
+        let pp = projected(hub, project, viewer, *p).await?;
+        let (p, pp2) = (*p, pp);
+        let same = blocking(hub, project.id, move |src| Ok(src.snapshot(&pp2)?.change_id == src.snapshot(&p)?.change_id)).await?;
+        if same && !out.contains(&pp) {
+            out.push(pp);
+        }
+    }
+    Ok(out)
+}
+
+async fn projected_inner(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, real: ObjectId) -> Result<ObjectId> {
     if viewer.admin {
         return Ok(real);
     }
@@ -189,6 +222,7 @@ pub async fn projected(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, real:
             .fetch_optional(&hub.db)
             .await?;
         let origin = origin.and_then(|o| ObjectId::from_hex(&o).ok());
+        let ppreds = projected_predecessors(hub, project, viewer, &s).await?;
         let (proj_text, bindings, viewer2) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone());
         let hub2 = hub.clone();
         let (result, new_obj) = blocking(hub, project.id, move |src| {
@@ -216,6 +250,7 @@ pub async fn projected(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, real:
             let mut u = without_signature(&s);
             u.tree = ptree;
             u.parents = pparents;
+            u.predecessors = ppreds;
             u.conflicts.retain(|c| view_read(c));
             if u == without_signature(&s) {
                 return Ok((x, None));
@@ -434,6 +469,20 @@ fn entry_at(src: &Source, tree: &ObjectId, path: &str) -> Result<Option<veil_cor
     Ok(None)
 }
 
+/// Every object entry `e` names: its object, its fallback and, for a
+/// conflict, its terms' objects and fallbacks (what `fetch` serves at its
+/// path).
+fn named_ids(src: &Source, e: &veil_core::TreeEntry) -> Result<Vec<ObjectId>> {
+    let mut out = vec![e.id];
+    out.extend(e.fallback);
+    if e.kind == EntryKind::Conflict {
+        if let Object::Conflict(c) = Object::decode(&src.raw(&e.id)?)? {
+            out.extend(c.referenced_ids());
+        }
+    }
+    Ok(out)
+}
+
 /// A common ancestor of real snapshots `a` and `b` (the universal root at
 /// worst): both histories are walked a generation at a time until one
 /// reaches a snapshot the other has seen.
@@ -615,7 +664,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             tip_projection.insert(projected(hub, project, viewer, *t).await?, *t);
         }
     }
-    let signers: HashSet<String> = sqlx::query_scalar::<_, String>("SELECT signing_key FROM devices WHERE removed_at IS NULL")
+    let signers: HashSet<String> = sqlx::query_scalar::<_, String>("SELECT signing_key FROM devices WHERE removed_at IS NULL AND NOT pending")
         .fetch_all(&hub.db)
         .await?
         .into_iter()
@@ -626,6 +675,9 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
         let r = tip_projection.get(id).copied().unwrap_or(reals[0]);
         real_of.insert(*id, r);
     }
+    // What this pusher uploaded (BUG-824): a push names nothing else that
+    // is not already where it was in a parent.
+    let uploaded = Arc::new(receipted(hub, project.id, person, &req.receipts));
     // 2. Complete and check each new snapshot.
     let mut completed: Vec<Completed> = Vec::new();
     for id in &order {
@@ -653,6 +705,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             (project.policy_text.clone(), project.bindings.clone(), viewer.clone(), n.clone(), viewer.admin);
         let hub2 = hub.clone();
         let rp = real_parents.clone();
+        let uploaded = uploaded.clone();
         let c = blocking(hub, project.id, move |src| {
             let p = Project {
                 id: src.project,
@@ -664,11 +717,11 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             };
             let view = p.view(&viewer2);
             let ptrees: Vec<ObjectId> = rp.iter().map(|p| Ok(src.snapshot(p)?.tree)).collect::<Result<_>>()?;
-            let mut g = Graft::new(src, &view);
+            let mut g = Graft::new(src, &view).proving(&uploaded, ptrees.clone());
             let real_tree = g.root(n2.tree, Some(ptrees[0]))?;
             // A merge must not change what the pusher cannot see.
             for other in &ptrees[1..] {
-                let mut g2 = Graft::new(src, &view);
+                let mut g2 = Graft::new(src, &view).proving(&uploaded, ptrees.clone());
                 if g2.root(n2.tree, Some(*other))? != real_tree && !admin {
                     // Compare the hidden parts: the same full tree from either side.
                     return Err(Error::forbidden(
@@ -681,6 +734,26 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             // Store the trees the graft built before checking (the check reads them).
             for (id, raw) in &trees {
                 src.rt.block_on(src.hub.objects.put(src.project, id, Bytes::from(raw.clone())))?;
+            }
+            // Every object a changed path names (its object, fallback and
+            // conflict terms) was uploaded by the pusher, or is named by the
+            // entry at that path in a parent: anything else gets the answer
+            // a missing object gets, stored or not (BUG-824, BUG-834).
+            for c in &g.changes {
+                let Some(e) = &c.new else { continue };
+                let mut before = HashSet::new();
+                for t in &ptrees {
+                    if let Some(pe) = entry_at(src, t, &c.path)? {
+                        before.extend(named_ids(src, &pe)?);
+                    }
+                }
+                let known = |id: &ObjectId| uploaded.contains(id) || before.contains(id);
+                if !known(&e.id) {
+                    return Err(VeilError::Missing(e.id).into());
+                }
+                if let Some(id) = named_ids(src, e)?.into_iter().find(|id| !known(id)) {
+                    return Err(VeilError::Missing(id).into());
+                }
             }
             check_changes(src, &view, &g.changes, &real_tree, &rp)?;
             // Access lines: only admins change them.
@@ -907,11 +980,36 @@ async fn is_ancestor(hub: &Arc<Hub>, project: i64, a: ObjectId, b: ObjectId) -> 
     .await
 }
 
+/// The receipt for `person` uploading object `id` to `project`: a MAC only
+/// the server can make. A push shows it for each object it introduces.
+pub fn receipt(hub: &Hub, project: i64, person: i64, id: &ObjectId) -> String {
+    let mut h = blake3::Hasher::new_keyed(&hub.receipt_key);
+    h.update(&project.to_le_bytes());
+    h.update(&person.to_le_bytes());
+    h.update(&id.0);
+    hex::encode(&h.finalize().as_bytes()[..16])
+}
+
+/// The objects whose receipts in `receipts` are `person`'s (compared in
+/// constant time).
+fn receipted(hub: &Hub, project: i64, person: i64, receipts: &std::collections::BTreeMap<ObjectId, String>) -> HashSet<ObjectId> {
+    receipts
+        .iter()
+        .filter(|(id, r)| {
+            let want = receipt(hub, project, person, id);
+            r.len() == want.len() && r.bytes().zip(want.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+        })
+        .map(|(id, _)| *id)
+        .collect()
+}
+
 /// Store uploaded objects (`docs/HUB.md` §4.5): each is re-hashed against
 /// its id and must decode canonically (safe names, sorted trees) at a
 /// repository format the server serves. Nothing uploaded is visible until a
-/// push makes a branch reach it.
-pub async fn upload(hub: &Arc<Hub>, project: i64, body: Bytes) -> Result<usize> {
+/// push makes a branch reach it. Returns a receipt per object, in order
+/// (stored whether or not the project held it already, so the answer is
+/// the same either way).
+pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes) -> Result<Vec<String>> {
     let frames: Vec<(ObjectId, Bytes)> = veil_core::hub::wire::read_frames(&body)?
         .into_iter()
         .map(|(id, raw)| (id, body.slice_ref(raw)))
@@ -922,7 +1020,7 @@ pub async fn upload(hub: &Arc<Hub>, project: i64, body: Bytes) -> Result<usize> 
         }
         Object::decode(raw)?;
     }
-    let n = frames.len();
+    let receipts = frames.iter().map(|(id, _)| receipt(hub, project, person, id)).collect();
     let mut set = tokio::task::JoinSet::new();
     let hub2 = hub.clone();
     let mut it = frames.into_iter();
@@ -937,5 +1035,5 @@ pub async fn upload(hub: &Arc<Hub>, project: i64, body: Bytes) -> Result<usize> 
             None => break,
         }
     }
-    Ok(n)
+    Ok(receipts)
 }

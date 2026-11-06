@@ -157,7 +157,7 @@ fn bug_820_a_merge_cannot_revert_a_file_the_pusher_may_not_write() {
     let old = entry_of(&api, &token, &p.name, before, "src/lib.rs");
     // Carol may not write src/ directly...
     let mut c = Craft::new(&api, &p.carol, &p.name, "main");
-    c.refer("src/lib.rs", old.id, old.size);
+    c.copy("src/lib.rs", before, "src/lib.rs", old.id, old.size);
     let r = c.push("main", "revert");
     assert_eq!(r.status, 403, "{}", String::from_utf8_lossy(&r.body));
     // ...nor through a merge with the snapshot before the fix.
@@ -259,12 +259,12 @@ fn bug_823_a_push_builds_on_the_tip_of_the_branch_it_moves() {
 }
 
 /// BUG-824. Attacker: a participant with write access somewhere (a dev).
-/// A push may name, without uploading it, any object the project stores:
-/// it lands if the object exists and fails if not. Harm: confirms guesses
-/// of whole files in folders they cannot see (a short password file, a
-/// salary).
+/// A push could name, without uploading it, any object the project stores:
+/// it landed if the object existed and failed if not. Harm: confirms
+/// guesses of whole files in folders they cannot see (a short password
+/// file, a salary). Fixed: a push names only objects its pusher uploaded
+/// (upload receipts) or that are already at that path in a parent.
 #[test]
-#[ignore = "BUG-824: a push may name an object it did not upload, which confirms guesses of hidden content"]
 fn bug_824_a_push_does_not_confirm_guesses_of_hidden_content() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -286,6 +286,33 @@ fn bug_824_a_push_does_not_confirm_guesses_of_hidden_content() {
         String::from_utf8_lossy(&r_right.body),
         String::from_utf8_lossy(&r_wrong.body)
     );
+    let msg = |r: &Reply, ids: [ObjectId; 2]| {
+        let mut m = String::from_utf8_lossy(&r.body).to_string();
+        for id in ids {
+            m = m.replace(&id.short(), "ID");
+        }
+        m
+    };
+    assert_eq!(msg(&r_right, [real, wrong_id]), msg(&r_wrong, [real, wrong_id]));
+    // A whole hidden folder guessed as a tree: the same answer too.
+    let bill = real_paths(&p.dir).into_iter().find(|(q, _)| *q == BILL_DIR).unwrap().1;
+    let mut right = Craft::new(&api, &p.dev, &p.name, "main");
+    right.refer_dir("src/guess", bill);
+    let r_right = right.push("main", "guess");
+    let mut wrong = Craft::new(&api, &p.dev, &p.name, "main");
+    wrong.refer_dir("src/guess", wrong_id);
+    let r_wrong = wrong.push("main", "guess");
+    assert_eq!(
+        msg(&r_right, [bill, wrong_id]),
+        msg(&r_wrong, [bill, wrong_id]),
+        "a guessed hidden folder gets another answer than a wrong guess"
+    );
+    // Uploading the guess itself lands the push whether or not the
+    // project held it: the push says nothing about other folders.
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.file("src/guess.txt", BILL_MARK);
+    let r = c.push("main", "uploaded guess");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
 }
 
 /// BUG-825. Attacker: anyone on Earth. TCP connections that never start
@@ -304,11 +331,11 @@ fn bug_825_a_silent_connection_is_closed() {
     assert!(!open, "a silent connection was still open after {:?}", start.elapsed());
 }
 
-/// BUG-826. Attacker: none (low). A projected snapshot keeps the real
-/// ids in `predecessors`: a viewer learns the id of an earlier version
-/// of a change that touched a folder they cannot see.
+/// BUG-826. Attacker: none (low). A projected snapshot kept the real
+/// ids in `predecessors`: a viewer learned the id of an earlier version
+/// of a change that touched a folder they cannot see. Fixed: they are
+/// projected too.
 #[test]
-#[ignore = "BUG-826: projections keep the real ids of predecessors"]
 fn bug_826_a_projection_names_no_hidden_predecessor() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -331,15 +358,36 @@ fn bug_826_a_projection_names_no_hidden_predecessor() {
     let (_, raw) = h.frames().into_iter().find(|(id, _)| *id == tip).unwrap();
     let Object::Snapshot(s) = Object::decode(&raw).unwrap() else { panic!() };
     assert!(!s.predecessors.contains(&first), "the dev was given the real id of a change of billing");
+    // ...but the dev's own version of it: their history stays connected.
+    let seen_first = api.tips(Some(&token), &p.name).unwrap().branches["a"];
+    assert_eq!(s.predecessors, vec![seen_first]);
+    // A later version that touches only what the dev sees is no longer
+    // served as is when its predecessor touched more.
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    c.file("src/a.rs", "a3");
+    let (_, r) = c.push_edited("c", None, |s| s.predecessors = vec![first]);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let tip_c = api.tips(Some(&token), &p.name).unwrap().branches["c"];
+    let h = api.post_json(Some(&token), &format!("/v1/projects/{}/history", p.name), &json!({"tips": [tip_c.hex()]}));
+    let (_, raw) = h.frames().into_iter().find(|(id, _)| *id == tip_c).unwrap();
+    let Object::Snapshot(sc) = Object::decode(&raw).unwrap() else { panic!() };
+    assert_eq!(sc.predecessors, vec![seen_first]);
+    assert_eq!(sc.signature_valid(), Some(true));
+    // The admin sees the real one.
+    let tip = api.tips(Some(&p.admin.token()), &p.name).unwrap().branches["b"];
+    let h = api.post_json(Some(&p.admin.token()), &format!("/v1/projects/{}/history", p.name), &json!({"tips": [tip.hex()]}));
+    let (_, raw) = h.frames().into_iter().find(|(id, _)| *id == tip).unwrap();
+    let Object::Snapshot(s) = Object::decode(&raw).unwrap() else { panic!() };
+    assert_eq!(s.predecessors, vec![first]);
 }
 
 /// BUG-827. Attacker: a compromised server (outside the boundary for
 /// secrets: HUB.md §13.6). It lists its own device under a person an
-/// admin adds to a group; the admin's `vl group add` wraps the secret key
-/// for every listed device. Harm: the server (or whoever broke in) holds
-/// the project's secret key and opens every `.env`.
+/// admin adds to a group; the admin's `vl group add` wrapped the secret
+/// key for every listed device. Harm: the server (or whoever broke in)
+/// holds the project's secret key and opens every `.env`. Fixed: a key is
+/// wrapped only for devices vouched for outside the server (§13.11).
 #[test]
-#[ignore = "BUG-827: vl group add wraps the secret key for every device the server lists"]
 fn bug_827_a_server_cannot_slip_its_own_device_into_a_key_grant() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -357,12 +405,106 @@ fn bug_827_a_server_cannot_slip_its_own_device_into_a_key_grant() {
             .execute(&db),
         )
         .unwrap();
-    p.admin.ok(&p.dir, &["group", "add", "finance", &newbie.name]);
     let api = hub.api();
-    let rings = api.get(Some(&p.admin.token()), &format!("/v1/projects/{}/rings", p.name));
     let member = veil_core::identity::parse_public_identity(&mal.public_id()).unwrap().member_id();
-    let text = String::from_utf8_lossy(&rings.body);
-    assert!(!text.contains(&member), "the server's device was granted the secret key");
+    let mine = newbie.identity().public_hex();
+    let rings = |who: &str| String::from_utf8_lossy(&api.get(Some(&p.admin.token()), &format!("/v1/projects/{}/rings", p.name)).body).contains(who);
+    // Unconfirmed: both devices are shown to be confirmed, neither gets the key.
+    let out = p.admin.ok(&p.dir, &["group", "add", "finance", &newbie.name]);
+    assert!(out.contains(&format!("confirm {}'s device", newbie.name)), "{out}");
+    assert!(!rings(&member), "the server's device was granted the secret key");
+    assert!(!rings(&mine), "an unconfirmed device was granted the secret key");
+    // The server forges vouches for its device: signed by its own key, and
+    // newbie's genuine signature over another device moved onto it.
+    let other = Identity::generate("newbie");
+    let pid = |i: &Identity| veil_core::identity::parse_public_identity(&i.public_id()).unwrap();
+    let genuine = newbie.identity().sign(
+        veil_core::crypto::domains::SIG_CONTEXT_HUB_DEVICE,
+        &veil_core::hub::wire::vouch_message(&pid(&other)).unwrap(),
+    );
+    let self_signed = mal.sign(veil_core::crypto::domains::SIG_CONTEXT_HUB_DEVICE, &veil_core::hub::wire::vouch_message(&pid(&mal)).unwrap());
+    for (by, sig) in [(newbie.identity().verifying_hex(), genuine), (mal.verifying_hex(), self_signed)] {
+        hub.rt
+            .block_on(
+                sqlx::query(
+                    "INSERT INTO device_vouches (device_id, voucher_key, signature, created_at) SELECT id, $1, $2, 0 FROM devices WHERE signing_key = $3",
+                )
+                .bind(by)
+                .bind(sig)
+                .bind(mal.verifying_hex())
+                .execute(&db),
+            )
+            .unwrap();
+    }
+    // The admin checks newbie's fingerprint with newbie: newbie's device
+    // gets the key, the server's still does not.
+    let out = p.admin.ok(&p.dir, &["group", "add", "finance", &newbie.name, "--confirm", &newbie.fingerprint()]);
+    assert!(out.contains("granted to"), "{out}");
+    assert!(rings(&mine), "the confirmed device has no key: {out}");
+    assert!(!rings(&member), "the server's device was granted the secret key: {out}");
+    // A fingerprint that matches nothing the server lists stops the grant.
+    let other_fp = veil_core::hub::wire::device_fingerprint(&pid(&other)).unwrap();
+    let out = p.admin.fails(&p.dir, &["group", "add", "finance", &newbie.name, "--confirm", &other_fp]);
+    assert!(out.contains("different device"), "{out}");
+    assert!(!rings(&member));
+}
+
+/// A person's later device is confirmed by the person (cross-signing),
+/// and then receives the key from an admin without asking the admin to
+/// check a fingerprint again (HUB.md §13.11). Until confirmed, it is
+/// nothing: no session, no folder, no key.
+#[test]
+fn a_later_device_is_confirmed_by_its_person() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let laptop = hub.new_device_of(&p.fin);
+    let api = hub.api();
+    // Pending: anyone on Earth until confirmed.
+    let d = laptop.dir("early");
+    let _ = laptop.run(laptop.home.path(), &["clone", &hub.url(&p.name), d.to_str().unwrap()]);
+    assert_no_marker(&everything_in(&d), &[BILL_MARK, ENV_MARK], "a pending device");
+    // fin confirms it from the device they already use.
+    let fp = laptop.fingerprint();
+    p.fin.ok(p.fin.home.path(), &["identity", "confirm", &fp]);
+    laptop.ok(laptop.home.path(), &["login", &format!("veil://{}", hub.authority()), "--ca", hub.ca.to_str().unwrap()]);
+    let c = laptop.dir("c");
+    laptop.ok(laptop.home.path(), &["clone", &hub.url(&p.name), c.to_str().unwrap()]);
+    assert!(c.join(BILL_DIR).join("acme/invoice.txt").exists(), "folder access follows the person");
+    assert!(!c.join(BILL_DIR).join(".env").exists(), "no key before an admin wraps it");
+    // The admin's next `vl group add` wraps the key for it: no fingerprint
+    // to check, fin's first device vouched for it.
+    let out = p.admin.ok(&p.dir, &["group", "add", "finance", &p.fin.name]);
+    assert!(!out.contains("confirm "), "{out}");
+    assert!(out.contains("granted to"), "{out}");
+    let c2 = laptop.dir("c2");
+    laptop.ok(laptop.home.path(), &["clone", &hub.url(&p.name), c2.to_str().unwrap()]);
+    assert!(std::fs::read_to_string(c2.join(BILL_DIR).join(".env")).unwrap().contains(ENV_MARK));
+    // Another person cannot confirm a device under fin's name...
+    let thief = hub.new_device_of(&p.fin);
+    let out = p.dev.fails(p.dev.home.path(), &["identity", "confirm", &thief.fingerprint()]);
+    assert!(out.contains("none of"), "{out}");
+    // ...nor through the API, with a valid signature of their own.
+    let pid = veil_core::identity::parse_public_identity(&thief.identity().public_id()).unwrap();
+    let sig = p.dev.identity().sign(veil_core::crypto::domains::SIG_CONTEXT_HUB_DEVICE, &veil_core::hub::wire::vouch_message(&pid).unwrap());
+    let r = api.post_json(Some(&p.dev.token()), "/v1/devices/vouch", &json!({"device": thief.identity().public_id(), "signature": sig}));
+    assert_eq!(r.status, 404, "{}", String::from_utf8_lossy(&r.body));
+    thief.fails(thief.home.path(), &["login", &format!("veil://{}", hub.authority()), "--ca", hub.ca.to_str().unwrap()]);
+    // Removing fin from their last group rotates the key away from both
+    // devices, even one a compromised server leaves out of the list.
+    hub.rt
+        .block_on(
+            sqlx::query("UPDATE devices SET removed_at = 1 WHERE signing_key = $1")
+                .bind(laptop.identity().verifying_hex())
+                .execute(&hub.hub().db),
+        )
+        .unwrap();
+    let out = p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    assert!(out.contains("rotated away"), "{out}");
+    let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(&p.dir)), None, "test").unwrap();
+    let st = repo.keys().ring_state("team").unwrap().unwrap().unwrap();
+    for who in [&p.fin, &laptop] {
+        assert!(!st.members.contains_key(&who.identity().public_hex()), "{} kept the key", who.home.path().display());
+    }
 }
 
 /// BUG-828. Attacker: none (a silent gap). A group's manager removes
@@ -417,4 +559,224 @@ fn a_pulled_policy_never_unseals_a_members_secret() {
     p.admin.ok(&p.dir, &["new", "main"]);
     let env = std::fs::read_to_string(p.dir.join(format!("{BILL_DIR}/.env"))).unwrap();
     assert!(env.contains(marker), "the member's push did not land: {env}");
+}
+
+/// BUG-834. Attacker: a participant who may write somewhere (dev writes
+/// `src/`). Controls: a pushed conflict object whose terms name an object
+/// id the push never uploaded. Upload receipts cover entries, not the ids
+/// a conflict names, and the fetch route serves an id a conflict at a
+/// readable path names. Harm: a right guess of a hidden file is served
+/// back (a wrong one is not found): BUG-824's oracle, through fetch.
+#[test]
+fn bug_834_a_conflict_names_no_hidden_object() {
+    use veil_core::object::{Conflict, ConflictTerm, EntryKind, TermKind, TreeEntry, Visibility};
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let path = format!("{BILL_DIR}/acme/invoice.txt");
+    let real = real_paths(&p.dir).into_iter().find(|(q, _)| *q == path).unwrap().1;
+    let term = |id: ObjectId| {
+        Some(ConflictTerm {
+            kind: TermKind::File,
+            id,
+            size: 1,
+            executable: false,
+            visibility: Visibility::Public,
+            fallback: None,
+        })
+    };
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    let mine = c.put_object(Object::Blob(b"mine".to_vec()));
+    let conflict = c.put_object(Object::Conflict(Conflict {
+        adds: vec![term(mine), term(real)],
+        removes: vec![term(mine)],
+    }));
+    c.set_entry(
+        "src/c.txt",
+        TreeEntry {
+            name: String::new(),
+            kind: EntryKind::Conflict,
+            id: conflict,
+            size: 0,
+            executable: false,
+            visibility: Visibility::Public,
+            fallback: None,
+        },
+    );
+    let r = c.push("main", "a conflict");
+    if r.status == 200 {
+        let tip = api.tips(Some(&p.dev.token()), &p.name).unwrap().branches["main"];
+        let f = api.post_json(
+            Some(&p.dev.token()),
+            &format!("/v1/projects/{}/fetch", p.name),
+            &json!({"snapshot": tip.hex(), "objects": [{"path": "src/c.txt", "id": real.hex()}]}),
+        );
+        assert!(
+            !String::from_utf8_lossy(&f.body).contains(BILL_MARK),
+            "a hidden file was served through a conflict that names it"
+        );
+    }
+}
+
+/// BUG-834, the other route: a sealed secret's `fallback` names an object
+/// the push never uploaded, and the fetch route serves an entry's fallback.
+#[test]
+fn bug_834_a_fallback_names_no_hidden_object() {
+    use veil_core::{
+        crypto::{Envelope, Suite},
+        object::{EntryKind, TreeEntry, Visibility},
+    };
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let path = format!("{BILL_DIR}/acme/invoice.txt");
+    let real = real_paths(&p.dir).into_iter().find(|(q, _)| *q == path).unwrap().1;
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    let sealed = c.put_object(Object::Sealed(Envelope {
+        scope: "team".into(),
+        suite: Suite::AesSiv,
+        ciphertext: vec![7u8; 48],
+    }));
+    c.set_entry(
+        "src/.env",
+        TreeEntry {
+            name: String::new(),
+            kind: EntryKind::File,
+            id: sealed,
+            size: 1,
+            executable: false,
+            visibility: Visibility::Cloaked { scope: "team".into() },
+            fallback: Some(real),
+        },
+    );
+    let r = c.push("main", "a secret with a fallback");
+    if r.status == 200 {
+        let tip = api.tips(Some(&p.dev.token()), &p.name).unwrap().branches["main"];
+        let f = api.post_json(
+            Some(&p.dev.token()),
+            &format!("/v1/projects/{}/fetch", p.name),
+            &json!({"snapshot": tip.hex(), "objects": [{"path": "src/.env", "id": real.hex()}]}),
+        );
+        assert!(
+            !String::from_utf8_lossy(&f.body).contains(BILL_MARK),
+            "a hidden file was served as a secret's fallback"
+        );
+    } else {
+        println!("refused: {}", String::from_utf8_lossy(&r.body));
+    }
+}
+
+/// BUG-835. Attacker: a compromised server, with a person it will help
+/// keep the key after their removal. Controls: the device lists. When an
+/// admin adds two people at once and confirms one's device (`vl group add
+/// finance one two --confirm <two's fingerprint>`), the server lists
+/// two's device under one: the fingerprint matched there, so the key ring
+/// recorded two's device under the name `one`. Removing two later revokes
+/// only what the server lists for two and the ring members named `two`:
+/// two's device keeps the secret key. Fixed: a `--confirm` names one
+/// person's device, so it takes one person.
+#[test]
+fn bug_835_a_confirmed_device_is_recorded_under_its_persons_name() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let one = hub.person("one");
+    let two = hub.person("two");
+    // two keeps a (pending) device of their own, so the server still
+    // lists a person named two.
+    let _spare = hub.new_device_of(&two);
+    let db = hub.hub().db.clone();
+    let move_device = |to: &str| {
+        hub.rt
+            .block_on(
+                sqlx::query("UPDATE devices SET person_id = (SELECT id FROM people WHERE name = $1) WHERE signing_key = $2")
+                    .bind(to)
+                    .bind(two.identity().verifying_hex())
+                    .execute(&db),
+            )
+            .unwrap();
+    };
+    // The admin compared two's fingerprint with two; the server lists
+    // two's device under one.
+    move_device(&one.name);
+    let fp = two.fingerprint();
+    let out = p.admin.run(&p.dir, &["group", "add", "finance", &one.name, &two.name, "--confirm", &fp]);
+    let out = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    move_device(&two.name);
+    let ring = || {
+        let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(&p.dir)), None, "test").unwrap();
+        repo.keys().ring_state("team").unwrap().unwrap().unwrap()
+    };
+    let member = two.identity().public_hex();
+    assert!(out.contains("one at a time"), "{out}");
+    if let Some(m) = ring().members.get(&member) {
+        assert_eq!(m.name, two.name, "two's device was recorded under another name: {out}");
+    }
+    // Removing two (the server hides two's device) leaves two no key.
+    move_device(&one.name);
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &two.name]);
+    assert!(!ring().members.contains_key(&member), "two kept the secret key after their removal");
+}
+
+/// BUG-836. Attacker: a compromised server keeping a removed person the
+/// key. Controls: the group list an admin's `vl group remove` reads to
+/// decide whether the person left their last group. It says fin is still
+/// in another group: the key was not rotated, and nothing said so. Fixed:
+/// the removal says who keeps the key, and why.
+#[test]
+fn bug_836_a_removal_that_does_not_rotate_says_so() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    // The server's records gain fin in `security` (no admin did that).
+    hub.rt
+        .block_on(
+            sqlx::query(
+                "INSERT INTO group_members (group_id, person_id) SELECT g.id, pe.id FROM groups g JOIN projects pr ON pr.id = g.project_id, \
+                 people pe WHERE pr.name = $1 AND g.name = 'security' AND pe.name = $2",
+            )
+            .bind(&p.name)
+            .bind(&p.fin.name)
+            .execute(&hub.hub().db),
+        )
+        .unwrap();
+    let out = p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    assert!(out.contains("not rotated") && out.contains("security"), "{out}");
+}
+
+/// BUG-832's fix, held against its own risk. Attacker: a teammate who may
+/// write `billing/` and holds the `team` key. Controls: a sealed
+/// `billing/.netrc` they commit (the project's policy seals it). fin,
+/// who cannot read the policy, keeps a `.netrc` of their own there, which
+/// the built-in rules keep local. fin's snapshots must never seal fin's
+/// file under `team` (the teammate would open it): the recorded entry is
+/// kept, fin's file stays on fin's device.
+#[test]
+fn a_view_without_the_policy_never_seals_a_local_only_file() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let d = p.fin.dir("c");
+    p.fin.ok(p.fin.home.path(), &["clone", &hub.url(&p.name), d.to_str().unwrap()]);
+    // fin's own credential, local-only on fin's device.
+    let mine = "machine example.com login fin password MARKER-FINS-OWN-NETRC-5b1e";
+    write_files(&d, &[(&format!("{BILL_DIR}/.netrc") as &str, mine)]);
+    p.fin.ok(&d, &["status"]);
+    // The teammate (here the admin) seals and pushes a `.netrc` of theirs.
+    let policy = std::fs::read_to_string(p.dir.join(".veilpolicy")).unwrap();
+    std::fs::write(p.dir.join(".veilpolicy"), format!("{policy}{BILL_DIR}/.netrc  cloak team\n")).unwrap();
+    write_files(&p.dir, &[(&format!("{BILL_DIR}/.netrc") as &str, "machine example.com login team password theirs")]);
+    p.admin.commit_main(&p.dir, "a shared netrc");
+    p.admin.ok(&p.dir, &["push"]);
+    // fin pulls, commits other work, and pushes.
+    p.fin.ok(&d, &["pull"]);
+    let _ = p.fin.run(&d, &["new", "main"]);
+    write_files(&d, &[(&format!("{BILL_DIR}/q.txt") as &str, "q")]);
+    if std::fs::read_to_string(d.join(BILL_DIR).join(".netrc")).unwrap_or_default() != mine {
+        write_files(&d, &[(&format!("{BILL_DIR}/.netrc") as &str, mine)]);
+    }
+    p.fin.commit_main(&d, "fin's work");
+    p.fin.ok(&d, &["push"]);
+    p.admin.ok(&p.dir, &["pull"]);
+    p.admin.ok(&p.dir, &["new", "main"]);
+    let got = std::fs::read_to_string(p.dir.join(BILL_DIR).join(".netrc")).unwrap_or_default();
+    assert!(!got.contains("MARKER-FINS-OWN-NETRC-5b1e"), "fin's local-only credential was sealed and pushed: {got:?}");
+    assert!(got.contains("theirs"), "{got:?}");
 }

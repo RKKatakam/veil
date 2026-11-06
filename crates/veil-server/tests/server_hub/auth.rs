@@ -56,13 +56,23 @@ fn a_login_cannot_be_replayed_forged_or_relayed() {
     let mut b = login_body(&api, &mallory, &mallory, &ch, &api.authority, Some(&unique("m")));
     b["identity"] = json!(alice.public_id());
     assert_eq!(api.post_json(None, "/v1/auth/login", &b).status, 400);
-    // A taken name cannot be registered again by another key.
-    let ch = challenge(&api, &mallory);
-    let r = api.post_json(None, "/v1/auth/login", &login_body(&api, &mallory, &mallory, &ch, &api.authority, Some(&name)));
-    assert_eq!(r.status, 409);
-    // An unknown device without a name is not signed in.
+    // A taken name cannot be registered again by another key: the key
+    // becomes a pending device of that person, with no session, now or
+    // later, until one of their devices vouches for it (HUB.md §13.11).
+    for _ in 0..2 {
+        let ch = challenge(&api, &mallory);
+        let r = api.post_json(None, "/v1/auth/login", &login_body(&api, &mallory, &mallory, &ch, &api.authority, Some(&name)));
+        assert_eq!(r.status, 409);
+        assert_eq!(r.json()["code"], "device_pending", "{}", String::from_utf8_lossy(&r.body));
+        assert!(r.json().get("token").is_none());
+    }
     let ch = challenge(&api, &mallory);
     let r = api.post_json(None, "/v1/auth/login", &login_body(&api, &mallory, &mallory, &ch, &api.authority, None));
+    assert_eq!(r.status, 409);
+    // An unknown device without a name is not signed in.
+    let stranger = Identity::generate("stranger");
+    let ch = challenge(&api, &stranger);
+    let r = api.post_json(None, "/v1/auth/login", &login_body(&api, &stranger, &stranger, &ch, &api.authority, None));
     assert_eq!(r.status, 401);
 }
 

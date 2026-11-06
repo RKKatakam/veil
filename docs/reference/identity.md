@@ -11,6 +11,7 @@ Subcommands:
 * [`vl identity new`](#vl-identity-new): Create a new identity (replaces the existing one with --force; the replaced one is kept so local vaults can be re-keyed)
 * [`vl identity recover-vault`](#vl-identity-recover-vault): Re-key this repository's local vault, sealed by an identity that was replaced, to the current identity
 * [`vl identity recover-admin`](#vl-identity-recover-admin): Hand the scope admin rights of a replaced identity over to the current one, in this repository: the replaced identity signs a grant that makes the current identity an admin. Push to share it
+* [`vl identity confirm`](#vl-identity-confirm): Confirm that another device of yours is yours, on a Veil server
 
 ## `vl identity show`
 
@@ -63,6 +64,28 @@ Options:
 |---|---|
 | `--from <FROM>` | Identity file to recover from (default: every identity replaced by `vl identity new --force`, newest first) |
 | `--revoke-old` | Then revoke the replaced identity from those scopes (rotates their keys). Leave it out while another device still uses it |
+
+## `vl identity confirm`
+
+Confirm that another device of yours is yours, on a Veil server.
+
+The new device signs in with `vl login URL --name YOU` and shows its fingerprint. Run this on a device you already use: it signs that device with this one, and the server lets it sign in. Admins then grant it the project's secret keys without asking you again.
+
+```text
+vl identity confirm [OPTIONS] <FINGERPRINT>
+```
+
+Arguments:
+
+| | |
+|---|---|
+| `<FINGERPRINT>` | The new device's fingerprint (`vl identity show` on it) (required) |
+
+Options:
+
+| | |
+|---|---|
+| `--server <SERVER>` | The server (`veil://host[:port]`); default: the one this device is signed in to |
 
 ---
 
