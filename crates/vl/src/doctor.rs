@@ -89,12 +89,13 @@ pub fn run(repo_arg: Option<&Path>, remotes: bool) -> Result<ExitCode> {
     check_veil_home(&mut r);
     let identity = check_identity(&mut r);
     check_sandboxes(&mut r);
-    check_confinement(&mut r);
 
     let start = match repo_arg {
         Some(p) => p.to_path_buf(),
         None => std::env::current_dir()?,
     };
+    // Never a `bwrap` or `systemd-run` from inside the project.
+    check_confinement(&mut r, find_root(&start).and_then(|r| r.canonicalize().ok()).as_deref());
     match find_root(&start) {
         None => {
             r.section("Repository");
@@ -269,8 +270,8 @@ fn private_file_problem(path: &Path) -> Option<String> {
 }
 
 /// Whether `vl ws exec` can confine its command here, and how limits apply.
-fn check_confinement(r: &mut Report) {
-    for (works, line, detail) in crate::confine::doctor() {
+fn check_confinement(r: &mut Report, root: Option<&Path>) {
+    for (works, line, detail) in crate::confine::doctor(root) {
         match works {
             true => r.item(Level::Ok, &line, &detail),
             false => r.warn(line, &detail),

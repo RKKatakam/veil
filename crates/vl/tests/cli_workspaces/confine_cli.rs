@@ -619,3 +619,381 @@ fn doctor_says_whether_confinement_works() {
     let out = text(&t.cmd(&t.proj, &["doctor"]).env("PATH", &empty).output().unwrap());
     assert!(out.contains("bubblewrap is not installed"), "{out}");
 }
+
+// ---- Confinement verification review --------------------------------------
+
+/// `vl ws exec <args>` from the project, killed if it outlives `secs`:
+/// `None` when it hung.
+fn exec_deadline(t: &T, args: &[&str], envs: &[(&str, &std::ffi::OsStr)], secs: u64) -> Option<Output> {
+    let mut all = vec!["ws", "exec"];
+    all.extend_from_slice(args);
+    let mut c = t.cmd(&t.proj, &all);
+    for (k, v) in envs {
+        c.env(k, v);
+    }
+    let mut child = c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(secs) {
+        if child.try_wait().unwrap().is_some() {
+            return Some(child.wait_with_output().unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+#[test]
+fn an_allowed_link_to_a_folder_holding_keys_or_the_project_still_hides_them() {
+    let t = T::new();
+    let identity = std::fs::read_to_string(t.env.root.join("home-alice/identity.json")).unwrap();
+    // A link to the folder that holds the Veil home and the project (as a
+    // `~/src` link to a data disk would), and a link to `~/.cargo`.
+    let alias = t.env.root.join("alias");
+    std::os::unix::fs::symlink(&t.env.root, &alias).unwrap();
+    std::os::unix::fs::symlink(t.home.join(".cargo"), t.home.join("cargo-link")).unwrap();
+    // A `CARGO_HOME` outside the home, allowed.
+    let cargo_home = t.env.dir("cargo-home");
+    write(&cargo_home, "credentials", CARGO_TOKEN);
+    let a = alias.display();
+    let script = format!(
+        "cat {a}/home-alice/identity.json; ls -A {a}/proj/.veil; cat {a}/proj/.veil/local/sandboxes/agent/manifest.json; \
+         cat ~/cargo-link/credentials.toml {ch}/credentials; ls -A {a}/proj; echo end",
+        ch = cargo_home.display()
+    );
+    let cargo_link = t.home.join("cargo-link").display().to_string();
+    let o = t
+        .cmd(&t.proj, &["ws", "exec", "agent", "--allow", &a.to_string(), "--allow", &cargo_link, "--allow", &cargo_home.display().to_string(), "--", "sh", "-c", &script])
+        .env("CARGO_HOME", &cargo_home)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(out.trim_end().ends_with("end"), "{out}");
+    assert!(!out.contains(identity.trim()), "the Veil identity is visible through an allowed link: {out}");
+    assert!(!out.contains("\"pending\"") && !out.contains("sandboxes"), "the real .veil is visible through an allowed link: {out}");
+    assert!(!out.contains(CARGO_TOKEN), "cargo's credentials are visible through an allowed link: {out}");
+    assert!(!out.contains("a.txt"), "the real project is visible through an allowed link: {out}");
+    // An allowed path inside the Veil home or the project is refused.
+    for inside in [t.env.root.join("home-alice"), alias.join("proj/.veil"), t.proj.clone()] {
+        let o = t.exec(&["agent", "--allow", &inside.display().to_string(), "--", "true"]);
+        assert!(!o.status.success() && text(&o).contains("that is inside the"), "{inside:?}: {}", text(&o));
+    }
+}
+
+#[test]
+fn doctor_never_runs_a_bwrap_from_inside_the_project() {
+    let t = T::new();
+    let marker = t.env.root.join("doctor-ran-project-bwrap");
+    let bin = t.proj.join("bin");
+    for prog in ["bwrap", "systemd-run", "systemctl"] {
+        write(&bin, prog, &format!("#!/bin/sh\ntouch {}\n", marker.display()));
+        std::fs::set_permissions(bin.join(prog), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let out = text(&t.cmd(&t.proj.join("src"), &["doctor"]).env("PATH", &path).output().unwrap());
+    assert!(!marker.exists(), "vl doctor ran the project's own program: {out}");
+    assert!(out.contains("confinement works (bubblewrap"), "{out}");
+}
+
+#[test]
+fn links_fifos_and_sockets_the_command_plants_never_make_vl_write_or_read_outside() {
+    let t = T::new();
+    write(&t.proj, "config/.env", "DB_PASSWORD=isolated-config-value-55e1\n");
+    t.env.ok("alice", &t.proj, &["commit", "-m", "config"]);
+    t.env.ok("alice", &t.proj, &["ws", "rm", "agent"]);
+    t.env.ok("alice", &t.proj, &["ws", "new", "agent", "-r", "@-"]);
+    let canary = t.env.dir("canary");
+    write(&canary, "existing", "canary\n");
+    write(&canary, ".env", "canary-env\n");
+    write(&canary, ".netrc", "canary-netrc\n");
+    let c = canary.display().to_string();
+    let before = snapshot(&canary, &[]);
+    // Run 1 swaps the injected files and their folder for links outside,
+    // and leaves a FIFO and a socket.
+    let script = format!(
+        "rm -rf config src; ln -s {c} config; ln -s {c} src; rm -f .netrc; ln -s {c}/.netrc .netrc; mkfifo pipe; \
+         ln -s {c}/existing a.txt.link; python3 -c 'import socket; socket.socket(socket.AF_UNIX).bind(\"sock\")' 2>/dev/null; echo end"
+    );
+    let o = exec_deadline(&t, &["agent", "--with-isolated", "--", "sh", "-c", &script], &[], 60).expect("vl hung after the run");
+    assert!(o.status.success(), "{}", text(&o));
+    assert_eq!(before, snapshot(&canary, &[]), "run 1 changed the canary: {}", text(&o));
+    // Run 2 injects again, into the linked folder; a sparse run leaves
+    // links outside its set, which `vl` removes.
+    let o = exec_deadline(&t, &["agent", "--with-isolated", "--", "sh", "-c", "ls -la; cat config/.env; echo end"], &[], 60)
+        .expect("vl hung on the next run");
+    assert_eq!(before, snapshot(&canary, &[]), "the next run changed the canary: {}", text(&o));
+    let script = format!("ln -s {c} stray; mkdir -p deep; ln -s {c}/existing deep/x; ln -s {c} deep/d; echo end");
+    let o = exec_deadline(&t, &["agent", "--only", "a.txt", "--", "sh", "-c", &script], &[], 60).expect("vl hung on a sparse run");
+    let o2 = exec_deadline(&t, &["agent", "--with-isolated", "--", "true"], &[], 60).expect("vl hung on a full run");
+    assert_eq!(before, snapshot(&canary, &[]), "a sparse run changed the canary: {}\n{}", text(&o), text(&o2));
+    let all = all_text(&canary);
+    assert!(!all.contains("isolated"), "{all}");
+}
+
+fn all_text(dir: &Path) -> String {
+    let mut s = String::new();
+    for (p, _) in snapshot(dir, &[]) {
+        if let Ok(c) = std::fs::read_to_string(dir.join(&p)) {
+            s.push_str(&c);
+        }
+    }
+    s
+}
+
+#[test]
+fn the_command_inherits_no_descriptor_of_vl_but_its_stdio() {
+    let t = T::new();
+    // `ls` lists the shell's descriptors: what the same shell has outside.
+    let script = "ls /proc/$$/fd > fds.txt; true";
+    let base = t.env.dir("fd-baseline");
+    let o = Command::new("sh").args(["-c", script]).current_dir(&base).stdin(Stdio::null()).output().unwrap();
+    assert!(o.status.success());
+    let want = std::fs::read_to_string(base.join("fds.txt")).unwrap();
+    assert!(want.split_whitespace().count() <= 4, "{want}");
+    for flags in [&[][..], &["--with-isolated", "--memory", "1G"][..]] {
+        let mut args = vec!["agent"];
+        args.extend_from_slice(flags);
+        args.extend(["--", "sh", "-c", script]);
+        let o = t.exec(&args);
+        assert!(o.status.success(), "{}", text(&o));
+        assert_eq!(t.cat("fds.txt").unwrap(), want, "{flags:?}: {}", text(&o));
+    }
+}
+
+#[test]
+fn a_slow_systemd_user_manager_does_not_hang_vl() {
+    let t = T::new();
+    t.sh("true");
+    let slow = t.env.dir("slow-systemd");
+    for prog in ["systemd-run", "systemctl"] {
+        write(&slow, prog, "#!/bin/sh\nexec sleep 600\n");
+        std::fs::set_permissions(slow.join(prog), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!("{}:{}", slow.display(), std::env::var("PATH").unwrap_or_default());
+    let start = Instant::now();
+    let o = exec_deadline(&t, &["agent", "--memory", "1G", "--", "sh", "-c", "echo ran > slow.txt"], &[("PATH", path.as_ref())], 60);
+    let o = o.unwrap_or_else(|| panic!("vl hung on a slow systemd user manager ({:?})", start.elapsed()));
+    assert!(o.status.success(), "{}", text(&o));
+    assert_eq!(t.cat("slow.txt").as_deref(), Some("ran\n"), "{}", text(&o));
+}
+
+/// With a limit, the command goes through `systemd-run`, which must pass
+/// it on as given (it expands `$VAR` and `$$` by default since systemd 254).
+#[test]
+fn a_command_with_dollar_signs_runs_as_given_under_a_systemd_scope() {
+    if !systemd_scopes_work() {
+        return;
+    }
+    let t = T::new();
+    let script = "echo \"pid=$$ home=${HOME} x=$X\" > dollars.txt; echo '$$ ${HOME}' >> dollars.txt";
+    let plain = t.cmd(&t.proj, &["ws", "exec", "agent", "--", "sh", "-c", script]).env("X", "outer").output().unwrap();
+    assert!(plain.status.success(), "{}", text(&plain));
+    let want = t.cat("dollars.txt").unwrap();
+    let o = t.cmd(&t.proj, &["ws", "exec", "agent", "--memory", "1G", "--", "sh", "-c", script]).env("X", "outer").env("VEIL_EXEC_LIMITS_BACKEND", "systemd").output().unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    assert_eq!(t.cat("dollars.txt").unwrap(), want, "systemd-run rewrote the command: {}", text(&o));
+}
+
+/// A `systemctl` that never answers after a scoped run that was killed
+/// must not keep `vl` from recording.
+#[test]
+fn a_hung_systemctl_after_a_scoped_run_does_not_keep_vl_from_recording() {
+    let t = T::new();
+    t.sh("true");
+    let fake = t.env.dir("fake-systemd");
+    // `systemd-run` runs the command in place, as `--scope` does; `systemctl` hangs.
+    write(&fake, "systemd-run", "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done; shift; exec \"$@\"\n");
+    write(&fake, "systemctl", "#!/bin/sh\nexec sleep 600\n");
+    for prog in ["systemd-run", "systemctl"] {
+        std::fs::set_permissions(fake.join(prog), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!("{}:{}", fake.display(), std::env::var("PATH").unwrap_or_default());
+    let o = exec_deadline(&t, &["agent", "--memory", "1G", "--", "sh", "-c", "echo ran > killed.txt; kill -9 $$"], &[("PATH", path.as_ref())], 60)
+        .expect("vl hung on systemctl after the run");
+    assert!(text(&o).contains("Recorded"), "{}", text(&o));
+    assert_eq!(t.cat("killed.txt").as_deref(), Some("ran\n"), "{}", text(&o));
+}
+
+/// `kill -9` of `vl` while `bwrap` or `systemd-run` is still starting
+/// (each made to take two seconds): the command never runs on, orphaned.
+#[test]
+fn killing_vl_while_bwrap_or_systemd_run_starts_leaves_nothing_running() {
+    let t = T::new();
+    t.sh("true");
+    let which = |p: &str| {
+        let o = Command::new("sh").args(["-c", &format!("command -v {p}")]).output().unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    let mut cases = vec![("bwrap", vec![])];
+    if systemd_scopes_work() {
+        cases.push(("systemd-run", vec!["--memory", "1G"]));
+    }
+    for (prog, flags) in cases {
+        let slow = t.env.dir(&format!("slow-{prog}"));
+        let started = slow.join("started");
+        let marker = format!("30.{}{}", std::process::id(), prog.len());
+        write(
+            &slow,
+            prog,
+            &format!("#!/bin/sh\ncase \"$*\" in *{marker}*) touch {s}; sleep 2;; esac\nexec {real} \"$@\"\n", s = started.display(), real = which(prog)),
+        );
+        std::fs::set_permissions(slow.join(prog), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:{}", slow.display(), std::env::var("PATH").unwrap_or_default());
+        let mut args = vec!["ws", "exec", "agent", "--with-isolated"];
+        args.extend(flags.iter());
+        let script = format!("sleep {marker}");
+        args.extend(["--", "sh", "-c", &script]);
+        let mut child = t.cmd(&t.proj, &args).env("PATH", &path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        assert!(wait_for(Duration::from_secs(20), || started.exists()), "{prog}: never started");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        std::thread::sleep(Duration::from_secs(4));
+        assert!(!sleeping(&marker), "{prog}: the command ran on after vl was killed");
+        assert!(wait_for(Duration::from_secs(10), || !t.files("agent").join(".netrc").exists()), "{prog}: the injected file was left");
+    }
+    let o = exec_deadline(&t, &["agent", "--", "sh", "-c", "echo next > next.txt"], &[], 60).expect("the next run hung");
+    assert!(o.status.success() && t.cat("next.txt").as_deref() == Some("next\n"), "{}", text(&o));
+}
+
+/// `kill -9` of `vl` at every moment of a confined, limited run with
+/// injected secrets: nothing is left running, no scope stays, the injected
+/// file goes, and the next run records and works. Fails now and then under
+/// load: `vl` killed after `bwrap` cloned the sandbox's init but before
+/// that init armed its own `--die-with-parent` leaves the command running;
+/// `systemd-run` killed while systemd starts its scope can leave the
+/// (empty) scope active.
+#[test]
+#[ignore = "BUG-852: vl killed during bwrap's own start-up can leave the command running"]
+fn killing_vl_at_any_moment_leaves_nothing_and_the_next_run_recovers() {
+    let t = T::new();
+    t.sh("true");
+    let scopes = || {
+        let u = Command::new("systemctl").args(["--user", "list-units", "--all", "--no-legend", "veil-exec-*"]).output();
+        u.map(|u| String::from_utf8_lossy(&u.stdout).into_owned()).unwrap_or_default()
+    };
+    for round in 0..4 {
+        for (i, delay) in [0u64, 2, 5, 10, 20, 35, 50, 65, 80, 100, 120, 150, 200, 300, 500, 800].into_iter().enumerate() {
+            // Unique to this test process: copies of it may run at once.
+            let marker = format!("30.{}{round}{i:02}", std::process::id());
+            let script = format!("echo {i} > run{i}.txt; sleep {marker}");
+            let mut child = t
+                .cmd(&t.proj, &["ws", "exec", "agent", "--with-isolated", "--memory", "1G", "--", "sh", "-c", &script])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            std::thread::sleep(Duration::from_millis(delay));
+            let _ = child.kill();
+            child.wait().unwrap();
+            assert!(wait_for(Duration::from_secs(15), || !sleeping(&marker)), "{delay} ms: the command outlived vl");
+            assert!(wait_for(Duration::from_secs(15), || !t.files("agent").join(".netrc").exists()), "{delay} ms: the injected file was left");
+            assert!(wait_for(Duration::from_secs(15), || !scopes().contains(&format!("veil-exec-{pid}-"))), "{delay} ms: a scope was left: {}", scopes());
+        }
+    }
+    let o = exec_deadline(&t, &["agent", "--", "sh", "-c", "cat a.txt; echo next > next.txt"], &[], 60).expect("the next run hung");
+    assert!(o.status.success(), "{}", text(&o));
+    assert_eq!(t.cat("next.txt").as_deref(), Some("next\n"), "{}", text(&o));
+    assert!(t.cat(".netrc").is_none_or(|c| !c.contains("isolated-value")), "{}", text(&o));
+}
+
+#[test]
+fn a_project_path_with_spaces_newlines_dashes_and_dollars_is_bound_as_is() {
+    let env = Env::new();
+    let proj = env.project("alice", "-p $HOME x\ny", &[("a.txt", "a\n")]);
+    env.ok("alice", &proj, &["ws", "new", "agent", "-r", "@-"]);
+    for flags in [&[][..], &["--memory", "1G"][..], &["--ephemeral"][..]] {
+        let mut args = vec!["ws", "exec"];
+        if !flags.contains(&"--ephemeral") {
+            args.push("agent");
+        }
+        args.extend_from_slice(flags);
+        args.extend(["--", "sh", "-c", "pwd > where.txt; cat a.txt; echo x > new.txt"]);
+        let o = env.cmd("alice", &proj, &args).stdin(Stdio::null()).output().unwrap();
+        assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("a\n"), "{flags:?}: {}", text(&o));
+        assert!(!proj.join("new.txt").exists() && !proj.join("where.txt").exists(), "{flags:?}: wrote the real project");
+        if flags.contains(&"--ephemeral") {
+            continue;
+        }
+        let where_ = env.stdout("alice", &proj, &["ws", "cat", "agent", "where.txt"]);
+        assert_eq!(where_, format!("{}\n", proj.display()), "{flags:?}");
+    }
+}
+
+#[test]
+fn renames_and_hard_links_across_the_sandbox_boundary_change_nothing_outside() {
+    let t = T::new();
+    let tools = t.env.dir("tools");
+    write(&tools, "lib.txt", "TOOLS-LIB-1b7e\n");
+    write(&tools, "sub/x", "x\n");
+    let tl = tools.display();
+    let h = t.home.display();
+    let script = [
+        format!("mv {tl}/lib.txt moved.txt"),
+        format!("mv {tl}/sub ."),
+        format!("mv a.txt {tl}/a.txt"),
+        format!("mv src {tl}/src"),
+        format!("ln {tl}/lib.txt hard.txt"),
+        format!("ln a.txt {tl}/hard"),
+        format!("ln {h}/.cargo/bin/tool hardtool"),
+        format!("mv {h}/.cargo/bin/tool ."),
+        format!("cp -a {tl}/lib.txt copy.txt"),
+        "mv a.txt /tmp/a.txt; mv /tmp/a.txt a.txt".to_string(),
+        format!("mknod {tl}/dev c 1 3"),
+        format!("mkfifo {tl}/fifo"),
+        "true".to_string(),
+    ]
+    .iter()
+    .map(|s| format!("( {s} ) 2>/dev/null;"))
+    .collect::<Vec<_>>()
+    .join(" ");
+    let before = (snapshot(&tools, &[]), snapshot(&t.home, &[]), snapshot(&t.proj, &[".veil"]));
+    let o = t.exec(&["agent", "--allow", &tl.to_string(), "--", "sh", "-c", &script]);
+    assert!(o.status.success(), "{}", text(&o));
+    let after = (snapshot(&tools, &[]), snapshot(&t.home, &[]), snapshot(&t.proj, &[".veil"]));
+    assert_eq!(before.0, after.0, "the allowed folder changed: {}", text(&o));
+    assert_eq!(before.1, after.1, "the home changed: {}", text(&o));
+    assert_eq!(before.2, after.2, "the real project changed: {}", text(&o));
+    // Reading through the allow-list still works: the copy landed.
+    assert_eq!(t.cat("copy.txt").as_deref(), Some("TOOLS-LIB-1b7e\n"), "{}", text(&o));
+}
+
+/// Several workspaces run at once, each planting a marker and trying to
+/// read, change or signal the others'; none can.
+#[test]
+fn concurrent_runs_in_many_workspaces_stay_separate() {
+    let t = T::new();
+    let n = 6;
+    for i in 0..n {
+        t.env.ok("alice", &t.proj, &["ws", "new", &format!("w{i}"), "-r", "@-"]);
+    }
+    let p = t.proj.display().to_string();
+    let others = (0..n).map(|i| t.files(&format!("w{i}")).display().to_string()).collect::<Vec<_>>().join(" ");
+    let children: Vec<_> = (0..n)
+        .map(|i| {
+            let script = format!(
+                "echo MARK-{i}-c0ffee > mine.txt; sleep 0.5; for d in {others}; do cat $d/mine.txt; echo x > $d/mine.txt; done; \
+                 cat {p}/.veil/local/sandboxes/w*/files/mine.txt; \
+                 for f in /proc/[0-9]*/cmdline; do tr '\\0' ' ' < $f; echo; done; sleep 0.5; cat mine.txt"
+            );
+            t.cmd(&t.proj, &["ws", "exec", &format!("w{i}"), "--", "sh", "-c", &script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for (i, c) in children.into_iter().enumerate() {
+        let o = c.wait_with_output().unwrap();
+        let out = String::from_utf8_lossy(&o.stdout).into_owned();
+        assert!(o.status.success(), "w{i}: {}", text(&o));
+        for j in (0..n).filter(|j| *j != i) {
+            assert!(!out.contains(&format!("MARK-{j}-c0ffee")), "w{i} saw w{j}: {out}");
+        }
+        assert!(out.trim_end().ends_with(&format!("MARK-{i}-c0ffee")), "w{i}'s own file changed: {out}");
+        assert_eq!(t.env.stdout("alice", &t.proj, &["ws", "cat", &format!("w{i}"), "mine.txt"]), format!("MARK-{i}-c0ffee\n"));
+    }
+}

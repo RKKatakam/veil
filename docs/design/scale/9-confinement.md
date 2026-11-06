@@ -11,7 +11,7 @@ Status: **built** (2026-11-06), with the resource limits of `8-sandbox-limits.md
 `vl` builds a `bwrap` command line (`crates/vl/src/confine.rs`) and runs the user's command through it:
 
 ```text
-[systemd-run --user --scope --quiet --collect -p MemoryMax=… -p MemorySwapMax=0 -p CPUQuota=… -p TasksMax=… --]
+[systemd-run --user --scope --quiet --unit veil-exec-… [--expand-environment=no] -p MemoryMax=… -p MemorySwapMax=0 -p CPUQuota=… -p TasksMax=… --]
 bwrap --die-with-parent --new-session --unshare-user --disable-userns --unshare-pid
       --unshare-ipc --unshare-uts --unshare-cgroup-try [--unshare-net]
       --ro-bind /usr /usr  (and /bin /sbin /lib* as symlinks or binds, /etc, /opt, /nix, /sys when present)
@@ -21,6 +21,7 @@ bwrap --die-with-parent --new-session --unshare-user --disable-userns --unshare-
       --ro-bind <allowed> <allowed> …                    (the allow-list, read-only)
       --ro-bind /dev/null ~/.cargo/credentials.toml …    (known credential files inside allowed folders)
       --tmpfs $VEIL_HOME                                 (the Veil identity, always hidden)
+      --tmpfs <every other name an allowed link gives the Veil home or the project>
       --bind <sandbox files> <project root>              (read-write, at the project's real path)
       --chdir <project root>/<the sub-folder vl was run from>
       --setenv HOME $HOME --setenv TMPDIR /tmp --setenv PWD …
@@ -30,11 +31,12 @@ bwrap --die-with-parent --new-session --unshare-user --disable-userns --unshare-
 - **Same project path.** The sandbox (`.veil/local/sandboxes/NAME/files`, or the `--ephemeral` directory) is bound read-write at the project's canonical path, and the command starts in the same sub-folder the user ran `vl` from (the root if the sandbox has no such folder, e.g. with `--only`). The real project, its `.veil` (the store, other workspaces' sandboxes) included, is not visible: the bind replaces it.
 - **The computer's tools, read-only and live:** nothing is copied, so start-up costs milliseconds.
 - **Private by default:** an empty, writable `HOME` and `/tmp` (tmpfs, gone after the run), a fresh `/proc` showing only the sandbox's processes, no other mount of the real `/home`, `/run`, `/var` or `/media`.
-- **The allow-list** adds folders or files of the machine, always read-only: toolchains and the agent tool's own configuration. Defaults (those that exist): `~/.cargo`, `~/.rustup`, `~/.local/bin`, `~/.local/share/claude`, `~/.nvm`, `~/.pyenv`, `~/.volta`, `~/.bun`, `~/.deno`, `~/.claude`, `~/.claude.json`, `~/.codex`, `~/.gemini`. **Never `~/.ssh`, `~/.gnupg` or the Veil home.** More come from `--allow PATH` and from `[exec.confine] allow = [...]` in `.veil/local/config.toml` and `$VEIL_HOME/config.toml` (device-local only). `~/.cargo/credentials` and `credentials.toml` are masked even when `~/.cargo` is allowed, and `$VEIL_HOME` is masked even when an allowed folder contains it.
+- **The allow-list** adds folders or files of the machine, always read-only: toolchains and the agent tool's own configuration. Defaults (those that exist): `~/.cargo`, `~/.rustup`, `~/.local/bin`, `~/.local/share/claude`, `~/.nvm`, `~/.pyenv`, `~/.volta`, `~/.bun`, `~/.deno`, `~/.claude`, `~/.claude.json`, `~/.codex`, `~/.gemini`. **Never `~/.ssh`, `~/.gnupg` or the Veil home.** More come from `--allow PATH` and from `[exec.confine] allow = [...]` in `.veil/local/config.toml` and `$VEIL_HOME/config.toml` (device-local only). Cargo's `credentials` and `credentials.toml` (in `~/.cargo` and `$CARGO_HOME`) are masked even when an allowed folder holds them, and `$VEIL_HOME` and the real project are hidden even when an allowed folder contains them: under their own names and under every other name an allowed link gives them (an allowed `~/src` that links to the disk holding the project; BUG-848). An allowed path inside the Veil home or the project is refused. Without a usable `HOME` there are no defaults (BUG-854). Sockets and FIFOs in an allowed folder stay reachable: a read-only mount refuses writes to files, not connections (the guide says so).
 - **Network on by default** (agents call their model's API); `--no-network` adds `--unshare-net` (only a private loopback).
 - **Signals.** `--new-session` detaches the command from the terminal (no `TIOCSTI` injection), so the terminal's Ctrl-C reaches `vl` only. `bwrap` runs in its own process group; `vl` forwards SIGINT and SIGQUIT to the command's process group (as the terminal would) and SIGTERM and SIGHUP to the command (BUG-550), through a pidfd, so a reused pid is never signalled.
 - **When the command exits, everything it started stops** (the pid namespace ends). Unconfined runs keep the old behaviour (background processes keep running).
-- **When `vl` dies** (`kill -9`), `--die-with-parent` kills the sandbox's processes; the reaper then cleans up as before.
+- **When `vl` dies** (`kill -9`), the parent-death signal `vl` arms before it runs `systemd-run` or `bwrap` kills them, and `--die-with-parent` the sandbox's processes; the reaper then cleans up as before (BUG-851). **Open (BUG-852):** `vl` killed in the moment between `bwrap` creating the sandbox's first process and that process arming its own parent-death signal leaves the command running (seen under load, for kills 65–100 ms after the start), and `systemd-run` killed while systemd starts its scope can leave the empty scope active, or failed (a scope is not `--collect`ed: `vl` reads why it failed, then clears it).
+- **`systemd-run` is never trusted to answer:** each call to it or to `systemctl` has a 5-second deadline (a user manager that does not answer means the polling fallback, and never delays recording; BUG-850), and the command reaches `bwrap` as given: with `--expand-environment=no` where `systemd-run` knows it (systemd 254 and later expand `$VAR` and `$$` otherwise; BUG-849).
 
 ### Resource limits (`8-sandbox-limits.md`)
 
@@ -106,8 +108,8 @@ The attacker is **the command** (a coding agent, a test suite, a dependency's bu
     - *Invariant:* allow paths must be absolute and exist (missing defaults are skipped; a missing explicit one is an error); `/` is refused; values are passed as separate arguments (no shell); configuration over 1 MiB, or malformed, is an error, never silently dropped.
     - *Tests:* each of these.
 13. **The allow-list as a write channel.**
-    - *Invariant:* always `--ro-bind`.
-    - *Test:* writing into an allowed folder fails, and its hash is unchanged.
+    - *Invariant:* always `--ro-bind`. Files in it cannot be changed, created, renamed or linked; a socket or FIFO in it can still be connected to or written (documented in the guide; the default folders hold none).
+    - *Test:* writing into an allowed folder fails, and its hash is unchanged; so do renames and hard links across the boundary.
 14. **What confinement does not cover** (documented in the guide):
     - the environment is passed through (agents need their API keys);
     - the network, when on;

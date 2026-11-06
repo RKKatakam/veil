@@ -214,11 +214,14 @@ What the command sees:
 
   Only these two device-local files count: nothing in the repository (a
   teammate's tracked `config.toml`) can widen what an agent sees. The Veil
-  home stays hidden even inside an allowed folder. An agent that must
+  home, your project directory and cargo's credentials stay hidden even
+  inside an allowed folder, or behind an allowed link to one; a path
+  inside the Veil home or the project cannot be allowed. An agent that must
   write its configuration (a token refresh) cannot, here; a read-only
   folder still lets the command reach sockets and FIFOs in it.
 * **When the command exits, everything it started stops** (a dev server
-  too), and `kill -9` of `vl` stops it all as well; the reaper then takes
+  too), and `kill -9` of `vl` stops it all as well (except, rarely, in the
+  instant `bwrap` starts the sandbox: BUG-852); the reaper then takes
   injected files out as before.
 * **Ctrl-C, SIGTERM and SIGHUP** reach the command as before: the command
   has no terminal of its own (no keystrokes can be pushed into yours), so

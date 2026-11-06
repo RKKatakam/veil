@@ -93,8 +93,9 @@ pub const DEFAULT_ALLOW: &[&str] = &[
     ".gemini",
 ];
 
-/// Credential files inside allowed folders that stay hidden.
-const MASKED: &[&str] = &[".cargo/credentials", ".cargo/credentials.toml"];
+/// Credential files of cargo's home (`~/.cargo`, `$CARGO_HOME`) that stay
+/// hidden when an allowed folder holds them.
+const MASKED: &[&str] = &["credentials", "credentials.toml"];
 
 /// What `vl` says when there is no `bwrap`.
 const INSTALL: &str = "install bubblewrap (`apt install bubblewrap`, `dnf install bubblewrap` or `pacman -S bubblewrap`)";
@@ -323,8 +324,10 @@ fn show_size(n: u64) -> String {
 /// How the kernel-enforced limits are applied.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Backend {
-    /// A systemd user scope (`systemd-run`, `systemctl`).
-    Systemd { run: PathBuf, ctl: PathBuf },
+    /// A systemd user scope (`systemd-run`, `systemctl`). `verbatim`:
+    /// `systemd-run` takes `--expand-environment=no` (systemd 254 and
+    /// later, which otherwise expand `$VAR` and `$$` in the command).
+    Systemd { run: PathBuf, ctl: PathBuf, verbatim: bool },
     /// `RLIMIT_CPU` and polling.
     Poll,
 }
@@ -376,7 +379,6 @@ impl Confine {
             .and_then(|d| d.canonicalize().ok())
             .and_then(|d| d.strip_prefix(&root).ok().map(Path::to_path_buf))
             .unwrap_or_default();
-        let home = home.unwrap_or_else(|| PathBuf::from("/tmp/home"));
         let mut allow = Vec::new();
         for user in &a.allow {
             let p = Path::new(user);
@@ -384,9 +386,10 @@ impl Confine {
             allow.push((p, true));
         }
         allow.extend(cfg.allow.into_iter().map(|p| (p, true)));
-        allow.extend(DEFAULT_ALLOW.iter().map(|d| (home.join(d), false)));
+        allow.extend(default_allow(home.as_deref()));
+        let home = home.unwrap_or_else(|| PathBuf::from("/tmp/home"));
         let bwrap = find_program("bwrap", Some(&root)).ok_or_else(|| anyhow!("confinement needs bubblewrap, which is not installed: {INSTALL}, {OPT_OUT}"))?;
-        let base = base_args(&home, &allow, a.no_network)?;
+        let base = base_args(&home, Some(&root), &allow, a.no_network)?;
         probe(&bwrap, &base)?;
         let backend = backend(&limits, &root)?;
         let (soft, unavailable) = weak_limits(&limits, &backend);
@@ -423,8 +426,11 @@ impl Confine {
         let dir = self.start_dir(sandbox);
         let mut args: Vec<OsString> = Vec::new();
         let program = match &self.backend {
-            Backend::Systemd { run, .. } if self.limits.wants_cgroup() || self.limits.cpu_time.is_some() => {
+            Backend::Systemd { run, verbatim, .. } if self.limits.wants_cgroup() || self.limits.cpu_time.is_some() => {
                 args.extend(["--user", "--scope", "--quiet", "--unit", unit].map(OsString::from));
+                if *verbatim {
+                    args.push("--expand-environment=no".into());
+                }
                 let mut prop = |p: String| {
                     args.push("-p".into());
                     args.push(p.into());
@@ -497,6 +503,12 @@ impl Confine {
     }
 }
 
+/// The default allow-list under `home`, as `(path, explicit)`. None
+/// without a usable `HOME`: the stand-in `/tmp/home` is anyone's to create.
+fn default_allow(home: Option<&Path>) -> Vec<(PathBuf, bool)> {
+    home.map(|h| DEFAULT_ALLOW.iter().map(|d| (h.join(d), false)).collect()).unwrap_or_default()
+}
+
 /// `$HOME`, when it is a usable absolute path.
 fn home_dir() -> Option<PathBuf> {
     let h = PathBuf::from(std::env::var_os("HOME")?);
@@ -532,8 +544,15 @@ fn is_executable(p: &Path) -> bool {
 
 /// The namespaces and every mount but the sandbox's. `allow`: `(path,
 /// explicit)`; a missing default is skipped, a missing explicit entry is an
-/// error.
-fn base_args(home: &Path, allow: &[(PathBuf, bool)], no_network: bool) -> Result<Vec<OsString>> {
+/// error. `root`: the project's canonical path, where the sandbox appears.
+///
+/// The Veil home, the real project (its `.veil`: the store and the other
+/// workspaces' sandboxes) and cargo's credentials stay hidden whatever the
+/// allow-list holds: under their own names, and under every other name an
+/// allowed link gives them (an allowed `~/src` that links to the disk
+/// holding the project). An allowed path inside the Veil home or the
+/// project is refused.
+fn base_args(home: &Path, root: Option<&Path>, allow: &[(PathBuf, bool)], no_network: bool) -> Result<Vec<OsString>> {
     let mut a: Vec<OsString> = Vec::new();
     let mut push = |items: &[&std::ffi::OsStr]| a.extend(items.iter().map(|s| s.to_os_string()));
     for f in [
@@ -576,8 +595,16 @@ fn base_args(home: &Path, allow: &[(PathBuf, bool)], no_network: bool) -> Result
         }
     }
     push(&["--tmpfs".as_ref(), home.as_os_str()]);
-    let mut bound: Vec<PathBuf> = Vec::new();
-    for (p, explicit) in allow {
+    let vh = crate::ctx::veil_home();
+    let vh_real = vh.canonicalize().ok().filter(|v| v.is_dir() && v != Path::new("/"));
+    // What an allowed path may not be inside of.
+    let inside: Vec<(&Path, &str)> = [(vh_real.as_deref(), "inside the Veil home, which stays hidden"), (root, "inside the project, where the command sees its sandbox")]
+        .into_iter()
+        .filter_map(|(p, why)| Some((p?, why)))
+        .collect();
+    // `(dest, src)`: where each allowed path appears, and what it shows.
+    let mut bound: Vec<(PathBuf, PathBuf)> = Vec::new();
+    'allow: for (p, explicit) in allow {
         // Where it appears: the path as given (a symlinked `~/.local/bin`
         // stays where `PATH` names it), else resolved (`..`).
         let dest = match normal(p).or_else(|| p.canonicalize().ok()) {
@@ -592,32 +619,53 @@ fn base_args(home: &Path, allow: &[(PathBuf, bool)], no_network: bool) -> Result
             Err(e) if *explicit => bail!("--allow {}: {e}", safe(&p.to_string_lossy())),
             _ => continue,
         };
-        if bound.contains(&dest) {
+        for (h, why) in &inside {
+            if src.starts_with(h) {
+                match explicit {
+                    true => bail!("--allow {}: that is {why}", safe(&p.to_string_lossy())),
+                    false => continue 'allow,
+                }
+            }
+        }
+        if bound.iter().any(|(d, _)| *d == dest) {
             continue;
         }
         push(&["--ro-bind".as_ref(), src.as_os_str(), dest.as_os_str()]);
-        bound.push(dest);
+        bound.push((dest, src));
     }
-    for m in MASKED {
-        let p = home.join(m);
-        if bound.iter().any(|b| p.starts_with(b)) && std::fs::metadata(&p).is_ok_and(|m| m.is_file()) {
-            push(&["--ro-bind".as_ref(), "/dev/null".as_ref(), p.as_os_str()]);
+    // Every name under which the allow-list shows `real` (canonical).
+    let aliases = |real: &Path| -> Vec<PathBuf> {
+        bound.iter().filter_map(|(dest, src)| real.strip_prefix(src).ok().map(|rel| dest.join(rel))).collect()
+    };
+    let mut masks: Vec<(&str, PathBuf)> = Vec::new();
+    // Credential files, as named and wherever an allowed path shows them.
+    let cargo_home = std::env::var_os("CARGO_HOME").map(PathBuf::from).filter(|c| c.is_absolute());
+    for p in [Some(home.join(".cargo")), cargo_home].iter().flatten().flat_map(|c| MASKED.iter().map(|m| c.join(m))) {
+        if !std::fs::metadata(&p).is_ok_and(|m| m.is_file()) {
+            continue;
         }
-    }
-    // The Veil identity and keys, whatever the allow-list holds.
-    let vh = crate::ctx::veil_home();
-    let mut hidden = Vec::new();
-    if let Some(v) = normal(&vh) {
-        hidden.push(v);
-    }
-    if let Ok(c) = vh.canonicalize() {
-        hidden.push(c);
-    }
-    hidden.dedup();
-    for v in hidden {
-        if v != Path::new("/") && std::fs::metadata(&v).is_ok_and(|m| m.is_dir()) {
-            push(&["--tmpfs".as_ref(), v.as_os_str()]);
+        if bound.iter().any(|(d, _)| p.starts_with(d)) {
+            masks.push(("/dev/null", p.clone()));
         }
+        masks.extend(p.canonicalize().iter().flat_map(|c| aliases(c)).map(|a| ("/dev/null", a)));
+    }
+    // The Veil identity and keys, and the real project.
+    if let Some(v) = &vh_real {
+        masks.extend(normal(&vh).into_iter().chain([v.clone()]).chain(aliases(v)).map(|v| ("", v)));
+    }
+    if let Some(r) = root {
+        masks.extend(aliases(r).into_iter().filter(|a| a != r).map(|a| ("", a)));
+    }
+    let mut done: Vec<PathBuf> = Vec::new();
+    for (with, at) in masks {
+        if at == Path::new("/") || done.contains(&at) {
+            continue;
+        }
+        match with {
+            "" => push(&["--tmpfs".as_ref(), at.as_os_str()]),
+            file => push(&["--ro-bind".as_ref(), file.as_ref(), at.as_os_str()]),
+        }
+        done.push(at);
     }
     Ok(a)
 }
@@ -668,18 +716,45 @@ fn backend(limits: &Limits, root: &Path) -> Result<Backend> {
     }
 }
 
-/// A working systemd user manager: `systemd-run --user --scope` runs `true`.
+/// How long a `systemd-run` or `systemctl` call may take before `vl` gives
+/// up on it: a user manager that does not answer must not hang `vl`.
+const SYSTEMD_WAIT: Duration = Duration::from_secs(5);
+
+/// `cmd`'s output (stdin closed, stderr dropped), or `None` if it cannot
+/// run or outlives `limit`, when it is killed.
+fn output_within(cmd: &mut std::process::Command, limit: Duration) -> Option<std::process::Output> {
+    use std::process::Stdio;
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// A working systemd user manager: `systemd-run --user --scope` runs `true`
+/// in time.
 fn systemd(root: Option<&Path>) -> Option<Backend> {
     let run = find_program("systemd-run", root)?;
     let ctl = find_program("systemctl", root)?;
-    let ok = std::process::Command::new(&run)
-        .args(["--user", "--scope", "--quiet", "--collect", "--", "true"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    ok.then_some(Backend::Systemd { run, ctl })
+    let works = |extra: &[&str]| {
+        let mut c = std::process::Command::new(&run);
+        c.args(["--user", "--scope", "--quiet", "--collect"]).args(extra).args(["--", "true"]);
+        output_within(&mut c, SYSTEMD_WAIT).is_some_and(|o| o.status.success())
+    };
+    let verbatim = match works(&["--expand-environment=no"]) {
+        true => true,
+        false if works(&[]) => false,
+        false => return None,
+    };
+    Some(Backend::Systemd { run, ctl, verbatim })
 }
 
 /// `(soft, unavailable)` limit names with `backend`.
@@ -703,14 +778,14 @@ fn weak_limits(l: &Limits, backend: &Backend) -> (Vec<&'static str>, Vec<&'stati
 }
 
 /// What `vl doctor` says about confinement here: `(works, line, detail)`.
-pub fn doctor() -> Vec<(bool, String, Vec<String>)> {
+pub fn doctor(root: Option<&Path>) -> Vec<(bool, String, Vec<String>)> {
     let mut out = Vec::new();
     if !BUILT {
         out.push((true, "confinement: not built for this OS yet; `vl ws exec` runs unconfined".to_string(), Vec::new()));
         return out;
     }
     let home = home_dir().unwrap_or_else(|| PathBuf::from("/tmp/home"));
-    match find_program("bwrap", None) {
+    match find_program("bwrap", root) {
         None => out.push((
             false,
             "confinement: bubblewrap is not installed; `vl ws exec` refuses to run without --unconfined".into(),
@@ -723,14 +798,14 @@ pub fn doctor() -> Vec<(bool, String, Vec<String>)> {
                 .ok()
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_default();
-            let probe = base_args(&home, &[], false).and_then(|base| probe(&bwrap, &base));
+            let probe = base_args(&home, None, &[], false).and_then(|base| probe(&bwrap, &base));
             match probe {
                 Ok(()) => out.push((true, format!("confinement works ({}): `vl ws exec` runs confined", safe(&version)), Vec::new())),
                 Err(e) => out.push((false, "confinement does not work here".into(), vec![safe(&e.to_string()).into_owned()])),
             }
         }
     }
-    match systemd(None) {
+    match systemd(root) {
         Some(_) => out.push((true, "resource limits: a systemd user scope (enforced by the kernel)".into(), Vec::new())),
         None => out.push((
             true,
@@ -1010,10 +1085,17 @@ mod run {
             (_, Some(t), false) => Some(t.value.as_secs().max(1)),
             _ => None,
         };
-        // SAFETY: only signal(2) and setrlimit(2), which are
-        // async-signal-safe, between fork and exec.
+        let vl = std::process::id() as libc::pid_t;
+        // SAFETY: only prctl(2), getppid(2), signal(2) and setrlimit(2),
+        // which are async-signal-safe, between fork and exec.
         unsafe {
             cmd.pre_exec(move || {
+                // `vl` dying at any moment kills `systemd-run` or `bwrap`
+                // (and so the sandbox): `bwrap`'s own `--die-with-parent`
+                // only holds once it has started. It survives both execs.
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 || libc::getppid() != vl {
+                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+                }
                 for (sig, d) in &child_dispositions {
                     libc::signal(*sig, *d);
                 }
@@ -1153,16 +1235,19 @@ mod run {
             if status.signal().is_some() || status.code().is_some_and(|c| c > 128) {
                 // systemd learns of the OOM kill a moment after `vl` sees the
                 // exit: wait (up to a second) for the scope to settle.
+                let deadline = Instant::now() + super::SYSTEMD_WAIT;
                 let show = || {
-                    Command::new(ctl)
-                        .args(["--user", "show", "-p", "ActiveState", "-p", "Result", &format!("{unit}.scope")])
-                        .output()
-                        .ok()
+                    let mut c = Command::new(ctl);
+                    c.args(["--user", "show", "-p", "ActiveState", "-p", "Result", &format!("{unit}.scope")]);
+                    super::output_within(&mut c, deadline.saturating_duration_since(Instant::now()))
                         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
                         .unwrap_or_default()
                 };
                 let mut result = String::new();
                 for _ in 0..20 {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
                     let out = show();
                     let get = |k: &str| out.lines().find_map(|l| l.strip_prefix(k)).unwrap_or("").to_string();
                     result = get("Result=");
@@ -1174,10 +1259,9 @@ mod run {
                 if result == "oom-kill" && stopped.is_none() {
                     stopped = l.memory.as_ref().map(|m| format!("memory limit ({})", show_size(m.value)));
                 }
-                let _ = Command::new(ctl)
-                    .args(["--user", "reset-failed", &format!("{unit}.scope")])
-                    .stderr(std::process::Stdio::null())
-                    .status();
+                let mut c = Command::new(ctl);
+                c.args(["--user", "reset-failed", &format!("{unit}.scope")]);
+                let _ = super::output_within(&mut c, super::SYSTEMD_WAIT);
             }
             if forks_refused && stopped.is_none() {
                 if let Some(p) = &l.pids {
@@ -1244,6 +1328,12 @@ mod tests {
         assert_eq!(normal(Path::new("/a/./b")), Some(PathBuf::from("/a/b")));
         assert_eq!(normal(Path::new("/a/../b")), None);
         assert_eq!(normal(Path::new("a/b")), None);
+    }
+
+    #[test]
+    fn without_a_home_there_is_no_default_allow_list() {
+        assert!(default_allow(None).is_empty());
+        assert_eq!(default_allow(Some(Path::new("/home/u"))).len(), DEFAULT_ALLOW.len());
     }
 
     #[test]
