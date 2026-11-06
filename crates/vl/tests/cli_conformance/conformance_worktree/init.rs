@@ -111,9 +111,11 @@ fn init_lists_existing_secrets_as_local_only() {
     r.write("deploy/id_ed25519", "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Blbn\n-----END OPENSSH PRIVATE KEY-----\n");
     r.write("app.py", "print('hi')\n");
     let out = r.ok(&["init"]);
+    // A personal key stays on the device; a shared secret (`.env`) is
+    // sealed and recorded, never stored in plain text (docs/VISIBILITY.md).
     assert!(out.contains("local-only"), "{out}");
-    assert!(out.contains(".env"), "{out}");
-    assert_eq!(r.paths("@"), vec!["app.py"]);
+    assert!(out.contains("id_ed25519") && !out.contains("local-only .env"), "{out}");
+    assert_eq!(r.paths("@"), vec![".env", "app.py"]);
     assert!(!contains_bytes(&all_bytes(&r.path(".veil/objects")), "Xk29vLq8sPz"));
 }
 

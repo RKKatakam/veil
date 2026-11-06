@@ -104,6 +104,11 @@ pub struct RemoteConfig {
     /// unreleased embargoed content.
     #[serde(default)]
     pub public: bool,
+    /// A Veil server remote cloned with `vl clone --only DIR`: only DIR's
+    /// files are fetched (device-local; absent otherwise, so earlier
+    /// `repo.json` files keep their bytes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub only: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

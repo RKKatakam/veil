@@ -11,6 +11,15 @@
 //!
 //! Tiers: `public`, `public!`, `cloak [scope]`, `isolate`, `ignore`.
 //!
+//! **Access lines** (`docs/VISIBILITY.md`, the Veil server's permission
+//! model) name who may see a folder: `billing/  finance`, `infra/  ops
+//! carol`, `src/  public`. On the device an access line records its paths
+//! as plain text, exactly like `public` (it never weakens a secret's
+//! protection); who may see them is decided by the server, from the
+//! accepted policy ([`crate::hub::access`]). A line whose fields after the
+//! pattern are all valid group or person names ([`valid_principal_name`])
+//! is an access line; anything else that is not a tier still fails safe.
+//!
 //! Patterns are globs (`*`, `**`, `?`, `[…]`, `{a,b}`). A backslash escapes
 //! the next character, so `config\[prod\].yml` matches that literal name and
 //! `my\ file.txt` contains a space; `vl cloak <existing path>` writes such
@@ -85,6 +94,30 @@ const BUILTIN_SECRETS: &[&str] = &[
     "*.tfstate",
     "*.tfstate.*",
 ];
+
+/// The built-in secrets that are **shared** (a team's `.env`, Terraform
+/// state): new repositories seal and sync them ([`SYNCED_SECRETS_POLICY`]).
+/// Every other built-in secret is a personal credential or private key
+/// (`id_rsa`, `id_ed25519`, `*.pem`, `*.key`, `.netrc`, …) and stays on the
+/// device.
+pub const SHARED_SECRETS: &[&str] = &[".env", ".env.*", ".envrc", "*.tfstate", "*.tfstate.*"];
+
+/// The `.veilpolicy` lines that seal the shared secrets ([`SHARED_SECRETS`])
+/// under the `team` scope, so they are encrypted on the device and synced
+/// (`docs/VISIBILITY.md`, "Secrets are encrypted"). `vl init` writes them;
+/// `vl upgrade --sync-secrets` adds them to an existing repository after
+/// listing the files that would start syncing.
+pub const SYNCED_SECRETS_POLICY: &str = "\
+# Shared secrets are encrypted on this device and synced; only devices
+# holding the 'team' key open them (an admin's `vl group add` grants it).
+# Personal private keys (id_rsa, id_ed25519, *.pem, *.key, .netrc, ...)
+# never leave this device.
+.env                     cloak team
+.env.*                   cloak team
+.envrc                   cloak team
+*.tfstate                cloak team
+*.tfstate.*              cloak team
+";
 
 const BUILTIN_PUBLIC_EXCEPTIONS: &[&str] = &[".env.example", ".env.sample", ".env.template", ".env.dist"];
 
@@ -316,6 +349,9 @@ impl Tier {
 pub struct Rule {
     pub pattern: String,
     pub tier: Tier,
+    /// The groups and people an access line names (empty for every other
+    /// rule). On the device the rule is a plain `public` rule.
+    pub grantees: Vec<String>,
     /// `public!` — deliberate exposure, secret scanning disabled.
     pub force: bool,
     pub builtin: bool,
@@ -362,6 +398,34 @@ fn compile_set(rules: &[Rule]) -> GlobSet {
     b.build().expect("globs were already validated individually")
 }
 
+
+/// Is `name` a valid group or person name for an access line: 1 to 64
+/// lowercase ASCII letters, digits, `-`, `_` or `.`, starting with a letter
+/// or digit, and not a tier keyword?
+pub fn valid_principal_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.'))
+        && !TIER_KEYWORDS.contains(&name)
+}
+
+/// Words that are tiers, never group or person names.
+const TIER_KEYWORDS: &[&str] = &["public", "cloak", "cloaked", "isolate", "isolated", "local", "ignore", "ignored"];
+
+/// Is a split policy line (`fields`) an access line: a pattern, then
+/// `public` and/or one or more group or person names?
+pub fn is_access_line(fields: &[String]) -> bool {
+    fields.len() >= 2
+        && fields[1..].iter().all(|f| f == "public" || valid_principal_name(f))
+        && !(fields.len() == 2 && fields[1] == "public")
+}
+
+/// Split a policy line into fields: whitespace separates fields unless
+/// escaped, and an unescaped `#` starts a comment.
+pub fn split_fields(line: &str) -> Vec<String> {
+    fields(line)
+}
 
 /// Characters with a meaning in a policy pattern.
 const SPECIAL: &[char] = &['*', '?', '[', ']', '{', '}', '\\', '#'];
@@ -473,6 +537,7 @@ impl Rule {
         };
         Ok(Rule {
             pattern: pattern.trim().to_string(),
+            grantees: Vec::new(),
             exact: build(&base)?,
             under: build(&format!("{base}/**"))?,
             tier,
@@ -643,8 +708,14 @@ impl Policy {
                 policy.warnings.push(format!("{at}: {why}; treating '{}' as isolate", parts[0]));
                 (Tier::Isolated, false)
             };
+            let mut grantees = Vec::new();
             let (tier, force) = match parts.get(1).map(String::as_str) {
                 None => invalid("expected '<pattern> <tier>'".into()),
+                // An access line: plain text here, access decided by the server.
+                Some(_) if is_access_line(&parts) => {
+                    grantees = parts[1..].iter().filter(|n| *n != "public").cloned().collect();
+                    (Tier::Public, false)
+                }
                 Some("public") => (Tier::Public, false),
                 Some("public!") => (Tier::Public, true),
                 Some("cloak" | "cloaked") => {
@@ -660,7 +731,10 @@ impl Policy {
                 Some(other) => invalid(format!("unknown tier '{other}'")),
             };
             match Rule::new(&parts[0], tier.clone(), force, false, false) {
-                Ok(r) => policy.rules.push(r),
+                Ok(mut r) => {
+                    r.grantees = grantees;
+                    policy.rules.push(r)
+                }
                 // Not a valid glob. A protective rule falls back to the
                 // literal name (`config[prod.yml`), so it still protects
                 // what it names; an exposing one is dropped.
@@ -1989,7 +2063,7 @@ mod tests {
 
     #[test]
     fn invalid_rules_fail_safe() {
-        let p = Policy::parse("a/ cloak local\nb/ cloak embargo/x\nc/ clok\nd/\ne[ cloak\nf[ public!\n");
+        let p = Policy::parse("a/ cloak local\nb/ cloak embargo/x\nc/ Clok\nd/\ne[ cloak\nf[ public!\n");
         for path in ["a/x", "b/x", "c/x", "d/x"] {
             assert_eq!(class(&p, path), Tier::Isolated, "{path}: {:?}", p.warnings);
         }

@@ -25,11 +25,11 @@ fn files_dir(proj: &Path) -> PathBuf {
     sandbox_dir(proj).join("files")
 }
 
-/// `main` = `a.txt`, `src/lib.rs`, `README.md`, plus an isolated `.env`
+/// `main` = `a.txt`, `src/lib.rs`, `README.md`, plus an isolated `.netrc`
 /// (in the local vault); virtual workspace `agent` on it.
 fn project(env: &Env) -> PathBuf {
     let proj = env.project(U, "proj", &[("a.txt", "a\n"), ("src/lib.rs", "pub fn f() {}\n"), ("README.md", "r\n")]);
-    write(&proj, ".env", &format!("SESSION_SALT={SECRET}\n"));
+    write(&proj, ".netrc", &format!("SESSION_SALT={SECRET}\n"));
     env.ok(U, &proj, &["commit", "-m", "env"]);
     env.ok(U, &proj, &["ws", "new", "agent", "-r", "@-"]);
     proj
@@ -53,8 +53,8 @@ fn work_kept(env: &Env, proj: &Path, path: &str, content: &str) -> bool {
 /// ARCHITECTURE §6 step 8 / `sandbox.rs` module docs: "nothing that copies
 /// an injected secret survives into a run that no longer guards against
 /// it". The guard only cleans what the builder quarantined, and the builder
-/// never looks at ignored or isolated paths: a build that bakes `.env` into
-/// `target/`, `node_modules/`, or a `.env.local` / `.env.bak` copy, keeps
+/// never looks at ignored or isolated paths: a build that bakes `.netrc` into
+/// `target/`, `node_modules/`, or a `.netrc.local` / `.netrc.bak` copy, keeps
 /// the secret in the sandbox, readable by every later run that was not
 /// given it.
 #[test]
@@ -69,13 +69,13 @@ fn injected_secret_copies_in_ignored_or_isolated_paths_are_taken_out() {
             "--",
             "sh",
             "-c",
-            "mkdir -p target node_modules/pkg; cp .env target/app.env; cp .env node_modules/pkg/config; cp .env .env.local; cp .env .env.bak",
+            "mkdir -p target node_modules/pkg; cp .netrc target/app.env; cp .netrc node_modules/pkg/config; cp .netrc .netrc.local; cp .netrc .netrc.bak",
         ],
     );
     assert!(!out.contains("error"), "{out}");
     let left = tree_contains(&sandbox_dir(&proj), SECRET.as_bytes());
     // A later run, not given the isolated files, must not find the secret.
-    let later = exec(&env, &proj, &["--", "sh", "-c", "cat target/app.env node_modules/pkg/config .env.local .env.bak 2>/dev/null; true"]);
+    let later = exec(&env, &proj, &["--", "sh", "-c", "cat target/app.env node_modules/pkg/config .netrc.local .netrc.bak 2>/dev/null; true"]);
     assert!(
         left.is_empty() && !later.contains(SECRET),
         "the injected secret outlived its run in {left:?}; a run without --with-isolated read it:\n{later}"
@@ -107,7 +107,7 @@ fn a_secret_that_lands_after_an_injected_run_is_never_recorded() {
             "--",
             "sh",
             "-c",
-            "v=$(cat .env); (sleep 2; echo \"$v\" > server.log) </dev/null >/dev/null 2>&1 &",
+            "v=$(cat .netrc); (sleep 2; echo \"$v\" > server.log) </dev/null >/dev/null 2>&1 &",
         ],
     );
     let log = files_dir(&proj).join("server.log");

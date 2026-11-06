@@ -4,8 +4,8 @@
 //! makes a snapshot less protected than the pin (BUG-106, BUG-107).
 //!
 //! Each route test starts from the same state: Alice's project has an
-//! isolated `.env` and is pushed to `hub`; Mallory pushes a `.veilpolicy`
-//! that says `.env public!`; Alice pulls. After the route, `.env` must
+//! isolated `.netrc` and is pushed to `hub`; Mallory pushes a `.veilpolicy`
+//! that says `.netrc public!`; Alice pulls. After the route, `.netrc` must
 //! still be off the record until Alice runs `vl policy accept`.
 
 use crate::adversarial_support;
@@ -17,13 +17,13 @@ use adversarial_support::{read, text, write, Env};
 const U: &str = "alice";
 const SECRET: &str = "DB_PASSWORD=hunter2hunter2\n";
 
-/// Alice's project (`.env` isolated, `main` pushed to `hub`) after
-/// `vl pull` of Mallory's `.env public!` on `main`.
+/// Alice's project (`.netrc` isolated, `main` pushed to `hub`) after
+/// `vl pull` of Mallory's `.netrc public!` on `main`.
 fn pulled_hostile_policy(env: &Env) -> std::path::PathBuf {
     let hub = env.dir("hub");
     let proj = env.dir("proj");
     env.ok(U, &proj, &["init"]);
-    write(&proj, ".env", SECRET);
+    write(&proj, ".netrc", SECRET);
     write(&proj, "a.txt", "a\n");
     env.ok(U, &proj, &["commit", "-m", "initial"]);
     env.ok(U, &proj, &["tag", "set", "main", "-r", "@-"]);
@@ -32,7 +32,7 @@ fn pulled_hostile_policy(env: &Env) -> std::path::PathBuf {
     env.ok(U, &proj, &["push"]);
     let m = env.root.join("m");
     env.ok("mallory", &env.root, &["clone", hub.to_str().unwrap(), "m"]);
-    let policy = read(&m, ".veilpolicy") + ".env public!\n";
+    let policy = read(&m, ".veilpolicy") + ".netrc public!\n";
     write(&m, ".veilpolicy", &policy);
     write(&m, "b.txt", "b\n");
     env.ok("mallory", &m, &["commit", "-m", "add b"]);
@@ -41,17 +41,17 @@ fn pulled_hostile_policy(env: &Env) -> std::path::PathBuf {
     proj
 }
 
-/// `.env` is not recorded in the working copy, nor in a commit of it.
+/// `.netrc` is not recorded in the working copy, nor in a commit of it.
 fn assert_env_off_the_record(env: &Env, proj: &Path, route: &str) {
-    assert_eq!(read(proj, ".env"), SECRET, "{route}: the local .env is gone");
+    assert_eq!(read(proj, ".netrc"), SECRET, "{route}: the local .netrc is gone");
     let status = env.ok(U, proj, &["status"]);
     let files = env.stdout(U, proj, &["files"]);
     assert!(
-        !files.lines().any(|l| l.ends_with(" .env")) && !status.contains("A .env"),
-        "{route}: the pulled policy published .env without `vl policy accept`:\n{status}\n{files}"
+        !files.lines().any(|l| l.ends_with(" .netrc")) && !status.contains("A .netrc"),
+        "{route}: the pulled policy published .netrc without `vl policy accept`:\n{status}\n{files}"
     );
     assert!(status.contains("policy accept"), "{route}: nothing says the policy is held back:\n{status}");
-    let p = env.stdout(U, proj, &["policy", "check", ".env"]);
+    let p = env.stdout(U, proj, &["policy", "check", ".netrc"]);
     assert!(p.contains("isolated") && p.contains("not yet accepted"), "{route}: {p}");
 }
 
@@ -59,7 +59,7 @@ fn assert_env_off_the_record(env: &Env, proj: &Path, route: &str) {
 fn assert_accept_moves_it(env: &Env, proj: &Path) {
     env.ok(U, proj, &["policy", "accept"]);
     let files = env.stdout(U, proj, &["files"]);
-    assert!(files.lines().any(|l| l.ends_with(" .env")), "{files}");
+    assert!(files.lines().any(|l| l.ends_with(" .netrc")), "{files}");
 }
 
 #[test]
@@ -85,14 +85,14 @@ fn restoring_only_the_policy_file_holds_it_back() {
 fn restore_of_other_paths_keeps_the_members_own_policy_edit() {
     let env = Env::new();
     let proj = env.project(U, "proj", &[("a.txt", "a\n"), ("b.txt", "b\n")]);
-    write(&proj, ".env", SECRET);
+    write(&proj, ".netrc", SECRET);
     env.ok(U, &proj, &["status"]);
-    let policy = read(&proj, ".veilpolicy") + ".env public!\n";
+    let policy = read(&proj, ".veilpolicy") + ".netrc public!\n";
     write(&proj, ".veilpolicy", &policy);
     write(&proj, "a.txt", "changed\n");
     env.ok(U, &proj, &["--no-snapshot", "restore", "a.txt"]);
     let files = env.stdout(U, &proj, &["files"]);
-    assert!(files.lines().any(|l| l.ends_with(" .env")), "the member's own edit was not applied:\n{files}");
+    assert!(files.lines().any(|l| l.ends_with(" .netrc")), "the member's own edit was not applied:\n{files}");
 }
 
 #[test]
@@ -128,7 +128,7 @@ fn undo_back_onto_a_pulled_policy_holds_it_back() {
     env.ok(U, &proj, &["new", "main"]);
     env.ok(U, &proj, &["new", "before"]);
     env.ok(U, &proj, &["undo"]);
-    assert!(read(&proj, ".veilpolicy").contains(".env public!"), "control: undo is back on main");
+    assert!(read(&proj, ".veilpolicy").contains(".netrc public!"), "control: undo is back on main");
     assert_env_off_the_record(&env, &proj, "undo");
 }
 
@@ -141,7 +141,7 @@ fn op_restore_onto_a_pulled_policy_holds_it_back() {
     let op = log.split_whitespace().next().unwrap().to_string();
     env.ok(U, &proj, &["new", "before"]);
     env.ok(U, &proj, &["op", "restore", &op]);
-    assert!(read(&proj, ".veilpolicy").contains(".env public!"), "control: op restore is back on main");
+    assert!(read(&proj, ".veilpolicy").contains(".netrc public!"), "control: op restore is back on main");
     assert_env_off_the_record(&env, &proj, "op restore");
 }
 
@@ -163,7 +163,7 @@ fn cloaked_project(env: &Env) -> std::path::PathBuf {
     env.ok(U, &proj, &["init"]);
     write(&proj, ".veilpolicy", "secrets/ cloak team\n");
     write(&proj, "secrets/db.yml", "password: hunter2hunter2\n");
-    write(&proj, ".env", SECRET);
+    write(&proj, ".netrc", SECRET);
     write(&proj, "README", "hi\n");
     env.ok(U, &proj, &["commit", "-m", "initial"]);
     proj
@@ -177,7 +177,7 @@ fn assert_still_protected(env: &Env, proj: &Path, what: &str) -> String {
         assert!(l.starts_with("cloaked:team"), "{what}: the policy stopped applying:\n{status}\n{files}");
     }
     assert!(files.contains("secrets/new.yml"), "{what}: {files}");
-    assert!(!files.lines().any(|l| l.ends_with(" .env")), "{what}: {files}");
+    assert!(!files.lines().any(|l| l.ends_with(" .netrc")), "{what}: {files}");
     status
 }
 
@@ -283,10 +283,10 @@ fn a_directory_named_veilpolicy_falls_back_to_the_pin() {
 fn the_members_own_edit_still_applies() {
     let env = Env::new();
     let proj = cloaked_project(&env);
-    let policy = read(&proj, ".veilpolicy") + ".env public!\n";
+    let policy = read(&proj, ".veilpolicy") + ".netrc public!\n";
     write(&proj, ".veilpolicy", &policy);
     let files = env.stdout(U, &proj, &["files"]);
-    assert!(files.lines().any(|l| l.ends_with(" .env")), "{files}");
+    assert!(files.lines().any(|l| l.ends_with(" .netrc")), "{files}");
 }
 
 /// A symlink planted by a hostile Git checkout (`vl init` in CI) to a file

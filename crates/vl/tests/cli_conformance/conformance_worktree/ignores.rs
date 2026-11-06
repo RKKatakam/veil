@@ -330,11 +330,13 @@ fn trailing_whitespace_after_a_rule_is_ignored() {
 
 // Scenario from git t0008-ignores.sh "multiple files inside ignored
 // sub-directory" with Veil's fail-safe rule parsing: an unknown tier
-// keeps the files out (isolated), never public.
+// keeps the files out (isolated), never public. (A lowercase word is a
+// group or person name: an access line, refused by the server at push
+// when no such group exists.)
 #[test]
 fn a_misspelt_ignore_rule_fails_safe() {
     let env = Env::new();
-    let r = with_rules(&env, "scratch/ ingore\n");
+    let r = with_rules(&env, "scratch/ Ingore\n");
     r.write("scratch/a.txt", "c\n");
     let st = r.status();
     assert!(st.contains("warning"), "{st}");

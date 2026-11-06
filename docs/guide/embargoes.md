@@ -7,7 +7,7 @@ tree**: no new file names, sizes or message, and none of the fix's history.
 After the release, the same snapshot ids become readable, with nothing
 rewritten.
 
-> **With the server**, an embargo goes to chosen groups now and becomes public later (`vl merge fix --into main --embargo-for security distro-partners --until 2026-12-01`), and an embargoed PR doesn't exist for anyone else ([VISIBILITY.md](../VISIBILITY.md), "Hidden changes"). The commands below are today's client, before the server, where the audience is a *scope* (`--embargo --scope S`); this changes when the server lands (see [OVERVIEW.md](../OVERVIEW.md)).
+> **With the server**, an embargo goes to chosen groups now and becomes public later (planned: `vl merge fix --into main --embargo-for <groups…> --until <date>`), and an embargoed PR doesn't exist for anyone else ([VISIBILITY.md](../VISIBILITY.md), "Hidden changes"). The commands below are today's client, before the server, where the audience is a *scope* (`--embargo --scope S`); this changes when the server lands (see [OVERVIEW.md](../OVERVIEW.md)).
 
 1. [The workflow](#the-workflow)
 2. [What the public sees](#what-the-public-sees)

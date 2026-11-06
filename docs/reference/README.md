@@ -27,6 +27,9 @@ Global options (accepted by every command):
 |---|---|
 | [`vl init`](init.md) | Create a repository in PATH (default: current directory) |
 | [`vl clone`](clone.md) | Copy a repository (and every tag you can see) into a new directory |
+| [`vl login`](login.md) | Sign in to a Veil server with this device's identity key |
+| [`vl group`](group.md) | Groups of people on the Veil server (the origin remote's project) |
+| [`vl access`](access.md) | Who may see a path; with WHO, give a group, a person or `public` access to it |
 | [`vl status`](status.md) | Show working-copy changes, local-only files and conflicts |
 | [`vl log`](log.md) | Show the snapshot graph |
 | [`vl show`](show.md) | Show a snapshot's metadata and diff |

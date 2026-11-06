@@ -1,0 +1,54 @@
+[package]
+name = "veil-server"
+description = "The Veil server (the Hub): projects, permissions and sync for `vl` (docs/HUB.md)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[[bin]]
+name = "veil-server"
+path = "src/main.rs"
+
+[dependencies]
+veil-core.workspace = true
+anyhow.workspace = true
+blake3.workspace = true
+clap.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# The async runtime the HTTP server, database and object-store clients share.
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "fs", "sync", "time", "signal"] }
+# HTTP routing and extractors for the JSON API.
+axum = { version = "0.8", default-features = false, features = ["json", "query", "tokio", "http1", "http2"] }
+# Serving the axum router over our own TLS listener.
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "service"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+# TLS everywhere (ring provider: no C toolchain beyond what zstd needs).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# A self-signed certificate for local development (`--self-signed`).
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+# Metadata in PostgreSQL / YugabyteDB, plain SQL, no compile-time database.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres"] }
+# The S3 object store: request signing without the AWS SDK, sent with reqwest.
+rusty-s3 = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# The object-store trait is async and object safe.
+async-trait = "0.1"
+bytes = "1"
+# FsStore writes each object to a temporary file before renaming it.
+tempfile.workspace = true
+
+[features]
+# Tests that need Docker (PostgreSQL, YugabyteDB, MinIO): run by
+# scripts/verify-server.sh, never by verify-fast.sh.
+containers = []
+
+[dev-dependencies]
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }

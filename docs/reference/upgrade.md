@@ -18,6 +18,7 @@ Options:
 | `--dry-run` | Show what would happen without changing anything |
 | `--remote <NAME>` | Upgrade this remote instead of the local repository |
 | `--force` | Upgrade even if fsck reports corruption |
+| `--sync-secrets` | Start encrypting and syncing shared secrets (`.env`, `.env.*`, `.envrc`, Terraform state) under the `team` key, as new repositories do: lists the files that would start syncing, then adds the rules to `.veilpolicy` (with --dry-run: only lists). Personal private keys stay on this device |
 
 ---
 

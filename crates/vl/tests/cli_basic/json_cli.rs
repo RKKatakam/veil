@@ -353,7 +353,7 @@ fn world() -> World {
     let alice = env.dir("alice");
     write(&alice, "README.md", "hello\n");
     write(&alice, "internal/plan.md", &format!("{CLOAKED_TEXT}\n"));
-    write(&alice, ".env", &format!("API={ISOLATED_TEXT}\n"));
+    write(&alice, ".netrc", &format!("API={ISOLATED_TEXT}\n"));
     write(&alice, "run.sh", "echo hi\n");
     env.ok("alice", &alice, &["init"]);
     env.ok("alice", &alice, &["cloak", "internal/"]);
@@ -489,7 +489,7 @@ fn status_shape() {
     let v = json_ok(env, "alice", alice, &["status", "--json"]);
     check_doc(&v, "veil.status/1");
     assert_eq!(v["workspace"]["name"], "default");
-    assert_eq!(v["isolated"], json!([".env"]));
+    assert_eq!(v["isolated"], json!([".netrc"]));
     let q = nonempty(&v, "quarantined");
     assert_eq!(q[0]["path"], "cfg.py");
     assert_eq!(q[0]["state"], "never_recorded");
@@ -599,7 +599,7 @@ fn diff_and_show_shape() {
     #[cfg(unix)]
     assert_eq!(by("run.sh")["new"]["mode"], "100755");
     assert_eq!(by("internal/plan.md")["new"]["visibility"], json!({"kind": "cloaked", "scope": "team", "embargo": null}));
-    assert!(!files.iter().any(|f| f["path"] == ".env"), "isolated files are never recorded");
+    assert!(!files.iter().any(|f| f["path"] == ".netrc"), "isolated files are never recorded");
 
     let v = json_ok(env, "alice", alice, &["diff", "--from", "root()", "--to", "main", "--stat", "--json"]);
     check_doc(&v, "veil.diff/1");
@@ -685,7 +685,7 @@ fn ls_shape() {
     assert_eq!(get("README.md")["tier"], "embargoed", "@ is on the embargoed merge, whose key Alice holds");
     let plan = get("internal/plan.md");
     assert_eq!((plan["tier"].clone(), plan["scope"].clone(), plan["readable"].clone()), (json!("cloaked"), json!("team"), json!(true)));
-    let env_file = get(".env");
+    let env_file = get(".netrc");
     assert_eq!((env_file["tier"].clone(), env_file["recorded"].clone()), (json!("isolated"), json!(false)));
     let q = get("cfg.py");
     assert_eq!((q["tier"].clone(), q["quarantine"]["state"].clone()), (json!("quarantined"), json!("never_recorded")));
@@ -746,13 +746,13 @@ fn push_plan_shape() {
 fn scan_shape_and_exit_status() {
     let w = world();
     let (env, alice) = (&w.env, &w.alice);
-    write(alice, ".env", &format!("API={ISOLATED_TEXT}\nGH={TOKEN}\n"));
+    write(alice, ".netrc", &format!("API={ISOLATED_TEXT}\nGH={TOKEN}\n"));
     let v = json_ok(env, "alice", alice, &["scan", "--json"]);
     check_doc(&v, "veil.scan/1");
     assert_eq!(v["mode"], "working_copy");
     assert_eq!(v["clean"], true);
     let f = nonempty(&v, "files");
-    assert!(f.iter().any(|f| f["path"] == ".env" && f["tier"] == "isolated" && f["protected"] == true), "{v}");
+    assert!(f.iter().any(|f| f["path"] == ".netrc" && f["tier"] == "isolated" && f["protected"] == true), "{v}");
 
     write(alice, "cfg.py", &format!("token = '{TOKEN}'\n"));
     let (v, code) = json_doc(env, "alice", alice, &["scan", "--json"]);
@@ -828,7 +828,7 @@ fn no_confidential_plaintext_in_any_json_output() {
     let carol = all_json(&w.env, "carol", &w.carol);
     assert_absent(&carol, &[CLOAKED_TEXT, CLOAKED_DESC, ISOLATED_TEXT, VAULT_VALUE, EMBARGO_TEXT, "plan-tag"], "carol");
     // Alice herself: isolated files and vault values never appear either.
-    write(&w.alice, ".env", &format!("API={ISOLATED_TEXT}\nGH={TOKEN}\n"));
+    write(&w.alice, ".netrc", &format!("API={ISOLATED_TEXT}\nGH={TOKEN}\n"));
     let alice = all_json(&w.env, "alice", &w.alice);
     assert_absent(&alice, &[ISOLATED_TEXT, VAULT_VALUE, TOKEN], "alice");
     assert!(alice.contains(CLOAKED_TEXT) && alice.contains(CLOAKED_DESC), "alice is a member and reads it");

@@ -5,7 +5,7 @@
 
 Copy a repository (and every tag you can see) into a new directory.
 
-SOURCE is a path, `ssh://[user@]host[:port]/path` or scp-style `[user@]host:path` (through your own `ssh`; the server needs only SSH with SFTP).
+SOURCE is a Veil server project (`veil://host[:port]/project` or `https://host[:port]/project`): you receive only what you may see. Today's client also clones a path, `ssh://[user@]host[:port]/path` or scp-style `[user@]host:path` (through your own `ssh`).
 
 ```text
 vl clone [OPTIONS] <SOURCE> [DEST]
@@ -15,8 +15,14 @@ Arguments:
 
 | | |
 |---|---|
-| `<SOURCE>` | Repository to clone: a path or an SSH URL (required) |
+| `<SOURCE>` | Project or repository to clone: a server URL, a path or an SSH URL (required) |
 | `<DEST>` | Directory to clone into (default: the source's last path component) |
+
+Options:
+
+| | |
+|---|---|
+| `--only <DIR>` | From a Veil server: fetch only this directory's files (the server sends only that subtree's objects) |
 
 ---
 

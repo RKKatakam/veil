@@ -127,11 +127,11 @@ fn status_does_not_show_ignored_files() {
 fn status_reports_local_only_and_quarantined_files() {
     let env = Env::new();
     let r = env.repo("p");
-    r.write(".env", DOTENV);
+    r.write(".netrc", DOTENV);
     r.write("cfg.js", LEAKY);
     r.write("app.py", "print(1)\n");
     let st = r.status();
-    assert!(st.contains("Local-only (isolated; never snapshotted or pushed):\n  L .env"), "{st}");
+    assert!(st.contains("Local-only (isolated; never snapshotted or pushed):\n  L .netrc"), "{st}");
     assert!(st.contains("Q cfg.js [quarantined]  (aws-access-key-id; never recorded)"), "{st}");
     assert!(st.contains("warning: cfg.js quarantined"), "{st}");
     assert_eq!(r.changes(), vec!["A app.py"]);
