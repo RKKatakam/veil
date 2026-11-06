@@ -1,44 +1,50 @@
 # Known open issues
 
-Collected from the agents' reports during rounds 1–2. Fixed adversarial
+Collected from the agents' reports during the build rounds. Fixed adversarial
 findings are in `docs/BUGS.md`; this file lists what is known and **not yet
 fixed**. Severity: high / medium / low.
 
-## Before the Hub (owner-approved order: after all bugs are fixed)
+## The order (owner, 2026-11-05)
 
-> **Scion for developers** (`docs/design/scion-for-developers.md`, added
-> 2026-11-04): a server-centred, agent-scale roadmap on top of the Hub.
-> Its **phase 0** belongs here, in the scale round after Git parity:
-> lock-free SFTP writes (pack first, lock only for the branch update),
-> a lock-free op log, a history (commit-graph) index, the scale
-> benchmark (including a mostly-cloaked profile) and background cleanup
-> instead of whole-store `gc`. Phases 1–4 are Hub work.
+Veil is server-centric ([OVERVIEW.md](OVERVIEW.md)). The order is:
 
-### Agent workspaces and scale
+1. **Next: the Veil server and the permission model, built together**
+   ([HUB.md](HUB.md) §11, [VISIBILITY.md](VISIBILITY.md)): the server, the
+   database (YugabyteDB; PostgreSQL in dev and CI), object storage,
+   sign-in, groups, admins, managers, folder access, `public`, encrypted
+   secrets, and `vl` pushing and pulling through the server, each person
+   receiving only what they may see.
+2. **Then: a simplification pass.** Remove what the server makes
+   unnecessary: SFTP and path remotes, offline assumptions, old storage
+   formats (kept readable for `vl upgrade`) and old jargon (`cloak`,
+   `scope`, `isolate`).
+3. **Then: the server's features, in stages**
+   ([design/scion-for-developers.md](design/scion-for-developers.md)):
+   fetch on demand, server-side history and search, landing changes at
+   agent scale, PR review and hidden PRs. Each is gated by the server's
+   benchmark targets ([HUB.md](HUB.md) §9.2).
+
+**Non-goals:** Git interop (permanent); offline use or plain-file remotes
+(SFTP, shared drives); encrypting code.
+
+### Client work, independent of the server
 - **Copy-on-write file clones for project-directory checkouts** (`vl ws
   switch`, `vl edit`): `ws exec` sandboxes clone already
-  (`StorageBackend::clone_known`); the project directory does not.
+  (`StorageBackend::clone_known`); the project directory does not
+  (`docs/design/scale/5-reflink-checkouts.md`).
+- **Sandbox resource limits** (`docs/design/scale/8-sandbox-limits.md`).
 - **Fix what the scale benchmark exposes** (the harness is built:
-  `scripts/bench-scale.sh`; the 1 GB baseline and its ranked offenders are
-  in `docs/design/scale/BASELINE.md`; the ~5 GB run is still to do):
-  - streaming / incremental `gc` (no whole-store pack in memory);
-  - streaming pull (packs written to disk, not held in RAM);
+  `scripts/bench-scale.sh`; numbers in `docs/design/scale/BASELINE.md`; the
+  ~5 GB run is still to do):
   - streaming large-file read/hash/seal (no whole file in memory);
-  - content-defined chunking for large binaries (an LFS replacement);
-  - partial and sparse clone;
-  - a history index (like Git's commit-graph) so commands stop walking all
-    history;
-  - concurrent op-log merging instead of one repository lock.
-
-### Gaps compared with Git (core, before the Hub)
+  - content-defined chunking for large binaries (an LFS replacement).
 - **Missing everyday commands:** `archive` (tarball of a snapshot).
-- **Directory-rename detection in merges** (Git's `ort`: a file added on one
-  side inside a directory the other side renamed goes to the new
-  directory). Merges follow file renames, not directory renames.
+- **Directory-rename detection in merges** (a file added on one side inside
+  a directory the other side renamed goes to the new directory). Merges
+  follow file renames, not directory renames.
 - **Non-UTF-8 names** are not recorded.
 - **Windows** support.
-- **Maturity:** days of history versus Git's two decades; unaudited; no
-  community, tutorials or Stack Overflow answers yet.
+- **Maturity:** days of history; unaudited; no community or tutorials yet.
 
 ## Correctness
 
@@ -53,18 +59,20 @@ fixed**. Severity: high / medium / low.
   file can grant others. Add an optional passphrase (Argon2id-wrapped keys)
   and OS keychain / hardware-key storage (macOS Keychain, Secret Service,
   FIDO2/age-plugin style), with a `vl identity protect` migration.
-- **Names of cloaked files are visible:** tree entries keep their names in
-  plaintext for anyone who can read the repository; only contents are
-  sealed (sealed directory names need a future format bump, see
-  `docs/HUB.md`). Until then, keep secrets out of file and directory names.
+- **Names of cloaked files are visible** in today's client: tree entries
+  keep their names in plaintext for anyone who can read the repository.
+  With the server, people without access to a folder receive neither its
+  files nor their names (`docs/HUB.md` §5.4). Until then, keep secrets out
+  of file and directory names.
 
-- **Trust on first use for key rings:** a fresh clone from a malicious remote
-  can be served a valid but outdated ring. Needs a ring-head pin shared out of
-  band.
+- **Trust on first use for key rings** (today's client): a fresh clone from a
+  malicious remote can be served a valid but outdated ring. With the server,
+  group membership lives on the server; device keys for secrets need the
+  checks in `docs/HUB.md` §6.3.
 - **Snapshot signatures are advisory:** no "require signed" policy yet;
   `author` is unverified.
 - **Embargo metadata still visible:** that an embargo exists, parent ids,
-  author, time, scope, deadline, ciphertext sizes on team remotes.
+  author, time, its audience, deadline, ciphertext sizes.
 - **Scanner misses:** word-only passphrases and passwords with spaces,
   weak passwords, URL passwords that are words or numbers, values whose
   key is on another line (except Kubernetes `value:` and XML elements),
@@ -106,29 +114,27 @@ fixed**. Severity: high / medium / low.
   file it has not modified, and when the builder records a very large file
   (the streaming large-file item above).
 
-- **Other scopes on an embargoed line:** later edits on an embargoed line to
-  files cloaked under a *different* scope are readable by that scope's
-  members before the release. Workaround: cloak and embargo under the same
-  scope.
+- **Other scopes on an embargoed line** (today's client): later edits on an
+  embargoed line to files cloaked under a *different* scope are readable by
+  that scope's members before the release. Workaround: cloak and embargo
+  under the same scope. With the server, only secrets are encrypted besides
+  embargoes, so this narrows to secrets.
 - **Old content keeps the old crypto:** `vl upgrade` to format 3 re-wraps
   ring keys under HPKE but never re-seals history; content sealed before the
   upgrade stays under the pre-standard construction (`docs/CRYPTO.md` §5).
 - **The policy pin does not forget an accepted weakening** when a teammate
   later reverts it (only dropped `public!` rules are forgotten).
 - **A hostile SFTP server can still force up to the 4 GiB read ceiling**
-  (`VEIL_SFTP_MAX_FILE`), since sizes come from the server.
+  (`VEIL_SFTP_MAX_FILE`), since sizes come from the server. Goes away with
+  SFTP remotes in the simplification pass.
 
 ## Optional (owner: "nice to have, not needed")
 
-- **Scope governance:** a rogue or departed sole admin can revoke everyone;
-  recovery today is manual (new scope, re-cloak, rotate real secrets).
-  Possible additions: hold suspicious ring changes for `vl scope accept`,
-  two-admin approval for admin revocations, a minimum admin count, a
-  break-glass offline recovery identity, and a `vl scope recover` command
-  that automates the re-key. Belongs with the Veil Hub's organisation model.
+- **Admin governance:** a rogue or departed sole admin can remove everyone.
+  Possible additions on the server: a minimum admin count, two-admin
+  approval for removing an admin, and a break-glass recovery account.
 
 ## Performance
 
-- **`gc` always rewrites everything into one in-memory pack;** no
-  incremental or streaming packing yet.
-- **Concurrent op-log merging:** writers serialise on the repository lock.
+- Streaming `gc` and pull, incremental maintenance and the lock-free op log
+  are built (scale streams G and O); see `docs/design/scale/BASELINE.md`.
