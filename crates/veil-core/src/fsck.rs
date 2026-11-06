@@ -7,9 +7,9 @@
 //!    Sealed objects whose scope key we hold are opened and their content
 //!    decoded too.
 //! 2. **Reachability.** From the current view and from the view of every
-//!    retained operation: snapshot → parents, tree → entries and embargo
-//!    fallbacks. A missing object is classified by the visibility of the
-//!    entry that references it. Content of cloaked or embargoed entries is
+//!    retained operation: snapshot → parents, tree → entries. A missing
+//!    object is classified by the visibility of the entry that references
+//!    it. Content of sealed secret entries is
 //!    legitimately absent from clones of public remotes (and from team
 //!    members who were not sent it): **redacted (expected)**. A missing
 //!    public file, tree or snapshot is **corrupt**.
@@ -589,14 +589,6 @@ impl Checker {
             None => return next,
         };
         self.report.trees += 1;
-        // An embargo wrapper: its sealed side (withheld until release) and
-        // its fallback, plus the listed objects only the sealed side reaches.
-        if let Some(w) = crate::embargo::wrapper_parts(&tree) {
-            self.check_embargo_known(&w.embargo);
-            next.push((w.inner, format!("{path} (under embargo {})", w.embargo), true));
-            next.push((w.fallback, path.to_string(), false));
-            return next;
-        }
         let mut prev: Option<&str> = None;
         for e in &tree.entries {
             let bad_name = e.name.is_empty() || e.name == "." || e.name == ".." || e.name.contains(['/', '\0']);
@@ -745,32 +737,11 @@ impl Checker {
             Visibility::Public => (Severity::Corrupt, String::new()),
             Visibility::Cloaked { scope } => (
                 Severity::Redacted,
-                format!(" (cloaked under '{scope}': withheld from public remotes)"),
+                format!(" (a secret sealed under '{scope}': withheld from public receivers)"),
             ),
-            Visibility::Embargoed { embargo } => {
-                self.check_embargo_known(embargo);
-                let released = self.embargoes.get(embargo).copied().unwrap_or(false);
-                let why = if released {
-                    format!(" (embargo {embargo} was released; pull again to receive it)")
-                } else {
-                    format!(" (under embargo {embargo})")
-                };
-                (Severity::Redacted, why)
-            }
         };
         let label = format!("{} {path}", if e.kind.is_special() { e.kind.name() } else { "file" });
         self.check_blob(e.id, &label, missing_as, &why, Some(e.visibility.key_scope()));
-        if let Some(fb) = e.fallback {
-            // An embargoed entry's pre-merge version, or the last public
-            // version a sealed edit keeps for readers without the key. The
-            // former may itself have been cloaked and withheld, which this
-            // entry cannot tell; hence only a warning.
-            let (what, why) = match &e.visibility {
-                Visibility::Embargoed { .. } => ("embargo fallback", " (withheld if the pre-merge file was cloaked)"),
-                _ => ("last public version, shown to readers without the key", ""),
-            };
-            self.check_blob(fb, &format!("{label} ({what})"), Severity::Warning, why, None);
-        }
     }
 
     /// `expected_scope`: `Some(None)` = must be plaintext, `Some(Some(s))` =
@@ -1021,6 +992,10 @@ impl Checker {
             };
             self.report.embargoes += 1;
             let raw = self.backend.read(&vpath(&path))?;
+            if let Err(err) = crate::keychain::check_embargo_format(&raw) {
+                self.push(Severity::Corrupt, format!("embargo record {path}: {err}"));
+                continue;
+            }
             match serde_json::from_slice::<EmbargoRecord>(&raw) {
                 Err(err) => self.push(
                     Severity::Corrupt,
@@ -1035,14 +1010,6 @@ impl Checker {
                                 rec.id
                             ),
                         );
-                    }
-                    if let Some(k) = &rec.released_key {
-                        if crate::crypto::parse_key_hex(k).is_err() {
-                            self.push(
-                                Severity::Corrupt,
-                                format!("embargo record {path}: released key is malformed"),
-                            );
-                        }
                     }
                     self.embargoes.insert(rec.id.clone(), self.keys.embargo_released(&rec.id));
                 }

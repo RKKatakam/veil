@@ -37,9 +37,6 @@ use crate::{
 pub struct WorkspaceState {
     /// The working-copy snapshot of this workspace.
     pub wc: ObjectId,
-    /// Scope under which this workspace's line of work is cloaked.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cloak: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -675,7 +672,6 @@ fn merge_views_with(base: &View, sides: &[&View], first_wins: bool, descends: &m
         let b = base.workspaces.get(name);
         let vals: Vec<Option<&WorkspaceState>> = sides.iter().map(|s| s.workspaces.get(name)).collect();
         let Some((wc, lost)) = pick(b.map(|w| w.wc), vals.iter().map(|v| v.map(|w| w.wc)).collect(), first_wins) else { continue };
-        let cloak = pick_cloak(b.map(|w| w.cloak.clone()), vals.iter().map(|v| v.map(|w| w.cloak.clone())).collect(), first_wins);
         if !lost.is_empty() {
             out.warnings.push(format!(
                 "workspace '{name}' was moved by concurrent commands; kept {}, and the other working cop{} as visible change{}",
@@ -685,13 +681,7 @@ fn merge_views_with(base: &View, sides: &[&View], first_wins: bool, descends: &m
             ));
             losers.extend(lost);
         }
-        out.view.workspaces.insert(
-            name.clone(),
-            WorkspaceState {
-                wc,
-                cloak: cloak.unwrap_or_default(),
-            },
-        );
+        out.view.workspaces.insert(name.clone(), WorkspaceState { wc });
     }
     // Tags.
     let names: BTreeSet<&String> = base.tags.keys().chain(sides.iter().flat_map(|s| s.tags.keys())).collect();
@@ -767,21 +757,6 @@ fn pick<T: Copy + PartialEq>(base: Option<T>, sides: Vec<Option<T>>, first_wins:
         }
     }
     Some((first, lost))
-}
-
-/// 3-way cloak: the first changed side's, except that a cloaked value wins
-/// over an uncloaked one (`None` when every side removed the key).
-fn pick_cloak(base: Option<Option<String>>, sides: Vec<Option<Option<String>>>, first_wins: bool) -> Option<Option<String>> {
-    if first_wins {
-        if let Some(first) = sides.iter().find(|s| **s != base) {
-            return first.clone();
-        }
-    }
-    let changed: Vec<Option<String>> = sides.iter().filter(|s| **s != base).flatten().cloned().collect();
-    if changed.is_empty() {
-        return base.or_else(|| sides.into_iter().flatten().next());
-    }
-    Some(changed.iter().find(|c| c.is_some()).cloned().unwrap_or(None))
 }
 
 const PRUNED_OPS: &str = ".veil/ops_pruned";

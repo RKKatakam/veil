@@ -101,8 +101,8 @@ pub const REPO_FORMAT_VERSION: u32 = REPO_FORMAT;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RemoteConfig {
     pub url: String,
-    /// Public remotes never receive cloaked content, cloaked tags or
-    /// unreleased embargoed content.
+    /// Public remotes never receive sealed secrets or unreleased embargoed
+    /// history.
     #[serde(default)]
     pub public: bool,
     /// A Veil server remote cloned with `vl clone --only DIR`: only DIR's
@@ -301,7 +301,7 @@ impl Repo {
             view.heads.insert(wc_id);
             view.workspaces.insert(
                 DEFAULT_WORKSPACE.to_string(),
-                WorkspaceState { wc: wc_id, cloak: None },
+                WorkspaceState { wc: wc_id },
             );
         }
         drop(init_store);
@@ -858,13 +858,6 @@ impl Repo {
     /// the merge base of the parents merged so far and that parent
     /// ([`Repo::merge_base_tree`]: a virtual base when there are several).
     pub fn parents_tree(&self, parents: &[ObjectId]) -> Result<MergeOutcome> {
-        self.parents_tree_with(parents, false)
-    }
-
-    /// [`Repo::parents_tree`]; with `markers`, conflicts are written as
-    /// markers into the files whatever the repository format (for a merge
-    /// about to go under an embargo, see [`crate::merge::merge_trees_with_markers`]).
-    pub fn parents_tree_with(&self, parents: &[ObjectId], markers: bool) -> Result<MergeOutcome> {
         match parents {
             [] => Ok(MergeOutcome::clean(self.store.empty_tree()?)),
             [p] => Ok(MergeOutcome::clean(self.snapshot(p)?.tree)),
@@ -878,10 +871,7 @@ impl Repo {
                     // unreleased embargo) contributes nothing we can see.
                     let Some(ps) = self.snapshot_opt(p)? else { continue };
                     let base = self.merge_base_tree(&merged, &[*p])?;
-                    let out = match markers {
-                        true => crate::merge::merge_trees_with_markers(&self.store, Some(base), acc, ps.tree)?,
-                        false => merge_trees(&self.store, Some(base), acc, ps.tree)?,
-                    };
+                    let out = merge_trees(&self.store, Some(base), acc, ps.tree)?;
                     acc = out.tree;
                     conflicts.extend(out.conflicts);
                     renames.extend(out.renames);
@@ -1002,12 +992,7 @@ impl Repo {
     /// are followed ([`crate::merge`]): a file the new parents renamed gets
     /// the change's edit at its new name; `renames` reports those of
     /// applying the change.
-    ///
-    /// A change on a cloaked line (`cloak`) never introduces public content:
-    /// what the result holds publicly that the new parents' merge does not
-    /// (such as a file moved aside by a file/directory conflict, BUG-243) is
-    /// sealed under its scope, as `vl squash` into a cloaked change does.
-    pub fn rebase_tree(&self, old_parents: &[ObjectId], new_parents: &[ObjectId], tree: ObjectId, cloak: Option<&str>) -> Result<MergeOutcome> {
+    pub fn rebase_tree(&self, old_parents: &[ObjectId], new_parents: &[ObjectId], tree: ObjectId) -> Result<MergeOutcome> {
         let base = self.parents_tree(old_parents)?.tree;
         let onto = self.parents_tree(new_parents)?;
         let out = merge_trees(&self.store, Some(base), onto.tree, tree)?;
@@ -1021,11 +1006,7 @@ impl Repo {
                 conflicts.push(c);
             }
         }
-        let tree = match cloak {
-            Some(scope) => crate::embargo::seal_introduced(&self.store, &out.tree, Some(onto.tree), scope)?,
-            None => out.tree,
-        };
-        Ok(MergeOutcome { tree, conflicts, renames: out.renames })
+        Ok(MergeOutcome { tree: out.tree, conflicts, renames: out.renames })
     }
 
     /// No content change relative to its parents.

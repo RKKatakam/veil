@@ -260,7 +260,6 @@ pub fn vis_label(v: &Visibility) -> String {
     match v {
         Visibility::Public => String::new(),
         Visibility::Cloaked { scope } => magenta(&format!("[cloaked:{}]", safe(scope))),
-        Visibility::Embargoed { embargo } => yellow(&format!("[embargo:{}]", safe(embargo))),
     }
 }
 
@@ -296,18 +295,11 @@ pub fn print_build_warnings(r: &BuildReport) {
     }
     for p in &r.blocked_exposures {
         warn_untrusted(&format!(
-            "policy tries to make built-in secret path {p} public; ignored (use `public!` / `vl expose --force` to override)"
+            "policy tries to make built-in secret path {p} public; ignored (use `public!` to override)"
         ));
     }
     for (p, why) in &r.cloak_failures {
         warn_untrusted(&format!("could not cloak {p} ({why}); it was kept local-only"));
-    }
-    for (p, embargo) in &r.held_back {
-        warn_untrusted(&format!(
-            "edit of {p} not recorded: this line is under embargo {embargo}, whose content you cannot read, \
-             so recording it would revert the hidden fix. Your edit stays in the working copy and is recorded \
-             after the release (or work on the embargoed merge's first parent instead)"
-        ));
     }
     // A command's held-back edit of `.veilpolicy`: the caller says where
     // it stays and how to accept it (`policy_edit_held_message`).
@@ -426,15 +418,13 @@ pub fn signature_detail(status: &SignatureStatus, s: &Snapshot) -> String {
 /// which this repository cannot show. `None`: no explanation beyond the
 /// engine's error (see `api::redaction_for_diff`).
 /// Why this reader cannot materialise `e`, in a few words (`cloaked:team;
-/// no key`, `cloaked:team; not received`, `embargo …; not
-/// released`), for listings; [`hidden_explanation`] says what to do.
+/// no key`, `cloaked:team; not received`), for listings; [`hidden_explanation`] says what to do.
 pub fn hidden_reason(repo: &Repo, e: &TreeEntry) -> Option<String> {
     let present = repo.store().has(&e.id);
     Some(match &e.visibility {
         Visibility::Public => return None,
         Visibility::Cloaked { scope } if present => format!("cloaked:{}; no key", safe(scope)),
         Visibility::Cloaked { scope } => format!("cloaked:{}; not received", safe(scope)),
-        Visibility::Embargoed { embargo } => format!("embargo {}; not released", safe(embargo)),
     })
 }
 
@@ -459,16 +449,11 @@ pub fn hidden_explanation(repo: &Repo, path: &VPath, e: &TreeEntry) -> Option<St
                  (`vl scope grant {scope} <key>`), clone the project from the Veil server to read it"
             )
         }
-        Visibility::Embargoed { embargo } => format!(
-            "{path} is under embargo {}, which is not released yet (`vl show` gives the deadline); \
-             it becomes readable once it is released and you pull",
-            safe(embargo)
-        ),
     })
 }
 
 /// The content of the file entry `e` at `path`, or an error that explains
-/// cloaked, withheld and embargoed content instead of the store's
+/// sealed and withheld secrets instead of the store's
 /// `object … is not present in this store`.
 pub fn read_file(repo: &Repo, path: &VPath, e: &TreeEntry) -> Result<Vec<u8>> {
     // A conflict: the file with markers this reader is shown.
@@ -513,7 +498,6 @@ pub fn print_files(repo: &Repo, tree: &ObjectId) -> Result<()> {
         let vis = match shown {
             Visibility::Public => dim(&format!("{vis:<18}")),
             Visibility::Cloaked { .. } => magenta(&format!("{vis:<18}")),
-            Visibility::Embargoed { .. } => yellow(&format!("{vis:<18}")),
         };
         println!("{vis} {:>9}  {}{flag}", e.size, safe(path.as_str()));
     }

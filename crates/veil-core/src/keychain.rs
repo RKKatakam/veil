@@ -1,4 +1,4 @@
-//! Scope keys, signed key rings and embargo records.
+//! Scope keys and signed key rings (for secret files), and embargo records.
 //!
 //! Shared, publishable metadata lives under `.veil/meta/`:
 //!
@@ -7,9 +7,9 @@
 //!   key of an admin who was authorised at that point of the log. The
 //!   current membership and the key *generations* are derived by replaying
 //!   the log; nothing in the file is trusted unless the replay verifies.
-//! * `embargoes/<id>.json`   — an embargo key wrapped under a scope key, plus
-//!   its release condition, signed by the scope member who created it; on
-//!   release the plaintext key is published.
+//! * `embargoes/<id>.json`   — an embargo's plain record: who may see the
+//!   embargoed work (`scope`), its deadline and its release. Nothing in it
+//!   is encrypted or signed: the server enforces embargoes as permissions.
 //! * `vault/<scope>/<id>.json` — team-vault records (`crate::team_vault`):
 //!   secrets sealed for a scope's members, each signed by its writer.
 //!
@@ -44,13 +44,12 @@
 //! learns the format from its store ([`Keychain::set_format`]). A ring that
 //! holds any HPKE-wrapped key is ring format 3, which older vl refuse (no
 //! keys) instead of misreading, and which a format-1/2 repository refuses to
-//! store ("run `vl upgrade`"). Older generation keys (`prev-key:`) and
-//! embargo keys (`embargo-wrap:`) are sealed with XChaCha20-Poly1305 under a
-//! random nonce in every format. Every domain-separation string is in
+//! store ("run `vl upgrade`"). Older generation keys (`prev-key:`) are
+//! sealed with XChaCha20-Poly1305 under a random nonce in every format. Every domain-separation string is in
 //! [`crate::crypto::domains`]; `docs/CRYPTO.md` reviews them.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc, RwLock,
@@ -61,7 +60,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::{
-    crypto::{domains, parse_key_hex, random_bytes, random_key, Envelope, Key},
+    crypto::{domains, random_bytes, random_key, Envelope, Key},
     error::{Result, VeilError},
     identity::{
         format_public_key, is_low_order_public_key, parse_public_identity, parse_public_key, verify_binding, wrap_key,
@@ -101,17 +100,21 @@ pub fn max_ring_format(repo_format: u32) -> u32 {
     }
 }
 
-/// Embargo record format. Format-1 records carry no `format` field; a later
-/// format adds `"format": N`, which this build refuses (see
-/// `docs/FORMAT.md`) instead of reading, and re-writing, half of it.
-pub const EMBARGO_FORMAT: u32 = 1;
+/// Embargo record format: 2, the plain record. Format-1 records (no
+/// `format` field) held an embargo key, removed with every encryption of
+/// non-secret content: `vl upgrade` converts them, this build refuses them,
+/// as it refuses a newer format (see `docs/FORMAT.md`) instead of reading,
+/// and re-writing, half of it.
+pub const EMBARGO_FORMAT: u32 = 2;
 
-/// Refuse an embargo record written in a newer format.
+/// Refuse an embargo record not written in [`EMBARGO_FORMAT`].
 pub fn check_embargo_format(raw: &[u8]) -> Result<()> {
     let v: serde_json::Value = serde_json::from_slice(raw)?;
     match v.get("format").map(|f| f.as_u64()) {
-        None => Ok(()),
-        Some(Some(f)) if f <= u64::from(EMBARGO_FORMAT) => Ok(()),
+        Some(Some(f)) if f == u64::from(EMBARGO_FORMAT) => Ok(()),
+        None => Err(VeilError::Unsupported(
+            "an embargo record of an older format (it held an embargo key); run `vl upgrade`".into(),
+        )),
         Some(f) => Err(VeilError::Unsupported(format!(
             "embargo record format {} needs a newer vl (this is vl {})",
             f.map_or("?".to_string(), |f| f.to_string()),
@@ -121,8 +124,6 @@ pub fn check_embargo_format(raw: &[u8]) -> Result<()> {
 }
 
 const RING_SIG_CONTEXT: &str = domains::SIG_CONTEXT_RING_CHANGE;
-const EMBARGO_SIG_CONTEXT: &str = domains::SIG_CONTEXT_EMBARGO;
-const RELEASE_SIG_CONTEXT: &str = domains::SIG_CONTEXT_EMBARGO_RELEASE;
 
 /// Public fingerprint of a scope key.
 pub fn key_fingerprint(key: &Key) -> String {
@@ -905,80 +906,31 @@ fn genesis_proof(key: &Key, scope: &str, key_id: &str, signer: &str, signing_key
 
 // ---- embargo records -----------------------------------------------------
 
+/// An embargo, in plain text: the server keeps the embargoed work from
+/// everyone outside `scope` until it is released (`docs/VISIBILITY.md`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmbargoRecord {
+    /// Always [`EMBARGO_FORMAT`].
+    pub format: u32,
     pub id: String,
-    /// Scope whose members may read the embargoed content before release.
+    /// The group (scope) that may see the embargoed work before release.
     pub scope: String,
-    pub wrapped: Envelope,
     /// Automatic release time (ms since epoch); `None` = manual release.
     pub until: Option<i64>,
-    pub released_key: Option<String>,
     pub released_at: Option<i64>,
     pub created: i64,
-    /// Always empty: an embargo carries no description (the record is
-    /// synced in plaintext, to public remotes too). Kept, and signed, so
-    /// records stay readable by, and verifiable for, every version.
-    pub description: String,
-    /// Envelope label of the scope key generation `wrapped` is sealed under
-    /// (absent on legacy records: the bare scope, i.e. generation 0).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope_key: Option<String>,
-    /// Fingerprint of the embargo key; a published `released_key` must match.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key_id: Option<String>,
-    /// Signature of the creating member over everything above except the
-    /// release fields.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signature: Option<Signature>,
-    /// Signature of the releasing member over `(id, released_key, released_at)`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub release_signature: Option<Signature>,
-}
-
-#[derive(Serialize)]
-struct EmbargoBody<'a> {
-    id: &'a str,
-    scope: &'a str,
-    wrapped: &'a Envelope,
-    until: Option<i64>,
-    created: i64,
-    description: &'a str,
-    scope_key: &'a Option<String>,
-    key_id: &'a Option<String>,
 }
 
 impl EmbargoRecord {
+    /// Released: by `vl embargo release`, or its deadline has passed.
     pub fn is_released(&self) -> bool {
-        self.released_key.is_some()
+        self.released_at.is_some() || self.until.is_some_and(|u| u <= crate::now_millis())
     }
 
-    /// The immutable, signed part of the record.
-    fn body(&self) -> Vec<u8> {
-        serde_json::to_vec(&EmbargoBody {
-            id: &self.id,
-            scope: &self.scope,
-            wrapped: &self.wrapped,
-            until: self.until,
-            created: self.created,
-            description: &self.description,
-            scope_key: &self.scope_key,
-            key_id: &self.key_id,
-        })
-        .unwrap()
-    }
-
-    fn release_body(&self) -> Vec<u8> {
-        serde_json::to_vec(&(&self.id, &self.released_key, self.released_at)).unwrap()
-    }
-
-    /// Does the published key (if any) match the committed fingerprint?
-    fn release_consistent(&self) -> bool {
-        match (&self.released_key, &self.key_id) {
-            (Some(k), Some(id)) => parse_key_hex(k).is_ok_and(|k| key_fingerprint(&k) == *id),
-            (Some(k), None) => parse_key_hex(k).is_ok(),
-            (None, _) => true,
-        }
+    /// The fields fixed at creation (a record received with other ones is
+    /// another embargo under the same id, and is refused).
+    fn body(&self) -> (&str, &str, Option<i64>, i64) {
+        (&self.id, &self.scope, self.until, self.created)
     }
 }
 
@@ -1036,11 +988,6 @@ struct ScopeAccess {
     /// Current generation's key id.
     current: String,
     legacy: bool,
-    /// Registered signing key → (member id, name) of every **current**
-    /// member, from a verified signed ring; `None` when there is no such
-    /// ring (a public clone, a legacy ring), i.e. when this repository
-    /// cannot tell who may release the scope's embargoes (BUG-108).
-    release_signers: Option<HashMap<String, (String, String)>>,
 }
 
 /// Outcome of merging an incoming ring into the local one.
@@ -1101,9 +1048,6 @@ pub struct Keychain {
     identity: Option<Identity>,
     repo_id: String,
     access: RwLock<HashMap<String, Arc<ScopeAccess>>>,
-    /// Release signatures already verified (a hash of body, key and
-    /// signature): key lookups check them often, and the check is pure.
-    verified_releases: RwLock<HashSet<[u8; 32]>>,
     /// Repository format: decides how keys are wrapped and which ring
     /// formats may be stored.
     format: AtomicU32,
@@ -1122,7 +1066,6 @@ impl Keychain {
             identity,
             repo_id,
             access: RwLock::new(HashMap::new()),
-            verified_releases: RwLock::new(HashSet::new()),
             format: AtomicU32::new(crate::repo::REPO_FORMAT),
         }
     }
@@ -1164,20 +1107,16 @@ impl Keychain {
         &self.backend
     }
 
-    /// Forget cached keys (after pulling new rings or embargo records).
+    /// Forget cached keys (after pulling new rings).
     pub fn invalidate(&self) {
         self.access.write().unwrap().clear();
     }
 
     /// The key for an envelope label, if this identity can obtain it:
-    /// `local`, `embargo/<id>`, `<scope>#<key-id>` or a bare `<scope>`
-    /// (= generation 0).
+    /// `local`, `<scope>#<key-id>` or a bare `<scope>` (= generation 0).
     pub fn key(&self, label: &str) -> Option<Key> {
         if label == LOCAL_SCOPE {
             return self.identity.as_ref().map(|i| i.local_key(&self.repo_id));
-        }
-        if let Some(id) = label.strip_prefix(domains::EMBARGO_LABEL_PREFIX) {
-            return self.embargo_key(id);
         }
         let (scope, kid) = split_label(label);
         let access = self.scope_access(scope);
@@ -1196,13 +1135,10 @@ impl Keychain {
     }
 
     /// Label and key to seal *new* content for `scope`: the current
-    /// generation. Labels that already name a generation (and `local`,
-    /// `embargo/…`) are used as they are.
+    /// generation. Labels that already name a generation (and `local`)
+    /// are used as they are.
     pub fn sealing_key(&self, scope: &str) -> Result<(String, Key)> {
-        if scope == LOCAL_SCOPE
-            || scope.starts_with(domains::EMBARGO_LABEL_PREFIX)
-            || scope.contains(domains::GENERATION_SEPARATOR)
-        {
+        if scope == LOCAL_SCOPE || scope.contains(domains::GENERATION_SEPARATOR) {
             return Ok((scope.to_string(), self.require(scope)?));
         }
         let access = self.scope_access(scope);
@@ -1245,13 +1181,6 @@ impl Keychain {
             genesis: state.genesis_key_id().to_string(),
             current: state.key_id().to_string(),
             legacy: state.legacy,
-            release_signers: (!state.legacy && !ring.is_legacy()).then(|| {
-                state
-                    .members
-                    .iter()
-                    .filter_map(|(id, m)| Some((m.signing_key.clone()?, (id.clone(), m.name.clone()))))
-                    .collect()
-            }),
             ..Default::default()
         };
         let Some(me) = &self.identity else { return access };
@@ -2093,27 +2022,6 @@ impl Keychain {
         }
     }
 
-    /// Is `s` validly signed by a **current** member of `scope`, with the
-    /// signing key the scope's verified ring registers for them (or by this
-    /// identity, while it is a member)? Unlike [`Keychain::snapshot_status`],
-    /// a member of some other scope, or a revoked member, does not count
-    /// (BUG-122: only members of `scope` may decide to publish its content).
-    pub fn signed_by_member(&self, scope: &str, s: &Snapshot) -> bool {
-        let (Some(sig), Some(true)) = (&s.signature, s.signature_valid()) else {
-            return false;
-        };
-        if let Some(me) = &self.identity {
-            if sig.key == me.verifying_hex() && sig.signer == me.public_hex() && self.is_member(scope) {
-                return true;
-            }
-        }
-        let access = self.scope_access(scope);
-        access
-            .release_signers
-            .as_ref()
-            .is_some_and(|m| m.get(&sig.key).is_some_and(|(member, _)| *member == sig.signer))
-    }
-
     // ---- embargoes -------------------------------------------------------
 
     fn embargo_path(id: &str) -> Result<VPath> {
@@ -2138,7 +2046,6 @@ impl Keychain {
         let _lock = self.lock_meta()?;
         self.backend
             .write(&Self::embargo_path(&rec.id)?, &serde_json::to_vec_pretty(rec)?)?;
-        self.invalidate();
         Ok(())
     }
 
@@ -2159,223 +2066,61 @@ impl Keychain {
         Ok(out)
     }
 
-    fn embargo_key(&self, id: &str) -> Option<Key> {
-        let rec = self.effective_embargo(id)?;
-        if let Some(k) = &rec.released_key {
-            return parse_key_hex(k).ok();
-        }
-        let label = rec.scope_key.clone().unwrap_or_else(|| rec.scope.clone());
-        if split_label(&label).0 != rec.scope {
-            return None;
-        }
-        let scope_key = Zeroizing::new(self.key(&label)?);
-        let raw = Zeroizing::new(rec.wrapped.open(&scope_key).ok()?);
-        let key: Key = raw.as_slice().try_into().ok()?;
-        match &rec.key_id {
-            Some(kid) if key_fingerprint(&key) != *kid => None,
-            _ => Some(key),
-        }
-    }
-
-    /// Is embargo `id` released *here*: its record carries a release this
-    /// repository accepts ([`Keychain::release_rejection`]), or this
-    /// identity staged one that has not been pushed yet
-    /// ([`Keychain::stage_release`]).
+    /// Is embargo `id` released *here*: its record is released
+    /// ([`EmbargoRecord::is_released`]), or this identity staged a release
+    /// that has not been pushed yet ([`Keychain::stage_release`]).
     pub fn embargo_released(&self, id: &str) -> bool {
         self.effective_embargo(id).is_some_and(|r| r.is_released())
     }
 
-    /// The record as this repository acts on it: a published release counts
-    /// only if it is accepted here, and a release staged by this identity
-    /// counts too. A rejected release is removed from the returned record.
+    /// The record as this repository acts on it: with a release this
+    /// identity staged applied.
     pub fn effective_embargo(&self, id: &str) -> Option<EmbargoRecord> {
-        let mut rec = self.load_embargo(id).ok()??;
-        if rec.is_released() && self.release_rejection(&rec).is_none() {
+        let rec = self.load_embargo(id).ok()??;
+        if rec.is_released() {
             return Some(rec);
         }
-        if let Some(staged) = self.staged_release(&rec) {
-            return Some(staged);
-        }
-        rec.released_key = None;
-        rec.released_at = None;
-        rec.release_signature = None;
-        Some(rec)
+        Some(self.staged_release(&rec).unwrap_or(rec))
     }
 
     /// Where embargo `id` stands here (see [`ReleaseState`]).
     pub fn release_state(&self, id: &str) -> ReleaseState {
-        let Some(rec) = self.load_embargo(id).ok().flatten() else {
-            return ReleaseState::Unreleased;
-        };
-        let rejected = rec.is_released().then(|| self.release_rejection(&rec)).flatten();
-        if rec.is_released() && rejected.is_none() {
-            ReleaseState::Released
-        } else if self.staged_release(&rec).is_some() {
-            ReleaseState::Staged
-        } else if let Some(why) = rejected {
-            ReleaseState::Rejected(why)
-        } else {
-            ReleaseState::Unreleased
+        match self.load_embargo(id).ok().flatten() {
+            Some(rec) if rec.is_released() => ReleaseState::Released,
+            Some(rec) if self.staged_release(&rec).is_some() => ReleaseState::Staged,
+            _ => ReleaseState::Unreleased,
         }
     }
 
-    /// Why the release a record carries is not accepted here, if it is not.
-    ///
-    /// The published key must match the record's fingerprint and the
-    /// release signature (if any) must verify. Where this repository holds
-    /// a verified signed ring for the embargo's scope, the release must also
-    /// be signed by a **current** member of that scope, with the signing key
-    /// the ring registers for them, unless the record's deadline has passed
-    /// (and its creation signature is good): then any key holder's engine
-    /// would release it anyway. So a member revoked after the embargo was
-    /// created, who still holds its key, cannot release it in-protocol
-    /// (BUG-108). Without such a ring (a clone of a public remote, which
-    /// never receives rings; a legacy ring) nobody can be judged, and the
-    /// release is accepted on its fingerprint, as before.
-    pub fn release_rejection(&self, rec: &EmbargoRecord) -> Option<String> {
-        if !rec.is_released() {
-            return None;
-        }
-        if !rec.release_consistent() {
-            return Some("its published key does not match the record".into());
-        }
-        if let Some(rs) = &rec.release_signature {
-            if !self.release_signature_valid(rec, rs) {
-                return Some("its release signature is invalid".into());
-            }
-        }
-        let access = self.scope_access(&rec.scope);
-        let signers = access.release_signers.as_ref()?;
-        if let Some(rs) = &rec.release_signature {
-            if signers.get(&rs.key).is_some_and(|(member, _)| *member == rs.signer) {
-                return None;
-            }
-        }
-        if rec.until.is_some_and(|u| u <= crate::now_millis()) && self.embargo_trusted(rec) {
-            return None;
-        }
-        Some(match &rec.release_signature {
-            Some(rs) => format!(
-                "it was released by {}, who is not a current member of '{}' (a member revoked after the embargo was created keeps its key, but may not release it before its deadline)",
-                &rs.signer[..rs.signer.len().min(16)],
-                rec.scope
-            ),
-            None => format!(
-                "its release is unsigned; only a current member of '{}' may release it before its deadline",
-                rec.scope
-            ),
-        })
-    }
-
-    fn release_signature_valid(&self, rec: &EmbargoRecord, rs: &Signature) -> bool {
-        let mut h = blake3::Hasher::new();
-        let body = rec.release_body();
-        for part in [body.as_slice(), rs.signer.as_bytes(), rs.key.as_bytes(), rs.sig.as_bytes()] {
-            h.update(&(part.len() as u64).to_le_bytes());
-            h.update(part);
-        }
-        let digest = *h.finalize().as_bytes();
-        if self.verified_releases.read().unwrap().contains(&digest) {
-            return true;
-        }
-        let ok = rs.verify(RELEASE_SIG_CONTEXT, &body);
-        if ok {
-            self.verified_releases.write().unwrap().insert(digest);
-        }
-        ok
-    }
-
-    /// Authenticity of an embargo record's creation signature: the signer
-    /// must be (or have been) a member of the record's scope.
-    pub fn embargo_status(&self, rec: &EmbargoRecord) -> SignatureStatus {
-        let Some(sig) = &rec.signature else {
-            return SignatureStatus::Unsigned;
-        };
-        let signers = match self.load_ring(&rec.scope).ok().flatten().map(|r| r.verify()) {
-            Some(Ok(st)) => st.ever_signers,
-            _ => BTreeMap::new(),
-        };
-        self.judge(sig, sig.verify(EMBARGO_SIG_CONTEXT, &rec.body()), &signers)
-    }
-
-    /// May this record's deadline trigger an automatic release? Only when
-    /// its creation is signed by a member: an unsigned or forged record
-    /// could otherwise move `until` into the past.
-    pub fn embargo_trusted(&self, rec: &EmbargoRecord) -> bool {
-        self.embargo_status(rec).is_good()
-    }
-
+    /// A new embargo for the group `scope`, released at `until` (or by
+    /// hand). Plain text: who may see the work is a permission.
     pub fn create_embargo(&self, scope: &str, until: Option<i64>) -> Result<String> {
-        let _lock = self.lock_meta()?;
-        // Signed records are attributed through the ring, so a legacy
-        // (unsigned) ring is upgraded first.
-        if let Some(ring) = self.load_ring(scope)? {
-            if ring.is_legacy() && self.is_member(scope) {
-                self.upgrade_legacy(ring)?;
-            }
-        }
-        let (label, scope_key) = self.sealing_key(scope).map_err(|_| {
-            VeilError::Policy(format!("an embargo needs a scope you belong to; you have no key for '{scope}'"))
-        })?;
-        let scope_key = Zeroizing::new(scope_key);
+        validate_scope_name(scope)?;
         let id = hex::encode(random_bytes::<5>());
-        let key = Zeroizing::new(random_key());
-        let mut rec = EmbargoRecord {
+        let rec = EmbargoRecord {
+            format: EMBARGO_FORMAT,
             id: id.clone(),
             scope: scope.to_string(),
-            wrapped: Envelope::seal_random(&scope_key, &format!("{}{id}", domains::EMBARGO_WRAP_LABEL_PREFIX), &*key)?,
             until,
-            released_key: None,
             released_at: None,
             created: crate::now_millis(),
-            description: String::new(),
-            scope_key: Some(label),
-            key_id: Some(key_fingerprint(&key)),
-            signature: None,
-            release_signature: None,
         };
-        rec.signature = self.identity.as_ref().map(|me| Signature::create(me, EMBARGO_SIG_CONTEXT, &rec.body()));
         self.save_embargo(&rec)?;
         Ok(id)
     }
 
-    /// `rec` released by this identity now, if this identity holds the key
-    /// and may release it ([`Keychain::release_rejection`]).
-    fn released_by_me(&self, rec: &EmbargoRecord) -> Result<EmbargoRecord> {
-        let id = &rec.id;
-        let key = self
-            .key(&format!("{}{id}", domains::EMBARGO_LABEL_PREFIX))
-            .ok_or_else(|| VeilError::Policy(format!("you do not hold the key for embargo '{id}'")))?;
-        let mut r = rec.clone();
-        r.released_key = Some(hex::encode(key));
-        r.released_at = Some(crate::now_millis());
-        r.release_signature = self
-            .identity
-            .as_ref()
-            .map(|me| Signature::create(me, RELEASE_SIG_CONTEXT, &r.release_body()));
-        if self.release_rejection(&r).is_some() {
-            return Err(VeilError::Policy(format!(
-                "cannot release embargo {id}: you are not a current member of '{}'. A member revoked after an embargo was created keeps its key, but only a current member may release it before its deadline",
-                rec.scope
-            )));
-        }
-        Ok(r)
-    }
-
-    /// Publish the embargo key in the record now, making the embargoed
-    /// content readable to all once the record is synced. Irreversible as
-    /// soon as the record leaves this repository; `Repo::release_embargo`
-    /// stages instead ([`Keychain::stage_release`]).
+    /// Release embargo `id` in its (synced) record now. Irreversible as soon
+    /// as the record leaves this repository; `Repo::release_embargo` stages
+    /// instead ([`Keychain::stage_release`]).
     pub fn release_embargo(&self, id: &str) -> Result<()> {
         let _lock = self.lock_meta()?;
-        let rec = self
+        let mut rec = self
             .load_embargo(id)?
             .ok_or_else(|| VeilError::NotFound(format!("embargo '{id}'")))?;
-        if rec.is_released() && self.release_rejection(&rec).is_none() {
-            return Ok(());
+        if rec.released_at.is_none() {
+            rec.released_at = Some(crate::now_millis());
+            self.save_embargo(&rec)?;
         }
-        let rec = self.released_by_me(&rec)?;
-        self.save_embargo(&rec)?;
         self.remove_staged(id)
     }
 
@@ -2389,55 +2134,40 @@ impl Keychain {
         if self.backend.exists(&path)? {
             self.backend.remove_file(&path)?;
         }
-        self.invalidate();
         Ok(())
     }
 
     /// The record with the release this identity staged applied, if there is
-    /// one that is still valid here.
+    /// one.
     fn staged_release(&self, rec: &EmbargoRecord) -> Option<EmbargoRecord> {
-        let me = self.identity.as_ref()?;
         let raw = self.backend.read_opt(&Self::staged_path(&rec.id).ok()?).ok()??;
         let st: StagedRelease = serde_json::from_slice(&raw).ok()?;
-        if st.release_signature.signer != me.public_hex() || st.release_signature.key != me.verifying_hex() {
-            return None;
-        }
         let mut r = rec.clone();
-        r.released_key = Some(st.released_key);
         r.released_at = Some(st.released_at);
-        r.release_signature = Some(st.release_signature);
-        (r.release_signature.is_some() && self.release_rejection(&r).is_none()).then_some(r)
+        Some(r)
     }
 
     /// Release embargo `id` **in this repository only**: from now on this
     /// repository treats it as released (checkouts, snapshots, `vl log`),
-    /// but the key is kept in device-local state (`.veil/local/releases/`,
+    /// but the release is kept in device-local state (`.veil/local/releases/`,
     /// which no sync reads) and reaches the synced record only when this
     /// repository next pushes ([`Keychain::publish_staged_releases`]). Until then
-    /// [`Keychain::take_back_release`] undoes it completely: the key never
-    /// left this repository through vl (BUG-109).
+    /// [`Keychain::take_back_release`] undoes it completely (BUG-109).
     pub fn stage_release(&self, id: &str) -> Result<StageOutcome> {
         let _lock = self.lock_meta()?;
-        let rec = self
-            .load_embargo(id)?
-            .ok_or_else(|| VeilError::NotFound(format!("embargo '{id}'")))?;
+        if self.load_embargo(id)?.is_none() {
+            return Err(VeilError::NotFound(format!("embargo '{id}'")));
+        }
         match self.release_state(id) {
             ReleaseState::Released => return Ok(StageOutcome::AlreadyReleased),
             ReleaseState::Staged => return Ok(StageOutcome::AlreadyStaged),
-            ReleaseState::Unreleased | ReleaseState::Rejected(_) => {}
+            ReleaseState::Unreleased => {}
         }
-        if self.identity.is_none() {
-            return Err(VeilError::Policy("releasing an embargo needs an identity".into()));
-        }
-        let r = self.released_by_me(&rec)?;
         let st = StagedRelease {
-            released_key: r.released_key.clone().expect("set"),
-            released_at: r.released_at.expect("set"),
-            release_signature: r.release_signature.clone().expect("an identity signs"),
+            released_at: crate::now_millis(),
         };
         self.backend
             .write(&Self::staged_path(id)?, &serde_json::to_vec_pretty(&st)?)?;
-        self.invalidate();
         Ok(StageOutcome::Staged)
     }
 
@@ -2451,7 +2181,7 @@ impl Keychain {
         for e in self.backend.list_dir(&dir)? {
             let Some(id) = e.name.strip_suffix(".json") else { continue };
             if let Ok(Some(rec)) = self.load_embargo(id) {
-                if !(rec.is_released() && self.release_rejection(&rec).is_none()) {
+                if !rec.is_released() {
                     if let Some(r) = self.staged_release(&rec) {
                         out.push((id.to_string(), r.released_at.unwrap_or_default()));
                     }
@@ -2475,7 +2205,7 @@ impl Keychain {
         for e in self.backend.list_dir(&dir)? {
             let Some(id) = e.name.strip_suffix(".json") else { continue };
             let Some(rec) = self.load_embargo(id).ok().flatten() else { continue };
-            if rec.is_released() && self.release_rejection(&rec).is_none() {
+            if rec.is_released() {
                 self.remove_staged(id)?;
                 continue;
             }
@@ -2498,131 +2228,37 @@ impl Keychain {
                 self.remove_staged(id)?;
                 TakeBack::TakenBack
             }
-            ReleaseState::Unreleased | ReleaseState::Rejected(_) => {
+            ReleaseState::Unreleased => {
                 self.remove_staged(id)?;
                 TakeBack::NotReleased
             }
         })
     }
 
-    /// Does this repository hold a verifying ring for `scope` (so it can
-    /// judge who may sign that scope's embargo records)?
-    fn can_judge(&self, scope: &str) -> bool {
-        matches!(self.ring_state(scope), Ok(Some(Ok(_))))
-    }
-
     /// Merge an embargo record received from another repository. Returns a
-    /// warning when (part of) the record was rejected.
-    ///
-    /// A repository without a ring for the record's scope (a clone of a
-    /// public remote, which never receives rings, BUG-077) cannot tell who
-    /// may sign it. It accepts the record unverified: it holds no key for
-    /// the scope, so the record can never trigger a release here, and a
-    /// published key is still checked against the record's fingerprint and
-    /// then by the AEAD of the content it opens. A record that a ring later
-    /// shows to be signed by a member replaces an unverified local one.
+    /// warning when it was refused: a record whose fixed fields (scope,
+    /// deadline, creation) differ from the local one's is another embargo
+    /// under the same id. A release it carries is taken.
     pub fn merge_embargo(&self, incoming: &EmbargoRecord) -> Result<Option<String>> {
         let _lock = self.lock_meta()?;
         let id = &incoming.id;
-        if Self::embargo_path(id).is_err() {
-            return Ok(Some(format!("embargo record with invalid id '{id}' rejected")));
+        if Self::embargo_path(id).is_err() || validate_scope_name(&incoming.scope).is_err() {
+            return Ok(Some(format!("embargo record with invalid id or scope '{id}' rejected")));
         }
-        let status = self.embargo_status(incoming);
-        let judged = self.can_judge(&incoming.scope);
-        if status == SignatureStatus::Bad || (judged && matches!(status, SignatureStatus::Unknown { .. })) {
-            return Ok(Some(format!(
-                "embargo {id}: record rejected ({}; not signed by a member of '{}')",
-                status.label(),
-                incoming.scope
-            )));
-        }
-        if !incoming.release_consistent() {
-            return Ok(Some(format!("embargo {id}: published key does not match the record; rejected")));
-        }
-        if let Some(rs) = &incoming.release_signature {
-            if !rs.verify(RELEASE_SIG_CONTEXT, &incoming.release_body()) {
-                return Ok(Some(format!("embargo {id}: release signature is invalid; rejected")));
-            }
-        }
-        // A release by someone who may not release it (BUG-108) is dropped;
-        // the rest of the record is merged.
-        let mut ignored = None;
-        let stripped;
-        let incoming = match self.release_rejection(incoming) {
-            Some(why) => {
-                ignored = Some(format!("embargo {id}: release ignored: {why}"));
-                let mut r = incoming.clone();
-                r.released_key = None;
-                r.released_at = None;
-                r.release_signature = None;
-                stripped = r;
-                &stripped
-            }
-            None => incoming,
-        };
         let Some(mut local) = self.load_embargo(id)? else {
             self.save_embargo(incoming)?;
-            let unsigned = (judged && status == SignatureStatus::Unsigned)
-                .then(|| format!("embargo {id}: record is unsigned (legacy); it will never be released automatically"));
-            return Ok(join_warnings(ignored, unsigned));
+            return Ok(None);
         };
         if local.body() != incoming.body() {
-            if status.is_good() && !self.embargo_status(&local).is_good() {
-                // The local record was accepted unverified (no ring then);
-                // the signed one wins. Keep a local release only if it is
-                // the key this record commits to.
-                let mut rec = incoming.clone();
-                if !rec.is_released() && local.is_released() {
-                    rec.released_key = local.released_key.clone();
-                    rec.released_at = local.released_at;
-                    rec.release_signature = local.release_signature.clone();
-                    let signed = rec
-                        .release_signature
-                        .as_ref()
-                        .is_none_or(|rs| rs.verify(RELEASE_SIG_CONTEXT, &rec.release_body()));
-                    if rec.key_id.is_none() || !rec.release_consistent() || !signed || self.release_rejection(&rec).is_some() {
-                        rec.released_key = None;
-                        rec.released_at = None;
-                        rec.release_signature = None;
-                    }
-                }
-                self.save_embargo(&rec)?;
-                let replaced = format!(
-                    "embargo {id}: replaced an unverified local record with the one signed by a member of '{}'",
-                    rec.scope
-                );
-                return Ok(join_warnings(ignored, Some(replaced)));
-            }
             return Ok(Some(format!(
-                "embargo {id}: incoming record conflicts with the local one (tampered deadline, scope or key?); kept the local record"
+                "embargo {id}: incoming record conflicts with the local one (another deadline or scope); kept the local record"
             )));
         }
-        let mut changed = false;
-        if local.signature.is_none() && incoming.signature.is_some() {
-            local.signature = incoming.signature.clone();
-            changed = true;
-        }
-        // A local release that is not accepted here (one planted on a
-        // remote with a key that does not match the fingerprint, or one by
-        // a revoked member) is replaced by an accepted one.
-        let local_ok = local.is_released() && self.release_rejection(&local).is_none();
-        if !local_ok && incoming.is_released() {
-            local.released_key = incoming.released_key.clone();
+        if local.released_at.is_none() && incoming.released_at.is_some() {
             local.released_at = incoming.released_at;
-            local.release_signature = incoming.release_signature.clone();
-            changed = true;
-        }
-        if changed {
             self.save_embargo(&local)?;
         }
-        Ok(ignored)
-    }
-}
-
-fn join_warnings(a: Option<String>, b: Option<String>) -> Option<String> {
-    match (a, b) {
-        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
-        (a, b) => a.or(b),
+        Ok(None)
     }
 }
 
@@ -2630,12 +2266,10 @@ fn join_warnings(a: Option<String>, b: Option<String>) -> Option<String> {
 /// ([`Keychain::stage_release`]). `.veil/local/` is never synced.
 const STAGED_RELEASES: &str = ".veil/local/releases";
 
-/// A staged release: the fields that publishing writes into the record.
+/// A staged release: the time that publishing writes into the record.
 #[derive(Serialize, Deserialize)]
 struct StagedRelease {
-    released_key: String,
     released_at: i64,
-    release_signature: Signature,
 }
 
 /// Where an embargo's release stands in this repository.
@@ -2645,11 +2279,8 @@ pub enum ReleaseState {
     /// Released by this identity, not yet pushed or exported: `vl undo`
     /// can still take it back.
     Staged,
-    /// The record carries a release accepted here (published).
+    /// The record is released (published, or past its deadline).
     Released,
-    /// The record carries a release this repository does not accept
-    /// (why), so it is treated as unreleased.
-    Rejected(String),
 }
 
 /// Result of [`Keychain::stage_release`].

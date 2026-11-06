@@ -6,7 +6,7 @@
 //! Many CLI tests check what a second person's client does with what it
 //! received: a non-member's history tools, a public mirror's clone, a
 //! policy held back after a pull, a mount under a key grant. The Veil
-//! server refuses cloaked lines and embargoes in S1, so those tests move
+//! server does not run embargoes in S1, so those tests move
 //! repositories with the engine's in-process transfer instead
 //! (`veil_core::remote::push`/`pull`): `vl remote add NAME PATH [--public]`,
 //! `vl clone PATH [DEST]`, `vl push [NAME] [-t TAG]… [--force]` and
@@ -162,11 +162,10 @@ fn clone_populate(backend: Arc<dyn StorageBackend>, url: String, shown: String, 
     let wc = repo.new_change(DEFAULT_WORKSPACE, vec![target], "")?;
     let to = repo.snapshot(&wc)?.tree;
     // Journalled (BUG-830). The record remembers what could not be
-    // materialised (no key yet, an unreleased embargo), so it is filled in
-    // once it becomes readable instead of being recorded as deleted.
-    let (state, co) = repo.check_out_new(&*fs, DEFAULT_WORKSPACE, wc, None)?;
+    // materialised (no key yet), so it is filled in once it becomes
+    // readable instead of being recorded as deleted.
+    let (_, co) = repo.check_out_new(&*fs, DEFAULT_WORKSPACE, wc, None)?;
     ctx::mark_clone_complete(&fs)?;
-    let hidden_by_embargo = state.materialised.view().is_some();
     println!(
         "Cloned {} into {} ({} objects, {} files)",
         safe(&shown),
@@ -175,12 +174,6 @@ fn clone_populate(backend: Arc<dyn StorageBackend>, url: String, shown: String, 
         co.written
     );
     print_clone_redactions(&repo, &to, &co.redacted, &identity);
-    if hidden_by_embargo {
-        println!(
-            "  {} an embargoed merge is not readable to you yet; you see its pre-merge content until it is released.",
-            yellow("note:")
-        );
-    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -197,7 +190,6 @@ fn print_clone_redactions(repo: &Repo, tree: &veil_core::ObjectId, redacted: &[V
     let (mut sealed, mut withheld) = (0, 0);
     let mut scopes = std::collections::BTreeSet::new();
     for p in redacted {
-        // Embargoed content has a note of its own (below).
         let Ok(Some(e)) = lookup(repo.store(), tree, p) else {
             continue;
         };
@@ -259,7 +251,7 @@ pub fn push(ctx: &mut Ctx, name: &str, tags: &[String], force: bool, verify: &ho
     }
     for e in &r.releases_published {
         println!(
-            "  {} embargo {} (its key is in the pushed record now; the release can no longer be undone)",
+            "  {} embargo {} (its release is in the pushed record now and can no longer be undone)",
             green("published"),
             safe(e)
         );
@@ -269,7 +261,7 @@ pub fn push(ctx: &mut Ctx, name: &str, tags: &[String], force: bool, verify: &ho
         r.objects_copied,
         if cfg.public { "public remote " } else { "" },
         if r.redacted > 0 {
-            format!("; {} cloaked/embargoed object(s) withheld", r.redacted)
+            format!("; {} sealed secret object(s) withheld", r.redacted)
         } else {
             String::new()
         }

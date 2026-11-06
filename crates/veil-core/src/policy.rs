@@ -765,6 +765,12 @@ impl Policy {
                 Some("ignore" | "ignored") => (Tier::Ignored, false),
                 Some(other) => invalid(format!("unknown tier '{other}'")),
             };
+            if matches!(tier, Tier::Cloaked(_)) && !names_secret(&parts[0]) {
+                policy.warnings.push(format!(
+                    "{at}: `cloak` seals secret files only (.env, keys, ...): what '{}' names that is not a secret file is isolated (kept on this device); give folders access with `vl access`",
+                    parts[0]
+                ));
+            }
             match Rule::new(&parts[0], tier.clone(), force, false, false) {
                 Ok(mut r) => {
                     r.grantees = grantees;
@@ -954,6 +960,10 @@ impl Policy {
             }
         }
         let mut hit = self.rules.iter().zip(&matched).filter(|(_, m)| **m).map(|(r, _)| r).peekable();
+        // A built-in rule names the path: a secret file (`.env`), or its
+        // public example (`.env.example`), the only paths a `cloak` line
+        // seals.
+        let secret_file = hit.peek().is_some_and(|r| r.builtin);
         // Built-in rules come first.
         while let Some(r) = hit.next_if(|r| r.builtin) {
             c.builtin_secret = r.secret;
@@ -973,8 +983,21 @@ impl Policy {
         if c.tier == Tier::Cloaked(RULE_SCOPE.to_string()) {
             c.tier = Tier::Cloaked(rule_scope(&self.access, &name));
         }
+        // Only secret files are ever sealed: a `cloak` line keeps anything
+        // else on the device, failing safe (its parse warned).
+        if matches!(c.tier, Tier::Cloaked(_)) && !secret_file {
+            c.tier = Tier::Isolated;
+        }
         c
     }
+}
+
+/// Does the pattern `pattern`, read as a path, name a built-in secret file
+/// (`.env`, `*.pem`, …)? A `cloak` line whose pattern does not is warned
+/// about (and `vl cloak` refuses it): it seals nothing.
+pub fn names_secret(pattern: &str) -> bool {
+    let name = crate::vpath::nfc(pattern.trim_end_matches('/'));
+    builtin_rules().1.is_match(&*name)
 }
 
 impl Classification {

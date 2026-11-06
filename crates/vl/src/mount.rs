@@ -1,8 +1,8 @@
 //! `vl ws mount` and `vl ws unmount`: a workspace as a directory (FUSE).
 //!
 //! **What is served.** Reads come from the workspace's tree as this reader
-//! may see it ([`fs::ReaderView`]: a cloaked file it cannot decrypt is its
-//! public fallback or absent, as in a checkout). Every write, create,
+//! may see it ([`fs::ReaderView`]: a secret file it cannot decrypt is
+//! absent, as in a checkout). Every write, create,
 //! delete, rename, `mkdir`, `chmod +x` and truncate goes to a copy-on-write
 //! overlay whose upper layer and whiteouts live in
 //! `.veil/local/mounts/<ws>/` (`0700`), so a crash of the mount loses no
@@ -561,13 +561,6 @@ impl Recorder {
         }
         for p in &r.isolated {
             lines.push(format!("{} is isolated (local-only): it stays in the mount and is never recorded", safe(p.as_str())));
-        }
-        for (p, embargo) in &r.held_back {
-            lines.push(format!(
-                "{} held back: the workspace is under embargo {} whose content you cannot read; it stays in the mount and is recorded after the release",
-                safe(p.as_str()),
-                safe(embargo)
-            ));
         }
         for (p, why) in &r.cloak_failures {
             lines.push(format!("{} held back: {}", safe(p.as_str()), safe(why)));

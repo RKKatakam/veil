@@ -306,9 +306,8 @@ impl<'r> Transaction<'r> {
     /// 4, see [`crate::conflict::index_conflicts`]): every conflict entry of
     /// its tree, plus the older kinds of conflict the operation carried,
     /// less those resolved since the snapshot it was derived from (the one
-    /// it rewrites, else its first parent). Under an unreleased embargo no
-    /// conflict is recorded (snapshot metadata is public). Below format 4
-    /// the list is the operation's, unchanged.
+    /// it rewrites, else its first parent). Below format 4 the list is the
+    /// operation's, unchanged.
     pub(crate) fn indexed(&self, snap: Snapshot) -> Result<Snapshot> {
         let store = &self.repo.store;
         if store.format() < crate::object::CONFLICT_REPO_FORMAT {
@@ -320,15 +319,6 @@ impl<'r> Transaction<'r> {
         let tolerated = |e: &VeilError| {
             e.is_unreadable() || e.is_not_found() || matches!(e, VeilError::Corrupt(..) | VeilError::Json(_) | VeilError::Unsupported(_))
         };
-        match crate::embargo::unreleased_wrapper(store, &s.tree) {
-            Ok(Some(_)) => {
-                s.conflicts.clear();
-                return Ok(s);
-            }
-            Ok(None) => {}
-            Err(e) if tolerated(&e) => return Ok(s),
-            Err(e) => return Err(e),
-        }
         let from = s.predecessors.first().or(s.parents.first()).copied();
         let base = match from {
             Some(id) => self.repo.snapshot_opt(&id).ok().flatten(),
@@ -352,19 +342,13 @@ impl<'r> Transaction<'r> {
     }
 
     /// Create a new change on top of `parents` (merging them if several).
-    ///
-    /// The change takes the workspace's `cloak`, not its parents'. Sealed
-    /// entries it inherits from a cloaked parent stay sealed regardless: the
-    /// builder never moves sealed content to a wider audience (see
-    /// `builder.rs`), so `vl new <cloaked change>` cannot declassify it.
+    /// Sealed secrets it inherits stay sealed: the builder never moves
+    /// sealed content to a wider audience (see `builder.rs`).
     ///
     /// A parent named more than once is recorded once (BUG-240).
-    pub fn new_change(&mut self, parents: Vec<ObjectId>, description: &str, cloak: Option<String>) -> Result<ObjectId> {
+    pub fn new_change(&mut self, parents: Vec<ObjectId>, description: &str) -> Result<ObjectId> {
         let parents = dedup_parents(parents);
         let merged = self.repo.parents_tree(&parents)?;
-        let store = &self.repo.store;
-        // On a line under an unreleased embargo, conflicts are not recorded
-        // (see `embargo`).
         let conflicts = merged.conflicts.iter().map(|p| p.to_string()).collect();
         // A merge of concurrent operations derives what is random elsewhere,
         // so that every process merging the same heads writes the same.
@@ -390,8 +374,7 @@ impl<'r> Transaction<'r> {
             author: self.repo.user.clone(),
             timestamp,
             predecessors: vec![],
-            conflicts: crate::embargo::recordable_conflicts(store, &merged.tree, conflicts)?,
-            cloak,
+            conflicts,
             embargo: None,
             signature: None,
         };
@@ -581,7 +564,7 @@ impl<'r> Transaction<'r> {
             // relative to the merge of its old ones. A merge one of whose
             // parents moved is re-merged, never rebased by one parent's diff
             // (that dropped what the other parents hold, BUG-251).
-            let out = match self.repo.rebase_tree(&s.parents, &new_parents, s.tree, s.cloak.as_deref()) {
+            let out = match self.repo.rebase_tree(&s.parents, &new_parents, s.tree) {
                 // A merge of concurrent operations never fails for a policy
                 // reason (threat 18; two embargoes combined, say): this
                 // snapshot, and what is built on it, stay where their side
@@ -599,7 +582,7 @@ impl<'r> Transaction<'r> {
             ns.parents = new_parents;
             ns.tree = tree;
             ns.predecessors = vec![id];
-            ns.conflicts = crate::embargo::recordable_conflicts(&store, &tree, conflicts.into_iter().collect())?;
+            ns.conflicts = conflicts.into_iter().collect();
             // Rebasing someone else's change: `author` stays theirs, the
             // signature becomes ours, and `predecessors` keeps the original.
             let ns = self.indexed(ns)?;
@@ -624,13 +607,8 @@ impl<'r> Transaction<'r> {
                 self.view.tags.get_mut(&name).unwrap().target = r.first().copied().unwrap_or(root);
             }
         }
-        let wss: Vec<(String, ObjectId, Option<String>)> = self
-            .view
-            .workspaces
-            .iter()
-            .map(|(n, w)| (n.clone(), w.wc, w.cloak.clone()))
-            .collect();
-        for (name, wc, cloak) in wss {
+        let wss: Vec<(String, ObjectId)> = self.view.workspaces.iter().map(|(n, w)| (n.clone(), w.wc)).collect();
+        for (name, wc) in wss {
             if !self.rewritten.contains_key(&wc) {
                 continue;
             }
@@ -639,7 +617,7 @@ impl<'r> Transaction<'r> {
                 r[0]
             } else {
                 let parents = if r.is_empty() { vec![root] } else { r };
-                self.new_change(parents, "", cloak)?
+                self.new_change(parents, "")?
             };
             self.view.workspaces.get_mut(&name).unwrap().wc = new_wc;
         }
@@ -647,13 +625,12 @@ impl<'r> Transaction<'r> {
     }
 
     /// BUG-681: no rewrite moves a change confined to an unreleased embargo
-    /// (its fix, work built on it, its wrapped line) out of it. A rebase,
+    /// (its fix, work built on it, the embargoed line) out of it. A rebase,
     /// or an abandon whose descendants move, that puts such a change onto
     /// parents outside the embargo would publish the fix's file names (the
     /// moved change's edits of them, as conflicts) before the release.
     /// Only rewrites that change parents are judged: confinement follows
-    /// the history, and the tree of a change that keeps its parents keeps
-    /// its embargo wrapper.
+    /// the history.
     fn check_confinement(&mut self) -> Result<()> {
         let before = vec![self.repo.view.clone()];
         match self.confinement_violations(&before)?.into_iter().next() {
@@ -906,7 +883,6 @@ impl<'r> Transaction<'r> {
                 crate::object::Object::Tree(t) => {
                     for e in &t.entries {
                         refs.push(e.id);
-                        refs.extend(e.fallback);
                     }
                 }
                 crate::object::Object::Conflict(c) => refs.extend(c.referenced_ids()),

@@ -1235,35 +1235,21 @@ impl ObjectStore {
         Ok(obj)
     }
 
-    /// The tree `id` as this reader sees it. An embargo wrapper (see
-    /// [`crate::embargo`]) resolves to its sealed content for key holders
-    /// and to its fallback for everyone else; any other tree is returned as
-    /// stored. The resolution is not cached: it depends on keys and release
-    /// state, which change.
+    /// The tree `id`. Directories are never encrypted (only secret files
+    /// are): a sealed tree object, which only a removed feature wrote, is
+    /// refused.
     pub fn tree(&self, id: &ObjectId) -> Result<Arc<Tree>> {
-        let t = self.tree_object(id)?;
-        match crate::embargo::wrapper_parts(&t) {
-            None => Ok(t),
-            Some(w) => {
-                if self.keys.has(&w.key_label()) {
-                    match self.tree(&w.inner) {
-                        Err(e) if e.is_unreadable() => {}
-                        r => return r,
-                    }
-                }
-                self.tree(&w.fallback)
-            }
-        }
+        self.tree_object(id)
     }
 
-    /// The tree object `id` exactly as stored (unsealed, but an embargo
-    /// wrapper is *not* resolved). For code that walks raw objects.
+    /// The tree object `id` as stored ([`ObjectStore::tree`]).
     pub fn tree_object(&self, id: &ObjectId) -> Result<Arc<Tree>> {
         if let Some(t) = self.trees.get(id) {
             return Ok(t);
         }
-        let t = match self.open(id)? {
+        let t = match self.get(id)? {
             Object::Tree(t) => Arc::new(t),
+            Object::Sealed(_) => return Err(crate::object::removed_encryption(&format!("directory tree {} is encrypted", id.short()))),
             o => {
                 return Err(VeilError::Corrupt(
                     id.hex(),
@@ -1377,16 +1363,9 @@ impl ObjectStore {
         }
     }
 
-    /// Read a file entry, falling back to the embargo fallback when the
-    /// primary content is unreadable.
+    /// Read a file entry.
     pub fn read_entry(&self, e: &TreeEntry) -> Result<Vec<u8>> {
-        match self.read_blob(&e.id) {
-            Err(err) if err.is_unreadable() => match &e.fallback {
-                Some(fb) => self.read_blob(fb),
-                None => Err(err),
-            },
-            r => r,
-        }
+        self.read_blob(&e.id)
     }
 
     fn id_readable(&self, id: &ObjectId) -> bool {
@@ -1404,14 +1383,12 @@ impl ObjectStore {
         match e.kind {
             // A conflict is always materialised (unreadable sides redacted).
             EntryKind::Dir | EntryKind::Conflict => self.has(&e.id),
-            EntryKind::File | EntryKind::Symlink => {
-                self.id_readable(&e.id) || e.fallback.is_some_and(|f| self.id_readable(&f))
-            }
+            EntryKind::File | EntryKind::Symlink => self.id_readable(&e.id),
         }
     }
 
     /// Would `data` encode to exactly `reference` (same plaintext, same
-    /// sealing scope)? Used to recognise unchanged fallback content.
+    /// sealing scope)? Used to recognise unchanged content.
     pub fn matches_encoding(&self, reference: &ObjectId, data: &[u8]) -> Result<bool> {
         let raw = match self.get_raw(reference) {
             Ok(r) => r,

@@ -2,30 +2,22 @@
 //!
 //! Visibility is enforced *in the transfer itself*:
 //!
-//! | content                         | team remote | public remote |
-//! |---------------------------------|-------------|---------------|
-//! | public objects                  | ✓           | ✓             |
-//! | cloaked objects (ciphertext)    | ✓           | ✗ redacted    |
-//! | unreleased embargoed objects    | ✓           | ✗ (fallback ✓)|
-//! | released embargoed objects      | ✓           | ✓             |
-//! | merged-in history of an unreleased embargoed merge | cloaked under the embargo's scope, not building on withheld history | ✗ |
-//! | cloaked tags                    | ✓           | ✗             |
-//! | annotated tag objects (`veil:atag`, format 5) | ✓ with their tag | ✓ with their tag, never one with a sealed message |
-//! | key rings                       | ✓           | ✗ (they name the members) |
-//! | embargo records                 | ✓           | ✓ (encrypted, signed) |
+//! | content                         | team receiver | public receiver |
+//! |---------------------------------|---------------|-----------------|
+//! | plain objects                   | ✓             | ✓               |
+//! | sealed secrets (ciphertext)     | ✓             | ✗ redacted      |
+//! | an unreleased embargoed merge, its fix, and anything built on them | ✗ | ✗ |
+//! | annotated tag objects (`veil:atag`, format 5) | ✓ with their tag | ✓ with their tag |
+//! | key rings (secrets only)        | ✓             | ✗ (they name the members) |
+//! | embargo records                 | ✓             | ✓ (plain)       |
 //! | team vault (`vl secret --scope`) | ✓ (sealed, signed records) | ✗ |
 //! | isolated files, vault, `local`  | never — not in the graph at all |
 //!
-//! Redacted tree entries keep their names and ids, so a later push to a
-//! team remote or a key grant fills them in without any history rewrite.
-//!
-//! An unreleased embargoed merge reaches a remote with its extra parents
-//! *redacted*: the snapshots only those parents reach (the fix, and how it
-//! was made) stay local until the embargo is released, and a tag that would
-//! publish them by another route (a tag on the fix, a commit building on
-//! it) is skipped with a reason. Graph walks treat a missing parent as
-//! absent, so clones of such a remote work normally; the next push after
-//! the release fills the parents in, with unchanged snapshot ids.
+//! Only secret files are ever encrypted. Redacted tree entries keep their
+//! names and ids, so a later transfer to a team receiver or a key grant
+//! fills them in without any history rewrite. A tag that would publish
+//! embargoed history (a tag on the fix, a commit building on it) is skipped
+//! with a reason until the release.
 //!
 //! # Who uses it
 //!
@@ -314,7 +306,6 @@ impl StorageBackend for PackWrites<'_> {
 struct Transfer<'a> {
     src: &'a ObjectStore,
     dst: &'a ObjectStore,
-    src_keys: &'a Keychain,
     public: bool,
     seen: HashSet<ObjectId>,
     /// Tree height of every object copied so far (0 for non-trees).
@@ -324,14 +315,11 @@ struct Transfer<'a> {
 
 impl Transfer<'_> {
     fn allowed(&self, raw: &[u8]) -> bool {
+        // A sealed secret goes to team receivers only, never under `local`.
         match Object::sealed_scope(raw) {
             None => true,
             Some(scope) if scope == LOCAL_SCOPE => false,
-            Some(_) if !self.public => true,
-            Some(scope) => match scope.strip_prefix("embargo/") {
-                Some(id) => self.src_keys.embargo_released(id),
-                None => false,
-            },
+            Some(_) => !self.public,
         }
     }
 
@@ -434,9 +422,6 @@ impl Transfer<'_> {
             Object::Tree(t) => {
                 let mut children = Vec::with_capacity(t.entries.len());
                 for e in &t.entries {
-                    // File fallbacks, and the pre-merge tree of an embargo
-                    // wrapper's marker entry.
-                    children.extend(e.fallback);
                     children.push(e.id);
                 }
                 (true, children)
@@ -482,7 +467,7 @@ pub(crate) fn ancestors_in(store: &ObjectStore, tips: &[ObjectId]) -> Result<Vec
 /// public remote (its fix history): what releasing it publishes, beside
 /// the merge's content.
 pub fn withheld_by_embargo(local: &Repo, embargo: &str) -> Result<Vec<ObjectId>> {
-    let mut out: Vec<ObjectId> = embargo_withheld(local, true)?
+    let mut out: Vec<ObjectId> = embargo_withheld(local)?
         .into_iter()
         .filter(|(_, e)| e == embargo)
         .map(|(id, _)| id)
@@ -492,75 +477,36 @@ pub fn withheld_by_embargo(local: &Repo, embargo: &str) -> Result<Vec<ObjectId>>
 }
 
 /// History that must not leave this repository yet: for every unreleased
-/// embargoed merge in the local graph, the snapshots reachable only through
-/// its merged-in (non-first) parents — the fix itself, and how it was made.
-/// Maps each to the embargo that withholds it.
-///
-/// A public remote receives none of it before release. A team remote may
-/// receive the part that is cloaked under **the embargo's own scope** (its
-/// content and descriptions are sealed for exactly the readers the embargo
-/// allows). Everything else is withheld there too, because team remotes are
-/// also read by people outside the embargo's scope:
-/// * plaintext snapshots;
-/// * snapshots cloaked under another scope, even a wider one (BUG-043);
-/// * snapshots that build on withheld ones (BUG-054): their trees carry the
-///   withheld content, and sending them would leave a dangling parent that
-///   blocks the push.
-pub(crate) fn embargo_withheld(local: &Repo, public: bool) -> Result<HashMap<ObjectId, String>> {
+/// embargoed merge in the local graph, the merge itself and the snapshots
+/// reachable only through its merged-in (non-first) parents (the fix, and
+/// how it was made). Maps each to the embargo that withholds it.
+/// Embargoes are not encrypted, so no receiver gets any of it before the
+/// release, and a snapshot that builds on it is refused too
+/// ([`push_closure`]).
+pub(crate) fn embargo_withheld(local: &Repo) -> Result<HashMap<ObjectId, String>> {
     let mut out = HashMap::new();
     for id in local.visible_embargoed()? {
         let s = local.snapshot(&id)?;
         let Some(e) = &s.embargo else { continue };
-        if s.parents.len() < 2 || local.keys().embargo_released(e) {
+        if local.keys().embargo_released(e) {
             continue;
         }
-        // An unknown record (no scope to compare with) withholds everything.
-        let scope = local.keys().load_embargo(e).ok().flatten().map(|r| r.scope);
-        // What the extra parents reach and the mainline does not. A
-        // snapshot this replica lacks is withheld from it already.
-        let mut merged_in: HashMap<ObjectId, Option<Arc<crate::object::Snapshot>>> = HashMap::new();
+        out.entry(id).or_insert_with(|| e.clone());
+        if s.parents.len() < 2 {
+            continue;
+        }
         for a in local.graph().range(local, &s.parents[1..], &s.parents[..1])? {
-            let snap = local.snapshot_opt(&a)?;
-            merged_in.insert(a, snap);
-        }
-        // Withheld: everything on a public remote; on a team remote, what
-        // is not cloaked under the embargo's scope, and whatever has a
-        // withheld parent. Post-order walk (parents first), iterative.
-        let own = |snap: &Arc<crate::object::Snapshot>| public || scope.is_none() || snap.cloak != scope;
-        let mut state: HashMap<ObjectId, bool> = HashMap::new();
-        for start in merged_in.keys() {
-            let mut stack = vec![(*start, false)];
-            while let Some((a, expanded)) = stack.pop() {
-                if state.contains_key(&a) {
-                    continue;
-                }
-                let snap = &merged_in[&a];
-                let parents = snap.iter().flat_map(|s| s.parents.iter()).filter(|p| merged_in.contains_key(*p));
-                if !expanded {
-                    stack.push((a, true));
-                    stack.extend(parents.filter(|p| !state.contains_key(*p)).map(|p| (*p, false)));
-                } else {
-                    let w = snap.as_ref().is_some_and(own) || parents.into_iter().any(|p| state.get(p) == Some(&true));
-                    state.insert(a, w);
-                }
-            }
-        }
-        let withheld = state.into_iter().filter(|(_, w)| *w).map(|(a, _)| a);
-        for a in withheld {
             out.entry(a).or_insert_with(|| e.clone());
         }
     }
     Ok(out)
 }
 
-/// The snapshots to send for `tips`: every ancestor, except the withheld
-/// merged-in history of unreleased embargoed merges (those merges reach the
-/// remote with their extra parents redacted). Fails with a reason if the
-/// tips reach withheld history any other way, i.e. some snapshot *builds
-/// on* the embargoed fix and would publish it.
+/// The snapshots to send for `tips`: every ancestor. Fails with a reason
+/// if the tips reach history an unreleased embargo withholds (the
+/// embargoed merge, its fix, or anything built on them).
 pub(crate) fn push_closure(
     store: &ObjectStore,
-    keys: &Keychain,
     tips: &[ObjectId],
     withheld: &HashMap<ObjectId, String>,
 ) -> Result<Result<Vec<ObjectId>, String>> {
@@ -582,11 +528,9 @@ pub(crate) fn push_closure(
             Err(VeilError::Missing(_)) => continue,
             Err(e) => return Err(e),
         };
-        let embargoed_merge = s.embargo.as_deref().is_some_and(|e| !keys.embargo_released(e));
-        for (i, p) in s.parents.iter().enumerate() {
+        for p in &s.parents {
             match withheld.get(p) {
                 None => stack.push(*p),
-                Some(_) if embargoed_merge && i > 0 => {} // redacted parent
                 Some(e) => {
                     return Ok(Err(format!(
                         "snapshot {} builds on {}, which is withheld by unreleased embargo {e}; release the embargo first",
@@ -608,15 +552,12 @@ pub(crate) fn push_closure(
 /// Nothing is merged as a union any more: each ring is a signed, hash-chained
 /// log that only ever fast-forwards (see [`Keychain::merge_ring`]), so a
 /// revocation cannot be undone by syncing with a replica that still lists
-/// the member. Rings are merged before embargo records because the records'
-/// signatures are checked against ring membership. Runs inside the
-/// destination's transaction: each merge is a read-modify-write under its
-/// lock (the keychain takes it reentrantly).
+/// the member. Embargo records are plain ([`Keychain::merge_embargo`]).
+/// Runs inside the destination's transaction: each merge is a
+/// read-modify-write under its lock (the keychain takes it reentrantly).
 ///
-/// A public destination gets no rings (they name every member, BUG-077).
-/// Its readers hold no scope key, so they only need embargo records, whose
-/// released keys they check against the record's fingerprint
-/// ([`Keychain::merge_embargo`]). Rings an earlier vl pushed there are left
+/// A public destination gets no rings (they name every member, BUG-077),
+/// only embargo records. Rings an earlier vl pushed there are left
 /// alone (removing them would lock members out of a team remote that was
 /// added as public by mistake), with a warning.
 ///
@@ -862,17 +803,16 @@ pub fn push(
     // that decision and the upload (BUG-807).
     let releases_published = local.keys().publish_staged_releases()?;
     let mut report = SyncReport::default();
-    let (sendable, withheld) = sendable_tags(local, public, only_tags, &mut report)?;
+    let (sendable, withheld) = sendable_tags(local, only_tags, &mut report)?;
     let selected = accepted_tags(local, sendable, &tx.view.tags, force, &mut report)?;
     let tips: Vec<ObjectId> = selected.iter().map(|(_, t)| t.target).collect();
-    let ids = push_closure(local.store(), local.keys(), &tips, &withheld)?
+    let ids = push_closure(local.store(), &tips, &withheld)?
         .map_err(|why| VeilError::repo(format!("push: {why}")))?;
     {
         let dst = tx.repo().store().clone();
         let mut xfer = Transfer {
             src: local.store(),
             dst: &dst,
-            src_keys: local.keys(),
             public,
             seen: HashSet::new(),
             heights: HashMap::new(),
@@ -914,7 +854,6 @@ pub fn push(
 #[allow(clippy::type_complexity)]
 fn sendable_tags(
     local: &Repo,
-    public: bool,
     only_tags: &[String],
     report: &mut SyncReport,
 ) -> Result<(Vec<(String, Tag)>, HashMap<ObjectId, String>)> {
@@ -936,10 +875,10 @@ fn sendable_tags(
     }
     // The merged-in history of an unreleased embargoed merge stays here, and
     // so does any tag that would publish it by another route.
-    let withheld = embargo_withheld(local, public)?;
+    let withheld = embargo_withheld(local)?;
     let mut sendable = Vec::new();
     for (name, tag) in selected {
-        match push_closure(local.store(), local.keys(), &[tag.target], &withheld)? {
+        match push_closure(local.store(), &[tag.target], &withheld)? {
             Ok(_) => sendable.push((name, tag)),
             Err(why) => report.tags_skipped.push((name, why)),
         }
@@ -1183,7 +1122,6 @@ pub fn pull(local: &mut Repo, remote_name: &str, remote_backend: Arc<dyn Storage
     let mut xfer = Transfer {
         src: remote.store(),
         dst: tx.repo().store(),
-        src_keys: remote.keys(),
         public: false,
         seen: HashSet::new(),
         heights: HashMap::new(),

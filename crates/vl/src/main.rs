@@ -326,7 +326,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             let message = hooks::before_commit(ctx, hooks, message, !cli.no_snapshot, "commit")?;
             let c = api::commit(ctx, &message, !*no_advance, !cli.no_snapshot)?;
             println!("Committed {}", one_line(&ctx.repo, &c.result.committed));
-            print_tags_kept(&ctx.repo, &c.result);
+            print_tags_kept(&c.result);
         }
         Cmd::Edit { rev } => {
             let id = ctx.rev(rev)?;
@@ -407,6 +407,13 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Tag(c) => cmd_tag(ctx, c)?,
         Cmd::Cloak { patterns, scope } => {
             validate_scope_name(scope)?;
+            // Only secret files are ever encrypted (`docs/VISIBILITY.md`).
+            if let Some(p) = patterns.iter().find(|p| !veil_core::policy::names_secret(&rule_pattern(ctx, p).0)) {
+                bail!(
+                    "`vl cloak` seals secret files only (.env, keys, ...), and '{}' is not one; to choose who sees a folder, use `vl access <folder> <group>`",
+                    safe(p)
+                );
+            }
             if !ctx.repo.keys().is_member(scope) {
                 bail!("{}", not_a_member(ctx, scope)?);
             }
@@ -485,11 +492,11 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             }
             println!("Restored to operation {}", op.short());
             for e in &staged {
-                println!("  embargo {}: release taken back (its key had not left this repository)", safe(e));
+                println!("  embargo {}: release taken back (it had not left this repository)", safe(e));
             }
             for e in &published {
                 warn(&format!(
-                    "embargo {} stays released: its key was published after that operation, and a published key cannot be taken back",
+                    "embargo {} stays released: its release was published after that operation, and a published release cannot be taken back",
                     safe(e)
                 ));
             }
@@ -526,7 +533,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
                 );
             }
             if let Some(e) = undone.strip_prefix(RELEASE_OP_PREFIX) {
-                println!("Embargo {} is unreleased again: its key had not left this repository.", safe(e));
+                println!("Embargo {} is unreleased again: its release had not left this repository.", safe(e));
             }
         }
         Cmd::Redo => {
@@ -848,26 +855,9 @@ fn retire_identity(path: &Path) -> Result<(PathBuf, Option<Identity>)> {
 // ---- inspection ----------------------------------------------------------
 
 /// Tags a commit left at its parent, and how to move them on purpose.
-fn print_tags_kept(repo: &Repo, r: &CommitResult) {
-    let (cloaked, plain): (Vec<_>, Vec<_>) = r.kept.iter().partition(|(_, why)| matches!(why, TagKept::CloakedLine(_)));
+fn print_tags_kept(r: &CommitResult) {
+    let plain: Vec<_> = r.kept.iter().collect();
     let names = |v: &[&(String, TagKept)]| v.iter().map(|(n, _)| safe(n).into_owned()).collect::<Vec<_>>().join(", ");
-    let change = repo
-        .snapshot(&r.committed)
-        .map(|s| s.change_id.short())
-        .unwrap_or_else(|_| r.committed.short());
-    if let Some((_, TagKept::CloakedLine(scope))) = cloaked.first() {
-        let first = safe(&cloaked[0].0).into_owned();
-        eprintln!(
-            "{} {} not moved: this is a line cloaked for '{}', and a commit there never moves an uncloaked tag (public remotes would receive it)",
-            yellow("note:"),
-            names(&cloaked),
-            safe(scope)
-        );
-        eprintln!(
-            "  {} publish the work with `vl merge {change} --into {first}` (add `--embargo` to keep it hidden until a release), or move the tag yourself: `vl tag set {first} -r {change}`",
-            dim("hint:")
-        );
-    }
     let (release, plain): (Vec<_>, Vec<_>) = plain.into_iter().partition(|(_, why)| matches!(why, TagKept::Release));
     if !plain.is_empty() {
         eprintln!("{} {} not moved (--no-advance)", dim("note:"), names(&plain));
@@ -909,27 +899,13 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()
     // A version put back keeps its audience: a sealed version, or a
     // conflict, is recorded as the entry it was written from, never as a
     // public edit of `@`'s (BUG-481). A sealed version this reader cannot
-    // read is not put back at all (its last public version is not it).
+    // read is not put back at all.
     let mut unreadable: Vec<VPath> = Vec::new();
-    let mut moves_audience = false;
     for c in changes.iter().filter(|c| wanted(&c.path)) {
         let Some(e) = &c.new else { continue };
         if e.kind.holds_blob() && !ctx.repo.store().entry_readable(e) {
             unreadable.push(c.path.clone());
-        } else if restored_as_recorded(&ctx.repo, e)? {
-            let same = c.old.as_ref().is_some_and(|o| o.kind.holds_blob() && o.kind == e.kind && o.visibility == e.visibility);
-            moves_audience |= !same;
         }
-    }
-    // Under an unreleased embargo, the working copy's tree is the
-    // embargo's; a version with another audience cannot be put into it as
-    // it is, and taking it in as an edit would seal it under the embargo
-    // (whose release publishes it).
-    let embargoed = veil_core::embargo::unreleased_wrapper(ctx.repo.store(), &wc_tree)?.is_some();
-    if embargoed && moves_audience {
-        bail!(
-            "the working copy is under an unreleased embargo: restoring a version sealed for another audience, or a conflict, into it would put that version under the embargo's key (its release would publish it); restore it into a change outside the embargo"
-        );
     }
     for p in &unreadable {
         eprintln!("  {} {} (unreadable here; not restored)", render::yellow("redacted"), safe(p.as_str()));
@@ -950,10 +926,10 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()
             || r.failed.iter().any(|(o, _)| p.starts_with(o))
     };
     let mut carried: Vec<(VPath, veil_core::TreeEntry)> = Vec::new();
-    for c in changes.iter().filter(|c| !embargoed && wanted(&c.path) && !not_written(&c.path)) {
+    for c in changes.iter().filter(|c| wanted(&c.path) && !not_written(&c.path)) {
         if let Some(e) = c.new.as_ref().filter(|e| e.kind.is_file_like() || e.kind.is_special()) {
             if restored_as_recorded(&ctx.repo, e)? {
-                carried.push((c.path.clone(), with_fallback_of(e, c.old.as_ref())));
+                carried.push((c.path.clone(), e.clone()));
             }
         }
     }
@@ -973,9 +949,8 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()
         let res = match veil_core::tree::lookup(ctx.repo.store(), &src_tree, &p)? {
             Some(e) if e.kind.is_file_like() => {
                 let data = read_file(&ctx.repo, &p, &e)?;
-                if !embargoed && restored_as_recorded(&ctx.repo, &e)? {
-                    let was = veil_core::tree::lookup(ctx.repo.store(), &wc_tree, &p)?;
-                    carry = Some((p.clone(), with_fallback_of(&e, was.as_ref())));
+                if restored_as_recorded(&ctx.repo, &e)? {
+                    carry = Some((p.clone(), e.clone()));
                 }
                 let exec = match e.kind {
                     veil_core::EntryKind::Conflict => {
@@ -988,9 +963,8 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()
             // A quarantined link (a token in its target) put back.
             Some(e) if e.kind == veil_core::EntryKind::Symlink => {
                 let target = read_file(&ctx.repo, &p, &e)?;
-                if !embargoed && restored_as_recorded(&ctx.repo, &e)? {
-                    let was = veil_core::tree::lookup(ctx.repo.store(), &wc_tree, &p)?;
-                    carry = Some((p.clone(), with_fallback_of(&e, was.as_ref())));
+                if restored_as_recorded(&ctx.repo, &e)? {
+                    carry = Some((p.clone(), e.clone()));
                 }
                 ctx.fs.write_link(&p, &target)
             }
@@ -1017,27 +991,10 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()
     Ok(())
 }
 
-/// Sealed version `e` put back over `was`: what readers without its key
-/// see stays what they saw at that path (`was`'s public version, as the
-/// builder carries it for a sealed edit), not the fallback `e` had where
-/// it came from. A conflict is put back as it is.
-fn with_fallback_of(e: &veil_core::TreeEntry, was: Option<&veil_core::TreeEntry>) -> veil_core::TreeEntry {
-    if !matches!(e.kind, veil_core::EntryKind::File | veil_core::EntryKind::Symlink) {
-        return e.clone();
-    }
-    let fallback = match was.filter(|w| w.kind == e.kind) {
-        Some(w) if w.visibility.is_public() && w.fallback.is_none() => Some(w.id),
-        Some(w) if w.visibility == e.visibility => w.fallback,
-        _ => None,
-    };
-    veil_core::TreeEntry { fallback, ..e.clone() }
-}
-
 /// Is version `e`, put back by `vl restore`, recorded as it is (rather
 /// than judged as an edit of the working copy's file)? A conflict always
-/// is (it is put back as the same conflict); a file whose content is
-/// sealed (cloaked, or under an embargo) is, so that it keeps its
-/// audience. A plaintext file is an ordinary edit: the policy and the
+/// is (it is put back as the same conflict); a sealed secret file is, so
+/// that it keeps its audience. A plaintext file is an ordinary edit: the policy and the
 /// working copy's line decide its sealing, and it may only end up
 /// narrower. Labels are claims: a file labelled sealed whose object is
 /// plaintext is plaintext (`verify_sealing`).
@@ -1149,47 +1106,13 @@ fn cmd_merge(
     println!("Merged {}", one_line(&ctx.repo, &res.snapshot));
     if let Some(e) = &res.embargo {
         println!(
-            "  {} {e}: changed files are sealed for scope '{scope}'; everyone else sees the pre-merge content {}.",
+            "  {} {e}: the merge and the history it brings in stay with '{scope}' (pushes hold them back) {}.",
             yellow("embargo"),
             match deadline {
                 Some(t) => format!("until {}, or an earlier `vl embargo release {e}`", fmt_deadline(t)),
                 None => format!("until `vl embargo release {e}`"),
             }
         );
-    }
-    // A file of the merged-in cloaked line is public now, or (under an
-    // embargo, this merge's or the destination's) once that is released.
-    let merged = ctx.repo.snapshot(&res.snapshot)?.tree;
-    let (mut published, mut on_release) = (Vec::new(), Vec::new());
-    for p in &res.declassified {
-        let visibility = match VPath::new(p) {
-            Ok(vp) => lookup(ctx.repo.store(), &merged, &vp)?.map(|e| e.visibility),
-            Err(_) => None,
-        };
-        match visibility {
-            Some(veil_core::object::Visibility::Embargoed { .. }) => on_release.push(p.as_str()),
-            _ => published.push(p.as_str()),
-        }
-    }
-    if !published.is_empty() {
-        println!(
-            "  {} (secret-scanned): {}",
-            yellow("published from the cloaked line"),
-            safe(&published.join(", "))
-        );
-    }
-    if !on_release.is_empty() {
-        println!(
-            "  {} (from the cloaked line; secret-scanned): {}",
-            yellow("public on release"),
-            safe(&on_release.join(", "))
-        );
-    }
-    if !res.quarantined.is_empty() {
-        warn_untrusted(&format!(
-            "quarantined, left out of the merge (they hold secrets): {}",
-            res.quarantined.join(", ")
-        ));
     }
     rewrite_cmd::print_renames(&res.renames);
     // Warnings quote paths from the merged trees: escaped (BUG-680).
@@ -1221,21 +1144,9 @@ fn cmd_embargo(ctx: &mut Ctx, c: &EmbargoCmd) -> Result<()> {
                         green("released"),
                         yellow("(not pushed yet: `vl undo` takes it back)")
                     ),
-                    ReleaseState::Rejected(why) => format!("{} {}", pending(), red(&format!("(release ignored: {})", safe(&why)))),
                     ReleaseState::Unreleased => pending(),
                 };
-                let key = if ctx.repo.keys().has(&format!("embargo/{}", r.id)) {
-                    ""
-                } else {
-                    " (no key)"
-                };
-                // Records carry no description; one written by an early
-                // version is still shown.
-                let desc = match first_line(&r.description) {
-                    d if d.trim().is_empty() => String::new(),
-                    d => format!("  {d}"),
-                };
-                println!("{}  scope:{}  {state}{key}{desc}", bold(&safe(&r.id)), safe(&r.scope));
+                println!("{}  scope:{}  {state}", bold(&safe(&r.id)), safe(&r.scope));
             }
         }
         EmbargoCmd::Release { id, yes } => cmd_embargo_release(ctx, id, *yes)?,
@@ -1244,7 +1155,7 @@ fn cmd_embargo(ctx: &mut Ctx, c: &EmbargoCmd) -> Result<()> {
 }
 
 /// `vl embargo release`: a previewed, confirmed release (BUG-109). The
-/// release is staged in this repository; the next push publishes the key, and until then `vl undo` takes it back.
+/// release is staged in this repository; the next push publishes it, and until then `vl undo` takes it back.
 fn cmd_embargo_release(ctx: &mut Ctx, id: &str, yes: bool) -> Result<()> {
     let keys = ctx.repo.keys();
     let Some(rec) = keys.load_embargo(id)? else {
@@ -1259,11 +1170,11 @@ fn cmd_embargo_release(ctx: &mut Ctx, id: &str, yes: bool) -> Result<()> {
             println!("Embargo {} is already released here; your next push publishes it (`vl undo` right after the release takes it back).", safe(id));
             return Ok(());
         }
-        ReleaseState::Unreleased | ReleaseState::Rejected(_) => {}
+        ReleaseState::Unreleased => {}
     }
     // What becomes public.
     println!(
-        "Releasing embargo {} (scope {}) publishes its key: everyone who receives your next push can read the fix.",
+        "Releasing embargo {} (scope {}) publishes the fix: your next push sends it, and everyone who may see the code can read it.",
         bold(&safe(id)),
         safe(&rec.scope)
     );
@@ -1326,7 +1237,7 @@ fn cmd_embargo_release(ctx: &mut Ctx, id: &str, yes: bool) -> Result<()> {
     }
     ctx.repo.release_embargo(id)?;
     println!(
-        "Released embargo {} in this repository. Your next push publishes the key; until then `vl undo` takes it back.",
+        "Released embargo {} in this repository. Your next push publishes it; until then `vl undo` takes it back.",
         safe(id)
     );
     Ok(())
@@ -2092,12 +2003,12 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
             true => api::emit_json(&api::workspace_list(&ctx.repo, &ctx.ws))?,
             false => api::text::workspace_list(&api::workspace_list(&ctx.repo, &ctx.ws)),
         },
-        WsCmd::New { name, rev, cloak } => {
+        WsCmd::New { name, rev } => {
             let bases = match rev {
                 Some(r) => vec![ctx.rev(r)?],
                 None => ctx.repo.snapshot(&ctx.wc()?)?.parents.clone(),
             };
-            let wc = ctx.repo.create_workspace(name, bases, cloak.clone())?;
+            let wc = ctx.repo.create_workspace(name, bases)?;
             println!("Created virtual workspace {} at {}", bold(name), one_line(&ctx.repo, &wc));
             println!(
                 "  {} no directory was created. Use `vl ws exec {name} -- <cmd>` or `vl ws switch {name}`.",
@@ -2173,8 +2084,6 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
                         .to_string()
                 } else if r.quarantined.iter().any(|(p, _)| *p == vp) {
                     "it looks like it contains a secret, so it was quarantined".to_string()
-                } else if r.held_back.iter().any(|(p, _)| *p == vp) {
-                    "it is held back under an embargo this identity holds no key for".to_string()
                 } else if r.cloak_failures.iter().any(|(p, _)| *p == vp) {
                     "it should be cloaked but no key is available".to_string()
                 } else {

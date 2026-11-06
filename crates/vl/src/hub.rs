@@ -716,7 +716,6 @@ pub fn pull(repo: &mut Repo, remote: &str, client: &Client, only: Option<&str>) 
                                     children.push((e.id, p));
                                     continue;
                                 }
-                                children.extend(e.fallback.map(|f| (f, p.clone())));
                                 children.push((e.id, p));
                             }
                         }
@@ -853,11 +852,6 @@ fn collect_tree(
                 }
             }
             out.push((e.id, raw));
-        }
-        if let Some(fb) = e.fallback {
-            if seen.insert(fb) {
-                out.push((fb, store.get_raw(&fb)?));
-            }
         }
     }
     Ok(())

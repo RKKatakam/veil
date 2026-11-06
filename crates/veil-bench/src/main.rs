@@ -52,11 +52,12 @@ struct GenArgs {
     /// Data profile: tiny (smoke test), small, 1g, 5g.
     #[arg(long, default_value = "small")]
     profile: String,
-    /// 85 % of the files under cloak rules (the `cloaked-*` profiles).
+    /// 85 % of the files under access lines (the `cloaked-*` profiles; a
+    /// historical name, nothing but secret files is encrypted).
     #[arg(long)]
     cloaked: bool,
-    /// What the server accepts: no cloak rules, no `isolate` rule, no
-    /// cloaked fix line, no scopes (set by `run --server`).
+    /// What the server accepts: no access lines, no `isolate` rule, no
+    /// fix line, no scopes (set by `run --server`).
     #[arg(long)]
     plain: bool,
     #[arg(long, default_value_t = 1)]
@@ -394,7 +395,7 @@ fn main() -> Result<()> {
             proc::install_signal_handlers();
             if server.server.is_some() {
                 if g.cloaked {
-                    return Err(anyhow!("--cloaked cannot go through the server (it refuses cloaked content)"));
+                    return Err(anyhow!("--cloaked cannot go through the server (its groups are not set up there)"));
                 }
                 g.plain = true;
             }

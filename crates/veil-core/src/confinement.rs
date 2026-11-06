@@ -1,19 +1,16 @@
 //! Which unreleased embargo a snapshot belongs to, for the routes that copy
 //! content from one revision into another (BUG-681).
 //!
-//! An unreleased embargo keeps three kinds of snapshot from a public
-//! remote (`remote::embargo_withheld`, `remote::push_closure`):
-//! * its **withheld history**: the fix, and how it was made;
+//! An unreleased embargo keeps two kinds of snapshot in this repository
+//! (`remote::embargo_withheld`, `remote::push_closure`):
+//! * its **withheld history**: the embargoed merge, the fix, and how it was
+//!   made;
 //! * snapshots that **build on** that history: a push refuses them until
-//!   the release, so they are part of the fix line too;
-//! * snapshots whose tree sits under the embargo's **wrapper** (the
-//!   embargoed merge and the key holders' work on top of it): their content
-//!   is sealed under the embargo key, and outsiders see the fallback.
+//!   the release, so they are part of the fix line too.
 //!
-//! A snapshot of any of these is *confined* to the embargo. Copying content
-//! out of a confined snapshot into one that is not would publish the fix's
-//! file names (and its content when the fix was not cloaked) before the
-//! release, so every copy route refuses it: `vl restore --from`,
+//! A snapshot of either is *confined* to the embargo. Copying content out
+//! of a confined snapshot into one that is not would publish the fix
+//! before the release, so every copy route refuses it: `vl restore --from`,
 //! `vl squash` (`--into`), `vl duplicate`/`vl cherry-pick`, and any rewrite
 //! that moves a confined change onto parents outside the embargo
 //! (`vl rebase`, `vl abandon` of the fix, ...), which
@@ -23,7 +20,6 @@
 use std::collections::HashMap;
 
 use crate::{
-    embargo::unreleased_wrapper,
     error::{Result, VeilError},
     id::ObjectId,
     repo::Repo,
@@ -50,7 +46,7 @@ pub fn active_embargoes(repo: &Repo) -> Result<std::collections::HashSet<String>
         let s = repo.snapshot(&id)?;
         if let Some(e) = &s.embargo {
             // A merge rewritten down to one parent (its fix abandoned)
-            // still holds the fix in its sealed tree: still active.
+            // still holds the fix in its tree: still active.
             if !repo.keys().embargo_released(e) {
                 out.insert(e.clone());
             }
@@ -62,7 +58,7 @@ pub fn active_embargoes(repo: &Repo) -> Result<std::collections::HashSet<String>
 impl Confinement {
     /// The confinement of `repo`'s current view.
     pub fn new(repo: &Repo) -> Result<Confinement> {
-        let withheld = crate::remote::embargo_withheld(repo, true)?;
+        let withheld = crate::remote::embargo_withheld(repo)?;
         let mut floor = crate::graph_index::Gen::MAX;
         for id in withheld.keys() {
             if let Some(g) = repo.graph().generation(repo, id)? {
@@ -78,21 +74,14 @@ impl Confinement {
 
     /// The unreleased embargo `id` is confined to, if any.
     pub fn of(&mut self, repo: &Repo, id: &ObjectId) -> Result<Option<String>> {
-        let s = repo.snapshot(id)?;
-        if let Some(w) = unreleased_wrapper(repo.store(), &s.tree)? {
-            return Ok(Some(w.embargo));
-        }
         if self.withheld.is_empty() {
             return Ok(None);
         }
         self.history(repo, id)
     }
 
-    /// By history alone (not the tree): withheld, or building on withheld
-    /// history, which is what a push refuses. The extra parents of an
-    /// unreleased embargoed merge do not count (the merge reaches the
-    /// remote with them redacted), so the embargoed line itself is not
-    /// confined by this. Iterative.
+    /// By history: withheld, or building on withheld history, which is what
+    /// a push refuses. Iterative.
     pub fn of_history(&mut self, repo: &Repo, id: &ObjectId) -> Result<Option<String>> {
         if self.withheld.is_empty() {
             return Ok(None);
@@ -119,11 +108,7 @@ impl Confinement {
                 self.memo.insert(x, None);
                 continue;
             };
-            let embargoed_merge = s.embargo.as_deref().is_some_and(|e| !repo.keys().embargo_released(e));
-            let parents = match embargoed_merge {
-                true => &s.parents[..s.parents.len().min(1)],
-                false => &s.parents[..],
-            };
+            let parents = &s.parents[..];
             if !expanded {
                 stack.push((x, true));
                 stack.extend(parents.iter().filter(|p| !self.memo.contains_key(*p)).map(|p| (*p, false)));
@@ -156,7 +141,7 @@ impl Confinement {
 /// change and the embargo only.
 pub fn copy_refusal(what: &str, src: &ObjectId, e: &str) -> VeilError {
     VeilError::Policy(format!(
-        "{what} {}: it is part of unreleased embargo {e} (the fix, work built on it, or the embargoed line), and a copy outside the embargo would publish the fix's file names before the release; copy it into a change inside the embargo, or release the embargo first (`vl embargo release {e}`)",
+        "{what} {}: it is part of unreleased embargo {e} (the fix, work built on it, or the embargoed line), and a copy outside the embargo would publish the fix before the release; copy it into a change inside the embargo, or release the embargo first (`vl embargo release {e}`)",
         src.short()
     ))
 }

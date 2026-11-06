@@ -254,15 +254,6 @@ pub fn cherry_pick(ctx: &mut Ctx, args: &CherryPickArgs) -> Result<ExitCode> {
                 let names: Vec<String> = r.advanced.iter().map(|n| safe(n).into_owned()).collect();
                 println!("Moved {} to the last copy", names.join(", "));
             }
-            if let Some((_, veil_core::commands::TagKept::CloakedLine(scope))) = r.kept.first() {
-                let names: Vec<String> = r.kept.iter().map(|(n, _)| safe(n).into_owned()).collect();
-                eprintln!(
-                    "{} {} not moved: this is a line cloaked for '{}', and copying onto it never moves an uncloaked tag",
-                    yellow("note:"),
-                    names.join(", "),
-                    safe(scope)
-                );
-            }
         }
     }
     Ok(ExitCode::SUCCESS)

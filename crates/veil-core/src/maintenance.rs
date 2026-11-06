@@ -596,10 +596,8 @@ fn path_hints(
                 match e.kind {
                     EntryKind::Dir => stack.push((e.id, sub)),
                     _ => {
-                        for f in std::iter::once(e.id).chain(e.fallback) {
-                            if set.contains(&f) && walked.insert(f) {
-                                hints.entry((HINT_FILE, sub.clone())).or_default().push(f);
-                            }
+                        if set.contains(&e.id) && walked.insert(e.id) {
+                            hints.entry((HINT_FILE, sub.clone())).or_default().push(e.id);
                         }
                     }
                 }

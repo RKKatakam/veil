@@ -67,12 +67,11 @@ pub fn changes_summary_with(changes: &[Change], scores: bool) {
 }
 
 /// A tier as `vl ls` prints it: `public`, `cloaked:<scope>`,
-/// `embargoed:<id>`, `redacted`, `isolated`, `ignored`, `quarantined`.
-pub fn tier_label(tier: &str, scope: Option<&str>, embargo: Option<&str>) -> String {
-    match (tier, scope, embargo) {
-        ("cloaked", Some(s), _) => format!("cloaked:{}", safe(s)),
-        ("embargoed", _, Some(e)) => format!("embargoed:{}", safe(e)),
-        (t, _, _) => t.to_string(),
+/// `redacted`, `isolated`, `ignored`, `quarantined`.
+pub fn tier_label(tier: &str, scope: Option<&str>) -> String {
+    match (tier, scope) {
+        ("cloaked", Some(s)) => format!("cloaked:{}", safe(s)),
+        (t, _) => t.to_string(),
     }
 }
 
@@ -80,7 +79,7 @@ pub fn tier_label(tier: &str, scope: Option<&str>, embargo: Option<&str>) -> Str
 fn tier_coloured(label: &str, tier: &str) -> String {
     match tier {
         "cloaked" => magenta(label),
-        "embargoed" | "quarantined" => yellow(label),
+        "quarantined" => yellow(label),
         "redacted" => red(label),
         _ => dim(label),
     }
@@ -88,16 +87,15 @@ fn tier_coloured(label: &str, tier: &str) -> String {
 
 /// ` [tier]` after a path in `vl status` (nothing for public files), with
 /// what a redacted file is sealed for.
-fn tier_mark(tier: &str, scope: Option<&str>, embargo: Option<&str>) -> String {
+fn tier_mark(tier: &str, scope: Option<&str>) -> String {
     if tier == "public" {
         return String::new();
     }
-    format!(" {}", tier_coloured(&format!("[{}]", tier_label(tier, scope, embargo)), tier))
+    format!(" {}", tier_coloured(&format!("[{}]", tier_label(tier, scope)), tier))
 }
 
 fn change_mark(c: &Change) -> String {
-    let (scope, embargo) = (c.visibility.scope.as_deref(), c.visibility.embargo.as_deref());
-    let mut mark = tier_mark(c.tier, scope, embargo);
+    let mut mark = tier_mark(c.tier, c.visibility.scope.as_deref());
     if c.conflict.is_some() {
         mark.push_str(&format!(" {}", red("[conflict]")));
     }
@@ -115,10 +113,7 @@ pub fn status(s: &Status) {
         println!("Working copy changes:");
         changes_summary(&s.changes);
     }
-    println!("Workspace    : {}{}", green(&safe(&s.workspace.name)), match &s.workspace.cloak {
-        Some(c) => magenta(&format!(" [cloaked:{}]", safe(c))),
-        None => String::new(),
-    });
+    println!("Workspace    : {}", green(&safe(&s.workspace.name)));
     println!("Working copy : {} {}", bold(&green("@")), one_line(&s.working_copy));
     for p in &s.parents {
         println!("Parent       : {}", one_line(p));
@@ -126,7 +121,7 @@ pub fn status(s: &Status) {
     if !s.isolated.is_empty() {
         println!("{}", dim("Local-only (isolated; never snapshotted or pushed):"));
         for p in &s.isolated {
-            println!("  {} {}{}", dim("L"), safe(p), tier_mark("isolated", None, None));
+            println!("  {} {}{}", dim("L"), safe(p), tier_mark("isolated", None));
         }
     }
     if !s.quarantined.is_empty() {
@@ -136,7 +131,7 @@ pub fn status(s: &Status) {
                 "held_back" => "edit held back; history keeps the previous version",
                 _ => "never recorded",
             };
-            println!("  {} {}{}  ({}; {state})", yellow("Q"), safe(&q.path), tier_mark(q.tier, None, None), q.rule);
+            println!("  {} {}{}  ({}; {state})", yellow("Q"), safe(&q.path), tier_mark(q.tier, None), q.rule);
         }
     }
     if !s.policy_held_back.is_empty() {
@@ -146,7 +141,7 @@ pub fn status(s: &Status) {
                 "  {} {}{}  ({}; .veilpolicy says {})",
                 yellow("P"),
                 safe(&h.path),
-                tier_mark(h.tier, h.scope.as_deref(), None),
+                tier_mark(h.tier, h.scope.as_deref()),
                 safe(&h.accepted),
                 safe(&h.wanted)
             );
@@ -161,7 +156,7 @@ pub fn status(s: &Status) {
     if !s.redacted.is_empty() {
         println!("{}", dim("Redacted (unreadable here; kept in history, absent on disk):"));
         for r in &s.redacted {
-            println!("  {} {}{}  ({})", dim("R"), safe(&r.path), tier_mark(r.tier, None, None), safe(&r.redaction.message));
+            println!("  {} {}{}  ({})", dim("R"), safe(&r.path), tier_mark(r.tier, None), safe(&r.redaction.message));
         }
     }
     if !s.conflicts.is_empty() {
@@ -299,9 +294,6 @@ fn log_entry(e: &LogEntry, lanes: &mut Vec<Option<ObjectId>>) {
     }
     if !e.conflicts.is_empty() {
         header.push(red("(conflict)"));
-    }
-    if let Some(c) = &e.cloak {
-        header.push(magenta(&format!("[cloaked:{}]", safe(c))));
     }
     if let Some(em) = &e.embargo {
         header.push(yellow(&format!("[embargo:{}{}]", safe(&em.id), if em.released { " released" } else { "" })));
@@ -520,9 +512,6 @@ pub fn show(repo: &Repo, s: &Show, r: &Renames) -> Result<()> {
     if !s.tags.is_empty() {
         println!("Tags      : {}", cyan(&s.tags.iter().map(|t| safe(t)).collect::<Vec<_>>().join(", ")));
     }
-    if let Some(c) = &s.cloak {
-        println!("Cloaked   : {}", magenta(&safe(c)));
-    }
     if let Some(e) = &s.embargo {
         let state = match (e.state, e.until_ms) {
             ("released", _) => "released".to_string(),
@@ -557,8 +546,7 @@ pub fn show(repo: &Repo, s: &Show, r: &Renames) -> Result<()> {
 pub fn workspace_list(w: &WorkspaceList) {
     for ws in &w.workspaces {
         let here = if ws.current { green("* ") } else { "  ".into() };
-        let cloak = ws.cloak.as_ref().map(|c| magenta(&format!(" [cloaked:{}]", safe(c)))).unwrap_or_default();
-        println!("{here}{}{cloak}: {}", bold(&safe(&ws.name)), one_line(&ws.working_copy));
+        println!("{here}{}: {}", bold(&safe(&ws.name)), one_line(&ws.working_copy));
     }
 }
 
@@ -689,7 +677,7 @@ pub fn ls(l: &Ls) {
         if stdout_closed() {
             return;
         }
-        let label = tier_label(e.tier, e.scope.as_deref(), e.embargo.as_deref());
+        let label = tier_label(e.tier, e.scope.as_deref());
         let size = e.size.map_or_else(|| "-".to_string(), |s| s.to_string());
         let mut note = Vec::new();
         if let Some(r) = &e.redaction {
@@ -736,9 +724,8 @@ pub fn ls(l: &Ls) {
 mod tests {
     #[test]
     fn tier_labels() {
-        assert_eq!(tier_label("cloaked", Some("ops"), None), "cloaked:ops");
-        assert_eq!(tier_label("embargoed", None, Some("e1")), "embargoed:e1");
-        assert_eq!(tier_label("redacted", Some("ops"), None), "redacted");
+        assert_eq!(tier_label("cloaked", Some("ops")), "cloaked:ops");
+        assert_eq!(tier_label("redacted", Some("ops")), "redacted");
     }
 
     use proptest::prelude::*;
@@ -820,9 +807,6 @@ pub fn blame(b: &BlameDoc) {
             }
         }
     }
-    if b.version == "fallback" {
-        crate::render::warn("you cannot read the current version of this file: its last public version is annotated (members see newer content)");
-    }
     if b.unattributed > 0 {
         let why = match b.stopped {
             Some("max_changes") => "the walk stopped at --max-changes; raise it to go further",
@@ -876,14 +860,6 @@ pub fn grep(g: &GrepDoc, style: GrepStyle) {
                 false => println!("{}:{text}{cut}", magenta(&p)),
             }
         }
-    }
-    let fallback: Vec<String> = g.files.iter().filter(|f| f.tier == "fallback").map(|f| safe(&f.path).into_owned()).collect();
-    if !fallback.is_empty() {
-        crate::render::warn(&format!(
-            "searched the last public version of {} file(s) you cannot read (members see newer content): {}",
-            fallback.len(),
-            fallback.join(", ")
-        ));
     }
     if g.skipped.sealed > 0 {
         crate::render::warn(&format!("{} file(s) not searched: sealed for a scope you are not in", g.skipped.sealed));

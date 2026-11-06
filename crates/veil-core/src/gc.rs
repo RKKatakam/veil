@@ -20,7 +20,7 @@
 //!    retained operation, the universal root, the project directory's
 //!    checkout pointer, keep markers and `extra_roots`: snapshot →
 //!    parents and tree; tree → entries, and a subtree already marked is
-//!    not entered again; file entry → object and embargo `fallback`.
+//!    not entered again; file entry → object.
 //!    Snapshot `predecessors` (the evolution log) are weak references.
 //!    Memory is the bitmap, the walk stack, the packs' index tables and
 //!    the store's cache limits, never the objects' content.
@@ -466,17 +466,6 @@ impl Mark<'_> {
                     continue;
                 }
             };
-            // An embargo wrapper lists every object reachable only through its
-            // sealed side (which gc may be unable to open); the rest is
-            // reachable through the fallback.
-            if let Some(w) = crate::embargo::wrapper_parts(&t) {
-                self.reach.insert(w.inner);
-                for l in &w.listed {
-                    self.reach.insert(*l);
-                }
-                stack.push((w.fallback, path));
-                continue;
-            }
             for e in &t.entries {
                 let sub = || match path.is_empty() {
                     true => e.name.clone(),
@@ -487,9 +476,6 @@ impl Mark<'_> {
                     // Symlink targets are blobs too.
                     EntryKind::File | EntryKind::Symlink => {
                         self.reach.insert(e.id);
-                        if let Some(fb) = e.fallback {
-                            self.reach.insert(fb);
-                        }
                     }
                     EntryKind::Conflict => self.conflict(e.id, &sub()),
                 }
