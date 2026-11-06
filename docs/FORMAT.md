@@ -219,8 +219,8 @@ work, which the engine avoids:
   keychain follows the same format: it wraps keys with HPKE only from
   format 3 and refuses to store a format-3 ring below it. Push and pull copy objects with
   `put_raw`, so a format-1 remote or clone can never receive an object an
-  older vl could not read: the push fails with "upgrade it with `vl upgrade
-  --remote <name>`", and nothing is recorded.
+  older vl could not read: the push fails with "upgrade it with `vl
+  upgrade`", and nothing is recorded.
 * `fsck` reports a binary tree in a format-1 repository, an AES-SIV object
   or an HPKE ring in a format-1/2 repository, a conflict object or
   conflict entry below format 4, and any format-5 object or view field
@@ -452,8 +452,9 @@ still waiting for its admin.
   operation in and removes the file. This vl's own format-5 transactions
   re-read `repo.json` under the lock before moving the head, and fail
   ("the repository was upgraded while this command ran") instead.
-* **Remotes and clones.** `vl upgrade --remote NAME` does the same on a
-  remote. A remote keeps one head, written under its lock, at every
+* **Remotes and clones.** `vl -R <bare repository> upgrade` does the same
+  on a bare repository (an old path remote, upgraded structurally: no
+  identity, no re-keying). A remote keeps one head, written under its lock, at every
   format. An older vl refuses a format-6 repository or remote outright: it
   would read only `op_head` and silently fork the log. Lock-free pushes and
   pulls work against format-5 remotes (the remote's side is unchanged).
@@ -466,7 +467,7 @@ still waiting for its admin.
   `min_vl`.
 * **Remotes and clones.** A format-4 remote or clone refuses symlink
   trees, link-term conflicts and annotated tags ("upgrade it with
-  `vl upgrade --remote <name>`"), and its operation store refuses a view
+  `vl upgrade`"), and its operation store refuses a view
   naming one; an older vl refuses a format-5 repository or remote outright
   (so it never drops `Tag.annotation` by rewriting a view). The order for
   a team is the usual one.
@@ -493,8 +494,8 @@ still waiting for its admin.
   conflict entry the embargoed tree would take in goes in as its file of
   markers), and nothing else.
 * **Remotes and clones.** A format-3 remote or clone refuses conflict
-  objects and trees with conflict entries ("upgrade it with `vl upgrade
-  --remote <name>`"): only history that holds an unresolved conflict is
+  objects and trees with conflict entries ("upgrade it with `vl
+  upgrade`"): only history that holds an unresolved conflict is
   affected. An older vl refuses a format-4 repository outright ("this
   repository uses format 4, which needs a newer vl"), and a conflict entry
   or object met elsewhere as `Unsupported`.
@@ -510,8 +511,8 @@ still waiting for its admin.
   (CRYPTO.md §5).
 * **Rings.** The upgrading admin's rotation makes each ring format 3. A
   remote or clone at format 2 refuses it (and AES-SIV objects) with "run
-  `vl upgrade` / `vl upgrade --remote <name>`". The order for a team is the
-  one above: everyone installs this vl, `vl upgrade --remote origin`, one
+  `vl upgrade`". The order for a team is the
+  one above: everyone installs this vl, the shared repository is upgraded, one
   admin upgrades and pushes (others pull before upgrading, so the rotation
   is not made twice: two admins rotating concurrently diverge the ring, as
   any concurrent admin edits do).

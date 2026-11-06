@@ -38,10 +38,17 @@
 # binary (`cargo test -p veil-core --test core_format --no-run` prints it).
 #
 #   upgraded/       the previous set's alice/ and team-remote/ (and their
-#                   identities) after `vl upgrade --remote origin`,
+#                   identities) after `vl -R team-remote upgrade` (a bare
+#                   repository is upgraded structurally),
 #                   `vl upgrade` and one more commit pushed: old sealed
 #                   objects and ring changes next to new ones
+#
+# team-remote/ and public-mirror/ are written through path remotes, which
+# `vl` keeps only as a test fixture since the Veil server replaced them:
+# <path/to/vl> must be a debug build (`cargo build -p vl`), run here with
+# VEIL_TEST_PATH_REMOTES set.
 set -euo pipefail
+export VEIL_TEST_PATH_REMOTES=1
 
 VL=$(realpath "$1")
 OUT=$2
@@ -190,7 +197,7 @@ if [ -n "$PREV" ]; then
         shift
         VEIL_HOME="$U/home-$who" VEIL_USER=$who "$VL" -R "$U/alice" "$@"
     }
-    up alice upgrade --remote origin >/dev/null
+    VEIL_HOME="$U/home-alice" VEIL_USER=alice "$VL" -R "$U/team-remote" upgrade >/dev/null
     up alice upgrade >/dev/null
     printf 'team-only notes v3 (after the upgrade)\n' > "$U/alice/secrets/notes.txt"
     printf 'after the upgrade\n' > "$U/alice/UPGRADED.md"

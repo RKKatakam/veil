@@ -2426,7 +2426,13 @@ fn cmd_upgrade(repo_arg: Option<&Path>, dry_run: bool, force: bool) -> Result<Ex
     let root = ctx::find_root(&start)
         .ok_or_else(|| anyhow!("no Veil repository found in {} or its parents", start.display()))?;
     let backend = Arc::new(DiskBackend::new(&root)) as Arc<dyn StorageBackend>;
-    let (label, identity) = ("this repository".to_string(), Some(load_identity()?));
+    // A bare repository (an old path remote) is upgraded structurally, as a
+    // remote was: its sealed content and rings are not ours to re-key.
+    let bare = Repo::open_remote(backend.clone()).is_ok_and(|r| r.view().workspaces.is_empty());
+    let (label, identity) = match bare {
+        true => ("this bare repository".to_string(), None),
+        false => ("this repository".to_string(), Some(load_identity()?)),
+    };
     let opts = UpgradeOptions {
         dry_run,
         force,

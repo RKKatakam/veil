@@ -1375,7 +1375,7 @@ impl Keychain {
             return Err(VeilError::Unsupported(format!(
                 "this repository is at format {have} and cannot store the key ring of scope '{}' \
                  (ring format {needs}: {what}); upgrade it with `vl upgrade` \
-                 (a remote: `vl upgrade --remote <name>`) once everyone who uses it runs vl {} or later",
+                 once everyone who uses it runs vl {} or later",
                 ring.scope,
                 crate::repo::min_vl_for_format(repo)
             )));
