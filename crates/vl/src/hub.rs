@@ -836,7 +836,9 @@ pub fn pull_with(repo: &mut Repo, remote: &str, client: &Client, only: Option<&s
     };
     let mut content = thin.then(|| Incoming::new(&content_store));
     let checked_out = checkout_branch(&tips).and_then(|b| tips.branches.get(&b).copied());
-    let limit = store.cache_limit().unwrap_or(u64::MAX);
+    // The cache's bound applies to what goes to the cache (not to `vl
+    // partial full`, which fills the main store).
+    let limit = store.cache_limit().filter(|_| thin).unwrap_or(u64::MAX);
     let mut content_bytes = 0u64;
     let mut new_snaps = Vec::new();
     if !want_tips.is_empty() {
