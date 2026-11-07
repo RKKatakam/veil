@@ -898,3 +898,243 @@ fn a_received_copy_is_never_recorded_after_the_device_gains_the_key() {
         assert!(veil_core::tree::lookup(repo.store(), &tree, &veil_core::VPath::new(&own).unwrap()).unwrap().is_none(), "recorded in {snap}");
     }
 }
+
+// ---- secret shares, review cycle 2 (docs/BUGS.md "Secret shares cycle 2") ----------------
+
+/// The snapshot the working copy of `dir`'s default workspace is on (its
+/// first parent), as hex.
+fn wc_parent(dir: &Path) -> String {
+    let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(dir)), None, "test").unwrap();
+    let wc = repo.view().workspaces["default"].wc;
+    repo.store().snapshot(&wc).unwrap().parents[0].to_string()
+}
+
+/// The share of `path` from `sharer` to `recipient`, as stored.
+fn record_from(hub: &TestHub, p: &Project, path: &str, sharer: &str, recipient: &str) -> ShareRecord {
+    serde_json::from_str(&row_of(hub, p, path, sharer, recipient).unwrap().2.expect("an active share has a record")).unwrap()
+}
+
+/// BUG-1064: the forward rule reads the revisions of the workspace the
+/// share was made in, but the file from the project directory, whichever
+/// workspace it is attached to. The admin (whose commits record `.env`)
+/// rotates it, commits, shares the rotated value with dev, then switches
+/// the directory to a workspace on the revision before the rotation: the
+/// old value is back in the directory, the default workspace has not
+/// moved, and the pass seals the old value, rolling dev back to the secret
+/// the admin rotated away from.
+#[test]
+#[ignore = "BUG-1064: a workspace switch rolls the share back (the rule checks one workspace, the file is another's)"]
+fn bug_1064_switching_the_directory_to_an_older_workspace_never_rolls_the_share_back() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let (a, env, dev_id) = (&p.dir, env_path(), p.dev.identity());
+    let old = read(a, &env).unwrap();
+    assert!(old.contains(ENV_MARK));
+    let rotated = "KEY=MARKER-ROTATED-BEFORE-SHARING-3c9d1e07\n";
+    write_files(a, &[(&env, rotated)]);
+    p.admin.ok(a, &["commit", "-m", "rotate the key"]);
+    p.admin.ok(a, &["secret", "share", &env, "--with", &p.dev.name]);
+    assert_eq!(record_from(&hub, &p, &env, &p.admin.name, &p.dev.name).open(&dev_id).unwrap(), rotated.as_bytes());
+    // A workspace on the revision before the rotation, and the directory on it.
+    p.admin.ok(a, &["ws", "new", "before", "-r", "@--"]);
+    p.admin.ok(a, &["ws", "switch", "before"]);
+    assert_eq!(read(a, &env).unwrap(), old, "the older workspace holds the value before the rotation");
+    let out = (0..3).map(|_| p.admin.ok(a, &["share-keys"])).collect::<Vec<_>>().join("");
+    let r = record_from(&hub, &p, &env, &p.admin.name, &p.dev.name);
+    assert!(
+        !r.open(&dev_id).is_ok_and(|c| c == old.as_bytes()),
+        "the admin's pass sealed the value from before the rotation for dev (version {}): rolled back\n{out}",
+        r.version
+    );
+}
+
+/// BUG-1065: "forward" accepts any snapshot of the change the last value
+/// was sealed on, an earlier version of it too (step 5.6 of the review
+/// skill: the change id alone does not say which version is newer). The
+/// admin commits a value (never shared), squashes a newer one into the
+/// same change, shares that, then starts a change on the earlier version
+/// of the change (where `vl undo` of the squash, or `vl evolog`, lead):
+/// the earlier value is back, and the pass seals it.
+#[test]
+#[ignore = "BUG-1065: an earlier version of the same change counts as forward (change id alone)"]
+fn bug_1065_an_earlier_version_of_the_same_change_is_an_older_revision() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let (a, env, dev_id) = (&p.dir, env_path(), p.dev.identity());
+    let earlier = "KEY=MARKER-EARLIER-VERSION-NEVER-SHARED-77d0a4b2\n";
+    write_files(a, &[(&env, earlier)]);
+    p.admin.ok(a, &["commit", "-m", "the key"]);
+    let first_version = wc_parent(a);
+    let current = "KEY=MARKER-CURRENT-VERSION-SHARED-0e5f2c19\n";
+    write_files(a, &[(&env, current)]);
+    p.admin.ok(a, &["squash"]);
+    assert_ne!(wc_parent(a), first_version, "the squash rewrote the change");
+    p.admin.ok(a, &["secret", "share", &env, "--with", &p.dev.name]);
+    assert_eq!(record_from(&hub, &p, &env, &p.admin.name, &p.dev.name).open(&dev_id).unwrap(), current.as_bytes());
+    // On the earlier version of the same change.
+    p.admin.ok(a, &["new", &first_version]);
+    assert_eq!(read(a, &env).unwrap(), earlier);
+    let out = (0..3).map(|_| p.admin.ok(a, &["share-keys"])).collect::<Vec<_>>().join("");
+    let r = record_from(&hub, &p, &env, &p.admin.name, &p.dev.name);
+    assert!(
+        !r.open(&dev_id).is_ok_and(|c| c == earlier.as_bytes()),
+        "the admin's pass sealed the earlier version's value for dev (version {}):\n{out}",
+        r.version
+    );
+}
+
+/// `vl args` as `who` in `dir`, starting no background pass.
+fn quiet(who: &Person, dir: &Path, args: &[&str]) -> std::process::Output {
+    let o = who.command(dir, args).env("VEIL_KEY_SHARE", "0").output().unwrap();
+    assert!(o.status.success(), "vl {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    o
+}
+
+/// Wait until no background pass runs in `dir`.
+fn no_pass_running(dir: &Path) {
+    let dir = dir.canonicalize().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let busy = std::fs::read_dir("/proc").unwrap().flatten().any(|e| {
+            let cmd = std::fs::read(e.path().join("cmdline")).unwrap_or_default();
+            cmd.windows(10).any(|w| w == b"share-keys") && std::fs::read_link(e.path().join("cwd")).is_ok_and(|c| c == dir)
+        });
+        if !busy {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "a background pass never ended");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// BUG-1066: `secret-shares.json` is read, changed and written back with
+/// no lock, by `vl secret share|unshare`, the background pass and `vl
+/// pull` in different processes. A pass in flight when fin unshares writes
+/// back the record it read before: the unshared share is recorded again,
+/// and the server that forgets the unshare (BUG-1060's attack) gets fin's
+/// rotated secret sealed for dev after all. The server decides how long
+/// the pass is in flight (it answers the recipient's device list when it
+/// likes); here a gate in the database holds that answer until fin's
+/// unshare is done. (PostgreSQL: advisory locks.)
+#[test]
+#[ignore = "BUG-1066: a background pass in flight writes back a share fin unshared meanwhile"]
+fn bug_1066_a_pass_in_flight_never_brings_back_an_unshare() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let (f, _d) = shared(&hub, &p);
+    let env = env_path();
+    // A second share of fin's, ended from another device of fin's: the
+    // pass forgets it, so it writes its record back.
+    let other = format!("{BILL_DIR}/.env.other");
+    write_files(&f, &[(&other, "OTHER=MARKER-OTHER-SHARE-6d13a0b4\n")]);
+    quiet(&p.fin, &f, &["secret", "share", &other, "--with", &p.dev.name]);
+    no_pass_running(&f);
+    sql(
+        &hub,
+        "UPDATE secret_shares SET unshared_at = 1, version = version + 1, body = NULL \
+         WHERE path = $1 AND project_id = (SELECT id FROM projects WHERE name = $2)",
+        &[&other, &p.name],
+    );
+    let last = record(&hub, &p, &env, &p.dev.name);
+    // The gate: the server answers dev's device list (`GET
+    // /v1/people/dev/devices`, the route's own query) only when the test
+    // says, from its second call on (the first is the key pass's, before
+    // the share pass reads `secret-shares.json`).
+    let db = hub.hub().db.clone();
+    let dev_person: i64 = hub.rt.block_on(sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(&p.dev.name).fetch_one(&db)).unwrap();
+    let _rt = hub.rt.enter();
+    let mut gate = hub.rt.block_on(db.acquire()).unwrap();
+    hub.rt.block_on(sqlx::query("SELECT pg_advisory_lock(4242)").execute(&mut *gate)).unwrap();
+    sql(
+        &hub,
+        &format!(
+            "CREATE FUNCTION veil_test_gate(p BIGINT) RETURNS BOOLEAN LANGUAGE plpgsql VOLATILE AS $g$ BEGIN \
+             IF p = {dev_person} AND current_query() LIKE '%d.person_id = $1 AND d.removed_at IS NULL AND NOT d.pending AND NOT EXISTS%' THEN INSERT INTO gate_log VALUES (current_query()); \
+             IF (SELECT count(*) FROM gate_log) > 1 THEN PERFORM pg_advisory_lock_shared(4242); PERFORM pg_advisory_unlock_shared(4242); END IF; END IF; \
+             RETURN TRUE; END $g$"
+        ),
+        &[],
+    );
+    sql(&hub, "CREATE TABLE gate_log (q TEXT)", &[]);
+    sql(&hub, "ALTER TABLE devices RENAME TO devices_gated", &[]);
+    sql(&hub, "CREATE VIEW devices AS SELECT * FROM devices_gated d WHERE veil_test_gate(d.person_id)", &[]);
+    let waiting = || -> i64 {
+        hub.rt
+            .block_on(sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 4242 AND NOT granted").fetch_one(&db))
+            .unwrap()
+    };
+    std::thread::scope(|scope| {
+        let pass = scope.spawn(|| quiet(&p.fin, &f, &["share-keys"]));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while waiting() == 0 {
+            assert!(std::time::Instant::now() < deadline, "the pass never asked for dev's devices");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // While the pass waits for the server: fin unshares.
+        quiet(&p.fin, &f, &["secret", "unshare", &env, "--from", &p.dev.name]);
+        hub.rt.block_on(sqlx::query("SELECT pg_advisory_unlock(4242)").execute(&mut *gate)).unwrap();
+        let o = pass.join().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    });
+    let gated: i64 = hub.rt.block_on(sqlx::query_scalar("SELECT count(*) FROM gate_log").fetch_one(&db)).unwrap();
+    assert!(gated >= 2, "the share pass never asked for dev's devices");
+    sql(&hub, "DROP VIEW devices", &[]);
+    sql(&hub, "ALTER TABLE devices_gated RENAME TO devices", &[]);
+    let local = std::fs::read_to_string(f.join(".veil/local/secret-shares.json")).unwrap_or_default();
+    // BUG-1060's attack: the server forgets the unshare; fin rotates.
+    store(&hub, &p, &env, &last);
+    sql(
+        &hub,
+        "UPDATE secret_shares SET unshared_at = NULL WHERE path = $1 AND project_id = (SELECT id FROM projects WHERE name = $2)",
+        &[&env, &p.name],
+    );
+    let rotated = "KEY=MARKER-ROTATED-AFTER-UNSHARE-9e4c27f5\n";
+    write_files(&f, &[(&env, rotated)]);
+    for _ in 0..3 {
+        p.fin.ok(&f, &["share-keys"]);
+    }
+    let r = record(&hub, &p, &env, &p.dev.name);
+    assert!(
+        !r.open(&p.dev.identity()).is_ok_and(|c| c == rotated.as_bytes()),
+        "fin's device sealed the rotated secret for dev after fin unshared it (version {} > {}); the clone's record \
+         after the race: {local}",
+        r.version,
+        last.version
+    );
+}
+
+/// BUG-1067: the hold-back before a snapshot moves whatever regular file is
+/// at a received share's path, every time, to one fixed name: the second
+/// move writes over the first. dev edits the copy they received, gains the
+/// folder's key (the edit is moved out), then writes a file of their own
+/// at that path: it is moved too, over dev's edit, which is lost.
+#[test]
+#[ignore = "BUG-1067: holding back a received copy writes over what it held before"]
+fn bug_1067_holding_back_a_received_copy_never_loses_what_it_held() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let f = clone(&hub, &p, &p.fin, "f");
+    let d = clone(&hub, &p, &p.dev, "d");
+    write_files(&d, &[(".veilpolicy", &format!("{}{BILL_DIR}/  finance\n", veil_core::policy::SYNCED_SECRETS_POLICY))]);
+    let own = format!("{BILL_DIR}/.env.fin-own");
+    let mark = "FIN=MARKER-FIN-OWN-SHARED-1f7c3a90\n";
+    write_files(&f, &[(&own, mark)]);
+    p.fin.ok(&f, &["secret", "share", &own, "--with", &p.dev.name]);
+    p.dev.ok(&d, &["pull"]);
+    assert_eq!(read(&d, &own).unwrap(), mark);
+    // dev's own edit of the copy (never written over by a later version).
+    let edited = format!("{mark}DEV=MARKER-DEV-OWN-EDIT-OF-THE-COPY-8b2e40d1\n");
+    write_files(&d, &[(&own, &edited)]);
+    p.admin.ok(&p.dir, &["group", "add", "finance", &p.dev.name]);
+    p.dev.ok(&d, &["pull"]);
+    p.dev.ok(&d, &["commit", "-m", "after joining finance"]);
+    assert!(read(&d, &own).is_none());
+    // A file of dev's own at that path, later.
+    write_files(&d, &[(&own, "FIN=MARKER-DEV-OWN-NEW-FILE-c41a9e3f\n")]);
+    let out = p.dev.ok(&d, &["commit", "-m", "a file of my own"]);
+    let held: Vec<String> = std::fs::read_dir(d.join(".veil/local/secret-shares-held"))
+        .unwrap()
+        .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+        .collect();
+    assert!(held.contains(&edited), "dev's own edit of the copy is gone; held now: {held:?}\n{out}");
+}
