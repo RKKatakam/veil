@@ -21,5 +21,6 @@ mod adversarial;
 mod secrets2;
 mod adversarial_s2;
 mod projects;
+mod derived;
 mod startup;
 mod caches;

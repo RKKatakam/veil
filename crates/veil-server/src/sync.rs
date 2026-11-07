@@ -1285,6 +1285,9 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             hub.caches.put_memo(project.id, view_key, real, projected);
         }
     }
+    // Derived history data for the branches moved, in the background: the
+    // push never waits.
+    crate::derive::landed(hub, project.id, moved);
     // The tips as the pusher sees them now (their own snapshots, where the
     // server's projection gives them back).
     let accepted = plans.iter().any(|p| p.3.is_some());

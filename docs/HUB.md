@@ -7,7 +7,9 @@ commands, 2026-11-06): the server core, sign-in, the permission model,
 sync with fetch on demand, enforcement and secrets sealed on the device.
 **§13 records what was built and every decision S1 made**; where §1–§12
 propose something §13 decided otherwise, §13 is what runs. Later
-milestones are in §13.9. Statements about what Veil does today cite the
+milestones are in §13.9; **S12** (derived history data: commit graph,
+changed paths, per-rule lists; no query API yet) is built too, recorded
+in `docs/design/server/phase-3-server-history.md` §10. Statements about what Veil does today cite the
 document or source file they come from; everything else is a proposal and
 is worded as one.
 
