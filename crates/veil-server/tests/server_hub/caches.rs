@@ -53,9 +53,19 @@ fn both(apis: &[&Api; 2], token: &str, project: &str) -> [bool; 2] {
     out
 }
 
+/// Run `q` straight in the database, as an operator would. Its trigger
+/// bumps the one epoch clock, which other tests bump too: YugabyteDB may
+/// refuse it as a conflict (`40001`), and it runs again.
 fn sql(hub: &TestHub, q: &str) -> u64 {
     let h = hub.hub();
-    hub.rt.block_on(sqlx::query(q).execute(&h.db)).unwrap().rows_affected()
+    for _ in 0..50 {
+        match hub.rt.block_on(sqlx::query(q).execute(&h.db)) {
+            Ok(r) => return r.rows_affected(),
+            Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("40001") => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => panic!("{q}: {e}"),
+        }
+    }
+    panic!("{q}: kept conflicting")
 }
 
 fn member(api: &Api, admin: &str, project: &str, group: &str, who: &str, add: bool) {
