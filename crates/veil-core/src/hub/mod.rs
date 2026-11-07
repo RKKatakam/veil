@@ -7,6 +7,9 @@
 //! * [`project`]: the per-viewer projection of trees (entries a viewer may
 //!   not read are left out, names included), and the graft that turns a
 //!   pushed tree back into the full tree (`docs/HUB.md` §4.6, §5.4).
+//! * [`grant`]: read grants (signed by the server, bound to a device) and
+//!   the chain check every layer uses to serve an object only to someone
+//!   whose projected root reaches it (`docs/HUB.md` §13.13).
 //! * [`wire`]: the JSON messages and the object frames of the protocol
 //!   (`docs/HUB.md` §4).
 //!
@@ -14,5 +17,6 @@
 //! own records and the accepted policy, never from labels in a snapshot.
 
 pub mod access;
+pub mod grant;
 pub mod project;
 pub mod wire;

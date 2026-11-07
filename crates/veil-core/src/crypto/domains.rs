@@ -92,6 +92,13 @@ pub const SIG_CONTEXT_HUB_DEVICE: &str = "hub-device";
 /// the invite's key, over `person ‖ 0x00 ‖ X25519 ‖ Ed25519` of the
 /// joining device (`hub::wire::join_message`).
 pub const SIG_CONTEXT_HUB_INVITE: &str = "hub-invite";
+/// Signature context: a Veil server's read grant (`hub::grant`, `docs/HUB.md`
+/// §13.13), by its grant key, over the grant's JSON body exactly as sent.
+pub const SIG_CONTEXT_HUB_GRANT: &str = "hub-grant";
+/// Signature context: a device's request under a read grant
+/// (`hub::grant::request_message`): the grant's hash, the time and the
+/// hash of the object ids asked for.
+pub const SIG_CONTEXT_HUB_REQUEST: &str = "hub-request";
 
 /// Every signature context, for the uniqueness test.
 pub const SIG_CONTEXTS: &[&str] = &[
@@ -105,6 +112,8 @@ pub const SIG_CONTEXTS: &[&str] = &[
     SIG_CONTEXT_HUB_LOGIN,
     SIG_CONTEXT_HUB_DEVICE,
     SIG_CONTEXT_HUB_INVITE,
+    SIG_CONTEXT_HUB_GRANT,
+    SIG_CONTEXT_HUB_REQUEST,
 ];
 
 // ---- key rings and embargoes (keychain.rs) --------------------------------
@@ -245,7 +254,7 @@ mod tests {
             "028e842fb2475981",
             "a signature context changed; that breaks existing signatures. Add a new constant instead."
         );
-        assert_eq!(SIG_CONTEXTS[5..], ["vault-entry", "tag", "hub-login", "hub-device", "hub-invite"], "a signature context changed or was reordered");
+        assert_eq!(SIG_CONTEXTS[5..], ["vault-entry", "tag", "hub-login", "hub-device", "hub-invite", "hub-grant", "hub-request"], "a signature context changed or was reordered");
         let labels = [
             WRAP_LABEL_PREFIX,
             PREV_KEY_LABEL_PREFIX,
