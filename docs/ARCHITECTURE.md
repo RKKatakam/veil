@@ -3466,11 +3466,13 @@ The lists below describe what today's client protects, and what not.
 * *History withheld by an embargo* is computed from the local graph. If the
   embargoed merge is undone, or abandoned with nothing built on it, before
   a push, nothing protects the fix branch any more; it is then an ordinary
-  change. A rewrite that drops the merge, or replaces it with a snapshot
-  without its embargo, while a change built on it survives is refused
-  (`Transaction::check_embargoed_merges`; a merge of concurrent operations
-  drops such a rewrite), so a fix kept in a descendant's tree is never
-  left unwithheld (BUG-942, BUG-943).
+  change. Otherwise a transaction's rewrites keep one invariant
+  (`Transaction::check_withheld`): every snapshot an unreleased embargo
+  withheld before that is still visible is still withheld afterwards. A
+  squash or abandon of the merge while a change built on it survives, or a
+  rebase of the merge onto other parents, is refused; a merge of
+  concurrent operations drops such a rewrite (BUG-942, BUG-943, BUG-990).
+  `vl blame --public` refuses a revision a push withholds (BUG-991).
 * Content committed in plaintext **before** a path was cloaked stays readable
   in those older snapshots. `vl cloak` warns when this applies.
 

@@ -163,14 +163,15 @@ Nothing is recorded when this happens. Your options:
   fix's own parent), `vl duplicate` and `vl cherry-pick`, `vl rebase`
   of work built on the fix onto another line, and `vl abandon` of the fix
   while work is built on it.
-* **Nothing drops the embargoed merge while work is built on it.** Until
-  the release, `vl abandon` of the merge, `vl squash` of it into the change
-  on top of it, and any other rewrite that removes it or leaves it without
-  its embargo refuse while a change built on it survives ("release the
-  embargo first, or abandon what is built on it too"): that change holds
-  the fix, and without the merge nothing would withhold it. A concurrent
-  operation that does it (another workspace) is dropped when the
-  operations merge.
+* **What the embargo withholds stays withheld.** Until the release, a
+  command after which something the embargo withheld is still there but no
+  longer withheld is refused ("release the embargo first, or abandon what
+  is built on the merge too"): `vl abandon` of the merge, or `vl squash` of
+  it into the change on top of it, while a change built on it survives
+  (that change holds the fix); `vl rebase` of the merge onto other parents
+  (the fix first, the fix alone, or without the fix), which would stop it
+  covering the fix line. A concurrent operation that does it (another
+  workspace) is dropped when the operations merge.
   Inside the embargo they all work: restore from the fix into a change on
   the fix line, squash work on the fix into it, rebase or split the fix
   itself (the embargoed merge follows). `vl cat -r` reads it and changes
