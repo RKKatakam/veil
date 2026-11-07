@@ -8,6 +8,7 @@
 |---|---|---|
 | [`phase-2-thin-clients.md`](phase-2-thin-clients.md) | Fetch on demand, bounded caches, mounts, the per-machine daemon and watcher, layered caches that serve only what the asker may see, workspaces in seconds, commits through the API, agent sessions and attribution | a fresh workspace on any size of project under 2 s cold, 300 ms warm; 10,000 pulls/s with caches; 100 landings/s into one `main` |
 | [`phase-3-server-history.md`](phase-3-server-history.md) | Derived data per change, the query API (log, blame, diff, files, grep, search) projected per viewer | history, blame and search through the API in milliseconds to low hundreds of ms; answers identical to those on a project built from the viewer's view |
+| [`storage-and-cost.md`](storage-and-cost.md) | Cost and speed across phases: one database commit per push, request caches, tips without a hot row, compressed objects, packs per push and their merging, cost gates in every benchmark | at most 2 storage writes and 1 database commit per push; 5 or fewer statements per warm pull; server under 1 GB on the 1 GB profile |
 | [`phase-4-agent-scale.md`](phase-4-agent-scale.md) | Batched server-side landing, conflicts back to agents, protected `main`, land first and test after, bisect and revert, PRs and review, embargo release, CI, rate limits, metrics, the web client | 1,000 landings/s into one `main` with 10,000 agents, p99 under 1 s; PR open or update under 100 ms |
 
 ## The owner's numbers, phase by phase
@@ -29,7 +30,7 @@ S1 is built. **S2** (secrets at scale: keys per access rule, background wrapping
 | # | Phase | Milestone | Depends on |
 |---|---|---|---|
 | S3 | 2 | Fetch on demand in the client (thin clones, bounded cache, no full graph) | S1, simplification pass |
-| S4 | 2 | Request-path caches (permissions, sessions, snapshot resolution, tips) and fewer commits per landing | S1 |
+| S4 | 2 | Request-path caches (permissions, sessions, snapshot resolution, tips invalidated without a hot row), **one database commit per push**, and the cost gates in `veil-bench load` (`storage-and-cost.md` §3–5, §9) | S1 |
 | S5 | 2 | Read grants, the object routes, access epochs | S1 |
 | S6 | 2 | The Veil daemon: shared object cache | S3, S5 |
 | S7 | 2 | The daemon's file watcher (`status`/`commit` without a scan) | S6 |
@@ -37,7 +38,10 @@ S1 is built. **S2** (secrets at scale: keys per access rule, background wrapping
 | S9 | 2 | Regional cache | S5 |
 | S10 | 2 | Commits through the API (with the server-side secret scan) | S1 |
 | S11 | 2 | Agent sessions and attribution | S10, S8 |
-| G2 | 2 | Phase 2 gate run | S3–S11 |
+| S27 | 2 | Compressed objects (zstd) in storage and transport (`storage-and-cost.md` §6) | S1 |
+| S28 | 2 | Packs: one storage write per push for small objects, index, range reads (`storage-and-cost.md` §7) | S5, S27 |
+| S29 | 2 | Merging packs and pack garbage collection (`storage-and-cost.md` §8) | S28 |
+| G2 | 2 | Phase 2 gate run | S3–S11, S27–S29 |
 | S12 | 3 | Derived-data framework, commit graph, changed paths, per-rule lists, eager projection memos at each branch move | S1 |
 | S13 | 3 | Query API with per-viewer projection, and the projection-equivalence harness | S12 |
 | S14 | 3 | Blame and file history | S13 |
@@ -64,15 +68,17 @@ The owner allows many agents at once. Each wave's milestones touch different fil
 | Wave | Milestones in parallel | Notes on shared code |
 |---|---|---|
 | **1** | **S3, S4, S5, S10, S12** | S4 and S10 both touch the push transaction in `veil-server/src/sync.rs`: S10 puts its code in a new `changes.rs` and calls the push checks; whichever merges second rebases. S5's chain check lives in `veil-core::hub` (WASM-safe), used by S6 and S9 later. |
-| **2** | **S6, S8, S9, S13, S17** | S6 and S8 both use S3's promisor, not each other's code. S17 needs S4, S10 and S12. |
-| **3** | **S7, S11, S14, S15, S18, S21, S22, S24** | S11 needs S8's workspace socket. S22 also needs S2. S14 and S15 are separate modules (`derive/blame.rs`, `search/`). |
-| **4** | **S16, S19, S23, S25, G2** | G2 runs when S3–S11 are in. |
+| **2** | **S6, S8, S9, S13, S17, S27** | S6 and S8 both use S3's promisor, not each other's code. S17 needs S4, S10 and S12. S27 touches the object store encoding (`store.rs`) and the fetch protocol's framing only. |
+| **3** | **S7, S11, S14, S15, S18, S21, S22, S24, S28** | S11 needs S8's workspace socket. S22 also needs S2. S14 and S15 are separate modules (`derive/blame.rs`, `search/`). |
+| **4** | **S16, S19, S23, S25, S29, G2** | G2 runs when S3–S11 and S27–S29 are in. |
 | **5** | **S20, S26 (if approved)** | G3 is part of S16. |
 | **6** | **G4** | The landing part of G4 (1,000/s into one `main`) can run as soon as S17, S18 and S24 are in; the bisect part waits for S20. |
 
 **Critical path to 1,000 landings/s into one `main`:** S4 + S10 → S17 → S18 and S24 → the landing part of G4. Four waves.
 
 **Critical path to workspaces in seconds:** S3 + S5 → S6 + S8 → G2.
+
+**Cost and speed work outside the milestones** (BUG-864 server memory, BUG-865 parallel push checks, commit and clone-one-folder speed): `storage-and-cost.md` §10.
 
 **Memory on the build machine:** each agent's builds take several GB. The owner asked to watch RAM: run at most as many building agents as the machine's memory allows (use `bash ~/.cache/veil-orch/verify-fast.sh`, which deletes `target/` when done), and start the rest when one finishes.
 
