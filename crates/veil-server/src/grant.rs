@@ -223,7 +223,7 @@ impl ChainSource for Source {
 
 /// What a request under a grant that does not hold gets. It says nothing
 /// of any object.
-fn grant_invalid() -> Error {
+pub(crate) fn grant_invalid() -> Error {
     Error::new(
         StatusCode::UNAUTHORIZED,
         "grant_invalid",
@@ -233,7 +233,7 @@ fn grant_invalid() -> Error {
 
 /// What an object the grant does not reach, and an object that is not
 /// there, both get.
-fn not_reached() -> Error {
+pub(crate) fn not_reached() -> Error {
     Error::not_found("no such object that your grant reaches")
 }
 
@@ -369,12 +369,12 @@ fn stream(hub: Arc<Hub>, project: i64, items: Vec<(ObjectId, u64)>) -> sync::Fra
     sync::FrameStream(rx)
 }
 
-fn header<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
+pub(crate) fn header<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
     h.get(name).and_then(|v| v.to_str().ok())
 }
 
 /// `Veil-Chain: id,id,…` (absent or empty: the root itself).
-fn parse_chain(h: &HeaderMap) -> Result<Vec<ObjectId>> {
+pub(crate) fn parse_chain(h: &HeaderMap) -> Result<Vec<ObjectId>> {
     match header(h, "veil-chain").map(str::trim) {
         None | Some("") => Ok(Vec::new()),
         Some(s) => s
@@ -386,7 +386,7 @@ fn parse_chain(h: &HeaderMap) -> Result<Vec<ObjectId>> {
 }
 
 /// `Veil-Signature: <unix ms>.<signature>`, absent for anyone on Earth.
-fn parse_signature(h: &HeaderMap) -> Result<(i64, Option<String>)> {
+pub(crate) fn parse_signature(h: &HeaderMap) -> Result<(i64, Option<String>)> {
     match header(h, "veil-signature") {
         None => Ok((0, None)),
         Some(s) => {
@@ -399,7 +399,7 @@ fn parse_signature(h: &HeaderMap) -> Result<(i64, Option<String>)> {
 /// A single `bytes=START-[END]` range (`END` absent: to the end); `None`
 /// for no range, or one this server does not take (it then sends the whole
 /// object, as HTTP allows).
-fn parse_range(h: &HeaderMap) -> Option<(u64, u64)> {
+pub(crate) fn parse_range(h: &HeaderMap) -> Option<(u64, u64)> {
     let r = header(h, "range")?.strip_prefix("bytes=")?;
     let (a, b) = r.split_once('-')?;
     let start: u64 = a.trim().parse().ok()?;
@@ -448,8 +448,14 @@ pub async fn batch(State(hub): State<HubState>, Path(target): Path<String>, body
         return Err(Error::bad_request(format!("at most {MAX_WANTS} objects per request")));
     }
     let ids: Vec<ObjectId> = req.wants.iter().map(|w| w.id).collect();
+    if req.skip.len() > MAX_WANTS {
+        return Err(Error::bad_request(format!("at most {MAX_WANTS} objects per request")));
+    }
     let (grant, project) = check(&hub, p, &req.grant, req.ts, req.signature.as_deref(), &ids).await?;
-    let items = reached(&hub, project, &grant, req.wants.into_iter().map(|w| (w.chain, w.id)).collect()).await?;
+    // What a regional cache forwarding the request served itself (S9).
+    let skip: std::collections::HashSet<ObjectId> = req.skip.into_iter().collect();
+    let wants = req.wants.into_iter().filter(|w| !skip.contains(&w.id)).map(|w| (w.chain, w.id)).collect();
+    let items = reached(&hub, project, &grant, wants).await?;
     let body = axum::body::Body::new(stream(hub.clone(), project, items));
     Ok(([(header::CONTENT_TYPE, "application/octet-stream")], body).into_response())
 }
