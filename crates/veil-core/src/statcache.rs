@@ -21,7 +21,7 @@
 //! every path against the current policy on every run and only uses a fact
 //! where it would otherwise have needed the bytes. As a second line of
 //! defence the whole cache is keyed on the `.veilpolicy` content id and on a
-//! fingerprint of the key and embargo state, and it is dropped when either
+//! fingerprint of the key state, and it is dropped when either
 //! changes.
 //!
 //! **Racy mtime.** A file written in the same timestamp tick in which it was
@@ -180,7 +180,7 @@ impl Record {
 pub struct CacheKey {
     /// Blob id of `.veilpolicy`, `None` if there is none.
     pub policy: Option<ObjectId>,
-    /// Fingerprint of identity, scope keys and embargo states.
+    /// Fingerprint of identity and scope keys.
     pub keys: ObjectId,
     /// Kind of clock the stamps were taken on.
     pub exact: bool,
@@ -203,7 +203,7 @@ impl CacheKey {
 
 /// Fingerprint of everything in the keychain that can change what a file's
 /// tree entry looks like: who we are, which scope keys we hold (and which
-/// key), and which embargoes exist, are released, or are readable.
+/// key).
 pub fn key_state(keys: &Keychain) -> Result<ObjectId> {
     let mut h = blake3::Hasher::new();
     h.update(b"veil statcache key-state v1\0");
@@ -225,11 +225,6 @@ pub fn key_state(keys: &Keychain) -> Result<ObjectId> {
                 .as_bytes(),
         );
         h.update(b"\0");
-    }
-    h.update(b"embargoes\0");
-    for e in keys.embargoes()? {
-        h.update(e.id.as_bytes());
-        h.update(&[keys.embargo_released(&e.id) as u8, keys.has(&format!("embargo/{}", e.id)) as u8, 0]);
     }
     Ok(ObjectId(*h.finalize().as_bytes()))
 }
@@ -347,6 +342,7 @@ impl StatCache {
         let old = std::mem::take(&mut self.records);
         CacheRun {
             new: HashMap::with_capacity(old.len()),
+            old_len: old.len(),
             old,
             verified_at: clock.now,
             exact: clock.exact,
@@ -355,7 +351,7 @@ impl StatCache {
     }
 
     pub(crate) fn end_run(&mut self, run: CacheRun) {
-        self.dirty |= run.changed || run.new.len() != run.old.len();
+        self.dirty |= run.changed || run.new.len() != run.old_len;
         self.records = run.new;
     }
 }
@@ -363,7 +359,10 @@ impl StatCache {
 /// One build's view of the cache: lookups go to the records from the last
 /// run, and only paths seen in this run survive into the next one.
 pub(crate) struct CacheRun {
+    /// The last run's records not yet used by this one.
     old: HashMap<VPath, Record>,
+    /// How many records the last run left.
+    old_len: usize,
     new: HashMap<VPath, Record>,
     verified_at: i64,
     exact: bool,
@@ -371,6 +370,35 @@ pub(crate) struct CacheRun {
 }
 
 impl CacheRun {
+    /// How many records the last run left (about the working copy's files).
+    #[cfg(feature = "os")]
+    pub(crate) fn len(&self) -> usize {
+        self.old_len
+    }
+
+    /// [`CacheRun::trusted`], moved out of the last run's records: carried
+    /// into the next run with [`CacheRun::keep_taken`] once used, or given
+    /// back with [`CacheRun::give_back`] (no copy of the path or the record).
+    pub(crate) fn take_trusted(&mut self, path: &VPath, meta: &Metadata) -> Option<(VPath, Record)> {
+        let stamp = Stamp::of(meta)?;
+        let (path, rec) = self.old.remove_entry(path)?;
+        if rec.vouches_for(&stamp, self.exact) {
+            return Some((path, rec));
+        }
+        self.old.insert(path, rec);
+        None
+    }
+
+    /// Carry a record taken by [`CacheRun::take_trusted`] into the next run.
+    pub(crate) fn keep_taken(&mut self, path: VPath, rec: Record) {
+        self.new.insert(path, rec);
+    }
+
+    /// A record taken by [`CacheRun::take_trusted`] and not used.
+    pub(crate) fn give_back(&mut self, path: VPath, rec: Record) {
+        self.old.insert(path, rec);
+    }
+
     /// The record for `path` if it can vouch for the file's current stat.
     pub(crate) fn trusted(&self, path: &VPath, meta: &Metadata) -> Option<&Record> {
         let stamp = Stamp::of(meta)?;

@@ -413,3 +413,48 @@ fn flaky_proxy(upstream: String, drop_it: impl Fn(usize) -> bool + Send + 'stati
     });
     format!("http://{addr}")
 }
+
+/// An unreleased embargo never reaches the server: `vl push` sends neither
+/// the embargoed merge nor its fix (the tag on them is rejected here, with
+/// the reason), so nothing of the fix is uploaded and nobody else sees it.
+#[test]
+fn an_unreleased_embargo_never_reaches_the_server() {
+    const FIX: &str = "EMBARGOED-FIX-MARKER-4471";
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    write_files(&p.dir, &[("src/fix.rs", FIX)]);
+    p.admin.ok(&p.dir, &["commit", "--no-advance", "-m", "the fix"]);
+    p.admin.ok(&p.dir, &["merge", "@-", "--into", "main", "--embargo", "-m", "merge the fix"]);
+    let out = p.admin.fails(&p.dir, &["push"]);
+    assert!(out.contains("rejected") && out.contains("embargo"), "{out}");
+    let d = p.dev.dir("c");
+    p.dev.ok(p.dev.home.path(), &["clone", &hub.url(&p.name), d.to_str().unwrap()]);
+    assert_no_marker(&everything_in(&d), &[FIX], "dev");
+    assert!(!d.join("src/fix.rs").exists(), "the fix reached a clone");
+}
+
+/// BUG-1015 (regression on the simplification branch): `vl squash` of the
+/// embargoed merge into the fix, with a follow-up on `main`, leaves `main`
+/// a plain merge that holds the fix and that no embargo withholds, so the
+/// next `vl push` uploads the fix and every member who can read the project
+/// gets it before the release.
+#[test]
+fn squashing_the_embargoed_merge_into_the_fix_never_reaches_the_server() {
+    const FIX: &str = "EMBARGOED-FIX-MARKER-5582";
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    write_files(&p.dir, &[("src/fix.rs", FIX)]);
+    p.admin.ok(&p.dir, &["commit", "--no-advance", "-m", "the fix"]);
+    p.admin.ok(&p.dir, &["tag", "set", "fixline", "-r", "@-"]);
+    p.admin.ok(&p.dir, &["merge", "fixline", "--into", "main", "--embargo", "-m", "merge the fix"]);
+    p.admin.ok(&p.dir, &["new", "main"]);
+    write_files(&p.dir, &[("src/follow.rs", "follow-up")]);
+    p.admin.ok(&p.dir, &["commit", "-m", "follow-up"]);
+    let _ = p.admin.run(&p.dir, &["squash", "-r", "main-", "--into", "fixline"]);
+    p.admin.ok(&p.dir, &["tag", "delete", "fixline"]);
+    let _ = p.admin.run(&p.dir, &["push"]);
+    let d = p.dev.dir("c");
+    p.dev.ok(p.dev.home.path(), &["clone", &hub.url(&p.name), d.to_str().unwrap()]);
+    assert_no_marker(&everything_in(&d), &[FIX], "dev");
+    assert!(!d.join("src/fix.rs").exists(), "the fix reached a clone");
+}

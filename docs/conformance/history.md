@@ -4,8 +4,8 @@ Veil checked against the history-related parts of Git's and Jujutsu's test
 suites: what `vl diff`, `vl log`, revisions, `vl merge`, `vl rebase`,
 `vl squash`, `vl abandon`, `vl describe`, `vl edit`, `vl evolog` and the
 op log do, compared with `git diff/log/rev-list/merge/rebase` and jj's
-equivalents, plus Veil-only variants of the same scenarios with cloaked,
-isolated and embargoed content.
+equivalents, plus Veil-only variants of the same scenarios with sealed secret files,
+isolated files and embargoed content.
 
 Tests: `crates/vl/tests/cli_conformance/conformance_history/` (a module of the `cli_conformance` binary; modules `diff`,
 `log`, `revisions`, `merge`, `rewrite`, `veil_angles`). Run them with
@@ -35,8 +35,7 @@ reproductions with `-- --ignored conformance_history::`. Baseline: `integration`
     the conflict mark; it clears it).
 * **Held:** every Veil-specific merge/rewrite scenario kept cloaked
   plaintext out of everything an outsider can read: conflict markers in
-  cloaked files, a policy change racing a public edit, rebases of cloaked
-  lines and of `.veilpolicy` edits (including a conflicted
+  cloaked files, a policy change racing a public edit, rebases of `.veilpolicy` edits (including a conflicted
   `.veilpolicy`), squash and abandon across cloak boundaries, embargoed
   merges that are reworded, squashed into, rebased onto, abandoned and
   undone, and non-member `diff`/`show`/`log`. Isolated files and
@@ -67,7 +66,7 @@ reproductions with `-- --ignored conformance_history::`. Baseline: `integration`
   follow their change.
 * **Abandoning a merge** reparents its children onto both of the merge's
   parents (jj semantics). Abandoning an embargoed merge therefore turns
-  its child into a plain merge of the cloaked fix line, which stays sealed.
+  its child into a plain merge of the fix line.
 * **Revisions are deliberately minimal** in 1.0: `@`, `name@`, tags, remote
   tags, change/snapshot id prefixes, `root`, `X-`. There are no ranges,
   `::`, `|`, functions, `~N` or `^`; all of them are rejected cleanly
@@ -79,8 +78,6 @@ reproductions with `-- --ignored conformance_history::`. Baseline: `integration`
 * **Files written before `vl cloak` are recorded publicly** by the automatic
   snapshot that `vl cloak` itself takes first. The guide says to set the
   policy before the next command. The Veil tests cloak first, then write.
-* **On an unreleased embargoed line, conflicts are not recorded** in snapshot
-  metadata (only reported and left as markers), by design (ARCHITECTURE §7).
 
 ## Pending features (acceptance scenarios for the feature wave)
 
@@ -405,10 +402,13 @@ scenarios below are still to port; until then their rows keep the status
 
 All in `veil_angles`, each named after the Git/jj scenario it replays:
 
-* **Cloaked files through merges and rebases**: `merge_conflict_in_a_cloaked_file_stays_sealed`
+Since repository format 8 only secret files are encrypted: the cloaked
+files below are secret files (`secret/.env.k`), and embargoed history is
+withheld from every push until its release.
+
+* **Sealed secret files through merges and rebases**: `merge_conflict_in_a_cloaked_file_stays_sealed`
   (markers and resolution stay sealed; nothing on a public mirror),
   `rebase_conflict_in_a_cloaked_file_stays_sealed`, `clean_merge_of_a_cloaked_file_stays_sealed`,
-  `conflict_between_a_cloaking_edit_and_a_public_edit_stays_sealed` (both merge directions),
   `file_added_under_a_directory_cloaked_by_the_other_side_is_sealed_from_then_on`,
   `non_member_diff_show_and_log_of_a_cloaked_merge_reveal_nothing`.
 * **`.veilpolicy` in rewrites**: `rebasing_a_policy_change_keeps_its_cloaked_files_sealed`,
@@ -416,17 +416,14 @@ All in `veil_angles`, each named after the Git/jj scenario it replays:
   `isolate` rules with a warning, which fails safe),
   `merged_policy_that_exposes_cloaked_files_is_not_taken`.
 * **Rewrites across cloak boundaries**: `abandoning_the_change_that_cloaked_a_file_keeps_the_childs_edit_sealed`,
-  `squashing_a_cloaked_change_into_a_public_parent_keeps_it_sealed`,
-  `rebasing_a_cloaked_line_onto_public_work_keeps_it_sealed`, `change_ids_survive_every_rewrite_of_a_cloaked_change`,
+  `change_ids_survive_every_rewrite_of_a_cloaked_change`,
   `undo_of_a_cloaked_conflict_merge_restores_everything`.
 * **Isolated and quarantined content**: `isolated_file_survives_rebase_squash_and_abandon`,
   `quarantined_secret_is_not_recorded_by_a_rewrite`, `merge::isolated_file_survives_a_merge`.
-* **Embargoed history**: `embargo_fixture_hides_the_fix_from_outsiders`,
-  `cloaked_fix_line_is_encrypted_at_rest_before_the_merge`, `embargoed_merge_stores_no_plaintext_of_the_fix` (BUG-249),
+* **Embargoed history** (no remote receives the fix before the release): `embargo_fixture_hides_the_fix_from_outsiders`,
   `rebasing_onto_an_embargoed_merge_keeps_the_embargo`, `describing_an_embargoed_merge_keeps_its_description_sealed`,
   `rewording_the_fix_after_the_embargoed_merge_keeps_the_embargo`, `squashing_into_an_embargoed_merge_keeps_the_embargo`,
-  `abandoning_an_embargoed_merge_leaks_nothing`, `undoing_an_embargoed_merge_restores_the_previous_state`,
-  `conflict_on_an_embargoed_line_is_not_recorded_in_metadata`.
+  `abandoning_an_embargoed_merge_leaks_nothing`, `undoing_an_embargoed_merge_restores_the_previous_state`.
 
 "Outsider" checks open the repository with a fresh identity that holds no
 key and read every snapshot the op log still reaches, including

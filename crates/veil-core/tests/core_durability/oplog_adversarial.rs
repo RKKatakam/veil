@@ -58,7 +58,7 @@ fn undone_abandon_is_not_redone_by_a_concurrent_merge() {
             let wc = r.workspace_wc(WS).unwrap();
             assert!(r.is_ancestor(&x, &wc).unwrap(), "the undo itself restored X");
         },
-        |r| r.set_tag("unrelated", base, None, false).unwrap(),
+        |r| r.set_tag("unrelated", base, false).unwrap(),
     );
     let r = open(&fs, &id);
     let wc = r.workspace_wc(WS).unwrap();
@@ -87,7 +87,7 @@ fn undone_amend_is_not_redone_by_a_concurrent_merge() {
             let wc = r.workspace_wc(WS).unwrap();
             assert_eq!(r.snapshot(&wc).unwrap().parents, vec![x], "the undo itself restored X");
         },
-        |r| r.set_tag("unrelated", base, None, false).unwrap(),
+        |r| r.set_tag("unrelated", base, false).unwrap(),
     );
     let r = open(&fs, &id);
     let wc = r.workspace_wc(WS).unwrap();
@@ -105,7 +105,7 @@ fn undone_amend_is_not_redone_by_a_concurrent_merge() {
 fn merge_base_is_found_below_the_ancestry_slack() {
     let (mut repo, fs, id) = new_repo("alice");
     let base = commit_files(&mut repo, &*fs, &[("f", "1\n")], "base");
-    repo.set_tag("withdrawn", base, None, false).unwrap();
+    repo.set_tag("withdrawn", base, false).unwrap();
     let h = repo.heads()[0];
     let hop = repo.ops().get(&h).unwrap();
     let t0 = hop.timestamp;
@@ -116,11 +116,11 @@ fn merge_base_is_found_below_the_ancestry_slack() {
     v1.tags.remove("withdrawn");
     let a1 = put_op(&repo, vec![h], t0 + 60_000, v1.clone(), "delete tag withdrawn");
     let mut v2 = v1.clone();
-    v2.tags.insert("a".into(), Tag::new(base, None));
+    v2.tags.insert("a".into(), Tag::new(base));
     let o1 = put_op(&repo, vec![a1], t0 + 2 * HOUR, v2, "set tag a");
     // The other: one long command that started from H.
     let mut v3 = hop.view.clone();
-    v3.tags.insert("b".into(), Tag::new(base, None));
+    v3.tags.insert("b".into(), Tag::new(base));
     let o2 = put_op(&repo, vec![h], t0 + 2 * HOUR + 1, v3, "pull from origin");
     drop(repo);
     fs.remove_file(&head_file(&h)).unwrap();
@@ -147,17 +147,16 @@ fn commit_in(r: &mut veil_core::Repo, ws: &str, files: &[(&str, &str)], msg: &st
 
 /// One side moves change Y onto an embargoed merge (Y joins embargo E1);
 /// the other, at the same time, merges a second fix into Y's line under its
-/// own embargo E2. Each is allowed on its own view. The merge's rebase of
-/// E2's merge onto the moved Y then combines two unreleased embargoes,
-/// which `merge_trees` refuses: the merge fails, and since every command
-/// merges the heads first (at open), every command fails from then on.
+/// own embargo E2. Each is allowed on its own view. Merging the two heads
+/// must never fail every later command, and neither fix may leave the
+/// repository before its release.
 #[test]
 fn merge_combining_two_embargoes_degrades_instead_of_failing_forever() {
     let (mut repo, fs, id) = new_repo("alice");
     let v1 = commit_files(&mut repo, &*fs, &[("a.c", "v\n")], "v1");
-    repo.set_tag("main", v1, None, false).unwrap();
+    repo.set_tag("main", v1, false).unwrap();
     for ws in ["rel", "fix1", "fix2"] {
-        repo.create_workspace(ws, vec![v1], None).unwrap();
+        repo.create_workspace(ws, vec![v1]).unwrap();
     }
     let y = commit_in(&mut repo, "rel", &[("rel.c", "release line\n")], "y");
     let fix1 = commit_in(&mut repo, "fix1", &[("FIXONE-NAME-Q4.c", "FIXONE-BODY-Q4\n")], "fix one");
@@ -177,12 +176,11 @@ fn merge_combining_two_embargoes_degrades_instead_of_failing_forever() {
     );
     let mut r = veil_core::Repo::open(fs.clone(), Some(id.clone()), &id.name).expect("every command fails: the merge of the heads fails");
     let w = r.take_warnings();
-    assert!(w.iter().any(|w| w.contains("left on its old parents")), "{w:?}");
     for msg in &w {
         assert!(!msg.contains("FIXONE") && !msg.contains("FIXTWO"), "a warning names a fix: {msg}");
     }
     let (c, _) = r.commit_working_copy(WS, "later").unwrap();
-    r.set_tag("later", c, None, false).unwrap();
+    r.set_tag("later", c, false).unwrap();
     let mirror = std::sync::Arc::new(veil_core::MemoryBackend::new());
     veil_core::remote::push(&mut r, mirror.clone(), true, &[], false).unwrap();
     for n in ["FIXONE-NAME-Q4", "FIXONE-BODY-Q4", "FIXTWO-NAME-Q4", "FIXTWO-BODY-Q4"] {
@@ -200,15 +198,15 @@ fn merge_combining_two_embargoes_degrades_instead_of_failing_forever() {
 fn transaction_whose_base_was_pruned_does_not_merge_against_nothing() {
     let (mut repo, fs, id) = new_repo("alice");
     let base = commit_files(&mut repo, &*fs, &[("f", "1\n")], "base");
-    repo.set_tag("withdrawn", base, None, false).unwrap();
+    repo.set_tag("withdrawn", base, false).unwrap();
     drop(repo);
     let mut long = open(&fs, &id);
     let mut tx = long.transaction("pull from origin").unwrap();
-    tx.view.tags.insert("pulled".into(), Tag::new(base, None));
+    tx.view.tags.insert("pulled".into(), Tag::new(base));
     {
         let mut other = open(&fs, &id);
         other.delete_tag("withdrawn").unwrap();
-        other.set_tag("a", base, None, false).unwrap();
+        other.set_tag("a", base, false).unwrap();
         let mut g = open(&fs, &id);
         let opts = veil_core::gc::GcOptions {
             keep_ops: Some(std::time::Duration::ZERO),
@@ -272,6 +270,16 @@ impl StorageBackend for PublishGate {
             Self::wait(&self.go);
         }
         self.inner.create_new(path, data)
+    }
+    /// A staged head file renamed into `op_heads/` (format 6): the same
+    /// moment as `create_new` above.
+    fn rename_unsynced(&self, from: &veil_core::VPath, to: &veil_core::VPath) -> veil_core::Result<()> {
+        let me = std::thread::current().name() == Some("recorder-a");
+        if me && to.as_str().starts_with(OP_HEADS_DIR) && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            Self::set(&self.at);
+            Self::wait(&self.go);
+        }
+        self.inner.rename_unsynced(from, to)
     }
     fn remove_file(&self, path: &veil_core::VPath) -> veil_core::Result<()> {
         self.inner.remove_file(path)
@@ -349,4 +357,41 @@ fn two_recorders_of_one_workspace_never_both_publish() {
     let wc = r.workspace_wc(WS).unwrap();
     assert_eq!(read_at(&r, &wc, "file-a"), b"from A\n");
     assert_eq!(read_at(&r, &wc, "file-b"), b"from B\n", "B's edit is not in the working copy");
+}
+
+/// BUG-942/943 through concurrent operations: one side abandons the
+/// embargoed merge (nothing is built on it in its view, so it may), while
+/// the other commits a follow-up on the merge. Merging the two heads would
+/// rebase the follow-up onto the merge's parents, holding the fix with no
+/// embargoed ancestor: the merge drops the abandon instead, and the fix
+/// stays withheld.
+#[test]
+fn a_concurrent_abandon_of_the_embargoed_merge_never_unwithholds_its_fix() {
+    let (mut repo, fs, id) = new_repo("alice");
+    let v1 = commit_files(&mut repo, &*fs, &[("a.c", "v\n")], "v1");
+    repo.set_tag("main", v1, false).unwrap();
+    repo.create_workspace("fix", vec![v1]).unwrap();
+    let fix = commit_in(&mut repo, "fix", &[("FIX-NAME-Q5.c", "FIX-BODY-Q5\n")], "fix");
+    let spec = Some(veil_core::commands::EmbargoSpec { scope: "team".into(), until: None });
+    let m = repo.merge(WS, v1, vec![fix], "embargoed", spec).unwrap().snapshot;
+    repo.edit(WS, v1).unwrap();
+    drop(repo);
+    concurrently(
+        &fs,
+        &id,
+        |r| r.abandon(m).unwrap(),
+        |r| {
+            r.create_workspace("w2", vec![m]).unwrap();
+            commit_in(r, "w2", &[("follow.c", "f\n")], "follow-up");
+        },
+    );
+    let mut r = veil_core::Repo::open(fs.clone(), Some(id.clone()), &id.name).unwrap();
+    let w2 = r.workspace_wc("w2").unwrap();
+    assert!(veil_core::remote::embargo_blocks(&r, &[w2]).unwrap()[0].is_some(), "the follow-up no longer builds on the embargoed merge");
+    r.set_tag("later", w2, false).unwrap();
+    let mirror = std::sync::Arc::new(veil_core::MemoryBackend::new());
+    let _ = veil_core::remote::push(&mut r, mirror.clone(), true, &[], false);
+    for n in ["FIX-NAME-Q5", "FIX-BODY-Q5"] {
+        assert!(backend_contains(&*mirror, n.as_bytes()).is_empty(), "{n} reached the public remote");
+    }
 }

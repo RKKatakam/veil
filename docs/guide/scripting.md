@@ -82,7 +82,7 @@ vl split --hunks src/config.rs:1,3 -m "Config: read the new keys" --json | jq -r
 
 * **One document, one line**, on standard output. Warnings and errors still
   go to standard error.
-* **`schema`** names the document and its version: `veil.status/1`. New
+* **`schema`** names the document and its version: `veil.status/2`. New
   fields may appear without notice; anything that could break a reader (a
   field removed, renamed or retyped) comes with a new version,
   `veil.status/2`. Check `schema`, and ignore fields you don't know.
@@ -106,9 +106,8 @@ vl split --hunks src/config.rs:1,3 -m "Config: read the new keys" --json | jq -r
 ## Nothing more than the text shows
 
 `--json` never shows a reader more than the text output does. Content you
-cannot decrypt appears as a redaction with a reason (`no_key`, `withheld`,
-`not_released`), never as content; a description sealed for a scope you are
-not in is `null`, with the scope named in `description_hidden`. Isolated
+cannot decrypt appears as a redaction with a reason (`no_key`, `withheld`),
+never as content. Isolated
 files are listed by path only, and `vl secret list` lists names only. See
 [Secrets and visibility](secrets-and-visibility.md) for what each tier
 protects.

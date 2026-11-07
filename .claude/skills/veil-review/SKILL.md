@@ -5,7 +5,7 @@ description: Review a Veil branch before it merges into `integration` (a fix wav
 
 # Reviewing Veil changes
 
-Veil (`vl`) is a server-centric version control system (`docs/OVERVIEW.md`): the client is always connected to the Veil server, which stores the code and enforces who can see what (`docs/VISIBILITY.md`: admins, private by default, groups and managers, folder access, `public`; secrets encrypted automatically). Today's client, before the server, still restricts paths by cloaking them for a scope and syncs through path and SFTP remotes. Agents write nearly all of its code, and one agent works at a time.
+Veil (`vl`) is a server-centric version control system (`docs/OVERVIEW.md`): the client is always connected to the Veil server, which stores the code and enforces who can see what (`docs/VISIBILITY.md`: admins, private by default, groups and managers, folder access, `public`; secrets encrypted automatically). Today's client still restricts paths by cloaking them for a scope; it syncs only through the server (path and SFTP remotes were removed in the simplification pass, part 1; debug builds keep path remotes as a test fixture, `crates/vl/src/test_remotes.rs`). Agents write nearly all of its code, and one agent works at a time.
 
 The question every review answers is not "did someone read every line?" It is **"what could go wrong with this change, and which check, automated or human, is the right one to catch it?"** Anthropic's Claude Code team frames it the same way.
 
@@ -52,9 +52,9 @@ Agent approvals never stand in for the owner's where the owner is required. The 
 
 ## Step 0.5: design conformance (every tier)
 The diff must match `docs/OVERVIEW.md` and `docs/VISIBILITY.md`. Reject anything that:
-- reintroduces encrypting code;
+- encrypts anything but secret files (code, folders, descriptions, tags, embargoes, attribution);
 - adds an offline or plain-file remote path;
-- uses rings for anything but secrets and embargoes;
+- uses rings for anything but secrets;
 - invents access tiers or names beyond admins, groups, managers, access and public;
 - touches Git interop.
 
@@ -77,10 +77,9 @@ For each lens, read the diff **against the whole codebase and the brief's intent
 
 **For a bug fix, find the root cause.** Then check that the fix closes the bug's whole class, not just the one reproduction.
 
-1. **Confidentiality.** Can private, secret, cloaked, isolated or embargoed content (or a cloaked tag name or description) reach someone without access, or:
+1. **Confidentiality.** Can private, secret, isolated or embargoed content reach someone without access, or:
    - a public snapshot, a remote, a log, JSON output, an error message or a bundle?
    - Is a label used as authority where the object should be (`verify_sealing`)?
-   - Is a fallback version one the base doesn't already show publicly?
    - Does confined content move into an unconfined change?
 2. **Correctness.**
    - Edge cases: empty repos, the root change, conflicts, renames and symlinks.
@@ -123,7 +122,7 @@ Anthropic confirms a finding only when enough independent agents vote for it. He
 
 - **It is real in the code.** It is shown by a failing test (preferred), a command transcript or an exact trace with **`file:line`**. Never guess file names. "Might" and "could in theory" don't count.
 - **Security findings: it crosses the trust boundary** (`docs/ARCHITECTURE.md` "Threat model"). Name all three:
-  - **the attacker**, who must be outside the boundary: a person without access to the folder, a remote operator (today's plain-file remotes; for the server, only for secrets and embargoes), a hostile pull or bundle, another OS user;
+  - **the attacker**, who must be outside the boundary: a person without access to the folder, a remote operator (the server, only for secrets and embargoes), a hostile pull or bundle, another OS user;
   - **what they control:** the exact input;
   - **the harm:** what leaks, is lost or runs, and to whom.
 
@@ -170,6 +169,7 @@ Anthropic once saw an agent author and an agent reviewer cycle more than fifty t
 3. **Never re-report** a finding from an earlier cycle. Report each finding's whole class once, so it gets fixed once.
 4. **A pre-existing issue never sends a branch back.** File it.
 5. **Pivot early.** If the approach is wrong, say so on the first cycle, not after three rounds of line comments. Agent work is cheap to throw away.
+6. **When the same class comes back with a new route, fix what the check compares, not the route.** Simplification part 2 needed three cycles for embargo leaks (abandon, squash, rebase, squash-into-fix, an earlier version) because each fix compared snapshot ids, which every rewrite changes. The fix that closes the class keys the rule on what rewrites keep (change ids and descent). A reviewer who sees a second route of a class should say so and ask for the identity basis to change.
 
 ## Step 6: decide and merge (orchestrator)
 

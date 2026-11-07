@@ -3,7 +3,7 @@
 
 # `vl pull`
 
-Fetch tags and history from a remote
+Fetch tags and history from the Veil server: what you may see
 
 ```text
 vl pull [OPTIONS] [REMOTE]
@@ -14,12 +14,6 @@ Arguments:
 | | |
 |---|---|
 | `<REMOTE>` | Remote to pull from (default: `origin`) |
-
-Options:
-
-| | |
-|---|---|
-| `--full` | Walk and verify every object instead of skipping what this repository provably has (repairs damaged local objects) |
 
 ---
 

@@ -178,8 +178,8 @@ fn inspecting_a_conflict_agrees_with_materialising_it_and_never_merges() {
         let m = materialize(repo.store(), c, Audience::Reader).unwrap();
         let v = inspect(repo.store(), c, Audience::Reader).unwrap();
         assert_eq!(
-            (v.executable, v.visibility, v.fallback, v.winner, v.redacted, v.unreadable_side),
-            (m.executable, m.visibility, m.fallback, m.winner, m.redacted, m.unreadable_side)
+            (v.executable, v.visibility, v.winner, v.redacted, v.unreadable_side),
+            (m.executable, m.visibility, m.winner, m.redacted, m.unreadable_side)
         );
     }
     // A conflict whose rendering spends the whole work limit (the order

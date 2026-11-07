@@ -116,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
         data_dir: data.clone(),
         session_ttl: Duration::from_secs(a.session_seconds),
         db_connections: a.db_connections,
+        catch_up_at_start: true,
     })
     .await?;
     println!("veil-server listening on https://{}", running.addr);

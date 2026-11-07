@@ -48,10 +48,8 @@ use std::{
 use veil_core::{
     commands::EmbargoSpec,
     fsck::{fsck, Severity},
-    keychain::current_key_has_legacy_wraps,
     remote,
-    repo::{is_repo, read_config},
-    upgrade::{upgrade, UpgradeOptions, JOURNAL_PATH},
+    repo::is_repo,
     working_copy::CheckoutState,
     workspace::SnapshotOptions,
     tree::{lookup, walk_files},
@@ -103,6 +101,10 @@ struct FaultyBackend {
     /// history index's layers): no barrier covers them, a power loss tears
     /// them.
     never_synced: Mutex<Vec<VPath>>,
+    /// Written by `stage_unsynced` and not published yet: a barrier makes
+    /// the content durable, never the name (as on disk, where the staging
+    /// directory is never synced), so a power loss removes them.
+    staged: Mutex<Vec<VPath>>,
     tore: AtomicBool,
 }
 
@@ -117,6 +119,7 @@ impl FaultyBackend {
             volatile: Mutex::new(Vec::new()),
             renamed: Mutex::new(Vec::new()),
             never_synced: Mutex::new(Vec::new()),
+            staged: Mutex::new(Vec::new()),
             tore: AtomicBool::new(false),
         }
     }
@@ -127,11 +130,35 @@ impl FaultyBackend {
 
     /// Power loss: what never reached stable storage is torn.
     fn tear_volatile(&self) {
-        // A rename whose directory was never synced did not happen.
-        for (from, to) in self.renamed.lock().unwrap().drain(..).rev() {
+        // A rename whose directory was never synced may or may not have
+        // happened. Directories are independent of each other (a journal
+        // keeps the renames into one directory in order): those into every
+        // other directory, by first appearance, are undone, so that a name
+        // made durable before what it depends on (in another directory) is
+        // caught.
+        let renamed: Vec<(VPath, VPath)> = self.renamed.lock().unwrap().drain(..).collect();
+        let mut dirs: Vec<VPath> = Vec::new();
+        for (_, to) in &renamed {
+            let d = to.parent().unwrap_or_else(VPath::root);
+            if !dirs.contains(&d) {
+                dirs.push(d);
+            }
+        }
+        for (from, to) in renamed.into_iter().rev() {
+            let d = to.parent().unwrap_or_else(VPath::root);
+            if dirs.iter().position(|x| *x == d).is_some_and(|i| i % 2 == 1) {
+                continue;
+            }
             if let Some(data) = self.inner.read_opt(&to).unwrap() {
                 self.inner.write(&from, &data).unwrap();
                 self.inner.remove_file(&to).unwrap();
+            }
+        }
+        // Staged files whose names never became durable: gone, synced or not.
+        for path in self.staged.lock().unwrap().drain(..) {
+            if self.inner.read_opt(&path).unwrap().is_some() {
+                self.inner.remove_file(&path).unwrap();
+                self.tore.store(true, Ordering::SeqCst);
             }
         }
         let mut volatile = self.volatile.lock().unwrap();
@@ -225,6 +252,26 @@ impl StorageBackend for FaultyBackend {
             }
             Ok(())
         })
+    }
+    /// As `DiskBackend` stages a transaction's file: the content waits for
+    /// the next barrier, the name for none (see `staged`).
+    fn stage_unsynced(&self, path: &VPath, data: &[u8]) -> Result<()> {
+        self.write_unsynced(path, data)?;
+        self.staged.lock().unwrap().push(path.clone());
+        Ok(())
+    }
+    /// A staged file renamed into place: the new name waits for the next
+    /// barrier (a power loss before it undoes the rename, and the staged
+    /// name is not durable either).
+    fn publish_unsynced(&self, from: &VPath, to: &VPath) -> Result<()> {
+        self.rename_unsynced(from, to)?;
+        let mut staged = self.staged.lock().unwrap();
+        staged.retain(|p| p != from);
+        // The undone rename brings it back under its staged name only.
+        if self.renamed.lock().unwrap().iter().any(|(f, _)| f == from) {
+            staged.push(from.clone());
+        }
+        Ok(())
     }
     fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool> {
         self.mutate(|| self.inner.create_new(path, data))
@@ -439,7 +486,7 @@ fn world() -> World {
     fs.write(&p("secrets/key.txt"), b"s3cr3t\n").unwrap();
     repo.snapshot_workspace(WS, &*fs).unwrap();
     let (v1, _) = repo.commit_working_copy(WS, "v1").unwrap();
-    repo.set_tag("main", v1, None, false).unwrap();
+    repo.set_tag("main", v1, false).unwrap();
     fs.write(&p("src/b.rs"), b"fn b() {}\n").unwrap();
     repo.snapshot_workspace(WS, &*fs).unwrap();
     repo.commit_working_copy(WS, "v2").unwrap();
@@ -448,7 +495,7 @@ fn world() -> World {
     ws.write("side.txt", "side\n").unwrap();
     ws.write("secrets/key.txt", "rotated\n").unwrap();
     let (side, _) = repo.commit_ephemeral(&ws, "side").unwrap();
-    repo.set_tag("side", side, None, false).unwrap();
+    repo.set_tag("side", side, false).unwrap();
 
     let remote_old = Arc::new(MemoryBackend::new());
     remote::push(&mut repo, remote_old.clone(), false, &[], false).unwrap();
@@ -769,6 +816,29 @@ fn crash_during_commit() {
     });
 }
 
+/// `vl commit`: the working copy recorded and committed as one operation
+/// (`SnapshotOptions::commit`). Its operation and head file are staged with
+/// its objects and made durable by their barrier, then named in turn, each
+/// after a barrier (a power loss tears what no barrier covered, and takes
+/// the staged names with it): a crash at any point leaves the commit
+/// recorded completely or not at all.
+#[test]
+fn crash_during_one_operation_commit() {
+    sweep("one-operation commit", Target::Local, |env| {
+        let mut repo = env.open(&env.local)?;
+        let out = repo.snapshot_workspace_with(
+            WS,
+            &*env.local,
+            SnapshotOptions {
+                commit: Some(("committed under fire", true)),
+                ..Default::default()
+            },
+        )?;
+        assert!(out.committed.is_some());
+        Ok(())
+    });
+}
+
 #[test]
 fn crash_during_rebase() {
     sweep("rebase", Target::Local, |env| {
@@ -815,39 +885,6 @@ fn crash_during_public_push() {
     sweep("public push", Target::RemoteOld, |env| {
         let mut repo = env.open(&env.local)?;
         remote::push(&mut repo, env.remote_old.clone(), true, &[], false)?;
-        Ok(())
-    });
-}
-
-/// A two-phase push in packs of one object each, journalled: a crash at
-/// any write (each staged pack and index, the journal's `touched` marks,
-/// each rename into `objects/pack/`, the metadata, the operation) leaves no
-/// visible partial push, and the retry resumes from the journal.
-#[test]
-fn crash_during_resumable_push() {
-    sweep("resumable push", Target::RemoteOld, |env| {
-        let mut repo = env.open(&env.local)?;
-        let opts = remote::SyncOptions {
-            journal: Some("ssh://hub/remote_old".into()),
-            chunk: 1,
-            ..Default::default()
-        };
-        let report = remote::push_with(&mut repo, env.remote_old.clone(), false, &[], false, &opts)?;
-        assert!(report.tags_skipped.is_empty(), "{report:?}");
-        Ok(())
-    });
-}
-
-#[test]
-fn eio_during_resumable_push() {
-    eio_sweep("resumable push", Target::RemoteOld, |env| {
-        let mut repo = env.open(&env.local)?;
-        let opts = remote::SyncOptions {
-            journal: Some("ssh://hub/remote_old".into()),
-            chunk: 1,
-            ..Default::default()
-        };
-        remote::push_with(&mut repo, env.remote_old.clone(), false, &[], false, &opts)?;
         Ok(())
     });
 }
@@ -994,7 +1031,7 @@ fn wc_session(disk: Arc<dyn StorageBackend>, id: &Identity, switch_to: Option<&s
         // matches" case). Anything else would be a real stale directory,
         // which nothing here produces.
         let base = repo.snapshot(&st.snapshot)?.tree;
-        let (tree, _) = repo.build_from_recorded(&*disk, Some(base), None, None, Some(&st.materialised))?;
+        let (tree, _) = repo.build_from_recorded(&*disk, Some(base), None, Some(&st.materialised))?;
         assert_eq!(tree, repo.snapshot(&wc)?.tree, "the directory is behind its workspace");
         st.snapshot = wc;
         st.save(&*disk)?;
@@ -1069,7 +1106,7 @@ fn switch_world() -> SwitchWorld {
     }
     repo.snapshot_workspace(WS, &*base_disk).unwrap();
     let (base, _) = repo.commit_working_copy(WS, "base").unwrap();
-    repo.create_workspace("agent", vec![base], None).unwrap();
+    repo.create_workspace("agent", vec![base]).unwrap();
     let overlay = repo.workspace_overlay("agent").unwrap();
     overlay.write(&p("agent.txt"), b"agent only\n").unwrap();
     overlay.remove_file(&p("dir/old.txt")).unwrap();
@@ -1225,7 +1262,7 @@ fn crash_during_switch_onto_conflict_entries() {
     repo.snapshot_workspace(WS, &*base_disk).unwrap();
     let (base, _) = repo.commit_working_copy(WS, "base").unwrap();
     let side = |repo: &mut Repo, name: &str, text: &[u8], gone: Option<&[u8]>| {
-        repo.create_workspace(name, vec![base], None).unwrap();
+        repo.create_workspace(name, vec![base]).unwrap();
         let o = repo.workspace_overlay(name).unwrap();
         o.write(&p("a.txt"), text).unwrap();
         match gone {
@@ -1237,7 +1274,7 @@ fn crash_during_switch_onto_conflict_entries() {
     };
     let x = side(&mut repo, "x", b"one\nTWO-X\nthree\n", Some(b"edited\n"));
     let y = side(&mut repo, "y", b"one\nTWO-Y\nthree\n", None);
-    repo.create_workspace("agent", vec![x, y], None).unwrap();
+    repo.create_workspace("agent", vec![x, y]).unwrap();
     let agent_wc = repo.workspace_wc("agent").unwrap();
     let agent_tree = repo.snapshot(&agent_wc).unwrap().tree;
     for f in ["a.txt", "gone.txt"] {
@@ -1290,112 +1327,6 @@ fn crash_during_switch_onto_conflict_entries() {
     assert!(crashes > 5, "the sweep crashed only {crashes} times");
 }
 
-// ---- vl upgrade ------------------------------------------------------------------
-
-/// A repository at `format` (1 or 2): history with cloaked files under
-/// `team`, which Alice administers and Bob is a member of, so the upgrade
-/// to format 3 runs `verify`, `set-format` and `3:hpke-ring-keys`.
-fn upgrade_world(format: u32, alice: &Identity, bob: &Identity) -> MemoryBackend {
-    let fs = Arc::new(MemoryBackend::new());
-    let mut repo = Repo::init_for_clone_at(fs.clone(), Some(alice.clone()), "alice", format).unwrap();
-    repo.keys().create_scope("team").unwrap();
-    repo.keys().grant("team", &bob.public_id(), "bob").unwrap();
-    fs.write(&p(".veilpolicy"), b"secrets/ cloak team\n").unwrap();
-    fs.write(&p("src/a.rs"), b"fn a() {}\n").unwrap();
-    fs.write(&p("secrets/key.txt"), b"s3cr3t\n").unwrap();
-    repo.snapshot_workspace(WS, &*fs).unwrap();
-    let (v1, _) = repo.commit_working_copy(WS, "v1").unwrap();
-    repo.set_tag("main", v1, None, false).unwrap();
-    fs.write(&p("secrets/key.txt"), b"rotated\n").unwrap();
-    repo.snapshot_workspace(WS, &*fs).unwrap();
-    repo.commit_working_copy(WS, "v2").unwrap();
-    drop(repo);
-    fs.fork()
-}
-
-/// The upgrade finished: format 3, no journal, the ring's current key
-/// HPKE-wrapped (Bob still holds it), history unchanged and readable.
-fn assert_upgraded(disk: &Arc<dyn StorageBackend>, alice: &Identity, bob: &Identity, before: &BTreeMap<ObjectId, Files>, ctx: &str) {
-    assert_eq!(read_config(&**disk).unwrap().format, veil_core::repo::REPO_FORMAT, "{ctx}");
-    assert!(!disk.exists(&p(JOURNAL_PATH)).unwrap(), "{ctx}: journal left behind");
-    let repo = Repo::open(disk.clone(), Some(alice.clone()), "alice").unwrap();
-    let ring = repo.keys().load_ring("team").unwrap().unwrap();
-    let st = ring.verify().unwrap();
-    assert!(!current_key_has_legacy_wraps(&ring, &st), "{ctx}: ring not moved to HPKE");
-    assert_eq!(&history(&repo), before, "{ctx}: history changed");
-    drop(repo);
-    let bobs = Repo::open(disk.clone(), Some(bob.clone()), "bob").unwrap();
-    assert!(bobs.keys().is_member("team"), "{ctx}: Bob lost the key");
-    assert_healthy(disk.clone(), alice, ctx);
-}
-
-/// Crash `vl upgrade` at every write, in every crash mode, from format 1 and
-/// from format 2. After each crash the repository opens at the old or the new
-/// format with its history intact and `fsck` clean; running the upgrade
-/// again finishes it, including the ring step.
-fn upgrade_sweep(from: u32) {
-    let alice = Identity::generate("alice");
-    let bob = Identity::generate("bob");
-    let world = upgrade_world(from, &alice, &bob);
-    let before = {
-        let disk: Arc<dyn StorageBackend> = Arc::new(world.fork());
-        history(&Repo::open(disk, Some(alice.clone()), "alice").unwrap())
-    };
-    let mut crashes = 0;
-    // Crashes past the commit point with the ring step still to do.
-    let mut in_ring_step = 0;
-    for mode in [Crash::BeforeWrite, Crash::AfterWrite, Crash::PowerLoss] {
-        for budget in 0..10_000 {
-            let mem = Arc::new(world.fork());
-            let faulty = Arc::new(FaultyBackend::new(mem.clone(), budget, mode));
-            let ctx = format!("upgrade {from}→3: {mode:?} after {budget} writes");
-            let result = upgrade(faulty.clone(), Some(alice.clone()), &UpgradeOptions::default());
-            let disk: Arc<dyn StorageBackend> = mem;
-            match result {
-                Ok(r) if !faulty.crashed() => {
-                    assert!(budget > 0 && r.steps.iter().any(|s| s == "3:hpke-ring-keys"), "{ctx}: {r:?}");
-                    assert_upgraded(&disk, &alice, &bob, &before, &ctx);
-                    break;
-                }
-                Ok(_) => {}
-                Err(e) => assert!(faulty.crashed(), "{ctx}: failed without a crash: {e}"),
-            }
-            crashes += 1;
-
-            // Reboot: either format, never anything in between.
-            let format = read_config(&*disk).unwrap().format;
-            assert!(format == from || format == veil_core::repo::REPO_FORMAT, "{ctx}: format {format}");
-            let repo = Repo::open(disk.clone(), Some(alice.clone()), "alice")
-                .unwrap_or_else(|e| panic!("{ctx}: repository does not open: {e}"));
-            assert_eq!(history(&repo), before, "{ctx}: history changed");
-            let ring = repo.keys().load_ring("team").unwrap().unwrap();
-            if format == veil_core::repo::REPO_FORMAT && current_key_has_legacy_wraps(&ring, &ring.verify().unwrap()) {
-                in_ring_step += 1;
-            }
-            drop(repo);
-            assert_healthy(disk.clone(), &alice, &ctx);
-
-            // `vl upgrade` again resumes and finishes.
-            let r = upgrade(disk.clone(), Some(alice.clone()), &UpgradeOptions::default())
-                .unwrap_or_else(|e| panic!("{ctx}: resuming failed: {e}"));
-            assert!(!r.up_to_date || format == veil_core::repo::REPO_FORMAT, "{ctx}: {r:?}");
-            assert_upgraded(&disk, &alice, &bob, &before, &format!("{ctx}, after resuming"));
-        }
-    }
-    assert!(crashes >= 5, "upgrade {from}→3: too few crash points ({crashes})");
-    assert!(in_ring_step >= 3, "upgrade {from}→3: no crash between the commit point and the ring rotation");
-}
-
-#[test]
-fn crash_during_upgrade_from_format_1() {
-    upgrade_sweep(1);
-}
-
-#[test]
-fn crash_during_upgrade_from_format_2() {
-    upgrade_sweep(2);
-}
-
 /// The lock-free op log (format 6, threat 6): two heads left by concurrent
 /// operations (an amend on one side, a child of the amended change on the
 /// other), merged by the next `Repo::open`, which writes rebased snapshots
@@ -1418,8 +1349,8 @@ fn crash_during_settle() {
     let (fa, fb) = (Arc::new(disk.fork()), Arc::new(disk.fork()));
     Repo::open(fa.clone(), Some(id.clone()), "alice").unwrap().describe(x, "x, amended").unwrap();
     let mut b = Repo::open(fb.clone(), Some(id.clone()), "alice").unwrap();
-    b.create_workspace("side", vec![x], None).unwrap();
-    b.set_tag("from-b", x, None, false).unwrap();
+    b.create_workspace("side", vec![x]).unwrap();
+    b.set_tag("from-b", x, false).unwrap();
     drop(b);
     land(&disk, &fa, &heads);
     land(&disk, &fb, &heads);

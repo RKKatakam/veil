@@ -2,7 +2,7 @@
 
 Status: **not built; re-aimed at the server** (Scion 4.1, 4.2 and 4.4; `docs/HUB.md` §4.4, §9.1). Veil is server-centric (`docs/OVERVIEW.md`): the client fetches from the Veil server, which checks access on every request and serves each object by id through the caches. The client-side mechanics below (the marker, the cache area, `Unavailable`, eviction, push from a partial checkout) carry over unchanged. **Requires format 6:**
 - `repo.json` gains the `partial` marker;
-- an older vl would read every object not yet fetched as `Missing`, which **the engine treats as redacted** (`VeilError::is_unreadable`, `error.rs`). It would check out fallbacks, skip history on push and gc nothing (threat 1).
+- an older vl would read every object not yet fetched as `Missing`, which **the engine treats as redacted** (`VeilError::is_unreadable`, `error.rs`). It would leave files out of checkouts, skip history on push and gc nothing (threat 1).
 
 **The highest-risk client feature of the scale work.**
 
@@ -106,10 +106,10 @@ The server stores code as plain text and decides who may see each path (`docs/VI
    - `Transaction::indexed`'s `tolerated` keeps it;
    - `fsck` classifies it as expected redaction;
    - `gc` refuses to guess;
-   - checkout writes the fallback, and `Materialised` records it as hidden;
+   - checkout leaves it out, and `Materialised` records it as hidden;
    - the builder's `carry_unreadable` carries it.
 
-   An unreachable server would then give a person an old public fallback in place of a file they may read, and a push that silently drops history.
+   An unreachable server would then leave out a file a person may read, and a push would silently drop history.
    - *Invariant:* `Missing` is returned only when the server says the object is absent or not visible to this person. A failed or impossible fetch is `Unavailable`, which every one of those sites propagates as an error, before writing anything.
    - *Test:* `partial_clone.rs`:
      - a checkout and a push, each run with the server stopped half way: both fail, and the view, the working copy and `checkout.json` are unchanged;
@@ -118,9 +118,8 @@ The server stores code as plain text and decides who may see each path (`docs/VI
    - *Invariant:* every object fetched on demand passes the server's access check for that person; secrets and embargoed objects arrive only as ciphertext, and only for people with access.
    - *Test:* a person without access to `billing/` opens files through `cat`, the mount and `blame`, and runs a mount `find`. The server's request log shows no object under `billing/`, and no name from it reaches the client.
 3. *(Covered by threat 2.)*
-4. **A missing object downgrades content.** The server (or a cache) claims a sealed object is absent, so the client renders the public fallback. If the next snapshot recorded the fallback, the sealed content would be reverted.
-   - *Invariant:* a file materialised from a fallback is recorded in `Materialised.fallback` and never recorded as an edit; it is filled in when the object appears (unchanged rules). A missing **plaintext** object referenced by a reachable tree is `Corrupt`, never redacted.
-   - *Test:* a test server hides one sealed blob and one public blob. The sealed one checks out as its fallback, the next snapshot keeps the tree unchanged, and the public one fails with `Corrupt`.
+4. **A missing object downgrades content.** The fallback versions this threat was about were removed in repository format 8 (only secret files are encrypted).
+   - *Invariant:* a missing **plaintext** object referenced by a reachable tree is `Corrupt`, never redacted.
 5. **gc in a partial clone.**
    - *Invariant:* an unfetched tree's subtree is entirely on the server, so skipping it during the mark loses nothing local. It holds because locally created objects are only ever referenced from local trees.
    - *Test:* a property test with random local edits, restores from outside the horizon, and `gc --prune-now` with an empty cache. Then `vl partial full` succeeds, and the full store passes `fsck`.
@@ -141,7 +140,7 @@ The server stores code as plain text and decides who may see each path (`docs/VI
     - *Invariant:* `readdir` and `stat` never fetch blobs (sizes come from tree entries); fetching stops at `cache_limit` minus the pinned set and then fails with a clear message rather than evicting in a loop.
     - *Test:* `ls -lR` over the mount fetches no blob. `cat` of every file with a small cache fails cleanly once the limit is reached.
 12. **The server is unreachable.** Veil has no offline mode; this is about failing safely.
-    - *Invariant:* a command that needs an object it does not have fails with `Unavailable` before writing anything; it never writes a fallback or a partial result.
+    - *Invariant:* a command that needs an object it does not have fails with `Unavailable` before writing anything; it never writes a partial result.
     - *Test:* a matrix of `status`, `log`, `diff`, `commit`, `ws exec`, `blame` on an old file and `push` with the server stopped.
 13. **Embargo release in a partial clone.**
     - *Invariant:* released content becomes readable when the release reaches the server's records and the objects are fetched, exactly as filled in today.

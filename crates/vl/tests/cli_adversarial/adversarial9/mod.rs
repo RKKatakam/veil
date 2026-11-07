@@ -12,8 +12,6 @@ mod common;
 pub use common::*;
 
 mod attributes;
-mod embargo;
-mod history;
 mod symlinks;
 mod hooks;
 mod tags;

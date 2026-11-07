@@ -84,7 +84,7 @@ fn a_merge_change_can_be_duplicated() {
     r.tag("merge", "@-");
     let out = r.ok(&["duplicate", "merge", "--json"]);
     let v: serde_json::Value = serde_json::from_str(out.lines().find(|l| l.starts_with('{')).unwrap()).unwrap();
-    assert_eq!(v["schema"], "veil.duplicate/1");
+    assert_eq!(v["schema"], "veil.duplicate/2");
     let dup = v["duplicates"][0]["duplicate"]["snapshot_id"].as_str().unwrap().to_string();
     let s = r.snap(&dup[..16]);
     assert_eq!(s.parents, r.snap("merge").parents, "beside the source: the same parents");

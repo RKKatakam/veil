@@ -20,7 +20,7 @@
 //! (`Transaction::for_merge`) and never lets that move a change out of an
 //! unreleased embargo.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
     error::{Result, VeilError},
@@ -30,6 +30,7 @@ use crate::{
     object::Snapshot,
     oplog::{Operation, RawHeads, View},
     repo::Repo,
+    vpath::VPath,
 };
 
 /// How old a transaction may get before it freshens, at commit, every
@@ -101,7 +102,16 @@ pub struct Transaction<'r> {
     pub(crate) check_carried: bool,
     merge: Option<MergeCtx>,
     done: bool,
+    /// The staging directory, kept after the objects' publication for the
+    /// staged operation ([`STAGED_OP`]); removed when it is published, or
+    /// when the transaction ends without publishing it.
+    kept_dir: Option<VPath>,
 }
+
+/// Names of the operation's bytes and of its (empty) head file in a
+/// transaction's staging directory (format 6).
+const STAGED_OP: &str = "operation";
+const STAGED_HEAD: &str = "head";
 
 impl<'r> Transaction<'r> {
     pub(crate) fn new(repo: &'r mut Repo, description: String, lock: Option<RepoLock>) -> Result<Self> {
@@ -160,6 +170,7 @@ impl<'r> Transaction<'r> {
             check_carried: false,
             merge: None,
             done: false,
+            kept_dir: None,
         })
     }
 
@@ -306,9 +317,8 @@ impl<'r> Transaction<'r> {
     /// 4, see [`crate::conflict::index_conflicts`]): every conflict entry of
     /// its tree, plus the older kinds of conflict the operation carried,
     /// less those resolved since the snapshot it was derived from (the one
-    /// it rewrites, else its first parent). Under an unreleased embargo no
-    /// conflict is recorded (snapshot metadata is public). Below format 4
-    /// the list is the operation's, unchanged.
+    /// it rewrites, else its first parent). Below format 4 the list is the
+    /// operation's, unchanged.
     pub(crate) fn indexed(&self, snap: Snapshot) -> Result<Snapshot> {
         let store = &self.repo.store;
         if store.format() < crate::object::CONFLICT_REPO_FORMAT {
@@ -320,15 +330,6 @@ impl<'r> Transaction<'r> {
         let tolerated = |e: &VeilError| {
             e.is_unreadable() || e.is_not_found() || matches!(e, VeilError::Corrupt(..) | VeilError::Json(_) | VeilError::Unsupported(_))
         };
-        match crate::embargo::unreleased_wrapper(store, &s.tree) {
-            Ok(Some(_)) => {
-                s.conflicts.clear();
-                return Ok(s);
-            }
-            Ok(None) => {}
-            Err(e) if tolerated(&e) => return Ok(s),
-            Err(e) => return Err(e),
-        }
         let from = s.predecessors.first().or(s.parents.first()).copied();
         let base = match from {
             Some(id) => self.repo.snapshot_opt(&id).ok().flatten(),
@@ -352,20 +353,13 @@ impl<'r> Transaction<'r> {
     }
 
     /// Create a new change on top of `parents` (merging them if several).
-    ///
-    /// The change takes the workspace's `cloak`, not its parents'. Sealed
-    /// entries it inherits from a cloaked parent stay sealed regardless: the
-    /// builder never moves sealed content to a wider audience (see
-    /// `builder.rs`), so `vl new <cloaked change>` cannot declassify it.
+    /// Sealed secrets it inherits stay sealed: the builder never moves
+    /// sealed content to a wider audience (see `builder.rs`).
     ///
     /// A parent named more than once is recorded once (BUG-240).
-    pub fn new_change(&mut self, parents: Vec<ObjectId>, description: &str, cloak: Option<String>) -> Result<ObjectId> {
+    pub fn new_change(&mut self, parents: Vec<ObjectId>, description: &str) -> Result<ObjectId> {
         let parents = dedup_parents(parents);
         let merged = self.repo.parents_tree(&parents)?;
-        let store = &self.repo.store;
-        // On a line under an unreleased embargo, messages are sealed under
-        // the embargo key and conflicts are not recorded (see `embargo`).
-        let scope = crate::embargo::description_scope(store, &merged.tree, cloak.as_deref())?;
         let conflicts = merged.conflicts.iter().map(|p| p.to_string()).collect();
         // A merge of concurrent operations derives what is random elsewhere,
         // so that every process merging the same heads writes the same.
@@ -387,12 +381,11 @@ impl<'r> Transaction<'r> {
             parents,
             change_id,
             tree: merged.tree,
-            description: store.make_text(description, scope.as_deref())?,
+            description: crate::object::Text::Plain(description.to_string()),
             author: self.repo.user.clone(),
             timestamp,
             predecessors: vec![],
-            conflicts: crate::embargo::recordable_conflicts(store, &merged.tree, conflicts)?,
-            cloak,
+            conflicts,
             embargo: None,
             signature: None,
         };
@@ -464,7 +457,7 @@ impl<'r> Transaction<'r> {
             return Ok(());
         }
         let s = self.repo.snapshot(&id)?;
-        let undescribed = self.repo.store.read_text(&s.description).is_some_and(|t| t.trim().is_empty());
+        let undescribed = s.description.as_str().trim().is_empty();
         // A change holding a conflict of its own (a merge that conflicted)
         // is kept; one that only inherits its parent's conflicts (format 4:
         // they are in its tree too) is as empty as any.
@@ -582,7 +575,7 @@ impl<'r> Transaction<'r> {
             // relative to the merge of its old ones. A merge one of whose
             // parents moved is re-merged, never rebased by one parent's diff
             // (that dropped what the other parents hold, BUG-251).
-            let out = match self.repo.rebase_tree(&s.parents, &new_parents, s.tree, s.cloak.as_deref()) {
+            let out = match self.repo.rebase_tree(&s.parents, &new_parents, s.tree) {
                 // A merge of concurrent operations never fails for a policy
                 // reason (threat 18; two embargoes combined, say): this
                 // snapshot, and what is built on it, stay where their side
@@ -600,7 +593,7 @@ impl<'r> Transaction<'r> {
             ns.parents = new_parents;
             ns.tree = tree;
             ns.predecessors = vec![id];
-            ns.conflicts = crate::embargo::recordable_conflicts(&store, &tree, conflicts.into_iter().collect())?;
+            ns.conflicts = conflicts.into_iter().collect();
             // Rebasing someone else's change: `author` stays theirs, the
             // signature becomes ours, and `predecessors` keeps the original.
             let ns = self.indexed(ns)?;
@@ -625,13 +618,8 @@ impl<'r> Transaction<'r> {
                 self.view.tags.get_mut(&name).unwrap().target = r.first().copied().unwrap_or(root);
             }
         }
-        let wss: Vec<(String, ObjectId, Option<String>)> = self
-            .view
-            .workspaces
-            .iter()
-            .map(|(n, w)| (n.clone(), w.wc, w.cloak.clone()))
-            .collect();
-        for (name, wc, cloak) in wss {
+        let wss: Vec<(String, ObjectId)> = self.view.workspaces.iter().map(|(n, w)| (n.clone(), w.wc)).collect();
+        for (name, wc) in wss {
             if !self.rewritten.contains_key(&wc) {
                 continue;
             }
@@ -640,21 +628,175 @@ impl<'r> Transaction<'r> {
                 r[0]
             } else {
                 let parents = if r.is_empty() { vec![root] } else { r };
-                self.new_change(parents, "", cloak)?
+                self.new_change(parents, "")?
             };
             self.view.workspaces.get_mut(&name).unwrap().wc = new_wc;
         }
         Ok(())
     }
 
+    /// BUG-942/943/990/1015/1016: what an unreleased embargo withholds
+    /// stays withheld. The rule is by change (`remote::Withheld`): every
+    /// version of a change of the fix line, and everything descending from
+    /// one. After any transaction, no visible snapshot that the rule of the
+    /// view it started from withheld may be left unwithheld, unless its
+    /// embargo was released or withdrawn: a squash of the merge into its
+    /// follow-up or into the fix, an abandon that rebases the follow-up
+    /// onto the merge's parents, a rebase of the merge onto other parents
+    /// (which keeps its `embargo` field but no longer covers the fix), ...
+    ///
+    /// And every withheld snapshot the transaction rewrote (not abandoned)
+    /// must have visible successors that are still withheld, unless the
+    /// embargo was released (BUG-1040: work withheld only by descent, which
+    /// holds the fix after `vl squash -r fix --into` it, rebased off the
+    /// merge when the merge goes).
+    ///
+    /// An embargo is withdrawn, as undoing the merge withdraws it, when no
+    /// visible snapshot carries it any more and the transaction replaced
+    /// nothing it withheld (only dropped it: the bare merge abandoned, or a
+    /// view restored by `vl undo`). The rule depends only on the visible
+    /// embargoed merges: a transaction without rewrites that leaves them as
+    /// they were cannot break it, and is not checked further.
+    fn check_withheld(&mut self) -> Result<()> {
+        let before = vec![self.repo.view.clone()];
+        match self.withheld_violations(&before)?.into_iter().next() {
+            None => Ok(()),
+            Some((x, e)) => Err(VeilError::Policy(format!(
+                "cannot drop, replace or move the embargoed merge of unreleased embargo {e} this way: change {} (which the embargo withholds) would stay visible but no longer be withheld, so the next push would publish it before the release; release the embargo first (`vl embargo release {e}`), or abandon what is built on the merge too",
+                self.repo.snapshot(&x)?.change_id.short()
+            ))),
+        }
+    }
+
+    /// The visible unreleased embargoed merges of view `v`, sorted.
+    fn embargoed_merges_in(&mut self, v: &View) -> Result<Vec<ObjectId>> {
+        let mut v = v.clone();
+        std::mem::swap(&mut self.repo.view, &mut v);
+        let res = self.repo.visible_embargoed();
+        std::mem::swap(&mut self.repo.view, &mut v);
+        let mut out = Vec::new();
+        for id in res? {
+            if self.repo.snapshot(&id)?.embargo.as_deref().is_some_and(|e| !self.repo.keys().embargo_released(e)) {
+                out.push(id);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// [`Transaction::check_withheld`]'s findings: `(a version of a
+    /// withheld change, visible and no longer withheld, its embargo)`,
+    /// sorted.
+    fn withheld_violations(&mut self, before: &[View]) -> Result<Vec<(ObjectId, String)>> {
+        // Nothing withheld before: nothing to lose (and the view it ends
+        // with is not read: most transactions stop here).
+        let mut before_merges = Vec::new();
+        for v in before {
+            before_merges.push(self.embargoed_merges_in(v)?);
+        }
+        if before_merges.iter().all(|m| m.is_empty()) {
+            return Ok(Vec::new());
+        }
+        let after_view = self.view.clone();
+        let after_merges = self.embargoed_merges_in(&after_view)?;
+        if self.rewritten.is_empty() && before_merges.iter().all(|m| *m == after_merges) {
+            return Ok(Vec::new());
+        }
+        let mut was = crate::remote::Withheld::default();
+        // What each view the transaction started from withheld, and which
+        // of its rewritten snapshots were withheld there: those replaced
+        // (not abandoned), with their finals.
+        let olds: Vec<ObjectId> = self.rewritten.keys().copied().collect();
+        let mut replaced: Vec<(ObjectId, String)> = Vec::new();
+        for v in before {
+            let mut v = v.clone();
+            std::mem::swap(&mut self.repo.view, &mut v);
+            let res = (|repo: &Repo| -> Result<(crate::remote::Withheld, Vec<Option<String>>)> {
+                let w = crate::remote::embargo_withheld(repo)?;
+                let of = if w.is_empty() { vec![None; olds.len()] } else { w.blocking(repo, &olds)? };
+                Ok((w, of))
+            })(self.repo);
+            std::mem::swap(&mut self.repo.view, &mut v);
+            let (w, of) = res?;
+            for (old, e) in olds.iter().zip(of) {
+                if let Some(e) = e {
+                    let (finals, abandoned) = self.resolve(*old);
+                    if !abandoned {
+                        replaced.extend(finals.into_iter().map(|f| (f, e.clone())));
+                    }
+                }
+            }
+            was.extend(w);
+        }
+        if was.is_empty() {
+            return Ok(Vec::new());
+        }
+        replaced.sort();
+        replaced.dedup();
+        let replaced_embargoes: HashSet<String> = replaced.iter().map(|(_, e)| e.clone()).collect();
+        // ...against what the view it ends with withholds: every version
+        // of a withheld change visible now must still be withheld (all
+        // that descends from one then is too), and so must every final of
+        // a withheld snapshot the transaction replaced (BUG-1040: work that
+        // was withheld only by descent, and now holds the fix).
+        std::mem::swap(&mut self.repo.view, &mut self.view);
+        type Lost = (Vec<(ObjectId, String)>, Vec<(ObjectId, String)>, HashSet<String>);
+        let res = (|repo: &Repo| -> Result<Lost> {
+            let now = crate::remote::embargo_withheld(repo)?;
+            let refs = repo.view.refs();
+            let mut lost = Vec::new();
+            for e in was.embargoes() {
+                let versions = was.versions_from(repo, &e, &refs)?;
+                for (y, w) in versions.iter().zip(now.blocking(repo, &versions)?) {
+                    if w.is_none() {
+                        lost.push((*y, e.clone()));
+                    }
+                }
+            }
+            let finals: HashSet<ObjectId> = replaced.iter().map(|(f, _)| *f).collect();
+            let visible = repo.visible_among(&finals)?;
+            let shown: Vec<(ObjectId, String)> = replaced.iter().filter(|(f, _)| visible.contains(f)).cloned().collect();
+            let ids: Vec<ObjectId> = shown.iter().map(|(f, _)| *f).collect();
+            let mut moved = Vec::new();
+            for ((f, e), w) in shown.into_iter().zip(now.blocking(repo, &ids)?) {
+                if w.is_none() {
+                    moved.push((f, e));
+                }
+            }
+            let mut carried = HashSet::new();
+            for id in repo.visible_embargoed()? {
+                carried.extend(repo.snapshot(&id)?.embargo.clone());
+            }
+            Ok((lost, moved, carried))
+        })(self.repo);
+        std::mem::swap(&mut self.repo.view, &mut self.view);
+        let (lost, moved, carried) = res?;
+        let mut out = Vec::new();
+        for (y, e) in lost {
+            if self.repo.keys().embargo_released(&e) {
+                continue;
+            }
+            // Withdrawn: nothing carries it, and nothing it withheld was
+            // replaced (only dropped).
+            if !carried.contains(&e) && !replaced_embargoes.contains(&e) {
+                continue;
+            }
+            out.push((y, e));
+        }
+        // A replaced snapshot is never withdrawn: its finals stay withheld.
+        out.extend(moved.into_iter().filter(|(_, e)| !self.repo.keys().embargo_released(e)));
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
     /// BUG-681: no rewrite moves a change confined to an unreleased embargo
-    /// (its fix, work built on it, its wrapped line) out of it. A rebase,
+    /// (its fix, work built on it, the embargoed line) out of it. A rebase,
     /// or an abandon whose descendants move, that puts such a change onto
     /// parents outside the embargo would publish the fix's file names (the
     /// moved change's edits of them, as conflicts) before the release.
     /// Only rewrites that change parents are judged: confinement follows
-    /// the history, and the tree of a change that keeps its parents keeps
-    /// its embargo wrapper.
+    /// the history.
     fn check_confinement(&mut self) -> Result<()> {
         let before = vec![self.repo.view.clone()];
         match self.confinement_violations(&before)?.into_iter().next() {
@@ -728,8 +870,10 @@ impl<'r> Transaction<'r> {
         std::mem::swap(&mut self.repo.view, &mut self.view);
         let res = (|repo: &Repo| -> Result<Vec<(ObjectId, String)>> {
             let mut after = crate::confinement::Confinement::new(repo)?;
-            // Abandoning the embargoed merge itself withdraws the embargo
-            // (as undoing the merge does): nothing is moved out of it.
+            // Abandoning the embargoed merge itself, with nothing built on
+            // it (`check_withheld` refuses it otherwise), withdraws
+            // the embargo, as undoing the merge does: nothing is moved out
+            // of it.
             let active = crate::confinement::active_embargoes(repo)?;
             let mut out = Vec::new();
             for (old, e, finals) in &was {
@@ -775,7 +919,36 @@ impl<'r> Transaction<'r> {
             if !self.rewritten.is_empty() {
                 self.rebase_descendants()?;
             }
-            let bad = self.confinement_violations(&before)?;
+            let mut bad = self.confinement_violations(&before)?;
+            // A side's rewrite of an embargoed merge that stops withholding
+            // what it withheld (BUG-942/943/990), such as a drop of the
+            // merge another side built on: the rewrite goes, the merge stays.
+            for (x, e) in self.withheld_violations(&before)? {
+                let mut merges: Vec<ObjectId> = Vec::new();
+                for old in union.keys() {
+                    if self.repo.snapshot_opt(old)?.is_some_and(|s| s.embargo.as_deref() == Some(e.as_str())) {
+                        merges.push(*old);
+                    }
+                }
+                if merges.is_empty() {
+                    // No rewrite of its merge to drop: the rewrite that
+                    // made `x` (a final no longer withheld, BUG-1040), or
+                    // that of what was withheld, or of what it followed.
+                    let mut made: Vec<ObjectId> = Vec::new();
+                    for (old, r) in &union {
+                        if matches!(r, Rewrite::Replaced(_)) && self.resolve(*old).0.contains(&x) {
+                            made.push(*old);
+                        }
+                    }
+                    made.sort();
+                    merges = if made.is_empty() { vec![x] } else { made };
+                }
+                for m in merges {
+                    if !bad.iter().any(|(o, _)| *o == m) {
+                        bad.push((m, e.clone()));
+                    }
+                }
+            }
             if bad.is_empty() {
                 clean = true;
                 break;
@@ -907,7 +1080,6 @@ impl<'r> Transaction<'r> {
                 crate::object::Object::Tree(t) => {
                     for e in &t.entries {
                         refs.push(e.id);
-                        refs.extend(e.fallback);
                     }
                 }
                 crate::object::Object::Conflict(c) => refs.extend(c.referenced_ids()),
@@ -972,13 +1144,37 @@ impl<'r> Transaction<'r> {
         Ok(())
     }
 
-    /// Fail unless this transaction still holds its repository lock (see
-    /// [`RepoLock::ensure_held`]); lock-free transactions always pass. A
-    /// push checks it before it publishes its packs.
-    pub(crate) fn ensure_held(&self) -> Result<()> {
-        match &self.lock {
-            Some(lock) => lock.ensure_held(),
-            None => Ok(()),
+    /// The operation this transaction records (its view and rewrites as
+    /// they are now).
+    fn operation(&self) -> Operation {
+        let format6 = self.repo.format() >= crate::oplog::OP_HEADS_REPO_FORMAT;
+        let mut parents = self.base.clone();
+        parents.sort();
+        let mut rewritten = BTreeMap::new();
+        if format6 {
+            for (old, r) in &self.rewritten {
+                let new = match r {
+                    Rewrite::Replaced(n) => vec![*n],
+                    Rewrite::Abandoned(_) => Vec::new(),
+                };
+                rewritten.insert(*old, new);
+            }
+        }
+        let (timestamp, user) = match &self.merge {
+            Some(m) => (m.timestamp, "veil".to_string()),
+            None => (now_millis(), self.repo.user.clone()),
+        };
+        Operation {
+            parents,
+            timestamp,
+            user,
+            description: self.description.clone(),
+            view: self.view.clone(),
+            manual_undo: self.manual_undo.clone(),
+            undo_of: self.undo_of,
+            redo_of: self.redo_of,
+            workspace: self.workspace.clone().filter(|_| format6),
+            rewritten,
         }
     }
 
@@ -987,10 +1183,25 @@ impl<'r> Transaction<'r> {
     pub fn commit(mut self) -> Result<Option<ObjectId>> {
         if self.merge.is_some() {
             self.merge_rebase()?;
-        } else if !self.rewritten.is_empty() {
-            self.rebase_descendants()?;
-            self.check_confinement()?;
+        } else {
+            if !self.rewritten.is_empty() {
+                self.rebase_descendants()?;
+            }
+            // The more specific refusal first (a change moved out of the
+            // embargo), then the withholding rule, for any change of the
+            // view, rewrites or not (`vl undo`, a tag moved).
+            if !self.rewritten.is_empty() {
+                self.check_confinement()?;
+            }
+            if self.view != self.repo.view {
+                self.check_withheld()?;
+            }
         }
+        let record = self.view != self.start_view || self.record_always;
+        // The operation (format 6), when one is recorded: its bytes and its
+        // empty head file are staged with the objects, so that the objects'
+        // barrier makes them durable too (`OpStore::publish_staged`).
+        let mut staged = None;
         if self.staging {
             // A long transaction freshens everything it references (gc's
             // grace period); one that gc deleted objects under checks what
@@ -999,17 +1210,30 @@ impl<'r> Transaction<'r> {
             if long || self.check_carried {
                 self.freshen_references(long)?;
             }
+            if record {
+                let op = self.operation();
+                let (id, raw) = self.repo.ops.encode(&op)?;
+                let op_file = self.repo.store.stage_tx_file(STAGED_OP, &raw)?;
+                let head = self.repo.store.stage_tx_file(STAGED_HEAD, b"")?;
+                staged = Some((id, op, op_file, head));
+            }
             // Durability barrier, then publication: every object this
             // transaction wrote is on stable storage, under its final name,
-            // before the operation that references it is written.
+            // before the operation that references it is named.
             self.done = true;
-            self.repo.store.publish_tx_staging()?;
+            self.kept_dir = match record {
+                true => self.repo.store.publish_tx_staging_keeping_dir()?,
+                false => {
+                    self.repo.store.publish_tx_staging()?;
+                    None
+                }
+            };
         } else {
             // Durability barrier: every object this transaction wrote is on
             // stable storage before the operation that references it.
             self.repo.store.sync_barrier()?;
         }
-        if self.view == self.start_view && !self.record_always {
+        if !record {
             return Ok(None);
         }
         let lock_free = self.lock.is_none() && self.merge.is_none();
@@ -1032,40 +1256,23 @@ impl<'r> Transaction<'r> {
                 ));
             }
         }
-        let format6 = self.repo.format() >= crate::oplog::OP_HEADS_REPO_FORMAT;
-        let mut parents = self.base.clone();
-        parents.sort();
-        let mut rewritten = BTreeMap::new();
-        if format6 {
-            for (old, r) in &self.rewritten {
-                let new = match r {
-                    Rewrite::Replaced(n) => vec![*n],
-                    Rewrite::Abandoned(_) => Vec::new(),
-                };
-                rewritten.insert(*old, new);
-            }
-        }
-        let (timestamp, user) = match &self.merge {
-            Some(m) => (m.timestamp, "veil".to_string()),
-            None => (now_millis(), self.repo.user.clone()),
-        };
-        let op = Operation {
-            parents,
-            timestamp,
-            user,
-            description: self.description.clone(),
-            view: self.view.clone(),
-            manual_undo: self.manual_undo.clone(),
-            undo_of: self.undo_of,
-            redo_of: self.redo_of,
-            workspace: self.workspace.clone().filter(|_| format6),
-            rewritten,
-        };
         if let Some(lock) = &self.lock {
             // Fencing: never move the head unless we still hold the lock.
             lock.ensure_held()?;
         }
-        let id = self.repo.ops.publish(&op, &self.stale)?;
+        let id = match staged {
+            Some((id, op, op_file, head)) => {
+                self.repo.ops.publish_staged(&id, &op, &op_file, &head, &self.stale)?;
+                id
+            }
+            None => {
+                let op = self.operation();
+                self.repo.ops.publish(&op, &self.stale)?
+            }
+        };
+        if let Some(dir) = self.kept_dir.take() {
+            self.repo.store.drop_tx_dir(&dir);
+        }
         drop(publishing);
         self.repo.op_id = id;
         self.repo.base = vec![id];
@@ -1116,6 +1323,11 @@ impl Drop for Transaction<'_> {
         if self.staging {
             if !self.done {
                 let _ = self.repo.store.publish_tx_staging();
+            }
+            // An operation staged but not published (superseded, or a
+            // barrier failed): nothing names it.
+            if let Some(dir) = self.kept_dir.take() {
+                self.repo.store.drop_tx_dir(&dir);
             }
             self.reg.take();
             return;

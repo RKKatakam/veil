@@ -21,7 +21,7 @@ Options:
 |---|---|
 | `--into <INTO>` | Merge into this snapshot (default: @, or @- if @ is empty) |
 | `-m, --message <MESSAGE>` | Description of the merge (default: "merge REVS") |
-| `--embargo` | Delayed-visibility merge: hide the merged changes from anyone outside SCOPE until released |
+| `--embargo` | Delayed-visibility merge: the server keeps the merge and the history it brings in from anyone outside SCOPE until released (a permission; nothing is encrypted) |
 | `--until <TIME>` | Release automatically at TIME (RFC 3339, YYYY-MM-DD, or +7d/+12h/+30m) |
 | `--scope <SCOPE>` | Scope that can see the embargoed changes before release (default: `team`) |
 

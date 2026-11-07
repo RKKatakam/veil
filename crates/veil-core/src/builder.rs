@@ -5,15 +5,14 @@
 //! * `ignored` paths are skipped;
 //! * `isolated` paths (and every built-in secret like `.env`) are reported
 //!   back to the caller and **never** written to the CAS;
-//! * `cloaked` paths, and every file of a cloaked line of work, are sealed
-//!   under their scope key;
+//! * secret files under a `cloak` rule (`.env`, keys and similar: only
+//!   secret files are ever encrypted) are sealed under their scope key;
 //! * public files are secret-scanned and quarantined on a hit. A quarantined
 //!   file that was already tracked keeps its previous (safe) entry, so the
 //!   local edit is held back instead of being recorded as a deletion;
-//! * embargoed entries stay embargoed until released, and a key holder's edit
-//!   of one is secret-scanned (the release will publish it);
-//! * entries this reader cannot see (no key, or stripped by a public remote)
-//!   are carried over untouched instead of being treated as deletions.
+//! * entries this reader cannot see (a secret it holds no key for, or one
+//!   it never received) are carried over untouched instead of being
+//!   treated as deletions.
 //!
 //! With a [`StatCache`] the builder skips reading files whose stat data is
 //! unchanged, using content facts recorded on an earlier run. Classification
@@ -75,9 +74,15 @@ struct BuildFrame {
     dir: VPath,
     parent: Option<(Arc<Tree>, ObjectId)>,
     entries: Vec<DirEntry>,
+    /// The listing's stats of `entries` ([`DirListing::stats`]).
+    stats: Vec<Option<Metadata>>,
+    /// Their classifications, when made ahead of the walk (by entry).
+    classes: Vec<Option<Classification>>,
     next: usize,
     out: Tree,
-    seen: HashSet<String>,
+    /// Special entries (symlinks where a directory or file was tracked…)
+    /// whose tracked entry was kept.
+    kept_special: Vec<String>,
     /// Name of the subdirectory being built on top of this frame.
     waiting: Option<String>,
 }
@@ -87,12 +92,26 @@ enum Opened {
     Done(Option<ObjectId>),
 }
 
+/// Is a listed entry part of the working copy the walk records? Not a
+/// reserved name (`.veil`, at any depth), nor a file left by an interrupted
+/// atomic write (crash debris, never content).
+fn counted(e: &DirEntry) -> bool {
+    !crate::object::is_reserved_name(&e.name) && !(e.kind == NodeKind::File && is_temp_name(&e.name))
+}
+
+/// What the listing of its directory told of a leaf ([`Builder::listed`]).
+struct Listed {
+    path: VPath,
+    meta: Option<Metadata>,
+    /// Its classification as a file or a symlink (the kind it was listed
+    /// as): for that kind only.
+    class: Option<(EntryKind, Classification)>,
+}
+
 pub struct BuildOptions<'a> {
     pub policy: &'a Policy,
     /// Tree of the snapshot being amended (enables reuse and carry-over).
     pub parent_tree: Option<ObjectId>,
-    /// Cloak every public file under this scope (cloaked line of work).
-    pub cloak: Option<&'a str>,
     /// Secret content the engine handed to whoever wrote `fs` (the isolated
     /// files injected into a sandbox). New content containing any of it is
     /// quarantined, whatever its path and tier.
@@ -104,23 +123,11 @@ pub struct BuildOptions<'a> {
     pub rescan: bool,
     /// What the working copy `fs` was materialised from, relative to
     /// `parent_tree` (see [`Materialised`]): which files were left out
-    /// because this reader could not read them, and which were written from
-    /// an embargo fallback. A path that was never materialised is never
+    /// because this reader could not read them. A path that was never materialised is never
     /// recorded as deleted, even once it has become readable. `None` when
     /// `fs` is not a checked-out working copy (overlays, sandboxes) or the
     /// caller keeps no record.
     pub materialised: Option<&'a Materialised>,
-    /// On a cloaked line of work: the tree its change is compared with (the
-    /// merged tree of its parents), computed only if needed. The one public
-    /// entry such a build creates from a sealed one, an edit back to the
-    /// last public version, is kept public only where this tree holds that
-    /// very version at the same path, as a public entry or as the fallback
-    /// of a sealed one (what readers without the key see there already).
-    /// Anywhere else (a rebase moved the change onto a base without the
-    /// file, or with another version) it would be public content the line
-    /// introduces, so it is sealed (BUG-128). `None`: not known, so such an
-    /// edit is always sealed.
-    pub line_base: Option<&'a dyn Fn() -> Result<ObjectId>>,
     /// How `.veilattributes` decides the line endings recorded.
     pub line_endings: LineEndings<'a>,
 }
@@ -548,8 +555,7 @@ fn assignment_value(line: &str) -> Option<&str> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Sealing {
     /// The object is sealed exactly as the label says (plaintext for a
-    /// public label, under scope `s` for `cloaked:s`, under `embargo/<id>`
-    /// for `embargo:<id>`).
+    /// public label, under scope `s` for `cloaked:s`).
     Verified,
     /// The object is sealed for another audience than the label claims: its
     /// real visibility. The label is hostile or corrupt.
@@ -561,17 +567,14 @@ pub enum Sealing {
 }
 
 /// The visibility a raw stored object really has, from its own envelope
-/// label: plaintext blob → public, sealed under `embargo/<id>` → embargoed,
-/// sealed under `scope` or `scope#<key-id>` → cloaked under `scope`.
+/// label: plaintext blob → public, sealed under `scope` or `scope#<key-id>`
+/// → cloaked under `scope`.
 /// `None` for anything else.
 pub fn object_visibility(raw: &[u8]) -> Option<Visibility> {
     if Object::is_blob_raw(raw) {
         return Some(Visibility::Public);
     }
     let label = Object::sealed_scope(raw)?;
-    if let Some(id) = label.strip_prefix("embargo/") {
-        return (!id.is_empty()).then(|| Visibility::Embargoed { embargo: id.to_string() });
-    }
     let scope = crate::keychain::split_label(&label).0;
     crate::keychain::validate_scope_name(scope)
         .is_ok()
@@ -601,17 +604,6 @@ pub fn verify_sealing(store: &ObjectStore, e: &TreeEntry) -> Result<Sealing> {
         Some(actual) if actual == e.visibility => Sealing::Verified,
         Some(actual) => Sealing::Relabelled(actual),
     })
-}
-
-/// The cloak of a line of work, as recorded in a snapshot's `cloak` field,
-/// if it may decide how new content is sealed: a valid scope name. Never
-/// `local`, an embargo label (a released embargo's key is public) or a key
-/// generation (`team#<old key>`, which a revoked member still holds). The
-/// field comes from whoever wrote the snapshot, so anything else is a
-/// forged claim and is ignored. Sealing under a valid scope still needs
-/// the key: for a scope the member is not in, edits are held back.
-pub fn trusted_cloak(cloak: Option<&str>) -> Option<&str> {
-    cloak.filter(|c| crate::keychain::validate_scope_name(c).is_ok())
 }
 
 /// Human description of a relabelled entry, for reports.
@@ -653,7 +645,7 @@ pub struct BuildReport {
     /// recorded `.veilpolicy`, and the paths it would weaken are in
     /// `policy_held_back`. Says why (`could weaken …`, `was deleted`).
     pub policy_edit_held: Option<String>,
-    /// Files that should have been cloaked but no key was available, or
+    /// Secret files that should have been sealed but no key was available, or
     /// whose recorded sealing could not be verified (the edit stays local).
     pub cloak_failures: Vec<(VPath, String)>,
     /// Tracked files whose recorded visibility label disagrees with the
@@ -662,10 +654,6 @@ pub struct BuildReport {
     /// decided from the object's real sealing, never from the label (see
     /// [`verify_sealing`]). Also reported in `policy_warnings`.
     pub relabelled: Vec<(VPath, String)>,
-    /// Edits held back on a line under an unreleased embargo this reader
-    /// holds no key for (recording them would revert the hidden fix), with
-    /// the embargo's id. They are recorded once the embargo is released.
-    pub held_back: Vec<(VPath, String)>,
     /// Entries carried over because this reader cannot materialise them.
     pub carried: Vec<VPath>,
     pub ignored: usize,
@@ -721,7 +709,6 @@ impl BuildReport {
         let mut v: Vec<VPath> = self.isolated.clone();
         v.extend(self.quarantined.iter().map(|(p, _)| p.clone()));
         v.extend(self.cloak_failures.iter().map(|(p, _)| p.clone()));
-        v.extend(self.held_back.iter().map(|(p, _)| p.clone()));
         v.sort();
         v.dedup();
         v
@@ -748,14 +735,6 @@ struct Builder<'a> {
     report: BuildReport,
     /// How `fs` compares names (read once per build).
     folding: NameFolding,
-    /// The line's cloak, if it may decide sealing ([`trusted_cloak`]).
-    cloak: Option<&'a str>,
-    /// The parent tree is under an unreleased embargo, whose sealed tree
-    /// never holds a conflict entry: a partly edited conflict is recorded
-    /// as the file it is.
-    under_embargo: bool,
-    /// [`BuildOptions::line_base`], once computed.
-    line_base: Option<Option<ObjectId>>,
     /// Symlinks are recorded as entries (repository format 5); below that
     /// they are special files, never recorded.
     links: bool,
@@ -764,6 +743,12 @@ struct Builder<'a> {
     /// For the file just read: its bytes on disk and its line-ending facts
     /// (see [`Builder::line_endings`]), for the stat cache.
     eol_now: Option<(ObjectId, EolFact)>,
+    /// What was learnt of the leaf about to be built as its directory was
+    /// listed (used instead of asking again, for that path only).
+    listed: Option<Listed>,
+    /// Listings made ahead of the walk, on other threads.
+    #[cfg(feature = "os")]
+    prefetch: Option<&'a crate::prefetch::Prefetch<'a>>,
 }
 
 /// Build a tree from `fs`, returning its id and a report.
@@ -811,6 +796,16 @@ pub fn build_tree_cached(
         (Some(c), Some(clock)) => Some(c.begin_run(CacheKey::compute(fs, &store.keys, clock)?, clock)),
         _ => None,
     };
+    // Large working copies on a disk are listed ahead of the walk (see
+    // `prefetch`), from now on: after the clock reading the cache run
+    // took.
+    #[cfg(feature = "os")]
+    let prefetch = match (fs.kind(), run.as_ref().map(CacheRun::len)) {
+        ("disk", Some(files)) if crate::prefetch::workers_for(files) > 0 => {
+            Some((crate::prefetch::Prefetch::new(fs, store, opts.policy, opts.parent_tree), crate::prefetch::workers_for(files)))
+        }
+        _ => None,
+    };
     let parent_policy = match parent.as_ref().and_then(|t| t.get(POLICY_FILE)) {
         // A directory (a hostile tree, BUG-121) holds no rules.
         Some(e) if policy_changed && e.kind != EntryKind::File => None,
@@ -837,28 +832,36 @@ pub fn build_tree_cached(
             ..Default::default()
         },
         folding: fs.name_folding(),
-        cloak: trusted_cloak(opts.cloak),
-        under_embargo: match opts.parent_tree {
-            Some(t) => crate::embargo::unreleased_wrapper(store, &t)?.is_some(),
-            None => false,
-        },
-        line_base: None,
         links: store.format() >= crate::object::GIT_PARITY_REPO_FORMAT,
         attrs: None,
         eol_now: None,
+        listed: None,
+        #[cfg(feature = "os")]
+        prefetch: prefetch.as_ref().map(|(p, _)| p),
     };
-    if let (Some(c), None) = (opts.cloak, b.cloak) {
-        b.report.policy_warnings.push(format!(
-            "this change claims to be on a line cloaked under '{c}', which is not a scope; the claim is ignored (a remote or an import may have forged it)"
-        ));
-    }
     let root_parent = parent.clone().zip(opts.parent_tree);
-    let id = match b.build_dir(&VPath::root(), root_parent)? {
+    #[cfg(feature = "os")]
+    let built = match &prefetch {
+        Some((p, workers)) => std::thread::scope(|s| {
+            for _ in 0..*workers {
+                // A worker that cannot start leaves its share to the others
+                // (and the walk).
+                let _ = std::thread::Builder::new().stack_size(256 << 10).spawn_scoped(s, || p.work());
+            }
+            // The workers stop when the walk ends, however it ends (a panic
+            // too: the scope waits for them before passing it on).
+            let _stop = p.stopper();
+            b.build_dir(&VPath::root(), root_parent)
+        }),
+        None => b.build_dir(&VPath::root(), root_parent),
+    };
+    #[cfg(not(feature = "os"))]
+    let built = b.build_dir(&VPath::root(), root_parent);
+    let id = match built? {
         Some(id) => id,
         None => store.empty_tree()?,
     };
     let id = b.protect_moves(id)?;
-    let id = b.keep_embargo(id)?;
     if let (Some(c), Some(run)) = (cache, b.cache.take()) {
         c.end_run(run);
     }
@@ -878,9 +881,6 @@ impl<'a> Builder<'a> {
     /// deletes a sealed entry and adds a public one.
     fn protect_moves(&mut self, id: ObjectId) -> Result<ObjectId> {
         let Some(parent) = self.opts.parent_tree.filter(|p| *p != id) else { return Ok(id) };
-        if crate::embargo::unreleased_wrapper(self.store, &parent)?.is_some() {
-            return Ok(id);
-        }
         let changes = crate::tree::diff_trees(self.store, Some(&parent), Some(&id))?;
         let blob_kind = |e: &TreeEntry| matches!(e.kind, EntryKind::File | EntryKind::Symlink);
         let deleted: Vec<&TreeEntry> = changes
@@ -893,7 +893,7 @@ impl<'a> Builder<'a> {
             .iter()
             .filter(|c| c.old.is_none())
             .filter_map(|c| c.new.as_ref().map(|e| (&c.path, e)))
-            .filter(|(_, e)| blob_kind(e) && e.visibility.is_public() && e.fallback.is_none())
+            .filter(|(_, e)| blob_kind(e) && e.visibility.is_public())
             .collect();
         if deleted.is_empty() || added.is_empty() {
             return Ok(id);
@@ -930,7 +930,6 @@ impl<'a> Builder<'a> {
             let entry = TreeEntry {
                 id: sealed,
                 visibility: vis.clone(),
-                fallback: None,
                 ..e.clone()
             };
             tree = crate::conflict::set_entry(self.store, &tree, path, Some(entry))?;
@@ -938,34 +937,11 @@ impl<'a> Builder<'a> {
                 run.forget(path);
             }
             self.report.policy_warnings.push(format!(
-                "{path}: its content was moved from a path sealed as {}; it stays sealed there (protection follows content across a rename; \
-                 `vl expose {path}` makes it public)",
+                "{path}: its content was moved from a path sealed as {}; it stays sealed there (protection follows a secret across a rename)",
                 vis.label()
             ));
         }
         Ok(tree)
-    }
-
-    /// A line under an unreleased embargo stays under it. A key holder's new
-    /// tree is re-wrapped under the same embargo (readers without the key
-    /// keep seeing the pre-merge tree). A reader without the key only sees
-    /// that pre-merge tree, so recording edits on top of it would silently
-    /// revert the hidden change for everyone else: such edits are held back
-    /// (reported in [`BuildReport::held_back`]) until the embargo is released.
-    fn keep_embargo(&mut self, id: ObjectId) -> Result<ObjectId> {
-        let Some(parent) = self.opts.parent_tree.filter(|p| *p != id) else {
-            return Ok(id);
-        };
-        let Some(w) = crate::embargo::unreleased_wrapper(self.store, &parent)? else {
-            return Ok(id);
-        };
-        if self.store.keys.has(&w.key_label()) {
-            return crate::embargo::wrap_line(self.store, &w.embargo, &id, &w.fallback);
-        }
-        for c in crate::tree::diff_trees(self.store, Some(&parent), Some(&id))? {
-            self.report.held_back.push((c.path, w.embargo.clone()));
-        }
-        Ok(parent)
     }
 
     /// Build the tree of directory `dir`. `parent` is the parent snapshot's
@@ -987,7 +963,7 @@ impl<'a> Builder<'a> {
                     f.out.insert(TreeEntry::dir(&name, id));
                 }
             }
-            let Some(child) = f.entries.get(f.next).cloned() else {
+            let Some(child) = f.entries.get(f.next) else {
                 let fin = stack.pop().expect("checked");
                 let id = self.finish_dir(fin)?;
                 if stack.is_empty() {
@@ -996,25 +972,38 @@ impl<'a> Builder<'a> {
                 done = Some(id);
                 continue;
             };
-            f.next += 1;
+            let kind = child.kind;
             // `.veil` is reserved at every depth (trees containing it are
             // refused on decode). A directory holding one is a nested
             // repository, left out as a whole by `open_dir`.
-            if crate::object::is_reserved_name(&child.name) {
+            if !counted(child) {
+                if !crate::object::is_reserved_name(&child.name) {
+                    // Crash debris of an interrupted atomic write, never content.
+                    self.report.ignored += 1;
+                }
+                f.next += 1;
                 continue;
             }
-            // Crash debris of an interrupted atomic write, never content.
-            if child.kind == NodeKind::File && is_temp_name(&child.name) {
-                self.report.ignored += 1;
-                continue;
-            }
-            f.seen.insert(child.name.clone());
             let path = f.dir.join(&child.name);
-            let parent_entry = f.parent.as_ref().and_then(|(t, _)| t.get(&child.name)).cloned();
-            match child.kind {
+            let meta = f.stats.get_mut(f.next).and_then(Option::take);
+            let class = f.classes.get_mut(f.next).and_then(Option::take);
+            f.next += 1;
+            let name = path.file_name();
+            self.listed = (meta.is_some() || class.is_some()).then(|| Listed {
+                path: path.clone(),
+                meta,
+                class: class.and_then(|c| match kind {
+                    NodeKind::File => Some((EntryKind::File, c)),
+                    NodeKind::Symlink => Some((EntryKind::Symlink, c)),
+                    NodeKind::Dir => None,
+                }),
+            });
+            let parent_tree = f.parent.as_ref().map(|(t, _)| t.clone());
+            let parent_entry = parent_tree.as_deref().and_then(|t| t.get(name));
+            match kind {
                 NodeKind::Dir => {
                     let class = self.opts.policy.classify(&path, true);
-                    let pdir = parent_entry.clone().filter(|e| e.kind == EntryKind::Dir);
+                    let pdir = parent_entry.filter(|e| e.kind == EntryKind::Dir);
                     if class.tier == Tier::Ignored {
                         self.report.ignored += 1;
                         self.report.ignored_paths.push((path.clone(), true));
@@ -1027,13 +1016,13 @@ impl<'a> Builder<'a> {
                                 wanted: tier_keyword(t, *force),
                                 dir: true,
                             });
-                            if let Some(pe) = &pdir {
+                            if let Some(pe) = pdir {
                                 f.out.insert(pe.clone());
                             }
                         }
                         continue;
                     }
-                    if let Some(pe) = &pdir {
+                    if let Some(pe) = pdir {
                         if self.use_hints && self.fs.known_id(&path) == Some(pe.id) {
                             f.out.insert(pe.clone());
                             continue;
@@ -1044,7 +1033,7 @@ impl<'a> Builder<'a> {
                             .unreadable
                             .push((path, format!("directory nesting exceeds {MAX_TREE_DEPTH} levels")));
                         if let Some(pe) = pdir {
-                            f.out.insert(pe);
+                            f.out.insert(pe.clone());
                         }
                         continue;
                     }
@@ -1052,17 +1041,18 @@ impl<'a> Builder<'a> {
                         Some(e) => Some((self.store.tree(&e.id)?, e.id)),
                         None => None,
                     };
+                    let name = name.to_string();
                     match self.open_dir(path, sub)? {
-                        Opened::Done(Some(id)) => f.out.insert(TreeEntry::dir(&child.name, id)),
+                        Opened::Done(Some(id)) => f.out.insert(TreeEntry::dir(&name, id)),
                         Opened::Done(None) => {}
                         Opened::Frame(c) => {
-                            f.waiting = Some(child.name.clone());
+                            f.waiting = Some(name);
                             stack.push(c);
                         }
                     }
                 }
                 NodeKind::File => {
-                    if let Some(e) = self.file_entry(&path, &child.name, parent_entry.as_ref(), EntryKind::File)? {
+                    if let Some(e) = self.file_entry(&path, name, parent_entry, EntryKind::File)? {
                         self.report.files += 1;
                         f.out.insert(e);
                     }
@@ -1074,13 +1064,13 @@ impl<'a> Builder<'a> {
                     if let Some(pe) = parent_entry {
                         let tier = self.opts.policy.classify(&path, pe.kind == EntryKind::Dir).tier;
                         if !matches!(tier, Tier::Ignored | Tier::Isolated) {
+                            f.out.insert(pe.clone());
                             self.report.shadowed.push(path);
-                            f.out.insert(pe);
                         }
                     }
                 }
                 NodeKind::Symlink => {
-                    if let Some(e) = self.file_entry(&path, &child.name, parent_entry.as_ref(), EntryKind::Symlink)? {
+                    if let Some(e) = self.file_entry(&path, name, parent_entry, EntryKind::Symlink)? {
                         self.report.files += 1;
                         f.out.insert(e);
                     }
@@ -1092,8 +1082,9 @@ impl<'a> Builder<'a> {
     /// List `dir` and start its frame, or finish at once (vanished or
     /// unreadable directory).
     fn open_dir(&mut self, dir: VPath, parent: Option<(Arc<Tree>, ObjectId)>) -> Result<Opened> {
-        let listing = match self.fs.list_dir_full(&dir) {
-            Ok(l) if self.folding.folds() => self.canonical_names(&dir, l, parent.as_ref().map(|(t, _)| &**t)),
+        let (listing, classes) = match self.list_dir(&dir, parent.as_ref().map(|(t, _)| &**t)) {
+            // Names may change: classified again, under the names recorded.
+            Ok((l, _)) if self.folding.folds() => (self.canonical_names(&dir, l, parent.as_ref().map(|(t, _)| &**t)), Vec::new()),
             Ok(l) => l,
             // Vanished while we were building: a deletion like any other.
             Err(e) if e.is_not_found() && !dir.is_root() => return Ok(Opened::Done(None)),
@@ -1116,7 +1107,7 @@ impl<'a> Builder<'a> {
             });
         }
         let mut out = Tree::default();
-        let mut seen = HashSet::new();
+        let mut kept_special = Vec::new();
         // A tracked path that is now a symlink (or socket, device…) is never
         // followed, and is not a deletion either: keep the tracked entry.
         for name in &listing.special {
@@ -1126,28 +1117,54 @@ impl<'a> Builder<'a> {
                 if matches!(tier, Tier::Ignored | Tier::Isolated) {
                     continue; // no longer tracked by policy anyway
                 }
-                seen.insert(name.clone());
+                kept_special.push(name.clone());
                 self.report.shadowed.push(path);
                 out.insert(pe.clone());
             }
         }
+        // Stats and classes only stand for the names they were listed under.
+        let stats = match listing.stats.len() == listing.entries.len() {
+            true => listing.stats,
+            false => Vec::new(),
+        };
+        let classes = match classes.len() == listing.entries.len() {
+            true => classes,
+            false => Vec::new(),
+        };
         Ok(Opened::Frame(BuildFrame {
             dir,
             parent,
             entries: listing.entries,
+            stats,
+            classes,
             next: 0,
             out,
-            seen,
+            kept_special,
             waiting: None,
         }))
     }
 
+    /// `dir`'s listing (`tree`: its tree in the parent snapshot).
+    #[allow(unused_variables)]
+    fn list_dir(&self, dir: &VPath, tree: Option<&Tree>) -> Result<(DirListing, Vec<Option<Classification>>)> {
+        #[cfg(feature = "os")]
+        if let Some(p) = self.prefetch {
+            return p.list(dir, tree);
+        }
+        Ok((self.fs.list_dir_full(dir)?, Vec::new()))
+    }
+
     fn finish_dir(&mut self, f: BuildFrame) -> Result<Option<ObjectId>> {
-        let BuildFrame { dir, parent, mut out, seen, .. } = f;
+        let BuildFrame { dir, parent, mut out, entries, kept_special, .. } = f;
+        // What the walk looked at: every listed entry (sorted by name) but
+        // reserved names and crash debris, and the special entries kept.
+        let seen = |name: &str| {
+            entries.binary_search_by(|e| e.name.as_str().cmp(name)).is_ok_and(|i| counted(&entries[i])) || kept_special.iter().any(|n| n == name)
+        };
         // Entries we could never have materialised are not deletions.
         if let Some((p, _)) = &parent {
             for e in &p.entries {
-                if !seen.contains(&e.name) {
+                if !seen(&e.name) {
                     if let Some(c) = self.carry_unreadable(e, &dir.join(&e.name))? {
                         out.insert(c);
                     }
@@ -1176,6 +1193,8 @@ impl<'a> Builder<'a> {
     /// used if the backend really resolves it, so a wrongly reported
     /// folding can never make a file look deleted.
     fn canonical_names(&self, dir: &VPath, mut listing: DirListing, parent: Option<&Tree>) -> DirListing {
+        // Names may change and entries move: stats are taken again.
+        listing.stats.clear();
         let folding = self.folding;
         let tracked: HashMap<std::borrow::Cow<'_, str>, &str> = parent
             .map(|t| t.entries.iter().map(|e| (folding.key(&e.name), e.name.as_str())).collect())
@@ -1255,16 +1274,7 @@ impl<'a> Builder<'a> {
                     // Readable and absent is a deletion, unless it was never
                     // materialised (it became readable since checkout).
                     let never_materialised = b.opts.materialised.is_some_and(|m| m.hidden(path));
-                    // A cloaked file this reader only sees as its last public
-                    // version (fallback): deleting that copy must not delete
-                    // the sealed content it cannot read.
-                    let readable = match &e.visibility {
-                        Visibility::Cloaked { .. } => b.store.entry_readable(&TreeEntry {
-                            fallback: None,
-                            ..e.clone()
-                        }),
-                        _ => b.store.entry_readable(e),
-                    };
+                    let readable = b.store.entry_readable(e);
                     if readable && !never_materialised {
                         Ok(Err(None))
                     } else {
@@ -1295,13 +1305,7 @@ impl<'a> Builder<'a> {
                 // a deletion (a removed link).
                 EntryKind::Symlink => {
                     let never_materialised = b.opts.materialised.is_some_and(|m| m.hidden(path));
-                    let readable = match &e.visibility {
-                        Visibility::Cloaked { .. } => b.store.entry_readable(&TreeEntry {
-                            fallback: None,
-                            ..e.clone()
-                        }),
-                        _ => b.store.entry_readable(e),
-                    };
+                    let readable = b.store.entry_readable(e);
                     if b.links && readable && !never_materialised {
                         Ok(Err(None))
                     } else {
@@ -1417,7 +1421,7 @@ impl<'a> Builder<'a> {
             );
         }
         let pseudo = shown.filter(|se| se.kind == kind);
-        let held = |r: &BuildReport| (r.cloak_failures.len(), r.quarantined.len(), r.held_back.len(), r.unreadable.len());
+        let held = |r: &BuildReport| (r.cloak_failures.len(), r.quarantined.len(), r.unreadable.len());
         let before = held(&self.report);
         let resolved = self.plain_file_entry(path, name, pseudo.as_ref(), kind)?;
         if held(&self.report) != before && !local_only {
@@ -1540,6 +1544,9 @@ impl<'a> Builder<'a> {
             }
             return Ok(Some(ce.clone()));
         }
+        // The rendering checkout wrote while a side was unreadable here, not
+        // refreshed since (a grant arrived): the conflict as recorded, never
+        // an edit of it.
         if let Some(rec) = self.opts.materialised {
             if !local_only && rec.from_fallback(self.store, path)? == Some(Object::blob_id(&data)) {
                 return Ok(Some(ce.clone()));
@@ -1560,11 +1567,10 @@ impl<'a> Builder<'a> {
             .or_else(|| conflict.adds.iter().position(Option::is_some));
         let pseudo = pick.and_then(|i| conflict.adds[i].as_ref()).map(|t| TreeEntry {
             visibility: if m.winner.is_some() { m.visibility.clone() } else { t.visibility.clone() },
-            fallback: if m.winner.is_some() { m.fallback } else { t.fallback },
             executable: m.executable,
             ..t.entry(name)
         });
-        let held = |r: &BuildReport| (r.cloak_failures.len(), r.quarantined.len(), r.held_back.len(), r.unreadable.len());
+        let held = |r: &BuildReport| (r.cloak_failures.len(), r.quarantined.len(), r.unreadable.len());
         let before = held(&self.report);
         let resolved = self.plain_file_entry(path, name, pseudo.as_ref(), EntryKind::File)?;
         if held(&self.report) != before {
@@ -1583,7 +1589,7 @@ impl<'a> Builder<'a> {
                 return Ok(Some(ce.clone()));
             }
         }
-        if r.kind == EntryKind::File && !self.under_embargo && crate::conflict::has_markers(&data, &m.style) {
+        if r.kind == EntryKind::File && crate::conflict::has_markers(&data, &m.style) {
             if let Some((o, b, t)) = crate::conflict::parse_markers(&data, &m.style) {
                 // Each side keeps its own executable bit unless the copy's
                 // bit was changed.
@@ -1599,7 +1605,6 @@ impl<'a> Builder<'a> {
                         size: bytes.len() as u64,
                         executable: exec,
                         visibility: r.visibility.clone(),
-                        fallback: None,
                     }))
                 };
                 let merge = crate::conflict::Merge {
@@ -1627,9 +1632,16 @@ impl<'a> Builder<'a> {
     fn plain_file_entry(&mut self, path: &VPath, name: &str, parent_entry: Option<&TreeEntry>, kind: EntryKind) -> Result<Option<TreeEntry>> {
         self.eol_now = None;
         let parent_file = parent_entry.filter(|e| e.kind == kind);
-        let class = match kind {
-            EntryKind::Symlink => self.opts.policy.classify_link(path),
-            _ => self.opts.policy.classify(path, false),
+        let (listed, listed_class) = match self.listed.take().filter(|l| l.path == *path) {
+            Some(l) => (l.meta, l.class),
+            None => (None, None),
+        };
+        let class = match listed_class.filter(|(k, _)| *k == kind) {
+            Some((_, c)) => c,
+            None => match kind {
+                EntryKind::Symlink => self.opts.policy.classify_link(path),
+                _ => self.opts.policy.classify(path, false),
+            },
         };
         if class.blocked_exposure {
             self.report.blocked_exposures.push(path.clone());
@@ -1684,7 +1696,7 @@ impl<'a> Builder<'a> {
         // checked against its object and the decision taken again on what
         // the object really is (BUG-103). The fast paths in between only
         // ever reuse existing objects.
-        let (mut desired, mut cloak_fallback) = self.audience(path, &class, parent_file);
+        let mut desired = self.audience(path, &class, parent_file);
 
         // Fast path: overlay/tree-view says the file is byte-identical.
         if let Some(pe) = parent_file {
@@ -1693,9 +1705,12 @@ impl<'a> Builder<'a> {
             }
         }
 
-        let meta = match self.fs.metadata(path) {
-            Ok(m) => m,
-            Err(e) => return self.unreadable(path, e, parent_file),
+        let meta = match listed {
+            Some(m) => Some(m),
+            None => match self.fs.metadata(path) {
+                Ok(m) => m,
+                Err(e) => return self.unreadable(path, e, parent_file),
+            },
         };
         // Vanished, or replaced by something else since it was listed.
         let want = match kind {
@@ -1706,16 +1721,13 @@ impl<'a> Builder<'a> {
             return Ok(parent_file.cloned());
         }
         let executable = kind == EntryKind::File && meta.as_ref().is_some_and(|m| m.executable);
-        // Embargoed entries depend on the parent entry and on embargo state,
-        // not only on content: always take the slow path for them.
-        let parent_embargoed = parent_file.is_some_and(|pe| matches!(pe.visibility, Visibility::Embargoed { .. }));
         // With injected secrets every changed file must be read and checked.
         // A link's target is read in one call, cheaper than a cache lookup
         // is worth: never cached.
-        let cacheable = !parent_embargoed && self.opts.injected.is_none() && kind == EntryKind::File;
+        let cacheable = self.opts.injected.is_none() && kind == EntryKind::File;
         let meta = meta.filter(|_| kind == EntryKind::File);
         if let (Some(m), true) = (&meta, cacheable) {
-            if let Some(e) = self.cached_entry(path, name, m, &desired, cloak_fallback, class.allow_secrets, parent_file)? {
+            if let Some(e) = self.cached_entry(path, name, m, &desired, class.allow_secrets, parent_file)? {
                 return Ok(Some(e));
             }
         }
@@ -1780,23 +1792,13 @@ impl<'a> Builder<'a> {
                         ..pe.clone()
                     };
                     parent_file = Some(&corrected);
-                    (desired, cloak_fallback) = self.audience(path, &class, parent_file);
+                    desired = self.audience(path, &class, parent_file);
                 }
                 Sealing::Unverifiable if !pe.visibility.is_public() => {
-                    // Shown the recorded fallback and left untouched.
-                    if pe.fallback == Some(content) && pe.executable == executable {
-                        return Ok(Some(TreeEntry {
-                            name: name.to_string(),
-                            ..pe.clone()
-                        }));
-                    }
                     // The claim would decide the sealing of this edit:
                     // without its object, it cannot be trusted.
-                    let (trusted, _) = self.audience(path, &class, None);
-                    let keeps_embargo = matches!(pe.visibility, Visibility::Embargoed { .. })
-                        && trusted.is_public()
-                        && pe.visibility.key_scope().is_some_and(|l| self.store.keys.has(&l));
-                    if desired != trusted || keeps_embargo {
+                    let trusted = self.audience(path, &class, None);
+                    if desired != trusted {
                         let why = format!(
                             "its recorded version is labelled {} and its content is not in this repository to verify that; the edit stays local, history keeps the recorded version",
                             pe.visibility.label()
@@ -1805,69 +1807,6 @@ impl<'a> Builder<'a> {
                     }
                 }
                 Sealing::Unverifiable => {}
-            }
-        }
-
-        // Embargoes are sticky until released.
-        let mut fallback = None;
-        if let Some(pe) = parent_file {
-            if let Visibility::Embargoed { embargo } = &pe.visibility {
-                if self.store.keys.embargo_released(embargo) {
-                    // Released: unchanged content keeps its (now readable)
-                    // entry instead of showing up as a spurious edit.
-                    if pe.executable == executable && self.store.matches_encoding(&pe.id, &data)? {
-                        return Ok(Some(pe.clone()));
-                    }
-                    // Content equal to the pre-embargo version is a
-                    // deliberate revert (BUG-050), unless the working copy's
-                    // materialisation record says checkout wrote exactly that
-                    // fallback here and nothing has refreshed it since: then
-                    // it is a stale copy, and recording it would silently
-                    // revert the released fix. (The CLI normally fills such
-                    // files in before snapshotting; this is the backstop.)
-                    if let (Some(fb), Some(rec)) = (pe.fallback, self.opts.materialised) {
-                        if pe.executable == executable
-                            && rec.from_fallback(self.store, path)? == Some(fb)
-                            && self.store.matches_encoding(&fb, &data)?
-                        {
-                            return Ok(Some(pe.clone()));
-                        }
-                    }
-                    // Anything else is an edit.
-                } else {
-                    if self.store.keys.has(&format!("embargo/{embargo}")) {
-                        // Stays under the embargo only if the path is public
-                        // anyway (the release publishes it). A path the
-                        // policy now cloaks is sealed under its scope: the
-                        // release must never publish it.
-                        if desired.is_public() {
-                            desired = pe.visibility.clone();
-                            fallback = pe.fallback;
-                        }
-                    } else if let Some(fb) = pe.fallback {
-                        if self.store.matches_encoding(&fb, &data)? {
-                            // We were shown the fallback and did not touch it.
-                            return Ok(Some(TreeEntry {
-                                name: name.to_string(),
-                                ..pe.clone()
-                            }));
-                        }
-                    }
-                }
-            }
-        }
-
-        if fallback.is_none() {
-            fallback = cloak_fallback;
-        }
-        if let (Some(fb), Some(pe), Visibility::Cloaked { scope }) = (cloak_fallback, parent_file, &desired) {
-            if pe.executable == executable && content == fb && pe.visibility == desired && !self.store.keys.has(scope) {
-                // A reader without the key was shown the last public version
-                // and did not touch it.
-                return Ok(Some(TreeEntry {
-                    name: name.to_string(),
-                    ..pe.clone()
-                }));
             }
         }
 
@@ -1886,43 +1825,11 @@ impl<'a> Builder<'a> {
             }
         }
 
-        // A cloaked line of work seals what it *introduces*. A file left
-        // exactly as its public parent had it is already public; keep the
-        // entry (as the overlay fast path above does) rather than sealing a
-        // copy of public bytes.
-        if let Some(pe) = parent_file {
-            if self.cloak.is_some()
-                && class.tier == Tier::Public
-                && pe.visibility.is_public()
-                && pe.id == content
-                && pe.executable == executable
-                && !self.policy_changed
-            {
-                return Ok(Some(pe.clone()));
-            }
-        }
-
-        // Content sealed under an embargo key is published by the release:
-        // it goes through the scanner like public content (BUG-042). A hit
-        // holds the edit back; the previous (sealed) entry stays.
-        if matches!(desired, Visibility::Embargoed { .. }) && !class.allow_secrets {
-            let unchanged = match parent_file {
-                Some(pe) => pe.executable == executable && self.store.matches_encoding(&pe.id, &data)?,
-                None => false,
-            };
-            if !unchanged {
-                let findings = secrets::scan(&data);
-                if !findings.is_empty() {
-                    return self.quarantine(path, findings, parent_file);
-                }
-            }
-        }
-
         let mut scanned_clean = false;
         if desired.is_public() {
             if let Some(pe) = parent_file {
                 if !self.policy_changed && !self.rescan && pe.id == content && pe.visibility.is_public() && pe.executable == executable {
-                    self.learn(path, meta.as_ref(), content, false, None, parent_embargoed);
+                    self.learn(path, meta.as_ref(), content, false, None);
                     return Ok(Some(pe.clone())); // unchanged; scanned before
                 }
             }
@@ -1935,46 +1842,23 @@ impl<'a> Builder<'a> {
             }
         }
 
-        // Unchanged cloaked content keeps its sealing (and key generation),
-        // so a key rotation does not show every cloaked file as modified.
+        // An unchanged secret keeps its sealing (and key generation), so a
+        // key rotation does not show every secret as modified.
         if let Some(pe) = parent_file {
             if !desired.is_public()
                 && pe.visibility == desired
-                && pe.fallback == fallback
                 && pe.executable == executable
                 && self.store.matches_encoding(&pe.id, &data)?
             {
                 // Verified: the next snapshot may take it from the stat
                 // cache (BUG-300).
                 if let Visibility::Cloaked { scope } = &desired {
-                    self.learn(path, meta.as_ref(), content, false, Some((scope.clone(), pe.id)), parent_embargoed);
+                    self.learn(path, meta.as_ref(), content, false, Some((scope.clone(), pe.id)));
                 }
                 return Ok(Some(TreeEntry {
                     name: name.to_string(),
                     ..pe.clone()
                 }));
-            }
-        }
-
-        // A sealed edit of a public file, edited back to its last public
-        // version: nothing to seal, that content is public already. On a
-        // cloaked line only where the line's base shows that version here:
-        // otherwise the public entry would be one the line introduces
-        // (BUG-128), and the edit is sealed like any other.
-        if let (Some(fb), Visibility::Cloaked { .. }) = (cloak_fallback, &desired) {
-            if content == fb && !self.policy_changed && !self.rescan {
-                let entry = TreeEntry {
-                    name: name.to_string(),
-                    kind,
-                    id: fb,
-                    size: data.len() as u64,
-                    executable,
-                    visibility: Visibility::Public,
-                    fallback: None,
-                };
-                if self.cloak.is_none() || self.base_holds(path, &entry)? {
-                    return Ok(Some(entry));
-                }
             }
         }
 
@@ -2001,18 +1885,13 @@ impl<'a> Builder<'a> {
         }
 
         // Backstop: new content is never sealed under a key that is not an
-        // audience: a released embargo's key is public, and a cloak label
-        // must name a scope (never `embargo/…`, `local` or a generation).
+        // audience: a cloak label must name a scope (never `local` or a
+        // generation).
         let unsealable = match &desired {
             Visibility::Public => None,
             Visibility::Cloaked { scope } => crate::keychain::validate_scope_name(scope)
                 .is_err()
                 .then(|| format!("'{scope}' is not a scope")),
-            Visibility::Embargoed { embargo } => self
-                .store
-                .keys
-                .embargo_released(embargo)
-                .then(|| format!("embargo {embargo} is released and its key is public")),
         };
         if let Some(why) = unsealable {
             return self.cannot_seal(path, name, parent_file, format!("{why}; the edit stays local"));
@@ -2031,13 +1910,11 @@ impl<'a> Builder<'a> {
             }
             Err(e) => return Err(e),
         };
-        if fallback.is_none() || matches!(desired, Visibility::Cloaked { .. }) {
-            let sealed = match &desired {
-                Visibility::Cloaked { scope } => Some((scope.clone(), id)),
-                _ => None,
-            };
-            self.learn(path, meta.as_ref(), content, scanned_clean, sealed, parent_embargoed);
-        }
+        let sealed = match &desired {
+            Visibility::Cloaked { scope } => Some((scope.clone(), id)),
+            _ => None,
+        };
+        self.learn(path, meta.as_ref(), content, scanned_clean, sealed);
         Ok(Some(TreeEntry {
             name: name.to_string(),
             kind,
@@ -2045,7 +1922,6 @@ impl<'a> Builder<'a> {
             size: data.len() as u64,
             executable,
             visibility: desired,
-            fallback,
         }))
     }
 
@@ -2072,29 +1948,6 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Does the line's base ([`BuildOptions::line_base`]) show readers
-    /// without a key `entry`'s public version of `path`: as a public entry,
-    /// or as the fallback of a sealed one (same object and mode)?
-    fn base_holds(&mut self, path: &VPath, entry: &TreeEntry) -> Result<bool> {
-        let base = match self.line_base {
-            Some(b) => b,
-            None => {
-                let b = self.opts.line_base.map(|f| f()).transpose()?;
-                self.line_base = Some(b);
-                b
-            }
-        };
-        let Some(base) = base else { return Ok(false) };
-        Ok(crate::tree::lookup(self.store, &base, path)?.is_some_and(|e| {
-            let shown = match (&e.visibility, e.fallback) {
-                (Visibility::Public, None) => Some(e.id),
-                (Visibility::Cloaked { .. }, fb) => fb,
-                _ => None,
-            };
-            e.kind == entry.kind && shown == Some(entry.id) && e.executable == entry.executable
-        }))
-    }
-
     /// The edit of `path` cannot be sealed (no key, or no trustworthy
     /// audience): it stays local, reported in `cloak_failures`. A tracked
     /// file keeps its recorded entry, never a deletion.
@@ -2117,27 +1970,18 @@ impl<'a> Builder<'a> {
 
     /// The audience of new content at `path` (classified `class`, not
     /// ignored or isolated), given its parent entry: the visibility to seal
-    /// it under, and the last public version to show readers without the
-    /// key. Inputs: the policy (with the accepted pin), the line's trusted
-    /// cloak, and the parent entry, whose label the caller must have
-    /// verified before content is sealed under the result.
-    fn audience(&self, path: &VPath, class: &Classification, parent_file: Option<&TreeEntry>) -> (Visibility, Option<ObjectId>) {
+    /// it under. Inputs: the policy (with the accepted pin) and the parent
+    /// entry, whose label the caller must have verified before content is
+    /// sealed under the result.
+    fn audience(&self, path: &VPath, class: &Classification, parent_file: Option<&TreeEntry>) -> Visibility {
         let mut desired = match &class.tier {
             Tier::Cloaked(s) => Visibility::Cloaked { scope: s.clone() },
             _ => Visibility::Public,
         };
-        if let (Some(scope), Visibility::Public) = (self.cloak, &desired) {
-            if path.as_str() != POLICY_FILE {
-                desired = Visibility::Cloaked {
-                    scope: scope.to_string(),
-                };
-            }
-        }
-        // Sealed content keeps its audience. Neither a change of workspace
-        // (`vl new <cloaked change>`), nor a rebase, nor a policy that arrived
-        // by merge may re-key it or make it public: only an edit of
-        // `.veilpolicy` in this very snapshot that reclassifies the path
-        // (`vl expose`, `vl cloak --scope`) is a deliberate decision to.
+        // A sealed secret keeps its audience. Neither a change of workspace,
+        // nor a rebase, nor a policy that arrived by merge may re-key it or
+        // make it public: only an edit of `.veilpolicy` in this very
+        // snapshot that reclassifies the path is a deliberate decision to.
         if let Some(pe) = parent_file.filter(|pe| matches!(pe.visibility, Visibility::Cloaked { .. })) {
             if desired != pe.visibility {
                 let reclassified = self
@@ -2149,25 +1993,7 @@ impl<'a> Builder<'a> {
                 }
             }
         }
-        // A public file sealed only because of the line it is edited on (a
-        // cloaked workspace, or sealed content keeping its audience; the
-        // policy itself says public) keeps its last public version as
-        // `fallback`: readers without the key (public remotes, members
-        // of other scopes) go on seeing that version instead of losing the
-        // file. A file the policy cloaks has none: hiding it is the point.
-        let cloak_fallback = match (&desired, parent_file) {
-            (Visibility::Cloaked { .. }, Some(pe)) if class.tier == Tier::Public => {
-                if pe.visibility.is_public() && pe.fallback.is_none() {
-                    Some(pe.id)
-                } else if pe.visibility == desired {
-                    pe.fallback
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
-        (desired, cloak_fallback)
+        desired
     }
 
     /// Hold the edit back, but do not record a deletion: keep the previously
@@ -2191,7 +2017,6 @@ impl<'a> Builder<'a> {
         content: ObjectId,
         scanned_clean: bool,
         sealed: Option<(String, ObjectId)>,
-        parent_embargoed: bool,
     ) {
         // The record describes the bytes on disk: with a line-ending fact
         // when they hold a CR (and the blob recorded for them, when it is
@@ -2200,7 +2025,7 @@ impl<'a> Builder<'a> {
             Some((disk, fact)) => (disk, Some(fact)),
             None => (content, None),
         };
-        if let (Some(run), Some(m), false) = (self.cache.as_mut(), meta, parent_embargoed) {
+        if let (Some(run), Some(m)) = (self.cache.as_mut(), meta) {
             run.learn(path, m, content, scanned_clean, sealed, eol);
         }
     }
@@ -2239,7 +2064,7 @@ impl<'a> Builder<'a> {
         };
         if !renorm {
             if let Some(pe) = parent_file {
-                let unchanged = pe.fallback == Some(disk) || matches_quietly(self.store, &pe.id, &raw);
+                let unchanged = matches_quietly(self.store, &pe.id, &raw);
                 if unchanged {
                     let renormalize = renormalised(&raw) != raw;
                     if renormalize {
@@ -2311,18 +2136,9 @@ impl<'a> Builder<'a> {
     }
 
     /// The versions of `e` a reader may have been shown in the working
-    /// copy: its content if readable, and its fallback.
+    /// copy: its content if readable.
     fn shown_versions(&self, e: &TreeEntry) -> Vec<Vec<u8>> {
-        let mut v = Vec::new();
-        if let Ok(d) = self.store.read_blob(&e.id) {
-            v.push(d);
-        }
-        if let Some(fb) = e.fallback {
-            if let Ok(d) = self.store.read_blob(&fb) {
-                v.push(d);
-            }
-        }
-        v
+        self.store.read_blob(&e.id).into_iter().collect()
     }
 
     /// Does working-copy content `raw` at `path` stand for recorded content
@@ -2351,13 +2167,35 @@ impl<'a> Builder<'a> {
         name: &str,
         meta: &Metadata,
         desired: &Visibility,
-        cloak_fallback: Option<ObjectId>,
         allow_secrets: bool,
         parent_file: Option<&TreeEntry>,
     ) -> Result<Option<TreeEntry>> {
-        let Some(rec) = self.cache.as_ref().and_then(|c| c.trusted(path, meta)).cloned() else {
+        let Some((key, rec)) = self.cache.as_mut().and_then(|c| c.take_trusted(path, meta)) else {
             return Ok(None);
         };
+        let entry = self.entry_from_record(path, name, meta, desired, allow_secrets, parent_file, &rec);
+        // A record that made the entry is carried into the next run.
+        if let Some(run) = self.cache.as_mut() {
+            match entry {
+                Ok(Some(_)) => run.keep_taken(key, rec),
+                _ => run.give_back(key, rec),
+            }
+        }
+        entry
+    }
+
+    /// [`Builder::cached_entry`] from `rec`, the trusted record of `path`.
+    #[allow(clippy::too_many_arguments)]
+    fn entry_from_record(
+        &mut self,
+        path: &VPath,
+        name: &str,
+        meta: &Metadata,
+        desired: &Visibility,
+        allow_secrets: bool,
+        parent_file: Option<&TreeEntry>,
+        rec: &crate::statcache::Record,
+    ) -> Result<Option<TreeEntry>> {
         // Content holding a CR: its facts only hold for the parent entry
         // they were learned against and the attributes then in force (the
         // file is read again otherwise, once).
@@ -2366,15 +2204,8 @@ impl<'a> Builder<'a> {
                 return Ok(None);
             }
         }
-        // Only cloaked entries carry a fallback here (a sealed edit of a
-        // public file); embargoed ones never come from the cache.
-        let fallback = match desired {
-            Visibility::Cloaked { .. } => cloak_fallback,
-            _ => None,
-        };
-        let same_as_parent = |id: &ObjectId| {
-            parent_file.filter(|pe| pe.id == *id && pe.visibility == *desired && pe.executable == meta.executable && pe.fallback == fallback)
-        };
+        let same_as_parent =
+            |id: &ObjectId| parent_file.filter(|pe| pe.id == *id && pe.visibility == *desired && pe.executable == meta.executable);
         let entry = match desired {
             Visibility::Public => {
                 let id = rec.eol.as_ref().and_then(|f| f.recorded).unwrap_or(rec.content);
@@ -2389,15 +2220,11 @@ impl<'a> Builder<'a> {
             Visibility::Cloaked { scope } => match &rec.sealed {
                 Some((s, id)) if s == scope && self.store.keys.has(scope) => match same_as_parent(id) {
                     Some(pe) => Some(pe.clone()),
-                    None if self.store.has(id) => Some(TreeEntry {
-                        fallback,
-                        ..self.fresh_entry(name, *id, meta, desired)
-                    }),
+                    None if self.store.has(id) => Some(self.fresh_entry(name, *id, meta, desired)),
                     None => None,
                 },
                 _ => None,
             },
-            Visibility::Embargoed { .. } => None,
         };
         let entry = match (&rec.eol, entry) {
             (Some(_), Some(e)) if !parent_file.is_some_and(|pe| *pe == e) => None,
@@ -2408,9 +2235,6 @@ impl<'a> Builder<'a> {
                 self.report.renormalizable.push(path.clone());
             }
             self.report.cache_hits += 1;
-            if let Some(run) = self.cache.as_mut() {
-                run.keep(path, rec);
-            }
         }
         Ok(entry)
     }
@@ -2423,7 +2247,6 @@ impl<'a> Builder<'a> {
             size: meta.len,
             executable: meta.executable,
             visibility: visibility.clone(),
-            fallback: None,
         }
     }
 
@@ -2432,7 +2255,7 @@ impl<'a> Builder<'a> {
     /// been recorded under a rule (e.g. `public!`) that no longer applies,
     /// and must not be carried into a new snapshot if it holds a secret.
     fn previous_is_safe(&self, pe: &TreeEntry) -> Result<bool> {
-        if !pe.visibility.is_public() || pe.fallback.is_some() {
+        if !pe.visibility.is_public() {
             return Ok(true);
         }
         match self.store.read_entry(pe) {

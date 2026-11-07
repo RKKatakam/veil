@@ -7,8 +7,8 @@
 //!
 //! **Layers.** Reads come from an [`OverlayBackend`]: its lower layer is a
 //! [`ReaderView`] of the workspace's tree (what *this* reader may see: a
-//! cloaked file it cannot decrypt shows its public fallback, or is absent,
-//! exactly as checkout writes it), its upper layer holds every write, and
+//! secret file it cannot decrypt is absent, exactly as checkout writes
+//! it), its upper layer holds every write, and
 //! whiteouts hide what was deleted. The lower layer is never written. The
 //! upper layer of a real mount is a directory on disk
 //! (`.veil/local/mounts/<ws>/upper`) and whiteouts are appended to a
@@ -330,8 +330,7 @@ impl Lower for veil_core::vfs::MemoryBackend {}
 ///
 /// A [`TreeView`] lists only what this reader can materialise, but answers
 /// `metadata` (and `read`, with an error) for every entry. Here an entry
-/// this reader cannot read is absent everywhere, as in a checkout, and a
-/// cloaked file shown as its public fallback has the fallback's size.
+/// this reader cannot read is absent everywhere, as in a checkout.
 #[derive(Debug)]
 pub struct ReaderView {
     store: Arc<ObjectStore>,
@@ -362,9 +361,7 @@ impl ReaderView {
     }
 
     /// Is leaf entry `e` shown to this reader, as checkout would write it?
-    /// A symlink only with its own target (never an embargo fallback,
-    /// which may not be a link), a conflict with a symlink side as that
-    /// shown side.
+    /// A conflict with a symlink side as that shown side.
     fn visible_leaf(&self, e: &TreeEntry) -> bool {
         let shown = match e.kind {
             EntryKind::Conflict => match self.store.conflict(&e.id) {
@@ -377,7 +374,6 @@ impl ReaderView {
             _ => e.clone(),
         };
         match shown.kind {
-            EntryKind::Symlink => self.store.entry_readable(&TreeEntry { fallback: None, ..shown }),
             EntryKind::Dir => false,
             _ => self.store.entry_readable(&shown),
         }
@@ -484,19 +480,8 @@ impl StorageBackend for ReaderView {
     }
 
     fn metadata(&self, path: &VPath) -> VResult<Option<Metadata>> {
-        let Some(e) = self.entry(path)? else { return Ok(None) };
-        if e.kind == EntryKind::File {
-            if let Some(fb) = e.fallback {
-                let own = TreeEntry {
-                    fallback: None,
-                    ..e.clone()
-                };
-                if !self.store.entry_readable(&own) {
-                    // Shown as its last public version: that is its size.
-                    let len = self.store.read_blob(&fb)?.len() as u64;
-                    return Ok(Some(Metadata::unstamped(NodeKind::File, len, e.executable)));
-                }
-            }
+        if self.entry(path)?.is_none() {
+            return Ok(None);
         }
         self.view.metadata(path)
     }

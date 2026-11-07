@@ -23,8 +23,8 @@ fn no_escape(what: &str, t: &str) {
     assert!(!t.contains('\u{7}'), "{what} printed a raw BEL: {t:?}");
 }
 
-/// A cloaked file and a sealed description (a cloaked workspace's commit)
-/// copied onto the public line: an outsider reads none of it, and neither
+/// A cloaked secret file copied onto the public line: an outsider reads
+/// none of it, and neither
 /// `vl log`, `vl show --json` nor `vl duplicate --json` as an outsider
 /// shows it.
 #[test]
@@ -33,8 +33,8 @@ fn copies_of_cloaked_work_are_unreadable_to_outsiders() {
     let r = env.repo("p");
     r.commit("base", &[("a.txt", &lines10("a"))]);
     r.tag("main", "@-");
-    r.ok(&["cloak", "secret/"]);
-    r.write("secret/key.txt", "CLOAKED-DUP-SECRET-1\n");
+    r.ok(&["cloak", "secret/.env.key"]);
+    r.write("secret/.env.key", "CLOAKED-DUP-SECRET-1\n");
     r.ok(&["commit", "--no-advance", "-m", "public words"]);
     r.tag("withsecret", "@-");
     r.ok(&["new", "main"]);
@@ -45,29 +45,32 @@ fn copies_of_cloaked_work_are_unreadable_to_outsiders() {
     assert!(r.outsider_reads("CLOAKED-DUP-SECRET-1").is_empty(), "{:?}", r.outsider_reads("CLOAKED-DUP-SECRET-1"));
     assert!(r.store_contains("CLOAKED-DUP-SECRET-1").is_empty(), "sealed at rest");
     // The member reads the copy.
-    assert_eq!(r.read("secret/key.txt"), "CLOAKED-DUP-SECRET-1\n");
-    assert_eq!(r.visibility("@-", "secret/key.txt"), veil_core::Visibility::Cloaked { scope: "team".into() });
+    assert_eq!(r.read("secret/.env.key"), "CLOAKED-DUP-SECRET-1\n");
+    assert_eq!(r.visibility("@-", "secret/.env.key"), veil_core::Visibility::Cloaked { scope: "team".into() });
 }
 
-/// Threat review 11 through the binary: the refusal names neither the
-/// fix's files nor its description, and nothing is recorded.
+/// Threat review 11 through the binary: a copy of the fix outside the
+/// embargo (onto the pre-merge line) is refused; the refusal names neither
+/// the fix's files nor its description, and nothing is recorded.
 #[test]
 fn an_embargoed_fix_cannot_be_copied_out_and_the_refusal_names_nothing() {
     let env = Env::new();
     let r = env.repo("p");
     r.commit("v1", &[("a.c", &lines10("vuln"))]);
     r.tag("main", "@-");
+    // Not a tag: `vl merge --into main` moves every tag at main.
+    let v1 = r.sid("@-");
     r.ok(&["new", "main"]);
     r.commit("EMBARGOED-DESC-Z9", &[("FIX-NAME-Z9.c", "the fix\n")]);
     r.tag("fix", "@-");
     r.ok(&["merge", "fix", "--into", "main", "--embargo", "-m", "embargoed fix"]);
     let before = r.op_head();
-    let t = r.fails(&["duplicate", "fix", "-d", "main"]);
+    let t = r.fails(&["duplicate", "fix", "-d", &v1[..16]]);
     assert!(t.contains("withholds"), "{t}");
     assert!(!t.contains("Z9"), "{t}");
-    let t = r.fails(&["duplicate", "fix", "-d", "main", "--json"]);
+    let t = r.fails(&["duplicate", "fix", "-d", &v1[..16], "--json"]);
     assert!(!t.contains("Z9"), "{t}");
-    r.ok(&["new", "main"]);
+    r.ok(&["new", &v1[..16]]);
     let mid = r.op_head();
     let t = r.fails(&["cherry-pick", "fix"]);
     assert!(!t.contains("Z9"), "{t}");
@@ -205,11 +208,19 @@ fn merge_warnings_quoting_hostile_paths_are_escaped() {
     let env = Env::new();
     let r = env.repo("p");
     r.ok(&["scope", "create", "ops"]);
-    r.ok(&["cloak", "secrets/"]);
-    r.write("secrets/x\u{1b}[31mRED", "pw\n");
+    r.ok(&["cloak", "secrets/*.pem"]);
+    r.write("secrets/x\u{1b}[31mRED.pem", "pw\n");
     r.ok(&["commit", "-m", "base"]);
     r.tag("main", "@-");
-    let policy = r.read(".veilpolicy").replace("secrets/                 cloak team", "secrets/ cloak ops");
+    let policy: String = r
+        .read(".veilpolicy")
+        .lines()
+        .map(|l| match l.starts_with("secrets/*.pem") {
+            true => "secrets/*.pem cloak ops\n".to_string(),
+            false => format!("{l}\n"),
+        })
+        .collect();
+    assert!(policy.contains("secrets/*.pem cloak ops"), "{policy}");
     r.write(".veilpolicy", policy);
     r.ok(&["commit", "--no-advance", "-m", "rekey"]);
     r.tag("rekey", "@-");

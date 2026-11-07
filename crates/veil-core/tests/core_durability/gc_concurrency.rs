@@ -110,6 +110,10 @@ impl StorageBackend for Pause {
         self.inner.write_unsynced(path, data)
     }
     fn rename_unsynced(&self, from: &VPath, to: &VPath) -> Result<()> {
+        // The staged head file named (format 6): as `create_new` below.
+        if to.as_str().starts_with(OP_HEADS_DIR) {
+            self.stop_here(At::OpHead);
+        }
         self.inner.rename_unsynced(from, to)?;
         if from.as_str().contains("/incoming/tx-") && self.renames.fetch_add(1, Ordering::SeqCst) == 0 {
             self.stop_here(At::FirstRename);
@@ -273,7 +277,7 @@ fn a_transaction_whose_base_gc_prunes_records_whole_or_refuses() {
     let base = {
         let mut r = Repo::open(fs.clone(), Some(id.clone()), "alice").unwrap();
         let c = commit_files(&mut r, &*fs, &[("base.txt", "base\n")], "base");
-        r.set_tag("withdrawn", c, None, false).unwrap();
+        r.set_tag("withdrawn", c, false).unwrap();
         c
     };
     fs.write(&p("work.txt"), b"recorded work 811-d\n").unwrap();
@@ -286,7 +290,7 @@ fn a_transaction_whose_base_gc_prunes_records_whole_or_refuses() {
         move || {
             let mut other = Repo::open(mfs, Some(mid.clone()), "alice").unwrap();
             other.delete_tag("withdrawn").unwrap();
-            other.set_tag("landed", base, None, false).unwrap();
+            other.set_tag("landed", base, false).unwrap();
         },
     );
     let g = g.unwrap();
@@ -320,7 +324,7 @@ fn a_tag_carried_from_an_older_view_is_checked_at_commit() {
     gc(&mut g, &prune_now()).unwrap();
     assert!(!repo.store().has(&old), "the test needs the snapshot gone");
     let mut tx = repo.transaction("tag set").unwrap();
-    tx.view.tags.insert("stale".into(), Tag::new(old, None));
+    tx.view.tags.insert("stale".into(), Tag::new(old));
     let e = tx.commit().unwrap_err();
     assert!(e.to_string().contains("run the command again"), "{e}");
     let r = open(&fs, &id);
@@ -360,7 +364,7 @@ fn prune_now_beside_many_writers_loses_nothing() {
         let mut r = Repo::open(fs.clone(), Some(id.clone()), "alice").unwrap();
         let wc = r.workspace_wc(WS).unwrap();
         for n in &names {
-            r.create_workspace(n, vec![wc], None).unwrap();
+            r.create_workspace(n, vec![wc]).unwrap();
         }
     }
     let stop = Arc::new(AtomicBool::new(false));
@@ -379,7 +383,7 @@ fn prune_now_beside_many_writers_loses_nothing() {
                     Err(e) => assert!(e.to_string().contains("run the command again"), "{e}"),
                 }
                 let wc = r.workspace_wc(&n).unwrap();
-                r.set_tag(&format!("{n}-tag-{k}"), wc, None, false).unwrap();
+                r.set_tag(&format!("{n}-tag-{k}"), wc, false).unwrap();
             }
             (n, done)
         }));
@@ -425,7 +429,7 @@ fn prune_now_beside_writers_that_publish_packs_loses_nothing() {
         r.snapshot_workspace(WS, &*fs).unwrap();
         let wc = r.workspace_wc(WS).unwrap();
         for i in 0..3 {
-            r.create_workspace(&format!("agent{i}"), vec![wc], None).unwrap();
+            r.create_workspace(&format!("agent{i}"), vec![wc]).unwrap();
         }
     }
     let stop = Arc::new(AtomicBool::new(false));
@@ -599,13 +603,13 @@ impl StorageBackend for Wire {
 fn hub_gc_never_deletes_what_a_push_over_ssh_is_publishing() {
     let (mut alice, fs, id) = new_repo("alice");
     let c1 = commit_files(&mut alice, &*fs, &[("a.txt", "first 814\n")], "first");
-    alice.set_tag("main", c1, None, false).unwrap();
+    alice.set_tag("main", c1, false).unwrap();
     let hub = Arc::new(MemoryBackend::new());
     let wire = Wire::new(hub.clone(), true, None);
     let ssh: Arc<dyn StorageBackend> = wire.clone();
     veil_core::remote::push(&mut alice, ssh.clone(), false, &[], false).unwrap();
     let c2 = commit_files(&mut alice, &*fs, &[("b.txt", "pushed over ssh 814\n")], "second");
-    alice.set_tag("main", c2, None, true).unwrap();
+    alice.set_tag("main", c2, true).unwrap();
     let gc_thread: Arc<Mutex<Option<std::thread::JoinHandle<Result<GcReport>>>>> = Default::default();
     {
         let (hub, id, slot) = (hub.clone(), id.clone(), gc_thread.clone());
@@ -654,7 +658,7 @@ fn a_gc_that_dies_after_deleting_still_makes_carried_ids_checked() {
     assert!(probe.store().snapshot(&old).is_err(), "the test needs the snapshot gone");
     drop(probe);
     let mut tx = repo.transaction("tag set").unwrap();
-    tx.view.tags.insert("stale".into(), Tag::new(old, None));
+    tx.view.tags.insert("stale".into(), Tag::new(old));
     let e = tx.commit().expect_err("a tag naming a deleted snapshot was recorded");
     assert!(e.to_string().contains("run the command again"), "{e}");
 }

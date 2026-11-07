@@ -10,16 +10,27 @@ use std::sync::{Arc, Mutex};
 /// Taken by every test here: another test's allocations would count.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
-use veil_core::{
-    remote::{self, SyncOptions},
-    DiskBackend, Identity, Repo,
-};
+use veil_core::{object::Object, remote::Incoming, DiskBackend, ObjectId, Repo};
 
 fn rss_kib() -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)?.parse().ok()))
         .unwrap_or(0)
+}
+
+/// Write `count` incompressible blobs of `len` bytes (seeds from `first`)
+/// into the repository at `dir` as the server's pull writes what it
+/// receives ([`Incoming`]): one pack, streamed.
+fn receive_blobs(dir: &std::path::Path, first: u64, count: usize, len: usize) -> usize {
+    let repo = Repo::open_remote(Arc::new(DiskBackend::new(dir))).unwrap();
+    let store = repo.store().clone();
+    let mut incoming = Incoming::new(&store);
+    for i in 0..count {
+        let raw = Object::Blob(noise(first + i as u64, len)).encode();
+        incoming.put(ObjectId::hash(&raw), raw, &format!("b{i}.bin")).unwrap();
+    }
+    incoming.finish().unwrap()
 }
 
 /// Incompressible bytes, deterministic from `seed`.
@@ -50,30 +61,19 @@ fn reading_every_pack_does_not_hold_the_whole_store_in_memory() {
     const BLOBS: usize = 150;
     const BLOB: usize = 200 * 1024; // 150 × 200 KiB ≈ 30 MiB per pack
     let tmp = tempfile::tempdir().unwrap();
-    let local_dir = tmp.path().join("local");
     let remote_dir = tmp.path().join("remote");
-    std::fs::create_dir_all(&local_dir).unwrap();
     std::fs::create_dir_all(&remote_dir).unwrap();
-    let id = Identity::generate("bench");
-    let mut repo = Repo::init(Arc::new(DiskBackend::new(&local_dir)), Some(id.clone()), "bench").unwrap();
-    let mut head = repo.root_id();
-    // Each push lands as one pack on the remote.
+    drop(Repo::init_bare(Arc::new(DiskBackend::new(&remote_dir))).unwrap());
+    // Each batch received lands as one pack.
     for p in 0..PACKS {
-        let ws = repo.ephemeral_workspace(head).unwrap();
-        for b in 0..BLOBS {
-            ws.write(&format!("p{p}/b{b}.bin"), noise((p * BLOBS + b) as u64 + 1, BLOB)).unwrap();
-        }
-        head = repo.commit_ephemeral(&ws, &format!("pack {p}")).unwrap().0;
-        repo.set_tag("main", head, None, false).unwrap();
-        remote::push_with(&mut repo, Arc::new(DiskBackend::new(&remote_dir)), false, &[], false, &SyncOptions::default()).unwrap();
+        assert_eq!(receive_blobs(&remote_dir, (p * BLOBS) as u64 + 1, BLOBS, BLOB), 1);
     }
-    drop(repo);
     let packs = std::fs::read_dir(remote_dir.join(".veil/objects/pack"))
         .unwrap()
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().ends_with(".pack"))
         .count();
-    assert!(packs >= PACKS, "expected one pack per push, found {packs}");
+    assert!(packs >= PACKS, "expected one pack per batch, found {packs}");
 
     let remote = Repo::open(Arc::new(DiskBackend::new(&remote_dir)), None, "reader").unwrap();
     let ids = remote.store().list_objects().unwrap();
@@ -112,47 +112,27 @@ fn peak_rss_kib<T>(f: impl FnOnce() -> T) -> (T, u64) {
     })
 }
 
-/// BUG-800, the write and transfer side: a clone (a pull into an empty
-/// repository) of a store several times the caches' size neither
-/// downloads the remote's packs into memory (they are spooled to disk)
-/// nor builds the packs it writes there (they are streamed). The baseline
-/// measured `vl clone` at 1.98 GB RSS for a 1 GB store, then 1.2 GB once
-/// reads were bounded.
+/// BUG-800, the write side: a clone receiving a store several times the
+/// caches' size never builds the packs it writes in memory (they are
+/// streamed). The baseline measured `vl clone` at 1.98 GB RSS for a 1 GB
+/// store, then 1.2 GB once reads were bounded. Measured on what the
+/// server's pull writes with ([`Incoming`]).
 #[test]
 #[cfg(target_os = "linux")]
 fn a_clone_of_a_large_store_does_not_hold_it_in_memory() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    const PACKS: usize = 4;
-    const BLOBS: usize = 250;
-    const BLOB: usize = 200 * 1024; // 4 × 250 × 200 KiB ≈ 195 MiB
+    const BLOBS: usize = 1000;
+    const BLOB: usize = 200 * 1024; // 1000 × 200 KiB ≈ 195 MiB
     let tmp = tempfile::tempdir().unwrap();
-    let (local_dir, remote_dir, clone_dir) = (tmp.path().join("local"), tmp.path().join("remote"), tmp.path().join("clone"));
-    for d in [&local_dir, &remote_dir, &clone_dir] {
-        std::fs::create_dir_all(d).unwrap();
-    }
-    let id = Identity::generate("bench");
-    let mut repo = Repo::init(Arc::new(DiskBackend::new(&local_dir)), Some(id.clone()), "bench").unwrap();
-    let mut head = repo.root_id();
-    for p in 0..PACKS {
-        let ws = repo.ephemeral_workspace(head).unwrap();
-        for b in 0..BLOBS {
-            ws.write(&format!("p{p}/b{b}.bin"), noise((p * BLOBS + b) as u64 + 1, BLOB)).unwrap();
-        }
-        head = repo.commit_ephemeral(&ws, &format!("pack {p}")).unwrap().0;
-        repo.set_tag("main", head, None, false).unwrap();
-        remote::push_with(&mut repo, Arc::new(DiskBackend::new(&remote_dir)), false, &[], false, &SyncOptions::default()).unwrap();
-    }
-    drop(repo);
-    let store_mib = (PACKS * BLOBS * BLOB) as u64 >> 20;
-
-    let mut clone = Repo::init_for_clone(Arc::new(DiskBackend::new(&clone_dir)), Some(id), "bench").unwrap();
+    let clone_dir = tmp.path().join("clone");
+    std::fs::create_dir_all(&clone_dir).unwrap();
+    drop(Repo::init_bare(Arc::new(DiskBackend::new(&clone_dir))).unwrap());
+    let store_mib = (BLOBS * BLOB) as u64 >> 20;
     let before = rss_kib();
-    let (report, peak) = peak_rss_kib(|| remote::pull(&mut clone, "origin", Arc::new(DiskBackend::new(&remote_dir))).unwrap());
+    let (packs, peak) = peak_rss_kib(|| receive_blobs(&clone_dir, 1, BLOBS, BLOB));
     let grown_mib = peak.saturating_sub(before) / 1024;
-    assert!(report.packs_written >= 1, "{report:?}");
-    assert_eq!(clone.view().tags["main"].target, head);
+    assert!(packs >= 1, "{packs} packs");
     // What may grow: the last versions kept as delta bases (64 MiB) and a
     // few MiB of buffers. Holding the store (≈ 195 MiB) is the bug.
-    assert!(grown_mib < store_mib / 2, "cloning {store_mib} MiB in {PACKS} packs grew peak RSS by {grown_mib} MiB");
-    assert!(!clone_dir.join(".veil/objects/incoming/pull").exists(), "the download spool is removed");
+    assert!(grown_mib < store_mib / 2, "receiving {store_mib} MiB grew peak RSS by {grown_mib} MiB");
 }

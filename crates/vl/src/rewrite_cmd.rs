@@ -24,7 +24,7 @@ use crate::{
 };
 
 /// JSON schema of `vl duplicate --json` and `vl cherry-pick --json`.
-pub const DUPLICATE_SCHEMA: &str = "veil.duplicate/1";
+pub const DUPLICATE_SCHEMA: &str = "veil.duplicate/2";
 
 /// The description of each duplicate.
 #[derive(Args, Debug)]
@@ -83,7 +83,7 @@ pub struct CherryPickArgs {
     pub out: JsonOut,
 }
 
-/// `veil.duplicate/1`: the copies made (ids only: no description, so
+/// `veil.duplicate/2`: the copies made (ids only: no description, so
 /// nothing sealed can appear here), and for cherry-pick where `@` and the
 /// tags went.
 #[derive(Serialize, Debug)]
@@ -253,15 +253,6 @@ pub fn cherry_pick(ctx: &mut Ctx, args: &CherryPickArgs) -> Result<ExitCode> {
             if !r.advanced.is_empty() {
                 let names: Vec<String> = r.advanced.iter().map(|n| safe(n).into_owned()).collect();
                 println!("Moved {} to the last copy", names.join(", "));
-            }
-            if let Some((_, veil_core::commands::TagKept::CloakedLine(scope))) = r.kept.first() {
-                let names: Vec<String> = r.kept.iter().map(|(n, _)| safe(n).into_owned()).collect();
-                eprintln!(
-                    "{} {} not moved: this is a line cloaked for '{}', and copying onto it never moves an uncloaked tag",
-                    yellow("note:"),
-                    names.join(", "),
-                    safe(scope)
-                );
             }
         }
     }

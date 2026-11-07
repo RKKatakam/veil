@@ -13,28 +13,6 @@ use std::path::{Path, PathBuf};
 
 use adversarial_support::*;
 
-fn fixture(format: u32) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../veil-core/tests/fixtures/format-{format}"))
-}
-
-fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for e in std::fs::read_dir(from).unwrap() {
-        let e = e.unwrap();
-        let dst = to.join(e.file_name());
-        if e.file_type().unwrap().is_dir() {
-            copy_dir(&e.path(), &dst);
-        } else {
-            std::fs::copy(e.path(), &dst).unwrap();
-        }
-    }
-}
-
-fn format_of(repo: &Path) -> u64 {
-    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(repo.join(".veil/repo.json")).unwrap()).unwrap();
-    v["format"].as_u64().unwrap()
-}
-
 /// `vl files -r <rev>` as (path, tier label) pairs.
 fn recorded(env: &Env, user: &str, proj: &Path, rev: &str) -> Vec<(String, String)> {
     env.stdout(user, proj, &["files", "-r", rev])
@@ -60,52 +38,6 @@ fn public_key(env: &Env, user: &str) -> String {
         .last()
         .unwrap()
         .to_string()
-}
-
-// ---- vl upgrade --remote ---------------------------------------------------
-
-/// `vl upgrade --remote <name>` turns the remote's URL into a local path
-/// without asking whether it is an SSH remote (`remote_backend`, which every
-/// other command uses, does). For `host:path` or `sftp://host/path` it opens
-/// `<project>/host:path` instead: an error at best, and here a decoy
-/// repository at that path is "upgraded" and the command reports success,
-/// while the real remote stays at format 2 and keeps refusing AES-SIV
-/// objects and HPKE rings.
-#[test]
-fn upgrade_remote_does_not_treat_an_ssh_url_as_a_local_path() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().join("fx");
-    copy_dir(&fixture(2), &root);
-    let alice = root.join("alice");
-    let home = root.join("home-alice");
-    let vl = |args: &[&str]| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_vl"))
-            .args(args)
-            .current_dir(&alice)
-            .env("VEIL_HOME", &home)
-            .env("VEIL_USER", "alice")
-            .env("NO_COLOR", "1")
-            .output()
-            .unwrap()
-    };
-    // An SSH remote whose host does not resolve (nothing can be upgraded).
-    let url = "nobody@veil-test.invalid:srv/team.veil";
-    let out = vl(&["remote", "add", "build", url]);
-    assert!(out.status.success(), "{}", text(&out));
-    // A decoy repository where the URL lands when read as a relative path.
-    let decoy = alice.join("nobody@veil-test.invalid:srv/team.veil");
-    copy_dir(&root.join("team-remote"), &decoy);
-    assert_eq!(format_of(&decoy), 2);
-
-    let out = vl(&["upgrade", "--remote", "build"]);
-    let said = text(&out);
-    assert!(
-        !out.status.success() && format_of(&decoy) == 2,
-        "`vl upgrade --remote build` ({url}) acted on the local directory {}: success = {}, decoy now at format {}\n{said}",
-        decoy.display(),
-        out.status.success(),
-        format_of(&decoy)
-    );
 }
 
 // ---- the accepted policy: the member's own edit -----------------------------

@@ -1,5 +1,6 @@
-//! Veil invariants under merging and rewriting: cloaked and isolated files,
-//! embargoed history, `.veilpolicy` edits, stable change ids and the op log.
+//! Veil invariants under merging and rewriting: cloaked (secret) and
+//! isolated files, embargoed history (withheld from every push until its
+//! release), `.veilpolicy` edits, stable change ids and the op log.
 //! Each scenario is a Git/jj history scenario (named per test) replayed
 //! with protected content; plaintext must never reach what an outsider can
 //! read (public snapshots, plaintext descriptions, a public remote).
@@ -39,19 +40,19 @@ fn is_cloaked(v: &veil_core::Visibility) -> bool {
     matches!(v, veil_core::Visibility::Cloaked { .. })
 }
 
-/// base: `secret/k.txt` cloaked; then the usual left/right fork.
+/// base: `secret/.env.k` (a secret file) cloaked; then the usual left/right fork.
 fn cloaked_fork<'a>(env: &'a Env, left: &str, right: &str) -> R<'a> {
     let r = env.repo("p");
-    r.ok(&["cloak", "secret/"]);
-    r.write("secret/k.txt", "line1\nline2\nline3\n");
+    r.ok(&["cloak", "secret/.env.k"]);
+    r.write("secret/.env.k", "line1\nline2\nline3\n");
     r.write("pub.txt", "p\n");
     r.ok(&["commit", "--no-advance", "-m", "base"]);
     r.tag("base", "@-");
-    r.write("secret/k.txt", left);
+    r.write("secret/.env.k", left);
     r.ok(&["commit", "--no-advance", "-m", "left"]);
     r.tag("left", "@-");
     r.ok(&["new", "base"]);
-    r.write("secret/k.txt", right);
+    r.write("secret/.env.k", right);
     r.ok(&["commit", "--no-advance", "-m", "right"]);
     r.tag("right", "@-");
     r
@@ -67,20 +68,20 @@ fn merge_conflict_in_a_cloaked_file_stays_sealed() {
         "line1\nRIGHT-CLOAK-9921\nline3\n",
     );
     let out = r.ok(&["merge", "left"]);
-    assert!(out.contains("conflicts in: secret/k.txt"), "{out}");
-    let f = r.read("secret/k.txt");
+    assert!(out.contains("conflicts in: secret/.env.k"), "{out}");
+    let f = r.read("secret/.env.k");
     assert!(
         f.contains("<<<<<<<") && f.contains("LEFT-CLOAK-4417") && f.contains("RIGHT-CLOAK-9921"),
         "{f}"
     );
     assert!(
-        is_cloaked(&r.visibility("@-", "secret/k.txt")),
+        is_cloaked(&r.visibility("@-", "secret/.env.k")),
         "conflicted cloaked file merged as public"
     );
     // Resolving it keeps it sealed too.
-    r.write("secret/k.txt", "line1\nRESOLVED-CLOAK-5531\nline3\n");
+    r.write("secret/.env.k", "line1\nRESOLVED-CLOAK-5531\nline3\n");
     r.ok(&["squash"]);
-    assert!(is_cloaked(&r.visibility("@-", "secret/k.txt")));
+    assert!(is_cloaked(&r.visibility("@-", "secret/.env.k")));
     for n in ["LEFT-CLOAK-4417", "RIGHT-CLOAK-9921", "RESOLVED-CLOAK-5531"] {
         assert_no_leak(&r, n);
     }
@@ -103,8 +104,8 @@ fn rebase_conflict_in_a_cloaked_file_stays_sealed() {
         "line1\nRIGHT-RB-2271\nline3\n",
     );
     let out = r.ok(&["rebase", "-s", "right", "-d", "left"]);
-    assert!(out.contains("conflicts in: secret/k.txt"), "{out}");
-    assert!(is_cloaked(&r.visibility("right", "secret/k.txt")));
+    assert!(out.contains("conflicts in: secret/.env.k"), "{out}");
+    assert!(is_cloaked(&r.visibility("right", "secret/.env.k")));
     assert_no_leak(&r, "LEFT-RB-1180");
     assert_no_leak(&r, "RIGHT-RB-2271");
 }
@@ -121,66 +122,33 @@ fn clean_merge_of_a_cloaked_file_stays_sealed() {
     let out = r.ok(&["merge", "left"]);
     assert!(!out.contains("conflict"), "{out}");
     assert_eq!(
-        r.read("secret/k.txt"),
+        r.read("secret/.env.k"),
         "LEFT-CM-3301\nline2\nRIGHT-CM-3302\n"
     );
-    assert!(is_cloaked(&r.visibility("@-", "secret/k.txt")));
+    assert!(is_cloaked(&r.visibility("@-", "secret/.env.k")));
     assert_no_leak(&r, "LEFT-CM-3301");
     assert_no_leak(&r, "RIGHT-CM-3302");
 }
 
-// Scenario from git t6430 (one side changes policy, other edits): left cloaks a public file and edits it, right edits it publicly.
-#[test]
-fn conflict_between_a_cloaking_edit_and_a_public_edit_stays_sealed() {
-    for direction in ["left-into-right", "right-into-left"] {
-        let env = Env::new();
-        let r = env.repo("p");
-        r.commit("base", &[("conf/app.cfg", "a\nb\nc\n")]);
-        r.tag("base", "@-");
-        r.ok(&["cloak", "conf/"]);
-        r.write("conf/app.cfg", "a\nLEFT-NOWCLOAKED-6610\nc\n");
-        r.ok(&["commit", "--no-advance", "-m", "cloak conf and edit"]);
-        r.tag("left", "@-");
-        assert!(is_cloaked(&r.visibility("left", "conf/app.cfg")));
-        r.ok(&["new", "base"]);
-        r.write("conf/app.cfg", "a\nright public edit\nc\n");
-        r.ok(&["commit", "--no-advance", "-m", "public edit"]);
-        r.tag("right", "@-");
-        let (into, other) = if direction == "left-into-right" {
-            ("right", "left")
-        } else {
-            ("left", "right")
-        };
-        r.ok(&["new", into]);
-        r.ok(&["merge", other]);
-        assert!(r.read("conf/app.cfg").contains("LEFT-NOWCLOAKED-6610"));
-        assert!(
-            is_cloaked(&r.visibility("@-", "conf/app.cfg")),
-            "{direction}: the merged file holding cloaked text is public"
-        );
-        assert_no_leak(&r, "LEFT-NOWCLOAKED-6610");
-    }
-}
-
-// Scenario from git t6430 (policy on one side, new file on the other): a file added under a directory the other side cloaks.
+// Scenario from git t6430 (policy on one side, new file on the other): a secret file added under a directory the other side cloaks.
 #[test]
 fn file_added_under_a_directory_cloaked_by_the_other_side_is_sealed_from_then_on() {
     let env = Env::new();
     let r = env.repo("p");
     r.commit("base", &[("k", "k\n")]);
     r.tag("base", "@-");
-    r.write("private/existing.txt", "e\n");
-    r.ok(&["cloak", "private/"]);
+    r.write("private/existing.pem", "e\n");
+    r.ok(&["cloak", "private/*.pem"]);
     r.ok(&["commit", "--no-advance", "-m", "cloak private"]);
     r.tag("left", "@-");
     r.ok(&["new", "base"]);
-    r.write("private/new.txt", "added publicly before the rule\n");
+    r.write("private/new.pem", "added before the rule\n");
     r.ok(&["commit", "--no-advance", "-m", "add file"]);
     r.ok(&["merge", "left"]);
     // From the merge on, the merged policy cloaks private/: later edits are sealed.
-    r.write("private/new.txt", "LATER-EDIT-7702\n");
+    r.write("private/new.pem", "LATER-EDIT-7702\n");
     r.ok(&["commit", "--no-advance", "-m", "edit"]);
-    assert!(is_cloaked(&r.visibility("@-", "private/new.txt")));
+    assert!(is_cloaked(&r.visibility("@-", "private/new.pem")));
     assert_no_leak(&r, "LATER-EDIT-7702");
 }
 
@@ -191,8 +159,8 @@ fn rebasing_a_policy_change_keeps_its_cloaked_files_sealed() {
     let r = env.repo("p");
     r.commit("base", &[("k", "k\n")]);
     r.tag("base", "@-");
-    r.ok(&["cloak", "vault/"]);
-    r.write("vault/key.txt", "POLICY-RB-8812\n");
+    r.ok(&["cloak", "vault/*.pem"]);
+    r.write("vault/key.pem", "POLICY-RB-8812\n");
     r.ok(&["commit", "--no-advance", "-m", "cloak vault"]);
     r.tag("x", "@-");
     r.ok(&["new", "base"]);
@@ -208,7 +176,7 @@ fn rebasing_a_policy_change_keeps_its_cloaked_files_sealed() {
         "{policy}"
     );
     assert!(r.snap("x").conflicts.is_empty());
-    assert!(is_cloaked(&r.visibility("x", "vault/key.txt")));
+    assert!(is_cloaked(&r.visibility("x", "vault/key.pem")));
     assert_no_leak(&r, "POLICY-RB-8812");
 }
 
@@ -219,8 +187,8 @@ fn conflicted_policy_after_rebase_keeps_files_sealed() {
     let r = env.repo("p");
     r.commit("base", &[("k", "k\n")]);
     r.tag("base", "@-");
-    r.ok(&["cloak", "vault/"]);
-    r.write("vault/key.txt", "POLICY-CF-1212\n");
+    r.ok(&["cloak", "vault/*.pem"]);
+    r.write("vault/key.pem", "POLICY-CF-1212\n");
     r.ok(&["commit", "--no-advance", "-m", "cloak vault"]);
     r.tag("x", "@-");
     r.ok(&["new", "base"]);
@@ -234,10 +202,10 @@ fn conflicted_policy_after_rebase_keeps_files_sealed() {
         "the two appended rules should conflict:\n{out}"
     );
     // Every later command reads the conflicted policy; edits in vault/ stay sealed.
-    r.write("vault/key.txt", "AFTER-CONFLICT-3434\n");
+    r.write("vault/key.pem", "AFTER-CONFLICT-3434\n");
     let st = r.ok(&["status"]);
     assert!(!st.contains("panicked"), "{st}");
-    assert!(is_cloaked(&r.visibility("@", "vault/key.txt")));
+    assert!(is_cloaked(&r.visibility("@", "vault/key.pem")));
     assert_no_leak(&r, "POLICY-CF-1212");
     assert_no_leak(&r, "AFTER-CONFLICT-3434");
 }
@@ -247,18 +215,18 @@ fn conflicted_policy_after_rebase_keeps_files_sealed() {
 fn merged_policy_that_exposes_cloaked_files_is_not_taken() {
     let env = Env::new();
     let r = env.repo("p");
-    r.ok(&["cloak", "vault/"]);
-    r.write("vault/key.txt", "EXPOSE-MERGE-5151\n");
+    r.ok(&["cloak", "vault/*.pem"]);
+    r.write("vault/key.pem", "EXPOSE-MERGE-5151\n");
     r.ok(&["commit", "--no-advance", "-m", "base"]);
     r.tag("base", "@-");
-    r.ok(&["expose", "vault/", "--force"]);
+    r.ok(&["expose", "vault/*.pem", "--force"]);
     r.ok(&["commit", "--no-advance", "-m", "expose vault"]);
     r.tag("exposer", "@-");
     r.ok(&["new", "base"]);
     r.commit("other", &[("o", "o\n")]);
     let out = r.ok(&["merge", "exposer"]);
     assert!(out.contains("kept the destination's .veilpolicy"), "{out}");
-    assert!(is_cloaked(&r.visibility("@-", "vault/key.txt")));
+    assert!(is_cloaked(&r.visibility("@-", "vault/key.pem")));
 }
 
 // Scenario from jj test_abandon, on a change that cloaked a file: its child's edit of that file stays sealed.
@@ -267,66 +235,20 @@ fn abandoning_the_change_that_cloaked_a_file_keeps_the_childs_edit_sealed() {
     let env = Env::new();
     let r = env.repo("p");
     r.commit("base", &[("k", "k\n")]);
-    r.ok(&["cloak", "vault/"]);
-    r.write("vault/key.txt", "first\n");
+    r.ok(&["cloak", "vault/*.pem"]);
+    r.write("vault/key.pem", "first\n");
     r.ok(&["commit", "--no-advance", "-m", "cloak vault"]);
     let cloaker = r.cid("@-");
-    r.write("vault/key.txt", "CHILD-EDIT-8080\n");
+    r.write("vault/key.pem", "CHILD-EDIT-8080\n");
     r.ok(&["commit", "--no-advance", "-m", "edit the key"]);
     let child = r.cid("@-");
     r.ok(&["abandon", &cloaker]);
-    assert!(r.paths(&child).contains(&"vault/key.txt".to_string()));
+    assert!(r.paths(&child).contains(&"vault/key.pem".to_string()));
     assert!(
-        is_cloaked(&r.visibility(&child, "vault/key.txt")),
+        is_cloaked(&r.visibility(&child, "vault/key.pem")),
         "abandon declassified the child's sealed edit"
     );
     assert_no_leak(&r, "CHILD-EDIT-8080");
-}
-
-// Scenario from jj test_squash, cloaked line into public parent: description and content stay sealed.
-#[test]
-fn squashing_a_cloaked_change_into_a_public_parent_keeps_it_sealed() {
-    let env = Env::new();
-    let r = env.repo("p");
-    r.commit("public base", &[("app.txt", "v1\n")]);
-    r.tag("main", "@-");
-    r.ok(&["ws", "new", "work", "-r", "main", "--cloak", "team"]);
-    r.ok(&["ws", "switch", "work"]);
-    r.write("app.txt", "v1\nSQUASH-CLOAKED-4545\n");
-    r.ok(&["describe", "-m", "SQUASH-DESC-4546"]);
-    r.ok(&["squash"]);
-    let into = r.snap("main");
-    assert!(
-        is_cloaked(&r.visibility("main", "app.txt")),
-        "squash published the cloaked edit"
-    );
-    assert!(into.description.unwrap().contains("SQUASH-DESC-4546"));
-    assert_no_leak(&r, "SQUASH-CLOAKED-4545");
-    assert_no_leak(&r, "SQUASH-DESC-4546");
-}
-
-// Scenario from git t3400 / jj test_rebase, cloaked line onto a new public base: still sealed after the rebase.
-#[test]
-fn rebasing_a_cloaked_line_onto_public_work_keeps_it_sealed() {
-    let env = Env::new();
-    let r = env.repo("p");
-    r.commit("public base", &[("app.txt", "1\n2\n3\n")]);
-    r.tag("main", "@-");
-    r.ok(&["ws", "new", "work", "-r", "main", "--cloak", "team"]);
-    r.ok(&["ws", "switch", "work"]);
-    r.write("app.txt", "1\n2\nCLOAKED-LINE-6767\n");
-    r.ok(&["describe", "-m", "CLOAKED-LINE-DESC-6768"]);
-    let work = r.cid("work@");
-    r.ok(&["ws", "switch", "default"]);
-    r.ok(&["new", "main"]);
-    r.commit("public follow-up", &[("app.txt", "ONE\n2\n3\n")]);
-    r.tag("main2", "@-");
-    r.ok(&["rebase", "-s", &work, "-d", "main2"]);
-    assert_eq!(r.cid(&work[..12]), work);
-    assert!(is_cloaked(&r.visibility(&work[..12], "app.txt")));
-    assert_eq!(r.cat(&work[..12], "app.txt"), "ONE\n2\nCLOAKED-LINE-6767\n");
-    assert_no_leak(&r, "CLOAKED-LINE-6767");
-    assert_no_leak(&r, "CLOAKED-LINE-DESC-6768");
 }
 
 // Scenario from git t6436-merge-overwrite.sh / jj rebase, with an isolated file: never recorded, never removed.
@@ -375,8 +297,8 @@ fn quarantined_secret_is_not_recorded_by_a_rewrite() {
 }
 
 /// A repository with an unreleased embargoed merge on `main`, made the way
-/// the guide does it (fix on a cloaked workspace). The fix adds
-/// `FIX_MARK` to `parser.py`.
+/// the guide does it (fix on its own workspace). The fix adds `FIX_MARK`
+/// to `parser.py`.
 const FIX_MARK: &str = "EMBARGOED-FIX-9090";
 
 fn embargoed(env: &Env) -> R<'_> {
@@ -386,7 +308,7 @@ fn embargoed(env: &Env) -> R<'_> {
         &[("parser.py", "def parse(buf):\n    return buf[0]\n")],
     );
     r.tag("main", "@-");
-    r.ok(&["ws", "new", "fix", "-r", "main", "--cloak", "team"]);
+    r.ok(&["ws", "new", "fix", "-r", "main"]);
     r.ok(&["ws", "switch", "fix"]);
     r.write(
         "parser.py",
@@ -407,59 +329,38 @@ fn embargoed(env: &Env) -> R<'_> {
     r
 }
 
-/// What an outsider can read (and the public mirror receives) holds none
-/// of the fix. (The holder's own store is checked separately: BUG-249.)
-fn assert_embargo_holds(r: &R) {
-    for n in [FIX_MARK, "FIX-DESC-9091", "EMBARGO-MERGE-DESC-9092"] {
-        assert_outsider_blind(r, n);
+/// Push every tag to a public remote `mirror` and a team remote `origin`
+/// (added on first use): neither receives any of `needles` (the embargoed
+/// merge and the history it brings in are withheld until the release).
+fn assert_withheld(r: &R, needles: &[&str]) {
+    let mirror = push_public(r, &[]);
+    let team = r.env.root.join("team");
+    if !team.exists() {
+        r.ok(&["remote", "add", "origin", team.to_str().unwrap()]);
+    }
+    let out = r.ok(&["push", "mirror"]);
+    r.ok(&["push", "origin"]);
+    for n in needles.iter().chain(&[FIX_MARK, "FIX-DESC-9091", "EMBARGO-MERGE-DESC-9092"]) {
+        for remote in [&mirror, &team] {
+            let hits = store_contains(remote, n.as_bytes());
+            assert!(hits.is_empty(), "{n:?} reached {}: {hits:?}\n{out}", remote.display());
+        }
     }
 }
 
-fn assert_outsider_blind(r: &R, needle: &str) {
-    let reads = r.outsider_reads(needle);
-    assert!(reads.is_empty(), "an outsider reads {needle:?}: {reads:?}");
-}
-
-// Control: outsiders and the public mirror see nothing of the embargoed fix.
+// Control: no remote receives anything of the embargoed fix.
 #[test]
 fn embargo_fixture_hides_the_fix_from_outsiders() {
     let env = Env::new();
     let r = embargoed(&env);
     assert!(r.read("parser.py").contains(FIX_MARK));
-    assert_embargo_holds(&r);
-    let mirror = push_public(&r, &["main"]);
-    assert!(store_contains(&mirror, FIX_MARK.as_bytes()).is_empty());
+    assert_withheld(&r, &[]);
+    // Asked for by name, the embargoed `main` is refused.
+    let t = r.fails(&["push", "mirror", "-t", "main"]);
+    assert!(t.contains("requested tag was not pushed: main"), "{t}");
 }
 
-// Control: the cloaked fix line, before the merge, is encrypted at rest.
-#[test]
-fn cloaked_fix_line_is_encrypted_at_rest_before_the_merge() {
-    let env = Env::new();
-    let r = env.repo("p");
-    r.commit("parser", &[("parser.py", "v1\n")]);
-    r.tag("main", "@-");
-    r.ok(&["ws", "new", "fix", "-r", "main", "--cloak", "team"]);
-    r.ok(&["ws", "switch", "fix"]);
-    r.write("parser.py", format!("v1\n{FIX_MARK}\n"));
-    r.ok(&["describe", "-m", "FIX-DESC-9091"]);
-    r.ok(&["ws", "switch", "default"]);
-    assert_no_leak(&r, FIX_MARK);
-    assert_no_leak(&r, "FIX-DESC-9091");
-}
-
-// Scenario from git t6430 (merge) with Veil's embargo: the embargoed merge writes no plaintext of the fix.
-#[test]
-fn embargoed_merge_stores_no_plaintext_of_the_fix() {
-    let env = Env::new();
-    let r = embargoed(&env);
-    let hits = r.store_contains(FIX_MARK);
-    assert!(
-        hits.is_empty(),
-        "the embargoed fix is stored in plaintext: {hits:?}"
-    );
-}
-
-// Scenario from jj test_rebase, on an embargoed line: a key holder's change rebased onto the embargoed merge stays wrapped.
+// Scenario from jj test_rebase, on an embargoed line: a change rebased onto the embargoed merge is withheld with it.
 #[test]
 fn rebasing_onto_an_embargoed_merge_keeps_the_embargo() {
     let env = Env::new();
@@ -470,12 +371,11 @@ fn rebasing_onto_an_embargoed_merge_keeps_the_embargo() {
     let w = r.cid("@");
     r.ok(&["rebase", "-s", &w, "-d", "main"]);
     assert!(r.read("parser.py").contains(FIX_MARK));
-    assert_embargo_holds(&r);
-    let mirror = push_public(&r, &["main"]);
-    assert!(store_contains(&mirror, FIX_MARK.as_bytes()).is_empty());
+    r.tag("built-on", "@");
+    assert_withheld(&r, &["ON-TOP-9093"]);
 }
 
-// Scenario from git t3423-rebase-reword.sh, on an embargoed merge: rewording keeps the description sealed.
+// Scenario from git t3423-rebase-reword.sh, on an embargoed merge: the reworded merge stays withheld.
 #[test]
 fn describing_an_embargoed_merge_keeps_its_description_sealed() {
     let env = Env::new();
@@ -485,8 +385,7 @@ fn describing_an_embargoed_merge_keeps_its_description_sealed() {
         r.snap("main").description.as_deref(),
         Some("REWORDED-EMBARGO-9094")
     );
-    assert_outsider_blind(&r, "REWORDED-EMBARGO-9094");
-    assert_embargo_holds(&r);
+    assert_withheld(&r, &["REWORDED-EMBARGO-9094"]);
 }
 
 // Scenario from git t3423 (reword the merged-in fix): rewriting the fix change re-merges under the same embargo.
@@ -497,8 +396,7 @@ fn rewording_the_fix_after_the_embargoed_merge_keeps_the_embargo() {
     let embargo = r.snap("main").embargo.clone().expect("embargoed merge");
     r.ok(&["describe", "-r", "fix@", "-m", "FIX-REWORD-9095"]);
     assert_eq!(r.snap("main").embargo.as_deref(), Some(embargo.as_str()));
-    assert_outsider_blind(&r, "FIX-REWORD-9095");
-    assert_embargo_holds(&r);
+    assert_withheld(&r, &["FIX-REWORD-9095"]);
 }
 
 // Scenario from jj test_squash, into an embargoed merge: what is squashed in stays under the embargo.
@@ -510,27 +408,28 @@ fn squashing_into_an_embargoed_merge_keeps_the_embargo() {
     r.ok(&["describe", "-m", "SQUASHED-DESC-9097"]);
     r.ok(&["squash"]);
     assert!(r.cat("main", "parser.py").contains("SQUASHED-IN-9096"));
-    assert_outsider_blind(&r, "SQUASHED-IN-9096");
-    assert_outsider_blind(&r, "SQUASHED-DESC-9097");
-    assert_embargo_holds(&r);
+    assert_withheld(&r, &["SQUASHED-IN-9096", "SQUASHED-DESC-9097"]);
 }
 
-// Scenario from jj test_abandon, on an embargoed merge: abandoning it leaves nothing readable behind.
+// Scenario from jj test_abandon, on an embargoed merge: abandoning it publishes nothing of the fix.
+// Unlike jj, the abandon is refused while a change (here the working copy) is built on the
+// merge: rebased onto its parents, that change would merge the fix with nothing withholding
+// it (BUG-943). With the working copy moved off it, the abandon goes through.
 #[test]
 fn abandoning_an_embargoed_merge_leaks_nothing() {
     let env = Env::new();
     let r = embargoed(&env);
     let before = r.sid("main-");
     let m = r.cid("main");
+    let err = r.fails(&["abandon", &m]);
+    assert!(err.contains("embargoed merge") && err.contains("vl embargo release"), "{err}");
+    r.ok(&["new", &before]);
     r.ok(&["abandon", &m]);
-    // jj semantics: the child now merges both former parents; main moved to the first.
+    // jj semantics: main moved to the abandoned merge's first parent.
     assert_eq!(r.tag_target("main"), Some(before));
-    assert_embargo_holds(&r);
     let mirror = push_public(&r, &["main"]);
     assert!(store_contains(&mirror, FIX_MARK.as_bytes()).is_empty());
-    for n in [FIX_MARK, "FIX-DESC-9091"] {
-        assert!(r.outsider_reads(n).is_empty());
-    }
+    assert!(store_contains(&mirror, b"FIX-DESC-9091").is_empty());
 }
 
 // Scenario from jj test_undo, on an embargoed merge: undo restores the pre-merge state exactly.
@@ -540,7 +439,7 @@ fn undoing_an_embargoed_merge_restores_the_previous_state() {
     let r = env.repo("p");
     r.commit("parser", &[("parser.py", "v1\n")]);
     r.tag("main", "@-");
-    r.ok(&["ws", "new", "fix", "-r", "main", "--cloak", "team"]);
+    r.ok(&["ws", "new", "fix", "-r", "main"]);
     r.ok(&["ws", "switch", "fix"]);
     r.write("parser.py", "v1\nUNDO-FIX-9098\n");
     r.ok(&["ws", "switch", "default"]);
@@ -549,30 +448,6 @@ fn undoing_an_embargoed_merge_restores_the_previous_state() {
     r.ok(&["undo"]);
     assert_eq!(r.state(), before);
     assert_eq!(r.read("parser.py"), "v1\n");
-    assert_outsider_blind(&r, "UNDO-FIX-9098");
-}
-
-// Scenario from git t6427 (conflict) on an embargoed line: markers in the file, no conflict list in public metadata.
-#[test]
-fn conflict_on_an_embargoed_line_is_not_recorded_in_metadata() {
-    let env = Env::new();
-    let r = embargoed(&env);
-    // A public change on main's first parent that touches the fixed line.
-    r.ok(&["new", "main-"]);
-    r.write("parser.py", "def parse(buf):\n    return buf[1]\n");
-    r.ok(&["describe", "-m", "conflicting public edit"]);
-    let side = r.cid("@");
-    r.ok(&["new", "main"]);
-    let out = r.ok(&["merge", &side[..12], "-m", "combine"]);
-    assert!(out.contains("conflict"), "{out}");
-    let m = r.snap("@-");
-    assert!(
-        m.conflicts.is_empty(),
-        "conflicted paths published in metadata: {:?}",
-        m.conflicts
-    );
-    assert!(r.read("parser.py").contains("<<<<<<<"));
-    assert_embargo_holds(&r);
 }
 
 // Scenario from jj test_rewrite (change ids): a change id survives every rewrite, cloaked or not.
@@ -580,19 +455,19 @@ fn conflict_on_an_embargoed_line_is_not_recorded_in_metadata() {
 fn change_ids_survive_every_rewrite_of_a_cloaked_change() {
     let env = Env::new();
     let r = cloaked_fork(&env, "L\n", "R\n");
-    r.commit("on right", &[("secret/k.txt", "R2\n")]);
+    r.commit("on right", &[("secret/.env.k", "R2\n")]);
     let c = r.cid("@-");
     r.ok(&["describe", "-r", &c[..12], "-m", "renamed"]);
     r.ok(&["rebase", "-s", "right", "-d", "left"]);
     r.ok(&["edit", &c[..12]]);
-    r.write("secret/k.txt", "R3\n");
+    r.write("secret/.env.k", "R3\n");
     r.ok(&["new"]);
     r.ok(&["squash", "-r", &c[..12]]);
     // After squashing, c is folded into `right` (which keeps its own id).
     assert!(r.try_snap(&c[..12]).is_none());
     let right = r.snap("right");
-    assert_eq!(r.cat("right", "secret/k.txt"), "R3\n");
-    assert!(is_cloaked(&r.visibility("right", "secret/k.txt")));
+    assert_eq!(r.cat("right", "secret/.env.k"), "R3\n");
+    assert!(is_cloaked(&r.visibility("right", "secret/.env.k")));
     assert_eq!(right.description.as_deref(), Some("right\n\nrenamed"));
 }
 
@@ -606,7 +481,7 @@ fn undo_of_a_cloaked_conflict_merge_restores_everything() {
     r.ok(&["merge", "left"]);
     r.ok(&["undo"]);
     assert_eq!(r.state(), before);
-    assert_eq!(r.read("secret/k.txt"), "UNDO-R-2\n");
+    assert_eq!(r.read("secret/.env.k"), "UNDO-R-2\n");
     assert_no_leak(&r, "UNDO-L-1");
 }
 
@@ -621,7 +496,7 @@ fn non_member_diff_show_and_log_of_a_cloaked_merge_reveal_nothing() {
         "line1\nNM-RIGHT-7272\nline3\n",
     );
     r.ok(&["merge", "left", "-m", "merge of cloaked edits"]);
-    r.write("secret/k.txt", "NM-RESOLVED-7373\n");
+    r.write("secret/.env.k", "NM-RESOLVED-7373\n");
     r.ok(&["squash"]);
     r.tag("main", "@-");
     let team = env.root.join("team-remote");
@@ -652,36 +527,8 @@ fn non_member_diff_show_and_log_of_a_cloaked_merge_reveal_nothing() {
         seen.contains("content hidden") || seen.contains("redacted"),
         "{seen}"
     );
-    if bob.exists("secret/k.txt") {
-        let on_disk = bob.read("secret/k.txt");
+    if bob.exists("secret/.env.k") {
+        let on_disk = bob.read("secret/.env.k");
         assert!(!on_disk.contains("NM-"), "{on_disk}");
     }
-}
-
-// BUG-243 / BUG-251 (merge wave): a cloaked change rebased into a file/directory conflict holds the
-// public file moved aside to `NAME~ours`; as a path the cloaked line introduces, it is sealed.
-#[test]
-fn file_moved_aside_in_a_cloaked_rebase_is_sealed() {
-    let env = Env::new();
-    let r = env.repo("p");
-    r.commit("base", &[("x", "file\n")]);
-    r.tag("base", "@-");
-    r.ok(&["ws", "new", "sec", "-r", "base", "--cloak", "team"]);
-    r.ok(&["ws", "switch", "sec"]);
-    r.rm("x");
-    r.write("x/inner.txt", "dir content\n");
-    r.ok(&["commit", "--no-advance", "-m", "cloaked dir"]);
-    r.tag("c", "@-");
-    assert_eq!(r.snap("c").cloak.as_deref(), Some("team"));
-    r.ok(&["ws", "switch", "default"]);
-    r.ok(&["new", "base"]);
-    r.write("x", "edited\n");
-    r.ok(&["commit", "--no-advance", "-m", "public edit"]);
-    r.tag("p", "@-");
-    r.ok(&["rebase", "-s", "c", "-d", "p"]);
-    let s = r.snap("c");
-    assert!(s.conflicts.contains(&"x~ours".to_string()), "{s:?}");
-    assert_eq!(r.cat("c", "x~ours"), "edited\n");
-    assert_eq!(r.cat("c", "x/inner.txt"), "dir content\n");
-    assert!(is_cloaked(&r.visibility("c", "x~ours")), "moved-aside file public on a cloaked line");
 }

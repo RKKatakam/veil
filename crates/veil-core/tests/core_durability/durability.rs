@@ -9,8 +9,7 @@
 use std::sync::{Arc, Mutex};
 
 use veil_core::{
-    lock::{LockInfo, RepoLock, LOCK_PATH},
-    now_millis, remote,
+    repo::REPO_FORMAT, remote,
     vfs::{DirEntry, Metadata},
     DiskBackend, Identity, MemoryBackend, ObjectId, Repo, Result, StorageBackend, VPath,
 };
@@ -26,6 +25,19 @@ enum Call {
     Barrier,
     Rename(String),
     CreateNew(String),
+    /// `stage_unsynced` (path), `publish_unsynced` (new name).
+    Staged(String),
+    Published(String),
+}
+
+/// The operation file named (written, or a staged one renamed).
+fn is_op(c: &Call) -> bool {
+    matches!(c, Call::Write(p) | Call::Published(p) if p.starts_with(".veil/ops/"))
+}
+
+/// The head file named (format 6: created, or a staged one renamed).
+fn is_head(c: &Call) -> bool {
+    matches!(c, Call::CreateNew(p) | Call::Published(p) if p.starts_with(".veil/op_heads/"))
 }
 
 /// Records every mutation, in order.
@@ -68,6 +80,14 @@ impl StorageBackend for Recorder {
         self.calls.lock().unwrap().push(Call::Rename(to.to_string()));
         self.inner.rename_unsynced(from, to)
     }
+    fn stage_unsynced(&self, path: &VPath, data: &[u8]) -> Result<()> {
+        self.calls.lock().unwrap().push(Call::Staged(path.to_string()));
+        self.inner.stage_unsynced(path, data)
+    }
+    fn publish_unsynced(&self, from: &VPath, to: &VPath) -> Result<()> {
+        self.calls.lock().unwrap().push(Call::Published(to.to_string()));
+        self.inner.publish_unsynced(from, to)
+    }
     fn remove_file(&self, path: &VPath) -> Result<()> {
         self.inner.remove_file(path)
     }
@@ -96,17 +116,19 @@ impl StorageBackend for Recorder {
 
 /// Formats ≤ 5: objects are written unsynced, then one barrier, then the
 /// operation, then the head; no unsynced write follows the barrier.
-/// Format 6: objects are written unsynced into the transaction's staging
-/// directory, one barrier, renamed into place, a second barrier, then the
-/// operation and its head file.
+/// Format 6: the objects, the operation and its (empty) head file are
+/// staged in the transaction's directory; one barrier; the objects renamed
+/// into place; a barrier; the operation renamed into place; a barrier; the
+/// head renamed into place; a barrier. Each name becomes durable only
+/// after everything it depends on did.
 fn assert_ordered(calls: &[Call], what: &str, format: u32) {
+    if format >= 6 {
+        return assert_ordered_staged(calls, what);
+    }
     let pos = |pred: &dyn Fn(&Call) -> bool| calls.iter().position(pred);
     let op = pos(&|c| matches!(c, Call::Write(p) if p.starts_with(".veil/ops/")))
         .unwrap_or_else(|| panic!("{what}: no op written: {calls:?}"));
-    let head = match format {
-        6 => pos(&|c| matches!(c, Call::CreateNew(p) if p.starts_with(".veil/op_heads/"))).expect("head file created"),
-        _ => pos(&|c| matches!(c, Call::Write(p) if p == ".veil/op_head")).expect("head written"),
-    };
+    let head = pos(&|c| matches!(c, Call::Write(p) if p == ".veil/op_head")).expect("head written");
     let barrier = calls[..op]
         .iter()
         .rposition(|c| *c == Call::Barrier)
@@ -114,21 +136,6 @@ fn assert_ordered(calls: &[Call], what: &str, format: u32) {
     let unsynced: Vec<usize> = (0..calls.len()).filter(|i| matches!(calls[*i], Call::Unsynced(_))).collect();
     assert!(!unsynced.is_empty(), "{what}: objects were written durably one by one");
     assert!(barrier < op && op < head, "{what}: order is objects, barrier, op, head: {calls:?}");
-    if format == 6 {
-        let renames: Vec<usize> = (0..calls.len()).filter(|i| matches!(calls[*i], Call::Rename(_))).collect();
-        let first_barrier = calls.iter().position(|c| *c == Call::Barrier).unwrap();
-        assert!(!renames.is_empty(), "{what}: nothing published: {calls:?}");
-        assert!(unsynced.iter().all(|i| *i < first_barrier), "{what}: unsynced write after the staging barrier: {calls:?}");
-        assert!(renames.iter().all(|i| *i > first_barrier && *i < barrier), "{what}: renames between the barriers: {calls:?}");
-        for c in calls {
-            match c {
-                Call::Unsynced(p) => assert!(p.starts_with(".veil/objects/incoming/tx-"), "{what}: staged outside the transaction's directory ({p})"),
-                Call::Rename(p) => assert!(p.starts_with(".veil/objects/") && !p.contains("incoming"), "{what}: renamed to {p}"),
-                _ => {}
-            }
-        }
-        return;
-    }
     assert!(unsynced.iter().all(|i| *i < barrier), "{what}: unsynced write after the barrier: {calls:?}");
     for c in calls {
         if let Call::Unsynced(p) = c {
@@ -137,14 +144,41 @@ fn assert_ordered(calls: &[Call], what: &str, format: u32) {
     }
 }
 
+/// [`assert_ordered`] for formats 6 and later (staged transactions).
+fn assert_ordered_staged(calls: &[Call], what: &str) {
+    let pos = |pred: &dyn Fn(&Call) -> bool| calls.iter().position(pred).unwrap_or_else(|| panic!("{what}: {calls:?}"));
+    let barrier_after = |i: usize| i + 1 + calls[i + 1..].iter().position(|c| *c == Call::Barrier).unwrap_or_else(|| panic!("{what}: no barrier after call {i}: {calls:?}"));
+    let op = pos(&is_op);
+    let head = pos(&is_head);
+    let staged: Vec<(usize, &String)> = calls.iter().enumerate().filter_map(|(i, c)| match c {
+        Call::Staged(p) => Some((i, p)),
+        _ => None,
+    }).collect();
+    assert!(staged.len() > 2, "{what}: objects were written durably one by one: {calls:?}");
+    assert!(staged.iter().all(|(_, p)| p.starts_with(".veil/objects/incoming/tx-")), "{what}: staged outside the transaction's directory: {calls:?}");
+    assert!(staged.iter().any(|(_, p)| p.ends_with("/operation")) && staged.iter().any(|(_, p)| p.ends_with("/head")), "{what}: the operation and its head are staged: {calls:?}");
+    // The staged contents, then one barrier.
+    let first = barrier_after(staged.last().unwrap().0);
+    assert!(calls[..first].iter().all(|c| !matches!(c, Call::Published(_) | Call::Rename(_))), "{what}: a name before the first barrier: {calls:?}");
+    // The objects' names, then a barrier.
+    let objects: Vec<usize> = (0..calls.len()).filter(|i| matches!(&calls[*i], Call::Published(p) if p.starts_with(".veil/objects/"))).collect();
+    assert!(!objects.is_empty(), "{what}: no object published: {calls:?}");
+    assert!(objects.iter().all(|i| *i > first), "{what}: {calls:?}");
+    let second = barrier_after(*objects.last().unwrap());
+    // The operation's name, a barrier, the head's name, a barrier.
+    assert!(op > second, "{what}: the operation is named after its objects are durable: {calls:?}");
+    let third = barrier_after(op);
+    assert!(head > third, "{what}: the head is named after its operation is durable: {calls:?}");
+    barrier_after(head);
+    assert!(calls.iter().all(|c| !matches!(c, Call::Unsynced(p) | Call::Write(p) if p.starts_with(".veil/objects/") || p.starts_with(".veil/ops/"))), "{what}: {calls:?}");
+}
+
 #[test]
 fn transactions_sync_objects_once_before_the_operation() {
     let tmp = tempfile::tempdir().unwrap();
     for (n, (format, inner)) in [
-        (5, Arc::new(MemoryBackend::new()) as Arc<dyn StorageBackend>),
-        (5, Arc::new(DiskBackend::new(tmp.path().join("5"))) as Arc<dyn StorageBackend>),
-        (6, Arc::new(MemoryBackend::new()) as Arc<dyn StorageBackend>),
-        (6, Arc::new(DiskBackend::new(tmp.path().join("6"))) as Arc<dyn StorageBackend>),
+        (REPO_FORMAT, Arc::new(MemoryBackend::new()) as Arc<dyn StorageBackend>),
+        (REPO_FORMAT, Arc::new(DiskBackend::new(tmp.path().join("8"))) as Arc<dyn StorageBackend>),
     ]
     .into_iter()
     .enumerate()
@@ -163,7 +197,7 @@ fn transactions_sync_objects_once_before_the_operation() {
         repo.snapshot_workspace("default", &*inner).unwrap();
         assert_ordered(&rec.take(), "snapshot", format);
         let (c, _) = repo.commit_working_copy("default", "c").unwrap();
-        repo.set_tag("main", c, None, false).unwrap();
+        repo.set_tag("main", c, false).unwrap();
 
         // Pull into a fresh clone: the copied objects go through the barrier too.
         let clone_fs = Arc::new(Recorder {
@@ -229,55 +263,6 @@ fn walkdir(dir: &std::path::Path) -> Vec<String> {
         }
     }
     out
-}
-
-/// After a power loss the lock of the dead holder is still on disk, and some
-/// of its unsynced objects are torn. Taking the lock over removes exactly
-/// those, so the next transaction rewrites them instead of trusting them.
-#[test]
-#[cfg(unix)]
-fn taking_over_a_crashed_lock_discards_torn_objects() {
-    let tmp = tempfile::tempdir().unwrap();
-    let fs: Arc<dyn StorageBackend> = Arc::new(DiskBackend::new(tmp.path()));
-    let id = Identity::generate("alice");
-    // The unsynced-object protocol and its recovery: formats ≤ 5 (and
-    // network remotes); format 6 stages objects instead.
-    let mut repo = Repo::init_for_clone_at(fs.clone(), Some(id.clone()), "alice", 5).unwrap();
-    let good = repo.store().put(&veil_core::object::Object::Blob(b"kept".to_vec())).unwrap();
-    let torn = ObjectId::hash(b"some object the dead holder was writing");
-    let torn_path = p(&format!(".veil/objects/{}/{}", &torn.hex()[..2], &torn.hex()[2..]));
-    fs.write(&torn_path, b"").unwrap();
-
-    // A dead process's lock, from this machine, taken just before the crash.
-    let mine = {
-        let _l = RepoLock::acquire(fs.clone()).unwrap();
-        RepoLock::holder(&*fs).unwrap().unwrap()
-    };
-    let mut child = std::process::Command::new("true").spawn().unwrap();
-    let dead = child.id();
-    child.wait().unwrap();
-    let crashed = LockInfo {
-        pid: dead,
-        token: "00".repeat(16),
-        acquired: now_millis() - 1000,
-        renewed: now_millis() - 1000,
-        ..mine
-    };
-    fs.write(&p(LOCK_PATH), &serde_json::to_vec(&crashed).unwrap()).unwrap();
-
-    let report = veil_core::fsck::fsck(fs.clone(), Some(id.clone())).unwrap();
-    assert!(report.is_ok(), "a torn unreachable object under a leftover lock is a note: {report:?}");
-
-    let tx = repo.transaction("after the crash").unwrap();
-    assert!(!fs.exists(&torn_path).unwrap(), "torn object removed");
-    assert!(repo_has(&tx, &good), "intact object kept");
-    drop(tx);
-    let report = veil_core::fsck::fsck(fs, Some(id)).unwrap();
-    assert!(report.is_ok() && report.findings.iter().all(|f| !f.message.contains("torn")), "{report:?}");
-}
-
-fn repo_has(tx: &veil_core::transaction::Transaction<'_>, id: &ObjectId) -> bool {
-    tx.repo().store().has(id)
 }
 
 /// Incompressible bytes, deterministic from `seed`.
@@ -409,10 +394,10 @@ fn many_new_objects_are_one_pack_published_before_the_operation() {
     let calls = rec.take();
     let pos = |pred: &dyn Fn(&Call) -> bool| calls.iter().position(pred).unwrap_or_else(|| panic!("{calls:?}"));
     let idx = pos(&|c| matches!(c, Call::Write(p) if p.starts_with(".veil/objects/pack/") && p.ends_with(".idx")));
-    let op = pos(&|c| matches!(c, Call::Write(p) if p.starts_with(".veil/ops/")));
-    let head = pos(&|c| matches!(c, Call::CreateNew(p) if p.starts_with(".veil/op_heads/")));
+    let op = pos(&is_op);
+    let head = pos(&is_head);
     assert!(idx < op && op < head, "{calls:?}");
-    let loose_writes = calls.iter().filter(|c| matches!(c, Call::Unsynced(p) if p.starts_with(".veil/objects/"))).count();
+    let loose_writes = calls.iter().filter(|c| matches!(c, Call::Unsynced(p) | Call::Staged(p) if p.starts_with(".veil/objects/") && !p.ends_with("/operation") && !p.ends_with("/head"))).count();
     // The root, `src`, its 7 directories and the snapshot.
     assert_eq!(loose_writes, 10, "only trees and the snapshot are loose: {calls:?}");
     let packs = dir("pack");
@@ -450,25 +435,29 @@ fn few_new_objects_stay_loose() {
     assert!(std::fs::read_dir(tmp.path().join("a/.veil/objects/pack")).map(|d| d.count()).unwrap_or(0) == 0);
 }
 
-/// BUG-800: a pull that writes packs streams each `.pack`, then issues the
-/// store's barrier, then writes the `.idx` durably, before the operation
-/// and its head; the download spool is gone afterwards.
+/// BUG-800: a pull from the Veil server writes what it receives as the
+/// server client does ([`remote::Incoming`], in the pull's transaction):
+/// it streams each `.pack`, then issues the store's barrier, then writes
+/// the `.idx` durably, before the operation and its head.
 #[test]
 fn pulled_packs_are_published_before_their_index_and_the_operation() {
     let tmp = tempfile::tempdir().unwrap();
     let id = Identity::generate("alice");
     let fs = Arc::new(DiskBackend::new(tmp.path().join("a")));
     let mut repo = Repo::init(fs.clone(), Some(id.clone()), "alice").unwrap();
-    // More objects than a pull writes loose (256).
+    // More objects than a pull writes loose (16).
     for i in 0..300 {
         fs.write(&p(&format!("src/d{}/f{i}.txt", i % 7)), &noise(i, 3000)).unwrap();
     }
     repo.snapshot_workspace("default", &*fs).unwrap();
     let (c, _) = repo.commit_working_copy("default", "c").unwrap();
-    repo.set_tag("main", c, None, false).unwrap();
-    // A pack on the remote, so that the pull downloads (spools) it.
-    let remote: Arc<dyn StorageBackend> = Arc::new(DiskBackend::new(tmp.path().join("r")));
-    remote::push(&mut repo, remote.clone(), false, &[], false).unwrap();
+    let sent: Vec<(ObjectId, Vec<u8>)> = repo
+        .store()
+        .list_objects()
+        .unwrap()
+        .into_iter()
+        .map(|o| (o, repo.store().get_raw(&o).unwrap()))
+        .collect();
 
     let rec = Arc::new(Recorder {
         inner: Arc::new(DiskBackend::new(tmp.path().join("b"))),
@@ -476,18 +465,25 @@ fn pulled_packs_are_published_before_their_index_and_the_operation() {
     });
     let mut clone = Repo::init_for_clone(rec.clone(), Some(id), "alice").unwrap();
     rec.take();
-    let report = remote::pull(&mut clone, "origin", remote).unwrap();
-    assert_eq!(report.packs_written, 1);
+    let mut tx = clone.transaction("pull from origin").unwrap();
+    tx.repository_wide();
+    let store = tx.repo().store().clone();
+    let mut incoming = remote::Incoming::new(&store);
+    for (o, raw) in sent {
+        incoming.put(o, raw, "").unwrap();
+    }
+    assert_eq!(incoming.finish().unwrap(), 1);
+    tx.view.remote_tags.insert("origin/main".into(), c);
+    tx.commit().unwrap();
     let calls = rec.take();
     let pos = |pred: &dyn Fn(&Call) -> bool| calls.iter().position(pred).unwrap_or_else(|| panic!("{calls:?}"));
     let idx = pos(&|c| matches!(c, Call::Write(p) if p.starts_with(".veil/objects/pack/") && p.ends_with(".idx")));
     let barrier = calls[..idx].iter().rposition(|c| *c == Call::Barrier).unwrap_or_else(|| panic!("no barrier before the index: {calls:?}"));
-    let op = pos(&|c| matches!(c, Call::Write(p) if p.starts_with(".veil/ops/")));
+    let op = pos(&is_op);
     assert!(barrier < idx && idx < op, "{calls:?}");
     assert!(!calls.iter().any(|c| matches!(c, Call::Write(p) | Call::Unsynced(p) if p.ends_with(".pack"))), "the pack is streamed: {calls:?}");
-    let incoming: Vec<String> = std::fs::read_dir(tmp.path().join("b/.veil/objects/incoming")).map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
-    assert!(incoming.is_empty(), "the spool and the staging are removed: {incoming:?}");
     let packs: Vec<String> = std::fs::read_dir(tmp.path().join("b/.veil/objects/pack")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
     assert_eq!(packs.len(), 2, "{packs:?}");
-    assert_eq!(clone.view().tags["main"].target, c);
+    assert_eq!(clone.view().remote_tags["origin/main"], c);
+    assert!(clone.store().has(&c));
 }

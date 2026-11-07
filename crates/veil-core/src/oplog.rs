@@ -37,17 +37,27 @@ use crate::{
 pub struct WorkspaceState {
     /// The working-copy snapshot of this workspace.
     pub wc: ObjectId,
-    /// Scope under which this workspace's line of work is cloaked.
+    /// Random, made when the workspace is created: another workspace made
+    /// later under the same name (after `vl undo` of the first one's
+    /// creation, or `vl op restore`) has another. Device-local state kept
+    /// per workspace (its `ws exec` sandbox and layers) belongs to an id,
+    /// not a name (BUG-1031, BUG-1033). Absent on workspaces made before it
+    /// existed, and dropped by an older vl that rewrites the view (whose
+    /// sandbox then starts afresh).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cloak: Option<String>,
+    pub id: Option<String>,
+}
+
+impl WorkspaceState {
+    /// A new workspace's state, with a fresh [`WorkspaceState::id`].
+    pub fn new(wc: ObjectId) -> WorkspaceState {
+        WorkspaceState { wc, id: Some(hex::encode(crate::crypto::random_bytes::<16>())) }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tag {
     pub target: ObjectId,
-    /// Cloaked tags are never pushed to public remotes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cloak: Option<String>,
     /// The annotated tag object (`veil:atag`, repository format 5) that
     /// makes this a release tag. Its `name` and `target` must equal this
     /// entry's (`Atag::verify`). Absent on every other tag, and on every
@@ -58,12 +68,8 @@ pub struct Tag {
 
 impl Tag {
     /// A tag without annotation.
-    pub fn new(target: ObjectId, cloak: Option<String>) -> Tag {
-        Tag {
-            target,
-            cloak,
-            annotation: None,
-        }
+    pub fn new(target: ObjectId) -> Tag {
+        Tag { target, annotation: None }
     }
 }
 
@@ -225,11 +231,19 @@ impl OpStore {
     }
 
     pub fn put(&self, op: &Operation) -> Result<ObjectId> {
+        let (id, raw) = self.encode(op)?;
+        self.backend.write(&Self::op_path(&id), &raw)?;
+        Ok(id)
+    }
+
+    /// `op`'s id and stored bytes, if this repository's format can record
+    /// it.
+    pub(crate) fn encode(&self, op: &Operation) -> Result<(ObjectId, Vec<u8>)> {
         let format = self.format.load(AtomicOrdering::Relaxed);
         if format < crate::object::GIT_PARITY_REPO_FORMAT && op.view.uses_format_5() {
             return Err(VeilError::Unsupported(format!(
                 "this repository is at format {format} and cannot record annotated or release tags; \
-                 upgrade it with `vl upgrade` (a remote: `vl upgrade --remote <name>`) once everyone who uses it runs vl {} or later",
+                 upgrade it with `vl upgrade` once everyone who uses it runs vl {} or later",
                 crate::repo::min_vl_for_format(crate::object::GIT_PARITY_REPO_FORMAT)
             )));
         }
@@ -241,9 +255,7 @@ impl OpStore {
             )));
         }
         let raw = serde_json::to_vec(op)?;
-        let id = ObjectId::hash(&raw);
-        self.backend.write(&Self::op_path(&id), &raw)?;
-        Ok(id)
+        Ok((ObjectId::hash(&raw), raw))
     }
 
     pub fn get(&self, id: &ObjectId) -> Result<Operation> {
@@ -264,7 +276,7 @@ impl OpStore {
         }
     }
 
-    fn uses_heads_dir(&self) -> bool {
+    pub(crate) fn uses_heads_dir(&self) -> bool {
         self.format.load(AtomicOrdering::Relaxed) >= OP_HEADS_REPO_FORMAT
     }
 
@@ -442,6 +454,30 @@ impl OpStore {
             return Ok(id);
         }
         self.backend.create_new(&Self::head_file(&id), b"")?;
+        self.retire(&id, op, stale)?;
+        Ok(id)
+    }
+
+    /// [`OpStore::publish`] of operation `id` (`op`, format 6), whose bytes
+    /// and empty head file a transaction staged (`staged_op`, `staged_head`)
+    /// and made durable with its objects, all now durable under their own
+    /// names. Two barriers, each after one name: the operation's, then the
+    /// head's. A crash leaves no head, or a head whose operation and
+    /// objects are all durable.
+    pub(crate) fn publish_staged(&self, id: &ObjectId, op: &Operation, staged_op: &VPath, staged_head: &VPath, stale: &RawHeads) -> Result<()> {
+        debug_assert!(self.uses_heads_dir());
+        self.backend.publish_unsynced(staged_op, &Self::op_path(id))?;
+        self.backend.sync_barrier()?;
+        self.backend.publish_unsynced(staged_head, &Self::head_file(id))?;
+        self.backend.sync_barrier()?;
+        self.retire(id, op, stale)
+    }
+
+    /// Remove the head files `id` replaces: its parents and the stale heads
+    /// read with them (a crash before leaves ancestors among the heads,
+    /// which readers drop).
+    fn retire(&self, id: &ObjectId, op: &Operation, stale: &RawHeads) -> Result<()> {
+        let id = *id;
         let mut gone: Vec<ObjectId> = op.parents.clone();
         gone.extend(stale.all.iter().copied());
         gone.sort();
@@ -458,7 +494,7 @@ impl OpStore {
                 self.backend.remove_file(&Self::head_path())?;
             }
         }
-        Ok(id)
+        Ok(())
     }
 
     fn raw_legacy(&self) -> Result<Option<ObjectId>> {
@@ -682,7 +718,8 @@ fn merge_views_with(base: &View, sides: &[&View], first_wins: bool, descends: &m
         let b = base.workspaces.get(name);
         let vals: Vec<Option<&WorkspaceState>> = sides.iter().map(|s| s.workspaces.get(name)).collect();
         let Some((wc, lost)) = pick(b.map(|w| w.wc), vals.iter().map(|v| v.map(|w| w.wc)).collect(), first_wins) else { continue };
-        let cloak = pick_cloak(b.map(|w| w.cloak.clone()), vals.iter().map(|v| v.map(|w| w.cloak.clone())).collect(), first_wins);
+        // The identity goes with the working copy that won.
+        let id = vals.iter().flatten().chain(b.iter()).find(|w| w.wc == wc).and_then(|w| w.id.clone());
         if !lost.is_empty() {
             out.warnings.push(format!(
                 "workspace '{name}' was moved by concurrent commands; kept {}, and the other working cop{} as visible change{}",
@@ -692,13 +729,7 @@ fn merge_views_with(base: &View, sides: &[&View], first_wins: bool, descends: &m
             ));
             losers.extend(lost);
         }
-        out.view.workspaces.insert(
-            name.clone(),
-            WorkspaceState {
-                wc,
-                cloak: cloak.unwrap_or_default(),
-            },
-        );
+        out.view.workspaces.insert(name.clone(), WorkspaceState { wc, id });
     }
     // Tags.
     let names: BTreeSet<&String> = base.tags.keys().chain(sides.iter().flat_map(|s| s.tags.keys())).collect();
@@ -728,25 +759,16 @@ fn merge_views_with(base: &View, sides: &[&View], first_wins: bool, descends: &m
             lost.push(first);
         }
         lost.retain(|t| *t != winner.0);
-        let cloak = pick_cloak(b.map(|t| t.cloak.clone()), vals.iter().map(|v| v.map(|t| t.cloak.clone())).collect(), first_wins).unwrap_or_default();
         if !lost.is_empty() {
-            let shown = match &cloak {
-                Some(_) => "a cloaked tag".to_string(),
-                None => format!("tag '{name}'"),
-            };
             out.warnings.push(format!(
-                "{shown} was moved by concurrent commands; kept {}, and the other target stays a visible change",
+                "tag '{name}' was moved by concurrent commands; kept {}, and the other target stays a visible change",
                 winner.0.short()
             ));
             losers.extend(lost);
         }
         out.view.tags.insert(
             name.clone(),
-            Tag {
-                target: winner.0,
-                cloak,
-                annotation: winner.1,
-            },
+            Tag { target: winner.0, annotation: winner.1 },
         );
     }
     // Remote tags.
@@ -783,21 +805,6 @@ fn pick<T: Copy + PartialEq>(base: Option<T>, sides: Vec<Option<T>>, first_wins:
         }
     }
     Some((first, lost))
-}
-
-/// 3-way cloak: the first changed side's, except that a cloaked value wins
-/// over an uncloaked one (`None` when every side removed the key).
-fn pick_cloak(base: Option<Option<String>>, sides: Vec<Option<Option<String>>>, first_wins: bool) -> Option<Option<String>> {
-    if first_wins {
-        if let Some(first) = sides.iter().find(|s| **s != base) {
-            return first.clone();
-        }
-    }
-    let changed: Vec<Option<String>> = sides.iter().filter(|s| **s != base).flatten().cloned().collect();
-    if changed.is_empty() {
-        return base.or_else(|| sides.into_iter().flatten().next());
-    }
-    Some(changed.iter().find(|c| c.is_some()).cloned().unwrap_or(None))
 }
 
 const PRUNED_OPS: &str = ".veil/ops_pruned";

@@ -1,6 +1,5 @@
 //! The repository generator: a realistic, seeded history built through
-//! `veil_core`'s API in-process (ephemeral workspaces, as `sftp_bench.rs`
-//! does), so 10,000 snapshots take minutes rather than hours of CLI runs.
+//! `veil_core`'s API in-process (ephemeral workspaces), so 10,000 snapshots take minutes rather than hours of CLI runs.
 //!
 //! Shape (see `docs/design/scale/9-scale-benchmark.md`):
 //! * a directory tree of fan-out up to 20 and depth up to 8;
@@ -11,9 +10,10 @@
 //!   deletions at about 2 % each, new files trickling in, a hot set of
 //!   files that changes often (blame), and a `log -S` needle;
 //! * a side branch merged every `merge_every` snapshots, 20 tags;
-//! * `.veilpolicy` cloak rules for scopes `a` and `b` over a fraction of
-//!   the files (3 %, or 85 % for `--cloaked`), and `*.env isolate`;
-//! * a `release` line with a cloaked fix line of 50 snapshots, merged into
+//! * `.veilpolicy` access lines for groups `a` and `b` over a fraction of
+//!   the files (3 %, or 85 % for `--cloaked`, a historical name: only
+//!   secret files are ever encrypted), and `*.env isolate`;
+//! * a `release` line with a fix line of 50 snapshots, merged into
 //!   `release` under an unreleased embargo (through the CLI afterwards:
 //!   see `run::setup_embargo`).
 //!
@@ -46,12 +46,11 @@ pub struct Profile {
     pub tags: usize,
     /// Extra large binaries (bytes each).
     pub big_binaries: Vec<u64>,
-    /// Fraction of the files under `cloak` rules.
+    /// Fraction of the files under access lines for groups `a` and `b`.
     pub cloaked: f64,
-    /// What the server accepts (`--plain`): no cloak rules, no `isolate`
-    /// rule and no cloaked fix line (the server refuses cloaked lines and
-    /// embargoes, `docs/HUB.md` §13.8; the simplification pass removes
-    /// cloaking).
+    /// What the server accepts (`--plain`): no access lines, no `isolate`
+    /// rule and no fix line (the server does not run embargoes yet,
+    /// `docs/HUB.md` §13.8).
     pub plain: bool,
 }
 
@@ -237,7 +236,7 @@ fn plan(p: &Profile, seed: u64) -> Layout {
 }
 
 /// Pick disjoint subtrees until about `fraction` of the files are under
-/// cloak rules, alternating scopes `a` and `b`.
+/// access lines, alternating groups `a` and `b`.
 fn plan_cloak(rng: &mut Rng, dirs: &[String], files: &[File], fraction: f64) -> Vec<(String, &'static str)> {
     let want = (files.len() as f64 * fraction) as usize;
     let under = |d: &str| {
@@ -350,7 +349,7 @@ pub fn generate(p: &Profile, seed: u64, root: &Path, home: &Path, pack_every: us
         policy.push_str("\n# veil-bench\n*.env isolate\n");
     }
     for (d, s) in &layout.cloak_rules {
-        policy.push_str(&format!("{d}/ cloak {s}\n"));
+        policy.push_str(&format!("{d}/ {s}\n"));
     }
     let chunk = 2000usize;
     let chunks = import.len().div_ceil(chunk).max(1);
@@ -399,7 +398,7 @@ pub fn generate(p: &Profile, seed: u64, root: &Path, home: &Path, pack_every: us
         if let Some((btip, _, at, _)) = &branch {
             if step >= *at {
                 let mut tx = repo.transaction("merge branch")?;
-                let id = tx.new_change(vec![tip, *btip], &format!("Merge branch at step {step}"), None)?;
+                let id = tx.new_change(vec![tip, *btip], &format!("Merge branch at step {step}"))?;
                 tx.commit()?;
                 all.push(id);
                 tip = id;
@@ -533,7 +532,7 @@ pub fn generate(p: &Profile, seed: u64, root: &Path, home: &Path, pack_every: us
             mainline.push(tip);
             if step.is_multiple_of(tag_every) && tags.len() < p.tags {
                 let name = format!("rel-{:03}", tags.len() + 1);
-                repo.set_tag(&name, tip, None, false)?;
+                repo.set_tag(&name, tip, false)?;
                 tags.push((name, step));
             }
             if step >= release_at && release_base.is_none() {
@@ -565,7 +564,7 @@ pub fn generate(p: &Profile, seed: u64, root: &Path, home: &Path, pack_every: us
         tip = commit_ws(&mut repo, &ws, "late files", &mut all)?;
         mainline.push(tip);
     }
-    repo.set_tag("main", tip, None, false)?;
+    repo.set_tag("main", tip, false)?;
 
     // ---- the release line and the cloaked fix line ------------------------
     let mut rtip = release_base.unwrap_or(tip);
@@ -580,7 +579,7 @@ pub fn generate(p: &Profile, seed: u64, root: &Path, home: &Path, pack_every: us
         ws.write(&path, content::edit_text(&mut Rng::fork(seed, 900_000 + k), &data, ext, None))?;
         rtip = commit_ws(&mut repo, &ws, &format!("release fix {k}"), &mut all)?;
     }
-    repo.set_tag("release", rtip, None, false)?;
+    repo.set_tag("release", rtip, false)?;
     let mut ftip = None;
     if !p.plain {
         ftip = Some(fix_line(&mut repo, &mut rng, seed, rtip, &hot, &live, &layout, &mut all)?);
@@ -627,7 +626,7 @@ pub fn generate(p: &Profile, seed: u64, root: &Path, home: &Path, pack_every: us
         "most_edited_edits": most_edited.1,
         "renamed_away": old_path,
         "needle": needle,
-        "cloak_rules": layout.cloak_rules.iter().map(|(d, s)| format!("{d}/ cloak {s}")).collect::<Vec<_>>(),
+        "access_lines": layout.cloak_rules.iter().map(|(d, s)| format!("{d}/ {s}")).collect::<Vec<_>>(),
         "main": tip.hex(),
         "release": rtip.hex(),
         "fix_tip": ftip.map(|f| f.hex()),
@@ -642,17 +641,15 @@ pub fn generate(p: &Profile, seed: u64, root: &Path, home: &Path, pack_every: us
     Ok(Generated { manifest })
 }
 
-/// The cloaked fix line: 50 snapshots in workspace `fix-sec` (scope
-/// `team`) on top of `release`, merged later under an embargo
-/// (`run::setup`). Its tip.
+/// The fix line: 50 snapshots in workspace `fix-sec` on top of
+/// `release`, merged later under an embargo (`run::setup`). Its tip.
 #[allow(clippy::too_many_arguments)]
 fn fix_line(repo: &mut Repo, rng: &mut Rng, seed: u64, rtip: ObjectId, hot: &[String], live: &Live, layout: &Layout, all: &mut Vec<ObjectId>) -> Result<ObjectId> {
     let paths = hot.to_vec();
-    let fix_base = repo.create_workspace("fix-sec", vec![rtip], Some("team".into()))?;
+    let fix_base = repo.create_workspace("fix-sec", vec![rtip])?;
     all.push(fix_base);
     let mut ftip = fix_base;
-    // The fix touches public files only: an embargo for `team` refuses a
-    // merge that changes files cloaked under another scope.
+    // The fix touches files outside the access lines only.
     let public: Vec<String> = live
         .text_paths()
         .into_iter()

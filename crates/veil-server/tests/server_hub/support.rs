@@ -64,6 +64,9 @@ impl TestHub {
             data_dir: dir.path().join("data"),
             session_ttl: ttl,
             db_connections: 16,
+            // Tests count their own derive runs; `derived.rs` checks the
+            // start-up catch-up by calling it.
+            catch_up_at_start: false,
         };
         let running = rt.block_on(veil_server::start(config)).expect("server starts");
         let ca = dir.path().join("data/self-signed-cert.pem");
@@ -627,7 +630,6 @@ impl<'a> Craft<'a> {
             size: 1,
             executable: false,
             visibility: vis,
-            fallback: None,
         };
         self.root = self.set_at("", Some(self.root), &parts, entry);
     }
@@ -665,7 +667,6 @@ impl<'a> Craft<'a> {
             timestamp: veil_core::now_millis(),
             predecessors: vec![],
             conflicts: vec![],
-            cloak: None,
             embargo: None,
             signature: None,
         };
@@ -690,7 +691,6 @@ impl Craft<'_> {
             timestamp: veil_core::now_millis(),
             predecessors: vec![],
             conflicts: vec![],
-            cloak: None,
             embargo: None,
             signature: None,
         };
@@ -712,7 +712,6 @@ impl Craft<'_> {
             timestamp: veil_core::now_millis(),
             predecessors: vec![],
             conflicts: vec![],
-            cloak: None,
             embargo: None,
             signature: None,
         };
@@ -778,7 +777,6 @@ impl Craft<'_> {
             size,
             executable: false,
             visibility: Visibility::Public,
-            fallback: None,
         };
         self.root = self.set_at("", Some(self.root), &parts, entry);
     }
@@ -805,7 +803,6 @@ impl Craft<'_> {
             timestamp: veil_core::now_millis(),
             predecessors: vec![],
             conflicts: vec![],
-            cloak: None,
             embargo: None,
             signature: None,
         };

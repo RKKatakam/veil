@@ -14,17 +14,16 @@ use adversarial_support::*;
 use veil_core::{
     crypto::{random_key, Envelope},
     identity::{parse_public_identity, wrap_key, wrap_key_legacy, HpkeWrappedKey, WrappedKey, HPKE_SUITE},
-    keychain::{current_key_has_legacy_wraps, KeyRing, MemberGrant, RingChange, RingOp, Role},
+    keychain::{KeyRing, MemberGrant, RingChange, RingOp, Role},
     object::Object,
-    remote,
     upgrade::{upgrade, UpgradeOptions, JOURNAL_PATH},
     Identity, MemoryBackend, Repo, StorageBackend,
 };
 
-/// A repository at `format` for `id`, with a `team` scope `id` administers.
-fn repo_at(format: u32, id: &Identity) -> (Repo, Arc<MemoryBackend>) {
+/// A repository for `id`, with a `team` scope `id` administers.
+fn repo_for_admin(id: &Identity) -> (Repo, Arc<MemoryBackend>) {
     let fs = Arc::new(MemoryBackend::new());
-    let repo = Repo::init_for_clone_at(fs.clone(), Some(id.clone()), &id.name, format).unwrap();
+    let repo = Repo::init_for_clone(fs.clone(), Some(id.clone()), &id.name).unwrap();
     repo.keys().create_scope("team").unwrap();
     (repo, fs)
 }
@@ -61,23 +60,18 @@ fn append_signed(repo: &Repo, scope: &str, signer: &Identity, op: RingOp) -> Key
 /// (public) signing key. The grant is accepted, and the ring's signer table
 /// (`RingState::ever_signers`, key → member) now maps Alice's key to Mallory.
 /// Every signature Alice ever made is judged "unknown key" from then on, by
-/// every reader, and Alice's timed embargoes never auto-release (only a
-/// "good" creation signature may trigger a release).
+/// every reader.
 #[test]
 fn a_grant_cannot_rebind_another_members_signing_key() {
     let alice = Identity::generate("alice");
     let mallory = Identity::generate("mallory");
-    let (mut repo, fs) = repo_at(3, &alice);
+    let (mut repo, fs) = repo_for_admin(&alice);
     commit_files(&mut repo, &*fs, &[("README.md", "hello\n")], "alice's work");
     let alices = repo.view().workspaces[WS].wc;
     let alices = repo.snapshot(&repo.snapshot(&alices).unwrap().parents[0]).unwrap();
     // Control: before the grant Alice's commit is good for a reader with no identity.
     let reader = Repo::open(fs.clone(), None, "reader").unwrap();
     assert!(reader.keys().snapshot_status(&alices).is_good());
-    let until = veil_core::now_millis() + 50;
-    let embargo = repo.keys().create_embargo("team", Some(until)).unwrap();
-    let rec = repo.keys().load_embargo(&embargo).unwrap().unwrap();
-    assert!(repo.keys().embargo_trusted(&rec), "control: Alice's record is trusted");
 
     // Mallory's "public identity": her X25519 key, Alice's signing key.
     let forged = format!("{}{}", mallory.public_hex(), alice.verifying_hex());
@@ -87,11 +81,9 @@ fn a_grant_cannot_rebind_another_members_signing_key() {
 
     let reader = Repo::open(fs.clone(), None, "reader").unwrap();
     let status = reader.keys().snapshot_status(&alices);
-    let trusted = repo.keys().embargo_trusted(&rec);
     assert!(
-        granted.is_err() || (status.is_good() && trusted),
-        "the grant of Alice's signing key to Mallory was accepted; Alice's commit is now {status:?} \
-         and her embargo record trusted = {trusted}"
+        granted.is_err() || status.is_good(),
+        "the grant of Alice's signing key to Mallory was accepted; Alice's commit is now {status:?}"
     );
 }
 
@@ -107,7 +99,7 @@ fn a_grant_cannot_rebind_another_members_signing_key() {
 fn a_forged_signing_half_does_not_let_mallory_sign() {
     let alice = Identity::generate("alice");
     let mallory = Identity::generate("mallory");
-    let (repo, _fs) = repo_at(3, &alice);
+    let (repo, _fs) = repo_for_admin(&alice);
     let forged = format!("{}{}", mallory.public_hex(), alice.verifying_hex());
     assert!(repo.keys().grant_role("team", &forged, "mallory", Role::Admin).is_err());
     let with_alices_binding = format!("{forged}{}", alice.binding_hex());
@@ -157,13 +149,13 @@ fn a_forged_signing_half_does_not_let_mallory_sign() {
 /// legacy box) refuse to wrap to it. So:
 /// * the admin can no longer revoke **anyone else** (a revocation rotates
 ///   the key to the remaining members, which include the low-order one);
-/// * `vl upgrade` to format 3 fails *after* its commit point, at
-///   `3:hpke-ring-keys`, and fails again on every resume.
+/// * `vl upgrade` fails *after* its commit point, and fails again on every
+///   resume.
 #[test]
 fn a_low_order_member_does_not_block_revocation_or_upgrade() {
     let alice = Identity::generate("alice");
     let bob = Identity::generate("bob");
-    let (repo, fs) = repo_at(2, &alice);
+    let (repo, fs) = repo_for_admin(&alice);
     repo.keys().grant("team", &bob.public_id(), "bob").unwrap();
     // A grant to the all-zero point, signed by the admin (as legacy vl
     // could make before BUG-010 was fixed). The wrap itself is irrelevant
@@ -204,49 +196,6 @@ fn a_low_order_member_does_not_block_revocation_or_upgrade() {
         "revoke bob: {:?}; upgrade: {:?}; journal left behind: {journal_left}",
         revoked.map(|_| ()),
         up.map(|r| r.steps)
-    );
-}
-
-// ---- the migration step never runs for admins of upgraded clones ---------
-
-/// A non-admin's upgrade leaves the ring alone and tells the admin to "run
-/// `vl upgrade` (or `vl scope rotate`) in an upgraded clone"; `vl upgrade
-/// --remote` says rings "move to HPKE when an admin who has upgraded their
-/// clone pushes". But an admin whose clone is *already* at format 3 (a fresh
-/// clone of the upgraded remote, or the clone a non-admin upgraded) gets
-/// "already at format 3" from `vl upgrade`: `3:hpke-ring-keys` only runs as
-/// part of a 2 → 3 transition. The scope keeps sealing new content under a
-/// key that was published under the legacy key wrap, and nothing says so.
-#[test]
-fn an_admin_upgrading_an_upgraded_clone_moves_their_rings_to_hpke() {
-    let alice = Identity::generate("alice");
-    let (mut a2, afs) = repo_at(2, &alice);
-    commit_files(&mut a2, &*afs, &[("README.md", "hi\n")], "init");
-    let main = a2.view().workspaces[WS].wc;
-    let main = a2.snapshot(&main).unwrap().parents[0];
-    a2.set_tag("main", main, None, true).unwrap();
-    // The shared remote is at format 2 and gets upgraded structurally.
-    let remote_fs = Arc::new(MemoryBackend::new());
-    drop(Repo::init_bare_at(remote_fs.clone(), 2).unwrap());
-    remote::push(&mut a2, remote_fs.clone(), false, &[], false).unwrap();
-    let r = upgrade(remote_fs.clone(), None, &UpgradeOptions::default()).unwrap();
-    assert!(r.notes.iter().any(|n| n.contains("when an admin who has upgraded their clone pushes")), "{:#?}", r.notes);
-
-    // Alice starts a fresh clone of the (now format-3) remote, as `vl clone` does.
-    let cfs = Arc::new(MemoryBackend::new());
-    let mut clone = Repo::init_for_clone_at(cfs.clone(), Some(alice.clone()), "alice", 3).unwrap();
-    remote::pull(&mut clone, "origin", remote_fs.clone()).unwrap();
-    drop(clone);
-    let r = upgrade(cfs.clone(), Some(alice.clone()), &UpgradeOptions::default()).unwrap();
-    let clone = Repo::open(cfs.clone(), Some(alice.clone()), "alice").unwrap();
-    let rg = ring(&clone, "team");
-    let st = rg.verify().unwrap();
-    assert!(
-        !current_key_has_legacy_wraps(&rg, &st),
-        "Alice (admin) ran `vl upgrade` as told; it said up_to_date = {} and scope 'team' still seals new \
-         content under a legacy-wrapped key (generation {})",
-        r.up_to_date,
-        st.generation
     );
 }
 

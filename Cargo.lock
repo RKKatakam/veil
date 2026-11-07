@@ -3053,6 +3053,7 @@ dependencies = [
  "memchr",
  "proptest",
  "regex",
+ "regex-syntax",
  "ruzstd",
  "serde",
  "serde_json",

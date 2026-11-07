@@ -21,8 +21,7 @@
 //!
 //! Format-1 to 3 repositories cannot store conflict objects: their merges
 //! still write markers into the file and list the path on the snapshot
-//! (`Snapshot::conflicts`), as before. So do merges under an unreleased
-//! embargo (whose sealed trees never hold conflict entries).
+//! (`Snapshot::conflicts`), as before.
 
 use std::collections::BTreeSet;
 
@@ -217,9 +216,6 @@ pub struct Materialized {
     /// shows (as for a file merged from those sides). What a resolution is
     /// sealed for, unless the policy or the line narrows it.
     pub visibility: Visibility,
-    /// The last public version, for a sealed result (as a merged file
-    /// would carry it).
-    pub fallback: Option<ObjectId>,
     /// The add whose (verified) sealing decided `visibility`, if sealed.
     pub winner: Option<usize>,
     /// Some side or base is not shown (unreadable here, or sealed for
@@ -238,7 +234,6 @@ struct Seen {
     verified: Option<Visibility>,
     claimed: Visibility,
     content: Option<Vec<u8>>,
-    fallback: Option<ObjectId>,
     id: ObjectId,
 }
 
@@ -248,10 +243,6 @@ impl Seen {
     }
 }
 
-fn released(store: &ObjectStore, v: &Visibility) -> bool {
-    matches!(v, Visibility::Embargoed { embargo } if store.keys.embargo_released(embargo))
-}
-
 fn see(store: &ObjectStore, t: &ConflictTerm, audience: Audience) -> Result<Seen> {
     let e = t.entry("");
     let verified = match verify_sealing(store, &e)? {
@@ -259,10 +250,9 @@ fn see(store: &ObjectStore, t: &ConflictTerm, audience: Audience) -> Result<Seen
         Sealing::Relabelled(actual) => Some(actual),
         Sealing::Unverifiable => None,
     };
-    // Plaintext only: content under an embargo, even a released one, is
-    // not shown to the public audience.
+    // Plaintext only: a sealed (secret) term is never shown to the public
+    // audience.
     let shown_to_public = matches!(verified, Some(Visibility::Public));
-    // A sealed term's fallback is an older version, never its content.
     let content = match audience {
         Audience::Public if !shown_to_public => None,
         _ => match store.read_blob(&t.id) {
@@ -275,28 +265,16 @@ fn see(store: &ObjectStore, t: &ConflictTerm, audience: Audience) -> Result<Seen
         verified,
         claimed: t.visibility.clone(),
         content,
-        fallback: t.fallback,
         id: t.id,
     })
 }
 
-/// Rank of a visibility for picking the result's audience: a scope's
-/// sealing beats an embargo's, a released embargo counts as public.
-fn rank(store: &ObjectStore, v: &Visibility) -> u8 {
-    match v {
-        Visibility::Cloaked { .. } => 2,
-        Visibility::Embargoed { embargo } if !store.keys.embargo_released(embargo) => 1,
-        _ => 0,
-    }
-}
-
 /// Is a term with (verified) visibility `v` shown in a file sealed as
-/// `result`? Public content (and a released embargo's) is shown anywhere;
-/// sealed content only in a file sealed exactly as it is (BUG-126).
-fn shown_in(store: &ObjectStore, v: Option<&Visibility>, result: &Visibility) -> bool {
+/// `result`? Public content is shown anywhere; sealed content only in a
+/// file sealed exactly as it is (BUG-126).
+fn shown_in(v: Option<&Visibility>, result: &Visibility) -> bool {
     match v {
         Some(Visibility::Public) => true,
-        Some(v) if released(store, v) => true,
         Some(v) => v == result,
         None => false,
     }
@@ -310,7 +288,6 @@ fn redaction_line(store: &ObjectStore, s: &Seen, audience: Audience, other_audie
         }
         (_, v) if !store.has(&s.id) => format!("this version ({}) is not in this repository", v.label()),
         (_, Visibility::Cloaked { scope }) => format!("this version is sealed for scope '{scope}' and you do not hold its key"),
-        (_, Visibility::Embargoed { embargo }) => format!("this version is under embargo {embargo}"),
         (_, v) => format!("this version ({}) cannot be read here", v.label()),
     };
     format!("(not shown: {why})\n").into_bytes()
@@ -359,7 +336,6 @@ pub fn materialize(store: &ObjectStore, c: &Conflict, audience: Audience) -> Res
 pub struct View {
     pub executable: bool,
     pub visibility: Visibility,
-    pub fallback: Option<ObjectId>,
     pub winner: Option<usize>,
     pub redacted: bool,
     pub unreadable_side: bool,
@@ -374,7 +350,6 @@ pub fn inspect(store: &ObjectStore, c: &Conflict, audience: Audience) -> Result<
     Ok(View {
         executable: m.executable,
         visibility: m.visibility,
-        fallback: m.fallback,
         winner: m.winner,
         redacted: m.redacted,
         unreadable_side: m.unreadable_side,
@@ -416,7 +391,6 @@ fn render(store: &ObjectStore, c: &Conflict, audience: Audience, text: bool) -> 
             content: Vec::new(),
             executable,
             visibility: Visibility::Public,
-            fallback: None,
             winner: None,
             redacted: false,
             unreadable_side,
@@ -447,7 +421,6 @@ fn render(store: &ObjectStore, c: &Conflict, audience: Audience, text: bool) -> 
             content,
             executable,
             visibility: s.vis().clone(),
-            fallback: s.fallback,
             winner: Some(kept),
             redacted: true,
             unreadable_side,
@@ -455,43 +428,18 @@ fn render(store: &ObjectStore, c: &Conflict, audience: Audience, text: bool) -> 
         });
     }
 
-    // The result's audience: the highest-ranked side's (ours first), as
+    // The result's audience: the first sealed side's (ours first), as
     // `merge::merged_visibility` decides for a merged file.
-    let mut winner: Option<usize> = None;
-    for (i, s) in adds.iter().enumerate() {
-        let Some(s) = s else { continue };
-        let r = rank(store, s.vis());
-        if r > 0 && winner.is_none_or(|w| r > rank(store, adds[w].as_ref().expect("present").vis())) {
-            winner = Some(i);
-        }
-    }
-    let (visibility, fallback) = match winner {
-        None => (Visibility::Public, None),
-        Some(w) => {
-            let ws = adds[w].as_ref().expect("present");
-            // The newest public version: a public side's, else the sealed
-            // side's own fallback.
-            let public_side = adds
-                .iter()
-                .flatten()
-                .find(|s| s.vis().is_public() && s.fallback.is_none())
-                .map(|s| s.id);
-            let fb = match ws.vis() {
-                Visibility::Cloaked { .. } => match ws.fallback {
-                    Some(_) => public_side.or(ws.fallback),
-                    None => None,
-                },
-                _ => public_side.or(ws.fallback),
-            };
-            (ws.vis().clone(), fb)
-        }
+    let winner = adds.iter().position(|s| s.as_ref().is_some_and(|s| matches!(s.vis(), Visibility::Cloaked { .. })));
+    let visibility = match winner {
+        None => Visibility::Public,
+        Some(w) => adds[w].as_ref().expect("present").vis().clone(),
     };
-    let shown = |s: &Seen| shown_in(store, s.verified.as_ref(), &visibility) && s.content.is_some();
+    let shown = |s: &Seen| shown_in(s.verified.as_ref(), &visibility) && s.content.is_some();
     let mut out = Materialized {
         content: Vec::new(),
         executable,
         visibility: visibility.clone(),
-        fallback,
         winner,
         redacted: false,
         unreadable_side,
@@ -641,7 +589,6 @@ fn describe_special(store: &ObjectStore, c: &Conflict, audience: Audience) -> Re
             content: Vec::new(),
             executable: false,
             visibility: Visibility::Public,
-            fallback: None,
             winner: None,
             redacted: false,
             unreadable_side,
@@ -653,7 +600,6 @@ fn describe_special(store: &ObjectStore, c: &Conflict, audience: Audience) -> Re
         content: Vec::new(),
         executable: t.kind == crate::object::TermKind::File && t.executable,
         visibility: s.vis().clone(),
-        fallback: t.fallback,
         winner: Some(i),
         redacted: true,
         unreadable_side,
@@ -670,7 +616,7 @@ pub fn materialize_entry(store: &ObjectStore, e: &TreeEntry, audience: Audience)
 /// entry `c`, with every version shown? Then an edit of that file is an
 /// edit of the conflict.
 pub fn publicly_renders_as(store: &ObjectStore, c: &TreeEntry, file: &TreeEntry) -> Result<bool> {
-    if !file.visibility.is_public() || file.fallback.is_some() {
+    if !file.visibility.is_public() {
         return Ok(false);
     }
     let m = match materialize_entry(store, c, Audience::Public) {
@@ -683,7 +629,7 @@ pub fn publicly_renders_as(store: &ObjectStore, c: &TreeEntry, file: &TreeEntry)
 
 /// Conflict entry `c` (at `path`) as the file of markers this reader is
 /// shown, sealed as the materialised file is: for trees that cannot hold a
-/// conflict entry (under an unreleased embargo). Refused when a version
+/// conflict entry (older formats). Refused when a version
 /// cannot be read here, which writing markers would lose.
 pub fn as_marker_file(store: &ObjectStore, c: &TreeEntry, path: &VPath) -> Result<TreeEntry> {
     // A conflict with a symlink side: its shown side, as it is
@@ -708,13 +654,11 @@ pub fn as_marker_file(store: &ObjectStore, c: &TreeEntry, path: &VPath) -> Resul
         size: m.content.len() as u64,
         executable: m.executable,
         visibility: m.visibility,
-        fallback: m.fallback,
     })
 }
 
-/// The bytes a reader sees for a file-like entry: a file's content (its
-/// fallback when this reader cannot read it, as [`ObjectStore::read_entry`])
-/// or a conflict's materialisation for this reader.
+/// The bytes a reader sees for a file-like entry: a file's content (as
+/// [`ObjectStore::read_entry`]) or a conflict's materialisation for this reader.
 ///
 /// A symlink's bytes are its target; a
 /// conflict with such a side reads as its shown side ([`shown_side`]).
@@ -943,7 +887,6 @@ impl Pick {
 
 /// `tree` with the entry at `path` replaced by `entry` (removed for
 /// `None`; directories left empty disappear, missing ones are created).
-/// Plain trees only: a tree under an embargo wrapper is refused.
 pub fn set_entry(store: &ObjectStore, tree: &ObjectId, path: &VPath, entry: Option<TreeEntry>) -> Result<ObjectId> {
     let comps: Vec<&str> = path.components().collect();
     let Some((last, dirs)) = comps.split_last() else {
@@ -951,9 +894,6 @@ pub fn set_entry(store: &ObjectStore, tree: &ObjectId, path: &VPath, entry: Opti
     };
     // Walk down, keeping each directory, then rebuild upwards.
     let mut chain: Vec<crate::object::Tree> = vec![(*store.tree_object(tree)?).clone()];
-    if crate::embargo::wrapper_parts(&chain[0]).is_some() {
-        return Err(VeilError::Policy("this change is under an unreleased embargo; edit the file to resolve the conflict".into()));
-    }
     for d in dirs {
         let next = match chain.last().expect("non-empty").get(d) {
             Some(e) if e.kind == EntryKind::Dir => (*store.tree_object(&e.id)?).clone(),
@@ -1013,7 +953,7 @@ impl crate::repo::Repo {
             return Err(VeilError::repo(match marked.is_empty() {
                 true => format!("no conflict at {} in the working copy (`vl resolve --list` lists them)", names.join(", ")),
                 false => format!(
-                    "{} holds a conflict recorded as markers in the file (by a merge in an older repository format, or under an embargo): edit the file to resolve it",
+                    "{} holds a conflict recorded as markers in the file (by a merge in an older repository format): edit the file to resolve it",
                     marked.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
                 ),
             }));
@@ -1054,7 +994,6 @@ mod tests {
             size: 0,
             executable: false,
             visibility: Visibility::Public,
-            fallback: None,
         })
     }
 

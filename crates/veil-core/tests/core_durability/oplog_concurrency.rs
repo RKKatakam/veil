@@ -99,7 +99,7 @@ fn concurrent_tag_sets_all_land() {
     let (mut repo, fs, id) = new_repo("alice");
     let base = commit_files(&mut repo, &*fs, &[("f", "1\n")], "base");
     drop(repo);
-    concurrently(&fs, &id, |r| r.set_tag("from-a", base, None, false).unwrap(), |r| r.set_tag("from-b", base, None, false).unwrap());
+    concurrently(&fs, &id, |r| r.set_tag("from-a", base, false).unwrap(), |r| r.set_tag("from-b", base, false).unwrap());
     let mut r = open(&fs, &id);
     assert!(r.view().tags.contains_key("from-a") && r.view().tags.contains_key("from-b"), "{:?}", r.view().tags.keys());
     assert_merged(&r, 2);
@@ -112,7 +112,7 @@ fn concurrent_tag_sets_all_land() {
     let ws = r.workspace_wc(WS).unwrap();
     let (x, _) = r.commit_working_copy(WS, "x").unwrap();
     drop(r);
-    concurrently(&fs, &id, |r| r.set_tag("main", x, None, true).unwrap(), |r| r.set_tag("main", ws, None, true).unwrap());
+    concurrently(&fs, &id, |r| r.set_tag("main", x, true).unwrap(), |r| r.set_tag("main", ws, true).unwrap());
     let mut r = open(&fs, &id);
     let won = r.view().tags["main"].target;
     let lost = if won == x { ws } else { x };
@@ -130,7 +130,7 @@ fn amend_racing_child_rebases_child() {
     let x = commit_files(&mut repo, &*fs, &[("f", "1\n")], "x");
     let change = repo.snapshot(&x).unwrap().change_id;
     drop(repo);
-    let (x2, side) = concurrently(&fs, &id, |r| r.describe(x, "x, amended").unwrap(), |r| r.create_workspace("side", vec![x], None).unwrap());
+    let (x2, side) = concurrently(&fs, &id, |r| r.describe(x, "x, amended").unwrap(), |r| r.create_workspace("side", vec![x]).unwrap());
     let r = open(&fs, &id);
     assert_merged(&r, 2);
     let side_now = r.workspace_wc("side").unwrap();
@@ -150,8 +150,8 @@ const FIX_NAMES: [&str; 3] = ["FIXNAME-K7", "FIXBODY-K7", "CHILDBODY-K7"];
 /// the fix that edits one of its files. Returns (v1, fix, child).
 fn fix_line(repo: &mut Repo, fs: &MemoryBackend) -> (ObjectId, ObjectId, ObjectId) {
     let v1 = commit_files(repo, fs, &[("a.c", "v\n")], "v1");
-    repo.set_tag("main", v1, None, false).unwrap();
-    repo.create_workspace("fixws", vec![v1], None).unwrap();
+    repo.set_tag("main", v1, false).unwrap();
+    repo.create_workspace("fixws", vec![v1]).unwrap();
     let ov = repo.workspace_overlay("fixws").unwrap();
     ov.write(&p("FIXNAME-K7.c"), b"FIXBODY-K7\n").unwrap();
     repo.snapshot_workspace("fixws", &ov).unwrap();
@@ -177,7 +177,7 @@ fn concurrent_rebase_cannot_escape_embargo() {
         |r| r.rebase(child, vec![v1]).unwrap(),
         |r| {
             let m = r.merge(WS, v1, vec![fix], "embargoed", Some(EmbargoSpec { scope: "team".into(), until: None })).unwrap();
-            r.set_tag("main", m.snapshot, None, true).unwrap();
+            r.set_tag("main", m.snapshot, true).unwrap();
             m.snapshot
         },
     );
@@ -200,7 +200,7 @@ fn concurrent_rebase_cannot_escape_embargo() {
     }
     // Later commands succeed and do not warn again (threat 18).
     let (c, _) = r.commit_working_copy(WS, "later").unwrap();
-    r.set_tag("later", c, None, false).unwrap();
+    r.set_tag("later", c, false).unwrap();
     assert!(open(&fs, &id).take_warnings().is_empty());
     // And a public push carries nothing of the fix.
     let mirror = Arc::new(MemoryBackend::new());
@@ -259,7 +259,7 @@ fn expected_wc_cas_supersedes() {
     let mut tx = repo.transaction("record").unwrap();
     tx.expect_wc(WS, wc);
     let blob = tx.repo().store().put(&veil_core::object::Object::Blob(b"staged by the loser".to_vec())).unwrap();
-    tx.view.tags.insert("loser".into(), Tag::new(wc, None));
+    tx.view.tags.insert("loser".into(), Tag::new(wc));
     // ...loses to an operation that moved it meanwhile.
     other.new_change(WS, vec![wc], "moved").unwrap();
     let err = tx.commit().unwrap_err();
@@ -273,8 +273,8 @@ fn expected_wc_cas_supersedes() {
     let wc = repo.workspace_wc(WS).unwrap();
     let mut tx = repo.transaction("record").unwrap();
     tx.expect_wc(WS, wc);
-    tx.view.tags.insert("winner".into(), Tag::new(wc, None));
-    open(&fs, &id).set_tag("unrelated", wc, None, false).unwrap();
+    tx.view.tags.insert("winner".into(), Tag::new(wc));
+    open(&fs, &id).set_tag("unrelated", wc, false).unwrap();
     tx.commit().unwrap();
     let r = open(&fs, &id);
     assert!(r.view().tags.contains_key("winner") && r.view().tags.contains_key("unrelated"));
@@ -426,7 +426,7 @@ fn eio_barrier_never_adopted() {
     let s_b = build(tx_b.repo());
     assert_eq!(s_a, s_b);
     tx_b.add_head(s_b).unwrap();
-    tx_b.view.tags.insert("from-b".into(), Tag::new(s_b, None));
+    tx_b.view.tags.insert("from-b".into(), Tag::new(s_b));
     // A's barrier fails: its objects are void, and nobody adopted them.
     disk.fail_next.store(true, Ordering::SeqCst);
     assert!(tx_a.commit().is_err());
@@ -436,7 +436,7 @@ fn eio_barrier_never_adopted() {
     let mut tx_b = b.transaction("B again").unwrap();
     let s_b = build(tx_b.repo());
     tx_b.add_head(s_b).unwrap();
-    tx_b.view.tags.insert("from-b".into(), Tag::new(s_b, None));
+    tx_b.view.tags.insert("from-b".into(), Tag::new(s_b));
     tx_b.commit().unwrap();
     disk.power_loss();
     let r = Repo::open(fs.clone(), Some(id.clone()), "alice").unwrap();
@@ -544,7 +544,7 @@ fn hostile_op_heads_entries_ignored() {
     fs.write(&p(&format!("{OP_HEADS_DIR}/{}/x", ObjectId::hash(b"dir").hex())), b"").unwrap();
     let mut r = open(&fs, &id);
     assert_eq!(r.heads(), [head]);
-    r.set_tag("after", head_target(&r), None, false).unwrap();
+    r.set_tag("after", head_target(&r), false).unwrap();
     let report = fsck(fs.clone(), Some(id.clone())).unwrap();
     assert!(report.is_ok(), "{:?}", report.findings);
     assert!(report.findings.iter().any(|f| f.message.contains("not a head file")), "{:?}", report.findings);
@@ -568,8 +568,8 @@ fn two_settlers_write_one_merge() {
     let (fa, fb) = (Arc::new(fs.fork()), Arc::new(fs.fork()));
     open(&fa, &id).describe(x, "x, amended").unwrap();
     let mut b = open(&fb, &id);
-    b.create_workspace("side", vec![x], None).unwrap();
-    b.set_tag("t", x, None, false).unwrap();
+    b.create_workspace("side", vec![x]).unwrap();
+    b.set_tag("t", x, false).unwrap();
     drop(b);
     land(&fs, &fa, &heads);
     land(&fs, &fb, &heads);
@@ -597,7 +597,7 @@ fn pruned_ancestry_keeps_both_heads() {
     let (mut repo, fs, id) = new_repo("alice");
     let base = commit_files(&mut repo, &*fs, &[("f", "1\n")], "base");
     drop(repo);
-    concurrently(&fs, &id, |r| r.set_tag("a", base, None, false).unwrap(), |r| r.set_tag("b", base, None, false).unwrap());
+    concurrently(&fs, &id, |r| r.set_tag("a", base, false).unwrap(), |r| r.set_tag("b", base, false).unwrap());
     // `gc --keep-ops-days` removed the operations linking the two heads.
     let heads: Vec<String> = head_files(&*fs).into_iter().collect();
     let r0 = veil_core::oplog::OpStore::new(fs.clone());
@@ -631,7 +631,7 @@ fn long_transaction_survives_gc() {
     let tree = raw_tree(tx.repo(), vec![file("old.txt", old)]);
     let s = raw_snapshot(tx.repo(), vec![tx.repo().root_id()], tree, "long");
     tx.add_head(s).unwrap();
-    tx.view.tags.insert("long".into(), Tag::new(s, None));
+    tx.view.tags.insert("long".into(), Tag::new(s));
     // Two gc runs, more than the grace period apart, while it runs.
     let now = veil_core::now_millis();
     let mut g = open(&fs, &id);
@@ -651,7 +651,7 @@ fn long_transaction_survives_gc() {
 fn mount_recording_racing_commit() {
     let (mut repo, fs, id) = new_repo("alice");
     let base = commit_files(&mut repo, &*fs, &[("f", "1\n")], "base");
-    repo.create_workspace("agent", vec![base], None).unwrap();
+    repo.create_workspace("agent", vec![base]).unwrap();
     drop(repo);
     concurrently(
         &fs,
@@ -687,12 +687,12 @@ fn exec_recording_racing_rebase_of_base() {
     let (mut repo, fs, id) = new_repo("alice");
     let first = commit_files(&mut repo, &*fs, &[("f", "1\n")], "first");
     let base = commit_files(&mut repo, &*fs, &[("g", "2\n")], "base");
-    repo.create_workspace("o", vec![first], None).unwrap();
+    repo.create_workspace("o", vec![first]).unwrap();
     let ov = repo.workspace_overlay("o").unwrap();
     ov.write(&p("o.txt"), b"other line\n").unwrap();
     repo.snapshot_workspace("o", &ov).unwrap();
     let (other, _) = repo.commit_working_copy("o", "other").unwrap();
-    let agent = repo.create_workspace("agent", vec![base], None).unwrap();
+    let agent = repo.create_workspace("agent", vec![base]).unwrap();
     // The sandbox was materialised from `agent`; meanwhile its base is
     // rebased (which moves the workspace), so the recording supersedes
     // rather than reverting the rebase, and nothing is lost.
@@ -717,7 +717,7 @@ fn release_undo_with_concurrent_commit() {
     let (v1, fix, _) = fix_line(&mut repo, &fs);
     let m = repo.merge(WS, v1, vec![fix], "embargoed", Some(EmbargoSpec { scope: "team".into(), until: None })).unwrap();
     let e = m.embargo.clone().unwrap();
-    repo.create_workspace("agent", vec![v1], None).unwrap();
+    repo.create_workspace("agent", vec![v1]).unwrap();
     drop(repo);
     // The release changes device-local and shared metadata as well as the
     // log: it runs on the disk itself, the agent's recording on a fork.
@@ -746,7 +746,7 @@ fn release_undo_with_concurrent_commit() {
 fn undo_racing_commit_keeps_commit() {
     let (mut repo, fs, id) = new_repo("alice");
     let base = commit_files(&mut repo, &*fs, &[("f", "1\n")], "base");
-    repo.create_workspace("agent", vec![base], None).unwrap();
+    repo.create_workspace("agent", vec![base]).unwrap();
     repo.set_command_workspace(Some(WS.into()));
     let c1 = commit_files(&mut repo, &*fs, &[("mine.txt", "mine\n")], "mine");
     drop(repo);
@@ -832,7 +832,7 @@ fn two_pulls_at_once() {
         src.snapshot_workspace(WS, &*src_fs).unwrap();
         src.commit_working_copy(WS, "c").unwrap()
     };
-    src.set_tag("main", c, None, false).unwrap();
+    src.set_tag("main", c, false).unwrap();
     let remote_fs: Arc<dyn StorageBackend> = Arc::new(DiskBackend::new(tmp.path().join("remote")));
     remote::push(&mut src, remote_fs.clone(), false, &[], false).unwrap();
     // One clone, two pulls at once (two processes).
@@ -871,7 +871,7 @@ fn many_threads_no_lost_operation() {
     const THREADS: usize = 8;
     const ROUNDS: usize = 6;
     for t in 0..THREADS {
-        init.create_workspace(&format!("w{t}"), vec![base], None).unwrap();
+        init.create_workspace(&format!("w{t}"), vec![base]).unwrap();
     }
     drop(init);
     let handles: Vec<_> = (0..THREADS)
@@ -887,7 +887,7 @@ fn many_threads_no_lost_operation() {
                     ov.write(&p(&format!("file-{t}")), format!("{n}\n").as_bytes()).unwrap();
                     r.snapshot_workspace(&ws, &ov).unwrap();
                     let wc = r.workspace_wc(&ws).unwrap();
-                    r.set_tag(&format!("t{t}-{n}"), wc, None, false).unwrap();
+                    r.set_tag(&format!("t{t}-{n}"), wc, false).unwrap();
                 }
             })
         })

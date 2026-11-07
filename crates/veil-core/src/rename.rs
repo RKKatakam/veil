@@ -3,10 +3,7 @@
 //!
 //! Renames are never recorded in snapshots, trees or operations; they exist
 //! only in this reader's output. Detection runs on the changes between two trees as
-//! [`crate::tree::diff_trees`] lists them, which reads trees through
-//! [`ObjectStore::tree`]: embargo wrappers are already resolved for this
-//! reader, so a non-holder never sees a rename an embargoed fix made
-//! (threat review 8).
+//! [`crate::tree::diff_trees`] lists them.
 //!
 //! 1. **Exact pass** (linear): a deleted and an added entry of the same
 //!    kind and the same object id. Sealed objects pair only with the same
@@ -15,7 +12,7 @@
 //!    only with an equal conflict id (threat review 9). Empty files never
 //!    pair (every empty file is "the same").
 //! 2. **Inexact pass**, only on files this reader reads as
-//!    [`Readable::Plain`] (never a fallback, never ciphertext): similarity
+//!    [`Readable::Plain`] (never ciphertext): similarity
 //!    is Git's span hash (chunks of a line, at most 64 bytes, hashed and
 //!    weighed by their bytes; score = shared bytes / larger size). It runs
 //!    only while `sources × destinations ≤ limit²`, each file is at most

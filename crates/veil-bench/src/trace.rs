@@ -11,9 +11,7 @@
 //!   `O_CREAT|O_EXCL`), which fails with `EEXIST` while someone holds it,
 //!   and released with `unlinkat(…, "lock")`. A command's wait is the time
 //!   from its first failed attempt to its successful one; its hold is the
-//!   time from acquisition to release. The remote's lock appears the same
-//!   way: in `vl`'s own trace for a path remote, and in the `sftp-server`
-//!   trace (`<trace>.sftp.<pid>`, written by the stand-in `ssh`) for SFTP.
+//!   time from acquisition to release.
 //!
 //! strace slows each traced syscall, so traced runs are never the timed
 //! ones: they give counts, and lock times relative to each other.
@@ -341,28 +339,15 @@ pub fn summarise_lines(lines: impl Iterator<Item = String>, snapshots: &HashSet<
     s
 }
 
-/// Summarise `trace` and its `sftp-server` siblings, then delete them.
+/// Summarise `trace`, then delete it.
 pub fn summarise_files(trace: &Path, snapshots: &HashSet<String>, local_root: &Path) -> TraceSummary {
     let mut s = TraceSummary::default();
-    let mut files = vec![trace.to_path_buf()];
-    if let (Some(dir), Some(name)) = (trace.parent(), trace.file_name().and_then(|n| n.to_str())) {
-        let prefix = format!("{name}.sftp.");
-        if let Ok(rd) = std::fs::read_dir(dir) {
-            for e in rd.flatten() {
-                if e.file_name().to_str().is_some_and(|n| n.starts_with(&prefix)) {
-                    files.push(e.path());
-                }
-            }
-        }
+    if let Ok(file) = std::fs::File::open(trace) {
+        use std::io::BufRead;
+        let lines = std::io::BufReader::new(file).lines().map_while(|l| l.ok());
+        s.merge(&summarise_lines(lines, snapshots, local_root));
     }
-    for f in files {
-        if let Ok(file) = std::fs::File::open(&f) {
-            use std::io::BufRead;
-            let lines = std::io::BufReader::new(file).lines().map_while(|l| l.ok());
-            s.merge(&summarise_lines(lines, snapshots, local_root));
-        }
-        let _ = std::fs::remove_file(&f);
-    }
+    let _ = std::fs::remove_file(trace);
     s
 }
 
