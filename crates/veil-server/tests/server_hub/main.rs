@@ -26,3 +26,4 @@ mod projects;
 mod derived;
 mod startup;
 mod caches;
+mod adversarial_s4;
