@@ -59,7 +59,7 @@ fn move_on_remote(env: &Env, theirs: &std::path::Path, remote: &std::path::Path,
     let mut r = veil_core::Repo::open_remote(std::sync::Arc::new(veil_core::DiskBackend::new(remote))).unwrap();
     assert!(r.store().has(&target), "the teammate's snapshot reached the remote");
     let mut tx = r.transaction("move a release tag").unwrap();
-    tx.view.tags.insert(name.to_string(), veil_core::oplog::Tag { target, cloak: None, annotation: None });
+    tx.view.tags.insert(name.to_string(), veil_core::oplog::Tag { target, annotation: None });
     tx.commit().unwrap();
 }
 

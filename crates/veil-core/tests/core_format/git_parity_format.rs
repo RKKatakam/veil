@@ -4,9 +4,8 @@
 //!
 //! Security properties tested here:
 //!
-//! * a sealed symlink target and a cloaked tag's
-//!   annotation (its sealed message) never reach a public remote, by any
-//!   route (property test over the secret strings);
+//! * a sealed symlink target never reaches a public remote, by any route
+//!   (property test over the secret strings);
 //! * an atag is pushed only with its tag, so an atag whose target is
 //!   withheld by an embargo stays here with it;
 //! * a forged, re-targeted or transplanted annotation is never pushed,
@@ -46,7 +45,6 @@ fn link(repo: &Repo, name: &str, kind: EntryKind, content: &str, vis: Visibility
         size: content.len() as u64,
         executable: false,
         visibility: vis,
-        fallback: None,
     }
 }
 
@@ -98,7 +96,7 @@ fn links_repo(sealed_target: &str) -> (Repo, Arc<MemoryBackend>, ObjectId, Objec
     let (mut alice, fs, _) = new_repo("alice");
     assert!(alice.format() >= 5);
     let main = commit_files(&mut alice, &*fs, &[("README", "hi\n")], "v1");
-    alice.set_tag("main", main, None, false).unwrap();
+    alice.set_tag("main", main, false).unwrap();
     let mut tree = alice.snapshot(&main).unwrap().tree;
     for (path, kind, content, vis) in [
         ("links/readme", EntryKind::Symlink, "../README", Visibility::Public),
@@ -108,7 +106,7 @@ fn links_repo(sealed_target: &str) -> (Repo, Arc<MemoryBackend>, ObjectId, Objec
         tree = put_at(&alice, tree, path, link(&alice, name, kind, content, vis));
     }
     let links = snapshot(&alice, main, tree, vec![]);
-    set_view_tag(&mut alice, "links", Tag::new(links, None));
+    set_view_tag(&mut alice, "links", Tag::new(links));
     (alice, fs, main, links)
 }
 
@@ -117,37 +115,21 @@ fn links_repo(sealed_target: &str) -> (Repo, Arc<MemoryBackend>, ObjectId, Objec
 proptest! {
     #![proptest_config(ProptestConfig { cases: 12, ..ProptestConfig::default() })]
 
-    /// Whatever the secret strings, a public push carries none of them: not
-    /// the sealed symlink target, not the
-    /// cloaked tag's sealed message (nor its atag), not a sealed message
-    /// smuggled into a non-cloaked tag's atag. A team push carries them all
-    /// (as ciphertext).
+    /// Whatever the secret string, a public push never carries the sealed
+    /// symlink target; a team push carries it as ciphertext. Annotated tags
+    /// are plain text, and go with their tag.
     #[test]
     fn a_public_push_never_carries_sealed_link_targets_or_cloaked_annotations(
         target in "/srv/[a-z]{6,12}-secret",
-        notes in "release notes [a-z]{8,16}",
     ) {
         let (mut alice, _fs, _, links) = links_repo(&target);
-        let sealed = alice.store().make_text(&notes, Some("team")).unwrap();
-        let cloaked_atag = annotate(&alice, "team-release", links, sealed.clone());
-        set_view_tag(&mut alice, "team-release", Tag { target: links, cloak: Some("team".into()), annotation: Some(cloaked_atag) });
-        // A non-cloaked tag whose atag holds a sealed message (only a bug or
-        // a hostile edit makes one): withheld from the public remote too.
-        let smuggled = annotate(&alice, "smuggled", links, sealed);
-        set_view_tag(&mut alice, "smuggled", Tag { target: links, cloak: None, annotation: Some(smuggled) });
         let public_atag = annotate(&alice, "v1.0", links, Text::Plain("public notes\n".into()));
-        set_view_tag(&mut alice, "v1.0", Tag { target: links, cloak: None, annotation: Some(public_atag) });
+        set_view_tag(&mut alice, "v1.0", Tag { target: links, annotation: Some(public_atag) });
 
         let mirror = Arc::new(MemoryBackend::new());
-        let report = remote::push(&mut alice, mirror.clone(), true, &[], false).unwrap();
-        let skipped: Vec<&str> = report.tags_skipped.iter().map(|(n, _)| n.as_str()).collect();
-        prop_assert!(skipped.contains(&"team-release") && skipped.contains(&"smuggled"), "{:?}", report.tags_skipped);
-        for secret in [target.as_bytes(), notes.as_bytes()] {
-            prop_assert!(backend_contains(&*mirror, secret).is_empty(), "{:?} reached the public mirror", String::from_utf8_lossy(secret));
-        }
+        remote::push(&mut alice, mirror.clone(), true, &[], false).unwrap();
+        prop_assert!(backend_contains(&*mirror, target.as_bytes()).is_empty(), "the sealed target reached the public mirror");
         let m = Repo::open(mirror.clone(), None, "remote").unwrap();
-        prop_assert!(!m.store().has(&cloaked_atag) && !m.store().has(&smuggled));
-        prop_assert!(!m.view().tags.contains_key("team-release") && !m.view().tags.contains_key("smuggled"));
         let v1 = &m.view().tags["v1.0"];
         prop_assert_eq!(v1.annotation, Some(public_atag));
         prop_assert!(m.store().atag(&public_atag).unwrap().verify("v1.0", &links).is_signed());
@@ -162,11 +144,8 @@ proptest! {
         let team_remote = Arc::new(MemoryBackend::new());
         remote::push(&mut alice, team_remote.clone(), false, &[], false).unwrap();
         let t = Repo::open(team_remote.clone(), None, "remote").unwrap();
-        prop_assert!(t.store().has(&cloaked_atag));
-        prop_assert_eq!(t.view().tags["team-release"].annotation, Some(cloaked_atag));
-        for secret in [target.as_bytes(), notes.as_bytes()] {
-            prop_assert!(backend_contains(&*team_remote, secret).is_empty(), "plaintext on the team remote");
-        }
+        prop_assert_eq!(t.view().tags["v1.0"].annotation, Some(public_atag));
+        prop_assert!(backend_contains(&*team_remote, target.as_bytes()).is_empty(), "plaintext on the team remote");
     }
 }
 
@@ -177,18 +156,18 @@ proptest! {
 fn an_annotation_of_embargo_withheld_history_stays_with_it() {
     let (mut alice, fs, _) = new_repo("alice");
     let main = commit_files(&mut alice, &*fs, &[("auth.rs", "fn check() -> bool { true }\n")], "v1");
-    alice.set_tag("main", main, None, false).unwrap();
-    alice.create_workspace("fix", vec![main], Some("team".into())).unwrap();
+    alice.set_tag("main", main, false).unwrap();
+    alice.create_workspace("fix", vec![main]).unwrap();
     let ov = alice.workspace_overlay("fix").unwrap();
     ov.write(&p("auth.rs"), b"fn check() -> bool { verify() }\n").unwrap();
     let fix = alice.snapshot_workspace("fix", &ov).unwrap().snapshot;
     let r = alice
         .merge(WS, main, vec![fix], "merge", Some(EmbargoSpec { scope: "team".into(), until: None }))
         .unwrap();
-    alice.set_tag("main", r.snapshot, None, false).unwrap();
+    alice.set_tag("main", r.snapshot, false).unwrap();
     const NOTES: &str = "fixes the auth bypass in check()";
     let a = annotate(&alice, "v1.2.1", fix, Text::Plain(NOTES.into()));
-    set_view_tag(&mut alice, "v1.2.1", Tag { target: fix, cloak: None, annotation: Some(a) });
+    set_view_tag(&mut alice, "v1.2.1", Tag { target: fix, annotation: Some(a) });
     let mirror = Arc::new(MemoryBackend::new());
     let report = remote::push(&mut alice, mirror.clone(), true, &[], false).unwrap();
     assert!(report.tags_skipped.iter().any(|(n, why)| n == "v1.2.1" && why.contains("embargo")), "{:?}", report.tags_skipped);
@@ -204,13 +183,13 @@ fn forged_retargeted_and_transplanted_annotations_are_never_pushed() {
     let (mut alice, _fs, main, links) = links_repo("/x");
     // Transplanted: v2's view entry names v1's genuine atag.
     let v1 = annotate(&alice, "v1", links, Text::Plain("one".into()));
-    set_view_tag(&mut alice, "v2", Tag { target: links, cloak: None, annotation: Some(v1) });
+    set_view_tag(&mut alice, "v2", Tag { target: links, annotation: Some(v1) });
     // Re-targeted: the entry moved to main, the atag still says links.
     let moved = annotate(&alice, "moved", links, Text::Plain("m".into()));
-    set_view_tag(&mut alice, "moved", Tag { target: main, cloak: None, annotation: Some(moved) });
+    set_view_tag(&mut alice, "moved", Tag { target: main, annotation: Some(moved) });
     // Missing, and not an atag at all.
-    set_view_tag(&mut alice, "gone", Tag { target: links, cloak: None, annotation: Some(ObjectId([9; 32])) });
-    set_view_tag(&mut alice, "notatag", Tag { target: links, cloak: None, annotation: Some(links) });
+    set_view_tag(&mut alice, "gone", Tag { target: links, annotation: Some(ObjectId([9; 32])) });
+    set_view_tag(&mut alice, "notatag", Tag { target: links, annotation: Some(links) });
     let r = Arc::new(MemoryBackend::new());
     let report = remote::push(&mut alice, r.clone(), false, &[], false).unwrap();
     for name in ["v2", "moved", "gone", "notatag"] {
@@ -256,10 +235,10 @@ fn a_hostile_remotes_annotations_are_checked_on_pull() {
     }
     let mut rr = Repo::open(r.clone(), None, "remote").unwrap();
     let mut tx = rr.transaction("evil").unwrap();
-    tx.view.tags.insert("v2".into(), Tag { target: links, cloak: None, annotation: Some(genuine) });
-    tx.view.tags.insert("v3".into(), Tag { target: main, cloak: None, annotation: Some(retargeted) });
-    tx.view.tags.insert("v4".into(), Tag { target: links, cloak: None, annotation: Some(forged) });
-    tx.view.tags.insert("v5".into(), Tag { target: links, cloak: None, annotation: Some(ObjectId([7; 32])) });
+    tx.view.tags.insert("v2".into(), Tag { target: links, annotation: Some(genuine) });
+    tx.view.tags.insert("v3".into(), Tag { target: main, annotation: Some(retargeted) });
+    tx.view.tags.insert("v4".into(), Tag { target: links, annotation: Some(forged) });
+    tx.view.tags.insert("v5".into(), Tag { target: links, annotation: Some(ObjectId([7; 32])) });
     tx.commit().unwrap();
     let (mut victim, _, _) = new_repo("victim");
     let report = remote::pull(&mut victim, "origin", r).unwrap();
@@ -293,7 +272,7 @@ fn gc_keeps_annotations_their_targets_and_link_objects() {
     let (mut alice, _fs, _main, links) = links_repo("/srv/x");
     let v1 = annotate(&alice, "v1.0", links, Text::Plain("one".into()));
     let mut tx = alice.transaction("tags").unwrap();
-    tx.view.tags.insert("v1.0".into(), Tag { target: links, cloak: None, annotation: Some(v1) });
+    tx.view.tags.insert("v1.0".into(), Tag { target: links, annotation: Some(v1) });
     tx.commit().unwrap();
     let opts = GcOptions {
         grace: std::time::Duration::ZERO,
@@ -322,7 +301,7 @@ fn fsck_checks_link_content() {
     let long = "x".repeat(veil_core::fsck::MAX_LINK_TARGET + 1);
     tree = put_at(&alice, tree, "bad/long", link(&alice, "long", EntryKind::Symlink, &long, Visibility::Public));
     let s = snapshot(&alice, main, tree, vec![]);
-    set_view_tag(&mut alice, "bad", Tag::new(s, None));
+    set_view_tag(&mut alice, "bad", Tag::new(s));
     let f = fsck(alice.backend().clone(), alice.identity().cloned()).unwrap();
     for (path, why) in [("bad/nul", "NUL"), ("bad/long", "over")] {
         assert!(
@@ -348,7 +327,6 @@ fn checkout_writes_links_and_the_builder_keeps_them() {
         size: 7,
         executable: false,
         visibility: Visibility::Public,
-        fallback: None,
     });
     let link_tree = put_at(&alice, file_tree, "links/readme", link(&alice, "readme", EntryKind::Symlink, "../README", Visibility::Public));
     let main_tree = alice.snapshot(&main).unwrap().tree;
@@ -407,34 +385,12 @@ fn merges_never_merge_link_targets_by_line() {
     assert!(fs.read(&p("l")).is_err());
 }
 
-/// Below format 5 nothing of this can be written, even through the API.
-#[test]
-fn format_4_repositories_refuse_links_annotations_and_link_terms() {
-    let fs = Arc::new(MemoryBackend::new());
-    let r = Repo::init_for_clone_at(fs, Some(veil_core::Identity::generate("a")), "a", 4).unwrap();
-    let e = TreeEntry {
-        name: "l".into(),
-        kind: EntryKind::Symlink,
-        id: ObjectId([1; 32]),
-        size: 1,
-        executable: false,
-        visibility: Visibility::Public,
-        fallback: None,
-    };
-    assert!(matches!(r.store().put_tree(&Tree { entries: vec![e] }), Err(VeilError::Unsupported(_))));
-    let a = Atag::annotated("v1", r.root_id(), Text::Plain(String::new()), "a", 0);
-    assert!(matches!(r.store().put_atag(&a), Err(VeilError::Unsupported(_))));
-    let t = |kind| Some(veil_core::ConflictTerm { kind, id: ObjectId([2; 32]), size: 0, executable: false, visibility: Visibility::Public, fallback: None });
-    let c = veil_core::Conflict { adds: vec![t(TermKind::Symlink), t(TermKind::File)], removes: vec![None] };
-    assert!(matches!(r.store().put_conflict(&c), Err(VeilError::Unsupported(_))));
-}
-
 /// The view fields are additive: a view without them serialises exactly as
 /// before (so format-4 operations keep their ids), with them it names them.
 #[test]
 fn view_fields_are_omitted_when_empty() {
     let mut v = veil_core::oplog::View::default();
-    v.tags.insert("main".into(), Tag::new(ObjectId([1; 32]), None));
+    v.tags.insert("main".into(), Tag::new(ObjectId([1; 32])));
     let json = serde_json::to_string(&v).unwrap();
     assert!(!json.contains("annotation"), "{json}");
     assert_eq!(json, format!(r#"{{"heads":[],"workspaces":{{}},"tags":{{"main":{{"target":"{}"}}}},"remote_tags":{{}}}}"#, "01".repeat(32)));

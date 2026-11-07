@@ -52,9 +52,9 @@ fn setup() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(repo.join("secrets")).unwrap();
     std::fs::write(repo.join("a.txt"), "hello\n").unwrap();
-    std::fs::write(repo.join("secrets/db.yml"), "password: hunter2\n").unwrap();
+    std::fs::write(repo.join("secrets/.env.prod"), "password: hunter2\n").unwrap();
     ok(&home, &repo, &["init"]);
-    ok(&home, &repo, &["cloak", "secrets/"]);
+    ok(&home, &repo, &["cloak", "secrets/.env.prod"]);
     ok(&home, &repo, &["commit", "-m", "one"]);
     std::fs::write(repo.join("a.txt"), "hello again\n").unwrap();
     ok(&home, &repo, &["commit", "-m", "two"]);

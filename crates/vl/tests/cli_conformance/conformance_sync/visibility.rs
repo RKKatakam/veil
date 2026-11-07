@@ -6,17 +6,18 @@ use std::path::{Path, PathBuf};
 use super::support::*;
 
 const CLOAKED: &str = "CLOAKED-PLAINTEXT-7781";
-const CLOAKED_MSG: &str = "Secret roadmap 5532";
+/// The sealed secret file.
+const PLAN: &str = "secrets/.env.plan";
 const ISOLATED: &str = "DB_PASSWORD=isolated-9931";
 const KEYFILE: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ\n-----END OPENSSH PRIVATE KEY-----\n";
 
-/// A repository with a cloaked file, a cloaked workspace commit with a
-/// secret description, a cloaked tag, isolated files, and a public file.
+/// A repository with a cloaked secret file, isolated files, and a public
+/// file.
 fn secretive(env: &Env) -> PathBuf {
     let proj = env.dir("proj");
     env.ok("alice", &proj, &["init"]);
-    env.ok("alice", &proj, &["cloak", "secrets/"]);
-    write(&proj, "secrets/plan.md", &format!("{CLOAKED}\n"));
+    env.ok("alice", &proj, &["cloak", PLAN]);
+    write(&proj, PLAN, &format!("{CLOAKED}\n"));
     write(&proj, "app.txt", "public app\n");
     write(&proj, ".netrc", &format!("{ISOLATED}\n"));
     write(
@@ -27,31 +28,6 @@ fn secretive(env: &Env) -> PathBuf {
     write(&proj, "keys/id_rsa", KEYFILE);
     env.ok("alice", &proj, &["commit", "-m", "public start"]);
     env.ok("alice", &proj, &["tag", "set", "main", "-r", "@-"]);
-    env.ok(
-        "alice",
-        &proj,
-        &["ws", "new", "hidden", "-r", "main", "--cloak", "team"],
-    );
-    env.ok(
-        "alice",
-        &proj,
-        &[
-            "ws",
-            "exec",
-            "hidden",
-            "-m",
-            CLOAKED_MSG,
-            "--",
-            "sh",
-            "-c",
-            "echo hidden-work > hidden.txt",
-        ],
-    );
-    env.ok(
-        "alice",
-        &proj,
-        &["tag", "set", "roadmap", "-r", "hidden@", "--cloak", "team"],
-    );
     proj
 }
 
@@ -66,8 +42,8 @@ fn push_to(env: &Env, proj: &Path, name: &str, public: bool) -> PathBuf {
     dir
 }
 
-// Veil: a public remote never receives cloaked content, cloaked descriptions, cloaked tags,
-// isolated files or key rings (README "Team remotes and public remotes").
+// Veil: a public remote never receives cloaked (secret-file) content, isolated files or key
+// rings (README "Team remotes and public remotes").
 #[test]
 fn a_public_remote_receives_none_of_the_protected_content() {
     let env = Env::new();
@@ -75,10 +51,8 @@ fn a_public_remote_receives_none_of_the_protected_content() {
     let mirror = push_to(&env, &proj, "mirror", true);
     for (needle, what) in [
         (CLOAKED, "cloaked file"),
-        (CLOAKED_MSG, "cloaked description"),
         (ISOLATED, "isolated .netrc"),
         ("BEGIN OPENSSH PRIVATE KEY", "isolated key"),
-        ("hidden-work", "cloaked workspace file"),
     ] {
         assert_absent(&mirror, needle, what);
     }
@@ -88,10 +62,6 @@ fn a_public_remote_receives_none_of_the_protected_content() {
         keyrings(&mirror)
     );
     let remote = open_repo(&mirror);
-    assert!(
-        !remote.view().tags.contains_key("roadmap"),
-        "cloaked tag pushed"
-    );
     assert!(remote.view().tags.contains_key("main"));
     assert!(
         contains(&everything_in(&mirror), "public app"),
@@ -106,7 +76,6 @@ fn a_team_remote_holds_ciphertext_and_key_rings_but_no_plaintext() {
     let proj = secretive(&env);
     let hub = push_to(&env, &proj, "origin", false);
     assert_absent(&hub, CLOAKED, "cloaked file on a team remote");
-    assert_absent(&hub, CLOAKED_MSG, "cloaked description on a team remote");
     assert_absent(&hub, ISOLATED, "isolated .netrc on a team remote");
     assert_absent(
         &hub,
@@ -114,10 +83,6 @@ fn a_team_remote_holds_ciphertext_and_key_rings_but_no_plaintext() {
         "isolated key on a team remote",
     );
     assert!(!keyrings(&hub).is_empty());
-    assert!(
-        open_repo(&hub).view().tags.contains_key("roadmap"),
-        "cloaked tags do reach team remotes"
-    );
     // A member clone reads everything back.
     let key = env.pubkey("bob");
     env.ok(
@@ -127,54 +92,21 @@ fn a_team_remote_holds_ciphertext_and_key_rings_but_no_plaintext() {
     );
     env.ok("alice", &proj, &["push"]);
     let bob = env.clone("bob", &hub, "bob");
-    assert_eq!(read(&bob, "secrets/plan.md"), format!("{CLOAKED}\n"));
+    assert_eq!(read(&bob, PLAN), format!("{CLOAKED}\n"));
     assert!(!bob.join(".netrc").exists() && !bob.join("keys/id_rsa").exists());
-    let log = env.stdout("bob", &bob, &["show", "roadmap"]);
-    assert!(log.contains(CLOAKED_MSG), "{log}");
 }
 
-// Veil: a non-member clone of a team remote sees the cloaked tag but none of the plaintext.
+// Veil: a non-member clone of a team remote learns none of the cloaked plaintext.
 #[test]
 fn a_non_member_clone_of_a_team_remote_learns_no_plaintext() {
     let env = Env::new();
     let proj = secretive(&env);
     let hub = push_to(&env, &proj, "origin", false);
     let eve = env.clone("eve", &hub, "eve");
-    assert!(!eve.join("secrets/plan.md").exists());
+    assert!(!eve.join(PLAN).exists());
     assert_absent(&eve, CLOAKED, "non-member clone");
-    assert_absent(&eve, CLOAKED_MSG, "non-member clone");
-    let out = env.ok("eve", &eve, &["show", "roadmap"]);
-    assert!(!out.contains(CLOAKED_MSG), "{out}");
-}
-
-// Scenario from git t5516 (push of a named ref) + Veil: `-t <cloaked tag>` to a public remote fails.
-#[test]
-fn pushing_a_cloaked_tag_by_name_to_a_public_remote_fails() {
-    let env = Env::new();
-    let proj = secretive(&env);
-    let mirror = env.path("mirror");
-    env.ok(
-        "alice",
-        &proj,
-        &[
-            "remote",
-            "add",
-            "mirror",
-            mirror.to_str().unwrap(),
-            "--public",
-        ],
-    );
-    let (code, out) = env.code("alice", &proj, &["push", "mirror", "-t", "roadmap"]);
-    assert_ne!(code, 0, "{out}");
-    assert!(out.contains("roadmap"), "{out}");
-    // All tags: the cloaked one is skipped and does not fail the push.
-    let (code, out) = env.code("alice", &proj, &["push", "mirror"]);
-    assert_eq!(code, 0, "{out}");
-    assert!(
-        out.contains("skipped roadmap") || out.contains("roadmap"),
-        "{out}"
-    );
-    assert_absent(&mirror, CLOAKED_MSG, "after -t");
+    let out = env.ok("eve", &eve, &["show", "main"]);
+    assert!(!out.contains(CLOAKED), "{out}");
 }
 
 // Veil: `--force` to a public remote is still filtered.
@@ -185,7 +117,6 @@ fn force_push_to_a_public_remote_is_still_filtered() {
     let mirror = push_to(&env, &proj, "mirror", true);
     env.ok("alice", &proj, &["push", "mirror", "--force"]);
     assert_absent(&mirror, CLOAKED, "forced full push");
-    assert_absent(&mirror, CLOAKED_MSG, "forced full push");
     assert!(keyrings(&mirror).is_empty());
 }
 
@@ -198,7 +129,7 @@ fn work_from_a_public_mirror_clone_does_not_delete_cloaked_files_on_the_team_rem
     let hub = push_to(&env, &proj, "origin", false);
     let mirror = push_to(&env, &proj, "mirror", true);
     let carol = env.clone("carol", &mirror, "carol");
-    assert!(!carol.join("secrets/plan.md").exists());
+    assert!(!carol.join(PLAN).exists());
     env.commit(
         "carol",
         &carol,
@@ -214,7 +145,7 @@ fn work_from_a_public_mirror_clone_does_not_delete_cloaked_files_on_the_team_rem
     assert!(out.contains("pushed main"), "{out}");
     env.ok("alice", &proj, &["pull"]);
     assert_eq!(
-        env.stdout("alice", &proj, &["cat", "secrets/plan.md", "-r", "main"]),
+        env.stdout("alice", &proj, &["cat", PLAN, "-r", "main"]),
         format!("{CLOAKED}\n")
     );
     assert_eq!(
@@ -233,7 +164,7 @@ fn pulling_from_the_public_mirror_loses_no_cloaked_content() {
     env.ok("alice", &proj, &["pull", "mirror"]);
     assert_eq!(env.tag_target("alice", &proj, "main"), before);
     assert_eq!(
-        env.stdout("alice", &proj, &["cat", "secrets/plan.md", "-r", "main"]),
+        env.stdout("alice", &proj, &["cat", PLAN, "-r", "main"]),
         format!("{CLOAKED}\n")
     );
     env.ok("alice", &proj, &["fsck"]);
@@ -266,15 +197,17 @@ fn a_public_remote_with_key_rings_from_earlier_warns() {
     );
 }
 
-// Veil: history from before a path was cloaked stays public (documented), but the new
-// version does not reach the mirror.
+// Veil: history from before a secret file was cloaked stays public (documented: it was
+// exposed with `--force`), but the new version does not reach the mirror.
 #[test]
 fn cloaking_later_keeps_old_versions_public_and_new_ones_private() {
     let env = Env::new();
-    let proj = env.project("alice", "proj", &[("notes.md", "old public notes 1111\n")]);
-    let out = env.ok("alice", &proj, &["cloak", "notes.md"]);
-    let _ = out;
-    write(&proj, "notes.md", "new private notes 2222\n");
+    let proj = env.project("alice", "proj", &[("a.txt", "a\n")]);
+    write(&proj, "deploy.pem", "old public notes 1111\n");
+    env.ok("alice", &proj, &["expose", "--force", "deploy.pem"]);
+    env.ok("alice", &proj, &["commit", "-m", "public"]);
+    env.ok("alice", &proj, &["cloak", "deploy.pem"]);
+    write(&proj, "deploy.pem", "new private notes 2222\n");
     env.ok("alice", &proj, &["commit", "-m", "now private"]);
     let mirror = push_to(&env, &proj, "mirror", true);
     let all = everything_in(&mirror);
@@ -300,16 +233,28 @@ fn a_quarantined_file_reaches_no_remote() {
     }
 }
 
-/// Alice's project with an embargoed (plaintext-line) fix merged into main.
+/// Alice's project with an embargoed fix merged into main.
 fn embargoed(env: &Env) -> PathBuf {
-    let proj = env.project(
+    let proj = before_the_fix(env);
+    merge_the_fix(env, &proj);
+    proj
+}
+
+/// Alice's project, before the fix.
+fn before_the_fix(env: &Env) -> PathBuf {
+    env.project(
         "alice",
         "proj",
         &[
             ("auth.rs", "fn check() -> bool { true }\n"),
             ("README", "hi\n"),
         ],
-    );
+    )
+}
+
+/// The fix, on workspace `fix`, merged into main under an embargo.
+fn merge_the_fix(env: &Env, proj: &Path) {
+    let proj = proj.to_path_buf();
     env.ok("alice", &proj, &["ws", "new", "fix", "-r", "main"]);
     env.ok(
         "alice",
@@ -339,7 +284,6 @@ fn embargoed(env: &Env) -> PathBuf {
             "Fix CVE 4471",
         ],
     );
-    proj
 }
 
 fn embargo_id(env: &Env, proj: &Path) -> String {
@@ -350,8 +294,8 @@ fn embargo_id(env: &Env, proj: &Path) -> String {
         .to_string()
 }
 
-// Veil: an unreleased embargo's fix and history reach neither the public mirror nor a team
-// remote (a plaintext fix line is withheld whole); after release both receive it, same ids.
+// Veil: an unreleased embargo's merge and the history it brings in reach neither the public
+// mirror nor a team remote; after release both receive it, same ids.
 #[test]
 fn an_unreleased_embargo_reaches_no_remote_and_the_release_keeps_snapshot_ids() {
     let env = Env::new();
@@ -368,7 +312,8 @@ fn an_unreleased_embargo_reaches_no_remote_and_the_release_keeps_snapshot_ids() 
             assert_absent(d, needle, "unreleased embargo");
         }
     }
-    let main_before = open_repo(&mirror).view().tags["main"].target;
+    assert!(!open_repo(&mirror).view().tags.contains_key("main"), "the embargoed main reached the mirror");
+    let main_here = open_repo(&proj).view().tags["main"].target;
     let id = embargo_id(&env, &proj);
     env.ok("alice", &proj, &["embargo", "release", &id, "--yes"]);
     env.ok("alice", &proj, &["push", "mirror"]);
@@ -379,7 +324,7 @@ fn an_unreleased_embargo_reaches_no_remote_and_the_release_keeps_snapshot_ids() 
     );
     assert_eq!(
         open_repo(&mirror).view().tags["main"].target,
-        main_before,
+        main_here,
         "same snapshot id after release"
     );
     let carol = env.clone("carol", &mirror, "carol");
@@ -414,20 +359,25 @@ fn a_tag_on_the_embargoed_fix_is_skipped_by_push() {
     assert_ne!(code, 0, "naming a held-back tag fails: {out}");
 }
 
-// Veil: a clone of the mirror pulled after the release sees the fix; one pulled before
-// sees the pre-merge tree and records nothing as deleted.
+// Veil: a clone of the mirror made before the release has the pre-merge tree; after the
+// release and a pull its work moves onto the fix and records nothing as deleted.
 #[test]
 fn a_mirror_clone_from_before_the_release_catches_up() {
     let env = Env::new();
-    let proj = embargoed(&env);
+    let proj = before_the_fix(&env);
     let mirror = push_to(&env, &proj, "mirror", true);
+    merge_the_fix(&env, &proj);
+    let out = env.ok("alice", &proj, &["push", "mirror"]);
+    assert!(out.contains("skipped main"), "{out}");
     let carol = env.clone("carol", &mirror, "carol");
     assert_eq!(read(&carol, "auth.rs"), "fn check() -> bool { true }\n");
     assert!(!carol.join("verify.rs").exists());
+    assert_absent(&mirror, "EMBARGOED-FIX-4471", "before the release");
     let id = embargo_id(&env, &proj);
     env.ok("alice", &proj, &["embargo", "release", &id, "--yes"]);
     env.ok("alice", &proj, &["push", "mirror"]);
     env.ok("carol", &carol, &["pull"]);
+    env.ok("carol", &carol, &["rebase", "-s", "@", "-d", "main"]);
     assert_eq!(read(&carol, "verify.rs"), "NEW-FILE-4471\n");
     let diff = env.ok("carol", &carol, &["diff"]);
     assert!(!diff.contains("auth.rs"), "{diff}");

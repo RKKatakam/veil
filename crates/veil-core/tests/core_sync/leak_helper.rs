@@ -15,7 +15,7 @@ fn backend_contains_sees_plaintext_inside_packs() {
     // Compressible, so zstd really changes the bytes.
     let body = "public-needle-7f3a ".repeat(200);
     let main = commit_files(&mut alice, &*fs, &[("notes.txt", body.as_str())], "v1");
-    alice.set_tag("main", main, None, false).unwrap();
+    alice.set_tag("main", main, false).unwrap();
     let mirror = Arc::new(MemoryBackend::new());
     remote::push(&mut alice, mirror.clone(), true, &[], false).unwrap();
     // Pushed objects arrive loose; gc packs them.

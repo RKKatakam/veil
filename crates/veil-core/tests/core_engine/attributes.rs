@@ -28,7 +28,7 @@ fn tree_of(repo: &Repo, files: &[(&str, &[u8])]) -> ObjectId {
     for (path, data) in files {
         fs.write(&p(path), data).unwrap();
     }
-    repo.build_from(&fs, None, None).unwrap().0
+    repo.build_from(&fs, None).unwrap().0
 }
 
 fn bytes_at(repo: &Repo, tree: &ObjectId, path: &str) -> Vec<u8> {
@@ -326,16 +326,12 @@ fn a_union_merge_never_puts_a_sealed_base_in_a_public_result() {
     let base = sealed_tree(&repo, ga, &format!("intro\n{BASE_LINE}\noutro\n"), &team());
     let ours = sealed_tree(&repo, ga, "intro\nOURS\noutro\n", &Visibility::Public);
     let theirs = sealed_tree(&repo, ga, "intro\nTHEIRS\noutro\n", &Visibility::Public);
-    for out in [
-        veil_core::merge::merge_trees(repo.store(), Some(base), ours, theirs).unwrap(),
-        veil_core::merge::merge_trees_with_markers(repo.store(), Some(base), ours, theirs).unwrap(),
-    ] {
-        let e = entry_at(&repo, &out.tree, "notes.txt").unwrap();
-        assert!(e.visibility.is_public());
-        let text = String::from_utf8(repo.store().read_entry(&e).unwrap()).unwrap();
-        assert!(!text.contains(BASE_LINE), "{text}");
-        assert!(text.contains("OURS") && text.contains("THEIRS"), "{text}");
-    }
+    let out = veil_core::merge::merge_trees(repo.store(), Some(base), ours, theirs).unwrap();
+    let e = entry_at(&repo, &out.tree, "notes.txt").unwrap();
+    assert!(e.visibility.is_public());
+    let text = String::from_utf8(repo.store().read_entry(&e).unwrap()).unwrap();
+    assert!(!text.contains(BASE_LINE), "{text}");
+    assert!(text.contains("OURS") && text.contains("THEIRS"), "{text}");
     // With a public base, union keeps both sides' lines around the base's
     // common lines.
     let pbase = sealed_tree(&repo, ga, "intro\nmiddle\noutro\n", &Visibility::Public);
@@ -495,14 +491,18 @@ fn a_megabyte_of_patterns_slows_a_snapshot_little() {
 #[test]
 fn an_outsider_with_a_sealed_gitattributes_checks_out_clean() {
     let (mut alice, fs, _) = new_repo("alice");
-    let main = commit_files(
-        &mut alice,
-        &*fs,
-        &[(".veilpolicy", ".veilattributes cloak team\n"), (".veilattributes", "*.txt eol=crlf\n"), ("a.txt", "one\ntwo\n")],
-        "v1",
-    );
-    alice.set_tag("main", main, None, false).unwrap();
-    assert_eq!(fs.read(&p("a.txt")).unwrap(), b"one\ntwo\n");
+    let v1 = commit_files(&mut alice, &*fs, &[(".veilattributes", "*.txt eol=crlf\n"), ("a.txt", "one\ntwo\n")], "v1");
+    // `.veilattributes` sealed for `team` (only a secret file is sealed
+    // through the policy: the version is stored as is, as a hostile or
+    // earlier writer could).
+    let store = alice.store();
+    let mut root = (*store.tree(&store.snapshot(&v1).unwrap().tree).unwrap()).clone();
+    let mut e = root.get(".veilattributes").unwrap().clone();
+    e.id = store.store_file(b"*.txt eol=crlf\n", &team()).unwrap();
+    e.visibility = team();
+    root.insert(e);
+    let main = raw_snapshot(&alice, vec![v1], store.put_tree(&root).unwrap(), "seal the attributes");
+    alice.set_tag("main", main, false).unwrap();
     let team_remote = Arc::new(MemoryBackend::new());
     remote::push(&mut alice, team_remote.clone(), false, &[], false).unwrap();
     // Bob holds no `team` key.
@@ -515,14 +515,14 @@ fn an_outsider_with_a_sealed_gitattributes_checks_out_clean() {
     let r = bob.checkout_tree_recorded(&wc, None, &tree, &mut rec, None).unwrap();
     assert!(r.redacted.contains(&p(".veilattributes")));
     assert_eq!(wc.read(&p("a.txt")).unwrap(), b"one\ntwo\n", "defaults apply: no conversion");
-    let (now, report) = bob.build_from_recorded(&wc, Some(tree), None, None, Some(&rec)).unwrap();
+    let (now, report) = bob.build_from_recorded(&wc, Some(tree), None, Some(&rec)).unwrap();
     assert_eq!(now, tree, "nothing to record: {report:?}");
     // Alice, a member, gets CRLF; her copy is not an edit either.
     let awc = MemoryBackend::new();
     let mut arec = Materialised::default();
     alice.checkout_tree_recorded(&awc, None, &tree, &mut arec, None).unwrap();
     assert_eq!(awc.read(&p("a.txt")).unwrap(), b"one\r\ntwo\r\n");
-    assert_eq!(alice.build_from_recorded(&awc, Some(tree), None, None, Some(&arec)).unwrap().0, tree);
+    assert_eq!(alice.build_from_recorded(&awc, Some(tree), None, Some(&arec)).unwrap().0, tree);
 }
 
 // ---- 12. first-class conflicts ----------------------------------------------------------
@@ -542,11 +542,11 @@ fn an_eol_crlf_conflict_resolves_in_an_editor_that_keeps_crlf() {
     let copy = fs.read(&p("a.txt")).unwrap();
     assert!(copy.windows(2).any(|w| w == b"\r\n") && !attributes::TextStat::of(&copy).lonelf > 0, "markers in CRLF");
     // Untouched: still the conflict.
-    let (t, _) = repo.build_from_recorded(&*fs, Some(m.tree), None, None, Some(&rec)).unwrap();
+    let (t, _) = repo.build_from_recorded(&*fs, Some(m.tree), None, Some(&rec)).unwrap();
     assert_eq!(entry_at(&repo, &t, "a.txt").unwrap().kind, EntryKind::Conflict);
     // Edited, CRLF kept: a resolution, recorded with LF.
     fs.write(&p("a.txt"), b"1\r\nRESOLVED\r\n3\r\n").unwrap();
-    let (t, _) = repo.build_from_recorded(&*fs, Some(m.tree), None, None, Some(&rec)).unwrap();
+    let (t, _) = repo.build_from_recorded(&*fs, Some(m.tree), None, Some(&rec)).unwrap();
     let e = entry_at(&repo, &t, "a.txt").unwrap();
     assert_eq!(e.kind, EntryKind::File);
     assert_eq!(repo.store().read_entry(&e).unwrap(), b"1\nRESOLVED\n3\n");
@@ -635,7 +635,7 @@ fn the_stat_cache_agrees_with_a_fresh_read() {
     assert_eq!(bytes_at(&repo, &t1, "a.txt"), b"x\ny\n");
     fs.write(&p(".veilattributes"), b"*.txt -text\n* text=auto\n").unwrap();
     let t3 = run(&mut repo, &mut cache);
-    let fresh = repo.build_from(&*fs, Some(t1), None).unwrap().0;
+    let fresh = repo.build_from(&*fs, Some(t1)).unwrap().0;
     assert_eq!(entry_at(&repo, &t3, "a.txt"), entry_at(&repo, &fresh, "a.txt"));
     assert_eq!(entry_at(&repo, &t3, "i.png"), entry_at(&repo, &t1, "i.png"));
 }

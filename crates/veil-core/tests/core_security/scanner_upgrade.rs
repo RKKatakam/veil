@@ -33,7 +33,6 @@ fn files_trusted_by_an_older_scanner_are_rescanned_once() {
         size: secret.len() as u64,
         executable: false,
         visibility: Visibility::Public,
-        fallback: None,
     });
     let tree = repo.store().put_tree(&t).unwrap();
     let wc = repo.workspace_wc(WS).unwrap();

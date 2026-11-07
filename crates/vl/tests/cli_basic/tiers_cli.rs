@@ -35,18 +35,17 @@ fn ls(env: &Env, user: &str, dir: &Path, args: &[&str]) -> BTreeMap<String, Stri
         .collect()
 }
 
-/// Alice's project: public, cloaked, isolated, executable files and a
-/// cloaked tag; a team remote and a public mirror.
+/// Alice's project: public, cloaked (a sealed secret file), isolated and
+/// executable files; a team remote and a public mirror.
 fn project(env: &Env) -> std::path::PathBuf {
     let dir = env.dir("alice");
     write(&dir, "src/main.rs", "fn main() {}\n");
-    write(&dir, "secrets/db.yml", &format!("{CLOAKED}\n"));
+    write(&dir, "secrets/.env.db", &format!("{CLOAKED}\n"));
     write(&dir, ".netrc", &format!("KEY={ISOLATED}\n"));
     env.ok("alice", &dir, &["init"]);
-    env.ok("alice", &dir, &["cloak", "secrets/"]);
+    env.ok("alice", &dir, &["cloak", "secrets/.env.db"]);
     env.ok("alice", &dir, &["commit", "-m", "one"]);
     env.ok("alice", &dir, &["tag", "set", "main", "-r", "@-"]);
-    env.ok("alice", &dir, &["tag", "set", "ops", "-r", "@-", "--cloak", "team"]);
     let team = env.root.join("team");
     let mirror = env.root.join("mirror");
     env.ok("alice", &dir, &["remote", "add", "origin", team.to_str().unwrap()]);
@@ -60,10 +59,10 @@ fn ls_shows_every_tier_and_status_marks_every_file() {
     let dir = project(&env);
     write(&dir, "cfg.js", "k = \"AKIAIOSFODNN7EXAMPLE\"\n");
     write(&dir, "target/debug/app", "binary\n");
-    write(&dir, "secrets/db.yml", &format!("{CLOAKED} v2\n"));
+    write(&dir, "secrets/.env.db", &format!("{CLOAKED} v2\n"));
     let files = ls(&env, "alice", &dir, &["--all"]);
     assert_eq!(files["src/main.rs"], "public");
-    assert_eq!(files["secrets/db.yml"], "cloaked:team");
+    assert_eq!(files["secrets/.env.db"], "cloaked:team");
     assert_eq!(files[".netrc"], "isolated");
     assert_eq!(files["cfg.js"], "quarantined");
     assert_eq!(files["target/"], "ignored", "{files:?}");
@@ -78,14 +77,14 @@ fn ls_shows_every_tier_and_status_marks_every_file() {
     assert!(!old.contains_key(".netrc") && !old.contains_key("cfg.js"), "{old:?}");
     // `vl files` keeps its format.
     let f = env.stdout("alice", &dir, &["files"]);
-    assert!(f.lines().any(|l| l.starts_with("cloaked:team") && l.ends_with("secrets/db.yml")), "{f}");
+    assert!(f.lines().any(|l| l.starts_with("cloaked:team") && l.ends_with("secrets/.env.db")), "{f}");
 
     let st = env.stdout("alice", &dir, &["status"]);
-    assert!(st.contains("M secrets/db.yml [cloaked:team]"), "{st}");
+    assert!(st.contains("M secrets/.env.db [cloaked:team]"), "{st}");
     assert!(st.contains("L .netrc [isolated]"), "{st}");
     assert!(st.contains("Q cfg.js [quarantined]  (aws-access-key-id; never recorded)"), "{st}");
     let (v, _) = json(&env, "alice", &dir, &["status", "--json"]);
-    let change = v["changes"].as_array().unwrap().iter().find(|c| c["path"] == "secrets/db.yml").unwrap();
+    let change = v["changes"].as_array().unwrap().iter().find(|c| c["path"] == "secrets/.env.db").unwrap();
     assert_eq!(change["tier"], "cloaked");
     assert_eq!(v["quarantined"][0]["tier"], "quarantined");
 
@@ -94,12 +93,12 @@ fn ls_shows_every_tier_and_status_marks_every_file() {
     env.ok("bob", &env.root, &["clone", "team", "bob"]);
     let bob = env.root.join("bob");
     let files = ls(&env, "bob", &bob, &[]);
-    assert_eq!(files["secrets/db.yml"], "redacted", "{files:?}");
+    assert_eq!(files["secrets/.env.db"], "redacted", "{files:?}");
     let line = env.stdout("bob", &bob, &["ls", "secrets"]);
     assert!(line.contains("(cloaked:team; no key)"), "{line}");
     assert!(!line.contains(CLOAKED));
     write(&bob, "src/main.rs", "fn main() { bob() }\n");
     let st = env.stdout("bob", &bob, &["status"]);
-    assert!(st.contains("R secrets/db.yml [redacted]  (cloaked:team; no key)"), "{st}");
+    assert!(st.contains("R secrets/.env.db [redacted]  (cloaked:team; no key)"), "{st}");
     assert!(st.contains("M src/main.rs\n"), "public files carry no mark: {st}");
 }

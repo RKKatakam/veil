@@ -36,7 +36,6 @@ fn layout() -> Vec<Tree> {
                     } else {
                         Visibility::Public
                     },
-                    fallback: None,
                 });
             }
             let id = ObjectId::hash(&Object::Tree(sub.clone()).encode());

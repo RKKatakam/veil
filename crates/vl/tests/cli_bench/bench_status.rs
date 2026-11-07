@@ -7,7 +7,8 @@
 //! ```
 //!
 //! Layout: `src/mNNN/sK/fJJ.rs` (200 × 5 × 20 = 20,000 files). The first ten
-//! modules are cloaked by `.veilpolicy` (1,000 encrypted files), and an
+//! modules are restricted by access lines in `.veilpolicy` (1,000 plain
+//! files: only secret files are encrypted), and an
 //! ignored `target/` holds another 500 files that are never read.
 
 use std::{
@@ -96,7 +97,7 @@ fn status_on_20k_files() {
     }
     let mut policy = String::from("target/ ignore\n");
     for m in 0..10 {
-        policy.push_str(&format!("src/m{m:03}/ cloak team\n"));
+        policy.push_str(&format!("src/m{m:03}/ team\n"));
     }
     std::fs::write(root.join(".veilpolicy"), policy).unwrap();
     eprintln!(
@@ -146,5 +147,5 @@ fn status_on_20k_files() {
     );
     eprintln!("status, unchanged tree          {}", stats(unchanged));
     eprintln!("status, 1 public file edited    {}", stats(touched));
-    eprintln!("status, 1 cloaked file edited   {}", stats(touched_cloaked));
+    eprintln!("status, 1 restricted file edited {}", stats(touched_cloaked));
 }

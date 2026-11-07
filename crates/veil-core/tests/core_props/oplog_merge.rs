@@ -40,10 +40,10 @@ fn base_view() -> View {
     let mut v = View::default();
     v.heads.insert(id(1));
     for t in 0..2u8 {
-        v.tags.insert(format!("t{t}"), Tag::new(id(1), None));
+        v.tags.insert(format!("t{t}"), Tag::new(id(1)));
     }
     for w in 0..3u8 {
-        v.workspaces.insert(format!("w{w}"), WorkspaceState { wc: id(2), cloak: None });
+        v.workspaces.insert(format!("w{w}"), WorkspaceState { wc: id(2) });
     }
     v
 }
@@ -52,7 +52,7 @@ fn apply(v: &mut View, edits: &[Edit]) {
     for e in edits {
         match e {
             Edit::SetTag(t, x) => {
-                v.tags.insert(format!("t{t}"), Tag::new(id(*x), None));
+                v.tags.insert(format!("t{t}"), Tag::new(id(*x)));
             }
             Edit::DeleteTag(t) => {
                 v.tags.remove(&format!("t{t}"));
@@ -125,44 +125,18 @@ proptest! {
     }
 }
 
-/// Threat 20: a concurrent move never drops a cloak set on the other side.
-#[test]
-fn cloak_survives_concurrent_move() {
-    let mut base = View::default();
-    base.tags.insert("t".into(), Tag::new(id(1), None));
-    base.workspaces.insert("w".into(), WorkspaceState { wc: id(2), cloak: None });
-    let mut cloaked = base.clone();
-    cloaked.tags.get_mut("t").unwrap().cloak = Some("team".into());
-    cloaked.workspaces.get_mut("w").unwrap().cloak = Some("team".into());
-    let mut moved = base.clone();
-    moved.tags.get_mut("t").unwrap().target = id(3);
-    moved.workspaces.get_mut("w").unwrap().wc = id(4);
-    for sides in [[&cloaked, &moved], [&moved, &cloaked]] {
-        let m = merge_views(&base, &sides, &mut no_descent).view;
-        assert_eq!(m.tags["t"], Tag { target: id(3), cloak: Some("team".into()), annotation: None });
-        assert_eq!(m.workspaces["w"], WorkspaceState { wc: id(4), cloak: Some("team".into()) });
-    }
-    // Both changed the cloak: a cloaked side wins over an uncloaked one.
-    let mut uncloak = cloaked.clone();
-    uncloak.tags.get_mut("t").unwrap().cloak = None;
-    let mut other = base.clone();
-    other.tags.get_mut("t").unwrap().cloak = Some("ops".into());
-    let m = merge_views(&cloaked, &[&uncloak, &other], &mut no_descent).view;
-    assert!(m.tags["t"].cloak.is_some(), "{:?}", m.tags["t"]);
-}
-
 /// Threat 21: a release tag's target and annotation stay one unit.
 #[test]
 fn release_tag_never_torn() {
     let base = View::default();
     let release = |target: u8, ann: u8| {
         let mut v = View::default();
-        v.tags.insert("v1".into(), Tag { target: id(target), cloak: None, annotation: Some(id(ann)) });
+        v.tags.insert("v1".into(), Tag { target: id(target), annotation: Some(id(ann)) });
         v
     };
     let (a, b) = (release(1, 11), release(2, 12));
     let mut ordinary = View::default();
-    ordinary.tags.insert("v1".into(), Tag::new(id(3), None));
+    ordinary.tags.insert("v1".into(), Tag::new(id(3)));
     for sides in [[&a, &b], [&b, &a], [&a, &ordinary], [&ordinary, &a]] {
         let m = merge_views(&base, &sides, &mut no_descent).view;
         let t = &m.tags["v1"];
@@ -171,7 +145,7 @@ fn release_tag_never_torn() {
     }
     // A move of a tag, merged with its release: the release stays.
     let mut moved = a.clone();
-    moved.tags.insert("v1".into(), Tag::new(id(4), None));
+    moved.tags.insert("v1".into(), Tag::new(id(4)));
     let m = merge_views(&a, &[&a, &moved], &mut no_descent).view;
     let t = &m.tags["v1"];
     assert!(t.annotation.is_none() || t.target == id(1), "{t:?}");
@@ -189,7 +163,7 @@ fn tag_cmd() -> impl Strategy<Value = TagCmd> {
 
 fn run_tag(repo: &mut Repo, c: &TagCmd, target: ObjectId) {
     match c {
-        TagCmd::Set(t) => repo.set_tag(&format!("t{t}"), target, None, true).unwrap(),
+        TagCmd::Set(t) => repo.set_tag(&format!("t{t}"), target, true).unwrap(),
         TagCmd::Delete(t) => {
             let _ = repo.delete_tag(&format!("t{t}"));
         }
@@ -210,7 +184,7 @@ proptest! {
         let root = repo.root_id();
         let ta = repo.new_change("default", vec![root], "a").unwrap();
         let tb = repo.new_change("default", vec![root], "b").unwrap();
-        repo.set_tag("t0", root, None, true).unwrap();
+        repo.set_tag("t0", root, true).unwrap();
         let base: BTreeMap<String, ObjectId> = repo.view().tags.iter().map(|(n, t)| (n.clone(), t.target)).collect();
         drop(repo);
         let heads = |f: &MemoryBackend| f.list_dir(&VPath::new(OP_HEADS_DIR).unwrap()).unwrap().into_iter().map(|e| e.name).collect::<Vec<_>>();

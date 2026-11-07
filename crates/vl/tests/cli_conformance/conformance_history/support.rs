@@ -107,7 +107,6 @@ pub struct Snap {
     pub parent_changes: Vec<String>,
     pub conflicts: Vec<String>,
     pub description: Option<String>,
-    pub cloak: Option<String>,
     pub embargo: Option<String>,
     pub predecessors: Vec<String>,
     pub tree: String,
@@ -332,9 +331,8 @@ impl R<'_> {
     }
 
     /// Paths under `.veil/` (raw files, and decoded pack entries) whose
-    /// bytes contain `needle`. Cloaked content and sealed descriptions are
-    /// encrypted at rest, so plaintext that only ever lived in cloaked
-    /// files must never show up here.
+    /// bytes contain `needle`. Sealed secret files are encrypted at rest,
+    /// so plaintext that only ever lived in them must never show up here.
     pub fn store_contains(&self, needle: &str) -> Vec<String> {
         store_contains(&self.dir, needle.as_bytes())
     }
@@ -362,10 +360,8 @@ impl R<'_> {
             };
             stack.extend(s.parents.iter().copied());
             stack.extend(s.predecessors.iter().copied());
-            if let veil_core::object::Text::Plain(d) = &s.description {
-                if d.contains(needle) {
-                    hits.push(format!("description of {}", id.short()));
-                }
+            if s.description.as_str().contains(needle) {
+                hits.push(format!("description of {}", id.short()));
             }
             let Ok(files) = veil_core::tree::walk_files(repo.store(), &s.tree) else {
                 continue;
@@ -414,8 +410,7 @@ pub fn snap_of(repo: &Repo, id: &veil_core::ObjectId) -> Snap {
             })
             .collect(),
         conflicts: s.conflicts.clone(),
-        description: repo.store().read_text(&s.description),
-        cloak: s.cloak.clone(),
+        description: Some(s.description.as_str().to_string()),
         embargo: s.embargo.clone(),
         predecessors: s.predecessors.iter().map(|p| p.hex()).collect(),
         tree: s.tree.hex(),

@@ -504,7 +504,7 @@ const SECRET_VALUE: &str = "sk_live_9f8e7d6c5b4a3210_TEAMVAULT_CANARY";
 fn the_vault_never_reaches_a_public_remote() {
     let mut alice = peer("alice");
     let commit = adversarial_support::commit_files(&mut alice.repo, &*alice.fs, &[("README", "hello\n")], "c");
-    alice.repo.set_tag("main", commit, None, false).unwrap();
+    alice.repo.set_tag("main", commit, false).unwrap();
     set(&alice, SECRET_NAME, SECRET_VALUE);
     alice.repo.keys().create_scope("ops").unwrap();
     alice.repo.keys().team_secret_write("ops", "OPS_ONLY_NAME_CANARY", Some("ops-value-canary")).unwrap();

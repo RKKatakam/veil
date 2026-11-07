@@ -5,8 +5,8 @@
 //!   documented in `docs/reference/json.md` under its schema's heading.
 //! * **Every read command accepts `--json`** and prints exactly one
 //!   document, on one line, whose `schema` names it.
-//! * **Confidentiality.** No plaintext of cloaked, embargoed or isolated
-//!   content, no sealed description and no secret value appears in any
+//! * **Confidentiality.** No plaintext of sealed secret files, embargoed or
+//!   isolated content and no secret value appears in any
 //!   JSON output, for a non-member, a public-mirror reader, or (for
 //!   isolated files and vault values) the owner.
 
@@ -104,15 +104,11 @@ fn nullable(mut spec: Value) -> Value {
 }
 
 fn vis() -> Value {
-    json!({"kind": "string", "scope": "string|null", "embargo": "string|null"})
+    json!({"kind": "string", "scope": "string|null"})
 }
 
 fn redaction() -> Value {
     json!({"reason": "string", "message": "string"})
-}
-
-fn hidden_text() -> Value {
-    nullable(json!({"scope": "string", "reason": "string"}))
 }
 
 fn snapshot_ref() -> Value {
@@ -120,7 +116,7 @@ fn snapshot_ref() -> Value {
         "snapshot_id": "string", "snapshot_short": "string",
         "change_id": "string|null", "change_short": "string|null",
         "available": "bool", "empty": "bool",
-        "description": "string|null", "description_hidden": hidden_text(),
+        "description": "string|null",
     })
 }
 
@@ -150,15 +146,15 @@ fn diff_files() -> Value {
 
 /// Every schema, by name.
 fn specs() -> Vec<(&'static str, Value)> {
-    let tag_label = json!({"name": "string", "cloak": "string|null"});
+    let tag_label = json!({"name": "string"});
     let parent = json!({"snapshot_id": "string", "snapshot_short": "string", "change_short": "string|null", "withheld": "bool"});
     let log_entry = json!({
         "snapshot_id": "string", "snapshot_short": "string", "change_id": "string", "change_short": "string",
         "root": "bool", "current": "bool", "author": "string|null", "timestamp": "string|null", "signature": sig(),
         "workspaces": ["string"], "tags": [tag_label], "remote_tags": ["string"], "empty": "bool",
-        "conflicts": ["string"], "cloak": "string|null",
+        "conflicts": ["string"],
         "embargo": nullable(json!({"id": "string", "released": "bool"})),
-        "description": "string|null", "description_hidden": hidden_text(), "parents": [parent],
+        "description": "string|null", "parents": [parent],
     });
     let scan_file = json!({
         "path": "string", "tier": "string", "scope": "string|null", "protected": "bool",
@@ -167,7 +163,7 @@ fn specs() -> Vec<(&'static str, Value)> {
     vec![
         ("veil.status/1", json!({
             "schema": "string",
-            "workspace": {"name": "string", "cloak": "string|null"},
+            "workspace": {"name": "string"},
             "working_copy": snapshot_ref(),
             "parents": [snapshot_ref()],
             "changes": [change()],
@@ -187,14 +183,13 @@ fn specs() -> Vec<(&'static str, Value)> {
             "schema": "string", "snapshot_id": "string", "snapshot_short": "string",
             "change_id": "string", "change_short": "string", "root": "bool", "author": "string",
             "timestamp": "string|null", "signature": sig(), "parents": [snapshot_ref()], "tags": ["string"],
-            "cloak": "string|null",
             "embargo": nullable(json!({"id": "string", "state": "string", "until": "string|null"})),
-            "conflicts": ["string"], "description": "string|null", "description_hidden": hidden_text(),
+            "conflicts": ["string"], "description": "string|null",
             "diff": {"stat": "bool", "files": diff_files()},
         })),
         ("veil.workspace.list/1", json!({
             "schema": "string",
-            "workspaces": [{"name": "string", "current": "bool", "cloak": "string|null", "working_copy": snapshot_ref()}],
+            "workspaces": [{"name": "string", "current": "bool", "working_copy": snapshot_ref()}],
         })),
         ("veil.tag.list/1", {
             let annotation = json!({
@@ -203,7 +198,7 @@ fn specs() -> Vec<(&'static str, Value)> {
             });
             json!({
                 "schema": "string",
-                "tags": [{"name": "string", "cloak": "string|null", "target": snapshot_ref(), "kind": "string", "annotation": annotation}],
+                "tags": [{"name": "string", "target": snapshot_ref(), "kind": "string", "annotation": annotation}],
                 "remote_tags": [{"name": "string", "target": snapshot_ref()}],
             })
         }),
@@ -219,9 +214,9 @@ fn specs() -> Vec<(&'static str, Value)> {
         ("veil.ls/1", json!({
             "schema": "string", "snapshot": snapshot_ref(), "working_copy": "bool", "all": "bool",
             "entries": [{
-                "path": "string", "dir": "bool", "tier": "string", "scope": "string|null", "embargo": "string|null",
+                "path": "string", "dir": "bool", "tier": "string", "scope": "string|null",
                 "recorded": "bool", "visibility": nullable(vis()), "size": "number|null", "executable": "bool",
-                "readable": "bool", "fallback": "bool", "redaction": nullable(redaction()),
+                "readable": "bool", "redaction": nullable(redaction()),
                 "quarantine": nullable(json!({"rule": "string", "line": "number", "state": "string"})),
                 "conflict": conflict_info(), "kind": "string", "target": "string|null",
             }],
@@ -305,7 +300,9 @@ fn nonempty<'a>(v: &'a Value, key: &str) -> &'a Vec<Value> {
 // ---- the scenario ----------------------------------------------------------------------
 
 const CLOAKED_TEXT: &str = "CLOAKED-PLAN-4417";
-const CLOAKED_DESC: &str = "CLOAKED-DESCRIPTION-9902";
+/// The sealed secret file.
+const PLAN: &str = "internal/.env.plan";
+const PLAN_DESC: &str = "plan-description";
 const ISOLATED_TEXT: &str = "ISOLATED-VALUE-6623";
 const VAULT_VALUE: &str = "VAULT-VALUE-1187";
 const TOKEN: &str = "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789";
@@ -320,19 +317,19 @@ struct World {
     carol: PathBuf,
 }
 
-/// Alice's project: public, cloaked, isolated, binary and executable files,
-/// a cloaked workspace with a sealed description, a cloaked tag, an
-/// unreleased embargo, a vault secret; a team remote Bob cloned without a
+/// Alice's project: public, cloaked (a sealed secret file), isolated, binary
+/// and executable files, a second workspace with a tag, an unreleased
+/// embargo, a vault secret; a team remote Bob cloned without a
 /// key and a public mirror Carol cloned.
 fn world() -> World {
     let env = Env::new();
     let alice = env.dir("alice");
     write(&alice, "README.md", "hello\n");
-    write(&alice, "internal/plan.md", &format!("{CLOAKED_TEXT}\n"));
+    write(&alice, PLAN, &format!("{CLOAKED_TEXT}\n"));
     write(&alice, ".netrc", &format!("API={ISOLATED_TEXT}\n"));
     write(&alice, "run.sh", "echo hi\n");
     env.ok("alice", &alice, &["init"]);
-    env.ok("alice", &alice, &["cloak", "internal/"]);
+    env.ok("alice", &alice, &["cloak", PLAN]);
     std::fs::write(alice.join("logo.bin"), b"\x00\x01\x02binary").unwrap();
     #[cfg(unix)]
     {
@@ -343,17 +340,19 @@ fn world() -> World {
     env.ok("alice", &alice, &["tag", "set", "main", "-r", "@-"]);
     env.ok("alice", &alice, &["secret", "set", "API_TOKEN", VAULT_VALUE]);
 
-    // A cloaked line of work with a sealed description, and a cloaked tag.
-    env.ok("alice", &alice, &["ws", "new", "plan", "-r", "main", "--cloak", "team"]);
-    write_stdin(&env, "alice", &alice, &["ws", "write", "plan", "internal/plan.md"], format!("{CLOAKED_TEXT} v2\n").as_bytes());
-    env.ok("alice", &alice, &["describe", "-r", "plan@", "-m", CLOAKED_DESC]);
-    env.ok("alice", &alice, &["tag", "set", "plan-tag", "-r", "plan@", "--cloak", "team"]);
+    // A second line of work editing the secret file, and a tag on it.
+    env.ok("alice", &alice, &["ws", "new", "plan", "-r", "main"]);
+    write_stdin(&env, "alice", &alice, &["ws", "write", "plan", PLAN], format!("{CLOAKED_TEXT} v2\n").as_bytes());
+    env.ok("alice", &alice, &["describe", "-r", "plan@", "-m", PLAN_DESC]);
+    env.ok("alice", &alice, &["tag", "set", "plan-tag", "-r", "plan@"]);
 
     // An unreleased embargo on main.
     env.ok("alice", &alice, &["ws", "new", "fix", "-r", "main"]);
     write_stdin(&env, "alice", &alice, &["ws", "write", "fix", "README.md"], format!("hello\n{EMBARGO_TEXT}\n").as_bytes());
     env.ok("alice", &alice, &["describe", "-r", "fix@", "-m", "fix"]);
     env.ok("alice", &alice, &["merge", "fix@", "--into", "main", "--embargo", "-m", "embargoed merge"]);
+    // Main before the embargoed merge: what the remotes receive of it.
+    env.ok("alice", &alice, &["tag", "set", "base", "-r", "plan@-"]);
 
     let team = env.root.join("team");
     let mirror = env.root.join("mirror");
@@ -444,7 +443,7 @@ fn every_read_command_accepts_json_and_prints_one_document() {
     assert_eq!(v["mode"], "gate");
     // In a bare repository (a remote), the history commands.
     let team = w.env.root.join("team");
-    for args in [&["log", "--json"][..], &["show", "main", "--json"], &["tag", "list", "--json"], &["op", "log", "--json"]] {
+    for args in [&["log", "--json"][..], &["show", "base", "--json"], &["tag", "list", "--json"], &["op", "log", "--json"]] {
         let mut a = vec!["-R", team.to_str().unwrap()];
         a.extend_from_slice(args);
         let (v, code) = json_doc(&w.env, "alice", &w.env.root, &a);
@@ -478,7 +477,7 @@ fn status_shape() {
     let v = json_ok(env, "bob", &w.bob, &["status", "--json"]);
     check_doc(&v, "veil.status/1");
     let r = nonempty(&v, "redacted");
-    assert_eq!(r[0]["path"], "internal/plan.md");
+    assert_eq!(r[0]["path"], PLAN);
     assert_eq!(r[0]["redaction"]["reason"], "no_key");
 }
 
@@ -533,9 +532,8 @@ fn log_shape() {
     assert!(root["author"].is_null() && root["signature"].is_null() && root["timestamp"].is_null());
     assert!(entries.iter().any(|e| e["current"] == true && e["workspaces"] == json!(["default"])), "{v}");
     let plan = entries.iter().find(|e| e["workspaces"] == json!(["plan"])).expect("the plan workspace");
-    assert_eq!(plan["cloak"], "team");
-    assert_eq!(plan["description"], CLOAKED_DESC, "alice is a member");
-    assert_eq!(plan["tags"], json!([{"name": "plan-tag", "cloak": "team"}]));
+    assert_eq!(plan["description"], PLAN_DESC);
+    assert_eq!(plan["tags"], json!([{"name": "plan-tag"}]));
     assert_eq!(plan["signature"]["status"], "good");
     let merge = entries.iter().find(|e| e["embargo"].is_object()).expect("the embargoed merge");
     assert_eq!(merge["embargo"]["released"], false);
@@ -547,12 +545,8 @@ fn log_shape() {
     assert_eq!(v["entries"].as_array().unwrap().len(), 2);
     assert_eq!(v["truncated"], true);
 
-    // Bob: the sealed description is hidden, with its scope.
     let v = json_ok(&w.env, "bob", &w.bob, &["log", "--json"]);
     check_doc(&v, "veil.log/1");
-    let plan = v["entries"].as_array().unwrap().iter().find(|e| e["cloak"] == "team").expect("the cloaked change");
-    assert!(plan["description"].is_null(), "{plan}");
-    assert_eq!(plan["description_hidden"], json!({"scope": "team", "reason": "no_key"}));
 }
 
 #[test]
@@ -573,7 +567,7 @@ fn diff_and_show_shape() {
     assert_eq!(by("logo.bin")["content"]["hunks"], json!([]));
     #[cfg(unix)]
     assert_eq!(by("run.sh")["new"]["mode"], "100755");
-    assert_eq!(by("internal/plan.md")["new"]["visibility"], json!({"kind": "cloaked", "scope": "team", "embargo": null}));
+    assert_eq!(by(PLAN)["new"]["visibility"], json!({"kind": "cloaked", "scope": "team"}));
     assert!(!files.iter().any(|f| f["path"] == ".netrc"), "isolated files are never recorded");
 
     let v = json_ok(env, "alice", alice, &["diff", "--from", "root()", "--to", "main", "--stat", "--json"]);
@@ -602,20 +596,24 @@ fn diff_and_show_shape() {
     check_doc(&v, "veil.show/1");
     assert!(v["root"] == true && v["signature"].is_null());
 
+    // The unreleased embargoed merge never reached the remotes.
+    for (who, dir) in [("bob", &w.bob), ("carol", &w.carol)] {
+        let (v, code) = json_doc(env, who, dir, &["show", "main", "--json"]);
+        assert_eq!(code, Some(1), "{who}: {v}");
+        check_doc(&v, "veil.error/1");
+    }
     // Bob: the cloaked file's content is hidden, with a reason.
-    let v = json_ok(env, "bob", &w.bob, &["diff", "--from", "root()", "--to", "main", "--json"]);
+    let v = json_ok(env, "bob", &w.bob, &["diff", "--from", "root()", "--to", "base", "--json"]);
     check_doc(&v, "veil.diff/1");
-    let plan = v["files"].as_array().unwrap().iter().find(|f| f["path"] == "internal/plan.md").unwrap();
+    let plan = v["files"].as_array().unwrap().iter().find(|f| f["path"] == PLAN).unwrap();
     assert_eq!(plan["new"]["readable"], false);
     assert_eq!(plan["content"]["hidden"]["reason"], "no_key");
     assert_eq!(plan["content"]["hunks"], json!([]));
     let v = json_ok(env, "bob", &w.bob, &["show", "plan-tag", "--json"]);
     check_doc(&v, "veil.show/1");
-    assert!(v["description"].is_null());
-    assert_eq!(v["description_hidden"]["scope"], "team");
 
     // Carol read the public mirror: the cloaked content was withheld.
-    let v = json_ok(env, "carol", &w.carol, &["diff", "--from", "root()", "--to", "main", "--json"]);
+    let v = json_ok(env, "carol", &w.carol, &["diff", "--from", "root()", "--to", "base", "--json"]);
     check_doc(&v, "veil.diff/1");
 }
 
@@ -627,7 +625,7 @@ fn list_shapes() {
     check_doc(&v, "veil.workspace.list/1");
     let ws = nonempty(&v, "workspaces");
     assert!(ws.iter().any(|w| w["name"] == "default" && w["current"] == true));
-    assert!(ws.iter().any(|w| w["name"] == "plan" && w["cloak"] == "team" && w["current"] == false));
+    assert!(ws.iter().any(|w| w["name"] == "plan" && w["current"] == false));
 
     let v = json_ok(env, "alice", alice, &["tag", "list", "--json"]);
     check_doc(&v, "veil.tag.list/1");
@@ -657,8 +655,8 @@ fn ls_shape() {
     let entries = nonempty(&v, "entries");
     let get = |p: &str| entries.iter().find(|e| e["path"] == p).unwrap_or_else(|| panic!("{p} not listed: {v}")).clone();
     assert_eq!(get("logo.bin")["tier"], "public");
-    assert_eq!(get("README.md")["tier"], "embargoed", "@ is on the embargoed merge, whose key Alice holds");
-    let plan = get("internal/plan.md");
+    assert_eq!(get("README.md")["tier"], "public", "an embargo is a permission, not a tier");
+    let plan = get(PLAN);
     assert_eq!((plan["tier"].clone(), plan["scope"].clone(), plan["readable"].clone()), (json!("cloaked"), json!("team"), json!(true)));
     let env_file = get(".netrc");
     assert_eq!((env_file["tier"].clone(), env_file["recorded"].clone()), (json!("isolated"), json!(false)));
@@ -672,16 +670,15 @@ fn ls_shape() {
     let v = json_ok(env, "bob", &w.bob, &["ls", "--json"]);
     check_doc(&v, "veil.ls/1");
     let entries = nonempty(&v, "entries");
-    let plan = entries.iter().find(|e| e["path"] == "internal/plan.md").unwrap();
+    let plan = entries.iter().find(|e| e["path"] == PLAN).unwrap();
     assert_eq!((plan["tier"].clone(), plan["readable"].clone()), (json!("redacted"), json!(false)), "{v}");
     assert_eq!(plan["redaction"]["reason"], "no_key");
-    // Alice holds the embargo key: main's README.md is embargoed for her.
+    // Main (the embargoed merge) lists its files plainly for Alice.
     let v = json_ok(env, "alice", alice, &["ls", "-r", "main", "README.md", "--json"]);
     check_doc(&v, "veil.ls/1");
     assert_eq!(v["working_copy"], false);
     let e = &nonempty(&v, "entries")[0];
-    assert_eq!(e["tier"], "embargoed", "{v}");
-    assert!(e["embargo"].is_string());
+    assert_eq!(e["tier"], "public", "{v}");
 }
 
 #[test]
@@ -756,24 +753,24 @@ fn json_is_escaped_for_terminals_but_decodes_to_the_raw_data() {
     assert!(v["entries"].as_array().unwrap().iter().any(|e| e["description"] == evil), "{v}");
 }
 
-/// No plaintext of cloaked, embargoed or isolated content, no sealed
-/// description and no secret value, in any JSON output of any read command
-/// on any revision, for anyone who may not read it.
+/// No plaintext of cloaked (secret-file), embargoed or isolated content and
+/// no secret value, in any JSON output of any read command on any revision,
+/// for anyone who may not read it.
 #[test]
 fn no_confidential_plaintext_in_any_json_output() {
     let w = world();
     // Bob: on the team remote, but not in `team`.
     let bob = all_json(&w.env, "bob", &w.bob);
-    assert_absent(&bob, &[CLOAKED_TEXT, CLOAKED_DESC, ISOLATED_TEXT, VAULT_VALUE, EMBARGO_TEXT], "bob");
+    assert_absent(&bob, &[CLOAKED_TEXT, ISOLATED_TEXT, VAULT_VALUE, EMBARGO_TEXT], "bob");
     assert!(bob.contains("no_key"), "bob's output should explain the redaction");
     // Carol: the public mirror.
     let carol = all_json(&w.env, "carol", &w.carol);
-    assert_absent(&carol, &[CLOAKED_TEXT, CLOAKED_DESC, ISOLATED_TEXT, VAULT_VALUE, EMBARGO_TEXT, "plan-tag"], "carol");
+    assert_absent(&carol, &[CLOAKED_TEXT, ISOLATED_TEXT, VAULT_VALUE, EMBARGO_TEXT], "carol");
     // Alice herself: isolated files and vault values never appear either.
     write(&w.alice, ".netrc", &format!("API={ISOLATED_TEXT}\nGH={TOKEN}\n"));
     let alice = all_json(&w.env, "alice", &w.alice);
     assert_absent(&alice, &[ISOLATED_TEXT, VAULT_VALUE, TOKEN], "alice");
-    assert!(alice.contains(CLOAKED_TEXT) && alice.contains(CLOAKED_DESC), "alice is a member and reads it");
+    assert!(alice.contains(CLOAKED_TEXT), "alice is a member and reads it");
 }
 
 /// Every key of every schema is documented in `docs/reference/json.md`,

@@ -17,21 +17,19 @@ fn entry() -> impl Strategy<Value = TreeEntry> {
         any::<[u8; 32]>(),
         prop_oneof![Just(0u64), 1u64..300, any::<u64>()],
         any::<bool>(),
-        0u8..3,
-        prop::option::of(any::<[u8; 32]>()),
+        0u8..2,
     )
-        .prop_map(|(name, dir, id, size, exec, tier, fb)| TreeEntry {
+        .prop_map(|(name, dir, id, size, exec, tier)| TreeEntry {
             name,
             kind: if dir { EntryKind::Dir } else { EntryKind::File },
             id: ObjectId(id),
             size,
             executable: exec,
+            // Only secret files are sealed: never a directory.
             visibility: match tier {
-                0 => Visibility::Public,
-                1 => Visibility::Cloaked { scope: "team".into() },
-                _ => Visibility::Embargoed { embargo: "0123456789".into() },
+                1 if !dir => Visibility::Cloaked { scope: "team".into() },
+                _ => Visibility::Public,
             },
-            fallback: fb.map(ObjectId),
         })
 }
 

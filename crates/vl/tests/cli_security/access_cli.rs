@@ -64,9 +64,9 @@ fn revoke_rotates_and_survives_push_and_pull() {
     let env = Env::new();
     let proj = env.root.join("proj");
     std::fs::create_dir_all(&proj).unwrap();
-    write(&proj, "internal/plan.md", "v1 plan\n");
+    write(&proj, "internal/.env.plan", "v1 plan\n");
     env.ok("alice", &proj, &["init"]);
-    env.ok("alice", &proj, &["cloak", "internal/"]);
+    env.ok("alice", &proj, &["cloak", "internal/.env.plan"]);
     env.ok("alice", &proj, &["commit", "-m", "v1"]);
     env.ok("alice", &proj, &["tag", "set", "main", "-r", "@-"]);
     let team = env.root.join("team");
@@ -91,7 +91,7 @@ fn revoke_rotates_and_survives_push_and_pull() {
     env.ok("alice", &proj, &["pull"]);
     let list = env.ok("alice", &proj, &["scope", "list"]);
     assert!(!list.contains("bob"), "pull resurrected the revoked member:\n{list}");
-    write(&proj, "internal/plan.md", "v2 plan\n");
+    write(&proj, "internal/.env.plan", "v2 plan\n");
     env.ok("alice", &proj, &["commit", "-m", "v2"]);
     env.ok("alice", &proj, &["tag", "set", "main", "-r", "@-"]);
     env.ok("alice", &proj, &["push"]);
@@ -100,8 +100,8 @@ fn revoke_rotates_and_survives_push_and_pull() {
     env.ok("bob", &bob_dir, &["pull"]);
     let list = env.ok("bob", &bob_dir, &["scope", "list"]);
     assert!(list.contains("revoked (history only)") && !list.contains("bob "), "{list}");
-    assert_eq!(env.ok("bob", &bob_dir, &["cat", "internal/plan.md", "-r", "main-"]), "v1 plan\n");
-    assert!(!env.vl("bob", &bob_dir, &["cat", "internal/plan.md", "-r", "main"]).status.success());
+    assert_eq!(env.ok("bob", &bob_dir, &["cat", "internal/.env.plan", "-r", "main-"]), "v1 plan\n");
+    assert!(!env.vl("bob", &bob_dir, &["cat", "internal/.env.plan", "-r", "main"]).status.success());
 
     let log = env.ok("alice", &proj, &["scope", "log", "team"]);
     assert!(log.contains("grant bob") && log.contains("revoke bob → generation 1"), "{log}");

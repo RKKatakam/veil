@@ -260,20 +260,20 @@ fn remote_reads(remote: &Path, tag: &str, path: &str) -> Option<Vec<u8>> {
     anon.store().read_entry(&e).ok()
 }
 
-/// A project with `secrets/ cloak team`, one cloaked file, tag `main` and
+/// A project with `secrets/*.pem cloak team`, one cloaked file, tag `main` and
 /// a public mirror remote `mirror`.
 fn project_with_cloaked_secret(env: &Env) -> std::path::PathBuf {
     let proj = env.dir("proj");
     env.ok(U, &proj, &["init"]);
-    write(&proj, ".veilpolicy", "secrets/ cloak team\n");
-    write(&proj, "secrets/db.yml", "password: hunter2hunter2\n");
+    write(&proj, ".veilpolicy", "secrets/*.pem cloak team\n");
+    write(&proj, "secrets/db.pem", "password: hunter2hunter2\n");
     write(&proj, "README", "hi\n");
     env.ok(U, &proj, &["commit", "-m", "initial"]);
     env.ok(U, &proj, &["tag", "set", "main", "-r", "@-"]);
     let mirror = env.dir("mirror");
     env.ok(U, &proj, &["remote", "add", "mirror", mirror.to_str().unwrap(), "--public"]);
     env.ok(U, &proj, &["push", "mirror"]);
-    assert!(mirror_reads(&mirror, "secrets/db.yml").is_none(), "control: cloaked content is withheld");
+    assert!(mirror_reads(&mirror, "secrets/db.pem").is_none(), "control: cloaked content is withheld");
     proj
 }
 
@@ -296,7 +296,7 @@ fn a_symlinked_policy_file_still_applies() {
     let aside = env.root.join("dotfiles-veilpolicy");
     std::fs::rename(proj.join(".veilpolicy"), &aside).unwrap();
     std::os::unix::fs::symlink(&aside, proj.join(".veilpolicy")).unwrap();
-    write(&proj, "secrets/api.yml", "token: Xk9mQ2vL7pR4wZt8\n");
+    write(&proj, "secrets/api.pem", "token: Xk9mQ2vL7pR4wZt8\n");
     let status = env.ok(U, &proj, &["status"]);
     let files = env.stdout(U, &proj, &["files"]);
     assert!(
@@ -306,8 +306,8 @@ fn a_symlinked_policy_file_still_applies() {
     env.ok(U, &proj, &["commit", "-m", "more secrets"]);
     env.ok(U, &proj, &["push", "mirror"]);
     let mirror = env.root.join("mirror");
-    assert!(mirror_reads(&mirror, "secrets/db.yml").is_none(), "the cloaked file reached the public mirror in plaintext");
-    assert!(mirror_reads(&mirror, "secrets/api.yml").is_none(), "the new secret reached the public mirror in plaintext");
+    assert!(mirror_reads(&mirror, "secrets/db.pem").is_none(), "the cloaked file reached the public mirror in plaintext");
+    assert!(mirror_reads(&mirror, "secrets/api.pem").is_none(), "the new secret reached the public mirror in plaintext");
 }
 
 /// "Nothing in the working copy can fail a snapshot" (ARCHITECTURE §4):
@@ -353,7 +353,7 @@ fn undo_of_an_embargo_release_keeps_the_fix_embargoed() {
     let mirror = env.dir("mirror");
     env.ok(U, &proj, &["remote", "add", "mirror", mirror.to_str().unwrap(), "--public"]);
     env.ok(U, &proj, &["push", "mirror"]);
-    env.ok(U, &proj, &["ws", "new", "fix", "-r", "main", "--cloak", "team"]);
+    env.ok(U, &proj, &["ws", "new", "fix", "-r", "main"]);
     let mut c = env.cmd(U, &proj, &["ws", "write", "fix", "auth.rs"]);
     c.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     let mut child = c.spawn().unwrap();

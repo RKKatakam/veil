@@ -182,7 +182,7 @@ fn storage_benchmark() {
         }
         head = s;
     }
-    repo.set_tag("main", head, None, false).unwrap();
+    repo.set_tag("main", head, false).unwrap();
     println!(
         "\nBuilt {FILES} files, {COMMITS} commits (+{abandoned} abandoned) in {:.1} s",
         t.elapsed().as_secs_f64()

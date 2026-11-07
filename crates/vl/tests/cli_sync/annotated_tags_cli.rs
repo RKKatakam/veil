@@ -108,10 +108,6 @@ fn annotated_tags_are_signed_verified_and_immutable() {
     assert!(err.contains("plain tag"), "{err}");
     let err = env.fails(&dir, &["tag", "set", "main", "-a", "-m", "x"]);
     assert!(err.contains("--force"), "{err}");
-    // A cloaked annotated tag: its message is sealed.
-    env.ok(&dir, &["tag", "set", "v-team", "-r", "@-", "-a", "-m", "TEAM-ONLY-NOTES", "--cloak"]);
-    let out = env.ok(&dir, &["tag", "verify", "v-team"]);
-    assert!(out.contains("TEAM-ONLY-NOTES"), "a member reads it: {out}");
     // The commit printed that release tags stay.
     std::fs::write(dir.join("README.md"), "three\n").unwrap();
     env.ok(&dir, &["tag", "set", "v1.1", "-a", "-m", "on @-", "-r", "@-"]);

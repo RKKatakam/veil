@@ -107,7 +107,7 @@ fn the_smoke_scenario_runs() {
 /// back exactly, also through the pure-Rust decoder.
 #[test]
 fn repositories_written_by_native_vl_read_and_verify() {
-    for format in [1u32, 2, 3] {
+    for format in [veil_core::repo::REPO_FORMAT] {
         let set = fixtures().join(format!("format-{format}"));
         let fs = load_dir(&set.join("alice"));
         let kinds = pack_entry_kinds(&fs);
@@ -120,7 +120,7 @@ fn repositories_written_by_native_vl_read_and_verify() {
         assert_eq!(read_at(&repo, &main, "README.md").as_deref(), Some(&b"Fixture project\n"[..]));
         assert!(String::from_utf8(read_at(&repo, &main, "docs/big.txt").unwrap()).is_ok());
         assert_eq!(
-            read_at(&repo, &main, "secrets/notes.txt").as_deref(),
+            read_at(&repo, &main, "secrets/.env.notes").as_deref(),
             Some(&b"team-only notes v2\n"[..]),
             "format {format}: sealed content unseals"
         );

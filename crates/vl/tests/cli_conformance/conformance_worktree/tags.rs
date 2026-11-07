@@ -176,34 +176,6 @@ fn an_abandoned_change_cannot_be_tagged() {
     assert!(err.contains("not found"), "{err}");
 }
 
-// Scenario from git t7004-tag.sh (lightweight tags list) with Veil's
-// cloaked tags: the scope is shown in the list.
-#[test]
-fn a_cloaked_tag_is_marked_in_the_list() {
-    let env = Env::new();
-    let (r, one, _) = chain(&env);
-    r.ok(&["tag", "set", "secret-line", "-r", one.as_str(), "--cloak"]);
-    let list = r.out(&["tag", "list"]);
-    assert!(list.contains("secret-line [cloaked:team]:"), "{list}");
-    // Moving it keeps its cloak.
-    r.ok(&["tag", "set", "secret-line", "-r", "@-"]);
-    assert!(r.out(&["tag", "list"]).contains("secret-line [cloaked:team]:"));
-}
-
-// Scenario from git t7004-tag.sh (invalid tag options) with Veil's scopes:
-// a cloaked tag must name a scope that exists and that you can use, as
-// `vl cloak --scope` and `vl ws new --cloak` require; reserved names
-// (`local`, `embargo/…`) and malformed ones are refused.
-#[test]
-fn a_cloaked_tag_needs_a_valid_scope() {
-    let env = Env::new();
-    let (r, one, _) = chain(&env);
-    for bad in ["tema", "local", "embargo/x", "../x", "UPPER", ""] {
-        let out = r.run(&["tag", "set", "t", "-r", one.as_str(), &format!("--cloak={bad}")]);
-        assert!(!out.status.success(), "--cloak={bad:?} accepted: {}", text(&out));
-    }
-}
-
 // Scenario from git t3200 "git branch -m" (rename): no rename command;
 // set the new name, delete the old one.
 #[test]

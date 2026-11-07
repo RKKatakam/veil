@@ -211,8 +211,8 @@ fn an_old_stale_lock_is_recovered_automatically() {
 fn sandbox_project(env: &Env) -> std::path::PathBuf {
     let proj = env.project("alice", "proj", &[("app.py", "print('hi')\n")]);
     write(&proj, ".netrc", "API_TOKEN=super-secret-isolated-value\n");
-    write(&proj, "secrets/db.txt", "cloaked-db-password\n");
-    env.ok("alice", &proj, &["cloak", "secrets/"]);
+    write(&proj, "secrets/.env.db", "cloaked-db-password\n");
+    env.ok("alice", &proj, &["cloak", "secrets/.env.db"]);
     env.ok("alice", &proj, &["commit", "-m", "with secrets"]);
     env.ok("alice", &proj, &["ws", "new", "agent", "-r", "@-"]);
     proj
@@ -225,7 +225,7 @@ fn ws_exec_sandbox_is_private_to_the_user() {
     let out = env.stdout(
         "alice",
         &proj,
-        &["ws", "exec", "agent", "--with-isolated", "--", "sh", "-c", "stat -c '%a %n' . .netrc secrets secrets/db.txt"],
+        &["ws", "exec", "agent", "--with-isolated", "--", "sh", "-c", "stat -c '%a %n' . .netrc secrets secrets/.env.db"],
     );
     for line in out.lines() {
         let mode = u32::from_str_radix(line.split_whitespace().next().unwrap(), 8).unwrap();
@@ -245,7 +245,7 @@ fn killed_ws_exec_leaves_no_plaintext_behind() {
     let _ = child.wait();
     let leftovers: Vec<String> = tree_listing(&env.root.join("tmp"))
         .into_iter()
-        .filter(|p| p.ends_with(".netrc") || p.ends_with("db.txt"))
+        .filter(|p| p.ends_with(".netrc") || p.ends_with(".env.db"))
         .collect();
     assert!(leftovers.is_empty(), "secrets left on disk after crash: {leftovers:?}");
 }

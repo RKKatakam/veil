@@ -26,13 +26,15 @@ fn vl_home(
         .unwrap()
 }
 
-// jj test_load_repo.rs: an older remote is still readable by a newer client.
+// Veil: a remote in format 7 (which may hold encrypted descriptions, tags, embargoes or
+// folders) is refused by a clone until it is upgraded, and nothing is written to it.
 #[test]
-fn a_current_clone_of_a_format_2_remote_reads_and_pushes_back() {
+fn a_clone_of_a_format_7_remote_is_refused_until_it_is_upgraded() {
     let env = Env::new();
-    let root = fx(&env, 2);
+    let root = fx(&env, 7);
     let remote = root.join("team-remote");
     let home = root.join("home-bob");
+    let before = listing(&remote);
     let out = vl_home(
         &env,
         &home,
@@ -43,50 +45,11 @@ fn a_current_clone_of_a_format_2_remote_reads_and_pushes_back() {
             env.path("bob").to_str().unwrap(),
         ],
     );
-    assert!(out.status.success(), "{}", text(&out));
-    let bob = env.path("bob");
-    assert_eq!(repo_format(&bob), 2);
-    write(&bob, "from-bob.txt", "bob\n");
-    for args in [
-        vec!["commit", "-m", "bob on format 2"],
-        vec!["tag", "set", "main", "-r", "@-", "--allow-backwards"],
-        vec!["push"],
-        vec!["fsck"],
-    ] {
-        let out = vl_home(&env, &home, &bob, &args);
-        assert!(out.status.success(), "{args:?}: {}", text(&out));
-    }
-    assert_eq!(
-        repo_format(&remote),
-        2,
-        "pushing does not upgrade the remote"
-    );
-    let out = vl_home(
-        &env,
-        &home,
-        &env.root,
-        &["fsck", "-R", remote.to_str().unwrap()],
-    );
-    assert!(out.status.success(), "{}", text(&out));
-}
-
-// Veil: old-format public mirrors hold no cloaked plaintext either.
-#[test]
-fn old_format_public_mirrors_hold_no_cloaked_plaintext() {
-    let env = Env::new();
-    for n in [1, 2, 3] {
-        let root = fx(&env, n);
-        let mirror = root.join("public-mirror");
-        assert_absent(
-            &mirror,
-            "team-only notes",
-            &format!("format-{n} public mirror"),
-        );
-        assert!(
-            contains(&everything_in(&root.join("team-remote")), "veil:"),
-            "control: objects were read"
-        );
-    }
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("format 7") && text(&out).contains("vl upgrade"), "{}", text(&out));
+    assert!(!env.path("bob").join(".veil").exists());
+    assert_eq!(repo_format(&remote), 7);
+    assert_eq!(listing(&remote), before);
 }
 
 // Veil: a remote written by a newer vl (unknown format) is refused by clone, pull and push,

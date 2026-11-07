@@ -117,9 +117,9 @@ fn cloaked_content_and_public_mirrors() {
     let env = Env::new();
     let proj = env.dir("proj");
     write(&proj, "README.md", "hello\n");
-    write(&proj, "internal/plan.md", "the secret plan\n");
+    write(&proj, "internal/.env.plan", "the secret plan\n");
     env.ok("alice", &proj, &["init"]);
-    env.ok("alice", &proj, &["cloak", "internal/"]);
+    env.ok("alice", &proj, &["cloak", "internal/.env.plan"]);
     env.ok("alice", &proj, &["commit", "-m", "v1"]);
     env.ok("alice", &proj, &["tag", "set", "main", "-r", "@-"]);
     let mirror = env.root.join("mirror");
@@ -132,7 +132,7 @@ fn cloaked_content_and_public_mirrors() {
     let out = env.ok("bob", &env.root, &["clone", "mirror", "bob-public"]);
     assert!(out.contains("1 cloaked file(s)"), "{out}");
     assert!(env.root.join("bob-public/README.md").exists());
-    assert!(!env.root.join("bob-public/internal/plan.md").exists());
+    assert!(!env.root.join("bob-public/internal/.env.plan").exists());
     let grep = Command::new("grep").args(["-r", "secret plan"]).arg(&mirror).output().unwrap();
     assert!(grep.stdout.is_empty(), "plaintext leaked into the public mirror");
     // Pushed objects arrive zstd-packed, which grep cannot see into.
@@ -145,7 +145,7 @@ fn cloaked_content_and_public_mirrors() {
     env.ok("alice", &proj, &["push"]);
     env.ok("bob", &env.root, &["clone", "team", "bob-team"]);
     assert_eq!(
-        std::fs::read_to_string(env.root.join("bob-team/internal/plan.md")).unwrap(),
+        std::fs::read_to_string(env.root.join("bob-team/internal/.env.plan")).unwrap(),
         "the secret plan\n"
     );
 }

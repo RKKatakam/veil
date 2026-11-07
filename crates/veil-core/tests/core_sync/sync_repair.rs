@@ -19,7 +19,7 @@ fn history(repo: &mut Repo, fs: &MemoryBackend, n: usize) -> ObjectId {
         let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
         last = commit_files(repo, fs, &refs, &format!("c{i}"));
     }
-    repo.set_tag("main", last, None, true).unwrap();
+    repo.set_tag("main", last, true).unwrap();
     last
 }
 
@@ -74,8 +74,8 @@ fn a_clone_of_a_public_mirror_gets_the_ciphertext_from_the_team_remote() {
     let bob_id = Identity::generate("bob");
     alice.keys().grant("team", &bob_id.public_id(), "bob").unwrap();
     fs.write(&p(".veilpolicy"), b"secret/ cloak team\n").unwrap();
-    let c = commit_files(&mut alice, &*fs, &[("secret/plan.md", "the plan\n"), ("README", "hi\n")], "c");
-    alice.set_tag("main", c, None, true).unwrap();
+    let c = commit_files(&mut alice, &*fs, &[("secret/.env.plan", "the plan\n"), ("README", "hi\n")], "c");
+    alice.set_tag("main", c, true).unwrap();
     let mirror = Arc::new(MemoryBackend::new());
     let team = Arc::new(MemoryBackend::new());
     let pub_report = remote::push(&mut alice, mirror.clone(), true, &[], false).unwrap();
@@ -85,11 +85,11 @@ fn a_clone_of_a_public_mirror_gets_the_ciphertext_from_the_team_remote() {
     let bfs = Arc::new(MemoryBackend::new());
     let mut bob = Repo::init_for_clone(bfs.clone(), Some(bob_id), "bob").unwrap();
     remote::pull(&mut bob, "mirror", mirror).unwrap();
-    assert!(read_entry_opt(&bob, &c, "secret/plan.md").is_none(), "the mirror has no ciphertext");
+    assert!(read_entry_opt(&bob, &c, "secret/.env.plan").is_none(), "the mirror has no ciphertext");
     // Same snapshots, so nothing new at the snapshot level: the gap below
     // already-known snapshots is still filled.
     remote::pull(&mut bob, "team", team).unwrap();
-    assert_eq!(read_entry_opt(&bob, &c, "secret/plan.md").as_deref(), Some(&b"the plan\n"[..]));
+    assert_eq!(read_entry_opt(&bob, &c, "secret/.env.plan").as_deref(), Some(&b"the plan\n"[..]));
 }
 
 fn read_entry_opt(repo: &Repo, rev: &ObjectId, path: &str) -> Option<Vec<u8>> {

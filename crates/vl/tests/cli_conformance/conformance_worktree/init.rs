@@ -158,14 +158,14 @@ fn outer_repository_does_not_record_a_nested_repositorys_cloaked_files() {
     outer.commit("outer");
     let inner = env.bare_dir("outer/inner");
     inner.ok(&["init"]);
-    inner.ok(&["cloak", "secrets/"]);
-    inner.write("secrets/plan.txt", SECRET_PLAN);
+    inner.ok(&["cloak", "secrets/plan.pem"]);
+    inner.write("secrets/plan.pem", SECRET_PLAN);
     inner.commit("inner");
-    assert_eq!(inner.files("@-").iter().find(|f| f.path == "secrets/plan.txt").unwrap().vis, "cloaked:team");
+    assert_eq!(inner.files("@-").iter().find(|f| f.path == "secrets/plan.pem").unwrap().vis, "cloaked:team");
     outer.ok(&["status"]);
     let leaked: Vec<FileLine> = outer.files("@").into_iter().filter(|f| f.path.starts_with("inner/")).collect();
     assert!(
-        leaked.iter().all(|f| f.path != "inner/secrets/plan.txt" || f.vis != "public"),
+        leaked.iter().all(|f| f.path != "inner/secrets/plan.pem" || f.vis != "public"),
         "the inner repository's cloaked file is recorded in public by the outer one: {leaked:?}"
     );
 }
@@ -181,8 +181,8 @@ fn a_nested_repositorys_plaintext_never_leaves_the_outer_one() {
     outer.write("o.txt", "outer\n");
     let inner = env.bare_dir("outer/inner");
     inner.ok(&["init"]);
-    inner.ok(&["cloak", "secrets/"]);
-    inner.write("secrets/plan.txt", SECRET_PLAN);
+    inner.ok(&["cloak", "secrets/plan.pem"]);
+    inner.write("secrets/plan.pem", SECRET_PLAN);
     inner.write("notes.txt", "inner notes\n");
     inner.commit("inner");
     let st = outer.status();

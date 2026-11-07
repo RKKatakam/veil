@@ -159,28 +159,27 @@ fn same_size_edits_are_seen_with_a_warm_cache() {
     assert!(proj.join(".veil/local/statcache/other.cache").is_file());
 }
 
-/// BUG-757: `vl restore` of a cloaked file whose directory was deleted (by
-/// `rm -r`, `git clean`) put the file back, then failed with `not found`:
-/// the restored entry was set into a tree that no longer had its directory.
+/// BUG-757: `vl restore` of a cloaked file (a `.env.*`, under `init`'s
+/// `cloak rule`) whose directory was deleted (by `rm -r`, `git clean`) put
+/// the file back, then failed with `not found`: the restored entry was set
+/// into a tree that no longer had its directory.
 #[test]
 fn restoring_a_cloaked_file_into_a_deleted_directory_works() {
     let env = Env::new();
     let proj = env.dir("proj");
     env.ok(&proj, &["init"]);
-    let policy = std::fs::read_to_string(proj.join(".veilpolicy")).unwrap();
-    write(&proj, ".veilpolicy", &format!("{policy}secrets/ cloak\n"));
-    write(&proj, "secrets/deep/db.yml", "password: hunter2\n");
+    write(&proj, "secrets/deep/.env.db", "password: hunter2\n");
     write(&proj, "plain/f.txt", "plain\n");
     env.ok(&proj, &["commit", "-m", "v1"]);
     std::fs::remove_dir_all(proj.join("secrets")).unwrap();
     std::fs::remove_dir_all(proj.join("plain")).unwrap();
-    let out = env.ok(&proj, &["restore", "secrets/deep/db.yml"]);
+    let out = env.ok(&proj, &["restore", "secrets/deep/.env.db"]);
     assert!(out.contains("Restored 1 path(s)"), "{out}");
-    assert_eq!(read(&proj, "secrets/deep/db.yml"), "password: hunter2\n");
+    assert_eq!(read(&proj, "secrets/deep/.env.db"), "password: hunter2\n");
     env.ok(&proj, &["restore", "plain/f.txt"]);
     assert_eq!(read(&proj, "plain/f.txt"), "plain\n");
     let st = env.ok(&proj, &["status"]);
     assert!(st.contains("no changes"), "{st}");
     let ls = env.stdout(&proj, &["ls", "-r", "@"]);
-    assert!(ls.lines().any(|l| l.starts_with("cloaked") && l.ends_with("secrets/deep/db.yml")), "{ls}");
+    assert!(ls.lines().any(|l| l.starts_with("cloaked") && l.ends_with("secrets/deep/.env.db")), "{ls}");
 }

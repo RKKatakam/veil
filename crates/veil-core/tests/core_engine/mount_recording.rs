@@ -46,7 +46,7 @@ fn parent_has(repo: &Repo, path: &str) -> bool {
 fn undo_redo_and_op_restore_skip_mount_recordings_and_keep_them() {
     let (mut repo, fs, _) = new_repo("alice");
     let base = commit_files(&mut repo, &*fs, &[("a.txt", "a\n")], "base");
-    repo.create_workspace("agent", vec![base], None).unwrap();
+    repo.create_workspace("agent", vec![base]).unwrap();
     let before_commit = repo.op_id();
     commit_files(&mut repo, &*fs, &[("c.txt", "c\n")], "project commit");
     assert!(parent_has(&repo, "c.txt"));
@@ -85,7 +85,7 @@ fn undo_redo_and_op_restore_skip_mount_recordings_and_keep_them() {
 fn only_mount_recordings_and_the_own_snapshot_are_skipped() {
     let (mut repo, fs, _) = new_repo("alice");
     let base = commit_files(&mut repo, &*fs, &[("a.txt", "a\n")], "base");
-    repo.create_workspace("agent", vec![base], None).unwrap();
+    repo.create_workspace("agent", vec![base]).unwrap();
     let o = repo.workspace_overlay("agent").unwrap();
     o.write(&p("w.txt"), b"w\n").unwrap();
     repo.snapshot_workspace("agent", &o).unwrap();
@@ -113,15 +113,13 @@ fn only_mount_recordings_and_the_own_snapshot_are_skipped() {
 #[test]
 fn a_restored_sealed_version_stays_sealed_on_the_recovery_path() {
     let (mut repo, fs, _) = new_repo("alice");
-    let base = commit_files(&mut repo, &*fs, &[("f.txt", "public\n")], "base");
-    repo.create_workspace("sec", vec![base], Some("team".into())).unwrap();
-    let o = repo.workspace_overlay("sec").unwrap();
-    o.write(&p("f.txt"), b"SEALED-0492\n").unwrap();
-    let sealed_at = repo.snapshot_workspace("sec", &o).unwrap().snapshot;
-    let sealed = file_entry(&repo, &sealed_at, "f.txt").unwrap();
-    assert_eq!(sealed.visibility, Visibility::Cloaked { scope: "team".into() });
+    commit_files(&mut repo, &*fs, &[("f.txt", "public\n")], "base");
+    // A version of `f.txt` sealed for `team` (as a secret file's is).
+    let team = Visibility::Cloaked { scope: "team".into() };
+    let id = repo.store().store_file(b"SEALED-0492\n", &team).unwrap();
+    let sealed = veil_core::TreeEntry { visibility: team, size: 12, ..file("f.txt", id) };
 
-    // What `vl restore -r sec@ f.txt` wrote.
+    // What `vl restore -r <it> f.txt` wrote.
     fs.write(&p("f.txt"), b"SEALED-0492\n").unwrap();
     let held = repo.workspace_wc(WS).unwrap();
     let carried = [(p("f.txt"), sealed.clone())];

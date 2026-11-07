@@ -333,17 +333,17 @@ fn clone_before_a_grant_gets_redactions_then_the_file_after_grant_and_pull() {
     let env = Env::new();
     let proj = env.dir("proj");
     env.ok("alice", &proj, &["init"]);
-    env.ok("alice", &proj, &["cloak", "secrets/"]);
-    write(&proj, "secrets/notes.md", "internal notes\n");
+    env.ok("alice", &proj, &["cloak", "secrets/.env.notes"]);
+    write(&proj, "secrets/.env.notes", "internal notes\n");
     write(&proj, "README", "hi\n");
     env.ok("alice", &proj, &["commit", "-m", "c"]);
     env.ok("alice", &proj, &["tag", "set", "main", "-r", "@-"]);
     env.ok("alice", &proj, &["remote", "add", "origin", "../hub"]);
     env.ok("alice", &proj, &["push"]);
     let c = env.clone("bob", &env.path("hub"), "c");
-    assert!(!c.join("secrets/notes.md").exists());
+    assert!(!c.join("secrets/.env.notes").exists());
     let st = env.ok("bob", &c, &["status"]);
-    assert!(st.contains("secrets/notes.md"), "{st}");
+    assert!(st.contains("secrets/.env.notes"), "{st}");
     let key = env.pubkey("bob");
     env.ok(
         "alice",
@@ -353,5 +353,5 @@ fn clone_before_a_grant_gets_redactions_then_the_file_after_grant_and_pull() {
     env.ok("alice", &proj, &["push"]);
     let out = env.ok("bob", &c, &["pull"]);
     assert!(out.contains("Filled in 1 file"), "{out}");
-    assert_eq!(read(&c, "secrets/notes.md"), "internal notes\n");
+    assert_eq!(read(&c, "secrets/.env.notes"), "internal notes\n");
 }

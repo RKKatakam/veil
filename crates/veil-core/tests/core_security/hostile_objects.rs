@@ -114,7 +114,7 @@ fn builder_never_records_dot_veil_directories() {
 fn damaged_object_is_repaired_by_pulling_it_again() {
     let (mut alice, afs, _) = new_repo("alice");
     let c = commit_files(&mut alice, &*afs, &[("a.txt", "trusted\n")], "c");
-    alice.set_tag("main", c, None, true).unwrap();
+    alice.set_tag("main", c, true).unwrap();
     let remote_fs = Arc::new(MemoryBackend::new());
     remote::push(&mut alice, remote_fs.clone(), false, &[], false).unwrap();
 
@@ -232,7 +232,7 @@ fn set_tag_refuses_trees_and_revsets_refuse_non_snapshots() {
     let (mut repo, fs, _) = new_repo("alice");
     let c = commit_files(&mut repo, &*fs, &[("a.txt", "a\n")], "c");
     let tree = repo.snapshot(&c).unwrap().tree;
-    assert!(repo.set_tag("t", tree, None, true).is_err());
+    assert!(repo.set_tag("t", tree, true).is_err());
     let blob_id = file_entry(&repo, &c, "a.txt").unwrap().id;
     assert!(resolve(&repo, &blob_id.hex(), WS).is_err(), "a blob id resolved as a revision");
     assert_eq!(resolve(&repo, &c.hex(), WS).unwrap(), c);

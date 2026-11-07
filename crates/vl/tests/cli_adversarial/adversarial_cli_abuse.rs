@@ -457,14 +457,15 @@ fn cloaking_a_file_with_glob_metacharacters_cloaks_that_file() {
     let env = Env::new();
     let proj = env.dir("proj");
     env.ok("alice", &proj, &["init"]);
-    write(&proj, "config[prod].yml", "prod creds: correct-horse\n");
+    write(&proj, "config[prod].pem", "prod creds: correct-horse\n");
     write(&proj, "notes{1}.txt", "private\n");
-    write(&proj, "app/[id]/token?.json", "t\n");
-    let msg = env.ok("alice", &proj, &["cloak", "config[prod].yml", "app/[id]/token?.json"]);
+    write(&proj, "app/[id]/token?.pem", "t\n");
+    let msg = env.ok("alice", &proj, &["cloak", "config[prod].pem", "app/[id]/token?.pem"]);
     assert!(msg.contains("Added rule"));
     env.ok("alice", &proj, &["isolate", "notes{1}.txt"]);
     env.ok("alice", &proj, &["commit", "-m", "c"]);
     let files = env.stdout("alice", &proj, &["files", "-r", "@-"]);
+    assert!(files.contains("config[prod].pem") && files.contains("app/[id]/token?.pem"), "{files}");
     for line in files.lines() {
         if line.contains("config[prod]") || line.contains("token?") {
             assert!(line.starts_with("cloaked"), "told it was cloaked, recorded as: {line}");

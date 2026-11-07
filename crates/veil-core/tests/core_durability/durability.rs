@@ -9,8 +9,7 @@
 use std::sync::{Arc, Mutex};
 
 use veil_core::{
-    lock::{LockInfo, RepoLock, LOCK_PATH},
-    now_millis, remote,
+    repo::REPO_FORMAT, remote,
     vfs::{DirEntry, Metadata},
     DiskBackend, Identity, MemoryBackend, ObjectId, Repo, Result, StorageBackend, VPath,
 };
@@ -104,7 +103,7 @@ fn assert_ordered(calls: &[Call], what: &str, format: u32) {
     let op = pos(&|c| matches!(c, Call::Write(p) if p.starts_with(".veil/ops/")))
         .unwrap_or_else(|| panic!("{what}: no op written: {calls:?}"));
     let head = match format {
-        6 => pos(&|c| matches!(c, Call::CreateNew(p) if p.starts_with(".veil/op_heads/"))).expect("head file created"),
+        f if f >= 6 => pos(&|c| matches!(c, Call::CreateNew(p) if p.starts_with(".veil/op_heads/"))).expect("head file created"),
         _ => pos(&|c| matches!(c, Call::Write(p) if p == ".veil/op_head")).expect("head written"),
     };
     let barrier = calls[..op]
@@ -114,7 +113,7 @@ fn assert_ordered(calls: &[Call], what: &str, format: u32) {
     let unsynced: Vec<usize> = (0..calls.len()).filter(|i| matches!(calls[*i], Call::Unsynced(_))).collect();
     assert!(!unsynced.is_empty(), "{what}: objects were written durably one by one");
     assert!(barrier < op && op < head, "{what}: order is objects, barrier, op, head: {calls:?}");
-    if format == 6 {
+    if format >= 6 {
         let renames: Vec<usize> = (0..calls.len()).filter(|i| matches!(calls[*i], Call::Rename(_))).collect();
         let first_barrier = calls.iter().position(|c| *c == Call::Barrier).unwrap();
         assert!(!renames.is_empty(), "{what}: nothing published: {calls:?}");
@@ -141,10 +140,8 @@ fn assert_ordered(calls: &[Call], what: &str, format: u32) {
 fn transactions_sync_objects_once_before_the_operation() {
     let tmp = tempfile::tempdir().unwrap();
     for (n, (format, inner)) in [
-        (5, Arc::new(MemoryBackend::new()) as Arc<dyn StorageBackend>),
-        (5, Arc::new(DiskBackend::new(tmp.path().join("5"))) as Arc<dyn StorageBackend>),
-        (6, Arc::new(MemoryBackend::new()) as Arc<dyn StorageBackend>),
-        (6, Arc::new(DiskBackend::new(tmp.path().join("6"))) as Arc<dyn StorageBackend>),
+        (REPO_FORMAT, Arc::new(MemoryBackend::new()) as Arc<dyn StorageBackend>),
+        (REPO_FORMAT, Arc::new(DiskBackend::new(tmp.path().join("8"))) as Arc<dyn StorageBackend>),
     ]
     .into_iter()
     .enumerate()
@@ -163,7 +160,7 @@ fn transactions_sync_objects_once_before_the_operation() {
         repo.snapshot_workspace("default", &*inner).unwrap();
         assert_ordered(&rec.take(), "snapshot", format);
         let (c, _) = repo.commit_working_copy("default", "c").unwrap();
-        repo.set_tag("main", c, None, false).unwrap();
+        repo.set_tag("main", c, false).unwrap();
 
         // Pull into a fresh clone: the copied objects go through the barrier too.
         let clone_fs = Arc::new(Recorder {
@@ -229,55 +226,6 @@ fn walkdir(dir: &std::path::Path) -> Vec<String> {
         }
     }
     out
-}
-
-/// After a power loss the lock of the dead holder is still on disk, and some
-/// of its unsynced objects are torn. Taking the lock over removes exactly
-/// those, so the next transaction rewrites them instead of trusting them.
-#[test]
-#[cfg(unix)]
-fn taking_over_a_crashed_lock_discards_torn_objects() {
-    let tmp = tempfile::tempdir().unwrap();
-    let fs: Arc<dyn StorageBackend> = Arc::new(DiskBackend::new(tmp.path()));
-    let id = Identity::generate("alice");
-    // The unsynced-object protocol and its recovery: formats ≤ 5 (and
-    // network remotes); format 6 stages objects instead.
-    let mut repo = Repo::init_for_clone_at(fs.clone(), Some(id.clone()), "alice", 5).unwrap();
-    let good = repo.store().put(&veil_core::object::Object::Blob(b"kept".to_vec())).unwrap();
-    let torn = ObjectId::hash(b"some object the dead holder was writing");
-    let torn_path = p(&format!(".veil/objects/{}/{}", &torn.hex()[..2], &torn.hex()[2..]));
-    fs.write(&torn_path, b"").unwrap();
-
-    // A dead process's lock, from this machine, taken just before the crash.
-    let mine = {
-        let _l = RepoLock::acquire(fs.clone()).unwrap();
-        RepoLock::holder(&*fs).unwrap().unwrap()
-    };
-    let mut child = std::process::Command::new("true").spawn().unwrap();
-    let dead = child.id();
-    child.wait().unwrap();
-    let crashed = LockInfo {
-        pid: dead,
-        token: "00".repeat(16),
-        acquired: now_millis() - 1000,
-        renewed: now_millis() - 1000,
-        ..mine
-    };
-    fs.write(&p(LOCK_PATH), &serde_json::to_vec(&crashed).unwrap()).unwrap();
-
-    let report = veil_core::fsck::fsck(fs.clone(), Some(id.clone())).unwrap();
-    assert!(report.is_ok(), "a torn unreachable object under a leftover lock is a note: {report:?}");
-
-    let tx = repo.transaction("after the crash").unwrap();
-    assert!(!fs.exists(&torn_path).unwrap(), "torn object removed");
-    assert!(repo_has(&tx, &good), "intact object kept");
-    drop(tx);
-    let report = veil_core::fsck::fsck(fs, Some(id)).unwrap();
-    assert!(report.is_ok() && report.findings.iter().all(|f| !f.message.contains("torn")), "{report:?}");
-}
-
-fn repo_has(tx: &veil_core::transaction::Transaction<'_>, id: &ObjectId) -> bool {
-    tx.repo().store().has(id)
 }
 
 /// Incompressible bytes, deterministic from `seed`.

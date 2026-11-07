@@ -24,19 +24,20 @@ const FIX_MARKER: &str = "verify_signature_of_the_embargoed_fix_4c1d";
 fn embargoed_fix() -> (Repo, Arc<MemoryBackend>, Identity, Arc<MemoryBackend>, String, ObjectId) {
     let (mut alice, fs, id) = new_repo("alice");
     let main = commit_files(&mut alice, &*fs, &[("auth.rs", "fn check() -> bool { true }\n")], "v1");
-    alice.set_tag("main", main, None, false).unwrap();
+    alice.set_tag("main", main, false).unwrap();
     let mirror = Arc::new(MemoryBackend::new());
     remote::push(&mut alice, mirror.clone(), true, &[], false).unwrap();
-    alice.create_workspace("fix", vec![main], None).unwrap();
+    alice.create_workspace("fix", vec![main]).unwrap();
     let ov = alice.workspace_overlay("fix").unwrap();
     ov.write(&p("auth.rs"), format!("fn check() -> bool {{ {FIX_MARKER}() }}\n").as_bytes()).unwrap();
     let fix = alice.snapshot_workspace("fix", &ov).unwrap().snapshot;
     let r = alice
         .merge(WS, main, vec![fix], "merge the fix", Some(EmbargoSpec { scope: "team".into(), until: None }))
         .unwrap();
-    alice.set_tag("main", r.snapshot, None, false).unwrap();
+    alice.set_tag("main", r.snapshot, false).unwrap();
     let e = r.embargo.unwrap();
-    assert_eq!(remote::withheld_by_embargo(&alice, &e).unwrap(), vec![fix], "control: the fix is withheld");
+    let withheld = remote::withheld_by_embargo(&alice, &e).unwrap();
+    assert!(withheld.contains(&fix) && withheld.contains(&r.snapshot), "control: the merge and the fix are withheld: {withheld:?}");
     (alice, fs, id, mirror, e, fix)
 }
 
@@ -99,7 +100,7 @@ proptest! {
     fn nothing_withheld_is_ever_pushed(ops in prop::collection::vec(op(), 1..14)) {
         let (mut alice, fs, _) = new_repo("alice");
         let base = commit_files(&mut alice, &*fs, &[("a.txt", "base\n")], "base");
-        alice.set_tag("main", base, None, false).unwrap();
+        alice.set_tag("main", base, false).unwrap();
         let (mirror, team) = (Arc::new(MemoryBackend::new()), Arc::new(MemoryBackend::new()));
         let mut fixes: Vec<(String, usize)> = Vec::new();
         let mut attempts = 0;
@@ -110,14 +111,14 @@ proptest! {
                     let ws = alice.ephemeral_workspace(main).unwrap();
                     ws.write(&format!("f{}.txt", n % 5), format!("edit {n}\n")).unwrap();
                     if let Ok((c, _)) = alice.commit_ephemeral(&ws, "edit") {
-                        alice.set_tag("main", c, None, true).unwrap();
+                        alice.set_tag("main", c, true).unwrap();
                     }
                 }
                 Op::Embargo(n) => {
                     let main = alice.view().tags["main"].target;
                     attempts += 1;
                     let ws = format!("fix{attempts}");
-                    alice.create_workspace(&ws, vec![main], None).unwrap();
+                    alice.create_workspace(&ws, vec![main]).unwrap();
                     let ov = alice.workspace_overlay(&ws).unwrap();
                     ov.write(&p(&format!("fix{n}-{attempts}.txt")), format!("{}\n", marker(fixes.len())).as_bytes()).unwrap();
                     // Refused when `main` combines embargoes whose releases
@@ -125,7 +126,7 @@ proptest! {
                     let Ok(fix) = alice.snapshot_workspace(&ws, &ov).map(|s| s.snapshot) else { continue };
                     let spec = EmbargoSpec { scope: "team".into(), until: None };
                     if let Ok(r) = alice.merge(WS, main, vec![fix], "merge", Some(spec)) {
-                        alice.set_tag("main", r.snapshot, None, true).unwrap();
+                        alice.set_tag("main", r.snapshot, true).unwrap();
                         fixes.push((r.embargo.unwrap(), fixes.len()));
                     }
                 }
@@ -167,7 +168,7 @@ fn many_concurrent_pushers_to_one_repository() {
     let root = tmp.path().join("hub");
     let (mut alice, fs, id) = new_repo("alice");
     let base = commit_files(&mut alice, &*fs, &[("a.txt", "base\n")], "base");
-    alice.set_tag("main", base, None, false).unwrap();
+    alice.set_tag("main", base, false).unwrap();
     remote::push(&mut alice, Arc::new(veil_core::DiskBackend::new(&root)), false, &[], false).unwrap();
     const N: usize = 12;
     let threads: Vec<_> = (0..N)
@@ -184,7 +185,7 @@ fn many_concurrent_pushers_to_one_repository() {
                     let body: String = (0..300).map(|j| format!("{i}-{round}-{j} ")).collect();
                     ws.write(&format!("agents/{i}.txt"), &body).unwrap();
                     let (c, _) = me.commit_ephemeral(&ws, "work").unwrap();
-                    me.set_tag(&format!("agent-{i}"), c, None, true).unwrap();
+                    me.set_tag(&format!("agent-{i}"), c, true).unwrap();
                     let rep = remote::push(&mut me, hub.clone(), false, &[format!("agent-{i}")], false).unwrap();
                     assert!(rep.tags_updated.iter().any(|(t, s)| *t == format!("agent-{i}") && *s == c), "{rep:#?}");
                     tips.push((c, body));

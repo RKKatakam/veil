@@ -7,13 +7,13 @@ use std::process::Stdio;
 
 use adversarial_support::*;
 
-/// A project with a public file and a cloaked one, tagged `main`, pushed
+/// A project with a public file and a cloaked secret file, tagged `main`, pushed
 /// to a team remote (`team`) and a public mirror (`mirror`).
 fn cloaked_project(env: &Env) -> std::path::PathBuf {
     let proj = env.project(
         "alice",
         "proj",
-        &[(".veilpolicy", "internal/ cloak team\n"), ("internal/plan.md", "the plan\n"), ("README", "hi\n")],
+        &[(".veilpolicy", ".env.* cloak team\n"), ("internal/.env.plan", "the plan\n"), ("README", "hi\n")],
     );
     let team = env.root.join("team");
     let mirror = env.root.join("mirror");
@@ -127,19 +127,21 @@ fn a_push_with_a_diverged_tag_fails_but_still_pushes_the_others() {
     env.ok("alice", &proj, &["push"]);
 }
 
-/// Tags held back by design (a cloaked tag on a public remote) do not fail
+/// Tags held back by design (on an unreleased embargoed merge) do not fail
 /// an all-tags push, but a tag asked for by name that is not pushed does.
 #[test]
 fn a_requested_tag_that_is_held_back_fails_the_push() {
     let env = Env::new();
     let proj = cloaked_project(&env);
-    env.ok("alice", &proj, &["tag", "set", "secret-line", "-r", "main", "--cloak", "team"]);
+    env.ok("alice", &proj, &["ws", "new", "fix", "-r", "main"]);
+    env.ok("alice", &proj, &["ws", "exec", "fix", "-m", "fix", "--", "sh", "-c", "printf 'fixed\\n' > README"]);
+    env.ok("alice", &proj, &["merge", "fix@", "--into", "main", "--embargo", "-m", "Fix"]);
     let out = env.vl("alice", &proj, &["push", "mirror"]);
     assert!(out.status.success(), "{}", text(&out));
-    assert!(text(&out).contains("skipped secret-line"), "{}", text(&out));
-    let out = env.vl("alice", &proj, &["push", "mirror", "-t", "secret-line"]);
+    assert!(text(&out).contains("skipped main"), "{}", text(&out));
+    let out = env.vl("alice", &proj, &["push", "mirror", "-t", "main"]);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
-    assert!(stderr(&out).contains("requested tag was not pushed: secret-line"), "{}", text(&out));
+    assert!(stderr(&out).contains("requested tag was not pushed: main"), "{}", text(&out));
 }
 
 // ---- BUG-082: lock times ----------------------------------------------------
@@ -167,7 +169,7 @@ fn reading_a_cloaked_file_from_a_public_clone_explains_why_it_is_withheld() {
     assert!(!out.contains("next `vl pull`"), "a pull from the mirror never brings them:\n{out}");
     let carol = env.root.join("carol");
 
-    let out = env.vl("carol", &carol, &["cat", "internal/plan.md", "-r", "main"]);
+    let out = env.vl("carol", &carol, &["cat", "internal/.env.plan", "-r", "main"]);
     let err = stderr(&out);
     assert!(!out.status.success());
     assert!(!err.contains("not present in this store"), "{err}");
@@ -186,7 +188,7 @@ fn reading_a_cloaked_file_without_a_key_says_to_ask_for_a_grant() {
     let out = env.ok("bob", &env.root, &["clone", "team", "bob"]);
     assert!(out.contains("1 cloaked file(s) (scope 'team') you hold no key for"), "{out}");
     let bob = env.root.join("bob");
-    let out = env.vl("bob", &bob, &["cat", "internal/plan.md", "-r", "main"]);
+    let out = env.vl("bob", &bob, &["cat", "internal/.env.plan", "-r", "main"]);
     let err = stderr(&out);
     assert!(err.contains("you hold no key") && err.contains("vl scope grant team"), "{err}");
     let show = env.stdout("bob", &bob, &["show", "main"]);
@@ -199,7 +201,7 @@ fn reading_a_cloaked_file_without_a_key_says_to_ask_for_a_grant() {
 fn an_embargoed_merge_reports_files_as_public_on_release_and_an_absolute_deadline() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("auth.rs", "v1\n")]);
-    env.ok("alice", &proj, &["ws", "new", "fix", "-r", "main", "--cloak", "team"]);
+    env.ok("alice", &proj, &["ws", "new", "fix", "-r", "main"]);
     env.ok("alice", &proj, &["ws", "exec", "fix", "-m", "fix", "--", "sh", "-c", "printf 'v2\\n' > auth.rs"]);
     let out = env
         .cmd("alice", &proj, &["merge", "fix@", "--into", "main", "--embargo", "--until", "2099-12-01T09:00:00Z", "-m", "Fix"])
@@ -210,8 +212,7 @@ fn an_embargoed_merge_reports_files_as_public_on_release_and_an_absolute_deadlin
     let all = text(&out);
     assert!(out.status.success(), "{all}");
     assert!(all.contains("until 2099-12-01 10:00:00 +01:00 (09:00:00 UTC)"), "{all}");
-    assert!(all.contains("public on release (from the cloaked line; secret-scanned): auth.rs"), "{all}");
-    assert!(!all.contains("published from the cloaked line"), "{all}");
+    assert!(all.contains("the merge and the history it brings in stay with") && all.contains("pushes hold them back"), "{all}");
 
     let out = env.cmd("alice", &proj, &["embargo", "list"]).env("TZ", "CET-1").output().unwrap();
     assert!(text(&out).contains("until 2099-12-01 10:00:00 +01:00 (09:00:00 UTC)"), "{}", text(&out));

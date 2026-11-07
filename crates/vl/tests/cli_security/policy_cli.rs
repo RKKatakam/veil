@@ -29,17 +29,17 @@ fn explicit_globs_still_match_as_globs() {
     let env = Env::new();
     let proj = env.dir("proj");
     env.ok("alice", &proj, &["init"]);
-    write(&proj, "config/a.yml", "a\n");
-    write(&proj, "config/b.yml", "b\n");
+    write(&proj, "config/a.pem", "a\n");
+    write(&proj, "config/b.pem", "b\n");
     write(&proj, "config/c.txt", "c\n");
     write(&proj, "logs/x1.log", "x\n");
-    let out = env.ok("alice", &proj, &["cloak", "config/*.yml"]);
+    let out = env.ok("alice", &proj, &["cloak", "config/*.pem"]);
     assert!(!out.contains("literal path"), "{out}");
     env.ok("alice", &proj, &["isolate", "logs/x[0-9].log"]);
     env.ok("alice", &proj, &["commit", "-m", "c"]);
     let files = recorded(&env, &proj);
-    assert!(tier_of(&files, "config/a.yml").unwrap().starts_with("cloaked"), "{files:?}");
-    assert!(tier_of(&files, "config/b.yml").unwrap().starts_with("cloaked"), "{files:?}");
+    assert!(tier_of(&files, "config/a.pem").unwrap().starts_with("cloaked"), "{files:?}");
+    assert!(tier_of(&files, "config/b.pem").unwrap().starts_with("cloaked"), "{files:?}");
     assert_eq!(tier_of(&files, "config/c.txt"), Some("public"), "{files:?}");
     assert_eq!(tier_of(&files, "logs/x1.log"), None, "{files:?}");
 }
@@ -49,20 +49,22 @@ fn literal_directories_and_names_with_spaces_or_hashes() {
     let env = Env::new();
     let proj = env.dir("proj");
     env.ok("alice", &proj, &["init"]);
-    write(&proj, "app/[id]/page.tsx", "p\n");
+    write(&proj, "app/[id]/deploy.pem", "p\n");
+    write(&proj, "app/i/deploy.pem", "should stay local\n");
     write(&proj, "app/i/page.tsx", "should stay public\n");
     write(&proj, "my notes.txt", "private\n");
     write(&proj, "issue#12.md", "private\n");
-    let out = env.ok("alice", &proj, &["cloak", "app/[id]/"]);
+    let out = env.ok("alice", &proj, &["cloak", "app/[id]/deploy.pem"]);
     assert!(out.contains("literal path"), "{out}");
     env.ok("alice", &proj, &["isolate", "my notes.txt", "issue#12.md"]);
     let policy = env.stdout("alice", &proj, &["policy", "show"]);
     let all = env.ok("alice", &proj, &["policy", "show"]);
     assert!(!all.contains("warning"), "the written rules must parse cleanly:\n{all}");
-    assert!(policy.contains(r"app/\[id\]/"), "{policy}");
+    assert!(policy.contains(r"app/\[id\]/deploy.pem"), "{policy}");
     env.ok("alice", &proj, &["commit", "-m", "c"]);
     let files = recorded(&env, &proj);
-    assert!(tier_of(&files, "app/[id]/page.tsx").unwrap().starts_with("cloaked"), "{files:?}");
+    assert!(tier_of(&files, "app/[id]/deploy.pem").unwrap().starts_with("cloaked"), "{files:?}");
+    assert_eq!(tier_of(&files, "app/i/deploy.pem"), None, "a glob `[id]` would have cloaked it: {files:?}");
     assert_eq!(tier_of(&files, "app/i/page.tsx"), Some("public"), "{files:?}");
     assert_eq!(tier_of(&files, "my notes.txt"), None, "{files:?}");
     assert_eq!(tier_of(&files, "issue#12.md"), None, "{files:?}");
@@ -122,14 +124,15 @@ fn uppercase_secret_files_are_isolated_and_cloak_rules_ignore_case() {
     let proj = env.dir("proj");
     env.ok("alice", &proj, &["init"]);
     write(&proj, ".NETRC", "X=1\n");
-    write(&proj, "Secrets/a.txt", "s\n");
+    write(&proj, "Secrets/.env.prod", "s\n");
     write(&proj, "Fixtures/key.pem", "not a key\n");
-    env.ok("alice", &proj, &["cloak", "secrets/"]);
+    env.ok("alice", &proj, &["cloak", "secrets/.env.prod"]);
     env.ok("alice", &proj, &["expose", "--force", "fixtures/"]);
     env.ok("alice", &proj, &["commit", "-m", "c"]);
     let files = recorded(&env, &proj);
     assert_eq!(tier_of(&files, ".NETRC"), None, "{files:?}");
-    assert!(tier_of(&files, "Secrets/a.txt").unwrap().starts_with("cloaked"), "{files:?}");
+    // `cloaked:team`, not the scope of `init`'s `.env.* cloak rule`.
+    assert_eq!(tier_of(&files, "Secrets/.env.prod"), Some("cloaked:team"), "{files:?}");
     // `public!` is case-sensitive: it does not expose `Fixtures/`.
     assert_eq!(tier_of(&files, "Fixtures/key.pem"), None, "{files:?}");
 }
