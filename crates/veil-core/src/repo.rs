@@ -113,9 +113,9 @@ pub fn check_format_upgradable(format: u32) -> Result<()> {
     if format < MIN_UPGRADE_FORMAT {
         return Err(VeilError::Unsupported(format!(
             "this repository uses format {format}, which this vl no longer reads (formats 1 to {} were dropped). \
-             Nothing was changed. Upgrade it to format 7 with vl {} first (`vl upgrade` there), then run `vl upgrade` here",
-            MIN_UPGRADE_FORMAT - 1,
-            min_vl_for_format(7)
+             Nothing was changed. Upgrade it to format 7 first with a vl from before format 8 (`vl upgrade` there), \
+             then run `vl upgrade` here",
+            MIN_UPGRADE_FORMAT - 1
         )));
     }
     Ok(())

@@ -177,8 +177,8 @@ impl Vis {
 #[derive(Serialize, Debug, Clone)]
 pub struct Redaction {
     /// `no_key` (cloaked for a scope you hold no key for, or unreadable),
-    /// `withheld` (never received: a public mirror never delivers it), `not_released`
-    /// (an unreleased embargo), `unwritable` (readable, but this
+    /// `withheld` (never received: a public mirror never delivers it),
+    /// `unwritable` (readable, but this
     /// filesystem could not hold the file), `missing` (a public object
     /// absent from the store: damage, not a redaction) or `error` (the
     /// store could not read it).

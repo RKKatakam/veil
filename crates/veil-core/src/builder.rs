@@ -1443,6 +1443,14 @@ impl<'a> Builder<'a> {
             }
             return Ok(Some(ce.clone()));
         }
+        // The rendering checkout wrote while a side was unreadable here, not
+        // refreshed since (a grant arrived): the conflict as recorded, never
+        // an edit of it.
+        if let Some(rec) = self.opts.materialised {
+            if !local_only && rec.from_fallback(self.store, path)? == Some(Object::blob_id(&data)) {
+                return Ok(Some(ce.clone()));
+            }
+        }
         if m.unreadable_side && !local_only {
             return self.cannot_seal(
                 path,

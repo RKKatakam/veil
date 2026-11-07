@@ -207,6 +207,24 @@ fn notes_for(from: u32, to: u32) -> Vec<String> {
     notes
 }
 
+/// The refusal of an upgrade of a repository holding `removed`
+/// ([`removed_content`]), naming each thing.
+fn removed_refusal(removed: &[String]) -> VeilError {
+    let n = removed.len();
+    let mut list: Vec<String> = removed.iter().take(MAX_REMOVED_LISTED).cloned().collect();
+    if n > MAX_REMOVED_LISTED {
+        list.push(format!("… and {} more", n - MAX_REMOVED_LISTED));
+    }
+    // One line: the CLI prints errors escaped (a path here is untrusted).
+    VeilError::repo(format!(
+        "upgrade refused: this repository holds {n} thing(s) encrypted by features vl no longer has \
+         (only secret files are encrypted from format {REPO_FORMAT} on), and converting them would \
+         rewrite its whole history. Nothing was changed. Found: {}. Keep using the vl that wrote it \
+         (format 7 or earlier), or start a new repository from a checkout of the files",
+        list.join("; ")
+    ))
+}
+
 /// Most findings [`removed_content`] names one by one.
 const MAX_REMOVED_LISTED: usize = 50;
 
@@ -320,6 +338,17 @@ pub fn upgrade(
     opts: &UpgradeOptions,
 ) -> Result<UpgradeReport> {
     check_format_upgradable(opts.to)?;
+    // Before any lock is taken (a lock leaves its file): a format this
+    // build does not read, or a repository it would refuse, is left exactly
+    // as it was. The check is repeated under the lock.
+    let config = read_config(&*backend)?;
+    check_format_upgradable(config.format)?;
+    if !opts.dry_run && config.format < REPO_FORMAT {
+        let removed = removed_content(&backend)?;
+        if !removed.is_empty() {
+            return Err(removed_refusal(&removed));
+        }
+    }
     // The gc lease first (threat 10 of the maintenance design): no gc or
     // background maintenance runs while the format changes under it.
     let _lease = match opts.dry_run {
@@ -423,19 +452,7 @@ pub fn upgrade(
                 if j.done.is_empty() {
                     backend.remove_file(&journal_path())?;
                 }
-                let n = report.removed.len();
-                let mut list: Vec<String> = report.removed.iter().take(MAX_REMOVED_LISTED).map(|f| format!("  {f}")).collect();
-                if n > MAX_REMOVED_LISTED {
-                    list.push(format!("  … and {} more", n - MAX_REMOVED_LISTED));
-                }
-                return Err(VeilError::repo(format!(
-                    "upgrade refused: this repository holds {n} thing(s) encrypted by features vl no longer has \
-                     (only secret files are encrypted from format {REPO_FORMAT} on), and converting them would \
-                     rewrite its whole history. Nothing was changed:\n{}\nKeep using vl {} for it, or start a \
-                     new repository from a checkout of the files",
-                    list.join("\n"),
-                    min_vl_for_format(7)
-                )));
+                return Err(removed_refusal(&report.removed));
             }
             let fsck = fsck(backend.clone(), identity.clone())?;
             report.corrupt = fsck

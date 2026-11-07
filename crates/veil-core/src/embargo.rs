@@ -9,13 +9,15 @@
 //! only secret files ever are (`docs/VISIBILITY.md`). Until the embargo is
 //! released (by `vl embargo release`, or at its deadline) the merge, the
 //! history it brings in and anything built on it never leave this
-//! repository for a public receiver (`remote::embargo_withheld`), and the
+//! repository for any receiver (`remote::embargo_withheld`), and the
 //! Veil server refuses embargoed merges until it enforces them as
 //! permissions (`docs/HUB.md` §13.8).
 //!
 //! Embargoes never overlap (Veil 1.0): a new embargoed merge of, or into, a
 //! line that carries an unreleased embargo is refused before anything is
-//! recorded (`Repo::merge`).
+//! recorded (`Repo::merge`). Combining two embargoed lines otherwise (a
+//! merge, a rebase) is allowed: the result builds on both, so it is
+//! withheld until both are released.
 //!
 //! # Normalisation
 //!
@@ -36,12 +38,6 @@ use crate::{
     tree::MAX_TREE_DEPTH,
     vpath::VPath,
 };
-
-pub fn overlap_error(a: &str, b: &str) -> VeilError {
-    VeilError::Policy(format!(
-        "cannot combine history under two unreleased embargoes ({a} and {b}): embargoes cannot overlap; release one of them first (`vl embargo release <id>`), then merge or rebase"
-    ))
-}
 
 // ---- normalisation after a merge -------------------------------------------
 

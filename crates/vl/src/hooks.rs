@@ -2047,7 +2047,7 @@ mod tests {
             let id = |n: u8| ObjectId::hash(&[n]);
             let local: BTreeMap<String, veil_core::oplog::Tag> = tags
                 .iter()
-                .map(|(n, t)| (format!("tag-{n}"), veil_core::oplog::Tag { target: id(*t), cloak: None, annotation: None }))
+                .map(|(n, t)| (format!("tag-{n}"), veil_core::oplog::Tag { target: id(*t), annotation: None }))
                 .collect();
             let there: BTreeMap<String, ObjectId> = remote.iter().map(|(n, t)| (format!("origin/tag-{n}"), id(*t))).collect();
             let only: Vec<String> = only.iter().map(|n| format!("tag-{n}")).collect();

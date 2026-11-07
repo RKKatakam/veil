@@ -12,7 +12,7 @@ pub const VERSION: &str = concat!(
     env!("VL_GIT_COMMIT"),
     ", repository format ",
     // Kept in step with `veil_core::repo::REPO_FORMAT_VERSION` by a test.
-    "7",
+    "8",
     ")"
 );
 
