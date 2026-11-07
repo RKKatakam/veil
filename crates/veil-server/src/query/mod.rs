@@ -83,6 +83,10 @@ pub struct Limits {
     /// Most snapshots a log's frontier (and a kept cursor) may hold: a page
     /// ends before a step would pass it.
     pub frontier: usize,
+    /// How long a kept cursor lives from its last writing, and the most
+    /// bytes of kept cursors a project holds (oldest dropped first).
+    pub kept_for: Duration,
+    pub kept_bytes: usize,
     /// Most ancestry pairs.
     pub pairs: usize,
     pub deadline: Duration,
@@ -97,7 +101,9 @@ impl Default for Limits {
             diff: DiffLimits::default(),
             list: 10_000,
             cursor: 1_000,
-            frontier: 100_000,
+            frontier: 10_000,
+            kept_for: Duration::from_secs(3600),
+            kept_bytes: 32 << 20,
             pairs: 100,
             deadline: Duration::from_secs(2),
         }
@@ -328,6 +334,50 @@ impl<'g, 'a> LogWalk<'g, 'a> {
 /// as the cursor itself is (the same page always writes the same row).
 const STORED_CURSOR: &str = "frontier-";
 
+/// Keep a wide cursor (BUG-1076), and bound what the project keeps: one
+/// row per request, at most `Limits::frontier` snapshots in it (about
+/// 65 bytes each); a row lives `Limits::kept_for` from its last writing
+/// (the same frontier written again is the same row, refreshed); and every
+/// write deletes the project's expired rows, then its oldest rows past
+/// `Limits::kept_bytes` in all. A cursor so dropped is refused when sent
+/// back (`invalid cursor`): the log is asked for again from its start.
+fn keep_cursor(cx: &crate::derive::Cx, vk: &str, id: &str, text: &str, limits: &Limits) -> Result<()> {
+    let now = veil_core::now_millis();
+    let pool = &cx.hub().db;
+    cx.db(|| {
+        sqlx::query(
+            "INSERT INTO log_cursors (project_id, view_key, id, frontier, created_at) VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (project_id, view_key, id) DO UPDATE SET created_at = EXCLUDED.created_at",
+        )
+        .bind(cx.project())
+        .bind(vk)
+        .bind(id)
+        .bind(text)
+        .bind(now)
+        .execute(pool)
+    })?;
+    let expired = now - limits.kept_for.as_millis() as i64;
+    cx.db(|| {
+        sqlx::query("DELETE FROM log_cursors WHERE project_id = $1 AND created_at < $2")
+            .bind(cx.project())
+            .bind(expired)
+            .execute(pool)
+    })?;
+    cx.db(|| {
+        sqlx::query(
+            "DELETE FROM log_cursors WHERE project_id = $1 AND (view_key, id) IN ( \
+                 SELECT view_key, id FROM ( \
+                     SELECT view_key, id, SUM(LENGTH(frontier)) OVER (ORDER BY created_at DESC, view_key, id) AS kept \
+                     FROM log_cursors WHERE project_id = $1) t \
+                 WHERE kept > $2)",
+        )
+        .bind(cx.project())
+        .bind(limits.kept_bytes as i64)
+        .execute(pool)
+    })?;
+    Ok(())
+}
+
 fn cursor_id(ids: &[ObjectId]) -> String {
     let mut h = blake3::Hasher::new_derive_key("veil 2026 hub log cursor v1");
     for id in ids {
@@ -372,11 +422,13 @@ pub async fn log(hub: &Arc<Hub>, ask: &Ask, q: LogParams, limits: Limits) -> Res
         if let Some(token) = after.as_deref().and_then(|a| a.strip_prefix(STORED_CURSOR)) {
             g.tick()?;
             let (cx, vk) = (g.cx, g.vk);
+            let fresh = veil_core::now_millis() - limits.kept_for.as_millis() as i64;
             let stored: Option<String> = cx.db(|| {
-                sqlx::query_scalar("SELECT frontier FROM log_cursors WHERE project_id = $1 AND view_key = $2 AND id = $3")
+                sqlx::query_scalar("SELECT frontier FROM log_cursors WHERE project_id = $1 AND view_key = $2 AND id = $3 AND created_at >= $4")
                     .bind(cx.project())
                     .bind(vk)
                     .bind(token)
+                    .bind(fresh)
                     .fetch_optional(&cx.hub().db)
             })?;
             let stored = stored.ok_or_else(|| Error::bad_request("invalid cursor"))?;
@@ -426,14 +478,7 @@ pub async fn log(hub: &Arc<Hub>, ask: &Ask, q: LogParams, limits: Limits) -> Res
             let id = cursor_id(&heads);
             let text = heads.iter().map(|h| h.hex()).collect::<Vec<_>>().join(",");
             let (cx, vk) = (g.cx, g.vk);
-            cx.db(|| {
-                sqlx::query("INSERT INTO log_cursors (project_id, view_key, id, frontier) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING")
-                    .bind(cx.project())
-                    .bind(vk)
-                    .bind(&id)
-                    .bind(&text)
-                    .execute(&cx.hub().db)
-            })?;
+            keep_cursor(cx, vk, &id, &text, &limits)?;
             Some(format!("{STORED_CURSOR}{id}"))
         };
         Ok(json!({

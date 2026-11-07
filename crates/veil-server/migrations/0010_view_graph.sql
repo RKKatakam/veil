@@ -37,11 +37,14 @@ CREATE TABLE IF NOT EXISTS view_fills (
 );
 -- Log cursors wider than a request may carry (BUG-1076): what is left of
 -- a log to walk, kept under the hash of what it names and the viewer's
--- key. A function of the viewer's history, written again identically.
+-- key (the same frontier is one row). Bounded: a row lives an hour from
+-- its last writing (`created_at`, milliseconds since the epoch), and each
+-- write drops the project's expired rows and its oldest past a byte cap.
 CREATE TABLE IF NOT EXISTS log_cursors (
     project_id BIGINT NOT NULL,
     view_key TEXT NOT NULL,
     id TEXT NOT NULL,
     frontier TEXT NOT NULL,
+    created_at BIGINT NOT NULL,
     PRIMARY KEY (project_id, view_key, id)
 );

@@ -1536,16 +1536,11 @@ mod s13_adversarial {
         }
         assert_eq!(seen, total);
     }
-    /// A log over a wide graph pages to the end, through cursors the server
-    /// keeps (BUG-1076), and the pages together are the log in one page:
     /// 40 lines from the root that never meet but at the top, merged one
-    /// after another, so that 40 are open at once while the log walks
-    /// them; with a cursor limit of 8.
-    #[test]
-    fn query_wide_logs_page_through_kept_cursors() {
-        let th = TestHub::start();
+    /// after another: 40 are open at once while a log walks them.
+    fn wide_graph(th: &TestHub) -> (Hist, usize, usize) {
         let (policy_text, bindings) = policy(1);
-        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let mut h = Hist::new(th, &policy_text, &bindings);
         let t0 = 1_700_000_000_000i64;
         let (lines, len) = (40usize, 5usize);
         let mut tips = Vec::new();
@@ -1556,7 +1551,7 @@ mod s13_adversarial {
                 let mut change = [0u8; 16];
                 change[..8].copy_from_slice(&((l * 100 + i) as u64 + 1).to_le_bytes());
                 change[15] = 0xd1;
-                tip = h.commit(&th, &[tip], f, change, t0 + (i * lines + l) as i64 * 1000, None);
+                tip = h.commit(th, &[tip], f, change, t0 + (i * lines + l) as i64 * 1000, None);
             }
             tips.push(tip);
         }
@@ -1565,10 +1560,22 @@ mod s13_adversarial {
             let mut change = [0u8; 16];
             change[..8].copy_from_slice(&(l as u64).to_le_bytes());
             change[15] = 0xd2;
-            top = h.commit(&th, &[top, *t], Files::from([("pub/top.txt".to_string(), format!("{l}\n").into_bytes())]), change, t0 + 10_000_000 + l as i64, None);
+            top = h.commit(th, &[top, *t], Files::from([("pub/top.txt".to_string(), format!("{l}\n").into_bytes())]), change, t0 + 10_000_000 + l as i64, None);
         }
-        h.set_branch(&th, "main", top);
-        warm_up(&th, &h, &Viewer::default());
+        h.set_branch(th, "main", top);
+        warm_up(th, &h, &Viewer::default());
+        (h, lines, len)
+    }
+
+    /// A log over a wide graph pages to the end, through cursors the server
+    /// keeps (BUG-1076), and the pages together are the log in one page:
+    /// 40 lines from the root that never meet but at the top, merged one
+    /// after another, so that 40 are open at once while the log walks
+    /// them; with a cursor limit of 8.
+    #[test]
+    fn query_wide_logs_page_through_kept_cursors() {
+        let th = TestHub::start();
+        let (h, lines, len) = wide_graph(&th);
         let a = ask(&th, &h, &Viewer::default());
         let ids = |v: &Value| v["entries"].as_array().unwrap().iter().map(|e| e["snapshot_id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
         let whole = th.rt.block_on(query::log(&h.hub, &a, LogParams { n: Some(1000), ..Default::default() }, Limits::default())).unwrap();
@@ -1600,6 +1607,72 @@ mod s13_adversarial {
         warm_up(&th, &h, &admin());
         let r = th.rt.block_on(query::log(&h.hub, &other, LogParams { after: Some(c), ..Default::default() }, narrow));
         assert!(matches!(r, Err(Error::Api { code: "bad_request", .. })), "{r:?}");
+    }
+
+    /// Kept cursors are bounded, whatever anyone asks: anyone on Earth
+    /// paging a wide public log over and over, from many places, makes the
+    /// server keep at most `Limits::kept_bytes` of cursors for the project
+    /// after every request (oldest dropped first; one row per request, of
+    /// at most `Limits::frontier` snapshots); the same frontier is kept
+    /// once; rows past `Limits::kept_for` are dropped by the next write and
+    /// never served.
+    #[test]
+    fn query_kept_cursors_stay_bounded() {
+        let th = TestHub::start();
+        let (h, _, _) = wide_graph(&th);
+        let a = ask(&th, &h, &Viewer::default());
+        let limits = Limits {
+            cursor: 2,
+            kept_bytes: 8 << 10,
+            ..Limits::default()
+        };
+        let kept = || -> (i64, i64) {
+            th.rt.block_on(
+                sqlx::query_as("SELECT COUNT(*), COALESCE(SUM(LENGTH(frontier)), 0)::bigint FROM log_cursors WHERE project_id = $1")
+                    .bind(h.id)
+                    .fetch_one(&h.hub.db),
+            )
+            .unwrap()
+        };
+        let mut rng = Rng::new(97);
+        let (mut after, mut written, mut tokens) = (None::<String>, 0usize, HashSet::new());
+        for _ in 0..300 {
+            if rng.chance(10) {
+                after = None;
+            }
+            let n = 1 + rng.below(6);
+            let v = th.rt.block_on(query::log(&h.hub, &a, LogParams { n: Some(n), after: after.clone(), ..Default::default() }, limits));
+            after = match v {
+                Ok(v) => v["next"].as_str().map(str::to_string),
+                // A cursor dropped meanwhile (the cap): start again.
+                Err(Error::Api { code: "bad_request", .. }) => None,
+                Err(e) => panic!("{e:?}"),
+            };
+            if let Some(c) = after.as_ref().filter(|c| c.starts_with("frontier-")) {
+                written += 1;
+                tokens.insert(c.clone());
+            }
+            let (rows, bytes) = kept();
+            assert!(bytes as usize <= limits.kept_bytes, "{rows} rows, {bytes} bytes kept");
+        }
+        let (rows, bytes) = kept();
+        println!("kept cursors: {written} written ({} distinct), {rows} rows and {bytes} bytes kept, cap {}", tokens.len(), limits.kept_bytes);
+        assert!(tokens.len() > rows as usize, "the cap never dropped a row");
+        // The same frontier is one row.
+        let v = th.rt.block_on(query::log(&h.hub, &a, LogParams { n: Some(3), ..Default::default() }, limits)).unwrap();
+        let first = v["next"].as_str().unwrap().to_string();
+        let before = kept().0;
+        let v = th.rt.block_on(query::log(&h.hub, &a, LogParams { n: Some(3), ..Default::default() }, limits)).unwrap();
+        assert_eq!(v["next"].as_str().unwrap(), first);
+        assert_eq!(kept().0, before, "the same frontier was kept twice");
+        // Expired rows are never served, and the next write drops them.
+        th.rt.block_on(again(|| sqlx::query("UPDATE log_cursors SET created_at = 0 WHERE project_id = $1").bind(h.id).execute(&h.hub.db)));
+        let r = th.rt.block_on(query::log(&h.hub, &a, LogParams { after: Some(first.clone()), ..Default::default() }, limits));
+        assert!(matches!(r, Err(Error::Api { code: "bad_request", .. })), "an expired cursor was served: {r:?}");
+        let v = th.rt.block_on(query::log(&h.hub, &a, LogParams { n: Some(5), ..Default::default() }, limits)).unwrap();
+        assert!(v["next"].as_str().unwrap().starts_with("frontier-"));
+        let old: i64 = th.rt.block_on(sqlx::query_scalar("SELECT COUNT(*) FROM log_cursors WHERE project_id = $1 AND created_at = 0").bind(h.id).fetch_one(&h.hub.db)).unwrap();
+        assert_eq!(old, 0, "expired rows were not dropped by the next write");
     }
 
     /// BUG-1078's bound at the source: a snapshot of more than
