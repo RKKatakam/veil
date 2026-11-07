@@ -412,14 +412,20 @@ fn squashing_into_an_embargoed_merge_keeps_the_embargo() {
 }
 
 // Scenario from jj test_abandon, on an embargoed merge: abandoning it publishes nothing of the fix.
+// Unlike jj, the abandon is refused while a change (here the working copy) is built on the
+// merge: rebased onto its parents, that change would merge the fix with nothing withholding
+// it (BUG-943). With the working copy moved off it, the abandon goes through.
 #[test]
 fn abandoning_an_embargoed_merge_leaks_nothing() {
     let env = Env::new();
     let r = embargoed(&env);
     let before = r.sid("main-");
     let m = r.cid("main");
+    let err = r.fails(&["abandon", &m]);
+    assert!(err.contains("embargoed merge") && err.contains("vl embargo release"), "{err}");
+    r.ok(&["new", &before]);
     r.ok(&["abandon", &m]);
-    // jj semantics: the child now merges both former parents; main moved to the first.
+    // jj semantics: main moved to the abandoned merge's first parent.
     assert_eq!(r.tag_target("main"), Some(before));
     let mirror = push_public(&r, &["main"]);
     assert!(store_contains(&mirror, FIX_MARK.as_bytes()).is_empty());
