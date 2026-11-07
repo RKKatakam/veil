@@ -609,7 +609,7 @@ pub fn scan(s: &Scan) {
     match (gate, s.clean) {
         (false, true) => println!("{} no secrets in public files ({} protected file(s) contain secrets)", green("ok:"), s.protected),
         (false, false) => println!(
-            "{} {} public file(s) contain secrets; they are quarantined from snapshots until cloaked, isolated or fixed",
+            "{} {} public file(s) contain secrets; they are quarantined from snapshots until moved into a secret file, isolated or fixed",
             red("found:"),
             s.exposed
         ),

@@ -286,7 +286,7 @@ pub fn print_build_warnings(r: &BuildReport) {
         };
         let p = safe(p.as_str());
         warn(&format!(
-            "{} quarantined: looks like a secret ({} at line {}: {}); {held}. Fix it, or `vl cloak|isolate|expose --force {p}`",
+            "{} quarantined: looks like a secret ({} at line {}: {}); {held}. Move the secret into a secret file (`.env`, …), fix it, or `vl isolate|expose --force {p}`",
             bold(&p),
             f.rule,
             f.line,

@@ -246,3 +246,22 @@ fn a_clone_killed_at_any_point_is_refused_or_finished() {
     }
     println!("refused {refused}, finished {finished}");
 }
+
+/// An unreleased embargo never reaches the server: `vl push` sends neither
+/// the embargoed merge nor its fix (the tag on them is rejected here, with
+/// the reason), so nothing of the fix is uploaded and nobody else sees it.
+#[test]
+fn an_unreleased_embargo_never_reaches_the_server() {
+    const FIX: &str = "EMBARGOED-FIX-MARKER-4471";
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    write_files(&p.dir, &[("src/fix.rs", FIX)]);
+    p.admin.ok(&p.dir, &["commit", "--no-advance", "-m", "the fix"]);
+    p.admin.ok(&p.dir, &["merge", "@-", "--into", "main", "--embargo", "-m", "merge the fix"]);
+    let out = p.admin.fails(&p.dir, &["push"]);
+    assert!(out.contains("rejected") && out.contains("embargo"), "{out}");
+    let d = p.dev.dir("c");
+    p.dev.ok(p.dev.home.path(), &["clone", &hub.url(&p.name), d.to_str().unwrap()]);
+    assert_no_marker(&everything_in(&d), &[FIX], "dev");
+    assert!(!d.join("src/fix.rs").exists(), "the fix reached a clone");
+}

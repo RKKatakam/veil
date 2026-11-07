@@ -502,6 +502,21 @@ pub(crate) fn embargo_withheld(local: &Repo) -> Result<HashMap<ObjectId, String>
     Ok(out)
 }
 
+/// For each of `targets` (tags another route, such as the Veil server's
+/// push, is about to send): why it may not be sent because it would publish
+/// history an unreleased embargo withholds (`None`: it may). Nothing of
+/// such history may leave the repository, by any route.
+pub fn embargo_blocks(local: &Repo, targets: &[ObjectId]) -> Result<Vec<Option<String>>> {
+    let withheld = embargo_withheld(local)?;
+    if withheld.is_empty() {
+        return Ok(vec![None; targets.len()]);
+    }
+    targets
+        .iter()
+        .map(|t| Ok(push_closure(local.store(), &[*t], &withheld)?.err()))
+        .collect()
+}
+
 /// The snapshots to send for `tips`: every ancestor. Fails with a reason
 /// if the tips reach history an unreleased embargo withholds (the
 /// embargoed merge, its fix, or anything built on them).

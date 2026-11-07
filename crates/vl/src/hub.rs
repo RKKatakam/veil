@@ -899,11 +899,24 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
                 bail!("no tag '{t}' here");
             }
         }
+        // Nothing an unreleased embargo withholds is uploaded: a tag that
+        // would publish it is not pushed (it reaches no remote by any route).
+        let targets: Vec<ObjectId> = updates.iter().filter_map(|u| u.new).collect();
+        let blocks = veil_core::remote::embargo_blocks(repo, &targets)?;
+        let mut withheld = Vec::new();
+        let mut kept = Vec::new();
+        for (u, why) in updates.into_iter().zip(blocks) {
+            match why {
+                Some(why) => withheld.push((u.branch, why)),
+                None => kept.push(u),
+            }
+        }
+        let updates = kept;
         if updates.is_empty() {
             return Ok(PushOutcome {
                 warnings: vec![],
                 moved: vec![],
-                rejected: vec![],
+                rejected: withheld,
                 uploaded: 0,
                 created,
             });
@@ -984,7 +997,7 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
         let mut out = PushOutcome {
             warnings: result.warnings.clone(),
             moved: vec![],
-            rejected: vec![],
+            rejected: withheld,
             uploaded,
             created,
         };
