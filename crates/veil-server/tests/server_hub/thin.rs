@@ -675,3 +675,340 @@ fn every_working_copy_move_past_the_cache_bound_records_nothing() {
     admin.ok(&thin, &["status"]);
     assert!(thin.join("big/f00.bin").exists(), "under the larger bound the move happens");
 }
+
+// ---- S3 cycle 3 review (`docs/BUGS.md`, "S3 cycle 3") --------------------
+
+/// The change id (as written, letters k–z) of the snapshot described
+/// `description` in `dir`'s `vl log`.
+fn change_of(who: &Person, dir: &Path, description: &str) -> String {
+    log_field(who, dir, description, "change_id")
+}
+
+/// The snapshot id of the snapshot described `description` in `dir`'s `vl log`.
+fn snapshot_of(who: &Person, dir: &Path, description: &str) -> String {
+    log_field(who, dir, description, "snapshot_id")
+}
+
+fn log_field(who: &Person, dir: &Path, description: &str, field: &str) -> String {
+    let o = who.run(dir, &["log", "--json"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let log = json(&String::from_utf8_lossy(&o.stdout));
+    let e = log["entries"].as_array().unwrap().iter().find(|e| e["description"].as_str().is_some_and(|d| d.trim() == description));
+    e.unwrap_or_else(|| panic!("no snapshot described {description:?}: {log}"))[field].as_str().unwrap().to_string()
+}
+
+/// BUG-1261 (guarantee 1 of the S3 cycle 3 brief; BUG-105's class): a tag
+/// pushed under the name of an old change's id (12 characters of it: a
+/// chance match with any other id is one in 16¹²) is refused as a local
+/// tag by a full clone's pull ("the name is also a change or snapshot id
+/// of this repository"), so `vl show <that id>` shows the change. A thin
+/// clone's pull checks the name against the snapshots it holds only
+/// (`RevisionNames::shadows` through `topo_children_first`, held-only
+/// since the BUG-1260 fix), creates the tag, and from then on the id names
+/// the tag's target, as tags resolve first (`revset::resolve_base`): the
+/// same revision expression names a different change than in a full
+/// clone, even after the old change was fetched. Whoever can push a tag
+/// redirects `vl edit <change>` of everyone with a thin clone.
+#[test]
+#[ignore = "BUG-1261: a pulled tag named like an unheld change's id hides that change in a thin clone"]
+fn s3r3_a_pulled_tag_never_hides_the_id_of_a_change_the_thin_clone_does_not_hold() {
+    let hub = TestHub::start();
+    let (admin, dir, name) = project_with_history(&hub, 6, 10);
+    let first: String = change_of(&admin, &dir, "first").chars().take(12).collect();
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+    let full = admin.dir("full");
+    admin.ok(admin.home.path(), &["clone", "--full", &hub.url(&name), full.to_str().unwrap()]);
+    // The tag, on the tip ("commit 5"), named after the first change's id.
+    admin.ok(&dir, &["tag", "set", &first, "-r", "main"]);
+    admin.ok(&dir, &["push"]);
+    let full_pull = admin.ok(&full, &["pull"]);
+    let thin_pull = admin.ok(&thin, &["pull"]);
+    let fresh = admin.dir("fresh");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), fresh.to_str().unwrap()]);
+    let shown = admin.ok(&full, &["show", &first]);
+    assert!(shown.contains("first") && !shown.contains("commit 5"), "the full clone shows the change:\n{full_pull}\n{shown}");
+    for (what, clone, pulled) in [("a pull", &thin, thin_pull.as_str()), ("a clone", &fresh, "")] {
+        // Also once the history the change is in has been fetched.
+        for when in ["at once", "after `vl log`"] {
+            let o = admin.run(clone, &["show", &first]);
+            let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+            assert!(
+                out.contains("first") && !out.contains("commit 5"),
+                "a thin clone after {what} ({when}): `vl show {first}` names another change than a full clone:\n{pulled}\n{out}"
+            );
+            admin.ok(clone, &["log"]);
+        }
+    }
+}
+
+/// Files under `dir`, recursively, removed (a cache's contents).
+fn remove_files_under(dir: &Path) {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            if e.file_type().unwrap().is_dir() {
+                stack.push(e.path());
+            } else {
+                std::fs::remove_file(e.path()).unwrap();
+            }
+        }
+    }
+}
+
+/// Guarantee 2 of the S3 cycle 3 brief (BUG-1146's fallback, which the
+/// builder did not test): a project directory behind `@` that cannot be
+/// brought up to it. The state is built as an interrupted command leaves
+/// it: `vl new big` published its operation (its fetch-ahead held `big`'s
+/// files), and the process was killed before the directory moved; then
+/// the cache lost those files (emptied here, as an eviction would) and is
+/// bounded at 100 KiB, so they cannot come back. The person has an edit
+/// in the directory. `vl status`, `vl undo`, `vl op restore` and `vl
+/// partial limit` each run, and the edit survives.
+#[test]
+fn s3r3_a_directory_behind_at_that_cannot_catch_up_still_runs_status_undo_op_restore_and_partial_limit() {
+    let hub = TestHub::start();
+    let (admin, name) = project_with_big_branch(&hub);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+    admin.ok(&thin, &["new", "big"]);
+    let on_big = veil_core::ObjectId::from_hex(&log_ids(&admin, &thin)[0]).unwrap();
+    admin.ok(&thin, &["new", "main"]);
+    let o = admin.run(&thin, &["op", "log", "--json"]);
+    let before = json(&String::from_utf8_lossy(&o.stdout))["operations"][0]["op_id"].as_str().unwrap().to_string();
+    {
+        let mut repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(&thin)), None, "test").unwrap();
+        let mut tx = repo.transaction("new big (killed before the directory moved)").unwrap();
+        tx.view.workspaces.get_mut("default").unwrap().wc = on_big;
+        tx.commit().unwrap();
+    }
+    remove_files_under(&thin.join(".veil/cache"));
+    let config = std::fs::read_to_string(thin.join(".veil/repo.json")).unwrap();
+    let mut c = json(&config);
+    c["partial"]["cache_limit"] = serde_json::json!(100 * 1024);
+    std::fs::write(thin.join(".veil/repo.json"), serde_json::to_string_pretty(&c).unwrap()).unwrap();
+    write_files(&thin, &[("src/lib.rs", "fn edited_while_behind() {}\n")]);
+    assert!(!thin.join("big/f00.bin").exists());
+    let cases: &[(&str, &[&str])] = &[
+        ("status", &["status"]),
+        ("undo", &["undo"]),
+        ("op-restore", &["op", "restore", &before]),
+        ("partial-limit", &["partial", "limit", "1G"]),
+    ];
+    for (tag, cmd) in cases {
+        let copy = admin.dir(&format!("behind-{tag}"));
+        let st = std::process::Command::new("cp").arg("-a").arg(&thin).arg(&copy).status().unwrap();
+        assert!(st.success());
+        let o = admin.run(&copy, cmd);
+        let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        assert!(o.status.success(), "`vl {}` with the directory behind `@`:\n{out}", cmd.join(" "));
+        // The fallback ran: the directory could not be brought up to `@`.
+        assert!(out.contains("the working copy stays as it is"), "`vl {}` did not meet a directory behind `@`:\n{out}", cmd.join(" "));
+        let o = admin.run(&copy, &["status"]);
+        let after = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        assert!(o.status.success(), "`vl status` after `vl {}`:\n{out}\n{after}", cmd.join(" "));
+        // The edit is in the directory, or saved in a change.
+        let on_disk = std::fs::read_to_string(copy.join("src/lib.rs")).unwrap_or_default().contains("edited_while_behind");
+        let o = admin.run(&copy, &["log", "-p"]);
+        let logged = String::from_utf8_lossy(&o.stdout).contains("edited_while_behind");
+        assert!(on_disk || logged, "`vl {}` lost the edit made while the directory was behind `@`:\n{out}\n{after}", cmd.join(" "));
+    }
+}
+
+
+/// `vl bisect` by hand in `dir`, from `bad` to `good`, with "bad" meaning
+/// `data/f3.bin` is there: its last answer.
+fn bisect_by_hand(who: &Person, dir: &Path, bad: &str, good: &str) -> String {
+    let out = who.ok(dir, &["bisect", "start", "--bad", bad, "--good", good]);
+    if out.contains("The first bad snapshot is") {
+        who.ok(dir, &["bisect", "reset"]);
+        return out;
+    }
+    for _ in 0..20 {
+        let verdict = if dir.join("data/f3.bin").exists() { "bad" } else { "good" };
+        let out = who.ok(dir, &["bisect", verdict]);
+        if out.contains("The first bad snapshot is") {
+            who.ok(dir, &["bisect", "reset"]);
+            return out;
+        }
+    }
+    panic!("bisect did not converge in {}", dir.display());
+}
+
+/// BUG-1262 (guarantee 3 of the S3 cycle 3 brief; introduced by the BUG-1260
+/// fix): `vl bisect` reads its candidates with the whole-graph walks that
+/// now read only what is held (`bisect::candidates`: `Repo::ancestors`,
+/// `topo_children_first`), outside `Repo::exact`. In a thin clone, which
+/// holds the tips, the candidates stop at the boundary, and bisect names
+/// as the first bad snapshot one that a full clone (and the history) say
+/// is not: here `data/f3.bin` arrives in "commit 3", and the thin clone's
+/// bisect finds a later commit.
+#[test]
+#[ignore = "BUG-1262: vl bisect in a thin clone searches only the held snapshots"]
+fn s3r3_bisect_in_a_thin_clone_finds_what_a_full_clone_finds() {
+    let hub = TestHub::start();
+    let (admin, _dir, name) = project_with_history(&hub, 12, 10);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+    let full = admin.dir("full");
+    admin.ok(admin.home.path(), &["clone", "--full", &hub.url(&name), full.to_str().unwrap()]);
+    let first = snapshot_of(&admin, &full, "first");
+    let culprit: String = snapshot_of(&admin, &full, "commit 3").chars().take(8).collect();
+    let found = bisect_by_hand(&admin, &full, "main", &first);
+    assert!(found.contains(&culprit), "the full clone finds commit 3 ({culprit}):\n{found}");
+    let found = bisect_by_hand(&admin, &thin, "main", &first);
+    assert!(found.contains(&culprit), "the thin clone's bisect does not find commit 3 ({culprit}):\n{found}");
+}
+
+/// BUG-1263 (guarantee 2 of the S3 cycle 3 brief; BUG-1146's class): `vl ws
+/// switch` past the cache's bound. The switch is an operation that leaves
+/// the view as it is (the attachment is device-local), so
+/// `Transaction::commit`'s fetch-ahead, keyed on a change of the view,
+/// skips it; the end-of-command move then cannot fetch and leaves the
+/// directory as it is. The command exits 0, prints "Project directory
+/// attached to workspace other", and records the switch, while the
+/// directory stays attached to `default`. The warning advises `vl undo`,
+/// which (in `default`) undoes an unrelated, earlier operation: here the
+/// creation of `other`. (The cycle 2 control
+/// `s3r2_a_workspace_switch_past_the_cache_bound_records_nothing` passes
+/// because the command now succeeds.)
+#[test]
+#[ignore = "BUG-1263: vl ws switch past the cache bound records the switch, says it switched, and does not"]
+fn s3r3_a_workspace_switch_past_the_cache_bound_switches_or_records_nothing() {
+    let hub = TestHub::start();
+    let (admin, name) = project_with_big_branch(&hub);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", "--cache-size", "100K", &hub.url(&name), thin.to_str().unwrap()]);
+    admin.ok(&thin, &["ws", "new", "other", "-r", "big"]);
+    let o = admin.run(&thin, &["ws", "switch", "other"]);
+    let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    let attached = json(&std::fs::read_to_string(thin.join(".veil/local/checkout.json")).unwrap())["workspace"].as_str().unwrap().to_string();
+    let o2 = admin.run(&thin, &["op", "log", "-n", "1"]);
+    let head = String::from_utf8_lossy(&o2.stdout).to_string();
+    if o.status.success() {
+        assert!(
+            attached == "other" && thin.join("big/f00.bin").exists(),
+            "`vl ws switch other` succeeded, yet the directory is attached to '{attached}':\n{out}\n{head}"
+        );
+    } else {
+        assert!(!head.contains("switch the project directory"), "a failed switch was recorded:\n{out}\n{head}");
+    }
+    // What the warning advises undoes the switch, nothing else.
+    let undo = admin.ok(&thin, &["undo"]);
+    assert!(!undo.contains("create workspace"), "`vl undo` undid an unrelated operation:\n{out}\n{undo}");
+}
+
+
+/// A project, and a fork of it (another project on the same server) with
+/// one more commit, "on the fork", adding 150 KB that do not compress at
+/// `x/x.txt`. Returns the admin, the project's name and the fork's.
+fn project_and_fork(hub: &TestHub) -> (Person, String, String) {
+    let (admin, dir, name) = project_with_history(hub, 1, 10);
+    let fork = unique("fork");
+    admin.ok(&dir, &["remote", "add", "fork", &hub.url(&fork)]);
+    admin.ok(&dir, &["new", "main"]);
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut text = String::from("only on the fork, readable by admin\n");
+    while text.len() < 150_000 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        text.push_str(&format!("{x:016x}"));
+    }
+    write_files(&dir, &[("x/x.txt", &text)]);
+    admin.commit_main(&dir, "on the fork");
+    admin.ok(&dir, &["push", "fork"]);
+    (admin, name, fork)
+}
+
+/// BUG-1265 (guarantees 7 and 2 of the S3 cycle 3 brief; introduced by the
+/// server-tips refresh of cycle 2): "on the server" is judged from *every*
+/// remote's tips in the view (`Repo::pin_working_copies` hands
+/// `remote_tags.values()` to `set_local_heads`; `server_tips_now` uses
+/// them), where the connection's own tips were the thin clone's remote's
+/// only (`thin::attach` filters `origin/`). A thin clone that also pulls
+/// from a second remote (a fork on the same server) takes the fork's
+/// snapshots for its server's. The fork's content, checked out once and
+/// evicted, is then asked of the clone's server, which has no such
+/// snapshot, and its "nothing there" reads as a redaction: `vl show
+/// fork/main` fails with "object … is not present in this store", and
+/// `vl new fork/main` passes its fetch-ahead (a refusal is left for the
+/// reader), records the move, journals it and fails half way: from then
+/// on every command, `vl status`, `vl op log`, `vl undo`, fails ("'/' is
+/// not fetched, and the server has no copy of it"), until the checkout
+/// record is edited by hand.
+#[test]
+#[ignore = "BUG-1265: a second remote's snapshots count as the thin clone's server's; a move onto one wedges the clone"]
+fn s3r3_a_second_remotes_snapshot_is_never_the_servers_and_never_wedges_the_clone() {
+    let hub = TestHub::start();
+    let (admin, name, fork) = project_and_fork(&hub);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+    admin.ok(&thin, &["remote", "add", "fork", &hub.url(&fork)]);
+    admin.ok(&thin, &["pull", "fork"]);
+    admin.ok(&thin, &["new", "fork/main"]);
+    assert!(thin.join("x/x.txt").exists());
+    // Back on the project's own tip; the fork's file is evicted.
+    admin.ok(&thin, &["new", "origin/main"]);
+    admin.ok(&thin, &["partial", "limit", "100K"]);
+    admin.ok(&thin, &["partial", "limit", "100K"]);
+    let o = admin.run(&thin, &["show", "fork/main"]);
+    let show = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    let o = admin.run(&thin, &["new", "fork/main"]);
+    let new = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    let o = admin.run(&thin, &["status"]);
+    let status = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert!(o.status.success(), "the clone is wedged after `vl new fork/main`:\n{new}\n`vl status`:\n{status}");
+    assert!(!show.contains("is not present in this store"), "the fork's file, which the server never had, reads as withheld:\n{show}");
+}
+
+/// Guarantee 3 of the S3 cycle 3 brief (BUG-1260's class): a revision name
+/// that names nothing (a typo) and looks like an id prefix does not make a
+/// thin clone fetch the whole history to say so.
+#[test]
+fn s3r3_a_revision_that_names_nothing_does_not_fetch_the_whole_history() {
+    let hub = TestHub::start();
+    let (admin, _dir, name) = project_with_history(&hub, 6, 10);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+    for typo in ["cafe0123", "kmnpqrst"] {
+        let o = admin.run(&thin, &["show", typo]);
+        assert!(!o.status.success(), "{typo} names nothing");
+    }
+    drop(hub);
+    let o = admin.run(&thin, &["log"]);
+    assert!(
+        !o.status.success(),
+        "a revision that names nothing fetched the whole history (`vl log` with the server gone):\n{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+}
+
+/// BUG-1266 (guarantee 1 of the S3 cycle 3 brief; introduced by S3 before
+/// cycle 2, not reported): the change id of a change beyond a thin clone's
+/// boundary names nothing. `revset::resolve_base` matches a change id
+/// prefix against the history index (`entries_matching`), which reads what
+/// is held only and records no boundary hit, so `Repo::exact` (in
+/// `Ctx::rev`) has nothing to page in: `vl show <change>` of an old change,
+/// as a teammate's message or a full clone's `vl log` gives it, fails with
+/// "revision … not found" until a command that pages history in (`vl log`)
+/// has run. A full snapshot id is asked of the server (`Ctx::rev`); a
+/// change id or a short snapshot id is not. Same root as BUG-1261: an id
+/// lookup answered from held history only.
+#[test]
+#[ignore = "BUG-1266: a thin clone does not find the change id of a change beyond its boundary"]
+fn s3r3_an_old_change_id_names_the_same_change_as_in_a_full_clone() {
+    let hub = TestHub::start();
+    let (admin, dir, name) = project_with_history(&hub, 6, 10);
+    let first: String = change_of(&admin, &dir, "first").chars().take(12).collect();
+    let first_snapshot: String = snapshot_of(&admin, &dir, "first").chars().take(12).collect();
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+    for rev in [&first, &first_snapshot] {
+        let o = admin.run(&thin, &["show", rev]);
+        let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        assert!(o.status.success() && out.contains("first"), "`vl show {rev}` (the first change) in a thin clone:\n{out}");
+    }
+}
+

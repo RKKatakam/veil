@@ -764,3 +764,147 @@ fn a_pull_in_a_long_lived_process_refreshes_what_is_on_the_server() {
     let err = repo.store().read_entry(&e).unwrap_err();
     assert!(matches!(err, VeilError::Missing(_)), "the server's refusal under its new tip reads as {err:?}");
 }
+
+// ---- S3 cycle 3 review (`docs/BUGS.md`, "S3 cycle 3") --------------------
+
+/// Guarantee 4 of the S3 cycle 3 brief: gc in a thin clone across a pull, a
+/// local commit, a rebase of it onto the server's new tip, and an
+/// eviction. The BUG-1148 fix pins the trees of the server-side bases of
+/// the *view's* heads; the rebased commit's base is the new tip `Q`. Its
+/// old version `L` (on the old tip `T`) is still a root of gc, through the
+/// op log (kept whole by default), and so is every working-copy snapshot
+/// the log remembers on `T`; `T`'s trees are not pinned, are evicted, and
+/// `classify_gap` cannot tell `L`'s unchanged directories (`src/`, `doc/`,
+/// by `T`'s ids) from lost work: gc is incomplete and deletes nothing, on
+/// every run while the op log holds `L`.
+#[test]
+#[ignore = "BUG-1264: gc in a thin clone never completes after a local commit is rebased onto a new server tip"]
+fn s3r3_gc_in_a_thin_clone_completes_after_a_rebase_onto_the_new_tip() {
+    let id = Identity::generate("alice");
+    let sfs = Arc::new(MemoryBackend::new());
+    let mut srepo = Repo::init(sfs.clone(), Some(id.clone()), "alice").unwrap();
+    let t = commit_files(&mut srepo, &*sfs, &[("src/a.txt", "a one\n"), ("doc/r.md", "readme\n")], "t");
+    let q = commit_files(&mut srepo, &*sfs, &[("src/a.txt", "a by a teammate\n")], "q");
+    let server = Arc::new(Server {
+        store: srepo.store().clone(),
+        tips: vec![q],
+        down: AtomicBool::new(false),
+        tamper: AtomicBool::new(false),
+        refuse: Mutex::new(HashSet::new()),
+        asked: Mutex::new(Vec::new()),
+        pages: Mutex::new(0),
+    });
+    let pr = Project { server: server.clone(), commits: vec![t, q], tip: t, id: id.clone() };
+    let (mut repo, fs) = thin(&pr, 1 << 30);
+    checkout(&mut repo, &fs, t);
+    let mine = commit_files(&mut repo, &*fs, &[("new.txt", "mine, unpushed\n")], "local work");
+    // The pull of `Q`, then the local commit rebased onto it (the working
+    // copy, its child, moves with it).
+    repo.store().put_raw(&q, &server.store.get_raw(&q).unwrap()).unwrap();
+    let mut tx = repo.transaction("pull").unwrap();
+    tx.view.remote_tags.insert("origin/main".into(), q);
+    tx.commit().unwrap();
+    let rebased = repo.rebase(mine, vec![q]).unwrap();
+    assert_ne!(rebased, mine);
+    // The directory follows (`vl rebase` moves it to the rebased working
+    // copy; here a fresh change on the rebased commit).
+    checkout(&mut repo, &fs, rebased);
+    // An eviction, as the next fetch past the bound makes one (the pins are
+    // the repository's own, from its view).
+    repo.store().set_cache_limit(0);
+    repo.store().trim_cache().unwrap();
+    repo.store().set_cache_limit(1 << 30);
+    let report = gc(&mut repo, &GcOptions { grace: Duration::ZERO, ..GcOptions::default() }).unwrap();
+    assert!(report.incomplete.is_empty(), "gc deleted nothing: {:?}", report.incomplete);
+    // And it deleted nothing of the local work.
+    server.down.store(true, Ordering::SeqCst);
+    assert_eq!(read_at(&repo, &rebased, "new.txt"), b"mine, unpushed\n");
+}
+
+/// The server of `inner`, serving history pages of at most `cap` snapshots
+/// (a server may send fewer than asked): a walk of the whole graph then
+/// takes a page per `cap` snapshots, which a project's 2,000-snapshot page
+/// would hide in a small test.
+struct Capped(Arc<Server>, usize);
+
+impl Promisor for Capped {
+    fn fetch(&self, wants: &[Located]) -> veil_core::Result<Vec<Option<Vec<u8>>>> {
+        self.0.fetch(wants)
+    }
+
+    fn history(&self, tips: &[ObjectId], limit: usize) -> veil_core::Result<Vec<(ObjectId, Vec<u8>)>> {
+        self.0.history(tips, limit.min(self.1))
+    }
+
+    fn server_tips(&self) -> Vec<ObjectId> {
+        self.0.server_tips()
+    }
+}
+
+/// A server project of `n` linear commits, and a thin clone of its tip
+/// whose server pages history 2 snapshots at a time.
+fn long_project(n: usize) -> (Project, Repo, Arc<MemoryBackend>) {
+    let id = Identity::generate("alice");
+    let sfs = Arc::new(MemoryBackend::new());
+    let mut srepo = Repo::init(sfs.clone(), Some(id.clone()), "alice").unwrap();
+    let mut commits = Vec::new();
+    for i in 0..n {
+        commits.push(commit_files(&mut srepo, &*sfs, &[("src/a.txt", &format!("a {i}\n"))], &format!("c{i}")));
+    }
+    let tip = *commits.last().unwrap();
+    let server = Arc::new(Server {
+        store: srepo.store().clone(),
+        tips: vec![tip],
+        down: AtomicBool::new(false),
+        tamper: AtomicBool::new(false),
+        refuse: Mutex::new(HashSet::new()),
+        asked: Mutex::new(Vec::new()),
+        pages: Mutex::new(0),
+    });
+    let pr = Project { server: server.clone(), commits, tip, id };
+    let (repo, fs) = thin(&pr, 1 << 30);
+    repo.store().set_promisor(Arc::new(Capped(server, 2)));
+    (pr, repo, fs)
+}
+
+/// BUG-1267 (guarantee 3 of the S3 cycle 3 brief; BUG-1260's class, not in
+/// its fix or its audit; the fetching read is S3 cycle 1's): the short id
+/// of a hidden snapshot (an earlier version of a change, as `vl evolog`
+/// and `vl op log` show it) makes a thin clone page in the project's whole
+/// history. `revset::recorded_snapshots_with_prefix` walks every
+/// operation's view through parents and predecessors with
+/// `Repo::snapshot`, which pages history in at the boundary, and descends
+/// the server tip's ancestry to the root before it reaches the working
+/// copy's predecessors. The audit tables count `snapshot_opt(` only:
+/// `Repo::snapshot(`'s callers are in none of them. Here: 40 commits, a
+/// page of 2 snapshots, and resolving the earlier version reads 20 pages
+/// (every snapshot), where its answer is held already.
+#[test]
+#[ignore = "BUG-1267: a hidden snapshot's short id makes a thin clone fetch the whole history"]
+fn s3r3_a_hidden_snapshots_short_id_does_not_page_in_the_whole_history() {
+    let (pr, mut repo, fs) = long_project(40);
+    checkout(&mut repo, &fs, pr.tip);
+    fs.write(&p("mine.txt"), b"mine\n").unwrap();
+    let earlier = crate::adversarial_support::snap(&mut repo, &*fs);
+    fs.write(&p("mine.txt"), b"mine, edited\n").unwrap();
+    let now = crate::adversarial_support::snap(&mut repo, &*fs);
+    assert_ne!(earlier, now);
+    let prefix = &earlier.hex()[..12];
+    *pr.server.pages.lock().unwrap() = 0;
+    let got = repo.exact(|r| veil_core::revset::resolve(r, prefix, "default")).unwrap();
+    assert_eq!(got, earlier);
+    let pages = *pr.server.pages.lock().unwrap();
+    assert!(pages <= 2, "resolving a held, hidden snapshot by its short id read {pages} history pages (the project has 40 snapshots, 2 a page)");
+}
+
+/// Guarantee 3 of the S3 cycle 3 brief, the walks the BUG-1260 fix made
+/// held-only: none pages history in, however long the history.
+#[test]
+fn s3r3_the_whole_graph_walks_page_in_nothing() {
+    let (pr, repo, _fs) = long_project(40);
+    *pr.server.pages.lock().unwrap() = 0;
+    repo.visible_snapshots().unwrap();
+    repo.ancestors(&pr.tip).unwrap();
+    repo.merge_bases_naive(&[pr.tip], &[pr.commits[3]]).unwrap();
+    assert_eq!(*pr.server.pages.lock().unwrap(), 0);
+}
