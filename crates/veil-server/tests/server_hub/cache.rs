@@ -692,3 +692,51 @@ fn the_epoch_feed_for_caches_needs_the_caches_token() {
         assert_eq!(api.post_with("/v1/cache/epochs", junk, &[("veil-cache-token", token.trim())]).status, 400);
     }
 }
+
+/// Many readers of a new object at once (every agent after a landing) cost
+/// the server one request, not one each: later requests wait for the one
+/// fetching it.
+#[test]
+fn concurrent_readers_of_a_new_object_cost_the_server_one_request() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let server = hub.api();
+    let c = TestCache::start(&hub, &hub.authority(), 1 << 30);
+    let dev = Reader::new(&server, &c.api, Some(&p.dev), &p.name);
+    warm(&c, &dev, &[], &dev.root());
+    // A landing: a new root the cache has never seen.
+    write_files(&p.dir, &[("src/new-after-landing.txt", "new")]);
+    p.admin.commit_main(&p.dir, "a landing");
+    p.admin.ok(&p.dir, &["push"]);
+    let dev = Reader::new(&server, &c.api, Some(&p.dev), &p.name);
+    let root = dev.root();
+    let want = server_bytes(&server, &dev, root);
+    let forwarded = c.stat("forwarded");
+    let n = 24;
+    let barrier = std::sync::Barrier::new(n);
+    std::thread::scope(|s| {
+        for i in 0..n {
+            let (dev, barrier, want) = (&dev, &barrier, &want);
+            s.spawn(move || {
+                barrier.wait();
+                if i % 2 == 0 {
+                    assert_eq!(&dev.batch(&[(Vec::new(), root)])[0].1, want);
+                } else {
+                    let g = dev.get(&[], &root);
+                    assert_eq!((g.status, &g.body), (200, want));
+                }
+            });
+        }
+    });
+    let asked = c.stat("forwarded") - forwarded;
+    eprintln!("cache: {n} concurrent readers of a new root: {asked} requests to the server, {} waited", c.stat("joined"));
+    assert!(asked <= 3, "{asked} requests to the server for {n} readers of one object");
+}
+
+/// The bytes of `id` (met at the root) as the server itself serves it to `r`.
+fn server_bytes(server: &Api, r: &Reader, id: ObjectId) -> Vec<u8> {
+    let direct = Reader { via: server, project: r.project.clone(), id: r.id.clone(), grant: r.grant.clone(), key: r.key.clone() };
+    let g = direct.get(&[], &id);
+    assert_eq!(g.status, 200);
+    g.body
+}
