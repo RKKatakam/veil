@@ -152,15 +152,21 @@ impl Bench {
         let mut rss = 0u64;
         let mut server_rss: Option<u64> = None;
         let mut server_before: Option<u64> = None;
+        // The server's bytes read and written during the last run.
+        let mut server_io: Option<(u64, u64)> = None;
         let mut last = Outcome::default();
         for i in 0..runs {
             prep(self, i)?;
             if let Some(k) = self.server_pid.and_then(crate::server::reset_peak) {
                 server_before.get_or_insert(k);
             }
+            let io_before = self.server_pid.and_then(crate::server::io_bytes);
             let o = self.env.run_full(&c.cwd, &args, false, &env, Some(self.opts.timeout))?;
             if let Some(k) = self.server_pid.and_then(crate::server::peak_kib) {
                 server_rss = Some(server_rss.unwrap_or(0).max(k));
+            }
+            if let (Some(a), Some(b)) = (io_before, self.server_pid.and_then(crate::server::io_bytes)) {
+                server_io = Some((b.0 - a.0, b.1 - a.1));
             }
             if !o.ok() {
                 self.say(&format!("  {} FAILED ({}): {}", c.name, o.code, o.stderr.lines().last().unwrap_or("")));
@@ -211,6 +217,8 @@ impl Bench {
             "maxrss_mib": rss as f64 / 1024.0,
             "server_maxrss_mib": server_rss.map(|k| k as f64 / 1024.0),
             "server_rss_before_mib": server_before.map(|k| k as f64 / 1024.0),
+            "server_read_bytes": server_io.map(|io| io.0),
+            "server_written_bytes": server_io.map(|io| io.1),
             "stdout_bytes": last.stdout_bytes,
             "trace": traced,
         });
@@ -225,7 +233,10 @@ impl Bench {
         let srv = server_rss
             .map(|k| format!(", server {:.0} → {:.0} MiB", server_before.unwrap_or(0) as f64 / 1024.0, k as f64 / 1024.0))
             .unwrap_or_default();
-        self.say(&format!("  {:<34} {:>9.3} s  {:>7.1} MiB{srv}{}", c.name, med, rss as f64 / 1024.0, tr));
+        let io = server_io
+            .map(|(r, w)| format!(", server read {:.1} / wrote {:.1} MiB", r as f64 / 1048576.0, w as f64 / 1048576.0))
+            .unwrap_or_default();
+        self.say(&format!("  {:<34} {:>9.3} s  {:>7.1} MiB{srv}{io}{}", c.name, med, rss as f64 / 1024.0, tr));
         self.cases.push(v.clone());
         Ok(v)
     }
