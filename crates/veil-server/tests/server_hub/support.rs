@@ -375,6 +375,11 @@ impl Api {
         self.post(token, path, &serde_json::to_vec(v).unwrap(), true)
     }
 
+    /// POST JSON, leaving the answer's body unread (a client that stalls).
+    pub fn post_unread(&self, path: &str, body: &[u8]) -> ureq::http::Response<ureq::Body> {
+        self.agent.post(format!("{}{path}", self.base)).header("content-type", "application/json").send(body).unwrap()
+    }
+
     /// POST JSON with the `Host` header a relaying server would send.
     pub fn post_json_host(&self, path: &str, v: &serde_json::Value, host: &str) -> Reply {
         let r = self

@@ -856,3 +856,233 @@ fn a_grant_racing_a_removal_never_outlives_it() {
     }
     eprintln!("racing grants: {wider} with the wider view (all void), {narrower} with the narrower one");
 }
+
+
+// ---- S5 review cycle 2 (docs/BUGS.md, "S5 cycle 2") --------------------------------
+
+/// BUG-1086. A `Range` read of an object not in the server's cache goes to
+/// S3 as `bytes=START-END`, `END` being the request's or, for an open range
+/// (`bytes=START-`, what a resumed download sends), `u64::MAX`. MinIO does
+/// not parse a position that large, ignores the range and answers the
+/// whole object (200), which the server then slices: an open range reads
+/// the whole object from the store, not "only the bytes asked for". And a
+/// range starting past the end gets 416 with no `Content-Range`, which
+/// `S3Store::get_range` refuses as an error, so the route answers 500
+/// instead of the directory store's 416. The S3 store must answer as the
+/// directory store does, reading only the bytes asked for.
+#[test]
+#[ignore = "BUG-1086: S3 ranged reads: an open range reads the whole object, a range past the end is an error (500)"]
+fn bug_1086_s3_ranges_read_only_the_bytes_asked_for_and_answer_as_the_directory_store() {
+    use veil_server::store::{BlobStore, FsStore, S3Store};
+    let Ok(endpoint) = std::env::var("VEIL_TEST_S3_ENDPOINT") else {
+        eprintln!("bug_1086: skipped (no VEIL_TEST_S3_ENDPOINT: run scripts/verify-server.sh)");
+        return;
+    };
+    // A proxy in front of MinIO that counts the bytes MinIO sends back.
+    let upstream = endpoint.trim_start_matches("http://").trim_end_matches('/').to_string();
+    let (proxy, received) = counting_proxy(upstream);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let bucket = std::env::var("VEIL_TEST_S3_BUCKET").unwrap_or_else(|_| "veil-test".into());
+        let (key_id, secret) = (std::env::var("VEIL_TEST_S3_KEY").unwrap(), std::env::var("VEIL_TEST_S3_SECRET").unwrap());
+        let s3 = S3Store::new(&proxy, &bucket, "us-east-1", &key_id, &secret).unwrap();
+        s3.ensure_bucket().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let fs = FsStore::new(dir.path());
+        let mut raw = b"veil:blob\n".to_vec();
+        raw.extend(std::iter::repeat_n(b'x', 4 << 20));
+        let raw = bytes::Bytes::from(raw);
+        let key = unique("bug1086/");
+        s3.put(&key, raw.clone()).await.unwrap();
+        fs.put(&key, raw.clone()).await.unwrap();
+        let len = raw.len() as u64;
+        let mut failures = Vec::new();
+        // The same answers as the directory store, for every range.
+        for (a, b) in [(2, 5), (len - 10, u64::MAX), (len, u64::MAX), (len + 5, len + 9), (len + 5, u64::MAX)] {
+            let f = fs.get_range(&key, a, b).await.map_err(|e| format!("{e:#}"));
+            let s = s3.get_range(&key, a, b).await.map_err(|e| format!("{e:#}"));
+            if f != s {
+                failures.push(format!("bytes={a}-{b}: directory store {:?}, S3 {:?}", f.map(|o| o.map(|(p, l)| (p.len(), l))), s.map(|o| o.map(|(p, l)| (p.len(), l)))));
+            }
+        }
+        // The last 10 bytes, by an open range: about 10 bytes from the store.
+        received.store(0, std::sync::atomic::Ordering::SeqCst);
+        let (part, _) = s3.get_range(&key, len - 10, u64::MAX).await.unwrap().unwrap();
+        assert_eq!(part.len(), 10);
+        let got = received.load(std::sync::atomic::Ordering::SeqCst);
+        if got > 64 << 10 {
+            failures.push(format!("an open range of the last 10 bytes of a 4 MiB object read {got} bytes from S3"));
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    });
+}
+
+/// A TCP proxy to `upstream` counting the bytes upstream sends back; its
+/// URL and the count.
+fn counting_proxy(upstream: String) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::{
+        io::{Read, Write},
+        net::{Shutdown, TcpListener, TcpStream},
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let c0 = count.clone();
+    std::thread::spawn(move || {
+        for c in l.incoming() {
+            let Ok(c) = c else { continue };
+            let (up, count) = (upstream.clone(), c0.clone());
+            std::thread::spawn(move || {
+                let Ok(u) = TcpStream::connect(&up) else { return };
+                let (mut c2, mut u2) = (c.try_clone().unwrap(), u.try_clone().unwrap());
+                let t = std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut c2, &mut u2);
+                    let _ = u2.shutdown(Shutdown::Write);
+                });
+                let (mut u, mut c) = (u, c);
+                let mut buf = vec![0u8; 64 << 10];
+                while let Ok(n) = u.read(&mut buf) {
+                    if n == 0 || c.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                    count.fetch_add(n, Ordering::SeqCst);
+                }
+                let _ = c.shutdown(Shutdown::Write);
+                let _ = t.join();
+            });
+        }
+    });
+    (format!("http://{addr}"), count)
+}
+
+/// This process's peak resident memory since [`reset_peak`], in bytes.
+fn peak_rss() -> usize {
+    let s = std::fs::read_to_string("/proc/self/status").unwrap();
+    let kib: usize = s.lines().find(|l| l.starts_with("VmHWM:")).and_then(|l| l.split_whitespace().nth(1)).unwrap().parse().unwrap();
+    kib << 10
+}
+
+fn reset_peak() {
+    std::fs::write("/proc/self/clear_refs", "5").expect("resetting VmHWM");
+}
+
+/// BUG-1087. A batch's read-ahead (as S1's `fetch`'s) is bounded by the
+/// sizes the tree entries record, and the server never checks those
+/// against the objects: a pusher writes them. Anyone who can push (anyone
+/// who signs up, to a project of their own; here a dev, to `src/`) records
+/// an 8 MiB file as 1 byte and asks for it 64 times in one batch on a
+/// server that has not cached it: all 64 reads start at once, each its own
+/// copy, about 512 MiB for one request (the bound is about 8 MiB ahead),
+/// held for as long as the client does not read. Objects up to 2 GiB are
+/// accepted, so a few such requests run a server out of memory. The same
+/// file with its true size stays within the bound (the control). It
+/// measures memory, so it runs in a process of its own.
+#[test]
+#[ignore = "BUG-1087: read-ahead trusts the sizes pushed tree entries record (a 1-byte entry for 8 MiB: 64 copies at once)"]
+fn bug_1087_a_batch_reads_ahead_by_sizes_the_pusher_wrote() {
+    const CHILD: &str = "VEIL_BUG1087_CHILD";
+    if std::env::var(CHILD).is_err() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "grants::bug_1087_a_batch_reads_ahead_by_sizes_the_pusher_wrote", "--nocapture", "--test-threads=1", "--include-ignored"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+        return;
+    }
+    const MIB: usize = 1 << 20;
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let file = |tag: &str| {
+        let mut b = format!("{tag} {}\n", unique("")).into_bytes();
+        b.resize(8 * MIB, b'z');
+        Object::Blob(b)
+    };
+    let (honest, lying) = (file("honest"), file("lying"));
+    let honest_len = honest.encode().len() as u64;
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    for (path, object, size) in [("src/honest.bin", honest, honest_len), ("src/lying.bin", lying, 1)] {
+        let id = c.put_object(object);
+        c.set_entry(path, veil_core::TreeEntry { name: String::new(), kind: EntryKind::File, id, size, executable: false, visibility: Default::default() });
+    }
+    let r = c.push("main", "two large files");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    // Another server of the deployment, whose cache holds neither.
+    let cold = TestHub::beside(&hub);
+    let capi = cold.api();
+    let dev = Reader::new(&capi, Some(&p.dev), &p.name);
+    let root = dev.root();
+    let tree = |chain: &[ObjectId], id: &ObjectId| match Object::decode(&dev.get(chain, id).body).unwrap() {
+        Object::Tree(t) => t,
+        _ => panic!("not a tree"),
+    };
+    let src = tree(&[], &root).get("src").unwrap().id;
+    let s = tree(&[root], &src);
+    let mut grew = Vec::new();
+    for name in ["honest.bin", "lying.bin"] {
+        let id = s.get(name).unwrap().id;
+        let ids = vec![id; 64];
+        let ts = veil_core::now_millis();
+        let req = BatchRequest {
+            grant: dev.grant.clone(),
+            ts,
+            signature: dev.signature(&dev.grant, ts, &ids),
+            wants: ids.iter().map(|id| ChainWant { chain: vec![root, src], id: *id }).collect(),
+        };
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        reset_peak();
+        let before = peak_rss();
+        // A client that does not read the answer.
+        let stalled = capi.post_unread(&format!("/v1/objects/{}:batch", p.name), &serde_json::to_vec(&req).unwrap());
+        assert_eq!(stalled.status().as_u16(), 200);
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        grew.push((name, peak_rss().saturating_sub(before) / MIB));
+        drop(stalled);
+    }
+    eprintln!("peak growth while one batch of 64 wants of an 8 MiB file is not read (MiB): {grew:?}");
+    assert!(grew[0].1 < 192, "the control (true size) went past the bound: {grew:?}");
+    assert!(grew[1].1 < 192, "a batch held {} MiB for one request, by sizes its pusher wrote: {grew:?}", grew[1].1);
+}
+
+/// BUG-1088. A grant names its project and person by their database ids,
+/// which are sequential (`BIGSERIAL`). Anyone who signs up creates a
+/// project and reads its id in their own grant: two of them, made before
+/// and after others create private projects, give how many projects
+/// everyone else created in between (and a person's own id, how many people
+/// signed up before them); anyone on Earth reads the same from the grants of
+/// public projects. No other answer of the server shows these ids
+/// (BUG-1081 removed the feed's). In a database of its own, so the count is
+/// exact.
+#[test]
+#[ignore = "BUG-1088: grants carry sequential project and person ids: anyone counts the server's private projects"]
+fn bug_1088_a_grants_ids_count_the_servers_private_projects() {
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(2).build().unwrap();
+    let hub = TestHub::start_on(&fresh_database(&rt), std::time::Duration::from_secs(3600));
+    let api = hub.api();
+    let (watcher, other) = (hub.person("watch"), hub.person("other"));
+    // The watcher's project, with a commit (an empty project has no grant).
+    let create = |who: &Person| -> GrantBody {
+        let name = unique("count");
+        let dir = who.dir(&name);
+        std::fs::create_dir_all(&dir).unwrap();
+        who.ok(&dir, &["init"]);
+        write_files(&dir, &[("a.txt", "a")]);
+        who.ok(&dir, &["remote", "add", "origin", &hub.url(&name)]);
+        who.commit_main(&dir, "a");
+        who.ok(&dir, &["push"]);
+        Grant::read_unverified(&api.tips(Some(&who.token()), &name).unwrap().grants["main"]).unwrap()
+    };
+    let first = create(&watcher);
+    // Someone else's private projects.
+    let o = other.token();
+    for _ in 0..5 {
+        let r = api.post(Some(&o), &format!("/v1/projects/{}", unique("private")), b"", true);
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    }
+    let second = create(&watcher);
+    let between = second.project_id - first.project_id - 1;
+    assert_ne!(between, 5, "the watcher's two grants show that 5 projects were created by others in between");
+}
