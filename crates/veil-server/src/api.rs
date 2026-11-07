@@ -590,13 +590,22 @@ async fn fetch(State(hub): State<HubState>, caller: Caller, Path(p): Path<String
     Ok(([(header::CONTENT_TYPE, frames_type(encoded))], axum::body::Body::new(stream)).into_response())
 }
 
-async fn objects(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, body: Bytes) -> Result<Json<veil_core::hub::wire::Uploaded>> {
+async fn objects(
+    State(hub): State<HubState>,
+    caller: Caller,
+    Path(p): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<veil_core::hub::wire::Uploaded>> {
+    // A `vl` that sends encoded frames has made each object as small as it
+    // gets; plain frames (an older `vl`) are compressed here.
+    let encoded = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.eq_ignore_ascii_case(encoding::FRAMES));
     let me = caller.signed_in()?.id;
     let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
     if !project.participant(&viewer) {
         return Err(Error::forbidden("you are not in this project"));
     }
-    let receipts = sync::upload(&hub, project.id, me, body, crate::db::body_limit("/objects") as u64).await?;
+    let receipts = sync::upload(&hub, project.id, me, body, crate::db::body_limit("/objects") as u64, encoded).await?;
     Ok(Json(veil_core::hub::wire::Uploaded {
         stored: receipts.len(),
         receipts,

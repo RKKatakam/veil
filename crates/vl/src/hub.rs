@@ -262,19 +262,6 @@ fn objects_of(body: &[u8]) -> Result<Vec<(ObjectId, Vec<u8>)>> {
     Ok(encoding::read_frames(body, ANSWER_LIMIT)?.into_iter().map(|(id, raw)| (id, raw.into_owned())).collect())
 }
 
-/// `objects`' encodings, compressed on several threads; in order.
-fn encode_all(objects: &[(ObjectId, Vec<u8>)]) -> Vec<std::borrow::Cow<'_, [u8]>> {
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
-    let chunk = objects.len().div_ceil(threads).max(1);
-    std::thread::scope(|s| {
-        let parts: Vec<_> = objects
-            .chunks(chunk)
-            .map(|c| s.spawn(move || c.iter().map(|(_, raw)| encoding::encode(raw)).collect::<Vec<_>>()))
-            .collect();
-        parts.into_iter().flat_map(|p| p.join().expect("an encoding thread panicked")).collect()
-    })
-}
-
 impl Client {
     pub fn new(url: &HubUrl, identity: Identity) -> Result<Client> {
         let file = load_file()?;
@@ -475,7 +462,7 @@ impl Client {
     /// [`FETCH_REQUESTS`] of them in flight (the server reads and frames
     /// them on several threads). Each part's objects are checked against
     /// its wants, in order.
-    pub fn fetch_each(&self, snapshot: ObjectId, wants: &[Want], sizes: &[u64], mut f: impl FnMut(&Want, &[u8]) -> Result<()>) -> Result<()> {
+    pub fn fetch_each(&self, snapshot: ObjectId, wants: &[Want], sizes: &[u64], mut f: impl FnMut(&Want, Vec<u8>) -> Result<()>) -> Result<()> {
         // Fewer than 2,000 objects in one request; more in at least
         // FETCH_REQUESTS parts (the server serves each on its own threads).
         let most = match wants.len() < 2 * FETCH_PART_MIN {
@@ -494,22 +481,27 @@ impl Client {
         if start < wants.len() {
             parts.push(start..wants.len());
         }
-        // Each part's objects decoded where its answer arrives (on the
-        // fetch threads), then checked against its wants here.
-        let mut check = |part: &[Want], got: Vec<(ObjectId, Vec<u8>)>| -> Result<()> {
+        // Each part's objects checked against its wants, then decoded one
+        // at a time (bounded), each handed on as it is decoded: only
+        // answers as sent (compressed) wait in flight.
+        let mut check = |part: &[Want], body: &[u8]| -> Result<()> {
+            let got = encoding::split_frames(body)?;
             if got.len() != part.len() {
                 bail!("the server sent {} objects for {} asked", got.len(), part.len());
             }
-            for (w, (id, raw)) in part.iter().zip(got) {
+            let mut left = ANSWER_LIMIT;
+            for (w, (id, enc)) in part.iter().zip(got) {
                 if id != w.id {
                     bail!("the server sent another object than asked");
                 }
-                f(w, &raw)?;
+                let raw = encoding::decode(&id, enc, left.min(veil_core::hub::wire::MAX_FRAME_OBJECT as u64))?.into_owned();
+                left -= raw.len() as u64;
+                f(w, raw)?;
             }
             Ok(())
         };
         if parts.len() == 1 {
-            return check(wants, objects_of(&self.fetch_body(snapshot, wants.to_vec())?)?);
+            return check(wants, &self.fetch_body(snapshot, wants.to_vec())?);
         }
         let token = self.token.borrow().clone();
         let url = format!("{}{}", self.url.base(), self.url.project_path("/fetch"));
@@ -518,21 +510,20 @@ impl Client {
         std::thread::scope(|s| -> Result<()> {
             // A part fetched waits here until the one before is written:
             // at most one answer per request in flight, plus this one.
-            let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Option<Vec<(ObjectId, Vec<u8>)>>)>(0);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Option<Vec<u8>>)>(0);
             for _ in 0..FETCH_REQUESTS.min(parts.len()) {
                 let (tx, url, token, next) = (tx.clone(), &url, &token, &next);
                 s.spawn(move || loop {
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(p) = parts.get(i) else { break };
-                    let body = (|| -> Option<Vec<(ObjectId, Vec<u8>)>> {
+                    let body = (|| -> Option<Vec<u8>> {
                         let body = serde_json::to_vec(&FetchRequest { snapshot, objects: wants[p.clone()].to_vec() }).ok()?;
                         let mut r = agent.post(url).header("content-type", "application/json").header("accept", ACCEPT);
                         if let Some(t) = token {
                             r = r.header("authorization", &format!("Bearer {t}"));
                         }
                         let resp = r.send(&body[..]).ok()?;
-                        let body = (resp.status().as_u16() == 200).then(|| read_body(resp).ok()).flatten()?;
-                        objects_of(&body).ok()
+                        (resp.status().as_u16() == 200).then(|| read_body(resp).ok()).flatten()
                     })();
                     // The receiver is gone when writing failed: stop.
                     if tx.send((i, body)).is_err() {
@@ -545,20 +536,21 @@ impl Client {
                 let (i, body) = rx.recv().map_err(|_| anyhow!("a fetch thread stopped"))?;
                 let part = &wants[parts[i].clone()];
                 match body {
-                    Some(got) => check(part, got)?,
+                    Some(body) => check(part, &body)?,
                     // Anything else (a session to renew, an error to
                     // report): this part again, the ordinary way.
-                    None => check(part, objects_of(&self.fetch_body(snapshot, part.to_vec())?)?)?,
+                    None => check(part, &self.fetch_body(snapshot, part.to_vec())?)?,
                 }
             }
             Ok(())
         })
     }
 
-    /// Upload object frames (plain, or encoded for a server of revision 2);
-    /// the server's receipt for each, in order.
-    pub fn upload(&self, frames: Vec<u8>) -> Result<Vec<String>> {
-        let out = self.ok("POST", &self.url.project_path("/objects"), Some(("application/octet-stream", frames)))?;
+    /// Upload object frames (plain, or `encoded` for a server of revision
+    /// 2); the server's receipt for each, in order.
+    pub fn upload(&self, frames: Vec<u8>, encoded: bool) -> Result<Vec<String>> {
+        let ct = if encoded { encoding::FRAMES } else { "application/octet-stream" };
+        let out = self.ok("POST", &self.url.project_path("/objects"), Some((ct, frames)))?;
         Ok(serde_json::from_slice::<veil_core::hub::wire::Uploaded>(&out)?.receipts)
     }
 
@@ -778,7 +770,7 @@ pub fn pull(repo: &mut Repo, remote: &str, client: &Client, only: Option<&str>) 
         let mut next = Vec::new();
         for (snap, (wants, sizes)) in by_snap {
             client.fetch_each(snap, &wants, &sizes, |w, raw| {
-                let obj = Object::decode(raw)?;
+                let obj = Object::decode(&raw)?;
                 let mut children = Vec::new();
                 match &obj {
                     Object::Tree(t) => {
@@ -805,7 +797,7 @@ pub fn pull(repo: &mut Repo, remote: &str, client: &Client, only: Option<&str>) 
                         next.push((w.snapshot.unwrap_or(snap), p, cid, size));
                     }
                 }
-                if incoming.put(w.id, raw.to_vec(), &w.path)? {
+                if incoming.put(w.id, raw, &w.path)? {
                     report.objects_copied += 1;
                 }
                 Ok(())
@@ -1010,52 +1002,41 @@ impl<'a, F: FnMut(ObjectId, Vec<u8>) -> Result<()>> Introduced<'a, F> {
     }
 }
 
-/// Objects on their way to the server, about 8 MiB (uncompressed) per
-/// request, and the server's receipt for each: the push shows them, so it
-/// names nothing it did not send (BUG-824). To a server of revision 2 they
-/// go compressed (S27).
+/// Object frames on their way to the server, about 8 MiB per request, and
+/// the server's receipt for each: the push shows them, so it names nothing
+/// it did not send (BUG-824). To a server of revision 2 each object goes
+/// compressed (S27), compressed as the walk finds it.
 struct Uploads<'a> {
     client: &'a Client,
     compress: bool,
-    objects: Vec<(ObjectId, Vec<u8>)>,
-    bytes: usize,
+    frames: Vec<u8>,
+    ids: Vec<ObjectId>,
     receipts: BTreeMap<ObjectId, String>,
 }
 
 impl Uploads<'_> {
-    fn add(&mut self, id: ObjectId, raw: Vec<u8>) -> Result<()> {
-        self.bytes += raw.len();
-        self.objects.push((id, raw));
-        if self.bytes > 8 << 20 {
+    fn add(&mut self, id: &ObjectId, raw: &[u8]) -> Result<()> {
+        match self.compress {
+            true => put_frame(&mut self.frames, id, &encoding::encode(raw)),
+            false => put_frame(&mut self.frames, id, raw),
+        }
+        self.ids.push(*id);
+        if self.frames.len() > 8 << 20 {
             self.flush()?;
         }
         Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
-        if self.objects.is_empty() {
+        if self.ids.is_empty() {
             return Ok(());
         }
-        let objects = std::mem::take(&mut self.objects);
-        self.bytes = 0;
-        let mut frames = Vec::new();
-        match self.compress {
-            true => {
-                for ((id, _), enc) in objects.iter().zip(encode_all(&objects)) {
-                    put_frame(&mut frames, id, &enc);
-                }
-            }
-            false => {
-                for (id, raw) in &objects {
-                    put_frame(&mut frames, id, raw);
-                }
-            }
+        let r = self.client.upload(std::mem::take(&mut self.frames), self.compress)?;
+        let ids = std::mem::take(&mut self.ids);
+        if r.len() != ids.len() {
+            bail!("the server sent {} upload receipts for {} objects", r.len(), ids.len());
         }
-        let r = self.client.upload(frames)?;
-        if r.len() != objects.len() {
-            bail!("the server sent {} upload receipts for {} objects", r.len(), objects.len());
-        }
-        self.receipts.extend(objects.into_iter().map(|(id, _)| id).zip(r));
+        self.receipts.extend(ids.into_iter().zip(r));
         Ok(())
     }
 }
@@ -1147,8 +1128,8 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
         // Upload what the push introduces as the walk finds it, 8 MiB per
         // request (BUG-858).
         // A server of revision 2 reads compressed objects.
-        let mut up = Uploads { client, compress: revision >= 2, objects: Vec::new(), bytes: 0, receipts: BTreeMap::new() };
-        let mut walk = Introduced::new(&store, |id, raw| up.add(id, raw));
+        let mut up = Uploads { client, compress: revision >= 2, frames: Vec::new(), ids: Vec::new(), receipts: BTreeMap::new() };
+        let mut walk = Introduced::new(&store, |id, raw| up.add(&id, &raw));
         for (id, s) in &new {
             let parents: Vec<ObjectId> = s.parents.iter().filter_map(|p| store.snapshot(p).ok().map(|ps| ps.tree)).collect();
             walk.snapshot(*id, s.tree, parents)?;
@@ -1218,14 +1199,13 @@ mod tests {
             .map(|r| (ObjectId::hash(r), r.to_vec()))
             .collect();
         let (mut plain, mut encoded) = (Vec::new(), Vec::new());
-        for ((id, raw), enc) in objs.iter().zip(encode_all(&objs)) {
+        for (id, raw) in &objs {
             put_frame(&mut plain, id, raw);
-            put_frame(&mut encoded, id, &enc);
+            put_frame(&mut encoded, id, &encoding::encode(raw));
         }
         assert_ne!(plain, encoded);
         assert_eq!(objects_of(&plain).unwrap(), objs);
         assert_eq!(objects_of(&encoded).unwrap(), objs);
-        assert!(encode_all(&[]).is_empty());
     }
 
     #[test]

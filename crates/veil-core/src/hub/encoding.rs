@@ -35,8 +35,10 @@ const PLAIN: u8 = b'v';
 #[cfg_attr(not(feature = "zstd"), allow(dead_code))]
 const LEVEL: i32 = 3;
 
-/// The `Accept` media type of a client that reads encoded frames: a server
-/// answers it with compressed objects (`history`, `fetch`).
+/// The media type of a body of encoded frames: a client that reads them
+/// says so in `Accept` (a server then answers `history` and `fetch` with
+/// objects as stored), and sends its uploads under it (each object
+/// already as small as it gets: a server stores it as it is).
 pub const FRAMES: &str = "application/x-veil-encoded-frames";
 
 /// The encoding of `raw` (a canonical encoding): a zstd frame when that is
@@ -64,6 +66,8 @@ pub fn encode(raw: &[u8]) -> Cow<'_, [u8]> {
             out[0] = ZSTD;
             let n = c.compress_to_buffer(raw, &mut out[1..]).ok()?;
             out.truncate(1 + n);
+            // Kept, it holds only its own bytes (a cache weighs it by them).
+            out.shrink_to_fit();
             Some(out)
         });
         if let Some(z) = z.filter(|z| z.len() < raw.len()) {

@@ -1539,6 +1539,8 @@ client (`crates/vl/src/hub.rs`).
 * **The server's store** (`Objects`) writes the encoding, and keeps
   encodings in its object cache (so the cache holds more objects), each
   checked against its id when it was read from the store or received.
+  `vl` decodes a fetch answer as it writes it, so only answers as sent
+  (compressed) wait in flight: a clone holds less than before.
   `get` returns the canonical encoding (the projection, push checks and
   older clients use it); `get_encoded` returns what is stored, for the wire.
   Every object the store answers is decoded, bounded, and re-hashed before
@@ -1551,11 +1553,14 @@ client (`crates/vl/src/hub.rs`).
     caller that accepts them, and plain frames to anyone else. Projected
     trees made for one viewer are sent as they are.
   * **Uploads:** the server reads every upload as encoded frames (so a `vl`
-    from before S27 still uploads), decodes and checks each, and stores the
-    client's frame when it is smaller, else compresses the object itself.
-    `vl` compresses an upload on up to 8 threads, but only for a server of
-    **revision 2** (`Tips::revision`); to an older server it sends plain
-    frames.
+    from before S27 still uploads), and decodes and checks each. A `vl`
+    that compresses sends its upload as
+    `Content-Type: application/x-veil-encoded-frames`, each object already
+    as small as it gets (compressed as the push's walk finds it): the server
+    stores each as sent (never larger than the object). A plain upload (an
+    older `vl`) is compressed by the server. `vl` compresses only for a
+    server of **revision 2** (`Tips::revision`); to an older server it
+    sends plain frames.
 * **Compatibility, both ways.** An older `vl` sends no `Accept` and gets
   plain frames; its plain uploads are compressed by the server. A newer
   `vl` and an older server: the server ignores `Accept` and answers plain

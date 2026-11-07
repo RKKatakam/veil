@@ -1185,11 +1185,13 @@ fn receipted(hub: &Hub, project: i64, person: i64, receipts: &std::collections::
 /// `limit` bytes for the whole request, so a compressed request costs no
 /// more than a plain one could), re-hashed against its id, and must decode
 /// canonically (safe names, sorted trees) at a repository format the server
-/// serves. It is stored compressed when that is smaller (`docs/HUB.md`
-/// §13.13). Nothing uploaded is visible until a push makes a branch reach
+/// serves. It is stored as the client encoded it when the client sent
+/// `encoded` frames (made as small as they get) and that is no larger than
+/// the object; a plain frame is compressed here when that is smaller
+/// (`docs/HUB.md` §13.13). Nothing uploaded is visible until a push makes a branch reach
 /// it. Returns a receipt per object, in order (stored whether or not the
 /// project held it already, so the answer is the same either way).
-pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes, limit: u64) -> Result<Vec<String>> {
+pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes, limit: u64, encoded: bool) -> Result<Vec<String>> {
     // The checks, decoding and compressing on a blocking thread. Each
     // encoding is copied out of the request: a slice would keep the whole
     // body alive in the object cache for as long as any one of its
@@ -1204,10 +1206,11 @@ pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes, limi
                 return Err(Error::bad_request("an object of a newer format than this server serves"));
             }
             Object::decode(&raw)?;
-            // Stored as the client compressed it when that is smaller;
-            // compressed here otherwise (an older client's plain frame).
+            // As the client encoded it (never larger than the object);
+            // compressed here when the client sent plain frames.
             let stored = match &raw {
-                Cow::Owned(r) if enc.len() < r.len() => Bytes::copy_from_slice(enc),
+                Cow::Owned(r) if enc.len() >= r.len() => Bytes::copy_from_slice(r),
+                _ if encoded => Bytes::copy_from_slice(enc),
                 _ => Bytes::copy_from_slice(&encoding::encode(&raw)),
             };
             out.push((id, stored));
