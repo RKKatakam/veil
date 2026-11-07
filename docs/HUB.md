@@ -1526,8 +1526,10 @@ client (`crates/vl/src/hub.rs`).
 * **The server's store** (`Objects`) writes the encoding, and keeps
   encodings in its object cache (so the cache holds more objects), each
   checked against its id when it was read from the store or received.
-  `vl` decodes a fetch answer as it writes it, so only answers as sent
-  (compressed) wait in flight: a clone holds less than before.
+  `vl`'s fetch threads hand on answers as sent (compressed); the receiving
+  thread checks the ids and decodes one answer at a time, on up to 8
+  threads. Decoding on the fetch threads instead held 8 decoded answers at
+  once and broke the 1 GB clone's 512 MiB gate (549–559 MiB).
   `get` returns the canonical encoding (the projection, push checks and
   older clients use it); `get_encoded` returns what is stored, for the wire.
   Every object the store answers is decoded, bounded, and re-hashed before
@@ -1566,6 +1568,27 @@ client (`crates/vl/src/hub.rs`).
 * **What it does not change:** the client's local store (pulled objects
   already go into zstd packs; loose objects stay as they are until
   `vl gc`), the repository format, and the per-object permission checks.
+
+#### Measured (2026-11-07)
+
+`scripts/bench-server.sh` with MinIO, release builds, before (`f7e9aac` plus
+the byte counters) and after (S27), the bytes being what the server wrote
+(`/proc/PID/io`: to MinIO during a push, to the client during a clone). The
+machine was shared and often loaded (15–70); times are within noise or
+better.
+
+| | before | after |
+|---|---:|---:|
+| 1 GB profile: bytes stored, initial push | 2,462 MiB | **1,191 MiB (−52%)** |
+| 1 GB: bytes sent, full clone | 2,352 MiB | **1,057 MiB (−55%)** |
+| 1 GB: bytes sent, clone of one directory | 82.8 MiB | 42.2 MiB (−49%) |
+| 1 GB: push / full clone | 286 s / 58.4 s | 272 s / 46.8 s |
+| 1 GB: client peak, push / clone (gate 512 MiB) | 341 / 453 MiB | 319 / 448 MiB |
+| 1 GB: server peak, push / clone | 2,550 / 2,958 MiB | 1,999 / 2,984 MiB |
+| OpenScion 10k: bytes stored / sent by a clone | 46.0 / 41.9 MB | 27.2 / 23.1 MB (random hex: −41% / −45%) |
+| OpenScion clone everything, 1k / 10k | 101.8 / 622.8 ms | 100.7 / 501.6 ms |
+| load: server CPU per landing (1 / 10 / 100 projects) | 4.0 / 3.8 / 2.9 ms | 3.6 / 4.0 / 3.4 ms |
+| load: database statements per landing | 34 | 34 |
 
 #### Threat review
 
