@@ -299,23 +299,36 @@ pub fn queued(ticket: &str) -> LandResult {
 }
 
 /// Wait for `w`'s outcome until `deadline`: from the service here as soon as
-/// it commits, else (a service on another server) from the queue row,
-/// read every 250 ms, keeping a service running meanwhile.
+/// it commits; else (a service on another server) from the queue row, read
+/// with a backoff from 250 ms to 2 s, keeping a service running meanwhile.
+/// While this server runs the branch's service, the row is read only every
+/// 5 s (a fallback): thousands of waiters must not each poll the database
+/// while a batch is late, or the backlog feeds itself.
 pub async fn wait(hub: &Arc<Hub>, project: i64, person: i64, branch: &str, mut w: Waiter, deadline: tokio::time::Instant) -> Result<LandResult> {
+    let key = (project, branch.to_string());
+    let mut step = Duration::from_millis(250);
+    let mut last_read = tokio::time::Instant::now();
     let out = loop {
-        let step = (tokio::time::Instant::now() + Duration::from_millis(250)).min(deadline);
-        if let Ok(Ok(r)) = tokio::time::timeout_at(step, &mut w.rx).await {
+        let until = (tokio::time::Instant::now() + step).min(deadline);
+        if let Ok(Ok(r)) = tokio::time::timeout_at(until, &mut w.rx).await {
             break r;
         }
-        if let Some((_, r)) = read(hub, project, person, &w.ticket).await? {
-            if r.state != LandState::Queued {
-                break r;
+        let local = hub.landing.running.lock().unwrap().contains_key(&key);
+        if !local || last_read.elapsed() >= Duration::from_secs(5) {
+            last_read = tokio::time::Instant::now();
+            if let Some((_, r)) = read(hub, project, person, &w.ticket).await? {
+                if r.state != LandState::Queued {
+                    break r;
+                }
             }
         }
         if tokio::time::Instant::now() >= deadline {
             break queued(&w.ticket);
         }
-        ensure(hub, project, branch);
+        if !local {
+            step = (step * 2).min(Duration::from_secs(2));
+            ensure(hub, project, branch);
+        }
     };
     hub.landing.forget(&w.ticket);
     Ok(out)
