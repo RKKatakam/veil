@@ -624,9 +624,15 @@ impl Ctx {
     }
 
     /// Record the project directory as operation `description`, with line
-    /// endings as `line_endings` says (`vl renormalize`). The directory was
-    /// recorded when the command started, so it is not stale.
+    /// endings as `line_endings` says (`vl renormalize`). Under the lock, as
+    /// every recording (BUG-1125); a directory another command moved since
+    /// this one started is not renormalized.
     pub fn snapshot_with_line_endings(&mut self, description: String, line_endings: veil_core::builder::LineEndings<'_>) -> Result<BuildReport> {
+        let _wc = self.lock_dir(None)?;
+        self.resume()?;
+        if self.behind()? {
+            bail!("the working copy moved while this command ran (another `vl` is running here?); try again");
+        }
         let view_wc = self.wc()?;
         let disk = self.fs.clone();
         let fs: &dyn StorageBackend = &*disk;
@@ -767,7 +773,12 @@ impl Ctx {
     /// directory then looked stale, and its edits were moved into a side
     /// change and out of it (BUG-1084). If the directory was attached
     /// elsewhere meanwhile, that workspace is locked instead (BUG-1121).
-    fn lock_dir(&mut self, to: Option<&str>) -> Result<Vec<veil_core::lock::WcLock>> {
+    ///
+    /// A command that writes into the directory itself (`vl restore`, the
+    /// policy commands) holds it from before it reads the directory until
+    /// its closing snapshot (BUG-1125); the lock is re-entrant within a
+    /// process.
+    pub fn lock_dir(&mut self, to: Option<&str>) -> Result<Vec<veil_core::lock::WcLock>> {
         if self.bare {
             return Ok(Vec::new());
         }
@@ -818,6 +829,9 @@ impl Ctx {
         // its record says now, under the lock.
         let to = (self.ws != self.checkout.attached()).then(|| std::mem::replace(&mut self.ws, self.checkout.attached().to_string()));
         let _wc = self.lock_dir(to.as_deref())?;
+        // The re-read may have merged heads that landed meanwhile: only the
+        // process that writes a merge says what it decided (BUG-1126).
+        self.print_merge_warnings();
         if let Some(ws) = to {
             self.attach(&ws)?;
         }

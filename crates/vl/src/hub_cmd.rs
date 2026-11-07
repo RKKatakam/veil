@@ -346,6 +346,8 @@ pub fn access(ctx: &mut Ctx, path: &str, who: &[String]) -> Result<()> {
         }
     }
     let file = VPath::new(POLICY_FILE)?;
+    // Rewrites `.veilpolicy` in the directory (BUG-1125).
+    let wc_lock = ctx.lock_dir(None)?;
     let text = String::from_utf8(ctx.fs.read(&file).unwrap_or_default()).context(".veilpolicy is not UTF-8")?;
     let new_line = format!("{:<24}{}", line_path(&norm), who.join(" "));
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
@@ -365,6 +367,7 @@ pub fn access(ctx: &mut Ctx, path: &str, who: &[String]) -> Result<()> {
     let mut out = lines.join("\n");
     out.push('\n');
     ctx.fs.write(&file, out.as_bytes())?;
+    drop(wc_lock);
     println!("{} .veilpolicy: {}", if replaced { "Updated" } else { "Added to" }, safe(&new_line));
     println!("  Push it to apply (only admins may change access; the last matching line wins).");
     // The line's secrets get their own key (docs/HUB.md §13.12).

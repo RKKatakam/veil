@@ -346,7 +346,6 @@ fn ws_write(env: &Env, proj: &std::path::Path, ws: &str, path: &str, data: &str)
 /// window is renormalize's own work after its opening snapshot.)
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "BUG-1125: vl renormalize records the directory without the working-copy lock"]
 fn bug_1125_renormalize_waits_for_a_live_move_of_the_directory() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a.txt", "a\n")]);
@@ -393,7 +392,6 @@ fn bug_1125_renormalize_waits_for_a_live_move_of_the_directory() {
 /// that is recording or checking out the directory.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "BUG-1125: vl restore writes the directory without the working-copy lock"]
 fn bug_1125_restore_waits_for_another_recorder() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a.txt", "a\n")]);
@@ -417,7 +415,6 @@ fn bug_1125_restore_waits_for_another_recorder() {
 /// merge prints it, and later commands find it merged.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "BUG-1126: merge warnings of Ctx::finish's re-read are never printed"]
 fn bug_1126_finish_prints_the_merge_it_wrote() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a.txt", "a\n")]);
@@ -441,4 +438,26 @@ fn bug_1126_finish_prints_the_merge_it_wrote() {
     t.push_str(&text(&env.vl("alice", &proj, &["--no-snapshot", "log"])));
     t.push_str(&text(&env.vl("alice", &proj, &["status"])));
     assert!(t.contains("moved by concurrent commands"), "the merge's warning was never printed: {t}");
+}
+
+/// BUG-1125: the policy commands (`vl expose`, `cloak`, `isolate`, `ignore`)
+/// rewrite `.veilpolicy` in the directory: they wait for the working-copy
+/// lock before reading it, so a recorder never sees it half way and two
+/// of them never drop each other's rule.
+#[cfg(target_os = "linux")]
+#[test]
+fn bug_1125_policy_rules_wait_for_another_recorder() {
+    let env = Env::new();
+    let proj = env.project("alice", "proj", &[("a.txt", "a\n")]);
+    env.ok("alice", &proj, &["status"]);
+    let policy = read(&proj, ".veilpolicy");
+    let lock = hold_wc_lock(&proj, "default");
+    let mut child = env.spawn("alice", &proj, &["--no-snapshot", "ignore", "build-out/"]);
+    let blocked = blocks_on(&lock, &mut child);
+    let on_disk = read(&proj, ".veilpolicy");
+    drop(lock);
+    let out = child.wait_with_output().unwrap();
+    assert!(blocked && out.status.success(), "{}", text(&out));
+    assert_eq!(on_disk, policy, "`.veilpolicy` was rewritten while another `vl` held the lock");
+    assert!(read(&proj, ".veilpolicy").contains("build-out/"));
 }

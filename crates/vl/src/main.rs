@@ -876,6 +876,9 @@ fn print_tags_kept(r: &CommitResult) {
 }
 
 fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()> {
+    // Writes into the directory: under its lock until the closing snapshot
+    // has recorded them (BUG-1125).
+    let _wc = ctx.lock_dir(None)?;
     let wc = ctx.repo.snapshot(&ctx.wc()?)?;
     let wc_tree = wc.tree;
     // By default, what `vl status` compares with: the parents of `@`,
@@ -1400,6 +1403,9 @@ fn not_a_member(ctx: &Ctx, scope: &str) -> Result<String> {
 
 fn cmd_policy_rules(ctx: &mut Ctx, patterns: &[String], tier: Tier, force: bool) -> Result<()> {
     use veil_core::policy::{read_policy_file, PolicyFile};
+    // Rewrites `.veilpolicy` in the directory: under its lock until the
+    // closing snapshot (BUG-1125).
+    let _wc = ctx.lock_dir(None)?;
     let path = VPath::new(POLICY_FILE)?;
     let mut text = match read_policy_file(&*ctx.fs)? {
         PolicyFile::File(b) => String::from_utf8_lossy(&b).into_owned(),
@@ -1774,6 +1780,8 @@ fn cmd_secret(ctx: &mut Ctx, c: &SecretCmd) -> Result<()> {
         }
         SecretCmd::Recover { path } => {
             let p = ctx.repo_path(path)?;
+            // Writes into the directory (BUG-1125).
+            let _wc = ctx.lock_dir(None)?;
             if !ctx.repo.vault_recover_file(&*ctx.fs, &p)? {
                 bail!("the local vault holds no backup of {}", safe(p.as_str()));
             }
@@ -2292,6 +2300,8 @@ fn cmd_fsck(repo_arg: Option<&Path>, verbose: bool) -> Result<ExitCode> {
 /// the files first (`docs/VISIBILITY.md`, "Existing repositories").
 fn cmd_sync_secrets(ctx: &mut Ctx, dry_run: bool) -> Result<ExitCode> {
     use veil_core::policy::{Policy, Tier, SYNCED_SECRETS_POLICY};
+    // Rewrites `.veilpolicy` in the directory (BUG-1125).
+    let _wc = ctx.lock_dir(None)?;
     let file = VPath::new(POLICY_FILE)?;
     let text = String::from_utf8_lossy(&ctx.fs.read(&file).unwrap_or_default()).into_owned();
     let current = Policy::parse(&text);

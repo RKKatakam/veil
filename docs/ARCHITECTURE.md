@@ -2426,7 +2426,11 @@ take no lock:
   directory was attached elsewhere while it waited locks that workspace
   instead (BUG-1121). `ws write` writes over the `@` it reads under the
   lock and records with `expected_wc`, so it never reverts what landed
-  meanwhile (BUG-1120).
+  meanwhile (BUG-1120). A command that writes into the directory itself
+  (`vl restore`, `vl renormalize`, the policy commands, `vl access`, `vl
+  secret recover`) holds `lock_dir` from before it reads the directory
+  until its closing snapshot (BUG-1125); `finish` prints the warnings of
+  a merge its re-read wrote (BUG-1126).
 * **Merging (`Repo::settle`).** Several heads are merged into one operation
   at open and before every transaction: folded in id order, each against
   the nearest common operation, by `oplog::merge_views`, a 3-way merge per
