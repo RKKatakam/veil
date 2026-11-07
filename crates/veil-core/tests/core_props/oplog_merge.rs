@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use proptest::prelude::*;
 use veil_core::{
-    oplog::{merge_views, Tag, View, WorkspaceState, OP_HEADS_DIR},
+    oplog::{merge_views, revert_views, Tag, View, WorkspaceState, OP_HEADS_DIR},
     Identity, MemoryBackend, ObjectId, Repo, StorageBackend, VPath,
 };
 
@@ -43,7 +43,7 @@ fn base_view() -> View {
         v.tags.insert(format!("t{t}"), Tag::new(id(1), None));
     }
     for w in 0..3u8 {
-        v.workspaces.insert(format!("w{w}"), WorkspaceState { wc: id(2), cloak: None });
+        v.workspaces.insert(format!("w{w}"), WorkspaceState { wc: id(2), cloak: None, id: None });
     }
     v
 }
@@ -130,7 +130,7 @@ proptest! {
 fn cloak_survives_concurrent_move() {
     let mut base = View::default();
     base.tags.insert("t".into(), Tag::new(id(1), None));
-    base.workspaces.insert("w".into(), WorkspaceState { wc: id(2), cloak: None });
+    base.workspaces.insert("w".into(), WorkspaceState { wc: id(2), cloak: None, id: None });
     let mut cloaked = base.clone();
     cloaked.tags.get_mut("t").unwrap().cloak = Some("team".into());
     cloaked.workspaces.get_mut("w").unwrap().cloak = Some("team".into());
@@ -140,7 +140,7 @@ fn cloak_survives_concurrent_move() {
     for sides in [[&cloaked, &moved], [&moved, &cloaked]] {
         let m = merge_views(&base, &sides, &mut no_descent).view;
         assert_eq!(m.tags["t"], Tag { target: id(3), cloak: Some("team".into()), annotation: None });
-        assert_eq!(m.workspaces["w"], WorkspaceState { wc: id(4), cloak: Some("team".into()) });
+        assert_eq!(m.workspaces["w"], WorkspaceState { wc: id(4), cloak: Some("team".into()), id: None });
     }
     // Both changed the cloak: a cloaked side wins over an uncloaked one.
     let mut uncloak = cloaked.clone();
@@ -252,5 +252,30 @@ proptest! {
             }
         }
         prop_assert_eq!(r.heads().len(), 1);
+    }
+}
+
+/// BUG-1031: a workspace's identity goes with the working copy that won: a
+/// concurrent move keeps it, and an undo that brings back an earlier
+/// workspace of the same name brings back that one's, never the later one's.
+#[test]
+fn a_workspace_keeps_its_identity_through_merges_and_undo() {
+    let first = WorkspaceState::new(id(2), None);
+    let later = WorkspaceState::new(id(5), None);
+    assert!(first.id.is_some() && first.id != later.id, "each workspace gets its own id");
+    let mut base = View::default();
+    base.workspaces.insert("w".into(), first.clone());
+    let mut moved = base.clone();
+    moved.workspaces.get_mut("w").unwrap().wc = id(4);
+    let m = merge_views(&base, &[&moved, &base], &mut no_descent).view;
+    assert_eq!(m.workspaces["w"].id, first.id);
+    // Removed, then made again under its name; undoing the removal's
+    // successor and the removal brings the first back, with its own id.
+    let gone = View::default();
+    let mut again = View::default();
+    again.workspaces.insert("w".into(), later.clone());
+    let back = revert_views(&gone, &base, &again, &mut no_descent).view;
+    if let Some(w) = back.workspaces.get("w") {
+        assert!((w.wc == first.wc && w.id == first.id) || (w.wc == later.wc && w.id == later.id), "{w:?}");
     }
 }

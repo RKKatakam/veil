@@ -301,7 +301,7 @@ impl Repo {
             view.heads.insert(wc_id);
             view.workspaces.insert(
                 DEFAULT_WORKSPACE.to_string(),
-                WorkspaceState { wc: wc_id, cloak: None },
+                WorkspaceState::new(wc_id, None),
             );
         }
         drop(init_store);

@@ -297,7 +297,7 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
                     dir.display()
                 ));
             }
-            (Manifest::new(name), StatCache::new(), aside)
+            (Manifest::for_workspace(&ctx.repo, name), StatCache::new(), aside)
         }
     };
     let fs = SandboxFs::new(
@@ -428,9 +428,11 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
 
     print_running(a.command, &paths.files, confine);
     // What the command writes to the allow-list stays for the workspace's
-    // later runs, unless it was given secrets: then nothing it wrote
+    // later runs (this very workspace's: an earlier one of the same name
+    // has its own), unless it was given secrets: then nothing it wrote
     // outside its files outlives it.
-    let layers = injection.is_none().then_some(paths.dir.as_path());
+    let layers_dir = paths.dir.join(crate::confine::layers_dir(core::workspace_id(&ctx.repo, name).as_deref()));
+    let layers = injection.is_none().then_some(layers_dir.as_path());
     let code = run_command(&paths.files, &paths.dir, a.command, confine, layers);
     // Nothing may have run (the command was not found): recording finds no
     // change and the injected files are taken out as after any run.
@@ -841,8 +843,8 @@ fn print_running(command: &[String], dir: &Path, confine: Option<&Confine>) {
 /// closed terminal) are forwarded to it: `vl` waits for it and records what
 /// it left (BUG-550). With `confine`, `dir` appears at the project's path
 /// inside the confinement ([`crate::confine`], which forwards the signals),
-/// and the allow-list's writes are kept in the layers of `layers` (a
-/// persistent sandbox's directory) or thrown away (`None`).
+/// and the allow-list's writes are kept in the layers directory `layers` (a
+/// persistent sandbox's) or thrown away (`None`).
 fn run_command(dir: &Path, ceiling: &Path, command: &[String], confine: Option<&Confine>, layers: Option<&Path>) -> Result<i32> {
     let mut ceilings = ceiling.as_os_str().to_owned();
     if let Some(old) = std::env::var_os("GIT_CEILING_DIRECTORIES").filter(|v| !v.is_empty()) {

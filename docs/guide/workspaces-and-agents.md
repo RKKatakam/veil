@@ -221,7 +221,7 @@ What the command sees:
 * **Writes to the allow-list stay with the workspace.** Each allowed folder
   is shown through an overlay: your real `~/.cargo` underneath, unchanged,
   and the workspace's own layer on top, in
-  `.veil/local/sandboxes/agent/layers/` (only you can read it; it is never
+  `.veil/local/sandboxes/agent/layers-…/` (only you can read it; it is never
   recorded or synced, and other workspaces don't see it). An allowed file
   (`~/.claude.json`) is copied there on first use. So `cargo build` after an
   agent adds a crate works, and the agent keeps its settings and session
@@ -229,9 +229,15 @@ What the command sees:
   any of it. A download costs disk once per workspace (serde_json and its
   dependencies, about 5 MiB; tokio with all features, about 26 MiB; next to
   nothing for crates your `~/.cargo` already has).
-  * **Starting over:** delete `.veil/local/sandboxes/agent/layers` (when
+  * **Starting over:** delete `.veil/local/sandboxes/agent/layers-*` (when
     nothing runs in the workspace); `vl ws rm` deletes it with the
-    workspace. The workspace's copy of a file is not refreshed from yours.
+    workspace. A workspace made again under the name of one you removed
+    (with `vl undo`) starts from your real folders: the layers belong to
+    the workspace, not its name. The workspace's copy of a file is not
+    refreshed from yours. A `chmod` an agent makes to its layer is undone
+    at the next run.
+  * **Sockets and FIFOs** you allow are shown as they are (reachable,
+    never copied).
   * **Thrown away instead:** with `--ephemeral`, and with `--with-isolated`
     (a command given secrets keeps nothing it wrote outside its files, so
     no copy of a secret, and no transcript quoting one, outlives the run).

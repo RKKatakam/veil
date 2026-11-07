@@ -557,6 +557,18 @@ struct Mounts {
     allowed: Vec<Allowed>,
     /// What stays hidden whatever the allow-list shows, mounted last.
     masks: Vec<OsString>,
+    /// Where the masks are.
+    hidden: Vec<PathBuf>,
+}
+
+/// What an allowed path is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Dir,
+    /// A regular file.
+    File,
+    /// A socket, FIFO or device: bound as it is, never opened or copied.
+    Other,
 }
 
 /// A folder or file of the allow-list.
@@ -566,8 +578,9 @@ struct Allowed {
     dest: PathBuf,
     /// The real folder or file it shows (canonical).
     src: PathBuf,
-    dir: bool,
-    /// Writes to it go to a layer ([`Layers`]). Not for a folder that holds
+    kind: Kind,
+    /// Writes to it go to a layer ([`Layers`]). Only for a folder or a
+    /// regular file (BUG-1032). Not for a folder that holds
     /// the project (whose `.veil` holds the layers), nor for one with
     /// anything hidden below its top level: a hidden path must stay a
     /// mount point the command cannot rename or delete.
@@ -585,13 +598,30 @@ enum Layers<'a> {
     /// directory.
     Throwaway(&'a Path),
     /// Kept for the workspace's later runs, in this directory of its
-    /// sandbox's private state.
+    /// sandbox's private state ([`layers_dir`]).
     Workspace(&'a Path),
 }
 
-/// The directory of a workspace's layers, in its sandbox's directory
-/// (`.veil/local/sandboxes/<ws>`): removed with it by `vl ws rm`.
-const LAYERS_DIR: &str = "layers";
+/// The name of the directory of a workspace's layers, in its sandbox's
+/// directory (`.veil/local/sandboxes/<ws>`, removed with it by `vl ws rm`):
+/// `layers-<hash of its id>`, so an earlier workspace of the same name (one
+/// `vl undo` removed) never lends its layers to a new one, and gets its
+/// own back after `vl redo` (BUG-1031); `layers` for a workspace without an
+/// id.
+pub fn layers_dir(workspace_id: Option<&str>) -> String {
+    match workspace_id {
+        Some(id) => format!("layers-{}", &blake3::hash(id.as_bytes()).to_hex()[..16]),
+        None => "layers".to_string(),
+    }
+}
+
+/// The longest any step of setting up a confined run may take (a `bwrap`
+/// probe, copying an allowed file): a hung filesystem must not hang `vl`
+/// while it holds the workspace's lock.
+const SETUP_WAIT: Duration = Duration::from_secs(30);
+
+/// Copies of allowed files are made under this prefix, then renamed.
+const COPY_PREFIX: &str = ".copy-";
 
 /// The name of the layer of the allowed path `dest` in a layers directory:
 /// its last component, readable, and a hash of the whole path.
@@ -611,27 +641,46 @@ fn layer_name(dest: &Path) -> String {
     format!("{name}-{}", &hash.to_hex()[..16])
 }
 
-/// A private copy of the real file `src` at `at` (`0600`, `0700` if `src`
-/// is executable): kept if `keep`
-/// and it is already a regular file, else made afresh. Never written
-/// through a link: whatever is at `at` is removed first, and the copy is
-/// created exclusively, then renamed into place.
+/// The mode of a copy of `src`: `0700` if it is executable, else `0600`.
+fn copy_mode(src: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    if src.permissions().mode() & 0o100 != 0 { 0o700 } else { 0o600 }
+}
+
+/// A private copy of the real file `src` at `at` (mode [`copy_mode`],
+/// applied again at every run): kept if `keep` and it is already a regular
+/// file, else made afresh. Never written through a link: whatever is at
+/// `at` is removed first, and the copy is created exclusively, then renamed
+/// into place. Only a regular file is copied: it is opened without
+/// blocking (a FIFO swapped in is never waited on) and checked; the copy
+/// gives up after [`SETUP_WAIT`].
 fn file_copy(src: &Path, at: &Path, keep: bool) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     if keep && std::fs::symlink_metadata(at).is_ok_and(|m| m.is_file()) {
-        return Ok(());
+        let mode = copy_mode(&std::fs::metadata(src).with_context(|| format!("reading {}", src.display()))?);
+        return std::fs::set_permissions(at, std::fs::Permissions::from_mode(mode)).with_context(|| format!("chmod {}", at.display()));
     }
     veil_core::vfs::remove_tree(at).with_context(|| format!("removing {}", at.display()))?;
     let dir = at.parent().ok_or_else(|| anyhow!("{} has no parent", at.display()))?;
-    let tmp = dir.join(format!(".copy-{}", hex::encode(veil_core::crypto::random_bytes::<8>())));
-    let made = (|| -> std::io::Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-        let mut from = std::fs::File::open(src)?;
-        let mode = if from.metadata()?.permissions().mode() & 0o100 != 0 { 0o700 } else { 0o600 };
-        let mut to = std::fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp)?;
-        std::io::copy(&mut from, &mut to)?;
-        std::fs::rename(&tmp, at)
-    })();
+    let tmp = dir.join(format!("{COPY_PREFIX}{}", hex::encode(veil_core::crypto::random_bytes::<8>())));
+    let (from, to) = (src.to_path_buf(), tmp.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let copied = (|| -> std::io::Result<()> {
+            let mut f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(&from)?;
+            let meta = f.metadata()?;
+            if !meta.is_file() {
+                return Err(std::io::Error::other("not a regular file"));
+            }
+            let mut t = std::fs::OpenOptions::new().write(true).create_new(true).mode(copy_mode(&meta)).open(&to)?;
+            std::io::copy(&mut f, &mut t).map(drop)
+        })();
+        let _ = tx.send(copied);
+    });
+    let made = match rx.recv_timeout(SETUP_WAIT) {
+        Ok(r) => r.and_then(|()| std::fs::rename(&tmp, at)),
+        Err(_) => Err(std::io::Error::other(format!("it took longer than {} s", SETUP_WAIT.as_secs()))),
+    };
     if made.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -653,7 +702,7 @@ impl Mounts {
                 }
             };
             let keep = matches!(layers, Layers::Workspace(_));
-            if !al.dir {
+            if al.kind == Kind::File {
                 if let Some(d) = at.parent() {
                     veil_core::vfs::private_dir(d).with_context(|| format!("creating {}", d.display()))?;
                 }
@@ -668,6 +717,17 @@ impl Mounts {
                 let (upper, work) = (at.join("upper"), at.join("work"));
                 for d in [&at, &upper, &work] {
                     veil_core::vfs::private_dir(d).with_context(|| format!("creating {}", d.display()))?;
+                }
+                // Whatever an earlier run left at a masked path (a folder,
+                // a link, a FIFO where the real file has appeared since)
+                // goes: the mask then lies on the real entry, whatever its
+                // shape, and always mounts (BUG-1030). Links are removed,
+                // never followed.
+                for h in self.hidden.iter().filter(|h| h.parent() == Some(al.dest.as_path())) {
+                    if let Some(name) = h.file_name() {
+                        let entry = upper.join(name);
+                        veil_core::vfs::remove_tree(&entry).with_context(|| format!("removing {}", entry.display()))?;
+                    }
                 }
                 a.extend(["--overlay-src".into(), src, "--overlay".into(), upper.into_os_string(), work.into_os_string(), dest]);
             }
@@ -812,10 +872,15 @@ fn base_args(home: &Path, root: Option<&Path>, allow: &[(PathBuf, bool)], no_net
         .map(|(dest, src)| {
             let holds_project = root.is_some_and(|r| r.starts_with(&src));
             let hidden_below = done.iter().any(|m| m.starts_with(&dest) && m.parent() != Some(dest.as_path()));
-            Allowed { dir: src.is_dir(), layer: !holds_project && !hidden_below, dest, src }
+            let kind = match std::fs::metadata(&src) {
+                Ok(m) if m.is_dir() => Kind::Dir,
+                Ok(m) if m.is_file() => Kind::File,
+                _ => Kind::Other,
+            };
+            Allowed { kind, layer: kind != Kind::Other && !holds_project && !hidden_below, dest, src }
         })
         .collect();
-    Ok(Mounts { head: a, allowed, masks: hide })
+    Ok(Mounts { head: a, allowed, masks: hide, hidden: done })
 }
 
 /// Run the confinement once with `true`: a missing or unusable `bwrap`
@@ -835,15 +900,26 @@ fn probe(bwrap: &Path, base: &[OsString]) -> Result<()> {
 }
 
 /// `bwrap ARGS -- true`: `Err` if it cannot be run, `Ok(Err(first line of
-/// its error))` if it fails.
+/// its error))` if it fails or outlives [`SETUP_WAIT`] (then it is killed).
 fn try_true(bwrap: &Path, args: &[OsString]) -> std::io::Result<std::result::Result<(), String>> {
-    let o = std::process::Command::new(bwrap)
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(bwrap)
         .args(args)
         .args(["--", "true"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output()?;
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let start = std::time::Instant::now();
+    while child.try_wait()?.is_none() {
+        if start.elapsed() >= SETUP_WAIT {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(Err(format!("bwrap did not finish within {} s", SETUP_WAIT.as_secs())));
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let o = child.wait_with_output()?;
     if o.status.success() {
         return Ok(Ok(()));
     }
@@ -857,10 +933,11 @@ const READ_ONLY_BREAKS: &str = "cargo cannot download crates, and coding agents 
 
 impl Confine {
     /// The mounts of a run: writes to the allow-list are kept in the
-    /// layers of `state` (a persistent sandbox's directory; the caller holds
-    /// its lock), or thrown away after the run (`None`), with the throwaway
-    /// directory of file copies. Where overlayfs does not work, the
-    /// allow-list is read-only, and `vl` says what that breaks.
+    /// layers directory `state` (a persistent sandbox's [`layers_dir`]; the
+    /// caller holds its lock), or thrown away after the run (`None`), with
+    /// the throwaway directory of file copies. Where the layers cannot be
+    /// mounted, the allow-list is read-only, and `vl` says why and what
+    /// that breaks.
     fn layered(&self, state: Option<&Path>) -> Result<(Vec<OsString>, Option<crate::sandbox::Sandbox>)> {
         let read_only = || self.mounts.args(&Layers::ReadOnly);
         if !self.mounts.any_layer() {
@@ -868,14 +945,19 @@ impl Confine {
         }
         let mut copies = None;
         let layered = match state {
-            Some(s) => {
-                let dir = s.join(LAYERS_DIR);
-                veil_core::vfs::private_dir(&dir)
-                    .with_context(|| format!("creating {}", dir.display()))
-                    .and_then(|()| self.mounts.args(&Layers::Workspace(&dir)))
-            }
+            Some(dir) => veil_core::vfs::private_dir(dir)
+                .with_context(|| format!("creating {}", dir.display()))
+                .and_then(|()| {
+                    // Copies a timed-out copy left behind.
+                    for e in std::fs::read_dir(dir)?.flatten() {
+                        if e.file_name().to_string_lossy().starts_with(COPY_PREFIX) {
+                            let _ = veil_core::vfs::remove_tree(&e.path());
+                        }
+                    }
+                    self.mounts.args(&Layers::Workspace(dir))
+                }),
             None => {
-                if self.mounts.allowed.iter().any(|a| a.layer && !a.dir) {
+                if self.mounts.allowed.iter().any(|a| a.layer && a.kind == Kind::File) {
                     copies = Some(crate::sandbox::Sandbox::create("home")?);
                 }
                 let dir = copies.as_ref().map_or(Path::new("/nonexistent"), |c| c.path());
@@ -885,7 +967,12 @@ impl Confine {
         let why = match layered {
             Ok(args) => match try_true(&self.bwrap, &args) {
                 Ok(Ok(())) => return Ok((args, copies)),
-                Ok(Err(e)) => format!("overlayfs does not work here: {e}"),
+                // Say which: overlayfs itself, or these layers.
+                Ok(Err(e)) if !self.overlay_works() => format!("overlayfs does not work here: {e}"),
+                Ok(Err(e)) => match state {
+                    Some(dir) => format!("the workspace's layers could not be mounted: {e}; deleting {} starts them over", dir.display()),
+                    None => format!("the allowed folders could not be layered: {e}"),
+                },
                 Err(e) => e.to_string(),
             },
             Err(e) => format!("{e:#}"),
@@ -896,6 +983,18 @@ impl Confine {
         ));
         Ok((read_only()?, None))
     }
+
+    /// Does an overlay of a folder every machine has mount here?
+    fn overlay_works(&self) -> bool {
+        overlay_probe(&self.bwrap, self.mounts.head.clone()).is_ok_and(|r| r.is_ok())
+    }
+}
+
+/// `bwrap` with `head` and a throwaway overlay of `/usr`: does overlayfs
+/// work here at all?
+fn overlay_probe(bwrap: &Path, mut head: Vec<OsString>) -> std::io::Result<std::result::Result<(), String>> {
+    head.extend(["--overlay-src", "/usr", "--tmp-overlay", "/usr"].map(OsString::from));
+    try_true(bwrap, &head)
 }
 
 /// The mechanism for `limits` (`VEIL_EXEC_LIMITS_BACKEND=systemd|poll`
@@ -1005,9 +1104,8 @@ pub fn doctor(root: Option<&Path>) -> Vec<(bool, String, Vec<String>)> {
                 Err(e) => out.push((false, "confinement does not work here".into(), vec![safe(&e.to_string()).into_owned()])),
             }
             // Writes to the allow-list: an overlay of a folder every machine has.
-            if let Ok(mut b) = base {
-                b.extend(["--overlay-src", "/usr", "--tmp-overlay", "/usr"].map(OsString::from));
-                match try_true(&bwrap, &b) {
+            if let Ok(b) = base {
+                match overlay_probe(&bwrap, b) {
                     Ok(Ok(())) => out.push((true, "allow-list: writable, each workspace's writes kept in its own layer (overlayfs)".into(), Vec::new())),
                     Ok(Err(e)) => out.push((
                         false,

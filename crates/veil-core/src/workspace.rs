@@ -882,7 +882,7 @@ impl Repo {
             return Err(VeilError::AlreadyExists(format!("workspace '{name}'")));
         }
         let wc = tx.new_change(bases, "", cloak.clone())?;
-        tx.view.workspaces.insert(name.to_string(), WorkspaceState { wc, cloak });
+        tx.view.workspaces.insert(name.to_string(), WorkspaceState::new(wc, cloak));
         tx.commit()?;
         Ok(wc)
     }

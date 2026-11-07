@@ -244,6 +244,11 @@ pub struct Manifest {
     /// changed since ([`scrub`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard_checked: Option<i64>,
+    /// The [`crate::oplog::WorkspaceState::id`] of the workspace the files
+    /// belong to: a later workspace of the same name is another one, and
+    /// never gets them (BUG-1033). Absent for a workspace without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
 }
 
 /// The output of a command that is not recorded yet ([`Manifest::pending`]).
@@ -288,7 +293,13 @@ impl Manifest {
             quarantined: Vec::new(),
             pending: None,
             guard_checked: None,
+            workspace_id: None,
         }
+    }
+
+    /// A new manifest for workspace `ws` as `repo` has it now.
+    pub fn for_workspace(repo: &Repo, ws: &str) -> Manifest {
+        Manifest { workspace_id: workspace_id(repo, ws), ..Manifest::new(ws) }
     }
 
     /// [`Manifest::only`] as a set (`None`: the whole tree).
@@ -324,6 +335,9 @@ pub fn rebuild_reason(repo: &Repo, paths: &SandboxPaths, ws: &str, loaded: &Load
     if m.workspace != ws {
         return Some(format!("its manifest belongs to workspace '{}'", m.workspace));
     }
+    if m.workspace_id != workspace_id(repo, ws) {
+        return Some(format!("it belongs to an earlier workspace named '{ws}' (removed, then made again)"));
+    }
     if m.running.is_some() {
         return Some("the previous run did not finish (vl was killed or crashed)".into());
     }
@@ -344,6 +358,11 @@ pub fn rebuild_reason(repo: &Repo, paths: &SandboxPaths, ws: &str, loaded: &Load
         Some(t) if !repo.store().has(&t) => Some("the snapshot it holds is no longer in the repository".into()),
         _ => None,
     }
+}
+
+/// The identity of workspace `ws` in `repo` ([`crate::oplog::WorkspaceState::id`]).
+pub fn workspace_id(repo: &Repo, ws: &str) -> Option<String> {
+    repo.view().workspaces.get(ws).and_then(|w| w.id.clone())
 }
 
 /// Remove the sandbox's files, manifest and stat cache (the lock stays):
@@ -1417,7 +1436,9 @@ pub fn set_aside(repo: &Repo, paths: &SandboxPaths, ws: &str, loaded: &Loaded, t
             SetAside::Nothing
         }
         Ok(_) => match loaded {
-            Loaded::Found(m) if m.pending.is_none() && m.version == MANIFEST_VERSION && m.workspace == ws => {
+            // Only this very workspace's work is re-imported: another one's
+            // (an earlier workspace of the same name) is kept aside whole.
+            Loaded::Found(m) if m.pending.is_none() && m.version == MANIFEST_VERSION && m.workspace == ws && m.workspace_id == workspace_id(repo, ws) => {
                 let (keep, quarantined, differing) = unrecorded_work(repo, paths, m, target)?;
                 if keep.is_empty() && differing {
                     let dir = kept_dir(paths);

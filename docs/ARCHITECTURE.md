@@ -1840,7 +1840,7 @@ A workspace is only a named pointer in the view. It owns no directory.
      `bwrap` binds the sandbox at the project's canonical path, the
      system read-only, an empty tmpfs `HOME` and `/tmp`, the allow-list
      through overlays whose upper layers are the workspace's own
-     (`.veil/local/sandboxes/<ws>/layers`, thrown away with
+     (`.veil/local/sandboxes/<ws>/layers-<hash of the workspace's id>`, thrown away with
      `--ephemeral` or `--with-isolated`; the real folders are never
      written, BUG-1025), and a tmpfs over the Veil home (and over the Veil home
      and the project under every other name an allowed link gives them,
