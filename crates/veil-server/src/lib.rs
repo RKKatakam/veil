@@ -13,6 +13,7 @@
 //! | [`grant`] | read grants, the object routes, the access-epoch feed |
 //! | [`mod@derive`] | derived history data: commit graph, changed paths, per-rule lists (S12) |
 //! | [`query`] | the query API: history answered per viewer (S13) |
+//! | [`prs`] | PRs and review: visibility classes, revisions, threads, approvals (S21) |
 //! | [`db`] | PostgreSQL / YugabyteDB, migrations, serialisable retries |
 //! | [`store`] | object storage: local directory or S3 |
 //! | [`tls`] | TLS configuration |
@@ -26,6 +27,7 @@ pub mod derive;
 pub mod error;
 pub mod grant;
 pub mod perm;
+pub mod prs;
 pub mod query;
 pub mod shares;
 pub mod store;

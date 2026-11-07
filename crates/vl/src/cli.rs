@@ -140,6 +140,11 @@ pub enum Cmd {
         /// Groups, people, or `public`.
         who: Vec<String>,
     },
+    /// PRs and review on the Veil server: a PR is visible only to people
+    /// who can see every file it touches; reviews are signed by this
+    /// device and stop counting when the files change.
+    #[command(subcommand)]
+    Pr(PrCmd),
 
     // ---- inspecting -------------------------------------------------------
     /// Show working-copy changes, local-only files and conflicts.
@@ -788,7 +793,16 @@ impl Cmd {
             | Cmd::Grep(history::GrepArgs { out, .. })
             | Cmd::Duplicate(rewrite_cmd::DuplicateArgs { out, .. })
             | Cmd::CherryPick(rewrite_cmd::CherryPickArgs { out, .. })
-            | Cmd::Attr(attr_cmd::AttrArgs { cmd: attr_cmd::AttrCmd::Check { out, .. } }) => out,
+            | Cmd::Attr(attr_cmd::AttrArgs { cmd: attr_cmd::AttrCmd::Check { out, .. } })
+            | Cmd::Pr(
+                PrCmd::Create { out, .. }
+                | PrCmd::List { out, .. }
+                | PrCmd::Show { out, .. }
+                | PrCmd::Diff { out, .. }
+                | PrCmd::Update { out, .. }
+                | PrCmd::Comment { out, .. }
+                | PrCmd::Review { out, .. },
+            ) => out,
             _ => return false,
         };
         out.json
@@ -875,6 +889,119 @@ pub enum PolicyCmd {
         #[arg(long, value_name = "NAME")]
         workspace: Option<String>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PrCmd {
+    /// Open a PR for the stack of changes from the target's tip to REV
+    /// (pushed first, with `vl push`).
+    Create {
+        /// The top change of the stack.
+        rev: String,
+        /// The branch it is for (default: the project's default branch).
+        #[arg(long)]
+        onto: Option<String>,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        body: Option<String>,
+        #[command(flatten)]
+        out: JsonOut,
+    },
+    /// List the PRs you may see (open ones by default).
+    List {
+        /// open, closed, landed or all.
+        #[arg(long)]
+        state: Option<String>,
+        /// Every state.
+        #[arg(long)]
+        all: bool,
+        /// Only PRs whose title or body holds this text.
+        #[arg(long)]
+        search: Option<String>,
+        #[command(flatten)]
+        out: JsonOut,
+    },
+    /// Show a PR: its revisions, review and threads.
+    Show {
+        id: String,
+        /// Also show its threads and comments.
+        #[arg(long)]
+        threads: bool,
+        #[command(flatten)]
+        out: JsonOut,
+    },
+    /// Show a PR's diff (the current revision's, or one change's).
+    Diff {
+        id: String,
+        #[arg(long)]
+        revision: Option<u32>,
+        /// One change of the stack (its change id).
+        #[arg(long)]
+        change: Option<String>,
+        /// Only list changed paths.
+        #[arg(long)]
+        stat: bool,
+        #[command(flatten)]
+        out: JsonOut,
+    },
+    /// Make a new revision of a PR from REV (its changes keep their change
+    /// ids; pushed first).
+    Update {
+        id: String,
+        rev: String,
+        #[command(flatten)]
+        out: JsonOut,
+    },
+    /// Comment on a PR, on lines of a file it changes, or in a thread.
+    Comment {
+        id: String,
+        #[arg(short, long)]
+        message: String,
+        /// A file the PR changes.
+        #[arg(long)]
+        path: Option<String>,
+        /// The (first) line, 1-based.
+        #[arg(long)]
+        line: Option<u32>,
+        /// The last line (default: --line).
+        #[arg(long)]
+        end: Option<u32>,
+        /// Lines of the version before the change.
+        #[arg(long)]
+        old: bool,
+        /// The change of the stack (default: the top one that changes the file).
+        #[arg(long)]
+        change: Option<String>,
+        /// Reply in this thread instead.
+        #[arg(long)]
+        thread: Option<String>,
+        #[command(flatten)]
+        out: JsonOut,
+    },
+    /// Resolve a thread (or reopen it).
+    Resolve {
+        id: String,
+        thread: String,
+        #[arg(long)]
+        reopen: bool,
+    },
+    /// Approve the PR's current revision, or ask for changes.
+    Review {
+        id: String,
+        #[arg(long)]
+        approve: bool,
+        #[arg(long)]
+        request_changes: bool,
+        #[arg(short, long)]
+        message: Option<String>,
+        #[command(flatten)]
+        out: JsonOut,
+    },
+    /// Close a PR (its author or an admin).
+    Close { id: String },
+    /// Land a PR whose review rules are met.
+    Land { id: String },
 }
 
 #[derive(Subcommand, Debug)]
