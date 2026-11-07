@@ -60,7 +60,7 @@ The owner adopted the four synthetic workloads published by OpenScion, an indepe
 |---|---:|---:|---|
 | Import a directory (first snapshot) | **22 ms** | **245 ms** | 48–58 / 202–208 ms after performance round 1 (Git: 87–94 / 763–764 ms) |
 | Clone everything | **51 ms** | **544 ms** | 114–119 / **437–449 ms** after performance round 2: **10k meets its target** (Git: 169–192 / 563–589 ms) |
-| Commit one changed file | **2.5 ms** | **22 ms** | 17–21 / 43–49 ms after performance round 2, one transaction (Git: 9–16 / 27–38 ms) |
+| Commit one changed file | **2.5 ms** | **22 ms** | 15.3 / 22.3 ms after performance round 3 (Git: 8.2 / 9.9 ms; 21.8 / 39.7 ms before the round) |
 | Clone one directory | **6.1 ms** | **25 ms** | 55–69 / 69–92 ms after performance round 2 (Git: 50–51 / 52–56 ms) |
 
 - **Measured by the S1 server milestone** on an ext4 NVMe disk: release builds, the median of 5, PostgreSQL, with Git as the same-machine reference. Absolute numbers depend on the machine, so each gate also requires **beating Git on the same machine**. **No gate is met yet.**
@@ -68,8 +68,9 @@ The owner adopted the four synthetic workloads published by OpenScion, an indepe
 - **BUG-818 fixed** (one durability barrier per checkout): clones are 2.5–10× faster. The rest of a 10k clone is the transfer plus about 16 `openat` calls per file from checkout's no-follow path walks.
 - **Performance round 1** (`docs/design/scale/OPENSCION.md`): import beats Git (1.7× at 1k, 3.7× at 10k); commit one file does not yet (Git does no fsync; Veil's commit is two durable transactions). **Measured as OpenScion measures** (in one process, in memory, no disk or process start), Veil meets the import, clone-everything and commit targets: 8.8 / 86 ms, 32 / 303 ms, 0.9 / 7.4 ms.
 - **Performance round 2** (`docs/design/scale/OPENSCION.md`): clone everything is 2.3× faster at 10k (beats Git 1.3×, meets 544 ms); `vl commit` is one operation; the server's load curves are in `docs/design/scale/LOAD.md` (about 2,500 pulls/s and 2,000 landings/s across projects on one machine).
-- **Through the server** (`scripts/bench-server.sh`, 2026-11-06, `docs/design/scale/BASELINE.md`): the 512 MiB memory gate fails for the 1 GB profile's initial push (2,410 MiB, BUG-858) and full clone (979 MiB, BUG-859), and the server grows to several GB (BUG-860); an initial push of a long history is refused (BUG-857). Landings with MinIO stop at about 376/s, limited by the object store.
-- **Next costs:** clone one directory's ~60 sequential `fsync`s, checkout's path walks, the commit's scan.
+- **Performance round 3** (`docs/design/scale/OPENSCION.md`, 2026-11-07): commit one file is 1.4× (1k) and 1.8× (10k) faster, still about 2× slower than Git (which makes no fsync). Its transaction makes its objects, operation and head durable with four barriers in sequence instead of about twenty; the scanner compiles its rules only for text that could hold a token; large working copies are listed, stat'ed and classified ahead of the walk on other threads.
+- **Through the server** (`scripts/bench-server.sh`, 2026-11-06, `docs/design/scale/BASELINE.md`): after the server bench fixes (BUG-857 to BUG-861) the 1 GB profile passes the 512 MiB memory gate: its initial push is accepted in one push (401 MiB, was 2,410 MiB and refused) and its full clone peaks at 433 MiB (was 918–979 MiB). The server still grows past its bounded caches, now mostly glibc's per-thread arenas (BUG-864), and checks a long history's snapshots one at a time (BUG-865). Landings with MinIO stop at about 376/s, limited by the object store; a reset S3 connection is now tried again (BUG-861).
+- **Next costs:** clone one directory's ~60 sequential `fsync`s, checkout's path walks, the commit's walk of the working copy on one thread (about 1 µs a file) and its six barriers in sequence.
 - **Performance rounds continue until every gate is met.** The profile runs in `crates/veil-bench` (`docs/design/scale/OPENSCION.md`) and is re-run on every stream that touches the client or the server.
 
 ## What exists today, and what's next

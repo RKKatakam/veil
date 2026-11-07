@@ -246,3 +246,170 @@ fn a_clone_killed_at_any_point_is_refused_or_finished() {
     }
     println!("refused {refused}, finished {finished}");
 }
+
+/// A new project of `admin`'s in `dir`, with remote `origin` at `hub`.
+fn new_project(hub: &TestHub, admin: &Person, dir: &std::path::Path) -> String {
+    let name = unique("hist");
+    std::fs::create_dir_all(dir).unwrap();
+    admin.ok(dir, &["init"]);
+    admin.ok(dir, &["remote", "add", "origin", &hub.url(&name)]);
+    name
+}
+
+/// BUG-857. One push of a history in which a later snapshot holds a tree
+/// an earlier one introduced (`docs/` with `a`; then `a` and `b`; then `a`
+/// again). The push walked `docs/` once, under the last snapshot against
+/// a parent that had `a` already, and never under the first, which
+/// introduced `a`: it never sent `a`, and the server refused the push
+/// ("missing object"). Every snapshot arrives whole.
+#[test]
+fn bug_857_a_push_of_a_history_that_reuses_a_tree_is_accepted() {
+    let hub = TestHub::start();
+    let admin = hub.person("admin");
+    let dir = admin.dir("proj");
+    let name = new_project(&hub, &admin, &dir);
+    write_files(&dir, &[("docs/a.txt", "first file"), ("README", "r")]);
+    admin.ok(&dir, &["commit", "-m", "add a"]);
+    write_files(&dir, &[("docs/b.txt", "second file")]);
+    admin.ok(&dir, &["commit", "-m", "add b"]);
+    std::fs::remove_file(dir.join("docs/b.txt")).unwrap();
+    admin.commit_main(&dir, "remove b");
+    let out = admin.ok(&dir, &["push"]);
+    assert!(out.contains("Created project"), "{out}");
+    let c = admin.dir("clone");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), c.to_str().unwrap()]);
+    assert_eq!(std::fs::read_to_string(c.join("docs/a.txt")).unwrap(), "first file");
+    assert!(!c.join("docs/b.txt").exists());
+    // The snapshots before are whole in the clone too.
+    assert!(admin.ok(&c, &["cat", "docs/b.txt", "-r", "main-"]).contains("second file"));
+    assert!(admin.ok(&c, &["cat", "docs/a.txt", "-r", "main--"]).contains("first file"));
+}
+
+/// BUG-857's class, through the real server: random histories (pinned
+/// seeds) of files added, changed, removed, put back, copied, and turned
+/// into directories and back, each pushed whole in one push. The server
+/// accepts each push (nothing it asks a receipt for is left out), and a
+/// clone has the last snapshot's files. `hub.rs`'s
+/// `a_push_sends_exactly_what_the_server_lacks` checks that nothing more
+/// is sent.
+#[test]
+fn random_histories_pushed_in_one_push_are_accepted() {
+    let hub = TestHub::start();
+    let admin = hub.person("admin");
+    for seed in [0x9e37_79b9_7f4a_7c15u64, 0x2545_f491_4f6c_dd1d, 0xd1b5_4a32_d192_ed03] {
+        let mut x = seed;
+        let mut rng = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let dir = admin.dir(&format!("p{seed:x}"));
+        let name = new_project(&hub, &admin, &dir);
+        let paths = ["a", "b", "d/a", "d/b", "d/e/a", "d/e/b", "y", "y/a"];
+        let mut files: std::collections::BTreeMap<&str, String> = std::collections::BTreeMap::new();
+        for i in 0..24 {
+            for _ in 0..1 + rng(3) {
+                let p = paths[rng(paths.len() as u64) as usize];
+                match rng(4) {
+                    0 => {
+                        files.remove(p);
+                    }
+                    // A few contents, shared by every path: copies and moves.
+                    _ => {
+                        files.insert(p, format!("content {}", rng(4)));
+                    }
+                }
+            }
+            // `y` is a file or a directory.
+            if files.contains_key("y") && files.contains_key("y/a") {
+                files.remove(if rng(2) == 0 { "y" } else { "y/a" });
+            }
+            for p in paths {
+                let _ = std::fs::remove_file(dir.join(p));
+            }
+            let _ = std::fs::remove_dir_all(dir.join("y"));
+            for (p, c) in &files {
+                write_files(&dir, &[(p, c.as_str())]);
+            }
+            write_files(&dir, &[("n", &format!("{i}"))]);
+            admin.ok(&dir, &["commit", "-m", &format!("step {i}")]);
+        }
+        admin.ok(&dir, &["tag", "set", "main", "-r", "@-", "--force"]);
+        admin.ok(&dir, &["push"]);
+        let c = admin.dir(&format!("c{seed:x}"));
+        admin.ok(admin.home.path(), &["clone", &hub.url(&name), c.to_str().unwrap()]);
+        for p in paths {
+            assert_eq!(std::fs::read_to_string(c.join(p)).ok(), files.get(p).cloned(), "seed {seed:x}: {p}");
+        }
+    }
+}
+
+/// BUG-861. An object store whose connections close before answering, as
+/// S3 services close idle keep-alive connections: a proxy in front of
+/// MinIO drops every other new connection of the first twelve, the very
+/// first included, after reading its request. The server tries each such
+/// request again: it starts, a push stores every object and a clone
+/// fetches them (before, the first one already failed: HTTP 500).
+#[test]
+fn bug_861_a_closed_object_store_connection_is_tried_again() {
+    let Ok(endpoint) = std::env::var("VEIL_TEST_S3_ENDPOINT") else {
+        eprintln!("bug_861: skipped (no VEIL_TEST_S3_ENDPOINT: run scripts/verify-server.sh)");
+        return;
+    };
+    let upstream = endpoint.trim_start_matches("http://").trim_end_matches('/').to_string();
+    let proxy = flaky_proxy(upstream, |n| n < 12 && n % 2 == 0);
+    let hub = TestHub::start_with_s3(
+        &std::env::var("VEIL_TEST_DATABASE_URL").unwrap(),
+        std::time::Duration::from_secs(3600),
+        Some(proxy),
+    );
+    let admin = hub.person("admin");
+    let dir = admin.dir("proj");
+    let name = new_project(&hub, &admin, &dir);
+    let files: Vec<(String, String)> = (0..300).map(|i| (format!("src/f{i:03}.txt"), format!("file {i} {}", unique("")))).collect();
+    let pairs: Vec<(&str, &str)> = files.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect();
+    write_files(&dir, &pairs);
+    admin.commit_main(&dir, "many files");
+    admin.ok(&dir, &["push"]);
+    let c = admin.dir("clone");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), c.to_str().unwrap()]);
+    for (p, content) in &files {
+        assert_eq!(&std::fs::read_to_string(c.join(p)).unwrap(), content);
+    }
+}
+
+/// A TCP proxy to `upstream` that closes new connection `n` after reading
+/// its first bytes, without answering, when `drop_it(n)`. Returns its URL.
+fn flaky_proxy(upstream: String, drop_it: impl Fn(usize) -> bool + Send + 'static) -> String {
+    use std::{
+        io::Read,
+        net::{Shutdown, TcpListener, TcpStream},
+    };
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for (n, c) in l.incoming().enumerate() {
+            let Ok(mut c) = c else { continue };
+            if drop_it(n) {
+                let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let _ = c.read(&mut [0u8; 4096]);
+                continue;
+            }
+            let up = upstream.clone();
+            std::thread::spawn(move || {
+                let Ok(u) = TcpStream::connect(&up) else { return };
+                let (mut c2, mut u2) = (c.try_clone().unwrap(), u.try_clone().unwrap());
+                let t = std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut c2, &mut u2);
+                    let _ = u2.shutdown(Shutdown::Write);
+                });
+                let (mut u, mut c) = (u, c);
+                let _ = std::io::copy(&mut u, &mut c);
+                let _ = c.shutdown(Shutdown::Write);
+                let _ = t.join();
+            });
+        }
+    });
+    format!("http://{addr}")
+}

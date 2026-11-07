@@ -225,6 +225,14 @@ impl OpStore {
     }
 
     pub fn put(&self, op: &Operation) -> Result<ObjectId> {
+        let (id, raw) = self.encode(op)?;
+        self.backend.write(&Self::op_path(&id), &raw)?;
+        Ok(id)
+    }
+
+    /// `op`'s id and stored bytes, if this repository's format can record
+    /// it.
+    pub(crate) fn encode(&self, op: &Operation) -> Result<(ObjectId, Vec<u8>)> {
         let format = self.format.load(AtomicOrdering::Relaxed);
         if format < crate::object::GIT_PARITY_REPO_FORMAT && op.view.uses_format_5() {
             return Err(VeilError::Unsupported(format!(
@@ -241,9 +249,7 @@ impl OpStore {
             )));
         }
         let raw = serde_json::to_vec(op)?;
-        let id = ObjectId::hash(&raw);
-        self.backend.write(&Self::op_path(&id), &raw)?;
-        Ok(id)
+        Ok((ObjectId::hash(&raw), raw))
     }
 
     pub fn get(&self, id: &ObjectId) -> Result<Operation> {
@@ -264,7 +270,7 @@ impl OpStore {
         }
     }
 
-    fn uses_heads_dir(&self) -> bool {
+    pub(crate) fn uses_heads_dir(&self) -> bool {
         self.format.load(AtomicOrdering::Relaxed) >= OP_HEADS_REPO_FORMAT
     }
 
@@ -442,6 +448,30 @@ impl OpStore {
             return Ok(id);
         }
         self.backend.create_new(&Self::head_file(&id), b"")?;
+        self.retire(&id, op, stale)?;
+        Ok(id)
+    }
+
+    /// [`OpStore::publish`] of operation `id` (`op`, format 6), whose bytes
+    /// and empty head file a transaction staged (`staged_op`, `staged_head`)
+    /// and made durable with its objects, all now durable under their own
+    /// names. Two barriers, each after one name: the operation's, then the
+    /// head's. A crash leaves no head, or a head whose operation and
+    /// objects are all durable.
+    pub(crate) fn publish_staged(&self, id: &ObjectId, op: &Operation, staged_op: &VPath, staged_head: &VPath, stale: &RawHeads) -> Result<()> {
+        debug_assert!(self.uses_heads_dir());
+        self.backend.publish_unsynced(staged_op, &Self::op_path(id))?;
+        self.backend.sync_barrier()?;
+        self.backend.publish_unsynced(staged_head, &Self::head_file(id))?;
+        self.backend.sync_barrier()?;
+        self.retire(id, op, stale)
+    }
+
+    /// Remove the head files `id` replaces: its parents and the stale heads
+    /// read with them (a crash before leaves ancestors among the heads,
+    /// which readers drop).
+    fn retire(&self, id: &ObjectId, op: &Operation, stale: &RawHeads) -> Result<()> {
+        let id = *id;
         let mut gone: Vec<ObjectId> = op.parents.clone();
         gone.extend(stale.all.iter().copied());
         gone.sort();
@@ -458,7 +488,7 @@ impl OpStore {
                 self.backend.remove_file(&Self::head_path())?;
             }
         }
-        Ok(id)
+        Ok(())
     }
 
     fn raw_legacy(&self) -> Result<Option<ObjectId>> {
