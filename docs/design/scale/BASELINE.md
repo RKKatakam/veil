@@ -1,6 +1,6 @@
 # Scale baseline: 1 GB, `integration` @ b549e1e
 
-These are the scale benchmark's numbers for today's client (`9-scale-benchmark.md`), first measured on `integration` @ **b549e1e** before any scale stream landed, then after each. **Push, clone and pull now go through the Veil server** ([the first section](#through-the-veil-server-2026-11-06-bfa691a)); the older remote cases below used path and SFTP remotes, which the simplification pass removes, and are kept as history. The server's own targets are in `docs/HUB.md` §9.2. They rank the streams: see [the ranked list](#ranked-offenders) and [what it means for the plan](#what-this-means-for-the-plan).
+These are the scale benchmark's numbers for today's client (`9-scale-benchmark.md`), first measured on `integration` @ **b549e1e** before any scale stream landed, then after each. **Push, clone and pull now go through the Veil server** ([after the server bench fixes](#after-the-server-bench-fixes-2026-11-06-7fb947f), and [the first measurement](#through-the-veil-server-2026-11-06-bfa691a)); the older remote cases below used path and SFTP remotes, which the simplification pass removes, and are kept as history. The server's own targets are in `docs/HUB.md` §9.2. They rank the streams: see [the ranked list](#ranked-offenders) and [what it means for the plan](#what-this-means-for-the-plan).
 
 - **Machine:**
   - 32 CPUs (i9-13900KF), 30 GB RAM;
@@ -9,6 +9,37 @@ These are the scale benchmark's numbers for today's client (`9-scale-benchmark.m
 - **Neighbours:** other agents were building at the same time, so the absolute times carry some noise.
 - **Run:** `scripts/bench-scale.sh 1g -- --rtt 0,2`, 2026-11-05. It took 21.5 minutes end to end, including 4 minutes of generation, then deleted everything it generated.
 - **Raw results** (not committed): `.scratch/bench-results/1g-seed1-*.json` and `.md`.
+
+## After the server bench fixes (2026-11-06, `7fb947f`)
+
+`scripts/bench-server.sh 1g`, 2026-11-06, on the "server bench fixes" branch @ **`7fb947f`** (BUG-857 to BUG-861), against a re-run of the base the same evening (`integration` @ `d9f221b` with the S2 secrets branch merged, `1f9f880`). Same machine and setup as below (MinIO, a fresh server for the phase). Other agents loaded the machine throughout (load average 27 to 72), so times carry more noise than memory. Raw results (not committed): `.scratch/bench-results/server-1g-7fb947f-*` and `.scratch/base/.scratch/bench-results/server-1g-1f9f880-*`.
+
+**Gate (every case ≤ 512 MiB on the client): passes.** The initial push succeeds in one push.
+
+| case | before (`1f9f880`) | after (`7fb947f`) | gate |
+|---|---:|---:|---|
+| push, initial (all tags) | 116.2 s, then **refused** (BUG-857); **2,412 MiB**; server 12 → 1,439 MiB | **337.1 s, accepted**; **401 MiB**; server 12 → 2,304 MiB | passes |
+| (before only) push in 54 fast-forward steps, the workaround | 199.8 s; 869 MiB; server → 2,338 MiB | not needed | |
+| clone, full (1.9 GB on disk) | 67.6 s; **918 MiB**; server 2,338 → 3,123 MiB (+785) | **60.6 s**; **433 MiB**; server 2,280 → 2,645 MiB (+365) | passes |
+| pull, 1 new snapshot | 0.21 s; 141 MiB | 0.22–1.4 s (one run of three slow, the others 0.2 s); 138 MiB | passes |
+| pull, nothing new | 0.20 s; 77 MiB | 0.22 s; 75 MiB | passes |
+| clone, one directory (`--only docs`) | 5.7 s; 90 MiB | 7.1 s; 108 MiB | passes |
+
+- **The initial push** now does in one push what took 116 s of refused upload and 200 s of fast-forward steps before (316 s in all): 337 s; the server checks the 10,022 snapshots one after another (BUG-865). An earlier run of the branch (`65519e1`) measured 317.5 s and 350 MiB.
+- **The full clone** writes each part of a level as it arrives; its peak (433 MiB) is the fetch and checkout's staging together, under the gate. The first run of the branch (`65519e1`) took 81 s: tree levels went out as 4 requests instead of 8; `7fb947f` keeps at least 8 parts for a level of 2,000 objects or more, and the server reads ahead in a sliding window instead of 64 objects at a time.
+- **The server** still grows past its caches' 512 MiB, but no longer with what it serves: a full clone adds 365 MiB where it added 785 MiB. An upload's objects are copied out of the request (a slice kept the whole 8 MiB body alive in the object cache), fetch answers stream, and decoded trees are weighed by their real size. What remains is the allocator's (BUG-864): pushes of a generated 1 GB repository to a fresh server, measured by hand (not `--plain`, so each was refused at its embargoed merge after its uploads and part of its checks: a lower bound), peaked at 1.5–2.6 GB with glibc's default arenas (one per thread: 34 to 146 threads), 1.1 GB with `MALLOC_ARENA_MAX=2` and 0.84 GB with `MALLOC_ARENA_MAX=1`, whose single heap held about 330 MiB during the uploads (the bounded caches) and 820 MiB during the checks (both caches full, plus the push's tables).
+
+**Nothing got slower** (the same machine and evening; with load averages of 6 to 72, single runs vary by up to 2×, so the base and the branch were also run alternately):
+
+| workload | before (`1f9f880`): runs, median | after: runs, median |
+|---|---|---|
+| OpenScion clone everything, 1k files | 106.5, 135.4, 126.6, 171.6 ms: 131 ms | 100.8, 97.8, 105.1, 129.7, 151.0 ms: 105 ms |
+| OpenScion clone everything, 10k files | 391.0, 460.4, 487.8, 673.3 ms: 474 ms | 390.6, 413.1, 466.4, 897.9, 404.2 ms: 413 ms |
+| OpenScion clone one directory, 1k / 10k | 58.1, 54.7, 73.0, 53.7 / 54.5, 64.3, 63.9, 121.9 ms: 56 / 64 ms | 55.2, 61.7, 52.3, 58.6, 109.7 / 55.2, 57.2, 60.6, 81.8, 64.3 ms: 59 / 61 ms |
+| load: pull, 100 clients (alternating, 10 s each) | 5,177, 4,616, 4,441 /s | 5,199, 4,532, 4,769 /s |
+| load: land, 10 / 100 projects (`bench-server.sh load`) | 531, 531 / 535 (2,990 errors), 407 /s | 473 / 652 /s, 0 errors |
+
+The load profile's third curve (one project, 50 agents) failed to start its server in the base's first run (`ensure_bucket` met a reset MinIO connection: BUG-861) and in the branch's run with 6 tries in 1.5 s; with tries for up to 10 s every curve ran, with no error.
 
 ## Through the Veil server (2026-11-06, `bfa691a`)
 

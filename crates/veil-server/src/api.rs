@@ -561,7 +561,8 @@ async fn fetch(State(hub): State<HubState>, caller: Caller, Path(p): Path<String
         return Err(Error::bad_request(format!("at most {MAX_WANTS} objects per request")));
     }
     let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
-    Ok(frames(sync::fetch(&hub, &project, &viewer, req.snapshot, req.objects).await?))
+    let stream = sync::fetch(&hub, &project, &viewer, req.snapshot, req.objects).await?;
+    Ok(([(header::CONTENT_TYPE, "application/octet-stream")], axum::body::Body::new(stream)).into_response())
 }
 
 async fn objects(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, body: Bytes) -> Result<Json<veil_core::hub::wire::Uploaded>> {
