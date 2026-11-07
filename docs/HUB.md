@@ -2244,9 +2244,12 @@ outcome is known, up to 30 s, else at `queued`.
 branch's **lease** (`landing_leases`: a holder, a fencing epoch bumped at
 every takeover, an expiry on the database's clock, 2 s unless renewed). A
 submit wakes the service on its own server, starting one if no other
-server holds the lease; a waiting submitter keeps one running (every
-250 ms it re-reads its row and makes sure a service runs); a starting
-server resumes every branch with queued rows. A service with nothing to do
+server holds the lease; a waiting submitter hears from the service on its
+server as soon as the batch commits, and keeps one running: where another
+server holds the lease it re-reads its row with a backoff from 250 ms to
+2 s (where this server runs the service, only every 5 s, so thousands of
+waiters never poll the database while a batch is late); a starting server
+resumes every branch with queued rows. A service with nothing to do
 for 5 s gives the lease back. Its loop:
 
 * **Batch:** every ready row not in the batch being committed, in queue
