@@ -1517,10 +1517,13 @@ database):
 | snapshot resolution | (project, id) → committed; (project, view key, real) → projected; (project, projected) → real | nothing: these facts never change (rows are never deleted or rewritten; a view key is a hash of what its viewer may read) |
 | branch tips | project → branch rows | a notice from every push (`NOTIFY`), or at most 100 ms |
 
-**Access epochs: never stale, on any server.** `access_epochs` holds a
-counter per person (`(0, person)`: their sessions, devices, admin rights,
+**Access epochs: never stale, on any server.** `access_epochs` holds an
+epoch per person (`(0, person)`: their sessions, devices, admin rights,
 group memberships, device bars) and per project (`(project, 0)`: its
-accepted policy, bindings and groups). **Triggers** on `group_members`,
+accepted policy, bindings and groups): the value of one clock
+(`access_epoch_clock`) at the row's last bump, so epochs only grow. The
+table, the clock and the bump are shared with S5's read grants, which are
+void below their person's or project's epoch. **Triggers** on `group_members`,
 `project_admins`, `sessions`, `people`, `devices`, `device_bars`,
 `projects` and `groups` bump them in the transaction of the change itself,
 whatever route (or operator) makes it, so a route written later cannot
@@ -1530,6 +1533,11 @@ id from the path), and a cached session or permission is used only if it
 was built under exactly those epochs. An entry is built by reading the
 epochs first and the records after, or both in one statement, so it is
 never tagged newer than what it holds.
+
+*A grant carries the request's epochs:* the epochs a request read before
+using any cached permission are in `Caller::epochs`; anything issued from
+that permission (S5's read grants) must record those, never a later read,
+so it can never be newer than the view it was made from.
 
 *How staleness is bounded:* a change commits together with its epoch bump;
 any request that starts after the commit reads the new epoch, misses every

@@ -1,8 +1,9 @@
 -- Access epochs (docs/HUB.md §13.13; docs/design/server/phase-2-thin-clients.md
--- §4.4, §5.2). Every server caches sessions and permissions in memory and
+-- §4.4, §5.2), shared with S5's read grants. Every server caches sessions and permissions in memory and
 -- checks them, on every request, against these counters: a change that could
 -- make a cached decision wrong bumps one in the same transaction, so the next
--- request to any server sees it. Rows are never deleted; epochs only grow.
+-- request to any server sees it. Rows are never deleted; epochs only grow
+-- (each is the clock's value at its last bump).
 --
 --   (0, person)    the person's sessions, devices, admin rights, groups, bars
 --   (project, 0)   the project's accepted policy, its bindings, its groups
@@ -11,23 +12,39 @@
 -- by any route written later or by an operator, bumps the epoch.
 -- Idempotent (IF NOT EXISTS, OR REPLACE, DROP … IF EXISTS): YugabyteDB may
 -- apply DDL statement by statement.
+-- The table, the clock and the bump are S5's (`0007_access_epochs.sql`,
+-- read grants), written identically here so that whichever migration runs
+-- first, the result is the same. One clock for every epoch: a bump
+-- increments its row, which stays locked until the bump's transaction
+-- commits, so epochs commit in increasing order.
+CREATE TABLE IF NOT EXISTS access_epoch_clock (
+    id INT PRIMARY KEY,
+    n BIGINT NOT NULL
+);
+INSERT INTO access_epoch_clock (id, n) VALUES (1, 0) ON CONFLICT DO NOTHING;
 CREATE TABLE IF NOT EXISTS access_epochs (
-    project_id BIGINT NOT NULL,          -- 0 for a person-wide change
-    person_id BIGINT NOT NULL,           -- 0 for a project-wide change
+    project_id BIGINT NOT NULL,
+    person_id BIGINT NOT NULL,
     epoch BIGINT NOT NULL,
     changed_at BIGINT NOT NULL,
     PRIMARY KEY (project_id, person_id)
 );
+CREATE INDEX IF NOT EXISTS access_epochs_by_epoch ON access_epochs (epoch);
 
 CREATE OR REPLACE FUNCTION veil_bump_epoch(p BIGINT, q BIGINT) RETURNS VOID AS $$
+DECLARE
+    e BIGINT;
 BEGIN
+    UPDATE access_epoch_clock SET n = n + 1 WHERE id = 1 RETURNING n INTO e;
     INSERT INTO access_epochs (project_id, person_id, epoch, changed_at)
-    VALUES (p, q, 1, (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT)
-    ON CONFLICT (project_id, person_id) DO UPDATE
-    SET epoch = access_epochs.epoch + 1, changed_at = EXCLUDED.changed_at;
+    VALUES (p, q, e, (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT)
+    ON CONFLICT (project_id, person_id) DO UPDATE SET epoch = EXCLUDED.epoch, changed_at = EXCLUDED.changed_at;
 END
 $$ LANGUAGE plpgsql;
 
+-- The request-path caches' triggers (S4): every change that can make a
+-- cached session or permission wrong, granting as well as taking away
+-- (S5's triggers cover the removals its grants need).
 -- Rows naming a person: group members, project admins, sessions (deleted or
 -- changed; a new session invalidates nothing), people (a new name).
 CREATE OR REPLACE FUNCTION veil_epoch_person_row() RETURNS trigger AS $$
@@ -98,27 +115,27 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS veil_epoch ON group_members;
-CREATE TRIGGER veil_epoch AFTER INSERT OR UPDATE OR DELETE ON group_members
+DROP TRIGGER IF EXISTS veil_cache_epoch ON group_members;
+CREATE TRIGGER veil_cache_epoch AFTER INSERT OR UPDATE OR DELETE ON group_members
     FOR EACH ROW EXECUTE FUNCTION veil_epoch_person_row();
-DROP TRIGGER IF EXISTS veil_epoch ON project_admins;
-CREATE TRIGGER veil_epoch AFTER INSERT OR UPDATE OR DELETE ON project_admins
+DROP TRIGGER IF EXISTS veil_cache_epoch ON project_admins;
+CREATE TRIGGER veil_cache_epoch AFTER INSERT OR UPDATE OR DELETE ON project_admins
     FOR EACH ROW EXECUTE FUNCTION veil_epoch_person_row();
-DROP TRIGGER IF EXISTS veil_epoch ON sessions;
-CREATE TRIGGER veil_epoch AFTER UPDATE OR DELETE ON sessions
+DROP TRIGGER IF EXISTS veil_cache_epoch ON sessions;
+CREATE TRIGGER veil_cache_epoch AFTER UPDATE OR DELETE ON sessions
     FOR EACH ROW EXECUTE FUNCTION veil_epoch_person_row();
-DROP TRIGGER IF EXISTS veil_epoch ON people;
-CREATE TRIGGER veil_epoch AFTER UPDATE OR DELETE ON people
+DROP TRIGGER IF EXISTS veil_cache_epoch ON people;
+CREATE TRIGGER veil_cache_epoch AFTER UPDATE OR DELETE ON people
     FOR EACH ROW EXECUTE FUNCTION veil_epoch_people_row();
-DROP TRIGGER IF EXISTS veil_epoch ON devices;
-CREATE TRIGGER veil_epoch AFTER UPDATE OF removed_at, pending, signing_key, person_id OR DELETE ON devices
+DROP TRIGGER IF EXISTS veil_cache_epoch ON devices;
+CREATE TRIGGER veil_cache_epoch AFTER UPDATE OF removed_at, pending, signing_key, person_id OR DELETE ON devices
     FOR EACH ROW EXECUTE FUNCTION veil_epoch_device_row();
-DROP TRIGGER IF EXISTS veil_epoch ON device_bars;
-CREATE TRIGGER veil_epoch AFTER INSERT OR UPDATE OR DELETE ON device_bars
+DROP TRIGGER IF EXISTS veil_cache_epoch ON device_bars;
+CREATE TRIGGER veil_cache_epoch AFTER INSERT OR UPDATE OR DELETE ON device_bars
     FOR EACH ROW EXECUTE FUNCTION veil_epoch_bar_row();
-DROP TRIGGER IF EXISTS veil_epoch ON projects;
-CREATE TRIGGER veil_epoch AFTER UPDATE OF name, default_branch, policy_text, policy_bindings OR DELETE ON projects
+DROP TRIGGER IF EXISTS veil_cache_epoch ON projects;
+CREATE TRIGGER veil_cache_epoch AFTER UPDATE OF name, default_branch, policy_text, policy_bindings OR DELETE ON projects
     FOR EACH ROW EXECUTE FUNCTION veil_epoch_project_row();
-DROP TRIGGER IF EXISTS veil_epoch ON groups;
-CREATE TRIGGER veil_epoch AFTER UPDATE OR DELETE ON groups
+DROP TRIGGER IF EXISTS veil_cache_epoch ON groups;
+CREATE TRIGGER veil_cache_epoch AFTER UPDATE OR DELETE ON groups
     FOR EACH ROW EXECUTE FUNCTION veil_epoch_group_row();
