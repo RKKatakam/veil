@@ -1145,3 +1145,109 @@ fn the_format_8_set_holds_links_and_annotated_tags_for_their_audiences() {
         assert!(!bytes.windows(SEALED_TARGET.len()).any(|w| w == SEALED_TARGET.as_bytes()), "{} holds the sealed target", id.short());
     }
 }
+
+// ---- adversarial pass: simplification part 2 ----------------------------------------
+
+/// A repository this build writes at format 8, then marked `from` (as a
+/// format-7 repository holding the same objects is): `(tmp, root, fs, alice)`.
+fn written_then_marked(from: u32, build: impl FnOnce(&mut Repo, &Path, &Arc<DiskBackend>)) -> (tempfile::TempDir, PathBuf, Arc<DiskBackend>, Identity) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("p");
+    std::fs::create_dir_all(&root).unwrap();
+    let alice = Identity::generate("alice");
+    let fs = Arc::new(DiskBackend::new(&root));
+    let mut repo = Repo::init(fs.clone(), Some(alice.clone()), "alice").unwrap();
+    build(&mut repo, &root, &fs);
+    drop(repo);
+    let mut cfg = read_config(&*fs).unwrap();
+    cfg.format = from;
+    cfg.min_vl = Some(veil_core::repo::min_vl_for_format(from).into());
+    fs.write(&p(".veil/repo.json"), &serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+    (tmp, root, fs, alice)
+}
+
+/// BUG-940: a secret renamed to an ordinary path stays sealed there
+/// (protection follows a secret across a rename: format 8 writes this
+/// itself, as format 7 did), but `vl upgrade` names it as content "only
+/// the removed encryption wrote" and refuses the repository, telling its
+/// owner to start a new one.
+#[test]
+#[ignore = "BUG-940: vl upgrade refuses a renamed secret, which format 8 itself writes"]
+fn a_renamed_secret_does_not_block_the_upgrade() {
+    let (_tmp, _root, fs, alice) = written_then_marked(7, |repo, root, fs| {
+        std::fs::write(root.join(".veilpolicy"), ".env cloak team\n").unwrap();
+        std::fs::write(root.join(".env"), "TOKEN=fixture-not-a-secret-4471\n").unwrap();
+        repo.snapshot_workspace("default", &**fs).unwrap();
+        repo.commit_working_copy("default", "first").unwrap();
+        std::fs::rename(root.join(".env"), root.join("settings.txt")).unwrap();
+        repo.snapshot_workspace("default", &**fs).unwrap();
+        let (c, _) = repo.commit_working_copy("default", "rename").unwrap();
+        let tree = repo.snapshot(&c).unwrap().tree;
+        let e = lookup(repo.store(), &tree, &p("settings.txt")).unwrap().expect("renamed");
+        assert_eq!(e.visibility, Visibility::Cloaked { scope: "team".into() }, "control: format 8 keeps the moved secret sealed");
+    });
+    let r = upgrade(fs.clone(), Some(alice), &UpgradeOptions::default());
+    assert!(r.is_ok(), "a repository holding only what format 8 writes was refused: {}", r.unwrap_err());
+}
+
+/// BUG-941: the removed-content check reads a conflict entry's object only
+/// to see that it decodes, so a conflict whose side is encrypted for a
+/// cloaked folder (`billing/ cloak finance` before format 8: an encrypted
+/// file that is not a secret file) passes, and the format-8 repository
+/// keeps encrypted code, which the check exists to refuse (docs/FORMAT.md
+/// §5 "Format 8").
+#[test]
+#[ignore = "BUG-941: vl upgrade misses a conflict side encrypted for a cloaked folder"]
+fn an_encrypted_conflict_side_of_an_ordinary_file_is_named() {
+    let (_tmp, _root, fs, alice) = written_then_marked(7, |repo, _, _| {
+        let store = repo.store();
+        let public = store.put(&Object::Blob(b"public side\n".to_vec())).unwrap();
+        // The structure only: the check reads labels, never content.
+        let sealed = store.put(&Object::Blob(b"stands for a sealed side\n".to_vec())).unwrap();
+        let term = |id: ObjectId, visibility: Visibility| veil_core::ConflictTerm {
+            kind: veil_core::object::TermKind::File,
+            id,
+            size: 0,
+            executable: false,
+            visibility,
+        };
+        let conflict = veil_core::Conflict {
+            adds: vec![Some(term(public, Visibility::Public)), Some(term(sealed, Visibility::Cloaked { scope: "finance".into() }))],
+            removes: vec![Some(term(public, Visibility::Public))],
+        };
+        let cid = store.put_conflict(&conflict).unwrap();
+        let billing = store
+            .put(&Object::Tree(Tree {
+                entries: vec![TreeEntry {
+                    name: "report.txt".into(),
+                    kind: EntryKind::Conflict,
+                    id: cid,
+                    size: 0,
+                    executable: false,
+                    visibility: Visibility::Public,
+                }],
+            }))
+            .unwrap();
+        let root_tree = store.put(&Object::Tree(Tree { entries: vec![TreeEntry::dir("billing", billing)] })).unwrap();
+        let s = Snapshot {
+            parents: vec![repo.root_id()],
+            change_id: ChangeId::random(),
+            tree: root_tree,
+            description: Text::Plain("merge with a conflict".into()),
+            author: "alice".into(),
+            timestamp: 1,
+            predecessors: vec![],
+            conflicts: vec!["billing/report.txt".into()],
+            embargo: None,
+            signature: None,
+        };
+        let id = store.put_snapshot(&s).unwrap();
+        repo.set_tag("main", id, false).unwrap();
+    });
+    let r = upgrade(fs, Some(alice), &UpgradeOptions { dry_run: true, ..Default::default() }).unwrap();
+    assert!(
+        r.removed.iter().any(|f| f.contains("billing/report.txt")),
+        "the encrypted side of billing/report.txt was not named: {:?}",
+        r.removed
+    );
+}

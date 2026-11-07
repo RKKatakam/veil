@@ -519,3 +519,75 @@ fn rebasing_the_embargoed_merge_itself_keeps_the_fix_sealed() {
     let anon = reader(mirror, None);
     assert!(readable_containing(&anon, b"SECRETFIX").is_empty());
 }
+
+// ---- adversarial pass: simplification part 2 ----------------------------------------
+
+/// The fix merged under an unreleased embargo, and a follow-up change on
+/// `main` built on the merge: `(alice, main before the merge, the merge,
+/// the follow-up)`.
+fn embargoed_with_follow_up() -> (Repo, ObjectId, ObjectId, ObjectId) {
+    let (mut alice, fs, _) = new_repo("alice");
+    let main = commit_files(&mut alice, &*fs, &[("auth.rs", "v1\n"), ("other", "o\n")], "v1");
+    alice.set_tag("main", main, false).unwrap();
+    let ws = alice.ephemeral_workspace(main).unwrap();
+    ws.write("auth.rs", "v2 SIMPADV-EMBARGOED-FIX-7741\n").unwrap();
+    let (fix, _) = alice.commit_ephemeral(&ws, "fix").unwrap();
+    let r = alice.merge(WS, main, vec![fix], "m", embargo("team")).unwrap();
+    let ws = alice.ephemeral_workspace(r.snapshot).unwrap();
+    ws.write("other", "o2\n").unwrap();
+    let (follow, _) = alice.commit_ephemeral(&ws, "follow-up").unwrap();
+    alice.set_tag("main", follow, false).unwrap();
+    // Control: the follow-up is withheld (it builds on the embargoed merge).
+    let tip = alice.view().tags["main"].target;
+    assert!(remote::embargo_blocks(&alice, &[tip]).unwrap()[0].is_some(), "control: main is withheld before the rewrite");
+    (alice, main, r.snapshot, follow)
+}
+
+/// After a rewrite of the embargoed merge: `main` still holds the fix, so
+/// it is still withheld from every remote (what `vl push` to the Veil
+/// server checks, `remote::embargo_blocks`), and a push to a mirror
+/// carries none of it.
+fn assert_fix_still_withheld(alice: &mut Repo) {
+    let tip = alice.view().tags["main"].target;
+    assert!(
+        String::from_utf8(read_at(alice, &tip, "auth.rs")).unwrap().contains("SIMPADV-EMBARGOED-FIX-7741"),
+        "control: main still holds the fix"
+    );
+    let blocks = remote::embargo_blocks(alice, &[tip]).unwrap();
+    let mirror = Arc::new(MemoryBackend::new());
+    let _ = remote::push(alice, mirror.clone(), true, &[], false);
+    let anon = reader(mirror, None);
+    let leaked = readable_containing(&anon, b"SIMPADV-EMBARGOED-FIX-7741");
+    assert!(
+        blocks[0].is_some() && leaked.is_empty(),
+        "the unreleased fix left its embargo: `vl push` would upload main ({:?}); the mirror reads it in {leaked:?}",
+        blocks[0]
+    );
+}
+
+/// BUG-943 (pre-existing: the same leak on `integration` 1b39297, to a
+/// public remote): `vl abandon` of the embargoed merge rebases the
+/// follow-up onto the merge's parents (`main` and the fix), a plain merge
+/// of the fix with no embargoed ancestor, so nothing withholds it any more
+/// and `vl push` uploads it.
+#[test]
+#[ignore = "BUG-943: abandoning the embargoed merge leaves its fix in the follow-up's tree, unwithheld"]
+fn abandoning_the_embargoed_merge_keeps_the_fix_withheld() {
+    let (mut alice, _, m, _) = embargoed_with_follow_up();
+    alice.abandon(m).unwrap();
+    assert_fix_still_withheld(&mut alice);
+}
+
+/// BUG-942: the embargoed merge squashed into its follow-up (a descendant
+/// inside the embargo, so the copy check lets it through) is abandoned,
+/// and the follow-up keeps the fix with no embargoed ancestor: `vl push`
+/// uploads it. `integration` 1b39297 refused this squash ("a change under
+/// an embargo can only be squashed whole into its parent", a check on the
+/// wrapper tree that format 8 removed with it).
+#[test]
+#[ignore = "BUG-942: squashing the embargoed merge into its follow-up leaves the fix unwithheld"]
+fn squashing_the_embargoed_merge_into_its_follow_up_keeps_the_fix_withheld() {
+    let (mut alice, _, m, follow) = embargoed_with_follow_up();
+    alice.squash_into(m, Some(follow), None).unwrap();
+    assert_fix_still_withheld(&mut alice);
+}
