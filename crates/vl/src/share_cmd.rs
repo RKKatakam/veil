@@ -434,10 +434,15 @@ pub fn pass(ctx: &mut Ctx, client: &Client) -> Result<Vec<String>> {
     let Some(me) = hub::signed_in_servers()?.into_iter().find(|(a, _)| *a == client.url.authority).map(|(_, p)| p) else {
         return Ok(vec![]);
     };
+    // The record before the listing: a listing is then never older than
+    // the entries it is judged against. Read the other way round, an unshare
+    // and a new share of the same file between the two reads made a stale
+    // "ended" look like the end of the new share, which was then forgotten.
+    let made = load_state(ctx).made;
     let shares = client.shares()?;
     let mut out = Vec::new();
-    if !load_state(ctx).made.is_empty() {
-        out.extend(rewrap(ctx, client, &me, &shares)?);
+    if !made.is_empty() {
+        out.extend(rewrap(ctx, client, &me, made, &shares)?);
     }
     out.extend(receive(ctx, &me, &shares));
     if !shares.is_empty() && !takes_part(ctx) {
@@ -454,14 +459,19 @@ pub fn pass(ctx: &mut Ctx, client: &Client) -> Result<Vec<String>> {
 /// content goes out only with `vl secret share`. A share the server lists
 /// as ended, paused or shared again elsewhere is forgotten here: only a new
 /// `vl secret share` starts it again.
-fn rewrap(ctx: &mut Ctx, client: &Client, me: &str, shares: &[ShareInfo]) -> Result<Vec<String>> {
+fn rewrap(ctx: &mut Ctx, client: &Client, me: &str, made_now: BTreeMap<String, Made>, shares: &[ShareInfo]) -> Result<Vec<String>> {
     let identity = load_identity()?;
     let project = project_id(ctx)?;
     let mut out = Vec::new();
-    for (key, made) in load_state(ctx).made {
+    for (key, made) in made_now {
         let Some((path, recipient)) = key.split_once('\u{0}') else { continue };
         let label = format!("share of {path} with {recipient}");
         let Some(s) = shares.iter().find(|s| s.sharer == me && s.path == path && s.recipient == recipient) else { continue };
+        // A listing older than what this clone recorded says nothing about
+        // it (a lying server, or a race): never acted on.
+        if s.version < made.version {
+            continue;
+        }
         if s.unshared_at.is_some() || !s.active || s.version > made.version {
             let why = match (&s.unshared_at, &s.paused) {
                 (Some(_), _) => "ended".to_string(),
