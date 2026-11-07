@@ -9,7 +9,7 @@ use std::{
 
 use adversarial_support::*;
 use veil_core::{
-    lock::RepoLock,
+    lock::{LockInfo, RepoLock},
     now_millis, MemoryBackend, Repo, StorageBackend,
 };
 
@@ -279,4 +279,48 @@ fn a_clean_snapshot_needs_no_lock_and_large_content_still_records() {
     assert_eq!(read_at(&b, &out.snapshot, "big.bin"), big);
     let mut c = Repo::open(fs.clone(), None, "c").unwrap();
     assert!(!c.snapshot_workspace("default", &*fs).unwrap().changed);
+}
+
+/// BUG-013, on format 8: a live holder of the repository lock is never
+/// robbed. Transactions no longer take `.veil/lock` (the op log is
+/// lock-free), but `vl upgrade`, gc, the vault and key-ring writes do
+/// (`RepoLock`). A's lock file is rewritten to look like a lease that
+/// expired two minutes ago, held by another process on this machine that
+/// is still running (a live child, with its start time, BUG-052); B must
+/// wait rather than take it, and enters only once A releases it.
+#[test]
+#[cfg(unix)]
+fn a_live_lock_holder_is_never_robbed() {
+    let (_repo, fs, _) = new_repo("alice");
+    let backend: Arc<dyn StorageBackend> = fs.clone();
+    let mut alive = std::process::Command::new("sleep").arg("60").spawn().expect("spawn `sleep`");
+    let held = RepoLock::acquire(backend.clone()).unwrap();
+    // ...A is still working, 121 s after its lease was last renewed:
+    let mut info = LockInfo::parse(&fs.read(&p(LOCK)).unwrap()).expect("current lock format");
+    info.pid = alive.id();
+    info.acquired = now_millis() - 121_000;
+    info.renewed = info.acquired;
+    let mut planted = serde_json::to_value(&info).unwrap();
+    let start = veil_core::lock::process_start(alive.id()).expect("start time of a live child");
+    planted["pid_start"] = start.id.into();
+    fs.write(&p(LOCK), &serde_json::to_vec(&planted).unwrap()).unwrap();
+
+    let b = std::thread::spawn({
+        let backend = backend.clone();
+        move || {
+            let lock = RepoLock::acquire(backend).unwrap();
+            let entered = Instant::now();
+            drop(lock);
+            entered
+        }
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(!b.is_finished(), "B took the lock while A held it");
+    let released = Instant::now();
+    drop(held);
+    let b_entered = b.join().unwrap();
+    let _ = alive.kill();
+    let _ = alive.wait();
+    assert!(b_entered >= released, "B entered before A released the lock");
+    assert!(!fs.exists(&p(LOCK)).unwrap(), "the lock was left behind");
 }
