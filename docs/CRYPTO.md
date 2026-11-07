@@ -391,6 +391,9 @@ and is trusted with code but never with secrets.
 
 ### C14. Person-to-person secret shares — standard parts (C2, C3, C5), one key per version
 
+**Approved by the orchestrator under the owner's delegation, 2026-11-07**,
+as a construction from C2, C3 and C5.
+
 What it is for (`docs/HUB.md` §13.13): a member gives **one secret file**
 to **one other member**, without an admin, so that only that person's
 confirmed devices (and the sharing device) can open it, and the server,
