@@ -527,7 +527,7 @@ fn prefix_end(prefix: &str, digits: &str) -> Option<String> {
 /// 1 to 32 letters k–z (a pulled tag of any length is checked). A change the viewer cannot see is not in their
 /// history: its projection is its parent's, whose change id differs, and
 /// is left out. Nothing else is named; anything that matches nothing gets
-/// the same empty answer. Bounded: [`RESOLVE_MATCHES`] of each kind, and
+/// the same empty answer. Bounded: 16 matches of each kind, and
 /// the query's deadline (then `warming` while the viewer's graph fills).
 pub async fn resolve_prefix(hub: &Arc<Hub>, ask: &Ask, prefix: &str, limits: Limits) -> Result<Value> {
     let deadline = Instant::now() + limits.deadline;
