@@ -348,3 +348,40 @@ fn two_recorders_of_one_workspace_never_both_publish() {
     assert_eq!(read_at(&r, &wc, "file-a"), b"from A\n");
     assert_eq!(read_at(&r, &wc, "file-b"), b"from B\n", "B's edit is not in the working copy");
 }
+
+/// BUG-942/943 through concurrent operations: one side abandons the
+/// embargoed merge (nothing is built on it in its view, so it may), while
+/// the other commits a follow-up on the merge. Merging the two heads would
+/// rebase the follow-up onto the merge's parents, holding the fix with no
+/// embargoed ancestor: the merge drops the abandon instead, and the fix
+/// stays withheld.
+#[test]
+fn a_concurrent_abandon_of_the_embargoed_merge_never_unwithholds_its_fix() {
+    let (mut repo, fs, id) = new_repo("alice");
+    let v1 = commit_files(&mut repo, &*fs, &[("a.c", "v\n")], "v1");
+    repo.set_tag("main", v1, false).unwrap();
+    repo.create_workspace("fix", vec![v1]).unwrap();
+    let fix = commit_in(&mut repo, "fix", &[("FIX-NAME-Q5.c", "FIX-BODY-Q5\n")], "fix");
+    let spec = Some(veil_core::commands::EmbargoSpec { scope: "team".into(), until: None });
+    let m = repo.merge(WS, v1, vec![fix], "embargoed", spec).unwrap().snapshot;
+    repo.edit(WS, v1).unwrap();
+    drop(repo);
+    concurrently(
+        &fs,
+        &id,
+        |r| r.abandon(m).unwrap(),
+        |r| {
+            r.create_workspace("w2", vec![m]).unwrap();
+            commit_in(r, "w2", &[("follow.c", "f\n")], "follow-up");
+        },
+    );
+    let mut r = veil_core::Repo::open(fs.clone(), Some(id.clone()), &id.name).unwrap();
+    let w2 = r.workspace_wc("w2").unwrap();
+    assert!(veil_core::remote::embargo_blocks(&r, &[w2]).unwrap()[0].is_some(), "the follow-up no longer builds on the embargoed merge");
+    r.set_tag("later", w2, false).unwrap();
+    let mirror = std::sync::Arc::new(veil_core::MemoryBackend::new());
+    let _ = veil_core::remote::push(&mut r, mirror.clone(), true, &[], false);
+    for n in ["FIX-NAME-Q5", "FIX-BODY-Q5"] {
+        assert!(backend_contains(&*mirror, n.as_bytes()).is_empty(), "{n} reached the public remote");
+    }
+}

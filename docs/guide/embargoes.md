@@ -163,6 +163,14 @@ Nothing is recorded when this happens. Your options:
   fix's own parent), `vl duplicate` and `vl cherry-pick`, `vl rebase`
   of work built on the fix onto another line, and `vl abandon` of the fix
   while work is built on it.
+* **Nothing drops the embargoed merge while work is built on it.** Until
+  the release, `vl abandon` of the merge, `vl squash` of it into the change
+  on top of it, and any other rewrite that removes it or leaves it without
+  its embargo refuse while a change built on it survives ("release the
+  embargo first, or abandon what is built on it too"): that change holds
+  the fix, and without the merge nothing would withhold it. A concurrent
+  operation that does it (another workspace) is dropped when the
+  operations merge.
   Inside the embargo they all work: restore from the fix into a change on
   the fix line, squash work on the fix into it, rebase or split the fix
   itself (the embargoed merge follows). `vl cat -r` reads it and changes
@@ -175,8 +183,9 @@ Nothing is recorded when this happens. Your options:
 * **A pushed release is final.** Only an unpushed release can be undone
   (above).
 * **Undoing the merge undoes the embargo.** If the embargoed merge is
-  undone or abandoned before a push, the fix line is an ordinary change
-  again, pushed as soon as a tag reaches it.
+  undone, or abandoned with nothing built on it, before a push, the fix
+  line is an ordinary change again, pushed as soon as a tag reaches it.
+  (Work built on the merge keeps it in history, so its fix stays withheld.)
 
 Who sees what is described in [VISIBILITY.md](../VISIBILITY.md), "Hidden changes".
 

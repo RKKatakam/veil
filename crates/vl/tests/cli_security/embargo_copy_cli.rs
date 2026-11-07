@@ -209,12 +209,11 @@ fn cat_reads_the_fix_and_records_nothing() {
 /// forbid. A consumer (CI, an agent) that publishes what Veil calls
 /// public publishes the fix.
 #[test]
-#[ignore = "BUG-944: `vl ls --json` calls an unreleased embargo's files public, under an unchanged schema"]
 fn json_never_calls_a_file_under_an_unreleased_embargo_public() {
     let env = Env::new();
     let (r, _) = embargoed(&env);
     let doc: serde_json::Value = serde_json::from_str(&r.ok(&["ls", "-r", "main", "--json"])).unwrap();
-    assert_eq!(doc["schema"], "veil.ls/1");
+    assert_eq!(doc["schema"], "veil.ls/2");
     let fix = doc["entries"]
         .as_array()
         .unwrap()
@@ -231,7 +230,6 @@ fn json_never_calls_a_file_under_an_unreleased_embargo_public() {
 /// it. Before format 8 this squash was refused ("a change under an embargo
 /// can only be squashed whole into its parent").
 #[test]
-#[ignore = "BUG-942: squashing the embargoed merge into its follow-up publishes the fix on the next push"]
 fn squashing_the_embargoed_merge_away_publishes_nothing() {
     let env = Env::new();
     let (r, _) = embargoed(&env);
@@ -239,6 +237,7 @@ fn squashing_the_embargoed_merge_away_publishes_nothing() {
     r.ok(&["new", "main"]);
     r.commit("follow-up", &[("follow.c", "f\n")]);
     r.tag("main", "@-");
-    r.ok(&["squash", "-r", &merge, "--into", "main"]);
+    let out = r.fails(&["squash", "-r", &merge, "--into", "main"]);
+    assert!(out.contains("embargoed merge") && out.contains("vl embargo release"), "{out}");
     publishes_nothing(&env, &r);
 }

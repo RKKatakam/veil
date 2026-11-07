@@ -571,10 +571,10 @@ fn assert_fix_still_withheld(alice: &mut Repo) {
 /// of the fix with no embargoed ancestor, so nothing withholds it any more
 /// and `vl push` uploads it.
 #[test]
-#[ignore = "BUG-943: abandoning the embargoed merge leaves its fix in the follow-up's tree, unwithheld"]
 fn abandoning_the_embargoed_merge_keeps_the_fix_withheld() {
     let (mut alice, _, m, _) = embargoed_with_follow_up();
-    alice.abandon(m).unwrap();
+    let err = alice.abandon(m).unwrap_err().to_string();
+    assert!(err.contains("embargoed merge") && err.contains("release the embargo first"), "{err}");
     assert_fix_still_withheld(&mut alice);
 }
 
@@ -585,9 +585,43 @@ fn abandoning_the_embargoed_merge_keeps_the_fix_withheld() {
 /// an embargo can only be squashed whole into its parent", a check on the
 /// wrapper tree that format 8 removed with it).
 #[test]
-#[ignore = "BUG-942: squashing the embargoed merge into its follow-up leaves the fix unwithheld"]
 fn squashing_the_embargoed_merge_into_its_follow_up_keeps_the_fix_withheld() {
     let (mut alice, _, m, follow) = embargoed_with_follow_up();
-    alice.squash_into(m, Some(follow), None).unwrap();
+    let err = alice.squash_into(m, Some(follow), None).unwrap_err().to_string();
+    assert!(err.contains("embargoed merge") && err.contains("release the embargo first"), "{err}");
     assert_fix_still_withheld(&mut alice);
+}
+
+/// The class of BUG-942/943, for the routes that keep the embargo: a
+/// rebase of the embargoed merge (its line moves with it) and a describe
+/// are rewrites that keep it, so they are allowed and the fix stays
+/// withheld; abandoning the merge together with what is built on it
+/// withdraws the embargo with nothing left holding the fix.
+#[test]
+fn rewrites_that_keep_the_embargoed_merge_are_allowed() {
+    let (mut alice, main, m, follow) = embargoed_with_follow_up();
+    alice.describe(m, "m, reworded").unwrap();
+    assert_fix_still_withheld(&mut alice);
+    let (mut alice, _, m, follow2) = embargoed_with_follow_up();
+    let _ = (main, follow);
+    let wc = alice.workspace_wc(WS).unwrap();
+    alice.abandon(follow2).unwrap();
+    if alice.is_ancestor(&m, &wc).unwrap() {
+        alice.edit(WS, main_of(&alice)).unwrap();
+    }
+    alice.abandon(m).unwrap();
+    let tip = alice.view().tags["main"].target;
+    assert!(!String::from_utf8(read_at(&alice, &tip, "auth.rs")).unwrap().contains("SIMPADV-EMBARGOED-FIX-7741"), "main lost the merge and the fix with it");
+}
+
+/// The first snapshot of the history before the merge (`v1`).
+fn main_of(alice: &Repo) -> ObjectId {
+    let mut id = alice.view().tags["main"].target;
+    loop {
+        let s = alice.snapshot(&id).unwrap();
+        if s.parents.len() != 1 || s.parents[0] == alice.root_id() {
+            return id;
+        }
+        id = s.parents[0];
+    }
 }

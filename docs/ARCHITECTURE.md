@@ -2835,7 +2835,7 @@ documented in `docs/reference/json.md` (hand-written; `docgen` keeps it
 when it regenerates the reference). Additive changes keep the version;
 anything else bumps it. The shape tests pin every key and type, and fail if
 a key is missing from `json.md`. Two write commands take `--json` too,
-`vl split` and `vl squash` (`api::shape`, `veil.split/1`, `veil.squash/1`),
+`vl split` and `vl squash` (`api::shape`, `veil.split/2`, `veil.squash/2`),
 because scripts and agents need to know which change got what; their
 interactive picker (`crates/vl/src/picker.rs`) writes to stderr, so stdout
 still carries only the document. A failure under `--json` prints a
@@ -2848,8 +2848,8 @@ document; clap's usage errors (exit 2) stay text.
 `vl blame`, `vl grep`, the `vl log` filters, `vl bisect` and rename
 detection (Git-parity stream H; designs in `docs/design/git-parity/1-…`,
 `2-…`, `3-…`) are read commands like the others: engines in `veil-core`,
-results in `api` (`veil.blame/1`, `veil.grep/1`, additive fields in
-`veil.log/1`, `veil.diff/1`, `veil.status/1`), `crates/vl/src/history.rs`
+results in `api` (`veil.blame/2`, `veil.grep/2`, additive fields in
+`veil.log/2`, `veil.diff/2`, `veil.status/2`), `crates/vl/src/history.rs`
 for the CLI, and `blame`/`grep` methods in `vl serve`.
 
 * **One reader of content.** Every one of them reads file content through
@@ -3464,8 +3464,13 @@ The lists below describe what today's client protects, and what not.
 * *An embargo release is final once pushed.* Until the next push it is
   staged locally and `vl undo` takes it back (§7).
 * *History withheld by an embargo* is computed from the local graph. If the
-  embargoed merge is undone or abandoned before a push, nothing protects
-  the fix branch any more; it is then an ordinary change.
+  embargoed merge is undone, or abandoned with nothing built on it, before
+  a push, nothing protects the fix branch any more; it is then an ordinary
+  change. A rewrite that drops the merge, or replaces it with a snapshot
+  without its embargo, while a change built on it survives is refused
+  (`Transaction::check_embargoed_merges`; a merge of concurrent operations
+  drops such a rewrite), so a fix kept in a descendant's tree is never
+  left unwithheld (BUG-942, BUG-943).
 * Content committed in plaintext **before** a path was cloaked stays readable
   in those older snapshots. `vl cloak` warns when this applies.
 

@@ -517,6 +517,27 @@ pub fn embargo_blocks(local: &Repo, targets: &[ObjectId]) -> Result<Vec<Option<S
         .collect()
 }
 
+/// For a snapshot no push may send yet (an unreleased embargo withholds
+/// it, or it builds on withheld history): the nearest snapshot down its
+/// first parents that a push does send, whose files are already
+/// published. `None` for a snapshot a push sends. What the snapshot holds
+/// beyond that one is under the embargo (`vl ls`'s tier `embargoed`).
+pub fn embargo_base(local: &Repo, id: &ObjectId) -> Result<Option<ObjectId>> {
+    let withheld = embargo_withheld(local)?;
+    if withheld.is_empty() || push_closure(local.store(), &[*id], &withheld)?.is_ok() {
+        return Ok(None);
+    }
+    let mut x = *id;
+    loop {
+        let Some(s) = local.snapshot_opt(&x)? else { return Ok(Some(local.root_id())) };
+        let Some(p) = s.parents.first().copied() else { return Ok(Some(local.root_id())) };
+        if push_closure(local.store(), &[p], &withheld)?.is_ok() {
+            return Ok(Some(p));
+        }
+        x = p;
+    }
+}
+
 /// The snapshots to send for `tips`: every ancestor. Fails with a reason
 /// if the tips reach history an unreleased embargo withholds (the
 /// embargoed merge, its fix, or anything built on them).

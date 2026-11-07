@@ -624,6 +624,58 @@ impl<'r> Transaction<'r> {
         Ok(())
     }
 
+    /// BUG-942/943: an unreleased embargoed merge is what withholds its fix
+    /// (`remote::embargo_withheld` starts from it). No rewrite may drop it,
+    /// or replace it with a snapshot that does not carry its embargo, while
+    /// anything built on it survives the transaction: the survivor would
+    /// hold the fix with no embargoed ancestor, and the next push would
+    /// send it (a squash of the merge into its follow-up, an abandon that
+    /// rebases the follow-up onto the merge's parents, ...). Rewrites that
+    /// keep the embargo (a rebase of the merge, a describe) are fine, and so
+    /// is dropping the merge with nothing on top of it (that withdraws the
+    /// embargo, as undoing the merge does).
+    fn check_embargoed_merges(&self) -> Result<()> {
+        match self.embargoed_merge_violations()?.into_iter().next() {
+            None => Ok(()),
+            Some((m, e, d)) => Err(VeilError::Policy(format!(
+                "cannot drop or replace the embargoed merge {} of unreleased embargo {e}: change {} is built on it, and without the merge nothing would withhold the fix it holds, so the next push would publish it before the release; release the embargo first (`vl embargo release {e}`), or abandon what is built on it too",
+                self.repo.snapshot(&m)?.change_id.short(),
+                self.repo.snapshot(&d)?.change_id.short()
+            ))),
+        }
+    }
+
+    /// [`Transaction::check_embargoed_merges`]'s findings: `(the embargoed
+    /// merge, its embargo, a change built on it that survives)`, sorted.
+    fn embargoed_merge_violations(&self) -> Result<Vec<(ObjectId, String, ObjectId)>> {
+        let mut out = Vec::new();
+        let mut olds: Vec<ObjectId> = self.rewritten.keys().copied().collect();
+        olds.sort();
+        for m in &olds {
+            let Some(s) = self.repo.snapshot_opt(m)? else { continue };
+            let Some(e) = &s.embargo else { continue };
+            if self.repo.keys().embargo_released(e) {
+                continue;
+            }
+            let (finals, abandoned) = self.resolve(*m);
+            let mut kept = !abandoned;
+            for f in &finals {
+                kept &= self.repo.snapshot(f)?.embargo.as_deref() == Some(e.as_str());
+            }
+            if kept {
+                continue;
+            }
+            for d in &olds {
+                if d == m || self.resolve(*d).1 || !self.repo.is_ancestor(m, d)? {
+                    continue;
+                }
+                out.push((*m, e.clone(), *d));
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// BUG-681: no rewrite moves a change confined to an unreleased embargo
     /// (its fix, work built on it, the embargoed line) out of it. A rebase,
     /// or an abandon whose descendants move, that puts such a change onto
@@ -704,8 +756,10 @@ impl<'r> Transaction<'r> {
         std::mem::swap(&mut self.repo.view, &mut self.view);
         let res = (|repo: &Repo| -> Result<Vec<(ObjectId, String)>> {
             let mut after = crate::confinement::Confinement::new(repo)?;
-            // Abandoning the embargoed merge itself withdraws the embargo
-            // (as undoing the merge does): nothing is moved out of it.
+            // Abandoning the embargoed merge itself, with nothing built on
+            // it (`check_embargoed_merges` refuses it otherwise), withdraws
+            // the embargo, as undoing the merge does: nothing is moved out
+            // of it.
             let active = crate::confinement::active_embargoes(repo)?;
             let mut out = Vec::new();
             for (old, e, finals) in &was {
@@ -751,7 +805,14 @@ impl<'r> Transaction<'r> {
             if !self.rewritten.is_empty() {
                 self.rebase_descendants()?;
             }
-            let bad = self.confinement_violations(&before)?;
+            let mut bad = self.confinement_violations(&before)?;
+            // A side's drop of an embargoed merge another side built on
+            // (BUG-942/943): the drop goes, the merge stays.
+            for (m, e, _) in self.embargoed_merge_violations()? {
+                if !bad.iter().any(|(o, _)| *o == m) {
+                    bad.push((m, e));
+                }
+            }
             if bad.is_empty() {
                 clean = true;
                 break;
@@ -954,6 +1015,7 @@ impl<'r> Transaction<'r> {
             self.merge_rebase()?;
         } else if !self.rewritten.is_empty() {
             self.rebase_descendants()?;
+            self.check_embargoed_merges()?;
             self.check_confinement()?;
         }
         if self.staging {
