@@ -740,3 +740,213 @@ fn server_bytes(server: &Api, r: &Reader, id: ObjectId) -> Vec<u8> {
     assert_eq!(g.status, 200);
     g.body
 }
+
+/// The security review of S9, cycle 1 (`docs/BUGS.md`, "S9 cycle 1").
+mod s9_adversarial {
+    use super::*;
+    use veil_core::object::Tree;
+
+    const MIB: usize = 1 << 20;
+
+    fn rss() -> usize {
+        let s = std::fs::read_to_string("/proc/self/status").unwrap();
+        let kib: usize = s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)).unwrap().parse().unwrap();
+        kib << 10
+    }
+
+    /// Tree `id` met at `chain`, as `r` reads it.
+    fn tree(r: &Reader, chain: &[ObjectId], id: &ObjectId) -> Tree {
+        let g = r.get(chain, id);
+        assert_eq!(g.status, 200, "{}", String::from_utf8_lossy(&g.body));
+        match Object::decode(&g.body) {
+            Ok(Object::Tree(t)) => t,
+            _ => panic!("not a tree"),
+        }
+    }
+
+    /// A batch of `wants` under anyone on Earth's grant `r` (no signature),
+    /// its answer left unread: a client that stalls.
+    fn stall(c: &TestCache, r: &Reader, wants: &[(Vec<ObjectId>, ObjectId)]) -> ureq::http::Response<ureq::Body> {
+        let req = BatchRequest {
+            grant: r.grant.clone(),
+            ts: veil_core::now_millis(),
+            signature: None,
+            wants: wants.iter().map(|(chain, id)| ChainWant { chain: chain.clone(), id: *id }).collect(),
+            skip: Vec::new(),
+        };
+        let resp = c.api.post_unread(&format!("/v1/objects/{}:batch", r.project), &serde_json::to_vec(&req).unwrap());
+        assert_eq!(resp.status().as_u16(), 200);
+        resp
+    }
+
+    /// Add `files` (public: under `src/`) to `main` and push.
+    fn land(p: &Project, files: &[(&str, &str)], msg: &str) {
+        write_files(&p.dir, files);
+        p.admin.commit_main(&p.dir, msg);
+        p.admin.ok(&p.dir, &["push"]);
+    }
+
+    /// BUG-1180 (a): a request fetching an object the store will never keep
+    /// (larger than its largest object) still marks it in flight, until its
+    /// client has read the whole answer; every other reader of it waits
+    /// for that fetch (up to 2 s), gains nothing, and asks the server anyway.
+    #[test]
+    #[ignore = "BUG-1180: coalescing waits on fetches that cannot help (objects never kept) and for as long as the fetcher's client takes"]
+    fn bug_1180_readers_wait_on_a_fetch_of_an_object_never_kept() {
+        let hub = TestHub::start();
+        let p = setup_project(&hub);
+        let huge = "h".repeat(17 * MIB);
+        land(&p, &[("src/huge.bin", &huge)], "a file larger than a cache keeps");
+        let server = hub.api();
+        let c = TestCache::start(&hub, &hub.authority(), 1 << 30);
+        let r = Reader::new(&server, &c.api, None, &p.name);
+        let root = r.root();
+        warm(&c, &r, &[], &root);
+        let src = tree(&r, &[], &root).get("src").unwrap().id;
+        let huge_id = tree(&r, &[root], &src).get("huge.bin").unwrap().id;
+        // A reader whose client is slow (here: stalled) fetches it.
+        let slow = stall(&c, &r, &[(vec![root, src], huge_id)]);
+        let joined = c.stat("joined");
+        let t = Instant::now();
+        let g = r.get(&[root, src], &huge_id);
+        let took = t.elapsed();
+        assert_eq!(g.status, 200);
+        assert!(g.body.len() > huge.len());
+        eprintln!("cache: a reader of a 17 MiB object while another's client stalls: {took:?}, joined {}", c.stat("joined") - joined);
+        assert_eq!(c.stat("joined"), joined, "a reader waited {took:?} for a fetch whose object the store never keeps");
+        drop(slow);
+    }
+
+    /// BUG-1180 (b): one batch of anyone on Earth's (100,000 wants are
+    /// allowed; 65,536 objects may be in flight) marks every want after a
+    /// miss in flight, ids nobody has included, and holds them while its
+    /// client does not read: coalescing stops for every project, and every
+    /// reader of a new object asks the server itself.
+    #[test]
+    #[ignore = "BUG-1180: one stalled request fills the cache's in-flight map; coalescing stops for everyone"]
+    fn bug_1180_one_stalled_request_fills_the_in_flight_map() {
+        let hub = TestHub::start();
+        let p = setup_project(&hub);
+        let huge = "h".repeat(17 * MIB);
+        land(&p, &[("src/huge.bin", &huge), ("src/sub/x.txt", "never read through the cache")], "files");
+        let server = hub.api();
+        let c = TestCache::start(&hub, &hub.authority(), 1 << 30);
+        let anyone = Reader::new(&server, &c.api, None, &p.name);
+        let root = anyone.root();
+        warm(&c, &anyone, &[], &root);
+        let src_id = tree(&anyone, &[], &root).get("src").unwrap().id;
+        let src = tree(&anyone, &[root], &src_id);
+        let (sub, huge_id) = (src.get("sub").unwrap().id, src.get("huge.bin").unwrap().id);
+        let x = {
+            let direct = Reader { via: &server, project: anyone.project.clone(), id: None, grant: anyone.grant.clone(), key: anyone.key.clone() };
+            tree(&direct, &[root, src_id], &sub).get("x.txt").unwrap().id
+        };
+        // A tree the store does not hold (so nothing after it is final),
+        // an answer too large to buffer, then 70,000 ids nobody has.
+        let mut wants = vec![(vec![root, src_id, sub], x), (vec![root, src_id], huge_id)];
+        wants.extend((0..70_000).map(|_| (vec![root, random_id()], random_id())));
+        let stalled = stall(&c, &anyone, &wants);
+        // A landing, and every agent reads the new root at once.
+        land(&p, &[("src/new-after-landing.txt", "new")], "a landing");
+        let dev = Reader::new(&server, &c.api, Some(&p.dev), &p.name);
+        warm(&c, &dev, &[], &dev.root());
+        land(&p, &[("src/second-landing.txt", "newer")], "another landing");
+        let dev = Reader::new(&server, &c.api, Some(&p.dev), &p.name);
+        let new_root = dev.root();
+        let want = server_bytes(&server, &dev, new_root);
+        let forwarded = c.stat("forwarded");
+        let n = 24;
+        let barrier = std::sync::Barrier::new(n);
+        std::thread::scope(|s| {
+            for i in 0..n {
+                let (dev, barrier, want) = (&dev, &barrier, &want);
+                s.spawn(move || {
+                    barrier.wait();
+                    if i % 2 == 0 {
+                        assert_eq!(&dev.batch(&[(Vec::new(), new_root)])[0].1, want);
+                    } else {
+                        let g = dev.get(&[], &new_root);
+                        assert_eq!((g.status, &g.body), (200, want));
+                    }
+                });
+            }
+        });
+        let asked = c.stat("forwarded") - forwarded;
+        eprintln!("cache: {n} readers of a new root while one request stalls with 70,000 wants: {asked} requests to the server");
+        assert!(asked <= 3, "{asked} requests to the server for {n} readers of one object: coalescing is off");
+        drop(stalled);
+    }
+
+    /// BUG-1181: `--memory` does not bound the cache's memory. An answer
+    /// takes its share of the budget only while it reads an object from the
+    /// store, and gives it back before the bytes are sent, so a client that
+    /// does not read keeps up to 16 MiB per request (an object served by
+    /// `GET`, a batch's frames) outside the budget; anyone on Earth opens
+    /// as many as they like. (The same for what a forwarded answer keeps:
+    /// `forward_get`'s whole object, a relay's frame, never budgeted.)
+    #[test]
+    #[ignore = "BUG-1181: an answer's object bytes are held after its share of --memory is given back"]
+    fn bug_1181_stalled_clients_hold_memory_outside_the_budget() {
+        let hub = TestHub::start();
+        let p = setup_project(&hub);
+        let big = "b".repeat(15 * MIB);
+        land(&p, &[("src/big.bin", &big)], "a 15 MiB public file");
+        let server = hub.api();
+        // `--memory 64M`: 32 MiB for objects being read, so two of these
+        // at a time.
+        let c = TestCache::start(&hub, &hub.authority(), 1 << 30);
+        let r = Reader::new(&server, &c.api, None, &p.name);
+        let root = r.root();
+        warm(&c, &r, &[], &root);
+        let src = tree(&r, &[], &root).get("src").unwrap().id;
+        let big_id = tree(&r, &[root], &src).get("big.bin").unwrap().id;
+        warm(&c, &r, &[root, src], &big_id);
+        let mut stalled = Vec::new();
+        let (local, before) = (c.stat("local"), rss());
+        for _ in 0..8 {
+            stalled.push(stall(&c, &r, &[(vec![root, src], big_id)]));
+        }
+        let chain = format!("{},{}", root.hex(), src.hex());
+        let path = format!("/v1/objects/{}/{}", p.name, big_id.hex());
+        for _ in 0..8 {
+            stalled.push(c.api.get_unread(&path, &[("veil-grant", &r.grant), ("veil-chain", &chain)]));
+        }
+        std::thread::sleep(Duration::from_secs(2));
+        let (served, grew) = (c.stat("local") - local, rss().saturating_sub(before) / MIB);
+        eprintln!("cache: 16 stalled answers of a 15 MiB object at --memory 64M: {served} read from the store, RSS +{grew} MiB");
+        assert!(served <= 3, "{served} answers of 15 MiB hold their bytes at once, within a 32 MiB budget (RSS +{grew} MiB)");
+        drop(stalled);
+    }
+
+    /// BUG-1182: a batch that names one object twice, first through a tree
+    /// the cache does not hold and then through trees it holds, gets the
+    /// object at its second place; the server sends it at its first (the
+    /// first want its root reaches). The cache plans the id twice (once
+    /// for the server, once from its store) and tells the server to skip it.
+    #[test]
+    #[ignore = "BUG-1182: a batch through the cache is not in the server's order when an id repeats"]
+    fn bug_1182_a_repeated_id_keeps_the_servers_order() {
+        let hub = TestHub::start();
+        let p = setup_project(&hub);
+        land(&p, &[("src/a/same.txt", "the same file twice"), ("src/b/same.txt", "the same file twice"), ("src/b/other.txt", "so b is another tree")], "a copy");
+        let server = hub.api();
+        let c = TestCache::start(&hub, &hub.authority(), 1 << 30);
+        let r = Reader::new(&server, &c.api, None, &p.name);
+        let root = r.root();
+        warm(&c, &r, &[], &root);
+        let src_id = tree(&r, &[], &root).get("src").unwrap().id;
+        let src = tree(&r, &[root], &src_id);
+        let (a, b, lib) = (src.get("a").unwrap().id, src.get("b").unwrap().id, src.get("lib.rs").unwrap().id);
+        assert_ne!(a, b);
+        let same = tree(&r, &[root, src_id], &a).get("same.txt").unwrap().id;
+        warm(&c, &r, &[root, src_id], &lib);
+        warm(&c, &r, &[root, src_id, a], &same);
+        // `b`'s tree was never read through the cache.
+        let wants = vec![(vec![root, src_id, b], same), (vec![root, src_id], lib), (vec![root, src_id, a], same)];
+        let direct = Reader { via: &server, project: r.project.clone(), id: None, grant: r.grant.clone(), key: r.key.clone() };
+        let order = |rd: &Reader| rd.batch(&wants).into_iter().map(|f| f.0).collect::<Vec<_>>();
+        let want = order(&direct);
+        assert_eq!(want, vec![same, lib], "the server: each id at the first want its root reaches");
+        assert_eq!(order(&r), want, "the cache's order");
+    }
+}
