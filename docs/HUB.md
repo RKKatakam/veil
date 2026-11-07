@@ -818,8 +818,9 @@ protocol as pure functions, shared with `vl`; they build for WASM),
 |---|---|---|
 | HTTPS API | tokio, axum, hyper, rustls (ring) | TLS on every connection; `--tls-cert/--tls-key`, or a self-signed certificate (rcgen) for `localhost`/`127.0.0.1` created in the data directory, which `vl login --ca FILE` pins for that server |
 | Metadata | sqlx, PostgreSQL 17 (development, CI) and YugabyteDB 2025.2 | portable SQL only; read-check-write transactions are SERIALIZABLE through `db::serializable`, except where unique keys and row locks decide the races (branch moves, sign-in, project and group creation, group changes: READ COMMITTED, because on YugabyteDB a SERIALIZABLE read blocks every insert into the table it read until it commits, BUG-847); retried with capped exponential backoff on `40001`/`40P01` (YugabyteDB reports conflicts as both) |
-| Migrations | `db::migrate`, `migrations/0001_initial.sql`, `0002_device_vouches.sql` (pending devices, vouches: §13.11), `0003_invites_and_key_sharing.sql` (invites, key requests, pending devices by fingerprint and the fingerprints a person waits for, devices barred from one project: §13.12) | each in its own transaction, recorded in `schema_migrations`; servers starting together race on its primary key and the loser re-checks. On PostgreSQL DDL is transactional; on YugabyteDB DDL inside a transaction block is applied statement by statement unless transactional DDL is enabled, so **migration files are idempotent** (`IF NOT EXISTS`) and a half-applied one is completed by the next start |
+| Migrations | `db::migrate`, `migrations/0001_initial.sql`, `0002_device_vouches.sql` (pending devices, vouches: §13.11), `0003_invites_and_key_sharing.sql` (invites, key requests, pending devices by fingerprint and the fingerprints a person waits for, devices barred from one project: §13.12), `0006_access_epochs.sql` (access epochs and the triggers that bump them: §13.14) | each in its own transaction, recorded in `schema_migrations`; servers starting together race on its primary key and the loser re-checks. On PostgreSQL DDL is transactional; on YugabyteDB DDL inside a transaction block is applied statement by statement unless transactional DDL is enabled, so **migration files are idempotent** (`IF NOT EXISTS`) and a half-applied one is completed by the next start |
 | Object storage | `store::BlobStore`: `FsStore` (a directory; unit tests, development) and `S3Store` (rusty-s3 request signing + reqwest; tested against MinIO) | key `p/<project id>/ab/cdef…`: projects never share an object; every read is re-hashed against its id; an in-memory cache of objects and decoded trees (256 MiB each, decoded trees weighed by the memory they hold: BUG-860). Every S3 request is idempotent (GET, HEAD, PUT of a key naming its content) and is tried again for up to 10 s, with jittered waits doubling from 25 ms to 1 s, when its connection closes or resets or the store answers 5xx; idle connections are dropped after 15 s, before S3 services drop them (BUG-861) |
+| Memory allocator | jemalloc (`tikv-jemallocator`, pinned), the `veil-server` binary's only | two arenas, background purging, 1 s decay (`src/main.rs`; `_RJEM_MALLOC_CONF` overrides them): glibc's arena per thread held 2-3x the server's data (BUG-864; `docs/design/scale/BASELINE.md`, "The server's allocator"). **Building the server needs `make` and a C compiler** (jemalloc is built from source) |
 | Server identity | an Ed25519 `Identity` in `<data>/hub-identity.json` (0600); a random secret in `<data>/hub-receipt-key` (0600) | signs projected snapshots (§13.4); its key is shown by `vl login`. The secret keys upload receipts (§13.5); servers sharing the data directory accept each other's |
 
 **YugabyteDB's licence (checked 2026-11-06).** The `LICENSE.md` shipped in
@@ -911,7 +912,9 @@ quay.io; the tests use the MinIO server binary packaged as
   | force a branch move, delete a branch | admins |
 
 * **Every check is on the server, on every request**; removing someone
-  takes effect on their next request.
+  takes effect on their next request, on every server: servers cache
+  sessions and permissions, but check them against the access epochs on
+  every request (§13.14).
 
 ### 13.4 History for someone without access: projected history (§5.4, §12.1 Q1, decided)
 
@@ -960,7 +963,7 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
 
 | Route | |
 |---|---|
-| `GET /v1/projects/{p}/tips` | branches → tips as the caller sees them (projections) |
+| `GET /v1/projects/{p}/tips` | branches → tips as the caller sees them (projections); the branch rows may be up to 100 ms old (§13.14) |
 | `POST …/history {tips, stop}` | the caller's projected snapshots from `tips` down to `stop`, as object frames (`id ‖ len u32be ‖ object`) |
 | `POST …/fetch {snapshot, objects: [{path, id, snapshot?}]}` | objects by id, each with the path where the client met it under that snapshot (its own `snapshot`, or the request's); the server walks the viewer's projection of that snapshot to that path and serves the object only if it is there. No list of what the client has; each request names an immutable object, so a per-viewer cache can serve it |
 | `POST …/objects` | upload object frames: re-hashed, canonically decoded, format-checked, stored; invisible until a push reaches them. Answers a **receipt** per object (a server MAC over project ‖ person ‖ id) |
@@ -1169,7 +1172,7 @@ can run in parallel).
 1. **S2: secrets at scale** (built, §13.12) — invites, keys per access
    rule, sharing in the background for new members and devices, device
    removal.
-   Person-to-person secret shares (`vl secret share`, §13.14) close
+   Person-to-person secret shares (`vl secret share`, §13.15) close
    phase 1.
 2. **S3: fetch on demand in the client** — the partial-clone design
    (`docs/design/scale/6-partial-clone.md`): bounded cache, objects fetched
@@ -1618,7 +1621,127 @@ Threat review (phase 2 §6, rows 11–13, and what S10 adds):
 | 8 | Another person | `change_id` of someone else's change | rewrites their change | revisions only by the change ref's creator (also in the upsert itself) | `expected_tips_and_revisions_of_a_change` |
 | 9 | Anyone on Earth | calls the route signed out | commits | 401; a participant is required | `an_api_commit_is_refused_…` |
 
-### 13.14 Person-to-person secret shares (phase 1)
+### 13.14 S4: request-path caches and one commit per push (as built)
+
+Milestone S4 (`docs/design/server/phase-2-thin-clients.md` §9,
+`storage-and-cost.md` §3–5, §9). Code: `caches.rs`, `auth.rs` (`Caller`),
+`perm.rs` (`open`), `sync.rs` (`projected`, `resolve`, `tips`, `push`),
+`migrations/0006_access_epochs.sql`.
+
+**What each server keeps in memory** (LRU caches with byte budgets; never
+in the database):
+
+| Cache | Key → value | Kept fresh by |
+|---|---|---|
+| sessions | token hash → person, device, expiry | the person's access epoch, read on every request; the expiry |
+| projects | name → accepted policy, bindings, default branch | the project's access epoch, read on every request |
+| permissions | (project, person, device) → admin, groups, device barred | both epochs |
+| snapshot resolution | (project, id) → committed; (project, view key, real) → projected; (project, view key, projected) → real | nothing: these facts never change (rows are never deleted or rewritten; a view key is a hash of what its viewer may read) |
+| branch tips | project → branch rows | a notice from every push (`NOTIFY`), or at most 100 ms |
+
+**Access epochs: never stale, on any server.** `access_epochs` holds an
+epoch per person (`(0, person)`: their sessions, devices, admin rights,
+group memberships, device bars) and per project (`(project, 0)`: its
+accepted policy, bindings and groups). **Each change sets its key's epoch
+to a fresh random value** (60 bits from `gen_random_uuid()`, never 0 and
+never the previous value), not a count: an epoch carried to a client shows
+neither how many changes happened nor when (BUG-1081). Only equality is
+compared. A bump writes only its own key's row; there is no server-wide
+row. S5's read grants use the same epochs (void unless equal to the
+current ones). **Triggers** on `group_members`,
+`project_admins`, `sessions`, `people`, `devices`, `device_bars`,
+`projects` and `groups` bump them in the transaction of the change itself,
+whatever route (or operator) makes it, so a route written later cannot
+forget. **Every request reads its two epochs** in one statement of two
+primary-key lookups (the session check reads them; it learns the project's
+id from the path), and a cached session or permission is used only if it
+was built under exactly those epochs. An entry is built by reading the
+epochs first and the records after, or both in one statement, so it is
+never tagged with an epoch set after what it holds was read.
+
+*What a read grant can rely on (S5):* (1) an entry records the epochs read
+before its rows, and `perm::open_at` returns them with the view, so a grant
+made from it carries those, never a later read of the epochs; (2) an entry
+is used only while its person's and project's epochs equal its recorded
+ones; (3) permission entries are per device (a bar is the device's);
+(4) nothing else that decides a view (policy text and bindings, groups,
+admin rows, devices, sessions) is cached outside such an entry
+(`a_view_carries_the_epochs_it_was_built_under`).
+
+*How staleness is bounded:* a change commits together with its new epoch;
+any request that starts after the commit reads it, misses every entry
+built under an earlier one (a random value repeats an earlier one with
+negligible odds: 2^-60 for each pair), and reads the database. So a cached decision is the
+one the database gives at the moment of the request: **staleness is zero**,
+for removals from a group, policy changes, deleted groups, admin rights,
+device bars and removals, and ended sessions (there is no sign-out route;
+deleting a session row, as device removal does, is one). A request already
+running when the change commits finishes as it would have without caches.
+Tested with two servers on one database (`server_hub` `caches`): each kind
+of change through either server or straight in the database, and readers
+hammering both servers while an admin removes them (every request started
+after the removal returned was refused). Dropping one trigger makes both
+tests fail.
+
+**Snapshot resolution** answers from memory what never changes; every
+answer is still projected for the asker's current view, so it grants
+nothing. **A resolution is per view:** for a viewer, a projected id
+stands for a real snapshot whose projection *for that viewer's view key*
+is that id (any of them gives that viewer the same tree and history);
+another view's real snapshot for the same id is never used, since the
+same projected id can stand for different real snapshots in different
+views (BUG-915). Without one for the asker's view, the database lists every
+real snapshot the id stands for. A push resolves parents from the database
+(newest first) or from the branch tips it reads.
+
+**Bounded by bytes, and by limits** (BUG-913). Every entry is weighed by
+what it holds (strings, a parsed policy's rules, a view's group set, branch
+rows, plus the cache's own bookkeeping), never counted as one, since its
+size is the asker's to choose. Budgets: sessions 16 MiB, projects 32 MiB,
+permissions 32 MiB, snapshot resolution 64 MiB, branch tips 32 MiB (about
+176 MiB in all); an entry heavier than its cache's budget is not kept.
+Expired tip rows are freed as time passes. Server limits that bound what
+one entry can hold: **10,000 branches per project** and **1,000 branch
+updates per push** (`sync::MAX_BRANCHES`, `MAX_PUSH_UPDATES`), and **1,000
+groups per project** (`perm::MAX_GROUPS`); each is checked against the
+records when the request begins, so concurrent requests may each add up to
+the bound.
+
+**Branch tips.** A pull may see a tip up to **100 ms** old, as
+`phase-2-thin-clients.md` §5.1 allows; rows read before a push's notice are
+never kept after it. A push never trusts the cache: it reads the branches
+and compares and swaps in the database. Notices: PostgreSQL delivers
+`NOTIFY` (another server saw a push within 5–15 ms in the tests);
+**YugabyteDB 2025.2 does not by default** (`ysql_yb_enable_listen_notify`
+is off), which the server detects at start (it sends itself a notice), and
+tips then expire after 100 ms only. Its change feed is not used.
+
+**One database commit per push.** The push's transaction writes the branch
+compare-and-swaps, the accepted policy, the snapshot and origin rows, the
+pusher's projection memo of what it moved (worked out before the
+transaction, as it will read after the commit) and the audit row, and sends
+the notice. A push whose every update is refused commits nothing
+(BUG-910), and a push records only the snapshots of the updates that land
+(BUG-914). Other viewers' projections are worked out when they first ask,
+as before; a reader never gets an unprojected answer. A push reads only the
+signing keys its snapshots name, not every device.
+
+**Cost** (`veil-bench load`, `docs/design/scale/LOAD.md`): a landing's
+push is 1 commit (3 before) and its request path 15 statements (34 before);
+S12's deriver adds about 4 commits and 16 statements in the background. An
+up-to-date pull is 1 statement (6); a request with warm caches 1 statement
+(its epochs). **Gates** in
+`veil-bench load`: at most 1 commit per landing, at most 5 statements per
+up-to-date pull. A pull that brings new snapshots makes one request per
+tree level (7 for the load test's agents), each reading its epochs, so it
+costs about 8 statements: under the hard rule that every request is decided
+on current access, fewer statements per such pull needs fewer requests per
+pull (S3), not a staler check.
+
+`veil-server` writes its counters (storage writes and reads, cache hits and
+misses) to `DATA/stats.json` at start and on `SIGUSR1`, for the benchmarks.
+
+### 13.15 Person-to-person secret shares (phase 1)
 
 **Goal** (owner, 2026-11-06): any member shares **their own** secret with
 any other member, **without an admin**. It is wrapped (HPKE) to that

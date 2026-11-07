@@ -542,8 +542,9 @@ struct Move {
 
 /// The one database commit of a change: its snapshot row, the caller's
 /// projection, the change ref, the audit row and, with `mv`, the branch's
-/// compare-and-swap (and an admin's policy), with the rows of the caller's
-/// changes `restacked` under it. `Ok(Some(moved))` with a move,
+/// compare-and-swap (and an admin's policy) and the notice that drops every
+/// server's tips (`caches`, S4), with the rows of the caller's changes
+/// `restacked` under it. `Ok(Some(moved))` with a move,
 /// `Ok(None)` without; `Err(conflict)` when the tip moved and the change is
 /// not kept.
 async fn commit(
@@ -562,7 +563,9 @@ async fn commit(
     let moved_refs: Vec<(String, String)> = restacked.iter().map(|(n, o, _)| (n.hex(), o.hex())).collect();
     let (real, cid, accept) = (built.real.hex(), plan.change_id.to_string(), built.accept.clone());
     let mv = mv.map(|m| (m.branch, m.cur.hex(), m.keep_on_loss));
-    crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
+    let notify = hub.caches.notices.load(std::sync::atomic::Ordering::SeqCst);
+    let committed: Vec<ObjectId> = restacked.iter().map(|(n, _, _)| *n).chain(std::iter::once(built.real)).collect();
+    let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
         let (real, cid, accept, mv, view_key, snaps, moved_refs) =
             (real.clone(), cid.clone(), accept.clone(), mv.clone(), view_key.clone(), snaps.clone(), moved_refs.clone());
         Box::pin(async move {
@@ -643,10 +646,25 @@ async fn commit(
                 .bind(&what)
                 .execute(&mut *c)
                 .await?;
+            // Delivered at commit, to every server: drop your tips.
+            if notify && moved == Some(true) {
+                sqlx::query("SELECT pg_notify($1, $2)")
+                    .bind(crate::caches::TIPS_CHANNEL)
+                    .bind(pid.to_string())
+                    .execute(&mut *c)
+                    .await?;
+            }
             Ok(moved)
         })
     })
-    .await
+    .await?;
+    for id in &committed {
+        hub.caches.put_committed(pid, id);
+    }
+    if r == Some(true) {
+        hub.caches.tips_changed(pid);
+    }
+    Ok(r)
 }
 
 /// The real tip of `branch`, if it exists.
@@ -675,7 +693,7 @@ async fn resolve_base(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, base: 
     // A projection many hidden-only changes share stands for each of them;
     // the newest few are enough (they differ only in what the caller
     // cannot see).
-    for r in sync::resolve(hub, project.id, &base).await?.into_iter().take(16) {
+    for r in sync::resolve(hub, project.id, &project.view(viewer).key(), &base).await?.into_iter().take(16) {
         if sync::projected(hub, project, viewer, r).await? == base {
             return Ok(r);
         }
@@ -875,9 +893,14 @@ pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, caller: 
                 if cur.is_none() {
                     rejected = Some("the branch was deleted".into());
                 }
-                let mut c = hub.db.acquire().await?;
-                let project = crate::perm::load_project(&mut c, &project.name).await?.ok_or_else(|| Error::not_found("project"))?;
-                let viewer = crate::perm::load_viewer(&mut c, project.id, caller).await?;
+                // The access now: epochs read again, then the caches
+                // checked against them (S4), so a removal, a bar or a
+                // policy change since the request began applies here.
+                let now = crate::auth::Caller {
+                    person: caller.person.clone(),
+                    epochs: crate::caches::read_epochs(&hub.db, caller.person.as_ref().map_or(0, |p| p.id), Some(project.id)).await?,
+                };
+                let (project, viewer) = crate::perm::open(hub, &project.name, &now).await?;
                 if !project.participant(&viewer) {
                     return Err(Error::forbidden("you are not in this project"));
                 }

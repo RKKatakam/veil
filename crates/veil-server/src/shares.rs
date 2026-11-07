@@ -1,4 +1,4 @@
-//! Person-to-person secret shares (`docs/HUB.md` §13.14): a member's copy
+//! Person-to-person secret shares (`docs/HUB.md` §13.15): a member's copy
 //! of one secret file, sealed on their device for another member's
 //! confirmed devices (`veil_core::secret_share`).
 //!
@@ -75,7 +75,7 @@ type Row = (String, String, String, i64, i64, i64, Option<i64>, Option<String>, 
 /// recipient, and only while it is active.
 pub async fn list(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>) -> Result<Json<Vec<ShareInfo>>> {
     let me = caller.signed_in()?.clone();
-    let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
+    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     if !project.participant(&viewer) {
         return Err(Error::forbidden("you are not in this project"));
     }
@@ -146,7 +146,7 @@ async fn stored(db: &sqlx::PgPool, project: i64, path: &str, sharer: i64, recipi
 /// version stored (`expect`).
 pub async fn put(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Json(req): Json<SharePut>) -> Result<Json<ShareInfo>> {
     let me = caller.signed_in()?.clone();
-    let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
+    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     if !project.participant(&viewer) {
         return Err(Error::forbidden("you are not in this project"));
     }
@@ -272,7 +272,7 @@ pub async fn put(State(hub): State<HubState>, caller: Caller, Path(p): Path<Stri
 /// update built before brings it back.
 pub async fn remove(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Json(req): Json<ShareRemove>) -> Result<Json<ShareInfo>> {
     let me = caller.signed_in()?.clone();
-    let (project, _) = perm::open(&hub.db, &p, &caller).await?;
+    let (project, _) = perm::open(&hub, &p, &caller).await?;
     let gone = || Error::not_found(format!("you share no secret '{}' with '{}' here", req.path, req.recipient));
     let recipient = person_id(&hub.db, &req.recipient).await?.ok_or_else(gone)?;
     let now = veil_core::now_millis();

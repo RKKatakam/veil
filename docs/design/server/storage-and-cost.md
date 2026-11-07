@@ -22,9 +22,11 @@ Each of those is also time on the request path. So every item here makes Veil **
 | Landings/s across 100 projects, MinIO | 376 (bound by the object store) | 4,000 (phase 2 gate) |
 | Landings/s into one `main` | about 20 | 100 (phase 2), 1,000 (phase 4, by batching) |
 | Bytes stored and sent | uncompressed | compressed (zstd) |
-| Server memory, 1 GB project push | 2.3 GB peak (BUG-864: allocator arenas) | under 1 GB |
+| Server memory, 1 GB project | push 2.4 GB, clone 2.9 GB peak (BUG-864: allocator arenas; fixed with jemalloc, 2026-11-07: push 0.98 GB, clone 1.58 GB, BUG-1000) | under 1 GB |
 
 ## 3. One database commit per push (S4)
+
+> **Built** (S4, `HUB.md` §13.14): one commit per landing, measured by `veil-bench load`.
 
 - The push's transaction writes **everything at once:** the snapshot rows, the origin and audit rows, and the one-row compare-and-swap that moves the branch.
 - **Per-viewer views are worked out after the commit, in the background** (as S12's deriver already runs after a landing).
@@ -32,6 +34,8 @@ Each of those is also time on the request path. So every item here makes Veil **
 - `LOAD.md` measured about 8 commits per landing, spent on the database's write-ahead log. One commit is close to Git hosting's ref compare-and-swap.
 
 ## 4. Request-path caches (S4)
+
+> **Built** (S4, `HUB.md` §13.14): versioned by access epochs that database triggers bump; every request reads its epochs, so staleness is zero. Tested with two servers on one database.
 
 In each API server's memory, never in the database:
 - **sessions:** sign-in token → person and device;
@@ -45,6 +49,8 @@ In each API server's memory, never in the database:
 - This is tested under load with several servers on one database.
 
 ## 5. "Nothing changed" without a hot row
+
+> **Built** (S4, `HUB.md` §13.14) with `LISTEN`/`NOTIFY` on PostgreSQL. On YugabyteDB 2025.2 with default flags the server finds notices are not delivered and relies on the 100 ms expiry; the change feed is not used.
 
 - Each server keeps each project's **tips in memory**. Every push tells every server to drop its copy.
 - **Not a version counter per project:** one row that every push updates becomes a new hot spot, and database sequences can commit out of order.
@@ -85,6 +91,8 @@ In each API server's memory, never in the database:
 
 ## 9. Cost gates in every benchmark run (S4, then each milestone)
 
+> **Built** (S4): `veil-bench load --mode branches`, the cost columns, and the gates for commits per landing and statements per up-to-date pull. Storage writes are reported, not gated, until S28. **A pull that brings new snapshots** makes one request per tree level, and each request reads its access epochs (the hard rule of §4), so it costs about one statement per request: about 8 for the load test's agents. Meeting 5 for those pulls needs fewer requests per pull (S3), not a weaker check.
+
 `veil-bench load` gains a mode where **many agents push to their own branches in one project**. It reports, per push and per pull:
 - storage writes and reads;
 - database commits and statements;
@@ -107,7 +115,8 @@ Found by the benchmarks of 2026-11-06. Each is a small fix round, not a mileston
 
 | Item | What | Where it's tracked |
 |---|---|---|
-| Server memory arenas | glibc keeps one memory arena per thread (2.3 GB peak; one arena: 840 MB). Use a different allocator, or cap the arenas, in `veil-server`. | BUG-864 |
+| Server memory arenas | Done: glibc kept one memory arena per thread (2.4 GB push peak). `veil-server` now uses jemalloc with two arenas (push 984 MiB; measurements in `BASELINE.md`, "The server's allocator"). | BUG-864 (fixed) |
+| Server memory during a clone | A full clone of the 1 GB profile still adds about 0.7 GB beyond the caches, under every allocator (peak 1.58 GB). Profile the fetch path and bound it. | BUG-1000 |
 | Push checks one snapshot at a time | The 1 GB project's first push takes about 330 s. Check snapshots in parallel, bounded by memory. | BUG-865 |
 | Commit one file | Still 3–4× slower than Git: the scan of every file. Use the stat cache to skip unchanged files (performance round 3); the daemon's file watcher (S7) removes the scan entirely. | `OPENSCION.md` |
 | Clone one folder | About 60 forced disk writes in sequence. Use one durability barrier, as the full clone already does. | `OPENSCION.md` |

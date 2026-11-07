@@ -233,7 +233,7 @@ const MAX_INVITE_MS: i64 = 30 * 24 * 3600 * 1000;
 /// A hint: the device that shares decides from the key rings.
 async fn pending_keys(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>) -> Result<Json<Vec<Devices>>> {
     caller.signed_in()?;
-    let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
+    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     if !project.participant(&viewer) {
         return Err(Error::forbidden("you are not in this project"));
     }
@@ -266,7 +266,7 @@ async fn remove_device(State(hub): State<HubState>, caller: Caller, Json(req): J
     let me = caller.signed_in()?.clone();
     let admin_of = match &req.project {
         Some(p) => {
-            let (project, viewer) = perm::open(&hub.db, p, &caller).await?;
+            let (project, viewer) = perm::open(&hub, p, &caller).await?;
             viewer.admin.then_some(project.id)
         }
         None => None,
@@ -337,7 +337,7 @@ async fn remove_device(State(hub): State<HubState>, caller: Caller, Json(req): J
 /// until when. The invite's secret is never sent (`docs/HUB.md` §13.12).
 async fn create_invite(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Json(req): Json<InviteRequest>) -> Result<Json<InviteRequest>> {
     let me = caller.signed_in()?.id;
-    let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
+    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     require_admin(&viewer)?;
     if !veil_core::keychain::valid_verifying_key(&req.key) || req.key != req.key.to_ascii_lowercase() {
         return Err(Error::bad_request("an invite key is an Ed25519 public key in lowercase hex"));
@@ -543,7 +543,7 @@ async fn create_project(State(hub): State<HubState>, caller: Caller, Path(name):
 }
 
 async fn tips(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>) -> Result<Json<Tips>> {
-    let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
+    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     let branches = sync::tips(&hub, &project, &viewer).await?.into_iter().collect();
     Ok(Json(Tips {
         branches,
@@ -555,7 +555,7 @@ async fn tips(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>
 }
 
 async fn history(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Json(req): Json<HistoryRequest>) -> Result<Response> {
-    let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
+    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     Ok(frames(sync::history(&hub, &project, &viewer, &req.tips, &req.stop).await?))
 }
 
@@ -563,14 +563,14 @@ async fn fetch(State(hub): State<HubState>, caller: Caller, Path(p): Path<String
     if req.objects.len() > MAX_WANTS {
         return Err(Error::bad_request(format!("at most {MAX_WANTS} objects per request")));
     }
-    let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
+    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     let stream = sync::fetch(&hub, &project, &viewer, req.snapshot, req.objects).await?;
     Ok(([(header::CONTENT_TYPE, "application/octet-stream")], axum::body::Body::new(stream)).into_response())
 }
 
 async fn objects(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, body: Bytes) -> Result<Json<veil_core::hub::wire::Uploaded>> {
     let me = caller.signed_in()?.id;
-    let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
+    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     if !project.participant(&viewer) {
         return Err(Error::forbidden("you are not in this project"));
     }
@@ -583,7 +583,7 @@ async fn objects(State(hub): State<HubState>, caller: Caller, Path(p): Path<Stri
 
 async fn push(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Json(req): Json<PushRequest>) -> Result<Json<PushResult>> {
     let me = caller.signed_in()?.id;
-    let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
+    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     Ok(Json(sync::push(&hub, &project, &viewer, me, req).await?))
 }
 
@@ -595,7 +595,7 @@ async fn changes(
     Json(req): Json<veil_core::hub::changes::ChangeRequest>,
 ) -> Result<Json<veil_core::hub::changes::ChangeResult>> {
     caller.signed_in()?;
-    let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
+    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     Ok(Json(crate::changes::create(&hub, &project, &viewer, &caller, req).await?))
 }
 
@@ -616,7 +616,7 @@ async fn names_of(c: &mut PgConnection, table: &str, id: i64) -> Result<Vec<Stri
 /// Who may see `path`, and which rule decides. Only a participant who may
 /// read the path gets an answer.
 async fn access(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Query(q): Query<PathQuery>) -> Result<Json<AccessInfo>> {
-    let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
+    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     let path = q.path.trim_matches('/').to_string();
     let view = project.view(&viewer);
     // Who has access names groups and people: for the project's own
@@ -669,7 +669,7 @@ async fn group_info(c: &mut PgConnection, project: i64, name: &str) -> Result<Gr
 
 async fn list_groups(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>) -> Result<Json<Vec<GroupInfo>>> {
     let me = caller.signed_in()?.id;
-    let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
+    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     let mut c = hub.db.acquire().await?;
     let names: Vec<String> = sqlx::query_scalar("SELECT name FROM groups WHERE project_id = $1 ORDER BY name")
         .bind(project.id)
@@ -698,7 +698,7 @@ fn require_admin(viewer: &Viewer) -> Result<()> {
 
 async fn create_group(State(hub): State<HubState>, caller: Caller, Path((p, g)): Path<(String, String)>) -> Result<Json<GroupInfo>> {
     let me = caller.signed_in()?.id;
-    let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
+    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     require_admin(&viewer)?;
     if !valid_principal_name(&g) {
         return Err(Error::bad_request("a group name is 1 to 64 lowercase letters, digits, '-', '_' or '.', and not a tier word"));
@@ -712,6 +712,11 @@ async fn create_group(State(hub): State<HubState>, caller: Caller, Path((p, g)):
     let info = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
         let g = g2.clone();
         Box::pin(async move {
+            // Bounded (concurrent creations may each add up to the bound).
+            let n: i64 = sqlx::query_scalar("SELECT count(*) FROM groups WHERE project_id = $1").bind(pid).fetch_one(&mut *c).await?;
+            if n >= perm::MAX_GROUPS {
+                return Err(Error::bad_request(format!("a project has at most {} groups", perm::MAX_GROUPS)));
+            }
             // A plain insert, the unique key refusing a second group.
             let r = sqlx::query("INSERT INTO groups (project_id, name) VALUES ($1, $2)").bind(pid).bind(&g).execute(&mut *c).await;
             if let Err(sqlx::Error::Database(d)) = &r {
@@ -745,7 +750,7 @@ async fn create_group(State(hub): State<HubState>, caller: Caller, Path((p, g)):
 
 async fn delete_group(State(hub): State<HubState>, caller: Caller, Path((p, g)): Path<(String, String)>) -> Result<Json<GroupInfo>> {
     let me = caller.signed_in()?.id;
-    let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
+    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     require_admin(&viewer)?;
     let pid = project.id;
     let g2 = g.clone();
@@ -791,7 +796,7 @@ enum Op {
 /// a manager never adds themselves (an admin does). Managers: admins.
 async fn change_group(hub: HubState, caller: Caller, p: String, g: String, op: Op, req: GroupChange) -> Result<Json<GroupInfo>> {
     let me = caller.signed_in()?.id;
-    let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
+    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     let pid = project.id;
     let admin = viewer.admin;
     let (g2, people) = (g.clone(), req.people.clone());
@@ -878,7 +883,7 @@ async fn add_managers(State(hub): State<HubState>, caller: Caller, Path((p, g)):
 /// by every reader; the server only keeps the longest log that verifies.
 async fn get_rings(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>) -> Result<Json<Vec<serde_json::Value>>> {
     caller.signed_in()?;
-    let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
+    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     if !project.participant(&viewer) {
         return Err(Error::forbidden("you are not in this project"));
     }
@@ -891,7 +896,7 @@ async fn get_rings(State(hub): State<HubState>, caller: Caller, Path(p): Path<St
 
 async fn get_ring(State(hub): State<HubState>, caller: Caller, Path((p, scope)): Path<(String, String)>) -> Result<Json<serde_json::Value>> {
     caller.signed_in()?;
-    let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
+    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     if !project.participant(&viewer) {
         return Err(Error::forbidden("you are not in this project"));
     }
@@ -910,7 +915,7 @@ async fn post_ring(
     Json(ring): Json<KeyRing>,
 ) -> Result<Json<serde_json::Value>> {
     caller.signed_in()?;
-    let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
+    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     if !project.participant(&viewer) {
         return Err(Error::forbidden("you are not in this project"));
     }

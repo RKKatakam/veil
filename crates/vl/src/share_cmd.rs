@@ -1,4 +1,4 @@
-//! Person-to-person secret shares (`docs/HUB.md` §13.14): `vl secret share
+//! Person-to-person secret shares (`docs/HUB.md` §13.15): `vl secret share
 //! PATH --with PERSON`, `vl secret unshare PATH --from PERSON`, `vl secret
 //! shares`, and the background pass that keeps them up to date.
 //!
@@ -50,7 +50,7 @@ use crate::{
 pub const SHARE_SCHEMA: &str = "veil.secret.share/1";
 pub const SHARES_SCHEMA: &str = "veil.secret.shares/1";
 
-/// Device-local memory of this clone's shares (`docs/HUB.md` §13.14): what
+/// Device-local memory of this clone's shares (`docs/HUB.md` §13.15): what
 /// it received (the last version written here of each (sharer, path), and
 /// the newest genuine version seen, written or not), and **the shares this
 /// clone made**, which are the only ones its background pass touches

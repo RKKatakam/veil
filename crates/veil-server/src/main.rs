@@ -6,6 +6,10 @@
 //!             [--tls-cert cert.pem --tls-key key.pem]   (default: self-signed)
 //! veil-server migrate --database-url postgres://…   (apply migrations, then exit)
 //! ```
+//!
+//! On `SIGUSR1` the server writes its request-path counters (storage
+//! writes and reads, cache hits and misses) to `DATA/stats.json`, for the
+//! benchmarks' cost gates (`docs/design/server/storage-and-cost.md` §9).
 
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
@@ -69,6 +73,21 @@ fn database_url(given: Option<String>) -> anyhow::Result<String> {
     }
 }
 
+/// jemalloc, not glibc's malloc (BUG-864): glibc gives each of the
+/// server's threads (32 workers, up to 512 blocking) its own arena and
+/// returns little of it, so a 1 GB push left the server at 2.4 GB for under
+/// 1 GB of data. Two arenas (each thread keeps a small cache in
+/// front of them) and background threads returning memory unused for a
+/// second keep it near what it holds (`docs/design/scale/BASELINE.md`,
+/// "The server's allocator"). `_RJEM_MALLOC_CONF` overrides these settings.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// jemalloc reads its settings from this symbol at start (a C string).
+#[used]
+#[export_name = "_rjem_malloc_conf"]
+static MALLOC_CONF: &[u8; 70] = b"narenas:2,background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
+
 fn main() -> anyhow::Result<()> {
     // Deep trees recurse on every server thread (BUG-1052).
     tokio::runtime::Builder::new_multi_thread()
@@ -116,7 +135,44 @@ async fn serve() -> anyhow::Result<()> {
     if matches!(running.cert_pem.as_str(), s if !s.is_empty()) {
         println!("certificate: {}", data.join("self-signed-cert.pem").display());
     }
-    tokio::signal::ctrl_c().await?;
+    let hub = running.hub.clone();
+    let mut usr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
+    let mut n = 0u64;
+    // Written once at start: it says this server answers SIGUSR1.
+    let _ = std::fs::write(data.join("stats.json"), serde_json::to_vec(&stats(&hub, 0))?);
+    loop {
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => { r?; break; }
+            _ = usr1.recv() => {
+                n += 1;
+                let path = data.join("stats.json");
+                let tmp = data.join("stats.json.tmp");
+                let written = std::fs::write(&tmp, serde_json::to_vec(&stats(&hub, n))?).and_then(|_| std::fs::rename(&tmp, &path));
+                if let Err(e) = written {
+                    eprintln!("veil-server: writing {}: {e}", path.display());
+                }
+            }
+        }
+    }
     running.stop().await;
     Ok(())
+}
+
+/// The counters `SIGUSR1` writes (`n` counts the signals).
+fn stats(hub: &veil_server::Hub, n: u64) -> serde_json::Value {
+    use std::sync::atomic::Ordering::Relaxed;
+    let c = &hub.caches.stats;
+    serde_json::json!({
+        "n": n,
+        "storage_writes": hub.objects.writes.load(Relaxed),
+        "storage_written_bytes": hub.objects.written_bytes.load(Relaxed),
+        "storage_reads": hub.objects.reads.load(Relaxed),
+        "session_hits": c.session_hits.load(Relaxed),
+        "session_misses": c.session_misses.load(Relaxed),
+        "permission_hits": c.permission_hits.load(Relaxed),
+        "permission_misses": c.permission_misses.load(Relaxed),
+        "tips_hits": c.tips_hits.load(Relaxed),
+        "tips_misses": c.tips_misses.load(Relaxed),
+        "notices": hub.caches.notices.load(Relaxed),
+    })
 }

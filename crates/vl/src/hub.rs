@@ -660,7 +660,7 @@ impl Client {
     }
 
     /// The secret shares this person makes or receives here (admins: every
-    /// share of the project), `docs/HUB.md` §13.14.
+    /// share of the project), `docs/HUB.md` §13.15.
     pub fn shares(&self) -> Result<Vec<veil_core::secret_share::ShareInfo>> {
         self.json("GET", &self.url.project_path("/shares"), None::<&()>)
     }

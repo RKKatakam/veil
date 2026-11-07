@@ -35,7 +35,10 @@ use veil_core::{
     identity::verify_signature,
 };
 
+use std::sync::atomic::Ordering;
+
 use crate::{
+    caches::Epochs,
     error::{Error, Result},
     HubState,
 };
@@ -73,6 +76,9 @@ fn pending(name: &str) -> Error {
 #[derive(Clone, Debug)]
 pub struct Caller {
     pub person: Option<Person>,
+    /// The access epochs this request read: cached permissions are used
+    /// only if they were built under exactly these (`caches`).
+    pub epochs: Epochs,
 }
 
 #[derive(Clone, Debug)]
@@ -315,27 +321,74 @@ async fn prune_pending(db: &sqlx::PgPool, name: &str) {
 impl FromRequestParts<HubState> for Caller {
     type Rejection = Error;
 
+    /// The session, checked on every request against the person's access
+    /// epoch, which is read in the same statement as the project's (when the
+    /// path names a project this server knows): a session ended or a device
+    /// removed on any server is refused here (`caches`).
     async fn from_request_parts(parts: &mut Parts, hub: &HubState) -> Result<Caller> {
+        let project = match axum::extract::RawPathParams::from_request_parts(parts, hub).await {
+            Ok(params) => params.iter().find(|(k, _)| *k == "p").and_then(|(_, v)| hub.caches.project(v)).map(|e| e.project.id),
+            Err(_) => None,
+        };
         let Some(auth) = parts.headers.get("authorization") else {
-            return Ok(Caller { person: None });
+            let epochs = match project {
+                Some(p) => crate::caches::read_epochs(&hub.db, 0, Some(p)).await?,
+                None => Epochs::default(),
+            };
+            return Ok(Caller { person: None, epochs });
         };
         let token = auth
             .to_str()
             .ok()
             .and_then(|a| a.strip_prefix("Bearer "))
             .ok_or_else(|| Error::unauthorized("expected a bearer token"))?;
-        let row: Option<(i64, String, String)> = sqlx::query_as(
-            "SELECT p.id, p.name, d.signing_key FROM sessions s JOIN devices d ON d.id = s.device_id JOIN people p ON p.id = s.person_id \
+        let hash = token_hash(token);
+        let now = veil_core::now_millis();
+        let stats = &hub.caches.stats;
+        if let Some(e) = hub.caches.session(&hash).filter(|e| e.expires_at > now) {
+            let epochs = crate::caches::read_epochs(&hub.db, e.person.id, project).await?;
+            if epochs.person == e.epoch {
+                stats.session_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(Caller {
+                    person: Some(e.person.clone()),
+                    epochs,
+                });
+            }
+        }
+        stats.session_misses.fetch_add(1, Ordering::Relaxed);
+        // The session and the person's epoch in one statement: the entry is
+        // never tagged with an epoch newer than what it was read with.
+        let row: Option<(i64, String, String, i64, i64, i64)> = sqlx::query_as(
+            "SELECT p.id, p.name, d.signing_key, s.expires_at, \
+             COALESCE((SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = p.id), 0), \
+             COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $3 AND person_id = 0), 0) \
+             FROM sessions s JOIN devices d ON d.id = s.device_id JOIN people p ON p.id = s.person_id \
              WHERE s.token_hash = $1 AND s.expires_at > $2 AND d.removed_at IS NULL AND NOT d.pending",
         )
-        .bind(token_hash(token))
-        .bind(veil_core::now_millis())
+        .bind(&hash)
+        .bind(now)
+        .bind(project.unwrap_or(-1))
         .fetch_optional(&hub.db)
         .await?;
         match row {
-            Some((id, name, device_key)) => Ok(Caller {
-                person: Some(Person { id, name, device_key }),
-            }),
+            Some((id, name, device_key, expires_at, person_epoch, project_epoch)) => {
+                let person = Person { id, name, device_key };
+                hub.caches.put_session(
+                    &hash,
+                    crate::caches::SessionEntry {
+                        person: person.clone(),
+                        expires_at,
+                        epoch: person_epoch,
+                    },
+                );
+                Ok(Caller {
+                    person: Some(person),
+                    epochs: Epochs {
+                        person: person_epoch,
+                        project: project.map(|p| (p, project_epoch)),
+                    },
+                })
+            }
             // Never downgraded to anonymous: the client signs in again.
             None => Err(Error::unauthorized("session expired or unknown; sign in again")),
         }

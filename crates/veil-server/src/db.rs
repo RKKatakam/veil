@@ -40,6 +40,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (3, "invites_and_key_sharing", include_str!("../migrations/0003_invites_and_key_sharing.sql")),
     (4, "derived", include_str!("../migrations/0004_derived.sql")),
     (5, "change_refs", include_str!("../migrations/0005_change_refs.sql")),
+    (6, "access_epochs", include_str!("../migrations/0006_access_epochs.sql")),
     (9, "secret_shares", include_str!("../migrations/0009_secret_shares.sql")),
 ];
 

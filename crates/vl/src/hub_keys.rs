@@ -1133,7 +1133,7 @@ pub fn run_pass(ctx: &mut Ctx, client: &Client) -> Result<()> {
     for (label, person, what) in keys.as_ref().map(Vec::as_slice).unwrap_or_default() {
         println!("  {} the secret key of {} {what} {}", dim("keys:"), safe(label), safe(person));
     }
-    // Person-to-person secret shares (docs/HUB.md §13.14), whatever the
+    // Person-to-person secret shares (docs/HUB.md §13.15), whatever the
     // key pass did.
     for line in crate::share_cmd::pass(ctx, client)? {
         println!("  {} {}", dim("shares:"), safe(&line));

@@ -47,6 +47,10 @@ async-trait = "0.1"
 bytes = "1"
 # FsStore writes each object to a temporary file before renaming it.
 tempfile.workspace = true
+# The global allocator (BUG-864): glibc keeps an arena per thread and
+# returns little of it, so the server held 2-3x its data. jemalloc with two
+# arenas and background purging (settings in src/main.rs) measured best.
+tikv-jemallocator = "=0.7.0"
 
 [features]
 # Tests that need Docker (PostgreSQL, YugabyteDB, MinIO): run by
