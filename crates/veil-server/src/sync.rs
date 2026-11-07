@@ -67,10 +67,17 @@ pub struct Source {
     pub hub: Arc<Hub>,
     pub project: i64,
     pub rt: Handle,
+    /// Objects read before the store: what an API commit made and has not
+    /// stored yet (stored only once every check passed, so a refused
+    /// plain-text secret is never stored; `changes`).
+    pub pending: HashMap<ObjectId, Bytes>,
 }
 
 impl Source {
     pub fn raw(&self, id: &ObjectId) -> veil_core::Result<Bytes> {
+        if let Some(raw) = self.pending.get(id) {
+            return Ok(raw.clone());
+        }
         // Every history starts at the universal root and its empty tree.
         let empty = Object::Tree(Tree::default()).encode();
         if *id == ObjectId::hash(&empty) {
@@ -118,10 +125,21 @@ impl TreeSource for Source {
 
 /// Run `f` with a [`Source`] on a blocking thread.
 pub async fn blocking<T: Send + 'static>(hub: &Arc<Hub>, project: i64, f: impl FnOnce(&Source) -> Result<T> + Send + 'static) -> Result<T> {
+    blocking_with(hub, project, HashMap::new(), f).await
+}
+
+/// [`blocking`], with objects `pending` read before the store.
+pub async fn blocking_with<T: Send + 'static>(
+    hub: &Arc<Hub>,
+    project: i64,
+    pending: HashMap<ObjectId, Bytes>,
+    f: impl FnOnce(&Source) -> Result<T> + Send + 'static,
+) -> Result<T> {
     let src = Source {
         hub: hub.clone(),
         project,
         rt: Handle::current(),
+        pending,
     };
     tokio::task::spawn_blocking(move || f(&src)).await.map_err(|e| Error::Other(e.into()))?
 }
@@ -457,7 +475,7 @@ fn personal_key(path: &str) -> bool {
 }
 
 /// The text of the `.veilpolicy` at the root of real tree `tree`.
-fn policy_text(src: &Source, tree: &ObjectId) -> Result<String> {
+pub(crate) fn policy_text(src: &Source, tree: &ObjectId) -> Result<String> {
     let Node::Tree(t, _) = src.node(tree)? else {
         return Ok(String::new());
     };
@@ -471,7 +489,7 @@ fn policy_text(src: &Source, tree: &ObjectId) -> Result<String> {
 }
 
 /// The entry at `path` in real tree `tree`.
-fn entry_at(src: &Source, tree: &ObjectId, path: &str) -> Result<Option<veil_core::TreeEntry>> {
+pub(crate) fn entry_at(src: &Source, tree: &ObjectId, path: &str) -> Result<Option<veil_core::TreeEntry>> {
     let mut cur = *tree;
     let parts: Vec<&str> = path.split('/').collect();
     for (i, part) in parts.iter().enumerate() {
@@ -529,9 +547,18 @@ fn common_ancestor(src: &Source, a: ObjectId, b: ObjectId) -> Result<ObjectId> {
 }
 
 /// Check the paths one snapshot changes: write access, personal keys,
-/// secrets sealed, nothing local-only (`docs/HUB.md` §4.5, checks 2 and 8).
-/// `parents` are the snapshot's real parents.
-fn check_changes(src: &Source, view: &View, changes: &[Change], real_tree: &ObjectId, parents: &[ObjectId]) -> Result<()> {
+/// secrets sealed, nothing local-only, no secret in a plain-text file
+/// (`docs/HUB.md` §4.5, checks 2, 8 and 9). `parents` are the snapshot's
+/// real parents; `accepted` is the project's accepted `.veilpolicy`.
+fn check_changes(
+    src: &Source,
+    view: &View,
+    changes: &[Change],
+    real_tree: &ObjectId,
+    parents: &[ObjectId],
+    accepted: &Policy,
+    admin: bool,
+) -> Result<()> {
     let text = policy_text(src, real_tree)?;
     let policy = Policy::parse(&text);
     // A merge's other parents: their trees, and the tree of a common
@@ -578,8 +605,10 @@ fn check_changes(src: &Source, view: &View, changes: &[Change], real_tree: &Obje
             continue;
         }
         let vp = VPath::new(&c.path).map_err(|_| Error::bad_request(format!("invalid path '{}'", c.path)))?;
-        let sealed = Object::sealed_scope(&src.raw(&e.id)?).is_some();
-        match policy.classify(&vp, false).tier {
+        let raw = src.raw(&e.id)?;
+        let sealed = Object::sealed_scope(&raw).is_some();
+        let class = policy.classify(&vp, false);
+        match class.tier {
             Tier::Isolated | Tier::Ignored => {
                 return Err(Error::forbidden(format!(
                     "'{}' stays on the device by the project's policy (a secret or ignored file)",
@@ -595,16 +624,121 @@ fn check_changes(src: &Source, view: &View, changes: &[Change], real_tree: &Obje
         if sealed != matches!(e.visibility, Visibility::Cloaked { .. }) {
             return Err(Error::bad_request(format!("'{}': the entry's label does not match its object", c.path)));
         }
+        // Check 9: the secret scan of every new plain-text file, as `vl`
+        // scans before it records one. `public!` turns it off only where
+        // the accepted policy (an admin's) says so, or an admin's own
+        // change does: anyone may turn `public` into `public!`, which is
+        // the same access. Findings name the rule and line, never the text.
+        let unscanned = class.allow_secrets && (admin || accepted.classify(&vp, false).allow_secrets);
+        if !sealed && !unscanned {
+            if let Object::Blob(data) = Object::decode(&raw)? {
+                if let Some(f) = veil_core::secrets::scan(&data).first() {
+                    return Err(Error::forbidden(format!(
+                        "'{}' looks like it holds a secret ({}, line {}): put secrets in a secret file such as .env, \
+                         which Veil encrypts",
+                        c.path, f.rule, f.line
+                    )));
+                }
+            }
+        }
     }
     Ok(())
 }
 
+/// Complete and check new snapshot `n` on its real parents `rp`, for
+/// `viewer` (`docs/HUB.md` §4.5): the graft of its tree onto the full
+/// tree, a merge that changes nothing the viewer cannot see, closure
+/// (every object a changed path names was `uploaded` or is the entry at
+/// that path in a parent), checks 2, 8 and 9 ([`check_changes`]) and access
+/// lines changed only by admins. Pushes and commits through the API
+/// (`changes`) both run it. `p` carries the accepted policy.
+pub(crate) fn complete(
+    src: &Source,
+    p: &Project,
+    viewer: &Viewer,
+    uploaded: &HashSet<ObjectId>,
+    n: &Snapshot,
+    rp: &[ObjectId],
+    identity: &veil_core::Identity,
+) -> Result<Completed> {
+    let admin = viewer.admin;
+    let view = p.view(viewer);
+    let ptrees: Vec<ObjectId> = rp.iter().map(|p| Ok(src.snapshot(p)?.tree)).collect::<Result<_>>()?;
+    let mut g = Graft::new(src, &view).proving(uploaded, ptrees.clone());
+    let real_tree = g.root(n.tree, Some(ptrees[0]))?;
+    // A merge must not change what the pusher cannot see.
+    for other in &ptrees[1..] {
+        let mut g2 = Graft::new(src, &view).proving(uploaded, ptrees.clone());
+        if g2.root(n.tree, Some(*other))? != real_tree && !admin {
+            // Compare the hidden parts: the same full tree from either side.
+            return Err(Error::forbidden(
+                "this merge combines changes in folders you cannot see; ask someone with access to merge it",
+            ));
+        }
+    }
+    let mut trees: Vec<(ObjectId, Vec<u8>)> = g.created.drain().collect();
+    trees.sort();
+    // Store the trees the graft built before checking (the check reads them).
+    for (id, raw) in &trees {
+        src.rt.block_on(src.hub.objects.put(src.project, id, Bytes::from(raw.clone())))?;
+    }
+    // Every object a changed path names (its object, fallback and
+    // conflict terms) was uploaded by the pusher, or is named by the
+    // entry at that path in a parent: anything else gets the answer
+    // a missing object gets, stored or not (BUG-824, BUG-834).
+    for c in &g.changes {
+        let Some(e) = &c.new else { continue };
+        let mut before = HashSet::new();
+        for t in &ptrees {
+            if let Some(pe) = entry_at(src, t, &c.path)? {
+                before.extend(named_ids(src, &pe)?);
+            }
+        }
+        let known = |id: &ObjectId| uploaded.contains(id) || before.contains(id);
+        if !known(&e.id) {
+            return Err(VeilError::Missing(e.id).into());
+        }
+        if let Some(id) = named_ids(src, e)?.into_iter().find(|id| !known(id)) {
+            return Err(VeilError::Missing(id).into());
+        }
+    }
+    check_changes(src, &view, &g.changes, &real_tree, rp, &Policy::parse(&p.policy_text), admin)?;
+    // Access lines: only admins change them.
+    let mine = AccessPolicy::parse(&policy_text(src, &real_tree)?);
+    let mut unchanged = false;
+    for t in &ptrees {
+        if AccessPolicy::parse(&policy_text(src, t)?).same_rules(&mine) {
+            unchanged = true;
+        }
+    }
+    if !unchanged && !admin {
+        return Err(Error::forbidden("only admins may change access lines in .veilpolicy"));
+    }
+    let mut real = n.clone();
+    real.tree = real_tree;
+    real.parents = rp.to_vec();
+    if real == *n {
+        return Ok(Completed {
+            real: ObjectId::hash(&Object::Snapshot(real).encode()),
+            raw: None,
+            origin: None,
+        });
+    }
+    real.sign(identity);
+    let raw = Object::Snapshot(real).encode();
+    Ok(Completed {
+        real: ObjectId::hash(&raw),
+        raw: Some(Bytes::from(raw)),
+        origin: None,
+    })
+}
+
 /// One new snapshot, completed.
-struct Completed {
-    real: ObjectId,
-    raw: Option<Bytes>,
+pub(crate) struct Completed {
+    pub real: ObjectId,
+    pub raw: Option<Bytes>,
     /// The pusher's own snapshot, when the server completed it.
-    origin: Option<ObjectId>,
+    pub origin: Option<ObjectId>,
 }
 
 /// Handle a push (`docs/HUB.md` §4.5): complete and check every new
@@ -721,8 +855,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             return Err(Error::bad_request("a snapshot without parents (only the root has none)"));
         }
         let real_parents: Vec<ObjectId> = n.parents.iter().map(|p| real_of[p]).collect();
-        let (policy_text_acc, bindings, viewer2, n2, admin) =
-            (project.policy_text.clone(), project.bindings.clone(), viewer.clone(), n.clone(), viewer.admin);
+        let (policy_text_acc, bindings, viewer2, n2) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone(), n.clone());
         let hub2 = hub.clone();
         let rp = real_parents.clone();
         let uploaded = uploaded.clone();
@@ -732,78 +865,10 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
                 name: String::new(),
                 default_branch: String::new(),
                 policy: AccessPolicy::parse(&policy_text_acc),
-                policy_text: String::new(),
+                policy_text: policy_text_acc,
                 bindings,
             };
-            let view = p.view(&viewer2);
-            let ptrees: Vec<ObjectId> = rp.iter().map(|p| Ok(src.snapshot(p)?.tree)).collect::<Result<_>>()?;
-            let mut g = Graft::new(src, &view).proving(&uploaded, ptrees.clone());
-            let real_tree = g.root(n2.tree, Some(ptrees[0]))?;
-            // A merge must not change what the pusher cannot see.
-            for other in &ptrees[1..] {
-                let mut g2 = Graft::new(src, &view).proving(&uploaded, ptrees.clone());
-                if g2.root(n2.tree, Some(*other))? != real_tree && !admin {
-                    // Compare the hidden parts: the same full tree from either side.
-                    return Err(Error::forbidden(
-                        "this merge combines changes in folders you cannot see; ask someone with access to merge it",
-                    ));
-                }
-            }
-            let mut trees: Vec<(ObjectId, Vec<u8>)> = g.created.drain().collect();
-            trees.sort();
-            // Store the trees the graft built before checking (the check reads them).
-            for (id, raw) in &trees {
-                src.rt.block_on(src.hub.objects.put(src.project, id, Bytes::from(raw.clone())))?;
-            }
-            // Every object a changed path names (its object, fallback and
-            // conflict terms) was uploaded by the pusher, or is named by the
-            // entry at that path in a parent: anything else gets the answer
-            // a missing object gets, stored or not (BUG-824, BUG-834).
-            for c in &g.changes {
-                let Some(e) = &c.new else { continue };
-                let mut before = HashSet::new();
-                for t in &ptrees {
-                    if let Some(pe) = entry_at(src, t, &c.path)? {
-                        before.extend(named_ids(src, &pe)?);
-                    }
-                }
-                let known = |id: &ObjectId| uploaded.contains(id) || before.contains(id);
-                if !known(&e.id) {
-                    return Err(VeilError::Missing(e.id).into());
-                }
-                if let Some(id) = named_ids(src, e)?.into_iter().find(|id| !known(id)) {
-                    return Err(VeilError::Missing(id).into());
-                }
-            }
-            check_changes(src, &view, &g.changes, &real_tree, &rp)?;
-            // Access lines: only admins change them.
-            let mine = AccessPolicy::parse(&policy_text(src, &real_tree)?);
-            let mut unchanged = false;
-            for t in &ptrees {
-                if AccessPolicy::parse(&policy_text(src, t)?).same_rules(&mine) {
-                    unchanged = true;
-                }
-            }
-            if !unchanged && !admin {
-                return Err(Error::forbidden("only admins may change access lines in .veilpolicy"));
-            }
-            let mut real = (*n2).clone();
-            real.tree = real_tree;
-            real.parents = rp.clone();
-            if real == *n2 {
-                return Ok(Completed {
-                    real: ObjectId::hash(&Object::Snapshot(real).encode()),
-                    raw: None,
-                    origin: None,
-                });
-            }
-            real.sign(&hub2.identity);
-            let raw = Object::Snapshot(real).encode();
-            Ok(Completed {
-                real: ObjectId::hash(&raw),
-                raw: Some(Bytes::from(raw)),
-                origin: None,
-            })
+            complete(src, &p, &viewer2, &uploaded, &n2, &rp, &hub2.identity)
         })
         .await?;
         let c = Completed {
@@ -914,14 +979,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
                     return Err(Error::conflict(format!("branch '{branch}' moved during the push; pull, then push again")));
                 }
                 if let Some(text) = accept {
-                    let policy = AccessPolicy::parse(&text);
-                    let bindings = crate::perm::bind_names(&mut *c, pid, &policy).await?;
-                    sqlx::query("UPDATE projects SET policy_text = $1, policy_bindings = $2, policy_version = policy_version + 1 WHERE id = $3")
-                        .bind(&text)
-                        .bind(serde_json::to_string(&bindings).map_err(|e| Error::Other(e.into()))?)
-                        .bind(pid)
-                        .execute(&mut *c)
-                        .await?;
+                    crate::perm::accept_policy(&mut *c, pid, &text).await?;
                 }
                 moved.push(branch);
             }
@@ -951,26 +1009,10 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
     let project = crate::perm::load_project(&mut *hub.db.acquire().await?, &project.name)
         .await?
         .ok_or_else(|| Error::not_found("project"))?;
-    let mut warnings = Vec::new();
-    if accepted {
-        // Never silently: say who can now see what.
-        for r in &project.policy.rules {
-            let mut who: Vec<String> = Vec::new();
-            if r.public {
-                who.push("everyone on Earth (public, read)".into());
-            }
-            for n in &r.names {
-                who.push(match project.bindings.get(n) {
-                    Some(crate::perm::Binding::Group(_)) => format!("group {n}"),
-                    _ => format!("person {n}"),
-                });
-            }
-            warnings.push(format!("access accepted: {}/ → {}", r.path, who.join(", ")));
-        }
-        for w in &project.policy.warnings {
-            warnings.push(w.clone());
-        }
-    }
+    let warnings = match accepted {
+        true => crate::perm::accepted_listing(&project),
+        false => Vec::new(),
+    };
     for (branch, _, new, _) in plans {
         let tip = match new {
             Some(n) => Some(projected(hub, &project, viewer, n).await?),
@@ -982,7 +1024,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
 }
 
 /// Is `a` an ancestor of (or equal to) `b` in the real history?
-async fn is_ancestor(hub: &Arc<Hub>, project: i64, a: ObjectId, b: ObjectId) -> Result<bool> {
+pub(crate) async fn is_ancestor(hub: &Arc<Hub>, project: i64, a: ObjectId, b: ObjectId) -> Result<bool> {
     blocking(hub, project, move |src| {
         let mut seen = HashSet::new();
         let mut stack = vec![b];
@@ -1012,7 +1054,7 @@ pub fn receipt(hub: &Hub, project: i64, person: i64, id: &ObjectId) -> String {
 
 /// The objects whose receipts in `receipts` are `person`'s (compared in
 /// constant time).
-fn receipted(hub: &Hub, project: i64, person: i64, receipts: &std::collections::BTreeMap<ObjectId, String>) -> HashSet<ObjectId> {
+pub(crate) fn receipted(hub: &Hub, project: i64, person: i64, receipts: &std::collections::BTreeMap<ObjectId, String>) -> HashSet<ObjectId> {
     receipts
         .iter()
         .filter(|(id, r)| {
