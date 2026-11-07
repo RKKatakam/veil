@@ -413,6 +413,12 @@ impl Api {
         self.agent.post(format!("{}{path}", self.base)).header("content-type", "application/json").send(body).unwrap()
     }
 
+    /// POST a body read from `body` as it is sent (chunked): a client that
+    /// sends slowly, or stops.
+    pub fn post_reader(&self, path: &str, body: impl std::io::Read + Send + 'static) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+        self.agent.post(format!("{}{path}", self.base)).header("content-type", "application/json").send(ureq::SendBody::from_owned_reader(body))
+    }
+
     /// GET with extra headers, leaving the answer's body unread (a client
     /// that stalls).
     pub fn get_unread(&self, path: &str, headers: &[(&str, &str)]) -> ureq::http::Response<ureq::Body> {

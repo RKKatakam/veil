@@ -1059,3 +1059,450 @@ mod s9_adversarial {
         eprintln!("cache: a connection past the cap of 2 was served {waited:?} after one closed");
     }
 }
+
+/// The security review of S9, cycle 2 (`docs/BUGS.md`, "S9 cycle 2"): the
+/// cycle-1 fixes' guarantees (same answers, bounded memory, bounded
+/// connection slots, no circular waits, cut-off bodies are errors).
+mod s9_cycle2 {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    use veil_core::object::Tree;
+
+    const MIB: usize = 1 << 20;
+
+    fn rss() -> usize {
+        let s = std::fs::read_to_string("/proc/self/status").unwrap();
+        let kib: usize = s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)).unwrap().parse().unwrap();
+        kib << 10
+    }
+
+    fn tree(r: &Reader, chain: &[ObjectId], id: &ObjectId) -> Tree {
+        let g = r.get(chain, id);
+        assert_eq!(g.status, 200, "{}", String::from_utf8_lossy(&g.body));
+        match Object::decode(&g.body) {
+            Ok(Object::Tree(t)) => t,
+            _ => panic!("not a tree"),
+        }
+    }
+
+    fn land(p: &Project, files: &[(&str, &str)], msg: &str) {
+        write_files(&p.dir, files);
+        p.admin.commit_main(&p.dir, msg);
+        p.admin.ok(&p.dir, &["push"]);
+    }
+
+    /// A request body of `len` bytes of JSON whitespace, then nothing until
+    /// `gate`'s sender is dropped: a client that sends slowly, or stops.
+    /// `sent` counts the bytes handed over.
+    struct Stops {
+        left: usize,
+        gate: std::sync::mpsc::Receiver<()>,
+        sent: Arc<AtomicUsize>,
+    }
+
+    impl std::io::Read for Stops {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.left == 0 {
+                let _ = self.gate.recv();
+                return Err(std::io::Error::other("the client went away"));
+            }
+            let n = buf.len().min(self.left).min(64 << 10);
+            buf[..n].fill(b' ');
+            self.left -= n;
+            self.sent.fetch_add(n, Relaxed);
+            Ok(n)
+        }
+    }
+
+    /// Start a `POST …:batch` to the cache whose body stops after `len`
+    /// bytes; dropping the returned sender ends it.
+    fn stopping_post(c: &TestCache, project: &str, len: usize, sent: &Arc<AtomicUsize>) -> std::sync::mpsc::Sender<()> {
+        let (tx, gate) = std::sync::mpsc::channel();
+        let api = Api::at(&c.running.addr.to_string(), &c.running.cert_pem);
+        let (path, sent) = (format!("/v1/objects/{project}:batch"), sent.clone());
+        std::thread::spawn(move || drop(api.post_reader(&path, Stops { left: len, gate, sent })));
+        tx
+    }
+
+    /// Guarantee 4: every connection slot is released in bounded time. A
+    /// request whose head arrived but whose body never does holds its slot
+    /// for as long as the client likes: `header_read_timeout` (20 s) covers
+    /// only the head, the write deadline (30 s) only writes, and nothing
+    /// bounds reading the body. 1,024 such connections (anyone on Earth,
+    /// no grant needed) close the cache to everyone.
+    #[test]
+    #[ignore = "BUG-1183: a request body that never arrives holds its connection slot forever"]
+    fn bug_1183_a_body_that_never_arrives_holds_its_connection_slot() {
+        let hub = TestHub::start();
+        let p = setup_project(&hub);
+        let server = hub.api();
+        let c = TestCache::start_with(&hub, &hub.authority(), 1 << 30, 2);
+        let r = Reader::new(&server, &c.api, None, &p.name);
+        let root = r.root();
+        let sent = Arc::new(AtomicUsize::new(0));
+        // Two clients send a request's head and a few bytes of its body, then stop.
+        let gates: Vec<_> = (0..2).map(|_| stopping_post(&c, &p.name, 10, &sent)).collect();
+        until(Duration::from_secs(10), "both heads sent", || sent.load(Relaxed) >= 20);
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (done, api) = (done.clone(), Api::at(&c.running.addr.to_string(), &c.running.cert_pem));
+            let (grant, project) = (r.grant.clone(), p.name.clone());
+            std::thread::spawn(move || {
+                let g = api.get_with(&format!("/v1/objects/{project}/{}", root.hex()), &[("veil-grant", &grant)]);
+                done.store(true, SeqCst);
+                g.status
+            })
+        };
+        // Past the head's 20 s and the write deadline's 30 s, with margin.
+        let t = Instant::now();
+        while !done.load(SeqCst) && t.elapsed() < Duration::from_secs(50) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let served = done.load(SeqCst);
+        eprintln!("cache: a third client while two bodies stall (cap 2): served {served} after {:?}", t.elapsed());
+        drop(gates);
+        assert!(served, "two requests whose bodies never arrive held the cache's 2 connections for {:?}", t.elapsed());
+        assert_eq!(reader.join().unwrap(), 200);
+    }
+
+    /// Guarantee 3: the cache's memory stays within `--memory` + about
+    /// 128 KiB per connection. A batch's body is read whole into memory
+    /// before anything else (axum's `Bytes`, up to the 64 MiB body limit),
+    /// outside the budget: 8 clients that each send 56 MiB of a body and
+    /// stop hold about 450 MiB at `--memory 64M`.
+    #[test]
+    #[ignore = "BUG-1184: request bodies (up to 64 MiB each) are held outside --memory"]
+    fn bug_1184_request_bodies_are_held_outside_the_memory_bound() {
+        let hub = TestHub::start();
+        let p = setup_project(&hub);
+        let c = TestCache::start(&hub, &hub.authority(), 1 << 30);
+        let (n, len) = (8, 56 * MIB);
+        let sent = Arc::new(AtomicUsize::new(0));
+        let before = rss();
+        let gates: Vec<_> = (0..n).map(|_| stopping_post(&c, &p.name, len, &sent)).collect();
+        until(Duration::from_secs(60), "the bodies sent", || sent.load(Relaxed) >= n * len);
+        std::thread::sleep(Duration::from_secs(1));
+        let grew = rss().saturating_sub(before) / MIB;
+        drop(gates);
+        // --memory 64M, plus 128 KiB a connection, plus slack for the test.
+        let bound = 64 + n / 8 + 32;
+        eprintln!("cache: {n} bodies of {} MiB, stopped before their end, at --memory 64M: RSS +{grew} MiB (bound about {bound} MiB)", len / MIB);
+        assert!(grew <= bound, "{n} unfinished request bodies grew the cache by {grew} MiB, past --memory 64M + 128 KiB a connection");
+    }
+
+    /// Guarantee 5: no circular waits. An answer relaying a frame it keeps
+    /// takes that frame's whole share of the budget at once (up to 16 MiB)
+    /// and holds it while it waits in `Out::reserve` for the share of the
+    /// next chunk; `forward_get`'s `whole` does the same. Two such answers
+    /// whose kept frames take nearly all the budget wait for each other
+    /// forever, though their clients read everything: the semaphore hands
+    /// every share given back to the first waiter, whose chunk is larger
+    /// than what is left. Then every answer of the cache that needs the
+    /// budget waits too. Anyone on Earth: four cold public files.
+    #[test]
+    #[ignore = "BUG-1185: answers hold kept frames' shares while waiting for the budget (deadlock)"]
+    fn bug_1185_kept_frames_hold_the_budget_while_their_answers_wait_for_it() {
+        let hub = TestHub::start();
+        let p = setup_project(&hub);
+        // --memory 64M: a budget of 32,768 KiB; each object 16,234 KiB, so
+        // two kept frames leave 300 KiB, less than a chunk can be.
+        let size = 16_234 * 1024 - 64;
+        let files: Vec<(String, String)> = (0..4).map(|i| (format!("src/big{i}.bin"), format!("{i}{}", "k".repeat(size - 1)))).collect();
+        let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        land(&p, &refs, "four large public files");
+        let server = hub.api();
+        // It hangs in about half the rounds: stop at the first.
+        let mut hung = 0;
+        for round in 0..8 {
+            if hung > 0 {
+                break;
+            }
+            let c = TestCache::start(&hub, &hub.authority(), 1 << 30);
+            let r = Reader::new(&server, &c.api, None, &p.name);
+            let root = r.root();
+            warm(&c, &r, &[], &root);
+            let src = tree(&r, &[], &root).get("src").unwrap().id;
+            let st = tree(&r, &[root], &src);
+            let ids: Vec<ObjectId> = (0..4).map(|i| st.get(&format!("big{i}.bin")).unwrap().id).collect();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let barrier = Arc::new(std::sync::Barrier::new(ids.len()));
+            for id in ids.clone() {
+                let (tx, barrier) = (tx.clone(), barrier.clone());
+                let api = Api::at(&c.running.addr.to_string(), &c.running.cert_pem);
+                let (grant, project) = (r.grant.clone(), p.name.clone());
+                std::thread::spawn(move || {
+                    let req = BatchRequest {
+                        grant,
+                        ts: veil_core::now_millis(),
+                        signature: None,
+                        wants: vec![ChainWant { chain: vec![root, src], id }],
+                        skip: Vec::new(),
+                    };
+                    barrier.wait();
+                    let got = api.post(None, &format!("/v1/objects/{project}:batch"), &serde_json::to_vec(&req).unwrap(), true);
+                    let _ = tx.send(got.status == 200 && got.frames().len() == 1);
+                });
+            }
+            drop(tx);
+            let t = Instant::now();
+            let mut done = 0;
+            while done < ids.len() {
+                match rx.recv_timeout(Duration::from_secs(60).saturating_sub(t.elapsed())) {
+                    Ok(ok) => {
+                        assert!(ok, "an answer failed");
+                        done += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            eprintln!("cache: round {round}: {done} of {} answers of 16 MiB cold objects within {:?}", ids.len(), t.elapsed());
+            if done < ids.len() {
+                hung += 1;
+                // A later small answer waits too: the whole cache is stuck.
+                let t = Instant::now();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let api = Api::at(&c.running.addr.to_string(), &c.running.cert_pem);
+                let (grant, project) = (r.grant.clone(), p.name.clone());
+                std::thread::spawn(move || {
+                    let _ = tx.send(api.get_with(&format!("/v1/objects/{project}/{}", root.hex()), &[("veil-grant", &grant)]).status);
+                });
+                let small = rx.recv_timeout(Duration::from_secs(10));
+                eprintln!("cache: round {round}: a GET of the root afterwards: {small:?} after {:?}", t.elapsed());
+                // The server itself answers the same batch at once: the cache is what waits.
+                let direct = Reader { via: &server, project: r.project.clone(), id: None, grant: r.grant.clone(), key: r.key.clone() };
+                let t = Instant::now();
+                assert_eq!(direct.batch(&[(vec![root, src], ids[0])]).len(), 1);
+                eprintln!("cache: round {round}: the server answers the same batch directly in {:?}", t.elapsed());
+                std::mem::forget(c);
+            }
+        }
+        assert_eq!(hung, 0, "four readers of cold 16 MiB objects never got their answers (clients reading)");
+    }
+
+    /// Guarantee 6: a cut-off body is an error, never a short object. A
+    /// `GET` from the store sends its head at once when the budget is
+    /// taken, and its bytes once its share is free; if the object left the
+    /// store meanwhile, the answer ends unfinished, and the client's read
+    /// fails (a chunked body without its last chunk), never a short `200`.
+    #[test]
+    fn a_get_cut_off_after_its_head_is_an_error_for_the_client() {
+        let hub = TestHub::start();
+        let p = setup_project(&hub);
+        let big = "b".repeat(15 * MIB);
+        land(&p, &[("src/big.bin", &big), ("src/small.txt", "a small file that leaves the store")], "files");
+        let server = hub.api();
+        let c = TestCache::start(&hub, &hub.authority(), 1 << 30);
+        let r = Reader::new(&server, &c.api, None, &p.name);
+        let root = r.root();
+        warm(&c, &r, &[], &root);
+        let src = tree(&r, &[], &root).get("src").unwrap().id;
+        let st = tree(&r, &[root], &src);
+        let (big_id, small_id) = (st.get("big.bin").unwrap().id, st.get("small.txt").unwrap().id);
+        warm(&c, &r, &[root, src], &big_id);
+        warm(&c, &r, &[root, src], &small_id);
+        let small_raw = server_bytes_at(&server, &r, &[root, src], small_id);
+        // Three stalled answers of 15 MiB take the 32 MiB budget (the third
+        // waits holding what was left).
+        let chain = format!("{},{}", root.hex(), src.hex());
+        let big_path = format!("/v1/objects/{}/{}", p.name, big_id.hex());
+        let stalled: Vec<_> = (0..3).map(|_| c.api.get_unread(&big_path, &[("veil-grant", &r.grant), ("veil-chain", &chain)])).collect();
+        std::thread::sleep(Duration::from_millis(500));
+        let small_path = format!("/v1/objects/{}/{}", p.name, small_id.hex());
+        let resp = c.api.get_unread(&small_path, &[("veil-grant", &r.grant), ("veil-chain", &chain)]);
+        assert_eq!(resp.status().as_u16(), 200);
+        // The object leaves the store after its check, before its bytes.
+        let gone: Vec<String> = c.files().into_iter().filter(|(_, b)| *b == small_raw).map(|(f, _)| f).collect();
+        assert_eq!(gone.len(), 1, "the small object's file in the store");
+        std::fs::remove_file(&gone[0]).unwrap();
+        drop(stalled);
+        let read = resp.into_body().read_to_vec();
+        eprintln!("cache: a GET whose object left the store after its head: {:?}", read.as_ref().map(|b| b.len()).map_err(|e| e.to_string()));
+        match read {
+            Err(_) => {}
+            Ok(b) => assert_eq!(b, small_raw, "a cut-off answer read as a whole one ({} bytes)", b.len()),
+        }
+    }
+
+    /// The bytes of `id` at `chain` as the server serves it to `r`.
+    fn server_bytes_at(server: &Api, r: &Reader, chain: &[ObjectId], id: ObjectId) -> Vec<u8> {
+        let direct = Reader { via: server, project: r.project.clone(), id: r.id.clone(), grant: r.grant.clone(), key: r.key.clone() };
+        let g = direct.get(chain, &id);
+        assert_eq!(g.status, 200);
+        g.body
+    }
+
+    /// A `veil-server cache` process (the binary beside `vl`) in front of
+    /// `hub`, at `--memory 64M`: its child, address and certificate.
+    fn cache_process(hub: &TestHub, dir: &Path) -> (std::process::Child, String, String) {
+        let bin = vl_bin().with_file_name("veil-server");
+        let ca = dir.join("upstream.pem");
+        std::fs::write(&ca, &hub.cert_pem).unwrap();
+        let token = hub.ca.parent().unwrap().join("hub-cache-token");
+        let mut child = std::process::Command::new(bin)
+            .args(["cache", "--upstream", &format!("https://{}", hub.authority()), "--upstream-ca", ca.to_str().unwrap()])
+            .args(["--token-file", token.to_str().unwrap(), "--dir", dir.join("cache").to_str().unwrap(), "--listen", "127.0.0.1:0", "--memory", "64M"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.take().unwrap()), &mut line).unwrap();
+        let addr = line.trim().rsplit("https://").next().unwrap().to_string();
+        let pem = std::fs::read_to_string(dir.join("cache").join("self-signed-cert.pem")).unwrap();
+        (child, addr, pem)
+    }
+
+    fn rss_of(pid: u32) -> usize {
+        let s = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        let kib: usize = s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)).unwrap().parse().unwrap();
+        kib << 10
+    }
+
+    /// Guarantee 3, measured on its own process: `--memory` + about
+    /// 128 KiB per connection, with 192 clients that stall on answers the
+    /// server sends through the cache (cold objects). Once the budget is
+    /// taken, each answer waits in `Out::reserve` holding the chunk it read
+    /// from the server (at most the HTTP client's read buffer), beside its
+    /// connection's TLS and HTTP buffers. (Measured +6 MiB: the kernel's
+    /// socket buffers, outside the process, take most of each answer.)
+    #[test]
+    fn a_cache_process_with_stalled_clients_stays_within_its_bound() {
+        let hub = TestHub::start();
+        let p = setup_project(&hub);
+        let files: Vec<(String, String)> = (0..4).map(|i| (format!("src/m{i}.bin"), format!("{i}{}", "m".repeat(MIB - 1)))).collect();
+        let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        land(&p, &refs, "four 1 MiB public files");
+        let server = hub.api();
+        let dir = tempfile::Builder::new().prefix("veil-cache-proc").tempdir().unwrap();
+        let (mut child, addr, pem) = cache_process(&hub, dir.path());
+        let api = Api::at(&addr, &pem);
+        let r = Reader::new(&server, &api, None, &p.name);
+        let root = r.root();
+        let src = tree(&r, &[], &root).get("src").unwrap().id;
+        let st = tree(&r, &[root], &src);
+        let ids: Vec<ObjectId> = (0..4).map(|i| st.get(&format!("m{i}.bin")).unwrap().id).collect();
+        std::thread::sleep(Duration::from_secs(1));
+        let before = rss_of(child.id());
+        let n = 192;
+        let chain = format!("{},{}", root.hex(), src.hex());
+        let stalled: Vec<_> = (0..n)
+            .map(|i| api.get_unread(&format!("/v1/objects/{}/{}", p.name, ids[i % ids.len()].hex()), &[("veil-grant", &r.grant), ("veil-chain", &chain)]))
+            .collect();
+        std::thread::sleep(Duration::from_secs(3));
+        let grew = rss_of(child.id()).saturating_sub(before) / MIB;
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(stalled);
+        let bound = 64 + n * 128 / 1024;
+        eprintln!("cache process: {n} stalled GETs of cold 1 MiB objects at --memory 64M: RSS +{grew} MiB (bound {bound} MiB)");
+        assert!(grew <= bound, "{n} stalled clients grew the cache by {grew} MiB, past --memory 64M + 128 KiB a connection ({bound} MiB)");
+    }
+
+    /// Guarantee 1, widened: the cache's answers are the server's, byte for
+    /// byte, for several viewers (anyone on Earth, a developer, finance, the
+    /// admin), with wants that name ids and trees of another project (which
+    /// the cache also holds), ids the viewer may not see under their real
+    /// chains and under the viewer's trees, repeats under refused chains,
+    /// random `skip` lists, and `GET`s with ranges. A fixed seed.
+    #[test]
+    fn the_caches_answers_are_the_servers_for_every_viewer_and_project() {
+        let hub = TestHub::start();
+        let p = setup_project(&hub);
+        land(
+            &p,
+            &[("src/a/same.txt", "the same bytes"), ("src/b/same.txt", "the same bytes"), ("src/b/o.txt", "o"), ("src/c/d/same.txt", "the same bytes"), ("src/c/d/e.txt", "e")],
+            "copies in several folders",
+        );
+        let q = setup_project(&hub);
+        land(&q, &[("src/a/same.txt", "the same bytes"), ("src/q-only.txt", "only in q")], "another project's copies");
+        let server = hub.api();
+        let real = real_chains(&p.dir);
+        let q_real = real_chains(&q.dir);
+        // q's trees and ids as its admin reads them (through the server).
+        let q_walked = Reader::new(&server, &server, Some(&q.admin), &q.name).walk();
+        let q_trees: Vec<Vec<ObjectId>> = q_walked
+            .iter()
+            .filter(|(_, _, raw)| matches!(Object::decode(raw), Ok(Object::Tree(_))))
+            .map(|(chain, id, _)| [chain.clone(), vec![*id]].concat())
+            .collect();
+        let mut seed = 0x5eed_1183_u64;
+        let mut rnd = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let viewers: [Option<&Person>; 4] = [None, Some(&p.dev), Some(&p.fin), Some(&p.admin)];
+        let (mut batches, mut gets) = (0, 0);
+        for case in 0..12 {
+            let who = viewers[case % viewers.len()];
+            let c = TestCache::start(&hub, &hub.authority(), 1 << 30);
+            let r = Reader::new(&server, &c.api, who, &p.name);
+            let direct = Reader { via: &server, project: r.project.clone(), id: r.id.clone(), grant: r.grant.clone(), key: r.key.clone() };
+            let walked = direct.walk();
+            let reached: HashSet<ObjectId> = walked.iter().map(|w| w.1).collect();
+            let hidden: Vec<&(String, Vec<ObjectId>, ObjectId)> = real.iter().filter(|x| !reached.contains(&x.2)).collect();
+            let trees: Vec<Vec<ObjectId>> = walked
+                .iter()
+                .filter(|(_, _, raw)| matches!(Object::decode(raw), Ok(Object::Tree(_))))
+                .map(|(chain, id, _)| [chain.clone(), vec![*id]].concat())
+                .collect();
+            warm(&c, &r, &[], &r.root());
+            for (chain, id, _) in &walked {
+                if rnd(2) == 0 {
+                    assert_eq!(r.get(chain, id).status, 200);
+                }
+            }
+            // The cache also holds parts of the other project, under its name.
+            let qr = Reader::new(&server, &c.api, Some(&q.admin), &q.name);
+            for (chain, id, _) in &q_walked {
+                if rnd(2) == 0 {
+                    assert_eq!(qr.get(chain, id).status, 200);
+                }
+            }
+            for _ in 0..10 {
+                let mut wants: Vec<(Vec<ObjectId>, ObjectId)> = Vec::new();
+                for _ in 0..1 + rnd(10) {
+                    let w = &walked[rnd(walked.len())];
+                    let other = trees[rnd(trees.len())].clone();
+                    let qw = &q_walked[rnd(q_walked.len())];
+                    wants.push(match rnd(14) {
+                        0..=4 => (w.0.clone(), w.1),
+                        5 => (other, w.1),
+                        6 if !hidden.is_empty() => {
+                            let h = hidden[rnd(hidden.len())];
+                            (if rnd(2) == 0 { h.1.clone() } else { other }, h.2)
+                        }
+                        7 => (other, random_id()),
+                        // The other project's ids, under its trees or ours.
+                        8 => (qw.0.clone(), qw.1),
+                        9 => (if rnd(2) == 0 { q_trees[rnd(q_trees.len())].clone() } else { other }, q_real[rnd(q_real.len())].2),
+                        // An id wanted before, under another chain (often refused).
+                        _ => match wants.get(rnd(wants.len().max(1))) {
+                            Some(prev) => (if rnd(2) == 0 { other } else { q_trees[rnd(q_trees.len())].clone() }, prev.1),
+                            None => (w.0.clone(), w.1),
+                        },
+                    });
+                }
+                let skip: Vec<ObjectId> = match rnd(3) {
+                    0 => wants.iter().filter(|_| rnd(3) == 0).map(|w| w.1).collect(),
+                    _ => Vec::new(),
+                };
+                let (a, b) = (r.batch_as(&r.grant, &wants, skip.clone()), direct.batch_as(&direct.grant, &wants, skip.clone()));
+                assert_eq!((a.status, &a.body), (b.status, &b.body), "case {case} ({:?}): the batch {wants:?} skipping {skip:?}", who.map(|w| &w.name));
+                batches += 1;
+                for (chain, id) in wants.iter().take(3) {
+                    let range = match rnd(4) {
+                        0 => Some(format!("bytes={}-{}", rnd(8), 4 + rnd(8))),
+                        1 => Some(format!("bytes={}-", rnd(40))),
+                        _ => None,
+                    };
+                    let extra: Vec<(&str, &str)> = range.iter().map(|v| ("range", v.as_str())).collect();
+                    let (a, b) = (r.get_as(&r.grant, chain, id, None, &extra), direct.get_as(&direct.grant, chain, id, None, &extra));
+                    assert_eq!((a.status, &a.body), (b.status, &b.body), "case {case}: GET {chain:?} {id:?} {range:?}");
+                    gets += 1;
+                }
+            }
+        }
+        eprintln!("cache: {batches} random batches and {gets} GETs (4 viewers, 2 projects, skips, ranges) answered as the server answers them");
+    }
+}
