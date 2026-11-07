@@ -286,7 +286,7 @@ fn entries(src: &Source, pr: &Projector, edits: &[Edit], uploaded: &HashSet<Obje
 /// projected; `pr` projects nothing itself): the
 /// folders on the way (the root's id first, then each folder's, as far as
 /// they are folders) and the entry at the end.
-fn walk(pr: &Projector, root: ObjectId, parts: &[String]) -> Result<(Vec<ObjectId>, Option<TreeEntry>)> {
+pub(crate) fn walk(pr: &Projector, root: ObjectId, parts: &[String]) -> Result<(Vec<ObjectId>, Option<TreeEntry>)> {
     let mut dirs = vec![root];
     let mut cur = root;
     for (i, part) in parts.iter().enumerate() {
@@ -547,6 +547,7 @@ struct Move {
 /// `restacked` under it. `Ok(Some(moved))` with a move,
 /// `Ok(None)` without; `Err(conflict)` when the tip moved and the change is
 /// not kept.
+#[allow(clippy::too_many_arguments)]
 async fn commit(
     hub: &Arc<Hub>,
     plan: &Arc<Plan>,
@@ -555,8 +556,19 @@ async fn commit(
     restacked: &[(ObjectId, ObjectId, ObjectId)],
     person: i64,
     mv: Option<Move>,
+    land: Option<&(crate::landing::Submitter, crate::landing::Queued)>,
 ) -> Result<Option<bool>> {
     let pid = who.project.id;
+    // A landing: the change joins the queue in this same commit.
+    let land = land.map(|(w, q)| {
+        (
+            w.clone(),
+            crate::landing::Queued {
+                stack: vec![built.real],
+                ..q.clone()
+            },
+        )
+    });
     let view_key = (!who.viewer.admin).then(|| who.project.view(&who.viewer).key());
     let mut snaps: Vec<(String, String)> = restacked.iter().map(|(n, _, m)| (n.hex(), m.hex())).collect();
     snaps.push((built.real.hex(), built.mine.hex()));
@@ -566,9 +578,12 @@ async fn commit(
     let notify = hub.caches.notices.load(std::sync::atomic::Ordering::SeqCst);
     let committed: Vec<ObjectId> = restacked.iter().map(|(n, _, _)| *n).chain(std::iter::once(built.real)).collect();
     let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
-        let (real, cid, accept, mv, view_key, snaps, moved_refs) =
-            (real.clone(), cid.clone(), accept.clone(), mv.clone(), view_key.clone(), snaps.clone(), moved_refs.clone());
+        let (real, cid, accept, mv, view_key, snaps, moved_refs, land) =
+            (real.clone(), cid.clone(), accept.clone(), mv.clone(), view_key.clone(), snaps.clone(), moved_refs.clone(), land.clone());
         Box::pin(async move {
+            if let Some((w, q)) = &land {
+                crate::landing::insert(&mut *c, pid, w, q).await?;
+            }
             let now = veil_core::now_millis();
             let mut moved = None;
             if let Some((branch, cur, keep)) = &mv {
@@ -588,6 +603,7 @@ async fn commit(
                     crate::perm::accept_policy(&mut *c, pid, text).await?;
                 }
             }
+            let mut memos = Vec::new();
             for (snap, mine) in &snaps {
                 sqlx::query("INSERT INTO snapshots (project_id, id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
                     .bind(pid)
@@ -595,7 +611,7 @@ async fn commit(
                     .execute(&mut *c)
                     .await?;
                 if let Some(key) = &view_key {
-                    sqlx::query(
+                    let n = sqlx::query(
                         "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at) VALUES ($1, $2, $3, $4, $5) \
                          ON CONFLICT DO NOTHING",
                     )
@@ -605,7 +621,12 @@ async fn commit(
                     .bind(mine)
                     .bind(now)
                     .execute(&mut *c)
-                    .await?;
+                    .await?
+                    .rows_affected();
+                    // Cached once committed, if it is the row stored.
+                    if n == 1 {
+                        memos.push((key.clone(), snap.clone(), mine.clone()));
+                    }
                 }
             }
             // The caller's changes made again under this one keep their refs.
@@ -654,12 +675,18 @@ async fn commit(
                     .execute(&mut *c)
                     .await?;
             }
-            Ok(moved)
+            Ok((moved, memos))
         })
     })
     .await?;
+    let (r, memos) = r;
     for id in &committed {
         hub.caches.put_committed(pid, id);
+    }
+    for (k, real, mine) in memos {
+        if let (Ok(real), Ok(mine)) = (ObjectId::from_hex(&real), ObjectId::from_hex(&mine)) {
+            hub.caches.put_memo(pid, &k, &real, &mine);
+        }
     }
     if r == Some(true) {
         hub.caches.tips_changed(pid);
@@ -761,7 +788,23 @@ const NOT_ON_TIP: &str = "not a fast-forward: the change is not on the branch's 
 
 /// `POST /v1/projects/{p}/changes`.
 pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, caller: &Caller, req: ChangeRequest) -> Result<ChangeResult> {
+    create_with(hub, project, viewer, caller, req, None).await
+}
+
+/// [`create`]; with `land`, the change (made on `base`, never moving a
+/// branch) also joins the landing queue in its one commit (`landing`).
+pub(crate) async fn create_with(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    caller: &Caller,
+    req: ChangeRequest,
+    land: Option<(crate::landing::Submitter, crate::landing::Queued)>,
+) -> Result<ChangeResult> {
     let person = caller.signed_in()?.clone();
+    if land.is_some() && req.onto.is_some() {
+        return Err(bad("a landing names its branch once (`onto` of the landing)"));
+    }
     if !project.participant(viewer) {
         return Err(Error::forbidden("you are not in this project"));
     }
@@ -819,6 +862,14 @@ pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, caller: 
     // stack of the caller's own unlanded changes on it); the change is
     // still made and kept on its ref. All judged on the caller's view.
     let mut rejected: Option<String> = None;
+    // Only the landing service moves a protected branch (S17).
+    if let Some(o) = &onto {
+        let default_tip = tip(hub, project.id, &project.default_branch).await?;
+        let protected = sync::blocking(hub, project.id, move |src| crate::landing::protected(src, default_tip)).await?;
+        if protected.contains(&o.branch) {
+            rejected = Some(format!("'{}' is protected: land the change instead (`vl land`, `POST …/land`)", o.branch));
+        }
+    }
     let (mut parent, mut pparent) = (base_real, req.base);
     let mut restacked = Vec::new();
     if let (Some(o), Some(c)) = (&onto, cur) {
@@ -884,7 +935,7 @@ pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, caller: 
             _ => None,
         };
         sync::put_all(hub, project.id, built.store.clone()).await?;
-        match commit(hub, &plan, &who, &built, &restacked, person.id, mv).await {
+        match commit(hub, &plan, &who, &built, &restacked, person.id, mv, land.as_ref()).await {
             Ok(m) => break (built, m),
             // The tip moved during the request: try again on the new one,
             // with the access as it is now (BUG-1051).

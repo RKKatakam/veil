@@ -174,5 +174,12 @@ fn stats(hub: &veil_server::Hub, n: u64) -> serde_json::Value {
         "tips_hits": c.tips_hits.load(Relaxed),
         "tips_misses": c.tips_misses.load(Relaxed),
         "notices": hub.caches.notices.load(Relaxed),
+        "landing_batches": hub.landing.stats.batches.load(Relaxed),
+        "landing_landed": hub.landing.stats.landed.load(Relaxed),
+        "landing_conflicts": hub.landing.stats.conflicts.load(Relaxed),
+        "landing_rejected": hub.landing.stats.rejected.load(Relaxed),
+        "landing_build_us": hub.landing.stats.build_us.load(Relaxed),
+        "landing_store_us": hub.landing.stats.store_us.load(Relaxed),
+        "landing_commit_us": hub.landing.stats.commit_us.load(Relaxed),
     })
 }

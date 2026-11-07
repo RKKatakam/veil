@@ -11,11 +11,13 @@
 //!   (`docs/HUB.md` §4).
 //! * [`changes`]: the messages of commits through the API
 //!   (`docs/HUB.md` §13.13).
+//! * [`land`]: the landing service's messages (`docs/HUB.md` §13.15).
 //!
 //! The server is the authority (`docs/VISIBILITY.md`): it decides from its
 //! own records and the accepted policy, never from labels in a snapshot.
 
 pub mod access;
 pub mod changes;
+pub mod land;
 pub mod project;
 pub mod wire;

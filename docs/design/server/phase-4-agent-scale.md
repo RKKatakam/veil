@@ -2,7 +2,7 @@
 
 > **Owner decisions (2026-11-06):** every recommended default in the README's product-decision list is approved. **Embargoes are permission-based, not encrypted:** an embargoed change is plain text behind the server's checks, and **the server flips it public at the deadline.** The time-lock and release-machine designs below are not needed; the embargo release service becomes a scheduled server job. The hidden embargo line (decision 8) stays.
 
-> **Status: design, not built** (2026-11-06). Base: `integration` @ `3851159`.
+> **Status: design** (2026-11-06). Base: `integration` @ `3851159`. **S17, the landing service, is built** (2026-11-07, `docs/HUB.md` §13.15): the queue, submit checks, lease and fencing, batches, the fast path, pipelining, the landing check, protected branches (`.veilrules`), `vl land` and `vl push` to a protected branch. Its measurements are in `docs/design/scale/LOAD.md` ("The landing service"). As built, the edit set is not stored (it is read from the objects), and protection is opt-in (decision 9 not applied yet).
 > Sources of truth: `docs/OVERVIEW.md` and `docs/VISIBILITY.md` (including "Who can see a PR"); where this document disagrees with them, they win. The server as built is `docs/HUB.md` §13. PRs are `HUB.md` §7, embargoes §8, the web client §10. The roadmap is `docs/design/scion-for-developers.md`, phase 4 (items 5.1–5.8, 6.1–6.7). The measured limits are `docs/design/scale/LOAD.md`.
 
 ## 1. Goal

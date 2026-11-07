@@ -571,6 +571,9 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             }
             return hub_cmd::push(ctx, name, tag, *force, hooks);
         }
+        Cmd::Land { rev, onto, remote, no_wait, status } => {
+            return hub_cmd::land(ctx, remote, rev.as_deref(), onto.as_deref(), !*no_wait, status.as_deref());
+        }
         #[cfg(debug_assertions)]
         Cmd::Pull { remote } if test_remotes::is_path_remote(ctx, remote) => test_remotes::pull(ctx, remote)?,
         Cmd::Pull { remote } => hub_cmd::pull(ctx, remote)?,

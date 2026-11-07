@@ -9,6 +9,7 @@
 //! | [`perm`] | the permission model: admins, groups, the accepted policy |
 //! | [`sync`] | projected history, fetch by id, push validation, branch CAS |
 //! | [`changes`] | commits through the API: edits on a revision, the push's checks, one commit |
+//! | [`landing`] | the landing service: the queue, leases, batches, the fast path, protected branches (S17) |
 //! | [`mod@derive`] | derived history data: commit graph, changed paths, per-rule lists (S12) |
 //! | [`db`] | PostgreSQL / YugabyteDB, migrations, serialisable retries |
 //! | [`store`] | object storage: local directory or S3 |
@@ -21,6 +22,7 @@ pub mod changes;
 pub mod db;
 pub mod derive;
 pub mod error;
+pub mod landing;
 pub mod perm;
 pub mod store;
 pub mod sync;
@@ -60,6 +62,8 @@ pub struct Hub {
     pub caches: caches::Caches,
     /// The derive workers (`derive::landed`).
     pub derive: derive::Workers,
+    /// The landing services running here, and the submitters waiting here.
+    pub landing: landing::Services,
 }
 
 pub type HubState = Arc<Hub>;
@@ -88,8 +92,10 @@ pub struct Config {
     pub session_ttl: Duration,
     pub db_connections: u32,
     /// Derive, in the background once serving, every branch a landing left
-    /// underived (`derive::resume`). Servers do; tests that count
-    /// their own derive runs turn it off.
+    /// underived (`derive::resume`), and start the landing services of
+    /// every branch with queued landings (`landing::resume`). Servers do;
+    /// tests that count their own derive runs, or share a database between
+    /// servers with separate object stores, turn it off.
     pub catch_up_at_start: bool,
 }
 
@@ -167,6 +173,7 @@ pub async fn start(config: Config) -> Result<Running> {
         certificate,
         caches: caches::Caches::default(),
         derive: derive::Workers::default(),
+        landing: landing::Services::default(),
     });
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;
@@ -177,6 +184,8 @@ pub async fn start(config: Config) -> Result<Running> {
     let task = tokio::spawn(serve_tls(listener, tls, app, rx));
     if config.catch_up_at_start {
         tokio::spawn(derive::resume(hub.clone(), None));
+        // Landings queued when a server stopped are landed.
+        tokio::spawn(landing::resume(hub.clone()));
     }
     Ok(Running {
         addr,

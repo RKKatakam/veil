@@ -51,6 +51,9 @@ tempfile.workspace = true
 # returns little of it, so the server held 2-3x its data. jemalloc with two
 # arenas and background purging (settings in src/main.rs) measured best.
 tikv-jemallocator = "=0.7.0"
+# `.veilrules` (branch rules, S17): TOML, as `vl` already parses its
+# configuration (the same crate and version).
+toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
 
 [features]
 # Tests that need Docker (PostgreSQL, YugabyteDB, MinIO): run by
@@ -58,4 +61,6 @@ tikv-jemallocator = "=0.7.0"
 containers = []
 
 [dev-dependencies]
+# The landing service's property test (`landing::edits`).
+proptest = "1"
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }

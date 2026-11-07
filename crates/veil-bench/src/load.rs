@@ -14,6 +14,12 @@
 //!   moved, the server applies the file to the new tip itself; a change
 //!   rejected after its rebases (a *collision*) asks for the tips and
 //!   tries again;
+//! * **landing:** one new file in its own directory, submitted to the
+//!   landing service (`POST …/land`, `docs/HUB.md` §13.15) on the snapshot
+//!   it last saw (its own last landing): no pull, no upload, no race. The
+//!   request answers once the change landed, in a batch with the others
+//!   that arrived meanwhile; a conflict or a refusal (a *collision*) asks
+//!   for the tips and submits again;
 //! * **land:** a pull, then a new file in its own directory on top of that
 //!   `main` (a blob and the trees above it, and a signed snapshot),
 //!   uploaded, then pushed as a compare-and-swap of `main`. When `main`
@@ -85,10 +91,15 @@ pub enum Mode {
     /// Land on a branch of one's own.
     Branches,
     Api,
+    /// Through the landing service.
+    Landing,
 }
 
 /// The cost gates (`storage-and-cost.md` §9).
 pub const GATE_COMMITS_PER_PUSH: f64 = 1.0;
+/// Database commits per landing through the landing service (phase 4 §7):
+/// the submit's, and its share of its batch's.
+pub const GATE_COMMITS_PER_LANDING: f64 = 1.5;
 pub const GATE_STATEMENTS_PER_WARM_PULL: f64 = 5.0;
 
 /// Request and response bytes of every agent (counted in windows).
@@ -583,6 +594,58 @@ impl Agent<'_> {
     }
 }
 
+impl Agent<'_> {
+    /// Land one new file through the landing service (`--mode landing`);
+    /// the collisions on the way: conflicts and refusals, each followed by
+    /// a new submit on the tip.
+    fn land_service(&mut self, deadline: Instant) -> Result<u64> {
+        let mut collisions = 0;
+        let mut attempt = 0u32;
+        self.files += 1;
+        let path = format!("{}/f{:06}", self.dir.join("/"), self.files);
+        loop {
+            attempt += 1;
+            if Instant::now() > deadline {
+                bail!("no landing within the deadline after {collisions} collisions");
+            }
+            let base = match self.clone.tip {
+                Some((t, _)) => t,
+                None => {
+                    self.c.requests.fetch_add(1, Ordering::Relaxed);
+                    let r = self.api.get(self.token, &self.path("/tips"))?;
+                    ok(&r, "tips")?;
+                    let tips: Tips = serde_json::from_slice(&r.body)?;
+                    *tips.branches.get("main").ok_or_else(|| anyhow!("no main"))?
+                }
+            };
+            self.c.requests.fetch_add(1, Ordering::Relaxed);
+            let req = json!({"onto": "main", "base": base.hex(), "description": format!("land {}", self.files),
+                "edits": [{"path": path, "put": {"text": format!("agent file {} of {}\n", self.files, self.dir.join("/"))}}]});
+            let r = self.api.post_json(Some(self.token), &self.path("/land"), &req)?;
+            if r.status == 503 {
+                self.c.count(&self.c.busy, 1);
+                backoff(attempt);
+                continue;
+            }
+            ok(&r, "land")?;
+            let v: serde_json::Value = serde_json::from_slice(&r.body)?;
+            match v["state"].as_str() {
+                Some("landed") => {
+                    let mine: ObjectId = serde_json::from_value(v["landed"].as_array().and_then(|l| l.last()).cloned().unwrap_or_default())?;
+                    self.clone.tip = Some((mine, mine));
+                    return Ok(collisions);
+                }
+                Some("queued") => bail!("still queued after the server's wait: {v}"),
+                _ => {
+                    collisions += 1;
+                    self.c.count(&self.c.collisions, 1);
+                    self.clone.tip = None;
+                }
+            }
+        }
+    }
+}
+
 /// Capped, jittered backoff after a busy server.
 fn backoff(attempt: u32) {
     let cap = 5u64 << attempt.min(6);
@@ -727,6 +790,14 @@ fn server_stats(pid: u32, file: &std::path::Path) -> Option<serde_json::Value> {
 pub fn missed_gates(r: &serde_json::Value, background: f64) -> Vec<String> {
     let mut out = Vec::new();
     let mode = r["mode"].as_str().unwrap_or("");
+    // The design's gate is at its target rate, where batches fill (phase 4
+    // §7); a landing alone in its batch costs two commits.
+    if mode == "landing" && r["rate"].as_f64().is_none_or(|rate| rate >= 500.0) {
+        let ops = r["ops"].as_f64().unwrap_or(0.0);
+        if let Some(c) = r["db_push_commits_per_op"].as_f64().filter(|c| c * ops > GATE_COMMITS_PER_LANDING * ops * 1.02 + 20.0) {
+            out.push(format!("landing: {c:.2} database commits per landing, the deriver's aside (gate: {GATE_COMMITS_PER_LANDING})"));
+        }
+    }
     if matches!(mode, "land" | "branches" | "api") {
         // A few landings straddle the window's edges, and the database's own
         // maintenance (autovacuum, analyze) takes a few transactions.
@@ -897,14 +968,25 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
                         return;
                     }
                 };
-                // The first clone, before the clock starts.
-                if let Err(e) = agent.pull() {
+                // The first clone, before the clock starts (through the
+                // landing service an agent needs only the tip it lands on).
+                let first = match a.mode {
+                    Mode::Landing => agent.api.get(agent.token, &agent.path("/tips")).and_then(|r| {
+                        ok(&r, "tips")?;
+                        let tips: Tips = serde_json::from_slice(&r.body)?;
+                        let tip = *tips.branches.get("main").ok_or_else(|| anyhow!("no main"))?;
+                        agent.clone.tip = Some((tip, tip));
+                        Ok(true)
+                    }),
+                    _ => agent.pull(),
+                };
+                if let Err(e) = first {
                     c.error(&e);
                 }
                 ready.wait();
                 while !stop.load(Ordering::Relaxed) {
                     let scheduled = match (a.mode, rate) {
-                        (Mode::Land | Mode::Branches | Mode::Api, Rate::PerSecond(_)) => match rx.lock().unwrap().recv_timeout(Duration::from_millis(100)) {
+                        (Mode::Land | Mode::Branches | Mode::Api | Mode::Landing, Rate::PerSecond(_)) => match rx.lock().unwrap().recv_timeout(Duration::from_millis(100)) {
                             Ok(t) => t,
                             Err(_) => continue,
                         },
@@ -914,6 +996,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
                         Mode::Pull => agent.pull().map(|moved| u64::from(!moved)),
                         Mode::Land | Mode::Branches => agent.land(scheduled + Duration::from_secs(60)),
                         Mode::Api => agent.land_api(scheduled + Duration::from_secs(60)),
+                        Mode::Landing => agent.land_service(scheduled + Duration::from_secs(60)),
                     };
                     let done = Instant::now();
                     if !c.measuring.load(Ordering::Relaxed) {
@@ -979,7 +1062,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
         ready.wait();
         // Open loop: schedule landings at `rate`, round robin over the projects.
         let schedule = |until: Instant, start: Instant, mut k: u64| -> u64 {
-            if let (Mode::Land | Mode::Branches | Mode::Api, Rate::PerSecond(r)) = (a.mode, rate) {
+            if let (Mode::Land | Mode::Branches | Mode::Api | Mode::Landing, Rate::PerSecond(r)) = (a.mode, rate) {
                 loop {
                     let at = start + Duration::from_secs_f64(k as f64 / r);
                     if at >= until {
@@ -1035,7 +1118,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
         lat.sort_by(|x, y| x.partial_cmp(y).unwrap());
         let per_op = |x: f64| if ops > 0.0 { x / ops } else { f64::NAN };
         result = json!({
-            "mode": match a.mode { Mode::Pull => "pull", Mode::Land => "land", Mode::Branches => "branches", Mode::Api => "api" },
+            "mode": match a.mode { Mode::Pull => "pull", Mode::Land => "land", Mode::Branches => "branches", Mode::Api => "api", Mode::Landing => "landing" },
             "projects": projects,
             "clients": clients,
             "rate": match rate { Rate::Max => json!("max"), Rate::PerSecond(r) => json!(r) },
@@ -1074,6 +1157,13 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
             "background_landings": bg.ops.load(Ordering::Relaxed),
             "background_errors": bg.errors.load(Ordering::Relaxed),
         });
+        // The landing service's own counters (the server this tool started).
+        let ratio = |a: Option<f64>, b: Option<f64>, k: f64| a.zip(b).map(|(a, b)| if b > 0.0 { a / b / k } else { f64::NAN });
+        result["landing_batches"] = json!(stat("landing_batches"));
+        result["landings_per_batch"] = json!(ratio(stat("landing_landed"), stat("landing_batches"), 1.0));
+        result["landing_build_ms_per_op"] = json!(ratio(stat("landing_build_us"), stat("landing_landed"), 1000.0));
+        result["landing_store_ms_per_batch"] = json!(ratio(stat("landing_store_us"), stat("landing_batches"), 1000.0));
+        result["landing_commit_ms_per_batch"] = json!(ratio(stat("landing_commit_us"), stat("landing_batches"), 1000.0));
         Ok(())
     })?;
     Ok(result)
@@ -1116,7 +1206,7 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
     };
     let rates = match a.mode {
         Mode::Pull => vec![Rate::Max],
-        Mode::Land | Mode::Branches | Mode::Api => a.rates.clone(),
+        Mode::Land | Mode::Branches | Mode::Api | Mode::Landing => a.rates.clone(),
     };
     let mut runs = Vec::new();
     for &projects in &a.projects {
@@ -1175,7 +1265,7 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
             f(&r["p50_ms"], 1),
             f(&r["p99_ms"], 1),
             match r["mode"].as_str() {
-                Some("land" | "branches" | "api") => f(&r["collisions_per_op"], 2),
+                Some("land" | "branches" | "api" | "landing") => f(&r["collisions_per_op"], 2),
                 _ => "–".into(),
             },
             f(&r["requests_per_op"], 1),
@@ -1218,6 +1308,26 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
             pct(&r["tips_hit_share"]),
             if missed == 0 { "none".to_string() } else { format!("**{missed}**") },
         ));
+    }
+    let landing: Vec<&serde_json::Value> = v["runs"].as_array().map(|r| r.iter().filter(|r| r["mode"] == "landing").collect()).unwrap_or_default();
+    if !landing.is_empty() {
+        out.push_str(
+            "\n| Landing service: clients | Target rate (/s) | Done (/s) | Batches | Landings per batch | Build CPU (ms/landing) | Store objects (ms/batch) | Transaction (ms/batch) |\n\
+             |---:|---:|---:|---:|---:|---:|---:|---:|\n",
+        );
+        for r in landing {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                r["clients"],
+                r["rate"].as_str().map(str::to_string).unwrap_or_else(|| f(&r["rate"], 2)),
+                f(&r["ops_per_s"], 1),
+                f(&r["landing_batches"], 0),
+                f(&r["landings_per_batch"], 1),
+                f(&r["landing_build_ms_per_op"], 3),
+                f(&r["landing_store_ms_per_batch"], 1),
+                f(&r["landing_commit_ms_per_batch"], 1),
+            ));
+        }
     }
     Ok(out)
 }

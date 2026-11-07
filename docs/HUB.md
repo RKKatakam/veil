@@ -969,6 +969,7 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
 | `POST …/objects` | upload object frames: re-hashed, canonically decoded, format-checked, stored; invisible until a push reaches them. Answers a **receipt** per object (a server MAC over project ‖ person ‖ id) |
 | `POST …/push {updates: [{branch, expected, new}], force, receipts}` | complete and check every new snapshot, then move the branches in **one serialisable transaction of compare-and-swaps** (`UPDATE branches SET target = new WHERE … AND target = expected`); one lost race rejects the whole push with 409 and `vl` retries |
 | `POST …/changes {base, edits, onto?, change_id?, receipts}` | a commit through the API, without a checkout (S10, §13.13) |
+| `POST …/land {onto, snapshot \| base+edits, receipts, wait}`, `GET …/land/{ticket}` | submit a landing to the landing service, and its outcome (S17, §13.15) |
 | `GET …/access?path=` | the deciding line and who it names; only for a path the caller may read |
 | `…/groups`, `GET|POST …/rings/{scope}`, `GET /v1/people/{name}/devices` | groups; key rings of secret scopes; a person's devices (active, the newest pending, removed), the vouches and invite joins the server stores, which devices check before sharing a key (§13.11, §13.12) |
 | `POST /v1/devices/vouch {device, signature}` | the signed-in device vouches for another device of its person; a pending one becomes active |
@@ -1738,4 +1739,134 @@ pull (S3), not a staler check.
 
 `veil-server` writes its counters (storage writes and reads, cache hits and
 misses) to `DATA/stats.json` at start and on `SIGUSR1`, for the benchmarks.
+
+### 13.15 S17: the landing service (as built)
+
+Milestone S17 (`docs/design/server/phase-4-agent-scale.md` §4.1–4.6, §8).
+Code: `crates/veil-server/src/landing/` (`mod.rs`: submit, waiters, the
+services a server runs; `service.rs`: one branch's service; `edits.rs`:
+edit sets, the fast path, the landing check; `rules.rs`: `.veilrules`),
+`migrations/0011_landing.sql`, `vl land` (`crates/vl/src/hub.rs`,
+`hub_cmd.rs`), the messages in `veil_core::hub::land`.
+
+```text
+POST /v1/projects/{p}/land
+{ "onto": "main",
+  "snapshot": "<id, as a push names it>"            // uploaded first, with receipts
+  | "base": "<id as the caller sees it>", "edits": [...], "description", "change_id"?,
+  "receipts": {...}, "wait": true }
+→ { "ticket", "state": "queued" | "landed" | "conflict" | "rejected",
+    "change_id"?, "landed": ["<each change's snapshot, as the caller sees it>"],
+    "message"?, "paths": ["<the change's own paths that moved>"], "warnings": [...] }
+GET /v1/projects/{p}/land/{ticket}[?wait=false]     // its submitter's only; anyone else: 404
+```
+
+**Submitting** (one request, one database commit). The change is built and
+checked by the code a push or an API commit runs, never a copy of it: an
+uploaded snapshot goes through `sync::push` (signatures, `sync::complete`:
+the graft, write access, access lines and `.veilrules` changed only by
+admins, closure, personal keys, secrets as ciphertext, check 9), and edits
+through `changes::create` (the same `complete`, inline text held in memory
+until the checks pass). Instead of a branch's compare-and-swap, the
+request's transaction inserts one **queue row**: the stack of real
+snapshots (oldest first, at most 64; an uploaded snapshot brings the new
+snapshots under it, which must not hold conflicts), the submitter, and the
+access epochs its checks ran under. The snapshots become committed history
+in that commit (they resolve and project like any other); the edit set is
+not stored: it is each snapshot's diff against its first parent, read from
+the objects. With `wait` (the default) the request answers once the
+outcome is known, up to 30 s, else at `queued`.
+
+**The landing service.** One per branch, on whichever server holds the
+branch's **lease** (`landing_leases`: a holder, a fencing epoch bumped at
+every takeover, an expiry on the database's clock, 2 s unless renewed). A
+submit wakes the service on its own server, starting one if no other
+server holds the lease; a waiting submitter keeps one running (every
+250 ms it re-reads its row and makes sure a service runs); a starting
+server resumes every branch with queued rows. A service with nothing to do
+for 5 s gives the lease back. Its loop:
+
+* **Batch:** every ready row not in the batch being committed, in queue
+  order, at most 500. An entry whose edits touch `.veilpolicy` or
+  `.veilrules` ends the batch before it and **lands alone**; nothing is
+  built after it until it is committed.
+* **For each change of an entry's stack:** on the tip already, it lands as
+  it is (the submitted snapshot). Otherwise **the fast path**: every path
+  of its edit set must be, on the tip, what it was in its base: the same
+  entry (kind, content, mode, label), absent in both, or under the same
+  non-folder in both. Exact per path: nothing else on the tip matters. Then
+  its edits are applied (only the folder listings on the way are rewritten;
+  folders are made where needed and dropped once empty) and a **new
+  snapshot** is signed by the server: parent the tip, the change's id,
+  description, author and time, predecessor the submitted snapshot. A merge
+  lands only on the tip it was made on. A path that moved: **`conflict`**,
+  naming the change's own paths that moved (never landed over; content
+  merges are S18). A stack lands all or nothing.
+* **The landing check:** each new snapshot's diff against its parent must be
+  exactly the change's edit set, path for path; a mismatch rejects the
+  entry (and logs a bug, with ids only), never lands it.
+* **Checks again when what they read changed:** while the submitter's and
+  the project's access epochs (§13.14) are those the submit recorded, and
+  the tip's `.veilpolicy` is the base's, the submit's checks still hold.
+  Otherwise (someone removed from a group, a device barred, an access
+  change landed, a policy file moved) the push's checks run again on the
+  new parent, as the submitter is now: their projection of the new snapshot
+  is grafted back by `sync::complete` and must give exactly its tree.
+  Someone no longer in the project is refused. A change of who has access
+  on the default branch is accepted in the batch's transaction (an admin's
+  only), which bumps the project's epoch: every later entry is checked
+  against it.
+* **Projections per viewer:** for every view key in use (the batch's
+  submitters', and those of the last minute, at most 64), the service
+  projects each new snapshot (`sync::project_one`) and writes the memo rows
+  in the batch's commit; a submitter's `landed` ids are theirs. Other
+  viewers' projections are worked out when they ask, as before.
+* **Pipelined:** while batch *n* is stored and committed, batch *n+1* is
+  built on the tip *n* leaves. If *n* loses (the branch moved under it: an
+  admin's forced push; or the lease was lost), *n+1* is discarded and built
+  again from the database.
+* **One commit per batch:** the new objects are stored first, then one
+  transaction: the lease (its holder and epoch: **fencing**), the branch's
+  compare-and-swap, an accepted policy, the queue rows (each must still be
+  `queued`, else nothing commits: an entry never lands twice), the
+  snapshot rows, the memo rows, an audit row and the tips notice.
+
+**Protected branches.** `.veilrules` at the project root (TOML;
+`[branches.NAME] protected = true`; other tables are left to later
+milestones, an unknown key under a branch is refused). Only admins change
+it, on any branch (`sync::complete`), and an admin's must parse, so the
+default branch's current file is always an admin's. A protected branch is
+moved only by its landing service: a push of it **lands instead** (its new
+snapshots, as one stack, need not be on the tip; `vl push` waits and
+reports `landed`); a commit through the API with `onto` it is kept but
+`rejected`; deleting it needs an admin's `--force`; an admin's
+`vl push --force` still moves it (audited). Product decision 9 (protected
+`main` by default for new projects) is not applied yet: protection is
+opt-in.
+
+**`vl land [REV] [--onto BRANCH] [--no-wait] [--status TICKET]`** uploads
+REV (default `@-`) and what the server lacks under it, submits it, and on
+`landed` pulls and moves the local tag of the branch to where the change
+landed if it was at REV or below. The working copy stays on REV, a
+predecessor of the landed snapshot with the same content at every path it
+edits; the next change made on it lands the same way.
+
+**Limits.** Fair share between people and sessions is FIFO here (S24); a
+new view key's first projection walks history back to a memo, which the
+service pays in its first batch after an access change (BUG-1100); the
+batch-tip memos for other viewers are S12's.
+
+Threat review (phase 4 §6, rows 1–4, and what S17 adds), tests in
+`server_hub` `landing` and `veil-server` `landing::edits`:
+
+| # | Attacker | Capability | Harm | Mitigation | Test |
+|---|---|---|---|---|---|
+| 1 | An agent with access to `src/` only | submits edits touching `billing/`, the root, `.veilrules`, a secret in a file | writes where it may not | the push's checks at submit (nothing is queued); again at landing when access changed | `access_is_checked_at_submit_and_again_when_an_entry_lands` |
+| 2 | An admin and an agent at once | a revoking policy change queued between two writes of the revoked path | the second lands under rules that no longer allow it | policy and rules changes land alone; the epoch they bump re-runs later entries' checks; no batch is built before they commit | same: the second write is `rejected` |
+| 3 | — (failover) | two servers both run a branch's service | `main` moved twice from one tip, a lost or doubled change | the lease's epoch checked in the batch's transaction; queue rows must still be `queued`; the branch's compare-and-swap | `only_the_lease_holder_lands_and_every_ticket_lands_once_across_servers` (two servers, the lease stolen every 30 ms: every change on `main` exactly once) |
+| 4 | — (a bug) | the fast path rewrites a tree wrongly | a change lost or altered | the landing check before the commit; property test against applying each change's edits by hand | `batched_landings_equal_sequential_edits`, `non_overlapping_changes_land_in_batches_each_once_with_exactly_its_edits` |
+| 5 | A submitter | reads a conflict or a ticket | learns about hidden folders | a conflict names only the change's own paths; tickets are random and their submitter's only (404 for anyone else) | `hostile_landing_requests_are_refused` |
+| 6 | Any participant | a stale clone pushes a protected `main` | moves it over others' work | a push of a protected branch lands instead (fast path or `conflict`) | `protected_branches_move_only_by_landing_and_push_lands_instead` |
+| 7 | A non-admin, even one given `.veilrules` | unprotects `main` | bypasses the landing service | `.veilrules` changes are admins' only, on any branch | same |
+| 8 | Hostile API client | bad branch names, both or neither of `snapshot` and `edits`, unknown fields, missing objects, a branch that does not exist | a corrupt queue or a crash | the request's shape checked first; refusals before anything is queued | `hostile_landing_requests_are_refused` |
 

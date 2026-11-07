@@ -1032,6 +1032,29 @@ pub(crate) fn complete(
     if !unchanged && !admin {
         return Err(Error::forbidden("only admins may change access lines in .veilpolicy"));
     }
+    // Branch rules (`.veilrules`, S17): only admins change them, on any
+    // branch, so the default branch's are always an admin's; theirs must
+    // parse.
+    let rules_at = |t: &ObjectId| entry_at(src, t, crate::landing::rules::RULES_FILE);
+    let rules = rules_at(&real_tree)?;
+    let mut same_rules = false;
+    for t in &ptrees {
+        if rules_at(t)?.is_some_and(|e| rules.as_ref().is_some_and(|r| r.same_content(&e))) || (rules.is_none() && rules_at(t)?.is_none()) {
+            same_rules = true;
+        }
+    }
+    if !same_rules {
+        if !admin {
+            return Err(Error::forbidden("only admins may change the branch rules (.veilrules)"));
+        }
+        if let Some(e) = &rules {
+            let text = match Object::decode(&src.raw(&e.id)?)? {
+                Object::Blob(b) if e.kind == EntryKind::File => String::from_utf8_lossy(&b).into_owned(),
+                _ => return Err(Error::bad_request(".veilrules must be a plain-text file")),
+            };
+            crate::landing::rules::Rules::parse(&text).map_err(Error::bad_request)?;
+        }
+    }
     let mut real = n.clone();
     real.tree = real_tree;
     real.parents = rp.to_vec();
@@ -1065,7 +1088,25 @@ pub(crate) struct Completed {
 /// origin, projection memo and audit rows: **one database commit per push**
 /// (`storage-and-cost.md` §3). Other viewers' projections are worked out when
 /// they first ask, as before.
-pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i64, req: PushRequest) -> Result<PushResult> {
+pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, who: &crate::landing::Submitter, req: PushRequest) -> Result<PushResult> {
+    Ok(push_with(hub, project, viewer, who, req, false, true).await?.0)
+}
+
+/// [`push`]. An update of a protected branch (every update, with
+/// `land_all`: `POST …/land` of an uploaded snapshot) is not moved here: the
+/// new snapshots it brings join the landing queue, in the push's one
+/// commit, as one stack (`landing`), and with `wait` the push answers once
+/// they landed. Their outcomes come back too.
+pub(crate) async fn push_with(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    who: &crate::landing::Submitter,
+    req: PushRequest,
+    land_all: bool,
+    wait: bool,
+) -> Result<(PushResult, Vec<veil_core::hub::land::LandResult>)> {
+    let person = who.person.id;
     if !project.participant(viewer) {
         return Err(Error::forbidden("you are not in this project"));
     }
@@ -1085,6 +1126,11 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             .fetch_all(&hub.db)
             .await?;
         rows.into_iter().filter_map(|(n, t)| ObjectId::from_hex(&t).ok().map(|t| (n, t))).collect()
+    };
+    // Branches only the landing service moves (S17).
+    let protected = {
+        let default_tip = current.get(&project.default_branch).copied();
+        blocking(hub, project.id, move |src| crate::landing::protected(src, default_tip)).await?
     };
     // Only the branches this push moves, and the default branch, are
     // candidates; a branch this push moves wins over the default branch
@@ -1225,6 +1271,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
     }
     // 3. Move the branches: one serialisable transaction of compare-and-swaps.
     let mut plans = Vec::new();
+    let mut queued: Vec<crate::landing::Queued> = Vec::new();
     let mut results = Vec::new();
     // New branches, against the branches when the push began (concurrent
     // pushes may each add up to the bound).
@@ -1237,6 +1284,60 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             return Err(Error::bad_request(format!("invalid branch name {:?}", u.branch)));
         }
         let cur = current.get(&u.branch).copied();
+        // Landed by the landing service instead of moved here: the new
+        // changes on top of whatever base they have (they need not be on
+        // the tip), as one stack.
+        if !req.force && (land_all || protected.contains(&u.branch)) && (cur.is_some() || land_all) {
+            let Some(n) = u.new else {
+                return Err(Error::forbidden(format!("'{}' is protected: only an admin's forced push deletes it", u.branch)));
+            };
+            let new_real = *real_of.get(&n).ok_or_else(|| Error::bad_request("unknown new tip"))?;
+            let refuse = |m: &str| BranchResult {
+                branch: u.branch.clone(),
+                ok: false,
+                message: Some(m.to_string()),
+                tip: None,
+                ticket: None,
+            };
+            if cur.is_none() {
+                results.push(refuse(&format!("there is no branch '{}' to land on", u.branch)));
+                continue;
+            }
+            if Some(new_real) == cur {
+                results.push(BranchResult { tip: Some(projected(hub, project, viewer, new_real).await?), ok: true, message: None, ..refuse("") });
+                continue;
+            }
+            let fresh: HashSet<ObjectId> = completed.iter().map(|c| c.real).collect();
+            let mut stack = Vec::new();
+            let mut x = new_real;
+            while fresh.contains(&x) && stack.len() <= veil_core::hub::land::MAX_LAND_STACK {
+                stack.push(x);
+                x = real_parents_of[&x][0];
+            }
+            stack.reverse();
+            if stack.is_empty() {
+                results.push(refuse("nothing new to land: that snapshot is already on the server (land a new change)"));
+                continue;
+            }
+            if stack.len() > veil_core::hub::land::MAX_LAND_STACK {
+                results.push(refuse(&format!(
+                    "at most {} new changes land at once; land them in parts, or have an admin push with --force",
+                    veil_core::hub::land::MAX_LAND_STACK
+                )));
+                continue;
+            }
+            let conflicted = stack.iter().any(|s| parents_of.iter().any(|(pid, n)| real_of.get(pid) == Some(s) && !n.conflicts.is_empty()));
+            if conflicted {
+                results.push(refuse("a change with unresolved conflicts never lands: resolve them first"));
+                continue;
+            }
+            queued.push(crate::landing::Queued {
+                ticket: crate::landing::ticket(),
+                branch: u.branch.clone(),
+                stack,
+            });
+            continue;
+        }
         let cur_seen = match cur {
             Some(c) => Some(projected(hub, project, viewer, c).await?),
             None => None,
@@ -1247,6 +1348,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
                 ok: false,
                 message: Some("the branch has moved since you last pulled; pull, then push again".into()),
                 tip: cur_seen,
+                ticket: None,
             });
             continue;
         }
@@ -1264,6 +1366,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
                     ok: false,
                     message: Some("not a fast-forward; pull and merge, then push again".into()),
                     tip: cur_seen,
+                    ticket: None,
                 });
                 continue;
             }
@@ -1295,13 +1398,16 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             Box::pin(projected_inner(hub, project, viewer, *n, Some(&mut deferred))).await?;
         }
     }
+    for q in &queued {
+        Box::pin(projected_inner(hub, project, viewer, *q.stack.last().expect("a stack is never empty"), Some(&mut deferred))).await?;
+    }
     // Only the snapshots this push made (known ones are recorded already:
     // rewriting their rows made every racing pusher write the same row),
     // and of those only what the updates that land reach: a refused
     // update's snapshots are no branch's history (BUG-914).
     let landing: HashSet<ObjectId> = {
         let mut seen = HashSet::new();
-        let mut stack: Vec<ObjectId> = plans.iter().filter_map(|p| p.2).collect();
+        let mut stack: Vec<ObjectId> = plans.iter().filter_map(|p| p.2).chain(queued.iter().filter_map(|q| q.stack.last().copied())).collect();
         while let Some(x) = stack.pop() {
             if let Some(ps) = real_parents_of.get(&x) {
                 if seen.insert(x) {
@@ -1318,17 +1424,24 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
     let notify = hub.caches.notices.load(std::sync::atomic::Ordering::SeqCst);
     let pid = project.id;
     let plans2 = plans.clone();
+    let (queued2, who2) = (queued.clone(), who.clone());
+    // Whoever lands here hears at once (registered before the commit).
+    let waiters: Vec<crate::landing::Waiter> = queued.iter().map(|q| hub.landing.register(&q.ticket)).collect();
     // Nothing to move (every update refused: the pusher pulls and tries
     // again): no commit, and nothing recorded as history no branch reaches.
-    let (moved, memo_stored) = if plans.is_empty() {
+    let (moved, memo_stored) = if plans.is_empty() && queued.is_empty() {
         (Vec::new(), Vec::new())
     } else {
-        crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
+        let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
         let plans = plans2.clone();
         let new_reals = new_reals.clone();
         let origins = origins.clone();
         let memos = memos.clone();
+        let (queued, who) = (queued2.clone(), who2.clone());
         Box::pin(async move {
+            for q in &queued {
+                crate::landing::insert(&mut *c, pid, &who, q).await?;
+            }
             let mut moved = Vec::new();
             for (branch, cur, new, accept) in plans {
                 let rows = match (cur, new) {
@@ -1418,8 +1531,31 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             Ok((moved, memo_stored))
         })
     })
-    .await?
+    .await;
+        match r {
+            Ok(r) => r,
+            Err(e) => {
+                for w in waiters {
+                    crate::landing::abandon(hub, w);
+                }
+                return Err(e);
+            }
+        }
     };
+    // The landings: their services wake, and with `wait` the push answers
+    // once they are decided.
+    let deadline = tokio::time::Instant::now() + crate::landing::WAIT;
+    let mut landings = Vec::new();
+    for (q, w) in queued.iter().zip(waiters) {
+        crate::landing::ensure(hub, project.id, &q.branch);
+        landings.push(match wait {
+            true => crate::landing::wait(hub, project.id, person, &q.branch, w, deadline).await?,
+            false => {
+                crate::landing::abandon(hub, w);
+                crate::landing::queued(&q.ticket)
+            }
+        });
+    }
     if !moved.is_empty() {
         hub.caches.tips_changed(project.id);
         for c in &completed {
@@ -1455,9 +1591,30 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             Some(n) => Some(projected(hub, project, viewer, n).await?),
             None => None,
         };
-        results.push(BranchResult { branch, ok: true, message: None, tip });
+        results.push(BranchResult { branch, ok: true, message: None, tip, ticket: None });
     }
-    Ok(PushResult { results, warnings })
+    let mut warnings = warnings;
+    for (q, l) in queued.iter().zip(&landings) {
+        use veil_core::hub::land::LandState;
+        warnings.extend(l.warnings.iter().cloned());
+        results.push(BranchResult {
+            branch: q.branch.clone(),
+            ok: l.state == LandState::Landed,
+            message: match l.state {
+                LandState::Landed => None,
+                LandState::Queued => Some(format!("queued to land as {} (`vl land --status {}`)", l.ticket, l.ticket)),
+                LandState::Conflict => Some(format!(
+                    "conflict: {} changed on '{}' since your change's base; pull, redo it there, and push again",
+                    l.paths.join(", "),
+                    q.branch
+                )),
+                LandState::Rejected => Some(l.message.clone().unwrap_or_default()),
+            },
+            tip: l.landed.last().copied(),
+            ticket: Some(q.ticket.clone()),
+        });
+    }
+    Ok((PushResult { results, warnings }, landings))
 }
 
 /// Is `a` an ancestor of (or equal to) `b` in the real history?
