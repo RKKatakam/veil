@@ -875,7 +875,8 @@ fn long_project(n: usize) -> (Project, Repo, Arc<MemoryBackend>) {
 /// operation's view through parents and predecessors with
 /// `Repo::snapshot`, which pages history in at the boundary, and descends
 /// the server tip's ancestry to the root before it reaches the working
-/// copy's predecessors. The audit tables count `snapshot_opt(` only:
+/// copy's predecessors (always for an abandoned change, whose versions
+/// only older operations name). The audit tables count `snapshot_opt(` only:
 /// `Repo::snapshot(`'s callers are in none of them. Here: 40 commits, a
 /// page of 2 snapshots, and resolving the earlier version reads 20 pages
 /// (every snapshot), where its answer is held already.
@@ -889,6 +890,10 @@ fn s3r3_a_hidden_snapshots_short_id_does_not_page_in_the_whole_history() {
     fs.write(&p("mine.txt"), b"mine, edited\n").unwrap();
     let now = crate::adversarial_support::snap(&mut repo, &*fs);
     assert_ne!(earlier, now);
+    // The change abandoned (`vl abandon`): its versions are in older
+    // operations' views only, so the walk, newest operation first, meets
+    // the tip's ancestry before them whatever the ids' order.
+    repo.abandon(now).unwrap();
     let prefix = &earlier.hex()[..12];
     *pr.server.pages.lock().unwrap() = 0;
     let got = repo.exact(|r| veil_core::revset::resolve(r, prefix, "default")).unwrap();
