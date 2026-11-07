@@ -14,10 +14,11 @@ use veil_core::Identity;
 use crate::support::*;
 
 /// A new, empty database on the test server, as a URL (with `user` and
-/// `password` when given). Left behind: the containers are thrown away.
+/// `password` when given). Left behind; its name starts with
+/// `VEIL_TEST_DB_PREFIX`, so `scripts/verify-server.sh` drops it afterwards.
 fn fresh_database(rt: &tokio::runtime::Runtime) -> (String, String) {
     let admin = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
-    let name = unique("veil_fresh_");
+    let name = format!("{}{}", std::env::var("VEIL_TEST_DB_PREFIX").unwrap_or_default(), unique("veil_fresh_"));
     rt.block_on(async {
         let db = veil_server::db::connect(&admin, 1).await.unwrap();
         sqlx::raw_sql(&format!("CREATE DATABASE {name}")).execute(&db).await.unwrap();
