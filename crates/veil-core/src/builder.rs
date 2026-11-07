@@ -75,9 +75,15 @@ struct BuildFrame {
     dir: VPath,
     parent: Option<(Arc<Tree>, ObjectId)>,
     entries: Vec<DirEntry>,
+    /// The listing's stats of `entries` ([`DirListing::stats`]).
+    stats: Vec<Option<Metadata>>,
+    /// Their classifications, when made ahead of the walk (by entry).
+    classes: Vec<Option<Classification>>,
     next: usize,
     out: Tree,
-    seen: HashSet<String>,
+    /// Special entries (symlinks where a directory or file was tracked…)
+    /// whose tracked entry was kept.
+    kept_special: Vec<String>,
     /// Name of the subdirectory being built on top of this frame.
     waiting: Option<String>,
 }
@@ -85,6 +91,22 @@ struct BuildFrame {
 enum Opened {
     Frame(BuildFrame),
     Done(Option<ObjectId>),
+}
+
+/// Is a listed entry part of the working copy the walk records? Not a
+/// reserved name (`.veil`, at any depth), nor a file left by an interrupted
+/// atomic write (crash debris, never content).
+fn counted(e: &DirEntry) -> bool {
+    !crate::object::is_reserved_name(&e.name) && !(e.kind == NodeKind::File && is_temp_name(&e.name))
+}
+
+/// What the listing of its directory told of a leaf ([`Builder::listed`]).
+struct Listed {
+    path: VPath,
+    meta: Option<Metadata>,
+    /// Its classification as a file or a symlink (the kind it was listed
+    /// as): for that kind only.
+    class: Option<(EntryKind, Classification)>,
 }
 
 pub struct BuildOptions<'a> {
@@ -764,6 +786,12 @@ struct Builder<'a> {
     /// For the file just read: its bytes on disk and its line-ending facts
     /// (see [`Builder::line_endings`]), for the stat cache.
     eol_now: Option<(ObjectId, EolFact)>,
+    /// What was learnt of the leaf about to be built as its directory was
+    /// listed (used instead of asking again, for that path only).
+    listed: Option<Listed>,
+    /// Listings made ahead of the walk, on other threads.
+    #[cfg(feature = "os")]
+    prefetch: Option<&'a crate::prefetch::Prefetch<'a>>,
 }
 
 /// Build a tree from `fs`, returning its id and a report.
@@ -811,6 +839,16 @@ pub fn build_tree_cached(
         (Some(c), Some(clock)) => Some(c.begin_run(CacheKey::compute(fs, &store.keys, clock)?, clock)),
         _ => None,
     };
+    // Large working copies on a disk are listed ahead of the walk (see
+    // `prefetch`), from now on: after the clock reading the cache run
+    // took.
+    #[cfg(feature = "os")]
+    let prefetch = match (fs.kind(), run.as_ref().map(CacheRun::len)) {
+        ("disk", Some(files)) if crate::prefetch::workers_for(files) > 0 => {
+            Some((crate::prefetch::Prefetch::new(fs, store, opts.policy, opts.parent_tree), crate::prefetch::workers_for(files)))
+        }
+        _ => None,
+    };
     let parent_policy = match parent.as_ref().and_then(|t| t.get(POLICY_FILE)) {
         // A directory (a hostile tree, BUG-121) holds no rules.
         Some(e) if policy_changed && e.kind != EntryKind::File => None,
@@ -846,6 +884,9 @@ pub fn build_tree_cached(
         links: store.format() >= crate::object::GIT_PARITY_REPO_FORMAT,
         attrs: None,
         eol_now: None,
+        listed: None,
+        #[cfg(feature = "os")]
+        prefetch: prefetch.as_ref().map(|(p, _)| p),
     };
     if let (Some(c), None) = (opts.cloak, b.cloak) {
         b.report.policy_warnings.push(format!(
@@ -853,7 +894,24 @@ pub fn build_tree_cached(
         ));
     }
     let root_parent = parent.clone().zip(opts.parent_tree);
-    let id = match b.build_dir(&VPath::root(), root_parent)? {
+    #[cfg(feature = "os")]
+    let built = match &prefetch {
+        Some((p, workers)) => std::thread::scope(|s| {
+            for _ in 0..*workers {
+                // A worker that cannot start leaves its share to the others
+                // (and the walk).
+                let _ = std::thread::Builder::new().stack_size(256 << 10).spawn_scoped(s, || p.work());
+            }
+            // The workers stop when the walk ends, however it ends (a panic
+            // too: the scope waits for them before passing it on).
+            let _stop = p.stopper();
+            b.build_dir(&VPath::root(), root_parent)
+        }),
+        None => b.build_dir(&VPath::root(), root_parent),
+    };
+    #[cfg(not(feature = "os"))]
+    let built = b.build_dir(&VPath::root(), root_parent);
+    let id = match built? {
         Some(id) => id,
         None => store.empty_tree()?,
     };
@@ -987,7 +1045,7 @@ impl<'a> Builder<'a> {
                     f.out.insert(TreeEntry::dir(&name, id));
                 }
             }
-            let Some(child) = f.entries.get(f.next).cloned() else {
+            let Some(child) = f.entries.get(f.next) else {
                 let fin = stack.pop().expect("checked");
                 let id = self.finish_dir(fin)?;
                 if stack.is_empty() {
@@ -996,25 +1054,38 @@ impl<'a> Builder<'a> {
                 done = Some(id);
                 continue;
             };
-            f.next += 1;
+            let kind = child.kind;
             // `.veil` is reserved at every depth (trees containing it are
             // refused on decode). A directory holding one is a nested
             // repository, left out as a whole by `open_dir`.
-            if crate::object::is_reserved_name(&child.name) {
+            if !counted(child) {
+                if !crate::object::is_reserved_name(&child.name) {
+                    // Crash debris of an interrupted atomic write, never content.
+                    self.report.ignored += 1;
+                }
+                f.next += 1;
                 continue;
             }
-            // Crash debris of an interrupted atomic write, never content.
-            if child.kind == NodeKind::File && is_temp_name(&child.name) {
-                self.report.ignored += 1;
-                continue;
-            }
-            f.seen.insert(child.name.clone());
             let path = f.dir.join(&child.name);
-            let parent_entry = f.parent.as_ref().and_then(|(t, _)| t.get(&child.name)).cloned();
-            match child.kind {
+            let meta = f.stats.get_mut(f.next).and_then(Option::take);
+            let class = f.classes.get_mut(f.next).and_then(Option::take);
+            f.next += 1;
+            let name = path.file_name();
+            self.listed = (meta.is_some() || class.is_some()).then(|| Listed {
+                path: path.clone(),
+                meta,
+                class: class.and_then(|c| match kind {
+                    NodeKind::File => Some((EntryKind::File, c)),
+                    NodeKind::Symlink => Some((EntryKind::Symlink, c)),
+                    NodeKind::Dir => None,
+                }),
+            });
+            let parent_tree = f.parent.as_ref().map(|(t, _)| t.clone());
+            let parent_entry = parent_tree.as_deref().and_then(|t| t.get(name));
+            match kind {
                 NodeKind::Dir => {
                     let class = self.opts.policy.classify(&path, true);
-                    let pdir = parent_entry.clone().filter(|e| e.kind == EntryKind::Dir);
+                    let pdir = parent_entry.filter(|e| e.kind == EntryKind::Dir);
                     if class.tier == Tier::Ignored {
                         self.report.ignored += 1;
                         self.report.ignored_paths.push((path.clone(), true));
@@ -1027,13 +1098,13 @@ impl<'a> Builder<'a> {
                                 wanted: tier_keyword(t, *force),
                                 dir: true,
                             });
-                            if let Some(pe) = &pdir {
+                            if let Some(pe) = pdir {
                                 f.out.insert(pe.clone());
                             }
                         }
                         continue;
                     }
-                    if let Some(pe) = &pdir {
+                    if let Some(pe) = pdir {
                         if self.use_hints && self.fs.known_id(&path) == Some(pe.id) {
                             f.out.insert(pe.clone());
                             continue;
@@ -1044,7 +1115,7 @@ impl<'a> Builder<'a> {
                             .unreadable
                             .push((path, format!("directory nesting exceeds {MAX_TREE_DEPTH} levels")));
                         if let Some(pe) = pdir {
-                            f.out.insert(pe);
+                            f.out.insert(pe.clone());
                         }
                         continue;
                     }
@@ -1052,17 +1123,18 @@ impl<'a> Builder<'a> {
                         Some(e) => Some((self.store.tree(&e.id)?, e.id)),
                         None => None,
                     };
+                    let name = name.to_string();
                     match self.open_dir(path, sub)? {
-                        Opened::Done(Some(id)) => f.out.insert(TreeEntry::dir(&child.name, id)),
+                        Opened::Done(Some(id)) => f.out.insert(TreeEntry::dir(&name, id)),
                         Opened::Done(None) => {}
                         Opened::Frame(c) => {
-                            f.waiting = Some(child.name.clone());
+                            f.waiting = Some(name);
                             stack.push(c);
                         }
                     }
                 }
                 NodeKind::File => {
-                    if let Some(e) = self.file_entry(&path, &child.name, parent_entry.as_ref(), EntryKind::File)? {
+                    if let Some(e) = self.file_entry(&path, name, parent_entry, EntryKind::File)? {
                         self.report.files += 1;
                         f.out.insert(e);
                     }
@@ -1074,13 +1146,13 @@ impl<'a> Builder<'a> {
                     if let Some(pe) = parent_entry {
                         let tier = self.opts.policy.classify(&path, pe.kind == EntryKind::Dir).tier;
                         if !matches!(tier, Tier::Ignored | Tier::Isolated) {
+                            f.out.insert(pe.clone());
                             self.report.shadowed.push(path);
-                            f.out.insert(pe);
                         }
                     }
                 }
                 NodeKind::Symlink => {
-                    if let Some(e) = self.file_entry(&path, &child.name, parent_entry.as_ref(), EntryKind::Symlink)? {
+                    if let Some(e) = self.file_entry(&path, name, parent_entry, EntryKind::Symlink)? {
                         self.report.files += 1;
                         f.out.insert(e);
                     }
@@ -1092,8 +1164,9 @@ impl<'a> Builder<'a> {
     /// List `dir` and start its frame, or finish at once (vanished or
     /// unreadable directory).
     fn open_dir(&mut self, dir: VPath, parent: Option<(Arc<Tree>, ObjectId)>) -> Result<Opened> {
-        let listing = match self.fs.list_dir_full(&dir) {
-            Ok(l) if self.folding.folds() => self.canonical_names(&dir, l, parent.as_ref().map(|(t, _)| &**t)),
+        let (listing, classes) = match self.list_dir(&dir, parent.as_ref().map(|(t, _)| &**t)) {
+            // Names may change: classified again, under the names recorded.
+            Ok((l, _)) if self.folding.folds() => (self.canonical_names(&dir, l, parent.as_ref().map(|(t, _)| &**t)), Vec::new()),
             Ok(l) => l,
             // Vanished while we were building: a deletion like any other.
             Err(e) if e.is_not_found() && !dir.is_root() => return Ok(Opened::Done(None)),
@@ -1116,7 +1189,7 @@ impl<'a> Builder<'a> {
             });
         }
         let mut out = Tree::default();
-        let mut seen = HashSet::new();
+        let mut kept_special = Vec::new();
         // A tracked path that is now a symlink (or socket, device…) is never
         // followed, and is not a deletion either: keep the tracked entry.
         for name in &listing.special {
@@ -1126,28 +1199,54 @@ impl<'a> Builder<'a> {
                 if matches!(tier, Tier::Ignored | Tier::Isolated) {
                     continue; // no longer tracked by policy anyway
                 }
-                seen.insert(name.clone());
+                kept_special.push(name.clone());
                 self.report.shadowed.push(path);
                 out.insert(pe.clone());
             }
         }
+        // Stats and classes only stand for the names they were listed under.
+        let stats = match listing.stats.len() == listing.entries.len() {
+            true => listing.stats,
+            false => Vec::new(),
+        };
+        let classes = match classes.len() == listing.entries.len() {
+            true => classes,
+            false => Vec::new(),
+        };
         Ok(Opened::Frame(BuildFrame {
             dir,
             parent,
             entries: listing.entries,
+            stats,
+            classes,
             next: 0,
             out,
-            seen,
+            kept_special,
             waiting: None,
         }))
     }
 
+    /// `dir`'s listing (`tree`: its tree in the parent snapshot).
+    #[allow(unused_variables)]
+    fn list_dir(&self, dir: &VPath, tree: Option<&Tree>) -> Result<(DirListing, Vec<Option<Classification>>)> {
+        #[cfg(feature = "os")]
+        if let Some(p) = self.prefetch {
+            return p.list(dir, tree);
+        }
+        Ok((self.fs.list_dir_full(dir)?, Vec::new()))
+    }
+
     fn finish_dir(&mut self, f: BuildFrame) -> Result<Option<ObjectId>> {
-        let BuildFrame { dir, parent, mut out, seen, .. } = f;
+        let BuildFrame { dir, parent, mut out, entries, kept_special, .. } = f;
+        // What the walk looked at: every listed entry (sorted by name) but
+        // reserved names and crash debris, and the special entries kept.
+        let seen = |name: &str| {
+            entries.binary_search_by(|e| e.name.as_str().cmp(name)).is_ok_and(|i| counted(&entries[i])) || kept_special.iter().any(|n| n == name)
+        };
         // Entries we could never have materialised are not deletions.
         if let Some((p, _)) = &parent {
             for e in &p.entries {
-                if !seen.contains(&e.name) {
+                if !seen(&e.name) {
                     if let Some(c) = self.carry_unreadable(e, &dir.join(&e.name))? {
                         out.insert(c);
                     }
@@ -1176,6 +1275,8 @@ impl<'a> Builder<'a> {
     /// used if the backend really resolves it, so a wrongly reported
     /// folding can never make a file look deleted.
     fn canonical_names(&self, dir: &VPath, mut listing: DirListing, parent: Option<&Tree>) -> DirListing {
+        // Names may change and entries move: stats are taken again.
+        listing.stats.clear();
         let folding = self.folding;
         let tracked: HashMap<std::borrow::Cow<'_, str>, &str> = parent
             .map(|t| t.entries.iter().map(|e| (folding.key(&e.name), e.name.as_str())).collect())
@@ -1627,9 +1728,16 @@ impl<'a> Builder<'a> {
     fn plain_file_entry(&mut self, path: &VPath, name: &str, parent_entry: Option<&TreeEntry>, kind: EntryKind) -> Result<Option<TreeEntry>> {
         self.eol_now = None;
         let parent_file = parent_entry.filter(|e| e.kind == kind);
-        let class = match kind {
-            EntryKind::Symlink => self.opts.policy.classify_link(path),
-            _ => self.opts.policy.classify(path, false),
+        let (listed, listed_class) = match self.listed.take().filter(|l| l.path == *path) {
+            Some(l) => (l.meta, l.class),
+            None => (None, None),
+        };
+        let class = match listed_class.filter(|(k, _)| *k == kind) {
+            Some((_, c)) => c,
+            None => match kind {
+                EntryKind::Symlink => self.opts.policy.classify_link(path),
+                _ => self.opts.policy.classify(path, false),
+            },
         };
         if class.blocked_exposure {
             self.report.blocked_exposures.push(path.clone());
@@ -1693,9 +1801,12 @@ impl<'a> Builder<'a> {
             }
         }
 
-        let meta = match self.fs.metadata(path) {
-            Ok(m) => m,
-            Err(e) => return self.unreadable(path, e, parent_file),
+        let meta = match listed {
+            Some(m) => Some(m),
+            None => match self.fs.metadata(path) {
+                Ok(m) => m,
+                Err(e) => return self.unreadable(path, e, parent_file),
+            },
         };
         // Vanished, or replaced by something else since it was listed.
         let want = match kind {
@@ -2355,9 +2466,33 @@ impl<'a> Builder<'a> {
         allow_secrets: bool,
         parent_file: Option<&TreeEntry>,
     ) -> Result<Option<TreeEntry>> {
-        let Some(rec) = self.cache.as_ref().and_then(|c| c.trusted(path, meta)).cloned() else {
+        let Some((key, rec)) = self.cache.as_mut().and_then(|c| c.take_trusted(path, meta)) else {
             return Ok(None);
         };
+        let entry = self.entry_from_record(path, name, meta, desired, cloak_fallback, allow_secrets, parent_file, &rec);
+        // A record that made the entry is carried into the next run.
+        if let Some(run) = self.cache.as_mut() {
+            match entry {
+                Ok(Some(_)) => run.keep_taken(key, rec),
+                _ => run.give_back(key, rec),
+            }
+        }
+        entry
+    }
+
+    /// [`Builder::cached_entry`] from `rec`, the trusted record of `path`.
+    #[allow(clippy::too_many_arguments)]
+    fn entry_from_record(
+        &mut self,
+        path: &VPath,
+        name: &str,
+        meta: &Metadata,
+        desired: &Visibility,
+        cloak_fallback: Option<ObjectId>,
+        allow_secrets: bool,
+        parent_file: Option<&TreeEntry>,
+        rec: &crate::statcache::Record,
+    ) -> Result<Option<TreeEntry>> {
         // Content holding a CR: its facts only hold for the parent entry
         // they were learned against and the attributes then in force (the
         // file is read again otherwise, once).
@@ -2408,9 +2543,6 @@ impl<'a> Builder<'a> {
                 self.report.renormalizable.push(path.clone());
             }
             self.report.cache_hits += 1;
-            if let Some(run) = self.cache.as_mut() {
-                run.keep(path, rec);
-            }
         }
         Ok(entry)
     }

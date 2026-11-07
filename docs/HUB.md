@@ -831,7 +831,7 @@ protocol as pure functions, shared with `vl`; they build for WASM),
 | HTTPS API | tokio, axum, hyper, rustls (ring) | TLS on every connection; `--tls-cert/--tls-key`, or a self-signed certificate (rcgen) for `localhost`/`127.0.0.1` created in the data directory, which `vl login --ca FILE` pins for that server |
 | Metadata | sqlx, PostgreSQL 17 (development, CI) and YugabyteDB 2025.2 | portable SQL only; read-check-write transactions are SERIALIZABLE through `db::serializable`, except where unique keys and row locks decide the races (branch moves, sign-in, project and group creation, group changes: READ COMMITTED, because on YugabyteDB a SERIALIZABLE read blocks every insert into the table it read until it commits, BUG-847); retried with capped exponential backoff on `40001`/`40P01` (YugabyteDB reports conflicts as both) |
 | Migrations | `db::migrate`, `migrations/0001_initial.sql`, `0002_device_vouches.sql` (pending devices, vouches: §13.11), `0003_invites_and_key_sharing.sql` (invites, key requests, pending devices by fingerprint and the fingerprints a person waits for, devices barred from one project: §13.12), `0004_access_epochs.sql` (access epochs and the triggers that bump them: §13.13) | each in its own transaction, recorded in `schema_migrations`; servers starting together race on its primary key and the loser re-checks. On PostgreSQL DDL is transactional; on YugabyteDB DDL inside a transaction block is applied statement by statement unless transactional DDL is enabled, so **migration files are idempotent** (`IF NOT EXISTS`) and a half-applied one is completed by the next start |
-| Object storage | `store::BlobStore`: `FsStore` (a directory; unit tests, development) and `S3Store` (rusty-s3 request signing + reqwest; tested against MinIO) | key `p/<project id>/ab/cdef…`: projects never share an object; every read is re-hashed against its id; an in-memory cache of objects and decoded trees |
+| Object storage | `store::BlobStore`: `FsStore` (a directory; unit tests, development) and `S3Store` (rusty-s3 request signing + reqwest; tested against MinIO) | key `p/<project id>/ab/cdef…`: projects never share an object; every read is re-hashed against its id; an in-memory cache of objects and decoded trees (256 MiB each, decoded trees weighed by the memory they hold: BUG-860). Every S3 request is idempotent (GET, HEAD, PUT of a key naming its content) and is tried again for up to 10 s, with jittered waits doubling from 25 ms to 1 s, when its connection closes or resets or the store answers 5xx; idle connections are dropped after 15 s, before S3 services drop them (BUG-861) |
 | Server identity | an Ed25519 `Identity` in `<data>/hub-identity.json` (0600); a random secret in `<data>/hub-receipt-key` (0600) | signs projected snapshots (§13.4); its key is shown by `vl login`. The secret keys upload receipts (§13.5); servers sharing the data directory accept each other's |
 
 **YugabyteDB's licence (checked 2026-11-06).** The `LICENSE.md` shipped in
@@ -993,8 +993,15 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
   has. **Revision 1** (`Tips::revision`, performance round 2): a want may
   name its own snapshot, so a pull behind by many landings asks once per
   level instead of once per snapshot and level; `vl` asks a server of
-  revision 0 the old way. A level of more than 2,000 objects is fetched as
-  up to 8 requests at once (`Client::fetch_all`). From 16 objects a pull
+  revision 0 the old way. A level is fetched in parts of at most 2,500
+  objects and about 8 MiB (by the sizes tree entries carry), a snapshot's
+  wants together, up to 8 requests at once; each part's objects are
+  written as the part arrives, so a clone's memory does not grow with a
+  level (`Client::fetch_each`, BUG-859). The server checks every want of
+  a request first, a snapshot at a time (that snapshot's projected trees
+  are dropped before the next), then streams the answer, reading 64
+  objects or about 8 MiB at a time (BUG-860); an answer that fails part
+  way ends in an error, never as a shorter whole. From 16 objects a pull
   stores what it received as one pack, compressed on several threads (one
   fsync instead of one, a rename and a directory sync per object). `vl clone URL --only DIR`
   fetches the root, the trees on the way to `DIR`, and `DIR`'s subtree
@@ -1017,6 +1024,15 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
   new snapshot signed by a registered device key) and 12 (fast-forward
   unless an admin forces) are built. Cloaked lines and embargoed content
   are refused in S1. Not built: 9 (the server-side secret scan), 11, 13.
+* **What a push uploads** (`hub::push`, `hub::Introduced`): every new
+  snapshot and, at each path where its tree differs from all of its
+  parents' trees, the trees down to that path and what the entry there
+  names that no parent's entry at that path names: exactly what check 7
+  asks a receipt for. A tree is walked once for each set of parent trees
+  it is compared with (BUG-857: walked once per push, a tree reused by a
+  later snapshot hid the files an earlier one introduced, and the server
+  refused the push). Objects go up as the walk finds them, about 8 MiB
+  per request (BUG-858).
 * **The default branch's move accepts its policy** in the same
   transaction, admins only.
 * **Objects first, then the branch move:** a crash leaves only

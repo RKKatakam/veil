@@ -110,6 +110,10 @@ impl StorageBackend for Pause {
         self.inner.write_unsynced(path, data)
     }
     fn rename_unsynced(&self, from: &VPath, to: &VPath) -> Result<()> {
+        // The staged head file named (format 6): as `create_new` below.
+        if to.as_str().starts_with(OP_HEADS_DIR) {
+            self.stop_here(At::OpHead);
+        }
         self.inner.rename_unsynced(from, to)?;
         if from.as_str().contains("/incoming/tx-") && self.renames.fetch_add(1, Ordering::SeqCst) == 0 {
             self.stop_here(At::FirstRename);

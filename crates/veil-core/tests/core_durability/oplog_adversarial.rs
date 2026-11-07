@@ -273,6 +273,16 @@ impl StorageBackend for PublishGate {
         }
         self.inner.create_new(path, data)
     }
+    /// A staged head file renamed into `op_heads/` (format 6): the same
+    /// moment as `create_new` above.
+    fn rename_unsynced(&self, from: &veil_core::VPath, to: &veil_core::VPath) -> veil_core::Result<()> {
+        let me = std::thread::current().name() == Some("recorder-a");
+        if me && to.as_str().starts_with(OP_HEADS_DIR) && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            Self::set(&self.at);
+            Self::wait(&self.go);
+        }
+        self.inner.rename_unsynced(from, to)
+    }
     fn remove_file(&self, path: &veil_core::VPath) -> veil_core::Result<()> {
         self.inner.remove_file(path)
     }

@@ -347,6 +347,7 @@ impl StatCache {
         let old = std::mem::take(&mut self.records);
         CacheRun {
             new: HashMap::with_capacity(old.len()),
+            old_len: old.len(),
             old,
             verified_at: clock.now,
             exact: clock.exact,
@@ -355,7 +356,7 @@ impl StatCache {
     }
 
     pub(crate) fn end_run(&mut self, run: CacheRun) {
-        self.dirty |= run.changed || run.new.len() != run.old.len();
+        self.dirty |= run.changed || run.new.len() != run.old_len;
         self.records = run.new;
     }
 }
@@ -363,7 +364,10 @@ impl StatCache {
 /// One build's view of the cache: lookups go to the records from the last
 /// run, and only paths seen in this run survive into the next one.
 pub(crate) struct CacheRun {
+    /// The last run's records not yet used by this one.
     old: HashMap<VPath, Record>,
+    /// How many records the last run left.
+    old_len: usize,
     new: HashMap<VPath, Record>,
     verified_at: i64,
     exact: bool,
@@ -371,6 +375,35 @@ pub(crate) struct CacheRun {
 }
 
 impl CacheRun {
+    /// How many records the last run left (about the working copy's files).
+    #[cfg(feature = "os")]
+    pub(crate) fn len(&self) -> usize {
+        self.old_len
+    }
+
+    /// [`CacheRun::trusted`], moved out of the last run's records: carried
+    /// into the next run with [`CacheRun::keep_taken`] once used, or given
+    /// back with [`CacheRun::give_back`] (no copy of the path or the record).
+    pub(crate) fn take_trusted(&mut self, path: &VPath, meta: &Metadata) -> Option<(VPath, Record)> {
+        let stamp = Stamp::of(meta)?;
+        let (path, rec) = self.old.remove_entry(path)?;
+        if rec.vouches_for(&stamp, self.exact) {
+            return Some((path, rec));
+        }
+        self.old.insert(path, rec);
+        None
+    }
+
+    /// Carry a record taken by [`CacheRun::take_trusted`] into the next run.
+    pub(crate) fn keep_taken(&mut self, path: VPath, rec: Record) {
+        self.new.insert(path, rec);
+    }
+
+    /// A record taken by [`CacheRun::take_trusted`] and not used.
+    pub(crate) fn give_back(&mut self, path: VPath, rec: Record) {
+        self.old.insert(path, rec);
+    }
+
     /// The record for `path` if it can vouch for the file's current stat.
     pub(crate) fn trusted(&self, path: &VPath, meta: &Metadata) -> Option<&Record> {
         let stamp = Stamp::of(meta)?;
