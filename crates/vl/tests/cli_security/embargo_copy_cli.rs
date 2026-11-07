@@ -495,3 +495,151 @@ fn random_rewrites_never_push_what_an_unreleased_embargo_withholds() {
     }
     println!("{withdrawn_cases} of {CASES} cases ended with the embargo withdrawn");
 }
+
+
+// ---- Simplification cycle 4 ----------------------------------------------------
+
+/// BUG-1040 (pre-existing on 82429c6): the fix squashed into work built on
+/// the embargoed merge (allowed: a copy inside the embargo) leaves its
+/// content in a change that is withheld only because it descends from the
+/// merge. Dropping the merge then (abandoning it, or squashing it into that
+/// work) rebases the work onto v1, and no check sees it: no version of a
+/// fix-line change is visible any more (`check_withheld` compares only
+/// versions), and the confinement check skips an embargo whose merge is
+/// gone. `vl embargo list` calls the embargo withdrawn, the push gives no
+/// warning, and it publishes the fix.
+#[test]
+#[ignore = "BUG-1040: squashing the fix into work on the merge, then dropping the merge, publishes the fix"]
+fn the_fix_squashed_into_work_on_the_merge_stays_withheld_when_the_merge_goes() {
+    for route in ["abandon", "squash"] {
+        let env = Env::new();
+        let (r, _) = embargoed(&env);
+        r.ok(&["new", "main"]);
+        r.commit("follow-up", &[("f.c", "f\n")]);
+        r.tag("fu", "@-");
+        // Inside the embargo: allowed.
+        r.ok(&["squash", "-r", "fix", "--into", "fu"]);
+        let _ = match route {
+            "abandon" => r.run(&["abandon", "main"]),
+            _ => r.run(&["squash", "-r", "main", "--into", "fu"]),
+        };
+        publishes_nothing(&env, &r);
+    }
+}
+
+/// BUG-1041 (pre-existing on 82429c6): `vl undo --op` carries "the edits
+/// recorded since" the undone operation over to the working copy it
+/// restores, as the difference between the working copy that operation
+/// left and the current one (`Repo::restore_view_keeping_edits`). When the
+/// working copy moved to another change since (`vl edit`, `vl new`), that
+/// difference is the other change's whole content: here the fix, 3-way
+/// merged into a change on the public line, where `vl status` lists its
+/// files as plain additions and the next commit and push publish them. The
+/// rewrite keeps the change's parents, so the confinement check never
+/// judges it. Plain `vl undo` reaches it too, after an earlier `undo --op`
+/// moved the working copy (the randomized test below).
+#[test]
+#[ignore = "BUG-1041: vl undo --op copies the change being edited into the restored working copy"]
+fn undo_never_copies_the_change_being_edited_into_another() {
+    for route in ["edit", "new"] {
+        let env = Env::new();
+        let (r, v1) = embargoed(&env);
+        with_child(&r, &v1);
+        other(&r, &v1);
+        r.ok(&["abandon", "other"]);
+        let abandon = r.op_head();
+        r.ok(&[route, "fixchild"]);
+        r.ok(&["undo", "--op", &abandon]);
+        // The restored working copy is the empty change on `other` again.
+        assert!(!r.exists("FIXNAME-K7.c") && !r.exists("child.c"), "{route}: the fix's files are in the working copy on other");
+        r.ok(&["commit", "-m", "work"]);
+        publishes_nothing(&env, &r);
+    }
+}
+
+/// The randomized test above with working-copy commands too (`redo`,
+/// `edit`, `merge`, abandoning two changes, committing a new file) and
+/// work built on the embargoed merge (`fu`). Seed 0x7777deadbeef0001 finds
+/// BUG-1041 in case 6 (`vl undo --op` after `vl edit fixchild`, then a
+/// commit); seed 0xa1b2c3d4e5f60718 finds it in case 4 through plain `vl
+/// undo`.
+#[test]
+#[ignore = "BUG-1041: vl undo --op copies the change being edited into the restored working copy"]
+fn random_rewrites_and_working_copy_commands_never_push_what_an_unreleased_embargo_withholds() {
+    const CASES: usize = 7;
+    const STEPS: usize = 24;
+    let markers = ["FIXNAME-K7", "FIX2-K7", "FIXBODY-K7", "FIXDESC-K7", "CHILDDESC-K7"];
+    let mut rng = Rng(0x7777_dead_beef_0001);
+    for case in 0..CASES {
+        let env = Env::new();
+        let (r, v1) = embargoed(&env);
+        with_child(&r, &v1);
+        r.ok(&["new", "main"]);
+        r.commit("follow-up", &[("f.c", "f\n")]);
+        r.tag("fu", "@-");
+        other(&r, &v1);
+        let mirror = env.dir("mirror");
+        env.run(U, &mirror, &["init", "--bare"]);
+        r.ok(&["remote", "add", "pub", mirror.to_str().unwrap(), "--public"]);
+        let mut revs: Vec<String> = ["fix", "main", "main-", "fixchild", "other", "@", "@-", v1.as_str(), "fu"].iter().map(|s| s.to_string()).collect();
+        for n in ["fix", "main", "fixchild"] {
+            revs.push(r.sid(n)[..16].to_string());
+        }
+        let mut ops: Vec<String> = vec![r.op_head()];
+        let mut log = Vec::new();
+        for step in 0..STEPS {
+            let a = rng.pick(&revs).to_string();
+            let b = rng.pick(&revs).to_string();
+            let n = rng.next();
+            let args: Vec<String> = match n % 15 {
+                0 if n.is_multiple_of(3) => vec!["squash".into(), "-r".into(), a],
+                0 => vec!["squash".into(), "-r".into(), a, "--into".into(), b],
+                1 if n.is_multiple_of(3) => vec!["rebase".into(), "-s".into(), a, "-d".into(), b],
+                1 if n % 3 == 1 => vec!["rebase".into(), "-r".into(), a, "-d".into(), b.clone(), "-d".into(), rng.pick(&revs).to_string()],
+                1 => vec!["rebase".into(), "-r".into(), a, "-d".into(), b],
+                2 => vec!["describe".into(), "-r".into(), a, "-m".into(), format!("reworded {step}")],
+                3 if n.is_multiple_of(2) => vec!["undo".into()],
+                3 => vec!["undo".into(), "--op".into(), rng.pick(&ops).to_string()],
+                4 => vec!["restore".into(), "--from".into(), a],
+                5 => vec!["tag".into(), "set".into(), ["fix", "main", "rel", "fu"][(n / 10 % 4) as usize].into(), "-r".into(), a],
+                6 if n.is_multiple_of(2) => vec!["new".into(), a, b],
+                6 => vec!["new".into(), a],
+                7 => vec!["split".into(), "-r".into(), a, ["FIXNAME-K7.c", "a.c", "child.c", "f.c"][(n / 10 % 4) as usize].into()],
+                8 => vec!["abandon".into(), a],
+                9 => vec!["duplicate".into(), a, "-d".into(), b],
+                10 => vec!["redo".into()],
+                11 => vec!["edit".into(), a],
+                12 => vec!["merge".into(), a, "--into".into(), b],
+                13 => vec!["abandon".into(), a, b],
+                _ => {
+                    r.write(&format!("w{step}.c"), "w\n");
+                    vec!["commit".into(), "-m".into(), format!("work {step}")]
+                }
+            };
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = r.run(&argv);
+            assert!(exited_cleanly(&out), "case {case}, {argv:?} crashed:\n{}", text(&out));
+            log.push(format!("{argv:?} -> {}", if out.status.success() { "ok" } else { "refused" }));
+            ops.push(r.op_head());
+            for rev in ["fix", "main", "@", "@-", "fixchild", "fu"] {
+                if let Some(s) = r.try_snap(rev) {
+                    let id = s.id[..16].to_string();
+                    if !revs.contains(&id) {
+                        revs.push(id);
+                    }
+                }
+            }
+            let push = text(&r.run(&["push", "pub"]));
+            let leaked: Vec<&str> = markers.iter().copied().filter(|m| !store_contains(&mirror, m.as_bytes()).is_empty()).collect();
+            if !leaked.is_empty() {
+                let list = r.ok(&["embargo", "list"]);
+                assert!(
+                    list.contains("withdrawn") && push.contains("withdrawn"),
+                    "case {case}: {leaked:?} reached the public remote while the embargo is not withdrawn:\n{}\nembargo list: {list}\npush: {push}",
+                    log.join("\n")
+                );
+                break;
+            }
+        }
+    }
+}
