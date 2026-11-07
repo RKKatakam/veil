@@ -262,31 +262,43 @@ fn objects_of(body: &[u8]) -> Result<Vec<(ObjectId, Vec<u8>)>> {
     Ok(encoding::read_frames(body, ANSWER_LIMIT)?.into_iter().map(|(id, raw)| (id, raw.into_owned())).collect())
 }
 
-/// An answer of frames decoded into one buffer: each object's id and its
-/// bytes' range. One allocation per answer, so decoding on the fetch
-/// threads holds what a plain answer did (not one allocation per object
-/// in each thread's arena).
+/// Frames decoded into one buffer: each object's bytes' range, in order.
 struct Decoded {
     bytes: Vec<u8>,
-    objects: Vec<(ObjectId, std::ops::Range<usize>)>,
+    objects: Vec<std::ops::Range<usize>>,
 }
 
 impl Decoded {
-    fn of(body: &[u8]) -> Result<Decoded> {
-        let frames = encoding::split_frames(body)?;
-        // Sized once from what the encodings declare (each decode is still
-        // bounded on its own).
+    /// `frames` decoded (each bounded, and at most `limit` bytes in all)
+    /// and checked against their ids, into one buffer sized from what the
+    /// encodings declare.
+    fn of(frames: &[(ObjectId, &[u8])], limit: u64) -> Result<Decoded> {
         let size: u64 = frames.iter().map(|(_, enc)| encoding::decoded_len(enc).unwrap_or(0)).sum();
-        let mut d = Decoded { bytes: Vec::with_capacity(size.min(256 << 20) as usize), objects: Vec::with_capacity(frames.len()) };
-        let mut left = ANSWER_LIMIT;
+        let mut d = Decoded { bytes: Vec::with_capacity(size.min(limit).min(256 << 20) as usize), objects: Vec::with_capacity(frames.len()) };
+        let mut left = limit;
         for (id, enc) in frames {
-            let raw = encoding::decode(&id, enc, left.min(veil_core::hub::wire::MAX_FRAME_OBJECT as u64))?;
+            let raw = encoding::decode(id, enc, left.min(veil_core::hub::wire::MAX_FRAME_OBJECT as u64))?;
             left -= raw.len() as u64;
             let start = d.bytes.len();
             d.bytes.extend_from_slice(&raw);
-            d.objects.push((id, start..d.bytes.len()));
+            d.objects.push(start..d.bytes.len());
         }
         Ok(d)
+    }
+
+    /// An answer's frames decoded on up to 8 threads, in order: one
+    /// answer is decoded at a time, so only answers as sent (compressed)
+    /// wait in flight.
+    fn parallel(frames: &[(ObjectId, &[u8])]) -> Result<Vec<Decoded>> {
+        let threads = (frames.len() / 256).clamp(1, 8);
+        if threads == 1 {
+            return Ok(vec![Decoded::of(frames, ANSWER_LIMIT)?]);
+        }
+        let chunk = frames.len().div_ceil(threads);
+        std::thread::scope(|s| {
+            let parts: Vec<_> = frames.chunks(chunk).map(|c| s.spawn(move || Decoded::of(c, ANSWER_LIMIT / threads as u64))).collect();
+            parts.into_iter().map(|p| p.join().map_err(|_| anyhow!("a decoding thread panicked"))?).collect()
+        })
     }
 }
 
@@ -509,22 +521,27 @@ impl Client {
         if start < wants.len() {
             parts.push(start..wants.len());
         }
-        // Each part's answer decoded where it arrives (on the fetch
-        // threads), then checked against its wants here.
-        let mut check = |part: &[Want], got: Decoded| -> Result<()> {
-            if got.objects.len() != part.len() {
-                bail!("the server sent {} objects for {} asked", got.objects.len(), part.len());
+        // Each part's answer checked against its wants, then decoded here
+        // (on several threads): only answers as sent (compressed) wait in
+        // flight, and one answer at a time is held decoded.
+        let mut check = |part: &[Want], body: &[u8]| -> Result<()> {
+            let frames = encoding::split_frames(body)?;
+            if frames.len() != part.len() {
+                bail!("the server sent {} objects for {} asked", frames.len(), part.len());
             }
-            for (w, (id, range)) in part.iter().zip(got.objects) {
-                if id != w.id {
-                    bail!("the server sent another object than asked");
+            if part.iter().zip(&frames).any(|(w, (id, _))| *id != w.id) {
+                bail!("the server sent another object than asked");
+            }
+            let mut wants = part.iter();
+            for d in Decoded::parallel(&frames)? {
+                for range in d.objects {
+                    f(wants.next().expect("one want per frame"), d.bytes[range].to_vec())?;
                 }
-                f(w, got.bytes[range].to_vec())?;
             }
             Ok(())
         };
         if parts.len() == 1 {
-            return check(wants, Decoded::of(&self.fetch_body(snapshot, wants.to_vec())?)?);
+            return check(wants, &self.fetch_body(snapshot, wants.to_vec())?);
         }
         let token = self.token.borrow().clone();
         let url = format!("{}{}", self.url.base(), self.url.project_path("/fetch"));
@@ -533,21 +550,20 @@ impl Client {
         std::thread::scope(|s| -> Result<()> {
             // A part fetched waits here until the one before is written:
             // at most one answer per request in flight, plus this one.
-            let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Option<Decoded>)>(0);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Option<Vec<u8>>)>(0);
             for _ in 0..FETCH_REQUESTS.min(parts.len()) {
                 let (tx, url, token, next) = (tx.clone(), &url, &token, &next);
                 s.spawn(move || loop {
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(p) = parts.get(i) else { break };
-                    let body = (|| -> Option<Decoded> {
+                    let body = (|| -> Option<Vec<u8>> {
                         let body = serde_json::to_vec(&FetchRequest { snapshot, objects: wants[p.clone()].to_vec() }).ok()?;
                         let mut r = agent.post(url).header("content-type", "application/json").header("accept", ACCEPT);
                         if let Some(t) = token {
                             r = r.header("authorization", &format!("Bearer {t}"));
                         }
                         let resp = r.send(&body[..]).ok()?;
-                        let body = (resp.status().as_u16() == 200).then(|| read_body(resp).ok()).flatten()?;
-                        Decoded::of(&body).ok()
+                        (resp.status().as_u16() == 200).then(|| read_body(resp).ok()).flatten()
                     })();
                     // The receiver is gone when writing failed: stop.
                     if tx.send((i, body)).is_err() {
@@ -560,10 +576,10 @@ impl Client {
                 let (i, body) = rx.recv().map_err(|_| anyhow!("a fetch thread stopped"))?;
                 let part = &wants[parts[i].clone()];
                 match body {
-                    Some(got) => check(part, got)?,
+                    Some(body) => check(part, &body)?,
                     // Anything else (a session to renew, an error to
                     // report): this part again, the ordinary way.
-                    None => check(part, Decoded::of(&self.fetch_body(snapshot, part.to_vec())?)?)?,
+                    None => check(part, &self.fetch_body(snapshot, part.to_vec())?)?,
                 }
             }
             Ok(())
@@ -1239,15 +1255,24 @@ mod tests {
         assert_ne!(plain, encoded);
         assert_eq!(objects_of(&plain).unwrap(), objs);
         assert_eq!(objects_of(&encoded).unwrap(), objs);
-        for body in [&plain, &encoded] {
-            let d = Decoded::of(body).unwrap();
-            let got: Vec<(ObjectId, Vec<u8>)> = d.objects.iter().map(|(id, r)| (*id, d.bytes[r.clone()].to_vec())).collect();
-            assert_eq!(got, objs);
+        // Decoded on several threads (a large answer), in order.
+        let many: Vec<(ObjectId, Vec<u8>)> = (0..2000)
+            .map(|i| format!("veil:blob\nobject {i} {}", "text ".repeat(i % 50)).into_bytes())
+            .map(|r| (ObjectId::hash(&r), r))
+            .collect();
+        let mut body = Vec::new();
+        for (id, raw) in &many {
+            put_frame(&mut body, id, &encoding::encode(raw));
         }
-        let mut bad = encoded.clone();
+        let frames = encoding::split_frames(&body).unwrap();
+        let parts = Decoded::parallel(&frames).unwrap();
+        assert!(parts.len() > 1);
+        let got: Vec<Vec<u8>> = parts.iter().flat_map(|d| d.objects.iter().map(|r| d.bytes[r.clone()].to_vec())).collect();
+        assert_eq!(got, many.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>());
+        let mut bad = body.clone();
         let last = bad.len() - 1;
         bad[last] ^= 1;
-        assert!(Decoded::of(&bad).is_err());
+        assert!(Decoded::parallel(&encoding::split_frames(&bad).unwrap()).is_err());
     }
 
     #[test]
