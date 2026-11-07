@@ -8,8 +8,9 @@ developers and reviewers are in [`docs/ARCHITECTURE.md`](../ARCHITECTURE.md),
 is always connected to the Veil server, which stores the code and enforces
 who can see what ([VISIBILITY.md](../VISIBILITY.md)). Its first milestone
 is built: [The Veil server](the-server.md), and `vl` syncs only through it.
-Where a page shows cloaking or scopes, that is today's client: folder access
-on the server replaces it in the next part of the simplification pass.
+Only secret files (`.env`, keys) are ever encrypted: where a page shows
+cloaking or scopes, it is about secret files; folders and code are plain
+text behind folder access (`vl access`).
 
 Every example here was run with the `vl` it documents. Output is real,
 trimmed where marked (`…`); some paths and host names were shortened
@@ -55,9 +56,8 @@ vl undo                          # step back through the operation log (`vl redo
   the creator is the admin, everything is private by default, admins give
   groups or people access to folders, and `public` folders are visible to
   everyone. Veil is server-centric ([OVERVIEW.md](../OVERVIEW.md)): the
-  server enforces this. Today's client, before the server, restricts paths
-  by encrypting them for a *scope* (`vl cloak`); this changes when the
-  server lands.
+  server enforces this. Only secret files are encrypted, for a *scope*
+  (`vl cloak .env.prod --scope ops`).
 * **Tags** are Veil's branches. They follow rewrites of the change they
   point at, and move forward on `vl commit`, `vl merge` and pulls; nothing
   else moves them.

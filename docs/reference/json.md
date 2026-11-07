@@ -87,11 +87,10 @@ Ignore fields you do not know, and check `schema` before reading a document.
 A JSON document never contains anything the text output of the same command
 does not show to the same reader:
 
-* Content you cannot decrypt (cloaked for a scope you are not in, withheld by
-  a public remote, under an unreleased embargo) is reported as a
-  [`redaction`](#redaction): a reason, never the content.
-* A description sealed for a scope you are not in is `null`, with a
-  [`description_hidden`](#hidden-description) that names the scope.
+* Content you cannot decrypt (a secret sealed for a scope you are not in,
+  or withheld by a public remote) is reported as a
+  [`redaction`](#redaction): a reason, never the content. Only secret files
+  are ever sealed: descriptions, tags and embargoed changes are plain text.
 * Isolated files (`.env`, …) are listed by path in `vl status`; their
   content is never recorded, so it is never in any document.
 * `vl secret list --json` lists secret **names**; values are never read into
@@ -131,22 +130,9 @@ README`): in `status`, `show` (`parents`), `workspace list`, `tag list`.
 | `snapshot_short` | string | Its first 8 digits |
 | `change_id` | string or null | The change id (reverse hex); null if the snapshot is not `available` |
 | `change_short` | string or null | Its first 8 characters |
-| `available` | bool | False when this repository cannot read the snapshot (withheld by an unreleased embargo on a public clone, or removed by `vl gc`): only its id is known, and every other field is null or false |
+| `available` | bool | False when this repository cannot read the snapshot (never received, or removed by `vl gc`): only its id is known, and every other field is null or false |
 | `empty` | bool | The change makes no changes of its own (`(empty)`) |
-| `description` | string or null | The full description (`""` if none is set); null if it is sealed for a scope you are not in |
-| `description_hidden` | [hidden description](#hidden-description) or null | Why `description` is null |
-
-### Hidden description
-
-A description sealed for a scope you are not in (the text shows
-`[cloaked:team]`), or, in a `--public` view (`blame --public`), any
-description a public mirror cannot read (cloaked, or under an unreleased
-embargo), whatever keys you hold.
-
-| Field | Type | Meaning |
-|---|---|---|
-| `scope` | string | The scope it is sealed for |
-| `reason` | string | `no_key`; `not_public`: a `--public` view, and the description is not public |
+| `description` | string or null | The full description (`""` if none is set); null if the snapshot is not `available` |
 
 ### Visibility
 
@@ -154,9 +140,8 @@ Who can read a file: the `visibility` of a change or diff entry.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `kind` | string | `public`, `cloaked` or `embargoed` |
+| `kind` | string | `public`, or `cloaked` (a sealed secret file) |
 | `scope` | string or null | The scope of a `cloaked` file |
-| `embargo` | string or null | The embargo id of an `embargoed` file |
 
 ### Redaction
 
@@ -164,7 +149,7 @@ Content this reader cannot see, and why. It never carries the content.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `reason` | string | `no_key`: cloaked for a scope you hold no key for; `withheld`: a public remote never delivered it; `not_released`: under an embargo not released yet; `unwritable` (`status` only): readable, but this filesystem could not hold the file; `missing`: a public object absent from the store (damage, not a redaction: run `vl fsck`); `error`: the store could not read it |
+| `reason` | string | `no_key`: cloaked for a scope you hold no key for; `withheld`: a public remote never delivered it; `unwritable` (`status` only): readable, but this filesystem could not hold the file; `missing`: a public object absent from the store (damage, not a redaction: run `vl fsck`); `error`: the store could not read it |
 | `message` | string | The explanation the text output prints (`cloaked:team; no key`) |
 
 ### Signature
@@ -188,7 +173,7 @@ A changed path, as `vl status` lists it.
 | `score` | number *(optional)* | Renamed or copied: the similarity in percent (100 for an exact move) |
 | `visibility` | [visibility](#visibility) | Of the new version (of the old one, for a deletion) |
 | `redacted` | bool | The new version is unreadable here |
-| `tier` | string | Its [tier](#tier) for this reader: `public`, `cloaked`, `embargoed` or `redacted` (`[redacted]` in the text, followed by the label of whom it is sealed for) |
+| `tier` | string | Its [tier](#tier) for this reader: `public`, `cloaked` or `redacted` (`[redacted]` in the text, followed by the label of whom it is sealed for) |
 | `conflict` | [conflict](#conflict) or null | The new version is an unresolved conflict (`[conflict]` in the text); `visibility` and `tier` are then those of the file with markers you are shown |
 | `kind` | string | What the new version is (the old one for a deletion): `file`, `symlink` (repository format 5) or `conflict` |
 | `old_kind` | string or null | The old version's kind when a modification changed it, e.g. a file replaced by a symlink (`T path (file → symlink)` in the text); null otherwise |
@@ -197,8 +182,8 @@ A changed path, as `vl status` lists it.
 
 An unresolved conflict recorded as data (repository format 4): the versions
 of a file a merge could not combine. It never carries content. Null for a
-file, and for a conflict recorded as markers in the file (older formats,
-merges under an embargo), which is resolved by editing the file.
+file, and for a conflict recorded as markers in the file (older formats),
+which is resolved by editing the file.
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -215,9 +200,8 @@ marks it (`[cloaked:team]`; public files carry no mark):
 
 | Tier | Meaning |
 |---|---|
-| `public` | Plaintext, sent to every remote (also a file of a released embargo) |
-| `cloaked` | Encrypted for a scope you are in (`scope` names it); team remotes get the ciphertext, public remotes nothing |
-| `embargoed` | Under an unreleased embargo whose key you hold (`embargo` names it) |
+| `public` | Plaintext, sent to every remote you may push it to |
+| `cloaked` | A secret file encrypted for a scope you are in (`scope` names it); team remotes get the ciphertext, public remotes nothing |
 | `redacted` | Recorded, but sealed for someone else or withheld from this repository: you cannot read it (a [redaction](#redaction) says why) |
 | `isolated` | Local only: never snapshotted, never pushed |
 | `quarantined` | Kept out of the snapshot because it looks like it contains a secret |
@@ -243,7 +227,7 @@ An entry (`old`, `new`):
 | `visibility` | [visibility](#visibility) | Who can read this version |
 | `executable` | bool | The executable bit |
 | `mode` | string | `100644` or `100755`, as Git writes it; `120000` for a symlink (repository format 5) |
-| `readable` | bool | This reader can materialise this version (for an embargoed file: its pre-merge fallback counts) |
+| `readable` | bool | This reader can materialise this version  |
 | `conflict` | [conflict](#conflict) or null | This version is an unresolved conflict; its content (and `visibility`, `executable`, `readable`) is that of the file with markers you are shown (`unresolved conflict` in the text) |
 | `kind` | string | `file`, `symlink` (repository format 5) or `conflict` |
 | `target` | string or null | A symlink's target (`symlink PATH -> TARGET` in the text, escaped), when you can read it; null for a link sealed for someone else (its target is content) and for anything but a symlink. A symlink's `content` is the diff of its target |
@@ -278,10 +262,10 @@ A line:
 this command found.
 
 ```json
-{"schema":"veil.status/1","workspace":{"name":"default","cloak":null},
- "working_copy":{"snapshot_id":"ee72…02c8","snapshot_short":"ee720280","change_id":"kxqp…slxt","change_short":"kxqpvmkk","available":true,"empty":false,"description":"","description_hidden":null},
- "parents":[{"snapshot_id":"37cd…e8f2","snapshot_short":"37cdc51f","change_id":"pqmv…ynro","change_short":"pqmvvlvm","available":true,"empty":false,"description":"Add the README","description_hidden":null}],
- "changes":[{"path":"README.md","status":"modified","visibility":{"kind":"public","scope":null,"embargo":null},"redacted":false,"tier":"public"}],
+{"schema":"veil.status/1","workspace":{"name":"default"},
+ "working_copy":{"snapshot_id":"ee72…02c8","snapshot_short":"ee720280","change_id":"kxqp…slxt","change_short":"kxqpvmkk","available":true,"empty":false,"description":""},
+ "parents":[{"snapshot_id":"37cd…e8f2","snapshot_short":"37cdc51f","change_id":"pqmv…ynro","change_short":"pqmvvlvm","available":true,"empty":false,"description":"Add the README"}],
+ "changes":[{"path":"README.md","status":"modified","visibility":{"kind":"public","scope":null},"redacted":false,"tier":"public"}],
  "isolated":[".env"],"quarantined":[],"policy_held_back":[],"nested":[],"redacted":[],"conflicts":[]}
 ```
 
@@ -290,7 +274,7 @@ this command found.
 | Field | Type | Meaning |
 |---|---|---|
 | `schema` | string | `veil.status/1` |
-| `workspace` | object | The workspace the project directory is attached to: `name` (string) and `cloak` (string or null: the scope everything recorded in it is cloaked under) |
+| `workspace` | object | The workspace the project directory is attached to: `name` (string) |
 | `working_copy` | [snapshot reference](#snapshot-reference) | The working-copy change, `@` |
 | `parents` | array of [snapshot references](#snapshot-reference) | Its parents (two or more for a merge) |
 | `changes` | array of [changes](#change) | What `@` changes, compared with its parents |
@@ -325,15 +309,13 @@ An entry:
 | `timestamp` | string or null | When this snapshot was made |
 | `signature` | [signature](#signature) or null | Its signature |
 | `workspaces` | array of strings | Workspaces whose working copy this is (`name@` in the text) |
-| `tags` | array | Local tags pointing here: `name`, and `cloak` (string or null: the scope of a cloaked tag, never pushed to public remotes) |
+| `tags` | array | Local tags pointing here: `name` |
 | `remote_tags` | array of strings | Tags last seen on a remote, as `remote/tag` |
 | `empty` | bool | The change makes no changes of its own |
 | `conflicts` | array of strings | Paths that still have conflict markers (`×` and `(conflict)` in the text) |
-| `cloak` | string or null | The scope of a snapshot on a cloaked line of work |
 | `embargo` | object or null | The embargo this merge introduced: `id` (string) and `released` (bool) |
-| `description` | string or null | The full description; null if sealed for a scope you are not in |
-| `description_hidden` | [hidden description](#hidden-description) or null | Why `description` is null |
-| `parents` | array | The parents, first parent first: `snapshot_id`, `snapshot_short`, `change_short` (string or null) and `withheld` (bool: the parent is not in this repository, as with an unreleased embargo on a public clone; its `change_short` is then null) |
+| `description` | string or null | The full description |
+| `parents` | array | The parents, first parent first: `snapshot_id`, `snapshot_short`, `change_short` (string or null) and `withheld` (bool: the parent is not in this repository; its `change_short` is then null) |
 | `files` | array of strings *(optional)* | With `-S` or `-G`: the files that matched (every changed file with `--pickaxe-all`) |
 | `not_searched` | array of [visibilities](#visibility) *(optional)* | With `--show-skipped`: this snapshot was not searched, because the versions `-S`/`-G` would read are sealed for these audiences |
 
@@ -370,11 +352,9 @@ what they change is sealed for you; listed in `entries` only with
 | `signature` | [signature](#signature) or null | Its signature; null for the root |
 | `parents` | array of [snapshot references](#snapshot-reference) | Its parents (the text lists them only for a merge) |
 | `tags` | array of strings | Local tags pointing here |
-| `cloak` | string or null | The scope of a snapshot on a cloaked line of work |
 | `embargo` | object or null | The embargo this merge introduced: `id` (string); `state`: `pending`, `staged` (released here, not pushed yet), `released` or `unknown` (no record of it here); `until` (string or null: when a `pending` embargo is released automatically; null for a manual release) |
 | `conflicts` | array of strings | Paths that still have conflict markers |
-| `description` | string or null | The full description; null if sealed for a scope you are not in |
-| `description_hidden` | [hidden description](#hidden-description) or null | Why `description` is null |
+| `description` | string or null | The full description |
 | `diff` | object | The snapshot's changes: `stat` (bool) and `files` (array of [file diffs](#file-diff)), as in [`veil.diff/1`](#veildiff1) |
 
 ## `veil.workspace.list/1`
@@ -384,7 +364,7 @@ what they change is sealed for you; listed in `entries` only with
 | Field | Type | Meaning |
 |---|---|---|
 | `schema` | string | `veil.workspace.list/1` |
-| `workspaces` | array | By name: `name`; `current` (bool: the project directory is attached to it); `cloak` (string or null); `working_copy` (a [snapshot reference](#snapshot-reference)) |
+| `workspaces` | array | By name: `name`; `current` (bool: the project directory is attached to it); `working_copy` (a [snapshot reference](#snapshot-reference)) |
 
 ## `veil.tag.list/1`
 
@@ -393,7 +373,7 @@ what they change is sealed for you; listed in `entries` only with
 | Field | Type | Meaning |
 |---|---|---|
 | `schema` | string | `veil.tag.list/1` |
-| `tags` | array | Local tags, by name: `name`; `cloak` (string or null: never pushed to public remotes); `target` (a [snapshot reference](#snapshot-reference)); `kind` (`release` for an annotated tag, else `branch`); `annotation` (null for a plain tag, see below) |
+| `tags` | array | Local tags, by name: `name`; `target` (a [snapshot reference](#snapshot-reference)); `kind` (`release` for an annotated tag, else `branch`); `annotation` (null for a plain tag, see below) |
 | `remote_tags` | array | Tags as last seen on remotes: `name` (`remote/tag`) and `target` |
 
 An `annotation` holds `id` (the hex id of the annotated tag object), `kind`, `tagger` (as recorded; a claim, like a snapshot's author), `timestamp` (when it was tagged), `message`, `signer`, `verified` and `status`: `kind` is `annotated`; `message` is null when sealed for a scope you are not in; `verified` is true only for a valid Veil signature by a key a ring of this repository knows (`signer` names its owner); `status` says what the check found (`good signature by …`, `unsigned`, `unverified (name mismatch)`, …).
@@ -456,8 +436,8 @@ the working copy its local-only files.
 
 ```json
 {"schema":"veil.ls/1","snapshot":{"snapshot_id":"ee72…02c8","snapshot_short":"ee720280",…},"working_copy":true,"all":false,
- "entries":[{"path":".env","dir":false,"tier":"isolated","scope":null,"embargo":null,"recorded":false,"visibility":null,"size":21,"executable":false,"readable":true,"fallback":false,"redaction":null,"quarantine":null},
-            {"path":"ops/keys.yml","dir":false,"tier":"redacted","scope":"ops","embargo":null,"recorded":true,"visibility":{"kind":"cloaked","scope":"ops","embargo":null},"size":310,"executable":false,"readable":false,"fallback":false,"redaction":{"reason":"no_key","message":"cloaked:ops; no key"},"quarantine":null}]}
+ "entries":[{"path":".env","dir":false,"tier":"isolated","scope":null,"recorded":false,"visibility":null,"size":21,"executable":false,"readable":true,"redaction":null,"quarantine":null},
+            {"path":"ops/.env.keys","dir":false,"tier":"redacted","scope":"ops","recorded":true,"visibility":{"kind":"cloaked","scope":"ops"},"size":310,"executable":false,"readable":false,"redaction":{"reason":"no_key","message":"cloaked:ops; no key"},"quarantine":null}]}
 ```
 
 | Field | Type | Meaning |
@@ -469,15 +449,13 @@ the working copy its local-only files.
 | `entries` | array | In tree order (depth first, by name within a directory), each: |
 | `path` | string | The file (an ignored directory: the directory) |
 | `dir` | bool | An ignored directory, listed as a whole (`--all`; never descended into) |
-| `tier` | string | Its [tier](#tier): `public`, `cloaked`, `embargoed`, `redacted`, `isolated`, `quarantined` or `ignored` |
+| `tier` | string | Its [tier](#tier): `public`, `cloaked`, `redacted`, `isolated`, `quarantined` or `ignored` |
 | `scope` | string or null | The scope of a cloaked file (also when `redacted`) |
-| `embargo` | string or null | The embargo of an embargoed file (also when `redacted`) |
 | `recorded` | bool | In the snapshot; false for local-only files |
 | `visibility` | [visibility](#visibility) or null | The recorded entry's label; null when not recorded |
 | `size` | number or null | Bytes: the recorded size, or the size on disk of a local-only file; null for a directory |
 | `executable` | bool | The executable bit (`*` in the text) |
 | `readable` | bool | You can read the content (for a local-only file: it is on disk) |
-| `fallback` | bool | What you can read is the file's last public version: it was edited on a cloaked line of a scope you are not in |
 | `redaction` | [redaction](#redaction) or null | Why a `redacted` file cannot be read. Never content |
 | `quarantine` | object or null | A `quarantined` file: `rule` (string), `line` (number) and `state` (`never_recorded`, or `held_back`: history keeps the previous, recorded version) |
 | `conflict` | [conflict](#conflict) or null | An unresolved conflict (`conflict: 2 sides` in the text); `tier`, `scope`, `visibility`, `size` and `executable` are those of the file with markers you are shown, `readable` says whether you can read every side |
@@ -491,7 +469,7 @@ conflicts of a snapshot (`-r`, default `@`).
 
 ```json
 {"schema":"veil.resolve.list/1","snapshot":{"snapshot_id":"ee72…02c8",…},
- "conflicts":[{"path":"src/app.rs","conflict":{"sides":2,"bases":1,"versions":[{"role":"side","number":1,"visibility":{"kind":"public","scope":null,"embargo":null},"readable":true},…],"redacted":false,"unreadable_side":false}}]}
+ "conflicts":[{"path":"src/app.rs","conflict":{"sides":2,"bases":1,"versions":[{"role":"side","number":1,"visibility":{"kind":"public","scope":null},"readable":true},…],"redacted":false,"unreadable_side":false}}]}
 ```
 
 | Field | Type | Meaning |
@@ -561,14 +539,13 @@ guessed through: lines whose history is sealed for you are unattributed.
 | `schema` | string | `veil.blame/1` |
 | `path` | string | The file |
 | `rev` | [snapshot reference](#snapshot-reference) | The snapshot whose version is annotated (`-r`) |
-| `version` | string | `plain`, or `fallback`: you cannot read the file at `rev`, and its last public version (what your checkout shows) is annotated |
 | `public` | bool | `--public`: annotated as a public mirror sees the history |
 | `coarse` | bool | Some two versions differed too much to compare line by line: their differing middle is attributed whole |
 | `stopped` | string or null | `max_changes` (`--max-changes` was reached) or `budget` (the work budget was spent); null when the walk finished |
 | `visited` | number | Snapshot visits of the walk |
 | `unattributed` | number | Lines with no change |
 | `lines` | array of lines | One per line (of `-L START,END` only, if given) |
-| `changes` | array of [snapshot references](#snapshot-reference) | Every change a line is attributed to, once, newest first (descriptions sealed for you are hidden, as everywhere) |
+| `changes` | array of [snapshot references](#snapshot-reference) | Every change a line is attributed to, once, newest first  |
 
 A line:
 
@@ -596,12 +573,12 @@ the text only; the document always lists every match.
 | `schema` | string | `veil.grep/1` |
 | `rev` | [snapshot reference](#snapshot-reference) | The snapshot searched |
 | `matches` | array | Every matching line, by path then line: `path`, `line` (number, from 1), `text` (the line without its break, cut at 1 MiB), `truncated` (bool: it was cut) and `tier` (below) |
-| `files` | array | Every file with a match: `path`, `tier`, `scope` (string or null: of a cloaked file, or the embargo of an embargoed one), `count` (number: matching lines, up to `--max-count`), `binary` (bool: its lines are not listed unless `-a`) and `conflict` (bool: an unresolved conflict, searched as the file with markers you are shown) |
-| `skipped` | object | What was not searched: `sealed` (files you cannot read and have no public version of), `binary` (binary files that matched, lines not listed), `too_large` (files over 256 MiB) |
+| `files` | array | Every file with a match: `path`, `tier`, `scope` (string or null: of a cloaked file), `count` (number: matching lines, up to `--max-count`), `binary` (bool: its lines are not listed unless `-a`) and `conflict` (bool: an unresolved conflict, searched as the file with markers you are shown) |
+| `skipped` | object | What was not searched: `sealed` (files you cannot read), `binary` (binary files that matched, lines not listed), `too_large` (files over 256 MiB) |
 | `searched` | number | Files of the snapshot considered |
 
-`tier` is `public`, `cloaked` or `embargoed` (sealed, and you hold the
-key), or `fallback`: the last public version of a file you cannot read.
+`tier` is `public`, or `cloaked` (a sealed secret file, and you hold the
+key).
 Members see newer content there.
 
 The exit status is 0 when something matched and 1 when nothing did, with

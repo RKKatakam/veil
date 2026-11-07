@@ -15,7 +15,7 @@ The design check:
 |---|---|
 | Server-centric, always connected | Landing, merging, bisect, revert, review and release run on the server or through it. |
 | Code is plain text behind the server's checks | The server merges plain-text code itself; every PR, status, count and notification passes the one access function. |
-| Only secrets and embargoes are encrypted | The server moves secret files by id without opening them; a conflict inside one goes to someone with the key. Embargoed fixes stay encrypted until release. Key rings stay for secrets only. |
+| Only secret files are encrypted | The server moves secret files by id without opening them; a conflict inside one goes to someone with the key. Key rings stay for secrets only. |
 | Admins, groups, managers, folder access, public | PR visibility is "can see every file it touches", computed from the same rules. No new kind of access. |
 | No Git, no offline mode, no SFTP | None. |
 
@@ -62,7 +62,7 @@ vl tested [BRANCH]                            the newest snapshot that passed ev
 vl bisect --server --check NAME [--from GOOD --to BAD]   server-side bisect (also automatic)
 
 vl embargo create … --until T                 as today (`vl merge … --embargo-for G… --until T`), now through the server
-vl embargo release ID                         early release by a key holder (as today)
+vl embargo release ID                         early release by someone with the right (as today)
 
 vl rules                                      show the protected-branch and review rules
 vl stats                                      health metrics (admins)
@@ -194,24 +194,14 @@ Every viewer without full view needs projected snapshots (`HUB.md` §13.4), and 
 
 **What changes.** Today's engine keeps an embargoed merge on `main` and makes everything on top of it hidden for outsiders until release ("sticky", `ARCHITECTURE.md` §7, "Trade-offs"): outsiders cannot even record on top of it. On a `main` that thousands of agents land into, that would stop them all until the release. So:
 
-* **Until release, the fix lives on a hidden embargo line,** `embargo/<id>`: `main` as it was at the merge, plus the fix, encrypted as today. Only the embargo's groups (and admins, who see everything) know the line exists; for everyone else it has no name, no count and no placeholder. Its groups get the fix right away: code, message and history, decrypted on their devices.
-* **`main` keeps moving for everyone.** A key holder (or a machine in the embargo's groups) may rebase the line onto newer `main` (`vl embargo follow ID`), as plain landings never touch it.
+* **Until release, the fix lives on a hidden embargo line,** `embargo/<id>`: `main` as it was at the merge, plus the fix, as plain text behind the server's checks. Only the embargo's groups (and admins, who see everything) know the line exists; for everyone else it has no name, no count and no placeholder. Its groups get the fix right away: code, message and history.
+* **`main` keeps moving for everyone.** A member of the embargo's groups (or a machine in them) may rebase the line onto newer `main` (`vl embargo follow ID`), as plain landings never touch it.
 * **At release,** the content becomes ordinary plain text (as `HUB.md` §8.3 says), and the server lands the fix onto `main` through the landing service like any change. A conflict goes back to the embargo's authors.
 * This is a product decision for the owner (§11, item 1).
 
-**Releasing on time without the server holding the key.** Three ways, in order of preference:
+**Releasing on time.** The key-holder, release-machine and time-lock designs of this round are not needed (the owner's decision at the top): embargoes are not encrypted (repository format 8), and the server makes the fix public at the deadline as a scheduled job.
 
-| Way | Who holds the key before the deadline | Needs |
-|---|---|---|
-| A key holder releases (early, or at the deadline when the server's deadline worker notifies them, `HUB.md` §8.2) | the embargo's groups only | one of them online |
-| A **release machine** in the embargo's groups (added like a person, run by the security team, not by the server) watches the deadline and releases | that machine, as a member | the machine online |
-| **Time-lock**: when the embargo is created, the creator's `vl` also encrypts the embargo key to the deadline's round of a public randomness beacon (drand's time-lock encryption). Nobody can decrypt it until the beacon publishes that round's signature, which happens at the deadline. The server's release service then decrypts it, checks it against the key fingerprint in the signed record, and publishes the release | **nobody** (the beacon's threshold network would have to collude) | the beacon's signature, which is public; anyone can do the release, including any client |
-
-* **The time-lock also proves the time.** The beacon's round signature cannot exist before its round, so a release carrying it proves the deadline passed without trusting any clock (today's rule accepts a release after the deadline; this makes "after" checkable).
-* **The server can delay a release** (it could refuse to publish), but not make one early. Any key holder can still release by pushing, and any client can run the time-lock release itself.
-* Using drand (an external public service) is a product decision (§11, item 2). It needs a new embargo record version and signing context (`FORMAT.md` §4), and a crypto review (`CRYPTO.md`).
-
-**Embargoed PRs** exist only for the embargo's groups: their title and body are encrypted with the embargo key, their visibility class includes the embargo (§4.9), and they appear in no list, count, search or notification of anyone else.
+**Embargoed PRs** exist only for the embargo's groups: their visibility class includes the embargo (§4.9), and they appear in no list, count, search or notification of anyone else.
 
 ### 4.9 PRs and review
 
@@ -309,7 +299,7 @@ A runaway agent fills only its own queue; the batch takes it in turn with everyo
 | `GET …/tested/{branch}` | `main@tested` |
 | `POST …/bisect {check, good, bad}` | a bisect by hand (automatic ones start on failures) |
 | `POST …/prs`, `GET …/prs?state=`, `GET …/prs/{id}`, `…/revisions`, `…/threads`, `…/reviews`, `…/land` | PRs (`HUB.md` §7.2–7.5) |
-| `POST …/embargoes/{id}/release` | a release (key holder's, or the time-lock's with the beacon signature) |
+| `POST …/embargoes/{id}/release` | a release by someone with the right |
 | `GET …/health` | metrics (admins) |
 
 ### 5.2 Database
@@ -400,7 +390,7 @@ CREATE TABLE IF NOT EXISTS embargo_lines (
 
 ### 5.3 Object store
 
-New objects: edit sets, and the trees and snapshots the landing service builds. The embargo record gains a version with the time-lock ciphertext and the beacon's round (`FORMAT.md` §4). No change to existing objects.
+New objects: edit sets, and the trees and snapshots the landing service builds. No change to existing objects. (The time-lock's new embargo record version is not needed: embargo records are plain since repository format 8.)
 
 ## 6. Threat review
 
@@ -416,8 +406,8 @@ New objects: edit sets, and the trees and snapshots the landing service builds. 
 | 8 | Person outside an embargo's groups | lists branches, PRs, events; searches | learns an embargo exists before release | hidden embargo lines; embargoed PRs in a class with the embargo; nothing indexed | an embargoed fix with its PR: outsiders' every answer equals the same project without it, until release |
 | 9 | Anyone | watches `main` for a revert of an embargoed fix | learns the fix early | embargoed fixes reach `main` only at release | an embargoed change whose release fails a check: the revert happens after release, never before |
 | 10 | A CI job with broad access | posts a status about `billing/` on a public snapshot | leaks hidden test output | a status is shown only to people who can see every path the job's session could read | a job session with `billing/` posts on a public change: invisible to public viewers; a job narrowed to `src/` is visible to them |
-| 11 | Someone who breaks into the server | releases an embargo early | publishes the fix before the deadline | the server holds no key; the time-lock cannot be opened before the beacon's round | crypto test vectors; a release attempt with a round before the deadline is refused by clients |
-| 12 | Same | delays or suppresses a release | the fix stays hidden too long | accepted (availability is the server's); any key holder or client can release by themselves | a release published by a client with the beacon signature is accepted |
+| 11 | Someone who breaks into the server | releases an embargo early | publishes the fix before the deadline | not mitigated by encryption: embargoes are permissions the server enforces (the owner's decision at the top) | |
+| 12 | Same | delays or suppresses a release | the fix stays hidden too long | accepted (availability is the server's); someone with the right can release by themselves | |
 | 13 | A runaway agent | submits 10⁵ landings, or opens 10⁴ sessions | starves other agents | per-session outstanding cap; fair share per person, then per session; per-person request limits across sessions | one agent floods while 1,000 others land at 1/s: the others' p99 stays within its target |
 | 14 | — (flaky test) | a check fails at random | the bisect reverts an innocent change | the culprit must fail and its parent pass, twice each | a 5 % flaky check over 1,000 landings: no automatic revert |
 | 15 | A reviewer | approves revision 2 then the author pushes revision 3 | an unreviewed change lands | approvals bound to a revision, dismissed on any file change, device-signed | approve, push, land: refused until approved again |
@@ -459,8 +449,8 @@ New objects: edit sets, and the trees and snapshots the landing service builds. 
 | **S19** | CI through the API; land first, test after | checks and their visibility, CI job sessions, `check.requested`, `main@tested`, `vl checks`, `vl tested`, `.veilrules` `[branches]` and `[checks]` | S11, S13, S17 | new `veil-server` `checks.rs` |
 | **S20** | Automatic bisect and revert | path-narrowed k-ary bisect, confirmation runs, revert changes in the priority lane, notifications | S14, S19 | new `bisect.rs` |
 | **S21** | PRs and review | PR records, visibility classes, random ids, revisions on change ids, threads and anchors (`HUB.md` §7.3), approvals, risk classification, `.veilrules` `[review]`, notifications, PR search, `vl pr` | S13 (S17 to land) | new `veil-server` `prs/`; `crates/vl` |
-| **S22** | Embargoes through the server, and the release service | embargo records and wrappers accepted by push, hidden embargo lines, `vl embargo follow`, deadline worker, release machine support, time-lock release (if approved), landing at release | S2, S17 | `veil-server` `sync.rs`, new `embargo.rs`; `veil-core` `embargo.rs` |
-| **S23** | Embargoed PRs | encrypted title and body, the embargo in visibility classes | S21, S22 | `prs/` |
+| **S22** | Embargoes through the server, and the release service | embargo records accepted by push, hidden embargo lines, `vl embargo follow`, the scheduled release job, landing at release | S2, S17 | `veil-server` `sync.rs`, new `embargo.rs`; `veil-core` `embargo.rs` |
+| **S23** | Embargoed PRs | the embargo in visibility classes | S21, S22 | `prs/` |
 | **S24** | Rate limits, health metrics, failure isolation | token buckets, fair share, per-project bulkheads, load shedding, `vl stats` | S17 | `veil-server` middleware |
 | **S25** | Web client, first version | browse code and history, PRs and review, administration; no secrets | S13, S21 | new `web/` (TypeScript), `veil-core` WASM build |
 | **S26** | Secrets in the browser | browser device identity, passkey-protected keys, confirmation, decryption in a Worker | S25, S2; only if the owner approves (§11, item 6) | `web/` |
@@ -472,7 +462,7 @@ New objects: edit sets, and the trees and snapshots the landing service builds. 
 2. **Object writes per batch:** about 6 small objects per landing. On S3 this is many PUTs; a batch could write its new trees and snapshots as one pack object with an index, if the object store's request rate becomes the limit. Measure first.
 3. **Projects with many view keys:** eager batch-tip memos cost about 50 ms of CPU a second per view key at 1,000 landings a second (§4.5). A project whose people have hundreds of distinct read sets needs several cores for it. Compute memos only for view keys used in the last day, and pay one catch-up walk for a returning viewer? Measure how many view keys real projects have.
 4. **Comment-only detection** for the low risk tier needs a parser per language; which languages first, and what counts as "comment-only" for generated files.
-5. **The time-lock implementation:** a Rust implementation of drand's time-lock encryption to review and pin, the beacon's public key pinned in `vl`, and the record's new version (`CRYPTO.md`, `FORMAT.md`).
+5. **The time-lock implementation:** not needed (the owner's decision at the top: embargoes are permissions, not encryption).
 6. **Hidden embargo lines and `.veilpolicy`:** a fix that changes `.veilpolicy` under embargo would change access at release; refuse policy changes on embargo lines?
 7. **Release branches** with their own landing service: how a fix landed on `main` is carried to them (cherry-pick through the landing service, or by hand).
 
@@ -485,7 +475,7 @@ New objects: edit sets, and the trees and snapshots the landing service builds. 
 ## 11. Product decisions for the owner
 
 1. **Embargoed merges into a busy `main`.** Today an embargoed merge on `main` hides everything landed on top of it from outsiders until release, and outsiders cannot record on top of it. With thousands of agents that freezes `main`. Recommendation: the fix lives on a hidden embargo line (its groups get it at once) and lands on `main` at release.
-2. **On-time release without the server holding keys.** Recommendation: offer the time-lock (drand, an external public beacon run by a group of independent organisations) as the default for embargoes with a deadline, with a release machine as the alternative for teams that don't want an outside dependency. Without either, a release waits for a key holder to be online.
+2. **On-time release without the server holding keys.** Recommendation: offer the time-lock (drand, an external public beacon run by a group of independent organisations) as the default for embargoes with a deadline, with a release machine as the alternative for teams that don't want an outside dependency. Without either, a release waits for a key holder to be online. *Owner, 2026-11-06: not needed; the server releases at the deadline (the decision at the top).*
 3. **PR names:** short random ids (`pr-4f2a9c`) instead of sequential numbers, so hidden PRs leave no gaps. Recommendation: yes.
 4. **Automatic revert:** the server reverts a confirmed culprit without asking anyone, and tells its author. Recommendation: yes for protected `main` (land first, test after needs it); a project setting can make it a proposal instead.
 5. **What needs a person's approval.** Recommendation for the defaults: low risk lands with checks alone; normal needs one approval (an agent's counts, if it is not a session of the author); high needs one person's approval. Agents' approvals never count for high risk.

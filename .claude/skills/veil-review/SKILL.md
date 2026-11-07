@@ -52,9 +52,9 @@ Agent approvals never stand in for the owner's where the owner is required. The 
 
 ## Step 0.5: design conformance (every tier)
 The diff must match `docs/OVERVIEW.md` and `docs/VISIBILITY.md`. Reject anything that:
-- reintroduces encrypting code;
+- encrypts anything but secret files (code, folders, descriptions, tags, embargoes, attribution);
 - adds an offline or plain-file remote path;
-- uses rings for anything but secrets and embargoes;
+- uses rings for anything but secrets;
 - invents access tiers or names beyond admins, groups, managers, access and public;
 - touches Git interop.
 
@@ -77,10 +77,9 @@ For each lens, read the diff **against the whole codebase and the brief's intent
 
 **For a bug fix, find the root cause.** Then check that the fix closes the bug's whole class, not just the one reproduction.
 
-1. **Confidentiality.** Can private, secret, cloaked, isolated or embargoed content (or a cloaked tag name or description) reach someone without access, or:
+1. **Confidentiality.** Can private, secret, isolated or embargoed content reach someone without access, or:
    - a public snapshot, a remote, a log, JSON output, an error message or a bundle?
    - Is a label used as authority where the object should be (`verify_sealing`)?
-   - Is a fallback version one the base doesn't already show publicly?
    - Does confined content move into an unconfined change?
 2. **Correctness.**
    - Edge cases: empty repos, the root change, conflicts, renames and symlinks.

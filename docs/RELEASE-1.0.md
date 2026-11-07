@@ -93,4 +93,4 @@ content-defined chunking for large files.
 - **Git interop:** no import, export, sync, colocation, submodules, Git file
   formats or Git-format patches (owner decision, 2026-11-05).
 - **Offline use, or plain-file remotes** (SFTP, shared drives).
-- **Encrypting code.** Only secrets and embargoed changes are encrypted.
+- **Encrypting code.** Only secret files (`.env`, keys) are encrypted.

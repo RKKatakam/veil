@@ -53,7 +53,7 @@ assert_eq!(repo.store().read_entry(&entry)?, b"pub fn answer() -> u32 { 42 }\n")
 ```
 
 [`crates/veil-core/examples/wasm_smoke.rs`](../../crates/veil-core/examples/wasm_smoke.rs)
-goes further: log, diff, a cloaked directory sealed under a scope and read
+goes further: log, diff, a secret file sealed under a scope and read
 back, an outsider who cannot read it, a merge, a clone by pull into a
 second in-memory repository, and `gc`. Run it on your machine with exactly
 the portable feature set:

@@ -59,8 +59,8 @@ Veil is server-centric ([OVERVIEW.md](OVERVIEW.md)). The order is:
   file can grant others. Add an optional passphrase (Argon2id-wrapped keys)
   and OS keychain / hardware-key storage (macOS Keychain, Secret Service,
   FIDO2/age-plugin style), with a `vl identity protect` migration.
-- **Names of cloaked files are visible** in today's client: tree entries
-  keep their names in plaintext for anyone who can read the repository.
+- **Names of sealed secret files are visible**: tree entries keep their
+  names in plaintext for anyone who can read the repository.
   With the server, people without access to a folder receive neither its
   files nor their names (`docs/HUB.md` §5.4). Until then, keep secrets out
   of file and directory names.

@@ -92,7 +92,7 @@ The owner adopted the four synthetic workloads published by OpenScion, an indepe
   - **macOS:** Apple's sandbox profiles; weaker, and documented as such.
   - **Optional `--container IMAGE`** (Docker or Podman) for a fully separate environment, with the sandbox mounted at the same path.
   - **Tests prove** an agent can't read `~/.ssh` or write outside its sandbox.
-- **Now: a simplification pass.** Remove what the server makes unnecessary. **Part 1 is done** (2026-11-06): SFTP and path remotes and the offline-era text are gone, and `vl` syncs only through the server. Next: old storage formats and old jargon.
+- **Now: a simplification pass.** Remove what the server makes unnecessary. **Part 1 is done** (2026-11-06): SFTP and path remotes and the offline-era text are gone, and `vl` syncs only through the server. **Part 2 is done** (2026-11-07): only secret files are encrypted. Encrypted descriptions, tags, embargoes, folders and lines of work are gone, and repository format 8 marks it (formats 1 to 5 are no longer read; `vl upgrade` brings 6 and 7 to 8 when they hold none of that). Next: old jargon.
 - **Then: the server's features, in stages.**
   - fetch on demand;
   - server-side history and search;
@@ -103,4 +103,4 @@ The owner adopted the four synthetic workloads published by OpenScion, an indepe
 
 - **Git interop.** No import, export, sync, colocation, submodules or Git-format patches. This is permanent.
 - **Offline use, or plain-file remotes** (SFTP, shared drives).
-- **Encrypting code.** Only secrets (`.env`, keys) are encrypted. Embargoed changes are protected by the server's permissions and made public by the server at their deadline.
+- **Encrypting code.** Only secrets (`.env`, keys) are encrypted. Embargoed changes are protected by the server's permissions and made public at their deadline.

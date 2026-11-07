@@ -1,6 +1,6 @@
 # Maintenance
 
-> Where this page mentions cloaking, scopes or isolated files, the server replaces them with folder access and encrypted secrets (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)).
+> Only secret files (`.env`, keys) are ever encrypted ("cloaked", for a scope); who sees folders and code is decided by folder access (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)).
 
 1. [`vl gc`](#vl-gc)
 2. [`vl fsck`](#vl-fsck)
@@ -164,43 +164,26 @@ whenever something behaves strangely.
 
 ## `vl upgrade`: repository formats
 
-A repository records its format in `.veil/repo.json`. Every `vl` reads every
-older format and keeps writing it, so **existing repositories keep working
-without an upgrade**. `vl upgrade` opts in to what a newer format adds:
-
-| Format | Adds |
-|---|---|
-| 1 | The first release: JSON trees |
-| 2 | Binary trees, which make `vl status` faster |
-| 3 | Standard cryptography: AES-SIV for sealed objects, HPKE key wrapping, independent signing keys |
+A repository records its format in `.veil/repo.json`. This `vl` opens
+**format 8** only: the format in which only secret files are encrypted.
+`vl upgrade` brings a repository at format 6 or 7 to format 8.
 
 ```text
-$ vl upgrade --dry-run
-Would upgrade this repository from format 1 to format 3
-  objects    76 (27 JSON tree(s), 0 binary tree(s))
-  steps      verify, set-format, 3:hpke-ring-keys
-  note: new content is sealed with AES-SIV and scope keys are wrapped with HPKE; existing sealed objects keep the legacy construction, their bytes and their ids (nothing is re-sealed), so snapshot ids and signatures do not change
-  note: a member's clone at format 1 or 2 refuses AES-SIV objects and HPKE key rings: it cannot pull them until it is upgraded (`vl upgrade` there)
-  …
-$ vl upgrade
-Upgraded this repository from format 1 to format 3
-  …
-  note: scope 'team': new key generation 3, wrapped to every member with HPKE; earlier generations stay reachable (and stay under the legacy key wrapping already published)
+vl upgrade [--dry-run] [--force]
 ```
 
-* **Nothing is rewritten.** Old objects keep their bytes and ids, so
-  snapshot ids, change ids and signatures stay valid.
+* **Nothing is converted or dropped.** If the repository holds anything
+  that only the removed encryption wrote (an encrypted change description
+  or tag message, a cloaked tag or workspace and the snapshots recorded in one,
+  an embargoed tree or a fallback version, a sealed directory, an embargo
+  key), the upgrade refuses and names each thing it found. Otherwise it
+  rewrites nothing: snapshot ids, change ids and signatures stay valid.
 * It runs `fsck` first and refuses if there is corruption (`--force`
   overrides). It is journaled and resumes after a crash.
-* **Older `vl` releases can no longer read an upgraded repository.**
-* **Order matters for a team.** Everyone upgrades `vl` first, then each
-  member upgrades their clone: a clone at an older format can't pull
-  objects of a newer one.
-* **Admins: run `vl upgrade` even in a clone that is already at format 3**
-  (one a non-admin upgraded). It
-  moves the key rings you administer to HPKE ("Moved the key rings of this
-  repository (format 3) to HPKE key wrapping"), then push. Members who are
-  not admins get a note naming the scopes still waiting.
+* **Formats 1 to 5 are no longer read.** Upgrade such a repository to
+  format 7 with an earlier `vl` first.
+* **Older `vl` releases cannot read a format-8 repository.** Everyone
+  upgrades `vl` first, then each member upgrades their clone.
 * `vl clone` creates a clone at the newest format.
 
 Details: [`docs/FORMAT.md`](../FORMAT.md).
@@ -246,7 +229,7 @@ warning: other repositories' local vaults are still sealed by the replaced ident
   still holds private keys: delete it once no vault needs it.
 * Run `vl identity recover-vault` in every other repository you use (next
   section), and send the new public key to your scope admins.
-* Until they grant it, cloaked files you edit can't be sealed and are kept
+* Until they grant it, secret files you edit can't be sealed and are kept
   local-only, with `warning: could not cloak … (no key for scope 'team')`.
 
 **Admin rights.** Where the replaced identity was an admin, it can sign the

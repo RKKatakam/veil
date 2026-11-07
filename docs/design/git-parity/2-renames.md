@@ -1,6 +1,6 @@
 # 2. Rename and copy detection (`diff`, `log`, `status`, merge)
 
-> **Access model:** written for today's client, which restricts paths by cloaking them for a *scope*. With the server, access is the ordinary model in `docs/VISIBILITY.md` (admins, private by default, groups and managers, folder access, `public`): cloaked paths become private folders, and only secrets and embargoed changes are encrypted.
+> **Access model:** written for the client of that round, which also restricted paths by cloaking them for a *scope*. Repository format 8 removed that, with every other non-secret encryption: only secret files (`.env`, keys) are encrypted, and access is the ordinary model in `docs/VISIBILITY.md` (admins, private by default, groups and managers, folder access, `public`).
 
 Status: design and threat review. No format change: renames are computed, never stored, as in Git.
 
@@ -16,7 +16,7 @@ Status: design and threat review. No format change: renames are computed, never 
   ```
 
   1. **Exact pass** (O(n)). Match deleted and added entries with equal `id` (and equal kind, after feature 6). Sealed objects pair only with the same sealed id: deterministic sealing makes that equal content, and the equality is already visible to everyone (the threat model's "equality leakage").
-  2. **Inexact pass**, only on entries this reader can read as text (`blame::readable_version` = `Plain`, never `Fallback`).
+  2. **Inexact pass**, only on entries this reader can read as text (`blame::readable_version` = `Plain`).
      - Similarity uses Git's spanhash: 64-byte chunks hashed into a `HashMap<u32, u32>`, score = common / max. It is not Myers.
      - Only when `deleted × added ≤ limit²`; otherwise `truncated = true` and only exact pairs are reported, as with Git's `diff.renameLimit`.
      - Each file is capped at 16 MiB for the inexact pass.
@@ -37,16 +37,16 @@ Status: design and threat review. No format change: renames are computed, never 
 
 ## Threat review
 
-1. **The similarity score as an oracle on sealed content.** If inexact scoring read sealed objects for a reader who holds the key, and the result were stored or exported, it would leak. A score, the old-path pairing, is a few bits of information about cloaked plaintext.
+1. **The similarity score as an oracle on sealed content.** If inexact scoring read sealed objects for a reader who holds the key, and the result were stored or exported, it would leak. A score, the old-path pairing, is a few bits of information about sealed plaintext.
    - *Invariant:* renames are never stored in snapshots, trees or operations. They appear only in this reader's output.
    - *Test:* grep the encodings and the op log after a `vl merge` that followed a rename: no rename record.
-2. **A merge result that depends on the merger's keys.** A member of `ops` pairs `secrets/a.yml` (sealed) with `config/a.yml` by content; a non-member cannot. The two merge differently, but that is not a leak. The risk is that a member's merge *moves sealed content to another path whose audience differs*.
+2. **A merge result that depends on the merger's keys.** A member of `ops` pairs `deploy/.env` (sealed) with `config/env.txt` by content; a non-member cannot. The two merge differently, but that is not a leak. The risk is that a member's merge *moves sealed content to another path whose audience differs*.
    - *Invariant:* the content merge runs through `merge::merge_file` with the real entries, so its audience rules (`merged_visibility`, `audience_clash`, two scopes → conflict, BUG-123) decide the sealing. The pairing only changes which entries are combined.
-   - *Test (property):* random trees with cloaked and public files and random renames on both sides. After any merge, every result entry's verified audience is one of its inputs' audiences, or narrower (extend `hostile_labels_props.rs`).
-3. **An edit following a rename from a cloaked to a public path.** Ours moves `secrets/db.yml` (sealed for `ops`) to `docs/db.yml` *as sealed content*: an exact-id rename, so the sealing is carried. Theirs edits `secrets/db.yml`. The merged result at `docs/db.yml` must stay sealed for `ops`.
+   - *Test (property):* random trees with sealed and public files and random renames on both sides. After any merge, every result entry's verified audience is one of its inputs' audiences, or narrower (extend `hostile_labels_props.rs`).
+3. **An edit following a rename from a sealed to a public path.** Ours moves `deploy/.env` (sealed for `ops`) to `docs/db.yml` *as sealed content*: an exact-id rename, so the sealing is carried. Theirs edits `deploy/.env`. The merged result at `docs/db.yml` must stay sealed for `ops`.
    - *Invariant:* `merged_visibility` of two `ops` versions is `ops`. A rename never re-runs the policy on merged content; only the builder does that, for working-copy edits.
    - *Test:* this exact scenario, then a public push; `docs/db.yml` is redacted on the mirror.
-4. **An edit following a rename from a public to a cloaked path.** Ours moves `config.yml` to `secrets/config.yml`, which policy cloaks (sealed when ours recorded it). Theirs makes a public edit of `config.yml`. The merge applies theirs' edit at the cloaked path and seals it. This narrows the audience, which is allowed. The base text appears in markers only if `base_shown` is true (BUG-126).
+4. **An edit following a rename from a public to a sealed path.** Ours moves `config.yml` to `config/.env`, a secret file the policy cloaks (sealed when ours recorded it). Theirs makes a public edit of `config.yml`. The merge applies theirs' edit at the sealed path and seals it. This narrows the audience, which is allowed. The base text appears in markers only if `base_shown` is true (BUG-126).
    - *Test:* conflict this case and check that the materialised markers for the public reader contain no sealed text.
 5. **The pairing reads content the merger cannot read.** *Invariant:* the inexact pass uses `Plain` versions only, so an unreadable entry can pair by exact id only. *Test:* a non-member merges; there are no `Corrupt` or decrypt attempts (a counter in the test store).
 6. **Quadratic cost from hostile trees.** A pushed change deletes 50 000 files and adds 50 000 similar ones.
@@ -56,8 +56,7 @@ Status: design and threat review. No format change: renames are computed, never 
 7. **Many-to-one pairs.** Several deleted files are similar to one added file, or one deleted file is copied 10 000 times.
    - *Invariant:* each destination gets at most one source, assigned greedily by score and then by path; sources may be reused only for copies. The output size is linear in the changes.
    - *Test:* 10 000 identical copies; the output has 10 000 lines, and memory stays under 64 MiB.
-8. **A rename across embargo views.** For a non-holder, an embargoed merge's tree resolves to the fallback. Rename detection must run on the *reader's resolved trees* (`checkout::resolve_view`), never on the wrapper's listed ids, which would show the fix renamed a file (BUG-104/018 class).
-   - *Test:* an embargoed fix renames `a.c` to `b.c`; an outsider's `vl show` of the merge lists no rename and no `b.c`.
+8. **A rename across embargo views.** Removed in repository format 8 (only secret files are encrypted). An unreleased embargo is withheld from every push.
 9. **Conflict entries as rename sources.** A conflict is matched only by an exact equal conflict id, never by inexact content (rendering it costs the materialise budget, and its sides have their own audiences).
 10. **Kinds** (feature 6). A symlink renames only to a symlink, by exact id. A file ↔ symlink pair is never a rename.
 11. **Case-only renames on macOS** (`README` → `readme`). The builder already keeps recorded spellings stable (`canonical_names`). `vl status` shows `R README -> readme` only after an explicit `mv` that changed the recorded spelling.
@@ -70,8 +69,8 @@ Status: design and threat review. No format change: renames are computed, never 
 ## Open decisions
 
 - **Should rename detection run inside merges and auto-rebase by default?** *Recommendation:* yes, with exact and inexact passes within the limits, as Git's `ort` does. The modify/delete conflicts users get today are the commonest Git-parity complaint, and point 2 shows audiences are decided by `merge_file`, not by the pairing. Add `VEIL_MERGE_RENAMES=0` as an escape hatch for one release.
-- **Protection follows content across a rename in the builder.** Today, `mv secrets/db.yml docs/db.yml`, where policy cloaks only `secrets/`, records `docs/db.yml` as *public* after a scan. *Recommendation:* in this round, the builder carries the deleted entry's verified sealing to the new path when the new file's plaintext id equals a sealed entry deleted in the same snapshot.
-  - That is exact content only; the stat cache knows the plaintext id of cloaked files it verified (BUG-300).
-  - The file stays sealed, with a warning "`docs/db.yml` was `secrets/db.yml` (cloaked:ops); kept sealed; run `vl expose docs/db.yml` to publish".
+- **Protection follows content across a rename in the builder.** Today, `mv deploy/.env docs/db.yml`, where policy cloaks only `deploy/.env`, records `docs/db.yml` as *public* after a scan. *Recommendation:* in this round, the builder carries the deleted entry's verified sealing to the new path when the new file's plaintext id equals a sealed entry deleted in the same snapshot.
+  - That is exact content only; the stat cache knows the plaintext id of sealed files it verified (BUG-300).
+  - The file stays sealed, with a warning "`docs/db.yml` was `deploy/.env` (cloaked:ops); kept sealed; run `vl expose docs/db.yml` to publish".
   - This is a strengthening, consistent with "protection follows the name" for artefacts (§4 rule 2). Inexact matches only warn. Owner: stream W (builder).
 - **Copies (`-C`) by default?** *Recommendation:* no. They are off by default in diff, log and merge, as in Git, because they are expensive and rarely wanted.

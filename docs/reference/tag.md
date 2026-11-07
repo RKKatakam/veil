@@ -45,10 +45,9 @@ Options:
 | | |
 |---|---|
 | `-r, --rev <REV>` | Snapshot the tag points at (default: `@`) |
-| `--cloak [<SCOPE>]` | Cloak the tag (default scope: team): never pushed to public remotes |
 | `--allow-backwards` | Allow moving the tag to a snapshot that is not a descendant |
 | `-a, --annotate` | Make an annotated release tag: immutable, signed when you have an identity |
-| `-m, --message <MESSAGE>` | The annotated tag's message (implies `-a`; sealed for a cloaked tag) |
+| `-m, --message <MESSAGE>` | The annotated tag's message (implies `-a`) |
 | `--force` | Replace an existing annotated tag (or annotate a plain one). A release tag moved without `-m` keeps its message |
 
 ## `vl tag delete`

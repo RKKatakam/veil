@@ -3,7 +3,7 @@
 
 # `vl cloak`
 
-Encrypt matching paths for a scope (default: team)
+Encrypt matching secret files (.env, keys, ...) for a scope (default: team). Only secret files are ever encrypted; `vl access` decides who sees everything else
 
 ```text
 vl cloak [OPTIONS] <PATTERNS>...
@@ -13,7 +13,7 @@ Arguments:
 
 | | |
 |---|---|
-| `<PATTERNS>…` | Paths or glob patterns (required) |
+| `<PATTERNS>…` | Secret files (paths or glob patterns) (required) |
 
 Options:
 

@@ -6,7 +6,7 @@ transactions). Run `vl doctor` first when something is off: it checks the
 machine and the repository and explains what it finds.
 
 * [Secrets and policy](#secrets-and-policy)
-* [Cloaking and keys](#cloaking-and-keys)
+* [Secret files and keys](#secret-files-and-keys)
 * [History, tags and revisions](#history-tags-and-revisions)
 * [Remotes](#remotes)
 * [The working copy and the filesystem](#the-working-copy-and-the-filesystem)
@@ -18,7 +18,8 @@ machine and the repository and explains what it finds.
 ### `warning: X quarantined: looks like a secret (RULE at line N: …)`
 
 The scanner found a credential in a public file, so the file (or this edit
-of it) was not recorded. It's still on disk. Remove the secret, or cloak,
+of it) was not recorded. It's still on disk. Remove the secret (a shared
+value belongs in a secret file such as `.env`, or the team vault), or
 isolate or `expose --force` the file, or `vl restore X` to drop the edit.
 See [Quarantine](secrets-and-visibility.md#quarantine).
 
@@ -66,7 +67,7 @@ until then.
 
 ### `warning: N matching file(s) already exist in plaintext in earlier snapshots (e.g. X). New snapshots are protected; rotate any secrets they contain.`
 
-You cloaked or isolated a path that was already recorded in plaintext.
+You cloaked or isolated a file that was already recorded in plaintext.
 Older snapshots (and any remote they were pushed to)
 still contain it. Rotate the secrets.
 
@@ -76,9 +77,24 @@ A rule with an unknown tier, no tier, or an invalid scope (`local`,
 `embargo/…`, upper case) is treated as `isolate`, with a warning. Check
 with `vl policy check PATH`.
 
-## Cloaking and keys
+## Secret files and keys
 
-> Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)).
+Only secret files (`.env`, keys and the like) are ever encrypted
+("cloaked", for a scope). Who sees folders and code is decided by folder
+access (`vl access`, [VISIBILITY.md](../VISIBILITY.md)).
+
+### `error: `vl cloak` seals secret files only (.env, keys, ...), and 'X' is not one; …`
+
+`vl cloak` takes secret files only. To choose who sees a folder, use
+`vl access <folder> <group>`.
+
+### `warning: …: `cloak` seals secret files only (.env, keys, ...): what 'P' names that is not a secret file is isolated (kept on this device); …`
+
+A `cloak` line in `.veilpolicy` (perhaps from an older repository, such as
+`secrets/ cloak team`) names files that are not secret files. Those files
+are kept on this device, never recorded or pushed. To share the folder with
+some people only, replace the line with an access line
+(`vl access secrets/ finance`).
 
 ### `error: you hold no current key for scope 'S' (create it with `vl scope create S`)`
 
@@ -94,17 +110,16 @@ for access, then the next command records it.
 
 ### `R` files in `vl status`, `redacted X (cloaked:S; no key; left out of the working copy)`
 
-Cloaked files you can't read are kept in history and left out of your
+Secret files sealed for a scope you are not in are kept in history and left out of your
 working copy. The reason in brackets says why: `no key` (you are not a
-member of `S`), `not received` (see the next entry) or
-`embargo …; not released`. They appear automatically (`Filled in N file(s) that became
+member of `S`) or `not received` (see the next entry). They appear automatically (`Filled in N file(s) that became
 readable`) after an admin grants you the scope and pushes, and you pull.
 
 ### `error: X is cloaked under scope 'S' and its content never reached this repository …`
 
-`vl cat` (or `vl restore`) of a cloaked file in a repository that came from
-a public mirror (before the Veil server), which never delivers cloaked
-content. Once a member grants you `S`, clone the project from the Veil
+`vl cat` (or `vl restore`) of a sealed secret file in a repository that
+came from a public mirror (before the Veil server), which never delivers
+sealed content. Once a member grants you `S`, clone the project from the Veil
 server. `vl files` shows such files as `(redacted)`, and `vl diff` /
 `vl show` as `(content hidden: cloaked:S; not received)`.
 
@@ -115,17 +130,12 @@ public key (`vl identity show`) with a member, who runs
 `vl scope grant S <key>` and pushes; then `vl pull`. `vl diff` and
 `vl show` say `(content hidden: cloaked:S; you hold no key)`.
 
-### `error: X is under embargo E, which is not released yet …`
-
-The file belongs to an embargoed merge you can't read. `vl show REV`
-gives the deadline (`Embargo   : E (until …)`); after the release, pull.
-
 ### `warning: key ring for scope 'team': exists on both sides with different keys; the incoming key ring was not merged`
 
 Your repository and the remote each created their own `team` scope,
 usually because you ran `vl init` and then pulled instead of cloning. The
 rings can't be merged. Delete the directory and `vl clone` the remote. See
-[Use `vl clone`](teams-and-remotes.md#use-vl-clone-not-vl-init--pull).
+[Use `vl clone`](teams-and-remotes.md#teammates).
 
 ### `error: … that public identity has a signing key but no proof that it belongs to …`
 
@@ -178,12 +188,9 @@ if you don't need it.
 
 ### `vl status` doesn't show my merge conflict
 
-In a repository at format 4 it does: the change on top of the merge holds
-the conflict, listed with `recorded on` the merge. In an older format (or
-for a merge under an embargo) conflicts are markers in the file, recorded
-on the merge only, which is `@-` after `vl merge`: use `vl log` (`×` marks
-it), then `vl edit` it and fix the files there. See
-[Conflicts](getting-started.md#conflicts).
+It does: the change on top of the merge holds the conflict, listed with
+`recorded on` the merge (`@-` after `vl merge`; `×` marks it in `vl log`).
+See [Conflicts](getting-started.md#conflicts).
 
 ### `vl resolve` says I cannot resolve a conflict / my edit of a conflicted file is "held back"
 
@@ -193,11 +200,11 @@ line, and an edit or a deletion by you would drop content you cannot read,
 so it stays local. Ask a member of the scope to resolve it, or keep a
 version you are allowed to choose with `vl resolve PATH --ours|--theirs`.
 
-### `warning: edit of X not recorded: this line is under embargo E, whose content you cannot read, …`
+### `error: … embargoed merges cannot be pushed to the server yet …`
 
-You are working on top of an embargoed merge you hold no key for. Recording
-your edit would silently revert the hidden fix, so it stays on disk and is
-recorded after the release. Work on the merge's first parent instead
+The Veil server does not take embargoed merges yet, so it refuses a push
+whose tags reach one. Push only tags that do not reach it, and keep other
+work on a line without the embargo
 ([Embargoes](embargoes.md#working-on-an-embargoed-line)).
 
 ### `error: policy violation: cannot merge under a new embargo: … already carries unreleased embargo E, and embargoes cannot overlap; …`
@@ -261,7 +268,7 @@ snapshot's file as deleted). To take the snapshot's version instead, move
 `inner/` holds a `.veil` directory: it is a repository of its own (a
 vendored project, a monorepo member, or `vl init` run in the wrong place).
 As Git does with an embedded repository, this repository records nothing
-in it, whatever `.veilpolicy` says: its cloaked files are plaintext on
+in it, whatever `.veilpolicy` says: its secret files are plaintext on
 disk, and only its own policy knows they are secret. Commit and push its
 files from inside it. If this repository recorded files there before,
 they show as deleted (they stay on disk), and a checkout never writes or
@@ -402,8 +409,7 @@ exits 1.
 
 ## Locks, crashes and integrity
 
-From format 6 commands record their operations without the repository
-lock: only key-ring, vault and `repo.json` changes, `vl gc` and `vl
+Commands record their operations without the repository lock: only key-ring, vault and `repo.json` changes, `vl gc` and `vl
 upgrade` take it, for milliseconds to seconds.
 A `vl` killed while it records leaves its new objects in
 `.veil/objects/incoming/tx-…`, which the next command removes once that
@@ -482,15 +488,16 @@ Everything else is in the operation log: `vl op log`, `vl op restore ID`.
 does not interoperate with Git: it imports, exports and syncs nothing with
 it.
 
-**Is my `.env` safe?** It's never recorded or pushed, by any command,
-unless a policy you accepted says `cloak` (encrypted for a scope) or
-`public!`. It is backed up in your local vault. Your machine's disk is
+**Is my `.env` safe?** It's never recorded or pushed in plaintext, by any
+command, unless a policy you accepted says `public!`. A `cloak` line (new
+repositories write `.env  cloak rule`) records it encrypted for a scope and
+syncs it. It is backed up in your local vault. Your machine's disk is
 still your responsibility.
 
 **Can a teammate see my isolated files?** No. They never leave your
 machine.
 
-**Can the server see cloaked files?** No, it stores ciphertext. It can see
+**Can the server see secret files?** No, it stores ciphertext. It can see
 their names, sizes and who the scope members are. See
 [what isn't protected](secrets-and-visibility.md#what-is-protected-and-what-isnt).
 

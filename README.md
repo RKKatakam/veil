@@ -20,10 +20,9 @@ offline-first. Start with [what Veil is](docs/OVERVIEW.md) and
 **Today:** the client engine and the server's first milestone (S1: sign-in,
 groups, folder access, `public`, encrypted secrets, push, pull and clone
 through the server) are built ([OVERVIEW.md](docs/OVERVIEW.md), "What exists
-today, and what's next"). `vl` syncs only through the Veil server. The
-client still also restricts paths by encrypting them for a scope
-(`vl cloak`); the next part of the simplification pass replaces that with
-folder access.
+today, and what's next"). `vl` syncs only through the Veil server, and only
+secret files are ever encrypted: folders are restricted by the server's
+access rules (`vl access`).
 
 ## Documentation
 
@@ -169,7 +168,7 @@ Change ids (`syplqsok`, letters k–z) are stable across rewrites; snapshot ids
 
 ## A tour
 
-> Cloaking and scopes are today's client; folder access on the server replaces them (see [OVERVIEW.md](docs/OVERVIEW.md) and [VISIBILITY.md](docs/VISIBILITY.md)). Cloaked lines and embargoes cannot be pushed to the server yet ([HUB.md](docs/HUB.md) §13.8), so they stay on the device for now.
+> Folders are restricted by the server's access rules ([VISIBILITY.md](docs/VISIBILITY.md)); only secret files are encrypted. Embargoed merges cannot be pushed to the server yet ([HUB.md](docs/HUB.md) §13.8), so they stay on the device until released.
 
 ```sh
 # Secrets: nothing to configure.
@@ -178,11 +177,11 @@ echo 'k = "AKIAIOSFODNN7EXAMPLE"' > cfg.js      # quarantined with a warning
 vl scan                                          # CI-friendly: exit 1 if a public file holds a secret
 vl secret import .env && vl run -- ./server      # encrypted device-local vault → env vars
 
-# Cloaking: encrypted for a scope, inside the same repository.
-vl cloak secrets/ --scope team
-vl scope grant team veil1<bob's public key> --name bob   # from bob's `vl identity show`
-vl scope revoke team veil1<…>   # rotates the key: new content is unreadable to them
-vl ls                 # every file's tier: public, cloaked:team, isolated, quarantined…
+# Secret files can also be sealed for a scope and synced (only secret files).
+vl cloak config/.env.prod --scope ops
+vl scope grant ops veil1<bob's public key> --name bob    # from bob's `vl identity show`
+vl scope revoke ops veil1<…>    # rotates the key: new secrets are unreadable to them
+vl ls                 # every file's tier: public, cloaked:ops, isolated, quarantined…
 
 # Sync: through the Veil server, which sends each person only what they may see.
 vl login veil://hub.example.com --name alice
@@ -190,19 +189,18 @@ vl remote add origin veil://hub.example.com/acme
 vl push               # a new project: you are its admin, everything is private
 vl access src/ public # who may see what (push it to apply)
 
-# Delayed-visibility merge (e.g. a security fix), developed out of sight.
-vl ws new fix-cve -r main --cloak team            # or any change not on `main`
+# Delayed-visibility merge (e.g. a security fix): a permission, not encryption.
+vl ws new fix-cve -r main                         # or any change not on `main`
 vl merge fix-cve@ --into main --embargo --until +7d -m "Fix CVE-…"
 vl embargo release <id>   # (or automatically after 7 days)
-# Until release, outsiders see main's pre-merge tree, even for commits made on
-# top of the merge (their messages are sealed too), and cannot commit on top of it.
+# Until release, the merge and the history it brings in stay here: no push sends
+# them, nor a tag or commit built on them, and copies out of the embargo are refused.
 # Veil keeps one unreleased embargo per line: a second `--embargo` merge into
 # (or of) a line that still carries one is refused, and so is merging or rebasing
 # two embargoed lines together. Release the earlier embargo first, then merge.
 
-# Visibility never widens by accident: rebase, `vl new`, squash and policy edits that
-# arrive by merge keep sealed files sealed. Publishing is explicit: `vl merge` of a
-# cloaked line (secret-scanned; it lists what it published) or `vl expose`.
+# Protection never widens by accident: rebase, `vl new`, squash and policy edits that
+# arrive by merge keep sealed secrets sealed. Publishing a secret is explicit (`vl expose --force`).
 
 # Virtual workspaces: no directories, no collisions.
 vl ws new agent                                   # exists only in the DAG
@@ -230,13 +228,13 @@ History      new [revs…] [-m] · commit -m · describe [-r rev] -m · edit <re
              abandon [rev] · rebase -s <rev> -d <dest…> · squash [-r rev]
              restore [paths…] [--from rev]
              merge <revs…> [--into rev] [-m] [--embargo] [--until TIME] [--scope S]
-             embargo list|release <id> · tag list|set <name> [-r rev] [--cloak [S]]|delete
-Visibility   cloak <pat…> [--scope S] · isolate <pat…> · expose <pat…> [--force] · ignore <pat…>
+             embargo list|release <id> · tag list|set <name> [-r rev]|delete
+Visibility   cloak <secret file…> [--scope S] · isolate <pat…> · expose <pat…> [--force] · ignore <pat…>
              policy show|check <paths…>|accept · scan
 Secrets      secret set|get|list|rm|import · run -- <cmd…>
 Access       scope list|create <S>|grant <S> <pubkey> [--name] [--admin]|revoke <S> <pubkey>
              scope rotate <S> · scope log <S>
-Workspaces   ws list|new <name> [-r rev] [--cloak [S]]|switch <name>|rm <name>
+Workspaces   ws list|new <name> [-r rev]|switch <name>|rm <name>
              ws exec <name>|--ephemeral [-r rev] [-m] [--with-isolated] [--only <path>…] -- <cmd…>
              ws cat <name> <path> · ws write <name> <path> < stdin
              ws mount <name> <dir> [--foreground] [--record-every SECS] · ws unmount <name>
@@ -253,27 +251,32 @@ Revisions: `@` (working copy), `name@` (another workspace), `root`, tags,
 
 ### `.veilpolicy`
 
-> Today's client, before the server; this changes when the server lands. With the server, `.veilpolicy` holds folder access (`billing/ finance`, `src/ public`), and only admins can change it ([VISIBILITY.md](docs/VISIBILITY.md)).
+`.veilpolicy` holds folder access (`billing/ finance`, `src/ public`), which
+the server enforces and only admins can change ([VISIBILITY.md](docs/VISIBILITY.md)),
+and the device-side rules:
 
 ```text
-# <pattern>        <tier> [scope]     — last matching rule wins
-secrets/            cloak team
-config/prod/**      cloak ops
+# <pattern>        <tier or who> [scope]     — last matching rule wins
+billing/            finance                  # access: plain text, the server decides
+config/.env.prod    cloak ops                # a secret file, sealed for `ops`
 *.local.json        isolate
 target/             ignore
-tests/fixtures/     public!           # deliberate exposure, secret scanning off
+tests/fixtures/     public!                  # deliberate exposure, secret scanning off
 ```
 
 Built-in rules (`.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa`, `*.tfstate`, …)
 come first and **cannot be overridden by a plain `public` rule**, only by
-`cloak` (encrypted sharing) or an explicit `public!`.
+`cloak` (encrypted sharing) or an explicit `public!`. **Only secret files are
+ever encrypted:** a `cloak` line on anything else (`secrets/`, `src/`) keeps it
+on the device, as `isolate` does, with a warning; give a folder to a group
+with `vl access` instead.
 
 Patterns are globs; `\` escapes a character (`config\[prod\].yml`,
 `my\ notes.txt`). `vl cloak|isolate|expose|ignore <path>` on an existing path
 writes it escaped, so `app/[id]/` means that directory. Built-in secret rules
 and `cloak`/`isolate` rules ignore case (`.ENV`, `Secrets/`). `public`,
 `public!` and `ignore` rules are case-sensitive. A rule with an invalid scope
-(`local`, `embargo/…`, `UPPER`), an unknown tier or no tier is treated as
+(`local`, `rule`, `UPPER`), an unknown tier or no tier is treated as
 `isolate`, with a warning.
 
 `.veilpolicy` is shared, but **a change to it that you did not make never
@@ -406,10 +409,12 @@ docs/FORMAT.md        on-disk formats, compatibility rules, migrations
 
 ## Repository formats
 
-A repository records its format in `.veil/repo.json`. Every release reads
-every older format and keeps writing it, so existing repositories just
-work; `vl upgrade` opts in to a newer one (format 2: binary trees, a faster
-`vl status`) without rewriting history: ids and signatures stay valid. See
+A repository records its format in `.veil/repo.json`. This release reads and
+writes format 8 (only secret files are encrypted). `vl upgrade` brings a
+format-6 or format-7 repository to it without rewriting history (ids and
+signatures stay valid), unless it holds what earlier releases could still
+encrypt (descriptions, tags, embargoes, folders): then it refuses, naming
+each thing. Formats 1 to 5 are no longer read. See
 [docs/FORMAT.md](docs/FORMAT.md).
 
 ## Embedding the engine (in-memory, e.g. for agents)
@@ -433,7 +438,7 @@ drop(ws);                                       // vanishes; the snapshot remain
 The client engine, the CLI and the server's milestone S1 work end-to-end
 and are covered by tests (`cargo test`; `scripts/verify-server.sh` for the
 server). The simplification pass is under way: plain-file remotes are gone,
-cloaking and old formats are next ([OVERVIEW.md](docs/OVERVIEW.md)). See
+and only secret files are encrypted ([OVERVIEW.md](docs/OVERVIEW.md)). See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#limitations-and-roadmap) for
 known limitations. The engine also builds for WebAssembly
 ([docs/guide/embedding.md](docs/guide/embedding.md)).

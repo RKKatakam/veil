@@ -6,7 +6,7 @@
 Generated from `vl` itself (`vl <command> --help` shows the same text). For
 explanations and worked examples, read the [user guide](../guide/README.md).
 
-Veil — snapshot-first version control with cloaking, engine-level secret protection and virtual workspaces.
+Veil — snapshot-first version control with engine-level secret protection (secret files are encrypted) and virtual workspaces.
 
 There is no staging area: every `vl` invocation first records the working copy as a snapshot of the current change. Use `vl commit -m` to finish a change, `vl undo` to step back through the operation log.
 
@@ -60,7 +60,7 @@ Global options (accepted by every command):
 | [`vl merge`](merge.md) | Merge REVS into the current line of work |
 | [`vl embargo`](embargo.md) | Manage embargoes created by delayed-visibility merges |
 | [`vl tag`](tag.md) | Manage tags (named pointers into the snapshot graph) |
-| [`vl cloak`](cloak.md) | Encrypt matching paths for a scope (default: team) |
+| [`vl cloak`](cloak.md) | Encrypt matching secret files (.env, keys, ...) for a scope (default: team). Only secret files are ever encrypted; `vl access` decides who sees everything else |
 | [`vl isolate`](isolate.md) | Keep matching paths local-only: never snapshotted, never synced |
 | [`vl expose`](expose.md) | Make matching paths public |
 | [`vl ignore`](ignore.md) | Do not track matching paths at all |
