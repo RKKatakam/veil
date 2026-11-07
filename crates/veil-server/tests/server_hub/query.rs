@@ -42,6 +42,13 @@ fn ask(th: &TestHub, h: &Hist, viewer: &Viewer) -> Ask {
     }
 }
 
+/// Fill `viewer`'s graph of `h` up to its branches (as a landing does), so
+/// that no query of the test meets a first fill.
+fn warm_up(th: &TestHub, h: &Hist, viewer: &Viewer) {
+    let tips: Vec<ObjectId> = h.branches.values().copied().collect();
+    th.rt.block_on(query::graph::ensure(&h.hub, &h.project(th), viewer, &tips, None)).unwrap();
+}
+
 fn admin() -> Viewer {
     Viewer {
         admin: true,
@@ -178,6 +185,8 @@ fn query_projection_equivalence() {
                 revs.push(s.hex());
             }
             let (mine_ask, copy_ask) = (ask(&th, &h, &viewer), ask(&th, &copy, &admin()));
+            warm_up(&th, &h, &viewer);
+            warm_up(&th, &copy, &admin());
             let hidden_paths: Vec<String> = all_paths(&h).into_iter().filter(|k| !view.read(k) && !k.is_empty()).collect();
             for q in queries(&mut rng, &revs, &paths) {
                 let (real, theirs) = (run(&th, &h, &mine_ask, &q), run(&th, &copy, &copy_ask, &q));
@@ -249,7 +258,7 @@ fn query_graph_matches_direct_walks() {
             h.set_branch(&th, if i == 0 { "main" } else { ["s1", "s2", "s3"][i - 1] }, *t);
         }
         let project = h.project(&th);
-        th.rt.block_on(query::graph::extend(&h.hub, &project, &admin(), &tips, None)).unwrap();
+        th.rt.block_on(query::graph::extend(&h.hub, &project, &admin(), &tips)).unwrap();
         // The model.
         let anc = |x: ObjectId| -> HashSet<ObjectId> {
             let mut seen = HashSet::new();
@@ -363,6 +372,8 @@ fn query_work_ignores_hidden_content() {
     b.set_branch(&th, "main", tb);
     for (who, viewer) in [("anyone on Earth", Viewer::default()), ("a dev", viewers(1)[1].1.clone())] {
         let (aa, ab) = (ask(&th, &a, &viewer), ask(&th, &b, &viewer));
+        warm_up(&th, &a, &viewer);
+        warm_up(&th, &b, &viewer);
         let tip = th.rt.block_on(query::resolve(&a.hub, &aa, "main", Instant::now() + Duration::from_secs(60))).unwrap();
         assert_eq!(tip, th.rt.block_on(query::resolve(&b.hub, &ab, "main", Instant::now() + Duration::from_secs(60))).unwrap());
         let revs = vec!["main".to_string(), tip.hex()];
@@ -400,6 +411,8 @@ fn query_hidden_and_withheld_are_missing() {
     h.set_branch(&th, "embargoed", c);
     let anyone = ask(&th, &h, &Viewer::default());
     let adm = ask(&th, &h, &admin());
+    warm_up(&th, &h, &Viewer::default());
+    warm_up(&th, &h, &admin());
     let one = |a: &Ask, q: Q| run(&th, &h, a, &q).remove(0);
     let log = |rev: &str| Q::Log(LogParams { rev: Some(rev.into()), ..Default::default() }, Limits::default());
     let missing = ObjectId([0x5a; 32]).hex();
@@ -455,6 +468,7 @@ fn query_hostile_inputs_are_bounded() {
     }
     h.set_branch(&th, "main", tip);
     let a_ = ask(&th, &h, &Viewer::default());
+    warm_up(&th, &h, &Viewer::default());
     let hub = h.hub.clone();
     th.rt.block_on(async {
         // `n` is capped.
@@ -541,7 +555,7 @@ fn query_concurrent_extensions_agree() {
                     if i % 2 == 1 {
                         tips.reverse();
                     }
-                    set.spawn(async move { query::graph::extend(&hub, &project, &v, &tips, None).await.unwrap() });
+                    set.spawn(async move { query::graph::extend(&hub, &project, &v, &tips).await.unwrap() });
                 }
             }
             while set.join_next().await.is_some() {}
@@ -580,6 +594,72 @@ fn query_landing_fills_the_viewer_graphs() {
             assert_eq!(n, 1, "{key}: the tip's row");
         }
     }
+}
+
+/// A first fill of a view key (minutes on a long history) runs once, in
+/// the background: many requests at once, from anyone on Earth and from
+/// people who signed up with no access (the same view key: keys come from
+/// the server's records, never from a request), start one fill; each gets
+/// `warming` at its deadline, never pays for the fill inside it, and the
+/// fill finishes after they gave up.
+#[test]
+fn query_first_fill_runs_once_in_the_background() {
+    let th = TestHub::start();
+    let (policy_text, bindings) = policy(1);
+    let mut h = Hist::new(&th, &policy_text, &bindings);
+    random_history(&th, &mut h, &mut Rng::new(71), 150);
+    let project = h.project(&th);
+    let nobody = |i: i64| Viewer {
+        person: Some(990_000 + i),
+        ..Viewer::default()
+    };
+    for i in 0..8 {
+        assert_eq!(project.view(&nobody(i)).key(), project.view(&Viewer::default()).key(), "a sign-up without access reads as anyone on Earth");
+    }
+    assert_eq!(th.hub().query.fills_started(h.id), 0);
+    let quick = Limits {
+        deadline: Duration::from_millis(5),
+        ..Limits::default()
+    };
+    let base = ask(&th, &h, &Viewer::default());
+    let codes: Vec<String> = th.rt.block_on(async {
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..24 {
+            let viewer = if i % 3 == 0 { Viewer::default() } else { nobody(i) };
+            let (hub, a) = (h.hub.clone(), Ask { viewer, ..base.clone() });
+            set.spawn(async move {
+                match query::log(&hub, &a, LogParams::default(), quick).await {
+                    Ok(_) => "ok".to_string(),
+                    Err(Error::Api { code, .. }) => code.to_string(),
+                    Err(e) => panic!("{e:?}"),
+                }
+            });
+        }
+        let mut out = Vec::new();
+        while let Some(r) = set.join_next().await {
+            out.push(r.unwrap());
+        }
+        out
+    });
+    assert!(codes.iter().all(|c| c == "warming" || c == "deadline" || c == "ok"), "{codes:?}");
+    assert!(codes.iter().any(|c| c == "warming"), "{codes:?}");
+    // The fill goes on without them, and is the only one.
+    let t = Instant::now();
+    let a = ask(&th, &h, &Viewer::default());
+    loop {
+        match th.rt.block_on(query::log(&h.hub, &a, LogParams::default(), quick)) {
+            Ok(_) | Err(Error::Api { code: "deadline", .. }) => break,
+            Err(Error::Api { code: "warming", .. }) => {}
+            Err(e) => panic!("{e:?}"),
+        }
+        assert!(t.elapsed() < Duration::from_secs(300), "the fill never finished");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(th.hub().query.fills_started(h.id), 1, "one fill for one view key");
+    assert!(th.rt.block_on(query::log(&h.hub, &a, LogParams::default(), Limits::default())).is_ok());
+    // A landing keeps the view key warm (`memo_tips`) without a new fill
+    // of the history: it joins or extends by the new snapshots only.
+    assert_eq!(th.hub().query.fills_started(h.id), 1);
 }
 
 /// Row 13: a new policy is answered under its own view keys: what a viewer
@@ -788,7 +868,7 @@ fn query_speed() {
         let a = ask(&th, &h, &viewer);
         let t = Instant::now();
         let tips: Vec<ObjectId> = h.branches.values().copied().collect();
-        th.rt.block_on(query::graph::extend(&h.hub, &project, &viewer, &tips, None)).unwrap();
+        th.rt.block_on(query::graph::extend(&h.hub, &project, &viewer, &tips)).unwrap();
         println!("query_speed: {who}: projected and extended the graph in {:?}", t.elapsed());
         let hub = h.hub.clone();
         let mut runs: BTreeMap<&str, Vec<Duration>> = BTreeMap::new();

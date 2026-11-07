@@ -943,9 +943,10 @@ pub async fn memo_tips(hub: &Arc<Hub>, project_id: i64, branches: &[String]) -> 
             continue;
         }
         // Memoise the projections, and extend the viewer's graph with them
-        // (`query::graph::extend`), so that queries find both. One view
-        // key's failure leaves the others' done (and a query fills it).
-        if let Err(e) = crate::query::graph::extend(hub, &project, &v, &tips, None).await {
+        // (`query::graph::ensure`: the one fill of this view key, which a
+        // query that needs it joins), so that queries find both. One view
+        // key's failure leaves the others' done.
+        if let Err(e) = crate::query::graph::ensure(hub, &project, &v, &tips, None).await {
             if failed.is_ok() {
                 failed = Err(e);
             }

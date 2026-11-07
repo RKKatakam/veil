@@ -47,8 +47,9 @@ pub struct Hub {
     pub certificate: rustls::pki_types::CertificateDer<'static>,
     /// The derive workers (`derive::landed`).
     pub derive: derive::Workers,
-    /// Rows of viewers' graphs, by project, view key and snapshot (`query::graph`).
-    pub views: LruCache<Arc<query::graph::VRow>>,
+    /// The query API's caches and the viewer-graph fills running here
+    /// (`query::graph`).
+    pub query: query::graph::State,
 }
 
 pub type HubState = Arc<Hub>;
@@ -155,7 +156,7 @@ pub async fn start(config: Config) -> Result<Running> {
         session_ttl_ms: config.session_ttl.as_millis() as i64,
         certificate,
         derive: derive::Workers::default(),
-        views: LruCache::new(64 << 20),
+        query: query::graph::State::default(),
     });
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;

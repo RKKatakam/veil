@@ -374,7 +374,13 @@ Code: `crates/veil-server/src/query/` (`mod.rs` the routes and answers, `graph.r
 
 **The viewer graph** (departure from §3.2 and §3.4). Every query walks the commit graph of the viewer's projected history, never the real one: a `view_graph` row per (project, view key, projected snapshot), with the generation (the client's corrected commit date, as the real graph computes it), first-parent depth, parents, embargo flags, the jump table, `down` (the nearest snapshot below on the first-parent line that is a merge or the root) and one real snapshot it projects (where its trees come from). A row is a function of the projected snapshot objects alone, exactly what the viewer's own copy of the project would derive, so:
 * **a log is ordered by what the viewer sees** (S12's item 1): real generations, which hidden snapshots raise, order nothing. The order is exactly the client's (tested against Kahn's algorithm on histories with timestamps far ahead and far behind);
-* **a query's work is proportional to what the viewer sees** (S12's item 2): it reads viewer rows, projected snapshots and projected trees only. Hidden snapshots are walked once per view key, when the graph is filled from the projection memo (`graph::extend`): eagerly by `memo_tips` after each landing, and on demand by a query that names a tip not in it yet (then within the query's deadline; what was filled is kept, so the next call carries on).
+* **a query's work is proportional to what the viewer sees** (S12's item 2): it reads viewer rows, projected snapshots and projected trees only. Hidden snapshots are walked once per view key, when the graph is filled from the projection memo (`graph::extend`): eagerly by `memo_tips` after each landing, and by a query that names a tip not in it yet (in the background: below).
+
+**First fills are bounded, run once, and never inside a request.** Filling a view key's graph for a whole history costs what projecting it costs (80 s for anyone on Earth on 20,000 snapshots in a debug build, almost all of it S1's `sync::projected`). So:
+* **once:** a fill is one background task per project and view key on a server (`graph::ensure`), and one server at a time (a database advisory lock per project and view key); every query and landing that needs it joins it;
+* **outside requests:** a query waits for it only until its own deadline, then gets `warming` (503) while the fill runs on to the end; no request's deadline bounds, or pays for, a first fill, and a hundred anonymous requests cost one fill;
+* **warm at landing:** `memo_tips` runs every view key of the project's people, anyone on Earth's and the admins' through the same `ensure` after each landing (as S12's eager memos), so after the first fill a landing adds a few rows per new snapshot and view key, and queries find the graph filled;
+* **few view keys:** a view key is a function of the accepted policy and of who reads which access lines, which come from the server's records (admins, group members, people named on a line: `perm`), never from a request. Anyone can sign up, but someone with no access reads exactly what anyone on Earth reads, and has their key. So the keys, and the fills, anyone can cause are bounded by the distinct read sets of the project's people (at most one per person, and at most 2 to the number of lines) plus two; only admins and group managers, by changing who is in a group, make new ones. A new policy makes new keys, which its own landing warms.
 
 Admins have a graph too (view key `admin`, of real history), so every viewer runs the same code. The per-rule lists of S12 (`derive::view::Reader`) are not used by these routes; they stay for blame, file history and search (S14, S15). `log -- PATH` walks the viewer's graph and compares the path's projected entries in each snapshot and its first parent (walked down both trees at once, stopping where they meet), within a work budget per page (20,000 reads, then a cursor): its cost depends only on the viewer's history.
 
@@ -389,8 +395,8 @@ Admins have a graph too (view key `admin`, of real history), so every viewer run
 **Departures and limits:**
 * Answers use the field names of `docs/reference/json.md` where they apply server-side (no workspaces, tags or tiers); timestamps are milliseconds. S16 renders them as `vl` does.
 * `blame`, `history`, `grep` and `search` are S14 and S15; narrowed agent sessions (row 12) wait for phase 2's sessions.
-* Rows of a view key that no longer exists (a policy changed what someone reads) stay, like the projection memo; nothing purges either yet. After a policy change, the first query of each new view key fills its graph from its projections, which takes as long as `tips` does then.
-* Residual timing (row 4): the projector reads the directories that hold an access rule (bounded by the policy, not by history), decoding a tree costs its hidden entries too, and a query that arrives before `memo_tips` reached its view key fills the graph itself. The `work` counter counts the viewer-visible reads only, so it shows none of these; their cost is bounded by the policy, by one tree's size and by one landing's snapshots.
+* Rows of a view key that no longer exists (a policy changed what someone reads) stay, like the projection memo; nothing purges either yet. Until a new view key's first fill is done, its queries answer `warming`.
+* Residual timing (row 4): the projector reads the directories that hold an access rule (bounded by the policy, not by history), decoding a tree costs its hidden entries too, and a query that arrives before a landing's fill reached its view key gets `warming` sooner or later depending on how much history (hidden included) that fill walks: one bit, once per landing and view key. The `work` counter counts the viewer-visible reads only, so it shows none of these; their cost is bounded by the policy, by one tree's size and by one landing's snapshots.
 * A log cursor names the heads of the rest of the log: for a history with more than 1,000 open lines at one point, the cursor is refused when sent back.
 * BUG-1070 (S1's `history` and `fetch` accept real ids of hidden snapshots) is recorded, not fixed here.
 
@@ -404,21 +410,21 @@ Admins have a graph too (view key `admin`, of real history), so every viewer run
 | 7 | the viewer graph holds ids and numbers; `file` serves a secret's ciphertext; no hunks of sealed content | `query_routes_serve_each_person_their_part`: finance's `file` of `billing/.env` has no plaintext marker |
 | 8 | embargo lines withheld from everyone | `query_hidden_and_withheld_are_missing` (by branch, by id, from the log; for anyone and for admins) |
 | 9 | no answer cache; the viewer and their view key come from the records on every request | `query_routes_serve_each_person_their_part`: removed from finance, the next query gets `billing/` as missing |
-| 10 | the bounds above | `query_hostile_inputs_are_bounded` |
+| 10 | the bounds above; a first fill once per view key, in the background, joined by every request (`warming` at their deadlines); view keys from records only | `query_hostile_inputs_are_bounded`; `query_first_fill_runs_once_in_the_background` (24 requests at once from anyone on Earth and from sign-ups without access, with a 5 ms deadline: one fill, which finishes after they gave up; mutation caught: a fill per request) ; `query_landing_fills_the_viewer_graphs` |
 | 11 | rows a function of projected objects, written parents first, `ON CONFLICT DO NOTHING` | `query_concurrent_extensions_agree` (six extenders per view key at once write what one writes); `query_graph_matches_direct_walks` (ancestry, merge bases and log order against brute force, 700-snapshot histories with long runs, merges every way and skewed timestamps) |
 | 13 | a new policy gives new view keys, whose graphs are built from their own projections | `query_follows_policy_changes` |
 | 3, 12 | ranking: S15; narrowed sessions: phase 2 | — |
 
-**Speed** (`query_speed`, PostgreSQL 17, through `bench-quiet.sh`; 20,000 snapshots, 500 files, 1–4 changed a snapshot, a merge every 50, a hot file changed every 10th snapshot, two branches whose merge base is the 11th snapshot; anyone on Earth cannot see two fifths of the files; 20 rounds after a warm-up). Release build, load 8.3 before and 45.6 after; debug build in brackets, load 16.0 before and 8.3 after:
+**Speed** (`query_speed`, PostgreSQL 17, through `bench-quiet.sh`; 20,000 snapshots, 500 files, 1–4 changed a snapshot, a merge every 50, a hot file changed every 10th snapshot, two branches whose merge base is the 11th snapshot; anyone on Earth cannot see two fifths of the files; 20 rounds after a warm-up). Release build, load 14.3 before and 24.0 after; debug build in brackets, load 16.0 before and 8.3 after:
 
 | Query | Target (p99) | admin p50 / p99 | anyone on Earth p50 / p99 | rows read (admin / anyone) |
 |---|---|---|---|---|
-| `log -n 50` | 20 ms | 0.9 / 1.1 ms (3.3 / 6.0) | 1.8 / 3.8 ms (4.6 / 8.9) | 103 / 123 |
-| `log -n 50 -- PATH` (hot file) | 50 ms | 7.0 / 8.5 ms (44 / 55) | 10.5 / 13.9 ms (47 / 83) | 3,967 / 2,945 |
-| merge bases 20,000 apart | 5 ms | 1.0 / 1.7 ms (5.8 / 11.7) | 1.8 / 2.8 ms (6.0 / 6.1) | 12,390 / 12,425 |
-| `is_ancestor(root, tip)` | 5 ms | 0.04 / 0.06 ms | 0.08 / 1.4 ms | 26 / 22 |
-| `diff` against the merge base, 100 files | 50 ms | 5.2 / 6.2 ms (21 / 29) | 7.0 / 9.9 ms (21 / 23) | 225 / 225 |
-| `file` | 10 ms | 0.5 / 0.6 ms | 1.1 / 6.1 ms | 6 / 6 |
-| `tree` | 10 ms | 0.6 / 0.9 ms | 1.2 / 3.0 ms | 5 / 5 |
+| `log -n 50` | 20 ms | 0.5 / 0.7 ms (3.3 / 6.0) | 0.7 / 0.9 ms (4.6 / 8.9) | 103 / 123 |
+| `log -n 50 -- PATH` (hot file) | 50 ms | 5.1 / 6.9 ms (44 / 55) | 5.8 / 8.3 ms (47 / 83) | 3,967 / 2,945 |
+| merge bases 20,000 apart | 5 ms | 0.9 / 1.5 ms (5.8 / 11.7) | 1.0 / 1.6 ms (6.0 / 6.1) | 12,390 / 12,425 |
+| `is_ancestor(root, tip)` | 5 ms | 0.03 / 0.04 ms | 0.02 / 0.05 ms | 26 / 22 |
+| `diff` against the merge base, 100 files | 50 ms | 3.1 / 4.7 ms (21 / 29) | 3.2 / 5.3 ms (21 / 23) | 225 / 225 |
+| `file` | 10 ms | 0.2 / 0.3 ms | 0.2 / 0.3 ms | 6 / 6 |
+| `tree` | 10 ms | 0.3 / 0.3 ms | 0.3 / 0.4 ms | 5 / 5 |
 
-S12's paint-down took 707 ms (debug) for the same merge bases. The merge-base walk still visits every merge on the line (here 400 of them, a few rows each); a line without merges costs tens of rows. Filling a view key's graph for the whole 20,000-snapshot history took 4.3 s for the admins and 80 s for anyone on Earth, almost all of it S1's projection of every snapshot for that key (what `tips` pays today); after that, a landing costs a few rows per new snapshot and view key.
+S12's paint-down took 707 ms (debug) for the same merge bases. The merge-base walk still visits every merge on the line (here 400 of them, a few rows each); a line without merges costs tens of rows. Filling a view key's graph for the whole 20,000-snapshot history (once, in the background) took 3.3 s for the admins and 41 s for anyone on Earth in release (80 s in debug), almost all of it S1's projection of every snapshot for that key (what `tips` pays today); after that, a landing costs a few rows per new snapshot and view key.

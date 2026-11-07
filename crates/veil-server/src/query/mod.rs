@@ -27,6 +27,9 @@
 //! name at most 1,000 snapshots; a diff lists 10,000 files and 8 MiB of
 //! changed lines; a folder listing 10,000 entries; 100 ancestry pairs; and
 //! every query has a 2 s deadline, past which it fails (never answers less).
+//! A viewer's graph not filled yet is filled once, in the background
+//! (`graph::ensure`); a query waits for it until its deadline, then answers
+//! `warming`.
 //! Every answer carries the policy version it was computed under, and its
 //! `work` (rows and objects read).
 
@@ -50,7 +53,7 @@ use serde_json::{json, Value};
 use veil_core::{object::Snapshot, ObjectId};
 
 use self::{
-    graph::{blocking, extend, root, VRow, G},
+    graph::{blocking, ensure, root, VRow, G},
     trees::{clean_path, entry_json, DiffLimits, Trees},
 };
 use crate::{
@@ -187,7 +190,7 @@ pub async fn resolve(hub: &Arc<Hub>, ask: &Ask, rev: &str, deadline: Instant) ->
             target.and_then(|t| ObjectId::from_hex(&t).ok()).ok_or_else(no_revision)?
         }
     };
-    let p = extend(hub, &ask.project, &ask.viewer, &[real], Some(deadline)).await?[0];
+    let p = ensure(hub, &ask.project, &ask.viewer, &[real], Some(deadline)).await?[0];
     match row_of(p).await? {
         Some(r) if !r.withheld() && (parse_id(rev).is_none() || parse_id(rev) == Some(p)) => Ok(p),
         _ => Err(no_revision()),

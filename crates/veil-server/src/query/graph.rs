@@ -22,8 +22,9 @@
 //! every viewer runs the same code.
 //!
 //! **Filled** from the projection memo ([`extend`]): eagerly when a landing
-//! memoises its tips for every view key (`derive::memo_tips`), and on
-//! demand when a query names a tip not in it yet. Rows are written parents
+//! memoises its tips for every view key (`derive::memo_tips`), and when a
+//! query names a tip not in it yet: either way by one background fill per
+//! view key ([`ensure`]), which a query waits for until its deadline only. Rows are written parents
 //! first, each insert `ON CONFLICT DO NOTHING`: a row's presence means its
 //! ancestors' are present, and two servers extending at once write the same
 //! rows (`real` may name either of two real snapshots with one projection;
@@ -36,12 +37,14 @@
 use std::{
     cell::{Cell, RefCell},
     collections::{BinaryHeap, HashMap, HashSet},
-    sync::{Arc, OnceLock},
-    time::Instant,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
+use tokio::sync::watch;
+
 use axum::http::StatusCode;
-use veil_core::{object::Snapshot, ObjectId};
+use veil_core::{cache::LruCache, object::Snapshot, ObjectId};
 
 use crate::{
     derive::{
@@ -205,7 +208,7 @@ impl<'a> G<'a> {
         }
         let hub = self.cx.hub();
         let k = cache_key(self.cx.project(), self.vk, id);
-        if let Some(r) = hub.views.get(&k) {
+        if let Some(r) = hub.query.rows.get(&k) {
             self.local.borrow_mut().insert(*id, r.clone());
             return Ok(Some(r));
         }
@@ -231,7 +234,7 @@ impl<'a> G<'a> {
             down: ObjectId::from_hex(&down).map_err(bad)?,
             real: ObjectId::from_hex(&real).map_err(bad)?,
         });
-        hub.views.insert(k, r.clone(), 320);
+        hub.query.rows.insert(k, r.clone(), 320);
         self.local.borrow_mut().insert(*id, r.clone());
         Ok(Some(r))
     }
@@ -530,23 +533,18 @@ pub async fn blocking<T: Send + 'static>(hub: &Arc<Hub>, project: i64, f: impl F
 /// and everything below them; answer each tip's id in the viewer's
 /// history. The projections come from the memo (`sync::projected`, which
 /// fills it first); hidden snapshots are walked here once per view key,
-/// never by a query that finds their rows.
-pub async fn extend(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[ObjectId], deadline: Option<Instant>) -> Result<Vec<ObjectId>> {
+/// never by a query that finds their rows. Queries and landings call it
+/// through [`ensure`], which runs it once per view key, in the background.
+pub async fn extend(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[ObjectId]) -> Result<Vec<ObjectId>> {
     let mut ps = Vec::with_capacity(tips.len());
     for t in tips {
-        // The memo is filled as it goes: one cut by the deadline is
-        // carried on by the next call.
-        let p = sync::projected(hub, project, viewer, *t);
-        ps.push(match deadline {
-            Some(d) => tokio::time::timeout_at(d.into(), p).await.map_err(|_| too_slow())??,
-            None => p.await?,
-        });
+        ps.push(sync::projected(hub, project, viewer, *t).await?);
     }
     let vk = project.view(viewer).key();
     let admin = viewer.admin;
     let pairs: Vec<(ObjectId, ObjectId)> = tips.iter().copied().zip(ps.iter().copied()).collect();
     blocking(hub, project.id, move |cx| {
-        let g = G::new(cx, &vk, deadline);
+        let g = G::new(cx, &vk, None);
         let mut w = Walk {
             g: &g,
             admin,
@@ -563,8 +561,8 @@ pub async fn extend(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[
             }
             Ok(())
         })();
-        // What was computed is kept, also when the deadline cut the walk:
-        // the next one goes on from there.
+        // What was computed is kept, also when the walk failed: the next
+        // one goes on from there.
         w.flush()?;
         r
     })
@@ -711,4 +709,175 @@ impl Walk<'_, '_> {
         self.pending.clear();
         Ok(())
     }
+}
+
+// ---- filling once ----------------------------------------------------------------
+
+/// The query API's state in one server process.
+pub struct State {
+    /// Rows of viewers' graphs, by project, view key and snapshot.
+    pub rows: LruCache<Arc<VRow>>,
+    /// Fills running here, by project and view key: their outcome once done.
+    fills: Mutex<HashMap<(i64, String), Fill>>,
+    /// Fills started here, per project (the tests count them).
+    started: Mutex<HashMap<i64, u64>>,
+}
+
+type Fill = watch::Receiver<Option<std::result::Result<(), String>>>;
+
+impl Default for State {
+    fn default() -> Self {
+        State {
+            rows: LruCache::new(64 << 20),
+            fills: Mutex::new(HashMap::new()),
+            started: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl State {
+    /// How many fills this process started for `project`.
+    pub fn fills_started(&self, project: i64) -> u64 {
+        self.started.lock().unwrap().get(&project).copied().unwrap_or(0)
+    }
+}
+
+/// A query whose viewer's graph is being filled: the fill goes on in the
+/// background; the caller tries again.
+pub fn warming() -> Error {
+    Error::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "warming",
+        "this history is being prepared for you; try again in a few seconds",
+    )
+}
+
+/// How long a fill waits for another server's fill of the same view key
+/// before it goes ahead itself (it then finds that one's rows).
+const FILL_LOCK_WAIT: Duration = Duration::from_secs(600);
+const FILL_LOCK_BASE: i64 = 0x7665_696c_7166_0000; // "veilqf"
+
+/// The viewer's ids of real snapshots `tips`, once the viewer's graph holds
+/// them. A graph that does not hold them yet is filled by **one** task per
+/// project and view key on this server (and one server at a time, by a
+/// database advisory lock): every caller that needs it joins that task.
+/// The task runs in the background to the end, whoever stops waiting;
+/// a caller with a `deadline` gets [`warming`] when it passes (a query's
+/// deadline never bounds, nor pays for, a first fill).
+///
+/// View keys come from the server's records only (the accepted policy and
+/// who is an admin, in which groups, or named on a line: `perm`), never
+/// from a request, so the fills anyone can cause are one per distinct way
+/// the project's people read it, plus anyone on Earth's and the admins';
+/// `derive::memo_tips` keeps each of those warm at every landing.
+pub async fn ensure(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[ObjectId], deadline: Option<Instant>) -> Result<Vec<ObjectId>> {
+    let vk = project.view(viewer).key();
+    // A fill this call started and saw finish: if its rows are still not
+    // there, something is wrong; never loop on it.
+    let mut ours_done = false;
+    loop {
+        if let Some(ps) = warm(hub, project.id, &vk, viewer.admin, tips).await? {
+            return Ok(ps);
+        }
+        if ours_done {
+            return Err(bad("a fill finished without the rows it was for"));
+        }
+        // Another caller's fill may be for other tips: wait for it, then
+        // look again (and start ours).
+        let (mut rx, started) = start_or_join(hub, project, viewer, &vk, tips);
+        let done = async { rx.wait_for(|d| d.is_some()).await.ok().and_then(|d| d.clone()) };
+        let outcome = match deadline {
+            Some(d) => tokio::time::timeout_at(d.into(), done).await.map_err(|_| warming())?,
+            None => done.await,
+        };
+        if let Some(Err(e)) = outcome {
+            return Err(Error::Other(anyhow::anyhow!("filling a viewer graph: {e}")));
+        }
+        ours_done = started;
+    }
+}
+
+/// The viewer's ids of `tips` if their graph holds them all.
+async fn warm(hub: &Arc<Hub>, project: i64, vk: &str, admin: bool, tips: &[ObjectId]) -> Result<Option<Vec<ObjectId>>> {
+    let mut out = Vec::with_capacity(tips.len());
+    for t in tips {
+        let p = if admin || *t == root() {
+            *t
+        } else {
+            let p: Option<String> = sqlx::query_scalar("SELECT projected_id FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
+                .bind(project)
+                .bind(vk)
+                .bind(t.hex())
+                .fetch_optional(&hub.db)
+                .await?;
+            match p.and_then(|p| ObjectId::from_hex(&p).ok()) {
+                Some(p) => p,
+                None => return Ok(None),
+            }
+        };
+        let cached = p == root() || hub.query.rows.get(&cache_key(project, vk, &p)).is_some();
+        if !cached {
+            let found: Option<String> = sqlx::query_scalar("SELECT snapshot FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = $3")
+                .bind(project)
+                .bind(vk)
+                .bind(p.hex())
+                .fetch_optional(&hub.db)
+                .await?;
+            if found.is_none() {
+                return Ok(None);
+            }
+        }
+        out.push(p);
+    }
+    Ok(Some(out))
+}
+
+/// Join the fill running for (`project`, `vk`), or start one for `tips`;
+/// whether this call started it.
+fn start_or_join(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, tips: &[ObjectId]) -> (Fill, bool) {
+    let key = (project.id, vk.to_string());
+    let mut fills = hub.query.fills.lock().unwrap();
+    if let Some(rx) = fills.get(&key) {
+        return (rx.clone(), false);
+    }
+    let (tx, rx) = watch::channel(None);
+    fills.insert(key.clone(), rx.clone());
+    *hub.query.started.lock().unwrap().entry(project.id).or_default() += 1;
+    drop(fills);
+    let (hub, project, viewer, tips) = (hub.clone(), project.clone(), viewer.clone(), tips.to_vec());
+    tokio::spawn(async move {
+        let r = locked_fill(&hub, &project, &viewer, &key.1, &tips).await;
+        if let Err(e) = &r {
+            eprintln!("veil-server: filling a viewer graph of project {}: {e:?}", project.id);
+        }
+        hub.query.fills.lock().unwrap().remove(&key);
+        let _ = tx.send(Some(r.map(|_| ()).map_err(|e| format!("{e:?}"))));
+    });
+    (rx, true)
+}
+
+/// [`extend`] under the database advisory lock of (`project`, `vk`), so
+/// that two servers do not fill one view key at once.
+async fn locked_fill(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, tips: &[ObjectId]) -> Result<()> {
+    let mut h = blake3::Hasher::new();
+    h.update(&project.id.to_le_bytes());
+    h.update(vk.as_bytes());
+    let key = FILL_LOCK_BASE ^ i64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().unwrap());
+    let mut c = hub.db.acquire().await?;
+    let deadline = tokio::time::Instant::now() + FILL_LOCK_WAIT;
+    let mut got = false;
+    while !got && tokio::time::Instant::now() < deadline {
+        got = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)").bind(key).fetch_one(&mut *c).await?;
+        if !got {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    let r = extend(hub, project, viewer, tips).await.map(|_| ());
+    if got {
+        let unlocked = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)").bind(key).fetch_one(&mut *c).await;
+        if !matches!(unlocked, Ok(true)) {
+            let _ = sqlx::Connection::close(c.detach()).await;
+        }
+    }
+    r
 }
