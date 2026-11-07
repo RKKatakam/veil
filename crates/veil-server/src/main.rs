@@ -69,6 +69,21 @@ fn database_url(given: Option<String>) -> anyhow::Result<String> {
     }
 }
 
+/// jemalloc, not glibc's malloc (BUG-864): glibc gives each of the
+/// server's threads (32 workers, up to 512 blocking) its own arena and
+/// returns little of it, so a 1 GB push left the server at 2.4 GB for under
+/// 1 GB of data. Two arenas (each thread keeps a small cache in
+/// front of them) and background threads returning memory unused for a
+/// second keep it near what it holds (`docs/design/scale/BASELINE.md`,
+/// "The server's allocator"). `_RJEM_MALLOC_CONF` overrides these settings.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// jemalloc reads its settings from this symbol at start (a C string).
+#[used]
+#[export_name = "_rjem_malloc_conf"]
+static MALLOC_CONF: &[u8; 70] = b"narenas:2,background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
+
 fn main() -> anyhow::Result<()> {
     // Deep trees recurse on every server thread (BUG-1052).
     tokio::runtime::Builder::new_multi_thread()
