@@ -681,3 +681,110 @@ fn squashing_the_embargoed_merge_into_the_fix_never_reaches_the_server() {
     assert_no_marker(&everything_in(&d), &[FIX], "dev");
     assert!(!d.join("src/fix.rs").exists(), "the fix reached a clone");
 }
+
+/// The window a stored encoding's zstd frame declares, in bytes (`None`:
+/// a plain encoding; a single-segment frame's window is its content).
+fn stored_window(enc: &[u8]) -> Option<u64> {
+    let f = enc.strip_prefix(&[veil_core::hub::encoding::ZSTD][..])?;
+    let fhd = f[4];
+    if fhd & 0x20 != 0 {
+        return Some(veil_core::hub::encoding::decoded_len(enc).unwrap());
+    }
+    let wd = f[5];
+    let base = 1u64 << (10 + (wd >> 3));
+    Some(base + (base / 8) * u64::from(wd & 7))
+}
+
+/// `enc` (a zstd encoding from `encoding::encode`) with its frame header
+/// rewritten to declare a 2 GiB window: same blocks, same content. The
+/// format allows it; libzstd's one-shot decoder (objects up to 64 MiB)
+/// reads it; the WASM decoder refuses windows above 128 MiB.
+fn with_huge_window(enc: &[u8], content: u64) -> Vec<u8> {
+    let f = &enc[1..];
+    let fhd = f[4];
+    let single = fhd & 0x20 != 0;
+    let fcs = match fhd >> 6 {
+        0 => usize::from(single),
+        1 => 2,
+        2 => 4,
+        _ => 8,
+    };
+    let dict = [0, 1, 2, 4][usize::from(fhd & 3)];
+    let header = 5 + usize::from(!single) + dict + fcs;
+    let mut out = vec![veil_core::hub::encoding::ZSTD, 0x28, 0xb5, 0x2f, 0xfd, 0x80 | (fhd & 0x04), 21 << 3];
+    out.extend_from_slice(&(content as u32).to_le_bytes());
+    out.extend_from_slice(&f[header..]);
+    out
+}
+
+/// BUG-1008 (S27 adversarial pass). `dev` (no access to billing) knows a
+/// file that billing holds too (a licence, a vendored file: the same
+/// object). `dev` uploads it as an encoded frame declaring a 2 GiB window:
+/// the server checks it (libzstd reads it), answers a receipt, and stores
+/// it as sent over the admin's encoding: the object every snapshot with
+/// that file names, billing's included, is now one the web client's
+/// decoder refuses (windows above 2^27). The server must store only
+/// encodings every reader decodes.
+#[test]
+#[ignore = "BUG-1008: a participant's encoded upload is stored as sent, though the WASM decoder can't read it"]
+fn bug_1008_an_upload_cannot_store_a_frame_the_web_client_cannot_read() {
+    use veil_core::hub::{encoding, wire::put_frame};
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let shared = "Permission is hereby granted, free of charge, to any person.\n".repeat(300);
+    write_files(&p.dir, &[("src/LICENSE", &shared), (&format!("{BILL_DIR}/LICENSE"), &shared)]);
+    p.admin.commit_main(&p.dir, "the licence, twice");
+    p.admin.ok(&p.dir, &["push"]);
+    let paths = real_paths(&p.dir);
+    let (_, id) = paths.iter().find(|(path, _)| path == "src/LICENSE").unwrap().clone();
+    assert!(paths.iter().any(|(path, i)| *path == format!("{BILL_DIR}/LICENSE") && *i == id));
+    let pid = project_id(&hub, &p.name);
+    let hubref = hub.hub();
+    let before = hub.rt.block_on(hubref.objects.get_encoded(pid, &id)).unwrap().unwrap();
+    assert!(stored_window(&before).unwrap() <= 1 << 27);
+    let raw = veil_core::object::Object::Blob(shared.into_bytes()).encode();
+    assert_eq!(ObjectId::hash(&raw), id);
+    let hostile = with_huge_window(&before, raw.len() as u64);
+    assert!(hostile.len() < raw.len());
+    assert_eq!(&*encoding::decode(&id, &hostile, 1 << 30).unwrap(), &raw[..], "libzstd reads it");
+    let mut body = Vec::new();
+    put_frame(&mut body, &id, &hostile);
+    let r = hub.api().upload_encoded_body(&p.dev.token(), &p.name, &body);
+    let after = hub.rt.block_on(hubref.objects.get_encoded(pid, &id)).unwrap().unwrap();
+    assert!(
+        stored_window(&after).is_none_or(|w| w <= 1 << 27),
+        "status {}: the server now stores and serves a frame with a {} MiB window",
+        r.status,
+        stored_window(&after).unwrap() >> 20
+    );
+}
+
+/// BUG-1009 (S27 adversarial pass). The accepted risk of `docs/HUB.md`
+/// §13.13 ("a participant can make the server decode up to 2 GiB per
+/// upload request from a small body") is bounded per request only: the
+/// server holds each such object decoded (twice for its canonical check:
+/// `Object::decode` copies a blob), on a blocking thread, for every
+/// request at once. An 8 KiB request decodes 128 MiB here; eight at once
+/// (33 KB sent in all) raised this process's peak memory by
+/// 1.33 GiB in the S27 pass (one: 262 MiB), and
+/// 1 GiB objects from 32 KiB requests exhaust the server's memory with a
+/// few dozen requests (before S27 each such object cost the sender its
+/// size in upload). The server must not decode far more than a request
+/// carries: e.g. refuse a frame expanding more than some fixed ratio, so
+/// `vl` sends such an object plain, or bound decoding server-wide.
+#[test]
+#[ignore = "BUG-1009: an 8 KiB upload makes the server decode 128 MiB, with no bound across concurrent requests"]
+fn bug_1009_a_small_upload_cannot_make_the_server_decode_a_large_object() {
+    use veil_core::hub::{encoding, wire::put_frame};
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let raw = veil_core::object::Object::Blob(vec![0u8; 128 << 20]).encode();
+    let id = ObjectId::hash(&raw);
+    let enc = encoding::encode(&raw).into_owned();
+    drop(raw);
+    let mut body = Vec::new();
+    put_frame(&mut body, &id, &enc);
+    assert!(body.len() < 8 << 10, "{} bytes", body.len());
+    let r = hub.api().upload_encoded_body(&p.dev.token(), &p.name, &body);
+    assert_ne!(r.status, 200, "an upload of {} bytes made the server decode {} MiB", body.len(), 128);
+}

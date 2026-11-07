@@ -357,6 +357,17 @@ impl Api {
         self.post(Some(token), &format!("/v1/projects/{project}/objects"), body, false)
     }
 
+    /// POST object frames as a `vl` that sends encoded frames does (S27):
+    /// under `Content-Type: application/x-veil-encoded-frames`.
+    pub fn upload_encoded_body(&self, token: &str, project: &str, body: &[u8]) -> Reply {
+        let r = self
+            .agent
+            .post(format!("{}/v1/projects/{project}/objects", self.base))
+            .header("authorization", &format!("Bearer {token}"))
+            .header("content-type", encoding::FRAMES);
+        Self::finish(r.send(body))
+    }
+
     /// POST JSON with the `Host` header a relaying server would send.
     pub fn post_json_host(&self, path: &str, v: &serde_json::Value, host: &str) -> Reply {
         let r = self
