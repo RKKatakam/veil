@@ -965,6 +965,7 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
 | `POST …/fetch {snapshot, objects: [{path, id, snapshot?}]}` | objects by id, each with the path where the client met it under that snapshot (its own `snapshot`, or the request's); the server walks the viewer's projection of that snapshot to that path and serves the object only if it is there. No list of what the client has; each request names an immutable object, so a per-viewer cache can serve it |
 | `POST …/objects` | upload object frames: re-hashed, canonically decoded, format-checked, stored; invisible until a push reaches them. Answers a **receipt** per object (a server MAC over project ‖ person ‖ id) |
 | `POST …/push {updates: [{branch, expected, new}], force, receipts}` | complete and check every new snapshot, then move the branches in **one serialisable transaction of compare-and-swaps** (`UPDATE branches SET target = new WHERE … AND target = expected`); one lost race rejects the whole push with 409 and `vl` retries |
+| `POST …/changes {base, edits, onto?, change_id?, receipts}` | a commit through the API, without a checkout (S10, §13.13) |
 | `GET …/access?path=` | the deciding line and who it names; only for a path the caller may read |
 | `…/groups`, `GET|POST …/rings/{scope}`, `GET /v1/people/{name}/devices` | groups; key rings of secret scopes; a person's devices (active, the newest pending, removed), the vouches and invite joins the server stores, which devices check before sharing a key (§13.11, §13.12) |
 | `POST /v1/devices/vouch {device, signature}` | the signed-in device vouches for another device of its person; a pending one becomes active |
@@ -1008,7 +1009,9 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
   push never confirms a guess of a hidden file or folder: BUG-824),
   8 (§13.6), 10 (every
   new snapshot signed by a registered device key) and 12 (fast-forward
-  unless an admin forces) are built. Embargoed merges are refused in S1. Not built: 9 (the server-side secret scan), 11, 13.
+  unless an admin forces) are built. Embargoed merges are refused in S1.
+  9 (the server-side secret scan) is built by S10 (§13.13), for pushes and
+  commits through the API alike. Not built: 11, 13.
 * **What a push uploads** (`hub::push`, `hub::Introduced`): every new
   snapshot and, at each path where its tree differs from all of its
   parents' trees, the trees down to that path and what the entry there
@@ -1496,3 +1499,120 @@ secrets, §3.1), unless a row says otherwise. Each row is tested in
 * **A clone made before its device anchored the project** opens no secret
   until the person confirms the fingerprint; this is the price of never
   trusting a ring on the server's word.
+
+### 13.13 S10: commits through the API
+
+Built 2026-11-07 (`crates/veil-server/src/changes.rs`; the messages in
+`veil_core::hub::changes`; `vl change new`). Design: phase 2 §5.5
+(`docs/design/server/phase-2-thin-clients.md`).
+
+```text
+POST /v1/projects/{p}/changes
+{ "base": "<snapshot id as the caller sees it>",
+  "change_id": "<optional: a new revision of a change of yours made here>",
+  "description": "…",
+  "edits": [ {"path": "src/a.rs", "put": {"text": "…", "executable": false}},
+             {"path": "src/b.bin", "put": {"object": "<id>"}},          // uploaded first, with its receipt
+             {"path": "src/old.rs", "delete": true} ],
+  "receipts": {"<id>": "<receipt>"},
+  "onto": {"branch": "main", "expected": "<tip id>" | "rebase"} }      // optional
+→ { "change_id", "snapshot": "<as the caller sees it>",
+    "branch": {"branch", "status": "ok" | "rejected", "message"?, "tip"?, "rebased": n},
+    "warnings": […] }                                                     // an admin's access change, listed
+```
+
+* **The same checks as a push, by the same code.** The server applies the
+  edits to the caller's projection of `base` (the tree their own `vl` would
+  push), then runs the push's per-snapshot checks on it
+  (`sync::complete`): the graft onto the full tree, so nothing the caller
+  cannot see is touched; write access for every edited path; access lines
+  changed only by admins, against the actual parent (the authority is the
+  accepted policy); closure (an object that is not the caller's upload, nor
+  the entry at that path in the caller's **view** of `base`, gets the answer
+  a missing one gets, before anything reads it, so a guess of a hidden
+  file's content is never confirmed: BUG-1050); personal keys refused;
+  secret paths only as ciphertext; check 9 below. A move of the default
+  branch accepts its policy only when the branch moves and only from an
+  admin, with the same listing of who can now see what; anyone else's
+  change of access lines is kept, `rejected` (BUG-1051).
+* **Check 9, the server-side secret scan** (also for pushes): every new
+  plain-text file, symlink and conflict term is scanned with the scanner `vl` uses
+  (`veil_core::secrets::scan`); a hit refuses the change. The error names
+  the path, the rule and the line, never the text. `public!` turns it off
+  only where the **accepted** policy (an admin's) says so, or in an admin's
+  own change: anyone may turn `public` into `public!`, which is the same
+  access. A push of old history recorded under an older scanner can now be
+  refused where today's scanner finds something.
+* **Inline text is held in memory until every check passed** (`Source::pending`),
+  so a refused plain-text secret is never stored. (An object uploaded
+  through `POST …/objects` is stored at upload, as for pushes: BUG-930.)
+* **Labels are claims:** an uploaded object's entry takes its kind, size and
+  label from the object (a sealed envelope is a secret of its scope, a blob
+  is plain); anything else is refused. As in every push (format 8), a sealed
+  object is accepted only as a secret: at a secret file's path, or as
+  content that descends from a secret (a renamed secret, which `vl` keeps
+  sealed), by the rule `vl upgrade` checks (`policy::sealed_secret`).
+* **The snapshot** is signed by the server's key; its author is the caller.
+  Other viewers get the same projections as for any pushed snapshot (§13.4);
+  the caller's own projection is worked out before the commit and recorded
+  with it.
+* **One database commit per API commit** (`storage-and-cost.md` §3): the
+  snapshot row, the caller's projection memo, the change ref, the audit row
+  and, with `onto`, the one-row compare-and-swap of the branch (and an
+  admin's policy) are one READ COMMITTED transaction. Objects are stored
+  before it, at most 64 at a time (BUG-1053). A non-admin's one-file change stores 6 objects (the blob, the
+  full trees on its path, the snapshot and the caller's projection).
+* **Change refs** (`change_refs`, migration 5): every change made this way
+  is kept under its change id, whether or not a branch moved, and is a
+  `base` like any snapshot. Only its creator makes a new revision of it
+  (`change_id`); the new snapshot names the previous one as predecessor.
+* **`onto`.** `expected` is the push's compare-and-swap, judged on the
+  caller's view: the move is refused (the change is still kept) unless the
+  branch's tip is that snapshot as the caller sees it, and `base` is that
+  tip or a stack of up to 64 of the caller's own unlanded changes on it,
+  each writing only paths they may still write. When changes the caller
+  cannot see landed under the stack, the server makes the caller's changes
+  again on the real tip (each their view grafted onto the new parent, with
+  the push's checks); the caller sees them with the same ids, so nothing
+  tells them a hidden change landed (BUG-1054). `"rebase"`: when the tip
+  is not `base`, the server applies the edits to the tip instead, provided the
+  entry at every edited path, and whether each folder above it is a folder,
+  is the same in `base` and the tip; it tries again on a lost race, up to 5
+  times, then answers `rejected`. Each try reads the accepted policy and
+  the caller's access again. **The change is its edits:** applied to
+  another tip, it never carries what `base` had and the tip has not (to
+  stack on an unlanded change, use `expected`).
+* **Limits:** 10,000 edits, 64 MiB of inline text (and the 64 MiB body
+  limit), paths of at most 4,096 bytes with at most 1,024 folders above the
+  file (`MAX_TREE_DEPTH`, a tree's own limit; every server thread has a
+  stack for walks that deep: BUG-1052), in Unicode NFC,
+  each component a valid entry name (no `..`, `.`, empty, NUL or any
+  spelling of `.veil`); two edits of one path, or of a file and something
+  below it, are refused; a delete names an existing file.
+* **`vl change new [PROJECT] --edits FILE.json [--base ID] [-m MSG]
+  [--onto BRANCH [--expected ID]] [--change ID]`** sends the list. In a
+  clone of the project it seals secret files with the clone's keys
+  first (outside one, it refuses to send them), and it scans every
+  ordinary file itself, so a secret never leaves the device.
+* **Measured** (`docs/design/scale/LOAD.md`, "Commits through the API"):
+  one file by one agent, p50 7.4 ms as the client sees it, 2.7 ms of
+  server CPU, 13 statements and 1 commit (a push: 10.7 ms, 34 statements,
+  3 commits); 1,000 landings/s across 100 projects (pushes: 283–547);
+  into one `main` with 50 agents, 20/s at p99 95 ms, peaking near 35/s,
+  short of phase 2's 100/s (each lost race rebuilds the change; S17
+  batches).
+
+Threat review (phase 2 §6, rows 11–13, and what S10 adds):
+
+| # | Attacker | Capability | Harm | Mitigation | Test (`server_hub` `changes`) |
+|---|---|---|---|---|---|
+| 1 | A member | edits outside their folders, at the private root, in a nested hidden folder; deletes a hidden file | writes where they may not, or learns a hidden name exists | the push's graft and write check; a hidden file and a missing one get the same "nothing at" | `an_api_commit_is_refused_whatever_a_push_refuses_and_stores_nothing` |
+| 2 | A member | edits `.veilpolicy`'s access lines; turns `public` into `public!` | gains access, or turns the scan off | the push's access-line check against the parents; the scan's exemption needs the accepted policy or an admin | same, and `the_secret_scan_is_off_only_where_the_accepted_policy_says_public_bang` |
+| 3 | A member, or a hostile API client | sends a plain-text `.env`, a token in an ordinary file, a personal key | a secret stored in the clear, or echoed in an error, log or JSON | checks 8 and 9; inline text is stored only after the checks; errors name the rule and line only | same (the blobs are not in the store; the answers lack the secret) |
+| 4 | A member | `put.object` names a hidden blob's id (from an old grant, a log) | copies a hidden file into their folder, or confirms it exists | an object without the caller's receipt that is not the entry at that path in `base` gets the missing answer, before it is read | same (a hidden id and a random one get the same answer) |
+| 5 | A member | `base` is the real id of a snapshot they see only part of | a graft on content they cannot see, or a confirmation of the real id | `base` must equal the caller's projection of the real snapshot it resolves to | same (404) |
+| 6 | Hostile API client | `..`, NUL, `.veil` and its spellings, non-NFC names, 1,100 levels, 10,001 edits, 64 MiB + 1 of text, overlapping or duplicate edits, unknown fields, a snapshot id as a file | a corrupt tree, or work quadratic in the input | the request limits; each component checked with the tree's own name check; one pass per path for overlaps and rebases | `hostile_edit_lists_are_refused` |
+| 7 | Racing agents | `rebase` onto one `main` | a change lost, landed twice, or applied over a newer edit of its file | reapplied only when every edited path is unchanged; the branch moves only by the compare-and-swap, in the same transaction as the change's rows | `rebase_lands_every_racing_change_once_with_exactly_its_edits` (50 agents: each landed once, each landed snapshot's diff is exactly its edit) |
+| 8 | Another person | `change_id` of someone else's change | rewrites their change | revisions only by the change ref's creator (also in the upsert itself) | `expected_tips_and_revisions_of_a_change` |
+| 9 | Anyone on Earth | calls the route signed out | commits | 401; a participant is required | `an_api_commit_is_refused_…` |
+
