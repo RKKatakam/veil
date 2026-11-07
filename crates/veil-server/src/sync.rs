@@ -135,7 +135,36 @@ fn without_signature(s: &Snapshot) -> Snapshot {
 /// The projection of real snapshot `real` for `viewer` (the module docs).
 /// Its predecessors are projected too (BUG-826).
 pub async fn projected(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, real: ObjectId) -> Result<ObjectId> {
-    Box::pin(projected_inner(hub, project, viewer, real)).await
+    Box::pin(projected_inner(hub, project, viewer, real, None)).await
+}
+
+/// What a push made and has not committed yet: the pusher's projections of
+/// its new snapshots are worked out before its transaction and written in it
+/// (one commit per push, `storage-and-cost.md` §3).
+#[derive(Default)]
+struct Deferred {
+    /// The push's new real snapshots, each with the pusher's own snapshot
+    /// the server completed it from.
+    fresh: HashMap<ObjectId, Option<ObjectId>>,
+    /// Memo rows `(view key, real, projected)` for the push's transaction.
+    rows: Vec<(String, ObjectId, ObjectId)>,
+}
+
+/// Is `id` committed history of `project` (a `snapshots` row; never deleted,
+/// so a yes is cached)?
+async fn committed(hub: &Hub, project: i64, id: &ObjectId) -> Result<bool> {
+    if hub.caches.committed(project, id) {
+        return Ok(true);
+    }
+    let stored: Option<String> = sqlx::query_scalar("SELECT id FROM snapshots WHERE project_id = $1 AND id = $2")
+        .bind(project)
+        .bind(id.hex())
+        .fetch_optional(&hub.db)
+        .await?;
+    if stored.is_some() {
+        hub.caches.put_committed(project, id);
+    }
+    Ok(stored.is_some())
 }
 
 /// The predecessors of `s` as `viewer` is shown them (BUG-826): a stored
@@ -144,19 +173,22 @@ pub async fn projected(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, real:
 /// see); one the server never stored names nothing on it and is kept.
 /// Terminates: ids are hashes of what they name, so no snapshot is its own
 /// predecessor or ancestor.
-async fn projected_predecessors(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, s: &Snapshot) -> Result<Vec<ObjectId>> {
+async fn projected_predecessors(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    s: &Snapshot,
+    mut deferred: Option<&mut Deferred>,
+) -> Result<Vec<ObjectId>> {
     let mut out = Vec::new();
     for p in &s.predecessors {
-        let stored: Option<String> = sqlx::query_scalar("SELECT id FROM snapshots WHERE project_id = $1 AND id = $2")
-            .bind(project.id)
-            .bind(p.hex())
-            .fetch_optional(&hub.db)
-            .await?;
-        if stored.is_none() {
+        // A push's own new snapshots count as stored: they are, once it commits.
+        let fresh = deferred.as_ref().is_some_and(|d| d.fresh.contains_key(p));
+        if !fresh && !committed(hub, project.id, p).await? {
             out.push(*p);
             continue;
         }
-        let pp = projected(hub, project, viewer, *p).await?;
+        let pp = Box::pin(projected_inner(hub, project, viewer, *p, deferred.as_deref_mut())).await?;
         let (p, pp2) = (*p, pp);
         let same = blocking(hub, project.id, move |src| Ok(src.snapshot(&pp2)?.change_id == src.snapshot(&p)?.change_id)).await?;
         if same && !out.contains(&pp) {
@@ -166,7 +198,13 @@ async fn projected_predecessors(hub: &Arc<Hub>, project: &Project, viewer: &View
     Ok(out)
 }
 
-async fn projected_inner(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, real: ObjectId) -> Result<ObjectId> {
+async fn projected_inner(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    real: ObjectId,
+    mut deferred: Option<&mut Deferred>,
+) -> Result<ObjectId> {
     if viewer.admin {
         return Ok(real);
     }
@@ -184,15 +222,33 @@ async fn projected_inner(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, rea
             continue;
         }
         if !expanded {
-            let memo: Option<String> =
-                sqlx::query_scalar("SELECT projected_id FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
-                    .bind(project.id)
-                    .bind(&view_key)
-                    .bind(x.hex())
-                    .fetch_optional(&hub.db)
-                    .await?;
+            let fresh = deferred.as_ref().is_some_and(|d| d.fresh.contains_key(&x));
+            // A push's new snapshot has no memo yet, except one this push
+            // just worked out.
+            let mine = deferred.as_ref().and_then(|d| d.rows.iter().find(|(k, r, _)| *k == view_key && *r == x).map(|(_, _, p)| *p));
+            let memo = match mine {
+                Some(p) => Some(p),
+                None if fresh => None,
+                None => match hub.caches.memo(project.id, &view_key, &x) {
+                    Some(p) => Some(p),
+                    None => {
+                        let m: Option<String> =
+                            sqlx::query_scalar("SELECT projected_id FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
+                                .bind(project.id)
+                                .bind(&view_key)
+                                .bind(x.hex())
+                                .fetch_optional(&hub.db)
+                                .await?;
+                        let m = m.map(|p| ObjectId::from_hex(&p).map_err(|e| Error::Other(e.into()))).transpose()?;
+                        if let Some(p) = &m {
+                            hub.caches.put_memo(project.id, &view_key, &x, p);
+                        }
+                        m
+                    }
+                },
+            };
             if let Some(p) = memo {
-                done.insert(x, ObjectId::from_hex(&p).map_err(|e| Error::Other(e.into()))?);
+                done.insert(x, p);
                 continue;
             }
             let s = blocking(hub, project.id, move |src| Ok(src.snapshot(&x)?)).await?;
@@ -216,13 +272,18 @@ async fn projected_inner(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, rea
             }
             v
         };
-        let origin: Option<String> = sqlx::query_scalar("SELECT origin_id FROM origins WHERE project_id = $1 AND real_id = $2")
-            .bind(project.id)
-            .bind(x.hex())
-            .fetch_optional(&hub.db)
-            .await?;
-        let origin = origin.and_then(|o| ObjectId::from_hex(&o).ok());
-        let ppreds = projected_predecessors(hub, project, viewer, &s).await?;
+        let origin = match deferred.as_ref().and_then(|d| d.fresh.get(&x)) {
+            Some(o) => *o,
+            None => {
+                let origin: Option<String> = sqlx::query_scalar("SELECT origin_id FROM origins WHERE project_id = $1 AND real_id = $2")
+                    .bind(project.id)
+                    .bind(x.hex())
+                    .fetch_optional(&hub.db)
+                    .await?;
+                origin.and_then(|o| ObjectId::from_hex(&o).ok())
+            }
+        };
+        let ppreds = projected_predecessors(hub, project, viewer, &s, deferred.as_deref_mut()).await?;
         let (proj_text, bindings, viewer2) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone());
         let hub2 = hub.clone();
         let (result, new_obj) = blocking(hub, project.id, move |src| {
@@ -269,17 +330,42 @@ async fn projected_inner(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, rea
         if let Some(raw) = new_obj {
             hub.objects.put(project.id, &result, raw).await?;
         }
-        sqlx::query(
-            "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at) VALUES ($1, $2, $3, $4, $5) \
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(project.id)
-        .bind(&view_key)
-        .bind(x.hex())
-        .bind(result.hex())
-        .bind(veil_core::now_millis())
-        .execute(&hub.db)
-        .await?;
+        let result = match deferred.as_deref_mut() {
+            Some(d) => {
+                d.rows.push((view_key.clone(), x, result));
+                result
+            }
+            None => {
+                let inserted = sqlx::query(
+                    "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at) VALUES ($1, $2, $3, $4, $5) \
+                     ON CONFLICT DO NOTHING",
+                )
+                .bind(project.id)
+                .bind(&view_key)
+                .bind(x.hex())
+                .bind(result.hex())
+                .bind(veil_core::now_millis())
+                .execute(&hub.db)
+                .await?
+                .rows_affected();
+                // Another request stored it first: every server answers what
+                // is stored.
+                let stored = if inserted == 1 {
+                    result
+                } else {
+                    let p: String =
+                        sqlx::query_scalar("SELECT projected_id FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
+                            .bind(project.id)
+                            .bind(&view_key)
+                            .bind(x.hex())
+                            .fetch_one(&hub.db)
+                            .await?;
+                    ObjectId::from_hex(&p).map_err(|e| Error::Other(e.into()))?
+                };
+                hub.caches.put_memo(project.id, &view_key, &x, &stored);
+                stored
+            }
+        };
         done.insert(x, result);
     }
     Ok(done[&real])
@@ -287,38 +373,66 @@ async fn projected_inner(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, rea
 
 /// The real snapshots a snapshot id the client names may stand for: itself
 /// if it is committed history, else the snapshots it is a projection of
-/// (newest first).
+/// (newest first). Served from the server's memory where it knows the
+/// answer: that a snapshot is committed never changes, and a projected id
+/// stands for a real snapshot forever. Callers project what they get for
+/// the asker's current view, so the answer grants nothing.
 pub async fn resolve(hub: &Hub, project: i64, id: &ObjectId) -> Result<Vec<ObjectId>> {
-    if *id == root_snapshot_id() {
+    if *id == root_snapshot_id() || hub.caches.committed(project, id) {
         return Ok(vec![*id]);
     }
-    let real: Option<String> = sqlx::query_scalar("SELECT id FROM snapshots WHERE project_id = $1 AND id = $2")
-        .bind(project)
-        .bind(id.hex())
-        .fetch_optional(&hub.db)
-        .await?;
-    if real.is_some() {
-        return Ok(vec![*id]);
+    if let Some(real) = hub.caches.resolved(project, id) {
+        return Ok(vec![real]);
     }
-    let rows: Vec<String> =
-        sqlx::query_scalar("SELECT real_id FROM projections WHERE project_id = $1 AND projected_id = $2 ORDER BY created_at DESC")
-            .bind(project)
-            .bind(id.hex())
-            .fetch_all(&hub.db)
-            .await?;
-    Ok(rows.iter().filter_map(|r| ObjectId::from_hex(r).ok()).collect())
+    let r = resolve_stored(hub, project, id).await?;
+    if let Some(first) = r.first() {
+        hub.caches.put_resolved(project, id, first);
+    }
+    Ok(r)
 }
 
-/// Branch tips as `viewer` sees them.
+/// [`resolve`] as the database answers it now, newest first (a push picks
+/// the real parent it grafts on from it), in one statement.
+async fn resolve_stored(hub: &Hub, project: i64, id: &ObjectId) -> Result<Vec<ObjectId>> {
+    if *id == root_snapshot_id() || hub.caches.committed(project, id) {
+        return Ok(vec![*id]);
+    }
+    let rows: Vec<(String, i32, i64)> = sqlx::query_as(
+        "SELECT id, 0, 0::BIGINT FROM snapshots WHERE project_id = $1 AND id = $2 \
+         UNION ALL SELECT real_id, 1, created_at FROM projections WHERE project_id = $1 AND projected_id = $2 \
+         ORDER BY 2, 3 DESC",
+    )
+    .bind(project)
+    .bind(id.hex())
+    .fetch_all(&hub.db)
+    .await?;
+    if rows.first().is_some_and(|r| r.1 == 0) {
+        hub.caches.put_committed(project, id);
+        return Ok(vec![*id]);
+    }
+    Ok(rows.iter().filter_map(|r| ObjectId::from_hex(&r.0).ok()).collect())
+}
+
+/// Branch tips as `viewer` sees them. The branch rows come from this
+/// server's memory for at most `caches::TIPS_TTL`, dropped at every push's
+/// notice; each viewer's projection is of their current view.
 pub async fn tips(hub: &Arc<Hub>, project: &Project, viewer: &Viewer) -> Result<Vec<(String, ObjectId)>> {
-    let rows: Vec<(String, String)> = sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1 ORDER BY name")
-        .bind(project.id)
-        .fetch_all(&hub.db)
-        .await?;
+    let rows = match hub.caches.tips(project.id) {
+        Ok(rows) => rows,
+        Err(generation) => {
+            let at = std::time::Instant::now();
+            let rows: Vec<(String, String)> = sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1 ORDER BY name")
+                .bind(project.id)
+                .fetch_all(&hub.db)
+                .await?;
+            hub.caches.put_tips(project.id, generation, at, rows.clone());
+            Arc::new(rows)
+        }
+    };
     let mut out = Vec::new();
-    for (name, target) in rows {
-        let real = ObjectId::from_hex(&target).map_err(|e| Error::Other(e.into()))?;
-        out.push((name, projected(hub, project, viewer, real).await?));
+    for (name, target) in rows.iter() {
+        let real = ObjectId::from_hex(target).map_err(|e| Error::Other(e.into()))?;
+        out.push((name.clone(), projected(hub, project, viewer, real).await?));
     }
     Ok(out)
 }
@@ -609,7 +723,10 @@ struct Completed {
 
 /// Handle a push (`docs/HUB.md` §4.5): complete and check every new
 /// snapshot, store what the server built, then move every branch in one
-/// serialisable transaction of compare-and-swaps.
+/// transaction of compare-and-swaps, which also writes the snapshot,
+/// origin, projection memo and audit rows: **one database commit per push**
+/// (`storage-and-cost.md` §3). Other viewers' projections are worked out when
+/// they first ask, as before.
 pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i64, req: PushRequest) -> Result<PushResult> {
     if !project.participant(viewer) {
         return Err(Error::forbidden("you are not in this project"));
@@ -618,6 +735,26 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
         return Err(Error::forbidden("only admins may force a branch move"));
     }
     let root = root_snapshot_id();
+    // Current tips (always from the database: a push never trusts a cache),
+    // to pick which real snapshot a projected parent stands for (the
+    // branch's tip when it projects to it).
+    let current: HashMap<String, ObjectId> = {
+        let rows: Vec<(String, String)> = sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1")
+            .bind(project.id)
+            .fetch_all(&hub.db)
+            .await?;
+        rows.into_iter().filter_map(|(n, t)| ObjectId::from_hex(&t).ok().map(|t| (n, t))).collect()
+    };
+    // Only the branches this push moves, and the default branch, are
+    // candidates; a branch this push moves wins over the default branch
+    // (both may look the same to the pusher).
+    let mut tip_projection: HashMap<ObjectId, ObjectId> = HashMap::new();
+    let candidates = std::iter::once(&project.default_branch).chain(req.updates.iter().map(|u| &u.branch));
+    for name in candidates {
+        if let Some(t) = current.get(name) {
+            tip_projection.insert(projected(hub, project, viewer, *t).await?, *t);
+        }
+    }
     // 1. The new snapshots: everything the new tips reach that the server
     //    does not hold as history or as a projection.
     let mut known: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
@@ -628,7 +765,11 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
         if known.contains_key(&id) || parents_of.contains_key(&id) {
             continue;
         }
-        let r = resolve(hub, project.id, &id).await?;
+        if let Some(t) = tip_projection.get(&id) {
+            known.insert(id, vec![*t]);
+            continue;
+        }
+        let r = resolve_stored(hub, project.id, &id).await?;
         if !r.is_empty() {
             known.insert(id, r);
             continue;
@@ -665,30 +806,21 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             }
         }
     }
-    // Current tips, to pick which real snapshot a projected parent stands
-    // for (the branch's tip when it projects to it).
-    let current: HashMap<String, ObjectId> = {
-        let rows: Vec<(String, String)> = sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1")
-            .bind(project.id)
-            .fetch_all(&hub.db)
-            .await?;
-        rows.into_iter().filter_map(|(n, t)| ObjectId::from_hex(&t).ok().map(|t| (n, t))).collect()
+    // The keys that signed the new snapshots, and which of them are
+    // registered, confirmed devices (now, from the database).
+    let keys: Vec<String> = {
+        let mut k: Vec<String> = parents_of.values().filter_map(|n| n.signature.as_ref().map(|s| s.key.clone())).collect();
+        k.sort();
+        k.dedup();
+        k
     };
-    // Only the branches this push moves, and the default branch, are
-    // candidates; a branch this push moves wins over the default branch
-    // (both may look the same to the pusher).
-    let mut tip_projection: HashMap<ObjectId, ObjectId> = HashMap::new();
-    let candidates = std::iter::once(&project.default_branch).chain(req.updates.iter().map(|u| &u.branch));
-    for name in candidates {
-        if let Some(t) = current.get(name) {
-            tip_projection.insert(projected(hub, project, viewer, *t).await?, *t);
-        }
-    }
-    let signers: HashSet<String> = sqlx::query_scalar::<_, String>("SELECT signing_key FROM devices WHERE removed_at IS NULL AND NOT pending")
-        .fetch_all(&hub.db)
-        .await?
-        .into_iter()
-        .collect();
+    let signers: HashSet<String> =
+        sqlx::query_scalar::<_, String>("SELECT signing_key FROM devices WHERE signing_key = ANY($1) AND removed_at IS NULL AND NOT pending")
+            .bind(&keys)
+            .fetch_all(&hub.db)
+            .await?
+            .into_iter()
+            .collect();
     let mut real_of: HashMap<ObjectId, ObjectId> = HashMap::new();
     real_of.insert(root, root);
     for (id, reals) in &known {
@@ -871,16 +1003,35 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
         }
         plans.push((u.branch.clone(), cur, new_real, accept));
     }
+    // The pusher's projections of what this push moves branches to, worked
+    // out now and written in its transaction (an admin's are the snapshots).
+    let mut deferred = Deferred {
+        fresh: completed.iter().map(|c| (c.real, c.origin)).collect(),
+        rows: Vec::new(),
+    };
+    for (_, _, new, _) in &plans {
+        if let Some(n) = new {
+            Box::pin(projected_inner(hub, project, viewer, *n, Some(&mut deferred))).await?;
+        }
+    }
     // Only the snapshots this push made: known ones are recorded already
     // (rewriting their rows made every racing pusher write the same row).
     let new_reals: Vec<String> = completed.iter().map(|c| c.real.hex()).collect();
     let origins: Vec<(String, String)> = completed.iter().filter_map(|c| c.origin.map(|o| (c.real.hex(), o.hex()))).collect();
+    let memos: Vec<(String, String, String)> = deferred.rows.iter().map(|(k, r, p)| (k.clone(), r.hex(), p.hex())).collect();
+    let notify = hub.caches.notices.load(std::sync::atomic::Ordering::SeqCst);
     let pid = project.id;
     let plans2 = plans.clone();
-    let moved = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
+    // Nothing to move (every update refused: the pusher pulls and tries
+    // again): no commit, and nothing recorded as history no branch reaches.
+    let (moved, memo_stored) = if plans.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
         let plans = plans2.clone();
         let new_reals = new_reals.clone();
         let origins = origins.clone();
+        let memos = memos.clone();
         Box::pin(async move {
             let mut moved = Vec::new();
             for (branch, cur, new, accept) in plans {
@@ -916,6 +1067,8 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
                 if let Some(text) = accept {
                     let policy = AccessPolicy::parse(&text);
                     let bindings = crate::perm::bind_names(&mut *c, pid, &policy).await?;
+                    // Bumps the project's access epoch (a trigger): every
+                    // server's cached permissions for it are void.
                     sqlx::query("UPDATE projects SET policy_text = $1, policy_bindings = $2, policy_version = policy_version + 1 WHERE id = $3")
                         .bind(&text)
                         .bind(serde_json::to_string(&bindings).map_err(|e| Error::Other(e.into()))?)
@@ -940,17 +1093,67 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
                     .execute(&mut *c)
                     .await?;
             }
-            Ok(moved)
+            // A row stored first by another request wins (and is not cached
+            // here from this push's answer).
+            let mut memo_stored = Vec::new();
+            for (view_key, real, projected) in &memos {
+                let n = sqlx::query(
+                    "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at) VALUES ($1, $2, $3, $4, $5) \
+                     ON CONFLICT DO NOTHING",
+                )
+                .bind(pid)
+                .bind(view_key)
+                .bind(real)
+                .bind(projected)
+                .bind(veil_core::now_millis())
+                .execute(&mut *c)
+                .await?
+                .rows_affected();
+                memo_stored.push(n == 1);
+            }
+            sqlx::query("INSERT INTO audit_log (project_id, at, actor, action, details) VALUES ($1, $2, $3, 'push', $4)")
+                .bind(pid)
+                .bind(veil_core::now_millis())
+                .bind(person)
+                .bind(format!("moved {moved:?}"))
+                .execute(&mut *c)
+                .await?;
+            // Delivered at commit, to every server: drop your tips.
+            if notify && !moved.is_empty() {
+                sqlx::query("SELECT pg_notify($1, $2)")
+                    .bind(crate::caches::TIPS_CHANNEL)
+                    .bind(pid.to_string())
+                    .execute(&mut *c)
+                    .await?;
+            }
+            Ok((moved, memo_stored))
         })
     })
-    .await?;
-    crate::audit(&hub.db, Some(project.id), Some(person), "push", &format!("moved {moved:?}")).await;
+    .await?
+    };
+    if !moved.is_empty() {
+        hub.caches.tips_changed(project.id);
+        for c in &completed {
+            hub.caches.put_committed(project.id, &c.real);
+        }
+    }
+    for ((view_key, real, projected), stored) in deferred.rows.iter().zip(memo_stored) {
+        if stored {
+            hub.caches.put_memo(project.id, view_key, real, projected);
+        }
+    }
     // The tips as the pusher sees them now (their own snapshots, where the
     // server's projection gives them back).
     let accepted = plans.iter().any(|p| p.3.is_some());
-    let project = crate::perm::load_project(&mut *hub.db.acquire().await?, &project.name)
-        .await?
-        .ok_or_else(|| Error::not_found("project"))?;
+    let reloaded;
+    let project = if accepted {
+        reloaded = crate::perm::load_project(&mut *hub.db.acquire().await?, &project.name)
+            .await?
+            .ok_or_else(|| Error::not_found("project"))?;
+        &reloaded
+    } else {
+        project
+    };
     let mut warnings = Vec::new();
     if accepted {
         // Never silently: say who can now see what.
@@ -973,7 +1176,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
     }
     for (branch, _, new, _) in plans {
         let tip = match new {
-            Some(n) => Some(projected(hub, &project, viewer, n).await?),
+            Some(n) => Some(projected(hub, project, viewer, n).await?),
             None => None,
         };
         results.push(BranchResult { branch, ok: true, message: None, tip });

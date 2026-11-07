@@ -5,6 +5,7 @@
 //! |---|---|
 //! | [`api`] | the HTTPS routes |
 //! | [`auth`] | challenge-response sign-in, session tokens |
+//! | [`caches`] | sessions, permissions, snapshot resolution and tips in memory, versioned by access epochs |
 //! | [`perm`] | the permission model: admins, groups, the accepted policy |
 //! | [`sync`] | projected history, fetch by id, push validation, branch CAS |
 //! | [`db`] | PostgreSQL / YugabyteDB, migrations, serialisable retries |
@@ -13,6 +14,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod caches;
 pub mod db;
 pub mod error;
 pub mod perm;
@@ -41,6 +43,8 @@ pub struct Hub {
     /// The TLS certificate (leaf, DER): sign-in accepts only signatures
     /// for a server name it is valid for.
     pub certificate: rustls::pki_types::CertificateDer<'static>,
+    /// Request-path caches (`caches`): never stale for a permission.
+    pub caches: caches::Caches,
 }
 
 pub type HubState = Arc<Hub>;
@@ -142,11 +146,14 @@ pub async fn start(config: Config) -> Result<Running> {
         receipt_key,
         session_ttl_ms: config.session_ttl.as_millis() as i64,
         certificate,
+        caches: caches::Caches::default(),
     });
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;
     let (tx, rx) = tokio::sync::watch::channel(false);
     let app = api::router(hub.clone());
+    // Push notices drop other servers' cached tips (`caches::listen`).
+    tokio::spawn(caches::listen(hub.clone(), rx.clone()));
     let task = tokio::spawn(serve_tls(listener, tls, app, rx));
     Ok(Running {
         addr,

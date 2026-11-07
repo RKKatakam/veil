@@ -172,6 +172,11 @@ impl BlobStore for S3Store {
 pub struct Objects {
     store: Arc<dyn BlobStore>,
     cache: LruCache<Bytes>,
+    /// Requests to the store, for the benchmarks' cost gates
+    /// (`storage-and-cost.md` §9): writes, bytes written, reads.
+    pub writes: std::sync::atomic::AtomicU64,
+    pub written_bytes: std::sync::atomic::AtomicU64,
+    pub reads: std::sync::atomic::AtomicU64,
 }
 
 impl Objects {
@@ -179,6 +184,9 @@ impl Objects {
         Objects {
             store,
             cache: LruCache::new(cache_bytes),
+            writes: Default::default(),
+            written_bytes: Default::default(),
+            reads: Default::default(),
         }
     }
 
@@ -204,6 +212,7 @@ impl Objects {
         if let Some(b) = self.cache.get(&ck) {
             return Ok(Some(b));
         }
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(b) = self.store.get(&object_key(project, id)).await? else {
             return Ok(None);
         };
@@ -224,6 +233,7 @@ impl Objects {
         let Some(r) = self.store.get_blocking(&object_key(project, id)) else {
             return rt.block_on(self.get(project, id));
         };
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(b) = r? else { return Ok(None) };
         if ObjectId::hash(&b) != *id {
             bail!("stored object {} does not match its id", id.short());
@@ -253,6 +263,8 @@ impl Objects {
     }
 
     pub async fn put(&self, project: i64, id: &ObjectId, raw: Bytes) -> Result<()> {
+        self.writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.written_bytes.fetch_add(raw.len() as u64, std::sync::atomic::Ordering::Relaxed);
         self.store.put(&object_key(project, id), raw.clone()).await?;
         self.cache.insert(Self::cache_key(project, id), raw.clone(), raw.len());
         Ok(())

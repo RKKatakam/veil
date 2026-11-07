@@ -72,7 +72,19 @@ fn a_server_on_a_current_schema_runs_no_ddl() {
             format!("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {role}"),
             format!("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {role}"),
         ] {
-            sqlx::raw_sql(&q).execute(&db).await.unwrap();
+            // On YugabyteDB the catalog is shared: other tests' DDL can
+            // abort this one (`40001`); run it again, as migrations do.
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                match sqlx::raw_sql(&q).execute(&db).await {
+                    Ok(_) => break,
+                    Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("40001") && attempt < 50 => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(e) => panic!("{q}: {e}"),
+                }
+            }
         }
         db.close().await;
     });

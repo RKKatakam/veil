@@ -1216,3 +1216,11 @@ Branch `t3/8c680abf` @ `1a81c2c` (S2: invites, keys per access rule, background 
 **Residual (not filed, no practical test):** the invite link is a command-line argument of `vl join`, which other OS users of the same machine can read (`/proc/<pid>/cmdline`) while it runs. For a name nobody has yet, one who reads it and registers the name before `vl join`'s own sign-in (a window of milliseconds) joins in the invitee's place; the invitee's join then fails ("a name somebody has"), so it is noticed. **Done** (secrets S2 owner fixes): `vl join -` reads the link on standard input, and `vl invite` and the guide say to use it (`server_hub` `projects::an_invite_names_the_projects_fingerprint`).
 
 **Nits** (not filed; **both fixed** in secrets S2 owner fixes): `Keychain::check_with_keys` checks that a `Revoke` or `Rotate` generation unlocks the previous one, but not a `RevokeOwn`'s (`keychain.rs`, the one match the new kind was not added to; now checked, `core_security` `ring_shares::a_revoke_own_rotation_must_unlock_the_previous_generation`); unbounded pending devices (no cap per person since S2) let anyone grow the `devices` table, which only a sign-in under the same name prunes (now at most 32 per person, the oldest pushed out, never one whose fingerprint the person looked for in the last hour: `server_hub` `secrets2::pending_devices_made_by_others_never_hide_the_real_one`, with floods in parallel).
+
+## Server S4 (request-path caches, one commit per push)
+
+Found while building S4 (`HUB.md` §13.13).
+
+| ID | Sev. | Area | Finding | Root cause | Reproducing tests |
+|---|---|---|---|---|---|
+| BUG-910 | low (**fixed**, S4; **pre-existing**: S1) | server / push | **Fixed:** a push whose every branch update is refused (the branch moved since the pusher pulled) commits nothing. **A refused push recorded its snapshots as committed history** though no branch reaches them, and cost a database commit per lost race: `resolve` then treated them as history, so their projections could be fetched by id (by someone who learns it; ids are unguessable hashes, and everything served is still projected for the asker). | `sync::push` ran its transaction (snapshot, origin and audit rows) whether or not any compare-and-swap was planned. | `server_hub::caches::tips_follow_pushes_on_every_server` (the snapshot count after a refused push) |

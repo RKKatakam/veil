@@ -30,6 +30,10 @@
 //! one lander per project moves `main` at `background` landings per
 //! second.
 //!
+//! In `branches` mode every agent lands on a branch of its own in one
+//! project (`a/NNNN`, made from `main` by its first push): pushes never
+//! collide, so a run measures what one push costs.
+//!
 //! Measured per run: operations per second, latency p50/p99, collisions
 //! and retries per landing, errors, and when known the server's CPU per
 //! operation (`--server-pid`, or the server this tool started), the
@@ -37,6 +41,14 @@
 //! `yb-master` on this machine), database statements per operation
 //! (`pg_stat_statements` if it is loaded, else transactions from
 //! `pg_stat_database`) and this tool's own CPU.
+//!
+//! **Cost per operation** (`docs/design/server/storage-and-cost.md` §9):
+//! database commits (transactions that wrote: transaction ids PostgreSQL
+//! assigned), statements, storage writes and reads (the server this tool
+//! started writes its counters on `SIGUSR1`), and bytes sent and received.
+//! **Gates**, which fail the run: at most 1 database commit per landing
+//! (`land`, `branches`), and at most 5 statements per pull with warm caches
+//! when nothing changed (`pull` with `--background 0`).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -61,7 +73,17 @@ use veil_core::{
 pub enum Mode {
     Pull,
     Land,
+    /// Land on a branch of one's own.
+    Branches,
 }
+
+/// The cost gates (`storage-and-cost.md` §9).
+pub const GATE_COMMITS_PER_PUSH: f64 = 1.0;
+pub const GATE_STATEMENTS_PER_WARM_PULL: f64 = 5.0;
+
+/// Request and response bytes of every agent (counted in windows).
+static BYTES_SENT: AtomicU64 = AtomicU64::new(0);
+static BYTES_RECEIVED: AtomicU64 = AtomicU64::new(0);
 
 /// Target aggregate landings per second, or as fast as the agents go.
 #[derive(Clone, Copy, Debug)]
@@ -149,6 +171,7 @@ impl Api {
         let r = r?;
         let status = r.status().as_u16();
         let body = r.into_body().with_config().limit(1 << 32).read_to_vec()?;
+        BYTES_RECEIVED.fetch_add(body.len() as u64, Ordering::Relaxed);
         Ok(Reply { status, body })
     }
 
@@ -162,6 +185,7 @@ impl Api {
             r = r.header("authorization", &format!("Bearer {t}"));
         }
         r = r.header("content-type", if json { "application/json" } else { "application/octet-stream" });
+        BYTES_SENT.fetch_add(body.len() as u64, Ordering::Relaxed);
         Self::finish(r.send(body))
     }
 
@@ -254,6 +278,10 @@ struct Agent<'a> {
     project: String,
     /// This agent's directory, `w/gNN/aNNNN`.
     dir: Vec<String>,
+    /// The branch it lands on (`main`, or its own in `branches` mode), and
+    /// whether that exists yet.
+    branch: String,
+    exists: bool,
     clone: Held,
     files: u64,
     c: &'a Counters,
@@ -270,7 +298,9 @@ impl Agent<'_> {
         let r = self.api.get(self.token, &self.path("/tips"))?;
         ok(&r, "tips")?;
         let tips: Tips = serde_json::from_slice(&r.body)?;
-        let tip = *tips.branches.get("main").ok_or_else(|| anyhow!("no main"))?;
+        // A branch of its own starts from `main`.
+        self.exists = tips.branches.contains_key(&self.branch);
+        let tip = *tips.branches.get(&self.branch).or_else(|| tips.branches.get("main")).ok_or_else(|| anyhow!("no main"))?;
         if self.clone.tip.is_some_and(|(t, _)| t == tip) {
             return Ok(false);
         }
@@ -443,8 +473,8 @@ impl Agent<'_> {
                 .collect::<Result<_>>()?;
             let req = PushRequest {
                 updates: vec![BranchUpdate {
-                    branch: "main".into(),
-                    expected: Some(tip),
+                    branch: self.branch.clone(),
+                    expected: self.exists.then_some(tip),
                     new: Some(snap),
                 }],
                 force: false,
@@ -462,6 +492,7 @@ impl Agent<'_> {
                         self.pull()?;
                         continue;
                     }
+                    self.exists = true;
                     // What was made is held; the server shows the pusher
                     // its own snapshot back.
                     for (id, raw) in objects {
@@ -551,6 +582,54 @@ fn db_statements(rt: &tokio::runtime::Runtime, url: &str) -> Option<(f64, &'stat
             .ok()?;
         Some((n, "transactions"))
     })
+}
+
+/// Transactions that wrote, so far: the transaction ids PostgreSQL assigned
+/// (a read-only transaction gets none). `None` elsewhere (YugabyteDB).
+fn db_writes(rt: &tokio::runtime::Runtime, url: &str) -> Option<f64> {
+    rt.block_on(async {
+        let mut c = <sqlx::PgConnection as sqlx::Connection>::connect(url).await.ok()?;
+        sqlx::query_scalar::<_, f64>("SELECT pg_snapshot_xmax(pg_current_snapshot())::text::float8").fetch_one(&mut c).await.ok()
+    })
+}
+
+/// The counters of the server `pid` (which writes them to `file` at start
+/// and on `SIGUSR1`): the answer to this signal, waited for up to 2 s.
+fn server_stats(pid: u32, file: &std::path::Path) -> Option<serde_json::Value> {
+    let read = || std::fs::read(file).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    // A server that never wrote the file does not answer SIGUSR1 (an older
+    // build): the signal would end it.
+    let before = read()?["n"].as_u64()?;
+    // SAFETY: kill has no memory preconditions; the pid is our own child.
+    if unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) } != 0 {
+        return None;
+    }
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_secs(2) {
+        if let Some(v) = read().filter(|v| v["n"].as_u64().is_some_and(|n| n > before)) {
+            return Some(v);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    None
+}
+
+/// The gates one run missed (`storage-and-cost.md` §9).
+pub fn missed_gates(r: &serde_json::Value, background: f64) -> Vec<String> {
+    let mut out = Vec::new();
+    let mode = r["mode"].as_str().unwrap_or("");
+    if matches!(mode, "land" | "branches") {
+        // A few landings straddle the window's edges.
+        if let Some(c) = r["db_commits_per_op"].as_f64().filter(|c| *c > GATE_COMMITS_PER_PUSH * 1.05) {
+            out.push(format!("{mode}: {c:.2} database commits per landing (gate: {GATE_COMMITS_PER_PUSH})"));
+        }
+    }
+    if mode == "pull" && background == 0.0 {
+        if let Some(n) = r["db_per_op"].as_f64().filter(|n| *n > GATE_STATEMENTS_PER_WARM_PULL) {
+            out.push(format!("pull: {n:.1} statements per up-to-date pull (gate: {GATE_STATEMENTS_PER_WARM_PULL})"));
+        }
+    }
+    out
 }
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {
@@ -656,6 +735,8 @@ struct Ctx<'a> {
     agent_token: &'a str,
     server_pid: Option<u32>,
     stats: Option<(&'a tokio::runtime::Runtime, &'a str)>,
+    /// The server this tool started, and the file its `SIGUSR1` writes.
+    server_stats: Option<(u32, PathBuf)>,
 }
 
 /// Scheduled landings of one project, shared by its agents.
@@ -691,6 +772,11 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
                         identity: cx.agent,
                         project: name.clone(),
                         dir: vec!["w".into(), format!("g{:02}", (i / projects) / 32), format!("a{:04}", i / projects)],
+                        branch: match a.mode {
+                            Mode::Branches => format!("a/{:04}", i / projects),
+                            _ => "main".into(),
+                        },
+                        exists: false,
                         clone: Held::default(),
                         files: 0,
                         c,
@@ -708,7 +794,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
                 ready.wait();
                 while !stop.load(Ordering::Relaxed) {
                     let scheduled = match (a.mode, rate) {
-                        (Mode::Land, Rate::PerSecond(_)) => match rx.lock().unwrap().recv_timeout(Duration::from_millis(100)) {
+                        (Mode::Land | Mode::Branches, Rate::PerSecond(_)) => match rx.lock().unwrap().recv_timeout(Duration::from_millis(100)) {
                             Ok(t) => t,
                             Err(_) => continue,
                         },
@@ -716,7 +802,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
                     };
                     let r = match a.mode {
                         Mode::Pull => agent.pull().map(|moved| u64::from(!moved)),
-                        Mode::Land => agent.land(scheduled + Duration::from_secs(60)),
+                        Mode::Land | Mode::Branches => agent.land(scheduled + Duration::from_secs(60)),
                     };
                     let done = Instant::now();
                     if !c.measuring.load(Ordering::Relaxed) {
@@ -749,6 +835,8 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
                         identity: cx.agent,
                         project: name.clone(),
                         dir: vec!["w".into(), "bg".into(), format!("p{p}")],
+                        branch: "main".into(),
+                        exists: false,
                         clone: Held::default(),
                         files: 0,
                         c: bg,
@@ -780,7 +868,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
         ready.wait();
         // Open loop: schedule landings at `rate`, round robin over the projects.
         let schedule = |until: Instant, start: Instant, mut k: u64| -> u64 {
-            if let (Mode::Land, Rate::PerSecond(r)) = (a.mode, rate) {
+            if let (Mode::Land | Mode::Branches, Rate::PerSecond(r)) = (a.mode, rate) {
                 loop {
                     let at = start + Duration::from_secs_f64(k as f64 / r);
                     if at >= until {
@@ -804,6 +892,9 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
         let before_db = db_cpu(a.db_container.as_deref());
         let before_self = cpu_of(std::process::id());
         let before_stmts = cx.stats.and_then(|(rt, url)| db_statements(rt, url));
+        let before_writes = cx.stats.and_then(|(rt, url)| db_writes(rt, url));
+        let before_server_stats = cx.server_stats.as_ref().and_then(|(pid, f)| server_stats(*pid, f));
+        let (sent0, received0) = (BYTES_SENT.load(Ordering::Relaxed), BYTES_RECEIVED.load(Ordering::Relaxed));
         let req0 = c.requests.load(Ordering::Relaxed);
         c.measuring.store(true, Ordering::Relaxed);
         let t0 = Instant::now();
@@ -814,6 +905,10 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
         let db = db_cpu(a.db_container.as_deref()) - before_db;
         let me = cpu_of(std::process::id()).zip(before_self).map(|(b, a)| b - a);
         let stmts = cx.stats.and_then(|(rt, url)| db_statements(rt, url)).zip(before_stmts).map(|((b, what), (a, _))| (b - a, what));
+        let writes = cx.stats.and_then(|(rt, url)| db_writes(rt, url)).zip(before_writes).map(|(b, a)| b - a);
+        let (sent, received) = (BYTES_SENT.load(Ordering::Relaxed) - sent0, BYTES_RECEIVED.load(Ordering::Relaxed) - received0);
+        let server_stats = cx.server_stats.as_ref().and_then(|(pid, f)| server_stats(*pid, f)).zip(before_server_stats);
+        let stat = |k: &str| server_stats.as_ref().and_then(|(b, a)| Some(b[k].as_f64()? - a[k].as_f64()?));
         let requests = c.requests.load(Ordering::Relaxed) - req0;
         stop.store(true, Ordering::Relaxed);
         let ops = c.ops.load(Ordering::Relaxed) as f64;
@@ -821,7 +916,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
         lat.sort_by(|x, y| x.partial_cmp(y).unwrap());
         let per_op = |x: f64| if ops > 0.0 { x / ops } else { f64::NAN };
         result = json!({
-            "mode": match a.mode { Mode::Pull => "pull", Mode::Land => "land" },
+            "mode": match a.mode { Mode::Pull => "pull", Mode::Land => "land", Mode::Branches => "branches" },
             "projects": projects,
             "clients": clients,
             "rate": match rate { Rate::Max => json!("max"), Rate::PerSecond(r) => json!(r) },
@@ -843,6 +938,16 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
             "db_cores": db / elapsed,
             "db_per_op": stmts.map(|(n, _)| per_op(n)),
             "db_counted": stmts.map(|(_, w)| w),
+            "db_per_request": stmts.map(|(n, _)| if requests > 0 { n / requests as f64 } else { f64::NAN }),
+            "db_commits_per_op": writes.map(per_op),
+            "storage_writes_per_op": stat("storage_writes").map(per_op),
+            "storage_written_bytes_per_op": stat("storage_written_bytes").map(per_op),
+            "storage_reads_per_op": stat("storage_reads").map(per_op),
+            "session_hit_share": stat("session_hits").zip(stat("session_misses")).map(|(h, m)| h / (h + m)),
+            "permission_hit_share": stat("permission_hits").zip(stat("permission_misses")).map(|(h, m)| h / (h + m)),
+            "tips_hit_share": stat("tips_hits").zip(stat("tips_misses")).map(|(h, m)| h / (h + m)),
+            "bytes_sent_per_op": per_op(sent as f64),
+            "bytes_received_per_op": per_op(received as f64),
             "load_tool_cores": me.map(|x| x / elapsed),
             "background_landings": bg.ops.load(Ordering::Relaxed),
             "background_errors": bg.errors.load(Ordering::Relaxed),
@@ -885,10 +990,11 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
         agent_token: &agent_token,
         server_pid,
         stats: a.server.database_url.as_deref().map(|u| (&rt, u)),
+        server_stats: _server.as_ref().map(|s: &crate::server::Server| (s.pid(), a.dir.join("server").join("stats.json"))),
     };
     let rates = match a.mode {
         Mode::Pull => vec![Rate::Max],
-        Mode::Land => a.rates.clone(),
+        Mode::Land | Mode::Branches => a.rates.clone(),
     };
     let mut runs = Vec::new();
     for &projects in &a.projects {
@@ -896,8 +1002,13 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
             for &rate in &rates {
                 let clients = clients.max(projects);
                 eprintln!("load: {:?} projects={projects} clients={clients} rate={rate:?}", a.mode);
-                let r = run_one(&cx, a, projects, clients, rate)?;
+                let mut r = run_one(&cx, a, projects, clients, rate)?;
                 eprintln!("      {}", line(&r));
+                let missed = missed_gates(&r, a.background);
+                for m in &missed {
+                    eprintln!("      GATE MISSED: {m}");
+                }
+                r["gates_missed"] = json!(missed);
                 runs.push(r);
             }
         }
@@ -940,7 +1051,7 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
             f(&r["p50_ms"], 1),
             f(&r["p99_ms"], 1),
             match r["mode"].as_str() {
-                Some("land") => f(&r["collisions_per_op"], 2),
+                Some("land" | "branches") => f(&r["collisions_per_op"], 2),
                 _ => "–".into(),
             },
             f(&r["requests_per_op"], 1),
@@ -951,6 +1062,34 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
             f(&r["db_per_op"], 1),
             f(&r["load_tool_cores"], 1),
             r["errors"],
+        ));
+    }
+    out.push_str(
+        "\n| Mode | Projects | Clients | Target rate (/s) | DB commits per op | DB statements per op | DB statements per request | Storage writes per op | Storage reads per op | KiB stored per op | KiB sent per op | KiB received per op | Session / permission / tips cache hits | Gates missed |\n\
+         |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|\n",
+    );
+    let pct = |x: &serde_json::Value| x.as_f64().filter(|v| v.is_finite()).map(|v| format!("{:.0} %", v * 100.0)).unwrap_or_else(|| "–".into());
+    let kib = |x: &serde_json::Value| x.as_f64().filter(|v| v.is_finite()).map(|v| format!("{:.1}", v / 1024.0)).unwrap_or_else(|| "–".into());
+    for r in v["runs"].as_array().ok_or_else(|| anyhow!("no runs"))? {
+        let missed = r["gates_missed"].as_array().map(|m| m.len()).unwrap_or(0);
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} / {} / {} | {} |\n",
+            r["mode"].as_str().unwrap_or(""),
+            r["projects"],
+            r["clients"],
+            r["rate"].as_str().map(str::to_string).unwrap_or_else(|| f(&r["rate"], 2)),
+            f(&r["db_commits_per_op"], 2),
+            f(&r["db_per_op"], 1),
+            f(&r["db_per_request"], 2),
+            f(&r["storage_writes_per_op"], 1),
+            f(&r["storage_reads_per_op"], 1),
+            kib(&r["storage_written_bytes_per_op"]),
+            kib(&r["bytes_sent_per_op"]),
+            kib(&r["bytes_received_per_op"]),
+            pct(&r["session_hit_share"]),
+            pct(&r["permission_hit_share"]),
+            pct(&r["tips_hit_share"]),
+            if missed == 0 { "none".to_string() } else { format!("**{missed}**") },
         ));
     }
     Ok(out)
