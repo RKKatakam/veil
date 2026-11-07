@@ -187,6 +187,31 @@ fn query_projection_equivalence() {
             let (mine_ask, copy_ask) = (ask(&th, &h, &viewer), ask(&th, &copy, &admin()));
             warm_up(&th, &h, &viewer);
             warm_up(&th, &copy, &admin());
+            // The log's order and cursors come from the viewer's own graph:
+            // page through each branch's whole log, as the viewer and on the
+            // copy, and compare both with the order computed directly from
+            // the copy's snapshots (generations of the projected graph, never
+            // the real one's).
+            for branch in ["main", "side"] {
+                let pages = |hh: &Hist, a: &Ask| -> (Vec<String>, Vec<Option<String>>) {
+                    let (mut ids, mut cursors, mut after) = (Vec::new(), Vec::new(), None);
+                    loop {
+                        let p = LogParams { rev: Some(branch.into()), n: Some(3), after: after.clone(), ..Default::default() };
+                        let v = th.rt.block_on(query::log(&hh.hub, a, p, Limits::default())).unwrap();
+                        ids.extend(v["entries"].as_array().unwrap().iter().map(|e| e["snapshot_id"].as_str().unwrap().to_string()));
+                        after = v["next"].as_str().map(str::to_string);
+                        cursors.push(after.clone());
+                        if after.is_none() {
+                            return (ids, cursors);
+                        }
+                    }
+                };
+                let (mine, mine_cursors) = pages(&h, &mine_ask);
+                let (theirs, theirs_cursors) = pages(&copy, &copy_ask);
+                assert_eq!(mine, theirs, "seed {seed}, {who}: log order of {branch}");
+                assert_eq!(mine_cursors, theirs_cursors, "seed {seed}, {who}: log cursors of {branch}");
+                assert_eq!(mine, model_log(&th, &copy, copy.branches[branch]), "seed {seed}, {who}: log order of {branch} against the projected graph");
+            }
             let hidden_paths: Vec<String> = all_paths(&h).into_iter().filter(|k| !view.read(k) && !k.is_empty()).collect();
             for q in queries(&mut rng, &revs, &paths) {
                 let (real, theirs) = (run(&th, &h, &mine_ask, &q), run(&th, &copy, &copy_ask, &q));
@@ -333,6 +358,45 @@ fn query_graph_matches_direct_walks() {
         assert_eq!(logged, order, "seed {seed}: log order");
         println!("seed {seed}: {} snapshots, {} pairs, {work} rows read", h.order.len(), pairs.len());
     }
+}
+
+/// The log of `tip` in `copy` (a project holding one viewer's projected
+/// history), computed from its snapshot objects alone: newest first by the
+/// generation of that graph (timestamps clamped as the graphs clamp them,
+/// raised above the parents'), ties by id.
+fn model_log(th: &TestHub, copy: &Hist, tip: ObjectId) -> Vec<String> {
+    let (hub, id) = (copy.hub.clone(), copy.id);
+    th.rt
+        .block_on(veil_server::sync::blocking(&hub, id, move |src| {
+            let mut snaps: HashMap<ObjectId, (i64, Vec<ObjectId>)> = HashMap::new();
+            let mut stack = vec![tip];
+            while let Some(x) = stack.pop() {
+                if snaps.contains_key(&x) {
+                    continue;
+                }
+                let s = src.snapshot(&x)?;
+                stack.extend(s.parents.iter().copied());
+                snaps.insert(x, (s.timestamp, s.parents.clone()));
+            }
+            let mut gens: HashMap<ObjectId, i64> = HashMap::new();
+            let mut order: Vec<ObjectId> = snaps.keys().copied().collect();
+            // Parents first: by depth of the walk, repeated until settled.
+            while gens.len() < snaps.len() {
+                for x in &order {
+                    if gens.contains_key(x) {
+                        continue;
+                    }
+                    let (ts, ps) = &snaps[x];
+                    if ps.iter().all(|p| gens.contains_key(p)) {
+                        let g = ps.iter().map(|p| gens[p] + 1).max().unwrap_or(0).max((*ts).clamp(0, i64::MAX / 4));
+                        gens.insert(*x, g);
+                    }
+                }
+            }
+            order.sort_by(|a, b| (gens[b], *b).cmp(&(gens[a], *a)));
+            Ok(order.iter().map(|x| x.hex()).collect())
+        }))
+        .unwrap()
 }
 
 /// Row 4: two projects that differ only in what a viewer cannot see give
