@@ -428,6 +428,8 @@ impl<'a> Reach<'a> {
 
 struct Mark<'a> {
     store: &'a ObjectStore,
+    /// A thin clone: an object it does not hold is on the server.
+    partial: bool,
     reach: Reach<'a>,
     incomplete: Vec<String>,
 }
@@ -447,7 +449,7 @@ impl Mark<'_> {
                     stack.extend(s.parents.iter().enumerate().map(|(i, p)| (*p, embargoed && i > 0)));
                     self.tree(s.tree, String::new());
                 }
-                Err(VeilError::Missing(_)) if withheld => {}
+                Err(VeilError::Missing(_)) if withheld || self.partial => {}
                 Err(e) => self.incomplete.push(format!("snapshot {}: {e}", id.short())),
             }
         }
@@ -461,6 +463,7 @@ impl Mark<'_> {
             }
             let t = match self.store.tree_object(&id) {
                 Ok(t) => t,
+                Err(VeilError::Missing(_)) if self.partial => continue,
                 Err(e) => {
                     self.incomplete.push(format!("tree {} at '{path}': {e}", id.short()));
                     continue;
@@ -514,6 +517,7 @@ impl Mark<'_> {
                     self.reach.insert(t);
                 }
             }
+            Err(VeilError::Missing(_)) if self.partial => {}
             Err(e) => self.incomplete.push(format!("conflict {} at '{path}': {e}", id.short())),
         }
     }
@@ -586,6 +590,14 @@ pub fn gc(repo: &mut Repo, opts: &GcOptions) -> Result<GcReport> {
 /// `prune`), then consolidate loose objects older than `loose_age`, then
 /// merge packs geometrically.
 pub(crate) fn run(repo: &mut Repo, opts: &GcOptions, prune: bool, loose_age: Duration) -> Result<GcReport> {
+    // A thin clone: gc never fetches. What it does not hold is on the
+    // server, and nothing local sits only below it (threat 5 of the
+    // partial-clone design), so the mark stops there.
+    let store = repo.store.clone();
+    store.without_fetching(|| run_here(repo, opts, prune, loose_age))
+}
+
+fn run_here(repo: &mut Repo, opts: &GcOptions, prune: bool, loose_age: Duration) -> Result<GcReport> {
     let backend = repo.backend.clone();
     // Re-read under the hold: an upgrade since the repository was opened
     // (it takes the gc lease too) changed what this run would write.
@@ -742,6 +754,7 @@ fn prune_store(
     roots.extend(opts.extra_roots.iter().copied());
     roots.extend(checkout_snapshots(&*backend));
     let mut mark = Mark {
+        partial: store.is_partial(),
         store,
         reach: Reach::new(&inv),
         incomplete,

@@ -857,7 +857,8 @@ fn newer_repository_format_is_refused_with_the_release_it_needs() {
     let fx = Fixture::new(8);
     let fs = fx.backend("alice");
     let mut cfg = read_config(&*fs).unwrap();
-    cfg.format = REPO_FORMAT + 1;
+    // Format 9 is a thin clone's (S3): the first unknown one is past it.
+    cfg.format = veil_core::repo::MAX_REPO_FORMAT + 1;
     cfg.min_vl = None;
     fs.write(&p(".veil/repo.json"), &serde_json::to_vec_pretty(&cfg).unwrap())
         .unwrap();

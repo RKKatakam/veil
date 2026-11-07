@@ -127,12 +127,13 @@ fn people_see_each_others_pushes_and_every_signature_verifies() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
     let d = p.dev.dir("c");
-    p.dev.ok(p.dev.home.path(), &["clone", &hub.url(&p.name), d.to_str().unwrap()]);
+    // Full clones: the test walks every snapshot each one holds.
+    p.dev.ok(p.dev.home.path(), &["clone", "--full", &hub.url(&p.name), d.to_str().unwrap()]);
     write_files(&d, &[("src/dev.rs", "fn dev() {}")]);
     p.dev.commit_main(&d, "dev change");
     p.dev.ok(&d, &["push"]);
     let f = p.fin.dir("c");
-    p.fin.ok(p.fin.home.path(), &["clone", &hub.url(&p.name), f.to_str().unwrap()]);
+    p.fin.ok(p.fin.home.path(), &["clone", "--full", &hub.url(&p.name), f.to_str().unwrap()]);
     assert!(f.join("src/dev.rs").exists());
     write_files(&f, &[(&format!("{BILL_DIR}/q.txt") as &str, "q")]);
     p.fin.commit_main(&f, "finance change");

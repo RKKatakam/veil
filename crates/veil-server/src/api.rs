@@ -594,7 +594,7 @@ async fn history(
 ) -> Result<Response> {
     let encoded = reads_encoded(&headers);
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
-    let body = sync::history(&hub, &project, &viewer, &req.tips, &req.stop, encoded).await?;
+    let body = sync::history(&hub, &project, &viewer, &req.tips, &req.stop, req.limit, encoded).await?;
     Ok(([(header::CONTENT_TYPE, frames_type(encoded))], body).into_response())
 }
 

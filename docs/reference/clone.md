@@ -23,6 +23,8 @@ Options:
 | | |
 |---|---|
 | `--only <DIR>` | Fetch only this directory's files (the server sends only that subtree's objects) |
+| `--full` | Fetch every snapshot and object you may see. Without it the clone is thin: it holds the branch tips and what it checks out, and fetches the rest from the server when something reads it |
+| `--cache-size <SIZE>` | Bound of a thin clone's object cache (bytes, or with K, M or G; default 4G). What is checked out is never evicted |
 
 ---
 

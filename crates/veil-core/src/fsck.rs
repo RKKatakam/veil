@@ -268,14 +268,19 @@ pub fn fsck_repo(repo: &Repo) -> Result<FsckReport> {
 pub fn fsck(backend: Arc<dyn StorageBackend>, identity: Option<Identity>) -> Result<FsckReport> {
     let mut report = FsckReport::default();
     let config = backend.read(&vpath(".veil/repo.json"))?;
-    let (repo_id, format) = match serde_json::from_slice::<RepoConfig>(&config) {
-        Ok(c) => (c.repo_id, c.format),
+    let (repo_id, format, partial) = match serde_json::from_slice::<RepoConfig>(&config) {
+        Ok(c) => {
+            if let Err(e) = c.check_partial() {
+                report.findings.push(Finding { severity: Severity::Corrupt, message: e.to_string() });
+            }
+            (c.repo_id, c.format, c.partial)
+        }
         Err(e) => {
             report.findings.push(Finding {
                 severity: Severity::Corrupt,
                 message: format!(".veil/repo.json cannot be parsed: {e}"),
             });
-            (String::new(), crate::repo::REPO_FORMAT)
+            (String::new(), crate::repo::REPO_FORMAT, None)
         }
     };
     if let Err(e) = crate::repo::check_format_upgradable(format) {
@@ -287,6 +292,12 @@ pub fn fsck(backend: Arc<dyn StorageBackend>, identity: Option<Identity>) -> Res
     let keys = Arc::new(Keychain::new(backend.clone(), identity, repo_id));
     let store = ObjectStore::new(backend.clone(), vpath(".veil/objects"), keys.clone());
     store.set_format(format);
+    // A thin clone: its cache area is read too, and nothing is fetched. An
+    // object neither holds is on the server: a note, not damage.
+    if let Some(p) = &partial {
+        store.set_partial(vpath(crate::promisor::CACHE_DIR), p.cache_limit);
+        store.never_fetch();
+    }
     // Read-only: looking at gc-pending objects must not write keep markers
     // or loose copies (that would also rescue garbage from the next gc).
     store.set_freshening(false);
@@ -469,6 +480,12 @@ impl Checker {
     }
 
     fn note_missing(&mut self, id: ObjectId, severity: Severity, message: String) {
+        // A thin clone holds only what it fetched: the rest is read from
+        // the server when needed.
+        let (severity, message) = match self.store.is_partial() && severity == Severity::Corrupt {
+            true => (Severity::Note, format!("{message} (not fetched: this thin clone reads it from the server)")),
+            false => (severity, message),
+        };
         match self.missing.get(&id) {
             Some((s, _)) if *s <= severity => {}
             _ => {

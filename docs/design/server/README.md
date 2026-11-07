@@ -29,7 +29,7 @@ S1 is built. **S2** (secrets at scale: keys per access rule, background wrapping
 
 | # | Phase | Milestone | Depends on |
 |---|---|---|---|
-| S3 | 2 | Fetch on demand in the client (thin clones, bounded cache, no full graph) | S1, simplification pass |
+| S3 | 2 | Fetch on demand in the client (thin clones, bounded cache, no full graph): **built**, `HUB.md` §13.18 | S1, simplification pass |
 | S4 | 2 | **Built** (`HUB.md` §13.14). Request-path caches (permissions, sessions, snapshot resolution, tips invalidated without a hot row), **one database commit per push**, and the cost gates in `veil-bench load` (`storage-and-cost.md` §3–5, §9) | S1 |
 | S5 | 2 | Read grants, the object routes, access epochs (built: `HUB.md` §13.16) | S1 |
 | S6 | 2 | The Veil daemon: shared object cache | S3, S5 |
