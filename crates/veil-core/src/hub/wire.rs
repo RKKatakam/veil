@@ -40,9 +40,10 @@ use crate::{
 pub const PROTOCOL: u32 = 1;
 /// What this side of `/v1/` supports beyond its first release, as
 /// [`Tips::revision`] tells clients: 1, a fetch names objects of several
-/// snapshots ([`Want::snapshot`]); 2, read grants with the tips and the
+/// snapshots ([`Want::snapshot`]); 2, uploads may carry compressed
+/// objects ([`super::encoding`]); 3, read grants with the tips and the
 /// object routes ([`super::grant`]).
-pub const REVISION: u32 = 2;
+pub const REVISION: u32 = 3;
 /// Largest object a frame may carry.
 pub const MAX_FRAME_OBJECT: usize = 1 << 30;
 /// Most objects one fetch request may name.
@@ -109,7 +110,7 @@ pub struct Tips {
     /// The server's [`REVISION`] (0: a server from before revisions).
     #[serde(default)]
     pub revision: u32,
-    /// Branch → a read grant (revision 2) for its tip's projected root
+    /// Branch → a read grant (revision 3) for its tip's projected root
     /// tree, signed by the server's grant key (`super::grant`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub grants: BTreeMap<String, String>,

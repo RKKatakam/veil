@@ -9,9 +9,11 @@
 //!   pushed tree back into the full tree (`docs/HUB.md` §4.6, §5.4).
 //! * [`grant`]: read grants (signed by the server, bound to a device) and
 //!   the chain check every layer uses to serve an object only to someone
-//!   whose projected root reaches it (`docs/HUB.md` §13.15).
+//!   whose projected root reaches it (`docs/HUB.md` §13.16).
 //! * [`wire`]: the JSON messages and the object frames of the protocol
 //!   (`docs/HUB.md` §4).
+//! * [`encoding`]: objects compressed (zstd) for storage and transport,
+//!   ids unchanged (`docs/HUB.md`, S27).
 //! * [`changes`]: the messages of commits through the API
 //!   (`docs/HUB.md` §13.13).
 //!
@@ -20,6 +22,7 @@
 
 pub mod access;
 pub mod changes;
+pub mod encoding;
 pub mod grant;
 pub mod project;
 pub mod wire;

@@ -1,4 +1,4 @@
-//! Read grants and the chain check (`docs/HUB.md` §13.15; design:
+//! Read grants and the chain check (`docs/HUB.md` §13.16; design:
 //! `docs/design/server/phase-2-thin-clients.md` §4.3–§4.5).
 //!
 //! **A grant** is the server's decision, in a form any layer can check by

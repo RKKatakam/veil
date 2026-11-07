@@ -819,7 +819,7 @@ protocol as pure functions, shared with `vl`; they build for WASM),
 | HTTPS API | tokio, axum, hyper, rustls (ring) | TLS on every connection; `--tls-cert/--tls-key`, or a self-signed certificate (rcgen) for `localhost`/`127.0.0.1` created in the data directory, which `vl login --ca FILE` pins for that server |
 | Metadata | sqlx, PostgreSQL 17 (development, CI) and YugabyteDB 2025.2 | portable SQL only; read-check-write transactions are SERIALIZABLE through `db::serializable`, except where unique keys and row locks decide the races (branch moves, sign-in, project and group creation, group changes: READ COMMITTED, because on YugabyteDB a SERIALIZABLE read blocks every insert into the table it read until it commits, BUG-847); retried with capped exponential backoff on `40001`/`40P01` (YugabyteDB reports conflicts as both) |
 | Migrations | `db::migrate`, `migrations/0001_initial.sql`, `0002_device_vouches.sql` (pending devices, vouches: §13.11), `0003_invites_and_key_sharing.sql` (invites, key requests, pending devices by fingerprint and the fingerprints a person waits for, devices barred from one project: §13.12), `0006_access_epochs.sql` (access epochs and the triggers that bump them: §13.14) | each in its own transaction, recorded in `schema_migrations`; servers starting together race on its primary key and the loser re-checks. On PostgreSQL DDL is transactional; on YugabyteDB DDL inside a transaction block is applied statement by statement unless transactional DDL is enabled, so **migration files are idempotent** (`IF NOT EXISTS`) and a half-applied one is completed by the next start |
-| Object storage | `store::BlobStore`: `FsStore` (a directory; unit tests, development) and `S3Store` (rusty-s3 request signing + reqwest; tested against MinIO) | key `p/<project id>/ab/cdef…`: projects never share an object; every read is re-hashed against its id; an in-memory cache of objects and decoded trees (256 MiB each, decoded trees weighed by the memory they hold: BUG-860). Every S3 request is idempotent (GET, HEAD, PUT of a key naming its content) and is tried again for up to 10 s, with jittered waits doubling from 25 ms to 1 s, when its connection closes or resets or the store answers 5xx; idle connections are dropped after 15 s, before S3 services drop them (BUG-861) |
+| Object storage | `store::BlobStore`: `FsStore` (a directory; unit tests, development) and `S3Store` (rusty-s3 request signing + reqwest; tested against MinIO) | key `p/<project id>/ab/cdef…`: projects never share an object; objects are stored compressed (zstd) when that is smaller, under the id of the uncompressed object (S27, §13.15); every read is decoded, bounded, and re-hashed against its id; an in-memory cache of objects (as stored) and decoded trees (256 MiB each, decoded trees weighed by the memory they hold: BUG-860). Every S3 request is idempotent (GET, HEAD, PUT of a key naming its content) and is tried again for up to 10 s, with jittered waits doubling from 25 ms to 1 s, when its connection closes or resets or the store answers 5xx or 429 (BUG-1005, BUG-1053); idle connections are dropped after 15 s, before S3 services drop them (BUG-861) |
 | Memory allocator | jemalloc (`tikv-jemallocator`, pinned), the `veil-server` binary's only | two arenas, background purging, 1 s decay (`src/main.rs`; `_RJEM_MALLOC_CONF` overrides them): glibc's arena per thread held 2-3x the server's data (BUG-864; `docs/design/scale/BASELINE.md`, "The server's allocator"). **Building the server needs `make` and a C compiler** (jemalloc is built from source) |
 | Server identity | an Ed25519 `Identity` in `<data>/hub-identity.json` (0600); a random secret in `<data>/hub-receipt-key` (0600) | signs projected snapshots (§13.4); its key is shown by `vl login`. The secret keys upload receipts (§13.5); servers sharing the data directory accept each other's |
 
@@ -964,9 +964,9 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
 | Route | |
 |---|---|
 | `GET /v1/projects/{p}/tips` | branches → tips as the caller sees them (projections); the branch rows may be up to 100 ms old (§13.14) |
-| `POST …/history {tips, stop}` | the caller's projected snapshots from `tips` down to `stop`, as object frames (`id ‖ len u32be ‖ object`) |
-| `POST …/fetch {snapshot, objects: [{path, id, snapshot?}]}` | objects by id, each with the path where the client met it under that snapshot (its own `snapshot`, or the request's); the server walks the viewer's projection of that snapshot to that path and serves the object only if it is there. No list of what the client has; each request names an immutable object, so a per-viewer cache can serve it |
-| `POST …/objects` | upload object frames: re-hashed, canonically decoded, format-checked, stored; invisible until a push reaches them. Answers a **receipt** per object (a server MAC over project ‖ person ‖ id) |
+| `POST …/history {tips, stop}` | the caller's projected snapshots from `tips` down to `stop`, as object frames (`id ‖ len u32be ‖ object`); to a caller that accepts encoded frames, each object as stored, compressed or not (§13.15) |
+| `POST …/fetch {snapshot, objects: [{path, id, snapshot?}]}` | objects by id, each with the path where the client met it under that snapshot (its own `snapshot`, or the request's); the server walks the viewer's projection of that snapshot to that path and serves the object only if it is there (as stored, to a caller that accepts encoded frames: §13.15). No list of what the client has; each request names an immutable object, so a per-viewer cache can serve it |
+| `POST …/objects` | upload object frames, plain or encoded (§13.15): decoded (bounded), re-hashed, canonically decoded, format-checked, stored compressed when that is smaller; invisible until a push reaches them. Answers a **receipt** per object (a server MAC over project ‖ person ‖ id) |
 | `POST …/push {updates: [{branch, expected, new}], force, receipts}` | complete and check every new snapshot, then move the branches in **one serialisable transaction of compare-and-swaps** (`UPDATE branches SET target = new WHERE … AND target = expected`); one lost race rejects the whole push with 409 and `vl` retries |
 | `POST …/changes {base, edits, onto?, change_id?, receipts}` | a commit through the API, without a checkout (S10, §13.13) |
 | `GET …/access?path=` | the deciding line and who it names; only for a path the caller may read |
@@ -1739,8 +1739,154 @@ pull (S3), not a staler check.
 `veil-server` writes its counters (storage writes and reads, cache hits and
 misses) to `DATA/stats.json` at start and on `SIGUSR1`, for the benchmarks.
 
+### 13.15 S27: compressed objects in storage and on the wire
 
-### 13.15 S5: read grants, the object routes, access epochs (built)
+Built on `integration` @ `f7e9aac` (2026-11-07), as
+`docs/design/server/storage-and-cost.md` §6 asks. Code:
+`veil_core::hub::encoding`, `crates/veil-server/src/store.rs`
+(`Objects`), the `history`, `fetch` and `objects` routes, and `vl`'s
+client (`crates/vl/src/hub.rs`).
+
+#### The design
+
+* **An object's encoding** is how the server stores it and sends it. Its
+  first byte says which:
+
+  ```text
+  'v' …          the canonical encoding itself (every object starts `veil:`);
+                 every object stored before S27 is one, so they stay readable
+  'z' ‖ frame    one zstd frame (level 3) of the canonical encoding, declaring its size
+  ```
+
+  **Object ids stay the BLAKE3 of the uncompressed canonical encoding**, so
+  content addressing, deduplication, upload receipts and signatures don't
+  change, and the storage key is the same (`p/<project>/ab/cdef…`).
+* **The encoder keeps whichever is smaller** (`encoding::encode`). Secrets
+  are ciphertext and don't shrink: they are stored and sent as they are.
+  Objects are compressed **one at a time, never together**, and only after
+  a secret is sealed on its device (never compress-then-encrypt).
+* **The server's store** (`Objects`) writes the encoding, and keeps
+  encodings in its object cache (so the cache holds more objects), each
+  checked against its id when it was read from the store or received.
+  `vl`'s fetch threads hand on answers as sent (compressed); the receiving
+  thread checks the ids and decodes one answer at a time, on up to 8
+  threads. Decoding on the fetch threads instead held 8 decoded answers at
+  once and broke the 1 GB clone's 512 MiB gate (549–559 MiB).
+  `get` returns the canonical encoding (the projection, push checks and
+  older clients use it); `get_encoded` returns what is stored, for the wire.
+  Every object the store answers is decoded, bounded, and re-hashed before
+  it is cached or served, as before.
+* **The wire.** An *encoded frame* is `id ‖ len u32be ‖ encoding`. A body of
+  plain frames (S1's) is also a body of encoded frames.
+  * `vl` sends `Accept: application/x-veil-encoded-frames` and reads every
+    answer as encoded frames. The server answers `history` and `fetch` with
+    each object **as stored** (no compression on the request path) to a
+    caller that accepts them, and plain frames to anyone else. Projected
+    trees made for one viewer are sent as they are.
+  * **Uploads:** the server reads every upload as encoded frames (so a `vl`
+    from before S27 still uploads), decodes and checks each, and **stores
+    its own encoding** of what it decoded (`encoding::encode`), never the
+    client's frame: no client chooses the stored bytes of an object others
+    share (BUG-1008; an S3 PUT replaces what a key held). `vl` compresses
+    each object as the push's walk finds it, within the ratio below
+    (`encode_to_send`), and only for a server of **revision 2**
+    (`Tips::revision`); to an older server it sends plain frames.
+* **Compatibility, both ways.** An older `vl` sends no `Accept` and gets
+  plain frames; its plain uploads are compressed by the server. A newer
+  `vl` and an older server: the server ignores `Accept` and answers plain
+  frames, which `vl` reads; `vl` uploads plain frames to it. Were encoded
+  frames ever sent to an older server, it would refuse them (their bytes
+  don't hash to their ids), never misread them.
+* **Bounded decoding** (`encoding::decode`): a `z` frame must be exactly one
+  zstd frame that declares its size (no trailing bytes, no second or
+  skippable frame), that size must be at most the object size limit
+  (`wire::MAX_FRAME_OBJECT`, as for a plain frame), and its window at most
+  2^27 bytes (`MAX_WINDOW`: what every decoder reads, the web client's
+  pure decoder included; libzstd's one-shot decoder does not check it,
+  BUG-1008), before anything is decoded. The decoder never produces more than the declared size, objects
+  above 64 MiB are hashed while streaming before they are held in memory
+  (BUG-490's rule), and the result must hash to the id. An upload's objects
+  together may decode to at most the request body limit (2 GiB).
+* **What a client sends expands at most 64 times** (`encoding::within_ratio`;
+  any frame decoding to at most 64 KiB may expand more): the server refuses
+  anything else before decoding it, and `vl` sends such an object plain, so
+  its size is the sender's to pay, as before S27. What the server stores
+  is as small as it gets (no ratio). **Decoding in uploads holds a
+  server-wide budget** of 256 MiB of decoded bytes at once
+  (`sync::DECODING_IN_FLIGHT`, a semaphore by bytes; an object larger than
+  that takes all of it), across every request (BUG-1009).
+* **What it does not change:** the client's local store (pulled objects
+  already go into zstd packs; loose objects stay as they are until
+  `vl gc`), the repository format, and the per-object permission checks.
+
+#### Measured (2026-11-07)
+
+`scripts/bench-server.sh` with MinIO, release builds, before (`f7e9aac` plus
+the byte counters) and after (S27), the bytes being what the server wrote
+(`/proc/PID/io`: to MinIO during a push, to the client during a clone). The
+machine was shared and often loaded (15–70); times are within noise or
+better.
+
+| | before | after |
+|---|---:|---:|
+| 1 GB profile: bytes stored, initial push | 2,462 MiB | **1,191 MiB (−52%)** |
+| 1 GB: bytes sent, full clone | 2,352 MiB | **1,057 MiB (−55%)** |
+| 1 GB: bytes sent, clone of one directory | 82.8 MiB | 42.2 MiB (−49%) |
+| 1 GB: push / full clone | 286 s / 58.4 s | 272 s / 46.8 s |
+| 1 GB: client peak, push / clone (gate 512 MiB) | 341 / 453 MiB | 319 / 448 MiB |
+| 1 GB: server peak, push / clone | 2,550 / 2,958 MiB | 1,999 / 2,984 MiB |
+| OpenScion 10k: bytes stored / sent by a clone | 46.0 / 41.9 MB | 27.2 / 23.1 MB (random hex: −41% / −45%) |
+| OpenScion clone everything, 1k / 10k | 101.8 / 622.8 ms | 100.7 / 501.6 ms |
+| load: server CPU per landing (1 / 10 / 100 projects) | 4.0 / 3.8 / 2.9 ms | 3.6 / 4.0 / 3.4 ms |
+| load: database statements per landing | 34 | 34 |
+
+#### Threat review
+
+Attackers outside the trust boundary (§3.1): a participant uploading
+crafted frames, a reader without access to a folder, a network observer
+(TLS everywhere). The server and its object store are trusted with code.
+
+| # | Threat | Defence | Test |
+|---|---|---|---|
+| 1 | **Zip bomb:** a small upload that expands past the object size limit, or a request that decodes to gigabytes | size declared, checked against the limit before decoding; the decoder stops at the declared size; per-request total ≤ the body limit | `encoding::tests::a_zip_bomb_is_refused_before_it_expands`, `server_hub::sync::hostile_compressed_uploads_are_refused` |
+| 2 | **A frame that decodes to other content** than its id (to plant one object under another's id) | every decoded object is re-hashed against its id, on upload and on every read from the store | `decoding_refuses_wrong_ids_and_unknown_markers`, `hostile_compressed_uploads_are_refused`, `store::tests::objects_are_stored_compressed_and_old_ones_stay_readable` |
+| 3 | **Malformed frames:** no declared size, trailing bytes or a second frame (hidden data riding along in storage), an unknown marker, truncation | refused; the whole request is refused, with no receipt | `malformed_frames_are_refused`, `hostile_compressed_uploads_are_refused` |
+| 4 | **Compression as an oracle** (BREACH-style: a guess and hidden data compressed together) | each object is compressed alone; answers carry only objects the viewer may read at their path; projected trees hold only what the viewer may see | `compressed_answers_hold_nothing_the_viewer_may_not_see` |
+| 5 | **Secrets**: plaintext compressed, or compressed before encryption | secrets are sealed on the device before upload; the server sees and stores ciphertext, kept as it is | `objects_are_compressed_in_storage_and_for_clients_that_read_them` (the `.env` is stored uncompressed), `leaks::…` (the server never holds the secret's plaintext, decoded) |
+| 6 | **Mixed versions misread each other's frames** | negotiated (`Accept`, revision 2); a plain frame is an encoded frame; encoded frames sent to an older server fail its hash check | `objects_are_compressed_in_storage_and_for_clients_that_read_them`, `hub::tests::answers_of_plain_and_encoded_frames` |
+| 7 | **Tests that scan the server's files** for leaked plaintext miss it once objects are compressed | the scan decodes object files first (`support::stored_bytes`) | `secrets2::…` |
+| 8 | **A frame some reader can't decode** stored over another folder's object (a 2 GiB window: BUG-1008) | `decode` refuses windows above 2^27 on every path; the server stores only its own encoding | `encoding::tests::bug_1008_a_frame_every_decoder_reads_or_none`, `server_hub` `sync::bug_1008_…`, `sync::an_uploaded_frame_of_raw_blocks_round_trips_to_its_id` |
+| 9 | **Small uploads that exhaust the server's memory** (4 KiB decoding to 128 MiB, many at once: BUG-1009) | at most 64:1 above 64 KiB, refused before decoding; 256 MiB decoded in flight server-wide; no copy of a blob for its check | `encoding::tests::what_is_sent_expands_at_most_the_ratio`, `sync::bug_1009_…`, `sync::compressed_uploads_decode_within_a_server_wide_bound` (16 × 48 MiB at once: +301 MiB, 821 MiB without the budget) |
+
+**Left as it is (low, accepted):** a participant can still make the
+server decode more than they send: up to 64 times a frame's size (or
+64 KiB from a tiny frame), up to the 2 GiB a request may decode. It is
+**bounded server-wide**: at most 256 MiB is decoded at once across every
+request, so memory stays bounded however many requests arrive; the cost
+left is CPU (zstd decodes at about 1 GB/s), which per-person rate limits
+(later work, §4.7) bound.
+
+#### Reverting
+
+Revert the merge **only if no server ran it on real data**: an older
+server cannot read objects stored compressed (they fail its hash check,
+"stored object … does not match its id"). Once a server has stored
+compressed objects:
+
+1. **Stop writing them:** make `encoding::encode` return its input (one
+   line). Every object the server writes is then plain, uploads included
+   (an upload is always stored as the server's own encoding, never as the
+   client's frame), and the server keeps reading both kinds. Clients may
+   go on sending compressed frames: the server decodes them and stores
+   them plain.
+2. **To stop clients sending compressed frames too,** set `wire::REVISION`
+   back to 1: `vl` then uploads plain frames (it still accepts compressed
+   answers, which a server writing only plain objects no longer sends,
+   except for objects already stored compressed).
+3. **To run a server from before S27** on the same store, every object
+   stored compressed must first be rewritten plain; no tool does that yet.
+
+### 13.16 S5: read grants, the object routes, access epochs (built)
 
 Design: `docs/design/server/phase-2-thin-clients.md` §4.3–§4.5, §5.1. Code:
 `veil_core::hub::grant` (the grant, request signatures and the chain
@@ -1749,16 +1895,19 @@ caches (S9)), `crates/veil-server/src/grant.rs` (issuing, the routes, the
 feed); the access epochs are S4's (§13.14, `migrations/0006_access_epochs.sql`). Nothing new is encrypted:
 grants are **signed**.
 
-* **The grant.** `GET …/tips` (revision 2) returns, per branch, a grant
+* **The grant.** `GET …/tips` (revision 3) returns, per branch, a grant
   and the server's grant key (`Tips::grants`, `Tips::grant_key`). A grant
   is `hex(JSON body) . hex(signature)`: Ed25519 by the server's **grant
   key** (`<data>/hub-grant-key`, an Ed25519 seed, 0600; servers sharing the
   data directory share it), context `hub-grant`, over the body bytes as
   sent (verified before they are parsed; never re-encoded). The body is
-  `{project, project_id, person, device, root, epoch, person_epoch,
-  expires}`: the caller's projected root tree of the tip, their device's
-  Ed25519 key, the access epochs of the project and of the person, and an
-  expiry 10 minutes on. It holds nothing its holder could not see
+  `{project, device, root, epoch, person_epoch, expires}`: the project's
+  name, the caller's device's Ed25519 key, their projected root tree of
+  the tip, the access epochs of the project and of the person, and an
+  expiry 10 minutes on. **No database id:** project and person ids are
+  sequential and would count the server's projects and people
+  (BUG-1088); checking a grant looks the project up by name and the
+  person by the device's key, with both epochs, in one statement. It holds nothing its holder could not see
   otherwise: **no view key** (an unkeyed hash of every access line, hidden
   ones included, would confirm guesses of hidden folder names: BUG-1080),
   and epochs that are opaque. Unknown
@@ -1780,9 +1929,10 @@ grants are **signed**.
   72 bytes); the server accepts `ts` within ±5 minutes. A copied grant is
   useless without the device key.
 * **Checks, in order:** the grant's signature, its project (the route's),
-  its expiry, the request's signature, then the current epochs of its
-  project and person (one indexed query; both must be equal to the
-  grant's): any failure is `401
+  its expiry, the request's signature, then the project by name, the
+  device (still active) and the current epochs of the project and of the
+  device's person (one statement; both must be equal to the grant's): any
+  failure is `401
   grant_invalid`, which says nothing about any object. Then each object's
   chain (`Chains::allows`): `chain[0]` is the grant's root, each tree has
   a directory entry naming the next, and the last tree has an entry whose
@@ -1791,14 +1941,32 @@ grants are **signed**.
   serves the same). The check reads only objects it already reached from
   the root, and an object is read only after its own check, so "not
   reachable" and "not there" are the same `404` (the same body), and in a
-  batch both are left out. Every object, trees included, is read through
-  `store::Objects`, one at a time (`grant::read`, and `Objects::get_range`
-  for a `Range`): when small objects move into packs (S28), only those
-  change, and a pack is never handed out. A `Range` reads only the bytes
-  asked for from the store (`BlobStore::get_range`). A batch is streamed as
-  `fetch` is (BUG-860): at most 64 objects and about 8 MiB read ahead,
-  each counted by the size its entry or conflict term records, or as 1 MiB
-  until it is read when it records none (a tree), then as what it is.
+  batch both are left out; a batch sends each id once. Every object,
+  trees included, is read through `store::Objects`, one at a time
+  (`grant::read`, and `Objects::get_range` for a `Range`), and decoded
+  from S27's encoding (§13.15) and checked against its id: when small
+  objects move into packs (S28), only those change, and a pack is never
+  handed out.
+* **`Range`** answers bytes of the object, never of what is stored. An
+  object stored as it is (S27's plain encoding) is read for those bytes
+  only (`BlobStore::get_range`: a file's seek, an S3 ranged `GET`, an open
+  range sent open; past the end, 416 with the length, from a `HEAD` on S3:
+  BUG-1086). A compressed one is decoded whole, its decoded bytes counted
+  in the server-wide budget below, then sliced.
+* **Read-ahead is bounded by sizes the server can trust** (BUG-1087), in
+  the batch route and in S1's `fetch` alike: at most 64 objects and about
+  8 MiB ahead of what a request has sent, and, across every request,
+  `store::DECODED_IN_FLIGHT` (256 MiB, the budget S27's uploads decode
+  under). An object's cost is the size its entry or conflict term records
+  plus 4 KiB (`store::SIZE_SLACK`): **a push or an API commit whose entry
+  records less than its object holds is refused** (`sync::check_changes`,
+  which reads every new object for the secret checks anyway; an API
+  commit records a sealed secret's stored length). An object that records
+  no size (a tree, a conflict) costs what its encoding declares: S27's
+  frames declare their size in their first bytes, read from the cache or
+  the store. A read waits for the budget only when its request holds none
+  of it, so requests never wait on each other in a cycle; an id asked for
+  more than once is read once.
   **An error making a grant** (the store failing to read or write the
   projected trees) is logged, and that branch gets no grant: the tips and
   every pull still answer (BUG-1083).

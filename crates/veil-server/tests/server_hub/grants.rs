@@ -30,7 +30,7 @@ impl<'a> Reader<'a> {
     fn new(api: &'a Api, who: Option<&Person>, project: &str) -> Reader<'a> {
         let token = who.map(|p| p.token());
         let tips = api.tips(token.as_deref(), project).expect("tips");
-        assert!(tips.grant_key.is_some() && tips.revision >= 2);
+        assert!(tips.grant_key.is_some() && tips.revision >= 3);
         Reader {
             api,
             project: project.to_string(),
@@ -361,6 +361,22 @@ fn grants_hold_only_for_their_device_project_key_and_time() {
     asked.insert(150, (vec![dev.root()], admin_root));
     let got = dev.batch(&asked);
     assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), bulk.iter().map(|b| b.1).collect::<Vec<_>>());
+    // A `Range` of an object stored compressed (S27: 20 KB of one letter):
+    // bytes of the object, never of what is stored; on a server whose
+    // cache does not hold it, and on this one.
+    let (chain, id) = bulk[7].clone();
+    let whole = got[7].1.clone();
+    let stored = hub.rt.block_on(hub.hub().objects.get_encoded(project_id(&hub, &p.name), &id)).unwrap().unwrap();
+    assert!(veil_core::hub::encoding::is_compressed(&stored), "the test needs an object stored compressed");
+    let cold = TestHub::beside(&hub);
+    let capi = cold.api();
+    for (who, r) in [("this server", &dev), ("another server", &Reader { api: &capi, ..Reader::new(&capi, Some(&p.dev), &p.name) })] {
+        let part = r.get_as(&r.grant, &chain, &id, None, &[("range", "bytes=100-199")]);
+        assert_eq!((part.status, &part.body[..]), (206, &whole[100..200]), "{who}");
+        let tail = r.get_as(&r.grant, &chain, &id, None, &[("range", &format!("bytes={}-", whole.len() - 10))]);
+        assert_eq!((tail.status, &tail.body[..]), (206, &whole[whole.len() - 10..]), "{who}");
+        assert_eq!(r.get_as(&r.grant, &chain, &id, None, &[("range", &format!("bytes={}-", whole.len()))]).status, 416, "{who}");
+    }
 }
 
 #[test]
@@ -992,7 +1008,9 @@ fn bug_1087_a_batch_reads_ahead_by_sizes_the_pusher_wrote() {
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        stderr.lines().filter(|l| l.contains("peak growth")).for_each(|l| eprintln!("{l}"));
+        assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}{stderr}");
         return;
     }
     const MIB: usize = 1 << 20;
@@ -1057,9 +1075,23 @@ fn bug_1087_a_batch_reads_ahead_by_sizes_the_pusher_wrote() {
         grew.push((name, peak_rss().saturating_sub(before) / MIB));
         drop(stalled);
     }
+    // S1's fetch, the same: 64 wants of one 8 MiB file at its path, unread
+    // (src/ is public: anyone on Earth fetches it).
+    let tip = capi.tips(None, &p.name).unwrap().branches["main"];
+    let lying = s.get("lying.bin").unwrap().id;
+    let wants: Vec<serde_json::Value> = (0..64).map(|_| serde_json::json!({"path": "src/lying.bin", "id": lying.hex()})).collect();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    reset_peak();
+    let before = peak_rss();
+    let stalled = capi.post_unread(&format!("/v1/projects/{}/fetch", p.name), &serde_json::to_vec(&serde_json::json!({"snapshot": tip.hex(), "objects": wants})).unwrap());
+    assert_eq!(stalled.status().as_u16(), 200);
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    grew.push(("fetch of lying.bin", peak_rss().saturating_sub(before) / MIB));
+    drop(stalled);
     eprintln!("peak growth while one batch of 64 wants of an 8 MiB file is not read (MiB): {grew:?}");
     assert!(grew[0].1 < 192, "the control (true size) went past the bound: {grew:?}");
     assert!(grew[1].1 < 64, "a batch of one id asked for 64 times held {} MiB: {grew:?}", grew[1].1);
+    assert!(grew[2].1 < 64, "a fetch of one id asked for 64 times held {} MiB: {grew:?}", grew[2].1);
 }
 
 /// BUG-1088. A grant names its project and person by their database ids,

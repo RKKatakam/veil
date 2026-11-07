@@ -1,5 +1,5 @@
 //! Read grants, the object routes and the access-epoch feed (`docs/HUB.md`
-//! §13.15; [`veil_core::hub::grant`] has the grant and the chain check).
+//! §13.16; [`veil_core::hub::grant`] has the grant and the chain check).
 //!
 //! * **Grants with the tips.** `GET …/tips` returns, per branch, a grant for
 //!   the caller's projected root tree of its tip, signed by the server's

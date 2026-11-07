@@ -9,7 +9,10 @@ use std::{
 };
 
 use veil_core::{
-    hub::wire::{put_frame, read_frames, Tips},
+    hub::{
+        encoding,
+        wire::{put_frame, Tips},
+    },
     Identity, ObjectId,
 };
 use veil_server::{tls::TlsSource, Config, Running, Storage};
@@ -294,9 +297,16 @@ impl Reply {
     pub fn json(&self) -> serde_json::Value {
         serde_json::from_slice(&self.body).unwrap_or(serde_json::Value::Null)
     }
+    /// The objects of an answer of frames, plain or encoded (decoded).
     pub fn frames(&self) -> Vec<(ObjectId, Vec<u8>)> {
         assert_eq!(self.status, 200, "{}", String::from_utf8_lossy(&self.body));
-        read_frames(&self.body).unwrap().into_iter().map(|(i, r)| (i, r.to_vec())).collect()
+        encoding::read_frames(&self.body, 1 << 32).unwrap().into_iter().map(|(i, r)| (i, r.into_owned())).collect()
+    }
+
+    /// The frames of the answer as sent: ids and encodings.
+    pub fn raw_frames(&self) -> Vec<(ObjectId, Vec<u8>)> {
+        assert_eq!(self.status, 200, "{}", String::from_utf8_lossy(&self.body));
+        encoding::split_frames(&self.body).unwrap().into_iter().map(|(i, e)| (i, e.to_vec())).collect()
     }
 }
 
@@ -380,6 +390,34 @@ impl Api {
         self.agent.post(format!("{}{path}", self.base)).header("content-type", "application/json").send(body).unwrap()
     }
 
+    /// POST JSON as a `vl` that reads encoded frames (compressed objects).
+    pub fn post_json_encoded(&self, token: Option<&str>, path: &str, v: &serde_json::Value) -> (Reply, Option<String>) {
+        let mut r = self.agent.post(format!("{}{path}", self.base)).header("content-type", "application/json").header("accept", encoding::FRAMES);
+        if let Some(t) = token {
+            r = r.header("authorization", &format!("Bearer {t}"));
+        }
+        let resp = r.send(&serde_json::to_vec(v).unwrap()[..]).unwrap();
+        let ct = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).map(str::to_string);
+        (Self::finish(Ok(resp)), ct)
+    }
+
+    /// POST object frames as they are (encoded or not, well formed or not).
+    pub fn upload_body(&self, token: &str, project: &str, body: &[u8]) -> Reply {
+        self.post(Some(token), &format!("/v1/projects/{project}/objects"), body, false)
+    }
+
+    /// POST encoded object frames (S27), under the encoded frames' media
+    /// type (which the server does not need: it reads every upload as
+    /// encoded frames).
+    pub fn upload_encoded_body(&self, token: &str, project: &str, body: &[u8]) -> Reply {
+        let r = self
+            .agent
+            .post(format!("{}/v1/projects/{project}/objects", self.base))
+            .header("authorization", &format!("Bearer {token}"))
+            .header("content-type", encoding::FRAMES);
+        Self::finish(r.send(body))
+    }
+
     /// POST JSON with the `Host` header a relaying server would send.
     pub fn post_json_host(&self, path: &str, v: &serde_json::Value, host: &str) -> Reply {
         let r = self
@@ -456,6 +494,19 @@ pub fn everything_in(clone: &Path) -> Vec<(String, Vec<u8>)> {
         }
     }
     out
+}
+
+/// The bytes of a file in the server's data directory, an object's decoded
+/// (S27: objects are stored compressed, so a scan of the raw files would
+/// miss what they hold). Object files are `…/ab/cdef…` under their id.
+pub fn stored_bytes(path: &Path) -> Vec<u8> {
+    let b = std::fs::read(path).unwrap_or_default();
+    let name = |p: Option<&Path>| p.and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let hex = format!("{}{}", name(path.parent()), name(Some(path)));
+    match ObjectId::from_hex(&hex) {
+        Ok(id) if encoding::is_compressed(&b) => encoding::decode(&id, &b, u64::MAX).map(|r| r.into_owned()).unwrap_or(b),
+        _ => b,
+    }
 }
 
 /// Assert no item contains any of `markers` (whole markers only).

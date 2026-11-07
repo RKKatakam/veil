@@ -95,7 +95,7 @@ pub const SIG_CONTEXT_HUB_DEVICE: &str = "hub-device";
 /// joining device (`hub::wire::join_message`).
 pub const SIG_CONTEXT_HUB_INVITE: &str = "hub-invite";
 /// Signature context: a Veil server's read grant (`hub::grant`, `docs/HUB.md`
-/// §13.15), by its grant key, over the grant's JSON body exactly as sent.
+/// §13.16), by its grant key, over the grant's JSON body exactly as sent.
 pub const SIG_CONTEXT_HUB_GRANT: &str = "hub-grant";
 /// Signature context: a device's request under a read grant
 /// (`hub::grant::request_message`): the grant's hash, the time and the
