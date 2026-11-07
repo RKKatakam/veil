@@ -2240,7 +2240,12 @@ veil-server cache --upstream https://hub:8443 --token-file TOKEN --dir DIR
   smaller), and the answer merges both in the request's order. What the
   server sends is kept (whole objects of at most 16 MiB, each checked
   against its id). A refusal from the server is passed on as it is; a
-  server the cache cannot reach is `503 unavailable`. A local object lost
+  server the cache cannot reach is `503 unavailable`. **Concurrent misses are
+  coalesced:** a request fetching objects from the server marks them in
+  flight (at most 65,536 at once), and a later request needing one of them
+  waits for that fetch (at most 2 s), then decides again from the store, so
+  every agent reading a new tree after a landing costs the server one
+  request (tested: 24 readers at once, 1 request). A local object lost
   between the check and the read (evicted, damaged) is left out of a batch
   (the client asks again; the cache, which removed it, then asks the
   server).
@@ -2300,13 +2305,13 @@ milestone's):
 | 8 | Anyone on Earth; a signed-in person, an admin | reads the feed for caches (no token, a wrong one, a session) | `401`, naming nothing | `the_epoch_feed_for_caches_needs_the_caches_token` |
 | 9 | Hostile input | malformed grants (non-hex, 10 KB), chains of `MAX_CHAIN + 5`, non-hex chains and signatures, more than `MAX_WANTS` wants, bad JSON, routes the cache does not serve, a `Range` past the end or on a hidden object; a feed request with 50,001 keys, unknown fields, wrong types | refused cleanly (400/401/404/416), as at the server | tests 3 and 8 |
 | 10 | — (a cache that loses an object) | an object evicted or damaged between check and read | left out of a batch; the client asks again and the server sends it | `the_cache_store_keeps_to_its_size` (a 64 KiB store under 200 files of 4 KiB) |
-| 11 | A compromised regional cache | reads what it stores | plain-text code, as the server holds it (inside its boundary, design §4.1); secret files only as ciphertext | the store holds no plaintext of `billing/.env` (test 1) |
+| 11 | A compromised regional cache | reads what it stores, serves it to anyone | plain-text code, as the server holds it (inside its boundary, design §4.1; `ARCHITECTURE.md` "Threat model"): as trusted as the object store; secret files only as ciphertext; it cannot sign a grant | the store holds no plaintext of `billing/.env` (test 1) |
+| 12 | — (load) | every agent reads a new tree after a landing | one request to the server per object, not one per reader | `concurrent_readers_of_a_new_object_cost_the_server_one_request` |
 
 **Residual:** the cache answers a request it can decide faster than one it
 forwards, so timing tells whether trees and objects the asker may read are
 in its store (that someone recently read a file they may read; design row
 14, accepted). A grant voided by an access change is still served from the
 store for up to one poll after the change (about a second, at most 5 s: the
-owner's bound). Concurrent first readers of a new object all miss and ask
-the server (no request coalescing). Not built: `vl` reading through the
+owner's bound). Not built: `vl` reading through the
 cache (S3), the Veil daemon (S6), the public CDN URLs of design §4.3.

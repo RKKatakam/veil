@@ -77,6 +77,10 @@ pub const MAX_OBJECT: u64 = 16 << 20;
 const CHUNK: usize = 256 << 10;
 /// How long a poll of the feed may take.
 const POLL_TIMEOUT: Duration = Duration::from_secs(3);
+/// Most objects being fetched from the server at once that later requests
+/// can wait on, and how long they wait.
+const MAX_FLIGHTS: usize = 1 << 16;
+const FLIGHT_WAIT: Duration = Duration::from_secs(2);
 
 pub struct Config {
     pub listen: SocketAddr,
@@ -110,6 +114,8 @@ pub struct Stats {
     pub forwarded: AtomicU64,
     /// … of which because the grant's epochs were not confirmed current.
     pub unconfirmed: AtomicU64,
+    /// Requests that waited for objects another request was fetching.
+    pub joined: AtomicU64,
     /// Requests the server could not be reached for.
     pub unavailable: AtomicU64,
     pub polls: AtomicU64,
@@ -127,7 +133,29 @@ pub struct Cache {
     /// KiB of objects being read for answers, across every request.
     budget: tokio::sync::Semaphore,
     budget_kib: u32,
+    /// Objects a request is fetching from the server, by the store's key:
+    /// a later request for one waits for it (closed when it is done)
+    /// instead of asking again.
+    flights: std::sync::Mutex<std::collections::HashMap<[u8; 32], Arc<tokio::sync::Semaphore>>>,
     pub stats: Stats,
+}
+
+/// The objects one request is fetching for others to wait on: done when
+/// dropped (its answer finished, kept or not).
+struct Flight {
+    cache: Arc<Cache>,
+    keys: Vec<[u8; 32]>,
+}
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        let mut f = self.cache.flights.lock().unwrap();
+        for k in &self.keys {
+            if let Some(s) = f.remove(k) {
+                s.close();
+            }
+        }
+    }
 }
 
 pub struct Running {
@@ -173,6 +201,7 @@ pub async fn start(c: Config) -> anyhow::Result<Running> {
         epochs: epochs::Tracker::default(),
         budget: tokio::sync::Semaphore::new(budget_kib as usize),
         budget_kib,
+        flights: Default::default(),
         stats: Stats::default(),
     });
     let listener = tokio::net::TcpListener::bind(c.listen).await?;
@@ -388,6 +417,53 @@ async fn decide(
     checked.unwrap_or(Decision::Forward)
 }
 
+/// [`decide`], then, for the objects only the server can give: the request
+/// fetches those nobody else is fetching (the [`Flight`] it holds until its
+/// answer is done), and first waits, at most [`FLIGHT_WAIT`], for those
+/// another request is fetching, then decides again. So many readers of a
+/// new object (a tree after each landing) cost the server one request, not
+/// one each.
+async fn decide_joined(
+    cache: &Arc<Cache>,
+    project: &str,
+    token: &str,
+    ts: i64,
+    signature: Option<&str>,
+    wants: Vec<(Vec<ObjectId>, ObjectId)>,
+    skip: &HashSet<ObjectId>,
+) -> (Decision, Option<Flight>) {
+    let d = decide(cache, project, token, ts, signature, wants.clone(), skip).await;
+    let Decision::Checked(plan) = &d else { return (d, None) };
+    let (mut mine, mut others) = (Vec::new(), Vec::new());
+    {
+        let mut f = cache.flights.lock().unwrap();
+        for (id, _) in plan.iter().filter(|p| p.1.is_none()) {
+            let k = disk::key(project, id);
+            match f.get(&k) {
+                Some(s) => others.push(s.clone()),
+                None if f.len() < MAX_FLIGHTS => {
+                    f.insert(k, Arc::new(tokio::sync::Semaphore::new(0)));
+                    mine.push(k);
+                }
+                None => {}
+            }
+        }
+    }
+    let flight = (!mine.is_empty()).then(|| Flight { cache: cache.clone(), keys: mine });
+    if others.is_empty() {
+        return (d, flight);
+    }
+    cache.stats.joined.fetch_add(1, Relaxed);
+    let _ = tokio::time::timeout(FLIGHT_WAIT, async {
+        for s in others {
+            // Closed when its fetch is done: an error is the wake-up.
+            let _ = s.acquire().await;
+        }
+    })
+    .await;
+    (decide(cache, project, token, ts, signature, wants, skip).await, flight)
+}
+
 // ---- answers -----------------------------------------------------------------------------------
 
 /// A body sent as it is produced; an error ends it unfinished, so it is
@@ -571,7 +647,8 @@ async fn batch(State(cache): State<Arc<Cache>>, Path(target): Path<String>, body
     }
     let mut skip: HashSet<ObjectId> = req.skip.iter().copied().collect();
     let wants = req.wants.iter().map(|w| (w.chain.clone(), w.id)).collect();
-    let (plan, upstream) = match decide(&cache, &p, &req.grant, req.ts, req.signature.as_deref(), wants, &skip).await {
+    let (decision, flight) = decide_joined(&cache, &p, &req.grant, req.ts, req.signature.as_deref(), wants, &skip).await;
+    let (plan, upstream) = match decision {
         Decision::Invalid => {
             cache.stats.refused.fetch_add(1, Relaxed);
             return grant_invalid().into_response();
@@ -600,7 +677,11 @@ async fn batch(State(cache): State<Arc<Cache>>, Path(target): Path<String>, body
     };
     let r = relay::Relay::new(skip, req.wants.iter().map(|w| w.id).collect(), cache.store.max_object as usize);
     let (tx, rx) = tokio::sync::mpsc::channel(1);
-    tokio::spawn(async move { cache.answer(&p, plan, resp, r, tx).await });
+    tokio::spawn(async move {
+        cache.answer(&p, plan, resp, r, tx).await;
+        // What it fetched is kept: requests waiting on it look again.
+        drop(flight);
+    });
     frames_response(rx)
 }
 
@@ -626,7 +707,8 @@ async fn get_object(State(cache): State<Arc<Cache>>, Path((p, id)): Path<(String
         Err(e) => return e.into_response(),
     };
     let range = parse_range(&headers);
-    match decide(&cache, &p, token, ts, sig.as_deref(), vec![(chain, id)], &HashSet::new()).await {
+    let (decision, flight) = decide_joined(&cache, &p, token, ts, sig.as_deref(), vec![(chain, id)], &HashSet::new()).await;
+    match decision {
         Decision::Invalid => {
             cache.stats.refused.fetch_add(1, Relaxed);
             grant_invalid().into_response()
@@ -643,14 +725,14 @@ async fn get_object(State(cache): State<Arc<Cache>>, Path((p, id)): Path<(String
                     local_answer(raw, range)
                 }
                 // Gone or damaged since the check: the server sends it.
-                _ => forward_get(cache, p, id, headers, range.is_some()).await,
+                _ => forward_get(cache, p, id, headers, range.is_some(), flight).await,
             }
         }
         Decision::Checked(plan) if plan.is_empty() => {
             cache.stats.refused.fetch_add(1, Relaxed);
             not_reached().into_response()
         }
-        _ => forward_get(cache, p, id, headers, range.is_some()).await,
+        _ => forward_get(cache, p, id, headers, range.is_some(), flight).await,
     }
 }
 
@@ -672,7 +754,7 @@ fn local_answer(raw: Vec<u8>, range: Option<(u64, u64)>) -> Response {
 
 /// Ask the server for one object with the client's headers; pass its
 /// answer on, keeping a whole object (no range) that matches its id.
-async fn forward_get(cache: Arc<Cache>, p: String, id: ObjectId, headers: HeaderMap, ranged: bool) -> Response {
+async fn forward_get(cache: Arc<Cache>, p: String, id: ObjectId, headers: HeaderMap, ranged: bool, flight: Option<Flight>) -> Response {
     cache.stats.forwarded.fetch_add(1, Relaxed);
     let mut r = cache.up.get(format!("{}/v1/objects/{}/{}", cache.base, p, id.hex()));
     for h in ["veil-grant", "veil-chain", "veil-signature", "range"] {
@@ -716,6 +798,7 @@ async fn forward_get(cache: Arc<Cache>, p: String, id: ObjectId, headers: Header
         if let Some(w) = whole {
             cache.keep(&p, vec![(id, w)]).await;
         }
+        drop(flight);
     });
     ([(header::CONTENT_TYPE, "application/octet-stream")], axum::body::Body::new(Chunks(rx))).into_response()
 }
@@ -732,6 +815,7 @@ pub fn stats_json(cache: &Cache) -> serde_json::Value {
         "refused": s.refused.load(Relaxed),
         "forwarded": s.forwarded.load(Relaxed),
         "unconfirmed": s.unconfirmed.load(Relaxed),
+        "joined": s.joined.load(Relaxed),
         "unavailable": s.unavailable.load(Relaxed),
         "polls": s.polls.load(Relaxed),
         "poll_errors": s.poll_errors.load(Relaxed),
