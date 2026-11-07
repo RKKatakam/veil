@@ -451,6 +451,36 @@ during the later points as other agents built; `bench3`):
 
 Raw results (not committed): `.scratch/bench-results/server-landing-d8cf2b2-20261107T143547Z*` (quiet), `…T150318Z*` (10,000 agents) and the `bench3` log.
 
+**After the S17 review's fixes** (2026-11-07, on `integration` @ `9cddf93`
+with S13's background fills; `docs/BUGS.md` BUG-1100 to 1109). The landing
+service now keeps every view key of the project and never walks history,
+bounds batches in bytes (8 MiB) and in changes (64), and its waiters stop
+polling while it runs here (BUG-1108). The machine was shared and loaded
+(load average 10–15 at the start of each point, often 80–260 during it),
+so read the shape:
+
+| Agents | Target (/s) | Landed (/s) | p50 (ms) | p99 (ms) | Landings per batch | Prepare (ms/batch) | Store objects (ms/batch) | Transaction (ms/batch) | DB commits per landing | DB statements per landing |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1,000 | 800 | 800 | 82 | 1,122 | 12.9 | 0.7 | 14.0 | 8.4 | 1.31 | 14.6 |
+| 1,000 | 1,000 | **1,023** | 191 | **718** | 25.2 | 0.6 | 26.7 | 8.7 | **1.03** | 11.7 |
+| 1,000 | 2,000 | 1,212 (the most) | 4,664 | 7,050 | 64.0 | 1.6 | 55.4 | 20.6 | 1.03 | 12.3 |
+| 10,000 | 1,000 | 820 | 962 | 2,716 | 56.7 | 2.3 | 73.2 | 26.7 | 1.25 | 13.6 |
+
+* **1,000/s into one `main` with 1,000 agents, p99 718 ms: under the 1 s
+  target for the first time**, at 1.03 commits per landing.
+* **Old and new side by side** (the server before the fixes, `76f337c`,
+  run interleaved with the new one): their costs per landing are the same
+  (build 0.27–0.4 ms of CPU, about 1 ms of object writes, 12–15
+  statements), but which of two regimes a run settles in decides its p50:
+  small batches (tens of ms) or, once behind, large ones (seconds). The old
+  server too fell into the large one on a loaded machine (702/s, p50
+  1.96 s at 800/s). Batches of at most 64 keep the service in the small
+  regime (BUG-1109); at 10,000 agents, with the load rising to 115 during
+  the run, it did not stay there.
+* **The limit is still the object store** (about 14 synced writes per
+  landing); packs (S28) are next.
+
+
 ## What would raise each ceiling (not built)
 
 | Ceiling | Bound by | What raises it |

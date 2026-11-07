@@ -2336,10 +2336,10 @@ predecessor of the landed snapshot with the same content at every path it
 edits; the next change made on it lands the same way.
 
 **Measured** (`docs/design/scale/LOAD.md`, "The landing service"): into one
-`main`, 1,084 landings/s with 1,000 agents and 995/s with 10,000 at a
-1,000/s target (1,353/s at most), no collisions, 1.0–1.06 database commits
-and about 11 statements per landing; p50 152–196 ms, p99 1.6–1.8 s (the
-target is 1 s): the object store's synced writes, 13–14 per landing, are the
+`main`, 1,023 landings/s with 1,000 agents at a 1,000/s target, p50 191 ms
+and **p99 718 ms**, 1.03 database commits and about 12 statements per
+landing; 820/s with 10,000 agents on a loaded machine; 1,212/s at most. No
+collisions. The object store's synced writes, about 14 per landing, are the
 limit (packs, S28).
 
 **Limits.** Fair share between people and sessions is FIFO here (S24); a
