@@ -778,9 +778,16 @@ fn grants_are_void_after_a_group_deleted_a_name_rebound_and_a_device_removed() {
     // /v1/devices/remove` does for the person's own device).
     let dev = Reader::new(&api, Some(&p.dev), &p.name);
     assert_eq!(dev.get(&[], &dev.root()).status, 200);
-    hub.rt
-        .block_on(sqlx::query("UPDATE devices SET removed_at = $1 WHERE signing_key = $2").bind(1i64).bind(p.dev.identity().verifying_hex()).execute(&hub.hub().db))
-        .unwrap();
+    // Retried as the routes are: every bump updates the one clock row, so
+    // on YugabyteDB it may conflict with another test's (40001).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    while let Err(e) = hub.rt.block_on(
+        sqlx::query("UPDATE devices SET removed_at = $1 WHERE signing_key = $2").bind(1i64).bind(p.dev.identity().verifying_hex()).execute(&hub.hub().db),
+    ) {
+        let retryable = matches!(&e, sqlx::Error::Database(d) if matches!(d.code().as_deref(), Some("40001" | "40P01")));
+        assert!(retryable && std::time::Instant::now() < deadline, "{e:?}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     assert!(invalid(&dev.get(&[], &dev.root())), "a device its person removed");
 }
 
