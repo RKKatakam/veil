@@ -240,91 +240,29 @@ fn squash_into_other_changes() {
     assert_eq!(repo.view(), &view_before);
 }
 
-/// On a cloaked line, edits of a public file are sealed for the scope with
-/// the last public version as fallback: so is every half.
-#[test]
-fn cloaked_hunks_stay_sealed_with_the_public_fallback() {
-    let (mut repo, fs, _) = new_repo("alice");
-    let base = commit_files(&mut repo, &*fs, &[("a.txt", OLD)], "base");
-    repo.create_workspace("t", vec![base], Some("team".into())).unwrap();
-    let o = repo.workspace_overlay("t").unwrap();
-    o.write(&p("a.txt"), NEW.as_bytes()).unwrap();
-    let c = repo.snapshot_workspace("t", &o).unwrap().snapshot;
-    let new_e = file_entry(&repo, &c, "a.txt").unwrap();
-    let old_e = file_entry(&repo, &base, "a.txt").unwrap();
-    assert_eq!(new_e.visibility, team());
-    assert_eq!(new_e.fallback, Some(old_e.id));
-    let parts = repo.change_parts(&c, true).unwrap();
-    assert!(matches!(parts.units[0].content, Content::Text(_)), "public → sealed for the line: hunks can be chosen");
-    let sel = selection::select(&parts.units, &[spec("a.txt", &["1.1"])]).unwrap();
-    let r = repo.split(&parts, &sel, Some("part")).unwrap();
-    let mid = file_entry(&repo, &r.first, "a.txt").unwrap();
-    assert_eq!(mid.visibility, team(), "lines of a sealed version stay sealed for its scope");
-    assert_eq!(mid.fallback, Some(old_e.id), "readers without the key still see the last public version");
-    let (vis, data) = versions(&repo, &mid).remove(0);
-    assert_eq!(vis, team(), "the object itself is sealed");
-    assert_eq!(data.unwrap(), OLD.replacen("2\n", "TWO\n", 1).as_bytes());
-    assert!(backend_contains(repo.backend().as_ref(), b"TWO").is_empty(), "no plaintext of the edit anywhere");
-    assert_eq!(repo.snapshot(&r.first).unwrap().cloak.as_deref(), Some("team"), "the first part is on the same cloaked line");
-    assert!(matches!(repo.snapshot(&r.first).unwrap().description, veil_core::object::Text::Sealed(_)), "and its description is sealed");
-}
-
-/// BUG-682: a public edit never published (the working copy), squashed
-/// whole into a cloaked change that seals another edit of the same file,
-/// merges into a sealed version. Its fallback, what readers without the
-/// key see, stays the last public version the line's base shows: never
-/// the draft's plaintext, which a push of the cloaked change would
-/// otherwise put on a public remote.
-#[test]
-fn a_draft_squashed_into_a_sealed_edit_never_becomes_its_fallback() {
-    let (mut repo, fs, _) = new_repo("alice");
-    let base = commit_files(&mut repo, &*fs, &[("a.txt", OLD)], "base");
-    repo.create_workspace("t", vec![base], Some("team".into())).unwrap();
-    let o = repo.workspace_overlay("t").unwrap();
-    o.write(&p("a.txt"), OLD.replacen("2\n", "SECRET-682\n", 1).as_bytes()).unwrap();
-    let sealed = repo.snapshot_workspace("t", &o).unwrap().snapshot;
-    fs.write(&p("a.txt"), OLD.replacen("19\n", "DRAFT-682\n", 1).as_bytes()).unwrap();
-    let draft = snap(&mut repo, &*fs);
-    let r = repo.squash_into(draft, Some(sealed), None).unwrap();
-    let e = file_entry(&repo, &r.destination, "a.txt").unwrap();
-    assert_eq!(e.visibility, team(), "the merged version is sealed for the line");
-    let (_, data) = versions(&repo, &e).remove(0);
-    let data = String::from_utf8(data.unwrap()).unwrap();
-    assert!(data.contains("SECRET-682") && data.contains("DRAFT-682"), "both edits are merged: {data}");
-    let old_e = file_entry(&repo, &base, "a.txt").unwrap();
-    assert_eq!(e.fallback, Some(old_e.id), "readers without the key see the base's version, not the draft");
-    repo.set_tag("s", r.destination, None, false).unwrap();
-    let mirror = std::sync::Arc::new(veil_core::MemoryBackend::new());
-    veil_core::remote::push(&mut repo, mirror.clone(), true, &[], false).unwrap();
-    for needle in [&b"DRAFT-682"[..], b"SECRET-682"] {
-        let hits = backend_contains(&*mirror, needle);
-        assert!(hits.is_empty(), "{} is on the public mirror: {hits:?}", String::from_utf8_lossy(needle));
-    }
-}
-
 /// A change that moves a file to another audience offers it whole only:
 /// the lines of the sealed version never land in a public file.
 #[test]
 fn exposures_and_rekeys_move_whole() {
     let (mut repo, fs, _) = new_repo("alice");
-    commit_files(&mut repo, &*fs, &[(".veilpolicy", "s/ cloak team\n"), ("s/a.txt", OLD)], "base");
-    assert_eq!(file_entry(&repo, &wc(&repo), "s/a.txt").unwrap().visibility, team());
-    fs.write(&p(".veilpolicy"), b"").unwrap();
-    fs.write(&p("s/a.txt"), NEW.as_bytes()).unwrap();
+    commit_files(&mut repo, &*fs, &[(".veilpolicy", "s/ cloak team\n"), ("s/.env.a", OLD)], "base");
+    assert_eq!(file_entry(&repo, &wc(&repo), "s/.env.a").unwrap().visibility, team());
+    fs.write(&p(".veilpolicy"), b"s/ public!\n").unwrap();
+    fs.write(&p("s/.env.a"), NEW.as_bytes()).unwrap();
     snap(&mut repo, &*fs);
     let c = wc(&repo);
-    assert!(file_entry(&repo, &c, "s/a.txt").unwrap().visibility.is_public(), "exposed by the policy edit");
+    assert!(file_entry(&repo, &c, "s/.env.a").unwrap().visibility.is_public(), "exposed by the policy edit");
     let parts = repo.change_parts(&c, true).unwrap();
-    let u = parts.units.iter().find(|u| u.path == p("s/a.txt")).unwrap();
+    let u = parts.units.iter().find(|u| u.path == p("s/.env.a")).unwrap();
     assert!(matches!(u.content, Content::Whole(Whole::Audience)), "{:?}", u.content);
     let pol = parts.units.iter().find(|u| u.path == p(".veilpolicy")).unwrap();
     assert!(matches!(pol.content, Content::Whole(Whole::Policy)));
-    let e = selection::select(&parts.units, &[spec("s/a.txt", &["1"])]).unwrap_err().to_string();
+    let e = selection::select(&parts.units, &[spec("s/.env.a", &["1"])]).unwrap_err().to_string();
     assert!(e.contains("cannot be split by hunk"), "{e}");
     // Whole, it moves as recorded.
-    let sel = selection::select(&parts.units, &[spec("s/a.txt", &[])]).unwrap();
+    let sel = selection::select(&parts.units, &[spec("s/.env.a", &[])]).unwrap();
     let r = repo.split(&parts, &sel, None).unwrap();
-    assert!(file_entry(&repo, &r.first, "s/a.txt").unwrap().same_content(&file_entry(&repo, &c, "s/a.txt").unwrap()));
+    assert!(file_entry(&repo, &r.first, "s/.env.a").unwrap().same_content(&file_entry(&repo, &c, "s/.env.a").unwrap()));
 }
 
 /// A reader outside a scope sees a file sealed for it as one opaque unit:
@@ -481,7 +419,7 @@ fn file_case() -> impl Strategy<Value = FileCase> {
     )
 }
 
-const PATHS: [&str; 6] = ["a.txt", "d/b.txt", "d/e/c.txt", "secret/s.txt", "secret/t.bin", "z.txt"];
+const PATHS: [&str; 6] = ["a.txt", "d/b.txt", "d/e/c.txt", "secret/.env.s", "secret/t.key", "z.txt"];
 
 fn write_version(fs: &dyn StorageBackend, files: &[FileCase], new: bool) {
     for (path, f) in PATHS.iter().zip(files) {

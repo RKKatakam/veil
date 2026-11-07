@@ -134,10 +134,10 @@ fn policy_cannot_casually_expose_builtin_secrets() {
 fn cloaked_files_are_ciphertext_for_non_members() {
     let (mut alice, fs, _) = new_repo("alice");
     fs.write(&p(".veilpolicy"), b"secrets/ cloak team\n").unwrap();
-    fs.write(&p("secrets/db.yml"), b"password: hunter2\n").unwrap();
+    fs.write(&p("secrets/.env.db"), b"password: hunter2\n").unwrap();
     fs.write(&p("README.md"), b"hello\n").unwrap();
     let wc = snap(&mut alice, &fs);
-    let e = file_entry(&alice, &wc, "secrets/db.yml").unwrap();
+    let e = file_entry(&alice, &wc, "secrets/.env.db").unwrap();
     assert_eq!(e.visibility, Visibility::Cloaked { scope: "team".into() });
     // Raw object is ciphertext.
     let raw = alice.store().get_raw(&e.id).unwrap();
@@ -158,25 +158,6 @@ fn cloaked_files_are_ciphertext_for_non_members() {
     alice.keys().grant("team", &bob.public_hex(), "bob").unwrap();
     let bob_repo = Repo::open(fs.clone(), Some(bob), "bob").unwrap();
     assert_eq!(bob_repo.store().read_entry(&e).unwrap(), b"password: hunter2\n");
-}
-
-#[test]
-fn cloaked_workspace_seals_files_and_descriptions() {
-    let (mut repo, _fs, _) = new_repo("alice");
-    let base = repo.root_id();
-    repo.create_workspace("stealth", vec![base], Some("team".into())).unwrap();
-    let overlay = repo.workspace_overlay("stealth").unwrap();
-    overlay.write(&p("plan.md"), b"launch on friday").unwrap();
-    let out = repo.snapshot_workspace("stealth", &overlay).unwrap();
-    let id = repo.describe(out.snapshot, "secret launch").unwrap();
-    let s = repo.snapshot(&id).unwrap();
-    assert!(matches!(s.description, veil_core::object::Text::Sealed(_)));
-    assert_eq!(repo.description(&s), "secret launch");
-    let e = file_entry(&repo, &id, "plan.md").unwrap();
-    assert_eq!(e.visibility, Visibility::Cloaked { scope: "team".into() });
-
-    let outsider = Repo::open(repo.backend().clone(), Some(Identity::generate("eve")), "eve").unwrap();
-    assert_eq!(outsider.description(&s), "[cloaked:team]");
 }
 
 #[test]
@@ -241,19 +222,17 @@ fn rebase_reports_conflicts() {
 #[test]
 fn public_remote_never_receives_cloaked_or_isolated_content() {
     let (mut alice, fs, _) = new_repo("alice");
-    fs.write(&p(".veilpolicy"), b"internal/ cloak\n").unwrap();
-    fs.write(&p("internal/roadmap.md"), b"acquire competitor\n").unwrap();
+    fs.write(&p(".veilpolicy"), b"internal/.env.roadmap cloak\n").unwrap();
+    fs.write(&p("internal/.env.roadmap"), b"acquire competitor\n").unwrap();
     fs.write(&p("lib.rs"), b"pub fn f() {}\n").unwrap();
     fs.write(&p(".env"), b"TOKEN=abc").unwrap();
     snap(&mut alice, &fs);
     let (c, _) = alice.commit_working_copy(WS, "release").unwrap();
-    alice.set_tag("main", c, None, false).unwrap();
-    alice.set_tag("wip", c, Some("team".into()), false).unwrap();
+    alice.set_tag("main", c, false).unwrap();
 
     let public_backend = Arc::new(MemoryBackend::new());
     let rep = remote::push(&mut alice, public_backend.clone(), true, &[], false).unwrap();
     assert_eq!(rep.redacted, 1, "the cloaked blob is withheld");
-    assert!(rep.tags_skipped.iter().any(|(t, _)| t == "wip"));
 
     // Nothing in the public remote contains the cloaked plaintext or .env.
     for path in veil_core::vfs::walk_files(&*public_backend, &VPath::root(), &|_| false).unwrap() {
@@ -269,12 +248,12 @@ fn public_remote_never_receives_cloaked_or_isolated_content() {
     let main = resolve(&carol, "main", WS).unwrap();
     let wc = carol.new_change(WS, vec![main], "").unwrap();
     let report = carol.checkout_tree(&*carol_fs, None, &carol.snapshot(&wc).unwrap().tree).unwrap();
-    assert_eq!(report.redacted, vec![p("internal/roadmap.md")]);
+    assert_eq!(report.redacted, vec![p("internal/.env.roadmap")]);
     assert!(carol_fs.exists(&p("lib.rs")).unwrap());
     carol_fs.write(&p("lib.rs"), b"pub fn f() { /* carol */ }\n").unwrap();
     let out = carol.snapshot_workspace(WS, &*carol_fs).unwrap();
-    assert!(file_entry(&carol, &out.snapshot, "internal/roadmap.md").is_some(), "redacted entry carried over");
-    assert_eq!(out.report.carried, vec![p("internal/roadmap.md")]);
+    assert!(file_entry(&carol, &out.snapshot, "internal/.env.roadmap").is_some(), "redacted entry carried over");
+    assert_eq!(out.report.carried, vec![p("internal/.env.roadmap")]);
 }
 
 #[test]
@@ -283,7 +262,7 @@ fn embargoed_merge_hides_changes_until_release() {
     fs.write(&p("auth.rs"), b"fn check() -> bool { true }\n").unwrap();
     snap(&mut alice, &fs);
     let (main, _) = alice.commit_working_copy(WS, "v1").unwrap();
-    alice.set_tag("main", main, None, false).unwrap();
+    alice.set_tag("main", main, false).unwrap();
 
     // Security fix developed out of sight.
     let fix_ws = alice.ephemeral_workspace(main).unwrap();
@@ -295,20 +274,25 @@ fn embargoed_merge_hides_changes_until_release() {
         .merge(WS, main, vec![fix], "merge security fix", Some(EmbargoSpec { scope: "team".into(), until: None }))
         .unwrap();
     let embargo = res.embargo.clone().unwrap();
+    // Plain text: an embargo is a permission, not encryption.
     let e = file_entry(&alice, &res.snapshot, "auth.rs").unwrap();
-    assert_eq!(e.visibility, Visibility::Embargoed { embargo: embargo.clone() });
+    assert_eq!(e.visibility, Visibility::Public);
     assert!(String::from_utf8(alice.store().read_entry(&e).unwrap()).unwrap().contains("verify_signature"));
     assert_eq!(resolve(&alice, "main", WS).unwrap(), res.snapshot, "tag advanced");
 
-    // Publish to a public mirror before release.
+    // Publish to a public mirror before release: the merge and the fix are
+    // withheld, so the mirror learns neither the fix nor the name of the
+    // file it adds (BUG-018).
     let public_backend = Arc::new(MemoryBackend::new());
     remote::push(&mut alice, public_backend.clone(), true, &[], false).unwrap();
     let mirror = Repo::open(public_backend.clone(), Some(Identity::generate("public")), "public").unwrap();
-    let e_pub = file_entry(&mirror, &res.snapshot, "auth.rs").unwrap();
-    assert_eq!(mirror.store().read_entry(&e_pub).unwrap(), b"fn check() -> bool { true }\n", "public sees pre-merge content");
-    // The embargoed tree is sealed whole: the mirror does not even learn the
-    // name of the file the fix adds (BUG-018).
-    assert!(file_entry(&mirror, &res.snapshot, "CVE.md").is_none());
+    assert!(mirror.snapshot_opt(&res.snapshot).unwrap().is_none(), "the embargoed merge reached the mirror");
+    assert!(mirror.snapshot_opt(&fix).unwrap().is_none(), "the fix reached the mirror");
+    for path in veil_core::vfs::walk_files(&*public_backend, &VPath::root(), &|_| false).unwrap() {
+        let data = public_backend.read(&path).unwrap();
+        assert!(!data.windows(16).any(|w| w == b"verify_signature"), "{path}");
+        assert!(!data.windows(6).any(|w| w == b"CVE.md"), "{path}");
+    }
 
     // Release and push again: the public now sees the fix, same snapshot ids.
     alice.release_embargo(&embargo).unwrap();

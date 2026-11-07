@@ -79,3 +79,15 @@ The identity files (`home-*/identity.json`) hold test-only keys, and
 `alice/.env` is a deliberately harmless file: isolated up to the format-6
 set, sealed for `team` from the format-7 set on (`vl init` syncs shared
 secrets).
+
+* `format-8/`: only secret files are encrypted, generated with
+  `VEIL_FIXTURE_EXTRAS=<core_format test binary> generate.sh target/debug/vl
+  …/format-8 …/format-7` (a debug build of the same sources). The sealed
+  file is `secrets/.env.notes` (a secret file; there is no cloaked
+  directory), the sealed link `secrets/.env.current`, the embargoed fixes
+  are developed in ordinary workspaces, `team-only` is an ordinary tag and
+  `team-release` an ordinary signed annotated tag. `upgraded/` is absent:
+  the format-7 set holds what format 8 removed, so `vl upgrade` refuses it
+  (`format_compat.rs` checks that, and that the format-1 to 7 sets are
+  refused and left unchanged). Both remotes lack `main`, which builds on
+  the unreleased embargo.

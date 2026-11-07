@@ -77,7 +77,7 @@ fn a_swap_file_of_an_isolated_key_is_not_recorded() {
     let scanned = scan(&vim_swap(KEY));
     snap(&mut repo, &*fs);
     let main = repo.commit_working_copy(WS, "deploy notes").unwrap().0;
-    repo.set_tag("main", main, None, false).unwrap();
+    repo.set_tag("main", main, false).unwrap();
 
     let mirror = Arc::new(MemoryBackend::new());
     remote::push(&mut repo, mirror.clone(), true, &["main".to_string()], false).unwrap();

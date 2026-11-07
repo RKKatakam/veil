@@ -137,7 +137,6 @@ mod tests {
             size: 0,
             executable: false,
             visibility: Default::default(),
-            fallback: None,
         }
     }
 

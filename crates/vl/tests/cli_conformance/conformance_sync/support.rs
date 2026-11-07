@@ -1,6 +1,6 @@
 //! Helpers for the remotes and storage conformance suite: run the real `vl`
-//! binary with an isolated `VEIL_HOME` per user, stand in for `ssh` with a
-//! local `sftp-server`, and look inside
+//! binary with an isolated `VEIL_HOME` per user and the path remotes of the
+//! test fixture (`crates/vl/src/test_remotes.rs`), and look inside
 //! repositories (every object's bytes, metadata files) for leaks.
 
 #![allow(dead_code)]
@@ -17,8 +17,6 @@ use veil_core::{DiskBackend, Repo, StorageBackend};
 pub struct Env {
     pub tmp: tempfile::TempDir,
     pub root: PathBuf,
-    /// `VEIL_SSH` for every `vl` this environment runs (a stand-in).
-    pub ssh: Option<String>,
     /// Extra environment variables for every `vl`.
     pub envs: Vec<(String, String)>,
 }
@@ -30,51 +28,8 @@ impl Env {
         Env {
             tmp,
             root,
-            ssh: None,
             envs: Vec::new(),
         }
-    }
-
-    /// An environment whose `ssh` is a script serving the local
-    /// `sftp-server` from `<root>/sshhome` (the "login directory"), logging
-    /// its arguments to `<root>/ssh.log`. `None` (test skipped) without an
-    /// `sftp-server`.
-    pub fn with_sftp() -> Option<Env> {
-        Self::with_sftp_wrapper("")
-    }
-
-    /// Like [`Env::with_sftp`], with `filter` spliced into the pipeline
-    /// around the server, for example `| head -c 4000` (the connection
-    /// drops after 4,000 bytes from the server).
-    pub fn with_sftp_wrapper(filter: &str) -> Option<Env> {
-        sftp_server()?;
-        let mut env = Env::new();
-        env.ssh = Some(env.sftp_script("fake-ssh", filter));
-        Some(env)
-    }
-
-    /// Write a stand-in `ssh` script `<root>/<name>` (see [`Env::with_sftp`])
-    /// and return its path, for `VEIL_SSH`.
-    pub fn sftp_script(&self, name: &str, filter: &str) -> String {
-        let server = sftp_server().expect("sftp-server");
-        let home = self.dir("sshhome");
-        let script = self.root.join(name);
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\ncd '{home}' || exit 255\nexec sh -c '{server} {filter}'\n",
-                log = self.root.join("ssh.log").display(),
-                home = home.display(),
-                server = server.display(),
-            ),
-        )
-        .unwrap();
-        set_mode(&script, 0o755);
-        script.display().to_string()
-    }
-
-    pub fn ssh_log(&self) -> String {
-        std::fs::read_to_string(self.root.join("ssh.log")).unwrap_or_default()
     }
 
     pub fn dir(&self, name: &str) -> PathBuf {
@@ -93,7 +48,7 @@ impl Env {
 
     pub fn cmd(&self, user: &str, cwd: &Path, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_vl"));
-        c.args(args)
+        c.env("VEIL_TEST_PATH_REMOTES", "1").args(args)
             .current_dir(cwd)
             .env("VEIL_HOME", self.home(user))
             .env("VEIL_USER", user)
@@ -102,9 +57,6 @@ impl Env {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .stdin(Stdio::null());
-        if let Some(ssh) = &self.ssh {
-            c.env("VEIL_SSH", ssh);
-        }
         c.envs(self.envs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         c
     }
@@ -453,23 +405,3 @@ pub fn fixture(format: u32) -> PathBuf {
 
 // ---- git -------------------------------------------------------------------
 
-// ---- ssh -------------------------------------------------------------------
-
-const SFTP_SERVERS: &[&str] = &[
-    "/usr/lib/openssh/sftp-server",
-    "/usr/libexec/openssh/sftp-server",
-    "/usr/libexec/sftp-server",
-    "/usr/lib/ssh/sftp-server",
-    "/opt/homebrew/libexec/sftp-server",
-];
-
-pub fn sftp_server() -> Option<PathBuf> {
-    let found = std::env::var("VEIL_TEST_SFTP_SERVER")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| SFTP_SERVERS.iter().map(PathBuf::from).find(|p| p.exists()));
-    if found.is_none() {
-        eprintln!("SKIPPED: no sftp-server binary found");
-    }
-    found
-}

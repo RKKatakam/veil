@@ -17,8 +17,8 @@
 //! the tree's entries that do not.
 //!
 //! Everything the builder decides is thus decided exactly as for a full
-//! working copy whose files outside the set are unchanged: the policy, the
-//! cloaked line, embargoes, conflicts. When the policy changed (or the
+//! working copy whose files outside the set are unchanged: the policy,
+//! sealed secrets, conflicts. When the policy changed (or the
 //! scanner's rules did), hints are off and the builder reads the files
 //! outside the set from the tree to reclassify them, which is slow but
 //! exactly right.
@@ -106,8 +106,7 @@ impl SparseSet {
 
 /// `tree` restricted to `set`: the entries in the set, and the directories
 /// leading to them (with nothing else). Entries are copied as they are
-/// (sealed, embargoed, conflicts); embargo wrappers are resolved as this
-/// reader sees them ([`ObjectStore::tree`]). New tree objects are written to
+/// (sealed secrets, conflicts). New tree objects are written to
 /// the store, as any build does.
 pub fn restrict(store: &ObjectStore, tree: &ObjectId, set: &SparseSet) -> Result<ObjectId> {
     match restrict_dir(store, &VPath::root(), tree, set)? {

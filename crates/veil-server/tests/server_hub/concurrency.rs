@@ -83,10 +83,9 @@ fn concurrent_pushers_lose_no_update() {
     let mut descs = Vec::new();
     loop {
         let s = repo.store().snapshot(&id).unwrap();
-        if let veil_core::object::Text::Plain(t) = &s.description {
-            if t.starts_with('w') && t.contains('-') {
-                descs.push(t.clone());
-            }
+        let t = s.description.as_str();
+        if t.starts_with('w') && t.contains('-') {
+            descs.push(t.to_string());
         }
         assert!(s.parents.len() <= 1, "a fast-forward-only branch has no merges");
         match s.parents.first() {

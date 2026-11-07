@@ -15,7 +15,7 @@ use veil_core::{
         wire::{join_message, vouch_message, InviteKey},
     },
     identity::{parse_public_identity, PublicIdentity},
-    keychain::{KeyRing, Keychain, MemberGrant, RingChange, RingOp, Role, ShareProof, RING_FORMAT_SHARES, SHARES_REPO_FORMAT},
+    keychain::{KeyRing, Keychain, MemberGrant, RingChange, RingOp, Role, ShareProof, RING_FORMAT_SHARES},
     policy::{rule_scope, rule_scope_of, Policy, Tier, DEFAULT_SCOPE},
     Identity, MemoryBackend, Repo, VPath,
 };
@@ -26,10 +26,10 @@ fn pid(i: &Identity) -> PublicIdentity {
     parse_public_identity(&i.public_id()).unwrap()
 }
 
-/// A device's keychain at repository `format`, holding `ring` if given.
-fn device(id: &Identity, format: u32, ring: Option<&KeyRing>) -> Repo {
+/// A device's keychain, holding `ring` if given.
+fn device(id: &Identity, ring: Option<&KeyRing>) -> Repo {
     let fs = Arc::new(MemoryBackend::new());
-    let repo = Repo::init_for_clone_at(fs, Some(id.clone()), &id.name, format).unwrap();
+    let repo = Repo::init_for_clone(fs, Some(id.clone()), &id.name).unwrap();
     if let Some(r) = ring {
         repo.keys().save_ring(r).unwrap();
     }
@@ -90,7 +90,7 @@ fn member(id: &Identity, name: &str, generation: u32, role: Role) -> MemberGrant
 fn start() -> (Identity, Identity, Repo) {
     let admin = Identity::generate("admin");
     let alice = Identity::generate("alice");
-    let a = device(&admin, SHARES_REPO_FORMAT, None);
+    let a = device(&admin, None);
     a.keys().create_scope(SCOPE).unwrap();
     a.keys().grant(SCOPE, &alice.public_id(), "alice").unwrap();
     (admin, alice, a)
@@ -100,11 +100,11 @@ fn start() -> (Identity, Identity, Repo) {
 fn a_person_shares_with_their_new_device_which_then_opens_the_key() {
     let (_admin, alice, a) = start();
     let laptop = Identity::generate("alice");
-    let al = device(&alice, SHARES_REPO_FORMAT, Some(&ring(a.keys())));
+    let al = device(&alice, Some(&ring(a.keys())));
     al.keys().share(SCOPE, &laptop.public_id(), "alice", vouch(&alice, &laptop)).unwrap();
     let r = ring(al.keys());
     assert_eq!(r.format, RING_FORMAT_SHARES);
-    let lp = device(&laptop, SHARES_REPO_FORMAT, Some(&r));
+    let lp = device(&laptop, Some(&r));
     assert_eq!(lp.keys().sealing_key(SCOPE).unwrap().1, al.keys().sealing_key(SCOPE).unwrap().1, "the shared device holds the key");
     // The admin's device takes it as a fast-forward.
     assert_eq!(a.keys().merge_ring(&r).unwrap(), veil_core::keychain::RingMerge::Updated);
@@ -193,7 +193,7 @@ fn a_member_removes_only_their_own_devices_and_the_key_rotates() {
     let laptop = Identity::generate("alice");
     let bob = Identity::generate("bob");
     a.keys().grant(SCOPE, &bob.public_id(), "bob").unwrap();
-    let al = device(&alice, SHARES_REPO_FORMAT, Some(&ring(a.keys())));
+    let al = device(&alice, Some(&ring(a.keys())));
     al.keys().share(SCOPE, &laptop.public_id(), "alice", vouch(&alice, &laptop)).unwrap();
     let before = al.keys().sealing_key(SCOPE).unwrap();
     // Not bob's device.
@@ -205,7 +205,7 @@ fn a_member_removes_only_their_own_devices_and_the_key_rotates() {
     assert!(matches!(r.log.last().unwrap().op, RingOp::RevokeOwn { .. }));
     let after = al.keys().sealing_key(SCOPE).unwrap();
     assert_ne!(before.1, after.1, "the key did not rotate");
-    let lp = device(&laptop, SHARES_REPO_FORMAT, Some(&r));
+    let lp = device(&laptop, Some(&r));
     assert!(lp.keys().sealing_key(SCOPE).is_err(), "the removed device holds the new key");
     // Never shared to again, even with a genuine vouch.
     assert!(al.keys().share(SCOPE, &laptop.public_id(), "alice", vouch(&alice, &laptop)).is_err());
@@ -213,26 +213,6 @@ fn a_member_removes_only_their_own_devices_and_the_key_rotates() {
     let RingOp::RevokeOwn { rotation, .. } = r.log.last().unwrap().op.clone() else { unreachable!() };
     let bad = appended(&r, &bob, RingOp::RevokeOwn { member: alice.public_hex(), rotation });
     assert!(bad.verify().unwrap_err().contains("only their own devices"));
-}
-
-#[test]
-fn ring_format_4_needs_repository_format_7() {
-    let (_admin, alice, a) = start();
-    let laptop = Identity::generate("alice");
-    let al = device(&alice, SHARES_REPO_FORMAT, Some(&ring(a.keys())));
-    al.keys().share(SCOPE, &laptop.public_id(), "alice", vouch(&alice, &laptop)).unwrap();
-    let r = ring(al.keys());
-    // A format-6 repository cannot store it (`vl upgrade`), and a ring that
-    // says format 3 while holding a share does not verify.
-    let old = device(&alice, 6, None);
-    let e = old.keys().save_ring(&r).unwrap_err().to_string();
-    assert!(e.contains("vl upgrade"), "{e}");
-    let mut labelled = r.clone();
-    labelled.format = 3;
-    assert!(labelled.verify().unwrap_err().contains("ring format 4"));
-    let mut newer = r.clone();
-    newer.format = RING_FORMAT_SHARES + 1;
-    assert!(newer.verify().unwrap_err().contains("newer vl"));
 }
 
 #[test]
@@ -341,7 +321,7 @@ proptest! {
             // Honest steps (each may not apply; then nothing happens).
             let _ = match step {
                 Try::AliceConfirmsLaptop if st.members.contains_key(&alice.public_hex()) => {
-                    let al = device(&alice, SHARES_REPO_FORMAT, Some(&r));
+                    let al = device(&alice, Some(&r));
                     al.keys().share(SCOPE, &laptop.public_id(), "alice", vouch(&alice, &laptop)).map(|()| ring(al.keys()))
                 }
                 Try::AdminInvitesCarol if !st.invites.contains_key(&carol_key.public_hex()) => {
@@ -355,7 +335,7 @@ proptest! {
                     Ok(ring(a.keys()))
                 }
                 Try::AliceRemovesLaptop if st.members.contains_key(&alice.public_hex()) => {
-                    let al = device(&alice, SHARES_REPO_FORMAT, Some(&r));
+                    let al = device(&alice, Some(&r));
                     al.keys().revoke_device(SCOPE, &laptop.public_hex()).map(|_| ring(al.keys()))
                 }
                 _ => Ok(r.clone()),
@@ -380,7 +360,7 @@ fn step_index(t: &Try) -> usize {
 
 /// A project's repository: its `team` ring and the rule ring `SCOPE`.
 fn project(admin: &Identity) -> Repo {
-    let a = device(admin, SHARES_REPO_FORMAT, None);
+    let a = device(admin, None);
     a.keys().create_scope(DEFAULT_SCOPE).unwrap();
     a.keys().create_scope(SCOPE).unwrap();
     a
@@ -415,7 +395,7 @@ fn every_ring_names_its_project_and_another_projects_ring_is_refused() {
     assert!(b.keys().ring_state(SCOPE).unwrap().unwrap().unwrap_err().contains("another project"));
     assert!(b.keys().grant(SCOPE, &Identity::generate("x").public_id(), "x").is_err());
     // A repository of B without that ring refuses to take it.
-    let c = device(&admin, SHARES_REPO_FORMAT, Some(&b.keys().load_ring(DEFAULT_SCOPE).unwrap().unwrap()));
+    let c = device(&admin, Some(&b.keys().load_ring(DEFAULT_SCOPE).unwrap().unwrap()));
     let m = c.keys().merge_ring(&rule_a).unwrap();
     assert!(matches!(&m, veil_core::keychain::RingMerge::Rejected(w) if w.contains("another project")), "{m:?}");
     // The genesis is signed: rewriting its project breaks the signature, and
@@ -429,11 +409,6 @@ fn every_ring_names_its_project_and_another_projects_ring_is_refused() {
     // refused.
     assert!(regenesis(&team_a, &admin, Some(pa.clone())).verify().unwrap_err().contains("names no project"));
     assert!(regenesis(&rule_a, &admin, Some("xyz".into())).verify().unwrap_err().contains("malformed project id"));
-    // A format-6 repository makes rings that name no project, as before.
-    let old = device(&admin, 6, None);
-    old.keys().create_scope(DEFAULT_SCOPE).unwrap();
-    old.keys().create_scope(SCOPE).unwrap();
-    assert!(matches!(&old.keys().load_ring(SCOPE).unwrap().unwrap().log[0].op, RingOp::Genesis { project: None, .. }));
 }
 
 #[test]
@@ -447,14 +422,14 @@ fn a_clone_trusts_only_the_team_ring_whose_fingerprint_it_confirmed() {
     let fp_a = project_fingerprint(&a.keys().project_id().unwrap());
     assert!(veil_core::hub::wire::normalize_fingerprint(&fp_a).as_deref() == Some(fp_a.as_str()));
     // Nothing confirmed yet: no ring is taken, none seals.
-    let fresh = device(&admin, SHARES_REPO_FORMAT, None);
+    let fresh = device(&admin, None);
     fresh.keys().set_anchor("").unwrap();
     assert!(matches!(fresh.keys().merge_ring(&team_a).unwrap(), RingMerge::Rejected(w) if w.contains("not confirmed")));
     fresh.keys().save_ring(&team_a).unwrap();
     assert!(fresh.keys().sealing_key(DEFAULT_SCOPE).is_err());
     // Confirmed A: B's team (another project's) is refused, A's taken, and
     // A's rule ring with it; an unbound ring is not.
-    let d = device(&admin, SHARES_REPO_FORMAT, None);
+    let d = device(&admin, None);
     d.keys().set_anchor(&fp_a).unwrap();
     assert!(matches!(d.keys().merge_ring(&team_b).unwrap(), RingMerge::Rejected(w) if w.contains("this device confirmed")));
     assert_eq!(d.keys().merge_ring(&team_a).unwrap(), RingMerge::Updated);
@@ -462,7 +437,7 @@ fn a_clone_trusts_only_the_team_ring_whose_fingerprint_it_confirmed() {
     assert!(d.keys().sealing_key(SCOPE).is_ok());
     let (_, _, plain) = start();
     let unbound = plain.keys().load_ring(SCOPE).unwrap().unwrap();
-    let e = device(&admin, SHARES_REPO_FORMAT, Some(&team_a));
+    let e = device(&admin, Some(&team_a));
     e.keys().set_anchor(&fp_a).unwrap();
     assert!(matches!(e.keys().merge_ring(&unbound).unwrap(), RingMerge::Rejected(w) if w.contains("bound to no project")));
     // Another project's fingerprint: A's team is refused too.
@@ -477,7 +452,7 @@ fn a_clone_trusts_only_the_team_ring_whose_fingerprint_it_confirmed() {
 fn a_revoke_own_rotation_must_unlock_the_previous_generation() {
     let (_admin, alice, a) = start();
     let laptop = Identity::generate("alice");
-    let al = device(&alice, SHARES_REPO_FORMAT, Some(&ring(a.keys())));
+    let al = device(&alice, Some(&ring(a.keys())));
     al.keys().share(SCOPE, &laptop.public_id(), "alice", vouch(&alice, &laptop)).unwrap();
     let before = ring(al.keys());
     assert!(al.keys().revoke_device(SCOPE, &laptop.public_hex()).unwrap());
@@ -492,7 +467,7 @@ fn a_revoke_own_rotation_must_unlock_the_previous_generation() {
     .unwrap();
     let bad = appended(&before, &alice, RingOp::RevokeOwn { member, rotation });
     assert!(bad.verify().is_ok(), "only a key holder can tell");
-    let other = device(&alice, SHARES_REPO_FORMAT, Some(&before));
+    let other = device(&alice, Some(&before));
     let m = other.keys().merge_ring(&bad).unwrap();
     assert!(matches!(&m, veil_core::keychain::RingMerge::Rejected(w) if w.contains("does not unlock")), "{m:?}");
 }

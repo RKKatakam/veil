@@ -119,9 +119,9 @@ proptest! {
 fn small_repo() -> Repo {
     let (mut repo, fs, _) = new_repo("alice");
     let a = commit_files(&mut repo, &*fs, &[("a.txt", "1\n")], "one");
-    repo.set_tag("main", a, None, false).unwrap();
+    repo.set_tag("main", a, false).unwrap();
     commit_files(&mut repo, &*fs, &[("b.txt", "2\n")], "two");
-    repo.create_workspace("agent", vec![a], None).unwrap();
+    repo.create_workspace("agent", vec![a]).unwrap();
     repo
 }
 
@@ -162,7 +162,6 @@ fn exercise_tree(entries: Vec<(String, bool, u8)>) {
             size: k as u64,
             executable: k % 2 == 0,
             visibility: Visibility::Public,
-            fallback: None,
         })
         .collect();
     let root = repo.store().put(&Object::Tree(Tree { entries })).unwrap();
@@ -226,7 +225,6 @@ fn exercise_link_tree(entries: Vec<(String, u8, Vec<u8>)>) {
             size: target.len() as u64,
             executable: k % 5 == 0,
             visibility: Visibility::Public,
-            fallback: None,
         });
     }
     let Ok(root) = store.put(&Object::Tree(tree)) else { return };
@@ -245,11 +243,9 @@ fn exercise_link_tree(entries: Vec<(String, u8, Vec<u8>)>) {
         &veil_core::builder::BuildOptions {
             policy: &veil_core::policy::Policy::builtin(),
             parent_tree: Some(root),
-            cloak: None,
             injected: None,
             rescan: false,
             materialised: None,
-            line_base: None,
             line_endings: Default::default(),
         },
     );
@@ -285,8 +281,8 @@ fn sealed_blob_replayed_into_another_repository_is_unreadable() {
     // Same scope *name*, different scope key.
     let (mut a, afs, _) = new_repo("alice");
     afs.write(&p(".veilpolicy"), b"s/ cloak team\n").unwrap();
-    let c = commit_files(&mut a, &*afs, &[("s/k", "alice secret\n")], "c");
-    let e = file_entry(&a, &c, "s/k").unwrap();
+    let c = commit_files(&mut a, &*afs, &[("s/.env.k", "alice secret\n")], "c");
+    let e = file_entry(&a, &c, "s/.env.k").unwrap();
     let raw = a.store().get_raw(&e.id).unwrap();
 
     let (b, _bfs, _) = new_repo("bob");
@@ -300,8 +296,8 @@ fn sealed_blob_with_rewritten_scope_header_is_unreadable() {
     let (mut a, afs, _) = new_repo("alice");
     a.keys().create_scope("ops").unwrap();
     afs.write(&p(".veilpolicy"), b"s/ cloak ops\n").unwrap();
-    let c = commit_files(&mut a, &*afs, &[("s/k", "ops secret\n")], "c");
-    let e = file_entry(&a, &c, "s/k").unwrap();
+    let c = commit_files(&mut a, &*afs, &[("s/.env.k", "ops secret\n")], "c");
+    let e = file_entry(&a, &c, "s/.env.k").unwrap();
     let Object::Sealed(mut env) = a.store().get(&e.id).unwrap() else { panic!() };
     env.scope = "team".into();
     let forged = a.store().put(&Object::Sealed(env)).unwrap();
@@ -326,16 +322,6 @@ fn wrapped_key_moved_between_scopes_or_recipients_fails() {
     assert!(alice.unwrap_key(&legacy, "ops").is_err());
     assert!(bob.unwrap_key(&legacy, "team").is_err());
     assert_eq!(alice.unwrap_key(&legacy, "team").unwrap(), k);
-}
-
-#[test]
-fn descriptions_use_random_nonces_but_blobs_are_convergent() {
-    let (repo, _fs, _) = new_repo("alice");
-    let t1 = repo.store().make_text("same", Some("team")).unwrap();
-    let t2 = repo.store().make_text("same", Some("team")).unwrap();
-    assert_ne!(t1, t2, "description ciphertexts must not reveal equality");
-    let v = Visibility::Cloaked { scope: "team".into() };
-    assert_eq!(repo.store().store_file(b"x", &v).unwrap(), repo.store().store_file(b"x", &v).unwrap());
 }
 
 #[test]

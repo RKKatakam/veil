@@ -1,6 +1,6 @@
 # 5. Hooks and signed tags
 
-> **Access model:** written for today's client, which restricts paths by cloaking them for a *scope*. With the server, access is the ordinary model in `docs/VISIBILITY.md` (admins, private by default, groups and managers, folder access, `public`): cloaked paths become private folders, and only secrets and embargoed changes are encrypted.
+> **Access model:** written for the client of that round, which also restricted paths by cloaking them for a *scope*. Repository format 8 removed that, with every other non-secret encryption: only secret files (`.env`, keys) are encrypted, and access is the ordinary model in `docs/VISIBILITY.md` (admins, private by default, groups and managers, folder access, `public`).
 
 Status: design and threat review. Hooks need no format change. Annotated/signed tags are part of **format 5** (see `PLAN.md`).
 
@@ -42,9 +42,9 @@ Status: design and threat review. Hooks need no format change. Annotated/signed 
    - This is documented as a limit: trusting `npm run lint` trusts `package.json` scripts.
    - *Revised (Git-parity fix wave 3, BUG-700–702):* "every file it names" covers every spelling (`./a`, `a//b`, `--opt=a`, `VAR=a` name `a`), and a directory the program may run (`python3 tools`, `node dir`) or that `files` lists is pinned with every file below it (capped) and copied like a script; other directories are the command's data, as the working directory is. Build tools are recognised behind launchers (`nice make`, `timeout 60 make`, `sudo -u x make`). Commands whose code is text (`sh -c`, `python3 -c`, `node -e`, …), that pass their arguments through a shell or take them from their input (`xargs`, `watch`, `parallel`), or name the project in a way no trust can pin (through `..`, by absolute path or `/proc`) are refused, `--i-understand-indirect` or not. A property test over generated argv shapes checks that every repository file a trusted command runs is pinned or makes trust refuse.
 4. **Hook input leaking sealed content.** A `pre-push` hook to a public remote should see what the remote receives.
-   - *Invariant:* stdin lists snapshot ids. It never lists cloaked tags for a public remote, or withheld snapshots.
+   - *Invariant:* stdin lists snapshot ids. It never lists withheld snapshots.
    - A hook can still run `vl cat` as the user: the hook is trusted code. This is documented.
-   - *Test (conformance t5401/t5571):* a public push with a cloaked tag; the hook's stdin has no cloaked tag name and no withheld id.
+   - *Test (conformance t5401/t5571):* a public push with withheld history; the hook's stdin has no withheld id.
 5. **Hook environment leaks.** An `.env` value or vault secret must not be in the hook's environment. *Invariant:* the environment is scrubbed, with an allowlist (`PATH`, `HOME`, `USER`, `LANG`, `TERM`, `TMPDIR`, `VEIL_HOOK*`). *Test:* `env` in the hook, with `vl run`-style variables set in the parent, prints none of them.
 6. **Deadlock and lost operations.** A hook that runs `vl status` must not deadlock on the repository lock or lose the outer command's state (BUG-361/362).
    - *Invariant:* hooks run before the transaction takes the lock. After the hook, `@` is snapshotted again; a changed tree aborts the commit with "the pre-commit hook changed files; review and commit again".
@@ -61,14 +61,14 @@ Status: design and threat review. Hooks need no format change. Annotated/signed 
 - The signature is `Ed25519(identity signing key, SIG_PREFIX ‖ "tag" ‖ 0 ‖ unsigned-id)`. The new context `SIG_CONTEXT_TAG = "tag"` goes in `crypto/domains.rs`, pinned by its unit test.
 - **CLI:** `vl tag set NAME -r REV -a -m MSG` (annotated, signed when an identity exists) and `vl tag verify NAME`. `vl tag list` and `api::tag_list` gain `annotated`, `signer` and `verified` (additive).
   - An annotated tag is **immutable**: `tag set` over it is refused without `--force`, which writes a new atag. That is Git's release-tag semantics.
-- **Message sealing:** a cloaked tag (`--cloak S`) seals the message under `S` (`Text::Sealed`), and the atag is never pushed to public remotes (cloaked tags never are).
+- **Message sealing:** Removed in repository format 8 (only secret files are encrypted). Tag messages are plain text.
 
 ### Threat review
 
 17. **Replay or transplant of a signature.** An atag signed for `v1.0 → X` is re-used for `v1.0 → Y`, or under another name.
     - *Invariant:* the signature covers the unsigned id of the canonical JSON, including `name` and `target`. The view's tag name must equal `atag.name`, or the tag is shown "unverified (name mismatch)".
     - *Test:* a forged view entry pointing at an atag of another name.
-18. **A cloaked tag message on a public remote.** *Invariant:* push excludes cloaked tags and their atags, and an atag object is withheld from public remotes when `cloak` is set (`push_closure`). *Test:* a public mirror's object dump has no atag with a sealed message, and none of its plaintext.
+18. **Tag message secrecy on a public remote.** Removed in repository format 8 (only secret files are encrypted).
 20. **Format 4 readers.** A format-4 vl must refuse the view of a format-5 remote (FORMAT rule), not drop `annotation`. This is covered by the format-5 bump, and the test is in `format_compat.rs`.
 21. **Terminal escapes in tag messages.** These go through `render::safe` and `to_json`.
 

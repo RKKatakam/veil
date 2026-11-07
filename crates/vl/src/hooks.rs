@@ -42,9 +42,8 @@
 //!   `push` likewise refuses if the hook moved a tag.
 //! * **Output.** A hook's stdout and stderr both go to `vl`'s stderr, never
 //!   to its stdout (where `--json` documents and `vl serve` replies go).
-//! * **Input.** `pre-push` gets, on stdin, one line per tag the push sends:
-//!   never a cloaked tag on a public remote, never a snapshot held back by
-//!   an embargo. No hook input carries file content.
+//! * **Input.** `pre-push` gets, on stdin, one line per tag the push sends
+//!   to the Veil server. No hook input carries file content.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -1578,18 +1577,11 @@ fn commit_msg(root: &Path, rs: &[Runnable], message: &str, env: Vec<(&'static st
     r
 }
 
-/// `pre-push`, for `vl push`. `lines` builds the hook's
-/// stdin (only if a hook will run): one line per tag the push sends. If
-/// the hook moved a tag, the push is refused (it would send something else
+/// `pre-push`, for `vl push` to the Veil server `url` (remote `remote`).
+/// Its stdin is one line per tag the push sends ([`push_lines`]). If the
+/// hook moved a tag, the push is refused (it would send something else
 /// than the hook was shown).
-pub fn before_push(
-    ctx: &mut Ctx,
-    verify: &NoVerifyArgs,
-    remote: &str,
-    url: &str,
-    kind: &str,
-    lines: impl FnOnce(&mut Ctx) -> Result<Vec<String>>,
-) -> Result<()> {
+pub fn before_push(ctx: &mut Ctx, verify: &NoVerifyArgs, remote: &str, url: &str, only_tags: &[String]) -> Result<()> {
     if verify.no_verify || ctx.bare || inside_hook() {
         return Ok(());
     }
@@ -1598,13 +1590,13 @@ pub fn before_push(
     if rs.is_empty() {
         return Ok(());
     }
-    let mut stdin = lines(ctx)?.join("\n");
+    let tags = ctx.repo.view().tags.clone();
+    let mut stdin = push_lines(&tags, &ctx.repo.view().remote_tags, remote, only_tags).join("\n");
     if !stdin.is_empty() {
         stdin.push('\n');
     }
-    let tags = ctx.repo.view().tags.clone();
     let inv = Invocation {
-        args: vec![remote.into(), veil_core::remote::redact_url(url).into(), kind.into()],
+        args: vec![remote.into(), url.into()],
         stdin: Some(stdin.into_bytes()),
         env: vec![("VEIL_WORKSPACE", ctx.ws.clone())],
     };
@@ -1617,45 +1609,20 @@ pub fn before_push(
     Ok(())
 }
 
-/// The pre-push lines of a push to a Veil remote: `<tag> <snapshot>
-/// <remote-snapshot-or-0>` for each tag it creates, moves or tries to
-/// (rejected), and `<tag> 0 <remote-snapshot-or-0>` for each `--delete`.
-/// Never a cloaked tag on a public remote, never a snapshot an unreleased
-/// embargo holds back.
-pub fn veil_push_lines(repo: &Repo, plan: &veil_core::push_plan::PushPlan, remote: &str, delete: &[String]) -> Vec<String> {
-    let mut out = plan_lines(plan);
-    out.extend(delete_lines(repo, remote, delete, plan.public));
-    out
-}
-
-/// The tag lines of [`veil_push_lines`].
-fn plan_lines(plan: &veil_core::push_plan::PushPlan) -> Vec<String> {
-    use veil_core::push_plan::TagAction;
-    let withheld: HashSet<ObjectId> = plan.withheld_snapshots.iter().map(|(id, _)| *id).collect();
-    let mut out = Vec::new();
-    for t in &plan.tags {
-        if !matches!(t.action, TagAction::Create | TagAction::Update | TagAction::Rejected)
-            || (plan.public && t.cloak.is_some())
-            || withheld.contains(&t.target)
-        {
-            continue;
-        }
-        let there = t.remote.map(|r| r.hex()).unwrap_or_else(|| "0".into());
-        out.push(format!("{} {} {there}", t.name, t.target.hex()));
-    }
-    out
-}
-
-/// `<tag> 0 <remote-snapshot-or-0>` for each tag `--delete` removes on
-/// `remote`.
-pub fn delete_lines(repo: &Repo, remote: &str, delete: &[String], public: bool) -> Vec<String> {
-    let view = repo.view();
-    delete
-        .iter()
-        .filter(|d| !(public && view.tags.get(*d).is_some_and(|t| t.cloak.is_some())))
-        .map(|d| {
-            let there = view.remote_tags.get(&format!("{remote}/{d}")).map(|r| r.hex()).unwrap_or_else(|| "0".into());
-            format!("{d} 0 {there}")
+/// The pre-push lines of a push of `only_tags` (all if empty) to `remote`:
+/// `<tag> <snapshot> <remote-snapshot-or-0>` for each tag whose target
+/// differs from the remote's (`<remote>/<tag>`), as the push sends it.
+fn push_lines(
+    tags: &BTreeMap<String, veil_core::oplog::Tag>,
+    remote_tags: &BTreeMap<String, ObjectId>,
+    remote: &str,
+    only_tags: &[String],
+) -> Vec<String> {
+    tags.iter()
+        .filter(|(name, _)| only_tags.is_empty() || only_tags.contains(*name))
+        .filter_map(|(name, t)| {
+            let there = remote_tags.get(&format!("{remote}/{name}"));
+            (there != Some(&t.target)).then(|| format!("{name} {} {}", t.target.hex(), there.map(|r| r.hex()).unwrap_or_else(|| "0".into())))
         })
         .collect()
 }
@@ -2068,53 +2035,35 @@ mod tests {
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
 
-        /// The pre-push input of a public remote never names a cloaked tag
-        /// or a snapshot an embargo withholds; it names only tags the push
-        /// sends (or tries to), each once, and their targets.
+        /// The pre-push input names only the tags the push sends (whose
+        /// target differs from the remote's), each once, with their targets
+        /// and the remote's.
         #[test]
-        fn pre_push_input_hides_what_a_public_remote_does_not_get(
-            tags in proptest::collection::vec((0u8..5, proptest::option::of(0u8..3), 0u8..8, proptest::option::of(0u8..8)), 0..12),
-            withheld in proptest::collection::vec(0u8..8, 0..4),
-            public: bool,
+        fn pre_push_input_names_what_the_push_sends(
+            tags in proptest::collection::btree_map(0u8..8, 0u8..8, 0..8),
+            remote in proptest::collection::btree_map(0u8..10, 0u8..8, 0..8),
+            only in proptest::collection::vec(0u8..10, 0..3),
         ) {
-            use veil_core::push_plan::{PlannedTag, PushPlan, TagAction};
             let id = |n: u8| ObjectId::hash(&[n]);
-            let actions = [TagAction::Create, TagAction::Update, TagAction::Unchanged, TagAction::Rejected, TagAction::Skipped];
-            let plan = PushPlan {
-                public,
-                tags: tags
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (a, cloak, target, remote))| PlannedTag {
-                        name: format!("{}tag{i}", if cloak.is_some() { "cloaked" } else { "plain" }),
-                        action: actions[*a as usize],
-                        target: id(*target),
-                        remote: remote.map(id),
-                        reason: None,
-                        cloak: cloak.map(|s| format!("scope{s}")),
-                    })
-                    .collect(),
-                withheld_snapshots: withheld.iter().map(|w| (id(*w), "e1".to_string())).collect(),
-                ..Default::default()
-            };
-            let lines = plan_lines(&plan);
-            let text = lines.join("\n");
-            for w in &withheld {
-                let hex = id(*w).hex();
-                let targeted = lines.iter().any(|l| l.split(' ').nth(1) == Some(hex.as_str()));
-                proptest::prop_assert!(!targeted, "withheld {hex} named: {text}");
+            let local: BTreeMap<String, veil_core::oplog::Tag> = tags
+                .iter()
+                .map(|(n, t)| (format!("tag-{n}"), veil_core::oplog::Tag { target: id(*t), annotation: None }))
+                .collect();
+            let there: BTreeMap<String, ObjectId> = remote.iter().map(|(n, t)| (format!("origin/tag-{n}"), id(*t))).collect();
+            let only: Vec<String> = only.iter().map(|n| format!("tag-{n}")).collect();
+            let lines = push_lines(&local, &there, "origin", &only);
+            for (name, t) in &local {
+                let sent = (only.is_empty() || only.contains(name)) && there.get(&format!("origin/{name}")) != Some(&t.target);
+                let named: Vec<&String> = lines.iter().filter(|l| l.split(' ').next() == Some(name.as_str())).collect();
+                proptest::prop_assert_eq!(named.len(), usize::from(sent), "{:?}", lines);
+                if let Some(l) = named.first() {
+                    let f: Vec<&str> = l.split(' ').collect();
+                    let r = there.get(&format!("origin/{name}")).map(|r| r.hex()).unwrap_or_else(|| "0".into());
+                    let hex = t.target.hex();
+                    proptest::prop_assert_eq!(f, vec![name.as_str(), hex.as_str(), r.as_str()]);
+                }
             }
-            if public {
-                proptest::prop_assert!(!text.contains("cloaked"), "{text}");
-            }
-            for l in &lines {
-                let f: Vec<&str> = l.split(' ').collect();
-                proptest::prop_assert_eq!(f.len(), 3);
-                let t = plan.tags.iter().find(|t| t.name == f[0]).unwrap();
-                proptest::prop_assert!(matches!(t.action, TagAction::Create | TagAction::Update | TagAction::Rejected));
-                proptest::prop_assert_eq!(f[1], t.target.hex());
-                proptest::prop_assert_eq!(lines.iter().filter(|x| x.starts_with(&format!("{} ", f[0]))).count(), 1);
-            }
+            proptest::prop_assert!(lines.iter().all(|l| local.contains_key(l.split(' ').next().unwrap())));
         }
     }
 

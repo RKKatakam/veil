@@ -24,7 +24,7 @@ struct Fixture {
     main: ObjectId,
 }
 
-/// A repository with public, cloaked and embargoed content, a tag, a virtual
+/// A repository with public content, a sealed secret, an embargo, a tag, a virtual
 /// workspace and some rewritten history.
 fn fixture() -> Fixture {
     let fs = Arc::new(MemoryBackend::new());
@@ -32,12 +32,12 @@ fn fixture() -> Fixture {
     let mut repo = Repo::init(fs.clone(), Some(id.clone()), "alice").unwrap();
     fs.write(&p(".veilpolicy"), b"secrets/ cloak team\n").unwrap();
     fs.write(&p("src/lib.rs"), b"pub fn f() {}\n").unwrap();
-    fs.write(&p("secrets/db.yml"), b"password: hunter2\n").unwrap();
+    fs.write(&p("secrets/.env.db"), b"password: hunter2\n").unwrap();
     repo.snapshot_workspace(WS, &*fs).unwrap();
     let (v1, _) = repo.commit_working_copy(WS, "v1").unwrap();
     repo.describe(v1, "v1, reworded").unwrap();
     let v1 = repo.snapshot(&repo.workspace_wc(WS).unwrap()).unwrap().parents[0];
-    repo.set_tag("main", v1, None, false).unwrap();
+    repo.set_tag("main", v1, false).unwrap();
     let ws = repo.ephemeral_workspace(v1).unwrap();
     ws.write("src/lib.rs", "pub fn f() { fixed() }\n").unwrap();
     let (fix, _) = repo.commit_ephemeral(&ws, "fix").unwrap();
@@ -53,7 +53,7 @@ fn fixture() -> Fixture {
             }),
         )
         .unwrap();
-    repo.create_workspace("agent", vec![m.snapshot], None).unwrap();
+    repo.create_workspace("agent", vec![m.snapshot]).unwrap();
     Fixture {
         repo,
         fs,
@@ -135,12 +135,12 @@ fn undecodable_objects_are_corrupt_even_if_unreachable() {
 #[test]
 fn missing_public_content_is_corrupt_but_missing_cloaked_content_is_redacted() {
     let f = fixture();
-    let cloaked = entry(&f.repo, &f.main, "secrets/db.yml");
+    let cloaked = entry(&f.repo, &f.main, "secrets/.env.db");
     assert!(matches!(cloaked.visibility, Visibility::Cloaked { .. }));
     f.fs.remove_file(&object_path(&cloaked.id)).unwrap();
     let r = fsck_repo(&f.repo).unwrap();
     assert!(r.is_ok(), "{:#?}", corrupt_messages(&r));
-    assert!(has(&r, Severity::Redacted, "secrets/db.yml"));
+    assert!(has(&r, Severity::Redacted, "secrets/.env.db"));
 
     let public = entry(&f.repo, &f.main, ".veilpolicy");
     f.fs.remove_file(&object_path(&public.id)).unwrap();
@@ -173,15 +173,18 @@ fn missing_trees_and_parents_are_corrupt() {
 fn clone_of_a_public_mirror_only_has_expected_redactions() {
     let mut f = fixture();
     let main = f.main;
-    f.repo.set_tag("main", main, None, false).unwrap();
+    f.repo.set_tag("main", main, false).unwrap();
+    // Below the embargoed merge (withheld from every remote until its
+    // release): the history with the secret.
+    let v1 = f.repo.snapshot(&main).unwrap().parents[0];
+    f.repo.set_tag("v1", v1, false).unwrap();
     let mirror = Arc::new(MemoryBackend::new());
     remote::push(&mut f.repo, mirror.clone(), true, &[], false).unwrap();
 
-    // The mirror itself lacks cloaked and embargoed content: expected.
+    // The mirror itself lacks the sealed secret: expected.
     let r = fsck(mirror.clone(), None).unwrap();
     assert!(r.is_ok(), "{:#?}", corrupt_messages(&r));
-    assert!(has(&r, Severity::Redacted, "cloaked under 'team'"));
-    assert!(has(&r, Severity::Redacted, "under embargo"));
+    assert!(has(&r, Severity::Redacted, "sealed under 'team'"), "{:#?}", r.findings);
 
     // So does a stranger's clone of it.
     let carol_fs = Arc::new(MemoryBackend::new());
@@ -189,7 +192,7 @@ fn clone_of_a_public_mirror_only_has_expected_redactions() {
     remote::pull(&mut carol, "origin", mirror).unwrap();
     let r = fsck_repo(&carol).unwrap();
     assert!(r.is_ok(), "{:#?}", corrupt_messages(&r));
-    assert!(r.count(Severity::Redacted) >= 2);
+    assert!(r.count(Severity::Redacted) >= 1);
 }
 
 #[test]

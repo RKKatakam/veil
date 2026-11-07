@@ -330,7 +330,7 @@ fn agent_sockets_namespaces_and_privileges_are_closed() {
 }
 
 #[test]
-fn the_allow_list_is_read_only_and_only_device_local() {
+fn the_allow_list_is_never_written_and_only_device_local() {
     let t = T::new();
     let tools = t.env.dir("tools");
     write(&tools, "lib.txt", "TOOLS-VISIBLE-91ac\n");
@@ -356,9 +356,11 @@ fn the_allow_list_is_read_only_and_only_device_local() {
     assert!(o.status.success(), "{out}");
     assert!(out.contains("TOOLS-VISIBLE-91ac") && out.contains("CONFIG-ALLOWED-3e2f"), "{out}");
     assert!(!out.contains("TRACKED-ALLOW-6b0d"), "a tracked file widened the allow-list: {out}");
-    assert!(out.contains("Read-only file system"), "{out}");
+    // The writes went to the workspace's layers (BUG-1025), never to the folders.
     let after = (snapshot(&tools, &[]), snapshot(&conf, &[]), snapshot(&t.home.join(".cargo"), &[]));
     assert_eq!(before, after, "an allowed folder changed: {out}");
+    let o = t.exec(&["w2", "--allow", &tools.display().to_string(), "--", "sh", "-c", &format!("ls {}; cat ~/.cargo/bin/tool", tools.display())]);
+    assert_eq!(String::from_utf8_lossy(&o.stdout), "new\nx\n", "{}", text(&o));
 }
 
 #[test]
@@ -891,8 +893,12 @@ fn killing_vl_at_any_moment_leaves_nothing_and_the_next_run_recovers() {
             assert!(wait_for(Duration::from_secs(15), || !scopes().contains(&format!("veil-exec-{pid}-"))), "{delay} ms: a scope was left: {}", scopes());
         }
     }
+    // The throwaway copies of allowed files (injected runs) went with them.
+    let tmp = t.env.root.join("tmp");
+    let homes = || std::fs::read_dir(&tmp).map(|d| d.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("veil-ws-home-")).count()).unwrap_or(0);
+    assert!(wait_for(Duration::from_secs(15), || homes() == 0), "throwaway copies were left: {}", homes());
     let o = exec_deadline(&t, &["agent", "--", "sh", "-c", "cat a.txt; echo next > next.txt"], &[], 60).expect("the next run hung");
-    assert!(o.status.success(), "{}", text(&o));
+    assert!(o.status.success() && !text(&o).contains("read-only in this run"), "{}", text(&o));
     assert_eq!(t.cat("next.txt").as_deref(), Some("next\n"), "{}", text(&o));
     assert!(t.cat(".netrc").is_none_or(|c| !c.contains("isolated-value")), "{}", text(&o));
 }
@@ -905,7 +911,8 @@ fn killing_vl_at_any_moment_leaves_nothing_and_the_next_run_recovers() {
 #[test]
 fn the_next_run_and_ws_rm_stop_what_a_dead_run_left_running() {
     let t = T::new();
-    t.sh("true");
+    t.sh("echo kept > ~/.cargo/kept");
+    assert!(layers(&t, "agent").exists(), "the runs must have layers (BUG-1025)");
     let o = Command::new("sh").args(["-c", "command -v bwrap"]).output().unwrap();
     let bwrap = String::from_utf8_lossy(&o.stdout).trim().to_string();
     for (i, next) in [&["ws", "exec", "agent", "--", "true"][..], &["ws", "rm", "--force", "agent"]].into_iter().enumerate() {
@@ -928,10 +935,14 @@ fn the_next_run_and_ws_rm_stop_what_a_dead_run_left_running() {
         assert!(wait_for(Duration::from_secs(10), || sleeping(&left)), "the stand-in never started");
         let o = t.cmd(&t.proj, next).stdin(Stdio::null()).output().unwrap();
         assert!(o.status.success(), "{next:?}: {}", text(&o));
+        assert!(!text(&o).contains("read-only in this run"), "{next:?}: the layers did not mount after a dead run: {}", text(&o));
         assert!(!sleeping(&left), "{next:?}: what the dead run left still runs");
         assert!(init.try_wait().unwrap().is_some(), "{next:?}: the stand-in init still runs");
+        if i == 0 {
+            assert_eq!(t.sh_out("cat ~/.cargo/kept"), "kept\n", "a dead run lost the layer");
+        }
     }
-    assert!(!t.files("agent").exists());
+    assert!(!t.files("agent").exists() && !layers(&t, "agent").exists());
 }
 
 #[test]
@@ -966,6 +977,7 @@ fn renames_and_hard_links_across_the_sandbox_boundary_change_nothing_outside() {
     let tl = tools.display();
     let h = t.home.display();
     let script = [
+        format!("cp -a {tl}/lib.txt copy.txt"),
         format!("mv {tl}/lib.txt moved.txt"),
         format!("mv {tl}/sub ."),
         format!("mv a.txt {tl}/a.txt"),
@@ -974,7 +986,6 @@ fn renames_and_hard_links_across_the_sandbox_boundary_change_nothing_outside() {
         format!("ln a.txt {tl}/hard"),
         format!("ln {h}/.cargo/bin/tool hardtool"),
         format!("mv {h}/.cargo/bin/tool ."),
-        format!("cp -a {tl}/lib.txt copy.txt"),
         "mv a.txt /tmp/a.txt; mv /tmp/a.txt a.txt".to_string(),
         format!("mknod {tl}/dev c 1 3"),
         format!("mkfifo {tl}/fifo"),
@@ -991,8 +1002,10 @@ fn renames_and_hard_links_across_the_sandbox_boundary_change_nothing_outside() {
     assert_eq!(before.0, after.0, "the allowed folder changed: {}", text(&o));
     assert_eq!(before.1, after.1, "the home changed: {}", text(&o));
     assert_eq!(before.2, after.2, "the real project changed: {}", text(&o));
-    // Reading through the allow-list still works: the copy landed.
+    // Reading through the allow-list still works: the copy landed. Moves
+    // out of an allowed folder took the file from its layer only (BUG-1025).
     assert_eq!(t.cat("copy.txt").as_deref(), Some("TOOLS-LIB-1b7e\n"), "{}", text(&o));
+    assert_eq!(t.cat("moved.txt").as_deref(), Some("TOOLS-LIB-1b7e\n"), "{}", text(&o));
 }
 
 /// Several workspaces run at once, each planting a marker and trying to
@@ -1031,4 +1044,531 @@ fn concurrent_runs_in_many_workspaces_stay_separate() {
         assert!(out.trim_end().ends_with(&format!("MARK-{i}-c0ffee")), "w{i}'s own file changed: {out}");
         assert_eq!(t.env.stdout("alice", &t.proj, &["ws", "cat", &format!("w{i}"), "mine.txt"]), format!("MARK-{i}-c0ffee\n"));
     }
+}
+
+// ---- BUG-1025: the allow-list is writable, per workspace -------------------
+
+const SESSION: &str = "CLAUDE-SESSION-LINE-2f6a";
+const SETTINGS: &str = "{\"theme\":\"dark\",\"numStartups\":1}\n";
+
+/// A fake home with a coding agent's configuration, and a run of `script`
+/// in `ws` that must succeed: its stdout.
+fn agent_home(t: &T) {
+    write(&t.home, ".claude/settings.json", "{\"model\":\"opus\"}\n");
+    write(&t.home, ".claude.json", SETTINGS);
+    write(&t.home, ".codex/config.toml", "model = \"x\"\n");
+}
+
+fn run_out(t: &T, args: &[&str]) -> String {
+    let o = t.exec(args);
+    assert!(o.status.success(), "{args:?}: {}", text(&o));
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+/// The real cargo of this machine's toolchain (`rustc --print sysroot`),
+/// if there is one: `(sysroot, cargo)`.
+fn real_cargo() -> Option<(PathBuf, PathBuf)> {
+    let o = Command::new("rustc").args(["--print", "sysroot"]).output().ok()?;
+    let sysroot = PathBuf::from(String::from_utf8(o.stdout).ok()?.trim());
+    let cargo = sysroot.join("bin/cargo");
+    (o.status.success() && cargo.is_file()).then_some((sysroot, cargo))
+}
+
+#[test]
+fn bug_1025_a_confined_cargo_writes_its_home_and_the_next_run_has_it() {
+    let t = T::new();
+    // A stand-in for a download: what cargo writes under `~/.cargo/registry`.
+    let o = t.exec(&["agent", "--", "sh", "-c", "mkdir -p ~/.cargo/registry/cache/i && echo crate > ~/.cargo/registry/cache/i/itoa-1.0.0.crate"]);
+    assert!(o.status.success(), "a write under ~/.cargo/registry failed: {}", text(&o));
+    let out = run_out(&t, &["agent", "--", "sh", "-c", "cat ~/.cargo/registry/cache/i/itoa-1.0.0.crate"]);
+    assert_eq!(out, "crate\n", "the download did not survive to the next run");
+    // The real cargo: `cargo install` writes `~/.cargo/bin` and `~/.cargo/.crates.toml`, offline.
+    let Some((sysroot, cargo)) = real_cargo() else {
+        eprintln!("no rustc toolchain here: the real cargo case is skipped");
+        return;
+    };
+    // `CARGO_HOME` (rustup sets it for the tests) would name the real one.
+    let script = format!(
+        "unset CARGO_HOME RUSTUP_HOME; mkdir -p tool/src && printf '[package]\\nname = \"hello-1025\"\\nversion = \"0.1.0\"\\nedition = \"2021\"\\n' > tool/Cargo.toml && \
+         echo 'fn main() {{ println!(\"hello-1025-ran\"); }}' > tool/src/main.rs && \
+         CARGO_TARGET_DIR=/tmp/target RUSTC={s}/bin/rustc PATH={s}/bin:$PATH {cargo} install --offline --quiet --path tool && ls ~/.cargo/bin",
+        s = sysroot.display(),
+        cargo = cargo.display()
+    );
+    let s = sysroot.display().to_string();
+    let o = t.exec(&["agent", "--allow", &s, "--", "sh", "-c", &script]);
+    assert!(o.status.success(), "a confined `cargo install` failed: {}", text(&o));
+    let out = run_out(&t, &["agent", "--", "sh", "-c", "~/.cargo/bin/hello-1025; grep -c hello-1025 ~/.cargo/.crates.toml"]);
+    assert_eq!(out, "hello-1025-ran\n1\n", "what cargo installed did not survive to the next run");
+}
+
+#[test]
+fn bug_1025_coding_agents_save_their_settings_and_sessions() {
+    let t = T::new();
+    agent_home(&t);
+    let script = format!(
+        "mkdir -p ~/.claude/projects/p && echo {SESSION} >> ~/.claude/projects/p/s.jsonl && echo {SESSION} >> ~/.claude/history.jsonl && \
+         printf '{{\"theme\":\"light\"}}\\n' > ~/.claude.json && echo 'model = \"y\"' > ~/.codex/config.toml && echo saved"
+    );
+    let o = t.exec(&["agent", "--", "sh", "-c", &script]);
+    assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("saved"), "{}", text(&o));
+    let out = run_out(&t, &["agent", "--", "sh", "-c", "cat ~/.claude/projects/p/s.jsonl ~/.claude/history.jsonl ~/.claude.json ~/.codex/config.toml"]);
+    assert_eq!(out, format!("{SESSION}\n{SESSION}\n{{\"theme\":\"light\"}}\nmodel = \"y\"\n"), "the agent's settings and sessions were lost");
+}
+
+#[test]
+fn bug_1025_what_a_run_writes_to_the_allow_list_stays_with_that_workspace_only() {
+    let t = T::new();
+    agent_home(&t);
+    t.env.ok("alice", &t.proj, &["ws", "new", "other", "-r", "@-"]);
+    let write_all = format!("echo {SESSION} > ~/.claude/mark; echo {SESSION} > ~/.cargo/mark; echo '{{\"w\":1}}' > ~/.claude.json; echo done");
+    let o = t.exec(&["agent", "--", "sh", "-c", &write_all]);
+    assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("done"), "{}", text(&o));
+    let read_all = "cat ~/.claude/mark ~/.cargo/mark ~/.claude.json 2>&1; echo end";
+    let mine = run_out(&t, &["agent", "--", "sh", "-c", read_all]);
+    assert_eq!(mine, format!("{SESSION}\n{SESSION}\n{{\"w\":1}}\nend\n"), "the next run of the workspace lost them");
+    // Another workspace sees the real folders, not this one's writes.
+    let other = run_out(&t, &["other", "--", "sh", "-c", read_all]);
+    assert!(!other.contains(SESSION) && other.contains(SETTINGS.trim()), "{other}");
+}
+
+/// The workspace's layers directory (`layers-<hash of its id>`).
+fn layers(t: &T, ws: &str) -> PathBuf {
+    let dir = t.proj.join(".veil/local/sandboxes").join(ws);
+    let found = std::fs::read_dir(&dir).ok().and_then(|d| d.flatten().map(|e| e.path()).find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("layers"))));
+    found.unwrap_or_else(|| dir.join("layers"))
+}
+
+/// Every file under `dir` whose content holds `needle`.
+fn holding(dir: &Path, needle: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        for e in entries.flatten() {
+            let m = std::fs::symlink_metadata(e.path()).unwrap();
+            if m.is_dir() {
+                stack.push(e.path());
+            } else if m.is_file() && std::fs::read(e.path()).is_ok_and(|c| String::from_utf8_lossy(&c).contains(needle)) {
+                out.push(e.path());
+            }
+        }
+    }
+    out
+}
+
+/// The real folders and files of the allow-list are never written: every
+/// kind of change a command makes to them, in a kept, a throwaway and an
+/// injected run, leaves them byte for byte (and mtime) as they were.
+#[test]
+fn the_real_allowed_folders_and_files_are_unchanged_after_runs_that_write_them() {
+    let t = T::new();
+    agent_home(&t);
+    write(&t.home, ".claude/projects/p/old.jsonl", "old\n");
+    write(&t.home, ".cargo/registry/cache/i/a.crate", "crate\n");
+    let mtime = |p: &Path| std::fs::symlink_metadata(p).unwrap().modified().unwrap();
+    let (json, settings) = (t.home.join(".claude.json"), t.home.join(".claude/settings.json"));
+    let before = (snapshot(&t.home, &[]), mtime(&json), mtime(&settings), mtime(&t.home.join(".claude")));
+    let script = "echo x >> ~/.claude.json; : > ~/.claude/settings.json; chmod 777 ~/.claude/settings.json ~/.claude; \
+                  mv ~/.claude/projects/p/old.jsonl ~/.claude/moved; rm -rf ~/.claude/projects ~/.cargo/registry; \
+                  ln -s /etc/passwd ~/.claude/link; ln ~/.cargo/bin/tool ~/.cargo/hard; touch -d 2001-01-01 ~/.claude.json ~/.codex/config.toml; \
+                  mkdir -p ~/.cargo/registry/index && echo new > ~/.cargo/registry/index/n; cat ~/.claude.json; echo end";
+    for args in [&["agent"][..], &["--ephemeral"], &["agent", "--with-isolated"]] {
+        let mut all = args.to_vec();
+        all.extend(["--", "sh", "-c", script]);
+        let out = run_out(&t, &all);
+        assert!(out.ends_with(&format!("{SETTINGS}x\nend\n")), "{args:?}: {out}");
+    }
+    let after = (snapshot(&t.home, &[]), mtime(&json), mtime(&settings), mtime(&t.home.join(".claude")));
+    assert_eq!(before, after, "a real allowed folder or file changed");
+}
+
+/// Cargo's credentials, the Veil home and the real project stay hidden on
+/// top of the layers: nothing a command does in one run (delete, rename,
+/// overwrite, link, rename a folder that holds them) shows them in the next.
+#[test]
+fn masks_hold_through_the_layers_in_this_run_and_the_next() {
+    let t = T::new();
+    let identity = std::fs::read_to_string(t.env.root.join("home-alice/identity.json")).unwrap();
+    let id_line = identity.lines().find(|l| l.contains("secret")).unwrap_or(identity.trim()).trim().to_string();
+    // A Veil home directly inside an allowed folder (a layer), and one two
+    // levels down (that folder stays read-only).
+    let top = t.env.dir("stash-top");
+    let deep = t.env.dir("stash-deep");
+    let copy = |to: &Path| {
+        let o = Command::new("cp").arg("-a").arg(t.env.root.join("home-alice")).arg(to).output().unwrap();
+        assert!(o.status.success(), "{}", text(&o));
+    };
+    copy(&top.join("vh"));
+    std::fs::create_dir_all(deep.join("a")).unwrap();
+    copy(&deep.join("a/vh"));
+    let attack = |vh: &Path, allow: &Path| {
+        let (v, a) = (vh.display(), allow.display());
+        let script = format!(
+            "cat ~/.cargo/credentials.toml; unlink ~/.cargo/credentials.toml; mv ~/.cargo/credentials.toml ~/.cargo/c2; mv ~/.cargo ~/.c2; \
+             ln ~/.cargo/credentials.toml ~/.cargo/c3; cp ~/.cargo/credentials.toml ~/.cargo/c4; echo planted > ~/.cargo/credentials.toml; \
+             rm -rf {v}; mv {v} {a}/moved; mv {a}/a {a}/b; ln -s {v} {a}/l; mkdir {a}/fresh; cat {v}/identity.json {a}/moved/identity.json {a}/b/vh/identity.json; echo end"
+        );
+        for _ in 0..2 {
+            let o = t
+                .cmd(&t.proj, &["ws", "exec", "agent", "--allow", &a.to_string(), "--", "sh", "-c", &script])
+                .env("VEIL_HOME", vh)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            let out = String::from_utf8_lossy(&o.stdout).into_owned();
+            assert!(o.status.success() && out.ends_with("end\n"), "{}", text(&o));
+            assert!(!out.contains(CARGO_TOKEN), "cargo's credentials showed through a layer: {out}");
+            assert!(!out.contains(&id_line), "the Veil home showed through a layer: {out}");
+        }
+        text(&t.cmd(&t.proj, &["ws", "exec", "agent", "--allow", &a.to_string(), "--", "true"]).env("VEIL_HOME", vh).output().unwrap())
+    };
+    let top_run = attack(&top.join("vh"), &top);
+    assert!(!top_run.contains("read-only:"), "{top_run}");
+    let deep_run = attack(&deep.join("a/vh"), &deep);
+    assert!(deep_run.contains(&format!("read-only: {}", deep.display())), "{deep_run}");
+    // A folder that holds the project stays read-only too (its layers are in the project).
+    let o = t.exec(&["agent", "--allow", &t.env.root.display().to_string(), "--", "sh", "-c", &format!("touch {}/x; echo end", t.env.root.display())]);
+    assert!(text(&o).contains(&format!("read-only: {}", t.env.root.display())) && text(&o).contains("Read-only file system"), "{}", text(&o));
+    // Nothing secret was ever copied into a layer.
+    for secret in [CARGO_TOKEN, id_line.as_str()] {
+        assert_eq!(holding(&layers(&t, "agent"), secret), Vec::<PathBuf>::new(), "{secret}");
+    }
+}
+
+/// Links a command plants in its layers resolve inside the confinement
+/// only, in later runs too; `vl` never follows one, nor a link put where a
+/// file copy belongs.
+#[test]
+fn links_planted_in_the_layers_lead_nowhere_outside() {
+    let t = T::new();
+    agent_home(&t);
+    let canary = t.env.dir("layer-canary");
+    write(&canary, "secret", OTHER);
+    let c = canary.display();
+    let plant = format!(
+        "ln -s {c}/secret ~/.cargo/l1; ln -s {c} ~/.claude/l2; ln -s ../../../../../../../../../.. ~/.claude/up; ln -s {h}/.ssh ~/.claude/ssh; echo end",
+        h = t.home.display()
+    );
+    run_out(&t, &["agent", "--", "sh", "-c", &plant]);
+    let out = run_out(&t, &["agent", "--", "sh", "-c", &format!("cat ~/.cargo/l1 ~/.claude/l2/secret ~/.claude/up{c}/secret ~/.claude/ssh/id_test 2>&1; echo x > ~/.claude/l2/new 2>&1; echo end")]);
+    assert!(!out.contains(OTHER) && !out.contains(SSH_KEY), "{out}");
+    // A link where the copy of `~/.claude.json` belongs is replaced, not written through.
+    let copy = std::fs::read_dir(layers(&t, "agent")).unwrap().flatten().find(|e| e.file_name().to_string_lossy().starts_with("claude.json-")).unwrap().path();
+    std::fs::remove_file(&copy).unwrap();
+    std::os::unix::fs::symlink(canary.join("secret"), &copy).unwrap();
+    let before = snapshot(&canary, &[]);
+    let out = run_out(&t, &["agent", "--", "sh", "-c", "cat ~/.claude.json; echo over > ~/.claude.json"]);
+    assert!(!out.contains(OTHER) && out.contains(SETTINGS.trim()), "{out}");
+    assert!(std::fs::symlink_metadata(&copy).unwrap().is_file());
+    // `vl ws rm` removes the layers without following a link.
+    t.env.ok("alice", &t.proj, &["ws", "rm", "agent"]);
+    assert!(!layers(&t, "agent").exists());
+    assert_eq!(snapshot(&canary, &[]), before, "a planted link was followed");
+}
+
+/// The layers are the user's only (`0700`, copies `0600`), go with the
+/// workspace, and deleting them resets the allow-list to the real folders.
+#[test]
+fn layers_are_private_and_go_with_the_workspace() {
+    let t = T::new();
+    agent_home(&t);
+    run_out(&t, &["agent", "--", "sh", "-c", "echo a > ~/.cargo/mark; echo '{}' > ~/.claude.json"]);
+    let dir = layers(&t, "agent");
+    let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&dir), 0o700);
+    let mut names = Vec::new();
+    for e in std::fs::read_dir(&dir).unwrap().flatten() {
+        let p = e.path();
+        names.push(e.file_name().to_string_lossy().into_owned());
+        match p.is_dir() {
+            true => assert!(mode(&p) == 0o700 && mode(&p.join("upper")) == 0o700 && mode(&p.join("work")) == 0o700, "{p:?}"),
+            false => assert_eq!(mode(&p), 0o600, "{p:?}"),
+        }
+    }
+    assert!(names.iter().any(|n| n.starts_with("cargo-")) && names.iter().any(|n| n.starts_with("claude.json-")), "{names:?}");
+    // Deleting the folder resets the layers.
+    veil_core::vfs::remove_tree(&dir).unwrap();
+    let out = run_out(&t, &["agent", "--", "sh", "-c", "cat ~/.cargo/mark ~/.claude.json 2>&1; true"]);
+    assert!(out.contains("No such file") && out.contains(SETTINGS.trim()), "{out}");
+    // `vl ws rm` takes them; a new workspace of the same name starts from the real folders.
+    run_out(&t, &["agent", "--", "sh", "-c", "echo b > ~/.cargo/mark"]);
+    t.env.ok("alice", &t.proj, &["ws", "rm", "agent"]);
+    assert!(!dir.exists() && !t.proj.join(".veil/local/sandboxes/agent").exists());
+    t.env.ok("alice", &t.proj, &["ws", "new", "agent", "-r", "@-"]);
+    let out = run_out(&t, &["agent", "--", "sh", "-c", "cat ~/.cargo/mark 2>&1; true"]);
+    assert!(out.contains("No such file"), "{out}");
+    // A `chmod` in a run is undone at the next run's set-up.
+    run_out(&t, &["agent", "--", "sh", "-c", "chmod 777 ~/.cargo; chmod 666 ~/.claude.json; echo x > ~/.cargo/y"]);
+    run_out(&t, &["agent", "--", "true"]);
+    for e in std::fs::read_dir(layers(&t, "agent")).unwrap().flatten() {
+        let p = e.path();
+        match p.is_dir() {
+            true => assert!(mode(&p) == 0o700 && mode(&p.join("upper")) == 0o700 && mode(&p.join("work")) == 0o700, "{p:?}"),
+            false => assert_eq!(mode(&p), 0o600, "{p:?}"),
+        }
+    }
+    // An allowed executable file stays executable in its copy.
+    let tool = t.env.dir("bin").join("tool-1025");
+    std::fs::write(&tool, "#!/bin/sh\necho tool-1025-ran\n").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let tl = tool.display().to_string();
+    assert_eq!(run_out(&t, &["agent", "--allow", &tl, "--", &tl]), "tool-1025-ran\n");
+    let copy = std::fs::read_dir(layers(&t, "agent")).unwrap().flatten().find(|e| e.file_name().to_string_lossy().starts_with("tool-1025-")).unwrap().path();
+    assert_eq!(mode(&copy), 0o700);
+}
+
+/// A throwaway sandbox, and a run given secrets, keep nothing of what they
+/// wrote to the allow-list: an injected secret copied there is gone.
+#[test]
+fn throwaway_and_injected_runs_keep_no_writes() {
+    let t = T::new();
+    agent_home(&t);
+    let tmp = t.env.root.join("tmp");
+    for args in [&["--ephemeral"][..], &["agent", "--with-isolated"]] {
+        let mut all = args.to_vec();
+        all.extend(["--", "sh", "-c", "cat .netrc > ~/.claude/stash 2>/dev/null; cat .netrc >> ~/.claude.json 2>/dev/null; echo w > ~/.cargo/w; cat ~/.cargo/w"]);
+        assert_eq!(run_out(&t, &all), "w\n", "{args:?}");
+        let left: Vec<String> = std::fs::read_dir(&tmp).map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+        assert!(left.is_empty(), "{args:?}: left in TMPDIR: {left:?}");
+    }
+    for args in [&["--ephemeral"][..], &["agent"]] {
+        let mut all = args.to_vec();
+        all.extend(["--", "sh", "-c", "cat ~/.claude/stash ~/.cargo/w 2>&1; cat ~/.claude.json"]);
+        let out = run_out(&t, &all);
+        assert!(!out.contains("isolated-value") && !out.contains("w\n") && out.contains(SETTINGS.trim()), "{args:?}: {out}");
+    }
+    assert_eq!(holding(&t.proj.join(".veil/local/sandboxes"), "isolated-value"), Vec::<PathBuf>::new());
+}
+
+/// Where overlayfs does not work, the allow-list is read-only, the run
+/// still happens, and `vl` (and `vl doctor`) say what that breaks.
+#[test]
+fn without_overlayfs_the_allow_list_is_read_only_and_vl_says_so() {
+    let t = T::new();
+    agent_home(&t);
+    let real = std::env::split_paths(&std::env::var_os("PATH").unwrap()).map(|d| d.join("bwrap")).find(|p| p.is_file()).unwrap();
+    let fake = t.env.dir("no-overlay");
+    write(
+        &fake,
+        "bwrap",
+        &format!(
+            "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --overlay|--tmp-overlay) echo 'bwrap: Can'\"'\"'t make overlay mount: Operation not permitted' >&2; exit 1;; esac; done\nexec {} \"$@\"\n",
+            real.display()
+        ),
+    );
+    std::fs::set_permissions(fake.join("bwrap"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", fake.display(), std::env::var("PATH").unwrap_or_default());
+    for args in [&["agent"][..], &["--ephemeral"]] {
+        let mut all = vec!["ws", "exec"];
+        all.extend_from_slice(args);
+        all.extend(["--", "sh", "-c", "cat ~/.claude.json; echo x > ~/.claude/new; echo end"]);
+        let o = t.cmd(&t.proj, &all).env("PATH", &path).stdin(Stdio::null()).output().unwrap();
+        let out = text(&o);
+        assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).ends_with("end\n"), "{args:?}: {out}");
+        assert!(out.contains("the allow-list is read-only in this run") && out.contains("overlay mount") && out.contains("cargo cannot download crates"), "{args:?}: {out}");
+        assert!(out.contains("Read-only file system"), "{args:?}: {out}");
+    }
+    let out = text(&t.cmd(&t.proj, &["doctor"]).env("PATH", &path).output().unwrap());
+    assert!(out.contains("allow-list: read-only, overlayfs does not work here"), "{out}");
+    // A layer that cannot be used is named as the cause, not overlayfs.
+    run_out(&t, &["agent", "--", "true"]);
+    let cargo = std::fs::read_dir(layers(&t, "agent")).unwrap().flatten().find(|e| e.file_name().to_string_lossy().starts_with("cargo-")).unwrap().path();
+    veil_core::vfs::remove_tree(&cargo.join("work")).unwrap();
+    std::fs::write(cargo.join("work"), "not a folder").unwrap();
+    let o = t.exec(&["agent", "--", "true"]);
+    let out = text(&o);
+    assert!(o.status.success() && out.contains("the allow-list is read-only in this run") && out.contains("work"), "{out}");
+    assert!(!out.contains("overlayfs does not work"), "the warning blamed overlayfs: {out}");
+    let out = text(&t.cmd(&t.proj, &["doctor"]).output().unwrap());
+    assert!(out.contains("allow-list: writable"), "{out}");
+}
+
+// ---- Verification of the layers: BUG-1030 to BUG-1033 ---------------------
+
+/// Whatever a run leaves in its layer at a masked path (a folder, a link to
+/// an outside canary, a file, a FIFO), the masks hold in the next run once
+/// the real files exist, the layers still mount (no read-only fallback),
+/// and nothing outside is touched.
+#[test]
+fn bug_1030_masks_hold_and_the_layers_mount_whatever_a_run_left_at_a_masked_path() {
+    for shape in ["mkdir -p \"$p/sub\" && echo mine > \"$p/sub/f\"", "ln -s CANARY \"$p\"", "echo mine > \"$p\"", "mkfifo \"$p\""] {
+        let t = T::new();
+        std::fs::remove_file(t.home.join(".cargo/credentials.toml")).unwrap();
+        let canary = t.env.dir("mask-canary");
+        write(&canary, "keep", "canary\n");
+        let shape = shape.replace("CANARY", &canary.display().to_string());
+        run_out(&t, &["agent", "--", "sh", "-c", &format!("for p in ~/.cargo/credentials ~/.cargo/credentials.toml; do {shape}; done; echo kept > ~/.cargo/w")]);
+        // The real credentials appear afterwards (`cargo login`).
+        write(&t.home, ".cargo/credentials", CARGO_TOKEN);
+        write(&t.home, ".cargo/credentials.toml", CARGO_TOKEN);
+        let before = snapshot(&canary, &[]);
+        for _ in 0..2 {
+            let o = t.exec(&["agent", "--", "sh", "-c", "cat ~/.cargo/credentials ~/.cargo/credentials.toml ~/.cargo/credentials/sub/f; ls -la ~/.cargo/; cat ~/.cargo/w; echo x >> ~/.cargo/w; echo end"]);
+            let out = text(&o);
+            assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).ends_with("end\n"), "{shape}: {out}");
+            assert!(!out.contains(CARGO_TOKEN), "{shape}: the credentials showed: {out}");
+            assert!(!out.contains("read-only in this run") && !out.contains("Read-only"), "{shape}: the layers did not mount: {out}");
+            assert!(String::from_utf8_lossy(&o.stdout).contains("kept\n"), "{shape}: the layer was lost: {out}");
+        }
+        assert_eq!(snapshot(&canary, &[]), before, "{shape}: the canary changed");
+    }
+}
+
+/// Run `script` in workspace `agent`, then `vl undo` until the workspace
+/// is gone (its sandbox directory stays), and make `agent` again.
+fn undo_and_make_again(t: &T, script: &str) {
+    run_out(t, &["agent", "--", "sh", "-c", script]);
+    for _ in 0..8 {
+        if !t.env.stdout("alice", &t.proj, &["ws", "list"]).contains("agent") {
+            break;
+        }
+        t.env.ok("alice", &t.proj, &["undo"]);
+    }
+    assert!(!t.env.stdout("alice", &t.proj, &["ws", "list"]).contains("agent"), "the workspace is still there");
+    assert!(t.proj.join(".veil/local/sandboxes/agent").exists(), "the test needs the old sandbox to stay");
+    t.env.ok("alice", &t.proj, &["ws", "new", "agent", "-r", "@-"]);
+}
+
+/// A workspace removed by `vl undo`, then made again under its name, is
+/// another workspace: it never sees the first one's layers.
+#[test]
+fn bug_1031_a_new_workspace_of_the_same_name_never_sees_the_old_ones_layers() {
+    let t = T::new();
+    agent_home(&t);
+    let canary = t.env.dir("old-canary");
+    write(&canary, "keep", "canary\n");
+    undo_and_make_again(&t, &format!("echo OLD-LAYER-77b1 > ~/.claude/x; ln -s {}/keep ~/.claude/link", canary.display()));
+    let before = snapshot(&canary, &[]);
+    let out = run_out(&t, &["agent", "--", "sh", "-c", "cat ~/.claude/x ~/.claude/link 2>&1; echo end"]);
+    assert!(!out.contains("OLD-LAYER-77b1") && !out.contains("canary"), "the new workspace saw the old one's layer: {out}");
+    assert_eq!(snapshot(&canary, &[]), before, "setting the old layers aside followed a link");
+    // Its own layers work as usual.
+    run_out(&t, &["agent", "--", "sh", "-c", "echo NEW-LAYER-5c0e > ~/.claude/x"]);
+    assert_eq!(run_out(&t, &["agent", "--", "sh", "-c", "cat ~/.claude/x"]), "NEW-LAYER-5c0e\n");
+}
+
+/// The same for the sandbox's files: the first workspace's unrecorded (here
+/// quarantined) work is kept aside whole, never shown to or recorded in the
+/// new one.
+#[test]
+fn bug_1033_a_new_workspace_of_the_same_name_never_gets_the_old_ones_files() {
+    let t = T::new();
+    undo_and_make_again(&t, "echo 'aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY' > creds.txt");
+    let out = run_out(&t, &["agent", "--", "sh", "-c", "cat creds.txt 2>&1; echo end"]);
+    assert!(!out.contains("EXAMPLEKEY"), "the new workspace saw the old one's files: {out}");
+    assert!(t.cat("creds.txt").is_none(), "the old workspace's files were recorded in the new one");
+    // They are kept, whole, for you to look at.
+    let kept: Vec<_> = std::fs::read_dir(t.proj.join(".veil/local/sandboxes/agent")).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("unrecorded-")).collect();
+    assert_eq!(kept.len(), 1, "{out}");
+    assert!(kept[0].path().join("creds.txt").exists());
+}
+
+/// An allowed socket or FIFO is bound as it is: reachable, never opened or
+/// copied by `vl`, and the rest of the allow-list keeps its layers.
+#[test]
+fn bug_1032_an_allowed_socket_or_fifo_is_bound_as_it_is() {
+    let t = T::new();
+    let ipc = t.env.dir("ipc");
+    let sock = ipc.join("s.sock");
+    let _l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let fifo = ipc.join("f.fifo");
+    assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    let (s, f) = (sock.display().to_string(), fifo.display().to_string());
+    let script = format!("test -S {s} && echo SOCK; test -p {f} && echo FIFO; echo x > ~/.cargo/w && cat ~/.cargo/w");
+    for ws in [&["agent"][..], &["--ephemeral"]] {
+        let mut args = ws.to_vec();
+        args.extend(["--allow", &s, "--allow", &f, "--", "sh", "-c", &script]);
+        let o = exec_deadline(&t, &args, &[], 30).unwrap_or_else(|| panic!("{ws:?}: vl hung"));
+        let out = text(&o);
+        assert!(o.status.success() && String::from_utf8_lossy(&o.stdout) == "SOCK\nFIFO\nx\n", "{ws:?}: {out}");
+        assert!(!out.contains("read-only in this run"), "{ws:?}: {out}");
+    }
+}
+
+/// Every directory and file under `dir` with its extended attributes
+/// (links not followed), one per line, sorted.
+fn xattrs(dir: &Path) -> String {
+    let script = "import os, sys\nfor r, ds, fs in os.walk(sys.argv[1]):\n    for n in ds + fs:\n        p = os.path.join(r, n)\n        try:\n            print(p, sorted((a, os.getxattr(p, a, follow_symlinks=False)) for a in os.listxattr(p, follow_symlinks=False)))\n        except OSError as e:\n            print(p, 'errno', e.errno)\n";
+    let o = Command::new("python3").args(["-I", "-c", script]).arg(dir).output().unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    let mut lines: Vec<String> = String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect();
+    lines.sort();
+    lines.join("\n")
+}
+
+/// Unusual changes to the allow-list (renames across layers and into the
+/// project, hard links, delete and recreate, a file made a folder or a
+/// link, extended attributes, overlayfs's own attributes) change only the
+/// workspace's layers: the real folders keep every byte, mode, mtime and
+/// attribute, and the next run sees what the last one left.
+#[test]
+fn unusual_changes_to_the_allow_list_leave_the_real_folders_as_they_were() {
+    let t = T::new();
+    agent_home(&t);
+    write(&t.home, ".claude/projects/p/a.jsonl", "a\n");
+    write(&t.home, ".cargo/registry/cache/c.crate", "crate\n");
+    let attr = |p: &str, name: &str| format!("python3 -I -c \"import os; os.setxattr(os.path.expanduser('{p}'), '{name}', b'v')\"");
+    let script = [
+        "mv ~/.cargo/registry ~/.claude/moved-registry".to_string(),
+        "mv ~/.claude/projects/p/a.jsonl ./a-moved.jsonl".into(),
+        "mv ~/.claude.json ~/.claude/json-moved".into(),
+        "ln ~/.cargo/bin/tool ~/.claude/hard; ln ~/.claude/settings.json ~/.claude/hard2".into(),
+        "rm ~/.claude/settings.json; echo new > ~/.claude/settings.json".into(),
+        "rm ~/.codex/config.toml; mkdir ~/.codex/config.toml".into(),
+        "rm -rf ~/.claude/projects; ln -s /etc ~/.claude/projects".into(),
+        attr("~/.claude/hard2", "user.veil"),
+        attr("~/.cargo/bin/tool", "user.veil"),
+        attr("~/.claude.json", "user.veil"),
+        attr("~/.cargo", "user.overlay.opaque"),
+        attr("~/.claude/settings.json", "user.overlay.redirect"),
+        "chmod 000 ~/.cargo/bin; truncate -s 0 ~/.claude.json; touch -d 2000-01-01 ~/.claude".into(),
+    ]
+    .iter()
+    .map(|c| format!("( {c} ) 2>/dev/null;"))
+    .collect::<Vec<_>>()
+    .join(" ");
+    let before = (snapshot(&t.home, &[]), xattrs(&t.home));
+    for args in [&["agent"][..], &["--ephemeral"]] {
+        let mut all = args.to_vec();
+        all.extend(["--", "sh", "-c", &script]);
+        run_out(&t, &all);
+    }
+    assert_eq!((snapshot(&t.home, &[]), xattrs(&t.home)), before, "a real allowed folder changed");
+    let out = run_out(&t, &["agent", "--", "sh", "-c", "cat ~/.claude/settings.json; test -d ~/.codex/config.toml && echo dir; cat ~/.claude/moved-registry/cache/c.crate; ls ~/.cargo/registry 2>&1; true"]);
+    assert!(out.starts_with("new\ndir\ncrate\n") && out.contains("No such file"), "the next run did not see the last one's changes: {out}");
+    assert_eq!(t.cat("a-moved.jsonl").as_deref(), Some("a\n"));
+}
+
+/// Workspaces running at once each write the same allowed paths: each sees
+/// only its own writes, then and in its next run, and the real folders
+/// none of them.
+#[test]
+fn concurrent_workspaces_keep_their_own_layers() {
+    let t = T::new();
+    agent_home(&t);
+    let n = 4;
+    for i in 0..n {
+        t.env.ok("alice", &t.proj, &["ws", "new", &format!("w{i}"), "-r", "@-"]);
+    }
+    let before = snapshot(&t.home, &[]);
+    let children: Vec<_> = (0..n)
+        .map(|i| {
+            let script = format!(
+                "echo MINE-{i}-9d3f > ~/.claude/who; echo '{{\"w\":{i}}}' > ~/.claude.json; mkdir -p ~/.cargo/registry/cache && echo MINE-{i}-9d3f > ~/.cargo/registry/cache/c; \
+                 sleep 0.5; cat ~/.claude/who ~/.claude.json ~/.cargo/registry/cache/c"
+            );
+            t.cmd(&t.proj, &["ws", "exec", &format!("w{i}"), "--", "sh", "-c", &script]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()
+        })
+        .collect();
+    for (i, c) in children.into_iter().enumerate() {
+        let o = c.wait_with_output().unwrap();
+        assert!(o.status.success(), "w{i}: {}", text(&o));
+        assert_eq!(String::from_utf8_lossy(&o.stdout), format!("MINE-{i}-9d3f\n{{\"w\":{i}}}\nMINE-{i}-9d3f\n"), "w{i}");
+    }
+    for i in 0..n {
+        let out = run_out(&t, &[&format!("w{i}"), "--", "sh", "-c", "cat ~/.claude/who ~/.claude.json ~/.cargo/registry/cache/c"]);
+        assert_eq!(out, format!("MINE-{i}-9d3f\n{{\"w\":{i}}}\nMINE-{i}-9d3f\n"), "w{i} next run");
+    }
+    assert_eq!(snapshot(&t.home, &[]), before, "a real allowed folder changed");
 }

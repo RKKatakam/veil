@@ -37,7 +37,7 @@ impl Env {
 
     pub fn cmd(&self, user: &str, cwd: &Path, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_vl"));
-        c.args(args)
+        c.env("VEIL_TEST_PATH_REMOTES", "1").args(args)
             .current_dir(cwd)
             .env("VEIL_HOME", self.root.join(format!("home-{user}")))
             .env("VEIL_USER", user)
@@ -129,7 +129,6 @@ pub fn file(name: &str, id: ObjectId) -> TreeEntry {
         size: 0,
         executable: false,
         visibility: Visibility::Public,
-        fallback: None,
     }
 }
 
@@ -163,14 +162,13 @@ pub fn evil_remote_on_disk(dest: &Path, description: &str, tags: &[&str], build:
             timestamp: 1,
             predecessors: vec![],
             conflicts: vec![],
-            cloak: None,
             signature: None,
             embargo: None,
         })
         .unwrap();
     let mut tx = r.transaction("evil").unwrap();
     for t in tags {
-        tx.view.tags.insert(t.to_string(), Tag::new(s, None));
+        tx.view.tags.insert(t.to_string(), Tag::new(s));
     }
     tx.view.heads.insert(s);
     tx.commit().unwrap();

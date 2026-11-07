@@ -15,7 +15,7 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
 use crate::{
-    proc::{self, check_stop, du, free_bytes, remove_tree, Outcome, VlEnv},
+    proc::{check_stop, du, free_bytes, remove_tree, Outcome, VlEnv},
     trace::{self, TraceSummary},
 };
 
@@ -27,8 +27,6 @@ pub struct Options {
     pub timeout: Duration,
     /// Stop when free disk would drop below this many bytes.
     pub min_free: u64,
-    pub rtts: Vec<u64>,
-    pub sftp_server: Option<PathBuf>,
     pub skip: Vec<String>,
 }
 
@@ -103,10 +101,6 @@ impl<'a> Case<'a> {
     }
     pub fn traced(mut self) -> Self {
         self.trace = true;
-        self
-    }
-    pub fn env(mut self, k: &str, v: &str) -> Self {
-        self.env.push((k.into(), v.into()));
         self
     }
 }
@@ -415,63 +409,6 @@ pub fn local(b: &mut Bench, label: &str, trace: bool) -> Result<()> {
     Ok(())
 }
 
-/// Push, clone and pull through a path remote or SFTP.
-pub fn remote(b: &mut Bench, kind: &str, rtt_ms: u64, trace: bool) -> Result<()> {
-    let repo = b.repo.clone();
-    let name = if rtt_ms > 0 { format!("{kind}-{rtt_ms}ms") } else { kind.to_string() };
-    let remote_dir = b.dir.join(format!("remote-{name}"));
-    let clone_parent = b.dir.join(format!("clone-{name}"));
-    remove_tree(&remote_dir, &b.dir)?;
-    remove_tree(&clone_parent, &b.dir)?;
-    let url = match kind {
-        "path" => s(&remote_dir),
-        _ => format!("bench@example.invalid:{}", remote_dir.display()),
-    };
-    let group = format!("remote: {name}");
-    let g = group.as_str();
-    let rtt = rtt_ms.to_string();
-    let store = b.manifest["store_disk_bytes_loose"].as_u64().unwrap_or(2_000_000_000);
-    let tree = b.manifest["tree_disk_bytes"].as_u64().unwrap_or(1_000_000_000);
-    b.preflight(&format!("push to {name}"), store)?;
-    let _ = b.env.run(&repo, &["remote", "rm", "bench"], false);
-    b.vl_ok(&repo, &["remote", "add", "bench", &url])?;
-    let t = |c| traced_if(c, trace);
-    let r = b.case(Case::new("push, initial (all tags)", g, &repo, &["push", "bench"]).runs(1).env("VEIL_BENCH_RTT_MS", &rtt), |_, _| Ok(()))?;
-    if r.get("ok") != Some(&json!(true)) {
-        let _ = b.env.run(&repo, &["remote", "rm", "bench"], false);
-        remove_tree(&remote_dir, &b.dir)?;
-        return Ok(());
-    }
-    let (rb, rf) = du(&remote_dir);
-    b.note(format!("{name} remote after the initial push: {:.2} GB in {} files", rb as f64 / 1e9, rf));
-    b.case(t(Case::new("push, nothing new", g, &repo, &["push", "bench"]).env("VEIL_BENCH_RTT_MS", &rtt)), |_, _| Ok(()))?;
-    b.case(t(Case::new("push, 1 new snapshot", g, &repo, &["push", "bench"]).env("VEIL_BENCH_RTT_MS", &rtt)), |b, _| {
-        b.dirty(1)?;
-        b.vl_ok(&b.repo.clone(), &["commit", "-m", "one more"])?;
-        Ok(())
-    })?;
-    b.preflight(&format!("clone from {name}"), rb + tree)?;
-    std::fs::create_dir_all(&clone_parent)?;
-    let clone = clone_parent.join("c");
-    b.case(Case::new("clone, full", g, &clone_parent, &["clone", &url, "c"]).runs(1).env("VEIL_BENCH_RTT_MS", &rtt), |_, _| Ok(()))?;
-    if clone.join(".veil").exists() {
-        let (cb, _) = du(&clone);
-        b.note(format!("{name} clone: {:.2} GB on disk", cb as f64 / 1e9));
-        b.case(t(Case::new("pull, 1 new snapshot", g, &clone, &["pull"]).env("VEIL_BENCH_RTT_MS", &rtt)), |b, _| {
-            b.dirty(1)?;
-            let repo = b.repo.clone();
-            b.vl_ok(&repo, &["commit", "-m", "for pull"])?;
-            b.env.ok(&repo, &["push", "bench"]).map(|_| ())
-        })?;
-        b.case(Case::new("pull, nothing new", g, &clone, &["pull"]).env("VEIL_BENCH_RTT_MS", &rtt), |_, _| Ok(()))?;
-        b.case(Case::new("status in clone, clean", g, &clone, &["status"]), |_, _| Ok(()))?;
-    }
-    remove_tree(&clone_parent, &b.dir)?;
-    let _ = b.env.run(&repo, &["remote", "rm", "bench"], false);
-    remove_tree(&remote_dir, &b.dir)?;
-    Ok(())
-}
-
 /// Push, clone and pull through the Veil server (`server`: started by the
 /// caller; the repository's identity signs in as the project's admin, so
 /// it may push the history it signed). Every case records the client's
@@ -623,45 +560,6 @@ pub fn gc_incremental(b: &mut Bench) -> Result<()> {
     Ok(())
 }
 
-/// Write the stand-in `ssh`: it ignores its arguments and runs a local
-/// `sftp-server` (under strace when `VEIL_BENCH_STRACE` is set, behind the
-/// RTT shim when `VEIL_BENCH_RTT_MS` is set).
-pub fn write_fake_ssh(dir: &Path, server: &Path, me: &Path) -> Result<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    let p = dir.join("fake-ssh");
-    let script = format!(
-        "#!/bin/sh\n# veil-bench stand-in for ssh: speaks SFTP on stdio with a local sftp-server.\n\
-         S='{server}'\n\
-         if [ -n \"$VEIL_BENCH_STRACE\" ]; then\n  set -- strace -f -qq -ttt -y -e trace={sys} -e signal=none -o \"$VEIL_BENCH_STRACE.sftp.$$\" \"$S\"\nelse\n  set -- \"$S\"\nfi\n\
-         if [ -n \"$VEIL_BENCH_RTT_MS\" ] && [ \"$VEIL_BENCH_RTT_MS\" != 0 ]; then\n  exec '{me}' sftp-shim --rtt-ms \"$VEIL_BENCH_RTT_MS\" -- \"$@\"\nfi\n\
-         exec \"$@\"\n",
-        server = server.display(),
-        me = me.display(),
-        sys = proc::STRACE_SYSCALLS,
-    );
-    std::fs::write(&p, script)?;
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))?;
-    Ok(p)
-}
-
-pub fn sftp_server() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("VEIL_TEST_SFTP_SERVER") {
-        return Some(PathBuf::from(p));
-    }
-    [
-        "/usr/lib/openssh/sftp-server",
-        "/usr/libexec/openssh/sftp-server",
-        "/usr/libexec/sftp-server",
-        "/usr/lib/ssh/sftp-server",
-        "/usr/local/libexec/sftp-server",
-        "/opt/homebrew/libexec/sftp-server",
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .find(|p| p.exists())
-}
-
-/// Machine and build facts every result records (threat 2).
 pub fn machine_facts(vl: &Path, src: Option<&Path>) -> Value {
     let sh = |c: &str| {
         Command::new("sh").arg("-c").arg(c).output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default()

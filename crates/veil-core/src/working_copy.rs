@@ -47,8 +47,7 @@ pub const CHECKOUT_STATE_PATH: &str = ".veil/local/checkout.json";
 
 /// Which workspace the project directory is attached to, which snapshot was
 /// last materialised there, and what was materialised from what (files left
-/// out because they were unreadable, files written from an embargo fallback;
-/// see [`Materialised`]). Device-local.
+/// out because they were unreadable; see [`Materialised`]). Device-local.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct CheckoutState {
     pub workspace: String,

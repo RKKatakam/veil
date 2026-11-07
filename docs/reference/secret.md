@@ -3,7 +3,7 @@
 
 # `vl secret`
 
-Encrypted secrets: the device-local vault, or a scope's team vault (`--scope`), shared with the scope's members through team remotes
+Encrypted secrets: the device-local vault, or a scope's team vault (`--scope`), sealed for the scope's members (it does not sync through the Veil server yet)
 
 Subcommands:
 
@@ -34,7 +34,7 @@ Options:
 
 | | |
 |---|---|
-| `--scope <SCOPE>` | Store it in this scope's team vault (sealed for its members, pushed to team remotes) instead of the local vault |
+| `--scope <SCOPE>` | Store it in this scope's team vault (sealed for its members) instead of the local vault |
 
 ## `vl secret get`
 

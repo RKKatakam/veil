@@ -51,25 +51,3 @@ fn doctor_removes_stale_takeover_guards() {
     let again = text(&env.vl("alice", &proj, &["doctor"]));
     assert!(!again.contains("lock.steal"), "{again}");
 }
-
-/// `vl doctor --remotes` lists the push uploads a remote holds unpublished
-/// for more than a day, with their size; fresh ones are not listed.
-#[test]
-fn doctor_lists_old_push_staging_on_a_remote() {
-    let env = Env::new();
-    let proj = env.project("alice", "proj", &[("a.txt", "a\n")]);
-    let hub = env.dir("hub");
-    env.ok("alice", &proj, &["remote", "add", "origin", hub.to_str().unwrap()]);
-    env.ok("alice", &proj, &["push"]);
-    let day = 24 * 3600 * 1000;
-    let now = veil_core::now_millis();
-    for (name, age) in [("old", 3 * day), ("new", 60_000)] {
-        let dir = hub.join(format!(".veil/objects/incoming/push-{name}0000000000000000000000000000a"));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("touched"), (now - age).to_string()).unwrap();
-        std::fs::write(dir.join("pack-x.pack"), vec![7u8; 4096]).unwrap();
-    }
-    let out = text(&env.vl("alice", &proj, &["doctor", "--remotes"]));
-    assert!(out.contains("1 unpublished push upload(s)") && out.contains("push-old") && out.contains("3 days old"), "{out}");
-    assert!(!out.contains("push-new"), "{out}");
-}

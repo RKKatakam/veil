@@ -1,6 +1,6 @@
 # Git-parity round: build plan
 
-> **Access model:** written for today's client, which restricts paths by cloaking them for a *scope*. With the server, access is the ordinary model in `docs/VISIBILITY.md` (admins, private by default, groups and managers, folder access, `public`): cloaked paths become private folders, and only secrets and embargoed changes are encrypted.
+> **Access model:** written for the client of that round, which also restricted paths by cloaking them for a *scope*. Repository format 8 removed that, with every other non-secret encryption: only secret files (`.env`, keys) are encrypted, and access is the ordinary model in `docs/VISIBILITY.md` (admins, private by default, groups and managers, folder access, `public`).
 
 From `integration` @ aa78e6d. The feature designs and threat reviews are in `1-…md` to `7-…md` in this directory (features 4, 5b, 8 and 9, Git interop, were removed on 2026-11-05: Veil does not interoperate with Git). Every builder brief must append its feature's "Threat review" list. Each numbered point is a required test (property or hostile-input), and the adversarial pass starts from the same lists.
 
@@ -31,12 +31,12 @@ One bump, `REPO_FORMAT = 5`, `min_vl_for_format(5)` = this round's release. It f
 3. **New object `veil:atag\n`**, encoding byte `{` (canonical JSON):
    `{name, target, kind:"annotated", message: Text, tagger, timestamp, signature?}`.
    - The signature is over the unsigned id, with the new context `SIG_CONTEXT_TAG = "tag"` (added to `crypto/domains.rs` and the CRYPTO.md tables; a new signed body that never changes).
-   - It is withheld from public remotes when the tag is cloaked.
 4. **View** (operations, remote views): `Tag.annotation: Option<ObjectId>`, omitted when empty. A format-4 vl never sees them, because it refuses the repository and the remote.
 5. **Upgrade `4 → 5`:** no step (nothing is rewritten; ids and signatures are kept). `vl upgrade --remote` as usual.
 6. **Fixtures:** `tests/fixtures/format-5/`, generated once with `generate.sh <vl> <out> <format-4 set>`. It holds:
    - a public symlink, a symlink inside a cloaked directory (sealed target), and an absolute-target symlink;
    - an annotated signed tag and a cloaked annotated tag;
+   - (format 8 no longer reads format 5, and removed the cloaking of directories and tags: these fixtures stay as the record of format 5);
    - a link/file conflict;
    - the `upgraded/` set.
    - `encodings.txt` gains: a binary tree with a symlink, a conflict with a symlink term, and an atag.

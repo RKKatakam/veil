@@ -269,7 +269,7 @@ fn prune_with_clock_steps_beside_writers_keeps_everything_reachable() {
                 let ws = format!("w{w}");
                 if !r.view().workspaces.contains_key(&ws) {
                     let root = r.root_id();
-                    r.create_workspace(&ws, vec![root], None).unwrap();
+                    r.create_workspace(&ws, vec![root]).unwrap();
                 }
                 let ov = r.workspace_overlay(&ws).unwrap();
                 ov.write(&p(&format!("f{}.txt", x % 5)), format!("{w} {k} {x}\n").as_bytes()).unwrap();
@@ -347,7 +347,7 @@ fn pruning_memory_is_the_inventory_bits_not_the_objects() {
     let root = raw_tree(tx.repo(), dirs);
     let snap = raw_snapshot(tx.repo(), vec![tx.repo().root_id()], root, "many");
     tx.add_head(snap).unwrap();
-    tx.view.tags.insert("many".into(), veil_core::oplog::Tag::new(snap, None));
+    tx.view.tags.insert("many".into(), veil_core::oplog::Tag::new(snap));
     tx.commit().unwrap();
     gc(&mut repo, &GcOptions::default()).unwrap();
     assert!(ids(&repo).len() > N);
@@ -365,15 +365,15 @@ fn pruning_memory_is_the_inventory_bits_not_the_objects() {
 
 // ---- threat 5: content gc cannot read -----------------------------------------------
 
-/// Bob's clone holds a directory sealed for a scope he lacks: his gc
-/// cannot see what it references, so it deletes nothing that run, and
-/// after Alice grants him the scope he reads it all.
+/// Bob's clone holds a secret sealed for a scope he lacks: his gc deletes
+/// nothing it still needs, and after Alice grants him the scope he reads
+/// it.
 #[test]
 fn gc_that_cannot_open_a_sealed_tree_deletes_nothing() {
     let (mut alice, fs, _) = new_repo("alice");
-    fs.write(&p(".veilpolicy"), b"secrets/ cloak team\n").unwrap();
-    let c = commit_files(&mut alice, &*fs, &[("secrets/key.txt", "s3cr3t-811\n"), ("open.txt", "open\n")], "sealed");
-    alice.set_tag("main", c, None, false).unwrap();
+    fs.write(&p(".veilpolicy"), b"secrets/.env.key cloak team\n").unwrap();
+    let c = commit_files(&mut alice, &*fs, &[("secrets/.env.key", "s3cr3t-811\n"), ("open.txt", "open\n")], "sealed");
+    alice.set_tag("main", c, false).unwrap();
     let team = Arc::new(MemoryBackend::new());
     remote::push(&mut alice, team.clone(), false, &[], false).unwrap();
     let bob_id = Identity::generate("bob");
@@ -393,17 +393,26 @@ fn gc_that_cannot_open_a_sealed_tree_deletes_nothing() {
     alice.keys().grant("team", &bob_id.public_id(), "bob").unwrap();
     remote::push(&mut alice, team.clone(), false, &[], false).unwrap();
     remote::pull(&mut bob, "origin", team).unwrap();
-    assert_eq!(read_at(&bob, &c, "secrets/key.txt"), b"s3cr3t-811\n");
+    assert_eq!(read_at(&bob, &c, "secrets/.env.key"), b"s3cr3t-811\n");
 }
 
 // ---- threat 10: maintenance during `vl upgrade` ------------------------------------
+
+/// `repo.json` of the repository on `fs` set to `format` (a repository an
+/// older vl wrote, holding nothing format 8 removed).
+fn mark_format(fs: &MemoryBackend, format: u32) {
+    let mut cfg = veil_core::repo::read_config(fs).unwrap();
+    cfg.format = format;
+    fs.write(&p(".veil/repo.json"), &serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+}
 
 /// `vl upgrade` takes the gc lease: while maintenance holds it (paused
 /// mid-run), the upgrade waits, and goes on once it is released.
 #[test]
 fn upgrade_waits_for_running_maintenance() {
-    let (repo, fs, id) = new_repo_v5("alice");
+    let (repo, fs, id) = new_repo("alice");
     drop(repo);
+    mark_format(&fs, 7);
     let backend: Arc<dyn StorageBackend> = fs.clone();
     let lease = GcLease::acquire(&backend, false).unwrap().expect("free");
     let up = {
@@ -418,14 +427,17 @@ fn upgrade_waits_for_running_maintenance() {
     assert_fsck_clean(fs.clone(), &id, "after the upgrade");
 }
 
-/// A gc opened before an upgrade re-reads the format under its hold and
-/// stops instead of writing for the old one.
+/// A gc opened before the format changed re-reads it under its hold and
+/// stops instead of writing for another one. (No repository this build
+/// opens can be upgraded under it, so the change is written by hand, then
+/// upgraded back.)
 #[test]
 fn gc_stops_if_the_repository_was_upgraded_since_it_opened() {
-    let (mut repo, fs, id) = new_repo_v5("alice");
+    let (mut repo, fs, id) = new_repo("alice");
     commit_files(&mut repo, &*fs, &[("f", "1\n")], "c");
-    veil_core::upgrade::upgrade(fs.clone(), Some(id.clone()), &Default::default()).unwrap();
+    mark_format(&fs, 7);
     let e = gc(&mut repo, &GcOptions::default()).unwrap_err();
+    veil_core::upgrade::upgrade(fs.clone(), Some(id.clone()), &Default::default()).unwrap();
     assert!(e.to_string().contains("upgraded"), "{e}");
     let mut fresh = open(&fs, &id);
     gc(&mut fresh, &GcOptions::default()).unwrap();
@@ -663,7 +675,7 @@ fn eio_at_any_step_of_maintenance_loses_nothing() {
 fn a_pulls_remote_loose_objects_are_spooled_and_checked() {
     let (mut alice, fs, id) = new_repo("alice");
     let c = commit_files(&mut alice, &*fs, &[("a.txt", "a\n"), ("b.txt", "b\n")], "c");
-    alice.set_tag("main", c, None, false).unwrap();
+    alice.set_tag("main", c, false).unwrap();
     let hub = Arc::new(MemoryBackend::new());
     remote::push(&mut alice, hub.clone(), false, &[], false).unwrap();
     // Unpack the hub: every object loose.
@@ -683,7 +695,7 @@ fn a_pulls_remote_loose_objects_are_spooled_and_checked() {
     assert!(bfs.list_dir(&p(".veil/objects/incoming")).map(|v| v.is_empty()).unwrap_or(true));
     // A corrupt loose object on the remote is not taken.
     let c2 = commit_files(&mut alice, &*fs, &[("c.txt", "c-811\n")], "c2");
-    alice.set_tag("main", c2, None, false).unwrap();
+    alice.set_tag("main", c2, false).unwrap();
     remote::push(&mut alice, hub.clone(), false, &[], false).unwrap();
     let blob_id = ObjectId::hash(&Object::Blob(b"c-811\n".to_vec()).encode());
     let path = p(&format!(".veil/objects/{}/{}", &blob_id.hex()[..2], &blob_id.hex()[2..]));
@@ -696,26 +708,3 @@ fn a_pulls_remote_loose_objects_are_spooled_and_checked() {
 }
 
 // ---- threat 14: two gcs on a format-5 repository --------------------------------------
-
-/// On a format-5 repository (or remote) an older client's gc holds only
-/// `.veil/lock`: ours takes it too, and waits while it is held.
-#[test]
-fn gc_on_a_format_5_repository_waits_for_an_older_clients_lock() {
-    let (mut repo, fs, id) = new_repo_v5("alice");
-    commit_files(&mut repo, &*fs, &[("f", "1\n")], "c");
-    drop(repo);
-    let backend: Arc<dyn StorageBackend> = fs.clone();
-    let old_client = veil_core::lock::RepoLock::acquire(backend.clone()).unwrap();
-    let ours = {
-        let (fs, id) = (fs.clone(), id.clone());
-        std::thread::spawn(move || {
-            let mut r = open(&fs, &id);
-            gc(&mut r, &GcOptions::default())
-        })
-    };
-    std::thread::sleep(Duration::from_millis(300));
-    assert!(!ours.is_finished(), "our gc ran beside the older client's");
-    drop(old_client);
-    ours.join().unwrap().unwrap();
-    assert_fsck_clean(fs.clone(), &id, "after gc on format 5");
-}

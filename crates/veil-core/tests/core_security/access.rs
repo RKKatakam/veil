@@ -1,12 +1,11 @@
 //! Access control and authenticity: signed key rings, key rotation on
-//! revoke, signed embargo records and snapshot signatures. Adversarial cases
+//! revoke and snapshot signatures. Adversarial cases
 //! play the attacker by editing the shared metadata files directly.
 
 use std::sync::Arc;
 
 use serde_json::Value;
 use veil_core::{
-    commands::EmbargoSpec,
     keychain::{KeyRing, Keychain, RingChange, RingMerge, RingOp, Role, SignatureStatus},
     remote,
     revset::resolve,
@@ -75,7 +74,7 @@ fn commit_cloaked(peer: &mut Peer, path: &str, content: &str, msg: &str) -> Obje
     peer.fs.write(&p(path), content.as_bytes()).unwrap();
     peer.repo.snapshot_workspace(WS, &*peer.fs).unwrap();
     let (c, _) = peer.repo.commit_working_copy(WS, msg).unwrap();
-    peer.repo.set_tag("main", c, None, true).unwrap();
+    peer.repo.set_tag("main", c, true).unwrap();
     c
 }
 
@@ -90,7 +89,7 @@ fn team_with_bob() -> (Peer, Identity, Arc<MemoryBackend>) {
     let mut alice = peer("alice");
     let bob = Identity::generate("bob");
     alice.repo.keys().grant("team", &bob.public_id(), "bob").unwrap();
-    commit_cloaked(&mut alice, "secret/plan.md", "v1 plan\n", "v1");
+    commit_cloaked(&mut alice, "secret/.env.plan", "v1 plan\n", "v1");
     let remote = Arc::new(MemoryBackend::new());
     remote::push(&mut alice.repo, remote.clone(), false, &[], false).unwrap();
     (alice, bob, remote)
@@ -142,15 +141,15 @@ fn revoked_member_reads_history_but_not_new_content() {
     let (mut alice, bob, remote) = team_with_bob();
     let v1 = resolve(&alice.repo, "main", WS).unwrap();
     alice.repo.keys().revoke("team", &bob.public_id()).unwrap();
-    let v2 = commit_cloaked(&mut alice, "secret/plan.md", "v2 plan: after revocation\n", "v2");
-    commit_cloaked(&mut alice, "secret/new.md", "brand new\n", "v3");
+    let v2 = commit_cloaked(&mut alice, "secret/.env.plan", "v2 plan: after revocation\n", "v2");
+    commit_cloaked(&mut alice, "secret/.env.new", "brand new\n", "v3");
     let v3 = resolve(&alice.repo, "main", WS).unwrap();
     remote::push(&mut alice.repo, remote.clone(), false, &[], false).unwrap();
 
     let bob_repo = clone_as(&bob, &remote);
-    assert_eq!(read(&bob_repo, &v1, "secret/plan.md").unwrap(), b"v1 plan\n", "history stays readable");
-    assert_eq!(read(&bob_repo, &v2, "secret/plan.md"), None, "changed file uses the new generation");
-    assert_eq!(read(&bob_repo, &v3, "secret/new.md"), None, "new file uses the new generation");
+    assert_eq!(read(&bob_repo, &v1, "secret/.env.plan").unwrap(), b"v1 plan\n", "history stays readable");
+    assert_eq!(read(&bob_repo, &v2, "secret/.env.plan"), None, "changed file uses the new generation");
+    assert_eq!(read(&bob_repo, &v3, "secret/.env.new"), None, "new file uses the new generation");
     assert!(!bob_repo.keys().is_member("team"));
 
     // Bob tampers with his own copy of the ring to re-add himself: the ring
@@ -160,12 +159,12 @@ fn revoked_member_reads_history_but_not_new_content() {
     log.truncate(2); // drop the revocation
     write_json(&**bob_repo.backend(), RING, &v);
     let bob_repo = Repo::open(bob_repo.backend().clone(), Some(bob.clone()), "bob").unwrap();
-    assert_eq!(read(&bob_repo, &v2, "secret/plan.md"), None);
+    assert_eq!(read(&bob_repo, &v2, "secret/.env.plan"), None);
 
     // Members (and Alice) still read everything.
     let alice_clone = clone_as(&alice.id, &remote);
-    assert_eq!(read(&alice_clone, &v1, "secret/plan.md").unwrap(), b"v1 plan\n");
-    assert_eq!(read(&alice_clone, &v2, "secret/plan.md").unwrap(), b"v2 plan: after revocation\n");
+    assert_eq!(read(&alice_clone, &v1, "secret/.env.plan").unwrap(), b"v1 plan\n");
+    assert_eq!(read(&alice_clone, &v2, "secret/.env.plan").unwrap(), b"v2 plan: after revocation\n");
 }
 
 #[test]
@@ -173,13 +172,13 @@ fn members_granted_after_a_rotation_read_all_generations() {
     let (mut alice, bob, remote) = team_with_bob();
     let v1 = resolve(&alice.repo, "main", WS).unwrap();
     alice.repo.keys().revoke("team", &bob.public_id()).unwrap();
-    let v2 = commit_cloaked(&mut alice, "secret/plan.md", "v2\n", "v2");
+    let v2 = commit_cloaked(&mut alice, "secret/.env.plan", "v2\n", "v2");
     let dave = Identity::generate("dave");
     alice.repo.keys().grant("team", &dave.public_id(), "dave").unwrap();
     remote::push(&mut alice.repo, remote.clone(), false, &[], false).unwrap();
     let dave_repo = clone_as(&dave, &remote);
-    assert_eq!(read(&dave_repo, &v1, "secret/plan.md").unwrap(), b"v1 plan\n");
-    assert_eq!(read(&dave_repo, &v2, "secret/plan.md").unwrap(), b"v2\n");
+    assert_eq!(read(&dave_repo, &v1, "secret/.env.plan").unwrap(), b"v1 plan\n");
+    assert_eq!(read(&dave_repo, &v2, "secret/.env.plan").unwrap(), b"v2\n");
 }
 
 #[test]
@@ -339,86 +338,13 @@ fn diverged_rings_keep_the_local_log_and_warn() {
     assert_eq!(members(&alice.repo), vec!["alice", "bob", "fred"]);
 }
 
-// ---- embargo records ------------------------------------------------------
-
-fn embargoed(alice: &mut Peer) -> String {
-    alice.fs.write(&p("auth.rs"), b"v1\n").unwrap();
-    alice.repo.snapshot_workspace(WS, &*alice.fs).unwrap();
-    let (main, _) = alice.repo.commit_working_copy(WS, "v1").unwrap();
-    alice.repo.set_tag("main", main, None, true).unwrap();
-    let ws = alice.repo.ephemeral_workspace(main).unwrap();
-    ws.write("auth.rs", "v2 fix\n").unwrap();
-    let (fix, _) = alice.repo.commit_ephemeral(&ws, "fix").unwrap();
-    let far = veil_core::now_millis() + 7 * 24 * 3600 * 1000;
-    let spec = EmbargoSpec {
-        scope: "team".into(),
-        until: Some(far),
-    };
-    alice.repo.merge(WS, main, vec![fix], "embargoed fix", Some(spec)).unwrap().embargo.unwrap()
-}
-
-#[test]
-fn tampered_embargo_deadline_is_rejected_and_never_auto_releases() {
-    let (mut alice, bob, remote) = team_with_bob();
-    let e = embargoed(&mut alice);
-    let rec = alice.repo.keys().load_embargo(&e).unwrap().unwrap();
-    assert!(matches!(alice.repo.keys().embargo_status(&rec), SignatureStatus::Good { .. }));
-    remote::push(&mut alice.repo, remote.clone(), false, &[], false).unwrap();
-    let mut carol = clone_of("carol", &remote);
-    let path = format!(".veil/meta/embargoes/{e}.json");
-
-    // The attacker moves the deadline into the past on the remote.
-    let mut v = read_json(&*remote, &path);
-    v["until"] = Value::from(1);
-    write_json(&*remote, &path, &v);
-    let rep = remote::pull(&mut carol.repo, "origin", remote.clone()).unwrap();
-    assert!(rep.warnings.iter().any(|w| w.contains(&e)), "{:?}", rep.warnings);
-    assert_ne!(carol.repo.keys().load_embargo(&e).unwrap().unwrap().until, Some(1));
-
-    // A member cloning fresh rejects the record (bad signature), so the
-    // embargo key is never auto-published by their engine.
-    let mut bob_repo = clone_as(&bob, &remote);
-    assert!(bob_repo.keys().load_embargo(&e).unwrap().is_none());
-    assert!(bob_repo.auto_release_embargoes().unwrap().is_empty());
-
-    // Stripping the signature instead: accepted only as an unsigned record,
-    // which is never released automatically.
-    v.as_object_mut().unwrap().remove("signature");
-    write_json(&*remote, &path, &v);
-    let mut bob_repo = clone_as(&bob, &remote);
-    let stripped = bob_repo.keys().load_embargo(&e).unwrap().unwrap();
-    assert_eq!(bob_repo.keys().embargo_status(&stripped), SignatureStatus::Unsigned);
-    assert!(bob_repo.auto_release_embargoes().unwrap().is_empty());
-    assert!(!bob_repo.keys().embargo_released(&e));
-}
-
-#[test]
-fn forged_embargo_release_is_rejected() {
-    let (mut alice, _bob, remote) = team_with_bob();
-    let e = embargoed(&mut alice);
-    remote::push(&mut alice.repo, remote.clone(), false, &[], false).unwrap();
-    let path = format!(".veil/meta/embargoes/{e}.json");
-    let mut v = read_json(&*remote, &path);
-    v["released_key"] = Value::String(hex::encode([7u8; 32]));
-    v["released_at"] = Value::from(5);
-    write_json(&*remote, &path, &v);
-    let rep = remote::pull(&mut alice.repo, "origin", remote.clone()).unwrap();
-    assert!(rep.warnings.iter().any(|w| w.contains("does not match")), "{:?}", rep.warnings);
-    assert!(!alice.repo.keys().embargo_released(&e));
-    // A genuine release propagates.
-    alice.repo.release_embargo(&e).unwrap();
-    remote::push(&mut alice.repo, remote.clone(), false, &[], false).unwrap();
-    let carol = clone_of("carol", &remote);
-    assert!(carol.repo.keys().embargo_released(&e));
-}
-
 // ---- snapshot signatures --------------------------------------------------
 
 #[test]
 fn snapshots_are_signed_and_rebases_are_signed_by_the_rewriter() {
     let (mut alice, bob, remote) = team_with_bob();
     let v1 = resolve(&alice.repo, "main", WS).unwrap();
-    let v2 = commit_cloaked(&mut alice, "secret/more.md", "more\n", "v2");
+    let v2 = commit_cloaked(&mut alice, "secret/.env.more", "more\n", "v2");
     remote::push(&mut alice.repo, remote.clone(), false, &[], false).unwrap();
     let s = alice.repo.snapshot(&v1).unwrap();
     assert_eq!(s.signature_valid(), Some(true));
@@ -492,7 +418,7 @@ fn signature_stripping_and_transplants_are_detected() {
         let mut tx = bad.transaction("plant").unwrap();
         tx.view.tags.insert(
             "evil".into(),
-            veil_core::oplog::Tag::new(bad_id, None),
+            veil_core::oplog::Tag::new(bad_id),
         );
         tx.commit().unwrap();
     }
@@ -574,30 +500,4 @@ fn legacy_rings_and_envelopes_keep_working_and_upgrade_on_first_change() {
     let bob_keys = Keychain::new(fs.clone(), Some(bob), "x".into());
     assert!(bob_keys.has("team"), "Bob keeps generation 0 (history)");
     assert!(!bob_keys.is_member("team"), "but not the new generation");
-}
-
-#[test]
-fn embargo_on_a_legacy_ring_upgrades_it_so_the_record_is_attributable() {
-    use veil_core::{crypto::random_key, identity::wrap_key_legacy as wrap_key, keychain::{key_fingerprint, RingMember}};
-    let fs = Arc::new(MemoryBackend::new());
-    let alice = Identity::generate("alice");
-    let repo = Repo::init_for_clone(fs, Some(alice.clone()), "alice").unwrap();
-    let key = random_key();
-    let mut legacy = KeyRing {
-        scope: "team".into(),
-        key_id: key_fingerprint(&key),
-        ..Default::default()
-    };
-    legacy.members.insert(
-        alice.public_hex(),
-        RingMember {
-            name: "alice".into(),
-            wrapped: wrap_key(&alice.public_key(), &key, "team").unwrap(),
-        },
-    );
-    repo.keys().save_ring(&legacy).unwrap();
-    let id = repo.keys().create_embargo("team", Some(1)).unwrap();
-    assert!(!repo.keys().load_ring("team").unwrap().unwrap().is_legacy());
-    let rec = repo.keys().load_embargo(&id).unwrap().unwrap();
-    assert!(repo.keys().embargo_trusted(&rec));
 }

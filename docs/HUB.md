@@ -47,7 +47,8 @@ Contents:
   access.
 * **Secrets are encrypted** (`.env`, keys), automatically, and follow the
   same folder access. The server never holds a key that opens them.
-  Embargoed changes are encrypted the same way until release.
+  Nothing else is encrypted: embargoed changes are plain text, hidden by
+  the server's permissions until release.
 * **Personal private keys** (`id_rsa`, `id_ed25519`, private `*.pem`) are
   never uploaded.
 * **Pull requests on change ids**, visible only to people who can see every
@@ -62,7 +63,7 @@ Contents:
 * **Git interop** of any kind. Permanent (owner, 2026-11-05).
 * **Offline use, or plain-file remotes** (SFTP, shared drives). The server
   is the only remote.
-* **Encrypting code.** Only secrets and embargoed changes are encrypted.
+* **Encrypting code.** Only secret files (`.env`, keys) are encrypted.
 * **Protecting code from the server's operator.** The server is trusted
   with plain-text code (§3.1).
 * **Protecting a user from their own compromised device.** A device that
@@ -96,7 +97,7 @@ Contents:
                          │ merges, landings        ▲
                          │ history and search      │ caches (per machine, regional)
                          │ indexes                 │
-                         └── deadline worker (embargo release, §8.2)
+                         └── deadline worker (embargo release, §8.2; not built)
 ```
 
 | Component | Does | Built from |
@@ -106,7 +107,7 @@ Contents:
 | **Metadata DB** | People, devices, groups, managers, admins, folder access, branch tips, PRs, review threads, approvals, CI jobs, the audit log | **YugabyteDB** (owner, 2026-11-05: open source, Spanner-style scaling). The schema is PostgreSQL-compatible, so plain **PostgreSQL** runs it for development and CI. A branch move is one conditional `UPDATE` |
 | **Object storage** | File contents, trees and snapshots, each by its BLAKE3 id | S3-compatible; immutable objects, served through caches |
 | **Web client** | Browsing, review, administration | TypeScript UI; `veil-core` in WASM only where a secret is opened (§10) |
-| **Deadline worker** | Notifies or releases embargoes on time | §8.2 |
+| **Deadline worker** | Makes embargoes public at their deadline (not built, not in this round) | §8.2 |
 
 ### 2.2 What each part can see
 
@@ -174,7 +175,7 @@ compromised server reads `billing/`") is out of scope and recorded as such.
 
 | Attacker | Can | Cannot | Mitigations |
 |---|---|---|---|
-| **Someone who breaks into the server** | Read all code and metadata; deny service; change permissions in the DB | Read secrets or unreleased embargoed changes; forge snapshot signatures | Ordinary server hardening, audit log, backups. Secrets and embargo keys never reach it (§6, §8) |
+| **Someone who breaks into the server** | Read all code and metadata; deny service; change permissions in the DB | Read secrets; forge snapshot signatures | Ordinary server hardening, audit log, backups. Secrets' keys never reach it (§6). Unreleased embargoed changes are plain text there, protected by its permissions like any private folder (§8) |
 | **A person without access to a folder** | Read what they were given and `public` | Receive the folder's files, names, history or PRs | Server-side checks on every request (§5.3); one check used everywhere (search, counts, API, agents) |
 | **A person who loses access** | Keep what they already pulled, including secret values | Receive anything new | Server stops serving at once; secret keys rotate; the server lists the secrets to change (§6.4) |
 | **A group manager** | Add and remove people in their groups | Change folder access, make anything public, manage other groups | Server checks role on every change (§5.3) |
@@ -347,8 +348,8 @@ have their own, lower limits.
 
 * `vl clone`, `vl push` and `vl pull` talk to the server; `hub:` URLs
   (`hub:acme/app`, `https://hub.example/acme/app`) name a project.
-* Path and SFTP remotes, which today's client supports, are removed in the
-  simplification pass after the server lands (OVERVIEW.md).
+* Path and SFTP remotes were removed in the simplification pass, part 1
+  (OVERVIEW.md).
 * **Moving an existing repository** onto the server is a push, with the
   upgrade steps of §5.7.
 
@@ -438,13 +439,13 @@ Every check is made by one function on the server, on every request.
 
 From VISIBILITY.md, "Existing repositories":
 
-* paths that today's client cloaks become private folders, with access for
-  the people who could open them; their secrets stay encrypted;
 * `.env` files start syncing, encrypted, only after an explicit upgrade
   step that lists them;
+* a repository from before format 8 that holds encrypted folders,
+  descriptions, tags or embargoes is not upgraded: `vl upgrade` names each
+  thing (FORMAT.md §5);
 * nothing is made public or decrypted silently;
-* `vl cloak`, `vl isolate` and `vl expose` become aliases of `vl access`,
-  or are removed, in the simplification pass.
+* `vl cloak` seals secret files only; `vl access` gives folders to groups.
 
 ---
 
@@ -544,7 +545,7 @@ limit: an agent that is given a secret can use it while it runs.
 ```text
 PullRequest {
   number, target: "main", author,
-  title, body,                          // plain text; encrypted only for an embargoed PR
+  title, body,                          // plain text, an embargoed PR's too
   stack: [ChangeId],                    // the changes under review, bottom first
   revisions: [Revision],                // one per push to the PR
   state: Open | Landed {at, by} | Closed,
@@ -611,44 +612,29 @@ vl merge fix --into main --embargo-for security distro-partners --until 2026-12-
 
 ### 8.1 What exists today
 
-Embargoes are built in today's client (ARCHITECTURE.md §7, CRYPTO.md C7):
+Embargoes are permissions, not encryption (owner, 2026-11-06;
+`docs/VISIBILITY.md`). In the client (ARCHITECTURE.md §7):
 
-* the embargoed merge's content, description and history are encrypted
-  under an embargo key, wrapped for its audience;
-* a signed record commits to the key's fingerprint and the deadline;
-* release publishes the key in the record, and every reader checks it;
-* anything built on the fix stays hidden too; history withheld from others
-  is computed by `remote::embargo_withheld`;
-* release happens on the first `vl` run by a key holder after the deadline,
-  or by `vl embargo release`.
+* an embargoed merge is an ordinary merge with a plain record (its group,
+  its deadline, its release);
+* the merge, the history it brings in and anything built on it are
+  withheld from every push until the release (`remote::embargo_withheld`),
+  and copies out of the embargo are refused;
+* the release is `vl embargo release`, or the deadline passing.
 
-### 8.2 A trusted clock for deadlines
+The server refuses embargoed merges in S1, so they stay on the device until
+released. (Before format 8 the client encrypted embargoed content under an
+embargo key; that is removed, FORMAT.md §5.)
 
-The server runs a **deadline worker**. At the deadline it notifies the
-embargo's key holders, whose `vl` releases and pushes; clients can also
-check deadlines against signed time from the server instead of a local
-clock that may be wrong (the engine's clock is replaceable for this,
-`clock.rs`, ARCHITECTURE.md §13).
+### 8.2 On the server (not built)
 
-An optional **escrow** mode lets the release happen even if no key holder
-is online: the embargo key is also HPKE-wrapped to a separate release
-service, bound to the embargo id and deadline, and that service publishes
-it at the deadline. It needs a new embargo record version and signing
-context (FORMAT.md §4).
-
-### 8.3 On the server
-
-* The groups named (`--embargo-for`) get the fix at once: code, message
-  and history, decrypted on their devices. Everyone else, the public
-  included, sees nothing of it until release.
-* **Embargoed changes stay encrypted on the server**, because they often go
-  to people outside the project (`distro-partners`).
-* Release is a push of the record with its key. The server checks the
-  fingerprint, and from then on the content is ordinary: plain text,
-  merged, indexed and searchable like any other.
+* The groups named (`--embargo-for`) see the merge, its message and its
+  history at once, as plain text behind the server's permissions.
+  Everyone else, the public included, sees nothing of it until release:
+  no snapshot, no name, no count.
+* At the deadline the server makes it public. **A server-side deadline
+  scheduler is not built yet**, and is not part of this round.
 * An embargoed PR exists only for its groups (§7.1).
-* **Landing an embargoed change before release** needs the embargo key, so
-  it runs on a key holder's device or a machine in its groups (§7.5).
 
 ### 8.4 Coordinated disclosure
 
@@ -772,15 +758,15 @@ From OVERVIEW.md:
      what they may see (§4.6);
    * moving existing repositories onto the server (§5.7).
 2. **Then: a simplification pass.** Remove what the server makes
-   unnecessary: plain-file (SFTP and path) remotes, offline assumptions, old
-   storage formats (still readable for `vl upgrade`) and old jargon (cloak,
-   scope, isolate).
+   unnecessary: plain-file (SFTP and path) remotes and offline assumptions
+   (**part 1, done**), old storage formats (still readable for
+   `vl upgrade`) and old jargon (cloak, scope, isolate).
 3. **Then: the server's features, in stages.**
    * fetch on demand (§9.1);
    * server-side history and search (§9.1);
    * landing changes at agent scale (§9.1), proved by the gates of §9.2;
    * PR review and hidden PRs (§7);
-   * the deadline worker and escrow (§8.2), CI on machines (§5.5), the web
+   * the deadline worker (§8.2), CI on machines (§5.5), the web
      client (§10).
 
 What must carry over from today's engine, unchanged in meaning: the object
@@ -1016,14 +1002,13 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
   3 (access lines), 4–6 (hash, canonical decoding, format), 7 (closure:
   every object a push introduces carries the pusher's upload receipt,
   unless the entry at the same path in one of the snapshot's parents names
-  it; that is every object an entry names: its own, its `fallback`, and a
-  conflict's terms, which `fetch` also serves at that path (BUG-834);
+  it; that is every object an entry names: its own and a conflict's
+  terms, which `fetch` also serves at that path (BUG-834);
   anything else, stored or not, gets the answer a missing object gets, so a
   push never confirms a guess of a hidden file or folder: BUG-824),
   8 (§13.6), 10 (every
   new snapshot signed by a registered device key) and 12 (fast-forward
-  unless an admin forces) are built. Cloaked lines and embargoed content
-  are refused in S1. Not built: 9 (the server-side secret scan), 11, 13.
+  unless an admin forces) are built. Embargoed merges are refused in S1. Not built: 9 (the server-side secret scan), 11, 13.
 * **What a push uploads** (`hub::push`, `hub::Introduced`): every new
   snapshot and, at each path where its tree differs from all of its
   parents' trees, the trees down to that path and what the entry there
@@ -1154,7 +1139,7 @@ invite join or the person's own vouch. Server lists are hints.
   from any member's device, in the background; devices are removed with
   `vl identity remove`; pending devices are found by fingerprint, so others
   made under a name never hide the real one, and are bounded per person.
-* **Embargoes and cloaked lines** cannot be pushed to the server yet.
+* **Embargoed merges** cannot be pushed to the server yet.
 * **`--only` clones** cannot move to revisions that changed folders outside
   their directory (§13.5).
 * **A working copy without the project's `.veilpolicy`** (someone who cannot
@@ -1168,8 +1153,9 @@ invite join or the person's own vouch. Server lists are hints.
   history signed by teammates who have not signed in yet is refused until
   they do.
 * The team vault (`vl secret --scope`) does not sync through the server.
-* `vl push --dry-run` and `--delete`, and `pre-push` hooks, are not
-  available for server remotes yet.
+* `vl push --dry-run` and `--delete` were removed with path remotes (the
+  simplification pass, part 1); `pre-push` hooks run before a push to the
+  server.
 
 ### 13.9 Later milestones (not in S1)
 
@@ -1189,11 +1175,12 @@ can run in parallel).
    §9.2.
 5. **Precomputed history and search APIs** (blame, file history, graph,
    search through the API).
-6. **The embargo release service** (deadline worker, escrow, §8.2) and
-   embargoes through the server.
+6. **Embargoes through the server** (permissions, §8.2; the deadline
+   worker is not built yet).
 7. **The web client** (§10).
-8. **The simplification pass:** remove SFTP and path remotes, offline
-   assumptions, cloak/scope jargon (OVERVIEW.md).
+8. **The simplification pass:** remove SFTP and path remotes (part 1,
+   done), every encryption but secret files' (part 2, done: format 8),
+   offline assumptions, cloak/scope jargon (OVERVIEW.md).
 
 ### 13.10 Speed (the OpenScion gates, first measurement)
 

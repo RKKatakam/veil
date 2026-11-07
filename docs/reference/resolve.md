@@ -5,7 +5,7 @@
 
 List unresolved conflicts, or resolve one by keeping one of its versions.
 
-With no `--ours`/`--theirs`/`--base`/`--side`, lists the conflicts of the working copy (or `-r REV`): each version with who can read it. Otherwise each conflict at or below PATHS in the working copy is replaced by the version named, exactly as it is recorded: a version sealed for a scope stays sealed for that scope, and a version with no file removes the path. To combine the versions instead, edit the file: a conflict is resolved once its markers are gone.
+With no `--ours`/`--theirs`/`--base`/`--side`, lists the conflicts of the working copy (or `-r REV`): each version with who can read it. Otherwise each conflict at or below PATHS in the working copy is replaced by the version named, exactly as it is recorded: a secret sealed for a scope stays sealed for that scope, and a version with no file removes the path. To combine the versions instead, edit the file: a conflict is resolved once its markers are gone.
 
 ```text
 vl resolve [OPTIONS] [PATHS]...

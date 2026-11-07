@@ -38,21 +38,21 @@ fn undo_reverts_an_accidental_expose() {
     let proj = env.project(
         "alice",
         "proj",
-        &[(".veilpolicy", "secrets/ cloak team\n"), ("secrets/db.yml", "db-pass-Xk9mQ2vL7pR4\n"), ("README", "hi\n")],
+        &[(".veilpolicy", "secrets/*.pem cloak team\n"), ("secrets/db.pem", "db-pass-Xk9mQ2vL7pR4\n"), ("README", "hi\n")],
     );
-    assert!(tier_of(&recorded(&env, &proj, "@-"), "secrets/db.yml").unwrap().starts_with("cloak"));
+    assert!(tier_of(&recorded(&env, &proj, "@-"), "secrets/db.pem").unwrap().starts_with("cloak"));
     write(&proj, "README", "hi there\n");
     env.ok("alice", &proj, &["commit", "-m", "readme"]);
-    env.ok("alice", &proj, &["expose", "secrets/", "--force"]);
-    assert_eq!(tier_of(&recorded(&env, &proj, "@"), "secrets/db.yml").as_deref(), Some("public"));
+    env.ok("alice", &proj, &["expose", "secrets/*.pem", "--force"]);
+    assert_eq!(tier_of(&recorded(&env, &proj, "@"), "secrets/db.pem").as_deref(), Some("public"));
 
     let undo = env.ok("alice", &proj, &["undo"]);
     let after = recorded(&env, &proj, "@");
     assert!(
-        tier_of(&after, "secrets/db.yml").is_some_and(|t| t.starts_with("cloak")),
-        "after `vl undo` ({}): secrets/db.yml is {:?}; .veilpolicy = {:?}",
+        tier_of(&after, "secrets/db.pem").is_some_and(|t| t.starts_with("cloak")),
+        "after `vl undo` ({}): secrets/db.pem is {:?}; .veilpolicy = {:?}",
         undo.trim(),
-        tier_of(&after, "secrets/db.yml"),
+        tier_of(&after, "secrets/db.pem"),
         read(&proj, ".veilpolicy")
     );
 }

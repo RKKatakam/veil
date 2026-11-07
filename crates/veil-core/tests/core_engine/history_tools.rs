@@ -106,8 +106,8 @@ fn blame_follows_a_rename_only_when_asked() {
 fn blame_through_a_merge_takes_the_first_parent_holding_a_line() {
     let (mut r, fs, _) = new_repo("alice");
     let base = commit_files(&mut r, &*fs, &[("f", "1\n2\n3\n")], "base");
-    r.set_tag("main", base, None, false).unwrap();
-    r.create_workspace("side", vec![base], None).unwrap();
+    r.set_tag("main", base, false).unwrap();
+    r.create_workspace("side", vec![base]).unwrap();
     let s1 = commit_in(&mut r, "side", &[("f", "1\n2\n3\nside\n")], "side");
     let ours = commit_files(&mut r, &*fs, &[("f", "top\n1\n2\n3\n")], "ours");
     let m = r.merge(WS, ours, vec![s1], "merge", None).unwrap().snapshot;
@@ -250,21 +250,20 @@ fn octopus_and_criss_cross_histories_visit_each_snapshot_once() {
 struct Cloaked {
     alice: Repo,
     fs: Arc<MemoryBackend>,
-    v1: ObjectId,
     edit: ObjectId,
 }
 
-/// Alice: `README.md` public on `main` (v1), then edited on a cloaked
-/// line (sealed with its last public version as fallback), and a policy-
-/// cloaked `plan.md` edited twice there.
+/// Alice: `README.md` public on `main` (v1), then edited (publicly) in
+/// workspace `p`, and a secret `.env.plan` (sealed for `team` by the
+/// policy) edited twice there.
 fn cloaked() -> Cloaked {
     let (mut alice, fs, _) = new_repo("alice");
-    let v1 = commit_files(&mut alice, &*fs, &[("README.md", "a\nb\nc\n")], "v1");
-    alice.set_tag("main", v1, None, false).unwrap();
-    alice.create_workspace("p", vec![v1], Some(TEAM.into())).unwrap();
-    commit_in(&mut alice, "p", &[("README.md", &format!("a\nb\n{SECRET} 1\nc\n")), ("plan.md", &format!("{SECRET} plan\n"))], "plan");
-    let edit = commit_in(&mut alice, "p", &[("README.md", &format!("a\nb\n{SECRET} 1\nc\n{SECRET} 2\n")), ("plan.md", &format!("{SECRET} plan\n{SECRET} more\n"))], "plan 2");
-    Cloaked { alice, fs, v1, edit }
+    let v1 = commit_files(&mut alice, &*fs, &[("README.md", "a\nb\nc\n"), (".veilpolicy", ".env.plan cloak team\n")], "v1");
+    alice.set_tag("main", v1, false).unwrap();
+    alice.create_workspace("p", vec![v1]).unwrap();
+    commit_in(&mut alice, "p", &[("README.md", "a\nb\nd 1\nc\n"), (".env.plan", &format!("{SECRET} plan\n"))], "plan");
+    let edit = commit_in(&mut alice, "p", &[("README.md", "a\nb\nd 1\nc\nd 2\n"), (".env.plan", &format!("{SECRET} plan\n{SECRET} more\n"))], "plan 2");
+    Cloaked { alice, fs, edit }
 }
 
 fn blame_text(r: &Repo, rev: &ObjectId, path: &str, o: &BlameOptions) -> String {
@@ -272,62 +271,29 @@ fn blame_text(r: &Repo, rev: &ObjectId, path: &str, o: &BlameOptions) -> String 
     b.lines.iter().map(|l| format!("{:?} {}", l.origin, String::from_utf8_lossy(&l.text))).collect()
 }
 
-/// Threat review 1 and 2: blame by an outsider (and as the public sees it)
-/// reads the fallback, attributes nothing to the cloaked changes, opens no
-/// sealed object and prints none of the sealed text.
-#[test]
-fn blame_without_the_key_reads_fallbacks_and_attributes_nothing_to_cloaked_changes() {
-    let Cloaked { mut alice, fs, v1, edit } = cloaked();
-    let mallory = outsider_of(fs.clone());
-    let b = blame(&mallory, &edit, &p("README.md"), &me()).unwrap();
-    assert!(b.fallback);
-    assert_eq!(b.stats.sealed_opened, 0);
-    assert_eq!(b.stats.open_failed, 0);
-    assert!(b.lines.iter().all(|l| matches!(&l.origin, Origin::Snapshot { id, .. } if *id == v1)), "{:?}", b.lines);
-    assert!(!blame_text(&mallory, &edit, "README.md", &me()).contains(SECRET));
-    // A file with no public version cannot be blamed at all.
-    assert!(blame(&mallory, &edit, &p("plan.md"), &me()).unwrap_err().is_unreadable());
-    // The member as the public sees it: the same.
-    let public = BlameOptions { reader: Reader::Public, ..me() };
-    let b = blame(&alice, &edit, &p("README.md"), &public).unwrap();
-    assert!(b.fallback && b.stats.sealed_opened == 0);
-    assert!(!blame_text(&alice, &edit, "README.md", &public).contains(SECRET));
-    // The member reads her own edits.
-    assert!(blame_text(&alice, &edit, "README.md", &me()).contains(SECRET));
-    // Merged into main, the edit is public: its new lines go to the merge,
-    // never to the cloaked changes, for an outsider and a mirror reader.
-    let m = alice.merge(WS, v1, vec![edit], "publish", None).unwrap().snapshot;
-    let carol = mirror_of(&mut alice);
-    let mallory = outsider_of(fs);
-    for r in [&mallory, &carol] {
-        let got = origins(r, &m, "README.md", &me());
-        assert_eq!(got, [Some(v1), Some(v1), Some(m), Some(v1), Some(m)], "lines 3 and 5 are the merge's");
-    }
-}
-
-/// Threat review 3: an embargoed fix of line 10. A non-holder's (and the
-/// mirror's) blame of the merge attributes line 10 to its pre-fix change;
-/// the holder sees the fix.
+/// Threat review 3: an embargoed fix of line 10. The holder's blame sees
+/// the fix; a mirror never receives the merge before the release (its
+/// `main` is withheld with it; `stable` stays on v1).
 #[test]
 fn an_embargoed_fix_is_not_attributed_for_readers_without_the_key() {
     let (mut alice, fs, _) = new_repo("alice");
     let text: String = (1..=20).map(|i| format!("line {i}\n")).collect();
     let v1 = commit_files(&mut alice, &*fs, &[("src/vuln.c", &text)], "v1");
-    alice.set_tag("main", v1, None, false).unwrap();
-    alice.create_workspace("fix", vec![v1], Some(TEAM.into())).unwrap();
+    alice.set_tag("main", v1, false).unwrap();
+    alice.create_workspace("fix", vec![v1]).unwrap();
     let fixed = text.replace("line 10\n", "line 10 FIXED-BOUNDS-CHECK\n");
     let fix = commit_in(&mut alice, "fix", &[("src/vuln.c", &fixed)], "fix");
     let m = alice.merge(WS, v1, vec![fix], "embargoed", Some(EmbargoSpec { scope: TEAM.into(), until: None })).unwrap().snapshot;
     let got = origins(&alice, &m, "src/vuln.c", &me());
     assert_eq!(got[9], Some(fix), "the holder sees the fix");
+    alice.set_tag("stable", v1, false).unwrap();
     let carol = mirror_of(&mut alice);
-    let mallory = outsider_of(fs);
-    for (who, r) in [("mallory", &mallory), ("carol", &carol)] {
-        let b = blame(r, &m, &p("src/vuln.c"), &me()).unwrap();
-        assert!(b.lines.iter().all(|l| matches!(&l.origin, Origin::Snapshot { id, .. } if *id == v1)), "{who}: {:?}", b.lines);
-        assert!(!blame_text(r, &m, "src/vuln.c", &me()).contains("FIXED"), "{who}");
-        assert_eq!(b.stats.sealed_opened, 0, "{who}");
-    }
+    assert!(carol.snapshot_opt(&m).unwrap().is_none() && carol.snapshot_opt(&fix).unwrap().is_none());
+    assert!(!carol.view().tags.contains_key("main"), "main, moved onto the embargoed merge, was pushed");
+    let stable = carol.view().tags["stable"].target;
+    assert_eq!(stable, v1);
+    assert!(!blame_text(&carol, &stable, "src/vuln.c", &me()).contains("FIXED"));
+    drop(fs);
 }
 
 // ---- grep --------------------------------------------------------------------------------
@@ -358,8 +324,7 @@ fn grep_searches_the_snapshot_with_its_options() {
 }
 
 /// Threat review 2 and 12: grep without the key opens no sealed object,
-/// searches fallbacks labelled `fallback`, counts the rest as sealed, and
-/// finds no sealed text.
+/// counts the secrets as sealed, and finds no sealed text.
 #[test]
 fn grep_without_the_key_never_reads_ciphertext() {
     let Cloaked { alice, fs, edit, .. } = cloaked();
@@ -367,16 +332,16 @@ fn grep_without_the_key_never_reads_ciphertext() {
     let g = grep_of(&mallory, &edit, ".", &GrepOptions::default());
     assert_eq!(g.stats.sealed_opened, 0);
     assert_eq!(g.stats.open_failed, 0);
-    assert_eq!(g.skipped.sealed, 1, "plan.md");
+    assert_eq!(g.skipped.sealed, 1, ".env.plan");
     let readme = g.files.iter().find(|f| f.path.as_str() == "README.md").unwrap();
-    assert_eq!(readme.tier, Tier::Fallback);
+    assert_eq!(readme.tier, Tier::Public);
     assert!(grep_of(&mallory, &edit, SECRET, &GrepOptions::default()).files.is_empty());
     let public = GrepOptions { reader: Reader::Public, ..GrepOptions::default() };
     let g = grep_of(&alice, &edit, SECRET, &public);
     assert!(g.files.is_empty() && g.stats.sealed_opened == 0);
-    // The member finds both, labelled cloaked.
+    // The member finds the secret, labelled cloaked.
     let g = grep_of(&alice, &edit, SECRET, &GrepOptions::default());
-    assert_eq!(g.files.len(), 2);
+    assert_eq!(g.files.len(), 1);
     assert!(g.files.iter().all(|f| f.tier == Tier::Cloaked(TEAM.into())));
 }
 
@@ -482,27 +447,28 @@ fn pickaxe_never_counts_what_the_reader_cannot_read() {
 }
 
 /// Threat review 4: an embargoed fix of `src/vuln.c`. Neither the path
-/// filter nor `-S` on the fixed line lists the merge for a non-holder or
-/// a mirror reader.
+/// filter nor `-S` on the fixed line lists the fix or the merge for a
+/// mirror reader (the mirror never receives them before the release).
 #[test]
 fn log_filters_do_not_reveal_an_embargoed_fix() {
     let (mut alice, fs, _) = new_repo("alice");
     let v1 = commit_files(&mut alice, &*fs, &[("src/vuln.c", "check(x);\n"), ("README", "r\n")], "v1");
-    alice.set_tag("main", v1, None, false).unwrap();
-    alice.create_workspace("fix", vec![v1], Some(TEAM.into())).unwrap();
+    alice.set_tag("main", v1, false).unwrap();
+    alice.create_workspace("fix", vec![v1]).unwrap();
     let fix = commit_in(&mut alice, "fix", &[("src/vuln.c", "check(x); BOUNDS-FIX-4411\n")], "fix");
     let m = alice.merge(WS, v1, vec![fix], "embargoed", Some(EmbargoSpec { scope: TEAM.into(), until: None })).unwrap().snapshot;
     let path = || LogFilter { paths: vec![p("src/vuln.c")], ..LogFilter::default() };
     let pick = || LogFilter { pickaxe: Some(Pickaxe::string("BOUNDS-FIX-4411", false).unwrap()), ..LogFilter::default() };
-    assert!(listed(&search(&alice, path())).contains(&m));
+    assert!(listed(&search(&alice, path())).contains(&fix));
+    assert!(listed(&search(&alice, pick())).contains(&fix));
+    alice.set_tag("stable", v1, false).unwrap();
     let carol = mirror_of(&mut alice);
-    let mallory = outsider_of(fs);
-    for (who, r) in [("mallory", &mallory), ("carol", &carol)] {
-        assert!(!listed(&search(r, path())).contains(&m), "{who}");
-        let got = search(r, pick());
-        assert!(listed(&got).is_empty(), "{who}: {got:?}");
-        assert!(!got.iter().any(|(id, _)| *id == m), "{who}: the merge is not even skipped");
-    }
+    drop(fs);
+    let got = listed(&search(&carol, path()));
+    assert!(!got.contains(&m) && !got.contains(&fix), "{got:?}");
+    let got = search(&carol, pick());
+    assert!(listed(&got).is_empty(), "{got:?}");
+    assert!(!got.iter().any(|(id, _)| *id == m || *id == fix), "the merge is not even skipped");
 }
 
 // ---- revsets ----------------------------------------------------------------------------
@@ -513,8 +479,8 @@ fn ranges_are_dag_differences() {
     let c1 = commit_files(&mut r, &*fs, &[("f", "1\n")], "1");
     let c2 = commit_files(&mut r, &*fs, &[("f", "2\n")], "2");
     let c3 = commit_files(&mut r, &*fs, &[("f", "3\n")], "3");
-    r.set_tag("one", c1, None, false).unwrap();
-    r.set_tag("three", c3, None, false).unwrap();
+    r.set_tag("one", c1, false).unwrap();
+    r.set_tag("three", c3, false).unwrap();
     let set = |s: &str| revset::resolve_set(&r, s, WS).unwrap();
     assert_eq!(set("one..three"), [c3, c2]);
     assert_eq!(set("::one"), [c1, r.root_id()]);
@@ -582,21 +548,26 @@ fn bisect_over_a_merge_searches_the_whole_dag_difference() {
 proptest! {
     #![proptest_config(ProptestConfig { cases: 24, ..ProptestConfig::default() })]
 
-    /// Random histories mixing public commits and edits on a cloaked line
-    /// (some carrying the secret marker): an outsider's and the public
-    /// view's blame, grep and pickaxe never return the marker, never open
-    /// a sealed object, and never fail.
+    /// Random histories mixing public commits and edits of secret files
+    /// sealed for `team` (some carrying the secret marker): an outsider's
+    /// and the public view's blame, grep and pickaxe never return the
+    /// marker, never open a sealed object, and never fail.
     #[test]
     fn history_tools_never_return_sealed_text_to_readers_without_the_key(
         steps in proptest::collection::vec((any::<bool>(), 0u8..3, 0u8..4), 1..8),
     ) {
         let (mut alice, fs, _) = new_repo("alice");
-        let base = commit_files(&mut alice, &*fs, &[("a.txt", "one\ntwo\n"), ("b.txt", "x\n")], "base");
-        alice.set_tag("main", base, None, false).unwrap();
-        alice.create_workspace("p", vec![base], Some(TEAM.into())).unwrap();
+        let base = commit_files(
+            &mut alice,
+            &*fs,
+            &[("a.txt", "one\ntwo\n"), ("b.txt", "x\n"), (".env.a", "one\ntwo\n"), (".veilpolicy", ".env.* cloak team\n")],
+            "base",
+        );
+        alice.set_tag("main", base, false).unwrap();
+        alice.create_workspace("p", vec![base]).unwrap();
         let mut last = base;
         for (i, (cloaked, file, kind)) in steps.iter().enumerate() {
-            let name = ["a.txt", "b.txt", "c.txt"][*file as usize];
+            let name = if *cloaked { [".env.a", ".env.b", ".env.c"] } else { ["a.txt", "b.txt", "c.txt"] }[*file as usize];
             let text = match kind {
                 0 => format!("one\ntwo\nline {i}\n"),
                 1 => format!("one\n{SECRET} {i}\ntwo\n"),

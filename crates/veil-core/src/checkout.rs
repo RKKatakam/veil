@@ -63,11 +63,11 @@ use crate::{
     attributes::{lf_to_crlf, to_odb, to_worktree, Attrs, ToOdb},
     error::{Result, VeilError},
     id::ObjectId,
-    object::{is_reserved_name, EntryKind, Object, TreeEntry, Visibility},
+    object::{is_reserved_name, EntryKind, Object, TreeEntry},
     policy::{Policy, Tier},
     statcache::StatCache,
     store::ObjectStore,
-    tree::{diff_trees, lookup, TreeChange, TreeView, MAX_TREE_DEPTH},
+    tree::{diff_trees, lookup, TreeChange, TreeView},
     vfs::{NodeKind, StorageBackend},
     vpath::{NameFolding, VPath},
 };
@@ -86,8 +86,8 @@ pub struct CheckoutReport {
     /// Paths that are, or lie below, a symlink or other special file in the
     /// working copy: never written, removed or followed.
     pub blocked: Vec<VPath>,
-    /// Files written from their embargo fallback because this reader cannot
-    /// read the entry itself, with the fallback's id.
+    /// Conflicts written with a version this reader cannot read (a sealed
+    /// secret), with the blob id of the rendering written.
     pub from_fallback: Vec<(VPath, ObjectId)>,
     /// Paths of the tree that were not written because something checkout
     /// did not write is in the way, with that obstacle: a directory that
@@ -121,11 +121,11 @@ pub struct CheckoutReport {
 /// what. Device-local state, kept by whoever owns the working copy (the CLI
 /// stores it in `.veil/local/checkout.json`).
 ///
-/// A file that was unreadable at checkout (no key for its scope yet, an
-/// unreleased embargo) is absent on disk, or holds the embargo's fallback.
-/// Once it becomes readable (a grant arrives by pull, the embargo is
-/// released), that is not the user deleting or reverting it: the working
-/// copy is merely stale. [`Materialised::fill_in`] materialises the real
+/// A file that was unreadable at checkout (a secret this device holds no
+/// key for yet) is absent on disk, and a conflict with such a version is
+/// written with that version redacted. Once it becomes readable (a grant
+/// arrives by pull), that is not the user deleting or reverting it: the
+/// working copy is merely stale. [`Materialised::fill_in`] materialises the real
 /// content, never over local edits, and the builder consults the record
 /// ([`crate::builder::BuildOptions::materialised`]) so a path that was never
 /// materialised is not recorded as deleted.
@@ -133,11 +133,11 @@ pub struct CheckoutReport {
 /// Three facts, each relative to the tree the working copy was last checked
 /// out from (or snapshotted as):
 ///
-/// * [`view`](Materialised::view): the root was an embargo wrapper shown as
-///   its fallback; this is the tree actually materialised.
+/// * [`view`](Materialised::view): the tree actually materialised, when it
+///   is another (a one-directory clone's).
 /// * [`hidden`](Materialised::hidden): file entries left out (unreadable).
-/// * [`from_fallback`](Materialised::from_fallback): files written from an
-///   embargo fallback instead of the entry's own content.
+/// * [`from_fallback`](Materialised::from_fallback): conflicts written with
+///   a version this reader could not read, with the rendering written.
 ///
 /// An empty record means "the working copy is the tree as read now", which
 /// is also what a record written by an older version reads as.
@@ -232,8 +232,8 @@ impl Materialised {
         self.crlf.contains(path)
     }
 
-    /// The tree actually materialised when the working copy's tree is an
-    /// embargo wrapper this reader saw as its fallback (`None` otherwise).
+    /// The tree actually materialised, when it is not the working copy's
+    /// tree (a one-directory clone's; `None` otherwise).
     pub fn view(&self) -> Option<ObjectId> {
         self.view
     }
@@ -249,19 +249,17 @@ impl Materialised {
         self.hidden.iter()
     }
 
-    /// The embargo fallback materialised at `path`, if the file there was
-    /// written from one and checkout has not written that path since:
+    /// What checkout wrote at `path` instead of the entry itself, if it did
+    /// and has not written that path since:
     ///
-    /// * a file whose entry this reader could not read, written from the
-    ///   entry's `fallback` (that id is returned);
-    /// * any file below a [`view`](Materialised::view): the whole tree was
-    ///   shown as the wrapper's fallback, and the id of `path` in that
-    ///   fallback tree is returned.
+    /// * a conflict written with a version this reader could not read: the
+    ///   blob id of the rendering written;
+    /// * any file below a [`view`](Materialised::view): the id of `path` in
+    ///   the tree actually materialised.
     ///
     /// `None` means the file at `path` (if any) was materialised from the
     /// entry itself, or not by checkout at all. It says nothing about later
-    /// local edits: compare the content with the returned id to tell "still
-    /// the fallback I was shown" from an edit that happens to match.
+    /// local edits: compare the content with the returned id.
     pub fn from_fallback(&self, store: &ObjectStore, path: &VPath) -> Result<Option<ObjectId>> {
         if let Some(fb) = self.fallback.get(path) {
             return Ok(Some(*fb));
@@ -273,8 +271,9 @@ impl Materialised {
         })
     }
 
-    /// Every file written from an entry's fallback, with the fallback's id
-    /// (files below a [`view`](Materialised::view) are not listed).
+    /// Every conflict written with an unreadable version, with the id of the
+    /// rendering written (files below a [`view`](Materialised::view) are not
+    /// listed).
     pub fn fallback_paths(&self) -> impl Iterator<Item = (&VPath, &ObjectId)> {
         self.fallback.iter()
     }
@@ -301,10 +300,10 @@ impl Materialised {
         Ok(())
     }
 
-    /// Materialise everything the record says is missing or shown as a
-    /// fallback but that this reader can now read in `tree` (the tree the
-    /// working copy was checked out from): files that were hidden, files
-    /// written from a fallback, and the embargoed side of a wrapper root.
+    /// Materialise everything the record says is missing or redacted but
+    /// that this reader can now read in `tree` (the tree the working copy
+    /// was checked out from): files that were hidden, and conflicts written
+    /// with a version that was unreadable.
     /// Local edits are never overwritten (they are reported as
     /// [`CheckoutReport::kept_local`] and dropped from the record: the file
     /// is the user's now). Cheap when nothing changed: one lookup per
@@ -318,12 +317,11 @@ impl Materialised {
     ) -> Result<CheckoutReport> {
         let mut total = CheckoutReport::default();
         if let Some(shown) = self.view {
-            let (now, fell_back) = resolve_view(store, tree)?;
-            if now != shown {
+            if *tree != shown {
                 let changes = diff_trees(store, Some(&shown), Some(tree))?;
                 let report = apply_changes(store, fs, Some(&shown), tree, &changes, cache.as_deref_mut(), Some(&self.crlf))?;
                 self.absorb(fs, &changes, &report)?;
-                self.view = fell_back.then_some(now);
+                self.view = None;
                 total.merge(report);
             }
         }
@@ -365,21 +363,6 @@ impl Materialised {
                         });
                     }
                 }
-                Lookup::Entry(e) if e.kind == EntryKind::File && e.fallback == Some(fb) => {
-                    if store.read_blob(&e.id).is_ok() {
-                        let shown = TreeEntry {
-                            id: fb,
-                            fallback: None,
-                            visibility: Visibility::Public,
-                            ..e.clone()
-                        };
-                        changes.push(TreeChange {
-                            path: p,
-                            old: Some(shown),
-                            new: Some(e),
-                        });
-                    }
-                }
                 _ => {
                     self.fallback.remove(&p);
                 }
@@ -410,37 +393,10 @@ fn lookup_opt(store: &ObjectStore, tree: &ObjectId, path: &VPath) -> Result<Look
     }
 }
 
-/// The plain tree this reader sees for `id` (as [`ObjectStore::tree`]
-/// resolves embargo wrappers), and whether a wrapper was shown as its
-/// fallback on the way.
-pub fn resolve_view(store: &ObjectStore, id: &ObjectId) -> Result<(ObjectId, bool)> {
-    let mut id = *id;
-    let mut fell_back = false;
-    for _ in 0..MAX_TREE_DEPTH {
-        let t = store.tree_object(&id)?;
-        let Some(w) = crate::embargo::wrapper_parts(&t) else {
-            return Ok((id, fell_back));
-        };
-        if store.keys.has(&w.key_label()) {
-            match store.tree_object(&w.inner) {
-                Ok(_) => {
-                    id = w.inner;
-                    continue;
-                }
-                Err(e) if e.is_unreadable() => {}
-                Err(e) => return Err(e),
-            }
-        }
-        id = w.fallback;
-        fell_back = true;
-    }
-    Err(VeilError::Corrupt(id.hex(), "embargo wrappers nest too deeply".into()))
-}
-
 /// [`checkout_cached`] that keeps `record` (what `fs` was materialised from
 /// relative to `from`, see [`Materialised`]) up to date: the diff starts
-/// from what is really on disk (a wrapper's fallback when that is what was
-/// shown), and afterwards the record describes `fs` relative to `to`. Then
+/// from what is really on disk, and afterwards the record describes `fs`
+/// relative to `to`. Then
 /// anything recorded that has become readable is filled in.
 pub fn checkout_recorded(
     store: &std::sync::Arc<ObjectStore>,
@@ -454,8 +410,7 @@ pub fn checkout_recorded(
     let changes = diff_trees(store, shown.as_ref(), Some(to))?;
     let mut report = apply_changes(store, fs, shown.as_ref(), to, &changes, cache.as_deref_mut(), Some(&record.crlf))?;
     record.absorb(fs, &changes, &report)?;
-    let (now, fell_back) = resolve_view(store, to)?;
-    record.view = fell_back.then_some(now);
+    record.view = None;
     report.merge(record.fill_in(store, fs, to, cache)?);
     Ok(report)
 }
@@ -893,7 +848,6 @@ fn apply_changes(
         // whose line endings are converted on the way out.
         if !local_edit
             && !conversion.writes_crlf()
-            && new.fallback.is_none()
             && fs.clones()
             && store.entry_readable(new)
             && fs.clone_known(&c.path, &new.id)?
@@ -1018,7 +972,7 @@ fn stage_one(store: &ObjectStore, fs: &dyn StorageBackend, j: &Job<'_>) -> Stagi
         Err(e) => return Staging1::Fatal(e),
     };
     // Line endings for the working copy (`eol=crlf`), on the bytes as
-    // read: a conflict's markers too, a fallback too.
+    // read: a conflict's markers too.
     let (data, crlf) = match to_worktree(&data, j.conversion) {
         Some(d) => (d, true),
         None => (data, false),
@@ -1261,8 +1215,7 @@ fn apply_special(
             }
             let target = match read_materialised(store, e) {
                 Ok((t, None)) => t,
-                // A link is never written from an embargo fallback (the
-                // pre-merge version may be a file); left out, as unreadable.
+                // Never a stand-in for a link: left out, as unreadable.
                 Ok((_, Some(_))) => {
                     remove_ours(store, fs, c, current.as_ref(), report, &mut cache, eol)?;
                     report.redacted.push(path.clone());
@@ -1406,9 +1359,7 @@ fn whole_filesystem(e: &std::io::Error) -> bool {
     matches!(e.kind(), K::StorageFull | K::ReadOnlyFilesystem | K::QuotaExceeded)
 }
 
-/// The bytes checkout writes for file entry `e`, and the embargo fallback
-/// they were read from when this reader cannot read the entry itself (as
-/// [`ObjectStore::read_entry`], which falls back silently).
+/// The bytes checkout writes for file entry `e`.
 ///
 /// A conflict entry is materialised with markers for this reader
 /// ([`crate::conflict::materialize`]): only here, when it is written to
@@ -1422,14 +1373,7 @@ fn read_materialised(store: &ObjectStore, e: &TreeEntry) -> Result<(Vec<u8>, Opt
         let shown = m.unreadable_side.then(|| Object::blob_id(&m.content));
         return Ok((m.content, shown));
     }
-    match store.read_blob(&e.id) {
-        Ok(d) => Ok((d, None)),
-        Err(err) if err.is_unreadable() => match e.fallback {
-            Some(fb) => Ok((store.read_blob(&fb)?, Some(fb))),
-            None => Err(err),
-        },
-        Err(err) => Err(err),
-    }
+    Ok((store.read_blob(&e.id)?, None))
 }
 
 /// Does the node at `path` hold exactly what checkout materialises for
