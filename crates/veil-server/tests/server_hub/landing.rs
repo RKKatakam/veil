@@ -851,3 +851,367 @@ fn big_folder_batch_in_a_child() {
     eprintln!("the landing service's peak grew by {grew} MiB for 400 one-line changes ({batches} batches)");
     assert!(grew <= 256, "the landing service's peak grew by {grew} MiB for 400 one-line changes ({batches} batches)");
 }
+
+// S17 review, cycle 2 (docs/BUGS.md, "S17 cycle 2").
+
+/// The content of `path` on main's real tip, if it is a file there.
+fn real_file(hub: &TestHub, project: i64, path: &str) -> Option<Vec<u8>> {
+    let src = source(hub, project);
+    let mut id = src.snapshot(&real_tip(hub, project)).unwrap().tree;
+    let parts: Vec<&str> = path.split('/').collect();
+    for (i, part) in parts.iter().enumerate() {
+        let O::Tree(t) = O::decode(&src.raw(&id).unwrap()).unwrap() else { return None };
+        let e = t.get(part)?.clone();
+        if i + 1 == parts.len() {
+            return match O::decode(&src.raw(&e.id).unwrap()).unwrap() {
+                O::Blob(b) => Some(b),
+                _ => None,
+            };
+        }
+        id = e.id;
+    }
+    None
+}
+
+/// Land a snapshot the server already holds (named as `token`'s owner sees
+/// it), uploading nothing.
+fn land_held(api: &Api, token: &str, project: &str, snapshot: ObjectId, wait: bool) -> Reply {
+    api.post_json(
+        Some(token),
+        &format!("/v1/projects/{project}/land"),
+        &json!({"onto": "main", "snapshot": snapshot.hex(), "receipts": {}, "wait": wait}),
+    )
+}
+
+/// An API commit of `edits` on `base`, kept on no branch: the snapshot as
+/// its maker sees it.
+fn kept_change(api: &Api, token: &str, project: &str, base: ObjectId, edits: Value) -> ObjectId {
+    let r = api.post_json(Some(token), &format!("/v1/projects/{project}/changes"), &json!({"base": base.hex(), "edits": edits}));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    serde_json::from_value(r.json()["snapshot"].clone()).unwrap()
+}
+
+#[test]
+#[ignore = "BUG-1110: a stack of two or more changes is rejected (\"missing object\"): a kept view key's new projection is read before it is held"]
+fn bug_1110_a_stack_of_two_new_changes_lands() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    // Two new commits of the dev's, one on the other, landed at once (as
+    // `vl push` of two commits to a protected branch submits them). Others
+    // read src/ (it is public): their view keys see both changes.
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.file("src/first.rs", "first\n");
+    let mut s = Snapshot {
+        parents: vec![c.tip],
+        change_id: veil_core::ChangeId::random(),
+        tree: c.root,
+        description: Text::Plain("first".into()),
+        author: "dev".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        signature: None,
+    };
+    s.sign(&c.identity);
+    let first = c.put(O::Snapshot(s));
+    c.tip = first;
+    c.file("src/second.rs", "second\n");
+    let r = land_crafted(c, vec![first], true);
+    let v = r.json();
+    assert_eq!(v["state"], "landed", "a stack of two new changes: {v}");
+    assert_eq!(v["landed"].as_array().map(Vec::len), Some(2), "{v}");
+    assert!(real_file(&hub, pid, "src/first.rs").is_some() && real_file(&hub, pid, "src/second.rs").is_some());
+}
+
+#[test]
+#[ignore = "BUG-1111: a landing's stack takes in another person's change: its conflict names their paths the submitter cannot read"]
+fn bug_1111_a_landing_answer_names_no_path_its_submitter_cannot_read() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    // fin (finance and devs) pushes a change of billing and src/ to a branch
+    // of their own.
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name]);
+    let invoice = format!("{BILL_DIR}/acme/invoice.txt");
+    let mut c = Craft::new(&api, &p.fin, &p.name, "main");
+    c.file(&invoice, "fin's edit\n");
+    c.file("src/fin.rs", "fin\n");
+    let r = c.push_to("fin-wip", None);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    // The admin edits the invoice on main meanwhile.
+    write_files(&p.dir, &[(&invoice, "the admin's edit\n")]);
+    p.admin.commit_main(&p.dir, "the admin's invoice edit");
+    p.admin.ok(&p.dir, &["push"]);
+    // The dev, who may not read billing, sees fin's change only as its
+    // projection (src/fin.rs), and asks for it to land.
+    let token = p.dev.token();
+    let theirs = api.tips(Some(&token), &p.name).unwrap().branches["fin-wip"];
+    let r = land_held(&api, &token, &p.name, theirs, true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    eprintln!("{} {body}", r.status);
+    assert!(!body.contains(BILL_DIR), "the dev's landing answer names a path under billing, which they cannot read: {body}");
+}
+
+#[test]
+#[ignore = "BUG-1112: a landing of edits on an unlanded base lands only the edits and says landed (BUG-1103's class, the edits route)"]
+fn bug_1112_edits_landed_on_an_unlanded_base_bring_the_base_or_are_refused() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    // The dev's first change, kept on no branch (an API commit; a landing
+    // answered `conflict` leaves the same).
+    let first = kept_change(&api, &token, &p.name, tip_for(&hub, &token, &p.name), json!([put("src/first.rs", "first\n")]));
+    // A second change made of edits on it, landed.
+    let r = land(&api, &token, &p.name, first, json!([put("src/second.rs", "second\n")]), true).json();
+    eprintln!("{r}");
+    if r["state"] == "landed" {
+        assert!(real_file(&hub, pid, "src/second.rs").is_some(), "{r}");
+        assert!(real_file(&hub, pid, "src/first.rs").is_some(), "main got the second change without the first it was made on, and the answer says landed: {r}");
+    }
+}
+
+#[test]
+#[ignore = "BUG-1270: two queued stacks that share a change: the second is answered conflict on the shared change's own paths"]
+fn bug_1270_stacks_that_share_a_change_both_land_and_it_lands_once() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    // A change two agents build on (kept on no branch).
+    let shared = kept_change(&api, &token, &p.name, tip_for(&hub, &token, &p.name), json!([put("src/shared.rs", "shared\n")]));
+    // Two stacks on it, each one more change of a file of its own, both
+    // queued before either lands.
+    hold(&hub, pid);
+    let mut tickets = Vec::new();
+    for name in ["src/one.rs", "src/two.rs"] {
+        let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+        c.root = c.tree_of(shared);
+        c.tip = shared;
+        c.file(name, "mine\n");
+        let r = land_crafted(c, vec![shared], false).json();
+        assert_eq!(r["state"], "queued", "{r}");
+        tickets.push(r["ticket"].as_str().unwrap().to_string());
+    }
+    release(&hub, pid);
+    let outcomes: Vec<Value> = tickets.iter().map(|t| outcome(&api, &token, &p.name, t)).collect();
+    eprintln!("{outcomes:?}");
+    for o in &outcomes {
+        assert_eq!(o["state"], "landed", "a stack whose shared change landed with the other one is refused: {o}");
+    }
+    assert!(real_file(&hub, pid, "src/one.rs").is_some() && real_file(&hub, pid, "src/two.rs").is_some());
+}
+
+#[test]
+#[ignore = "BUG-1271: a change answered conflict, with a fix on top (a merge of main into it), is answered conflict again forever"]
+fn bug_1271_a_conflicted_change_with_a_fix_on_top_lands() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    // The dev changes src/lib.rs; the admin changes it on main first.
+    let base = tip_for(&hub, &token, &p.name);
+    let mine = kept_change(&api, &token, &p.name, base, json!([put("src/lib.rs", "the dev's\n")]));
+    write_files(&p.dir, &[("src/lib.rs", "the admin's\n")]);
+    p.admin.commit_main(&p.dir, "the admin's lib.rs");
+    p.admin.ok(&p.dir, &["push"]);
+    let r = land_held(&api, &token, &p.name, mine, true).json();
+    assert_eq!(r["state"], "conflict", "{r}");
+    // The fix on top (HUB.md §13.19 lists "a landing answered `conflict`
+    // with a fix on top" among the stacks that land): the dev merges main
+    // into their change and resolves the file.
+    let main_now = tip_for(&hub, &token, &p.name);
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.root = c.tree_of(mine);
+    c.tip = mine;
+    c.file("src/lib.rs", "the admin's and the dev's\n");
+    let r = land_crafted(c, vec![mine, main_now], true);
+    let v = r.json();
+    eprintln!("{v}");
+    assert_eq!(v["state"], "landed", "the fix on top of a conflicted change never lands: {v}");
+    assert_eq!(real_file(&hub, pid, "src/lib.rs").as_deref(), Some(&b"the admin's and the dev's\n"[..]));
+}
+
+/// Guarantee 4 of the cycle-2 review: a merge checked again after an
+/// access change is judged against all its parents, both ways: what it takes
+/// from another parent stays allowed (bug_1105), and its own edit of a path
+/// its submitter may no longer write is refused.
+#[test]
+fn a_merge_checked_again_refuses_its_own_edit_its_submitter_may_no_longer_write() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name]);
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.file("src/feature.rs", "feature\n");
+    let r = c.push_to("feature", None);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    // fin (a dev for now) merges it, and edits src/own.rs in the merge.
+    let ftok = p.fin.token();
+    let feature = api.tips(Some(&ftok), &p.name).unwrap().branches["feature"];
+    let mut m = Craft::new(&api, &p.fin, &p.name, "main");
+    let tip = m.tip;
+    m.root = m.tree_of(feature);
+    m.tip = feature;
+    m.file("src/own.rs", "fin's own\n");
+    hold(&hub, pid);
+    let v = land_crafted(m, vec![tip, feature], false).json();
+    assert_eq!(v["state"], "queued", "accepted at submit: {v}");
+    // fin is no longer a dev: src/ stays readable (public), not writable.
+    p.admin.ok(&p.dir, &["group", "remove", "devs", &p.fin.name]);
+    release(&hub, pid);
+    let r = outcome(&api, &ftok, &p.name, v["ticket"].as_str().unwrap());
+    assert_eq!(r["state"], "rejected", "{r}");
+    assert!(real_file(&hub, pid, "src/own.rs").is_none());
+}
+
+/// Guarantee 1 of the cycle-2 review, on the routes bug_1102 does not take:
+/// with main unprotected, a non-admin who may write `.veilrules` changes the
+/// default branch's rules neither by an API commit with `onto` nor by a
+/// plain push of a merge that keeps an older parent's (absent) rules.
+#[test]
+fn the_default_branch_rules_change_by_no_route_but_an_admin_s() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    p.admin.ok(&p.dir, &["access", ".veilrules", "devs"]);
+    p.admin.commit_main(&p.dir, "devs may edit the rules file");
+    p.admin.ok(&p.dir, &["push"]);
+    let token = p.dev.token();
+    let before = kept_change(&api, &token, &p.name, tip_for(&hub, &token, &p.name), json!([put("src/side.rs", "side\n")]));
+    write_files(&p.dir, &[(".veilrules", "[branches.release]\nprotected = true\n")]);
+    p.admin.commit_main(&p.dir, "protect release");
+    p.admin.ok(&p.dir, &["push"]);
+    let rules_tip = tip_for(&hub, &token, &p.name);
+    // An API commit moving main.
+    let r = api.post_json(
+        Some(&token),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({"base": rules_tip.hex(), "edits": [put(".veilrules", "")], "onto": {"branch": "main", "expected": rules_tip.hex()}}),
+    );
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert!(body.contains("only admins may change the branch rules"), "{} {body}", r.status);
+    assert_eq!(tip_for(&hub, &token, &p.name), rules_tip, "{body}");
+    // A plain push of a merge keeping the older parent's (absent) rules.
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    without(&mut c, ".veilrules");
+    let r = c.push_merge("main", &[before]);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert!(body.contains("only admins may change the branch rules"), "{} {body}", r.status);
+    assert_eq!(tip_for(&hub, &token, &p.name), rules_tip, "{body}");
+}
+
+/// BUG-1272, in a process of its own (it measures this process's memory).
+#[test]
+#[ignore = "BUG-1272: a batch's first entry is not bounded in bytes: a stack of 64 changes in a big folder holds 64 rewritten listings"]
+fn bug_1272_a_stack_of_changes_in_a_big_folder_stays_within_the_batch_bound() {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["landing::big_folder_stacks_in_a_child", "--exact", "--include-ignored", "--nocapture", "--test-threads", "1"])
+        .env("VEIL_S17_CHILD", "1")
+        .env("MALLOC_ARENA_MAX", "2")
+        .output()
+        .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success() && text.contains("1 passed"), "{}", &text[text.len().saturating_sub(1500)..]);
+}
+
+#[test]
+#[ignore = "helper of bug_1272 (run in a child process)"]
+fn big_folder_stacks_in_a_child() {
+    if std::env::var_os("VEIL_S17_CHILD").is_none() {
+        return;
+    }
+    use veil_core::object::{EntryKind, Tree, TreeEntry, Visibility};
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    // A folder of 60,000 files (twice bug_1107's), a listing of about 3.2 MB, in
+    // a folder only admins read (so no view key's projection changes:
+    // BUG-1110 does not hide this one).
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    let blob = c.put(O::Blob(b"x\n".to_vec()));
+    let mut t = Tree::default();
+    for i in 0..60_000 {
+        t.insert(TreeEntry {
+            name: format!("generated-file-{i:05}.rs"),
+            kind: EntryKind::File,
+            id: blob,
+            size: 2,
+            executable: false,
+            visibility: Visibility::Public,
+        });
+    }
+    let big = c.put(O::Tree(t.clone()));
+    c.refer_dir("gen/big", big);
+    let r = c.push("main", "a big folder");
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    // Two agents (admins') each make a stack of 64 one-line changes in it
+    // (as many as one landing takes), on the same base.
+    let token = p.admin.token();
+    let base = tip_for(&hub, &token, &p.name);
+    hold(&hub, pid);
+    let mut tickets = Vec::new();
+    for agent in 0..2 {
+        let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+        let mut parent = base;
+        let mut t = t.clone();
+        for k in 0..veil_core::hub::land::MAX_LAND_STACK {
+            let i = agent * 1000 + k;
+            let b = c.put(O::Blob(format!("{i}\n").into_bytes()));
+            let mut e = t.get(&format!("generated-file-{i:05}.rs")).unwrap().clone();
+            e.id = b;
+            e.size = format!("{i}\n").len() as u64;
+            t.remove(&e.name.clone());
+            t.insert(e);
+            let id = c.put(O::Tree(t.clone()));
+            c.refer_dir("gen/big", id);
+            let mut s = Snapshot {
+                parents: vec![parent],
+                change_id: veil_core::ChangeId::random(),
+                tree: c.root,
+                description: Text::Plain(format!("change {i}")),
+                author: "agent".into(),
+                timestamp: veil_core::now_millis(),
+                predecessors: vec![],
+                conflicts: vec![],
+                embargo: None,
+                signature: None,
+            };
+            s.sign(&c.identity);
+            parent = c.put(O::Snapshot(s));
+        }
+        let up = c.api.upload(&c.token, &c.project, &c.objects);
+        assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+        let receipts = up.json()["receipts"].as_array().unwrap().clone();
+        let map: serde_json::Map<String, Value> = c.objects.iter().zip(receipts).map(|((id, _), r)| (id.hex(), r)).collect();
+        let r = c.api.post_json(Some(&c.token), &format!("/v1/projects/{}/land", c.project), &json!({"onto": "main", "snapshot": parent.hex(), "receipts": map, "wait": false}));
+        assert_eq!(r.json()["state"], "queued", "{}", String::from_utf8_lossy(&r.body));
+        tickets.push(r.json()["ticket"].as_str().unwrap().to_string());
+    }
+    // Main moves first, so both stacks are made again on it.
+    let atok = p.admin.token();
+    let a = land(&api, &atok, &p.name, tip_for(&hub, &atok, &p.name), json!([put("src/admin.rs", "admin\n")]), false).json();
+    std::fs::write("/proc/self/clear_refs", "5").unwrap();
+    let (start, _) = rss();
+    let trees0 = hub.hub().trees.stats().weight;
+    release(&hub, pid);
+    assert_eq!(outcome(&api, &atok, &p.name, a["ticket"].as_str().unwrap())["state"], "landed");
+    for t in &tickets {
+        assert_eq!(outcome(&api, &token, &p.name, t)["state"], "landed");
+    }
+    let (_, peak) = rss();
+    let trees = hub.hub().trees.stats().weight.saturating_sub(trees0) as u64;
+    let grew = peak.saturating_sub(start).saturating_sub(trees) >> 20;
+    let batches = sql_i64(&hub, "SELECT count(*) FROM audit_log WHERE project_id = $1 AND action = 'land'", pid);
+    eprintln!("decoded-tree cache grew by {} MiB; the landing service's peak grew by {grew} MiB for two stacks of 64 ({batches} batches)", trees >> 20);
+    // bug_1107's bound for 400 such changes in batches of 8 MiB.
+    assert!(grew <= 256, "the landing service's peak grew by {grew} MiB for two stacks of 64 one-line changes ({batches} batches)");
+}
