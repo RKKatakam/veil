@@ -1,5 +1,5 @@
 //! Read grants, the object routes and the access-epoch feed (`docs/HUB.md`
-//! §13.13; [`veil_core::hub::grant`] has the grant and the chain check).
+//! §13.14; [`veil_core::hub::grant`] has the grant and the chain check).
 //!
 //! * **Grants with the tips.** `GET …/tips` returns, per branch, a grant for
 //!   the caller's projected root tree of its tip, signed by the server's
@@ -15,17 +15,15 @@
 //!   and served on its own, after its own check: wherever the store keeps it
 //!   (a pack, later: S28), nothing else is ever handed out with it. A batch
 //!   is streamed with bounded memory, as `sync::fetch` is.
-//! * **Access epochs.** Every change that can take access away gives its
-//!   project or person a new epoch, a random value, in its own transaction
-//!   (database triggers, `migrations/0007_access_epochs.sql`). The server
-//!   refuses a grant whose epochs are not the current ones on the next
-//!   request; `GET /v1/epochs` gives a signed-in caller the current epochs
-//!   of their person and of the projects they can see, for caches.
-//!
-//! **Order matters when a grant is made:** the epochs are read *before*
-//! the caller's view is loaded. An access change committed after that read
-//! gives a new epoch and voids the grant; one committed before it is in
-//! the view.
+//! * **Access epochs** are S4's (`migrations/0006_access_epochs.sql`,
+//!   `caches`): every access change bumps its project's or person's epoch
+//!   in its own transaction. A grant carries **tokens** of the epochs its
+//!   view was built under (`perm::open_at`), keyed BLAKE3 values
+//!   ([`Grants::tokens`]), never the epochs, which are values of one
+//!   server-wide clock (BUG-1081). The server refuses a grant whose tokens
+//!   are not those of the current epochs on the next request; `GET
+//!   /v1/epochs` gives a signed-in caller the current tokens of their
+//!   person and of the projects they can see, for caches.
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -64,6 +62,8 @@ pub const FEED_PROJECTS: usize = 1000;
 pub struct Grants {
     key: SeedSigner,
     key_hex: String,
+    /// The MAC key of epoch tokens (`HUB_EPOCH_TOKEN`).
+    epoch_key: [u8; 32],
     stored: LruCache<()>,
 }
 
@@ -84,6 +84,7 @@ impl Grants {
         Ok(Grants {
             key_hex: key.verifying_hex(),
             key,
+            epoch_key: blake3::derive_key(veil_core::crypto::domains::HUB_EPOCH_TOKEN, &seed),
             stored: LruCache::new(8 << 20),
         })
     }
@@ -97,38 +98,32 @@ impl Grants {
     pub fn issue(&self, body: &GrantBody) -> String {
         Grant::issue(&self.key, body)
     }
-}
 
-/// The current access epochs of the project named `project` and of
-/// `person` (0 where there is none): what a grant is made with, read
-/// before the caller's view.
-pub async fn epochs_by_name(db: &sqlx::PgPool, project: &str, person: Option<i64>) -> Result<(i64, i64)> {
-    Ok(sqlx::query_as(
-        "SELECT COALESCE(MAX(epoch) FILTER (WHERE person_id = 0), 0), COALESCE(MAX(epoch) FILTER (WHERE project_id = 0), 0) \
-         FROM access_epochs WHERE (project_id = (SELECT id FROM projects WHERE name = $1) AND person_id = 0) \
-         OR (project_id = 0 AND person_id = $2)",
-    )
-    .bind(project)
-    .bind(person.unwrap_or(-1))
-    .fetch_one(db)
-    .await?)
-}
+    /// The tokens a grant carries for S4's access epochs (`caches::Epochs`)
+    /// of `project` and of `person` (anyone on Earth: 0): keyed BLAKE3 over
+    /// `kind ‖ id ‖ epoch`, so equal tokens are equal epochs and no client
+    /// sees the server-wide clock the epochs are values of (BUG-1081).
+    pub fn tokens(&self, project: i64, project_epoch: i64, person: Option<i64>, person_epoch: i64) -> (i64, i64) {
+        let mac = |kind: u8, id: i64, epoch: i64| {
+            let mut h = blake3::Hasher::new_keyed(&self.epoch_key);
+            h.update(&[kind]);
+            h.update(&id.to_le_bytes());
+            h.update(&epoch.to_le_bytes());
+            i64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().unwrap())
+        };
+        (mac(b'p', project, project_epoch), person.map_or(0, |p| mac(b'q', p, person_epoch)))
+    }
 
-/// The current access epochs of `project` and of `person` (0 where there
-/// is none): one indexed query.
-pub async fn current_epochs(db: &sqlx::PgPool, project: i64, person: Option<i64>) -> Result<(i64, i64)> {
-    Ok(sqlx::query_as(
-        "SELECT COALESCE(MAX(epoch) FILTER (WHERE person_id = 0), 0), COALESCE(MAX(epoch) FILTER (WHERE project_id = 0), 0) \
-         FROM access_epochs WHERE (project_id = $1 AND person_id = 0) OR (project_id = 0 AND person_id = $2)",
-    )
-    .bind(project)
-    .bind(person.unwrap_or(-1))
-    .fetch_one(db)
-    .await?)
+    /// The tokens of the current epochs of `project` and `person` (one
+    /// indexed query).
+    pub async fn current(&self, db: &sqlx::PgPool, project: i64, person: Option<i64>) -> Result<(i64, i64)> {
+        let e = crate::caches::read_epochs(db, person.unwrap_or(0), Some(project)).await?;
+        Ok(self.tokens(project, e.project.map_or(0, |(_, e)| e), person, e.person))
+    }
 }
 
 /// Grants for `tips` (branch → projected snapshot), made with the epochs
-/// read before `viewer` was loaded. A branch whose projected root cannot be
+/// `viewer` was built under (`perm::open_at`). A branch whose projected root cannot be
 /// stored (the store failing, BUG-1083) gets none: the server logs it, and
 /// the tips, S1's fetch and every pull still work.
 pub async fn for_tips(
@@ -136,9 +131,11 @@ pub async fn for_tips(
     project: &Project,
     viewer: &Viewer,
     caller: &Caller,
-    (epoch, person_epoch): (i64, i64),
+    epochs: crate::caches::Epochs,
     tips: &BTreeMap<String, ObjectId>,
 ) -> Result<BTreeMap<String, String>> {
+    let person = caller.person.as_ref().map(|p| p.id);
+    let (epoch, person_epoch) = hub.grants.tokens(project.id, epochs.project.map_or(0, |(_, e)| e), person, epochs.person);
     let expires = veil_core::now_millis() + GRANT_TTL_MS;
     let mut out = BTreeMap::new();
     for (branch, snap) in tips {
@@ -253,7 +250,7 @@ async fn check(hub: &Hub, project: &str, token: &str, ts: i64, signature: Option
     if !g.usable(project, now, g.body.epoch, g.body.person_epoch) || !request_signed(&g, ts, ids, signature, now) {
         return Err(grant_invalid());
     }
-    let (epoch, person_epoch) = current_epochs(&hub.db, g.body.project_id, g.body.person).await?;
+    let (epoch, person_epoch) = hub.grants.current(&hub.db, g.body.project_id, g.body.person).await?;
     if !g.usable(project, now, epoch, person_epoch) {
         return Err(grant_invalid());
     }
@@ -452,10 +449,10 @@ pub async fn epochs(State(hub): State<HubState>, caller: Caller, Query(q): Query
     if names.len() > FEED_PROJECTS {
         return Err(Error::bad_request(format!("at most {FEED_PROJECTS} projects per request")));
     }
-    let mut out = Epochs { person: current_epochs(&hub.db, 0, Some(me)).await?.1, ..Default::default() };
+    let mut out = Epochs { person: hub.grants.tokens(0, 0, Some(me), caller.epochs.person).1, ..Default::default() };
     for name in names {
-        let Ok((project, _)) = crate::perm::open(&hub.db, name, &caller).await else { continue };
-        out.projects.insert(project.name, current_epochs(&hub.db, project.id, None).await?.0);
+        let Ok((project, _, e)) = crate::perm::open_at(&hub, name, &caller).await else { continue };
+        out.projects.insert(project.name, hub.grants.tokens(project.id, e.project.map_or(0, |(_, e)| e), None, 0).0);
     }
     Ok(Json(out))
 }

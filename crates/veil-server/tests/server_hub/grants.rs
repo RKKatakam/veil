@@ -469,7 +469,7 @@ fn bench_object_routes() {
     let mut q = Vec::new();
     for _ in 0..1000 {
         let t = Instant::now();
-        hub.rt.block_on(veil_server::grant::current_epochs(&state.db, g.body.project_id, g.body.person)).unwrap();
+        hub.rt.block_on(state.grants.current(&state.db, g.body.project_id, g.body.person)).unwrap();
         q.push(t.elapsed().as_secs_f64() * 1e6);
     }
     println!("   of which the epoch query (µs): p50 {:.0}  p99 {:.0}", percentile(&mut q.clone(), 0.5), percentile(&mut q, 0.99));
@@ -685,7 +685,7 @@ fn bug_1082_the_epoch_feed_skips_a_change_whose_key_changed_again() {
         .rt
         .block_on(sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = 0").bind(pid).fetch_one(&db))
         .unwrap();
-    assert_eq!(now, current, "the feed gives the project's current epoch");
+    assert_eq!(now, hub.hub().grants.tokens(pid, current, None, 0).0, "the feed gives the project's current epoch");
     assert!(!seen.contains(&now), "each change gives a new epoch: {seen:?} then {now}");
     assert!(invalid(&dev.get(&[], &dev.root())), "a grant of an earlier epoch");
     let fresh = Reader::new(&api, Some(&p.dev), &p.name);

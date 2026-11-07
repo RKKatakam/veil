@@ -9,7 +9,7 @@
 //!   pushed tree back into the full tree (`docs/HUB.md` §4.6, §5.4).
 //! * [`grant`]: read grants (signed by the server, bound to a device) and
 //!   the chain check every layer uses to serve an object only to someone
-//!   whose projected root reaches it (`docs/HUB.md` §13.13).
+//!   whose projected root reaches it (`docs/HUB.md` §13.14).
 //! * [`wire`]: the JSON messages and the object frames of the protocol
 //!   (`docs/HUB.md` §4).
 //!

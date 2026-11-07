@@ -12,6 +12,8 @@
 #
 # Environment:
 #   OBJECTS=local   the server keeps objects in a local directory instead of MinIO
+#   SERVER_BIN      the veil-server to measure (default: the release build here),
+#                   e.g. an older build kept for a before/after comparison
 #   STEP_LIMIT      seconds for the profile's run (default 3600); the build has 1800
 #   OUT_DIR         where results go (default .scratch/bench-results)
 #
@@ -87,7 +89,7 @@ PG_ID=$(D inspect -f '{{.Id}}' "$PG")
 DB_URL=postgres://veil:veil@127.0.0.1:$PG_PORT/veil
 echo "   postgres :$PG_PORT  minio :$S3_PORT"
 
-SERVER_ARGS=(--server "$ROOT/target/release/veil-server" --database-url "$DB_URL")
+SERVER_ARGS=(--server "${SERVER_BIN:-$ROOT/target/release/veil-server}" --database-url "$DB_URL")
 if [[ "${OBJECTS:-s3}" != "local" ]]; then
     export VEIL_S3_ACCESS_KEY=veilminio VEIL_S3_SECRET_KEY=veilminio-secret
     SERVER_ARGS+=(--s3-endpoint "http://127.0.0.1:$S3_PORT" --s3-bucket veil-bench)
@@ -125,9 +127,13 @@ case "$PROFILE" in
     load)
         # Each curve with its own server (and data directory).
         L=("$BENCH" load "${SERVER_ARGS[@]}" --db-container "$PG_ID" --duration 15)
+        # The cost gates (docs/design/server/storage-and-cost.md §9) fail a
+        # curve: 1 database commit per landing; 5 statements per up-to-date pull.
+        run "${L[@]}" --dir "$WORK/quiet" --mode pull --projects 1 --clients 10,100,1000 --background 0 --out "${OUT%.json}-quiet.json" "${EXTRA[@]}" || status=$?
         run "${L[@]}" --dir "$WORK/pull" --mode pull --projects 1 --clients 10,100,1000 --background 20 --out "${OUT%.json}-pull.json" "${EXTRA[@]}" || status=$?
-        ((status == 0)) && { run "${L[@]}" --dir "$WORK/land" --mode land --projects 1,10,100 --clients 1 --rates max --out "${OUT%.json}-land.json" "${EXTRA[@]}" || status=$?; }
-        ((status == 0)) && { run "${L[@]}" --dir "$WORK/hot" --mode land --projects 1 --clients 50 --rates 5,20,40 --out "${OUT%.json}-hot.json" "${EXTRA[@]}" || status=$?; }
+        run "${L[@]}" --dir "$WORK/land" --mode land --projects 1,10,100 --clients 1 --rates max --out "${OUT%.json}-land.json" "${EXTRA[@]}" || status=$?
+        run "${L[@]}" --dir "$WORK/branches" --mode branches --projects 1 --clients 1,10,100 --rates max --out "${OUT%.json}-branches.json" "${EXTRA[@]}" || status=$?
+        run "${L[@]}" --dir "$WORK/hot" --mode land --projects 1 --clients 50 --rates 5,20,40,80 --out "${OUT%.json}-hot.json" "${EXTRA[@]}" || status=$?
         ;;
     *)
         # Generation, the checkout, the server phase (push, clone, pull,
