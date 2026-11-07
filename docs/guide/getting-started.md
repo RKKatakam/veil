@@ -404,7 +404,7 @@ executable-bit change. The numbers are the hunks `vl diff -r REV --json`
 lists (from 1). `--plan FILE` (or `-` for standard input) takes the same as
 JSON, and `vl serve --local` offers `split` and `squash` taking that plan;
 with `--json`, both commands print what they made
-([`veil.split/1`, `veil.squash/1`](../reference/json.md#veilsplit1)).
+([`veil.split/2`, `veil.squash/2`](../reference/json.md#veilsplit2)).
 
 **What can be split by hunk.** Visibility never changes: a hunk of a
 sealed secret file goes into the other change sealed for the same scope.

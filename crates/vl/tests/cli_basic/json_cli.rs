@@ -161,7 +161,7 @@ fn specs() -> Vec<(&'static str, Value)> {
         "findings": [{"line": "number", "rule": "string", "excerpt": "string"}], "error": "string|null",
     });
     vec![
-        ("veil.status/1", json!({
+        ("veil.status/2", json!({
             "schema": "string",
             "workspace": {"name": "string"},
             "working_copy": snapshot_ref(),
@@ -177,9 +177,9 @@ fn specs() -> Vec<(&'static str, Value)> {
             "redacted": [{"path": "string", "redaction": redaction(), "tier": "string"}],
             "conflicts": [{"path": "string", "recorded_on": "string|null", "conflict": conflict_info()}],
         })),
-        ("veil.log/1", json!({"schema": "string", "entries": [log_entry], "truncated": "bool"})),
-        ("veil.diff/1", json!({"schema": "string", "stat": "bool", "files": diff_files()})),
-        ("veil.show/1", json!({
+        ("veil.log/2", json!({"schema": "string", "entries": [log_entry], "truncated": "bool"})),
+        ("veil.diff/2", json!({"schema": "string", "stat": "bool", "files": diff_files()})),
+        ("veil.show/2", json!({
             "schema": "string", "snapshot_id": "string", "snapshot_short": "string",
             "change_id": "string", "change_short": "string", "root": "bool", "author": "string",
             "timestamp": "string|null", "signature": sig(), "parents": [snapshot_ref()], "tags": ["string"],
@@ -187,11 +187,11 @@ fn specs() -> Vec<(&'static str, Value)> {
             "conflicts": ["string"], "description": "string|null",
             "diff": {"stat": "bool", "files": diff_files()},
         })),
-        ("veil.workspace.list/1", json!({
+        ("veil.workspace.list/2", json!({
             "schema": "string",
             "workspaces": [{"name": "string", "current": "bool", "working_copy": snapshot_ref()}],
         })),
-        ("veil.tag.list/1", {
+        ("veil.tag.list/2", {
             let annotation = json!({
                 "?": true, "id": "string", "kind": "string", "tagger": "string", "timestamp": "string|null",
                 "message": "string|null", "signer": "string|null", "verified": "bool", "status": "string",
@@ -211,7 +211,7 @@ fn specs() -> Vec<(&'static str, Value)> {
             "files": [scan_file], "exposed": "number", "protected": "number", "clean": "bool",
         })),
         ("veil.secret.list/1", json!({"schema": "string", "secrets": [{"name": "string"}]})),
-        ("veil.ls/1", json!({
+        ("veil.ls/2", json!({
             "schema": "string", "snapshot": snapshot_ref(), "working_copy": "bool", "all": "bool",
             "entries": [{
                 "path": "string", "dir": "bool", "tier": "string", "scope": "string|null",
@@ -221,16 +221,16 @@ fn specs() -> Vec<(&'static str, Value)> {
                 "conflict": conflict_info(), "kind": "string", "target": "string|null",
             }],
         })),
-        ("veil.resolve.list/1", json!({
+        ("veil.resolve.list/2", json!({
             "schema": "string", "snapshot": snapshot_ref(),
             "conflicts": [{"path": "string", "conflict": conflict_info()}],
         })),
         ("veil.error/1", json!({"schema": "string", "error": {"message": "string", "hint": "string|null"}})),
-        ("veil.split/1", {
+        ("veil.split/2", {
             let taken = json!([{"path": "string", "whole": "bool", "hunks": ["string"]}]);
             json!({"schema": "string", "first": snapshot_ref(), "second": snapshot_ref(), "chosen": taken, "operation": {"op_id": "string", "op_short": "string"}})
         }),
-        ("veil.squash/1", {
+        ("veil.squash/2", {
             let taken = json!([{"path": "string", "whole": "bool", "hunks": ["string"]}]);
             json!({
                 "schema": "string", "destination": snapshot_ref(), "source": nullable(snapshot_ref()),
@@ -370,26 +370,26 @@ fn world() -> World {
 /// Every read command, with `--json`, and the schema it prints.
 fn read_commands() -> Vec<(Vec<&'static str>, &'static str)> {
     vec![
-        (vec!["status", "--json"], "veil.status/1"),
-        (vec!["st", "--json"], "veil.status/1"),
-        (vec!["log", "--json"], "veil.log/1"),
-        (vec!["log", "-n", "1", "--json"], "veil.log/1"),
-        (vec!["diff", "--json"], "veil.diff/1"),
-        (vec!["diff", "--from", "root()", "--to", "@", "--json"], "veil.diff/1"),
-        (vec!["diff", "--from", "root()", "--to", "@", "--stat", "--json"], "veil.diff/1"),
-        (vec!["show", "--json"], "veil.show/1"),
-        (vec!["show", "main", "--json"], "veil.show/1"),
-        (vec!["show", "@-", "--stat", "--json"], "veil.show/1"),
-        (vec!["workspace", "list", "--json"], "veil.workspace.list/1"),
-        (vec!["ws", "list", "--json"], "veil.workspace.list/1"),
-        (vec!["tag", "list", "--json"], "veil.tag.list/1"),
+        (vec!["status", "--json"], "veil.status/2"),
+        (vec!["st", "--json"], "veil.status/2"),
+        (vec!["log", "--json"], "veil.log/2"),
+        (vec!["log", "-n", "1", "--json"], "veil.log/2"),
+        (vec!["diff", "--json"], "veil.diff/2"),
+        (vec!["diff", "--from", "root()", "--to", "@", "--json"], "veil.diff/2"),
+        (vec!["diff", "--from", "root()", "--to", "@", "--stat", "--json"], "veil.diff/2"),
+        (vec!["show", "--json"], "veil.show/2"),
+        (vec!["show", "main", "--json"], "veil.show/2"),
+        (vec!["show", "@-", "--stat", "--json"], "veil.show/2"),
+        (vec!["workspace", "list", "--json"], "veil.workspace.list/2"),
+        (vec!["ws", "list", "--json"], "veil.workspace.list/2"),
+        (vec!["tag", "list", "--json"], "veil.tag.list/2"),
         (vec!["op", "log", "--json"], "veil.op.log/1"),
         (vec!["scan", "--json"], "veil.scan/1"),
         (vec!["secret", "list", "--json"], "veil.secret.list/1"),
-        (vec!["ls", "--json"], "veil.ls/1"),
-        (vec!["ls", "--all", "--json"], "veil.ls/1"),
-        (vec!["resolve", "--list", "--json"], "veil.resolve.list/1"),
-        (vec!["resolve", "--json"], "veil.resolve.list/1"),
+        (vec!["ls", "--json"], "veil.ls/2"),
+        (vec!["ls", "--all", "--json"], "veil.ls/2"),
+        (vec!["resolve", "--list", "--json"], "veil.resolve.list/2"),
+        (vec!["resolve", "--json"], "veil.resolve.list/2"),
     ]
 }
 
@@ -461,7 +461,7 @@ fn status_shape() {
     let nested = env.dir("alice/vendor/lib");
     env.ok("alice", &nested, &["init"]);
     let v = json_ok(env, "alice", alice, &["status", "--json"]);
-    check_doc(&v, "veil.status/1");
+    check_doc(&v, "veil.status/2");
     assert_eq!(v["workspace"]["name"], "default");
     assert_eq!(v["isolated"], json!([".netrc"]));
     let q = nonempty(&v, "quarantined");
@@ -475,7 +475,7 @@ fn status_shape() {
 
     // Bob holds no key: the cloaked file is redacted, with a reason.
     let v = json_ok(env, "bob", &w.bob, &["status", "--json"]);
-    check_doc(&v, "veil.status/1");
+    check_doc(&v, "veil.status/2");
     let r = nonempty(&v, "redacted");
     assert_eq!(r[0]["path"], PLAN);
     assert_eq!(r[0]["redaction"]["reason"], "no_key");
@@ -491,12 +491,12 @@ fn status_shape_with_conflicts() {
     env.ok("alice", &proj, &["commit", "-m", "ours"]);
     env.ok("alice", &proj, &["merge", "other@", "-m", "merge"]);
     let v = json_ok(&env, "alice", &proj, &["status", "--json"]);
-    check_doc(&v, "veil.status/1");
+    check_doc(&v, "veil.status/2");
     let c = nonempty(&v, "conflicts");
     assert_eq!(c[0]["path"], "a.txt");
     assert!(c[0]["recorded_on"].is_string(), "{v}");
     let v = json_ok(&env, "alice", &proj, &["log", "--json"]);
-    check_doc(&v, "veil.log/1");
+    check_doc(&v, "veil.log/2");
     let merge = v["entries"].as_array().unwrap().iter().find(|e| e["parents"].as_array().unwrap().len() == 2).expect("a merge");
     assert_eq!(merge["conflicts"], json!(["a.txt"]));
     // Format 4: the conflict is data, described in every listing.
@@ -504,15 +504,15 @@ fn status_shape_with_conflicts() {
     let roles: Vec<&str> = c[0]["conflict"]["versions"].as_array().unwrap().iter().map(|x| x["role"].as_str().unwrap()).collect();
     assert_eq!(roles, ["side", "base", "side"]);
     let v = json_ok(&env, "alice", &proj, &["ls", "--json"]);
-    check_doc(&v, "veil.ls/1");
+    check_doc(&v, "veil.ls/2");
     let a = v["entries"].as_array().unwrap().iter().find(|e| e["path"] == "a.txt").unwrap();
     assert_eq!(a["conflict"]["sides"], 2, "{a}");
     assert_eq!(a["tier"], "public");
     let v = json_ok(&env, "alice", &proj, &["resolve", "--list", "--json"]);
-    check_doc(&v, "veil.resolve.list/1");
+    check_doc(&v, "veil.resolve.list/2");
     assert_eq!(v["conflicts"][0]["path"], "a.txt");
     let v = json_ok(&env, "alice", &proj, &["diff", "-r", "@-", "--json"]);
-    check_doc(&v, "veil.diff/1");
+    check_doc(&v, "veil.diff/2");
     let out = env.ok("alice", &proj, &["resolve", "a.txt", "--theirs"]);
     assert!(out.contains("Resolved a.txt"), "{out}");
     assert_eq!(std::fs::read_to_string(proj.join("a.txt")).unwrap(), "theirs\n");
@@ -524,7 +524,7 @@ fn status_shape_with_conflicts() {
 fn log_shape() {
     let w = world();
     let v = json_ok(&w.env, "alice", &w.alice, &["log", "--json"]);
-    check_doc(&v, "veil.log/1");
+    check_doc(&v, "veil.log/2");
     assert_eq!(v["truncated"], false);
     let entries = nonempty(&v, "entries");
     let root = entries.last().unwrap();
@@ -541,12 +541,12 @@ fn log_shape() {
     assert!(entries.iter().any(|e| !e["remote_tags"].as_array().unwrap().is_empty()), "{v}");
 
     let v = json_ok(&w.env, "alice", &w.alice, &["log", "-n", "2", "--json"]);
-    check_doc(&v, "veil.log/1");
+    check_doc(&v, "veil.log/2");
     assert_eq!(v["entries"].as_array().unwrap().len(), 2);
     assert_eq!(v["truncated"], true);
 
     let v = json_ok(&w.env, "bob", &w.bob, &["log", "--json"]);
-    check_doc(&v, "veil.log/1");
+    check_doc(&v, "veil.log/2");
 }
 
 #[test]
@@ -554,7 +554,7 @@ fn diff_and_show_shape() {
     let w = world();
     let (env, alice) = (&w.env, &w.alice);
     let v = json_ok(env, "alice", alice, &["diff", "--from", "root()", "--to", "main", "--json"]);
-    check_doc(&v, "veil.diff/1");
+    check_doc(&v, "veil.diff/2");
     assert_eq!(v["stat"], false);
     let files = nonempty(&v, "files");
     let by = |p: &str| files.iter().find(|f| f["path"] == p).unwrap_or_else(|| panic!("no {p} in {v}"));
@@ -571,14 +571,14 @@ fn diff_and_show_shape() {
     assert!(!files.iter().any(|f| f["path"] == ".netrc"), "isolated files are never recorded");
 
     let v = json_ok(env, "alice", alice, &["diff", "--from", "root()", "--to", "main", "--stat", "--json"]);
-    check_doc(&v, "veil.diff/1");
+    check_doc(&v, "veil.diff/2");
     assert!(v["files"].as_array().unwrap().iter().all(|f| f["content"].is_null()), "{v}");
 
     // A modification and a deletion.
     write(alice, "README.md", "hello\nworld");
     std::fs::remove_file(alice.join("run.sh")).unwrap();
     let v = json_ok(env, "alice", alice, &["diff", "--json"]);
-    check_doc(&v, "veil.diff/1");
+    check_doc(&v, "veil.diff/2");
     let files = nonempty(&v, "files");
     let readme = files.iter().find(|f| f["path"] == "README.md").unwrap();
     assert_eq!(readme["status"], "modified");
@@ -587,13 +587,13 @@ fn diff_and_show_shape() {
     assert!(files.iter().any(|f| f["path"] == "run.sh" && f["status"] == "deleted" && f["new"].is_null()), "{v}");
 
     let v = json_ok(env, "alice", alice, &["show", "main", "--json"]);
-    check_doc(&v, "veil.show/1");
+    check_doc(&v, "veil.show/2");
     assert_eq!(v["tags"], json!(["main"]));
     assert_eq!(v["embargo"]["state"], "pending");
     assert_eq!(v["parents"].as_array().unwrap().len(), 2);
     assert_eq!(v["signature"]["status"], "good");
     let v = json_ok(env, "alice", alice, &["show", "root()", "--json"]);
-    check_doc(&v, "veil.show/1");
+    check_doc(&v, "veil.show/2");
     assert!(v["root"] == true && v["signature"].is_null());
 
     // The unreleased embargoed merge never reached the remotes.
@@ -604,17 +604,17 @@ fn diff_and_show_shape() {
     }
     // Bob: the cloaked file's content is hidden, with a reason.
     let v = json_ok(env, "bob", &w.bob, &["diff", "--from", "root()", "--to", "base", "--json"]);
-    check_doc(&v, "veil.diff/1");
+    check_doc(&v, "veil.diff/2");
     let plan = v["files"].as_array().unwrap().iter().find(|f| f["path"] == PLAN).unwrap();
     assert_eq!(plan["new"]["readable"], false);
     assert_eq!(plan["content"]["hidden"]["reason"], "no_key");
     assert_eq!(plan["content"]["hunks"], json!([]));
     let v = json_ok(env, "bob", &w.bob, &["show", "plan-tag", "--json"]);
-    check_doc(&v, "veil.show/1");
+    check_doc(&v, "veil.show/2");
 
     // Carol read the public mirror: the cloaked content was withheld.
     let v = json_ok(env, "carol", &w.carol, &["diff", "--from", "root()", "--to", "base", "--json"]);
-    check_doc(&v, "veil.diff/1");
+    check_doc(&v, "veil.diff/2");
 }
 
 #[test]
@@ -622,13 +622,13 @@ fn list_shapes() {
     let w = world();
     let (env, alice) = (&w.env, &w.alice);
     let v = json_ok(env, "alice", alice, &["ws", "list", "--json"]);
-    check_doc(&v, "veil.workspace.list/1");
+    check_doc(&v, "veil.workspace.list/2");
     let ws = nonempty(&v, "workspaces");
     assert!(ws.iter().any(|w| w["name"] == "default" && w["current"] == true));
     assert!(ws.iter().any(|w| w["name"] == "plan" && w["current"] == false));
 
     let v = json_ok(env, "alice", alice, &["tag", "list", "--json"]);
-    check_doc(&v, "veil.tag.list/1");
+    check_doc(&v, "veil.tag.list/2");
     nonempty(&v, "tags");
     let remote = nonempty(&v, "remote_tags");
     assert!(remote.iter().any(|t| t["name"].as_str().unwrap().contains('/')), "{v}");
@@ -650,12 +650,14 @@ fn ls_shape() {
     std::fs::create_dir_all(alice.join("target")).unwrap();
     write(alice, "target/out.o", "x\n");
     let v = json_ok(env, "alice", alice, &["ls", "--all", "--json"]);
-    check_doc(&v, "veil.ls/1");
+    check_doc(&v, "veil.ls/2");
     assert_eq!((v["working_copy"].clone(), v["all"].clone()), (json!(true), json!(true)));
     let entries = nonempty(&v, "entries");
     let get = |p: &str| entries.iter().find(|e| e["path"] == p).unwrap_or_else(|| panic!("{p} not listed: {v}")).clone();
     assert_eq!(get("logo.bin")["tier"], "public");
-    assert_eq!(get("README.md")["tier"], "public", "an embargo is a permission, not a tier");
+    // The working copy builds on the unreleased embargo, whose fix
+    // changed README.md: no push sends this version yet (BUG-944).
+    assert_eq!(get("README.md")["tier"], "embargoed", "an unreleased embargo withholds this version");
     let plan = get(PLAN);
     assert_eq!((plan["tier"].clone(), plan["scope"].clone(), plan["readable"].clone()), (json!("cloaked"), json!("team"), json!(true)));
     let env_file = get(".netrc");
@@ -668,17 +670,19 @@ fn ls_shape() {
 
     // Bob holds no key: the cloaked file is redacted, with the reason.
     let v = json_ok(env, "bob", &w.bob, &["ls", "--json"]);
-    check_doc(&v, "veil.ls/1");
+    check_doc(&v, "veil.ls/2");
     let entries = nonempty(&v, "entries");
     let plan = entries.iter().find(|e| e["path"] == PLAN).unwrap();
     assert_eq!((plan["tier"].clone(), plan["readable"].clone()), (json!("redacted"), json!(false)), "{v}");
     assert_eq!(plan["redaction"]["reason"], "no_key");
-    // Main (the embargoed merge) lists its files plainly for Alice.
+    // Main (the embargoed merge) lists its files plainly for Alice, the
+    // fix's version as `embargoed` (no push sends it yet, BUG-944), its
+    // plain visibility as public.
     let v = json_ok(env, "alice", alice, &["ls", "-r", "main", "README.md", "--json"]);
-    check_doc(&v, "veil.ls/1");
+    check_doc(&v, "veil.ls/2");
     assert_eq!(v["working_copy"], false);
     let e = &nonempty(&v, "entries")[0];
-    assert_eq!(e["tier"], "public", "{v}");
+    assert_eq!((e["tier"].clone(), e["visibility"]["kind"].clone()), (json!("embargoed"), json!("public")), "{v}");
 }
 
 #[test]
@@ -823,15 +827,15 @@ fn split_and_squash_shapes() {
     write(&p, "a.txt", "ONE\n2\n3\n4\n5\n6\n7\n8\n9\nTEN\n");
     write(&p, "b.txt", "B\n");
     let v = json_ok(&env, "alice", &p, &["split", "--hunks", "a.txt:1", "-m", "first", "--json"]);
-    check_doc(&v, "veil.split/1");
+    check_doc(&v, "veil.split/2");
     assert_eq!(v["chosen"], json!([{"path": "a.txt", "whole": false, "hunks": ["1"]}]));
     assert_eq!(v["first"]["description"], "first");
     let v = json_ok(&env, "alice", &p, &["squash", "b.txt", "--json"]);
-    check_doc(&v, "veil.squash/1");
+    check_doc(&v, "veil.squash/2");
     assert_eq!(v["source_abandoned"], false);
     assert_eq!(v["moved"], json!([{"path": "b.txt", "whole": true, "hunks": []}]));
     let v = json_ok(&env, "alice", &p, &["squash", "--json"]);
-    check_doc(&v, "veil.squash/1");
+    check_doc(&v, "veil.squash/2");
     assert_eq!(v["source"], Value::Null);
     assert_eq!(v["source_abandoned"], true);
     // A refusal is a `veil.error/1` document.

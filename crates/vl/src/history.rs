@@ -73,7 +73,7 @@ fn line_range(s: &str) -> Result<(usize, usize)> {
     Ok((a, b))
 }
 
-/// The `veil.blame/1` document of `a` (`vl blame`, and `vl serve`'s
+/// The `veil.blame/2` document of `a` (`vl blame`, and `vl serve`'s
 /// `blame` method).
 pub fn blame_doc(ctx: &Ctx, a: &BlameArgs) -> Result<api::BlameDoc> {
     let lines = a.lines.as_deref().map(line_range).transpose()?;
@@ -133,7 +133,7 @@ pub struct GrepArgs {
     pub out: JsonOut,
 }
 
-/// The `veil.grep/1` document of `a` (`vl grep`, and `vl serve`'s `grep`
+/// The `veil.grep/2` document of `a` (`vl grep`, and `vl serve`'s `grep`
 /// method).
 pub fn grep_doc(ctx: &Ctx, a: &GrepArgs) -> Result<api::GrepDoc> {
     let opts = GrepOptions {

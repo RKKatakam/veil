@@ -25,7 +25,7 @@ Status: design and threat review. No format change: renames are computed, never 
   - `vl diff` and `vl show` print `R087 old -> new` and copies as `C`; `--no-renames` turns detection off and `-M[N]` / `-C` tune it.
   - `vl status` shows `R old -> new` (conformance t7525/t7001).
   - `vl log --follow PATH`, path filtering itself being feature 3.
-  - JSON is additive in `veil.diff/1` and `veil.status/1`: `{status:"renamed", from, path, score}`. This is additive, so the schema keeps its version; `docs/reference/json.md` is updated.
+  - JSON is additive in `veil.diff/2` and `veil.status/2`: `{status:"renamed", from, path, score}`. This is additive, so the schema keeps its version; `docs/reference/json.md` is updated.
   - Touches `api::change`, `api::diff_body` and `api::status` in `crates/vl/src/api.rs`, and `api/text.rs`.
 - **Merge** (`merge.rs`): a rename on one side plus an edit on the other is a modify/delete conflict today (conformance note). New step in `merge::merge_trees_in`, before the directory walk:
   - Detect renames base→ours and base→theirs, exact plus inexact, with the reader's view. Detection is restricted to the **verified-public or same-audience** pairs below.

@@ -340,20 +340,20 @@ fn write_methods_record_operations_that_undo_takes_back() {
 
     write(&alice, "new.txt", "from the editor\n");
     let r = c.ok("snapshot", json!({}));
-    assert_eq!(r["schema"], "veil.snapshot/1");
+    assert_eq!(r["schema"], "veil.snapshot/2");
     let st = c.ok("status", json!({"snapshot": false}));
     assert!(st["changes"].as_array().unwrap().iter().any(|ch| ch["path"] == "new.txt"), "{st}");
     assert_eq!(st["working_copy"]["snapshot_id"], r["working_copy"]["snapshot_id"]);
     assert_eq!(c.ok("op.log", json!({"limit": 1, "snapshot": false}))["operations"][0]["op_id"], r["operation"]["op_id"]);
 
     let d = c.ok("describe", json!({"message": "described over the socket"}));
-    assert_eq!(d["schema"], "veil.describe/1");
+    assert_eq!(d["schema"], "veil.describe/2");
     assert_eq!(d["described"]["description"], "described over the socket");
     assert_eq!(cli_json(&env, "alice", &alice, &["show", "--json"])["description"], "described over the socket");
 
     let before = cli_json(&env, "alice", &alice, &["show", "--json"]);
     let cm = c.ok("commit", json!({"message": "committed over the socket"}));
-    assert_eq!(cm["schema"], "veil.commit/1");
+    assert_eq!(cm["schema"], "veil.commit/2");
     assert_eq!(cm["committed"]["description"], "committed over the socket");
     assert_eq!(cm["committed"]["change_id"], before["change_id"]);
     assert_eq!(cm["working_copy"]["empty"], true);
@@ -366,7 +366,7 @@ fn write_methods_record_operations_that_undo_takes_back() {
     assert_eq!(at["description"], "described over the socket");
 
     let n = c.ok("new", json!({"message": "next"}));
-    assert_eq!(n["schema"], "veil.new/1");
+    assert_eq!(n["schema"], "veil.new/2");
     assert_eq!(n["working_copy"]["description"], "next");
     assert_eq!(cli_json(&env, "alice", &alice, &["show", "--json"])["snapshot_id"], n["working_copy"]["snapshot_id"]);
     env.ok("alice", &alice, &["undo"]);
@@ -564,7 +564,7 @@ fn malformed_requests_get_json_rpc_errors() {
     let v = c.recv();
     let a = v.as_array().unwrap_or_else(|| panic!("{v}"));
     assert_eq!(a.len(), 2);
-    assert_eq!(a[0]["result"]["schema"], "veil.tag.list/1");
+    assert_eq!(a[0]["result"]["schema"], "veil.tag.list/2");
     assert_eq!(a[1]["error"]["code"], -32601);
     let big: Vec<String> = (0..65).map(|i| format!(r#"{{"jsonrpc":"2.0","id":{i},"method":"server.info"}}"#)).collect();
     c.send(&format!("[{}]", big.join(",")));
@@ -737,7 +737,7 @@ fn the_client_mode_and_long_paths() {
     // From a subdirectory, and with -R, as every command.
     std::fs::create_dir_all(p.join("sub")).unwrap();
     let st = env.stdout("alice", &p.join("sub"), &["serve", "--call", "status"]);
-    assert!(st.starts_with("{\"schema\":\"veil.status/1\""));
+    assert!(st.starts_with("{\"schema\":\"veil.status/2\""));
     let st = env.stdout("alice", &env.root, &["-R", p.to_str().unwrap(), "serve", "--call", "op.log", r#"{"limit":1}"#]);
     assert!(st.starts_with("{\"schema\":\"veil.op.log/1\""));
     // Errors: the veil.error/1 document on stdout, exit 1.
@@ -765,8 +765,8 @@ fn a_bare_repository_serves_history_only() {
     env.ok("alice", &p, &["push"]);
     let server = Server::start(&env, "alice", &team);
     let mut c = server.conn();
-    assert_eq!(c.ok("log", json!({}))["schema"], "veil.log/1");
-    assert_eq!(c.ok("tag.list", json!({}))["schema"], "veil.tag.list/1");
+    assert_eq!(c.ok("log", json!({}))["schema"], "veil.log/2");
+    assert_eq!(c.ok("tag.list", json!({}))["schema"], "veil.tag.list/2");
     for m in ["status", "commit", "snapshot"] {
         let params = if m == "commit" { json!({"message": "x"}) } else { json!({}) };
         let (code, e) = c.err(m, params);
@@ -785,7 +785,7 @@ fn a_panicking_or_slow_reader_does_not_block_others() {
     stuck.write_all(b"{\"jsonrpc\":\"2.0\",").unwrap();
     // Others are served meanwhile.
     let mut c = server.conn();
-    assert_eq!(c.ok("status", json!({}))["schema"], "veil.status/1");
+    assert_eq!(c.ok("status", json!({}))["schema"], "veil.status/2");
     let mut buf = [0u8; 1];
     stuck.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
     assert!(stuck.read(&mut buf).is_err(), "no answer to half a request");
@@ -950,11 +950,11 @@ fn split_and_squash_from_a_plan() {
     let server = Server::start(&env, "alice", &p);
     let mut c = server.conn();
     let v = c.ok("split", json!({"message": "from the server", "files": [{"path": "a.txt", "hunks": [2]}]}));
-    assert_eq!(v["schema"], "veil.split/1");
+    assert_eq!(v["schema"], "veil.split/2");
     assert_eq!(v["first"]["description"], "from the server");
     assert_eq!(env.stdout("alice", &p, &["cat", "-r", "@-", "a.txt"]), "1\n2\n3\n4\n5\n6\n7\n8\n9\nTEN\n");
     let v = c.ok("squash", json!({"files": [{"path": "c.txt"}]}));
-    assert_eq!(v["schema"], "veil.squash/1");
+    assert_eq!(v["schema"], "veil.squash/2");
     assert_eq!(v["source_abandoned"], false);
     assert_eq!(env.stdout("alice", &p, &["cat", "-r", "@-", "c.txt"]), "c\n");
     let (code, _) = c.err("squash", json!({"files": []}));

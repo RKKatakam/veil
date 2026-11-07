@@ -836,8 +836,8 @@ pub enum EmbargoCmd {
     /// List embargoes.
     List,
     /// Release an embargo: show what becomes public, ask, and release it in
-    /// this repository. The next push publishes the key;
-    /// until then `vl undo` takes the release back.
+    /// this repository. The next push publishes the release and the
+    /// history it withheld; until then `vl undo` takes the release back.
     Release {
         /// Embargo id, from `vl embargo list`.
         id: String,

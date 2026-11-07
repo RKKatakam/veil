@@ -91,7 +91,7 @@ owsxoqpu (alice 2026-11-04 7) }
   more. The author is a claim (whoever made the snapshot wrote it); `vl log`
   shows whether the signature is good.
 * `vl annotate` is the same command.
-* `--json` gives [`veil.blame/1`](../reference/json.md#veilblame1).
+* `--json` gives [`veil.blame/2`](../reference/json.md#veilblame2).
 
 **Limits.** Blame visits each snapshot at most once. It stops after
 `--max-changes` snapshots (default 100 000) or when its work budget is

@@ -108,7 +108,7 @@ The local-only tiers (`isolated`, `quarantined`, `ignored`) come from the
 working copy, so they are listed for `-r @` only (and not with
 `--no-snapshot`). Paths narrow the list to those files or directories,
 relative to the current directory. `vl ls --json` prints the same as one
-document ([`veil.ls/1`](../reference/json.md#veills1)).
+document ([`veil.ls/2`](../reference/json.md#veills2)).
 
 `vl status` marks changed and local-only files with the same tiers (public
 files carry no mark):

@@ -64,7 +64,7 @@ vl duplicate REV… [-d DEST…] [-m MSG | --keep-description] [-x] [--json]
 - One operation: `vl undo` removes every copy (and, for cherry-pick, puts
   `@` and the tags back).
 
-`--json` prints `veil.duplicate/1` ([reference](../reference/json.md#veilduplicate1)):
+`--json` prints `veil.duplicate/2` ([reference](../reference/json.md#veilduplicate2)):
 the ids of each source and copy, its conflicts and the renames it followed,
 never a description.
 

@@ -82,7 +82,7 @@ vl split --hunks src/config.rs:1,3 -m "Config: read the new keys" --json | jq -r
 
 * **One document, one line**, on standard output. Warnings and errors still
   go to standard error.
-* **`schema`** names the document and its version: `veil.status/1`. New
+* **`schema`** names the document and its version: `veil.status/2`. New
   fields may appear without notice; anything that could break a reader (a
   field removed, renamed or retyped) comes with a new version,
   `veil.status/2`. Check `schema`, and ignore fields you don't know.

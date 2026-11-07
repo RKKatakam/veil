@@ -45,24 +45,24 @@ use crate::ctx::Ctx;
 
 // ---- schema names ------------------------------------------------------------
 
-pub const STATUS_SCHEMA: &str = "veil.status/1";
-pub const LOG_SCHEMA: &str = "veil.log/1";
-pub const DIFF_SCHEMA: &str = "veil.diff/1";
-pub const SHOW_SCHEMA: &str = "veil.show/1";
-pub const WORKSPACE_LIST_SCHEMA: &str = "veil.workspace.list/1";
-pub const TAG_LIST_SCHEMA: &str = "veil.tag.list/1";
+pub const STATUS_SCHEMA: &str = "veil.status/2";
+pub const LOG_SCHEMA: &str = "veil.log/2";
+pub const DIFF_SCHEMA: &str = "veil.diff/2";
+pub const SHOW_SCHEMA: &str = "veil.show/2";
+pub const WORKSPACE_LIST_SCHEMA: &str = "veil.workspace.list/2";
+pub const TAG_LIST_SCHEMA: &str = "veil.tag.list/2";
 pub const OP_LOG_SCHEMA: &str = "veil.op.log/1";
 pub const SCAN_SCHEMA: &str = "veil.scan/1";
 pub const SECRET_LIST_SCHEMA: &str = "veil.secret.list/1";
 pub const ERROR_SCHEMA: &str = "veil.error/1";
-pub const LS_SCHEMA: &str = "veil.ls/1";
-pub const RESOLVE_LIST_SCHEMA: &str = "veil.resolve.list/1";
-pub const SNAPSHOT_SCHEMA: &str = "veil.snapshot/1";
-pub const DESCRIBE_SCHEMA: &str = "veil.describe/1";
-pub const NEW_SCHEMA: &str = "veil.new/1";
-pub const COMMIT_SCHEMA: &str = "veil.commit/1";
-pub const BLAME_SCHEMA: &str = "veil.blame/1";
-pub const GREP_SCHEMA: &str = "veil.grep/1";
+pub const LS_SCHEMA: &str = "veil.ls/2";
+pub const RESOLVE_LIST_SCHEMA: &str = "veil.resolve.list/2";
+pub const SNAPSHOT_SCHEMA: &str = "veil.snapshot/2";
+pub const DESCRIBE_SCHEMA: &str = "veil.describe/2";
+pub const NEW_SCHEMA: &str = "veil.new/2";
+pub const COMMIT_SCHEMA: &str = "veil.commit/2";
+pub const BLAME_SCHEMA: &str = "veil.blame/2";
+pub const GREP_SCHEMA: &str = "veil.grep/2";
 
 // ---- JSON output -------------------------------------------------------------
 
@@ -474,6 +474,38 @@ pub fn change(repo: &Repo, c: &TreeChange) -> Change {
 
 /// A [`Change`] for each item: a pair is listed at its destination, with
 /// its source in `from`.
+/// Which files of a snapshot an unreleased embargo still withholds
+/// (BUG-944): those that differ from the tree a push already published
+/// (`remote::embargo_base`). Their tier is `embargoed`, never `public`:
+/// no push sends them before the release.
+pub struct EmbargoTiers {
+    base: Option<ObjectId>,
+}
+
+impl EmbargoTiers {
+    pub fn of(repo: &Repo, snapshot: &ObjectId) -> Result<EmbargoTiers> {
+        let base = match veil_core::remote::embargo_base(repo, snapshot)? {
+            Some(b) => Some(repo.snapshot(&b)?.tree),
+            None => None,
+        };
+        Ok(EmbargoTiers { base })
+    }
+
+    /// `tier` of the version `e` at `p`, or `embargoed` if it is a public
+    /// version the embargo withholds.
+    pub fn tier(&self, repo: &Repo, p: &VPath, e: Option<&TreeEntry>, tier: &'static str) -> &'static str {
+        match (&self.base, e) {
+            (Some(base), Some(e)) if tier == "public" => {
+                match lookup(repo.store(), base, p).ok().flatten() {
+                    Some(b) if b.id == e.id && b.kind == e.kind => tier,
+                    _ => "embargoed",
+                }
+            }
+            _ => tier,
+        }
+    }
+}
+
 pub fn item_change(repo: &Repo, item: &Item) -> Change {
     match item {
         Item::Change(c) => change(repo, c),
@@ -577,7 +609,7 @@ fn redaction_for_diff(repo: &Repo, e: &TreeEntry, err: &veil_core::VeilError) ->
 
 // ---- status ----------------------------------------------------------------------
 
-/// `vl status --json` (`veil.status/1`).
+/// `vl status --json` (`veil.status/2`).
 #[derive(Serialize, Debug)]
 pub struct Status {
     pub schema: &'static str,
@@ -710,7 +742,21 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
         workspace: WorkspaceInfo { name: ctx.ws.clone() },
         working_copy: snapshot_ref(repo, &wc),
         parents: s.parents.iter().map(|p| snapshot_ref(repo, p)).collect(),
-        changes: changes.iter().map(|c| item_change(repo, c)).collect(),
+        changes: {
+            let embargo = EmbargoTiers::of(repo, &wc)?;
+            changes
+                .iter()
+                .map(|c| {
+                    let mut ch = item_change(repo, c);
+                    let (p, e) = match c {
+                        Item::Change(c) => (&c.path, c.new.as_ref()),
+                        Item::Pair(pr) => (&pr.to, Some(&pr.new)),
+                    };
+                    ch.tier = embargo.tier(repo, p, e, ch.tier);
+                    ch
+                })
+                .collect()
+        },
         isolated: report.isolated.iter().map(path).collect(),
         quarantined: report
             .quarantined
@@ -740,7 +786,7 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
 
 // ---- log -------------------------------------------------------------------------
 
-/// `vl log --json` (`veil.log/1`).
+/// `vl log --json` (`veil.log/2`).
 #[derive(Serialize, Debug)]
 pub struct Log {
     pub schema: &'static str,
@@ -1036,7 +1082,7 @@ pub fn log_with(repo: &Repo, ws: &str, q: LogQuery) -> Result<Log> {
 
 // ---- diff ------------------------------------------------------------------------
 
-/// `vl diff --json` (`veil.diff/1`).
+/// `vl diff --json` (`veil.diff/2`).
 #[derive(Serialize, Debug)]
 pub struct Diff {
     pub schema: &'static str,
@@ -1300,7 +1346,7 @@ pub fn diff_trees_for(ctx: &Ctx, rev: Option<&str>, from: Option<&str>, to: Opti
 
 // ---- show ------------------------------------------------------------------------
 
-/// `vl show --json` (`veil.show/1`).
+/// `vl show --json` (`veil.show/2`).
 #[derive(Serialize, Debug)]
 pub struct Show {
     pub schema: &'static str,
@@ -1406,7 +1452,7 @@ pub fn show_header(ctx: &Ctx, rev: &str, stat: bool) -> Result<Show> {
 
 // ---- workspace list, tag list, op log, secret list ----------------------------------------
 
-/// `vl workspace list --json` (`veil.workspace.list/1`).
+/// `vl workspace list --json` (`veil.workspace.list/2`).
 #[derive(Serialize, Debug)]
 pub struct WorkspaceList {
     pub schema: &'static str,
@@ -1437,7 +1483,7 @@ pub fn workspace_list(repo: &Repo, current: &str) -> WorkspaceList {
     }
 }
 
-/// `vl tag list --json` (`veil.tag.list/1`).
+/// `vl tag list --json` (`veil.tag.list/2`).
 #[derive(Serialize, Debug)]
 pub struct TagList {
     pub schema: &'static str,
@@ -1847,7 +1893,7 @@ pub fn scan_gate(fs: &dyn StorageBackend, policy: &Policy, policy_from: &str) ->
 
 // ---- ls --------------------------------------------------------------------------
 
-/// `vl ls --json` (`veil.ls/1`).
+/// `vl ls --json` (`veil.ls/2`).
 #[derive(Serialize, Debug)]
 pub struct Ls {
     pub schema: &'static str,
@@ -1866,7 +1912,7 @@ pub struct LsEntry {
     pub path: String,
     /// An ignored directory, listed as a whole (never descended into).
     pub dir: bool,
-    /// `public`, `cloaked`, `redacted` (recorded, but sealed for someone
+    /// `public`, `cloaked`, `embargoed` (withheld by an unreleased embargo), `redacted` (recorded, but sealed for someone
     /// else or withheld here), `isolated`, `ignored` or
     /// `quarantined` (see [`entry_tier`]).
     pub tier: &'static str,
@@ -1931,6 +1977,7 @@ pub fn ls(ctx: &Ctx, rev: &str, paths: &[String], all: bool, local_files: bool) 
     let working_copy = local_files && !ctx.bare && ctx.wc().ok() == Some(id);
     let filters: Vec<VPath> = paths.iter().map(|p| ctx.repo_path(p)).collect::<Result<_>>()?;
     let report = &ctx.report;
+    let embargo = EmbargoTiers::of(repo, &id)?;
     let quarantined: HashMap<&VPath, &veil_core::secrets::Finding> =
         report.quarantined.iter().filter_map(|(p, f)| f.first().map(|f| (p, f))).collect();
     let quarantine = |p: &VPath| {
@@ -1955,6 +2002,7 @@ pub fn ls(ctx: &Ctx, rev: &str, paths: &[String], all: bool, local_files: bool) 
             "redacted" => redaction_for_listing(repo, &e),
             _ => None,
         };
+        tier = embargo.tier(repo, &p, Some(&e), tier);
         let q = working_copy.then(|| quarantine(&p)).flatten();
         if q.is_some() {
             tier = "quarantined";
@@ -2048,7 +2096,7 @@ pub fn ls(ctx: &Ctx, rev: &str, paths: &[String], all: bool, local_files: bool) 
 
 // ---- resolve --list -----------------------------------------------------------------
 
-/// `vl resolve --list --json` (`veil.resolve.list/1`).
+/// `vl resolve --list --json` (`veil.resolve.list/2`).
 #[derive(Serialize, Debug)]
 pub struct ResolveList {
     pub schema: &'static str,
@@ -2112,7 +2160,7 @@ pub fn op_ref(repo: &Repo) -> OpRef {
     OpRef { op_id: id.hex(), op_short: id.short() }
 }
 
-/// `snapshot` (`veil.snapshot/1`): the working copy was recorded.
+/// `snapshot` (`veil.snapshot/2`): the working copy was recorded.
 #[derive(Serialize, Debug)]
 pub struct Recorded {
     pub schema: &'static str,
@@ -2125,7 +2173,7 @@ pub fn recorded(ctx: &Ctx) -> Result<Recorded> {
     Ok(Recorded { schema: SNAPSHOT_SCHEMA, working_copy: snapshot_ref(&ctx.repo, &ctx.wc()?), operation: op_ref(&ctx.repo) })
 }
 
-/// `vl describe` (`veil.describe/1`).
+/// `vl describe` (`veil.describe/2`).
 #[derive(Serialize, Debug)]
 pub struct Described {
     pub schema: &'static str,
@@ -2152,7 +2200,7 @@ pub fn describe(ctx: &mut Ctx, rev: &str, message: &str) -> Result<Described> {
     Ok(Described { schema: DESCRIBE_SCHEMA, described: snapshot_ref(&ctx.repo, &new), operation: op_ref(&ctx.repo), id: new })
 }
 
-/// `vl new` (`veil.new/1`).
+/// `vl new` (`veil.new/2`).
 #[derive(Serialize, Debug)]
 pub struct NewChange {
     pub schema: &'static str,
@@ -2169,7 +2217,7 @@ pub fn new_change(ctx: &mut Ctx, revs: &[String], message: &str) -> Result<NewCh
     Ok(NewChange { schema: NEW_SCHEMA, working_copy: snapshot_ref(&ctx.repo, &id), operation: op_ref(&ctx.repo) })
 }
 
-/// `vl commit` (`veil.commit/1`).
+/// `vl commit` (`veil.commit/2`).
 #[derive(Serialize)]
 pub struct Committed {
     pub schema: &'static str,
@@ -2293,7 +2341,7 @@ mod cli_tests {
 
 // ---- blame -----------------------------------------------------------------------
 
-/// `vl blame --json` (`veil.blame/1`).
+/// `vl blame --json` (`veil.blame/2`).
 #[derive(Serialize, Debug)]
 pub struct BlameDoc {
     pub schema: &'static str,
@@ -2460,7 +2508,7 @@ pub fn blame(ctx: &Ctx, req: &BlameRequest<'_>) -> Result<BlameDoc> {
 
 // ---- grep ------------------------------------------------------------------------
 
-/// `vl grep --json` (`veil.grep/1`).
+/// `vl grep --json` (`veil.grep/2`).
 #[derive(Serialize, Debug)]
 pub struct GrepDoc {
     pub schema: &'static str,
@@ -2530,6 +2578,7 @@ pub fn grep(ctx: &Ctx, req: GrepRequest<'_>) -> Result<GrepDoc> {
     o.paths = req.paths.iter().map(|p| ctx.repo_path(p)).collect::<Result<_>>()?;
     let re = veil_core::grep::compile(req.pattern, &o)?;
     let g = veil_core::grep::grep(repo.store(), &tree, &re, &o)?;
+    let embargo = EmbargoTiers::of(repo, &id)?;
     let mut matches = Vec::new();
     let mut files = Vec::new();
     for f in &g.files {
@@ -2537,13 +2586,15 @@ pub fn grep(ctx: &Ctx, req: GrepRequest<'_>) -> Result<GrepDoc> {
             Tier::Cloaked(s) => Some(s.clone()),
             _ => None,
         };
-        files.push(GrepFileDoc { path: path(&f.path), tier: f.tier.as_str(), scope, count: f.count, binary: f.binary, conflict: f.conflict });
+        let entry = lookup(repo.store(), &tree, &f.path)?;
+        let tier = embargo.tier(repo, &f.path, entry.as_ref(), f.tier.as_str());
+        files.push(GrepFileDoc { path: path(&f.path), tier, scope, count: f.count, binary: f.binary, conflict: f.conflict });
         for l in &f.lines {
             matches.push(GrepMatchDoc {
                 path: path(&f.path),
                 line: l.number,
                 text: String::from_utf8_lossy(&l.text).into_owned(),
-                tier: f.tier.as_str(),
+                tier,
                 truncated: l.truncated,
             });
         }

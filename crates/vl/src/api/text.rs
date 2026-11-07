@@ -79,7 +79,7 @@ pub fn tier_label(tier: &str, scope: Option<&str>) -> String {
 fn tier_coloured(label: &str, tier: &str) -> String {
     match tier {
         "cloaked" => magenta(label),
-        "quarantined" => yellow(label),
+        "embargoed" | "quarantined" => yellow(label),
         "redacted" => red(label),
         _ => dim(label),
     }

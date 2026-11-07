@@ -14,7 +14,7 @@ vl blame PATH [-r REV] [-L START,END] [--follow] [--max-changes N] [--json]
 ```
 
 - **Output:** one line per line of `PATH` at `REV` (default `@`): the short change id, the author (a claim; see the threat model), the date and the line.
-  - `--json` returns `veil.blame/1`: `{path, rev, lines:[{line, change, snapshot, author, timestamp, text}], unattributed?, redacted?}`.
+  - `--json` returns `veil.blame/2`: `{path, rev, lines:[{line, change, snapshot, author, timestamp, text}], unattributed?, redacted?}`.
 - **Algorithm** (new `crates/veil-core/src/blame.rs`, `pub fn blame(repo, rev, path, opts) -> Result<Blame>`):
   - Walk the ancestors of `REV`, children before parents (`Repo::topo_children_first`). Keep the set of lines not yet attributed. For each snapshot, diff the file between the snapshot and each parent's version.
     - The parent's version comes from `Repo::parents_tree`, the same merged base `vl diff` uses. A line that every parent lacks is attributed to the snapshot. A line a parent holds moves to that parent.
@@ -99,7 +99,7 @@ vl cherry-pick REV… [-d @]     (alias: duplicate onto @-, then @ rebases on to
     - *Test:* duplicate a two-scope conflict, then `resolve --list` as each member.
 15. **Signature and provenance spoofing.** `author` is copied (a claim), the duplicate is signed by the duplicator, and `vl log` shows both. *Invariant:* no field implies the original signer signed the duplicate.
 16. **Undo.** One transaction per command, so `vl undo` removes the duplicates exactly. *Test:* duplicate three changes, then `undo`; the view is equal.
-17. **`--json` and `vl serve`.** `veil.duplicate/1` lists the new ids only. `serve` exposes `blame` (read) and not `bisect run` (it executes code). *Test:* `serve` method list check (`every_method_is_listed_once`).
+17. **`--json` and `vl serve`.** `veil.duplicate/2` lists the new ids only. `serve` exposes `blame` (read) and not `bisect run` (it executes code). *Test:* `serve` method list check (`every_method_is_listed_once`).
 
 ## Open decisions
 

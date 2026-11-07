@@ -35,7 +35,7 @@ vl grep PATTERN [-r REV] [-i] [-F] [-w] [-n] [-l] [-c] [--max-count N] [-a] [--j
   - Each file is read through `blame::readable_version`. `Plain` is searched. `Redacted` is counted in `skipped: {sealed: N}` and never searched.
   - Binary content (a NUL in the first 8 KiB, or attribute `binary`/`-text`, feature 7) prints "binary file matches" unless `-a`.
   - Conflict entries are searched in their rendering for this reader (`conflict::materialize`).
-- **Output:** `path:line:text`, escaped with `render::safe`. JSON is `veil.grep/1` `{rev, matches:[{path, line, text, tier}], skipped:{sealed, binary, too_large}}`. `serve` gets a `grep` method.
+- **Output:** `path:line:text`, escaped with `render::safe`. JSON is `veil.grep/2` `{rev, matches:[{path, line, text, tier}], skipped:{sealed, binary, too_large}}`. `serve` gets a `grep` method.
 - **Parallelism:** files are searched on `remote::par_map`-style worker threads. Output order is sorted by path, so it is deterministic.
 
 ## Threat review

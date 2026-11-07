@@ -389,7 +389,7 @@ fn blame_text_json_and_flags() {
     assert!(lines[1].starts_with(&second[..8]) && lines[1].contains("alice") && lines[1].ends_with("2) TWO"), "{out}");
     assert_eq!(env.stdout("alice", &dir, &["annotate", "f.txt"]), out);
     let v = json_ok(&env, "alice", &dir, &["blame", "f.txt", "-L", "2,3", "--json"]);
-    assert_eq!(v["schema"], "veil.blame/1");
+    assert_eq!(v["schema"], "veil.blame/2");
     assert_eq!(v["lines"].as_array().unwrap().len(), 2);
     assert_eq!(v["lines"][0]["line"], 2);
     assert_eq!(v["lines"][0]["author"], "alice");
@@ -460,7 +460,7 @@ fn grep_flags_output_and_exit_codes() {
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.is_empty());
     let v = json_ok(&env, "alice", &dir, &["grep", "key", "--json", "a.txt", "bin.dat", "src"]);
-    assert_eq!(v["schema"], "veil.grep/1");
+    assert_eq!(v["schema"], "veil.grep/2");
     assert_eq!(v["matches"].as_array().unwrap().len(), 3);
     assert_eq!(v["files"].as_array().unwrap().len(), 3);
     assert_eq!(v["skipped"]["binary"], 1);
@@ -867,10 +867,10 @@ fn serve_offers_blame_and_grep_but_not_bisect() {
     let info = env.stdout("alice", &dir, &["serve", "--call", "server.info"]);
     assert!(info.contains("\"blame\"") && info.contains("\"grep\"") && !info.contains("bisect"), "{info}");
     let v: Value = serde_json::from_str(&env.stdout("alice", &dir, &["serve", "--call", "blame", r#"{"path":"f.txt","lines":[1,1]}"#])).unwrap();
-    assert_eq!(v["schema"], "veil.blame/1");
+    assert_eq!(v["schema"], "veil.blame/2");
     assert_eq!(v["lines"][0]["text"], "needle");
     let v: Value = serde_json::from_str(&env.stdout("alice", &dir, &["serve", "--call", "grep", r#"{"pattern":"NEEDLE","ignore_case":true}"#])).unwrap();
-    assert_eq!(v["schema"], "veil.grep/1");
+    assert_eq!(v["schema"], "veil.grep/2");
     assert_eq!(v["matches"][0]["path"], "f.txt");
     let out = env.vl("alice", &dir, &["serve", "--call", "bisect", "{}"]);
     assert!(!out.status.success());
@@ -886,11 +886,11 @@ fn new_schemas_are_documented() {
     let dir = env.project("alice", "p", &[("f.txt", "one\n"), ("g.txt", "some content to move\n")]);
     std::fs::rename(dir.join("g.txt"), dir.join("h.txt")).unwrap();
     let docs = [
-        ("veil.blame/1", json_ok(&env, "alice", &dir, &["blame", "f.txt", "--json"])),
-        ("veil.grep/1", json_ok(&env, "alice", &dir, &["grep", "one", "--json"])),
-        ("veil.log/1", json_ok(&env, "alice", &dir, &["log", "-S", "one", "--show-skipped", "--json"])),
-        ("veil.diff/1", json_ok(&env, "alice", &dir, &["diff", "--json"])),
-        ("veil.status/1", json_ok(&env, "alice", &dir, &["status", "--json"])),
+        ("veil.blame/2", json_ok(&env, "alice", &dir, &["blame", "f.txt", "--json"])),
+        ("veil.grep/2", json_ok(&env, "alice", &dir, &["grep", "one", "--json"])),
+        ("veil.log/2", json_ok(&env, "alice", &dir, &["log", "-S", "one", "--show-skipped", "--json"])),
+        ("veil.diff/2", json_ok(&env, "alice", &dir, &["diff", "--json"])),
+        ("veil.status/2", json_ok(&env, "alice", &dir, &["status", "--json"])),
     ];
     fn keys(v: &Value, out: &mut Vec<String>) {
         match v {

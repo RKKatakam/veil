@@ -24,7 +24,7 @@ use crate::{
 };
 
 /// JSON schema of `vl duplicate --json` and `vl cherry-pick --json`.
-pub const DUPLICATE_SCHEMA: &str = "veil.duplicate/1";
+pub const DUPLICATE_SCHEMA: &str = "veil.duplicate/2";
 
 /// The description of each duplicate.
 #[derive(Args, Debug)]
@@ -83,7 +83,7 @@ pub struct CherryPickArgs {
     pub out: JsonOut,
 }
 
-/// `veil.duplicate/1`: the copies made (ids only: no description, so
+/// `veil.duplicate/2`: the copies made (ids only: no description, so
 /// nothing sealed can appear here), and for cherry-pick where `@` and the
 /// tags went.
 #[derive(Serialize, Debug)]
