@@ -918,3 +918,154 @@ fn search_speed() {
         }
     }
 }
+
+// ---- S15 cycle 1 review (BUG-1230..) ------------------------------------------------
+
+/// A grep's deadline is checked only between files, and one file's regular
+/// expression search cannot be stopped: a short pattern the size limits
+/// accept (a counted repetition of a class, with no literal to skip by)
+/// takes seconds per mebibyte of line, so one request by anyone on Earth
+/// holds a blocking thread far past its 2 s deadline, at a branch tip
+/// (through the index) and at an old revision (a scan) alike.
+#[test]
+#[ignore = "BUG-1230: a grep runs one file's regular expression past the query deadline"]
+fn bug_1230_grep_pattern_cost_passes_the_deadline() {
+    let th = TestHub::start();
+    let (policy_text, bindings) = policy(1);
+    let mut h = Hist::new(&th, &policy_text, &bindings);
+    // A mebibyte on one line (as a minified bundle is), no newline.
+    let mut x: u64 = 12345;
+    let line: Vec<u8> = (0..(1usize << 20) - 1)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            b"abcdefghijklmnopqrstuvwxyz0123456789 "[(x % 37) as usize]
+        })
+        .collect();
+    let files = Files::from([("pub/bundle.min.js".to_string(), line)]);
+    let tip = h.commit(&th, &[root_snapshot_id()], files, [7; 16], 1_000, None);
+    h.set_branch(&th, "main", tip);
+    index(&th, &h);
+    let anyone = Viewer::default();
+    warm_up(&th, &h, &anyone);
+    let a = ask(&th, &h, &anyone);
+    let projected = projections(&th, &h, &a.project, &anyone)[&tip].hex();
+    // 41 bytes; compiles under the 1 MiB limit.
+    let pattern = r"(?-u)[\x00-\xff]*[a-f][\x00-\xff]{1000}[A-Z]";
+    for rev in [None, Some(projected)] {
+        let t = Instant::now();
+        let r = th.rt.block_on(search::grep(&h.hub, &a, GrepParams { pattern: pattern.into(), rev: rev.clone(), ..Default::default() }, Limits::default()));
+        let took = t.elapsed();
+        assert!(!norm(r).starts_with("error 400"), "the pattern is accepted");
+        assert!(took < Duration::from_secs(5), "rev {rev:?}: a grep with a 2 s deadline took {took:?}");
+    }
+}
+
+/// The names index holds only the branches an update was asked for (a
+/// landing's, or the one a query names): a branch that has not landed
+/// since the index began (every branch of a project when the server is
+/// upgraded) is never walked, so a path only its history held is not
+/// found by a name search of "every path the project's history held".
+/// The same root: an update that did not run (a restart, an error, which
+/// is only logged) is resumed by nothing but that branch's next landing,
+/// so its index stays behind its tip (S12 resumes derivation; BUG-982).
+#[test]
+#[ignore = "BUG-1231: the search index covers only branches updated since; nothing resumes a missed update"]
+fn bug_1231_index_follows_only_the_branches_asked_for() {
+    let th = TestHub::start();
+    let (policy_text, bindings) = policy(1);
+    let mut h = Hist::new(&th, &policy_text, &bindings);
+    let base = h.commit(&th, &[root_snapshot_id()], Files::from([("pub/common.txt".to_string(), b"hello\n".to_vec())]), [1; 16], 1_000, None);
+    let feature = h.commit(
+        &th,
+        &[base],
+        Files::from([("pub/common.txt".to_string(), b"hello\n".to_vec()), ("pub/featurexyzzy.txt".to_string(), b"new\n".to_vec())]),
+        [2; 16],
+        2_000,
+        None,
+    );
+    h.set_branch(&th, "main", base);
+    h.set_branch(&th, "feature", feature);
+    h.derive(&th);
+    let anyone = Viewer::default();
+    warm_up(&th, &h, &anyone);
+    let a = ask(&th, &h, &anyone);
+    // What the first query of main does (`search::shards` → `index::landed`).
+    th.rt.block_on(index::update(&h.hub, h.id, Some(vec!["main".to_string()]))).unwrap();
+    let names = run(&th, &h, &a, &S::Search(SearchParams { q: Some("featurexyzzy".into()), kind: Some("path".into()), ..Default::default() }, Limits::default()));
+    let v: Value = serde_json::from_str(&names[0]).unwrap_or_else(|_| panic!("{names:?}"));
+    // main moves with no update run for it (one that failed or was cut).
+    let next = h.commit(&th, &[base], Files::from([("pub/common.txt".to_string(), b"hello again\n".to_vec())]), [3; 16], 3_000, None);
+    h.set_branch(&th, "main", next);
+    h.derive(&th);
+    warm_up(&th, &h, &anyone);
+    let want = projections(&th, &h, &a.project, &anyone)[&next].hex();
+    let mut covered = String::new();
+    for _ in 0..25 {
+        let r = run(&th, &h, &a, &S::Search(SearchParams { q: Some("hello".into()), ..Default::default() }, Limits::default()));
+        covered = serde_json::from_str::<Value>(&r[0]).map(|v| v["snapshot_id"].as_str().unwrap_or("").to_string()).unwrap_or_default();
+        if covered == want {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(covered, want, "main's index stays behind its tip");
+    assert_eq!(v["files"], 1, "a path only feature's history held: {names:?}");
+}
+
+/// The bounds and the deadline are checked only in the loop that reads
+/// candidates; before it, a query loads every segment of the viewer's
+/// shards and collects and sorts every live document holding the words'
+/// trigrams (every matching name; a grep's every candidate after its
+/// cursor, cheaper only while they come sorted). So one request's time and memory grow with the project, not with the
+/// 4,000 candidates (or a grep page) it reads, and no deadline stops it.
+/// Anyone on Earth can ask it of a large public project.
+#[test]
+#[ignore = "BUG-1232: a query collects and sorts every candidate before its bounds and deadline apply"]
+fn bug_1232_candidates_are_collected_past_the_bounds() {
+    let th = TestHub::start();
+    let (policy_text, bindings) = policy(1);
+    let mut h = Hist::new(&th, &policy_text, &bindings);
+    // 300,000 small public files (one shared blob: cheap to store and index).
+    let mut files = Files::new();
+    for d in 0..150 {
+        for f in 0..2_000 {
+            files.insert(format!("pub/d{d}/f{f}.txt"), b"common word\n".to_vec());
+        }
+    }
+    let tip = h.commit(&th, &[root_snapshot_id()], files, [9; 16], 1_000, None);
+    h.set_branch(&th, "main", tip);
+    index(&th, &h);
+    let anyone = Viewer::default();
+    warm_up(&th, &h, &anyone);
+    let a = ask(&th, &h, &anyone);
+    let deadline = Duration::from_millis(300);
+    let limits = Limits { deadline, ..Limits::default() };
+    let queries = [
+        // Words of under three bytes narrow nothing: every live document is
+        // a candidate for each.
+        S::Search(SearchParams { q: Some("c o m n w r d on".into()), ..Default::default() }, limits),
+        S::Search(SearchParams { q: Some("txt".into()), kind: Some("path".into()), ..Default::default() }, limits),
+    ];
+    // Once to load the segments into the cache, then measured.
+    let mut took = Vec::new();
+    for q in &queries {
+        let hub = h.hub.clone();
+        let call = || {
+            th.rt.block_on(async {
+                match q {
+                    S::Search(p, l) => search::search(&hub, &a, p.clone(), *l).await,
+                    S::Grep(p, l) => search::grep(&hub, &a, p.clone(), *l).await,
+                }
+            })
+        };
+        let _ = call();
+        let t = Instant::now();
+        let r = norm(call());
+        took.push((t.elapsed(), r.chars().take(120).collect::<String>()));
+    }
+    for (t, r) in &took {
+        assert!(*t < deadline + Duration::from_millis(700), "a query with a {deadline:?} deadline took {t:?}: {r}\n{took:?}");
+    }
+}
