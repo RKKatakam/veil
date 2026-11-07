@@ -41,13 +41,17 @@
 //! crashed upgrade resumes where it stopped (`vl upgrade` again). Old data is
 //! never removed by an upgrade. A dry run takes no lock and writes nothing.
 
-use std::sync::Arc;
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{Result, VeilError},
     fsck::{fsck, Severity},
+    id::ObjectId,
     identity::Identity,
     keychain::{HpkeMigration, Keychain, HPKE_REPO_FORMAT},
     lock::RepoLock,
@@ -237,12 +241,12 @@ const MAX_REMOVED_LISTED: usize = 50;
 /// workspaces in any retained operation's view, and embargo records that
 /// hold an embargo key. Nothing is decrypted: labels and structure name it.
 pub fn removed_content(backend: &Arc<dyn StorageBackend>) -> Result<Vec<String>> {
-    use std::collections::{BTreeSet, HashSet};
     let keys = Arc::new(Keychain::new(backend.clone(), None, String::new()));
     let store = ObjectStore::new(backend.clone(), VPath::new(".veil/objects")?, keys);
     store.set_freshening(false);
     let mut found: BTreeSet<String> = BTreeSet::new();
-    let mut roots: Vec<(crate::id::ObjectId, String)> = Vec::new();
+    // Every snapshot: its parents and its tree.
+    let mut snapshots: HashMap<ObjectId, (Vec<ObjectId>, ObjectId)> = HashMap::new();
     for id in store.list_objects()? {
         let Ok(raw) = store.read_raw(&id) else { continue };
         if Object::is_snapshot_raw(&raw) {
@@ -255,7 +259,8 @@ pub fn removed_content(backend: &Arc<dyn StorageBackend>) -> Result<Vec<String>>
                 found.insert(format!("snapshot {}: an encrypted description", id.short()));
             }
             if let Some(t) = v.get("tree").and_then(|t| serde_json::from_value(t.clone()).ok()) {
-                roots.push((t, String::new()));
+                let parents = v.get("parents").and_then(|p| serde_json::from_value(p.clone()).ok()).unwrap_or_default();
+                snapshots.insert(id, (parents, t));
             }
         } else if raw.starts_with(crate::object::ATAG_TAG) {
             if let Err(e) = Object::decode(&raw) {
@@ -263,45 +268,47 @@ pub fn removed_content(backend: &Arc<dyn StorageBackend>) -> Result<Vec<String>>
             }
         }
     }
-    // The trees, by path (each tree object once).
-    let mut seen: HashSet<crate::id::ObjectId> = HashSet::new();
-    while let Some((id, dir)) = roots.pop() {
-        if !seen.insert(id) {
-            continue;
+    // The trees. A sealed file at a path no built-in secret rule names is
+    // what format 8 itself writes when it descends from a secret: a secret
+    // renamed (protection follows content across a rename), or edited at
+    // its new path (sealed content keeps its audience). Anything else
+    // sealed there (a file under a cloaked folder, a cloaked line's edit),
+    // and a conflict side sealed the same way, only the removed
+    // encryption wrote. So snapshots are visited parents first, and a
+    // sealed entry is a secret's when its path names a secret, when its
+    // object was a secret's anywhere before, when a parent held a
+    // secret's sealed entry at the same path, or when a parent's secret of
+    // the same scope left its path in this snapshot (a rename and an edit
+    // at once).
+    let mut sealed_of: HashMap<ObjectId, Vec<SealedEntry>> = HashMap::new();
+    let mut secret_ids: HashSet<ObjectId> = HashSet::new();
+    let mut secret_paths: HashMap<ObjectId, HashMap<String, String>> = HashMap::new();
+    for id in parents_first(&snapshots) {
+        let (parents, tree) = &snapshots[&id];
+        let entries = sealed_entries(&store, *tree, &mut sealed_of, &mut found)?;
+        let here: HashSet<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        let before: Vec<&HashMap<String, String>> = parents.iter().filter_map(|p| secret_paths.get(p)).collect();
+        let mut mine: HashMap<String, String> = HashMap::new();
+        for e in &entries {
+            let secret = crate::policy::names_secret(&e.path)
+                || secret_ids.contains(&e.id)
+                || before.iter().any(|b| b.contains_key(&e.path))
+                || before.iter().any(|b| b.iter().any(|(p, scope)| *scope == e.scope && !here.contains(p.as_str())));
+            if secret {
+                secret_ids.insert(e.id);
+                mine.insert(e.path.clone(), e.scope.clone());
+            } else {
+                found.insert(format!(
+                    "{}{}: encrypted (cloaked:{}), and not a secret file",
+                    e.path,
+                    if e.conflict_side { " (a conflict side)" } else { "" },
+                    e.scope
+                ));
+            }
         }
-        let Ok(raw) = store.read_raw(&id) else { continue };
-        let shown = if dir.is_empty() { "/".to_string() } else { format!("{dir}/") };
-        let tree = match Object::decode(&raw) {
-            Ok(Object::Tree(t)) => t,
-            Ok(Object::Sealed(_)) => {
-                found.insert(format!("{shown}: an encrypted directory"));
-                continue;
-            }
-            Ok(_) => continue,
-            Err(e) => {
-                found.insert(format!("{shown}: {e}"));
-                continue;
-            }
-        };
-        for e in &tree.entries {
-            let path = if dir.is_empty() { e.name.clone() } else { format!("{dir}/{}", e.name) };
-            match e.kind {
-                EntryKind::Dir => roots.push((e.id, path)),
-                EntryKind::File | EntryKind::Symlink
-                    if matches!(e.visibility, Visibility::Cloaked { .. }) && !crate::policy::names_secret(&path) =>
-                {
-                    found.insert(format!("{path}: encrypted ({}), and not a secret file", e.visibility.label()));
-                }
-                EntryKind::Conflict => {
-                    if let Err(err) = store.get_raw(&e.id).and_then(|r| Object::decode(&r)) {
-                        found.insert(format!("{path}: {err}"));
-                    }
-                }
-                _ => {}
-            }
-        }
+        secret_paths.insert(id, mine);
     }
-    // Every retained operation's view (an undo restores any of them).
+        // Every retained operation's view (an undo restores any of them).
     let ops = VPath::new(".veil/ops")?;
     if backend.exists(&ops)? {
         for f in backend.list_dir(&ops)? {
@@ -507,6 +514,136 @@ pub fn upgrade(
         backend.remove_file(&journal_path())?;
     }
     Ok(report)
+}
+
+/// A sealed file, symlink or conflict side of a tree, at `path`.
+#[derive(Clone)]
+struct SealedEntry {
+    path: String,
+    scope: String,
+    id: ObjectId,
+    conflict_side: bool,
+}
+
+/// The sealed entries of tree `tree` (paths relative to it), each tree
+/// object read once (`memo`). What cannot be read as format 8 reads it
+/// (an encrypted directory, an embargoed entry, a fallback version, a
+/// conflict that does not decode) goes to `found`, named by its path.
+fn sealed_entries(
+    store: &ObjectStore,
+    tree: ObjectId,
+    memo: &mut HashMap<ObjectId, Vec<SealedEntry>>,
+    found: &mut BTreeSet<String>,
+) -> Result<Vec<SealedEntry>> {
+    // Iterative, parents after children: (tree, its path, children done).
+    let mut stack: Vec<(ObjectId, String, bool)> = vec![(tree, String::new(), false)];
+    let mut dirs: HashMap<ObjectId, Vec<(String, ObjectId)>> = HashMap::new();
+    let mut owns: HashMap<ObjectId, Vec<SealedEntry>> = HashMap::new();
+    while let Some((id, dir, done)) = stack.pop() {
+        if memo.contains_key(&id) || (!done && owns.contains_key(&id)) {
+            continue;
+        }
+        let shown = if dir.is_empty() { "/".to_string() } else { format!("{dir}/") };
+        if done {
+            let mut out = Vec::new();
+            for (name, sub) in dirs.remove(&id).unwrap_or_default() {
+                for e in memo.get(&sub).into_iter().flatten() {
+                    out.push(SealedEntry { path: format!("{name}/{}", e.path), ..e.clone() });
+                }
+            }
+            out.extend(owns.remove(&id).unwrap_or_default());
+            memo.insert(id, out);
+            continue;
+        }
+        let Ok(raw) = store.read_raw(&id) else {
+            memo.insert(id, Vec::new());
+            continue;
+        };
+        let tree = match Object::decode(&raw) {
+            Ok(Object::Tree(t)) => t,
+            Ok(Object::Sealed(_)) => {
+                found.insert(format!("{shown}: an encrypted directory"));
+                memo.insert(id, Vec::new());
+                continue;
+            }
+            Ok(_) => {
+                memo.insert(id, Vec::new());
+                continue;
+            }
+            Err(e) => {
+                found.insert(format!("{shown}: {e}"));
+                memo.insert(id, Vec::new());
+                continue;
+            }
+        };
+        let mut own = Vec::new();
+        let mut subdirs = Vec::new();
+        for e in &tree.entries {
+            let path = if dir.is_empty() { e.name.clone() } else { format!("{dir}/{}", e.name) };
+            match e.kind {
+                EntryKind::Dir => subdirs.push((e.name.clone(), e.id, path)),
+                EntryKind::File | EntryKind::Symlink => {
+                    if let Visibility::Cloaked { scope } = &e.visibility {
+                        own.push(SealedEntry { path: e.name.clone(), scope: scope.clone(), id: e.id, conflict_side: false });
+                    }
+                }
+                EntryKind::Conflict => match store.get_raw(&e.id).and_then(|r| Object::decode(&r)) {
+                    Ok(Object::Conflict(c)) => {
+                        for t in c.interleaved().flatten() {
+                            if let Visibility::Cloaked { scope } = &t.visibility {
+                                own.push(SealedEntry { path: e.name.clone(), scope: scope.clone(), id: t.id, conflict_side: true });
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        found.insert(format!("{path}: {err}"));
+                    }
+                },
+            }
+        }
+        // Paths are relative to this tree (its parent prefixes them):
+        // children first, then this tree again to combine them.
+        stack.push((id, dir.clone(), true));
+        let mut names = Vec::new();
+        for (name, sub, path) in subdirs {
+            names.push((name, sub));
+            if !memo.contains_key(&sub) {
+                stack.push((sub, path, false));
+            }
+        }
+        dirs.insert(id, names);
+        owns.insert(id, own);
+    }
+    Ok(memo.get(&tree).cloned().unwrap_or_default())
+}
+
+/// Snapshot ids, every snapshot after the parents among them.
+fn parents_first(snapshots: &HashMap<ObjectId, (Vec<ObjectId>, ObjectId)>) -> Vec<ObjectId> {
+    let mut out = Vec::new();
+    let mut done: HashSet<ObjectId> = HashSet::new();
+    let mut ids: Vec<ObjectId> = snapshots.keys().copied().collect();
+    ids.sort();
+    for start in ids {
+        let mut stack = vec![(start, false)];
+        while let Some((id, expanded)) = stack.pop() {
+            if done.contains(&id) {
+                continue;
+            }
+            if expanded {
+                done.insert(id);
+                out.push(id);
+                continue;
+            }
+            stack.push((id, true));
+            for p in snapshots.get(&id).map(|(p, _)| p.as_slice()).unwrap_or(&[]) {
+                if snapshots.contains_key(p) && !done.contains(p) {
+                    stack.push((*p, false));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Count objects and plaintext trees by encoding.

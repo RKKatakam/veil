@@ -1,11 +1,12 @@
 # Veil on-disk formats
 
 From 1.0 on, a repository written by any vl release is readable by every
-later release, or upgradable to what it reads, with one exception the owner
-approved (2026-11-06): format 8, where only secret files are encrypted,
-no longer reads formats 1 to 5, and upgrades formats 6 and 7 only when they
-hold nothing that the removed encryption of non-secret content wrote (§5,
-"Format 8"). This document lists everything Veil persists, how each part
+later release, or upgradable to what it reads, with one exception
+approved by the owner, 2026-11-07: format 8, where only secret files are
+encrypted, no longer reads formats 1 to 5 (dropping them was the owner's
+request of 2026-11-06), and upgrades formats 6 and 7 only when they hold
+nothing that the removed encryption of non-secret content wrote, refusing
+otherwise rather than decrypting (§5, "Format 8"). This document lists everything Veil persists, how each part
 is versioned, the rules for changing any of it, and how `vl upgrade`
 migrates a repository.
 
@@ -418,7 +419,9 @@ still waiting for its admin.
 ### Format 8 (only secret files are encrypted)
 
 Owner decision (2026-11-06): **only secret files are ever encrypted**
-(`docs/VISIBILITY.md`). Formats 7 and earlier could also encrypt change
+(`docs/VISIBILITY.md`). Format 8, and refusal (not a decrypting upgrade)
+for a repository that holds removed content, were approved by the owner,
+2026-11-07. Formats 7 and earlier could also encrypt change
 descriptions and attribution, annotated-tag messages, tag names (cloaked
 tags), whole lines of work (cloaked workspaces, whose public edits carried
 a *fallback* version), embargoed merges (embargo keys, wrapper trees,
@@ -439,8 +442,11 @@ signed records) and folders. Format 8 removes all of it.
   decrypting, every snapshot (an encrypted description, a `cloak` field),
   every annotated tag (a sealed message), every tree reachable from a
   snapshot (embargoed entries, fallback versions, encrypted directories,
-  and an encrypted file whose path no built-in secret rule names, such as
-  a file under a cloaked folder), the view of every retained operation
+  and an encrypted file or conflict side whose path no built-in secret rule
+  names, such as a file under a cloaked folder, unless its lineage shows it
+  is a secret: its object was a secret's in an earlier snapshot, a parent
+  held a secret at that path, or a parent's secret of the same access left
+  its path in this snapshot, a renamed secret that format 8 keeps sealed), the view of every retained operation
   (cloaked tags and workspaces, which an undo could bring back) and every
   embargo record (one holding a key). If it finds nothing, the upgrade
   writes `repo.json` and nothing else: every object, operation and id
@@ -453,8 +459,10 @@ signed records) and folders. Format 8 removes all of it.
   repository from a checkout of the files; the refusal says so. Holding
   the keys does not change the answer: unsealing would still rewrite the
   history.
-* **Formats 1 to 5** are no longer read: opening, `fsck` and `vl upgrade`
-  refuse them, saying to upgrade them to format 7 first with a vl from before format 8.
+* **Formats 1 to 5** are no longer read (the owner asked for it on
+  2026-11-06; approved by the owner, 2026-11-07): opening, `fsck` and
+  `vl upgrade` refuse them, saying to upgrade them to format 7 first with a
+  vl from before format 8.
 * **Objects of older formats** that an upgraded repository holds (JSON
   trees, legacy sealed objects, legacy key wraps, marker conflicts) are
   still read.

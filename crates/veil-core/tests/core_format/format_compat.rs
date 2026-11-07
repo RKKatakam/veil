@@ -1172,7 +1172,6 @@ fn written_then_marked(from: u32, build: impl FnOnce(&mut Repo, &Path, &Arc<Disk
 /// the removed encryption wrote" and refuses the repository, telling its
 /// owner to start a new one.
 #[test]
-#[ignore = "BUG-940: vl upgrade refuses a renamed secret, which format 8 itself writes"]
 fn a_renamed_secret_does_not_block_the_upgrade() {
     let (_tmp, _root, fs, alice) = written_then_marked(7, |repo, root, fs| {
         std::fs::write(root.join(".veilpolicy"), ".env cloak team\n").unwrap();
@@ -1197,7 +1196,6 @@ fn a_renamed_secret_does_not_block_the_upgrade() {
 /// keeps encrypted code, which the check exists to refuse (docs/FORMAT.md
 /// §5 "Format 8").
 #[test]
-#[ignore = "BUG-941: vl upgrade misses a conflict side encrypted for a cloaked folder"]
 fn an_encrypted_conflict_side_of_an_ordinary_file_is_named() {
     let (_tmp, _root, fs, alice) = written_then_marked(7, |repo, _, _| {
         let store = repo.store();
