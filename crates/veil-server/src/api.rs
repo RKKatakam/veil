@@ -592,9 +592,9 @@ async fn changes(
     Path(p): Path<String>,
     Json(req): Json<veil_core::hub::changes::ChangeRequest>,
 ) -> Result<Json<veil_core::hub::changes::ChangeResult>> {
-    let me = caller.signed_in()?.clone();
+    caller.signed_in()?;
     let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
-    Ok(Json(crate::changes::create(&hub, &project, &viewer, &me, req).await?))
+    Ok(Json(crate::changes::create(&hub, &project, &viewer, &caller, req).await?))
 }
 
 #[derive(Deserialize)]

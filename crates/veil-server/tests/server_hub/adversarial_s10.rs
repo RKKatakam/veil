@@ -34,7 +34,6 @@ fn real_id(p: &Project, path: &str) -> ObjectId {
 /// 5,000?"). A right guess and a wrong one must get the same answer, as a
 /// push's do (BUG-824's rule).
 #[test]
-#[ignore = "BUG-1050: put.object at a hidden path confirms a guess of the hidden file's content (closure is judged on the real base before the graft)"]
 fn bug_1050_a_put_at_a_hidden_path_never_confirms_a_guess_of_its_content() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -66,7 +65,6 @@ fn bug_1050_a_put_at_a_hidden_path_never_confirms_a_guess_of_its_content() {
 /// apply): the branch did not move, so the answer is "rejected" and the
 /// change is kept, as for any other base.
 #[test]
-#[ignore = "BUG-1051: an API commit whose move is refused, on a base older than the accepted policy, fails with 'only admins may change who has access'"]
 fn bug_1051_a_refused_move_on_an_older_base_is_rejected_not_an_access_change() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -153,7 +151,6 @@ fn s10_kind_changes_across_a_boundary_answer_alike_for_hidden_and_missing() {
 /// limit of 1,024 levels, and stays up. Run in a child process: today the
 /// whole server (and this test binary with it) aborts on a stack overflow.
 #[test]
-#[ignore = "BUG-1052: a path 500-1,024 levels deep (an API edit or a pushed tree) overflows a server worker's stack and aborts the whole server"]
 fn bug_1052_a_deep_edit_never_takes_the_server_down() {
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["adversarial_s10::deep_edit_in_a_child", "--exact", "--include-ignored", "--nocapture"])
@@ -182,20 +179,40 @@ fn deep_edit_in_a_child() {
     }
     // The same depth through a push (the graft recurses too); crafted on a
     // thread with a large stack (the crafting recurses as well).
-    let r = std::thread::scope(|s| {
-        std::thread::Builder::new()
-            .stack_size(512 << 20)
-            .spawn_scoped(s, || {
-                let api = hub.api();
-                let mut c = Craft::new(&api, &p.dev, &p.name, "main");
-                c.file(&format!("src/x/{}", vec!["d"; 600].join("/")), "deep");
-                c.push("main", "deep").status
-            })
-            .unwrap()
-            .join()
-            .unwrap()
-    });
+    let push = |path: String| {
+        std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(512 << 20)
+                .spawn_scoped(s, || {
+                    let api = hub.api();
+                    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+                    c.file(&path, "deep");
+                    let r = c.push("main", "deep");
+                    (r.status, body(&r))
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        })
+    };
+    let (r, _) = push(format!("src/x/{}", vec!["d"; 600].join("/")));
     assert!(r < 500, "{r}");
+    // Exactly at the limit (`MAX_TREE_DEPTH` folders above the file), both
+    // routes land; one folder more is refused by both (BUG-1052).
+    let limit = veil_core::tree::MAX_TREE_DEPTH;
+    let token = p.dev.token();
+    // `folders` folders above the file, the first of them `top`.
+    let at = |top: &str, folders: usize| format!("{top}/{}f", "d/".repeat(folders - 1));
+    assert_eq!(at("src", limit).split('/').count(), limit + 1);
+    let base = tip(&hub, &token, &p.name);
+    let r = change(&hub, &token, &p.name, &json!({"base": base.hex(), "edits": [put(&at("src", limit), "x")], "onto": {"branch": "main", "expected": "rebase"}}));
+    assert_eq!(r.json()["branch"]["status"], "ok", "{}", body(&r));
+    let r = change(&hub, &token, &p.name, &json!({"base": tip(&hub, &token, &p.name).hex(), "edits": [put(&at("src", limit + 1), "x")]}));
+    assert_eq!(r.status, 400, "{}", body(&r));
+    let (r, b) = push(at("src", limit).replacen("src/d/", "src/p/", 1));
+    assert_eq!(r, 200, "a push at the limit: {b}");
+    let (r, b) = push(at("src", limit + 1).replacen("src/d/", "src/q/", 1));
+    assert!((400..500).contains(&r), "a push past the limit: {r} {b}");
     eprintln!("deep edits answered");
 }
 
@@ -203,7 +220,6 @@ fn deep_edit_in_a_child() {
 /// 100 folders deep, 100,000 objects from a 236 KB request) land on an S3
 /// store (MinIO here): the server does not send every object at once.
 #[test]
-#[ignore = "BUG-1053: an API commit stores all its objects at once (one task each, unbounded); on S3 a 10,000-file change gets HTTP 429s and fails with a 500"]
 fn bug_1053_a_change_of_ten_thousand_files_lands_on_s3() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -223,7 +239,6 @@ fn bug_1053_a_change_of_ten_thousand_files_lands_on_s3() {
 /// where they see it. A change on main they cannot see must not change the
 /// answer: it is not in their history, and must not show (S1, §13.4).
 #[test]
-#[ignore = "BUG-1054: an expected tip is refused as 'not a fast-forward' when a change the caller cannot see landed on main, revealing it"]
 fn bug_1054_a_hidden_change_on_main_does_not_refuse_an_expected_move() {
     let hub = TestHub::start();
     let p = setup_project(&hub);

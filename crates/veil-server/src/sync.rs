@@ -650,7 +650,7 @@ pub(crate) fn entry_at(src: &Source, tree: &ObjectId, path: &str) -> Result<Opti
 /// Every object entry `e` names: its object, its fallback and, for a
 /// conflict, its terms' objects and fallbacks (what `fetch` serves at its
 /// path).
-fn named_ids(src: &Source, e: &veil_core::TreeEntry) -> Result<Vec<ObjectId>> {
+pub(crate) fn named_ids(src: &Source, e: &veil_core::TreeEntry) -> Result<Vec<ObjectId>> {
     let mut out = vec![e.id];
     out.extend(e.fallback);
     if e.kind == EntryKind::Conflict {
@@ -1243,13 +1243,19 @@ pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes) -> R
         Object::decode(raw)?;
     }
     let receipts = frames.iter().map(|(id, _)| receipt(hub, project, person, id)).collect();
+    put_all(hub, project, frames).await?;
+    Ok(receipts)
+}
+
+/// Store `objects` in `project`, at most [`PUTS_AT_ONCE`] at a time (an
+/// object store answers a flood with "slow down": BUG-1053).
+pub async fn put_all(hub: &Arc<Hub>, project: i64, objects: impl IntoIterator<Item = (ObjectId, Bytes)>) -> Result<()> {
     let mut set = tokio::task::JoinSet::new();
-    let hub2 = hub.clone();
-    let mut it = frames.into_iter();
+    let mut it = objects.into_iter();
     loop {
-        while set.len() < 64 {
+        while set.len() < PUTS_AT_ONCE {
             let Some((id, raw)) = it.next() else { break };
-            let h = hub2.clone();
+            let h = hub.clone();
             set.spawn(async move { h.objects.put(project, &id, raw).await });
         }
         match set.join_next().await {
@@ -1257,5 +1263,8 @@ pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes) -> R
             None => break,
         }
     }
-    Ok(receipts)
+    Ok(())
 }
+
+/// Most object writes one request has in flight ([`put_all`]).
+pub const PUTS_AT_ONCE: usize = 64;

@@ -1538,12 +1538,15 @@ POST /v1/projects/{p}/changes
   push), then runs the push's per-snapshot checks on it
   (`sync::complete`): the graft onto the full tree, so nothing the caller
   cannot see is touched; write access for every edited path; access lines
-  changed only by admins (the authority is the accepted policy); closure
-  (an object that is not the caller's upload, nor the entry at that path in
-  `base`, gets the answer a missing one gets, before anything reads it);
-  personal keys refused; secret paths only as ciphertext; check 9 below. A
-  move of the default branch accepts its policy as a push does (admins
-  only), with the same listing of who can now see what.
+  changed only by admins, against the actual parent (the authority is the
+  accepted policy); closure (an object that is not the caller's upload, nor
+  the entry at that path in the caller's **view** of `base`, gets the answer
+  a missing one gets, before anything reads it, so a guess of a hidden
+  file's content is never confirmed: BUG-1050); personal keys refused;
+  secret paths only as ciphertext; check 9 below. A move of the default
+  branch accepts its policy only when the branch moves and only from an
+  admin, with the same listing of who can now see what; anyone else's
+  change of access lines is kept, `rejected` (BUG-1051).
 * **Check 9, the server-side secret scan** (also for pushes): every new
   plain-text file, symlink and conflict term is scanned with the scanner `vl` uses
   (`veil_core::secrets::scan`); a hit refuses the change. The error names
@@ -1566,23 +1569,32 @@ POST /v1/projects/{p}/changes
   snapshot row, the caller's projection memo, the change ref, the audit row
   and, with `onto`, the one-row compare-and-swap of the branch (and an
   admin's policy) are one READ COMMITTED transaction. Objects are stored
-  before it. A non-admin's one-file change stores 6 objects (the blob, the
+  before it, at most 64 at a time (BUG-1053). A non-admin's one-file change stores 6 objects (the blob, the
   full trees on its path, the snapshot and the caller's projection).
 * **Change refs** (`change_refs`, migration 5): every change made this way
   is kept under its change id, whether or not a branch moved, and is a
   `base` like any snapshot. Only its creator makes a new revision of it
   (`change_id`); the new snapshot names the previous one as predecessor.
-* **`onto`.** `expected` is the push's compare-and-swap: the move is refused
-  (the change is still kept) if the branch's tip is not that snapshot as the
-  caller sees it, or the change is not on top of it. `"rebase"`: when the tip
+* **`onto`.** `expected` is the push's compare-and-swap, judged on the
+  caller's view: the move is refused (the change is still kept) unless the
+  branch's tip is that snapshot as the caller sees it, and `base` is that
+  tip or a stack of up to 64 of the caller's own unlanded changes on it,
+  each writing only paths they may still write. When changes the caller
+  cannot see landed under the stack, the server makes the caller's changes
+  again on the real tip (each their view grafted onto the new parent, with
+  the push's checks); the caller sees them with the same ids, so nothing
+  tells them a hidden change landed (BUG-1054). `"rebase"`: when the tip
   is not `base`, the server applies the edits to the tip instead, provided the
   entry at every edited path, and whether each folder above it is a folder,
   is the same in `base` and the tip; it tries again on a lost race, up to 5
-  times, then answers `rejected`. **The change is its edits:** applied to
+  times, then answers `rejected`. Each try reads the accepted policy and
+  the caller's access again. **The change is its edits:** applied to
   another tip, it never carries what `base` had and the tip has not (to
-  stack on an unlanded change, land that first, or use `expected`).
+  stack on an unlanded change, use `expected`).
 * **Limits:** 10,000 edits, 64 MiB of inline text (and the 64 MiB body
-  limit), paths of at most 4,096 bytes and 1,024 levels, in Unicode NFC,
+  limit), paths of at most 4,096 bytes with at most 1,024 folders above the
+  file (`MAX_TREE_DEPTH`, a tree's own limit; every server thread has a
+  stack for walks that deep: BUG-1052), in Unicode NFC,
   each component a valid entry name (no `..`, `.`, empty, NUL or any
   spelling of `.veil`); two edits of one path, or of a file and something
   below it, are refused; a delete names an existing file.

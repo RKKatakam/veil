@@ -44,7 +44,12 @@ impl TestHub {
     /// A server whose objects are in the S3 store at `endpoint` (MinIO, or
     /// something in front of it), or in a temporary directory.
     pub fn start_with_s3(database_url: &str, ttl: Duration, endpoint: Option<String>) -> TestHub {
-        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(8).build().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(8)
+            .thread_stack_size(veil_server::THREAD_STACK)
+            .build()
+            .unwrap();
         let dir = tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap();
         let storage = match endpoint {
             Some(endpoint) => Storage::S3 {

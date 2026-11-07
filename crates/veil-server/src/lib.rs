@@ -29,6 +29,15 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use veil_core::{cache::LruCache, object::Tree, object::TreeEncoding, Identity};
 
+/// The stack of every thread that runs the server's work (the runtime's
+/// workers and blocking threads): enough for the walks that recurse once
+/// per folder level (projection, the graft, an API commit's edits) at
+/// `veil_core::tree::MAX_TREE_DEPTH` levels, the deepest a tree may be
+/// (BUG-1052). Whoever builds the runtime `start` runs on sets it
+/// (`main.rs`, the tests). Address space only: a thread uses what it
+/// touches.
+pub const THREAD_STACK: usize = 64 << 20;
+
 /// Shared server state.
 pub struct Hub {
     pub db: sqlx::PgPool,

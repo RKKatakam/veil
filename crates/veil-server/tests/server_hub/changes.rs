@@ -454,3 +454,87 @@ fn bug_931_a_conflicts_terms_get_the_secret_checks() {
     }
     assert_eq!(tip_for(&hub, &p.dev.token(), &p.name), before);
 }
+
+/// A stack of the caller's own unlanded changes lands with `expected` after
+/// a change they cannot see landed on main: their changes are made again on
+/// the real tip, the hidden change is kept, and the caller sees their
+/// changes with the ids they were given (BUG-1054).
+#[test]
+fn a_stack_lands_over_a_hidden_change_which_it_keeps_and_never_shows() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let token = p.dev.token();
+    let main = tip_for(&hub, &token, &p.name);
+    let r = change(&hub, &token, &p.name, &json!({"base": main.hex(), "description": "first", "edits": [put("src/first.txt", "1")]}));
+    let x: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+    let hidden = "MARKER-HIDDEN-UNDER-STACK-71c2e9";
+    write_files(&p.dir, &[(&format!("{BILL_DIR}/acme/invoice.txt"), hidden)]);
+    p.admin.commit_main(&p.dir, "billing only");
+    p.admin.ok(&p.dir, &["push"]);
+    assert_eq!(tip_for(&hub, &token, &p.name), main);
+    let r = change(&hub, &token, &p.name, &json!({"base": x.hex(), "description": "second", "edits": [put("src/second.txt", "2")],
+        "onto": {"branch": "main", "expected": main.hex()}}));
+    let v = r.json();
+    assert_eq!(v["branch"]["status"], "ok", "{v}");
+    // The dev's history: second, then first with the id they were given.
+    let now = tip_for(&hub, &token, &p.name);
+    let h = hub.api().post_json(Some(&token), &format!("/v1/projects/{}/history", p.name), &json!({"tips": [now.hex()], "stop": [main.hex()]}));
+    let snaps: Vec<_> = h.frames();
+    assert_eq!(snaps.len(), 2, "two changes above main");
+    let (_, raw) = snaps.iter().find(|(id, _)| *id == now).unwrap();
+    let O::Snapshot(top) = O::decode(raw).unwrap() else { panic!() };
+    assert_eq!(top.parents, vec![x], "the first change keeps its id for the dev");
+    assert_no_marker(&[("history".into(), h.body.clone())], &[hidden, "billing only"], &p.dev.name);
+    // The full main keeps the hidden change and has both files.
+    p.admin.ok(&p.dir, &["pull"]);
+    p.admin.ok(&p.dir, &["new", "main"]);
+    assert_eq!(std::fs::read_to_string(p.dir.join(format!("{BILL_DIR}/acme/invoice.txt"))).unwrap(), hidden);
+    assert!(p.dir.join("src/first.txt").exists() && p.dir.join("src/second.txt").exists());
+    // The real history: second, first (made again), then the hidden change.
+    let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(&p.dir)), None, "test").unwrap();
+    let mut cur = repo.view().tags["main"].target;
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        let s = repo.store().snapshot(&cur).unwrap();
+        let veil_core::object::Text::Plain(d) = &s.description else { panic!() };
+        seen.push(d.clone());
+        cur = s.parents[0];
+    }
+    assert_eq!(seen, ["second", "first", "billing only"]);
+}
+
+/// A stack is made again on the tip only if the caller may still write
+/// everything it changes (otherwise their view would drop an edit): a dev
+/// whose write access to a folder was taken away cannot land an older
+/// change of theirs there by stacking on it.
+#[test]
+fn a_stack_writing_where_its_author_lost_access_is_rejected() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let token = p.dev.token();
+    let main = tip_for(&hub, &token, &p.name);
+    let r = change(&hub, &token, &p.name, &json!({"base": main.hex(), "edits": [put("src/x.txt", "x")]}));
+    let x: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+    // The admin keeps src/ public but lets devs write only src/y/.
+    let policy = std::fs::read_to_string(p.dir.join(".veilpolicy")).unwrap();
+    let edited: String = policy
+        .lines()
+        .map(|l| match l.split_whitespace().collect::<Vec<_>>()[..] {
+            ["src/", "public", "devs"] => "src/ public\nsrc/y/ devs".to_string(),
+            _ => l.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_ne!(edited, policy.trim_end());
+    let atok = p.admin.token();
+    let abase = tip_for(&hub, &atok, &p.name);
+    let r = change(&hub, &atok, &p.name, &json!({"base": abase.hex(), "edits": [put(".veilpolicy", &format!("{edited}\n"))], "onto": {"branch": "main", "expected": abase.hex()}}));
+    assert_eq!(r.json()["branch"]["status"], "ok", "{}", String::from_utf8_lossy(&r.body));
+    let now = tip_for(&hub, &token, &p.name);
+    let r = change(&hub, &token, &p.name, &json!({"base": x.hex(), "edits": [put("src/y/new.txt", "y")], "onto": {"branch": "main", "expected": now.hex()}}));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let v = r.json();
+    assert_eq!(v["branch"]["status"], "rejected", "{v}");
+    assert!(v["branch"]["message"].as_str().unwrap().contains("writes 'src/x.txt', which you may no longer write"), "{v}");
+    assert_eq!(tip_for(&hub, &token, &p.name), now);
+}
